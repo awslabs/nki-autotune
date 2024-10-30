@@ -1,11 +1,10 @@
-## My Project
+## NKI_autotune
+Automatically profile and select the best meta parameters for NKI kernels.
 
-TODO: Fill this README out!
+## Installation
+1. Follow AWS Neuron [tutorial] (https://awsdocs-neuron.readthedocs-hosted.com/en/latest/index.html) to install Neuron packages.
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+2. Install requirements.txt.
 
 ## Security
 
