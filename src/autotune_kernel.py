@@ -1,8 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Tuple, Any
-import multiprocessing, warnings, pickle
+from typing import List, Tuple, Any, Union
+import multiprocessing, warnings, pickle, subprocess
 from dataclasses import dataclass
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
@@ -10,127 +10,92 @@ from time import perf_counter
 
 import neuronxcc.nki as nki
 from neuronxcc.starfish.penguin.targets.nki.TraceKernel import (
-    BenchmarkKernel,
-    decltensor,
+    BaremetalKernel,
+    BenchmarkKernel
 )
 
 
-class AutotuneKernel(BenchmarkKernel):
-    """
-    Compile and benchmark NKI kernel on NeuronDevice.
-    """
+class AutotuneKernel(BaremetalKernel):
+  """
+  Compile and benchmark NKI kernel on NeuronDevice.
+  """
 
-    def __init__(
-        self,
-        configs: List[dict] = None,
-        warmup=2,
-        iters=5,
-        max_workers=None,
-        benchmark_machines=None,
-        **kwargs,
-    ):
-        super().__init__(warmup=warmup, iters=iters, **kwargs)
-        self.design_space = configs
-        self.max_workers = max_workers
-        self.results = []
-        self.benchmark_machines = (
-            benchmark_machines if benchmark_machines is not None else ["localhost"]
-        )  # a list of instance used for remote benchmark, if it is none, use the current machine itself
+  def __init__(self, warmup=5, iters=10, device_count=1, configs: Union[dict, List[dict]] = None,
+               **kwargs):
+    super().__init__(**kwargs)
+    self.warmup = warmup
+    self.iters = iters
+    self.device_count = device_count
+    self.perf_dict = {}
+    self.design_space = self._generate_design_space(configs)
 
-    def create_tensor_ptr(self, ctx, shape, dtype, name="", annotation=None):
-        return decltensor(shape, dtype)
+  def __call__(self, *args, **kwargs):
+    total_configs = len(self.design_space)
+    for i, configs in enumerate(self.design_space):
+      perf = self.test_design(configs, args, kwargs)
+      self.perf_dict[str(configs)] = perf
+      print(f'Progress: {i + 1}/{total_configs} configurations tested')
+    self.post_tuning()
+    return None  # the kernel output means nothing here
 
-    def __call__(self, *args, **kwargs):
-        device_locks = {
-            machine: multiprocessing.Manager().Lock()
-            for machine in self.benchmark_machines
-        }
+  def test_design(self, configs, args, kwargs):
+    benchmark = BenchmarkKernel(func=self.func, warmup=self.warmup, iters=self.iters,
+                                device_count=self.device_count)
+    combined_kwargs = {**configs, **kwargs}
+    try:
+      benchmark(*args, **combined_kwargs)
+      perf = benchmark.benchmark_result.nc_latency.get_latency_percentile(99) / 1000.0
+    except AssertionError as e:
+      print(f"Warning: failed for config {configs}, reason: {e}")
+      perf = float('inf')
+    except subprocess.CalledProcessError as e:
+      print(
+        f"Warning: Will fail if not running on a neuron device, failed for config {configs}, reason: {e}")
+      perf = float('inf')
+    return perf
 
-        args = [
-            self._translate_param(ctx=None, o=a, name="", annotation=None) for a in args
-        ]
-        kwargs = {
-            k: self._translate_param(ctx=None, o=v, name=k, annotation=None)
-            for k, v in kwargs.items()
-        }
-        self.results = {
-            "timestamps": [],
-            "configs": [],
-            "latencies": [],
-        }
+  def _generate_design_space(self, configs) -> List:
+    if isinstance(configs, dict):  # user use numerical method to define the design space
+      param_specs = configs
 
-        with ProcessPoolExecutor(max_workers=self.max_workers) as e:
-            all_instances = []
-            # TODO Evenly assign the benchmarking jobs to instances, can improve to dynamic allocation in the future
-            for config, machine in zip(
-                self.design_space,
-                self.benchmark_machines
-                * (len(self.design_space) // len(self.benchmark_machines) + 1),
-            ):
-                future = e.submit(
-                    test_design,
-                    func=self.func,
-                    grid=self.grid,
-                    args=args,
-                    kwargs=kwargs,
-                    configs=config,
-                    device_lock=device_locks[machine],
-                    warmup=self.warmup,
-                    iters=self.iters,
-                    device_count=self.device_count,
-                    benchmark_machine=machine,
-                )
-                all_instances.append((future, config))
+      def generate_values(spec):
+        method, *args = spec
+        if method == "linear":
+          start, end, step = args
+          return range(start, end + 1, step)
+        elif method == "power_of_2":
+          start, end = args
+          return (2 ** i for i in range(start, end + 1))
+        elif method == "categorical":
+          return args[0]
+        else:
+          raise ValueError(f"Unknown method: {method}")
 
-            total_configs = len(all_instances)
-            start = perf_counter()
-            for i in tqdm(range(total_configs), desc="Benchmarking configurations"):
-                future, config = all_instances[i]
-                try:
-                    latency_us = future.result()
-                except Exception as e:
-                    latency_us = float("inf")
-                    warnings.warn(
-                        f"Warning: failed for config {config}, reason: {e} ({type(e)})",
-                        category=RuntimeWarning,
-                        stacklevel=2,
-                    )
-                elapsed = perf_counter() - start
-                self.results["timestamps"].append(elapsed)
-                self.results["configs"].append(config)
-                self.results["latencies"].append(latency_us)
+      def generate_configs(params):
+        if not params:
+          result_configs.append(current.copy())
+          return
+        key, spec = params[0]
+        for value in generate_values(spec):
+          current[key] = value
+          generate_configs(params[1:])
 
-        assert self.results["latencies"], "No configs tested"
-        best_config, best_latency_us = min(
-            zip(self.results["configs"], self.results["latencies"]), key=lambda x: x[1]
-        )
-        print(f"The best latency is {best_latency_us} us for config {best_config}")
+      result_configs = []
+      current = {}
+      generate_configs(list(param_specs.items()))
+      return result_configs
+    elif isinstance(configs, List):  # user provide a list of designs
+      return configs
+    else:
+      raise NotImplementedError(f"Unsupported configs type {type(configs)}")
 
-        self.grid = ()
-        pickle.dump(self.results, open("benchmark_results.pkl", "wb"))
-        return None  # the kernel output means nothing here
+  def post_tuning(self):
+    assert len(self.perf_dict) > 0, "No configs tested"
+    min_key = min(self.perf_dict, key=self.perf_dict.get)
+    min_value = self.perf_dict[min_key]
+    print(f"The best perf is {min_value} for config {min_key}")
 
-
-def test_design(
-    func,
-    grid,
-    args,
-    kwargs,
-    configs,
-    device_lock,
-    warmup,
-    iters,
-    device_count,
-    benchmark_machine=None,
-):
-    benchmark = BenchmarkKernel(
-        func=func,
-        grid=grid,
-        warmup=warmup,
-        iters=iters,
-        device_count=device_count,
-        device_lock=device_lock,
-        benchmark_machine=benchmark_machine,
-    )
-    benchmark(*args, **configs, **kwargs)
-    return benchmark.benchmark_result.nc_latency.get_latency_percentile(99)
+    # dump the performance dict
+    from pprint import pformat
+    with open(f"./perf_dict.txt", "w") as f:
+      f.write(pformat(self.perf_dict))

@@ -51,3 +51,6 @@ Desktop.ini
 *.tsv
 *.xlsx
 *.pdf
+
+# Artifacts
+artifacts/
