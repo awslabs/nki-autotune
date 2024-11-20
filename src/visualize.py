@@ -5,11 +5,20 @@ import matplotlib.pyplot as plt
 import pickle
 
 
+def simultaneous_sort(primary, secondary):
+    sorted_pairs = sorted(zip(primary, secondary), key=lambda x: x[0])
+    primary, secondary = zip(*sorted_pairs)
+
+    # Convert back to lists if needed
+    primary = list(primary)
+    secondary = list(secondary)
+    return primary, secondary
+
+
 def plot_tuning_results(tuning_results):
-    # Unpack the data from the dictionary
-    timestamps = tuning_results["timestamps"]
-    configs = tuning_results["configs"]
-    latencies = tuning_results["latencies"]
+    timestamps = [x["time_elapsed"] for x in tuning_results]
+    latencies = [x["latency"] for x in tuning_results]
+    timestamps, latencies = simultaneous_sort(timestamps, latencies)
     best_latencies = [min(latencies[: i + 1]) for i in range(len(latencies))]
 
     # Create a figure and axis
@@ -34,6 +43,6 @@ def plot_tuning_results(tuning_results):
     plt.savefig("latency_vs_timestamp.pdf", dpi=600)
 
 
-if __name__ == "__main__":
-    tuning_results = pickle.load(open("benchmark_results.pkl", "rb"))
-    plot_tuning_results(tuning_results)
+# if __name__ == "__main__":
+#     tuning_results = pickle.load(open("perf_results.pkl", "rb"))
+#     plot_tuning_results(tuning_results)

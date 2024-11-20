@@ -14,6 +14,8 @@ from neuronxcc.starfish.penguin.targets.nki.TraceKernel import (
     BenchmarkKernel,
 )
 
+from src.visualize import plot_tuning_results
+
 
 class AutotuneKernel(BaremetalKernel):
     """
@@ -32,15 +34,23 @@ class AutotuneKernel(BaremetalKernel):
         self.warmup = warmup
         self.iters = iters
         self.device_count = device_count
-        self.perf_dict = {}
+        self.perf_results = []
         self.design_space = self._generate_design_space(configs)
 
     def __call__(self, *args, **kwargs):
         total_configs = len(self.design_space)
+        start = perf_counter()
         for i in tqdm(range(total_configs)):
             configs = self.design_space[i]
-            perf = self.test_design(configs, args, kwargs)
-            self.perf_dict[str(configs)] = perf
+            latency = self.test_design(configs, args, kwargs)
+            time_elapsed = perf_counter() - start
+            self.perf_results.append(
+                {
+                    "configs": configs,
+                    "latency": latency,
+                    "time_elapsed": time_elapsed,
+                }
+            )
             print(f"Progress: {i + 1}/{total_configs} configurations tested")
         self.post_tuning()
         return None  # the kernel output means nothing here
@@ -55,19 +65,19 @@ class AutotuneKernel(BaremetalKernel):
         combined_kwargs = {**configs, **kwargs}
         try:
             benchmark(*args, **combined_kwargs)
-            perf = (
+            latency = (
                 benchmark.benchmark_result.nc_latency.get_latency_percentile(99)
                 / 1000.0
             )
         except AssertionError as e:
             print(f"Warning: failed for config {configs}, reason: {e}")
-            perf = float("inf")
+            latency = float("inf")
         except subprocess.CalledProcessError as e:
             print(
                 f"Warning: Will fail if not running on a neuron device, failed for config {configs}, reason: {e}"
             )
-            perf = float("inf")
-        return perf
+            latency = float("inf")
+        return latency
 
     def _generate_design_space(self, configs) -> List:
         if isinstance(configs, dict):
@@ -106,15 +116,19 @@ class AutotuneKernel(BaremetalKernel):
             raise NotImplementedError(f"Unsupported configs type {type(configs)}")
 
     def post_tuning(self):
-        assert len(self.perf_dict) > 0, "No configs tested"
-        min_key = min(
-            self.perf_dict, key=lambda configs_str: self.perf_dict[configs_str]
+        assert self.perf_results, "No configs tested"
+        best_result = min(
+            self.perf_results,
+            key=lambda element: element["latency"],
         )
-        min_value = self.perf_dict[min_key]
-        print(f"The best perf is {min_value} for config {min_key}")
+        min_latency = best_result["latency"]
+        min_config = best_result["configs"]
+        print(f"The best latency is {min_latency} for config {min_config}")
 
-        # dump the performance dict
+        # dump the performance logs
         from pprint import pformat
 
-        with open(f"./perf_dict.txt", "w") as f:
-            f.write(pformat(self.perf_dict))
+        with open(f"./perf_results.txt", "w") as f:
+            f.write(pformat(self.perf_results))
+        # pickle.dump(self.perf_results, open(f"./perf_results.pkl", "wb"))
+        plot_tuning_results(self.perf_results)

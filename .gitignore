@@ -21,6 +21,7 @@ coverage.xml
 .pytest_cache/
 *.sh
 *.txt
+*.pkl
 
 # Environments
 .env
