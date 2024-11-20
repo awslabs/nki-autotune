@@ -4,6 +4,7 @@
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
 
+
 # This is taken from the open source NKI samples repo
 # https://github.com/aws-neuron/nki-samples/blob/main/src/tutorials/matrix_multiplication/matrix_multiplication_nki_kernels.py#L247
 def nki_matmul_fully_optimized_(

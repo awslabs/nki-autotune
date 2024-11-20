@@ -20,7 +20,7 @@ def get_autotune_configs():
         list: A list of dictionaries, each containing configuration parameters for TILES_IN_BLOCK_M,
                 TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
     """
-    space = [int(2**x) for x in range(4, 6)]
+    space = [int(2**x) for x in range(4, 5)]
     TILES_IN_BLOCK_M_options = space
     TILES_IN_BLOCK_N_options = space
     TILES_IN_BLOCK_K_options = space
