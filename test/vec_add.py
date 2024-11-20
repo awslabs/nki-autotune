@@ -5,11 +5,7 @@ https://awsdocs-neuron-staging.readthedocs-hosted.com/en/nki_docs_2.21_beta_clas
 
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
-import neuronxcc.nki.isa as nisa
-import neuronxcc.nki.compiler as ncc
 import neuronxcc.nki.typing as nt
-from neuronxcc.nki import baremetal
-from neuronxcc.nki import benchmark
 
 import argparse
 from argparse import RawTextHelpFormatter
@@ -60,7 +56,6 @@ order to amortize DMA transfer overheads and load many more elements per
 DMA transfer. The input vectors are then added together and the result
 tiles are stored in HBM.
 """
-@nki.jit
 def vector_add_stream_auto(a_vec, b_vec, out, PARTITION_DIM = 128, FREE_DIM = 1000):
     
     # Get the total number of vector rows
