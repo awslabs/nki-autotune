@@ -12,8 +12,8 @@ def nki_matmul_fully_optimized_(
     result,
     # Meta-parameters
     TILES_IN_BLOCK_M=16,
-    TILES_IN_BLOCK_N=4,
-    TILES_IN_BLOCK_K=4,
+    TILES_IN_BLOCK_N=2,
+    TILES_IN_BLOCK_K=8,
 ):
     """NKI kernel to compute a large matrix multiplication efficiently by
        blocking all dimensions and doing layout optimization.

@@ -14,36 +14,31 @@ from itertools import product
 import random
 import sys
 
-sys.path.append('../')
+sys.path.append("../")
 from src.autotune_kernel import AutotuneKernel
 
 
-# This Just Disables the Compiler Logging Because It Clogs the Output 
+# This Just Disables the Compiler Logging Because It Clogs the Output
 import logging
+
 logging.disable(logging.OFF)
+
 
 def get_autotune_configs():
     PARTITION_DIM_options = [int(2**x) for x in range(0, 8)]
-    FREE_DIM_options = [int(2**x)*1000 for x in range(0, 4)]
+    FREE_DIM_options = [int(2**x) * 1000 for x in range(0, 4)]
 
-    params = list(
-        product(
-            PARTITION_DIM_options,
-            FREE_DIM_options
-        )
-    )
+    params = list(product(PARTITION_DIM_options, FREE_DIM_options))
 
     configs = []
 
     for PARTITION_DIM, FREE_DIM in params:
-        config = {
-            "PARTITION_DIM": PARTITION_DIM,
-            "FREE_DIM": FREE_DIM
-        }
+        config = {"PARTITION_DIM": PARTITION_DIM, "FREE_DIM": FREE_DIM}
         configs.append(config)
-    
+
     random.shuffle(configs)
     return configs
+
 
 """
 This is an extension of the tiled implementation of a vector add kernel
@@ -56,8 +51,10 @@ order to amortize DMA transfer overheads and load many more elements per
 DMA transfer. The input vectors are then added together and the result
 tiles are stored in HBM.
 """
-def vector_add_stream_auto(a_vec, b_vec, out, PARTITION_DIM = 128, FREE_DIM = 1000):
-    
+
+
+def vector_add_stream_auto(a_vec, b_vec, out, PARTITION_DIM=128, FREE_DIM=1000):
+
     # Get the total number of vector rows
     M = a_vec.shape[0]
 
@@ -77,8 +74,12 @@ def vector_add_stream_auto(a_vec, b_vec, out, PARTITION_DIM = 128, FREE_DIM = 10
     for m in nl.affine_range((M // TILE_M)):
 
         # Allocate space for a reshaped tile
-        a_tile = nl.ndarray((PARTITION_DIM, FREE_DIM), dtype=a_vec.dtype, buffer=nl.sbuf)
-        b_tile = nl.ndarray((PARTITION_DIM, FREE_DIM), dtype=a_vec.dtype, buffer=nl.sbuf)
+        a_tile = nl.ndarray(
+            (PARTITION_DIM, FREE_DIM), dtype=a_vec.dtype, buffer=nl.sbuf
+        )
+        b_tile = nl.ndarray(
+            (PARTITION_DIM, FREE_DIM), dtype=a_vec.dtype, buffer=nl.sbuf
+        )
 
         # Load the input tiles
         a_tile = nl.load(a_vec_re[m])
@@ -93,6 +94,7 @@ def vector_add_stream_auto(a_vec, b_vec, out, PARTITION_DIM = 128, FREE_DIM = 10
     # Reshape the output vector into its original shape
     out = out.reshape((M,))
 
+
 def main():
     parser = argparse.ArgumentParser(formatter_class=RawTextHelpFormatter)
     parser.add_argument("--size", type=int, required=True)
@@ -104,10 +106,13 @@ def main():
 
     print(f"\nRunning vector add with vector size = {args.size}")
 
-    tuner = AutotuneKernel.trace(vector_add_stream_auto, configs=get_autotune_configs(), show_compiler_tb=True)
+    tuner = AutotuneKernel.trace(
+        vector_add_stream_auto, configs=get_autotune_configs(), show_compiler_tb=True
+    )
     # Allocate space for the reshaped output vector in HBM
     output = nt.tensor[[a.shape[0], 1], a.dtype]
     tuner(a, b, output)
+
 
 if __name__ == "__main__":
     main()
