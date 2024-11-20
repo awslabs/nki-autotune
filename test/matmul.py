@@ -3,7 +3,6 @@
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
-import numpy as np
 from itertools import product
 import random
 

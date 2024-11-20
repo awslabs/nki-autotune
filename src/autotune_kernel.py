@@ -37,7 +37,8 @@ class AutotuneKernel(BaremetalKernel):
 
     def __call__(self, *args, **kwargs):
         total_configs = len(self.design_space)
-        for i, configs in enumerate(self.design_space):
+        for i in tqdm(range(total_configs)):
+            configs = self.design_space[i]
             perf = self.test_design(configs, args, kwargs)
             self.perf_dict[str(configs)] = perf
             print(f"Progress: {i + 1}/{total_configs} configurations tested")
@@ -69,9 +70,8 @@ class AutotuneKernel(BaremetalKernel):
         return perf
 
     def _generate_design_space(self, configs) -> List:
-        if isinstance(
-            configs, dict
-        ):  # user use numerical method to define the design space
+        if isinstance(configs, dict):
+            # user use numerical method to define the design space
             param_specs = configs
 
             def generate_values(spec):
@@ -107,7 +107,9 @@ class AutotuneKernel(BaremetalKernel):
 
     def post_tuning(self):
         assert len(self.perf_dict) > 0, "No configs tested"
-        min_key = min(self.perf_dict, key=self.perf_dict.get)
+        min_key = min(
+            self.perf_dict, key=lambda configs_str: self.perf_dict[configs_str]
+        )
         min_value = self.perf_dict[min_key]
         print(f"The best perf is {min_value} for config {min_key}")
 
