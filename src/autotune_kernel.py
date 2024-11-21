@@ -1,14 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Tuple, Any, Union
-import multiprocessing, warnings, pickle, subprocess
-from dataclasses import dataclass
-from concurrent.futures import ProcessPoolExecutor
+from typing import List, Union
+import pickle, subprocess
 from tqdm import tqdm
 from time import perf_counter
-
-import neuronxcc.nki as nki
 from neuronxcc.starfish.penguin.targets.nki.TraceKernel import (
     BaremetalKernel,
     BenchmarkKernel,
@@ -130,5 +126,5 @@ class AutotuneKernel(BaremetalKernel):
 
         with open(f"./perf_results.txt", "w") as f:
             f.write(pformat(self.perf_results))
-        # pickle.dump(self.perf_results, open(f"./perf_results.pkl", "wb"))
+        pickle.dump(self.perf_results, open(f"./perf_results.pkl", "wb"))
         plot_tuning_results(self.perf_results)

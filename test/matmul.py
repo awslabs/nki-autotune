@@ -19,10 +19,9 @@ def get_autotune_configs():
         list: A list of dictionaries, each containing configuration parameters for TILES_IN_BLOCK_M,
                 TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
     """
-    space = [int(2**x) for x in range(3, 5)]
-    TILES_IN_BLOCK_M_options = [2, 4, 8, 16]
-    TILES_IN_BLOCK_N_options = [2, 4, 8, 16]
-    TILES_IN_BLOCK_K_options = [2, 4, 8, 16]
+    TILES_IN_BLOCK_M_options = [1, 2, 4, 8, 16, 32]
+    TILES_IN_BLOCK_N_options = [1, 2, 4, 8, 16]
+    TILES_IN_BLOCK_K_options = [1, 2, 4, 8, 16, 32, 64]
     params = list(
         product(
             TILES_IN_BLOCK_M_options,
@@ -49,7 +48,7 @@ if __name__ == "__main__":
 
     tuner = AutotuneKernel.trace(
         nki_matmul_fully_optimized_,
-        iters=20,
+        iters=10,
         configs=get_autotune_configs(),
         show_compiler_tb=True,
     )

@@ -43,6 +43,6 @@ def plot_tuning_results(tuning_results):
     plt.savefig("latency_vs_timestamp.pdf", dpi=600)
 
 
-# if __name__ == "__main__":
-#     tuning_results = pickle.load(open("perf_results.pkl", "rb"))
-#     plot_tuning_results(tuning_results)
+if __name__ == "__main__":
+    tuning_results = pickle.load(open("perf_results.pkl", "rb"))
+    plot_tuning_results(tuning_results)
