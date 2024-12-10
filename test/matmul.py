@@ -20,9 +20,9 @@ def get_autotune_configs():
         list: A list of dictionaries, each containing configuration parameters for TILES_IN_BLOCK_M,
                 TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
     """
-    TILES_IN_BLOCK_M_options = [1, 2, 4, 8, 16, 32]
-    TILES_IN_BLOCK_N_options = [1, 2, 4, 8, 16]
-    TILES_IN_BLOCK_K_options = [1, 2, 4, 8, 16, 32, 64]
+    TILES_IN_BLOCK_M_options = [2, 4]
+    TILES_IN_BLOCK_N_options = [2, 4]
+    TILES_IN_BLOCK_K_options = [2, 4]
     params = list(
         product(
             TILES_IN_BLOCK_M_options,
