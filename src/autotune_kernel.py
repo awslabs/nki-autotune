@@ -7,16 +7,16 @@ from tqdm import tqdm
 from time import perf_counter
 from neuronxcc.starfish.penguin.targets.nki.TraceKernel import (
     BaremetalKernel,
-    BenchmarkKernel
+    BenchmarkKernel,
 )
 
 from src.visualize import plot_tuning_results
 
 
 class AutotuneKernel(BaremetalKernel):
-  """
-  Compile and benchmark NKI kernel on NeuronDevice.
-  """
+    """
+    Compile and benchmark NKI kernel on NeuronDevice.
+    """
 
     def __init__(
         self,
@@ -31,7 +31,7 @@ class AutotuneKernel(BaremetalKernel):
         self.iters = iters
         self.device_count = device_count
         self.perf_results = []
-        self.design_space = self._generate_design_space(configs)
+        self.design_space = configs
 
     def __call__(self, *args, **kwargs):
         total_configs = len(self.design_space)
@@ -74,23 +74,6 @@ class AutotuneKernel(BaremetalKernel):
             )
             latency = float("inf")
         return latency
-
-  def _generate_design_space(self, configs) -> List:
-    if isinstance(configs, dict):  # user use numerical method to define the design space
-      param_specs = configs
-
-      def generate_values(spec):
-        method, *args = spec
-        if method == "linear":
-          start, end, step = args
-          return range(start, end + 1, step)
-        elif method == "power_of_2":
-          start, end = args
-          return (2 ** i for i in range(start, end + 1))
-        elif method == "categorical":
-          return args[0]
-        else:
-          raise ValueError(f"Unknown method: {method}")
 
     def post_tuning(self):
         assert self.perf_results, "No configs tested"
