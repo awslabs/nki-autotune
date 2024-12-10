@@ -3,12 +3,10 @@
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
-import numpy as np
 from itertools import product
 import random
 
 from src.autotune_kernel import AutotuneKernel
-
 from src.kernels import nki_matmul_fully_optimized_
 
 
@@ -20,7 +18,7 @@ def get_autotune_configs():
         list: A list of dictionaries, each containing configuration parameters for TILES_IN_BLOCK_M,
                 TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
     """
-    TILES_IN_BLOCK_M_options = [2, 4]
+    TILES_IN_BLOCK_M_options = [4]
     TILES_IN_BLOCK_N_options = [2, 4]
     TILES_IN_BLOCK_K_options = [2, 4]
     params = list(
