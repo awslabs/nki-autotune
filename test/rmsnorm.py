@@ -8,7 +8,7 @@ import random
 import numpy as np
 
 from src.autotune_kernel import AutotuneKernel
-from src.kernels import stack_allocated_fused_rms_norm_qkv, allocated_fused_rms_norm_qkv
+from src.kernels import allocated_fused_rms_norm_qkv
 
 
 def get_autotune_configs():
