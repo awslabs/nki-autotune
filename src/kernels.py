@@ -4,6 +4,16 @@
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
 
+import logging
+import math
+from functools import partial
+from typing import Optional
+import neuronxcc.nki as nki
+import neuronxcc.nki.language as nl
+import neuronxcc.nki.isa as nisa
+import neuronxcc.nki.compiler as ncc
+from neuronxcc.nki.language import par_dim
+import numpy as np
 
 # This is taken from the open source NKI samples repo
 # https://github.com/aws-neuron/nki-samples/blob/main/src/tutorials/matrix_multiplication/matrix_multiplication_nki_kernels.py#L247
@@ -743,7 +753,7 @@ def allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, eps=1e-
     return out_tensor
 
 @nki.jit(kernel_return=True)
-def nki_rms_norm_(a_tensor, g_tensor, eps, PARTITION_DIM, FREE_DIM):
+def nki_rms_norm_(a_tensor, g_tensor, eps, PARTITION_DIM):
     # Calculate out_tensor = a_tensor/RMS(a_tensor) * g_tensor
     # Where RMS(a_tensor) = sqrt((1/N) * sum(a_tensor * a_tensor))
     # and N = a_tensor.shape[1]

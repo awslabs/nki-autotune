@@ -22,18 +22,15 @@ def get_autotune_configs():
                 TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
     """
     PARTITION_DIM_options = [int(2**x) for x in range(6, 9)]
-    FREE_DIM_options = [1000]
     params = list(
         product(
             PARTITION_DIM_options,
-            FREE_DIM_options,
         )
     )
     configs = []
-    for PARTITION_DIM, FREE_DIM in params:
+    for PARTITION_DIM in PARTITION_DIM_options:
         config = {
             "PARTITION_DIM": PARTITION_DIM,
-            "FREE_DIM": FREE_DIM,
         }
         configs.append(config)
     random.shuffle(configs)
@@ -60,7 +57,7 @@ if __name__ == "__main__":
     #output_np = np.matmul(rms_norm_hidden, weights)
     print(f"output_np = {output_np} {output_np.shape}")
 
-    output = nki_rms_norm_(hidden, weights, eps, 128, 1000)
+    output = nki_rms_norm_(hidden, weights, eps, 128)
     print(
         f"rms_norm_output_nki = {output} {output.shape}"
     )
