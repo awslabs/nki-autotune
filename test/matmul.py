@@ -6,7 +6,7 @@ import neuronxcc.nki.typing as nt
 from itertools import product
 import random
 
-from src.autotune_kernel import AutotuneKernel
+from src.autotune_kernel import Autotune
 from src.kernels import nki_matmul_fully_optimized_
 
 
@@ -43,12 +43,13 @@ def get_autotune_configs():
 if __name__ == "__main__":
     lhsT = nt.tensor[[8192, 4096], nl.bfloat16]
     rhs = nt.tensor[[8192, 8192], nl.bfloat16]
-    output = nt.tensor[[4096, 8192], nl.bfloat16]
 
-    tuner = AutotuneKernel.trace(
+    tuner = Autotune(
         nki_matmul_fully_optimized_,
-        iters=10,
         configs=get_autotune_configs(),
+        warmup=2,
+        iters=10,
+        max_workers=2,
         show_compiler_tb=True,
     )
-    tuner(lhsT, rhs, output)
+    tuner(lhsT, rhs)

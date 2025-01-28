@@ -18,10 +18,10 @@ import numpy as np
 
 # This is taken from the open source NKI samples repo
 # https://github.com/aws-neuron/nki-samples/blob/main/src/tutorials/matrix_multiplication/matrix_multiplication_nki_kernels.py#L247
+@nki.jit
 def nki_matmul_fully_optimized_(
     lhsT,
     rhs,
-    result,
     # Meta-parameters
     TILES_IN_BLOCK_M=16,
     TILES_IN_BLOCK_N=2,
@@ -45,6 +45,8 @@ def nki_matmul_fully_optimized_(
     K, M = lhsT.shape
     K_, N = rhs.shape
     assert K == K_, "lhsT and rhs must have the same contraction dimension"
+
+    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
     TILE_K = nl.tile_size.pmax  # 128
@@ -157,6 +159,7 @@ def nki_matmul_fully_optimized_(
                     ],
                     value=result_packed[i_res_packed.p, i_res_packed.x],
                 )
+    return result
 
 
 @nki.jit
