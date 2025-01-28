@@ -7,10 +7,10 @@ from itertools import product
 import torch
 import numpy as np
 
-from src.autotune_kernel import AutotuneKernel
+from src.autotune_kernel import Autotune
 from src.allocated_kernels import allocated_fused_rms_norm_qkv
 from neuronxcc.starfish.support.util import allclose
-from neuronxcc.nki import benchmark, baremetal, simulate_kernel
+from neuronxcc.nki import baremetal
 
 
 def get_autotune_configs():
@@ -62,11 +62,12 @@ if __name__ == "__main__":
 
     hidden = nt.tensor[[batch, seqlen, dim], nl.bfloat16]
     weights = nt.tensor[[dim, d_head], nl.bfloat16]
-    tuner = AutotuneKernel.trace(
+    tuner = Autotune(
         allocated_fused_rms_norm_qkv,
-        iters=10,
         configs=get_autotune_configs(),
-        max_workers=1,
+        warmup=2,
+        iters=10,
+        max_workers=2,
         show_compiler_tb=True,
     )
     tuner(hidden, weights)

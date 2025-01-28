@@ -2,43 +2,42 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import List
-import multiprocessing, warnings, dill, pickle
+import multiprocessing, warnings, dill, pickle, math
 
 multiprocessing.reduction.ForkingPickler.dumps = dill.dumps
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 from time import perf_counter
 from pprint import pformat
-from neuronxcc.starfish.penguin.targets.nki.NumpyKernel import BenchmarkKernel
-from neuronxcc.starfish.penguin.targets.nki.TraceKernel import decltensor
+import neuronxcc.nki as nki
 
 from src.visualize import plot_tuning_results
 
 
-class AutotuneKernel(BenchmarkKernel):
+class Autotune:
     """
     Compile and benchmark NKI kernel on NeuronDevice.
     """
 
     def __init__(
         self,
-        configs: List[dict] = None,
-        warmup=2,
-        iters=5,
-        max_workers=None,
+        func,
+        configs: List[dict],
+        warmup: int = 2,
+        iters: int = 5,
+        max_workers: int | None = None,
         benchmark_machines=None,
         **kwargs,
     ):
-        super().__init__(warmup=warmup, iters=iters, **kwargs)
-        self.design_space = configs
+        self.func = func
+        self.configs = configs
+        self.warmup = warmup
+        self.iters = iters
         self.max_workers = max_workers
-        self.perf_results = []
         self.benchmark_machines = (
             benchmark_machines if benchmark_machines is not None else ["localhost"]
         )  # a list of instance used for remote benchmark, if it is none, use the current machine itself
-
-    def create_parameter(self, ctx, shape, dtype, name="", annotation=None):
-        return decltensor(shape, dtype)
+        self.perf_results = []
 
     def __call__(self, *args, **kwargs):
         device_locks = {
@@ -46,40 +45,33 @@ class AutotuneKernel(BenchmarkKernel):
             for machine in self.benchmark_machines
         }
 
-        args = [
-            self._translate_param(ctx=None, o=a, name="", annotation=None) for a in args
-        ]
-        kwargs = {
-            k: self._translate_param(ctx=None, o=v, name=k, annotation=None)
-            for k, v in kwargs.items()
-        }
+        benchmark_machines = self.benchmark_machines * math.ceil(
+            len(self.configs) // len(self.benchmark_machines)
+        )
 
-        with ProcessPoolExecutor(max_workers=self.max_workers) as e:
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             all_instances = []
-            # TODO Evenly assign the benchmarking jobs to instances, can improve to dynamic allocation in the future
             for config, machine in zip(
-                self.design_space,
-                self.benchmark_machines
-                * (len(self.design_space) // len(self.benchmark_machines) + 1),
+                self.configs,
+                benchmark_machines,
             ):
-                future = e.submit(
+                future = executor.submit(
                     test_design,
                     func=self.func,
-                    grid=self.grid,
                     args=args,
                     kwargs=kwargs,
                     configs=config,
                     device_lock=device_locks[machine],
                     warmup=self.warmup,
                     iters=self.iters,
-                    device_count=self.device_count,
                     benchmark_machine=machine,
                 )
                 all_instances.append((future, config))
 
-            total_configs = len(all_instances)
             start = perf_counter()
-            for i in tqdm(range(total_configs), desc="Benchmarking configurations"):
+            for i in tqdm(
+                range(len(all_instances)), desc="Benchmarking configurations"
+            ):
                 future, config = all_instances[i]
                 try:
                     latency_us = future.result()
@@ -99,7 +91,6 @@ class AutotuneKernel(BenchmarkKernel):
                     }
                 )
 
-        self.grid = ()
         self._post_tuning()
         return None
 
@@ -124,25 +115,22 @@ class AutotuneKernel(BenchmarkKernel):
 
 def test_design(
     func,
-    grid,
     args,
     kwargs,
     configs,
     device_lock,
     warmup,
     iters,
-    device_count,
     benchmark_machine=None,
 ):
-    benchmark = BenchmarkKernel(
-        func=func,
-        grid=grid,
+    print(f"func = {func}")
+    bench_func = nki.benchmark(
         warmup=warmup,
         iters=iters,
-        device_count=device_count,
         device_lock=device_lock,
         benchmark_machine=benchmark_machine,
-        kernel_return=True,
-    )
-    benchmark(*args, **configs, **kwargs)
-    return benchmark.benchmark_result.nc_latency.get_latency_percentile(99)
+    )(func)
+    bench_func(*args, **configs, **kwargs)
+    latency_res = bench_func.benchmark_result.nc_latency
+    p99 = latency_res.get_latency_percentile(99)
+    return p99
