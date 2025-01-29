@@ -9,8 +9,8 @@ from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 from time import perf_counter
 from pprint import pformat
-import neuronxcc.nki as nki
 
+from src.benchmark import test_design
 from src.visualize import plot_tuning_results
 
 
@@ -111,26 +111,3 @@ class Autotune:
             )
         pickle.dump(self.perf_results, open(f"./perf_results.pkl", "wb"))
         plot_tuning_results(self.perf_results)
-
-
-def test_design(
-    func,
-    args,
-    kwargs,
-    configs,
-    device_lock,
-    warmup,
-    iters,
-    benchmark_machine=None,
-):
-    print(f"func = {func}")
-    bench_func = nki.benchmark(
-        warmup=warmup,
-        iters=iters,
-        device_lock=device_lock,
-        benchmark_machine=benchmark_machine,
-    )(func)
-    bench_func(*args, **configs, **kwargs)
-    latency_res = bench_func.benchmark_result.nc_latency
-    p99 = latency_res.get_latency_percentile(99)
-    return p99
