@@ -91,10 +91,10 @@ class Autotune:
                     }
                 )
 
-        self._post_tuning()
+        self._post_tuning(*args)
         return None
 
-    def _post_tuning(self):
+    def _post_tuning(self, *args):
         assert self.perf_results, "No configs tested"
         best_result = min(
             self.perf_results,
@@ -106,6 +106,7 @@ class Autotune:
         # dump the performance logs
         with open(f"./perf_results.log", "w") as f:
             f.write(pformat(self.perf_results))
+            f.write(f"\nAutotune for inputs {[arg.tensor_shape for arg in args]}")
             f.write(
                 f"\nThe best latency is {min_latency} us for the config {min_config}"
             )
