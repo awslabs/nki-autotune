@@ -30,7 +30,7 @@ def update_base_addr(base_addr, tensor, advance: bool):
         print(f"Allocate buf @ {base_addr} -> {next_base_addr}")
     else:
         next_base_addr = base_addr - buf_size
-        print(f"Restore buf @ {base_addr} -> {next_base_addr}")
+        # print(f"Restore buf @ {base_addr} -> {next_base_addr}")
     return next_base_addr
 
 
@@ -194,15 +194,18 @@ def allocated_fused_rms_norm_qkv(
                         square_sum[...],
                         dtype=weights.dtype,
                     )
-                    for j in nl.affine_range(4):
+                    TILES_IN_BLOCK = fmax // pmax
+                    for j in nl.affine_range(TILES_IN_BLOCK):
                         transpose_res_psum[m, i_lhs.p, j * pmax + i_lhs.x] = (
                             nisa.nc_matmul(
-                                out_tile[i_lhs.p, (m * 4 + j) * pmax + i_lhs.x],
+                                out_tile[
+                                    i_lhs.p, (m * TILES_IN_BLOCK + j) * pmax + i_lhs.x
+                                ],
                                 identity_tensor[...],
                                 is_transpose=True,
                             )
                         )
-                    out_tile[i_rhs.p, m * 4 * pmax + i_rhs.x] = nl.copy(
+                    out_tile[i_rhs.p, m * TILES_IN_BLOCK * pmax + i_rhs.x] = nl.copy(
                         transpose_res_psum[m], dtype=hidden.dtype
                     )
 
@@ -240,4 +243,120 @@ def allocated_fused_rms_norm_qkv(
         sbuf_base_addr = update_base_addr(sbuf_base_addr, weights_buffer, False)
     sbuf_base_addr = update_base_addr(sbuf_base_addr, bias_placeholder, False)
     sbuf_base_addr = update_base_addr(sbuf_base_addr, identity_tensor, False)
+    return out_tensor
+
+
+@nki.jit
+def allocated_rms_norm(hidden, hidden_buffer_degree, norm_dtype=nl.float32, eps=1e-6):
+    """
+    Allocated kernel that computes RMSNorm(hidden). This kernel is designed to only handle fp16/bf16 tensor types.
+    Internally, normalizations are cast to fp32 to avoid NaN errors.
+
+    Args:
+        hidden (_type_): Input tensor of the attention block in BSH layout
+        norm_dtype (_type_, optional): Data type for RMS norm, should be f32 to avoid NaN. Defaults to nl.float32.
+        eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
+    """
+    # Hidden should be in BSH layout.
+    batch, batchless_shape = hidden.shape[0], hidden.shape[1:]
+    seqlen, dim = batchless_shape
+
+    assert dim <= 8192 and dim & 128 == 0, "Unsupported hidden dimension"
+
+    out_tensor = nl.ndarray(
+        (batch, seqlen, dim), dtype=hidden.dtype, buffer=nl.shared_hbm
+    )
+
+    pmax = nl.tile_size.pmax  # 128
+    ix, iy = nl.mgrid[0:pmax, 0:dim]
+    NUM_TILES = math.ceil(seqlen / pmax)
+    TILES_INT = math.ceil(NUM_TILES / hidden_buffer_degree)
+    scale = 1 / dim
+    sbuf_base_addr = 0
+
+    bias_placeholder = nl.ndarray(
+        (par_dim(pmax), 1),
+        dtype=np.float32,
+        buffer=ncc.sbuf.mod_alloc(base_addr=sbuf_base_addr),
+    )
+    sbuf_base_addr = update_base_addr(sbuf_base_addr, bias_placeholder, True)
+    bias_placeholder[...] = 0
+
+    for b in nl.affine_range(batch):
+        for i in nl.affine_range(TILES_INT):
+            # Double buffer the input tensor
+            in_bufs = nl.ndarray(
+                (hidden_buffer_degree, par_dim(pmax), dim),
+                dtype=hidden.dtype,
+                buffer=ncc.sbuf.mod_alloc(
+                    base_addr=sbuf_base_addr, num_free_tiles=(hidden_buffer_degree,)
+                ),
+            )
+            sbuf_base_addr = update_base_addr(sbuf_base_addr, in_bufs, True)
+            for i_interleave_grp in nl.affine_range(hidden_buffer_degree):
+                in_bufs[i_interleave_grp] = nl.load(
+                    hidden[
+                        b, (hidden_buffer_degree * i + i_interleave_grp) * pmax + ix, iy
+                    ],
+                    mask=(hidden_buffer_degree * i + i_interleave_grp) * pmax + ix
+                    < seqlen,
+                )
+                act = nl.ndarray(
+                    (par_dim(pmax), dim),
+                    dtype=norm_dtype,
+                    buffer=ncc.sbuf.mod_alloc(base_addr=sbuf_base_addr),
+                )
+                sbuf_base_addr = update_base_addr(sbuf_base_addr, act, True)
+
+                # Write the RMS and RMS Reciprocal tensors back out here, in-place
+                square_sum = nl.ndarray(
+                    (par_dim(pmax), 1),
+                    dtype=norm_dtype,
+                    buffer=ncc.sbuf.mod_alloc(base_addr=sbuf_base_addr),
+                )
+                sbuf_base_addr = update_base_addr(sbuf_base_addr, square_sum, True)
+
+                act[...] = nisa.activation_reduce(
+                    op=nl.square,
+                    data=in_bufs[i_interleave_grp],
+                    reduce_op=np.add,
+                    reduce_res=square_sum[...],
+                    bias=bias_placeholder[...],
+                )
+                square_sum[...] = nisa.tensor_scalar(
+                    square_sum[...], np.multiply, scale, op1=np.add, operand1=eps
+                )
+                square_sum[...] = nisa.activation(
+                    op=nl.rsqrt, data=square_sum[...], bias=bias_placeholder[...]
+                )
+
+                # Apply normalization
+                output_tile = nl.ndarray(
+                    (par_dim(pmax), dim),
+                    dtype=hidden.dtype,
+                    buffer=ncc.sbuf.mod_alloc(base_addr=sbuf_base_addr),
+                )
+                sbuf_base_addr = update_base_addr(sbuf_base_addr, output_tile, True)
+
+                output_tile[...] = nl.multiply(
+                    in_bufs[i_interleave_grp],
+                    square_sum[...],
+                    dtype=hidden.dtype,
+                )
+                # Store result
+                nl.store(
+                    out_tensor[
+                        b,
+                        (hidden_buffer_degree * i + i_interleave_grp) * pmax + ix,
+                        iy,
+                    ],
+                    value=output_tile,
+                    mask=(hidden_buffer_degree * i + i_interleave_grp) * pmax + ix
+                    < seqlen,
+                )
+                sbuf_base_addr = update_base_addr(sbuf_base_addr, output_tile, False)
+                sbuf_base_addr = update_base_addr(sbuf_base_addr, square_sum, False)
+                sbuf_base_addr = update_base_addr(sbuf_base_addr, act, False)
+            sbuf_base_addr = update_base_addr(sbuf_base_addr, in_bufs, False)
+    sbuf_base_addr = update_base_addr(sbuf_base_addr, bias_placeholder, False)
     return out_tensor

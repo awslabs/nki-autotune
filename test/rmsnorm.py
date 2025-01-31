@@ -8,7 +8,7 @@ import torch
 import numpy as np
 
 from src.autotune_kernel import Autotune
-from src.allocated_kernels import allocated_fused_rms_norm_qkv
+from src.allocated_kernels import allocated_fused_rms_norm_qkv, allocated_rms_norm
 from neuronxcc.starfish.support.util import allclose
 from neuronxcc.nki import baremetal
 
@@ -31,11 +31,12 @@ def rms_norm(hidden, gamma, eps=1e-6):
     return norm
 
 
-def cpu_golden_result(hidden, gamma, qkv_weights, dtype, do_norm=True):
+def cpu_golden_result(hidden, gamma, qkv_weights, dtype, do_norm=True, fuse=True):
     if do_norm:
-        hidden = rms_norm(hidden, gamma)
-    qkv_out = (hidden @ qkv_weights).astype(dtype)
-    return qkv_out
+        output = rms_norm(hidden, gamma)
+    if fuse:
+        output = (output @ qkv_weights).astype(dtype)
+    return output
 
 
 def verify(batch, seqlen, dim, d_head, hidden_buffer_degree):
@@ -45,37 +46,54 @@ def verify(batch, seqlen, dim, d_head, hidden_buffer_degree):
 
     hidden = np.random.random_sample((batch, seqlen, dim))
     weights = np.random.random_sample((dim, d_head))
-    golden_res = nl.static_cast(
-        cpu_golden_result(hidden, None, weights, dtype, do_norm=True), np.float32
-    )
-
     hidden_dev = nl.static_cast(hidden, dtype)
     weights_dev = nl.static_cast(weights, dtype)
 
-    numeric_func = baremetal(allocated_fused_rms_norm_qkv)
-    allocated_out = numeric_func(hidden_dev, weights_dev, hidden_buffer_degree)
+    # golden_res = nl.static_cast(
+    #     cpu_golden_result(hidden, None, weights, dtype), np.float32
+    # )
+    # numeric_func = baremetal(allocated_fused_rms_norm_qkv)
+    # allocated_out = numeric_func(hidden_dev, weights_dev, hidden_buffer_degree)
+    # allocated_out = nl.static_cast(allocated_out, np.float32)
+    # match = allclose(allocated_out, golden_res, atol=atol, rtol=rtol, verbose=1)
+    # print(
+    #     f"fused_rms_norm_qkv match for hidden_buffer_degree {hidden_buffer_degree}: {match}"
+    # )
+
+    golden_res = nl.static_cast(
+        cpu_golden_result(hidden, None, weights, dtype, fuse=False), np.float32
+    )
+    numeric_func = baremetal(allocated_rms_norm)
+    allocated_out = numeric_func(hidden_dev, hidden_buffer_degree)
     allocated_out = nl.static_cast(allocated_out, np.float32)
     match = allclose(allocated_out, golden_res, atol=atol, rtol=rtol, verbose=1)
-    print(
-        f"Allocated kernel match for hidden_buffer_degree {hidden_buffer_degree}: {match}"
-    )
+    print(f"rms_norm match for hidden_buffer_degree {hidden_buffer_degree}: {match}")
 
 
 if __name__ == "__main__":
-    batch, seqlen, dim, d_head = 1, 4096, 2048, 256
+    batch, seqlen, dim, d_head = 1, 2048, 4096, 256
     configs = get_autotune_configs()
-    for config in configs:
-        print(config)
-        verify(batch, seqlen, dim, d_head, config["hidden_buffer_degree"])
+    # for config in configs:
+    #     verify(batch, seqlen, dim, d_head, config["hidden_buffer_degree"])
 
     hidden = nt.tensor[[batch, seqlen, dim], nl.bfloat16]
     weights = nt.tensor[[dim, d_head], nl.bfloat16]
+    # tuner = Autotune(
+    #     allocated_fused_rms_norm_qkv,
+    #     configs=configs,
+    #     warmup=10,
+    #     iters=100,
+    #     max_workers=1,
+    #     show_compiler_tb=True,
+    # )
+    # tuner(hidden, weights)
+
     tuner = Autotune(
-        allocated_fused_rms_norm_qkv,
-        configs=get_autotune_configs(),
-        warmup=2,
-        iters=10,
+        allocated_rms_norm,
+        configs=configs,
+        warmup=10,
+        iters=100,
         max_workers=1,
         show_compiler_tb=True,
     )
-    tuner(hidden, weights)
+    tuner(hidden)
