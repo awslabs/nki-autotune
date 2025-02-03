@@ -34,6 +34,7 @@ def update_base_addr(base_addr, tensor, advance: bool):
     return next_base_addr
 
 
+@nki.compiler.skip_middle_end_transformations
 @nki.jit
 def allocated_fused_rms_norm_qkv(
     hidden, weights, hidden_buffer_degree, norm_dtype=nl.float32, eps=1e-6
@@ -246,6 +247,7 @@ def allocated_fused_rms_norm_qkv(
     return out_tensor
 
 
+@nki.compiler.skip_middle_end_transformations
 @nki.jit
 def allocated_rms_norm(hidden, hidden_buffer_degree, norm_dtype=nl.float32, eps=1e-6):
     """
@@ -284,7 +286,7 @@ def allocated_rms_norm(hidden, hidden_buffer_degree, norm_dtype=nl.float32, eps=
 
     for b in nl.affine_range(batch):
         for i in nl.affine_range(TILES_INT):
-            # Double buffer the input tensor
+            # Buffer the input tensor
             in_bufs = nl.ndarray(
                 (hidden_buffer_degree, par_dim(pmax), dim),
                 dtype=hidden.dtype,

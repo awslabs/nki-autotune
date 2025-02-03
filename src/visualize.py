@@ -15,7 +15,7 @@ def simultaneous_sort(primary, secondary):
     return primary, secondary
 
 
-def plot_tuning_results(tuning_results):
+def plot_tuning_results(tuning_results, cache_dest: str):
     timestamps = [x["time_elapsed"] for x in tuning_results]
     latencies = [x["latency"] for x in tuning_results]
     timestamps, latencies = simultaneous_sort(timestamps, latencies)
@@ -40,9 +40,4 @@ def plot_tuning_results(tuning_results):
 
     # Adjust the layout and display the plot
     fig.tight_layout()
-    plt.savefig("latency_vs_timestamp.pdf", dpi=600)
-
-
-if __name__ == "__main__":
-    tuning_results = pickle.load(open("perf_results.pkl", "rb"))
-    plot_tuning_results(tuning_results)
+    plt.savefig(f"{cache_dest}.pdf", dpi=600)
