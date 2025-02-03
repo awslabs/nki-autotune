@@ -14,10 +14,10 @@ from neuronxcc.nki import baremetal
 
 def get_autotune_configs():
     configs = [
-        {"in_buffer_degree": 1},
-        {"in_buffer_degree": 2},
-        {"in_buffer_degree": 4},
-        {"in_buffer_degree": 8},
+        {"hidden_buffer_degree": 1},
+        {"hidden_buffer_degree": 2},
+        {"hidden_buffer_degree": 4},
+        {"hidden_buffer_degree": 8},
     ]
     return configs
 
@@ -33,7 +33,7 @@ def cpu_golden_result(hidden, dtype, gamma=None, qkv_weights=None, eps=1e-6):
     return output
 
 
-def verify(batch, seqlen, dim, d_head, in_buffer_degree):
+def verify(batch, seqlen, dim, d_head, hidden_buffer_degree):
     dtype = np.float16
     atol = 1e-2
     rtol = 1e-3
@@ -49,36 +49,35 @@ def verify(batch, seqlen, dim, d_head, in_buffer_degree):
         cpu_golden_result(hidden, dtype, qkv_weights=qkv_weights), np.float32
     )
     numeric_func = baremetal(allocated_fused_rms_norm_qkv)
-    allocated_out = numeric_func(hidden_dev, qkv_weights_dev, in_buffer_degree)
+    allocated_out = numeric_func(hidden_dev, qkv_weights_dev, hidden_buffer_degree)
     allocated_out = nl.static_cast(allocated_out, np.float32)
     match = allclose(allocated_out, golden_res, atol=atol, rtol=rtol, verbose=1)
-    print(
-        f"allocated_fused_rms_norm_qkv match for in_buffer_degree {in_buffer_degree}: {match}"
-    )
+    assert (
+        match
+    ), f"allocated_fused_rms_norm_qkv match for hidden_buffer_degree {hidden_buffer_degree}: {match}"
 
     golden_res = nl.static_cast(cpu_golden_result(hidden, dtype), np.float32)
     numeric_func = baremetal(allocated_rms_norm)
-    allocated_out = numeric_func(hidden_dev, in_buffer_degree)
+    allocated_out = numeric_func(hidden_dev, hidden_buffer_degree)
     allocated_out = nl.static_cast(allocated_out, np.float32)
     match = allclose(allocated_out, golden_res, atol=atol, rtol=rtol, verbose=1)
-    print(f"allocated_rms_norm match for in_buffer_degree {in_buffer_degree}: {match}")
+    assert (
+        match
+    ), f"allocated_rms_norm match for hidden_buffer_degree {hidden_buffer_degree}: {match}"
 
-    golden_res = nl.static_cast(
-        cpu_golden_result(hidden[0], dtype, gamma=gamma), np.float32
-    )
+    golden_res = nl.static_cast(cpu_golden_result(hidden, dtype), np.float32)
     numeric_func = baremetal(nki_rmsnorm_kernel)
-    allocated_out = numeric_func(hidden_dev[0], gamma_dev)
-    allocated_out = nl.static_cast(allocated_out, np.float32)
-    match = allclose(allocated_out, golden_res, atol=atol, rtol=rtol, verbose=1)
-    print(f"nki_rmsnorm_kernel match: {match} {golden_res.shape}")
+    nki_out = numeric_func(hidden_dev, hidden_buffer_degree)
+    nki_out = nl.static_cast(nki_out, np.float32)
+    match = allclose(nki_out, golden_res, atol=atol, rtol=rtol, verbose=1)
+    assert match, f"nki_rmsnorm_kernel match: {match} {golden_res.shape}"
 
 
 if __name__ == "__main__":
     batch, seqlen, dim, d_head = 1, 2048, 4096, 512
     configs = get_autotune_configs()
     for config in configs:
-        verify(batch, seqlen, dim, d_head, config["in_buffer_degree"])
-        break
+        verify(batch, seqlen, dim, d_head, config["hidden_buffer_degree"])
     hidden = nt.tensor[[batch, seqlen, dim], nl.bfloat16]
     weights = nt.tensor[[dim, d_head], nl.bfloat16]
 
@@ -93,13 +92,24 @@ if __name__ == "__main__":
     # )
     # tuner(hidden, weights)
 
-    # tuner = Autotune(
-    #     allocated_rms_norm,
-    #     configs=configs,
-    #     warmup=10,
-    #     iters=100,
-    #     max_workers=1,
-    #     show_compiler_tb=True,
-    #     cache_dir="private",
-    # )
-    # tuner(hidden)
+    tuner = Autotune(
+        allocated_rms_norm,
+        configs=configs,
+        warmup=10,
+        iters=100,
+        max_workers=1,
+        show_compiler_tb=True,
+        cache_dir="private",
+    )
+    tuner(hidden)
+
+    tuner = Autotune(
+        nki_rmsnorm_kernel,
+        configs=configs,
+        warmup=10,
+        iters=100,
+        max_workers=1,
+        show_compiler_tb=True,
+        cache_dir="private",
+    )
+    tuner(hidden)

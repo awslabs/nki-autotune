@@ -27,7 +27,7 @@ def update_base_addr(base_addr, tensor, advance: bool):
         )
     if advance:
         next_base_addr = base_addr + buf_size
-        print(f"Allocate buf @ {base_addr} -> {next_base_addr}")
+        # print(f"Allocate buf @ {base_addr} -> {next_base_addr}")
     else:
         next_base_addr = base_addr - buf_size
         # print(f"Restore buf @ {base_addr} -> {next_base_addr}")
@@ -70,7 +70,6 @@ def allocated_fused_rms_norm_qkv(
     M = math.ceil(dim / pmax)
     NUM_TRANSP_TILES = math.ceil(dim / fmax)
     NUM_TILES = math.ceil(seqlen / pmax)
-    print(f"hidden_buffer_degree = {hidden_buffer_degree}")
     TILES_INT = math.ceil(NUM_TILES / hidden_buffer_degree)
     scale = 1 / dim
     sbuf_base_addr = 0

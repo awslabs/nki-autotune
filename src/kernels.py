@@ -163,62 +163,53 @@ def nki_matmul_fully_optimized_(
 
 
 @nki.jit
-def nki_rmsnorm_kernel(a_tensor, g_tensor):
-    # Calculate out_tensor = a_tensor/RMS(a_tensor) * g_tensor
-    # Where RMS(a_tensor) = sqrt((1/N) * sum(a_tensor * a_tensor))
-    # and N = a_tensor.shape[1]
-    # Reduction (mean) is performed in the free (2nd) dimension
-    out_tensor = nl.ndarray(a_tensor.shape, dtype=a_tensor.dtype, buffer=nl.shared_hbm)
+def nki_rmsnorm_kernel(hidden, hidden_buffer_degree):
+    pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
 
     # Make sure shapes match
-    assert (
-        a_tensor.shape[1] == g_tensor.shape[0]
-    ), f"a_tensor {a_tensor.shape} g_tensor {g_tensor.shape}"
+    batch = hidden.shape[0]
+    seqlen = hidden.shape[1]
+    dim = hidden.shape[2]
+
+    out_tensor = nl.ndarray(hidden.shape, dtype=hidden.dtype, buffer=nl.shared_hbm)
 
     # Generate tensor indices to index input tensor
-    ix = nl.arange(128)[:, None]
-    iw = nl.arange(1)[:, None]
-    iy = nl.arange(a_tensor.shape[1])[None, :]
+    ix = nl.arange(pmax)[:, None]
+    iy = nl.arange(dim)[None, :]
 
-    num_rows = a_tensor.shape[0]
+    # Process each batch
+    for b in nl.affine_range(batch):
+        # Process pmax (128) rows at a time due to 128-partition tile size limitation
+        # Since we're not reducing across the first dimension
+        # Tiles can be processed independently
+        for i in nl.affine_range(math.ceil(seqlen / pmax)):
 
-    # Load RMSNorm weight once, reused by rows/tiles of a_tensor
-    g_tile = nl.load(g_tensor.reshape((1, g_tensor.shape[0]))[iw, iy])
+            # Load input data from external memory to on-chip memory
+            a_tile = nl.load(
+                hidden[b, i * pmax + ix, iy], mask=(i * pmax + ix < seqlen)
+            )
 
-    # Process 128 rows at a time due to 128-partition tile size limitation
-    # Since we're not reducing across the first dimension
-    # Tiles can be processed independently
-    for i in nl.affine_range(math.ceil(a_tensor.shape[0] / 128)):
+            # Compute element-wise square of hidden
+            in_square = nl.square(a_tile)
 
-        # Load input data from external memory to on-chip memory
-        a_tile = nl.load(a_tensor[i * 128 + ix, iy], mask=(i * 128 + ix < num_rows))
+            # Calculate sum of squared elements, along last dimension
+            square_sum = nl.sum(in_square, axis=[1])
 
-        # Compute element-wise square of a_tensor
-        in_square = nl.square(a_tile)
+            # Scale and get a reciprocal
+            mean = square_sum / dim
 
-        # Calculate sum of squared elements, along last dimension
-        square_sum = nl.sum(in_square, axis=[1])
+            # Take square root of mean and then reciprocal with
+            # rsqrt API (one ISA instruction)
+            rms_reciprocal = nl.rsqrt(mean)
 
-        # Scale and get a reciprocal
-        mean = square_sum / a_tensor.shape[1]
+            # Scale the input tensor
+            out_tile = nl.multiply(a_tile, rms_reciprocal)
 
-        # Take square root of mean and then reciprocal with
-        # rsqrt API (one ISA instruction)
-        rms_reciprocal = nl.rsqrt(mean)
-
-        # Scale the input tensor
-        out_tile = nl.multiply(a_tile, rms_reciprocal)
-
-        # Broadcast weight along first axis to match tensor shape
-        # num_rows_active = min(num_rows - i * 128, 128)
-        g_bcast = g_tile.broadcast_to((128, g_tensor.shape[0]))
-
-        # Multiply with the RMSNorm weight
-        out_tile[...] = nl.multiply(out_tile, g_bcast, mask=(i * 128 + ix < num_rows))
-
-        # store the addition results back to external memory (out_tensor)
-        nl.store(
-            out_tensor[i * 128 + ix, iy], value=out_tile, mask=(i * 128 + ix < num_rows)
-        )
+            # store the addition results back to external memory (out_tensor)
+            nl.store(
+                out_tensor[b, i * pmax + ix, iy],
+                value=out_tile,
+                mask=(i * pmax + ix < seqlen),
+            )
 
     return out_tensor
