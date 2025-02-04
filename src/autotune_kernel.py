@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import List
-import multiprocessing, warnings, dill, pickle, math
+import multiprocessing, warnings, dill, pickle, math, os, shutil
 
 multiprocessing.reduction.ForkingPickler.dumps = dill.dumps
 from concurrent.futures import ProcessPoolExecutor
@@ -37,8 +37,17 @@ class Autotune:
         self.max_workers = max_workers
         self.benchmark_machines = (
             benchmark_machines if benchmark_machines is not None else ["localhost"]
-        )  # a list of instance used for remote benchmark, if it is none, use the current machine itself
+        )
         self.perf_results = []
+
+        if "cache_dir" in self.kwargs:
+            cache_dir = self.kwargs["cache_dir"]
+        else:
+            cache_dir = "."
+        self.cache_dir = f"{cache_dir}/{self.func.func_name}"
+        if os.path.exists(self.cache_dir):
+            shutil.rmtree(self.cache_dir)
+        os.makedirs(self.cache_dir)
 
     def __call__(self, *args, **kwargs):
         device_locks = {
@@ -65,6 +74,7 @@ class Autotune:
                     device_lock=device_locks[machine],
                     warmup=self.warmup,
                     iters=self.iters,
+                    cache_dir=self.cache_dir,
                     benchmark_machine=machine,
                 )
                 all_instances.append((future, config))
@@ -105,16 +115,11 @@ class Autotune:
         min_config = best_result["configs"]
 
         # Dump the performance logs
-        if "cache_dir" in self.kwargs:
-            cache_dir = self.kwargs["cache_dir"]
-        else:
-            cache_dir = "."
-        cache_dest = f"{cache_dir}/{self.func.func_name}"
-        with open(f"{cache_dest}.log", "w") as f:
+        with open(f"{self.cache_dir}/tune.log", "w") as f:
             f.write(pformat(self.perf_results))
             f.write(f"\nAutotune for inputs {[arg.tensor_shape for arg in args]}")
             f.write(
                 f"\nThe best latency is {min_latency} us for the config {min_config}"
             )
-        pickle.dump(self.perf_results, open(f"{cache_dest}.pkl", "wb"))
-        plot_tuning_results(self.perf_results, cache_dest)
+        pickle.dump(self.perf_results, open(f"{self.cache_dir}/tune.pkl", "wb"))
+        plot_tuning_results(self.perf_results, self.cache_dir)

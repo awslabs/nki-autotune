@@ -163,7 +163,7 @@ def nki_matmul_fully_optimized_(
 
 
 @nki.jit
-def nki_rmsnorm_kernel(hidden, hidden_buffer_degree):
+def nki_rmsnorm_kernel(hidden):
     pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
 
     # Make sure shapes match
