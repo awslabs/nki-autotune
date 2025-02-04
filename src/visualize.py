@@ -15,7 +15,7 @@ def simultaneous_sort(primary, secondary):
     return primary, secondary
 
 
-def plot_tuning_results(tuning_results, cache_dest: str):
+def plot_tuning_results(tuning_results, fig_dir: str):
     timestamps = [x["time_elapsed"] for x in tuning_results]
     latencies = [x["latency"] for x in tuning_results]
     timestamps, latencies = simultaneous_sort(timestamps, latencies)
@@ -40,4 +40,4 @@ def plot_tuning_results(tuning_results, cache_dest: str):
 
     # Adjust the layout and display the plot
     fig.tight_layout()
-    plt.savefig(f"{cache_dest}.pdf", dpi=600)
+    plt.savefig(f"{fig_dir}/tradeoff.pdf", dpi=600)

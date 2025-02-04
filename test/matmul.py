@@ -50,6 +50,5 @@ if __name__ == "__main__":
         warmup=2,
         iters=10,
         max_workers=2,
-        show_compiler_tb=True,
     )
     tuner(lhsT, rhs)

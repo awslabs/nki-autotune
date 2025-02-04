@@ -106,9 +106,7 @@ def main():
 
     print(f"\nRunning vector add with vector size = {args.size}")
 
-    tuner = AutotuneKernel.trace(
-        vector_add_stream_auto, configs=get_autotune_configs(), show_compiler_tb=True
-    )
+    tuner = AutotuneKernel.trace(vector_add_stream_auto, configs=get_autotune_configs())
     # Allocate space for the reshaped output vector in HBM
     output = nt.tensor[[a.shape[0], 1], a.dtype]
     tuner(a, b, output)

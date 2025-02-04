@@ -6,6 +6,7 @@ import neuronxcc.nki.typing as nt
 import numpy as np
 
 from src.autotune_kernel import Autotune
+from src.benchmark import test_kernel
 from src.allocated_kernels import allocated_fused_rms_norm_qkv, allocated_rms_norm
 from src.kernels import nki_rmsnorm_kernel
 from neuronxcc.starfish.support.util import allclose
@@ -67,7 +68,7 @@ def verify(batch, seqlen, dim, d_head, hidden_buffer_degree):
 
     golden_res = nl.static_cast(cpu_golden_result(hidden, dtype), np.float32)
     numeric_func = baremetal(nki_rmsnorm_kernel)
-    nki_out = numeric_func(hidden_dev, hidden_buffer_degree)
+    nki_out = numeric_func(hidden_dev)
     nki_out = nl.static_cast(nki_out, np.float32)
     match = allclose(nki_out, golden_res, atol=atol, rtol=rtol, verbose=1)
     assert match, f"nki_rmsnorm_kernel match: {match} {golden_res.shape}"
@@ -87,7 +88,6 @@ if __name__ == "__main__":
     #     warmup=10,
     #     iters=100,
     #     max_workers=1,
-    #     show_compiler_tb=True,
     #     cache_dir="private",
     # )
     # tuner(hidden, weights)
@@ -98,18 +98,9 @@ if __name__ == "__main__":
         warmup=10,
         iters=100,
         max_workers=1,
-        show_compiler_tb=True,
         cache_dir="private",
     )
     tuner(hidden)
 
-    tuner = Autotune(
-        nki_rmsnorm_kernel,
-        configs=configs,
-        warmup=10,
-        iters=100,
-        max_workers=1,
-        show_compiler_tb=True,
-        cache_dir="private",
-    )
-    tuner(hidden)
+    p99 = test_kernel(nki_rmsnorm_kernel, [hidden], warmup=10, iters=100)
+    print(f"nki_rmsnorm_kernel p99 = {p99} us.")
