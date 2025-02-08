@@ -35,7 +35,18 @@ def test_kernel(
     args,
     warmup,
     iters,
-):
+) -> float:
+    """Profile the NKI kernel P99 latency
+
+    Args:
+        func (_type_): NKI kernel
+        args (_type_): kernel inputs
+        warmup (_type_): number of warmup runs
+        iters (_type_): number of trials
+
+    Returns:
+        float: P99 latency
+    """
     bench_func = nki.benchmark(
         warmup=warmup,
         iters=iters,

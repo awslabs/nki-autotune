@@ -7,7 +7,7 @@ from itertools import product
 import random
 
 from src.autotune_kernel import Autotune
-from src.kernels import nki_matmul_fully_optimized_
+from src.matmul import nki_matmul_fully_optimized_
 
 
 def get_autotune_configs():
