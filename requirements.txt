@@ -1,2 +1,4 @@
 matplotlib
 dill
+pytest
+black
