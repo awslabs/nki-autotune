@@ -5,7 +5,7 @@ import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
 from src.allocation import update_base_addr
 
-import logging, math
+import math
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
