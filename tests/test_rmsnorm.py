@@ -1,7 +1,10 @@
 import pytest
 import numpy as np
 
-from src.weighted_rmsnorm import weighted_rmsnorm, allocated_weighted_rmsnorm
+from src.weighted_rmsnorm import (
+    weighted_rmsnorm,
+    allocated_weighted_rmsnorm,
+)
 from src.fused_rmsnorm_linear import allocated_fused_rms_norm_qkv
 
 import neuronxcc.nki.language as nl
@@ -9,9 +12,15 @@ from neuronxcc.starfish.support.util import allclose
 from neuronxcc.nki import baremetal
 
 
-def cpu_golden_result(hidden, gamma, qkv_weights, eps):
-    rms = np.sqrt(np.mean(np.square(hidden), axis=-1, keepdims=True))
-    output = hidden * np.reciprocal(rms + eps)
+def silu(x):
+    return x / (1 + np.exp(-x))
+
+
+def cpu_golden_result(hidden, gate, gamma, qkv_weights, eps):
+    if gate is not None:
+        hidden = hidden * silu(gate.astype(np.float32))
+    rms = np.sqrt(np.mean(np.square(hidden), axis=-1, keepdims=True) + eps)
+    output = hidden * np.reciprocal(rms)
     if gamma is not None:
         output *= gamma
     if qkv_weights is not None:
@@ -31,7 +40,7 @@ def test_weighted_rmsnorm(batch, seqlen, dim, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     gamma = np.random.random_sample((dim))
     golden_output = nl.static_cast(
-        cpu_golden_result(hidden, gamma, None, eps), np.float32
+        cpu_golden_result(hidden, None, gamma, None, eps), np.float32
     )
 
     data_type = np.float16
@@ -59,7 +68,7 @@ def test_allocated_weighted_rmsnorm(batch, seqlen, dim, buffer_degree, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     gamma = np.random.random_sample((dim))
     golden_output = nl.static_cast(
-        cpu_golden_result(hidden, gamma, None, eps), np.float32
+        cpu_golden_result(hidden, None, gamma, None, eps), np.float32
     )
 
     data_type = np.float16
@@ -87,7 +96,7 @@ def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
     hidden = np.random.random_sample((batch, seqlen, dim))
     qkv_weights = np.random.random_sample((dim, d_head))
     golden_output = nl.static_cast(
-        cpu_golden_result(hidden, None, qkv_weights, eps), np.float32
+        cpu_golden_result(hidden, None, None, qkv_weights, eps), np.float32
     )
 
     data_type = np.float16
