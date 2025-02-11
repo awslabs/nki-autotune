@@ -10,10 +10,12 @@ import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.compiler as ncc
 from neuronxcc.nki.language import par_dim
+import numpy as np
 
 
-def matmul(
-    A_DRAM, B_DRAM, Z_DRAM, TILES_IN_BLOCK_K=8, TILES_IN_BLOCK_M=4, TILES_IN_BLOCK_N=4
+@nki.jit
+def matmul_NMK(
+    A_DRAM, B_DRAM, TILES_IN_BLOCK_K=8, TILES_IN_BLOCK_M=4, TILES_IN_BLOCK_N=4
 ):
     """
     Optimized matrix multiplication kernel
@@ -45,6 +47,8 @@ def matmul(
     assert NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K == K
     assert NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M == M
     assert NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N == N
+
+    Z_DRAM = nl.ndarray([M, N], dtype=A_DRAM.dtype, buffer=nl.shared_hbm)
 
     for n2 in nl.affine_range(NUM_BLOCK_N):
         for m2 in nl.affine_range(NUM_BLOCK_M):
@@ -106,7 +110,7 @@ def matmul(
                         n_end = n_start + TILE_N
 
                         for k1 in nl.affine_range(TILES_IN_BLOCK_K):
-                            Z_PSUM += ni.nc_matmul(
+                            Z_PSUM += nisa.nc_matmul(
                                 A_SBUF[k1, :, m_start:m_end],
                                 B_SBUF[k1, :, n_start:n_end],
                             )
@@ -126,18 +130,19 @@ def matmul(
                 # values of Z at a time. We cannot coalesce across M because M gets
                 # split across the partition dimension
                 nl.store(Z_DRAM[m_start:m_end, n_start:n_end], value=Z_SBUF[m1])
+    return Z_DRAM
 
 
 # This is taken from the open source NKI samples repo
 # https://github.com/aws-neuron/nki-samples/blob/main/src/tutorials/matrix_multiplication/matrix_multiplication_nki_kernels.py#L247
 @nki.jit
-def nki_matmul_fully_optimized_(
+def matmul_NKM(
     lhsT,
     rhs,
     # Meta-parameters
+    TILES_IN_BLOCK_K=8,
     TILES_IN_BLOCK_M=16,
     TILES_IN_BLOCK_N=2,
-    TILES_IN_BLOCK_K=8,
 ):
     """NKI kernel to compute a large matrix multiplication efficiently by
        blocking all dimensions and doing layout optimization.
