@@ -13,42 +13,79 @@ from neuronxcc.nki.language import par_dim
 import numpy as np
 
 
+def common_head(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
+    K, M = lhsT.shape
+    K_, N = rhs.shape
+    assert (
+        K == K_
+    ), f"lhsT and rhs contraction dimension mismatch, got {lhsT.shape} and {rhs.shape}"
+
+    TILE_K = nl.tile_size.pmax  # 128
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+
+    BLOCK_K = TILE_K * TILES_IN_BLOCK_K
+    BLOCK_M = TILE_M * TILES_IN_BLOCK_M
+    BLOCK_N = TILE_N * TILES_IN_BLOCK_N
+
+    NUM_BLOCK_K = K // BLOCK_K
+    NUM_BLOCK_M = M // BLOCK_M
+    NUM_BLOCK_N = N // BLOCK_N
+
+    assert NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K == K
+    assert NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M == M
+    assert NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N == N
+
+    return (
+        M,
+        N,
+        K,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        NUM_BLOCK_M,
+        NUM_BLOCK_N,
+        NUM_BLOCK_K,
+    )
+
+
 @nki.jit
-def matmul_NMK(
-    A_DRAM, B_DRAM, TILES_IN_BLOCK_K=8, TILES_IN_BLOCK_M=4, TILES_IN_BLOCK_N=4
-):
+def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
     """
     Optimized matrix multiplication kernel
 
      Args:
 
-        A_DRAM: an input tensor of shape [K, M], where K is a multiple of 1024
+        lhsT: an input tensor of shape [K, M], where K is a multiple of 1024
         and M is a multiple of 512.  It is the left-hand-side argument of the
         matrix multiplication, delivered transposed for optimal performance.
 
-        B_DRAM: an input tensor of shape [K, N],  where K is a multiple of 1024
+        rhs: an input tensor of shape [K, N],  where K is a multiple of 1024
           and N is a multiple of 2048.  It is the right-hand-side argument of
           the matrix multiplication.
 
         Z_DRAM: the resulting output tensor of shape [M, N]
 
     """
-    K, M = A_DRAM.shape
-    _, N = B_DRAM.shape
+    (
+        M,
+        N,
+        K,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        NUM_BLOCK_M,
+        NUM_BLOCK_N,
+        NUM_BLOCK_K,
+    ) = common_head(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
 
-    TILE_K = nl.tile_size.pmax
-    TILE_M = nl.tile_size.gemm_stationary_fmax
-    TILE_N = nl.tile_size.gemm_moving_fmax
-
-    NUM_BLOCK_K = K // (TILES_IN_BLOCK_K * TILE_K)
-    NUM_BLOCK_M = M // (TILES_IN_BLOCK_M * TILE_M)
-    NUM_BLOCK_N = N // (TILES_IN_BLOCK_N * TILE_N)
-
-    assert NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K == K
-    assert NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M == M
-    assert NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N == N
-
-    Z_DRAM = nl.ndarray([M, N], dtype=A_DRAM.dtype, buffer=nl.shared_hbm)
+    Z_DRAM = nl.ndarray([M, N], dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
     for n2 in nl.affine_range(NUM_BLOCK_N):
         for m2 in nl.affine_range(NUM_BLOCK_M):
@@ -65,12 +102,12 @@ def matmul_NMK(
             for k2 in nl.affine_range(NUM_BLOCK_K):
                 A_SBUF = nl.ndarray(
                     (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), TILES_IN_BLOCK_M * TILE_M),
-                    dtype=A_DRAM.dtype,
+                    dtype=lhsT.dtype,
                     buffer=nl.sbuf,
                 )
                 B_SBUF = nl.ndarray(
                     (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), TILES_IN_BLOCK_N * TILE_N),
-                    dtype=B_DRAM.dtype,
+                    dtype=rhs.dtype,
                     buffer=nl.sbuf,
                 )
 
@@ -88,12 +125,12 @@ def matmul_NMK(
                     # We coalesce memory accesses by loading TILES_IN_BLOCK_M * TILE_M
                     # values of A at a time. We cannot coalesce across K because K gets
                     # split across the partition dimension
-                    A_SBUF[k1] = nl.load(A_DRAM[k_start:k_end, m_start:m_end])
+                    A_SBUF[k1] = nl.load(lhsT[k_start:k_end, m_start:m_end])
 
                     # We coalesce memory accesses by loading TILES_IN_BLOCK_N * TILE_N
                     # values of B at a time. We cannot coalesce across K because K gets
                     # split across the partition dimension
-                    B_SBUF[k1] = nl.load(B_DRAM[k_start:k_end, n_start:n_end])
+                    B_SBUF[k1] = nl.load(rhs[k_start:k_end, n_start:n_end])
 
                 for m1 in nl.affine_range(TILES_IN_BLOCK_M):
                     for n1 in nl.affine_range(TILES_IN_BLOCK_N):
@@ -136,14 +173,7 @@ def matmul_NMK(
 # This is taken from the open source NKI samples repo
 # https://github.com/aws-neuron/nki-samples/blob/main/src/tutorials/matrix_multiplication/matrix_multiplication_nki_kernels.py#L247
 @nki.jit
-def matmul_NKM(
-    lhsT,
-    rhs,
-    # Meta-parameters
-    TILES_IN_BLOCK_K=8,
-    TILES_IN_BLOCK_M=16,
-    TILES_IN_BLOCK_N=2,
-):
+def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
     """NKI kernel to compute a large matrix multiplication efficiently by
        blocking all dimensions and doing layout optimization.
 
@@ -159,28 +189,22 @@ def matmul_NKM(
         TILES_IN_BLOCK_*: meta parameters to control blocking dimensions
     """
 
-    K, M = lhsT.shape
-    K_, N = rhs.shape
-    assert K == K_, "lhsT and rhs must have the same contraction dimension"
+    (
+        M,
+        N,
+        K,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        NUM_BLOCK_M,
+        NUM_BLOCK_N,
+        NUM_BLOCK_K,
+    ) = common_head(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
 
     result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-    TILE_K = nl.tile_size.pmax  # 128
-    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-
-    BLOCK_M = TILE_M * TILES_IN_BLOCK_M
-    BLOCK_N = TILE_N * TILES_IN_BLOCK_N
-    BLOCK_K = TILE_K * TILES_IN_BLOCK_K
-
-    # the size has to be multiple of block size
-    assert M % BLOCK_M == 0
-    assert N % BLOCK_N == 0
-    assert K % BLOCK_K == 0
-
-    NUM_BLOCK_M = M // BLOCK_M
-    NUM_BLOCK_N = N // BLOCK_N
-    NUM_BLOCK_K = K // BLOCK_K
 
     # Blocking N dimension (the RHS free dimension)
     for n in nl.affine_range(NUM_BLOCK_N):
