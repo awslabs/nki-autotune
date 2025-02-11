@@ -16,8 +16,8 @@ from itertools import product
 def cpu_golden(lhsT, rhs):
     # lhsT is the transposed left matrix and rhs is the right matrix
     assert (
-        lhsT.shape[1] == rhs.shape[0]
-    ), "Matrix dimensions don't match for multiplication"
+        lhsT.shape[0] == rhs.shape[0]
+    ), f"Contraction dimensions don't match: {lhsT.shape} {rhs.shape}"
 
     # Initialize result matrix with zeros
     result = np.matmul(lhsT.T, rhs)
@@ -27,23 +27,55 @@ def cpu_golden(lhsT, rhs):
 
 def get_tests():
     kernels = [matmul_NMK, matmul_NKM]
-    K_sizes = [1024]
-    M_sizes = [1024]
-    N_sizes = [1024]
-    TILES_IN_BLOCK_K = [1]
-    TILES_IN_BLOCK_M = [1]
-    TILES_IN_BLOCK_N = [1]
-    tests = list(
+
+    TILE_K = nl.tile_size.pmax  # 128
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+
+    TILES_IN_BLOCK_K_vals = [1, 8]
+    TILES_IN_BLOCK_M_vals = [1, 4, 8]
+    TILES_IN_BLOCK_N_vals = [1, 4]
+
+    NUM_BLOCK_K_vals = [1, 4, 8]
+    NUM_BLOCK_M_vals = [1, 4]
+    NUM_BLOCK_N_vals = [1, 8]
+
+    configs = list(
         product(
             kernels,
-            K_sizes,
-            M_sizes,
-            N_sizes,
+            TILES_IN_BLOCK_K_vals,
+            TILES_IN_BLOCK_M_vals,
+            TILES_IN_BLOCK_N_vals,
+            NUM_BLOCK_K_vals,
+            NUM_BLOCK_M_vals,
+            NUM_BLOCK_N_vals,
+        )
+    )
+    tests = []
+    for config in configs:
+        (
+            kernel,
             TILES_IN_BLOCK_K,
             TILES_IN_BLOCK_M,
             TILES_IN_BLOCK_N,
-        )
-    )
+            NUM_BLOCK_K,
+            NUM_BLOCK_M,
+            NUM_BLOCK_N,
+        ) = config
+        K = NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K
+        M = NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M
+        N = NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N
+        if all([M >= 1024, N >= 1024, K >= 1024]):
+            test = (
+                kernel,
+                K,
+                M,
+                N,
+                TILES_IN_BLOCK_K,
+                TILES_IN_BLOCK_M,
+                TILES_IN_BLOCK_N,
+            )
+            tests.append(test)
     return tests
 
 
@@ -71,3 +103,8 @@ def test_matmul(
     rtol = 1e-3
     match = allclose(nki_out, golden_output, atol=atol, rtol=rtol, verbose=1)
     assert match
+
+
+if __name__ == "__main__":
+    tests = get_tests()
+    print(len(tests))
