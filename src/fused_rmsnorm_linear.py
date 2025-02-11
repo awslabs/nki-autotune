@@ -14,6 +14,7 @@ from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
 from src.allocation import update_base_addr
+from private.decorators import enable_stack_allocator
 
 
 @nki.compiler.skip_middle_end_transformations
@@ -225,9 +226,6 @@ def allocated_fused_rms_norm_qkv(hidden, weights, hidden_buffer_degree, eps):
     sbuf_base_addr = update_base_addr(sbuf_base_addr, bias_placeholder, False)
     sbuf_base_addr = update_base_addr(sbuf_base_addr, identity_tensor, False)
     return out_tensor
-
-
-from private.decorators import enable_stack_allocator
 
 
 @enable_stack_allocator(log_level=logging.INFO)
