@@ -6,8 +6,6 @@ import neuronxcc.nki.isa as nisa
 
 import logging, math
 import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.compiler as ncc
 from neuronxcc.nki.language import par_dim
 import numpy as np
@@ -20,14 +18,17 @@ def common_head(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
         K == K_
     ), f"lhsT and rhs contraction dimension mismatch, got {lhsT.shape} and {rhs.shape}"
 
+    # Tile sizes
     TILE_K = nl.tile_size.pmax  # 128
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
 
+    # Block sizes
     BLOCK_K = TILE_K * TILES_IN_BLOCK_K
     BLOCK_M = TILE_M * TILES_IN_BLOCK_M
     BLOCK_N = TILE_N * TILES_IN_BLOCK_N
 
+    # Number of blocks
     NUM_BLOCK_K = K // BLOCK_K
     NUM_BLOCK_M = M // BLOCK_M
     NUM_BLOCK_N = N // BLOCK_N
@@ -67,7 +68,7 @@ def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
           and N is a multiple of 2048.  It is the right-hand-side argument of
           the matrix multiplication.
 
-        Z_DRAM: the resulting output tensor of shape [M, N]
+        result: the resulting output tensor of shape [M, N]
 
     """
     (
@@ -85,89 +86,89 @@ def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
         NUM_BLOCK_K,
     ) = common_head(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
 
-    Z_DRAM = nl.ndarray([M, N], dtype=lhsT.dtype, buffer=nl.shared_hbm)
+    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
-    for n2 in nl.affine_range(NUM_BLOCK_N):
-        for m2 in nl.affine_range(NUM_BLOCK_M):
-
-            # Partition Z and then ensure that we are Z-block stationary
-            # This way, no matter how large K, M, and N are, Z is never spilled/loaded
-            # We only need to store once
-            Z_SBUF = nl.zeros(
-                (TILES_IN_BLOCK_M, nl.par_dim(TILE_M), TILES_IN_BLOCK_N * TILE_N),
-                dtype=Z_DRAM.dtype,
+    for block_id_N in nl.affine_range(NUM_BLOCK_N):
+        for block_id_M in nl.affine_range(NUM_BLOCK_M):
+            # BLOCK_M * BLOCK_N result block
+            result_block = nl.zeros(
+                (TILES_IN_BLOCK_M, nl.par_dim(TILE_M), BLOCK_N),
+                dtype=result.dtype,
                 buffer=nl.sbuf,
             )
 
-            for k2 in nl.affine_range(NUM_BLOCK_K):
-                A_SBUF = nl.ndarray(
-                    (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), TILES_IN_BLOCK_M * TILE_M),
+            for block_id_K in nl.affine_range(NUM_BLOCK_K):
+                # BLOCK_K * BLOCK_M lhsT block
+                lhsT_block = nl.ndarray(
+                    (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_M),
                     dtype=lhsT.dtype,
                     buffer=nl.sbuf,
                 )
-                B_SBUF = nl.ndarray(
-                    (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), TILES_IN_BLOCK_N * TILE_N),
+                # BLOCK_K * BLOCK_N rhs block
+                rhs_block = nl.ndarray(
+                    (TILES_IN_BLOCK_K, nl.par_dim(TILE_K), BLOCK_N),
                     dtype=rhs.dtype,
                     buffer=nl.sbuf,
                 )
 
-                # Load in a block of A and a block of B
-                for k1 in nl.affine_range(TILES_IN_BLOCK_K):
-                    k_start = k2 * TILES_IN_BLOCK_K * TILE_K + k1 * TILE_K
-                    k_end = k_start + TILE_K
+                # Load the lhsT and the rhs block by tiles
+                i_lhsT = nl.mgrid[0:TILE_K, 0:BLOCK_M]
+                i_rhs = nl.mgrid[0:TILE_K, 0:BLOCK_N]
+                for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
+                    k_start = block_id_K * BLOCK_K + tile_id_K * TILE_K
+                    m_start = block_id_M * BLOCK_M
+                    n_start = block_id_N * BLOCK_N
 
-                    m_start = m2 * TILES_IN_BLOCK_M * TILE_M
-                    m_end = m_start + TILES_IN_BLOCK_M * TILE_M
+                    lhsT_block[tile_id_K] = nl.load(
+                        lhsT[k_start + i_lhsT.p, m_start + i_lhsT.x]
+                    )
+                    rhs_block[tile_id_K] = nl.load(
+                        rhs[k_start + i_rhs.p, n_start + i_rhs.x]
+                    )
 
-                    n_start = n2 * TILES_IN_BLOCK_N * TILE_N
-                    n_end = n_start + TILES_IN_BLOCK_N * TILE_N
-
-                    # We coalesce memory accesses by loading TILES_IN_BLOCK_M * TILE_M
-                    # values of A at a time. We cannot coalesce across K because K gets
-                    # split across the partition dimension
-                    A_SBUF[k1] = nl.load(lhsT[k_start:k_end, m_start:m_end])
-
-                    # We coalesce memory accesses by loading TILES_IN_BLOCK_N * TILE_N
-                    # values of B at a time. We cannot coalesce across K because K gets
-                    # split across the partition dimension
-                    B_SBUF[k1] = nl.load(rhs[k_start:k_end, n_start:n_end])
-
-                for m1 in nl.affine_range(TILES_IN_BLOCK_M):
-                    for n1 in nl.affine_range(TILES_IN_BLOCK_N):
+                for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+                    for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
                         # Keep the tile of Z stationary in the PSUM buffer to minimize the
                         # number of calls to nl.loop_reduce
-                        Z_PSUM = nl.zeros(
+                        res_tile = nl.zeros(
                             (TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum
                         )
 
-                        m_start = m1 * TILE_M
+                        m_start = tile_id_M * TILE_M
                         m_end = m_start + TILE_M
 
-                        n_start = n1 * TILE_N
+                        n_start = tile_id_N * TILE_N
                         n_end = n_start + TILE_N
 
-                        for k1 in nl.affine_range(TILES_IN_BLOCK_K):
-                            Z_PSUM += nisa.nc_matmul(
-                                A_SBUF[k1, :, m_start:m_end],
-                                B_SBUF[k1, :, n_start:n_end],
+                        # Accumulate the K tiles within the K block
+                        for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
+                            res_tile += nisa.nc_matmul(
+                                lhsT_block[tile_id_K, :, m_start:m_end],
+                                rhs_block[tile_id_K, :, n_start:n_end],
                             )
 
-                        Z_SBUF[m1, :, n_start:n_end] = nl.loop_reduce(
-                            Z_PSUM, op=np.add, loop_indices=[k2], dtype=Z_DRAM.dtype
+                        # Accumulate the K blocks
+                        result_block[tile_id_M, :, n_start:n_end] = nl.loop_reduce(
+                            res_tile,
+                            op=np.add,
+                            loop_indices=[block_id_K],
+                            dtype=result.dtype,
                         )
 
-            for m1 in nl.affine_range(TILES_IN_BLOCK_M):
-                m_start = m2 * TILES_IN_BLOCK_M * TILE_M + m1 * TILE_M
+            for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+                m_start = block_id_M * BLOCK_M + tile_id_M * TILE_M
                 m_end = m_start + TILE_M
 
-                n_start = n2 * TILES_IN_BLOCK_N * TILE_N
-                n_end = n_start + TILES_IN_BLOCK_N * TILE_N
+                n_start = block_id_N * BLOCK_N
+                n_end = n_start + BLOCK_N
 
-                # We coalesce memory accesses by storing TILES_IN_BLOCK_N * TILE_N
+                # We coalesce memory accesses by storing BLOCK_N
                 # values of Z at a time. We cannot coalesce across M because M gets
                 # split across the partition dimension
-                nl.store(Z_DRAM[m_start:m_end, n_start:n_end], value=Z_SBUF[m1])
-    return Z_DRAM
+                nl.store(
+                    result[m_start:m_end, n_start:n_end], value=result_block[tile_id_M]
+                )
+    return result
 
 
 # This is taken from the open source NKI samples repo

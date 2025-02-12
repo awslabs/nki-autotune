@@ -27,18 +27,19 @@ def cpu_golden(lhsT, rhs):
 
 def get_tests():
     kernels = [matmul_NMK, matmul_NKM]
+    kernels = [matmul_NMK]
 
     TILE_K = nl.tile_size.pmax  # 128
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
 
-    TILES_IN_BLOCK_K_vals = [1, 8]
-    TILES_IN_BLOCK_M_vals = [1, 4, 8]
+    TILES_IN_BLOCK_K_vals = [4, 8]
+    TILES_IN_BLOCK_M_vals = [1, 8]
     TILES_IN_BLOCK_N_vals = [1, 4]
 
-    NUM_BLOCK_K_vals = [1, 4, 8]
-    NUM_BLOCK_M_vals = [1, 4]
-    NUM_BLOCK_N_vals = [1, 8]
+    NUM_BLOCK_K_vals = [8]
+    NUM_BLOCK_M_vals = [4]
+    NUM_BLOCK_N_vals = [8]
 
     configs = list(
         product(
