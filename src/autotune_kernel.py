@@ -100,10 +100,10 @@ class AutotuneKernel(BenchmarkKernel):
                 )
 
         self.grid = ()
-        self.post_tuning()
-        return None  # the kernel output means nothing here
+        self._post_tuning()
+        return None
 
-    def post_tuning(self):
+    def _post_tuning(self):
         assert self.perf_results, "No configs tested"
         best_result = min(
             self.perf_results,
@@ -115,7 +115,9 @@ class AutotuneKernel(BenchmarkKernel):
         # dump the performance logs
         with open(f"./perf_results.log", "w") as f:
             f.write(pformat(self.perf_results))
-            f.write(f"\nThe best latency is {min_latency} us for config {min_config}")
+            f.write(
+                f"\nThe best latency is {min_latency} us for the config {min_config}"
+            )
         pickle.dump(self.perf_results, open(f"./perf_results.pkl", "wb"))
         plot_tuning_results(self.perf_results)
 
@@ -140,6 +142,7 @@ def test_design(
         device_count=device_count,
         device_lock=device_lock,
         benchmark_machine=benchmark_machine,
+        kernel_return=True,
     )
     benchmark(*args, **configs, **kwargs)
     return benchmark.benchmark_result.nc_latency.get_latency_percentile(99)
