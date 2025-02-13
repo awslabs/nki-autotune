@@ -126,6 +126,11 @@ def save_result_block(result, result_tiles, m_ofs, n_ofs):
                 value=result_tiles[tile_id_M, tile_id_N],
             )
 
+            # coalesce result tiles for better DMA performance
+            for tile_id_N in nl.affine_range(num_n_tiles):
+                result_packed[idx_res.p, tile_id_N * TILE_N + idx_res.x] = nl.copy(
+                    result_tiles[block_id_M, tile_id_M, tile_id_N, idx_res.p, idx_res.x]
+                )
 
 def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
     NUM_BLOCK_K, NUM_BLOCK_M, NUM_BLOCK_N, num_m_tiles, num_n_tiles, TILE_M, TILE_N = (
