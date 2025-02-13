@@ -29,7 +29,9 @@ class MatMul:
         self.NUM_BLOCK_N = self.N // self.BLOCK_N
 
         # Data checks
-        assert (self.K == self.K_), f"lhsT and rhs contraction dimension mismatch, got {lhsT.shape} and {rhs.shape}"
+        assert (
+            self.K == self.K_
+        ), f"lhsT and rhs contraction dimension mismatch, got {lhsT.shape} and {rhs.shape}"
         assert self.NUM_BLOCK_K * TILES_IN_BLOCK_K * self.TILE_K == self.K
         assert self.NUM_BLOCK_M * TILES_IN_BLOCK_M * self.TILE_M == self.M
         assert self.NUM_BLOCK_N * TILES_IN_BLOCK_N * self.TILE_N == self.N
@@ -123,7 +125,9 @@ def load_tensor_by_par_tiles(
     idx = nl.mgrid[0:par_tile_size, 0:free_dim_size]
     for par_tile_id in nl.affine_range(num_par_tiles):
         tiles[par_tile_id, idx.p, idx.x] = nl.load(
-            input_tensor[par_ofs + par_tile_id * par_tile_size + idx.p, free_ofs + idx.x]
+            input_tensor[
+                par_ofs + par_tile_id * par_tile_size + idx.p, free_ofs + idx.x
+            ]
         )
     return tiles
 
@@ -135,11 +139,14 @@ def matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles, result_dtype, block_id_M):
     _n = num_n_tiles * TILE_N
 
     # Data checks
-    assert (num_k_tiles == _num_k_tiles and TILE_K == _TILE_K
+    assert (
+        num_k_tiles == _num_k_tiles and TILE_K == _TILE_K
     ), f"lhsT_tiles {lhsT_tiles.shape} does not match with rhs_tiles {rhs_tiles.shape}"
-    assert (m == num_m_tiles * TILE_M
+    assert (
+        m == num_m_tiles * TILE_M
     ), f"lhsT_tiles {lhsT_tiles.shape} does not match with result_tiles {result_tiles.shape}"
-    assert (n == _n
+    assert (
+        n == _n
     ), f"rhs_tiles {rhs_tiles.shape} does not match with result_tiles {result_tiles.shape}"
 
     idx_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
@@ -168,22 +175,25 @@ def save_result_naive(result, result_tiles, block_id_M, m_ofs, n_ofs):
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for tile_id_M in nl.affine_range(num_m_tiles):
         for tile_id_N in nl.affine_range(num_n_tiles):
-            nl.store(result[m_ofs + tile_id_M * TILE_M + idx_res.p, n_ofs + tile_id_N * TILE_N + idx_res.x],
-                     value=result_tiles[block_id_M, tile_id_M, tile_id_N])
+            nl.store(
+                result[
+                    m_ofs + tile_id_M * TILE_M + idx_res.p,
+                    n_ofs + tile_id_N * TILE_N + idx_res.x,
+                ],
+                value=result_tiles[block_id_M, tile_id_M, tile_id_N],
+            )
 
 
 def save_result(result, result_tiles, n_blk_ofs, TILE_K):
     NUM_BLOCK_M, num_m_tiles, num_n_tiles, _, TILE_N = result_tiles.shape
-    
+
     for block_id_M in nl.affine_range(NUM_BLOCK_M):
         for tile_id_M in nl.affine_range(num_m_tiles):
             idx_res = nl.mgrid[0:TILE_K, 0:TILE_N]
-            idx_res_packed = nl.mgrid[0:TILE_K, 0:TILE_N * num_n_tiles]
+            idx_res_packed = nl.mgrid[0:TILE_K, 0 : TILE_N * num_n_tiles]
 
             result_packed = nl.ndarray(
-                (TILE_K, TILE_N * num_n_tiles), 
-                dtype=result_tiles.dtype, 
-                buffer=nl.sbuf
+                (TILE_K, TILE_N * num_n_tiles), dtype=result_tiles.dtype, buffer=nl.sbuf
             )
 
             # coalesce result tiles for better DMA performance
@@ -193,12 +203,12 @@ def save_result(result, result_tiles, n_blk_ofs, TILE_K):
                 )
 
             nl.store(
-                    result[
-                        (num_m_tiles * block_id_M + tile_id_M) * TILE_K + idx_res_packed.p,
-                        n_blk_ofs + idx_res_packed.x,
-                    ],
-                    value=result_packed[idx_res_packed.p, idx_res_packed.x],
-                )
+                result[
+                    (num_m_tiles * block_id_M + tile_id_M) * TILE_K + idx_res_packed.p,
+                    n_blk_ofs + idx_res_packed.x,
+                ],
+                value=result_packed[idx_res_packed.p, idx_res_packed.x],
+            )
 
 
 def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
@@ -209,7 +219,13 @@ def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
     for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
             result_tiles = nl.zeros(
-                (mm.BLOCK_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
+                (
+                    mm.BLOCK_M,
+                    TILES_IN_BLOCK_M,
+                    TILES_IN_BLOCK_N,
+                    nl.par_dim(mm.TILE_M),
+                    mm.TILE_N,
+                ),
                 dtype=result.dtype,
                 buffer=nl.sbuf,
             )
@@ -257,7 +273,13 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
     for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
         # M * BLOCK_N
         result_tiles = nl.zeros(
-            (mm.NUM_BLOCK_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
+            (
+                mm.NUM_BLOCK_M,
+                TILES_IN_BLOCK_M,
+                TILES_IN_BLOCK_N,
+                nl.par_dim(mm.TILE_M),
+                mm.TILE_N,
+            ),
             dtype=result.dtype,
             buffer=nl.sbuf,
         )
@@ -298,7 +320,7 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                     result_tiles,
                     block_id_M,
                     m_offset=block_id_M * mm.BLOCK_M,
-                    n_offset=block_id_N * mm.BLOCK_N
+                    n_offset=block_id_N * mm.BLOCK_N,
                 )
 
     return result
