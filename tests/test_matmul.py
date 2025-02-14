@@ -1,9 +1,17 @@
 import pytest
 import numpy as np
 
+import sys
+
+sys.path.append("../")
+
 from src.matmul import (
     matmul_NMK,
+    matmul_MNK,
+    matmul_KMN,
+    matmul_KNM,
     matmul_NKM,
+    matmul_MKN,
 )
 
 import neuronxcc.nki.language as nl
@@ -26,7 +34,7 @@ def cpu_golden(lhsT, rhs):
 
 
 def get_tests():
-    kernels = [matmul_NMK, matmul_NKM]
+    kernels = [matmul_NMK, matmul_MNK, matmul_KMN, matmul_KNM, matmul_NKM, matmul_MKN]
 
     TILE_K = nl.tile_size.pmax  # 128
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
