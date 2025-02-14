@@ -82,3 +82,5 @@ Desktop.ini
 # Artifacts
 artifacts/
 private
+*.neff
+*.ntff
