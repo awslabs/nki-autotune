@@ -427,18 +427,6 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
         # Use `sequential_range` because we do not want the compiler to change this loop by,
         # for example, vectorizing it
         for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
-            result_tiles = nl.zeros(
-                (
-                    mm.NUM_BLOCK_M,
-                    TILES_IN_BLOCK_M,
-                    TILES_IN_BLOCK_N,
-                    nl.par_dim(mm.TILE_M),
-                    mm.TILE_N,
-                ),
-                dtype=result.dtype,
-                buffer=nl.sbuf,
-            )
-
             # Loading tiles from rhs
             # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
             rhs_tiles = load_tensor_by_par_tiles(
