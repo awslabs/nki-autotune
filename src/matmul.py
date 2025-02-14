@@ -451,6 +451,14 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                 )
 
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+            """
+            save_result_block(
+                result,
+                result_tiles[block_id_M],
+                m_ofs=block_id_M * mm.BLOCK_M,
+                n_ofs=block_id_N * mm.BLOCK_N,
+            )
+            """
             save_result_dma(
                 result,
                 result_tiles,
@@ -514,8 +522,22 @@ def matmul_MKN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                     lhsT_tiles, rhs_tiles, result_tiles[block_id_N], result.dtype
                 )
 
-        save_result_dma(
-            result, result_tiles, n_ofs=block_id_N * mm.BLOCK_N, TILE_K=mm.TILE_K
-        )
+        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+            """
+            save_result_block(
+                result,
+                result_tiles[block_id_N],
+                m_ofs=block_id_M * mm.BLOCK_M,
+                n_ofs=block_id_N * mm.BLOCK_N,
+            )
+            """
+            save_result_dma(
+                result,
+                result_tiles,
+                block_id_N,
+                m_ofs=block_id_M * TILES_IN_BLOCK_M,
+                n_ofs=block_id_N * mm.BLOCK_N,
+                TILE_K=mm.TILE_K,
+            )
 
     return result
