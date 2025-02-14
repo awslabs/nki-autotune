@@ -3,6 +3,7 @@
 
 from typing import List
 import multiprocessing, warnings, dill, pickle, math, os, shutil
+from itertools import product
 
 multiprocessing.reduction.ForkingPickler.dumps = dill.dumps
 from concurrent.futures import ProcessPoolExecutor
@@ -21,15 +22,14 @@ class Autotune:
 
     def __init__(
         self,
-        func,
         configs: List[dict],
         warmup: int = 2,
         iters: int = 5,
         max_workers: int | None = None,
         benchmark_machines=None,
+        cache_dir="./autotune_cache",
         **kwargs,
     ):
-        self.func = func
         self.configs = configs
         self.warmup = warmup
         self.iters = iters
@@ -39,12 +39,7 @@ class Autotune:
             benchmark_machines if benchmark_machines is not None else ["localhost"]
         )
         self.perf_results = []
-
-        if "cache_dir" in self.kwargs:
-            cache_dir = self.kwargs["cache_dir"]
-        else:
-            cache_dir = "."
-        self.cache_dir = f"{cache_dir}/{self.func.func_name}"
+        self.cache_dir = cache_dir
         if os.path.exists(self.cache_dir):
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
@@ -59,15 +54,16 @@ class Autotune:
             len(self.configs) // len(self.benchmark_machines)
         )
 
-        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            all_instances = []
-            for config, machine in zip(
-                self.configs,
-                benchmark_machines,
-            ):
-                future = executor.submit(
-                    test_design,
-                    func=self.func,
+        start = perf_counter()
+        for config, machine in tqdm(
+            zip(self.configs, benchmark_machines),
+            total=len(self.configs),
+            desc="Benchmarking configs",
+        ):
+            kernel = config.pop("kernel", None)
+            try:
+                latency_us = test_design(
+                    func=kernel,
                     args=args,
                     kwargs=kwargs,
                     configs=config,
@@ -77,30 +73,22 @@ class Autotune:
                     cache_dir=self.cache_dir,
                     benchmark_machine=machine,
                 )
-                all_instances.append((future, config))
-
-            start = perf_counter()
-            for i in tqdm(
-                range(len(all_instances)), desc="Benchmarking configurations"
-            ):
-                future, config = all_instances[i]
-                try:
-                    latency_us = future.result()
-                except Exception as e:
-                    latency_us = float("inf")
-                    warnings.warn(
-                        f"Warning: failed for config {config}, reason: {e} ({type(e)})",
-                        category=RuntimeWarning,
-                        stacklevel=2,
-                    )
-                elapsed = perf_counter() - start
-                self.perf_results.append(
-                    {
-                        "configs": config,
-                        "latency": latency_us,
-                        "time_elapsed": elapsed,
-                    }
+            except Exception as e:
+                latency_us = float("inf")
+                warnings.warn(
+                    f"Warning: failed for config {config}, kernel {kernel.func_name} reason: {e} ({type(e)})",
+                    category=RuntimeWarning,
+                    stacklevel=2,
                 )
+            elapsed = perf_counter() - start
+            config["kernel_name"] = kernel.func_name
+            self.perf_results.append(
+                {
+                    "configs": config,
+                    "latency": latency_us,
+                    "time_elapsed": elapsed,
+                }
+            )
 
         self._post_tuning(*args)
         return None

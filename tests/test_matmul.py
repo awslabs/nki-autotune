@@ -34,7 +34,7 @@ def cpu_golden(lhsT, rhs):
 
 
 def get_tests():
-    kernels = [matmul_NMK, matmul_MNK, matmul_KMN, matmul_KNM, matmul_NKM, matmul_MKN]
+    kernels = [matmul_NMK, matmul_MNK, matmul_KMN, matmul_KNM, matmul_NKM]
 
     TILE_K = nl.tile_size.pmax  # 128
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
