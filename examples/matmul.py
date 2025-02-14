@@ -7,7 +7,14 @@ from itertools import product
 import random
 
 from src.autotune_kernel import Autotune
-from src.matmul import nki_matmul_fully_optimized_
+from src.matmul import (
+    matmul_KMN,
+    matmul_MKN,
+    matmul_KNM,
+    matmul_MNK,
+    matmul_NKM,
+    matmul_NMK,
+)
 
 
 def get_autotune_configs():
@@ -18,19 +25,22 @@ def get_autotune_configs():
         list: A list of dictionaries, each containing configuration parameters for TILES_IN_BLOCK_M,
                 TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
     """
-    TILES_IN_BLOCK_M_options = [4]
-    TILES_IN_BLOCK_N_options = [2, 4]
-    TILES_IN_BLOCK_K_options = [2, 4]
+    kernels = [matmul_KMN, matmul_KNM, matmul_MNK, matmul_NKM, matmul_NMK]
+    TILES_IN_BLOCK_M_options = [1, 4, 8, 16]
+    TILES_IN_BLOCK_N_options = [1, 4, 8, 16]
+    TILES_IN_BLOCK_K_options = [1, 4, 8, 16]
     params = list(
         product(
+            kernels,
             TILES_IN_BLOCK_M_options,
             TILES_IN_BLOCK_N_options,
             TILES_IN_BLOCK_K_options,
         )
     )
     configs = []
-    for TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K in params:
+    for kernel, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K in params:
         config = {
+            "kernel": kernel,
             "TILES_IN_BLOCK_M": TILES_IN_BLOCK_M,
             "TILES_IN_BLOCK_N": TILES_IN_BLOCK_N,
             "TILES_IN_BLOCK_K": TILES_IN_BLOCK_K,
@@ -41,14 +51,17 @@ def get_autotune_configs():
 
 
 if __name__ == "__main__":
-    lhsT = nt.tensor[[8192, 4096], nl.bfloat16]
-    rhs = nt.tensor[[8192, 8192], nl.bfloat16]
-
-    tuner = Autotune(
-        nki_matmul_fully_optimized_,
-        configs=get_autotune_configs(),
-        warmup=2,
-        iters=10,
-        max_workers=2,
-    )
-    tuner(lhsT, rhs)
+    for free_dim in [1024, 2048]:
+        M = free_dim
+        N = free_dim
+        for K in [128, 256, 512, 1024]:
+            lhsT = nt.tensor[[K, M], nl.float32]
+            rhs = nt.tensor[[K, N], nl.float32]
+            tuner = Autotune(
+                configs=get_autotune_configs(),
+                warmup=2,
+                iters=10,
+                max_workers=2,
+                cache_dir=f"private/matmul-M{M}-N{N}-K{K}",
+            )
+            tuner(lhsT, rhs)
