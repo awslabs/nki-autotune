@@ -130,21 +130,13 @@ def save_result_block(result, result_tiles, m_ofs, n_ofs):
                     m_ofs + tile_id_M * TILE_M + idx_res.p,
                     n_ofs + tile_id_N * TILE_N + idx_res.x,
                 ],
-                value=result_tiles[tile_id_M, tile_id_N],
+                value=result_tiles[block_id_M, tile_id_M, tile_id_N],
             )
 
-            # coalesce result tiles for better DMA performance
-            for tile_id_N in nl.affine_range(num_n_tiles):
-                result_packed[idx_res.p, tile_id_N * TILE_N + idx_res.x] = nl.copy(
-                    result_tiles[block_id_M, tile_id_M, tile_id_N, idx_res.p, idx_res.x]
-                )
 
-def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
-    NUM_BLOCK_K, NUM_BLOCK_M, NUM_BLOCK_N, num_m_tiles, num_n_tiles, TILE_M, TILE_N = (
-        result_tiles.shape
-    )
+def save_result(result, result_tiles, n_blk_ofs, TILE_K):
+    NUM_BLOCK_M, num_m_tiles, num_n_tiles, _, TILE_N = result_tiles.shape
 
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for block_id_M in nl.affine_range(NUM_BLOCK_M):
         m_ofs = block_id_M * BLOCK_M
         for block_id_N in nl.affine_range(NUM_BLOCK_N):
@@ -181,19 +173,19 @@ def save_result_dma(result, result_tiles, block_id, m_ofs, n_ofs, TILE_K):
             (TILE_K, TILE_N * num_n_tiles), dtype=result_tiles.dtype, buffer=nl.sbuf
         )
 
-        # coalesce result tiles for better DMA performance
-        for tile_id_N in nl.affine_range(num_n_tiles):
-            result_packed[idx_res.p, tile_id_N * TILE_N + idx_res.x] = nl.copy(
-                result_tiles[block_id, tile_id_M, tile_id_N, idx_res.p, idx_res.x]
-            )
+            # coalesce result tiles for better DMA performance
+            for tile_id_N in nl.affine_range(num_n_tiles):
+                result_packed[idx_res.p, tile_id_N * TILE_N + idx_res.x] = nl.copy(
+                    result_tiles[block_id_M, tile_id_M, tile_id_N, idx_res.p, idx_res.x]
+                )
 
-        nl.store(
-            result[
-                (m_ofs + tile_id_M) * TILE_K + idx_res_packed.p,
-                n_ofs + idx_res_packed.x,
-            ],
-            value=result_packed[idx_res_packed.p, idx_res_packed.x],
-        )
+            nl.store(
+                result[
+                    (num_m_tiles * block_id_M + tile_id_M) * TILE_K + idx_res_packed.p,
+                    n_blk_ofs + idx_res_packed.x,
+                ],
+                value=result_packed[idx_res_packed.p, idx_res_packed.x],
+            )
 
 
 @nki.jit
@@ -429,6 +421,7 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
 
     # Blocking N dimension (the RHS free dimension)
     for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+        # M * BLOCK_N
         result_tiles = nl.zeros(
             (
                 mm.NUM_BLOCK_M,
@@ -441,10 +434,6 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
             buffer=nl.sbuf,
         )
 
-        # Blocking K dimension (the contraction dimension)
-        # Use `sequential_range` because we do not want the compiler to change this loop by,
-        # for example, vectorizing it
-        for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
             # Loading tiles from rhs
             # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
             rhs_tiles = load_tensor_by_par_tiles(
@@ -472,16 +461,68 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                     lhsT_tiles, rhs_tiles, result_tiles[block_id_M], result.dtype
                 )
 
-        for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-            """
-            save_result_block(
-                result,
-                result_tiles[block_id_M],
-                m_ofs=block_id_M * mm.BLOCK_M,
-                n_ofs=block_id_N * mm.BLOCK_N,
+                save_result_naive(
+                    result,
+                    result_tiles,
+                    block_id_M,
+                    m_offset=block_id_M * mm.BLOCK_M,
+                    n_offset=block_id_N * mm.BLOCK_N,
+                )
+
+    return result
+
+
+@nki.jit
+def matmul_NMK_orig(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
+    (
+        M,
+        N,
+        K,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        NUM_BLOCK_M,
+        NUM_BLOCK_N,
+        NUM_BLOCK_K,
+    ) = common_head(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
+
+    result = nl.ndarray((M, N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    for block_id_N in nl.affine_range(NUM_BLOCK_N):
+        for block_id_M in nl.affine_range(NUM_BLOCK_M):
+            result_tiles = nl.zeros(
+                (TILES_IN_BLOCK_M, nl.par_dim(TILE_M), BLOCK_N),
+                dtype=result.dtype,
+                buffer=nl.sbuf,
             )
-            """
-            save_result_dma(
+
+            for block_id_K in nl.affine_range(NUM_BLOCK_K):
+                # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
+                lhsT_tiles = load_tensor_by_par_tiles(
+                    input_tensor=lhsT,
+                    num_par_tiles=TILES_IN_BLOCK_K,
+                    par_tile_size=TILE_K,
+                    free_dim_size=BLOCK_M,
+                    par_offset=block_id_K * BLOCK_K,
+                    free_offset=block_id_M * BLOCK_M,
+                )
+                # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
+                rhs_tiles = load_tensor_by_par_tiles(
+                    input_tensor=rhs,
+                    num_par_tiles=TILES_IN_BLOCK_K,
+                    par_tile_size=TILE_K,
+                    free_dim_size=BLOCK_N,
+                    par_offset=block_id_K * BLOCK_K,
+                    free_offset=block_id_N * BLOCK_N,
+                )
+                matmul_tiles(
+                    lhsT_tiles, rhs_tiles, result_tiles, result.dtype, block_id_K
+                )
+
+            save_result(
                 result,
                 result_tiles,
                 block_id_M,
