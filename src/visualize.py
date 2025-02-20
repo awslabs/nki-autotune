@@ -62,44 +62,60 @@ def plot_tuning_results(tuning_results, fig_dir: str):
     plt.close()
 
 
-def make_sweep_plot(data, save_path):
-    # Calculate number of subfigures needed
+def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
+    # Sort data by M value
+    data = dict(sorted(data.items(), key=lambda x: x[0][0]))
     n_plots = len(data)
-    # Calculate reasonable grid dimensions
     n_cols = math.ceil(math.sqrt(n_plots))
     n_rows = math.ceil(n_plots / n_cols)
 
-    # Create color map for kernels
-    kernel_names = set()
+    fig = plt.figure(figsize=(subplot_width * n_cols + 2, subplot_height * n_rows))
+
+    # Get unique kernel base names (without _best/_worst suffix)
+    kernel_bases = set()
     for results in data.values():
-        kernel_names.update(k for k in results.keys() if k.startswith("matmul_"))
-    kernel_names = sorted(list(kernel_names))
-    colors = sns.color_palette("husl", len(kernel_names))
-    color_dict = dict(zip(kernel_names, colors))
+        kernel_bases.update(
+            k.rsplit("_", 1)[0] for k in results.keys() if k.startswith("matmul_")
+        )
+    kernel_bases = sorted(list(kernel_bases))
 
-    # Create figure and subfigures
-    fig = plt.figure(figsize=(5 * n_cols, 4 * n_rows))
+    # Create color map for kernel base names
+    colors = sns.color_palette("husl", len(kernel_bases))
+    color_dict = dict(zip(kernel_bases, colors))
 
-    # Store one line from each kernel type for legend
-    legend_lines = []
-    legend_labels = []
+    # Store lines for legend
+    kernel_lines = []  # For kernel types
+    style_lines = []  # For best/worst styles
 
-    # Plot each M,N pair in a separate subfigure
+    print(f"{pformat(data)}")
+
     for idx, ((M, N), results) in enumerate(data.items(), 1):
         ax = fig.add_subplot(n_rows, n_cols, idx)
 
-        # Get K values for x-axis
         k_values = results["K"]
 
-        for kernel in kernel_names:
-            if kernel in results:
+        for kernel_base in kernel_bases:
+            best_key = f"{kernel_base}_best"
+            worst_key = f"{kernel_base}_worst"
+            color = color_dict[kernel_base]
+
+            if best_key in results:
                 line = ax.plot(
-                    k_values, results[kernel], marker="o", color=color_dict[kernel]
+                    k_values, results[best_key], color=color, linestyle="-", marker="o"
                 )
-                # Store only the first instance of each kernel type
-                if kernel not in legend_labels:
-                    legend_lines.append(line[0])
-                    legend_labels.append(kernel)
+                if idx == 1:  # Store only from first subplot for legend
+                    kernel_lines.append(line[0])
+
+            if worst_key in results:
+                line = ax.plot(
+                    k_values,
+                    results[worst_key],
+                    color=color,
+                    linestyle="--",
+                    marker="o",
+                )
+                if idx == 1 and len(style_lines) < 2:  # Store one example of each style
+                    style_lines.append(line[0])
 
         ax.set_xticks(k_values)
         ax.set_xticklabels(k_values)
@@ -108,33 +124,56 @@ def make_sweep_plot(data, save_path):
         ax.set_title(f"M={M}, N={N}")
         ax.grid(True)
 
-        # Use log scale if K values span multiple orders of magnitude
         if max(k_values) / min(k_values) > 10:
             ax.set_xscale("log")
 
-    fig.legend(
-        legend_lines,
-        legend_labels,
-        bbox_to_anchor=(1.02, 0.5),  # Position legend to the right
-        loc="center left",  # Anchor point on the legend
+    # Create two legends
+    # First legend for kernel types
+    first_legend = fig.legend(
+        kernel_lines,
+        kernel_bases,
+        bbox_to_anchor=(1.02, 0.6),
+        loc="center left",
+        title="Kernel Types",
         borderaxespad=0,
     )
-    # Adjust layout to prevent overlap
-    plt.tight_layout()
 
-    # Save figure
-    plt.savefig(save_path, bbox_inches="tight", dpi=600)
+    # Second legend for line styles
+    fig.legend(
+        style_lines,
+        ["Best", "Worst"],
+        bbox_to_anchor=(1.02, 0.3),
+        loc="center left",
+        title="Performance",
+        borderaxespad=0,
+    )
+
+    # Add first legend to figure
+    fig.add_artist(first_legend)
+
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
     plt.close()
 
 
-def find_best_latencies(profiling_results):
-    best_latencies = {}
+def find_latencies(profiling_results):
+    latencies = {"best": {}, "worst": {}}
     for result in profiling_results:
         kernel_name = result["configs"]["kernel_name"]
         latency = result["latency"]
-        if kernel_name not in best_latencies or latency < best_latencies[kernel_name]:
-            best_latencies[kernel_name] = latency
-    return best_latencies
+        if latency == float("inf"):
+            continue
+        if (
+            kernel_name not in latencies["best"]
+            or latency < latencies["best"][kernel_name]
+        ):
+            latencies["best"][kernel_name] = latency
+        if (
+            kernel_name not in latencies["worst"]
+            or latency > latencies["worst"][kernel_name]
+        ):
+            latencies["worst"][kernel_name] = latency
+    return latencies
 
 
 def plot_matmul_sweep(prefix):
@@ -148,20 +187,21 @@ def plot_matmul_sweep(prefix):
             tuning_result = pickle.load(open(f"{folder}/tune.pkl", "rb"))
         else:
             continue
-        best_latencies = find_best_latencies(tuning_result)
+        latencies = find_latencies(tuning_result)
         if (M, N) not in fig_data:
             fig_data[(M, N)] = {"K": []}
         fig_data[(M, N)]["K"].append(K)
-        for kernel_name in best_latencies:
-            kernel_latency = best_latencies[kernel_name]
-            if kernel_name not in fig_data[(M, N)]:
-                fig_data[(M, N)][kernel_name] = []
-            fig_data[(M, N)][kernel_name].append(kernel_latency)
+        for category in latencies:
+            for kernel_name in latencies[category]:
+                kernel_latency = latencies[category][kernel_name]
+                latency_type = f"{kernel_name}_{category}"
+                if latency_type not in fig_data[(M, N)]:
+                    fig_data[(M, N)][latency_type] = []
+                fig_data[(M, N)][latency_type].append(kernel_latency)
     sorted_fig_data = {}
     for MN in fig_data:
         M, N = MN
         sorted_fig_data[(M, N)] = sort_by_key(fig_data[MN], "K")
-    print(f"{pformat(sorted_fig_data)}")
     make_sweep_plot(sorted_fig_data, "./matmul_sweep.pdf")
 
 
