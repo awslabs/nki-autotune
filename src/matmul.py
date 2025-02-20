@@ -8,10 +8,17 @@ import numpy as np
 
 
 class MatMul:
-    def __init__(self, lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
+    def __init__(
+        self,
+        lhsT_shape,
+        rhs_shape,
+        TILES_IN_BLOCK_K,
+        TILES_IN_BLOCK_M,
+        TILES_IN_BLOCK_N,
+    ):
         # Input sizes
-        self.K, self.M = lhsT.shape
-        self.K_, self.N = rhs.shape
+        self.K, self.M = lhsT_shape
+        self.K_, self.N = rhs_shape
 
         # Tile sizes
         self.TILE_K = nl.tile_size.pmax  # 128
@@ -31,7 +38,7 @@ class MatMul:
         # Data checks
         assert (
             self.K == self.K_
-        ), f"lhsT and rhs contraction dimension mismatch, got {lhsT.shape} and {rhs.shape}"
+        ), f"lhsT and rhs contraction dimension mismatch, got {lhsT_shape} and {rhs_shape}"
         assert self.NUM_BLOCK_K * TILES_IN_BLOCK_K * self.TILE_K == self.K
         assert self.NUM_BLOCK_M * TILES_IN_BLOCK_M * self.TILE_M == self.M
         assert self.NUM_BLOCK_N * TILES_IN_BLOCK_N * self.TILE_N == self.N
@@ -190,7 +197,9 @@ def save_result_dma(result, result_tiles, block_id, m_ofs, n_ofs, TILE_K):
 
 @nki.jit
 def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
+    mm = MatMul(
+        lhsT.shape, rhs.shape, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N
+    )
 
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
@@ -239,7 +248,9 @@ def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
 
 @nki.jit
 def matmul_MNK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
+    mm = MatMul(
+        lhsT.shape, rhs.shape, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N
+    )
 
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
@@ -289,7 +300,9 @@ def matmul_MNK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
 
 @nki.jit
 def matmul_KMN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
+    mm = MatMul(
+        lhsT.shape, rhs.shape, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N
+    )
 
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
@@ -347,7 +360,9 @@ def matmul_KMN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
 
 @nki.jit
 def matmul_KNM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
+    mm = MatMul(
+        lhsT.shape, rhs.shape, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N
+    )
 
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
@@ -405,7 +420,9 @@ def matmul_KNM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
 
 @nki.jit
 def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
+    mm = MatMul(
+        lhsT.shape, rhs.shape, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N
+    )
 
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
@@ -477,7 +494,9 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
 
 @nki.jit
 def matmul_MKN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
+    mm = MatMul(
+        lhsT.shape, rhs.shape, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N
+    )
 
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 

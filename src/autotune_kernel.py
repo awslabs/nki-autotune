@@ -26,6 +26,7 @@ class Autotune:
         warmup: int = 2,
         iters: int = 5,
         max_workers: int | None = None,
+        pruning_func=None,
         benchmark_machines=None,
         cache_dir="./autotune_cache",
         **kwargs,
@@ -35,6 +36,7 @@ class Autotune:
         self.iters = iters
         self.kwargs = kwargs
         self.max_workers = max_workers
+        self.pruning_func = pruning_func
         self.benchmark_machines = (
             benchmark_machines if benchmark_machines is not None else ["localhost"]
         )
@@ -67,6 +69,7 @@ class Autotune:
                     args=args,
                     kwargs=kwargs,
                     configs=config,
+                    pruning_func=self.pruning_func,
                     device_lock=device_locks[machine],
                     warmup=self.warmup,
                     iters=self.iters,
@@ -90,7 +93,7 @@ class Autotune:
                 }
             )
 
-        self._post_tuning(*args)
+            self._post_tuning(*args)
         return None
 
     def _post_tuning(self, *args):
