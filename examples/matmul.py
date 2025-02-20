@@ -14,6 +14,7 @@ from src.matmul import (
     matmul_MNK,
     matmul_NKM,
     matmul_NMK,
+    MatMul,
 )
 
 
@@ -25,7 +26,7 @@ def get_autotune_configs():
         list: A list of dictionaries, each containing configuration parameters for TILES_IN_BLOCK_M,
                 TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
     """
-    kernels = [matmul_KMN, matmul_KNM, matmul_MNK, matmul_NKM, matmul_NMK]
+    kernels = [matmul_KMN, matmul_MKN, matmul_KNM, matmul_MNK, matmul_NKM, matmul_NMK]
     TILES_IN_BLOCK_M_options = [1, 4, 8, 16]
     TILES_IN_BLOCK_N_options = [1, 4, 8, 16]
     TILES_IN_BLOCK_K_options = [1, 4, 8, 16]
@@ -51,17 +52,24 @@ def get_autotune_configs():
 
 
 if __name__ == "__main__":
-    for free_dim in [1024, 2048]:
-        M = free_dim
-        N = free_dim
-        for K in [128, 256, 512, 1024]:
-            lhsT = nt.tensor[[K, M], nl.float32]
-            rhs = nt.tensor[[K, N], nl.float32]
-            tuner = Autotune(
-                configs=get_autotune_configs(),
-                warmup=2,
-                iters=10,
-                max_workers=2,
-                cache_dir=f"private/matmul-M{M}-N{N}-K{K}",
-            )
-            tuner(lhsT, rhs)
+    pruning_func = MatMul
+    shapes = [1024, 2048, 4096, 8192]
+    MNK = list(
+        product(
+            shapes,
+            shapes,
+            shapes,
+        )
+    )
+    for M, N, K in MNK:
+        lhsT = nt.tensor[[K, M], nl.float32]
+        rhs = nt.tensor[[K, N], nl.float32]
+        tuner = Autotune(
+            configs=get_autotune_configs(),
+            warmup=10,
+            iters=100,
+            max_workers=2,
+            pruning_func=pruning_func,
+            cache_dir=f"private/matmul-M{M}-N{N}-K{K}",
+        )
+        tuner(lhsT, rhs)

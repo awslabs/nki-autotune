@@ -7,12 +7,16 @@ def test_design(
     args,
     kwargs,
     configs,
+    pruning_func,
     device_lock,
     warmup,
     iters,
     cache_dir,
     benchmark_machine=None,
 ) -> float:
+    # Pruning func should auto fail if the inputs are illegal
+    arg_shapes = [arg.tensor_shape for arg in args]
+    pruning_func(*arg_shapes, **configs, **kwargs)
     bench_func = nki.benchmark(
         warmup=warmup,
         iters=iters,
