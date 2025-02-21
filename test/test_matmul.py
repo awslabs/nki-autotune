@@ -111,8 +111,3 @@ def test_matmul(
     rtol = 1e-3
     match = allclose(nki_out, golden_output, atol=atol, rtol=rtol, verbose=1)
     assert match
-
-
-if __name__ == "__main__":
-    tests = get_tests()
-    print(len(tests))
