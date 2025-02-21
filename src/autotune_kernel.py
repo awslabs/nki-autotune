@@ -25,7 +25,6 @@ class Autotune:
         configs: List[dict],
         warmup: int = 2,
         iters: int = 5,
-        max_workers: int | None = None,
         pruning_func=None,
         benchmark_machines=None,
         cache_dir="./autotune_cache",
@@ -35,7 +34,6 @@ class Autotune:
         self.warmup = warmup
         self.iters = iters
         self.kwargs = kwargs
-        self.max_workers = max_workers
         self.pruning_func = pruning_func
         self.benchmark_machines = (
             benchmark_machines if benchmark_machines is not None else ["localhost"]
