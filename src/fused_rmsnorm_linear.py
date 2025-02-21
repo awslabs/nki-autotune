@@ -228,7 +228,7 @@ def allocated_fused_rms_norm_qkv(hidden, weights, hidden_buffer_degree, eps):
     return out_tensor
 
 
-@enable_stack_allocator(log_level=logging.INFO)
+@nki.compiler.enable_stack_allocator(log_level=logging.INFO)
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
 def stack_allocated_fused_rms_norm_qkv(
