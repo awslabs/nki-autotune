@@ -3,7 +3,7 @@
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
-from src.allocation import update_base_addr
+from src.allocation.utils import update_base_addr
 
 import math
 import neuronxcc.nki as nki

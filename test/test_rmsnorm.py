@@ -5,7 +5,10 @@ from src.weighted_rmsnorm import (
     weighted_rmsnorm,
     allocated_weighted_rmsnorm,
 )
-from src.fused_rmsnorm_linear import allocated_fused_rms_norm_qkv, stack_allocated_fused_rms_norm_qkv
+from src.fused_rmsnorm_linear import (
+    allocated_fused_rms_norm_qkv,
+    stack_allocated_fused_rms_norm_qkv,
+)
 
 import neuronxcc.nki.language as nl
 from neuronxcc.starfish.support.util import allclose
@@ -111,6 +114,7 @@ def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
     match = allclose(allocated_out, golden_output, atol=atol, rtol=rtol, verbose=1)
     assert match
 
+
 @pytest.mark.parametrize(
     "batch, seqlen, dim, d_head, buffer_degree, eps",
     [
@@ -119,7 +123,9 @@ def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
         (1, 4096, 2048, 128, 4, 1e-6),
     ],
 )
-def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree, eps):
+def test_stack_allocated_fused_rms_norm_qkv(
+    batch, seqlen, dim, d_head, buffer_degree, eps
+):
     hidden = np.random.random_sample((batch, seqlen, dim))
     qkv_weights = np.random.random_sample((dim, d_head))
     golden_output = nl.static_cast(

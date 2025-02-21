@@ -13,8 +13,17 @@ import numpy as np
 from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
-from src.allocation import update_base_addr
-from private.decorators import enable_stack_allocator
+from src.allocation.decorators import enable_stack_allocator
+from src.allocation.utils import update_base_addr
+
+
+def compatibility_checks(hidden_shape, weights_shape):
+    print(f"hidden_shape = {hidden_shape}. weights_shape = {weights_shape}.")
+    batch, seqlen, dim = hidden_shape
+    _dim, head_dim = weights_shape
+    assert dim <= 8192 and dim & 128 == 0, "Unsupported hidden dimension"
+    assert _dim == dim, "Reduction dimension must match"
+    assert head_dim <= 512, "Head dimension must be 512 or less"
 
 
 @nki.compiler.skip_middle_end_transformations
@@ -29,14 +38,11 @@ def allocated_fused_rms_norm_qkv(hidden, weights, hidden_buffer_degree, eps):
         weights (_type_): Fused QKV linear weights, assumed to be eltwise-multiplied with RMS norm weight vector (gamma)
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
+    compatibility_checks(hidden.shape, weights.shape)
     # Hidden should be in BSH layout.
     batch, batchless_shape = hidden.shape[0], hidden.shape[1:]
     seqlen, dim = batchless_shape
     _dim, head_dim = weights.shape
-
-    assert dim <= 8192 and dim & 128 == 0, "Unsupported hidden dimension"
-    assert _dim == dim, "Reduction dimension must match"
-    assert head_dim <= 512, "Head dimension must be 512 or less"
 
     norm_dtype = nl.float32
 
@@ -228,7 +234,7 @@ def allocated_fused_rms_norm_qkv(hidden, weights, hidden_buffer_degree, eps):
     return out_tensor
 
 
-@nki.compiler.enable_stack_allocator(log_level=logging.INFO)
+@enable_stack_allocator(log_level=logging.INFO)
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
 def stack_allocated_fused_rms_norm_qkv(
@@ -245,14 +251,10 @@ def stack_allocated_fused_rms_norm_qkv(
         norm_dtype (_type_, optional): Data type for RMS norm, should be f32 to avoid NaN. Defaults to nl.float32.
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
+    compatibility_checks(hidden.shape, weights.shape)
     # Hidden should be in BSH layout.
-    batch, batchless_shape = hidden.shape[0], hidden.shape[1:]
-    seqlen, dim = batchless_shape
+    batch, seqlen, dim = hidden.shape
     _dim, head_dim = weights.shape
-
-    assert dim <= 8192 and dim & 128 == 0, "Unsupported hidden dimension"
-    assert _dim == dim, "Reduction dimension must match"
-    assert head_dim <= 512, "Head dimension must be 512 or less"
 
     out_tensor = nl.ndarray(
         (batch, seqlen, head_dim), dtype=hidden.dtype, buffer=nl.shared_hbm
