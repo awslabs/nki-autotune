@@ -27,9 +27,9 @@ def get_autotune_configs():
                 TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
     """
     kernels = [matmul_KMN, matmul_MKN, matmul_KNM, matmul_MNK, matmul_NKM, matmul_NMK]
-    TILES_IN_BLOCK_M_options = [1, 4, 8, 16]
-    TILES_IN_BLOCK_N_options = [1, 4, 8, 16]
-    TILES_IN_BLOCK_K_options = [1, 4, 8, 16]
+    TILES_IN_BLOCK_M_options = [1, 2, 4, 8, 16, 32, 64]
+    TILES_IN_BLOCK_N_options = [1, 2, 4, 8, 16, 32, 64]
+    TILES_IN_BLOCK_K_options = [1, 2, 4, 8, 16, 32, 64]
     params = list(
         product(
             kernels,
@@ -68,8 +68,7 @@ if __name__ == "__main__":
             configs=get_autotune_configs(),
             warmup=10,
             iters=100,
-            max_workers=2,
             pruning_func=pruning_func,
-            cache_dir=f"private/matmul-M{M}-N{N}-K{K}",
+            cache_dir=f"/home/ubuntu/matmul/M{M}-N{N}-K{K}",
         )
         tuner(lhsT, rhs)

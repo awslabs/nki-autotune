@@ -64,7 +64,7 @@ def plot_tuning_results(tuning_results, fig_dir: str):
 
 def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
     # Sort data by M value
-    data = dict(sorted(data.items(), key=lambda x: x[0][0]))
+    data = dict(sorted(data.items(), key=lambda x: x[0]))
     n_plots = len(data)
     n_cols = math.ceil(math.sqrt(n_plots))
     n_rows = math.ceil(n_plots / n_cols)
@@ -85,12 +85,12 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
 
     # Store lines for legend
     kernel_lines = []  # For kernel types
-    style_lines = []  # For best/worst styles
+    style_lines = [None, None]  # For best/worst styles
 
     print(f"{pformat(data)}")
 
-    for idx, ((M, N), results) in enumerate(data.items(), 1):
-        ax = fig.add_subplot(n_rows, n_cols, idx)
+    for subplot_idx, ((M, N), results) in enumerate(data.items(), 1):
+        ax = fig.add_subplot(n_rows, n_cols, subplot_idx)
 
         k_values = results["K"]
 
@@ -103,8 +103,10 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
                 line = ax.plot(
                     k_values, results[best_key], color=color, linestyle="-", marker="o"
                 )
-                if idx == 1:  # Store only from first subplot for legend
+                if subplot_idx == 1:  # Store only from first subplot for legend
                     kernel_lines.append(line[0])
+                if style_lines[0] is None:
+                    style_lines[0] = line[0]
 
             if worst_key in results:
                 line = ax.plot(
@@ -112,10 +114,10 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
                     results[worst_key],
                     color=color,
                     linestyle="--",
-                    marker="o",
+                    marker="x",
                 )
-                if idx == 1 and len(style_lines) < 2:  # Store one example of each style
-                    style_lines.append(line[0])
+                if style_lines[1] is None:
+                    style_lines[1] = line[0]
 
         ax.set_xticks(k_values)
         ax.set_xticklabels(k_values)
@@ -141,7 +143,7 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
     # Second legend for line styles
     fig.legend(
         style_lines,
-        ["Best", "Worst"],
+        ["Best Meta Parameter", "Worst Meta Parameter"],
         bbox_to_anchor=(1.02, 0.3),
         loc="center left",
         title="Performance",
@@ -206,4 +208,4 @@ def plot_matmul_sweep(prefix):
 
 
 if __name__ == "__main__":
-    plot_matmul_sweep("private/matmul-")
+    plot_matmul_sweep("/home/ubuntu/matmul/")
