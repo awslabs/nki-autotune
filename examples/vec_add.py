@@ -74,12 +74,8 @@ def vector_add_stream_auto(a_vec, b_vec, out, PARTITION_DIM=128, FREE_DIM=1000):
     for m in nl.affine_range((M // TILE_M)):
 
         # Allocate space for a reshaped tile
-        a_tile = nl.ndarray(
-            (PARTITION_DIM, FREE_DIM), dtype=a_vec.dtype, buffer=nl.sbuf
-        )
-        b_tile = nl.ndarray(
-            (PARTITION_DIM, FREE_DIM), dtype=a_vec.dtype, buffer=nl.sbuf
-        )
+        a_tile = nl.ndarray((PARTITION_DIM, FREE_DIM), dtype=a_vec.dtype, buffer=nl.sbuf)
+        b_tile = nl.ndarray((PARTITION_DIM, FREE_DIM), dtype=a_vec.dtype, buffer=nl.sbuf)
 
         # Load the input tiles
         a_tile = nl.load(a_vec_re[m])

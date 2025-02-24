@@ -3,3 +3,4 @@ dill
 pytest
 black
 seaborn
+pytest-progress

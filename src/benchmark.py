@@ -1,22 +1,21 @@
 import neuronxcc.nki as nki
+from neuronxcc.nki.compile import GenericKernel
+
 import shutil, subprocess
+from typing import Callable, Dict, Tuple
 
 
 def test_design(
-    func,
-    args,
-    kwargs,
-    configs,
-    pruning_func,
+    func: GenericKernel,
+    args: Tuple,
+    kwargs: Dict,
+    configs: Dict,
     device_lock,
-    warmup,
-    iters,
-    cache_dir,
+    warmup: int,
+    iters: int,
+    cache_dir: str,
     benchmark_machine=None,
 ) -> float:
-    # Pruning func should auto fail if the inputs are illegal
-    arg_shapes = [arg.tensor_shape for arg in args]
-    pruning_func(*arg_shapes, **configs, **kwargs)
     bench_func = nki.benchmark(
         warmup=warmup,
         iters=iters,
@@ -35,12 +34,7 @@ def test_design(
     return p99
 
 
-def test_kernel(
-    func,
-    args,
-    warmup,
-    iters,
-) -> float:
+def test_kernel(func, args, warmup, iters) -> float:
     """Profile the NKI kernel P99 latency
 
     Args:
@@ -52,10 +46,7 @@ def test_kernel(
     Returns:
         float: P99 latency
     """
-    bench_func = nki.benchmark(
-        warmup=warmup,
-        iters=iters,
-    )(func)
+    bench_func = nki.benchmark(warmup=warmup, iters=iters)(func)
     bench_func(*args)
     latency_res = bench_func.benchmark_result.nc_latency
     p99 = latency_res.get_latency_percentile(99)

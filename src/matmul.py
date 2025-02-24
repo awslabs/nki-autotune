@@ -5,41 +5,135 @@ import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki as nki
 import numpy as np
+from neuronxcc.nki.compiler.backends.neuron.tensors import TensorRef, KernelHBMTensor
+from typing import Tuple
+from itertools import permutations
 
 
-class MatMul:
-    def __init__(self, lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
+class MatMulCompatibility:
+    """
+    Inputs compatibility checks for GEMM kernels
+    """
+
+    def __init__(
+        self,
+        lhsT_shape: Tuple,
+        rhs_shape: Tuple,
+        TILES_IN_BLOCK_K: int,
+        TILES_IN_BLOCK_M: int,
+        TILES_IN_BLOCK_N: int,
+        BUFFER_K: int,
+        BUFFER_M: int,
+        BUFFER_N: int,
+        loop_order: str,
+    ):
         # Input sizes
-        self.K, self.M = lhsT.shape
-        self.K_, self.N = rhs.shape
+        self.K, self.M = lhsT_shape
+        self.K_, self.N = rhs_shape
 
-        # Tile sizes
+        # Single tile sizes
         self.TILE_K = nl.tile_size.pmax  # 128
         self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
         self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
 
+        # Tiles in a block
+        self.TILES_IN_BLOCK_K = TILES_IN_BLOCK_K
+        self.TILES_IN_BLOCK_M = TILES_IN_BLOCK_M
+        self.TILES_IN_BLOCK_N = TILES_IN_BLOCK_N
+
         # Block sizes
-        self.BLOCK_K = self.TILE_K * TILES_IN_BLOCK_K
-        self.BLOCK_M = self.TILE_M * TILES_IN_BLOCK_M
-        self.BLOCK_N = self.TILE_N * TILES_IN_BLOCK_N
+        self.BLOCK_K = self.TILE_K * self.TILES_IN_BLOCK_K
+        self.BLOCK_M = self.TILE_M * self.TILES_IN_BLOCK_M
+        self.BLOCK_N = self.TILE_N * self.TILES_IN_BLOCK_N
 
         # Number of blocks
         self.NUM_BLOCK_K = self.K // self.BLOCK_K
         self.NUM_BLOCK_M = self.M // self.BLOCK_M
         self.NUM_BLOCK_N = self.N // self.BLOCK_N
 
-        # Data checks
+        # Buffer degrees
+        self.BUFFER_K = BUFFER_K
+        self.BUFFER_M = BUFFER_M
+        self.BUFFER_N = BUFFER_N
+
+        self.loop_order = loop_order
+
+        self._data_checks()
+
+    def _data_checks(self):
+        assert self.K == self.K_, f"lhsT and rhs contraction dimension mismatch, got {self.K} and {self.K_}"
         assert (
-            self.K == self.K_
-        ), f"lhsT and rhs contraction dimension mismatch, got {lhsT.shape} and {rhs.shape}"
-        assert self.NUM_BLOCK_K * TILES_IN_BLOCK_K * self.TILE_K == self.K
-        assert self.NUM_BLOCK_M * TILES_IN_BLOCK_M * self.TILE_M == self.M
-        assert self.NUM_BLOCK_N * TILES_IN_BLOCK_N * self.TILE_N == self.N
+            self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K * self.TILE_K == self.K
+        ), f"NUM_BLOCK_K {self.NUM_BLOCK_K} * TILES_IN_BLOCK_K {self.TILES_IN_BLOCK_K} * TILE_K {self.TILE_K} != K {self.K}"
+        assert (
+            self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M * self.TILE_M == self.M
+        ), f"NUM_BLOCK_M {self.NUM_BLOCK_M} * TILES_IN_BLOCK_M {self.TILES_IN_BLOCK_M} * TILE_M {self.TILE_M} != M {self.M}"
+        assert (
+            self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N * self.TILE_N == self.N
+        ), f"NUM_BLOCK_N {self.NUM_BLOCK_N} * TILES_IN_BLOCK_N {self.TILES_IN_BLOCK_N} * TILE_N {self.TILE_N} != N {self.N}"
+
+        assert (
+            self.BUFFER_M <= self.NUM_BLOCK_M
+        ), f"M buffer degree {self.BUFFER_M} cannot be larger than number of blocks {self.NUM_BLOCK_M}"
+        assert (
+            self.BUFFER_N <= self.NUM_BLOCK_N
+        ), f"N buffer degree {self.BUFFER_N} cannot be larger than number of blocks {self.NUM_BLOCK_N}"
+        assert (
+            self.BUFFER_K <= self.NUM_BLOCK_K
+        ), f"K buffer degree {self.BUFFER_K} cannot be larger than number of blocks {self.NUM_BLOCK_K}"
+
+        assert self.loop_order in [
+            "MNK",
+            "MKN",
+            "NMK",
+            "NKM",
+            "KMN",
+            "KNM",
+        ], f"Loop order {self.loop_order} GEMM does not exist."
 
 
-def load_tensor_by_par_tiles(
-    input_tensor, num_par_tiles, par_tile_size, free_dim_size, par_ofs, free_ofs
+@nki.jit
+def matmul_main(
+    lhsT: TensorRef,
+    rhs: TensorRef,
+    TILES_IN_BLOCK_K: int,
+    TILES_IN_BLOCK_M: int,
+    TILES_IN_BLOCK_N: int,
+    BUFFER_K: int,
+    BUFFER_M: int,
+    BUFFER_N: int,
+    loop_order: str,
 ):
+    mm = MatMulCompatibility(
+        lhsT.shape,
+        rhs.shape,
+        TILES_IN_BLOCK_K,
+        TILES_IN_BLOCK_M,
+        TILES_IN_BLOCK_N,
+        BUFFER_K,
+        BUFFER_M,
+        BUFFER_N,
+        loop_order,
+    )
+    result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    if loop_order == "MNK":
+        return matmul_MNK(lhsT, rhs, mm, result)
+    elif loop_order == "MKN":
+        return matmul_MKN(lhsT, rhs, mm, result)
+    elif loop_order == "NMK":
+        return matmul_NMK(lhsT, rhs, mm, result)
+    elif loop_order == "NKM":
+        return matmul_NKM(lhsT, rhs, mm, result)
+    elif loop_order == "KMN":
+        return matmul_KMN(lhsT, rhs, mm, result)
+    elif loop_order == "KNM":
+        return matmul_KNM(lhsT, rhs, mm, result)
+    else:
+        raise NotImplementedError(f"Loop order {loop_order} GEMM does not exist.")
+
+
+def load_tensor_by_par_tiles(input_tensor, num_par_tiles, par_tile_size, free_dim_size, par_ofs, free_ofs):
     """
     Load a rectangular area of shape (num_par_tiles * par_tile_size, free_dim_size) from the input tensor.
     The location of the rectangle from the input is offset by (par_ofs, free_ofs).
@@ -60,17 +154,13 @@ def load_tensor_by_par_tiles(
     """
 
     tiles = nl.ndarray(
-        (num_par_tiles, nl.par_dim(par_tile_size), free_dim_size),
-        dtype=input_tensor.dtype,
-        buffer=nl.sbuf,
+        (num_par_tiles, nl.par_dim(par_tile_size), free_dim_size), dtype=input_tensor.dtype, buffer=nl.sbuf
     )
 
     idx = nl.mgrid[0:par_tile_size, 0:free_dim_size]
     for par_tile_id in nl.affine_range(num_par_tiles):
         tiles[par_tile_id, idx.p, idx.x] = nl.load(
-            input_tensor[
-                par_ofs + par_tile_id * par_tile_size + idx.p, free_ofs + idx.x
-            ]
+            input_tensor[par_ofs + par_tile_id * par_tile_size + idx.p, free_ofs + idx.x]
         )
     return tiles
 
@@ -88,9 +178,7 @@ def matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles, result_dtype):
     assert (
         m == num_m_tiles * TILE_M
     ), f"lhsT_tiles {lhsT_tiles.shape} does not match with result_tiles {result_tiles.shape}"
-    assert (
-        n == _n
-    ), f"rhs_tiles {rhs_tiles.shape} does not match with result_tiles {result_tiles.shape}"
+    assert n == _n, f"rhs_tiles {rhs_tiles.shape} does not match with result_tiles {result_tiles.shape}"
 
     idx_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
@@ -107,9 +195,7 @@ def matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles, result_dtype):
                     rhs_tiles[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x],
                 )
 
-            result_tiles[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += res_tile[
-                idx_res.p, idx_res.x
-            ]
+            result_tiles[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += res_tile[idx_res.p, idx_res.x]
 
 
 def save_result_block(result, result_tiles, m_ofs, n_ofs):
@@ -119,18 +205,13 @@ def save_result_block(result, result_tiles, m_ofs, n_ofs):
     for tile_id_M in nl.affine_range(num_m_tiles):
         for tile_id_N in nl.affine_range(num_n_tiles):
             nl.store(
-                result[
-                    m_ofs + tile_id_M * TILE_M + idx_res.p,
-                    n_ofs + tile_id_N * TILE_N + idx_res.x,
-                ],
+                result[m_ofs + tile_id_M * TILE_M + idx_res.p, n_ofs + tile_id_N * TILE_N + idx_res.x],
                 value=result_tiles[tile_id_M, tile_id_N],
             )
 
 
 def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
-    NUM_BLOCK_K, NUM_BLOCK_M, NUM_BLOCK_N, num_m_tiles, num_n_tiles, TILE_M, TILE_N = (
-        result_tiles.shape
-    )
+    NUM_BLOCK_K, NUM_BLOCK_M, NUM_BLOCK_N, num_m_tiles, num_n_tiles, TILE_M, TILE_N = result_tiles.shape
 
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for block_id_M in nl.affine_range(NUM_BLOCK_M):
@@ -140,9 +221,7 @@ def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
             for tile_id_M in nl.affine_range(num_m_tiles):
                 for tile_id_N in nl.affine_range(num_n_tiles):
                     result_acc = nl.zeros(
-                        (num_m_tiles, num_n_tiles, nl.par_dim(TILE_M), TILE_N),
-                        dtype=result_tiles.dtype,
-                        buffer=nl.sbuf,
+                        (num_m_tiles, num_n_tiles, nl.par_dim(TILE_M), TILE_N), dtype=result_tiles.dtype, buffer=nl.sbuf
                     )
                     for block_id_K in nl.affine_range(NUM_BLOCK_K):
                         result_acc[tile_id_M, tile_id_N] += result_tiles[
@@ -150,10 +229,7 @@ def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
                         ]
 
                     nl.store(
-                        result[
-                            m_ofs + tile_id_M * TILE_M + idx_res.p,
-                            n_ofs + tile_id_N * TILE_N + idx_res.x,
-                        ],
+                        result[m_ofs + tile_id_M * TILE_M + idx_res.p, n_ofs + tile_id_N * TILE_N + idx_res.x],
                         value=result_acc[tile_id_M, tile_id_N],
                     )
 
@@ -165,9 +241,7 @@ def save_result_dma(result, result_tiles, block_id, m_ofs, n_ofs, TILE_K):
         idx_res = nl.mgrid[0:TILE_K, 0:TILE_N]
         idx_res_packed = nl.mgrid[0:TILE_K, 0 : TILE_N * num_n_tiles]
 
-        result_packed = nl.ndarray(
-            (TILE_K, TILE_N * num_n_tiles), dtype=result_tiles.dtype, buffer=nl.sbuf
-        )
+        result_packed = nl.ndarray((TILE_K, TILE_N * num_n_tiles), dtype=result_tiles.dtype, buffer=nl.sbuf)
 
         # coalesce result tiles for better DMA performance
         for tile_id_N in nl.affine_range(num_n_tiles):
@@ -176,38 +250,25 @@ def save_result_dma(result, result_tiles, block_id, m_ofs, n_ofs, TILE_K):
             )
 
         nl.store(
-            result[
-                (m_ofs + tile_id_M) * TILE_K + idx_res_packed.p,
-                n_ofs + idx_res_packed.x,
-            ],
+            result[(m_ofs + tile_id_M) * TILE_K + idx_res_packed.p, n_ofs + idx_res_packed.x],
             value=result_packed[idx_res_packed.p, idx_res_packed.x],
         )
 
 
-@nki.jit
-def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
-
-    result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-    for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-        for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+def matmul_NMK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
+    for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
+        for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
             result_tiles = nl.zeros(
-                (
-                    TILES_IN_BLOCK_M,
-                    TILES_IN_BLOCK_N,
-                    nl.par_dim(mm.TILE_M),
-                    mm.TILE_N,
-                ),
+                (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
                 dtype=result.dtype,
                 buffer=nl.sbuf,
             )
 
-            for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
+            for block_id_K in nl.affine_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
                 lhsT_tiles = load_tensor_by_par_tiles(
                     input_tensor=lhsT,
-                    num_par_tiles=TILES_IN_BLOCK_K,
+                    num_par_tiles=mm.TILES_IN_BLOCK_K,
                     par_tile_size=mm.TILE_K,
                     free_dim_size=mm.BLOCK_M,
                     par_ofs=block_id_K * mm.BLOCK_K,
@@ -216,7 +277,7 @@ def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
                 rhs_tiles = load_tensor_by_par_tiles(
                     input_tensor=rhs,
-                    num_par_tiles=TILES_IN_BLOCK_K,
+                    num_par_tiles=mm.TILES_IN_BLOCK_K,
                     par_tile_size=mm.TILE_K,
                     free_dim_size=mm.BLOCK_N,
                     par_ofs=block_id_K * mm.BLOCK_K,
@@ -224,39 +285,24 @@ def matmul_NMK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                 )
                 matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles, result.dtype)
 
-            save_result_block(
-                result,
-                result_tiles,
-                m_ofs=block_id_M * mm.BLOCK_M,
-                n_ofs=block_id_N * mm.BLOCK_N,
-            )
+            save_result_block(result, result_tiles, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
     return result
 
 
-@nki.jit
-def matmul_MNK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
-
-    result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+def matmul_MNK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
+    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
+        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
             result_tiles = nl.zeros(
-                (
-                    TILES_IN_BLOCK_M,
-                    TILES_IN_BLOCK_N,
-                    nl.par_dim(mm.TILE_M),
-                    mm.TILE_N,
-                ),
+                (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
                 dtype=result.dtype,
                 buffer=nl.sbuf,
             )
 
-            for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
+            for block_id_K in nl.affine_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
                 lhsT_tiles = load_tensor_by_par_tiles(
                     input_tensor=lhsT,
-                    num_par_tiles=TILES_IN_BLOCK_K,
+                    num_par_tiles=mm.TILES_IN_BLOCK_K,
                     par_tile_size=mm.TILE_K,
                     free_dim_size=mm.BLOCK_M,
                     par_ofs=block_id_K * mm.BLOCK_K,
@@ -265,7 +311,7 @@ def matmul_MNK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
                 rhs_tiles = load_tensor_by_par_tiles(
                     input_tensor=rhs,
-                    num_par_tiles=TILES_IN_BLOCK_K,
+                    num_par_tiles=mm.TILES_IN_BLOCK_K,
                     par_tile_size=mm.TILE_K,
                     free_dim_size=mm.BLOCK_N,
                     par_ofs=block_id_K * mm.BLOCK_K,
@@ -273,29 +319,20 @@ def matmul_MNK(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                 )
                 matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles, result.dtype)
 
-            save_result_block(
-                result,
-                result_tiles,
-                m_ofs=block_id_M * mm.BLOCK_M,
-                n_ofs=block_id_N * mm.BLOCK_N,
-            )
+            save_result_block(result, result_tiles, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
 
     return result
 
 
-@nki.jit
-def matmul_KMN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
-
-    result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+def matmul_KMN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
 
     result_tiles = nl.zeros(
         (
             mm.NUM_BLOCK_K,
             mm.NUM_BLOCK_M,
             mm.NUM_BLOCK_N,
-            TILES_IN_BLOCK_M,
-            TILES_IN_BLOCK_N,
+            mm.TILES_IN_BLOCK_M,
+            mm.TILES_IN_BLOCK_N,
             nl.par_dim(mm.TILE_M),
             mm.TILE_N,
         ),
@@ -303,57 +340,43 @@ def matmul_KMN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
         buffer=nl.sbuf,
     )
 
-    for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
-        for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+    for block_id_K in nl.affine_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
+        for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
             # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
             lhsT_tiles = load_tensor_by_par_tiles(
                 input_tensor=lhsT,
-                num_par_tiles=TILES_IN_BLOCK_K,
+                num_par_tiles=mm.TILES_IN_BLOCK_K,
                 par_tile_size=mm.TILE_K,
                 free_dim_size=mm.BLOCK_M,
                 par_ofs=block_id_K * mm.BLOCK_K,
                 free_ofs=block_id_M * mm.BLOCK_M,
             )
-            for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+            for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
                 rhs_tiles = load_tensor_by_par_tiles(
                     input_tensor=rhs,
-                    num_par_tiles=TILES_IN_BLOCK_K,
+                    num_par_tiles=mm.TILES_IN_BLOCK_K,
                     par_tile_size=mm.TILE_K,
                     free_dim_size=mm.BLOCK_N,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_N * mm.BLOCK_N,
                 )
 
-                matmul_tiles(
-                    lhsT_tiles,
-                    rhs_tiles,
-                    result_tiles[block_id_K, block_id_M, block_id_N],
-                    result.dtype,
-                )
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N], result.dtype)
 
-    save_result_acc(
-        result,
-        result_tiles,
-        mm.BLOCK_M,
-        mm.BLOCK_N,
-    )
+    save_result_acc(result, result_tiles, mm.BLOCK_M, mm.BLOCK_N)
     return result
 
 
-@nki.jit
-def matmul_KNM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
-
-    result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+def matmul_KNM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
 
     result_tiles = nl.zeros(
         (
             mm.NUM_BLOCK_K,
             mm.NUM_BLOCK_M,
             mm.NUM_BLOCK_N,
-            TILES_IN_BLOCK_M,
-            TILES_IN_BLOCK_N,
+            mm.TILES_IN_BLOCK_M,
+            mm.TILES_IN_BLOCK_N,
             nl.par_dim(mm.TILE_M),
             mm.TILE_N,
         ),
@@ -361,60 +384,40 @@ def matmul_KNM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
         buffer=nl.sbuf,
     )
 
-    for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
-        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+    for block_id_K in nl.affine_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
+        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
             # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
             rhs_tiles = load_tensor_by_par_tiles(
                 input_tensor=rhs,
-                num_par_tiles=TILES_IN_BLOCK_K,
+                num_par_tiles=mm.TILES_IN_BLOCK_K,
                 par_tile_size=mm.TILE_K,
                 free_dim_size=mm.BLOCK_N,
                 par_ofs=block_id_K * mm.BLOCK_K,
                 free_ofs=block_id_N * mm.BLOCK_N,
             )
-            for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+            for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
                 lhsT_tiles = load_tensor_by_par_tiles(
                     input_tensor=lhsT,
-                    num_par_tiles=TILES_IN_BLOCK_K,
+                    num_par_tiles=mm.TILES_IN_BLOCK_K,
                     par_tile_size=mm.TILE_K,
                     free_dim_size=mm.BLOCK_M,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_M * mm.BLOCK_M,
                 )
 
-                matmul_tiles(
-                    lhsT_tiles,
-                    rhs_tiles,
-                    result_tiles[block_id_K, block_id_M, block_id_N],
-                    result.dtype,
-                )
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N], result.dtype)
 
-    save_result_acc(
-        result,
-        result_tiles,
-        mm.BLOCK_M,
-        mm.BLOCK_N,
-    )
+    save_result_acc(result, result_tiles, mm.BLOCK_M, mm.BLOCK_N)
     return result
 
 
-@nki.jit
-def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
-
-    result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+def matmul_NKM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
 
     # Blocking N dimension (the RHS free dimension)
-    for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+    for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
         result_tiles = nl.zeros(
-            (
-                mm.NUM_BLOCK_M,
-                TILES_IN_BLOCK_M,
-                TILES_IN_BLOCK_N,
-                nl.par_dim(mm.TILE_M),
-                mm.TILE_N,
-            ),
+            (mm.NUM_BLOCK_M, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
             dtype=result.dtype,
             buffer=nl.sbuf,
         )
@@ -422,12 +425,12 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
         # Blocking K dimension (the contraction dimension)
         # Use `sequential_range` because we do not want the compiler to change this loop by,
         # for example, vectorizing it
-        for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
+        for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
             # Loading tiles from rhs
             # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
             rhs_tiles = load_tensor_by_par_tiles(
                 input_tensor=rhs,
-                num_par_tiles=TILES_IN_BLOCK_K,
+                num_par_tiles=mm.TILES_IN_BLOCK_K,
                 par_tile_size=mm.TILE_K,
                 free_dim_size=mm.BLOCK_N,
                 par_ofs=block_id_K * mm.BLOCK_K,
@@ -435,20 +438,18 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
             )
 
             # Blocking M dimension (the LHS free dimension)
-            for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+            for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
                 # Loading tiles from lhsT
                 lhsT_tiles = load_tensor_by_par_tiles(
                     input_tensor=lhsT,
-                    num_par_tiles=TILES_IN_BLOCK_K,
+                    num_par_tiles=mm.TILES_IN_BLOCK_K,
                     par_tile_size=mm.TILE_K,
                     free_dim_size=mm.BLOCK_M,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_M * mm.BLOCK_M,
                 )
 
-                matmul_tiles(
-                    lhsT_tiles, rhs_tiles, result_tiles[block_id_M], result.dtype
-                )
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_M], result.dtype)
 
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
             """
@@ -463,7 +464,7 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                 result,
                 result_tiles,
                 block_id_M,
-                m_ofs=block_id_M * TILES_IN_BLOCK_M,
+                m_ofs=block_id_M * mm.TILES_IN_BLOCK_M,
                 n_ofs=block_id_N * mm.BLOCK_N,
                 TILE_K=mm.TILE_K,
             )
@@ -471,22 +472,11 @@ def matmul_NKM(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
     return result
 
 
-@nki.jit
-def matmul_MKN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
-    mm = MatMul(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
-
-    result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
+def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
     # Blocking M dimension (the LHS free dimension)
-    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
         result_tiles = nl.zeros(
-            (
-                mm.NUM_BLOCK_N,
-                TILES_IN_BLOCK_M,
-                TILES_IN_BLOCK_N,
-                nl.par_dim(mm.TILE_M),
-                mm.TILE_N,
-            ),
+            (mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
             dtype=result.dtype,
             buffer=nl.sbuf,
         )
@@ -494,11 +484,11 @@ def matmul_MKN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
         # Blocking K dimension (the contraction dimension)
         # Use `sequential_range` because we do not want the compiler to change this loop by,
         # for example, vectorizing it
-        for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
+        for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
             # Loading tiles from lhsT
             lhsT_tiles = load_tensor_by_par_tiles(
                 input_tensor=lhsT,
-                num_par_tiles=TILES_IN_BLOCK_K,
+                num_par_tiles=mm.TILES_IN_BLOCK_K,
                 par_tile_size=mm.TILE_K,
                 free_dim_size=mm.BLOCK_M,
                 par_ofs=block_id_K * mm.BLOCK_K,
@@ -506,21 +496,19 @@ def matmul_MKN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
             )
 
             # Blocking N dimension (the RHS free dimension)
-            for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+            for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
                 # Loading tiles from rhs
                 # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
                 rhs_tiles = load_tensor_by_par_tiles(
                     input_tensor=rhs,
-                    num_par_tiles=TILES_IN_BLOCK_K,
+                    num_par_tiles=mm.TILES_IN_BLOCK_K,
                     par_tile_size=mm.TILE_K,
                     free_dim_size=mm.BLOCK_N,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_N * mm.BLOCK_N,
                 )
 
-                matmul_tiles(
-                    lhsT_tiles, rhs_tiles, result_tiles[block_id_N], result.dtype
-                )
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_N], result.dtype)
 
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             """
@@ -535,7 +523,7 @@ def matmul_MKN(lhsT, rhs, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N):
                 result,
                 result_tiles,
                 block_id_N,
-                m_ofs=block_id_M * TILES_IN_BLOCK_M,
+                m_ofs=block_id_M * mm.TILES_IN_BLOCK_M,
                 n_ofs=block_id_N * mm.BLOCK_N,
                 TILE_K=mm.TILE_K,
             )
