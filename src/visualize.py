@@ -74,9 +74,7 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
     # Get unique kernel base names (without _best/_worst suffix)
     kernel_bases = set()
     for results in data.values():
-        kernel_bases.update(
-            k.rsplit("_", 1)[0] for k in results.keys() if k.startswith("matmul_")
-        )
+        kernel_bases.update(k.rsplit("_", 1)[0] for k in results.keys() if k.startswith("matmul_"))
     kernel_bases = sorted(list(kernel_bases))
 
     # Create color map for kernel base names
@@ -100,22 +98,14 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
             color = color_dict[kernel_base]
 
             if best_key in results:
-                line = ax.plot(
-                    k_values, results[best_key], color=color, linestyle="-", marker="o"
-                )
+                line = ax.plot(k_values, results[best_key], color=color, linestyle="-", marker="o")
                 if subplot_idx == 1:  # Store only from first subplot for legend
                     kernel_lines.append(line[0])
                 if style_lines[0] is None:
                     style_lines[0] = line[0]
 
             if worst_key in results:
-                line = ax.plot(
-                    k_values,
-                    results[worst_key],
-                    color=color,
-                    linestyle="--",
-                    marker="x",
-                )
+                line = ax.plot(k_values, results[worst_key], color=color, linestyle="--", marker="x")
                 if style_lines[1] is None:
                     style_lines[1] = line[0]
 
@@ -132,12 +122,7 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
     # Create two legends
     # First legend for kernel types
     first_legend = fig.legend(
-        kernel_lines,
-        kernel_bases,
-        bbox_to_anchor=(1.02, 0.6),
-        loc="center left",
-        title="Kernel Types",
-        borderaxespad=0,
+        kernel_lines, kernel_bases, bbox_to_anchor=(1.02, 0.6), loc="center left", title="Kernel Types", borderaxespad=0
     )
 
     # Second legend for line styles
@@ -165,15 +150,9 @@ def find_latencies(profiling_results):
         latency = result["latency"]
         if latency == float("inf"):
             continue
-        if (
-            kernel_name not in latencies["best"]
-            or latency < latencies["best"][kernel_name]
-        ):
+        if kernel_name not in latencies["best"] or latency < latencies["best"][kernel_name]:
             latencies["best"][kernel_name] = latency
-        if (
-            kernel_name not in latencies["worst"]
-            or latency > latencies["worst"][kernel_name]
-        ):
+        if kernel_name not in latencies["worst"] or latency > latencies["worst"][kernel_name]:
             latencies["worst"][kernel_name] = latency
     return latencies
 

@@ -3,22 +3,15 @@
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
-from itertools import product
-import random
+import random, os, shutil
+from typing import List, Dict
+from itertools import product, permutations
 
 from src.autotune_kernel import Autotune
-from src.matmul import (
-    matmul_KMN,
-    matmul_MKN,
-    matmul_KNM,
-    matmul_MNK,
-    matmul_NKM,
-    matmul_NMK,
-    MatMul,
-)
+from src.matmul import matmul_main, MatMulCompatibility
 
 
-def get_autotune_configs():
+def get_autotune_configs() -> List[Dict]:
     """
     Define a list of configuration dictionaries representing the specific design choices for autotuning.
 
@@ -26,49 +19,60 @@ def get_autotune_configs():
         list: A list of dictionaries, each containing configuration parameters for TILES_IN_BLOCK_M,
                 TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
     """
-    kernels = [matmul_KMN, matmul_MKN, matmul_KNM, matmul_MNK, matmul_NKM, matmul_NMK]
     TILES_IN_BLOCK_M_options = [1, 2, 4, 8, 16, 32, 64]
     TILES_IN_BLOCK_N_options = [1, 2, 4, 8, 16, 32, 64]
     TILES_IN_BLOCK_K_options = [1, 2, 4, 8, 16, 32, 64]
+    BUFFER_M_options = [1, 2, 4, 8]
+    BUFFER_N_options = [1, 2, 4, 8]
+    BUFFER_K_options = [1, 2, 4, 8]
+    loop_orders = ["".join(p) for p in permutations("MNK")]
     params = list(
         product(
-            kernels,
             TILES_IN_BLOCK_M_options,
             TILES_IN_BLOCK_N_options,
             TILES_IN_BLOCK_K_options,
+            BUFFER_M_options,
+            BUFFER_N_options,
+            BUFFER_K_options,
+            loop_orders,
         )
     )
     configs = []
-    for kernel, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K in params:
+    for TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order in params:
         config = {
-            "kernel": kernel,
             "TILES_IN_BLOCK_M": TILES_IN_BLOCK_M,
             "TILES_IN_BLOCK_N": TILES_IN_BLOCK_N,
             "TILES_IN_BLOCK_K": TILES_IN_BLOCK_K,
+            "BUFFER_M": BUFFER_M,
+            "BUFFER_N": BUFFER_N,
+            "BUFFER_K": BUFFER_K,
+            "loop_order": loop_order,
         }
         configs.append(config)
     random.shuffle(configs)
     return configs
 
 
-if __name__ == "__main__":
-    pruning_func = MatMul
-    shapes = [1024, 2048, 4096, 8192]
-    MNK = list(
-        product(
-            shapes,
-            shapes,
-            shapes,
-        )
-    )
+def profile():
+    cache_root = "/home/ubuntu/matmul-cache"
+    if os.path.exists(cache_root):
+        shutil.rmtree(cache_root)
+    os.makedirs(cache_root)
+    shapes = [4096, 8192]
+    MNK = list(product(shapes, shapes, shapes))
     for M, N, K in MNK:
         lhsT = nt.tensor[[K, M], nl.float32]
         rhs = nt.tensor[[K, N], nl.float32]
         tuner = Autotune(
-            configs=get_autotune_configs(),
+            kernel=matmul_main,
+            max_configs=100,
             warmup=10,
             iters=100,
-            pruning_func=pruning_func,
-            cache_dir=f"/home/ubuntu/matmul/M{M}-N{N}-K{K}",
+            pruning_func=MatMulCompatibility,
+            cache_dir=f"{cache_root}/M{M}-N{N}-K{K}",
         )
-        tuner(lhsT, rhs)
+        tuner(get_autotune_configs(), lhsT, rhs)
+
+
+if __name__ == "__main__":
+    profile()

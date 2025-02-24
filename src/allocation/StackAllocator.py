@@ -5,31 +5,17 @@ StackAllocator.py - Stack allocator for nki kernel
 
 """
 
-from contextlib import contextmanager
 from typing import List, Optional, cast
 
 import numpy as np
 
 from neuronxcc.starfish.penguin.common import align
 from neuronxcc.starfish.penguin.targets.nki.metaclasses import sbuf
-from neuronxcc.starfish.penguin.targets.nki.allocator import (
-    Allocator,
-    n_elts,
-    AllocFunc,
-)
+from neuronxcc.starfish.penguin.targets.nki.allocator import Allocator, n_elts, AllocFunc
 from neuronxcc.starfish.penguin.targets.nki.stmts import StmtScope
-from neuronxcc.starfish.penguin.targets.nki.stmts import (
-    StmtScope,
-    SyncProgramScope,
-    KernelScope,
-    FunctionScope,
-)
+from neuronxcc.starfish.penguin.targets.nki.stmts import StmtScope, SyncProgramScope, KernelScope, FunctionScope
 from neuronxcc.starfish.penguin.targets.nki.tensors import KernelTensor, InstTile
-from neuronxcc.starfish.penguin.targets.tonga.TongaTensor import (
-    NeuronSBTensor,
-    NeuronPSUMTensor,
-    NeuronLocalTensor,
-)
+from neuronxcc.starfish.penguin.targets.tonga.TongaTensor import NeuronSBTensor, NeuronPSUMTensor, NeuronLocalTensor
 from neuronxcc.starfish.support.LogContext import print_info, print_debug
 
 
@@ -81,18 +67,16 @@ class StackAllocator(Allocator):
         print_info(f"Enter new scope: {scope.name} top_frame: {self.top_frame_or_none}")
 
     def allocate_pending_tensors_in_scope(self, scope):
-        with self.indent_filter.indent():
-            print_info(f"DEBUG: Allocating pending tensors in scope: {scope.name}")
-            for tensor in scope.pop_pending_tensors():
-                if isinstance(tensor, KernelTensor):
-                    self.allocate(tensor, tensor.allocation)
-                    continue
+        for tensor in scope.pop_pending_tensors():
+            if isinstance(tensor, KernelTensor):
+                self.allocate(tensor, tensor.allocation)
+                continue
 
-                if isinstance(tensor, InstTile):
-                    self.allocate_pending_inst_tile(tensor)
-                    continue
+            if isinstance(tensor, InstTile):
+                self.allocate_pending_inst_tile(tensor)
+                continue
 
-                raise RuntimeError(f"Unexpected tensor type {type(tensor)}")
+            raise RuntimeError(f"Unexpected tensor type {type(tensor)}")
 
     def enter_scope(self, scope: StmtScope):
         try:
@@ -101,9 +85,7 @@ class StackAllocator(Allocator):
             parent = self.top_frame
         except IndexError:
             # First scope, there is no parent
-            assert isinstance(
-                scope, KernelScope
-            ), f"Unexpected scope type {type(scope)} for first stack frame!"
+            assert isinstance(scope, KernelScope), f"Unexpected scope type {type(scope)} for first stack frame!"
             self.create_kernel_frame(scope)
             return
 
@@ -117,13 +99,7 @@ class StackAllocator(Allocator):
 
         # print(f'parent={parent}')
 
-        self.stack.append(
-            StackFrame(
-                sbuf_base=parent.sbuf_next_ptr,
-                psum_base=parent.psum_next_ptr,
-                scope=scope,
-            )
-        )
+        self.stack.append(StackFrame(sbuf_base=parent.sbuf_next_ptr, psum_base=parent.psum_next_ptr, scope=scope))
 
     def exit_scope(self, scope: StmtScope):
         # print(f'exit {scope.name}')
@@ -135,26 +111,13 @@ class StackAllocator(Allocator):
         assert self.top_frame.scope == scope, "stack push/pop order mismatch!"
         self.stack.pop()
 
-    @contextmanager
-    def scope(self, scope: StmtScope):
-        self.log_enter_scope(scope)
-        with self.indent_filter.indent():
-            self.enter_scope(scope)
-            yield
-            self.exit_scope(scope)
-        self.log_exit_scope(scope)
-
     def create_kernel_frame(self, scope: KernelScope):
         self.stack.append(StackFrame(sbuf_base=0, psum_base=0, scope=scope))
         self.allocate_activation_bias_tensor(scope)
 
     def allocate_activation_bias_tensor(self, scope: FunctionScope):
         self.act_bias_tensor = scope.buffer(
-            (128, 1),
-            dtype=np.float32,
-            buffer=sbuf,
-            name="stack_allocator_bias_tensor",
-            init_value=0.0,
+            (128, 1), dtype=np.float32, buffer=sbuf, name="stack_allocator_bias_tensor", init_value=0.0
         )
 
     def get_activation_bias_tensor(self):
@@ -163,9 +126,7 @@ class StackAllocator(Allocator):
     def allow_pe_transpose(self):
         return False
 
-    def allocate_sbuf_tensor(
-        self, tensor: KernelTensor, allocation: Optional[AllocFunc]
-    ):
+    def allocate_sbuf_tensor(self, tensor: KernelTensor, allocation: Optional[AllocFunc]):
         if allocation is None:
             self.allocate_sbuf_on_stack(tensor)
             return
@@ -173,9 +134,7 @@ class StackAllocator(Allocator):
         # FIXME: Modify the allocation for modulo allocation in the hidden dimensions
         super().allocate_sbuf_tensor(tensor, allocation=allocation)
 
-    def allocate_psum_tensor(
-        self, tensor: KernelTensor, allocation: Optional[AllocFunc]
-    ):
+    def allocate_psum_tensor(self, tensor: KernelTensor, allocation: Optional[AllocFunc]):
         if allocation is None:
             self.allocate_psum_on_stack(tensor)
             return
@@ -193,9 +152,7 @@ class StackAllocator(Allocator):
         min_align = self.target.reqd_sb_align_in_bytes
         alloc_size_in_bytes = align(alloc_size_in_bytes, min_align)
 
-        base_addr, next_ptr = self.top_frame.allocate_sbuf(
-            alloc_size_in_bytes, min_align=min_align
-        )
+        base_addr, next_ptr = self.top_frame.allocate_sbuf(alloc_size_in_bytes, min_align=min_align)
 
         print_info(
             f"Allocating sbuf tensor {tensor_ir.name}: base_addr={base_addr},"
@@ -205,10 +162,7 @@ class StackAllocator(Allocator):
             f" next_ptr={next_ptr}"
         )
 
-        assert (
-            self.top_frame.sbuf_next_ptr
-            <= self.target.statebuf_usable_par_size_in_bytes
-        ), "stack overflow on sbuf"
+        assert self.top_frame.sbuf_next_ptr <= self.target.statebuf_usable_par_size_in_bytes, "stack overflow on sbuf"
 
         block_rank = len(block_shape)
         self.assign_stack_allocation(
@@ -219,6 +173,8 @@ class StackAllocator(Allocator):
             bank_id=0,
             min_align=min_align,
         )
+
+        print_info(f"allocation = {tensor_ir.allocation}")
 
     def allocate_psum_on_stack(self, tensor: KernelTensor):
         tensor_ir = cast(NeuronPSUMTensor, tensor.tensor)
@@ -253,13 +209,7 @@ class StackAllocator(Allocator):
         )
 
     def assign_stack_allocation(
-        self,
-        tensor_ir: NeuronLocalTensor,
-        min_align,
-        byte_addr,
-        allocated_block_shape,
-        bank_id,
-        allocated_bank_shape,
+        self, tensor_ir: NeuronLocalTensor, min_align, byte_addr, allocated_block_shape, bank_id, allocated_bank_shape
     ):
         tensor_ir.allocation = tensor_ir.createAllocation(
             allocated_block_shape=allocated_block_shape,
@@ -272,6 +222,7 @@ class StackAllocator(Allocator):
 
     def allocate(self, tensor: KernelTensor, allocation: Optional[AllocFunc]):
         tensor_ir_class = tensor.tensor_ir_class
+        print_info(f"allocate tensor = {tensor} {tensor_ir_class}. allocation = {allocation}")
 
         if issubclass(tensor_ir_class, NeuronSBTensor):
             self.allocate_sbuf_tensor(tensor, allocation=allocation)
