@@ -16,6 +16,10 @@ def test_design(
     cache_dir: str,
     benchmark_machine=None,
 ) -> float:
+    """
+    Returns:
+        float: P99 latency in ms
+    """
     bench_func = nki.benchmark(
         warmup=warmup,
         iters=iters,
@@ -27,14 +31,15 @@ def test_design(
     latency_res = bench_func.benchmark_result.nc_latency
     p99 = latency_res.get_latency_percentile(99)
     profile_name = func.func_name + "-" + "-".join(f"{v}" for k, v in configs.items())
-    cmd = f"neuron-profile capture -n file.neff --profile-nth-exec={iters}"
-    subprocess.run(cmd, shell=True)
+    # cmd = f"neuron-profile capture -n file.neff --profile-nth-exec={iters}"
+    # subprocess.run(cmd, shell=True)
     shutil.move("file.neff", f"{cache_dir}/{profile_name}.neff")
-    shutil.move(f"profile_exec_{iters}.ntff", f"{cache_dir}/{profile_name}.ntff")
+    # shutil.move(f"profile_exec_{iters}.ntff", f"{cache_dir}/{profile_name}.ntff")
+    p99 /= 1000
     return p99
 
 
-def test_kernel(func, args, warmup, iters) -> float:
+def test_kernel(func, args, warmup: int, iters: int) -> float:
     """Profile the NKI kernel P99 latency
 
     Args:
@@ -44,10 +49,11 @@ def test_kernel(func, args, warmup, iters) -> float:
         iters (_type_): number of trials
 
     Returns:
-        float: P99 latency
+        float: P99 latency in ms
     """
     bench_func = nki.benchmark(warmup=warmup, iters=iters)(func)
     bench_func(*args)
     latency_res = bench_func.benchmark_result.nc_latency
     p99 = latency_res.get_latency_percentile(99)
+    p99 /= 1000
     return p99

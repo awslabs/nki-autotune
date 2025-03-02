@@ -1,4 +1,4 @@
-import pytest, random, sys
+import pytest, random, sys, warnings
 import numpy as np
 from typing import List, Tuple
 
@@ -71,13 +71,22 @@ def get_tests(num_tests: int) -> List[Tuple]:
         N = NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N
 
         try:
+            # Loop order here does not affect compatibility. Just use any one.
             MatMulCompatibility(
-                (K, M), (K, N), TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, BUFFER_K, BUFFER_M, BUFFER_N
+                (K, M),
+                (K, N),
+                TILES_IN_BLOCK_K,
+                TILES_IN_BLOCK_M,
+                TILES_IN_BLOCK_N,
+                BUFFER_K,
+                BUFFER_M,
+                BUFFER_N,
+                "MNK",
             )
             assert max(M, N, K) <= 16384, f"Input sizes are too large"
             test = (K, M, N, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, BUFFER_K, BUFFER_M, BUFFER_N)
             valid_tests.append(test)
-        except:
+        except Exception as e:
             continue
     # Handle loop orders
     loop_orders = ["".join(p) for p in permutations("MNK")]
