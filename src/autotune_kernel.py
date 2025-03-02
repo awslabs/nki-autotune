@@ -6,7 +6,7 @@ import multiprocessing, warnings, dill, pickle, math, os, shutil
 from itertools import product
 
 multiprocessing.reduction.ForkingPickler.dumps = dill.dumps
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 from time import perf_counter
 from pprint import pformat
@@ -25,6 +25,7 @@ class Autotune:
     def __init__(
         self,
         kernel: GenericKernel,
+        configs: List[dict],
         max_configs: int | None = None,
         warmup: int = 2,
         iters: int = 5,
@@ -33,6 +34,7 @@ class Autotune:
         cache_dir="./autotune_cache",
     ):
         self.kernel = kernel
+        self.configs = configs
         self.max_configs = max_configs
         self.warmup = warmup
         self.iters = iters
@@ -44,10 +46,10 @@ class Autotune:
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
 
-    def _prune(self, configs: List[dict], args: Tuple, kwargs: Dict) -> List[dict]:
+    def _prune(self, args: Tuple, kwargs: Dict) -> List[dict]:
         # Pruning func should throw a fail if the inputs are illegal
         valid_configs = []
-        for config in configs:
+        for config in self.configs:
             arg_shapes = [arg.tensor_shape for arg in args]
             try:
                 if self.pruning_func is not None:
@@ -57,22 +59,23 @@ class Autotune:
                 warnings.warn(
                     f"Warning: invalid config {config}, reason: {e} ({type(e)})", category=RuntimeWarning, stacklevel=2
                 )
-            if len(valid_configs) == self.max_configs:
+            if self.max_configs and len(valid_configs) == self.max_configs:
                 break
         return valid_configs
 
-    def __call__(self, configs: List[dict], *args, **kwargs):
-        valid_configs = self._prune(configs, args, kwargs)
+    def __call__(self, *args, **kwargs):
+        start = perf_counter()
+        valid_configs = self._prune(args, kwargs)
         device_locks = {machine: multiprocessing.Manager().Lock() for machine in self.benchmark_machines}
 
         benchmark_machines = self.benchmark_machines * math.ceil(len(valid_configs) // len(self.benchmark_machines))
 
-        start = perf_counter()
-        for config, machine in tqdm(
-            zip(valid_configs, benchmark_machines), total=len(valid_configs), desc="Benchmarking configs"
-        ):
-            try:
-                latency_us = test_design(
+        max_workers = min(len(valid_configs), os.cpu_count() - 1)
+        futures_to_config = {}
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            for config, machine in zip(valid_configs, benchmark_machines):
+                future = pool.submit(
+                    test_design,
                     func=self.kernel,
                     args=args,
                     kwargs=kwargs,
@@ -83,16 +86,23 @@ class Autotune:
                     cache_dir=self.cache_dir,
                     benchmark_machine=machine,
                 )
+                futures_to_config[future] = config
+
+        for future in tqdm(
+            as_completed(futures_to_config), total=len(futures_to_config), desc="Benchmarking configurations"
+        ):
+            config = futures_to_config[future]
+            try:
+                latency_us = future.result()
             except Exception as e:
                 latency_us = float("inf")
                 warnings.warn(
-                    f"Warning: failed for config {config}, kernel {self.kernel.func_name} reason: {e} ({type(e)})",
+                    f"Warning: failed for config {config}, reason: {e} ({type(e)})",
                     category=RuntimeWarning,
                     stacklevel=2,
                 )
             elapsed = perf_counter() - start
             self.perf_results.append({"configs": config, "latency": latency_us, "time_elapsed": elapsed})
-
             self._post_tuning(*args)
         return None
 

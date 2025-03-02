@@ -9,6 +9,7 @@ from itertools import product, permutations
 
 from src.autotune_kernel import Autotune
 from src.matmul import matmul_main, MatMulCompatibility
+from src.cache.directories import TUNED_NKI_CACHE_DIR
 
 
 def get_autotune_configs() -> List[Dict]:
@@ -54,25 +55,28 @@ def get_autotune_configs() -> List[Dict]:
 
 
 def profile():
-    cache_root = "/home/ubuntu/matmul-cache"
+    cache_root = TUNED_NKI_CACHE_DIR
     if os.path.exists(cache_root):
         shutil.rmtree(cache_root)
     os.makedirs(cache_root)
     shapes = [4096, 8192]
+    dtype = nl.bfloat16
     MNK = list(product(shapes, shapes, shapes))
     for M, N, K in MNK:
-        lhsT = nt.tensor[[K, M], nl.float32]
-        rhs = nt.tensor[[K, N], nl.float32]
+        lhsT = nt.tensor[[K, M], dtype]
+        rhs = nt.tensor[[K, N], dtype]
         tuner = Autotune(
             kernel=matmul_main,
+            configs=get_autotune_configs(),
             max_configs=100,
             warmup=10,
             iters=100,
             pruning_func=MatMulCompatibility,
             cache_dir=f"{cache_root}/M{M}-N{N}-K{K}",
         )
-        tuner(get_autotune_configs(), lhsT, rhs)
+        tuner(lhsT, rhs)
 
 
 if __name__ == "__main__":
+    os.environ["NEURON_CC_FLAGS"] = "--framework=XLA --target=trn1 --auto-cast=none"
     profile()

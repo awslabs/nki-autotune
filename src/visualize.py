@@ -7,6 +7,8 @@ from glob import glob
 from pprint import pformat
 import numpy as np
 import seaborn as sns
+from typing import Dict, List
+from src.cache.directories import TORCH_CACHE_DIR, NKI_CACHE_DIR, TUNED_NKI_CACHE_DIR
 
 
 def sort_lists_by_first(*lists):
@@ -62,7 +64,7 @@ def plot_tuning_results(tuning_results, fig_dir: str):
     plt.close()
 
 
-def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
+def make_sweep_plot(data, save_path, nki_baseline, torch_baseline, subplot_width=5, subplot_height=4):
     # Sort data by M value
     data = dict(sorted(data.items(), key=lambda x: x[0]))
     n_plots = len(data)
@@ -74,7 +76,7 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
     # Get unique kernel base names (without _best/_worst suffix)
     kernel_bases = set()
     for results in data.values():
-        kernel_bases.update(k.rsplit("_", 1)[0] for k in results.keys() if k.startswith("matmul_"))
+        kernel_bases.update(k.split("_")[0] for k in results.keys() if k.endswith("_best"))
     kernel_bases = sorted(list(kernel_bases))
 
     # Create color map for kernel base names
@@ -85,12 +87,17 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
     kernel_lines = []  # For kernel types
     style_lines = [None, None]  # For best/worst styles
 
-    print(f"{pformat(data)}")
-
     for subplot_idx, ((M, N), results) in enumerate(data.items(), 1):
+        print(f"M {M} N {N}\n{pformat(results)}")
         ax = fig.add_subplot(n_rows, n_cols, subplot_idx)
 
         k_values = results["K"]
+
+        nki_baseline_plot = [nki_baseline[(M, N, k)] for k in k_values]
+        nki_line = ax.plot(k_values, nki_baseline_plot, color="black", linestyle="-", marker="o")
+
+        torch_baseline_plot = [torch_baseline[(M, N, k)] for k in k_values]
+        torch_line = ax.plot(k_values, torch_baseline_plot, color="black", linestyle="--", marker="o")
 
         for kernel_base in kernel_bases:
             best_key = f"{kernel_base}_best"
@@ -112,17 +119,27 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
         ax.set_xticks(k_values)
         ax.set_xticklabels(k_values)
         ax.set_xlabel("K")
-        ax.set_ylabel("Latency (μs)")
+        ax.set_ylabel("Latency (ms)")
         ax.set_title(f"M={M}, N={N}")
         ax.grid(True)
 
         if max(k_values) / min(k_values) > 10:
             ax.set_xscale("log")
+        ax.set_yscale("log")
 
     # Create two legends
     # First legend for kernel types
     first_legend = fig.legend(
         kernel_lines, kernel_bases, bbox_to_anchor=(1.02, 0.6), loc="center left", title="Kernel Types", borderaxespad=0
+    )
+
+    baseline_legend = fig.legend(
+        [nki_line[0], torch_line[0]],
+        ["NKI", "Torch"],
+        bbox_to_anchor=(1.1, 0.6),
+        loc="center left",
+        title="Baselines",
+        borderaxespad=0,
     )
 
     # Second legend for line styles
@@ -135,18 +152,19 @@ def make_sweep_plot(data, save_path, subplot_width=5, subplot_height=4):
         borderaxespad=0,
     )
 
-    # Add first legend to figure
+    # Add legends to figure
     fig.add_artist(first_legend)
+    fig.add_artist(baseline_legend)
 
     plt.tight_layout()
     plt.savefig(save_path, bbox_inches="tight")
     plt.close()
 
 
-def find_latencies(profiling_results):
+def find_latencies(profiling_results: List):
     latencies = {"best": {}, "worst": {}}
     for result in profiling_results:
-        kernel_name = result["configs"]["kernel_name"]
+        kernel_name = result["configs"]["loop_order"]
         latency = result["latency"]
         if latency == float("inf"):
             continue
@@ -157,10 +175,10 @@ def find_latencies(profiling_results):
     return latencies
 
 
-def plot_matmul_sweep(prefix):
+def read_tuning_data(prefix):
     pattern = r"M(\d+)-N(\d+)-K(\d+)"
     fig_data = {}
-    for folder in glob(f"{prefix}*"):
+    for folder in glob(f"{prefix}/*"):
         match = re.search(pattern, folder)
         if match:
             M, N, K = map(int, match.groups())
@@ -183,8 +201,13 @@ def plot_matmul_sweep(prefix):
     for MN in fig_data:
         M, N = MN
         sorted_fig_data[(M, N)] = sort_by_key(fig_data[MN], "K")
-    make_sweep_plot(sorted_fig_data, "./matmul_sweep.pdf")
+    return sorted_fig_data
 
 
 if __name__ == "__main__":
-    plot_matmul_sweep("/home/ubuntu/matmul/")
+    nki_baseline = pickle.load(
+        open(f"{NKI_CACHE_DIR}/nki_matmul_fully_optimized_/nki_matmul_fully_optimized_.pkl", "rb")
+    )
+    torch_baseline = pickle.load(open(f"{TORCH_CACHE_DIR}/matmul/matmul.pkl", "rb"))
+    tuned_data = read_tuning_data(TUNED_NKI_CACHE_DIR)
+    make_sweep_plot(tuned_data, "./matmul_sweep.pdf", nki_baseline, torch_baseline)

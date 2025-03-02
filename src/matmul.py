@@ -165,7 +165,7 @@ def load_tensor_by_par_tiles(input_tensor, num_par_tiles, par_tile_size, free_di
     return tiles
 
 
-def matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles, result_dtype):
+def matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles):
     num_k_tiles, TILE_K, m = lhsT_tiles.shape
     _num_k_tiles, _TILE_K, n = rhs_tiles.shape
     num_m_tiles, num_n_tiles, TILE_M, TILE_N = result_tiles.shape
@@ -185,7 +185,7 @@ def matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles, result_dtype):
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for tile_id_M in nl.affine_range(num_m_tiles):
         for tile_id_N in nl.affine_range(num_n_tiles):
-            res_tile = nl.zeros((TILE_M, TILE_N), dtype=result_dtype, buffer=nl.psum)
+            res_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
             # Use PSUM buffer to accumulate into a single hardware tile
             # to minimize the number of calls to nl.loop_reduce
@@ -283,7 +283,7 @@ def matmul_NMK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_N * mm.BLOCK_N,
                 )
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles, result.dtype)
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles)
 
             save_result_block(result, result_tiles, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
     return result
@@ -317,7 +317,7 @@ def matmul_MNK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_N * mm.BLOCK_N,
                 )
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles, result.dtype)
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles)
 
             save_result_block(result, result_tiles, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
 
@@ -362,7 +362,7 @@ def matmul_KMN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     free_ofs=block_id_N * mm.BLOCK_N,
                 )
 
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N], result.dtype)
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N])
 
     save_result_acc(result, result_tiles, mm.BLOCK_M, mm.BLOCK_N)
     return result
@@ -406,7 +406,7 @@ def matmul_KNM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     free_ofs=block_id_M * mm.BLOCK_M,
                 )
 
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N], result.dtype)
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N])
 
     save_result_acc(result, result_tiles, mm.BLOCK_M, mm.BLOCK_N)
     return result
@@ -449,7 +449,7 @@ def matmul_NKM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     free_ofs=block_id_M * mm.BLOCK_M,
                 )
 
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_M], result.dtype)
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_M])
 
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
             """
@@ -508,7 +508,7 @@ def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     free_ofs=block_id_N * mm.BLOCK_N,
                 )
 
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_N], result.dtype)
+                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_N])
 
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             """
