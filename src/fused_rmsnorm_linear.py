@@ -190,7 +190,7 @@ def allocated_fused_rms_norm_qkv(hidden, weights, hidden_buffer_degree, eps):
     return out_tensor
 
 
-@nki.compiler.enable_stack_allocator(log_level=logging.INFO)
+@nki.compiler.enable_stack_allocator()
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
 def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, eps=1e-6):
@@ -296,7 +296,7 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
     return out_tensor
 
 
-@nki.compiler.enable_stack_allocator(log_level=logging.INFO)
+@nki.compiler.enable_stack_allocator()
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
 def optimized_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, eps=1e-6):
@@ -312,7 +312,6 @@ def optimized_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, eps=1e-
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
     compatibility_checks(hidden.shape, weights.shape)
-    # Hidden should be in BSH layout.
     batch, seqlen, dim = hidden.shape
     _dim, head_dim = weights.shape
 
@@ -323,11 +322,9 @@ def optimized_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, eps=1e-
     i_lhs = nl.mgrid[0:pmax, 0:pmax]
     i_rhs = nl.mgrid[0:pmax, 0:fmax]
     i_res = nl.mgrid[0:pmax, 0:fmax]
+    NUM_SEQ_TILES = math.ceil(seqlen / pmax)
     NUM_DIM_TILES = math.ceil(dim / pmax)
     NUM_TRANSP_TILES = math.ceil(dim / fmax)
-    NUM_TILES = math.ceil(seqlen / pmax)
-    # Number of interleaving groups, each group uses 2 tiles
-    NUM_INT_GRPS = math.ceil(NUM_TILES / 2)
     scale = 1 / dim
 
     # all PE array ops must output to FP32 on trn1 but must match input dtype in trn2
@@ -349,70 +346,60 @@ def optimized_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, eps=1e-
         )
 
     for batch_id in nl.affine_range(batch):
-        for int_group_id in nl.affine_range(NUM_INT_GRPS):
+        for seq_tile_id in nl.affine_range(NUM_SEQ_TILES, multi_buffer=8):
+            seq_offset = seq_tile_id * pmax
+            in_bufs = nl.ndarray((par_dim(pmax), dim), dtype=hidden.dtype, buffer=nl.sbuf)
+            in_bufs = nl.load(hidden[batch_id, seq_offset + ix, iy], mask=seq_offset + ix < seqlen)
+
             """
-            Compute the results by double buffer the hidden tensor.
+            Allocate the psum early, such that it will not share address with transpose_res_psum.
+            This avoid anti-dependencies on instuctions trying to read two of them.
             """
-            in_bufs = nl.ndarray((2, par_dim(pmax), dim), dtype=hidden.dtype, buffer=nl.sbuf)
-            for i_interleave_grp in nl.affine_range(2):
-                seq_offset = (2 * int_group_id + i_interleave_grp) * pmax
-                in_bufs[i_interleave_grp] = nl.load(
-                    hidden[batch_id, seq_offset + ix, iy], mask=seq_offset + ix < seqlen
+            square_sum = nl.ndarray((par_dim(pmax), 1), dtype=norm_dtype, buffer=nl.sbuf)
+            res_psum = nl.ndarray((par_dim(pmax), fmax), dtype=nl.float32, buffer=nl.psum)
+            output_sbuf = nl.ndarray((par_dim(pmax), fmax), dtype=weights.dtype, buffer=nl.sbuf)
+
+            """
+            Write the RMS and RMS Reciprocal tensors back to square_sum, in-place
+            """
+            nisa.activation_reduce(op=nl.square, data=in_bufs, reduce_op=np.add, reduce_res=square_sum[...])
+            square_sum[...] = nisa.tensor_scalar(square_sum[...], np.multiply, scale, op1=np.add, operand1=eps)
+            square_sum[...] = nisa.activation(op=nl.rsqrt, data=square_sum[...])
+
+            """
+            Perform (RMSNorm(hidden)^T)^T @ wQKV
+            Write the output of RMS and RMS^T (in-place) to rmsnorm_t_tile
+            Perform (hidden .* RMS Reciprocal)^T in tiles of fmax (512)
+            """
+            rmsnorm_t_tile = nl.ndarray((par_dim(pmax), dim), dtype=weights.dtype, buffer=nl.sbuf)
+            for transpose_tile_id in nl.affine_range(NUM_TRANSP_TILES):
+                dim_offset = transpose_tile_id * fmax
+                rmsnorm_t_tile[i_rhs.p, dim_offset + i_rhs.x] = nl.multiply(
+                    in_bufs[i_rhs.p, dim_offset + i_rhs.x], square_sum[...], dtype=weights.dtype
+                )
+                """
+                nisa.nc_transpose only handles tiles of (pmax, pmax)
+                In order to transpose rmsnorm_t_tile (pmax, fmax), need to parallel by fmax//pmax
+                """
+                transpose_res_psum = nl.ndarray((par_dim(pmax), fmax), dtype=transpose_res_psum_dtype, buffer=nl.psum)
+                for j in nl.affine_range(fmax // pmax):
+                    transpose_res_psum[i_lhs.p, j * pmax + i_lhs.x] = nisa.nc_transpose(
+                        rmsnorm_t_tile[i_lhs.p, dim_offset + j * pmax + i_lhs.x]
+                    )
+                rmsnorm_t_tile[i_rhs.p, dim_offset + i_rhs.x] = nl.copy(transpose_res_psum, dtype=hidden.dtype)
+
+            for dim_tile_id in nl.affine_range(NUM_DIM_TILES):
+                res_psum += nisa.nc_matmul(
+                    rmsnorm_t_tile[i_lhs.p, dim_tile_id * pmax + i_lhs.x], weights_buffer[dim_tile_id, i_rhs.p, i_rhs.x]
                 )
 
-                """
-                Write the RMS and RMS Reciprocal tensors back to square_sum, in-place
-                """
-                square_sum = nl.ndarray((par_dim(pmax), 1), dtype=norm_dtype, buffer=nl.sbuf)
-                nisa.activation_reduce(
-                    op=nl.square, data=in_bufs[i_interleave_grp], reduce_op=np.add, reduce_res=square_sum[...]
-                )
-                square_sum[...] = nisa.tensor_scalar(square_sum[...], np.multiply, scale, op1=np.add, operand1=eps)
-                square_sum[...] = nisa.activation(op=nl.rsqrt, data=square_sum[...])
-
-                """
-                Perform (RMSNorm(hidden)^T)^T @ wQKV
-                Write the output of RMS and RMS^T (in-place) to rmsnorm_t_tile
-                Perform (hidden .* RMS Reciprocal)^T in tiles of fmax (512)
-                """
-                rmsnorm_t_tile = nl.ndarray((par_dim(pmax), dim), dtype=weights.dtype, buffer=nl.sbuf)
-                for transpose_tile_id in nl.affine_range(NUM_TRANSP_TILES):
-                    dim_offset = transpose_tile_id * fmax
-                    rmsnorm_t_tile[i_rhs.p, dim_offset + i_rhs.x] = nl.multiply(
-                        in_bufs[i_interleave_grp, i_rhs.p, dim_offset + i_rhs.x], square_sum[...], dtype=weights.dtype
-                    )
-                    """
-                    nisa.nc_transpose only handles tiles of (pmax, pmax)
-                    In order to transpose rmsnorm_t_tile (pmax, fmax), need to parallel by fmax//pmax
-                    """
-                    transpose_res_psum = nl.ndarray(
-                        (par_dim(pmax), fmax), dtype=transpose_res_psum_dtype, buffer=nl.psum
-                    )
-                    for j in nl.affine_range(fmax // pmax):
-                        transpose_res_psum[i_lhs.p, j * pmax + i_lhs.x] = nisa.nc_transpose(
-                            rmsnorm_t_tile[i_lhs.p, dim_offset + j * pmax + i_lhs.x]
-                        )
-                    rmsnorm_t_tile[i_rhs.p, dim_offset + i_rhs.x] = nl.copy(transpose_res_psum, dtype=hidden.dtype)
-
-                """
-                Allocate the psum early, such that it will not share address with transpose_res_psum.
-                This avoid anti-dependencies on instuctions trying to read two of them.
-                """
-                res_psum = nl.ndarray((par_dim(pmax), fmax), dtype=nl.float32, buffer=nl.psum)
-                for dim_tile_id in nl.affine_range(NUM_DIM_TILES):
-                    res_psum += nisa.nc_matmul(
-                        rmsnorm_t_tile[i_lhs.p, dim_tile_id * pmax + i_lhs.x],
-                        weights_buffer[dim_tile_id, i_rhs.p, i_rhs.x],
-                    )
-
-                """
-                Store the final output tiles to output_sbuf before sending back to DRAM
-                """
-                output_sbuf = nl.ndarray((par_dim(pmax), fmax), dtype=weights.dtype, buffer=nl.sbuf)
-                output_sbuf[...] = nl.copy(res_psum, dtype=out_tensor.dtype)
-                nl.store(
-                    out_tensor[batch_id, seq_offset + i_res.p, i_res.x],
-                    value=output_sbuf,
-                    mask=(seq_offset + i_res.p < seqlen) & (i_res.x < head_dim),
-                )
+            """
+            Store the final output tiles to output_sbuf before sending back to DRAM
+            """
+            output_sbuf[...] = nl.copy(res_psum, dtype=out_tensor.dtype)
+            nl.store(
+                out_tensor[batch_id, seq_offset + i_res.p, i_res.x],
+                value=output_sbuf,
+                mask=(seq_offset + i_res.p < seqlen) & (i_res.x < head_dim),
+            )
     return out_tensor
