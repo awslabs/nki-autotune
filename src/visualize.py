@@ -157,7 +157,7 @@ def make_sweep_plot(data, save_path, nki_baseline, torch_baseline, subplot_width
     fig.add_artist(baseline_legend)
 
     plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    plt.savefig(save_path, bbox_inches="tight", dpi=300)
     plt.close()
 
 
@@ -210,4 +210,4 @@ if __name__ == "__main__":
     )
     torch_baseline = pickle.load(open(f"{TORCH_CACHE_DIR}/matmul/matmul.pkl", "rb"))
     tuned_data = read_tuning_data(TUNED_NKI_CACHE_DIR)
-    make_sweep_plot(tuned_data, "./matmul_sweep.pdf", nki_baseline, torch_baseline)
+    make_sweep_plot(tuned_data, "./matmul_sweep.png", nki_baseline, torch_baseline)

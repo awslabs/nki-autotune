@@ -7,10 +7,12 @@ from src.fused_rmsnorm_linear import (
     stack_allocated_fused_rms_norm_qkv,
     optimized_fused_rms_norm_qkv,
 )
+from src.benchmark import test_kernel
 
 import neuronxcc.nki.language as nl
 from neuronxcc.starfish.support.util import allclose
 from neuronxcc.nki import baremetal
+import neuronxcc.nki.typing as nt
 
 
 def silu(x):
@@ -136,3 +138,23 @@ def test_optimized_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
     rtol = 1e-3
     match = allclose(allocated_out, golden_output, atol=atol, rtol=rtol, verbose=1)
     assert match
+
+
+@pytest.mark.xfail(reason="Optimized kernel not yet done")
+@pytest.mark.parametrize("batch, seqlen, dim, d_head, eps", [(1, 1024, 4096, 256, 1e-6), (1, 2048, 1024, 512, 1e-3)])
+def test_optimized_fused_rms_norm_qkv_perf(batch, seqlen, dim, d_head, eps):
+    dtype = nl.bfloat16
+    hidden = nt.tensor[[batch, seqlen, dim], dtype]
+    qkv_weights = nt.tensor[[dim, d_head], dtype]
+    warmup = 10
+    iters = 100
+    baseline_p99 = test_kernel(
+        stack_allocated_fused_rms_norm_qkv, [hidden, qkv_weights, nl.float32, eps], warmup=warmup, iters=iters
+    )
+    optimized_p99 = test_kernel(
+        optimized_fused_rms_norm_qkv, [hidden, qkv_weights, nl.float32, eps], warmup=warmup, iters=iters
+    )
+    print(f"Optimized version {optimized_p99}ms. stack_allocated_fused_rms_norm_qkv {baseline_p99}ms.")
+    assert (
+        optimized_p99 <= baseline_p99
+    ), f"Optimized version {optimized_p99}ms should be faster than stack_allocated_fused_rms_norm_qkv {baseline_p99}ms"
