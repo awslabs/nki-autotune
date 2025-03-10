@@ -8,7 +8,7 @@ from typing import List, Dict
 from itertools import product, permutations
 
 from src.autotune_kernel import Autotune
-from src.matmul import matmul_main, MatMulCompatibility
+from src.kernels.matmul import matmul_main, MatMulCompatibility
 from src.cache.directories import TUNED_NKI_CACHE_DIR
 
 

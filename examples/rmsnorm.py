@@ -6,8 +6,8 @@ import neuronxcc.nki.typing as nt
 import numpy as np
 
 from src.autotune_kernel import Autotune
-from src.benchmark import test_kernel
-from src.fused_rmsnorm_linear import stack_allocated_fused_rms_norm_qkv, allocated_fused_rms_norm_qkv
+from src.benchmark import profile_kernel
+from src.kernels.fused_rmsnorm_linear import stack_allocated_fused_rms_norm_qkv, allocated_fused_rms_norm_qkv
 
 
 def get_autotune_configs():
@@ -30,5 +30,5 @@ if __name__ == "__main__":
     n_groups = 1
     eps = 1e-6
 
-    p99 = test_kernel(stack_allocated_fused_rms_norm_qkv, [hidden, weights, nl.float32, eps], warmup=10, iters=100)
+    p99 = profile_kernel(stack_allocated_fused_rms_norm_qkv, [hidden, weights, nl.float32, eps], warmup=10, iters=100)
     print(f"stack_allocated_fused_rms_norm_qkv p99 = {p99} us.")
