@@ -88,16 +88,19 @@ def make_sweep_plot(data, save_path, nki_baseline, torch_baseline, subplot_width
     style_lines = [None, None]  # For best/worst styles
 
     for subplot_idx, ((M, N), results) in enumerate(data.items(), 1):
-        print(f"M {M} N {N}\n{pformat(results)}")
-        ax = fig.add_subplot(n_rows, n_cols, subplot_idx)
-
         k_values = results["K"]
+        print(f"M {M} N {N}. k_values = {k_values}")
+        # print({pformat(results)})
+        ax = fig.add_subplot(n_rows, n_cols, subplot_idx)
 
         nki_baseline_plot = [nki_baseline[(M, N, k)] for k in k_values]
         nki_line = ax.plot(k_values, nki_baseline_plot, color="black", linestyle="-", marker="o")
+        print(f"nki_baseline_plot = {nki_baseline_plot}")
 
         torch_baseline_plot = [torch_baseline[(M, N, k)] for k in k_values]
         torch_line = ax.plot(k_values, torch_baseline_plot, color="black", linestyle="--", marker="o")
+
+        nki_bestline = None
 
         for kernel_base in kernel_bases:
             best_key = f"{kernel_base}_best"
@@ -106,6 +109,13 @@ def make_sweep_plot(data, save_path, nki_baseline, torch_baseline, subplot_width
 
             if best_key in results:
                 line = ax.plot(k_values, results[best_key], color=color, linestyle="-", marker="o")
+                if nki_bestline is None:
+                    nki_bestline = results[best_key]
+                else:
+                    nki_bestline = [
+                        min(current_best, new_latency)
+                        for current_best, new_latency in zip(nki_bestline, results[best_key])
+                    ]
                 if subplot_idx == 1:  # Store only from first subplot for legend
                     kernel_lines.append(line[0])
                 if style_lines[0] is None:
@@ -116,6 +126,11 @@ def make_sweep_plot(data, save_path, nki_baseline, torch_baseline, subplot_width
                 if style_lines[1] is None:
                     style_lines[1] = line[0]
 
+        print(f"nki_bestline = {nki_bestline}")
+        nki_baseline_improvement = [
+            (baseline - best) / baseline * 100 for baseline, best in zip(nki_baseline_plot, nki_bestline)
+        ]
+        print(f"nki_baseline_improvement = {nki_baseline_improvement}")
         ax.set_xticks(k_values)
         ax.set_xticklabels(k_values)
         ax.set_xlabel("K")
