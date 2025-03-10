@@ -6,7 +6,7 @@ import os, pickle, shutil
 from itertools import product
 
 from src.cache.directories import NKI_CACHE_DIR
-from src.benchmark import test_kernel
+from src.benchmark import profile_kernel
 
 
 @nki.jit
@@ -139,7 +139,7 @@ def profile():
     for M, N, K in MNK:
         lhsT = nt.tensor[[K, M], dtype]
         rhs = nt.tensor[[K, N], dtype]
-        p99 = test_kernel(nki_matmul_fully_optimized_, [lhsT, rhs], warmup=num_warmup, iters=num_runs)
+        p99 = profile_kernel(nki_matmul_fully_optimized_, [lhsT, rhs], warmup=num_warmup, iters=num_runs)
         perf_results[(M, N, K)] = p99
         pickle.dump(perf_results, open(f"{cache_dir}/{nki_matmul_fully_optimized_.func_name}.pkl", "wb"))
 

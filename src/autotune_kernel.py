@@ -11,7 +11,7 @@ from tqdm import tqdm
 from time import perf_counter
 from pprint import pformat
 
-from src.benchmark import test_design
+from src.benchmark import profile_kernel
 from src.visualize import plot_tuning_results
 
 from neuronxcc.nki.compile import GenericKernel
@@ -75,7 +75,7 @@ class Autotune:
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
             for config, machine in zip(valid_configs, benchmark_machines):
                 future = pool.submit(
-                    test_design,
+                    profile_kernel,
                     func=self.kernel,
                     args=args,
                     kwargs=kwargs,

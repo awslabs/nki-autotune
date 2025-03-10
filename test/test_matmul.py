@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 sys.path.append("../")
 
-from src.matmul import matmul_main, MatMulCompatibility
+from src.kernels.matmul import matmul_main, MatMulCompatibility
 
 import neuronxcc.nki.language as nl
 from neuronxcc.starfish.support.util import allclose

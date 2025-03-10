@@ -14,6 +14,7 @@ from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
 from src.allocation.utils import update_base_addr
+from src.kernels.utils import load_tensor_by_par_tiles
 
 
 def compatibility_checks(hidden_shape, weights_shape):
@@ -346,7 +347,7 @@ def optimized_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, eps=1e-
         )
 
     for batch_id in nl.affine_range(batch):
-        for seq_tile_id in nl.affine_range(NUM_SEQ_TILES, multi_buffer=8):
+        for seq_tile_id in nl.affine_range(NUM_SEQ_TILES, multi_buffer=2):
             seq_offset = seq_tile_id * pmax
             in_bufs = nl.ndarray((par_dim(pmax), dim), dtype=hidden.dtype, buffer=nl.sbuf)
             in_bufs = nl.load(hidden[batch_id, seq_offset + ix, iy], mask=seq_offset + ix < seqlen)
