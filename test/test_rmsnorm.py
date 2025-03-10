@@ -1,8 +1,8 @@
 import pytest
 import numpy as np
 
-from src.kernels.weighted_rmsnorm import weighted_rmsnorm, allocated_weighted_rmsnorm
-from src.kernels.fused_rmsnorm_linear import (
+from src.kernels.rmsnorm_weighted import weighted_rmsnorm, allocated_weighted_rmsnorm
+from src.kernels.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
     stack_allocated_fused_rms_norm_qkv,
     optimized_fused_rms_norm_qkv,
@@ -149,10 +149,10 @@ def test_optimized_fused_rms_norm_qkv_perf(batch, seqlen, dim, d_head, eps):
     warmup = 10
     iters = 100
     baseline_p99 = profile_kernel(
-        stack_allocated_fused_rms_norm_qkv, [hidden, qkv_weights, nl.float32, eps], warmup=warmup, iters=iters
+        stack_allocated_fused_rms_norm_qkv, (hidden, qkv_weights, nl.float32, eps), warmup=warmup, iters=iters
     )
     optimized_p99 = profile_kernel(
-        optimized_fused_rms_norm_qkv, [hidden, qkv_weights, nl.float32, eps], warmup=warmup, iters=iters
+        optimized_fused_rms_norm_qkv, (hidden, qkv_weights, nl.float32, eps), warmup=warmup, iters=iters
     )
     print(f"Optimized version {optimized_p99}ms. stack_allocated_fused_rms_norm_qkv {baseline_p99}ms.")
     assert (
