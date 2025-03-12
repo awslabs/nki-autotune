@@ -30,5 +30,7 @@ if __name__ == "__main__":
     n_groups = 1
     eps = 1e-6
 
-    p99 = profile_kernel(stack_allocated_fused_rms_norm_qkv, (hidden, weights, nl.float32, eps), warmup=10, iters=100)
+    p99 = profile_kernel(
+        stack_allocated_fused_rms_norm_qkv, (hidden, weights, nl.float32, eps), {}, warmup=10, iters=100
+    )
     print(f"stack_allocated_fused_rms_norm_qkv p99 = {p99} us.")

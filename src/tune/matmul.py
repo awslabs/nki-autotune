@@ -3,7 +3,7 @@
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
-import random, os, shutil
+import random, os, shutil, time
 from typing import List, Dict
 from itertools import product, permutations
 
@@ -62,19 +62,23 @@ def profile():
     shapes = [4096, 8192]
     dtype = nl.bfloat16
     MNK = list(product(shapes, shapes, shapes))
+    start = time.perf_counter()
     for M, N, K in MNK:
         lhsT = nt.tensor[[K, M], dtype]
         rhs = nt.tensor[[K, N], dtype]
         tuner = Autotune(
             kernel=matmul_main,
             configs=get_autotune_configs(),
-            max_configs=100,
+            max_configs=127,
             warmup=10,
             iters=100,
             pruning_func=MatMulCompatibility,
             cache_dir=f"{cache_root}/M{M}-N{N}-K{K}",
         )
         tuner(lhsT, rhs)
+        break
+    latency = time.perf_counter() - start
+    print(f"latency = {latency}")
 
 
 if __name__ == "__main__":

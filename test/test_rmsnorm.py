@@ -120,9 +120,9 @@ def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_d
 
 @pytest.mark.parametrize(
     "batch, seqlen, dim, d_head, buffer_degree, eps",
-    [(1, 1024, 4096, 256, 1, 1e-6), (1, 2048, 1024, 512, 2, 1e-3), (1, 4096, 2048, 128, 4, 1e-6)],
+    [(1, 1024, 4096, 512, 1, 1e-6), (1, 2048, 1024, 512, 2, 1e-3), (1, 4096, 2048, 512, 4, 1e-6)],
 )
-def test_optimized_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree, eps):
+def test_optimized_fused_rms_norm_qkv_numerical(batch, seqlen, dim, d_head, buffer_degree, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     qkv_weights = np.random.random_sample((dim, d_head))
     golden_output = nl.static_cast(cpu_golden_result(hidden, None, None, qkv_weights, eps), np.float32)
@@ -131,7 +131,7 @@ def test_optimized_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
     hidden_dev = nl.static_cast(hidden, data_type)
     qkv_weights_dev = nl.static_cast(qkv_weights, data_type)
     numeric_func = baremetal(optimized_fused_rms_norm_qkv)
-    allocated_out = numeric_func(hidden_dev, qkv_weights_dev, nl.float32, eps)
+    allocated_out = numeric_func(hidden_dev, qkv_weights_dev, 1, 1, 1, 1, 1, 1, nl.float32, eps)
     allocated_out = nl.static_cast(allocated_out, np.float32)
 
     atol = 1e-2

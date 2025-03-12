@@ -46,14 +46,16 @@ class Autotune:
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
 
-    def _prune(self, args: Tuple, kwargs: Dict) -> List[dict]:
-        # Pruning func should throw a fail if the inputs are illegal
+    def _prune(self, args: Tuple) -> List[dict]:
+        """
+        Pruning func should throw a fail if the inputs are illegal
+        """
         valid_configs = []
         for config in self.configs:
             arg_shapes = [arg.tensor_shape for arg in args]
             try:
                 if self.pruning_func is not None:
-                    self.pruning_func(*arg_shapes, **config, **kwargs)
+                    self.pruning_func(*arg_shapes, **config)
                 valid_configs.append(config)
             except Exception as e:
                 warnings.warn(
@@ -63,9 +65,9 @@ class Autotune:
                 break
         return valid_configs
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args):
         start = perf_counter()
-        valid_configs = self._prune(args, kwargs)
+        valid_configs = self._prune(args)
         device_locks = {machine: multiprocessing.Manager().Lock() for machine in self.benchmark_machines}
 
         benchmark_machines = self.benchmark_machines * math.ceil(len(valid_configs) // len(self.benchmark_machines))
@@ -78,13 +80,13 @@ class Autotune:
                     profile_kernel,
                     func=self.kernel,
                     args=args,
-                    kwargs=kwargs,
                     configs=config,
-                    device_lock=device_locks[machine],
                     warmup=self.warmup,
                     iters=self.iters,
-                    cache_dir=self.cache_dir,
+                    device_lock=device_locks[machine],
                     benchmark_machine=machine,
+                    cache_dir=self.cache_dir,
+                    trace=False,
                 )
                 futures_to_config[future] = config
 
