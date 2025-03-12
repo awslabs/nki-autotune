@@ -2,14 +2,15 @@ import neuronxcc.nki as nki
 from neuronxcc.nki.compile import GenericKernel
 
 import shutil, subprocess
-from typing import Callable, Dict, Tuple
+from typing import Dict, Tuple
 
 
 def profile_kernel(
     func: GenericKernel,
     args: Tuple,
-    warmup: int,
-    iters: int,
+    configs: Dict = {},
+    warmup: int = 10,
+    iters: int = 100,
     device_lock=None,
     benchmark_machine=None,
     cache_dir: str | None = None,
@@ -33,7 +34,7 @@ def profile_kernel(
         benchmark_machine=benchmark_machine,
         save_neff_name="file.neff",
     )(func)
-    bench_func(*args)
+    bench_func(*args, **configs)
     latency_res = bench_func.benchmark_result.nc_latency
     p99 = latency_res.get_latency_percentile(99)
     if trace:

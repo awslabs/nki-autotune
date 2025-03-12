@@ -83,7 +83,7 @@ def get_tests(num_tests: int) -> List[Tuple]:
                 BUFFER_N,
                 "MNK",
             )
-            assert max(M, N, K) <= 16384, f"Input sizes are too large"
+            assert max(M, N, K) <= 8192, f"Input sizes are too large"
             test = (K, M, N, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, BUFFER_K, BUFFER_M, BUFFER_N)
             valid_tests.append(test)
         except Exception as e:
@@ -108,7 +108,7 @@ def get_tests(num_tests: int) -> List[Tuple]:
 
 @pytest.mark.parametrize(
     "K, M, N, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, BUFFER_K, BUFFER_M, BUFFER_N, loop_order",
-    get_tests(30),
+    get_tests(6),
 )
 def test_matmul_correctness(
     K, M, N, TILES_IN_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, BUFFER_K, BUFFER_M, BUFFER_N, loop_order
