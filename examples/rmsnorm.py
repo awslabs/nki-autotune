@@ -3,11 +3,17 @@
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
+import neuronxcc.nki as nki
 import numpy as np
+from neuronxcc.nki import baremetal
 
 from src.autotune_kernel import Autotune
 from src.benchmark import profile_kernel
-from src.kernels.rmsnorm_linear import stack_allocated_fused_rms_norm_qkv, allocated_fused_rms_norm_qkv
+from src.kernels.rmsnorm_linear import (
+    stack_allocated_fused_rms_norm_qkv,
+    allocated_fused_rms_norm_qkv,
+    optimized_fused_rms_norm_qkv,
+)
 
 
 def get_autotune_configs():
@@ -30,7 +36,15 @@ if __name__ == "__main__":
     n_groups = 1
     eps = 1e-6
 
-    p99 = profile_kernel(
-        stack_allocated_fused_rms_norm_qkv, (hidden, weights, nl.float32, eps), {}, warmup=10, iters=100
-    )
-    print(f"stack_allocated_fused_rms_norm_qkv p99 = {p99} us.")
+    # p99 = profile_kernel(
+    #     stack_allocated_fused_rms_norm_qkv, (hidden, weights, nl.float32, eps), {}, warmup=10, iters=100
+    # )
+    # print(f"stack_allocated_fused_rms_norm_qkv p99 = {p99} us.")
+
+    hidden = np.random.random_sample((batch, seqlen, dim))
+    qkv_weights = np.random.random_sample((dim, d_head))
+    data_type = np.float16
+    hidden_dev = nl.static_cast(hidden, data_type)
+    qkv_weights_dev = nl.static_cast(qkv_weights, data_type)
+    numeric_func = baremetal(optimized_fused_rms_norm_qkv)
+    nki_out = numeric_func(hidden_dev, qkv_weights_dev, 1, 1, 1, 1, 1, 1, nl.float32, eps)
