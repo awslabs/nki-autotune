@@ -7,7 +7,7 @@ import neuronxcc.nki as nki
 from neuronxcc.nki.compiler.backends.neuron.tensors import TensorRef, KernelHBMTensor
 from typing import Tuple
 
-from src.kernels.utils import load_tensor, matmul_tiles
+from src.kernels.utils import load_tensor_block, matmul_tiles
 
 
 class MatMulCompatibility:
@@ -201,14 +201,14 @@ def matmul_NMK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
 
             for block_id_K in nl.affine_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
-                lhsT_tiles = load_tensor(
+                lhsT_tiles = load_tensor_block(
                     input_tensor=lhsT,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_M * mm.BLOCK_M,
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
                 )
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
-                rhs_tiles = load_tensor(
+                rhs_tiles = load_tensor_block(
                     input_tensor=rhs,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_N * mm.BLOCK_N,
@@ -231,14 +231,14 @@ def matmul_MNK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
 
             for block_id_K in nl.affine_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
-                lhsT_tiles = load_tensor(
+                lhsT_tiles = load_tensor_block(
                     input_tensor=lhsT,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_M * mm.BLOCK_M,
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
                 )
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
-                rhs_tiles = load_tensor(
+                rhs_tiles = load_tensor_block(
                     input_tensor=rhs,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_N * mm.BLOCK_N,
@@ -270,7 +270,7 @@ def matmul_KMN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
     for block_id_K in nl.affine_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
             # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
-            lhsT_tiles = load_tensor(
+            lhsT_tiles = load_tensor_block(
                 input_tensor=lhsT,
                 par_ofs=block_id_K * mm.BLOCK_K,
                 free_ofs=block_id_M * mm.BLOCK_M,
@@ -278,7 +278,7 @@ def matmul_KMN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
             )
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
-                rhs_tiles = load_tensor(
+                rhs_tiles = load_tensor_block(
                     input_tensor=rhs,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_N * mm.BLOCK_N,
@@ -310,7 +310,7 @@ def matmul_KNM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
     for block_id_K in nl.affine_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
             # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
-            rhs_tiles = load_tensor(
+            rhs_tiles = load_tensor_block(
                 input_tensor=rhs,
                 par_ofs=block_id_K * mm.BLOCK_K,
                 free_ofs=block_id_N * mm.BLOCK_N,
@@ -318,7 +318,7 @@ def matmul_KNM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
             )
             for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
-                lhsT_tiles = load_tensor(
+                lhsT_tiles = load_tensor_block(
                     input_tensor=lhsT,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_M * mm.BLOCK_M,
@@ -347,7 +347,7 @@ def matmul_NKM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
         for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
             # Loading tiles from rhs
             # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
-            rhs_tiles = load_tensor(
+            rhs_tiles = load_tensor_block(
                 input_tensor=rhs,
                 par_ofs=block_id_K * mm.BLOCK_K,
                 free_ofs=block_id_N * mm.BLOCK_N,
@@ -357,7 +357,7 @@ def matmul_NKM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
             # Blocking M dimension (the LHS free dimension)
             for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
                 # Loading tiles from lhsT
-                lhsT_tiles = load_tensor(
+                lhsT_tiles = load_tensor_block(
                     input_tensor=lhsT,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_M * mm.BLOCK_M,
@@ -401,7 +401,7 @@ def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
         # for example, vectorizing it
         for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
             # Loading tiles from lhsT
-            lhsT_tiles = load_tensor(
+            lhsT_tiles = load_tensor_block(
                 input_tensor=lhsT,
                 par_ofs=block_id_K * mm.BLOCK_K,
                 free_ofs=block_id_M * mm.BLOCK_M,
@@ -412,7 +412,7 @@ def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
                 # Loading tiles from rhs
                 # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
-                rhs_tiles = load_tensor(
+                rhs_tiles = load_tensor_block(
                     input_tensor=rhs,
                     par_ofs=block_id_K * mm.BLOCK_K,
                     free_ofs=block_id_N * mm.BLOCK_N,
