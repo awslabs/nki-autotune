@@ -15,7 +15,13 @@ from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
 from src.allocation.utils import update_base_addr
-from src.kernels.utils import load_tensor_block, matmul_tiles, save_result_block
+from src.kernels.utils import (
+    load_tensor_block,
+    save_result_block,
+    transpose_block,
+    matmul_non_transposed_blocks,
+    load_non_transposed_lhs_block,
+)
 
 
 class RMSNormLinearCompatibility:
@@ -53,6 +59,11 @@ class RMSNormLinearCompatibility:
         self.TILES_IN_BLOCK_N = self.N // self.NUM_BLOCK_N // self.TILE_N
         self.TILES_IN_BLOCK_K = self.K // self.NUM_BLOCK_K // self.TILE_K
 
+        # Total number of tiles
+        self.TILES_IN_M = self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M
+        self.TILES_IN_N = self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N
+        self.TILES_IN_K = self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K
+
         # Block sizes
         self.BLOCK_M = self.TILE_M * self.TILES_IN_BLOCK_M
         self.BLOCK_N = self.TILE_N * self.TILES_IN_BLOCK_N
@@ -64,6 +75,7 @@ class RMSNormLinearCompatibility:
         self.BUFFER_N = BUFFER_N
 
         self._check(K_)
+        self._show()
 
     def _check(self, K_):
         pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
@@ -73,14 +85,14 @@ class RMSNormLinearCompatibility:
 
         assert self.K == K_, f"lhs and rhs contraction dimension mismatch, got {self.K} and {K_}"
         assert (
-            self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K * self.TILE_K == self.K
-        ), f"NUM_BLOCK_K {self.NUM_BLOCK_K} * TILES_IN_BLOCK_K {self.TILES_IN_BLOCK_K} * TILE_K {self.TILE_K} != K {self.K}"
-        assert (
             self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M * self.TILE_M == self.M
         ), f"NUM_BLOCK_M {self.NUM_BLOCK_M} * TILES_IN_BLOCK_M {self.TILES_IN_BLOCK_M} * TILE_M {self.TILE_M} != M {self.M}"
         assert (
             self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N * self.TILE_N == self.N
         ), f"NUM_BLOCK_N {self.NUM_BLOCK_N} * TILES_IN_BLOCK_N {self.TILES_IN_BLOCK_N} * TILE_N {self.TILE_N} != N {self.N}"
+        assert (
+            self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K * self.TILE_K == self.K
+        ), f"NUM_BLOCK_K {self.NUM_BLOCK_K} * TILES_IN_BLOCK_K {self.TILES_IN_BLOCK_K} * TILE_K {self.TILE_K} != K {self.K}"
 
         assert (
             self.BUFFER_M <= self.NUM_BLOCK_M
@@ -91,6 +103,17 @@ class RMSNormLinearCompatibility:
         assert (
             self.BUFFER_K <= self.NUM_BLOCK_K
         ), f"K buffer degree {self.BUFFER_K} cannot be larger than number of blocks {self.NUM_BLOCK_K}"
+
+    def _show(self):
+        print(
+            f"NUM_BLOCK_M {self.NUM_BLOCK_M} * TILES_IN_BLOCK_M {self.TILES_IN_BLOCK_M} * TILE_M {self.TILE_M} = M {self.M}"
+        )
+        print(
+            f"NUM_BLOCK_N {self.NUM_BLOCK_N} * TILES_IN_BLOCK_N {self.TILES_IN_BLOCK_N} * TILE_N {self.TILE_N} = N {self.N}"
+        )
+        print(
+            f"NUM_BLOCK_K {self.NUM_BLOCK_K} * TILES_IN_BLOCK_K {self.TILES_IN_BLOCK_K} * TILE_K {self.TILE_K} = K {self.K}"
+        )
 
 
 def compatibility_checks(hidden_shape, weights_shape):
@@ -416,12 +439,14 @@ def optimized_fused_rms_norm_qkv(
                 load_shape=(checker.TILES_IN_BLOCK_M, checker.TILE_M, K),
             )
             print(f"in_block = (TILES_IN_BLOCK_M, TILE_M, K) {in_block.shape}")
-            rmsnormT_block = compute_RMSNormT(
-                in_block=in_block, eps=eps, norm_dtype=norm_dtype, output_dtype=weights.dtype
+            rmsnorm_block = compute_RMSNorm(
+                in_block=in_block, checker=checker, eps=eps, norm_dtype=norm_dtype, output_dtype=weights.dtype
             )
+            print(f"rmsnorm_block = (TILES_IN_BLOCK_M, TILE_M, K) {rmsnorm_block.shape}")
+            rmsnormT_block = transpose_block(rmsnorm_block)
             print(f"rmsnormT_block = (TILES_IN_BLOCK_M, TILE_M, K) {rmsnormT_block.shape}")
             """
-            Perform (RMSNorm(hidden)^T)^T @ wQKV
+            Perform (RMSNorm(hidden)^T) @ wQKV
             """
             for block_id_N in nl.affine_range(checker.NUM_BLOCK_N):
                 result_block = nl.zeros(
@@ -436,17 +461,7 @@ def optimized_fused_rms_norm_qkv(
                         free_ofs=block_id_N * checker.BLOCK_N,
                         load_shape=(checker.TILES_IN_BLOCK_K, checker.TILE_K, checker.BLOCK_N),
                     )
-                    print(f"weights_block = (TILES_IN_BLOCK_K, TILE_K, BLOCK_N) {weights_block.shape}")
-                    # FIXME: select lhsT from rmsnormT_block
-                    rmsnormT_block_2D = rmsnormT_block.reshape((1, 0, 2))
-                    lhsT_block = load_tensor_block(
-                        input_tensor=rmsnormT_block_2D,
-                        par_ofs=block_id_K * checker.BLOCK_K,
-                        free_ofs=0,
-                        load_shape=(checker.TILES_IN_BLOCK_K, checker.TILE_K, checker.BLOCK_M),
-                    )
-                    print(f"lhsT_block = {lhsT_block.shape}")
-                    matmul_tiles(lhsT_block, weights_block, result_block)
+                    matmul_block(block_id_K, rmsnormT_block, weights_block, result_block, checker)
                 save_result_block(
                     out_tensor[batch_id],
                     result_block,
@@ -456,87 +471,76 @@ def optimized_fused_rms_norm_qkv(
     return out_tensor
 
 
-def compute_RMSNormT(in_block, eps, norm_dtype, output_dtype):
+def matmul_block(block_id_K, lhsT_block, weights_block, result_block, checker: RMSNormLinearCompatibility):
     """
-    Compute the RMSNorm(hidden)^T tile for the in_block
+    lhsT_block (TILES_IN_BLOCK_M, TILE_M, K)
+    weights_block = (TILES_IN_BLOCK_K, TILE_K, BLOCK_N)
+    result_block = (TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N)
+    """
+    print(f"lhsT_block (TILES_IN_BLOCK_M, TILE_M, K) = {lhsT_block.shape}")
+    print(f"weights_block = (TILES_IN_BLOCK_K, TILE_K, BLOCK_N) {weights_block.shape}")
+    print(f"result_block = (TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N) {result_block.shape}")
+    TILES_IN_BLOCK_M, TILE_M, K = lhsT_block.shape
+    TILES_IN_BLOCK_K, TILE_K, BLOCK_N = weights_block.shape
+    _TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_M, TILE_N = result_block.shape
+
+    # Data checks
+    assert TILES_IN_BLOCK_M == _TILES_IN_BLOCK_M
+    assert TILE_M == _TILE_M, f"RHS and result_block shape mismatch {weights_block.shape} {result_block.shape}"
+
+    idx_lhsT = nl.mgrid[0:TILE_M, 0:TILE_K]
+    idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
+    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    BLOCK_K_ofs = block_id_K * checker.BLOCK_K
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
+            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            """
+            Use PSUM buffer to accumulate into a single hardware tile
+            to minimize the number of calls to nl.loop_reduce
+            """
+            for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
+                lhsT_tile = lhsT_block[tile_id_M, idx_lhsT.p, BLOCK_K_ofs + tile_id_K * TILE_K + idx_lhsT.x]
+                print(f"lhsT_tile = {lhsT_tile.shape}")
+                rhs_tile = weights_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x]
+                print(f"rhs_tile = {rhs_tile.shape}")
+                result_tile += nisa.nc_matmul(lhsT_tile, rhs_tile)
+
+            result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
+
+
+def compute_RMSNorm(in_block, checker: RMSNormLinearCompatibility, eps, norm_dtype, output_dtype):
+    """
+    Compute the RMSNorm(hidden) block for the in_block
     Args:
         in_block: 3D input tensor tile (TILES_IN_BLOCK_M, TILE_M, K)
         eps: RMS norm epsilon term
         norm_dtype: Data type for RMS norm, should be f32 to avoid NaN
         output_dtype: Data type for output tensor
     """
-    pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
-    num_tiles, _, dim = in_block.shape
-    rmsnorm_t_tiles = nl.ndarray((num_tiles, par_dim(pmax), dim), dtype=output_dtype, buffer=nl.sbuf)
-    i_lhs = nl.mgrid[0:pmax, 0:pmax]
-    i_rhs = nl.mgrid[0:pmax, 0:fmax]
-    """
-    all PE array ops must output to FP32 on trn1 but must match input dtype in trn2
-    """
-    if nisa.get_nc_version() == nisa.nc_version.gen3:
-        transpose_res_psum_dtype = output_dtype
-    else:
-        transpose_res_psum_dtype = np.float32
-    for tile_id in nl.affine_range(num_tiles):
-        """
-        Allocate the psum early, such that it will not share address with transpose_res_psum.
-        This avoid anti-dependencies on instuctions trying to read two of them.
-        """
-        square_sum = nl.ndarray((par_dim(pmax), 1), dtype=norm_dtype, buffer=nl.sbuf)
+    assert in_block.shape[0] == checker.TILES_IN_BLOCK_M
+    assert in_block.shape[1] == checker.TILE_M
+    assert in_block.shape[2] == checker.K
+    scale = 1 / checker.K
+    rmsnorm_block = nl.ndarray(
+        (checker.TILES_IN_BLOCK_M, par_dim(checker.TILE_M), checker.K), dtype=output_dtype, buffer=nl.sbuf
+    )
+    i_rhs = nl.mgrid[0 : checker.TILE_M, 0 : checker.K]
+    for tile_id_M in nl.affine_range(checker.TILES_IN_BLOCK_M):
+        square_sum = nl.ndarray((par_dim(checker.TILE_M), 1), dtype=norm_dtype, buffer=nl.sbuf)
 
         """
         Write the RMS and RMS Reciprocal tensors back to square_sum, in-place
         """
-        nisa.activation_reduce(op=nl.square, data=in_block[tile_id], reduce_op=np.add, reduce_res=square_sum[...])
-        scale = 1 / dim
+        nisa.activation_reduce(op=nl.square, data=in_block[tile_id_M], reduce_op=np.add, reduce_res=square_sum[...])
         square_sum[...] = nisa.tensor_scalar(square_sum[...], np.multiply, scale, op1=np.add, operand1=eps)
         square_sum[...] = nisa.activation(op=nl.rsqrt, data=square_sum[...])
 
         """
-        Write the output of RMS and RMS^T (in-place) to rmsnorm_t_tile
-        Perform (hidden .* RMS Reciprocal)^T in tiles of fmax (512)
-        Transpose because the subsequent NKI matmul operats in lhsT * rhs
-        
-        Original tensor (4x8):
-        [A1 A2 A3 A4 | B1 B2 B3 B4]
-        [A5 A6 A7 A8 | B5 B6 B7 B8]
-        [A9 Aa Ab Ac | B9 Ba Bb Bc]
-        [Ad Ae Af Ag | Bd Be Bf Bg]
-
-        Split into two 4x4 tiles (A and B), then transpose each tile independently:
-
-        Tile A (4x4) before transpose:    Tile B (4x4) before transpose:
-        [A1 A2 A3 A4]                    [B1 B2 B3 B4]
-        [A5 A6 A7 A8]                    [B5 B6 B7 B8]
-        [A9 Aa Ab Ac]                    [B9 Ba Bb Bc]
-        [Ad Ae Af Ag]                    [Bd Be Bf Bg]
-
-        Tile A after transpose:           Tile B after transpose:
-        [A1 A5 A9 Ad]                    [B1 B5 B9 Bd]
-        [A2 A6 Aa Ae]                    [B2 B6 Ba Be]
-        [A3 A7 Ab Af]                    [B3 B7 Bb Bf]
-        [A4 A8 Ac Ag]                    [B4 B8 Bc Bg]
-
-        Result after block-wise transpose (still 4x8):
-        [A1 A5 A9 Ad | B1 B5 B9 Bd]
-        [A2 A6 Aa Ae | B2 B6 Ba Be]
-        [A3 A7 Ab Af | B3 B7 Bb Bf]
-        [A4 A8 Ac Ag | B4 B8 Bc Bg]
+        Write the output of RMS (in-place)
+        Perform (hidden .* RMS Reciprocal) in tiles of fmax (512)
         """
-        NUM_TRANSP_TILES = math.ceil(dim / fmax)
-        for transpose_tile_id in nl.affine_range(NUM_TRANSP_TILES):
-            dim_offset = transpose_tile_id * fmax
-            rmsnorm_t_tiles[tile_id, i_rhs.p, dim_offset + i_rhs.x] = nl.multiply(
-                in_block[tile_id, i_rhs.p, dim_offset + i_rhs.x], square_sum[...], dtype=output_dtype
-            )
-            """
-            nisa.nc_transpose only handles tiles of (pmax, pmax)
-            In order to transpose rmsnorm_t_tile (pmax, fmax), need to parallel by fmax//pmax
-            """
-            transpose_res_psum = nl.ndarray((par_dim(pmax), fmax), dtype=transpose_res_psum_dtype, buffer=nl.psum)
-            for j in nl.affine_range(fmax // pmax):
-                transpose_res_psum[i_lhs.p, j * pmax + i_lhs.x] = nisa.nc_transpose(
-                    rmsnorm_t_tiles[tile_id, i_lhs.p, dim_offset + j * pmax + i_lhs.x]
-                )
-            rmsnorm_t_tiles[tile_id, i_rhs.p, dim_offset + i_rhs.x] = nl.copy(transpose_res_psum, dtype=in_block.dtype)
-    return rmsnorm_t_tiles
+        rmsnorm_block[tile_id_M, i_rhs.p, i_rhs.x] = nl.multiply(
+            in_block[tile_id_M, i_rhs.p, i_rhs.x], square_sum[...], dtype=output_dtype
+        )
+    return rmsnorm_block
