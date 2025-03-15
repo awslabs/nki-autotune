@@ -7,114 +7,31 @@ import neuronxcc.nki as nki
 from neuronxcc.nki.compiler.backends.neuron.tensors import TensorRef, KernelHBMTensor
 from typing import Tuple
 
-from src.kernels.utils import load_tensor_block, matmul_tiles
-
-
-class MatMulCompatibility:
-    """
-    Inputs compatibility checks for GEMM kernels
-    """
-
-    def __init__(
-        self,
-        lhs_shape: Tuple,
-        rhs_shape: Tuple,
-        NUM_BLOCK_M: int,
-        NUM_BLOCK_N: int,
-        NUM_BLOCK_K: int,
-        BUFFER_M: int,
-        BUFFER_N: int,
-        BUFFER_K: int,
-        loop_order: str,
-    ):
-        # Input sizes
-        self.M, self.K = lhs_shape
-        K_, self.N = rhs_shape
-
-        # Single tile sizes
-        self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-        self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-        self.TILE_K = nl.tile_size.pmax  # 128
-
-        # Number of blocks
-        self.NUM_BLOCK_M = NUM_BLOCK_M
-        self.NUM_BLOCK_N = NUM_BLOCK_N
-        self.NUM_BLOCK_K = NUM_BLOCK_K
-
-        # Tiles in a block
-        self.TILES_IN_BLOCK_M = self.M // self.NUM_BLOCK_M // self.TILE_M
-        self.TILES_IN_BLOCK_N = self.N // self.NUM_BLOCK_N // self.TILE_N
-        self.TILES_IN_BLOCK_K = self.K // self.NUM_BLOCK_K // self.TILE_K
-
-        # Block sizes
-        self.BLOCK_K = self.TILE_K * self.TILES_IN_BLOCK_K
-        self.BLOCK_M = self.TILE_M * self.TILES_IN_BLOCK_M
-        self.BLOCK_N = self.TILE_N * self.TILES_IN_BLOCK_N
-
-        # Buffer degrees
-        self.BUFFER_K = BUFFER_K
-        self.BUFFER_M = BUFFER_M
-        self.BUFFER_N = BUFFER_N
-
-        self.loop_order = loop_order
-
-        self._check(K_)
-
-    def _check(self, K_):
-        assert self.K == K_, f"lhs and rhs contraction dimension mismatch, got {self.K} and {K_}"
-        assert (
-            self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K * self.TILE_K == self.K
-        ), f"NUM_BLOCK_K {self.NUM_BLOCK_K} * TILES_IN_BLOCK_K {self.TILES_IN_BLOCK_K} * TILE_K {self.TILE_K} != K {self.K}"
-        assert (
-            self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M * self.TILE_M == self.M
-        ), f"NUM_BLOCK_M {self.NUM_BLOCK_M} * TILES_IN_BLOCK_M {self.TILES_IN_BLOCK_M} * TILE_M {self.TILE_M} != M {self.M}"
-        assert (
-            self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N * self.TILE_N == self.N
-        ), f"NUM_BLOCK_N {self.NUM_BLOCK_N} * TILES_IN_BLOCK_N {self.TILES_IN_BLOCK_N} * TILE_N {self.TILE_N} != N {self.N}"
-
-        assert (
-            self.BUFFER_M <= self.NUM_BLOCK_M
-        ), f"M buffer degree {self.BUFFER_M} cannot be larger than number of blocks {self.NUM_BLOCK_M}"
-        assert (
-            self.BUFFER_N <= self.NUM_BLOCK_N
-        ), f"N buffer degree {self.BUFFER_N} cannot be larger than number of blocks {self.NUM_BLOCK_N}"
-        assert (
-            self.BUFFER_K <= self.NUM_BLOCK_K
-        ), f"K buffer degree {self.BUFFER_K} cannot be larger than number of blocks {self.NUM_BLOCK_K}"
-
-        assert self.loop_order in [
-            "MNK",
-            "MKN",
-            "NMK",
-            "NKM",
-            "KMN",
-            "KNM",
-        ], f"Loop order {self.loop_order} GEMM does not exist."
+from src.kernels.utils import (
+    load_tensor_block,
+    matmul_block,
+    load_non_transposed_lhs_block,
+    matmul_non_transposed_blocks,
+    MatMulCompatibility,
+)
 
 
 @nki.jit
 def matmul_main(
     lhsT: TensorRef,
     rhs: TensorRef,
-    TILES_IN_BLOCK_K: int,
-    TILES_IN_BLOCK_M: int,
-    TILES_IN_BLOCK_N: int,
-    BUFFER_K: int,
+    NUM_BLOCK_M: int,
+    NUM_BLOCK_N: int,
+    NUM_BLOCK_K: int,
     BUFFER_M: int,
     BUFFER_N: int,
+    BUFFER_K: int,
     loop_order: str,
 ):
     mm = MatMulCompatibility(
-        lhsT.shape[::-1],
-        rhs.shape,
-        TILES_IN_BLOCK_K,
-        TILES_IN_BLOCK_M,
-        TILES_IN_BLOCK_N,
-        BUFFER_K,
-        BUFFER_M,
-        BUFFER_N,
-        loop_order,
+        lhsT.shape[::-1], rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
     )
+    assert loop_order in ["MNK", "MKN", "NMK", "NKM", "KMN", "KNM"], f"Loop order {loop_order} GEMM does not exist."
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
     if loop_order == "MNK":
@@ -214,7 +131,7 @@ def matmul_NMK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     free_ofs=block_id_N * mm.BLOCK_N,
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles)
+                matmul_block(lhsT_tiles, rhs_tiles, result_tiles)
 
             save_result_block(result, result_tiles, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
     return result
@@ -244,7 +161,7 @@ def matmul_MNK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     free_ofs=block_id_N * mm.BLOCK_N,
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles)
+                matmul_block(lhsT_tiles, rhs_tiles, result_tiles)
 
             save_result_block(result, result_tiles, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
 
@@ -285,7 +202,7 @@ def matmul_KMN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
 
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N])
+                matmul_block(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N])
 
     save_result_acc(result, result_tiles, mm.BLOCK_M, mm.BLOCK_N)
     return result
@@ -325,7 +242,7 @@ def matmul_KNM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
                 )
 
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N])
+                matmul_block(lhsT_tiles, rhs_tiles, result_tiles[block_id_K, block_id_M, block_id_N])
 
     save_result_acc(result, result_tiles, mm.BLOCK_M, mm.BLOCK_N)
     return result
@@ -364,7 +281,7 @@ def matmul_NKM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
                 )
 
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_M])
+                matmul_block(lhsT_tiles, rhs_tiles, result_tiles[block_id_M])
 
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
             """
@@ -419,7 +336,7 @@ def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
 
-                matmul_tiles(lhsT_tiles, rhs_tiles, result_tiles[block_id_N])
+                matmul_block(lhsT_tiles, rhs_tiles, result_tiles[block_id_N])
 
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             """
@@ -438,5 +355,57 @@ def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                 n_ofs=block_id_N * mm.BLOCK_N,
                 TILE_K=mm.TILE_K,
             )
+
+    return result
+
+
+@nki.jit
+def gemm_with_non_transposed_lhs(
+    lhs: TensorRef,  # Shape (M, K)
+    rhs: TensorRef,  # Shape (K, N)
+    NUM_BLOCK_M: int,
+    NUM_BLOCK_N: int,
+    NUM_BLOCK_K: int,
+    BUFFER_M: int,
+    BUFFER_N: int,
+    BUFFER_K: int,
+):
+    mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_K, BUFFER_M, BUFFER_N)
+    # Create result tensor
+    result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+
+    # Loop over blocks with multi-buffering
+    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+            # Initialize result tiles for this block
+            result_block = nl.zeros(
+                (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
+                dtype=lhs.dtype,
+                buffer=nl.sbuf,
+            )
+
+            # Loop over K dimension
+            for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
+                # M, K = lhs_shape
+                lhs_block = load_tensor_block(
+                    input_tensor=lhs,
+                    par_ofs=block_id_K * mm.BLOCK_K,
+                    free_ofs=block_id_M * mm.BLOCK_M,
+                    load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
+                )
+
+                # Load RHS block
+                rhs_block = load_tensor_block(
+                    input_tensor=rhs,
+                    par_ofs=block_id_K * mm.BLOCK_K,
+                    free_ofs=block_id_N * mm.BLOCK_N,
+                    load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
+                )
+
+                # Perform matrix multiplication
+                matmul_block(lhs_block, rhs_block, result_block)
+
+            # Store result
+            save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
 
     return result
