@@ -34,80 +34,69 @@ class MatMulCompatibility:
         self.NUM_BLOCK_N = NUM_BLOCK_N
         self.NUM_BLOCK_K = NUM_BLOCK_K
 
-        # Tiles in a block
-        self.TILES_IN_BLOCK_M = self.M // self.NUM_BLOCK_M // self.TILE_M
-        self.TILES_IN_BLOCK_N = self.N // self.NUM_BLOCK_N // self.TILE_N
-        self.TILES_IN_BLOCK_K = self.K // self.NUM_BLOCK_K // self.TILE_K
-
-        # Total number of tiles
-        self.TILES_IN_M = self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M
-        self.TILES_IN_N = self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N
-        self.TILES_IN_K = self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K
-
-        # Block sizes
-        self.BLOCK_M = self.TILE_M * self.TILES_IN_BLOCK_M
-        self.BLOCK_N = self.TILE_N * self.TILES_IN_BLOCK_N
-        self.BLOCK_K = self.TILE_K * self.TILES_IN_BLOCK_K
-
         # Buffer degrees
         self.BUFFER_K = BUFFER_K
         self.BUFFER_M = BUFFER_M
         self.BUFFER_N = BUFFER_N
 
+        # Calculate other sizes
+        for dimension in ["M", "N", "K"]:
+            size = getattr(self, f"{dimension}")
+            num_block = getattr(self, f"NUM_BLOCK_{dimension}")
+            tile_size = getattr(self, f"TILE_{dimension}")
+            tiles_in_block = size // num_block // tile_size
+            tiles_in_dim = size // tile_size
+            block_size = size // num_block
+
+            setattr(self, f"TILES_IN_BLOCK_{dimension}", tiles_in_block)
+            setattr(self, f"TILES_IN_{dimension}", tiles_in_dim)
+            setattr(self, f"BLOCK_{dimension}", block_size)
+
         self._check(K_)
         self._show()
 
     def _check(self, K_):
-        pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
-        assert K_ == self.K, "Reduction dimension must match"
-
         assert self.K == K_, f"lhs and rhs contraction dimension mismatch, got {self.K} and {K_}"
-        assert (
-            self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M * self.TILE_M == self.M
-        ), f"NUM_BLOCK_M {self.NUM_BLOCK_M} * TILES_IN_BLOCK_M {self.TILES_IN_BLOCK_M} * TILE_M {self.TILE_M} != M {self.M}"
-        assert (
-            self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N * self.TILE_N == self.N
-        ), f"NUM_BLOCK_N {self.NUM_BLOCK_N} * TILES_IN_BLOCK_N {self.TILES_IN_BLOCK_N} * TILE_N {self.TILE_N} != N {self.N}"
-        assert (
-            self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K * self.TILE_K == self.K
-        ), f"NUM_BLOCK_K {self.NUM_BLOCK_K} * TILES_IN_BLOCK_K {self.TILES_IN_BLOCK_K} * TILE_K {self.TILE_K} != K {self.K}"
-
-        assert (
-            self.BUFFER_M <= self.NUM_BLOCK_M
-        ), f"M buffer degree {self.BUFFER_M} cannot be larger than number of M blocks {self.NUM_BLOCK_M}"
-        assert (
-            self.BUFFER_N <= self.NUM_BLOCK_N
-        ), f"N buffer degree {self.BUFFER_N} cannot be larger than number of N blocks {self.NUM_BLOCK_N}"
-        assert (
-            self.BUFFER_K <= self.NUM_BLOCK_K
-        ), f"K buffer degree {self.BUFFER_K} cannot be larger than number of K blocks {self.NUM_BLOCK_K}"
+        for dimension in ["M", "N", "K"]:
+            size = getattr(self, f"{dimension}")
+            num_block = getattr(self, f"NUM_BLOCK_{dimension}")
+            tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
+            tile_size = getattr(self, f"TILE_{dimension}")
+            buffer_size = getattr(self, f"BUFFER_{dimension}")
+            assert (
+                num_block * tiles_in_block * tile_size == size
+            ), f"{dimension} size {size} cannot be divided into {num_block} blocks * {tiles_in_block} tiles * {tile_size}"
+            assert (
+                buffer_size <= num_block
+            ), f"{dimension} buffer degree {buffer_size} cannot be larger than number of blocks {num_block}"
 
     def _show(self):
-        print(
-            f"NUM_BLOCK_M {self.NUM_BLOCK_M} * TILES_IN_BLOCK_M {self.TILES_IN_BLOCK_M} * TILE_M {self.TILE_M} = M {self.M}"
-        )
-        print(
-            f"NUM_BLOCK_N {self.NUM_BLOCK_N} * TILES_IN_BLOCK_N {self.TILES_IN_BLOCK_N} * TILE_N {self.TILE_N} = N {self.N}"
-        )
-        print(
-            f"NUM_BLOCK_K {self.NUM_BLOCK_K} * TILES_IN_BLOCK_K {self.TILES_IN_BLOCK_K} * TILE_K {self.TILE_K} = K {self.K}"
-        )
+        for dimension in ["M", "N", "K"]:
+            size = getattr(self, f"{dimension}")
+            num_block = getattr(self, f"NUM_BLOCK_{dimension}")
+            tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
+            tile_size = getattr(self, f"TILE_{dimension}")
+            block_size = getattr(self, f"BLOCK_{dimension}")
+            print(
+                f"NUM_BLOCK_{dimension} {num_block} * TILES_IN_BLOCK_{dimension} {tiles_in_block} * TILE_{dimension} {tile_size} = {dimension} {size}"
+            )
+            print(f"BLOCK_{dimension} {block_size}")
 
 
-def load_tensor_block(input_tensor, par_ofs: int, free_ofs: int, load_shape: Tuple[int, ...]):
+def load_tensor_block(input_tensor, par_ofs: int, free_ofs: int, load_shape: Tuple[int, nl.par_dim, int]):
     """
-    Load a rectangular 2D tile of shape (num_par_tiles * par_tile_size, free_dim_size) from the input tensor.
+    Load a rectangular 2D tile of shape (block_size * par_size, free_size) from the input tensor.
     The location of the 2D tile from the input is offset by (par_ofs, free_ofs) at its upper left corner.
-    Load the input tile by tile in parallel in the par dimension.
+    Load the input by (par_size, free_size) tiles in parallel in the par dimension.
 
     Input tensor (par_size, free_size):
     +------------------+
     |                  |
     |    +--------+    |  ← Starting at (par_ofs, free_ofs)
     |    |Tile 0  |    |
-    |    |Tile 1  |    |  Each tile is (par_tile_size * free_dim_size)
+    |    |Tile 1  |    |  Each tile is (par_size * free_size)
     |    |  ...   |    |
-    |    |Tile N-1|    |  N = num_par_tiles
+    |    |Tile N-1|    |  N = block_size
     |    +--------+    |
     |                  |
     +------------------+
@@ -121,19 +110,20 @@ def load_tensor_block(input_tensor, par_ofs: int, free_ofs: int, load_shape: Tup
 
     Returns:
         Loaded tiles in SBUF in the shape of load_shape
+    Treat the input 2D tensor as (B * P, F)
+    TODO: treat the input 2D tensor as (F, B * P)
     """
-
     par_size, free_size = input_tensor.shape
     assert len(load_shape) == 3, f"'load_shape' expects (block, par, free). Received {load_shape}."
     load_block_size, load_par_size, load_free_size = load_shape
-    idx = nl.mgrid[0:load_par_size, 0:load_free_size]
+    index = nl.mgrid[0:load_par_size, 0:load_free_size]
     loaded_tensor = nl.ndarray(
         (load_block_size, nl.par_dim(load_par_size), load_free_size), dtype=input_tensor.dtype, buffer=nl.sbuf
     )
     for block_id in nl.affine_range(load_block_size):
-        par_indices = par_ofs + block_id * load_par_size + idx.p
-        free_indices = free_ofs + idx.x
-        loaded_tensor[block_id, idx.p, idx.x] = nl.load(
+        par_indices = par_ofs + block_id * load_par_size + index.p
+        free_indices = free_ofs + index.x
+        loaded_tensor[block_id, index.p, index.x] = nl.load(
             input_tensor[par_indices, free_indices], mask=(par_indices < par_size) & (free_indices < free_size)
         )
     return loaded_tensor
@@ -141,7 +131,7 @@ def load_tensor_block(input_tensor, par_ofs: int, free_ofs: int, load_shape: Tup
 
 def matmul_block(lhsT_block, rhs_block, result_block):
     """
-    Accumulate matmul result tiles between lhsT and rhs into resulresult_blockt_tiles
+    Accumulate matmul result tiles between lhsT and rhs into result_block
 
     Args:
     lhsT_block: TILES_IN_BLOCK_K, TILE_K, BLOCK_M
@@ -168,7 +158,6 @@ def matmul_block(lhsT_block, rhs_block, result_block):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             """
             Use PSUM buffer to accumulate into a single hardware tile
-            to minimize the number of calls to nl.loop_reduce
             """
             for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
                 result_tile += nisa.nc_matmul(
@@ -193,6 +182,7 @@ def save_result_block(result, result_tiles, m_ofs, n_ofs):
 
 def transpose_block(block):
     """
+    Transpose the (pmax, pmax) tiles in a block in place
     all PE array ops must output to FP32 on trn1 but must match input dtype in trn2
     """
     if nisa.get_nc_version() == nisa.nc_version.gen3:
@@ -209,92 +199,54 @@ def transpose_block(block):
             for free_id in nl.affine_range(free_size // pmax):
                 free_ofs = free_id * pmax
                 blockT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=blockT_dtype, buffer=nl.psum)
-                blockT[index.p, index.x] = nisa.nc_transpose(block[block_id, par_ofs + index.p, free_ofs + index.x])
+                blockT[index.x, index.p] = nisa.nc_transpose(block[block_id, par_ofs + index.p, free_ofs + index.x])
                 block[block_id, par_ofs + index.p, free_ofs + index.x] = nl.copy(blockT, dtype=block.dtype)
     return block
 
 
-def load_non_transposed_lhs_block(input_tensor, par_ofs: int, free_ofs: int, load_shape: Tuple[int, ...]):
+def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
     """
-    Load a rectangular 2D tile of shape (num_m_tiles * TILE_M, K) from the input tensor.
-    The location of the 2D tile from the input is offset by (free_ofs, par_ofs) at its upper left corner.
+    Accumulate matmul result tiles between lhs and rhs into result_block
 
     Args:
-        input_tensor: the input tensor to load from, arranged in (M, K)
-        free_ofs: offset in the M dimension
-        par_ofs: offset in the K dimension
-        load_shape: 3D: (TILES_IN_BLOCK_M, TILE_M, K_size)
-
-    Returns:
-        Loaded tiles in SBUF in the shape of load_shape
+    lhs_block: TILES_IN_BLOCK_M, TILE_M, BLOCK_K
+    rhs_block: TILES_IN_BLOCK_K, TILE_K, BLOCK_N
+    result_block : TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N
     """
-    m_size, k_size = input_tensor.shape
-    assert len(load_shape) == 3, f"'load_shape' expects (tiles_m, tile_m, k_size). Received {load_shape}."
-    tiles_in_block_m, tile_m, load_k_size = load_shape
+    print(f"lhs_block (TILES_IN_BLOCK_M, TILE_M, BLOCK_K) = {lhs_block.shape}")
+    TILES_IN_BLOCK_M, TILE_M, BLOCK_K = lhs_block.shape
+    TILES_IN_BLOCK_K, TILE_K, BLOCK_N = rhs_block.shape
+    _TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_M, TILE_N = result_block.shape
 
-    idx = nl.mgrid[0:tile_m, 0:load_k_size]
-    loaded_tensor = nl.ndarray(
-        (tiles_in_block_m, nl.par_dim(tile_m), load_k_size), dtype=input_tensor.dtype, buffer=nl.sbuf
-    )
+    if nisa.get_nc_version() == nisa.nc_version.gen3:
+        transpose_dtype = lhs_block.dtype
+    else:
+        transpose_dtype = np.float32
 
-    for tile_id_m in nl.affine_range(tiles_in_block_m):
-        m_indices = free_ofs + tile_id_m * tile_m + idx.p
-        k_indices = par_ofs + idx.x
-        loaded_tensor[tile_id_m, idx.p, idx.x] = nl.load(
-            input_tensor[m_indices, k_indices], mask=(m_indices < m_size) & (k_indices < k_size)
-        )
-
-    return loaded_tensor
-
-
-def matmul_non_transposed_blocks(lhs_block, rhs_block, result_tiles):
-    """
-    Accumulate matmul result tiles between non-transposed lhs and rhs into result_tiles
-
-    Args:
-        lhs_block: BLOCK_M, TILES_IN_BLOCK_K, par_dim(TILE_K)
-        rhs_block: TILES_IN_BLOCK_K, par_dim(TILE_K), BLOCK_N
-        result_tiles: TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N
-    """
-    BLOCK_M, TILES_IN_BLOCK_K, TILE_K = lhs_block.shape
-    _TILES_IN_BLOCK_K, _TILE_K, BLOCK_N = rhs_block.shape
-    TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N = result_tiles.shape
-
-    # Data checks
-    assert (
-        TILES_IN_BLOCK_K == _TILES_IN_BLOCK_K and TILE_K == _TILE_K
-    ), f"lhs_block {lhs_block.shape} shape mismatch with rhs_block {rhs_block.shape}"
-    assert (
-        TILES_IN_BLOCK_M * TILE_M == BLOCK_M
-    ), f"lhs_block {lhs_block.shape} shape mismatch with result_tiles {result_tiles.shape}"
-    assert (
-        TILES_IN_BLOCK_N * TILE_N == BLOCK_N
-    ), f"rhs_block {rhs_block.shape} shape mismatch with result_tiles {result_tiles.shape}"
-
-    idx_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
+    idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-
     for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
         for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
-            res_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            """
+            Use PSUM buffer to accumulate into a single hardware tile
+            """
             for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
-                # Need to transpose LHS on the fly for matrix multiplication
-                lhs_tile = lhs_block[tile_id_M * TILE_M + idx_lhsT.x, tile_id_K, idx_lhsT.p]
-                print(f"lhs_tile = {lhs_tile.shape}")
+                lhsT_tile = nl.zeros((nl.par_dim(TILE_K), TILE_M), dtype=transpose_dtype, buffer=nl.psum)
+                lhsT_tile[idx_lhs.p, idx_lhs.x] = nisa.nc_transpose(
+                    lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x]
+                )
+                # lhsT_tile[idx_lhs.p, idx_lhs.x] = nl.copy(
+                #     lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x], dtype=lhsT_tile.dtype
+                # )
+                lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x] = nl.copy(lhsT_tile, dtype=lhs_block.dtype)
+                # print(f"lhsT_tile (TILE_K, TILE_M) = {lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x].shape}")
 
-                """
-                TILES_IN_BLOCK_K, TILE_K, BLOCK_M = lhsT_block.shape
-                res_tile += nisa.nc_matmul(
-                    lhsT_block[tile_id_K, idx_lhsT.p, tile_id_M * TILE_M + idx_lhsT.x],
+                print(f"rhs_tile (TILE_K, TILE_M) = {rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x].shape}")
+                result_tile += nisa.nc_matmul(
+                    lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x],
                     rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x],
                 )
-                """
 
-                # Perform the matrix multiplication
-                res_tile += nisa.nc_matmul(
-                    lhs_tile[idx_lhsT.p, idx_lhsT.x], rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x]
-                )
-
-            # Store the result
-            result_tiles[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += res_tile[idx_res.p, idx_res.x]
+            result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
