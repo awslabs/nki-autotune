@@ -7,13 +7,7 @@ import neuronxcc.nki as nki
 from neuronxcc.nki.compiler.backends.neuron.tensors import TensorRef, KernelHBMTensor
 from typing import Tuple
 
-from src.kernels.utils import (
-    load_tensor_block,
-    matmul_block,
-    load_non_transposed_lhs_block,
-    matmul_non_transposed_blocks,
-    MatMulCompatibility,
-)
+from src.kernels.utils import load_tensor_block, matmul_block, matmul_non_transposed_blocks, MatMulCompatibility
 
 
 @nki.jit
@@ -50,16 +44,21 @@ def matmul_main(
         raise NotImplementedError(f"Loop order {loop_order} GEMM does not exist.")
 
 
-def save_result_block(result, result_tiles, m_ofs, n_ofs):
-    num_m_tiles, num_n_tiles, TILE_M, TILE_N = result_tiles.shape
+def save_result_block(result, result_block, m_ofs: int, n_ofs: int):
+    """
+    Store result_block into result
+    Args:
+    result: M, N
+    result_block: TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, nl.par_dim(TILE_M), TILE_N
+    """
+    TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N = result_block.shape
 
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(num_m_tiles):
-        for tile_id_N in nl.affine_range(num_n_tiles):
-            nl.store(
-                result[m_ofs + tile_id_M * TILE_M + idx_res.p, n_ofs + tile_id_N * TILE_N + idx_res.x],
-                value=result_tiles[tile_id_M, tile_id_N],
-            )
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        m_start = m_ofs + tile_id_M * TILE_M
+        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
+            n_start = n_ofs + tile_id_N * TILE_N
+            nl.store(result[m_start + idx_res.p, n_start + idx_res.x], value=result_block[tile_id_M, tile_id_N])
 
 
 def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
@@ -370,28 +369,21 @@ def gemm_with_non_transposed_lhs(
     BUFFER_N: int,
     BUFFER_K: int,
 ):
-    mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_K, BUFFER_M, BUFFER_N)
-    # Create result tensor
+    mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
-
-    # Loop over blocks with multi-buffering
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-            # Initialize result tiles for this block
             result_block = nl.zeros(
                 (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
                 dtype=lhs.dtype,
                 buffer=nl.sbuf,
             )
-
-            # Loop over K dimension
             for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
-                # M, K = lhs_shape
                 lhs_block = load_tensor_block(
                     input_tensor=lhs,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_M * mm.BLOCK_M,
-                    load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
+                    par_ofs=block_id_M * mm.BLOCK_M,
+                    free_ofs=block_id_K * mm.BLOCK_K,
+                    load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.BLOCK_K),
                 )
 
                 # Load RHS block
@@ -403,7 +395,7 @@ def gemm_with_non_transposed_lhs(
                 )
 
                 # Perform matrix multiplication
-                matmul_block(lhs_block, rhs_block, result_block)
+                matmul_non_transposed_blocks(lhs_block, rhs_block, result_block)
 
             # Store result
             save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)

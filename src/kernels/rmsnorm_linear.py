@@ -15,105 +15,7 @@ from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
 from src.allocation.utils import update_base_addr
-from src.kernels.utils import (
-    load_tensor_block,
-    save_result_block,
-    transpose_block,
-    matmul_non_transposed_blocks,
-    load_non_transposed_lhs_block,
-)
-
-
-class RMSNormLinearCompatibility:
-    """
-    Inputs compatibility checks
-    """
-
-    def __init__(
-        self,
-        lhs_shape: Tuple,
-        rhs_shape: Tuple,
-        NUM_BLOCK_M: int,
-        NUM_BLOCK_N: int,
-        NUM_BLOCK_K: int,
-        BUFFER_M: int,
-        BUFFER_N: int,
-        BUFFER_K: int,
-    ) -> None:
-        # Input sizes
-        self.M, self.K = lhs_shape
-        K_, self.N = rhs_shape
-
-        # Single tile sizes
-        self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-        self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-        self.TILE_K = nl.tile_size.pmax  # 128
-
-        # Number of blocks
-        self.NUM_BLOCK_M = NUM_BLOCK_M
-        self.NUM_BLOCK_N = NUM_BLOCK_N
-        self.NUM_BLOCK_K = NUM_BLOCK_K
-
-        # Tiles in a block
-        self.TILES_IN_BLOCK_M = self.M // self.NUM_BLOCK_M // self.TILE_M
-        self.TILES_IN_BLOCK_N = self.N // self.NUM_BLOCK_N // self.TILE_N
-        self.TILES_IN_BLOCK_K = self.K // self.NUM_BLOCK_K // self.TILE_K
-
-        # Total number of tiles
-        self.TILES_IN_M = self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M
-        self.TILES_IN_N = self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N
-        self.TILES_IN_K = self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K
-
-        # Block sizes
-        self.BLOCK_M = self.TILE_M * self.TILES_IN_BLOCK_M
-        self.BLOCK_N = self.TILE_N * self.TILES_IN_BLOCK_N
-        self.BLOCK_K = self.TILE_K * self.TILES_IN_BLOCK_K
-
-        # Buffer degrees
-        self.BUFFER_K = BUFFER_K
-        self.BUFFER_M = BUFFER_M
-        self.BUFFER_N = BUFFER_N
-
-        self._check(K_)
-        self._show()
-
-    def _check(self, K_):
-        pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
-        assert self.K <= 8192 and self.K & pmax == 0, "Unsupported hidden dimension"
-        assert K_ == self.K, "Reduction dimension must match"
-        assert self.N <= fmax, "Head dimension must be fmax (512) or less"
-
-        assert self.K == K_, f"lhs and rhs contraction dimension mismatch, got {self.K} and {K_}"
-        assert (
-            self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M * self.TILE_M == self.M
-        ), f"NUM_BLOCK_M {self.NUM_BLOCK_M} * TILES_IN_BLOCK_M {self.TILES_IN_BLOCK_M} * TILE_M {self.TILE_M} != M {self.M}"
-        assert (
-            self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N * self.TILE_N == self.N
-        ), f"NUM_BLOCK_N {self.NUM_BLOCK_N} * TILES_IN_BLOCK_N {self.TILES_IN_BLOCK_N} * TILE_N {self.TILE_N} != N {self.N}"
-        assert (
-            self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K * self.TILE_K == self.K
-        ), f"NUM_BLOCK_K {self.NUM_BLOCK_K} * TILES_IN_BLOCK_K {self.TILES_IN_BLOCK_K} * TILE_K {self.TILE_K} != K {self.K}"
-
-        assert (
-            self.BUFFER_M <= self.NUM_BLOCK_M
-        ), f"M buffer degree {self.BUFFER_M} cannot be larger than number of blocks {self.NUM_BLOCK_M}"
-        assert (
-            self.BUFFER_N <= self.NUM_BLOCK_N
-        ), f"N buffer degree {self.BUFFER_N} cannot be larger than number of blocks {self.NUM_BLOCK_N}"
-        assert (
-            self.BUFFER_K <= self.NUM_BLOCK_K
-        ), f"K buffer degree {self.BUFFER_K} cannot be larger than number of blocks {self.NUM_BLOCK_K}"
-
-    def _show(self):
-        print(
-            f"NUM_BLOCK_M {self.NUM_BLOCK_M} * TILES_IN_BLOCK_M {self.TILES_IN_BLOCK_M} * TILE_M {self.TILE_M} = M {self.M}"
-        )
-        print(
-            f"NUM_BLOCK_N {self.NUM_BLOCK_N} * TILES_IN_BLOCK_N {self.TILES_IN_BLOCK_N} * TILE_N {self.TILE_N} = N {self.N}"
-        )
-        print(
-            f"NUM_BLOCK_K {self.NUM_BLOCK_K} * TILES_IN_BLOCK_K {self.TILES_IN_BLOCK_K} * TILE_K {self.TILE_K} = K {self.K}"
-        )
+from src.kernels.utils import load_tensor_block, save_result_block, matmul_non_transposed_blocks, MatMulCompatibility
 
 
 def compatibility_checks(hidden_shape, weights_shape):
@@ -422,7 +324,7 @@ def optimized_fused_rms_norm_qkv(
         norm_dtype (_type_, optional): Data type for RMS norm, should be f32 to avoid NaN. Defaults to nl.float32.
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
-    checker = RMSNormLinearCompatibility(
+    checker = MatMulCompatibility(
         hidden.shape[1:], weights.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
     )
     batch, M, K = hidden.shape
@@ -443,8 +345,6 @@ def optimized_fused_rms_norm_qkv(
                 in_block=in_block, checker=checker, eps=eps, norm_dtype=norm_dtype, output_dtype=weights.dtype
             )
             print(f"rmsnorm_block = (TILES_IN_BLOCK_M, TILE_M, K) {rmsnorm_block.shape}")
-            rmsnormT_block = transpose_block(rmsnorm_block)
-            print(f"rmsnormT_block = (TILES_IN_BLOCK_M, TILE_M, K) {rmsnormT_block.shape}")
             """
             Perform (RMSNorm(hidden)^T) @ wQKV
             """
@@ -461,7 +361,7 @@ def optimized_fused_rms_norm_qkv(
                         free_ofs=block_id_N * checker.BLOCK_N,
                         load_shape=(checker.TILES_IN_BLOCK_K, checker.TILE_K, checker.BLOCK_N),
                     )
-                    matmul_block(block_id_K, rmsnormT_block, weights_block, result_block, checker)
+                    matmul_non_transposed_blocks(rmsnorm_block, weights_block, result_block)
                 save_result_block(
                     out_tensor[batch_id],
                     result_block,
@@ -471,45 +371,7 @@ def optimized_fused_rms_norm_qkv(
     return out_tensor
 
 
-def matmul_block(block_id_K, lhsT_block, weights_block, result_block, checker: RMSNormLinearCompatibility):
-    """
-    lhsT_block (TILES_IN_BLOCK_M, TILE_M, K)
-    weights_block = (TILES_IN_BLOCK_K, TILE_K, BLOCK_N)
-    result_block = (TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N)
-    """
-    print(f"lhsT_block (TILES_IN_BLOCK_M, TILE_M, K) = {lhsT_block.shape}")
-    print(f"weights_block = (TILES_IN_BLOCK_K, TILE_K, BLOCK_N) {weights_block.shape}")
-    print(f"result_block = (TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N) {result_block.shape}")
-    TILES_IN_BLOCK_M, TILE_M, K = lhsT_block.shape
-    TILES_IN_BLOCK_K, TILE_K, BLOCK_N = weights_block.shape
-    _TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_M, TILE_N = result_block.shape
-
-    # Data checks
-    assert TILES_IN_BLOCK_M == _TILES_IN_BLOCK_M
-    assert TILE_M == _TILE_M, f"RHS and result_block shape mismatch {weights_block.shape} {result_block.shape}"
-
-    idx_lhsT = nl.mgrid[0:TILE_M, 0:TILE_K]
-    idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    BLOCK_K_ofs = block_id_K * checker.BLOCK_K
-    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
-        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
-            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            """
-            Use PSUM buffer to accumulate into a single hardware tile
-            to minimize the number of calls to nl.loop_reduce
-            """
-            for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
-                lhsT_tile = lhsT_block[tile_id_M, idx_lhsT.p, BLOCK_K_ofs + tile_id_K * TILE_K + idx_lhsT.x]
-                print(f"lhsT_tile = {lhsT_tile.shape}")
-                rhs_tile = weights_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x]
-                print(f"rhs_tile = {rhs_tile.shape}")
-                result_tile += nisa.nc_matmul(lhsT_tile, rhs_tile)
-
-            result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
-
-
-def compute_RMSNorm(in_block, checker: RMSNormLinearCompatibility, eps, norm_dtype, output_dtype):
+def compute_RMSNorm(in_block, checker: MatMulCompatibility, eps, norm_dtype, output_dtype):
     """
     Compute the RMSNorm(hidden) block for the in_block
     Args:

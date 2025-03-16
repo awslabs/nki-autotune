@@ -13,26 +13,18 @@ from neuronxcc.nki import baremetal
 from itertools import product, permutations
 
 
-def cpu_golden(lhsT, rhs):
-    # lhsT is the transposed left matrix and rhs is the right matrix
-    assert lhsT.shape[0] == rhs.shape[0], f"Contraction dimensions don't match: {lhsT.shape} {rhs.shape}"
-
-    # Initialize result matrix with zeros
-    result = np.matmul(lhsT.T, rhs)
-
-    return result
-
-
-def non_transposed_cpu_golden(lhs, rhs):
-    assert lhs.shape[1] == rhs.shape[0], f"Contraction dimensions don't match: {lhs.shape} {rhs.shape}"
-
-    # Initialize result matrix with zeros
+def cpu_golden(lhs, rhs, lhs_is_transposed: bool):
+    if lhs_is_transposed:
+        lhs = lhs.T
+    M, K = lhs.shape
+    _K, N = rhs.shape
+    assert K == _K, f"lhs and rhs shape mismatch: {lhs.shape}, {rhs.shape}"
     result = np.matmul(lhs, rhs)
-
     return result
 
 
 def get_tests(num_tests: int, mutate_loop_order: bool) -> List[Tuple]:
+    random.seed(42)
     NUM_BLOCK_M_vals = [2, 4, 16]
     NUM_BLOCK_N_vals = [2, 8, 16]
     NUM_BLOCK_K_vals = [2, 8, 16]
@@ -110,7 +102,7 @@ def test_matmul_correctness(M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFF
     data_type = np.float32
     lhsT = np.random.random_sample((K, M)).astype(data_type)
     rhs = np.random.random_sample((K, N)).astype(data_type)
-    golden_output = nl.static_cast(cpu_golden(lhsT, rhs), np.float32)
+    golden_output = nl.static_cast(cpu_golden(lhsT, rhs, lhs_is_transposed=True), np.float32)
 
     lhsT_dev = nl.static_cast(lhsT, data_type)
     rhs_dev = nl.static_cast(rhs, data_type)
@@ -128,7 +120,7 @@ def test_matmul_correctness(M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFF
 
 @pytest.mark.parametrize(
     "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K",
-    get_tests(1, mutate_loop_order=False),
+    get_tests(3, mutate_loop_order=False),
 )
 def test_non_transposed_matmul_correctness(
     M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
@@ -136,7 +128,7 @@ def test_non_transposed_matmul_correctness(
     data_type = np.float32
     lhs = np.random.random_sample((M, K)).astype(data_type)
     rhs = np.random.random_sample((K, N)).astype(data_type)
-    golden_output = nl.static_cast(non_transposed_cpu_golden(lhs, rhs), np.float32)
+    golden_output = nl.static_cast(cpu_golden(lhs, rhs, lhs_is_transposed=False), np.float32)
 
     lhs_dev = nl.static_cast(lhs, data_type)
     rhs_dev = nl.static_cast(rhs, data_type)
@@ -147,4 +139,4 @@ def test_non_transposed_matmul_correctness(
     atol = 1e-2
     rtol = 1e-3
     match = allclose(nki_out, golden_output, atol=atol, rtol=rtol, verbose=1)
-    assert match
+    assert match, f"nki_out\n{nki_out}\ngolden_output\n{golden_output}"
