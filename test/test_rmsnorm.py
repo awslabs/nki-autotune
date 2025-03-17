@@ -8,7 +8,7 @@ from src.kernels.rmsnorm_linear import (
     blocked_fused_rms_norm_linear,
 )
 from src.benchmark import profile_kernel
-from src.golden.rmsnorm_linear import cpu_golden_result
+from src.golden.rmsnorm_linear import rmsnorm_linear_golden
 
 import neuronxcc.nki.language as nl
 from neuronxcc.starfish.support.util import allclose
@@ -22,7 +22,7 @@ import neuronxcc.nki.typing as nt
 def test_weighted_rmsnorm(batch, seqlen, dim, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     gamma = np.random.random_sample((dim))
-    golden_output = nl.static_cast(cpu_golden_result(hidden, None, gamma, None, eps), np.float32)
+    golden_output = nl.static_cast(rmsnorm_linear_golden(hidden, None, gamma, None, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -44,7 +44,7 @@ def test_weighted_rmsnorm(batch, seqlen, dim, eps):
 def test_allocated_weighted_rmsnorm(batch, seqlen, dim, buffer_degree, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     gamma = np.random.random_sample((dim))
-    golden_output = nl.static_cast(cpu_golden_result(hidden, None, gamma, None, eps), np.float32)
+    golden_output = nl.static_cast(rmsnorm_linear_golden(hidden, None, gamma, None, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -66,7 +66,7 @@ def test_allocated_weighted_rmsnorm(batch, seqlen, dim, buffer_degree, eps):
 def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     qkv_weights = np.random.random_sample((dim, d_head))
-    golden_output = nl.static_cast(cpu_golden_result(hidden, None, None, qkv_weights, eps), np.float32)
+    golden_output = nl.static_cast(rmsnorm_linear_golden(hidden, None, None, qkv_weights, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -88,7 +88,7 @@ def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
 def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     qkv_weights = np.random.random_sample((dim, d_head))
-    golden_output = nl.static_cast(cpu_golden_result(hidden, None, None, qkv_weights, eps), np.float32)
+    golden_output = nl.static_cast(rmsnorm_linear_golden(hidden, None, None, qkv_weights, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -104,25 +104,21 @@ def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_d
 
 
 @pytest.mark.parametrize(
-    "batch, seqlen, dim, d_head, buffer_degree, eps",
-    [(1, 1024, 4096, 512, 1, 1e-6), (1, 2048, 1024, 512, 2, 1e-3), (1, 4096, 2048, 512, 4, 1e-6)],
+    "batch, M, K, N, eps", [(1, 1024, 4096, 512, 1e-6), (1, 2048, 1024, 512, 1e-3), (1, 4096, 2048, 512, 1e-6)]
 )
-def test_blocked_fused_rms_norm_linear_numerical(batch, seqlen, dim, d_head, buffer_degree, eps):
+def test_blocked_fused_rms_norm_linear_numerical(batch, M, K, N, eps):
     data_type = np.float32
-    hidden = np.random.random_sample((batch, seqlen, dim))
-    qkv_weights = np.random.random_sample((dim, d_head))
-    golden_output = nl.static_cast(cpu_golden_result(hidden, None, None, qkv_weights, eps), data_type)
+    atol, rtol = 1e-2, 1e-3
+    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
+    rhs = np.random.random_sample((K, N)).astype(data_type)
 
-    hidden_dev = nl.static_cast(hidden, data_type)
-    qkv_weights_dev = nl.static_cast(qkv_weights, data_type)
+    golden = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, eps), data_type)
+
     numeric_func = baremetal(blocked_fused_rms_norm_linear)
-    allocated_out = numeric_func(hidden_dev, qkv_weights_dev, 1, 1, 1, 1, 1, 1, nl.float32, eps)
-    allocated_out = nl.static_cast(allocated_out, data_type)
+    # TODO: add tests for num blocks and buffer sizes
+    nki_out = nl.static_cast(numeric_func(lhs, rhs, 2, 1, 2, 1, 1, 1, nl.float32, eps), data_type)
 
-    atol = 1e-2
-    rtol = 1e-3
-    match = allclose(allocated_out, golden_output, atol=atol, rtol=rtol, verbose=1)
-    assert match
+    assert allclose(nki_out, golden, atol=atol, rtol=rtol, verbose=1)
 
 
 @pytest.mark.xfail(reason="Optimized kernel not yet done")
