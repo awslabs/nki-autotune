@@ -298,6 +298,7 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
     return out_tensor
 
 
+# TODO: test enable_stack_allocator and skip_middle_end_transformations
 @nki.jit
 def blocked_fused_rms_norm_linear(
     lhs,
@@ -322,28 +323,38 @@ def blocked_fused_rms_norm_linear(
         norm_dtype (_type_, optional): Data type for RMS norm, should be f32 to avoid NaN. Defaults to nl.float32.
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
-    mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
-    result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
-    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-        lhs_block = load_tensor_block(
-            input_tensor=lhs, ofs=(block_id_M * mm.BLOCK_M, 0), load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K)
-        )
-        rmsnorm_block = compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
-        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-            result_block = nl.zeros(
-                (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
-                dtype=lhs.dtype,
-                buffer=nl.sbuf,
+    mm = MatMulCompatibility(
+        lhs.shape[1:], rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
+    )
+    batch_size = lhs.shape[0]
+    result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+    for batch_id in nl.affine_range(batch_size):
+        for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+            lhs_block = load_tensor_block(
+                input_tensor=lhs[batch_id],
+                ofs=(block_id_M * mm.BLOCK_M, 0),
+                load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K),
             )
-            rhs_block = load_tensor_block(
-                input_tensor=rhs, ofs=(0, block_id_N * mm.BLOCK_N), load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N)
-            )
-            matmul_non_transposed_blocks(rmsnorm_block, rhs_block, result_block)
-            save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
+            rmsnorm_block = compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
+            for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+                result_block = nl.zeros(
+                    (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
+                    dtype=lhs.dtype,
+                    buffer=nl.sbuf,
+                )
+                rhs_block = load_tensor_block(
+                    input_tensor=rhs,
+                    ofs=(0, block_id_N * mm.BLOCK_N),
+                    load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N),
+                )
+                matmul_non_transposed_blocks(rmsnorm_block, rhs_block, result_block)
+                save_result_block(
+                    result[batch_id], result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N
+                )
     return result
 
 
-def compute_RMSNorm(in_block, checker: MatMulCompatibility, eps, norm_dtype, output_dtype):
+def compute_RMSNorm(in_block, mm: MatMulCompatibility, eps, norm_dtype, output_dtype):
     """
     Compute the RMSNorm(hidden) block for the in_block
     Args:
@@ -352,16 +363,14 @@ def compute_RMSNorm(in_block, checker: MatMulCompatibility, eps, norm_dtype, out
         norm_dtype: Data type for RMS norm, should be f32 to avoid NaN
         output_dtype: Data type for output tensor
     """
-    assert in_block.shape[0] == checker.TILES_IN_BLOCK_M
-    assert in_block.shape[1] == checker.TILE_M
-    assert in_block.shape[2] == checker.K
-    scale = 1 / checker.K
-    rmsnorm_block = nl.ndarray(
-        (checker.TILES_IN_BLOCK_M, par_dim(checker.TILE_M), checker.K), dtype=output_dtype, buffer=nl.sbuf
-    )
-    i_rhs = nl.mgrid[0 : checker.TILE_M, 0 : checker.K]
-    for tile_id_M in nl.affine_range(checker.TILES_IN_BLOCK_M):
-        square_sum = nl.ndarray((par_dim(checker.TILE_M), 1), dtype=norm_dtype, buffer=nl.sbuf)
+    assert in_block.shape[0] == mm.TILES_IN_BLOCK_M
+    assert in_block.shape[1] == mm.TILE_M
+    assert in_block.shape[2] == mm.K
+    scale = 1 / mm.K
+    rmsnorm_block = nl.ndarray((mm.TILES_IN_BLOCK_M, par_dim(mm.TILE_M), mm.K), dtype=output_dtype, buffer=nl.sbuf)
+    i_rhs = nl.mgrid[0 : mm.TILE_M, 0 : mm.K]
+    for tile_id_M in nl.affine_range(mm.TILES_IN_BLOCK_M):
+        square_sum = nl.ndarray((par_dim(mm.TILE_M), 1), dtype=norm_dtype, buffer=nl.sbuf)
 
         """
         Write the RMS and RMS Reciprocal tensors back to square_sum, in-place

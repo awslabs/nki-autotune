@@ -20,12 +20,13 @@ if __name__ == "__main__":
     atol, rtol = 1e-2, 1e-3
     lhs = np.random.random_sample((batch, M, K)).astype(data_type)
     rhs = np.random.random_sample((K, N)).astype(data_type)
+    eps = 1e-6
 
-    golden = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, 1e-6), data_type)[0]
+    golden = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, eps), data_type)
     print(f"golden: {golden.shape}\n{golden}")
 
     numeric_func = baremetal(blocked_fused_rms_norm_linear)
-    nki_out = numeric_func(lhs[0], rhs, 2, 1, 2, 1, 1, 1)
+    nki_out = nl.static_cast(numeric_func(lhs, rhs, 2, 1, 2, 1, 1, 1, nl.float32, eps), data_type)
     print(f"nki_out: {nki_out.shape}\n{nki_out}")
 
     assert allclose(nki_out, golden, atol=atol, rtol=rtol, verbose=1)
