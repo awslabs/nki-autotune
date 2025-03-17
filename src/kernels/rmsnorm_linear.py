@@ -298,12 +298,10 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
     return out_tensor
 
 
-@nki.compiler.enable_stack_allocator()
-@nki.compiler.skip_middle_end_transformations
 @nki.jit
 def blocked_fused_rms_norm_linear(
-    hidden,
-    weights,
+    lhs,
+    rhs,
     NUM_BLOCK_M: int,
     NUM_BLOCK_N: int,
     NUM_BLOCK_K: int,
@@ -318,53 +316,31 @@ def blocked_fused_rms_norm_linear(
     Internally, normalizations are cast to fp32 to avoid NaN errors.
 
     Args:
-        hidden (_type_): Input tensor of the attention block in BSH layout
-        weights (_type_): Fused QKV linear weights, assumed to be eltwise-multiplied with RMS norm weight vector (gamma)
-        out_tensor (_type_): Output tensor
+        lhs (_type_): Input tensor of the attention block in BSH layout
+        rhs (_type_): Fused QKV linear weights, assumed to be eltwise-multiplied with RMS norm weight vector (gamma)
+        result (_type_): Output tensor
         norm_dtype (_type_, optional): Data type for RMS norm, should be f32 to avoid NaN. Defaults to nl.float32.
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
-    checker = MatMulCompatibility(
-        hidden.shape[1:], weights.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
-    )
-    batch, M, K = hidden.shape
-    _K, N = weights.shape
-
-    out_tensor = nl.ndarray((batch, M, N), dtype=hidden.dtype, buffer=nl.shared_hbm)
-
-    for batch_id in nl.affine_range(batch):
-        for block_id_M in nl.affine_range(checker.NUM_BLOCK_M):
-            in_block = load_tensor_block(
-                hidden[batch_id],
-                ofs=(block_id_M * checker.BLOCK_M, 0),
-                load_shape=(checker.TILES_IN_BLOCK_M, checker.TILE_M, checker.K),
+    mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
+    result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+        lhs_block = load_tensor_block(
+            input_tensor=lhs, ofs=(block_id_M * mm.BLOCK_M, 0), load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K)
+        )
+        rmsnorm_block = compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
+        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+            result_block = nl.zeros(
+                (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
+                dtype=lhs.dtype,
+                buffer=nl.sbuf,
             )
-            # rmsnorm_block = compute_RMSNorm(
-            #     in_block=in_block, checker=checker, eps=eps, norm_dtype=norm_dtype, output_dtype=weights.dtype
-            # )
-            # print(f"rmsnorm_block = (TILES_IN_BLOCK_M, TILE_M, K) {rmsnorm_block.shape}")
-            """
-            Perform (RMSNorm(hidden)^T) @ wQKV
-            """
-            for block_id_N in nl.affine_range(checker.NUM_BLOCK_N):
-                result_block = nl.zeros(
-                    (checker.TILES_IN_BLOCK_M, checker.TILES_IN_BLOCK_N, nl.par_dim(checker.TILE_M), checker.TILE_N),
-                    dtype=in_block.dtype,
-                    buffer=nl.sbuf,
-                )
-                weights_block = load_tensor_block(
-                    input_tensor=weights,
-                    ofs=(0, block_id_N * checker.BLOCK_N),
-                    load_shape=(checker.TILES_IN_K, checker.TILE_K, checker.BLOCK_N),
-                )
-                matmul_non_transposed_blocks(in_block, weights_block, result_block)
-                save_result_block(
-                    out_tensor[batch_id],
-                    result_block,
-                    m_ofs=block_id_M * checker.BLOCK_M,
-                    n_ofs=block_id_N * checker.BLOCK_N,
-                )
-    return out_tensor
+            rhs_block = load_tensor_block(
+                input_tensor=rhs, ofs=(0, block_id_N * mm.BLOCK_N), load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N)
+            )
+            matmul_non_transposed_blocks(rmsnorm_block, rhs_block, result_block)
+            save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
+    return result
 
 
 def compute_RMSNorm(in_block, checker: MatMulCompatibility, eps, norm_dtype, output_dtype):
