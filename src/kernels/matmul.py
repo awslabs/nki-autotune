@@ -119,15 +119,13 @@ def matmul_NMK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
                 lhsT_tiles = load_tensor_block(
                     input_tensor=lhsT,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_M * mm.BLOCK_M,
+                    ofs=(block_id_K * mm.BLOCK_K, block_id_M * mm.BLOCK_M),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
                 )
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
                 rhs_tiles = load_tensor_block(
                     input_tensor=rhs,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_N * mm.BLOCK_N,
+                    ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
                 matmul_block(lhsT_tiles, rhs_tiles, result_tiles)
@@ -149,15 +147,13 @@ def matmul_MNK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
                 lhsT_tiles = load_tensor_block(
                     input_tensor=lhsT,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_M * mm.BLOCK_M,
+                    ofs=(block_id_K * mm.BLOCK_K, block_id_M * mm.BLOCK_M),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
                 )
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
                 rhs_tiles = load_tensor_block(
                     input_tensor=rhs,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_N * mm.BLOCK_N,
+                    ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
                 matmul_block(lhsT_tiles, rhs_tiles, result_tiles)
@@ -188,16 +184,14 @@ def matmul_KMN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
             # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
             lhsT_tiles = load_tensor_block(
                 input_tensor=lhsT,
-                par_ofs=block_id_K * mm.BLOCK_K,
-                free_ofs=block_id_M * mm.BLOCK_M,
+                ofs=(block_id_K * mm.BLOCK_K, block_id_M * mm.BLOCK_M),
                 load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
             )
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
                 rhs_tiles = load_tensor_block(
                     input_tensor=rhs,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_N * mm.BLOCK_N,
+                    ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
 
@@ -228,16 +222,14 @@ def matmul_KNM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
             # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
             rhs_tiles = load_tensor_block(
                 input_tensor=rhs,
-                par_ofs=block_id_K * mm.BLOCK_K,
-                free_ofs=block_id_N * mm.BLOCK_N,
+                ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                 load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
             )
             for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
                 lhsT_tiles = load_tensor_block(
                     input_tensor=lhsT,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_M * mm.BLOCK_M,
+                    ofs=(block_id_K * mm.BLOCK_K, block_id_M * mm.BLOCK_M),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
                 )
 
@@ -265,8 +257,7 @@ def matmul_NKM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
             # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
             rhs_tiles = load_tensor_block(
                 input_tensor=rhs,
-                par_ofs=block_id_K * mm.BLOCK_K,
-                free_ofs=block_id_N * mm.BLOCK_N,
+                ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                 load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
             )
 
@@ -275,8 +266,7 @@ def matmul_NKM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                 # Loading tiles from lhsT
                 lhsT_tiles = load_tensor_block(
                     input_tensor=lhsT,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_M * mm.BLOCK_M,
+                    ofs=(block_id_K * mm.BLOCK_K, block_id_M * mm.BLOCK_M),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
                 )
 
@@ -319,8 +309,7 @@ def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
             # Loading tiles from lhsT
             lhsT_tiles = load_tensor_block(
                 input_tensor=lhsT,
-                par_ofs=block_id_K * mm.BLOCK_K,
-                free_ofs=block_id_M * mm.BLOCK_M,
+                ofs=(block_id_K * mm.BLOCK_K, block_id_M * mm.BLOCK_M),
                 load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_M),
             )
 
@@ -330,8 +319,7 @@ def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
                 # setting the load tile to `TILE_K x BLOCK_SIZE_N` to optimize DMA performance
                 rhs_tiles = load_tensor_block(
                     input_tensor=rhs,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_N * mm.BLOCK_N,
+                    ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
 

@@ -301,7 +301,7 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
 @nki.compiler.enable_stack_allocator()
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
-def optimized_fused_rms_norm_qkv(
+def blocked_fused_rms_norm_linear(
     hidden,
     weights,
     NUM_BLOCK_M: int,
@@ -336,11 +336,9 @@ def optimized_fused_rms_norm_qkv(
         for block_id_M in nl.affine_range(checker.NUM_BLOCK_M):
             in_block = load_tensor_block(
                 hidden[batch_id],
-                par_ofs=block_id_M * checker.BLOCK_M,
-                free_ofs=0,
+                ofs=(block_id_M * checker.BLOCK_M, 0),
                 load_shape=(checker.TILES_IN_BLOCK_M, checker.TILE_M, checker.K),
             )
-            print(f"in_block = (TILES_IN_BLOCK_M, TILE_M, K) {in_block.shape}")
             # rmsnorm_block = compute_RMSNorm(
             #     in_block=in_block, checker=checker, eps=eps, norm_dtype=norm_dtype, output_dtype=weights.dtype
             # )
@@ -351,17 +349,15 @@ def optimized_fused_rms_norm_qkv(
             for block_id_N in nl.affine_range(checker.NUM_BLOCK_N):
                 result_block = nl.zeros(
                     (checker.TILES_IN_BLOCK_M, checker.TILES_IN_BLOCK_N, nl.par_dim(checker.TILE_M), checker.TILE_N),
-                    dtype=weights.dtype,
+                    dtype=in_block.dtype,
                     buffer=nl.sbuf,
                 )
-                for block_id_K in nl.affine_range(checker.NUM_BLOCK_K):
-                    weights_block = load_tensor_block(
-                        input_tensor=weights,
-                        par_ofs=block_id_K * checker.BLOCK_K,
-                        free_ofs=block_id_N * checker.BLOCK_N,
-                        load_shape=(checker.TILES_IN_BLOCK_K, checker.TILE_K, checker.BLOCK_N),
-                    )
-                    matmul_non_transposed_blocks(in_block, rhs_block=weights_block, result_block=result_block)
+                weights_block = load_tensor_block(
+                    input_tensor=weights,
+                    ofs=(0, block_id_N * checker.BLOCK_N),
+                    load_shape=(checker.TILES_IN_K, checker.TILE_K, checker.BLOCK_N),
+                )
+                matmul_non_transposed_blocks(in_block, weights_block, result_block)
                 save_result_block(
                     out_tensor[batch_id],
                     result_block,
