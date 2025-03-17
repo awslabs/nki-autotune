@@ -372,6 +372,14 @@ def gemm_with_non_transposed_lhs(
     mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+        # TODO: make matmul_non_transposed_blocks more general to take in hoist lhs load
+        # lhs_full_K_block = load_tensor_block(
+        #     input_tensor=lhs,
+        #     par_ofs=block_id_M * mm.BLOCK_M,
+        #     free_ofs=0,
+        #     load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K),
+        # )
+        # print(f"lhs_full_K_block = {lhs_full_K_block.shape}")
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             result_block = nl.zeros(
                 (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
@@ -385,8 +393,6 @@ def gemm_with_non_transposed_lhs(
                     free_ofs=block_id_K * mm.BLOCK_K,
                     load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.BLOCK_K),
                 )
-
-                # Load RHS block
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
                     par_ofs=block_id_K * mm.BLOCK_K,

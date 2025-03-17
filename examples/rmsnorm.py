@@ -33,6 +33,18 @@ def cpu_golden_result(hidden, gate, gamma, qkv_weights, eps):
     return output
 
 
+def gemm_cpu_golden(lhs, rhs, lhs_is_transposed: bool):
+    if lhs_is_transposed:
+        lhs = lhs.T
+    batch_size, M, K = lhs.shape
+    _K, N = rhs.shape
+    assert K == _K, f"lhs and rhs shape mismatch: {lhs.shape}, {rhs.shape}"
+    result = np.zeros((batch_size, M, N))
+    for batch_id in range(batch_size):
+        result[batch_id] = np.matmul(lhs[batch_id], rhs)
+    return result
+
+
 if __name__ == "__main__":
     batch, seqlen, dim, d_head = 1, 2048, 4096, 512
     hidden = nt.tensor[[batch, seqlen, dim], nl.bfloat16]
@@ -52,9 +64,15 @@ if __name__ == "__main__":
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
     qkv_weights_dev = nl.static_cast(qkv_weights, data_type)
+
     numeric_func = baremetal(optimized_fused_rms_norm_qkv)
     nki_out = numeric_func(hidden_dev, qkv_weights_dev, 1, 1, 1, 1, 1, 1, nl.float32, eps)
+
+    # numeric_func = baremetal(stack_allocated_fused_rms_norm_qkv)
+    # nki_out = numeric_func(hidden_dev, qkv_weights_dev, nl.float32, eps)
+
     golden_output = nl.static_cast(cpu_golden_result(hidden, None, None, qkv_weights, eps), np.float32)
+    golden_output = nl.static_cast(gemm_cpu_golden(hidden, qkv_weights, False), np.float32)
     atol = 1e-2
     rtol = 1e-3
     print(nki_out.shape, nki_out)
