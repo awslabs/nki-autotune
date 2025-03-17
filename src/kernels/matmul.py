@@ -377,13 +377,8 @@ def gemm_with_non_transposed_lhs_MNK(
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
-
-                # Perform matrix multiplication
                 matmul_non_transposed_blocks(lhs_block, rhs_block, result_block)
-
-            # Store result
             save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
-
     return result
 
 
@@ -413,11 +408,6 @@ def gemm_with_non_transposed_lhs_MN(
             rhs_block = load_tensor_block(
                 input_tensor=rhs, ofs=(0, block_id_N * mm.BLOCK_N), load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N)
             )
-
-            # Perform matrix multiplication
             matmul_non_transposed_blocks(lhs_block, rhs_block, result_block)
-
-            # Store result
             save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
-
     return result
