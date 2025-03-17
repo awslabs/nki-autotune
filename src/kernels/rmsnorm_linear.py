@@ -338,13 +338,13 @@ def optimized_fused_rms_norm_qkv(
                 hidden[batch_id],
                 par_ofs=block_id_M * checker.BLOCK_M,
                 free_ofs=0,
-                load_shape=(checker.TILES_IN_BLOCK_M, checker.TILE_M, K),
+                load_shape=(checker.TILES_IN_BLOCK_M, checker.TILE_M, checker.K),
             )
             print(f"in_block = (TILES_IN_BLOCK_M, TILE_M, K) {in_block.shape}")
-            rmsnorm_block = compute_RMSNorm(
-                in_block=in_block, checker=checker, eps=eps, norm_dtype=norm_dtype, output_dtype=weights.dtype
-            )
-            print(f"rmsnorm_block = (TILES_IN_BLOCK_M, TILE_M, K) {rmsnorm_block.shape}")
+            # rmsnorm_block = compute_RMSNorm(
+            #     in_block=in_block, checker=checker, eps=eps, norm_dtype=norm_dtype, output_dtype=weights.dtype
+            # )
+            # print(f"rmsnorm_block = (TILES_IN_BLOCK_M, TILE_M, K) {rmsnorm_block.shape}")
             """
             Perform (RMSNorm(hidden)^T) @ wQKV
             """
@@ -361,7 +361,11 @@ def optimized_fused_rms_norm_qkv(
                         free_ofs=block_id_N * checker.BLOCK_N,
                         load_shape=(checker.TILES_IN_BLOCK_K, checker.TILE_K, checker.BLOCK_N),
                     )
-                    matmul_non_transposed_blocks(rmsnorm_block, weights_block, result_block)
+                    matmul_non_transposed_blocks(
+                        in_block,
+                        rhs_block=weights_block,
+                        result_block=result_block,
+                    )
                 save_result_block(
                     out_tensor[batch_id],
                     result_block,

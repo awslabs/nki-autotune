@@ -213,10 +213,16 @@ def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
     rhs_block: TILES_IN_BLOCK_K, TILE_K, BLOCK_N
     result_block : TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N
     """
-    print(f"lhs_block (TILES_IN_BLOCK_M, TILE_M, BLOCK_K) = {lhs_block.shape}")
+    print(f"lhs_block (TILES_IN_BLOCK_M, TILE_M, K) = {lhs_block.shape}")
     TILES_IN_BLOCK_M, TILE_M, BLOCK_K = lhs_block.shape
     TILES_IN_BLOCK_K, TILE_K, BLOCK_N = rhs_block.shape
     _TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_M, TILE_N = result_block.shape
+    assert (
+        BLOCK_K == TILES_IN_BLOCK_K * TILE_K
+    ), f"lhs_block {lhs_block.shape} does not match with rhs_block {rhs_block.shape}"
+    assert (
+        TILES_IN_BLOCK_M == _TILES_IN_BLOCK_M and TILE_M == _TILE_M
+    ), f"lhs_block {lhs_block.shape} does not match with result_block {result_block.shape}"
 
     if nisa.get_nc_version() == nisa.nc_version.gen3:
         transpose_dtype = lhs_block.dtype
@@ -233,17 +239,13 @@ def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
             Use PSUM buffer to accumulate into a single hardware tile
             """
             for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
-                lhsT_tile = nl.zeros((nl.par_dim(TILE_K), TILE_M), dtype=transpose_dtype, buffer=nl.psum)
+                lhsT_tile = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=transpose_dtype, buffer=nl.psum)
                 lhsT_tile[idx_lhs.p, idx_lhs.x] = nisa.nc_transpose(
                     lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x]
                 )
-                # lhsT_tile[idx_lhs.p, idx_lhs.x] = nl.copy(
-                #     lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x], dtype=lhsT_tile.dtype
-                # )
-                lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x] = nl.copy(lhsT_tile, dtype=lhs_block.dtype)
-                # print(f"lhsT_tile (TILE_K, TILE_M) = {lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x].shape}")
-
-                print(f"rhs_tile (TILE_K, TILE_M) = {rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x].shape}")
+                lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x] = nl.copy(
+                    lhsT_tile, dtype=lhs_block.dtype
+                )
                 result_tile += nisa.nc_matmul(
                     lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x],
                     rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x],
