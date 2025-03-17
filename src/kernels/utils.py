@@ -83,16 +83,17 @@ class MatMulCompatibility:
             print(f"BLOCK_{dimension} {block_size}")
 
 
-def load_tensor_block(input_tensor, par_ofs: int, free_ofs: int, load_shape: Tuple[int, nl.par_dim, int]):
+def load_tensor_block(input_tensor, ofs: Tuple[int, int], load_shape: Tuple[int, nl.par_dim, int]):
     """
-    Load a rectangular 2D tile of shape (block_size * par_size, free_size) from the input tensor.
-    The location of the 2D tile from the input is offset by (par_ofs, free_ofs) at its upper left corner.
-    Load the input by (par_size, free_size) tiles in parallel in the par dimension.
+    Load a 2D rectangle region from the input HBM tensor to SBUF.
+    The location of the 2D region is offset by (ofs[0], ofs[1]) at its upper left corner.
+    The size of the 2D region to load into SBUF is (block_size * par_size, free_size).
+    Load the input HBM tensor by (par_size, free_size) tiles in parallel in the block dimension.
+    Output SBUF tensor has a shape of (block_size, par_size, free_size).
 
-    Input tensor (par_size, free_size):
     +------------------+
     |                  |
-    |    +--------+    |  ← Starting at (par_ofs, free_ofs)
+    |    +--------+    |  ← Starting at (ofs[0], ofs[1])
     |    |Tile 0  |    |
     |    |Tile 1  |    |  Each tile is (par_size * free_size)
     |    |  ...   |    |
@@ -102,29 +103,26 @@ def load_tensor_block(input_tensor, par_ofs: int, free_ofs: int, load_shape: Tup
     +------------------+
 
     Args:
-        input_tensor: the input tensor to load from, arranged in (par_size, free_size)
-        par_ofs: offset in the partition dimension
-        free_ofs: offset in the free dimension
-        load_shape:
-        3D: (block_size, par_size, free_size)
+        input_tensor: the input 2D HBM tensor
+        ofs: location offsets in the 2D HBM tensor dimensions
+        load_shape: (block_size, par_dim(par_size), free_size)
 
     Returns:
         Loaded tiles in SBUF in the shape of load_shape
-    Treat the input 2D tensor as (B * P, F)
-    TODO: treat the input 2D tensor as (F, B * P)
     """
-    par_size, free_size = input_tensor.shape
+    assert len(ofs) == 2, f"'ofs' expects (ofs_0, ofs_1). Received {ofs}."
     assert len(load_shape) == 3, f"'load_shape' expects (block, par, free). Received {load_shape}."
+    max_rows, max_cols = input_tensor.shape
     load_block_size, load_par_size, load_free_size = load_shape
-    index = nl.mgrid[0:load_par_size, 0:load_free_size]
+    tile_index = nl.mgrid[0:load_par_size, 0:load_free_size]
     loaded_tensor = nl.ndarray(
         (load_block_size, nl.par_dim(load_par_size), load_free_size), dtype=input_tensor.dtype, buffer=nl.sbuf
     )
     for block_id in nl.affine_range(load_block_size):
-        par_indices = par_ofs + block_id * load_par_size + index.p
-        free_indices = free_ofs + index.x
-        loaded_tensor[block_id, index.p, index.x] = nl.load(
-            input_tensor[par_indices, free_indices], mask=(par_indices < par_size) & (free_indices < free_size)
+        row_indices = ofs[0] + block_id * load_par_size + tile_index.p
+        col_indices = ofs[1] + tile_index.x
+        loaded_tensor[block_id, tile_index.p, tile_index.x] = nl.load(
+            input_tensor[row_indices, col_indices], mask=(row_indices < max_rows) & (col_indices < max_cols)
         )
     return loaded_tensor
 
@@ -209,20 +207,22 @@ def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
     Accumulate matmul result tiles between lhs and rhs into result_block
 
     Args:
-    lhs_block: TILES_IN_BLOCK_M, TILE_M, BLOCK_K
-    rhs_block: TILES_IN_BLOCK_K, TILE_K, BLOCK_N
-    result_block : TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N
+    lhs_block: TILES_IN_M, TILE_M, K
+    rhs_block: TILES_IN_K, TILE_K, N
+    result_block : TILES_IN_M, TILES_IN_N, TILE_M, TILE_N
     """
-    print(f"lhs_block (TILES_IN_BLOCK_M, TILE_M, K) = {lhs_block.shape}")
-    TILES_IN_BLOCK_M, TILE_M, BLOCK_K = lhs_block.shape
-    TILES_IN_BLOCK_K, TILE_K, BLOCK_N = rhs_block.shape
-    _TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_M, TILE_N = result_block.shape
+    print(f"lhs_block (TILES_IN_m, TILE_M, k) = {lhs_block.shape}.")
+    print(f"rhs_block (TILES_IN_k, TILE_K, n) = {rhs_block.shape}.")
+    TILES_IN_M, TILE_M, K = lhs_block.shape
+    TILES_IN_K, TILE_K, N = rhs_block.shape
+    _TILES_IN_M, TILES_IN_N, _TILE_M, TILE_N = result_block.shape
+    assert TILES_IN_K * TILE_K == K, f"K dimension mismatch: lhs_block {lhs_block.shape}. rhs_block {rhs_block.shape}."
     assert (
-        BLOCK_K == TILES_IN_BLOCK_K * TILE_K
-    ), f"lhs_block {lhs_block.shape} does not match with rhs_block {rhs_block.shape}"
+        TILES_IN_M == _TILES_IN_M and TILE_M == _TILE_M
+    ), f"M dimension mismatch: lhs_block {lhs_block.shape}. result_block {result_block.shape}."
     assert (
-        TILES_IN_BLOCK_M == _TILES_IN_BLOCK_M and TILE_M == _TILE_M
-    ), f"lhs_block {lhs_block.shape} does not match with result_block {result_block.shape}"
+        N == TILES_IN_N * TILE_N
+    ), f"N dimension mismatch: rhs_block {rhs_block.shape}. result_block {result_block.shape}."
 
     if nisa.get_nc_version() == nisa.nc_version.gen3:
         transpose_dtype = lhs_block.dtype
@@ -232,23 +232,21 @@ def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
     idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
-        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
+    for tile_id_M in nl.affine_range(TILES_IN_M):
+        for tile_id_N in nl.affine_range(TILES_IN_N):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             """
             Use PSUM buffer to accumulate into a single hardware tile
             """
-            for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
+            for tile_id_K in nl.affine_range(TILES_IN_K):
                 lhsT_tile = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=transpose_dtype, buffer=nl.psum)
                 lhsT_tile[idx_lhs.p, idx_lhs.x] = nisa.nc_transpose(
                     lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x]
                 )
-                lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x] = nl.copy(
-                    lhsT_tile, dtype=lhs_block.dtype
-                )
+                temp_tile = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=lhs_block.dtype, buffer=nl.sbuf)
+                temp_tile[idx_lhs.p, idx_lhs.x] = nl.copy(lhsT_tile, dtype=lhs_block.dtype)
                 result_tile += nisa.nc_matmul(
-                    lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x],
-                    rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x],
+                    temp_tile, rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x]
                 )
 
             result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]

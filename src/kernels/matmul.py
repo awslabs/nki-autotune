@@ -359,7 +359,7 @@ def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
 
 
 @nki.jit
-def gemm_with_non_transposed_lhs(
+def gemm_with_non_transposed_lhs_MNK(
     lhs: TensorRef,  # Shape (M, K)
     rhs: TensorRef,  # Shape (K, N)
     NUM_BLOCK_M: int,
@@ -372,14 +372,6 @@ def gemm_with_non_transposed_lhs(
     mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-        # TODO: make matmul_non_transposed_blocks more general to take in hoist lhs load
-        # lhs_full_K_block = load_tensor_block(
-        #     input_tensor=lhs,
-        #     par_ofs=block_id_M * mm.BLOCK_M,
-        #     free_ofs=0,
-        #     load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K),
-        # )
-        # print(f"lhs_full_K_block = {lhs_full_K_block.shape}")
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             result_block = nl.zeros(
                 (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
@@ -389,19 +381,53 @@ def gemm_with_non_transposed_lhs(
             for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
                 lhs_block = load_tensor_block(
                     input_tensor=lhs,
-                    par_ofs=block_id_M * mm.BLOCK_M,
-                    free_ofs=block_id_K * mm.BLOCK_K,
+                    ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
                     load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.BLOCK_K),
                 )
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
-                    par_ofs=block_id_K * mm.BLOCK_K,
-                    free_ofs=block_id_N * mm.BLOCK_N,
+                    ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
 
                 # Perform matrix multiplication
                 matmul_non_transposed_blocks(lhs_block, rhs_block, result_block)
+
+            # Store result
+            save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
+
+    return result
+
+
+@nki.jit
+def gemm_with_non_transposed_lhs_MN(
+    lhs: TensorRef,  # Shape (M, K)
+    rhs: TensorRef,  # Shape (K, N)
+    NUM_BLOCK_M: int,
+    NUM_BLOCK_N: int,
+    NUM_BLOCK_K: int,
+    BUFFER_M: int,
+    BUFFER_N: int,
+    BUFFER_K: int,
+):
+    mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
+    result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+        lhs_block = load_tensor_block(
+            input_tensor=lhs, ofs=(block_id_M * mm.BLOCK_M, 0), load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K)
+        )
+        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+            result_block = nl.zeros(
+                (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
+                dtype=lhs.dtype,
+                buffer=nl.sbuf,
+            )
+            rhs_block = load_tensor_block(
+                input_tensor=rhs, ofs=(0, block_id_N * mm.BLOCK_N), load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N)
+            )
+
+            # Perform matrix multiplication
+            matmul_non_transposed_blocks(lhs_block, rhs_block, result_block)
 
             # Store result
             save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)

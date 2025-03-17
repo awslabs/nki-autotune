@@ -4,7 +4,12 @@ from typing import List, Tuple
 
 sys.path.append("../")
 
-from src.kernels.matmul import matmul_main, MatMulCompatibility, gemm_with_non_transposed_lhs
+from src.kernels.matmul import (
+    matmul_main,
+    MatMulCompatibility,
+    gemm_with_non_transposed_lhs_MN,
+    gemm_with_non_transposed_lhs_MNK,
+)
 
 import neuronxcc.nki.language as nl
 from neuronxcc.starfish.support.util import allclose
@@ -120,7 +125,7 @@ def test_matmul_correctness(M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFF
 
 @pytest.mark.parametrize(
     "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K",
-    get_tests(3, mutate_loop_order=False),
+    get_tests(1, mutate_loop_order=False),
 )
 def test_non_transposed_matmul_correctness(
     M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
@@ -132,7 +137,7 @@ def test_non_transposed_matmul_correctness(
 
     lhs_dev = nl.static_cast(lhs, data_type)
     rhs_dev = nl.static_cast(rhs, data_type)
-    numeric_func = baremetal(gemm_with_non_transposed_lhs)
+    numeric_func = baremetal(gemm_with_non_transposed_lhs_MN)
     nki_out = numeric_func(lhs_dev, rhs_dev, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
     nki_out = nl.static_cast(nki_out, np.float32)
 

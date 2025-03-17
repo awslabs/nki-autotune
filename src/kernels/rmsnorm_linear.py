@@ -361,11 +361,7 @@ def optimized_fused_rms_norm_qkv(
                         free_ofs=block_id_N * checker.BLOCK_N,
                         load_shape=(checker.TILES_IN_BLOCK_K, checker.TILE_K, checker.BLOCK_N),
                     )
-                    matmul_non_transposed_blocks(
-                        in_block,
-                        rhs_block=weights_block,
-                        result_block=result_block,
-                    )
+                    matmul_non_transposed_blocks(in_block, rhs_block=weights_block, result_block=result_block)
                 save_result_block(
                     out_tensor[batch_id],
                     result_block,
