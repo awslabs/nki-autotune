@@ -41,4 +41,4 @@ class GenTests:
         Returns:
             bool: True if test config is valid
         """
-        return config
+        raise Exception("process_test_config is not implemented in the base class")

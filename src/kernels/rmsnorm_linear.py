@@ -299,18 +299,11 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
 
 
 # TODO: test enable_stack_allocator and skip_middle_end_transformations
+@nki.compiler.enable_stack_allocator()
+@nki.compiler.skip_middle_end_transformations
 @nki.jit
 def blocked_fused_rms_norm_linear(
-    lhs,
-    rhs,
-    NUM_BLOCK_M: int,
-    NUM_BLOCK_N: int,
-    NUM_BLOCK_K: int,
-    BUFFER_M: int,
-    BUFFER_N: int,
-    BUFFER_K: int,
-    norm_dtype=nl.float32,
-    eps=1e-6,
+    lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, BUFFER_M: int, BUFFER_N: int, norm_dtype=nl.float32, eps=1e-6
 ):
     """
     Optimized kernel that computes RMSNorm(hidden) @ wQKV. This kernel is designed to only handle fp16/bf16 tensor types.
@@ -323,20 +316,18 @@ def blocked_fused_rms_norm_linear(
         norm_dtype (_type_, optional): Data type for RMS norm, should be f32 to avoid NaN. Defaults to nl.float32.
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
-    mm = MatMulCompatibility(
-        lhs.shape[1:], rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
-    )
+    mm = MatMulCompatibility(lhs.shape[1:], rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
     batch_size = lhs.shape[0]
     result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for batch_id in nl.affine_range(batch_size):
-        for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+        for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
             lhs_block = load_tensor_block(
                 input_tensor=lhs[batch_id],
                 ofs=(block_id_M * mm.BLOCK_M, 0),
                 load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K),
             )
             rmsnorm_block = compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
-            for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+            for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
                 result_block = nl.zeros(
                     (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
                     dtype=lhs.dtype,

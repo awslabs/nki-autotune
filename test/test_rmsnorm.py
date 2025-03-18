@@ -1,5 +1,6 @@
 import pytest
 import numpy as np
+from typing import Dict, Tuple
 
 from src.kernels.rmsnorm_weighted import weighted_rmsnorm, allocated_weighted_rmsnorm
 from src.kernels.rmsnorm_linear import (
@@ -7,13 +8,36 @@ from src.kernels.rmsnorm_linear import (
     stack_allocated_fused_rms_norm_qkv,
     blocked_fused_rms_norm_linear,
 )
+from src.kernels.matmul import MatMulCompatibility
 from src.benchmark import profile_kernel
 from src.golden.rmsnorm_linear import rmsnorm_linear_golden
+from test_generation import GenTests
 
 import neuronxcc.nki.language as nl
 from neuronxcc.starfish.support.util import allclose
 from neuronxcc.nki import baremetal
 import neuronxcc.nki.typing as nt
+
+
+class RMSNormLinearTestConfig(GenTests):
+    def process_test_config(self, config: Dict[str, int]) -> Tuple | None:
+        batch = config["batch"]
+        M = config["M"]
+        N = config["N"]
+        K = config["K"]
+        NUM_BLOCK_M = config["NUM_BLOCK_M"]
+        NUM_BLOCK_N = config["NUM_BLOCK_N"]
+        BUFFER_M = config["BUFFER_M"]
+        BUFFER_N = config["BUFFER_N"]
+        eps = config["eps"]
+
+        try:
+            assert max(M, N, K) <= 8192, f"Input sizes are too large for testing"
+            MatMulCompatibility((M, K), (K, N), NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
+            config_tuple = (batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, eps)
+            return config_tuple
+        except Exception as e:
+            return None
 
 
 @pytest.mark.parametrize(
@@ -104,9 +128,20 @@ def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_d
 
 
 @pytest.mark.parametrize(
-    "batch, M, K, N, eps", [(1, 1024, 4096, 512, 1e-6), (1, 2048, 1024, 512, 1e-3), (1, 4096, 2048, 512, 1e-6)]
+    "batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, eps",
+    RMSNormLinearTestConfig(
+        batch=[1, 2, 4],
+        M=[1024, 2048],
+        N=[2048, 4096],
+        K=[1024, 4096],
+        NUM_BLOCK_M=[1, 2, 4],
+        NUM_BLOCK_N=[1, 2, 4],
+        BUFFER_M=[1, 2, 4],
+        BUFFER_N=[1, 2, 4],
+        eps=[1e-6, 1e-3],
+    ).valid_tests[:10],
 )
-def test_blocked_fused_rms_norm_linear_numerical(batch, M, K, N, eps):
+def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, eps):
     data_type = np.float32
     atol, rtol = 1e-2, 1e-3
     lhs = np.random.random_sample((batch, M, K)).astype(data_type)
@@ -115,14 +150,15 @@ def test_blocked_fused_rms_norm_linear_numerical(batch, M, K, N, eps):
     golden = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, eps), data_type)
 
     numeric_func = baremetal(blocked_fused_rms_norm_linear)
-    # TODO: add tests for num blocks and buffer sizes
-    nki_out = nl.static_cast(numeric_func(lhs, rhs, 2, 1, 2, 1, 1, 1, nl.float32, eps), data_type)
+    nki_out = nl.static_cast(
+        numeric_func(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, nl.float32, eps), data_type
+    )
 
     assert allclose(nki_out, golden, atol=atol, rtol=rtol, verbose=1)
 
 
-@pytest.mark.xfail(reason="Optimized kernel not yet done")
-@pytest.mark.parametrize("batch, seqlen, dim, d_head, eps", [(1, 1024, 4096, 256, 1e-6), (1, 2048, 1024, 512, 1e-3)])
+# @pytest.mark.xfail(reason="Optimized kernel not yet done")
+@pytest.mark.parametrize("batch, seqlen, dim, d_head, eps", [(1, 1024, 4096, 512, 1e-6)])
 def test_blocked_fused_rms_norm_linear_perf(batch, seqlen, dim, d_head, eps):
     dtype = nl.bfloat16
     hidden = nt.tensor[[batch, seqlen, dim], dtype]
@@ -133,9 +169,9 @@ def test_blocked_fused_rms_norm_linear_perf(batch, seqlen, dim, d_head, eps):
         stack_allocated_fused_rms_norm_qkv, (hidden, qkv_weights, nl.float32, eps), warmup=warmup, iters=iters
     )
     optimized_p99 = profile_kernel(
-        blocked_fused_rms_norm_linear, (hidden, qkv_weights, nl.float32, eps), warmup=warmup, iters=iters
+        blocked_fused_rms_norm_linear, (hidden, qkv_weights, 1, 1, 1, 1, nl.float32, eps), warmup=warmup, iters=iters
     )
-    print(f"Optimized version {optimized_p99}ms. stack_allocated_fused_rms_norm_qkv {baseline_p99}ms.")
+    print(f"blocked_fused_rms_norm_linear {optimized_p99}ms. stack_allocated_fused_rms_norm_qkv {baseline_p99}ms.")
     assert (
         optimized_p99 <= baseline_p99
-    ), f"Optimized version {optimized_p99}ms should be faster than stack_allocated_fused_rms_norm_qkv {baseline_p99}ms"
+    ), f"blocked_fused_rms_norm_linear {optimized_p99}ms should be faster than stack_allocated_fused_rms_norm_qkv {baseline_p99}ms"

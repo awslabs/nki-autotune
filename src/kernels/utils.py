@@ -53,7 +53,7 @@ class MatMulCompatibility:
             setattr(self, f"BLOCK_{dimension}", block_size)
 
         self._check(K_)
-        self._show()
+        # self._show()
 
     def _check(self, K_):
         assert self.K == K_, f"lhs and rhs contraction dimension mismatch, got {self.K} and {K_}"
@@ -211,8 +211,6 @@ def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
     rhs_block: TILES_IN_K, TILE_K, N
     result_block : TILES_IN_M, TILES_IN_N, TILE_M, TILE_N
     """
-    print(f"lhs_block (TILES_IN_m, TILE_M, k) = {lhs_block.shape}.")
-    print(f"rhs_block (TILES_IN_k, TILE_K, n) = {rhs_block.shape}.")
     TILES_IN_M, TILE_M, K = lhs_block.shape
     TILES_IN_K, TILE_K, N = rhs_block.shape
     _TILES_IN_M, TILES_IN_N, _TILE_M, TILE_N = result_block.shape
@@ -243,6 +241,7 @@ def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
                 lhsT_tile[idx_lhs.p, idx_lhs.x] = nisa.nc_transpose(
                     lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x]
                 )
+                # FIXME: cannot save in-place to lhs_block because of pseudo dependencies
                 temp_tile = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=lhs_block.dtype, buffer=nl.sbuf)
                 temp_tile[idx_lhs.p, idx_lhs.x] = nl.copy(lhsT_tile, dtype=lhs_block.dtype)
                 result_tile += nisa.nc_matmul(
