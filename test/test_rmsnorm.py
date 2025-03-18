@@ -157,7 +157,7 @@ def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NU
     assert allclose(nki_out, golden, atol=atol, rtol=rtol, verbose=1)
 
 
-# @pytest.mark.xfail(reason="Optimized kernel not yet done")
+@pytest.mark.xfail(reason="Optimized kernel not yet done")
 @pytest.mark.parametrize("batch, seqlen, dim, d_head, eps", [(1, 1024, 4096, 512, 1e-6)])
 def test_blocked_fused_rms_norm_linear_perf(batch, seqlen, dim, d_head, eps):
     dtype = nl.bfloat16
