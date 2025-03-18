@@ -1,6 +1,6 @@
 import pytest, random, sys, warnings
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 sys.path.append("../")
 
@@ -11,86 +11,78 @@ from src.kernels.matmul import (
     gemm_with_non_transposed_lhs_MNK,
 )
 from src.golden.gemm import gemm_core, gemm_cpu_golden
+from test_generation import GenTests
 
 import neuronxcc.nki.language as nl
 from neuronxcc.starfish.support.util import allclose
 from neuronxcc.nki import baremetal
 
-from itertools import product, permutations
+from itertools import permutations
 
 
-def get_tests(num_tests: int, mutate_loop_order: bool) -> List[Tuple]:
-    random.seed(42)
-    NUM_BLOCK_M_vals = [2, 4, 16]
-    NUM_BLOCK_N_vals = [2, 8, 16]
-    NUM_BLOCK_K_vals = [2, 8, 16]
+class GEMMTestConfig(GenTests):
+    def process_test_config(self, config: Dict[str, int]) -> Tuple | None:
+        TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+        TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+        TILE_K = nl.tile_size.pmax  # 128
 
-    TILES_IN_BLOCK_M_vals = [1, 4, 8]
-    TILES_IN_BLOCK_N_vals = [1, 4, 8]
-    TILES_IN_BLOCK_K_vals = [1, 4, 8]
+        NUM_BLOCK_M = config.get("NUM_BLOCK_M", 1)
+        NUM_BLOCK_N = config.get("NUM_BLOCK_N", 1)
+        NUM_BLOCK_K = config.get("NUM_BLOCK_K", 1)
 
-    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-    TILE_K = nl.tile_size.pmax  # 128
+        TILES_IN_BLOCK_M = config.get("TILES_IN_BLOCK_M", 1)
+        TILES_IN_BLOCK_N = config.get("TILES_IN_BLOCK_N", 1)
+        TILES_IN_BLOCK_K = config.get("TILES_IN_BLOCK_K", 1)
 
-    BUFFER_M_vals = [2, 4, 8]
-    BUFFER_N_vals = [2, 4, 8]
-    BUFFER_K_vals = [1, 2, 4]
+        BUFFER_M = config.get("BUFFER_M", 1)
+        BUFFER_N = config.get("BUFFER_N", 1)
+        BUFFER_K = config.get("BUFFER_K", 1)
 
-    configs = list(
-        product(
-            NUM_BLOCK_M_vals,
-            NUM_BLOCK_N_vals,
-            NUM_BLOCK_K_vals,
-            TILES_IN_BLOCK_M_vals,
-            TILES_IN_BLOCK_N_vals,
-            TILES_IN_BLOCK_K_vals,
-            BUFFER_M_vals,
-            BUFFER_N_vals,
-            BUFFER_K_vals,
-        )
-    )
-    random.shuffle(configs)
-    valid_tests = []
-    for config in configs:
-        (
-            NUM_BLOCK_M,
-            NUM_BLOCK_N,
-            NUM_BLOCK_K,
-            TILES_IN_BLOCK_M,
-            TILES_IN_BLOCK_N,
-            TILES_IN_BLOCK_K,
-            BUFFER_M,
-            BUFFER_N,
-            BUFFER_K,
-        ) = config
-        M = NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M
-        N = NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N
-        K = NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K
+        M = config.get("M", NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M)
+        N = config.get("N", NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N)
+        K = config.get("K", NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K)
 
         try:
-            MatMulCompatibility((M, K), (K, N), NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
             assert max(M, N, K) <= 8192, f"Input sizes are too large for testing"
-            test = (M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
-            valid_tests.append(test)
+            MatMulCompatibility((M, K), (K, N), NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
+            if "M" in config:
+                config_tuple = (M, N, K)
+            else:
+                config_tuple = (M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
+            return config_tuple
         except Exception as e:
-            print(e)
-        if len(valid_tests) == num_tests:
-            break
-    assert valid_tests, f"No valid tests found"
+            return None
 
-    if mutate_loop_order:
+
+def get_tests_with_loop_order(num_tests: int, test_loop_order: bool) -> List[Tuple]:
+    gen = GEMMTestConfig(
+        NUM_BLOCK_M=[2, 4, 16],
+        NUM_BLOCK_N=[2, 8, 16],
+        NUM_BLOCK_K=[2, 8, 16],
+        TILES_IN_BLOCK_M=[1, 4, 8],
+        TILES_IN_BLOCK_N=[1, 4, 8],
+        TILES_IN_BLOCK_K=[1, 4, 8],
+        BUFFER_M=[2, 4, 8],
+        BUFFER_N=[2, 4, 8],
+        BUFFER_K=[1, 2, 4],
+    )
+    valid_tests = gen.valid_tests[:num_tests]
+
+    # We want to test every single loop order so it should not be part of the random test generation process
+    if test_loop_order:
         loop_orders = ["".join(p) for p in permutations("MNK")]
         tests = []
-        for loop_order in loop_orders:
-            loop_order_tests = [test + (loop_order,) for test in valid_tests]
-            tests.extend(loop_order_tests)
+        for test in valid_tests:
+            for loop_order in loop_orders:
+                tests.append(test + (loop_order,))
     else:
         tests = valid_tests
     return tests
 
 
-@pytest.mark.parametrize("M, N, K", [(1024, 1024, 128), (2048, 4096, 512), (4096, 4096, 256), (8192, 2048, 256)])
+@pytest.mark.parametrize(
+    "M, N, K", GEMMTestConfig(M=[1024, 2048], N=[2048, 4096], K=[1024, 2048, 4096]).valid_tests[:10]
+)
 def test_golden_matmul_correctness(M, N, K):
     batch = 1
     data_type = np.float32
@@ -105,7 +97,7 @@ def test_golden_matmul_correctness(M, N, K):
 
 @pytest.mark.parametrize(
     "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order",
-    get_tests(2, mutate_loop_order=True),
+    get_tests_with_loop_order(2, test_loop_order=True),
 )
 def test_matmul_correctness(M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order):
     data_type = np.float32
@@ -127,7 +119,7 @@ def test_matmul_correctness(M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFF
 
 @pytest.mark.parametrize(
     "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K",
-    get_tests(5, mutate_loop_order=False),
+    get_tests_with_loop_order(5, test_loop_order=False),
 )
 def test_non_transposed_matmul_correctness(
     M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
