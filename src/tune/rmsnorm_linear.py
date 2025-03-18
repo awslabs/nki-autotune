@@ -40,7 +40,7 @@ def profile():
         shutil.rmtree(cache_root)
     os.makedirs(cache_root)
     batch = 1
-    M = 1024
+    M = 8192
     N = 512
     K = 4096
     dtype = nl.bfloat16

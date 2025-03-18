@@ -15,7 +15,13 @@ from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
 from src.allocation.utils import update_base_addr
-from src.kernels.utils import load_tensor_block, save_result_block, matmul_non_transposed_blocks, MatMulCompatibility
+from src.kernels.utils import (
+    load_tensor_block,
+    save_result_block,
+    matmul_blocks_tile_transposed_lhs,
+    MatMulCompatibility,
+    transpose_block,
+)
 
 
 def compatibility_checks(hidden_shape, weights_shape):
@@ -298,9 +304,6 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
     return out_tensor
 
 
-# FIXME: enable_stack_allocator and skip_middle_end_transformations fail numerical testing
-# @nki.compiler.enable_stack_allocator()
-# @nki.compiler.skip_middle_end_transformations
 @nki.jit
 def blocked_fused_rms_norm_linear(
     lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, BUFFER_M: int, BUFFER_N: int, norm_dtype=nl.float32, eps=1e-6
@@ -327,7 +330,8 @@ def blocked_fused_rms_norm_linear(
                 ofs=(block_id_M * mm.BLOCK_M, 0),
                 load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K),
             )
-            rmsnorm_block = compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
+            rmsnormT_block = compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
+            rmsnormT_block = transpose_block(rmsnormT_block)
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
                 result_block = nl.zeros(
                     (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
@@ -339,7 +343,7 @@ def blocked_fused_rms_norm_linear(
                     ofs=(0, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N),
                 )
-                matmul_non_transposed_blocks(rmsnorm_block, rhs_block, result_block)
+                matmul_blocks_tile_transposed_lhs(rmsnormT_block, rhs_block, result_block)
                 save_result_block(
                     result[batch_id], result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N
                 )
