@@ -25,13 +25,13 @@ class Autotune:
     def __init__(
         self,
         kernel: GenericKernel,
-        configs: List[dict],
+        configs: List[Dict],
         max_configs: int | None = None,
-        warmup: int = 2,
-        iters: int = 5,
+        warmup: int = 10,
+        iters: int = 100,
         pruning_func: Callable | None = None,
         benchmark_machines=None,
-        cache_dir="./autotune_cache",
+        cache_dir: str | None = "./autotune_cache",
     ):
         self.kernel = kernel
         self.configs = configs
@@ -42,27 +42,27 @@ class Autotune:
         self.benchmark_machines = benchmark_machines if benchmark_machines is not None else ["localhost"]
         self.perf_results = []
         self.cache_dir = cache_dir
-        if os.path.exists(self.cache_dir):
-            shutil.rmtree(self.cache_dir)
-        os.makedirs(self.cache_dir)
+        if self.cache_dir:
+            if os.path.exists(self.cache_dir):
+                shutil.rmtree(self.cache_dir)
+            os.makedirs(self.cache_dir)
 
     def _prune(self, args: Tuple) -> List[dict]:
         """
         Pruning func should throw a fail if the inputs are illegal
         """
         valid_configs = []
+        arg_shapes = [arg.tensor_shape for arg in args]
         for config in self.configs:
-            arg_shapes = [arg.tensor_shape for arg in args]
             try:
                 if self.pruning_func is not None:
                     self.pruning_func(*arg_shapes, **config)
                 valid_configs.append(config)
             except Exception as e:
-                warnings.warn(
-                    f"Warning: invalid config {config}, reason: {e} ({type(e)})", category=RuntimeWarning, stacklevel=2
-                )
+                print(f"Prune invalid config {config}, reason: {e} ({type(e)})")
             if self.max_configs and len(valid_configs) == self.max_configs:
                 break
+        assert valid_configs, f"No valid autotune configs found"
         return valid_configs
 
     def __call__(self, *args):
@@ -115,9 +115,10 @@ class Autotune:
         min_config = best_result["configs"]
 
         # Dump the performance logs
-        with open(f"{self.cache_dir}/tune.log", "w") as f:
-            f.write(pformat(self.perf_results))
-            f.write(f"\nAutotune for inputs {[arg.tensor_shape for arg in args]}")
-            f.write(f"\nThe best latency is {min_latency} us for the config {min_config}")
-        pickle.dump(self.perf_results, open(f"{self.cache_dir}/tune.pkl", "wb"))
-        plot_tuning_results(self.perf_results, self.cache_dir)
+        if self.cache_dir:
+            with open(f"{self.cache_dir}/tune.log", "w") as f:
+                f.write(pformat(self.perf_results))
+                f.write(f"\nAutotune for inputs {[arg.tensor_shape for arg in args]}")
+                f.write(f"\nThe best latency is {min_latency} ms for the config {min_config}")
+            pickle.dump(self.perf_results, open(f"{self.cache_dir}/tune.pkl", "wb"))
+            plot_tuning_results(self.perf_results, self.cache_dir)

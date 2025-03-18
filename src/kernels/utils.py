@@ -1,6 +1,6 @@
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
-from typing import Tuple
+from typing import Tuple, List
 import numpy as np
 
 
@@ -13,15 +13,21 @@ class MatMulCompatibility:
         self,
         lhs_shape: Tuple,
         rhs_shape: Tuple,
-        NUM_BLOCK_M: int,
-        NUM_BLOCK_N: int,
-        NUM_BLOCK_K: int,
-        BUFFER_M: int,
-        BUFFER_N: int,
-        BUFFER_K: int,
+        NUM_BLOCK_M: int = 1,
+        NUM_BLOCK_N: int = 1,
+        NUM_BLOCK_K: int = -1,
+        BUFFER_M: int = 1,
+        BUFFER_N: int = 1,
+        BUFFER_K: int = -1,
     ) -> None:
         # Input sizes
-        self.M, self.K = lhs_shape
+        assert len(rhs_shape) == 2, f"Expecting (K, N) in RHS. Received {rhs_shape}."
+        if len(lhs_shape) == 2:
+            self.M, self.K = lhs_shape
+        elif len(lhs_shape) == 3:
+            batch, self.M, self.K = lhs_shape
+        else:
+            raise ValueError(f"lhs_shape must be either (M, K) or (batch, M, K). Received {lhs_shape}.")
         K_, self.N = rhs_shape
 
         # Single tile sizes
@@ -40,7 +46,16 @@ class MatMulCompatibility:
         self.BUFFER_N = BUFFER_N
 
         # Calculate other sizes
-        for dimension in ["M", "N", "K"]:
+        if self.NUM_BLOCK_K == -1 and self.BUFFER_K == -1:
+            dimensions = ["M", "N"]
+        else:
+            dimensions = ["M", "N", "K"]
+        self._calculate_sizes(dimensions)
+        self._check(K_, dimensions)
+        # self._show(dimensions)
+
+    def _calculate_sizes(self, dimensions: List[str]):
+        for dimension in dimensions:
             size = getattr(self, f"{dimension}")
             num_block = getattr(self, f"NUM_BLOCK_{dimension}")
             tile_size = getattr(self, f"TILE_{dimension}")
@@ -52,12 +67,9 @@ class MatMulCompatibility:
             setattr(self, f"TILES_IN_{dimension}", tiles_in_dim)
             setattr(self, f"BLOCK_{dimension}", block_size)
 
-        self._check(K_)
-        # self._show()
-
-    def _check(self, K_):
+    def _check(self, K_, dimensions: List[str]):
         assert self.K == K_, f"lhs and rhs contraction dimension mismatch, got {self.K} and {K_}"
-        for dimension in ["M", "N", "K"]:
+        for dimension in dimensions:
             size = getattr(self, f"{dimension}")
             num_block = getattr(self, f"NUM_BLOCK_{dimension}")
             tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
@@ -70,8 +82,8 @@ class MatMulCompatibility:
                 buffer_size <= num_block
             ), f"{dimension} buffer degree {buffer_size} cannot be larger than number of blocks {num_block}"
 
-    def _show(self):
-        for dimension in ["M", "N", "K"]:
+    def _show(self, dimensions: List[str]):
+        for dimension in dimensions:
             size = getattr(self, f"{dimension}")
             num_block = getattr(self, f"NUM_BLOCK_{dimension}")
             tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")

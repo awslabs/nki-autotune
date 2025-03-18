@@ -38,7 +38,8 @@ def profile_kernel(
     latency_res = bench_func.benchmark_result.nc_latency
     p99 = latency_res.get_latency_percentile(99)
     if trace:
-        assert cache_dir is not None, "Must provide a cache dir when generating trace files"
+        # FIXME: trace does not work with parallel compilation
+        assert cache_dir, "Must provide a cache dir when generating trace files"
         trace_cmd = f"neuron-profile capture -n file.neff --profile-nth-exec={iters}"
         subprocess.run(trace_cmd, shell=True)
         shutil.move(f"profile_exec_{iters}.ntff", f"{cache_dir}/{func.func_name}.ntff")
