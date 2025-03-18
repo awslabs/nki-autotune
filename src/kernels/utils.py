@@ -209,14 +209,17 @@ def transpose_block(block):
             for free_id in nl.affine_range(free_size // pmax):
                 free_ofs = free_id * pmax
                 blockT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=blockT_dtype, buffer=nl.psum)
-                blockT[index.x, index.p] = nisa.nc_transpose(block[block_id, par_ofs + index.p, free_ofs + index.x])
+                blockT[index.p, index.x] = nisa.nc_transpose(block[block_id, par_ofs + index.p, free_ofs + index.x])
                 block[block_id, par_ofs + index.p, free_ofs + index.x] = nl.copy(blockT, dtype=block.dtype)
     return block
 
 
-def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
+def matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_block):
     """
     Accumulate matmul result tiles between lhs and rhs into result_block
+    LHS is transposed at the tile level.
+    Note that this is not the same as lhsT.
+    'matmul_block' module computes lhsT @ rhs.
 
     Args:
     lhs_block: TILES_IN_M, TILE_M, K
@@ -234,11 +237,6 @@ def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
         N == TILES_IN_N * TILE_N
     ), f"N dimension mismatch: rhs_block {rhs_block.shape}. result_block {result_block.shape}."
 
-    if nisa.get_nc_version() == nisa.nc_version.gen3:
-        transpose_dtype = lhs_block.dtype
-    else:
-        transpose_dtype = np.float32
-
     idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
@@ -249,15 +247,9 @@ def matmul_non_transposed_blocks(lhs_block, rhs_block, result_block):
             Use PSUM buffer to accumulate into a single hardware tile
             """
             for tile_id_K in nl.affine_range(TILES_IN_K):
-                lhsT_tile = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=transpose_dtype, buffer=nl.psum)
-                lhsT_tile[idx_lhs.p, idx_lhs.x] = nisa.nc_transpose(
-                    lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x]
-                )
-                # FIXME: cannot save in-place to lhs_block because of pseudo dependencies
-                temp_tile = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=lhs_block.dtype, buffer=nl.sbuf)
-                temp_tile[idx_lhs.p, idx_lhs.x] = nl.copy(lhsT_tile, dtype=lhs_block.dtype)
                 result_tile += nisa.nc_matmul(
-                    temp_tile, rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x]
+                    lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x],
+                    rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x],
                 )
 
             result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]

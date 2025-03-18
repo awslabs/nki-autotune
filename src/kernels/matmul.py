@@ -7,7 +7,7 @@ import neuronxcc.nki as nki
 from neuronxcc.nki.compiler.backends.neuron.tensors import TensorRef, KernelHBMTensor
 from typing import Tuple
 
-from src.kernels.utils import load_tensor_block, matmul_block, matmul_non_transposed_blocks, MatMulCompatibility
+from src.kernels.utils import load_tensor_block, matmul_block, matmul_blocks_tile_transposed_lhs, MatMulCompatibility, transpose_block
 
 
 @nki.jit
@@ -367,17 +367,19 @@ def gemm_with_non_transposed_lhs_MNK(
                 buffer=nl.sbuf,
             )
             for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
-                lhs_block = load_tensor_block(
+                lhsT_block = load_tensor_block(
                     input_tensor=lhs,
                     ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
                     load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.BLOCK_K),
                 )
+                lhsT_block = transpose_block(lhsT_block)
+                # TODO: have a separate module to transpose lhs_block here
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
-                matmul_non_transposed_blocks(lhs_block, rhs_block, result_block)
+                matmul_blocks_tile_transposed_lhs(lhsT_block, rhs_block, result_block)
             save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
     return result
 
@@ -396,18 +398,19 @@ def gemm_with_non_transposed_lhs_MN(
     mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-        lhs_block = load_tensor_block(
+        lhsT_block = load_tensor_block(
             input_tensor=lhs, ofs=(block_id_M * mm.BLOCK_M, 0), load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K)
         )
+        lhsT_block = transpose_block(lhsT_block)
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             result_block = nl.zeros(
                 (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
                 dtype=lhs.dtype,
                 buffer=nl.sbuf,
-            )
+            )                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
             rhs_block = load_tensor_block(
                 input_tensor=rhs, ofs=(0, block_id_N * mm.BLOCK_N), load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N)
             )
-            matmul_non_transposed_blocks(lhs_block, rhs_block, result_block)
+            matmul_blocks_tile_transposed_lhs(lhsT_block, rhs_block, result_block)
             save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
     return result
