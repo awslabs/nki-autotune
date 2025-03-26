@@ -408,7 +408,7 @@ def gemm_with_non_transposed_lhs_MN(
         lhsT_block = load_tensor_block(
             input_tensor=lhs, ofs=(block_id_M * mm.BLOCK_M, 0), load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K)
         )
-        lhsT_block = transpose_tiles_in_block(lhsT_block)
+        transpose_tiles_in_block(lhsT_block)
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             result_block = nl.zeros(
                 (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
