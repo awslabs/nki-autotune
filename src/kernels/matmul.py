@@ -4,16 +4,23 @@
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki as nki
-from neuronxcc.nki.compiler.backends.neuron.tensors import TensorRef, KernelHBMTensor
+from neuronxcc.nki.compiler.backends.neuron.tensors import KernelHBMTensor
+from neuronxcc.nki.typing import tensor
 from typing import Tuple
 
-from src.kernels.utils import load_tensor_block, matmul_block, matmul_blocks_tile_transposed_lhs, MatMulCompatibility, transpose_block
+from src.kernels.utils import (
+    load_tensor_block,
+    matmul_block,
+    matmul_blocks_tile_transposed_lhs,
+    MatMulCompatibility,
+    transpose_tiles_in_block,
+)
 
 
 @nki.jit
 def matmul_main(
-    lhsT: TensorRef,
-    rhs: TensorRef,
+    lhsT: tensor,
+    rhs: tensor,
     NUM_BLOCK_M: int,
     NUM_BLOCK_N: int,
     NUM_BLOCK_K: int,
@@ -106,7 +113,7 @@ def save_result_dma(result, result_tiles, block_id, m_ofs, n_ofs, TILE_K):
         )
 
 
-def matmul_NMK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_NMK(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
     for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
             result_tiles = nl.zeros(
@@ -134,7 +141,7 @@ def matmul_NMK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
     return result
 
 
-def matmul_MNK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_MNK(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
             result_tiles = nl.zeros(
@@ -163,7 +170,7 @@ def matmul_MNK(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
     return result
 
 
-def matmul_KMN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_KMN(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
 
     result_tiles = nl.zeros(
         (
@@ -201,7 +208,7 @@ def matmul_KMN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
     return result
 
 
-def matmul_KNM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_KNM(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
 
     result_tiles = nl.zeros(
         (
@@ -239,7 +246,7 @@ def matmul_KNM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
     return result
 
 
-def matmul_NKM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_NKM(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
 
     # Blocking N dimension (the RHS free dimension)
     for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
@@ -293,7 +300,7 @@ def matmul_NKM(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
     return result
 
 
-def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_MKN(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
     # Blocking M dimension (the LHS free dimension)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
         result_tiles = nl.zeros(
@@ -348,8 +355,8 @@ def matmul_MKN(lhsT: TensorRef, rhs: TensorRef, mm: MatMulCompatibility, result:
 
 @nki.jit
 def gemm_with_non_transposed_lhs_MNK(
-    lhs: TensorRef,  # Shape (M, K)
-    rhs: TensorRef,  # Shape (K, N)
+    lhs: tensor,  # Shape (M, K)
+    rhs: tensor,  # Shape (K, N)
     NUM_BLOCK_M: int,
     NUM_BLOCK_N: int,
     NUM_BLOCK_K: int,
@@ -372,7 +379,7 @@ def gemm_with_non_transposed_lhs_MNK(
                     ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
                     load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.BLOCK_K),
                 )
-                lhsT_block = transpose_block(lhsT_block)
+                lhsT_block = transpose_tiles_in_block(lhsT_block)
                 # TODO: have a separate module to transpose lhs_block here
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
@@ -386,8 +393,8 @@ def gemm_with_non_transposed_lhs_MNK(
 
 @nki.jit
 def gemm_with_non_transposed_lhs_MN(
-    lhs: TensorRef,  # Shape (M, K)
-    rhs: TensorRef,  # Shape (K, N)
+    lhs: tensor,  # Shape (M, K)
+    rhs: tensor,  # Shape (K, N)
     NUM_BLOCK_M: int,
     NUM_BLOCK_N: int,
     NUM_BLOCK_K: int,
@@ -401,13 +408,13 @@ def gemm_with_non_transposed_lhs_MN(
         lhsT_block = load_tensor_block(
             input_tensor=lhs, ofs=(block_id_M * mm.BLOCK_M, 0), load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K)
         )
-        lhsT_block = transpose_block(lhsT_block)
+        lhsT_block = transpose_tiles_in_block(lhsT_block)
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             result_block = nl.zeros(
                 (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
                 dtype=lhs.dtype,
                 buffer=nl.sbuf,
-            )                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+            )
             rhs_block = load_tensor_block(
                 input_tensor=rhs, ofs=(0, block_id_N * mm.BLOCK_N), load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N)
             )

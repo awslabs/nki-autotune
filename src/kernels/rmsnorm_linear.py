@@ -20,7 +20,8 @@ from src.kernels.utils import (
     save_result_block,
     matmul_blocks_tile_transposed_lhs,
     MatMulCompatibility,
-    transpose_block,
+    transpose_tiles_in_block,
+    matmul_blocks_lhs,
 )
 
 
@@ -304,7 +305,7 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
     return out_tensor
 
 
-@nki.jit
+@nki.jit(debug_kernel=True)
 def blocked_fused_rms_norm_linear(
     lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, BUFFER_M: int, BUFFER_N: int, norm_dtype=nl.float32, eps=1e-6
 ):
@@ -330,8 +331,9 @@ def blocked_fused_rms_norm_linear(
                 ofs=(block_id_M * mm.BLOCK_M, 0),
                 load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K),
             )
-            rmsnormT_block = compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
-            rmsnormT_block = transpose_block(rmsnormT_block)
+
+            compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
+            # transpose_tiles_in_block(lhs_block)
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
                 result_block = nl.zeros(
                     (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
@@ -343,7 +345,8 @@ def blocked_fused_rms_norm_linear(
                     ofs=(0, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N),
                 )
-                matmul_blocks_tile_transposed_lhs(rmsnormT_block, rhs_block, result_block)
+                # matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_block)
+                matmul_blocks_lhs(lhs_block, rhs_block, result_block)
                 save_result_block(
                     result[batch_id], result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N
                 )
@@ -363,7 +366,6 @@ def compute_RMSNorm(in_block, mm: MatMulCompatibility, eps, norm_dtype, output_d
     assert in_block.shape[1] == mm.TILE_M
     assert in_block.shape[2] == mm.K
     scale = 1 / mm.K
-    rmsnorm_block = nl.ndarray((mm.TILES_IN_BLOCK_M, par_dim(mm.TILE_M), mm.K), dtype=output_dtype, buffer=nl.sbuf)
     i_rhs = nl.mgrid[0 : mm.TILE_M, 0 : mm.K]
     for tile_id_M in nl.affine_range(mm.TILES_IN_BLOCK_M):
         square_sum = nl.ndarray((par_dim(mm.TILE_M), 1), dtype=norm_dtype, buffer=nl.sbuf)
@@ -379,7 +381,6 @@ def compute_RMSNorm(in_block, mm: MatMulCompatibility, eps, norm_dtype, output_d
         Write the output of RMS (in-place)
         Perform (hidden .* RMS Reciprocal) in tiles of fmax (512)
         """
-        rmsnorm_block[tile_id_M, i_rhs.p, i_rhs.x] = nl.multiply(
-            in_block[tile_id_M, i_rhs.p, i_rhs.x], square_sum[...], dtype=output_dtype
-        )
-    return rmsnorm_block
+        rmsnorm_block = nl.ndarray((par_dim(mm.TILE_M), mm.K), dtype=output_dtype, buffer=nl.sbuf)
+        rmsnorm_block[...] = nl.multiply(in_block[tile_id_M, i_rhs.p, i_rhs.x], square_sum[...], dtype=output_dtype)
+        in_block[tile_id_M, i_rhs.p, i_rhs.x] = nl.copy(rmsnorm_block, dtype=output_dtype)

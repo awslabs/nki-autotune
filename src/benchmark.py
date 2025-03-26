@@ -1,21 +1,28 @@
 import neuronxcc.nki as nki
 from neuronxcc.nki.compile import GenericKernel
 
-import shutil, subprocess
+import shutil
 from typing import Dict, Tuple
+
+
+def dict_to_string(configs: Dict):
+    result = []
+    for key, val in configs.items():
+        result.append(str(key))
+        result.append(str(val))
+    return "-".join(result)
 
 
 def profile_kernel(
     func: GenericKernel,
     args: Tuple,
+    cache_dir: str,
     configs: Dict = {},
     warmup: int = 10,
     iters: int = 100,
     device_lock=None,
     benchmark_machine=None,
-    cache_dir: str | None = None,
-    trace: bool = False,
-) -> float:
+) -> Tuple[float, str]:
     """
     Profile the NKI kernel P99 latency
     Args:
@@ -37,13 +44,8 @@ def profile_kernel(
     bench_func(*args, **configs)
     latency_res = bench_func.benchmark_result.nc_latency
     p99 = latency_res.get_latency_percentile(99)
-    if trace:
-        # FIXME: trace does not work with parallel compilation
-        assert cache_dir, "Must provide a cache dir when generating trace files"
-        trace_cmd = f"neuron-profile capture -n file.neff --profile-nth-exec={iters}"
-        subprocess.run(trace_cmd, shell=True)
-        shutil.move(f"profile_exec_{iters}.ntff", f"{cache_dir}/{func.func_name}.ntff")
-    if cache_dir:
-        shutil.move("file.neff", f"{cache_dir}/{func.func_name}.neff")
+    configs_str = dict_to_string(configs)
+    neff_filename = f"{cache_dir}/{func.func_name}-{configs_str}.neff"
+    shutil.move("file.neff", neff_filename)
     p99 /= 1000
-    return p99
+    return p99, neff_filename
