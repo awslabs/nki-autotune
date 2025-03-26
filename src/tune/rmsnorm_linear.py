@@ -35,10 +35,6 @@ def get_autotune_configs() -> List[Dict]:
 
 
 def profile():
-    cache_root = TUNED_NKI_CACHE_DIR
-    if os.path.exists(cache_root):
-        shutil.rmtree(cache_root)
-    os.makedirs(cache_root)
     batch = 1
     M = 8192
     N = 512
@@ -48,14 +44,15 @@ def profile():
     rhs = nt.tensor[[K, N], dtype]
     tuner = Autotune(
         kernel=blocked_fused_rms_norm_linear,
+        kernel_args=(lhs, rhs),
         configs=get_autotune_configs(),
         max_configs=127,
         warmup=10,
         iters=100,
         pruning_func=MatMulCompatibility,
-        cache_dir=f"{cache_root}/blocked_fused_rms_norm_linear/M{M}-N{N}-K{K}",
+        trace=True,
     )
-    tuner(lhs, rhs)
+    tuner()
 
 
 if __name__ == "__main__":

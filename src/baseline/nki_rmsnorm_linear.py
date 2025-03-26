@@ -8,8 +8,8 @@ from src.benchmark import profile_kernel
 from src.kernels.rmsnorm_linear import stack_allocated_fused_rms_norm_qkv
 
 
-def profile():
-    cache_dir = f"{NKI_CACHE_DIR}/{stack_allocated_fused_rms_norm_qkv.func_name}"
+def profile(kernel):
+    cache_dir = f"{NKI_CACHE_DIR}/{kernel.func_name}"
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir)
     os.makedirs(cache_dir)
@@ -20,11 +20,11 @@ def profile():
     for M, N, K in MNK:
         lhs = nt.tensor[[batch, M, K], dtype]
         rhs = nt.tensor[[K, N], dtype]
-        p99 = profile_kernel(stack_allocated_fused_rms_norm_qkv, (lhs, rhs))
+        p99 = profile_kernel(kernel, (lhs, rhs))
         perf_results[(M, N, K)] = p99
-        pickle.dump(perf_results, open(f"{cache_dir}/{stack_allocated_fused_rms_norm_qkv.func_name}.pkl", "wb"))
+        pickle.dump(perf_results, open(f"{cache_dir}/{kernel.func_name}.pkl", "wb"))
 
 
 if __name__ == "__main__":
     os.environ["NEURON_CC_FLAGS"] = "--framework=XLA --target=trn1 --auto-cast=none"
-    profile()
+    profile(stack_allocated_fused_rms_norm_qkv)
