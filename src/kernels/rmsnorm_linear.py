@@ -22,6 +22,7 @@ from src.kernels.utils import (
     MatMulCompatibility,
     transpose_tiles_in_block,
     matmul_blocks_lhs,
+    transpose_tile,
 )
 
 
@@ -344,8 +345,8 @@ def blocked_fused_rms_norm_linear(
                     ofs=(0, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N),
                 )
-                # matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_block)
-                matmul_blocks_lhs(lhs_block, rhs_block, result_block)
+                matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_block)
+                # matmul_blocks_lhs(lhs_block, rhs_block, result_block)
                 save_result_block(
                     result[batch_id], result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N
                 )
@@ -382,4 +383,5 @@ def compute_RMSNorm(in_block, mm: MatMulCompatibility, eps, norm_dtype, output_d
         """
         rmsnorm_block = nl.ndarray((par_dim(mm.TILE_M), mm.K), dtype=output_dtype, buffer=nl.sbuf)
         rmsnorm_block[...] = nl.multiply(in_block[tile_id_M, i_rhs.p, i_rhs.x], square_sum[...], dtype=output_dtype)
+        transpose_tile(rmsnorm_block)
         in_block[tile_id_M, i_rhs.p, i_rhs.x] = nl.copy(rmsnorm_block, dtype=output_dtype)

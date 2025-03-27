@@ -50,6 +50,7 @@ def profile():
         warmup=10,
         iters=100,
         pruning_func=MatMulCompatibility,
+        cache_dir="/home/ubuntu/autotune/autotune-cache",
         trace=True,
     )
     tuner()
