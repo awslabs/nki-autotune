@@ -20,7 +20,7 @@ def profile(kernel):
     for M, N, K in MNK:
         lhs = nt.tensor[[batch, M, K], dtype]
         rhs = nt.tensor[[K, N], dtype]
-        p99 = profile_kernel(kernel, (lhs, rhs))
+        p99, _ = profile_kernel(kernel, (lhs, rhs))
         perf_results[(M, N, K)] = p99
         pickle.dump(perf_results, open(f"{cache_dir}/{kernel.func_name}.pkl", "wb"))
 
