@@ -139,7 +139,7 @@ def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_d
         BUFFER_M=[1, 2, 4],
         BUFFER_N=[1, 2, 4],
         eps=[1e-6, 1e-3],
-    ).valid_tests[:1],
+    ).valid_tests[:10],
 )
 def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, eps):
     data_type = np.float32

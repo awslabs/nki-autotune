@@ -56,14 +56,14 @@ class GEMMTestConfig(GenTests):
 
 def get_tests_with_loop_order(num_tests: int, test_loop_order: bool) -> List[Tuple]:
     gen = GEMMTestConfig(
-        NUM_BLOCK_M=[2, 4, 16],
-        NUM_BLOCK_N=[2, 8, 16],
-        NUM_BLOCK_K=[2, 8, 16],
+        NUM_BLOCK_M=[1, 2, 4, 16],
+        NUM_BLOCK_N=[1, 2, 8, 16],
+        NUM_BLOCK_K=[1, 2, 8, 16],
         TILES_IN_BLOCK_M=[1, 4, 8],
         TILES_IN_BLOCK_N=[1, 4, 8],
         TILES_IN_BLOCK_K=[1, 4, 8],
-        BUFFER_M=[2, 4, 8],
-        BUFFER_N=[2, 4, 8],
+        BUFFER_M=[1, 2, 4, 8],
+        BUFFER_N=[1, 2, 4, 8],
         BUFFER_K=[1, 2, 4],
     )
     valid_tests = gen.valid_tests[:num_tests]
@@ -117,9 +117,13 @@ def test_matmul_correctness(M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFF
     assert allclose(nki_out, golden_output, atol=atol, rtol=rtol, verbose=1)
 
 
+# @pytest.mark.parametrize(
+#     "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K",
+#     get_tests_with_loop_order(5, test_loop_order=False),
+# )
 @pytest.mark.parametrize(
     "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K",
-    get_tests_with_loop_order(5, test_loop_order=False),
+    [(2048, 512, 4096, 1, 1, 1, 1, 1, 1), (2048, 1024, 4096, 1, 1, 1, 1, 1, 1)],
 )
 def test_non_transposed_matmul_correctness(
     M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K

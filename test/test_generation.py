@@ -5,6 +5,10 @@ from itertools import product, permutations
 
 class GenTests:
     def __init__(self, **kwargs) -> None:
+        """
+        Create combinations of the input parameters.
+        Filter the invalid ones with a custom subclass method.
+        """
         keys = list(kwargs.keys())
         values = [kwargs[key] for key in keys]
         combinations = list(product(*values))
@@ -32,8 +36,7 @@ class GenTests:
 
     def process_test_config(self, config: Dict) -> Tuple | None:
         """
-        Process a config is valid.
-        Default to True for the base class.
+        Determine if a config is valid.
 
         Args:
             config (Dict): A test config
@@ -41,4 +44,6 @@ class GenTests:
         Returns:
             bool: True if test config is valid
         """
-        raise Exception("process_test_config is not implemented in the base class")
+        raise Exception(
+            "process_test_config is not implemented in the base class. Must specify a method to determine if a config is valid (True/False)."
+        )

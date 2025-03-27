@@ -17,21 +17,21 @@ def get_autotune_configs() -> List[Dict]:
     Define a list of configuration dictionaries representing the specific design choices for autotuning.
 
     Returns:
-        list: A list of dictionaries, each containing configuration parameters for TILES_IN_BLOCK_M,
-                TILES_IN_BLOCK_N, and TILES_IN_BLOCK_K.
+        list: A list of dictionaries, each containing configuration parameters for NUM_BLOCK_M,
+                NUM_BLOCK_N, and NUM_BLOCK_K.
     """
-    TILES_IN_BLOCK_M_options = [1, 2, 4, 8, 16, 32, 64]
-    TILES_IN_BLOCK_N_options = [1, 2, 4, 8, 16, 32, 64]
-    TILES_IN_BLOCK_K_options = [1, 2, 4, 8, 16, 32, 64]
+    NUM_BLOCK_M_options = [1, 2, 4, 8, 16, 32, 64]
+    NUM_BLOCK_N_options = [1, 2, 4, 8, 16, 32, 64]
+    NUM_BLOCK_K_options = [1, 2, 4, 8, 16, 32, 64]
     BUFFER_M_options = [1, 2, 4, 8]
     BUFFER_N_options = [1, 2, 4, 8]
     BUFFER_K_options = [1, 2, 4, 8]
     loop_orders = ["".join(p) for p in permutations("MNK")]
     params = list(
         product(
-            TILES_IN_BLOCK_M_options,
-            TILES_IN_BLOCK_N_options,
-            TILES_IN_BLOCK_K_options,
+            NUM_BLOCK_M_options,
+            NUM_BLOCK_N_options,
+            NUM_BLOCK_K_options,
             BUFFER_M_options,
             BUFFER_N_options,
             BUFFER_K_options,
@@ -39,11 +39,11 @@ def get_autotune_configs() -> List[Dict]:
         )
     )
     configs = []
-    for TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order in params:
+    for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order in params:
         config = {
-            "TILES_IN_BLOCK_M": TILES_IN_BLOCK_M,
-            "TILES_IN_BLOCK_N": TILES_IN_BLOCK_N,
-            "TILES_IN_BLOCK_K": TILES_IN_BLOCK_K,
+            "NUM_BLOCK_M": NUM_BLOCK_M,
+            "NUM_BLOCK_N": NUM_BLOCK_N,
+            "NUM_BLOCK_K": NUM_BLOCK_K,
             "BUFFER_M": BUFFER_M,
             "BUFFER_N": BUFFER_N,
             "BUFFER_K": BUFFER_K,
@@ -68,14 +68,13 @@ def profile():
         rhs = nt.tensor[[K, N], dtype]
         tuner = Autotune(
             kernel=matmul_main,
+            kernel_args=(lhsT, rhs),
             configs=get_autotune_configs(),
             max_configs=127,
-            warmup=10,
-            iters=100,
             pruning_func=MatMulCompatibility,
-            cache_dir=f"{cache_root}/M{M}-N{N}-K{K}",
+            trace=True,
         )
-        tuner(lhsT, rhs)
+        tuner()
         break
     latency = time.perf_counter() - start
     print(f"latency = {latency}")
