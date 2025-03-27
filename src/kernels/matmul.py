@@ -380,14 +380,14 @@ def gemm_with_non_transposed_lhs_MNK(
                     ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
                     load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.BLOCK_K),
                 )
-                transpose_tiles_in_block(lhsT_block)
+                # transpose_tiles_in_block(lhsT_block)
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
-                matmul_blocks_tile_transposed_lhs(lhsT_block, rhs_block, result_block)
-                # matmul_blocks_lhs(lhsT_block, rhs_block, result_block)
+                # matmul_blocks_tile_transposed_lhs(lhsT_block, rhs_block, result_block)
+                matmul_blocks_lhs(lhsT_block, rhs_block, result_block)
             save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
     return result
 

@@ -331,7 +331,6 @@ def blocked_fused_rms_norm_linear(
                 ofs=(block_id_M * mm.BLOCK_M, 0),
                 load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K),
             )
-
             compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
             # transpose_tiles_in_block(lhs_block)
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):

@@ -117,13 +117,9 @@ def test_matmul_correctness(M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFF
     assert allclose(nki_out, golden_output, atol=atol, rtol=rtol, verbose=1)
 
 
-# @pytest.mark.parametrize(
-#     "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K",
-#     get_tests_with_loop_order(5, test_loop_order=False),
-# )
 @pytest.mark.parametrize(
     "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K",
-    [(2048, 512, 4096, 1, 1, 1, 1, 1, 1), (2048, 1024, 4096, 1, 1, 1, 1, 1, 1)],
+    get_tests_with_loop_order(5, test_loop_order=False),
 )
 def test_non_transposed_matmul_correctness(
     M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K

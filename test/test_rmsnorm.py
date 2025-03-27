@@ -158,19 +158,13 @@ def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NU
 
 
 @pytest.mark.xfail(reason="Optimized kernel not yet done")
-@pytest.mark.parametrize("batch, seqlen, dim, d_head, eps", [(1, 1024, 4096, 512, 1e-6)])
-def test_blocked_fused_rms_norm_linear_perf(batch, seqlen, dim, d_head, eps):
+@pytest.mark.parametrize("batch, M, K, N, eps", [(1, 4096, 4096, 512, 1e-6)])
+def test_blocked_fused_rms_norm_linear_perf(batch, M, K, N, eps):
     dtype = nl.bfloat16
-    hidden = nt.tensor[[batch, seqlen, dim], dtype]
-    qkv_weights = nt.tensor[[dim, d_head], dtype]
-    warmup = 10
-    iters = 100
-    baseline_p99 = profile_kernel(
-        stack_allocated_fused_rms_norm_qkv, (hidden, qkv_weights, nl.float32, eps), warmup=warmup, iters=iters
-    )
-    optimized_p99 = profile_kernel(
-        blocked_fused_rms_norm_linear, (hidden, qkv_weights, 1, 1, 1, 1, nl.float32, eps), warmup=warmup, iters=iters
-    )
+    hidden = nt.tensor[[batch, M, K], dtype]
+    qkv_weights = nt.tensor[[K, N], dtype]
+    baseline_p99, _ = profile_kernel(stack_allocated_fused_rms_norm_qkv, (hidden, qkv_weights, nl.float32, eps))
+    optimized_p99, _ = profile_kernel(blocked_fused_rms_norm_linear, (hidden, qkv_weights, 4, 1, 4, 1, nl.float32, eps))
     print(f"blocked_fused_rms_norm_linear {optimized_p99}ms. stack_allocated_fused_rms_norm_qkv {baseline_p99}ms.")
     assert (
         optimized_p99 <= baseline_p99

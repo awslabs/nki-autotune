@@ -48,7 +48,7 @@ class Autotune:
         self.cache_dir = self._get_cache_dir(cache_dir)
         self.trace = trace
 
-    def _get_cache_dir(self, cache_dir: str | None = None):
+    def _get_cache_dir(self, cache_dir: str | None = None) -> str:
         if not cache_dir:
             cache_dir = f"{TUNED_NKI_CACHE_DIR}/{self.kernel.func_name}"
         shape_dir = convert_tensor_shapes([str(arg.tensor_shape) for arg in self.kernel_args])
@@ -129,15 +129,12 @@ class Autotune:
         min_config = best_result["configs"]
 
         # Dump the performance logs
-        if self.cache_dir:
-            with open(f"{self.cache_dir}/tune.log", "w") as f:
-                f.write(pformat(self.perf_results))
-                f.write(
-                    f"\nAutotune {self.kernel.func_name} for inputs {[arg.tensor_shape for arg in self.kernel_args]}"
-                )
-                f.write(f"\nThe best latency is {min_latency} ms for the config {min_config}")
-            pickle.dump(self.perf_results, open(f"{self.cache_dir}/tune.pkl", "wb"))
-            plot_tuning_results(self.perf_results, self.cache_dir)
+        with open(f"{self.cache_dir}/tune.log", "w") as f:
+            f.write(pformat(self.perf_results))
+            f.write(f"\nAutotune {self.kernel.func_name} for inputs {[arg.tensor_shape for arg in self.kernel_args]}")
+            f.write(f"\nThe best latency is {min_latency} ms for the config {min_config}")
+        pickle.dump(self.perf_results, open(f"{self.cache_dir}/tune.pkl", "wb"))
+        plot_tuning_results(self.perf_results, self.cache_dir)
 
     def _trace_neffs(self, neff_files: List[str]):
         for neff_file in neff_files:
@@ -150,4 +147,5 @@ class Autotune:
             upload_command = (
                 f'profile-upload -F "neff=@{neff_name}.neff" -F "ntff=@{neff_name}.ntff" -F name={neff_name}'
             )
-            print(upload_command)
+            with open(f"{self.cache_dir}/upload_profile.log", "a") as f:
+                f.write(f"{upload_command}\n")
