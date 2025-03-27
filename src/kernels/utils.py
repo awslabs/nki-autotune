@@ -269,6 +269,7 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for tile_id_M in nl.affine_range(TILES_IN_M):
+        lhsT_tile = nl.ndarray((nl.par_dim(TILE_M), K), dtype=tileT_dtype, buffer=nl.sbuf)
         for tile_id_N in nl.affine_range(TILES_IN_N):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             """
@@ -279,12 +280,15 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
                 # TODO: use a temp tile to hold tileT
                 tileT = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.psum)
                 tileT = nisa.nc_transpose(lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x])
-                tileT_tmp = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.sbuf)
+                
                 # lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x] = nl.copy(tileT, dtype=lhs_block.dtype)
-                tileT_tmp[...] = nl.copy(tileT, dtype=lhs_block.dtype)
-
+                # tileT_tmp = lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x]
+                
+                # tileT_tmp = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.sbuf)
+                lhsT_tile[idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x] = nl.copy(tileT, dtype=lhs_block.dtype)
+                
                 result_tile += nisa.nc_matmul(
-                    tileT_tmp, rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x]
+                    lhsT_tile[idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x], rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x]
                 )
 
             result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
