@@ -19,6 +19,7 @@ class MatMulCompatibility:
         BUFFER_M: int = 1,
         BUFFER_N: int = 1,
         BUFFER_K: int = -1,
+        **kwargs,
     ) -> None:
         # Input sizes
         assert len(rhs_shape) == 2, f"Expecting (K, N) in RHS. Received {rhs_shape}."
@@ -218,14 +219,16 @@ def transpose_tile(tile):
 
     Args:
         tile (_type_): _description_
-    """    
+    """
     if nisa.get_nc_version() == nisa.nc_version.gen3:
         tileT_dtype = tile.dtype
     else:
         tileT_dtype = np.float32
     pmax = nl.tile_size.pmax
     par_size, free_size = tile.shape
-    assert par_size==pmax and free_size==pmax, f"Can only transpose a single ({pmax}, {pmax}) tile, received {tile.shape}."
+    assert (
+        par_size == pmax and free_size == pmax
+    ), f"Can only transpose a single ({pmax}, {pmax}) tile, received {tile.shape}."
     tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=tileT_dtype, buffer=nl.psum)
     tileT = nisa.nc_transpose(tile)
     tile = nl.copy(tileT, dtype=tile.dtype)
@@ -253,12 +256,15 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
     assert (
         N == TILES_IN_N * TILE_N
     ), f"N dimension mismatch: rhs_block {rhs_block.shape}. result_block {result_block.shape}."
-    
+
     if nisa.get_nc_version() == nisa.nc_version.gen3:
         tileT_dtype = lhs_block.dtype
     else:
         tileT_dtype = np.float32
 
+    print(
+        f"lhs_block = {lhs_block.shape}. rhs_block = {rhs_block.shape}. TILES_IN_M = {TILES_IN_M}. TILES_IN_N = {TILES_IN_N}. TILES_IN_K = {TILES_IN_K}."
+    )
     idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
@@ -269,14 +275,16 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
             Use PSUM buffer to accumulate into a single hardware tile
             """
             for tile_id_K in nl.affine_range(TILES_IN_K):
+                # FIXME: in-place transposition repeated across tile_id_N
+                # TODO: use a temp tile to hold tileT
                 tileT = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.psum)
                 tileT = nisa.nc_transpose(lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x])
-                lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x] = nl.copy(tileT, dtype=lhs_block.dtype)
-                # transpose_tile(lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x])
+                tileT_tmp = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.sbuf)
+                # lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x] = nl.copy(tileT, dtype=lhs_block.dtype)
+                tileT_tmp[...] = nl.copy(tileT, dtype=lhs_block.dtype)
 
                 result_tile += nisa.nc_matmul(
-                    lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x],
-                    rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x],
+                    tileT_tmp, rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x]
                 )
 
             result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
