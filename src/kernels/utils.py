@@ -1,6 +1,7 @@
-import neuronxcc.nki.language as nl
+from typing import List, Tuple
+
 import neuronxcc.nki.isa as nisa
-from typing import Tuple, List
+import neuronxcc.nki.language as nl
 import numpy as np
 from neuronxcc.nki.typing import tensor
 

@@ -1,17 +1,16 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.isa as nisa
-from src.allocation.utils import update_base_addr
-
 import math
+
 import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.compiler as ncc
-from neuronxcc.nki.language import par_dim
+import neuronxcc.nki.isa as nisa
+import neuronxcc.nki.language as nl
 import numpy as np
+from neuronxcc.nki.language import par_dim
+
+from src.allocation.utils import update_base_addr
 
 
 @nki.jit

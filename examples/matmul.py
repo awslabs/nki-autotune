@@ -1,18 +1,17 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
-import neuronxcc.nki as nki
 import numpy as np
 from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 
-from src.autotune_kernel import Autotune
-from src.benchmark import profile_kernel
-from src.kernels.matmul import gemm_with_non_transposed_lhs_MN
 from src.golden.gemm import gemm_cpu_golden
-
+from src.kernels.matmul import gemm_with_non_transposed_lhs_MN
+from src.tune.autotune_kernel import Autotune
+from src.tune.benchmark import profile_kernel
 
 if __name__ == "__main__":
     batch, M, K, N = 1, 2048, 4096, 512

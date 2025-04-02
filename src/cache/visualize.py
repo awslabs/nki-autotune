@@ -1,14 +1,19 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import matplotlib.pyplot as plt
-import pickle, re, os, math
+import math
+import os
+import pickle
+import re
 from glob import glob
 from pprint import pformat
+from typing import Dict, List
+
+import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-from typing import Dict, List
-from src.cache.directories import TORCH_CACHE_DIR, NKI_CACHE_DIR, TUNED_NKI_CACHE_DIR
+
+from src.cache.directories import NKI_CACHE_DIR, TORCH_CACHE_DIR, TUNED_NKI_CACHE_DIR
 
 
 def sort_lists_by_first(*lists):

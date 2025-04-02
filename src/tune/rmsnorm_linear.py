@@ -1,16 +1,19 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import random
+import shutil
+import time
+from itertools import permutations, product
+from typing import Dict, List
+
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
-import random, os, shutil, time
-from typing import List, Dict
-from itertools import product, permutations
 
-from src.autotune_kernel import Autotune
-from src.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear
 from src.kernels.matmul import MatMulCompatibility
-from src.cache.directories import TUNED_NKI_CACHE_DIR
+from src.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear
+from src.tune.autotune_kernel import Autotune
 
 
 def get_autotune_configs() -> List[Dict]:
@@ -50,7 +53,6 @@ def profile():
         warmup=10,
         iters=100,
         pruning_func=MatMulCompatibility,
-        cache_dir="/home/ubuntu/autotune/autotune-cache",
         trace=True,
     )
     tuner()

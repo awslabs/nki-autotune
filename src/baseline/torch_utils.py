@@ -1,5 +1,7 @@
 import time
+
 import numpy as np
+import torch
 from torch_xla.core import xla_model as xm
 
 
@@ -50,3 +52,11 @@ def benchmark(torch_func, num_warmup: int, num_runs: int, *args):
         run_times.append((end - start) * 1000)  # Store in ms
     p99 = calculate_and_report_metrics(run_times)
     return p99
+
+
+def initialize_xla_tensor(shape, dtype):
+    """Initialize a XLA tensor."""
+    device = xm.xla_device()
+    xla_tensor = torch.rand(shape, dtype=dtype, device=device)
+    xm.mark_step()
+    return xla_tensor

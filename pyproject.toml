@@ -3,3 +3,8 @@ line-length = 120
 target-version = ['py310']
 include = '\.pyi?$'
 skip-magic-trailing-comma = true
+
+[tool.isort]
+known_first_party = ["nki-autotune"]
+profile = "black"
+line_length = 120

@@ -1,12 +1,15 @@
+import os
+import pickle
+import shutil
+from itertools import product
+
 import neuronxcc.nki as nki
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
-import os, pickle, shutil
-from itertools import product
 
 from src.cache.directories import NKI_CACHE_DIR
-from src.benchmark import profile_kernel
+from src.tune.benchmark import profile_kernel
 
 
 @nki.jit

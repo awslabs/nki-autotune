@@ -1,22 +1,22 @@
-import pytest
-import numpy as np
 from typing import Dict, Tuple
 
-from src.kernels.rmsnorm_weighted import weighted_rmsnorm, allocated_weighted_rmsnorm
-from src.kernels.rmsnorm_linear import (
-    allocated_fused_rms_norm_qkv,
-    stack_allocated_fused_rms_norm_qkv,
-    blocked_fused_rms_norm_linear,
-)
-from src.kernels.matmul import MatMulCompatibility
-from src.benchmark import profile_kernel
-from src.golden.rmsnorm_linear import rmsnorm_linear_golden
+import neuronxcc.nki.language as nl
+import neuronxcc.nki.typing as nt
+import numpy as np
+import pytest
+from neuronxcc.nki import baremetal
+from neuronxcc.starfish.support.util import allclose
 from test_generation import GenTests
 
-import neuronxcc.nki.language as nl
-from neuronxcc.starfish.support.util import allclose
-from neuronxcc.nki import baremetal
-import neuronxcc.nki.typing as nt
+from src.golden.rmsnorm_linear import rmsnorm_linear_golden
+from src.kernels.matmul import MatMulCompatibility
+from src.kernels.rmsnorm_linear import (
+    allocated_fused_rms_norm_qkv,
+    blocked_fused_rms_norm_linear,
+    stack_allocated_fused_rms_norm_qkv,
+)
+from src.kernels.rmsnorm_weighted import allocated_weighted_rmsnorm, weighted_rmsnorm
+from src.tune.benchmark import profile_kernel
 
 
 class RMSNormLinearTestConfig(GenTests):
@@ -157,15 +157,14 @@ def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NU
     assert allclose(nki_out, golden, atol=atol, rtol=rtol, verbose=1)
 
 
-@pytest.mark.xfail(reason="Optimized kernel not yet done")
-@pytest.mark.parametrize("batch, M, K, N, eps", [(1, 4096, 4096, 512, 1e-6)])
+@pytest.mark.parametrize("batch, M, K, N, eps", [(1, 8192, 4096, 512, 1e-6)])
 def test_blocked_fused_rms_norm_linear_perf(batch, M, K, N, eps):
     dtype = nl.bfloat16
     hidden = nt.tensor[[batch, M, K], dtype]
     qkv_weights = nt.tensor[[K, N], dtype]
     baseline_p99, _ = profile_kernel(stack_allocated_fused_rms_norm_qkv, (hidden, qkv_weights, nl.float32, eps))
-    optimized_p99, _ = profile_kernel(blocked_fused_rms_norm_linear, (hidden, qkv_weights, 4, 1, 4, 1, nl.float32, eps))
+    optimized_p99, _ = profile_kernel(blocked_fused_rms_norm_linear, (hidden, qkv_weights, 8, 1, 4, 1, nl.float32, eps))
     print(f"blocked_fused_rms_norm_linear {optimized_p99}ms. stack_allocated_fused_rms_norm_qkv {baseline_p99}ms.")
     assert (
-        optimized_p99 <= baseline_p99
+        optimized_p99 < baseline_p99
     ), f"blocked_fused_rms_norm_linear {optimized_p99}ms should be faster than stack_allocated_fused_rms_norm_qkv {baseline_p99}ms"
