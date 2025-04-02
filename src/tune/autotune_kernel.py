@@ -1,21 +1,29 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Callable, Tuple, Dict
-import multiprocessing, warnings, dill, pickle, math, os, shutil, subprocess
+import math
+import multiprocessing
+import os
+import pickle
+import shutil
+import subprocess
+import warnings
 from itertools import product
+from typing import Callable, Dict, List, Tuple
+
+import dill
 
 multiprocessing.reduction.ForkingPickler.dumps = dill.dumps
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from tqdm import tqdm
-from time import perf_counter
 from pprint import pformat
-
-from src.benchmark import profile_kernel
-from src.visualize import plot_tuning_results
-from src.cache.directories import TUNED_NKI_CACHE_DIR, split_file_info, convert_tensor_shapes
+from time import perf_counter
 
 from neuronxcc.nki.compile import GenericKernel
+from tqdm import tqdm
+
+from src.cache.directories import TUNED_NKI_CACHE_DIR, parse_tensor_shapes, split_file_info
+from src.cache.visualize import plot_tuning_results
+from src.tune.benchmark import profile_kernel
 
 
 class Autotune:
@@ -47,34 +55,6 @@ class Autotune:
         self.perf_results = []
         self.cache_dir = self._get_cache_dir(cache_dir)
         self.trace = trace
-
-    def _get_cache_dir(self, cache_dir: str | None = None) -> str:
-        if not cache_dir:
-            cache_dir = f"{TUNED_NKI_CACHE_DIR}/{self.kernel.func_name}"
-        shape_dir = convert_tensor_shapes([str(arg.tensor_shape) for arg in self.kernel_args])
-        cache_dir = f"{cache_dir}/{shape_dir}"
-        if os.path.exists(cache_dir):
-            shutil.rmtree(cache_dir)
-        os.makedirs(cache_dir)
-        return cache_dir
-
-    def _prune(self) -> List[dict]:
-        """
-        Pruning func should throw a fail if the inputs are illegal
-        """
-        valid_configs = []
-        arg_shapes = [arg.tensor_shape for arg in self.kernel_args]
-        for config in self.configs:
-            try:
-                if self.pruning_func is not None:
-                    self.pruning_func(*arg_shapes, **config)
-                valid_configs.append(config)
-            except Exception as e:
-                print(f"Prune invalid config {config}, reason: {e} ({type(e)})")
-            if self.max_configs and len(valid_configs) == self.max_configs:
-                break
-        assert valid_configs, f"No valid autotune configs found"
-        return valid_configs
 
     def __call__(self):
         start = perf_counter()
@@ -122,6 +102,48 @@ class Autotune:
             self._trace_neffs(neff_files)
         return None
 
+    def _get_cache_dir(self, cache_dir: str | None = None) -> str:
+        """
+        Determine and create the cache directory for storing autotune results.
+
+        This method creates a cache directory structure based on the kernel function name
+        and the shapes of the input tensors. If the directory already exists, it is
+        removed and recreated to ensure a clean starting state.
+
+        Args:
+            cache_dir (str | None, optional): Custom cache directory path. If None,
+                a default path is created based on the kernel function name. Defaults to None.
+
+        Returns:
+            str: Path to the created cache directory.
+        """
+        if not cache_dir:
+            cache_dir = f"{TUNED_NKI_CACHE_DIR}/{self.kernel.func_name}"
+        shape_dir = parse_tensor_shapes([str(arg.tensor_shape) for arg in self.kernel_args])
+        cache_dir = f"{cache_dir}/{shape_dir}"
+        if os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir)
+        os.makedirs(cache_dir)
+        return cache_dir
+
+    def _prune(self) -> List[dict]:
+        """
+        Pruning func should throw a fail if the inputs are illegal
+        """
+        valid_configs = []
+        arg_shapes = [arg.tensor_shape for arg in self.kernel_args]
+        for config in self.configs:
+            try:
+                if self.pruning_func is not None:
+                    self.pruning_func(*arg_shapes, **config)
+                valid_configs.append(config)
+            except Exception as e:
+                print(f"Prune invalid config {config}, reason: {e} ({type(e)})")
+            if self.max_configs and len(valid_configs) == self.max_configs:
+                break
+        assert valid_configs, f"No valid autotune configs found"
+        return valid_configs
+
     def _post_tuning(self):
         assert self.perf_results, "No configs tested"
         best_result = min(self.perf_results, key=lambda element: element["latency"])
@@ -137,6 +159,24 @@ class Autotune:
         plot_tuning_results(self.perf_results, self.cache_dir)
 
     def _trace_neffs(self, neff_files: List[str]):
+        """
+        Generate trace profiles for compiled kernel files.
+
+        This method processes each NEFF (Neuron Executable File Format) file by:
+        1. Capturing a trace profile using neuron-profile
+        2. Moving the resulting trace file (NTFF) to the appropriate location
+        3. Creating an upload command for the profile data and logging it
+
+        Args:
+            neff_files (List[str]): List of paths to NEFF files to be traced.
+
+        Raises:
+            AssertionError: If any of the provided files is not a .neff file.
+
+        Note:
+            This method is used when the 'trace' flag is set to True, allowing
+            for detailed performance analysis of the compiled kernels.
+        """
         for neff_file in neff_files:
             directory, neff_name, file_type = split_file_info(neff_file)
             assert file_type == "neff", f"{neff_file} is not a .neff file."

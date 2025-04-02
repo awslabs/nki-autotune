@@ -1,15 +1,19 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import random
+import shutil
+import time
+from itertools import permutations, product
+from typing import Dict, List
+
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
-import random, os, shutil, time
-from typing import List, Dict
-from itertools import product, permutations
 
-from src.autotune_kernel import Autotune
-from src.kernels.matmul import matmul_main, MatMulCompatibility
 from src.cache.directories import TUNED_NKI_CACHE_DIR
+from src.kernels.matmul import MatMulCompatibility, matmul_main
+from src.tune.autotune_kernel import Autotune
 
 
 def get_autotune_configs() -> List[Dict]:

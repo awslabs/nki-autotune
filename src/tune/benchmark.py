@@ -1,16 +1,10 @@
-import neuronxcc.nki as nki
-from neuronxcc.nki.compile import GenericKernel
-
 import shutil
 from typing import Dict, Tuple
 
+import neuronxcc.nki as nki
+from neuronxcc.nki.compile import GenericKernel
 
-def dict_to_string(configs: Dict):
-    result = []
-    for key, val in configs.items():
-        result.append(str(key))
-        result.append(str(val))
-    return "-".join(result)
+from src.cache.directories import dict_to_string
 
 
 def profile_kernel(

@@ -1,6 +1,6 @@
 import random
-from typing import List, Tuple, Dict
-from itertools import product, permutations
+from itertools import permutations, product
+from typing import Dict, List, Tuple
 
 
 class GenTests:

@@ -4,3 +4,4 @@ pytest
 black
 seaborn
 pytest-progress
+isort

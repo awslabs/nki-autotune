@@ -1,23 +1,27 @@
-import pytest, random, sys, warnings
+import random
+import sys
+import warnings
+from typing import Dict, List, Tuple
+
 import numpy as np
-from typing import List, Tuple, Dict
+import pytest
 
 sys.path.append("../")
 
+from itertools import permutations
+
+import neuronxcc.nki.language as nl
+from neuronxcc.nki import baremetal
+from neuronxcc.starfish.support.util import allclose
+from test_generation import GenTests
+
+from src.golden.gemm import gemm_core, gemm_cpu_golden
 from src.kernels.matmul import (
-    matmul_main,
     MatMulCompatibility,
     gemm_with_non_transposed_lhs_MN,
     gemm_with_non_transposed_lhs_MNK,
+    matmul_main,
 )
-from src.golden.gemm import gemm_core, gemm_cpu_golden
-from test_generation import GenTests
-
-import neuronxcc.nki.language as nl
-from neuronxcc.starfish.support.util import allclose
-from neuronxcc.nki import baremetal
-
-from itertools import permutations
 
 
 class GEMMTestConfig(GenTests):

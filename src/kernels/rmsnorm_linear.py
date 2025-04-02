@@ -5,24 +5,25 @@ kernels - Fused normalization with linear layers
 
 """
 
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.isa as nisa
-import neuronxcc.nki.compiler as ncc
 import math
-import numpy as np
 from typing import Tuple
+
+import neuronxcc.nki.compiler as ncc
+import neuronxcc.nki.isa as nisa
+import neuronxcc.nki.language as nl
+import numpy as np
 from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
 from src.allocation.utils import update_base_addr
 from src.kernels.utils import (
-    load_tensor_block,
-    save_result_block,
-    matmul_blocks_tile_transposed_lhs,
     MatMulCompatibility,
-    transpose_tiles_in_block,
+    load_tensor_block,
     matmul_blocks_lhs,
+    matmul_blocks_tile_transposed_lhs,
+    save_result_block,
     transpose_tile,
+    transpose_tiles_in_block,
 )
 
 
@@ -332,8 +333,7 @@ def blocked_fused_rms_norm_linear(
                 ofs=(block_id_M * mm.BLOCK_M, 0),
                 load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K),
             )
-            compute_RMSNorm(lhs_block, mm, eps, norm_dtype, lhs.dtype)
-            # transpose_tiles_in_block(lhs_block)
+            compute_RMSNormT(lhs_block, mm, eps, norm_dtype, lhs.dtype)
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
                 result_block = nl.zeros(
                     (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
@@ -346,16 +346,15 @@ def blocked_fused_rms_norm_linear(
                     load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N),
                 )
                 matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_block)
-                # matmul_blocks_lhs(lhs_block, rhs_block, result_block)
                 save_result_block(
                     result[batch_id], result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N
                 )
     return result
 
 
-def compute_RMSNorm(in_block, mm: MatMulCompatibility, eps, norm_dtype, output_dtype):
+def compute_RMSNormT(in_block, mm: MatMulCompatibility, eps, norm_dtype, output_dtype):
     """
-    Compute the RMSNorm(hidden) block for the in_block
+    Compute the RMSNormT(hidden) block for the in_block
     Args:
         in_block: 3D input tensor tile (TILES_IN_BLOCK_M, TILE_M, K)
         eps: RMS norm epsilon term

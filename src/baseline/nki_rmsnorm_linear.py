@@ -1,11 +1,14 @@
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.typing as nt
-import os, pickle, shutil
+import os
+import pickle
+import shutil
 from itertools import product
 
+import neuronxcc.nki.language as nl
+import neuronxcc.nki.typing as nt
+
 from src.cache.directories import NKI_CACHE_DIR
-from src.benchmark import profile_kernel
 from src.kernels.rmsnorm_linear import stack_allocated_fused_rms_norm_qkv
+from src.tune.benchmark import profile_kernel
 
 
 def profile(kernel):

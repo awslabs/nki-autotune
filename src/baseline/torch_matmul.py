@@ -1,7 +1,11 @@
-import torch, os, shutil, pickle
-from torch_xla.core import xla_model as xm
+import os
+import pickle
+import shutil
 from itertools import product
 from typing import Tuple
+
+import torch
+from torch_xla.core import xla_model as xm
 
 from src.baseline.torch_utils import benchmark
 from src.cache.directories import TORCH_CACHE_DIR

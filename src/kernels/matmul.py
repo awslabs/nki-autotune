@@ -1,20 +1,21 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.isa as nisa
-import neuronxcc.nki as nki
-from neuronxcc.nki.compiler.backends.neuron.tensors import KernelHBMTensor
-from neuronxcc.nki.typing import tensor
 from typing import Tuple
 
+import neuronxcc.nki as nki
+import neuronxcc.nki.isa as nisa
+import neuronxcc.nki.language as nl
+from neuronxcc.nki.compiler.backends.neuron.tensors import KernelHBMTensor
+from neuronxcc.nki.typing import tensor
+
 from src.kernels.utils import (
+    MatMulCompatibility,
     load_tensor_block,
     matmul_block,
-    matmul_blocks_tile_transposed_lhs,
-    MatMulCompatibility,
-    transpose_tiles_in_block,
     matmul_blocks_lhs,
+    matmul_blocks_tile_transposed_lhs,
+    transpose_tiles_in_block,
 )
 
 
