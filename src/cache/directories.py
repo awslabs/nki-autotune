@@ -1,5 +1,8 @@
 import os
+import shutil
 from typing import Dict, List, Tuple
+
+from neuronxcc.nki.typing import tensor
 
 home_dir = os.environ["HOME"]
 CACHE_ROOT_DIR = f"{home_dir}/autotune-cache"
@@ -105,3 +108,26 @@ def parse_tensor_shapes(tensor_shapes: List[str]) -> str:
     result = "_".join(processed_shapes)
 
     return result
+
+
+def get_cache_dir(cache_root_dir: str, kernel, kernel_args: Tuple) -> str:
+    """
+    Determine and create the cache directory for storing results.
+
+    This method creates a cache directory structure based on the kernel function name
+    and the shapes of the input tensors. If the directory already exists, it is
+    removed and recreated to ensure a clean starting state.
+
+    Args:
+        cache_dir (str | None, optional): Custom cache directory path. If None,
+            a default path is created based on the kernel function name. Defaults to None.
+
+    Returns:
+        str: Path to the created cache directory.
+    """
+    shape_dir = parse_tensor_shapes([str(arg.tensor_shape) for arg in kernel_args])
+    cache_dir = f"{cache_root_dir}/{kernel.func_name}/{shape_dir}"
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+    os.makedirs(cache_dir)
+    return cache_dir

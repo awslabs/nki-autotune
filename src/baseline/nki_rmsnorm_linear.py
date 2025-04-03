@@ -6,7 +6,8 @@ from itertools import product
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
 
-from src.cache.directories import NKI_CACHE_DIR
+from src.cache.directories import NKI_CACHE_DIR, get_cache_dir
+from src.cache.results import PerformanceMetrics
 from src.kernels.rmsnorm_linear import stack_allocated_fused_rms_norm_qkv
 from src.tune.benchmark import profile_kernel
 
@@ -19,13 +20,14 @@ def profile(kernel):
     dtype = nl.bfloat16
     batch = 1
     MNK = list(product([8192], [512], [4096]))
-    perf_results = {}
     for M, N, K in MNK:
         lhs = nt.tensor[[batch, M, K], dtype]
         rhs = nt.tensor[[K, N], dtype]
         p99, _ = profile_kernel(kernel, (lhs, rhs))
-        perf_results[(M, N, K)] = p99
-        pickle.dump(perf_results, open(f"{cache_dir}/{kernel.func_name}.pkl", "wb"))
+        cache_dir = get_cache_dir(NKI_CACHE_DIR, kernel, (lhs, rhs))
+        perf_results = PerformanceMetrics()
+        perf_results.add_result(configs={}, latency=p99)
+        perf_results.save(cache_dir=cache_dir)
 
 
 if __name__ == "__main__":
