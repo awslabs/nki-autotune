@@ -4,25 +4,21 @@
 import math
 import multiprocessing
 import os
-import pickle
 import shutil
 import subprocess
 import warnings
-from itertools import product
 from typing import Callable, Dict, List, Tuple
 
 import dill
 
 multiprocessing.reduction.ForkingPickler.dumps = dill.dumps
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from pprint import pformat
-from time import perf_counter
 
 from neuronxcc.nki.compile import GenericKernel
 from tqdm import tqdm
 
-from src.cache.directories import TUNED_NKI_CACHE_DIR, parse_tensor_shapes, split_file_info
-from src.cache.visualize import plot_tuning_results
+from src.cache.directories import TUNED_NKI_CACHE_DIR, get_cache_dir, parse_tensor_shapes, split_file_info
+from src.cache.results import PerformanceMetrics
 from src.tune.benchmark import profile_kernel
 
 
@@ -52,12 +48,17 @@ class Autotune:
         self.iters = iters
         self.pruning_func = pruning_func
         self.benchmark_machines = benchmark_machines if benchmark_machines is not None else ["localhost"]
-        self.perf_results = []
-        self.cache_dir = self._get_cache_dir(cache_dir)
+        self.perf_results = PerformanceMetrics()
+        if not cache_dir:
+            self.cache_dir = get_cache_dir(cache_root_dir=TUNED_NKI_CACHE_DIR, kernel=kernel, kernel_args=kernel_args)
+        else:
+            if os.path.exists(cache_dir):
+                shutil.rmtree(cache_dir)
+            os.makedirs(cache_dir)
+            self.cache_dir = cache_dir
         self.trace = trace
 
     def __call__(self):
-        start = perf_counter()
         valid_configs = self._prune()
         device_locks = {machine: multiprocessing.Manager().Lock() for machine in self.benchmark_machines}
 
@@ -86,45 +87,20 @@ class Autotune:
         ):
             config = futures_to_config[future]
             try:
-                latency_us, neff_file = future.result()
+                latency, neff_file = future.result()
                 neff_files.append(neff_file)
             except Exception as e:
-                latency_us = float("inf")
+                latency = float("inf")
                 warnings.warn(
                     f"Warning: failed for config {config}, reason: {e} ({type(e)})",
                     category=RuntimeWarning,
                     stacklevel=2,
                 )
-            elapsed = perf_counter() - start
-            self.perf_results.append({"configs": config, "latency": latency_us, "time_elapsed": elapsed})
-            self._post_tuning()
+            self.perf_results.add_result(configs=config, latency=latency)
+            self.perf_results.save(cache_dir=self.cache_dir)
         if self.trace:
             self._trace_neffs(neff_files)
         return None
-
-    def _get_cache_dir(self, cache_dir: str | None = None) -> str:
-        """
-        Determine and create the cache directory for storing autotune results.
-
-        This method creates a cache directory structure based on the kernel function name
-        and the shapes of the input tensors. If the directory already exists, it is
-        removed and recreated to ensure a clean starting state.
-
-        Args:
-            cache_dir (str | None, optional): Custom cache directory path. If None,
-                a default path is created based on the kernel function name. Defaults to None.
-
-        Returns:
-            str: Path to the created cache directory.
-        """
-        if not cache_dir:
-            cache_dir = f"{TUNED_NKI_CACHE_DIR}/{self.kernel.func_name}"
-        shape_dir = parse_tensor_shapes([str(arg.tensor_shape) for arg in self.kernel_args])
-        cache_dir = f"{cache_dir}/{shape_dir}"
-        if os.path.exists(cache_dir):
-            shutil.rmtree(cache_dir)
-        os.makedirs(cache_dir)
-        return cache_dir
 
     def _prune(self) -> List[dict]:
         """
@@ -143,20 +119,6 @@ class Autotune:
                 break
         assert valid_configs, f"No valid autotune configs found"
         return valid_configs
-
-    def _post_tuning(self):
-        assert self.perf_results, "No configs tested"
-        best_result = min(self.perf_results, key=lambda element: element["latency"])
-        min_latency = best_result["latency"]
-        min_config = best_result["configs"]
-
-        # Dump the performance logs
-        with open(f"{self.cache_dir}/tune.log", "w") as f:
-            f.write(pformat(self.perf_results))
-            f.write(f"\nAutotune {self.kernel.func_name} for inputs {[arg.tensor_shape for arg in self.kernel_args]}")
-            f.write(f"\nThe best latency is {min_latency} ms for the config {min_config}")
-        pickle.dump(self.perf_results, open(f"{self.cache_dir}/tune.pkl", "wb"))
-        plot_tuning_results(self.perf_results, self.cache_dir)
 
     def _trace_neffs(self, neff_files: List[str]):
         """

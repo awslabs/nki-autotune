@@ -40,35 +40,6 @@ def sort_by_key(data, sort_key):
     return {key: sorted_list for key, sorted_list in zip(keys, sorted_lists)}
 
 
-def plot_tuning_results(tuning_results, fig_dir: str):
-    timestamps = [x["time_elapsed"] for x in tuning_results]
-    latencies = [x["latency"] for x in tuning_results]
-    timestamps, latencies = sort_lists_by_first(timestamps, latencies)
-    best_latencies = [min(latencies[: i + 1]) for i in range(len(latencies))]
-
-    # Create a figure and axis
-    fig, ax = plt.subplots()
-
-    # Plot the data
-    ax.plot(timestamps, best_latencies)
-    ax.scatter(timestamps, best_latencies, marker="X", color="r")
-
-    # Set labels and title
-    ax.set_xlabel("Timestamp (s)")
-    ax.set_ylabel("Best Latency (us)")
-    ax.set_title("Latency vs Timestamp")
-
-    # Add grid lines and tick labels
-    # ax.grid(True)
-    ax.set_xticks(timestamps)
-    ax.set_xticklabels([f"{t:.2f}" for t in timestamps], rotation=45, ha="right")
-
-    # Adjust the layout and display the plot
-    fig.tight_layout()
-    plt.savefig(f"{fig_dir}/tradeoff.pdf", dpi=600)
-    plt.close()
-
-
 def make_sweep_plot(data, save_path, nki_baseline, torch_baseline, subplot_width=5, subplot_height=4):
     # Sort data by M value
     data = dict(sorted(data.items(), key=lambda x: x[0]))
