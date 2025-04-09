@@ -87,16 +87,17 @@ class Autotune:
         ):
             config = futures_to_config[future]
             try:
-                latency, neff_file = future.result()
+                latency, pe_utilization, neff_file = future.result()
                 neff_files.append(neff_file)
             except Exception as e:
                 latency = float("inf")
+                pe_utilization = 0
                 warnings.warn(
                     f"Warning: failed for config {config}, reason: {e} ({type(e)})",
                     category=RuntimeWarning,
                     stacklevel=2,
                 )
-            self.perf_results.add_result(configs=config, latency=latency)
+            self.perf_results.add_result(configs=config, latency=latency, pe_utilization=pe_utilization)
             self.perf_results.save(cache_dir=self.cache_dir)
         if self.trace:
             self._trace_neffs(neff_files)

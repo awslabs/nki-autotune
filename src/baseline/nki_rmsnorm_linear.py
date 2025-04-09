@@ -19,7 +19,7 @@ def profile(kernel):
     os.makedirs(cache_dir)
     dtype = nl.bfloat16
     batch = 1
-    MNK = list(product([8192], [512], [4096]))
+    MNK = list(product([2048, 4096, 8192], [512], [2048, 4096, 8192]))
     for M, N, K in MNK:
         lhs = nt.tensor[[batch, M, K], dtype]
         rhs = nt.tensor[[K, N], dtype]

@@ -2,9 +2,7 @@ import json
 import os
 import pickle
 from pprint import pformat
-from typing import Any, Dict, List, Optional, Union
-
-import matplotlib.pyplot as plt
+from typing import Any, Dict, List
 
 
 class PerformanceResult:
@@ -32,7 +30,12 @@ class PerformanceResult:
         self._additional_keys = list(kwargs.keys())
 
     def __repr__(self) -> str:
-        return f"PerformanceResult(latency={self.latency:.2f}ms, configs={self.configs})"
+        """Enhanced representation including all kwargs attributes"""
+        base = f"PerformanceResult(latency={self.latency:.2f}ms, configs={self.configs}"
+        for key in getattr(self, "_additional_keys", []):
+            base += f", {key}={getattr(self, key)}"
+        base += ")"
+        return base
 
     def to_dict(self) -> Dict:
         """Convert to dictionary representation including all attributes."""
@@ -86,28 +89,27 @@ class PerformanceMetrics:
 
     def to_dict_list(self) -> List[Dict]:
         """
-        Convert all results to a list of dictionaries.
+        Convert all results to a list of dictionaries, sorted by performance
+        (best/lowest latency first).
 
         Returns:
             List[Dict]: List of dictionary representations of all results.
         """
-        return [result.to_dict() for result in self.results]
+        # Sort results by latency (ascending order - lower is better)
+        sorted_results = sorted(self.results, key=lambda result: result.latency)
+        return [result.to_dict() for result in sorted_results]
 
     def save(self, cache_dir: str) -> None:
         """
-        Save the metrics to log and pickle files.
+        Save the metrics to log and JSON files.
 
         Args:
-            log_path (str): Path to save the formatted text log
-            pickle_path (str, optional): Path to save the pickle file
+            cache_dir (str): Directory to save the result files
         """
-        best_result = self.get_best_result()
-        with open(f"{cache_dir}/perf_metrics.log", "w") as f:
-            f.write(pformat(self.to_dict_list()))
-            f.write(f"\nThe best latency is {best_result.latency} ms for the config {best_result.configs}")
-
-        with open(f"{cache_dir}/perf_metrics.pkl", "wb") as f:
-            pickle.dump(self.to_dict_list(), f)
+        os.makedirs(cache_dir, exist_ok=True)
+        json_data = {"results": self.to_dict_list()}
+        with open(f"{cache_dir}/perf_metrics.json", "w") as f:
+            json.dump(json_data, f, indent=2, sort_keys=True)
 
     def __len__(self) -> int:
         """Return the number of results."""

@@ -16,7 +16,7 @@ def profile_kernel(
     configs: Dict = {},
     device_lock=None,
     benchmark_machine=None,
-) -> Tuple[float, str]:
+) -> Tuple[float, float, str]:
     """
     Profile the NKI kernel P99 latency
     Args:
@@ -50,4 +50,39 @@ def profile_kernel(
         shutil.move("file.neff", neff_filename)
     else:
         neff_filename = ""
-    return p99, neff_filename
+    pe_utilization = calculate_pe_utilization(args[0].tensor_shape, args[1].tensor_shape, p99, "trn1")
+    return p99, pe_utilization, neff_filename
+
+
+def calculate_pe_utilization(lhs_shape, rhs_shape, time_ms, target_instance_family):
+    """
+    Calculate hardware FLOPS utilization for a GEMM operation.
+
+    Parameters:
+    lhs_shape (tuple): Shape of matrix A (m, k)
+    rhs_shape (tuple): Shape of matrix B (k, n)
+    time_ms (float): Execution time in milliseconds
+
+    Returns:
+    dict: Dictionary containing FLOPS, TFLOPS, max TFLOPS, and utilization percentage
+    """
+    m, k = lhs_shape
+    _k, n = rhs_shape
+    assert k == _k, f"Incompatible matrix dimensions: {lhs_shape} and {rhs_shape}"
+
+    if any(target_instance_family.startswith(family) for family in {"sunda", "trainium", "trn1", "inf2"}):
+        pe_freq = 2.8 * 1e9  # Hz (2.8 GHz)
+        num_lnc = 1
+    elif any(target_instance_family.startswith(family) for family in {"trn2", "inf3", "gen3", "cayman"}):
+        pe_freq = 2.4 * 1e9  # Hz (2.4 GHz)
+        num_lnc = 2
+    else:
+        raise NotImplementedError("Unknown target instance: " + target_instance_family)
+
+    # Calculate total FLOPS (2 operations per matrix element - multiply and add)
+    flops = 2 * m * k * n
+    actual_latency_s = time_ms / 1000
+    actual_pe_cycles = actual_latency_s * pe_freq
+    theoretical_pe_cycles = flops / (2 * 128 * 128 * num_lnc)
+    pe_utilization = theoretical_pe_cycles / actual_pe_cycles
+    return pe_utilization

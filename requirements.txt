@@ -1,7 +1,7 @@
 matplotlib
 dill
 pytest
-black
 seaborn
-pytest-progress
-isort
+pre-commit
+black==25.1.0
+isort==6.0.1
