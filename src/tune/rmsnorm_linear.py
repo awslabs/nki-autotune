@@ -37,23 +37,20 @@ def get_autotune_configs() -> List[Dict]:
 
 def profile():
     batch = 1
-    M = 8192
-    N = 512
-    K = 4096
     dtype = nl.bfloat16
-    lhs = nt.tensor[[batch, M, K], dtype]
-    rhs = nt.tensor[[K, N], dtype]
-    tuner = Autotune(
-        kernel=blocked_fused_rms_norm_linear,
-        kernel_args=(lhs, rhs),
-        configs=get_autotune_configs(),
-        max_configs=127,
-        warmup=10,
-        iters=100,
-        pruning_func=MatMulCompatibility,
-        trace=True,
-    )
-    tuner()
+    MNK = list(product([2048, 4096, 8192], [512], [2048, 4096, 8192]))
+    for M, N, K in MNK:
+        lhs = nt.tensor[[batch, M, K], dtype]
+        rhs = nt.tensor[[K, N], dtype]
+        tuner = Autotune(
+            kernel=blocked_fused_rms_norm_linear,
+            kernel_args=(lhs, rhs),
+            configs=get_autotune_configs(),
+            max_configs=127,
+            pruning_func=MatMulCompatibility,
+            trace=True,
+        )
+        tuner()
 
 
 if __name__ == "__main__":

@@ -328,6 +328,13 @@ def blocked_fused_rms_norm_linear(
     result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for batch_id in nl.affine_range(batch_size):
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
+            """
+            NOTE:
+            Load-compute pattern
+            Design question:
+            The entire thing as a black box, or users clearly separate the components and autotune decides where/how.
+            TODO: Study the CUTLASS API template
+            """
             lhs_block = load_tensor_block(
                 input_tensor=lhs[batch_id],
                 ofs=(block_id_M * mm.BLOCK_M, 0),

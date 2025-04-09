@@ -4,7 +4,11 @@ Automatically profile and select the best meta parameters for NKI kernels.
 ## Installation
 1. Follow AWS Neuron [tutorial](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/setup/torch-neuronx.html#setup-torch-neuronx) to install Neuron packages.
 
-2. Install requirements.txt.
+2. Install requirements.
+```
+pip install -r requirements.txt
+pre-commit install
+```
 
 ## Security
 

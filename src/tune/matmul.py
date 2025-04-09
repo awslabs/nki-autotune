@@ -66,7 +66,6 @@ def profile():
     shapes = [4096, 8192]
     dtype = nl.bfloat16
     MNK = list(product(shapes, shapes, shapes))
-    start = time.perf_counter()
     for M, N, K in MNK:
         lhsT = nt.tensor[[K, M], dtype]
         rhs = nt.tensor[[K, N], dtype]
@@ -74,14 +73,12 @@ def profile():
             kernel=matmul_main,
             kernel_args=(lhsT, rhs),
             configs=get_autotune_configs(),
-            max_configs=127,
+            max_configs=10,
             pruning_func=MatMulCompatibility,
             trace=True,
         )
         tuner()
         break
-    latency = time.perf_counter() - start
-    print(f"latency = {latency}")
 
 
 if __name__ == "__main__":
