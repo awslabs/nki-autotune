@@ -87,7 +87,7 @@ class Autotune:
                 result, neff_file = future.result()
                 neff_files.append(neff_file)
             except Exception as e:
-                result = PerformanceResult(config, float("inf"))
+                result = PerformanceResult(config, float("inf"), error=e)
                 warnings.warn(
                     f"Warning: failed for config {config}, reason: {e} ({type(e)})",
                     category=RuntimeWarning,

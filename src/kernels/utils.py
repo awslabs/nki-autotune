@@ -13,7 +13,7 @@ class MatMulCompatibility:
 
     def __init__(
         self,
-        lhs_shape: Tuple,
+        lhsT_shape: Tuple,
         rhs_shape: Tuple,
         NUM_BLOCK_M: int = 1,
         NUM_BLOCK_N: int = 1,
@@ -25,12 +25,12 @@ class MatMulCompatibility:
     ) -> None:
         # Input sizes
         assert len(rhs_shape) == 2, f"Expecting (K, N) in RHS. Received {rhs_shape}."
-        if len(lhs_shape) == 2:
-            self.M, self.K = lhs_shape
-        elif len(lhs_shape) == 3:
-            batch, self.M, self.K = lhs_shape
+        if len(lhsT_shape) == 2:
+            self.K, self.M = lhsT_shape
+        elif len(lhsT_shape) == 3:
+            batch, self.K, self.M = lhsT_shape
         else:
-            raise ValueError(f"lhs_shape must be either (M, K) or (batch, M, K). Received {lhs_shape}.")
+            raise ValueError(f"lhsT_shape must be either (K, M) or (batch, K, M). Received {lhsT_shape}.")
         K_, self.N = rhs_shape
 
         # Single tile sizes
@@ -71,7 +71,9 @@ class MatMulCompatibility:
             setattr(self, f"BLOCK_{dimension}", block_size)
 
     def _check(self, K_, dimensions: List[str]):
-        assert self.K == K_, f"lhs and rhs contraction dimension mismatch, got {self.K} and {K_}"
+        assert (
+            self.K == K_
+        ), f"lhs and rhs contraction dimension mismatch, got lhs {self.M}, {self.K} and rhs {K_}, {self.N}"
         for dimension in dimensions:
             size = getattr(self, f"{dimension}")
             num_block = getattr(self, f"NUM_BLOCK_{dimension}")
