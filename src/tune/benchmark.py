@@ -4,7 +4,8 @@ from typing import Dict, Tuple
 import neuronxcc.nki as nki
 from neuronxcc.nki.compile import GenericKernel
 
-from src.cache.directories import dict_to_string
+from src.cache.directories import get_hash_name
+from src.cache.results import PerformanceResult
 
 
 def profile_kernel(
@@ -16,7 +17,7 @@ def profile_kernel(
     configs: Dict = {},
     device_lock=None,
     benchmark_machine=None,
-) -> Tuple[float, float, str]:
+) -> Tuple[PerformanceResult, str]:
     """
     Profile the NKI kernel P99 latency
     Args:
@@ -45,13 +46,14 @@ def profile_kernel(
     p99 = latency_res.get_latency_percentile(99)
     p99 /= 1000
     if cache_dir:
-        configs_str = dict_to_string(configs)
-        neff_filename = f"{cache_dir}/{func.func_name}-{configs_str}.neff"
+        neff_name = get_hash_name(func, args, configs)
+        neff_filename = f"{cache_dir}/{neff_name}.neff"
         shutil.move("file.neff", neff_filename)
     else:
         neff_filename = ""
     pe_utilization = calculate_pe_utilization(args[0].tensor_shape, args[1].tensor_shape, p99, "trn1")
-    return p99, pe_utilization, neff_filename
+    result = PerformanceResult(configs, p99, pe_utilization=pe_utilization)
+    return result, neff_filename
 
 
 def calculate_pe_utilization(lhs_shape, rhs_shape, time_ms, target_instance_family):

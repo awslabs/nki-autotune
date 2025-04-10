@@ -73,9 +73,9 @@ def profile():
             kernel=matmul_main,
             kernel_args=(lhsT, rhs),
             configs=get_autotune_configs(),
-            max_configs=10,
+            max_configs=5,
             pruning_func=MatMulCompatibility,
-            trace=True,
+            trace=False,
         )
         tuner()
         break

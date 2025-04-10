@@ -38,19 +38,20 @@ def matmul_main(
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
     if loop_order == "MNK":
-        return matmul_MNK(lhsT, rhs, mm, result)
+        matmul_MNK(lhsT, rhs, mm, result)
     elif loop_order == "MKN":
-        return matmul_MKN(lhsT, rhs, mm, result)
+        matmul_MKN(lhsT, rhs, mm, result)
     elif loop_order == "NMK":
-        return matmul_NMK(lhsT, rhs, mm, result)
+        matmul_NMK(lhsT, rhs, mm, result)
     elif loop_order == "NKM":
-        return matmul_NKM(lhsT, rhs, mm, result)
+        matmul_NKM(lhsT, rhs, mm, result)
     elif loop_order == "KMN":
-        return matmul_KMN(lhsT, rhs, mm, result)
+        matmul_KMN(lhsT, rhs, mm, result)
     elif loop_order == "KNM":
-        return matmul_KNM(lhsT, rhs, mm, result)
+        matmul_KNM(lhsT, rhs, mm, result)
     else:
         raise NotImplementedError(f"Loop order {loop_order} GEMM does not exist.")
+    return result
 
 
 def save_result_block(result, result_block, m_ofs: int, n_ofs: int):
