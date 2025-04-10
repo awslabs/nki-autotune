@@ -56,21 +56,21 @@ def profile_kernel(
     return result, neff_filename
 
 
-def calculate_pe_utilization(lhs_shape, rhs_shape, time_ms, target_instance_family):
+def calculate_pe_utilization(lhsT_shape, rhs_shape, time_ms, target_instance_family):
     """
     Calculate hardware FLOPS utilization for a GEMM operation.
 
     Parameters:
-    lhs_shape (tuple): Shape of matrix A (m, k)
+    lhsT_shape (tuple): Shape of matrix A (k, m)
     rhs_shape (tuple): Shape of matrix B (k, n)
     time_ms (float): Execution time in milliseconds
 
     Returns:
     dict: Dictionary containing FLOPS, TFLOPS, max TFLOPS, and utilization percentage
     """
-    m, k = lhs_shape
+    k, m = lhsT_shape
     _k, n = rhs_shape
-    assert k == _k, f"Incompatible matrix dimensions: {lhs_shape} and {rhs_shape}"
+    assert k == _k, f"Incompatible matrix dimensions: {lhsT_shape} and {rhs_shape}"
 
     if any(target_instance_family.startswith(family) for family in {"sunda", "trainium", "trn1", "inf2"}):
         pe_freq = 2.8 * 1e9  # Hz (2.8 GHz)
