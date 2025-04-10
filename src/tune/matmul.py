@@ -10,9 +10,9 @@ from typing import Dict, List
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
 
-from src.cache.directories import TUNED_NKI_CACHE_DIR
-from src.cache.visualize import plot_pe_vs_k
-from src.kernels.matmul import MatMulCompatibility, matmul_main
+from src.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
+from src.cache.visualize import plot_pe_vs_k_comparison
+from src.kernels.matmul import MatMulCompatibility, baseline, matmul_main
 from src.tune.autotune_kernel import Autotune
 
 
@@ -58,23 +58,31 @@ def get_autotune_configs() -> List[Dict]:
     return configs
 
 
-def profile(kernel):
-    cache_root = TUNED_NKI_CACHE_DIR
-    if os.path.exists(cache_root):
-        shutil.rmtree(cache_root)
-    os.makedirs(cache_root)
+def profile():
     dtype = nl.bfloat16
-    MNK = list(product([2048, 4096], [2048], [1024, 2048, 4096]))
+    MNK = list(product([1024, 2048, 4096], [1024, 2048, 4096], [1024, 2048, 4096]))
     for M, N, K in MNK:
         lhsT = nt.tensor[[K, M], dtype]
         rhs = nt.tensor[[K, N], dtype]
+
+        baseline_tuner = Autotune(
+            kernel=baseline,
+            kernel_args=(lhsT, rhs),
+            configs=[{"TILES_IN_BLOCK_M": 16, "TILES_IN_BLOCK_N": 2, "TILES_IN_BLOCK_K": 8}],
+            max_configs=1,
+            pruning_func=MatMulCompatibility,
+            cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
+            trace=False,
+        )
+        baseline_tuner()
+
         tuner = Autotune(
-            kernel=kernel,
+            kernel=matmul_main,
             kernel_args=(lhsT, rhs),
             configs=get_autotune_configs(),
             max_configs=100,
             pruning_func=MatMulCompatibility,
-            cache_dir=f"{TUNED_NKI_CACHE_DIR}/{kernel.func_name}/M{M}-N{N}-K{K}",
+            cache_dir=f"{TUNED_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
             trace=False,
         )
         tuner()
@@ -82,6 +90,5 @@ def profile(kernel):
 
 if __name__ == "__main__":
     os.environ["NEURON_CC_FLAGS"] = "--framework=XLA --target=trn1 --auto-cast=none"
-    kernel = matmul_main
-    # profile(kernel)
-    plot_pe_vs_k(kernel)
+    # profile()
+    plot_pe_vs_k_comparison(tuned_dir=f"{TUNED_CACHE_DIR}/GEMM", baseline_dir=f"{BASELINE_CACHE_DIR}/GEMM")

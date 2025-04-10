@@ -9,8 +9,9 @@ from neuronxcc.nki.typing import tensor
 home_dir = os.environ["HOME"]
 CACHE_ROOT_DIR = f"{home_dir}/autotune-cache"
 TORCH_CACHE_DIR = f"{CACHE_ROOT_DIR}/torch"
-NKI_CACHE_DIR = f"{CACHE_ROOT_DIR}/nki"
-TUNED_NKI_CACHE_DIR = f"{CACHE_ROOT_DIR}/tuned-nki"
+BASELINE_CACHE_DIR = f"{CACHE_ROOT_DIR}/baseline"
+TUNED_CACHE_DIR = f"{CACHE_ROOT_DIR}/tuned"
+VISUALIZATION_DIR = f"{CACHE_ROOT_DIR}/plots"
 
 
 def get_hash_name(kernel, kernel_args: Tuple[tensor, ...], configs: Dict):
