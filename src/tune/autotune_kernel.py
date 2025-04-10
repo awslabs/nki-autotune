@@ -16,7 +16,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 from neuronxcc.nki.compile import GenericKernel
 
-from src.cache.directories import TUNED_NKI_CACHE_DIR, get_cache_dir, parse_tensor_shapes, split_file_info
+from src.cache.directories import TUNED_CACHE_DIR, get_cache_dir, split_file_info
 from src.cache.results import PerformanceMetrics, PerformanceResult
 from src.tune.benchmark import profile_kernel
 
@@ -49,7 +49,7 @@ class Autotune:
         self.benchmark_machines = benchmark_machines if benchmark_machines is not None else ["localhost"]
         self.perf_results = PerformanceMetrics()
         if not cache_dir:
-            self.cache_dir = get_cache_dir(cache_root_dir=TUNED_NKI_CACHE_DIR, kernel=kernel, kernel_args=kernel_args)
+            self.cache_dir = get_cache_dir(cache_root_dir=TUNED_CACHE_DIR, kernel=kernel, kernel_args=kernel_args)
         else:
             if os.path.exists(cache_dir):
                 shutil.rmtree(cache_dir)
