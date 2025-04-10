@@ -1,5 +1,7 @@
+import hashlib
 import os
 import shutil
+import time
 from typing import Dict, List, Tuple
 
 from neuronxcc.nki.typing import tensor
@@ -9,6 +11,17 @@ CACHE_ROOT_DIR = f"{home_dir}/autotune-cache"
 TORCH_CACHE_DIR = f"{CACHE_ROOT_DIR}/torch"
 NKI_CACHE_DIR = f"{CACHE_ROOT_DIR}/nki"
 TUNED_NKI_CACHE_DIR = f"{CACHE_ROOT_DIR}/tuned-nki"
+
+
+def get_hash_name(kernel, kernel_args: Tuple[tensor, ...], configs: Dict):
+    kernel_str = str(kernel)
+    kernel_args_str = parse_tensor_shapes([str(arg.tensor_shape) for arg in kernel_args])
+    configs_str = dict_to_string(configs)
+    timestamp = str(time.time())
+    combined_str = f"{kernel_str}_{kernel_args_str}_{configs_str}_{timestamp}"
+    hash_value = hashlib.sha256(combined_str.encode("utf-8")).hexdigest()
+    hash_name = f"{kernel.func_name}-{hash_value}"
+    return hash_name
 
 
 def dict_to_string(configs: Dict) -> str:

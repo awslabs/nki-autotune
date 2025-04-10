@@ -12,13 +12,12 @@ from typing import Callable, Dict, List, Tuple
 import dill
 
 multiprocessing.reduction.ForkingPickler.dumps = dill.dumps
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 from neuronxcc.nki.compile import GenericKernel
-from tqdm import tqdm
 
 from src.cache.directories import TUNED_NKI_CACHE_DIR, get_cache_dir, parse_tensor_shapes, split_file_info
-from src.cache.results import PerformanceMetrics
+from src.cache.results import PerformanceMetrics, PerformanceResult
 from src.tune.benchmark import profile_kernel
 
 
@@ -82,22 +81,19 @@ class Autotune:
                 futures_to_config[future] = config
 
         neff_files = []
-        for future in tqdm(
-            as_completed(futures_to_config), total=len(futures_to_config), desc="Benchmarking configurations"
-        ):
+        for future in futures_to_config:
             config = futures_to_config[future]
             try:
-                latency, pe_utilization, neff_file = future.result()
+                result, neff_file = future.result()
                 neff_files.append(neff_file)
             except Exception as e:
-                latency = float("inf")
-                pe_utilization = 0
+                result = PerformanceResult(config, float("inf"))
                 warnings.warn(
                     f"Warning: failed for config {config}, reason: {e} ({type(e)})",
                     category=RuntimeWarning,
                     stacklevel=2,
                 )
-            self.perf_results.add_result(configs=config, latency=latency, pe_utilization=pe_utilization)
+            self.perf_results.append(result)
             self.perf_results.save(cache_dir=self.cache_dir)
         if self.trace:
             self._trace_neffs(neff_files)

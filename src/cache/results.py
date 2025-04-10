@@ -99,6 +99,9 @@ class PerformanceMetrics:
         sorted_results = sorted(self.results, key=lambda result: result.latency)
         return [result.to_dict() for result in sorted_results]
 
+    def append(self, result: PerformanceResult):
+        self.results.append(result)
+
     def save(self, cache_dir: str) -> None:
         """
         Save the metrics to log and JSON files.
