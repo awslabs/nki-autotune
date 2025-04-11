@@ -44,7 +44,6 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
-*.sh
 
 # Environments
 .env
@@ -79,6 +78,8 @@ Desktop.ini
 *.png
 *.txt
 *.pkl
+*.out
+*.err
 
 # Artifacts
 artifacts/
