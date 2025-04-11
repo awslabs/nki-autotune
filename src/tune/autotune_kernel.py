@@ -35,7 +35,6 @@ class Autotune:
         warmup: int = 10,
         iters: int = 100,
         pruning_func: Callable | None = None,
-        benchmark_machines=None,
         cache_dir: str | None = None,
         trace: bool = False,
     ):
@@ -46,7 +45,6 @@ class Autotune:
         self.warmup = warmup
         self.iters = iters
         self.pruning_func = pruning_func
-        self.benchmark_machines = benchmark_machines if benchmark_machines is not None else ["localhost"]
         self.perf_results = PerformanceMetrics()
         if not cache_dir:
             self.cache_dir = get_cache_dir(cache_root_dir=TUNED_CACHE_DIR, kernel=kernel, kernel_args=kernel_args)
@@ -58,6 +56,7 @@ class Autotune:
         self.trace = trace
 
     def __call__(self):
+        os.environ["NEURON_CC_FLAGS"] = "--framework=XLA --target=trn1 --auto-cast=none"
         valid_configs = self._prune()
         device_locks = {machine: multiprocessing.Manager().Lock() for machine in self.benchmark_machines}
 

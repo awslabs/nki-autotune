@@ -1,9 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 import random
-import shutil
 from itertools import permutations, product
 from typing import Dict, List
 
@@ -60,7 +58,7 @@ def get_autotune_configs() -> List[Dict]:
 
 def profile():
     dtype = nl.bfloat16
-    MNK = list(product([1024, 2048, 4096], [1024, 2048, 4096], [1024, 2048, 4096]))
+    MNK = list(product([2048], [4096], [2048]))
     for M, N, K in MNK:
         lhsT = nt.tensor[[K, M], dtype]
         rhs = nt.tensor[[K, N], dtype]
@@ -80,7 +78,7 @@ def profile():
             kernel=matmul_main,
             kernel_args=(lhsT, rhs),
             configs=get_autotune_configs(),
-            max_configs=100,
+            max_configs=4,
             pruning_func=MatMulCompatibility,
             cache_dir=f"{TUNED_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
             trace=False,
@@ -89,6 +87,5 @@ def profile():
 
 
 if __name__ == "__main__":
-    os.environ["NEURON_CC_FLAGS"] = "--framework=XLA --target=trn1 --auto-cast=none"
-    # profile()
-    plot_pe_vs_k_comparison(tuned_dir=f"{TUNED_CACHE_DIR}/GEMM", baseline_dir=f"{BASELINE_CACHE_DIR}/GEMM")
+    profile()
+    # plot_pe_vs_k_comparison(tuned_dir=f"{TUNED_CACHE_DIR}/GEMM", baseline_dir=f"{BASELINE_CACHE_DIR}/GEMM")
