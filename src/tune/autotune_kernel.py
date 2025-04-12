@@ -1,24 +1,22 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import math
 import multiprocessing
 import os
 import shutil
 import subprocess
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Dict, List, Tuple
 
-import dill
-
-multiprocessing.reduction.ForkingPickler.dumps = dill.dumps
-from concurrent.futures import ProcessPoolExecutor
-
+import numpy as np
 from neuronxcc.nki.compile import GenericKernel
+from tqdm import tqdm
 
+import src.tune.utils as utils
 from src.cache.directories import TUNED_CACHE_DIR, get_cache_dir, split_file_info
 from src.cache.results import PerformanceMetrics, PerformanceResult
-from src.tune.benchmark import profile_kernel
+from src.tune.utils import create_and_compile_nki_kernel
 
 
 class Autotune:
@@ -29,7 +27,7 @@ class Autotune:
     def __init__(
         self,
         kernel: GenericKernel,
-        kernel_args: Tuple,
+        kernel_args: Tuple[np.ndarray, ...],
         configs: List[Dict],
         max_configs: int | None = None,
         warmup: int = 10,
@@ -58,59 +56,72 @@ class Autotune:
     def __call__(self):
         os.environ["NEURON_CC_FLAGS"] = "--framework=XLA --target=trn1 --auto-cast=none"
         valid_configs = self._prune()
-        device_locks = {machine: multiprocessing.Manager().Lock() for machine in self.benchmark_machines}
+        num_workers = min(len(valid_configs), os.cpu_count() - 1)
 
-        benchmark_machines = self.benchmark_machines * math.ceil(len(valid_configs) // len(self.benchmark_machines))
-
-        max_workers = min(len(valid_configs), os.cpu_count() - 1)
         futures_to_config = {}
-        with ProcessPoolExecutor(max_workers=max_workers) as pool:
-            for config, machine in zip(valid_configs, benchmark_machines):
-                future = pool.submit(
-                    profile_kernel,
-                    func=self.kernel,
-                    args=self.kernel_args,
-                    cache_dir=self.cache_dir,
-                    configs=config,
-                    warmup=self.warmup,
-                    iters=self.iters,
-                    device_lock=device_locks[machine],
-                    benchmark_machine=machine,
-                )
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            for config in valid_configs:
+                utils.set_kernel(self.kernel)
+                future = executor.submit(create_and_compile_nki_kernel, self.kernel_args, config, self.cache_dir)
                 futures_to_config[future] = config
 
-        neff_files = []
-        for future in futures_to_config:
-            config = futures_to_config[future]
+        for future in tqdm(futures_to_config, total=len(futures_to_config), desc="Compiling kernels"):
             try:
-                result, neff_file = future.result()
-                neff_files.append(neff_file)
+                neff = future.result()
             except Exception as e:
-                result = PerformanceResult(config, float("inf"), error=e)
-                warnings.warn(
-                    f"Warning: failed for config {config}, reason: {e} ({type(e)})",
-                    category=RuntimeWarning,
-                    stacklevel=2,
-                )
-            self.perf_results.append(result)
-            self.perf_results.save(cache_dir=self.cache_dir)
-        if self.trace:
-            self._trace_neffs(neff_files)
-        return None
+                print(f"Error in worker process: {str(e)} {type(e)}")
+
+        # device_locks = {machine: multiprocessing.Manager().Lock() for machine in self.benchmark_machines}
+
+        # futures_to_config = {}
+        # with ProcessPoolExecutor(max_workers=num_workers) as pool:
+        #     for config, machine in zip(valid_configs, benchmark_machines):
+        #         future = pool.submit(
+        #             profile_kernel,
+        #             func=self.kernel,
+        #             args=self.kernel_args,
+        #             cache_dir=self.cache_dir,
+        #             configs=config,
+        #             warmup=self.warmup,
+        #             iters=self.iters,
+        #             device_lock=device_locks[machine],
+        #             benchmark_machine=machine,
+        #         )
+        #         futures_to_config[future] = config
+
+        # neff_files = []
+        # for future in futures_to_config:
+        #     config = futures_to_config[future]
+        #     try:
+        #         result, neff_file = future.result()
+        #         neff_files.append(neff_file)
+        #     except Exception as e:
+        #         result = PerformanceResult(config, float("inf"), error=e)
+        #         warnings.warn(
+        #             f"Warning: failed for config {config}, reason: {e} ({type(e)})",
+        #             category=RuntimeWarning,
+        #             stacklevel=2,
+        #         )
+        #     self.perf_results.append(result)
+        #     self.perf_results.save(cache_dir=self.cache_dir)
+        # if self.trace:
+        #     self._trace_neffs(neff_files)
+        # return None
 
     def _prune(self) -> List[dict]:
         """
         Pruning func should throw a fail if the inputs are illegal
         """
         valid_configs = []
-        arg_shapes = [arg.tensor_shape for arg in self.kernel_args]
+        invalid_configs = []
+        arg_shapes = [arg.shape for arg in self.kernel_args]
         for config in self.configs:
             try:
                 if self.pruning_func is not None:
                     self.pruning_func(*arg_shapes, **config)
                 valid_configs.append(config)
             except Exception as e:
-                print(f"Prune invalid config {config}, reason: {e} ({type(e)})")
+                invalid_configs.append((config, e))
             if self.max_configs and len(valid_configs) == self.max_configs:
                 break
         assert valid_configs, f"No valid autotune configs found"
