@@ -4,6 +4,7 @@ import shutil
 import time
 from typing import Dict, List, Tuple
 
+import numpy as np
 from neuronxcc.nki.typing import tensor
 
 home_dir = os.environ["HOME"]
@@ -14,9 +15,9 @@ TUNED_CACHE_DIR = f"{CACHE_ROOT_DIR}/tuned"
 VISUALIZATION_DIR = f"{CACHE_ROOT_DIR}/plots"
 
 
-def get_hash_name(kernel, kernel_args: Tuple[tensor, ...], configs: Dict):
+def get_hash_name(kernel, kernel_args: Tuple[np.ndarray, ...], configs: Dict):
     kernel_str = str(kernel)
-    kernel_args_str = parse_tensor_shapes([str(arg.tensor_shape) for arg in kernel_args])
+    kernel_args_str = parse_tensor_shapes([str(arg.shape) for arg in kernel_args])
     configs_str = dict_to_string(configs)
     timestamp = str(time.time())
     combined_str = f"{kernel_str}_{kernel_args_str}_{configs_str}_{timestamp}"

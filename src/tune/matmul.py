@@ -7,6 +7,8 @@ from typing import Dict, List
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
+import numpy as np
+from neuronpy.core.language import bfloat16
 
 from src.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
 from src.cache.visualize import plot_pe_vs_k_comparison
@@ -60,19 +62,19 @@ def profile():
     dtype = nl.bfloat16
     MNK = list(product([2048], [4096], [2048]))
     for M, N, K in MNK:
-        lhsT = nt.tensor[[K, M], dtype]
-        rhs = nt.tensor[[K, N], dtype]
+        lhsT = np.zeros((K, M), dtype=bfloat16)
+        rhs = np.zeros((K, N), dtype=bfloat16)
 
-        baseline_tuner = Autotune(
-            kernel=baseline,
-            kernel_args=(lhsT, rhs),
-            configs=[{"TILES_IN_BLOCK_M": 16, "TILES_IN_BLOCK_N": 2, "TILES_IN_BLOCK_K": 8}],
-            max_configs=1,
-            pruning_func=MatMulCompatibility,
-            cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
-            trace=False,
-        )
-        baseline_tuner()
+        # baseline_tuner = Autotune(
+        #     kernel=baseline,
+        #     kernel_args=(lhsT, rhs),
+        #     configs=[{"TILES_IN_BLOCK_M": 16, "TILES_IN_BLOCK_N": 2, "TILES_IN_BLOCK_K": 8}],
+        #     max_configs=1,
+        #     pruning_func=MatMulCompatibility,
+        #     cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
+        #     trace=False,
+        # )
+        # baseline_tuner()
 
         tuner = Autotune(
             kernel=matmul_main,
