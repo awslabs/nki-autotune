@@ -26,9 +26,9 @@ def get_autotune_configs() -> List[Dict]:
     NUM_BLOCK_M_options = [1, 2, 4, 8, 16, 32, 64]
     NUM_BLOCK_N_options = [1, 2, 4, 8, 16, 32, 64]
     NUM_BLOCK_K_options = [1, 2, 4, 8, 16, 32, 64]
-    BUFFER_M_options = [1, 2, 4, 8]
-    BUFFER_N_options = [1, 2, 4, 8]
-    BUFFER_K_options = [1, 2, 4, 8]
+    BUFFER_M_options = NUM_BLOCK_M_options
+    BUFFER_N_options = NUM_BLOCK_N_options
+    BUFFER_K_options = NUM_BLOCK_K_options
     loop_orders = ["".join(p) for p in permutations("MNK")]
     params = list(
         product(
@@ -58,8 +58,9 @@ def get_autotune_configs() -> List[Dict]:
 
 
 def profile():
-    shapes = [2048, 4096, 8192]
-    MNK = list(product(shapes, shapes, shapes))
+    mn_shapes = [1024, 2048, 4096, 8192]
+    k_shapes = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+    MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     for M, N, K in MNK:
         lhsT = np.zeros((K, M), dtype=bfloat16)
         rhs = np.zeros((K, N), dtype=bfloat16)
