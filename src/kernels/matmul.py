@@ -466,9 +466,9 @@ def baseline(
     BLOCK_K = TILE_K * TILES_IN_BLOCK_K
 
     # the size has to be multiple of block size
-    assert M % BLOCK_M == 0
-    assert N % BLOCK_N == 0
-    assert K % BLOCK_K == 0
+    assert M % BLOCK_M == 0, f"M {M} is not multiples of BLOCK_M {BLOCK_M}"
+    assert N % BLOCK_N == 0, f"N {N} is not multiples of BLOCK_N {BLOCK_N}"
+    assert K % BLOCK_K == 0, f"K {K} is not multiples of BLOCK_K {BLOCK_K}"
 
     NUM_BLOCK_M = M // BLOCK_M
     NUM_BLOCK_N = N // BLOCK_N
