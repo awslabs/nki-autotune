@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 # Import the NKI kernel implementation - assuming this file exists
 from src.kernels.matmul import baseline
+from src.tune.utils import create_spike_kernel
 
 # Constants
 WARMUP_ITER_DEFAULT = 5
@@ -104,7 +105,7 @@ def create_and_compile_nki_kernel(size_and_meta, output_dir):
         return (size, meta_params), {"status": "error", "error": str(e)}
 
 
-def benchmark_nki_matmul(warmup_iter=WARMUP_ITER_DEFAULT, bench_iter=BENCH_ITER_DEFAULT):
+def benchmark_nki_matmul(kernel, warmup_iter=WARMUP_ITER_DEFAULT, bench_iter=BENCH_ITER_DEFAULT):
     """Benchmark NKI matrix multiplication across different sizes and meta-parameters"""
     print("\n" + "=" * 80)
     print("NKI MATRIX MULTIPLICATION BENCHMARK")
@@ -161,15 +162,13 @@ def benchmark_nki_matmul(warmup_iter=WARMUP_ITER_DEFAULT, bench_iter=BENCH_ITER_
             lhs_t = np.zeros((k, m), dtype=bfloat16)
             rhs = np.zeros((k, n), dtype=bfloat16)
 
-            traced_kernel = baseline
-            traced_kernel.specialize(
-                lhs_t, rhs, TILES_IN_BLOCK_M=tiles_m, TILES_IN_BLOCK_N=tiles_n, TILES_IN_BLOCK_K=tiles_k
-            )
-
+            args = (lhs_t, rhs)
+            configs = {"TILES_IN_BLOCK_M": tiles_m, "TILES_IN_BLOCK_N": tiles_n, "TILES_IN_BLOCK_K": tiles_k}
             neff_path = result["neff_path"]
-            kernel = CompiledKernel(traced_kernel, neff_path)
 
-            compiled_kernels[(size, meta_params)] = (kernel, lhs_t, rhs)
+            spike_kernel = create_spike_kernel(neff_path, kernel, args, configs)
+
+            compiled_kernels[(size, meta_params)] = (spike_kernel, lhs_t, rhs)
 
     print(f"Successfully processed {len(compiled_kernels)} out of {len(size_meta_combinations)} NKI kernels")
 
@@ -233,7 +232,7 @@ def benchmark_nki_matmul(warmup_iter=WARMUP_ITER_DEFAULT, bench_iter=BENCH_ITER_
 def main():
     """Main function to run the benchmarks"""
 
-    benchmark_nki_matmul(WARMUP_ITER_DEFAULT, BENCH_ITER_DEFAULT)
+    benchmark_nki_matmul(baseline, WARMUP_ITER_DEFAULT, BENCH_ITER_DEFAULT)
 
     print("\nBenchmark completed successfully.")
 
