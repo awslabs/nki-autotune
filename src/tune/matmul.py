@@ -9,6 +9,7 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from src.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
+from src.cache.parameter_importance import analyze_and_visualize
 from src.cache.visualize import plot_pe_vs_k_comparison
 from src.kernels.matmul import MatMulCompatibility, baseline, matmul_main
 from src.tune.autotune_kernel import Autotune
@@ -89,3 +90,4 @@ def profile():
 if __name__ == "__main__":
     profile()
     plot_pe_vs_k_comparison(tuned_dir=f"{TUNED_CACHE_DIR}/GEMM", baseline_dir=f"{BASELINE_CACHE_DIR}/GEMM")
+    analyze_and_visualize(f"{TUNED_CACHE_DIR}/GEMM")
