@@ -1,22 +1,21 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import multiprocessing
 import os
 import shutil
 import subprocess
-import warnings
 from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Dict, List, Tuple
 
 import numpy as np
+from neuronpy.runtime.spike import SpikeExecutor
 from neuronxcc.nki.compile import GenericKernel
 from tqdm import tqdm
 
 import src.tune.utils as utils
 from src.cache.directories import TUNED_CACHE_DIR, get_cache_dir, split_file_info
-from src.cache.results import PerformanceMetrics, PerformanceResult
-from src.tune.utils import create_and_compile_nki_kernel
+from src.cache.results import PerformanceMetrics
+from src.tune.utils import create_and_compile_nki_kernel, create_spike_kernel
 
 
 class Autotune:
@@ -43,7 +42,7 @@ class Autotune:
         self.warmup = warmup
         self.iters = iters
         self.pruning_func = pruning_func
-        self.perf_results = PerformanceMetrics()
+        self.results = PerformanceMetrics(sort_key="min_ms")
         if not cache_dir:
             self.cache_dir = get_cache_dir(cache_root_dir=TUNED_CACHE_DIR, kernel=kernel, kernel_args=kernel_args)
         else:
@@ -58,55 +57,53 @@ class Autotune:
         valid_configs = self._prune()
         num_workers = min(len(valid_configs), os.cpu_count() - 1)
 
-        futures_to_config = {}
+        """
+        Parallel NKI compilation
+        TODO: support different NKI kernels
+        """
+        jobs = {}
+        for job_id, config in enumerate(valid_configs):
+            jobs[job_id] = {"config": config}
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for config in valid_configs:
+            for job_id in jobs:
                 utils.set_kernel(self.kernel)
-                future = executor.submit(create_and_compile_nki_kernel, self.kernel_args, config, self.cache_dir)
-                futures_to_config[future] = config
-
-        for future in tqdm(futures_to_config, total=len(futures_to_config), desc="Compiling kernels"):
+                future = executor.submit(
+                    create_and_compile_nki_kernel, self.kernel_args, jobs[job_id]["config"], self.cache_dir
+                )
+                jobs[job_id]["future"] = future
+        for job_id in tqdm(jobs, total=len(jobs), desc="Compiling kernels"):
+            future = jobs[job_id]["future"]
             try:
                 neff = future.result()
+                jobs[job_id]["neff"] = neff
             except Exception as e:
-                print(f"Error in worker process: {str(e)} {type(e)}")
+                # TODO: pass error to final results
+                print(f"Error in NKI compilation: {str(e)} {type(e)}")
 
-        # device_locks = {machine: multiprocessing.Manager().Lock() for machine in self.benchmark_machines}
+        for job_id in jobs:
+            jobs[job_id]["spike_kernel"] = create_spike_kernel(
+                jobs[job_id]["neff"], self.kernel, self.kernel_args, jobs[job_id]["config"]
+            )
 
-        # futures_to_config = {}
-        # with ProcessPoolExecutor(max_workers=num_workers) as pool:
-        #     for config, machine in zip(valid_configs, benchmark_machines):
-        #         future = pool.submit(
-        #             profile_kernel,
-        #             func=self.kernel,
-        #             args=self.kernel_args,
-        #             cache_dir=self.cache_dir,
-        #             configs=config,
-        #             warmup=self.warmup,
-        #             iters=self.iters,
-        #             device_lock=device_locks[machine],
-        #             benchmark_machine=machine,
-        #         )
-        #         futures_to_config[future] = config
+        with SpikeExecutor(verbose=0) as spike:
+            for job_id in jobs:
+                # FIXME: args are used, kwargs are needed to run but not used
+                # TODO: pass error to final results
+                stats = spike.benchmark(
+                    jobs[job_id]["spike_kernel"],
+                    *self.kernel_args,
+                    **jobs[job_id]["config"],
+                    warmup_iterations=self.warmup,
+                    benchmark_iterations=self.iters,
+                    device_id=0,
+                )
+                self.results.add_result(config=jobs[job_id]["config"], **stats)
 
-        # neff_files = []
-        # for future in futures_to_config:
-        #     config = futures_to_config[future]
-        #     try:
-        #         result, neff_file = future.result()
-        #         neff_files.append(neff_file)
-        #     except Exception as e:
-        #         result = PerformanceResult(config, float("inf"), error=e)
-        #         warnings.warn(
-        #             f"Warning: failed for config {config}, reason: {e} ({type(e)})",
-        #             category=RuntimeWarning,
-        #             stacklevel=2,
-        #         )
-        #     self.perf_results.append(result)
-        #     self.perf_results.save(cache_dir=self.cache_dir)
-        # if self.trace:
-        #     self._trace_neffs(neff_files)
-        # return None
+        self.results.save(cache_dir=self.cache_dir)
+        if self.trace:
+            for job_id in tqdm(jobs, total=len(jobs), desc="Tracing NEFFs"):
+                self._trace_neff(jobs[job_id]["neff"])
+        return None
 
     def _prune(self) -> List[dict]:
         """
@@ -127,7 +124,7 @@ class Autotune:
         assert valid_configs, f"No valid autotune configs found"
         return valid_configs
 
-    def _trace_neffs(self, neff_files: List[str]):
+    def _trace_neff(self, neff_file: str):
         """
         Generate trace profiles for compiled kernel files.
 
@@ -137,7 +134,7 @@ class Autotune:
         3. Creating an upload command for the profile data and logging it
 
         Args:
-            neff_files (List[str]): List of paths to NEFF files to be traced.
+            neff_files (str): NEFF file to be traced.
 
         Raises:
             AssertionError: If any of the provided files is not a .neff file.
@@ -146,15 +143,12 @@ class Autotune:
             This method is used when the 'trace' flag is set to True, allowing
             for detailed performance analysis of the compiled kernels.
         """
-        for neff_file in neff_files:
-            directory, neff_name, file_type = split_file_info(neff_file)
-            assert file_type == "neff", f"{neff_file} is not a .neff file."
-            ntff_file = f"{directory}/{neff_name}.ntff"
-            trace_cmd = f"neuron-profile capture -n {neff_file} --profile-nth-exec={self.iters}"
-            subprocess.run(trace_cmd, shell=True)
-            shutil.move(f"profile_exec_{self.iters}.ntff", ntff_file)
-            upload_command = (
-                f'profile-upload -F "neff=@{neff_name}.neff" -F "ntff=@{neff_name}.ntff" -F name={neff_name}'
-            )
-            with open(f"{self.cache_dir}/upload_profile.log", "a") as f:
-                f.write(f"{upload_command}\n")
+        directory, neff_name, file_type = split_file_info(neff_file)
+        assert file_type == "neff", f"{neff_file} is not a .neff file."
+        ntff_file = f"{directory}/{neff_name}.ntff"
+        trace_cmd = f"neuron-profile capture -n {neff_file} --profile-nth-exec={self.iters}"
+        subprocess.run(trace_cmd, shell=True)
+        shutil.move(f"profile_exec_{self.iters}.ntff", ntff_file)
+        upload_command = f'profile-upload -F "neff=@{neff_name}.neff" -F "ntff=@{neff_name}.ntff" -F name={neff_name}'
+        with open(f"{self.cache_dir}/upload_profile.log", "a") as f:
+            f.write(f"{upload_command}\n")

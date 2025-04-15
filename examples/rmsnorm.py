@@ -10,8 +10,6 @@ from neuronxcc.starfish.support.util import allclose
 
 from src.golden.rmsnorm_linear import rmsnorm_linear_golden
 from src.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear
-from src.tune.autotune_kernel import Autotune
-from src.tune.benchmark import profile_kernel
 
 if __name__ == "__main__":
     batch, M, K, N = 1, 2048, 4096, 512

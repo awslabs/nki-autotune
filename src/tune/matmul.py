@@ -5,8 +5,6 @@ import random
 from itertools import permutations, product
 from typing import Dict, List
 
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.typing as nt
 import numpy as np
 from neuronpy.core.language import bfloat16
 
@@ -59,28 +57,28 @@ def get_autotune_configs() -> List[Dict]:
 
 
 def profile():
-    dtype = nl.bfloat16
-    MNK = list(product([2048], [4096], [2048]))
+    shapes = [2048, 4096, 8192]
+    MNK = list(product(shapes, shapes, shapes))
     for M, N, K in MNK:
         lhsT = np.zeros((K, M), dtype=bfloat16)
         rhs = np.zeros((K, N), dtype=bfloat16)
 
-        # baseline_tuner = Autotune(
-        #     kernel=baseline,
-        #     kernel_args=(lhsT, rhs),
-        #     configs=[{"TILES_IN_BLOCK_M": 16, "TILES_IN_BLOCK_N": 2, "TILES_IN_BLOCK_K": 8}],
-        #     max_configs=1,
-        #     pruning_func=MatMulCompatibility,
-        #     cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
-        #     trace=False,
-        # )
-        # baseline_tuner()
+        baseline_tuner = Autotune(
+            kernel=baseline,
+            kernel_args=(lhsT, rhs),
+            configs=[{"TILES_IN_BLOCK_M": 16, "TILES_IN_BLOCK_N": 2, "TILES_IN_BLOCK_K": 8}],
+            max_configs=1,
+            pruning_func=MatMulCompatibility,
+            cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
+            trace=False,
+        )
+        baseline_tuner()
 
         tuner = Autotune(
             kernel=matmul_main,
             kernel_args=(lhsT, rhs),
             configs=get_autotune_configs(),
-            max_configs=4,
+            max_configs=100,
             pruning_func=MatMulCompatibility,
             cache_dir=f"{TUNED_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
             trace=False,
@@ -90,4 +88,4 @@ def profile():
 
 if __name__ == "__main__":
     profile()
-    # plot_pe_vs_k_comparison(tuned_dir=f"{TUNED_CACHE_DIR}/GEMM", baseline_dir=f"{BASELINE_CACHE_DIR}/GEMM")
+    plot_pe_vs_k_comparison(tuned_dir=f"{TUNED_CACHE_DIR}/GEMM", baseline_dir=f"{BASELINE_CACHE_DIR}/GEMM")
