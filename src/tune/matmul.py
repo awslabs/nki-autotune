@@ -58,8 +58,10 @@ def get_autotune_configs() -> List[Dict]:
 
 
 def profile():
-    mn_shapes = [1024, 2048, 4096, 8192]
-    k_shapes = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+    mn_shapes = [2048, 4096, 8192]
+    k_shapes = [1024, 2048, 4096, 8192, 16384]
+    mn_shapes = [1024]
+    k_shapes = [1024]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     for M, N, K in MNK:
         lhsT = np.zeros((K, M), dtype=bfloat16)

@@ -76,27 +76,26 @@ class Autotune:
             try:
                 neff = future.result()
                 jobs[job_id]["neff"] = neff
+                jobs[job_id]["spike_kernel"] = create_spike_kernel(
+                    jobs[job_id]["neff"], self.kernel, self.kernel_args, jobs[job_id]["config"]
+                )
             except Exception as e:
-                # TODO: pass error to final results
-                print(f"Error in NKI compilation: {str(e)} {type(e)}")
-
-        for job_id in jobs:
-            jobs[job_id]["spike_kernel"] = create_spike_kernel(
-                jobs[job_id]["neff"], self.kernel, self.kernel_args, jobs[job_id]["config"]
-            )
+                jobs[job_id]["error"] = str(e)
 
         with SpikeExecutor(verbose=0) as spike:
             for job_id in jobs:
                 # FIXME: args are used, kwargs are needed to run but not used
-                # TODO: pass error to final results
-                stats = spike.benchmark(
-                    jobs[job_id]["spike_kernel"],
-                    *self.kernel_args,
-                    **jobs[job_id]["config"],
-                    warmup_iterations=self.warmup,
-                    benchmark_iterations=self.iters,
-                    device_id=0,
-                )
+                if "error" in jobs[job_id]:
+                    stats = {"error": jobs[job_id]["error"], "min_ms": float("inf")}
+                else:
+                    stats = spike.benchmark(
+                        jobs[job_id]["spike_kernel"],
+                        *self.kernel_args,
+                        **jobs[job_id]["config"],
+                        warmup_iterations=self.warmup,
+                        benchmark_iterations=self.iters,
+                        device_id=0,
+                    )
                 self.results.add_result(config=jobs[job_id]["config"], **stats)
 
         self.results.save(cache_dir=self.cache_dir)
