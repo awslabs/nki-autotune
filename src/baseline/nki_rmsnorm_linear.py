@@ -1,5 +1,4 @@
 import os
-import pickle
 import shutil
 from itertools import product
 
@@ -9,7 +8,7 @@ import neuronxcc.nki.typing as nt
 from src.cache.directories import NKI_CACHE_DIR, get_cache_dir
 from src.cache.results import PerformanceMetrics
 from src.kernels.rmsnorm_linear import stack_allocated_fused_rms_norm_qkv
-from src.tune.benchmark import profile_kernel
+from src.tune.metrics import profile_kernel
 
 
 def profile(kernel):

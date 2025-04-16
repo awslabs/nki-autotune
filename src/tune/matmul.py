@@ -10,7 +10,7 @@ from src.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
 from src.cache.parameter_importance import analyze_and_visualize
 from src.cache.visualize import plot_pe_vs_k_comparison
 from src.kernels.matmul import MatMulCompatibility, baseline, matmul_main
-from src.tune.autotune_kernel import Autotune
+from src.tune.benchmark import Benchmark
 from src.tune.job import ProfileJobs
 
 
@@ -74,11 +74,11 @@ def profile():
             pruning_func=MatMulCompatibility,
             **{"TILES_IN_BLOCK_M": 16, "TILES_IN_BLOCK_N": 2, "TILES_IN_BLOCK_K": 8},
         )
-        baseline_tuner = Autotune(jobs=jobs, cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
+        baseline_tuner = Benchmark(jobs=jobs, cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
         baseline_tuner()
 
         jobs = get_autotune_jobs(M, N, K)
-        tuner = Autotune(jobs=jobs, cache_dir=f"{TUNED_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
+        tuner = Benchmark(jobs=jobs, cache_dir=f"{TUNED_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
         tuner()
 
 

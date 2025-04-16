@@ -1,37 +1,107 @@
-from typing import Dict, Tuple
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+import shutil
+import subprocess
+from concurrent.futures import Future, ProcessPoolExecutor
+from typing import Dict
+
+from neuronpy.runtime.spike import SpikeExecutor
+from tqdm import tqdm
+
+import src.tune.utils as utils
+from src.cache.directories import split_file_info
+from src.cache.results import PerformanceMetrics
+from src.tune.job import ProfileJob, ProfileJobs
+from src.tune.utils import compile_nki_kernel, create_spike_kernel
 
 
-def calculate_pe_utilization(
-    lhsT_shape: Tuple[int, ...], rhs_shape: Tuple[int, ...], time_ms: float, target_instance_family: str
-) -> float:
+class Benchmark:
     """
-    Calculate hardware FLOPS utilization for a GEMM operation.
-
-    Parameters:
-    lhsT_shape (tuple): Shape of matrix A (k, m)
-    rhs_shape (tuple): Shape of matrix B (k, n)
-    time_ms (float): Execution time in milliseconds
-
-    Returns:
-    dict: Dictionary containing FLOPS, TFLOPS, max TFLOPS, and utilization percentage
+    Compile and benchmark NKI kernel on NeuronDevice.
     """
-    k, m = lhsT_shape
-    _k, n = rhs_shape
-    assert k == _k, f"Incompatible matrix dimensions: {lhsT_shape} and {rhs_shape}"
 
-    if any(target_instance_family.startswith(family) for family in {"sunda", "trainium", "trn1", "inf2"}):
-        pe_freq = 2.8 * 1e9  # Hz (2.8 GHz)
-        num_lnc = 1
-    elif any(target_instance_family.startswith(family) for family in {"trn2", "inf3", "gen3", "cayman"}):
-        pe_freq = 2.4 * 1e9  # Hz (2.4 GHz)
-        num_lnc = 2
-    else:
-        raise NotImplementedError("Unknown target instance: " + target_instance_family)
+    def __init__(self, jobs: ProfileJobs, cache_dir: str, warmup: int = 10, iters: int = 100, trace: bool = False):
+        self.jobs = jobs
+        self.warmup = warmup
+        self.iters = iters
+        self.results = PerformanceMetrics(sort_key="min_ms")
+        if os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir)
+        os.makedirs(cache_dir)
+        self.cache_dir = cache_dir
+        self.trace = trace
 
-    # Calculate total FLOPS (2 operations per matrix element - multiply and add)
-    flops = 2 * m * k * n
-    actual_latency_s = time_ms / 1000
-    actual_pe_cycles = actual_latency_s * pe_freq
-    theoretical_pe_cycles = flops / (2 * 128 * 128 * num_lnc)
-    pe_utilization = theoretical_pe_cycles / actual_pe_cycles
-    return pe_utilization
+    def __call__(self):
+        num_workers = min(len(self.jobs), os.cpu_count() - 1)
+
+        """
+        Parallel NKI compilation
+        """
+        future_to_job: Dict[Future, ProfileJob] = {}
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            for job in self.jobs:
+                utils.set_kernel(job.kernel)
+                future = executor.submit(compile_nki_kernel, job.kernel_args, job.kwargs, self.cache_dir)
+                future_to_job[future] = job
+        for future in tqdm(future_to_job, total=len(future_to_job), desc="Compiling NKI kernels"):
+            job = future_to_job[future]
+            try:
+                neff = future.result()
+                spike_kernel = create_spike_kernel(neff, job.kernel, job.kernel_args, job.kwargs)
+                job.add_fields(neff=neff, spike_kernel=spike_kernel)
+            except Exception as e:
+                job.add_fields(error=str(e))
+
+        with SpikeExecutor(verbose=0) as spike:
+            for job in self.jobs:
+                if job.error:
+                    stats = {"error": job.error, "min_ms": float("inf")}
+                else:
+                    # FIXME: args are used, kwargs are needed to run but not used
+                    stats = spike.benchmark(
+                        job.spike_kernel,
+                        *job.kernel_args,
+                        **job.kwargs,
+                        warmup_iterations=self.warmup,
+                        benchmark_iterations=self.iters,
+                        device_id=0,
+                    )
+                self.results.add_result(config=job.kwargs, **stats)
+
+        self.results.save(cache_dir=self.cache_dir)
+        if self.trace:
+            for job in tqdm(self.jobs, total=len(self.jobs), desc="Tracing NEFFs"):
+                if job.neff:
+                    self._trace_neff(job.neff)
+        return None
+
+    def _trace_neff(self, neff_file: str):
+        """
+        Generate trace profiles for compiled kernel files.
+
+        This method processes each NEFF (Neuron Executable File Format) file by:
+        1. Capturing a trace profile using neuron-profile
+        2. Moving the resulting trace file (NTFF) to the appropriate location
+        3. Creating an upload command for the profile data and logging it
+
+        Args:
+            neff_files (str): NEFF file to be traced.
+
+        Raises:
+            AssertionError: If any of the provided files is not a .neff file.
+
+        Note:
+            This method is used when the 'trace' flag is set to True, allowing
+            for detailed performance analysis of the compiled kernels.
+        """
+        directory, neff_name, file_type = split_file_info(neff_file)
+        assert file_type == "neff", f"{neff_file} is not a .neff file."
+        ntff_file = f"{directory}/{neff_name}.ntff"
+        trace_cmd = f"neuron-profile capture -n {neff_file} --profile-nth-exec={self.iters}"
+        subprocess.run(trace_cmd, shell=True)
+        shutil.move(f"profile_exec_{self.iters}.ntff", ntff_file)
+        upload_command = f'profile-upload -F "neff=@{neff_name}.neff" -F "ntff=@{neff_name}.ntff" -F name={neff_name}'
+        with open(f"{self.cache_dir}/upload_profile.log", "a") as f:
+            f.write(f"{upload_command}\n")
