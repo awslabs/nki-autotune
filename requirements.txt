@@ -3,8 +3,6 @@ dill
 pytest
 seaborn
 pre-commit
-black==25.1.0
-isort==6.0.1
 
 --extra-index-url https://pip.repos.neuron.amazonaws.com
 wget

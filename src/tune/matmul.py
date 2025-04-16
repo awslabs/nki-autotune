@@ -1,9 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import random
 from itertools import permutations, product
-from typing import Dict, List
 
 import numpy as np
 from neuronpy.core.language import bfloat16
@@ -13,9 +11,10 @@ from src.cache.parameter_importance import analyze_and_visualize
 from src.cache.visualize import plot_pe_vs_k_comparison
 from src.kernels.matmul import MatMulCompatibility, baseline, matmul_main
 from src.tune.autotune_kernel import Autotune
+from src.tune.job import ProfileJobs
 
 
-def get_autotune_configs() -> List[Dict]:
+def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
     """
     Define a list of configuration dictionaries representing the specific design choices for autotuning.
 
@@ -23,9 +22,10 @@ def get_autotune_configs() -> List[Dict]:
         list: A list of dictionaries, each containing configuration parameters for NUM_BLOCK_M,
                 NUM_BLOCK_N, and NUM_BLOCK_K.
     """
-    NUM_BLOCK_M_options = [1, 2, 4, 8, 16, 32, 64]
-    NUM_BLOCK_N_options = [1, 2, 4, 8, 16, 32, 64]
-    NUM_BLOCK_K_options = [1, 2, 4, 8, 16, 32, 64]
+    size_options = [2, 4]
+    NUM_BLOCK_M_options = size_options
+    NUM_BLOCK_N_options = size_options
+    NUM_BLOCK_K_options = size_options
     BUFFER_M_options = NUM_BLOCK_M_options
     BUFFER_N_options = NUM_BLOCK_N_options
     BUFFER_K_options = NUM_BLOCK_K_options
@@ -41,7 +41,9 @@ def get_autotune_configs() -> List[Dict]:
             loop_orders,
         )
     )
-    configs = []
+    lhsT = np.zeros((K, M), dtype=bfloat16)
+    rhs = np.zeros((K, N), dtype=bfloat16)
+    jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order in params:
         config = {
             "NUM_BLOCK_M": NUM_BLOCK_M,
@@ -52,41 +54,31 @@ def get_autotune_configs() -> List[Dict]:
             "BUFFER_K": BUFFER_K,
             "loop_order": loop_order,
         }
-        configs.append(config)
-    random.shuffle(configs)
-    return configs
+        jobs.add_job(kernel=matmul_main, kernel_args=(lhsT, rhs), pruning_func=MatMulCompatibility, **config)
+    return jobs
 
 
 def profile():
     mn_shapes = [2048, 4096, 8192]
     k_shapes = [1024, 2048, 4096, 8192, 16384]
-    mn_shapes = [1024]
-    k_shapes = [1024]
+    mn_shapes = [2048]
+    k_shapes = [2048]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     for M, N, K in MNK:
         lhsT = np.zeros((K, M), dtype=bfloat16)
         rhs = np.zeros((K, N), dtype=bfloat16)
-
-        baseline_tuner = Autotune(
+        jobs = ProfileJobs()
+        jobs.add_job(
             kernel=baseline,
             kernel_args=(lhsT, rhs),
-            configs=[{"TILES_IN_BLOCK_M": 16, "TILES_IN_BLOCK_N": 2, "TILES_IN_BLOCK_K": 8}],
-            max_configs=1,
             pruning_func=MatMulCompatibility,
-            cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
-            trace=False,
+            **{"TILES_IN_BLOCK_M": 16, "TILES_IN_BLOCK_N": 2, "TILES_IN_BLOCK_K": 8},
         )
+        baseline_tuner = Autotune(jobs=jobs, cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
         baseline_tuner()
 
-        tuner = Autotune(
-            kernel=matmul_main,
-            kernel_args=(lhsT, rhs),
-            configs=get_autotune_configs(),
-            max_configs=100,
-            pruning_func=MatMulCompatibility,
-            cache_dir=f"{TUNED_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}",
-            trace=False,
-        )
+        jobs = get_autotune_jobs(M, N, K)
+        tuner = Autotune(jobs=jobs, cache_dir=f"{TUNED_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
         tuner()
 
 

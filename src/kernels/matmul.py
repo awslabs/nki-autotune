@@ -1,7 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple
 
 import neuronxcc.nki as nki
 import neuronxcc.nki.isa as nisa
@@ -9,14 +8,7 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki.compiler.backends.neuron.tensors import KernelHBMTensor
 from neuronxcc.nki.typing import tensor
 
-from src.kernels.utils import (
-    MatMulCompatibility,
-    load_tensor_block,
-    matmul_block,
-    matmul_blocks_lhs,
-    matmul_blocks_tile_transposed_lhs,
-    transpose_tiles_in_block,
-)
+from src.kernels.utils import MatMulCompatibility, load_tensor_block, matmul_block, matmul_blocks_lhs
 
 
 @nki.jit
@@ -117,12 +109,14 @@ def save_result_dma(result, result_tiles, block_id, m_ofs, n_ofs, TILE_K):
 def matmul_NMK(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
     for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
-            result_tiles = nl.zeros(
+            # Does it matter if we fold into free without block dimensions?
+            # Possible workaround for without blocking dimensions: list of tensors
+            result_block = nl.zeros(
                 (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
                 dtype=result.dtype,
                 buffer=nl.sbuf,
             )
-
+            # Hoist or not
             for block_id_K in nl.affine_range(mm.NUM_BLOCK_K, multi_buffer=mm.BUFFER_K):
                 # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
                 lhsT_tiles = load_tensor_block(
@@ -136,9 +130,9 @@ def matmul_NMK(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: Kerne
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
                 )
-                matmul_block(lhsT_tiles, rhs_tiles, result_tiles)
+                matmul_block(lhsT_tiles, rhs_tiles, result_block)
 
-            save_result_block(result, result_tiles, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
+            save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
     return result
 
 
@@ -333,6 +327,7 @@ def matmul_MKN(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: Kerne
 
                 matmul_block(lhsT_tiles, rhs_tiles, result_tiles[block_id_N])
 
+        # FIXME: double check the reduction.
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             """
             save_result_block(
