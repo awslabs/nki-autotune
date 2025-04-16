@@ -16,7 +16,7 @@ def set_kernel(kernel: GenericKernel):
     traced_kernel = kernel
 
 
-def create_and_compile_nki_kernel(kernel_args: Tuple[np.ndarray, ...], configs: Dict, output_dir: str) -> str:
+def compile_nki_kernel(kernel_args: Tuple[np.ndarray, ...], configs: Dict, output_dir: str) -> str:
     """Standalone function to create and compile a NKI kernel"""
     neff_name = get_hash_name(traced_kernel, kernel_args, configs)
     compile_dir = f"{output_dir}/{neff_name}"

@@ -5,7 +5,7 @@ import time
 from typing import Dict, List, Tuple
 
 import numpy as np
-from neuronxcc.nki.typing import tensor
+from neuronxcc.nki.compile import GenericKernel
 
 home_dir = os.environ["HOME"]
 CACHE_ROOT_DIR = f"{home_dir}/autotune-cache"
@@ -15,7 +15,7 @@ TUNED_CACHE_DIR = f"{CACHE_ROOT_DIR}/tuned"
 VISUALIZATION_DIR = f"{CACHE_ROOT_DIR}/plots"
 
 
-def get_hash_name(kernel, kernel_args: Tuple[np.ndarray, ...], configs: Dict):
+def get_hash_name(kernel: GenericKernel, kernel_args: Tuple[np.ndarray, ...], configs: Dict):
     kernel_str = str(kernel)
     kernel_args_str = parse_tensor_shapes([str(arg.shape) for arg in kernel_args])
     configs_str = dict_to_string(configs)
