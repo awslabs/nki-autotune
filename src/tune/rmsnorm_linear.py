@@ -3,7 +3,7 @@
 
 import os
 import random
-from itertools import permutations, product
+from itertools import product
 from typing import Dict, List
 
 import neuronxcc.nki.language as nl
@@ -11,7 +11,6 @@ import neuronxcc.nki.typing as nt
 
 from src.kernels.matmul import MatMulCompatibility
 from src.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear
-from src.tune.autotune_kernel import Autotune
 
 
 def get_autotune_configs() -> List[Dict]:

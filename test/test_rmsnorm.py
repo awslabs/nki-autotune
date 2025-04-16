@@ -16,7 +16,7 @@ from src.kernels.rmsnorm_linear import (
     stack_allocated_fused_rms_norm_qkv,
 )
 from src.kernels.rmsnorm_weighted import allocated_weighted_rmsnorm, weighted_rmsnorm
-from src.tune.benchmark import profile_kernel
+from src.tune.metrics import profile_kernel
 
 
 class RMSNormLinearTestConfig(GenTests):

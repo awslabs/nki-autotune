@@ -2,9 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-import math
 import os
-import pickle
 import re
 from collections import defaultdict
 
@@ -12,7 +10,7 @@ import matplotlib.pyplot as plt
 
 from src.cache.directories import VISUALIZATION_DIR
 from src.cache.results import PerformanceMetrics
-from src.tune.benchmark import calculate_pe_utilization
+from src.tune.metrics import calculate_pe_utilization
 
 
 def sort_lists_by_first(*lists):
