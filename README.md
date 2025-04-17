@@ -10,6 +10,17 @@ pre-commit install
 pip install -e .
 ```
 
+## BUILD
+Make sure you have the necessary build tools:
+```
+pip install --upgrade pip wheel build
+```
+Build the wheel:
+```
+python -m build --wheel
+```
+This will create a `.whl` file in the `dist/` directory, something like `dist/nki_autotune-0.1.0a0-py3-none-any.whl`.
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
