@@ -58,6 +58,7 @@ class Benchmark:
             for job in self.jobs:
                 if job.error:
                     stats = {"error": job.error, "min_ms": float("inf")}
+                    self.results.add_result(config=job.kwargs, error=job.error, min_ms=float("inf"))
                 else:
                     # FIXME: args are used, kwargs are needed to run but not used
                     stats = spike.benchmark(
@@ -68,7 +69,7 @@ class Benchmark:
                         benchmark_iterations=self.iters,
                         device_id=0,
                     )
-                self.results.add_result(config=job.kwargs, **stats)
+                    self.results.add_result(config=job.kwargs, neff=job.neff, **stats)
 
         self.results.save(cache_dir=self.cache_dir)
         if self.trace:
