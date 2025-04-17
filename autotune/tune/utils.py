@@ -6,7 +6,7 @@ from neuronpy.core.compile import compile_to_neff
 from neuronpy.runtime.spike import CompiledKernel
 from neuronxcc.nki.compile import GenericKernel
 
-from src.cache.directories import get_hash_name
+from autotune.cache.directories import get_hash_name
 
 traced_kernel = None
 

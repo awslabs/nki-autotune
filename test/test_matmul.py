@@ -1,6 +1,4 @@
-import random
 import sys
-import warnings
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -15,13 +13,8 @@ from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 from test_generation import GenTests
 
-from src.golden.gemm import gemm_core, gemm_cpu_golden
-from src.kernels.matmul import (
-    MatMulCompatibility,
-    gemm_with_non_transposed_lhs_MN,
-    gemm_with_non_transposed_lhs_MNK,
-    matmul_main,
-)
+from autotune.golden.gemm import gemm_core, gemm_cpu_golden
+from autotune.kernels.matmul import MatMulCompatibility, gemm_with_non_transposed_lhs_MN, matmul_main
 
 
 class GEMMTestConfig(GenTests):

@@ -9,8 +9,8 @@ from typing import Dict, List
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
 
-from src.kernels.matmul import MatMulCompatibility
-from src.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear
+from autotune.kernels.matmul import MatMulCompatibility
+from autotune.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear
 
 
 def get_autotune_configs() -> List[Dict]:

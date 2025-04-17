@@ -5,10 +5,10 @@ from itertools import product
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
 
-from src.cache.directories import NKI_CACHE_DIR, get_cache_dir
-from src.cache.results import PerformanceMetrics
-from src.kernels.rmsnorm_linear import stack_allocated_fused_rms_norm_qkv
-from src.tune.metrics import profile_kernel
+from autotune.cache.directories import NKI_CACHE_DIR, get_cache_dir
+from autotune.cache.results import PerformanceMetrics
+from autotune.kernels.rmsnorm_linear import stack_allocated_fused_rms_norm_qkv
+from autotune.tune.metrics import profile_kernel
 
 
 def profile(kernel):

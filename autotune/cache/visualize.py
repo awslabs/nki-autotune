@@ -8,9 +8,9 @@ from collections import defaultdict
 
 import matplotlib.pyplot as plt
 
-from src.cache.directories import VISUALIZATION_DIR
-from src.cache.results import PerformanceMetrics
-from src.tune.metrics import calculate_pe_utilization
+from autotune.cache.directories import VISUALIZATION_DIR
+from autotune.cache.results import PerformanceMetrics
+from autotune.tune.metrics import calculate_pe_utilization
 
 
 def sort_lists_by_first(*lists):

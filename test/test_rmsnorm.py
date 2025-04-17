@@ -8,15 +8,15 @@ from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 from test_generation import GenTests
 
-from src.golden.rmsnorm_linear import rmsnorm_linear_golden
-from src.kernels.matmul import MatMulCompatibility
-from src.kernels.rmsnorm_linear import (
+from autotune.golden.rmsnorm_linear import rmsnorm_linear_golden
+from autotune.kernels.matmul import MatMulCompatibility
+from autotune.kernels.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
     blocked_fused_rms_norm_linear,
     stack_allocated_fused_rms_norm_qkv,
 )
-from src.kernels.rmsnorm_weighted import allocated_weighted_rmsnorm, weighted_rmsnorm
-from src.tune.metrics import profile_kernel
+from autotune.kernels.rmsnorm_weighted import allocated_weighted_rmsnorm, weighted_rmsnorm
+from autotune.tune.metrics import profile_kernel
 
 
 class RMSNormLinearTestConfig(GenTests):

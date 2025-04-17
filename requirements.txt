@@ -3,8 +3,4 @@ dill
 pytest
 seaborn
 pre-commit
-
---extra-index-url https://pip.repos.neuron.amazonaws.com
-wget
-awscli
 neuronx-cc==2.*

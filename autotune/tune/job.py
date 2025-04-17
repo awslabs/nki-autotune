@@ -4,7 +4,7 @@ from typing import Callable, List, Tuple
 import numpy as np
 from neuronxcc.nki.compile import GenericKernel
 
-from src.cache.directories import get_hash_name
+from autotune.cache.directories import get_hash_name
 
 
 def dummy_pruning(*args, **kwargs):
