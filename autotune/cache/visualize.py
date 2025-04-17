@@ -3,6 +3,7 @@
 
 import json
 import os
+import random
 import re
 from collections import defaultdict
 
@@ -121,21 +122,28 @@ def plot_pe_vs_k(kernel_dir: str):
         plot_single_pe_vs_k(m, n, k_data, kernel_dir)
 
 
-def collect_pe_data(directory):
+def collect_pe_data_with_random_samples(directory, sample_sizes=[1, 10, "max"]):
     """
-    Collect PE utilization data for all MNK combinations in a directory.
+    Collect PE utilization data for all MNK combinations in a directory,
+    with random sampling of different sizes and selecting the best from each sample.
 
     Parameters:
     -----------
     directory : str
         Directory containing M-N-K subdirectories with perf_metrics.json files.
+    sample_sizes : list
+        List of sample sizes to collect. Use 'max' to use all available configs.
 
     Returns:
     --------
     dict
-        Dictionary mapping (M, N) pairs to dictionaries of K values and their PE utilization.
+        Dictionary mapping (M, N) pairs to dictionaries of K values and their PE utilization data
+        for different sample sizes.
     """
-    pe_utilization_data = defaultdict(dict)
+    pe_utilization_data = defaultdict(lambda: defaultdict(dict))
+
+    # Set random seed for reproducibility
+    random.seed(42)
 
     if not os.path.exists(directory):
         print(f"Directory not found: {directory}")
@@ -152,39 +160,110 @@ def collect_pe_data(directory):
             json_path = os.path.join(directory, dirname, "perf_metrics.json")
             if os.path.exists(json_path):
                 loaded_metrics = PerformanceMetrics.load(json_path)
-                best_config = loaded_metrics.get_best_result()
-                pe_utilization = calculate_pe_utilization((k, m), (k, n), best_config.min_ms, "trn1")
-                pe_utilization_data[(m, n)][k] = pe_utilization
+
+                # Get all results
+                all_results = loaded_metrics.results
+
+                # For each sample size
+                for size in sample_sizes:
+                    # Determine actual sample size
+                    if size == "max":
+                        actual_size = len(all_results)
+                    else:
+                        actual_size = min(size, len(all_results))
+
+                    if actual_size == 0:
+                        continue
+
+                    # Randomly sample configurations
+                    if actual_size < len(all_results):
+                        # Randomly sample without replacement
+                        sampled_results = random.sample(all_results, actual_size)
+                    else:
+                        # Use all results if asking for max or more than available
+                        sampled_results = all_results
+
+                    # Find the best configuration in this sample
+                    best_config = min(sampled_results, key=lambda r: r.min_ms)
+
+                    # Calculate PE utilization for the best config
+                    pe_util = calculate_pe_utilization((k, m), (k, n), best_config.min_ms, "trn1")
+
+                    # Store by actual sample size
+                    pe_utilization_data[(m, n)][k][actual_size] = pe_util
 
     return pe_utilization_data
 
 
 def plot_single_pe_vs_k_comparison(m, n, tuned_data, baseline_data):
     """
-    Create a single plot comparing tuned vs baseline PE utilization vs K for a specific (M, N) pair.
+    Create a single plot comparing tuned vs baseline PE utilization vs K for a specific (M, N) pair,
+    showing multiple sampling strategies for tuned data.
 
     Parameters:
     -----------
     m, n : int
         M and N dimensions.
     tuned_data : dict
-        Dictionary mapping K values to their respective PE utilization for tuned configs.
+        Nested dict mapping K values to sample sizes to PE utilization for tuned configs.
     baseline_data : dict
         Dictionary mapping K values to their respective PE utilization for baseline configs.
     """
     plt.figure(figsize=(10, 6))
 
+    # Define colors and styles for tuned data lines
+    tuned_styles = [
+        ("blue", "o-", "1-Sample Best"),
+        ("green", "s-", "10-Sample Best"),
+        ("purple", "d-", "All-Sample Best"),
+    ]
+
     # Plot tuned data if available
     if tuned_data:
+        # Get all K values
         k_values = sorted(tuned_data.keys())
-        pe_util_values = [tuned_data[k] for k in k_values]
-        plt.plot(k_values, pe_util_values, "o-", linewidth=2, color="blue", label="Tuned")
+
+        # Get all sample sizes from the data
+        all_sizes = set()
+        for k in k_values:
+            all_sizes.update(tuned_data[k].keys())
+        all_sizes = sorted(all_sizes)
+
+        # Plot each available sample size
+        for i, size in enumerate(all_sizes):
+            if i < len(tuned_styles):
+                color, style, label_base = tuned_styles[i]
+                label = f"{size}-Sample Best"
+
+                # Collect data for this sample size
+                pe_util_values = []
+                valid_k_values = []
+
+                for k in k_values:
+                    if size in tuned_data[k]:
+                        pe_util_values.append(tuned_data[k][size])
+                        valid_k_values.append(k)
+
+                # Only plot if we have data
+                if valid_k_values:
+                    plt.plot(valid_k_values, pe_util_values, style, linewidth=2, color=color, label=label)
 
     # Plot baseline data if available
     if baseline_data:
         k_values = sorted(baseline_data.keys())
-        pe_util_values = [baseline_data[k] for k in k_values]
-        plt.plot(k_values, pe_util_values, "s--", linewidth=2, color="red", label="Baseline")
+        pe_util_values = []
+        valid_k_values = []
+
+        for k in k_values:
+            # Get the max sample size (best we have for baseline)
+            max_size = max(baseline_data[k].keys()) if baseline_data[k] else 0
+            if max_size > 0:
+                pe_util_values.append(baseline_data[k][max_size])
+                valid_k_values.append(k)
+
+        if valid_k_values:
+            # FIXED: removed redundant color definition to avoid warning
+            plt.plot(valid_k_values, pe_util_values, "s--", linewidth=2, color="red", label="Baseline")
 
     plt.title(f"PE Utilization vs. K for M={m}, N={n}")
     plt.xlabel("K")
@@ -226,24 +305,22 @@ def plot_single_pe_vs_k_comparison(m, n, tuned_data, baseline_data):
 
 def plot_pe_vs_k_comparison(tuned_dir, baseline_dir):
     """
-    Create plots comparing PE utilization vs K for each unique (M, N) pair between tuned and baseline.
+    Create plots comparing PE utilization vs K for each unique (M, N) pair between tuned and baseline,
+    with multiple random sampling strategies for tuned data.
 
     Parameters:
     -----------
-    kernel : object
-        The kernel object containing func_name attribute.
-    tuned_cache_dir : str
-        Base cache directory for tuned results (TUNED_NKI_CACHE_DIR).
+    tuned_dir : str
+        Base cache directory for tuned results.
     baseline_dir : str
-        Base directory for baseline results, which contains GEMM directory.
+        Base directory for baseline results.
     """
-
     # Make sure output directory exists
     os.makedirs(VISUALIZATION_DIR, exist_ok=True)
 
-    # Collect data from tuned and baseline directories
-    tuned_data = collect_pe_data(tuned_dir)
-    baseline_data = collect_pe_data(baseline_dir)
+    # Collect data from tuned and baseline directories with random sampling
+    tuned_data = collect_pe_data_with_random_samples(tuned_dir, sample_sizes=[1, 10, "max"])
+    baseline_data = collect_pe_data_with_random_samples(baseline_dir, sample_sizes=["max"])
 
     # Get all unique (M, N) pairs from both datasets
     all_mn_pairs = set(tuned_data.keys()).union(baseline_data.keys())
