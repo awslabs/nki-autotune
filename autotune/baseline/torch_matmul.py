@@ -7,8 +7,8 @@ from typing import Tuple
 import torch
 from torch_xla.core import xla_model as xm
 
-from src.baseline.torch_utils import benchmark
-from src.cache.directories import TORCH_CACHE_DIR
+from autotune.baseline.torch_utils import benchmark
+from autotune.cache.directories import TORCH_CACHE_DIR
 
 
 def initialize_tensors(lhs_shape: Tuple, rhs_shape: Tuple, dtype):

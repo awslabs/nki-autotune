@@ -2,14 +2,11 @@ import os
 import pickle
 import shutil
 from itertools import product
-from typing import Tuple
 
 import torch
-import torch.nn.functional as F
-from torch_xla.core import xla_model as xm
 
-from src.baseline.torch_utils import benchmark, initialize_xla_tensor
-from src.cache.directories import TORCH_CACHE_DIR
+from autotune.baseline.torch_utils import benchmark, initialize_xla_tensor
+from autotune.cache.directories import TORCH_CACHE_DIR
 
 
 def silu(x):

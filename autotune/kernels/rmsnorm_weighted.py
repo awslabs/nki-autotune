@@ -10,7 +10,7 @@ import neuronxcc.nki.language as nl
 import numpy as np
 from neuronxcc.nki.language import par_dim
 
-from src.allocation.utils import update_base_addr
+from autotune.allocation.utils import update_base_addr
 
 
 @nki.jit

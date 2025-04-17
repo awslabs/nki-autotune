@@ -10,11 +10,11 @@ from typing import Dict
 from neuronpy.runtime.spike import SpikeExecutor
 from tqdm import tqdm
 
-import src.tune.utils as utils
-from src.cache.directories import split_file_info
-from src.cache.results import PerformanceMetrics
-from src.tune.job import ProfileJob, ProfileJobs
-from src.tune.utils import compile_nki_kernel, create_spike_kernel
+import autotune.tune.utils as utils
+from autotune.cache.directories import split_file_info
+from autotune.cache.results import PerformanceMetrics
+from autotune.tune.job import ProfileJob, ProfileJobs
+from autotune.tune.utils import compile_nki_kernel, create_spike_kernel
 
 
 class Benchmark:

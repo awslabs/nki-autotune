@@ -6,12 +6,12 @@ from itertools import permutations, product
 import numpy as np
 from neuronpy.core.language import bfloat16
 
-from src.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
-from src.cache.parameter_importance import analyze_and_visualize
-from src.cache.visualize import plot_pe_vs_k_comparison
-from src.kernels.matmul import MatMulCompatibility, baseline, matmul_main
-from src.tune.benchmark import Benchmark
-from src.tune.job import ProfileJobs
+from autotune.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
+from autotune.cache.parameter_importance import analyze_and_visualize
+from autotune.cache.visualize import plot_pe_vs_k_comparison
+from autotune.kernels.matmul import MatMulCompatibility, baseline, matmul_main
+from autotune.tune.benchmark import Benchmark
+from autotune.tune.job import ProfileJobs
 
 
 def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:

@@ -6,7 +6,6 @@ kernels - Fused normalization with linear layers
 """
 
 import math
-from typing import Tuple
 
 import neuronxcc.nki.compiler as ncc
 import neuronxcc.nki.isa as nisa
@@ -15,15 +14,13 @@ import numpy as np
 from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
-from src.allocation.utils import update_base_addr
-from src.kernels.utils import (
+from autotune.allocation.utils import update_base_addr
+from autotune.kernels.utils import (
     MatMulCompatibility,
     load_tensor_block,
-    matmul_blocks_lhs,
     matmul_blocks_tile_transposed_lhs,
     save_result_block,
     transpose_tile,
-    transpose_tiles_in_block,
 )
 
 
