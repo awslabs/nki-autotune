@@ -1,5 +1,5 @@
 import random
-from itertools import permutations, product
+from itertools import product
 from typing import Dict, List, Tuple
 
 

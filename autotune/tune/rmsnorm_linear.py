@@ -1,19 +1,18 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
-import random
 from itertools import product
-from typing import Dict, List
 
-import neuronxcc.nki.language as nl
-import neuronxcc.nki.typing as nt
+import numpy as np
+from neuronpy.core.language import bfloat16
 
-from autotune.kernels.matmul import MatMulCompatibility
-from autotune.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear
+from autotune.cache.directories import BASELINE_CACHE_DIR
+from autotune.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear, stack_allocated_fused_rms_norm_qkv
+from autotune.tune.benchmark import Benchmark
+from autotune.tune.job import ProfileJobs
 
 
-def get_autotune_configs() -> List[Dict]:
+def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
     """
     Define a list of configuration dictionaries representing the specific design choices for autotuning.
 
@@ -21,37 +20,48 @@ def get_autotune_configs() -> List[Dict]:
         List[Dict]: A list of dictionaries, each containing configuration parameters for
         NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N
     """
-    NUM_BLOCK_M_options = [1, 2, 4, 8]
-    NUM_BLOCK_N_options = [1, 2, 4, 8]
-    BUFFER_M_options = [1, 2, 4, 8]
-    BUFFER_N_options = [1, 2, 4, 8]
+    sizes = [1, 2, 4, 8, 16]
+    NUM_BLOCK_M_options = sizes
+    NUM_BLOCK_N_options = sizes
+    BUFFER_M_options = NUM_BLOCK_M_options
+    BUFFER_N_options = NUM_BLOCK_N_options
     params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, BUFFER_M_options, BUFFER_N_options))
-    configs = []
+
+    batch = 1
+    lhs = np.zeros((batch, M, K), dtype=bfloat16)
+    rhs = np.zeros((K, N), dtype=bfloat16)
+
+    jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N in params:
         config = {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "BUFFER_M": BUFFER_M, "BUFFER_N": BUFFER_N}
-        configs.append(config)
-    random.shuffle(configs)
-    return configs
+        jobs.add_job(kernel=blocked_fused_rms_norm_linear, kernel_args=(lhs, rhs), **config)
+    return jobs
 
 
-def profile():
+def get_baseline_jobs(M: int, N: int, K: int) -> ProfileJobs:
     batch = 1
-    dtype = nl.bfloat16
-    MNK = list(product([2048, 4096, 8192], [512], [2048, 4096, 8192]))
+    lhs = np.zeros((batch, M, K), dtype=bfloat16)
+    rhs = np.zeros((K, N), dtype=bfloat16)
+    jobs = ProfileJobs()
+    jobs.add_job(kernel=stack_allocated_fused_rms_norm_qkv, kernel_args=(lhs, rhs))
+    return jobs
+
+
+def profile(workload_name: str):
+    MNK = list(product([2048], [512], [8192]))
     for M, N, K in MNK:
-        lhs = nt.tensor[[batch, M, K], dtype]
-        rhs = nt.tensor[[K, N], dtype]
-        tuner = Autotune(
-            kernel=blocked_fused_rms_norm_linear,
-            kernel_args=(lhs, rhs),
-            configs=get_autotune_configs(),
-            max_configs=127,
-            pruning_func=MatMulCompatibility,
-            trace=True,
-        )
-        tuner()
+        baseline_jobs = get_baseline_jobs(M, N, K)
+        baseline_tuner = Benchmark(jobs=baseline_jobs, cache_dir=f"{BASELINE_CACHE_DIR}/{workload_name}/M{M}-N{N}-K{K}")
+        baseline_tuner()
+
+        # jobs = get_autotune_jobs(M, N, K)
+        # jobs = jobs.sample(100)
+        # tuner = Benchmark(jobs=jobs, cache_dir=f"{TUNED_CACHE_DIR}/{workload_name}/M{M}-N{N}-K{K}")
+        # tuner()
 
 
 if __name__ == "__main__":
-    os.environ["NEURON_CC_FLAGS"] = "--framework=XLA --target=trn1 --auto-cast=none"
-    profile()
+    workload_name = "fused_rmsnorm_GEMM"
+    profile(workload_name)
+    # plot_pe_vs_k_comparison(tuned_dir=f"{TUNED_CACHE_DIR}/{workload_name}", baseline_dir=f"{BASELINE_CACHE_DIR}/{workload_name}")
+    # analyze_and_visualize(f"{TUNED_CACHE_DIR}/{workload_name}")

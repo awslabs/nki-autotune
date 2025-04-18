@@ -16,13 +16,13 @@ VISUALIZATION_DIR = f"{CACHE_ROOT_DIR}/plots"
 
 
 def get_hash_name(kernel: GenericKernel, kernel_args: Tuple[np.ndarray, ...], configs: Dict):
-    kernel_str = str(kernel)
+    kernel_str = kernel.__name__
     kernel_args_str = parse_tensor_shapes([str(arg.shape) for arg in kernel_args])
     configs_str = dict_to_string(configs)
     timestamp = str(time.time())
     combined_str = f"{kernel_str}_{kernel_args_str}_{configs_str}_{timestamp}"
     hash_value = hashlib.sha256(combined_str.encode("utf-8")).hexdigest()
-    hash_name = f"{kernel.func_name}-{hash_value}"
+    hash_name = f"{kernel_str}-{hash_value}"
     return hash_name
 
 

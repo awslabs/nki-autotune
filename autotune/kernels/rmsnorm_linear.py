@@ -28,9 +28,9 @@ def compatibility_checks(hidden_shape, weights_shape):
     batch, seqlen, dim = hidden_shape
     _dim, head_dim = weights_shape
     pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
-    assert dim <= 8192 and dim & pmax == 0, "Unsupported hidden dimension"
-    assert _dim == dim, "Reduction dimension must match"
-    assert head_dim <= fmax, "Head dimension must be fmax (512) or less"
+    assert dim <= 8192 and dim & pmax == 0, f"Unsupported hidden dimension {dim}."
+    assert _dim == dim, f"Contraction dimensions do not match. Received {dim} and {_dim}."
+    assert head_dim <= fmax, f"Head dimension must be fmax (512) or less. Received {head_dim}."
 
 
 @nki.compiler.skip_middle_end_transformations
@@ -320,7 +320,7 @@ def blocked_fused_rms_norm_linear(
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
     assert len(lhs.shape) == 3, f"Expecting (batch, M, K) in LHS. Received {lhs.shape}."
-    mm = MatMulCompatibility(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
+    mm = MatMulCompatibility(lhs.shape[::-1], rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
     batch_size = lhs.shape[0]
     result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for batch_id in nl.affine_range(batch_size):

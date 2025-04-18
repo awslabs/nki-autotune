@@ -73,7 +73,7 @@ class MatMulCompatibility:
     def _check(self, K_, dimensions: List[str]):
         assert (
             self.K == K_
-        ), f"lhs and rhs contraction dimension mismatch, got lhs {self.M}, {self.K} and rhs {K_}, {self.N}"
+        ), f"lhs and rhs contraction dimension mismatch, got lhs ({self.M}, {self.K}) and rhs ({K_}, {self.N})"
         for dimension in dimensions:
             size = getattr(self, f"{dimension}")
             num_block = getattr(self, f"NUM_BLOCK_{dimension}")
