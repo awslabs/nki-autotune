@@ -6,12 +6,14 @@ from itertools import permutations, product
 import numpy as np
 from neuronpy.core.language import bfloat16
 
-from autotune.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
-from autotune.cache.parameter_importance import analyze_and_visualize
-from autotune.cache.visualize import plot_pe_vs_k_comparison
-from autotune.kernels.matmul import MatMulCompatibility, baseline, matmul_main
-from autotune.tune.benchmark import Benchmark
+from autotune.kernels.matmul import MatMulCompatibility, matmul_main
 from autotune.tune.job import ProfileJobs
+
+
+def matmul_xt_op(x_t, y):
+    """Matrix multiplication with transposed first operand"""
+    x = np.transpose(x_t, (1, 0))
+    return np.matmul(x, y)
 
 
 def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
@@ -66,24 +68,19 @@ def profile():
         lhsT = np.zeros((K, M), dtype=bfloat16)
         rhs = np.zeros((K, N), dtype=bfloat16)
         jobs = ProfileJobs()
-        jobs.add_job(
-            kernel=baseline,
-            kernel_args=(lhsT, rhs),
-            pruning_func=MatMulCompatibility,
-            TILES_IN_BLOCK_M=16,
-            TILES_IN_BLOCK_N=2,
-            TILES_IN_BLOCK_K=8,
-        )
-        baseline_tuner = Benchmark(jobs=jobs, cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
-        baseline_tuner()
+        jobs.add_job(kernel=matmul_xt_op, kernel_args=(lhsT, rhs), pruning_func=MatMulCompatibility)
+        print(jobs)
+        # baseline_tuner = Benchmark(jobs=jobs, cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
+        # baseline_tuner()
 
         jobs = get_autotune_jobs(M, N, K)
-        jobs = jobs.sample(200)
-        tuner = Benchmark(jobs=jobs, cache_dir=f"{TUNED_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
-        tuner()
+        jobs = jobs.sample(4)
+        print(jobs)
+        # tuner = Benchmark(jobs=jobs, cache_dir=f"{TUNED_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
+        # tuner()
 
 
 if __name__ == "__main__":
     profile()
-    plot_pe_vs_k_comparison(tuned_dir=f"{TUNED_CACHE_DIR}/GEMM", baseline_dir=f"{BASELINE_CACHE_DIR}/GEMM")
-    analyze_and_visualize(f"{TUNED_CACHE_DIR}/GEMM")
+    # plot_pe_vs_k_comparison(tuned_dir=f"{TUNED_CACHE_DIR}/GEMM", baseline_dir=f"{BASELINE_CACHE_DIR}/GEMM")
+    # analyze_and_visualize(f"{TUNED_CACHE_DIR}/GEMM")

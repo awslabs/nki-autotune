@@ -4,6 +4,8 @@
 import os
 import shutil
 import subprocess
+import sys
+import traceback
 from concurrent.futures import Future, ProcessPoolExecutor
 from typing import Dict
 
@@ -14,7 +16,7 @@ import autotune.tune.utils as utils
 from autotune.cache.directories import split_file_info
 from autotune.cache.results import PerformanceMetrics
 from autotune.tune.job import ProfileJob, ProfileJobs
-from autotune.tune.utils import compile_nki_kernel, create_spike_kernel
+from autotune.tune.utils import compile_kernel, create_spike_kernel
 
 
 class Benchmark:
@@ -37,29 +39,30 @@ class Benchmark:
         num_workers = min(len(self.jobs), os.cpu_count() - 1)
 
         """
-        Parallel NKI compilation
+        Parallel compilation
         """
         future_to_job: Dict[Future, ProfileJob] = {}
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             for job in self.jobs:
                 utils.set_kernel(job.kernel)
-                future = executor.submit(compile_nki_kernel, job.kernel_args, job.kwargs, self.cache_dir)
+                future = executor.submit(compile_kernel, job.name, job.kernel_args, job.kwargs, self.cache_dir)
                 future_to_job[future] = job
-        for future in tqdm(future_to_job, total=len(future_to_job), desc="Compiling NKI kernels"):
+        for future in tqdm(future_to_job, total=len(future_to_job), desc="Compiling kernels"):
             job = future_to_job[future]
             try:
                 neff = future.result()
                 spike_kernel = create_spike_kernel(neff, job.kernel, job.kernel_args, job.kwargs)
                 job.add_fields(neff=neff, spike_kernel=spike_kernel)
             except Exception as e:
-                job.add_fields(error=str(e))
+                # TODO: catch the entire stdout, stderr
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                error_string = f"{exc_type.__name__}: {str(e)}\n"
+                error_string += "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+                job.add_fields(error=error_string)
 
         with SpikeExecutor(verbose=0) as spike:
             for job in self.jobs:
-                if job.error:
-                    stats = {"error": job.error, "min_ms": float("inf")}
-                    self.results.add_result(config=job.kwargs, error=job.error, min_ms=float("inf"))
-                else:
+                if job.spike_kernel:
                     # FIXME: args are used, kwargs are needed to run but not used
                     stats = spike.benchmark(
                         job.spike_kernel,
@@ -70,6 +73,8 @@ class Benchmark:
                         device_id=0,
                     )
                     self.results.add_result(config=job.kwargs, neff=job.neff, **stats)
+                else:
+                    self.results.add_result(config=job.kwargs, error=job.error, min_ms=float("inf"))
 
         self.results.save(cache_dir=self.cache_dir)
         if self.trace:

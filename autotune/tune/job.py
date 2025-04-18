@@ -2,7 +2,6 @@ import random
 from typing import Callable, List, Tuple
 
 import numpy as np
-from neuronxcc.nki.compile import GenericKernel
 
 from autotune.cache.directories import get_hash_name
 
@@ -15,13 +14,7 @@ class ProfileJobs:
     def __init__(self) -> None:
         self.jobs: List[ProfileJob] = []
 
-    def add_job(
-        self,
-        kernel: GenericKernel,
-        kernel_args: Tuple[np.ndarray, ...],
-        pruning_func: Callable = dummy_pruning,
-        **kwargs,
-    ):
+    def add_job(self, kernel, kernel_args: Tuple[np.ndarray, ...], pruning_func: Callable = dummy_pruning, **kwargs):
         try:
             job = ProfileJob(kernel, kernel_args, pruning_func, **kwargs)
             job.prune()
@@ -58,12 +51,14 @@ class ProfileJobs:
         """Make ProfileJobs iterable."""
         return iter(self.jobs)
 
+    def __getitem__(self, index):
+        """Allow indexing to access individual profile jobs."""
+        return self.jobs[index]
+
 
 class ProfileJob:
-    def __init__(
-        self, kernel: GenericKernel, kernel_args: Tuple[np.ndarray, ...], pruning_func: Callable, **kwargs
-    ) -> None:
-        self.kernel: GenericKernel = kernel
+    def __init__(self, kernel, kernel_args: Tuple[np.ndarray, ...], pruning_func: Callable, **kwargs) -> None:
+        self.kernel = kernel
         self.kernel_args: Tuple[np.ndarray, ...] = kernel_args
         self.pruning_func = pruning_func
         self.kwargs = kwargs
@@ -78,7 +73,8 @@ class ProfileJob:
         kernel_name = getattr(self.kernel, "func_name", str(self.kernel))
         pruning_name = self.pruning_func.__name__
         kwargs_str = ", ".join(f"{k}={v}" for k, v in self.kwargs.items())
-        return f"ProfileJob(kernel={kernel_name}, shapes={arg_shapes}, pruning={pruning_name}, kwargs={{{kwargs_str}}}, name={self.name})"
+        repr_str = f"ProfileJob({type(self.kernel)} kernel={kernel_name}, shapes={arg_shapes}, pruning={pruning_name}, kwargs={{{kwargs_str}}}, name={self.name})"
+        return repr_str
 
     def __getattr__(self, name):
         """
