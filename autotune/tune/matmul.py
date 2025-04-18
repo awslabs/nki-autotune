@@ -6,18 +6,13 @@ from itertools import permutations, product
 import numpy as np
 from neuronpy.core.language import bfloat16
 
+from autotune.baseline.np_baselines import matmul_xt_op
 from autotune.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
 from autotune.cache.parameter_importance import analyze_and_visualize
 from autotune.cache.visualize import plot_pe_vs_k_comparison
 from autotune.kernels.matmul import MatMulCompatibility, matmul_main
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
-
-
-def matmul_xt_op(x_t, y):
-    """Matrix multiplication with transposed first operand"""
-    x = np.transpose(x_t, (1, 0))
-    return np.matmul(x, y)
 
 
 def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:

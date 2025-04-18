@@ -12,7 +12,6 @@ from typing import Dict
 from neuronpy.runtime.spike import SpikeExecutor
 from tqdm import tqdm
 
-import autotune.tune.utils as utils
 from autotune.cache.directories import split_file_info
 from autotune.cache.results import PerformanceMetrics
 from autotune.tune.job import ProfileJob, ProfileJobs
@@ -44,8 +43,9 @@ class Benchmark:
         future_to_job: Dict[Future, ProfileJob] = {}
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             for job in self.jobs:
-                utils.set_kernel(job.kernel)
-                future = executor.submit(compile_kernel, job.name, job.kernel_args, job.kwargs, self.cache_dir)
+                future = executor.submit(
+                    compile_kernel, job.kernel.__name__, job.name, job.kernel_args, job.kwargs, self.cache_dir
+                )
                 future_to_job[future] = job
         for future in tqdm(future_to_job, total=len(future_to_job), desc="Compiling kernels"):
             job = future_to_job[future]

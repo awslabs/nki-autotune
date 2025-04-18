@@ -1,10 +1,69 @@
 import glob
 import json
+import math
 import os
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+
+
+def safe_subtract(a, b):
+    """
+    Safely subtract b from a, handling infinity edge cases.
+
+    Args:
+        a: First operand
+        b: Second operand to subtract from a
+
+    Returns:
+        Result of a-b with proper infinity handling
+    """
+    if math.isinf(a) and math.isinf(b):
+        # If both are infinity with the same sign, return 0
+        if (a > 0 and b > 0) or (a < 0 and b < 0):
+            return 0
+        # If they have different signs, return a (since inf - (-inf) = inf)
+        return a
+    # Normal subtraction for all other cases
+    return a - b
+
+
+def safe_div(a, b):
+    """
+    Safely divide a by b, handling zero division and infinity edge cases.
+
+    Args:
+        a: Numerator
+        b: Denominator
+
+    Returns:
+        Result of a/b with proper handling of edge cases
+    """
+    # Both infinity case
+    if math.isinf(a) and math.isinf(b):
+        # Same sign infinities
+        if (a > 0 and b > 0) or (a < 0 and b < 0):
+            return 1.0
+        # Different sign infinities
+        return -1.0
+
+    # Zero division cases
+    if b == 0 or b < 0 and a > 0:
+        return float("inf")
+    if b == 0 or b < 0 and a < 0:
+        return float("-inf")
+    if a == 0 and b == 0:
+        return 1.0  # Equal values
+
+    # Infinity in numerator or denominator
+    if math.isinf(a) and b != 0:
+        return a if b > 0 else -a
+    if math.isinf(b):
+        return 0.0
+
+    # Standard division for normal cases
+    return a / b
 
 
 def analyze_parameter_importance(json_file):
@@ -33,8 +92,8 @@ def analyze_parameter_importance(json_file):
         worst_perf = performance_by_value.loc[worst_value, "mean"]
 
         # Calculate impact metrics
-        impact_range_ms = worst_perf - best_perf  # Absolute difference (ms)
-        impact_ratio = worst_perf / best_perf if best_perf > 0 else float("inf")  # How many times worse
+        impact_range_ms = safe_subtract(worst_perf, best_perf)  # Absolute difference (ms)
+        impact_ratio = safe_div(worst_perf, best_perf)  # How many times worse
 
         # Store results
         param_impact[param] = {
