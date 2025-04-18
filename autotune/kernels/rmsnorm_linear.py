@@ -35,7 +35,7 @@ def compatibility_checks(hidden_shape, weights_shape):
 
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
-def allocated_fused_rms_norm_qkv(hidden, weights, hidden_buffer_degree, eps):
+def allocated_fused_rms_norm_qkv(hidden, weights, hidden_buffer_degree: int, eps: float):
     """
     Allocated kernel that computes RMSNorm(hidden) @ wQKV. This kernel is designed to only handle fp16/bf16 tensor types.
     Internally, normalizations are cast to fp32 to avoid NaN errors.
@@ -320,7 +320,8 @@ def blocked_fused_rms_norm_linear(
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
     assert len(lhs.shape) == 3, f"Expecting (batch, M, K) in LHS. Received {lhs.shape}."
-    mm = MatMulCompatibility(lhs.shape[::-1], rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
+    lhsT_shape = (lhs.shape[0], lhs.shape[-1], lhs.shape[-2])
+    mm = MatMulCompatibility(lhsT_shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
     batch_size = lhs.shape[0]
     result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for batch_id in nl.affine_range(batch_size):

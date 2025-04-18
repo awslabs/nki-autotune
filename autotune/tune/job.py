@@ -14,7 +14,7 @@ class ProfileJobs:
     def __init__(self) -> None:
         self.jobs: List[ProfileJob] = []
 
-    def add_job(self, kernel, kernel_args: Tuple[np.ndarray, ...], pruning_func: Callable = dummy_pruning, **kwargs):
+    def add_job(self, kernel, kernel_args: Tuple[np.ndarray, ...], *, pruning_func: Callable = dummy_pruning, **kwargs):
         try:
             job = ProfileJob(kernel, kernel_args, pruning_func, **kwargs)
             job.prune()
