@@ -42,9 +42,8 @@ class GEMMTestConfig(GenTests):
 
         try:
             assert max(M, N, K) <= 8192, f"Input sizes are too large for testing"
-            GEMMCompatibility(
-                (M, K), (K, N), False, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
-            )
+            check = GEMMCompatibility(transposed_lhs=False)
+            check((M, K), (K, N), NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
             if "M" in config:
                 config_tuple = (M, N, K)
             else:

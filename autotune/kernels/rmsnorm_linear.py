@@ -320,8 +320,8 @@ def blocked_fused_rms_norm_linear(
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
     assert len(lhs.shape) == 3, f"Expecting (batch, M, K) in LHS. Received {lhs.shape}."
-    lhsT_shape = (lhs.shape[0], lhs.shape[-1], lhs.shape[-2])
-    mm = GEMMCompatibility(lhsT_shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
+    mm = GEMMCompatibility(transposed_lhs=False)
+    mm(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
     batch_size = lhs.shape[0]
     result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for batch_id in nl.affine_range(batch_size):

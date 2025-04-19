@@ -14,11 +14,13 @@ class GEMMCompatibility:
     divided into blocks and tiles according to hardware constraints.
     """
 
-    def __init__(
+    def __init__(self, transposed_lhs: bool) -> None:
+        self.transposed_lhs = transposed_lhs
+
+    def __call__(
         self,
         lhs_shape: Tuple[int, ...],
         rhs_shape: Tuple[int, ...],
-        transposed_lhs: bool,
         NUM_BLOCK_M: int = 1,
         NUM_BLOCK_N: int = 1,
         NUM_BLOCK_K: Optional[int] = None,  # Changed from -1 to None
@@ -48,12 +50,12 @@ class GEMMCompatibility:
 
         self.batch = None
         if len(lhs_shape) == 2:
-            if transposed_lhs:
+            if self.transposed_lhs:
                 self.K, self.M = lhs_shape
             else:
                 self.M, self.K = lhs_shape
         elif len(lhs_shape) == 3:
-            if transposed_lhs:
+            if self.transposed_lhs:
                 self.batch, self.K, self.M = lhs_shape
             else:
                 self.batch, self.M, self.K = lhs_shape

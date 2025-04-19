@@ -32,7 +32,8 @@ class RMSNormLinearTestConfig(GenTests):
 
         try:
             assert max(M, N, K) <= 8192, f"Input sizes are too large for testing"
-            GEMMCompatibility((M, K), (K, N), False, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
+            check = GEMMCompatibility(transposed_lhs=False)
+            check((M, K), (K, N), NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
             config_tuple = (batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, eps)
             return config_tuple
         except Exception as e:

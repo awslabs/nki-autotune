@@ -11,6 +11,7 @@ from autotune.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
 from autotune.cache.parameter_importance import analyze_and_visualize
 from autotune.cache.visualize import plot_pe_vs_k_comparison
 from autotune.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear, stack_allocated_fused_rms_norm_qkv
+from autotune.kernels.utils import GEMMCompatibility
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
 
@@ -37,14 +38,18 @@ def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
     jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N in params:
         config = {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "BUFFER_M": BUFFER_M, "BUFFER_N": BUFFER_N}
-        jobs.add_job(kernel=blocked_fused_rms_norm_linear, kernel_args=(lhs, rhs), **config)
+        jobs.add_job(
+            kernel=blocked_fused_rms_norm_linear,
+            kernel_args=(lhs, rhs),
+            pruning_func=GEMMCompatibility(transposed_lhs=False),
+            **config,
+        )
     return jobs
 
 
 def get_baseline_jobs(M: int, N: int, K: int) -> ProfileJobs:
     batch = 1
     lhs = np.zeros((batch, M, K), dtype=bfloat16)
-    lhsT = np.zeros((K, M), dtype=bfloat16)
     rhs = np.zeros((K, N), dtype=bfloat16)
     jobs = ProfileJobs()
     jobs.add_job(kernel=stack_allocated_fused_rms_norm_qkv, kernel_args=(lhs, rhs))
@@ -60,8 +65,8 @@ def profile(workload_name: str):
         baseline_tuner()
 
         jobs = get_autotune_jobs(M, N, K)
-        jobs = jobs.sample(10)
-        tuner = Benchmark(jobs=jobs, cache_dir=f"{TUNED_CACHE_DIR}/{workload_name}/M{M}-N{N}-K{K}")
+        sampled_jobs = jobs.sample(100)
+        tuner = Benchmark(jobs=sampled_jobs, cache_dir=f"{TUNED_CACHE_DIR}/{workload_name}/M{M}-N{N}-K{K}")
         tuner()
 
 

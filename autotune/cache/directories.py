@@ -8,6 +8,7 @@ import numpy as np
 from neuronxcc.nki.compile import GenericKernel
 
 home_dir = os.environ["HOME"]
+# FIXME: Organize the directories as workload_name/XXX_DIR
 CACHE_ROOT_DIR = f"{home_dir}/autotune-cache"
 TORCH_CACHE_DIR = f"{CACHE_ROOT_DIR}/torch"
 BASELINE_CACHE_DIR = f"{CACHE_ROOT_DIR}/baseline"
