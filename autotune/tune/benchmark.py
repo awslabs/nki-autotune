@@ -25,6 +25,8 @@ class Benchmark:
 
     def __init__(self, jobs: ProfileJobs, cache_dir: str, warmup: int = 10, iters: int = 100, trace: bool = False):
         self.jobs = jobs
+        if not self.jobs.has_valid_jobs:
+            raise ValueError(f"There are no valid jobs in {jobs}.")
         self.warmup = warmup
         self.iters = iters
         self.results = PerformanceMetrics(sort_key="min_ms")
@@ -35,14 +37,14 @@ class Benchmark:
         self.trace = trace
 
     def __call__(self):
-        num_workers = min(len(self.jobs), os.cpu_count() - 1)
+        num_workers = min(len(self.jobs.valid_jobs), os.cpu_count() - 1)
 
         """
         Parallel compilation
         """
         future_to_job: Dict[Future, ProfileJob] = {}
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for job in self.jobs:
+            for job in self.jobs.valid_jobs:
                 future = executor.submit(
                     compile_kernel, job.kernel.__name__, job.name, job.kernel_args, job.kwargs, self.cache_dir
                 )
@@ -61,7 +63,7 @@ class Benchmark:
                 job.add_fields(error=error_string)
 
         with SpikeExecutor(verbose=0) as spike:
-            for job in self.jobs:
+            for job in self.jobs.valid_jobs:
                 if job.spike_kernel:
                     # FIXME: args are used, kwargs are needed to run but not used
                     stats = spike.benchmark(
@@ -78,7 +80,7 @@ class Benchmark:
 
         self.results.save(cache_dir=self.cache_dir)
         if self.trace:
-            for job in tqdm(self.jobs, total=len(self.jobs), desc="Tracing NEFFs"):
+            for job in tqdm(self.jobs.valid_jobs, total=len(self.jobs.valid_jobs), desc="Tracing NEFFs"):
                 if job.neff:
                     self._trace_neff(job.neff)
         return None

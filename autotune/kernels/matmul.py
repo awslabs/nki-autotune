@@ -30,9 +30,8 @@ def matmul_main(
     BUFFER_K: int,
     loop_order: str,
 ):
-    mm = GEMMCompatibility(
-        lhsT.shape, rhs.shape, True, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
-    )
+    mm = GEMMCompatibility(transposed_lhs=True)
+    mm(lhsT.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
     assert loop_order in ["MNK", "MKN", "NMK", "NKM", "KMN", "KNM"], f"Loop order {loop_order} GEMM does not exist."
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
@@ -328,9 +327,8 @@ def gemm_with_non_transposed_lhs_MNK(
     BUFFER_N: int,
     BUFFER_K: int,
 ):
-    mm = GEMMCompatibility(
-        lhs.shape, rhs.shape, False, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
-    )
+    mm = GEMMCompatibility(transposed_lhs=False)
+    mm(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
@@ -368,9 +366,8 @@ def gemm_with_non_transposed_lhs_MN(
     BUFFER_N: int,
     BUFFER_K: int,
 ):
-    mm = GEMMCompatibility(
-        lhs.shape, rhs.shape, False, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
-    )
+    mm = GEMMCompatibility(transposed_lhs=False)
+    mm(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
         lhs_block = load_tensor_block(
