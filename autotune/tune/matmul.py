@@ -10,7 +10,7 @@ from autotune.baseline.np_baselines import matmul_xt_op
 from autotune.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
 from autotune.cache.parameter_importance import analyze_and_visualize
 from autotune.cache.visualize import plot_pe_vs_k_comparison
-from autotune.kernels.matmul import MatMulCompatibility, matmul_main
+from autotune.kernels.matmul import GEMMCompatibility, matmul_main
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
 
@@ -55,7 +55,7 @@ def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
             "BUFFER_K": BUFFER_K,
             "loop_order": loop_order,
         }
-        jobs.add_job(kernel=matmul_main, kernel_args=(lhsT, rhs), pruning_func=MatMulCompatibility, **config)
+        jobs.add_job(kernel=matmul_main, kernel_args=(lhsT, rhs), pruning_func=GEMMCompatibility, **config)
     return jobs
 
 
@@ -67,7 +67,7 @@ def profile():
         lhsT = np.zeros((K, M), dtype=bfloat16)
         rhs = np.zeros((K, N), dtype=bfloat16)
         jobs = ProfileJobs()
-        jobs.add_job(kernel=matmul_xt_op, kernel_args=(lhsT, rhs), pruning_func=MatMulCompatibility)
+        jobs.add_job(kernel=matmul_xt_op, kernel_args=(lhsT, rhs), pruning_func=GEMMCompatibility)
         baseline_tuner = Benchmark(jobs=jobs, cache_dir=f"{BASELINE_CACHE_DIR}/GEMM/M{M}-N{N}-K{K}")
         baseline_tuner()
 

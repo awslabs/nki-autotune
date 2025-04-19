@@ -8,7 +8,14 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki.compiler.backends.neuron.tensors import KernelHBMTensor
 from neuronxcc.nki.typing import tensor
 
-from autotune.kernels.utils import MatMulCompatibility, load_tensor_block, matmul_block, matmul_blocks_lhs
+from autotune.kernels.utils import (
+    GEMMCompatibility,
+    load_tensor_block,
+    matmul_block,
+    matmul_blocks_lhs,
+    save_result_acc,
+    save_result_block,
+)
 
 
 @nki.jit
@@ -23,7 +30,9 @@ def matmul_main(
     BUFFER_K: int,
     loop_order: str,
 ):
-    mm = MatMulCompatibility(lhsT.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
+    mm = GEMMCompatibility(
+        lhsT.shape, rhs.shape, True, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
+    )
     assert loop_order in ["MNK", "MKN", "NMK", "NKM", "KMN", "KNM"], f"Loop order {loop_order} GEMM does not exist."
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
@@ -42,47 +51,6 @@ def matmul_main(
     else:
         raise NotImplementedError(f"Loop order {loop_order} GEMM does not exist.")
     return result
-
-
-def save_result_block(result, result_block, m_ofs: int, n_ofs: int):
-    """
-    Store result_block into result
-    Args:
-    result: M, N
-    result_block: TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, nl.par_dim(TILE_M), TILE_N
-    """
-    TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N = result_block.shape
-
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
-        m_start = m_ofs + tile_id_M * TILE_M
-        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
-            n_start = n_ofs + tile_id_N * TILE_N
-            nl.store(result[m_start + idx_res.p, n_start + idx_res.x], value=result_block[tile_id_M, tile_id_N])
-
-
-def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
-    NUM_BLOCK_K, NUM_BLOCK_M, NUM_BLOCK_N, num_m_tiles, num_n_tiles, TILE_M, TILE_N = result_tiles.shape
-
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for block_id_M in nl.affine_range(NUM_BLOCK_M):
-        m_ofs = block_id_M * BLOCK_M
-        for block_id_N in nl.affine_range(NUM_BLOCK_N):
-            n_ofs = block_id_N * BLOCK_N
-            for tile_id_M in nl.affine_range(num_m_tiles):
-                for tile_id_N in nl.affine_range(num_n_tiles):
-                    result_acc = nl.zeros(
-                        (num_m_tiles, num_n_tiles, nl.par_dim(TILE_M), TILE_N), dtype=result_tiles.dtype, buffer=nl.sbuf
-                    )
-                    for block_id_K in nl.affine_range(NUM_BLOCK_K):
-                        result_acc[tile_id_M, tile_id_N] += result_tiles[
-                            block_id_K, block_id_M, block_id_N, tile_id_M, tile_id_N
-                        ]
-
-                    nl.store(
-                        result[m_ofs + tile_id_M * TILE_M + idx_res.p, n_ofs + tile_id_N * TILE_N + idx_res.x],
-                        value=result_acc[tile_id_M, tile_id_N],
-                    )
 
 
 def save_result_dma(result, result_tiles, block_id, m_ofs, n_ofs, TILE_K):
@@ -106,7 +74,7 @@ def save_result_dma(result, result_tiles, block_id, m_ofs, n_ofs, TILE_K):
         )
 
 
-def matmul_NMK(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_NMK(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
     for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
             # Does it matter if we fold into free without block dimensions?
@@ -136,7 +104,7 @@ def matmul_NMK(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: Kerne
     return result
 
 
-def matmul_MNK(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_MNK(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
             result_tiles = nl.zeros(
@@ -165,7 +133,7 @@ def matmul_MNK(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: Kerne
     return result
 
 
-def matmul_KMN(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_KMN(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
 
     result_tiles = nl.zeros(
         (
@@ -203,7 +171,7 @@ def matmul_KMN(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: Kerne
     return result
 
 
-def matmul_KNM(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_KNM(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
 
     result_tiles = nl.zeros(
         (
@@ -241,7 +209,7 @@ def matmul_KNM(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: Kerne
     return result
 
 
-def matmul_NKM(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_NKM(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
 
     # Blocking N dimension (the RHS free dimension)
     for block_id_N in nl.affine_range(mm.NUM_BLOCK_N, multi_buffer=mm.BUFFER_N):
@@ -295,7 +263,7 @@ def matmul_NKM(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: Kerne
     return result
 
 
-def matmul_MKN(lhsT: tensor, rhs: tensor, mm: MatMulCompatibility, result: KernelHBMTensor):
+def matmul_MKN(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
     # Blocking M dimension (the LHS free dimension)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M, multi_buffer=mm.BUFFER_M):
         result_tiles = nl.zeros(
@@ -360,8 +328,8 @@ def gemm_with_non_transposed_lhs_MNK(
     BUFFER_N: int,
     BUFFER_K: int,
 ):
-    mm = MatMulCompatibility(
-        lhs.shape[::-1], rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
+    mm = GEMMCompatibility(
+        lhs.shape, rhs.shape, False, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
     )
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
@@ -400,8 +368,8 @@ def gemm_with_non_transposed_lhs_MN(
     BUFFER_N: int,
     BUFFER_K: int,
 ):
-    mm = MatMulCompatibility(
-        lhs.shape[::-1], rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
+    mm = GEMMCompatibility(
+        lhs.shape, rhs.shape, False, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
     )
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):

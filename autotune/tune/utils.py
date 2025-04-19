@@ -41,6 +41,8 @@ def compile_kernel(
     elif isinstance(kernel, GenericKernel):
         traced_kernel = kernel
         compiler_args = "--internal-tensorizer-opt-level=nki"
+        if kernel_name == "stack_allocated_fused_rms_norm_qkv":
+            compiler_args = "--internal-nki-allocation"
     else:
         raise TypeError(f"{type(kernel)} {kernel} is not supported.")
     traced_kernel.specialize(*kernel_args, **configs)
