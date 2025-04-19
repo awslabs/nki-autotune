@@ -16,7 +16,7 @@ from neuronxcc.nki.language import par_dim
 
 from autotune.allocation.utils import update_base_addr
 from autotune.kernels.utils import (
-    MatMulCompatibility,
+    GEMMCompatibility,
     load_tensor_block,
     matmul_blocks_tile_transposed_lhs,
     save_result_block,
@@ -321,7 +321,7 @@ def blocked_fused_rms_norm_linear(
     """
     assert len(lhs.shape) == 3, f"Expecting (batch, M, K) in LHS. Received {lhs.shape}."
     lhsT_shape = (lhs.shape[0], lhs.shape[-1], lhs.shape[-2])
-    mm = MatMulCompatibility(lhsT_shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
+    mm = GEMMCompatibility(lhsT_shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
     batch_size = lhs.shape[0]
     result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for batch_id in nl.affine_range(batch_size):
@@ -357,7 +357,7 @@ def blocked_fused_rms_norm_linear(
     return result
 
 
-def compute_RMSNormT(in_block, mm: MatMulCompatibility, eps, norm_dtype, output_dtype):
+def compute_RMSNormT(in_block, mm: GEMMCompatibility, eps, norm_dtype, output_dtype):
     """
     Compute the RMSNormT(hidden) block for the in_block
     Args:

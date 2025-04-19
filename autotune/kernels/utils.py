@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import Optional, Tuple
 
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
@@ -6,98 +6,174 @@ import numpy as np
 from neuronxcc.nki.typing import tensor
 
 
-class MatMulCompatibility:
+class GEMMCompatibility:
     """
-    Inputs compatibility checks for GEMM
+    Validates compatibility of input shapes and parameters for GEMM operations.
+
+    This class checks whether the given matrix dimensions can be properly
+    divided into blocks and tiles according to hardware constraints.
     """
 
     def __init__(
         self,
-        lhsT_shape: Tuple,
-        rhs_shape: Tuple,
+        lhs_shape: Tuple[int, ...],
+        rhs_shape: Tuple[int, ...],
+        transposed_lhs: bool,
         NUM_BLOCK_M: int = 1,
         NUM_BLOCK_N: int = 1,
-        NUM_BLOCK_K: int = -1,
+        NUM_BLOCK_K: Optional[int] = None,  # Changed from -1 to None
         BUFFER_M: int = 1,
         BUFFER_N: int = 1,
-        BUFFER_K: int = -1,
+        BUFFER_K: Optional[int] = None,  # Changed from -1 to None
         **kwargs,
     ) -> None:
+        """
+        Initialize GEMM compatibility checker.
+
+        Args:
+            lhs_shape: Shape of left-hand side matrix, either (M,K) or (batch,M,K)
+                       If transposed_lhs is True, dimensions are interpreted as (K,M) or (batch,K,M)
+            rhs_shape: Shape of right-hand side matrix, expected to be (K,N)
+            transposed_lhs: Whether the LHS matrix is transposed
+            NUM_BLOCK_M: Number of blocks in M dimension
+            NUM_BLOCK_N: Number of blocks in N dimension
+            NUM_BLOCK_K: Number of blocks in K dimension, or None to skip K blocking
+            BUFFER_M: Buffer degree for M dimension, must be <= NUM_BLOCK_M
+            BUFFER_N: Buffer degree for N dimension, must be <= NUM_BLOCK_N
+            BUFFER_K: Buffer degree for K dimension, or None to skip K buffering
+        """
         # Input sizes
-        assert len(rhs_shape) == 2, f"Expecting (K, N) in RHS. Received {rhs_shape}."
-        if len(lhsT_shape) == 2:
-            self.K, self.M = lhsT_shape
-        elif len(lhsT_shape) == 3:
-            batch, self.K, self.M = lhsT_shape
+        if len(rhs_shape) != 2:
+            raise ValueError(f"Expecting (K, N) in RHS. Received {rhs_shape}.")
+
+        self.batch = None
+        if len(lhs_shape) == 2:
+            if transposed_lhs:
+                self.K, self.M = lhs_shape
+            else:
+                self.M, self.K = lhs_shape
+        elif len(lhs_shape) == 3:
+            if transposed_lhs:
+                self.batch, self.K, self.M = lhs_shape
+            else:
+                self.batch, self.M, self.K = lhs_shape
         else:
-            raise ValueError(f"lhsT_shape must be either (K, M) or (batch, K, M). Received {lhsT_shape}.")
+            raise ValueError(f"lhs_shape must be either 2D or (batch, 2D). Received {lhs_shape}.")
+
         K_, self.N = rhs_shape
 
-        # Single tile sizes
+        # Validate dimensions > 0
+        for dim_name, dim_value in [("M", self.M), ("K", self.K), ("N", self.N)]:
+            if dim_value <= 0:
+                raise ValueError(f"Dimension {dim_name} must be positive, got {dim_value}")
+
+        # Single tile sizes (hardware constants)
         self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
         self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
         self.TILE_K = nl.tile_size.pmax  # 128
 
-        # Number of blocks
+        # Number of blocks (None means no blocking in that dimension)
         self.NUM_BLOCK_M = NUM_BLOCK_M
         self.NUM_BLOCK_N = NUM_BLOCK_N
         self.NUM_BLOCK_K = NUM_BLOCK_K
 
-        # Buffer degrees
+        # Buffer degrees (None means no buffering in that dimension)
         self.BUFFER_K = BUFFER_K
         self.BUFFER_M = BUFFER_M
         self.BUFFER_N = BUFFER_N
 
-        # Calculate other sizes
-        if self.NUM_BLOCK_K == -1 and self.BUFFER_K == -1:
-            dimensions = ["M", "N"]
-        else:
-            dimensions = ["M", "N", "K"]
-        self._calculate_sizes(dimensions)
-        self._check(K_, dimensions)
-        # self._show(dimensions)
+        # Calculate derived sizes
+        self._calculate_sizes()
 
-    def _calculate_sizes(self, dimensions: List[str]):
-        for dimension in dimensions:
+        # Validate contraction dimension matches
+        if self.K != K_:
+            raise ValueError(f"Contraction dimension mismatch: LHS has K={self.K}, RHS has K={K_}")
+
+        # Validate dimensions
+        self._check()
+
+    def _calculate_sizes(self) -> None:
+        """Calculate derived sizes for each dimension."""
+        for dimension in ["M", "N", "K"]:
             size = getattr(self, f"{dimension}")
             num_block = getattr(self, f"NUM_BLOCK_{dimension}")
+
+            # Handle dimensions with no blocking
+            if num_block is None:
+                num_block = 1
+
             tile_size = getattr(self, f"TILE_{dimension}")
-            tiles_in_block = size // num_block // tile_size
-            tiles_in_dim = size // tile_size
             block_size = size // num_block
+            tiles_in_block = block_size // tile_size
+            tiles_in_dim = size // tile_size
 
             setattr(self, f"TILES_IN_BLOCK_{dimension}", tiles_in_block)
             setattr(self, f"TILES_IN_{dimension}", tiles_in_dim)
             setattr(self, f"BLOCK_{dimension}", block_size)
 
-    def _check(self, K_, dimensions: List[str]):
-        assert (
-            self.K == K_
-        ), f"lhs and rhs contraction dimension mismatch, got lhs ({self.M}, {self.K}) and rhs ({K_}, {self.N})"
-        for dimension in dimensions:
+    def _check(self) -> None:
+        """Validate that dimensions can be evenly divided into blocks and tiles."""
+        for dimension in ["M", "N", "K"]:
             size = getattr(self, f"{dimension}")
             num_block = getattr(self, f"NUM_BLOCK_{dimension}")
+
+            # Handle dimensions with no blocking
+            if num_block is None:
+                num_block = 1
+
             tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
             tile_size = getattr(self, f"TILE_{dimension}")
             buffer_size = getattr(self, f"BUFFER_{dimension}")
-            assert (
-                num_block * tiles_in_block * tile_size == size
-            ), f"{dimension} size {size} cannot be divided into {num_block} blocks * {tiles_in_block} tiles * {tile_size}"
-            assert (
-                buffer_size <= num_block
-            ), f"{dimension} buffer degree {buffer_size} cannot be larger than number of blocks {num_block}"
 
-    def _show(self, dimensions: List[str]):
+            # Check even division
+            if num_block * tiles_in_block * tile_size != size:
+                raise ValueError(
+                    f"{dimension} size {size} cannot be divided evenly into "
+                    f"{num_block} blocks * {tiles_in_block} tiles * {tile_size}"
+                )
+
+            # Check buffer size if specified
+            if buffer_size is not None:
+                if buffer_size <= 0:
+                    raise ValueError(f"{dimension} buffer degree must be positive, got {buffer_size}")
+                if buffer_size > num_block:
+                    raise ValueError(
+                        f"{dimension} buffer degree {buffer_size} cannot be larger "
+                        f"than number of blocks {num_block}"
+                    )
+
+    def __repr__(self) -> str:
+        """String representation showing the division of dimensions into blocks and tiles."""
+        # Determine which dimensions to include
+        if self.NUM_BLOCK_K is None and self.BUFFER_K is None:
+            dimensions = ["M", "N"]
+        else:
+            dimensions = ["M", "N", "K"]
+
+        lines = [f"GEMM Compatibility Check:"]
+        if self.batch is not None:
+            lines.append(f"Batch size: {self.batch}")
+
+        # Overall shape
+        lines.append(f"Matrix dimensions: ({self.M}, {self.K}) × ({self.K}, {self.N})")
+
+        # Add detailed information for each dimension
         for dimension in dimensions:
             size = getattr(self, f"{dimension}")
             num_block = getattr(self, f"NUM_BLOCK_{dimension}")
+            if num_block is None:
+                num_block = 1
             tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
             tile_size = getattr(self, f"TILE_{dimension}")
             block_size = getattr(self, f"BLOCK_{dimension}")
-            print(
-                f"NUM_BLOCK_{dimension} {num_block} * TILES_IN_BLOCK_{dimension} {tiles_in_block} * TILE_{dimension} {tile_size} = {dimension} {size}"
+            buffer_size = getattr(self, f"BUFFER_{dimension}")
+
+            lines.append(
+                f"{dimension}: {num_block} blocks × {tiles_in_block} tiles × " f"{tile_size} elements = {size} total"
             )
-            print(f"BLOCK_{dimension} {block_size}")
+            lines.append(f"  Block size: {block_size}, Buffer degree: {buffer_size}")
+
+        return "\n".join(lines)
 
 
 def load_tensor_block(input_tensor, ofs: Tuple[int, int], load_shape: Tuple[int, nl.par_dim, int]):
@@ -183,16 +259,45 @@ def matmul_block(lhsT_block, rhs_block, result_block):
             result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
 
 
-def save_result_block(result, result_tiles, m_ofs, n_ofs):
-    num_m_tiles, num_n_tiles, TILE_M, TILE_N = result_tiles.shape
+def save_result_block(result, result_block, m_ofs: int, n_ofs: int):
+    """
+    Store result_block into result
+    Args:
+    result: M, N
+    result_block: TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, nl.par_dim(TILE_M), TILE_N
+    """
+    TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N = result_block.shape
 
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(num_m_tiles):
-        for tile_id_N in nl.affine_range(num_n_tiles):
-            nl.store(
-                result[m_ofs + tile_id_M * TILE_M + idx_res.p, n_ofs + tile_id_N * TILE_N + idx_res.x],
-                value=result_tiles[tile_id_M, tile_id_N],
-            )
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        m_start = m_ofs + tile_id_M * TILE_M
+        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
+            n_start = n_ofs + tile_id_N * TILE_N
+            nl.store(result[m_start + idx_res.p, n_start + idx_res.x], value=result_block[tile_id_M, tile_id_N])
+
+
+def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
+    NUM_BLOCK_K, NUM_BLOCK_M, NUM_BLOCK_N, num_m_tiles, num_n_tiles, TILE_M, TILE_N = result_tiles.shape
+
+    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    for block_id_M in nl.affine_range(NUM_BLOCK_M):
+        m_ofs = block_id_M * BLOCK_M
+        for block_id_N in nl.affine_range(NUM_BLOCK_N):
+            n_ofs = block_id_N * BLOCK_N
+            for tile_id_M in nl.affine_range(num_m_tiles):
+                for tile_id_N in nl.affine_range(num_n_tiles):
+                    result_acc = nl.zeros(
+                        (num_m_tiles, num_n_tiles, nl.par_dim(TILE_M), TILE_N), dtype=result_tiles.dtype, buffer=nl.sbuf
+                    )
+                    for block_id_K in nl.affine_range(NUM_BLOCK_K):
+                        result_acc[tile_id_M, tile_id_N] += result_tiles[
+                            block_id_K, block_id_M, block_id_N, tile_id_M, tile_id_N
+                        ]
+
+                    nl.store(
+                        result[m_ofs + tile_id_M * TILE_M + idx_res.p, n_ofs + tile_id_N * TILE_N + idx_res.x],
+                        value=result_acc[tile_id_M, tile_id_N],
+                    )
 
 
 def transpose_tiles_in_block(block):

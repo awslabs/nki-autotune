@@ -14,7 +14,8 @@ from neuronxcc.starfish.support.util import allclose
 from test_generation import GenTests
 
 from autotune.golden.gemm import gemm_core, gemm_cpu_golden
-from autotune.kernels.matmul import MatMulCompatibility, gemm_with_non_transposed_lhs_MN, matmul_main
+from autotune.kernels.matmul import gemm_with_non_transposed_lhs_MN, matmul_main
+from autotune.kernels.utils import GEMMCompatibility
 
 
 class GEMMTestConfig(GenTests):
@@ -41,7 +42,9 @@ class GEMMTestConfig(GenTests):
 
         try:
             assert max(M, N, K) <= 8192, f"Input sizes are too large for testing"
-            MatMulCompatibility((M, K), (K, N), NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
+            GEMMCompatibility(
+                (M, K), (K, N), False, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
+            )
             if "M" in config:
                 config_tuple = (M, N, K)
             else:
