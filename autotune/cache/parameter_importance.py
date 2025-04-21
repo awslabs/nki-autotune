@@ -2,10 +2,13 @@ import glob
 import json
 import math
 import os
+import re
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+
+from autotune.cache.directories import get_cache_dir
 
 
 def safe_subtract(a, b):
@@ -76,12 +79,33 @@ def analyze_parameter_importance(json_file):
     results = data["results"]
     df = pd.DataFrame([{**r["config"], "min_ms": r["min_ms"]} for r in results])
 
+    # Get parameter names dynamically from the config
+    if not results:
+        print(f"Warning: No results found in {json_file}")
+        return {}, pd.DataFrame(), []
+
+    # Extract parameter names from the first configuration
+    all_parameters = list(results[0]["config"].keys())
+
     # Dictionary to store impact metrics for each parameter
     param_impact = {}
-    parameter_names = ["NUM_BLOCK_M", "NUM_BLOCK_N", "NUM_BLOCK_K", "BUFFER_M", "BUFFER_N", "BUFFER_K", "loop_order"]
 
     # Calculate impact for each parameter
-    for param in parameter_names:
+    for param in all_parameters:
+        # For parameters with only one unique value, add with zero impact
+        if df[param].nunique() <= 1:
+            single_value = df[param].iloc[0]
+            param_impact[param] = {
+                "impact_range_ms": 0.0,
+                "impact_ratio": 1.0,  # Ratio of 1.0 means no impact
+                "best_value": single_value,
+                "worst_value": single_value,
+                "best_perf": df["min_ms"].mean(),
+                "worst_perf": df["min_ms"].mean(),
+                "single_value": True,  # Mark this as a single-value parameter
+            }
+            continue
+
         # Group by parameter value and calculate mean performance
         performance_by_value = df.groupby(param)["min_ms"].agg(["mean", "count"])
 
@@ -103,15 +127,34 @@ def analyze_parameter_importance(json_file):
             "worst_value": worst_value,
             "best_perf": best_perf,
             "worst_perf": worst_perf,
+            "single_value": False,  # Mark this as a multi-value parameter
         }
 
-    return param_impact, df
+    return param_impact, df, all_parameters
 
 
-def plot_parameter_importance(param_impact, metric="impact_ratio", output_file="parameter_importance.png"):
-    """Create a plot showing ranked parameter importance."""
-    # Extract the chosen metric for each parameter
-    params = list(param_impact.keys())
+def plot_parameter_importance(
+    param_impact, metric="impact_ratio", output_file="parameter_importance.png", include_all=True
+):
+    """
+    Create a plot showing ranked parameter importance.
+
+    Args:
+        param_impact: Dictionary of parameter impact data
+        metric: Which metric to use for ranking ('impact_ratio' or 'impact_range_ms')
+        output_file: Where to save the plot
+        include_all: Whether to include parameters with single values (no impact)
+    """
+    # Extract parameters that have meaningful impact (multiple values)
+    if include_all:
+        params = list(param_impact.keys())
+    else:
+        params = [p for p, data in param_impact.items() if not data.get("single_value", False)]
+
+    if not params:
+        print("Warning: No parameters to plot")
+        return pd.DataFrame()
+
     impact_values = [param_impact[p][metric] for p in params]
 
     # Create a DataFrame for plotting
@@ -130,8 +173,12 @@ def plot_parameter_importance(param_impact, metric="impact_ratio", output_file="
     for i, param in enumerate(plot_df["Parameter"]):
         best_val = str(param_impact[param]["best_value"])
         worst_val = str(param_impact[param]["worst_value"])
-        # Only add text if there's enough space in the bar
-        if plot_df["Impact"].iloc[i] > 1.2:  # Only add if bar is tall enough
+
+        # For single-value parameters, just add the value
+        if param_impact[param].get("single_value", False):
+            plt.text(i, 0.5, f"Value: {best_val}", ha="center", color="black", fontweight="bold")
+        # For multi-value parameters with enough impact, show best/worst
+        elif plot_df["Impact"].iloc[i] > 1.0:  # Only add if bar is tall enough
             plt.text(
                 i, plot_df["Impact"].iloc[i] * 0.4, f"Best: {best_val}", ha="center", color="white", fontweight="bold"
             )
@@ -142,7 +189,7 @@ def plot_parameter_importance(param_impact, metric="impact_ratio", output_file="
     # Add value labels on top of bars
     for bar in bars:
         height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2.0, height + 0.1, f"{height:.2f}x", ha="center", va="bottom")
+        plt.text(bar.get_x() + bar.get_width() / 2.0, height + 0.02, f"{height:.2f}x", ha="center", va="bottom")
 
     # Set labels and title
     title_text = "Parameter Performance Impact (Ratio of Worst/Best Performance)"
@@ -155,6 +202,9 @@ def plot_parameter_importance(param_impact, metric="impact_ratio", output_file="
     plt.xticks(rotation=45)
     plt.tight_layout()
 
+    # Make sure the output directory exists
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
     # Save the plot
     plt.savefig(output_file, dpi=300)
     plt.close()
@@ -162,11 +212,42 @@ def plot_parameter_importance(param_impact, metric="impact_ratio", output_file="
     return plot_df
 
 
-def create_parameter_detail_plots(param_impact, df, output_dir):
-    """Create detailed plots showing performance for different values of each parameter."""
+def create_parameter_detail_plots(param_impact, df, output_dir, all_parameters):
+    """
+    Create detailed plots showing performance for different values of each parameter.
+
+    Args:
+        param_impact: Dictionary of parameter impact data
+        df: DataFrame with all results
+        output_dir: Directory to save plots to
+        all_parameters: List of all parameters to ensure we plot all of them
+    """
     os.makedirs(output_dir, exist_ok=True)
 
-    for param, impact in param_impact.items():
+    if not param_impact:
+        print(f"No parameter impact data available for {output_dir}")
+        return
+
+    for param in all_parameters:
+        if param not in param_impact:
+            continue
+
+        # Skip plotting for single-value parameters with no variation
+        if param_impact[param].get("single_value", False):
+            plt.figure(figsize=(6, 3))
+            plt.text(
+                0.5,
+                0.5,
+                f"Parameter '{param}' has only one value: {param_impact[param]['best_value']}",
+                ha="center",
+                va="center",
+            )
+            plt.axis("off")
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/{param}_performance.png", dpi=300)
+            plt.close()
+            continue
+
         # Group by parameter value and get mean performance
         perf_by_value = df.groupby(param)["min_ms"].mean().reset_index()
 
@@ -196,6 +277,27 @@ def create_parameter_detail_plots(param_impact, df, output_dir):
 
 def create_parameter_interaction_heatmap(df, param1, param2, output_file):
     """Create a heatmap showing how two parameters interact to affect performance."""
+    # Check if both parameters have multiple values
+    if df[param1].nunique() <= 1 or df[param2].nunique() <= 1:
+        plt.figure(figsize=(8, 6))
+        plt.text(
+            0.5,
+            0.5,
+            f"Cannot create interaction heatmap:\nParameter '{param1}' has {df[param1].nunique()} values\n"
+            + f"Parameter '{param2}' has {df[param2].nunique()} values\n"
+            + "Both parameters need multiple values for interactions.",
+            ha="center",
+            va="center",
+        )
+        plt.axis("off")
+        plt.tight_layout()
+
+        # Make sure the output directory exists
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        plt.savefig(output_file, dpi=300)
+        plt.close()
+        return
+
     # Create pivot table showing average performance for each combination
     pivot = df.pivot_table(index=param1, columns=param2, values="min_ms", aggfunc="mean")
 
@@ -204,93 +306,161 @@ def create_parameter_interaction_heatmap(df, param1, param2, output_file):
     plt.title(f"Average Performance: {param1} vs {param2} (ms, lower is better)")
     plt.tight_layout()
 
+    # Make sure the output directory exists
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
     plt.savefig(output_file, dpi=300)
     plt.close()
 
 
-def analyze_single_file(json_file):
-    """Analyze a single perf_metrics.json file."""
+def analyze_single_file(json_file, plots_dir):
+    """
+    Analyze a single perf_metrics.json file.
+
+    Args:
+        json_file: Path to the perf_metrics.json file
+        plots_dir: Directory to save plot outputs
+    """
     print(f"Analyzing: {json_file}")
 
-    # Get directory containing the json file for saving outputs
-    output_dir = os.path.dirname(json_file)
+    # Create parameter details directory within plots dir
+    param_details_dir = os.path.join(plots_dir, "param_details")
+    os.makedirs(param_details_dir, exist_ok=True)
 
-    # Extract M, N, K values from directory name
-    dir_name = os.path.basename(output_dir)
+    # Extract run type and shape info from file path
+    path_parts = json_file.split(os.sep)
+
+    # Find run type
+    run_type = ""
+    for part in path_parts:
+        if part in ["baseline", "tuned"]:
+            run_type = f"_{part}"
+            break
+
+    # Extract the MNK directory name
+    shape_dir = os.path.basename(os.path.dirname(json_file))
+    # Match MX-NY-KZ pattern
+    match = re.match(r"M(\d+)-N(\d+)-K(\d+)", shape_dir)
     size_info = ""
-    if "M" in dir_name and "N" in dir_name and "K" in dir_name:
-        size_info = f" ({dir_name})"
+    if match:
+        size_info = f"_{shape_dir}"
 
     # Calculate parameter importance
-    param_impact, df = analyze_parameter_importance(json_file)
+    param_impact, df, all_parameters = analyze_parameter_importance(json_file)
 
-    # Create main importance ranking plot
+    if not param_impact:
+        print(f"No parameter impact data available for {json_file}")
+        return None, df, None
+
+    # Create main importance ranking plot - include all parameters
     ranking_df = plot_parameter_importance(
-        param_impact, "impact_ratio", os.path.join(output_dir, f"parameter_importance_ratio{size_info}.png")
+        param_impact,
+        "impact_ratio",
+        os.path.join(plots_dir, f"parameter_importance{run_type}{size_info}.png"),
+        include_all=True,
     )
 
     # Create detailed plots for each parameter
-    param_details_dir = os.path.join(output_dir, "param_details")
-    create_parameter_detail_plots(param_impact, df, param_details_dir)
+    detail_plot_dir = os.path.join(param_details_dir, f"{run_type}{size_info}".strip("_"))
+    os.makedirs(detail_plot_dir, exist_ok=True)
+    create_parameter_detail_plots(param_impact, df, detail_plot_dir, all_parameters)
 
-    # Get top 2 parameters and create interaction heatmap
-    if len(ranking_df) >= 2:
-        top_params = ranking_df["Parameter"].iloc[:2].tolist()
-        create_parameter_interaction_heatmap(
-            df, top_params[0], top_params[1], os.path.join(output_dir, f"top_param_interaction{size_info}.png")
-        )
+    # Find top 2 parameters with variation for interaction heatmap
+    varied_params = [p for p, data in param_impact.items() if not data.get("single_value", False)]
+    if len(varied_params) >= 2:
+        varied_ranking = ranking_df[ranking_df["Parameter"].isin(varied_params)]
+        if not varied_ranking.empty:
+            top_params = varied_ranking.iloc[:2]["Parameter"].tolist()
+            create_parameter_interaction_heatmap(
+                df,
+                top_params[0],
+                top_params[1],
+                os.path.join(plots_dir, f"top_param_interaction{run_type}{size_info}.png"),
+            )
 
     # Save analysis results as text file
-    with open(os.path.join(output_dir, "parameter_analysis.txt"), "w") as f:
+    with open(os.path.join(plots_dir, f"parameter_analysis{run_type}{size_info}.txt"), "w") as f:
         f.write(f"GEMM Parameter Analysis{size_info}\n")
         f.write("=" * 50 + "\n\n")
 
         f.write("Parameter ranking by performance impact ratio:\n")
         for i, (_, impact) in enumerate(ranking_df.iterrows()):
-            best = param_impact[impact["Parameter"]]["best_value"]
-            worst = param_impact[impact["Parameter"]]["worst_value"]
-            f.write(
-                f"{i+1}. {impact['Parameter']}: {impact['Impact']:.2f}x difference " f"(Best: {best}, Worst: {worst})\n"
-            )
+            param_name = impact["Parameter"]
+            impact_value = impact["Impact"]
+
+            # Check if this is a single-value parameter
+            if param_impact[param_name].get("single_value", False):
+                single_value = param_impact[param_name]["best_value"]
+                f.write(f"{i+1}. {param_name}: No impact (single value: {single_value})\n")
+            else:
+                best = param_impact[param_name]["best_value"]
+                worst = param_impact[param_name]["worst_value"]
+                f.write(f"{i+1}. {param_name}: {impact_value:.2f}x difference " f"(Best: {best}, Worst: {worst})\n")
+
+        f.write("\nAll Parameters in Dataset:\n")
+        for param in all_parameters:
+            if param in param_impact:
+                if param_impact[param].get("single_value", False):
+                    f.write(f"  {param}: Single value = {param_impact[param]['best_value']}\n")
+                else:
+                    f.write(f"  {param}: Multiple values ({df[param].nunique()} unique values)\n")
+            else:
+                f.write(f"  {param}: Unknown\n")
 
         f.write("\nTop 5 configurations:\n")
         top_configs = df.nsmallest(5, "min_ms")
         for i, (_, row) in enumerate(top_configs.iterrows()):
+            # Write all parameters from the configuration
             f.write(f"\nConfig {i+1}: {row['min_ms']:.4f} ms\n")
-            for param in [
-                "NUM_BLOCK_M",
-                "NUM_BLOCK_N",
-                "NUM_BLOCK_K",
-                "BUFFER_M",
-                "BUFFER_N",
-                "BUFFER_K",
-                "loop_order",
-            ]:
-                f.write(f"  {param}: {row[param]}\n")
+            for param in all_parameters:
+                if param in row:
+                    f.write(f"  {param}: {row[param]}\n")
 
     return param_impact, df, ranking_df
 
 
-def find_all_perf_metrics_files(base_dir):
-    """Find all perf_metrics.json files under a base directory."""
-    return glob.glob(f"{base_dir}/**/perf_metrics.json", recursive=True)
+def find_all_perf_metrics_files(workload_name):
+    """
+    Find all perf_metrics.json files under a workload directory.
+
+    Args:
+        workload_name: Name of the workload
+
+    Returns:
+        List of found perf_metrics.json files
+    """
+    baseline_dir = get_cache_dir(workload_name, "baseline")
+    tuned_dir = get_cache_dir(workload_name, "tuned")
+    baseline_files = glob.glob(f"{baseline_dir}/M*-N*-K*/perf_metrics.json")
+    tuned_files = glob.glob(f"{tuned_dir}/M*-N*-K*/perf_metrics.json")
+
+    return baseline_files + tuned_files
 
 
-def analyze_and_visualize(base_dir):
-    """Analyze all perf_metrics.json files under a base directory."""
+def analyze_and_visualize(workload_name):
+    """
+    Analyze all perf_metrics.json files under a workload directory.
+
+    Args:
+        workload_name: Name of the workload
+    """
     # Find all json files
-    json_files = find_all_perf_metrics_files(base_dir)
+    json_files = find_all_perf_metrics_files(workload_name)
 
     if not json_files:
-        print(f"No perf_metrics.json files found under {base_dir}")
+        print(f"No perf_metrics.json files found under {workload_name}")
         return
 
     print(f"Found {len(json_files)} perf_metrics.json files to analyze")
 
+    # Create plots directory
+    plots_dir = get_cache_dir(workload_name, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
     # Process each file
     for json_file in json_files:
         try:
-            analyze_single_file(json_file)
+            analyze_single_file(json_file, plots_dir)
             print(f"Completed analysis for {json_file}")
         except Exception as e:
             print(f"Error analyzing {json_file}: {str(e)}")

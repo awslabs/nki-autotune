@@ -1,6 +1,5 @@
 import hashlib
 import os
-import shutil
 import time
 from typing import Dict, List, Tuple
 
@@ -126,24 +125,38 @@ def parse_tensor_shapes(tensor_shapes: List[str]) -> str:
     return result
 
 
-def get_cache_dir(cache_root_dir: str, kernel, kernel_args: Tuple) -> str:
+def get_cache_dir(workload_name: str, cache_type: str, **kwargs):
     """
-    Determine and create the cache directory for storing results.
+    Generate a cache directory path based on workload name and additional parameters.
 
-    This method creates a cache directory structure based on the kernel function name
-    and the shapes of the input tensors. If the directory already exists, it is
-    removed and recreated to ensure a clean starting state.
+    This function creates a cache directory path by combining the root directory,
+    workload name, and key-value pairs from the provided keyword arguments. The
+    key-value pairs are appended to the directory path in the format "key1value1-key2value2".
 
     Args:
-        cache_dir (str | None, optional): Custom cache directory path. If None,
-            a default path is created based on the kernel function name. Defaults to None.
+        workload_name (str): Name of the workload to create a cache directory for
+        **kwargs: Arbitrary keyword arguments that will be used to create subdirectory names
+                 in the format "keyvalue-"
 
     Returns:
-        str: Path to the created cache directory.
+        str: The full cache directory path
+
+    Example:
+        >>> get_cache_dir("sentiment_analysis", model="bert", batch=32)
+        "/path/to/cache/sentiment_analysis/modelbert-batch32"
     """
-    shape_dir = parse_tensor_shapes([str(arg.tensor_shape) for arg in kernel_args])
-    cache_dir = f"{cache_root_dir}/{kernel.func_name}/{shape_dir}"
-    if os.path.exists(cache_dir):
-        shutil.rmtree(cache_dir)
-    os.makedirs(cache_dir)
+    if cache_type not in ["baseline", "tuned", "plots"]:
+        raise ValueError(f"{cache_type} cache directory is not supported. Expecting (baseline, tuned, plots).")
+
+    cache_dir = f"{CACHE_ROOT_DIR}/{workload_name}/{cache_type}"
+    # Join all key-value pairs
+    kv_string = ""
+    for key, value in kwargs.items():
+        kv_string += f"{key}{value}-"
+
+    # Remove the last hyphen if any kwargs were provided
+    if kv_string:
+        kv_string = kv_string[:-1]
+        cache_dir = f"{cache_dir}/{kv_string}"
+
     return cache_dir

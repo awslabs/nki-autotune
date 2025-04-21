@@ -7,7 +7,7 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.baseline.np_baselines import rmsnorm_linear_op
-from autotune.cache.directories import BASELINE_CACHE_DIR, TUNED_CACHE_DIR
+from autotune.cache.directories import get_cache_dir
 from autotune.cache.parameter_importance import analyze_and_visualize
 from autotune.cache.visualize import plot_pe_vs_k_comparison
 from autotune.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear, stack_allocated_fused_rms_norm_qkv
@@ -61,19 +61,19 @@ def profile(workload_name: str):
     MNK = list(product([2048], [512], [8192]))
     for M, N, K in MNK:
         baseline_jobs = get_baseline_jobs(M, N, K)
-        baseline_tuner = Benchmark(jobs=baseline_jobs, cache_dir=f"{BASELINE_CACHE_DIR}/{workload_name}/M{M}-N{N}-K{K}")
+        cache_dir = get_cache_dir(workload_name, "baseline", M=M, N=N, K=K)
+        baseline_tuner = Benchmark(jobs=baseline_jobs, cache_dir=cache_dir)
         baseline_tuner()
 
         jobs = get_autotune_jobs(M, N, K)
         sampled_jobs = jobs.sample(100)
-        tuner = Benchmark(jobs=sampled_jobs, cache_dir=f"{TUNED_CACHE_DIR}/{workload_name}/M{M}-N{N}-K{K}")
+        cache_dir = get_cache_dir(workload_name, "tuned", M=M, N=N, K=K)
+        tuner = Benchmark(jobs=sampled_jobs, cache_dir=cache_dir)
         tuner()
 
 
 if __name__ == "__main__":
     workload_name = "fused_rmsnorm_GEMM"
     profile(workload_name)
-    plot_pe_vs_k_comparison(
-        tuned_dir=f"{TUNED_CACHE_DIR}/{workload_name}", baseline_dir=f"{BASELINE_CACHE_DIR}/{workload_name}"
-    )
-    analyze_and_visualize(f"{TUNED_CACHE_DIR}/{workload_name}")
+    plot_pe_vs_k_comparison(workload_name)
+    analyze_and_visualize(workload_name)
