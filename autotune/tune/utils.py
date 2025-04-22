@@ -26,6 +26,8 @@ def get_kernel_by_name(kernel_name):
         "allocated_fused_rms_norm_qkv": allocated_fused_rms_norm_qkv,
         "blocked_fused_rms_norm_linear": blocked_fused_rms_norm_linear,
     }
+    if kernel_name not in kernels:
+        raise ValueError(f"Need to include {kernel_name} in kernel library.")
     return kernels[kernel_name]
 
 
@@ -57,7 +59,10 @@ def compile_kernel(
     return output_neff
 
 
-def create_spike_kernel(neff_path: str, kernel, kernel_args: Tuple[np.ndarray, ...], configs: Dict) -> CompiledKernel:
+def create_spike_kernel(
+    neff_path: str, kernel_name: str, kernel_args: Tuple[np.ndarray, ...], configs: Dict
+) -> CompiledKernel:
+    kernel = get_kernel_by_name(kernel_name)
     if isinstance(kernel, types.FunctionType):
         traced_kernel = trace(kernel)
     elif isinstance(kernel, GenericKernel):

@@ -53,10 +53,9 @@ class Benchmark:
             job = future_to_job[future]
             try:
                 neff = future.result()
-                spike_kernel = create_spike_kernel(neff, job.kernel, job.kernel_args, job.kwargs)
+                spike_kernel = create_spike_kernel(neff, job.kernel.__name__, job.kernel_args, job.kwargs)
                 job.add_fields(neff=neff, spike_kernel=spike_kernel)
             except Exception as e:
-                # TODO: catch the entire stdout, stderr
                 exc_type, exc_value, exc_traceback = sys.exc_info()
                 error_string = f"{exc_type.__name__}: {str(e)}\n"
                 error_string += "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
@@ -74,7 +73,10 @@ class Benchmark:
                         benchmark_iterations=self.iters,
                         device_id=0,
                     )
-                    self.results.add_result(config=job.kwargs, neff=job.neff, **stats)
+                    # FIXME: this is calculating model MAC. Need to calculate hardware MAC.
+                    self.results.add_result(
+                        config=job.kwargs, neff=job.neff, MAC=job.spike_kernel.traced_kernel.matmul_mac_count, **stats
+                    )
                 else:
                     self.results.add_result(config=job.kwargs, error=job.error, min_ms=float("inf"))
 

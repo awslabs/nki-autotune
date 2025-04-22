@@ -8,6 +8,7 @@ from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 from test_generation import GenTests
 
+from autotune.baseline.np_baselines import rmsnorm_linear_op
 from autotune.golden.rmsnorm_linear import rmsnorm_linear_golden
 from autotune.kernels.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
@@ -20,21 +21,19 @@ from autotune.kernels.utils import GEMMCompatibility
 
 class RMSNormLinearTestConfig(GenTests):
     def process_test_config(self, config: Dict[str, int]) -> Tuple | None:
-        batch = config["batch"]
-        M = config["M"]
-        N = config["N"]
-        K = config["K"]
-        NUM_BLOCK_M = config["NUM_BLOCK_M"]
-        NUM_BLOCK_N = config["NUM_BLOCK_N"]
-        BUFFER_M = config["BUFFER_M"]
-        BUFFER_N = config["BUFFER_N"]
-        eps = config["eps"]
+        M = config.get("M", 1)
+        N = config.get("N", 1)
+        K = config.get("K", 1)
 
         try:
             assert max(M, N, K) <= 8192, f"Input sizes are too large for testing"
             check = GEMMCompatibility(transposed_lhs=False)
-            check((M, K), (K, N), NUM_BLOCK_M, NUM_BLOCK_N, 1, BUFFER_M, BUFFER_N, 1)
-            config_tuple = (batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, eps)
+            check((M, K), (K, N), **config)
+            config_tuple = tuple(
+                config.get(param, 1)
+                for param in ["batch", "M", "N", "K", "NUM_BLOCK_M", "NUM_BLOCK_N", "BUFFER_M", "BUFFER_N", "eps"]
+                if param in config
+            )
             return config_tuple
         except Exception as e:
             return None
@@ -169,3 +168,21 @@ def test_blocked_fused_rms_norm_linear_perf(batch, M, K, N, eps):
     assert (
         optimized_p99 < baseline_p99
     ), f"blocked_fused_rms_norm_linear {optimized_p99}ms should be faster than stack_allocated_fused_rms_norm_qkv {baseline_p99}ms"
+
+
+@pytest.mark.parametrize(
+    "batch, M, N, K, eps",
+    RMSNormLinearTestConfig(
+        batch=[1, 2, 4], M=[1024, 2048], N=[2048, 4096], K=[1024, 4096], eps=[1e-6, 1e-3]
+    ).valid_tests[:10],
+)
+def test_np_fused_rms_norm_linear_numerical(batch, M, N, K, eps):
+    data_type = np.float32
+    atol, rtol = 1e-2, 1e-3
+    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
+    rhs = np.random.random_sample((K, N)).astype(data_type)
+
+    golden = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, eps), data_type)
+    np_out = rmsnorm_linear_op(lhs, rhs, eps)
+
+    assert allclose(np_out, golden, atol=atol, rtol=rtol, verbose=1), f"NP output does not match with golden."

@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 from autotune.cache.directories import get_cache_dir
 from autotune.cache.results import PerformanceMetrics
-from autotune.tune.metrics import calculate_pe_utilization
+from autotune.tune.metrics import calculate_GEMM_pe_utilization
 
 
 def collect_pe_data_with_random_samples(directory: str, sample_sizes=[1, 10, "max"]):
@@ -78,10 +78,10 @@ def collect_pe_data_with_random_samples(directory: str, sample_sizes=[1, 10, "ma
                     best_config = min(sampled_results, key=lambda r: r.min_ms)
 
                     # Calculate PE utilization for the best config
-                    pe_util = calculate_pe_utilization((k, m), (k, n), best_config.min_ms, "trn1")
+                    model_pe_util = calculate_GEMM_pe_utilization((k, m), (k, n), best_config.min_ms, "trn1")
 
                     # Store by actual sample size
-                    pe_utilization_data[(m, n)][k][actual_size] = pe_util
+                    pe_utilization_data[(m, n)][k][actual_size] = model_pe_util
 
     return pe_utilization_data
 
