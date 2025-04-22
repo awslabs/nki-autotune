@@ -12,7 +12,7 @@ def matmul_op(x, y):
     return np.matmul(x, y)
 
 
-def rmsnorm_linear_op(x, y):
+def rmsnorm_linear_op(x, y, eps: float = 1e-6):
     """
     Applies RMSNorm to x and then performs matrix multiplication with y.
 
@@ -25,7 +25,6 @@ def rmsnorm_linear_op(x, y):
     """
     # Apply RMSNorm
     # Calculate root mean square along the last dimension
-    eps = 1e-6  # Small epsilon for numerical stability
     rms = np.sqrt(np.mean(x**2, axis=-1, keepdims=True) + eps)
 
     # Normalize x by dividing by its RMS
