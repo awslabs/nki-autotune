@@ -1,11 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import shutil
 import subprocess
-import sys
-import traceback
 from concurrent.futures import ProcessPoolExecutor
 
 from neuronpy.runtime.spike import SpikeExecutor
@@ -14,18 +13,7 @@ from tqdm import tqdm
 from autotune.cache.directories import split_file_info
 from autotune.cache.results import PerformanceMetrics
 from autotune.tune.job import ProfileJobs
-from autotune.tune.utils import compile_kernel, create_spike_kernel
-
-
-def capture_error_message(e) -> str:
-    exc_type, exc_value, exc_traceback = sys.exc_info()
-    error_string = f"{exc_type.__name__}: {str(e)}\n"
-    error_string += "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-    return error_string
-
-
-def run_with_args_and_kwargs(func, args, kwargs):
-    return func(*args, **kwargs)
+from autotune.tune.utils import capture_error_message, compile_kernel, create_spike_kernel
 
 
 class Benchmark:
@@ -56,11 +44,9 @@ class Benchmark:
         """
         Parallel compilation
         TODO:
-        1. Parallel run preprocessing
-        2. Parallel compile to NEFF
-        3. Run postprocessing
+        1. Parallel compile to NEFF
+        2. Run postprocessing
         """
-        self._parallel_preprocessing()
         self._parallel_compile_to_neff()
         self._profile()
         self._trace_neff()
@@ -78,23 +64,6 @@ class Benchmark:
         for job in self.jobs:
             results.add_result(config=job.kwargs)
         return results
-
-    def _parallel_preprocessing(self):
-        futures = []
-        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            for job_id in range(self.jobs.num_jobs):
-                job = self.jobs[job_id]
-                future = executor.submit(run_with_args_and_kwargs, job.preprocessing, job.get_arg_shapes(), job.kwargs)
-                futures.append((job_id, future))
-
-        for job_id, future in futures:
-            result = self.results[job_id]
-            try:
-                success = future.result()
-                result.add_fields(preprocessing=success)
-            except Exception as e:
-                error_string = capture_error_message(e)
-                result.add_error(error_string)
 
     def _parallel_compile_to_neff(self):
         futures = []
@@ -119,8 +88,6 @@ class Benchmark:
             for job_id in tqdm(range(self.jobs.num_jobs), total=self.jobs.num_jobs, desc="Profiling kernels"):
                 job = self.jobs[job_id]
                 result = self.results[job_id]
-                if result.error:
-                    continue
                 try:
                     spike_kernel = create_spike_kernel(result.neff, job.kernel_name, job.kernel_args, job.kwargs)
                     stats = spike.benchmark(
@@ -155,25 +122,31 @@ class Benchmark:
             This method is used when the 'trace' flag is set to True, allowing
             for detailed performance analysis of the compiled kernels.
         """
-        best_result = self.results.get_best_result()
-        try:
-            directory, neff_name, file_type = split_file_info(best_result.neff)
-            ntff_file = f"{directory}/{neff_name}.ntff"
-            trace_cmd = f"neuron-profile capture -n {best_result.neff} --profile-nth-exec={self.iters}"
-            subprocess.run(trace_cmd, shell=True)
-            shutil.move(f"profile_exec_{self.iters}.ntff", ntff_file)
+        for job_id in tqdm(range(self.jobs.num_jobs), total=self.jobs.num_jobs, desc="Profiling HFU"):
+            result = self.results[job_id]
+            try:
+                directory, neff_name, file_type = split_file_info(result.neff)
+                ntff_file = f"{directory}/{neff_name}.ntff"
+                trace_cmd = f"neuron-profile capture -n {result.neff} --profile-nth-exec={self.iters}"
+                subprocess.run(trace_cmd, shell=True)
+                shutil.move(f"profile_exec_{self.iters}.ntff", ntff_file)
 
-            output_json_file = f"{directory}/{neff_name}.json"
-            dump_json_cmd = f"neuron-profile view -n {best_result.neff} -s {ntff_file} --output-format json --output-file {output_json_file}"
-            subprocess.run(dump_json_cmd, shell=True)
+                output_json_file = f"{directory}/{neff_name}.json"
+                dump_json_cmd = f"neuron-profile view -n {result.neff} -s {ntff_file} --output-format json --output-file {output_json_file}"
+                subprocess.run(dump_json_cmd, shell=True)
 
-            best_result.add_fields(ntff=ntff_file, profile_json=output_json_file)
+                with open(output_json_file, "r") as f:
+                    data = json.load(f)
+                    hfu = data["summary"][0]["hfu_estimated_percent"]
+                    result.add_fields(hfu=hfu)
+                result.add_fields(ntff=ntff_file, profile_json=output_json_file)
 
-            upload_command = (
-                f'profile-upload -F "neff=@{neff_name}.neff" -F "ntff=@{neff_name}.ntff" -F name={neff_name}'
-            )
-            with open(f"{self.cache_dir}/upload_profile.log", "a") as f:
-                f.write(f"{upload_command}\n")
-        except Exception as e:
-            error_string = capture_error_message(e)
-            best_result.add_error(error_string)
+                upload_command = (
+                    f'profile-upload -F "neff=@{neff_name}.neff" -F "ntff=@{neff_name}.ntff" -F name={neff_name}'
+                )
+                with open(f"{self.cache_dir}/upload_profile.log", "a") as f:
+                    f.write(f"{upload_command}\n")
+            except Exception as e:
+                error_string = capture_error_message(e)
+                result.add_error(error_string)
+                result.add_fields(hfu=0)

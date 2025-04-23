@@ -1,4 +1,6 @@
 import shutil
+import sys
+import traceback
 import types
 from typing import Dict, Tuple
 
@@ -14,6 +16,13 @@ from autotune.kernels.rmsnorm_linear import (
     blocked_fused_rms_norm_linear,
     stack_allocated_fused_rms_norm_qkv,
 )
+
+
+def capture_error_message(e) -> str:
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    error_string = f"{exc_type.__name__}: {str(e)}\n"
+    error_string += "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    return error_string
 
 
 def get_kernel_by_name(kernel_name):
