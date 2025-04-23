@@ -1,7 +1,7 @@
 import os
 import random
 from concurrent.futures import ProcessPoolExecutor
-from typing import Callable, List, Tuple
+from typing import Callable, List, Set, Tuple
 
 import numpy as np
 from tqdm import tqdm
@@ -18,20 +18,34 @@ def run_with_args_and_kwargs(func, args, kwargs):
     return func(*args, **kwargs)
 
 
+def get_batch_size(num_samples: int, total_num_samples: int):
+    batch_size = max(num_samples, 1000)
+    batch_size = min(batch_size, total_num_samples)
+    return batch_size
+
+
 class ProfileJob:
-    # TODO: preprocessing, postprocessing components
-    def __init__(
-        self, kernel_name: str, kernel_args: Tuple[np.ndarray, ...], preprocessing: Callable, **kwargs
-    ) -> None:
+    # TODO: filter, postprocessing components
+    def __init__(self, kernel_name: str, kernel_args: Tuple[np.ndarray, ...], filter: Callable, **kwargs) -> None:
         self.kernel_name = kernel_name
         self.kernel_args: Tuple[np.ndarray, ...] = kernel_args
-        self.preprocessing = preprocessing
+        self.filter = filter
         self.kwargs = kwargs
         self.name = get_hash_name(kernel_name, kernel_args, kwargs)
 
     def get_arg_shapes(self):
         arg_shapes = [arg.shape for arg in self.kernel_args]
         return arg_shapes
+
+    def add_fields(self, **kwargs):
+        """
+        Add additional fields to this ProfileJob instance.
+
+        Args:
+            **kwargs: Arbitrary keyword arguments to add as attributes
+        """
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
     def __repr__(self) -> str:
         arg_shapes = [str(arg.shape) for arg in self.kernel_args]
@@ -54,42 +68,56 @@ class ProfileJobs:
         self.jobs: List[ProfileJob] = []
 
     def add_job(
-        self,
-        kernel_name: str,
-        kernel_args: Tuple[np.ndarray, ...],
-        *,
-        preprocessing: Callable = dummy_pruning,
-        **kwargs,
+        self, kernel_name: str, kernel_args: Tuple[np.ndarray, ...], *, filter: Callable = dummy_pruning, **kwargs
     ):
-        job = ProfileJob(kernel_name, kernel_args, preprocessing, **kwargs)
+        job = ProfileJob(kernel_name, kernel_args, filter, **kwargs)
         self.jobs.append(job)
-
-    def _parallel_filter(self) -> List[ProfileJob]:
-        futures = []
-        num_workers = min(len(self.jobs), os.cpu_count() - 1)
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for job_id in range(self.num_jobs):
-                job = self.jobs[job_id]
-                future = executor.submit(run_with_args_and_kwargs, job.preprocessing, job.get_arg_shapes(), job.kwargs)
-                futures.append((job_id, future))
-
-        valid_jobs: List[ProfileJob] = []
-        for job_id, future in tqdm(futures, total=len(futures), desc="Filtering jobs"):
-            job = self.jobs[job_id]
-            try:
-                success = future.result()
-                valid_jobs.append(job)
-            except Exception as e:
-                error_msg = capture_error_message(e)
-        return valid_jobs
 
     def sample(self, num_samples: int) -> None:
         """Sample only from valid jobs."""
-        valid_jobs = self._parallel_filter()
-        num_samples = min(num_samples, len(valid_jobs))
-        if num_samples > 0:
-            sampled_jobs = random.sample(valid_jobs, num_samples)
-        self.jobs = sampled_jobs
+        valid_jobs: List[ProfileJob] = []
+        remaining_num_samples = num_samples
+
+        # Keep track of jobs we've already processed
+        processed_job_ids: Set[int] = set()
+        available_job_ids = list(range(self.num_jobs))
+
+        while remaining_num_samples > 0 and available_job_ids:
+            # 1. Randomly sample remaining jobs
+            batch_size = get_batch_size(remaining_num_samples, len(available_job_ids))
+            sampled_job_ids = random.sample(available_job_ids, batch_size)
+
+            # Remove sampled jobs from available pool
+            for job_id in sampled_job_ids:
+                available_job_ids.remove(job_id)
+
+            # 2. Process the sampled batch in parallel
+            futures = []
+            num_workers = min(len(sampled_job_ids), os.cpu_count() - 1)
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                for job_id in sampled_job_ids:
+                    job = self.jobs[job_id]
+                    future = executor.submit(run_with_args_and_kwargs, job.filter, job.get_arg_shapes(), job.kwargs)
+                    futures.append((job_id, future))
+
+            # Process results of this batch
+            batch_valid_jobs: List[ProfileJob] = []
+            for job_id, future in tqdm(
+                futures, total=len(futures), desc=f"Filtering jobs (need {remaining_num_samples} more)"
+            ):
+                job = self.jobs[job_id]
+                try:
+                    success = future.result()
+                    batch_valid_jobs.append(job)
+                except Exception as e:
+                    error_msg = capture_error_message(e)
+
+                processed_job_ids.add(job_id)
+
+            # 3. Update remaining count
+            valid_jobs.extend(batch_valid_jobs[:remaining_num_samples])
+            remaining_num_samples = num_samples - len(valid_jobs)
+        self.jobs = valid_jobs
 
     @property
     def num_jobs(self) -> int:
