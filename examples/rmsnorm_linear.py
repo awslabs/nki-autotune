@@ -8,8 +8,7 @@ from neuronpy.core.language import bfloat16
 
 from autotune.cache.directories import get_cache_dir
 from autotune.cache.parameter_importance import analyze_and_visualize
-from autotune.cache.visualize import plot_pe_vs_k_comparison
-from autotune.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear
+from autotune.cache.visualize import plot_metrics_vs_k_comparison
 from autotune.kernels.utils import GEMMCompatibility
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
@@ -38,9 +37,9 @@ def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
     for NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N in params:
         config = {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "BUFFER_M": BUFFER_M, "BUFFER_N": BUFFER_N}
         jobs.add_job(
-            kernel=blocked_fused_rms_norm_linear,
+            kernel_name="blocked_fused_rms_norm_linear",
             kernel_args=(lhs, rhs),
-            pruning_func=GEMMCompatibility(transposed_lhs=False),
+            preprocessing=GEMMCompatibility(transposed_lhs=False),
             **config,
         )
     return jobs
@@ -69,9 +68,9 @@ def profile(workload_name: str, M: int, N: int, K: int):
     baseline_tuner()
 
     jobs = get_autotune_jobs(M, N, K)
-    sampled_jobs = jobs.sample(10)
+    jobs.sample(10)
     cache_dir = get_cache_dir(workload_name, "tuned", M=M, N=N, K=K)
-    tuner = Benchmark(jobs=sampled_jobs, cache_dir=cache_dir)
+    tuner = Benchmark(jobs=jobs, cache_dir=cache_dir)
     tuner()
 
 
@@ -82,7 +81,6 @@ if __name__ == "__main__":
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     for M, N, K in MNK:
         profile(workload_name, M, N, K)
-        #     plot_pe_vs_k_comparison(workload_name)
-        break
-    plot_pe_vs_k_comparison(workload_name)
+        plot_metrics_vs_k_comparison(workload_name)
+    plot_metrics_vs_k_comparison(workload_name)
     analyze_and_visualize(workload_name)

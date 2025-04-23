@@ -9,27 +9,30 @@ from autotune.cache.results import PerformanceMetrics
 from autotune.tune.metrics import calculate_GEMM_pe_utilization
 
 
-def collect_pe_data_with_stats(directory: str):
+def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu")):
     """
-    Collect PE utilization data for all MNK combinations in a directory,
+    Collect multiple performance metrics (PE utilization and/or HFU) for all MNK combinations,
     calculating both best and mean performance metrics.
 
     Parameters:
     -----------
     directory : str
         Directory containing M-N-K subdirectories with perf_metrics.json files.
+    metrics : tuple
+        Metrics to collect, options include "pe_util" and "hfu"
 
     Returns:
     --------
     dict
-        Dictionary mapping (M, N) pairs to dictionaries of K values and their PE utilization data
-        with 'best' and 'mean' statistics.
+        Dictionary mapping metric names to dictionaries of (M, N) pairs to dictionaries of K values
+        and their respective metric data with 'best' and 'mean' statistics.
     """
-    pe_utilization_data = defaultdict(lambda: defaultdict(dict))
+    # Initialize metrics data structure
+    metrics_data = {metric: defaultdict(lambda: defaultdict(dict)) for metric in metrics}
 
     if not os.path.exists(directory):
         print(f"Directory not found: {directory}")
-        return pe_utilization_data
+        return metrics_data
 
     # Scan the directories to find all MNK combinations
     for dirname in os.listdir(directory):
@@ -46,34 +49,55 @@ def collect_pe_data_with_stats(directory: str):
                 if not all_results:
                     continue
 
-                # Calculate best (minimum time) configuration
+                # Find best configuration (minimum time)
                 best_config = min(all_results, key=lambda r: r.min_ms)
-                best_pe_util = calculate_GEMM_pe_utilization((k, m), (k, n), best_config.min_ms, "trn1")
 
-                # Calculate mean PE utilization across all configurations
-                all_pe_utils = [calculate_GEMM_pe_utilization((k, m), (k, n), r.min_ms, "trn1") for r in all_results]
-                mean_pe_util = np.mean(all_pe_utils) if all_pe_utils else 0
+                # Process each requested metric
+                for metric in metrics:
+                    if metric == "pe_util":
+                        # Calculate PE utilization for best config
+                        best_pe_util = calculate_GEMM_pe_utilization((k, m), (k, n), best_config.min_ms, "trn1")
 
-                # Store both metrics
-                pe_utilization_data[(m, n)][k]["best"] = best_pe_util
-                pe_utilization_data[(m, n)][k]["mean"] = mean_pe_util
+                        # Calculate mean PE utilization across all configurations
+                        all_pe_utils = [
+                            calculate_GEMM_pe_utilization((k, m), (k, n), r.min_ms, "trn1") for r in all_results
+                        ]
+                        mean_pe_util = np.mean(all_pe_utils) if all_pe_utils else 0
 
-    return pe_utilization_data
+                        # Store both metrics
+                        metrics_data["pe_util"][(m, n)][k]["best"] = best_pe_util
+                        metrics_data["pe_util"][(m, n)][k]["mean"] = mean_pe_util
+
+                    elif metric == "hfu":
+                        # Extract HFU for best config if available
+                        best_hfu = best_config.hfu
+
+                        # Calculate mean HFU across all configurations
+                        all_hfus = [r.hfu for r in all_results]
+                        mean_hfu = np.mean(all_hfus) if all_hfus else 0
+
+                        # Store both metrics
+                        metrics_data["hfu"][(m, n)][k]["best"] = best_hfu
+                        metrics_data["hfu"][(m, n)][k]["mean"] = mean_hfu
+
+    return metrics_data
 
 
-def plot_single_pe_vs_k_comparison(m, n, tuned_data, baseline_data, plots_dir):
+def plot_single_metric_vs_k_comparison(m, n, metric_name, tuned_data, baseline_data, plots_dir):
     """
-    Create a single plot comparing tuned vs baseline PE utilization vs K for a specific (M, N) pair,
+    Create a single plot comparing tuned vs baseline metrics vs K for a specific (M, N) pair,
     showing best and mean statistics for tuned data.
 
     Parameters:
     -----------
     m, n : int
         M and N dimensions.
+    metric_name : str
+        Name of the metric to plot ('pe_util' or 'hfu')
     tuned_data : dict
-        Nested dict mapping K values to 'best' and 'mean' PE utilization for tuned configs.
+        Nested dict mapping K values to 'best' and 'mean' metric values for tuned configs.
     baseline_data : dict
-        Dictionary mapping K values to their respective PE utilization for baseline configs.
+        Dictionary mapping K values to their respective metric values for baseline configs.
     plots_dir : str
         Directory to save the plot.
     """
@@ -137,22 +161,52 @@ def plot_single_pe_vs_k_comparison(m, n, tuned_data, baseline_data, plots_dir):
                 label=styles[2][2],
             )
 
-    # Add a horizontal line at 87.5% to represent Trn1 Max
-    plt.axhline(y=0.875, color="purple", linestyle="--", linewidth=2, label="Trn1 Max")
+    # Set metric-specific properties
+    if metric_name == "pe_util":
+        # Add a horizontal line at 87.5% to represent Trn1 Max
+        plt.axhline(y=0.875, color="purple", linestyle="--", linewidth=2, label="Trn1 Max")
 
-    # Add text annotation for the line
-    if all_k_values:
-        plt.text(
-            min(all_k_values),  # X position - start of plot
-            0.885,  # Y position - slightly above the line
-            "87.5%",  # Text label
-            color="purple",
-            fontweight="bold",
-        )
+        # Add text annotation for the line
+        if all_k_values:
+            plt.text(
+                min(all_k_values),  # X position - start of plot
+                0.885,  # Y position - slightly above the line
+                "87.5%",  # Text label
+                color="purple",
+                fontweight="bold",
+            )
 
-    plt.title(f"PE Utilization vs. K for M={m}, N={n}")
+        plot_title = f"PE Utilization vs. K for M={m}, N={n}"
+        y_label = "PE Utilization (%)"
+        plot_type = "GEMM_PE_utilization"
+
+    elif metric_name == "hfu":
+        # Add a horizontal line at 87.5% to represent theoretical maximum
+        plt.axhline(y=0.875, color="purple", linestyle="--", linewidth=2, label="Theoretical Max")
+
+        # Add text annotation for the line
+        if all_k_values:
+            plt.text(
+                min(all_k_values),  # X position - start of plot
+                0.885,  # Y position - slightly above the line
+                "87.5%",  # Text label
+                color="purple",
+                fontweight="bold",
+            )
+
+        plot_title = f"Hardware Flops Utilization vs. K for M={m}, N={n}"
+        y_label = "Hardware Flops Utilization (%)"
+        plot_type = "Hardware_Flops_Utilization"
+
+    else:
+        # Generic case
+        plot_title = f"{metric_name} vs. K for M={m}, N={n}"
+        y_label = f"{metric_name} (%)"
+        plot_type = f"{metric_name}_vs_k"
+
+    plt.title(plot_title)
     plt.xlabel("K")
-    plt.ylabel("PE Utilization (%)")
+    plt.ylabel(y_label)
     plt.grid(True)
 
     # Use the already collected all_k_values for x-ticks
@@ -179,22 +233,24 @@ def plot_single_pe_vs_k_comparison(m, n, tuned_data, baseline_data, plots_dir):
 
     plt.tight_layout()
 
-    # GEMM_PE_utilization plots go directly in the plots directory
-    save_dir, filename = get_save_path(plots_dir, "GEMM_PE_utilization", m, n)
+    # Save plot
+    save_dir, filename = get_save_path(plots_dir, plot_type, m, n)
     save_path = os.path.join(save_dir, filename)
     plt.savefig(save_path, dpi=400)
     plt.close()
 
 
-def plot_pe_vs_k_comparison(workload_name: str):
+def plot_metrics_vs_k_comparison(workload_name: str, metrics=("pe_util", "hfu")):
     """
-    Create plots comparing PE utilization vs K for each unique (M, N) pair between tuned and baseline,
-    showing best and mean statistics for tuned data.
+    Create plots comparing selected metrics vs K for each unique (M, N) pair between
+    tuned and baseline, showing best and mean statistics for tuned data.
 
     Parameters:
     -----------
     workload_name : str
         Name of the workload (used to locate directories and save plots)
+    metrics : tuple
+        Metrics to plot, options include "pe_util" and "hfu"
     """
     # Construct directory paths
     tuned_dir = get_cache_dir(workload_name, "tuned")
@@ -205,17 +261,22 @@ def plot_pe_vs_k_comparison(workload_name: str):
     os.makedirs(plots_dir, exist_ok=True)
 
     # Collect data from tuned and baseline directories with statistics
-    tuned_data = collect_pe_data_with_stats(tuned_dir)
-    baseline_data = collect_pe_data_with_stats(baseline_dir)
+    tuned_metrics = collect_metrics_data_with_stats(tuned_dir, metrics)
+    baseline_metrics = collect_metrics_data_with_stats(baseline_dir, metrics)
 
-    # Get all unique (M, N) pairs from both datasets
-    all_mn_pairs = set(tuned_data.keys()).union(baseline_data.keys())
+    # Process each metric
+    for metric in metrics:
+        tuned_data = tuned_metrics.get(metric, {})
+        baseline_data = baseline_metrics.get(metric, {})
 
-    # Create plots for each (M, N) pair
-    for m, n in all_mn_pairs:
-        tuned_k_data = tuned_data.get((m, n), {})
-        baseline_k_data = baseline_data.get((m, n), {})
+        # Get all unique (M, N) pairs from both datasets for this metric
+        all_mn_pairs = set(tuned_data.keys()).union(baseline_data.keys())
 
-        # Only create plot if we have data for either tuned or baseline
-        if tuned_k_data or baseline_k_data:
-            plot_single_pe_vs_k_comparison(m, n, tuned_k_data, baseline_k_data, plots_dir)
+        # Create plots for each (M, N) pair
+        for m, n in all_mn_pairs:
+            tuned_k_data = tuned_data.get((m, n), {})
+            baseline_k_data = baseline_data.get((m, n), {})
+
+            # Only create plot if we have data for either tuned or baseline
+            if tuned_k_data or baseline_k_data:
+                plot_single_metric_vs_k_comparison(m, n, metric, tuned_k_data, baseline_k_data, plots_dir)

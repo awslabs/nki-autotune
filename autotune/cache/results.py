@@ -55,13 +55,21 @@ class PerformanceResult:
             self.attributes.add(key)
 
     def add_error(self, error_msg: str):
-        self.error = error_msg
-        if self.lower_is_better:
-            setattr(self, self.main_metric, float("inf"))
-        else:
-            setattr(self, self.main_metric, -float("inf"))
-        self.attributes.add("error")
-        self.attributes.add(self.main_metric)
+        """
+        Add error information, but only if no error has been recorded yet.
+        This ensures we keep the earliest error encountered.
+
+        Args:
+            error_msg: The error message to record
+        """
+        if "error" not in self.attributes:
+            self.error = error_msg
+            if self.lower_is_better:
+                setattr(self, self.main_metric, float("inf"))
+            else:
+                setattr(self, self.main_metric, -float("inf"))
+            self.attributes.add("error")
+            self.attributes.add(self.main_metric)
 
 
 class PerformanceMetrics:
@@ -200,7 +208,7 @@ class PerformanceMetrics:
 
         # Create a new instance with appropriate size
         results_data = data.get("results", [])
-        metrics = cls(size=len(results_data), sort_key=sort_key, lower_is_better=lower_is_better)
+        metrics = cls(sort_key=sort_key, lower_is_better=lower_is_better)
 
         # Load results
         for result_dict in results_data:

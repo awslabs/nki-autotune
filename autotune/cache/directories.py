@@ -161,7 +161,7 @@ def get_cache_dir(workload_name: str, cache_type: str, **kwargs):
     return cache_dir
 
 
-def get_save_path(plots_dir, plot_type, m=None, n=None, k=None, run_type=None):
+def get_save_path(plots_dir: str, plot_type, m=None, n=None, k=None, run_type=None):
     """
     Determine the save path based on plot type and dimensions.
 
@@ -182,7 +182,7 @@ def get_save_path(plots_dir, plot_type, m=None, n=None, k=None, run_type=None):
         (save_path, filename)
     """
     # GEMM_PE_utilization plots go directly in the plots folder
-    if plot_type == "GEMM_PE_utilization":
+    if plot_type == "GEMM_PE_utilization" or plot_type == "Hardware_Flops_Utilization":
         return plots_dir, f"{plot_type}_M{m}_N{n}.png"
 
     # For parameter analysis plots, determine the appropriate subdirectory
