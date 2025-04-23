@@ -12,20 +12,18 @@ def dummy_pruning(*args, **kwargs):
 
 class ProfileJobs:
     def __init__(self) -> None:
-        self.valid_jobs: List[ProfileJob] = []  # Valid jobs
-        self.invalid_jobs: List[ProfileJob] = []  # Jobs with errors
-        self.all_jobs: List[ProfileJob] = []  # All jobs in original insertion order
+        self.jobs: List[ProfileJob] = []
 
-    def add_job(self, kernel, kernel_args: Tuple[np.ndarray, ...], *, pruning_func: Callable = dummy_pruning, **kwargs):
-        job = ProfileJob(kernel, kernel_args, pruning_func, **kwargs)
-        try:
-            job.prune()
-            self.valid_jobs.append(job)  # Add to valid jobs if pruning succeeds
-        except Exception as e:
-            job.add_fields(error=e)
-            self.invalid_jobs.append(job)  # Add to invalid jobs if there's an error
-
-        self.all_jobs.append(job)  # Always add to all_jobs to maintain original order
+    def add_job(
+        self,
+        kernel_name: str,
+        kernel_args: Tuple[np.ndarray, ...],
+        *,
+        preprocessing: Callable = dummy_pruning,
+        **kwargs,
+    ):
+        job = ProfileJob(kernel_name, kernel_args, preprocessing, **kwargs)
+        self.jobs.append(job)
 
     def sample(self, num_samples: int):
         """Sample only from valid jobs."""
@@ -39,6 +37,10 @@ class ProfileJobs:
     def has_valid_jobs(self) -> bool:
         """Check if there are any valid jobs."""
         return len(self.valid_jobs) > 0
+
+    @property
+    def num_jobs(self) -> int:
+        return len(self.jobs)
 
     def __repr__(self) -> str:
         """Return a string representation of ProfileJobs, showing both valid and invalid jobs."""
@@ -76,27 +78,31 @@ class ProfileJobs:
 
     def __getitem__(self, index):
         """Allow indexing to access jobs in the original order they were added."""
-        return self.all_jobs[index]
+        return self.jobs[index]
 
 
 class ProfileJob:
-    def __init__(self, kernel, kernel_args: Tuple[np.ndarray, ...], pruning_func: Callable, **kwargs) -> None:
-        self.kernel = kernel
+    # TODO: preprocessing, postprocessing components
+    def __init__(
+        self, kernel_name: str, kernel_args: Tuple[np.ndarray, ...], preprocessing: Callable, **kwargs
+    ) -> None:
+        self.kernel_name = kernel_name
         self.kernel_args: Tuple[np.ndarray, ...] = kernel_args
-        self.pruning_func = pruning_func
+        self.preprocessing = preprocessing
         self.kwargs = kwargs
-        self.name = get_hash_name(kernel, kernel_args, kwargs)
+        self.name = get_hash_name(kernel_name, kernel_args, kwargs)
 
-    def prune(self):
+    def get_arg_shapes(self):
         arg_shapes = [arg.shape for arg in self.kernel_args]
-        self.pruning_func(*arg_shapes, **self.kwargs)
+        return arg_shapes
 
     def __repr__(self) -> str:
         arg_shapes = [str(arg.shape) for arg in self.kernel_args]
-        kernel_name = getattr(self.kernel, "func_name", str(self.kernel))
         kwargs_str = ", ".join(f"{k}={v}" for k, v in self.kwargs.items())
 
-        repr_str = f"ProfileJob({type(self.kernel)} kernel={kernel_name}, shapes={arg_shapes}, kwargs={{{kwargs_str}}}, name={self.name}"
+        repr_str = (
+            f"ProfileJob(kernel={self.kernel_name}, shapes={arg_shapes}, kwargs={{{kwargs_str}}}, name={self.name}"
+        )
 
         # Add error information if available
         if hasattr(self, "error") and self.error is not None:
@@ -111,13 +117,3 @@ class ProfileJob:
         Returns None for non-existent attributes instead of raising AttributeError.
         """
         return None
-
-    def add_fields(self, **kwargs):
-        """
-        Add additional fields to this ProfileJob instance.
-
-        Args:
-            **kwargs: Arbitrary keyword arguments to add as attributes
-        """
-        for key, value in kwargs.items():
-            setattr(self, key, value)

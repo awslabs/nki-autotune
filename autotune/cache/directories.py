@@ -1,27 +1,23 @@
 import hashlib
 import os
+import re
 import time
 from typing import Dict, List, Tuple
 
 import numpy as np
-from neuronxcc.nki.compile import GenericKernel
 
 home_dir = os.environ["HOME"]
 CACHE_ROOT_DIR = f"{home_dir}/autotune-cache"
 TORCH_CACHE_DIR = f"{CACHE_ROOT_DIR}/torch"
-BASELINE_CACHE_DIR = f"{CACHE_ROOT_DIR}/baseline"
-TUNED_CACHE_DIR = f"{CACHE_ROOT_DIR}/tuned"
-VISUALIZATION_DIR = f"{CACHE_ROOT_DIR}/plots"
 
 
-def get_hash_name(kernel: GenericKernel, kernel_args: Tuple[np.ndarray, ...], configs: Dict):
-    kernel_str = kernel.__name__
+def get_hash_name(kernel_name: str, kernel_args: Tuple[np.ndarray, ...], configs: Dict):
     kernel_args_str = parse_tensor_shapes([str(arg.shape) for arg in kernel_args])
     configs_str = dict_to_string(configs)
     timestamp = str(time.time())
-    combined_str = f"{kernel_str}_{kernel_args_str}_{configs_str}_{timestamp}"
+    combined_str = f"{kernel_name}_{kernel_args_str}_{configs_str}_{timestamp}"
     hash_value = hashlib.sha256(combined_str.encode("utf-8")).hexdigest()
-    hash_name = f"{kernel_str}-{hash_value}"
+    hash_name = f"{kernel_name}-{hash_value}"
     return hash_name
 
 
@@ -126,23 +122,27 @@ def parse_tensor_shapes(tensor_shapes: List[str]) -> str:
 
 def get_cache_dir(workload_name: str, cache_type: str, **kwargs):
     """
-    Generate a cache directory path based on workload name and additional parameters.
+    Generate a cache directory path based on workload name, cache type, and additional parameters.
 
     This function creates a cache directory path by combining the root directory,
-    workload name, and key-value pairs from the provided keyword arguments. The
-    key-value pairs are appended to the directory path in the format "key1value1-key2value2".
+    workload name, cache type, and key-value pairs from the provided keyword arguments.
+    The key-value pairs are appended to the directory path in the format "key1value1-key2value2".
 
     Args:
         workload_name (str): Name of the workload to create a cache directory for
+        cache_type (str): Type of cache directory; must be one of "baseline", "tuned", or "plots"
         **kwargs: Arbitrary keyword arguments that will be used to create subdirectory names
                  in the format "keyvalue-"
 
     Returns:
         str: The full cache directory path
 
+    Raises:
+        ValueError: If cache_type is not one of "baseline", "tuned", or "plots"
+
     Example:
-        >>> get_cache_dir("sentiment_analysis", model="bert", batch=32)
-        "/path/to/cache/sentiment_analysis/modelbert-batch32"
+        >>> get_cache_dir("sentiment_analysis", "tuned", model="bert", batch=32)
+        "CACHE_ROOT_DIR/sentiment_analysis/tuned/modelbert-batch32"
     """
     if cache_type not in ["baseline", "tuned", "plots"]:
         raise ValueError(f"{cache_type} cache directory is not supported. Expecting (baseline, tuned, plots).")
@@ -159,3 +159,69 @@ def get_cache_dir(workload_name: str, cache_type: str, **kwargs):
         cache_dir = f"{cache_dir}/{kv_string}"
 
     return cache_dir
+
+
+def get_save_path(plots_dir, plot_type, m=None, n=None, k=None, run_type=None):
+    """
+    Determine the save path based on plot type and dimensions.
+
+    Parameters:
+    -----------
+    plots_dir : str
+        Base directory for plots
+    plot_type : str
+        Type of the plot
+    m, n, k : int, optional
+        Matrix dimensions if applicable
+    run_type : str, optional
+        'tuned' or 'baseline'
+
+    Returns:
+    --------
+    tuple
+        (save_path, filename)
+    """
+    # GEMM_PE_utilization plots go directly in the plots folder
+    if plot_type == "GEMM_PE_utilization":
+        return plots_dir, f"{plot_type}_M{m}_N{n}.png"
+
+    # For parameter analysis plots, determine the appropriate subdirectory
+    shape_str = ""
+    if m is not None and n is not None:
+        shape_str = f"M{m}N{n}"
+        if k is not None:
+            shape_str += f"K{k}"
+
+    # Build the subdirectory path
+    if run_type and shape_str:
+        subdir = f"{run_type}-{shape_str}"
+    elif run_type:
+        subdir = run_type
+    elif shape_str:
+        subdir = f"tuned-{shape_str}"
+    else:
+        subdir = ""
+
+    # Return appropriate paths
+    if subdir:
+        full_path = os.path.join(plots_dir, subdir)
+        os.makedirs(full_path, exist_ok=True)
+        return full_path, f"{plot_type}.png"
+    else:
+        return plots_dir, f"{plot_type}.png"
+
+
+def extract_mnk_from_dirname(dirname):
+    """
+    Extract M, N, K values from a directory name.
+
+    Args:
+        dirname: Directory name in format M{m}-N{n}-K{k}
+
+    Returns:
+        Tuple of (m, n, k) as integers, or None for any missing value
+    """
+    match = re.match(r"M(\d+)-N(\d+)-K(\d+)", dirname)
+    if match:
+        return tuple(map(int, match.groups()))
+    return None, None, None

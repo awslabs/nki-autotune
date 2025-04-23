@@ -28,7 +28,7 @@ class GEMMCompatibility:
         BUFFER_N: int = 1,
         BUFFER_K: Optional[int] = None,  # Changed from -1 to None
         **kwargs,
-    ) -> None:
+    ) -> bool:
         """
         Initialize GEMM compatibility checker.
 
@@ -93,6 +93,7 @@ class GEMMCompatibility:
 
         # Validate dimensions
         self._check()
+        return True
 
     def _calculate_sizes(self) -> None:
         """Calculate derived sizes for each dimension."""

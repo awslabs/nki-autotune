@@ -8,19 +8,17 @@ class PerformanceResult:
     Represents a single kernel performance result.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, main_metric: str, lower_is_better: bool):
         """
         Initialize a performance result.
-
-        Args:
-            **kwargs: Metrics or metadata to store with the result
         """
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+        self.main_metric = main_metric
+        self.lower_is_better = lower_is_better
+        self.attributes = set()
 
     def __repr__(self) -> str:
-        """Enhanced representation showing all attributes"""
-        attributes = [f"{k}={v}" for k, v in self.__dict__.items()]
+        """Enhanced representation showing only attributes in self.attributes"""
+        attributes = [f"{k}={getattr(self, k)}" for k in self.attributes]
         return f"PerformanceResult({', '.join(attributes)})"
 
     def __getattr__(self, name: str) -> Any:
@@ -39,8 +37,31 @@ class PerformanceResult:
         return None
 
     def to_dict(self) -> Dict:
-        """Convert to dictionary representation including all attributes."""
-        return self.__dict__.copy()
+        """Convert to dictionary representation including only attributes in self.attributes."""
+        result = {}
+        for attr in self.attributes:
+            result[attr] = getattr(self, attr)
+        return result
+
+    def add_fields(self, **kwargs):
+        """
+        Add additional fields to this ProfileJob instance.
+
+        Args:
+            **kwargs: Arbitrary keyword arguments to add as attributes
+        """
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+            self.attributes.add(key)
+
+    def add_error(self, error_msg: str):
+        self.error = error_msg
+        if self.lower_is_better:
+            setattr(self, self.main_metric, float("inf"))
+        else:
+            setattr(self, self.main_metric, -float("inf"))
+        self.attributes.add("error")
+        self.attributes.add(self.main_metric)
 
 
 class PerformanceMetrics:
@@ -48,7 +69,7 @@ class PerformanceMetrics:
     Class to manage kernel performance metrics results.
     """
 
-    def __init__(self, sort_key: str, lower_is_better: bool = True):
+    def __init__(self, sort_key: str, lower_is_better: bool):
         """
         Initialize an empty collection of performance results.
 
@@ -71,17 +92,17 @@ class PerformanceMetrics:
             The created PerformanceResult instance
 
         Raises:
-            ValueError: If sort_key is not provided in kwargs
+            ValueError: If sort_key is not provided in kwargs (only when sort_key is not empty)
         """
-        assert self.sort_key in kwargs, f"Required sort key '{self.sort_key}' missing from performance data"
-
-        result = PerformanceResult(**kwargs)
+        result = PerformanceResult(self.sort_key, self.lower_is_better)
+        result.add_fields(**kwargs)
         self.results.append(result)
         return result
 
     def get_best_result(self) -> PerformanceResult:
         """
         Get the best performing result based on the sort_key.
+        If sort_key is empty, returns the first result.
 
         Returns:
             PerformanceResult: The best performing configuration
@@ -92,6 +113,10 @@ class PerformanceMetrics:
         if not self.results:
             raise ValueError("Performance results are empty")
 
+        # If sort_key is empty, return the first result
+        if not self.sort_key:
+            return self.results[0]
+
         return (
             min(self.results, key=lambda result: getattr(result, self.sort_key))
             if self.lower_is_better
@@ -100,11 +125,17 @@ class PerformanceMetrics:
 
     def to_dict_list(self) -> List[Dict]:
         """
-        Convert all results to a list of dictionaries, sorted by the sort_key.
+        Convert all results to a list of dictionaries.
+        Results are sorted by the sort_key if it's not empty.
 
         Returns:
             List[Dict]: List of dictionary representations of all results.
         """
+        # If sort_key is empty, return results without sorting
+        if not self.sort_key:
+            return [result.to_dict() for result in self.results]
+
+        # Otherwise, sort by the sort_key
         sorted_results = sorted(
             self.results,
             key=lambda result: getattr(result, self.sort_key),
@@ -164,14 +195,15 @@ class PerformanceMetrics:
 
         # Extract metadata if available
         metadata = data.get("metadata", {})
-        sort_key = metadata.get("sort_key")
+        sort_key = metadata.get("sort_key", "")
         lower_is_better = metadata.get("lower_is_better", True)
 
-        # Create a new instance
-        metrics = cls(sort_key=sort_key, lower_is_better=lower_is_better)
+        # Create a new instance with appropriate size
+        results_data = data.get("results", [])
+        metrics = cls(size=len(results_data), sort_key=sort_key, lower_is_better=lower_is_better)
 
         # Load results
-        for result_dict in data.get("results", []):
+        for result_dict in results_data:
             metrics.add_result(**result_dict)
 
         return metrics
