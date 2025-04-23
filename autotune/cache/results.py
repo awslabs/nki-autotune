@@ -54,6 +54,18 @@ class PerformanceResult:
             setattr(self, key, value)
             self.attributes.add(key)
 
+    def remove_fields(self, *keys):
+        """
+        Remove fields from this PerformanceResult instance.
+
+        Args:
+            **kwargs: Arbitrary keyword arguments to remove as attributes
+        """
+        for key in keys:
+            if key in self.attributes:
+                delattr(self, key)
+                self.attributes.remove(key)
+
     def add_error(self, error_msg: str):
         """
         Add error information, but only if no error has been recorded yet.

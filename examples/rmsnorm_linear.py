@@ -68,7 +68,7 @@ def profile(workload_name: str, M: int, N: int, K: int):
     baseline_tuner()
 
     jobs = get_autotune_jobs(M, N, K)
-    jobs.sample(10)
+    jobs.sample(100)
     cache_dir = get_cache_dir(workload_name, "tuned", M=M, N=N, K=K)
     tuner = Benchmark(jobs=jobs, cache_dir=cache_dir)
     tuner()

@@ -103,7 +103,7 @@ class ProfileJobs:
             # Process results of this batch
             batch_valid_jobs: List[ProfileJob] = []
             for job_id, future in tqdm(
-                futures, total=len(futures), desc=f"Filtering jobs (need {remaining_num_samples} more)"
+                futures, total=len(futures), desc=f"Sampling valid jobs (need {remaining_num_samples} more)"
             ):
                 job = self.jobs[job_id]
                 try:
