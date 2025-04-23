@@ -1,8 +1,4 @@
-import json
-import subprocess
 from typing import Tuple
-
-from autotune.cache.directories import split_file_info
 
 
 def calculate_pe_utilization(mac_count: int, time_ms: float, target_instance_family: str) -> float:
@@ -59,14 +55,3 @@ def calculate_GEMM_pe_utilization(
 
     # Call the direct MAC count function
     return calculate_pe_utilization(mac_count, time_ms, target_instance_family)
-
-
-def extract_hfu(neff: str, ntff: str) -> Tuple[str, float]:
-    directory, neff_name, file_type = split_file_info(neff)
-    output_json_file = f"{directory}/{neff_name}.json"
-    dump_json_cmd = f"neuron-profile view -n {neff} -s {ntff} --output-format json --output-file {output_json_file}"
-    subprocess.run(dump_json_cmd, shell=True)
-    with open(output_json_file, "r") as f:
-        data = json.load(f)
-        hfu = data["summary"][0]["hfu_estimated_percent"]
-    return output_json_file, hfu
