@@ -6,11 +6,10 @@ from itertools import product
 import numpy as np
 from neuronpy.core.language import bfloat16
 
-from autotune.baseline.np_baselines import rmsnorm_linear_op
 from autotune.cache.directories import get_cache_dir
 from autotune.cache.parameter_importance import analyze_and_visualize
 from autotune.cache.visualize import plot_pe_vs_k_comparison
-from autotune.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear, stack_allocated_fused_rms_norm_qkv
+from autotune.kernels.rmsnorm_linear import blocked_fused_rms_norm_linear
 from autotune.kernels.utils import GEMMCompatibility
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
@@ -52,28 +51,38 @@ def get_baseline_jobs(M: int, N: int, K: int) -> ProfileJobs:
     lhs = np.zeros((batch, M, K), dtype=bfloat16)
     rhs = np.zeros((K, N), dtype=bfloat16)
     jobs = ProfileJobs()
-    jobs.add_job(kernel=stack_allocated_fused_rms_norm_qkv, kernel_args=(lhs, rhs))
-    jobs.add_job(kernel=rmsnorm_linear_op, kernel_args=(lhs, rhs))
+    jobs.add_job(
+        kernel_name="stack_allocated_fused_rms_norm_qkv",
+        kernel_args=(lhs, rhs),
+        preprocessing=GEMMCompatibility(transposed_lhs=False),
+    )
+    jobs.add_job(
+        kernel_name="rmsnorm_linear_op", kernel_args=(lhs, rhs), preprocessing=GEMMCompatibility(transposed_lhs=False)
+    )
     return jobs
 
 
-def profile(workload_name: str):
-    MNK = list(product([2048], [512], [8192]))
-    for M, N, K in MNK:
-        baseline_jobs = get_baseline_jobs(M, N, K)
-        cache_dir = get_cache_dir(workload_name, "baseline", M=M, N=N, K=K)
-        baseline_tuner = Benchmark(jobs=baseline_jobs, cache_dir=cache_dir)
-        baseline_tuner()
+def profile(workload_name: str, M: int, N: int, K: int):
+    baseline_jobs = get_baseline_jobs(M, N, K)
+    cache_dir = get_cache_dir(workload_name, "baseline", M=M, N=N, K=K)
+    baseline_tuner = Benchmark(jobs=baseline_jobs, cache_dir=cache_dir)
+    baseline_tuner()
 
-        jobs = get_autotune_jobs(M, N, K)
-        sampled_jobs = jobs.sample(100)
-        cache_dir = get_cache_dir(workload_name, "tuned", M=M, N=N, K=K)
-        tuner = Benchmark(jobs=sampled_jobs, cache_dir=cache_dir)
-        tuner()
+    jobs = get_autotune_jobs(M, N, K)
+    sampled_jobs = jobs.sample(10)
+    cache_dir = get_cache_dir(workload_name, "tuned", M=M, N=N, K=K)
+    tuner = Benchmark(jobs=sampled_jobs, cache_dir=cache_dir)
+    tuner()
 
 
 if __name__ == "__main__":
     workload_name = "fused_rmsnorm_GEMM"
-    profile(workload_name)
+    mn_shapes = [2048, 4096, 8192]
+    k_shapes = [1024, 2048, 4096, 8192, 16384]
+    MNK = list(product(mn_shapes, mn_shapes, k_shapes))
+    for M, N, K in MNK:
+        profile(workload_name, M, N, K)
+        #     plot_pe_vs_k_comparison(workload_name)
+        break
     plot_pe_vs_k_comparison(workload_name)
     analyze_and_visualize(workload_name)

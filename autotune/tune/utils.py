@@ -47,6 +47,7 @@ def compile_kernel(
             compiler_args = "--internal-nki-allocation"
     else:
         raise TypeError(f"{type(kernel)} {kernel} is not supported.")
+    # TODO: dump the specialized NKI kernels
     traced_kernel.specialize(*kernel_args, **configs)
     neff = compile_to_neff(
         trace_kernel=traced_kernel,
@@ -62,6 +63,7 @@ def compile_kernel(
 def create_spike_kernel(
     neff_path: str, kernel_name: str, kernel_args: Tuple[np.ndarray, ...], configs: Dict
 ) -> CompiledKernel:
+    # FIXME: args are used, kwargs are needed to run but not used
     kernel = get_kernel_by_name(kernel_name)
     if isinstance(kernel, types.FunctionType):
         traced_kernel = trace(kernel)
@@ -69,6 +71,7 @@ def create_spike_kernel(
         traced_kernel = kernel
     else:
         raise TypeError(f"{type(kernel)} {kernel} is not supported.")
+    # FIXME: traced_kernel.matmul_mac_count is calculating model MAC. Need to calculate hardware MAC.
     traced_kernel.specialize(*kernel_args, **configs)
     spike_kernel = CompiledKernel(traced_kernel.copy_kernel(), neff_path)
     return spike_kernel

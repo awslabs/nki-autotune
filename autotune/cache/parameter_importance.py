@@ -2,13 +2,12 @@ import glob
 import json
 import math
 import os
-import re
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from autotune.cache.directories import get_cache_dir
+from autotune.cache.directories import extract_mnk_from_dirname, get_cache_dir, get_save_path
 
 
 def safe_subtract(a, b):
@@ -134,7 +133,7 @@ def analyze_parameter_importance(json_file):
 
 
 def plot_parameter_importance(
-    param_impact, metric="impact_ratio", output_file="parameter_importance.png", include_all=True
+    param_impact, metric="impact_ratio", m=None, n=None, k=None, run_type=None, plots_dir="plots", include_all=True
 ):
     """
     Create a plot showing ranked parameter importance.
@@ -142,7 +141,9 @@ def plot_parameter_importance(
     Args:
         param_impact: Dictionary of parameter impact data
         metric: Which metric to use for ranking ('impact_ratio' or 'impact_range_ms')
-        output_file: Where to save the plot
+        m, n, k: Matrix dimensions
+        run_type: 'tuned' or 'baseline'
+        plots_dir: Base directory for plots
         include_all: Whether to include parameters with single values (no impact)
     """
     # Extract parameters that have meaningful impact (multiple values)
@@ -202,80 +203,19 @@ def plot_parameter_importance(
     plt.xticks(rotation=45)
     plt.tight_layout()
 
-    # Make sure the output directory exists
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    # Save to param_details subdirectory
+    param_details_dir = os.path.join(plots_dir, "param_details")
+    save_dir, filename = get_save_path(param_details_dir, "parameter_importance", m, n, k, run_type)
+    save_path = os.path.join(save_dir, filename)
 
     # Save the plot
-    plt.savefig(output_file, dpi=300)
+    plt.savefig(save_path, dpi=300)
     plt.close()
 
     return plot_df
 
 
-def create_parameter_detail_plots(param_impact, df, output_dir, all_parameters):
-    """
-    Create detailed plots showing performance for different values of each parameter.
-
-    Args:
-        param_impact: Dictionary of parameter impact data
-        df: DataFrame with all results
-        output_dir: Directory to save plots to
-        all_parameters: List of all parameters to ensure we plot all of them
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    if not param_impact:
-        print(f"No parameter impact data available for {output_dir}")
-        return
-
-    for param in all_parameters:
-        if param not in param_impact:
-            continue
-
-        # Skip plotting for single-value parameters with no variation
-        if param_impact[param].get("single_value", False):
-            plt.figure(figsize=(6, 3))
-            plt.text(
-                0.5,
-                0.5,
-                f"Parameter '{param}' has only one value: {param_impact[param]['best_value']}",
-                ha="center",
-                va="center",
-            )
-            plt.axis("off")
-            plt.tight_layout()
-            plt.savefig(f"{output_dir}/{param}_performance.png", dpi=300)
-            plt.close()
-            continue
-
-        # Group by parameter value and get mean performance
-        perf_by_value = df.groupby(param)["min_ms"].mean().reset_index()
-
-        # Sort by performance (ascending)
-        perf_by_value = perf_by_value.sort_values("min_ms")
-
-        # Create the plot
-        plt.figure(figsize=(12, 6))
-        bars = plt.bar(perf_by_value[param].astype(str), perf_by_value["min_ms"])
-
-        # Add value labels
-        for bar in bars:
-            height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width() / 2.0, height + 0.05, f"{height:.2f}", ha="center", va="bottom")
-
-        plt.title(f"Performance by {param} Value", fontsize=16)
-        plt.ylabel("Latency (ms, lower is better)", fontsize=14)
-        plt.xlabel(param, fontsize=14)
-        plt.xticks(rotation=45)
-        plt.grid(axis="y", linestyle="--", alpha=0.7)
-        plt.tight_layout()
-
-        # Save the plot
-        plt.savefig(f"{output_dir}/{param}_performance.png", dpi=300)
-        plt.close()
-
-
-def create_parameter_interaction_heatmap(df, param1, param2, output_file):
+def create_parameter_interaction_heatmap(df, param1, param2, plots_dir, m=None, n=None, k=None, run_type=None):
     """Create a heatmap showing how two parameters interact to affect performance."""
     # Check if both parameters have multiple values
     if df[param1].nunique() <= 1 or df[param2].nunique() <= 1:
@@ -292,9 +232,10 @@ def create_parameter_interaction_heatmap(df, param1, param2, output_file):
         plt.axis("off")
         plt.tight_layout()
 
-        # Make sure the output directory exists
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        plt.savefig(output_file, dpi=300)
+        # Save to param_details subdirectory
+        param_details_dir = os.path.join(plots_dir, "param_details")
+        save_dir, filename = get_save_path(param_details_dir, f"interaction_{param1}_{param2}", m, n, k, run_type)
+        plt.savefig(os.path.join(save_dir, filename), dpi=300)
         plt.close()
         return
 
@@ -306,10 +247,10 @@ def create_parameter_interaction_heatmap(df, param1, param2, output_file):
     plt.title(f"Average Performance: {param1} vs {param2} (ms, lower is better)")
     plt.tight_layout()
 
-    # Make sure the output directory exists
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-    plt.savefig(output_file, dpi=300)
+    # Save to param_details subdirectory
+    param_details_dir = os.path.join(plots_dir, "param_details")
+    save_dir, filename = get_save_path(param_details_dir, f"interaction_{param1}_{param2}", m, n, k, run_type)
+    plt.savefig(os.path.join(save_dir, filename), dpi=300)
     plt.close()
 
 
@@ -323,27 +264,19 @@ def analyze_single_file(json_file, plots_dir):
     """
     print(f"Analyzing: {json_file}")
 
-    # Create parameter details directory within plots dir
-    param_details_dir = os.path.join(plots_dir, "param_details")
-    os.makedirs(param_details_dir, exist_ok=True)
-
     # Extract run type and shape info from file path
     path_parts = json_file.split(os.sep)
 
     # Find run type
-    run_type = ""
+    run_type = None
     for part in path_parts:
         if part in ["baseline", "tuned"]:
-            run_type = f"_{part}"
+            run_type = part
             break
 
-    # Extract the MNK directory name
+    # Extract the MNK directory name and values
     shape_dir = os.path.basename(os.path.dirname(json_file))
-    # Match MX-NY-KZ pattern
-    match = re.match(r"M(\d+)-N(\d+)-K(\d+)", shape_dir)
-    size_info = ""
-    if match:
-        size_info = f"_{shape_dir}"
+    m, n, k = extract_mnk_from_dirname(shape_dir)
 
     # Calculate parameter importance
     param_impact, df, all_parameters = analyze_parameter_importance(json_file)
@@ -354,16 +287,13 @@ def analyze_single_file(json_file, plots_dir):
 
     # Create main importance ranking plot - include all parameters
     ranking_df = plot_parameter_importance(
-        param_impact,
-        "impact_ratio",
-        os.path.join(plots_dir, f"parameter_importance{run_type}{size_info}.png"),
-        include_all=True,
+        param_impact, metric="impact_ratio", m=m, n=n, k=k, run_type=run_type, plots_dir=plots_dir, include_all=True
     )
 
     # Create detailed plots for each parameter
-    detail_plot_dir = os.path.join(param_details_dir, f"{run_type}{size_info}".strip("_"))
-    os.makedirs(detail_plot_dir, exist_ok=True)
-    create_parameter_detail_plots(param_impact, df, detail_plot_dir, all_parameters)
+    create_parameter_detail_plots(
+        param_impact, df, all_parameters, m=m, n=n, k=k, run_type=run_type, plots_dir=plots_dir
+    )
 
     # Find top 2 parameters with variation for interaction heatmap
     varied_params = [p for p, data in param_impact.items() if not data.get("single_value", False)]
@@ -372,15 +302,14 @@ def analyze_single_file(json_file, plots_dir):
         if not varied_ranking.empty:
             top_params = varied_ranking.iloc[:2]["Parameter"].tolist()
             create_parameter_interaction_heatmap(
-                df,
-                top_params[0],
-                top_params[1],
-                os.path.join(plots_dir, f"top_param_interaction{run_type}{size_info}.png"),
+                df, top_params[0], top_params[1], plots_dir, m=m, n=n, k=k, run_type=run_type
             )
 
-    # Save analysis results as text file
-    with open(os.path.join(plots_dir, f"parameter_analysis{run_type}{size_info}.txt"), "w") as f:
-        f.write(f"GEMM Parameter Analysis{size_info}\n")
+    # Save analysis results as text file in param_details subdirectory
+    param_details_dir = os.path.join(plots_dir, "param_details")
+    save_dir, _ = get_save_path(param_details_dir, "parameter_analysis", m, n, k, run_type)
+    with open(os.path.join(save_dir, "parameter_analysis.txt"), "w") as f:
+        f.write(f"GEMM Parameter Analysis for M{m}N{n}K{k}\n")
         f.write("=" * 50 + "\n\n")
 
         f.write("Parameter ranking by performance impact ratio:\n")
@@ -417,6 +346,78 @@ def analyze_single_file(json_file, plots_dir):
                     f.write(f"  {param}: {row[param]}\n")
 
     return param_impact, df, ranking_df
+
+
+def create_parameter_detail_plots(
+    param_impact, df, all_parameters, m=None, n=None, k=None, run_type=None, plots_dir="plots"
+):
+    """
+    Create detailed plots showing performance for different values of each parameter.
+
+    Args:
+        param_impact: Dictionary of parameter impact data
+        df: DataFrame with all results
+        all_parameters: List of all parameters to ensure we plot all of them
+        m, n, k: Matrix dimensions
+        run_type: 'tuned' or 'baseline'
+        plots_dir: Base directory to save plots
+    """
+    # Base directory for parameter details
+    param_details_dir = os.path.join(plots_dir, "param_details")
+    os.makedirs(param_details_dir, exist_ok=True)
+
+    if not param_impact:
+        print(f"No parameter impact data available")
+        return
+
+    for param in all_parameters:
+        if param not in param_impact:
+            continue
+
+        # Get the directory path for saving this parameter's plot
+        save_dir, _ = get_save_path(param_details_dir, param, m, n, k, run_type)
+
+        # Skip plotting for single-value parameters with no variation
+        if param_impact[param].get("single_value", False):
+            plt.figure(figsize=(6, 3))
+            plt.text(
+                0.5,
+                0.5,
+                f"Parameter '{param}' has only one value: {param_impact[param]['best_value']}",
+                ha="center",
+                va="center",
+            )
+            plt.axis("off")
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, f"{param}_performance.png"), dpi=300)
+            plt.close()
+            continue
+
+        # Group by parameter value and get mean performance
+        perf_by_value = df.groupby(param)["min_ms"].mean().reset_index()
+
+        # Sort by performance (ascending)
+        perf_by_value = perf_by_value.sort_values("min_ms")
+
+        # Create the plot
+        plt.figure(figsize=(12, 6))
+        bars = plt.bar(perf_by_value[param].astype(str), perf_by_value["min_ms"])
+
+        # Add value labels
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width() / 2.0, height + 0.05, f"{height:.2f}", ha="center", va="bottom")
+
+        plt.title(f"Performance by {param} Value", fontsize=16)
+        plt.ylabel("Latency (ms, lower is better)", fontsize=14)
+        plt.xlabel(param, fontsize=14)
+        plt.xticks(rotation=45)
+        plt.grid(axis="y", linestyle="--", alpha=0.7)
+        plt.tight_layout()
+
+        # Save the plot
+        plt.savefig(os.path.join(save_dir, f"{param}_performance.png"), dpi=300)
+        plt.close()
 
 
 def find_all_perf_metrics_files(workload_name):
