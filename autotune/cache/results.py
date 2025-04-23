@@ -45,7 +45,7 @@ class PerformanceResult:
 
     def add_fields(self, **kwargs):
         """
-        Add additional fields to this ProfileJob instance.
+        Add additional fields to this PerformanceResult instance.
 
         Args:
             **kwargs: Arbitrary keyword arguments to add as attributes

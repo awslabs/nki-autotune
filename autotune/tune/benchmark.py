@@ -1,10 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import json
 import os
 import shutil
-import subprocess
 from concurrent.futures import ProcessPoolExecutor
 
 from neuronpy.runtime.spike import SpikeExecutor
@@ -13,6 +11,7 @@ from tqdm import tqdm
 from autotune.cache.directories import split_file_info
 from autotune.cache.results import PerformanceMetrics
 from autotune.tune.job import ProfileJobs
+from autotune.tune.metrics import extract_hfu
 from autotune.tune.utils import capture_error_message, compile_kernel, create_spike_kernel
 
 
@@ -49,7 +48,7 @@ class Benchmark:
         """
         self._parallel_compile_to_neff()
         self._profile()
-        self._trace_neff()
+        self._parallel_extract_hfu()
         self.results.save(cache_dir=self.cache_dir)
         """
         TODO: add postprocessing function. postprocessing_func = xxx.
@@ -98,12 +97,13 @@ class Benchmark:
                         benchmark_iterations=self.iters,
                         device_id=0,
                     )
+                    self._capture_neff(spike, spike_kernel, job, result)
                     result.add_fields(**stats)
                 except Exception as e:
                     error_string = capture_error_message(e)
                     result.add_error(error_string)
 
-    def _trace_neff(self):
+    def _capture_neff(self, spike, spike_kernel, job, result):
         """
         Generate trace profiles for compiled kernel files.
 
@@ -122,30 +122,28 @@ class Benchmark:
             This method is used when the 'trace' flag is set to True, allowing
             for detailed performance analysis of the compiled kernels.
         """
-        for job_id in tqdm(range(self.jobs.num_jobs), total=self.jobs.num_jobs, desc="Profiling HFU"):
+        directory, neff_name, file_type = split_file_info(result.neff)
+        spike.run(spike_kernel, *job.kernel_args, save_trace=True, artifacts_dir=directory, **job.kwargs)
+        ntff_file = f"{directory}/{neff_name}.ntff"
+        shutil.move(f"{directory}/profile.ntff", ntff_file)
+        result.add_fields(ntff=ntff_file)
+
+        upload_command = f'profile-upload -F "neff=@{neff_name}.neff" -F "ntff=@{neff_name}.ntff" -F name={neff_name}'
+        with open(f"{self.cache_dir}/upload_profile.log", "a") as f:
+            f.write(f"{upload_command}\n")
+
+    def _parallel_extract_hfu(self):
+        futures = []
+        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+            for job_id in range(self.jobs.num_jobs):
+                result = self.results[job_id]
+                future = executor.submit(extract_hfu, result.neff, result.ntff)
+                futures.append((job_id, future))
+        for job_id, future in tqdm(futures, total=len(futures), desc="Extracting HFU"):
             result = self.results[job_id]
             try:
-                directory, neff_name, file_type = split_file_info(result.neff)
-                ntff_file = f"{directory}/{neff_name}.ntff"
-                trace_cmd = f"neuron-profile capture -n {result.neff} --profile-nth-exec={self.iters}"
-                subprocess.run(trace_cmd, shell=True)
-                shutil.move(f"profile_exec_{self.iters}.ntff", ntff_file)
-
-                output_json_file = f"{directory}/{neff_name}.json"
-                dump_json_cmd = f"neuron-profile view -n {result.neff} -s {ntff_file} --output-format json --output-file {output_json_file}"
-                subprocess.run(dump_json_cmd, shell=True)
-
-                with open(output_json_file, "r") as f:
-                    data = json.load(f)
-                    hfu = data["summary"][0]["hfu_estimated_percent"]
-                    result.add_fields(hfu=hfu)
-                result.add_fields(ntff=ntff_file, profile_json=output_json_file)
-
-                upload_command = (
-                    f'profile-upload -F "neff=@{neff_name}.neff" -F "ntff=@{neff_name}.ntff" -F name={neff_name}'
-                )
-                with open(f"{self.cache_dir}/upload_profile.log", "a") as f:
-                    f.write(f"{upload_command}\n")
+                json_file, hfu = future.result()
+                result.add_fields(profile_json=json_file, hfu=hfu)
             except Exception as e:
                 error_string = capture_error_message(e)
                 result.add_error(error_string)
