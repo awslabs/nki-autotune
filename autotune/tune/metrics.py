@@ -1,9 +1,6 @@
 import json
-import os
 import subprocess
-from typing import Tuple
-
-from autotune.cache.directories import split_file_info
+from typing import Dict, Tuple
 
 
 def calculate_pe_utilization(mac_count: int, time_ms: float, target_instance_family: str) -> float:
@@ -62,17 +59,23 @@ def calculate_GEMM_pe_utilization(
     return calculate_pe_utilization(mac_count, time_ms, target_instance_family)
 
 
-def dump_profile_json(neff: str, ntff: str) -> str:
-    directory, neff_name, file_type = split_file_info(neff)
-    output_json_file = f"{directory}/{neff_name}.json"
-    dump_json_cmd = f"neuron-profile view -n {neff} -s {ntff} --output-format json --output-file {output_json_file}"
-    subprocess.run(dump_json_cmd, shell=True)
-    return output_json_file
+def extract_metrics(neff: str, ntff: str) -> Dict[str, float]:
+    dump_json_cmd = f"neuron-profile view -n {neff} -s {ntff} --output-format summary-json"
+    process = subprocess.run(dump_json_cmd, shell=True, capture_output=True, text=True, check=True)
+    json_str = process.stdout
 
+    data = json.loads(json_str)
 
-def parse_hfu(profile_json: str):
-    with open(profile_json, "r") as f:
-        data = json.load(f)
-        hfu = data["summary"][0]["hfu_estimated_percent"]
-    os.remove(profile_json)
-    return hfu
+    # Get the first (and only) key in the dictionary
+    first_key = next(iter(data))
+    metrics = data[first_key]
+
+    # Extract key performance metrics
+    important_metrics = {
+        "hfu": metrics["hfu_estimated_percent"],
+        "mbu": metrics["mbu_estimated_percent"],
+        "Tensor Engine Utilization Time": metrics["tensor_engine_active_time_percent"],
+        "Total Time (ms)": metrics["total_time"] * 1000,
+        "Arithmetic Intensity": metrics["mm_arithmetic_intensity"],
+    }
+    return important_metrics
