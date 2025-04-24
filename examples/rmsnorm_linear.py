@@ -82,5 +82,6 @@ if __name__ == "__main__":
     for M, N, K in MNK:
         profile(workload_name, M, N, K)
         plot_metrics_vs_k_comparison(workload_name)
+        break
     plot_metrics_vs_k_comparison(workload_name)
     analyze_and_visualize(workload_name)
