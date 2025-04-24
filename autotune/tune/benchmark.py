@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 import subprocess
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 from neuronpy.runtime.spike import SpikeExecutor
 from tqdm import tqdm
@@ -13,6 +13,7 @@ from tqdm import tqdm
 from autotune.cache.directories import split_file_info
 from autotune.cache.results import PerformanceMetrics
 from autotune.tune.job import ProfileJobs
+from autotune.tune.metrics import dump_profile_json, parse_hfu
 from autotune.tune.utils import capture_error_message, compile_kernel, create_spike_kernel
 
 
@@ -49,7 +50,8 @@ class Benchmark:
         """
         self._parallel_compile_to_neff()
         self._profile()
-        self._extract_hfu()
+        # self._extract_hfu()
+        self._parallel_extract_hfu()
         self.results.save(cache_dir=self.cache_dir)
         """
         TODO: add postprocessing function. postprocessing_func = xxx.
@@ -131,7 +133,6 @@ class Benchmark:
 
     def _extract_hfu(self):
         for job_id in tqdm(range(self.jobs.num_jobs), total=self.jobs.num_jobs, desc="Extracting HFU"):
-            job = self.jobs[job_id]
             result = self.results[job_id]
             output_json_file = f"{self.cache_dir}/file.json"
 
@@ -171,3 +172,26 @@ class Benchmark:
                         result.remove_fields("ntff")
                     except Exception as e:
                         print(f"Warning: Failed to remove {result.ntff}: {e}")
+
+    def _parallel_extract_hfu(self):
+        """Extract HFU data for all jobs in parallel."""
+        futures = []
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            for job_id in range(self.jobs.num_jobs):
+                result = self.results[job_id]
+                future = executor.submit(dump_profile_json, result.neff, result.ntff)
+                futures.append((job_id, future))
+
+        for job_id, future in tqdm(futures, desc="Extracting HFU"):
+            result = self.results[job_id]
+            try:
+                profile_json = future.result()
+                hfu = parse_hfu(profile_json)
+                result.add_fields(hfu=hfu)
+                if result.ntff and os.path.exists(result.ntff):
+                    os.remove(result.ntff)
+                    result.remove_fields("ntff")
+            except Exception as e:
+                error_msg = capture_error_message(e)
+                result.add_error(error_msg)
+                result.add_fields(hfu=0)
