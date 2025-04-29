@@ -2,6 +2,8 @@ import json
 import subprocess
 from typing import Dict, Tuple
 
+import numpy as np
+
 
 def calculate_pe_utilization(mac_count: int, time_ms: float, target_instance_family: str) -> float:
     """
@@ -79,3 +81,45 @@ def extract_metrics(neff: str, ntff: str) -> Dict[str, float]:
         "Arithmetic Intensity": metrics["mm_arithmetic_intensity"],
     }
     return important_metrics
+
+
+def allclose(a, b, rtol=1e-05, atol=1e-08):
+    """
+    Compare arrays with detailed information about differences.
+    """
+    a = np.asarray(a)
+    b = np.asarray(b)
+
+    # Calculate absolute differences
+    abs_diff = np.abs(a - b)
+
+    # Calculate relative differences where b is not zero
+    # (avoiding division by zero)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel_diff = abs_diff / np.abs(b)
+
+    # Replace inf/nan from division by zero
+    rel_diff = np.where(np.isfinite(rel_diff), rel_diff, 0)
+
+    # Find max differences
+    max_abs_diff = np.max(abs_diff)
+    max_rel_diff = np.max(rel_diff)
+
+    # Check if arrays are close according to numpy's definition
+    is_close = np.all(abs_diff <= atol + rtol * np.abs(b))
+
+    # Find locations of largest differences
+    max_abs_idx = np.unravel_index(np.argmax(abs_diff), abs_diff.shape)
+    max_rel_idx = np.unravel_index(np.argmax(rel_diff), rel_diff.shape)
+
+    return {
+        "is_close": is_close,
+        "max_absolute_diff": max_abs_diff,
+        "max_absolute_diff_location": max_abs_idx,
+        "max_relative_diff": max_rel_diff,
+        "max_relative_diff_location": max_rel_idx,
+        "provided_rtol": rtol,
+        "provided_atol": atol,
+        "needed_rtol": max_rel_diff if max_rel_diff > rtol else rtol,
+        "needed_atol": max_abs_diff if max_abs_diff > atol else atol,
+    }

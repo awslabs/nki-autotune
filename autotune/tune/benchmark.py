@@ -122,8 +122,11 @@ class Benchmark:
             This method is used when the 'trace' flag is set to True, allowing
             for detailed performance analysis of the compiled kernels.
         """
+        # TODO: re-use capture_neff from utils.py
         directory, neff_name, file_type = split_file_info(result.neff)
-        spike.run(spike_kernel, *job.kernel_args, save_trace=True, artifacts_dir=directory, **job.kwargs)
+        kernel_output = spike.run(
+            spike_kernel, *job.kernel_args, save_trace=True, artifacts_dir=directory, **job.kwargs
+        )
         ntff_file = f"{directory}/{neff_name}.ntff"
         shutil.move(f"{directory}/profile.ntff", ntff_file)
         result.add_fields(ntff=ntff_file)

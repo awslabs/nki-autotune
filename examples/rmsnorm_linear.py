@@ -7,8 +7,6 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.cache.directories import get_cache_dir
-from autotune.cache.parameter_importance import analyze_and_visualize
-from autotune.cache.visualize import plot_metrics_vs_k_comparison
 from autotune.kernels.utils import GEMMCompatibility
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
@@ -79,8 +77,9 @@ if __name__ == "__main__":
     mn_shapes = [2048, 4096, 8192]
     k_shapes = [1024, 2048, 4096, 8192, 16384]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
+    MNK = [(4096, 4096, 16384)]
     for M, N, K in MNK:
         profile(workload_name, M, N, K)
-        plot_metrics_vs_k_comparison(workload_name)
-    plot_metrics_vs_k_comparison(workload_name)
-    analyze_and_visualize(workload_name)
+        # plot_metrics_vs_k_comparison(workload_name)
+    # plot_metrics_vs_k_comparison(workload_name)
+    # analyze_and_visualize(workload_name)

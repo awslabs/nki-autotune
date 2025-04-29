@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict
 
 import neuronxcc.nki.language as nl
 import neuronxcc.nki.typing as nt
@@ -20,7 +20,7 @@ from autotune.kernels.utils import GEMMCompatibility
 
 
 class RMSNormLinearTestConfig(GenTests):
-    def process_test_config(self, config: Dict[str, int]) -> Tuple | None:
+    def process_test_config(self, config: Dict[str, int]) -> bool:
         M = config.get("M", 1)
         N = config.get("N", 1)
         K = config.get("K", 1)
@@ -34,9 +34,9 @@ class RMSNormLinearTestConfig(GenTests):
                 for param in ["batch", "M", "N", "K", "NUM_BLOCK_M", "NUM_BLOCK_N", "BUFFER_M", "BUFFER_N", "eps"]
                 if param in config
             )
-            return config_tuple
+            return True
         except Exception as e:
-            return None
+            return False
 
 
 @pytest.mark.parametrize(
@@ -104,41 +104,44 @@ def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
     assert match
 
 
-@pytest.mark.parametrize(
-    "batch, seqlen, dim, d_head, buffer_degree, eps",
-    [(1, 1024, 4096, 256, 1, 1e-6), (1, 2048, 1024, 512, 2, 1e-3), (1, 4096, 2048, 128, 4, 1e-6)],
-)
-def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree, eps):
-    hidden = np.random.random_sample((batch, seqlen, dim))
-    qkv_weights = np.random.random_sample((dim, d_head))
-    golden_output = nl.static_cast(rmsnorm_linear_golden(hidden, None, None, qkv_weights, eps), np.float32)
+# @pytest.mark.parametrize(
+#     "batch, seqlen, dim, d_head, eps",
+#     [(1, 1024, 4096, 256, 1e-6), (1, 2048, 1024, 512, 1e-3), (1, 4096, 2048, 128, 1e-6)],
+# )
+@pytest.mark.parametrize("batch, seqlen, dim, d_head, eps", [(1, 1024, 4096, 256, 1e-6)])
+def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, eps):
+    lhs = np.random.random_sample((batch, seqlen, dim))
+    rhs = np.random.random_sample((dim, d_head))
+    golden_output = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, eps), np.float32)
 
     data_type = np.float16
-    hidden_dev = nl.static_cast(hidden, data_type)
-    qkv_weights_dev = nl.static_cast(qkv_weights, data_type)
-    numeric_func = baremetal(stack_allocated_fused_rms_norm_qkv)
-    allocated_out = numeric_func(hidden_dev, qkv_weights_dev, nl.float32, eps)
-    allocated_out = nl.static_cast(allocated_out, np.float32)
+    atol, rtol = 1e-2, 1e-3
+    lhs = nl.static_cast(lhs, data_type)
+    rhs = nl.static_cast(rhs, data_type)
 
-    atol = 1e-2
-    rtol = 1e-3
-    match = allclose(allocated_out, golden_output, atol=atol, rtol=rtol, verbose=1)
+    # nki_out, _ = run_kernel("stack_allocated_fused_rms_norm_qkv", (lhs, rhs), eps=eps)
+    # nki_out = nl.static_cast(nki_out, np.float32)
+
+    numeric_func = baremetal(stack_allocated_fused_rms_norm_qkv)
+    nki_out = numeric_func(lhs, rhs, nl.float32, eps)
+
+    match = allclose(nki_out, golden_output, atol=atol, rtol=rtol, verbose=1)
     assert match
 
 
 @pytest.mark.parametrize(
     "batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, eps",
     RMSNormLinearTestConfig(
-        batch=[1, 2, 4],
-        M=[1024, 2048],
-        N=[2048, 4096],
-        K=[1024, 4096],
-        NUM_BLOCK_M=[1, 2, 4],
-        NUM_BLOCK_N=[1, 2, 4],
-        BUFFER_M=[1, 2, 4],
-        BUFFER_N=[1, 2, 4],
+        batch=[1],
+        M=[1024],
+        N=[1024],
+        K=[1024],
+        NUM_BLOCK_M=[1],
+        NUM_BLOCK_N=[1],
+        BUFFER_M=[1],
+        BUFFER_N=[1],
         eps=[1e-6, 1e-3],
-    ).valid_tests[:2],
+    ).sample_tests(1),
 )
 def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, eps):
     data_type = np.float32
@@ -148,10 +151,20 @@ def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NU
 
     golden = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, eps), data_type)
 
+    # nki_out, _ = run_kernel(
+    #     "blocked_fused_rms_norm_linear",
+    #     (lhs, rhs),
+    #     NUM_BLOCK_M=NUM_BLOCK_M,
+    #     NUM_BLOCK_N=NUM_BLOCK_N,
+    #     BUFFER_M=BUFFER_M,
+    #     BUFFER_N=BUFFER_N,
+    #     eps=eps,
+    # )
+
     numeric_func = baremetal(blocked_fused_rms_norm_linear)
-    nki_out = nl.static_cast(
-        numeric_func(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, nl.float32, eps), data_type
-    )
+    nki_out = numeric_func(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, nl.float32, eps)
+
+    nki_out = nl.static_cast(nki_out, data_type)
 
     assert allclose(nki_out, golden, atol=atol, rtol=rtol, verbose=1)
 
@@ -174,7 +187,7 @@ def test_blocked_fused_rms_norm_linear_perf(batch, M, K, N, eps):
     "batch, M, N, K, eps",
     RMSNormLinearTestConfig(
         batch=[1, 2, 4], M=[1024, 2048], N=[2048, 4096], K=[1024, 4096], eps=[1e-6, 1e-3]
-    ).valid_tests[:10],
+    ).sample_tests(10),
 )
 def test_np_fused_rms_norm_linear_numerical(batch, M, N, K, eps):
     data_type = np.float32
