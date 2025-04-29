@@ -1,5 +1,7 @@
 import numpy as np
 
+# FIXME: combine with golden functions
+
 
 def matmul_xt_op(x_t, y):
     """Matrix multiplication with transposed first operand"""

@@ -1,5 +1,5 @@
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict
 
 import numpy as np
 import pytest
@@ -14,12 +14,15 @@ from neuronxcc.starfish.support.util import allclose
 from test_generation import GenTests
 
 from autotune.golden.gemm import gemm_core, gemm_cpu_golden
-from autotune.kernels.matmul import gemm_with_non_transposed_lhs_MN, matmul_main
+from autotune.kernels.matmul import gemm_with_non_transposed_lhs_MN
 from autotune.kernels.utils import GEMMCompatibility
+from autotune.tune.utils import run_kernel
+
+SHAPES = [1, 2, 4, 8]
 
 
 class GEMMTestConfig(GenTests):
-    def process_test_config(self, config: Dict[str, int]) -> Tuple | None:
+    def process_test_config(self, config: Dict[str, int]) -> bool:
         TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
         TILE_N = nl.tile_size.gemm_moving_fmax  # 512
         TILE_K = nl.tile_size.pmax  # 128
@@ -44,43 +47,13 @@ class GEMMTestConfig(GenTests):
             assert max(M, N, K) <= 8192, f"Input sizes are too large for testing"
             check = GEMMCompatibility(transposed_lhs=False)
             check((M, K), (K, N), NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
-            if "M" in config:
-                config_tuple = (M, N, K)
-            else:
-                config_tuple = (M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
-            return config_tuple
+            return True
         except Exception as e:
-            return None
-
-
-def get_tests_with_loop_order(num_tests: int, test_loop_order: bool) -> List[Tuple]:
-    gen = GEMMTestConfig(
-        NUM_BLOCK_M=[1, 2, 4, 16],
-        NUM_BLOCK_N=[1, 2, 8, 16],
-        NUM_BLOCK_K=[1, 2, 8, 16],
-        TILES_IN_BLOCK_M=[1, 4, 8],
-        TILES_IN_BLOCK_N=[1, 4, 8],
-        TILES_IN_BLOCK_K=[1, 4, 8],
-        BUFFER_M=[1, 2, 4, 8],
-        BUFFER_N=[1, 2, 4, 8],
-        BUFFER_K=[1, 2, 4],
-    )
-    valid_tests = gen.valid_tests[:num_tests]
-
-    # We want to test every single loop order so it should not be part of the random test generation process
-    if test_loop_order:
-        loop_orders = ["".join(p) for p in permutations("MNK")]
-        tests = []
-        for test in valid_tests:
-            for loop_order in loop_orders:
-                tests.append(test + (loop_order,))
-    else:
-        tests = valid_tests
-    return tests
+            return False
 
 
 @pytest.mark.parametrize(
-    "M, N, K", GEMMTestConfig(M=[1024, 2048], N=[2048, 4096], K=[1024, 2048, 4096]).valid_tests[:10]
+    "M, N, K", GEMMTestConfig(M=[1024, 2048, 4096], N=[1024, 2048, 4096], K=[1024, 2048, 4096]).sample_tests(10)
 )
 def test_golden_matmul_correctness(M, N, K):
     batch = 1
@@ -95,34 +68,94 @@ def test_golden_matmul_correctness(M, N, K):
 
 
 @pytest.mark.parametrize(
-    "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order",
-    get_tests_with_loop_order(2, test_loop_order=True),
+    "NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order",
+    GEMMTestConfig(
+        NUM_BLOCK_M=SHAPES,
+        NUM_BLOCK_N=SHAPES,
+        NUM_BLOCK_K=SHAPES,
+        TILES_IN_BLOCK_M=SHAPES,
+        TILES_IN_BLOCK_N=SHAPES,
+        TILES_IN_BLOCK_K=SHAPES,
+        BUFFER_M=SHAPES,
+        BUFFER_N=SHAPES,
+        BUFFER_K=SHAPES,
+        loop_order=["".join(p) for p in permutations("MNK")],
+    ).sample_tests(10),
 )
-def test_matmul_correctness(M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order):
+def test_matmul_correctness(
+    NUM_BLOCK_M,
+    NUM_BLOCK_N,
+    NUM_BLOCK_K,
+    TILES_IN_BLOCK_M,
+    TILES_IN_BLOCK_N,
+    TILES_IN_BLOCK_K,
+    BUFFER_M,
+    BUFFER_N,
+    BUFFER_K,
+    loop_order,
+):
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+    TILE_K = nl.tile_size.pmax  # 128
+    M = NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M
+    N = NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N
+    K = NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K
     data_type = np.float32
-    atol, rtol = 1e-2, 1e-3
     lhsT = np.random.random_sample((K, M)).astype(data_type)
     rhs = np.random.random_sample((K, N)).astype(data_type)
     golden_output = nl.static_cast(gemm_cpu_golden(lhsT, rhs, lhs_is_transposed=True), np.float32)
 
     lhsT_dev = nl.static_cast(lhsT, data_type)
     rhs_dev = nl.static_cast(rhs, data_type)
-    numeric_func = baremetal(matmul_main)
-    nki_out = numeric_func(
-        lhsT_dev, rhs_dev, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order=loop_order
+
+    nki_out, metrics = run_kernel(
+        kernel_name="matmul_main",
+        kernel_args=(lhsT_dev, rhs_dev),
+        NUM_BLOCK_M=NUM_BLOCK_M,
+        NUM_BLOCK_N=NUM_BLOCK_N,
+        NUM_BLOCK_K=NUM_BLOCK_K,
+        BUFFER_M=BUFFER_M,
+        BUFFER_N=BUFFER_N,
+        BUFFER_K=BUFFER_K,
+        loop_order=loop_order,
     )
     nki_out = nl.static_cast(nki_out, np.float32)
 
+    atol, rtol = 1e-2, 1e-3
     assert allclose(nki_out, golden_output, atol=atol, rtol=rtol, verbose=1)
 
 
 @pytest.mark.parametrize(
-    "M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K",
-    get_tests_with_loop_order(5, test_loop_order=False),
+    "NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K",
+    GEMMTestConfig(
+        NUM_BLOCK_M=SHAPES,
+        NUM_BLOCK_N=SHAPES,
+        NUM_BLOCK_K=SHAPES,
+        TILES_IN_BLOCK_M=SHAPES,
+        TILES_IN_BLOCK_N=SHAPES,
+        TILES_IN_BLOCK_K=SHAPES,
+        BUFFER_M=SHAPES,
+        BUFFER_N=SHAPES,
+        BUFFER_K=SHAPES,
+    ).sample_tests(5),
 )
 def test_non_transposed_matmul_correctness(
-    M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K
+    NUM_BLOCK_M,
+    NUM_BLOCK_N,
+    NUM_BLOCK_K,
+    TILES_IN_BLOCK_M,
+    TILES_IN_BLOCK_N,
+    TILES_IN_BLOCK_K,
+    BUFFER_M,
+    BUFFER_N,
+    BUFFER_K,
 ):
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+    TILE_K = nl.tile_size.pmax  # 128
+    M = NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M
+    N = NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N
+    K = NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K
     data_type = np.float32
     atol, rtol = 1e-2, 1e-3
     lhs = np.random.random_sample((M, K)).astype(data_type)
