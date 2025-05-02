@@ -10,14 +10,10 @@ from neuronpy.core.compile import compile_to_neff, trace
 from neuronpy.runtime.spike import CompiledKernel, SpikeExecutor
 from neuronxcc.nki.compile import GenericKernel
 
-from autotune.baseline.np_baselines import matmul_op, matmul_xt_op, rmsnorm_linear_op
 from autotune.cache.directories import split_file_info
-from autotune.kernels.matmul import matmul_main
-from autotune.kernels.rmsnorm_linear import (
-    allocated_fused_rms_norm_qkv,
-    blocked_fused_rms_norm_linear,
-    stack_allocated_fused_rms_norm_qkv,
-)
+from autotune.core import matmul_main
+from autotune.golden.gemm import matmul_op, matmul_xt_op
+from autotune.golden.rmsnorm_linear import rmsnorm_gemm
 from autotune.tune.metrics import extract_metrics
 
 
@@ -33,11 +29,8 @@ def get_kernel_by_name(kernel_name: str):
     kernels = {
         "matmul_op": matmul_op,
         "matmul_xt_op": matmul_xt_op,
-        "rmsnorm_linear_op": rmsnorm_linear_op,
-        "stack_allocated_fused_rms_norm_qkv": stack_allocated_fused_rms_norm_qkv,
+        "rmsnorm_linear_op": rmsnorm_gemm,
         "matmul_main": matmul_main,
-        "allocated_fused_rms_norm_qkv": allocated_fused_rms_norm_qkv,
-        "blocked_fused_rms_norm_linear": blocked_fused_rms_norm_linear,
     }
     if kernel_name in kernels:
         kernel = kernels[kernel_name]

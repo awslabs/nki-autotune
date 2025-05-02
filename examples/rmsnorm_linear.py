@@ -7,7 +7,7 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.cache.directories import get_cache_dir
-from autotune.kernels.utils import GEMMCompatibility
+from autotune.core.utils import GEMMCompatibility
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
 

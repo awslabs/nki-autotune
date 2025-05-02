@@ -15,7 +15,7 @@ from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
 from autotune.allocation.utils import update_base_addr
-from autotune.kernels.utils import (
+from autotune.core.utils import (
     GEMMCompatibility,
     load_tensor_block,
     matmul_blocks_tile_transposed_lhs,
@@ -304,8 +304,8 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
     return out_tensor
 
 
-@nki.compiler.enable_stack_allocator()
-@nki.compiler.skip_middle_end_transformations
+# @nki.compiler.enable_stack_allocator()
+# @nki.compiler.skip_middle_end_transformations
 @nki.jit()
 def blocked_fused_rms_norm_linear(
     lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, BUFFER_M: int, BUFFER_N: int, norm_dtype=nl.float32, eps=1e-6

@@ -31,3 +31,14 @@ def gemm_cpu_golden(lhs, rhs, lhs_is_transposed: bool):
     else:
         raise ValueError(f"lhs shape {lhs.shape} is not supported")
     return output
+
+
+def matmul_xt_op(x_t, y):
+    """Matrix multiplication with transposed first operand"""
+    x = np.transpose(x_t, (1, 0))
+    return np.matmul(x, y)
+
+
+def matmul_op(x, y):
+    """Matrix multiplication with non-transposed first operand"""
+    return np.matmul(x, y)
