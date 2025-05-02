@@ -11,11 +11,11 @@ from itertools import permutations
 import neuronxcc.nki.language as nl
 from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
-from test_generation import GenTests
 
+from autotune.core.matmul import gemm_with_non_transposed_lhs_MN
+from autotune.core.test_generation import GenTests
+from autotune.core.utils import GEMMCompatibility
 from autotune.golden.gemm import gemm_core, gemm_cpu_golden
-from autotune.kernels.matmul import gemm_with_non_transposed_lhs_MN
-from autotune.kernels.utils import GEMMCompatibility
 from autotune.tune.utils import run_kernel
 
 SHAPES = [1, 2, 4, 8]

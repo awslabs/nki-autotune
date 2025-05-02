@@ -6,17 +6,16 @@ import numpy as np
 import pytest
 from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
-from test_generation import GenTests
 
-from autotune.baseline.np_baselines import rmsnorm_linear_op
-from autotune.golden.rmsnorm_linear import rmsnorm_linear_golden
-from autotune.kernels.rmsnorm_linear import (
+from autotune.core.test_generation import GenTests
+from autotune.core.utils import GEMMCompatibility
+from autotune.golden.rmsnorm_linear import fused_rmsnorm_gemm, golden_fun, rmsnorm_gemm
+from kernel_library.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
     blocked_fused_rms_norm_linear,
     stack_allocated_fused_rms_norm_qkv,
 )
-from autotune.kernels.rmsnorm_weighted import allocated_weighted_rmsnorm, weighted_rmsnorm
-from autotune.kernels.utils import GEMMCompatibility
+from kernel_library.rmsnorm_weighted import allocated_weighted_rmsnorm, weighted_rmsnorm
 
 
 class RMSNormLinearTestConfig(GenTests):
@@ -24,19 +23,36 @@ class RMSNormLinearTestConfig(GenTests):
         M = config.get("M", 1)
         N = config.get("N", 1)
         K = config.get("K", 1)
-
         try:
             assert max(M, N, K) <= 8192, f"Input sizes are too large for testing"
             check = GEMMCompatibility(transposed_lhs=False)
             check((M, K), (K, N), **config)
-            config_tuple = tuple(
-                config.get(param, 1)
-                for param in ["batch", "M", "N", "K", "NUM_BLOCK_M", "NUM_BLOCK_N", "BUFFER_M", "BUFFER_N", "eps"]
-                if param in config
-            )
             return True
         except Exception as e:
             return False
+
+
+@pytest.mark.parametrize(
+    "batch, M, N, K, eps",
+    RMSNormLinearTestConfig(
+        batch=[1, 2, 4], M=[1024, 2048, 4096], N=[1024, 2048, 4096], K=[1024, 2048, 4096], eps=[1e-6, 1e-3]
+    ).sample_tests(10),
+)
+def test_rmsnorm_gemm_np_numerical(batch: int, M: int, N: int, K: int, eps: float):
+    data_type = np.float32
+    atol, rtol = 1e-2, 1e-3
+    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
+    rhs = np.random.random_sample((K, N)).astype(data_type)
+
+    golden = golden_fun(lhs, None, None, rhs, eps)
+    np_out = rmsnorm_gemm(lhs, rhs, eps)
+    fused_np_out = fused_rmsnorm_gemm(lhs, rhs, eps)
+    assert allclose(
+        np_out, golden, atol=atol, rtol=rtol, verbose=1
+    ), f"{rmsnorm_gemm} output does not match with golden."
+    assert allclose(
+        fused_np_out, golden, atol=atol, rtol=rtol, verbose=1
+    ), f"{fused_rmsnorm_gemm} output does not match with golden."
 
 
 @pytest.mark.parametrize(
@@ -45,7 +61,7 @@ class RMSNormLinearTestConfig(GenTests):
 def test_weighted_rmsnorm(batch, seqlen, dim, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     gamma = np.random.random_sample((dim))
-    golden_output = nl.static_cast(rmsnorm_linear_golden(hidden, None, gamma, None, eps), np.float32)
+    golden_output = nl.static_cast(golden_fun(hidden, None, gamma, None, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -67,7 +83,7 @@ def test_weighted_rmsnorm(batch, seqlen, dim, eps):
 def test_allocated_weighted_rmsnorm(batch, seqlen, dim, buffer_degree, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     gamma = np.random.random_sample((dim))
-    golden_output = nl.static_cast(rmsnorm_linear_golden(hidden, None, gamma, None, eps), np.float32)
+    golden_output = nl.static_cast(golden_fun(hidden, None, gamma, None, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -89,7 +105,7 @@ def test_allocated_weighted_rmsnorm(batch, seqlen, dim, buffer_degree, eps):
 def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     qkv_weights = np.random.random_sample((dim, d_head))
-    golden_output = nl.static_cast(rmsnorm_linear_golden(hidden, None, None, qkv_weights, eps), np.float32)
+    golden_output = nl.static_cast(golden_fun(hidden, None, None, qkv_weights, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -112,7 +128,7 @@ def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
 def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, eps):
     lhs = np.random.random_sample((batch, seqlen, dim))
     rhs = np.random.random_sample((dim, d_head))
-    golden_output = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, eps), np.float32)
+    golden_output = nl.static_cast(golden_fun(lhs, None, None, rhs, eps), np.float32)
 
     data_type = np.float16
     atol, rtol = 1e-2, 1e-3
@@ -149,7 +165,7 @@ def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NU
     lhs = np.random.random_sample((batch, M, K)).astype(data_type)
     rhs = np.random.random_sample((K, N)).astype(data_type)
 
-    golden = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, eps), data_type)
+    golden = nl.static_cast(golden_fun(lhs, None, None, rhs, eps), data_type)
 
     # nki_out, _ = run_kernel(
     #     "blocked_fused_rms_norm_linear",
@@ -181,21 +197,3 @@ def test_blocked_fused_rms_norm_linear_perf(batch, M, K, N, eps):
     assert (
         optimized_p99 < baseline_p99
     ), f"blocked_fused_rms_norm_linear {optimized_p99}ms should be faster than stack_allocated_fused_rms_norm_qkv {baseline_p99}ms"
-
-
-@pytest.mark.parametrize(
-    "batch, M, N, K, eps",
-    RMSNormLinearTestConfig(
-        batch=[1, 2, 4], M=[1024, 2048], N=[2048, 4096], K=[1024, 4096], eps=[1e-6, 1e-3]
-    ).sample_tests(10),
-)
-def test_np_fused_rms_norm_linear_numerical(batch, M, N, K, eps):
-    data_type = np.float32
-    atol, rtol = 1e-2, 1e-3
-    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
-
-    golden = nl.static_cast(rmsnorm_linear_golden(lhs, None, None, rhs, eps), data_type)
-    np_out = rmsnorm_linear_op(lhs, rhs, eps)
-
-    assert allclose(np_out, golden, atol=atol, rtol=rtol, verbose=1), f"NP output does not match with golden."
