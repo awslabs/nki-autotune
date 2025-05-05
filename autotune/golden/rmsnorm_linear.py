@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 
 
@@ -16,7 +18,7 @@ def golden_fun(hidden, gate, gamma, qkv_weights, eps: float):
     return output
 
 
-def rmsnorm_gemm(x, y, eps: float = 1e-6):
+def rmsnorm_gemm_golden(x, y, eps: float = 1e-6):
     """
     Applies RMSNorm to x and then performs matrix multiplication with y.
 
@@ -33,12 +35,7 @@ def rmsnorm_gemm(x, y, eps: float = 1e-6):
     return result
 
 
-import math
-
-import numpy as np
-
-
-def fused_rmsnorm_gemm(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e-5):
+def fused_rmsnorm_gemm_golden(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e-5):
     """
     Implements Fused RMSNorm + GEMM algorithm with blocked processing in all dimensions
 

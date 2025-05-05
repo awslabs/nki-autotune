@@ -9,7 +9,7 @@ from neuronxcc.starfish.support.util import allclose
 
 from autotune.core.test_generation import GenTests
 from autotune.core.utils import GEMMCompatibility
-from autotune.golden.rmsnorm_linear import fused_rmsnorm_gemm, golden_fun, rmsnorm_gemm
+from autotune.golden.rmsnorm_linear import fused_rmsnorm_gemm_golden, golden_fun, rmsnorm_gemm_golden
 from kernel_library.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
     blocked_fused_rms_norm_linear,
@@ -45,14 +45,14 @@ def test_rmsnorm_gemm_np_numerical(batch: int, M: int, N: int, K: int, eps: floa
     rhs = np.random.random_sample((K, N)).astype(data_type)
 
     golden = golden_fun(lhs, None, None, rhs, eps)
-    np_out = rmsnorm_gemm(lhs, rhs, eps)
-    fused_np_out = fused_rmsnorm_gemm(lhs, rhs, eps)
+    np_out = rmsnorm_gemm_golden(lhs, rhs, eps)
+    fused_np_out = fused_rmsnorm_gemm_golden(lhs, rhs, eps)
     assert allclose(
         np_out, golden, atol=atol, rtol=rtol, verbose=1
-    ), f"{rmsnorm_gemm} output does not match with golden."
+    ), f"{rmsnorm_gemm_golden} output does not match with golden."
     assert allclose(
         fused_np_out, golden, atol=atol, rtol=rtol, verbose=1
-    ), f"{fused_rmsnorm_gemm} output does not match with golden."
+    ), f"{fused_rmsnorm_gemm_golden} output does not match with golden."
 
 
 @pytest.mark.parametrize(

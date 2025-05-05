@@ -13,7 +13,7 @@ from neuronxcc.nki.compile import GenericKernel
 from autotune.cache.directories import split_file_info
 from autotune.core.matmul import matmul_main
 from autotune.golden.gemm import matmul_op, matmul_xt_op
-from autotune.golden.rmsnorm_linear import rmsnorm_gemm
+from autotune.golden.rmsnorm_linear import rmsnorm_gemm_golden
 from autotune.tune.metrics import extract_metrics
 
 
@@ -29,7 +29,7 @@ def get_kernel_by_name(kernel_name: str):
     kernels = {
         "matmul_op": matmul_op,
         "matmul_xt_op": matmul_xt_op,
-        "rmsnorm_linear_op": rmsnorm_gemm,
+        "rmsnorm_linear_op": rmsnorm_gemm_golden,
         "matmul_main": matmul_main,
     }
     if kernel_name in kernels:

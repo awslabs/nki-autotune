@@ -13,13 +13,11 @@ import neuronxcc.nki.language as nl
 import numpy as np
 from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
-from neuronxcc.nki.typing import tensor
 
 from autotune.allocation.utils import update_base_addr
 from autotune.core.utils import (
     GEMMCompatibility,
     load_tensor_block,
-    matmul_block,
     matmul_blocks_tile_transposed_lhs,
     save_result_block,
     transpose_tile,
@@ -390,39 +388,3 @@ def compute_RMSNormT(in_block, mm: GEMMCompatibility, eps, norm_dtype, output_dt
         rmsnorm_block[...] = nl.multiply(in_block[tile_id_M, i_rhs.p, i_rhs.x], square_sum[...], dtype=output_dtype)
         transpose_tile(rmsnorm_block)
         in_block[tile_id_M, i_rhs.p, i_rhs.x] = nl.copy(rmsnorm_block, dtype=output_dtype)
-
-
-def fused_rmsnorm_gemm(lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int):
-    assert len(lhs.shape) == 3, f"Expecting (batch, M, K) in LHS. Received {lhs.shape}."
-    checker = GEMMCompatibility(transposed_lhs=False)
-    checker(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
-    batch_size = lhs.shape[0]
-    result = nl.ndarray((batch_size, checker.M, checker.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
-    for batch_id in nl.affine_range(batch_size):
-        for block_id_M in nl.affine_range(checker.NUM_BLOCK_M):
-            for block_id_N in nl.affine_range(checker.NUM_BLOCK_N):
-                result_block = nl.zeros(
-                    (checker.TILES_IN_BLOCK_M, checker.TILES_IN_BLOCK_N, nl.par_dim(checker.TILE_M), checker.TILE_N),
-                    dtype=result.dtype,
-                    buffer=nl.sbuf,
-                )
-                for block_id_K in nl.affine_range(checker.NUM_BLOCK_K):
-                    # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
-                    lhs_block = load_tensor_block(
-                        input_tensor=lhs,
-                        ofs=(block_id_M * checker.BLOCK_M, block_id_K * checker.BLOCK_K),
-                        load_shape=(checker.TILES_IN_BLOCK_M, checker.TILE_M, checker.BLOCK_M),
-                    )
-                    # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
-                    rhs_block = load_tensor_block(
-                        input_tensor=rhs,
-                        ofs=(block_id_K * checker.BLOCK_K, block_id_N * checker.BLOCK_N),
-                        load_shape=(checker.TILES_IN_BLOCK_K, checker.TILE_K, checker.BLOCK_N),
-                    )
-                    matmul_block(lhsT_tiles, rhs_tiles, result_tiles)
-
-                save_result_block(
-                    result[batch_id], result_tiles, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N
-                )
-
-    return result

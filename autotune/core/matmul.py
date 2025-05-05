@@ -357,17 +357,10 @@ def gemm_with_non_transposed_lhs_MNK(
 
 @nki.jit
 def gemm_with_non_transposed_lhs_MN(
-    lhs: tensor,  # Shape (M, K)
-    rhs: tensor,  # Shape (K, N)
-    NUM_BLOCK_M: int,
-    NUM_BLOCK_N: int,
-    NUM_BLOCK_K: int,
-    BUFFER_M: int,
-    BUFFER_N: int,
-    BUFFER_K: int,
+    lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int  # Shape (M, K)  # Shape (K, N)
 ):
     mm = GEMMCompatibility(transposed_lhs=False)
-    mm(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
+    mm(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
         lhs_block = load_tensor_block(
@@ -499,5 +492,37 @@ def baseline(
                     result[(TILES_IN_BLOCK_M * m + bm) * TILE_K + i_res_packed.p, BLOCK_N * n + i_res_packed.x],
                     value=result_packed[i_res_packed.p, i_res_packed.x],
                 )
+
+    return result
+
+
+@nki.jit
+def gemm_with_non_transposed_lhs_MNK(lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int):
+    checker = GEMMCompatibility(transposed_lhs=False)
+    checker(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
+    result = nl.ndarray((checker.M, checker.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+    for block_id_M in nl.affine_range(checker.NUM_BLOCK_M):
+        for block_id_N in nl.affine_range(checker.NUM_BLOCK_N):
+            result_block = nl.zeros(
+                (checker.TILES_IN_BLOCK_M, checker.TILES_IN_BLOCK_N, nl.par_dim(checker.TILE_M), checker.TILE_N),
+                dtype=result.dtype,
+                buffer=nl.sbuf,
+            )
+            for block_id_K in nl.affine_range(checker.NUM_BLOCK_K):
+                lhs_block = load_tensor_block(
+                    input_tensor=lhs,
+                    ofs=(block_id_M * checker.BLOCK_M, block_id_K * checker.BLOCK_K),
+                    load_shape=(checker.TILES_IN_BLOCK_M, checker.TILE_M, checker.BLOCK_K),
+                )
+                rhs_block = load_tensor_block(
+                    input_tensor=rhs,
+                    ofs=(block_id_K * checker.BLOCK_K, block_id_N * checker.BLOCK_N),
+                    load_shape=(checker.TILES_IN_BLOCK_K, checker.TILE_K, checker.BLOCK_N),
+                )
+                matmul_blocks_lhs(lhs_block, rhs_block, result_block)
+
+            save_result_block(
+                result, result_block, m_ofs=block_id_M * checker.BLOCK_M, n_ofs=block_id_N * checker.BLOCK_N
+            )
 
     return result
