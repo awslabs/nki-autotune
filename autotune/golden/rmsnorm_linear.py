@@ -40,7 +40,7 @@ import numpy as np
 
 def fused_rmsnorm_gemm(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e-5):
     """
-    Implements Fused RMSNorm + GEMM algorithm with blocked processing in both dimensions
+    Implements Fused RMSNorm + GEMM algorithm with blocked processing in all dimensions
 
     Parameters:
     -----------
@@ -62,12 +62,14 @@ def fused_rmsnorm_gemm(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e-5):
     assert k == k_r, f"Matrix dimensions mismatch: lhs has {k} columns but rhs has {k_r} rows"
 
     # Hard-coded block sizes
-    m_block_size = 1024
-    k_block_size = 1024
+    TILES_IN_BLOCK_M = 1024
+    TILES_IN_BLOCK_N = 1024
+    TILES_IN_BLOCK_K = 1024
 
     # Calculate number of blocks in each dimension
-    NUM_BLOCK_M = math.ceil(m / m_block_size)
-    NUM_BLOCK_K = math.ceil(k / k_block_size)
+    NUM_BLOCK_M = math.ceil(m / TILES_IN_BLOCK_M)
+    NUM_BLOCK_N = math.ceil(n / TILES_IN_BLOCK_N)
+    NUM_BLOCK_K = math.ceil(k / TILES_IN_BLOCK_K)
 
     # Initialize output tensor
     O = np.zeros((batch, m, n))
@@ -75,46 +77,52 @@ def fused_rmsnorm_gemm(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e-5):
     # Process in batches and blocks of rows
     for batch_id in range(batch):
         for block_id_M in range(NUM_BLOCK_M):
-            # Calculate start and end indices for M dimension
-            block_start_M = block_id_M * m_block_size
-            block_end_M = min((block_id_M + 1) * m_block_size, m)
-            block_rows = block_end_M - block_start_M
+            block_start_M = block_id_M * TILES_IN_BLOCK_M
+            block_end_M = min((block_id_M + 1) * TILES_IN_BLOCK_M, m)
+            block_size_M = block_end_M - block_start_M
 
-            # Initialize accumulators for this M block
-            m_sums = np.zeros(block_rows)
-            m_prevs = np.zeros(block_rows)  # Initialize m_prevs here
-            o_primes = np.zeros((block_rows, n))
+            for block_id_N in range(NUM_BLOCK_N):
+                block_start_N = block_id_N * TILES_IN_BLOCK_N
+                block_end_N = min((block_id_N + 1) * TILES_IN_BLOCK_N, n)
+                block_size_N = block_end_N - block_start_N
 
-            # Process k dimension in blocks
-            for block_id_K in range(NUM_BLOCK_K):
-                # Calculate start and end indices for K dimension
-                block_start_K = block_id_K * k_block_size
-                block_end_K = min((block_id_K + 1) * k_block_size, k)
+                # Initialize accumulators for this M-N block
+                # FIXME: for the same block M, the square sums are the same.
+                square_sums = np.zeros(block_size_M)
+                prev_square_sums = np.zeros(block_size_M)
+                result_block = np.zeros((block_size_M, block_size_N))
 
-                # Update previous sum of squares in-place
-                m_prevs[:] = m_sums
+                for block_id_K in range(NUM_BLOCK_K):
+                    block_start_K = block_id_K * TILES_IN_BLOCK_K
+                    block_end_K = min((block_id_K + 1) * TILES_IN_BLOCK_K, k)
 
-                # Calculate sum of squares for this K block
-                block = lhs[batch_id, block_start_M:block_end_M, block_start_K:block_end_K]
-                m_sums_block = np.sum(block**2, axis=1)  # Sum along k dimension
-                m_sums += m_sums_block
+                    # Get current blocks
+                    lhs_block = lhs[batch_id, block_start_M:block_end_M, block_start_K:block_end_K]
+                    rhs_block = rhs[block_start_K:block_end_K, block_start_N:block_end_N]
 
-                # Compute normalization factors
-                norm_factor_prevs = np.sqrt(m_prevs / k + epsilon)
-                norm_factors = np.sqrt(m_sums / k + epsilon)
+                    # Update previous sum of squares
+                    prev_square_sums[:] = square_sums
 
-                # Adjust previous output based on new normalization factors
-                if block_id_K > 0:
-                    rescale = (norm_factor_prevs / norm_factors)[:, np.newaxis]
-                    o_primes *= rescale
+                    # Calculate sum of squares for this K block
+                    square_sums_block = np.sum(lhs_block**2, axis=1)
+                    square_sums += square_sums_block
 
-                # Calculate contribution from this block
-                # (normalized inputs * weights) for all elements in the block at once
-                norm_block = block / norm_factors[:, np.newaxis]
-                block_contribution = np.matmul(norm_block, rhs[block_start_K:block_end_K])
-                o_primes += block_contribution
+                    # Compute normalization factors
+                    norm_factor_prevs = np.sqrt(prev_square_sums / k + epsilon)
+                    norm_factors = np.sqrt(square_sums / k + epsilon)
 
-            # Store results for this block
-            O[batch_id, block_start_M:block_end_M] = o_primes
+                    # Adjust previous output based on new normalization factors
+                    if block_id_K > 0:
+                        rescale = (norm_factor_prevs / norm_factors)[:, np.newaxis]
+                        result_block *= rescale
+
+                    # Calculate contribution from this block
+                    # (normalized inputs * weights) for all elements in the block at once
+                    norm_block = lhs_block / norm_factors[:, np.newaxis]
+                    block_contribution = np.matmul(norm_block, rhs_block)
+                    result_block += block_contribution
+
+                # Store results for this block
+                O[batch_id, block_start_M:block_end_M, block_start_N:block_end_N] = result_block
 
     return O
