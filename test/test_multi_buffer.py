@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from neuronxcc.nki import baremetal
 
-from kernel_library import stack_allocated_fused_self_attn_for_SD_small_head_size
+from kernel_library.multi_buffer import stack_allocated_fused_self_attn_for_SD_small_head_size
 
 
 @pytest.mark.parametrize("batch, seqlen, dim, eps", [(1, 1024, 4096, 1e-6)])

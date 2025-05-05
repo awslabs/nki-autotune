@@ -13,24 +13,17 @@ import neuronxcc.nki.language as nl
 import numpy as np
 from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
+from neuronxcc.nki.typing import tensor
 
 from autotune.allocation.utils import update_base_addr
 from autotune.core.utils import (
     GEMMCompatibility,
     load_tensor_block,
+    matmul_block,
     matmul_blocks_tile_transposed_lhs,
     save_result_block,
     transpose_tile,
 )
-
-
-def compatibility_checks(hidden_shape, weights_shape):
-    batch, seqlen, dim = hidden_shape
-    _dim, head_dim = weights_shape
-    pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
-    assert dim <= 8192 and dim & pmax == 0, f"Unsupported hidden dimension {dim}."
-    assert _dim == dim, f"Contraction dimensions do not match. Received {dim} and {_dim}."
-    assert head_dim <= fmax, f"Head dimension must be fmax (512) or less. Received {head_dim}."
 
 
 @nki.compiler.skip_middle_end_transformations
@@ -45,17 +38,20 @@ def allocated_fused_rms_norm_qkv(hidden, weights, hidden_buffer_degree: int, eps
         weights (_type_): Fused QKV linear weights, assumed to be eltwise-multiplied with RMS norm weight vector (gamma)
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
-    compatibility_checks(hidden.shape, weights.shape)
+    check = GEMMCompatibility(transposed_lhs=False)
+    check(hidden.shape, weights.shape)
     # Hidden should be in BSH layout.
     batch, batchless_shape = hidden.shape[0], hidden.shape[1:]
     seqlen, dim = batchless_shape
     _dim, head_dim = weights.shape
+    pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
+    assert head_dim <= fmax, f"Head dimension must be fmax (512) or less. Received {head_dim}."
+    assert dim <= 8192 and dim & pmax == 0, f"Unsupported hidden dimension {dim}."
 
     norm_dtype = nl.float32
 
     out_tensor = nl.ndarray((batch, seqlen, head_dim), dtype=hidden.dtype, buffer=nl.shared_hbm)
 
-    pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
     ix, iy = nl.mgrid[0:pmax, 0:dim]
     i_lhs = nl.mgrid[0:pmax, 0:pmax]
     i_rhs = nl.mgrid[0:pmax, 0:fmax]
@@ -213,14 +209,17 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
         norm_dtype (_type_, optional): Data type for RMS norm, should be f32 to avoid NaN. Defaults to nl.float32.
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
-    compatibility_checks(hidden.shape, weights.shape)
+    check = GEMMCompatibility(transposed_lhs=False)
+    check(hidden.shape, weights.shape)
     # Hidden should be in BSH layout.
     batch, seqlen, dim = hidden.shape
     _dim, head_dim = weights.shape
+    pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
+    assert head_dim <= fmax, f"Head dimension must be fmax (512) or less. Received {head_dim}."
+    assert dim <= 8192 and dim & pmax == 0, f"Unsupported hidden dimension {dim}."
 
     out_tensor = nl.ndarray((batch, seqlen, head_dim), dtype=hidden.dtype, buffer=nl.shared_hbm)
 
-    pmax, fmax = nl.tile_size.pmax, nl.tile_size.psum_fmax  # 128, 512
     ix, iy = nl.mgrid[0:pmax, 0:dim]
     i_lhs = nl.mgrid[0:pmax, 0:pmax]
     i_rhs = nl.mgrid[0:pmax, 0:fmax]
@@ -391,3 +390,39 @@ def compute_RMSNormT(in_block, mm: GEMMCompatibility, eps, norm_dtype, output_dt
         rmsnorm_block[...] = nl.multiply(in_block[tile_id_M, i_rhs.p, i_rhs.x], square_sum[...], dtype=output_dtype)
         transpose_tile(rmsnorm_block)
         in_block[tile_id_M, i_rhs.p, i_rhs.x] = nl.copy(rmsnorm_block, dtype=output_dtype)
+
+
+def fused_rmsnorm_gemm(lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int):
+    assert len(lhs.shape) == 3, f"Expecting (batch, M, K) in LHS. Received {lhs.shape}."
+    checker = GEMMCompatibility(transposed_lhs=False)
+    checker(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
+    batch_size = lhs.shape[0]
+    result = nl.ndarray((batch_size, checker.M, checker.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+    for batch_id in nl.affine_range(batch_size):
+        for block_id_M in nl.affine_range(checker.NUM_BLOCK_M):
+            for block_id_N in nl.affine_range(checker.NUM_BLOCK_N):
+                result_block = nl.zeros(
+                    (checker.TILES_IN_BLOCK_M, checker.TILES_IN_BLOCK_N, nl.par_dim(checker.TILE_M), checker.TILE_N),
+                    dtype=result.dtype,
+                    buffer=nl.sbuf,
+                )
+                for block_id_K in nl.affine_range(checker.NUM_BLOCK_K):
+                    # TILES_IN_BLOCK_K, TILE_K, BLOCK_M
+                    lhs_block = load_tensor_block(
+                        input_tensor=lhs,
+                        ofs=(block_id_M * checker.BLOCK_M, block_id_K * checker.BLOCK_K),
+                        load_shape=(checker.TILES_IN_BLOCK_M, checker.TILE_M, checker.BLOCK_M),
+                    )
+                    # TILES_IN_BLOCK_K, TILE_K, BLOCK_N
+                    rhs_block = load_tensor_block(
+                        input_tensor=rhs,
+                        ofs=(block_id_K * checker.BLOCK_K, block_id_N * checker.BLOCK_N),
+                        load_shape=(checker.TILES_IN_BLOCK_K, checker.TILE_K, checker.BLOCK_N),
+                    )
+                    matmul_block(lhsT_tiles, rhs_tiles, result_tiles)
+
+                save_result_block(
+                    result[batch_id], result_tiles, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N
+                )
+
+    return result
