@@ -11,7 +11,7 @@ from neuronpy.runtime.spike import CompiledKernel, SpikeExecutor
 from neuronxcc.nki.compile import GenericKernel
 
 from autotune.cache.directories import split_file_info
-from autotune.core import matmul_main
+from autotune.core.matmul import matmul_main
 from autotune.golden.gemm import matmul_op, matmul_xt_op
 from autotune.golden.rmsnorm_linear import rmsnorm_gemm
 from autotune.tune.metrics import extract_metrics
