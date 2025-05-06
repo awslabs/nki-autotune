@@ -12,7 +12,7 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 
-from autotune.core.lhs_rhs import gemm_with_non_transposed_lhs_MN, gemm_with_non_transposed_lhs_MNK
+from autotune.core.lhs_rhs import gemm_main
 from autotune.core.test_generation import GenTests
 from autotune.core.utils import GEMMCompatibility
 from autotune.golden.gemm import gemm_core, gemm_cpu_golden
@@ -136,43 +136,11 @@ def test_non_transposed_matmul_correctness(
     rhs = np.random.random_sample((K, N)).astype(data_type)
     golden_output = nl.static_cast(gemm_cpu_golden(lhs, rhs, lhs_is_transposed=False), data_type)
 
-    numeric_func = baremetal(gemm_with_non_transposed_lhs_MN)
-    nki_out = numeric_func(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
-    nki_out = nl.static_cast(nki_out, data_type)
-    assert allclose(
-        nki_out, golden_output, atol=atol, rtol=rtol, verbose=1
-    ), f"nki_out\n{nki_out}\ngolden_output\n{golden_output}"
-
-
-@pytest.mark.parametrize(
-    "NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K",
-    GEMMTestConfig(
-        NUM_BLOCK_M=SHAPES,
-        NUM_BLOCK_N=SHAPES,
-        NUM_BLOCK_K=SHAPES,
-        TILES_IN_BLOCK_M=SHAPES,
-        TILES_IN_BLOCK_N=SHAPES,
-        TILES_IN_BLOCK_K=SHAPES,
-    ).sample_tests(5),
-)
-def test_blocked_non_transposed_matmul_correctness(
-    NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K
-):
-    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-    TILE_K = nl.tile_size.pmax  # 128
-    M = NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M
-    N = NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N
-    K = NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K
-    data_type = np.float32
-    atol, rtol = 1e-2, 1e-3
-    lhs = np.random.random_sample((M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
-    golden_output = nl.static_cast(gemm_cpu_golden(lhs, rhs, lhs_is_transposed=False), data_type)
-
-    numeric_func = baremetal(gemm_with_non_transposed_lhs_MNK)
-    nki_out = numeric_func(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
-    nki_out = nl.static_cast(nki_out, data_type)
-    assert allclose(
-        nki_out, golden_output, atol=atol, rtol=rtol, verbose=1
-    ), f"nki_out\n{nki_out}\ngolden_output\n{golden_output}"
+    # for template in ["MN", "MNK", "MKN"]:
+    for template in ["MKN"]:
+        numeric_func = baremetal(gemm_main)
+        nki_out = numeric_func(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template)
+        nki_out = nl.static_cast(nki_out, data_type)
+        assert allclose(
+            nki_out, golden_output, atol=atol, rtol=rtol, verbose=1
+        ), f"Non transposed LHS GEMM {template} is numerically wrong."

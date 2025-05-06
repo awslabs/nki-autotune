@@ -15,8 +15,9 @@ from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
 from autotune.allocation.utils import update_base_addr
-from autotune.core.dma import save_result_block
-from autotune.core.utils import GEMMCompatibility, load_tensor_block, matmul_blocks_tile_transposed_lhs, transpose_tile
+from autotune.core.dma import load_tensor_block, save_result_block
+from autotune.core.layout import transpose_tile
+from autotune.core.utils import GEMMCompatibility, matmul_blocks_tile_transposed_lhs
 
 
 @nki.compiler.skip_middle_end_transformations
