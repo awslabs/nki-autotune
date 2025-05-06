@@ -12,7 +12,7 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 
-from autotune.core.matmul import gemm_with_non_transposed_lhs_MN, gemm_with_non_transposed_lhs_MNK
+from autotune.core.lhs_rhs import gemm_with_non_transposed_lhs_MN, gemm_with_non_transposed_lhs_MNK
 from autotune.core.test_generation import GenTests
 from autotune.core.utils import GEMMCompatibility
 from autotune.golden.gemm import gemm_core, gemm_cpu_golden
@@ -68,7 +68,7 @@ def test_golden_matmul_correctness(M, N, K):
 
 
 @pytest.mark.parametrize(
-    "NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order",
+    "NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, loop_order",
     GEMMTestConfig(
         NUM_BLOCK_M=SHAPES,
         NUM_BLOCK_N=SHAPES,
@@ -76,23 +76,11 @@ def test_golden_matmul_correctness(M, N, K):
         TILES_IN_BLOCK_M=SHAPES,
         TILES_IN_BLOCK_N=SHAPES,
         TILES_IN_BLOCK_K=SHAPES,
-        BUFFER_M=SHAPES,
-        BUFFER_N=SHAPES,
-        BUFFER_K=SHAPES,
         loop_order=["".join(p) for p in permutations("MNK")],
     ).sample_tests(10),
 )
 def test_matmul_correctness(
-    NUM_BLOCK_M,
-    NUM_BLOCK_N,
-    NUM_BLOCK_K,
-    TILES_IN_BLOCK_M,
-    TILES_IN_BLOCK_N,
-    TILES_IN_BLOCK_K,
-    BUFFER_M,
-    BUFFER_N,
-    BUFFER_K,
-    loop_order,
+    NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K, loop_order
 ):
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
@@ -114,9 +102,6 @@ def test_matmul_correctness(
         NUM_BLOCK_M=NUM_BLOCK_M,
         NUM_BLOCK_N=NUM_BLOCK_N,
         NUM_BLOCK_K=NUM_BLOCK_K,
-        BUFFER_M=BUFFER_M,
-        BUFFER_N=BUFFER_N,
-        BUFFER_K=BUFFER_K,
         loop_order=loop_order,
     )
     nki_out = nl.static_cast(nki_out, np.float32)

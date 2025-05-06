@@ -70,7 +70,7 @@ class Benchmark:
             for job_id in range(self.jobs.num_jobs):
                 job = self.jobs[job_id]
                 future = executor.submit(
-                    compile_kernel, job.kernel_name, job.name, job.kernel_args, job.kwargs, self.cache_dir
+                    compile_kernel, job.kernel_name, job.name, job.kernel_args, self.cache_dir, **job.kwargs
                 )
                 futures.append((job_id, future))
         for job_id, future in tqdm(futures, total=len(futures), desc="Compiling kernels"):
@@ -88,7 +88,7 @@ class Benchmark:
                 job = self.jobs[job_id]
                 result = self.results[job_id]
                 try:
-                    spike_kernel = create_spike_kernel(result.neff, job.kernel_name, job.kernel_args, job.kwargs)
+                    spike_kernel = create_spike_kernel(result.neff, job.kernel_name, job.kernel_args, **job.kwargs)
                     stats = spike.benchmark(
                         spike_kernel,
                         *job.kernel_args,

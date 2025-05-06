@@ -11,6 +11,7 @@ from neuronpy.runtime.spike import CompiledKernel, SpikeExecutor
 from neuronxcc.nki.compile import GenericKernel
 
 from autotune.cache.directories import split_file_info
+from autotune.core.lhs_rhs import gemm_with_non_transposed_lhs_MNK
 from autotune.core.matmul import matmul_main
 from autotune.golden.gemm import matmul_op, matmul_xt_op
 from autotune.golden.rmsnorm_linear import rmsnorm_gemm_golden
@@ -31,6 +32,7 @@ def get_kernel_by_name(kernel_name: str):
         "matmul_xt_op": matmul_xt_op,
         "rmsnorm_linear_op": rmsnorm_gemm_golden,
         "matmul_main": matmul_main,
+        "non_transposed_matmul": gemm_with_non_transposed_lhs_MNK,
     }
     if kernel_name in kernels:
         kernel = kernels[kernel_name]
