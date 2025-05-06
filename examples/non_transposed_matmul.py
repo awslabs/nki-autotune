@@ -26,12 +26,18 @@ def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
     NUM_BLOCK_M_options = size_options
     NUM_BLOCK_N_options = size_options
     NUM_BLOCK_K_options = size_options
-    params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options))
+    templates = ["MN", "MNK", "MKN"]
+    params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, templates))
     lhs = np.zeros((M, K), dtype=bfloat16)
     rhs = np.zeros((K, N), dtype=bfloat16)
     jobs = ProfileJobs()
-    for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K in params:
-        config = {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K}
+    for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template in params:
+        config = {
+            "NUM_BLOCK_M": NUM_BLOCK_M,
+            "NUM_BLOCK_N": NUM_BLOCK_N,
+            "NUM_BLOCK_K": NUM_BLOCK_K,
+            "template": template,
+        }
         jobs.add_job(
             kernel_name="non_transposed_matmul",
             kernel_args=(lhs, rhs),
@@ -60,7 +66,7 @@ def profile(workload_name: str, M: int, N: int, K: int):
 if __name__ == "__main__":
     workload_name = "non_transposed_GEMM"
     mn_shapes = [2048]
-    k_shapes = [1024, 2048]
+    k_shapes = [1024, 2048, 4096, 8192]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     for M, N, K in MNK:
         profile(workload_name, M, N, K)

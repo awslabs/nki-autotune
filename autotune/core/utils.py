@@ -3,7 +3,6 @@ from typing import Optional, Tuple
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
-from neuronxcc.nki.typing import tensor
 
 
 class GEMMCompatibility:
@@ -179,50 +178,6 @@ class GEMMCompatibility:
         return "\n".join(lines)
 
 
-def load_tensor_block(input_tensor, ofs: Tuple[int, int], load_shape: Tuple[int, nl.par_dim, int]):
-    """
-    Load a 2D rectangle region from the input HBM tensor to SBUF.
-    The location of the 2D region is offset by (ofs[0], ofs[1]) at its upper left corner.
-    The size of the 2D region to load into SBUF is (block_size * par_size, free_size).
-    Load the input HBM tensor by (par_size, free_size) tiles in parallel in the block dimension.
-    Output SBUF tensor has a shape of (block_size, par_size, free_size).
-
-    +------------------+
-    |                  |
-    |    +--------+    |  ← Starting at (ofs[0], ofs[1])
-    |    |Tile 0  |    |
-    |    |Tile 1  |    |  Each tile is (par_size * free_size)
-    |    |  ...   |    |
-    |    |Tile N-1|    |  N = block_size
-    |    +--------+    |
-    |                  |
-    +------------------+
-
-    Args:
-        input_tensor: the input 2D HBM tensor
-        ofs: location offsets in the 2D HBM tensor dimensions
-        load_shape: (block_size, par_dim(par_size), free_size)
-
-    Returns:
-        Loaded tiles in SBUF in the shape of load_shape
-    """
-    assert len(ofs) == 2, f"'ofs' expects (ofs_0, ofs_1). Received {ofs}."
-    assert len(load_shape) == 3, f"'load_shape' expects (block, par, free). Received {load_shape}."
-    max_rows, max_cols = input_tensor.shape
-    load_block_size, load_par_size, load_free_size = load_shape
-    tile_index = nl.mgrid[0:load_par_size, 0:load_free_size]
-    loaded_tensor = nl.ndarray(
-        (load_block_size, nl.par_dim(load_par_size), load_free_size), dtype=input_tensor.dtype, buffer=nl.sbuf
-    )
-    for block_id in nl.affine_range(load_block_size):
-        row_indices = ofs[0] + block_id * load_par_size + tile_index.p
-        col_indices = ofs[1] + tile_index.x
-        loaded_tensor[block_id, tile_index.p, tile_index.x] = nl.load(
-            input_tensor[row_indices, col_indices], mask=(row_indices < max_rows) & (col_indices < max_cols)
-        )
-    return loaded_tensor
-
-
 def matmul_block(lhsT_block, rhs_block, result_block):
     """
     Accumulate matmul result tiles between lhsT and rhs into result_block
@@ -260,52 +215,6 @@ def matmul_block(lhsT_block, rhs_block, result_block):
                 )
 
             result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
-
-
-def transpose_tiles_in_block(block):
-    """
-    Transpose the (pmax, pmax) tiles in a block in place
-    all PE array ops must output to FP32 on trn1 but must match input dtype in trn2
-    """
-    if nisa.get_nc_version() == nisa.nc_version.gen3:
-        blockT_dtype = block.dtype
-    else:
-        blockT_dtype = np.float32
-    tiles_in_block, par_size, free_size = block.shape
-    pmax = nl.tile_size.pmax
-    index = nl.mgrid[0:pmax, 0:pmax]
-
-    for tile_id in nl.affine_range(tiles_in_block):
-        for par_id in nl.affine_range(par_size // pmax):
-            par_ofs = par_id * pmax
-            for free_id in nl.affine_range(free_size // pmax):
-                free_ofs = free_id * pmax
-                tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=blockT_dtype, buffer=nl.psum)
-                tileT[index.p, index.x] = nisa.nc_transpose(block[tile_id, par_ofs + index.p, free_ofs + index.x])
-                block[tile_id, par_ofs + index.p, free_ofs + index.x] = nl.copy(tileT, dtype=block.dtype)
-
-
-def transpose_tile(tile: tensor):
-    """Transpose a (pmax, free_dim) tile
-
-    Args:
-        tile (tensor): _description_
-    """
-    if nisa.get_nc_version() == nisa.nc_version.gen3:
-        transpose_dtype = tile.dtype
-    else:
-        transpose_dtype = np.float32
-    pmax = nl.tile_size.pmax
-    assert (
-        len(tile.shape) == 2 and tile.shape[0] == pmax
-    ), f"Only supports transposing (pmax, free_dim) tiles. Received {tile.shape}."
-    _, free_size = tile.shape
-    index = nl.mgrid[0:pmax, 0:pmax]
-    for free_id in nl.affine_range(free_size // pmax):
-        free_ofs = free_id * pmax
-        tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=transpose_dtype, buffer=nl.psum)
-        tileT[...] = nisa.nc_transpose(tile[index.p, free_ofs + index.x])
-        tile[index.p, free_ofs + index.x] = nl.copy(tileT, dtype=tile.dtype)
 
 
 def matmul_blocks_lhs(lhs_block, rhs_block, result_block):

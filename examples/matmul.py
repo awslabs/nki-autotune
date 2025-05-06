@@ -26,32 +26,16 @@ def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
     NUM_BLOCK_M_options = size_options
     NUM_BLOCK_N_options = size_options
     NUM_BLOCK_K_options = size_options
-    BUFFER_M_options = NUM_BLOCK_M_options
-    BUFFER_N_options = NUM_BLOCK_N_options
-    BUFFER_K_options = NUM_BLOCK_K_options
     loop_orders = ["".join(p) for p in permutations("MNK")]
-    params = list(
-        product(
-            NUM_BLOCK_M_options,
-            NUM_BLOCK_N_options,
-            NUM_BLOCK_K_options,
-            BUFFER_M_options,
-            BUFFER_N_options,
-            BUFFER_K_options,
-            loop_orders,
-        )
-    )
+    params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, loop_orders))
     lhsT = np.zeros((K, M), dtype=bfloat16)
     rhs = np.zeros((K, N), dtype=bfloat16)
     jobs = ProfileJobs()
-    for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K, loop_order in params:
+    for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, loop_order in params:
         config = {
             "NUM_BLOCK_M": NUM_BLOCK_M,
             "NUM_BLOCK_N": NUM_BLOCK_N,
             "NUM_BLOCK_K": NUM_BLOCK_K,
-            "BUFFER_M": BUFFER_M,
-            "BUFFER_N": BUFFER_N,
-            "BUFFER_K": BUFFER_K,
             "loop_order": loop_order,
         }
         jobs.add_job(
@@ -78,8 +62,8 @@ def profile(workload_name: str, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     workload_name = "GEMM"
-    mn_shapes = [2048, 4096, 8192]
-    k_shapes = [1024, 2048, 4096, 8192, 16384]
+    mn_shapes = [2048]
+    k_shapes = [1024, 2048]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     for M, N, K in MNK:
         profile(workload_name, M, N, K)

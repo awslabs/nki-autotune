@@ -1,4 +1,50 @@
+from typing import Tuple
+
 import neuronxcc.nki.language as nl
+
+
+def load_tensor_block(input_tensor, ofs: Tuple[int, int], load_shape: Tuple[int, nl.par_dim, int]):
+    """
+    Load a 2D rectangle region from the input HBM tensor to SBUF.
+    The location of the 2D region is offset by (ofs[0], ofs[1]) at its upper left corner.
+    The size of the 2D region to load into SBUF is (block_size * par_size, free_size).
+    Load the input HBM tensor by (par_size, free_size) tiles in parallel in the block dimension.
+    Output SBUF tensor has a shape of (block_size, par_size, free_size).
+
+    +------------------+
+    |                  |
+    |    +--------+    |  ← Starting at (ofs[0], ofs[1])
+    |    |Tile 0  |    |
+    |    |Tile 1  |    |  Each tile is (par_size * free_size)
+    |    |  ...   |    |
+    |    |Tile N-1|    |  N = block_size
+    |    +--------+    |
+    |                  |
+    +------------------+
+
+    Args:
+        input_tensor: the input 2D HBM tensor
+        ofs: location offsets in the 2D HBM tensor dimensions
+        load_shape: (block_size, par_dim(par_size), free_size)
+
+    Returns:
+        Loaded tiles in SBUF in the shape of load_shape
+    """
+    assert len(ofs) == 2, f"'ofs' expects (ofs_0, ofs_1). Received {ofs}."
+    assert len(load_shape) == 3, f"'load_shape' expects (block, par, free). Received {load_shape}."
+    max_rows, max_cols = input_tensor.shape
+    load_block_size, load_par_size, load_free_size = load_shape
+    tile_index = nl.mgrid[0:load_par_size, 0:load_free_size]
+    loaded_tensor = nl.ndarray(
+        (load_block_size, nl.par_dim(load_par_size), load_free_size), dtype=input_tensor.dtype, buffer=nl.sbuf
+    )
+    for block_id in nl.affine_range(load_block_size):
+        row_indices = ofs[0] + block_id * load_par_size + tile_index.p
+        col_indices = ofs[1] + tile_index.x
+        loaded_tensor[block_id, tile_index.p, tile_index.x] = nl.load(
+            input_tensor[row_indices, col_indices], mask=(row_indices < max_rows) & (col_indices < max_cols)
+        )
+    return loaded_tensor
 
 
 def save_result_dma(result, result_tiles, block_id, m_ofs, n_ofs, TILE_K):

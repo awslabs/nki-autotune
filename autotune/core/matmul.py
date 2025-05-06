@@ -7,8 +7,8 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki.compiler.backends.neuron.tensors import KernelHBMTensor
 from neuronxcc.nki.typing import tensor
 
-from autotune.core.dma import save_result_acc, save_result_block, save_result_dma
-from autotune.core.utils import GEMMCompatibility, load_tensor_block, matmul_block
+from autotune.core.dma import load_tensor_block, save_result_acc, save_result_block, save_result_dma
+from autotune.core.utils import GEMMCompatibility, matmul_block
 
 
 @nki.jit
@@ -255,16 +255,7 @@ def matmul_MKN(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelH
 
                 matmul_block(lhsT_tiles, rhs_tiles, result_tiles[block_id_N])
 
-        # FIXME: double check the reduction.
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-            """
-            save_result_block(
-                result,
-                result_tiles[block_id_N],
-                m_ofs=block_id_M * mm.BLOCK_M,
-                n_ofs=block_id_N * mm.BLOCK_N,
-            )
-            """
             save_result_dma(
                 result,
                 result_tiles,
