@@ -15,13 +15,8 @@ from neuronxcc import nki
 from neuronxcc.nki.language import par_dim
 
 from autotune.allocation.utils import update_base_addr
-from autotune.core.utils import (
-    GEMMCompatibility,
-    load_tensor_block,
-    matmul_blocks_tile_transposed_lhs,
-    save_result_block,
-    transpose_tile,
-)
+from autotune.core.dma import save_result_block
+from autotune.core.utils import GEMMCompatibility, load_tensor_block, matmul_blocks_tile_transposed_lhs, transpose_tile
 
 
 @nki.compiler.skip_middle_end_transformations
@@ -36,8 +31,6 @@ def allocated_fused_rms_norm_qkv(hidden, weights, hidden_buffer_degree: int, eps
         weights (_type_): Fused QKV linear weights, assumed to be eltwise-multiplied with RMS norm weight vector (gamma)
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
-    check = GEMMCompatibility(transposed_lhs=False)
-    check(hidden.shape, weights.shape)
     # Hidden should be in BSH layout.
     batch, batchless_shape = hidden.shape[0], hidden.shape[1:]
     seqlen, dim = batchless_shape
@@ -207,8 +200,6 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
         norm_dtype (_type_, optional): Data type for RMS norm, should be f32 to avoid NaN. Defaults to nl.float32.
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
     """
-    check = GEMMCompatibility(transposed_lhs=False)
-    check(hidden.shape, weights.shape)
     # Hidden should be in BSH layout.
     batch, seqlen, dim = hidden.shape
     _dim, head_dim = weights.shape
