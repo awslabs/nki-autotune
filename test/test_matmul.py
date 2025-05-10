@@ -114,12 +114,12 @@ def test_matmul_correctness(
     "NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K",
     GEMMTestConfig(
         NUM_BLOCK_M=SHAPES,
-        NUM_BLOCK_N=SHAPES,
+        NUM_BLOCK_N=[1, 2],
         NUM_BLOCK_K=SHAPES,
         TILES_IN_BLOCK_M=SHAPES,
         TILES_IN_BLOCK_N=SHAPES,
         TILES_IN_BLOCK_K=SHAPES,
-    ).sample_tests(5),
+    ).sample_tests(10),
 )
 def test_non_transposed_matmul_correctness(
     NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K
@@ -131,7 +131,7 @@ def test_non_transposed_matmul_correctness(
     N = NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N
     K = NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K
     data_type = np.float32
-    atol, rtol = 1e-2, 1e-3
+    atol, rtol = 1e-5, 1e-5
     lhs = np.random.random_sample((M, K)).astype(data_type)
     rhs = np.random.random_sample((K, N)).astype(data_type)
     golden_output = nl.static_cast(gemm_cpu_golden(lhs, rhs, lhs_is_transposed=False), data_type)

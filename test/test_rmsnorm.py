@@ -9,10 +9,16 @@ from neuronxcc.starfish.support.util import allclose
 
 from autotune.core.test_generation import GenTests
 from autotune.core.utils import GEMMCompatibility
-from autotune.golden.rmsnorm_linear import fused_rmsnorm_gemm_golden, golden_fun, rmsnorm_gemm_golden
+from autotune.golden.rmsnorm_linear import (
+    fused_rmsnorm_gemm_golden,
+    fused_rmsnorm_gemm_mkn,
+    golden_fun,
+    rmsnorm_gemm_golden,
+)
 from kernel_library.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
     blocked_fused_rms_norm_linear,
+    fused_rmsnorm_linear_MKN,
     stack_allocated_fused_rms_norm_qkv,
 )
 from kernel_library.rmsnorm_weighted import allocated_weighted_rmsnorm, weighted_rmsnorm
@@ -45,14 +51,9 @@ def test_rmsnorm_gemm_np_numerical(batch: int, M: int, N: int, K: int, eps: floa
     rhs = np.random.random_sample((K, N)).astype(data_type)
 
     golden = golden_fun(lhs, None, None, rhs, eps)
-    np_out = rmsnorm_gemm_golden(lhs, rhs, eps)
-    fused_np_out = fused_rmsnorm_gemm_golden(lhs, rhs, eps)
-    assert allclose(
-        np_out, golden, atol=atol, rtol=rtol, verbose=1
-    ), f"{rmsnorm_gemm_golden} output does not match with golden."
-    assert allclose(
-        fused_np_out, golden, atol=atol, rtol=rtol, verbose=1
-    ), f"{fused_rmsnorm_gemm_golden} output does not match with golden."
+    for func in [rmsnorm_gemm_golden, fused_rmsnorm_gemm_golden, fused_rmsnorm_gemm_mkn]:
+        np_out = func(lhs, rhs, eps)
+        assert allclose(np_out, golden, atol=atol, rtol=rtol, verbose=1), f"{func} output does not match with golden."
 
 
 @pytest.mark.parametrize(
@@ -197,3 +198,31 @@ def test_blocked_fused_rms_norm_linear_perf(batch, M, K, N, eps):
     assert (
         optimized_p99 < baseline_p99
     ), f"blocked_fused_rms_norm_linear {optimized_p99}ms should be faster than stack_allocated_fused_rms_norm_qkv {baseline_p99}ms"
+
+
+@pytest.mark.parametrize(
+    "batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, eps",
+    RMSNormLinearTestConfig(
+        batch=[1],
+        M=[1024, 2048],
+        N=[1024, 2048],
+        K=[1024, 2048],
+        NUM_BLOCK_M=[1, 2, 4],
+        NUM_BLOCK_N=[1, 2, 4],
+        NUM_BLOCK_K=[2, 4],
+        eps=[1e-6, 1e-3],
+    ).sample_tests(1),
+)
+def test_fused_rmsnorm_linear_MKN_numerical(batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, eps):
+    data_type = np.float32
+    atol, rtol = 1e-2, 1e-3
+    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
+    rhs = np.random.random_sample((K, N)).astype(data_type)
+
+    golden = nl.static_cast(golden_fun(lhs[0], None, None, rhs, eps), data_type)
+
+    numeric_func = baremetal(fused_rmsnorm_linear_MKN)
+    nki_out = numeric_func(lhs[0], rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, nl.float32, eps)
+
+    nki_out = nl.static_cast(nki_out, data_type)
+    assert allclose(nki_out, golden, atol=atol, rtol=rtol, verbose=1), f"Output does not match with golden."
