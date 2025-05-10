@@ -4,7 +4,7 @@ import numpy as np
 from neuronxcc.nki.typing import tensor
 
 
-def transpose_tiles_in_block(block):
+def transpose_tiles_in_block(block: tensor):
     """
     Transpose the (pmax, pmax) tiles in a block in place
     all PE array ops must output to FP32 on trn1 but must match input dtype in trn2
@@ -13,18 +13,25 @@ def transpose_tiles_in_block(block):
         blockT_dtype = block.dtype
     else:
         blockT_dtype = np.float32
-    tiles_in_block, par_size, free_size = block.shape
+    assert (
+        len(block.shape) == 4
+    ), f"Expect (row_tile_size, column_tile_size, row_num_tiles, column_num_tiles). Received {block.shape}."
+    row_tile_size, column_tile_size, row_num_tiles, column_num_tiles = block.shape
     pmax = nl.tile_size.pmax
     index = nl.mgrid[0:pmax, 0:pmax]
-
-    for tile_id in nl.affine_range(tiles_in_block):
-        for par_id in nl.affine_range(par_size // pmax):
-            par_ofs = par_id * pmax
-            for free_id in nl.affine_range(free_size // pmax):
-                free_ofs = free_id * pmax
-                tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=blockT_dtype, buffer=nl.psum)
-                tileT[index.p, index.x] = nisa.nc_transpose(block[tile_id, par_ofs + index.p, free_ofs + index.x])
-                block[tile_id, par_ofs + index.p, free_ofs + index.x] = nl.copy(tileT, dtype=block.dtype)
+    for row_tile_id in nl.affine_range(row_num_tiles):
+        for column_tile_id in nl.affine_range(column_num_tiles):
+            for row_transp_tile_id in nl.affine_range(row_tile_size // pmax):
+                row_ofs = row_transp_tile_id * pmax
+                for column_transp_tile_id in nl.affine_range(column_tile_size // pmax):
+                    column_ofs = column_transp_tile_id * pmax
+                    tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=blockT_dtype, buffer=nl.psum)
+                    tileT[index.p, index.x] = nisa.nc_transpose(
+                        block[row_ofs + index.p, column_ofs + index.x, row_tile_id, column_tile_id]
+                    )
+                    block[row_ofs + index.p, column_ofs + index.x, row_tile_id, column_tile_id] = nl.copy(
+                        tileT, dtype=block.dtype
+                    )
 
 
 def transpose_tile(tile: tensor):

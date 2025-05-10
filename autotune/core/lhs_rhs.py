@@ -71,33 +71,30 @@ def gemm_lhs_MN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelH
 def gemm_lhs_MKN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
         result_blocks = nl.zeros(
-            (mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
+            (nl.par_dim(mm.TILE_M), mm.TILE_N, mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N),
             dtype=result.dtype,
             buffer=nl.sbuf,
         )
-        for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
+        for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
             lhs_block = load_tensor_block(
                 input_tensor=lhs,
                 ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
-                load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.BLOCK_K),
+                load_shape=(mm.TILE_M, mm.TILE_K, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_K),
             )
             transpose_tiles_in_block(lhs_block)
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
-                    load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
+                    load_shape=(mm.TILE_K, mm.TILE_N, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N),
                 )
-                matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_blocks[block_id_N])
-
-        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-            save_result_dma(
-                result,
-                result_blocks,
-                block_id_N,
-                m_ofs=block_id_M * mm.TILES_IN_BLOCK_M,
-                n_ofs=block_id_N * mm.BLOCK_N,
-                TILE_K=mm.TILE_K,
-            )
+                result_block = matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block)
+                idx_res = nl.mgrid[0 : mm.TILE_M, 0 : mm.TILE_N]
+                for tile_id_M in nl.affine_range(mm.TILES_IN_BLOCK_M):
+                    for tile_id_N in nl.affine_range(mm.TILES_IN_BLOCK_N):
+                        result_blocks[idx_res.p, idx_res.x, block_id_N, tile_id_M, tile_id_N] += result_block[
+                            idx_res.p, idx_res.x, tile_id_M, tile_id_N
+                        ]
+        save_result_dma(result, result_blocks, block_id_M, TILE_K=mm.TILE_K)
 
     return result

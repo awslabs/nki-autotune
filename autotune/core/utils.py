@@ -269,7 +269,7 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
             result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
 
 
-def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_block):
+def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block):
     """
     Accumulate matmul result tiles between lhs and rhs into result_block
     LHS is transposed at the tile level.
@@ -277,22 +277,18 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_block):
     'matmul_block' module computes lhsT @ rhs.
 
     Args:
-    tileT_lhs_block: TILES_IN_M, TILE_M, K
-    rhs_block: TILES_IN_K, TILE_K, N
-    result_block : TILES_IN_M, TILES_IN_N, TILE_M, TILE_N
+    tileT_lhs_block: TILE_M, TILE_K, TILES_IN_M, TILES_IN_K
+    rhs_block: TILE_K, TILE_N, TILES_IN_K, TILES_IN_N
+    result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
     """
-    TILES_IN_M, TILE_M, K = tileT_lhs_block.shape
-    TILES_IN_K, TILE_K, N = rhs_block.shape
-    _TILES_IN_M, TILES_IN_N, _TILE_M, TILE_N = result_block.shape
+    TILE_M, TILE_K, TILES_IN_M, TILES_IN_K = tileT_lhs_block.shape
+    _TILE_K, TILE_N, _TILES_IN_K, TILES_IN_N = rhs_block.shape
+    result_block = nl.zeros(
+        (nl.par_dim(TILE_M), TILE_N, TILES_IN_M, TILES_IN_N), dtype=tileT_lhs_block.dtype, buffer=nl.sbuf
+    )
     assert (
-        TILES_IN_K * TILE_K == K
+        TILE_K == _TILE_K and TILES_IN_K == _TILES_IN_K
     ), f"K dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. rhs_block {rhs_block.shape}."
-    assert (
-        TILES_IN_M == _TILES_IN_M and TILE_M == _TILE_M
-    ), f"M dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. result_block {result_block.shape}."
-    assert (
-        N == TILES_IN_N * TILE_N
-    ), f"N dimension mismatch: rhs_block {rhs_block.shape}. result_block {result_block.shape}."
 
     idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
@@ -305,8 +301,8 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_block):
             """
             for tile_id_K in nl.affine_range(TILES_IN_K):
                 result_tile += nisa.nc_matmul(
-                    tileT_lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x],
-                    rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x],
+                    tileT_lhs_block[idx_lhs.p, idx_lhs.x, tile_id_M, tile_id_K],
+                    rhs_block[idx_rhs.p, idx_rhs.x, tile_id_K, tile_id_N],
                 )
-
-            result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
+            result_block[idx_res.p, idx_res.x, tile_id_M, tile_id_N] += result_tile[idx_res.p, idx_res.x]
+    return result_block
