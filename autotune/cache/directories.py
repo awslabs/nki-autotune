@@ -2,26 +2,26 @@ import hashlib
 import os
 import re
 import time
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
-import numpy as np
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE
 
 home_dir = os.environ["HOME"]
 CACHE_ROOT_DIR = f"{home_dir}/autotune-cache"
 TORCH_CACHE_DIR = f"{CACHE_ROOT_DIR}/torch"
 
 
-def get_hash_name(kernel_name: str, kernel_args: Tuple[np.ndarray, ...], configs: Dict):
-    kernel_args_str = parse_tensor_shapes([str(arg.shape) for arg in kernel_args])
+def get_hash_name(kernel_name: str, input_tensors: INPUT_TENSORS_DTYPE, configs: KERNEL_KWARGS_DTYPE):
+    input_tensors_str = parse_tensor_shapes([str(arg.shape) for arg in input_tensors])
     configs_str = dict_to_string(configs)
     timestamp = str(time.time())
-    combined_str = f"{kernel_name}_{kernel_args_str}_{configs_str}_{timestamp}"
+    combined_str = f"{kernel_name}_{input_tensors_str}_{configs_str}_{timestamp}"
     hash_value = hashlib.sha256(combined_str.encode("utf-8")).hexdigest()
     hash_name = f"{kernel_name}-{hash_value}"
     return hash_name
 
 
-def dict_to_string(configs: Dict) -> str:
+def dict_to_string(configs: KERNEL_KWARGS_DTYPE) -> str:
     """
     Convert a dictionary to a string by concatenating keys and values with hyphens.
 

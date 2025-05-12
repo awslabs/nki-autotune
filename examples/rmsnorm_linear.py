@@ -38,8 +38,8 @@ def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
         config = {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "BUFFER_M": BUFFER_M, "BUFFER_N": BUFFER_N}
         jobs.add_job(
             kernel_name="blocked_fused_rms_norm_linear",
-            kernel_args=(lhs, rhs),
-            filter=GEMMCompatibility(transposed_lhs=False),
+            input_tensors=(lhs, rhs),
+            preprocessing=GEMMCompatibility(transposed_lhs=False),
             **config,
         )
     return jobs
@@ -52,11 +52,11 @@ def get_baseline_jobs(M: int, N: int, K: int) -> ProfileJobs:
     jobs = ProfileJobs()
     jobs.add_job(
         kernel_name="stack_allocated_fused_rms_norm_qkv",
-        kernel_args=(lhs, rhs),
-        filter=GEMMCompatibility(transposed_lhs=False),
+        input_tensors=(lhs, rhs),
+        preprocessing=GEMMCompatibility(transposed_lhs=False),
     )
     jobs.add_job(
-        kernel_name="rmsnorm_linear_op", kernel_args=(lhs, rhs), filter=GEMMCompatibility(transposed_lhs=False)
+        kernel_name="rmsnorm_linear_op", input_tensors=(lhs, rhs), preprocessing=GEMMCompatibility(transposed_lhs=False)
     )
     return jobs
 

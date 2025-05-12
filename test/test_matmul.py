@@ -98,7 +98,7 @@ def test_matmul_correctness(
 
     nki_out, metrics = run_kernel(
         kernel_name="matmul_main",
-        kernel_args=(lhsT_dev, rhs_dev),
+        input_tensors=(lhsT_dev, rhs_dev),
         NUM_BLOCK_M=NUM_BLOCK_M,
         NUM_BLOCK_N=NUM_BLOCK_N,
         NUM_BLOCK_K=NUM_BLOCK_K,

@@ -39,7 +39,10 @@ def get_autotune_jobs(M: int, N: int, K: int) -> ProfileJobs:
             "loop_order": loop_order,
         }
         jobs.add_job(
-            kernel_name="matmul_main", kernel_args=(lhsT, rhs), filter=GEMMCompatibility(transposed_lhs=True), **config
+            kernel_name="matmul_main",
+            input_tensors=(lhsT, rhs),
+            preprocessing=GEMMCompatibility(transposed_lhs=True),
+            **config,
         )
     return jobs
 
@@ -48,7 +51,9 @@ def profile(workload_name: str, M: int, N: int, K: int):
     lhsT = np.zeros((K, M), dtype=bfloat16)
     rhs = np.zeros((K, N), dtype=bfloat16)
     jobs = ProfileJobs()
-    jobs.add_job(kernel_name="matmul_xt_op", kernel_args=(lhsT, rhs), filter=GEMMCompatibility(transposed_lhs=True))
+    jobs.add_job(
+        kernel_name="matmul_xt_op", input_tensors=(lhsT, rhs), preprocessing=GEMMCompatibility(transposed_lhs=True)
+    )
     cache_dir = get_cache_dir(workload_name, "baseline", M=M, N=N, K=K)
     baseline_tuner = Benchmark(jobs=jobs, cache_dir=cache_dir)
     baseline_tuner()

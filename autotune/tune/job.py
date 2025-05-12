@@ -1,16 +1,32 @@
 import os
 import random
 from concurrent.futures import ProcessPoolExecutor
-from typing import Callable, List, Set, Tuple
+from typing import List, Set
 
-import numpy as np
 from tqdm import tqdm
 
 from autotune.cache.directories import get_hash_name
 from autotune.tune.utils import capture_error_message
+from autotune.typing import (
+    INPUT_TENSORS_DTYPE,
+    KERNEL_KWARGS_DTYPE,
+    METRICS_DTYPE,
+    OUTPUT_TENSOR_DTYPE,
+    POSTPROCESSING_DTYPE,
+    PREPROCESSING_DTYPE,
+)
 
 
-def dummy_pruning(*args, **kwargs):
+def dummy_preprocessing(input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE) -> bool:
+    return True
+
+
+def dummy_postprocessing(
+    input_tensors: INPUT_TENSORS_DTYPE,
+    kernel_kwargs: KERNEL_KWARGS_DTYPE,
+    nki_out_tensor: OUTPUT_TENSOR_DTYPE,
+    metrics: METRICS_DTYPE,
+) -> bool:
     return True
 
 
@@ -25,16 +41,25 @@ def get_batch_size(num_samples: int, total_num_samples: int):
 
 
 class ProfileJob:
-    # TODO: filter, postprocessing components
-    def __init__(self, kernel_name: str, kernel_args: Tuple[np.ndarray, ...], filter: Callable, **kwargs) -> None:
+    def __init__(
+        self,
+        kernel_name: str,
+        input_tensors: INPUT_TENSORS_DTYPE,
+        kernel_kwargs: KERNEL_KWARGS_DTYPE,
+        compiler_flags: str,
+        preprocessing: PREPROCESSING_DTYPE,
+        postprocessing: POSTPROCESSING_DTYPE,
+    ) -> None:
         self.kernel_name = kernel_name
-        self.kernel_args: Tuple[np.ndarray, ...] = kernel_args
-        self.filter = filter
-        self.kwargs = kwargs
-        self.name = get_hash_name(kernel_name, kernel_args, kwargs)
+        self.input_tensors = input_tensors
+        self.kernel_kwargs = kernel_kwargs
+        self.compiler_flags = compiler_flags
+        self.preprocessing = preprocessing
+        self.postprocessing = postprocessing
+        self.name = get_hash_name(kernel_name, input_tensors, kernel_kwargs)
 
     def get_arg_shapes(self):
-        arg_shapes = [arg.shape for arg in self.kernel_args]
+        arg_shapes = [arg.shape for arg in self.input_tensors]
         return arg_shapes
 
     def add_fields(self, **kwargs):
@@ -48,8 +73,8 @@ class ProfileJob:
             setattr(self, key, value)
 
     def __repr__(self) -> str:
-        arg_shapes = [str(arg.shape) for arg in self.kernel_args]
-        kwargs_str = ", ".join(f"{k}={v}" for k, v in self.kwargs.items())
+        arg_shapes = [str(arg.shape) for arg in self.input_tensors]
+        kwargs_str = ", ".join(f"{k}={v}" for k, v in self.kernel_kwargs.items())
 
         return (
             f"ProfileJob(kernel={self.kernel_name}, shapes={arg_shapes}, " f"kwargs={{{kwargs_str}}}, name={self.name})"
@@ -68,9 +93,19 @@ class ProfileJobs:
         self.jobs: List[ProfileJob] = []
 
     def add_job(
-        self, kernel_name: str, kernel_args: Tuple[np.ndarray, ...], *, filter: Callable = dummy_pruning, **kwargs
+        self,
+        kernel_name: str,
+        input_tensors: INPUT_TENSORS_DTYPE,
+        kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
+        compiler_flags: str | None = None,
+        preprocessing: PREPROCESSING_DTYPE = dummy_preprocessing,
+        postprocessing: POSTPROCESSING_DTYPE = dummy_postprocessing,
     ):
-        job = ProfileJob(kernel_name, kernel_args, filter, **kwargs)
+        if kernel_kwargs is None:
+            kernel_kwargs = {}
+        if compiler_flags is None:
+            compiler_flags = ""
+        job = ProfileJob(kernel_name, input_tensors, kernel_kwargs, compiler_flags, preprocessing, postprocessing)
         self.jobs.append(job)
 
     def sample(self, num_samples: int) -> None:
@@ -97,7 +132,9 @@ class ProfileJobs:
             with ProcessPoolExecutor(max_workers=num_workers) as executor:
                 for job_id in sampled_job_ids:
                     job = self.jobs[job_id]
-                    future = executor.submit(run_with_args_and_kwargs, job.filter, job.get_arg_shapes(), job.kwargs)
+                    future = executor.submit(
+                        run_with_args_and_kwargs, job.preprocessing, job.get_arg_shapes(), job.kwargs
+                    )
                     futures.append((job_id, future))
 
             # Process results of this batch
