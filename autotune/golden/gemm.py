@@ -1,4 +1,29 @@
+import neuronxcc.nki.language as nl
 import numpy as np
+
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, METRICS_DTYPE, OUTPUT_TENSOR_DTYPE
+
+
+class GEMMCorrectness:
+    def __init__(self, transposed_lhs: bool) -> None:
+        self.transposed_lhs = transposed_lhs
+
+    def __call__(
+        self,
+        input_tensors: INPUT_TENSORS_DTYPE,
+        kernel_kwargs: KERNEL_KWARGS_DTYPE,
+        nki_out_tensor: OUTPUT_TENSOR_DTYPE,
+        metrics: METRICS_DTYPE,
+    ) -> bool:
+        data_type = np.float32
+        atol, rtol = 1e-2, 1e-2
+        lhs, rhs = input_tensors
+        golden = nl.static_cast(gemm_cpu_golden(lhs, rhs, self.transposed_lhs), data_type)
+        nki_out_tensor = nl.static_cast(nki_out_tensor, data_type)
+        np.testing.assert_allclose(
+            actual=nki_out_tensor, desired=golden, atol=atol, rtol=rtol, err_msg="", verbose=True
+        )
+        return True
 
 
 def gemm_core(lhs, rhs, lhs_is_transposed: bool):

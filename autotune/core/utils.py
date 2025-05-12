@@ -1,8 +1,8 @@
-from typing import Optional, Tuple
-
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
+
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE
 
 
 class GEMMCompatibility:
@@ -16,18 +16,7 @@ class GEMMCompatibility:
     def __init__(self, transposed_lhs: bool) -> None:
         self.transposed_lhs = transposed_lhs
 
-    def __call__(
-        self,
-        lhs_shape: Tuple[int, ...],
-        rhs_shape: Tuple[int, ...],
-        NUM_BLOCK_M: int = 1,
-        NUM_BLOCK_N: int = 1,
-        NUM_BLOCK_K: Optional[int] = None,  # Changed from -1 to None
-        BUFFER_M: int = 1,
-        BUFFER_N: int = 1,
-        BUFFER_K: Optional[int] = None,  # Changed from -1 to None
-        **kwargs,
-    ) -> bool:
+    def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE) -> bool:
         """
         Initialize GEMM compatibility checker.
 
@@ -39,11 +28,13 @@ class GEMMCompatibility:
             NUM_BLOCK_M: Number of blocks in M dimension
             NUM_BLOCK_N: Number of blocks in N dimension
             NUM_BLOCK_K: Number of blocks in K dimension, or None to skip K blocking
-            BUFFER_M: Buffer degree for M dimension, must be <= NUM_BLOCK_M
-            BUFFER_N: Buffer degree for N dimension, must be <= NUM_BLOCK_N
-            BUFFER_K: Buffer degree for K dimension, or None to skip K buffering
         """
-        # Input sizes
+        lhs, rhs = input_tensors
+        lhs_shape = lhs.shape
+        rhs_shape = rhs.shape
+        NUM_BLOCK_M: int = kernel_kwargs.get("NUM_BLOCK_M", 1)
+        NUM_BLOCK_N: int = kernel_kwargs.get("NUM_BLOCK_N", 1)
+        NUM_BLOCK_K: int = kernel_kwargs.get("NUM_BLOCK_K", 1)
         if len(rhs_shape) != 2:
             raise ValueError(f"Expecting (K, N) in RHS. Received {rhs_shape}.")
 
@@ -77,11 +68,6 @@ class GEMMCompatibility:
         self.NUM_BLOCK_M = NUM_BLOCK_M
         self.NUM_BLOCK_N = NUM_BLOCK_N
         self.NUM_BLOCK_K = NUM_BLOCK_K
-
-        # Buffer degrees (None means no buffering in that dimension)
-        self.BUFFER_K = BUFFER_K
-        self.BUFFER_M = BUFFER_M
-        self.BUFFER_N = BUFFER_N
 
         # Calculate derived sizes
         self._calculate_sizes()
@@ -125,7 +111,6 @@ class GEMMCompatibility:
 
             tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
             tile_size = getattr(self, f"TILE_{dimension}")
-            buffer_size = getattr(self, f"BUFFER_{dimension}")
 
             # Check even division
             if num_block * tiles_in_block * tile_size != size:
@@ -134,20 +119,10 @@ class GEMMCompatibility:
                     f"{num_block} blocks * {tiles_in_block} tiles * {tile_size}"
                 )
 
-            # Check buffer size if specified
-            if buffer_size is not None:
-                if buffer_size <= 0:
-                    raise ValueError(f"{dimension} buffer degree must be positive, got {buffer_size}")
-                if buffer_size > num_block:
-                    raise ValueError(
-                        f"{dimension} buffer degree {buffer_size} cannot be larger "
-                        f"than number of blocks {num_block}"
-                    )
-
     def __repr__(self) -> str:
         """String representation showing the division of dimensions into blocks and tiles."""
         # Determine which dimensions to include
-        if self.NUM_BLOCK_K is None and self.BUFFER_K is None:
+        if self.NUM_BLOCK_K is None:
             dimensions = ["M", "N"]
         else:
             dimensions = ["M", "N", "K"]
@@ -168,12 +143,11 @@ class GEMMCompatibility:
             tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
             tile_size = getattr(self, f"TILE_{dimension}")
             block_size = getattr(self, f"BLOCK_{dimension}")
-            buffer_size = getattr(self, f"BUFFER_{dimension}")
 
             lines.append(
                 f"{dimension}: {num_block} blocks × {tiles_in_block} tiles × " f"{tile_size} elements = {size} total"
             )
-            lines.append(f"  Block size: {block_size}, Buffer degree: {buffer_size}")
+            lines.append(f"  Block size: {block_size}")
 
         return "\n".join(lines)
 
