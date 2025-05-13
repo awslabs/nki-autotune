@@ -14,7 +14,7 @@ from autotune.core.utils import GEMMCompatibility, matmul_block
 @nki.jit
 def matmul_main(lhsT: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int, loop_order: str):
     mm = GEMMCompatibility(transposed_lhs=True)
-    mm(lhsT.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
+    mm((lhsT, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K})
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
     if loop_order == "MNK":

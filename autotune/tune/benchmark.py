@@ -36,6 +36,7 @@ class Benchmark:
         self.iters = iters
         self.results = self._init_results(main_metric, lower_is_better)
         self.num_workers = min(len(jobs.jobs), os.cpu_count() - 1)
+        self.num_workers = max(self.num_workers, 1)
         if os.path.exists(cache_dir):
             shutil.rmtree(cache_dir)
         os.makedirs(cache_dir)
@@ -99,7 +100,7 @@ class Benchmark:
     def _execute(self) -> Dict[int, np.ndarray]:
         kernel_outputs: Dict[int, np.ndarray] = {}
         with SpikeExecutor(verbose=0) as spike:
-            for job_id in tqdm(range(self.jobs.num_jobs), total=self.jobs.num_jobs, desc="Profiling kernels"):
+            for job_id in tqdm(range(self.jobs.num_jobs), total=self.jobs.num_jobs, desc="Executing kernels"):
                 job = self.jobs[job_id]
                 result = self.results[job_id]
                 try:
@@ -115,11 +116,12 @@ class Benchmark:
                         device_id=0,
                     )
                     kernel_output = self._capture_neff(spike, spike_kernel, job, result)
-                    kernel_outputs[job_id] = kernel_output
                     result.add_fields(**stats)
                 except Exception as e:
                     error_string = capture_error_message(e)
                     result.add_error(error_string)
+                    kernel_output = None
+                kernel_outputs[job_id] = kernel_output
         return kernel_outputs
 
     def _capture_neff(self, spike, spike_kernel, job: ProfileJob, result: PerformanceResult) -> np.ndarray:

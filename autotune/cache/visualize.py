@@ -9,7 +9,7 @@ from autotune.cache.results import PerformanceMetrics
 from autotune.tune.metrics import calculate_GEMM_pe_utilization
 
 
-def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu")):
+def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu_estimated_percent")):
     """
     Collect multiple performance metrics (PE utilization and/or HFU) for all MNK combinations,
     calculating both best and mean performance metrics.
@@ -19,7 +19,7 @@ def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu")):
     directory : str
         Directory containing M-N-K subdirectories with perf_metrics.json files.
     metrics : tuple
-        Metrics to collect, options include "pe_util" and "hfu"
+        Metrics to collect, options include "pe_util" and "hfu_estimated_percent"
 
     Returns:
     --------
@@ -68,17 +68,17 @@ def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu")):
                         metrics_data["pe_util"][(m, n)][k]["best"] = best_pe_util
                         metrics_data["pe_util"][(m, n)][k]["mean"] = mean_pe_util
 
-                    elif metric == "hfu":
+                    elif metric == "hfu_estimated_percent":
                         # Extract HFU for best config if available
-                        best_hfu = best_config.hfu
+                        best_hfu = best_config.metrics["hfu_estimated_percent"]
 
                         # Calculate mean HFU across all configurations
-                        all_hfus = [r.hfu for r in all_results]
+                        all_hfus = [r.metrics["hfu_estimated_percent"] for r in all_results]
                         mean_hfu = np.mean(all_hfus) if all_hfus else 0
 
                         # Store both metrics
-                        metrics_data["hfu"][(m, n)][k]["best"] = best_hfu
-                        metrics_data["hfu"][(m, n)][k]["mean"] = mean_hfu
+                        metrics_data["hfu_estimated_percent"][(m, n)][k]["best"] = best_hfu
+                        metrics_data["hfu_estimated_percent"][(m, n)][k]["mean"] = mean_hfu
 
     return metrics_data
 
@@ -180,7 +180,7 @@ def plot_single_metric_vs_k_comparison(m, n, metric_name, tuned_data, baseline_d
         y_label = "PE Utilization (%)"
         plot_type = "GEMM_PE_utilization"
 
-    elif metric_name == "hfu":
+    elif metric_name == "hfu_estimated_percent":
         # Add a horizontal line at 87.5% to represent theoretical maximum
         plt.axhline(y=0.875, color="purple", linestyle="--", linewidth=2, label="Theoretical Max")
 
@@ -240,7 +240,7 @@ def plot_single_metric_vs_k_comparison(m, n, metric_name, tuned_data, baseline_d
     plt.close()
 
 
-def plot_metrics_vs_k_comparison(workload_name: str, metrics=("pe_util", "hfu")):
+def plot_metrics_vs_k_comparison(workload_name: str, metrics=("pe_util", "hfu_estimated_percent")):
     """
     Create plots comparing selected metrics vs K for each unique (M, N) pair between
     tuned and baseline, showing best and mean statistics for tuned data.
@@ -250,7 +250,7 @@ def plot_metrics_vs_k_comparison(workload_name: str, metrics=("pe_util", "hfu"))
     workload_name : str
         Name of the workload (used to locate directories and save plots)
     metrics : tuple
-        Metrics to plot, options include "pe_util" and "hfu"
+        Metrics to plot, options include "pe_util" and "hfu_estimated_percent"
     """
     # Construct directory paths
     tuned_dir = get_cache_dir(workload_name, "tuned")

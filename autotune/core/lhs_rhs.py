@@ -11,7 +11,7 @@ from autotune.core.utils import GEMMCompatibility, matmul_blocks_lhs, matmul_blo
 @nki.jit
 def gemm_main(lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int, template: str):
     mm = GEMMCompatibility(transposed_lhs=False)
-    mm(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
+    mm((lhs, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K})
 
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     if template == "MNK":
@@ -34,6 +34,7 @@ def gemm_lhs_MNK(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: Kernel
                 buffer=nl.sbuf,
             )
             for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
+                # FIXME: fix the load shape
                 lhs_block = load_tensor_block(
                     input_tensor=lhs,
                     ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
@@ -51,6 +52,7 @@ def gemm_lhs_MNK(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: Kernel
 
 def gemm_lhs_MN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+        # FIXME: fix the load shape
         lhs_block = load_tensor_block(
             input_tensor=lhs, ofs=(block_id_M * mm.BLOCK_M, 0), load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K)
         )

@@ -31,7 +31,7 @@ def dummy_postprocessing(
 
 
 def run_with_args_and_kwargs(func, args, kwargs):
-    return func(*args, **kwargs)
+    return func(args, kwargs)
 
 
 def get_batch_size(num_samples: int, total_num_samples: int):
@@ -133,7 +133,7 @@ class ProfileJobs:
                 for job_id in sampled_job_ids:
                     job = self.jobs[job_id]
                     future = executor.submit(
-                        run_with_args_and_kwargs, job.preprocessing, job.get_arg_shapes(), job.kwargs
+                        run_with_args_and_kwargs, job.preprocessing, job.input_tensors, job.kernel_kwargs
                     )
                     futures.append((job_id, future))
 
@@ -145,7 +145,8 @@ class ProfileJobs:
                 job = self.jobs[job_id]
                 try:
                     success = future.result()
-                    batch_valid_jobs.append(job)
+                    if success:
+                        batch_valid_jobs.append(job)
                 except Exception as e:
                     error_msg = capture_error_message(e)
 
