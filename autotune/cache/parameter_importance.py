@@ -76,15 +76,15 @@ def analyze_parameter_importance(json_file):
 
     # Convert results to DataFrame for easier analysis
     results = data["results"]
-    df = pd.DataFrame([{**r["config"], "min_ms": r["min_ms"]} for r in results])
+    df = pd.DataFrame([{**r["kernel_kwargs"], "min_ms": r["min_ms"]} for r in results])
 
-    # Get parameter names dynamically from the config
+    # Get parameter names dynamically from the kernel_kwargs
     if not results:
         print(f"Warning: No results found in {json_file}")
         return {}, pd.DataFrame(), []
 
     # Extract parameter names from the first configuration
-    all_parameters = list(results[0]["config"].keys())
+    all_parameters = list(results[0]["kernel_kwargs"].keys())
 
     # Dictionary to store impact metrics for each parameter
     param_impact = {}
@@ -340,7 +340,7 @@ def analyze_single_file(json_file, plots_dir):
         top_configs = df.nsmallest(5, "min_ms")
         for i, (_, row) in enumerate(top_configs.iterrows()):
             # Write all parameters from the configuration
-            f.write(f"\nConfig {i+1}: {row['min_ms']:.4f} ms\n")
+            f.write(f"\nKernel kwargs {i+1}: {row['min_ms']:.4f} ms\n")
             for param in all_parameters:
                 if param in row:
                     f.write(f"  {param}: {row[param]}\n")

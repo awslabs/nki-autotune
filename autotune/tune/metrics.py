@@ -80,7 +80,7 @@ def extract_metrics(neff: str, ntff: str) -> Dict[str, float]:
         "Total Time (ms)": metrics["total_time"] * 1000,
         "Arithmetic Intensity": metrics["mm_arithmetic_intensity"],
     }
-    return important_metrics
+    return metrics
 
 
 def allclose(a, b, rtol=1e-05, atol=1e-08):
