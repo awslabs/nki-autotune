@@ -136,8 +136,7 @@ def test_non_transposed_matmul_correctness(
     rhs = np.random.random_sample((K, N)).astype(data_type)
     golden_output = nl.static_cast(gemm_cpu_golden(lhs, rhs, lhs_is_transposed=False), data_type)
 
-    # for template in ["MN", "MNK", "MKN"]:
-    for template in ["MKN"]:
+    for template in ["MN", "MNK", "MKN"]:
         numeric_func = baremetal(gemm_main)
         nki_out = numeric_func(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template)
         nki_out = nl.static_cast(nki_out, data_type)

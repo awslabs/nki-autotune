@@ -71,15 +71,6 @@ def extract_metrics(neff: str, ntff: str) -> Dict[str, float]:
     # Get the first (and only) key in the dictionary
     first_key = next(iter(data))
     metrics = data[first_key]
-
-    # Extract key performance metrics
-    important_metrics = {
-        "hfu": metrics["hfu_estimated_percent"],
-        "mbu": metrics["mbu_estimated_percent"],
-        "Tensor Engine Utilization Time": metrics["tensor_engine_active_time_percent"],
-        "Total Time (ms)": metrics["total_time"] * 1000,
-        "Arithmetic Intensity": metrics["mm_arithmetic_intensity"],
-    }
     return metrics
 
 

@@ -110,11 +110,15 @@ def save_result_block(result, result_block, m_ofs: int, n_ofs: int):
     result: M, N
     result_block: TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, nl.par_dim(TILE_M), TILE_N
     """
-    TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N = result_block.shape
+    M, N = result.shape
+    TILE_M, TILE_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N = result_block.shape
 
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
         m_start = m_ofs + tile_id_M * TILE_M
         for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
             n_start = n_ofs + tile_id_N * TILE_N
-            nl.store(result[m_start + idx_res.p, n_start + idx_res.x], value=result_block[tile_id_M, tile_id_N])
+            nl.store(
+                result[m_start + idx_res.p, n_start + idx_res.x],
+                value=result_block[idx_res.p, idx_res.x, tile_id_M, tile_id_N],
+            )
