@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from autotune.cache.directories import extract_mnk_from_dirname, get_cache_dir, get_save_path
-from autotune.cache.results import PerformanceMetrics
+from autotune.cache.results import PerformanceMetrics, PerformanceResult
 from autotune.tune.metrics import calculate_GEMM_pe_utilization
 
 
@@ -70,10 +70,10 @@ def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu_est
 
                     elif metric == "hfu_estimated_percent":
                         # Extract HFU for best config if available
-                        best_hfu = best_config.metrics["hfu_estimated_percent"]
+                        best_hfu = parse_hfu(best_config)
 
                         # Calculate mean HFU across all configurations
-                        all_hfus = [r.metrics["hfu_estimated_percent"] for r in all_results]
+                        all_hfus = [parse_hfu(r) for r in all_results]
                         mean_hfu = np.mean(all_hfus) if all_hfus else 0
 
                         # Store both metrics
@@ -81,6 +81,14 @@ def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu_est
                         metrics_data["hfu_estimated_percent"][(m, n)][k]["mean"] = mean_hfu
 
     return metrics_data
+
+
+def parse_hfu(result: PerformanceResult):
+    try:
+        hfu = result.metrics["hfu_estimated_percent"]
+    except:
+        hfu = 0
+    return hfu
 
 
 def plot_single_metric_vs_k_comparison(m, n, metric_name, tuned_data, baseline_data, plots_dir):

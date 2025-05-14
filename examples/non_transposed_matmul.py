@@ -23,7 +23,7 @@ def run_autotune_jobs(workload_name: str, M: int, N: int, K: int):
     NUM_BLOCK_M_options = size_options
     NUM_BLOCK_N_options = size_options
     NUM_BLOCK_K_options = size_options
-    templates = ["MKN"]
+    templates = ["MN", "MNK", "MKN", "legacy_MKN"]
     params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, templates))
     lhs = np.random.random_sample((M, K)).astype(bfloat16)
     rhs = np.random.random_sample((K, N)).astype(bfloat16)
@@ -67,10 +67,10 @@ def profile_baseline(workload_name: str, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     workload_name = "non_transposed_GEMM"
-    mn_shapes = [2048, 4096, 8192]
+    mn_shapes = [1024, 2048, 4096, 8192]
     k_shapes = [1024, 2048, 4096, 8192, 16384]
     mn_shapes = [1024]
-    k_shapes = [1024]
+    k_shapes = [1024, 2048]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     for M, N, K in MNK:
         profile_baseline(workload_name, M, N, K)

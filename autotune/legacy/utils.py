@@ -1,8 +1,8 @@
+from typing import Optional, Tuple
+
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
-
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE
 
 
 class GEMMCompatibility:
@@ -16,7 +16,18 @@ class GEMMCompatibility:
     def __init__(self, transposed_lhs: bool) -> None:
         self.transposed_lhs = transposed_lhs
 
-    def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE) -> bool:
+    def __call__(
+        self,
+        lhs_shape: Tuple[int, ...],
+        rhs_shape: Tuple[int, ...],
+        NUM_BLOCK_M: int = 1,
+        NUM_BLOCK_N: int = 1,
+        NUM_BLOCK_K: Optional[int] = None,  # Changed from -1 to None
+        BUFFER_M: int = 1,
+        BUFFER_N: int = 1,
+        BUFFER_K: Optional[int] = None,  # Changed from -1 to None
+        **kwargs,
+    ) -> bool:
         """
         Initialize GEMM compatibility checker.
 
@@ -28,13 +39,11 @@ class GEMMCompatibility:
             NUM_BLOCK_M: Number of blocks in M dimension
             NUM_BLOCK_N: Number of blocks in N dimension
             NUM_BLOCK_K: Number of blocks in K dimension, or None to skip K blocking
+            BUFFER_M: Buffer degree for M dimension, must be <= NUM_BLOCK_M
+            BUFFER_N: Buffer degree for N dimension, must be <= NUM_BLOCK_N
+            BUFFER_K: Buffer degree for K dimension, or None to skip K buffering
         """
-        lhs, rhs = input_tensors
-        lhs_shape = lhs.shape
-        rhs_shape = rhs.shape
-        NUM_BLOCK_M: int = kernel_kwargs.get("NUM_BLOCK_M", 1)
-        NUM_BLOCK_N: int = kernel_kwargs.get("NUM_BLOCK_N", 1)
-        NUM_BLOCK_K: int = kernel_kwargs.get("NUM_BLOCK_K", 1)
+        # Input sizes
         if len(rhs_shape) != 2:
             raise ValueError(f"Expecting (K, N) in RHS. Received {rhs_shape}.")
 
@@ -68,6 +77,11 @@ class GEMMCompatibility:
         self.NUM_BLOCK_M = NUM_BLOCK_M
         self.NUM_BLOCK_N = NUM_BLOCK_N
         self.NUM_BLOCK_K = NUM_BLOCK_K
+
+        # Buffer degrees (None means no buffering in that dimension)
+        self.BUFFER_K = BUFFER_K
+        self.BUFFER_M = BUFFER_M
+        self.BUFFER_N = BUFFER_N
 
         # Calculate derived sizes
         self._calculate_sizes()
@@ -111,6 +125,7 @@ class GEMMCompatibility:
 
             tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
             tile_size = getattr(self, f"TILE_{dimension}")
+            buffer_size = getattr(self, f"BUFFER_{dimension}")
 
             # Check even division
             if num_block * tiles_in_block * tile_size != size:
@@ -119,10 +134,20 @@ class GEMMCompatibility:
                     f"{num_block} blocks * {tiles_in_block} tiles * {tile_size}"
                 )
 
+            # Check buffer size if specified
+            if buffer_size is not None:
+                if buffer_size <= 0:
+                    raise ValueError(f"{dimension} buffer degree must be positive, got {buffer_size}")
+                if buffer_size > num_block:
+                    raise ValueError(
+                        f"{dimension} buffer degree {buffer_size} cannot be larger "
+                        f"than number of blocks {num_block}"
+                    )
+
     def __repr__(self) -> str:
         """String representation showing the division of dimensions into blocks and tiles."""
         # Determine which dimensions to include
-        if self.NUM_BLOCK_K is None:
+        if self.NUM_BLOCK_K is None and self.BUFFER_K is None:
             dimensions = ["M", "N"]
         else:
             dimensions = ["M", "N", "K"]
@@ -143,11 +168,12 @@ class GEMMCompatibility:
             tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
             tile_size = getattr(self, f"TILE_{dimension}")
             block_size = getattr(self, f"BLOCK_{dimension}")
+            buffer_size = getattr(self, f"BUFFER_{dimension}")
 
             lines.append(
                 f"{dimension}: {num_block} blocks × {tiles_in_block} tiles × " f"{tile_size} elements = {size} total"
             )
-            lines.append(f"  Block size: {block_size}")
+            lines.append(f"  Block size: {block_size}, Buffer degree: {buffer_size}")
 
         return "\n".join(lines)
 
@@ -203,18 +229,16 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
     rhs_block: TILES_IN_K, TILE_K, N
     result_block : TILES_IN_M, TILES_IN_N, TILE_M, TILE_N
     """
-    TILE_M, TILE_K, TILES_IN_M, TILES_IN_K = lhs_block.shape
-    _TILE_K, TILE_N, _TILES_IN_K, TILES_IN_N = rhs_block.shape
-    _TILE_M, _TILE_N, _TILES_IN_M, _TILES_IN_N = result_block.shape
+    TILES_IN_M, TILE_M, K = lhs_block.shape
+    TILES_IN_K, TILE_K, N = rhs_block.shape
+    _TILES_IN_M, TILES_IN_N, _TILE_M, TILE_N = result_block.shape
+    assert TILES_IN_K * TILE_K == K, f"K dimension mismatch: lhs_block {lhs_block.shape}. rhs_block {rhs_block.shape}."
     assert (
-        TILE_K == _TILE_K and TILES_IN_K == _TILES_IN_K
-    ), f"lhs_block and rhs_block shape mismatch: lhs_block {lhs_block.shape}. rhs_block {rhs_block.shape}."
+        TILES_IN_M == _TILES_IN_M and TILE_M == _TILE_M
+    ), f"M dimension mismatch: lhs_block {lhs_block.shape}. result_block {result_block.shape}."
     assert (
-        TILE_M == _TILE_M and TILES_IN_M == _TILES_IN_M
-    ), f"lhs_block and result_block shape mismatch: lhs_block {lhs_block.shape}. result_block {result_block.shape}."
-    assert (
-        TILE_N == _TILE_N and TILES_IN_N == _TILES_IN_N
-    ), f"rhs_block and result_block shape mismatch: rhs_block {rhs_block.shape}. result_block {result_block.shape}."
+        N == TILES_IN_N * TILE_N
+    ), f"N dimension mismatch: rhs_block {rhs_block.shape}. result_block {result_block.shape}."
 
     if nisa.get_nc_version() == nisa.nc_version.gen3:
         tileT_dtype = lhs_block.dtype
@@ -235,15 +259,17 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
                 # FIXME: in-place transposition repeated across tile_id_N
                 # TODO: use a temp tile to hold tileT
                 tileT_psum = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.psum)
-                tileT_psum[...] = nisa.nc_transpose(lhs_block[idx_lhs.p, idx_lhs.x, tile_id_M, tile_id_K])
+                tileT_psum[...] = nisa.nc_transpose(lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x])
                 tileT_sbuf = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.sbuf)
                 tileT_sbuf[...] = nl.copy(tileT_psum, dtype=lhs_block.dtype)
-                result_tile += nisa.nc_matmul(tileT_sbuf, rhs_block[idx_rhs.p, idx_rhs.x, tile_id_K, tile_id_N])
+                result_tile += nisa.nc_matmul(
+                    tileT_sbuf, rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x]
+                )
 
-            result_block[idx_res.p, idx_res.x, tile_id_M, tile_id_N] += result_tile[idx_res.p, idx_res.x]
+            result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
 
 
-def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block):
+def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_block):
     """
     Accumulate matmul result tiles between lhs and rhs into result_block
     LHS is transposed at the tile level.
@@ -251,18 +277,22 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block):
     'matmul_block' module computes lhsT @ rhs.
 
     Args:
-    tileT_lhs_block: TILE_M, TILE_K, TILES_IN_M, TILES_IN_K
-    rhs_block: TILE_K, TILE_N, TILES_IN_K, TILES_IN_N
-    result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
+    tileT_lhs_block: TILES_IN_M, TILE_M, K
+    rhs_block: TILES_IN_K, TILE_K, N
+    result_block : TILES_IN_M, TILES_IN_N, TILE_M, TILE_N
     """
-    TILE_M, TILE_K, TILES_IN_M, TILES_IN_K = tileT_lhs_block.shape
-    _TILE_K, TILE_N, _TILES_IN_K, TILES_IN_N = rhs_block.shape
-    result_block = nl.zeros(
-        (nl.par_dim(TILE_M), TILE_N, TILES_IN_M, TILES_IN_N), dtype=tileT_lhs_block.dtype, buffer=nl.sbuf
-    )
+    TILES_IN_M, TILE_M, K = tileT_lhs_block.shape
+    TILES_IN_K, TILE_K, N = rhs_block.shape
+    _TILES_IN_M, TILES_IN_N, _TILE_M, TILE_N = result_block.shape
     assert (
-        TILE_K == _TILE_K and TILES_IN_K == _TILES_IN_K
+        TILES_IN_K * TILE_K == K
     ), f"K dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. rhs_block {rhs_block.shape}."
+    assert (
+        TILES_IN_M == _TILES_IN_M and TILE_M == _TILE_M
+    ), f"M dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. result_block {result_block.shape}."
+    assert (
+        N == TILES_IN_N * TILE_N
+    ), f"N dimension mismatch: rhs_block {rhs_block.shape}. result_block {result_block.shape}."
 
     idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
@@ -275,8 +305,8 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block):
             """
             for tile_id_K in nl.affine_range(TILES_IN_K):
                 result_tile += nisa.nc_matmul(
-                    tileT_lhs_block[idx_lhs.p, idx_lhs.x, tile_id_M, tile_id_K],
-                    rhs_block[idx_rhs.p, idx_rhs.x, tile_id_K, tile_id_N],
+                    tileT_lhs_block[tile_id_M, idx_lhs.p, tile_id_K * TILE_K + idx_lhs.x],
+                    rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x],
                 )
-            result_block[idx_res.p, idx_res.x, tile_id_M, tile_id_N] += result_tile[idx_res.p, idx_res.x]
-    return result_block
+
+            result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
