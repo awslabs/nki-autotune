@@ -11,7 +11,7 @@ from autotune.legacy import layout as legacy_layout
 from autotune.legacy import utils as legacy_utils
 
 
-@nki.jit(debug_kernel=True)
+@nki.jit
 def gemm_main(lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int, template: str):
     mm = GEMMCompatibility(transposed_lhs=False)
     mm((lhs, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K})
@@ -81,7 +81,7 @@ def gemm_lhs_MN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelH
 def gemm_lhs_MKN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
         result_blocks = nl.zeros(
-            (nl.par_dim(mm.TILE_M), mm.TILE_N, mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N),
+            (nl.par_dim(mm.TILE_M), mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N),
             dtype=result.dtype,
             buffer=nl.sbuf,
         )
@@ -89,23 +89,17 @@ def gemm_lhs_MKN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: Kernel
             lhs_block = load_tensor_block(
                 input_tensor=lhs,
                 ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
-                load_shape=(mm.TILE_M, mm.TILE_K, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_K),
+                load_shape=(mm.TILE_M, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_K, mm.TILE_K),
             )
             transpose_tiles_in_block(lhs_block)
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
-                    load_shape=(mm.TILE_K, mm.TILE_N, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N),
+                    load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 )
-                result_block = matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block)
-                idx_res = nl.mgrid[0 : mm.TILE_M, 0 : mm.TILE_N]
-                for tile_id_M in nl.affine_range(mm.TILES_IN_BLOCK_M):
-                    for tile_id_N in nl.affine_range(mm.TILES_IN_BLOCK_N):
-                        result_blocks[idx_res.p, idx_res.x, block_id_N, tile_id_M, tile_id_N] += result_block[
-                            idx_res.p, idx_res.x, tile_id_M, tile_id_N
-                        ]
-        save_result_dma(result, result_blocks, block_id_M, TILE_K=mm.TILE_K)
+                matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_blocks, block_id_N)
+        save_result_dma(result, result_blocks, block_id_M)
 
     return result
 

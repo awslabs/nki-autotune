@@ -243,7 +243,7 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
             result_block[idx_res.p, idx_res.x, tile_id_M, tile_id_N] += result_tile[idx_res.p, idx_res.x]
 
 
-def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block):
+def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks, block_id_N):
     """
     Accumulate matmul result tiles between lhs and rhs into result_block
     LHS is transposed at the tile level.
@@ -255,11 +255,9 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block):
     rhs_block: TILE_K, TILE_N, TILES_IN_K, TILES_IN_N
     result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
     """
-    TILE_M, TILE_K, TILES_IN_M, TILES_IN_K = tileT_lhs_block.shape
-    _TILE_K, TILE_N, _TILES_IN_K, TILES_IN_N = rhs_block.shape
-    result_block = nl.zeros(
-        (nl.par_dim(TILE_M), TILE_N, TILES_IN_M, TILES_IN_N), dtype=tileT_lhs_block.dtype, buffer=nl.sbuf
-    )
+    TILE_M, TILES_IN_M, TILES_IN_K, TILE_K = tileT_lhs_block.shape
+    _TILE_K, _TILES_IN_K, TILES_IN_N, TILE_N = rhs_block.shape
+    _TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_N = result_blocks.shape
     assert (
         TILE_K == _TILE_K and TILES_IN_K == _TILES_IN_K
     ), f"K dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. rhs_block {rhs_block.shape}."
@@ -275,8 +273,7 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block):
             """
             for tile_id_K in nl.affine_range(TILES_IN_K):
                 result_tile += nisa.nc_matmul(
-                    tileT_lhs_block[idx_lhs.p, idx_lhs.x, tile_id_M, tile_id_K],
-                    rhs_block[idx_rhs.p, idx_rhs.x, tile_id_K, tile_id_N],
+                    tileT_lhs_block[idx_lhs.p, tile_id_M, tile_id_K, idx_lhs.x],
+                    rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x],
                 )
-            result_block[idx_res.p, idx_res.x, tile_id_M, tile_id_N] += result_tile[idx_res.p, idx_res.x]
-    return result_block
+            result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
