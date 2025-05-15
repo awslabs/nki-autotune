@@ -15,8 +15,8 @@ def transpose_tiles_in_block(block: tensor):
         blockT_dtype = np.float32
     assert (
         len(block.shape) == 4
-    ), f"Expect (row_tile_size, column_tile_size, row_num_tiles, column_num_tiles). Received {block.shape}."
-    row_tile_size, column_tile_size, row_num_tiles, column_num_tiles = block.shape
+    ), f"Expect (row_tile_size, row_num_tiles, column_num_tiles, column_tile_size). Received {block.shape}."
+    row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = block.shape
     pmax = nl.tile_size.pmax
     index = nl.mgrid[0:pmax, 0:pmax]
     for row_tile_id in nl.affine_range(row_num_tiles):
@@ -27,9 +27,9 @@ def transpose_tiles_in_block(block: tensor):
                     column_ofs = column_transp_tile_id * pmax
                     tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=blockT_dtype, buffer=nl.psum)
                     tileT[index.p, index.x] = nisa.nc_transpose(
-                        block[row_ofs + index.p, column_ofs + index.x, row_tile_id, column_tile_id]
+                        block[row_ofs + index.p, row_tile_id, column_tile_id, column_ofs + index.x]
                     )
-                    block[row_ofs + index.p, column_ofs + index.x, row_tile_id, column_tile_id] = nl.copy(
+                    block[row_ofs + index.p, row_tile_id, column_tile_id, column_ofs + index.x] = nl.copy(
                         tileT, dtype=block.dtype
                     )
 
