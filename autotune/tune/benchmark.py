@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from autotune.cache.results import PerformanceMetrics
 from autotune.tune.job import ProfileJobs
-from autotune.tune.metrics import calculate_mfu, extract_metrics, get_matmul_mac_count
+from autotune.tune.metrics import extract_metrics
 from autotune.tune.utils import capture_error_message, compile_kernel, create_spike_kernel, run_spike_kernel
 
 
@@ -132,8 +132,11 @@ class Benchmark:
         futures = []
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             for job_id in range(self.jobs.num_jobs):
+                job = self.jobs[job_id]
                 result = self.results[job_id]
-                future = executor.submit(extract_metrics, result.neff, result.ntff)
+                future = executor.submit(
+                    extract_metrics, result.neff, result.ntff, result.min_ms, job.spike_kernel.traced_kernel
+                )
                 futures.append((job_id, future))
 
         for job_id, future in tqdm(futures, desc="Extracting metrics"):
@@ -141,10 +144,6 @@ class Benchmark:
             result = self.results[job_id]
             try:
                 metrics = future.result()
-                matmul_mac_count = get_matmul_mac_count(job.spike_kernel.traced_kernel)
-                mfu = calculate_mfu(matmul_mac_count, result.min_ms, "trn1")
-                metrics["matmul_mac_count"] = matmul_mac_count
-                metrics["mfu_estimated_percent"] = mfu
                 result.add_fields(metrics=metrics)
                 if result.ntff and os.path.exists(result.ntff):
                     os.remove(result.ntff)
