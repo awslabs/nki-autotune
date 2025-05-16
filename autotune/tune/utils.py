@@ -92,11 +92,13 @@ def create_spike_kernel(
     return spike_kernel
 
 
-def capture_neff(spike, spike_kernel, input_tensors, neff: str, **kwargs) -> Tuple[str, np.ndarray]:
+def run_spike_kernel(
+    spike, spike_kernel, input_tensors, neff: str, kernel_kwargs: KERNEL_KWARGS_DTYPE
+) -> Tuple[str, np.ndarray]:
     directory, neff_name, file_type = split_file_info(neff)
     if file_type != "neff":
         raise ValueError(f"{neff} is not a neff file.")
-    kernel_output = spike.run(spike_kernel, *input_tensors, save_trace=True, artifacts_dir=directory, **kwargs)
+    kernel_output = spike.run(spike_kernel, *input_tensors, save_trace=True, artifacts_dir=directory, **kernel_kwargs)
     ntff_file = f"{directory}/{neff_name}.ntff"
     shutil.move(f"{directory}/profile.ntff", ntff_file)
     return ntff_file, kernel_output
@@ -110,7 +112,7 @@ def run_kernel(kernel_name: str, input_tensors: Tuple[np.ndarray, ...], **kwargs
         stats = spike.benchmark(
             spike_kernel, *input_tensors, **kwargs, warmup_iterations=10, benchmark_iterations=100, device_id=0
         )
-        ntff, kernel_output = capture_neff(spike, spike_kernel, input_tensors, neff, **kwargs)
+        ntff, kernel_output = run_spike_kernel(spike, spike_kernel, input_tensors, neff, **kwargs)
     metrics = extract_metrics(neff, ntff)
     metrics.update(stats)
     upload_command = f'profile-upload -F "neff=@{neff}" -F "ntff=@{ntff}" -F name={kernel_name}'

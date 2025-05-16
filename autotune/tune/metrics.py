@@ -3,11 +3,30 @@ import subprocess
 from typing import Dict, Tuple
 
 import numpy as np
+from neuronxcc.starfish.penguin.ir.ir import BIRKernel, NativeKernelTemplate, TensorContractTensorOp
+from neuronxcc.starfish.penguin.targets.tonga.TongaISAInst import MatMulOp, MatMulSparseOp
 
 
-def calculate_pe_utilization(mac_count: int, time_ms: float, target_instance_family: str) -> float:
+def get_matmul_mac_count(traced_kernel):
+    flops = 0
+    for inst in traced_kernel._code.insts:
+        if isinstance(inst, (MatMulOp, MatMulSparseOp, NativeKernelTemplate, BIRKernel)):
+            flops += inst.total_arithmetic_ops
+        elif isinstance(inst, (TensorContractTensorOp)):
+            lhs_shape = inst.lhs_shape
+            rhs_shape = inst.rhs_shape
+            M, K = lhs_shape
+            _K, N = rhs_shape
+            assert K == _K, f"Incompatible matrix shapes. Received LHS {lhs_shape}. RHS {rhs_shape}."
+            flops += 2 * M * N * K
+    # One MAC is 2 flops
+    mac_count = flops // 2
+    return mac_count
+
+
+def calculate_mfu(mac_count: int, time_ms: float, target_instance_family: str) -> float:
     """
-    Calculate PE utilization based on a given MAC.
+    Calculate Model Flops Utilization based on a given MAC.
 
     Parameters:
     mac_count (int): Number of multiply-accumulate operations
@@ -31,11 +50,11 @@ def calculate_pe_utilization(mac_count: int, time_ms: float, target_instance_fam
     actual_latency_s = time_ms / 1000
     actual_pe_cycles = actual_latency_s * pe_freq
     theoretical_pe_cycles = flops / (2 * 128 * 128 * num_lnc)
-    pe_utilization = theoretical_pe_cycles / actual_pe_cycles
-    return pe_utilization
+    mfu = theoretical_pe_cycles / actual_pe_cycles
+    return mfu
 
 
-def calculate_GEMM_pe_utilization(
+def calculate_mfu_from_shapes(
     lhsT_shape: Tuple[int, ...], rhs_shape: Tuple[int, ...], time_ms: float, target_instance_family: str
 ) -> float:
     """
@@ -56,9 +75,8 @@ def calculate_GEMM_pe_utilization(
 
     # Calculate MAC count
     mac_count = m * k * n
-
-    # Call the direct MAC count function
-    return calculate_pe_utilization(mac_count, time_ms, target_instance_family)
+    mfu = calculate_mfu(mac_count, time_ms, target_instance_family)
+    return mfu
 
 
 def extract_metrics(neff: str, ntff: str) -> Dict[str, float]:

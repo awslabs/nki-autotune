@@ -1,24 +1,22 @@
 import os
-from collections import defaultdict
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 from autotune.cache.directories import extract_mnk_from_dirname, get_cache_dir, get_save_path
 from autotune.cache.results import PerformanceMetrics, PerformanceResult
-from autotune.tune.metrics import calculate_GEMM_pe_utilization
 
 
-def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu_estimated_percent")):
+def collect_metrics_data_with_stats(directory: str, metric_names):
     """
-    Collect multiple performance metrics (PE utilization and/or HFU) for all MNK combinations,
+    Collect multiple performance metrics (MFU and/or HFU) for all MNK combinations,
     calculating both best and mean performance metrics.
 
     Parameters:
     -----------
     directory : str
         Directory containing M-N-K subdirectories with perf_metrics.json files.
-    metrics : tuple
+    metric_names : tuple
         Metrics to collect, options include "pe_util" and "hfu_estimated_percent"
 
     Returns:
@@ -27,8 +25,10 @@ def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu_est
         Dictionary mapping metric names to dictionaries of (M, N) pairs to dictionaries of K values
         and their respective metric data with 'best' and 'mean' statistics.
     """
-    # Initialize metrics data structure
-    metrics_data = {metric: defaultdict(lambda: defaultdict(dict)) for metric in metrics}
+    # Initialize metrics data with a cleaner structure
+    metrics_data = {}
+    for metric in metric_names:
+        metrics_data[metric] = {}
 
     if not os.path.exists(directory):
         print(f"Directory not found: {directory}")
@@ -53,42 +53,33 @@ def collect_metrics_data_with_stats(directory: str, metrics=("pe_util", "hfu_est
                 best_config = min(all_results, key=lambda r: r.min_ms)
 
                 # Process each requested metric
-                for metric in metrics:
-                    if metric == "pe_util":
-                        # Calculate PE utilization for best config
-                        best_pe_util = calculate_GEMM_pe_utilization((k, m), (k, n), best_config.min_ms, "trn1")
+                for metric in metric_names:
+                    best_metric = parse_metric(best_config, metric)
 
-                        # Calculate mean PE utilization across all configurations
-                        all_pe_utils = [
-                            calculate_GEMM_pe_utilization((k, m), (k, n), r.min_ms, "trn1") for r in all_results
-                        ]
-                        mean_pe_util = np.mean(all_pe_utils) if all_pe_utils else 0
+                    # Calculate mean metric across all configurations
+                    all_metrics = [parse_metric(r, metric) for r in all_results]
+                    mean_metric = np.mean(all_metrics) if all_metrics else 0
 
-                        # Store both metrics
-                        metrics_data["pe_util"][(m, n)][k]["best"] = best_pe_util
-                        metrics_data["pe_util"][(m, n)][k]["mean"] = mean_pe_util
+                    # Initialize nested dictionaries if they don't exist
+                    if (m, n) not in metrics_data[metric]:
+                        metrics_data[metric][(m, n)] = {}
 
-                    elif metric == "hfu_estimated_percent":
-                        # Extract HFU for best config if available
-                        best_hfu = parse_hfu(best_config)
+                    if k not in metrics_data[metric][(m, n)]:
+                        metrics_data[metric][(m, n)][k] = {}
 
-                        # Calculate mean HFU across all configurations
-                        all_hfus = [parse_hfu(r) for r in all_results]
-                        mean_hfu = np.mean(all_hfus) if all_hfus else 0
-
-                        # Store both metrics
-                        metrics_data["hfu_estimated_percent"][(m, n)][k]["best"] = best_hfu
-                        metrics_data["hfu_estimated_percent"][(m, n)][k]["mean"] = mean_hfu
+                    # Store both metrics
+                    metrics_data[metric][(m, n)][k]["best"] = best_metric
+                    metrics_data[metric][(m, n)][k]["mean"] = mean_metric
 
     return metrics_data
 
 
-def parse_hfu(result: PerformanceResult):
+def parse_metric(result: PerformanceResult, metric_name: str):
     try:
-        hfu = result.metrics["hfu_estimated_percent"]
+        metric = result.metrics[metric_name]
     except:
-        hfu = 0
-    return hfu
+        metric = 0
+    return metric
 
 
 def plot_single_metric_vs_k_comparison(m, n, metric_name, tuned_data, baseline_data, plots_dir):
@@ -170,44 +161,24 @@ def plot_single_metric_vs_k_comparison(m, n, metric_name, tuned_data, baseline_d
             )
 
     # Set metric-specific properties
-    if metric_name == "pe_util":
-        # Add a horizontal line at 87.5% to represent Trn1 Max
-        plt.axhline(y=0.875, color="purple", linestyle="--", linewidth=2, label="Trn1 Max")
-
-        # Add text annotation for the line
-        if all_k_values:
-            plt.text(
-                min(all_k_values),  # X position - start of plot
-                0.885,  # Y position - slightly above the line
-                "87.5%",  # Text label
-                color="purple",
-                fontweight="bold",
-            )
-
-        plot_title = f"PE Utilization vs. K for M={m}, N={n}"
-        y_label = "PE Utilization (%)"
-        plot_type = "GEMM_PE_utilization"
-
+    # Add a horizontal line at 87.5% to represent Trn1 Max
+    plt.axhline(y=0.875, color="purple", linestyle="--", linewidth=2, label="Trn1 Max")
+    plt.text(
+        min(all_k_values),  # X position - start of plot
+        0.885,  # Y position - slightly above the line
+        "87.5%",  # Text label
+        color="purple",
+        fontweight="bold",
+    )
+    if metric_name == "mfu_estimated_percent":
+        plot_title = f"Model Flops Utilization vs. K for M={m}, N={n}"
+        y_label = "MFU (%)"
+        plot_type = "Model_Flops_Utilization"
     elif metric_name == "hfu_estimated_percent":
-        # Add a horizontal line at 87.5% to represent theoretical maximum
-        plt.axhline(y=0.875, color="purple", linestyle="--", linewidth=2, label="Theoretical Max")
-
-        # Add text annotation for the line
-        if all_k_values:
-            plt.text(
-                min(all_k_values),  # X position - start of plot
-                0.885,  # Y position - slightly above the line
-                "87.5%",  # Text label
-                color="purple",
-                fontweight="bold",
-            )
-
         plot_title = f"Hardware Flops Utilization vs. K for M={m}, N={n}"
-        y_label = "Hardware Flops Utilization (%)"
+        y_label = "HFU (%)"
         plot_type = "Hardware_Flops_Utilization"
-
     else:
-        # Generic case
         plot_title = f"{metric_name} vs. K for M={m}, N={n}"
         y_label = f"{metric_name} (%)"
         plot_type = f"{metric_name}_vs_k"
@@ -248,7 +219,7 @@ def plot_single_metric_vs_k_comparison(m, n, metric_name, tuned_data, baseline_d
     plt.close()
 
 
-def plot_metrics_vs_k_comparison(workload_name: str, metrics=("pe_util", "hfu_estimated_percent")):
+def plot_metrics_vs_k_comparison(workload_name: str):
     """
     Create plots comparing selected metrics vs K for each unique (M, N) pair between
     tuned and baseline, showing best and mean statistics for tuned data.
@@ -257,7 +228,7 @@ def plot_metrics_vs_k_comparison(workload_name: str, metrics=("pe_util", "hfu_es
     -----------
     workload_name : str
         Name of the workload (used to locate directories and save plots)
-    metrics : tuple
+    metric_names : tuple
         Metrics to plot, options include "pe_util" and "hfu_estimated_percent"
     """
     # Construct directory paths
@@ -268,12 +239,15 @@ def plot_metrics_vs_k_comparison(workload_name: str, metrics=("pe_util", "hfu_es
     # Make sure output directory exists
     os.makedirs(plots_dir, exist_ok=True)
 
+    # Hardcode the metrics instead of using default args
+    metrics_to_collect = ["mfu_estimated_percent", "hfu_estimated_percent"]
+
     # Collect data from tuned and baseline directories with statistics
-    tuned_metrics = collect_metrics_data_with_stats(tuned_dir, metrics)
-    baseline_metrics = collect_metrics_data_with_stats(baseline_dir, metrics)
+    tuned_metrics = collect_metrics_data_with_stats(tuned_dir, metrics_to_collect)
+    baseline_metrics = collect_metrics_data_with_stats(baseline_dir, metrics_to_collect)
 
     # Process each metric
-    for metric in metrics:
+    for metric in metrics_to_collect:
         tuned_data = tuned_metrics.get(metric, {})
         baseline_data = baseline_metrics.get(metric, {})
 
