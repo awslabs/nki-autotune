@@ -79,7 +79,7 @@ def calculate_mfu_from_shapes(
     return mfu
 
 
-def extract_metrics(neff: str, ntff: str) -> Dict[str, float]:
+def extract_metrics(neff: str, ntff: str, latency: float, traced_kernel) -> Dict[str, float]:
     dump_json_cmd = f"neuron-profile view -n {neff} -s {ntff} --output-format summary-json"
     process = subprocess.run(dump_json_cmd, shell=True, capture_output=True, text=True, check=True)
     json_str = process.stdout
@@ -89,6 +89,11 @@ def extract_metrics(neff: str, ntff: str) -> Dict[str, float]:
     # Get the first (and only) key in the dictionary
     first_key = next(iter(data))
     metrics = data[first_key]
+
+    matmul_mac_count = get_matmul_mac_count(traced_kernel)
+    mfu = calculate_mfu(matmul_mac_count, latency, "trn1")
+    metrics["matmul_mac_count"] = matmul_mac_count
+    metrics["mfu_estimated_percent"] = mfu
     return metrics
 
 
