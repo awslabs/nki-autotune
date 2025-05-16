@@ -34,7 +34,7 @@ def gemm_lhs_MNK(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: Kernel
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             result_block = nl.zeros(
-                (nl.par_dim(mm.TILE_M), mm.TILE_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N),
+                (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 dtype=lhs.dtype,
                 buffer=nl.sbuf,
             )
@@ -42,12 +42,12 @@ def gemm_lhs_MNK(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: Kernel
                 lhs_block = load_tensor_block(
                     input_tensor=lhs,
                     ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
-                    load_shape=(mm.TILE_M, mm.TILE_K, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_K),
+                    load_shape=(mm.TILE_M, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_K, mm.TILE_K),
                 )
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
-                    load_shape=(mm.TILE_K, mm.TILE_N, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N),
+                    load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 )
                 matmul_blocks_lhs(lhs_block, rhs_block, result_block)
             save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
@@ -60,18 +60,18 @@ def gemm_lhs_MN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelH
         lhs_block = load_tensor_block(
             input_tensor=lhs,
             ofs=(block_id_M * mm.BLOCK_M, 0),
-            load_shape=(mm.TILE_M, mm.TILE_K, mm.TILES_IN_BLOCK_M, mm.TILES_IN_K),
+            load_shape=(mm.TILE_M, mm.TILES_IN_BLOCK_M, mm.TILES_IN_K, mm.TILE_K),
         )
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
             result_block = nl.zeros(
-                (nl.par_dim(mm.TILE_M), mm.TILE_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N),
+                (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 dtype=lhs.dtype,
                 buffer=nl.sbuf,
             )
             rhs_block = load_tensor_block(
                 input_tensor=rhs,
                 ofs=(0, block_id_N * mm.BLOCK_N),
-                load_shape=(mm.TILE_K, mm.TILE_N, mm.TILES_IN_K, mm.TILES_IN_BLOCK_N),
+                load_shape=(mm.TILE_K, mm.TILES_IN_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
             )
             matmul_blocks_lhs(lhs_block, rhs_block, result_block)
             save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)

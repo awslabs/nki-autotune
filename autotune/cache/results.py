@@ -34,6 +34,7 @@ class PerformanceResult:
         Raises:
             AttributeError: If the attribute doesn't exist and strict mode is enabled
         """
+        # FIXME: incorporate lower_is_better
         return None
 
     def to_dict(self) -> Dict:

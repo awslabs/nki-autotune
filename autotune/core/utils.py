@@ -203,9 +203,9 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
     rhs_block: TILES_IN_K, TILE_K, N
     result_block : TILES_IN_M, TILES_IN_N, TILE_M, TILE_N
     """
-    TILE_M, TILE_K, TILES_IN_M, TILES_IN_K = lhs_block.shape
-    _TILE_K, TILE_N, _TILES_IN_K, TILES_IN_N = rhs_block.shape
-    _TILE_M, _TILE_N, _TILES_IN_M, _TILES_IN_N = result_block.shape
+    TILE_M, TILES_IN_M, TILES_IN_K, TILE_K = lhs_block.shape
+    _TILE_K, _TILES_IN_K, TILES_IN_N, TILE_N = rhs_block.shape
+    _TILE_M, _TILES_IN_M, _TILES_IN_N, _TILE_N = result_block.shape
     assert (
         TILE_K == _TILE_K and TILES_IN_K == _TILES_IN_K
     ), f"lhs_block and rhs_block shape mismatch: lhs_block {lhs_block.shape}. rhs_block {rhs_block.shape}."
@@ -235,12 +235,12 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
                 # FIXME: in-place transposition repeated across tile_id_N
                 # TODO: use a temp tile to hold tileT
                 tileT_psum = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.psum)
-                tileT_psum[...] = nisa.nc_transpose(lhs_block[idx_lhs.p, idx_lhs.x, tile_id_M, tile_id_K])
+                tileT_psum[...] = nisa.nc_transpose(lhs_block[idx_lhs.p, tile_id_M, tile_id_K, idx_lhs.x])
                 tileT_sbuf = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.sbuf)
                 tileT_sbuf[...] = nl.copy(tileT_psum, dtype=lhs_block.dtype)
-                result_tile += nisa.nc_matmul(tileT_sbuf, rhs_block[idx_rhs.p, idx_rhs.x, tile_id_K, tile_id_N])
+                result_tile += nisa.nc_matmul(tileT_sbuf, rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x])
 
-            result_block[idx_res.p, idx_res.x, tile_id_M, tile_id_N] += result_tile[idx_res.p, idx_res.x]
+            result_block[idx_res.p, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
 
 
 def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks, block_id_N):
