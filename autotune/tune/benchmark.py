@@ -10,11 +10,10 @@ import numpy as np
 from neuronpy.runtime.spike import SpikeExecutor
 from tqdm import tqdm
 
-from autotune.cache.directories import split_file_info
-from autotune.cache.results import PerformanceMetrics, PerformanceResult
-from autotune.tune.job import ProfileJob, ProfileJobs
-from autotune.tune.metrics import extract_metrics
-from autotune.tune.utils import capture_error_message, compile_kernel, create_spike_kernel
+from autotune.cache.results import PerformanceMetrics
+from autotune.tune.job import ProfileJobs
+from autotune.tune.metrics import calculate_mfu, extract_metrics, get_matmul_mac_count
+from autotune.tune.utils import capture_error_message, compile_kernel, create_spike_kernel, run_spike_kernel
 
 
 class Benchmark:
@@ -104,6 +103,7 @@ class Benchmark:
                 job = self.jobs[job_id]
                 result = self.results[job_id]
                 try:
+                    # TODO: run fp32 correctness checking
                     spike_kernel = create_spike_kernel(
                         result.neff, job.kernel_name, job.input_tensors, job.kernel_kwargs
                     )
@@ -115,44 +115,17 @@ class Benchmark:
                         benchmark_iterations=self.iters,
                         device_id=0,
                     )
-                    kernel_output = self._capture_neff(spike, spike_kernel, job, result)
-                    result.add_fields(**stats)
+                    ntff_file, kernel_output = run_spike_kernel(
+                        spike, spike_kernel, job.input_tensors, result.neff, job.kernel_kwargs
+                    )
+                    job.add_fields(spike_kernel=spike_kernel)
+                    result.add_fields(ntff=ntff_file, **stats)
                 except Exception as e:
                     error_string = capture_error_message(e)
                     result.add_error(error_string)
                     kernel_output = None
                 kernel_outputs[job_id] = kernel_output
         return kernel_outputs
-
-    def _capture_neff(self, spike, spike_kernel, job: ProfileJob, result: PerformanceResult) -> np.ndarray:
-        """
-        Generate trace profiles for compiled kernel files.
-
-        This method processes each NEFF (Neuron Executable File Format) file by:
-        1. Capturing a trace profile using neuron-profile
-        2. Moving the resulting trace file (NTFF) to the appropriate location
-        3. Creating an upload command for the profile data and logging it
-
-        Args:
-            neff_files (str): NEFF file to be traced.
-
-        Raises:
-            AssertionError: If any of the provided files is not a .neff file.
-
-        Note:
-            This method is used when the 'trace' flag is set to True, allowing
-            for detailed performance analysis of the compiled kernels.
-        """
-        # TODO: re-use capture_neff from utils.py
-        directory, neff_name, file_type = split_file_info(result.neff)
-        # FIXME: an extra fp32 run for correctness
-        kernel_output = spike.run(
-            spike_kernel, *job.input_tensors, save_trace=True, artifacts_dir=directory, **job.kernel_kwargs
-        )
-        ntff_file = f"{directory}/{neff_name}.ntff"
-        shutil.move(f"{directory}/profile.ntff", ntff_file)
-        result.add_fields(ntff=ntff_file)
-        return kernel_output
 
     def _parallel_extract_metrics(self):
         """Extract profile metrics for all jobs in parallel."""
@@ -164,9 +137,14 @@ class Benchmark:
                 futures.append((job_id, future))
 
         for job_id, future in tqdm(futures, desc="Extracting metrics"):
+            job = self.jobs[job_id]
             result = self.results[job_id]
             try:
                 metrics = future.result()
+                matmul_mac_count = get_matmul_mac_count(job.spike_kernel.traced_kernel)
+                mfu = calculate_mfu(matmul_mac_count, result.min_ms, "trn1")
+                metrics["matmul_mac_count"] = matmul_mac_count
+                metrics["mfu_estimated_percent"] = mfu
                 result.add_fields(metrics=metrics)
                 if result.ntff and os.path.exists(result.ntff):
                     os.remove(result.ntff)

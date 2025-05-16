@@ -7,7 +7,6 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.cache.directories import get_cache_dir
-from autotune.cache.parameter_importance import analyze_and_visualize
 from autotune.cache.visualize import plot_metrics_vs_k_comparison
 from autotune.core.utils import GEMMCompatibility
 from autotune.tune.benchmark import Benchmark
@@ -84,4 +83,3 @@ if __name__ == "__main__":
         profile(workload_name, M, N, K)
         plot_metrics_vs_k_comparison(workload_name)
     plot_metrics_vs_k_comparison(workload_name)
-    analyze_and_visualize(workload_name)

@@ -161,7 +161,7 @@ def get_cache_dir(workload_name: str, cache_type: str, **kwargs):
     return cache_dir
 
 
-def get_save_path(plots_dir: str, plot_type, m=None, n=None, k=None, run_type=None):
+def get_save_path(plots_dir: str, plot_type, m=None, n=None, k=None):
     """
     Determine the save path based on plot type and dimensions.
 
@@ -181,34 +181,11 @@ def get_save_path(plots_dir: str, plot_type, m=None, n=None, k=None, run_type=No
     tuple
         (save_path, filename)
     """
-    # GEMM_PE_utilization plots go directly in the plots folder
-    if plot_type == "GEMM_PE_utilization" or plot_type == "Hardware_Flops_Utilization":
+    # MFU, HFU plots go directly in the plots folder
+    if plot_type in ["Model_Flops_Utilization", "Hardware_Flops_Utilization"]:
         return plots_dir, f"{plot_type}_M{m}_N{n}.png"
-
-    # For parameter analysis plots, determine the appropriate subdirectory
-    shape_str = ""
-    if m is not None and n is not None:
-        shape_str = f"M{m}N{n}"
-        if k is not None:
-            shape_str += f"K{k}"
-
-    # Build the subdirectory path
-    if run_type and shape_str:
-        subdir = f"{run_type}-{shape_str}"
-    elif run_type:
-        subdir = run_type
-    elif shape_str:
-        subdir = f"tuned-{shape_str}"
     else:
-        subdir = ""
-
-    # Return appropriate paths
-    if subdir:
-        full_path = os.path.join(plots_dir, subdir)
-        os.makedirs(full_path, exist_ok=True)
-        return full_path, f"{plot_type}.png"
-    else:
-        return plots_dir, f"{plot_type}.png"
+        raise NotImplementedError(f"Plot type {plot_type} is not supported.")
 
 
 def extract_mnk_from_dirname(dirname):
