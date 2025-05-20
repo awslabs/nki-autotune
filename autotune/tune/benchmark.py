@@ -35,6 +35,7 @@ class Benchmark:
         self.iters = iters
         self.results = self._init_results(main_metric, lower_is_better)
         self.valid_job_ids = list(range(self.jobs.num_jobs))
+        self.kernel_outputs: Dict[int, np.ndarray] = {}
         if os.path.exists(cache_dir):
             shutil.rmtree(cache_dir)
         os.makedirs(cache_dir)
@@ -43,9 +44,9 @@ class Benchmark:
     def __call__(self):
         self._parallel_preprocessing()
         self._parallel_compile_to_neff()
-        kernel_outputs = self._execute()
-        self._parallel_postprocessing(kernel_outputs)
-        self._parallel_extract_metrics()
+        self._execute()
+        self._parallel_postprocessing()
+        # self._parallel_extract_metrics()
         self.results.save(cache_dir=self.cache_dir)
 
     def _get_num_workers(self) -> int:
@@ -57,65 +58,71 @@ class Benchmark:
         results = PerformanceMetrics(sort_key=main_metric, lower_is_better=lower_is_better)
         for job in self.jobs:
             # NOTE: hardcoded saving of job's data fields
-            results.add_result(kernel_kwargs=job.kernel_kwargs, compiler_flags=job.compiler_flags)
+            results.add_result(kernel=job.kernel, kernel_kwargs=job.kernel_kwargs, compiler_flags=job.compiler_flags)
         return results
 
-    def _parallel_preprocessing(self):
+    def _parallel_execute(self, work_desc: str, submit_func, process_result_func):
+        """
+        General function for parallel execution of jobs.
+
+        Args:
+            work_desc: Description for the progress bar
+            submit_func: Function that takes a job object and returns (func, args) tuple
+                        for executor.submit
+            process_result_func: Function that takes (result_obj, future_result) to process results
+            num_workers: Number of workers for the ProcessPoolExecutor
+        """
         futures = []
         num_workers = self._get_num_workers()
+
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for job_id in self.valid_job_ids:
-                job = self.jobs[job_id]
-                future = executor.submit(job.preprocessing, job.input_tensors, job.kernel_kwargs)
+            for job_id in list(self.valid_job_ids):
+                func, args = submit_func(job_id)
+                future = executor.submit(func, *args)
                 futures.append((job_id, future))
-        for job_id, future in tqdm(futures, total=len(futures), desc="Preprocessing"):
-            result = self.results[job_id]
+
+        for job_id, future in tqdm(futures, total=len(futures), desc=work_desc):
             try:
-                preprocessing_is_ok = future.result()
-                result.add_fields(preprocessing_result=preprocessing_is_ok)
+                future_result = future.result()
+                process_result_func(job_id, future_result)
             except Exception as e:
                 error_string = capture_error_message(e)
-                result.add_error(error_string)
+                self.results[job_id].add_error(error_string)
                 self.valid_job_ids.remove(job_id)
+
+    def _parallel_preprocessing(self):
+        def submit_func(job_id):
+            job = self.jobs[job_id]
+            return (job.preprocessing, (job.input_tensors, job.kernel_kwargs))
+
+        def process_result_func(job_id, preprocessing_is_ok):
+            result = self.results[job_id]
+            result.add_fields(preprocessing_result=preprocessing_is_ok)
+
+        self._parallel_execute("Preprocessing", submit_func, process_result_func)
 
     def _parallel_compile_to_neff(self):
-        futures = []
-        num_workers = self._get_num_workers()
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for job_id in self.valid_job_ids:
-                job = self.jobs[job_id]
-                result = self.results[job_id]
-                future = executor.submit(
-                    compile_kernel,
-                    job.kernel_name,
-                    job.name,
-                    job.input_tensors,
-                    job.kernel_kwargs,
-                    job.compiler_flags,
-                    self.cache_dir,
-                )
-                futures.append((job_id, future))
-        for job_id, future in tqdm(futures, total=len(futures), desc="Compiling kernels"):
-            result = self.results[job_id]
-            try:
-                neff = future.result()
-                result.add_fields(neff=neff)
-            except Exception as e:
-                error_string = capture_error_message(e)
-                result.add_error(error_string)
-                self.valid_job_ids.remove(job_id)
+        def submit_func(job_id):
+            job = self.jobs[job_id]
+            return (
+                compile_kernel,
+                (job.kernel, job.name, job.input_tensors, job.kernel_kwargs, job.compiler_flags, self.cache_dir),
+            )
 
-    def _execute(self) -> Dict[int, np.ndarray]:
-        kernel_outputs: Dict[int, np.ndarray] = {}
+        def process_result_func(job_id, neff):
+            result = self.results[job_id]
+            result.add_fields(neff=neff)
+
+        self._parallel_execute("Compiling kernels", submit_func, process_result_func)
+
+    def _execute(self):
         with SpikeExecutor(verbose=0) as spike:
             for job_id in tqdm(self.valid_job_ids, total=len(self.valid_job_ids), desc="Executing kernels"):
                 job = self.jobs[job_id]
                 result = self.results[job_id]
                 try:
                     # TODO: run fp32 correctness checking
-                    spike_kernel = create_spike_kernel(
-                        result.neff, job.kernel_name, job.input_tensors, job.kernel_kwargs
-                    )
+                    spike_kernel = create_spike_kernel(result.neff, job.kernel, job.input_tensors, job.kernel_kwargs)
                     stats = spike.benchmark(
                         spike_kernel,
                         *job.input_tensors,
@@ -127,15 +134,26 @@ class Benchmark:
                     ntff_file, kernel_output = run_spike_kernel(
                         spike, spike_kernel, job.input_tensors, result.neff, job.kernel_kwargs
                     )
+                    self.kernel_outputs[job_id] = kernel_output
                     job.add_fields(spike_kernel=spike_kernel)
                     result.add_fields(ntff=ntff_file, **stats)
                 except Exception as e:
                     error_string = capture_error_message(e)
                     result.add_error(error_string)
-                    kernel_output = None
                     self.valid_job_ids.remove(job_id)
-                kernel_outputs[job_id] = kernel_output
-        return kernel_outputs
+
+    def _parallel_postprocessing(self):
+        def submit_func(job_id):
+            job = self.jobs[job_id]
+            kernel_output = self.kernel_outputs[job_id]
+            result = self.results[job_id]
+            return (job.postprocessing, (job.input_tensors, job.kernel_kwargs, kernel_output, result.metrics))
+
+        def process_result_func(job_id, postprocessing_is_ok):
+            result = self.results[job_id]
+            result.add_fields(postprocessing_result=postprocessing_is_ok)
+
+        self._parallel_execute("Postprocessing", submit_func, process_result_func)
 
     def _parallel_extract_metrics(self):
         """Extract profile metrics for all jobs in parallel."""
@@ -163,26 +181,4 @@ class Benchmark:
                 error_msg = capture_error_message(e)
                 result.add_error(error_msg)
                 result.add_fields(hfu=0)
-                self.valid_job_ids.remove(job_id)
-
-    def _parallel_postprocessing(self, kernel_outputs: Dict[int, np.ndarray]):
-        futures = []
-        num_workers = self._get_num_workers()
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for job_id in range(self.jobs.num_jobs):
-                job = self.jobs[job_id]
-                kernel_output = kernel_outputs[job_id]
-                result = self.results[job_id]
-                future = executor.submit(
-                    job.postprocessing, job.input_tensors, job.kernel_kwargs, kernel_output, result.metrics
-                )
-                futures.append((job_id, future))
-        for job_id, future in tqdm(futures, total=len(futures), desc="Postprocessing"):
-            result = self.results[job_id]
-            try:
-                postprocessing_is_ok = future.result()
-                result.add_fields(postprocessing_result=postprocessing_is_ok)
-            except Exception as e:
-                error_string = capture_error_message(e)
-                result.add_error(error_string)
                 self.valid_job_ids.remove(job_id)

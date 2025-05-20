@@ -9,6 +9,7 @@ from autotune.cache.directories import get_hash_name
 from autotune.tune.utils import capture_error_message
 from autotune.typing import (
     INPUT_TENSORS_DTYPE,
+    KERNEL_DTYPE,
     KERNEL_KWARGS_DTYPE,
     METRICS_DTYPE,
     OUTPUT_TENSOR_DTYPE,
@@ -43,19 +44,20 @@ def get_batch_size(num_samples: int, total_num_samples: int):
 class ProfileJob:
     def __init__(
         self,
-        kernel_name: str,
+        kernel: KERNEL_DTYPE,
         input_tensors: INPUT_TENSORS_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
         compiler_flags: str,
         preprocessing: PREPROCESSING_DTYPE,
         postprocessing: POSTPROCESSING_DTYPE,
     ) -> None:
-        self.kernel_name = kernel_name
+        self.kernel = kernel
         self.input_tensors = input_tensors
         self.kernel_kwargs = kernel_kwargs
         self.compiler_flags = compiler_flags
         self.preprocessing = preprocessing
         self.postprocessing = postprocessing
+        kernel_path, kernel_name = kernel
         self.name = get_hash_name(kernel_name, input_tensors, kernel_kwargs)
 
     def get_arg_shapes(self):
@@ -76,9 +78,7 @@ class ProfileJob:
         arg_shapes = [str(arg.shape) for arg in self.input_tensors]
         kwargs_str = ", ".join(f"{k}={v}" for k, v in self.kernel_kwargs.items())
 
-        return (
-            f"ProfileJob(kernel={self.kernel_name}, shapes={arg_shapes}, " f"kwargs={{{kwargs_str}}}, name={self.name})"
-        )
+        return f"ProfileJob(kernel={self.kernel}, shapes={arg_shapes}, " f"kwargs={{{kwargs_str}}}, name={self.name})"
 
     def __getattr__(self, name):
         """
@@ -94,7 +94,7 @@ class ProfileJobs:
 
     def add_job(
         self,
-        kernel_name: str,
+        kernel: KERNEL_DTYPE,
         input_tensors: INPUT_TENSORS_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
         compiler_flags: str | None = None,
@@ -105,7 +105,7 @@ class ProfileJobs:
             kernel_kwargs = {}
         if compiler_flags is None:
             compiler_flags = ""
-        job = ProfileJob(kernel_name, input_tensors, kernel_kwargs, compiler_flags, preprocessing, postprocessing)
+        job = ProfileJob(kernel, input_tensors, kernel_kwargs, compiler_flags, preprocessing, postprocessing)
         self.jobs.append(job)
 
     def sample(self, num_samples: int) -> None:
