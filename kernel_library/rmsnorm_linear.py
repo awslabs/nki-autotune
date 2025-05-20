@@ -296,7 +296,7 @@ def stack_allocated_fused_rms_norm_qkv(hidden, weights, norm_dtype=nl.float32, e
     return out_tensor
 
 
-@nki.jit()
+@nki.jit
 def blocked_fused_rms_norm_linear(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, norm_dtype=nl.float32, eps=1e-6):
     """
     Optimized kernel that computes RMSNorm(hidden) @ wQKV. This kernel is designed to only handle fp16/bf16 tensor types.
@@ -311,7 +311,7 @@ def blocked_fused_rms_norm_linear(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, 
     """
     assert len(lhs.shape) == 3, f"Expecting (batch, M, K) in LHS. Received {lhs.shape}."
     mm = GEMMCompatibility(transposed_lhs=False)
-    mm(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, 1)
+    mm((lhs, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N})
     batch_size = lhs.shape[0]
     result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for batch_id in nl.affine_range(batch_size):

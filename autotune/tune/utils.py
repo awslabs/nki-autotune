@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import shutil
 import sys
 import traceback
@@ -11,12 +12,8 @@ from neuronpy.runtime.spike import CompiledKernel, SpikeExecutor
 from neuronxcc.nki.compile import GenericKernel
 
 from autotune.cache.directories import split_file_info
-from autotune.core.lhs_rhs import gemm_main
-from autotune.core.lhsT_rhs import matmul_main
-from autotune.golden.gemm import matmul_op, matmul_xt_op
-from autotune.golden.rmsnorm_linear import rmsnorm_gemm_golden
 from autotune.tune.metrics import extract_metrics
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
 
 
 def capture_error_message(e) -> str:
@@ -26,25 +23,57 @@ def capture_error_message(e) -> str:
     return error_string
 
 
-def get_kernel_by_name(kernel_name: str):
+def parse_path_and_function(combined_str: str):
+    """
+    Parse a string containing a file path and function name in the format:
+    path/to/file.py/function_name
+
+    Args:
+        combined_str (str): The combined path and function string
+
+    Returns:
+        tuple: (file_path, function_name)
+
+    Raises:
+        ValueError: If the string format is invalid
+    """
+    # Find the last slash which separates the file path from the function name
+    last_slash_index = combined_str.rfind("/")
+
+    if last_slash_index == -1:
+        raise ValueError("Invalid format: expected 'path/to/file.py/function_name'")
+
+    # Extract the file path and function name
+    file_path = combined_str[:last_slash_index]
+    function_name = combined_str[last_slash_index + 1 :]
+
+    # Validate the extracted components
+    if not file_path or not function_name:
+        raise ValueError("Invalid format: both file path and function name must be non-empty")
+
+    # Check if the file path likely ends with a Python file
+    if not file_path.endswith(".py"):
+        # This is just a warning check, not an error
+        import warnings
+
+        warnings.warn("File path doesn't end with '.py', which is unusual")
+
+    return file_path, function_name
+
+
+def get_kernel_by_name(kernel_name: KERNEL_DTYPE):
     # TODO: implement a kernel library to add/load kernels
-    kernels = {
-        "matmul_op": matmul_op,
-        "matmul_xt_op": matmul_xt_op,
-        "rmsnorm_linear_op": rmsnorm_gemm_golden,
-        "matmul_main": matmul_main,
-        "non_transposed_matmul": gemm_main,
-    }
-    if kernel_name in kernels:
-        kernel = kernels[kernel_name]
-    else:
-        kernel_module = importlib.import_module("kernel_library")
-        kernel = getattr(kernel_module, kernel_name)
+    module_path, func_name = kernel_name
+    spec = importlib.util.spec_from_file_location(func_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[func_name] = module
+    spec.loader.exec_module(module)
+    kernel = getattr(module, func_name)
     return kernel
 
 
 def compile_kernel(
-    kernel_name: str,
+    kernel_name: KERNEL_DTYPE,
     neff_name: str,
     input_tensors: INPUT_TENSORS_DTYPE,
     kernel_kwargs: KERNEL_KWARGS_DTYPE,
@@ -53,19 +82,12 @@ def compile_kernel(
 ) -> str:
     """Standalone function to create and compile a NKI or NeuronPy kernel"""
     kernel = get_kernel_by_name(kernel_name)
-    allocated_kernels = ["stack_allocated_fused_rms_norm_qkv", "blocked_fused_rms_norm_linear"]
-    compiler_args = ["--target=trn1", "--auto-cast=none"]
     if isinstance(kernel, types.FunctionType):
         traced_kernel = trace(kernel)
-        compiler_args.append("--model-type=transformer")
     elif isinstance(kernel, GenericKernel):
         traced_kernel = kernel
-        compiler_args.append("--internal-tensorizer-opt-level=nki")
-        if kernel_name in allocated_kernels:
-            compiler_args.append("--internal-nki-allocation")
     else:
         raise TypeError(f"{type(kernel)} {kernel} is not supported.")
-    compiler_args = " ".join(compiler_args)
     # TODO: dump the specialized NKI kernels
     traced_kernel.specialize(*input_tensors, **kernel_kwargs)
     compile_dir = f"{output_dir}/{neff_name}"
@@ -77,7 +99,7 @@ def compile_kernel(
 
 
 def create_spike_kernel(
-    neff_path: str, kernel_name: str, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE
+    neff_path: str, kernel_name: KERNEL_DTYPE, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE
 ) -> CompiledKernel:
     # FIXME: args are used, kwargs are needed to run but not used
     kernel = get_kernel_by_name(kernel_name)

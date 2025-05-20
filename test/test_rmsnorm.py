@@ -9,12 +9,7 @@ from neuronxcc.starfish.support.util import allclose
 
 from autotune.core.test_generation import GenTests
 from autotune.core.utils import GEMMCompatibility
-from autotune.golden.rmsnorm_linear import (
-    fused_rmsnorm_gemm_golden,
-    fused_rmsnorm_gemm_mkn,
-    golden_fun,
-    rmsnorm_gemm_golden,
-)
+from autotune.golden.rmsnorm_linear import fused_rmsnorm_gemm_golden, fused_rmsnorm_gemm_mkn, rmsnorm_matmul_golden
 from kernel_library.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
     blocked_fused_rms_norm_linear,
@@ -50,8 +45,8 @@ def test_rmsnorm_gemm_np_numerical(batch: int, M: int, N: int, K: int, eps: floa
     lhs = np.random.random_sample((batch, M, K)).astype(data_type)
     rhs = np.random.random_sample((K, N)).astype(data_type)
 
-    golden = golden_fun(lhs, None, None, rhs, eps)
-    for func in [rmsnorm_gemm_golden, fused_rmsnorm_gemm_golden, fused_rmsnorm_gemm_mkn]:
+    golden = rmsnorm_matmul_golden(lhs, rhs, eps)
+    for func in [fused_rmsnorm_gemm_golden, fused_rmsnorm_gemm_mkn]:
         np_out = func(lhs, rhs, eps)
         assert allclose(np_out, golden, atol=atol, rtol=rtol, verbose=1), f"{func} output does not match with golden."
 
@@ -62,7 +57,7 @@ def test_rmsnorm_gemm_np_numerical(batch: int, M: int, N: int, K: int, eps: floa
 def test_weighted_rmsnorm(batch, seqlen, dim, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     gamma = np.random.random_sample((dim))
-    golden_output = nl.static_cast(golden_fun(hidden, None, gamma, None, eps), np.float32)
+    golden_output = nl.static_cast(rmsnorm_matmul_golden(hidden, gamma, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -84,7 +79,7 @@ def test_weighted_rmsnorm(batch, seqlen, dim, eps):
 def test_allocated_weighted_rmsnorm(batch, seqlen, dim, buffer_degree, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     gamma = np.random.random_sample((dim))
-    golden_output = nl.static_cast(golden_fun(hidden, None, gamma, None, eps), np.float32)
+    golden_output = nl.static_cast(rmsnorm_matmul_golden(hidden, gamma, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -106,7 +101,7 @@ def test_allocated_weighted_rmsnorm(batch, seqlen, dim, buffer_degree, eps):
 def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree, eps):
     hidden = np.random.random_sample((batch, seqlen, dim))
     qkv_weights = np.random.random_sample((dim, d_head))
-    golden_output = nl.static_cast(golden_fun(hidden, None, None, qkv_weights, eps), np.float32)
+    golden_output = nl.static_cast(rmsnorm_matmul_golden(hidden, qkv_weights, eps), np.float32)
 
     data_type = np.float16
     hidden_dev = nl.static_cast(hidden, data_type)
@@ -129,7 +124,7 @@ def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
 def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, eps):
     lhs = np.random.random_sample((batch, seqlen, dim))
     rhs = np.random.random_sample((dim, d_head))
-    golden_output = nl.static_cast(golden_fun(lhs, None, None, rhs, eps), np.float32)
+    golden_output = nl.static_cast(rmsnorm_matmul_golden(lhs, rhs, eps), np.float32)
 
     data_type = np.float16
     atol, rtol = 1e-2, 1e-3
@@ -166,7 +161,7 @@ def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NU
     lhs = np.random.random_sample((batch, M, K)).astype(data_type)
     rhs = np.random.random_sample((K, N)).astype(data_type)
 
-    golden = nl.static_cast(golden_fun(lhs, None, None, rhs, eps), data_type)
+    golden = nl.static_cast(rmsnorm_matmul_golden(lhs, rhs, eps), data_type)
 
     # nki_out, _ = run_kernel(
     #     "blocked_fused_rms_norm_linear",
@@ -219,7 +214,7 @@ def test_fused_rmsnorm_linear_MKN_numerical(batch, M, N, K, NUM_BLOCK_M, NUM_BLO
     lhs = np.random.random_sample((batch, M, K)).astype(data_type)
     rhs = np.random.random_sample((K, N)).astype(data_type)
 
-    golden = nl.static_cast(golden_fun(lhs[0], None, None, rhs, eps), data_type)
+    golden = nl.static_cast(rmsnorm_matmul_golden(lhs[0], rhs, eps), data_type)
 
     numeric_func = baremetal(fused_rmsnorm_linear_MKN)
     nki_out = numeric_func(lhs[0], rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, nl.float32, eps)

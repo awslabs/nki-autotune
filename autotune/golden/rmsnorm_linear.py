@@ -1,38 +1,50 @@
 import math
 
+import neuronxcc.nki.language as nl
 import numpy as np
 
-
-def golden_fun(hidden, gate, gamma, qkv_weights, eps: float):
-    def _silu(x):
-        return x / (1 + np.exp(-x))
-
-    if gate is not None:
-        hidden = hidden * _silu(gate.astype(np.float32))
-    rms = np.sqrt(np.mean(np.square(hidden), axis=-1, keepdims=True) + eps)
-    output = hidden * np.reciprocal(rms)
-    if gamma is not None:
-        output *= gamma
-    if qkv_weights is not None:
-        output = output @ qkv_weights
-    return output
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, METRICS_DTYPE, OUTPUT_TENSOR_DTYPE
 
 
-def rmsnorm_gemm_golden(x, y, eps: float = 1e-6):
+def rmsnorm_correctness(
+    input_tensors: INPUT_TENSORS_DTYPE,
+    kernel_kwargs: KERNEL_KWARGS_DTYPE,
+    nki_out_tensor: OUTPUT_TENSOR_DTYPE,
+    metrics: METRICS_DTYPE,
+):
+    atol, rtol = 1e-3, 1e-3
+    x, y = input_tensors
+    data_type = np.float32
+    nki_out_tensor = nl.static_cast(nki_out_tensor, data_type)
+
+    golden = nl.static_cast(rmsnorm_matmul_golden(x, y, kernel_kwargs["eps"]), data_type)
+    np.testing.assert_allclose(actual=nki_out_tensor, desired=golden, atol=atol, rtol=rtol, err_msg="", verbose=True)
+    return True
+
+
+def rmsnorm_matmul_golden(x, weight, eps: float):
     """
-    Applies RMSNorm to x and then performs matrix multiplication with y.
-
-    Args:
-        x: Input tensor to normalize
-        y: Weight matrix for the linear operation
-
-    Returns:
-        Result of normalized x multiplied by y
+    z: Array["B, L or 1, 1"] = (x**2).mean(-1, keepdims=True) + self.eps
+    z: Array["B, L or 1, D"] = x / np.sqrt(z)
+    ret = z * self.weight
     """
-    rms = np.sqrt(np.mean(x**2, axis=-1, keepdims=True) + eps)
-    x_normalized = x / rms
-    result = np.matmul(x_normalized, y)
-    return result
+    z = np.square(x)
+
+    # FIXME:
+    # if this `z` tensor is on PSUM, it might trigger
+    # In `codegenPartitionReduceOp` we have `assert inst.op.op != np.mean, 'There is not reduce mean!'`
+    # z = np.mean(z, axis=-1, keepdims=True)
+
+    # FIXME: this is another workaround because there is no mean reduction on partition dim
+    z = np.divide(z, x.shape[-1])
+    z = np.sum(z, axis=-1, keepdims=True)
+
+    z = z + eps
+    z = x / np.sqrt(z)
+
+    matmul_result = np.matmul(z, weight)
+
+    return matmul_result
 
 
 def fused_rmsnorm_gemm_golden(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e-5):

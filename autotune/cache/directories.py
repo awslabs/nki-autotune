@@ -149,14 +149,14 @@ def get_cache_dir(workload_name: str, cache_type: str, **kwargs):
 
     cache_dir = f"{CACHE_ROOT_DIR}/{workload_name}/{cache_type}"
     # Join all key-value pairs
-    kv_string = ""
+    key_val_string = ""
     for key, value in kwargs.items():
-        kv_string += f"{key}{value}-"
+        key_val_string += f"{key}{value}-"
 
     # Remove the last hyphen if any kwargs were provided
-    if kv_string:
-        kv_string = kv_string[:-1]
-        cache_dir = f"{cache_dir}/{kv_string}"
+    if key_val_string:
+        key_val_string = key_val_string[:-1]
+        cache_dir = f"{cache_dir}/{key_val_string}"
 
     return cache_dir
 
