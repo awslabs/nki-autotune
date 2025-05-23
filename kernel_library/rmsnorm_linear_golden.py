@@ -2,24 +2,86 @@ import math
 
 import neuronxcc.nki.language as nl
 import numpy as np
+import torch
 
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, METRICS_DTYPE, OUTPUT_TENSOR_DTYPE
 
 
-def rmsnorm_correctness(
+def rmsnorm_correctness_postprocessing(
     input_tensors: INPUT_TENSORS_DTYPE,
     kernel_kwargs: KERNEL_KWARGS_DTYPE,
     nki_out_tensor: OUTPUT_TENSOR_DTYPE,
     metrics: METRICS_DTYPE,
 ):
-    atol, rtol = 1e-3, 1e-3
-    x, y = input_tensors
     data_type = np.float32
     nki_out_tensor = nl.static_cast(nki_out_tensor, data_type)
 
-    golden = nl.static_cast(rmsnorm_matmul_golden(x, y, kernel_kwargs["eps"]), data_type)
-    np.testing.assert_allclose(actual=nki_out_tensor, desired=golden, atol=atol, rtol=rtol, err_msg="", verbose=True)
+    fp32_input_tensors = tuple([tensor.astype(np.float32) for tensor in input_tensors])
+    x, y = fp32_input_tensors
+    golden = rmsnorm_matmul_golden(x, y, kernel_kwargs["eps"])
+    np.testing.assert_allclose(actual=nki_out_tensor, desired=golden, atol=1e-3, rtol=1e-3, err_msg="", verbose=True)
     return True
+
+
+def rmsnorm_matmul(x: np.ndarray, weight: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+    """
+    Computes RMSNorm + GEMM on CPU using input precision and returns results as float32.
+
+    Parameters:
+    -----------
+    x : np.ndarray
+        Input array of shape (batch_size, seq_len, hidden_dim) in float32 or bfloat16
+    weight : np.ndarray
+        Weight matrix of shape (hidden_dim, out_dim) in float32 or bfloat16
+    eps : float
+        Epsilon value for numerical stability
+
+    Returns:
+    --------
+    np.ndarray
+        Result of RMSNorm(x) @ weight converted to float32 NumPy array
+    """
+    # Determine if inputs are bfloat16
+    is_bfloat16 = str(x.dtype) == "bfloat16" or str(weight.dtype) == "bfloat16"
+
+    # Convert NumPy arrays to PyTorch tensors (on CPU)
+    if is_bfloat16:
+        # Convert bfloat16 to float32 then to tensor then back to bfloat16
+        x_float32 = x.astype(np.float32)
+        weight_float32 = weight.astype(np.float32)
+
+        # Fix the to() syntax by using correct keyword format
+        x_tensor = torch.from_numpy(x_float32).to(dtype=torch.bfloat16)
+        weight_tensor = torch.from_numpy(weight_float32).to(dtype=torch.bfloat16)
+    else:
+        # Already float32, direct conversion
+        x_tensor = torch.from_numpy(x.copy())
+        weight_tensor = torch.from_numpy(weight.copy())
+
+    post_casting = x_tensor.float().numpy()
+    np.testing.assert_allclose(
+        actual=post_casting, desired=x_float32, atol=1e-6, rtol=1e-6, err_msg="Check casting", verbose=True
+    )
+    # Square the input
+    z = torch.square(x_tensor)
+
+    # Compute mean across the last dimension
+    z = torch.div(z, x_tensor.shape[-1])
+    z_mean = torch.sum(z, dim=-1, keepdim=True)
+
+    # Add epsilon for numerical stability
+    z_mean = z_mean + eps
+
+    # Normalize x
+    x_normalized = x_tensor / torch.sqrt(z_mean)
+
+    # Matrix multiplication with weights
+    result = torch.matmul(x_normalized, weight_tensor)
+
+    # Convert result to NumPy float32
+    result_np = result.float().numpy()
+
+    return result_np
 
 
 def rmsnorm_matmul_golden(x, weight, eps: float):
@@ -161,14 +223,14 @@ def fused_rmsnorm_gemm_mkn(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e
     assert k == k_r, f"Matrix dimensions mismatch: lhs has {k} columns but rhs has {k_r} rows"
 
     # Hard-coded block sizes
-    TILES_IN_BLOCK_M = 1024
-    TILES_IN_BLOCK_N = 1024
-    TILES_IN_BLOCK_K = 1024
+    BLOCK_M = 1024
+    BLOCK_N = 1024
+    BLOCK_K = 1024
 
     # Calculate number of blocks in each dimension
-    NUM_BLOCK_M = math.ceil(m / TILES_IN_BLOCK_M)
-    NUM_BLOCK_N = math.ceil(n / TILES_IN_BLOCK_N)
-    NUM_BLOCK_K = math.ceil(k / TILES_IN_BLOCK_K)
+    NUM_BLOCK_M = math.ceil(m / BLOCK_M)
+    NUM_BLOCK_N = math.ceil(n / BLOCK_N)
+    NUM_BLOCK_K = math.ceil(k / BLOCK_K)
 
     # Initialize output tensor
     O = np.zeros((batch, m, n))
@@ -177,8 +239,8 @@ def fused_rmsnorm_gemm_mkn(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e
     for batch_id in range(batch):
         # Process blocks of rows (M dimension)
         for block_id_M in range(NUM_BLOCK_M):
-            block_start_M = block_id_M * TILES_IN_BLOCK_M
-            block_end_M = min((block_id_M + 1) * TILES_IN_BLOCK_M, m)
+            block_start_M = block_id_M * BLOCK_M
+            block_end_M = min((block_id_M + 1) * BLOCK_M, m)
             block_size_M = block_end_M - block_start_M
 
             # Initialize square sums for this M block
@@ -186,12 +248,12 @@ def fused_rmsnorm_gemm_mkn(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e
             prev_square_sums = np.zeros(block_size_M)
 
             # Initialize result blocks for all N blocks for this M block
-            result_blocks = np.zeros((NUM_BLOCK_N, block_size_M, TILES_IN_BLOCK_N))
+            result_blocks = np.zeros((NUM_BLOCK_N, block_size_M, BLOCK_N))
 
             # Process K dimension blocks
             for block_id_K in range(NUM_BLOCK_K):
-                block_start_K = block_id_K * TILES_IN_BLOCK_K
-                block_end_K = min((block_id_K + 1) * TILES_IN_BLOCK_K, k)
+                block_start_K = block_id_K * BLOCK_K
+                block_end_K = min((block_id_K + 1) * BLOCK_K, k)
 
                 # Get lhs block for this K
                 lhs_block = lhs[batch_id, block_start_M:block_end_M, block_start_K:block_end_K]
@@ -211,8 +273,8 @@ def fused_rmsnorm_gemm_mkn(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e
                 if block_id_K > 0:
                     rescale = (norm_factor_prevs / norm_factors)[:, np.newaxis]
                     for block_id_N in range(NUM_BLOCK_N):
-                        block_end_N = min((block_id_N + 1) * TILES_IN_BLOCK_N, n)
-                        block_size_N = block_end_N - block_id_N * TILES_IN_BLOCK_N
+                        block_end_N = min((block_id_N + 1) * BLOCK_N, n)
+                        block_size_N = block_end_N - block_id_N * BLOCK_N
                         result_blocks[block_id_N, :, :block_size_N] *= rescale
 
                 # Normalize the lhs block
@@ -220,8 +282,8 @@ def fused_rmsnorm_gemm_mkn(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e
 
                 # Process N dimension blocks (innermost loop)
                 for block_id_N in range(NUM_BLOCK_N):
-                    block_start_N = block_id_N * TILES_IN_BLOCK_N
-                    block_end_N = min((block_id_N + 1) * TILES_IN_BLOCK_N, n)
+                    block_start_N = block_id_N * BLOCK_N
+                    block_end_N = min((block_id_N + 1) * BLOCK_N, n)
                     block_size_N = block_end_N - block_start_N
 
                     # Get rhs block
@@ -235,8 +297,8 @@ def fused_rmsnorm_gemm_mkn(lhs: np.ndarray, rhs: np.ndarray, epsilon: float = 1e
 
             # After processing all K blocks, write results to output tensor
             for block_id_N in range(NUM_BLOCK_N):
-                block_start_N = block_id_N * TILES_IN_BLOCK_N
-                block_end_N = min((block_id_N + 1) * TILES_IN_BLOCK_N, n)
+                block_start_N = block_id_N * BLOCK_N
+                block_end_N = min((block_id_N + 1) * BLOCK_N, n)
                 block_size_N = block_end_N - block_start_N
 
                 O[batch_id, block_start_M:block_end_M, block_start_N:block_end_N] = result_blocks[

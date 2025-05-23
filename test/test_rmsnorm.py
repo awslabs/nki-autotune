@@ -7,14 +7,18 @@ import pytest
 from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 
-from autotune.core.test_generation import GenTests
+from autotune.core.generate_tests import GenTests
 from autotune.core.utils import GEMMCompatibility
-from autotune.golden.rmsnorm_linear import fused_rmsnorm_gemm_golden, fused_rmsnorm_gemm_mkn, rmsnorm_matmul_golden
 from kernel_library.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
     blocked_fused_rms_norm_linear,
     fused_rmsnorm_linear_MKN,
     stack_allocated_fused_rms_norm_qkv,
+)
+from kernel_library.rmsnorm_linear_golden import (
+    fused_rmsnorm_gemm_golden,
+    fused_rmsnorm_gemm_mkn,
+    rmsnorm_matmul_golden,
 )
 from kernel_library.rmsnorm_weighted import allocated_weighted_rmsnorm, weighted_rmsnorm
 

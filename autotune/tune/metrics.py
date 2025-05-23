@@ -15,7 +15,6 @@ def get_matmul_mac_count(traced_kernel):
         elif isinstance(inst, (TensorContractTensorOp)):
             lhs_shape = inst.lhs_shape
             rhs_shape = inst.rhs_shape
-            print(f"shapes = {lhs_shape}, {rhs_shape}")
             batch_factor = 1
             if len(lhs_shape) == 2:
                 M, K = lhs_shape
@@ -23,8 +22,15 @@ def get_matmul_mac_count(traced_kernel):
                 batch_factor, M, K = lhs_shape
             else:
                 raise ValueError(f"Unrecognized lhs_shape {lhs_shape}. Expecting (batch (optional), M, K)")
-            _K, N = rhs_shape
-            assert K == _K, f"Incompatible matrix shapes. Received LHS {lhs_shape}. RHS {rhs_shape}."
+            if len(rhs_shape) == 2:
+                _K, N = rhs_shape
+            elif len(rhs_shape) == 3:
+                _batch_factor, _K, N = rhs_shape
+            else:
+                raise ValueError(f"Unrecognized rhs_shape {rhs_shape}. Expecting (batch (optional), K, N)")
+            assert (
+                K == _K and batch_factor == _batch_factor
+            ), f"Incompatible matrix shapes. Received LHS {lhs_shape}. RHS {rhs_shape}."
             flops += 2 * batch_factor * M * N * K
     # One MAC is 2 flops
     mac_count = flops // 2

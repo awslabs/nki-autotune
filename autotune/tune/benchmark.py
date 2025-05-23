@@ -46,7 +46,7 @@ class Benchmark:
         self._parallel_compile_to_neff()
         self._execute()
         self._parallel_postprocessing()
-        # self._parallel_extract_metrics()
+        self._parallel_extract_metrics()
         self.results.save(cache_dir=self.cache_dir)
 
     def _get_num_workers(self) -> int:
@@ -113,7 +113,27 @@ class Benchmark:
             result = self.results[job_id]
             result.add_fields(neff=neff)
 
+        def submit_fp32_func(job_id):
+            job = self.jobs[job_id]
+            fp32_input_tensors = tuple([tensor.astype(np.float32) for tensor in job.input_tensors])
+            return (
+                compile_kernel,
+                (
+                    job.kernel,
+                    f"{job.name}_fp32",
+                    fp32_input_tensors,
+                    job.kernel_kwargs,
+                    job.compiler_flags,
+                    self.cache_dir,
+                ),
+            )
+
+        def process_fp32_result_func(job_id, neff):
+            result = self.results[job_id]
+            result.add_fields(neff_fp32=neff)
+
         self._parallel_execute("Compiling kernels", submit_func, process_result_func)
+        self._parallel_execute("Compiling kernels in FP32", submit_fp32_func, process_fp32_result_func)
 
     def _execute(self):
         with SpikeExecutor(verbose=0) as spike:
@@ -121,7 +141,6 @@ class Benchmark:
                 job = self.jobs[job_id]
                 result = self.results[job_id]
                 try:
-                    # TODO: run fp32 correctness checking
                     spike_kernel = create_spike_kernel(result.neff, job.kernel, job.input_tensors, job.kernel_kwargs)
                     stats = spike.benchmark(
                         spike_kernel,
@@ -131,12 +150,21 @@ class Benchmark:
                         benchmark_iterations=self.iters,
                         device_id=0,
                     )
-                    ntff_file, kernel_output = run_spike_kernel(
+                    ntff_file, _ = run_spike_kernel(
                         spike, spike_kernel, job.input_tensors, result.neff, job.kernel_kwargs
                     )
-                    self.kernel_outputs[job_id] = kernel_output
                     job.add_fields(spike_kernel=spike_kernel)
                     result.add_fields(ntff=ntff_file, **stats)
+
+                    fp32_input_tensors = tuple([tensor.astype(np.float32) for tensor in job.input_tensors])
+                    spike_kernel = create_spike_kernel(
+                        result.neff_fp32, job.kernel, fp32_input_tensors, job.kernel_kwargs
+                    )
+                    ntff_fp32_file, kernel_output = run_spike_kernel(
+                        spike, spike_kernel, fp32_input_tensors, result.neff_fp32, job.kernel_kwargs
+                    )
+                    result.add_fields(ntff_fp32=ntff_fp32_file)
+                    self.kernel_outputs[job_id] = kernel_output
                 except Exception as e:
                     error_string = capture_error_message(e)
                     result.add_error(error_string)
@@ -174,9 +202,6 @@ class Benchmark:
             try:
                 metrics = future.result()
                 result.add_fields(metrics=metrics)
-                if result.ntff and os.path.exists(result.ntff):
-                    os.remove(result.ntff)
-                    result.remove_fields("ntff")
             except Exception as e:
                 error_msg = capture_error_message(e)
                 result.add_error(error_msg)

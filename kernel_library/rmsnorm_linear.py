@@ -18,9 +18,7 @@ from neuronxcc.nki.typing import tensor
 from autotune.allocation.utils import update_base_addr
 from autotune.core.dma import load_tensor_block, save_result_block, save_result_dma
 from autotune.core.layout import transpose_tile, transpose_tiles_in_block
-from autotune.core.misc import copy_block
-from autotune.core.scalar_ops import scale_tile
-from autotune.core.utils import GEMMCompatibility, matmul_blocks_tile_transposed_lhs
+from autotune.core.utils import GEMMCompatibility
 
 
 @nki.compiler.skip_middle_end_transformations
@@ -303,8 +301,8 @@ def blocked_fused_rms_norm_linear(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, 
     Internally, normalizations are cast to fp32 to avoid NaN errors.
 
     Args:
-        lhs (_type_): Input tensor of the attention block in BSH layout
-        rhs (_type_): Fused QKV linear weights, assumed to be eltwise-multiplied with RMS norm weight vector (gamma)
+        lhs (_type_): Input tensor in (batch, M, K) layout
+        rhs (_type_): Input tensor in (K, N) layout
         result (_type_): Output tensor
         norm_dtype (_type_, optional): Data type for RMS norm, should be f32 to avoid NaN. Defaults to nl.float32.
         eps (_type_, optional): RMS norm epsilon term. Defaults to 1e-6.
@@ -316,38 +314,31 @@ def blocked_fused_rms_norm_linear(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, 
     result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for batch_id in nl.affine_range(batch_size):
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-            """
-            NOTE:
-            Load-compute pattern
-            Design question:
-            The entire thing as a black box, or users clearly separate the components and autotune decides where/how.
-            TODO: Study the CUTLASS API template
-            """
             lhs_block = load_tensor_block(
                 input_tensor=lhs[batch_id],
                 ofs=(block_id_M * mm.BLOCK_M, 0),
-                load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.K),
+                load_shape=(mm.TILE_M, mm.TILES_IN_BLOCK_M, 1, mm.K),
             )
-            compute_RMSNormT(lhs_block, mm, eps, norm_dtype, lhs.dtype)
+            compute_RMSNormT(lhs_block, mm, eps, norm_dtype)
             for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
                 result_block = nl.zeros(
-                    (mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
+                    (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                     dtype=lhs.dtype,
                     buffer=nl.sbuf,
                 )
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
                     ofs=(0, block_id_N * mm.BLOCK_N),
-                    load_shape=(mm.TILES_IN_K, mm.TILE_K, mm.BLOCK_N),
+                    load_shape=(mm.TILE_K, mm.TILES_IN_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 )
-                matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_block)
+                # matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_block)
                 save_result_block(
                     result[batch_id], result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N
                 )
     return result
 
 
-def compute_RMSNormT(in_block, mm: GEMMCompatibility, eps, norm_dtype, output_dtype):
+def compute_RMSNormT(in_block, mm: GEMMCompatibility, eps, norm_dtype):
     """
     Compute the RMSNormT(hidden) block for the in_block
     Args:
@@ -356,18 +347,19 @@ def compute_RMSNormT(in_block, mm: GEMMCompatibility, eps, norm_dtype, output_dt
         norm_dtype: Data type for RMS norm, should be f32 to avoid NaN
         output_dtype: Data type for output tensor
     """
-    assert in_block.shape[0] == mm.TILES_IN_BLOCK_M
-    assert in_block.shape[1] == mm.TILE_M
-    assert in_block.shape[2] == mm.K
-    scale = 1 / mm.K
-    i_rhs = nl.mgrid[0 : mm.TILE_M, 0 : mm.K]
-    for tile_id_M in nl.affine_range(mm.TILES_IN_BLOCK_M):
-        square_sum = nl.ndarray((par_dim(mm.TILE_M), 1), dtype=norm_dtype, buffer=nl.sbuf)
+    TILE_M, TILES_IN_BLOCK_M, _, K = in_block.shape
+    assert in_block.shape == (mm.TILE_M, mm.TILES_IN_BLOCK_M, 1, mm.K)
+    scale = 1 / K
+    i_lhs = nl.mgrid[0:TILE_M, 0:K]
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        square_sum = nl.ndarray((par_dim(TILE_M), 1), dtype=norm_dtype, buffer=nl.sbuf)
 
         """
         Write the RMS and RMS Reciprocal tensors back to square_sum, in-place
         """
-        nisa.activation_reduce(op=nl.square, data=in_block[tile_id_M], reduce_op=np.add, reduce_res=square_sum[...])
+        nisa.activation_reduce(
+            op=nl.square, data=in_block[i_lhs.p, tile_id_M, 0, i_lhs.x], reduce_op=np.add, reduce_res=square_sum[...]
+        )
         square_sum[...] = nisa.tensor_scalar(square_sum[...], np.multiply, scale, op1=np.add, operand1=eps)
         square_sum[...] = nisa.activation(op=nl.rsqrt, data=square_sum[...])
 
@@ -375,14 +367,16 @@ def compute_RMSNormT(in_block, mm: GEMMCompatibility, eps, norm_dtype, output_dt
         Write the output of RMS (in-place)
         Perform (hidden .* RMS Reciprocal) in tiles of fmax (512)
         """
-        rmsnorm_block = nl.ndarray((par_dim(mm.TILE_M), mm.K), dtype=output_dtype, buffer=nl.sbuf)
-        rmsnorm_block[...] = nl.multiply(in_block[tile_id_M, i_rhs.p, i_rhs.x], square_sum[...], dtype=output_dtype)
+        rmsnorm_block = nl.ndarray((par_dim(TILE_M), K), dtype=in_block.dtype, buffer=nl.sbuf)
+        rmsnorm_block[...] = nl.multiply(
+            in_block[i_lhs.p, tile_id_M, 0, i_lhs.x], square_sum[...], dtype=in_block.dtype
+        )
         transpose_tile(rmsnorm_block)
-        in_block[tile_id_M, i_rhs.p, i_rhs.x] = nl.copy(rmsnorm_block, dtype=output_dtype)
+        in_block[i_lhs.p, tile_id_M, 0, i_lhs.x] = nl.copy(rmsnorm_block, dtype=in_block.dtype)
 
 
 @nki.jit()
-def fused_rmsnorm_linear_MKN(
+def online_rmsnorm_linear_MKN(
     lhs: tensor,
     rhs: tensor,
     NUM_BLOCK_M: int,
@@ -391,101 +385,162 @@ def fused_rmsnorm_linear_MKN(
     norm_dtype=nl.float32,
     eps: float = 1e-6,
 ):
+    assert len(lhs.shape) == 3, f"Expecting (batch, M, K) in LHS. Received {lhs.shape}."
     mm = GEMMCompatibility(transposed_lhs=False)
-    mm(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
-    result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
-    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-        result_blocks = nl.zeros(
-            (mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N),
-            dtype=result.dtype,
-            buffer=nl.sbuf,
-        )
-        square_sums = nl.zeros((mm.TILES_IN_BLOCK_M, nl.par_dim(mm.TILE_M), 1), dtype=result.dtype, buffer=nl.sbuf)
-        prev_square_sums = nl.zeros((mm.TILES_IN_BLOCK_M, nl.par_dim(mm.TILE_M), 1), dtype=result.dtype, buffer=nl.sbuf)
-        norm_factors = nl.zeros((mm.TILES_IN_BLOCK_M, nl.par_dim(mm.TILE_M), 1), dtype=result.dtype, buffer=nl.sbuf)
-        prev_norm_factors = nl.zeros(
-            (mm.TILES_IN_BLOCK_M, nl.par_dim(mm.TILE_M), 1), dtype=result.dtype, buffer=nl.sbuf
-        )
-        rescale_factors = nl.zeros((mm.TILES_IN_BLOCK_M, nl.par_dim(mm.TILE_M), 1), dtype=result.dtype, buffer=nl.sbuf)
-        for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
-            lhs_block = load_tensor_block(
-                input_tensor=lhs,
-                ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
-                load_shape=(mm.TILES_IN_BLOCK_M, mm.TILE_M, mm.BLOCK_K),
+    mm((lhs, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K})
+    batch_size = lhs.shape[0]
+    result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+    for batch_id in nl.affine_range(batch_size):
+        for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+            result_blocks = nl.zeros(
+                (nl.par_dim(mm.TILE_M), mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N),
+                dtype=result.dtype,
+                buffer=nl.sbuf,
             )
-            copy_block(square_sums, prev_square_sums)
-            update_square_sums(lhs_block, square_sums)
-            # FIXME: prev_norm_factors is recomputed
-            calculate_norm_factors(norm_factors, square_sums, scale=1 / lhs_block.shape[-1], eps=eps, reciprocal=True)
-            calculate_norm_factors(
-                prev_norm_factors, prev_square_sums, scale=1 / lhs_block.shape[-1], eps=eps, reciprocal=False
-            )
-            for tile_id_M in nl.affine_range(mm.TILES_IN_BLOCK_M):
-                rescale_factors[tile_id_M] = nl.multiply(prev_norm_factors[tile_id_M], norm_factors[tile_id_M])
-            """
-            TODO: Rescale previous result_blocks if this is not the first K block
-            result_blocks = (mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, nl.par_dim(mm.TILE_M), mm.TILE_N)
-            rescale_factors = (mm.TILES_IN_BLOCK_M, nl.par_dim(mm.TILE_M), 1)
-            """
-            if block_id_K > 0:
-                for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-                    for tile_id_M in nl.affine_range(mm.TILES_IN_BLOCK_M):
-                        for tile_id_N in nl.affine_range(mm.TILES_IN_BLOCK_N):
-                            scale_tile(result_blocks[block_id_N, tile_id_M, tile_id_N], rescale_factors[tile_id_M])
-            for tile_id_M in nl.affine_range(mm.TILES_IN_BLOCK_M):
-                scale_tile(lhs_block[tile_id_M], norm_factors[tile_id_M])
-            transpose_tiles_in_block(lhs_block)
-            for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-                rhs_block = load_tensor_block(
-                    input_tensor=rhs,
-                    ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
-                    load_shape=(mm.TILES_IN_BLOCK_K, mm.TILE_K, mm.BLOCK_N),
+            square_sums = nl.zeros(
+                (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=norm_dtype, buffer=nl.sbuf
+            )  # m_i
+            rms_factors = nl.zeros(square_sums.shape, dtype=square_sums.dtype, buffer=nl.sbuf)
+            prev_rms_factors = nl.zeros(square_sums.shape, dtype=square_sums.dtype, buffer=nl.sbuf)
+            for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
+                # FIXME: need to develop a replaceable tensor load/access function
+                lhs_block = load_tensor_block(
+                    input_tensor=lhs[batch_id],
+                    ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
+                    load_shape=(mm.TILE_M, mm.TILES_IN_BLOCK_M, 1, mm.BLOCK_K),
                 )
-                matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_blocks[block_id_N])
+                prev_rms_factors[...] = nl.copy(rms_factors[...], dtype=rms_factors.dtype)
+                update_square_sums(lhs_block, square_sums)
+                calculate_rms_factors(rms_factors, square_sums, scale=1 / mm.K, eps=eps)
+                # if block_id_K > 0:
+                #     scale_prev_results(result_blocks, rms_factors, prev_rms_factors)
+                scale_lhs(lhs_block, rms_factors)
+                transpose_tiles_in_block(lhs_block)
+                for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+                    rhs_block = load_tensor_block(
+                        input_tensor=rhs,
+                        ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
+                        load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
+                    )
+                    matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_blocks, block_id_N)
 
-        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-            save_result_dma(
-                result,
-                result_blocks,
-                block_id_N,
-                m_ofs=block_id_M * mm.TILES_IN_BLOCK_M,
-                n_ofs=block_id_N * mm.BLOCK_N,
-                TILE_K=mm.TILE_K,
-            )
+            save_result_dma(result[batch_id], result_blocks, block_id_M)
 
     return result
 
 
-def update_square_sums(lhs_block, square_sums):
+def update_square_sums(lhs, square_sums):
     """
     Update the square sums for the lhs_block
     Args:
-        lhs_block: 3D input tensor tile (TILES_IN_BLOCK_M, TILE_M, K)
+        lhs_block: 3D input tensor tile (TILE_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_K, TILE_K)
         square_sums: 3D tensor to store the square sums
     """
-    TILES_IN_BLOCK_M, TILE_M, BLOCK_K = lhs_block.shape
-    assert square_sums.shape == (TILES_IN_BLOCK_M, TILE_M, 1)
-    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
-        tmp_square_sums = nl.ndarray((par_dim(TILE_M), 1), dtype=lhs_block.dtype, buffer=nl.sbuf)
+    TILE_M, TILES_IN_M, unity, K = lhs.shape
+    assert unity == 1
+    assert square_sums.shape == (TILE_M, TILES_IN_M, 1)
+    i_lhs = nl.mgrid[0:TILE_M, 0:K]
+    i_square_sums = nl.mgrid[0:TILE_M, 0:1]
+    for tile_id_M in nl.affine_range(TILES_IN_M):
+        tmp_square_sums = nl.ndarray((nl.par_dim(TILE_M), 1), dtype=square_sums.dtype, buffer=nl.sbuf)
         nisa.activation_reduce(
-            op=nl.square, data=lhs_block[tile_id_M], reduce_op=np.add, reduce_res=tmp_square_sums[...]
+            op=nl.square, data=lhs[i_lhs.p, tile_id_M, 0, i_lhs.x], reduce_op=np.add, reduce_res=tmp_square_sums[...]
         )
-        square_sums[tile_id_M] += tmp_square_sums
+        square_sums[i_square_sums.p, tile_id_M, i_square_sums.x] += tmp_square_sums[...]
 
 
-def calculate_norm_factors(norm_factors, square_sums, scale: float, eps: float, reciprocal: bool):
+def calculate_rms_factors(norm_factors, square_sums, scale: float, eps: float):
     """
     Calculate the norm factors for the square sums
     Args:
         square_sums: 3D tensor to store the square sums
         eps: RMS norm epsilon term
     """
-    TILES_IN_BLOCK_M, TILE_M, _ = square_sums.shape
+    TILE_M, TILES_IN_BLOCK_M, unity = norm_factors.shape
+    assert square_sums.shape == norm_factors.shape
+    assert unity == 1
+    i_norm = nl.mgrid[0:TILE_M, 0:1]
     for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
-        norm_factors[tile_id_M] = nisa.tensor_scalar(
-            square_sums[tile_id_M], np.multiply, scale, op1=np.add, operand1=eps
+        norm_factors[i_norm.p, tile_id_M, i_norm.x] = nisa.tensor_scalar(
+            square_sums[i_norm.p, tile_id_M, i_norm.x], np.multiply, scale, op1=np.add, operand1=eps
         )
-        if reciprocal:
-            norm_factors[tile_id_M] = nisa.activation(op=nl.rsqrt, data=norm_factors[tile_id_M])
-        else:
-            norm_factors[tile_id_M] = nisa.activation(op=nl.sqrt, data=norm_factors[tile_id_M])
+        norm_factors[i_norm.p, tile_id_M, i_norm.x] = nisa.activation(
+            op=nl.sqrt, data=norm_factors[i_norm.p, tile_id_M, i_norm.x]
+        )
+
+
+def scale_lhs(lhs, rms_factors):
+    TILE_M, TILES_IN_BLOCK_M, unity, BLOCK_K = lhs.shape
+    assert rms_factors.shape == lhs.shape[:-1], f"rms_factors {rms_factors.shape} lhs {lhs.shape}"
+    assert unity == 1
+    i_lhs = nl.mgrid[0:TILE_M, 0:BLOCK_K]
+    i_rms_factors = nl.mgrid[0:TILE_M, 0:1]
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        lhs[i_lhs.p, tile_id_M, 0, i_lhs.x] = nl.divide(
+            lhs[i_lhs.p, tile_id_M, 0, i_lhs.x], rms_factors[i_rms_factors.p, tile_id_M, i_rms_factors.x]
+        )
+
+
+def scale_prev_results(result_blocks, rms_factors, prev_rms_factors):
+    TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N = result_blocks.shape
+    _TILE_M, _TILES_IN_BLOCK_M, unity = rms_factors.shape
+    assert prev_rms_factors.shape == rms_factors.shape
+    assert unity == 1
+    i_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    i_rms = nl.mgrid[0:TILE_M, 0:1]
+    tmp_scaling_factors = nl.ndarray((nl.par_dim(TILE_M), TILES_IN_BLOCK_M, 1), dtype=rms_factors.dtype, buffer=nl.sbuf)
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        tmp_scaling_factors[i_rms.p, tile_id_M, i_rms.x] = nl.divide(
+            prev_rms_factors[i_rms.p, tile_id_M, i_rms.x], rms_factors[i_rms.p, tile_id_M, i_rms.x]
+        )
+    for block_id_N in nl.affine_range(NUM_BLOCK_N):
+        for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+            for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
+                result_blocks[i_res.p, block_id_N, tile_id_M, tile_id_N, i_res.x] = nl.multiply(
+                    result_blocks[i_res.p, block_id_N, tile_id_M, tile_id_N, i_res.x],
+                    tmp_scaling_factors[i_rms.p, tile_id_M, i_rms.x],
+                )
+
+
+def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks, block_id_N):
+    """
+    Accumulate matmul result tiles between lhs and rhs into result_block
+    LHS is transposed at the tile level.
+    Note that this is not the same as lhsT.
+    'matmul_block' module computes lhsT @ rhs.
+
+    Args:
+    tileT_lhs_block: TILE_M, TILE_K, TILES_IN_M, TILES_IN_K
+    rhs_block: TILE_K, TILE_N, TILES_IN_K, TILES_IN_N
+    result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
+    """
+    TILE_M, TILES_IN_BLOCK_M, unity, BLOCK_K = tileT_lhs_block.shape
+    TILE_K, TILES_IN_BLOCK_K, TILES_IN_BLOCK_N, TILE_N = rhs_block.shape
+    _TILE_M, NUM_BLOCK_N, _TILES_IN_BLOCK_M, _TILES_IN_BLOCK_N, _TILE_N = result_blocks.shape
+    assert unity == 1
+    assert (
+        TILE_K * TILES_IN_BLOCK_K == BLOCK_K
+    ), f"K dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. rhs_block {rhs_block.shape}."
+    assert (
+        TILE_M == _TILE_M and TILES_IN_BLOCK_M == _TILES_IN_BLOCK_M
+    ), f"LHS and result shape mismatch: tileT_lhs_block {tileT_lhs_block.shape}. result_blocks {result_blocks.shape}."
+    assert (
+        TILE_N == _TILE_N and TILES_IN_BLOCK_N == _TILES_IN_BLOCK_N
+    ), f"RHS and result shape mismatch: rhs_block {rhs_block.shape}. result_blocks {result_blocks.shape}."
+
+    idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
+    idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
+    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
+            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            """
+            Use PSUM buffer to accumulate into a single hardware tile
+            """
+            for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
+                k_ofs = tile_id_K * TILE_K
+                result_tile += nisa.nc_matmul(
+                    tileT_lhs_block[idx_lhs.p, tile_id_M, 0, k_ofs + idx_lhs.x],
+                    rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x],
+                )
+            result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
