@@ -80,12 +80,14 @@ def gemm_lhs_MN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelH
 
 def gemm_lhs_MKN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
+        # TODO: tune different free dimension layout
         result_blocks = nl.zeros(
             (nl.par_dim(mm.TILE_M), mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N),
             dtype=result.dtype,
             buffer=nl.sbuf,
         )
         for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
+            # TODO: tune different free dimension layout
             lhs_block = load_tensor_block(
                 input_tensor=lhs,
                 ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
@@ -98,6 +100,7 @@ def gemm_lhs_MKN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: Kernel
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 )
+                # TODO: handle different lhs, rhs layouts
                 matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_blocks, block_id_N)
         save_result_dma(result, result_blocks, block_id_M)
 

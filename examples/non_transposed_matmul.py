@@ -8,8 +8,8 @@ from neuronpy.core.language import bfloat16
 
 from autotune.cache.directories import get_cache_dir
 from autotune.cache.visualize import plot_metrics_vs_k_comparison
+from autotune.core.golden import GEMMCorrectness
 from autotune.core.utils import GEMMCompatibility
-from autotune.golden.gemm import GEMMCorrectness
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
 
@@ -53,8 +53,9 @@ def profile_baseline(workload_name: str, M: int, N: int, K: int):
     rhs = np.random.random_sample((K, N)).astype(data_type)
     jobs = ProfileJobs()
     jobs.add_job(
-        kernel_name="matmul_op",
+        kernel=("autotune/golden/gemm.py", "gemm"),
         input_tensors=(lhs, rhs),
+        kernel_kwargs={"transposed_lhs": False},
         compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
         preprocessing=GEMMCompatibility(transposed_lhs=False),
         postprocessing=GEMMCorrectness(transposed_lhs=False),
@@ -66,8 +67,8 @@ def profile_baseline(workload_name: str, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     workload_name = "non_transposed_GEMM"
-    mn_shapes = [1024, 2048, 4096, 8192]
-    k_shapes = [1024, 2048, 4096, 8192, 16384]
+    mn_shapes = [2048]
+    k_shapes = [1024, 2048, 4096]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     for M, N, K in MNK:
         profile_baseline(workload_name, M, N, K)
