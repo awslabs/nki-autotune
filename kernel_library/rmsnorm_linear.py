@@ -412,8 +412,8 @@ def online_rmsnorm_linear_MKN(
                 prev_rms_factors[...] = nl.copy(rms_factors[...], dtype=rms_factors.dtype)
                 update_square_sums(lhs_block, square_sums)
                 calculate_rms_factors(rms_factors, square_sums, scale=1 / mm.K, eps=eps)
-                # if block_id_K > 0:
-                #     scale_prev_results(result_blocks, rms_factors, prev_rms_factors)
+                if block_id_K > 0:
+                    result_blocks[...] = scale_prev_results(result_blocks, rms_factors, prev_rms_factors)
                 scale_lhs(lhs_block, rms_factors)
                 transpose_tiles_in_block(lhs_block)
                 for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
@@ -486,20 +486,22 @@ def scale_prev_results(result_blocks, rms_factors, prev_rms_factors):
     _TILE_M, _TILES_IN_BLOCK_M, unity = rms_factors.shape
     assert prev_rms_factors.shape == rms_factors.shape
     assert unity == 1
-    i_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     i_rms = nl.mgrid[0:TILE_M, 0:1]
     tmp_scaling_factors = nl.ndarray((nl.par_dim(TILE_M), TILES_IN_BLOCK_M, 1), dtype=rms_factors.dtype, buffer=nl.sbuf)
     for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
         tmp_scaling_factors[i_rms.p, tile_id_M, i_rms.x] = nl.divide(
             prev_rms_factors[i_rms.p, tile_id_M, i_rms.x], rms_factors[i_rms.p, tile_id_M, i_rms.x]
         )
+    scaled_result_blocks = nl.ndarray(result_blocks.shape, dtype=result_blocks.dtype, buffer=nl.sbuf)
     for block_id_N in nl.affine_range(NUM_BLOCK_N):
         for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
             for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
-                result_blocks[i_res.p, block_id_N, tile_id_M, tile_id_N, i_res.x] = nl.multiply(
-                    result_blocks[i_res.p, block_id_N, tile_id_M, tile_id_N, i_res.x],
+                scaled_result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] = nl.multiply(
+                    result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x],
                     tmp_scaling_factors[i_rms.p, tile_id_M, i_rms.x],
                 )
+    return scaled_result_blocks
 
 
 def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks, block_id_N):
@@ -543,4 +545,7 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks,
                     tileT_lhs_block[idx_lhs.p, tile_id_M, 0, k_ofs + idx_lhs.x],
                     rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x],
                 )
-            result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
+            # result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
+            result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] = nl.add(
+                result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x], result_tile[idx_res.p, idx_res.x]
+            )
