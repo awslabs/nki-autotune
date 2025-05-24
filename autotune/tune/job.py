@@ -5,7 +5,6 @@ from typing import List, Set
 
 from tqdm import tqdm
 
-from autotune.cache.directories import get_hash_name
 from autotune.tune.utils import capture_error_message
 from autotune.typing import (
     INPUT_TENSORS_DTYPE,
@@ -44,6 +43,7 @@ def get_batch_size(num_samples: int, total_num_samples: int):
 class ProfileJob:
     def __init__(
         self,
+        name: str,
         kernel: KERNEL_DTYPE,
         input_tensors: INPUT_TENSORS_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
@@ -51,14 +51,13 @@ class ProfileJob:
         preprocessing: PREPROCESSING_DTYPE,
         postprocessing: POSTPROCESSING_DTYPE,
     ) -> None:
+        self.name = name
         self.kernel = kernel
         self.input_tensors = input_tensors
         self.kernel_kwargs = kernel_kwargs
         self.compiler_flags = compiler_flags
         self.preprocessing = preprocessing
         self.postprocessing = postprocessing
-        kernel_path, kernel_name = kernel
-        self.name = get_hash_name(kernel_name, input_tensors, kernel_kwargs)
 
     def get_arg_shapes(self):
         arg_shapes = [arg.shape for arg in self.input_tensors]
@@ -105,7 +104,16 @@ class ProfileJobs:
             kernel_kwargs = {}
         if compiler_flags is None:
             compiler_flags = ""
-        job = ProfileJob(kernel, input_tensors, kernel_kwargs, compiler_flags, preprocessing, postprocessing)
+        _, kernel_name = kernel
+        job = ProfileJob(
+            f"{kernel_name}_{len(self.jobs)+1}",
+            kernel,
+            input_tensors,
+            kernel_kwargs,
+            compiler_flags,
+            preprocessing,
+            postprocessing,
+        )
         self.jobs.append(job)
 
     def sample(self, num_samples: int) -> None:

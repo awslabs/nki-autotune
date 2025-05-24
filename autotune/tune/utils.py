@@ -91,11 +91,10 @@ def compile_kernel(
     # TODO: dump the specialized NKI kernels
     traced_kernel.specialize(*input_tensors, **kernel_kwargs)
     compile_dir = f"{output_dir}/{neff_name}"
-    neff = compile_to_neff(trace_kernel=traced_kernel, output_dir=compile_dir, additional_compiler_args=compiler_flags)
-    output_neff = f"{output_dir}/{neff_name}.neff"
-    shutil.move(neff, output_neff)
-    shutil.rmtree(compile_dir)
-    return output_neff
+    neff = compile_to_neff(
+        trace_kernel=traced_kernel, output_dir=compile_dir, additional_compiler_args=compiler_flags, save_artifacts=True
+    )
+    return neff
 
 
 def create_spike_kernel(

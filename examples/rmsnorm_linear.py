@@ -83,7 +83,7 @@ if __name__ == "__main__":
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     MNK = [(2048, 2048, 4096)]
     for M, N, K in MNK:
-        profile_baseline(workload_name, M, N, K)
+        # profile_baseline(workload_name, M, N, K)
         run_autotune_jobs(workload_name, M, N, K)
     #     plot_metrics_vs_k_comparison(workload_name)
     # plot_metrics_vs_k_comparison(workload_name)
