@@ -4,14 +4,11 @@ import neuronxcc.nki.language as nl
 import numpy as np
 import torch
 
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, METRICS_DTYPE, OUTPUT_TENSOR_DTYPE
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSOR_DTYPE
 
 
 def rmsnorm_correctness_postprocessing(
-    input_tensors: INPUT_TENSORS_DTYPE,
-    kernel_kwargs: KERNEL_KWARGS_DTYPE,
-    nki_out_tensor: OUTPUT_TENSOR_DTYPE,
-    metrics: METRICS_DTYPE,
+    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, nki_out_tensor: OUTPUT_TENSOR_DTYPE
 ):
     nki_out_tensor = nl.static_cast(nki_out_tensor, np.float32)
 

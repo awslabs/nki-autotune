@@ -10,7 +10,6 @@ from autotune.typing import (
     INPUT_TENSORS_DTYPE,
     KERNEL_DTYPE,
     KERNEL_KWARGS_DTYPE,
-    METRICS_DTYPE,
     OUTPUT_TENSOR_DTYPE,
     POSTPROCESSING_DTYPE,
     PREPROCESSING_DTYPE,
@@ -22,10 +21,7 @@ def dummy_preprocessing(input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNE
 
 
 def dummy_postprocessing(
-    input_tensors: INPUT_TENSORS_DTYPE,
-    kernel_kwargs: KERNEL_KWARGS_DTYPE,
-    nki_out_tensor: OUTPUT_TENSOR_DTYPE,
-    metrics: METRICS_DTYPE,
+    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, nki_out_tensor: OUTPUT_TENSOR_DTYPE
 ) -> bool:
     return True
 
@@ -97,14 +93,18 @@ class ProfileJobs:
         input_tensors: INPUT_TENSORS_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
         compiler_flags: str | None = None,
-        preprocessing: PREPROCESSING_DTYPE = dummy_preprocessing,
-        postprocessing: POSTPROCESSING_DTYPE = dummy_postprocessing,
+        preprocessing: PREPROCESSING_DTYPE | None = None,
+        postprocessing: POSTPROCESSING_DTYPE | None = None,
     ):
         if kernel_kwargs is None:
             kernel_kwargs = {}
         if compiler_flags is None:
             compiler_flags = ""
         _, kernel_name = kernel
+        if preprocessing is None:
+            preprocessing = dummy_preprocessing
+        if postprocessing is None:
+            postprocessing = dummy_postprocessing
         job = ProfileJob(
             f"{kernel_name}_{len(self.jobs)+1}",
             kernel,

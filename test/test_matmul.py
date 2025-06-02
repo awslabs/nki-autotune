@@ -59,8 +59,8 @@ def test_golden_matmul_correctness(M, N, K):
     batch = 1
     data_type = np.float32
     atol, rtol = 1e-2, 1e-3
-    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
+    lhs = np.random.normal((batch, M, K)).astype(data_type)
+    rhs = np.random.normal((K, N)).astype(data_type)
 
     golden_1 = nl.static_cast(gemm_core(lhs[0], rhs, False), data_type)
     golden_2 = nl.static_cast(gemm_cpu_golden(lhs, rhs, False), data_type)
@@ -89,8 +89,8 @@ def test_matmul_correctness(
     N = NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N
     K = NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K
     data_type = np.float32
-    lhsT = np.random.random_sample((K, M)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
+    lhsT = np.random.normal((K, M)).astype(data_type)
+    rhs = np.random.normal((K, N)).astype(data_type)
     golden_output = nl.static_cast(gemm_cpu_golden(lhsT, rhs, lhs_is_transposed=True), np.float32)
 
     lhsT_dev = nl.static_cast(lhsT, data_type)
@@ -132,8 +132,8 @@ def test_non_transposed_matmul_correctness(
     K = NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K
     data_type = np.float32
     atol, rtol = 1e-5, 1e-5
-    lhs = np.random.random_sample((M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
+    lhs = np.random.normal((M, K)).astype(data_type)
+    rhs = np.random.normal((K, N)).astype(data_type)
     golden_output = nl.static_cast(gemm_cpu_golden(lhs, rhs, lhs_is_transposed=False), data_type)
 
     for template in ["MN", "MNK", "MKN"]:
