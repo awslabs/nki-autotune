@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 from typing import Any, Dict, List
 
 
@@ -22,20 +23,10 @@ class PerformanceResult:
         return f"PerformanceResult({', '.join(attributes)})"
 
     def __getattr__(self, name: str) -> Any:
-        """
-        ADDED: Handle attribute access gracefully when attribute doesn't exist.
-
-        Args:
-            name: Name of the attribute to access
-
-        Returns:
-            None if the attribute doesn't exist
-
-        Raises:
-            AttributeError: If the attribute doesn't exist and strict mode is enabled
-        """
-        # FIXME: incorporate lower_is_better
-        return None
+        if self.lower_is_better:
+            return float("inf")
+        else:
+            return float("-inf")
 
     def to_dict(self) -> Dict:
         """Convert to dictionary representation including only attributes in self.attributes."""
@@ -49,11 +40,29 @@ class PerformanceResult:
         Add additional fields to this PerformanceResult instance.
 
         Args:
-            **kwargs: Arbitrary keyword arguments to add as attributes
+            **kwargs: Arbitrary keyword arguments to add as attributes.
+                If an attribute already exists, will attempt to add to it (e.g., update a dict).
+                Will not overwrite existing attributes and will raise a warning if addition is not possible.
         """
+
         for key, value in kwargs.items():
-            setattr(self, key, value)
-            self.attributes.add(key)
+            if key in self.attributes:
+                existing_value = getattr(self, key)
+                if isinstance(existing_value, dict) and isinstance(value, dict):
+                    existing_value.update(value)
+                elif isinstance(existing_value, list) and isinstance(value, list):
+                    existing_value.extend(value)
+                elif isinstance(existing_value, set) and isinstance(value, set):
+                    existing_value.update(value)
+                else:
+                    warnings.warn(
+                        f"Cannot add to existing attribute '{key}'. Attribute type {type(existing_value).__name__} "
+                        f"does not support addition or is incompatible with {type(value).__name__}.",
+                        UserWarning,
+                    )
+            else:
+                setattr(self, key, value)
+                self.attributes.add(key)
 
     def remove_fields(self, *keys):
         """
@@ -77,12 +86,7 @@ class PerformanceResult:
         """
         if "error" not in self.attributes:
             self.error = error_msg
-            if self.lower_is_better:
-                setattr(self, self.main_metric, float("inf"))
-            else:
-                setattr(self, self.main_metric, -float("inf"))
             self.attributes.add("error")
-            self.attributes.add(self.main_metric)
 
 
 class PerformanceMetrics:
@@ -139,9 +143,9 @@ class PerformanceMetrics:
             return self.results[0]
 
         return (
-            min(self.results, key=lambda result: getattr(result, self.sort_key))
+            min(self.results, key=lambda result: getattr(result, self.sort_key, float("inf")))
             if self.lower_is_better
-            else max(self.results, key=lambda result: getattr(result, self.sort_key))
+            else max(self.results, key=lambda result: getattr(result, self.sort_key, float("-inf")))
         )
 
     def to_dict_list(self) -> List[Dict]:
@@ -152,16 +156,14 @@ class PerformanceMetrics:
         Returns:
             List[Dict]: List of dictionary representations of all results.
         """
-        # If sort_key is empty, return results without sorting
-        if not self.sort_key:
-            return [result.to_dict() for result in self.results]
-
-        # Otherwise, sort by the sort_key
-        sorted_results = sorted(
-            self.results,
-            key=lambda result: getattr(result, self.sort_key),
-            reverse=not self.lower_is_better,  # Reverse sort if higher values are better
-        )
+        try:
+            sorted_results = sorted(
+                self.results,
+                key=lambda result: getattr(result, self.sort_key),
+                reverse=not self.lower_is_better,  # Reverse sort if higher values are better
+            )
+        except:
+            sorted_results = self.results
         return [result.to_dict() for result in sorted_results]
 
     def save(self, cache_dir: str, filename: str = "perf_metrics.json") -> str:

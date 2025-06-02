@@ -9,7 +9,7 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.cache.directories import get_cache_dir
-from autotune.cache.visualize import plot_metrics_vs_k_comparison
+from autotune.cache.visualize import plot_metric
 from autotune.core.utils import GEMMCompatibility
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
@@ -34,9 +34,12 @@ def run_autotune_jobs(workload_name: str, M: int, N: int, K: int):
 
     batch = 1
     data_type = bfloat16
-    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
-
+    lhs = np.random.normal(size=(batch, M, K)).astype(data_type)
+    rhs = np.random.normal(size=(K, N)).astype(data_type)
+    if data_type == np.dtype("float32"):
+        postprocessing = rmsnorm_correctness_postprocessing
+    else:
+        postprocessing = None
     jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K in params:
         jobs.add_job(
@@ -50,7 +53,7 @@ def run_autotune_jobs(workload_name: str, M: int, N: int, K: int):
             },
             compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
             preprocessing=GEMMCompatibility(transposed_lhs=False),
-            postprocessing=rmsnorm_correctness_postprocessing,
+            postprocessing=postprocessing,
         )
     jobs.sample(100)
     cache_dir = get_cache_dir(workload_name, "tuned", M=M, N=N, K=K)
@@ -61,8 +64,12 @@ def run_autotune_jobs(workload_name: str, M: int, N: int, K: int):
 def profile_baseline(workload_name: str, M: int, N: int, K: int):
     batch = 1
     data_type = bfloat16
-    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
+    lhs = np.random.normal(size=(batch, M, K)).astype(data_type)
+    rhs = np.random.normal(size=(K, N)).astype(data_type)
+    if data_type == np.dtype("float32"):
+        postprocessing = rmsnorm_correctness_postprocessing
+    else:
+        postprocessing = None
     jobs = ProfileJobs()
     jobs.add_job(
         kernel=("kernel_library/rmsnorm_linear_golden.py", "rmsnorm_matmul_golden"),
@@ -70,7 +77,7 @@ def profile_baseline(workload_name: str, M: int, N: int, K: int):
         kernel_kwargs={"eps": 1e-6},
         compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
         preprocessing=GEMMCompatibility(transposed_lhs=False),
-        postprocessing=rmsnorm_correctness_postprocessing,
+        postprocessing=postprocessing,
     )
     cache_dir = get_cache_dir(workload_name, "baseline", M=M, N=N, K=K)
     baseline_tuner = Benchmark(jobs=jobs, cache_dir=cache_dir)
@@ -82,8 +89,8 @@ if __name__ == "__main__":
     mn_shapes = [2048]
     k_shapes = [1024, 2048, 4096, 8192, 16384]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
-    for M, N, K in MNK:
-        profile_baseline(workload_name, M, N, K)
-        run_autotune_jobs(workload_name, M, N, K)
-        plot_metrics_vs_k_comparison(workload_name)
-    plot_metrics_vs_k_comparison(workload_name)
+    # for M, N, K in MNK:
+    #     profile_baseline(workload_name, M, N, K)
+    #     run_autotune_jobs(workload_name, M, N, K)
+    plot_metric(workload_name, "min_ms")
+    plot_metric(workload_name, "mfu_estimated_percent")

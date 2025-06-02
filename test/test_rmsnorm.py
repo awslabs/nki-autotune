@@ -46,8 +46,8 @@ class RMSNormLinearTestConfig(GenTests):
 def test_rmsnorm_gemm_np_numerical(batch: int, M: int, N: int, K: int, eps: float):
     data_type = np.float32
     atol, rtol = 1e-2, 1e-3
-    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
+    lhs = np.random.normal((batch, M, K)).astype(data_type)
+    rhs = np.random.normal((K, N)).astype(data_type)
 
     golden = rmsnorm_matmul_golden(lhs, rhs, eps)
     for func in [fused_rmsnorm_gemm_golden, fused_rmsnorm_gemm_mkn]:
@@ -59,8 +59,8 @@ def test_rmsnorm_gemm_np_numerical(batch: int, M: int, N: int, K: int, eps: floa
     "batch, seqlen, dim, eps", [(1, 1024, 4096, 1e-6), (1, 2048, 1024, 1e-3), (1, 4096, 2048, 1e-6)]
 )
 def test_weighted_rmsnorm(batch, seqlen, dim, eps):
-    hidden = np.random.random_sample((batch, seqlen, dim))
-    gamma = np.random.random_sample((dim))
+    hidden = np.random.normal((batch, seqlen, dim))
+    gamma = np.random.normal((dim))
     golden_output = nl.static_cast(rmsnorm_matmul_golden(hidden, gamma, eps), np.float32)
 
     data_type = np.float16
@@ -81,8 +81,8 @@ def test_weighted_rmsnorm(batch, seqlen, dim, eps):
     [(1, 1024, 4096, 1, 1e-6), (1, 2048, 1024, 2, 1e-3), (1, 4096, 2048, 4, 1e-6)],
 )
 def test_allocated_weighted_rmsnorm(batch, seqlen, dim, buffer_degree, eps):
-    hidden = np.random.random_sample((batch, seqlen, dim))
-    gamma = np.random.random_sample((dim))
+    hidden = np.random.normal((batch, seqlen, dim))
+    gamma = np.random.normal((dim))
     golden_output = nl.static_cast(rmsnorm_matmul_golden(hidden, gamma, eps), np.float32)
 
     data_type = np.float16
@@ -103,8 +103,8 @@ def test_allocated_weighted_rmsnorm(batch, seqlen, dim, buffer_degree, eps):
     [(1, 1024, 4096, 256, 1, 1e-6), (1, 2048, 1024, 512, 2, 1e-3), (1, 4096, 2048, 128, 4, 1e-6)],
 )
 def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree, eps):
-    hidden = np.random.random_sample((batch, seqlen, dim))
-    qkv_weights = np.random.random_sample((dim, d_head))
+    hidden = np.random.normal((batch, seqlen, dim))
+    qkv_weights = np.random.normal((dim, d_head))
     golden_output = nl.static_cast(rmsnorm_matmul_golden(hidden, qkv_weights, eps), np.float32)
 
     data_type = np.float16
@@ -126,8 +126,8 @@ def test_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, buffer_degree,
 # )
 @pytest.mark.parametrize("batch, seqlen, dim, d_head, eps", [(1, 1024, 4096, 256, 1e-6)])
 def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, eps):
-    lhs = np.random.random_sample((batch, seqlen, dim))
-    rhs = np.random.random_sample((dim, d_head))
+    lhs = np.random.normal((batch, seqlen, dim))
+    rhs = np.random.normal((dim, d_head))
     golden_output = nl.static_cast(rmsnorm_matmul_golden(lhs, rhs, eps), np.float32)
 
     data_type = np.float16
@@ -162,8 +162,8 @@ def test_stack_allocated_fused_rms_norm_qkv(batch, seqlen, dim, d_head, eps):
 def test_blocked_fused_rms_norm_linear_numerical(batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, BUFFER_M, BUFFER_N, eps):
     data_type = np.float32
     atol, rtol = 1e-2, 1e-3
-    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
+    lhs = np.random.normal((batch, M, K)).astype(data_type)
+    rhs = np.random.normal((K, N)).astype(data_type)
 
     golden = nl.static_cast(rmsnorm_matmul_golden(lhs, rhs, eps), data_type)
 
@@ -215,8 +215,8 @@ def test_blocked_fused_rms_norm_linear_perf(batch, M, K, N, eps):
 def test_fused_rmsnorm_linear_MKN_numerical(batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, eps):
     data_type = np.float32
     atol, rtol = 1e-2, 1e-3
-    lhs = np.random.random_sample((batch, M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
+    lhs = np.random.normal((batch, M, K)).astype(data_type)
+    rhs = np.random.normal((K, N)).astype(data_type)
 
     golden = nl.static_cast(rmsnorm_matmul_golden(lhs[0], rhs, eps), data_type)
 

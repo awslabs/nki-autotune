@@ -21,19 +21,11 @@ class Benchmark:
     Compile and benchmark NKI kernel on NeuronDevice.
     """
 
-    def __init__(
-        self,
-        jobs: ProfileJobs,
-        cache_dir: str,
-        main_metric: str = "min_ms",
-        lower_is_better: bool = True,
-        warmup: int = 10,
-        iters: int = 100,
-    ):
+    def __init__(self, jobs: ProfileJobs, cache_dir: str, warmup: int = 10, iters: int = 100):
         self.jobs = jobs
         self.warmup = warmup
         self.iters = iters
-        self.results = self._init_results(main_metric, lower_is_better)
+        self.results = self._init_results()
         self.valid_job_ids = list(range(self.jobs.num_jobs))
         self.kernel_outputs: Dict[int, np.ndarray] = {}
         if os.path.exists(cache_dir):
@@ -45,8 +37,8 @@ class Benchmark:
         self._parallel_preprocessing()
         self._parallel_compile_to_neff()
         self._execute()
-        self._parallel_postprocessing()
         self._parallel_extract_metrics()
+        self._parallel_postprocessing()
         self.results.save(cache_dir=self.cache_dir)
 
     def _get_num_workers(self) -> int:
@@ -54,10 +46,9 @@ class Benchmark:
         num_workers = max(num_workers, 1)
         return num_workers
 
-    def _init_results(self, main_metric: str, lower_is_better: bool) -> PerformanceMetrics:
-        results = PerformanceMetrics(sort_key=main_metric, lower_is_better=lower_is_better)
+    def _init_results(self) -> PerformanceMetrics:
+        results = PerformanceMetrics(sort_key="min_ms", lower_is_better=True)
         for job in self.jobs:
-            # NOTE: hardcoded saving of job's data fields
             results.add_result(
                 name=job.name, kernel=job.kernel, kernel_kwargs=job.kernel_kwargs, compiler_flags=job.compiler_flags
             )
@@ -147,8 +138,7 @@ class Benchmark:
         def submit_func(job_id):
             job = self.jobs[job_id]
             kernel_output = self.kernel_outputs[job_id]
-            result = self.results[job_id]
-            return (job.postprocessing, (job.input_tensors, job.kernel_kwargs, kernel_output, result.metrics))
+            return (job.postprocessing, (job.input_tensors, job.kernel_kwargs, kernel_output))
 
         def process_result_func(job_id, postprocessing_is_ok):
             result = self.results[job_id]
@@ -174,9 +164,8 @@ class Benchmark:
             result = self.results[job_id]
             try:
                 metrics = future.result()
-                result.add_fields(metrics=metrics)
+                result.add_fields(**metrics)
             except Exception as e:
                 error_msg = capture_error_message(e)
                 result.add_error(error_msg)
-                result.add_fields(hfu=0)
                 self.valid_job_ids.remove(job_id)

@@ -9,9 +9,9 @@ from kernel_library.multi_buffer import stack_allocated_fused_self_attn_for_SD_s
 def test_stack_allocated_fused_self_attn(batch, seqlen, dim, eps):
     dtype = np.float32
     bs, seqlen, d = 1, seqlen, 128
-    q = np.random.random_sample((bs, d, seqlen))
-    k = np.random.random_sample((bs, d, seqlen))
-    v = np.random.random_sample((bs, seqlen, d))
+    q = np.random.normal((bs, d, seqlen))
+    k = np.random.normal((bs, d, seqlen))
+    v = np.random.normal((bs, seqlen, d))
     q = q.astype(dtype)
     k = k.astype(dtype)
     v = v.astype(dtype)

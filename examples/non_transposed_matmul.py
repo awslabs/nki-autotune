@@ -24,8 +24,8 @@ def run_autotune_jobs(workload_name: str, M: int, N: int, K: int):
     NUM_BLOCK_K_options = size_options
     templates = ["MN", "MKN", "MNK", "legacy_MKN"]
     params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, templates))
-    lhs = np.random.random_sample((M, K)).astype(bfloat16)
-    rhs = np.random.random_sample((K, N)).astype(bfloat16)
+    lhs = np.random.normal((M, K)).astype(bfloat16)
+    rhs = np.random.normal((K, N)).astype(bfloat16)
     jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template in params:
         jobs.add_job(
@@ -49,8 +49,8 @@ def run_autotune_jobs(workload_name: str, M: int, N: int, K: int):
 
 def profile_baseline(workload_name: str, M: int, N: int, K: int):
     data_type = bfloat16
-    lhs = np.random.random_sample((M, K)).astype(data_type)
-    rhs = np.random.random_sample((K, N)).astype(data_type)
+    lhs = np.random.normal((M, K)).astype(data_type)
+    rhs = np.random.normal((K, N)).astype(data_type)
     jobs = ProfileJobs()
     jobs.add_job(
         kernel=("autotune/golden/gemm.py", "gemm"),
