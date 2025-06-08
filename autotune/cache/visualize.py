@@ -1,10 +1,11 @@
 import os
+from typing import List
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from autotune.cache.directories import extract_mnk_from_dirname, get_cache_dir
-from autotune.cache.results import PerformanceMetrics
+from autotune.cache.directories import CACHE_ROOT_DIR
+from autotune.cache.results import ProfileResults
 
 
 def collect_metrics_data_with_stats(directory: str, metric_name: str):
@@ -34,119 +35,126 @@ def collect_metrics_data_with_stats(directory: str, metric_name: str):
 
     # Scan the directories to find all MNK combinations
     for dirname in os.listdir(directory):
-        m, n, k = extract_mnk_from_dirname(dirname)
-        if m is not None and n is not None and k is not None:
-            # Read the perf_metrics.json file
-            json_path = os.path.join(directory, dirname, "perf_metrics.json")
-            if os.path.exists(json_path):
-                loaded_metrics = PerformanceMetrics.load(json_path)
+        # Read the perf_metrics.json file
+        json_path = os.path.join(directory, dirname, "perf_metrics.json")
+        if os.path.exists(json_path):
+            loaded_metrics = ProfileResults.load(json_path)
 
-                # Get all results
-                all_results = loaded_metrics.results
+            # Get all results
+            all_results = loaded_metrics.results
 
-                if not all_results:
-                    continue
+            if not all_results:
+                continue
 
-                # Find the best metric
-                best_config = loaded_metrics.get_best_result()
-                best_metric = getattr(best_config, metric_name)
+            # Find the best metric
+            best_config = loaded_metrics.get_best_result()
+            best_metric = getattr(best_config, metric_name)
 
-                # Calculate mean metric across all configurations
-                all_metrics = [getattr(r, metric_name) for r in all_results if "error" not in r.attributes]
-                mean_metric = np.mean(all_metrics) if all_metrics else 0
+            # Calculate mean metric across all configurations
+            all_metrics = [getattr(r, metric_name) for r in all_results if "error" not in r.attributes]
+            mean_metric = np.mean(all_metrics) if all_metrics else 0
 
-                # Initialize nested dictionaries if they don't exist
-                if (m, n) not in metrics_data:
-                    metrics_data[(m, n)] = {}
-
-                if k not in metrics_data[(m, n)]:
-                    metrics_data[(m, n)][k] = {}
-
-                # Store both metrics
-                metrics_data[(m, n)][k]["best"] = best_metric
-                metrics_data[(m, n)][k]["mean"] = mean_metric
+            # Store both metrics
+            metrics_data[dirname] = {"best": best_metric, "mean": mean_metric}
 
     return metrics_data
 
 
-def plot_metric(workload_name: str, metric_name: str):
+def numerical_key(dim_string: str) -> list:
+    """
+    Convert a dimension string to a list of integers for proper numerical sorting.
+    For strings like '1x2048x1024_1024x2048', converts to [1, 2048, 1024, 1024, 2048]
+    """
+    # Replace '_' with 'x' to treat the entire string uniformly
+    unified_string = dim_string.replace("_", "x")
+
+    # Split by 'x' and convert each component to integer if possible
+    components = []
+    for part in unified_string.split("x"):
+        try:
+            components.append(int(part))
+        except ValueError:
+            # If not a number, add a string (this is just a fallback)
+            components.append(part)
+
+    return components
+
+
+def plot_metric(metric_name: str, kernel_names: List[str]):
     """
     Create a single line plot showing MFU for all (M,N,K) combinations,
     comparing tuned vs baseline configurations.
 
     Parameters:
     -----------
-    workload_name : str
+    kernel_name : str
         Name of the workload (used to locate directories and save plots)
     """
-    # Same setup as the bar chart version
-    tuned_dir = get_cache_dir(workload_name, "tuned")
-    baseline_dir = get_cache_dir(workload_name, "baseline")
-    plots_dir = get_cache_dir(workload_name, "plots")
-
+    plots_dir = f"{CACHE_ROOT_DIR}/plots"
     os.makedirs(plots_dir, exist_ok=True)
 
-    tuned_metrics = collect_metrics_data_with_stats(tuned_dir, metric_name)
-    baseline_metrics = collect_metrics_data_with_stats(baseline_dir, metric_name)
+    all_kernels_metrics = {}
+    for kernel_name in kernel_names:
+        metrics = collect_metrics_data_with_stats(f"{CACHE_ROOT_DIR}/{kernel_name}", metric_name)
+        all_kernels_metrics[kernel_name] = metrics
 
-    # Collect all MNK combinations
-    mnk_labels = []
-    mnk_tuples = []
-    all_mn_pairs = set(tuned_metrics.keys()).union(baseline_metrics.keys())
+    all_inputs_strings = set()
+    for kernel_metrics in all_kernels_metrics.values():
+        all_inputs_strings.update(kernel_metrics.keys())
 
-    for m, n in all_mn_pairs:
-        tuned_k_data = tuned_metrics.get((m, n), {})
-        baseline_k_data = baseline_metrics.get((m, n), {})
-        all_k_values = set(tuned_k_data.keys()).union(baseline_k_data.keys())
+    all_inputs_strings_sorted = sorted(list(all_inputs_strings), key=lambda x: numerical_key(x))
 
-        for k in all_k_values:
-            mnk_tuples.append((m, n, k))
-
-    # Sort MNK tuples
-    mnk_tuples.sort()
-
-    # Extract data for plotting
-    tuned_best_values = []
-    tuned_mean_values = []
-    baseline_best_values = []
-
-    for m, n, k in mnk_tuples:
-        mnk_labels.append(f"({m},{n},{k})")
-
-        # Get tuned data
-        if (m, n) in tuned_metrics and k in tuned_metrics[(m, n)]:
-            tuned_best_values.append(tuned_metrics[(m, n)][k].get("best", 0))
-            tuned_mean_values.append(tuned_metrics[(m, n)][k].get("mean", 0))
-        else:
-            tuned_best_values.append(0)
-            tuned_mean_values.append(0)
-
-        # Get baseline data
-        if (m, n) in baseline_metrics and k in baseline_metrics[(m, n)]:
-            baseline_best_values.append(baseline_metrics[(m, n)][k].get("best", 0))
-        else:
-            baseline_best_values.append(0)
-
-    # Create the line plot
+    # Create the plot
     plt.figure(figsize=(16, 8))
 
-    x = np.arange(len(mnk_labels))
+    # Generate x-axis positions
+    x = np.arange(len(all_inputs_strings_sorted))
 
-    plt.plot(x, tuned_best_values, "o-", color="blue", linewidth=2, label="Tuned Best")
-    plt.plot(x, tuned_mean_values, "s-", color="green", linewidth=2, label="Tuned Mean")
-    plt.plot(x, baseline_best_values, "d--", color="red", linewidth=2, label="Baseline Best")
+    # Plot each kernel's data
+    colors = ["blue", "red", "green", "purple", "orange", "cyan", "magenta"]
+    markers = ["o", "s", "d", "^", "X", "P"]
+    line_styles = ["-"]
+
+    for i, (kernel_name, metrics) in enumerate(all_kernels_metrics.items()):
+        # Extract best values for each dimension
+        best_values = []
+        mean_values = []
+        for dim_string in all_inputs_strings_sorted:
+            if dim_string in metrics:
+                best_values.append(metrics[dim_string]["best"])
+                mean_values.append(metrics[dim_string]["mean"])
+            else:
+                best_values.append(0)  # No data for this dimension
+                mean_values.append(0)
+
+        # Choose color, marker and line style
+        color = colors[i % len(colors)]
+        marker = markers[i % len(markers)]
+        line_style = line_styles[i % len(line_styles)]
+
+        # Plot best values
+        plt.plot(
+            x,
+            best_values,
+            marker=marker,
+            linestyle=line_style,
+            color=color,
+            linewidth=2,
+            markersize=8,
+            label=f"{kernel_name}",
+        )
 
     # Set plot properties
-    plt.xlabel("(M,N,K) Configurations")
-    plt.ylabel(f"{metric_name}")
-    plt.title(f"{workload_name} {metric_name}")
-    plt.xticks(x, mnk_labels, rotation=90)
+    plt.xlabel("Input Shapes")
+    plt.ylabel(f"{metric_name.replace('_', ' ')}")
+    plt.title(f"{metric_name.replace('_', ' ')}")
+    plt.xticks(x, all_inputs_strings_sorted, rotation=90)
     plt.legend()
     plt.grid(True)
-
     plt.tight_layout()
 
     # Save plot
-    save_path = os.path.join(plots_dir, f"{workload_name}_{metric_name}.png")
+    kernels_str = "_vs_".join(kernel_names)
+    save_path = os.path.join(plots_dir, f"{kernels_str}_{metric_name}.png")
     plt.savefig(save_path, dpi=400)
     plt.close()

@@ -16,7 +16,7 @@ class GEMMCompatibility:
     def __init__(self, transposed_lhs: bool) -> None:
         self.transposed_lhs = transposed_lhs
 
-    def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE) -> bool:
+    def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE):
         """
         Initialize GEMM compatibility checker.
 
@@ -78,7 +78,6 @@ class GEMMCompatibility:
 
         # Validate dimensions
         self._check()
-        return True
 
     def _calculate_sizes(self) -> None:
         """Calculate derived sizes for each dimension."""
@@ -118,38 +117,6 @@ class GEMMCompatibility:
                     f"{dimension} size {size} cannot be divided evenly into "
                     f"{num_block} blocks * {tiles_in_block} tiles * {tile_size}"
                 )
-
-    def __repr__(self) -> str:
-        """String representation showing the division of dimensions into blocks and tiles."""
-        # Determine which dimensions to include
-        if self.NUM_BLOCK_K is None:
-            dimensions = ["M", "N"]
-        else:
-            dimensions = ["M", "N", "K"]
-
-        lines = [f"GEMM Compatibility Check:"]
-        if self.batch is not None:
-            lines.append(f"Batch size: {self.batch}")
-
-        # Overall shape
-        lines.append(f"Matrix dimensions: ({self.M}, {self.K}) × ({self.K}, {self.N})")
-
-        # Add detailed information for each dimension
-        for dimension in dimensions:
-            size = getattr(self, f"{dimension}")
-            num_block = getattr(self, f"NUM_BLOCK_{dimension}")
-            if num_block is None:
-                num_block = 1
-            tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
-            tile_size = getattr(self, f"TILE_{dimension}")
-            block_size = getattr(self, f"BLOCK_{dimension}")
-
-            lines.append(
-                f"{dimension}: {num_block} blocks × {tiles_in_block} tiles × " f"{tile_size} elements = {size} total"
-            )
-            lines.append(f"  Block size: {block_size}")
-
-        return "\n".join(lines)
 
 
 def matmul_block(lhsT_block, rhs_block, result_block):

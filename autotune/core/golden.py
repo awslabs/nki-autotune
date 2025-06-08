@@ -1,7 +1,7 @@
 import neuronxcc.nki.language as nl
 import numpy as np
 
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, METRICS_DTYPE, OUTPUT_TENSOR_DTYPE
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSOR_DTYPE
 
 
 class GEMMCorrectness:
@@ -13,7 +13,6 @@ class GEMMCorrectness:
         input_tensors: INPUT_TENSORS_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
         nki_out_tensor: OUTPUT_TENSOR_DTYPE,
-        metrics: METRICS_DTYPE,
     ) -> bool:
         data_type = np.float32
         atol, rtol = 1e-2, 1e-2

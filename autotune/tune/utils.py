@@ -16,6 +16,30 @@ from autotune.tune.metrics import extract_metrics
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
 
 
+def split_data_by_core(data, core_id, total_cores):
+    """
+    Split a list of data evenly among cores.
+
+    Args:
+        data: List of items to split
+        core_id: ID of current core (0-based)
+        total_cores: Total number of cores
+
+    Returns:
+        Subset of data assigned to this core
+    """
+    # Calculate chunk size and starting position
+    chunk_size = len(data) // total_cores
+    remainder = len(data) % total_cores
+
+    # Distribute the remainder evenly
+    start_idx = core_id * chunk_size + min(core_id, remainder)
+    # If core_id < remainder, this core gets one extra item
+    end_idx = start_idx + chunk_size + (1 if core_id < remainder else 0)
+
+    return data[start_idx:end_idx]
+
+
 def capture_error_message(e) -> str:
     exc_type, exc_value, exc_traceback = sys.exc_info()
     error_string = f"{exc_type.__name__}: {str(e)}\n"
@@ -74,7 +98,6 @@ def get_kernel_by_name(kernel_name: KERNEL_DTYPE):
 
 def compile_kernel(
     kernel_name: KERNEL_DTYPE,
-    neff_name: str,
     input_tensors: INPUT_TENSORS_DTYPE,
     kernel_kwargs: KERNEL_KWARGS_DTYPE,
     compiler_flags: str,
@@ -88,11 +111,9 @@ def compile_kernel(
         traced_kernel = kernel
     else:
         raise TypeError(f"{type(kernel)} {kernel} is not supported.")
-    # TODO: dump the specialized NKI kernels
     traced_kernel.specialize(*input_tensors, **kernel_kwargs)
-    compile_dir = f"{output_dir}/{neff_name}"
     neff = compile_to_neff(
-        trace_kernel=traced_kernel, output_dir=compile_dir, additional_compiler_args=compiler_flags, save_artifacts=True
+        trace_kernel=traced_kernel, output_dir=output_dir, additional_compiler_args=compiler_flags, save_artifacts=True
     )
     return neff
 

@@ -7,8 +7,7 @@ from typing import List, Tuple
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE
 
 home_dir = os.environ["HOME"]
-CACHE_ROOT_DIR = f"{home_dir}/autotune-cache"
-TORCH_CACHE_DIR = f"{CACHE_ROOT_DIR}/torch"
+CACHE_ROOT_DIR = f"/mnt/efs/autotune-cache"
 
 
 def get_hash_name(kernel_name: str, input_tensors: INPUT_TENSORS_DTYPE, configs: KERNEL_KWARGS_DTYPE):
@@ -120,34 +119,28 @@ def parse_tensor_shapes(tensor_shapes: List[str]) -> str:
     return result
 
 
-def get_cache_dir(workload_name: str, cache_type: str, **kwargs):
+def get_cache_dir(kernel_name: str, input_tensors: INPUT_TENSORS_DTYPE, **kwargs):
     """
-    Generate a cache directory path based on workload name, cache type, and additional parameters.
+    Generate a cache directory path based on workload name and additional parameters.
 
     This function creates a cache directory path by combining the root directory,
-    workload name, cache type, and key-value pairs from the provided keyword arguments.
+    workload name and key-value pairs from the provided keyword arguments.
     The key-value pairs are appended to the directory path in the format "key1value1-key2value2".
 
     Args:
         workload_name (str): Name of the workload to create a cache directory for
-        cache_type (str): Type of cache directory; must be one of "baseline", "tuned", or "plots"
         **kwargs: Arbitrary keyword arguments that will be used to create subdirectory names
                  in the format "keyvalue-"
 
     Returns:
         str: The full cache directory path
 
-    Raises:
-        ValueError: If cache_type is not one of "baseline", "tuned", or "plots"
-
     Example:
-        >>> get_cache_dir("sentiment_analysis", "tuned", model="bert", batch=32)
-        "CACHE_ROOT_DIR/sentiment_analysis/tuned/modelbert-batch32"
+        >>> get_cache_dir("sentiment_analysis", model="bert", batch=32)
+        "CACHE_ROOT_DIR/sentiment_analysis/modelbert-batch32"
     """
-    if cache_type not in ["baseline", "tuned", "plots"]:
-        raise ValueError(f"{cache_type} cache directory is not supported. Expecting (baseline, tuned, plots).")
-
-    cache_dir = f"{CACHE_ROOT_DIR}/{workload_name}/{cache_type}"
+    input_tensor_shapes = "_".join("x".join(str(dim) for dim in tensor.shape) for tensor in input_tensors)
+    cache_dir = f"{CACHE_ROOT_DIR}/{kernel_name}/{input_tensor_shapes}"
     # Join all key-value pairs
     key_val_string = ""
     for key, value in kwargs.items():
