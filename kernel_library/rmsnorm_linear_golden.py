@@ -9,13 +9,12 @@ from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TEN
 
 def rmsnorm_correctness_postprocessing(
     input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, nki_out_tensor: OUTPUT_TENSOR_DTYPE
-):
+) -> None:
     nki_out_tensor = nl.static_cast(nki_out_tensor, np.float32)
 
     x, y = input_tensors
     golden = rmsnorm_matmul(x, y, kernel_kwargs["eps"])
     np.testing.assert_allclose(actual=nki_out_tensor, desired=golden, atol=5e-2, rtol=5e-2, err_msg="", verbose=True)
-    return True
 
 
 def rmsnorm_matmul(x: np.ndarray, weight: np.ndarray, eps: float = 1e-5) -> np.ndarray:

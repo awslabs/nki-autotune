@@ -1,26 +1,45 @@
 import json
 import os
+import pickle
 import warnings
 from typing import Any, Dict, List
 
+from autotune.typing.infra_types import KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
 
-class PerformanceResult:
+
+class ProfileResult:
     """
     Represents a single kernel performance result.
     """
 
-    def __init__(self, main_metric: str, lower_is_better: bool):
+    def __init__(
+        self,
+        main_metric: str,
+        lower_is_better: bool,
+        kernel: KERNEL_DTYPE | None = None,
+        kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
+        compiler_flags: str | None = None,
+        cache_dir: str | None = None,
+    ):
         """
         Initialize a performance result.
         """
         self.main_metric = main_metric
         self.lower_is_better = lower_is_better
         self.attributes = set()
+        if kernel:
+            self.add_fields(kernel=kernel)
+        if kernel_kwargs:
+            self.add_fields(kernel_kwargs=kernel_kwargs)
+        if compiler_flags:
+            self.add_fields(compiler_flags=compiler_flags)
+        if cache_dir:
+            self.add_fields(cache_dir=cache_dir)
 
     def __repr__(self) -> str:
         """Enhanced representation showing only attributes in self.attributes"""
         attributes = [f"{k}={getattr(self, k)}" for k in self.attributes]
-        return f"PerformanceResult({', '.join(attributes)})"
+        return f"ProfileResult({', '.join(attributes)})"
 
     def __getattr__(self, name: str) -> Any:
         if self.lower_is_better:
@@ -37,7 +56,7 @@ class PerformanceResult:
 
     def add_fields(self, **kwargs):
         """
-        Add additional fields to this PerformanceResult instance.
+        Add additional fields to this ProfileResult instance.
 
         Args:
             **kwargs: Arbitrary keyword arguments to add as attributes.
@@ -66,7 +85,7 @@ class PerformanceResult:
 
     def remove_fields(self, *keys):
         """
-        Remove fields from this PerformanceResult instance.
+        Remove fields from this ProfileResult instance.
 
         Args:
             **kwargs: Arbitrary keyword arguments to remove as attributes
@@ -88,8 +107,81 @@ class PerformanceResult:
             self.error = error_msg
             self.attributes.add("error")
 
+    def save(self) -> str:
+        """
+        Save the ProfileResult instance to disk in its cache directory.
 
-class PerformanceMetrics:
+        Returns:
+            str: The filepath where the object was saved
+
+        Raises:
+            AttributeError: If cache_dir attribute is not set
+        """
+        if not hasattr(self, "cache_dir") or "cache_dir" not in self.attributes:
+            raise AttributeError(
+                "Cannot save ProfileResult: 'cache_dir' attribute not found. "
+                "Add a cache_dir attribute using add_fields() before calling save()."
+            )
+        filepath = os.path.join(self.cache_dir, "performance_result.pkl")
+
+        # Collect all essential data and attributes
+        state = {
+            "main_metric": self.main_metric,
+            "lower_is_better": self.lower_is_better,
+            "attributes": self.attributes,
+        }
+
+        # Add all tracked attributes
+        for attr in self.attributes:
+            state[attr] = getattr(self, attr)
+
+        # Save using pickle
+        with open(filepath, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        return filepath
+
+    @classmethod
+    def load(cls, filepath: str) -> "ProfileResult":
+        """
+        Load a ProfileResult instance from disk.
+
+        Args:
+            filepath: Path to the saved file
+
+        Returns:
+            ProfileResult: The loaded ProfileResult instance
+
+        Raises:
+            FileNotFoundError: If the file doesn't exist
+        """
+        filepath = os.path.join(filepath, "performance_result.pkl")
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"ProfileResult file not found: {filepath}")
+
+        # Load the state
+        with open(filepath, "rb") as f:
+            state = pickle.load(f)
+
+        # Extract required constructor arguments
+        main_metric = state.pop("main_metric")
+        lower_is_better = state.pop("lower_is_better")
+        attributes = state.pop("attributes")
+
+        # Create a new instance with minimal constructor arguments (no job)
+        instance = cls(main_metric=main_metric, lower_is_better=lower_is_better)
+
+        # Override the attributes set (it will be empty from initialization without job)
+        instance.attributes = attributes
+
+        # Add all the saved attributes
+        for key, value in state.items():
+            setattr(instance, key, value)
+
+        return instance
+
+
+class ProfileResults:
     """
     Class to manage kernel performance metrics results.
     """
@@ -102,11 +194,17 @@ class PerformanceMetrics:
             sort_key: The metric name to use for sorting results
             lower_is_better: Whether lower values of the sort key are better (default: True)
         """
-        self.results: List[PerformanceResult] = []
+        self.results: List[ProfileResult] = []
         self.sort_key = sort_key
         self.lower_is_better = lower_is_better
 
-    def add_result(self, **kwargs) -> PerformanceResult:
+    def add_result(
+        self,
+        kernel: KERNEL_DTYPE | None = None,
+        kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
+        compiler_flags: str | None = None,
+        cache_dir: str | None = None,
+    ) -> ProfileResult:
         """
         Add a new performance result.
 
@@ -114,23 +212,29 @@ class PerformanceMetrics:
             **kwargs: Metrics or metadata to store with the result
 
         Returns:
-            The created PerformanceResult instance
+            The created ProfileResult instance
 
         Raises:
             ValueError: If sort_key is not provided in kwargs (only when sort_key is not empty)
         """
-        result = PerformanceResult(self.sort_key, self.lower_is_better)
-        result.add_fields(**kwargs)
+        result = ProfileResult(
+            main_metric=self.sort_key,
+            lower_is_better=self.lower_is_better,
+            kernel=kernel,
+            kernel_kwargs=kernel_kwargs,
+            compiler_flags=compiler_flags,
+            cache_dir=cache_dir,
+        )
         self.results.append(result)
         return result
 
-    def get_best_result(self) -> PerformanceResult:
+    def get_best_result(self) -> ProfileResult:
         """
         Get the best performing result based on the sort_key.
         If sort_key is empty, returns the first result.
 
         Returns:
-            PerformanceResult: The best performing configuration
+            ProfileResult: The best performing configuration
 
         Raises:
             ValueError: If performance results are empty
@@ -166,9 +270,9 @@ class PerformanceMetrics:
             sorted_results = self.results
         return [result.to_dict() for result in sorted_results]
 
-    def save(self, cache_dir: str, filename: str = "perf_metrics.json") -> str:
+    def dump_summary(self):
         """
-        Save the metrics to a JSON file.
+        Dump the metrics summary to a JSON file.
 
         Args:
             cache_dir: Directory to save the result file
@@ -180,26 +284,28 @@ class PerformanceMetrics:
         Raises:
             OSError: If the directory cannot be created or the file cannot be written
         """
-        os.makedirs(cache_dir, exist_ok=True)
-        filepath = os.path.join(cache_dir, filename)
-        json_data = {
-            "metadata": {
-                "sort_key": self.sort_key,
-                "lower_is_better": self.lower_is_better,
-                "num_results": len(self.results),
-            },
-            "results": self.to_dict_list(),
-        }
-
-        try:
-            with open(filepath, "w") as f:
-                json.dump(json_data, f, indent=2, sort_keys=True)
-            return filepath
-        except Exception as e:
-            raise OSError(f"Failed to save metrics to {filepath}: {str(e)}")
+        json_data = {}
+        filename = "perf_metrics.json"
+        for result in self.results:
+            workload_cache_dir = os.path.dirname(result.cache_dir)
+            filepath = os.path.join(workload_cache_dir, filename)
+            if filepath not in json_data:
+                json_data[filepath] = {
+                    "metadata": {"sort_key": self.sort_key, "lower_is_better": self.lower_is_better},
+                    "results": [],
+                }
+            json_data[filepath]["results"].append(result.to_dict())
+        for filepath in json_data:
+            try:
+                directory = os.path.dirname(filepath)
+                os.makedirs(directory, exist_ok=True)
+                with open(filepath, "w") as f:
+                    json.dump(json_data[filepath], f, indent=2, sort_keys=True)
+            except Exception as e:
+                raise OSError(f"Failed to save metrics to {filepath}: {str(e)}")
 
     @classmethod
-    def load(cls, filepath: str) -> "PerformanceMetrics":
+    def load(cls, filepath: str) -> "ProfileResults":
         """
         Load metrics from a JSON file.
 
@@ -207,7 +313,7 @@ class PerformanceMetrics:
             filepath: Path to the JSON file to load
 
         Returns:
-            A new PerformanceMetrics instance with the loaded results
+            A new ProfileResults instance with the loaded results
 
         Raises:
             FileNotFoundError: If the file doesn't exist
@@ -235,13 +341,13 @@ class PerformanceMetrics:
         """Return the number of results."""
         return len(self.results)
 
-    def __getitem__(self, index: int) -> PerformanceResult:
+    def __getitem__(self, index: int) -> ProfileResult:
         """Access results by index."""
         return self.results[index]
 
     def __repr__(self) -> str:
-        """Return a string representation of the PerformanceMetrics instance."""
-        result_str = f"PerformanceMetrics(sort_key='{self.sort_key}', lower_is_better={self.lower_is_better})"
+        """Return a string representation of the ProfileResults instance."""
+        result_str = f"ProfileResults(sort_key='{self.sort_key}', lower_is_better={self.lower_is_better})"
 
         # Include up to 10 results as a preview
         preview_limit = min(10, len(self.results))

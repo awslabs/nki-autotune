@@ -1,10 +1,13 @@
 import os
+import pickle
 import random
+import shutil
 from concurrent.futures import ProcessPoolExecutor
 from typing import List, Set
 
 from tqdm import tqdm
 
+from autotune.cache.directories import CACHE_ROOT_DIR
 from autotune.tune.utils import capture_error_message
 from autotune.typing import (
     INPUT_TENSORS_DTYPE,
@@ -39,7 +42,7 @@ def get_batch_size(num_samples: int, total_num_samples: int):
 class ProfileJob:
     def __init__(
         self,
-        name: str,
+        index: int,
         kernel: KERNEL_DTYPE,
         input_tensors: INPUT_TENSORS_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
@@ -47,13 +50,19 @@ class ProfileJob:
         preprocessing: PREPROCESSING_DTYPE,
         postprocessing: POSTPROCESSING_DTYPE,
     ) -> None:
-        self.name = name
+        self.index = index
         self.kernel = kernel
         self.input_tensors = input_tensors
         self.kernel_kwargs = kernel_kwargs
         self.compiler_flags = compiler_flags
         self.preprocessing = preprocessing
         self.postprocessing = postprocessing
+
+    @property
+    def cache_dir(self) -> str:
+        input_tensor_shapes = "_".join("x".join(str(dim) for dim in tensor.shape) for tensor in self.input_tensors)
+        cache_dir = f"{CACHE_ROOT_DIR}/{self.kernel[1]}/{input_tensor_shapes}/id{self.index}"
+        return cache_dir
 
     def get_arg_shapes(self):
         arg_shapes = [arg.shape for arg in self.input_tensors]
@@ -69,11 +78,73 @@ class ProfileJob:
         for key, value in kwargs.items():
             setattr(self, key, value)
 
+    def init_job_dir(self):
+        if os.path.exists(self.cache_dir):
+            shutil.rmtree(self.cache_dir)
+        os.makedirs(self.cache_dir)
+
+    def save(self):
+        """
+        Save the ProfileJob instance to its cache directory.
+        """
+        filepath = os.path.join(self.cache_dir, "profile_job.pkl")
+
+        # Get all attributes including dynamically added ones
+        state = {}
+        for key, value in self.__dict__.items():
+            state[key] = value
+
+        # Save using pickle
+        with open(filepath, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def load(cls, filepath: str) -> "ProfileJob":
+        """
+        Load a ProfileJob instance from disk.
+
+        Args:
+            filepath: Path to the saved file
+
+        Returns:
+            ProfileJob: The loaded ProfileJob instance
+
+        Raises:
+            FileNotFoundError: If the file doesn't exist
+        """
+        filepath = os.path.join(filepath, "profile_job.pkl")
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"ProfileJob file not found: {filepath}")
+
+        # Load the state
+        with open(filepath, "rb") as f:
+            state = pickle.load(f)
+
+        # Create a new instance with the required constructor arguments
+        required_args = {
+            "index": state.pop("index"),
+            "kernel": state.pop("kernel"),
+            "input_tensors": state.pop("input_tensors"),
+            "kernel_kwargs": state.pop("kernel_kwargs"),
+            "compiler_flags": state.pop("compiler_flags"),
+            "preprocessing": state.pop("preprocessing"),
+            "postprocessing": state.pop("postprocessing"),
+        }
+
+        # Create the instance
+        instance = cls(**required_args)
+
+        # Add any additional fields that were saved
+        for key, value in state.items():
+            setattr(instance, key, value)
+
+        return instance
+
     def __repr__(self) -> str:
         arg_shapes = [str(arg.shape) for arg in self.input_tensors]
         kwargs_str = ", ".join(f"{k}={v}" for k, v in self.kernel_kwargs.items())
 
-        return f"ProfileJob(kernel={self.kernel}, shapes={arg_shapes}, " f"kwargs={{{kwargs_str}}}, name={self.name})"
+        return f"ProfileJob(kernel={self.kernel}, input_tensor_shapes={arg_shapes}, " f"kwargs={{{kwargs_str}}})"
 
     def __getattr__(self, name):
         """
@@ -100,19 +171,12 @@ class ProfileJobs:
             kernel_kwargs = {}
         if compiler_flags is None:
             compiler_flags = ""
-        _, kernel_name = kernel
         if preprocessing is None:
             preprocessing = dummy_preprocessing
         if postprocessing is None:
             postprocessing = dummy_postprocessing
         job = ProfileJob(
-            f"{kernel_name}_{len(self.jobs)+1}",
-            kernel,
-            input_tensors,
-            kernel_kwargs,
-            compiler_flags,
-            preprocessing,
-            postprocessing,
+            self.num_jobs, kernel, input_tensors, kernel_kwargs, compiler_flags, preprocessing, postprocessing
         )
         self.jobs.append(job)
 
