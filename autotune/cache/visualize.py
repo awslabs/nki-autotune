@@ -1,3 +1,4 @@
+import json
 import os
 from typing import List
 
@@ -5,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from autotune.cache.directories import CACHE_ROOT_DIR
-from autotune.cache.results import ProfileResults
+from autotune.cache.results import get_best_result
 
 
 def collect_metrics_data_with_stats(directory: str, metric_name: str):
@@ -38,20 +39,20 @@ def collect_metrics_data_with_stats(directory: str, metric_name: str):
         # Read the perf_metrics.json file
         json_path = os.path.join(directory, dirname, "perf_metrics.json")
         if os.path.exists(json_path):
-            loaded_metrics = ProfileResults.load(json_path)
-
+            with open(json_path, "r") as f:
+                data = json.load(f)
             # Get all results
-            all_results = loaded_metrics.results
+            all_results = data["results"]
 
             if not all_results:
                 continue
 
             # Find the best metric
-            best_config = loaded_metrics.get_best_result()
-            best_metric = getattr(best_config, metric_name)
+            best_config = get_best_result(data)
+            best_metric = best_config[metric_name]
 
             # Calculate mean metric across all configurations
-            all_metrics = [getattr(r, metric_name) for r in all_results if "error" not in r.attributes]
+            all_metrics = [r[metric_name] for r in all_results if "error" not in r]
             mean_metric = np.mean(all_metrics) if all_metrics else 0
 
             # Store both metrics

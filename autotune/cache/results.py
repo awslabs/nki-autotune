@@ -303,7 +303,11 @@ class ProfileResults:
                 sorted_results = results
 
             json_data[filepath] = {
-                "metadata": {"sort_key": self.sort_key, "lower_is_better": self.lower_is_better},
+                "metadata": {
+                    "sort_key": self.sort_key,
+                    "lower_is_better": self.lower_is_better,
+                    "num_results": len(sorted_results),
+                },
                 "results": [result.to_dict() for result in sorted_results],
             }
 
@@ -379,3 +383,16 @@ class ProfileResults:
                 result_str += f"\n    ... and {len(self.results) - preview_limit} more"
 
         return result_str
+
+
+def get_best_result(data: Dict):
+    if not data["metadata"]["sort_key"]:
+        return data["results"][0]
+
+    sort_key = data["metadata"]["sort_key"]
+    lower_is_better = data["metadata"]["lower_is_better"]
+    return (
+        min(data["results"], key=lambda result: getattr(result, sort_key, float("inf")))
+        if lower_is_better
+        else max(data["results"], key=lambda result: getattr(result, sort_key, float("-inf")))
+    )
