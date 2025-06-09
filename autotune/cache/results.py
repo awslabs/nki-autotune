@@ -273,28 +273,41 @@ class ProfileResults:
     def dump_summary(self):
         """
         Dump the metrics summary to a JSON file.
-
-        Args:
-            cache_dir: Directory to save the result file
-            filename: Name of the JSON file (default: "perf_metrics.json")
-
-        Returns:
-            Full path to the saved file
+        Results within each file are sorted by the sort_key.
 
         Raises:
             OSError: If the directory cannot be created or the file cannot be written
         """
-        json_data = {}
+        # Group results by filepath first
+        results_by_filepath = {}
         filename = "perf_metrics.json"
+
         for result in self.results:
             workload_cache_dir = os.path.dirname(result.cache_dir)
             filepath = os.path.join(workload_cache_dir, filename)
-            if filepath not in json_data:
-                json_data[filepath] = {
-                    "metadata": {"sort_key": self.sort_key, "lower_is_better": self.lower_is_better},
-                    "results": [],
-                }
-            json_data[filepath]["results"].append(result.to_dict())
+            if filepath not in results_by_filepath:
+                results_by_filepath[filepath] = []
+            results_by_filepath[filepath].append(result)
+
+        # Sort results within each filepath group and prepare JSON data
+        json_data = {}
+        for filepath, results in results_by_filepath.items():
+            # Sort results using the same logic as to_dict_list
+            try:
+                sorted_results = sorted(
+                    results,
+                    key=lambda result: getattr(result, self.sort_key),
+                    reverse=not self.lower_is_better,  # Reverse sort if higher values are better
+                )
+            except:
+                sorted_results = results
+
+            json_data[filepath] = {
+                "metadata": {"sort_key": self.sort_key, "lower_is_better": self.lower_is_better},
+                "results": [result.to_dict() for result in sorted_results],
+            }
+
+        # Write JSON files
         for filepath in json_data:
             try:
                 directory = os.path.dirname(filepath)
@@ -344,6 +357,12 @@ class ProfileResults:
     def __getitem__(self, index: int) -> ProfileResult:
         """Access results by index."""
         return self.results[index]
+
+    def __setitem__(self, index: int, value: ProfileResult) -> None:
+        """Set a result at the specified index."""
+        if not isinstance(value, ProfileResult):
+            raise TypeError(f"Expected ProfileResult instance, got {type(value).__name__}")
+        self.results[index] = value
 
     def __repr__(self) -> str:
         """Return a string representation of the ProfileResults instance."""

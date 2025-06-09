@@ -11,7 +11,7 @@ from tqdm import tqdm
 from autotune.cache.results import ProfileResults
 from autotune.tune.job import ProfileJobs
 from autotune.tune.metrics import extract_metrics
-from autotune.tune.parallel import parallel_execute
+from autotune.tune.parallel import parallel_execute, parallel_execute_groups
 from autotune.tune.run_nki import run_on_neuron_core
 from autotune.tune.utils import capture_error_message, compile_kernel
 
@@ -33,7 +33,7 @@ class Benchmark:
         self._parallel_init_jobs()
         self._parallel_preprocessing()
         self._parallel_compile_to_neff()
-        # self._parallel_run_kernels()
+        self._parallel_run_kernels()
         # self._parallel_extract_metrics()
         # self._parallel_postprocessing()
         self.results.dump_summary()
@@ -135,13 +135,6 @@ class Benchmark:
         )
 
     def _parallel_run_kernels(self):
-        """
-        FIXME: make this data parallel
-        1. Save results, jobs
-        2. Pass results, jobs paths and job IDs
-        3. Subprocess load results, jobs
-        """
-
         def submit_jobs(job_group_id: int, job_group: List[int]):
             kwargs = {
                 "neuron_core_id": job_group_id,
@@ -155,13 +148,12 @@ class Benchmark:
                 kwargs["job_ids"].append(job_id)
             return run_on_neuron_core, kwargs
 
-        def process_results(error: bool, job_group: List[int], kernel_stats: List):
-            if error:
-                self._process_error(job_group, kernel_stats)
-            for job_id, stats in zip(job_group, kernel_stats):
-                self.results[job_id].add_fields(**stats)
+        def process_results(error: bool, job_group: List[int], error_msg: None | str):
+            if error and error_msg:
+                for job_id in job_group:
+                    self._process_error(job_id, error_msg)
 
-        parallel_execute(
+        parallel_execute_groups(
             executor_type="thread",
             num_workers=32,
             job_ids=self.valid_job_ids,

@@ -13,9 +13,8 @@ from autotune.tune.utils import capture_error_message, create_spike_kernel, run_
 
 def run_on_neuron_core(
     neuron_core_id: int, warmup: int, iters: int, job_ids: List[int], jobs: ProfileJobs, results: ProfileResults
-):
+) -> None:
     """Run a Python script with a specific NEURON_RT_VISIBLE_CORES setting"""
-    kernel_stats = []
     cache_dirs = []
     for job_id in job_ids:
         job = jobs[job_id]
@@ -23,7 +22,6 @@ def run_on_neuron_core(
         job.save()
         result.save()
         cache_dirs.append(job.cache_dir)
-        kernel_stats.append({"run_nki": job.cache_dir})
     env = os.environ.copy()
     env["NEURON_RT_VISIBLE_CORES"] = str(neuron_core_id)
     cmd = ["python", "autotune/tune/run_nki.py"]
@@ -33,20 +31,26 @@ def run_on_neuron_core(
     process = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if process.stderr:
         raise Exception(process.stderr)
-    print(f"stdout = {process.stdout}, stderr = {process.stderr}")
-    return kernel_stats
+    for job_id in job_ids:
+        job = jobs[job_id]
+        result = ProfileResult.load(job.cache_dir)
+        results[job_id] = result
 
 
 def main():
+    """
+    FIXME: make this data parallel
+    1. Save results, jobs
+    2. Pass results, jobs paths and job IDs
+    3. Subprocess load results, jobs
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--cache_dirs", type=str, nargs="+", help="A list of cahce dirs to process.")
     parser.add_argument("--warmup", type=int, help="Number of kernel warmup runs.")
     parser.add_argument("--iters", type=int, help="Number of kernel profile runs.")
     args = parser.parse_args()
-    core_id = os.environ.get("NEURON_RT_VISIBLE_CORES")
     kernel_outputs = {}
     with SpikeExecutor(verbose=0) as spike:
-        # for cache_dir in tqdm(args.cache_dirs, total=len(args.cache_dirs), desc="Executing kernels"):
         for cache_dir in args.cache_dirs:
             try:
                 job = ProfileJob.load(cache_dir)
@@ -67,10 +71,10 @@ def main():
                 matmul_mac_count = get_matmul_mac_count(spike_kernel.traced_kernel)
                 result.add_fields(ntff=ntff_file, **stats, matmul_mac_count=matmul_mac_count)
                 kernel_outputs[job.index] = kernel_output
-                result.save()
             except Exception as e:
                 error_string = capture_error_message(e)
-                print(error_string)
+                result.add_error(error_string)
+            result.save()
 
 
 if __name__ == "__main__":

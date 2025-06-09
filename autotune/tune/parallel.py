@@ -108,7 +108,7 @@ def parallel_execute(
         process_results_func(error, job_id, future_result)
 
 
-def parallel_execute_as_groups(
+def parallel_execute_groups(
     executor_type: str,
     num_workers: int,
     job_ids: List[int],
