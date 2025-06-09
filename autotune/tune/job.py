@@ -3,7 +3,7 @@ import pickle
 import random
 import shutil
 from concurrent.futures import ProcessPoolExecutor
-from typing import List, Set
+from typing import Dict, List, Set
 
 from tqdm import tqdm
 
@@ -19,14 +19,14 @@ from autotune.typing import (
 )
 
 
-def dummy_preprocessing(input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE) -> bool:
-    return True
+def dummy_preprocessing(input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE) -> None:
+    pass
 
 
 def dummy_postprocessing(
-    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, nki_out_tensor: OUTPUT_TENSOR_DTYPE
-) -> bool:
-    return True
+    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_output: OUTPUT_TENSOR_DTYPE
+) -> None:
+    pass
 
 
 def run_with_args_and_kwargs(func, args, kwargs):
@@ -68,15 +68,15 @@ class ProfileJob:
         arg_shapes = [arg.shape for arg in self.input_tensors]
         return arg_shapes
 
-    def add_fields(self, **kwargs):
-        """
-        Add additional fields to this ProfileJob instance.
+    # def add_fields(self, **kwargs):
+    #     """
+    #     Add additional fields to this ProfileJob instance.
 
-        Args:
-            **kwargs: Arbitrary keyword arguments to add as attributes
-        """
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+    #     Args:
+    #         **kwargs: Arbitrary keyword arguments to add as attributes
+    #     """
+    #     for key, value in kwargs.items():
+    #         setattr(self, key, value)
 
     def init_job_dir(self):
         if os.path.exists(self.cache_dir):
@@ -89,9 +89,9 @@ class ProfileJob:
         """
         filepath = os.path.join(self.cache_dir, "profile_job.pkl")
 
-        # Get all attributes including dynamically added ones
         state = {}
-        for key, value in self.__dict__.items():
+        for key in ["index", "kernel", "input_tensors", "kernel_kwargs", "compiler_flags", "cache_dir"]:
+            value = getattr(self, key)
             state[key] = value
 
         # Save using pickle
@@ -99,7 +99,7 @@ class ProfileJob:
             pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     @classmethod
-    def load(cls, filepath: str) -> "ProfileJob":
+    def load(cls, filepath: str) -> Dict:
         """
         Load a ProfileJob instance from disk.
 
@@ -121,24 +121,23 @@ class ProfileJob:
             state = pickle.load(f)
 
         # Create a new instance with the required constructor arguments
-        required_args = {
-            "index": state.pop("index"),
-            "kernel": state.pop("kernel"),
-            "input_tensors": state.pop("input_tensors"),
-            "kernel_kwargs": state.pop("kernel_kwargs"),
-            "compiler_flags": state.pop("compiler_flags"),
-            "preprocessing": state.pop("preprocessing"),
-            "postprocessing": state.pop("postprocessing"),
-        }
+        # FIXME: only dump what's needed to run kernels in parallel
+        # required_args = {
+        #     "index": state.pop("index"),
+        #     "kernel": state.pop("kernel"),
+        #     "input_tensors": state.pop("input_tensors"),
+        #     "kernel_kwargs": state.pop("kernel_kwargs"),
+        #     "compiler_flags": state.pop("compiler_flags"),
+        # }
 
-        # Create the instance
-        instance = cls(**required_args)
+        # # Create the instance
+        # instance = cls(**required_args)
 
-        # Add any additional fields that were saved
-        for key, value in state.items():
-            setattr(instance, key, value)
+        # # Add any additional fields that were saved
+        # for key, value in state.items():
+        #     setattr(instance, key, value)
 
-        return instance
+        return state
 
     def __repr__(self) -> str:
         arg_shapes = [str(arg.shape) for arg in self.input_tensors]

@@ -105,7 +105,6 @@ def extract_metrics(neff: str, ntff: str, latency: float, matmul_mac_count: int)
     metrics = data[first_key]
 
     mfu = calculate_mfu(matmul_mac_count, latency, "trn1")
-    metrics["matmul_mac_count"] = matmul_mac_count
     metrics["mfu_estimated_percent"] = mfu
     return metrics
 

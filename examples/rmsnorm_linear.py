@@ -8,6 +8,7 @@ from itertools import product
 import numpy as np
 from neuronpy.core.language import bfloat16
 
+from autotune.cache.visualize import plot_metric
 from autotune.core.utils import GEMMCompatibility
 from autotune.tune.benchmark import Benchmark
 from autotune.tune.job import ProfileJobs
@@ -60,12 +61,12 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     mn_shapes = [2048]
-    k_shapes = [2048]
+    k_shapes = [1024, 2048, 4096, 8192, 16384]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
     for M, N, K in MNK:
         create_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs)
     tuner()
-    # plot_metric("min_ms", ["rmsnorm_matmul_golden", "online_rmsnorm_linear_MKN"])
-    # plot_metric("mfu_estimated_percent", ["rmsnorm_matmul_golden", "online_rmsnorm_linear_MKN"])
+    plot_metric("min_ms", ["rmsnorm_matmul_golden", "online_rmsnorm_linear_MKN"])
+    plot_metric("mfu_estimated_percent", ["rmsnorm_matmul_golden", "online_rmsnorm_linear_MKN"])

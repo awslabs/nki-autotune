@@ -3,6 +3,7 @@ import os
 import subprocess
 from typing import List
 
+import numpy as np
 from neuronpy.runtime.spike import SpikeExecutor
 
 from autotune.cache.results import ProfileResult, ProfileResults
@@ -49,28 +50,28 @@ def main():
     parser.add_argument("--warmup", type=int, help="Number of kernel warmup runs.")
     parser.add_argument("--iters", type=int, help="Number of kernel profile runs.")
     args = parser.parse_args()
-    kernel_outputs = {}
     with SpikeExecutor(verbose=0) as spike:
         for cache_dir in args.cache_dirs:
             try:
-                job = ProfileJob.load(cache_dir)
+                job_state = ProfileJob.load(cache_dir)
                 result = ProfileResult.load(cache_dir)
-                spike_kernel = create_spike_kernel(result.neff, job.kernel, job.input_tensors, job.kernel_kwargs)
+                spike_kernel = create_spike_kernel(
+                    result.neff, job_state["kernel"], job_state["input_tensors"], job_state["kernel_kwargs"]
+                )
                 stats = spike.benchmark(
                     spike_kernel,
-                    *job.input_tensors,
-                    **job.kernel_kwargs,
+                    *job_state["input_tensors"],
+                    **job_state["kernel_kwargs"],
                     warmup_iterations=args.warmup,
                     benchmark_iterations=args.iters,
                     device_id=0,
                 )
                 ntff_file, kernel_output = run_spike_kernel(
-                    spike, spike_kernel, job.input_tensors, result.neff, job.kernel_kwargs
+                    spike, spike_kernel, job_state["input_tensors"], result.neff, job_state["kernel_kwargs"]
                 )
-                # FIXME: move matmul_mac_count to metrics extraction
                 matmul_mac_count = get_matmul_mac_count(spike_kernel.traced_kernel)
                 result.add_fields(ntff=ntff_file, **stats, matmul_mac_count=matmul_mac_count)
-                kernel_outputs[job.index] = kernel_output
+                np.save(f"{job_state['cache_dir']}/kernel_output.npy", kernel_output)
             except Exception as e:
                 error_string = capture_error_message(e)
                 result.add_error(error_string)
