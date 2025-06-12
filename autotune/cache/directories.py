@@ -6,9 +6,6 @@ from typing import List, Tuple
 
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE
 
-home_dir = os.environ["HOME"]
-CACHE_ROOT_DIR = f"/mnt/efs/autotune-cache"
-
 
 def get_hash_name(kernel_name: str, input_tensors: INPUT_TENSORS_DTYPE, configs: KERNEL_KWARGS_DTYPE):
     input_tensors_str = parse_tensor_shapes([str(arg.shape) for arg in input_tensors])

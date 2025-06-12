@@ -19,15 +19,16 @@ class Benchmark:
     Compile and benchmark NKI kernel on NeuronDevice.
     """
 
-    def __init__(self, jobs: ProfileJobs, warmup: int = 10, iters: int = 100):
+    def __init__(self, jobs: ProfileJobs, cache_root_dir: str, warmup: int = 10, iters: int = 100):
         self.jobs = jobs
+        self.cache_root_dir = cache_root_dir
         self.warmup = warmup
         self.iters = iters
 
     def __call__(self):
         self.valid_job_ids = list(range(self.jobs.num_jobs))
-        self.results = self._init_results()
         self._parallel_init_jobs()
+        self.results = self._init_results()
         self._parallel_preprocessing()
         self._parallel_compile_to_neff()
         self._parallel_run_kernels()
@@ -40,6 +41,29 @@ class Benchmark:
         num_workers = max(num_workers, 1)
         return num_workers
 
+    def _parallel_init_jobs(self):
+        def submit_jobs(job_group_id: int, job_group: List[int]):
+            funcs = []
+            kwargs = []
+            for job_id in job_group:
+                self.jobs[job_id].cache_root_dir = self.cache_root_dir
+                funcs.append(self.jobs[job_id].init_job_dir)
+                kwargs.append({})
+            return funcs, kwargs
+
+        def process_results(error: bool, job_id: int, output: None | str):
+            if error and output:
+                raise Exception(output)
+
+        parallel_execute(
+            executor_type="thread",
+            num_workers=self._get_num_workers(),
+            job_ids=self.valid_job_ids,
+            submit_jobs_func=submit_jobs,
+            work_desc="Init Job Directories",
+            process_results_func=process_results,
+        )
+
     def _init_results(self) -> ProfileResults:
         results = ProfileResults(sort_key="min_ms", lower_is_better=True)
         for job in self.jobs:
@@ -50,28 +74,6 @@ class Benchmark:
                 cache_dir=job.cache_dir,
             )
         return results
-
-    def _parallel_init_jobs(self):
-        def submit_jobs(job_group_id: int, job_group: List[int]):
-            funcs = []
-            kwargs = []
-            for job_id in job_group:
-                funcs.append(self.jobs[job_id].init_job_dir)
-                kwargs.append({})
-            return funcs, kwargs
-
-        def process_results(error: bool, job_id: int, output: None | str):
-            if error and output:
-                self._process_error(job_id, output)
-
-        parallel_execute(
-            executor_type="thread",
-            num_workers=self._get_num_workers(),
-            job_ids=self.valid_job_ids,
-            submit_jobs_func=submit_jobs,
-            work_desc="Init Job Directories",
-            process_results_func=process_results,
-        )
 
     def _parallel_preprocessing(self):
         def submit_jobs(job_group_id: int, job_group: List[int]):

@@ -13,7 +13,7 @@ class GEMMCorrectness:
         input_tensors: INPUT_TENSORS_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
         nki_out_tensor: OUTPUT_TENSOR_DTYPE,
-    ) -> bool:
+    ):
         data_type = np.float32
         atol, rtol = 1e-2, 1e-2
         lhs, rhs = input_tensors
@@ -22,7 +22,6 @@ class GEMMCorrectness:
         np.testing.assert_allclose(
             actual=nki_out_tensor, desired=golden, atol=atol, rtol=rtol, err_msg="", verbose=True
         )
-        return True
 
 
 def gemm_cpu_golden(lhs, rhs, transposed_lhs=False):
