@@ -5,7 +5,6 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 
-from autotune.cache.directories import CACHE_ROOT_DIR
 from autotune.cache.results import get_best_result
 
 
@@ -81,7 +80,7 @@ def numerical_key(dim_string: str) -> list:
     return components
 
 
-def plot_metric(metric_name: str, kernel_names: List[str]):
+def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
     """
     Create a single line plot showing MFU for all (M,N,K) combinations,
     comparing tuned vs baseline configurations.
@@ -91,12 +90,12 @@ def plot_metric(metric_name: str, kernel_names: List[str]):
     kernel_name : str
         Name of the workload (used to locate directories and save plots)
     """
-    plots_dir = f"{CACHE_ROOT_DIR}/plots"
+    plots_dir = f"{cache_root_dir}/plots"
     os.makedirs(plots_dir, exist_ok=True)
 
     all_kernels_metrics = {}
     for kernel_name in kernel_names:
-        metrics = collect_metrics_data_with_stats(f"{CACHE_ROOT_DIR}/{kernel_name}", metric_name)
+        metrics = collect_metrics_data_with_stats(f"{cache_root_dir}/{kernel_name}", metric_name)
         all_kernels_metrics[kernel_name] = metrics
 
     all_inputs_strings = set()

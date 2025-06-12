@@ -7,7 +7,6 @@ from typing import Dict, List, Set
 
 from tqdm import tqdm
 
-from autotune.cache.directories import CACHE_ROOT_DIR
 from autotune.tune.utils import capture_error_message
 from autotune.typing import (
     INPUT_TENSORS_DTYPE,
@@ -61,22 +60,32 @@ class ProfileJob:
     @property
     def cache_dir(self) -> str:
         input_tensor_shapes = "_".join("x".join(str(dim) for dim in tensor.shape) for tensor in self.input_tensors)
-        cache_dir = f"{CACHE_ROOT_DIR}/{self.kernel[1]}/{input_tensor_shapes}/id{self.index}"
+        cache_dir = f"{self.cache_root_dir}/{self.kernel[1]}/{input_tensor_shapes}/id{self.index}"
         return cache_dir
+
+    @property
+    def cache_root_dir(self) -> str:
+        """
+        Get the root directory for caching.
+
+        Returns:
+            str: The root directory path
+        """
+        return self._cache_root_dir
+
+    @cache_root_dir.setter
+    def cache_root_dir(self, value: str) -> None:
+        """
+        Set the root directory for caching.
+
+        Args:
+            value: Path to the root directory
+        """
+        self._cache_root_dir = value
 
     def get_arg_shapes(self):
         arg_shapes = [arg.shape for arg in self.input_tensors]
         return arg_shapes
-
-    # def add_fields(self, **kwargs):
-    #     """
-    #     Add additional fields to this ProfileJob instance.
-
-    #     Args:
-    #         **kwargs: Arbitrary keyword arguments to add as attributes
-    #     """
-    #     for key, value in kwargs.items():
-    #         setattr(self, key, value)
 
     def init_job_dir(self):
         if os.path.exists(self.cache_dir):
@@ -120,23 +129,6 @@ class ProfileJob:
         with open(filepath, "rb") as f:
             state = pickle.load(f)
 
-        # Create a new instance with the required constructor arguments
-        # FIXME: only dump what's needed to run kernels in parallel
-        # required_args = {
-        #     "index": state.pop("index"),
-        #     "kernel": state.pop("kernel"),
-        #     "input_tensors": state.pop("input_tensors"),
-        #     "kernel_kwargs": state.pop("kernel_kwargs"),
-        #     "compiler_flags": state.pop("compiler_flags"),
-        # }
-
-        # # Create the instance
-        # instance = cls(**required_args)
-
-        # # Add any additional fields that were saved
-        # for key, value in state.items():
-        #     setattr(instance, key, value)
-
         return state
 
     def __repr__(self) -> str:
@@ -144,13 +136,6 @@ class ProfileJob:
         kwargs_str = ", ".join(f"{k}={v}" for k, v in self.kernel_kwargs.items())
 
         return f"ProfileJob(kernel={self.kernel}, input_tensor_shapes={arg_shapes}, " f"kwargs={{{kwargs_str}}})"
-
-    def __getattr__(self, name):
-        """
-        Called when an attribute lookup fails.
-        Returns None for non-existent attributes instead of raising AttributeError.
-        """
-        return None
 
 
 class ProfileJobs:
