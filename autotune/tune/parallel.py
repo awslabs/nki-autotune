@@ -169,9 +169,6 @@ def parallel_execute_groups(
     # Create a dictionary to map futures to job groups
     future_to_job_group = {}
 
-    # Track completed jobs for progress updates
-    completed_jobs = 0
-
     with pool_executor(max_workers=num_workers) as executor:
         # Submit all job groups
         for job_group_id, job_group in enumerate(job_groups):

@@ -13,8 +13,8 @@ from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 
 from autotune.core.generate_tests import GenTests
-from autotune.core.golden import gemm_core, gemm_cpu_golden
-from autotune.core.lhs_rhs import gemm_main
+from autotune.core.golden import lhs_rhs_gemm_np, lhsT_rhs_gemm_np
+from autotune.core.lhs_rhs import lhs_rhs_gemm
 from autotune.core.utils import GEMMCompatibility
 from autotune.tune.utils import run_kernel
 
@@ -63,7 +63,7 @@ def test_golden_matmul_correctness(M, N, K):
     rhs = np.random.normal((K, N)).astype(data_type)
 
     golden_1 = nl.static_cast(gemm_core(lhs[0], rhs, False), data_type)
-    golden_2 = nl.static_cast(gemm_cpu_golden(lhs, rhs, False), data_type)
+    golden_2 = nl.static_cast(lhs_rhs_gemm_np(lhs, rhs, False), data_type)
     assert allclose(golden_1, golden_2, atol=atol, rtol=rtol, verbose=1)
 
 
@@ -91,7 +91,7 @@ def test_matmul_correctness(
     data_type = np.float32
     lhsT = np.random.normal((K, M)).astype(data_type)
     rhs = np.random.normal((K, N)).astype(data_type)
-    golden_output = nl.static_cast(gemm_cpu_golden(lhsT, rhs, lhs_is_transposed=True), np.float32)
+    golden_output = nl.static_cast(lhsT_rhs_gemm_np(lhsT, rhs, lhs_is_transposed=True), np.float32)
 
     lhsT_dev = nl.static_cast(lhsT, data_type)
     rhs_dev = nl.static_cast(rhs, data_type)
@@ -134,10 +134,10 @@ def test_non_transposed_matmul_correctness(
     atol, rtol = 1e-5, 1e-5
     lhs = np.random.normal((M, K)).astype(data_type)
     rhs = np.random.normal((K, N)).astype(data_type)
-    golden_output = nl.static_cast(gemm_cpu_golden(lhs, rhs, lhs_is_transposed=False), data_type)
+    golden_output = nl.static_cast(lhs_rhs_gemm_np(lhs, rhs, lhs_is_transposed=False), data_type)
 
     for template in ["MN", "MNK", "MKN"]:
-        numeric_func = baremetal(gemm_main)
+        numeric_func = baremetal(lhs_rhs_gemm)
         nki_out = numeric_func(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template)
         nki_out = nl.static_cast(nki_out, data_type)
         assert allclose(
