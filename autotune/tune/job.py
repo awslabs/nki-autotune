@@ -2,12 +2,9 @@ import os
 import pickle
 import random
 import shutil
-from concurrent.futures import ProcessPoolExecutor
-from typing import Dict, List, Set
+from typing import Any, Callable, Dict, List, Set, Tuple
 
-from tqdm import tqdm
-
-from autotune.tune.utils import capture_error_message
+from autotune.tune.parallel import parallel_execute
 from autotune.typing import (
     INPUT_TENSORS_DTYPE,
     KERNEL_DTYPE,
@@ -164,6 +161,50 @@ class ProfileJobs:
         )
         self.jobs.append(job)
 
+    def extend(self, other_jobs: "ProfileJobs") -> "ProfileJobs":
+        """
+        Concatenate another ProfileJobs object to this one.
+        This modifies the current object and also returns it for chaining.
+
+        Args:
+            other_jobs: Another ProfileJobs instance to append
+
+        Returns:
+            self: The modified ProfileJobs instance
+        """
+        # Get the current number of jobs as the starting index
+        start_idx = self.num_jobs
+
+        # Add each job from other_jobs, updating its index
+        for i, job in enumerate(other_jobs.jobs):
+            # Create a new job with updated index
+            new_job = ProfileJob(
+                start_idx + i,  # New index
+                job.kernel,
+                job.input_tensors,
+                job.kernel_kwargs,
+                job.compiler_flags,
+                job.preprocessing,
+                job.postprocessing,
+            )
+
+            # Copy any additional attributes
+            for attr in dir(job):
+                if not attr.startswith("__") and attr not in [
+                    "index",
+                    "kernel",
+                    "input_tensors",
+                    "kernel_kwargs",
+                    "compiler_flags",
+                    "preprocessing",
+                    "postprocessing",
+                ]:
+                    if hasattr(job, attr) and not callable(getattr(job, attr)):
+                        setattr(new_job, attr, getattr(job, attr))
+            self.jobs.append(new_job)
+
+        return self
+
     def sample(self, num_samples: int) -> None:
         """Sample only from valid jobs."""
         valid_jobs: List[ProfileJob] = []
@@ -182,35 +223,74 @@ class ProfileJobs:
             for job_id in sampled_job_ids:
                 available_job_ids.remove(job_id)
 
-            # 2. Process the sampled batch in parallel
-            futures = []
-            num_workers = min(len(sampled_job_ids), os.cpu_count() - 1)
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                for job_id in sampled_job_ids:
-                    job = self.jobs[job_id]
-                    future = executor.submit(
-                        run_with_args_and_kwargs, job.preprocessing, job.input_tensors, job.kernel_kwargs
-                    )
-                    futures.append((job_id, future))
-
-            # Process results of this batch
+            # 2. Create a local capturing list for valid jobs
             batch_valid_jobs: List[ProfileJob] = []
-            for job_id, future in tqdm(
-                futures, total=len(futures), desc=f"Sampling valid jobs (need {remaining_num_samples} more)"
-            ):
-                job = self.jobs[job_id]
-                try:
-                    success = future.result()
-                    if success:
-                        batch_valid_jobs.append(job)
-                except Exception as e:
-                    error_msg = capture_error_message(e)
 
+            # Define submit_jobs_func for parallel_execute
+            def submit_jobs_func(group_id: int, job_group: List[int]) -> Tuple[List[Callable], List[Dict[str, Any]]]:
+                funcs = []
+                kwargs_list = []
+                for job_id in job_group:
+                    job = self.jobs[job_id]
+                    funcs.append(job.preprocessing)
+                    kwargs_list.append({"input_tensors": job.input_tensors, "kernel_kwargs": job.kernel_kwargs})
+                return funcs, kwargs_list
+
+            # Define process_results_func for parallel_execute
+            def process_results_func(error: bool, job_id: int, result: Any) -> None:
+                nonlocal batch_valid_jobs
+                job = self.jobs[job_id]
                 processed_job_ids.add(job_id)
+
+                # Only add to valid jobs if there was no error and the result indicates success
+                if not error and not result:
+                    batch_valid_jobs.append(job)
+                # else:
+                #     raise Exception(result)
+
+            # Use parallel_execute
+            num_workers = min(len(sampled_job_ids), os.cpu_count() - 1)
+            parallel_execute(
+                executor_type="process",
+                num_workers=num_workers,
+                job_ids=sampled_job_ids,
+                submit_jobs_func=submit_jobs_func,
+                work_desc=f"Sampling valid jobs (need {remaining_num_samples} more)",
+                process_results_func=process_results_func,
+            )
 
             # 3. Update remaining count
             valid_jobs.extend(batch_valid_jobs[:remaining_num_samples])
             remaining_num_samples = num_samples - len(valid_jobs)
+
+            # # 2. Process the sampled batch in parallel
+            # futures = []
+            # with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            #     for job_id in sampled_job_ids:
+            #         job = self.jobs[job_id]
+            #         future = executor.submit(
+            #             run_with_args_and_kwargs, job.preprocessing, job.input_tensors, job.kernel_kwargs
+            #         )
+            #         futures.append((job_id, future))
+
+            # # Process results of this batch
+            # batch_valid_jobs: List[ProfileJob] = []
+            # for job_id, future in tqdm(
+            #     futures, total=len(futures), desc=f"Sampling valid jobs (need {remaining_num_samples} more)"
+            # ):
+            #     job = self.jobs[job_id]
+            #     try:
+            #         success = future.result()
+            #         if success:
+            #             batch_valid_jobs.append(job)
+            #     except Exception as e:
+            #         error_msg = capture_error_message(e)
+
+            #     processed_job_ids.add(job_id)
+
+            # # 3. Update remaining count
+            # valid_jobs.extend(batch_valid_jobs[:remaining_num_samples])
+            # remaining_num_samples = num_samples - len(valid_jobs)
         self.jobs = valid_jobs
 
     @property

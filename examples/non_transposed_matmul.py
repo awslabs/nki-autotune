@@ -23,7 +23,7 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         postprocessing = None
     for trial in range(10):
         jobs.add_job(
-            kernel=("autotune/core/golden.py", "gemm_cpu_golden"),
+            kernel=("autotune/core/golden.py", "lhs_rhs_gemm_np"),
             input_tensors=(lhs, rhs),
             kernel_kwargs={"transposed_lhs": False},
             compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
@@ -39,7 +39,7 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, templates))
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template in params:
         jobs.add_job(
-            kernel=("autotune/core/lhs_rhs.py", "gemm_main"),
+            kernel=("autotune/core/lhs_rhs.py", "lhs_rhs_gemm"),
             input_tensors=(lhs, rhs),
             kernel_kwargs={
                 "NUM_BLOCK_M": NUM_BLOCK_M,
@@ -54,14 +54,14 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 
 
 if __name__ == "__main__":
+    cache_root_dir = "/mnt/efs/autotune-cache"
     mn_shapes = [2048]
     k_shapes = [1024, 2048, 4096, 8192, 16384]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
-    cache_root_dir = "/mnt/efs/autotune-cache"
     jobs = ProfileJobs()
     for M, N, K in MNK:
         add_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
-    plot_metric(cache_root_dir, "min_ms", ["gemm_cpu_golden", "gemm_main"])
-    plot_metric(cache_root_dir, "mfu_estimated_percent", ["gemm_cpu_golden", "gemm_main"])
+    plot_metric(cache_root_dir, "min_ms", ["lhs_rhs_gemm_np", "lhs_rhs_gemm"])
+    plot_metric(cache_root_dir, "mfu_estimated_percent", ["lhs_rhs_gemm_np", "lhs_rhs_gemm"])

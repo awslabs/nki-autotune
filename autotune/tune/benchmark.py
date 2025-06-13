@@ -27,6 +27,7 @@ class Benchmark:
 
     def __call__(self):
         self.valid_job_ids = list(range(self.jobs.num_jobs))
+        # FIXME: overlap compilation and execution
         self._parallel_init_jobs()
         self.results = self._init_results()
         self._parallel_preprocessing()
