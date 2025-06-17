@@ -8,58 +8,6 @@ import numpy as np
 from autotune.cache.results import get_best_result
 
 
-def collect_metrics_data_with_stats(directory: str, metric_name: str):
-    """
-    Collect multiple performance metrics (MFU and/or HFU) for all MNK combinations,
-    calculating both best and mean performance metrics.
-
-    Parameters:
-    -----------
-    directory : str
-        Directory containing M-N-K subdirectories with perf_metrics.json files.
-    metric_names : tuple
-        Metrics to collect, options include "pe_util" and "hfu_estimated_percent"
-
-    Returns:
-    --------
-    dict
-        Dictionary mapping metric names to dictionaries of (M, N) pairs to dictionaries of K values
-        and their respective metric data with 'best' and 'mean' statistics.
-    """
-    # Initialize metrics data with a cleaner structure
-    metrics_data = {}
-
-    if not os.path.exists(directory):
-        print(f"Directory not found: {directory}")
-        return metrics_data
-
-    # Scan the directories to find all MNK combinations
-    for dirname in os.listdir(directory):
-        # Read the perf_metrics.json file
-        json_path = os.path.join(directory, dirname, "perf_metrics.json")
-        if os.path.exists(json_path):
-            with open(json_path, "r") as f:
-                data = json.load(f)
-            # Get all results
-            all_results = data["results"]
-
-            if not all_results:
-                continue
-
-            # Find the best metric
-            best_config = get_best_result(data)
-            best_metric = best_config[metric_name]
-
-            # Calculate mean metric across all configurations
-            all_metrics = [r[metric_name] for r in all_results if "error" not in r]
-            mean_metric = np.mean(all_metrics) if all_metrics else 0
-
-            # Store both metrics
-            metrics_data[dirname] = {"best": best_metric, "mean": mean_metric}
-
-    return metrics_data
-
-
 def numerical_key(dim_string: str) -> list:
     """
     Convert a dimension string to a list of integers for proper numerical sorting.
@@ -80,15 +28,85 @@ def numerical_key(dim_string: str) -> list:
     return components
 
 
-def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
+def collect_metrics_data_with_stats(directory: str, metric_name: str):
     """
-    Create a single line plot showing MFU for all (M,N,K) combinations,
-    comparing tuned vs baseline configurations.
+    Collect performance metrics for all MNK combinations, calculating both best and mean values.
+    Skips directories where the requested metric doesn't exist.
 
     Parameters:
     -----------
-    kernel_name : str
-        Name of the workload (used to locate directories and save plots)
+    directory : str
+        Directory containing M-N-K subdirectories with perf_metrics.json files.
+    metric_name : str
+        Metric to collect (e.g., "pe_util" or "hfu_estimated_percent")
+
+    Returns:
+    --------
+    dict
+        Dictionary mapping dimension strings to dictionaries with 'best' and 'mean' statistics.
+    """
+    # Initialize metrics data
+    metrics_data = {}
+
+    if not os.path.exists(directory):
+        print(f"Directory not found: {directory}")
+        return metrics_data
+
+    # Scan the directories to find all MNK combinations
+    for dirname in os.listdir(directory):
+        json_path = os.path.join(directory, dirname, "perf_metrics.json")
+        if os.path.exists(json_path):
+            with open(json_path, "r") as f:
+                data = json.load(f)
+
+            # Get all results without errors
+            valid_results = [r for r in data.get("results", []) if "error" not in r]
+
+            if not valid_results:
+                continue
+
+            # Filter results that contain the metric_name
+            valid_metric_results = [r for r in valid_results if metric_name in r]
+
+            if not valid_metric_results:
+                # Skip this directory if no results have the metric
+                continue
+
+            try:
+                best_config = get_best_result(data)
+                # Skip if the requested metric isn't in the best config
+                if metric_name not in best_config:
+                    continue
+
+                best_metric = best_config[metric_name]
+
+                # Calculate mean metric using only results that have this metric
+                all_metrics = [r[metric_name] for r in valid_metric_results]
+                mean_metric = np.mean(all_metrics) if all_metrics else None
+
+                # Store metrics only if we successfully calculated them
+                metrics_data[dirname] = {"best": best_metric, "mean": mean_metric}
+            except:
+                # If there's any issue getting the best result or metric, skip this directory
+                continue
+
+    return metrics_data
+
+
+def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
+    """
+    Create a single line plot showing the specified metric for all (M,N,K) combinations,
+    comparing different kernel implementations. Skips plotting points for dimensions where
+    the metric doesn't exist.
+
+    Parameters:
+    -----------
+    cache_root_dir : str
+        Root directory for the cache data
+    metric_name : str
+        Name of the metric to plot
+    kernel_names : List[str]
+        List of kernel names to include in the plot
     """
     plots_dir = f"{cache_root_dir}/plots"
     os.makedirs(plots_dir, exist_ok=True)
@@ -108,7 +126,7 @@ def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
     plt.figure(figsize=(16, 8))
 
     # Generate x-axis positions
-    x = np.arange(len(all_inputs_strings_sorted))
+    x_positions = {dim: idx for idx, dim in enumerate(all_inputs_strings_sorted)}
 
     # Plot each kernel's data
     colors = ["blue", "red", "green", "purple", "orange", "cyan", "magenta"]
@@ -116,39 +134,39 @@ def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
     line_styles = ["-"]
 
     for i, (kernel_name, metrics) in enumerate(all_kernels_metrics.items()):
-        # Extract best values for each dimension
-        best_values = []
-        mean_values = []
-        for dim_string in all_inputs_strings_sorted:
-            if dim_string in metrics:
-                best_values.append(metrics[dim_string]["best"])
-                mean_values.append(metrics[dim_string]["mean"])
-            else:
-                best_values.append(0)  # No data for this dimension
-                mean_values.append(0)
-
         # Choose color, marker and line style
         color = colors[i % len(colors)]
         marker = markers[i % len(markers)]
         line_style = line_styles[i % len(line_styles)]
 
-        # Plot best values
-        plt.plot(
-            x,
-            best_values,
-            marker=marker,
-            linestyle=line_style,
-            color=color,
-            linewidth=2,
-            markersize=8,
-            label=f"{kernel_name}",
-        )
+        # Collect only the dimensions that have data
+        x_values = []
+        y_values = []
+
+        for dim_string in all_inputs_strings_sorted:
+            if dim_string in metrics:
+                x_values.append(x_positions[dim_string])
+                y_values.append(metrics[dim_string]["best"])
+
+        # Only plot if we have data points
+        if x_values:
+            # Plot points
+            plt.plot(
+                x_values,
+                y_values,
+                marker=marker,
+                linestyle=line_style,
+                color=color,
+                linewidth=2,
+                markersize=8,
+                label=f"{kernel_name}",
+            )
 
     # Set plot properties
     plt.xlabel("Input Shapes")
     plt.ylabel(f"{metric_name.replace('_', ' ')}")
     plt.title(f"{metric_name.replace('_', ' ')}")
-    plt.xticks(x, all_inputs_strings_sorted, rotation=90)
+    plt.xticks(range(len(all_inputs_strings_sorted)), all_inputs_strings_sorted, rotation=90)
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
