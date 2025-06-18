@@ -80,50 +80,50 @@ def online_softmax_gemm_np(lhs, rhs):
         for block_m in range(NUM_BLOCK_M):
             m_start = block_m * TILES_IN_BLOCK_M
             m_end = min(M, (block_m + 1) * TILES_IN_BLOCK_M)
-            M_block_size = m_end - m_start
 
             # Process blocks of N dimension
             for block_n in range(NUM_BLOCK_N):
                 n_start = block_n * TILES_IN_BLOCK_N
                 n_end = min(N, (block_n + 1) * TILES_IN_BLOCK_N)
-                N_block_size = n_end - n_start
 
                 # Initialize state arrays for this M,N block
-                a_vals = np.full((M_block_size, 1), float("-inf"))  # max values, shape (M_block_size, 1)
-                b_vals = np.zeros((M_block_size, 1))  # normalization terms, shape (M_block_size, 1)
-                o_vals = np.zeros((M_block_size, N_block_size))  # output values
+                b_vals = np.zeros((TILES_IN_BLOCK_M, 1))  # normalization terms, shape (TILES_IN_BLOCK_M, 1)
+                o_vals = np.zeros((TILES_IN_BLOCK_M, TILES_IN_BLOCK_N))  # output values
 
                 # Process K dimension in blocks
                 for block_k in range(NUM_BLOCK_K):
                     k_start = block_k * TILES_IN_BLOCK_K
                     k_end = min(K, (block_k + 1) * TILES_IN_BLOCK_K)
-                    K_block_size = k_end - k_start
 
                     # Extract the current K-block from inputs
-                    lhs_block = lhs[b, m_start:m_end, k_start:k_end]  # Shape: (M_block_size, K_block_size)
-                    rhs_block = rhs[k_start:k_end, n_start:n_end]  # Shape: (K_block_size, N_block_size)
+                    lhs_block = lhs[b, m_start:m_end, k_start:k_end]  # Shape: (TILES_IN_BLOCK_M, TILES_IN_BLOCK_K)
+                    rhs_block = rhs[k_start:k_end, n_start:n_end]  # Shape: (TILES_IN_BLOCK_K, TILES_IN_BLOCK_N)
+
+                    if block_k == 0:
+                        # Initialize a_vals for the first block
+                        a_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (TILES_IN_BLOCK_M, 1)
 
                     # Store previous values
                     a_prev = a_vals.copy()
                     b_prev = b_vals.copy()
 
                     # Calculate row-wise max values for this K block
-                    block_max_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (M_block_size, 1)
+                    block_max_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (TILES_IN_BLOCK_M, 1)
 
                     # Update global max for each row (m)
                     new_a_vals = np.maximum(a_vals, block_max_vals)
 
                     # Calculate scaling factor for the change in max values
-                    scale_factor = np.exp(a_vals - new_a_vals)  # Shape: (M_block_size, 1)
+                    scale_factor = np.exp(a_vals - new_a_vals)  # Shape: (TILES_IN_BLOCK_M, 1)
 
                     # Update a_vals
                     a_vals = new_a_vals
 
                     # Calculate exp(x - a) for all elements in the block
-                    exp_block = np.exp(lhs_block - a_vals)  # Shape: (M_block_size, K_block_size)
+                    exp_block = np.exp(lhs_block - a_vals)  # Shape: (TILES_IN_BLOCK_M, TILES_IN_BLOCK_K)
 
                     # Calculate sum of exp values for this block
-                    exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)  # Shape: (M_block_size, 1)
+                    exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)  # Shape: (TILES_IN_BLOCK_M, 1)
 
                     # Update b values (normalization term)
                     is_first_block = a_prev == float("-inf")  # Mask for first valid block
@@ -144,10 +144,10 @@ def online_softmax_gemm_np(lhs, rhs):
 
                     # Calculate contribution from this block
                     # Normalize exp_block by its sum for softmax weighting
-                    softmax_block = exp_block / b_vals  # Shape: (M_block_size, K_block_size)
+                    softmax_block = exp_block / b_vals  # Shape: (TILES_IN_BLOCK_M, TILES_IN_BLOCK_K)
 
                     # Calculate weighted contribution from this block
-                    contribution = np.matmul(softmax_block, rhs_block)  # Shape: (M_block_size, N_block_size)
+                    contribution = np.matmul(softmax_block, rhs_block)  # Shape: (TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
 
                     # Add contribution to output
                     o_vals = o_vals + contribution

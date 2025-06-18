@@ -12,7 +12,7 @@ from autotune.core.utils import GEMMCompatibility
 from kernel_library.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
     blocked_fused_rms_norm_linear,
-    fused_rmsnorm_linear_MKN,
+    online_rmsnorm_linear_MKN,
     stack_allocated_fused_rms_norm_qkv,
 )
 from kernel_library.rmsnorm_linear_golden import (
@@ -212,15 +212,15 @@ def test_blocked_fused_rms_norm_linear_perf(batch, M, K, N, eps):
         eps=[1e-6, 1e-3],
     ).sample_tests(1),
 )
-def test_fused_rmsnorm_linear_MKN_numerical(batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, eps):
+def test_online_rmsnorm_linear_MKN_numerical(batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, eps):
     data_type = np.float32
     atol, rtol = 1e-2, 1e-3
-    lhs = np.random.normal((batch, M, K)).astype(data_type)
-    rhs = np.random.normal((K, N)).astype(data_type)
+    lhs = np.random.normal(size=(batch, M, K)).astype(data_type)
+    rhs = np.random.normal(size=(K, N)).astype(data_type)
 
     golden = nl.static_cast(rmsnorm_matmul_golden(lhs[0], rhs, eps), data_type)
 
-    numeric_func = baremetal(fused_rmsnorm_linear_MKN)
+    numeric_func = baremetal(online_rmsnorm_linear_MKN)
     nki_out = numeric_func(lhs[0], rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, nl.float32, eps)
 
     nki_out = nl.static_cast(nki_out, data_type)
