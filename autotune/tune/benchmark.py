@@ -162,6 +162,13 @@ class Benchmark:
             process_results_func=process_results,
         )
 
+        # FIXME: check if result has error field
+        for job_id in self.valid_job_ids:
+            result = self.results[job_id]
+            if "error" in result.attributes:
+                error_msg = result.error
+                self._process_error(job_id, error_msg)
+
     def _parallel_postprocessing(self):
         def submit_jobs(job_group_id: int, job_group: List[int]):
             funcs = []

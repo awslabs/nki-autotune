@@ -7,7 +7,7 @@ import types
 from typing import Dict, Tuple
 
 import numpy as np
-from neuronpy.core.compile import compile_to_neff, trace
+from neuronpy.core.compile import CompilationTarget, compile_to_neff, trace
 from neuronpy.runtime.spike import CompiledKernel, SpikeExecutor
 from neuronxcc.nki.compile import GenericKernel
 
@@ -112,8 +112,21 @@ def compile_kernel(
     else:
         raise TypeError(f"{type(kernel)} {kernel} is not supported.")
     traced_kernel.specialize(*input_tensors, **kernel_kwargs)
+    if "--target=trn1" in compiler_flags:
+        target = CompilationTarget.TRN1
+        compiler_flags = compiler_flags.replace("--target=trn1", "")
+    elif "--target=trn2" in compiler_flags:
+        target = CompilationTarget.TRN2
+        compiler_flags = compiler_flags.replace("--target=trn2", "")
+    else:
+        raise Exception(f"Must specify either --target=trn1 or --target=trn2 in compiler flags.")
+    compiler_flags = " ".join(compiler_flags.split())
     neff = compile_to_neff(
-        trace_kernel=traced_kernel, output_dir=output_dir, additional_compiler_args=compiler_flags, save_artifacts=True
+        trace_kernel=traced_kernel,
+        output_dir=output_dir,
+        target=target,
+        additional_compiler_args=compiler_flags,
+        save_artifacts=True,
     )
     return neff
 
