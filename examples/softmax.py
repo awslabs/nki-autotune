@@ -6,6 +6,7 @@ import sys
 from itertools import product
 
 import numpy as np
+from neuronpy.core.language import bfloat16
 
 from autotune.cache.visualize import plot_metric
 from autotune.core.utils import GEMMCompatibility
@@ -18,7 +19,7 @@ from kernel_library.softmax import softmax_gemm_correctness_postprocessing
 
 def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     batch = 1
-    data_type = np.float32
+    data_type = bfloat16
     lhs = np.random.normal(size=(batch, M, K)).astype(data_type)
     rhs = np.random.normal(size=(K, N)).astype(data_type)
 
@@ -56,8 +57,8 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
-    mn_shapes = [1024]
-    k_shapes = [1024]
+    mn_shapes = [2048]
+    k_shapes = [4096]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
     for M, N, K in MNK:
