@@ -25,7 +25,7 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         jobs.add_job(
             kernel=("autotune/core/golden.py", "lhs_rhs_gemm_np"),
             input_tensors=(lhs, rhs),
-            kernel_kwargs={"transposed_lhs": False},
+            kernel_kwargs={},
             compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
             preprocessing=GEMMCompatibility(transposed_lhs=False),
             postprocessing=postprocessing,
@@ -37,8 +37,9 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     NUM_BLOCK_K_options = size_options
     templates = ["MN", "MKN", "MNK", "legacy_MKN"]
     params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, templates))
+    autotune_jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template in params:
-        jobs.add_job(
+        autotune_jobs.add_job(
             kernel=("autotune/core/lhs_rhs.py", "lhs_rhs_gemm"),
             input_tensors=(lhs, rhs),
             kernel_kwargs={
@@ -51,6 +52,8 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
             preprocessing=GEMMCompatibility(transposed_lhs=False),
             postprocessing=postprocessing,
         )
+    autotune_jobs.sample(100)
+    jobs.extend(autotune_jobs)
 
 
 if __name__ == "__main__":

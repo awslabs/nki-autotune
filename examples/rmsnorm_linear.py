@@ -41,8 +41,9 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     NUM_BLOCK_N_options = sizes
     NUM_BLOCK_K_options = sizes
     params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options))
+    autotune_jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K in params:
-        jobs.add_job(
+        autotune_jobs.add_job(
             kernel=("kernel_library/rmsnorm_linear.py", "online_rmsnorm_linear_MKN"),
             input_tensors=(lhs, rhs),
             kernel_kwargs={
@@ -55,8 +56,8 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
             preprocessing=GEMMCompatibility(transposed_lhs=False),
             postprocessing=postprocessing,
         )
-    # TODO: implement jobs appending
-    # jobs.sample(100)
+    autotune_jobs.sample(100)
+    jobs.extend(autotune_jobs)
 
 
 if __name__ == "__main__":

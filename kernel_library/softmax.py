@@ -7,6 +7,7 @@ from neuronxcc import nki
 from neuronxcc.nki.typing import tensor
 
 from autotune.core.dma import load_tensor_block, save_result_dma
+from autotune.core.layout import transpose_tiles_in_block
 from autotune.core.utils import GEMMCompatibility
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSOR_DTYPE
 
@@ -169,12 +170,15 @@ def online_softmax_linear_MKN(
     result = nl.ndarray((batch_size, mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     for batch_id in nl.affine_range(batch_size):
         for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-            result_blocks = nl.zeros(
+            result_block = nl.zeros(
                 (nl.par_dim(mm.TILE_M), mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 dtype=result.dtype,
                 buffer=nl.sbuf,
             )
-            max_vals = nl.zeros((nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=norm_dtype, buffer=nl.sbuf)
+            max_vals = nl.ndarray((nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=norm_dtype, buffer=nl.sbuf)
+            prev_max_vals = nl.ndarray(
+                (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=norm_dtype, buffer=nl.sbuf
+            )
             exp_sums = nl.zeros(max_vals.shape, dtype=max_vals.dtype, buffer=nl.sbuf)
             prev_exp_sums = nl.zeros(max_vals.shape, dtype=max_vals.dtype, buffer=nl.sbuf)
             for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
@@ -183,61 +187,181 @@ def online_softmax_linear_MKN(
                     ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
                     load_shape=(mm.TILE_M, mm.TILES_IN_BLOCK_M, 1, mm.BLOCK_K),
                 )
-                prev_exp_sums[...] = nl.copy(exp_sums[...], dtype=exp_sums.dtype)
-                update_max_vals(lhs_block, max_vals)
-                # update_exp_sums(lhs_block, exp_sums)
-                # # calculate_rms_factors(rms_factors, square_sums, scale=1 / mm.K, eps=eps)
+                block_max_vals = nl.ndarray(
+                    (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=lhs_block.dtype, buffer=nl.sbuf
+                )
+                exp_block = nl.ndarray(
+                    (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1, mm.BLOCK_K), dtype=lhs_block.dtype, buffer=nl.sbuf
+                )
+                sum_exp_block = nl.ndarray(
+                    (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=lhs_block.dtype, buffer=nl.sbuf
+                )
+                scaling_factors = nl.ndarray(
+                    (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=max_vals.dtype, buffer=nl.sbuf
+                )
+                compute_max_vals(input_tile=lhs_block, tile_max_vals=block_max_vals)
+                if block_id_K == 0:
+                    max_vals[...] = nl.copy(block_max_vals[...], dtype=block_max_vals.dtype)
+                else:
+                    max_vals[...] = nl.maximum(prev_max_vals, block_max_vals)
+                    compute_scaling_factors(max_vals, prev_max_vals, scaling_factors)
+                compute_safe_exp(lhs_block, exp_block, max_vals)
+                compute_sum_exp(exp_block, sum_exp_block)
+                if block_id_K == 0:
+                    exp_sums[...] = nl.copy(sum_exp_block[...], dtype=sum_exp_block.dtype)
+                else:
+                    update_exp_sums(prev_exp_sums, exp_sums, scaling_factors, sum_exp_block)
                 # if block_id_K > 0:
-                #     scale_prev_results(result_blocks, rms_factors, prev_rms_factors)
-                # scale_lhs(lhs_block, rms_factors)
-                # transpose_tiles_in_block(lhs_block)
-                # for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-                #     rhs_block = load_tensor_block(
-                #         input_tensor=rhs,
-                #         ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
-                #         load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
-                #     )
-                #     matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_blocks, block_id_N)
+                #     scale_prev_results(result_block, scaling_factors, max_vals, prev_max_vals)
+                # scale_lhs(exp_block, exp_sums)
+                transpose_tiles_in_block(exp_block)
+                for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
+                    rhs_block = load_tensor_block(
+                        input_tensor=rhs,
+                        ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
+                        load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
+                    )
+                    matmul_blocks_tile_transposed_lhs(exp_block, rhs_block, result_block, block_id_N)
 
-            save_result_dma(result[batch_id], result_blocks, block_id_M)
+                # Update previous values
+                prev_max_vals[...] = nl.copy(max_vals[...], dtype=max_vals.dtype)
+                prev_exp_sums[...] = nl.copy(exp_sums[...], dtype=exp_sums.dtype)
+
+            save_result_dma(result[batch_id], result_block, block_id_M)
 
     return result
 
 
-def update_max_vals(lhs, max_vals):
-    """
-    Update the max values for the lhs_block
-    Args:
-        lhs_block: 3D input tensor tile (TILE_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_K, TILE_K)
-        max_vals: 3D tensor to store the max values
-    """
-    TILE_M, TILES_IN_M, unity, K = lhs.shape
+def compute_safe_exp(input_tile, exp_tile, max_vals):
+    TILE_M, TILES_IN_M, unity, K = input_tile.shape
     assert unity == 1
+    assert exp_tile.shape == input_tile.shape
     assert max_vals.shape == (TILE_M, TILES_IN_M, 1)
-    i_lhs = nl.mgrid[0:TILE_M, 0:K]
+    i_input = nl.mgrid[0:TILE_M, 0:K]
     i_max_vals = nl.mgrid[0:TILE_M, 0:1]
-    acc_dtype = lhs.dtype  # FIXME
     for tile_id_M in nl.affine_range(TILES_IN_M):
-        max_vals[i_max_vals.p, tile_id_M, i_max_vals.x] = nisa.tensor_reduce(
-            op=nl.maximum, data=lhs[i_lhs.p, tile_id_M, 0, i_lhs.x], axis=(1,), dtype=acc_dtype, negate=False
+        exp_tile[i_input.p, tile_id_M, 0, i_input.x] = nisa.activation(
+            op=np.exp,
+            data=input_tile[i_input.p, tile_id_M, 0, i_input.x],
+            bias=-1 * max_vals[i_max_vals.p, tile_id_M, i_max_vals.x],
+            dtype=input_tile.dtype,
         )
 
 
-def update_exp_sums(lhs, square_sums):
+def compute_max_vals(input_tile, tile_max_vals):
     """
-    Update the exp sums for the lhs_block
+    Update the max values for the input_tile
     Args:
-        lhs_block: 3D input tensor tile (TILE_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_K, TILE_K)
-        square_sums: 3D tensor to store the square sums
+        input_tile: 4D input tensor tile (TILE_M, TILES_IN_BLOCK_M, 1, BLOCK_K)
+        tile_max_vals: 3D input tensor tile (TILE_M, TILES_IN_BLOCK_M, 1)
     """
-    TILE_M, TILES_IN_M, unity, K = lhs.shape
+    TILE_M, TILES_IN_M, unity, K = input_tile.shape
     assert unity == 1
-    assert square_sums.shape == (TILE_M, TILES_IN_M, 1)
-    i_lhs = nl.mgrid[0:TILE_M, 0:K]
-    i_square_sums = nl.mgrid[0:TILE_M, 0:1]
+    assert tile_max_vals.shape == (TILE_M, TILES_IN_M, 1)
+    i_input = nl.mgrid[0:TILE_M, 0:K]
+    i_max_vals = nl.mgrid[0:TILE_M, 0:1]
     for tile_id_M in nl.affine_range(TILES_IN_M):
-        tmp_square_sums = nl.ndarray((nl.par_dim(TILE_M), 1), dtype=square_sums.dtype, buffer=nl.sbuf)
-        nisa.activation_reduce(
-            op=nl.square, data=lhs[i_lhs.p, tile_id_M, 0, i_lhs.x], reduce_op=np.add, reduce_res=tmp_square_sums[...]
+        tile_max_vals[i_max_vals.p, tile_id_M, i_max_vals.x] = nisa.tensor_reduce(
+            op=np.max,
+            data=input_tile[i_input.p, tile_id_M, 0, i_input.x],
+            axis=(1,),
+            dtype=input_tile.dtype,
+            negate=False,
         )
-        square_sums[i_square_sums.p, tile_id_M, i_square_sums.x] += tmp_square_sums[...]
+
+
+def compute_scaling_factors(max_vals, prev_max_vals, scaling_factors):
+    TILE_M, TILES_IN_M, unity = max_vals.shape
+    assert unity == 1
+    assert prev_max_vals.shape == max_vals.shape
+    assert scaling_factors.shape == max_vals.shape
+    i_max_vals = nl.mgrid[0:TILE_M, 0:1]
+    for tile_id_M in nl.affine_range(TILES_IN_M):
+        scaling_factors[i_max_vals.p, tile_id_M, i_max_vals.x] = nisa.activation(
+            op=np.exp,
+            data=max_vals[i_max_vals.p, tile_id_M, i_max_vals.x],
+            bias=prev_max_vals[i_max_vals.p, tile_id_M, i_max_vals.x],
+            dtype=max_vals.dtype,
+            scale=-1.0,
+        )
+
+
+def compute_sum_exp(exp_block, sum_exp_block):
+    TILE_M, TILES_IN_M, unity, K = exp_block.shape
+    assert unity == 1
+    assert sum_exp_block.shape == (TILE_M, TILES_IN_M, 1)
+    i_exp_block = nl.mgrid[0:TILE_M, 0:K]
+    i_sum_exp_block = nl.mgrid[0:TILE_M, 0:1]
+    for tile_id_M in nl.affine_range(TILES_IN_M):
+        sum_exp_block[i_sum_exp_block.p, tile_id_M, i_sum_exp_block.x] = nisa.tensor_reduce(
+            op=np.add,
+            data=exp_block[i_exp_block.p, tile_id_M, 0, i_exp_block.x],
+            axis=(1,),
+            dtype=exp_block.dtype,
+            negate=False,
+        )
+
+
+def update_exp_sums(prev_exp_sums, exp_sums, scaling_factors, curr_block_exp_sums):
+    """
+    Update the exp sums
+    """
+    TILE_M, TILES_IN_M, unity = prev_exp_sums.shape
+    assert unity == 1
+    assert exp_sums.shape == prev_exp_sums.shape
+    assert scaling_factors.shape == prev_exp_sums.shape
+    assert curr_block_exp_sums.shape == prev_exp_sums.shape
+    i_exp_sums = nl.mgrid[0:TILE_M, 0:1]
+    for tile_id_M in nl.affine_range(TILES_IN_M):
+        exp_sums[i_exp_sums.p, tile_id_M, i_exp_sums.x] = nisa.activation(
+            op=np.copy,
+            data=prev_exp_sums[i_exp_sums.p, tile_id_M, i_exp_sums.x],
+            bias=curr_block_exp_sums[i_exp_sums.p, tile_id_M, i_exp_sums.x],
+            scale=scaling_factors[i_exp_sums.p, tile_id_M, i_exp_sums.x],
+        )
+
+
+def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks, block_id_N):
+    """
+    Accumulate matmul result tiles between lhs and rhs into result_block
+    LHS is transposed at the tile level.
+    Note that this is not the same as lhsT.
+    'matmul_block' module computes lhsT @ rhs.
+
+    Args:
+    tileT_lhs_block: TILE_M, TILE_K, TILES_IN_M, TILES_IN_K
+    rhs_block: TILE_K, TILE_N, TILES_IN_K, TILES_IN_N
+    result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
+    """
+    TILE_M, TILES_IN_BLOCK_M, unity, BLOCK_K = tileT_lhs_block.shape
+    TILE_K, TILES_IN_BLOCK_K, TILES_IN_BLOCK_N, TILE_N = rhs_block.shape
+    _TILE_M, NUM_BLOCK_N, _TILES_IN_BLOCK_M, _TILES_IN_BLOCK_N, _TILE_N = result_blocks.shape
+    assert unity == 1
+    assert (
+        TILE_K * TILES_IN_BLOCK_K == BLOCK_K
+    ), f"K dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. rhs_block {rhs_block.shape}."
+    assert (
+        TILE_M == _TILE_M and TILES_IN_BLOCK_M == _TILES_IN_BLOCK_M
+    ), f"LHS and result shape mismatch: tileT_lhs_block {tileT_lhs_block.shape}. result_blocks {result_blocks.shape}."
+    assert (
+        TILE_N == _TILE_N and TILES_IN_BLOCK_N == _TILES_IN_BLOCK_N
+    ), f"RHS and result shape mismatch: rhs_block {rhs_block.shape}. result_blocks {result_blocks.shape}."
+
+    idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
+    idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
+    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
+            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            """
+            Use PSUM buffer to accumulate into a single hardware tile
+            """
+            for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
+                k_ofs = tile_id_K * TILE_K
+                result_tile += nisa.nc_matmul(
+                    tileT_lhs_block[idx_lhs.p, tile_id_M, 0, k_ofs + idx_lhs.x],
+                    rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x],
+                )
+            result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] = nl.add(
+                result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x], result_tile[idx_res.p, idx_res.x]
+            )
