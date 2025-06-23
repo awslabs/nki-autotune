@@ -483,9 +483,8 @@ def scale_lhs(lhs, rms_factors):
 
 def scale_prev_results(result_blocks, rms_factors, prev_rms_factors):
     TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N = result_blocks.shape
-    _TILE_M, _TILES_IN_BLOCK_M, unity = rms_factors.shape
+    assert rms_factors.shape == (TILE_M, TILES_IN_BLOCK_M, 1)
     assert prev_rms_factors.shape == rms_factors.shape
-    assert unity == 1
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     i_rms = nl.mgrid[0:TILE_M, 0:1]
     tmp_scaling_factors = nl.ndarray((nl.par_dim(TILE_M), TILES_IN_BLOCK_M, 1), dtype=rms_factors.dtype, buffer=nl.sbuf)
