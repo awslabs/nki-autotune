@@ -211,9 +211,9 @@ def online_softmax_linear_MKN(
                     exp_sums[...] = nl.copy(sum_exp_block[...], dtype=sum_exp_block.dtype)
                 else:
                     update_exp_sums(prev_exp_sums, exp_sums, scaling_factors, sum_exp_block)
-                # if block_id_K > 0:
-                #     scale_prev_results(result_block, scaling_factors, max_vals, prev_max_vals)
-                # scale_lhs(exp_block, exp_sums)
+                if block_id_K > 0:
+                    scale_prev_results(result_block, scaling_factors, exp_sums, prev_exp_sums)
+                scale_lhs(exp_block, exp_sums)
                 transpose_tiles_in_block(exp_block)
                 for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
                     rhs_block = load_tensor_block(
@@ -230,6 +230,47 @@ def online_softmax_linear_MKN(
             save_result_dma(result[batch_id], result_block, block_id_M)
 
     return result
+
+
+def scale_lhs(lhs, scaling_factors):
+    TILE_M, TILES_IN_BLOCK_M, unity, BLOCK_K = lhs.shape
+    assert unity == 1
+    assert scaling_factors.shape == lhs.shape[:-1], f"scaling_factors {scaling_factors.shape} lhs {lhs.shape}"
+    i_lhs = nl.mgrid[0:TILE_M, 0:BLOCK_K]
+    idx_scaling_factors = nl.mgrid[0:TILE_M, 0:1]
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        lhs[i_lhs.p, tile_id_M, 0, i_lhs.x] = nl.divide(
+            lhs[i_lhs.p, tile_id_M, 0, i_lhs.x],
+            scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
+        )
+
+
+def scale_prev_results(result_block, scaling_factors, exp_sums, prev_exp_sums):
+    TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N = result_block.shape
+    assert scaling_factors.shape == (TILE_M, TILES_IN_BLOCK_M, 1)
+    assert exp_sums.shape == (TILE_M, TILES_IN_BLOCK_M, 1)
+    assert prev_exp_sums.shape == exp_sums.shape
+    idx_scaling_factors = nl.mgrid[0:TILE_M, 0:1]
+    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    tmp_scaling_factors = nl.ndarray(
+        (nl.par_dim(TILE_M), TILES_IN_BLOCK_M, 1), dtype=scaling_factors.dtype, buffer=nl.sbuf
+    )
+    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+        tmp_scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x] = nl.divide(
+            prev_exp_sums[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
+            exp_sums[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
+        )
+        tmp_scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x] = nl.multiply(
+            tmp_scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
+            scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
+        )
+    for block_id_N in nl.affine_range(NUM_BLOCK_N):
+        for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
+            for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
+                result_block[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] = nl.multiply(
+                    result_block[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x],
+                    tmp_scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
+                )
 
 
 def compute_safe_exp(input_tile, exp_tile, max_vals):

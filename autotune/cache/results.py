@@ -386,13 +386,16 @@ class ProfileResults:
 
 
 def get_best_result(data: Dict):
+    # Filter out results with an "error" attribute
+    valid_results = [result for result in data["results"] if not "error" in result]
+
     if not data["metadata"]["sort_key"]:
-        return data["results"][0]
+        return valid_results[0]
 
     sort_key = data["metadata"]["sort_key"]
     lower_is_better = data["metadata"]["lower_is_better"]
     return (
-        min(data["results"], key=lambda result: getattr(result, sort_key, float("inf")))
+        min(valid_results, key=lambda result: getattr(result, sort_key, float("inf")))
         if lower_is_better
-        else max(data["results"], key=lambda result: getattr(result, sort_key, float("-inf")))
+        else max(valid_results, key=lambda result: getattr(result, sort_key, float("-inf")))
     )
