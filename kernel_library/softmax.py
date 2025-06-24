@@ -63,14 +63,14 @@ def online_softmax_gemm_np(lhs, rhs):
         raise ValueError(f"Incompatible dimensions: lhs K dimension is {K} and rhs K dimension is {K_check}")
 
     # Hard-coded block sizes
-    TILES_IN_BLOCK_M = 1024
-    TILES_IN_BLOCK_N = 1024
-    TILES_IN_BLOCK_K = 1024
+    BLOCK_M = 1024
+    BLOCK_N = 1024
+    BLOCK_K = 1024
 
     # Calculate number of blocks in each dimension
-    NUM_BLOCK_M = math.ceil(M / TILES_IN_BLOCK_M)
-    NUM_BLOCK_N = math.ceil(N / TILES_IN_BLOCK_N)
-    NUM_BLOCK_K = math.ceil(K / TILES_IN_BLOCK_K)
+    NUM_BLOCK_M = math.ceil(M / BLOCK_M)
+    NUM_BLOCK_N = math.ceil(N / BLOCK_N)
+    NUM_BLOCK_K = math.ceil(K / BLOCK_K)
 
     # Initialize output matrix
     output = np.zeros((batch, M, N))
@@ -79,79 +79,73 @@ def online_softmax_gemm_np(lhs, rhs):
     for b in range(batch):
         # Process blocks of M dimension
         for block_m in range(NUM_BLOCK_M):
-            m_start = block_m * TILES_IN_BLOCK_M
-            m_end = min(M, (block_m + 1) * TILES_IN_BLOCK_M)
+            m_start = block_m * BLOCK_M
+            m_end = min(M, (block_m + 1) * BLOCK_M)
 
             # Process blocks of N dimension
             for block_n in range(NUM_BLOCK_N):
-                n_start = block_n * TILES_IN_BLOCK_N
-                n_end = min(N, (block_n + 1) * TILES_IN_BLOCK_N)
+                n_start = block_n * BLOCK_N
+                n_end = min(N, (block_n + 1) * BLOCK_N)
 
                 # Initialize state arrays for this M,N block
-                b_vals = np.zeros((TILES_IN_BLOCK_M, 1))  # normalization terms, shape (TILES_IN_BLOCK_M, 1)
-                o_vals = np.zeros((TILES_IN_BLOCK_M, TILES_IN_BLOCK_N))  # output values
+                a_vals = np.zeros((BLOCK_M, 1))
+                a_prev = np.zeros(a_vals.shape)
+                b_vals = np.zeros((BLOCK_M, 1))  # normalization terms, shape (BLOCK_M, 1)
+                b_prev = np.zeros(b_vals.shape)
+                o_vals = np.zeros((BLOCK_M, BLOCK_N))  # output values
 
                 # Process K dimension in blocks
                 for block_k in range(NUM_BLOCK_K):
-                    k_start = block_k * TILES_IN_BLOCK_K
-                    k_end = min(K, (block_k + 1) * TILES_IN_BLOCK_K)
+                    k_start = block_k * BLOCK_K
+                    k_end = min(K, (block_k + 1) * BLOCK_K)
 
                     # Extract the current K-block from inputs
-                    lhs_block = lhs[b, m_start:m_end, k_start:k_end]  # Shape: (TILES_IN_BLOCK_M, TILES_IN_BLOCK_K)
-                    rhs_block = rhs[k_start:k_end, n_start:n_end]  # Shape: (TILES_IN_BLOCK_K, TILES_IN_BLOCK_N)
+                    lhs_block = lhs[b, m_start:m_end, k_start:k_end]  # Shape: (BLOCK_M, BLOCK_K)
+                    rhs_block = rhs[k_start:k_end, n_start:n_end]  # Shape: (BLOCK_K, BLOCK_N)
+
+                    # Calculate row-wise max values for this K block
+                    block_max_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (BLOCK_M, 1)
 
                     if block_k == 0:
                         # Initialize a_vals for the first block
-                        a_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (TILES_IN_BLOCK_M, 1)
-
-                    # Store previous values
-                    a_prev = a_vals.copy()
-                    b_prev = b_vals.copy()
-
-                    # Calculate row-wise max values for this K block
-                    block_max_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (TILES_IN_BLOCK_M, 1)
+                        a_vals = block_max_vals  # Shape: (BLOCK_M, 1)
 
                     # Update global max for each row (m)
                     new_a_vals = np.maximum(a_vals, block_max_vals)
 
                     # Calculate scaling factor for the change in max values
-                    scale_factor = np.exp(a_vals - new_a_vals)  # Shape: (TILES_IN_BLOCK_M, 1)
+                    scale_factor = np.exp(a_vals - new_a_vals)  # Shape: (BLOCK_M, 1)
 
                     # Update a_vals
                     a_vals = new_a_vals
 
                     # Calculate exp(x - a) for all elements in the block
-                    exp_block = np.exp(lhs_block - a_vals)  # Shape: (TILES_IN_BLOCK_M, TILES_IN_BLOCK_K)
+                    exp_block = np.exp(lhs_block - a_vals)  # Shape: (BLOCK_M, BLOCK_K)
 
                     # Calculate sum of exp values for this block
-                    exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)  # Shape: (TILES_IN_BLOCK_M, 1)
+                    exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)  # Shape: (BLOCK_M, 1)
 
                     # Update b values (normalization term)
-                    is_first_block = a_prev == float("-inf")  # Mask for first valid block
-
-                    # For rows that have previous valid values
-                    b_vals = np.where(
-                        is_first_block,
-                        exp_sum_block,  # First valid block
-                        b_prev * scale_factor + exp_sum_block,  # Previous valid values exist
-                    )
-
                     # Scale previous output by the change in max and normalization factor
-                    valid_prev = ~is_first_block & (b_vals > 0)
-                    if np.any(valid_prev):
-                        # Only apply scaling where we have valid previous values
-                        rescale = np.where(valid_prev, scale_factor * (b_prev / b_vals), np.ones_like(scale_factor))
+                    if block_k == 0:
+                        b_vals = exp_sum_block
+                    else:
+                        b_vals = b_prev * scale_factor + exp_sum_block
+                        rescale = scale_factor * (b_prev / b_vals)
                         o_vals *= rescale
 
                     # Calculate contribution from this block
                     # Normalize exp_block by its sum for softmax weighting
-                    softmax_block = exp_block / b_vals  # Shape: (TILES_IN_BLOCK_M, TILES_IN_BLOCK_K)
+                    softmax_block = exp_block / b_vals  # Shape: (BLOCK_M, BLOCK_K)
 
                     # Calculate weighted contribution from this block
-                    contribution = np.matmul(softmax_block, rhs_block)  # Shape: (TILES_IN_BLOCK_M, TILES_IN_BLOCK_N)
+                    contribution = np.matmul(softmax_block, rhs_block)  # Shape: (BLOCK_M, BLOCK_N)
 
                     # Add contribution to output
                     o_vals = o_vals + contribution
+
+                    # Store previous values
+                    b_prev = b_vals.copy()
 
                 # Store results
                 output[b, m_start:m_end, n_start:n_end] = o_vals

@@ -1,3 +1,5 @@
+import os
+import sys
 from typing import Dict
 
 import neuronxcc.nki.language as nl
@@ -7,6 +9,7 @@ import pytest
 from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from autotune.core.generate_tests import GenTests
 from autotune.core.utils import GEMMCompatibility
 from kernel_library.rmsnorm_linear import (
