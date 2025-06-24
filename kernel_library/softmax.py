@@ -154,20 +154,11 @@ def online_softmax_gemm_np(lhs, rhs):
 
 def online_softmax_gemm_np_mkn(lhs, rhs):
     """
-    Implements the Online Softmax + GEMM algorithm with vectorized block processing
-    using MKN loop ordering.
-
-    Parameters:
-        lhs (numpy.ndarray): Left-hand side matrix of shape (batch, M, K)
-        rhs (numpy.ndarray): Right-hand side matrix of shape (K, N)
-
-    Returns:
-        numpy.ndarray: Result matrix of shape (batch, M, N)
+    Online Softmax + GEMM algorithm with vectorized block processing using MKN loop ordering.
     """
     batch, M, K = lhs.shape
     K_check, N = rhs.shape
 
-    # Check dimensions
     if K != K_check:
         raise ValueError(f"Incompatible dimensions: lhs K dimension is {K} and rhs K dimension is {K_check}")
 
@@ -193,11 +184,11 @@ def online_softmax_gemm_np_mkn(lhs, rhs):
             m_size = m_end - m_start
 
             # Initialize state arrays for the entire M block
-            a_vals = np.zeros((m_size, NUM_BLOCK_N, 1))  # Track max values for each M,N block
-            a_prev = np.zeros((m_size, NUM_BLOCK_N, 1))  # Previous max values
-            b_vals = np.zeros((m_size, NUM_BLOCK_N, 1))  # Track normalization terms
-            b_prev = np.zeros((m_size, NUM_BLOCK_N, 1))  # Previous normalization terms
-            outputs = np.zeros((m_size, N))  # Collect outputs for this M block
+            a_vals = np.zeros((m_size, 1))  # Current max values
+            a_prev = np.zeros((m_size, 1))  # Previous max values
+            b_vals = np.zeros((m_size, 1))  # Current normalization terms
+            b_prev = np.zeros((m_size, 1))  # Previous normalization terms
+            outputs = np.zeros((m_size, N))  # Collect outputs for all N
 
             # Process K dimension in blocks
             for block_k in range(NUM_BLOCK_K):
@@ -207,7 +198,40 @@ def online_softmax_gemm_np_mkn(lhs, rhs):
                 # Extract current K block for all M rows in this block
                 lhs_block = lhs[b, m_start:m_end, k_start:k_end]  # Shape: (m_size, BLOCK_K)
 
-                # For each N block, update the state and compute contributions
+                # Calculate block max values once for all N
+                block_max_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
+
+                if block_k == 0:
+                    # For first K block, simply set the values directly
+                    a_vals = block_max_vals
+                else:
+                    # For subsequent blocks, update max and calculate scaling
+                    a_vals = np.maximum(a_prev, block_max_vals)
+
+                # Calculate exp(x - a) for all elements in the block
+                exp_block = np.exp(lhs_block - a_vals)  # Shape: (m_size, BLOCK_K)
+                # Calculate sum of exp values for this block
+                exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
+
+                if block_k == 0:
+                    b_vals = exp_sum_block
+                else:
+                    # Calculate scaling factor for the change in max values
+                    scale_factor = np.exp(a_prev - a_vals)  # Shape: (m_size, 1)
+
+                    # Update b values (normalization term)
+                    b_vals = b_prev * scale_factor + exp_sum_block
+
+                    # Calculate global rescale factor to be applied to all N blocks
+                    global_rescale = scale_factor * (b_prev / b_vals)
+
+                    # Apply rescaling to existing outputs (for all N blocks at once)
+                    outputs *= global_rescale
+
+                # Normalize exp_block for softmax weighting
+                softmax_block = exp_block / b_vals
+
+                # Process each N block with the pre-calculated softmax weights
                 for block_n in range(NUM_BLOCK_N):
                     n_start = block_n * BLOCK_N
                     n_end = min(N, (block_n + 1) * BLOCK_N)
@@ -215,46 +239,13 @@ def online_softmax_gemm_np_mkn(lhs, rhs):
                     # Extract current N block for this K block
                     rhs_block = rhs[k_start:k_end, n_start:n_end]  # Shape: (BLOCK_K, n_size)
 
-                    # Find max values in current lhs_block
-                    block_max_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
-
-                    if block_k == 0:
-                        # Initialize a_vals for the first block
-                        a_vals[:, block_n] = block_max_vals
-                    else:
-                        # Update global max for each row (m)
-                        a_vals[:, block_n] = np.maximum(a_prev[:, block_n], block_max_vals)
-
-                        # Calculate scaling factor for the change in max values
-                        scale_factor = np.exp(a_prev[:, block_n] - a_vals[:, block_n])  # Shape: (m_size, 1)
-
-                    # Calculate exp(x - a) for all elements in the block
-                    exp_block = np.exp(lhs_block - a_vals[:, block_n])  # Shape: (m_size, BLOCK_K)
-
-                    # Calculate sum of exp values for this block
-                    exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
-
-                    # Update b values (normalization term)
-                    if block_k == 0:
-                        b_vals[:, block_n] = exp_sum_block
-                    else:
-                        b_vals[:, block_n] = b_prev[:, block_n] * scale_factor + exp_sum_block
-                        rescale = scale_factor * (b_prev[:, block_n] / b_vals[:, block_n])
-                        outputs[:, n_start:n_end] *= rescale
-
-                    # Calculate contribution from this block
-                    # Normalize exp_block by its sum for softmax weighting
-                    softmax_block = exp_block / b_vals[:, block_n]  # Shape: (m_size, BLOCK_K)
-
-                    # Calculate weighted contribution from this block
-                    contribution = np.matmul(softmax_block, rhs_block)  # Shape: (m_size, n_size)
-
-                    # Add contribution to output
+                    # Calculate contribution and add to outputs
+                    contribution = np.matmul(softmax_block, rhs_block)
                     outputs[:, n_start:n_end] += contribution
 
-                    # Store previous values
-                    b_prev[:, block_n] = b_vals[:, block_n].copy()
-                    a_prev[:, block_n] = a_vals[:, block_n].copy()
+                # Store current values as previous for next iteration
+                a_prev[:] = a_vals
+                b_prev[:] = b_vals
 
             # Store final results for this M block
             output[b, m_start:m_end, :] = outputs
