@@ -152,6 +152,115 @@ def online_softmax_gemm_np(lhs, rhs):
     return output
 
 
+def online_softmax_gemm_np_mkn(lhs, rhs):
+    """
+    Implements the Online Softmax + GEMM algorithm with vectorized block processing
+    using MKN loop ordering.
+
+    Parameters:
+        lhs (numpy.ndarray): Left-hand side matrix of shape (batch, M, K)
+        rhs (numpy.ndarray): Right-hand side matrix of shape (K, N)
+
+    Returns:
+        numpy.ndarray: Result matrix of shape (batch, M, N)
+    """
+    batch, M, K = lhs.shape
+    K_check, N = rhs.shape
+
+    # Check dimensions
+    if K != K_check:
+        raise ValueError(f"Incompatible dimensions: lhs K dimension is {K} and rhs K dimension is {K_check}")
+
+    # Hard-coded block sizes
+    BLOCK_M = 1024
+    BLOCK_N = 1024
+    BLOCK_K = 1024
+
+    # Calculate number of blocks in each dimension
+    NUM_BLOCK_M = math.ceil(M / BLOCK_M)
+    NUM_BLOCK_N = math.ceil(N / BLOCK_N)
+    NUM_BLOCK_K = math.ceil(K / BLOCK_K)
+
+    # Initialize output matrix
+    output = np.zeros((batch, M, N))
+
+    # Process each batch
+    for b in range(batch):
+        # Process blocks of M dimension
+        for block_m in range(NUM_BLOCK_M):
+            m_start = block_m * BLOCK_M
+            m_end = min(M, (block_m + 1) * BLOCK_M)
+            m_size = m_end - m_start
+
+            # Initialize state arrays for the entire M block
+            a_vals = np.full((m_size, NUM_BLOCK_N, 1), -np.inf)  # Track max values for each M,N block
+            b_vals = np.zeros((m_size, NUM_BLOCK_N, 1))  # Track normalization terms
+            outputs = np.zeros((m_size, N))  # Collect outputs for this M block
+
+            # Process K dimension in blocks
+            for block_k in range(NUM_BLOCK_K):
+                k_start = block_k * BLOCK_K
+                k_end = min(K, (block_k + 1) * BLOCK_K)
+
+                # Extract current K block for all M rows in this block
+                lhs_block = lhs[b, m_start:m_end, k_start:k_end]  # Shape: (m_size, BLOCK_K)
+
+                # For each N block, update the state and compute contributions
+                for block_n in range(NUM_BLOCK_N):
+                    n_start = block_n * BLOCK_N
+                    n_end = min(N, (block_n + 1) * BLOCK_N)
+                    n_size = n_end - n_start
+
+                    # Extract current N block for this K block
+                    rhs_block = rhs[k_start:k_end, n_start:n_end]  # Shape: (BLOCK_K, n_size)
+
+                    # Find max values in current lhs_block
+                    block_max_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
+
+                    # Update max values
+                    prev_a_vals = a_vals[:, block_n].copy()
+                    new_a_vals = np.maximum(prev_a_vals, block_max_vals)
+
+                    # Calculate scaling factor for previous values due to max change
+                    scale_factor = np.exp(prev_a_vals - new_a_vals)  # Shape: (m_size, 1)
+
+                    # Calculate exp(x - a) for this block
+                    exp_block = np.exp(lhs_block - new_a_vals)  # Shape: (m_size, BLOCK_K)
+
+                    # Sum of exp values for this block
+                    exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
+
+                    # Update normalization term
+                    prev_b_vals = b_vals[:, block_n].copy()
+                    if block_k == 0:
+                        new_b_vals = exp_sum_block
+                    else:
+                        new_b_vals = prev_b_vals * scale_factor + exp_sum_block
+
+                    # Compute softmax weights for this block
+                    softmax_block = exp_block / new_b_vals  # Shape: (m_size, BLOCK_K)
+
+                    # Compute contribution to output
+                    contribution = np.matmul(softmax_block, rhs_block)  # Shape: (m_size, n_size)
+
+                    # Scale previous outputs if max changed
+                    if block_k > 0:
+                        rescale = scale_factor * (prev_b_vals / new_b_vals)
+                        outputs[:, n_start:n_end] *= rescale
+
+                    # Add contribution to outputs
+                    outputs[:, n_start:n_end] += contribution
+
+                    # Update state arrays
+                    a_vals[:, block_n] = new_a_vals
+                    b_vals[:, block_n] = new_b_vals
+
+            # Store final results for this M block
+            output[b, m_start:m_end, :] = outputs
+
+    return output
+
+
 @nki.jit()
 def online_softmax_linear_MKN(
     lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int, norm_dtype=nl.float32
@@ -168,12 +277,10 @@ def online_softmax_linear_MKN(
                 dtype=result.dtype,
                 buffer=nl.sbuf,
             )
-            max_vals = nl.ndarray((nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=norm_dtype, buffer=nl.sbuf)
-            prev_max_vals = nl.ndarray(
-                (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=norm_dtype, buffer=nl.sbuf
-            )
-            exp_sums = nl.zeros(max_vals.shape, dtype=max_vals.dtype, buffer=nl.sbuf)
-            prev_exp_sums = nl.zeros(max_vals.shape, dtype=max_vals.dtype, buffer=nl.sbuf)
+            a_vals = nl.ndarray((nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=norm_dtype, buffer=nl.sbuf)
+            a_prev = nl.ndarray((nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=norm_dtype, buffer=nl.sbuf)
+            b_vals = nl.zeros(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
+            b_prev = nl.zeros(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
             for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
                 lhs_block = load_tensor_block(
                     input_tensor=lhs[batch_id],
@@ -190,23 +297,23 @@ def online_softmax_linear_MKN(
                     (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=lhs_block.dtype, buffer=nl.sbuf
                 )
                 scaling_factors = nl.ndarray(
-                    (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=max_vals.dtype, buffer=nl.sbuf
+                    (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=a_vals.dtype, buffer=nl.sbuf
                 )
                 compute_max_vals(input_tile=lhs_block, tile_max_vals=block_max_vals)
                 if block_id_K == 0:
-                    max_vals[...] = nl.copy(block_max_vals[...], dtype=block_max_vals.dtype)
+                    a_vals[...] = nl.copy(block_max_vals[...], dtype=block_max_vals.dtype)
                 else:
-                    max_vals[...] = nl.maximum(prev_max_vals, block_max_vals)
-                    compute_scaling_factors(max_vals, prev_max_vals, scaling_factors)
-                compute_safe_exp(lhs_block, exp_block, max_vals)
+                    a_vals[...] = nl.maximum(a_prev, block_max_vals)
+                    compute_scaling_factors(a_vals, a_prev, scaling_factors)
+                compute_safe_exp(lhs_block, exp_block, a_vals)
                 compute_sum_exp(exp_block, sum_exp_block)
                 if block_id_K == 0:
-                    exp_sums[...] = nl.copy(sum_exp_block[...], dtype=sum_exp_block.dtype)
+                    b_vals[...] = nl.copy(sum_exp_block[...], dtype=sum_exp_block.dtype)
                 else:
-                    update_exp_sums(prev_exp_sums, exp_sums, scaling_factors, sum_exp_block)
+                    update_exp_sums(b_prev, b_vals, scaling_factors, sum_exp_block)
                 if block_id_K > 0:
-                    scale_prev_results(result_block, scaling_factors, exp_sums, prev_exp_sums)
-                scale_lhs(exp_block, exp_sums)
+                    scale_prev_results(result_block, scaling_factors, b_vals, b_prev)
+                scale_lhs(exp_block, b_vals)
                 transpose_tiles_in_block(exp_block)
                 for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
                     rhs_block = load_tensor_block(
@@ -217,8 +324,8 @@ def online_softmax_linear_MKN(
                     matmul_blocks_tile_transposed_lhs(exp_block, rhs_block, result_block, block_id_N)
 
                 # Update previous values
-                prev_max_vals[...] = nl.copy(max_vals[...], dtype=max_vals.dtype)
-                prev_exp_sums[...] = nl.copy(exp_sums[...], dtype=exp_sums.dtype)
+                a_prev[...] = nl.copy(a_vals[...], dtype=a_vals.dtype)
+                b_prev[...] = nl.copy(b_vals[...], dtype=b_vals.dtype)
 
             save_result_dma(result[batch_id], result_block, block_id_M)
 

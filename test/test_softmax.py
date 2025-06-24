@@ -9,7 +9,7 @@ from autotune.core.generate_tests import GenTests
 from autotune.core.utils import GEMMCompatibility
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kernel_library.softmax import online_softmax_gemm_np, softmax_gemm_np
+from kernel_library.softmax import online_softmax_gemm_np, online_softmax_gemm_np_mkn, softmax_gemm_np
 
 
 class SoftmaxGemmTestConfig(GenTests):
@@ -41,4 +41,10 @@ def test_softmax_gemm_np_numerical(batch: int, M: int, N: int, K: int):
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     golden = softmax_gemm_np(lhs, rhs)
     online_np = online_softmax_gemm_np(lhs, rhs)
-    np.testing.assert_allclose(actual=online_np, desired=golden, atol=1e-5, rtol=1e-5, err_msg="", verbose=True)
+    online_np_mkn = online_softmax_gemm_np_mkn(lhs, rhs)
+    np.testing.assert_allclose(
+        actual=online_np, desired=golden, atol=1e-5, rtol=1e-5, err_msg="online_np", verbose=True
+    )
+    np.testing.assert_allclose(
+        actual=online_np_mkn, desired=golden, atol=1e-5, rtol=1e-5, err_msg="online_np_mkn", verbose=True
+    )
