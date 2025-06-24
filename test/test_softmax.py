@@ -1,3 +1,5 @@
+import os
+import sys
 from typing import Dict
 
 import numpy as np
@@ -5,6 +7,8 @@ import pytest
 
 from autotune.core.generate_tests import GenTests
 from autotune.core.utils import GEMMCompatibility
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kernel_library.softmax import online_softmax_gemm_np, softmax_gemm_np
 
 
