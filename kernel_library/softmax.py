@@ -109,15 +109,13 @@ def online_softmax_gemm_np(lhs, rhs):
                     if block_k == 0:
                         # Initialize a_vals for the first block
                         a_vals = block_max_vals  # Shape: (BLOCK_M, 1)
+                    else:
 
-                    # Update global max for each row (m)
-                    new_a_vals = np.maximum(a_vals, block_max_vals)
+                        # Update global max for each row (m)
+                        a_vals = np.maximum(a_prev, block_max_vals)
 
-                    # Calculate scaling factor for the change in max values
-                    scale_factor = np.exp(a_vals - new_a_vals)  # Shape: (BLOCK_M, 1)
-
-                    # Update a_vals
-                    a_vals = new_a_vals
+                        # Calculate scaling factor for the change in max values
+                        scale_factor = np.exp(a_prev - a_vals)  # Shape: (BLOCK_M, 1)
 
                     # Calculate exp(x - a) for all elements in the block
                     exp_block = np.exp(lhs_block - a_vals)  # Shape: (BLOCK_M, BLOCK_K)
@@ -146,6 +144,7 @@ def online_softmax_gemm_np(lhs, rhs):
 
                     # Store previous values
                     b_prev = b_vals.copy()
+                    a_prev = a_vals.copy()
 
                 # Store results
                 output[b, m_start:m_end, n_start:n_end] = o_vals
