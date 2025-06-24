@@ -193,8 +193,10 @@ def online_softmax_gemm_np_mkn(lhs, rhs):
             m_size = m_end - m_start
 
             # Initialize state arrays for the entire M block
-            a_vals = np.full((m_size, NUM_BLOCK_N, 1), -np.inf)  # Track max values for each M,N block
+            a_vals = np.zeros((m_size, NUM_BLOCK_N, 1))  # Track max values for each M,N block
+            a_prev = np.zeros((m_size, NUM_BLOCK_N, 1))  # Previous max values
             b_vals = np.zeros((m_size, NUM_BLOCK_N, 1))  # Track normalization terms
+            b_prev = np.zeros((m_size, NUM_BLOCK_N, 1))  # Previous normalization terms
             outputs = np.zeros((m_size, N))  # Collect outputs for this M block
 
             # Process K dimension in blocks
@@ -209,7 +211,6 @@ def online_softmax_gemm_np_mkn(lhs, rhs):
                 for block_n in range(NUM_BLOCK_N):
                     n_start = block_n * BLOCK_N
                     n_end = min(N, (block_n + 1) * BLOCK_N)
-                    n_size = n_end - n_start
 
                     # Extract current N block for this K block
                     rhs_block = rhs[k_start:k_end, n_start:n_end]  # Shape: (BLOCK_K, n_size)
@@ -217,43 +218,43 @@ def online_softmax_gemm_np_mkn(lhs, rhs):
                     # Find max values in current lhs_block
                     block_max_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
 
-                    # Update max values
-                    prev_a_vals = a_vals[:, block_n].copy()
-                    new_a_vals = np.maximum(prev_a_vals, block_max_vals)
+                    if block_k == 0:
+                        # Initialize a_vals for the first block
+                        a_vals[:, block_n] = block_max_vals
+                    else:
+                        # Update global max for each row (m)
+                        a_vals[:, block_n] = np.maximum(a_prev[:, block_n], block_max_vals)
 
-                    # Calculate scaling factor for previous values due to max change
-                    scale_factor = np.exp(prev_a_vals - new_a_vals)  # Shape: (m_size, 1)
+                        # Calculate scaling factor for the change in max values
+                        scale_factor = np.exp(a_prev[:, block_n] - a_vals[:, block_n])  # Shape: (m_size, 1)
 
-                    # Calculate exp(x - a) for this block
-                    exp_block = np.exp(lhs_block - new_a_vals)  # Shape: (m_size, BLOCK_K)
+                    # Calculate exp(x - a) for all elements in the block
+                    exp_block = np.exp(lhs_block - a_vals[:, block_n])  # Shape: (m_size, BLOCK_K)
 
-                    # Sum of exp values for this block
+                    # Calculate sum of exp values for this block
                     exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
 
-                    # Update normalization term
-                    prev_b_vals = b_vals[:, block_n].copy()
+                    # Update b values (normalization term)
                     if block_k == 0:
-                        new_b_vals = exp_sum_block
+                        b_vals[:, block_n] = exp_sum_block
                     else:
-                        new_b_vals = prev_b_vals * scale_factor + exp_sum_block
-
-                    # Compute softmax weights for this block
-                    softmax_block = exp_block / new_b_vals  # Shape: (m_size, BLOCK_K)
-
-                    # Compute contribution to output
-                    contribution = np.matmul(softmax_block, rhs_block)  # Shape: (m_size, n_size)
-
-                    # Scale previous outputs if max changed
-                    if block_k > 0:
-                        rescale = scale_factor * (prev_b_vals / new_b_vals)
+                        b_vals[:, block_n] = b_prev[:, block_n] * scale_factor + exp_sum_block
+                        rescale = scale_factor * (b_prev[:, block_n] / b_vals[:, block_n])
                         outputs[:, n_start:n_end] *= rescale
 
-                    # Add contribution to outputs
+                    # Calculate contribution from this block
+                    # Normalize exp_block by its sum for softmax weighting
+                    softmax_block = exp_block / b_vals[:, block_n]  # Shape: (m_size, BLOCK_K)
+
+                    # Calculate weighted contribution from this block
+                    contribution = np.matmul(softmax_block, rhs_block)  # Shape: (m_size, n_size)
+
+                    # Add contribution to output
                     outputs[:, n_start:n_end] += contribution
 
-                    # Update state arrays
-                    a_vals[:, block_n] = new_a_vals
-                    b_vals[:, block_n] = new_b_vals
+                    # Store previous values
+                    b_prev[:, block_n] = b_vals[:, block_n].copy()
+                    a_prev[:, block_n] = a_vals[:, block_n].copy()
 
             # Store final results for this M block
             output[b, m_start:m_end, :] = outputs
