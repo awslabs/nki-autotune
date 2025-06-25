@@ -47,6 +47,16 @@ class ProfileResult:
         else:
             return float("-inf")
 
+    @property
+    def main_metric_val(self) -> float:
+        if "error" in self.attributes:
+            if self.lower_is_better:
+                return float("inf")
+            else:
+                return float("-inf")
+        else:
+            return getattr(self, self.main_metric)
+
     def to_dict(self) -> Dict:
         """Convert to dictionary representation including only attributes in self.attributes."""
         result = {}
@@ -296,7 +306,7 @@ class ProfileResults:
             try:
                 sorted_results = sorted(
                     results,
-                    key=lambda result: getattr(result, self.sort_key),
+                    key=lambda result: result.main_metric_val,
                     reverse=not self.lower_is_better,  # Reverse sort if higher values are better
                 )
             except:
