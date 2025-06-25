@@ -2,7 +2,6 @@ import math
 
 import neuronxcc.nki.language as nl
 import numpy as np
-import torch
 
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSOR_DTYPE
 
@@ -13,65 +12,8 @@ def rmsnorm_correctness_postprocessing(
     kernel_output = nl.static_cast(kernel_output, np.float32)
 
     x, y = input_tensors
-    golden = rmsnorm_matmul(x, y, kernel_kwargs["eps"])
+    golden = rmsnorm_matmul_golden(x, y, kernel_kwargs["eps"])
     np.testing.assert_allclose(actual=kernel_output, desired=golden, atol=1e-3, rtol=1e-3, err_msg="", verbose=True)
-
-
-def rmsnorm_matmul(x: np.ndarray, weight: np.ndarray, eps: float = 1e-5) -> np.ndarray:
-    """
-    Computes RMSNorm + GEMM on CPU using input precision and returns results as float32.
-
-    Parameters:
-    -----------
-    x : np.ndarray
-        Input array of shape (batch_size, seq_len, hidden_dim) in float32 or bfloat16
-    weight : np.ndarray
-        Weight matrix of shape (hidden_dim, out_dim) in float32 or bfloat16
-    eps : float
-        Epsilon value for numerical stability
-
-    Returns:
-    --------
-    np.ndarray
-        Result of RMSNorm(x) @ weight converted to float32 NumPy array
-    """
-    # Determine if inputs are bfloat16
-    is_bfloat16 = str(x.dtype) == "bfloat16" or str(weight.dtype) == "bfloat16"
-
-    # Convert NumPy arrays to PyTorch tensors (on CPU)
-    if is_bfloat16:
-        # Convert bfloat16 to float32 then to tensor then back to bfloat16
-        x_float32 = x.astype(np.float32)
-        weight_float32 = weight.astype(np.float32)
-
-        # Fix the to() syntax by using correct keyword format
-        x_tensor = torch.from_numpy(x_float32).to(dtype=torch.bfloat16)
-        weight_tensor = torch.from_numpy(weight_float32).to(dtype=torch.bfloat16)
-    else:
-        # Already float32, direct conversion
-        x_tensor = torch.from_numpy(x.copy())
-        weight_tensor = torch.from_numpy(weight.copy())
-
-    # Square the input
-    z = torch.square(x_tensor)
-
-    # Compute mean across the last dimension
-    z = torch.div(z, x_tensor.shape[-1])
-    z_mean = torch.sum(z, dim=-1, keepdim=True)
-
-    # Add epsilon for numerical stability
-    z_mean = z_mean + eps
-
-    # Normalize x
-    x_normalized = x_tensor / torch.sqrt(z_mean)
-
-    # Matrix multiplication with weights
-    result = torch.matmul(x_normalized, weight_tensor)
-
-    # Convert result to NumPy float32
-    result_np = result.float().numpy()
-
-    return result_np
 
 
 def rmsnorm_matmul_golden(x, weight, eps: float):
