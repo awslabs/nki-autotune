@@ -245,8 +245,6 @@ class ProfileJobs:
                 # Only add to valid jobs if there was no error and the result indicates success
                 if not error and not result:
                     batch_valid_jobs.append(job)
-                # else:
-                #     raise Exception(result)
 
             # Use parallel_execute
             num_workers = min(len(sampled_job_ids), os.cpu_count() - 1)
@@ -263,34 +261,6 @@ class ProfileJobs:
             valid_jobs.extend(batch_valid_jobs[:remaining_num_samples])
             remaining_num_samples = num_samples - len(valid_jobs)
 
-            # # 2. Process the sampled batch in parallel
-            # futures = []
-            # with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            #     for job_id in sampled_job_ids:
-            #         job = self.jobs[job_id]
-            #         future = executor.submit(
-            #             run_with_args_and_kwargs, job.preprocessing, job.input_tensors, job.kernel_kwargs
-            #         )
-            #         futures.append((job_id, future))
-
-            # # Process results of this batch
-            # batch_valid_jobs: List[ProfileJob] = []
-            # for job_id, future in tqdm(
-            #     futures, total=len(futures), desc=f"Sampling valid jobs (need {remaining_num_samples} more)"
-            # ):
-            #     job = self.jobs[job_id]
-            #     try:
-            #         success = future.result()
-            #         if success:
-            #             batch_valid_jobs.append(job)
-            #     except Exception as e:
-            #         error_msg = capture_error_message(e)
-
-            #     processed_job_ids.add(job_id)
-
-            # # 3. Update remaining count
-            # valid_jobs.extend(batch_valid_jobs[:remaining_num_samples])
-            # remaining_num_samples = num_samples - len(valid_jobs)
         self.jobs = valid_jobs
 
     @property

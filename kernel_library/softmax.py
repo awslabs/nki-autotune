@@ -8,6 +8,8 @@ from neuronxcc.nki.typing import tensor
 
 from autotune.core.dma import load_tensor_block, save_result_dma
 from autotune.core.layout import transpose_tiles_in_block
+from autotune.core.reductions import compute_max_vals
+from autotune.core.scalar_ops import activation, scale_block
 from autotune.core.utils import GEMMCompatibility
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSOR_DTYPE
 
@@ -15,10 +17,16 @@ from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TEN
 def softmax_gemm_correctness_postprocessing(
     input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_output: OUTPUT_TENSOR_DTYPE
 ) -> None:
-    kernel_output = nl.static_cast(kernel_output, np.float32)
     lhs, rhs = input_tensors
     golden = softmax_gemm_np(lhs, rhs)
-    np.testing.assert_allclose(actual=kernel_output, desired=golden, atol=1e-3, rtol=1e-3, err_msg="", verbose=True)
+
+    kernel_output = nl.static_cast(kernel_output, np.float32)
+    # np.testing.assert_allclose(actual=kernel_output, desired=golden, atol=1e-3, rtol=1e-3, err_msg="", verbose=True)
+
+    online_golden = online_softmax_gemm_np_mkn(lhs, rhs)
+    np.testing.assert_allclose(
+        actual=kernel_output, desired=online_golden, atol=1e-3, rtol=1e-3, err_msg="", verbose=True
+    )
 
 
 def softmax_gemm_np(lhs, rhs):
@@ -269,7 +277,7 @@ def online_softmax_linear_MKN(
                 dtype=result.dtype,
                 buffer=nl.sbuf,
             )
-            a_vals = nl.ndarray((nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=norm_dtype, buffer=nl.sbuf)
+            a_vals = nl.ndarray((mm.TILE_M, mm.TILES_IN_BLOCK_M, 1, 1), dtype=norm_dtype, buffer=nl.sbuf)
             a_prev = nl.ndarray(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
             b_vals = nl.zeros(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
             b_prev = nl.zeros(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
@@ -279,24 +287,27 @@ def online_softmax_linear_MKN(
                     ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
                     load_shape=(mm.TILE_M, mm.TILES_IN_BLOCK_M, 1, mm.BLOCK_K),
                 )
-                exp_sum_block = nl.ndarray(
-                    (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, 1), dtype=lhs_block.dtype, buffer=nl.sbuf
-                )
                 block_max_vals = compute_max_vals(input_block=lhs_block)
+                scale_factor = nl.ndarray(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
                 if block_id_K == 0:
                     a_vals[...] = nl.copy(block_max_vals[...], dtype=block_max_vals.dtype)
                 else:
                     a_vals[...] = nl.maximum(a_prev, block_max_vals)
-                    scale_factor = compute_scale_factors(a_vals, a_prev)
+                    compute_scale_factors(scale_factor, a_vals, a_prev)
                 exp_block = compute_safe_exp(lhs_block, a_vals)
-                compute_sum_exp(exp_block, exp_sum_block)
+                exp_sum_block = nl.sum(x=exp_block, axis=[-1], keepdims=True)
                 if block_id_K == 0:
                     b_vals[...] = nl.copy(exp_sum_block[...], dtype=exp_sum_block.dtype)
                 else:
-                    update_exp_sums(b_prev, b_vals, scale_factor, exp_sum_block)
-                if block_id_K > 0:
+                    activation(
+                        out_block=b_vals,
+                        op=np.copy,
+                        data_block=b_prev,
+                        scale_block=scale_factor,
+                        bias_block=exp_sum_block,
+                    )
                     scale_prev_results(result_block, scale_factor, b_vals, b_prev)
-                scale_lhs(exp_block, b_vals)
+                scale_block(exp_block, b_vals, "divide")
                 transpose_tiles_in_block(exp_block)
                 for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
                     rhs_block = load_tensor_block(
@@ -315,44 +326,25 @@ def online_softmax_linear_MKN(
     return result
 
 
-def scale_lhs(lhs, scaling_factors):
-    TILE_M, TILES_IN_BLOCK_M, unity, BLOCK_K = lhs.shape
-    assert unity == 1
-    assert scaling_factors.shape == lhs.shape[:-1], f"scaling_factors {scaling_factors.shape} lhs {lhs.shape}"
-    i_lhs = nl.mgrid[0:TILE_M, 0:BLOCK_K]
-    idx_scaling_factors = nl.mgrid[0:TILE_M, 0:1]
-    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
-        lhs[i_lhs.p, tile_id_M, 0, i_lhs.x] = nl.divide(
-            lhs[i_lhs.p, tile_id_M, 0, i_lhs.x],
-            scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
-        )
-
-
 def scale_prev_results(result_block, scaling_factors, exp_sums, prev_exp_sums):
     TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N = result_block.shape
-    assert scaling_factors.shape == (TILE_M, TILES_IN_BLOCK_M, 1)
-    assert exp_sums.shape == (TILE_M, TILES_IN_BLOCK_M, 1)
-    assert prev_exp_sums.shape == exp_sums.shape
+    assert scaling_factors.shape == (TILE_M, TILES_IN_BLOCK_M, 1, 1)
+    assert exp_sums.shape == scaling_factors.shape
+    assert prev_exp_sums.shape == scaling_factors.shape
     idx_scaling_factors = nl.mgrid[0:TILE_M, 0:1]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    tmp_scaling_factors = nl.ndarray(
-        (nl.par_dim(TILE_M), TILES_IN_BLOCK_M, 1), dtype=scaling_factors.dtype, buffer=nl.sbuf
-    )
+    tmp_scaling_factors = nl.ndarray(scaling_factors.shape, dtype=scaling_factors.dtype, buffer=nl.sbuf)
     for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
-        tmp_scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x] = nl.divide(
-            prev_exp_sums[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
-            exp_sums[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
-        )
-        tmp_scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x] = nl.multiply(
-            tmp_scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
-            scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
-        )
+        coordinates = idx_scaling_factors.p, tile_id_M, 0, idx_scaling_factors.x
+        tmp_scaling_factors[coordinates] = nl.divide(prev_exp_sums[coordinates], exp_sums[coordinates])
+        tmp_scaling_factors[coordinates] = nl.multiply(tmp_scaling_factors[coordinates], scaling_factors[coordinates])
     for block_id_N in nl.affine_range(NUM_BLOCK_N):
         for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
             for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
-                result_block[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] = nl.multiply(
-                    result_block[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x],
-                    tmp_scaling_factors[idx_scaling_factors.p, tile_id_M, idx_scaling_factors.x],
+                scaling_factors_coordinates = idx_scaling_factors.p, tile_id_M, 0, idx_scaling_factors.x
+                result_coordinates = idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x
+                result_block[result_coordinates] = nl.multiply(
+                    result_block[result_coordinates], tmp_scaling_factors[scaling_factors_coordinates]
                 )
 
 
@@ -361,29 +353,27 @@ def compute_safe_exp(input_block, a_vals):
     exp_block = np.exp(input_block - a_vals)
 
     Args:
-        input_block (_type_): (par_size, *block_sizes, 1, bcast_size)
+        input_block (_type_): (par_size, *block_sizes, bcast_size)
         a_vals (_type_): (par_size, *block_sizes, 1)
     """
-    # FIXME: fix general safe exp calculation
-    assert len(input_block.shape) >= 3
-    assert a_vals.shape == input_block.shape[:-1]
+    assert a_vals.shape[:-1] == input_block.shape[:-1]
     exp_block = nl.ndarray(input_block.shape, dtype=input_block.dtype, buffer=nl.sbuf)
     par_size = input_block.shape[0]
     bcast_size = input_block.shape[-1]
-    free_size = input_block.shape[-2]
+    free_size = a_vals.shape[-1]
     assert free_size == 1
 
     i_input = nl.mgrid[0:par_size, 0:bcast_size]
     i_a_vals = nl.mgrid[0:par_size, 0:free_size]
 
+    block_sizes = input_block.shape[1:-1]
     num_blocks = 1
-    for dim in input_block.shape[1:-2]:
+    for dim in block_sizes:
         num_blocks *= dim
-
     for block_id in nl.affine_range(num_blocks):
         block_indices = []
         remaining = block_id
-        for dim in reversed(input_block.shape[1:-2]):
+        for dim in reversed(block_sizes):
             block_indices.insert(0, remaining % dim)
             remaining //= dim
         a_vals_coordinates = [i_a_vals.p] + block_indices + [i_a_vals.x]
@@ -397,47 +387,36 @@ def compute_safe_exp(input_block, a_vals):
     return exp_block
 
 
-def compute_max_vals(input_block):
+def compute_scale_factors(scale_factor, a_vals, a_prev):
     """
-    Get the max values for the input_block
+    Computes scale factors by applying exp(a_prev - a_vals) element-wise.
+
+    This function calculates scaling factors by applying the exponential function to
+    the difference between previous activation values and current activation values.
+    The computation is performed independently for each block in the multi-dimensional tensor.
+
     Args:
-        input_block: input block (tile_size, *block_sizes, free_size)
+        a_vals (nl.ndarray): Current activation values tensor with shape (par_size, *block_sizes, free_size).
+        a_prev (nl.ndarray): Previous activation values tensor with the same shape as a_vals.
 
     Returns:
-        block_max_vals: output block (tile_size, *block_sizes, 1)
+        nl.ndarray: Scale factors tensor with the same shape as inputs, containing
+                    exp(a_prev - a_vals) for each element.
+
+    Raises:
+        AssertionError: If a_vals and a_prev have different shapes.
+
+    Note:
+        This function processes the input tensors block by block, where blocks are determined
+        by the middle dimensions of the input tensors.
     """
-    block_max_vals = nl.ndarray(tuple(input_block.shape[:-1]) + (1,), dtype=input_block.dtype, buffer=nl.sbuf)
-    tile_size = input_block.shape[0]
-    free_size = input_block.shape[-1]
-    i_input = nl.mgrid[0:tile_size, 0:free_size]
-    i_max_vals = nl.mgrid[0:tile_size, 0:1]
-    num_blocks = 1
-    for dim in input_block.shape[1:-1]:
-        num_blocks *= dim
-    for block_id in nl.affine_range(num_blocks):
-        block_indices = []
-        remaining = block_id
-        for dim in reversed(input_block.shape[1:-1]):
-            block_indices.insert(0, remaining % dim)
-            remaining //= dim
-        max_vals_coordinates = [i_max_vals.p] + block_indices + [i_max_vals.x]
-        input_coordinates = [i_input.p] + block_indices + [i_input.x]
-        block_max_vals[tuple(max_vals_coordinates)] = nisa.tensor_reduce(
-            op=np.max, data=input_block[tuple(input_coordinates)], axis=(1,), dtype=input_block.dtype, negate=False
-        )
-    return block_max_vals
-
-
-def compute_scale_factors(a_vals, a_prev):
     assert a_vals.shape == a_prev.shape
-    scale_factor = nl.ndarray(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
-    tile_size = a_vals.shape[0]
+    par_size = a_vals.shape[0]
     free_size = a_vals.shape[-1]
-    assert free_size == 1
     num_blocks = 1
     for dim in a_vals.shape[1:-1]:
         num_blocks *= dim
-    i_a_vals = nl.mgrid[0:tile_size, 0:free_size]
+    i_a_vals = nl.mgrid[0:par_size, 0:free_size]
     for block_id in nl.affine_range(num_blocks):
         block_indices = []
         remaining = block_id
@@ -451,42 +430,6 @@ def compute_scale_factors(a_vals, a_prev):
             bias=a_prev[tuple(a_vals_coordinates)],
             dtype=a_vals.dtype,
             scale=-1.0,
-        )
-    return scale_factor
-
-
-def compute_sum_exp(exp_block, sum_exp_block):
-    TILE_M, TILES_IN_M, unity, K = exp_block.shape
-    assert unity == 1
-    assert sum_exp_block.shape == (TILE_M, TILES_IN_M, 1)
-    i_exp_block = nl.mgrid[0:TILE_M, 0:K]
-    i_sum_exp_block = nl.mgrid[0:TILE_M, 0:1]
-    for tile_id_M in nl.affine_range(TILES_IN_M):
-        sum_exp_block[i_sum_exp_block.p, tile_id_M, i_sum_exp_block.x] = nisa.tensor_reduce(
-            op=np.add,
-            data=exp_block[i_exp_block.p, tile_id_M, 0, i_exp_block.x],
-            axis=(1,),
-            dtype=exp_block.dtype,
-            negate=False,
-        )
-
-
-def update_exp_sums(prev_exp_sums, exp_sums, scaling_factors, curr_block_exp_sums):
-    """
-    Update the exp sums
-    """
-    TILE_M, TILES_IN_M, unity = prev_exp_sums.shape
-    assert unity == 1
-    assert exp_sums.shape == prev_exp_sums.shape
-    assert scaling_factors.shape == prev_exp_sums.shape
-    assert curr_block_exp_sums.shape == prev_exp_sums.shape
-    i_exp_sums = nl.mgrid[0:TILE_M, 0:1]
-    for tile_id_M in nl.affine_range(TILES_IN_M):
-        exp_sums[i_exp_sums.p, tile_id_M, i_exp_sums.x] = nisa.activation(
-            op=np.copy,
-            data=prev_exp_sums[i_exp_sums.p, tile_id_M, i_exp_sums.x],
-            bias=curr_block_exp_sums[i_exp_sums.p, tile_id_M, i_exp_sums.x],
-            scale=scaling_factors[i_exp_sums.p, tile_id_M, i_exp_sums.x],
         )
 
 
