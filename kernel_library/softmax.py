@@ -7,6 +7,7 @@ from neuronxcc import nki
 from neuronxcc.nki.typing import tensor
 
 from autotune.core.dma import load_tensor_block, save_result_dma
+from autotune.core.golden import lhs_rhs_gemm_np
 from autotune.core.layout import transpose_tiles_in_block
 from autotune.core.reductions import compute_max_vals
 from autotune.core.scalar_ops import activation, scale_block
@@ -25,8 +26,13 @@ def softmax_gemm_correctness_postprocessing(
 
     online_golden = online_softmax_gemm_np_mkn(lhs, rhs)
     np.testing.assert_allclose(
-        actual=kernel_output, desired=online_golden, atol=1e-3, rtol=1e-3, err_msg="", verbose=True
+        actual=kernel_output, desired=online_golden, atol=1e-5, rtol=1e-5, err_msg="", verbose=True
     )
+
+    gemm_golden = lhs_rhs_gemm_np(lhs, rhs)
+    # np.testing.assert_allclose(
+    #     actual=kernel_output, desired=gemm_golden, atol=1e-3, rtol=1e-3, err_msg="", verbose=True
+    # )
 
 
 def softmax_gemm_np(lhs, rhs):
@@ -160,7 +166,7 @@ def online_softmax_gemm_np(lhs, rhs):
     return output
 
 
-def online_softmax_gemm_np_mkn(lhs, rhs):
+def online_softmax_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int):
     """
     Online Softmax + GEMM algorithm with vectorized block processing using MKN loop ordering.
     """
@@ -170,15 +176,10 @@ def online_softmax_gemm_np_mkn(lhs, rhs):
     if K != K_check:
         raise ValueError(f"Incompatible dimensions: lhs K dimension is {K} and rhs K dimension is {K_check}")
 
-    # Hard-coded block sizes
-    BLOCK_M = 1024
-    BLOCK_N = 1024
-    BLOCK_K = 1024
-
-    # Calculate number of blocks in each dimension
-    NUM_BLOCK_M = math.ceil(M / BLOCK_M)
-    NUM_BLOCK_N = math.ceil(N / BLOCK_N)
-    NUM_BLOCK_K = math.ceil(K / BLOCK_K)
+    # Calculate block sizes in each dimension
+    BLOCK_M = M // NUM_BLOCK_M
+    BLOCK_N = N // NUM_BLOCK_N
+    BLOCK_K = K // NUM_BLOCK_K
 
     # Initialize output matrix
     output = np.zeros((batch, M, N))
@@ -215,8 +216,6 @@ def online_softmax_gemm_np_mkn(lhs, rhs):
                 else:
                     # For subsequent blocks, update max and calculate scaling
                     a_vals = np.maximum(a_prev, block_max_vals)
-
-                    # Calculate scaling factor for the change in max values
                     scale_factor = np.exp(a_prev - a_vals)  # Shape: (m_size, 1)
 
                 # Calculate exp(x - a) for all elements in the block
@@ -229,10 +228,7 @@ def online_softmax_gemm_np_mkn(lhs, rhs):
                 else:
                     # Update b values (normalization term)
                     b_vals = b_prev * scale_factor + exp_sum_block
-
-                    # Calculate global rescale factor to be applied to all N blocks
                     global_rescale = scale_factor * (b_prev / b_vals)
-
                     # Apply rescaling to existing outputs (for all N blocks at once)
                     outputs *= global_rescale
 
@@ -441,9 +437,9 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks,
     'matmul_block' module computes lhsT @ rhs.
 
     Args:
-    tileT_lhs_block: TILE_M, TILE_K, TILES_IN_M, TILES_IN_K
-    rhs_block: TILE_K, TILE_N, TILES_IN_K, TILES_IN_N
-    result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
+    tileT_lhs_block: TILE_M, TILES_IN_BLOCK_M, unity, BLOCK_K
+    rhs_block: TILE_K, TILES_IN_BLOCK_K, TILES_IN_BLOCK_N, TILE_N
+    result_block : TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N
     """
     TILE_M, TILES_IN_BLOCK_M, unity, BLOCK_K = tileT_lhs_block.shape
     TILE_K, TILES_IN_BLOCK_K, TILES_IN_BLOCK_N, TILE_N = rhs_block.shape
