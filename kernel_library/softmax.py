@@ -16,18 +16,11 @@ def softmax_gemm_correctness_postprocessing(
     input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_output: OUTPUT_TENSOR_DTYPE
 ) -> None:
     lhs, rhs = input_tensors
+    atol, rtol = 1e-5, 1e-5
     golden = softmax_gemm_np(lhs, rhs)
-    online_golden = online_softmax_gemm_np_mkn(lhs, rhs, **kernel_kwargs)
     kernel_output = nl.static_cast(kernel_output, np.float32)
-
-    atol, rtol = 1e-3, 1e-3
     np.testing.assert_allclose(
-        actual=kernel_output,
-        desired=online_golden,
-        atol=atol,
-        rtol=rtol,
-        err_msg="kernel_output vs online_golden",
-        verbose=True,
+        actual=kernel_output, desired=golden, atol=atol, rtol=rtol, err_msg="kernel_output vs golden", verbose=True
     )
 
 
@@ -104,9 +97,7 @@ def online_softmax_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM
                 else:
                     # For subsequent blocks, update max and calculate scaling
                     a_vals = np.maximum(a_prev, block_max_vals)
-                    # FIXME: proper calculation of scale_factor
-                    # scale_factor = np.exp(a_prev - a_vals)  # Shape: (m_size, 1)
-                    scale_factor = a_vals
+                    scale_factor = np.exp(a_prev - a_vals)  # Shape: (m_size, 1)
 
                 # Calculate exp(x - a) for all elements in the block
                 exp_block = np.exp(lhs_block - a_vals)  # Shape: (m_size, BLOCK_K)
@@ -164,7 +155,7 @@ def online_softmax_linear_MKN(
                 buffer=nl.sbuf,
             )
             a_vals = nl.ndarray((mm.TILE_M, mm.TILES_IN_BLOCK_M, 1, 1), dtype=norm_dtype, buffer=nl.sbuf)
-            a_prev = nl.ndarray(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
+            a_prev = nl.zeros(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
             b_vals = nl.zeros(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
             b_prev = nl.zeros(a_vals.shape, dtype=a_vals.dtype, buffer=nl.sbuf)
             for block_id_K in nl.sequential_range(mm.NUM_BLOCK_K):
@@ -179,9 +170,7 @@ def online_softmax_linear_MKN(
                     a_vals[...] = nl.copy(block_max_vals[...], dtype=block_max_vals.dtype)
                 else:
                     a_vals[...] = nl.maximum(a_prev, block_max_vals)
-                    # FIXME: proper calculation of scale_factor
-                    scale_factor[...] = nl.copy(a_vals[...])
-                    # compute_scale_factors(scale_factor, a_vals, a_prev)
+                    compute_scale_factors(scale_factor, a_vals, a_prev)
                 exp_block = compute_safe_exp(lhs_block, a_vals)
                 exp_sum_block = nl.sum(x=exp_block, axis=[-1], keepdims=True)
                 if block_id_K == 0:
