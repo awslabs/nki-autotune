@@ -35,10 +35,10 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         postprocessing=postprocessing,
     )
 
-    sizes = [1, 2, 4, 8, 16]
+    sizes = [1, 2, 4]
     NUM_BLOCK_M_options = sizes
     NUM_BLOCK_N_options = sizes
-    NUM_BLOCK_K_options = [1]
+    NUM_BLOCK_K_options = sizes
     params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options))
     autotune_jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K in params:

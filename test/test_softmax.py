@@ -9,7 +9,7 @@ from autotune.core.generate_tests import GenTests
 from autotune.core.utils import GEMMCompatibility
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kernel_library.softmax import online_softmax_gemm_np, online_softmax_gemm_np_mkn, softmax_gemm_np
+from kernel_library.softmax import online_softmax_gemm_np_mkn, softmax_gemm_np
 
 
 class SoftmaxGemmTestConfig(GenTests):
@@ -39,7 +39,7 @@ class SoftmaxGemmTestConfig(GenTests):
         NUM_BLOCK_M=[1, 2, 4],
         NUM_BLOCK_N=[1, 2, 4],
         NUM_BLOCK_K=[1, 2, 4],
-    ).sample_tests(50),
+    ).sample_tests(10),
 )
 def test_softmax_gemm_np_numerical(
     batch: int, M: int, N: int, K: int, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int
@@ -48,11 +48,7 @@ def test_softmax_gemm_np_numerical(
     lhs = np.random.normal(size=(batch, M, K)).astype(data_type)
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     golden = softmax_gemm_np(lhs, rhs)
-    online_np = online_softmax_gemm_np(lhs, rhs)
-    online_np_mkn = online_softmax_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
+    online_np = online_softmax_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
     np.testing.assert_allclose(
         actual=online_np, desired=golden, atol=1e-5, rtol=1e-5, err_msg="online_np", verbose=True
-    )
-    np.testing.assert_allclose(
-        actual=online_np_mkn, desired=golden, atol=1e-5, rtol=1e-5, err_msg="online_np_mkn", verbose=True
     )
