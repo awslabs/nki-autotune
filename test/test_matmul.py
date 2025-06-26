@@ -13,7 +13,7 @@ from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 
 from autotune.core.generate_tests import GenTests
-from autotune.core.golden import lhs_rhs_gemm_np, lhsT_rhs_gemm_np
+from autotune.core.golden import blocked_gemm_np_mkn, lhs_rhs_gemm_np, lhsT_rhs_gemm_np
 from autotune.core.lhs_rhs import lhs_rhs_gemm
 from autotune.core.utils import GEMMCompatibility
 from autotune.tune.utils import run_kernel
@@ -23,30 +23,16 @@ SHAPES = [1, 2, 4, 8]
 
 class GEMMTestConfig(GenTests):
     def process_test_config(self, config: Dict[str, int]) -> bool:
-        TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-        TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-        TILE_K = nl.tile_size.pmax  # 128
-
-        NUM_BLOCK_M = config.get("NUM_BLOCK_M", 1)
-        NUM_BLOCK_N = config.get("NUM_BLOCK_N", 1)
-        NUM_BLOCK_K = config.get("NUM_BLOCK_K", 1)
-
-        TILES_IN_BLOCK_M = config.get("TILES_IN_BLOCK_M", 1)
-        TILES_IN_BLOCK_N = config.get("TILES_IN_BLOCK_N", 1)
-        TILES_IN_BLOCK_K = config.get("TILES_IN_BLOCK_K", 1)
-
-        BUFFER_M = config.get("BUFFER_M", 1)
-        BUFFER_N = config.get("BUFFER_N", 1)
-        BUFFER_K = config.get("BUFFER_K", 1)
-
-        M = config.get("M", NUM_BLOCK_M * TILES_IN_BLOCK_M * TILE_M)
-        N = config.get("N", NUM_BLOCK_N * TILES_IN_BLOCK_N * TILE_N)
-        K = config.get("K", NUM_BLOCK_K * TILES_IN_BLOCK_K * TILE_K)
-
+        batch = config.get("batch", 1)
+        M = config.get("M", 1)
+        N = config.get("N", 1)
+        K = config.get("K", 1)
+        lhs = np.zeros((batch, M, K))
+        rhs = np.zeros((K, N))
         try:
             assert max(M, N, K) <= 8192, f"Input sizes are too large for testing"
             check = GEMMCompatibility(transposed_lhs=False)
-            check((M, K), (K, N), NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, BUFFER_M, BUFFER_N, BUFFER_K)
+            check(input_tensors=(lhs, rhs), kernel_kwargs={})
             return True
         except Exception as e:
             return False
@@ -91,7 +77,7 @@ def test_matmul_correctness(
     data_type = np.float32
     lhsT = np.random.normal((K, M)).astype(data_type)
     rhs = np.random.normal((K, N)).astype(data_type)
-    golden_output = nl.static_cast(lhsT_rhs_gemm_np(lhsT, rhs, lhs_is_transposed=True), np.float32)
+    golden_output = nl.static_cast(lhsT_rhs_gemm_np(lhsT, rhs), np.float32)
 
     lhsT_dev = nl.static_cast(lhsT, data_type)
     rhs_dev = nl.static_cast(rhs, data_type)
@@ -143,3 +129,29 @@ def test_non_transposed_matmul_correctness(
         assert allclose(
             nki_out, golden_output, atol=atol, rtol=rtol, verbose=1
         ), f"Non transposed LHS GEMM {template} is numerically wrong."
+
+
+@pytest.mark.parametrize(
+    "batch, M, N, K, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K",
+    GEMMTestConfig(
+        batch=[1, 2, 4],
+        M=[1024, 2048, 4096],
+        N=[1024, 2048, 4096],
+        K=[1024, 2048, 4096],
+        NUM_BLOCK_M=[1, 2, 4],
+        NUM_BLOCK_N=[1, 2, 4],
+        NUM_BLOCK_K=[1, 2, 4],
+    ).sample_tests(10),
+)
+def test_blocked_gemm_np_numerical(
+    batch: int, M: int, N: int, K: int, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int
+):
+    data_type = np.float32
+    lhs = np.random.normal(size=(batch, M, K)).astype(data_type)
+    rhs = np.random.normal(size=(K, N)).astype(data_type)
+
+    gemm_golden = lhs_rhs_gemm_np(lhs, rhs)
+    blocked_np = blocked_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
+    np.testing.assert_allclose(
+        actual=blocked_np, desired=gemm_golden, atol=1e-3, rtol=1e-3, err_msg="blocked numpy GEMM", verbose=True
+    )

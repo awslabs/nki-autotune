@@ -36,7 +36,7 @@ def scale_tile(input_tile, scale_tile):
 
 def scale_block(input_block, scale_factor, op: str):
     """
-    Scales down input_block by dividing each element by the corresponding scale_factor.
+    Scales down input_block by dividing/multiplying each element by the corresponding scale_factor.
 
     This function divides elements of the input_block by their corresponding values in the
     scale_factor tensor. The operation is performed in-place, modifying the input_block.
