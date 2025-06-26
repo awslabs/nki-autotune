@@ -32,6 +32,7 @@ class Benchmark:
         self.results = self._init_results()
         self._parallel_preprocessing()
         self._parallel_compile_to_neff()
+        self.results.dump_summary()
         self._parallel_run_kernels()
         self._parallel_extract_metrics()
         self._parallel_postprocessing()
