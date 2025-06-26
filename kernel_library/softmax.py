@@ -7,7 +7,7 @@ from neuronxcc.nki.typing import tensor
 from autotune.core.dma import load_tensor_block, save_result_dma
 from autotune.core.layout import transpose_tiles_in_block
 from autotune.core.reductions import compute_max_vals
-from autotune.core.scalar_ops import scale_block
+from autotune.core.scalar_ops import blocked_activation, scale_block
 from autotune.core.utils import GEMMCompatibility
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSOR_DTYPE
 
@@ -104,7 +104,9 @@ def online_softmax_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM
                 else:
                     # For subsequent blocks, update max and calculate scaling
                     a_vals = np.maximum(a_prev, block_max_vals)
-                    scale_factor = np.exp(a_prev - a_vals)  # Shape: (m_size, 1)
+                    # FIXME: proper calculation of scale_factor
+                    # scale_factor = np.exp(a_prev - a_vals)  # Shape: (m_size, 1)
+                    scale_factor = a_vals
 
                 # Calculate exp(x - a) for all elements in the block
                 exp_block = np.exp(lhs_block - a_vals)  # Shape: (m_size, BLOCK_K)
@@ -115,10 +117,10 @@ def online_softmax_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM
                     b_vals = exp_sum_block
                 else:
                     # Update b values (normalization term)
-                    # b_vals = b_prev * scale_factor + exp_sum_block
+                    b_vals = b_prev * scale_factor + exp_sum_block
                     # Apply rescaling to existing outputs (for all N blocks at once)
                     combined_rescale = scale_factor * (b_prev / b_vals)
-                    # outputs *= combined_rescale
+                    outputs *= combined_rescale
 
                 # Normalize exp_block for softmax weighting
                 softmax_block = exp_block / b_vals
@@ -177,21 +179,23 @@ def online_softmax_linear_MKN(
                     a_vals[...] = nl.copy(block_max_vals[...], dtype=block_max_vals.dtype)
                 else:
                     a_vals[...] = nl.maximum(a_prev, block_max_vals)
-                    compute_scale_factors(scale_factor, a_vals, a_prev)
+                    # FIXME: proper calculation of scale_factor
+                    scale_factor[...] = nl.copy(a_vals[...])
+                    # compute_scale_factors(scale_factor, a_vals, a_prev)
                 exp_block = compute_safe_exp(lhs_block, a_vals)
                 exp_sum_block = nl.sum(x=exp_block, axis=[-1], keepdims=True)
                 if block_id_K == 0:
                     b_vals[...] = nl.copy(exp_sum_block[...], dtype=exp_sum_block.dtype)
                 else:
-                    # activation(
-                    #     out_block=b_vals,
-                    #     op=np.copy,
-                    #     data_block=b_prev,
-                    #     scale_block=scale_factor,
-                    #     bias_block=exp_sum_block,
-                    # )
+                    blocked_activation(
+                        out_block=b_vals,
+                        op=np.copy,
+                        data_block=b_prev,
+                        scale_block=scale_factor,
+                        bias_block=exp_sum_block,
+                    )
                     combined_rescale = compute_combined_scale(scale_factor, b_vals, b_prev)
-                    # scale_prev_result(result_block, combined_rescale)
+                    scale_prev_result(result_block, combined_rescale)
                 scale_block(exp_block, b_vals, "divide")
                 transpose_tiles_in_block(exp_block)
                 for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):

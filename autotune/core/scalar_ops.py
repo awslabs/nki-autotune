@@ -91,7 +91,7 @@ def scale_block(input_block, scale_factor, op: str):
             raise NotImplementedError(f"OP must be divide/multiply. Received {op}.")
 
 
-def activation(out_block, op, data_block, scale_block, bias_block):
+def blocked_activation(out_block, op, data_block, scale_block, bias_block):
     """
     Applies an activation operation to blocks of data with bias and scaling.
 
