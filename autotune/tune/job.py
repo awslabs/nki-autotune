@@ -1,9 +1,11 @@
+import copy
 import os
 import pickle
 import random
 import shutil
 from typing import Any, Callable, Dict, List, Set, Tuple
 
+from autotune.infra.compile import process_compiler_flags
 from autotune.tune.parallel import parallel_execute
 from autotune.typing import (
     INPUT_TENSORS_DTYPE,
@@ -50,9 +52,9 @@ class ProfileJob:
         self.kernel = kernel
         self.input_tensors = input_tensors
         self.kernel_kwargs = kernel_kwargs
-        self.compiler_flags = compiler_flags
         self.preprocessing = preprocessing
         self.postprocessing = postprocessing
+        self.target_instance_family, self.compiler_flags = process_compiler_flags(compiler_flags)
 
     @property
     def cache_dir(self) -> str:
@@ -172,36 +174,20 @@ class ProfileJobs:
         Returns:
             self: The modified ProfileJobs instance
         """
+
         # Get the current number of jobs as the starting index
         start_idx = self.num_jobs
 
-        # Add each job from other_jobs, updating its index
-        for i, job in enumerate(other_jobs.jobs):
-            # Create a new job with updated index
-            new_job = ProfileJob(
-                start_idx + i,  # New index
-                job.kernel,
-                job.input_tensors,
-                job.kernel_kwargs,
-                job.compiler_flags,
-                job.preprocessing,
-                job.postprocessing,
-            )
+        # Deep copy each job and update only the index
+        for i, original_job in enumerate(other_jobs.jobs):
+            # Create a deep copy of the original job
+            job = copy.deepcopy(original_job)
 
-            # Copy any additional attributes
-            for attr in dir(job):
-                if not attr.startswith("__") and attr not in [
-                    "index",
-                    "kernel",
-                    "input_tensors",
-                    "kernel_kwargs",
-                    "compiler_flags",
-                    "preprocessing",
-                    "postprocessing",
-                ]:
-                    if hasattr(job, attr) and not callable(getattr(job, attr)):
-                        setattr(new_job, attr, getattr(job, attr))
-            self.jobs.append(new_job)
+            # Update only the index
+            job.index = start_idx + i
+
+            # Add to our jobs list
+            self.jobs.append(job)
 
         return self
 
@@ -226,7 +212,6 @@ class ProfileJobs:
             # 2. Create a local capturing list for valid jobs
             batch_valid_jobs: List[ProfileJob] = []
 
-            # Define submit_jobs_func for parallel_execute
             def submit_jobs_func(group_id: int, job_group: List[int]) -> Tuple[List[Callable], List[Dict[str, Any]]]:
                 funcs = []
                 kwargs_list = []
@@ -236,7 +221,6 @@ class ProfileJobs:
                     kwargs_list.append({"input_tensors": job.input_tensors, "kernel_kwargs": job.kernel_kwargs})
                 return funcs, kwargs_list
 
-            # Define process_results_func for parallel_execute
             def process_results_func(error: bool, job_id: int, result: Any) -> None:
                 nonlocal batch_valid_jobs
                 job = self.jobs[job_id]
@@ -246,7 +230,6 @@ class ProfileJobs:
                 if not error and not result:
                     batch_valid_jobs.append(job)
 
-            # Use parallel_execute
             num_workers = min(len(sampled_job_ids), os.cpu_count() - 1)
             parallel_execute(
                 executor_type="process",

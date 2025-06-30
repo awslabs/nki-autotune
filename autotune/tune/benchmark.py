@@ -114,6 +114,7 @@ class Benchmark:
                         "kernel_name": job.kernel,
                         "input_tensors": job.input_tensors,
                         "kernel_kwargs": job.kernel_kwargs,
+                        "target_instance_family": job.target_instance_family,
                         "compiler_flags": job.compiler_flags,
                         "output_dir": job.cache_dir,
                     }
@@ -211,6 +212,7 @@ class Benchmark:
             funcs = []
             kwargs = []
             for job_id in job_group:
+                job = self.jobs[job_id]
                 result = self.results[job_id]
                 funcs.append(extract_metrics)
                 kwargs.append(
@@ -219,6 +221,7 @@ class Benchmark:
                         "ntff": result.ntff,
                         "latency": result.min_ms,
                         "matmul_mac_count": result.matmul_mac_count,
+                        "target_instance_family": job.target_instance_family,
                     }
                 )
             return funcs, kwargs

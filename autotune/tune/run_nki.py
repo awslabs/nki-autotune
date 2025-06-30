@@ -66,6 +66,7 @@ def main():
                     benchmark_iterations=args.iters,
                     device_id=0,
                 )
+                # FIXME: could output multiple tensors
                 ntff_file, kernel_output = run_spike_kernel(
                     spike, spike_kernel, job_state["input_tensors"], result.neff, job_state["kernel_kwargs"]
                 )
