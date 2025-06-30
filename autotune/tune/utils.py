@@ -100,6 +100,7 @@ def compile_kernel(
     kernel_name: KERNEL_DTYPE,
     input_tensors: INPUT_TENSORS_DTYPE,
     kernel_kwargs: KERNEL_KWARGS_DTYPE,
+    target_instance_family: str,
     compiler_flags: str,
     output_dir: str,
 ) -> str:
@@ -112,15 +113,12 @@ def compile_kernel(
     else:
         raise TypeError(f"{type(kernel)} {kernel} is not supported.")
     traced_kernel.specialize(*input_tensors, **kernel_kwargs)
-    if "--target=trn1" in compiler_flags:
+    if target_instance_family == "trn1":
         target = CompilationTarget.TRN1
-        compiler_flags = compiler_flags.replace("--target=trn1", "")
-    elif "--target=trn2" in compiler_flags:
+    elif target_instance_family == "trn2":
         target = CompilationTarget.TRN2
-        compiler_flags = compiler_flags.replace("--target=trn2", "")
     else:
-        raise Exception(f"Must specify either --target=trn1 or --target=trn2 in compiler flags.")
-    compiler_flags = " ".join(compiler_flags.split())
+        raise Exception(f"target_instance_family {target_instance_family} must be trn1 or trn2")
     neff = compile_to_neff(
         trace_kernel=traced_kernel,
         output_dir=output_dir,
