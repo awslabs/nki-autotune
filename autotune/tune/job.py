@@ -11,7 +11,7 @@ from autotune.typing import (
     INPUT_TENSORS_DTYPE,
     KERNEL_DTYPE,
     KERNEL_KWARGS_DTYPE,
-    OUTPUT_TENSOR_DTYPE,
+    OUTPUT_TENSORS_DTYPE,
     POSTPROCESSING_DTYPE,
     PREPROCESSING_DTYPE,
 )
@@ -22,7 +22,7 @@ def dummy_preprocessing(input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNE
 
 
 def dummy_postprocessing(
-    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_output: OUTPUT_TENSOR_DTYPE
+    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_outputs: OUTPUT_TENSORS_DTYPE
 ) -> None:
     pass
 

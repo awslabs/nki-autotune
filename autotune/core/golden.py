@@ -1,7 +1,7 @@
 import neuronxcc.nki.language as nl
 import numpy as np
 
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSOR_DTYPE
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
 
 class GEMMCorrectness:
@@ -12,7 +12,7 @@ class GEMMCorrectness:
         self,
         input_tensors: INPUT_TENSORS_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
-        nki_out_tensor: OUTPUT_TENSOR_DTYPE,
+        nki_out_tensors: OUTPUT_TENSORS_DTYPE,
     ):
         data_type = np.float32
         atol, rtol = 1e-2, 1e-2
@@ -21,7 +21,7 @@ class GEMMCorrectness:
             golden = nl.static_cast(lhsT_rhs_gemm_np(lhs, rhs), data_type)
         else:
             golden = nl.static_cast(lhs_rhs_gemm_np(lhs, rhs), data_type)
-        nki_out_tensor = nl.static_cast(nki_out_tensor, data_type)
+        nki_out_tensor = nl.static_cast(nki_out_tensors[0], data_type)
         np.testing.assert_allclose(
             actual=nki_out_tensor, desired=golden, atol=atol, rtol=rtol, err_msg="", verbose=True
         )
