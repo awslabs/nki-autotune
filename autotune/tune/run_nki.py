@@ -1,5 +1,6 @@
 import argparse
 import os
+import pickle
 import subprocess
 from typing import List
 
@@ -67,12 +68,18 @@ def main():
                     device_id=0,
                 )
                 # FIXME: could output multiple tensors
-                ntff_file, kernel_output = run_spike_kernel(
+                ntff_file, kernel_outputs = run_spike_kernel(
                     spike, spike_kernel, job_state["input_tensors"], result.neff, job_state["kernel_kwargs"]
                 )
                 matmul_mac_count = get_matmul_mac_count(spike_kernel.traced_kernel)
                 result.add_fields(ntff=ntff_file, **stats, matmul_mac_count=matmul_mac_count)
-                np.save(f"{job_state['cache_dir']}/kernel_output.npy", kernel_output)
+                with open(f"{job_state['cache_dir']}/kernel_outputs.pkl", "wb") as f:
+                    if isinstance(kernel_outputs, tuple):
+                        pickle.dump(kernel_outputs, f)
+                    elif isinstance(kernel_outputs, np.ndarray):
+                        pickle.dump(tuple([kernel_outputs]), f)
+                    else:
+                        raise TypeError(f"{type(kernel_outputs)} is not supported as NKI kernel outputs.")
             except Exception as e:
                 error_string = capture_error_message(e)
                 result.add_error(error_string)

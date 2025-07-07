@@ -9,16 +9,16 @@ from autotune.core.layout import transpose_tiles_in_block
 from autotune.core.reductions import compute_max_vals
 from autotune.core.scalar_ops import blocked_activation, scale_block
 from autotune.core.utils import GEMMCompatibility
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSOR_DTYPE
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
 
 def softmax_gemm_correctness_postprocessing(
-    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_output: OUTPUT_TENSOR_DTYPE
+    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_outputs: OUTPUT_TENSORS_DTYPE
 ) -> None:
     lhs, rhs = input_tensors
     atol, rtol = 1e-5, 1e-5
     golden = softmax_gemm_np(lhs, rhs)
-    kernel_output = nl.static_cast(kernel_output, np.float32)
+    kernel_output = nl.static_cast(kernel_outputs[0], np.float32)
     np.testing.assert_allclose(
         actual=kernel_output, desired=golden, atol=atol, rtol=rtol, err_msg="kernel_output vs golden", verbose=True
     )

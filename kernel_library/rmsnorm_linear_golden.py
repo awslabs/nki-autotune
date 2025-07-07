@@ -3,13 +3,13 @@ import math
 import neuronxcc.nki.language as nl
 import numpy as np
 
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSOR_DTYPE
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
 
 def rmsnorm_correctness_postprocessing(
-    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_output: OUTPUT_TENSOR_DTYPE
+    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_outputs: OUTPUT_TENSORS_DTYPE
 ) -> None:
-    kernel_output = nl.static_cast(kernel_output, np.float32)
+    kernel_output = nl.static_cast(kernel_outputs[0], np.float32)
 
     x, y = input_tensors
     golden = rmsnorm_matmul_golden(x, y, kernel_kwargs["eps"])

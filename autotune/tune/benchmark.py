@@ -4,9 +4,8 @@
 import os
 from typing import Dict, List
 
-import numpy as np
-
 from autotune.cache.results import ProfileResults
+from autotune.infra.processing import postprocessing_fun_wrapper
 from autotune.tune.job import ProfileJobs
 from autotune.tune.metrics import extract_metrics
 from autotune.tune.parallel import parallel_execute, parallel_execute_groups
@@ -178,13 +177,14 @@ class Benchmark:
             for job_id in job_group:
                 job = self.jobs[job_id]
                 result = self.results[job_id]
-                kernel_output = np.load(f"{job.cache_dir}/kernel_output.npy")
-                funcs.append(job.postprocessing)
+                # FIXME: add a wrapper function to do np load to capture potential errors into cache
+                funcs.append(postprocessing_fun_wrapper)
                 kwargs.append(
                     {
+                        "processing_fun": job.postprocessing,
                         "input_tensors": job.input_tensors,
                         "kernel_kwargs": job.kernel_kwargs,
-                        "kernel_output": kernel_output,
+                        "cache_dir": job.cache_dir,
                     }
                 )
             return funcs, kwargs

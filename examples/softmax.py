@@ -35,7 +35,7 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         postprocessing=postprocessing,
     )
 
-    sizes = [1, 2, 4]
+    sizes = [1, 2, 4, 8, 16]
     NUM_BLOCK_M_options = sizes
     NUM_BLOCK_N_options = sizes
     NUM_BLOCK_K_options = sizes
@@ -57,11 +57,12 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
     mn_shapes = [2048]
-    k_shapes = [4096]
+    k_shapes = [2048, 4096, 8192, 16384]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
-    for M, N, K in MNK:
-        create_jobs(jobs, M, N, K)
+    create_jobs(jobs, M=8192, N=1024, K=8192)
+    # for M, N, K in MNK:
+    #     create_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
     kernels = ["softmax_gemm_np", "online_softmax_linear_MKN"]
