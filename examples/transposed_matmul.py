@@ -7,10 +7,10 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.cache.visualize import plot_metric
+from autotune.core.benchmark import Benchmark
 from autotune.core.golden import GEMMCorrectness
-from autotune.core.utils import GEMMCompatibility
-from autotune.tune.benchmark import Benchmark
-from autotune.tune.job import ProfileJobs
+from autotune.core.job import ProfileJobs
+from autotune.modules.matmul import GEMMCompatibility
 
 
 def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):

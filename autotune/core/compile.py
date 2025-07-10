@@ -2,7 +2,6 @@ import importlib
 import importlib.util
 import shutil
 import sys
-import traceback
 import types
 from typing import Dict, Tuple
 
@@ -12,8 +11,42 @@ from neuronpy.runtime.spike import CompiledKernel, SpikeExecutor
 from neuronxcc.nki.compile import GenericKernel
 
 from autotune.cache.directories import split_file_info
-from autotune.tune.metrics import extract_metrics
+from autotune.core.metrics import extract_metrics
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
+
+
+def process_compiler_flags(compiler_flags: str):
+    """
+    Process compiler flags string to extract target instance family and clean remaining flags.
+
+    This function extracts the target instance family (trn1 or trn2) from compiler flags,
+    removes that target flag from the string, and normalizes whitespace in the remaining flags.
+
+    Args:
+        compiler_flags: A string containing compiler flags, which must include either
+                       '--target=trn1' or '--target=trn2'
+
+    Returns:
+        tuple: A tuple containing:
+            - target_instance_family (str): The extracted target instance family ('trn1' or 'trn2')
+            - compiler_flags (str): The remaining compiler flags with normalized whitespace
+
+    Raises:
+        NotImplementedError: If the compiler flags do not contain either '--target=trn1'
+                             or '--target=trn2'
+    """
+    if "--target=trn1" in compiler_flags:
+        target_instance_family = "trn1"
+        compiler_flags = compiler_flags.replace("--target=trn1", "")
+    elif "--target=trn2" in compiler_flags:
+        target_instance_family = "trn2"
+        compiler_flags = compiler_flags.replace("--target=trn2", "")
+    else:
+        raise NotImplementedError(
+            f"Only support --target=trn1 or --target=trn2 in compiler flags. Received {compiler_flags}."
+        )
+    compiler_flags = " ".join(compiler_flags.split())
+    return target_instance_family, compiler_flags
 
 
 def split_data_by_core(data, core_id, total_cores):
@@ -38,13 +71,6 @@ def split_data_by_core(data, core_id, total_cores):
     end_idx = start_idx + chunk_size + (1 if core_id < remainder else 0)
 
     return data[start_idx:end_idx]
-
-
-def capture_error_message(e) -> str:
-    exc_type, exc_value, exc_traceback = sys.exc_info()
-    error_string = f"{exc_type.__name__}: {str(e)}\n"
-    error_string += "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-    return error_string
 
 
 def parse_path_and_function(combined_str: str):

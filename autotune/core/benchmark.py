@@ -5,12 +5,12 @@ import os
 from typing import Dict, List
 
 from autotune.cache.results import ProfileResults
-from autotune.infra.processing import postprocessing_fun_wrapper
-from autotune.tune.job import ProfileJobs
-from autotune.tune.metrics import extract_metrics
-from autotune.tune.parallel import parallel_execute, parallel_execute_groups
-from autotune.tune.run_nki import run_on_neuron_core
-from autotune.tune.utils import compile_kernel
+from autotune.core.compile import compile_kernel
+from autotune.core.job import ProfileJobs
+from autotune.core.metrics import extract_metrics
+from autotune.core.parallel import parallel_execute, parallel_execute_groups
+from autotune.core.processing import postprocessing_fun_wrapper
+from autotune.core.run_nki import run_on_neuron_core
 
 
 class Benchmark:

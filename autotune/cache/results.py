@@ -1,6 +1,8 @@
 import json
 import os
 import pickle
+import sys
+import traceback
 import warnings
 from typing import Any, Dict, List
 
@@ -409,3 +411,10 @@ def get_best_result(data: Dict):
         if lower_is_better
         else max(valid_results, key=lambda result: getattr(result, sort_key, float("-inf")))
     )
+
+
+def capture_error_message(e) -> str:
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    error_string = f"{exc_type.__name__}: {str(e)}\n"
+    error_string += "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    return error_string

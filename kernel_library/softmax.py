@@ -4,11 +4,11 @@ import numpy as np
 from neuronxcc import nki
 from neuronxcc.nki.typing import tensor
 
-from autotune.core.dma import load_tensor_block, save_result_dma
-from autotune.core.layout import transpose_tiles_in_block
-from autotune.core.reductions import compute_max_vals
-from autotune.core.scalar_ops import blocked_activation, scale_block
-from autotune.core.utils import GEMMCompatibility
+from autotune.modules.dma import load_tensor_block, save_result_dma
+from autotune.modules.layout import transpose_tiles_in_block
+from autotune.modules.matmul import GEMMCompatibility
+from autotune.modules.reductions import compute_max_vals
+from autotune.modules.scalar_ops import blocked_activation, scale_block
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
 

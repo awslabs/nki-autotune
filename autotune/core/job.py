@@ -5,8 +5,8 @@ import random
 import shutil
 from typing import Any, Callable, Dict, List, Set, Tuple
 
-from autotune.infra.compile import process_compiler_flags
-from autotune.tune.parallel import parallel_execute
+from autotune.core.compile import process_compiler_flags
+from autotune.core.parallel import parallel_execute
 from autotune.typing import (
     INPUT_TENSORS_DTYPE,
     KERNEL_DTYPE,

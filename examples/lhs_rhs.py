@@ -7,10 +7,9 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.cache.visualize import plot_metric
-from autotune.core.golden import GEMMCorrectness
-from autotune.core.utils import GEMMCompatibility
-from autotune.tune.benchmark import Benchmark
-from autotune.tune.job import ProfileJobs
+from autotune.core.benchmark import Benchmark
+from autotune.core.job import ProfileJobs
+from autotune.modules.matmul import GEMMCompatibility, GEMMCorrectness
 
 
 def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
@@ -26,7 +25,7 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     else:
         postprocessing = None
     jobs.add_job(
-        kernel=("autotune/core/golden.py", "lhs_rhs_gemm_np"),
+        kernel=("autotune/modules/matmul.py", "lhs_rhs_gemm_np"),
         input_tensors=(lhs, rhs),
         kernel_kwargs={},
         compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
@@ -43,7 +42,7 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     autotune_jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template in params:
         autotune_jobs.add_job(
-            kernel=("autotune/core/lhs_rhs.py", "lhs_rhs_gemm"),
+            kernel=("autotune/modules/lhs_rhs.py", "lhs_rhs_gemm"),
             input_tensors=(lhs, rhs),
             kernel_kwargs={
                 "NUM_BLOCK_M": NUM_BLOCK_M,
@@ -61,12 +60,13 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
-    mn_shapes = [10240]
-    k_shapes = [128, 256]
+    mn_shapes = [128]
+    k_shapes = [4096]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
-    for M, N, K in MNK:
-        add_jobs(jobs, M, N, K)
+    add_jobs(jobs, M=128, N=512, K=4096)
+    # for M, N, K in MNK:
+    #     add_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
     kernels = ["lhs_rhs_gemm_np", "lhs_rhs_gemm"]

@@ -10,8 +10,8 @@ from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from autotune.core.generate_tests import GenTests
-from autotune.core.utils import GEMMCompatibility
+from autotune.modules.matmul import GEMMCompatibility
+from autotune.test.generate_tests import GenTests
 from kernel_library.rmsnorm_linear import (
     allocated_fused_rms_norm_qkv,
     blocked_fused_rms_norm_linear,

@@ -7,10 +7,10 @@ from typing import List
 import numpy as np
 from neuronpy.runtime.spike import SpikeExecutor
 
-from autotune.cache.results import ProfileResult, ProfileResults
-from autotune.tune.job import ProfileJob, ProfileJobs
-from autotune.tune.metrics import get_matmul_mac_count
-from autotune.tune.utils import capture_error_message, create_spike_kernel, run_spike_kernel
+from autotune.cache.results import ProfileResult, ProfileResults, capture_error_message
+from autotune.core.compile import create_spike_kernel, run_spike_kernel
+from autotune.core.job import ProfileJob, ProfileJobs
+from autotune.core.metrics import get_matmul_mac_count
 
 
 def run_on_neuron_core(
@@ -26,7 +26,7 @@ def run_on_neuron_core(
         cache_dirs.append(job.cache_dir)
     env = os.environ.copy()
     env["NEURON_RT_VISIBLE_CORES"] = str(neuron_core_id)
-    cmd = ["python", "autotune/tune/run_nki.py"]
+    cmd = ["python", "autotune/core/run_nki.py"]
     cmd += ["--cache_dirs"] + cache_dirs
     cmd += ["--warmup", str(warmup)]
     cmd += ["--iters", str(iters)]
