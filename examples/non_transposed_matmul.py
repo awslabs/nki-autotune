@@ -14,22 +14,25 @@ from autotune.tune.job import ProfileJobs
 
 
 def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
-    data_type = bfloat16
+    data_type = "float32"
+    if data_type == "float32":
+        data_type = np.float32
+    else:
+        data_type = bfloat16
     lhs = np.random.normal(size=(M, K)).astype(data_type)
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     if data_type == np.dtype("float32"):
         postprocessing = GEMMCorrectness(transposed_lhs=False)
     else:
         postprocessing = None
-    for trial in range(10):
-        jobs.add_job(
-            kernel=("autotune/core/golden.py", "lhs_rhs_gemm_np"),
-            input_tensors=(lhs, rhs),
-            kernel_kwargs={},
-            compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-            preprocessing=GEMMCompatibility(transposed_lhs=False),
-            postprocessing=postprocessing,
-        )
+    jobs.add_job(
+        kernel=("autotune/core/golden.py", "lhs_rhs_gemm_np"),
+        input_tensors=(lhs, rhs),
+        kernel_kwargs={},
+        compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
+        preprocessing=GEMMCompatibility(transposed_lhs=False),
+        postprocessing=postprocessing,
+    )
 
     size_options = [1, 2, 4, 8, 16]
     NUM_BLOCK_M_options = size_options
@@ -58,13 +61,14 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
-    mn_shapes = [2048]
-    k_shapes = [1024, 2048, 4096, 8192, 16384]
+    mn_shapes = [10240]
+    k_shapes = [128, 256]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
     for M, N, K in MNK:
         add_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
-    plot_metric(cache_root_dir, "min_ms", ["lhs_rhs_gemm_np", "lhs_rhs_gemm"])
-    plot_metric(cache_root_dir, "mfu_estimated_percent", ["lhs_rhs_gemm_np", "lhs_rhs_gemm"])
+    kernels = ["lhs_rhs_gemm_np", "lhs_rhs_gemm"]
+    plot_metric(cache_root_dir, "min_ms", kernels)
+    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)

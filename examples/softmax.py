@@ -6,6 +6,7 @@ import sys
 from itertools import product
 
 import numpy as np
+from neuronpy.core.language import bfloat16
 
 from autotune.cache.visualize import plot_metric
 from autotune.core.utils import GEMMCompatibility
@@ -18,7 +19,7 @@ from kernel_library.softmax import softmax_gemm_correctness_postprocessing
 
 def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     batch = 1
-    data_type = np.float32
+    data_type = bfloat16
     lhs = np.random.normal(size=(batch, M, K)).astype(data_type)
     rhs = np.random.normal(size=(K, N)).astype(data_type)
 
@@ -35,10 +36,10 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         postprocessing=postprocessing,
     )
 
-    sizes = [1, 2, 4, 8, 16]
-    NUM_BLOCK_M_options = sizes
-    NUM_BLOCK_N_options = sizes
-    NUM_BLOCK_K_options = sizes
+    sizes = range(17)
+    NUM_BLOCK_M_options = [1]
+    NUM_BLOCK_N_options = [1]
+    NUM_BLOCK_K_options = [10]
     params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options))
     autotune_jobs = ProfileJobs()
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K in params:
@@ -56,15 +57,15 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
-    mn_shapes = [2048]
-    k_shapes = [2048, 4096, 8192, 16384]
+    mn_shapes = [10240]
+    k_shapes = [128]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
-    create_jobs(jobs, M=8192, N=1024, K=8192)
-    # for M, N, K in MNK:
-    #     create_jobs(jobs, M, N, K)
+    for M, N, K in MNK:
+        create_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
     kernels = ["softmax_gemm_np", "online_softmax_linear_MKN"]
-    plot_metric(cache_root_dir, "min_ms", kernels)
-    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)
+    stats_types = ["best", "mean"]
+    plot_metric(cache_root_dir, "min_ms", kernels, stats_types)
+    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels, stats_types)

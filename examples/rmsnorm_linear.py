@@ -62,7 +62,7 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
-    mn_shapes = [2048]
+    mn_shapes = [1024, 2048]
     k_shapes = [1024, 2048, 4096, 8192, 16384]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
@@ -70,5 +70,7 @@ if __name__ == "__main__":
         create_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
-    plot_metric(cache_root_dir, "min_ms", ["rmsnorm_matmul_golden", "online_rmsnorm_linear_MKN"])
-    plot_metric(cache_root_dir, "mfu_estimated_percent", ["rmsnorm_matmul_golden", "online_rmsnorm_linear_MKN"])
+    kernels = ["rmsnorm_matmul_golden", "online_rmsnorm_linear_MKN"]
+    stats_types = ["best", "mean"]
+    plot_metric(cache_root_dir, "min_ms", kernels, stats_types)
+    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels, stats_types)
