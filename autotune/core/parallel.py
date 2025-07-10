@@ -3,7 +3,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from tqdm import tqdm
 
-from autotune.tune.utils import capture_error_message
+from autotune.cache.results import capture_error_message
 
 
 def split_jobs_into_groups(job_ids: List[int], num_groups: int):

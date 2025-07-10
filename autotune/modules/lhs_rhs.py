@@ -3,12 +3,12 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki.compiler.backends.neuron.tensors import KernelHBMTensor
 from neuronxcc.nki.typing import tensor
 
-from autotune.core.dma import load_tensor_block, save_result_block, save_result_dma
-from autotune.core.layout import transpose_tiles_in_block
-from autotune.core.utils import GEMMCompatibility, matmul_blocks_lhs, matmul_blocks_tile_transposed_lhs
 from autotune.legacy import dma as legacy_dma
 from autotune.legacy import layout as legacy_layout
 from autotune.legacy import utils as legacy_utils
+from autotune.modules.dma import load_tensor_block, save_result_block, save_result_dma
+from autotune.modules.layout import transpose_tiles_in_block
+from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhs, matmul_blocks_tile_transposed_lhs
 
 
 @nki.jit

@@ -52,54 +52,6 @@ def load_tensor_block(input_tensor, ofs: Tuple[int, int], load_shape: Tuple[int,
     return block
 
 
-# def load_tensor_block(input_tensor, ofs: Tuple[int, int], load_shape: Tuple[int, int, int]):
-#     """
-#     Load a 2D rectangle region from the input HBM tensor to SBUF.
-#     The location of the 2D region is offset by (row_offset, column_offset) at its upper left corner.
-#     The size of the 2D region to load into SBUF is (row_tile_size * row_num_tiles, column_size).
-#     Load the input HBM tensor by (row_tile_size, column_size) tiles in parallel.
-#     Output SBUF tensor has a shape of load_shape.
-
-#     +------------------+
-#     |                  |
-#     |    +--------+    |  ← Starting at (ofs[0], ofs[1])
-#     |    |Tile 0  |    |
-#     |    |Tile 1  |    |  Each tile is (par_size * free_size)
-#     |    |  ...   |    |
-#     |    |Tile N-1|    |  N = block_size
-#     |    +--------+    |
-#     |                  |
-#     +------------------+
-
-#     Args:
-#         input_tensor: the input 2D HBM tensor
-#         ofs: location offsets in the 2D HBM tensor dimensions
-#         load_shape: (row_tile_size, row_num_tiles, column_size)
-
-#     Returns:
-#         Loaded tiles in SBUF in the shape of load_shape
-#     """
-#     assert len(ofs) == 2, f"'ofs' expects (row_offset, column_offset). Received {ofs}."
-#     assert (
-#         len(load_shape) == 3
-#     ), f"'load_shape' expects (row_tile_size, row_num_tiles, column_size). Received {load_shape}."
-#     max_rows, max_cols = input_tensor.shape
-#     row_tile_size, row_num_tiles, column_size = load_shape
-#     tile_index = nl.mgrid[0:row_tile_size, 0:column_size]
-#     block = nl.ndarray(
-#         (nl.par_dim(row_tile_size), row_num_tiles, column_size),
-#         dtype=input_tensor.dtype,
-#         buffer=nl.sbuf,
-#     )
-#     for row_tile_id in nl.affine_range(row_num_tiles):
-#         row_indices = ofs[0] + row_tile_id * row_tile_size + tile_index.p
-#         col_indices = ofs[1] + tile_index.x
-#         block[tile_index.p, row_tile_id, tile_index.x] = nl.load(
-#             input_tensor[row_indices, col_indices], mask=(row_indices < max_rows) & (col_indices < max_cols)
-#         )
-#     return block
-
-
 def save_result_dma(result, result_blocks, block_id_M: int):
     M, N = result.shape
     TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N = result_blocks.shape

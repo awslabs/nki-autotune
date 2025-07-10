@@ -12,10 +12,10 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki import baremetal
 from neuronxcc.starfish.support.util import allclose
 
-from autotune.core.generate_tests import GenTests
 from autotune.core.golden import blocked_gemm_np_mkn, lhs_rhs_gemm_np, lhsT_rhs_gemm_np
-from autotune.core.lhs_rhs import lhs_rhs_gemm
-from autotune.core.utils import GEMMCompatibility
+from autotune.modules.lhs_rhs import lhs_rhs_gemm
+from autotune.modules.matmul import GEMMCompatibility
+from autotune.test.generate_tests import GenTests
 from autotune.tune.utils import run_kernel
 
 SHAPES = [1, 2, 4, 8]

@@ -9,32 +9,34 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.cache.visualize import plot_metric
-from autotune.core.utils import GEMMCompatibility
-from autotune.tune.benchmark import Benchmark
-from autotune.tune.job import ProfileJobs
+from autotune.core.benchmark import Benchmark
+from autotune.core.job import ProfileJobs
+from autotune.modules.matmul import GEMMCompatibility
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kernel_library.rmsnorm_linear_golden import rmsnorm_correctness_postprocessing
 
 
-def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
+def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int, data_type: str):
     batch = 1
-    data_type = bfloat16
+    if data_type == "float32":
+        data_type = np.float32
+        postprocessing = rmsnorm_correctness_postprocessing
+    elif data_type == "bf16":
+        data_type = bfloat16
+        postprocessing = None
+    else:
+        raise NotImplementedError(f"{data_type} is not implemented.")
     lhs = np.random.normal(size=(batch, M, K)).astype(data_type)
     rhs = np.random.normal(size=(K, N)).astype(data_type)
-    if data_type == np.dtype("float32"):
-        postprocessing = rmsnorm_correctness_postprocessing
-    else:
-        postprocessing = None
-    for trial in range(10):
-        jobs.add_job(
-            kernel=("kernel_library/rmsnorm_linear_golden.py", "rmsnorm_matmul_golden"),
-            input_tensors=(lhs, rhs),
-            kernel_kwargs={"eps": 1e-6},
-            compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-            preprocessing=GEMMCompatibility(transposed_lhs=False),
-            postprocessing=postprocessing,
-        )
+    jobs.add_job(
+        kernel=("kernel_library/rmsnorm_linear_golden.py", "rmsnorm_matmul_golden"),
+        input_tensors=(lhs, rhs),
+        kernel_kwargs={"eps": 1e-6},
+        compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
+        preprocessing=GEMMCompatibility(transposed_lhs=False),
+        postprocessing=postprocessing,
+    )
 
     sizes = [1, 2, 4, 8, 16]
     NUM_BLOCK_M_options = sizes
@@ -62,15 +64,14 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
-    mn_shapes = [1024, 2048]
-    k_shapes = [1024, 2048, 4096, 8192, 16384]
+    mn_shapes = [1024]
+    k_shapes = [1024]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
     for M, N, K in MNK:
-        create_jobs(jobs, M, N, K)
+        create_jobs(jobs, M, N, K, "bf16")
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
     kernels = ["rmsnorm_matmul_golden", "online_rmsnorm_linear_MKN"]
-    stats_types = ["best", "mean"]
-    plot_metric(cache_root_dir, "min_ms", kernels, stats_types)
-    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels, stats_types)
+    plot_metric(cache_root_dir, "min_ms", kernels)
+    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)

@@ -1,4 +1,4 @@
-from autotune.tune.metrics import calculate_mfu
+from autotune.core.metrics import calculate_mfu
 
 
 def compute_attention_mfu(seq: int, hidden: int, latency_ms: float):

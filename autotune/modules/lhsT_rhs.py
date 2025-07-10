@@ -7,8 +7,8 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki.compiler.backends.neuron.tensors import KernelHBMTensor
 from neuronxcc.nki.typing import tensor
 
-from autotune.core.dma import load_tensor_block, save_result_acc, save_result_block, save_result_dma
-from autotune.core.utils import GEMMCompatibility, matmul_block
+from autotune.modules.dma import load_tensor_block, save_result_acc, save_result_block, save_result_dma
+from autotune.modules.matmul import GEMMCompatibility, matmul_block
 
 
 @nki.jit

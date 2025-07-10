@@ -1,7 +1,5 @@
 import time
-from datetime import datetime, timedelta
-
-import pytest
+from datetime import timedelta
 
 
 def pytest_collection_modifyitems(session, config, items):
