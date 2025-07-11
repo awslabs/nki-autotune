@@ -69,9 +69,9 @@ def save_result_dma(result, result_blocks, block_id_M: int):
         nl.store(result[m_ofs + idx_res_packed.p, idx_res_packed.x], value=result_blocks_packed)
 
 
-def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
-    NUM_BLOCK_K, NUM_BLOCK_M, NUM_BLOCK_N, num_m_tiles, num_n_tiles, TILE_M, TILE_N = result_tiles.shape
-
+def save_result_acc(result, result_block, BLOCK_M, BLOCK_N):
+    M, N = result.shape
+    TILE_M, TILES_IN_M, TILES_IN_N, TILE_N = result_block.shape
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for block_id_M in nl.affine_range(NUM_BLOCK_M):
         m_ofs = block_id_M * BLOCK_M
@@ -80,10 +80,10 @@ def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
             for tile_id_M in nl.affine_range(num_m_tiles):
                 for tile_id_N in nl.affine_range(num_n_tiles):
                     result_acc = nl.zeros(
-                        (num_m_tiles, num_n_tiles, nl.par_dim(TILE_M), TILE_N), dtype=result_tiles.dtype, buffer=nl.sbuf
+                        (num_m_tiles, num_n_tiles, nl.par_dim(TILE_M), TILE_N), dtype=result_block.dtype, buffer=nl.sbuf
                     )
                     for block_id_K in nl.affine_range(NUM_BLOCK_K):
-                        result_acc[tile_id_M, tile_id_N] += result_tiles[
+                        result_acc[tile_id_M, tile_id_N] += result_block[
                             block_id_K, block_id_M, block_id_N, tile_id_M, tile_id_N
                         ]
 
@@ -93,21 +93,49 @@ def save_result_acc(result, result_tiles, BLOCK_M, BLOCK_N):
                     )
 
 
-def save_result_block(result, result_block, m_ofs: int, n_ofs: int):
+def save_result_block(result, result_block, tile_index_ofs: Tuple[int, int]):
     """
-    Store result_block into result
+    Store a 4D SBUF block of tiled results back into a 2D HBM tensor.
+    The result_block tensor contains data organized in tiles that need to be stored in the
+    appropriate locations in the result tensor. The starting position for storing tiles is
+    determined by tile_index_ofs, which specifies the tile offset in both dimensions.
+
+    +--------------------------------------------------+
+    |                                                  |
+    |    +--------+--------+----+--------+             |
+    |    |Tile 0,0|Tile 0,1|... |Tile 0,n|             |  ← Starting at position
+    |    +--------+--------+----+--------+             |    (tile_index_ofs[0] * TILE_M, tile_index_ofs[1] * TILE_N)
+    |    |Tile 1,0|Tile 1,1|... |Tile 1,n|             |
+    |    +--------+--------+----+--------+             |  Each tile is (TILE_M, TILE_N) in size
+    |    |   ...  |   ...  |... |   ...  |             |
+    |    +--------+--------+----+--------+             |
+    |    |Tile m,0|Tile m,1|... |Tile m,n|             |  m=TILES_IN_M-1, n=TILES_IN_N-1
+    |    +--------+--------+----+--------+             |
+    |                                                  |
+    +--------------------------------------------------+
+
     Args:
-    result: M, N
-    result_block: TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, nl.par_dim(TILE_M), TILE_N
+        result: The destination 2D tensor with shape (M, N) where tiles will be stored
+        result_block: The source 4D tensor containing tiled results with shape
+                     (TILE_M, TILES_IN_M, TILES_IN_N, TILE_N), where:
+                     - TILE_M: Height of each tile
+                     - TILES_IN_M: Number of tiles in the M dimension (rows)
+                     - TILES_IN_N: Number of tiles in the N dimension (columns)
+                     - TILE_N: Width of each tile
+        tile_index_ofs: A tuple of (row_tile_offset, col_tile_offset) specifying the starting tile indices
+                       in the result tensor where tiles should be stored
+
+    Returns:
+        None. The result tensor is modified in-place.
     """
     M, N = result.shape
-    TILE_M, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N = result_block.shape
+    TILE_M, TILES_IN_M, TILES_IN_N, TILE_N = result_block.shape
 
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
-        m_start = m_ofs + tile_id_M * TILE_M
-        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
-            n_start = n_ofs + tile_id_N * TILE_N
+    for tile_id_M in nl.affine_range(TILES_IN_M):
+        m_start = (tile_index_ofs[0] + tile_id_M) * TILE_M
+        for tile_id_N in nl.affine_range(TILES_IN_N):
+            n_start = (tile_index_ofs[1] + tile_id_N) * TILE_N
             nl.store(
                 result[m_start + idx_res.p, n_start + idx_res.x],
                 value=result_block[idx_res.p, tile_id_M, tile_id_N, idx_res.x],

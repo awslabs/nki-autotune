@@ -16,20 +16,22 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
-        postprocessing = GEMMCorrectness(transposed_lhs=False)
+        postprocessing = GEMMCorrectness(transposed_lhs=True)
     elif data_type == "bf16":
         data_type = bfloat16
         postprocessing = None
     else:
         raise NotImplementedError(f"{data_type} is not implemented.")
-    lhs = np.random.normal(size=(M, K)).astype(data_type)
-    rhs = np.random.normal(size=(K, N)).astype(data_type)
+    # lhsT = np.random.normal(size=(K, M)).astype(data_type)
+    # rhs = np.random.normal(size=(K, N)).astype(data_type)
+    lhsT = np.zeros(shape=(K, M), dtype=data_type)
+    rhs = np.zeros(shape=(K, N), dtype=data_type)
     jobs.add_job(
-        kernel=("autotune/modules/matmul.py", "lhs_rhs_gemm_np"),
-        input_tensors=(lhs, rhs),
+        kernel=("autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
+        input_tensors=(lhsT, rhs),
         kernel_kwargs={},
         compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-        preprocessing=GEMMCompatibility(transposed_lhs=False),
+        preprocessing=GEMMCompatibility(transposed_lhs=True),
         postprocessing=postprocessing,
     )
 
@@ -37,21 +39,23 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     NUM_BLOCK_M_options = size_options
     NUM_BLOCK_N_options = size_options
     NUM_BLOCK_K_options = size_options
-    templates = ["MN", "MKN", "MNK"]
-    params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, templates))
+    loop_orders = ["MNK", "MKN", "NMK", "NKM", "KMN", "KNM"]
+    tensor_positions = list(product([0, 1, 2], repeat=3))
+    params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, loop_orders, tensor_positions))
     autotune_jobs = ProfileJobs()
-    for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template in params:
+    for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, loop_order, tensor_position in params:
         autotune_jobs.add_job(
-            kernel=("autotune/modules/lhs_rhs.py", "lhs_rhs_gemm"),
-            input_tensors=(lhs, rhs),
+            kernel=("autotune/modules/lhsT_rhs.py", "lhsT_rhs_gemm_general"),
+            input_tensors=(lhsT, rhs),
             kernel_kwargs={
                 "NUM_BLOCK_M": NUM_BLOCK_M,
                 "NUM_BLOCK_N": NUM_BLOCK_N,
                 "NUM_BLOCK_K": NUM_BLOCK_K,
-                "template": template,
+                "loop_order": loop_order,
+                "tensor_positions": tensor_position,
             },
             compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-            preprocessing=GEMMCompatibility(transposed_lhs=False),
+            preprocessing=GEMMCompatibility(transposed_lhs=True),
             postprocessing=postprocessing,
         )
     autotune_jobs.sample(100)
@@ -60,15 +64,15 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
-    mn_shapes = [128]
-    k_shapes = [4096]
+    mn_shapes = [2048]
+    k_shapes = [1024, 2048, 4096, 8192, 16384]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
-    add_jobs(jobs, M=128, N=512, K=4096)
+    add_jobs(jobs, M=512, N=512, K=10240)
     # for M, N, K in MNK:
     #     add_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
-    kernels = ["lhs_rhs_gemm_np", "lhs_rhs_gemm"]
+    kernels = ["lhsT_rhs_gemm_np", "lhsT_rhs_gemm", "lhsT_rhs_gemm_general"]
     plot_metric(cache_root_dir, "min_ms", kernels)
     plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)
