@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
@@ -14,20 +16,31 @@ class GEMMCompatibility:
     """
 
     def __init__(self, transposed_lhs: bool) -> None:
-        self.transposed_lhs = transposed_lhs
-
-    def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE):
         """
         Initialize GEMM compatibility checker.
 
         Args:
-            lhs_shape: Shape of left-hand side matrix, either (M,K) or (batch,M,K)
-                       If transposed_lhs is True, dimensions are interpreted as (K,M) or (batch,K,M)
-            rhs_shape: Shape of right-hand side matrix, expected to be (K,N)
-            transposed_lhs: Whether the LHS matrix is transposed
-            NUM_BLOCK_M: Number of blocks in M dimension
-            NUM_BLOCK_N: Number of blocks in N dimension
-            NUM_BLOCK_K: Number of blocks in K dimension, or None to skip K blocking
+            transposed_lhs: Whether the LHS matrix should be interpreted as transposed.
+        """
+        self.transposed_lhs = transposed_lhs
+
+    def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE):
+        """
+        Check compatibility of input tensors for GEMM operation with specified parameters.
+
+        Args:
+            input_tensors: Tuple containing (lhs, rhs) matrices for GEMM operation.
+                lhs_shape: Shape of left-hand side matrix, either (M,K) or (batch,M,K)
+                           If transposed_lhs is True, dimensions are interpreted as (K,M) or (batch,K,M)
+                rhs_shape: Shape of right-hand side matrix, expected to be (K,N)
+            kernel_kwargs: Dictionary containing kernel parameters:
+                NUM_BLOCK_M: Number of blocks in M dimension
+                NUM_BLOCK_N: Number of blocks in N dimension
+                NUM_BLOCK_K: Number of blocks in K dimension, or None to skip K blocking
+
+        Raises:
+            ValueError: If matrix shapes are incompatible or cannot be properly divided
+                       into the specified number of blocks and tiles.
         """
         lhs, rhs = input_tensors
         lhs_shape = lhs.shape
@@ -80,26 +93,45 @@ class GEMMCompatibility:
         self._check()
 
     def _calculate_sizes(self) -> None:
-        """Calculate derived sizes for each dimension."""
-        for dimension in ["M", "N", "K"]:
-            size = getattr(self, f"{dimension}")
-            num_block = getattr(self, f"NUM_BLOCK_{dimension}")
+        """
+        Calculate derived sizes for each dimension (M, N, K).
 
-            # Handle dimensions with no blocking
-            if num_block is None:
-                num_block = 1
+        For each dimension, calculates:
+        - Block size (dimension divided by number of blocks)
+        - Number of tiles in each block (block size divided by tile size)
+        - Total number of tiles in the dimension (dimension size divided by tile size)
 
-            tile_size = getattr(self, f"TILE_{dimension}")
-            block_size = size // num_block
-            tiles_in_block = block_size // tile_size
-            tiles_in_dim = size // tile_size
+        Results are stored as attributes on the class instance.
+        """
+        # Calculate sizes for M dimension
+        num_block_m = 1 if self.NUM_BLOCK_M is None else self.NUM_BLOCK_M
+        self.BLOCK_M: int = self.M // num_block_m
+        self.TILES_IN_BLOCK_M = self.BLOCK_M // self.TILE_M
+        self.TILES_IN_M = self.M // self.TILE_M
 
-            setattr(self, f"TILES_IN_BLOCK_{dimension}", tiles_in_block)
-            setattr(self, f"TILES_IN_{dimension}", tiles_in_dim)
-            setattr(self, f"BLOCK_{dimension}", block_size)
+        # Calculate sizes for N dimension
+        num_block_n = 1 if self.NUM_BLOCK_N is None else self.NUM_BLOCK_N
+        self.BLOCK_N: int = self.N // num_block_n
+        self.TILES_IN_BLOCK_N = self.BLOCK_N // self.TILE_N
+        self.TILES_IN_N = self.N // self.TILE_N
+
+        # Calculate sizes for K dimension
+        num_block_k = 1 if self.NUM_BLOCK_K is None else self.NUM_BLOCK_K
+        self.BLOCK_K: int = self.K // num_block_k
+        self.TILES_IN_BLOCK_K = self.BLOCK_K // self.TILE_K
+        self.TILES_IN_K = self.K // self.TILE_K
 
     def _check(self) -> None:
-        """Validate that dimensions can be evenly divided into blocks and tiles."""
+        """
+        Validate that dimensions can be evenly divided into blocks and tiles.
+
+        Verifies that for each dimension (M, N, K):
+        1. The dimension size can be evenly divided into the specified number of blocks
+        2. Each block can be evenly divided into tiles
+
+        Raises:
+            ValueError: If any dimension cannot be evenly divided as required.
+        """
         for dimension in ["M", "N", "K"]:
             size = getattr(self, f"{dimension}")
             num_block = getattr(self, f"NUM_BLOCK_{dimension}")
@@ -119,7 +151,7 @@ class GEMMCompatibility:
                 )
 
 
-def matmul_block(lhsT_block, rhs_block, result_block):
+def matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs: Tuple[int, int]):
     """
     Accumulate matmul result tiles between lhsT and rhs into result_block
 
@@ -128,34 +160,37 @@ def matmul_block(lhsT_block, rhs_block, result_block):
     rhs_block: TILES_IN_BLOCK_K, TILE_K, BLOCK_N
     result_block : TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N
     """
-    TILES_IN_BLOCK_K, TILE_K, BLOCK_M = lhsT_block.shape
-    _TILES_IN_BLOCK_K, _TILE_K, BLOCK_N = rhs_block.shape
-    TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N = result_block.shape
-
-    # Data checks
-    assert (
-        TILES_IN_BLOCK_K == _TILES_IN_BLOCK_K and TILE_K == _TILE_K
-    ), f"lhsT_block {lhsT_block.shape} does not match with rhs_block {rhs_block.shape}"
-    assert (
-        BLOCK_M == TILES_IN_BLOCK_M * TILE_M and BLOCK_N == TILES_IN_BLOCK_N * TILE_N
-    ), f"lhsT_block {lhsT_block.shape} does not match with result_block {result_block.shape}"
+    TILE_K, TILES_IN_K, TILES_IN_M, TILE_M = lhsT_block.shape
+    _, _, TILES_IN_N, TILE_N = rhs_block.shape
+    assert rhs_block.shape == (
+        TILE_K,
+        TILES_IN_K,
+        TILES_IN_N,
+        TILE_N,
+    ), f"lhsT_block {lhsT_block.shape} shape mismatch with rhs_block {rhs_block.shape}"
+    assert (result_block.shape[0], result_block.shape[-1]) == (
+        TILE_M,
+        TILE_N,
+    ), f"result_block {result_block.shape} shape mismatch with lhsT_block {lhsT_block.shape} @ rhs_block {rhs_block.shape}"
 
     idx_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
-        for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
+    M_ofs, N_ofs = ofs
+    for tile_id_M in nl.affine_range(TILES_IN_M):
+        for tile_id_N in nl.affine_range(TILES_IN_N):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             """
             Use PSUM buffer to accumulate into a single hardware tile
             """
-            for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
+            for tile_id_K in nl.affine_range(TILES_IN_K):
                 result_tile += nisa.nc_matmul(
-                    lhsT_block[tile_id_K, idx_lhsT.p, tile_id_M * TILE_M + idx_lhsT.x],
-                    rhs_block[tile_id_K, idx_rhs.p, tile_id_N * TILE_N + idx_rhs.x],
+                    lhsT_block[idx_lhsT.p, tile_id_K, tile_id_M, idx_lhsT.x],
+                    rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x],
                 )
-
-            result_block[tile_id_M, tile_id_N, idx_res.p, idx_res.x] += result_tile[idx_res.p, idx_res.x]
+            result_block[idx_res.p, M_ofs // TILE_M + tile_id_M, N_ofs // TILE_N + tile_id_N, idx_res.x] += result_tile[
+                idx_res.p, idx_res.x
+            ]
 
 
 def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
