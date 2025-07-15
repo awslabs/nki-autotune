@@ -1,18 +1,31 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from itertools import product
+from typing import Any, Dict, List
 
 import numpy as np
 from neuronpy.core.language import bfloat16
 
-from autotune.cache.visualize import plot_metric
-from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
-from autotune.modules.matmul import GEMMCompatibility, GEMMCorrectness
+from autotune.modules.lhsT_rhs import preprocessing
+from autotune.modules.lhsT_rhs_generator import create_inlined_kernel, save_kernel_to_file
+from autotune.modules.matmul import GEMMCorrectness
 
 
-def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
+def get_configs():
+    configs = [
+        {
+            "NUM_BLOCK_M": 2,
+            "NUM_BLOCK_N": 1,
+            "NUM_BLOCK_K": 4,
+            "loop_order": "MKN",
+            "tensor_positions": {"lhsT_block": 2, "rhs_block": 1, "result_block": -1},
+        }
+    ]
+    return configs
+
+
+def get_jobs(M: int, N: int, K: int, configs: List[Dict[str, Any]]):
     data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
@@ -22,57 +35,29 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         postprocessing = None
     else:
         raise NotImplementedError(f"{data_type} is not implemented.")
-    # lhsT = np.random.normal(size=(K, M)).astype(data_type)
-    # rhs = np.random.normal(size=(K, N)).astype(data_type)
-    lhsT = np.zeros(shape=(K, M), dtype=data_type)
-    rhs = np.zeros(shape=(K, N), dtype=data_type)
-    jobs.add_job(
-        kernel=("autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
-        input_tensors=(lhsT, rhs),
-        kernel_kwargs={},
-        compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-        preprocessing=GEMMCompatibility(transposed_lhs=True),
-        postprocessing=postprocessing,
-    )
-
-    size_options = [1, 2, 4, 8, 16]
-    NUM_BLOCK_M_options = size_options
-    NUM_BLOCK_N_options = size_options
-    NUM_BLOCK_K_options = size_options
-    loop_orders = ["MNK", "MKN", "NMK", "NKM", "KMN", "KNM"]
-    tensor_positions = list(product([0, 1, 2], repeat=3))
-    params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, loop_orders, tensor_positions))
-    autotune_jobs = ProfileJobs()
-    for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, loop_order, tensor_position in params:
-        autotune_jobs.add_job(
+    lhsT = np.random.normal(size=(K, M)).astype(data_type)
+    rhs = np.random.normal(size=(K, N)).astype(data_type)
+    jobs = ProfileJobs()
+    for config_id, config in enumerate(configs):
+        kernel_code = create_inlined_kernel(**config)
+        save_kernel_to_file(kernel_code, f"generated_lhsT_rhs_gemm_{config_id}.py", output_dir="generated_kernels")
+        jobs.add_job(
             kernel=("autotune/modules/lhsT_rhs.py", "lhsT_rhs_gemm_general"),
             input_tensors=(lhsT, rhs),
-            kernel_kwargs={
-                "NUM_BLOCK_M": NUM_BLOCK_M,
-                "NUM_BLOCK_N": NUM_BLOCK_N,
-                "NUM_BLOCK_K": NUM_BLOCK_K,
-                "loop_order": loop_order,
-                "tensor_positions": tensor_position,
-            },
+            kernel_kwargs=config,
             compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-            preprocessing=GEMMCompatibility(transposed_lhs=True),
+            preprocessing=preprocessing,
             postprocessing=postprocessing,
         )
-    autotune_jobs.sample(100)
-    jobs.extend(autotune_jobs)
+    return jobs
 
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
-    mn_shapes = [2048]
-    k_shapes = [1024, 2048, 4096, 8192, 16384]
-    MNK = list(product(mn_shapes, mn_shapes, k_shapes))
-    jobs = ProfileJobs()
-    add_jobs(jobs, M=512, N=512, K=10240)
-    # for M, N, K in MNK:
-    #     add_jobs(jobs, M, N, K)
-    tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
-    tuner()
-    kernels = ["lhsT_rhs_gemm_np", "lhsT_rhs_gemm", "lhsT_rhs_gemm_general"]
-    plot_metric(cache_root_dir, "min_ms", kernels)
-    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)
+    configs = get_configs()
+    jobs = get_jobs(M=512, N=512, K=10240, configs=configs)
+    # tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
+    # tuner()
+    # kernels = ["lhsT_rhs_gemm_general"]
+    # plot_metric(cache_root_dir, "min_ms", kernels)
+    # plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)

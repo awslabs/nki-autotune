@@ -156,10 +156,11 @@ def matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs: Tuple[int, int]
     Accumulate matmul result tiles between lhsT and rhs into result_block
 
     Args:
-    lhsT_block: TILES_IN_BLOCK_K, TILE_K, BLOCK_M
-    rhs_block: TILES_IN_BLOCK_K, TILE_K, BLOCK_N
-    result_block : TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_M, TILE_N
+    lhsT_block: TILE_K, TILES_IN_K, TILES_IN_M, TILE_M
+    rhs_block: TILE_K, TILES_IN_K, TILES_IN_N, TILE_N
+    result_block : TILE_M, >=TILES_IN_M, >=TILES_IN_N, TILE_N
     """
+    print(f"lhsT_block = {lhsT_block.shape}. rhs_block = {rhs_block.shape}. result_block = {result_block.shape}.")
     TILE_K, TILES_IN_K, TILES_IN_M, TILE_M = lhsT_block.shape
     _, _, TILES_IN_N, TILE_N = rhs_block.shape
     assert rhs_block.shape == (
@@ -168,9 +169,11 @@ def matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs: Tuple[int, int]
         TILES_IN_N,
         TILE_N,
     ), f"lhsT_block {lhsT_block.shape} shape mismatch with rhs_block {rhs_block.shape}"
-    assert (result_block.shape[0], result_block.shape[-1]) == (
-        TILE_M,
-        TILE_N,
+    assert (
+        result_block.shape[0] == TILE_M
+        and result_block.shape[1] >= TILES_IN_M
+        and result_block.shape[2] >= TILES_IN_N
+        and result_block.shape[3] == TILE_N
     ), f"result_block {result_block.shape} shape mismatch with lhsT_block {lhsT_block.shape} @ rhs_block {rhs_block.shape}"
 
     idx_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
