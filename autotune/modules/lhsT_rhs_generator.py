@@ -10,14 +10,29 @@ class CodeInliner:
 
         # Analyze which operations happen at which positions
         self.op_positions = self._analyze_operations()
+        print(self.op_positions)
 
     def _analyze_operations(self) -> Dict[int, List[str]]:
-        """Analyze which operations happen at each position"""
-        ops = {-1: [], 0: [], 1: [], 2: []}
+        """
+        Analyze which operations happen at each position
+
+        Position reference:
+        position = -1  # Before all loops
+        loop_0
+            position = 0
+            loop_1
+                position = 1
+                loop_2
+                    position = 2
+                position = 3
+            position = 4
+        position = 5
+        """
+        ops = {-1: [], 0: [], 1: [], 2: [], 3: [], 4: [], 5: []}
 
         for tensor_name, position in self.tensor_positions.items():
             if tensor_name in ["lhsT_block", "rhs_block", "result_block"]:
-                ops[position].append(f"load {tensor_name}")
+                ops[position].append(f"init_{tensor_name}")
 
         # Add matmul operation
         matmul_pos = max(self.tensor_positions["lhsT_block"], self.tensor_positions["rhs_block"])
@@ -25,7 +40,7 @@ class CodeInliner:
         ops[matmul_pos].append("matmul")
 
         # Add save operations (mirror of init)
-        ops[self.tensor_positions["result_block"]].append("save_result")
+        ops[4 - self.tensor_positions["result_block"]].append("save_result")
         return ops
 
     def generate_inlined_kernel(self) -> str:
@@ -55,12 +70,13 @@ def lhsT_rhs_gemm_inlined_{self.loop_order}(
     mm(input_tensors, kernel_kwargs)
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
     
+    # Inlined operations at position -1 (before all loops)
+    {self._generate_operations_at_position(-1, "    ")}
+    
     return result
 """
 
         """
-        # Inlined operations at position 0 (before all loops)
-    {self._generate_position_operations(0, "    ")}
         
     {loop_body}
         
@@ -71,13 +87,30 @@ def lhsT_rhs_gemm_inlined_{self.loop_order}(
 
     def _generate_docstring(self) -> str:
         loop_structure = ["Loop structure:"]
-        indentation = ""
+        indentation_level = 0
+        single_indentation = "    "
         for pos in self.op_positions:
-            if pos > -1:
+            if pos == -1:
+                if self.op_positions[pos]:
+                    indentation = indentation_level * single_indentation
+                    loop_structure.append(f"{indentation}{', '.join(self.op_positions[pos])}")
+            elif pos < 3:
+                """
+                loop_i
+                    position = i
+                """
+                indentation = indentation_level * single_indentation
                 loop_structure.append(f"{indentation}loop_{pos}: {self.loop_order[pos]}")
-                indentation += "    "
-            if self.op_positions[pos]:
-                loop_structure.append(f"{indentation}{', '.join(self.op_positions[pos])}")
+                indentation_level += 1
+                if self.op_positions[pos]:
+                    indentation = indentation_level * single_indentation
+                    loop_structure.append(f"{indentation}{', '.join(self.op_positions[pos])}")
+            else:
+                indentation_level -= 1
+                indentation_level = max(indentation_level, 0)
+                indentation = indentation_level * single_indentation
+                if self.op_positions[pos]:
+                    loop_structure.append(f"{indentation}{', '.join(self.op_positions[pos])}")
 
         loop_structure_str = "\n".join(loop_structure)
         docstring = f'''
@@ -123,14 +156,16 @@ This kernel uses block-based computation with a specific loop ordering.
 
         return "\n".join(loops)
 
-    def _generate_position_operations(self, position: int, indent: str) -> str:
+    def _generate_operations_at_position(self, position: int, indent: str) -> str:
         """Generate operations for a specific position"""
-        if position not in self.position_operations:
+        if position not in self.op_positions:
             return ""
 
         ops = []
+        ops.append(f"{indent}# Operations at position {position}")
+        print(f"Position {position} ops: {self.op_positions[position]}")
 
-        for op in self.position_operations[position]:
+        for op in self.op_positions[position]:
             if op == "init_lhsT_block":
                 ops.extend(self._generate_lhsT_block_init(position, indent))
             elif op == "init_rhs_block":
@@ -139,8 +174,8 @@ This kernel uses block-based computation with a specific loop ordering.
                 ops.extend(self._generate_result_block_init(position, indent))
             elif op == "matmul":
                 ops.extend(self._generate_matmul_operation(position, indent))
-        ops.append(f"{indent}# Operations at position {position}")
-        ops.append(f"{indent}1+1")
+            else:
+                raise NotImplementedError(f"{op} is not implemented.")
         return "\n".join(ops)
 
     def _generate_lhsT_block_init(self, position: int, indent: str) -> List[str]:
@@ -185,7 +220,7 @@ This kernel uses block-based computation with a specific loop ordering.
         """Generate result block initialization code"""
         ops = []
 
-        shape_calc = self._get_block_shape_calculation("result", ("M", "N"), position)
+        shape_calc = self._get_block_shape_calculation(("M", "N"), position)
 
         ops.append(f"{indent}# Initialize result block")
         ops.append(f"{indent}result_block_shape = {shape_calc}")
@@ -222,7 +257,7 @@ This kernel uses block-based computation with a specific loop ordering.
 
         return "\n".join(ops)
 
-    def _get_block_shape_calculation(self, tensor_type: str, dims: tuple, position: int) -> str:
+    def _get_block_shape_calculation(self, dims: tuple, position: int) -> str:
         """Generate block shape calculation code"""
         dim1, dim2 = dims
 

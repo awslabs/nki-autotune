@@ -50,12 +50,13 @@ def lhsT_rhs_gemm_inlined_MKN(lhsT: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_B
     Auto-generated inlined lhsT (K, M) @ rhs (K, N) GEMM kernel that computes result = lhsT^T @ rhs.
 
     Loop structure:
-    load result_block, save_result
+    init_result_block
     loop_0: M
         loop_1: K
-            load rhs_block
+            init_rhs_block
             loop_2: N
-                load lhsT_block, matmul
+                init_lhsT_block, matmul
+    save_result
 
     This kernel uses block-based computation with a specific loop ordering.
     """
@@ -67,5 +68,16 @@ def lhsT_rhs_gemm_inlined_MKN(lhsT: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_B
     mm = GEMMCompatibility(transposed_lhs=True)
     mm(input_tensors, kernel_kwargs)
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+
+    # Inlined operations at position -1 (before all loops)
+    # Operations at position -1
+    # Initialize result block
+    result_block_shape = (
+        mm.TILE_M,
+        mm.NUM_BLOCK_M * mm.TILES_IN_BLOCK_M,
+        mm.NUM_BLOCK_N * mm.TILES_IN_BLOCK_N,
+        mm.TILE_N,
+    )
+    result_block = nl.zeros(result_block_shape, dtype=lhsT.dtype, buffer=nl.sbuf)
 
     return result
