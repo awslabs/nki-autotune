@@ -19,7 +19,12 @@ class LoopContent:
 
     def generate_opening_code(self):
         """Generate opening operations as a list of strings."""
-        return self.opening_ops
+        openings = []
+        if self.comment:
+            openings.append(f'"""{self.comment}"""')
+        for op in self.opening_ops:
+            openings.append(op)
+        return openings
 
     def generate_closing_code(self):
         """Generate closing operations as a list of strings."""
@@ -27,10 +32,8 @@ class LoopContent:
 
 
 class LoopNestGenerator:
-    def __init__(self, loops: List[LoopContent]):
-        """
-        Initialize the loop nest generator.
-        """
+    def __init__(self, function_header: str, loops: List[LoopContent]):
+        self.function_header = function_header
         self.loops = loops
         self.num_loops = self._determine_loop_count()
 
@@ -55,56 +58,46 @@ class LoopNestGenerator:
             return lines
         return []
 
-    def generate_loopnest(self, openings: List[List[str]], closings: List[List[str]]) -> List[str]:
+    def generate_loopnest(self, indent_offset: int, openings: List[List[str]], closings: List[List[str]]) -> List[str]:
         """Generate the nested loop structure with opening and closing operations."""
         lines = []
-        loop_idx = 0
+        indent_level = indent_offset
 
         for i, loop in enumerate(self.loops):
-            if not loop.is_loop:
-                # Handle non-loop content (like outer operations)
-                for op in openings[i]:
-                    lines.append(f"{self._get_indent(0)}{op}")
-            else:
-                # Handle loop content
-                indent_level = loop_idx
-
+            if loop.is_loop:
                 # Add loop declaration
                 lines.append(f"{self._get_indent(indent_level)}for {loop.loop_var} in {loop.loop_range}:")
-
                 # Add opening operations for this loop
+                indent_level += 1
                 for op in openings[i]:
-                    lines.append(f"{self._get_indent(indent_level + 1)}{op}")
-
-                loop_idx += 1
+                    lines.append(f"{self._get_indent(indent_level)}{op}")
+            else:
+                # Handle non-loop content (like outer operations)
+                for op in openings[i]:
+                    lines.append(f"{self._get_indent(indent_level)}{op}")
 
         # Add closing operations in reverse order
-        current_loop_idx = self.num_loops - 1
         for i in range(len(self.loops) - 1, -1, -1):
             loop = self.loops[i]
+            for op in closings[i]:
+                lines.append(f"{self._get_indent(indent_level)}{op}")
             if loop.is_loop:
-                indent_level = current_loop_idx
-                # Add closing operations for this loop
-                for op in closings[i]:
-                    lines.append(f"{self._get_indent(indent_level + 1)}{op}")
-                current_loop_idx -= 1
-            else:
-                # Handle non-loop closing content
-                for op in closings[i]:
-                    lines.append(f"{self._get_indent(0)}{op}")
+                indent_level -= 1
 
         return lines
 
-    def generate_code(self, loops: List[LoopContent]):
+    def generate_code(self):
         """Generate the complete code as a single string."""
         openings = []
         closings = []
-        for loop in loops:
+        for loop in self.loops:
             loop_opening = loop.generate_opening_code()
             loop_closing = loop.generate_closing_code()
             openings.append(loop_opening)
             closings.append(loop_closing)
-        lines = self.generate_loopnest(openings, closings)
+        lines = [self.function_header]
+        kernel_lines = self.generate_loopnest(1, openings, closings)
+        lines.extend(kernel_lines)
         kernel_code = "\n".join(lines)
         return kernel_code
 
@@ -129,6 +122,6 @@ if __name__ == "__main__":
             closing_ops=[f"clean_loop_{loop_var}()"],
         )
         loop_contents.append(loop_content)
-    generator = LoopNestGenerator(loop_contents)
-    kernel_code = generator.generate_code(loop_contents)
+    generator = LoopNestGenerator(function_header="", loops=loop_contents)
+    kernel_code = generator.generate_code()
     print(kernel_code)

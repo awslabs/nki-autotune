@@ -8,7 +8,7 @@ from neuronpy.core.language import bfloat16
 
 from autotune.core.job import ProfileJobs
 from autotune.modules.lhsT_rhs import preprocessing
-from autotune.modules.lhsT_rhs_generator import create_gemm_kernel
+from autotune.modules.lhsT_rhs_generator import create_gemm_kernel, save_kernel_to_file
 from autotune.modules.matmul import GEMMCorrectness
 
 
@@ -40,7 +40,7 @@ def get_jobs(M: int, N: int, K: int, configs: List[Dict[str, Any]]):
     jobs = ProfileJobs()
     for config_id, config in enumerate(configs):
         kernel_code = create_gemm_kernel(**config)
-        # save_kernel_to_file(kernel_code, f"generated_lhsT_rhs_gemm_{config_id}.py", output_dir="generated_kernels")
+        save_kernel_to_file(kernel_code, f"generated_lhsT_rhs_gemm_{config_id}.py", output_dir="generated_kernels")
         jobs.add_job(
             kernel=("autotune/modules/lhsT_rhs.py", "lhsT_rhs_gemm_general"),
             input_tensors=(lhsT, rhs),
