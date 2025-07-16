@@ -4,3 +4,5 @@ pytest
 seaborn
 pre-commit
 neuronx-cc==2.*
+isort
+black

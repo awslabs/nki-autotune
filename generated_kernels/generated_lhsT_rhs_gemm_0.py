@@ -46,38 +46,18 @@ def preprocessing(input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWAR
 
 @nki.jit
 def lhsT_rhs_gemm_inlined_MKN(lhsT: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int):
-    """
-    Auto-generated inlined lhsT (K, M) @ rhs (K, N) GEMM kernel that computes result = lhsT^T @ rhs.
-
-    Loop structure:
-    init_result_block
-    loop_0: M
-        loop_1: K
-            init_rhs_block
-            loop_2: N
-                init_lhsT_block, matmul
-    save_result
-
-    This kernel uses block-based computation with a specific loop ordering.
-    """
-
-    # Setup mm compatibility object
-    input_tensors = (lhsT, rhs)
-    kernel_kwargs = {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K}
-    preprocessing(input_tensors, kernel_kwargs)
-    mm = GEMMCompatibility(transposed_lhs=True)
-    mm(input_tensors, kernel_kwargs)
-    result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-
-    # Inlined operations at position -1 (before all loops)
-    # Operations at position -1
-    # Initialize result block
-    result_block_shape = (
-        mm.TILE_M,
-        mm.NUM_BLOCK_M * mm.TILES_IN_BLOCK_M,
-        mm.NUM_BLOCK_N * mm.TILES_IN_BLOCK_N,
-        mm.TILE_N,
-    )
-    result_block = nl.zeros(result_block_shape, dtype=lhsT.dtype, buffer=nl.sbuf)
-
-    return result
+    """This is outer ops"""
+    outer_init()
+    for block_id_M in nl.affine_range(M):
+        """This is loop M"""
+        initialization_M()
+        for block_id_K in nl.affine_range(K):
+            """This is loop K"""
+            initialization_K()
+            for block_id_N in nl.affine_range(N):
+                """This is loop N"""
+                initialization_N()
+                clean_loop_N()
+            clean_loop_K()
+        clean_loop_M()
+    outer_clean()
