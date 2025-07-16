@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 from typing import Dict, List
 
+from autotune.generation.loop_nest import LoopNestGenerator
+
 
 class CodeInliner:
     def __init__(self, loop_order: str, tensor_positions: Dict[str, int]):
@@ -49,7 +51,7 @@ class CodeInliner:
         docstring = self._generate_docstring()
 
         # Generate loop structure with inlined operations
-        # loop_body = self._generate_loop_structure()
+        loop_body = self._generate_loop_structure()
 
         kernel_code = f"""
 @nki.jit
@@ -73,12 +75,12 @@ def lhsT_rhs_gemm_inlined_{self.loop_order}(
     # Inlined operations at position -1 (before all loops)
     {self._generate_operations_at_position(-1, "    ")}
     
+    {loop_body}
+    
     return result
 """
 
         """
-        
-    {loop_body}
         
         # Final save operations if needed
     {self._generate_final_save_operations()}
@@ -320,12 +322,17 @@ This kernel uses block-based computation with a specific loop ordering.
         return "    # Final save operations completed in loops"
 
 
-def create_inlined_kernel(loop_order: str, tensor_positions: Dict[str, int], **kwargs) -> str:
+def create_gemm_kernel(loop_order: str, tensor_positions: Dict[str, int], **kwargs) -> str:
     """Create an inlined kernel based on configuration"""
 
-    inliner = CodeInliner(loop_order, tensor_positions)
-    kernel_code = inliner.generate_inlined_kernel()
-    return kernel_code
+    # inliner = CodeInliner(loop_order, tensor_positions)
+    # kernel_code = inliner.generate_inlined_kernel()
+
+    print(loop_order, tensor_positions)
+
+    generator = LoopNestGenerator(loop_var_prefix="block_id")
+    # kernel_code = generator.generate_code_string(ops=tensor_positions)
+    # return kernel_code
 
 
 def save_kernel_to_file(kernel_code: str, filename: str, output_dir: str = "generated_kernels") -> str:
