@@ -323,12 +323,16 @@ This kernel uses block-based computation with a specific loop ordering.
 
 
 def create_gemm_kernel(loop_order: str, tensor_positions: Dict[str, int], **kwargs) -> str:
-    """Create an inlined kernel based on configuration"""
-    print(loop_order, tensor_positions)
+    """Create a kernel based on configuration"""
     function_header = f"""
 @nki.jit
-def lhsT_rhs_gemm_inlined_{loop_order}(lhsT: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int):
+def lhsT_rhs_gemm_generated_{loop_order}(lhsT: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int):
+    '''
+    Auto-generated lhsT (K, M) @ rhs (K, N) GEMM kernel that computes result = lhsT^T @ rhs.
+    This kernel uses block-based computation with a specific loop ordering.
+    '''
 """
+    print(tensor_positions)
     loop_contents = [
         LoopContent(
             comment=f"This is outer ops",
