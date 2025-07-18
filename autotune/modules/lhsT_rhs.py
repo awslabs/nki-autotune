@@ -39,7 +39,6 @@ def preprocessing(input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWAR
     ), f"lhsT_block and rhs_block must be on the same side of K loop. Received lhsT_block_position {lhsT_block_position}, rhs_block_position {rhs_block_position}, K_position {K_position}."
 
 
-@nki.jit
 def lhsT_rhs_gemm_general(
     lhsT: tensor,
     rhs: tensor,
@@ -141,15 +140,15 @@ def maybe_init(
     tensor_blocks,
 ):
     lhsT, rhs = input_tensors
-    if tensor_positions["lhsT_block_position"] == curr_position:
+    if tensor_positions["lhsT_block"] == curr_position:
         lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), curr_position)
         lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), curr_position, curr_block_ids)
         tensor_blocks["lhsT_block"] = load_tensor_block(input_tensor=lhsT, ofs=lhsT_ofs, load_shape=lhsT_block_shape)
-    if tensor_positions["rhs_block_position"] == curr_position:
+    if tensor_positions["rhs_block"] == curr_position:
         rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), curr_position)
         rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), curr_position, curr_block_ids)
         tensor_blocks["rhs_block"] = load_tensor_block(input_tensor=rhs, ofs=rhs_ofs, load_shape=rhs_block_shape)
-    if tensor_positions["result_block_position"] == curr_position:
+    if tensor_positions["result_block"] == curr_position:
         result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), curr_position)
         tensor_blocks["result_block"] = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
 
@@ -182,7 +181,7 @@ def maybe_save(
     M_position = loop_order.index("M")
     N_position = loop_order.index("N")
     K_position = loop_order.index("K")
-    if tensor_positions["result_block_position"] == curr_position:
+    if tensor_positions["result_block"] == curr_position:
         print(f"Saving {result_block.shape} into {result.shape}.")
         if curr_position == 0:
             save_result_block(result, result_block, tile_index_ofs=(0, 0))

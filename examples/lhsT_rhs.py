@@ -7,9 +7,9 @@ import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.core.job import ProfileJobs
-from autotune.modules.lhsT_rhs import preprocessing
-from autotune.modules.lhsT_rhs_generator import create_gemm_kernel, save_kernel_to_file
+from autotune.modules.lhsT_rhs import lhsT_rhs_gemm_general
 from autotune.modules.matmul import GEMMCorrectness
+from autotune.modules.pre_compile import pre_compile_kernel, save_kernel_to_file
 
 
 def get_configs():
@@ -19,7 +19,7 @@ def get_configs():
             "NUM_BLOCK_N": 1,
             "NUM_BLOCK_K": 4,
             "loop_order": "MKN",
-            "tensor_positions": {"lhsT_block": 2, "rhs_block": 1, "result_block": -1},
+            "tensor_positions": {-1: ["result_block"], 0: [], 1: ["rhs_block"], 2: ["lhsT_block"]},
         }
     ]
     return configs
@@ -39,16 +39,16 @@ def get_jobs(M: int, N: int, K: int, configs: List[Dict[str, Any]]):
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     jobs = ProfileJobs()
     for config_id, config in enumerate(configs):
-        kernel_code = create_gemm_kernel(**config)
+        kernel_code = pre_compile_kernel(lhsT_rhs_gemm_general, lhsT, rhs, **config)
         save_kernel_to_file(kernel_code, f"generated_lhsT_rhs_gemm_{config_id}.py", output_dir="generated_kernels")
-        jobs.add_job(
-            kernel=("autotune/modules/lhsT_rhs.py", "lhsT_rhs_gemm_general"),
-            input_tensors=(lhsT, rhs),
-            kernel_kwargs=config,
-            compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-            preprocessing=preprocessing,
-            postprocessing=postprocessing,
-        )
+        # jobs.add_job(
+        #     kernel=("autotune/modules/lhsT_rhs.py", "lhsT_rhs_gemm_general"),
+        #     input_tensors=(lhsT, rhs),
+        #     kernel_kwargs=config,
+        #     compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+        #     preprocessing=preprocessing,
+        #     postprocessing=postprocessing,
+        # )
     return jobs
 
 

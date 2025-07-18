@@ -13,22 +13,44 @@ class LoopContent:
         self.is_loop = loop_var and loop_range
         self.indent_size = 4
 
-    def _get_indent(self, level):
+    def _get_indent(self, level: int) -> str:
         """Get indentation string for given nesting level."""
         return " " * (self.indent_size * level)
 
-    def generate_opening_code(self):
+    def translate_op(self, op: str) -> str:
+        """
+        Translate an operation string to its desired output format.
+        This is a hook that can be overridden by subclasses to customize
+        how operations are printed.
+
+        The default implementation returns the operation unchanged.
+
+        Note: Do not add indentation in this method, as the LoopNestGenerator will
+        handle indentation based on the nesting level.
+
+        Args:
+            op (str): Operation string to translate
+
+        Returns:
+            str: Translated operation string without indentation
+        """
+        return op
+
+    def generate_opening_code(self) -> List[str]:
         """Generate opening operations as a list of strings."""
         openings = []
         if self.comment:
             openings.append(f'"""{self.comment}"""')
         for op in self.opening_ops:
-            openings.append(op)
+            openings.append(self.translate_op(op))
         return openings
 
-    def generate_closing_code(self):
+    def generate_closing_code(self) -> List[str]:
         """Generate closing operations as a list of strings."""
-        return self.closing_ops
+        closings = []
+        for op in self.closing_ops:
+            closings.append(self.translate_op(op))
+        return closings
 
 
 class LoopNestGenerator:
