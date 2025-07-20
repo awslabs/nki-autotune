@@ -281,6 +281,13 @@ def compiled_true_true():
         lhsT = np.random.normal(size=(1024, 4096))
 
 
+def save_code_to_file(filepath: str, kernel_code: str):
+    with open(filepath, "w") as f:
+        f.write(kernel_code)
+
+
+from autotune.modules.lhsT_rhs import lhsT_rhs_gemm_general
+
 if __name__ == "__main__":
     # Should match compiled_true_true
     kernel_code = pre_compile_kernel(top_level_general, inits=[True, True])
@@ -299,3 +306,17 @@ if __name__ == "__main__":
     print("False, True:")
     print(kernel_code)
     print()
+
+    lhsT = np.random.normal(size=(1024, 2048))
+    rhs = np.random.normal(size=(1024, 4096))
+    config = {
+        "lhsT": lhsT,
+        "rhs": rhs,
+        "NUM_BLOCK_M": 2,
+        "NUM_BLOCK_N": 1,
+        "NUM_BLOCK_K": 4,
+        "loop_order": "MKN",
+        "tensor_positions": {"result_block": -1, "rhs_block": 1, "lhsT_block": 2},
+    }
+    kernel_code = pre_compile_kernel(lhsT_rhs_gemm_general, **config)
+    save_code_to_file("generated_kernels/generated_lhsT_rhs.py", kernel_code)
