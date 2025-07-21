@@ -1,7 +1,7 @@
 import ast
 import copy
 import inspect
-from typing import Dict
+from typing import Any, Dict, List
 
 
 class ConstantFolder(ast.NodeTransformer):
@@ -36,28 +36,44 @@ class ConstantFolder(ast.NodeTransformer):
 class ConstantPropagator(ast.NodeTransformer):
     """Replace variables with known compile-time constants"""
 
-    def __init__(self, constants):
+    def __init__(self, constants: Dict[str, Any]):
         self.constants = constants
 
     def visit_Name(self, node):
+        """
+        1. Checks if the name is being used in a "load" context (reading a variable, not assigning to it)
+        2. Checks if the name exists in the pre-defined dictionary of constants
+        3. If both conditions are met, it replaces the variable reference with a literal constant
+
+        Example transformation:
+        Before (with constants={"x": 42}):
+        y = x + 1
+        After:
+        y = 42 + 1
+        """
         if isinstance(node.ctx, ast.Load) and node.id in self.constants:
             return ast.Constant(value=self.constants[node.id])
         return node
 
     def visit_Subscript(self, node):
+        """
+        1. Adding special handling for dictionary lookups where the dictionary is a known constant
+        2. Falling back to the `ConstantFolder` for other cases
+        """
         # Process children first
         node.value = self.visit(node.value)
         node.slice = self.visit(node.slice)
 
         # Handle dictionary access with constant keys
-        if isinstance(node.value, ast.Name) and node.value.id in self.constants:
-            container = self.constants[node.value.id]
-            if isinstance(container, dict) and isinstance(node.slice, ast.Constant):
-                try:
-                    value = container[node.slice.value]
-                    return ast.Constant(value=value)
-                except (KeyError, TypeError):
-                    pass
+        # if isinstance(node.value, ast.Name) and node.value.id in self.constants:
+        #     container = self.constants[node.value.id]
+        #     print(f"container = {container}")
+        #     if isinstance(container, dict) and isinstance(node.slice, ast.Constant):
+        #         try:
+        #             value = container[node.slice.value]
+        #             return ast.Constant(value=value)
+        #         except (KeyError, TypeError):
+        #             pass
 
         # Then let the constant folder try to simplify
         return ConstantFolder().visit(node)
@@ -66,13 +82,15 @@ class ConstantPropagator(ast.NodeTransformer):
 class FunctionInliner(ast.NodeTransformer):
     """Inline function calls with their body"""
 
-    def __init__(self, functions_dict):
+    def __init__(self, functions_dict, specialization_targets):
         self.functions_dict = functions_dict
+        self.specialization_targets = specialization_targets
 
     def visit_Expr(self, node):
         if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
             func_name = node.value.func.id
-            if func_name in self.functions_dict:
+            # Only inline functions that are in the specialization_targets list
+            if func_name in self.specialization_targets and func_name in self.functions_dict:
                 # Get the function definition
                 func_def = self.functions_dict[func_name]
 
@@ -182,41 +200,21 @@ class DeadCodeEliminator(ast.NodeTransformer):
         return node
 
 
-def pre_compile_kernel(func, **kwargs):
-    """Precompile a function with compile-time constants"""
-    # Get the source code
+def specialize_kernel(func, specialization_targets: List[str], **specialization_kwargs):
+    """
+    Specialize a function with compile-time constants specialization_kwargs
+    Only specialize and inline helper functions in the specialization_targets
+    Leave other top-level codes and helper functions as is
+    """
+    # Apply specialization with multiple passes
+    # Step 1: Propagate constants from specialization_kwargs
     source = inspect.getsource(func)
-
-    # Parse the AST
     tree = ast.parse(source)
     function_node = tree.body[0]
-
-    # Get module for other function definitions
-    module = inspect.getmodule(func)
-    module_source = inspect.getsource(module)
-    module_tree = ast.parse(module_source)
-
-    # Extract function definitions
-    functions = {}
-    for node in module_tree.body:
-        if isinstance(node, ast.FunctionDef):
-            functions[node.name] = node
-
-    # Process lists passed as kwargs to handle array-like access
-    processed_kwargs = {}
-    for key, value in kwargs.items():
-        if isinstance(value, list):
-            # Convert list to dictionary with integer keys
-            processed_kwargs[key] = {i: v for i, v in enumerate(value)}
-        else:
-            processed_kwargs[key] = value
-
-    # Apply optimizations with multiple passes
-
-    # Step 1: Propagate constants from kwargs
     propagated = copy.deepcopy(function_node)
-    propagator = ConstantPropagator(processed_kwargs)
+    propagator = ConstantPropagator(specialization_kwargs)
     propagated = propagator.visit(propagated)
+    print(ast.unparse(propagated))
 
     # Apply constant folding
     folder = ConstantFolder()
@@ -225,7 +223,16 @@ def pre_compile_kernel(func, **kwargs):
     ast.fix_missing_locations(propagated)
 
     # Step 2: Inline function calls
-    inliner = FunctionInliner(functions)
+    module = inspect.getmodule(func)
+    module_source = inspect.getsource(module)
+    module_tree = ast.parse(module_source)
+    functions = {}
+    for node in module_tree.body:
+        if isinstance(node, ast.FunctionDef):
+            functions[node.name] = node
+
+    # Pass the specialization_targets list to the FunctionInliner
+    inliner = FunctionInliner(functions, specialization_targets)
 
     # Process each statement separately to handle list returns
     new_body = []
@@ -256,9 +263,12 @@ import numpy as np
 
 
 def top_level_general(inits: Dict[int, bool]):
-    maybe_init(init=inits[0])
+    maybe_init(inits[0])
     for i in range(10):
         maybe_init(inits[1])
+    for j in range(20):
+        maybe_init(inits[2])
+    do_not_inline(inits[3])
 
 
 def maybe_init(init: bool):
@@ -266,19 +276,9 @@ def maybe_init(init: bool):
         lhsT = np.random.normal(size=(1024, 4096))
 
 
-def compiled_false_true():
-    for i in range(10):
-        lhsT = np.random.normal(size=(1024, 4096))
-
-
-def compiled_true_false():
-    lhsT = np.random.normal(size=(1024, 4096))
-
-
-def compiled_true_true():
-    lhsT = np.random.normal(size=(1024, 4096))
-    for i in range(10):
-        lhsT = np.random.normal(size=(1024, 4096))
+def do_not_inline(init: bool):
+    if init:
+        rhs = np.random.normal(size=(4096, 8192))
 
 
 def save_code_to_file(filepath: str, kernel_code: str):
@@ -286,37 +286,10 @@ def save_code_to_file(filepath: str, kernel_code: str):
         f.write(kernel_code)
 
 
-from autotune.modules.lhsT_rhs import lhsT_rhs_gemm_general
-
 if __name__ == "__main__":
-    # Should match compiled_true_true
-    kernel_code = pre_compile_kernel(top_level_general, inits=[True, True])
-    print("True, True:")
+    kernel_code = specialize_kernel(
+        top_level_general, specialization_targets=["maybe_init"], inits={0: True, 1: False, 2: True, 3: True}
+    )
+    print("True, False, True:")
     print(kernel_code)
     print()
-
-    # Should match compiled_true_false
-    kernel_code = pre_compile_kernel(top_level_general, inits=[True, False])
-    print("True, False:")
-    print(kernel_code)
-    print()
-
-    # Should match compiled_false_true
-    kernel_code = pre_compile_kernel(top_level_general, inits=[False, True])
-    print("False, True:")
-    print(kernel_code)
-    print()
-
-    lhsT = np.random.normal(size=(1024, 2048))
-    rhs = np.random.normal(size=(1024, 4096))
-    config = {
-        "lhsT": lhsT,
-        "rhs": rhs,
-        "NUM_BLOCK_M": 2,
-        "NUM_BLOCK_N": 1,
-        "NUM_BLOCK_K": 4,
-        "loop_order": "MKN",
-        "tensor_positions": {"result_block": -1, "rhs_block": 1, "lhsT_block": 2},
-    }
-    kernel_code = pre_compile_kernel(lhsT_rhs_gemm_general, **config)
-    save_code_to_file("generated_kernels/generated_lhsT_rhs.py", kernel_code)
