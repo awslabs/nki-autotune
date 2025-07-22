@@ -86,7 +86,6 @@ def lhsT_rhs_gemm_general(
     FIXME: compute the global coordinate, use the global coordinate to update tensors
     save and matmul locations should be mirror?
     """
-    input_tensors = (lhsT, rhs)
     kernel_kwargs = {
         "NUM_BLOCK_M": NUM_BLOCK_M,
         "NUM_BLOCK_N": NUM_BLOCK_N,
@@ -94,38 +93,20 @@ def lhsT_rhs_gemm_general(
         "loop_order": loop_order,
         "tensor_positions": tensor_positions,
     }
-    preprocessing(input_tensors, kernel_kwargs)
+    preprocessing((lhsT, rhs), kernel_kwargs)
     mm = GEMMCompatibility(transposed_lhs=True)
-    mm(input_tensors, kernel_kwargs)
+    mm((lhsT, rhs), kernel_kwargs)
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-    for loop_id in [0, 1, 2]:
-        loop_size = getattr(mm, f"NUM_BLOCK_{loop_order[loop_id]}")
-        print(f"Loop {loop_id}: {loop_order[loop_id]} size {loop_size}")
 
-    tensor_blocks = {"lhsT_block": None, "rhs_block": None, "result_block": None}
-    maybe_init(tensor_positions, 0, loop_order, [], mm, (lhsT, rhs), result, tensor_blocks)
+    maybe_init(tensor_positions, 0, loop_order, [], mm, (lhsT, rhs), result)
     for block_id_0 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[0]}")):
-        maybe_init(tensor_positions, 1, loop_order, [block_id_0], mm, (lhsT, rhs), result, tensor_blocks)
+        maybe_init(tensor_positions, 1, loop_order, [block_id_0], mm, (lhsT, rhs), result)
         for block_id_1 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[1]}")):
-            maybe_init(
-                tensor_positions, 2, loop_order, [block_id_0, block_id_1], mm, (lhsT, rhs), result, tensor_blocks
-            )
+            maybe_init(tensor_positions, 2, loop_order, [block_id_0, block_id_1], mm, (lhsT, rhs), result)
             for block_id_2 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[2]}")):
                 maybe_init(
-                    tensor_positions,
-                    3,
-                    loop_order,
-                    [block_id_0, block_id_1, block_id_2],
-                    mm,
-                    (lhsT, rhs),
-                    result,
-                    tensor_blocks,
+                    tensor_positions, 3, loop_order, [block_id_0, block_id_1, block_id_2], mm, (lhsT, rhs), result
                 )
-            maybe_save(
-                tensor_positions, 2, loop_order, [block_id_0, block_id_1], mm, tensor_blocks["result_block"], result
-            )
-        maybe_save(tensor_positions, 1, loop_order, [block_id_0], mm, tensor_blocks["result_block"], result)
-    maybe_save(tensor_positions, 0, loop_order, [block_id_0], mm, tensor_blocks["result_block"], result)
     return result
 
 
@@ -137,20 +118,18 @@ def maybe_init(
     mm: GEMMCompatibility,
     input_tensors,
     result,
-    tensor_blocks,
 ):
-    lhsT, rhs = input_tensors
     if tensor_positions["lhsT_block"] == curr_position:
         lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), curr_position)
         lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), curr_position, curr_block_ids)
-        tensor_blocks["lhsT_block"] = load_tensor_block(input_tensor=lhsT, ofs=lhsT_ofs, load_shape=lhsT_block_shape)
+        lhsT_block = load_tensor_block(input_tensor=input_tensors[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
     if tensor_positions["rhs_block"] == curr_position:
         rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), curr_position)
         rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), curr_position, curr_block_ids)
-        tensor_blocks["rhs_block"] = load_tensor_block(input_tensor=rhs, ofs=rhs_ofs, load_shape=rhs_block_shape)
+        rhs_block = load_tensor_block(input_tensor=input_tensors[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
     if tensor_positions["result_block"] == curr_position:
         result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), curr_position)
-        tensor_blocks["result_block"] = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
+        result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
 
 
 def maybe_compute(
