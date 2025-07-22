@@ -57,7 +57,7 @@ class ConstantExpressionEvaluator(ast.NodeTransformer):
                     result = not node.operand.value
                     return ast.Constant(value=result)
                 elif isinstance(node.op, ast.Invert):
-                    result = ~node.operand.value
+                    result = not node.operand.value
                     return ast.Constant(value=result)
             except Exception:
                 pass
@@ -117,60 +117,91 @@ class ConditionalEvaluator(ast.NodeTransformer):
     """Evaluate if-else statements with constant conditions"""
 
     def visit_If(self, node: ast.If) -> Union[ast.If, List[ast.stmt]]:
-        # First evaluate the condition using ConstantExpressionEvaluator
+        # First evaluate the test condition
         expr_evaluator = ConstantExpressionEvaluator()
         node.test = expr_evaluator.visit(node.test)
 
-        # If condition is now a constant, determine which branch to keep
+        # If condition is now a constant, we can determine which branch to keep
         if isinstance(node.test, ast.Constant):
             if node.test.value:
-                # Process and return the body (True branch)
-                return [self.visit(stmt) for stmt in node.body]
+                # Process the body (True branch)
+                result = []
+                for stmt in node.body:
+                    transformed = self.visit(stmt)
+                    if isinstance(transformed, list):
+                        result.extend(transformed)
+                    elif transformed is not None:
+                        result.append(transformed)
+                return result
             else:
-                # Process and return the orelse (False branch)
-                return [self.visit(stmt) for stmt in node.orelse]
+                # Process the else branch (False branch)
+                result = []
+                for stmt in node.orelse:
+                    transformed = self.visit(stmt)
+                    if isinstance(transformed, list):
+                        result.extend(transformed)
+                    elif transformed is not None:
+                        result.append(transformed)
+                return result
 
-        # If condition is not a constant, process both branches
+        # If condition isn't constant, process both branches normally
         node.body = [self.visit(stmt) for stmt in node.body]
         node.orelse = [self.visit(stmt) for stmt in node.orelse]
-
         return node
 
 
 class DeadCodeEliminator(ast.NodeTransformer):
     """Remove loops with empty bodies and other dead code"""
 
-    def visit_For(self, node: ast.For) -> Union[ast.For, List[ast.stmt]]:
-        # Visit the body first to process any nested transformations
-        node.body = [self.visit(stmt) for stmt in node.body if stmt]
-
-        # If the body is empty after transformations, remove the loop
-        if not node.body:
-            return []
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        """Visit function definition to process its body"""
+        node.body = self._visit_and_flatten_body(node.body)
         return node
 
-    def visit_While(self, node: ast.While) -> Union[ast.While, List[ast.stmt]]:
-        node.body = [self.visit(stmt) for stmt in node.body if stmt]
+    def _visit_and_flatten_body(self, body: List[ast.stmt]) -> List[ast.stmt]:
+        """Visit statements in a body and flatten any lists returned by transformations"""
+        result = []
+        for stmt in body:
+            transformed = self.visit(stmt)
+            if isinstance(transformed, list):
+                # If a statement was transformed into multiple statements, add them all
+                result.extend(transformed)
+            elif transformed is not None:
+                # If a statement was transformed into a single statement, add it
+                result.append(transformed)
+        return result
+
+    def visit_For(self, node: ast.For) -> Union[ast.For, None]:
+        """Process for loops, removing empty ones"""
+        # Process the body of the loop
+        node.body = self._visit_and_flatten_body(node.body)
+
+        # If the body is now empty, remove the loop
         if not node.body:
-            return []
+            return None
         return node
 
-    def visit_If(self, node: ast.If) -> Union[ast.If, List[ast.stmt]]:
-        # Process both branches to handle nested dead code
-        node.body = [self.visit(stmt) for stmt in node.body if stmt]
-        node.orelse = [self.visit(stmt) for stmt in node.orelse if stmt]
+    def visit_While(self, node: ast.While) -> Union[ast.While, None]:
+        """Process while loops, removing empty ones"""
+        node.body = self._visit_and_flatten_body(node.body)
 
-        # If both branches are empty, remove the if statement
+        if not node.body:
+            return None
+        return node
+
+    def visit_If(self, node: ast.If) -> Union[ast.If, List[ast.stmt], None]:
+        """Process if statements, simplifying or removing as needed"""
+        node.body = self._visit_and_flatten_body(node.body)
+        node.orelse = self._visit_and_flatten_body(node.orelse)
+
         if not node.body and not node.orelse:
-            return []
+            return None  # Remove the if statement if both branches are empty
 
-        # If the condition is a constant, return the appropriate branch
         if isinstance(node.test, ast.Constant):
             if node.test.value:
-                return node.body
+                return node.body  # Return only the true branch if condition is True
             else:
-                return node.orelse
-
+                return node.orelse  # Return only the false branch if condition is False
         return node
 
 
@@ -258,14 +289,14 @@ class FunctionInliner(ast.NodeTransformer):
             substituter = VariableSubstituter(arg_map)
             new_stmt = substituter.visit(stmt_copy)
 
-            # Apply constant expression evaluation
+            # Apply constant expression evaluation to simplify the statements
             expr_evaluator = ConstantExpressionEvaluator()
             if isinstance(new_stmt, list):
                 new_stmt = [expr_evaluator.visit(s) for s in new_stmt]
             else:
                 new_stmt = expr_evaluator.visit(new_stmt)
 
-            # Apply conditional evaluation
+            # Apply conditional evaluation to eliminate dead branches
             conditional_evaluator = ConditionalEvaluator()
             if isinstance(new_stmt, list):
                 processed_stmts = []
@@ -277,8 +308,13 @@ class FunctionInliner(ast.NodeTransformer):
                         processed_stmts.append(result)
                 new_stmt = processed_stmts
             else:
-                new_stmt = conditional_evaluator.visit(new_stmt)
+                result = conditional_evaluator.visit(new_stmt)
+                if isinstance(result, list):
+                    new_stmt = result
+                else:
+                    new_stmt = result
 
+            # Add the processed statements to the result
             if isinstance(new_stmt, list):
                 substituted_body.extend(new_stmt)
             elif new_stmt is not None:
@@ -382,9 +418,11 @@ def specialize_kernel(main_function, helper_names: List[str], **kwargs) -> str:
         conditional_evaluator = ConditionalEvaluator()
         inlined_main = conditional_evaluator.visit(inlined_main)
 
-        # Perform final dead code elimination
-        dead_code_eliminator = DeadCodeEliminator()
-        inlined_main = dead_code_eliminator.visit(inlined_main)
+        # Perform final dead code elimination (multiple passes)
+        # FIXME: hard coded to run 3 times
+        for _ in range(3):  # Run multiple passes to handle nested structures
+            dead_code_eliminator = DeadCodeEliminator()
+            inlined_main = dead_code_eliminator.visit(inlined_main)
 
     # Convert back to source code
     try:
