@@ -19,20 +19,18 @@ def preprocessing(input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWAR
     mm(input_tensors=input_tensors, kernel_kwargs=kernel_kwargs)
     loop_order = kernel_kwargs["loop_order"]
     tensor_positions = kernel_kwargs["tensor_positions"]
-    if len(loop_order) != 3 or sorted(loop_order) != sorted("MNK"):
+    if sorted(loop_order) != sorted("MNK"):
         raise ValueError(f"Invalid loop_order: {loop_order}. Must contain exactly M, N, and K.")
-    M_position = loop_order.index("M")
-    N_position = loop_order.index("N")
     K_position = loop_order.index("K")
-    lhsT_block_position = tensor_positions["lhsT_block_position"]
-    rhs_block_position = tensor_positions["rhs_block_position"]
-    result_block_position = tensor_positions["result_block_position"]
-    matmul_position = max(lhsT_block_position, rhs_block_position)
+    lhsT_block_position = tensor_positions["lhsT_block"]
+    rhs_block_position = tensor_positions["rhs_block"]
+    result_block_position = tensor_positions["result_block"]
+    matmul_position = tensor_positions["matmul"]
     assert (
         result_block_position <= K_position and result_block_position <= matmul_position
     ), f"result_block init must be before K loop and matmul. Received result_block_position {result_block_position}, K_position {K_position}, matmul_position {matmul_position}."
-    assert (
-        matmul_position <= lhsT_block_position and matmul_position <= rhs_block_position
+    assert matmul_position == max(
+        lhsT_block_position, rhs_block_position
     ), f"matmul must be after lhsT_block, rhs_block loads. Received matmul_position {matmul_position}, lhsT_block_position {lhsT_block_position}, rhs_block_position {rhs_block_position}."
     assert (lhsT_block_position <= K_position and rhs_block_position <= K_position) or (
         lhsT_block_position > K_position and rhs_block_position > K_position
@@ -62,9 +60,9 @@ def lhsT_rhs_gemm_general(
         NUM_BLOCK_M: int - Number of blocks along M dimension
         NUM_BLOCK_N: int - Number of blocks along N dimension
         NUM_BLOCK_K: int - Number of blocks along K dimension
-        loop_order: str - Three-character string specifying the loop ordering (e.g., "MNK", "NMK")
+        loop_order: str - Str specifying the loop ordering (e.g., "MNK")
         tensor_positions: Dict[str, int] - Positions where tensor operations occur:
-            (lhsT_block_position, rhs_block_position, result_block_position)
+            (lhsT_block, rhs_block, result_block)
 
     Returns:
         tensor of shape (M, N) - Result of the matrix multiplication
@@ -83,8 +81,8 @@ def lhsT_rhs_gemm_general(
         2. matmul operation must occur after lhsT_block and rhs_block loads
         3. lhsT_block and rhs_block loads must be on the same side of K loop
         4. Loop order must contain exactly the characters 'M', 'N', and 'K'
+        5. Save is right after the K loop
     FIXME: compute the global coordinate, use the global coordinate to update tensors
-    save and matmul locations should be mirror?
     """
     kernel_kwargs = {
         "NUM_BLOCK_M": NUM_BLOCK_M,
@@ -107,6 +105,13 @@ def lhsT_rhs_gemm_general(
                 maybe_init(
                     tensor_positions, 2, loop_order, [block_id_0, block_id_1, block_id_2], mm, (lhsT, rhs), result
                 )
+                maybe_compute(tensor_positions, 2, loop_order, [block_id_0, block_id_1, block_id_2], mm, (lhsT, rhs))
+            maybe_save(tensor_positions, 1, loop_order, [block_id_0, block_id_1], mm, result)
+            maybe_compute(tensor_positions, 1, loop_order, [block_id_0, block_id_1], mm, (lhsT, rhs))
+        maybe_save(tensor_positions, 0, loop_order, [block_id_0], mm, result)
+        maybe_compute(tensor_positions, 0, loop_order, [block_id_0], mm, (lhsT, rhs))
+    maybe_save(tensor_positions, -1, loop_order, [], mm, result)
+    maybe_compute(tensor_positions, -1, loop_order, [], mm, (lhsT, rhs))
     return result
 
 
@@ -133,47 +138,34 @@ def maybe_init(
 
 
 def maybe_compute(
-    tensor_positions: Tuple[int, int, int, int],
-    curr_position: int,
-    loop_order: str,
-    curr_block_ids,
-    mm: GEMMCompatibility,
-    input_tensors,
-    result,
-):
-    lhsT_block_position, rhs_block_position, result_block_position, matmul_position = tensor_positions
-    lhsT, rhs = input_tensors
-    if matmul_position == curr_position:
-        result_ofs = get_block_ofs(mm, loop_order, ("M", "N"), curr_position, curr_block_ids)
-        matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs=result_ofs)
-
-
-def maybe_save(
     tensor_positions: Dict[str, int],
     curr_position: int,
     loop_order: str,
     curr_block_ids,
     mm: GEMMCompatibility,
-    result_block,
-    result,
+    input_tensors,
 ):
-    M_position = loop_order.index("M")
-    N_position = loop_order.index("N")
-    K_position = loop_order.index("K")
+    if tensor_positions["matmul"] == curr_position:
+        result_ofs = get_block_ofs(mm, loop_order, ("M", "N"), curr_position, curr_block_ids)
+        matmul_blocks_lhsT(input_tensors[0], input_tensors[1], result_block, ofs=result_ofs)
+
+
+def maybe_save(
+    tensor_positions: Dict[str, int], curr_position: int, loop_order: str, curr_block_ids, mm: GEMMCompatibility, result
+):
     if tensor_positions["result_block"] == curr_position:
-        print(f"Saving {result_block.shape} into {result.shape}.")
         if curr_position == 0:
             save_result_block(result, result_block, tile_index_ofs=(0, 0))
         elif curr_position == 1:
-            if M_position == 0:
+            if loop_order.index("M") == 0:
                 tile_index_ofs = (curr_block_ids[0] * mm.TILES_IN_BLOCK_M, 0)
-            if N_position == 0:
+            if loop_order.index("N") == 0:
                 tile_index_ofs = (0, curr_block_ids[0] * mm.TILES_IN_BLOCK_N)
             save_result_block(result, result_block, tile_index_ofs=tile_index_ofs)
         elif curr_position == 2:
-            if M_position == 0:
+            if loop_order.index("M") == 0:
                 tile_index_ofs = (curr_block_ids[0] * mm.TILES_IN_BLOCK_M, curr_block_ids[1] * mm.TILES_IN_BLOCK_N)
-            if N_position == 0:
+            if loop_order.index("N") == 0:
                 tile_index_ofs = (curr_block_ids[1] * mm.TILES_IN_BLOCK_M, curr_block_ids[0] * mm.TILES_IN_BLOCK_N)
             save_result_block(result, result_block, tile_index_ofs=tile_index_ofs)
         else:
@@ -194,7 +186,7 @@ def get_block_shape(
 
     Args:
         mm (GEMMCompatibility): Object containing GEMM configuration parameters and block dimensions
-        loop_order (str): String representing the order of loops (e.g., "MNK")
+        loop_order (str): Str representing the order of loops (e.g., "MNK")
         dims (Tuple[str, str]): Tuple of dimension names to calculate shape for (e.g., ("M", "N"))
         curr_position (int): Current position in the nested loops (0, 1, 2, or 3)
 
@@ -240,7 +232,7 @@ def get_block_ofs(
 
     Args:
         mm (GEMMCompatibility): Object containing GEMM configuration parameters and block dimensions
-        loop_order (str): String representing the order of loops (e.g., "MNK")
+        loop_order (str): Str representing the order of loops (e.g., "MNK")
         dims (Tuple[str, str]): Tuple of dimension names to calculate offsets for (e.g., ("K", "M"))
         curr_position (int): Current position in the nested loops (0, 1, 2, or 3)
         curr_block_ids (List[int]): List of current block indices from the outer loops
