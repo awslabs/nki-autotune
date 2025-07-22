@@ -56,53 +56,24 @@ def lhsT_rhs_gemm_general(
     mm = GEMMCompatibility(transposed_lhs=True)
     mm((lhsT, rhs), kernel_kwargs)
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-    if tensor_positions["lhsT_block"] == 0:
-        lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), 0)
-        lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), 0, [])
+    if 2 == -1:
+        lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), -1)
+        lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), -1, [])
         lhsT_block = load_tensor_block(input_tensor=(lhsT, rhs)[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
-    if tensor_positions["rhs_block"] == 0:
-        rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 0)
-        rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), 0, [])
+    if 1 == -1:
+        rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), -1)
+        rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), -1, [])
         rhs_block = load_tensor_block(input_tensor=(lhsT, rhs)[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
-    if tensor_positions["result_block"] == 0:
-        result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), 0)
+    if -1 == -1:
+        result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), -1)
         result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
     for block_id_0 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[0]}")):
-        if tensor_positions["lhsT_block"] == 1:
-            lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), 1)
-            lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), 1, [block_id_0])
-            lhsT_block = load_tensor_block(input_tensor=(lhsT, rhs)[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
-        if tensor_positions["rhs_block"] == 1:
-            rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 1)
-            rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), 1, [block_id_0])
-            rhs_block = load_tensor_block(input_tensor=(lhsT, rhs)[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
-        if tensor_positions["result_block"] == 1:
-            result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), 1)
-            result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
         for block_id_1 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[1]}")):
-            if tensor_positions["lhsT_block"] == 2:
-                lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), 2)
-                lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), 2, [block_id_0, block_id_1])
-                lhsT_block = load_tensor_block(input_tensor=(lhsT, rhs)[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
-            if tensor_positions["rhs_block"] == 2:
-                rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 2)
-                rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), 2, [block_id_0, block_id_1])
-                rhs_block = load_tensor_block(input_tensor=(lhsT, rhs)[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
-            if tensor_positions["result_block"] == 2:
-                result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), 2)
-                result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
+            rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 1)
+            rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), 1, [block_id_0, block_id_1])
+            rhs_block = load_tensor_block(input_tensor=(lhsT, rhs)[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
             for block_id_2 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[2]}")):
-                if tensor_positions["lhsT_block"] == 3:
-                    lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), 3)
-                    lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), 3, [block_id_0, block_id_1, block_id_2])
-                    lhsT_block = load_tensor_block(
-                        input_tensor=(lhsT, rhs)[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape
-                    )
-                if tensor_positions["rhs_block"] == 3:
-                    rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 3)
-                    rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), 3, [block_id_0, block_id_1, block_id_2])
-                    rhs_block = load_tensor_block(input_tensor=(lhsT, rhs)[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
-                if tensor_positions["result_block"] == 3:
-                    result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), 3)
-                    result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
+                lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), 2)
+                lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), 2, [block_id_0, block_id_1, block_id_2])
+                lhsT_block = load_tensor_block(input_tensor=(lhsT, rhs)[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
     return result

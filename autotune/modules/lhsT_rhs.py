@@ -98,20 +98,20 @@ def lhsT_rhs_gemm_general(
     mm((lhsT, rhs), kernel_kwargs)
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
 
-    maybe_init(tensor_positions, 0, loop_order, [], mm, (lhsT, rhs), result)
+    maybe_init(tensor_positions, -1, loop_order, [], mm, (lhsT, rhs), result)
     for block_id_0 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[0]}")):
-        maybe_init(tensor_positions, 1, loop_order, [block_id_0], mm, (lhsT, rhs), result)
+        maybe_init(tensor_positions, 0, loop_order, [block_id_0], mm, (lhsT, rhs), result)
         for block_id_1 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[1]}")):
-            maybe_init(tensor_positions, 2, loop_order, [block_id_0, block_id_1], mm, (lhsT, rhs), result)
+            maybe_init(tensor_positions, 1, loop_order, [block_id_0, block_id_1], mm, (lhsT, rhs), result)
             for block_id_2 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[2]}")):
                 maybe_init(
-                    tensor_positions, 3, loop_order, [block_id_0, block_id_1, block_id_2], mm, (lhsT, rhs), result
+                    tensor_positions, 2, loop_order, [block_id_0, block_id_1, block_id_2], mm, (lhsT, rhs), result
                 )
     return result
 
 
 def maybe_init(
-    tensor_positions: Dict[str, int],
+    tensor_positions_arg: Dict[str, int],
     curr_position: int,
     loop_order: str,
     curr_block_ids,
@@ -119,15 +119,15 @@ def maybe_init(
     input_tensors,
     result,
 ):
-    if tensor_positions["lhsT_block"] == curr_position:
+    if tensor_positions_arg["lhsT_block"] == curr_position:
         lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), curr_position)
         lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), curr_position, curr_block_ids)
         lhsT_block = load_tensor_block(input_tensor=input_tensors[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
-    if tensor_positions["rhs_block"] == curr_position:
+    if tensor_positions_arg["rhs_block"] == curr_position:
         rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), curr_position)
         rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), curr_position, curr_block_ids)
         rhs_block = load_tensor_block(input_tensor=input_tensors[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
-    if tensor_positions["result_block"] == curr_position:
+    if tensor_positions_arg["result_block"] == curr_position:
         result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), curr_position)
         result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
 
