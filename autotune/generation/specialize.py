@@ -42,20 +42,55 @@ class GlobalConstantPropagator(ast.NodeTransformer):
 class ConstantExpressionEvaluator(ast.NodeTransformer):
     """Evaluate expressions involving constants"""
 
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+        """Evaluate unary operations with constant operands"""
+        node = self.generic_visit(node)
+        if isinstance(node.operand, ast.Constant):
+            try:
+                if isinstance(node.op, ast.USub):
+                    result = -node.operand.value
+                    return ast.Constant(value=result)
+                elif isinstance(node.op, ast.UAdd):
+                    result = +node.operand.value
+                    return ast.Constant(value=result)
+                elif isinstance(node.op, ast.Not):
+                    result = not node.operand.value
+                    return ast.Constant(value=result)
+                elif isinstance(node.op, ast.Invert):
+                    result = ~node.operand.value
+                    return ast.Constant(value=result)
+            except Exception:
+                pass
+        return node
+
     def visit_Compare(self, node: ast.Compare) -> ast.AST:
         """Evaluate comparison operations with constant operands"""
-        # Visit all parts of the comparison first
-        node.left = self.visit(node.left)
-        node.comparators = [self.visit(comp) for comp in node.comparators]
+        # Visit all parts of the comparison first to handle unary operations
+        node = self.generic_visit(node)
 
-        # Check if all parts are constants
-        if isinstance(node.left, ast.Constant) and all(isinstance(comp, ast.Constant) for comp in node.comparators):
-            # For simple comparisons with one operator
-            if len(node.ops) == 1 and len(node.comparators) == 1:
+        # Helper function to get the value from a node
+        def get_node_value(n):
+            if isinstance(n, ast.Constant):
+                return n.value
+            # Handle negative numbers represented as UnaryOp
+            elif isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant):
+                return -n.operand.value
+            # Handle negative numbers in older Python versions
+            elif hasattr(ast, "Num") and isinstance(n, ast.Num):
+                return n.n
+            return None
+
+        # Check if left operand is a constant
+        left_val = get_node_value(node.left)
+        if left_val is None:
+            return node
+
+        # For simple comparisons with one operator
+        if len(node.ops) == 1 and len(node.comparators) == 1:
+            right_val = get_node_value(node.comparators[0])
+            if right_val is not None:
+
                 try:
-                    left_val = node.left.value
-                    right_val = node.comparators[0].value
-
                     # Evaluate based on operator type
                     if isinstance(node.ops[0], ast.Eq):
                         result = left_val == right_val
@@ -71,10 +106,9 @@ class ConstantExpressionEvaluator(ast.NodeTransformer):
                         result = left_val >= right_val
                     else:
                         return node
-
                     return ast.Constant(value=result)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Error evaluating comparison: {e}")
 
         return node
 
@@ -83,8 +117,7 @@ class ConditionalEvaluator(ast.NodeTransformer):
     """Evaluate if-else statements with constant conditions"""
 
     def visit_If(self, node: ast.If) -> Union[ast.If, List[ast.stmt]]:
-        # Apply constant evaluation to the condition
-        node.test = self.visit(node.test)
+        # First evaluate the condition using ConstantExpressionEvaluator
         expr_evaluator = ConstantExpressionEvaluator()
         node.test = expr_evaluator.visit(node.test)
 
@@ -120,6 +153,24 @@ class DeadCodeEliminator(ast.NodeTransformer):
         node.body = [self.visit(stmt) for stmt in node.body if stmt]
         if not node.body:
             return []
+        return node
+
+    def visit_If(self, node: ast.If) -> Union[ast.If, List[ast.stmt]]:
+        # Process both branches to handle nested dead code
+        node.body = [self.visit(stmt) for stmt in node.body if stmt]
+        node.orelse = [self.visit(stmt) for stmt in node.orelse if stmt]
+
+        # If both branches are empty, remove the if statement
+        if not node.body and not node.orelse:
+            return []
+
+        # If the condition is a constant, return the appropriate branch
+        if isinstance(node.test, ast.Constant):
+            if node.test.value:
+                return node.body
+            else:
+                return node.orelse
+
         return node
 
 
@@ -206,6 +257,28 @@ class FunctionInliner(ast.NodeTransformer):
             stmt_copy = copy.deepcopy(stmt)
             substituter = VariableSubstituter(arg_map)
             new_stmt = substituter.visit(stmt_copy)
+
+            # Apply constant expression evaluation
+            expr_evaluator = ConstantExpressionEvaluator()
+            if isinstance(new_stmt, list):
+                new_stmt = [expr_evaluator.visit(s) for s in new_stmt]
+            else:
+                new_stmt = expr_evaluator.visit(new_stmt)
+
+            # Apply conditional evaluation
+            conditional_evaluator = ConditionalEvaluator()
+            if isinstance(new_stmt, list):
+                processed_stmts = []
+                for s in new_stmt:
+                    result = conditional_evaluator.visit(s)
+                    if isinstance(result, list):
+                        processed_stmts.extend(result)
+                    elif result is not None:
+                        processed_stmts.append(result)
+                new_stmt = processed_stmts
+            else:
+                new_stmt = conditional_evaluator.visit(new_stmt)
+
             if isinstance(new_stmt, list):
                 substituted_body.extend(new_stmt)
             elif new_stmt is not None:
@@ -263,23 +336,28 @@ def specialize_kernel(main_function, helper_names: List[str], **kwargs) -> str:
                 if isinstance(node, ast.FunctionDef) and node.name == helper_name:
                     # Apply transformations to helper function
                     if kwargs:
+                        # Make a deep copy to preserve the original
+                        transformed_node = copy.deepcopy(node)
+
                         # Step 1: Propagate constants
                         constant_propagator = GlobalConstantPropagator(kwargs)
-                        node = constant_propagator.visit(node)
+                        transformed_node = constant_propagator.visit(transformed_node)
 
                         # Step 2: Evaluate expressions
                         expr_evaluator = ConstantExpressionEvaluator()
-                        node = expr_evaluator.visit(node)
+                        transformed_node = expr_evaluator.visit(transformed_node)
 
                         # Step 3: Evaluate conditionals
                         conditional_evaluator = ConditionalEvaluator()
-                        node = conditional_evaluator.visit(node)
+                        transformed_node = conditional_evaluator.visit(transformed_node)
 
                         # Step 4: Remove dead code
                         dead_code_eliminator = DeadCodeEliminator()
-                        node = dead_code_eliminator.visit(node)
+                        transformed_node = dead_code_eliminator.visit(transformed_node)
 
-                    helper_funcs[helper_name] = node
+                        helper_funcs[helper_name] = transformed_node
+                    else:
+                        helper_funcs[helper_name] = node
                     break
         else:
             raise ValueError(f"Helper function '{helper_name}' not found in module")
@@ -288,7 +366,7 @@ def specialize_kernel(main_function, helper_names: List[str], **kwargs) -> str:
     inliner = FunctionInliner(helper_funcs)
 
     # Inline helpers in the main function
-    inlined_main = inliner.visit(main_func_node)
+    inlined_main = inliner.visit(copy.deepcopy(main_func_node))
 
     # Apply final transformations to the main function
     if kwargs:
@@ -304,9 +382,9 @@ def specialize_kernel(main_function, helper_names: List[str], **kwargs) -> str:
         conditional_evaluator = ConditionalEvaluator()
         inlined_main = conditional_evaluator.visit(inlined_main)
 
-    # Perform final dead code elimination
-    dead_code_eliminator = DeadCodeEliminator()
-    inlined_main = dead_code_eliminator.visit(inlined_main)
+        # Perform final dead code elimination
+        dead_code_eliminator = DeadCodeEliminator()
+        inlined_main = dead_code_eliminator.visit(inlined_main)
 
     # Convert back to source code
     try:
