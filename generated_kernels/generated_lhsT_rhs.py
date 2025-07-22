@@ -56,17 +56,8 @@ def lhsT_rhs_gemm_general(
     mm = GEMMCompatibility(transposed_lhs=True)
     mm((lhsT, rhs), kernel_kwargs)
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
-    if 2 == -1:
-        lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), -1)
-        lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), -1, [])
-        lhsT_block = load_tensor_block(input_tensor=(lhsT, rhs)[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
-    if 1 == -1:
-        rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), -1)
-        rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), -1, [])
-        rhs_block = load_tensor_block(input_tensor=(lhsT, rhs)[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
-    if -1 == -1:
-        result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), -1)
-        result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
+    result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), -1)
+    result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
     for block_id_0 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[0]}")):
         for block_id_1 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[1]}")):
             rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 1)
