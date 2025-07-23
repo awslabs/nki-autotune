@@ -19,9 +19,9 @@ def preprocessing(input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWAR
     mm(input_tensors=input_tensors, kernel_kwargs=kernel_kwargs)
     loop_order = kernel_kwargs["loop_order"]
     tensor_positions = kernel_kwargs["tensor_positions"]
-    if sorted(loop_order) != sorted("MNK"):
+    if sorted(loop_order.keys()) != sorted("MNK"):
         raise ValueError(f"Invalid loop_order: {loop_order}. Must contain exactly M, N, and K.")
-    K_position = loop_order.index("K")
+    K_position = loop_order["K"]
     lhsT_block_position = tensor_positions["lhsT_block"]
     rhs_block_position = tensor_positions["rhs_block"]
     result_block_position = tensor_positions["result_block"]
@@ -43,7 +43,7 @@ def lhsT_rhs_gemm_general(
     NUM_BLOCK_M: int,
     NUM_BLOCK_N: int,
     NUM_BLOCK_K: int,
-    loop_order: str,
+    loop_order: Dict[str, int],
     tensor_positions: Dict[str, int],
 ):
     """
@@ -60,7 +60,7 @@ def lhsT_rhs_gemm_general(
         NUM_BLOCK_M: int - Number of blocks along M dimension
         NUM_BLOCK_N: int - Number of blocks along N dimension
         NUM_BLOCK_K: int - Number of blocks along K dimension
-        loop_order: str - Str specifying the loop ordering (e.g., "MNK")
+        loop_order: Dict[str, int] - Dict specifying the loop ordering (e.g., "MNK")
         tensor_positions: Dict[str, int] - Positions where tensor operations occur:
             (lhsT_block, rhs_block, result_block)
 
@@ -95,13 +95,14 @@ def lhsT_rhs_gemm_general(
     mm = GEMMCompatibility(transposed_lhs=True)
     mm((lhsT, rhs), kernel_kwargs)
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
+    loop_order_lookup = {value: key for key, value in loop_order.items()}
 
     maybe_init(tensor_positions, -1, loop_order, [], mm, (lhsT, rhs), result)
-    for block_id_0 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[0]}")):
+    for block_id_0 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order_lookup[0]}")):
         maybe_init(tensor_positions, 0, loop_order, [block_id_0], mm, (lhsT, rhs), result)
-        for block_id_1 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[1]}")):
+        for block_id_1 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order_lookup[1]}")):
             maybe_init(tensor_positions, 1, loop_order, [block_id_0, block_id_1], mm, (lhsT, rhs), result)
-            for block_id_2 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order[2]}")):
+            for block_id_2 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order_lookup[2]}")):
                 maybe_init(
                     tensor_positions, 2, loop_order, [block_id_0, block_id_1, block_id_2], mm, (lhsT, rhs), result
                 )
@@ -118,7 +119,7 @@ def lhsT_rhs_gemm_general(
 def maybe_init(
     tensor_positions_arg: Dict[str, int],
     curr_position: int,
-    loop_order: str,
+    loop_order: Dict[str, int],
     curr_block_ids,
     mm: GEMMCompatibility,
     input_tensors,
@@ -140,7 +141,7 @@ def maybe_init(
 def maybe_compute(
     tensor_positions: Dict[str, int],
     curr_position: int,
-    loop_order: str,
+    loop_order: Dict[str, int],
     curr_block_ids,
     mm: GEMMCompatibility,
     input_tensors,
@@ -151,31 +152,35 @@ def maybe_compute(
 
 
 def maybe_save(
-    tensor_positions: Dict[str, int], curr_position: int, loop_order: str, curr_block_ids, mm: GEMMCompatibility, result
+    tensor_positions: Dict[str, int],
+    curr_position: int,
+    loop_order: Dict[str, int],
+    curr_block_ids,
+    mm: GEMMCompatibility,
+    result,
 ):
     if tensor_positions["result_block"] == curr_position:
         if curr_position == 0:
-            save_result_block(result, result_block, tile_index_ofs=(0, 0))
+            tile_index_ofs = (0, 0)
         elif curr_position == 1:
-            if loop_order.index("M") == 0:
+            if loop_order["M"] == 0:
                 tile_index_ofs = (curr_block_ids[0] * mm.TILES_IN_BLOCK_M, 0)
-            if loop_order.index("N") == 0:
+            if loop_order["N"] == 0:
                 tile_index_ofs = (0, curr_block_ids[0] * mm.TILES_IN_BLOCK_N)
-            save_result_block(result, result_block, tile_index_ofs=tile_index_ofs)
         elif curr_position == 2:
-            if loop_order.index("M") == 0:
+            if loop_order["M"] == 0:
                 tile_index_ofs = (curr_block_ids[0] * mm.TILES_IN_BLOCK_M, curr_block_ids[1] * mm.TILES_IN_BLOCK_N)
-            if loop_order.index("N") == 0:
+            if loop_order["N"] == 0:
                 tile_index_ofs = (curr_block_ids[1] * mm.TILES_IN_BLOCK_M, curr_block_ids[0] * mm.TILES_IN_BLOCK_N)
-            save_result_block(result, result_block, tile_index_ofs=tile_index_ofs)
         else:
             raise ValueError(
                 f"Invalid curr_position {curr_position} for result_block save. curr_position is in (0,1,2)."
             )
+        save_result_block(result, result_block, tile_index_ofs=tile_index_ofs)
 
 
 def get_block_shape(
-    mm: GEMMCompatibility, loop_order: str, dims: Tuple[str, str], curr_position: int
+    mm: GEMMCompatibility, loop_order: Dict[str, int], dims: Tuple[str, str], curr_position: int
 ) -> Tuple[int, int, int, int]:
     """
     Calculate the shape of tensor blocks in a GEMM operation.
@@ -186,7 +191,7 @@ def get_block_shape(
 
     Args:
         mm (GEMMCompatibility): Object containing GEMM configuration parameters and block dimensions
-        loop_order (str): Str representing the order of loops (e.g., "MNK")
+        loop_order (Dict[str,int]): Str representing the order of loops (e.g., "MNK")
         dims (Tuple[str, str]): Tuple of dimension names to calculate shape for (e.g., ("M", "N"))
         curr_position (int): Current position in the nested loops (0, 1, 2, or 3)
 
@@ -203,7 +208,7 @@ def get_block_shape(
     """
     num_blocks = []
     for dim in dims:
-        dim_position = loop_order.index(dim)
+        dim_position = loop_order[dim]
         if dim_position < curr_position:
             num_block = 1
         else:
@@ -222,7 +227,7 @@ def get_block_shape(
 
 
 def get_block_ofs(
-    mm: GEMMCompatibility, loop_order: str, dims: Tuple[str, str], curr_position: int, curr_block_ids
+    mm: GEMMCompatibility, loop_order: Dict[str, int], dims: Tuple[str, str], curr_position: int, curr_block_ids
 ) -> Tuple[int, int]:
     """
     Calculate the offset positions for blocks in a GEMM operation.
@@ -232,7 +237,7 @@ def get_block_ofs(
 
     Args:
         mm (GEMMCompatibility): Object containing GEMM configuration parameters and block dimensions
-        loop_order (str): Str representing the order of loops (e.g., "MNK")
+        loop_order (Dict[str,int]): Str representing the order of loops (e.g., "MNK")
         dims (Tuple[str, str]): Tuple of dimension names to calculate offsets for (e.g., ("K", "M"))
         curr_position (int): Current position in the nested loops (0, 1, 2, or 3)
         curr_block_ids (List[int]): List of current block indices from the outer loops
@@ -247,7 +252,7 @@ def get_block_ofs(
     block_ofs = []
     block_ofs_str = []
     for dim in dims:
-        dim_position = loop_order.index(dim)
+        dim_position = loop_order[dim]
         if dim_position < curr_position:
             block_size = getattr(mm, f"BLOCK_{dim}")
             ofs = curr_block_ids[dim_position] * getattr(mm, f"BLOCK_{dim}")

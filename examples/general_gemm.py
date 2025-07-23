@@ -1,5 +1,3 @@
-import numpy as np
-
 from autotune.generation.specialize import specialize_kernel
 from autotune.modules.lhsT_rhs import lhsT_rhs_gemm_general
 
@@ -10,10 +8,8 @@ def save_code_to_file(filepath: str, kernel_code: str):
 
 
 if __name__ == "__main__":
-    lhsT = np.random.normal(size=(1024, 2048))
-    rhs = np.random.normal(size=(1024, 4096))
     config = {
-        "loop_order": "MNK",
+        "loop_order": {"M": 0, "N": 1, "K": 2},
         "tensor_positions": {"result_block": 1, "rhs_block": 2, "lhsT_block": 0, "matmul": 2},
     }
     kernel_code = specialize_kernel(lhsT_rhs_gemm_general, ["maybe_init", "maybe_compute", "maybe_save"], **config)
