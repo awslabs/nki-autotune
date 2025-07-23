@@ -489,3 +489,46 @@ def specialize_kernel(main_function, helper_names: List[str], **kwargs) -> str:
     except ImportError:
         # Fallback if astor is not available
         return ast.unparse(inlined_main)
+
+
+def save_code_to_file(filepath: str, kernel_code: str, source_func):
+    """
+    Save the generated kernel code to a file, including necessary imports from the source module.
+
+    Args:
+        filepath: Path where to save the file
+        kernel_code: The generated kernel code
+        source_func: The source function that was specialized
+    """
+
+    # Get the module where the source function is defined
+    module = inspect.getmodule(source_func)
+
+    try:
+        if module:
+            # Get the source code of the module
+            source_code = inspect.getsource(module)
+            source_code = textwrap.dedent(source_code)
+
+            # Parse the source code into AST
+            tree = ast.parse(source_code)
+
+            # Extract import statements
+            imports = []
+            for node in tree.body:
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    imports.append(ast.unparse(node))
+
+            # Add imports to the generated code
+            import_code = "\n".join(imports)
+            kernel_code_with_imports = f"{import_code}\n\n{kernel_code}"
+
+            with open(filepath, "w") as f:
+                f.write(kernel_code_with_imports)
+            return
+    except Exception as e:
+        print(f"Warning: Could not extract imports from source module: {e}")
+
+    # Fallback if module is None or imports cannot be extracted
+    with open(filepath, "w") as f:
+        f.write(kernel_code)

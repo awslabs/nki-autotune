@@ -1,3 +1,13 @@
+from typing import Dict
+
+import neuronxcc.nki.language as nl
+from neuronxcc.nki.typing import tensor
+
+from autotune.modules.dma import load_tensor_block, save_result_block
+from autotune.modules.layout import get_block_ofs, get_block_shape
+from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT
+
+
 def lhsT_rhs_gemm_general(
     lhsT: tensor,
     rhs: tensor,
@@ -29,13 +39,16 @@ def lhsT_rhs_gemm_general(
         tensor of shape (M, N) - Result of the matrix multiplication
 
     Position reference:
-        position = -1  # Before all loops
-        loop_0        # Outermost loop
-            position = 0
-            loop_1    # Middle loop
-                position = 1
-                loop_2  # Innermost loop
-                    position = 2
+    position = -1
+    loop_0:
+        position = 0
+        loop_1:
+            position = 1
+            loop_2:
+                position = 2
+            position = 1
+        position = 0
+    position = -1
 
     Constraints:
         1. result_block initialization must occur before K loop and matmul operation
@@ -45,31 +58,26 @@ def lhsT_rhs_gemm_general(
         5. Save is right after the K loop
     FIXME: compute the global coordinate, use the global coordinate to update tensors
     """
-    kernel_kwargs = {
-        "NUM_BLOCK_M": NUM_BLOCK_M,
-        "NUM_BLOCK_N": NUM_BLOCK_N,
-        "NUM_BLOCK_K": NUM_BLOCK_K,
-        "loop_order": loop_order,
-        "tensor_positions": tensor_positions,
-    }
-    preprocessing((lhsT, rhs), kernel_kwargs)
+    kernel_kwargs = {"NUM_BLOCK_M": 2, "NUM_BLOCK_N": 1, "NUM_BLOCK_K": 4}
     mm = GEMMCompatibility(transposed_lhs=True)
     mm((lhsT, rhs), kernel_kwargs)
     result = nl.ndarray((mm.M, mm.N), dtype=lhsT.dtype, buffer=nl.shared_hbm)
     loop_order_lookup = {value: key for key, value in loop_order.items()}
     for block_id_0 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order_lookup[0]}")):
-        lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), 0)
-        lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), 0, [block_id_0])
-        lhsT_block = load_tensor_block(input_tensor=(lhsT, rhs)[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
         for block_id_1 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order_lookup[1]}")):
             result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), 1)
             result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
             for block_id_2 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order_lookup[2]}")):
+                lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), 2)
+                lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), 2, [block_id_0, block_id_1, block_id_2])
+                print(f"lhsT_ofs = {lhsT_ofs}")
+                lhsT_block = load_tensor_block(input_tensor=(lhsT, rhs)[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
                 rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 2)
                 rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), 2, [block_id_0, block_id_1, block_id_2])
+                print(f"rhs_ofs = {rhs_ofs}")
                 rhs_block = load_tensor_block(input_tensor=(lhsT, rhs)[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
                 result_ofs = get_block_ofs(mm, loop_order, ("M", "N"), 2, [block_id_0, block_id_1, block_id_2])
-                matmul_blocks_lhsT((lhsT, rhs)[0], (lhsT, rhs)[1], result_block, ofs=result_ofs)
+                matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs=result_ofs)
             tile_index_ofs = [block_id_0, block_id_1][0] * mm.TILES_IN_BLOCK_M, 0
             save_result_block(result, result_block, tile_index_ofs=tile_index_ofs)
     return result
