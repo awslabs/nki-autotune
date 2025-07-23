@@ -71,18 +71,24 @@ def matmul_MNK(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelH
             )
             for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
                 lhsT_ofs = (block_id_K * mm.BLOCK_K, block_id_M * mm.BLOCK_M)
-                print(f"lhsT_ofs = {lhsT_ofs}")
+                # print(f"lhsT_ofs = {lhsT_ofs}")
                 lhsT_block = load_tensor_block(
                     input_tensor=lhsT,
                     ofs=(block_id_K * mm.BLOCK_K, block_id_M * mm.BLOCK_M),
                     load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_M, mm.TILE_M),
                 )
+                # print(f"lhsT_block = {lhsT_block.shape}")
+                rhs_ofs = (block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N)
+                # print(f"rhs_ofs = {rhs_ofs}")
                 rhs_block = load_tensor_block(
                     input_tensor=rhs,
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 )
-                matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs=(0, 0))
+                # print(f"rhs_block = {rhs_block.shape}")
+                result_ofs = (0, 0)
+                print(f"result_ofs = {result_ofs}")
+                matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs=result_ofs)
             save_result_block(
                 result,
                 result_block,

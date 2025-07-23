@@ -160,7 +160,7 @@ def matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs: Tuple[int, int]
     rhs_block: TILE_K, TILES_IN_K, TILES_IN_N, TILE_N
     result_block : TILE_M, >=TILES_IN_M, >=TILES_IN_N, TILE_N
     """
-    print(f"lhsT_block = {lhsT_block.shape}. rhs_block = {rhs_block.shape}. result_block = {result_block.shape}.")
+    # print(f"lhsT_block {lhsT_block.shape} @ rhs_block {rhs_block.shape} = result_block {result_block.shape}.")
     TILE_K, TILES_IN_K, TILES_IN_M, TILE_M = lhsT_block.shape
     _, _, TILES_IN_N, TILE_N = rhs_block.shape
     assert rhs_block.shape == (

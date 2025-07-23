@@ -138,14 +138,14 @@ def get_block_ofs(
         if dim_position <= curr_position:
             block_size = getattr(mm, f"BLOCK_{dim}")
             ofs = curr_block_ids[dim_position] * getattr(mm, f"BLOCK_{dim}")
-            block_ofs_str.append(f"block_id * {block_size}")
+            block_ofs_str.append(f"block_id_{dim_position} * {block_size}")
         else:
             ofs = 0
             block_ofs_str.append("0")
         block_ofs.append(ofs)
     block_ofs = tuple(block_ofs)
-    # print(
-    #     f"get_block_ofs: dependent dims {dims}. curr loop position {curr_position}. loop_order {loop_order}.\n-->block_ofs{block_ofs_str}.\n-->{block_ofs}."
-    # )
+    print(
+        f"get_block_ofs: dependent dims {dims}. curr loop position {curr_position}. loop_order {loop_order}.\n-->block_ofs{block_ofs_str}.\n-->{block_ofs}."
+    )
     # FIXME: if curr_position > dim_position, there should be an offset. But need to check against the target block init location too.
     return block_ofs

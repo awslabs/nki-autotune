@@ -4,6 +4,7 @@
 
 from typing import Dict
 
+import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 
@@ -44,6 +45,7 @@ def check_template(loop_order: Dict[str, int], tensor_positions: Dict[str, int])
     ), f"lhsT_block and rhs_block must be on the same side of K loop. Received lhsT_block_position {lhsT_block_position}, rhs_block_position {rhs_block_position}, K_position {K_position}."
 
 
+@nki.jit
 def lhsT_rhs_gemm_general(
     lhsT: tensor,
     rhs: tensor,
