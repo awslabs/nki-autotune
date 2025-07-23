@@ -1,5 +1,6 @@
 from typing import Dict
 
+import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 
@@ -8,6 +9,7 @@ from autotune.modules.layout import get_block_ofs, get_block_shape
 from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT
 
 
+@nki.jit
 def lhsT_rhs_gemm_general(
     lhsT: tensor,
     rhs: tensor,
@@ -67,16 +69,28 @@ def lhsT_rhs_gemm_general(
         for block_id_1 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order_lookup[1]}")):
             result_block_shape = get_block_shape(mm, loop_order, ("M", "N"), 1)
             result_block = nl.zeros(result_block_shape, dtype=result.dtype, buffer=nl.sbuf)
+            if tensor_positions["rhs_block"] == 1:
+                rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 1)
+                rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), 1, [block_id_0, block_id_1])
+                rhs_block = load_tensor_block(input_tensor=rhs, ofs=rhs_ofs, load_shape=rhs_block_shape)
             for block_id_2 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{loop_order_lookup[2]}")):
                 lhsT_block_shape = get_block_shape(mm, loop_order, ("K", "M"), 2)
                 lhsT_ofs = get_block_ofs(mm, loop_order, ("K", "M"), 2, [block_id_0, block_id_1, block_id_2])
-                print(f"lhsT_ofs = {lhsT_ofs}")
+                # print(f"generated lhsT_ofs = {lhsT_ofs}")
                 lhsT_block = load_tensor_block(input_tensor=(lhsT, rhs)[0], ofs=lhsT_ofs, load_shape=lhsT_block_shape)
+                # print(f"generated lhsT_block = {lhsT_block.shape}")
                 rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 2)
                 rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), 2, [block_id_0, block_id_1, block_id_2])
-                print(f"rhs_ofs = {rhs_ofs}")
+                # print(f"generated rhs_ofs = {rhs_ofs}")
                 rhs_block = load_tensor_block(input_tensor=(lhsT, rhs)[1], ofs=rhs_ofs, load_shape=rhs_block_shape)
+                if tensor_positions["rhs_block"] == 2:
+                    rhs_block_shape = get_block_shape(mm, loop_order, ("K", "N"), 2)
+                    rhs_ofs = get_block_ofs(mm, loop_order, ("K", "N"), 2, [block_id_0, block_id_1, block_id_2])
+                    rhs_block = load_tensor_block(input_tensor=rhs, ofs=rhs_ofs, load_shape=rhs_block_shape)
+                # print(f"generated rhs_block = {rhs_block.shape}")
                 result_ofs = get_block_ofs(mm, loop_order, ("M", "N"), 2, [block_id_0, block_id_1, block_id_2])
+                result_ofs = (0, 0)
+                print(f"generated result_ofs = {result_ofs}")
                 matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs=result_ofs)
             tile_index_ofs = [block_id_0, block_id_1][0] * mm.TILES_IN_BLOCK_M, 0
             save_result_block(result, result_block, tile_index_ofs=tile_index_ofs)
