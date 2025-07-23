@@ -6,10 +6,11 @@ from typing import Any, Dict, List
 import numpy as np
 from neuronpy.core.language import bfloat16
 
+from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
-from autotune.modules.lhsT_rhs import lhsT_rhs_gemm_general
+from autotune.generation.lhsT_rhs import check_template, lhsT_rhs_gemm_general
+from autotune.generation.specialize import save_code_to_file, specialize_kernel
 from autotune.modules.matmul import GEMMCorrectness
-from autotune.modules.pre_compile import pre_compile_kernel
 
 
 def get_configs():
@@ -18,8 +19,8 @@ def get_configs():
             "NUM_BLOCK_M": 2,
             "NUM_BLOCK_N": 1,
             "NUM_BLOCK_K": 4,
-            "loop_order": "MKN",
-            "tensor_positions": {-1: ["result_block"], 0: [], 1: ["rhs_block"], 2: ["lhsT_block"]},
+            "loop_order": {"M": 0, "N": 1, "K": 2},
+            "tensor_positions": {"rhs_block": 2, "lhsT_block": 2, "result_block": 1, "matmul": 2},
         }
     ]
     return configs
@@ -39,24 +40,35 @@ def get_jobs(M: int, N: int, K: int, configs: List[Dict[str, Any]]):
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     jobs = ProfileJobs()
     for config_id, config in enumerate(configs):
-        kernel_code = pre_compile_kernel(lhsT_rhs_gemm_general, lhsT, rhs, **config)
-        # jobs.add_job(
-        #     kernel=("autotune/modules/lhsT_rhs.py", "lhsT_rhs_gemm_general"),
-        #     input_tensors=(lhsT, rhs),
-        #     kernel_kwargs=config,
-        #     compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-        #     preprocessing=preprocessing,
-        #     postprocessing=postprocessing,
-        # )
+        check_template(config["loop_order"], config["tensor_positions"])
+        kernel_code = specialize_kernel(lhsT_rhs_gemm_general, ["maybe_init", "maybe_compute", "maybe_save"], **config)
+        generated_file = f"generated_kernels/generated_lhsT_rhs_{config_id}.py"
+        save_code_to_file(generated_file, kernel_code, lhsT_rhs_gemm_general)
+        jobs.add_job(
+            kernel=(generated_file, "lhsT_rhs_gemm_general"),
+            input_tensors=(lhsT, rhs),
+            kernel_kwargs=config,
+            compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+            preprocessing=None,
+            postprocessing=postprocessing,
+        )
+    jobs.add_job(
+        kernel=("autotune/modules/lhsT_rhs.py", "lhsT_rhs_gemm"),
+        input_tensors=(lhsT, rhs),
+        kernel_kwargs={"NUM_BLOCK_M": 2, "NUM_BLOCK_N": 1, "NUM_BLOCK_K": 4, "template": "MNK"},
+        compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+        preprocessing=None,
+        postprocessing=postprocessing,
+    )
     return jobs
 
 
 if __name__ == "__main__":
-    cache_root_dir = "/mnt/efs/autotune-cache"
+    cache_root_dir = "/home/ubuntu/autotune-cache"
     configs = get_configs()
     jobs = get_jobs(M=512, N=512, K=10240, configs=configs)
-    # tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
-    # tuner()
+    tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
+    tuner()
     # kernels = ["lhsT_rhs_gemm_general"]
     # plot_metric(cache_root_dir, "min_ms", kernels)
     # plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)

@@ -1,7 +1,11 @@
+from typing import Dict, Tuple
+
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
 from neuronxcc.nki.typing import tensor
+
+from autotune.modules.matmul import GEMMCompatibility
 
 
 def transpose_tiles_in_block(block: tensor):
@@ -55,3 +59,93 @@ def transpose_tile(tile: tensor):
         tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=transpose_dtype, buffer=nl.psum)
         tileT[...] = nisa.nc_transpose(tile[index.p, free_ofs + index.x])
         tile[index.p, free_ofs + index.x] = nl.copy(tileT, dtype=tile.dtype)
+
+
+def get_block_shape(
+    mm: GEMMCompatibility, loop_order: Dict[str, int], dims: Tuple[str, str], curr_position: int
+) -> Tuple[int, int, int, int]:
+    """
+    Calculate the shape of tensor blocks in a GEMM operation.
+
+    This function computes the shape of blocks based on the current position in nested loops
+    and the specified dimensions. It determines how many blocks should be processed together
+    for each dimension based on loop nesting.
+
+    Args:
+        mm (GEMMCompatibility): Object containing GEMM configuration parameters and block dimensions
+        loop_order (Dict[str,int]): Str representing the order of loops (e.g., "MNK")
+        dims (Tuple[str, str]): Tuple of dimension names to calculate shape for (e.g., ("M", "N"))
+        curr_position (int): Current position in the nested loops (0, 1, 2, or 3)
+
+    Returns:
+        Tuple[int, int, int, int]: A 4-tuple representing the block shape:
+            - First element: Tile size for the first dimension
+            - Second element: Number of blocks * tiles in block for the first dimension
+            - Third element: Number of blocks * tiles in block for the second dimension
+            - Fourth element: Tile size for the second dimension
+
+    Note:
+        For dimensions with loop position less than curr_position, num_block is set to 1.
+        For other dimensions, num_block is set to the corresponding NUM_BLOCK_{dim} value.
+    """
+    num_blocks = []
+    for dim in dims:
+        dim_position = loop_order[dim]
+        if dim_position <= curr_position:
+            num_block = 1
+        else:
+            num_block = getattr(mm, f"NUM_BLOCK_{dim}")
+        num_blocks.append(num_block)
+    block_shape = (
+        getattr(mm, f"TILE_{dims[0]}"),
+        num_blocks[0] * getattr(mm, f"TILES_IN_BLOCK_{dims[0]}"),
+        num_blocks[1] * getattr(mm, f"TILES_IN_BLOCK_{dims[1]}"),
+        getattr(mm, f"TILE_{dims[1]}"),
+    )
+    # print(
+    #     f"get_block_shape: dependent dims {dims}. curr loop position {curr_position}. loop_order {loop_order}.\n--> block_shape{block_shape}."
+    # )
+    return block_shape
+
+
+def get_block_ofs(
+    mm: GEMMCompatibility, loop_order: Dict[str, int], dims: Tuple[str, str], curr_position: int, curr_block_ids
+) -> Tuple[int, int]:
+    """
+    Calculate the offset positions for blocks in a GEMM operation.
+
+    This function computes the starting offsets for blocks along specified dimensions based on
+    the current position in nested loops and the corresponding block indices.
+
+    Args:
+        mm (GEMMCompatibility): Object containing GEMM configuration parameters and block dimensions
+        loop_order (Dict[str,int]): Str representing the order of loops (e.g., "MNK")
+        dims (Tuple[str, str]): Tuple of dimension names to calculate offsets for (e.g., ("K", "M"))
+        curr_position (int): Current position in the nested loops (0, 1, 2, or 3)
+        curr_block_ids (List[int]): List of current block indices from the outer loops
+
+    Returns:
+        Tuple[int, int]: Tuple containing the offsets for the specified dimensions
+
+    Note:
+        For dimensions with loop position less than curr_position, offset is calculated as
+        block_id * block_size. For other dimensions, offset is 0.
+    """
+    block_ofs = []
+    block_ofs_str = []
+    for dim in dims:
+        dim_position = loop_order[dim]
+        if dim_position <= curr_position:
+            block_size = getattr(mm, f"BLOCK_{dim}")
+            ofs = curr_block_ids[dim_position] * getattr(mm, f"BLOCK_{dim}")
+            block_ofs_str.append(f"block_id * {block_size}")
+        else:
+            ofs = 0
+            block_ofs_str.append("0")
+        block_ofs.append(ofs)
+    block_ofs = tuple(block_ofs)
+    # print(
+    #     f"get_block_ofs: dependent dims {dims}. curr loop position {curr_position}. loop_order {loop_order}.\n-->block_ofs{block_ofs_str}.\n-->{block_ofs}."
+    # )
+    # FIXME: if curr_position > dim_position, there should be an offset. But need to check against the target block init location too.
+    return block_ofs
