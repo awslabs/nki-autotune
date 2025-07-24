@@ -87,7 +87,6 @@ def matmul_MNK(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelH
                 )
                 # print(f"rhs_block = {rhs_block.shape}")
                 result_ofs = (0, 0)
-                print(f"result_ofs = {result_ofs}")
                 matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs=result_ofs)
             save_result_block(
                 result,
@@ -115,12 +114,9 @@ def matmul_KMN(lhsT: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelH
                     load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 )
                 matmul_blocks_lhsT(
-                    lhsT_block,
-                    rhs_block,
-                    result_block,
-                    ofs=(block_id_M * mm.TILES_IN_BLOCK_M, block_id_N * mm.TILES_IN_BLOCK_N),
+                    lhsT_block, rhs_block, result_block, ofs=(block_id_M * mm.BLOCK_M, block_id_N * mm.BLOCK_N)
                 )
-    save_result_block(result, result_block, m_ofs=0, n_ofs=0)
+    save_result_block(result, result_block, tile_index_ofs=(0, 0))
     return result
 
 

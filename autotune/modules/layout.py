@@ -112,40 +112,34 @@ def get_block_ofs(
     mm: GEMMCompatibility, loop_order: Dict[str, int], dims: Tuple[str, str], curr_position: int, curr_block_ids
 ) -> Tuple[int, int]:
     """
-    Calculate the offset positions for blocks in a GEMM operation.
-
     This function computes the starting offsets for blocks along specified dimensions based on
     the current position in nested loops and the corresponding block indices.
 
     Args:
         mm (GEMMCompatibility): Object containing GEMM configuration parameters and block dimensions
-        loop_order (Dict[str,int]): Str representing the order of loops (e.g., "MNK")
+        loop_order (Dict[str,int]): Dict representing the order of loops
         dims (Tuple[str, str]): Tuple of dimension names to calculate offsets for (e.g., ("K", "M"))
-        curr_position (int): Current position in the nested loops (0, 1, 2, or 3)
+        curr_position (int): Current integer position in the nested loops
         curr_block_ids (List[int]): List of current block indices from the outer loops
 
     Returns:
         Tuple[int, int]: Tuple containing the offsets for the specified dimensions
 
     Note:
-        For dimensions with loop position less than curr_position, offset is calculated as
+        For dimensions with loop position <= curr_position, offset is calculated as
         block_id * block_size. For other dimensions, offset is 0.
     """
     block_ofs = []
-    block_ofs_str = []
     for dim in dims:
         dim_position = loop_order[dim]
         if dim_position <= curr_position:
             block_size = getattr(mm, f"BLOCK_{dim}")
             ofs = curr_block_ids[dim_position] * getattr(mm, f"BLOCK_{dim}")
-            block_ofs_str.append(f"block_id_{dim_position} * {block_size}")
         else:
             ofs = 0
-            block_ofs_str.append("0")
         block_ofs.append(ofs)
     block_ofs = tuple(block_ofs)
     print(
-        f"get_block_ofs: dependent dims {dims}. curr loop position {curr_position}. loop_order {loop_order}.\n-->block_ofs{block_ofs_str}.\n-->{block_ofs}."
+        f"get_block_ofs: dependent dims {dims}. curr loop position {curr_position}. loop_order {loop_order}.\n-->{block_ofs}."
     )
-    # FIXME: if curr_position > dim_position, there should be an offset. But need to check against the target block init location too.
     return block_ofs
