@@ -8,7 +8,6 @@ from neuronpy.core.language import bfloat16
 
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
-from autotune.generation.lhsT_rhs import check_template
 from autotune.modules.matmul import GEMMCorrectness
 
 
@@ -18,8 +17,8 @@ def get_configs():
             "NUM_BLOCK_M": 2,
             "NUM_BLOCK_N": 1,
             "NUM_BLOCK_K": 4,
-            "loop_order": {"M": 0, "N": 1, "K": 2},
-            "tensor_positions": {"rhs_block": 2, "lhsT_block": 2, "result_block": 1, "matmul": 2},
+            "loop_order_str": "MNK",
+            "tensor_positions": {"lhsT_block": 0, "rhs_block": 1},
         }
     ]
     return configs
@@ -39,12 +38,12 @@ def get_jobs(M: int, N: int, K: int, configs: List[Dict[str, Any]]):
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     jobs = ProfileJobs()
     for config_id, config in enumerate(configs):
-        check_template(config["loop_order"], config["tensor_positions"])
+        # process_template(config["loop_order"], config["tensor_positions"])
         # kernel_code = specialize_kernel(lhsT_rhs_gemm_general, ["maybe_init", "maybe_compute", "maybe_save"], **config)
-        generated_file = f"generated_kernels/generated_lhsT_rhs_{config_id}.py"
+        # generated_file = f"generated_kernels/generated_lhsT_rhs_{config_id}.py"
         # save_code_to_file(generated_file, kernel_code, lhsT_rhs_gemm_general)
         jobs.add_job(
-            kernel=(generated_file, "lhsT_rhs_gemm_general"),
+            kernel=("autotune/modules/meta_lhsT_rhs.py", "lhsT_rhs_gemm_general"),
             input_tensors=(lhsT, rhs),
             kernel_kwargs=config,
             compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
@@ -55,6 +54,14 @@ def get_jobs(M: int, N: int, K: int, configs: List[Dict[str, Any]]):
         kernel=("autotune/modules/lhsT_rhs.py", "lhsT_rhs_gemm"),
         input_tensors=(lhsT, rhs),
         kernel_kwargs={"NUM_BLOCK_M": 2, "NUM_BLOCK_N": 1, "NUM_BLOCK_K": 4, "template": "MNK"},
+        compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+        preprocessing=None,
+        postprocessing=postprocessing,
+    )
+    jobs.add_job(
+        kernel=("autotune/modules/lhsT_rhs.py", "lhsT_rhs_gemm"),
+        input_tensors=(lhsT, rhs),
+        kernel_kwargs={"NUM_BLOCK_M": 2, "NUM_BLOCK_N": 1, "NUM_BLOCK_K": 4, "template": "KMN"},
         compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
         preprocessing=None,
         postprocessing=postprocessing,

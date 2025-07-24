@@ -153,12 +153,30 @@ class GEMMCompatibility:
 
 def matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs: Tuple[int, int]):
     """
-    Accumulate matmul result tiles between lhsT and rhs into result_block
+    Perform tiled matrix multiplication between transposed left-hand side and right-hand side matrices.
+
+    This function computes the matrix multiplication lhsT @ rhs, where lhsT is already in transposed format.
+    Results are accumulated into the result_block at the specified offset position. The multiplication
+    is performed by iterating over tiles in each dimension and accumulating results along the K dimension.
+    This implementation optimizes performance by operating on blocked matrices for hardware efficiency.
 
     Args:
-    lhsT_block: TILE_K, TILES_IN_K, TILES_IN_M, TILE_M
-    rhs_block: TILE_K, TILES_IN_K, TILES_IN_N, TILE_N
-    result_block : TILE_M, >=TILES_IN_M, >=TILES_IN_N, TILE_N
+        lhsT_block: Left-hand side matrix block in transposed format.
+                   Shape: (TILE_K, TILES_IN_K, TILES_IN_M, TILE_M)
+                   Where TILE_K/M are tile sizes and TILES_IN_K/M are counts of tiles in those dimensions.
+        rhs_block: Right-hand side matrix block.
+                  Shape: (TILE_K, TILES_IN_K, TILES_IN_N, TILE_N)
+                  Where TILE_K/N are tile sizes and TILES_IN_K/N are counts of tiles in those dimensions.
+        result_block: Output matrix block where results are accumulated.
+                     Shape: (TILE_M, >=TILES_IN_M, >=TILES_IN_N, TILE_N)
+                     Must have sufficient space to store all tiles in M and N dimensions.
+        ofs: Tuple of (M_offset, N_offset) specifying where in the result_block to start accumulating.
+             These offsets are in #elements (not tiles or blocks).
+
+    Notes:
+        - This function accumulates results, so the result_block is both input and output
+        - Intermediate calculations use hardware-specific buffer allocation (nl.psum)
+        - The K dimension is fully accumulated over during the computation
     """
     # print(f"lhsT_block {lhsT_block.shape} @ rhs_block {rhs_block.shape} = result_block {result_block.shape}.")
     TILE_K, TILES_IN_K, TILES_IN_M, TILE_M = lhsT_block.shape
