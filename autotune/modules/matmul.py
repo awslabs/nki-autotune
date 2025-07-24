@@ -23,6 +23,10 @@ class GEMMCompatibility:
             transposed_lhs: Whether the LHS matrix should be interpreted as transposed.
         """
         self.transposed_lhs = transposed_lhs
+        # Single tile sizes (hardware constants)
+        self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+        self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+        self.TILE_K = nl.tile_size.pmax  # 128
 
     def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE):
         """
@@ -71,11 +75,6 @@ class GEMMCompatibility:
         for dim_name, dim_value in [("M", self.M), ("K", self.K), ("N", self.N)]:
             if dim_value <= 0:
                 raise ValueError(f"Dimension {dim_name} must be positive, got {dim_value}")
-
-        # Single tile sizes (hardware constants)
-        self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-        self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-        self.TILE_K = nl.tile_size.pmax  # 128
 
         # Number of blocks (None means no blocking in that dimension)
         self.NUM_BLOCK_M = NUM_BLOCK_M

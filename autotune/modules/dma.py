@@ -46,7 +46,6 @@ def load_tensor_block(input_tensor, ofs: Tuple[int, int], load_shape: Tuple[int,
         for column_tile_id in nl.affine_range(column_num_tiles):
             row_indices = ofs[0] + row_tile_id * row_tile_size + tile_index.p
             col_indices = ofs[1] + column_tile_id * column_tile_size + tile_index.x
-            # print(f"row_indices = {row_indices}. col_indices = {col_indices}.")
             block[tile_index.p, row_tile_id, column_tile_id, tile_index.x] = nl.load(
                 input_tensor[row_indices, col_indices], mask=(row_indices < max_rows) & (col_indices < max_cols)
             )

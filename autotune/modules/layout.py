@@ -127,14 +127,14 @@ def get_block_ofs(
 
     Note:
         For dimensions with loop position <= curr_position, offset is calculated as
-        block_id * block_size. For other dimensions, offset is 0.
+        block_id * block_size. For other dimensions, offset is block_id * 0 = 0.
     """
     block_ofs = []
     for dim in dims:
         dim_position = loop_order[dim]
         if dim_position <= curr_position:
             block_size = getattr(mm, f"BLOCK_{dim}")
-            ofs = curr_block_ids[dim_position] * getattr(mm, f"BLOCK_{dim}")
+            ofs = curr_block_ids[dim_position] * block_size
         else:
             ofs = 0
         block_ofs.append(ofs)
