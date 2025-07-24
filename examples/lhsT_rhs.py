@@ -6,9 +6,9 @@ from typing import Any, Dict, List
 import numpy as np
 from neuronpy.core.language import bfloat16
 
-from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
 from autotune.modules.matmul import GEMMCorrectness
+from autotune.modules.meta_lhsT_rhs import MetaTGEMM
 
 
 def get_configs():
@@ -38,7 +38,6 @@ def get_jobs(M: int, N: int, K: int, configs: List[Dict[str, Any]]):
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     jobs = ProfileJobs()
     for config_id, config in enumerate(configs):
-        # process_template(config["loop_order"], config["tensor_positions"])
         # kernel_code = specialize_kernel(lhsT_rhs_gemm_general, ["maybe_init", "maybe_compute", "maybe_save"], **config)
         # generated_file = f"generated_kernels/generated_lhsT_rhs_{config_id}.py"
         # save_code_to_file(generated_file, kernel_code, lhsT_rhs_gemm_general)
@@ -71,10 +70,26 @@ def get_jobs(M: int, N: int, K: int, configs: List[Dict[str, Any]]):
 
 if __name__ == "__main__":
     cache_root_dir = "/home/ubuntu/autotune-cache"
-    configs = get_configs()
-    jobs = get_jobs(M=512, N=512, K=10240, configs=configs)
-    tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
-    tuner()
+    # configs = get_configs()
+    # jobs = get_jobs(M=512, N=512, K=10240, configs=configs)
+    # tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
+    # tuner()
     # kernels = ["lhsT_rhs_gemm_general"]
     # plot_metric(cache_root_dir, "min_ms", kernels)
     # plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)
+
+    M = 512
+    N = 512
+    K = 10240
+    data_type = "float32"
+    lhsT = np.random.normal(size=(K, M)).astype(data_type)
+    rhs = np.random.normal(size=(K, N)).astype(data_type)
+    config = {
+        "NUM_BLOCK_M": 2,
+        "NUM_BLOCK_N": 1,
+        "NUM_BLOCK_K": 4,
+        "loop_order": "MNK",
+        "tensor_positions": {"lhsT_block": 0, "rhs_block": 1},
+    }
+    kernel = MetaTGEMM(**config)
+    kernel(lhsT, rhs)
