@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from itertools import product
+from itertools import permutations, product
 
 import numpy as np
 from neuronpy.core.language import bfloat16
@@ -9,7 +9,23 @@ from neuronpy.core.language import bfloat16
 from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
+from autotune.core.tune import generate_configs
 from autotune.modules.matmul import GEMMCompatibility, GEMMCorrectness
+
+
+def get_configs():
+    size_options = [1, 2, 4, 8, 16]
+    loop_orders = list(permutations("MNK"))
+    loop_orders = ["".join(loop_order) for loop_order in loop_orders]
+    loop_orders = ["MNK"]
+    params = {
+        "NUM_BLOCK_M": size_options,
+        "NUM_BLOCK_N": size_options,
+        "NUM_BLOCK_K": size_options,
+        "loop_order": loop_orders,
+    }
+    configs = generate_configs(**params)
+    return configs
 
 
 def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
@@ -24,51 +40,29 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         raise NotImplementedError(f"{data_type} is not implemented.")
     lhs = np.random.normal(size=(M, K)).astype(data_type)
     rhs = np.random.normal(size=(K, N)).astype(data_type)
-    jobs.add_job(
-        kernel=("autotune/modules/matmul.py", "lhs_rhs_gemm_np"),
-        input_tensors=(lhs, rhs),
-        kernel_kwargs={},
-        compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-        preprocessing=GEMMCompatibility(transposed_lhs=False),
-        postprocessing=postprocessing,
-    )
-
-    size_options = [1, 2, 4, 8, 16]
-    NUM_BLOCK_M_options = size_options
-    NUM_BLOCK_N_options = size_options
-    NUM_BLOCK_K_options = size_options
-    templates = ["MN", "MKN", "MNK"]
-    params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options, templates))
-    autotune_jobs = ProfileJobs()
-    for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K, template in params:
-        autotune_jobs.add_job(
+    configs = get_configs()
+    for config in configs:
+        jobs.add_job(
             kernel=("autotune/modules/lhs_rhs.py", "lhs_rhs_gemm"),
             input_tensors=(lhs, rhs),
-            kernel_kwargs={
-                "NUM_BLOCK_M": NUM_BLOCK_M,
-                "NUM_BLOCK_N": NUM_BLOCK_N,
-                "NUM_BLOCK_K": NUM_BLOCK_K,
-                "template": template,
-            },
+            kernel_kwargs=config,
             compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
             preprocessing=GEMMCompatibility(transposed_lhs=False),
             postprocessing=postprocessing,
         )
-    autotune_jobs.sample(100)
-    jobs.extend(autotune_jobs)
+    return jobs
 
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
-    mn_shapes = [128]
-    k_shapes = [4096]
+    mn_shapes = [4096]
+    k_shapes = [8192]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     jobs = ProfileJobs()
-    add_jobs(jobs, M=128, N=512, K=4096)
-    # for M, N, K in MNK:
-    #     add_jobs(jobs, M, N, K)
+    for M, N, K in MNK:
+        add_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
-    kernels = ["lhs_rhs_gemm_np", "lhs_rhs_gemm"]
+    kernels = ["lhs_rhs_gemm"]
     plot_metric(cache_root_dir, "min_ms", kernels)
     plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)

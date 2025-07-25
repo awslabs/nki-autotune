@@ -86,7 +86,9 @@ class GEMMCompatibility:
 
         # Validate contraction dimension matches
         if self.K != K_:
-            raise ValueError(f"Contraction dimension mismatch: LHS has K={self.K}, RHS has K={K_}")
+            raise ValueError(
+                f"Contraction dimension mismatch: LHS {lhs_shape} has K={self.K}, RHS {rhs_shape} has K={K_}"
+            )
 
         # Validate dimensions
         self._check()
