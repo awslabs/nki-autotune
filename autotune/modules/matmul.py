@@ -301,42 +301,6 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks,
             result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
 
 
-def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks, block_id_N):
-    """
-    Accumulate matmul result tiles between lhs and rhs into result_block
-    LHS is transposed at the tile level.
-    Note that this is not the same as lhsT.
-    'matmul_block' module computes lhsT @ rhs.
-
-    Args:
-    tileT_lhs_block: TILE_M, TILE_K, TILES_IN_M, TILES_IN_K
-    rhs_block: TILE_K, TILE_N, TILES_IN_K, TILES_IN_N
-    result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
-    """
-    TILE_M, TILES_IN_M, TILES_IN_K, TILE_K = tileT_lhs_block.shape
-    _TILE_K, _TILES_IN_K, TILES_IN_N, TILE_N = rhs_block.shape
-    _TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_N = result_blocks.shape
-    assert (
-        TILE_K == _TILE_K and TILES_IN_K == _TILES_IN_K
-    ), f"K dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. rhs_block {rhs_block.shape}."
-
-    idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
-    idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(TILES_IN_M):
-        for tile_id_N in nl.affine_range(TILES_IN_N):
-            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            """
-            Use PSUM buffer to accumulate into a single hardware tile
-            """
-            for tile_id_K in nl.affine_range(TILES_IN_K):
-                result_tile += nisa.nc_matmul(
-                    tileT_lhs_block[idx_lhs.p, tile_id_M, tile_id_K, idx_lhs.x],
-                    rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x],
-                )
-            result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
-
-
 class GEMMCorrectness:
     def __init__(self, transposed_lhs: bool) -> None:
         self.transposed_lhs = transposed_lhs

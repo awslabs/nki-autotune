@@ -130,7 +130,7 @@ def save_result_block(result, result_block, tile_index_ofs: Tuple[int, int]):
     """
     M, N = result.shape
     TILE_M, TILES_IN_M, TILES_IN_N, TILE_N = result_block.shape
-    print(f"Saving result_block {result_block.shape} into result {result.shape} with ofs {tile_index_ofs}.")
+    # print(f"Saving result_block {result_block.shape} into result {result.shape} with ofs {tile_index_ofs}.")
 
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for tile_id_M in nl.affine_range(TILES_IN_M):
