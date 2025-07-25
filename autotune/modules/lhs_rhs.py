@@ -9,19 +9,17 @@ from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhs, matmul
 
 
 @nki.jit
-def lhs_rhs_gemm(lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int, template: str):
+def lhs_rhs_gemm(lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int, loop_order: str):
     mm = GEMMCompatibility(transposed_lhs=False)
     mm((lhs, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K})
 
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
-    if template == "MNK":
+    if loop_order == "MNK":
         gemm_lhs_MNK(lhs, rhs, mm, result)
-    elif template == "MN":
-        gemm_lhs_MN(lhs, rhs, mm, result)
-    elif template == "MKN":
+    elif loop_order == "MKN":
         gemm_lhs_MKN(lhs, rhs, mm, result)
     else:
-        raise NotImplementedError(f"template {template} not implemented")
+        raise NotImplementedError(f"loop_order {loop_order} not implemented")
     return result
 
 
@@ -45,44 +43,20 @@ def gemm_lhs_MNK(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: Kernel
                     load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 )
                 matmul_blocks_lhs(lhs_block, rhs_block, result_block)
-            save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
-    return result
-
-
-def gemm_lhs_MN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
-    for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-        # FIXME: fix the load shape
-        lhs_block = load_tensor_block(
-            input_tensor=lhs,
-            ofs=(block_id_M * mm.BLOCK_M, 0),
-            load_shape=(mm.TILE_M, mm.TILES_IN_BLOCK_M, mm.TILES_IN_K, mm.TILE_K),
-        )
-        for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
-            result_block = nl.zeros(
-                (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N),
-                dtype=lhs.dtype,
-                buffer=nl.sbuf,
+            save_result_block(
+                result,
+                result_block,
+                tile_index_ofs=(block_id_M * mm.TILES_IN_BLOCK_M, block_id_N * mm.TILES_IN_BLOCK_N),
             )
-            rhs_block = load_tensor_block(
-                input_tensor=rhs,
-                ofs=(0, block_id_N * mm.BLOCK_N),
-                load_shape=(mm.TILE_K, mm.TILES_IN_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
-            )
-            matmul_blocks_lhs(lhs_block, rhs_block, result_block)
-            save_result_block(result, result_block, m_ofs=block_id_M * mm.BLOCK_M, n_ofs=block_id_N * mm.BLOCK_N)
     return result
 
 
 def gemm_lhs_MKN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: KernelHBMTensor):
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
-        # TODO: tune different free dimension layout
-        result_blocks = nl.zeros(
-            (nl.par_dim(mm.TILE_M), mm.NUM_BLOCK_N, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N),
-            dtype=result.dtype,
-            buffer=nl.sbuf,
+        result_block = nl.zeros(
+            (nl.par_dim(mm.TILE_M), mm.TILES_IN_BLOCK_M, mm.TILES_IN_N, mm.TILE_N), dtype=result.dtype, buffer=nl.sbuf
         )
         for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
-            # TODO: tune different free dimension layout
             lhs_block = load_tensor_block(
                 input_tensor=lhs,
                 ofs=(block_id_M * mm.BLOCK_M, block_id_K * mm.BLOCK_K),
@@ -95,8 +69,6 @@ def gemm_lhs_MKN(lhs: tensor, rhs: tensor, mm: GEMMCompatibility, result: Kernel
                     ofs=(block_id_K * mm.BLOCK_K, block_id_N * mm.BLOCK_N),
                     load_shape=(mm.TILE_K, mm.TILES_IN_BLOCK_K, mm.TILES_IN_BLOCK_N, mm.TILE_N),
                 )
-                # TODO: handle different lhs, rhs layouts
-                matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_blocks, block_id_N)
-        save_result_dma(result, result_blocks, block_id_M)
-
+                matmul_blocks_tile_transposed_lhs(lhs_block, rhs_block, result_block, block_id_N)
+        save_result_dma(result, result_block, block_id_M)
     return result
