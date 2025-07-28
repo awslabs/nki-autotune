@@ -2,9 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from typing import Dict, List, Tuple
-
-from autotune.modules.matmul import GEMMCompatibility
+from typing import Dict, Tuple
 
 
 class MetaGEMM:
@@ -32,20 +30,26 @@ class MetaGEMM:
         - Result init and save must be K_position, on the same level.
         It is pointless to further hoist result init and save out of the M,N parallel dimensions.
         """
+        self.transposed_lhs = transposed_lhs
         self.loop_order = str_to_dict(loop_order)
         assert sorted(loop_order) == sorted(
             "MNK"
         ), f"Invalid loop_order: {loop_order}. Must contain exactly M, N, and K."
+        if self.transposed_lhs:
+            self.lhs_dims = ("K", "M")
+        else:
+            self.lhs_dims = ("M", "K")
+        self.rhs_dims = ("K", "N")
+        self.result_dims = ("M", "N")
         self.op_positions: Dict[str, int] = {}
-        self.op_positions["lhs"] = self._parse_absolute_position(lhs_position, ["M", "K"])
-        self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, ["K", "N"])
+        self.op_positions["lhs"] = self._parse_absolute_position(lhs_position, self.lhs_dims)
+        self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, self.rhs_dims)
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
-        self.transposed_lhs = transposed_lhs
         self.code_file_path = "generated_kernels/generated_kernel.py"
         self._generate_code()
 
-    def _parse_absolute_position(self, relative_position: int, dependent_dims: List[str]):
+    def _parse_absolute_position(self, relative_position: int, dependent_dims: Tuple[str, ...]):
         """
         relative_position to calculate absolute_position:
         - Must be > dependent_dim_positions[:relative_position]
@@ -93,7 +97,6 @@ def lhs_rhs_gemm(
         """
         loop_openings = ""
         loop_closings = ""
-        print(self.op_positions)
         for loop_position in [0, 1, 2]:
             opening, closing = self._generate_loop(loop_position)
             loop_openings += opening
@@ -132,22 +135,25 @@ def lhs_rhs_gemm(
 
     def _generate_opening_at_position(self, loop_position: int) -> str:
         indentation = self._get_indentation(loop_position)
-        ops = []
-        for op in self.op_positions:
-            if self.op_positions[op] == loop_position:
-                ops.append(op)
         code = ""
-        if "lhs" in ops:
+        if self.op_positions["lhs"] == loop_position:
+            shape = self._get_block_shape(self.lhs_dims, loop_position)
             code += f"""
-    {indentation}lhs_block = load_tensor_block(lhs, xxx)
+    {indentation}lhs_block = load_tensor_block(input_tensor=lhs,
+    {indentation}   dim_0=(mm.TILE_{self.lhs_dims[0]}, {shape[0]}, {shape[1]}),
+    {indentation}   dim_1=(mm.TILE_{self.lhs_dims[1]}, {shape[2]}, {shape[3]}))
             """
-        if "rhs" in ops:
+        if self.op_positions["rhs"] == loop_position:
+            shape = self._get_block_shape(self.rhs_dims, loop_position)
             code += f"""
-    {indentation}rhs_block = load_tensor_block(rhs, xxx)
+    {indentation}rhs_block = load_tensor_block(input_tensor=rhs,
+    {indentation}   dim_0=(mm.TILE_{self.rhs_dims[0]}, {shape[0]}, {shape[1]}),
+    {indentation}   dim_1=(mm.TILE_{self.rhs_dims[1]}, {shape[2]}, {shape[3]}))
             """
-        if "result" in ops:
+        if self.op_positions["result"] == loop_position:
+            shape = self._get_block_shape(self.result_dims, loop_position)
             code += f"""
-    {indentation}result_block = nl.zeros(xxx)
+    {indentation}result_block = nl.zeros((mm.TILE_M, {shape[1]}, {shape[3]}, mm.TILE_N), dtype=result.dtype,buffer=nl.sbuf)
             """
         return code
 
@@ -155,46 +161,36 @@ def lhs_rhs_gemm(
         indentation = 4 * " "
         return indent_level * indentation
 
+    def _get_block_shape(self, dims: Tuple[str, str], loop_position: int) -> Tuple[str, ...]:
+        """
+        Calculate the shape of tensor blocks in a GEMM operation.
 
-def get_block_shape(mm: GEMMCompatibility, dims: Tuple[str, str], loop_position: int) -> Tuple[int, int, int, int]:
-    """
-    Calculate the shape of tensor blocks in a GEMM operation.
+        This function computes the shape of blocks based on the current position in nested loops
+        and the specified dimensions. It determines how many blocks should be processed together
+        for each dimension based on loop nesting.
 
-    This function computes the shape of blocks based on the current position in nested loops
-    and the specified dimensions. It determines how many blocks should be processed together
-    for each dimension based on loop nesting.
+        Args:
+            dims (Tuple[str, str]): Tuple of dimension names to calculate shape for (e.g., ("M", "N"))
+            loop_position (int): position in the nested loops (0, 1, 2, 3)
 
-    Args:
-        dims (Tuple[str, str]): Tuple of dimension names to calculate shape for (e.g., ("M", "N"))
-        loop_position (int): position in the nested loops (-1, 0, 1, 2)
+        Returns:
+            Tuple[4 * int]: (starting tile index 0, number of tiles 0, starting tile index 1, number of tiles 1)
 
-    Returns:
-        Tuple[int, int, int, int]: A 4-tuple representing the block shape:
-            - First element: Tile size for the first dimension
-            - Second element: Number of blocks * tiles in block for the first dimension
-            - Third element: Number of blocks * tiles in block for the second dimension
-            - Fourth element: Tile size for the second dimension
-
-    Note:
-        For dimensions with loop position less than curr_position, num_block is set to 1.
-        For other dimensions, num_block is set to the corresponding NUM_BLOCK_{dim} value.
-    """
-    block_shape = [getattr(mm, f"TILE_{dims[0]}")]
-    for dim in dims:
-        dim_position = self.loop_order[dim]
-        tiles_in_block = getattr(self.mm, f"TILES_IN_BLOCK_{dim}")
-        if dim_position <= loop_position:
-            num_block = 1
-        else:
-            num_block = getattr(self.mm, f"NUM_BLOCK_{dim}")
-        num_tiles = num_block * tiles_in_block
-        block_shape.append(num_tiles)
-    block_shape.append(getattr(self.mm, f"TILE_{dims[1]}"))
-    block_shape = tuple(block_shape)
-    # print(
-    #     f"get_block_shape: dependent dims {dims}. curr loop position {curr_position}. loop_order {loop_order}.\n--> block_shape{block_shape}."
-    # )
-    return block_shape
+        Note:
+            If <= dimension position, starting = 0. Else starting = block_id_X.
+            If <= dimension position, num_tiles = mm.TILES_IN_X. Else num_tiles = mm.TILES_IN_BLOCK_X.
+        """
+        block_shape = ()
+        for dim in dims:
+            dim_position = self.loop_order[dim]
+            if loop_position <= dim_position:
+                starting = "0"
+                num_tiles = f"mm.TILES_IN_{dim}"
+            else:
+                starting = f"block_id_{dim}"
+                num_tiles = f"mm.TILES_IN_BLOCK_{dim}"
+            block_shape += (starting, num_tiles)
+        return block_shape
 
 
 def str_to_dict(loop_order: str) -> Dict:

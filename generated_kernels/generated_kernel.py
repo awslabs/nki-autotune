@@ -17,15 +17,23 @@ def lhs_rhs_gemm(lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, N
 
     for block_id_M in nl.affine_range(mm.NUM_BLOCK_M):
 
-        lhs_block = load_tensor_block(lhs, xxx)
+        lhs_block = load_tensor_block(
+            input_tensor=lhs, dim_0=(mm.TILE_K, 0, mm.TILES_IN_K), dim_1=(mm.TILE_M, block_id_M, mm.TILES_IN_BLOCK_M)
+        )
 
         for block_id_N in nl.affine_range(mm.NUM_BLOCK_N):
 
-            result_block = nl.zeros(xxx)
+            result_block = nl.zeros(
+                (mm.TILE_M, mm.TILES_IN_BLOCK_M, mm.TILES_IN_BLOCK_N, mm.TILE_N), dtype=result.dtype, buffer=nl.sbuf
+            )
 
             for block_id_K in nl.affine_range(mm.NUM_BLOCK_K):
 
-                rhs_block = load_tensor_block(rhs, xxx)
+                rhs_block = load_tensor_block(
+                    input_tensor=rhs,
+                    dim_0=(mm.TILE_K, block_id_K, mm.TILES_IN_BLOCK_K),
+                    dim_1=(mm.TILE_N, block_id_N, mm.TILES_IN_BLOCK_N),
+                )
 
                 matmul_blocks_lhsT(lhs_block, rhs_block, result_block, ofs=xxx)
 
