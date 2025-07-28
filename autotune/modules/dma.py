@@ -3,39 +3,21 @@ from typing import Tuple
 import neuronxcc.nki.language as nl
 
 
-def load_tensor_block(input_tensor, ofs: Tuple[int, int], load_shape: Tuple[int, int, int, int]):
+def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[int, int, int]):
     """
-    Load a 2D rectangle region from the input HBM tensor to SBUF.
-    The location of the 2D region is offset by (row_offset, column_offset) at its upper left corner.
-    The size of the 2D region to load into SBUF is (row_tile_size * row_num_tiles, column_tile_size * column_num_tiles).
-    Load the input HBM tensor by (row_tile_size, column_tile_size) tiles in parallel.
-    Output SBUF tensor has a shape of load_shape.
-
-    +------------------+
-    |                  |
-    |    +--------+    |  ← Starting at (ofs[0], ofs[1])
-    |    |Tile 0  |    |
-    |    |Tile 1  |    |  Each tile is (par_size * free_size)
-    |    |  ...   |    |
-    |    |Tile N-1|    |  N = block_size
-    |    +--------+    |
-    |                  |
-    +------------------+
-
     Args:
         input_tensor: the input 2D HBM tensor
-        ofs: location offsets in the 2D HBM tensor dimensions
-        load_shape: (row_tile_size, row_num_tiles, column_num_tiles, column_tile_size)
+        dim_0, dim_1: (tile size, starting tile index, number of tiles)
 
     Returns:
-        Loaded tiles in SBUF in the shape of load_shape
+        Loaded tiles in SBUF in the shape of (tile_size_0, num_tiles_0, num_tiles_1, tile_size_1)
     """
-    assert len(ofs) == 2, f"'ofs' expects (row_offset, column_offset). Received {ofs}."
-    assert (
-        len(load_shape) == 4
-    ), f"'load_shape' expects (row_tile_size, row_num_tiles, column_num_tiles, column_tile_size). Received {load_shape}."
+    assert len(dim_0) == 3, f"'dim_0' expects (tile size, starting tile index, number of tiles). Received {dim_0}."
+    assert len(dim_1) == 3, f"'dim_1' expects (tile size, starting tile index, number of tiles). Received {dim_1}."
+    assert len(input_tensor.shape) == 2, f"Expects 2D input tensor. Received {input_tensor.shape}."
     max_rows, max_cols = input_tensor.shape
-    row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = load_shape
+    row_tile_size, row_tile_id_start, row_num_tiles = dim_0
+    column_tile_size, column_tile_id_start, column_num_tiles = dim_1
     tile_index = nl.mgrid[0:row_tile_size, 0:column_tile_size]
     block = nl.ndarray(
         (nl.par_dim(row_tile_size), row_num_tiles, column_num_tiles, column_tile_size),
@@ -44,10 +26,11 @@ def load_tensor_block(input_tensor, ofs: Tuple[int, int], load_shape: Tuple[int,
     )
     for row_tile_id in nl.affine_range(row_num_tiles):
         for column_tile_id in nl.affine_range(column_num_tiles):
-            row_indices = ofs[0] + row_tile_id * row_tile_size + tile_index.p
-            col_indices = ofs[1] + column_tile_id * column_tile_size + tile_index.x
+            row_indices = (row_tile_id_start + row_tile_id) * row_tile_size + tile_index.p
+            col_indices = (column_tile_id_start + column_tile_id) * column_tile_size + tile_index.x
+            mask = (row_indices < max_rows) & (col_indices < max_cols)
             block[tile_index.p, row_tile_id, column_tile_id, tile_index.x] = nl.load(
-                input_tensor[row_indices, col_indices], mask=(row_indices < max_rows) & (col_indices < max_cols)
+                input_tensor[row_indices, col_indices], mask=mask
             )
     return block
 
