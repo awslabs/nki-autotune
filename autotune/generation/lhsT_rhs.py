@@ -12,38 +12,6 @@ from autotune.modules.layout import get_block_ofs, get_block_shape
 from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT
 
 
-def check_template(loop_order: Dict[str, int], tensor_positions: Dict[str, int]):
-    """
-    Position reference:
-    position = 0
-    loop_0:
-        position = 1
-        loop_1:
-            position = 2
-            loop_2:
-                position = 3
-            position = 2
-        position = 1
-    position = 0
-    """
-    if sorted(loop_order.keys()) != sorted("MNK"):
-        raise ValueError(f"Invalid loop_order: {loop_order}. Must contain exactly M, N, and K.")
-    K_position = loop_order["K"]
-    lhsT_block_position = tensor_positions["lhsT_block"]
-    rhs_block_position = tensor_positions["rhs_block"]
-    result_block_position = tensor_positions["result_block"]
-    matmul_position = tensor_positions["matmul"]
-    assert (
-        result_block_position < K_position and result_block_position < matmul_position
-    ), f"result_block init must be before K loop and matmul. Received result_block_position {result_block_position}, K_position {K_position}, matmul_position {matmul_position}."
-    assert matmul_position == max(
-        lhsT_block_position, rhs_block_position
-    ), f"matmul must be right after lhsT_block, rhs_block loads. Received matmul_position {matmul_position}, lhsT_block_position {lhsT_block_position}, rhs_block_position {rhs_block_position}."
-    assert (lhsT_block_position <= K_position and rhs_block_position <= K_position) or (
-        lhsT_block_position >= K_position and rhs_block_position >= K_position
-    ), f"lhsT_block and rhs_block must be on the same side of K loop. Received lhsT_block_position {lhsT_block_position}, rhs_block_position {rhs_block_position}, K_position {K_position}."
-
-
 def lhsT_rhs_gemm_general(
     lhsT: tensor,
     rhs: tensor,
@@ -93,18 +61,6 @@ def lhsT_rhs_gemm_general(
         4. Loop order must contain exactly the characters 'M', 'N', and 'K'
         5. Save is right after the K loop
     FIXME: compute the global coordinate, use the global coordinate to update tensors
-
-    standard Python:
-    if xxx:
-        tensor = init()
-    f(tensor)
-
-    NKI:
-    if xxx:
-        lhs = init()
-    else:
-        lhs = init()
-    matmul(lhs, rhs) --> X
     """
     kernel_kwargs = {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K}
     mm = GEMMCompatibility(transposed_lhs=True)

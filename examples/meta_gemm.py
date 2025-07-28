@@ -19,15 +19,8 @@ def get_configs():
     loop_orders = ["".join(loop_order) for loop_order in loop_orders]
     loop_orders = ["MNK"]
     lhs_positions = [1]
-    rhs_positions = [0, 1, 2]
-    params = {
-        "NUM_BLOCK_M": size_options,
-        "NUM_BLOCK_N": size_options,
-        "NUM_BLOCK_K": size_options,
-        "loop_order": loop_orders,
-        "lhs_position": lhs_positions,
-        "rhs_position": rhs_positions,
-    }
+    rhs_positions = [3]
+    params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
     configs = generate_configs(**params)
     return configs
 
@@ -36,17 +29,17 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
-        postprocessing = GEMMCorrectness(transposed_lhs=False)
+        postprocessing = GEMMCorrectness(transposed_lhs=True)
     elif data_type == "bf16":
         data_type = bfloat16
         postprocessing = None
     else:
         raise NotImplementedError(f"{data_type} is not implemented.")
-    lhs = np.random.normal(size=(M, K)).astype(data_type)
+    lhsT = np.random.normal(size=(K, M)).astype(data_type)
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     configs = get_configs()
     for config in configs:
-        kernel = MetaGEMM(**config)
+        kernel = MetaGEMM(transposed_lhs=True, **config)
         # jobs.add_job(
         #     kernel=("autotune/modules/lhs_rhs.py", "lhs_rhs_gemm"),
         #     input_tensors=(lhs, rhs),
@@ -55,7 +48,6 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         #     preprocessing=GEMMCompatibility(transposed_lhs=False),
         #     postprocessing=postprocessing,
         # )
-        break
     return jobs
 
 
