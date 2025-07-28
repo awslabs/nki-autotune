@@ -6,23 +6,27 @@ from itertools import permutations, product
 import numpy as np
 from neuronpy.core.language import bfloat16
 
-from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
 from autotune.core.tune import generate_configs
-from autotune.modules.matmul import GEMMCompatibility, GEMMCorrectness
+from autotune.generation.meta_gemm import MetaGEMM
+from autotune.modules.matmul import GEMMCorrectness
 
 
 def get_configs():
     size_options = [2, 4, 8]
     loop_orders = list(permutations("MNK"))
     loop_orders = ["".join(loop_order) for loop_order in loop_orders]
-    loop_orders = ["MKN"]
+    loop_orders = ["MNK"]
+    lhs_positions = [1]
+    rhs_positions = [0, 1, 2]
     params = {
         "NUM_BLOCK_M": size_options,
         "NUM_BLOCK_N": size_options,
         "NUM_BLOCK_K": size_options,
         "loop_order": loop_orders,
+        "lhs_position": lhs_positions,
+        "rhs_position": rhs_positions,
     }
     configs = generate_configs(**params)
     return configs
@@ -42,14 +46,16 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     configs = get_configs()
     for config in configs:
-        jobs.add_job(
-            kernel=("autotune/modules/lhs_rhs.py", "lhs_rhs_gemm"),
-            input_tensors=(lhs, rhs),
-            kernel_kwargs=config,
-            compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-            preprocessing=GEMMCompatibility(transposed_lhs=False),
-            postprocessing=postprocessing,
-        )
+        kernel = MetaGEMM(**config)
+        # jobs.add_job(
+        #     kernel=("autotune/modules/lhs_rhs.py", "lhs_rhs_gemm"),
+        #     input_tensors=(lhs, rhs),
+        #     kernel_kwargs=config,
+        #     compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+        #     preprocessing=GEMMCompatibility(transposed_lhs=False),
+        #     postprocessing=postprocessing,
+        # )
+        break
     return jobs
 
 
@@ -62,7 +68,7 @@ if __name__ == "__main__":
     for M, N, K in MNK:
         add_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
-    tuner()
-    kernels = ["lhs_rhs_gemm"]
-    plot_metric(cache_root_dir, "min_ms", kernels)
-    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)
+    # tuner()
+    # kernels = ["lhs_rhs_gemm"]
+    # plot_metric(cache_root_dir, "min_ms", kernels)
+    # plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)

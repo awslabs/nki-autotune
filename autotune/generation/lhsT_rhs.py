@@ -15,16 +15,16 @@ from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT
 def check_template(loop_order: Dict[str, int], tensor_positions: Dict[str, int]):
     """
     Position reference:
-    position = -1
+    position = 0
     loop_0:
-        position = 0
+        position = 1
         loop_1:
-            position = 1
+            position = 2
             loop_2:
-                position = 2
-            position = 1
-        position = 0
-    position = -1
+                position = 3
+            position = 2
+        position = 1
+    position = 0
     """
     if sorted(loop_order.keys()) != sorted("MNK"):
         raise ValueError(f"Invalid loop_order: {loop_order}. Must contain exactly M, N, and K.")

@@ -171,6 +171,7 @@ def matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs: Tuple[int, int]
         result_block: Output matrix block where results are accumulated.
                      Shape: (TILE_M, >=TILES_IN_M, >=TILES_IN_N, TILE_N)
                      Must have sufficient space to store all tiles in M and N dimensions.
+        FIXME: use #tiles as offsets instead
         ofs: Tuple of (M_offset, N_offset) specifying where in the result_block to start accumulating.
              These offsets are in #elements (not tiles or blocks).
 
@@ -179,7 +180,6 @@ def matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs: Tuple[int, int]
         - Intermediate calculations use hardware-specific buffer allocation (nl.psum)
         - The K dimension is fully accumulated over during the computation
     """
-    # print(f"lhsT_block {lhsT_block.shape} @ rhs_block {rhs_block.shape} = result_block {result_block.shape}.")
     TILE_K, TILES_IN_K, TILES_IN_M, TILE_M = lhsT_block.shape
     _, _, TILES_IN_N, TILE_N = rhs_block.shape
     assert rhs_block.shape == (
@@ -267,7 +267,7 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
             result_block[idx_res.p, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
 
 
-def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks, block_id_N):
+def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_block, block_id_N):
     """
     Accumulate matmul result tiles between lhs and rhs into result_block
     LHS is transposed at the tile level.
@@ -275,13 +275,23 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks,
     'matmul_block' module computes lhsT @ rhs.
 
     Args:
-    tileT_lhs_block: TILE_M, TILE_K, TILES_IN_M, TILES_IN_K
-    rhs_block: TILE_K, TILE_N, TILES_IN_K, TILES_IN_N
+    tileT_lhs_block: TILE_M, TILES_IN_M, TILES_IN_K, TILE_K. Tile transposed LHS block.
+    rhs_block: TILE_K, TILES_IN_K, TILES_IN_N, TILE_N
     result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
+
+    FIXME: add tile number offsets in lhs and rhs
     """
     TILE_M, TILES_IN_M, TILES_IN_K, TILE_K = tileT_lhs_block.shape
-    _TILE_K, _TILES_IN_K, TILES_IN_N, TILE_N = rhs_block.shape
-    _TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_N = result_blocks.shape
+    _, _, TILES_IN_N, TILE_N = rhs_block.shape
+    assert rhs_block.shape == (
+        TILE_K,
+        TILES_IN_K,
+        TILES_IN_N,
+        TILE_N,
+    ), f"RHS dimension mismatch: tileT_lhs_block (M, K) {tileT_lhs_block.shape}. rhs_block (K, M) {rhs_block.shape}."
+    TILE_M, mm.TILES_IN_BLOCK_M, mm.TILES_IN_N, mm.TILE_N
+    _TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_N = result_block.shape
+    _TILE_M, TILES_IN_BLOCK_M, TILES_IN_N, TILE_N = result_block.shape
     assert (
         TILE_K == _TILE_K and TILES_IN_K == _TILES_IN_K
     ), f"K dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. rhs_block {rhs_block.shape}."
@@ -300,7 +310,7 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks,
                     tileT_lhs_block[idx_lhs.p, tile_id_M, tile_id_K, idx_lhs.x],
                     rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x],
                 )
-            result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
+            result_block[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
 
 
 class GEMMCorrectness:
