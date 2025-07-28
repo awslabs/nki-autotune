@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
@@ -13,30 +13,38 @@ from autotune.modules.layout import get_block_ofs
 from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT
 
 
-class MetaTGEMM:
+class MetaGEMM:
     """
     Position reference:
-    position = -1
+    position = 0
     loop_0:
-        position = 0
+        position = 1
         loop_1:
-            position = 1
+            position = 2
             loop_2:
-                position = 2
-            position = 1
-        position = 0
-    position = -1
+                position = 3
+            position = 2
+        position = 1
+    position = 0
     """
 
     def __init__(
-        self, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int, loop_order: str, tensor_positions: Dict[str, int]
+        self,
+        NUM_BLOCK_M: int,
+        NUM_BLOCK_N: int,
+        NUM_BLOCK_K: int,
+        loop_order: str,
+        lhs_position: int,
+        rhs_position: int,
     ) -> None:
         """
         Requirements:
         - Loop order must contain exactly the characters 'M', 'N', and 'K'.
-        - matmul_position = max(lhsT_block_position, rhs_block_position), otherwise some input blocks are lost.
-        - save_position = K_position - 1. Must save as soon as K accumulation is done, otherwise some output blocks are lost.
-        - result_block_position <= matmul_position to fully cover output blocks coordinates.
+        - Load LHS position: | M | K | = 3 choices. Always try to stay <= N level if possible.
+        - Load RHS position: | N | K | = 3 choices. Always try to stay <= M level if possible.
+        - Matmul is dependent on MNK dimensions, has to happen in the innermost loop, position = 3.
+        - Result init and save must be K_position, on the same level.
+        It is pointless to further hoist result init and save out of the M,N parallel dimensions.
         """
         self.NUM_BLOCK_M = NUM_BLOCK_M
         self.NUM_BLOCK_N = NUM_BLOCK_N
@@ -45,10 +53,33 @@ class MetaTGEMM:
         assert sorted(loop_order) == sorted(
             "MNK"
         ), f"Invalid loop_order: {loop_order}. Must contain exactly M, N, and K."
-        self.op_positions = tensor_positions
-        self.op_positions["matmul"] = max(tensor_positions["lhsT_block"], tensor_positions["rhs_block"])
-        self.op_positions["save"] = self.loop_order["K"] - 1
+        self.op_positions = {}
+        self.op_positions["lhs"] = self._parse_absolute_position(lhs_position, ["M", "K"])
+        self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, ["K", "N"])
+        self.op_positions["matmul"] = 3
+        self.op_positions["result"] = self.loop_order["K"]
         self.mm = GEMMCompatibility(transposed_lhs=True)
+
+    def _parse_absolute_position(self, relative_position: int, dependent_dims: List[str]):
+        """
+        relative_position to calculate absolute_position:
+        - Must be > dependent_dim_positions[:relative_position]
+        - Must be <= dependent_dim_positions[relative_position:]
+        - As small as possible.
+        """
+        candidates = [0, 1, 2, 3]
+        dependent_dim_positions = sorted([self.loop_order[dim] for dim in dependent_dims])
+        valid_positions = []
+        for candidate in candidates:
+            valids = []
+            for dependent_dim_position in dependent_dim_positions[:relative_position]:
+                valids.append(candidate > dependent_dim_position)
+            for dependent_dim_position in dependent_dim_positions[relative_position:]:
+                valids.append(candidate <= dependent_dim_position)
+            if all(valids):
+                valid_positions.append(candidate)
+        absolute_position = min(valid_positions)
+        return absolute_position
 
     def __call__(self, lhsT: tensor, rhs: tensor):
         self.mm(
