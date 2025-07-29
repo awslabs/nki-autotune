@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+from pathlib import Path
 from typing import Dict, Tuple
 
 
@@ -113,6 +114,7 @@ def lhs_rhs_gemm(
         total_code = "".join(
             [imports, func_header, common_body, loop_openings, innermost_loop_body, loop_closings, return_code]
         )
+        Path(self.code_file_path).parent.mkdir(parents=True, exist_ok=True)
         with open(self.code_file_path, "w") as f:
             f.write(total_code)
 
@@ -138,9 +140,9 @@ def lhs_rhs_gemm(
         indentation = self._get_indentation(loop_position)
         code += f"""
     {indentation}matmul_blocks_lhsT(
-    {indentation}   lhs_block, ({self.lhs_block_shape[0]}, {self.lhs_block_shape[1]}), ({self.lhs_block_shape[2]}, {self.lhs_block_shape[3]}),
-    {indentation}   rhs_block, ({self.rhs_block_shape[0]}, {self.rhs_block_shape[1]}), ({self.rhs_block_shape[2]}, {self.rhs_block_shape[3]}),
-    {indentation}   result_block, ({self.result_block_shape[0]}, {self.result_block_shape[1]}), ({self.result_block_shape[2]}, {self.result_block_shape[3]})
+    {indentation}   lhs_block, ({self.lhs_block_shape[0]}, {self.lhs_block_shape[2]}),
+    {indentation}   rhs_block, ({self.rhs_block_shape[0]}, {self.rhs_block_shape[2]}),
+    {indentation}   result_block, ({self.result_block_shape[0]}, {self.result_block_shape[2]})
     {indentation})
     """
         return code
