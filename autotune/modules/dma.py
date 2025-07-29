@@ -76,7 +76,7 @@ def save_result_acc(result, result_block, BLOCK_M, BLOCK_N):
                     )
 
 
-def save_result_block(result, result_block, tile_index_ofs: Tuple[int, int]):
+def save_result_block(result, result_block, result_block_dim_0: Tuple[int, int], result_block_dim_1: Tuple[int, int]):
     """
     Store a 4D SBUF block of tiled results back into a 2D HBM tensor.
     The result_block tensor contains data organized in tiles that need to be stored in the
@@ -111,15 +111,15 @@ def save_result_block(result, result_block, tile_index_ofs: Tuple[int, int]):
     Returns:
         None. The result tensor is modified in-place.
     """
-    M, N = result.shape
-    TILE_M, TILES_IN_M, TILES_IN_N, TILE_N = result_block.shape
-    # print(f"Saving result_block {result_block.shape} into result {result.shape} with ofs {tile_index_ofs}.")
-
+    start_M_tile, num_M_tiles = result_block_dim_0
+    start_N_tile, num_N_tiles = result_block_dim_1
+    TILE_M, _, _, TILE_N = result_block.shape
+    assert result_block.shape == (TILE_M, num_M_tiles, num_N_tiles, TILE_N)
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(TILES_IN_M):
-        m_start = (tile_index_ofs[0] + tile_id_M) * TILE_M
-        for tile_id_N in nl.affine_range(TILES_IN_N):
-            n_start = (tile_index_ofs[1] + tile_id_N) * TILE_N
+    for tile_id_M in nl.affine_range(num_M_tiles):
+        m_start = (start_M_tile + tile_id_M) * TILE_M
+        for tile_id_N in nl.affine_range(num_N_tiles):
+            n_start = (start_N_tile + tile_id_N) * TILE_N
             nl.store(
                 result[m_start + idx_res.p, n_start + idx_res.x],
                 value=result_block[idx_res.p, tile_id_M, tile_id_N, idx_res.x],

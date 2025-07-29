@@ -35,8 +35,20 @@ def lhs_rhs_gemm(lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, N
                     dim_1=(mm.TILE_N, block_id_N, mm.TILES_IN_BLOCK_N),
                 )
 
-                matmul_blocks_lhsT(lhs_block, rhs_block, result_block, ofs=xxx)
+                matmul_blocks_lhsT(
+                    lhs_block,
+                    (0, mm.TILES_IN_K),
+                    (block_id_M, mm.TILES_IN_BLOCK_M),
+                    rhs_block,
+                    (block_id_K, mm.TILES_IN_BLOCK_K),
+                    (block_id_N, mm.TILES_IN_BLOCK_N),
+                    result_block,
+                    (block_id_M, mm.TILES_IN_BLOCK_M),
+                    (block_id_N, mm.TILES_IN_BLOCK_N),
+                )
 
-            save_result_block(result, result_block, xxx)
+            save_result_block(
+                result, result_block, (block_id_M, mm.TILES_IN_BLOCK_M), (block_id_N, mm.TILES_IN_BLOCK_N)
+            )
 
     return result

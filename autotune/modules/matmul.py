@@ -152,7 +152,17 @@ class GEMMCompatibility:
                 )
 
 
-def matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs: Tuple[int, int]):
+def matmul_blocks_lhsT(
+    lhsT_block,
+    lhsT_block_dim_0: Tuple[int, int],
+    lhsT_block_dim_1: Tuple[int, int],
+    rhs_block,
+    rhs_block_dim_0: Tuple[int, int],
+    rhs_block_dim_1: Tuple[int, int],
+    result_block,
+    result_block_dim_0: Tuple[int, int],
+    result_block_dim_1: Tuple[int, int],
+):
     """
     Perform tiled matrix multiplication between transposed left-hand side and right-hand side matrices.
 
@@ -162,57 +172,60 @@ def matmul_blocks_lhsT(lhsT_block, rhs_block, result_block, ofs: Tuple[int, int]
     This implementation optimizes performance by operating on blocked matrices for hardware efficiency.
 
     Args:
-        lhsT_block: Left-hand side matrix block in transposed format.
-                   Shape: (TILE_K, TILES_IN_K, TILES_IN_M, TILE_M)
-                   Where TILE_K/M are tile sizes and TILES_IN_K/M are counts of tiles in those dimensions.
-        rhs_block: Right-hand side matrix block.
-                  Shape: (TILE_K, TILES_IN_K, TILES_IN_N, TILE_N)
-                  Where TILE_K/N are tile sizes and TILES_IN_K/N are counts of tiles in those dimensions.
-        result_block: Output matrix block where results are accumulated.
-                     Shape: (TILE_M, >=TILES_IN_M, >=TILES_IN_N, TILE_N)
-                     Must have sufficient space to store all tiles in M and N dimensions.
-        FIXME: use #tiles as offsets instead
-        ofs: Tuple of (M_offset, N_offset) specifying where in the result_block to start accumulating.
-             These offsets are in #elements (not tiles or blocks).
-
-    Notes:
-        - This function accumulates results, so the result_block is both input and output
-        - Intermediate calculations use hardware-specific buffer allocation (nl.psum)
-        - The K dimension is fully accumulated over during the computation
+        lhsT_block: Left-hand side matrix block in transposed format. (K, M)
+        rhs_block: Right-hand side matrix block. (K, N)
+        result_block: Output matrix block where results are accumulated. (M, N)
+        xxx_block_dim_x: starting tile index, num_tiles in dimension x
+        FIXME: use #tiles as offsets instead.
+        Need to account for the starting, num_tiles for lhs, rhs, and result.
     """
-    TILE_K, TILES_IN_K, TILES_IN_M, TILE_M = lhsT_block.shape
-    _, _, TILES_IN_N, TILE_N = rhs_block.shape
-    assert rhs_block.shape == (
-        TILE_K,
-        TILES_IN_K,
-        TILES_IN_N,
-        TILE_N,
-    ), f"lhsT_block {lhsT_block.shape} shape mismatch with rhs_block {rhs_block.shape}"
+    TILE_K, _, _, TILE_M = lhsT_block.shape
+    _TILE_K, _, _, TILE_N = rhs_block.shape
+    _TILE_M, _, _, _TILE_N = result_block.shape
+    assert TILE_K == _TILE_K, f"lhsT_block {lhsT_block.shape} tile K mismatch with rhs_block {rhs_block.shape}"
     assert (
-        result_block.shape[0] == TILE_M
-        and result_block.shape[1] >= TILES_IN_M
-        and result_block.shape[2] >= TILES_IN_N
-        and result_block.shape[3] == TILE_N
+        TILE_M == _TILE_M and TILE_N == _TILE_N
     ), f"result_block {result_block.shape} shape mismatch with lhsT_block {lhsT_block.shape} @ rhs_block {rhs_block.shape}"
-
     idx_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    M_ofs, N_ofs = ofs
-    for tile_id_M in nl.affine_range(TILES_IN_M):
-        for tile_id_N in nl.affine_range(TILES_IN_N):
+
+    start_M_tile, num_M_tiles = calculate_intersection(lhsT_block_dim_1, result_block_dim_0)
+    start_N_tile, num_N_tiles = calculate_intersection(rhs_block_dim_1, result_block_dim_1)
+    start_K_tile, num_K_tiles = calculate_intersection(lhsT_block_dim_0, rhs_block_dim_0)
+    lhsT_block_ofs = (start_K_tile - lhsT_block_dim_0[0], start_M_tile - lhsT_block_dim_1[0])
+    rhs_block_ofs = (start_K_tile - rhs_block_dim_0[0], start_N_tile - rhs_block_dim_1[0])
+    result_block_ofs = (start_M_tile - result_block_dim_0[0], start_N_tile - result_block_dim_1[0])
+
+    for tile_id_M in nl.affine_range(num_M_tiles):
+        for tile_id_N in nl.affine_range(num_N_tiles):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             """
             Use PSUM buffer to accumulate into a single hardware tile
             """
-            for tile_id_K in nl.affine_range(TILES_IN_K):
+            for tile_id_K in nl.affine_range(num_K_tiles):
                 result_tile += nisa.nc_matmul(
-                    lhsT_block[idx_lhsT.p, tile_id_K, tile_id_M, idx_lhsT.x],
-                    rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x],
+                    lhsT_block[idx_lhsT.p, lhsT_block_ofs[0] + tile_id_K, lhsT_block_ofs[1] + tile_id_M, idx_lhsT.x],
+                    rhs_block[idx_rhs.p, rhs_block_ofs[0] + tile_id_K, rhs_block_ofs[1] + tile_id_N, idx_rhs.x],
                 )
-            result_block[idx_res.p, M_ofs // TILE_M + tile_id_M, N_ofs // TILE_N + tile_id_N, idx_res.x] += result_tile[
-                idx_res.p, idx_res.x
-            ]
+            result_block[
+                idx_res.p, result_block_ofs[0] + tile_id_M, result_block_ofs[1] + tile_id_N, idx_res.x
+            ] += result_tile[idx_res.p, idx_res.x]
+
+
+def calculate_intersection(interval_0: Tuple[int, int], interval_1: Tuple[int, int]) -> Tuple[int, int]:
+    start_0, size_0 = interval_0
+    start_1, size_1 = interval_1
+
+    end_0 = start_0 + size_0
+    end_1 = start_1 + size_1
+
+    intersection_start = max(start_0, start_1)
+    intersection_end = min(end_0, end_1)
+    intersection_size = intersection_end - intersection_start
+    assert intersection_size > 0, f"Interval {interval_0} and {interval_1} do not overlap."
+
+    return (intersection_start, intersection_size)
 
 
 def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
