@@ -54,8 +54,11 @@ class MetaGEMM:
         relative_position to calculate absolute_position:
         - Must be > dependent_dim_positions[:relative_position]
         - Must be <= dependent_dim_positions[relative_position:]
-        - As small as possible.
+        - As small as possible to reduce redundant ops.
         """
+        assert relative_position in range(
+            len(dependent_dims) + 1
+        ), f"relative_position {relative_position} is out of bound for dependent_dims {dependent_dims}."
         candidates = [0, 1, 2, 3]
         dependent_dim_positions = sorted([self.loop_order[dim] for dim in dependent_dims])
         valid_positions = []
@@ -119,7 +122,10 @@ def lhs_rhs_gemm(
         """
         if self.op_positions["save"] == loop_position:
             closing = f"""
-    {indentation}save_result_block(result, result_block, xxx)
+    {indentation}save_result_block(result, result_block,
+    {indentation}   ({self.result_block_shape[0]}, {self.result_block_shape[1]}),
+    {indentation}   ({self.result_block_shape[2]}, {self.result_block_shape[3]})
+    {indentation})
         """
         else:
             closing = ""
@@ -129,7 +135,11 @@ def lhs_rhs_gemm(
         code = self._generate_opening_at_position(loop_position)
         indentation = self._get_indentation(loop_position)
         code += f"""
-    {indentation}matmul_blocks_lhsT(lhs_block, rhs_block, result_block, ofs=xxx)
+    {indentation}matmul_blocks_lhsT(
+    {indentation}   lhs_block, ({self.lhs_block_shape[0]}, {self.lhs_block_shape[1]}), ({self.lhs_block_shape[2]}, {self.lhs_block_shape[3]}),
+    {indentation}   rhs_block, ({self.rhs_block_shape[0]}, {self.rhs_block_shape[1]}), ({self.rhs_block_shape[2]}, {self.rhs_block_shape[3]}),
+    {indentation}   result_block, ({self.result_block_shape[0]}, {self.result_block_shape[1]}), ({self.result_block_shape[2]}, {self.result_block_shape[3]})
+    {indentation})
     """
         return code
 
@@ -137,23 +147,23 @@ def lhs_rhs_gemm(
         indentation = self._get_indentation(loop_position)
         code = ""
         if self.op_positions["lhs"] == loop_position:
-            shape = self._get_block_shape(self.lhs_dims, loop_position)
+            self.lhs_block_shape = self._get_block_shape(self.lhs_dims, loop_position)
             code += f"""
     {indentation}lhs_block = load_tensor_block(input_tensor=lhs,
-    {indentation}   dim_0=(mm.TILE_{self.lhs_dims[0]}, {shape[0]}, {shape[1]}),
-    {indentation}   dim_1=(mm.TILE_{self.lhs_dims[1]}, {shape[2]}, {shape[3]}))
+    {indentation}   dim_0=(mm.TILE_{self.lhs_dims[0]}, {self.lhs_block_shape[0]}, {self.lhs_block_shape[1]}),
+    {indentation}   dim_1=(mm.TILE_{self.lhs_dims[1]}, {self.lhs_block_shape[2]}, {self.lhs_block_shape[3]}))
             """
         if self.op_positions["rhs"] == loop_position:
-            shape = self._get_block_shape(self.rhs_dims, loop_position)
+            self.rhs_block_shape = self._get_block_shape(self.rhs_dims, loop_position)
             code += f"""
     {indentation}rhs_block = load_tensor_block(input_tensor=rhs,
-    {indentation}   dim_0=(mm.TILE_{self.rhs_dims[0]}, {shape[0]}, {shape[1]}),
-    {indentation}   dim_1=(mm.TILE_{self.rhs_dims[1]}, {shape[2]}, {shape[3]}))
+    {indentation}   dim_0=(mm.TILE_{self.rhs_dims[0]}, {self.rhs_block_shape[0]}, {self.rhs_block_shape[1]}),
+    {indentation}   dim_1=(mm.TILE_{self.rhs_dims[1]}, {self.rhs_block_shape[2]}, {self.rhs_block_shape[3]}))
             """
         if self.op_positions["result"] == loop_position:
-            shape = self._get_block_shape(self.result_dims, loop_position)
+            self.result_block_shape = self._get_block_shape(self.result_dims, loop_position)
             code += f"""
-    {indentation}result_block = nl.zeros((mm.TILE_M, {shape[1]}, {shape[3]}, mm.TILE_N), dtype=result.dtype,buffer=nl.sbuf)
+    {indentation}result_block = nl.zeros((mm.TILE_{self.result_dims[0]}, {self.result_block_shape[1]}, {self.result_block_shape[3]}, mm.TILE_{self.result_dims[1]}), dtype=result.dtype,buffer=nl.sbuf)
             """
         return code
 
