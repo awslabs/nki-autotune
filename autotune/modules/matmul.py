@@ -154,14 +154,11 @@ class GEMMCompatibility:
 
 def matmul_blocks_lhsT(
     lhsT_block,
-    lhsT_block_dim_0: Tuple[int, int],
-    lhsT_block_dim_1: Tuple[int, int],
+    lhsT_tile_ofs: Tuple[int, int],
     rhs_block,
-    rhs_block_dim_0: Tuple[int, int],
-    rhs_block_dim_1: Tuple[int, int],
+    rhs_tile_ofs: Tuple[int, int],
     result_block,
-    result_block_dim_0: Tuple[int, int],
-    result_block_dim_1: Tuple[int, int],
+    result_tile_ofs: Tuple[int, int],
 ):
     """
     Perform tiled matrix multiplication between transposed left-hand side and right-hand side matrices.
@@ -175,13 +172,12 @@ def matmul_blocks_lhsT(
         lhsT_block: Left-hand side matrix block in transposed format. (K, M)
         rhs_block: Right-hand side matrix block. (K, N)
         result_block: Output matrix block where results are accumulated. (M, N)
-        xxx_block_dim_x: starting tile index, num_tiles in dimension x
-        FIXME: use #tiles as offsets instead.
-        Need to account for the starting, num_tiles for lhs, rhs, and result.
+        xxx_tile_ofs: starting tile index in the two dimensions
+    FIXME: be more strict. cannot handle arbitrary offsets.
     """
-    TILE_K, _, _, TILE_M = lhsT_block.shape
-    _TILE_K, _, _, TILE_N = rhs_block.shape
-    _TILE_M, _, _, _TILE_N = result_block.shape
+    TILE_K, lhsT_num_K_tiles, lhsT_num_M_tiles, TILE_M = lhsT_block.shape
+    _TILE_K, rhs_num_K_tiles, rhs_num_N_tiles, TILE_N = rhs_block.shape
+    _TILE_M, result_num_M_tiles, result_num_N_tiles, _TILE_N = result_block.shape
     assert TILE_K == _TILE_K, f"lhsT_block {lhsT_block.shape} tile K mismatch with rhs_block {rhs_block.shape}"
     assert (
         TILE_M == _TILE_M and TILE_N == _TILE_N
@@ -190,12 +186,32 @@ def matmul_blocks_lhsT(
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
 
-    start_M_tile, num_M_tiles = calculate_intersection(lhsT_block_dim_1, result_block_dim_0)
-    start_N_tile, num_N_tiles = calculate_intersection(rhs_block_dim_1, result_block_dim_1)
-    start_K_tile, num_K_tiles = calculate_intersection(lhsT_block_dim_0, rhs_block_dim_0)
-    lhsT_block_ofs = (start_K_tile - lhsT_block_dim_0[0], start_M_tile - lhsT_block_dim_1[0])
-    rhs_block_ofs = (start_K_tile - rhs_block_dim_0[0], start_N_tile - rhs_block_dim_1[0])
-    result_block_ofs = (start_M_tile - result_block_dim_0[0], start_N_tile - result_block_dim_1[0])
+    lhsT_K_tile_start, lhsT_M_tile_start = lhsT_tile_ofs
+    rhs_K_tile_start, rhs_N_tile_start = rhs_tile_ofs
+    result_M_tile_start, result_N_tile_start = result_tile_ofs
+
+    start_K_tile, num_K_tiles = calculate_intersection(
+        (lhsT_K_tile_start, lhsT_num_K_tiles), (rhs_K_tile_start, rhs_num_K_tiles)
+    )
+    start_M_tile, num_M_tiles = calculate_intersection(
+        (lhsT_M_tile_start, lhsT_num_M_tiles), (result_M_tile_start, result_num_M_tiles)
+    )
+    start_N_tile, num_N_tiles = calculate_intersection(
+        (rhs_N_tile_start, rhs_num_N_tiles), (result_N_tile_start, result_num_N_tiles)
+    )
+    # print(f"{lhsT_block.shape} @ {rhs_block.shape} --> {result_block.shape}")
+    # print(f"start_M_tile = {start_M_tile}. num_M_tiles = {num_M_tiles}.")
+    # print(f"start_N_tile = {start_N_tile}. num_N_tiles = {num_N_tiles}.")
+    # print(f"start_K_tile = {start_K_tile}. num_K_tiles = {num_K_tiles}.")
+
+    relative_lhsT_K_tile_ofs = start_K_tile - lhsT_K_tile_start
+    relative_lhsT_M_tile_ofs = start_M_tile - lhsT_M_tile_start
+
+    relative_rhs_K_tile_ofs = start_K_tile - rhs_K_tile_start
+    relative_rhs_N_tile_ofs = start_N_tile - rhs_N_tile_start
+
+    relative_result_M_tile_ofs = start_M_tile - result_M_tile_start
+    relative_result_N_tile_ofs = start_N_tile - result_N_tile_start
 
     for tile_id_M in nl.affine_range(num_M_tiles):
         for tile_id_N in nl.affine_range(num_N_tiles):
@@ -205,11 +221,18 @@ def matmul_blocks_lhsT(
             """
             for tile_id_K in nl.affine_range(num_K_tiles):
                 result_tile += nisa.nc_matmul(
-                    lhsT_block[idx_lhsT.p, lhsT_block_ofs[0] + tile_id_K, lhsT_block_ofs[1] + tile_id_M, idx_lhsT.x],
-                    rhs_block[idx_rhs.p, rhs_block_ofs[0] + tile_id_K, rhs_block_ofs[1] + tile_id_N, idx_rhs.x],
+                    lhsT_block[
+                        idx_lhsT.p,
+                        relative_lhsT_K_tile_ofs + tile_id_K,
+                        relative_lhsT_M_tile_ofs + tile_id_M,
+                        idx_lhsT.x,
+                    ],
+                    rhs_block[
+                        idx_rhs.p, relative_rhs_K_tile_ofs + tile_id_K, relative_rhs_N_tile_ofs + tile_id_N, idx_rhs.x
+                    ],
                 )
             result_block[
-                idx_res.p, result_block_ofs[0] + tile_id_M, result_block_ofs[1] + tile_id_N, idx_res.x
+                idx_res.p, relative_result_M_tile_ofs + tile_id_M, relative_result_N_tile_ofs + tile_id_N, idx_res.x
             ] += result_tile[idx_res.p, idx_res.x]
 
 
@@ -220,12 +243,21 @@ def calculate_intersection(interval_0: Tuple[int, int], interval_1: Tuple[int, i
     end_0 = start_0 + size_0
     end_1 = start_1 + size_1
 
-    intersection_start = max(start_0, start_1)
-    intersection_end = min(end_0, end_1)
+    if start_0 > start_1:
+        intersection_start = start_0
+    else:
+        intersection_start = start_1
+    if end_0 < end_1:
+        intersection_end = end_0
+    else:
+        intersection_end = end_1
     intersection_size = intersection_end - intersection_start
     assert intersection_size > 0, f"Interval {interval_0} and {interval_1} do not overlap."
+    intersection = (intersection_start, intersection_size)
 
-    return (intersection_start, intersection_size)
+    # print(f"Interval_0 = {interval_0}\nInterval_1 = {interval_1}\nIntersection = {intersection}")
+
+    return intersection
 
 
 def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
