@@ -20,7 +20,9 @@ class MetaGEMM:
     position = 0
     """
 
-    def __init__(self, transposed_lhs: bool, loop_order: str, lhs_position: int, rhs_position: int) -> None:
+    def __init__(
+        self, code_file_path: str, transposed_lhs: bool, loop_order: str, lhs_position: int, rhs_position: int
+    ) -> None:
         """
         Requirements:
         - Loop order must contain exactly the characters 'M', 'N', and 'K'.
@@ -46,7 +48,7 @@ class MetaGEMM:
         self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, self.rhs_dims)
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
-        self.code_file_path = "generated_kernels/generated_kernel.py"
+        self.code_file_path = code_file_path
         self._generate_code()
 
     def _parse_absolute_position(self, relative_position: int, dependent_dims: Tuple[str, ...]):
@@ -197,7 +199,7 @@ def lhs_rhs_gemm(
                 starting = "0"
                 num_tiles = f"mm.TILES_IN_{dim}"
             else:
-                starting = f"block_id_{dim}"
+                starting = f"block_id_{dim} * mm.TILES_IN_BLOCK_{dim}"
                 num_tiles = f"mm.TILES_IN_BLOCK_{dim}"
             block_shape += (starting, num_tiles)
         return block_shape
