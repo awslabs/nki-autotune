@@ -17,8 +17,8 @@ def get_configs():
     loop_orders = list(permutations("MNK"))
     loop_orders = ["".join(loop_order) for loop_order in loop_orders]
     loop_orders = ["MNK"]
-    lhs_positions = [2]
-    rhs_positions = [0]
+    lhs_positions = [0]
+    rhs_positions = [2]
     template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
     template_configs = generate_configs(**template_params)
 
@@ -68,7 +68,7 @@ if __name__ == "__main__":
     for M, N, K in MNK:
         add_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
-    tuner()
+    # tuner()
     # kernels = ["lhs_rhs_gemm"]
     # plot_metric(cache_root_dir, "min_ms", kernels)
     # plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)
