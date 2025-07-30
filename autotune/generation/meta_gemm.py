@@ -139,7 +139,6 @@ def lhs_rhs_gemm(
         code = self._generate_opening_at_position(loop_position)
         indentation = self._get_indentation(loop_position)
         num_tiles, block_offsets = self._calculate_block_offset()
-        print(block_offsets)
         code += f"""
     {indentation}matmul_blocks_lhsT(
     {indentation}   lhs_block, ({block_offsets["lhs"][self.lhs_dims[0]]}, {block_offsets["lhs"][self.lhs_dims[1]]}),
