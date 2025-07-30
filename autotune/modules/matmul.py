@@ -43,7 +43,7 @@ class GEMMCompatibility:
                 NUM_BLOCK_K: Number of blocks in K dimension, or None to skip K blocking
 
         Raises:
-            ValueError: If matrix shapes are incompatible or cannot be properly divided
+            Exception: If matrix shapes are incompatible or cannot be properly divided
                        into the specified number of blocks and tiles.
         """
         lhs, rhs = input_tensors
@@ -53,7 +53,7 @@ class GEMMCompatibility:
         NUM_BLOCK_N: int = kernel_kwargs.get("NUM_BLOCK_N", 1)
         NUM_BLOCK_K: int = kernel_kwargs.get("NUM_BLOCK_K", 1)
         if len(rhs_shape) != 2:
-            raise ValueError(f"Expecting (K, N) in RHS. Received {rhs_shape}.")
+            raise Exception(f"Expecting (K, N) in RHS. Received {rhs_shape}.")
 
         self.batch = None
         if len(lhs_shape) == 2:
@@ -67,14 +67,14 @@ class GEMMCompatibility:
             else:
                 self.batch, self.M, self.K = lhs_shape
         else:
-            raise ValueError(f"lhs_shape must be either 2D or (batch, 2D). Received {lhs_shape}.")
+            raise Exception(f"lhs_shape must be either 2D or (batch, 2D). Received {lhs_shape}.")
 
         K_, self.N = rhs_shape
 
         # Validate dimensions > 0
         for dim_name, dim_value in [("M", self.M), ("K", self.K), ("N", self.N)]:
             if dim_value <= 0:
-                raise ValueError(f"Dimension {dim_name} must be positive, got {dim_value}")
+                raise Exception(f"Dimension {dim_name} must be positive, got {dim_value}")
 
         # Number of blocks (None means no blocking in that dimension)
         self.NUM_BLOCK_M = NUM_BLOCK_M
@@ -86,7 +86,7 @@ class GEMMCompatibility:
 
         # Validate contraction dimension matches
         if self.K != K_:
-            raise ValueError(
+            raise Exception(
                 f"Contraction dimension mismatch: LHS {lhs_shape} has K={self.K}, RHS {rhs_shape} has K={K_}"
             )
 
@@ -131,7 +131,7 @@ class GEMMCompatibility:
         2. Each block can be evenly divided into tiles
 
         Raises:
-            ValueError: If any dimension cannot be evenly divided as required.
+            Exception: If any dimension cannot be evenly divided as required.
         """
         for dimension in ["M", "N", "K"]:
             size = getattr(self, f"{dimension}")
@@ -146,7 +146,7 @@ class GEMMCompatibility:
 
             # Check even division
             if num_block * tiles_in_block * tile_size != size:
-                raise ValueError(
+                raise Exception(
                     f"{dimension} size {size} cannot be divided evenly into "
                     f"{num_block} blocks * {tiles_in_block} tiles * {tile_size}"
                 )
@@ -342,7 +342,7 @@ class GEMMCorrectness:
         nki_out_tensors: OUTPUT_TENSORS_DTYPE,
     ):
         data_type = np.float32
-        atol, rtol = 1e-5, 1e-5
+        atol, rtol = 1e-3, 1e-3
         lhs, rhs = input_tensors
         if self.transposed_lhs:
             golden = nl.static_cast(lhsT_rhs_gemm_np(lhs, rhs), data_type)

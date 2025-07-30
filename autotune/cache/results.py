@@ -314,11 +314,44 @@ class ProfileResults:
             except:
                 sorted_results = results
 
+            # Count results with postprocessing_result: true
+            correct_count = sum(
+                1
+                for result in sorted_results
+                if "postprocessing_result" in result.attributes and getattr(result, "postprocessing_result") is True
+            )
+
+            # Count and categorize errors
+            error_count = 0
+            error_types = {}
+
+            for result in sorted_results:
+                if "error" in result.attributes:
+                    error_count += 1
+
+                    # Try to extract error type from the error message
+                    error_msg = result.error
+                    error_type = "Other"
+
+                    # Extract error type from the beginning of the first line
+                    if error_msg:
+                        first_line = error_msg.split("\n")[0]
+                        if ": " in first_line:
+                            error_type = first_line.split(": ")[0].strip()
+
+                    # Increment count for this error type
+                    if error_type not in error_types:
+                        error_types[error_type] = 0
+                    error_types[error_type] += 1
+
             json_data[filepath] = {
                 "metadata": {
                     "sort_key": self.sort_key,
                     "lower_is_better": self.lower_is_better,
                     "num_results": len(sorted_results),
+                    "num_correct_results": correct_count,
+                    "num_error_results": error_count,
+                    "error_types": error_types,
                 },
                 "results": [result.to_dict() for result in sorted_results],
             }
