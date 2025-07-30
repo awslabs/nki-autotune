@@ -38,8 +38,8 @@ def add_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         postprocessing = None
     else:
         raise NotImplementedError(f"{data_type} is not implemented.")
-    lhsT = np.random.normal(size=(K, M)).astype(data_type)
-    rhs = np.random.normal(size=(K, N)).astype(data_type)
+    lhsT = np.random.normal(0, 0.001, size=(K, M)).astype(data_type)
+    rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
     configs = get_configs()
     for index, config in enumerate(configs):
         template_config, kernel_config = config
@@ -68,7 +68,7 @@ if __name__ == "__main__":
     for M, N, K in MNK:
         add_jobs(jobs, M, N, K)
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
-    # tuner()
+    tuner()
     # kernels = ["lhs_rhs_gemm"]
     # plot_metric(cache_root_dir, "min_ms", kernels)
     # plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)

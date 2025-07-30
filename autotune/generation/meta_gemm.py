@@ -138,13 +138,14 @@ def lhs_rhs_gemm(
     def _generate_innermost_body(self, loop_position: int):
         code = self._generate_opening_at_position(loop_position)
         indentation = self._get_indentation(loop_position)
-        self._calculate_block_offset()
+        num_tiles, block_offsets = self._calculate_block_offset()
+        print(block_offsets)
         code += f"""
     {indentation}matmul_blocks_lhsT(
-    {indentation}   lhs_block, (lhsT_K_tile_start, lhsT_M_tile_start),
-    {indentation}   rhs_block, (rhs_K_tile_start, rhs_N_tile_start),
-    {indentation}   result_block, (result_M_tile_start, result_N_tile_start)
-    {indentation}   (num_M_tiles, num_N_tiles, num_K_tiles)
+    {indentation}   lhs_block, ({block_offsets["lhs"][self.lhs_dims[0]]}, {block_offsets["lhs"][self.lhs_dims[1]]}),
+    {indentation}   rhs_block, ({block_offsets["rhs"][self.rhs_dims[0]]}, {block_offsets["rhs"][self.rhs_dims[1]]}),
+    {indentation}   result_block, ({block_offsets["result"][self.result_dims[0]]}, {block_offsets["result"][self.result_dims[1]]}),
+    {indentation}   ({num_tiles["M"]}, {num_tiles["N"]}, {num_tiles["K"]})
     {indentation})
     """
         return code
@@ -242,8 +243,6 @@ def lhs_rhs_gemm(
                 num_tiles[dim] = f"mm.TILES_IN_BLOCK_{dim}"
             else:
                 num_tiles[dim] = f"mm.TILES_IN_BLOCK_{dim}"
-            print(dim, dim_load_types[dim], list(dim_load_types[dim].values()))
-        print(num_tiles)
 
         # Calculate offsets for each tensor and dimension
         block_offsets = {}
@@ -263,11 +262,11 @@ def lhs_rhs_gemm(
 
                     # For "full" access in a mixed case, apply the full offset
                     if tensor_load_type == "full" and is_mixed_case:
-                        block_offsets[tensor][dim] = f"block_idx_{dim} * mm.TILES_IN_BLOCK_{dim}"
+                        block_offsets[tensor][dim] = f"block_id_{dim} * mm.TILES_IN_BLOCK_{dim}"
                     else:
                         # For all other cases, offset is 0
                         block_offsets[tensor][dim] = 0
-        print(block_offsets)
+        return num_tiles, block_offsets
 
 
 def str_to_dict(loop_order: str) -> Dict:
