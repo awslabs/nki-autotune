@@ -81,7 +81,7 @@ class MetaGEMM:
     def _generate_code(self):
         imports = f"""
 # This is auto generated kernel codes. Do not modify directly.
-from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT
+from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT, matmul_blocks_lhs
 from autotune.modules.dma import load_tensor_block, save_result_block
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
@@ -142,8 +142,9 @@ def {lhs_name}_rhs_gemm(
         code = self._generate_opening_at_position(loop_position)
         indentation = self._get_indentation(loop_position)
         num_tiles, block_offsets = self._calculate_block_offset()
+        matmul_subroutine = "matmul_blocks_lhsT" if self.transposed_lhs else "matmul_blocks_lhs"
         code += f"""
-    {indentation}matmul_blocks_lhsT(
+    {indentation}{matmul_subroutine}(
     {indentation}   lhs_block, ({block_offsets["lhs"][self.lhs_dims[0]]}, {block_offsets["lhs"][self.lhs_dims[1]]}),
     {indentation}   rhs_block, ({block_offsets["rhs"][self.rhs_dims[0]]}, {block_offsets["rhs"][self.rhs_dims[1]]}),
     {indentation}   result_block, ({block_offsets["result"][self.result_dims[0]]}, {block_offsets["result"][self.result_dims[1]]}),

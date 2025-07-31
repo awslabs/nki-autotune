@@ -1,6 +1,7 @@
 import importlib
 import importlib.util
 import shutil
+import signal
 import sys
 import types
 from typing import Dict, Tuple
@@ -122,6 +123,10 @@ def get_kernel_by_name(kernel_name: KERNEL_DTYPE):
     return kernel
 
 
+def timeout_handler(signum, frame):
+    raise TimeoutError("Compilation timed out after 3 minutes")
+
+
 def compile_kernel(
     kernel_name: KERNEL_DTYPE,
     input_tensors: INPUT_TENSORS_DTYPE,
@@ -145,14 +150,19 @@ def compile_kernel(
         target = CompilationTarget.TRN2
     else:
         raise Exception(f"target_instance_family {target_instance_family} must be trn1 or trn2")
-    neff = compile_to_neff(
-        trace_kernel=traced_kernel,
-        output_dir=output_dir,
-        target=target,
-        additional_compiler_args=compiler_flags,
-        save_artifacts=True,
-    )
-    return neff
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(180)
+    try:
+        neff = compile_to_neff(
+            trace_kernel=traced_kernel,
+            output_dir=output_dir,
+            target=target,
+            additional_compiler_args=compiler_flags,
+            save_artifacts=True,
+        )
+        return neff
+    finally:
+        signal.alarm(0)
 
 
 def create_spike_kernel(

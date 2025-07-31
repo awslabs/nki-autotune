@@ -1,6 +1,6 @@
 import json
 import subprocess
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from neuronxcc.starfish.penguin.ir.ir import BIRKernel, NativeKernelTemplate, TensorContractTensorOp
@@ -151,3 +151,11 @@ def allclose(a, b, rtol=1e-05, atol=1e-08):
         "needed_rtol": max_rel_diff if max_rel_diff > rtol else rtol,
         "needed_atol": max_abs_diff if max_abs_diff > atol else atol,
     }
+
+
+def tensor_to_matmul_mac_count(tensors: List[np.ndarray]) -> int:
+    if len(tensors) == 2 and len(tensors[0].shape) == 2 and len(tensors[1].shape) == 2:
+        mac_count = tensors[0].shape[0] * tensors[0].shape[1] * tensors[1].shape[1]
+    else:
+        mac_count = 0
+    return mac_count
