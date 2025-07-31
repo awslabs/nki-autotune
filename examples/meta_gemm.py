@@ -44,7 +44,8 @@ def add_jobs(all_jobs: ProfileJobs, M: int, N: int, K: int):
     rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
     kernel_configs = get_configs()
     jobs = ProfileJobs()
-    for template_id in enumerate(template_configs):
+    template_configs = get_template_configs()
+    for template_id in range(len(template_configs)):
         code_file_path = f"/mnt/efs/generated_kernels/generated_gemm_kernel_{template_id}.py"
         for kernel_config in kernel_configs:
             jobs.add_job(

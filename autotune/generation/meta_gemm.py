@@ -21,6 +21,8 @@ class MetaGEMM:
     position = 0
     """
 
+    # FIXME: if a loop var is not used, the loop should be removed.
+
     def __init__(
         self, code_file_path: str, transposed_lhs: bool, loop_order: str, lhs_position: int, rhs_position: int
     ) -> None:
@@ -85,9 +87,10 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 import neuronxcc.nki as nki
         """
+        lhs_name = "lhsT" if self.transposed_lhs else "lhs"
         func_header = f"""
 @nki.jit
-def lhs_rhs_gemm(
+def {lhs_name}_rhs_gemm(
     lhs: tensor,
     rhs: tensor,
     NUM_BLOCK_M: int,
