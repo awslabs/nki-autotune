@@ -55,7 +55,7 @@ def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: 
                 preprocessing=GEMMCompatibility(transposed_lhs=True),
                 postprocessing=postprocessing,
             )
-    jobs.sample(100)
+    jobs.sample(500)
     all_jobs.extend(jobs)
     all_jobs.add_job(
         kernel=("autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
@@ -87,6 +87,6 @@ if __name__ == "__main__":
         add_jobs(all_jobs, kernels, M, N, K)
     tuner = Benchmark(jobs=all_jobs, cache_root_dir=cache_root_dir)
     tuner()
-    kernel_names = ["lhsT_rhs_gemm", "lhs_rhs_gemm_np"]
+    kernel_names = ["lhsT_rhs_gemm", "lhsT_rhs_gemm_np"]
     plot_metric(cache_root_dir, "min_ms", kernel_names)
     plot_metric(cache_root_dir, "mfu_estimated_percent", kernel_names)

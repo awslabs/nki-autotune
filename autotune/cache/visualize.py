@@ -8,7 +8,7 @@ import numpy as np
 from autotune.cache.results import get_best_result
 
 
-def numerical_key(dim_string: str) -> list:
+def numerical_key(dim_string: str) -> List:
     """
     Convert a dimension string to a list of integers for proper numerical sorting.
     For strings like '1x2048x1024_1024x2048', converts to [1, 2048, 1024, 1024, 2048]
@@ -24,8 +24,18 @@ def numerical_key(dim_string: str) -> list:
         except ValueError:
             # If not a number, add a string (this is just a fallback)
             components.append(part)
-
     return components
+
+
+def parse_dirname(dirname: str):
+    components = numerical_key(dirname)
+    transposed_lhs = True
+    if transposed_lhs:
+        K, M, _K, N = components
+        assert K == _K
+    else:
+        M, K, _K, N = components
+    return (M, N, K)
 
 
 def collect_metrics_data_with_stats(directory: str, metric_name: str):
@@ -85,11 +95,11 @@ def collect_metrics_data_with_stats(directory: str, metric_name: str):
                 mean_metric = np.mean(all_metrics) if all_metrics else None
 
                 # Store metrics only if we successfully calculated them
-                metrics_data[dirname] = {"best": best_metric, "mean": mean_metric}
+                input_sizes = parse_dirname(dirname)
+                metrics_data[input_sizes] = {"best": best_metric, "mean": mean_metric}
             except:
                 # If there's any issue getting the best result or metric, skip this directory
                 continue
-
     return metrics_data
 
 
@@ -120,7 +130,7 @@ def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
     for kernel_metrics in all_kernels_metrics.values():
         all_inputs_strings.update(kernel_metrics.keys())
 
-    all_inputs_strings_sorted = sorted(list(all_inputs_strings), key=lambda x: numerical_key(x))
+    all_inputs_strings_sorted = sorted(list(all_inputs_strings))
 
     # Create the plot
     plt.figure(figsize=(16, 8))
@@ -178,7 +188,7 @@ def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
             )
 
     # Set plot properties
-    plt.xlabel("Input Shapes")
+    plt.xlabel("Input Shapes (M, N, K)")
     plt.ylabel(f"{metric_name.replace('_', ' ')}")
     plt.title(f"{metric_name.replace('_', ' ')} (Best values with error bars to Mean)")
     plt.xticks(range(len(all_inputs_strings_sorted)), all_inputs_strings_sorted, rotation=90)
