@@ -274,10 +274,3 @@ def str_to_dict(loop_order: str) -> Dict:
         loop_order_dict[position] = dimension
         loop_order_dict[dimension] = position
     return loop_order_dict
-
-
-def calculate_intersection(interval_0: Tuple[str, str], interval_1: Tuple[str, str]):
-    # print(f"Interval_0 = {interval_0}\nInterval_1 = {interval_1}")
-
-    start_0, size_0 = interval_0
-    start_1, size_1 = interval_1
