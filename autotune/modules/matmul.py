@@ -237,7 +237,6 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
     """
     Accumulate matmul result tiles between lhs and rhs into result_block
     LHS is not transposed.
-    Note that this is not the same as lhsT.
     'matmul_block' module computes lhsT @ rhs.
 
     Args:
