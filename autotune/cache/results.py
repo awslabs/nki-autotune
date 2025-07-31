@@ -22,6 +22,7 @@ class ProfileResult:
         kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
         compiler_flags: str | None = None,
         cache_dir: str | None = None,
+        **kwargs,
     ):
         """
         Initialize a performance result.
@@ -37,6 +38,7 @@ class ProfileResult:
             self.add_fields(compiler_flags=compiler_flags)
         if cache_dir:
             self.add_fields(cache_dir=cache_dir)
+        self.add_fields(**kwargs)
 
     def __repr__(self) -> str:
         """Enhanced representation showing only attributes in self.attributes"""
@@ -216,6 +218,7 @@ class ProfileResults:
         kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
         compiler_flags: str | None = None,
         cache_dir: str | None = None,
+        **kwargs,
     ) -> ProfileResult:
         """
         Add a new performance result.
@@ -236,6 +239,7 @@ class ProfileResults:
             kernel_kwargs=kernel_kwargs,
             compiler_flags=compiler_flags,
             cache_dir=cache_dir,
+            **kwargs,
         )
         self.results.append(result)
         return result

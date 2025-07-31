@@ -59,7 +59,8 @@ class ProfileJob:
     @property
     def cache_dir(self) -> str:
         input_tensor_shapes = "_".join("x".join(str(dim) for dim in tensor.shape) for tensor in self.input_tensors)
-        cache_dir = f"{self.cache_root_dir}/{self.kernel[1]}/{input_tensor_shapes}/id{self.index}"
+        kernel_name = self.kernel[1]
+        cache_dir = f"{self.cache_root_dir}/{kernel_name}/{input_tensor_shapes}/id{self.index}"
         return cache_dir
 
     @property

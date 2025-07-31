@@ -209,53 +209,36 @@ def matmul_blocks_lhsT(
             ] += result_tile[idx_res.p, idx_res.x]
 
 
-def calculate_intersection(interval_0: Tuple[int, int], interval_1: Tuple[int, int]) -> Tuple[int, int]:
-    start_0, size_0 = interval_0
-    start_1, size_1 = interval_1
-
-    end_0 = start_0 + size_0
-    end_1 = start_1 + size_1
-
-    if start_0 > start_1:
-        intersection_start = start_0
-    else:
-        intersection_start = start_1
-    if end_0 < end_1:
-        intersection_end = end_0
-    else:
-        intersection_end = end_1
-    intersection_size = intersection_end - intersection_start
-    assert intersection_size > 0, f"Interval {interval_0} and {interval_1} do not overlap."
-    intersection = (intersection_start, intersection_size)
-
-    print(f"Interval_0 = {interval_0}\nInterval_1 = {interval_1}\nIntersection = {intersection}")
-
-    return intersection
-
-
-def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
+def matmul_blocks_lhs(
+    lhs_block,
+    lhs_tile_ofs: Tuple[int, int],
+    rhs_block,
+    rhs_tile_ofs: Tuple[int, int],
+    result_block,
+    result_tile_ofs: Tuple[int, int],
+    num_tiles: Tuple[int, int, int],
+):
     """
     Accumulate matmul result tiles between lhs and rhs into result_block
     LHS is not transposed.
     'matmul_block' module computes lhsT @ rhs.
 
     Args:
-    lhs_block: TILES_IN_M, TILE_M, K
-    rhs_block: TILES_IN_K, TILE_K, N
-    result_block : TILES_IN_M, TILES_IN_N, TILE_M, TILE_N
+    lhs_block: Left-hand side matrix block in transposed format. (M, K)
+    rhs_block: Right-hand side matrix block. (K, N)
+    result_block: Output matrix block where results are accumulated. (M, N)
+    lhs_tile_ofs: lhs_M_tile_start, lhs_K_tile_start
+    rhs_tile_ofs: rhs_K_tile_start, rhs_N_tile_start
+    result_tile_ofs: result_M_tile_start, result_N_tile_start
+    num_tiles: number of M, N, K tiles to compute
     """
-    TILE_M, TILES_IN_M, TILES_IN_K, TILE_K = lhs_block.shape
-    _TILE_K, _TILES_IN_K, TILES_IN_N, TILE_N = rhs_block.shape
-    _TILE_M, _TILES_IN_M, _TILES_IN_N, _TILE_N = result_block.shape
+    TILE_M, _, _, TILE_K = lhs_block.shape
+    _TILE_K, _, _, TILE_N = rhs_block.shape
+    _TILE_M, _, _, _TILE_N = result_block.shape
+    assert TILE_K == _TILE_K, f"lhs_block {lhs_block.shape} tile K mismatch with rhs_block {rhs_block.shape}"
     assert (
-        TILE_K == _TILE_K and TILES_IN_K == _TILES_IN_K
-    ), f"lhs_block and rhs_block shape mismatch: lhs_block {lhs_block.shape}. rhs_block {rhs_block.shape}."
-    assert (
-        TILE_M == _TILE_M and TILES_IN_M == _TILES_IN_M
-    ), f"lhs_block and result_block shape mismatch: lhs_block {lhs_block.shape}. result_block {result_block.shape}."
-    assert (
-        TILE_N == _TILE_N and TILES_IN_N == _TILES_IN_N
-    ), f"rhs_block and result_block shape mismatch: rhs_block {rhs_block.shape}. result_block {result_block.shape}."
+        TILE_M == _TILE_M and TILE_N == _TILE_N
+    ), f"result_block {result_block.shape} shape mismatch with lhs_block {lhs_block.shape} @ rhs_block {rhs_block.shape}"
 
     if nisa.get_nc_version() == nisa.nc_version.gen3:
         tileT_dtype = lhs_block.dtype
@@ -265,14 +248,18 @@ def matmul_blocks_lhs(lhs_block, rhs_block, result_block):
     idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    lhs_M_tile_start, lhs_K_tile_start = lhs_tile_ofs
+    rhs_K_tile_start, rhs_N_tile_start = rhs_tile_ofs
+    result_M_tile_start, result_N_tile_start = result_tile_ofs
+    num_M_tiles, num_N_tiles, num_K_tiles = num_tiles
     # TODO: do M-K-N loop order, transpose M, K lhs_block then use it in N
-    for tile_id_M in nl.affine_range(TILES_IN_M):
-        for tile_id_N in nl.affine_range(TILES_IN_N):
+    for tile_id_M in nl.affine_range(num_M_tiles):
+        for tile_id_N in nl.affine_range(num_N_tiles):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             """
             Use PSUM buffer to accumulate into a single hardware tile
             """
-            for tile_id_K in nl.affine_range(TILES_IN_K):
+            for tile_id_K in nl.affine_range(num_K_tiles):
                 # FIXME: in-place transposition repeated across tile_id_N
                 # TODO: use a temp tile to hold tileT
                 tileT_psum = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.psum)
@@ -388,10 +375,12 @@ def lhsT_rhs_gemm_np(lhsT, rhs):
     numpy.ndarray
         Result of the matrix multiplication.
     """
-    if len(lhsT.shape) == 3:  # Batch dimension exists
+    if len(lhsT.shape) == 2:
+        lhs = np.transpose(lhsT, (1, 0))
+    elif len(lhsT.shape) == 3:  # Batch dimension exists
         lhs = np.transpose(lhsT, (0, 2, 1))
     else:
-        lhs = lhsT.T
+        raise NotImplementedError(f"lhsT shape {lhsT.shape} is not supported in GEMM.")
     return np.matmul(lhs, rhs)
 
 

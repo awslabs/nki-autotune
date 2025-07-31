@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from itertools import permutations
+from typing import List
 
 import numpy as np
 from neuronpy.core.language import bfloat16
@@ -28,7 +29,7 @@ def get_configs():
     return kernel_configs
 
 
-def add_jobs(all_jobs: ProfileJobs, M: int, N: int, K: int):
+def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: int):
     data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
@@ -42,12 +43,10 @@ def add_jobs(all_jobs: ProfileJobs, M: int, N: int, K: int):
     rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
     kernel_configs = get_configs()
     jobs = ProfileJobs()
-    template_configs = get_template_configs()
-    for template_id in range(len(template_configs)):
-        code_file_path = f"/mnt/efs/generated_lhs_rhs_kernels/generated_gemm_kernel_{template_id}.py"
+    for kernel in kernels:
         for kernel_config in kernel_configs:
             jobs.add_job(
-                kernel=(code_file_path, "lhs_rhs_gemm"),
+                kernel=(kernel.code_file_path, "lhs_rhs_gemm"),
                 input_tensors=(lhsT, rhs),
                 kernel_kwargs=kernel_config,
                 compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
@@ -62,20 +61,22 @@ def add_jobs(all_jobs: ProfileJobs, M: int, N: int, K: int):
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
     template_configs = get_template_configs()
+    kernels = []
     for template_id, template_config in enumerate(template_configs):
         kernel = MetaGEMM(
             code_file_path=f"/mnt/efs/generated_lhs_rhs_kernels/generated_gemm_kernel_{template_id}.py",
             transposed_lhs=False,
             **template_config,
         )
+        kernels.append(kernel)
     # mn_shapes = [1024]
     # k_shapes = [2048]
     # MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     # all_jobs = ProfileJobs()
     # for M, N, K in MNK:
-    #     add_jobs(all_jobs, M, N, K)
+    #     add_jobs(all_jobs, kernels, M, N, K)
     # tuner = Benchmark(jobs=all_jobs, cache_root_dir=cache_root_dir)
     # tuner()
-    # kernels = ["lhs_rhs_gemm"]
-    # plot_metric(cache_root_dir, "min_ms", kernels)
-    # plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)
+    # kernel_names = ["lhs_rhs_gemm"]
+    # plot_metric(cache_root_dir, "min_ms", kernel_names)
+    # plot_metric(cache_root_dir, "mfu_estimated_percent", kernel_names)

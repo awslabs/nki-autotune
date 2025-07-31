@@ -150,6 +150,7 @@ def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
                     best_val = metrics[dim_string]["best"]
                     mean_val = metrics[dim_string]["mean"]
                     best_values.append(best_val)
+                    # print(metric_name, mean_val, best_val)
 
                     # Calculate error bars based on which value is higher
                     if mean_val <= best_val:

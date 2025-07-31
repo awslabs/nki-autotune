@@ -7,7 +7,7 @@ from typing import Dict, List
 from autotune.cache.results import ProfileResults
 from autotune.core.compile import compile_kernel
 from autotune.core.job import ProfileJobs
-from autotune.core.metrics import extract_metrics
+from autotune.core.metrics import extract_metrics, tensor_to_matmul_mac_count
 from autotune.core.parallel import parallel_execute, parallel_execute_groups
 from autotune.core.processing import postprocessing_fun_wrapper
 from autotune.core.run_nki import run_on_neuron_core
@@ -68,11 +68,13 @@ class Benchmark:
     def _init_results(self) -> ProfileResults:
         results = ProfileResults(sort_key="min_ms", lower_is_better=True)
         for job in self.jobs:
+            matmul_mac_count = tensor_to_matmul_mac_count(job.input_tensors)
             results.add_result(
                 kernel=job.kernel,
                 kernel_kwargs=job.kernel_kwargs,
                 compiler_flags=job.compiler_flags,
                 cache_dir=job.cache_dir,
+                matmul_mac_count=matmul_mac_count,
             )
         return results
 
@@ -177,7 +179,6 @@ class Benchmark:
             for job_id in job_group:
                 job = self.jobs[job_id]
                 result = self.results[job_id]
-                # FIXME: add a wrapper function to do np load to capture potential errors into cache
                 funcs.append(postprocessing_fun_wrapper)
                 kwargs.append(
                     {

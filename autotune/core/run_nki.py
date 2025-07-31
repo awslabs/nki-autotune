@@ -10,7 +10,6 @@ from neuronpy.runtime.spike import SpikeExecutor
 from autotune.cache.results import ProfileResult, ProfileResults, capture_error_message
 from autotune.core.compile import create_spike_kernel, run_spike_kernel
 from autotune.core.job import ProfileJob, ProfileJobs
-from autotune.core.metrics import get_matmul_mac_count
 
 
 def run_on_neuron_core(
@@ -41,7 +40,6 @@ def run_on_neuron_core(
 
 def main():
     """
-    FIXME: make this data parallel
     1. Save results, jobs
     2. Pass results, jobs paths and job IDs
     3. Subprocess load results, jobs
@@ -67,12 +65,10 @@ def main():
                     benchmark_iterations=args.iters,
                     device_id=0,
                 )
-                # FIXME: could output multiple tensors
                 ntff_file, kernel_outputs = run_spike_kernel(
                     spike, spike_kernel, job_state["input_tensors"], result.neff, job_state["kernel_kwargs"]
                 )
-                matmul_mac_count = get_matmul_mac_count(spike_kernel.traced_kernel)
-                result.add_fields(ntff=ntff_file, **stats, matmul_mac_count=matmul_mac_count)
+                result.add_fields(ntff=ntff_file, **stats)
                 with open(f"{job_state['cache_dir']}/kernel_outputs.pkl", "wb") as f:
                     if isinstance(kernel_outputs, tuple):
                         pickle.dump(kernel_outputs, f)
