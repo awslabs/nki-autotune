@@ -34,25 +34,135 @@ class MetaGEMM:
         - Matmul is dependent on MNK dimensions, has to happen in the innermost loop, position = 3.
         - Result init and save must be K_position, on the same level.
         It is pointless to further hoist result init and save out of the M,N parallel dimensions.
+        There are 3! loop orders for MNK loops. There are hence in total, 3 * 3 * 6 = 54 kernel templates.
         """
         self.transposed_lhs = transposed_lhs
         self.loop_order = str_to_dict(loop_order)
         assert sorted(loop_order) == sorted(
             "MNK"
         ), f"Invalid loop_order: {loop_order}. Must contain exactly M, N, and K."
-        if self.transposed_lhs:
-            self.lhs_dims = ("K", "M")
-        else:
-            self.lhs_dims = ("M", "K")
-        self.rhs_dims = ("K", "N")
-        self.result_dims = ("M", "N")
+        self.dependent_dims = {
+            "lhs": ("K", "M") if self.transposed_lhs else ("M", "K"),
+            "rhs": ("K", "N"),
+            "result": ("M", "N"),
+        }
         self.op_positions: Dict[str, int] = {}
-        self.op_positions["lhs"] = self._parse_absolute_position(lhs_position, self.lhs_dims)
-        self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, self.rhs_dims)
+        self.op_positions["lhs"] = self._parse_absolute_position(lhs_position, self.dependent_dims["lhs"])
+        self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, self.dependent_dims["rhs"])
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
+        self.tensor_types = self._get_tensor_types()
+        self.start_tiles, self.num_tiles = self._calculate_tensor_coordinates()
+        self.relative_offsets, self.sizes = self._calculate_relative_offsets()
+        print(self.start_tiles)
+        print(self.relative_offsets)
         self.code_file_path = code_file_path
         self._generate_code()
+
+    def _get_tensor_types(self):
+        """
+        For each lhs, rhs, result
+        determine if it is a block or full in each of its dimensions
+
+        If <= dimension position:
+            full
+        Else:
+            block
+
+        Returns:
+        tensor_types[tensor][dim] = "block" | "full"
+        """
+        tensor_types = {}
+        for tensor in ["lhs", "rhs", "result"]:
+            absolute_position = self.op_positions[tensor]
+            dependent_dims = self.dependent_dims[tensor]
+            tensor_types[tensor] = {}
+            for dim in dependent_dims:
+                dim_position = self.loop_order[dim]
+                if absolute_position <= dim_position:
+                    tensor_types[tensor][dim] = "full"
+                else:
+                    tensor_types[tensor][dim] = "block"
+        return tensor_types
+
+    def _calculate_tensor_coordinates(self):
+        """
+        For each lhs, rhs, result, calculate:
+        - Tile start
+        - Number of tiles
+
+        If full:
+            start = 0.
+            num_tiles = TILES_IN_X.
+        If block:
+            start = block_id_X * TILES_IN_BLOCK_X.
+            num_tiles = TILES_IN_BLOCK_X.
+        Returns:
+        start_tiles[tensor][dim] = start
+        num_tiles[tensor][dim] = num_tiles
+        """
+        start_tiles = {}
+        num_tiles = {}
+        for tensor in self.tensor_types:
+            start_tiles[tensor] = {}
+            num_tiles[tensor] = {}
+            for dim in self.tensor_types[tensor]:
+                access_type = self.tensor_types[tensor][dim]
+                if access_type == "full":
+                    start_tiles[tensor][dim] = "0"
+                    num_tiles[tensor][dim] = f"mm.TILES_IN_{dim}"
+                elif access_type == "block":
+                    start_tiles[tensor][dim] = f"block_id_{dim} * mm.TILES_IN_BLOCK_{dim}"
+                    num_tiles[tensor][dim] = f"mm.TILES_IN_BLOCK_{dim}"
+                else:
+                    raise Exception(
+                        f"Expecting tensor access type block | full. Received {access_type} for {tensor} {dim}."
+                    )
+        return start_tiles, num_tiles
+
+    def _calculate_relative_offsets(self):
+        """
+        For any dimension X in M, N, K:
+        Calculate the offset in both tensors involving this particular dimension
+        - block, block
+            relative offset = 0
+            size = TILES_IN_BLOCK_X
+        - block, full
+            block relative offset = 0
+            full relative offset = block_id_X * TILES_IN_BLOCK_X
+            size = TILES_IN_BLOCK_X
+        - full, full
+            relative offset = 0
+            size = TILES_IN_X
+
+        relative_offsets[tensor][dim] = relative offset
+        """
+        relative_offsets = {}
+        sizes = {}
+        for dim in "MNK":
+            dim_tensor_types = {}
+            for tensor in self.tensor_types:
+                if dim in self.tensor_types[tensor]:
+                    dim_tensor_types[tensor] = self.tensor_types[tensor][dim]
+
+            block_count = sum(1 for t_type in dim_tensor_types.values() if t_type == "block")
+            full_count = len(dim_tensor_types) - block_count
+            is_mixed_case = block_count > 0 and full_count > 0
+
+            if block_count == 0:
+                sizes[dim] = f"mm.TILES_IN_{dim}"
+            else:
+                sizes[dim] = f"mm.TILES_IN_BLOCK_{dim}"
+
+            for tensor, access_type in dim_tensor_types.items():
+                if tensor not in relative_offsets:
+                    relative_offsets[tensor] = {}
+
+                if access_type == "full" and is_mixed_case:
+                    relative_offsets[tensor][dim] = f"block_id_{dim} * mm.TILES_IN_BLOCK_{dim}"
+                else:
+                    relative_offsets[tensor][dim] = 0
+        return relative_offsets, sizes
 
     def _parse_absolute_position(self, relative_position: int, dependent_dims: Tuple[str, ...]):
         """
@@ -79,16 +189,15 @@ class MetaGEMM:
         return absolute_position
 
     def _generate_code(self):
-        imports = f"""
+        lhs_name = "lhsT" if self.transposed_lhs else "lhs"
+        common_head = f"""
 # This is auto generated kernel codes. Do not modify directly.
 from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT, matmul_blocks_lhs
 from autotune.modules.dma import load_tensor_block, save_result_block
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 import neuronxcc.nki as nki
-        """
-        lhs_name = "lhsT" if self.transposed_lhs else "lhs"
-        func_header = f"""
+
 @nki.jit
 def {lhs_name}_rhs_gemm(
     lhs: tensor,
@@ -97,8 +206,6 @@ def {lhs_name}_rhs_gemm(
     NUM_BLOCK_N: int,
     NUM_BLOCK_K: int,
 ):
-        """
-        common_body = f"""
     kernel_kwargs = {{"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K}}
     mm = GEMMCompatibility(transposed_lhs={self.transposed_lhs})
     mm((lhs, rhs), kernel_kwargs)
@@ -114,9 +221,7 @@ def {lhs_name}_rhs_gemm(
         return_code = f"""
     return result
         """
-        total_code = "".join(
-            [imports, func_header, common_body, loop_openings, innermost_loop_body, loop_closings, return_code]
-        )
+        total_code = "".join([common_head, loop_openings, innermost_loop_body, loop_closings, return_code])
         Path(self.code_file_path).parent.mkdir(parents=True, exist_ok=True)
         with open(self.code_file_path, "w") as f:
             f.write(total_code)
@@ -128,10 +233,11 @@ def {lhs_name}_rhs_gemm(
     {indentation}for block_id_{self.loop_order[loop_position]} in nl.affine_range(mm.NUM_BLOCK_{self.loop_order[loop_position]}):
         """
         if self.op_positions["save"] == loop_position:
+            result_dims = self.dependent_dims["result"]
             closing = f"""
     {indentation}save_result_block(result, result_block,
-    {indentation}   ({self.result_block_shape[0]}, {self.result_block_shape[1]}),
-    {indentation}   ({self.result_block_shape[2]}, {self.result_block_shape[3]})
+    {indentation}   ({self.start_tiles["result"][result_dims[0]]}, {self.num_tiles["result"][result_dims[0]]}),
+    {indentation}   ({self.start_tiles["result"][result_dims[1]]}, {self.num_tiles["result"][result_dims[1]]})
     {indentation})
         """
         else:
@@ -141,135 +247,45 @@ def {lhs_name}_rhs_gemm(
     def _generate_innermost_body(self, loop_position: int):
         code = self._generate_opening_at_position(loop_position)
         indentation = self._get_indentation(loop_position)
-        num_tiles, block_offsets = self._calculate_block_offset()
         matmul_subroutine = "matmul_blocks_lhsT" if self.transposed_lhs else "matmul_blocks_lhs"
         code += f"""
     {indentation}{matmul_subroutine}(
-    {indentation}   lhs_block, ({block_offsets["lhs"][self.lhs_dims[0]]}, {block_offsets["lhs"][self.lhs_dims[1]]}),
-    {indentation}   rhs_block, ({block_offsets["rhs"][self.rhs_dims[0]]}, {block_offsets["rhs"][self.rhs_dims[1]]}),
-    {indentation}   result_block, ({block_offsets["result"][self.result_dims[0]]}, {block_offsets["result"][self.result_dims[1]]}),
-    {indentation}   ({num_tiles["M"]}, {num_tiles["N"]}, {num_tiles["K"]})
+    {indentation}   lhs_block, ({self.relative_offsets["lhs"][self.dependent_dims["lhs"][0]]}, {self.relative_offsets["lhs"][self.dependent_dims["lhs"][1]]}),
+    {indentation}   rhs_block, ({self.relative_offsets["rhs"][self.dependent_dims["rhs"][0]]}, {self.relative_offsets["rhs"][self.dependent_dims["rhs"][1]]}),
+    {indentation}   result_block, ({self.relative_offsets["result"][self.dependent_dims["result"][0]]}, {self.relative_offsets["result"][self.dependent_dims["result"][1]]}),
+    {indentation}   ({self.sizes["M"]}, {self.sizes["N"]}, {self.sizes["K"]})
     {indentation})
-    """
+        """
         return code
 
     def _generate_opening_at_position(self, loop_position: int) -> str:
         indentation = self._get_indentation(loop_position)
         code = ""
         if self.op_positions["lhs"] == loop_position:
-            self.lhs_block_shape = self._get_block_shape(self.lhs_dims, loop_position)
+            lhs_dims = self.dependent_dims["lhs"]
             code += f"""
     {indentation}lhs_block = load_tensor_block(input_tensor=lhs,
-    {indentation}   dim_0=(mm.TILE_{self.lhs_dims[0]}, {self.lhs_block_shape[0]}, {self.lhs_block_shape[1]}),
-    {indentation}   dim_1=(mm.TILE_{self.lhs_dims[1]}, {self.lhs_block_shape[2]}, {self.lhs_block_shape[3]}))
+    {indentation}   dim_0=(mm.TILE_{lhs_dims[0]}, {self.start_tiles["lhs"][lhs_dims[0]]}, {self.num_tiles["lhs"][lhs_dims[0]]}),
+    {indentation}   dim_1=(mm.TILE_{lhs_dims[1]}, {self.start_tiles["lhs"][lhs_dims[1]]}, {self.num_tiles["lhs"][lhs_dims[1]]}))
             """
         if self.op_positions["rhs"] == loop_position:
-            self.rhs_block_shape = self._get_block_shape(self.rhs_dims, loop_position)
+            rhs_dims = self.dependent_dims["rhs"]
             code += f"""
     {indentation}rhs_block = load_tensor_block(input_tensor=rhs,
-    {indentation}   dim_0=(mm.TILE_{self.rhs_dims[0]}, {self.rhs_block_shape[0]}, {self.rhs_block_shape[1]}),
-    {indentation}   dim_1=(mm.TILE_{self.rhs_dims[1]}, {self.rhs_block_shape[2]}, {self.rhs_block_shape[3]}))
+    {indentation}   dim_0=(mm.TILE_{rhs_dims[0]}, {self.start_tiles["rhs"][rhs_dims[0]]}, {self.num_tiles["rhs"][rhs_dims[0]]}),
+    {indentation}   dim_1=(mm.TILE_{rhs_dims[1]}, {self.start_tiles["rhs"][rhs_dims[1]]}, {self.num_tiles["rhs"][rhs_dims[1]]}))
             """
         if self.op_positions["result"] == loop_position:
-            self.result_block_shape = self._get_block_shape(self.result_dims, loop_position)
+            result_dims = self.dependent_dims["result"]
             code += f"""
-    {indentation}result_block = nl.zeros((mm.TILE_{self.result_dims[0]}, {self.result_block_shape[1]}, {self.result_block_shape[3]}, mm.TILE_{self.result_dims[1]}), dtype=result.dtype,buffer=nl.sbuf)
+    {indentation}result_block = nl.zeros((mm.TILE_{result_dims[0]}, {self.num_tiles["result"][result_dims[0]]}, {self.num_tiles["result"][result_dims[1]]}, mm.TILE_{result_dims[1]}),
+    {indentation}                         dtype=result.dtype,buffer=nl.sbuf)
             """
         return code
 
     def _get_indentation(self, indent_level: int):
         indentation = 4 * " "
         return indent_level * indentation
-
-    def _get_block_shape(self, dims: Tuple[str, str], loop_position: int) -> Tuple[str, str, str, str]:
-        """
-        Calculate the shape of tensor blocks in a GEMM operation.
-
-        This function computes the shape of blocks based on the current position in nested loops
-        and the specified dimensions. It determines how many blocks should be processed together
-        for each dimension based on loop nesting.
-
-        Args:
-            dims (Tuple[str, str]): Tuple of dimension names to calculate shape for (e.g., ("M", "N"))
-            loop_position (int): position in the nested loops (0, 1, 2, 3)
-
-        Returns:
-            Tuple[4 * int]: (starting tile index 0, number of tiles 0, starting tile index 1, number of tiles 1)
-
-        Note:
-            If <= dimension position, starting = 0. Else starting = block_id_X.
-            If <= dimension position, num_tiles = mm.TILES_IN_X. Else num_tiles = mm.TILES_IN_BLOCK_X.
-        """
-        block_shape = []
-        for dim in dims:
-            dim_position = self.loop_order[dim]
-            if loop_position <= dim_position:
-                start = "0"
-                num_tiles = f"mm.TILES_IN_{dim}"
-            else:
-                start = f"block_id_{dim} * mm.TILES_IN_BLOCK_{dim}"
-                num_tiles = f"mm.TILES_IN_BLOCK_{dim}"
-            block_shape.extend([start, num_tiles])
-        block_shape = tuple(block_shape)
-        return block_shape
-
-    def _calculate_block_offset(self):
-        """
-        For any dimension X in M, N, K:
-        - block, block
-            offset = 0
-            num_X_tiles = TILES_IN_BLOCK_X
-        - block, full
-            block offset = 0
-            full offset = block_idx_X * TILES_IN_BLOCK_X
-            num_X_tiles = TILES_IN_BLOCK_X
-        - full, full
-            offset = 0
-            num_X_tiles = TILES_IN_X
-        """
-        dim_load_types = {}
-        for tensor in ["lhs", "rhs", "result"]:
-            op_position = self.op_positions[tensor]
-            for dim in getattr(self, f"{tensor}_dims"):
-                if dim not in dim_load_types:
-                    dim_load_types[dim] = {}
-                dim_position = self.loop_order[dim]
-                if op_position <= dim_position:
-                    dim_load_types[dim][tensor] = "full"
-                else:
-                    dim_load_types[dim][tensor] = "block"
-        num_tiles = {}
-        for dim in dim_load_types:
-            if all([load_type == "full" for load_type in dim_load_types[dim].values()]):
-                num_tiles[dim] = f"mm.TILES_IN_{dim}"
-            elif all([load_type == "block" for load_type in dim_load_types[dim].values()]):
-                num_tiles[dim] = f"mm.TILES_IN_BLOCK_{dim}"
-            else:
-                num_tiles[dim] = f"mm.TILES_IN_BLOCK_{dim}"
-
-        # Calculate offsets for each tensor and dimension
-        block_offsets = {}
-        for tensor in ["lhs", "rhs", "result"]:
-            block_offsets[tensor] = {}
-            for dim in getattr(self, f"{tensor}_dims"):
-                if dim in dim_load_types and tensor in dim_load_types[dim]:
-                    # Get all load types for this dimension
-                    dim_loads = list(dim_load_types[dim].values())
-                    # Get the load type for this tensor and dimension
-                    tensor_load_type = dim_load_types[dim][tensor]
-
-                    # Check if it's a mixed case (some "block" and some "full" access for this dimension)
-                    is_all_block = all([load_type == "block" for load_type in dim_loads])
-                    is_all_full = all([load_type == "full" for load_type in dim_loads])
-                    is_mixed_case = not is_all_block and not is_all_full
-
-                    # For "full" access in a mixed case, apply the full offset
-                    if tensor_load_type == "full" and is_mixed_case:
-                        block_offsets[tensor][dim] = f"block_id_{dim} * mm.TILES_IN_BLOCK_{dim}"
-                    else:
-                        # For all other cases, offset is 0
-                        block_offsets[tensor][dim] = 0
-        return num_tiles, block_offsets
 
 
 def str_to_dict(loop_order: str) -> Dict:

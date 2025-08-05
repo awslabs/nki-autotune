@@ -20,19 +20,23 @@ def get_template_configs():
     loop_orders = ["".join(loop_order) for loop_order in loop_orders]
     lhs_positions = [0, 1, 2]
     rhs_positions = [0, 1, 2]
+
+    loop_orders = ["MNK"]
+    lhs_positions = [0]
+    rhs_positions = [0]
     template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
     template_configs = generate_configs(**template_params)
     return template_configs
 
 
 def get_configs():
-    kernel_params = {"NUM_BLOCK_M": [1, 2, 4, 8, 16], "NUM_BLOCK_N": [1, 2, 4, 8, 16], "NUM_BLOCK_K": [1, 2, 4, 8, 16]}
+    kernel_params = {"NUM_BLOCK_M": [2], "NUM_BLOCK_N": [2], "NUM_BLOCK_K": [4]}
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
 
 
 def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: int):
-    data_type = "bf16"
+    data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
         postprocessing = GEMMCorrectness(transposed_lhs=True)
@@ -57,19 +61,19 @@ def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: 
             )
     jobs.sample(500)
     all_jobs.extend(jobs)
-    all_jobs.add_job(
-        kernel=("autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
-        input_tensors=(lhsT, rhs),
-        kernel_kwargs={},
-        compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-        preprocessing=GEMMCompatibility(transposed_lhs=True),
-        postprocessing=postprocessing,
-    )
+    # all_jobs.add_job(
+    #     kernel=("autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
+    #     input_tensors=(lhsT, rhs),
+    #     kernel_kwargs={},
+    #     compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
+    #     preprocessing=GEMMCompatibility(transposed_lhs=True),
+    #     postprocessing=postprocessing,
+    # )
     return all_jobs
 
 
 if __name__ == "__main__":
-    cache_root_dir = "/mnt/efs/autotune-cache"
+    cache_root_dir = "/mnt/efs/autotune-dev-cache"
     template_configs = get_template_configs()
     kernels = []
     for template_id, template_config in enumerate(template_configs):
@@ -79,14 +83,14 @@ if __name__ == "__main__":
             **template_config,
         )
         kernels.append(kernel)
-    mn_shapes = [1024, 2048]
-    k_shapes = [1024, 2048, 4096, 8192, 16384]
+    mn_shapes = [2048]
+    k_shapes = [2048]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
     all_jobs = ProfileJobs()
     for M, N, K in MNK:
         add_jobs(all_jobs, kernels, M, N, K)
     tuner = Benchmark(jobs=all_jobs, cache_root_dir=cache_root_dir)
     tuner()
-    kernel_names = ["lhsT_rhs_gemm", "lhsT_rhs_gemm_np"]
+    kernel_names = ["lhsT_rhs_gemm"]
     plot_metric(cache_root_dir, "min_ms", kernel_names)
     plot_metric(cache_root_dir, "mfu_estimated_percent", kernel_names)
