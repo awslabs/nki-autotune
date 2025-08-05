@@ -63,7 +63,7 @@ def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: 
         input_tensors=(lhsT, rhs),
         kernel_kwargs={},
         compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-        preprocessing=GEMMCompatibility(transposed_lhs=True),
+        preprocessing=None,
         postprocessing=postprocessing,
     )
     return all_jobs

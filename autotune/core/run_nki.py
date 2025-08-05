@@ -25,7 +25,8 @@ def run_on_neuron_core(
         cache_dirs.append(job.cache_dir)
     env = os.environ.copy()
     env["NEURON_RT_VISIBLE_CORES"] = str(neuron_core_id)
-    cmd = ["python", "autotune/core/run_nki.py"]
+    script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "run_nki.py"))
+    cmd = ["python", script_path]
     cmd += ["--cache_dirs"] + cache_dirs
     cmd += ["--warmup", str(warmup)]
     cmd += ["--iters", str(iters)]
@@ -69,6 +70,8 @@ def main():
                     spike, spike_kernel, job_state["input_tensors"], result.neff, job_state["kernel_kwargs"]
                 )
                 result.add_fields(ntff=ntff_file, **stats)
+                if isinstance(kernel_outputs, List):
+                    kernel_outputs = tuple(kernel_outputs)
                 with open(f"{job_state['cache_dir']}/kernel_outputs.pkl", "wb") as f:
                     if isinstance(kernel_outputs, tuple):
                         pickle.dump(kernel_outputs, f)
