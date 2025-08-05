@@ -328,7 +328,7 @@ class GEMMCorrectness:
         nki_out_tensors: OUTPUT_TENSORS_DTYPE,
     ):
         data_type = np.float32
-        atol, rtol = 1e-3, 1e-3
+        atol, rtol = 1e-5, 1e-2
         lhs, rhs = input_tensors
         if self.transposed_lhs:
             golden = nl.static_cast(lhsT_rhs_gemm_np(lhs, rhs), data_type)

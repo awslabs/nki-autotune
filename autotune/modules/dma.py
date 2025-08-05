@@ -7,13 +7,13 @@ def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[in
     """
     Args:
         input_tensor: the input 2D HBM tensor
-        dim_0, dim_1: (tile size, starting tile index, number of tiles)
+        dim_0, dim_1: (tile size, start tile index, number of tiles)
 
     Returns:
         Loaded tiles in SBUF in the shape of (tile_size_0, num_tiles_0, num_tiles_1, tile_size_1)
     """
-    assert len(dim_0) == 3, f"'dim_0' expects (tile size, starting tile index, number of tiles). Received {dim_0}."
-    assert len(dim_1) == 3, f"'dim_1' expects (tile size, starting tile index, number of tiles). Received {dim_1}."
+    assert len(dim_0) == 3, f"'dim_0' expects (tile size, start tile index, number of tiles). Received {dim_0}."
+    assert len(dim_1) == 3, f"'dim_1' expects (tile size, start tile index, number of tiles). Received {dim_1}."
     assert len(input_tensor.shape) == 2, f"Expects 2D input tensor. Received {input_tensor.shape}."
     max_rows, max_cols = input_tensor.shape
     row_tile_size, row_tile_id_start, row_num_tiles = dim_0
@@ -105,8 +105,7 @@ def save_result_block(result, result_block, result_block_dim_0: Tuple[int, int],
                      - TILES_IN_M: Number of tiles in the M dimension (rows)
                      - TILES_IN_N: Number of tiles in the N dimension (columns)
                      - TILE_N: Width of each tile
-        tile_index_ofs: A tuple of (row_tile_offset, col_tile_offset) specifying the starting tile indices
-                       in the result tensor where tiles should be stored
+        result_block_dim_0|1: A tuple of (start tile, number of tiles) specifying the target location in the result tensor where tiles should be stored
 
     Returns:
         None. The result tensor is modified in-place.
