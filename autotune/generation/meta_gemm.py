@@ -21,8 +21,6 @@ class MetaGEMM:
     position = 0
     """
 
-    # FIXME: if a loop var is not used, the loop should be removed.
-
     def __init__(
         self, code_file_path: str, transposed_lhs: bool, loop_order: str, lhs_position: int, rhs_position: int
     ) -> None:
@@ -56,7 +54,16 @@ class MetaGEMM:
         self.relative_offsets, self.sizes = self._calculate_relative_offsets()
         self.used_loop_vars = self._get_used_loop_vars()
         self.code_file_path = code_file_path
-        self._generate_code()
+        code = self._generate_code()
+        title = f"""
+'''
+This is auto generated kernel codes. Do not modify directly.
+loop_order = {loop_order}
+lhs_position = {lhs_position}. rhs_position = {rhs_position}.
+'''"""
+        Path(self.code_file_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(self.code_file_path, "w") as f:
+            f.write(title + code)
 
     def _get_tensor_types(self):
         """
@@ -187,10 +194,9 @@ class MetaGEMM:
         absolute_position = min(valid_positions)
         return absolute_position
 
-    def _generate_code(self):
+    def _generate_code(self) -> str:
         lhs_name = "lhsT" if self.transposed_lhs else "lhs"
         common_head = f"""
-# This is auto generated kernel codes. Do not modify directly.
 from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT, matmul_blocks_lhs
 from autotune.modules.dma import load_tensor_block, save_result_block
 import neuronxcc.nki.language as nl
@@ -226,9 +232,7 @@ def {lhs_name}_rhs_gemm(
         return_code = f"""
     return result"""
         total_code = "".join([common_head, loop_openings, innermost_loop_body, loop_closings, return_code])
-        Path(self.code_file_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(self.code_file_path, "w") as f:
-            f.write(total_code)
+        return total_code
 
     def _add_indentation(self, code: str, indentation_level: int) -> str:
         indentation = self._get_indentation(indentation_level)
