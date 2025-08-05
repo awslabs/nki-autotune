@@ -29,6 +29,7 @@ class Benchmark:
         # FIXME: overlap compilation and execution
         self._parallel_init_jobs()
         self.results = self._init_results()
+        self.results.dump_summary()
         self._parallel_preprocessing()
         self._parallel_compile_to_neff()
         self.results.dump_summary()
