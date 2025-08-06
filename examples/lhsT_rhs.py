@@ -56,7 +56,7 @@ def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: 
                 preprocessing=GEMMCompatibility(transposed_lhs=True),
                 postprocessing=postprocessing,
             )
-    jobs.sample(500)
+    jobs.sample(100)
     all_jobs.extend(jobs)
     all_jobs.add_job(
         kernel=("autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
