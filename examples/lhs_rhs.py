@@ -1,12 +1,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from itertools import permutations
+from itertools import permutations, product
 from typing import List
 
 import numpy as np
 from neuronpy.core.language import bfloat16
 
+from autotune.cache.visualize import plot_metric
+from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
 from autotune.core.tune import generate_configs
 from autotune.generation.meta_gemm import MetaGEMM
@@ -59,24 +61,24 @@ def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: 
 
 
 if __name__ == "__main__":
-    cache_root_dir = "/mnt/efs/autotune-cache"
+    cache_root_dir = "/mnt/efs/autotune-dev-cache"
     template_configs = get_template_configs()
     kernels = []
     for template_id, template_config in enumerate(template_configs):
         kernel = MetaGEMM(
-            code_file_path=f"/mnt/efs/generated_lhs_rhs_kernels/generated_gemm_kernel_{template_id}.py",
+            code_file_path=f"/mnt/efs/generated_kernels/lhs_rhs_gemm/generated_gemm_kernel_{template_id}.py",
             transposed_lhs=False,
             **template_config,
         )
         kernels.append(kernel)
-    # mn_shapes = [1024]
-    # k_shapes = [2048]
-    # MNK = list(product(mn_shapes, mn_shapes, k_shapes))
-    # all_jobs = ProfileJobs()
-    # for M, N, K in MNK:
-    #     add_jobs(all_jobs, kernels, M, N, K)
-    # tuner = Benchmark(jobs=all_jobs, cache_root_dir=cache_root_dir)
-    # tuner()
-    # kernel_names = ["lhs_rhs_gemm"]
-    # plot_metric(cache_root_dir, "min_ms", kernel_names)
-    # plot_metric(cache_root_dir, "mfu_estimated_percent", kernel_names)
+    mn_shapes = [1024]
+    k_shapes = [2048]
+    MNK = list(product(mn_shapes, mn_shapes, k_shapes))
+    all_jobs = ProfileJobs()
+    for M, N, K in MNK:
+        add_jobs(all_jobs, kernels, M, N, K)
+    tuner = Benchmark(jobs=all_jobs, cache_root_dir=cache_root_dir)
+    tuner()
+    kernel_names = ["lhs_rhs_gemm"]
+    plot_metric(cache_root_dir, "min_ms", kernel_names)
+    plot_metric(cache_root_dir, "mfu_estimated_percent", kernel_names)

@@ -271,7 +271,15 @@ def matmul_blocks_lhs(
             result_block[idx_res.p, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
 
 
-def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_block, block_id_N):
+def matmul_blocks_tile_transposed_lhs(
+    tileT_lhs_block,
+    lhs_tile_ofs: Tuple[int, int],
+    rhs_block,
+    rhs_tile_ofs: Tuple[int, int],
+    result_block,
+    result_tile_ofs: Tuple[int, int],
+    num_tiles: Tuple[int, int, int],
+):
     """
     Accumulate matmul result tiles between lhs and rhs into result_block
     LHS is transposed at the tile level.
@@ -282,39 +290,38 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_block, 
     tileT_lhs_block: TILE_M, TILES_IN_M, TILES_IN_K, TILE_K. Tile transposed LHS block.
     rhs_block: TILE_K, TILES_IN_K, TILES_IN_N, TILE_N
     result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
-
-    FIXME: add tile number offsets in lhs and rhs
     """
-    TILE_M, TILES_IN_M, TILES_IN_K, TILE_K = tileT_lhs_block.shape
-    _, _, TILES_IN_N, TILE_N = rhs_block.shape
-    assert rhs_block.shape == (
-        TILE_K,
-        TILES_IN_K,
-        TILES_IN_N,
-        TILE_N,
-    ), f"RHS dimension mismatch: tileT_lhs_block (M, K) {tileT_lhs_block.shape}. rhs_block (K, M) {rhs_block.shape}."
-    TILE_M, mm.TILES_IN_BLOCK_M, mm.TILES_IN_N, mm.TILE_N
-    _TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, _TILE_N = result_block.shape
-    _TILE_M, TILES_IN_BLOCK_M, TILES_IN_N, TILE_N = result_block.shape
+    TILE_M, _, _, TILE_K = tileT_lhs_block.shape
+    _TILE_K, _, _, TILE_N = rhs_block.shape
+    _TILE_M, _, _, _TILE_N = result_block.shape
     assert (
-        TILE_K == _TILE_K and TILES_IN_K == _TILES_IN_K
-    ), f"K dimension mismatch: tileT_lhs_block {tileT_lhs_block.shape}. rhs_block {rhs_block.shape}."
-
+        TILE_K == _TILE_K
+    ), f"tileT_lhs_block {tileT_lhs_block.shape} tile K mismatch with rhs_block {rhs_block.shape}"
+    assert (
+        TILE_M == _TILE_M and TILE_N == _TILE_N
+    ), f"result_block {result_block.shape} shape mismatch with tileT_lhs_block {tileT_lhs_block.shape} @ rhs_block {rhs_block.shape}"
     idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(TILES_IN_M):
-        for tile_id_N in nl.affine_range(TILES_IN_N):
+    lhs_M_tile_start, lhs_K_tile_start = lhs_tile_ofs
+    rhs_K_tile_start, rhs_N_tile_start = rhs_tile_ofs
+    result_M_tile_start, result_N_tile_start = result_tile_ofs
+    num_M_tiles, num_N_tiles, num_K_tiles = num_tiles
+
+    for tile_id_M in nl.affine_range(num_M_tiles):
+        for tile_id_N in nl.affine_range(num_N_tiles):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             """
             Use PSUM buffer to accumulate into a single hardware tile
             """
-            for tile_id_K in nl.affine_range(TILES_IN_K):
+            for tile_id_K in nl.affine_range(num_K_tiles):
                 result_tile += nisa.nc_matmul(
-                    tileT_lhs_block[idx_lhs.p, tile_id_M, tile_id_K, idx_lhs.x],
-                    rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x],
+                    tileT_lhs_block[idx_lhs.p, lhs_M_tile_start + tile_id_M, lhs_K_tile_start + tile_id_K, idx_lhs.x],
+                    rhs_block[idx_rhs.p, rhs_K_tile_start + tile_id_K, rhs_N_tile_start + tile_id_N, idx_rhs.x],
                 )
-            result_block[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
+            result_block[
+                idx_res.p, result_M_tile_start + tile_id_M, result_N_tile_start + tile_id_N, idx_res.x
+            ] += result_tile[idx_res.p, idx_res.x]
 
 
 class GEMMCorrectness:
