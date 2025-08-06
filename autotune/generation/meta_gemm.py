@@ -197,7 +197,8 @@ lhs_position = {lhs_position}. rhs_position = {rhs_position}.
     def _generate_code(self) -> str:
         lhs_name = "lhsT" if self.transposed_lhs else "lhs"
         common_head = f"""
-from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT, matmul_blocks_lhs
+from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT, matmul_blocks_tile_transposed_lhs
+from autotune.modules.layout import transpose_tiles_in_block
 from autotune.modules.dma import load_tensor_block, save_result_block
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
@@ -274,7 +275,7 @@ def {lhs_name}_rhs_gemm(
 
     def _generate_innermost_body(self, loop_position: int):
         code = self._generate_opening_at_position(loop_position)
-        matmul_subroutine = "matmul_blocks_lhsT" if self.transposed_lhs else "matmul_blocks_lhs"
+        matmul_subroutine = "matmul_blocks_lhsT" if self.transposed_lhs else "matmul_blocks_tile_transposed_lhs"
         code += f"""
     {matmul_subroutine}(
         lhs_block, ({self.relative_offsets["lhs"][self.dependent_dims["lhs"][0]]}, {self.relative_offsets["lhs"][self.dependent_dims["lhs"][1]]}),
@@ -292,6 +293,9 @@ def {lhs_name}_rhs_gemm(
     lhs_block = load_tensor_block(input_tensor=lhs,
                                 dim_0=(mm.TILE_{lhs_dims[0]}, {self.start_tiles["lhs"][lhs_dims[0]]}, {self.num_tiles["lhs"][lhs_dims[0]]}),
                                 dim_1=(mm.TILE_{lhs_dims[1]}, {self.start_tiles["lhs"][lhs_dims[1]]}, {self.num_tiles["lhs"][lhs_dims[1]]}))"""
+            if not self.transposed_lhs:
+                code += """
+    transpose_tiles_in_block(lhs_block)"""
         if self.op_positions["rhs"] == loop_position:
             rhs_dims = self.dependent_dims["rhs"]
             code += f"""

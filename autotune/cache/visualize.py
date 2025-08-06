@@ -29,12 +29,13 @@ def numerical_key(dim_string: str) -> List:
 
 def parse_dirname(dirname: str):
     components = numerical_key(dirname)
-    transposed_lhs = True
-    if transposed_lhs:
-        K, M, _K, N = components
-        assert K == _K
+    lhs_0, lhs_1, K, N = components
+    if lhs_0 == K:
+        M = lhs_1
+    elif lhs_1 == K:
+        M = lhs_0
     else:
-        M, K, _K, N = components
+        raise Exception(f"Unrecognized input shape: {components}")
     return (M, N, K)
 
 
@@ -97,8 +98,9 @@ def collect_metrics_data_with_stats(directory: str, metric_name: str):
                 # Store metrics only if we successfully calculated them
                 input_sizes = parse_dirname(dirname)
                 metrics_data[input_sizes] = {"best": best_metric, "mean": mean_metric}
-            except:
+            except Exception as e:
                 # If there's any issue getting the best result or metric, skip this directory
+                print(e)
                 continue
     return metrics_data
 
