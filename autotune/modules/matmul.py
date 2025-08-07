@@ -1,8 +1,10 @@
+import math
 from typing import Tuple
 
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
+import tabulate
 
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
@@ -91,7 +93,7 @@ class GEMMCompatibility:
             )
 
         # Validate dimensions
-        self._check()
+        # self._check()
 
     def _calculate_sizes(self) -> None:
         """
@@ -106,21 +108,21 @@ class GEMMCompatibility:
         """
         # Calculate sizes for M dimension
         num_block_m = 1 if self.NUM_BLOCK_M is None else self.NUM_BLOCK_M
-        self.BLOCK_M: int = self.M // num_block_m
-        self.TILES_IN_BLOCK_M = self.BLOCK_M // self.TILE_M
-        self.TILES_IN_M = self.M // self.TILE_M
+        self.BLOCK_M: int = math.ceil(self.M / num_block_m)
+        self.TILES_IN_BLOCK_M = math.ceil(self.BLOCK_M / self.TILE_M)
+        self.TILES_IN_M = math.ceil(self.M / self.TILE_M)
 
         # Calculate sizes for N dimension
         num_block_n = 1 if self.NUM_BLOCK_N is None else self.NUM_BLOCK_N
-        self.BLOCK_N: int = self.N // num_block_n
-        self.TILES_IN_BLOCK_N = self.BLOCK_N // self.TILE_N
-        self.TILES_IN_N = self.N // self.TILE_N
+        self.BLOCK_N: int = math.ceil(self.N / num_block_n)
+        self.TILES_IN_BLOCK_N = math.ceil(self.BLOCK_N / self.TILE_N)
+        self.TILES_IN_N = math.ceil(self.N / self.TILE_N)
 
         # Calculate sizes for K dimension
         num_block_k = 1 if self.NUM_BLOCK_K is None else self.NUM_BLOCK_K
-        self.BLOCK_K: int = self.K // num_block_k
-        self.TILES_IN_BLOCK_K = self.BLOCK_K // self.TILE_K
-        self.TILES_IN_K = self.K // self.TILE_K
+        self.BLOCK_K: int = math.ceil(self.K / num_block_k)
+        self.TILES_IN_BLOCK_K = math.ceil(self.BLOCK_K / self.TILE_K)
+        self.TILES_IN_K = math.ceil(self.K / self.TILE_K)
 
     def _check(self) -> None:
         """
@@ -151,15 +153,166 @@ class GEMMCompatibility:
                     f"{num_block} blocks * {tiles_in_block} tiles * {tile_size}"
                 )
 
+    def __repr__(self) -> str:
+        """
+        Return a string representation of the GEMM compatibility checker as a table.
+
+        Returns:
+            A formatted table showing the configuration parameters.
+        """
+        header = f"GEMMCompatibility(transposed_lhs={self.transposed_lhs})"
+
+        # Check if dimensions have been set (after __call__ has been invoked)
+        if not hasattr(self, "M"):
+            return f"{header}\n(Dimensions not yet set - call the object with matrices to validate)"
+
+        # Format batch info if available
+        batch_info = f" (batch={self.batch})" if self.batch is not None else ""
+
+        # Create table data
+        table_data = [
+            ["Dimension", self.M, self.N, self.K],
+            ["Num blocks", self.NUM_BLOCK_M, self.NUM_BLOCK_N, self.NUM_BLOCK_K],
+            ["Block size", self.BLOCK_M, self.BLOCK_N, self.BLOCK_K],
+            ["Tiles/block", self.TILES_IN_BLOCK_M, self.TILES_IN_BLOCK_N, self.TILES_IN_BLOCK_K],
+            ["Tile size", self.TILE_M, self.TILE_N, self.TILE_K],
+        ]
+
+        # Generate the table with headers
+        table = tabulate.tabulate(table_data, headers=["Parameter", "M", "N", "K"], tablefmt="grid")
+
+        return f"{header}{batch_info}\n{table}"
+
+
+def matmul_blocks(
+    lhs_block,
+    lhs_tile_offsets: Tuple[int, int],
+    rhs_block,
+    rhs_tile_offsets: Tuple[int, int],
+    result_block,
+    result_tile_offsets: Tuple[int, int],
+    compute_num_tiles: Tuple[int, int, int],
+    global_size: Tuple[int, int, int],
+    global_lhs_tile_offsets: Tuple[int, int],
+    global_rhs_tile_offsets: Tuple[int, int],
+    global_result_tile_offsets: Tuple[int, int],
+    tile_transposed_lhs: bool,
+):
+    """
+    Perform tiled matrix multiplication between two SBUF blocks with flexible offsetting.
+
+    Computes result_block += matmul(lhs_block, rhs_block) for specified tile regions
+    within each block. This function supports arbitrary tile-level offsetting within
+    blocks and maintains awareness of global matrix coordinates.
+
+    Args:
+        lhs_block: Left-hand side matrix block stored in SBUF memory
+        lhs_tile_offsets: (M_offset, K_offset) - Starting tile coordinates within
+            lhs_block for the computation region
+        rhs_block: Right-hand side matrix block stored in SBUF memory
+        rhs_tile_offsets: (K_offset, N_offset) - Starting tile coordinates within
+            rhs_block for the computation region
+        result_block: Output matrix block stored in SBUF memory where results
+            will be accumulated
+        result_tile_offsets: (M_offset, N_offset) - Starting tile coordinates within
+            result_block where outputs will be written
+        compute_num_tiles: (M_tiles, N_tiles, K_tiles) - Number of tiles to compute
+            along each dimension for this matmul operation
+        global_size: (M_total, N_total, K_total) - Total size in elements of the
+            complete matrices being multiplied (across all blocks)
+        global_lhs_tile_offsets: (M_global, K_global) - Global tile coordinates
+            where lhs_block starts within the full left-hand matrix
+        global_rhs_tile_offsets: (K_global, N_global) - Global tile coordinates
+            where rhs_block starts within the full right-hand matrix
+        global_result_tile_offsets: (M_global, N_global) - Global tile coordinates
+            where result_block starts within the full output matrix
+        tile_transposed_lhs: (bool) - Whether lhs_block is transposed at the tile level.
+        Note that this is not the same as lhsT_block.
+
+    Notes:
+        - global_size is specified in element units
+        - compute_num_tiles are specified in tile units, not element units
+        - The function performs accumulation (+=) into result_block
+        - The input blocks are part of larger complete input tensors.
+        - Local offsets are relative to the individual input blocks
+        - Global offsets track position within the complete inputs
+    """
+    _TILE_K, _, _, TILE_N = rhs_block.shape
+    _TILE_M, _, _, _TILE_N = result_block.shape
+    if tile_transposed_lhs:
+        TILE_M, _, _, TILE_K = lhs_block.shape
+        lhs_M_tile_start, lhs_K_tile_start = lhs_tile_offsets
+        global_lhs_M_tile_start, global_lhs_K_tile_start = global_lhs_tile_offsets
+    else:
+        TILE_K, _, _, TILE_M = lhs_block.shape
+        lhs_K_tile_start, lhs_M_tile_start = lhs_tile_offsets
+        global_lhs_K_tile_start, global_lhs_M_tile_start = global_lhs_tile_offsets
+    rhs_K_tile_start, rhs_N_tile_start = rhs_tile_offsets
+    global_rhs_K_tile_start, global_rhs_N_tile_start = global_rhs_tile_offsets
+    result_M_tile_start, result_N_tile_start = result_tile_offsets
+    global_result_M_tile_start, global_result_N_tile_start = global_result_tile_offsets
+    assert TILE_K == _TILE_K, f"lhs_block {lhs_block.shape} tile_K mismatch with rhs_block {rhs_block.shape}"
+    assert (
+        TILE_M == _TILE_M and TILE_N == _TILE_N
+    ), f"result_block {result_block.shape} shape mismatch with lhs_block {lhs_block.shape} @ rhs_block {rhs_block.shape}"
+    idx_lhs = nl.mgrid[0 : lhs_block.shape[0], 0 : lhs_block.shape[-1]]
+    idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
+    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
+    num_M_tiles, num_N_tiles, num_K_tiles = compute_num_tiles
+    M, N, K = global_size
+
+    for tile_id_M in nl.affine_range(num_M_tiles):
+        for tile_id_N in nl.affine_range(num_N_tiles):
+            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            """
+            Use PSUM buffer to accumulate into a single hardware tile
+            """
+            for tile_id_K in nl.affine_range(num_K_tiles):
+                lhs_M_tile_index = lhs_M_tile_start + tile_id_M
+                lhs_K_tile_index = lhs_K_tile_start + tile_id_K
+                global_lhs_M_start = (global_lhs_M_tile_start + lhs_M_tile_index) * TILE_M
+                global_lhs_K_start = (global_lhs_K_tile_start + lhs_K_tile_index) * TILE_K
+                if tile_transposed_lhs:
+                    lhs_row_tile_index = lhs_M_tile_index
+                    lhs_col_tile_index = lhs_K_tile_index
+                    lhs_mask = (
+                        -1 * global_lhs_M_start + -1 * idx_lhs.p + M - 1
+                        >= 0 & -1 * global_lhs_K_start + -1 * idx_lhs.x + K - 1
+                        >= 0
+                    )
+                else:
+                    lhs_row_tile_index = lhs_K_tile_index
+                    lhs_col_tile_index = lhs_M_tile_index
+                    lhs_mask = (global_lhs_K_start + idx_lhs.p < K) & (global_lhs_M_start + idx_lhs.x < M)
+                rhs_K_tile_index = rhs_K_tile_start + tile_id_K
+                rhs_N_tile_index = rhs_N_tile_start + tile_id_N
+                global_rhs_K_start = (global_rhs_K_tile_start + rhs_K_tile_index) * TILE_K
+                global_rhs_N_start = (global_rhs_N_tile_start + rhs_N_tile_index) * TILE_N
+                rhs_mask = (global_rhs_K_start + idx_rhs.p < K) & (global_rhs_N_start + idx_rhs.x < N)
+                print(lhs_mask, lhs_mask.shape)
+                print(rhs_mask, rhs_mask.shape)
+                result_tile += nisa.nc_matmul(
+                    lhs_block[idx_lhs.p, lhs_row_tile_index, lhs_col_tile_index, idx_lhs.x],
+                    rhs_block[idx_rhs.p, rhs_K_tile_index, rhs_N_tile_index, idx_rhs.x],
+                    mask=lhs_mask & rhs_mask,
+                )
+            # FIXME: add result block masking
+            result_block[
+                idx_res.p, result_M_tile_start + tile_id_M, result_N_tile_start + tile_id_N, idx_res.x
+            ] += result_tile[idx_res.p, idx_res.x]
+
 
 def matmul_blocks_lhsT(
     lhsT_block,
-    lhsT_tile_ofs: Tuple[int, int],
+    local_lhsT_tile_ofs: Tuple[int, int],
     rhs_block,
-    rhs_tile_ofs: Tuple[int, int],
+    local_rhs_tile_ofs: Tuple[int, int],
     result_block,
-    result_tile_ofs: Tuple[int, int],
+    local_result_tile_ofs: Tuple[int, int],
     num_tiles: Tuple[int, int, int],
+    gemm_shape: Tuple[int, int, int],
+    lhsT_global_tile_ofs: Tuple[int, int],
+    rhs_global_tile_ofs: Tuple[int, int],
 ):
     """
     Perform tiled matrix multiplication between transposed left-hand side and right-hand side matrices.
@@ -173,11 +326,12 @@ def matmul_blocks_lhsT(
         lhsT_block: Left-hand side matrix block in transposed format. (K, M)
         rhs_block: Right-hand side matrix block. (K, N)
         result_block: Output matrix block where results are accumulated. (M, N)
-        lhsT_tile_ofs: lhsT_K_tile_start, lhsT_M_tile_start
-        rhs_tile_ofs: rhs_K_tile_start, rhs_N_tile_start
-        result_tile_ofs: result_M_tile_start, result_N_tile_start
+        local_lhsT_tile_ofs: lhsT_K_tile_start, lhsT_M_tile_start
+        local_rhs_tile_ofs: rhs_K_tile_start, rhs_N_tile_start
+        local_result_tile_ofs: result_M_tile_start, result_N_tile_start
         num_tiles: number of M, N, K tiles to compute
     """
+    print(f"{lhsT_block.shape} @ {rhs_block.shape} --> {result_block.shape}.")
     TILE_K, _, _, TILE_M = lhsT_block.shape
     _TILE_K, _, _, TILE_N = rhs_block.shape
     _TILE_M, _, _, _TILE_N = result_block.shape
@@ -188,9 +342,9 @@ def matmul_blocks_lhsT(
     idx_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
     idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    lhsT_K_tile_start, lhsT_M_tile_start = lhsT_tile_ofs
-    rhs_K_tile_start, rhs_N_tile_start = rhs_tile_ofs
-    result_M_tile_start, result_N_tile_start = result_tile_ofs
+    lhsT_K_tile_start, lhsT_M_tile_start = local_lhsT_tile_ofs
+    rhs_K_tile_start, rhs_N_tile_start = local_rhs_tile_ofs
+    result_M_tile_start, result_N_tile_start = local_result_tile_ofs
     num_M_tiles, num_N_tiles, num_K_tiles = num_tiles
 
     for tile_id_M in nl.affine_range(num_M_tiles):
@@ -207,68 +361,6 @@ def matmul_blocks_lhsT(
             result_block[
                 idx_res.p, result_M_tile_start + tile_id_M, result_N_tile_start + tile_id_N, idx_res.x
             ] += result_tile[idx_res.p, idx_res.x]
-
-
-def matmul_blocks_lhs(
-    lhs_block,
-    lhs_tile_ofs: Tuple[int, int],
-    rhs_block,
-    rhs_tile_ofs: Tuple[int, int],
-    result_block,
-    result_tile_ofs: Tuple[int, int],
-    num_tiles: Tuple[int, int, int],
-):
-    """
-    Accumulate matmul result tiles between lhs and rhs into result_block
-    LHS is not transposed.
-    'matmul_block' module computes lhsT @ rhs.
-
-    Args:
-    lhs_block: Left-hand side matrix block in transposed format. (M, K)
-    rhs_block: Right-hand side matrix block. (K, N)
-    result_block: Output matrix block where results are accumulated. (M, N)
-    lhs_tile_ofs: lhs_M_tile_start, lhs_K_tile_start
-    rhs_tile_ofs: rhs_K_tile_start, rhs_N_tile_start
-    result_tile_ofs: result_M_tile_start, result_N_tile_start
-    num_tiles: number of M, N, K tiles to compute
-    """
-    TILE_M, _, _, TILE_K = lhs_block.shape
-    _TILE_K, _, _, TILE_N = rhs_block.shape
-    _TILE_M, _, _, _TILE_N = result_block.shape
-    assert TILE_K == _TILE_K, f"lhs_block {lhs_block.shape} tile K mismatch with rhs_block {rhs_block.shape}"
-    assert (
-        TILE_M == _TILE_M and TILE_N == _TILE_N
-    ), f"result_block {result_block.shape} shape mismatch with lhs_block {lhs_block.shape} @ rhs_block {rhs_block.shape}"
-
-    if nisa.get_nc_version() == nisa.nc_version.gen3:
-        tileT_dtype = lhs_block.dtype
-    else:
-        tileT_dtype = np.float32
-
-    idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
-    idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    lhs_M_tile_start, lhs_K_tile_start = lhs_tile_ofs
-    rhs_K_tile_start, rhs_N_tile_start = rhs_tile_ofs
-    result_M_tile_start, result_N_tile_start = result_tile_ofs
-    num_M_tiles, num_N_tiles, num_K_tiles = num_tiles
-    # TODO: do M-K-N loop order, transpose M, K lhs_block then use it in N
-    for tile_id_M in nl.affine_range(num_M_tiles):
-        for tile_id_N in nl.affine_range(num_N_tiles):
-            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            """
-            Use PSUM buffer to accumulate into a single hardware tile
-            """
-            for tile_id_K in nl.affine_range(num_K_tiles):
-                # FIXME: in-place transposition repeated across tile_id_N
-                # TODO: use a temp tile to hold tileT
-                tileT_psum = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.psum)
-                tileT_psum[...] = nisa.nc_transpose(lhs_block[idx_lhs.p, tile_id_M, tile_id_K, idx_lhs.x])
-                tileT_sbuf = nl.ndarray((nl.par_dim(TILE_K), TILE_M), dtype=tileT_dtype, buffer=nl.sbuf)
-                tileT_sbuf[...] = nl.copy(tileT_psum, dtype=lhs_block.dtype)
-                result_tile += nisa.nc_matmul(tileT_sbuf, rhs_block[idx_rhs.p, tile_id_K, tile_id_N, idx_rhs.x])
-
-            result_block[idx_res.p, tile_id_M, tile_id_N, idx_res.x] += result_tile[idx_res.p, idx_res.x]
 
 
 def matmul_blocks_tile_transposed_lhs(

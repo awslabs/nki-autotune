@@ -50,10 +50,14 @@ class MetaGEMM:
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
         self.tensor_types = self._get_tensor_types()
-        self.start_tiles, self.num_tiles = self._calculate_tensor_coordinates()
-        self.relative_offsets, self.sizes = self._calculate_relative_offsets()
+        self.global_start_tiles, self.global_num_tiles = self._calculate_global_coordinates()
+        self.local_start_tiles, self.local_num_tiles = self._calculate_local_coordinates()
         self.used_loop_vars = self._get_used_loop_vars()
         self.code_file_path = code_file_path
+        print(self.global_start_tiles)
+        print(self.global_num_tiles)
+        print(self.local_start_tiles)
+        print(self.local_num_tiles)
         code = self._generate_code()
         title = f"""
 '''
@@ -91,7 +95,7 @@ lhs_position = {lhs_position}. rhs_position = {rhs_position}.
                     tensor_types[tensor][dim] = "block"
         return tensor_types
 
-    def _calculate_tensor_coordinates(self):
+    def _calculate_global_coordinates(self):
         """
         For each lhs, rhs, result, calculate:
         - Tile start
@@ -126,7 +130,7 @@ lhs_position = {lhs_position}. rhs_position = {rhs_position}.
                     )
         return start_tiles, num_tiles
 
-    def _calculate_relative_offsets(self):
+    def _calculate_local_coordinates(self):
         """
         For any dimension X in M, N, K:
         Calculate the offset in both tensors involving this particular dimension
@@ -197,7 +201,7 @@ lhs_position = {lhs_position}. rhs_position = {rhs_position}.
     def _generate_code(self) -> str:
         lhs_name = "lhsT" if self.transposed_lhs else "lhs"
         common_head = f"""
-from autotune.modules.matmul import GEMMCompatibility, matmul_blocks_lhsT, matmul_blocks_tile_transposed_lhs
+from autotune.modules.matmul import GEMMCompatibility, matmul_blocks
 from autotune.modules.layout import transpose_tiles_in_block
 from autotune.modules.dma import load_tensor_block, save_result_block
 import neuronxcc.nki.language as nl
@@ -228,7 +232,7 @@ def {lhs_name}_rhs_gemm(
             loop_var = self.loop_order[loop_position]
             if loop_var in self.used_loop_vars:
                 indentation_level += 1
-        innermost_loop_body = self._generate_innermost_body(loop_position + 1)
+        innermost_loop_body = self._generate_matmul_body(loop_position + 1)
         innermost_loop_body = self._add_indentation(innermost_loop_body, indentation_level)
         return_code = f"""
     return result"""
@@ -248,10 +252,10 @@ def {lhs_name}_rhs_gemm(
         """Determine which loop variables are actually used in operations"""
         used_loop_vars = set()
 
-        for tensor in self.start_tiles:
-            for dim in self.start_tiles[tensor]:
-                start = self.start_tiles[tensor][dim]
-                relative_offset = self.relative_offsets[tensor][dim]
+        for tensor in self.global_start_tiles:
+            for dim in self.global_start_tiles[tensor]:
+                start = self.global_start_tiles[tensor][dim]
+                relative_offset = self.local_start_tiles[tensor][dim]
                 if "block_id" in start or "block_id" in relative_offset:
                     used_loop_vars.add(dim)
         return used_loop_vars
@@ -266,22 +270,28 @@ def {lhs_name}_rhs_gemm(
             result_dims = self.dependent_dims["result"]
             closing = f"""
     save_result_block(result, result_block,
-       ({self.start_tiles["result"][result_dims[0]]}, {self.num_tiles["result"][result_dims[0]]}),
-       ({self.start_tiles["result"][result_dims[1]]}, {self.num_tiles["result"][result_dims[1]]})
+       ({self.global_start_tiles["result"][result_dims[0]]}, {self.global_num_tiles["result"][result_dims[0]]}),
+       ({self.global_start_tiles["result"][result_dims[1]]}, {self.global_num_tiles["result"][result_dims[1]]})
     )"""
         else:
             closing = ""
         return opening, closing
 
-    def _generate_innermost_body(self, loop_position: int):
+    def _generate_matmul_body(self, loop_position: int):
         code = self._generate_opening_at_position(loop_position)
         matmul_subroutine = "matmul_blocks_lhsT" if self.transposed_lhs else "matmul_blocks_tile_transposed_lhs"
+        matmul_subroutine = "matmul_blocks"
         code += f"""
     {matmul_subroutine}(
-        lhs_block, ({self.relative_offsets["lhs"][self.dependent_dims["lhs"][0]]}, {self.relative_offsets["lhs"][self.dependent_dims["lhs"][1]]}),
-        rhs_block, ({self.relative_offsets["rhs"][self.dependent_dims["rhs"][0]]}, {self.relative_offsets["rhs"][self.dependent_dims["rhs"][1]]}),
-        result_block, ({self.relative_offsets["result"][self.dependent_dims["result"][0]]}, {self.relative_offsets["result"][self.dependent_dims["result"][1]]}),
-        ({self.sizes["M"]}, {self.sizes["N"]}, {self.sizes["K"]})
+        lhs_block, ({self.local_start_tiles["lhs"][self.dependent_dims["lhs"][0]]}, {self.local_start_tiles["lhs"][self.dependent_dims["lhs"][1]]}),
+        rhs_block, ({self.local_start_tiles["rhs"][self.dependent_dims["rhs"][0]]}, {self.local_start_tiles["rhs"][self.dependent_dims["rhs"][1]]}),
+        result_block, ({self.local_start_tiles["result"][self.dependent_dims["result"][0]]}, {self.local_start_tiles["result"][self.dependent_dims["result"][1]]}),
+        compute_num_tiles=({self.local_num_tiles["M"]}, {self.local_num_tiles["N"]}, {self.local_num_tiles["K"]}),
+        global_size=(mm.M, mm.N, mm.K),
+        global_lhs_tile_offsets=({self.global_start_tiles["lhs"][self.dependent_dims["lhs"][0]]}, {self.global_start_tiles["lhs"][self.dependent_dims["lhs"][1]]}),
+        global_rhs_tile_offsets=({self.global_start_tiles["rhs"][self.dependent_dims["rhs"][0]]}, {self.global_start_tiles["rhs"][self.dependent_dims["rhs"][1]]}),
+        global_result_tile_offsets=({self.global_start_tiles["result"][self.dependent_dims["result"][0]]}, {self.global_start_tiles["result"][self.dependent_dims["result"][1]]}),
+        tile_transposed_lhs={not self.transposed_lhs},
     )"""
         return code
 
@@ -291,8 +301,8 @@ def {lhs_name}_rhs_gemm(
             lhs_dims = self.dependent_dims["lhs"]
             code += f"""
     lhs_block = load_tensor_block(input_tensor=lhs,
-                                dim_0=(mm.TILE_{lhs_dims[0]}, {self.start_tiles["lhs"][lhs_dims[0]]}, {self.num_tiles["lhs"][lhs_dims[0]]}),
-                                dim_1=(mm.TILE_{lhs_dims[1]}, {self.start_tiles["lhs"][lhs_dims[1]]}, {self.num_tiles["lhs"][lhs_dims[1]]}))"""
+                                dim_0=(mm.TILE_{lhs_dims[0]}, {self.global_start_tiles["lhs"][lhs_dims[0]]}, {self.global_num_tiles["lhs"][lhs_dims[0]]}),
+                                dim_1=(mm.TILE_{lhs_dims[1]}, {self.global_start_tiles["lhs"][lhs_dims[1]]}, {self.global_num_tiles["lhs"][lhs_dims[1]]}))"""
             if not self.transposed_lhs:
                 code += """
     transpose_tiles_in_block(lhs_block)"""
@@ -300,12 +310,12 @@ def {lhs_name}_rhs_gemm(
             rhs_dims = self.dependent_dims["rhs"]
             code += f"""
     rhs_block = load_tensor_block(input_tensor=rhs,
-                                dim_0=(mm.TILE_{rhs_dims[0]}, {self.start_tiles["rhs"][rhs_dims[0]]}, {self.num_tiles["rhs"][rhs_dims[0]]}),
-                                dim_1=(mm.TILE_{rhs_dims[1]}, {self.start_tiles["rhs"][rhs_dims[1]]}, {self.num_tiles["rhs"][rhs_dims[1]]}))"""
+                                dim_0=(mm.TILE_{rhs_dims[0]}, {self.global_start_tiles["rhs"][rhs_dims[0]]}, {self.global_num_tiles["rhs"][rhs_dims[0]]}),
+                                dim_1=(mm.TILE_{rhs_dims[1]}, {self.global_start_tiles["rhs"][rhs_dims[1]]}, {self.global_num_tiles["rhs"][rhs_dims[1]]}))"""
         if self.op_positions["result"] == loop_position:
             result_dims = self.dependent_dims["result"]
             code += f"""
-    result_block = nl.zeros((mm.TILE_{result_dims[0]}, {self.num_tiles["result"][result_dims[0]]}, {self.num_tiles["result"][result_dims[1]]}, mm.TILE_{result_dims[1]}),
+    result_block = nl.zeros((mm.TILE_{result_dims[0]}, {self.global_num_tiles["result"][result_dims[0]]}, {self.global_num_tiles["result"][result_dims[1]]}, mm.TILE_{result_dims[1]}),
                              dtype=result.dtype,buffer=nl.sbuf)"""
         return code
 

@@ -24,10 +24,15 @@ def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[in
         dtype=input_tensor.dtype,
         buffer=nl.sbuf,
     )
+    print(f"row_tile_size = {row_tile_size}. column_tile_size = {column_tile_size}.")
     for row_tile_id in nl.affine_range(row_num_tiles):
         for column_tile_id in nl.affine_range(column_num_tiles):
             row_indices = (row_tile_id_start + row_tile_id) * row_tile_size + tile_index.p
             col_indices = (column_tile_id_start + column_tile_id) * column_tile_size + tile_index.x
+            row_mask = row_indices < max_rows
+            col_mask = col_indices < max_cols
+            print(f"row_mask = {row_mask}, {row_mask.shape}. row_indices = {row_indices.shape}.")
+            print(f"col_mask = {col_mask}, {col_mask.shape}. col_indices = {col_indices.shape}.")
             mask = (row_indices < max_rows) & (col_indices < max_cols)
             block[tile_index.p, row_tile_id, column_tile_id, tile_index.x] = nl.load(
                 input_tensor[row_indices, col_indices], mask=mask
@@ -50,30 +55,6 @@ def save_result_dma(result, result_blocks, block_id_M: int):
                     result_blocks[idx_res.p, block_id_N, tile_id_M, tile_id_N, idx_res.x]
                 )
         nl.store(result[m_ofs + idx_res_packed.p, idx_res_packed.x], value=result_blocks_packed)
-
-
-def save_result_acc(result, result_block, BLOCK_M, BLOCK_N):
-    M, N = result.shape
-    TILE_M, TILES_IN_M, TILES_IN_N, TILE_N = result_block.shape
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for block_id_M in nl.affine_range(NUM_BLOCK_M):
-        m_ofs = block_id_M * BLOCK_M
-        for block_id_N in nl.affine_range(NUM_BLOCK_N):
-            n_ofs = block_id_N * BLOCK_N
-            for tile_id_M in nl.affine_range(num_m_tiles):
-                for tile_id_N in nl.affine_range(num_n_tiles):
-                    result_acc = nl.zeros(
-                        (num_m_tiles, num_n_tiles, nl.par_dim(TILE_M), TILE_N), dtype=result_block.dtype, buffer=nl.sbuf
-                    )
-                    for block_id_K in nl.affine_range(NUM_BLOCK_K):
-                        result_acc[tile_id_M, tile_id_N] += result_block[
-                            block_id_K, block_id_M, block_id_N, tile_id_M, tile_id_N
-                        ]
-
-                    nl.store(
-                        result[m_ofs + tile_id_M * TILE_M + idx_res.p, n_ofs + tile_id_N * TILE_N + idx_res.x],
-                        value=result_acc[tile_id_M, tile_id_N],
-                    )
 
 
 def save_result_block(result, result_block, result_block_dim_0: Tuple[int, int], result_block_dim_1: Tuple[int, int]):
