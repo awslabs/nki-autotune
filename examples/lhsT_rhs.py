@@ -18,15 +18,16 @@ from autotune.modules.matmul import GEMMCompatibility, GEMMCorrectness
 def get_template_configs():
     loop_orders = list(permutations("MNK"))
     loop_orders = ["".join(loop_order) for loop_order in loop_orders]
-    lhs_positions = [0, 1, 2]
-    rhs_positions = [0, 1, 2]
+    loop_orders = ["MKN"]
+    lhs_positions = [1]
+    rhs_positions = [2]
     template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
     template_configs = generate_configs(**template_params)
     return template_configs
 
 
 def get_configs():
-    num_blocks = [1, 2, 4, 8, 16]
+    num_blocks = [4]
     kernel_params = {"NUM_BLOCK_M": num_blocks, "NUM_BLOCK_N": num_blocks, "NUM_BLOCK_K": num_blocks}
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
@@ -58,14 +59,14 @@ def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: 
             )
     jobs.sample(100)
     all_jobs.extend(jobs)
-    all_jobs.add_job(
-        kernel=("autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
-        input_tensors=(lhsT, rhs),
-        kernel_kwargs={},
-        compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-        preprocessing=None,
-        postprocessing=postprocessing,
-    )
+    # all_jobs.add_job(
+    #     kernel=("autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
+    #     input_tensors=(lhsT, rhs),
+    #     kernel_kwargs={},
+    #     compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
+    #     preprocessing=None,
+    #     postprocessing=postprocessing,
+    # )
     return all_jobs
 
 
@@ -80,9 +81,7 @@ if __name__ == "__main__":
             **template_config,
         )
         kernels.append(kernel)
-    mn_shapes = [2048]
-    k_shapes = [2048]
-    MNK = list(product(mn_shapes, mn_shapes, k_shapes))
+    MNK = list(product([1029], [2035], [3957]))
     all_jobs = ProfileJobs()
     for M, N, K in MNK:
         add_jobs(all_jobs, kernels, M, N, K)

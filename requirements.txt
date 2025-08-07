@@ -7,3 +7,4 @@ neuronx-cc==2.*
 isort
 black
 astor
+tabulate
