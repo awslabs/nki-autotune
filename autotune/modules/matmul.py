@@ -275,11 +275,7 @@ def matmul_blocks(
                 if tile_transposed_lhs:
                     lhs_row_tile_index = lhs_M_tile_index
                     lhs_col_tile_index = lhs_K_tile_index
-                    lhs_mask = (
-                        -1 * global_lhs_M_start + -1 * idx_lhs.p + M - 1
-                        >= 0 & -1 * global_lhs_K_start + -1 * idx_lhs.x + K - 1
-                        >= 0
-                    )
+                    lhs_mask = global_lhs_M_start + idx_lhs.p < M & global_lhs_K_start + idx_lhs.x < K
                 else:
                     lhs_row_tile_index = lhs_K_tile_index
                     lhs_col_tile_index = lhs_M_tile_index
@@ -289,12 +285,14 @@ def matmul_blocks(
                 global_rhs_K_start = (global_rhs_K_tile_start + rhs_K_tile_index) * TILE_K
                 global_rhs_N_start = (global_rhs_N_tile_start + rhs_N_tile_index) * TILE_N
                 rhs_mask = (global_rhs_K_start + idx_rhs.p < K) & (global_rhs_N_start + idx_rhs.x < N)
-                print(lhs_mask, lhs_mask.shape)
-                print(rhs_mask, rhs_mask.shape)
+                # FIXME: add matmul masking
                 result_tile += nisa.nc_matmul(
-                    lhs_block[idx_lhs.p, lhs_row_tile_index, lhs_col_tile_index, idx_lhs.x],
-                    rhs_block[idx_rhs.p, rhs_K_tile_index, rhs_N_tile_index, idx_rhs.x],
-                    mask=lhs_mask & rhs_mask,
+                    lhs_block[idx_lhs.p, lhs_row_tile_index, lhs_col_tile_index, idx_lhs.x][
+                        (idx_lhs.p < K - global_lhs_K_start) & (idx_lhs.x < M - global_lhs_M_start)
+                    ],
+                    rhs_block[idx_rhs.p, rhs_K_tile_index, rhs_N_tile_index, idx_rhs.x][
+                        (idx_rhs.p < K - global_rhs_K_start) & (idx_rhs.x < N - global_rhs_N_start)
+                    ],
                 )
             # FIXME: add result block masking
             result_block[
@@ -331,7 +329,6 @@ def matmul_blocks_lhsT(
         local_result_tile_ofs: result_M_tile_start, result_N_tile_start
         num_tiles: number of M, N, K tiles to compute
     """
-    print(f"{lhsT_block.shape} @ {rhs_block.shape} --> {result_block.shape}.")
     TILE_K, _, _, TILE_M = lhsT_block.shape
     _TILE_K, _, _, TILE_N = rhs_block.shape
     _TILE_M, _, _, _TILE_N = result_block.shape

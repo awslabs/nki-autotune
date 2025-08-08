@@ -54,10 +54,6 @@ class MetaGEMM:
         self.local_start_tiles, self.local_num_tiles = self._calculate_local_coordinates()
         self.used_loop_vars = self._get_used_loop_vars()
         self.code_file_path = code_file_path
-        print(self.global_start_tiles)
-        print(self.global_num_tiles)
-        print(self.local_start_tiles)
-        print(self.local_num_tiles)
         code = self._generate_code()
         title = f"""
 '''

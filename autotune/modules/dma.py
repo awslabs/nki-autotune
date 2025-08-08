@@ -24,15 +24,12 @@ def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[in
         dtype=input_tensor.dtype,
         buffer=nl.sbuf,
     )
-    print(f"row_tile_size = {row_tile_size}. column_tile_size = {column_tile_size}.")
     for row_tile_id in nl.affine_range(row_num_tiles):
         for column_tile_id in nl.affine_range(column_num_tiles):
             row_indices = (row_tile_id_start + row_tile_id) * row_tile_size + tile_index.p
             col_indices = (column_tile_id_start + column_tile_id) * column_tile_size + tile_index.x
             row_mask = row_indices < max_rows
             col_mask = col_indices < max_cols
-            print(f"row_mask = {row_mask}, {row_mask.shape}. row_indices = {row_indices.shape}.")
-            print(f"col_mask = {col_mask}, {col_mask.shape}. col_indices = {col_indices.shape}.")
             mask = (row_indices < max_rows) & (col_indices < max_cols)
             block[tile_index.p, row_tile_id, column_tile_id, tile_index.x] = nl.load(
                 input_tensor[row_indices, col_indices], mask=mask
