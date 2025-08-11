@@ -91,15 +91,20 @@ def save_result_block(result, result_block, result_block_dim_0: Tuple[int, int],
     start_M_tile, num_M_tiles = result_block_dim_0
     start_N_tile, num_N_tiles = result_block_dim_1
     TILE_M, _, _, TILE_N = result_block.shape
+    M, N = result.shape
+    # FIXME: num_M_tiles, num_N_tiles are not necessary in result_block_dim_0|1
     assert result_block.shape == (TILE_M, num_M_tiles, num_N_tiles, TILE_N)
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for tile_id_M in nl.affine_range(num_M_tiles):
         m_start = (start_M_tile + tile_id_M) * TILE_M
+        m_indices = m_start + idx_res.p
         for tile_id_N in nl.affine_range(num_N_tiles):
             n_start = (start_N_tile + tile_id_N) * TILE_N
+            n_indices = n_start + idx_res.x
             nl.store(
-                result[m_start + idx_res.p, n_start + idx_res.x],
+                result[m_indices, n_indices],
                 value=result_block[idx_res.p, tile_id_M, tile_id_N, idx_res.x],
+                mask=(m_indices < M) & (n_indices < N),
             )
 
 

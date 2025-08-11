@@ -285,16 +285,10 @@ def matmul_blocks(
                 global_rhs_K_start = (global_rhs_K_tile_start + rhs_K_tile_index) * TILE_K
                 global_rhs_N_start = (global_rhs_N_tile_start + rhs_N_tile_index) * TILE_N
                 rhs_mask = (global_rhs_K_start + idx_rhs.p < K) & (global_rhs_N_start + idx_rhs.x < N)
-                # FIXME: add matmul masking
                 result_tile += nisa.nc_matmul(
-                    lhs_block[idx_lhs.p, lhs_row_tile_index, lhs_col_tile_index, idx_lhs.x][
-                        (idx_lhs.p < K - global_lhs_K_start) & (idx_lhs.x < M - global_lhs_M_start)
-                    ],
-                    rhs_block[idx_rhs.p, rhs_K_tile_index, rhs_N_tile_index, idx_rhs.x][
-                        (idx_rhs.p < K - global_rhs_K_start) & (idx_rhs.x < N - global_rhs_N_start)
-                    ],
+                    lhs_block[idx_lhs.p, lhs_row_tile_index, lhs_col_tile_index, idx_lhs.x][lhs_mask],
+                    rhs_block[idx_rhs.p, rhs_K_tile_index, rhs_N_tile_index, idx_rhs.x][rhs_mask],
                 )
-            # FIXME: add result block masking
             result_block[
                 idx_res.p, result_M_tile_start + tile_id_M, result_N_tile_start + tile_id_N, idx_res.x
             ] += result_tile[idx_res.p, idx_res.x]

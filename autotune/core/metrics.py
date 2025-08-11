@@ -49,6 +49,7 @@ def calculate_mfu(mac_count: int, time_ms: float, target_instance_family: str) -
 
     Returns:
     float: PE utilization percentage
+    FIXME: check dtype
     """
     if any(target_instance_family.startswith(family) for family in {"sunda", "trainium", "trn1", "inf2"}):
         pe_freq = 2.8 * 1e9  # Hz (2.8 GHz)
