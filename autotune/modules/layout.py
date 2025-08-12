@@ -22,18 +22,21 @@ def transpose_tiles_in_block(block: tensor):
     ), f"Expect (row_tile_size, row_num_tiles, column_num_tiles, column_tile_size). Received {block.shape}."
     row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = block.shape
     pmax = nl.tile_size.pmax
-    index = nl.mgrid[0:pmax, 0:pmax]
+    transp_index = nl.mgrid[0:pmax, 0:pmax]
     for row_tile_id in nl.affine_range(row_num_tiles):
         for column_tile_id in nl.affine_range(column_num_tiles):
             for row_transp_tile_id in nl.affine_range(row_tile_size // pmax):
                 row_ofs = row_transp_tile_id * pmax
+                transp_row_indices = row_ofs + transp_index.p
                 for column_transp_tile_id in nl.affine_range(column_tile_size // pmax):
                     column_ofs = column_transp_tile_id * pmax
+                    transp_column_indices = column_ofs + transp_index.x
                     tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=blockT_dtype, buffer=nl.psum)
-                    tileT[index.p, index.x] = nisa.nc_transpose(
-                        block[row_ofs + index.p, row_tile_id, column_tile_id, column_ofs + index.x]
+                    # FIXME: need masking here
+                    tileT[transp_index.p, transp_index.x] = nisa.nc_transpose(
+                        block[transp_row_indices, row_tile_id, column_tile_id, transp_column_indices]
                     )
-                    block[row_ofs + index.p, row_tile_id, column_tile_id, column_ofs + index.x] = nl.copy(
+                    block[transp_row_indices, row_tile_id, column_tile_id, transp_column_indices] = nl.copy(
                         tileT, dtype=block.dtype
                     )
 

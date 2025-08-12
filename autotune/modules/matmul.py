@@ -272,13 +272,11 @@ def matmul_blocks(
             lhs_M_mask = global_lhs_M_start + idx_lhs.p < M
         else:
             lhs_M_mask = global_lhs_M_start + idx_lhs.x < M
-        result_M_mask = global_lhs_M_start + idx_res.p < M
         for tile_id_N in nl.affine_range(num_N_tiles):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             rhs_N_tile_index = rhs_N_tile_start + tile_id_N
             global_rhs_N_start = (global_rhs_N_tile_start + rhs_N_tile_index) * TILE_N
             rhs_N_mask = global_rhs_N_start + idx_rhs.x < N
-            result_N_mask = global_rhs_N_start + idx_res.x < N
             """
             Use PSUM buffer to accumulate into a single hardware tile
             """
@@ -297,13 +295,9 @@ def matmul_blocks(
                 global_rhs_K_start = (global_rhs_K_tile_start + rhs_K_tile_index) * TILE_K
                 rhs_K_mask = global_rhs_K_start + idx_rhs.p < K
                 result_tile += nisa.nc_matmul(
-                    lhs_block[idx_lhs.p, lhs_row_tile_index, lhs_col_tile_index, idx_lhs.x][lhs_K_mask & lhs_M_mask],
-                    rhs_block[idx_rhs.p, rhs_K_tile_index, rhs_N_tile_index, idx_rhs.x][rhs_K_mask & rhs_N_mask],
+                    lhs_block[idx_lhs.p, lhs_row_tile_index, lhs_col_tile_index, idx_lhs.x][lhs_K_mask][lhs_M_mask],
+                    rhs_block[idx_rhs.p, rhs_K_tile_index, rhs_N_tile_index, idx_rhs.x][rhs_K_mask][rhs_N_mask],
                 )
-            """
-            FIXME: need truncation.
-            Only accumulate the region of result_M_mask & result_N_mask.
-            """
             result_block[
                 idx_res.p, result_M_tile_start + tile_id_M, result_N_tile_start + tile_id_N, idx_res.x
             ] += result_tile[idx_res.p, idx_res.x]

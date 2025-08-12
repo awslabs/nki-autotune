@@ -1,13 +1,17 @@
+import math
 from typing import Tuple
 
+import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
+import numpy as np
 
 
-def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[int, int, int]):
+def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[int, int, int], transpose: bool):
     """
     Args:
         input_tensor: the input 2D HBM tensor
         dim_0, dim_1: (tile size, start tile index, number of tiles)
+        transpose: whether to transpose each loaded tile
 
     Returns:
         Loaded tiles in SBUF in the shape of (tile_size_0, num_tiles_0, num_tiles_1, tile_size_1)
@@ -18,6 +22,14 @@ def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[in
     max_rows, max_cols = input_tensor.shape
     row_tile_size, row_tile_id_start, row_num_tiles = dim_0
     column_tile_size, column_tile_id_start, column_num_tiles = dim_1
+    pmax = nl.tile_size.pmax
+    row_transp_num_tiles = math.ceil(row_tile_size / pmax)
+    column_transp_num_tiles = math.ceil(column_tile_size / pmax)
+    transp_index = nl.mgrid[0:pmax, 0:pmax]
+    if nisa.get_nc_version() == nisa.nc_version.gen3:
+        tileT_dtype = input_tensor.dtype
+    else:
+        tileT_dtype = np.float32
     tile_index = nl.mgrid[0:row_tile_size, 0:column_tile_size]
     block = nl.ndarray(
         (nl.par_dim(row_tile_size), row_num_tiles, column_num_tiles, column_tile_size),
@@ -25,15 +37,34 @@ def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[in
         buffer=nl.sbuf,
     )
     for row_tile_id in nl.affine_range(row_num_tiles):
+        row_start = (row_tile_id_start + row_tile_id) * row_tile_size
+        row_indices = row_start + tile_index.p
+        row_mask = row_indices < max_rows
         for column_tile_id in nl.affine_range(column_num_tiles):
-            row_indices = (row_tile_id_start + row_tile_id) * row_tile_size + tile_index.p
-            col_indices = (column_tile_id_start + column_tile_id) * column_tile_size + tile_index.x
-            row_mask = row_indices < max_rows
-            col_mask = col_indices < max_cols
-            mask = (row_indices < max_rows) & (col_indices < max_cols)
+            column_start = (column_tile_id_start + column_tile_id) * column_tile_size
+            column_indices = column_start + tile_index.x
+            column_mask = column_indices < max_cols
             block[tile_index.p, row_tile_id, column_tile_id, tile_index.x] = nl.load(
-                input_tensor[row_indices, col_indices], mask=mask
+                input_tensor[row_indices, column_indices], mask=row_mask & column_mask
             )
+            if transpose:
+                for row_transp_tile_id in nl.affine_range(row_transp_num_tiles):
+                    row_ofs = row_transp_tile_id * pmax
+                    transp_row_indices = row_ofs + transp_index.p
+                    transp_row_mask = row_start + transp_row_indices < max_rows
+                    for column_transp_tile_id in nl.affine_range(column_transp_num_tiles):
+                        column_ofs = column_transp_tile_id * pmax
+                        transp_column_indices = column_ofs + transp_index.x
+                        transp_column_mask = column_start + transp_column_indices < max_cols
+                        transp_mask = transp_row_mask & transp_column_mask
+                        tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=tileT_dtype, buffer=nl.psum)
+                        tileT[transp_index.p, transp_index.x] = nisa.nc_transpose(
+                            block[transp_row_indices, row_tile_id, column_tile_id, transp_column_indices],
+                            mask=transp_mask,
+                        )
+                        block[transp_row_indices, row_tile_id, column_tile_id, transp_column_indices] = nl.copy(
+                            tileT, dtype=block.dtype, mask=transp_mask
+                        )
     return block
 
 
