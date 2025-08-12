@@ -332,16 +332,8 @@ class ProfileResults:
             for result in sorted_results:
                 if "error" in result.attributes:
                     error_count += 1
-
-                    # Try to extract error type from the error message
                     error_msg = result.error
-                    error_type = "Other"
-
-                    # Extract error type from the beginning of the first line
-                    if error_msg:
-                        first_line = error_msg.split("\n")[0]
-                        if ": " in first_line:
-                            error_type = first_line.split(": ")[0].strip()
+                    error_type = error_msg.split("\n")[0]
 
                     # Increment count for this error type
                     if error_type not in error_types:
