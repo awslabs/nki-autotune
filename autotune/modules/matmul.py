@@ -99,6 +99,10 @@ class GEMMCompatibility:
         """
         Calculate derived sizes for each dimension (M, N, K).
 
+        NUM_BLOCK_X * TILES_IN_BLOCK_X * TILE_X = X
+        BLOCK_X = TILES_IN_BLOCK_X * TILE_X
+        TILES_IN_X = NUM_BLOCK_X * TILES_IN_BLOCK_X
+
         For each dimension, calculates:
         - Block size (dimension divided by number of blocks)
         - Number of tiles in each block (block size divided by tile size)
@@ -108,21 +112,21 @@ class GEMMCompatibility:
         """
         # Calculate sizes for M dimension
         num_block_m = 1 if self.NUM_BLOCK_M is None else self.NUM_BLOCK_M
-        self.BLOCK_M: int = math.ceil(self.M / num_block_m)
-        self.TILES_IN_BLOCK_M = math.ceil(self.BLOCK_M / self.TILE_M)
-        self.TILES_IN_M = math.ceil(self.M / self.TILE_M)
+        self.TILES_IN_BLOCK_M = math.ceil(self.M / num_block_m / self.TILE_M)
+        self.BLOCK_M = int(self.TILES_IN_BLOCK_M * self.TILE_M)
+        self.TILES_IN_M = int(num_block_m * self.TILES_IN_BLOCK_M)
 
         # Calculate sizes for N dimension
         num_block_n = 1 if self.NUM_BLOCK_N is None else self.NUM_BLOCK_N
-        self.BLOCK_N: int = math.ceil(self.N / num_block_n)
-        self.TILES_IN_BLOCK_N = math.ceil(self.BLOCK_N / self.TILE_N)
-        self.TILES_IN_N = math.ceil(self.N / self.TILE_N)
+        self.TILES_IN_BLOCK_N = math.ceil(self.N / num_block_n / self.TILE_N)
+        self.BLOCK_N = int(self.TILES_IN_BLOCK_N * self.TILE_N)
+        self.TILES_IN_N = int(num_block_n * self.TILES_IN_BLOCK_N)
 
         # Calculate sizes for K dimension
         num_block_k = 1 if self.NUM_BLOCK_K is None else self.NUM_BLOCK_K
-        self.BLOCK_K: int = math.ceil(self.K / num_block_k)
-        self.TILES_IN_BLOCK_K = math.ceil(self.BLOCK_K / self.TILE_K)
-        self.TILES_IN_K = math.ceil(self.K / self.TILE_K)
+        self.TILES_IN_BLOCK_K = math.ceil(self.K / num_block_k / self.TILE_K)
+        self.BLOCK_K = int(self.TILES_IN_BLOCK_K * self.TILE_K)
+        self.TILES_IN_K = int(num_block_k * self.TILES_IN_BLOCK_K)
 
     def _check(self) -> None:
         """
@@ -262,33 +266,44 @@ def matmul_blocks(
     M, N, K = global_size
 
     for tile_id_M in nl.affine_range(num_M_tiles):
+        lhs_M_tile_index = lhs_M_tile_start + tile_id_M
+        global_lhs_M_start = (global_lhs_M_tile_start + lhs_M_tile_index) * TILE_M
+        if tile_transposed_lhs:
+            lhs_M_mask = global_lhs_M_start + idx_lhs.p < M
+        else:
+            lhs_M_mask = global_lhs_M_start + idx_lhs.x < M
+        result_M_mask = global_lhs_M_start + idx_res.p < M
         for tile_id_N in nl.affine_range(num_N_tiles):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            rhs_N_tile_index = rhs_N_tile_start + tile_id_N
+            global_rhs_N_start = (global_rhs_N_tile_start + rhs_N_tile_index) * TILE_N
+            rhs_N_mask = global_rhs_N_start + idx_rhs.x < N
+            result_N_mask = global_rhs_N_start + idx_res.x < N
             """
             Use PSUM buffer to accumulate into a single hardware tile
             """
             for tile_id_K in nl.affine_range(num_K_tiles):
-                lhs_M_tile_index = lhs_M_tile_start + tile_id_M
                 lhs_K_tile_index = lhs_K_tile_start + tile_id_K
-                global_lhs_M_start = (global_lhs_M_tile_start + lhs_M_tile_index) * TILE_M
                 global_lhs_K_start = (global_lhs_K_tile_start + lhs_K_tile_index) * TILE_K
                 if tile_transposed_lhs:
                     lhs_row_tile_index = lhs_M_tile_index
                     lhs_col_tile_index = lhs_K_tile_index
-                    lhs_mask = global_lhs_M_start + idx_lhs.p < M & global_lhs_K_start + idx_lhs.x < K
+                    lhs_K_mask = global_lhs_K_start + idx_lhs.x < K
                 else:
                     lhs_row_tile_index = lhs_K_tile_index
                     lhs_col_tile_index = lhs_M_tile_index
-                    lhs_mask = (global_lhs_K_start + idx_lhs.p < K) & (global_lhs_M_start + idx_lhs.x < M)
+                    lhs_K_mask = global_lhs_K_start + idx_lhs.p < K
                 rhs_K_tile_index = rhs_K_tile_start + tile_id_K
-                rhs_N_tile_index = rhs_N_tile_start + tile_id_N
                 global_rhs_K_start = (global_rhs_K_tile_start + rhs_K_tile_index) * TILE_K
-                global_rhs_N_start = (global_rhs_N_tile_start + rhs_N_tile_index) * TILE_N
-                rhs_mask = (global_rhs_K_start + idx_rhs.p < K) & (global_rhs_N_start + idx_rhs.x < N)
+                rhs_K_mask = global_rhs_K_start + idx_rhs.p < K
                 result_tile += nisa.nc_matmul(
-                    lhs_block[idx_lhs.p, lhs_row_tile_index, lhs_col_tile_index, idx_lhs.x][lhs_mask],
-                    rhs_block[idx_rhs.p, rhs_K_tile_index, rhs_N_tile_index, idx_rhs.x][rhs_mask],
+                    lhs_block[idx_lhs.p, lhs_row_tile_index, lhs_col_tile_index, idx_lhs.x][lhs_K_mask & lhs_M_mask],
+                    rhs_block[idx_rhs.p, rhs_K_tile_index, rhs_N_tile_index, idx_rhs.x][rhs_K_mask & rhs_N_mask],
                 )
+            """
+            FIXME: need truncation.
+            Only accumulate the region of result_M_mask & result_N_mask.
+            """
             result_block[
                 idx_res.p, result_M_tile_start + tile_id_M, result_N_tile_start + tile_id_N, idx_res.x
             ] += result_tile[idx_res.p, idx_res.x]

@@ -16,19 +16,23 @@ from autotune.modules.matmul import GEMMCompatibility, GEMMCorrectness
 
 
 def get_template_configs():
-    loop_orders = list(permutations("MNK"))
-    loop_orders = ["".join(loop_order) for loop_order in loop_orders]
-    loop_orders = ["MKN"]
-    lhs_positions = [1]
-    rhs_positions = [1]
+    loop_orders = ["".join(loop_order) for loop_order in permutations("MNK")]
+    lhs_positions = [0, 1, 2]
+    rhs_positions = [0, 1, 2]
+
+    # loop_orders = ["NKM"]
+    # lhs_positions = [2]
+    # rhs_positions = [0]
+
     template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
     template_configs = generate_configs(**template_params)
     return template_configs
 
 
 def get_configs():
-    num_blocks = [1, 2, 4]
+    num_blocks = [1, 2, 4, 8]
     kernel_params = {"NUM_BLOCK_M": num_blocks, "NUM_BLOCK_N": num_blocks, "NUM_BLOCK_K": num_blocks}
+    # kernel_params = {"NUM_BLOCK_M": [4], "NUM_BLOCK_N": [2], "NUM_BLOCK_K": [8]}
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
 
