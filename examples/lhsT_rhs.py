@@ -19,7 +19,6 @@ def get_template_configs():
     loop_orders = ["".join(loop_order) for loop_order in permutations("MNK")]
     lhs_positions = [0, 1, 2]
     rhs_positions = [0, 1, 2]
-
     template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
     template_configs = generate_configs(**template_params)
     return template_configs
@@ -80,7 +79,6 @@ if __name__ == "__main__":
             **template_config,
         )
         kernels.append(kernel)
-    MNK = list(product([4096], [4096], [4096]))
     MNK = list(product([1025], [2014], [1111]))
     all_jobs = ProfileJobs()
     for M, N, K in MNK:

@@ -16,8 +16,7 @@ from autotune.modules.matmul import GEMMCompatibility, GEMMCorrectness
 
 
 def get_template_configs():
-    loop_orders = list(permutations("MNK"))
-    loop_orders = ["".join(loop_order) for loop_order in loop_orders]
+    loop_orders = ["".join(loop_order) for loop_order in permutations("MNK")]
     lhs_positions = [0, 1, 2]
     rhs_positions = [0, 1, 2]
     template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
@@ -26,7 +25,8 @@ def get_template_configs():
 
 
 def get_configs():
-    kernel_params = {"NUM_BLOCK_M": [1, 2, 4, 8, 16], "NUM_BLOCK_N": [1, 2, 4, 8, 16], "NUM_BLOCK_K": [1, 2, 4, 8, 16]}
+    num_blocks = [1, 2, 4, 8]
+    kernel_params = {"NUM_BLOCK_M": num_blocks, "NUM_BLOCK_N": num_blocks, "NUM_BLOCK_K": num_blocks}
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
 
@@ -61,7 +61,7 @@ def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: 
         kernel=("autotune/modules/matmul.py", "lhs_rhs_gemm_np"),
         input_tensors=(lhs, rhs),
         kernel_kwargs={},
-        compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
+        compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
         preprocessing=None,
         postprocessing=postprocessing,
     )
@@ -79,9 +79,9 @@ if __name__ == "__main__":
             **template_config,
         )
         kernels.append(kernel)
-    MNK = list(product([1024], [2048], [3957]))
+    MNK = list(product([1025], [2014], [1111]))
     all_jobs = ProfileJobs()
-    for M, N, K in MNK:
+    for M, N, K in [(1024, 1024, 2049)]:
         add_jobs(all_jobs, kernels, M, N, K)
     tuner = Benchmark(jobs=all_jobs, cache_root_dir=cache_root_dir)
     tuner()

@@ -298,16 +298,18 @@ def {lhs_name}_rhs_gemm(
             code += f"""
     lhs_block = load_tensor_block(input_tensor=lhs,
                                 dim_0=(mm.TILE_{lhs_dims[0]}, {self.global_start_tiles["lhs"][lhs_dims[0]]}, {self.global_num_tiles["lhs"][lhs_dims[0]]}),
-                                dim_1=(mm.TILE_{lhs_dims[1]}, {self.global_start_tiles["lhs"][lhs_dims[1]]}, {self.global_num_tiles["lhs"][lhs_dims[1]]}))"""
-            if not self.transposed_lhs:
-                code += """
-    transpose_tiles_in_block(lhs_block)"""
+                                dim_1=(mm.TILE_{lhs_dims[1]}, {self.global_start_tiles["lhs"][lhs_dims[1]]}, {self.global_num_tiles["lhs"][lhs_dims[1]]}),
+                                transpose={not self.transposed_lhs})"""
+        #         if not self.transposed_lhs:
+        #             code += """
+        # transpose_tiles_in_block(lhs_block)"""
         if self.op_positions["rhs"] == loop_position:
             rhs_dims = self.dependent_dims["rhs"]
             code += f"""
     rhs_block = load_tensor_block(input_tensor=rhs,
                                 dim_0=(mm.TILE_{rhs_dims[0]}, {self.global_start_tiles["rhs"][rhs_dims[0]]}, {self.global_num_tiles["rhs"][rhs_dims[0]]}),
-                                dim_1=(mm.TILE_{rhs_dims[1]}, {self.global_start_tiles["rhs"][rhs_dims[1]]}, {self.global_num_tiles["rhs"][rhs_dims[1]]}))"""
+                                dim_1=(mm.TILE_{rhs_dims[1]}, {self.global_start_tiles["rhs"][rhs_dims[1]]}, {self.global_num_tiles["rhs"][rhs_dims[1]]}),
+                                transpose=False)"""
         if self.op_positions["result"] == loop_position:
             result_dims = self.dependent_dims["result"]
             code += f"""
