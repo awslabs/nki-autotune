@@ -37,7 +37,9 @@ def get_configs():
     return kernel_configs
 
 
-def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: int, transposed_lhs: bool = False):
+def make_gemm_jobs(
+    all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: int, transposed_lhs: bool = False
+):
     data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
@@ -97,10 +99,9 @@ def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: 
         preprocessing=None,
         postprocessing=postprocessing,
     )
-    return all_jobs
 
 
-def run_benchmark(transposed_lhs: bool = False, cache_root_dir: str = "/mnt/efs/autotune-dev-cache"):
+def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
     # Determine folder and function names based on transposition mode
     folder_name = "lhsT_rhs_gemm" if transposed_lhs else "lhs_rhs_gemm"
     kernel_names = [f"{folder_name}", f"{folder_name}_np"]
@@ -117,16 +118,8 @@ def run_benchmark(transposed_lhs: bool = False, cache_root_dir: str = "/mnt/efs/
         kernels.append(kernel)
 
     MNK = list(product([1025], [2014], [1111]))
-    all_jobs = ProfileJobs()
-
-    for M, N, K in MNK:
-        add_jobs(all_jobs, kernels, M, N, K, transposed_lhs=transposed_lhs)
-
-    tuner = Benchmark(jobs=all_jobs, cache_root_dir=cache_root_dir)
-    tuner()
-
-    plot_metric(cache_root_dir, "min_ms", kernel_names)
-    plot_metric(cache_root_dir, "mfu_estimated_percent", kernel_names)
+    for M, N, K in [(1025, 2014, 1111), (1024, 2048, 1024)]:
+        make_gemm_jobs(all_jobs, kernels, M, N, K, transposed_lhs=transposed_lhs)
 
 
 if __name__ == "__main__":
@@ -141,13 +134,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cache-dir", type=str, default="/mnt/efs/autotune-dev-cache", help="Root directory for the benchmark cache"
     )
-
     args = parser.parse_args()
-
+    all_jobs = ProfileJobs()
     if args.mode == "lhsT_rhs" or args.mode == "both":
         print("Running benchmark with transposed LHS matrix...")
-        run_benchmark(transposed_lhs=True, cache_root_dir=args.cache_dir)
-
+        add_jobs(all_jobs, transposed_lhs=True)
     if args.mode == "lhs_rhs" or args.mode == "both":
         print("Running benchmark with standard (non-transposed) LHS matrix...")
-        run_benchmark(transposed_lhs=False, cache_root_dir=args.cache_dir)
+        add_jobs(all_jobs, transposed_lhs=False)
+    tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
+    tuner()
+    kernel_names = ["lhs_rhs_gemm", "lhs_rhs_gemm_np", "lhsT_rhs_gemm", "lhsT_rhs_gemm_np"]
+    plot_metric(args.cache_dir, "min_ms", kernel_names)
+    plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
