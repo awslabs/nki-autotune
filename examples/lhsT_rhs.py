@@ -19,6 +19,10 @@ def get_template_configs():
     loop_orders = ["".join(loop_order) for loop_order in permutations("MNK")]
     lhs_positions = [0, 1, 2]
     rhs_positions = [0, 1, 2]
+
+    loop_orders = ["NKM"]
+    lhs_positions = [1]
+    rhs_positions = [2]
     template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
     template_configs = generate_configs(**template_params)
     return template_configs
@@ -27,6 +31,7 @@ def get_template_configs():
 def get_configs():
     num_blocks = [1, 2, 4, 8]
     kernel_params = {"NUM_BLOCK_M": num_blocks, "NUM_BLOCK_N": num_blocks, "NUM_BLOCK_K": num_blocks}
+    kernel_params = {"NUM_BLOCK_M": [4], "NUM_BLOCK_N": [1], "NUM_BLOCK_K": [2]}
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
 
@@ -41,22 +46,25 @@ def add_jobs(all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: 
         postprocessing = None
     else:
         raise NotImplementedError(f"{data_type} is not implemented.")
-    lhsT = np.random.normal(0, 0.001, size=(K, M)).astype(data_type)
-    rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
     kernel_configs = get_configs()
     jobs = ProfileJobs()
     for kernel in kernels:
         for kernel_config in kernel_configs:
-            jobs.add_job(
-                kernel=(kernel.code_file_path, "lhsT_rhs_gemm"),
-                input_tensors=(lhsT, rhs),
-                kernel_kwargs=kernel_config,
-                compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-                preprocessing=GEMMCompatibility(transposed_lhs=True),
-                postprocessing=postprocessing,
-            )
-    jobs.sample(100)
+            for _ in range(100):
+                lhsT = np.random.normal(0, 0.001, size=(K, M)).astype(data_type)
+                rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
+                jobs.add_job(
+                    kernel=(kernel.code_file_path, "lhsT_rhs_gemm"),
+                    input_tensors=(lhsT, rhs),
+                    kernel_kwargs=kernel_config,
+                    compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+                    preprocessing=GEMMCompatibility(transposed_lhs=True),
+                    postprocessing=postprocessing,
+                )
+    # jobs.sample(100)
     all_jobs.extend(jobs)
+    lhsT = np.random.normal(0, 0.001, size=(K, M)).astype(data_type)
+    rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
     all_jobs.add_job(
         kernel=("autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
         input_tensors=(lhsT, rhs),
@@ -85,6 +93,6 @@ if __name__ == "__main__":
         add_jobs(all_jobs, kernels, M, N, K)
     tuner = Benchmark(jobs=all_jobs, cache_root_dir=cache_root_dir)
     tuner()
-    kernel_names = ["lhsT_rhs_gemm"]
+    kernel_names = ["lhsT_rhs_gemm", "lhsT_rhs_gemm_np"]
     plot_metric(cache_root_dir, "min_ms", kernel_names)
     plot_metric(cache_root_dir, "mfu_estimated_percent", kernel_names)
