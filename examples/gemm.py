@@ -30,9 +30,9 @@ def get_template_configs():
 
 
 def get_configs():
-    num_blocks = [1, 2, 4, 8]
+    num_blocks = [1]
     kernel_params = {"NUM_BLOCK_M": num_blocks, "NUM_BLOCK_N": num_blocks, "NUM_BLOCK_K": num_blocks}
-    kernel_params = {"NUM_BLOCK_M": [4], "NUM_BLOCK_N": [1], "NUM_BLOCK_K": [2]}
+    kernel_params = {"NUM_BLOCK_M": [1], "NUM_BLOCK_N": [1], "NUM_BLOCK_K": [1]}
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
 
@@ -56,7 +56,7 @@ def make_gemm_jobs(
     # Choose function names based on transposed_lhs
     kernel_func = "lhsT_rhs_gemm" if transposed_lhs else "lhs_rhs_gemm"
     kernel_func_np = "lhsT_rhs_gemm_np" if transposed_lhs else "lhs_rhs_gemm_np"
-    num_repeats = 100
+    num_repeats = 1
 
     for kernel in kernels:
         for kernel_config in kernel_configs:
@@ -118,7 +118,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         kernels.append(kernel)
 
     MNK = list(product([1025], [2014], [1111]))
-    for M, N, K in [(1025, 2014, 1111), (1024, 2048, 1024)]:
+    for M, N, K in [(128, 512, 128), (129, 512, 128)]:
         make_gemm_jobs(all_jobs, kernels, M, N, K, transposed_lhs=transposed_lhs)
 
 
@@ -137,13 +137,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     all_jobs = ProfileJobs()
     if args.mode == "lhsT_rhs" or args.mode == "both":
-        print("Running benchmark with transposed LHS matrix...")
+        print("Adding jobs with transposed LHS matrix...")
         add_jobs(all_jobs, transposed_lhs=True)
     if args.mode == "lhs_rhs" or args.mode == "both":
-        print("Running benchmark with standard (non-transposed) LHS matrix...")
+        print("Adding jobs with standard (non-transposed) LHS matrix...")
         add_jobs(all_jobs, transposed_lhs=False)
     tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
     tuner()
-    kernel_names = ["lhs_rhs_gemm", "lhs_rhs_gemm_np", "lhsT_rhs_gemm", "lhsT_rhs_gemm_np"]
+    kernel_names = ["lhs_rhs_gemm", "lhsT_rhs_gemm"]
     plot_metric(args.cache_dir, "min_ms", kernel_names)
     plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
