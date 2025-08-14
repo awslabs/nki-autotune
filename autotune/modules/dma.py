@@ -51,11 +51,11 @@ def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[in
                 for row_transp_tile_id in nl.affine_range(row_transp_num_tiles):
                     row_ofs = row_transp_tile_id * pmax
                     transp_row_indices = row_ofs + transp_index.p
-                    transp_row_mask = row_start + transp_row_indices < max_rows
+                    transp_row_mask = (row_start + transp_row_indices) < max_rows
                     for column_transp_tile_id in nl.affine_range(column_transp_num_tiles):
                         column_ofs = column_transp_tile_id * pmax
                         transp_column_indices = column_ofs + transp_index.x
-                        transp_column_mask = column_start + transp_column_indices < max_cols
+                        transp_column_mask = (column_start + transp_column_indices) < max_cols
                         transp_mask = transp_row_mask & transp_column_mask
                         tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=tileT_dtype, buffer=nl.psum)
                         tileT[transp_index.p, transp_index.x] = nisa.nc_transpose(
@@ -85,7 +85,7 @@ def save_result_dma(result, result_blocks, block_id_M: int):
         nl.store(result[m_ofs + idx_res_packed.p, idx_res_packed.x], value=result_blocks_packed)
 
 
-def save_result_block(result, result_block, result_block_dim_0: Tuple[int, int], result_block_dim_1: Tuple[int, int]):
+def save_result_block(result, result_block, dst_ofs: Tuple[int, int]):
     """
     Store a 4D SBUF block of tiled results back into a 2D HBM tensor.
     The result_block tensor contains data organized in tiles that need to be stored in the
@@ -114,28 +114,25 @@ def save_result_block(result, result_block, result_block_dim_0: Tuple[int, int],
                      - TILES_IN_M: Number of tiles in the M dimension (rows)
                      - TILES_IN_N: Number of tiles in the N dimension (columns)
                      - TILE_N: Width of each tile
-        result_block_dim_0|1: A tuple of (start tile, number of tiles) specifying the target location in the result tensor where tiles should be stored
+        dst_ofs: A tuple of (start row tile, start column tile) specifying the target location in the result tensor where tiles should be stored
 
     Returns:
         None. The result tensor is modified in-place.
     """
-    start_M_tile, num_M_tiles = result_block_dim_0
-    start_N_tile, num_N_tiles = result_block_dim_1
-    TILE_M, _, _, TILE_N = result_block.shape
-    M, N = result.shape
-    # FIXME: num_M_tiles, num_N_tiles are not necessary in result_block_dim_0|1
-    assert result_block.shape == (TILE_M, num_M_tiles, num_N_tiles, TILE_N)
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_id_M in nl.affine_range(num_M_tiles):
-        m_start = (start_M_tile + tile_id_M) * TILE_M
-        m_indices = m_start + idx_res.p
-        for tile_id_N in nl.affine_range(num_N_tiles):
-            n_start = (start_N_tile + tile_id_N) * TILE_N
-            n_indices = n_start + idx_res.x
+    start_row_tile, start_column_tile = dst_ofs
+    row_tile_size, num_row_tiles, num_column_tiles, column_tile_size = result_block.shape
+    max_rows, max_cols = result.shape
+    idx_res = nl.mgrid[0:row_tile_size, 0:column_tile_size]
+    for row_tile_id in nl.affine_range(num_row_tiles):
+        row_start = (start_row_tile + row_tile_id) * row_tile_size
+        row_indices = row_start + idx_res.p
+        for column_tile_id in nl.affine_range(num_column_tiles):
+            column_start = (start_column_tile + column_tile_id) * column_tile_size
+            column_indices = column_start + idx_res.x
             nl.store(
-                result[m_indices, n_indices],
-                value=result_block[idx_res.p, tile_id_M, tile_id_N, idx_res.x],
-                mask=(m_indices < M) & (n_indices < N),
+                result[row_indices, column_indices],
+                value=result_block[idx_res.p, row_tile_id, column_tile_id, idx_res.x],
+                mask=(row_indices < max_rows) & (column_indices < max_cols),
             )
 
 

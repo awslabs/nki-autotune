@@ -1,0 +1,96 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import argparse
+
+import neuronxcc.nki as nki
+import neuronxcc.nki.language as nl
+import numpy as np
+from neuronpy.core.language import bfloat16
+
+from autotune.core.benchmark import Benchmark
+from autotune.core.job import ProfileJobs
+from autotune.core.metrics import check_correctness
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE, HBMTensor, SBUFTensor
+
+
+@nki.jit
+def nki_tile_transpose(input_tensor):
+    hbm_input_tensor = HBMTensor(input_tensor, axes=("M", "N"))
+    loaded_tensor = SBUFTensor(tile_sizes={"M": nl.tile_size.gemm_stationary_fmax, "N": nl.tile_size.pmax})
+    loaded_tensor.load(hbm_input_tensor, tile_offsets={"M": 0, "N": 0}, num_tiles={"M": 0, "N": 0})
+    result = loaded_tensor.dump()
+    return result
+
+
+def pad_to_128_aligned(matrix):
+    # Get current dimensions
+    rows, cols = matrix.shape
+
+    # Calculate target dimensions (next multiples of 128)
+    target_rows = ((rows + 127) // 128) * 128
+    target_cols = ((cols + 127) // 128) * 128
+
+    # Calculate padding needed
+    pad_rows = target_rows - rows
+    pad_cols = target_cols - cols
+
+    # Pad the matrix with zeros
+    padded_matrix = np.pad(matrix, ((0, pad_rows), (0, pad_cols)), mode="constant", constant_values=0)
+
+    return padded_matrix
+
+
+def transpose_correctness(
+    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, nki_out_tensors: OUTPUT_TENSORS_DTYPE
+):
+    input_tensor = input_tensors[0]
+    nki_out_tensor = nl.static_cast(nki_out_tensors[0], np.float32)
+
+    golden = pad_to_128_aligned(input_tensor)
+
+    # Input validation
+    # tile_size = 128
+    # rows, cols = input_tensor.shape
+    # golden = np.empty((cols, rows), dtype=input_tensor.dtype)
+    # for row_start in range(0, rows, tile_size):
+    #     row_end = min(row_start + tile_size, rows)
+    #     for col_start in range(0, cols, tile_size):
+    #         col_end = min(col_start + tile_size, cols)
+    #         tile = input_tensor[row_start:row_end, col_start:col_end]
+    #         transposed_tile = tile.transpose()
+    #         golden[col_start:col_end, row_start:row_end] = transposed_tile
+
+    print(input_tensor.astype(int), input_tensor.shape)
+    print(golden.astype(int), golden.shape)
+    print(nki_out_tensor.astype(int), nki_out_tensor.shape)
+    check_correctness(desired=golden, actual=nki_out_tensor, atol=1e-5, rtol=1e-2)
+
+
+def add_jobs(jobs, M, K):
+    data_type = "float32"
+    if data_type == "float32":
+        data_type = np.float32
+    elif data_type == "bf16":
+        data_type = bfloat16
+    input_tensor = np.arange(1, M * K + 1).reshape(M, K).astype(data_type)
+    jobs.add_job(
+        kernel=("/home/ec2-user/workplace/nki-autotune/examples/transpose.py", "nki_tile_transpose"),
+        input_tensors=(input_tensor,),
+        kernel_kwargs={},
+        compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+        preprocessing=None,
+        postprocessing=transpose_correctness,
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run GEMM benchmarks with different matrix configurations")
+    parser.add_argument(
+        "--cache-dir", type=str, default="/mnt/efs/autotune-dev-cache", help="Root directory for the benchmark cache"
+    )
+    args = parser.parse_args()
+    jobs = ProfileJobs()
+    add_jobs(jobs, 129, 128)
+    tuner = Benchmark(jobs=jobs, cache_root_dir=args.cache_dir)
+    tuner()
