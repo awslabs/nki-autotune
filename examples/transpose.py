@@ -16,9 +16,9 @@ from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TEN
 
 @nki.jit
 def nki_tile_transpose(input_tensor):
-    hbm_input_tensor = HBMTensor(input_tensor, axes=("M", "N"))
-    loaded_tensor = SBUFTensor(tile_sizes={"M": nl.tile_size.gemm_stationary_fmax, "N": nl.tile_size.pmax})
-    loaded_tensor.load(hbm_input_tensor, tile_offsets={"M": 0, "N": 0}, num_tiles={"M": 0, "N": 0})
+    hbm_input_tensor = HBMTensor(input_tensor, axes=("M", "K"))
+    loaded_tensor = SBUFTensor(tile_sizes={"M": nl.tile_size.gemm_stationary_fmax, "K": nl.tile_size.pmax})
+    loaded_tensor.load(hbm_input_tensor, tile_offsets={"M": 0, "K": 0}, num_tiles={"M": 0, "K": 0})
     padded = loaded_tensor.dump()
     loaded_tensor.tile_transpose()
     padded_tileT = loaded_tensor.dump()
@@ -100,6 +100,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     jobs = ProfileJobs()
     add_jobs(jobs, 129, 128)
-    # add_jobs(jobs, 128, 128)
     tuner = Benchmark(jobs=jobs, cache_root_dir=args.cache_dir)
     tuner()
