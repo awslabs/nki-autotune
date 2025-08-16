@@ -8,6 +8,12 @@ import numpy as np
 
 class HBMTensor:
     def __init__(self, tensor, axes: Tuple[str, str]) -> None:
+        """Initialize HBM tensor wrapper with axis names.
+
+        Args:
+            tensor: Input tensor data
+            axes: Tuple of axis names (e.g., ("M", "N"))
+        """
         self.tensor = tensor
         self.axes = axes
         self.sizes: Dict[str, int] = {}
@@ -20,17 +26,21 @@ class HBMTensor:
 
 class SBUFTensor:
     def __init__(self, tile_sizes: Dict[str, int]) -> None:
-        """
-        tile_sizes[axis] = tile size along axis
+        """Initialize SBUF tensor with specified tile sizes.
+
+        Args:
+            tile_sizes: Dictionary mapping axis names to tile sizes
         """
         self.tile_sizes = tile_sizes
         print(f"SBUFTensor.tile_sizes = {self.tile_sizes}")
 
     def load(self, hbm_tensor: HBMTensor, tile_offsets: Dict[str, int], num_tiles: Dict[str, int]) -> None:
-        """
-        tile_offsets[axis] = offsets in #tiles along axis wrt hbm_tensor
-        num_tiles[axis] = number of tiles to load along axis from hbm_tensor
-        0: load all the tiles along axis
+        """Load data from HBM tensor into SBUF with tiling.
+
+        Args:
+            hbm_tensor: Source HBM tensor to load from
+            tile_offsets: Starting tile offsets for each axis
+            num_tiles: Number of tiles to load per axis (0 = load all)
         """
         self.tile_offsets = tile_offsets
         self.axes = hbm_tensor.axes
@@ -63,8 +73,10 @@ class SBUFTensor:
         pass
 
     def dump(self):
-        """
-        Dump the entire self.tensor to HBM
+        """Dump SBUF tensor data back to HBM.
+
+        Returns:
+            HBM tensor containing the dumped data
         """
         row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = self.tensor.shape
         row_size = int(row_num_tiles * row_tile_size)
@@ -82,8 +94,10 @@ class SBUFTensor:
         return result
 
     def tile_transpose(self):
-        """
-        Tranpose self.tensor tile by tile in place
+        """Transpose tensor tile-by-tile in place.
+
+        Performs transpose operation on each tile,
+        handling boundary conditions for padded regions.
         """
         pmax = nl.tile_size.pmax
         if nisa.get_nc_version() == nisa.nc_version.gen3:
@@ -117,10 +131,34 @@ class SBUFTensor:
                             tileT, dtype=self.tensor.dtype
                         )
 
-    def read(self, tile_indices: Dict[str, int]):
-        pass
+    def read_tile(self, tile_indices: Dict[str, int]):
+        """Extract a specific tile from the tensor.
+
+        Args:
+            tile_indices: Dictionary mapping axis names to tile indices
+
+        Returns:
+            The requested tile as a tensor
+        """
+        row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = self.tensor.shape
+        row_tile_index, column_tile_index = tile_indices[self.axes[0]], tile_indices[self.axes[1]]
+        assert (
+            row_tile_index < row_num_tiles and column_tile_index < column_num_tiles
+        ), f"Out of bound access of tile {tile_indices} in a {self.tensor.shape} tensor."
+        idx_tile = nl.mgrid[0:row_tile_size, 0:column_tile_size]
+        tile = self.tensor[idx_tile.p, row_tile_index, column_tile_index, idx_tile.x]
+        return tile
 
     def _process_num_tiles(self, hbm_tensor: HBMTensor, num_tiles: Dict[str, int]) -> Dict[str, int]:
+        """Process and validate num_tiles parameter.
+
+        Args:
+            hbm_tensor: HBM tensor to calculate max tiles from
+            num_tiles: Dictionary of number of tiles per axis (0 = all tiles)
+
+        Returns:
+            Processed num_tiles with 0 values replaced by maximum possible tiles
+        """
         for axis in num_tiles:
             axis_num_tiles = num_tiles[axis]
             axis_size = hbm_tensor.sizes[axis]
