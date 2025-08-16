@@ -1,7 +1,9 @@
 import math
 from typing import Dict, Tuple
 
+import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
+import numpy as np
 
 
 class HBMTensor:
@@ -22,12 +24,13 @@ class SBUFTensor:
         tile_sizes[axis] = tile size along axis
         """
         self.tile_sizes = tile_sizes
+        print(f"SBUFTensor.tile_sizes = {self.tile_sizes}")
 
     def load(self, hbm_tensor: HBMTensor, tile_offsets: Dict[str, int], num_tiles: Dict[str, int]) -> None:
         """
-        tile_offsets[axis] = offsets in #tiles along axis
-        num_tiles[axis] = number of tiles to load along axis
-        0: load the entire input tensor
+        tile_offsets[axis] = offsets in #tiles along axis wrt hbm_tensor
+        num_tiles[axis] = number of tiles to load along axis from hbm_tensor
+        0: load all the tiles along axis
         """
         self.tile_offsets = tile_offsets
         self.axes = hbm_tensor.axes
@@ -39,7 +42,7 @@ class SBUFTensor:
         self.max_rows, self.max_columns = hbm_tensor.sizes[self.axes[0]], hbm_tensor.sizes[self.axes[1]]
 
         tile_index = nl.mgrid[0:row_tile_size, 0:column_tile_size]
-        self.tensor = nl.ndarray(
+        self.tensor = nl.zeros(
             (nl.par_dim(row_tile_size), row_num_tiles, column_num_tiles, column_tile_size),
             dtype=hbm_tensor.tensor.dtype,
             buffer=nl.sbuf,
@@ -60,6 +63,9 @@ class SBUFTensor:
         pass
 
     def dump(self):
+        """
+        Dump the entire self.tensor to HBM
+        """
         row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = self.tensor.shape
         row_size = int(row_num_tiles * row_tile_size)
         column_size = int(column_num_tiles * column_tile_size)
@@ -72,9 +78,47 @@ class SBUFTensor:
                 nl.store(
                     result[row_indices, column_indices],
                     value=self.tensor[idx_res.p, row_tile_id, column_tile_id, idx_res.x],
-                    mask=(row_indices < self.max_rows) & (column_indices < self.max_columns),
                 )
         return result
+
+    def tile_transpose(self):
+        """
+        Tranpose self.tensor tile by tile in place
+        """
+        pmax = nl.tile_size.pmax
+        if nisa.get_nc_version() == nisa.nc_version.gen3:
+            tileT_dtype = self.tensor.dtype
+        else:
+            tileT_dtype = np.float32
+
+        idx_transp = nl.mgrid[0:pmax, 0:pmax]
+        row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = self.tensor.shape
+        num_row_transp_tiles = math.ceil(row_tile_size / pmax)
+        num_column_transp_tiles = math.ceil(column_tile_size / pmax)
+        row_tile_offset, column_tile_offset = self.tile_offsets[self.axes[0]], self.tile_offsets[self.axes[1]]
+
+        for row_tile_id in nl.affine_range(row_num_tiles):
+            for column_tile_id in nl.affine_range(column_num_tiles):
+                for row_transp_tile_id in nl.affine_range(num_row_transp_tiles):
+                    row_indices = row_transp_tile_id * pmax + idx_transp.p
+                    row_mask = (row_tile_offset + row_tile_id) * row_tile_size + row_indices < self.max_rows
+                    for column_transp_tile_id in nl.affine_range(num_column_transp_tiles):
+                        column_indices = column_transp_tile_id * pmax + idx_transp.x
+                        column_mask = (
+                            column_tile_offset + column_tile_id
+                        ) * column_tile_size + column_indices < self.max_columns
+                        mask = row_mask & column_mask
+
+                        tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=tileT_dtype, buffer=nl.psum)
+                        tileT[idx_transp.p, idx_transp.x] = nisa.nc_transpose(
+                            self.tensor[row_indices, row_tile_id, column_tile_id, column_indices], mask=mask
+                        )
+                        self.tensor[row_indices, row_tile_id, column_tile_id, column_indices] = nl.copy(
+                            tileT, dtype=self.tensor.dtype
+                        )
+
+    def read(self, tile_indices: Dict[str, int]):
+        pass
 
     def _process_num_tiles(self, hbm_tensor: HBMTensor, num_tiles: Dict[str, int]) -> Dict[str, int]:
         for axis in num_tiles:

@@ -19,8 +19,10 @@ def nki_tile_transpose(input_tensor):
     hbm_input_tensor = HBMTensor(input_tensor, axes=("M", "N"))
     loaded_tensor = SBUFTensor(tile_sizes={"M": nl.tile_size.gemm_stationary_fmax, "N": nl.tile_size.pmax})
     loaded_tensor.load(hbm_input_tensor, tile_offsets={"M": 0, "N": 0}, num_tiles={"M": 0, "N": 0})
-    result = loaded_tensor.dump()
-    return result
+    padded = loaded_tensor.dump()
+    loaded_tensor.tile_transpose()
+    padded_tileT = loaded_tensor.dump()
+    return padded, padded_tileT
 
 
 def pad_to_128_aligned(matrix):
@@ -41,30 +43,36 @@ def pad_to_128_aligned(matrix):
     return padded_matrix
 
 
+def tile_transpose(input_tensor):
+    tile_size = 128
+    rows, cols = input_tensor.shape
+    golden = np.empty((rows, cols), dtype=input_tensor.dtype)
+    for row_start in range(0, rows, tile_size):
+        row_end = min(row_start + tile_size, rows)
+        for col_start in range(0, cols, tile_size):
+            col_end = min(col_start + tile_size, cols)
+            tile = input_tensor[row_start:row_end, col_start:col_end]
+            transposed_tile = tile.transpose()
+            golden[row_start:row_end, col_start:col_end] = transposed_tile
+    return golden
+
+
 def transpose_correctness(
     input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, nki_out_tensors: OUTPUT_TENSORS_DTYPE
 ):
     input_tensor = input_tensors[0]
-    nki_out_tensor = nl.static_cast(nki_out_tensors[0], np.float32)
+    print(f"input_tensor = \n{input_tensor.astype(int)}, {input_tensor.shape}")
+    nki_padded, nki_padded_tileT = nki_out_tensors
+    nki_padded = nl.static_cast(nki_padded, np.float32)
+    nki_padded_tileT = nl.static_cast(nki_padded_tileT, np.float32)
 
-    golden = pad_to_128_aligned(input_tensor)
+    padded = pad_to_128_aligned(input_tensor)
+    padded_tileT = tile_transpose(padded)
 
-    # Input validation
-    # tile_size = 128
-    # rows, cols = input_tensor.shape
-    # golden = np.empty((cols, rows), dtype=input_tensor.dtype)
-    # for row_start in range(0, rows, tile_size):
-    #     row_end = min(row_start + tile_size, rows)
-    #     for col_start in range(0, cols, tile_size):
-    #         col_end = min(col_start + tile_size, cols)
-    #         tile = input_tensor[row_start:row_end, col_start:col_end]
-    #         transposed_tile = tile.transpose()
-    #         golden[col_start:col_end, row_start:row_end] = transposed_tile
-
-    print(input_tensor.astype(int), input_tensor.shape)
-    print(golden.astype(int), golden.shape)
-    print(nki_out_tensor.astype(int), nki_out_tensor.shape)
-    check_correctness(desired=golden, actual=nki_out_tensor, atol=1e-5, rtol=1e-2)
+    for golden, nki_out in zip([padded, padded_tileT], [nki_padded, nki_padded_tileT]):
+        print(f"golden = \n{golden.astype(int)}, {golden.shape}")
+        print(f"nki_out = \n{nki_out.astype(int)}, {nki_out.shape}")
+        check_correctness(desired=golden, actual=nki_out, atol=1e-5, rtol=1e-2)
 
 
 def add_jobs(jobs, M, K):
@@ -92,5 +100,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     jobs = ProfileJobs()
     add_jobs(jobs, 129, 128)
+    # add_jobs(jobs, 128, 128)
     tuner = Benchmark(jobs=jobs, cache_root_dir=args.cache_dir)
     tuner()
