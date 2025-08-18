@@ -86,3 +86,6 @@ artifacts/
 private
 *.neff
 *.ntff
+
+# Remote development configuration (contains sensitive info)
+remote_tools/.remote_config
