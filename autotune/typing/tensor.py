@@ -142,9 +142,6 @@ class SBUFTensor:
         """
         row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = self.tensor.shape
         row_tile_index, column_tile_index = tile_indices[self.axes[0]], tile_indices[self.axes[1]]
-        assert (
-            row_tile_index < row_num_tiles and column_tile_index < column_num_tiles
-        ), f"Out of bound access of tile {tile_indices} in a {self.tensor.shape} tensor."
         idx_tile = nl.mgrid[0:row_tile_size, 0:column_tile_size]
         tile = self.tensor[idx_tile.p, row_tile_index, column_tile_index, idx_tile.x]
         return tile
