@@ -30,7 +30,7 @@ if [[ -z "$REMOTE_HOST" || -z "$REMOTE_CODE_PATH" ]]; then
 fi
 
 # Default rsync options if not specified
-RSYNC_OPTIONS=${RSYNC_OPTIONS:-"-av --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.remote_config'"}
+RSYNC_OPTIONS=${RSYNC_OPTIONS:-"-av --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.remote_config' --exclude='cache'"}
 
 # Construct remote path
 REMOTE_PATH="${REMOTE_HOST}:${REMOTE_CODE_PATH}/"
