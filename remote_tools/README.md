@@ -17,7 +17,7 @@ This directory contains tools for hybrid development with NKI autotune, allowing
 
 3. **Start developing**:
    ```bash
-   python remote_tools/dev_run.py examples/gemm.py --mode both
+   python remote_tools/dev_run.py --auto-fetch -- examples/gemm.py --mode both
    ```
 
 ## Configuration
@@ -56,19 +56,39 @@ SSH_OPTIONS="-o ConnectTimeout=10"
 ### `dev_run.py` - Main Development Tool
 **The tool you'll use most often** - combines sync and execution in one command.
 
+#### Argument Separation with `--`
+The tool uses the standard `--` separator to clearly distinguish between `dev_run.py` arguments and target script arguments:
+
 ```bash
-# Run GEMM benchmarks
-python remote_tools/dev_run.py examples/gemm.py --mode both
+python remote_tools/dev_run.py [DEV_RUN_OPTIONS] -- [TARGET_SCRIPT] [SCRIPT_ARGS...]
+```
+
+**Why `--` separator?**
+- **Unambiguous**: Clear separation prevents argument conflicts
+- **Standard**: Follows common CLI conventions (used by docker, git, etc.)
+- **Flexible**: Supports any target script arguments without interference
+- **Reliable**: No risk of confusion between wrapper and script arguments
+
+#### Usage Examples
+
+```bash
+# Run GEMM benchmarks with script arguments
+python remote_tools/dev_run.py --auto-fetch -- examples/gemm.py --mode both
+
+# Run specific GEMM mode
+python remote_tools/dev_run.py --auto-fetch -- examples/gemm.py --mode lhs_rhs
 
 # Run script with automatic cache fetching (recommended)
-python remote_tools/dev_run.py examples/transpose.py --auto-fetch
+python remote_tools/dev_run.py --auto-fetch -- examples/transpose.py
 
 # Run tests
-python remote_tools/dev_run.py -m pytest autotune/test/test_matmul.py -v
+python remote_tools/dev_run.py -- -m pytest autotune/test/test_matmul.py -v
 
-# Run any Python script
-python remote_tools/dev_run.py examples/softmax.py
+# Run any Python script with arguments
+python remote_tools/dev_run.py -- examples/softmax.py --arg1 value1 --arg2 value2
 
+# Run script without auto-fetch
+python remote_tools/dev_run.py -- examples/gemm.py --mode both
 ```
 
 **Features**:
@@ -123,17 +143,15 @@ The `dev_run.py` tool features intelligent progress bars with professional visua
 
 ### Download Progress  
 ```
-🔍 Scanning files to download...
-📦 Downloading:  85%|█████████████████▎  | 40/47 files [00:03<00:00]
-📦 Downloading: 100%|████████████████████| 47/47 files [00:03<00:00]
+📦 Downloading: 47 files [00:03]
+📦 Downloading: 94 files [00:05]
 ✅ Successfully downloaded 94 files for nki_tile_transpose
 ```
 
 **Key Features:**
-- **Two-phase operation**: First scans to determine actual files to transfer, then shows accurate progress
-- **Dynamic expansion**: Progress bars intelligently adapt if more files are discovered during transfer
-- **Meaningful percentages**: Always shows completion percentage, not confusing file counts
-- **Time estimates**: Displays elapsed time and estimated time remaining
+- **Smart upload scanning**: Two-phase operation for uploads (scan → transfer) with accurate file counting
+- **Dynamic progress**: Upload progress bars adapt when additional files are discovered
+- **Simple download tracking**: Shows file count and elapsed time for downloads
 - **Cache exclusion**: Downloaded cache files are never uploaded back to remote
 
 ## Log Access & Analysis
@@ -160,16 +178,16 @@ The autotune cache follows this directory structure:
 # Make some code changes locally...
 
 # Run benchmarks with automatic cache download
-python remote_tools/dev_run.py examples/gemm.py --mode both --auto-fetch
+python remote_tools/dev_run.py --auto-fetch -- examples/gemm.py --mode both
 
 # Run tests to verify changes
-python remote_tools/dev_run.py -m pytest autotune/test/ -v
+python remote_tools/dev_run.py -- -m pytest autotune/test/ -v
 
 # Try another example with auto-fetch for analysis
-python remote_tools/dev_run.py examples/softmax.py --auto-fetch
+python remote_tools/dev_run.py --auto-fetch -- examples/softmax.py
 
 # Run without cache download
-python remote_tools/dev_run.py examples/transpose.py
+python remote_tools/dev_run.py -- examples/transpose.py
 ```
 
 ### Advanced Usage

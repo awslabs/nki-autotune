@@ -269,34 +269,7 @@ def fetch_logs(remote_path, local_dir, config):
     print(f"📁 Local dir:   {local_dir}")
 
     try:
-        # Phase 1: Dry run to determine actual files to transfer
-        print("🔍 Scanning files to download...")
-        dry_run_cmd = f"rsync -av --dry-run {ssh_options} {remote_host}:{remote_path} {local_dir}/"
-
-        dry_run_result = subprocess.run(dry_run_cmd, shell=True, capture_output=True, text=True)
-
-        if dry_run_result.returncode != 0:
-            print("⚠️  Could not scan files, using basic progress...")
-            total_files = None
-        else:
-            # Parse dry-run output to count actual file transfers
-            total_files = 0
-            for line in dry_run_result.stdout.split("\n"):
-                line = line.strip()
-                # Count lines that represent file transfers (not directories, metadata, or status messages)
-                if (
-                    line
-                    and not line.endswith("/")
-                    and not line.startswith("receiving")
-                    and not line.startswith("sent")
-                    and not line.startswith("total size")
-                    and not line.startswith("building file list")
-                    and not line.startswith("created directory")
-                ):
-                    if "/" in line or ("." in line and not line.startswith(".")):
-                        total_files += 1
-
-        # Phase 2: Actual transfer with accurate progress
+        # Direct transfer with basic progress bar
         rsync_cmd = f"rsync -av --progress {ssh_options} {remote_host}:{remote_path} {local_dir}/"
 
         # Run rsync with real-time progress bar
@@ -310,16 +283,8 @@ def fetch_logs(remote_path, local_dir, config):
             universal_newlines=True,
         )
 
-        # Initialize progress bar with accurate count
-        if total_files and total_files > 0:
-            pbar = tqdm(
-                total=total_files,
-                desc="📦 Downloading",
-                unit="files",
-                bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} files [{elapsed}<{remaining}]",
-            )
-        else:
-            pbar = tqdm(desc="📦 Downloading", unit="files", bar_format="{desc}: {n_fmt} files [{elapsed}]")
+        # Initialize progress bar without predetermined total
+        pbar = tqdm(desc="📦 Downloading", unit="files", bar_format="{desc}: {n_fmt} files [{elapsed}]")
 
         files_processed = 0
 
@@ -342,11 +307,6 @@ def fetch_logs(remote_path, local_dir, config):
                     ):
                         # This looks like a file being transferred
                         files_processed += 1
-
-                        # If we exceed the predicted total, expand the progress bar
-                        if total_files and files_processed > total_files:
-                            pbar.total = files_processed + 10  # Add buffer for more potential files
-
                         pbar.n = files_processed
                         pbar.refresh()
 
@@ -374,15 +334,17 @@ def main():
         description="Sync local changes and run commands on remote Trainium instance",
         epilog="""
 Examples:
-  %(prog)s examples/gemm.py --mode both
-  %(prog)s examples/transpose.py --auto-fetch
-  %(prog)s "python examples/softmax.py"
-  %(prog)s -m pytest autotune/test/test_matmul.py -v
+  %(prog)s --auto-fetch -- examples/gemm.py --mode both
+  %(prog)s --local-dir ./results -- examples/transpose.py --size 1024
+  %(prog)s -- python examples/softmax.py --batch-size 32
+  %(prog)s -- -m pytest autotune/test/test_matmul.py -v
+  %(prog)s -- examples/gemm.py  # No script arguments needed
+
+Note: Use '--' to separate dev_run.py arguments from target script arguments.
+      Everything after '--' is passed directly to the target script.
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-
-    parser.add_argument("command", nargs="*", help="Command to execute on remote instance")
 
     parser.add_argument(
         "--local-dir", metavar="DIR", default="./cache", help="Local directory for downloaded logs (default: ./cache)"
@@ -392,7 +354,20 @@ Examples:
         "--auto-fetch", action="store_true", help="Automatically fetch generated cache after running script"
     )
 
+    parser.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="Command to execute on remote instance (use -- to separate from dev_run.py arguments)",
+    )
+
     args = parser.parse_args()
+
+    # Extract command arguments (everything after --)
+    all_command_args = args.command
+
+    # Handle the case where -- was used explicitly
+    if all_command_args and all_command_args[0] == "--":
+        all_command_args = all_command_args[1:]
 
     # Load and validate configuration
     config = load_config()
@@ -407,18 +382,29 @@ Examples:
     success = True
 
     # Validate command is provided for normal operation
-    if not args.command:
+    if not all_command_args:
         print("❌ Error: No command provided!")
-        print("Use --help for usage information.")
+        print("")
+        print("Usage: python dev_run.py [OPTIONS] -- COMMAND [COMMAND_ARGS...]")
+        print("Use --help for detailed usage information and examples.")
         sys.exit(1)
 
+    # Validate that the target script exists if it's a local Python file
+    target_script = all_command_args[0]
+    if target_script.endswith(".py") and not target_script.startswith("-"):
+        script_path = Path(target_script)
+        if not script_path.exists():
+            print(f"❌ Error: Python script not found: {target_script}")
+            print("Make sure the script path is correct relative to the current directory.")
+            sys.exit(1)
+
     # Join command arguments
-    command = " ".join(args.command)
+    command = " ".join(all_command_args)
 
     # Handle Python module execution (e.g., -m pytest)
-    if args.command[0] == "-m":
+    if all_command_args[0] == "-m":
         command = f"python {command}"
-    elif not command.startswith("python") and args.command[0].endswith(".py"):
+    elif not command.startswith("python") and target_script.endswith(".py"):
         # Auto-prepend python for .py files
         command = f"python {command}"
 

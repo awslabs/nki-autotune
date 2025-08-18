@@ -21,18 +21,18 @@ def get_template_configs():
     lhs_positions = [0, 1, 2]
     rhs_positions = [0, 1, 2]
 
-    loop_orders = ["NKM"]
-    lhs_positions = [1]
-    rhs_positions = [2]
+    # loop_orders = ["NKM"]
+    # lhs_positions = [1]
+    # rhs_positions = [2]
     template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
     template_configs = generate_configs(**template_params)
     return template_configs
 
 
 def get_configs():
-    num_blocks = [1]
+    num_blocks = [1, 2, 4]
     kernel_params = {"NUM_BLOCK_M": num_blocks, "NUM_BLOCK_N": num_blocks, "NUM_BLOCK_K": num_blocks}
-    kernel_params = {"NUM_BLOCK_M": [1], "NUM_BLOCK_N": [1], "NUM_BLOCK_K": [1]}
+    # kernel_params = {"NUM_BLOCK_M": [1], "NUM_BLOCK_N": [1], "NUM_BLOCK_K": [1]}
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
 
@@ -102,9 +102,9 @@ def make_gemm_jobs(
 
 
 def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
+    print(f"Adding jobs with transposed={transposed_lhs} LHS matrix...")
     # Determine folder and function names based on transposition mode
     folder_name = "lhsT_rhs_gemm" if transposed_lhs else "lhs_rhs_gemm"
-    kernel_names = [f"{folder_name}", f"{folder_name}_np"]
 
     template_configs = get_template_configs()
     kernels = []
@@ -128,7 +128,6 @@ if __name__ == "__main__":
         "--mode",
         type=str,
         choices=["lhsT_rhs", "lhs_rhs", "both"],
-        default="both",
         help="Matrix multiplication mode: lhsT_rhs (transposed LHS), lhs_rhs, or both",
     )
     parser.add_argument(
@@ -137,10 +136,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     all_jobs = ProfileJobs()
     if args.mode == "lhsT_rhs" or args.mode == "both":
-        print("Adding jobs with transposed LHS matrix...")
         add_jobs(all_jobs, transposed_lhs=True)
     if args.mode == "lhs_rhs" or args.mode == "both":
-        print("Adding jobs with standard (non-transposed) LHS matrix...")
         add_jobs(all_jobs, transposed_lhs=False)
     tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
     tuner()
