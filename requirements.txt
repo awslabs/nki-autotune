@@ -8,3 +8,4 @@ isort
 black
 astor
 tabulate
+tqdm

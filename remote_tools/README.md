@@ -60,30 +60,27 @@ SSH_OPTIONS="-o ConnectTimeout=10"
 # Run GEMM benchmarks
 python remote_tools/dev_run.py examples/gemm.py --mode both
 
+# Run script with automatic cache fetching (recommended)
+python remote_tools/dev_run.py examples/transpose.py --auto-fetch
+
 # Run tests
 python remote_tools/dev_run.py -m pytest autotune/test/test_matmul.py -v
 
 # Run any Python script
 python remote_tools/dev_run.py examples/softmax.py
 
-# Just sync files without running anything
-python remote_tools/dev_run.py --sync-only "echo done"
-
-# Skip syncing, just run command
-python remote_tools/dev_run.py --no-sync "python --version"
-
-# Access logs from remote cache
-python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/transpose/129x128
-python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/nki_tile_transpose --local-dir ./my_logs
 ```
 
 **Features**:
 - Automatically syncs your local changes first
 - Smart command handling (auto-prepends `python` for .py files)
 - Handles Python module execution (`-m pytest`)
+- **Auto-fetch**: Automatically detects and downloads generated cache after script execution
+- **Professional progress bars**: Shows percentage, transfer rate, and ETA using tqdm
+- **Smart sync**: Two-phase process (scan → transfer) with accurate file counting
+- **Dynamic progress**: Progress bars adapt when additional files are discovered
+- **Cache exclusion**: Prevents uploading downloaded cache back to remote
 - Clear progress display with success/failure status
-- Options for sync-only or execute-only modes
-- Log access functionality to download cache/results from remote
 
 ### `remote_sync.sh` - File Synchronization
 Syncs your local changes to the remote instance using rsync.
@@ -112,21 +109,36 @@ Executes commands on the remote instance with proper environment setup.
 - Streams command output back to you
 - Handles SSH options and provides execution details
 
+## Enhanced Progress Display
+
+The `dev_run.py` tool features intelligent progress bars with professional visual feedback:
+
+### Upload Progress
+```
+🔍 Scanning files to transfer...
+📤 Uploading:  50%|██████████          | 1/2 files [00:02<00:02]
+📤 Uploading: 100%|████████████████████| 2/2 files [00:02<00:00]
+✅ Successfully uploaded 4 files
+```
+
+### Download Progress  
+```
+🔍 Scanning files to download...
+📦 Downloading:  85%|█████████████████▎  | 40/47 files [00:03<00:00]
+📦 Downloading: 100%|████████████████████| 47/47 files [00:03<00:00]
+✅ Successfully downloaded 94 files for nki_tile_transpose
+```
+
+**Key Features:**
+- **Two-phase operation**: First scans to determine actual files to transfer, then shows accurate progress
+- **Dynamic expansion**: Progress bars intelligently adapt if more files are discovered during transfer
+- **Meaningful percentages**: Always shows completion percentage, not confusing file counts
+- **Time estimates**: Displays elapsed time and estimated time remaining
+- **Cache exclusion**: Downloaded cache files are never uploaded back to remote
+
 ## Log Access & Analysis
 
-The autotune framework saves detailed performance metrics, error logs, and cache data on the remote machine. You can access these logs during development:
-
-### Fetching Logs
-```bash
-# Download entire cache directory for a kernel
-python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/nki_tile_transpose
-
-# Download to a specific local directory
-python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/transpose/129x128 --local-dir ./analysis
-
-# Download specific performance results
-python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/gemm/1024x2048x4096/M1024-N2048-K4096
-```
+The autotune framework saves detailed performance metrics, error logs, and cache data on the remote machine. Use the `--auto-fetch` flag to automatically download these after script execution.
 
 ### Understanding Cache Structure
 The autotune cache follows this directory structure:
@@ -147,34 +159,25 @@ The autotune cache follows this directory structure:
 ```bash
 # Make some code changes locally...
 
-# Run benchmarks with real-time feedback
-python remote_tools/dev_run.py examples/gemm.py --mode both --cache-dir /mnt/efs/autotune-dev-cache
+# Run benchmarks with automatic cache download
+python remote_tools/dev_run.py examples/gemm.py --mode both --auto-fetch
 
 # Run tests to verify changes
 python remote_tools/dev_run.py -m pytest autotune/test/ -v
 
-# Download results for analysis
-python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/gemm --local-dir ./gemm_results
+# Try another example with auto-fetch for analysis
+python remote_tools/dev_run.py examples/softmax.py --auto-fetch
 
-# Try another example
-python remote_tools/dev_run.py examples/softmax.py
+# Run without cache download
+python remote_tools/dev_run.py examples/transpose.py
 ```
 
 ### Advanced Usage
 ```bash
-# Sync files only (no execution)
-python remote_tools/dev_run.py --sync-only "echo sync complete"
-
-# Execute without syncing (useful if no local changes)
-python remote_tools/dev_run.py --no-sync "python examples/attention.py"
-
 # Use individual tools for more control
 ./remote_tools/remote_sync.sh
 ./remote_tools/remote_exec.sh 'pip install -e .'
 ./remote_tools/remote_exec.sh 'python examples/gemm.py --mode lhs_rhs'
-
-# Download logs from multiple runs for comparison
-python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/matmul --local-dir ./matmul_analysis
 ```
 
 ## SSH Configuration
@@ -210,6 +213,6 @@ This allows you to use `your-remote-host` as the `REMOTE_HOST` in your config.
 - Ensure your remote instance has Trainium/Inferentia hardware drivers
 
 ### Performance
-- Use `--no-sync` when running multiple commands without local changes
 - Consider adjusting `RSYNC_OPTIONS` for your specific needs
 - Keep the remote instance "warm" to avoid cold start delays
+- Use individual shell scripts for fine-grained control when needed

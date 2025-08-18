@@ -60,16 +60,126 @@ def run_command(cmd, description=None):
 
 def sync_to_remote():
     """Sync local changes to remote instance"""
+    from tqdm import tqdm
+
     print("=" * 60)
     print("STEP 1: Syncing local changes to remote...")
     print("=" * 60)
 
-    sync_script = Path("remote_tools/remote_sync.sh")
-    if not sync_script.exists():
-        print(f"❌ Error: Sync script not found: {sync_script}")
-        return False
+    # Load config
+    config = load_config()
 
-    return run_command(str(sync_script))
+    remote_host = config["REMOTE_HOST"]
+    remote_path = config["REMOTE_CODE_PATH"]
+    ssh_options = config.get("SSH_OPTIONS", "")
+    rsync_options = config.get(
+        "RSYNC_OPTIONS",
+        "-av --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.remote_config' --exclude='cache'",
+    )
+
+    print("🔄 Syncing to remote...")
+    print(f"   Local:  {Path.cwd()}")
+    print(f"   Remote: {remote_host}:{remote_path}/")
+
+    try:
+        # Phase 1: Dry run to determine actual files to transfer
+        print("🔍 Scanning files to transfer...")
+        full_remote_path = f"{remote_host}:{remote_path}/"
+        dry_run_cmd = f"rsync {rsync_options} --dry-run {ssh_options} ./ {full_remote_path}"
+
+        dry_run_result = subprocess.run(dry_run_cmd, shell=True, capture_output=True, text=True)
+
+        if dry_run_result.returncode != 0:
+            print("⚠️  Could not scan files, using basic progress...")
+            total_files = None
+        else:
+            # Parse dry-run output to count actual file transfers
+            total_files = 0
+            for line in dry_run_result.stdout.split("\n"):
+                line = line.strip()
+                # Count lines that represent file transfers (not directories, metadata, or status messages)
+                if (
+                    line
+                    and not line.endswith("/")
+                    and not line.startswith("receiving")
+                    and not line.startswith("sent")
+                    and not line.startswith("total size")
+                    and not line.startswith("building file list")
+                    and not line.startswith("created directory")
+                ):
+                    if "/" in line or ("." in line and not line.startswith(".")):
+                        total_files += 1
+
+        # Phase 2: Actual transfer with accurate progress
+        rsync_cmd = f"rsync {rsync_options} --progress {ssh_options} ./ {full_remote_path}"
+
+        # Run rsync with real-time progress bar
+        process = subprocess.Popen(
+            rsync_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+
+        # Initialize progress bar with accurate count
+        if total_files and total_files > 0:
+            pbar = tqdm(
+                total=total_files,
+                desc="📤 Uploading",
+                unit="files",
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} files [{elapsed}<{remaining}]",
+            )
+        else:
+            pbar = tqdm(desc="📤 Uploading", unit="files", bar_format="{desc}: {n_fmt} files [{elapsed}]")
+
+        files_processed = 0
+
+        # Process rsync output line by line
+        if process.stdout:
+            for line in process.stdout:
+                line = line.strip()
+                # Look for file transfer lines (not directories or metadata)
+                if (
+                    line
+                    and not line.endswith("/")
+                    and not line.startswith("receiving")
+                    and not line.startswith("sent")
+                    and not line.startswith("total size")
+                ):
+                    if (
+                        "/" in line
+                        and not line.startswith("building file list")
+                        and not line.startswith("created directory")
+                    ):
+                        # This looks like a file being transferred
+                        files_processed += 1
+
+                        # If we exceed the predicted total, expand the progress bar
+                        if total_files and files_processed > total_files:
+                            pbar.total = files_processed + 10  # Add buffer for more potential files
+
+                        pbar.n = files_processed
+                        pbar.refresh()
+
+        # Wait for process to complete
+        process.wait()
+
+        # Close progress bar
+        pbar.close()
+
+        if process.returncode == 0:
+            print(f"✅ Successfully uploaded {files_processed} files")
+            return True
+        else:
+            print(f"❌ rsync failed with return code {process.returncode}")
+            return False
+
+    except Exception as e:
+        print(f"❌ Sync failed: {e}")
+        return False
 
 
 def execute_remote(command):
@@ -88,11 +198,65 @@ def execute_remote(command):
     return run_command(f'{exec_script} "{escaped_command}"')
 
 
+def detect_recent_cache_dirs(config, cache_root="/mnt/efs/autotune-dev-cache"):
+    """Detect recently modified cache directories on remote"""
+    remote_host = config["REMOTE_HOST"]
+    ssh_options = config.get("SSH_OPTIONS", "")
+
+    # Find directories modified in the last 5 minutes
+    find_cmd = f'ssh {ssh_options} {remote_host} "find {cache_root} -type d -name "id*" -newermt \\"5 minutes ago\\" | head -10"'
+
+    try:
+        result = subprocess.run(find_cmd, shell=True, capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            recent_dirs = []
+            for line in result.stdout.strip().split("\n"):
+                if line.strip():
+                    # Extract kernel name from path like /mnt/efs/autotune-dev-cache/nki_tile_transpose/129x128/id0
+                    parts = line.strip().split("/")
+                    if len(parts) >= 5:
+                        kernel_name = parts[4]  # Extract kernel name
+                        kernel_path = f"{cache_root}/{kernel_name}"
+                        if kernel_path not in recent_dirs:
+                            recent_dirs.append(kernel_path)
+            return recent_dirs
+        return []
+    except Exception as e:
+        print(f"⚠️  Could not detect recent cache directories: {e}")
+        return []
+
+
+def auto_fetch_recent_logs(config, local_dir):
+    """Automatically fetch recently generated cache directories"""
+    print("=" * 60)
+    print("STEP 3: Auto-fetching recent cache...")
+    print("=" * 60)
+
+    recent_dirs = detect_recent_cache_dirs(config)
+
+    if not recent_dirs:
+        print("⚠️  No recent cache directories detected.")
+        print("💡 Try running the command again or check if the script generated cache files.")
+        return False
+
+    print(f"🔍 Found {len(recent_dirs)} recently generated cache director{'ies' if len(recent_dirs) > 1 else 'y'}:")
+    for dir_path in recent_dirs:
+        print(f"   {dir_path}")
+
+    # Fetch all recent directories
+    success = True
+    for remote_path in recent_dirs:
+        kernel_name = remote_path.split("/")[-1]
+        print(f"\n📦 Fetching cache for: {kernel_name}")
+        if not fetch_logs(remote_path, local_dir, config):
+            success = False
+
+    return success
+
+
 def fetch_logs(remote_path, local_dir, config):
     """Download logs from remote cache to local directory"""
-    print("=" * 60)
-    print("FETCHING LOGS from remote...")
-    print("=" * 60)
+    from tqdm import tqdm
 
     # Create local directory if it doesn't exist
     local_path = Path(local_dir)
@@ -101,31 +265,108 @@ def fetch_logs(remote_path, local_dir, config):
     remote_host = config["REMOTE_HOST"]
     ssh_options = config.get("SSH_OPTIONS", "")
 
-    # Build rsync command to download logs
-    rsync_cmd = f"rsync -av {ssh_options} {remote_host}:{remote_path} {local_dir}/"
-
     print(f"📁 Remote path: {remote_path}")
     print(f"📁 Local dir:   {local_dir}")
-    print(f"🔄 Downloading...")
-    print("")
 
-    success = run_command(rsync_cmd, "Downloading logs from remote...")
+    try:
+        # Phase 1: Dry run to determine actual files to transfer
+        print("🔍 Scanning files to download...")
+        dry_run_cmd = f"rsync -av --dry-run {ssh_options} {remote_host}:{remote_path} {local_dir}/"
 
-    if success:
-        print(f"\n✅ Logs successfully downloaded to: {local_dir}")
-        # List what was downloaded
-        try:
-            downloaded_files = list(local_path.rglob("*"))
-            if downloaded_files:
-                print(f"📋 Downloaded {len(downloaded_files)} items:")
-                for item in sorted(downloaded_files)[:10]:  # Show first 10 items
-                    print(f"   {item.relative_to(local_path)}")
-                if len(downloaded_files) > 10:
-                    print(f"   ... and {len(downloaded_files) - 10} more items")
-        except Exception:
-            pass
+        dry_run_result = subprocess.run(dry_run_cmd, shell=True, capture_output=True, text=True)
 
-    return success
+        if dry_run_result.returncode != 0:
+            print("⚠️  Could not scan files, using basic progress...")
+            total_files = None
+        else:
+            # Parse dry-run output to count actual file transfers
+            total_files = 0
+            for line in dry_run_result.stdout.split("\n"):
+                line = line.strip()
+                # Count lines that represent file transfers (not directories, metadata, or status messages)
+                if (
+                    line
+                    and not line.endswith("/")
+                    and not line.startswith("receiving")
+                    and not line.startswith("sent")
+                    and not line.startswith("total size")
+                    and not line.startswith("building file list")
+                    and not line.startswith("created directory")
+                ):
+                    if "/" in line or ("." in line and not line.startswith(".")):
+                        total_files += 1
+
+        # Phase 2: Actual transfer with accurate progress
+        rsync_cmd = f"rsync -av --progress {ssh_options} {remote_host}:{remote_path} {local_dir}/"
+
+        # Run rsync with real-time progress bar
+        process = subprocess.Popen(
+            rsync_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+
+        # Initialize progress bar with accurate count
+        if total_files and total_files > 0:
+            pbar = tqdm(
+                total=total_files,
+                desc="📦 Downloading",
+                unit="files",
+                bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} files [{elapsed}<{remaining}]",
+            )
+        else:
+            pbar = tqdm(desc="📦 Downloading", unit="files", bar_format="{desc}: {n_fmt} files [{elapsed}]")
+
+        files_processed = 0
+
+        # Process rsync output line by line
+        if process.stdout:
+            for line in process.stdout:
+                line = line.strip()
+                # Look for file transfer lines (not directories or metadata)
+                if (
+                    line
+                    and not line.endswith("/")
+                    and not line.startswith("receiving")
+                    and not line.startswith("sent")
+                    and not line.startswith("total size")
+                ):
+                    if (
+                        "/" in line
+                        and not line.startswith("building file list")
+                        and not line.startswith("created directory")
+                    ):
+                        # This looks like a file being transferred
+                        files_processed += 1
+
+                        # If we exceed the predicted total, expand the progress bar
+                        if total_files and files_processed > total_files:
+                            pbar.total = files_processed + 10  # Add buffer for more potential files
+
+                        pbar.n = files_processed
+                        pbar.refresh()
+
+        # Wait for process to complete
+        process.wait()
+
+        # Close progress bar
+        pbar.close()
+
+        if process.returncode == 0:
+            kernel_name = remote_path.split("/")[-1]
+            print(f"✅ Successfully downloaded {files_processed} files for {kernel_name}")
+            return True
+        else:
+            print(f"❌ rsync failed with return code {process.returncode}")
+            return False
+
+    except Exception as e:
+        print(f"❌ Download failed: {e}")
+        return False
 
 
 def main():
@@ -134,29 +375,21 @@ def main():
         epilog="""
 Examples:
   %(prog)s examples/gemm.py --mode both
+  %(prog)s examples/transpose.py --auto-fetch
   %(prog)s "python examples/softmax.py"
   %(prog)s -m pytest autotune/test/test_matmul.py -v
-  %(prog)s "python -c 'import autotune; print(autotune.__version__)'"
-  
-Log Access:
-  %(prog)s --fetch-logs /mnt/efs/autotune-dev-cache/transpose/129x128
-  %(prog)s --fetch-logs /mnt/efs/autotune-dev-cache/nki_tile_transpose --local-dir ./my_logs
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument("command", nargs="*", help="Command to execute on remote instance")
 
-    parser.add_argument("--sync-only", action="store_true", help="Only sync files, do not execute command")
-
-    parser.add_argument("--no-sync", action="store_true", help="Skip syncing, only execute command")
-
     parser.add_argument(
-        "--fetch-logs", metavar="REMOTE_PATH", help="Download logs from remote cache directory to local machine"
+        "--local-dir", metavar="DIR", default="./cache", help="Local directory for downloaded logs (default: ./cache)"
     )
 
     parser.add_argument(
-        "--local-dir", metavar="DIR", default="./cache", help="Local directory for downloaded logs (default: ./cache)"
+        "--auto-fetch", action="store_true", help="Automatically fetch generated cache after running script"
     )
 
     args = parser.parse_args()
@@ -172,17 +405,6 @@ Log Access:
     print("")
 
     success = True
-
-    # Handle fetch-logs mode
-    if args.fetch_logs:
-        success = fetch_logs(args.fetch_logs, args.local_dir, config)
-        print("\n" + "=" * 60)
-        if success:
-            print("✅ Log fetch completed successfully!")
-        else:
-            print("❌ Log fetch failed!")
-            sys.exit(1)
-        return
 
     # Validate command is provided for normal operation
     if not args.command:
@@ -200,23 +422,31 @@ Log Access:
         # Auto-prepend python for .py files
         command = f"python {command}"
 
-    # Step 1: Sync (unless --no-sync)
-    if not args.no_sync:
-        success = sync_to_remote()
-        if not success:
-            print("\n❌ Sync failed, aborting.")
-            sys.exit(1)
-
-    # Step 2: Execute (unless --sync-only)
-    if not args.sync_only and success:
-        success = execute_remote(command)
-
-    print("\n" + "=" * 60)
-    if success:
-        print("✅ Development run completed successfully!")
-    else:
-        print("❌ Development run failed!")
+    # Step 1: Always sync local changes to remote
+    success = sync_to_remote()
+    if not success:
+        print("\n❌ Sync failed, aborting.")
         sys.exit(1)
+
+    # Step 2: Execute command on remote
+    success = execute_remote(command)
+    if not success:
+        print("\n❌ Development run failed!")
+        sys.exit(1)
+
+    # Step 3: Auto-fetch logs if requested
+    if args.auto_fetch:
+        auto_success = auto_fetch_recent_logs(config, args.local_dir)
+        if auto_success:
+            print("\n" + "=" * 60)
+            print("✅ Development run and auto-fetch completed successfully!")
+        else:
+            print("\n" + "=" * 60)
+            print("✅ Development run completed successfully!")
+            print("⚠️  Auto-fetch did not find recent cache directories.")
+    else:
+        print("\n" + "=" * 60)
+        print("✅ Development run completed successfully!")
 
 
 if __name__ == "__main__":
