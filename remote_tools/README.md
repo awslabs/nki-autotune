@@ -71,6 +71,10 @@ python remote_tools/dev_run.py --sync-only "echo done"
 
 # Skip syncing, just run command
 python remote_tools/dev_run.py --no-sync "python --version"
+
+# Access logs from remote cache
+python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/transpose/129x128
+python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/nki_tile_transpose --local-dir ./my_logs
 ```
 
 **Features**:
@@ -79,6 +83,7 @@ python remote_tools/dev_run.py --no-sync "python --version"
 - Handles Python module execution (`-m pytest`)
 - Clear progress display with success/failure status
 - Options for sync-only or execute-only modes
+- Log access functionality to download cache/results from remote
 
 ### `remote_sync.sh` - File Synchronization
 Syncs your local changes to the remote instance using rsync.
@@ -107,6 +112,35 @@ Executes commands on the remote instance with proper environment setup.
 - Streams command output back to you
 - Handles SSH options and provides execution details
 
+## Log Access & Analysis
+
+The autotune framework saves detailed performance metrics, error logs, and cache data on the remote machine. You can access these logs during development:
+
+### Fetching Logs
+```bash
+# Download entire cache directory for a kernel
+python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/nki_tile_transpose
+
+# Download to a specific local directory
+python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/transpose/129x128 --local-dir ./analysis
+
+# Download specific performance results
+python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/gemm/1024x2048x4096/M1024-N2048-K4096
+```
+
+### Understanding Cache Structure
+The autotune cache follows this directory structure:
+```
+/mnt/efs/autotune-dev-cache/
+├── {kernel_name}/
+│   ├── {input_tensor_shapes}/
+│   │   ├── {config_params}/
+│   │   │   ├── performance_result.pkl    # Detailed metrics
+│   │   │   ├── compilation_output.log    # Compiler logs
+│   │   │   └── execution_output.log      # Runtime logs
+│   │   └── perf_metrics.json            # Workload summary
+```
+
 ## Workflow Examples
 
 ### Typical Development Session
@@ -114,10 +148,13 @@ Executes commands on the remote instance with proper environment setup.
 # Make some code changes locally...
 
 # Run benchmarks with real-time feedback
-python remote_tools/dev_run.py examples/gemm.py --mode both --cache-dir /tmp/cache
+python remote_tools/dev_run.py examples/gemm.py --mode both --cache-dir /mnt/efs/autotune-dev-cache
 
 # Run tests to verify changes
 python remote_tools/dev_run.py -m pytest autotune/test/ -v
+
+# Download results for analysis
+python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/gemm --local-dir ./gemm_results
 
 # Try another example
 python remote_tools/dev_run.py examples/softmax.py
@@ -135,6 +172,9 @@ python remote_tools/dev_run.py --no-sync "python examples/attention.py"
 ./remote_tools/remote_sync.sh
 ./remote_tools/remote_exec.sh 'pip install -e .'
 ./remote_tools/remote_exec.sh 'python examples/gemm.py --mode lhs_rhs'
+
+# Download logs from multiple runs for comparison
+python remote_tools/dev_run.py --fetch-logs /mnt/efs/autotune-dev-cache/matmul --local-dir ./matmul_analysis
 ```
 
 ## SSH Configuration
