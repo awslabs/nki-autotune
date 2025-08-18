@@ -1,0 +1,17 @@
+# Remote development configuration template
+# Copy this to .remote_config and customize for your setup
+
+# SSH hostname/alias (should be configured in your ~/.ssh/config)
+REMOTE_HOST=your-remote-host
+
+# Path to the nki-autotune project on remote machine
+REMOTE_CODE_PATH=/path/to/remote/nki-autotune
+
+# Path to the virtual environment on remote machine (optional)
+REMOTE_VENV_PATH=/path/to/remote/venv
+
+# Optional: Custom rsync options (default: "-av --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.remote_config'")
+# RSYNC_OPTIONS="-av --exclude='.git' --exclude='__pycache__'"
+
+# Optional: Custom SSH options
+# SSH_OPTIONS="-o ConnectTimeout=10"
