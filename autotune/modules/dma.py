@@ -5,6 +5,8 @@ import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
 
+from autotune.typing import SBUFTensor
+
 
 def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[int, int, int], transpose: bool):
     """
@@ -85,7 +87,7 @@ def save_result_dma(result, result_blocks, block_id_M: int):
         nl.store(result[m_ofs + idx_res_packed.p, idx_res_packed.x], value=result_blocks_packed)
 
 
-def save_result_block(result, result_block, dst_ofs: Tuple[int, int]):
+def save_result_block(result, result_block: SBUFTensor, dst_ofs: Tuple[int, int]):
     """
     Store a 4D SBUF block of tiled results back into a 2D HBM tensor.
     The result_block tensor contains data organized in tiles that need to be stored in the
@@ -120,7 +122,7 @@ def save_result_block(result, result_block, dst_ofs: Tuple[int, int]):
         None. The result tensor is modified in-place.
     """
     start_row_tile, start_column_tile = dst_ofs
-    row_tile_size, num_row_tiles, num_column_tiles, column_tile_size = result_block.shape
+    row_tile_size, num_row_tiles, num_column_tiles, column_tile_size = result_block.tensor.shape
     max_rows, max_cols = result.shape
     idx_res = nl.mgrid[0:row_tile_size, 0:column_tile_size]
     for row_tile_id in nl.affine_range(num_row_tiles):
@@ -131,7 +133,7 @@ def save_result_block(result, result_block, dst_ofs: Tuple[int, int]):
             column_indices = column_start + idx_res.x
             nl.store(
                 result[row_indices, column_indices],
-                value=result_block[idx_res.p, row_tile_id, column_tile_id, idx_res.x],
+                value=result_block.tensor[idx_res.p, row_tile_id, column_tile_id, idx_res.x],
                 mask=(row_indices < max_rows) & (column_indices < max_cols),
             )
 

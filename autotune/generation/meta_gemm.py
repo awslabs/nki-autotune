@@ -203,7 +203,7 @@ lhs_position = {lhs_position}. rhs_position = {rhs_position}.
         else:
             lhs_name = "lhs"
         common_head = f"""
-from autotune.modules.matmul import GEMMCompatibility, matmul_blocks
+from autotune.modules.matmul import GEMMCompatibility, matmul_tensors
 from autotune.modules.dma import load_tensor_block, save_result_block
 from autotune.typing import HBMTensor, SBUFTensor
 import neuronxcc.nki.language as nl
@@ -223,7 +223,7 @@ def {lhs_name}_rhs_gemm(
     mm((lhs, rhs), kernel_kwargs)
     result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
     lhs_hbm = HBMTensor(lhs, axes={self.dependent_dims["lhs"]})
-    rhs_hbm = HBMTensor(lhs, axes={self.dependent_dims["rhs"]})"""
+    rhs_hbm = HBMTensor(rhs, axes={self.dependent_dims["rhs"]})"""
         indentation_level = 0
         loop_openings = ""
         loop_closings = ""
@@ -274,8 +274,7 @@ def {lhs_name}_rhs_gemm(
             result_dims = self.dependent_dims["result"]
             closing = f"""
     save_result_block(result, result_block,
-       ({self.global_start_tiles["result"][result_dims[0]]}, {self.global_num_tiles["result"][result_dims[0]]}),
-       ({self.global_start_tiles["result"][result_dims[1]]}, {self.global_num_tiles["result"][result_dims[1]]})
+       ({self.global_start_tiles["result"][result_dims[0]]}, {self.global_start_tiles["result"][result_dims[1]]})
     )"""
         else:
             closing = ""
@@ -283,18 +282,12 @@ def {lhs_name}_rhs_gemm(
 
     def _generate_matmul_body(self, loop_position: int):
         code = self._generate_opening_at_position(loop_position)
-        matmul_subroutine = "matmul_blocks_lhsT" if self.transposed_lhs else "matmul_blocks_tile_transposed_lhs"
-        matmul_subroutine = "matmul_blocks"
         code += f"""
-    {matmul_subroutine}(
+    matmul_tensors(
         lhs_block, ({self.local_start_tiles["lhs"][self.dependent_dims["lhs"][0]]}, {self.local_start_tiles["lhs"][self.dependent_dims["lhs"][1]]}),
         rhs_block, ({self.local_start_tiles["rhs"][self.dependent_dims["rhs"][0]]}, {self.local_start_tiles["rhs"][self.dependent_dims["rhs"][1]]}),
         result_block, ({self.local_start_tiles["result"][self.dependent_dims["result"][0]]}, {self.local_start_tiles["result"][self.dependent_dims["result"][1]]}),
         compute_num_tiles=({self.local_num_tiles["M"]}, {self.local_num_tiles["N"]}, {self.local_num_tiles["K"]}),
-        global_size=(mm.M, mm.N, mm.K),
-        global_lhs_tile_offsets=({self.global_start_tiles["lhs"][self.dependent_dims["lhs"][0]]}, {self.global_start_tiles["lhs"][self.dependent_dims["lhs"][1]]}),
-        global_rhs_tile_offsets=({self.global_start_tiles["rhs"][self.dependent_dims["rhs"][0]]}, {self.global_start_tiles["rhs"][self.dependent_dims["rhs"][1]]}),
-        global_result_tile_offsets=({self.global_start_tiles["result"][self.dependent_dims["result"][0]]}, {self.global_start_tiles["result"][self.dependent_dims["result"][1]]}),
         tile_transposed_lhs={not self.transposed_lhs},
     )"""
         return code
@@ -327,10 +320,12 @@ def {lhs_name}_rhs_gemm(
         tile_offsets={tile_offsets_str},
         num_tiles={num_tiles_str})"""
         if self.op_positions["result"] == loop_position:
-            result_dims = self.dependent_dims["result"]
+            result_axes = self.dependent_dims["result"]
+            result_num_tiles = {axis: self.global_num_tiles["result"][axis] for axis in result_axes}
+            result_num_tiles_str = format_dict_for_code(result_num_tiles)
             code += f"""
-    result_block = nl.zeros((mm.TILE_{result_dims[0]}, {self.global_num_tiles["result"][result_dims[0]]}, {self.global_num_tiles["result"][result_dims[1]]}, mm.TILE_{result_dims[1]}),
-                             dtype=result.dtype,buffer=nl.sbuf)"""
+    result_block = SBUFTensor(tile_sizes={{"{result_axes[0]}": mm.TILE_{result_axes[0]}, "{result_axes[1]}": mm.TILE_{result_axes[1]}}})
+    result_block.init_as_zero(num_tiles={result_num_tiles_str}, dtype = result.dtype)"""
         return code
 
     def _get_indentation(self, indent_level: int):
