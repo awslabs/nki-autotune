@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+from itertools import permutations
 from pathlib import Path
 from typing import Dict, Tuple
+
+from autotune.generation.generate import generate_configs
 
 
 class MetaGEMM:
@@ -195,11 +198,14 @@ lhs_position = {lhs_position}. rhs_position = {rhs_position}.
         return absolute_position
 
     def _generate_code(self) -> str:
-        lhs_name = "lhsT" if self.transposed_lhs else "lhs"
+        if self.transposed_lhs:
+            lhs_name = "lhsT"
+        else:
+            lhs_name = "lhs"
         common_head = f"""
 from autotune.modules.matmul import GEMMCompatibility, matmul_blocks
-from autotune.modules.layout import transpose_tiles_in_block
 from autotune.modules.dma import load_tensor_block, save_result_block
+from autotune.typing import HBMTensor, SBUFTensor
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 import neuronxcc.nki as nki
@@ -215,7 +221,9 @@ def {lhs_name}_rhs_gemm(
     kernel_kwargs = {{"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K}}
     mm = GEMMCompatibility(transposed_lhs={self.transposed_lhs})
     mm((lhs, rhs), kernel_kwargs)
-    result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)"""
+    result = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+    lhs_hbm = HBMTensor(lhs, axes={self.dependent_dims["lhs"]})
+    rhs_hbm = HBMTensor(lhs, axes={self.dependent_dims["rhs"]})"""
         indentation_level = 0
         loop_openings = ""
         loop_closings = ""
@@ -294,22 +302,30 @@ def {lhs_name}_rhs_gemm(
     def _generate_opening_at_position(self, loop_position: int) -> str:
         code = ""
         if self.op_positions["lhs"] == loop_position:
-            lhs_dims = self.dependent_dims["lhs"]
+            lhs_axes = self.dependent_dims["lhs"]
+            tile_offsets = {axis: self.global_start_tiles["lhs"][axis] for axis in lhs_axes}
+            num_tiles = {axis: self.global_num_tiles["lhs"][axis] for axis in lhs_axes}
+            tile_offsets_str = format_dict_for_code(tile_offsets)
+            num_tiles_str = format_dict_for_code(num_tiles)
             code += f"""
-    lhs_block = load_tensor_block(input_tensor=lhs,
-                                dim_0=(mm.TILE_{lhs_dims[0]}, {self.global_start_tiles["lhs"][lhs_dims[0]]}, {self.global_num_tiles["lhs"][lhs_dims[0]]}),
-                                dim_1=(mm.TILE_{lhs_dims[1]}, {self.global_start_tiles["lhs"][lhs_dims[1]]}, {self.global_num_tiles["lhs"][lhs_dims[1]]}),
-                                transpose={not self.transposed_lhs})"""
-        #         if not self.transposed_lhs:
-        #             code += """
-        # transpose_tiles_in_block(lhs_block)"""
+    lhs_block = SBUFTensor(tile_sizes={{"{lhs_axes[0]}": mm.TILE_{lhs_axes[0]}, "{lhs_axes[1]}": mm.TILE_{lhs_axes[1]}}})
+    lhs_block.load(lhs_hbm,
+        tile_offsets={tile_offsets_str},
+        num_tiles={num_tiles_str})"""
+            if not self.transposed_lhs:
+                code += """
+    lhs_block.tile_transpose()"""
         if self.op_positions["rhs"] == loop_position:
-            rhs_dims = self.dependent_dims["rhs"]
+            rhs_axes = self.dependent_dims["rhs"]
+            tile_offsets = {axis: self.global_start_tiles["rhs"][axis] for axis in rhs_axes}
+            num_tiles = {axis: self.global_num_tiles["rhs"][axis] for axis in rhs_axes}
+            tile_offsets_str = format_dict_for_code(tile_offsets)
+            num_tiles_str = format_dict_for_code(num_tiles)
             code += f"""
-    rhs_block = load_tensor_block(input_tensor=rhs,
-                                dim_0=(mm.TILE_{rhs_dims[0]}, {self.global_start_tiles["rhs"][rhs_dims[0]]}, {self.global_num_tiles["rhs"][rhs_dims[0]]}),
-                                dim_1=(mm.TILE_{rhs_dims[1]}, {self.global_start_tiles["rhs"][rhs_dims[1]]}, {self.global_num_tiles["rhs"][rhs_dims[1]]}),
-                                transpose=False)"""
+    rhs_block = SBUFTensor(tile_sizes={{"{rhs_axes[0]}": mm.TILE_{rhs_axes[0]}, "{rhs_axes[1]}": mm.TILE_{rhs_axes[1]}}})
+    rhs_block.load(rhs_hbm,
+        tile_offsets={tile_offsets_str},
+        num_tiles={num_tiles_str})"""
         if self.op_positions["result"] == loop_position:
             result_dims = self.dependent_dims["result"]
             code += f"""
@@ -322,9 +338,34 @@ def {lhs_name}_rhs_gemm(
         return indent_level * indentation
 
 
+def format_dict_for_code(dict_obj: dict) -> str:
+    """Format a dictionary for code generation, removing quotes from values that are code expressions"""
+    items = []
+    for key, value in dict_obj.items():
+        # Remove quotes from values to make them code expressions rather than string literals
+        items.append(f"'{key}': {value}")
+    return "{" + ", ".join(items) + "}"
+
+
 def str_to_dict(loop_order: str) -> Dict:
     loop_order_dict = {}
     for position, dimension in enumerate(loop_order):
         loop_order_dict[position] = dimension
         loop_order_dict[dimension] = position
     return loop_order_dict
+
+
+if __name__ == "__main__":
+    loop_orders = ["".join(loop_order) for loop_order in permutations("MNK")]
+    lhs_positions = [0, 1, 2]
+    rhs_positions = [0, 1, 2]
+    template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
+    template_configs = generate_configs(**template_params)
+    for transposed_lhs in [True, False]:
+        folder_name = "lhsT_rhs_gemm" if transposed_lhs else "lhs_rhs_gemm"
+        for template_id, template_config in enumerate(template_configs):
+            kernel = MetaGEMM(
+                code_file_path=f"generated_kernels/{folder_name}/generated_gemm_kernel_{template_id}.py",
+                transposed_lhs=transposed_lhs,
+                **template_config,
+            )

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
-from itertools import permutations, product
-from typing import List
+from glob import glob
+from itertools import product
 
 import numpy as np
 from neuronpy.core.language import bfloat16
@@ -11,22 +11,8 @@ from neuronpy.core.language import bfloat16
 from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
-from autotune.core.tune import generate_configs
-from autotune.generation.meta_gemm import MetaGEMM
+from autotune.generation.generate import generate_configs
 from autotune.modules.matmul import GEMMCompatibility, GEMMCorrectness
-
-
-def get_template_configs():
-    loop_orders = ["".join(loop_order) for loop_order in permutations("MNK")]
-    lhs_positions = [0, 1, 2]
-    rhs_positions = [0, 1, 2]
-
-    # loop_orders = ["NKM"]
-    # lhs_positions = [1]
-    # rhs_positions = [2]
-    template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
-    template_configs = generate_configs(**template_params)
-    return template_configs
 
 
 def get_configs():
@@ -37,9 +23,7 @@ def get_configs():
     return kernel_configs
 
 
-def make_gemm_jobs(
-    all_jobs: ProfileJobs, kernels: List[MetaGEMM], M: int, N: int, K: int, transposed_lhs: bool = False
-):
+def make_gemm_jobs(all_jobs: ProfileJobs, M: int, N: int, K: int, transposed_lhs: bool = False):
     data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
@@ -58,7 +42,8 @@ def make_gemm_jobs(
     kernel_func_np = "lhsT_rhs_gemm_np" if transposed_lhs else "lhs_rhs_gemm_np"
     num_repeats = 1
 
-    for kernel in kernels:
+    kernel_files = glob(f"generated_kernels/{kernel_func}/*.py")
+    for kernel_file in kernel_files:
         for kernel_config in kernel_configs:
             for _ in range(num_repeats):
                 if transposed_lhs:
@@ -71,7 +56,7 @@ def make_gemm_jobs(
                     input_tensors = (lhs, rhs)
 
                 jobs.add_job(
-                    kernel=(kernel.code_file_path, kernel_func),
+                    kernel=(kernel_file, kernel_func),
                     input_tensors=input_tensors,
                     kernel_kwargs=kernel_config,
                     compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
@@ -103,23 +88,9 @@ def make_gemm_jobs(
 
 def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
     print(f"Adding jobs with transposed={transposed_lhs} LHS matrix...")
-    # Determine folder and function names based on transposition mode
-    folder_name = "lhsT_rhs_gemm" if transposed_lhs else "lhs_rhs_gemm"
-
-    template_configs = get_template_configs()
-    kernels = []
-
-    for template_id, template_config in enumerate(template_configs):
-        kernel = MetaGEMM(
-            code_file_path=f"/mnt/efs/generated_kernels/{folder_name}/generated_gemm_kernel_{template_id}.py",
-            transposed_lhs=transposed_lhs,
-            **template_config,
-        )
-        kernels.append(kernel)
-
     MNK = list(product([1025], [2014], [1111]))
     for M, N, K in [(128, 512, 128), (129, 512, 128)]:
-        make_gemm_jobs(all_jobs, kernels, M, N, K, transposed_lhs=transposed_lhs)
+        make_gemm_jobs(all_jobs, M, N, K, transposed_lhs=transposed_lhs)
 
 
 if __name__ == "__main__":

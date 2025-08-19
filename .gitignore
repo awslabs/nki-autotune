@@ -92,3 +92,4 @@ remote_tools/.remote_config
 
 # Downloaded cache from remote autotune runs
 cache/
+generated_kernels/
