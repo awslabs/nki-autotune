@@ -7,12 +7,29 @@ import numpy as np
 
 
 class HBMTensor:
+    """High Bandwidth Memory tensor wrapper with named axes.
+
+    Provides a convenient interface for tensors stored in HBM by associating
+    dimension names with tensor axes and maintaining size mappings for efficient
+    tiled operations with SBUF tensors.
+
+    Attributes:
+        tensor: The wrapped tensor data
+        axes: Tuple of axis names corresponding to tensor dimensions
+        sizes: Dictionary mapping axis names to their corresponding dimension sizes,
+               enabling efficient lookup of tensor dimensions by name
+    """
+
     def __init__(self, tensor, axes: Tuple[str, str]) -> None:
-        """Initialize HBM tensor wrapper with axis names.
+        """Initialize HBM tensor wrapper with named axes.
 
         Args:
-            tensor: Input tensor data
-            axes: Tuple of axis names (e.g., ("M", "N"))
+            tensor: The tensor data to wrap (numpy array or NKI tensor)
+            axes: Tuple of axis names corresponding to tensor dimensions
+                  (e.g., ("M", "N") for a 2D matrix)
+
+        Raises:
+            AssertionError: If number of axes doesn't match tensor dimensions
         """
         self.tensor = tensor
         self.axes = axes
@@ -32,7 +49,6 @@ class SBUFTensor:
             tile_sizes: Dictionary mapping axis names to tile sizes
         """
         self.tile_sizes = tile_sizes
-        print(f"SBUFTensor.tile_sizes = {self.tile_sizes}")
 
     def load(self, hbm_tensor: HBMTensor, tile_offsets: Dict[str, int], num_tiles: Dict[str, int]) -> None:
         """Load data from HBM tensor into SBUF with tiling.
@@ -42,9 +58,19 @@ class SBUFTensor:
             tile_offsets: Starting tile offsets for each axis
             num_tiles: Number of tiles to load per axis (0 = load all)
         """
+        # Ensure all dictionaries have the same axes
+        tile_sizes_axes = set(self.tile_sizes.keys())
+        tile_offsets_axes = set(tile_offsets.keys())
+        num_tiles_axes = set(num_tiles.keys())
+        assert tile_sizes_axes == tile_offsets_axes == num_tiles_axes, (
+            f"Axes mismatch: tile_sizes has {tile_sizes_axes}, "
+            f"tile_offsets has {tile_offsets_axes}, "
+            f"num_tiles has {num_tiles_axes}. All must have exactly the same axes."
+        )
+
         self.tile_offsets = tile_offsets
         self.axes = hbm_tensor.axes
-        num_tiles = self._process_num_tiles(hbm_tensor, num_tiles)
+        num_tiles = self._pad_num_tiles(hbm_tensor, num_tiles)
 
         row_tile_size, column_tile_size = self.tile_sizes[self.axes[0]], self.tile_sizes[self.axes[1]]
         row_num_tiles, column_num_tiles = num_tiles[self.axes[0]], num_tiles[self.axes[1]]
@@ -52,11 +78,7 @@ class SBUFTensor:
         self.max_rows, self.max_columns = hbm_tensor.sizes[self.axes[0]], hbm_tensor.sizes[self.axes[1]]
 
         tile_index = nl.mgrid[0:row_tile_size, 0:column_tile_size]
-        self.tensor = nl.zeros(
-            (nl.par_dim(row_tile_size), row_num_tiles, column_num_tiles, column_tile_size),
-            dtype=hbm_tensor.tensor.dtype,
-            buffer=nl.sbuf,
-        )
+        self.init_as_zero(num_tiles, hbm_tensor.tensor.dtype)
         for row_tile_id in nl.affine_range(row_num_tiles):
             row_start = (row_tile_offset + row_tile_id) * row_tile_size
             row_indices = row_start + tile_index.p
@@ -71,6 +93,13 @@ class SBUFTensor:
 
     def copy(self, sbuf_tensor: "SBUFTensor"):
         pass
+
+    def init_as_zero(self, num_tiles: Dict[str, int], dtype):
+        row_tile_size, column_tile_size = self.tile_sizes[self.axes[0]], self.tile_sizes[self.axes[1]]
+        row_num_tiles, column_num_tiles = num_tiles[self.axes[0]], num_tiles[self.axes[1]]
+        self.tensor = nl.zeros(
+            (nl.par_dim(row_tile_size), row_num_tiles, column_num_tiles, column_tile_size), dtype=dtype, buffer=nl.sbuf
+        )
 
     def dump(self):
         """Dump SBUF tensor data back to HBM.
@@ -142,27 +171,63 @@ class SBUFTensor:
         """
         row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = self.tensor.shape
         row_tile_index, column_tile_index = tile_indices[self.axes[0]], tile_indices[self.axes[1]]
+        row_tile_offset, column_tile_offset = self.tile_offsets[self.axes[0]], self.tile_offsets[self.axes[1]]
         idx_tile = nl.mgrid[0:row_tile_size, 0:column_tile_size]
-        tile = self.tensor[idx_tile.p, row_tile_index, column_tile_index, idx_tile.x]
+        row_mask = (row_tile_offset + row_tile_index) * row_tile_size + idx_tile.p < self.max_rows
+        column_mask = (column_tile_offset + column_tile_index) * column_tile_size + idx_tile.x < self.max_columns
+        tile = self.tensor[idx_tile.p, row_tile_index, column_tile_index, idx_tile.x][row_mask][column_mask]
         return tile
 
-    def _process_num_tiles(self, hbm_tensor: HBMTensor, num_tiles: Dict[str, int]) -> Dict[str, int]:
-        """Process and validate num_tiles parameter.
+    def _pad_num_tiles(self, hbm_tensor: HBMTensor, num_tiles: Dict[str, int]) -> Dict[str, int]:
+        """Process and validate num_tiles parameter, expanding zero values to maximum possible tiles.
+
+        Converts num_tiles entries of 0 to the maximum number of tiles that can fit
+        for each axis given the tensor size, tile size, and tile offset. The maximum
+        tile count is calculated using math.ceil to handle cases where the tensor
+        dimension is not evenly divisible by the tile size (padding the last tile).
+        Also validates that requested tile counts are within valid bounds.
 
         Args:
-            hbm_tensor: HBM tensor to calculate max tiles from
-            num_tiles: Dictionary of number of tiles per axis (0 = all tiles)
+            hbm_tensor: HBM tensor to calculate maximum tiles from
+            num_tiles: Dictionary mapping axis names to number of tiles per axis.
+                      Value of 0 means "load all remaining tiles from offset"
 
         Returns:
-            Processed num_tiles with 0 values replaced by maximum possible tiles
+            Processed num_tiles dictionary with 0 values replaced by maximum possible tiles
+
+        Raises:
+            AssertionError: If any axis in num_tiles is not present in tile_sizes or tile_offsets
+            AssertionError: If any requested tile count exceeds maximum possible or is negative
         """
+        # Validate all axes in num_tiles exist in tile_sizes and tile_offsets
+        for axis in num_tiles:
+            assert axis in self.tile_sizes, f"Axis '{axis}' not found in tile_sizes: {set(self.tile_sizes.keys())}"
+            assert (
+                axis in self.tile_offsets
+            ), f"Axis '{axis}' not found in tile_offsets: {set(self.tile_offsets.keys())}"
+            assert (
+                axis in hbm_tensor.sizes
+            ), f"Axis '{axis}' not found in HBM tensor sizes: {set(hbm_tensor.sizes.keys())}"
+
         for axis in num_tiles:
             axis_num_tiles = num_tiles[axis]
             axis_size = hbm_tensor.sizes[axis]
-            max_axis_num_tiles = math.ceil(axis_size / self.tile_sizes[axis])
-            assert (
-                axis_num_tiles <= max_axis_num_tiles and axis_num_tiles >= 0
-            ), f"axis_num_tiles {axis_num_tiles} is out of bound for [0, {max_axis_num_tiles}]."
+            tile_size = self.tile_sizes[axis]
+            tile_offset = self.tile_offsets[axis]
+
+            # Calculate maximum tiles available from the offset position
+            max_axis_num_tiles = math.ceil(axis_size / tile_size) - tile_offset
+
+            # Validate original input before modification
+            assert axis_num_tiles >= 0, f"num_tiles for axis '{axis}' must be non-negative, got {axis_num_tiles}"
+            assert axis_num_tiles <= max_axis_num_tiles, (
+                f"num_tiles for axis '{axis}' ({axis_num_tiles}) exceeds maximum possible "
+                f"({max_axis_num_tiles}) given tensor size {axis_size}, tile size {tile_size}, "
+                f"and tile offset {tile_offset}"
+            )
+
+            # Replace 0 with maximum possible tiles
             if axis_num_tiles == 0:
                 num_tiles[axis] = max_axis_num_tiles
+
         return num_tiles
