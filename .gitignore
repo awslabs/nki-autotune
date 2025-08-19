@@ -90,6 +90,9 @@ private
 # Remote development configuration (contains sensitive info)
 remote_tools/.remote_config
 
+# Remote sync configuration (user-specific)
+remote/config.sh
+
 # Downloaded cache from remote autotune runs
 cache/
 generated_kernels/
