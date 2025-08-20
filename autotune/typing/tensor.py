@@ -20,7 +20,7 @@ class HBMTensor:
                enabling efficient lookup of tensor dimensions by name
     """
 
-    def __init__(self, tensor, axes: Tuple[str, str]) -> None:
+    def __init__(self, tensor, axes: Tuple[str, ...]) -> None:
         """Initialize HBM tensor wrapper with named axes.
 
         Args:
@@ -71,35 +71,56 @@ class SBUFTensor:
         self.tile_offsets = tile_offsets
         self.axes = hbm_tensor.axes
         num_tiles = self._pad_num_tiles(hbm_tensor, num_tiles)
-
-        row_tile_size, column_tile_size = self.tile_sizes[self.axes[0]], self.tile_sizes[self.axes[1]]
-        row_num_tiles, column_num_tiles = num_tiles[self.axes[0]], num_tiles[self.axes[1]]
-        row_tile_offset, column_tile_offset = tile_offsets[self.axes[0]], tile_offsets[self.axes[1]]
         self.max_rows, self.max_columns = hbm_tensor.sizes[self.axes[0]], hbm_tensor.sizes[self.axes[1]]
-
-        tile_index = nl.mgrid[0:row_tile_size, 0:column_tile_size]
         self.init_as_zero(num_tiles, hbm_tensor.tensor.dtype)
-        for row_tile_id in nl.affine_range(row_num_tiles):
-            row_start = (row_tile_offset + row_tile_id) * row_tile_size
-            row_indices = row_start + tile_index.p
-            row_mask = row_indices < self.max_rows
-            for column_tile_id in nl.affine_range(column_num_tiles):
-                column_start = (column_tile_offset + column_tile_id) * column_tile_size
-                column_indices = column_start + tile_index.x
-                column_mask = column_indices < self.max_columns
-                self.tensor[tile_index.p, row_tile_id, column_tile_id, tile_index.x] = nl.load(
-                    hbm_tensor.tensor[row_indices, column_indices], mask=row_mask & column_mask
-                )
+        tile_indices = self.construct_tile_indices()
+        for indices in tile_indices:
+            print(indices, indices.shape)
 
-    def copy(self, sbuf_tensor: "SBUFTensor"):
-        pass
+        total_num_tiles = math.prod(num_tiles.values())
+
+        for tile_counter in nl.affine_range(total_num_tiles):
+            tile_coordinates = linear_to_coordinates(linear_index=tile_counter, dimensions=num_tiles, axes=self.axes)
+            sbuf_index = [tile_indices[0], *tile_coordinates, *tile_indices[1:]]
+            hbm_index = []
+            axis_masks = []
+            for axis, tile_id in zip(self.axes, tile_coordinates):
+                tile_size = self.tile_sizes[axis]
+                grid = tuple(None if i != index else slice(None) for i in range(len(self.tensor.shape)))
+                axis_indices = (tile_id + self.tile_offsets[axis]) * tile_size + nl.arange(tile_size)[grid]
+                hbm_index.append(axis_indices)
+            mask = None
+            for axis_mask in axis_masks:
+                if mask is None:
+                    mask = axis_mask
+                else:
+                    mask = mask & axis_mask
+            self.tensor[sbuf_index] = nl.load(hbm_tensor.tensor[hbm_index], mask=mask)
+
+    def construct_tile_indices(self):
+        tile_indices = []
+        for index, size in enumerate(self.tensor.shape):
+            if index == 0 or index > len(self.axes):
+                grid = tuple(None if i != index else slice(None) for i in range(len(self.tensor.shape)))
+                axis_tile_indices = nl.arange(size)[grid]
+                tile_indices.append(axis_tile_indices)
+        return tile_indices
 
     def init_as_zero(self, num_tiles: Dict[str, int], dtype):
-        row_tile_size, column_tile_size = self.tile_sizes[self.axes[0]], self.tile_sizes[self.axes[1]]
-        row_num_tiles, column_num_tiles = num_tiles[self.axes[0]], num_tiles[self.axes[1]]
-        self.tensor = nl.zeros(
-            (nl.par_dim(row_tile_size), row_num_tiles, column_num_tiles, column_tile_size), dtype=dtype, buffer=nl.sbuf
+        """
+        (tile_size_0, num_tiles_0, num_tiles_1, ..., num_tiles_N-1, tile_size_1, ..., tile_size_N-1)
+            0               1           2                 N             N + 1               2N - 1
+
+        Args:
+            num_tiles (Dict[str, int]): _description_
+            dtype (_type_): _description_
+        """
+        tensor_shape = (
+            self.tile_sizes[self.axes[0]],
+            *[num_tiles[axis] for axis in self.axes],
+            *[self.tile_sizes[axis] for axis in self.axes[1:]],
         )
+        self.tensor = nl.zeros(tensor_shape, dtype=dtype, buffer=nl.sbuf)
 
     def dump(self):
         """Dump SBUF tensor data back to HBM.
@@ -231,3 +252,51 @@ class SBUFTensor:
                 num_tiles[axis] = max_axis_num_tiles
 
         return num_tiles
+
+
+def linear_to_coordinates(linear_index: int, dimensions: dict, axes: Tuple[str, ...]) -> Tuple[int, ...]:
+    """
+    Convert a linear index to multi-dimensional coordinates.
+
+    Args:
+        linear_index (int): Linear index identifier
+        dimensions (dict): Dictionary mapping axis names to size along that axis
+                         e.g., {'M': 2, 'K': 1}
+        axes: Tuple of axis names in the desired output order
+
+    Returns:
+        Tuple[int, ...]: Tuple of coordinate values in the same order as axes
+                        e.g., (1, 0) for axes=('M', 'K')
+
+    Example:
+        >>> linear_to_coordinates(0, {'M': 2, 'K': 1}, ('M', 'K'))
+        (0, 0)
+        >>> linear_to_coordinates(1, {'M': 2, 'K': 1}, ('M', 'K'))
+        (1, 0)
+        >>> linear_to_coordinates(3, {'M': 2, 'K': 2, 'N': 2}, ('M', 'K', 'N'))
+        (1, 1, 0)
+    """
+    if not dimensions:
+        return ()
+
+    # Get axis names and sizes in a consistent order
+    sizes = [dimensions[axis] for axis in axes]
+
+    # Calculate strides for each dimension
+    # Stride for dimension i is the product of all dimensions to the right of i
+    strides = []
+    stride = 1
+    for i in range(len(sizes) - 1, -1, -1):
+        strides.insert(0, stride)
+        stride *= sizes[i]
+
+    # Convert linear index to multi-dimensional coordinates
+    coordinates = []
+    remaining_id = linear_index
+
+    for i, axis in enumerate(axes):
+        coordinate_value = remaining_id // strides[i]
+        coordinates.append(coordinate_value)
+        remaining_id = remaining_id % strides[i]
+
+    return tuple(coordinates)
