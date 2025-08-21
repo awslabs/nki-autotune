@@ -120,12 +120,28 @@ class MetaGEMM:
             if not self.transposed_lhs:
                 lhs_tiles.tile_transpose()
         if self.op_positions["rhs"] == curr_position:
-            rhs_tile_sizes = {axis: getattr(self.mm, f"TILE_{axis}") for axis in self.axes["rhs"]}
-            rhs_tiles = SBUFTensor()
+            rhs_tile_sizes = {}
+            rhs_num_tiles = {}
+            for axis in self.axes["rhs"]:
+                rhs_tile_sizes[axis] = getattr(self.mm, f"TILE_{axis}")
+                if axis in loop_vars:
+                    rhs_num_tiles[axis] = getattr(self.mm, f"TILES_IN_BLOCK_{axis}")
+                else:
+                    rhs_num_tiles[axis] = getattr(self.mm, f"TILES_IN_{axis}")
+            rhs_tiles = SBUFTensor(par_axis=self.axes["rhs"][0], tile_sizes=rhs_tile_sizes, num_tiles=rhs_num_tiles)
             rhs_tiles.load()
         if self.op_positions["result"] == curr_position:
-            result_tile_sizes = {axis: getattr(self.mm, f"TILE_{axis}") for axis in self.axes["result"]}
-            result_tiles = SBUFTensor()
+            result_tile_sizes = {}
+            result_num_tiles = {}
+            for axis in self.axes["result"]:
+                result_tile_sizes[axis] = getattr(self.mm, f"TILE_{axis}")
+                if axis in loop_vars:
+                    result_num_tiles[axis] = getattr(self.mm, f"TILES_IN_BLOCK_{axis}")
+                else:
+                    result_num_tiles[axis] = getattr(self.mm, f"TILES_IN_{axis}")
+            result_tiles = SBUFTensor(
+                par_axis=self.axes["result"][0], tile_sizes=result_tile_sizes, num_tiles=result_num_tiles
+            )
 
     def maybe_store(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["save"] == curr_position:
