@@ -5,7 +5,7 @@ import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
 
-from autotune.typing import SBUFTensor
+from autotune.core.tensor import SBUFTensor
 
 
 def load_tensor_block(input_tensor, dim_0: Tuple[int, int, int], dim_1: Tuple[int, int, int], transpose: bool):

@@ -51,6 +51,7 @@ class MetaGEMM:
         self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, self.axes["rhs"])
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
+        self.mm = GEMMCompatibility(transposed_lhs=transposed_lhs)
 
         print(self.op_positions)
         print(self.loop_order)
@@ -78,23 +79,22 @@ class MetaGEMM:
         return absolute_position
 
     def __call__(self, lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int) -> Any:
-        mm = GEMMCompatibility(transposed_lhs=self.transposed_lhs)
-        mm((lhs, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K})
+        self.mm((lhs, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K})
         if self.transposed_lhs:
             lhs_hbm = HBMTensor(lhs, axes=("K", "M"))
         else:
             lhs_hbm = HBMTensor(lhs, axes=("M", "K"))
         rhs_hbm = HBMTensor(rhs, axes=("K", "N"))
-        result_hbm = nl.ndarray((mm.M, mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+        result_hbm = nl.ndarray((self.mm.M, self.mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
         loop_vars = {}
         self.maybe_init(curr_position=0, loop_vars=loop_vars)
-        for block_id_0 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{self.loop_order[0]}")):
+        for block_id_0 in nl.affine_range(getattr(self.mm, f"NUM_BLOCK_{self.loop_order[0]}")):
             loop_vars[self.loop_order[0]] = block_id_0
             self.maybe_init(curr_position=1, loop_vars=loop_vars)
-            for block_id_1 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{self.loop_order[1]}")):
+            for block_id_1 in nl.affine_range(getattr(self.mm, f"NUM_BLOCK_{self.loop_order[1]}")):
                 loop_vars[self.loop_order[1]] = block_id_1
                 self.maybe_init(curr_position=2, loop_vars=loop_vars)
-                for block_id_2 in nl.affine_range(getattr(mm, f"NUM_BLOCK_{self.loop_order[2]}")):
+                for block_id_2 in nl.affine_range(getattr(self.mm, f"NUM_BLOCK_{self.loop_order[2]}")):
                     loop_vars[self.loop_order[2]] = block_id_2
                     self.maybe_init(curr_position=3, loop_vars=loop_vars)
                     matmul_tensors()
@@ -107,14 +107,24 @@ class MetaGEMM:
 
     def maybe_init(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["lhs"] == curr_position:
-            lhs_tiles = SBUFTensor()
+            lhs_tile_sizes = {}
+            lhs_num_tiles = {}
+            for axis in self.axes["lhs"]:
+                lhs_tile_sizes[axis] = getattr(self.mm, f"TILE_{axis}")
+                if axis in loop_vars:
+                    lhs_num_tiles[axis] = getattr(self.mm, f"TILES_IN_BLOCK_{axis}")
+                else:
+                    lhs_num_tiles[axis] = getattr(self.mm, f"TILES_IN_{axis}")
+            lhs_tiles = SBUFTensor(par_axis=self.axes["lhs"][0], tile_sizes=lhs_tile_sizes, num_tiles=lhs_num_tiles)
             lhs_tiles.load()
             if not self.transposed_lhs:
                 lhs_tiles.tile_transpose()
         if self.op_positions["rhs"] == curr_position:
+            rhs_tile_sizes = {axis: getattr(self.mm, f"TILE_{axis}") for axis in self.axes["rhs"]}
             rhs_tiles = SBUFTensor()
             rhs_tiles.load()
         if self.op_positions["result"] == curr_position:
+            result_tile_sizes = {axis: getattr(self.mm, f"TILE_{axis}") for axis in self.axes["result"]}
             result_tiles = SBUFTensor()
 
     def maybe_store(self, curr_position: int, loop_vars: Dict):

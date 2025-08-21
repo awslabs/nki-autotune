@@ -53,6 +53,15 @@ class SBUFTensor:
         self.par_axis = par_axis
         self.tile_sizes = tile_sizes
         self.num_tiles = num_tiles
+        assert (
+            par_axis in tile_sizes and par_axis in num_tiles
+        ), f"par_axis {par_axis} is not in tile_sizes {tile_sizes}, num_tiles {num_tiles}."
+        assert set(tile_sizes.keys()) == set(num_tiles.keys()), (
+            f"Axes mismatch:"
+            f"tile_sizes {tile_sizes}, "
+            f"num_tiles {num_tiles}."
+            f"All must have exactly the same axes."
+        )
 
     def load(self, hbm_tensor: HBMTensor, tile_offsets: Dict[str, int]) -> None:
         """Load data from HBM tensor into SBUF with tiling.
@@ -62,13 +71,11 @@ class SBUFTensor:
             tile_offsets: Starting tile offsets for each axis
         """
         # Ensure all dictionaries have the same axes
-        tile_sizes_axes = set(self.tile_sizes.keys())
-        tile_offsets_axes = set(tile_offsets.keys())
-        num_tiles_axes = set(num_tiles.keys())
-        assert tile_sizes_axes == tile_offsets_axes == num_tiles_axes, (
-            f"Axes mismatch: tile_sizes has {tile_sizes_axes}, "
-            f"tile_offsets has {tile_offsets_axes}, "
-            f"num_tiles has {num_tiles_axes}. All must have exactly the same axes."
+        assert set(tile_offsets.keys()) == set(self.tile_sizes.keys()), (
+            f"Axes mismatch:"
+            f"tile_offsets {tile_offsets},"
+            f"tile_sizes has {self.tile_sizes}."
+            f"All must have exactly the same axes."
         )
 
         self.tile_offsets = tile_offsets
