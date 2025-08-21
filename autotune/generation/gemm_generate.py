@@ -57,26 +57,24 @@ class MetaGEMM:
 
     def _parse_absolute_position(self, relative_position: int, axes: Tuple[str, ...]):
         """
-        relative_position to calculate absolute_position:
-        - Must be > dependent_axis_positions[:relative_position]
-        - Must be <= dependent_axis_positions[relative_position:]
+        Convert relative_position to absolute_position.
+        Relative position is wrt the axes.
+        |0| P0 |1| P1 |2|
         - As small as possible to reduce redundant ops.
+
+        Example:
+            If axes=('M','K') with positions [1,3] and relative_position=1:
+            Returns 2 (must be > 1 and <= 3, so minimum is 2)
         """
-        assert relative_position in range(
-            len(axes) + 1
-        ), f"relative_position {relative_position} is out of bound for axes {axes}."
-        candidates = [0, 1, 2, 3]
-        dependent_axis_positions = sorted([self.loop_order[axis] for axis in axes])
-        valid_positions = []
-        for candidate in candidates:
-            valids = []
-            for dependent_axis_position in dependent_axis_positions[:relative_position]:
-                valids.append(candidate > dependent_axis_position)
-            for dependent_axis_position in dependent_axis_positions[relative_position:]:
-                valids.append(candidate <= dependent_axis_position)
-            if all(valids):
-                valid_positions.append(candidate)
-        absolute_position = min(valid_positions)
+        axis_positions = sorted([self.loop_order[axis] for axis in axes])
+        if relative_position == 0:
+            absolute_position = 0
+        elif relative_position == 1:
+            absolute_position = axis_positions[0] + 1
+        elif relative_position == 2:
+            absolute_position = axis_positions[1] + 1
+        else:
+            raise Exception(f"relative_position {relative_position} is out of bound for axes {axes}.")
         return absolute_position
 
     def __call__(self, lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int) -> Any:
@@ -100,9 +98,12 @@ class MetaGEMM:
                     loop_vars[self.loop_order[2]] = block_id_2
                     self.maybe_init(curr_position=3, loop_vars=loop_vars)
                     matmul_tensors()
-                self.maybe_store(curr_position=2)
-            self.maybe_store(curr_position=1)
-        self.maybe_store(curr_position=0)
+                del loop_vars[self.loop_order[2]]
+                self.maybe_store(curr_position=2, loop_vars=loop_vars)
+            del loop_vars[self.loop_order[1]]
+            self.maybe_store(curr_position=1, loop_vars=loop_vars)
+        del loop_vars[self.loop_order[0]]
+        self.maybe_store(curr_position=0, loop_vars=loop_vars)
 
     def maybe_init(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["lhs"] == curr_position:
