@@ -1,7 +1,8 @@
 from itertools import product
+from typing import Dict, List
 
 
-def generate_configs(**kwargs):
+def generate_configs(**kwargs) -> List[Dict]:
     """
     Generate a list of configurations by combining all possible component options.
 

@@ -6,7 +6,8 @@ import neuronxcc.nki.language as nl
 import numpy as np
 import tabulate
 
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE, SBUFTensor
+from autotune.core.tensor import SBUFTensor
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
 
 class GEMMCompatibility:

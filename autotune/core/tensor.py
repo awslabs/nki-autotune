@@ -42,21 +42,24 @@ class HBMTensor:
 
 
 class SBUFTensor:
-    def __init__(self, tile_sizes: Dict[str, int]) -> None:
+    def __init__(self, par_axis: str, tile_sizes: Dict[str, int], num_tiles: Dict[str, int]) -> None:
         """Initialize SBUF tensor with specified tile sizes.
 
         Args:
-            tile_sizes: Dictionary mapping axis names to tile sizes
+            par_axis: Partition axis name
+            tile_sizes: Dictionary mapping axis names to tile sizes for axes
+            num_tiles: Number of tiles to load per axis
         """
+        self.par_axis = par_axis
         self.tile_sizes = tile_sizes
+        self.num_tiles = num_tiles
 
-    def load(self, hbm_tensor: HBMTensor, tile_offsets: Dict[str, int], num_tiles: Dict[str, int]) -> None:
+    def load(self, hbm_tensor: HBMTensor, tile_offsets: Dict[str, int]) -> None:
         """Load data from HBM tensor into SBUF with tiling.
 
         Args:
             hbm_tensor: Source HBM tensor to load from
             tile_offsets: Starting tile offsets for each axis
-            num_tiles: Number of tiles to load per axis (0 = load all)
         """
         # Ensure all dictionaries have the same axes
         tile_sizes_axes = set(self.tile_sizes.keys())
