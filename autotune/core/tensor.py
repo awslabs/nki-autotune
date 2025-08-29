@@ -9,9 +9,11 @@ import numpy as np
 class HBMTensor:
     """High Bandwidth Memory tensor wrapper with named axes.
 
-    Provides a convenient interface for tensors stored in HBM by associating
+    Provides an interface for tensors stored in HBM by associating
     dimension names with tensor axes and maintaining size mappings for efficient
     tiled operations with SBUF tensors.
+
+    Sizes can be arbitrary and do not require any alignment.
 
     Attributes:
         tensor: The wrapped tensor data
@@ -42,47 +44,38 @@ class HBMTensor:
 
 
 class SBUFTensor:
-    def __init__(self, par_axis: str, tile_sizes: Dict[str, int], num_tiles: Dict[str, int]) -> None:
+    def __init__(self, par_axis: str, tile_sizes: Dict[str, int]) -> None:
         """Initialize SBUF tensor with specified tile sizes.
 
         Args:
             par_axis: Partition axis name
             tile_sizes: Dictionary mapping axis names to tile sizes for axes
-            num_tiles: Number of tiles to load per axis
         """
         self.par_axis = par_axis
         self.tile_sizes = tile_sizes
-        self.num_tiles = num_tiles
-        assert (
-            par_axis in tile_sizes and par_axis in num_tiles
-        ), f"par_axis {par_axis} is not in tile_sizes {tile_sizes}, num_tiles {num_tiles}."
-        assert set(tile_sizes.keys()) == set(num_tiles.keys()), (
-            f"Axes mismatch:"
-            f"tile_sizes {tile_sizes}, "
-            f"num_tiles {num_tiles}."
-            f"All must have exactly the same axes."
-        )
+        assert par_axis in tile_sizes, f"par_axis {par_axis} is not in tile_sizes {tile_sizes}."
 
-    def load(self, hbm_tensor: HBMTensor, tile_offsets: Dict[str, int]) -> None:
-        """Load data from HBM tensor into SBUF with tiling.
+    def load(self, source: HBMTensor, coordinates: Dict[str, Dict[str, int]]) -> None:
+        """Load data from HBM tensor into SBUF tile by tile.
+        If coordinates go beyond source tensor, pad the loaded result with 0.
 
         Args:
-            hbm_tensor: Source HBM tensor to load from
-            tile_offsets: Starting tile offsets for each axis
+            source: Source HBM tensor to load from
+            coordinates[axis]["start"] = Starting element index for each axis
+            coordinates[axis]["size"] = Number of elements for each axis
         """
         # Ensure all dictionaries have the same axes
-        assert set(tile_offsets.keys()) == set(self.tile_sizes.keys()), (
+        assert set(coordinates.keys()) == set(self.tile_sizes.keys()), (
             f"Axes mismatch:"
-            f"tile_offsets {tile_offsets},"
+            f"coordinates {coordinates},"
             f"tile_sizes has {self.tile_sizes}."
-            f"All must have exactly the same axes."
+            f"Do not have exactly the same axes."
         )
-
-        self.tile_offsets = tile_offsets
-        self.axes = hbm_tensor.axes
-        num_tiles = self._pad_num_tiles(hbm_tensor, num_tiles)
-        self.max_rows, self.max_columns = hbm_tensor.sizes[self.axes[0]], hbm_tensor.sizes[self.axes[1]]
-        self.init_as_zero(num_tiles, hbm_tensor.tensor.dtype)
+        self.global_coordinates = coordinates
+        self.axes = source.axes
+        num_tiles = self._pad_num_tiles(source, num_tiles)
+        self.max_rows, self.max_columns = source.sizes[self.axes[0]], source.sizes[self.axes[1]]
+        self.init_as_zero(num_tiles, source.tensor.dtype)
         tile_indices = self.construct_tile_indices()
         for indices in tile_indices:
             print(indices, indices.shape)
@@ -105,7 +98,7 @@ class SBUFTensor:
                     mask = axis_mask
                 else:
                     mask = mask & axis_mask
-            self.tensor[sbuf_index] = nl.load(hbm_tensor.tensor[hbm_index], mask=mask)
+            self.tensor[sbuf_index] = nl.load(source.tensor[hbm_index], mask=mask)
 
     def construct_tile_indices(self):
         tile_indices = []
