@@ -55,7 +55,22 @@ class SBUFTensor:
         self.tile_sizes = tile_sizes
         assert par_axis in tile_sizes, f"par_axis {par_axis} is not in tile_sizes {tile_sizes}."
 
-    def load(self, source: HBMTensor, coordinates: Dict[str, Dict[str, int]]) -> None:
+    def set_coordinates(self, global_coordinates: Dict[str, Dict[str, int]]) -> None:
+        """
+        Args:
+            global_coordinates (Dict[str, Dict[str, int]]): Region specification for each axis, where each axis maps to:
+                - "start": Starting index in the source tensor
+                - "size": Number of elements to load along this axis
+        """
+        assert set(global_coordinates.keys()) == set(self.tile_sizes.keys()), (
+            f"Axes mismatch:"
+            f"global_coordinates {global_coordinates},"
+            f"tile_sizes {self.tile_sizes}."
+            f"Do not have exactly the same axes."
+        )
+        self.global_coordinates = global_coordinates
+
+    def load(self, source: HBMTensor) -> None:
         """Load data from HBM tensor into SBUF tiles with automatic padding.
 
         Loads a region of the source tensor defined by coordinates into tiled SBUF memory.
@@ -63,17 +78,7 @@ class SBUFTensor:
 
         Args:
             source: HBM tensor to load data from
-            coordinates: Region specification for each axis, where each axis maps to:
-                - "start": Starting index in the source tensor
-                - "size": Number of elements to load along this axis
         """
-        assert set(coordinates.keys()) == set(self.tile_sizes.keys()), (
-            f"Axes mismatch:"
-            f"coordinates {coordinates},"
-            f"tile_sizes {self.tile_sizes}."
-            f"Do not have exactly the same axes."
-        )
-        self.global_coordinates = coordinates
         self.axes = source.axes
         assert len(self.axes) == 2, f"Expected 2 axes, got {len(self.axes)}: {self.axes}"
         par_axis, free_axis = self.axes[0], self.axes[1]
