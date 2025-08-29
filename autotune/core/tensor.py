@@ -70,7 +70,7 @@ class SBUFTensor:
         assert set(coordinates.keys()) == set(self.tile_sizes.keys()), (
             f"Axes mismatch:"
             f"coordinates {coordinates},"
-            f"tile_sizes has {self.tile_sizes}."
+            f"tile_sizes {self.tile_sizes}."
             f"Do not have exactly the same axes."
         )
         self.global_coordinates = coordinates
@@ -190,105 +190,3 @@ class SBUFTensor:
         column_mask = (column_tile_offset + column_tile_index) * column_tile_size + idx_tile.x < self.max_columns
         tile = self.tensor[idx_tile.p, row_tile_index, column_tile_index, idx_tile.x][row_mask][column_mask]
         return tile
-
-    def _pad_num_tiles(self, hbm_tensor: HBMTensor, num_tiles: Dict[str, int]) -> Dict[str, int]:
-        """Process and validate num_tiles parameter, expanding zero values to maximum possible tiles.
-
-        Converts num_tiles entries of 0 to the maximum number of tiles that can fit
-        for each axis given the tensor size, tile size, and tile offset. The maximum
-        tile count is calculated using math.ceil to handle cases where the tensor
-        dimension is not evenly divisible by the tile size (padding the last tile).
-        Also validates that requested tile counts are within valid bounds.
-
-        Args:
-            hbm_tensor: HBM tensor to calculate maximum tiles from
-            num_tiles: Dictionary mapping axis names to number of tiles per axis.
-                      Value of 0 means "load all remaining tiles from offset"
-
-        Returns:
-            Processed num_tiles dictionary with 0 values replaced by maximum possible tiles
-
-        Raises:
-            AssertionError: If any axis in num_tiles is not present in tile_sizes or tile_offsets
-            AssertionError: If any requested tile count exceeds maximum possible or is negative
-        """
-        # Validate all axes in num_tiles exist in tile_sizes and tile_offsets
-        for axis in num_tiles:
-            assert axis in self.tile_sizes, f"Axis '{axis}' not found in tile_sizes: {set(self.tile_sizes.keys())}"
-            assert (
-                axis in self.tile_offsets
-            ), f"Axis '{axis}' not found in tile_offsets: {set(self.tile_offsets.keys())}"
-            assert (
-                axis in hbm_tensor.sizes
-            ), f"Axis '{axis}' not found in HBM tensor sizes: {set(hbm_tensor.sizes.keys())}"
-
-        for axis in num_tiles:
-            axis_num_tiles = num_tiles[axis]
-            axis_size = hbm_tensor.sizes[axis]
-            tile_size = self.tile_sizes[axis]
-            tile_offset = self.tile_offsets[axis]
-
-            # Calculate maximum tiles available from the offset position
-            max_axis_num_tiles = math.ceil(axis_size / tile_size) - tile_offset
-
-            # Validate original input before modification
-            assert axis_num_tiles >= 0, f"num_tiles for axis '{axis}' must be non-negative, got {axis_num_tiles}"
-            assert axis_num_tiles <= max_axis_num_tiles, (
-                f"num_tiles for axis '{axis}' ({axis_num_tiles}) exceeds maximum possible "
-                f"({max_axis_num_tiles}) given tensor size {axis_size}, tile size {tile_size}, "
-                f"and tile offset {tile_offset}"
-            )
-
-            # Replace 0 with maximum possible tiles
-            if axis_num_tiles == 0:
-                num_tiles[axis] = max_axis_num_tiles
-
-        return num_tiles
-
-
-def linear_to_coordinates(linear_index: int, dimensions: dict, axes: Tuple[str, ...]) -> Tuple[int, ...]:
-    """
-    Convert a linear index to multi-dimensional coordinates.
-
-    Args:
-        linear_index (int): Linear index identifier
-        dimensions (dict): Dictionary mapping axis names to size along that axis
-                         e.g., {'M': 2, 'K': 1}
-        axes: Tuple of axis names in the desired output order
-
-    Returns:
-        Tuple[int, ...]: Tuple of coordinate values in the same order as axes
-                        e.g., (1, 0) for axes=('M', 'K')
-
-    Example:
-        >>> linear_to_coordinates(0, {'M': 2, 'K': 1}, ('M', 'K'))
-        (0, 0)
-        >>> linear_to_coordinates(1, {'M': 2, 'K': 1}, ('M', 'K'))
-        (1, 0)
-        >>> linear_to_coordinates(3, {'M': 2, 'K': 2, 'N': 2}, ('M', 'K', 'N'))
-        (1, 1, 0)
-    """
-    if not dimensions:
-        return ()
-
-    # Get axis names and sizes in a consistent order
-    sizes = [dimensions[axis] for axis in axes]
-
-    # Calculate strides for each dimension
-    # Stride for dimension i is the product of all dimensions to the right of i
-    strides = []
-    stride = 1
-    for i in range(len(sizes) - 1, -1, -1):
-        strides.insert(0, stride)
-        stride *= sizes[i]
-
-    # Convert linear index to multi-dimensional coordinates
-    coordinates = []
-    remaining_id = linear_index
-
-    for i, axis in enumerate(axes):
-        coordinate_value = remaining_id // strides[i]
-        coordinates.append(coordinate_value)
-        remaining_id = remaining_id % strides[i]
-
-    return tuple(coordinates)
