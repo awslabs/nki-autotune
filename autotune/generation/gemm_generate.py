@@ -124,31 +124,32 @@ class MetaGEMM:
                 lhs_tiles.tile_transpose()
         if self.op_positions["rhs"] == curr_position:
             rhs_tile_sizes: Dict[str, int] = {}
-            rhs_num_tiles: Dict[str, int] = {}
+            rhs_global_coordinates: Dict[str, Dict[str, int]] = {}
             for axis in self.axes["rhs"]:
                 rhs_tile_sizes[axis] = getattr(self.mm, f"TILE_{axis}")
+                rhs_global_coordinates[axis] = {}
                 if axis in loop_vars:
-                    rhs_num_tiles[axis] = getattr(self.mm, f"TILES_IN_BLOCK_{axis}")
+                    rhs_global_coordinates[axis]["start"] = loop_vars[axis] * getattr(self.mm, f"TILES_IN_BLOCK_{axis}")
+                    rhs_global_coordinates[axis]["size"] = getattr(self.mm, f"TILES_IN_BLOCK_{axis}")
                 else:
-                    rhs_num_tiles[axis] = getattr(self.mm, f"TILES_IN_{axis}")
-            rhs_tiles = SBUFTensor(par_axis=self.axes["rhs"][0], tile_sizes=rhs_tile_sizes, num_tiles=rhs_num_tiles)
-            rhs_tiles.load()
+                    rhs_global_coordinates[axis]["start"] = 0
+                    rhs_global_coordinates[axis]["size"] = getattr(self.mm, f"TILES_IN_{axis}")
+            rhs_tiles = SBUFTensor(par_axis=self.axes["rhs"][0], tile_sizes=rhs_tile_sizes)
+            rhs_tiles.load(source=self.rhs_hbm, coordinates=rhs_global_coordinates)
         if self.op_positions["result"] == curr_position:
             result_tile_sizes = {}
-            result_num_tiles = {}
             for axis in self.axes["result"]:
                 result_tile_sizes[axis] = getattr(self.mm, f"TILE_{axis}")
-                if axis in loop_vars:
-                    result_num_tiles[axis] = getattr(self.mm, f"TILES_IN_BLOCK_{axis}")
-                else:
-                    result_num_tiles[axis] = getattr(self.mm, f"TILES_IN_{axis}")
-            result_tiles = SBUFTensor(
-                par_axis=self.axes["result"][0], tile_sizes=result_tile_sizes, num_tiles=result_num_tiles
-            )
+            self.result_tiles = SBUFTensor(par_axis=self.axes["result"][0], tile_sizes=result_tile_sizes)
 
     def maybe_store(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["save"] == curr_position:
-            save_result_block()
+            # Calculate destination offset based on current loop variables
+            dst_ofs = (
+                loop_vars.get("M", 0) * getattr(self.mm, "TILES_IN_BLOCK_M", 1),
+                loop_vars.get("N", 0) * getattr(self.mm, "TILES_IN_BLOCK_N", 1),
+            )
+            save_result_block(self.result_hbm, self.result_tiles, dst_ofs)
 
 
 def str_to_dict(loop_order: str) -> Dict:
