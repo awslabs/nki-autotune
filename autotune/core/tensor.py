@@ -56,15 +56,17 @@ class SBUFTensor:
         assert par_axis in tile_sizes, f"par_axis {par_axis} is not in tile_sizes {tile_sizes}."
 
     def load(self, source: HBMTensor, coordinates: Dict[str, Dict[str, int]]) -> None:
-        """Load data from HBM tensor into SBUF tile by tile.
-        If coordinates go beyond source tensor, pad the loaded result with 0.
+        """Load data from HBM tensor into SBUF tiles with automatic padding.
+
+        Loads a region of the source tensor defined by coordinates into tiled SBUF memory.
+        Automatically pads with zeros if the requested region extends beyond tensor boundaries.
 
         Args:
-            source: Source HBM tensor to load from
-            coordinates[axis]["start"] = Starting element index for each axis
-            coordinates[axis]["size"] = Number of elements for each axis
+            source: HBM tensor to load data from
+            coordinates: Region specification for each axis, where each axis maps to:
+                - "start": Starting index in the source tensor
+                - "size": Number of elements to load along this axis
         """
-        # Ensure all dictionaries have the same axes
         assert set(coordinates.keys()) == set(self.tile_sizes.keys()), (
             f"Axes mismatch:"
             f"coordinates {coordinates},"
@@ -73,41 +75,28 @@ class SBUFTensor:
         )
         self.global_coordinates = coordinates
         self.axes = source.axes
-        num_tiles = self._pad_num_tiles(source, num_tiles)
-        self.max_rows, self.max_columns = source.sizes[self.axes[0]], source.sizes[self.axes[1]]
-        self.init_as_zero(num_tiles, source.tensor.dtype)
-        tile_indices = self.construct_tile_indices()
-        for indices in tile_indices:
-            print(indices, indices.shape)
+        assert len(self.axes) == 2, f"Expected 2 axes, got {len(self.axes)}: {self.axes}"
+        par_axis, free_axis = self.axes[0], self.axes[1]
+        num_par_tiles = math.ceil(self.global_coordinates[par_axis]["size"] / self.tile_sizes[par_axis])
+        num_free_tiles = math.ceil(self.global_coordinates[free_axis]["size"] / self.tile_sizes[free_axis])
 
-        total_num_tiles = math.prod(num_tiles.values())
+        # Set attributes needed by other methods
+        self.max_par_size = source.sizes[par_axis]
+        self.max_free_size = source.sizes[free_axis]
 
-        for tile_counter in nl.affine_range(total_num_tiles):
-            tile_coordinates = linear_to_coordinates(linear_index=tile_counter, dimensions=num_tiles, axes=self.axes)
-            sbuf_index = [tile_indices[0], *tile_coordinates, *tile_indices[1:]]
-            hbm_index = []
-            axis_masks = []
-            for axis, tile_id in zip(self.axes, tile_coordinates):
-                tile_size = self.tile_sizes[axis]
-                grid = tuple(None if i != index else slice(None) for i in range(len(self.tensor.shape)))
-                axis_indices = (tile_id + self.tile_offsets[axis]) * tile_size + nl.arange(tile_size)[grid]
-                hbm_index.append(axis_indices)
-            mask = None
-            for axis_mask in axis_masks:
-                if mask is None:
-                    mask = axis_mask
-                else:
-                    mask = mask & axis_mask
-            self.tensor[sbuf_index] = nl.load(source.tensor[hbm_index], mask=mask)
+        self.init_as_zero(num_tiles={par_axis: num_par_tiles, free_axis: num_free_tiles}, dtype=source.tensor.dtype)
+        par_indices = nl.arange(self.tile_sizes[par_axis])[:, None]
+        free_indices = nl.arange(self.tile_sizes[free_axis])[None, :]
 
-    def construct_tile_indices(self):
-        tile_indices = []
-        for index, size in enumerate(self.tensor.shape):
-            if index == 0 or index > len(self.axes):
-                grid = tuple(None if i != index else slice(None) for i in range(len(self.tensor.shape)))
-                axis_tile_indices = nl.arange(size)[grid]
-                tile_indices.append(axis_tile_indices)
-        return tile_indices
+        for par_tile_id in nl.affine_range(num_par_tiles):
+            for free_tile_id in nl.affine_range(num_free_tiles):
+                par_start = self.global_coordinates[par_axis]["start"] + par_tile_id * self.tile_sizes[par_axis]
+                free_start = self.global_coordinates[free_axis]["start"] + free_tile_id * self.tile_sizes[free_axis]
+                par_mask = par_start + par_indices < self.max_par_size
+                free_mask = free_start + free_indices < self.max_free_size
+                self.tensor[par_indices, par_tile_id, free_tile_id, free_indices] = nl.load(
+                    source.tensor[par_start + par_indices, free_start + free_indices], mask=par_mask & free_mask
+                )
 
     def init_as_zero(self, num_tiles: Dict[str, int], dtype):
         """
