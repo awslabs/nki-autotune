@@ -189,65 +189,33 @@ class GEMMCompatibility:
         return f"{header}{batch_info}\n{table}"
 
 
-def matmul_tensors(
-    lhs: SBUFTensor,
-    lhs_tile_offsets: Tuple[int, int],
-    rhs: SBUFTensor,
-    rhs_tile_offsets: Tuple[int, int],
-    result: SBUFTensor,
-    result_tile_offsets: Tuple[int, int],
-    compute_num_tiles: Tuple[int, int, int],
-    tile_transposed_lhs: bool,
-):
+def matmul_tensors(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBUFTensor, tile_transposed_lhs: bool):
     """
-    Perform tiled matrix multiplication between two SBUF blocks with flexible offsetting.
+    Perform tiled matrix multiplication between SBUF tiles.
 
-    Computes result_block += matmul(lhs_block, rhs_block) for specified tile regions
-    within each block. This function supports arbitrary tile-level offsetting within
-    blocks and maintains awareness of global matrix coordinates.
+    Computes result_tiles += matmul(lhs_tiles, rhs_tiles) for the overlapping regions within each block.
 
     Args:
-        lhs_block: Left-hand side matrix block stored in SBUF memory
-        lhs_tile_offsets: (M_offset, K_offset) - Starting tile coordinates within
-            lhs_block for the computation region
-        rhs_block: Right-hand side matrix block stored in SBUF memory
-        rhs_tile_offsets: (K_offset, N_offset) - Starting tile coordinates within
-            rhs_block for the computation region
-        result_block: Output matrix block stored in SBUF memory where results
+        lhs_tiles: Left-hand side matrix tiles stored in SBUF memory
+        rhs_tiles: Right-hand side matrix tiles stored in SBUF memory
+        result_tiles: Output matrix tiles stored in SBUF memory where results
             will be accumulated
-        result_tile_offsets: (M_offset, N_offset) - Starting tile coordinates within
-            result_block where outputs will be written
-        compute_num_tiles: (M_tiles, N_tiles, K_tiles) - Number of tiles to compute
-            along each dimension for this matmul operation
-        global_size: (M_total, N_total, K_total) - Total size in elements of the
-            complete matrices being multiplied (across all blocks)
-        tile_transposed_lhs: (bool) - Whether lhs_block is transposed at the tile level.
-        Note that this is not the same as lhsT_block.
-
-    Notes:
-        - global_size is specified in element units
-        - compute_num_tiles are specified in tile units, not element units
-        - The function performs accumulation (+=) into result_block
-        - The input blocks are part of larger complete input tensors.
-        - Local offsets are relative to the individual input blocks
-        - Global offsets track position within the complete inputs
+        tile_transposed_lhs: (bool) - Whether lhs_tiles is transposed at the tile level.
+        Note that this is not the same as lhsT_tiles.
     """
     if tile_transposed_lhs:
-        TILE_M, _, _, TILE_K = lhs.tensor.shape
-        lhs_M_tile_start, lhs_K_tile_start = lhs_tile_offsets
+        TILE_M, _, _, TILE_K = lhs_tiles.tensor.shape
     else:
-        TILE_K, _, _, TILE_M = lhs.tensor.shape
-        lhs_K_tile_start, lhs_M_tile_start = lhs_tile_offsets
-    _TILE_K, _, _, TILE_N = rhs.tensor.shape
-    _TILE_M, _, _, _TILE_N = result.tensor.shape
-    rhs_K_tile_start, rhs_N_tile_start = rhs_tile_offsets
-    result_M_tile_start, result_N_tile_start = result_tile_offsets
-    assert TILE_K == _TILE_K, f"lhs {lhs.tensor.shape} TILE_K mismatch with rhs {rhs.tensor.shape}"
+        TILE_K, _, _, TILE_M = lhs_tiles.tensor.shape
+    _TILE_K, _, _, TILE_N = rhs_tiles.tensor.shape
+    _TILE_M, _, _, _TILE_N = result_tiles.tensor.shape
+    assert (
+        TILE_K == _TILE_K
+    ), f"lhs_tiles {lhs_tiles.tensor.shape} TILE_K mismatch with rhs_tiles {rhs_tiles.tensor.shape}"
     assert (
         TILE_M == _TILE_M and TILE_N == _TILE_N
-    ), f"result {result.tensor.shape} shape mismatch with lhs {lhs.tensor.shape} @ rhs {rhs.tensor.shape}"
+    ), f"result_tiles {result_tiles.tensor.shape} shape mismatch with lhs_tiles {lhs_tiles.tensor.shape} @ rhs_tiles {rhs_tiles.tensor.shape}"
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    num_M_tiles, num_N_tiles, num_K_tiles = compute_num_tiles
 
     for tile_id_M in nl.affine_range(num_M_tiles):
         lhs_M_tile_index = lhs_M_tile_start + tile_id_M
