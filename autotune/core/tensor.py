@@ -117,8 +117,8 @@ class SBUFTensor:
         assert len(source.axes) == 2, f"Expected 2 axes, got {len(source.axes)}: {source.axes}"
 
         # Set attributes needed by other methods
-        max_par_size = source.sizes[self.par_axis]
-        max_free_size = source.sizes[self.free_axis]
+        self.max_par_size = source.sizes[self.par_axis]
+        self.max_free_size = source.sizes[self.free_axis]
 
         self.init_as_zero(dtype=source.tensor.dtype)
         par_indices = nl.arange(self.tile_sizes[self.par_axis])[:, None]
@@ -129,10 +129,10 @@ class SBUFTensor:
 
         for par_tile_id in nl.affine_range(self.global_coordinates[self.par_axis]["num_tiles"]):
             par_start = (par_tile_offset + par_tile_id) * self.tile_sizes[self.par_axis]
-            par_mask = par_start + par_indices < max_par_size
+            par_mask = par_start + par_indices < self.max_par_size
             for free_tile_id in nl.affine_range(self.global_coordinates[self.free_axis]["num_tiles"]):
                 free_start = (free_tile_offset + free_tile_id) * self.tile_sizes[self.free_axis]
-                free_mask = free_start + free_indices < max_free_size
+                free_mask = free_start + free_indices < self.max_free_size
                 self.tensor[par_indices, par_tile_id, free_tile_id, free_indices] = nl.load(
                     source.tensor[par_start + par_indices, free_start + free_indices], mask=par_mask & free_mask
                 )
@@ -160,18 +160,18 @@ class SBUFTensor:
         Returns:
             HBM tensor containing the dumped data
         """
-        row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = self.tensor.shape
-        row_size = int(row_num_tiles * row_tile_size)
-        column_size = int(column_num_tiles * column_tile_size)
-        idx_res = nl.mgrid[0:row_tile_size, 0:column_tile_size]
-        result = nl.ndarray((row_size, column_size), dtype=self.tensor.dtype, buffer=nl.shared_hbm)
-        for row_tile_id in nl.affine_range(row_num_tiles):
-            row_indices = row_tile_id * row_tile_size + idx_res.p
-            for column_tile_id in nl.affine_range(column_num_tiles):
-                column_indices = column_tile_id * column_tile_size + idx_res.x
+        par_tile_size, par_num_tiles, free_num_tiles, free_tile_size = self.tensor.shape
+        par_size = int(par_num_tiles * par_tile_size)
+        free_size = int(free_num_tiles * free_tile_size)
+        idx_res = nl.mgrid[0:par_tile_size, 0:free_tile_size]
+        result = nl.ndarray((par_size, free_size), dtype=self.tensor.dtype, buffer=nl.shared_hbm)
+        for par_tile_id in nl.affine_range(par_num_tiles):
+            par_indices = par_tile_id * par_tile_size + idx_res.p
+            for free_tile_id in nl.affine_range(free_num_tiles):
+                free_indices = free_tile_id * free_tile_size + idx_res.x
                 nl.store(
-                    result[row_indices, column_indices],
-                    value=self.tensor[idx_res.p, row_tile_id, column_tile_id, idx_res.x],
+                    result[par_indices, free_indices],
+                    value=self.tensor[idx_res.p, par_tile_id, free_tile_id, idx_res.x],
                 )
         return result
 
@@ -188,28 +188,29 @@ class SBUFTensor:
             tileT_dtype = np.float32
 
         idx_transp = nl.mgrid[0:pmax, 0:pmax]
-        row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = self.tensor.shape
-        num_row_transp_tiles = math.ceil(row_tile_size / pmax)
-        num_column_transp_tiles = math.ceil(column_tile_size / pmax)
-        row_tile_offset, column_tile_offset = self.tile_offsets[self.axes[0]], self.tile_offsets[self.axes[1]]
+        par_tile_size, num_par_tiles, num_free_tiles, free_tile_size = self.tensor.shape
+        num_par_transp_tiles = math.ceil(par_tile_size / pmax)
+        num_free_transp_tiles = math.ceil(free_tile_size / pmax)
+        par_tile_offset = self.global_coordinates[self.par_axis]["start_tile_index"]
+        free_tile_offset = self.global_coordinates[self.free_axis]["start_tile_index"]
 
-        for row_tile_id in nl.affine_range(row_num_tiles):
-            for column_tile_id in nl.affine_range(column_num_tiles):
-                for row_transp_tile_id in nl.affine_range(num_row_transp_tiles):
-                    row_indices = row_transp_tile_id * pmax + idx_transp.p
-                    row_mask = (row_tile_offset + row_tile_id) * row_tile_size + row_indices < self.max_rows
-                    for column_transp_tile_id in nl.affine_range(num_column_transp_tiles):
-                        column_indices = column_transp_tile_id * pmax + idx_transp.x
-                        column_mask = (
-                            column_tile_offset + column_tile_id
-                        ) * column_tile_size + column_indices < self.max_columns
-                        mask = row_mask & column_mask
+        for par_tile_id in nl.affine_range(num_par_tiles):
+            for free_tile_id in nl.affine_range(num_free_tiles):
+                for par_transp_tile_id in nl.affine_range(num_par_transp_tiles):
+                    par_indices = par_transp_tile_id * pmax + idx_transp.p
+                    par_mask = (par_tile_offset + par_tile_id) * par_tile_size + par_indices < self.max_par_size
+                    for free_transp_tile_id in nl.affine_range(num_free_transp_tiles):
+                        free_indices = free_transp_tile_id * pmax + idx_transp.x
+                        free_mask = (
+                            free_tile_offset + free_tile_id
+                        ) * free_tile_size + free_indices < self.max_free_size
+                        mask = par_mask & free_mask
 
                         tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=tileT_dtype, buffer=nl.psum)
                         tileT[idx_transp.p, idx_transp.x] = nisa.nc_transpose(
-                            self.tensor[row_indices, row_tile_id, column_tile_id, column_indices], mask=mask
+                            self.tensor[par_indices, par_tile_id, free_tile_id, free_indices], mask=mask
                         )
-                        self.tensor[row_indices, row_tile_id, column_tile_id, column_indices] = nl.copy(
+                        self.tensor[par_indices, par_tile_id, free_tile_id, free_indices] = nl.copy(
                             tileT, dtype=self.tensor.dtype
                         )
 
@@ -222,11 +223,10 @@ class SBUFTensor:
         Returns:
             The requested tile as a tensor
         """
-        row_tile_size, row_num_tiles, column_num_tiles, column_tile_size = self.tensor.shape
-        row_tile_index, column_tile_index = tile_indices[self.axes[0]], tile_indices[self.axes[1]]
-        row_tile_offset, column_tile_offset = self.tile_offsets[self.axes[0]], self.tile_offsets[self.axes[1]]
-        idx_tile = nl.mgrid[0:row_tile_size, 0:column_tile_size]
-        row_mask = (row_tile_offset + row_tile_index) * row_tile_size + idx_tile.p < self.max_rows
-        column_mask = (column_tile_offset + column_tile_index) * column_tile_size + idx_tile.x < self.max_columns
-        tile = self.tensor[idx_tile.p, row_tile_index, column_tile_index, idx_tile.x][row_mask][column_mask]
+        par_tile_size, par_num_tiles, free_num_tiles, free_tile_size = self.tensor.shape
+        par_tile_index = tile_indices[self.par_axis]
+        free_tile_index = tile_indices[self.free_axis]
+
+        idx_tile = nl.mgrid[0:par_tile_size, 0:free_tile_size]
+        tile = self.tensor[idx_tile.p, par_tile_index, free_tile_index, idx_tile.x]
         return tile
