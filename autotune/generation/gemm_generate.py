@@ -8,7 +8,7 @@ from typing import Any, Dict, Tuple
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 
-from autotune.core.tensor import GlobalCoordinates, HBMTensor, SBUFTensor
+from autotune.core.tensor import HBMTensor, SBUFTensor, TileCoordinates
 from autotune.generation.generate import generate_configs
 from autotune.modules.dma import save_result_block
 from autotune.modules.matmul import GEMMConfig, matmul_tensors
@@ -122,7 +122,7 @@ class MetaGEMM:
     def maybe_init(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["lhs"] == curr_position:
             lhs_tile_sizes: Dict[str, int] = {}
-            lhs_global_coordinates = GlobalCoordinates()
+            lhs_tile_coordinates = TileCoordinates()
             for axis in self.axes["lhs"]:
                 lhs_tile_sizes[axis] = getattr(self.gemm_config, f"TILE_{axis}")
                 if axis in loop_vars:
@@ -131,15 +131,15 @@ class MetaGEMM:
                 else:
                     start_tile_index = 0
                     num_tiles = getattr(self.gemm_config, f"TILES_IN_{axis}")
-                lhs_global_coordinates.add_axis(axis, start_tile_index, num_tiles)
+                lhs_tile_coordinates.add_axis(axis, start_tile_index, num_tiles)
             self.lhs_tiles = SBUFTensor(par_axis=self.axes["lhs"][0], tile_sizes=lhs_tile_sizes)
-            self.lhs_tiles.set_coordinates(lhs_global_coordinates)
+            self.lhs_tiles.set_coordinates(lhs_tile_coordinates)
             self.lhs_tiles.load(source=self.lhs_hbm)
             if not self.transposed_lhs:
                 self.lhs_tiles.tile_transpose()
         if self.op_positions["rhs"] == curr_position:
             rhs_tile_sizes: Dict[str, int] = {}
-            rhs_global_coordinates = GlobalCoordinates()
+            rhs_tile_coordinates = TileCoordinates()
             for axis in self.axes["rhs"]:
                 rhs_tile_sizes[axis] = getattr(self.gemm_config, f"TILE_{axis}")
                 if axis in loop_vars:
@@ -148,13 +148,13 @@ class MetaGEMM:
                 else:
                     start_tile_index = 0
                     num_tiles = getattr(self.gemm_config, f"TILES_IN_{axis}")
-                rhs_global_coordinates.add_axis(axis, start_tile_index, num_tiles)
+                rhs_tile_coordinates.add_axis(axis, start_tile_index, num_tiles)
             self.rhs_tiles = SBUFTensor(par_axis=self.axes["rhs"][0], tile_sizes=rhs_tile_sizes)
-            self.rhs_tiles.set_coordinates(rhs_global_coordinates)
+            self.rhs_tiles.set_coordinates(rhs_tile_coordinates)
             self.rhs_tiles.load(source=self.rhs_hbm)
         if self.op_positions["result"] == curr_position:
             result_tile_sizes = {}
-            result_global_coordinates = GlobalCoordinates()
+            result_tile_coordinates = TileCoordinates()
             for axis in self.axes["result"]:
                 result_tile_sizes[axis] = getattr(self.gemm_config, f"TILE_{axis}")
                 if axis in loop_vars:
@@ -163,9 +163,9 @@ class MetaGEMM:
                 else:
                     start_tile_index = 0
                     num_tiles = getattr(self.gemm_config, f"TILES_IN_{axis}")
-                result_global_coordinates.add_axis(axis, start_tile_index, num_tiles)
+                result_tile_coordinates.add_axis(axis, start_tile_index, num_tiles)
             self.result_tiles = SBUFTensor(par_axis=self.axes["result"][0], tile_sizes=result_tile_sizes)
-            self.result_tiles.set_coordinates(result_global_coordinates)
+            self.result_tiles.set_coordinates(result_tile_coordinates)
 
     def maybe_store(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["save"] == curr_position:
