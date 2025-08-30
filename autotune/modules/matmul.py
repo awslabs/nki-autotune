@@ -6,6 +6,7 @@ import neuronxcc.nki.language as nl
 import numpy as np
 import tabulate
 
+from autotune.core.metrics import check_correctness
 from autotune.core.tensor import SBUFTensor
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
@@ -127,7 +128,72 @@ class GEMMConfig:
         return f"{header}\n{table}"
 
 
-def matmul_tensors(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBUFTensor, tile_transposed_lhs: bool):
+def calculate_tile_overlap(coords1: dict, coords2: dict) -> tuple:
+    """
+    Calculate the overlapping tile region between two tile coordinate ranges.
+
+    Args:
+        coords1: First tile coordinates dictionary with 'start_tile_index' and 'num_tiles'
+        coords2: Second tile coordinates dictionary with 'start_tile_index' and 'num_tiles'
+
+    Returns:
+        Tuple of (overlap_start, overlap_end, num_overlap_tiles)
+    """
+    start1 = coords1["start_tile_index"]
+    end1 = start1 + coords1["num_tiles"]
+    start2 = coords2["start_tile_index"]
+    end2 = start2 + coords2["num_tiles"]
+
+    overlap_start = max(start1, start2)
+    overlap_end = min(end1, end2)
+    num_overlap_tiles = max(0, overlap_end - overlap_start)
+
+    return overlap_start, overlap_end, num_overlap_tiles
+
+
+def calculate_tile_overlap_ranges(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBUFTensor) -> dict:
+    """
+    Calculate the overlapping tile ranges for matrix multiplication.
+
+    Args:
+        lhs_tiles: Left-hand side SBUF tensor
+        rhs_tiles: Right-hand side SBUF tensor
+        result_tiles: Result SBUF tensor
+
+    Returns:
+        Dictionary containing:
+        - num_tiles: (num_M_tiles, num_N_tiles, num_K_tiles)
+        - global_ranges: Dictionary with global tile ranges for each dimension
+            - M_range: (M_start, M_end)
+            - N_range: (N_start, N_end)
+            - K_range: (K_start, K_end)
+        - result_offsets: (M_offset, N_offset) for result tensor local indexing
+    """
+    # Get tile coordinates from each tensor
+    lhs_M_coords = lhs_tiles.tile_coordinates["M"]
+    lhs_K_coords = lhs_tiles.tile_coordinates["K"]
+    rhs_K_coords = rhs_tiles.tile_coordinates["K"]
+    rhs_N_coords = rhs_tiles.tile_coordinates["N"]
+    result_M_coords = result_tiles.tile_coordinates["M"]
+    result_N_coords = result_tiles.tile_coordinates["N"]
+
+    # Calculate overlapping regions for each dimension (in global coordinates)
+    K_start, K_end, num_K_tiles = calculate_tile_overlap(lhs_K_coords, rhs_K_coords)
+    M_start, M_end, num_M_tiles = calculate_tile_overlap(lhs_M_coords, result_M_coords)
+    N_start, N_end, num_N_tiles = calculate_tile_overlap(rhs_N_coords, result_N_coords)
+
+    # Calculate local offsets for result tensor (still needed for direct tensor access)
+    result_M_offset = M_start - result_M_coords["start_tile_index"]
+    result_N_offset = N_start - result_N_coords["start_tile_index"]
+
+    return {
+        "num_tiles": (num_M_tiles, num_N_tiles, num_K_tiles),
+        "global_ranges": {"M_range": (M_start, M_end), "N_range": (N_start, N_end), "K_range": (K_start, K_end)},
+        "result_offsets": (result_M_offset, result_N_offset),
+    }
+
+
+def matmul_tiles(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBUFTensor, tile_transposed_lhs: bool):
     """
     Perform tiled matrix multiplication between SBUF tiles.
 
@@ -155,22 +221,32 @@ def matmul_tensors(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: S
     ), f"result_tiles {result_tiles.tensor.shape} shape mismatch with lhs_tiles {lhs_tiles.tensor.shape} @ rhs_tiles {rhs_tiles.tensor.shape}"
     idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
 
-    for tile_id_M in nl.affine_range(num_M_tiles):
-        lhs_M_tile_index = lhs_M_tile_start + tile_id_M
-        for tile_id_N in nl.affine_range(num_N_tiles):
-            rhs_N_tile_index = rhs_N_tile_start + tile_id_N
+    # Calculate overlapping regions using the helper function
+    overlap_info = calculate_tile_overlap_ranges(lhs_tiles, rhs_tiles, result_tiles)
+    num_M_tiles, num_N_tiles, num_K_tiles = overlap_info["num_tiles"]
+    M_start, M_end = overlap_info["global_ranges"]["M_range"]
+    N_start, N_end = overlap_info["global_ranges"]["N_range"]
+    K_start, K_end = overlap_info["global_ranges"]["K_range"]
+    result_M_offset, result_N_offset = overlap_info["result_offsets"]
+
+    # Iterate over tiles using nl.affine_range for hardware optimization
+    for tile_idx_M in nl.affine_range(num_M_tiles):
+        global_M_tile = M_start + tile_idx_M
+        for tile_idx_N in nl.affine_range(num_N_tiles):
+            global_N_tile = N_start + tile_idx_N
             """
             Use PSUM buffer to accumulate into a single hardware tile
             """
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            for tile_id_K in nl.affine_range(num_K_tiles):
-                lhs_K_tile_index = lhs_K_tile_start + tile_id_K
-                rhs_K_tile_index = rhs_K_tile_start + tile_id_K
-                lhs_tile = lhs.read_tile(tile_indices={"M": lhs_M_tile_index, "K": lhs_K_tile_index})
-                rhs_tile = rhs.read_tile(tile_indices={"K": rhs_K_tile_index, "N": rhs_N_tile_index})
+            for tile_idx_K in nl.affine_range(num_K_tiles):
+                global_K_tile = K_start + tile_idx_K
+                # Read tiles using global indices (the read_tile method now handles conversion)
+                lhs_tile = lhs_tiles.read_tile(tile_indices={"M": global_M_tile, "K": global_K_tile})
+                rhs_tile = rhs_tiles.read_tile(tile_indices={"K": global_K_tile, "N": global_N_tile})
                 result_tile += nisa.nc_matmul(lhs_tile, rhs_tile)
-            result.tensor[
-                idx_res.p, result_M_tile_start + tile_id_M, result_N_tile_start + tile_id_N, idx_res.x
+            # Store result using local indices for direct tensor access
+            result_tiles.tensor[
+                idx_res.p, result_M_offset + tile_idx_M, result_N_offset + tile_idx_N, idx_res.x
             ] += result_tile[idx_res.p, idx_res.x]
 
 
@@ -306,140 +382,8 @@ class GEMMCorrectness:
             golden = nl.static_cast(lhs_rhs_gemm_np(lhs, rhs), data_type)
         nki_out_tensor = nl.static_cast(nki_out_tensors[0], data_type)
 
-        # Calculate absolute and relative differences
-        abs_diff = np.abs(nki_out_tensor - golden)
-        # Avoid division by zero in relative difference calculation
-        rel_diff = np.divide(abs_diff, np.abs(golden), out=np.zeros_like(abs_diff), where=np.abs(golden) != 0)
-
-        # Calculate tolerance threshold using numpy's allclose formula
-        tolerance = atol + rtol * np.abs(golden)
-        mismatches = abs_diff > tolerance
-        total_mismatches = np.sum(mismatches)
-        total_elements = golden.size
-
-        if total_mismatches > 0:
-            # Calculate statistics
-            mismatch_percentage = (total_mismatches / total_elements) * 100
-            max_abs_diff = np.max(abs_diff)
-            max_rel_diff = np.max(rel_diff)
-
-            # Generate error message with statistics and mismatch regions
-            regions_summary = self._generate_mismatch_summary(mismatches)
-
-            err_msg = (
-                f"Mismatched elements: {total_mismatches} / {total_elements} ({mismatch_percentage:.6f}%)\n"
-                f"Max absolute difference: {max_abs_diff}\n"
-                f"Max relative difference: {max_rel_diff}\n"
-                f"{regions_summary}"
-            )
-
-            # Raise custom assertion error
-            raise AssertionError(err_msg)
-
-    def _generate_mismatch_summary(self, mismatches):
-        """Generate a summary of contiguous regions with mismatches."""
-        if len(mismatches.shape) == 2:  # For 2D arrays
-            return self._summarize_2d_mismatches(mismatches)
-        else:
-            # For other dimensions
-            return self._summarize_nd_mismatches(mismatches)
-
-    def _summarize_2d_mismatches(self, mismatches):
-        """Summarize mismatches in 2D arrays as contiguous regions, sorted by size."""
-        total_mismatches = np.sum(mismatches)
-
-        if total_mismatches == 0:
-            return "No mismatches found."
-
-        if total_mismatches == 1:
-            row, col = np.where(mismatches)
-            return f"Only element [{row[0]}, {col[0]}] is wrong."
-
-        # Find contiguous regions
-        region_info = []  # Will store (size, r_start, c_start, r_end, c_end) tuples
-        rows, cols = mismatches.shape
-
-        # Process the array to find rectangular regions
-        visited = np.zeros_like(mismatches, dtype=bool)
-
-        for r in range(rows):
-            for c in range(cols):
-                if mismatches[r, c] and not visited[r, c]:
-                    # Find the largest rectangle starting at (r,c)
-                    max_r, max_c = r, c
-
-                    # Extend rows
-                    while max_r + 1 < rows and mismatches[max_r + 1, c]:
-                        max_r += 1
-
-                    # Find the maximum width for this range of rows
-                    width = 1
-                    while c + width < cols:
-                        can_extend = True
-                        for row_idx in range(r, max_r + 1):
-                            if not mismatches[row_idx, c + width]:
-                                can_extend = False
-                                break
-                        if can_extend:
-                            width += 1
-                        else:
-                            break
-
-                    # Mark this region as visited
-                    visited[r : max_r + 1, c : c + width] = True
-
-                    # Calculate region size
-                    region_size = (max_r - r + 1) * width
-
-                    # Add region info: (size, r_start, c_start, r_end, c_end)
-                    region_info.append((region_size, r, c, max_r, c + width - 1))
-
-        # Sort regions by size (descending) and then by coordinates (ascending)
-        # For ties in size, sort by row_start, then col_start
-        region_info.sort(key=lambda x: (-x[0], x[1], x[2]))
-
-        # Format region strings
-        region_strings = []
-        for i, (size, r_start, c_start, r_end, c_end) in enumerate(region_info):
-            # Only display top 10 regions if there are more than 10
-            if i >= 10 and len(region_info) > 10:
-                remaining = len(region_info) - 10
-                region_strings.append(f"... {remaining} more regions not shown")
-                break
-
-            if r_start == r_end and c_start == c_end:
-                region_strings.append(f"[{r_start}, {c_start}] (size: {size})")
-            else:
-                region_strings.append(f"[{r_start}:{r_end+1}, {c_start}:{c_end+1}] (size: {size})")
-
-        if len(region_strings) == 1:
-            return f"Elements {region_strings[0]} are wrong."
-        else:
-            total_regions = len(region_info)
-            header = f"Found {total_regions} mismatched regions, sorted by size (largest first):"
-            return f"{header}\n" + "\n".join(region_strings)
-
-    def _summarize_nd_mismatches(self, mismatches):
-        """Handle mismatches in arrays with dimensions other than 2."""
-        total_mismatches = np.sum(mismatches)
-        if total_mismatches == 1:
-            coords = np.where(mismatches)
-            coord_str = ", ".join(str(dim[0]) for dim in coords)
-            return f"Only element [{coord_str}] is wrong."
-
-        # For higher dimensions, just report the total and some examples
-        coords = np.where(mismatches)
-        # Get up to 5 examples
-        examples = []
-        for i in range(min(5, total_mismatches)):
-            example = "[" + ", ".join(str(dim[i]) for dim in coords) + "]"
-            examples.append(example)
-
-        example_str = ", ".join(examples)
-        if total_mismatches > 5:
-            example_str += ", ..."
-
-        return f"Found {total_mismatches} mismatches. Examples: {example_str}"
+        # Use the centralized check_correctness function from metrics module
+        check_correctness(golden, nki_out_tensor, atol, rtol)
 
 
 def lhs_rhs_gemm_np(lhs, rhs):
