@@ -10,17 +10,29 @@ from autotune.core.tensor import SBUFTensor
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
 
-class GEMMCompatibility:
+class GEMMConfig:
     """
-    Validates compatibility of input shapes and parameters for GEMM operations.
+    Configuration and validation for GEMM (General Matrix Multiplication) operations.
 
-    This class checks whether the given matrix dimensions can be properly
-    divided into blocks and tiles according to hardware constraints.
+    Manages matrix blocking and tiling parameters for efficient GEMM computation on
+    specialized hardware. Validates that input matrix dimensions are compatible with
+    the specified blocking strategy and hardware tile constraints.
+
+    The class calculates block and tile arrangements using the formula:
+    Dimension = NUM_BLOCKS x TILES_PER_BLOCK x TILE_SIZE
+
+    Hardware tile sizes:
+    - TILE_M: 128 (stationary dimension)
+    - TILE_N: 512 (moving dimension)
+    - TILE_K: 128 (contraction dimension)
+
+    Args:
+        transposed_lhs: If True, treats LHS matrix as transposed (KxM instead of MxK)
     """
 
     def __init__(self, transposed_lhs: bool) -> None:
         """
-        Initialize GEMM compatibility checker.
+        Initialize GEMM config.
 
         Args:
             transposed_lhs: Whether the LHS matrix should be interpreted as transposed.
@@ -31,74 +43,16 @@ class GEMMCompatibility:
         self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
         self.TILE_K = nl.tile_size.pmax  # 128
 
-    def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE):
+    def __call__(
+        self,
+        lhs_shape: Tuple[int, int],
+        rhs_shape: Tuple[int, int],
+        NUM_BLOCK_M: int,
+        NUM_BLOCK_N: int,
+        NUM_BLOCK_K: int,
+    ) -> None:
         """
-        Check compatibility of input tensors for GEMM operation with specified parameters.
-
-        Args:
-            input_tensors: Tuple containing (lhs, rhs) matrices for GEMM operation.
-                lhs_shape: Shape of left-hand side matrix, either (M,K) or (batch,M,K)
-                           If transposed_lhs is True, dimensions are interpreted as (K,M) or (batch,K,M)
-                rhs_shape: Shape of right-hand side matrix, expected to be (K,N)
-            kernel_kwargs: Dictionary containing kernel parameters:
-                NUM_BLOCK_M: Number of blocks in M dimension
-                NUM_BLOCK_N: Number of blocks in N dimension
-                NUM_BLOCK_K: Number of blocks in K dimension, or None to skip K blocking
-
-        Raises:
-            Exception: If matrix shapes are incompatible or cannot be properly divided
-                       into the specified number of blocks and tiles.
-        """
-        lhs, rhs = input_tensors
-        lhs_shape = lhs.shape
-        rhs_shape = rhs.shape
-        NUM_BLOCK_M: int = kernel_kwargs.get("NUM_BLOCK_M", 1)
-        NUM_BLOCK_N: int = kernel_kwargs.get("NUM_BLOCK_N", 1)
-        NUM_BLOCK_K: int = kernel_kwargs.get("NUM_BLOCK_K", 1)
-        if len(rhs_shape) != 2:
-            raise Exception(f"Expecting (K, N) in RHS. Received {rhs_shape}.")
-
-        self.batch = None
-        if len(lhs_shape) == 2:
-            if self.transposed_lhs:
-                self.K, self.M = lhs_shape
-            else:
-                self.M, self.K = lhs_shape
-        elif len(lhs_shape) == 3:
-            if self.transposed_lhs:
-                self.batch, self.K, self.M = lhs_shape
-            else:
-                self.batch, self.M, self.K = lhs_shape
-        else:
-            raise Exception(f"lhs_shape must be either 2D or (batch, 2D). Received {lhs_shape}.")
-
-        K_, self.N = rhs_shape
-
-        # Validate dimensions > 0
-        for dim_name, dim_value in [("M", self.M), ("K", self.K), ("N", self.N)]:
-            if dim_value <= 0:
-                raise Exception(f"Dimension {dim_name} must be positive, got {dim_value}")
-
-        # Number of blocks (None means no blocking in that dimension)
-        self.NUM_BLOCK_M = NUM_BLOCK_M
-        self.NUM_BLOCK_N = NUM_BLOCK_N
-        self.NUM_BLOCK_K = NUM_BLOCK_K
-
-        # Calculate derived sizes
-        self._calculate_sizes()
-
-        # Validate contraction dimension matches
-        if self.K != K_:
-            raise Exception(
-                f"Contraction dimension mismatch: LHS {lhs_shape} has K={self.K}, RHS {rhs_shape} has K={K_}"
-            )
-
-        # Validate dimensions
-        # self._check()
-
-    def _calculate_sizes(self) -> None:
-        """
-        Calculate derived sizes for each dimension (M, N, K).
+        Calculate sizes for each dimension (M, N, K).
 
         NUM_BLOCK_X * TILES_IN_BLOCK_X * TILE_X = X
         BLOCK_X = TILES_IN_BLOCK_X * TILE_X
@@ -108,85 +62,69 @@ class GEMMCompatibility:
         - Block size (dimension divided by number of blocks)
         - Number of tiles in each block (block size divided by tile size)
         - Total number of tiles in the dimension (dimension size divided by tile size)
-
-        Results are stored as attributes on the class instance.
         """
-        # Calculate sizes for M dimension
-        num_block_m = 1 if self.NUM_BLOCK_M is None else self.NUM_BLOCK_M
-        self.TILES_IN_BLOCK_M = math.ceil(self.M / num_block_m / self.TILE_M)
+        if self.transposed_lhs:
+            self.K, self.M = lhs_shape
+        else:
+            self.M, self.K = lhs_shape
+        K_, self.N = rhs_shape
+        assert (
+            self.K == K_
+        ), f"Contraction dimension mismatch: LHS {lhs_shape} has K={self.K}, RHS {rhs_shape} has K={K_}"
+
+        # Single tile sizes (hardware constants)
+        self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+        self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+        self.TILE_K = nl.tile_size.pmax  # 128
+
+        self.NUM_BLOCK_M = NUM_BLOCK_M
+        self.NUM_BLOCK_N = NUM_BLOCK_N
+        self.NUM_BLOCK_K = NUM_BLOCK_K
+
+        self.TILES_IN_BLOCK_M = math.ceil(self.M / self.NUM_BLOCK_M / self.TILE_M)
         self.BLOCK_M = int(self.TILES_IN_BLOCK_M * self.TILE_M)
-        self.TILES_IN_M = int(num_block_m * self.TILES_IN_BLOCK_M)
+        self.TILES_IN_M = int(self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M)
 
-        # Calculate sizes for N dimension
-        num_block_n = 1 if self.NUM_BLOCK_N is None else self.NUM_BLOCK_N
-        self.TILES_IN_BLOCK_N = math.ceil(self.N / num_block_n / self.TILE_N)
+        self.TILES_IN_BLOCK_N = math.ceil(self.N / self.NUM_BLOCK_N / self.TILE_N)
         self.BLOCK_N = int(self.TILES_IN_BLOCK_N * self.TILE_N)
-        self.TILES_IN_N = int(num_block_n * self.TILES_IN_BLOCK_N)
+        self.TILES_IN_N = int(self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N)
 
-        # Calculate sizes for K dimension
-        num_block_k = 1 if self.NUM_BLOCK_K is None else self.NUM_BLOCK_K
-        self.TILES_IN_BLOCK_K = math.ceil(self.K / num_block_k / self.TILE_K)
+        self.TILES_IN_BLOCK_K = math.ceil(self.K / self.NUM_BLOCK_K / self.TILE_K)
         self.BLOCK_K = int(self.TILES_IN_BLOCK_K * self.TILE_K)
-        self.TILES_IN_K = int(num_block_k * self.TILES_IN_BLOCK_K)
-
-    def _check(self) -> None:
-        """
-        Validate that dimensions can be evenly divided into blocks and tiles.
-
-        Verifies that for each dimension (M, N, K):
-        1. The dimension size can be evenly divided into the specified number of blocks
-        2. Each block can be evenly divided into tiles
-
-        Raises:
-            Exception: If any dimension cannot be evenly divided as required.
-        """
-        for dimension in ["M", "N", "K"]:
-            size = getattr(self, f"{dimension}")
-            num_block = getattr(self, f"NUM_BLOCK_{dimension}")
-
-            # Handle dimensions with no blocking
-            if num_block is None:
-                num_block = 1
-
-            tiles_in_block = getattr(self, f"TILES_IN_BLOCK_{dimension}")
-            tile_size = getattr(self, f"TILE_{dimension}")
-
-            # Check even division
-            if num_block * tiles_in_block * tile_size != size:
-                raise Exception(
-                    f"{dimension} size {size} cannot be divided evenly into "
-                    f"{num_block} blocks * {tiles_in_block} tiles * {tile_size}"
-                )
+        self.TILES_IN_K = int(self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K)
 
     def __repr__(self) -> str:
         """
-        Return a string representation of the GEMM compatibility checker as a table.
+        Return a comprehensive string representation of the GEMM configuration.
 
         Returns:
-            A formatted table showing the configuration parameters.
+            Formatted string showing configuration parameters and computed values.
         """
-        header = f"GEMMCompatibility(transposed_lhs={self.transposed_lhs})"
+        class_name = self.__class__.__name__
+        header = f"{class_name}(transposed_lhs={self.transposed_lhs})"
 
-        # Check if dimensions have been set (after __call__ has been invoked)
+        # Check if dimensions have been configured (after __call__ has been invoked)
         if not hasattr(self, "M"):
-            return f"{header}\n(Dimensions not yet set - call the object with matrices to validate)"
+            return f"{header}\n  Status: Not configured - call with input matrices first"
 
-        # Format batch info if available
-        batch_info = f" (batch={self.batch})" if self.batch is not None else ""
-
-        # Create table data
+        # Create comprehensive table data with better organization
         table_data = [
-            ["Dimension", self.M, self.N, self.K],
-            ["Num blocks", self.NUM_BLOCK_M, self.NUM_BLOCK_N, self.NUM_BLOCK_K],
+            ["Matrix dimensions", self.M, self.N, self.K],
+            ["Block count", self.NUM_BLOCK_M, self.NUM_BLOCK_N, self.NUM_BLOCK_K],
             ["Block size", self.BLOCK_M, self.BLOCK_N, self.BLOCK_K],
-            ["Tiles/block", self.TILES_IN_BLOCK_M, self.TILES_IN_BLOCK_N, self.TILES_IN_BLOCK_K],
-            ["Tile size", self.TILE_M, self.TILE_N, self.TILE_K],
+            ["Tiles per block", self.TILES_IN_BLOCK_M, self.TILES_IN_BLOCK_N, self.TILES_IN_BLOCK_K],
+            ["Total tiles", self.TILES_IN_M, self.TILES_IN_N, self.TILES_IN_K],
+            ["Hardware tile size", self.TILE_M, self.TILE_N, self.TILE_K],
         ]
 
-        # Generate the table with headers
-        table = tabulate.tabulate(table_data, headers=["Parameter", "M", "N", "K"], tablefmt="grid")
-
-        return f"{header}{batch_info}\n{table}"
+        # Generate formatted table
+        table = tabulate.tabulate(
+            table_data,
+            headers=["Parameter", "M (rows)", "N (cols)", "K (inner)"],
+            tablefmt="simple_outline",
+            numalign="right",
+        )
+        return f"{header}\n{table}"
 
 
 def matmul_tensors(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBUFTensor, tile_transposed_lhs: bool):
