@@ -2,16 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from itertools import permutations
 from typing import Any, Dict, Tuple
 
+import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 
 from autotune.core.tensor import HBMTensor, SBUFTensor, TileCoordinates
-from autotune.generation.generate import generate_configs
-from autotune.modules.dma import save_result_block
-from autotune.modules.matmul import GEMMConfig, matmul_tensors
+from autotune.modules.dma import save_result_tiles
+from autotune.modules.matmul import GEMMConfig
 
 
 class MetaGEMM:
@@ -109,15 +108,16 @@ class MetaGEMM:
                 for block_id_2 in nl.affine_range(getattr(self.gemm_config, f"NUM_BLOCK_{self.loop_order[2]}")):
                     loop_vars[self.loop_order[2]] = block_id_2
                     self.maybe_init(curr_position=3, loop_vars=loop_vars)
-                    matmul_tensors(
-                        self.lhs_tiles, self.rhs_tiles, self.result_tiles, tile_transposed_lhs=not self.transposed_lhs
-                    )
+                    # matmul_tiles(
+                    #     self.lhs_tiles, self.rhs_tiles, self.result_tiles, tile_transposed_lhs=not self.transposed_lhs
+                    # )
                 del loop_vars[self.loop_order[2]]
                 self.maybe_store(curr_position=2, loop_vars=loop_vars)
             del loop_vars[self.loop_order[1]]
             self.maybe_store(curr_position=1, loop_vars=loop_vars)
         del loop_vars[self.loop_order[0]]
         self.maybe_store(curr_position=0, loop_vars=loop_vars)
+        return self.result_hbm
 
     def maybe_init(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["lhs"] == curr_position:
@@ -166,15 +166,11 @@ class MetaGEMM:
                 result_tile_coordinates.add_axis(axis, start_tile_index, num_tiles)
             self.result_tiles = SBUFTensor(par_axis=self.axes["result"][0], tile_sizes=result_tile_sizes)
             self.result_tiles.set_coordinates(result_tile_coordinates)
+            self.result_tiles.init_as_zero(self.result_hbm.dtype)
 
     def maybe_store(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["save"] == curr_position:
-            # Calculate destination offset based on current loop variables
-            dst_ofs = (
-                loop_vars.get("M", 0) * getattr(self.gemm_config, "TILES_IN_BLOCK_M", 1),
-                loop_vars.get("N", 0) * getattr(self.gemm_config, "TILES_IN_BLOCK_N", 1),
-            )
-            save_result_block(self.result_hbm, self.result_tiles, dst_ofs)
+            save_result_tiles(self.result_hbm, self.result_tiles)
 
 
 def str_to_dict(loop_order: str) -> Dict:
@@ -198,13 +194,17 @@ def str_to_dict(loop_order: str) -> Dict:
     return loop_order_dict
 
 
-if __name__ == "__main__":
-    loop_orders = ["".join(loop_order) for loop_order in permutations("MNK")]
-    lhs_positions = [0, 1, 2]
-    rhs_positions = [0, 1, 2]
-    template_params = {"loop_order": loop_orders, "lhs_position": lhs_positions, "rhs_position": rhs_positions}
-    template_configs = generate_configs(**template_params)
-    template_configs = [{"loop_order": "MKN", "lhs_position": 1, "rhs_position": 2}]
-    transposed_lhs = True
-    for template_id, template_config in enumerate(template_configs):
-        kernel = MetaGEMM(transposed_lhs=transposed_lhs, **template_config)
+@nki.jit
+def meta_gemm_wrapper(
+    lhs: tensor,
+    rhs: tensor,
+    NUM_BLOCK_M: int,
+    NUM_BLOCK_N: int,
+    NUM_BLOCK_K: int,
+    transposed_lhs: bool,
+    loop_order: str,
+    lhs_position: int,
+    rhs_position: int,
+):
+    gemm_instance = MetaGEMM(transposed_lhs, loop_order, lhs_position, rhs_position)
+    return gemm_instance(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)

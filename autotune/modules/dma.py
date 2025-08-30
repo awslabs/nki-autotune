@@ -87,18 +87,20 @@ def save_result_dma(result, result_blocks, block_id_M: int):
         nl.store(result[m_ofs + idx_res_packed.p, idx_res_packed.x], value=result_blocks_packed)
 
 
-def save_result_block(result, result_block: SBUFTensor, dst_ofs: Tuple[int, int]):
+def save_result_tiles(result, result_tiles: SBUFTensor):
     """
-    Store a 4D SBUF block of tiled results back into a 2D HBM tensor.
-    The result_block tensor contains data organized in tiles that need to be stored in the
-    appropriate locations in the result tensor. The starting position for storing tiles is
-    determined by tile_index_ofs, which specifies the tile offset in both dimensions.
+    Store SBUF tiles back into a 2D HBM tensor using global tile indexing.
+
+    The function uses the SBUFTensor's internal tile coordinates to determine
+    where each tile should be stored in the result tensor. Each tile is read
+    using the read_tile method with global indices and stored at the appropriate
+    position in the HBM result tensor.
 
     +--------------------------------------------------+
     |                                                  |
     |    +--------+--------+----+--------+             |
-    |    |Tile 0,0|Tile 0,1|... |Tile 0,n|             |  ← Starting at position
-    |    +--------+--------+----+--------+             |    (tile_index_ofs[0] * TILE_M, tile_index_ofs[1] * TILE_N)
+    |    |Tile 0,0|Tile 0,1|... |Tile 0,n|             |  ← Global tile positions
+    |    +--------+--------+----+--------+             |    determined by tile_coordinates
     |    |Tile 1,0|Tile 1,1|... |Tile 1,n|             |
     |    +--------+--------+----+--------+             |  Each tile is (TILE_M, TILE_N) in size
     |    |   ...  |   ...  |... |   ...  |             |
@@ -110,30 +112,50 @@ def save_result_block(result, result_block: SBUFTensor, dst_ofs: Tuple[int, int]
 
     Args:
         result: The destination 2D tensor with shape (M, N) where tiles will be stored
-        result_block: The source 4D tensor containing tiled results with shape
-                     (TILE_M, TILES_IN_M, TILES_IN_N, TILE_N), where:
-                     - TILE_M: Height of each tile
-                     - TILES_IN_M: Number of tiles in the M dimension (rows)
-                     - TILES_IN_N: Number of tiles in the N dimension (columns)
-                     - TILE_N: Width of each tile
-        dst_ofs: A tuple of (start row tile, start column tile) specifying the target location in the result tensor where tiles should be stored
+        result_tiles: SBUFTensor containing tiled results with internal tile coordinates
+                     specifying global tile positions
 
     Returns:
         None. The result tensor is modified in-place.
     """
-    start_row_tile, start_column_tile = dst_ofs
-    row_tile_size, num_row_tiles, num_column_tiles, column_tile_size = result_block.tensor.shape
+    # Get tile sizes and global coordinates from the SBUFTensor
+    par_axis = result_tiles.par_axis
+    free_axis = result_tiles.free_axis
+    row_tile_size = result_tiles.tile_sizes[par_axis]
+    column_tile_size = result_tiles.tile_sizes[free_axis]
+
+    # Get global tile coordinates
+    par_tile_coords = result_tiles.tile_coordinates[par_axis]
+    free_tile_coords = result_tiles.tile_coordinates[free_axis]
+
+    start_row_tile = par_tile_coords["start_tile_index"]
+    num_row_tiles = par_tile_coords["num_tiles"]
+    start_column_tile = free_tile_coords["start_tile_index"]
+    num_column_tiles = free_tile_coords["num_tiles"]
+
     max_rows, max_cols = result.shape
     idx_res = nl.mgrid[0:row_tile_size, 0:column_tile_size]
-    for row_tile_id in nl.affine_range(num_row_tiles):
-        row_start = (start_row_tile + row_tile_id) * row_tile_size
+
+    for row_tile_offset in nl.affine_range(num_row_tiles):
+        # Calculate global row tile index
+        global_row_tile = start_row_tile + row_tile_offset
+        row_start = global_row_tile * row_tile_size
         row_indices = row_start + idx_res.p
-        for column_tile_id in nl.affine_range(num_column_tiles):
-            column_start = (start_column_tile + column_tile_id) * column_tile_size
+
+        for column_tile_offset in nl.affine_range(num_column_tiles):
+            # Calculate global column tile index
+            global_column_tile = start_column_tile + column_tile_offset
+            column_start = global_column_tile * column_tile_size
             column_indices = column_start + idx_res.x
+
+            # Read tile using global indices
+            tile_indices = {par_axis: global_row_tile, free_axis: global_column_tile}
+            tile_data = result_tiles.read_tile(tile_indices)
+
+            # Store tile to result tensor
             nl.store(
                 result[row_indices, column_indices],
-                value=result_block.tensor[idx_res.p, row_tile_id, column_tile_id, idx_res.x],
+                value=tile_data,
                 mask=(row_indices < max_rows) & (column_indices < max_cols),
             )
 

@@ -31,7 +31,6 @@ class TileCoordinates:
         if axis not in self.data:
             raise KeyError(f"Axis '{axis}' not found in TileCoordinates. Available axes: {list(self.data.keys())}")
 
-        # Map internal names to the expected interface names
         return self.data[axis]
 
 
@@ -215,17 +214,29 @@ class SBUFTensor:
                         )
 
     def read_tile(self, tile_indices: Dict[str, int]):
-        """Extract a specific tile from the tensor.
+        """Extract a specific tile from the tensor using global tile indices.
 
         Args:
-            tile_indices: Dictionary mapping axis names to tile indices
+            tile_indices: Dictionary mapping axis names to global tile indices
 
         Returns:
             The requested tile as a tensor
         """
         par_tile_size, par_num_tiles, free_num_tiles, free_tile_size = self.tensor.shape
-        par_tile_index = tile_indices[self.par_axis]
-        free_tile_index = tile_indices[self.free_axis]
+
+        # Convert global indices to local indices
+        par_tile_index = tile_indices[self.par_axis] - self.tile_coordinates[self.par_axis]["start_tile_index"]
+        free_tile_index = tile_indices[self.free_axis] - self.tile_coordinates[self.free_axis]["start_tile_index"]
+
+        # Validate that the indices are within bounds
+        assert 0 <= par_tile_index < par_num_tiles, (
+            f"Global {self.par_axis} tile index {tile_indices[self.par_axis]} "
+            f"(local: {par_tile_index}) out of range [0, {par_num_tiles})"
+        )
+        assert 0 <= free_tile_index < free_num_tiles, (
+            f"Global {self.free_axis} tile index {tile_indices[self.free_axis]} "
+            f"(local: {free_tile_index}) out of range [0, {free_num_tiles})"
+        )
 
         idx_tile = nl.mgrid[0:par_tile_size, 0:free_tile_size]
         tile = self.tensor[idx_tile.p, par_tile_index, free_tile_index, idx_tile.x]
