@@ -6,6 +6,35 @@ import neuronxcc.nki.language as nl
 import numpy as np
 
 
+class GlobalCoordinates:
+    def __init__(self) -> None:
+        self.axes = set()
+        self.data = {}
+
+    def add_axis(self, axis: str, start_tile_index: int, num_tiles: int):
+        self.data[axis] = {"start_tile_index": start_tile_index, "num_tiles": num_tiles}
+        self.axes.add(axis)
+
+    def __getitem__(self, axis: str) -> Dict[str, int]:
+        """Access coordinate information for a specific axis.
+
+        Args:
+            axis: The axis name to retrieve coordinates for
+
+        Returns:
+            Dictionary with 'start' and 'size' keys mapping to start_tile_index
+            and num_tiles respectively
+
+        Raises:
+            KeyError: If the requested axis doesn't exist
+        """
+        if axis not in self.data:
+            raise KeyError(f"Axis '{axis}' not found in GlobalCoordinates. Available axes: {list(self.data.keys())}")
+
+        # Map internal names to the expected interface names
+        return self.data[axis]
+
+
 class HBMTensor:
     """High Bandwidth Memory tensor wrapper with named axes.
 
@@ -51,18 +80,24 @@ class SBUFTensor:
             par_axis: Partition axis name
             tile_sizes: Dictionary mapping axis names to tile sizes for axes
         """
+        assert par_axis in tile_sizes, f"par_axis {par_axis} is not in tile_sizes {tile_sizes}."
         self.par_axis = par_axis
         self.tile_sizes = tile_sizes
-        assert par_axis in tile_sizes, f"par_axis {par_axis} is not in tile_sizes {tile_sizes}."
+        free_axes = []
+        for axis in tile_sizes:
+            if axis != par_axis:
+                free_axes.append(axis)
+        assert len(free_axes) == 1, f"Expected 1 free axis, got {len(free_axes)} : {free_axes}"
+        self.free_axis = free_axes[0]
 
-    def set_coordinates(self, global_coordinates: Dict[str, Dict[str, int]]) -> None:
+    def set_coordinates(self, global_coordinates: GlobalCoordinates) -> None:
         """
         Args:
-            global_coordinates (Dict[str, Dict[str, int]]): Region specification for each axis, where each axis maps to:
-                - "start": Starting index in the source tensor
-                - "size": Number of elements to load along this axis
+            global_coordinates (GlobalCoordinates): Region specification for each axis, where each axis maps to:
+                - "start": Start tile index in the source tensor
+                - "size": Number of tiles to load along this axis
         """
-        assert set(global_coordinates.keys()) == set(self.tile_sizes.keys()), (
+        assert global_coordinates.axes == set(self.tile_sizes.keys()), (
             f"Axes mismatch:"
             f"global_coordinates {global_coordinates},"
             f"tile_sizes {self.tile_sizes}."
@@ -79,31 +114,30 @@ class SBUFTensor:
         Args:
             source: HBM tensor to load data from
         """
-        self.axes = source.axes
-        assert len(self.axes) == 2, f"Expected 2 axes, got {len(self.axes)}: {self.axes}"
-        par_axis, free_axis = self.axes[0], self.axes[1]
-        num_par_tiles = math.ceil(self.global_coordinates[par_axis]["size"] / self.tile_sizes[par_axis])
-        num_free_tiles = math.ceil(self.global_coordinates[free_axis]["size"] / self.tile_sizes[free_axis])
+        assert len(source.axes) == 2, f"Expected 2 axes, got {len(source.axes)}: {source.axes}"
 
         # Set attributes needed by other methods
-        self.max_par_size = source.sizes[par_axis]
-        self.max_free_size = source.sizes[free_axis]
+        max_par_size = source.sizes[self.par_axis]
+        max_free_size = source.sizes[self.free_axis]
 
-        self.init_as_zero(num_tiles={par_axis: num_par_tiles, free_axis: num_free_tiles}, dtype=source.tensor.dtype)
-        par_indices = nl.arange(self.tile_sizes[par_axis])[:, None]
-        free_indices = nl.arange(self.tile_sizes[free_axis])[None, :]
+        self.init_as_zero(dtype=source.tensor.dtype)
+        par_indices = nl.arange(self.tile_sizes[self.par_axis])[:, None]
+        free_indices = nl.arange(self.tile_sizes[self.free_axis])[None, :]
 
-        for par_tile_id in nl.affine_range(num_par_tiles):
-            for free_tile_id in nl.affine_range(num_free_tiles):
-                par_start = self.global_coordinates[par_axis]["start"] + par_tile_id * self.tile_sizes[par_axis]
-                free_start = self.global_coordinates[free_axis]["start"] + free_tile_id * self.tile_sizes[free_axis]
-                par_mask = par_start + par_indices < self.max_par_size
-                free_mask = free_start + free_indices < self.max_free_size
+        par_tile_offset = self.global_coordinates[self.par_axis]["start_tile_index"]
+        free_tile_offset = self.global_coordinates[self.free_axis]["start_tile_index"]
+
+        for par_tile_id in nl.affine_range(self.global_coordinates[self.par_axis]["num_tiles"]):
+            par_start = (par_tile_offset + par_tile_id) * self.tile_sizes[self.par_axis]
+            par_mask = par_start + par_indices < max_par_size
+            for free_tile_id in nl.affine_range(self.global_coordinates[self.free_axis]["num_tiles"]):
+                free_start = (free_tile_offset + free_tile_id) * self.tile_sizes[self.free_axis]
+                free_mask = free_start + free_indices < max_free_size
                 self.tensor[par_indices, par_tile_id, free_tile_id, free_indices] = nl.load(
                     source.tensor[par_start + par_indices, free_start + free_indices], mask=par_mask & free_mask
                 )
 
-    def init_as_zero(self, num_tiles: Dict[str, int], dtype):
+    def init_as_zero(self, dtype):
         """
         (tile_size_0, num_tiles_0, num_tiles_1, ..., num_tiles_N-1, tile_size_1, ..., tile_size_N-1)
             0               1           2                 N             N + 1               2N - 1
@@ -113,9 +147,10 @@ class SBUFTensor:
             dtype (_type_): _description_
         """
         tensor_shape = (
-            self.tile_sizes[self.axes[0]],
-            *[num_tiles[axis] for axis in self.axes],
-            *[self.tile_sizes[axis] for axis in self.axes[1:]],
+            self.tile_sizes[self.par_axis],
+            self.global_coordinates[self.par_axis]["num_tiles"],
+            self.global_coordinates[self.free_axis]["num_tiles"],
+            self.tile_sizes[self.free_axis],
         )
         self.tensor = nl.zeros(tensor_shape, dtype=dtype, buffer=nl.sbuf)
 

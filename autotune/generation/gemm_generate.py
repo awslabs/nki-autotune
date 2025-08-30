@@ -8,10 +8,10 @@ from typing import Any, Dict, Tuple
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 
-from autotune.core.tensor import HBMTensor, SBUFTensor
+from autotune.core.tensor import GlobalCoordinates, HBMTensor, SBUFTensor
 from autotune.generation.generate import generate_configs
 from autotune.modules.dma import save_result_block
-from autotune.modules.matmul import GEMMCompatibility, matmul_tensors
+from autotune.modules.matmul import GEMMConfig, matmul_tensors
 
 
 class MetaGEMM:
@@ -51,8 +51,6 @@ class MetaGEMM:
         self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, self.axes["rhs"])
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
-        self.mm = GEMMCompatibility(transposed_lhs=transposed_lhs)
-
         print(self.op_positions)
         print(self.loop_order)
 
@@ -79,22 +77,36 @@ class MetaGEMM:
         return absolute_position
 
     def __call__(self, lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int) -> Any:
-        self.mm((lhs, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K})
+        """
+
+        Args:
+            lhs (tensor): _description_
+            rhs (tensor): _description_
+            NUM_BLOCK_M (int): _description_
+            NUM_BLOCK_N (int): _description_
+            NUM_BLOCK_K (int): _description_
+
+        Returns:
+            Any: _description_
+        """
+        self.gemm_config = GEMMConfig(transposed_lhs=self.transposed_lhs)
+        self.gemm_config(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
+        print(self.gemm_config)
         if self.transposed_lhs:
             self.lhs_hbm = HBMTensor(lhs, axes=("K", "M"))
         else:
             self.lhs_hbm = HBMTensor(lhs, axes=("M", "K"))
         self.rhs_hbm = HBMTensor(rhs, axes=("K", "N"))
-        self.result_hbm = nl.ndarray((self.mm.M, self.mm.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
+        self.result_hbm = nl.ndarray((self.gemm_config.M, self.gemm_config.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
         loop_vars = {}
         self.maybe_init(curr_position=0, loop_vars=loop_vars)
-        for block_id_0 in nl.affine_range(getattr(self.mm, f"NUM_BLOCK_{self.loop_order[0]}")):
+        for block_id_0 in nl.affine_range(getattr(self.gemm_config, f"NUM_BLOCK_{self.loop_order[0]}")):
             loop_vars[self.loop_order[0]] = block_id_0
             self.maybe_init(curr_position=1, loop_vars=loop_vars)
-            for block_id_1 in nl.affine_range(getattr(self.mm, f"NUM_BLOCK_{self.loop_order[1]}")):
+            for block_id_1 in nl.affine_range(getattr(self.gemm_config, f"NUM_BLOCK_{self.loop_order[1]}")):
                 loop_vars[self.loop_order[1]] = block_id_1
                 self.maybe_init(curr_position=2, loop_vars=loop_vars)
-                for block_id_2 in nl.affine_range(getattr(self.mm, f"NUM_BLOCK_{self.loop_order[2]}")):
+                for block_id_2 in nl.affine_range(getattr(self.gemm_config, f"NUM_BLOCK_{self.loop_order[2]}")):
                     loop_vars[self.loop_order[2]] = block_id_2
                     self.maybe_init(curr_position=3, loop_vars=loop_vars)
                     matmul_tensors(
@@ -110,16 +122,16 @@ class MetaGEMM:
     def maybe_init(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["lhs"] == curr_position:
             lhs_tile_sizes: Dict[str, int] = {}
-            lhs_global_coordinates: Dict[str, Dict[str, int]] = {}
+            lhs_global_coordinates = GlobalCoordinates()
             for axis in self.axes["lhs"]:
-                lhs_tile_sizes[axis] = getattr(self.mm, f"TILE_{axis}")
-                lhs_global_coordinates[axis] = {}
+                lhs_tile_sizes[axis] = getattr(self.gemm_config, f"TILE_{axis}")
                 if axis in loop_vars:
-                    lhs_global_coordinates[axis]["start"] = loop_vars[axis] * getattr(self.mm, f"BLOCK_{axis}")
-                    lhs_global_coordinates[axis]["size"] = getattr(self.mm, f"BLOCK_{axis}")
+                    start_tile_index = loop_vars[axis] * getattr(self.gemm_config, f"TILES_IN_BLOCK_{axis}")
+                    num_tiles = getattr(self.gemm_config, f"TILES_IN_BLOCK_{axis}")
                 else:
-                    lhs_global_coordinates[axis]["start"] = 0
-                    lhs_global_coordinates[axis]["size"] = getattr(self.mm, axis)
+                    start_tile_index = 0
+                    num_tiles = getattr(self.gemm_config, f"TILES_IN_{axis}")
+                lhs_global_coordinates.add_axis(axis, start_tile_index, num_tiles)
             self.lhs_tiles = SBUFTensor(par_axis=self.axes["lhs"][0], tile_sizes=lhs_tile_sizes)
             self.lhs_tiles.set_coordinates(lhs_global_coordinates)
             self.lhs_tiles.load(source=self.lhs_hbm)
@@ -127,31 +139,31 @@ class MetaGEMM:
                 self.lhs_tiles.tile_transpose()
         if self.op_positions["rhs"] == curr_position:
             rhs_tile_sizes: Dict[str, int] = {}
-            rhs_global_coordinates: Dict[str, Dict[str, int]] = {}
+            rhs_global_coordinates = GlobalCoordinates()
             for axis in self.axes["rhs"]:
-                rhs_tile_sizes[axis] = getattr(self.mm, f"TILE_{axis}")
-                rhs_global_coordinates[axis] = {}
+                rhs_tile_sizes[axis] = getattr(self.gemm_config, f"TILE_{axis}")
                 if axis in loop_vars:
-                    rhs_global_coordinates[axis]["start"] = loop_vars[axis] * getattr(self.mm, f"BLOCK_{axis}")
-                    rhs_global_coordinates[axis]["size"] = getattr(self.mm, f"BLOCK_{axis}")
+                    start_tile_index = loop_vars[axis] * getattr(self.gemm_config, f"TILES_IN_BLOCK_{axis}")
+                    num_tiles = getattr(self.gemm_config, f"TILES_IN_BLOCK_{axis}")
                 else:
-                    rhs_global_coordinates[axis]["start"] = 0
-                    rhs_global_coordinates[axis]["size"] = getattr(self.mm, axis)
+                    start_tile_index = 0
+                    num_tiles = getattr(self.gemm_config, f"TILES_IN_{axis}")
+                rhs_global_coordinates.add_axis(axis, start_tile_index, num_tiles)
             self.rhs_tiles = SBUFTensor(par_axis=self.axes["rhs"][0], tile_sizes=rhs_tile_sizes)
             self.rhs_tiles.set_coordinates(rhs_global_coordinates)
             self.rhs_tiles.load(source=self.rhs_hbm)
         if self.op_positions["result"] == curr_position:
             result_tile_sizes = {}
-            result_global_coordinates: Dict[str, Dict[str, int]] = {}
+            result_global_coordinates = GlobalCoordinates()
             for axis in self.axes["result"]:
-                result_tile_sizes[axis] = getattr(self.mm, f"TILE_{axis}")
-                result_global_coordinates[axis] = {}
+                result_tile_sizes[axis] = getattr(self.gemm_config, f"TILE_{axis}")
                 if axis in loop_vars:
-                    result_global_coordinates[axis]["start"] = loop_vars[axis] * getattr(self.mm, f"BLOCK_{axis}")
-                    result_global_coordinates[axis]["size"] = getattr(self.mm, f"BLOCK_{axis}")
+                    start_tile_index = loop_vars[axis] * getattr(self.gemm_config, f"TILES_IN_BLOCK_{axis}")
+                    num_tiles = getattr(self.gemm_config, f"TILES_IN_BLOCK_{axis}")
                 else:
-                    result_global_coordinates[axis]["start"] = 0
-                    result_global_coordinates[axis]["size"] = getattr(self.mm, axis)
+                    start_tile_index = 0
+                    num_tiles = getattr(self.gemm_config, f"TILES_IN_{axis}")
+                result_global_coordinates.add_axis(axis, start_tile_index, num_tiles)
             self.result_tiles = SBUFTensor(par_axis=self.axes["result"][0], tile_sizes=result_tile_sizes)
             self.result_tiles.set_coordinates(result_global_coordinates)
 
@@ -159,8 +171,8 @@ class MetaGEMM:
         if self.op_positions["save"] == curr_position:
             # Calculate destination offset based on current loop variables
             dst_ofs = (
-                loop_vars.get("M", 0) * getattr(self.mm, "TILES_IN_BLOCK_M", 1),
-                loop_vars.get("N", 0) * getattr(self.mm, "TILES_IN_BLOCK_N", 1),
+                loop_vars.get("M", 0) * getattr(self.gemm_config, "TILES_IN_BLOCK_M", 1),
+                loop_vars.get("N", 0) * getattr(self.gemm_config, "TILES_IN_BLOCK_N", 1),
             )
             save_result_block(self.result_hbm, self.result_tiles, dst_ofs)
 
