@@ -137,7 +137,17 @@ class GEMMConfig:
         return f"{header}\n{table}"
 
 
-def calculate_tile_overlap(coords1: dict, coords2: dict) -> tuple:
+def max_nki_index(index1, index2):
+    if index1 == 0:
+        max_index = index2
+    elif index2 == 0:
+        max_index = index1
+    else:
+        max_index = max(index1, index2)
+    return max_index
+
+
+def calculate_tile_overlap(coords1: dict, coords2: dict) -> tuple[int, int]:
     """
     Calculate the overlapping tile region between two tile coordinate ranges.
 
@@ -146,18 +156,19 @@ def calculate_tile_overlap(coords1: dict, coords2: dict) -> tuple:
         coords2: Second tile coordinates dictionary with 'start_tile_index' and 'num_tiles'
 
     Returns:
-        Tuple of (overlap_start, overlap_end, num_overlap_tiles)
+        Tuple of (overlap_start, num_overlap_tiles)
     """
-    start1 = coords1["start_tile_index"]
-    end1 = start1 + coords1["num_tiles"]
-    start2 = coords2["start_tile_index"]
-    end2 = start2 + coords2["num_tiles"]
+    start_1 = coords1["start_tile_index"]
+    start_2 = coords2["start_tile_index"]
+    overlap_start = max_nki_index(start_1, start_2)
+    print(f"start_1 {start_1} start_2 {start_2} --> overlap_start = {overlap_start}.")
 
-    overlap_start = max(start1, start2)
-    overlap_end = min(end1, end2)
-    num_overlap_tiles = max(0, overlap_end - overlap_start)
+    num_tiles_1 = coords1["num_tiles"]
+    num_tiles_2 = coords2["num_tiles"]
+    num_overlap_tiles = min(num_tiles_1, num_tiles_2)
+    print(f"num_tiles_1 {num_tiles_1} num_tiles_2 {num_tiles_2} --> num_overlap_tiles = {num_overlap_tiles}.")
 
-    return overlap_start, overlap_end, num_overlap_tiles
+    return overlap_start, num_overlap_tiles
 
 
 def calculate_tile_overlap_ranges(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBUFTensor) -> dict:
@@ -172,32 +183,24 @@ def calculate_tile_overlap_ranges(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, 
     Returns:
         Dictionary containing:
         - num_tiles: (num_M_tiles, num_N_tiles, num_K_tiles)
-        - global_ranges: Dictionary with global tile ranges for each dimension
-            - M_range: (M_start, M_end)
-            - N_range: (N_start, N_end)
-            - K_range: (K_start, K_end)
+        - global_starts: Dictionary with global tile ranges for each dimension
+            - M: M_start
+            - N: N_start
+            - K: K_start
         - result_offsets: (M_offset, N_offset) for result tensor local indexing
     """
-    # Get tile coordinates from each tensor
-    lhs_M_coords = lhs_tiles.tile_coordinates["M"]
-    lhs_K_coords = lhs_tiles.tile_coordinates["K"]
-    rhs_K_coords = rhs_tiles.tile_coordinates["K"]
-    rhs_N_coords = rhs_tiles.tile_coordinates["N"]
-    result_M_coords = result_tiles.tile_coordinates["M"]
-    result_N_coords = result_tiles.tile_coordinates["N"]
-
     # Calculate overlapping regions for each dimension (in global coordinates)
-    K_start, K_end, num_K_tiles = calculate_tile_overlap(lhs_K_coords, rhs_K_coords)
-    M_start, M_end, num_M_tiles = calculate_tile_overlap(lhs_M_coords, result_M_coords)
-    N_start, N_end, num_N_tiles = calculate_tile_overlap(rhs_N_coords, result_N_coords)
+    K_start, num_K_tiles = calculate_tile_overlap(lhs_tiles.tile_coordinates["K"], rhs_tiles.tile_coordinates["K"])
+    M_start, num_M_tiles = calculate_tile_overlap(lhs_tiles.tile_coordinates["M"], result_tiles.tile_coordinates["M"])
+    N_start, num_N_tiles = calculate_tile_overlap(rhs_tiles.tile_coordinates["N"], result_tiles.tile_coordinates["N"])
 
     # Calculate local offsets for result tensor (still needed for direct tensor access)
-    result_M_offset = M_start - result_M_coords["start_tile_index"]
-    result_N_offset = N_start - result_N_coords["start_tile_index"]
+    result_M_offset = M_start - result_tiles.tile_coordinates["M"]["start_tile_index"]
+    result_N_offset = N_start - result_tiles.tile_coordinates["N"]["start_tile_index"]
 
     return {
         "num_tiles": (num_M_tiles, num_N_tiles, num_K_tiles),
-        "global_ranges": {"M_range": (M_start, M_end), "N_range": (N_start, N_end), "K_range": (K_start, K_end)},
+        "global_starts": {"M": M_start, "N": N_start, "K": K_start},
         "result_offsets": (result_M_offset, result_N_offset),
     }
 
@@ -234,9 +237,9 @@ def matmul_tiles(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBU
     for key in overlap_info:
         print(key, overlap_info[key])
     num_M_tiles, num_N_tiles, num_K_tiles = overlap_info["num_tiles"]
-    M_start, M_end = overlap_info["global_ranges"]["M_range"]
-    N_start, N_end = overlap_info["global_ranges"]["N_range"]
-    K_start, K_end = overlap_info["global_ranges"]["K_range"]
+    M_start = overlap_info["global_starts"]["M"]
+    N_start = overlap_info["global_starts"]["N"]
+    K_start = overlap_info["global_starts"]["K"]
     result_M_offset, result_N_offset = overlap_info["result_offsets"]
 
     # Iterate over tiles using nl.affine_range for hardware optimization

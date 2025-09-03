@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+from itertools import permutations
 
 import numpy as np
 from neuronpy.core.language import bfloat16
@@ -14,13 +15,21 @@ from autotune.modules.matmul import GEMMCorrectness
 
 def get_configs():
     kernel_params = {
-        "NUM_BLOCK_M": [1],
-        "NUM_BLOCK_N": [1],
-        "NUM_BLOCK_K": [1],
-        "loop_order": ["MKN"],
-        "lhs_position": [0],
-        "rhs_position": [2],
+        "NUM_BLOCK_M": [1, 2, 4],
+        "NUM_BLOCK_N": [1, 2, 4],
+        "NUM_BLOCK_K": [1, 2, 4],
+        "loop_order": ["".join(perm) for perm in permutations("MKN")],
+        "lhs_position": [0, 1, 2],
+        "rhs_position": [0, 1, 2],
     }
+    # kernel_params = {
+    #     "NUM_BLOCK_M": [2],
+    #     "NUM_BLOCK_N": [1],
+    #     "NUM_BLOCK_K": [1],
+    #     "loop_order": ["KMN"],
+    #     "lhs_position": [2],
+    #     "rhs_position": [0],
+    # }
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
 
@@ -41,7 +50,6 @@ def make_gemm_jobs(all_jobs: ProfileJobs, M: int, N: int, K: int, transposed_lhs
 
     for kernel_config in kernel_configs:
         kernel_config["transposed_lhs"] = transposed_lhs
-        print(kernel_config)
         if transposed_lhs:
             lhsT = np.random.normal(0, 0.001, size=(K, M)).astype(data_type)
             rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
