@@ -10,7 +10,7 @@ from neuronxcc.nki.typing import tensor
 
 from autotune.core.tensor import HBMTensor, SBUFTensor, TileCoordinates
 from autotune.modules.dma import save_result_tiles
-from autotune.modules.matmul import GEMMConfig
+from autotune.modules.matmul import GEMMConfig, matmul_tiles
 
 
 class MetaGEMM:
@@ -108,18 +108,16 @@ class MetaGEMM:
                 for block_id_2 in nl.affine_range(getattr(self.gemm_config, f"NUM_BLOCK_{self.loop_order[2]}")):
                     loop_vars[self.loop_order[2]] = block_id_2
                     self.maybe_init(curr_position=3, loop_vars=loop_vars)
-                    # matmul_tiles(
-                    #     self.lhs_tiles, self.rhs_tiles, self.result_tiles, tile_transposed_lhs=not self.transposed_lhs
-                    # )
+                    matmul_tiles(
+                        self.lhs_tiles, self.rhs_tiles, self.result_tiles, tile_transposed_lhs=not self.transposed_lhs
+                    )
                 del loop_vars[self.loop_order[2]]
-                self.maybe_store(curr_position=2, loop_vars=loop_vars)
+                self.maybe_store(curr_position=2)
             del loop_vars[self.loop_order[1]]
-            self.maybe_store(curr_position=1, loop_vars=loop_vars)
+            self.maybe_store(curr_position=1)
         del loop_vars[self.loop_order[0]]
-        self.maybe_store(curr_position=0, loop_vars=loop_vars)
-        lhs_tiles_hbm = self.lhs_tiles.dump()
-        # return self.result_hbm
-        return lhs_tiles_hbm
+        self.maybe_store(curr_position=0)
+        return self.result_hbm
 
     def maybe_init(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["lhs"] == curr_position:
@@ -173,7 +171,7 @@ class MetaGEMM:
             )
             self.result_tiles.init_as_zero(self.result_hbm.dtype)
 
-    def maybe_store(self, curr_position: int, loop_vars: Dict):
+    def maybe_store(self, curr_position: int):
         if self.op_positions["save"] == curr_position:
             save_result_tiles(self.result_hbm, self.result_tiles)
 

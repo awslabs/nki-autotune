@@ -82,17 +82,26 @@ class GEMMConfig:
         self.NUM_BLOCK_N = NUM_BLOCK_N
         self.NUM_BLOCK_K = NUM_BLOCK_K
 
-        self.TILES_IN_BLOCK_M = math.ceil(self.M / self.NUM_BLOCK_M / self.TILE_M)
+        self.TILES_IN_M = math.ceil(self.M / self.TILE_M)
+        assert (
+            self.TILES_IN_M >= self.NUM_BLOCK_M
+        ), f"NUM_BLOCK_M={self.NUM_BLOCK_M} exceeds available M tiles={self.TILES_IN_M}"
+        self.TILES_IN_BLOCK_M = math.ceil(self.TILES_IN_M / self.NUM_BLOCK_M)
         self.BLOCK_M = int(self.TILES_IN_BLOCK_M * self.TILE_M)
-        self.TILES_IN_M = int(self.NUM_BLOCK_M * self.TILES_IN_BLOCK_M)
 
-        self.TILES_IN_BLOCK_N = math.ceil(self.N / self.NUM_BLOCK_N / self.TILE_N)
+        self.TILES_IN_N = math.ceil(self.N / self.TILE_N)
+        assert (
+            self.TILES_IN_N >= self.NUM_BLOCK_N
+        ), f"NUM_BLOCK_N={self.NUM_BLOCK_N} exceeds available N tiles={self.TILES_IN_N}"
+        self.TILES_IN_BLOCK_N = math.ceil(self.TILES_IN_N / self.NUM_BLOCK_N)
         self.BLOCK_N = int(self.TILES_IN_BLOCK_N * self.TILE_N)
-        self.TILES_IN_N = int(self.NUM_BLOCK_N * self.TILES_IN_BLOCK_N)
 
-        self.TILES_IN_BLOCK_K = math.ceil(self.K / self.NUM_BLOCK_K / self.TILE_K)
+        self.TILES_IN_K = math.ceil(self.K / self.TILE_K)
+        assert (
+            self.TILES_IN_K >= self.NUM_BLOCK_K
+        ), f"NUM_BLOCK_K={self.NUM_BLOCK_K} exceeds available K tiles={self.TILES_IN_K}"
+        self.TILES_IN_BLOCK_K = math.ceil(self.TILES_IN_K / self.NUM_BLOCK_K)
         self.BLOCK_K = int(self.TILES_IN_BLOCK_K * self.TILE_K)
-        self.TILES_IN_K = int(self.NUM_BLOCK_K * self.TILES_IN_BLOCK_K)
 
     def __repr__(self) -> str:
         """
@@ -111,11 +120,11 @@ class GEMMConfig:
         # Create comprehensive table data with better organization
         table_data = [
             ["Matrix dimensions", self.M, self.N, self.K],
-            ["Block count", self.NUM_BLOCK_M, self.NUM_BLOCK_N, self.NUM_BLOCK_K],
-            ["Block size", self.BLOCK_M, self.BLOCK_N, self.BLOCK_K],
-            ["Tiles per block", self.TILES_IN_BLOCK_M, self.TILES_IN_BLOCK_N, self.TILES_IN_BLOCK_K],
-            ["Total tiles", self.TILES_IN_M, self.TILES_IN_N, self.TILES_IN_K],
             ["Hardware tile size", self.TILE_M, self.TILE_N, self.TILE_K],
+            ["Total tiles", self.TILES_IN_M, self.TILES_IN_N, self.TILES_IN_K],
+            ["Block count", self.NUM_BLOCK_M, self.NUM_BLOCK_N, self.NUM_BLOCK_K],
+            ["Tiles per block", self.TILES_IN_BLOCK_M, self.TILES_IN_BLOCK_N, self.TILES_IN_BLOCK_K],
+            ["Block size", self.BLOCK_M, self.BLOCK_N, self.BLOCK_K],
         ]
 
         # Generate formatted table
@@ -219,10 +228,11 @@ def matmul_tiles(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBU
     assert (
         TILE_M == _TILE_M and TILE_N == _TILE_N
     ), f"result_tiles {result_tiles.tensor.shape} shape mismatch with lhs_tiles {lhs_tiles.tensor.shape} @ rhs_tiles {rhs_tiles.tensor.shape}"
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
 
     # Calculate overlapping regions using the helper function
     overlap_info = calculate_tile_overlap_ranges(lhs_tiles, rhs_tiles, result_tiles)
+    for key in overlap_info:
+        print(key, overlap_info[key])
     num_M_tiles, num_N_tiles, num_K_tiles = overlap_info["num_tiles"]
     M_start, M_end = overlap_info["global_ranges"]["M_range"]
     N_start, N_end = overlap_info["global_ranges"]["N_range"]
@@ -230,6 +240,7 @@ def matmul_tiles(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBU
     result_M_offset, result_N_offset = overlap_info["result_offsets"]
 
     # Iterate over tiles using nl.affine_range for hardware optimization
+    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
     for tile_idx_M in nl.affine_range(num_M_tiles):
         global_M_tile = M_start + tile_idx_M
         for tile_idx_N in nl.affine_range(num_N_tiles):
