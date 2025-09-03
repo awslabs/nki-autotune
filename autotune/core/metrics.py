@@ -121,7 +121,6 @@ def tensor_to_matmul_mac_count(tensors: List[np.ndarray]) -> int:
 
 
 def check_correctness(desired, actual, atol, rtol):
-    print(f"desired = {desired.shape}. actual = {actual.shape}.")
     abs_diff = np.abs(actual - desired)
     # Avoid division by zero in relative difference calculation
     rel_diff = np.divide(abs_diff, np.abs(desired), out=np.zeros_like(abs_diff), where=np.abs(desired) != 0)
@@ -142,7 +141,8 @@ def check_correctness(desired, actual, atol, rtol):
         regions_summary = generate_mismatch_summary(mismatches, desired, actual)
 
         err_msg = (
-            f"Mismatched elements: {total_mismatches} / {total_elements} ({mismatch_percentage:.6f}%)\n"
+            f"Mismatched elements:\n"
+            f"{total_mismatches} / {total_elements} ({mismatch_percentage:.6f}%)\n"
             f"Max absolute difference: {max_abs_diff}\n"
             f"Max relative difference: {max_rel_diff}\n"
             f"{regions_summary}"

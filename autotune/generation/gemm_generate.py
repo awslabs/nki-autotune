@@ -50,8 +50,6 @@ class MetaGEMM:
         self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, self.axes["rhs"])
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
-        print(self.op_positions)
-        print(self.loop_order)
 
     def _parse_absolute_position(self, relative_position: int, axes: Tuple[str, ...]):
         """
