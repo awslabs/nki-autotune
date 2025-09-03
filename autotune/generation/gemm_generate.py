@@ -117,7 +117,9 @@ class MetaGEMM:
             self.maybe_store(curr_position=1, loop_vars=loop_vars)
         del loop_vars[self.loop_order[0]]
         self.maybe_store(curr_position=0, loop_vars=loop_vars)
-        return self.result_hbm
+        lhs_tiles_hbm = self.lhs_tiles.dump()
+        # return self.result_hbm
+        return lhs_tiles_hbm
 
     def maybe_init(self, curr_position: int, loop_vars: Dict):
         if self.op_positions["lhs"] == curr_position:
@@ -132,8 +134,9 @@ class MetaGEMM:
                     start_tile_index = 0
                     num_tiles = getattr(self.gemm_config, f"TILES_IN_{axis}")
                 lhs_tile_coordinates.add_axis(axis, start_tile_index, num_tiles)
-            self.lhs_tiles = SBUFTensor(par_axis=self.axes["lhs"][0], tile_sizes=lhs_tile_sizes)
-            self.lhs_tiles.set_coordinates(lhs_tile_coordinates)
+            self.lhs_tiles = SBUFTensor(
+                par_axis=self.axes["lhs"][0], tile_sizes=lhs_tile_sizes, tile_coordinates=lhs_tile_coordinates
+            )
             self.lhs_tiles.load(source=self.lhs_hbm)
             if not self.transposed_lhs:
                 self.lhs_tiles.tile_transpose()
@@ -149,8 +152,9 @@ class MetaGEMM:
                     start_tile_index = 0
                     num_tiles = getattr(self.gemm_config, f"TILES_IN_{axis}")
                 rhs_tile_coordinates.add_axis(axis, start_tile_index, num_tiles)
-            self.rhs_tiles = SBUFTensor(par_axis=self.axes["rhs"][0], tile_sizes=rhs_tile_sizes)
-            self.rhs_tiles.set_coordinates(rhs_tile_coordinates)
+            self.rhs_tiles = SBUFTensor(
+                par_axis=self.axes["rhs"][0], tile_sizes=rhs_tile_sizes, tile_coordinates=rhs_tile_coordinates
+            )
             self.rhs_tiles.load(source=self.rhs_hbm)
         if self.op_positions["result"] == curr_position:
             result_tile_sizes = {}
@@ -164,8 +168,9 @@ class MetaGEMM:
                     start_tile_index = 0
                     num_tiles = getattr(self.gemm_config, f"TILES_IN_{axis}")
                 result_tile_coordinates.add_axis(axis, start_tile_index, num_tiles)
-            self.result_tiles = SBUFTensor(par_axis=self.axes["result"][0], tile_sizes=result_tile_sizes)
-            self.result_tiles.set_coordinates(result_tile_coordinates)
+            self.result_tiles = SBUFTensor(
+                par_axis=self.axes["result"][0], tile_sizes=result_tile_sizes, tile_coordinates=result_tile_coordinates
+            )
             self.result_tiles.init_as_zero(self.result_hbm.dtype)
 
     def maybe_store(self, curr_position: int, loop_vars: Dict):

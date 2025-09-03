@@ -18,7 +18,7 @@ def get_configs():
         "NUM_BLOCK_N": [2],
         "NUM_BLOCK_K": [2],
         "loop_order": ["MKN"],
-        "lhs_position": [1],
+        "lhs_position": [0],
         "rhs_position": [2],
     }
     kernel_configs = generate_configs(**kernel_params)

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import math
 
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
@@ -11,14 +12,22 @@ from neuronpy.core.language import bfloat16
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
 from autotune.core.metrics import check_correctness
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE, HBMTensor, SBUFTensor
+from autotune.core.tensor import HBMTensor, SBUFTensor, TileCoordinates
+from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
 
 @nki.jit
 def nki_tile_transpose(input_tensor):
     hbm_input_tensor = HBMTensor(input_tensor, axes=("M", "K"))
-    loaded_tensor = SBUFTensor(tile_sizes={"M": nl.tile_size.gemm_stationary_fmax, "K": nl.tile_size.pmax})
-    loaded_tensor.load(hbm_input_tensor, tile_offsets={"M": 0, "K": 0}, num_tiles={"M": 0, "K": 0})
+    par_tile_size = nl.tile_size.gemm_stationary_fmax
+    free_tile_size = nl.tile_size.pmax
+    tile_coordinates = TileCoordinates()
+    tile_coordinates.add_axis("M", 0, math.ceil(hbm_input_tensor.sizes["M"] / par_tile_size))
+    tile_coordinates.add_axis("K", 0, math.ceil(hbm_input_tensor.sizes["K"] / free_tile_size))
+    loaded_tensor = SBUFTensor(
+        par_axis="M", tile_sizes={"M": par_tile_size, "K": free_tile_size}, tile_coordinates=tile_coordinates
+    )
+    loaded_tensor.load(hbm_input_tensor)
     padded = loaded_tensor.dump()
     loaded_tensor.tile_transpose()
     padded_tileT = loaded_tensor.dump()
