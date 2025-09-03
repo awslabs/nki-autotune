@@ -72,12 +72,15 @@ class HBMTensor:
 
 
 class SBUFTensor:
-    def __init__(self, par_axis: str, tile_sizes: Dict[str, int]) -> None:
+    def __init__(self, par_axis: str, tile_sizes: Dict[str, int], tile_coordinates: TileCoordinates) -> None:
         """Initialize SBUF tensor with specified tile sizes.
 
         Args:
             par_axis: Partition axis name
             tile_sizes: Dictionary mapping axis names to tile sizes for axes
+            tile_coordinates (TileCoordinates): Region specification for each axis, where each axis maps to:
+                - "start": Start tile index in the source tensor
+                - "size": Number of tiles to load along this axis
         """
         assert par_axis in tile_sizes, f"par_axis {par_axis} is not in tile_sizes {tile_sizes}."
         self.par_axis = par_axis
@@ -88,14 +91,6 @@ class SBUFTensor:
                 free_axes.append(axis)
         assert len(free_axes) == 1, f"Expected 1 free axis, got {len(free_axes)} : {free_axes}"
         self.free_axis = free_axes[0]
-
-    def set_coordinates(self, tile_coordinates: TileCoordinates) -> None:
-        """
-        Args:
-            tile_coordinates (TileCoordinates): Region specification for each axis, where each axis maps to:
-                - "start": Start tile index in the source tensor
-                - "size": Number of tiles to load along this axis
-        """
         assert tile_coordinates.axes == set(self.tile_sizes.keys()), (
             f"Axes mismatch:"
             f"tile_coordinates {tile_coordinates},"
@@ -159,14 +154,14 @@ class SBUFTensor:
         Returns:
             HBM tensor containing the dumped data
         """
-        par_tile_size, par_num_tiles, free_num_tiles, free_tile_size = self.tensor.shape
-        par_size = int(par_num_tiles * par_tile_size)
-        free_size = int(free_num_tiles * free_tile_size)
+        par_tile_size, num_par_tiles, num_free_tiles, free_tile_size = self.tensor.shape
+        par_size = int(num_par_tiles * par_tile_size)
+        free_size = int(num_free_tiles * free_tile_size)
         idx_res = nl.mgrid[0:par_tile_size, 0:free_tile_size]
         result = nl.ndarray((par_size, free_size), dtype=self.tensor.dtype, buffer=nl.shared_hbm)
-        for par_tile_id in nl.affine_range(par_num_tiles):
+        for par_tile_id in nl.affine_range(num_par_tiles):
             par_indices = par_tile_id * par_tile_size + idx_res.p
-            for free_tile_id in nl.affine_range(free_num_tiles):
+            for free_tile_id in nl.affine_range(num_free_tiles):
                 free_indices = free_tile_id * free_tile_size + idx_res.x
                 nl.store(
                     result[par_indices, free_indices],
@@ -180,6 +175,7 @@ class SBUFTensor:
         Performs transpose operation on each tile,
         handling boundary conditions for padded regions.
         """
+        print("Perform tile transposes")
         pmax = nl.tile_size.pmax
         if nisa.get_nc_version() == nisa.nc_version.gen3:
             tileT_dtype = self.tensor.dtype
