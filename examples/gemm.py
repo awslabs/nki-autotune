@@ -15,8 +15,8 @@ from autotune.modules.matmul import GEMMCorrectness
 def get_configs():
     kernel_params = {
         "NUM_BLOCK_M": [1],
-        "NUM_BLOCK_N": [2],
-        "NUM_BLOCK_K": [2],
+        "NUM_BLOCK_N": [1],
+        "NUM_BLOCK_K": [1],
         "loop_order": ["MKN"],
         "lhs_position": [0],
         "rhs_position": [2],
