@@ -232,6 +232,7 @@ class ProfileJobs:
                     batch_valid_jobs.append(job)
 
             num_workers = min(len(sampled_job_ids), os.cpu_count() - 1)
+            num_workers = 8
             parallel_execute(
                 executor_type="process",
                 num_workers=num_workers,

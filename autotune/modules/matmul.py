@@ -263,6 +263,7 @@ def matmul_tiles(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBU
                 rhs_tile = rhs_tiles.read_tile(tile_indices={"K": global_K_tile, "N": global_N_tile})
                 result_tile += nisa.nc_matmul(lhs_tile, rhs_tile)
             # Store result using local indices for direct tensor access
+            # FIXME: if K=1, just copy not add
             result_tiles.tensor[
                 idx_res.p, result_M_offset + tile_idx_M, result_N_offset + tile_idx_N, idx_res.x
             ] += result_tile[idx_res.p, idx_res.x]

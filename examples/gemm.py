@@ -7,6 +7,7 @@ from itertools import permutations
 import numpy as np
 from neuronpy.core.language import bfloat16
 
+from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
 from autotune.generation.generate import generate_configs
@@ -53,14 +54,14 @@ def get_configs():
         "lhs_position": [0, 1, 2],
         "rhs_position": [0, 1, 2],
     }
-    kernel_params = {
-        "NUM_BLOCK_M": [4],
-        "NUM_BLOCK_N": [4],
-        "NUM_BLOCK_K": [4],
-        "loop_order": ["MKN"],
-        "lhs_position": [2],
-        "rhs_position": [1],
-    }
+    # kernel_params = {
+    #     "NUM_BLOCK_M": [4],
+    #     "NUM_BLOCK_N": [4],
+    #     "NUM_BLOCK_K": [4],
+    #     "loop_order": ["MKN"],
+    #     "lhs_position": [2],
+    #     "rhs_position": [1],
+    # }
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
 
@@ -84,7 +85,6 @@ def make_gemm_jobs(all_jobs: ProfileJobs, M: int, N: int, K: int, transposed_lhs
 
     for kernel_config in kernel_configs:
         kernel_config["transposed_lhs"] = transposed_lhs
-
         jobs.add_job(
             kernel=("/home/ec2-user/workplace/nki-autotune/autotune/generation/gemm_generate.py", "meta_gemm_wrapper"),
             input_tensors=input_tensors,
@@ -94,6 +94,24 @@ def make_gemm_jobs(all_jobs: ProfileJobs, M: int, N: int, K: int, transposed_lhs
             postprocessing=postprocessing,
         )
     jobs.sample(num_samples=100)
+    if transposed_lhs:
+        all_jobs.add_job(
+            kernel=("/home/ec2-user/workplace/nki-autotune/autotune/modules/matmul.py", "lhsT_rhs_gemm_np"),
+            input_tensors=input_tensors,
+            kernel_kwargs={},
+            compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
+            preprocessing=None,
+            postprocessing=postprocessing,
+        )
+    else:
+        all_jobs.add_job(
+            kernel=("/home/ec2-user/workplace/nki-autotune/autotune/modules/matmul.py", "lhs_rhs_gemm_np"),
+            input_tensors=input_tensors,
+            kernel_kwargs={},
+            compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
+            preprocessing=None,
+            postprocessing=postprocessing,
+        )
     all_jobs.extend(jobs)
 
 
@@ -123,6 +141,6 @@ if __name__ == "__main__":
         add_jobs(all_jobs, transposed_lhs=False)
     tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
     tuner()
-    # kernel_names = ["lhs_rhs_gemm", "lhsT_rhs_gemm"]
-    # plot_metric(args.cache_dir, "min_ms", kernel_names)
-    # plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+    kernel_names = ["lhs_rhs_gemm_np", "meta_gemm_wrapper"]
+    plot_metric(args.cache_dir, "min_ms", kernel_names)
+    plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
