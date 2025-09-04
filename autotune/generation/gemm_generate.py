@@ -101,8 +101,10 @@ class MetaGEMM:
             Any: _description_
         """
         self.gemm_config = GEMMConfig(transposed_lhs=self.transposed_lhs)
-        self.gemm_config(lhs.shape, rhs.shape, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
-        print(self.gemm_config)
+        self.gemm_config(
+            input_tensors=(lhs, rhs),
+            kernel_kwargs={"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K},
+        )
         if self.transposed_lhs:
             self.lhs_hbm = HBMTensor(lhs, axes=("K", "M"))
         else:

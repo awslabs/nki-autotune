@@ -44,26 +44,30 @@ class GEMMConfig:
         self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
         self.TILE_K = nl.tile_size.pmax  # 128
 
-    def __call__(
-        self,
-        lhs_shape: Tuple[int, int],
-        rhs_shape: Tuple[int, int],
-        NUM_BLOCK_M: int,
-        NUM_BLOCK_N: int,
-        NUM_BLOCK_K: int,
-    ) -> None:
+    def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE) -> None:
         """
-        Calculate sizes for each dimension (M, N, K).
+        Configure GEMM operation parameters from input matrices and blocking configuration.
 
-        NUM_BLOCK_X * TILES_IN_BLOCK_X * TILE_X = X
-        BLOCK_X = TILES_IN_BLOCK_X * TILE_X
-        TILES_IN_X = NUM_BLOCK_X * TILES_IN_BLOCK_X
+        Extracts matrix dimensions, validates compatibility, and computes tile/block
+        arrangements for each dimension following: Dimension = NUM_BLOCKS × TILES_PER_BLOCK × TILE_SIZE
 
-        For each dimension, calculates:
-        - Block size (dimension divided by number of blocks)
-        - Number of tiles in each block (block size divided by tile size)
-        - Total number of tiles in the dimension (dimension size divided by tile size)
+        Args:
+            input_tensors: Tuple of (lhs, rhs) matrices. LHS shape is (M,K) or (K,M) if transposed.
+            kernel_kwargs: Dict with NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K block counts.
+
+        Raises:
+            AssertionError: If contraction dimensions mismatch or block count exceeds available tiles.
+
+        Sets attributes:
+            Matrix dims (M, N, K), tile sizes (TILE_M/N/K), block config (NUM_BLOCK_*, BLOCK_*),
+            and tile counts (TILES_IN_*, TILES_IN_BLOCK_*) for GEMM kernel execution.
         """
+        lhs, rhs = input_tensors
+        lhs_shape = lhs.shape
+        rhs_shape = rhs.shape
+        NUM_BLOCK_M = kernel_kwargs["NUM_BLOCK_M"]
+        NUM_BLOCK_N = kernel_kwargs["NUM_BLOCK_N"]
+        NUM_BLOCK_K = kernel_kwargs["NUM_BLOCK_K"]
         if self.transposed_lhs:
             self.K, self.M = lhs_shape
         else:
@@ -161,12 +165,12 @@ def calculate_tile_overlap(coords1: dict, coords2: dict) -> tuple[int, int]:
     start_1 = coords1["start_tile_index"]
     start_2 = coords2["start_tile_index"]
     overlap_start = max_nki_index(start_1, start_2)
-    print(f"start_1 {start_1} start_2 {start_2} --> overlap_start = {overlap_start}.")
+    # print(f"start_1 {start_1} start_2 {start_2} --> overlap_start = {overlap_start}.")
 
     num_tiles_1 = coords1["num_tiles"]
     num_tiles_2 = coords2["num_tiles"]
     num_overlap_tiles = min(num_tiles_1, num_tiles_2)
-    print(f"num_tiles_1 {num_tiles_1} num_tiles_2 {num_tiles_2} --> num_overlap_tiles = {num_overlap_tiles}.")
+    # print(f"num_tiles_1 {num_tiles_1} num_tiles_2 {num_tiles_2} --> num_overlap_tiles = {num_overlap_tiles}.")
 
     return overlap_start, num_overlap_tiles
 
@@ -234,8 +238,8 @@ def matmul_tiles(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBU
 
     # Calculate overlapping regions using the helper function
     overlap_info = calculate_tile_overlap_ranges(lhs_tiles, rhs_tiles, result_tiles)
-    for key in overlap_info:
-        print(key, overlap_info[key])
+    # for key in overlap_info:
+    #     print(key, overlap_info[key])
     num_M_tiles, num_N_tiles, num_K_tiles = overlap_info["num_tiles"]
     M_start = overlap_info["global_starts"]["M"]
     N_start = overlap_info["global_starts"]["N"]
