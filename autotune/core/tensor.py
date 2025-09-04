@@ -175,7 +175,6 @@ class SBUFTensor:
         Performs transpose operation on each tile,
         handling boundary conditions for padded regions.
         """
-        print("Perform tile transposes")
         pmax = nl.tile_size.pmax
         if nisa.get_nc_version() == nisa.nc_version.gen3:
             tileT_dtype = self.tensor.dtype
