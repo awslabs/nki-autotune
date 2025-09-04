@@ -51,6 +51,20 @@ class MetaGEMM:
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
 
+    def _get_loop_range(self, position: int) -> int:
+        """Check if any tensor operations at position > current will use this axis"""
+        axes_used = set()
+        for op_name in self.op_positions:
+            op_pos = self.op_positions[op_name]
+            if op_pos > position and op_name in self.axes:
+                axes_used.update(self.axes[op_name])
+        axis = self.loop_order[position]
+        if axis in axes_used:
+            trip_count = getattr(self.gemm_config, f"NUM_BLOCK_{axis}")
+        else:
+            trip_count = 1
+        return trip_count
+
     def _parse_absolute_position(self, relative_position: int, axes: Tuple[str, ...]):
         """
         Convert relative_position to absolute_position.
@@ -97,13 +111,13 @@ class MetaGEMM:
         self.result_hbm = nl.ndarray((self.gemm_config.M, self.gemm_config.N), dtype=lhs.dtype, buffer=nl.shared_hbm)
         loop_vars = {}
         self.maybe_init(curr_position=0, loop_vars=loop_vars)
-        for block_id_0 in nl.affine_range(getattr(self.gemm_config, f"NUM_BLOCK_{self.loop_order[0]}")):
+        for block_id_0 in nl.affine_range(self._get_loop_range(position=0)):
             loop_vars[self.loop_order[0]] = block_id_0
             self.maybe_init(curr_position=1, loop_vars=loop_vars)
-            for block_id_1 in nl.affine_range(getattr(self.gemm_config, f"NUM_BLOCK_{self.loop_order[1]}")):
+            for block_id_1 in nl.affine_range(self._get_loop_range(position=1)):
                 loop_vars[self.loop_order[1]] = block_id_1
                 self.maybe_init(curr_position=2, loop_vars=loop_vars)
-                for block_id_2 in nl.affine_range(getattr(self.gemm_config, f"NUM_BLOCK_{self.loop_order[2]}")):
+                for block_id_2 in nl.affine_range(self._get_loop_range(position=2)):
                     loop_vars[self.loop_order[2]] = block_id_2
                     self.maybe_init(curr_position=3, loop_vars=loop_vars)
                     matmul_tiles(
