@@ -10,26 +10,57 @@ from neuronpy.core.language import bfloat16
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
 from autotune.generation.generate import generate_configs
-from autotune.modules.matmul import GEMMCorrectness
+from autotune.modules.matmul import GEMMConfig, GEMMCorrectness
+
+# Global cache for tensors to avoid regenerating same tensors for identical M, K, N dimensions
+_tensor_cache = {}
+
+
+def get_tensors(M: int, N: int, K: int, data_type, transposed_lhs: bool = False):
+    """Get cached tensors or create new ones if not in cache.
+
+    Args:
+        M, N, K: Matrix dimensions
+        data_type: NumPy data type for the tensors
+        transposed_lhs: Whether LHS matrix should be transposed
+
+    Returns:
+        Tuple of (lhs/lhsT, rhs) tensors
+    """
+    # Create cache key based on dimensions, data type, and transpose flag
+    cache_key = (M, N, K, data_type, transposed_lhs)
+
+    if cache_key not in _tensor_cache:
+        # Generate new tensors if not in cache
+        if transposed_lhs:
+            lhsT = np.random.normal(0, 0.001, size=(K, M)).astype(data_type)
+            rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
+            _tensor_cache[cache_key] = (lhsT, rhs)
+        else:
+            lhs = np.random.normal(0, 0.001, size=(M, K)).astype(data_type)
+            rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
+            _tensor_cache[cache_key] = (lhs, rhs)
+
+    return _tensor_cache[cache_key]
 
 
 def get_configs():
     kernel_params = {
-        "NUM_BLOCK_M": [1, 2, 4],
-        "NUM_BLOCK_N": [1, 2, 4],
-        "NUM_BLOCK_K": [1, 2, 4],
+        "NUM_BLOCK_M": [1, 2, 4, 8, 16, 32],
+        "NUM_BLOCK_N": [1, 2, 4, 8, 16, 32],
+        "NUM_BLOCK_K": [1, 2, 4, 8, 16, 32],
         "loop_order": ["".join(perm) for perm in permutations("MKN")],
         "lhs_position": [0, 1, 2],
         "rhs_position": [0, 1, 2],
     }
-    # kernel_params = {
-    #     "NUM_BLOCK_M": [2],
-    #     "NUM_BLOCK_N": [1],
-    #     "NUM_BLOCK_K": [1],
-    #     "loop_order": ["KNM"],
-    #     "lhs_position": [0],
-    #     "rhs_position": [1],
-    # }
+    kernel_params = {
+        "NUM_BLOCK_M": [4],
+        "NUM_BLOCK_N": [4],
+        "NUM_BLOCK_K": [4],
+        "loop_order": ["MKN"],
+        "lhs_position": [2],
+        "rhs_position": [1],
+    }
     kernel_configs = generate_configs(**kernel_params)
     return kernel_configs
 
@@ -48,32 +79,28 @@ def make_gemm_jobs(all_jobs: ProfileJobs, M: int, N: int, K: int, transposed_lhs
     kernel_configs = get_configs()
     jobs = ProfileJobs()
 
+    # Get cached tensors for this M, N, K combination - same tensors will be used for all kernel configs
+    input_tensors = get_tensors(M, N, K, data_type, transposed_lhs)
+
     for kernel_config in kernel_configs:
         kernel_config["transposed_lhs"] = transposed_lhs
-        if transposed_lhs:
-            lhsT = np.random.normal(0, 0.001, size=(K, M)).astype(data_type)
-            rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
-            input_tensors = (lhsT, rhs)
-        else:
-            lhs = np.random.normal(0, 0.001, size=(M, K)).astype(data_type)
-            rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
-            input_tensors = (lhs, rhs)
 
         jobs.add_job(
             kernel=("/home/ec2-user/workplace/nki-autotune/autotune/generation/gemm_generate.py", "meta_gemm_wrapper"),
             input_tensors=input_tensors,
             kernel_kwargs=kernel_config,
             compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-            preprocessing=None,
+            preprocessing=GEMMConfig(transposed_lhs=transposed_lhs),
             postprocessing=postprocessing,
         )
-
+    jobs.sample(num_samples=100)
     all_jobs.extend(jobs)
 
 
 def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
     print(f"Adding jobs with transposed={transposed_lhs} LHS matrix...")
-    for M, N, K in [(129, 512, 128)]:
+    # for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
+    for M, N, K in [(4096, 4096, 4096)]:
         make_gemm_jobs(all_jobs, M, N, K, transposed_lhs=transposed_lhs)
 
 
