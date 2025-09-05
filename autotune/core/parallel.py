@@ -1,9 +1,12 @@
+import inspect
+import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Tuple
 
 from tqdm import tqdm
 
 from autotune.cache.results import capture_error_message
+from autotune.typing.infra_types import KERNEL_DTYPE
 
 
 def split_jobs_into_groups(job_ids: List[int], num_groups: int):
@@ -196,3 +199,30 @@ def parallel_execute_groups(
 
                 # Update the progress bar based on number of jobs in this group
                 progress_bar.update(jobs_in_group)
+
+
+def get_function_name(func) -> KERNEL_DTYPE:
+    """
+    Extract the absolute path and name of an imported function.
+
+    Args:
+        func: The function object to analyze
+
+    Returns:
+        Tuple[str, str]: A tuple containing (absolute_file_path, function_name)
+        Returns (None, None) if the function's module cannot be determined
+    """
+    # Get the function name
+    func_name = func.__name__ if hasattr(func, "__name__") else str(func)
+
+    # Get the module where the function is defined
+    module = inspect.getmodule(func)
+
+    # Get the file path of the module
+    if module and hasattr(module, "__file__") and module.__file__:
+        module_path = module.__file__
+        # Convert to absolute path
+        absolute_path = os.path.abspath(module_path)
+    else:
+        raise Exception(f"Cannot parse absolute path and function name for {func}")
+    return absolute_path, func_name

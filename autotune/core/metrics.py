@@ -112,9 +112,9 @@ def extract_metrics(
     return metrics
 
 
-def tensor_to_matmul_mac_count(tensors: List[np.ndarray]) -> int:
-    if len(tensors) == 2 and len(tensors[0].shape) == 2 and len(tensors[1].shape) == 2:
-        mac_count = tensors[0].shape[0] * tensors[0].shape[1] * tensors[1].shape[1]
+def tensor_to_matmul_mac_count(input_tensor_shapes: List[Tuple[int, ...]]) -> int:
+    if len(input_tensor_shapes) == 2 and len(input_tensor_shapes[0]) == 2 and len(input_tensor_shapes[1]) == 2:
+        mac_count = input_tensor_shapes[0][0] * input_tensor_shapes[0][1] * input_tensor_shapes[1][1]
     else:
         mac_count = 0
     return mac_count

@@ -1,5 +1,4 @@
 import math
-from typing import Tuple
 
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
@@ -26,25 +25,27 @@ class GEMMConfig:
     - TILE_M: 128 (stationary dimension)
     - TILE_N: 512 (moving dimension)
     - TILE_K: 128 (contraction dimension)
-
-    Args:
-        transposed_lhs: If True, treats LHS matrix as transposed (KxM instead of MxK)
     """
 
-    def __init__(self, transposed_lhs: bool) -> None:
+    def __init__(self) -> None:
         """
         Initialize GEMM config.
-
-        Args:
-            transposed_lhs: Whether the LHS matrix should be interpreted as transposed.
         """
-        self.transposed_lhs = transposed_lhs
         # Single tile sizes (hardware constants)
         self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
         self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
         self.TILE_K = nl.tile_size.pmax  # 128
 
-    def __call__(self, input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE) -> None:
+    def __call__(
+        self,
+        transposed_lhs: bool,
+        lhs_shape: tuple[int, int],
+        rhs_shape: tuple[int, int],
+        NUM_BLOCK_M: int,
+        NUM_BLOCK_N: int,
+        NUM_BLOCK_K: int,
+        **kwargs,
+    ) -> None:
         """
         Configure GEMM operation parameters from input matrices and blocking configuration.
 
@@ -52,6 +53,7 @@ class GEMMConfig:
         arrangements for each dimension following: Dimension = NUM_BLOCKS × TILES_PER_BLOCK × TILE_SIZE
 
         Args:
+            transposed_lhs: If True, treats LHS matrix as transposed (KxM instead of MxK)
             input_tensors: Tuple of (lhs, rhs) matrices. LHS shape is (M,K) or (K,M) if transposed.
             kernel_kwargs: Dict with NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K block counts.
 
@@ -62,12 +64,7 @@ class GEMMConfig:
             Matrix dims (M, N, K), tile sizes (TILE_M/N/K), block config (NUM_BLOCK_*, BLOCK_*),
             and tile counts (TILES_IN_*, TILES_IN_BLOCK_*) for GEMM kernel execution.
         """
-        lhs, rhs = input_tensors
-        lhs_shape = lhs.shape
-        rhs_shape = rhs.shape
-        NUM_BLOCK_M = kernel_kwargs["NUM_BLOCK_M"]
-        NUM_BLOCK_N = kernel_kwargs["NUM_BLOCK_N"]
-        NUM_BLOCK_K = kernel_kwargs["NUM_BLOCK_K"]
+        self.transposed_lhs = transposed_lhs
         if self.transposed_lhs:
             self.K, self.M = lhs_shape
         else:
@@ -139,6 +136,29 @@ class GEMMConfig:
             numalign="right",
         )
         return f"{header}\n{table}"
+
+
+class GEMMCorrectness:
+    def __init__(self, transposed_lhs: bool) -> None:
+        self.transposed_lhs = transposed_lhs
+
+    def __call__(
+        self,
+        input_tensors: INPUT_TENSORS_DTYPE,
+        kernel_kwargs: KERNEL_KWARGS_DTYPE,
+        nki_out_tensors: OUTPUT_TENSORS_DTYPE,
+    ):
+        data_type = np.float32
+        atol, rtol = 1e-5, 1e-2
+        lhs, rhs = input_tensors
+        if self.transposed_lhs:
+            golden = nl.static_cast(lhsT_rhs_gemm_np(lhs, rhs), data_type)
+        else:
+            golden = nl.static_cast(lhs_rhs_gemm_np(lhs, rhs), data_type)
+        nki_out_tensor = nl.static_cast(nki_out_tensors[0], data_type)
+
+        # Use the centralized check_correctness function from metrics module
+        check_correctness(golden, nki_out_tensor, atol, rtol)
 
 
 def max_nki_index(index1, index2):
@@ -269,142 +289,6 @@ def matmul_tiles(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBU
             ] += result_tile[idx_res.p, idx_res.x]
 
 
-def matmul_blocks_lhsT(
-    lhsT_block,
-    local_lhsT_tile_ofs: Tuple[int, int],
-    rhs_block,
-    local_rhs_tile_ofs: Tuple[int, int],
-    result_block,
-    local_result_tile_ofs: Tuple[int, int],
-    num_tiles: Tuple[int, int, int],
-    gemm_shape: Tuple[int, int, int],
-    lhsT_global_tile_ofs: Tuple[int, int],
-    rhs_global_tile_ofs: Tuple[int, int],
-):
-    """
-    Perform tiled matrix multiplication between transposed left-hand side and right-hand side matrices.
-
-    This function computes the matrix multiplication lhsT @ rhs, where lhsT is already in transposed format.
-    Results are accumulated into the result_block at the specified offset position. The multiplication
-    is performed by iterating over tiles in each dimension and accumulating results along the K dimension.
-    This implementation optimizes performance by operating on blocked matrices for hardware efficiency.
-
-    Args:
-        lhsT_block: Left-hand side matrix block in transposed format. (K, M)
-        rhs_block: Right-hand side matrix block. (K, N)
-        result_block: Output matrix block where results are accumulated. (M, N)
-        local_lhsT_tile_ofs: lhsT_K_tile_start, lhsT_M_tile_start
-        local_rhs_tile_ofs: rhs_K_tile_start, rhs_N_tile_start
-        local_result_tile_ofs: result_M_tile_start, result_N_tile_start
-        num_tiles: number of M, N, K tiles to compute
-    """
-    TILE_K, _, _, TILE_M = lhsT_block.shape
-    _TILE_K, _, _, TILE_N = rhs_block.shape
-    _TILE_M, _, _, _TILE_N = result_block.shape
-    assert TILE_K == _TILE_K, f"lhsT_block {lhsT_block.shape} tile K mismatch with rhs_block {rhs_block.shape}"
-    assert (
-        TILE_M == _TILE_M and TILE_N == _TILE_N
-    ), f"result_block {result_block.shape} shape mismatch with lhsT_block {lhsT_block.shape} @ rhs_block {rhs_block.shape}"
-    idx_lhsT = nl.mgrid[0:TILE_K, 0:TILE_M]
-    idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    lhsT_K_tile_start, lhsT_M_tile_start = local_lhsT_tile_ofs
-    rhs_K_tile_start, rhs_N_tile_start = local_rhs_tile_ofs
-    result_M_tile_start, result_N_tile_start = local_result_tile_ofs
-    num_M_tiles, num_N_tiles, num_K_tiles = num_tiles
-
-    for tile_id_M in nl.affine_range(num_M_tiles):
-        for tile_id_N in nl.affine_range(num_N_tiles):
-            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            """
-            Use PSUM buffer to accumulate into a single hardware tile
-            """
-            for tile_id_K in nl.affine_range(num_K_tiles):
-                result_tile += nisa.nc_matmul(
-                    lhsT_block[idx_lhsT.p, lhsT_K_tile_start + tile_id_K, lhsT_M_tile_start + tile_id_M, idx_lhsT.x],
-                    rhs_block[idx_rhs.p, rhs_K_tile_start + tile_id_K, rhs_N_tile_start + tile_id_N, idx_rhs.x],
-                )
-            result_block[
-                idx_res.p, result_M_tile_start + tile_id_M, result_N_tile_start + tile_id_N, idx_res.x
-            ] += result_tile[idx_res.p, idx_res.x]
-
-
-def matmul_blocks_tile_transposed_lhs(
-    tileT_lhs_block,
-    lhs_tile_ofs: Tuple[int, int],
-    rhs_block,
-    rhs_tile_ofs: Tuple[int, int],
-    result_block,
-    result_tile_ofs: Tuple[int, int],
-    num_tiles: Tuple[int, int, int],
-):
-    """
-    Accumulate matmul result tiles between lhs and rhs into result_block
-    LHS is transposed at the tile level.
-    Note that this is not the same as lhsT.
-    'matmul_block' module computes lhsT @ rhs.
-
-    Args:
-    tileT_lhs_block: TILE_M, TILES_IN_M, TILES_IN_K, TILE_K. Tile transposed LHS block.
-    rhs_block: TILE_K, TILES_IN_K, TILES_IN_N, TILE_N
-    result_block : TILE_M, TILE_N, TILES_IN_M, TILES_IN_N
-    """
-    TILE_M, _, _, TILE_K = tileT_lhs_block.shape
-    _TILE_K, _, _, TILE_N = rhs_block.shape
-    _TILE_M, _, _, _TILE_N = result_block.shape
-    assert (
-        TILE_K == _TILE_K
-    ), f"tileT_lhs_block {tileT_lhs_block.shape} tile K mismatch with rhs_block {rhs_block.shape}"
-    assert (
-        TILE_M == _TILE_M and TILE_N == _TILE_N
-    ), f"result_block {result_block.shape} shape mismatch with tileT_lhs_block {tileT_lhs_block.shape} @ rhs_block {rhs_block.shape}"
-    idx_lhs = nl.mgrid[0:TILE_M, 0:TILE_K]
-    idx_rhs = nl.mgrid[0:TILE_K, 0:TILE_N]
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    lhs_M_tile_start, lhs_K_tile_start = lhs_tile_ofs
-    rhs_K_tile_start, rhs_N_tile_start = rhs_tile_ofs
-    result_M_tile_start, result_N_tile_start = result_tile_ofs
-    num_M_tiles, num_N_tiles, num_K_tiles = num_tiles
-
-    for tile_id_M in nl.affine_range(num_M_tiles):
-        for tile_id_N in nl.affine_range(num_N_tiles):
-            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            """
-            Use PSUM buffer to accumulate into a single hardware tile
-            """
-            for tile_id_K in nl.affine_range(num_K_tiles):
-                result_tile += nisa.nc_matmul(
-                    tileT_lhs_block[idx_lhs.p, lhs_M_tile_start + tile_id_M, lhs_K_tile_start + tile_id_K, idx_lhs.x],
-                    rhs_block[idx_rhs.p, rhs_K_tile_start + tile_id_K, rhs_N_tile_start + tile_id_N, idx_rhs.x],
-                )
-            result_block[
-                idx_res.p, result_M_tile_start + tile_id_M, result_N_tile_start + tile_id_N, idx_res.x
-            ] += result_tile[idx_res.p, idx_res.x]
-
-
-class GEMMCorrectness:
-    def __init__(self, transposed_lhs: bool) -> None:
-        self.transposed_lhs = transposed_lhs
-
-    def __call__(
-        self,
-        input_tensors: INPUT_TENSORS_DTYPE,
-        kernel_kwargs: KERNEL_KWARGS_DTYPE,
-        nki_out_tensors: OUTPUT_TENSORS_DTYPE,
-    ):
-        data_type = np.float32
-        atol, rtol = 1e-5, 1e-2
-        lhs, rhs = input_tensors
-        if self.transposed_lhs:
-            golden = nl.static_cast(lhsT_rhs_gemm_np(lhs, rhs), data_type)
-        else:
-            golden = nl.static_cast(lhs_rhs_gemm_np(lhs, rhs), data_type)
-        nki_out_tensor = nl.static_cast(nki_out_tensors[0], data_type)
-
-        # Use the centralized check_correctness function from metrics module
-        check_correctness(golden, nki_out_tensor, atol, rtol)
-
-
 def lhs_rhs_gemm_np(lhs, rhs):
     """
     Calculate the general matrix multiplication (GEMM) between lhs and rhs.
@@ -447,58 +331,3 @@ def lhsT_rhs_gemm_np(lhsT, rhs):
     else:
         raise NotImplementedError(f"lhsT shape {lhsT.shape} is not supported in GEMM.")
     return np.matmul(lhs, rhs)
-
-
-def blocked_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int):
-    """
-    GEMM algorithm with vectorized block processing using MKN loop ordering.
-    """
-    batch, M, K = lhs.shape
-    K_check, N = rhs.shape
-
-    if K != K_check:
-        raise ValueError(f"Incompatible dimensions: lhs K dimension is {K} and rhs K dimension is {K_check}")
-
-    # Calculate block sizes in each dimension
-    BLOCK_M = M // NUM_BLOCK_M
-    BLOCK_N = N // NUM_BLOCK_N
-    BLOCK_K = K // NUM_BLOCK_K
-
-    # Initialize output matrix with the input data type
-    output = np.zeros((batch, M, N), dtype=lhs.dtype)
-
-    # Process each batch
-    for b in range(batch):
-        # Process blocks of M dimension
-        for block_m in range(NUM_BLOCK_M):
-            m_start = block_m * BLOCK_M
-            m_end = min(M, (block_m + 1) * BLOCK_M)
-            m_size = m_end - m_start
-
-            # Initialize accumulator for the entire M block with higher precision (float64)
-            outputs = np.zeros((m_size, N), dtype=np.float64)
-
-            # Process K dimension in blocks
-            for block_k in range(NUM_BLOCK_K):
-                k_start = block_k * BLOCK_K
-                k_end = min(K, (block_k + 1) * BLOCK_K)
-
-                # Extract current K block for all M rows in this block
-                lhs_block = lhs[b, m_start:m_end, k_start:k_end]
-
-                # Process each N block
-                for block_n in range(NUM_BLOCK_N):
-                    n_start = block_n * BLOCK_N
-                    n_end = min(N, (block_n + 1) * BLOCK_N)
-
-                    # Extract current N block for this K block
-                    rhs_block = rhs[k_start:k_end, n_start:n_end]
-
-                    # Calculate contribution and add to the higher precision accumulator
-                    contribution = np.matmul(lhs_block, rhs_block)
-                    outputs[:, n_start:n_end] += contribution
-
-            # Store final results for this M block, casting back to the original data type
-            output[b, m_start:m_end, :] = outputs.astype(lhs.dtype)
-
-    return output

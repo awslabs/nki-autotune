@@ -1,14 +1,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 from typing import Dict, List
 
 from autotune.cache.results import ProfileResults
 from autotune.core.compile import compile_kernel
 from autotune.core.job import ProfileJobs
 from autotune.core.metrics import extract_metrics, tensor_to_matmul_mac_count
-from autotune.core.parallel import parallel_execute, parallel_execute_groups
+from autotune.core.parallel import get_function_name, parallel_execute, parallel_execute_groups
 from autotune.core.processing import postprocessing_fun_wrapper
 from autotune.core.run_nki import run_on_neuron_core
 
@@ -25,51 +24,22 @@ class Benchmark:
         self.iters = iters
 
     def __call__(self):
-        self.valid_job_ids = list(range(self.jobs.num_jobs))
         # FIXME: overlap compilation and execution
-        self._parallel_init_jobs()
         self.results = self._init_results()
         self.results.dump_summary()
-        self._parallel_preprocessing()
-        self._parallel_compile_to_neff()
-        self.results.dump_summary()
-        self._parallel_run_kernels()
-        self._parallel_extract_metrics()
-        self._parallel_postprocessing()
-        self.results.dump_summary()
-
-    def _get_num_workers(self) -> int:
-        num_workers = min(len(self.valid_job_ids), os.cpu_count() - 1)
-        num_workers = max(num_workers, 1)
-        return num_workers
-
-    def _parallel_init_jobs(self):
-        def submit_jobs(job_group_id: int, job_group: List[int]):
-            funcs = []
-            kwargs = []
-            for job_id in job_group:
-                self.jobs[job_id].cache_root_dir = self.cache_root_dir
-                funcs.append(self.jobs[job_id].init_job_dir)
-                kwargs.append({})
-            return funcs, kwargs
-
-        def process_results(error: bool, job_id: int, output: None | str):
-            if error and output:
-                raise Exception(output)
-
-        parallel_execute(
-            executor_type="thread",
-            num_workers=self._get_num_workers(),
-            job_ids=self.valid_job_ids,
-            submit_jobs_func=submit_jobs,
-            work_desc="Init Job Directories",
-            process_results_func=process_results,
-        )
+        # self._parallel_compile_to_neff()
+        # self.results.dump_summary()
+        # self._parallel_run_kernels()
+        # self._parallel_extract_metrics()
+        # self._parallel_postprocessing()
+        # self.results.dump_summary()
 
     def _init_results(self) -> ProfileResults:
         results = ProfileResults(sort_key="min_ms", lower_is_better=True)
         for job in self.jobs:
-            matmul_mac_count = tensor_to_matmul_mac_count(job.input_tensors)
+            job.cache_root_dir = self.cache_root_dir
+            job.kernel = get_function_name(job.kernel)
+            matmul_mac_count = tensor_to_matmul_mac_count(job.input_tensor_shapes)
             results.add_result(
                 kernel=job.kernel,
                 kernel_kwargs=job.kernel_kwargs,
@@ -77,32 +47,8 @@ class Benchmark:
                 cache_dir=job.cache_dir,
                 matmul_mac_count=matmul_mac_count,
             )
+            job.init_job_dir()
         return results
-
-    def _parallel_preprocessing(self):
-        def submit_jobs(job_group_id: int, job_group: List[int]):
-            funcs = []
-            kwargs = []
-            for job_id in job_group:
-                job = self.jobs[job_id]
-                funcs.append(job.preprocessing)
-                kwargs.append({"input_tensors": job.input_tensors, "kernel_kwargs": job.kernel_kwargs})
-            return funcs, kwargs
-
-        def process_results(error: bool, job_id: int, preprocessing_is_ok: None | str):
-            if error and preprocessing_is_ok:
-                self._process_error(job_id, preprocessing_is_ok)
-            else:
-                self.results[job_id].add_fields(preprocessing_result=True)
-
-        parallel_execute(
-            executor_type="process",
-            num_workers=self._get_num_workers(),
-            job_ids=self.valid_job_ids,
-            submit_jobs_func=submit_jobs,
-            work_desc="Preprocessing",
-            process_results_func=process_results,
-        )
 
     def _parallel_compile_to_neff(self):
         def submit_jobs(job_group_id: int, job_group: List[int]):
