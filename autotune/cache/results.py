@@ -18,7 +18,7 @@ class ProfileResult:
         self,
         main_metric: str,
         lower_is_better: bool,
-        kernel: KERNEL_DTYPE | None = None,
+        kernel: KERNEL_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
         compiler_flags: str | None = None,
         cache_dir: str | None = None,
@@ -214,7 +214,7 @@ class ProfileResults:
 
     def add_result(
         self,
-        kernel: KERNEL_DTYPE | None = None,
+        kernel: KERNEL_DTYPE,
         kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
         compiler_flags: str | None = None,
         cache_dir: str | None = None,
