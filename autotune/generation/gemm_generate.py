@@ -9,7 +9,6 @@ import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 
 from autotune.core.tensor import HBMTensor, SBUFTensor, TileCoordinates
-from autotune.modules.dma import save_result_tiles
 from autotune.modules.matmul import GEMMConfig, matmul_tiles
 
 
@@ -191,7 +190,7 @@ class MetaGEMM:
 
     def maybe_store(self, curr_position: int):
         if self.op_positions["save"] == curr_position:
-            save_result_tiles(self.result_hbm, self.result_tiles)
+            self.result_tiles.save_to_hbm(self.result_hbm)
 
 
 def str_to_dict(loop_order: str) -> Dict:

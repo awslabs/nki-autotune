@@ -11,7 +11,6 @@ from neuronpy.core.language import bfloat16
 from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
-from autotune.modules.matmul import GEMMCompatibility
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kernel_library.rmsnorm_linear_golden import rmsnorm_correctness_postprocessing
@@ -31,11 +30,11 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int, data_type: str):
     rhs = np.random.normal(size=(K, N)).astype(data_type)
     jobs.add_job(
         kernel=("kernel_library/rmsnorm_linear_golden.py", "rmsnorm_matmul_golden"),
-        input_tensors=(lhs, rhs),
+        input_tensor_shapes=[lhs.shape, rhs.shape],
         kernel_kwargs={"eps": 1e-6},
         compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-        preprocessing=GEMMCompatibility(transposed_lhs=False),
         postprocessing=postprocessing,
+        data_type=data_type,
     )
 
     sizes = [1, 2, 4, 8, 16]
@@ -47,7 +46,7 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int, data_type: str):
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K in params:
         autotune_jobs.add_job(
             kernel=("kernel_library/rmsnorm_linear.py", "online_rmsnorm_linear_MKN"),
-            input_tensors=(lhs, rhs),
+            input_tensor_shapes=[lhs.shape, rhs.shape],
             kernel_kwargs={
                 "eps": 1e-6,
                 "NUM_BLOCK_M": NUM_BLOCK_M,
@@ -55,11 +54,21 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int, data_type: str):
                 "NUM_BLOCK_K": NUM_BLOCK_K,
             },
             compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-            preprocessing=GEMMCompatibility(transposed_lhs=False),
             postprocessing=postprocessing,
+            data_type=data_type,
         )
-    autotune_jobs.sample(100)
-    jobs.extend(autotune_jobs)
+    # Limit to 100 jobs if there are too many
+    if autotune_jobs.num_jobs > 100:
+        import random
+
+        sampled_indices = random.sample(range(autotune_jobs.num_jobs), 100)
+        sampled_jobs = ProfileJobs()
+        for idx in sampled_indices:
+            job = autotune_jobs[idx]
+            sampled_jobs.jobs.append(job)
+        jobs.extend(sampled_jobs)
+    else:
+        jobs.extend(autotune_jobs)
 
 
 if __name__ == "__main__":
