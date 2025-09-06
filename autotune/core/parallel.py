@@ -225,3 +225,11 @@ def get_function_name(func) -> KERNEL_DTYPE:
     else:
         raise Exception(f"Cannot parse absolute path and function name for {func}")
     return absolute_path, func_name
+
+
+def set_neuron_core(core_id: int):
+    """
+    Initializer function that runs once when each worker process starts.
+    Sets the NEURON_RT_VISIBLE_CORES environment variable.
+    """
+    os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_id)

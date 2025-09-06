@@ -6,11 +6,10 @@ from typing import Dict, List
 
 from tqdm import tqdm
 
-from autotune.cache.results import ProfileResults, capture_error_message
-from autotune.core.compile import compile_kernel
+from autotune.cache.results import ProfileResults
 from autotune.core.job import ProfileJobs
 from autotune.core.metrics import extract_metrics, tensor_to_matmul_mac_count
-from autotune.core.parallel import parallel_execute, parallel_execute_groups, split_jobs_into_groups
+from autotune.core.parallel import parallel_execute, set_neuron_core, split_jobs_into_groups
 from autotune.core.processing import postprocessing_fun_wrapper
 from autotune.core.run_nki import run_on_neuron_core
 
@@ -31,12 +30,9 @@ class Benchmark:
         self.results = self._init_results()
         self.results.dump_summary()
         self._run_on_neuron_cores()
-        # self._parallel_compile_to_neff()
-        # self.results.dump_summary()
-        # self._parallel_run_kernels()
         # self._parallel_extract_metrics()
         # self._parallel_postprocessing()
-        # self.results.dump_summary()
+        self.results.dump_summary()
 
     def _init_results(self) -> ProfileResults:
         results = ProfileResults(sort_key="min_ms", lower_is_better=True)
@@ -44,6 +40,7 @@ class Benchmark:
             job.cache_root_dir = self.cache_root_dir
             matmul_mac_count = tensor_to_matmul_mac_count(job.input_tensor_shapes)
             results.add_result(
+                index=job.index,
                 kernel=job.kernel,
                 kernel_kwargs=job.kernel_kwargs,
                 compiler_flags=job.compiler_flags,
@@ -56,109 +53,36 @@ class Benchmark:
     def _run_on_neuron_cores(self):
         """Main function to launch 32 worker subprocesses."""
         num_neuron_cores = 16
-
-        print(f"Launching {num_neuron_cores} Neuron cores...")
-        print("-" * 60)
-
-        rank_job_ids = split_jobs_into_groups(job_ids=list(range(self.jobs.num_jobs)), num_groups=num_neuron_cores)
-
-        # Use ProcessPoolExecutor for better subprocess management
-        with ProcessPoolExecutor(max_workers=num_neuron_cores) as executor:
-            futures = {}
-            for neuron_core_id in range(num_neuron_cores):
-                kwargs = {
-                    "neuron_core_id": neuron_core_id,
-                    "warmup": self.warmup,
-                    "iters": self.iters,
-                    "job_ids": rank_job_ids[neuron_core_id],
-                    "jobs": self.jobs,
-                    "results": self.results,
-                }
-                future = executor.submit(run_on_neuron_core, **kwargs)
-                futures[future] = neuron_core_id
-
-            # Create progress bar
-            with tqdm(total=num_neuron_cores, desc="Running kernels", unit="cores") as pbar:
-                # Collect results as they complete
-                for future in as_completed(futures):
-                    index = futures[future]
-                    try:
-                        future_result = future.result()
-                    except Exception as e:
-                        error_msg = capture_error_message(e)
-                        # result = self.results[job_id]
-                        # result.add_error(error_msg)
-                    # Update progress bar
-                    pbar.update(1)
-
-    def _parallel_compile_to_neff(self):
-        def submit_jobs(job_group_id: int, job_group: List[int]):
-            funcs = []
-            kwargs = []
-            for job_id in job_group:
-                job = self.jobs[job_id]
-                funcs.append(compile_kernel)
-                kwargs.append(
-                    {
-                        "kernel_name": job.kernel,
-                        "input_tensors": job.input_tensors,
-                        "kernel_kwargs": job.kernel_kwargs,
-                        "target_instance_family": job.target_instance_family,
-                        "compiler_flags": job.compiler_flags,
-                        "output_dir": job.cache_dir,
-                    }
-                )
-            return funcs, kwargs
-
-        def process_results(error: bool, job_id: int, neff: str):
-            if error:
-                self._process_error(job_id, neff)
-            else:
-                self.results[job_id].add_fields(neff=neff)
-
-        parallel_execute(
-            executor_type="process",
-            num_workers=self._get_num_workers(),
-            job_ids=self.valid_job_ids,
-            submit_jobs_func=submit_jobs,
-            work_desc="Compiling Kernels",
-            process_results_func=process_results,
-        )
-
-    def _parallel_run_kernels(self):
-        def submit_jobs(job_group_id: int, job_group: List[int]):
+        job_id_groups = split_jobs_into_groups(job_ids=list(range(self.jobs.num_jobs)), num_groups=num_neuron_cores)
+        executors = []
+        futures = {}
+        for neuron_core_id in range(num_neuron_cores):
+            rank_job_ids = job_id_groups[neuron_core_id]
+            executor = ProcessPoolExecutor(max_workers=1, initializer=set_neuron_core, initargs=(neuron_core_id,))
+            executors.append(executor)
             kwargs = {
-                "neuron_core_id": job_group_id,
                 "warmup": self.warmup,
                 "iters": self.iters,
-                "job_ids": [],
-                "jobs": self.jobs,
-                "results": self.results,
+                "jobs": [self.jobs[job_id] for job_id in rank_job_ids],
+                "results": [self.results[job_id] for job_id in rank_job_ids],
             }
-            for job_id in job_group:
-                kwargs["job_ids"].append(job_id)
-            return run_on_neuron_core, kwargs
+            future = executor.submit(run_on_neuron_core, **kwargs)
+            futures[future] = neuron_core_id
 
-        def process_results(error: bool, job_group: List[int], error_msg: None | str):
-            if error and error_msg:
-                for job_id in job_group:
-                    self._process_error(job_id, error_msg)
-
-        parallel_execute_groups(
-            executor_type="thread",
-            num_workers=32,
-            job_ids=self.valid_job_ids,
-            submit_jobs_func=submit_jobs,
-            work_desc="Run Kernels",
-            process_results_func=process_results,
-        )
-
-        # FIXME: check if result has error field
-        for job_id in self.valid_job_ids:
-            result = self.results[job_id]
-            if "error" in result.attributes:
-                error_msg = result.error
-                self._process_error(job_id, error_msg)
+        with tqdm(
+            total=self.jobs.num_jobs,
+            desc=f"Running {self.jobs.num_jobs} kernels on {num_neuron_cores} Neuron cores",
+            unit="kernels",
+        ) as pbar:
+            for future in as_completed(futures):
+                neuron_core_id = futures[future]
+                updated_results = future.result()
+                for updated_result in updated_results:
+                    job_id = updated_result.index
+                    self.results[job_id] = updated_result
+                pbar.update(len(updated_results))
+        for executor in executors:
+            executor.shutdown(wait=True)
 
     def _parallel_postprocessing(self):
         def submit_jobs(job_group_id: int, job_group: List[int]):

@@ -16,28 +16,26 @@ class ProfileResult:
 
     def __init__(
         self,
+        index: int,
         main_metric: str,
         lower_is_better: bool,
         kernel: KERNEL_DTYPE,
-        kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
-        compiler_flags: str | None = None,
-        cache_dir: str | None = None,
+        kernel_kwargs: KERNEL_KWARGS_DTYPE,
+        compiler_flags: str,
+        cache_dir: str,
         **kwargs,
     ):
         """
         Initialize a performance result.
         """
+        self.index = index
         self.main_metric = main_metric
         self.lower_is_better = lower_is_better
         self.attributes = set()
-        if kernel:
-            self.add_fields(kernel=kernel)
-        if kernel_kwargs:
-            self.add_fields(kernel_kwargs=kernel_kwargs)
-        if compiler_flags:
-            self.add_fields(compiler_flags=compiler_flags)
-        if cache_dir:
-            self.add_fields(cache_dir=cache_dir)
+        self.add_fields(kernel=kernel)
+        self.add_fields(kernel_kwargs=kernel_kwargs)
+        self.add_fields(compiler_flags=compiler_flags)
+        self.add_fields(cache_dir=cache_dir)
         self.add_fields(**kwargs)
 
     def __repr__(self) -> str:
@@ -208,10 +206,11 @@ class ProfileResults:
 
     def add_result(
         self,
+        index: int,
         kernel: KERNEL_DTYPE,
-        kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
-        compiler_flags: str | None = None,
-        cache_dir: str | None = None,
+        kernel_kwargs: KERNEL_KWARGS_DTYPE,
+        compiler_flags: str,
+        cache_dir: str,
         **kwargs,
     ) -> ProfileResult:
         """
@@ -227,6 +226,7 @@ class ProfileResults:
             ValueError: If sort_key is not provided in kwargs (only when sort_key is not empty)
         """
         result = ProfileResult(
+            index=index,
             main_metric=self.sort_key,
             lower_is_better=self.lower_is_better,
             kernel=kernel,

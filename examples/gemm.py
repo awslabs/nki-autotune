@@ -10,10 +10,8 @@ from neuronpy.core.language import bfloat16
 
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
-from autotune.core.parallel import get_function_name
-from autotune.generation.gemm_generate import lhs_rhs_meta_gemm, lhsT_rhs_meta_gemm
 from autotune.generation.generate import generate_configs
-from autotune.modules.matmul import GEMMConfig, GEMMCorrectness, lhs_rhs_gemm_np, lhsT_rhs_gemm_np
+from autotune.modules.matmul import GEMMConfig, GEMMCorrectness
 
 
 def get_inputs(M: int, N: int, K: int, data_type, transposed_lhs: bool = False):
@@ -52,11 +50,17 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         raise NotImplementedError(f"{data_type} is not implemented.")
 
     if transposed_lhs:
-        baseline_kernel = get_function_name(lhsT_rhs_gemm_np)
-        meta_kernel = get_function_name(lhsT_rhs_meta_gemm)
+        baseline_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/modules/matmul.py", "lhsT_rhs_gemm_np")
+        meta_kernel = (
+            "/home/ec2-user/workplace/nki-autotune/autotune/generation/gemm_generate.py",
+            "lhsT_rhs_meta_gemm",
+        )
     else:
-        baseline_kernel = get_function_name(lhs_rhs_gemm_np)
-        meta_kernel = get_function_name(lhs_rhs_meta_gemm)
+        baseline_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/modules/matmul.py", "lhs_rhs_gemm_np")
+        meta_kernel = (
+            "/home/ec2-user/workplace/nki-autotune/autotune/generation/gemm_generate.py",
+            "lhs_rhs_meta_gemm",
+        )
 
     kernel_params = {
         "NUM_BLOCK_M": [1, 2, 4, 8, 16, 32],
@@ -65,11 +69,16 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         "loop_order": ["".join(perm) for perm in permutations("MKN")],
         "lhs_position": [0, 1, 2],
         "rhs_position": [0, 1, 2],
-        "transposed_lhs": [transposed_lhs],
     }
     kernel_configs = generate_configs(**kernel_params)
 
-    for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
+    for M, N, K in [
+        (512, 512, 512),
+        (4096, 4096, 4096),
+        (8192, 8192, 8192),
+        (16384, 16384, 16384),
+        (24576, 24576, 24576),
+    ]:
         if transposed_lhs:
             lhs_shape = (K, M)
         else:
@@ -78,7 +87,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         valid_kernel_configs = []
         for kernel_config in kernel_configs:
             try:
-                GEMMConfig()(lhs_shape=lhs_shape, rhs_shape=rhs_shape, **kernel_config)
+                GEMMConfig()(lhs_shape=lhs_shape, rhs_shape=rhs_shape, transposed_lhs=transposed_lhs, **kernel_config)
                 valid_kernel_configs.append(kernel_config)
             except Exception as e:
                 pass

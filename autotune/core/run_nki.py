@@ -1,89 +1,48 @@
-import argparse
 import os
-import pickle
 from typing import List
 
-import numpy as np
 from neuronpy.runtime.spike import SpikeExecutor
 
-from autotune.cache.results import ProfileResult, ProfileResults, capture_error_message
-from autotune.core.compile import create_spike_kernel, run_spike_kernel
-from autotune.core.job import ProfileJob, ProfileJobs
+from autotune.cache.results import ProfileResult, capture_error_message
+from autotune.core.compile import compile_kernel, create_spike_kernel, run_spike_kernel
+from autotune.core.job import ProfileJob
 
 
 def run_on_neuron_core(
-    neuron_core_id: int, warmup: int, iters: int, job_ids: List[int], jobs: ProfileJobs, results: ProfileResults
-) -> None:
+    warmup: int, iters: int, jobs: List[ProfileJob], results: List[ProfileResult]
+) -> List[ProfileResult]:
     """Run a Python script with a specific NEURON_RT_VISIBLE_CORES setting"""
-    print(f"Running on Neuron core {neuron_core_id} for job IDs: {job_ids}")
-    env = os.environ.copy()
-    env["NEURON_RT_VISIBLE_CORES"] = str(neuron_core_id)
-    # cache_dirs = []
-    # for job_id in job_ids:
-    #     job = jobs[job_id]
-    #     result = results[job_id]
-    #     job.save()
-    #     result.save()
-    #     cache_dirs.append(job.cache_dir)
-    # script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "run_nki.py"))
-    # cmd = ["python", script_path]
-    # cmd += ["--cache_dirs"] + cache_dirs
-    # cmd += ["--warmup", str(warmup)]
-    # cmd += ["--iters", str(iters)]
-    # process = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    # if process.stderr:
-    #     raise Exception(process.stderr)
-    # for job_id in job_ids:
-    #     job = jobs[job_id]
-    #     result = ProfileResult.load(job.cache_dir)
-    #     results[job_id] = result
+    neuron_core_id = os.environ.get("NEURON_RT_VISIBLE_CORES", "NOT SET")
+    spike = SpikeExecutor(verbose=0)
+    spike_instance = spike.__enter__()
+    for job, result in zip(jobs, results):
+        try:
+            assert job.index == result.index, f"job index {job.index} mismatch result index {result.index}"
+            neff = compile_kernel(
+                kernel_name=job.kernel,
+                input_tensors=job.input_tensors,
+                kernel_kwargs=job.kernel_kwargs,
+                target_instance_family=job.target_instance_family,
+                compiler_flags=job.compiler_flags,
+                output_dir=job.cache_dir,
+            )
+            result.add_fields(neff=neff)
 
-
-def main():
-    """
-    1. Save results, jobs
-    2. Pass results, jobs paths and job IDs
-    3. Subprocess load results, jobs
-    """
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_dirs", type=str, nargs="+", help="A list of cahce dirs to process.")
-    parser.add_argument("--warmup", type=int, help="Number of kernel warmup runs.")
-    parser.add_argument("--iters", type=int, help="Number of kernel profile runs.")
-    args = parser.parse_args()
-    with SpikeExecutor(verbose=0) as spike:
-        for cache_dir in args.cache_dirs:
-            try:
-                job_state = ProfileJob.load(cache_dir)
-                result = ProfileResult.load(cache_dir)
-                spike_kernel = create_spike_kernel(
-                    result.neff, job_state["kernel"], job_state["input_tensors"], job_state["kernel_kwargs"]
-                )
-                stats = spike.benchmark(
-                    spike_kernel,
-                    *job_state["input_tensors"],
-                    **job_state["kernel_kwargs"],
-                    warmup_iterations=args.warmup,
-                    benchmark_iterations=args.iters,
-                    device_id=0,
-                )
-                ntff_file, kernel_outputs = run_spike_kernel(
-                    spike, spike_kernel, job_state["input_tensors"], result.neff, job_state["kernel_kwargs"]
-                )
-                result.add_fields(ntff=ntff_file, **stats)
-                if isinstance(kernel_outputs, List):
-                    kernel_outputs = tuple(kernel_outputs)
-                with open(f"{job_state['cache_dir']}/kernel_outputs.pkl", "wb") as f:
-                    if isinstance(kernel_outputs, tuple):
-                        pickle.dump(kernel_outputs, f)
-                    elif isinstance(kernel_outputs, np.ndarray):
-                        pickle.dump(tuple([kernel_outputs]), f)
-                    else:
-                        raise TypeError(f"{type(kernel_outputs)} is not supported as NKI kernel outputs.")
-            except Exception as e:
-                error_string = capture_error_message(e)
-                result.add_error(error_string)
-            result.save()
-
-
-if __name__ == "__main__":
-    main()
+            spike_kernel = create_spike_kernel(neff, job.kernel, job.input_tensors, job.kernel_kwargs)
+            stats = spike.benchmark(
+                spike_kernel,
+                *job.input_tensors,
+                **job.kernel_kwargs,
+                warmup_iterations=warmup,
+                benchmark_iterations=iters,
+                device_id=0,
+            )
+            ntff_file, kernel_outputs = run_spike_kernel(
+                spike, spike_kernel, job.input_tensors, neff, job.kernel_kwargs
+            )
+            result.add_fields(ntff=ntff_file, **stats)
+        except Exception as e:
+            error_msg = capture_error_message(e)
+            result.add_error(error_msg)
+    spike.__exit__(None, None, None)
+    return results
