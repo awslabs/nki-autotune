@@ -11,7 +11,6 @@ from neuronpy.core.language import bfloat16
 from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
-from autotune.modules.matmul import GEMMCompatibility
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kernel_library.softmax import softmax_gemm_correctness_postprocessing
@@ -29,11 +28,11 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         postprocessing = None
     jobs.add_job(
         kernel=("kernel_library/softmax.py", "softmax_gemm_np"),
-        input_tensors=(lhs, rhs),
+        input_tensor_shapes=[lhs.shape, rhs.shape],
         kernel_kwargs={},
         compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
-        preprocessing=GEMMCompatibility(transposed_lhs=False),
         postprocessing=postprocessing,
+        data_type=data_type,
     )
 
     sizes = range(17)
@@ -45,14 +44,24 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K in params:
         autotune_jobs.add_job(
             kernel=("kernel_library/softmax.py", "online_softmax_linear_MKN"),
-            input_tensors=(lhs, rhs),
+            input_tensor_shapes=[lhs.shape, rhs.shape],
             kernel_kwargs={"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K},
             compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-            preprocessing=GEMMCompatibility(transposed_lhs=False),
             postprocessing=postprocessing,
+            data_type=data_type,
         )
-    autotune_jobs.sample(100)
-    jobs.extend(autotune_jobs)
+    # Limit to 100 jobs if there are too many
+    if autotune_jobs.num_jobs > 100:
+        import random
+
+        sampled_indices = random.sample(range(autotune_jobs.num_jobs), 100)
+        sampled_jobs = ProfileJobs()
+        for idx in sampled_indices:
+            job = autotune_jobs[idx]
+            sampled_jobs.jobs.append(job)
+        jobs.extend(sampled_jobs)
+    else:
+        jobs.extend(autotune_jobs)
 
 
 if __name__ == "__main__":
@@ -66,6 +75,5 @@ if __name__ == "__main__":
     tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
     tuner()
     kernels = ["softmax_gemm_np", "online_softmax_linear_MKN"]
-    stats_types = ["best", "mean"]
-    plot_metric(cache_root_dir, "min_ms", kernels, stats_types)
-    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels, stats_types)
+    plot_metric(cache_root_dir, "min_ms", kernels)
+    plot_metric(cache_root_dir, "mfu_estimated_percent", kernels)

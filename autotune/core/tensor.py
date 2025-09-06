@@ -236,3 +236,57 @@ class SBUFTensor:
         idx_tile = nl.mgrid[0:par_tile_size, 0:free_tile_size]
         tile = self.tensor[idx_tile.p, par_tile_index, free_tile_index, idx_tile.x]
         return tile
+
+    def save_to_hbm(self, result):
+        """
+        Store SBUF tiles back into a 2D HBM tensor using global tile indexing.
+
+        This method uses the SBUFTensor's internal tile coordinates to determine
+        where each tile should be stored in the result tensor. Each tile is read
+        using the read_tile method with global indices and stored at the appropriate
+        position in the HBM result tensor.
+
+        Args:
+            result: The destination 2D tensor with shape (M, N) where tiles will be stored
+
+        Returns:
+            None. The result tensor is modified in-place.
+        """
+        # Get tile sizes and global coordinates
+        row_tile_size = self.tile_sizes[self.par_axis]
+        column_tile_size = self.tile_sizes[self.free_axis]
+
+        # Get global tile coordinates
+        par_tile_coords = self.tile_coordinates[self.par_axis]
+        free_tile_coords = self.tile_coordinates[self.free_axis]
+
+        start_row_tile = par_tile_coords["start_tile_index"]
+        num_row_tiles = par_tile_coords["num_tiles"]
+        start_column_tile = free_tile_coords["start_tile_index"]
+        num_column_tiles = free_tile_coords["num_tiles"]
+
+        max_rows, max_cols = result.shape
+        idx_res = nl.mgrid[0:row_tile_size, 0:column_tile_size]
+
+        for row_tile_offset in nl.affine_range(num_row_tiles):
+            # Calculate global row tile index
+            global_row_tile = start_row_tile + row_tile_offset
+            row_start = global_row_tile * row_tile_size
+            row_indices = row_start + idx_res.p
+
+            for column_tile_offset in nl.affine_range(num_column_tiles):
+                # Calculate global column tile index
+                global_column_tile = start_column_tile + column_tile_offset
+                column_start = global_column_tile * column_tile_size
+                column_indices = column_start + idx_res.x
+
+                # Read tile using global indices
+                tile_indices = {self.par_axis: global_row_tile, self.free_axis: global_column_tile}
+                tile_data = self.read_tile(tile_indices)
+
+                # Store tile to result tensor
+                nl.store(
+                    result[row_indices, column_indices],
+                    value=tile_data,
+                    mask=(row_indices < max_rows) & (column_indices < max_cols),
+                )
