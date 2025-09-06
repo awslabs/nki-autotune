@@ -24,12 +24,9 @@ class Benchmark:
         self.iters = iters
 
     def __call__(self):
-        # FIXME: overlap compilation and execution
         self.results = self._init_results()
         self.results.dump_summary()
         self._run_on_neuron_cores()
-        # self._parallel_extract_metrics()
-        # self._parallel_postprocessing()
         self.results.dump_summary()
 
     def _init_results(self) -> ProfileResults:
