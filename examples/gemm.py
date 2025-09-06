@@ -8,6 +8,7 @@ from itertools import permutations
 import numpy as np
 from neuronpy.core.language import bfloat16
 
+from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
 from autotune.generation.generate import generate_configs
@@ -129,6 +130,12 @@ if __name__ == "__main__":
         add_jobs(all_jobs, transposed_lhs=False)
     tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
     tuner()
-    # kernel_names = ["lhs_rhs_gemm_np", "meta_gemm_wrapper"]
-    # plot_metric(args.cache_dir, "min_ms", kernel_names)
-    # plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+
+    if args.mode == "lhsT_rhs" or args.mode == "both":
+        kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]
+        plot_metric(args.cache_dir, "min_ms", kernel_names)
+        plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+    if args.mode == "lhs_rhs" or args.mode == "both":
+        kernel_names = ["lhs_rhs_gemm_np", "lhs_rhs_meta_gemm"]
+        plot_metric(args.cache_dir, "min_ms", kernel_names)
+        plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)

@@ -6,6 +6,7 @@ from neuronpy.runtime.spike import SpikeExecutor
 from autotune.cache.results import ProfileResult, capture_error_message
 from autotune.core.compile import compile_kernel, create_spike_kernel, run_spike_kernel
 from autotune.core.job import ProfileJob
+from autotune.core.metrics import extract_metrics
 
 
 def run_on_neuron_core(
@@ -41,6 +42,18 @@ def run_on_neuron_core(
                 spike, spike_kernel, job.input_tensors, neff, job.kernel_kwargs
             )
             result.add_fields(ntff=ntff_file, **stats)
+
+            job.postprocessing(job.input_tensors, job.kernel_kwargs, kernel_outputs)
+            result.add_fields(postprocessing_result=True)
+
+            metrics = extract_metrics(
+                neff,
+                ntff_file,
+                latency=result.min_ms,
+                matmul_mac_count=result.matmul_mac_count,
+                target_instance_family=job.target_instance_family,
+            )
+            result.add_fields(**metrics)
         except Exception as e:
             error_msg = capture_error_message(e)
             result.add_error(error_msg)

@@ -183,14 +183,16 @@ def create_spike_kernel(
 
 def run_spike_kernel(
     spike, spike_kernel, input_tensors, neff: str, kernel_kwargs: KERNEL_KWARGS_DTYPE
-) -> Tuple[str, np.ndarray]:
+) -> Tuple[str, tuple[np.ndarray, ...]]:
     directory, neff_name, file_type = split_file_info(neff)
     if file_type != "neff":
         raise ValueError(f"{neff} is not a neff file.")
-    kernel_output = spike.run(spike_kernel, *input_tensors, save_trace=True, artifacts_dir=directory, **kernel_kwargs)
+    kernel_outputs = spike.run(spike_kernel, *input_tensors, save_trace=True, artifacts_dir=directory, **kernel_kwargs)
     ntff_file = f"{directory}/{neff_name}.ntff"
     shutil.move(f"{directory}/profile.ntff", ntff_file)
-    return ntff_file, kernel_output
+    if type(kernel_outputs) is np.ndarray:
+        kernel_outputs = tuple([kernel_outputs])
+    return ntff_file, kernel_outputs
 
 
 def run_kernel(kernel_name: str, input_tensors: Tuple[np.ndarray, ...], **kwargs) -> Tuple[np.ndarray, Dict]:

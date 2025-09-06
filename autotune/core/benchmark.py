@@ -2,15 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, List
 
 from tqdm import tqdm
 
 from autotune.cache.results import ProfileResults
 from autotune.core.job import ProfileJobs
-from autotune.core.metrics import extract_metrics, tensor_to_matmul_mac_count
-from autotune.core.parallel import parallel_execute, set_neuron_core, split_jobs_into_groups
-from autotune.core.processing import postprocessing_fun_wrapper
+from autotune.core.metrics import tensor_to_matmul_mac_count
+from autotune.core.parallel import set_neuron_core, split_jobs_into_groups
 from autotune.core.run_nki import run_on_neuron_core
 
 
@@ -83,80 +81,3 @@ class Benchmark:
                 pbar.update(len(updated_results))
         for executor in executors:
             executor.shutdown(wait=True)
-
-    def _parallel_postprocessing(self):
-        def submit_jobs(job_group_id: int, job_group: List[int]):
-            funcs = []
-            kwargs = []
-            for job_id in job_group:
-                job = self.jobs[job_id]
-                result = self.results[job_id]
-                funcs.append(postprocessing_fun_wrapper)
-                kwargs.append(
-                    {
-                        "processing_fun": job.postprocessing,
-                        "input_tensors": job.input_tensors,
-                        "kernel_kwargs": job.kernel_kwargs,
-                        "cache_dir": job.cache_dir,
-                    }
-                )
-            return funcs, kwargs
-
-        def process_results(error: bool, job_id: int, metrics: str | None):
-            if isinstance(metrics, str):
-                assert (
-                    error
-                ), f"Expecting error=True when metrics is an error string. Received error {error}, metrics {metrics}."
-                self._process_error(job_id, metrics)
-            else:
-                self.results[job_id].add_fields(postprocessing_result=True)
-
-        parallel_execute(
-            executor_type="process",
-            num_workers=self._get_num_workers(),
-            job_ids=self.valid_job_ids,
-            submit_jobs_func=submit_jobs,
-            work_desc="Postprocessing",
-            process_results_func=process_results,
-        )
-
-    def _parallel_extract_metrics(self):
-        def submit_jobs(job_group_id: int, job_group: List[int]):
-            funcs = []
-            kwargs = []
-            for job_id in job_group:
-                job = self.jobs[job_id]
-                result = self.results[job_id]
-                funcs.append(extract_metrics)
-                kwargs.append(
-                    {
-                        "neff": result.neff,
-                        "ntff": result.ntff,
-                        "latency": result.min_ms,
-                        "matmul_mac_count": result.matmul_mac_count,
-                        "target_instance_family": job.target_instance_family,
-                    }
-                )
-            return funcs, kwargs
-
-        def process_results(error: bool, job_id: int, metrics: str | Dict[str, float]):
-            if isinstance(metrics, str):
-                assert (
-                    error
-                ), f"Expecting error=True when metrics is an error string. Received error {error}, metrics {metrics}."
-                self._process_error(job_id, metrics)
-            else:
-                self.results[job_id].add_fields(**metrics)
-
-        parallel_execute(
-            executor_type="thread",
-            num_workers=self._get_num_workers(),
-            job_ids=self.valid_job_ids,
-            submit_jobs_func=submit_jobs,
-            work_desc="Extracting Metrics",
-            process_results_func=process_results,
-        )
-
-    def _process_error(self, job_id: int, error_msg: str):
-        result = self.results[job_id]
-        result.add_error(error_msg)
