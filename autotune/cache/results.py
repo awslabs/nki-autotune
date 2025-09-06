@@ -4,7 +4,7 @@ import pickle
 import sys
 import traceback
 import warnings
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from autotune.typing.infra_types import KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
 
@@ -44,12 +44,6 @@ class ProfileResult:
         """Enhanced representation showing only attributes in self.attributes"""
         attributes = [f"{k}={getattr(self, k)}" for k in self.attributes]
         return f"ProfileResult({', '.join(attributes)})"
-
-    def __getattr__(self, name: str) -> Any:
-        if self.lower_is_better:
-            return float("inf")
-        else:
-            return float("-inf")
 
     @property
     def main_metric_val(self) -> float:

@@ -7,7 +7,13 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from autotune.core.compile import process_compiler_flags
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE, POSTPROCESSING_DTYPE
+from autotune.typing import (
+    INPUT_TENSORS_DTYPE,
+    KERNEL_DTYPE,
+    KERNEL_KWARGS_DTYPE,
+    OUTPUT_TENSORS_DTYPE,
+    POSTPROCESSING_DTYPE,
+)
 
 
 def dummy_postprocessing(
@@ -30,7 +36,7 @@ class ProfileJob:
     def __init__(
         self,
         index: int,
-        kernel,
+        kernel: KERNEL_DTYPE,
         input_tensor_shapes: List[Tuple[int, ...]],
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
         compiler_flags: str,
@@ -148,7 +154,7 @@ class ProfileJobs:
 
     def add_job(
         self,
-        kernel,
+        kernel: KERNEL_DTYPE,
         input_tensor_shapes: List[Tuple[int, ...]],
         kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
         compiler_flags: str | None = None,

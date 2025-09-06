@@ -1,7 +1,6 @@
 import argparse
 import os
 import pickle
-import subprocess
 from typing import List
 
 import numpy as np
@@ -16,27 +15,28 @@ def run_on_neuron_core(
     neuron_core_id: int, warmup: int, iters: int, job_ids: List[int], jobs: ProfileJobs, results: ProfileResults
 ) -> None:
     """Run a Python script with a specific NEURON_RT_VISIBLE_CORES setting"""
-    cache_dirs = []
-    for job_id in job_ids:
-        job = jobs[job_id]
-        result = results[job_id]
-        job.save()
-        result.save()
-        cache_dirs.append(job.cache_dir)
+    print(f"Running on Neuron core {neuron_core_id} for job IDs: {job_ids}")
     env = os.environ.copy()
     env["NEURON_RT_VISIBLE_CORES"] = str(neuron_core_id)
-    script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "run_nki.py"))
-    cmd = ["python", script_path]
-    cmd += ["--cache_dirs"] + cache_dirs
-    cmd += ["--warmup", str(warmup)]
-    cmd += ["--iters", str(iters)]
-    process = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if process.stderr:
-        raise Exception(process.stderr)
-    for job_id in job_ids:
-        job = jobs[job_id]
-        result = ProfileResult.load(job.cache_dir)
-        results[job_id] = result
+    # cache_dirs = []
+    # for job_id in job_ids:
+    #     job = jobs[job_id]
+    #     result = results[job_id]
+    #     job.save()
+    #     result.save()
+    #     cache_dirs.append(job.cache_dir)
+    # script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "run_nki.py"))
+    # cmd = ["python", script_path]
+    # cmd += ["--cache_dirs"] + cache_dirs
+    # cmd += ["--warmup", str(warmup)]
+    # cmd += ["--iters", str(iters)]
+    # process = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # if process.stderr:
+    #     raise Exception(process.stderr)
+    # for job_id in job_ids:
+    #     job = jobs[job_id]
+    #     result = ProfileResult.load(job.cache_dir)
+    #     results[job_id] = result
 
 
 def main():
