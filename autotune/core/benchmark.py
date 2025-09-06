@@ -1,13 +1,16 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List
 
-from autotune.cache.results import ProfileResults
+from tqdm import tqdm
+
+from autotune.cache.results import ProfileResults, capture_error_message
 from autotune.core.compile import compile_kernel
 from autotune.core.job import ProfileJobs
 from autotune.core.metrics import extract_metrics, tensor_to_matmul_mac_count
-from autotune.core.parallel import get_function_name, parallel_execute, parallel_execute_groups
+from autotune.core.parallel import parallel_execute, parallel_execute_groups, split_jobs_into_groups
 from autotune.core.processing import postprocessing_fun_wrapper
 from autotune.core.run_nki import run_on_neuron_core
 
@@ -27,6 +30,7 @@ class Benchmark:
         # FIXME: overlap compilation and execution
         self.results = self._init_results()
         self.results.dump_summary()
+        self._run_on_neuron_cores()
         # self._parallel_compile_to_neff()
         # self.results.dump_summary()
         # self._parallel_run_kernels()
@@ -38,7 +42,6 @@ class Benchmark:
         results = ProfileResults(sort_key="min_ms", lower_is_better=True)
         for job in self.jobs:
             job.cache_root_dir = self.cache_root_dir
-            job.kernel = get_function_name(job.kernel)
             matmul_mac_count = tensor_to_matmul_mac_count(job.input_tensor_shapes)
             results.add_result(
                 kernel=job.kernel,
@@ -49,6 +52,44 @@ class Benchmark:
             )
             job.init_job_dir()
         return results
+
+    def _run_on_neuron_cores(self):
+        """Main function to launch 32 worker subprocesses."""
+        num_neuron_cores = 16
+
+        print(f"Launching {num_neuron_cores} Neuron cores...")
+        print("-" * 60)
+
+        rank_job_ids = split_jobs_into_groups(job_ids=list(range(self.jobs.num_jobs)), num_groups=num_neuron_cores)
+
+        # Use ProcessPoolExecutor for better subprocess management
+        with ProcessPoolExecutor(max_workers=num_neuron_cores) as executor:
+            futures = {}
+            for neuron_core_id in range(num_neuron_cores):
+                kwargs = {
+                    "neuron_core_id": neuron_core_id,
+                    "warmup": self.warmup,
+                    "iters": self.iters,
+                    "job_ids": rank_job_ids[neuron_core_id],
+                    "jobs": self.jobs,
+                    "results": self.results,
+                }
+                future = executor.submit(run_on_neuron_core, **kwargs)
+                futures[future] = neuron_core_id
+
+            # Create progress bar
+            with tqdm(total=num_neuron_cores, desc="Running kernels", unit="cores") as pbar:
+                # Collect results as they complete
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        future_result = future.result()
+                    except Exception as e:
+                        error_msg = capture_error_message(e)
+                        # result = self.results[job_id]
+                        # result.add_error(error_msg)
+                    # Update progress bar
+                    pbar.update(1)
 
     def _parallel_compile_to_neff(self):
         def submit_jobs(job_group_id: int, job_group: List[int]):
@@ -195,5 +236,3 @@ class Benchmark:
     def _process_error(self, job_id: int, error_msg: str):
         result = self.results[job_id]
         result.add_error(error_msg)
-        if job_id in self.valid_job_ids:
-            self.valid_job_ids.remove(job_id)

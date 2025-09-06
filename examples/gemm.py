@@ -10,6 +10,7 @@ from neuronpy.core.language import bfloat16
 
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
+from autotune.core.parallel import get_function_name
 from autotune.generation.gemm_generate import lhs_rhs_meta_gemm, lhsT_rhs_meta_gemm
 from autotune.generation.generate import generate_configs
 from autotune.modules.matmul import GEMMConfig, GEMMCorrectness, lhs_rhs_gemm_np, lhsT_rhs_gemm_np
@@ -51,11 +52,11 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         raise NotImplementedError(f"{data_type} is not implemented.")
 
     if transposed_lhs:
-        baseline_kernel = lhsT_rhs_gemm_np
-        meta_kernel = lhsT_rhs_meta_gemm
+        baseline_kernel = get_function_name(lhsT_rhs_gemm_np)
+        meta_kernel = get_function_name(lhsT_rhs_meta_gemm)
     else:
-        baseline_kernel = lhs_rhs_gemm_np
-        meta_kernel = lhs_rhs_meta_gemm
+        baseline_kernel = get_function_name(lhs_rhs_gemm_np)
+        meta_kernel = get_function_name(lhs_rhs_meta_gemm)
 
     kernel_params = {
         "NUM_BLOCK_M": [1, 2, 4, 8, 16, 32],

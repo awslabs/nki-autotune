@@ -1,5 +1,6 @@
 import inspect
 import os
+import random
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -11,18 +12,16 @@ from autotune.typing.infra_types import KERNEL_DTYPE
 
 def split_jobs_into_groups(job_ids: List[int], num_groups: int):
     """
-    Split job_ids into evenly distributed groups.
-
-    Args:
-        job_ids: List of job IDs to split
-        num_groups: Number of groups to split into
-
-    Returns:
-        List of lists, where each inner list contains job IDs for that group
+    Split job_ids into evenly distributed groups with randomized order.
     """
     groups: List[List[int]] = [[] for _ in range(num_groups)]
 
-    for i, job_id in enumerate(job_ids):
+    # Create a copy and shuffle it to randomize job distribution
+    shuffled_job_ids = job_ids.copy()
+    random.shuffle(shuffled_job_ids)
+
+    # Distribute shuffled jobs using round-robin
+    for i, job_id in enumerate(shuffled_job_ids):
         group_idx = i % num_groups
         groups[group_idx].append(job_id)
 
