@@ -223,19 +223,26 @@ class ProfileJobs:
 
         return result
 
-    def __getitem__(self, key):
+    def __iter__(self):
+        """Allow iteration over ProfileJobs."""
+        return iter(self.jobs)
+
+    def subset(self, key):
         """
-        Allow indexing to access jobs or create subsets.
+        Create a subset of ProfileJobs using a slice or list of indices.
+
+        To access a single job, use ProfileJobs.jobs[index] directly.
 
         Args:
-            key: Can be an int (single job), slice, or list of indices
+            key: A slice or list of indices to select jobs
 
         Returns:
-            ProfileJob if key is int, ProfileJobs subset otherwise
+            ProfileJobs: A new ProfileJobs instance containing the subset
+
+        Raises:
+            TypeError: If key is not a slice or list
         """
-        if isinstance(key, int):
-            return self.jobs[key]
-        elif isinstance(key, (slice, list)):
+        if isinstance(key, (slice, list)):
             subset_jobs = ProfileJobs()
             if isinstance(key, slice):
                 subset_jobs.jobs = self.jobs[key]
@@ -245,7 +252,10 @@ class ProfileJobs:
             subset_jobs._tensor_cache = self._tensor_cache
             return subset_jobs
         else:
-            raise TypeError(f"Invalid index type: {type(key)}")
+            raise TypeError(
+                f"subset() only accepts slice or list, got {type(key).__name__}. "
+                f"To access a single job, use ProfileJobs.jobs[index] directly."
+            )
 
     def initialize_input_tensors(self) -> None:
         for job in self.jobs:
