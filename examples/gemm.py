@@ -97,6 +97,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
             all_jobs.add_job(
                 kernel=meta_kernel,
                 input_tensor_shapes=[lhs_shape, rhs_shape],
+                data_type=data_type,
                 kernel_kwargs=kernel_config,
                 compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
                 postprocessing=postprocessing,
@@ -104,6 +105,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         all_jobs.add_job(
             kernel=baseline_kernel,
             input_tensor_shapes=[lhs_shape, rhs_shape],
+            data_type=data_type,
             kernel_kwargs={},
             compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
             postprocessing=postprocessing,

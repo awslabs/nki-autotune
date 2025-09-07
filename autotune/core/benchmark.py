@@ -47,7 +47,7 @@ class Benchmark:
 
     def _run_on_neuron_cores(self):
         """Main function to launch 32 worker subprocesses."""
-        num_neuron_cores = 16
+        num_neuron_cores = 32
         job_id_groups = split_jobs_into_groups(job_ids=list(range(self.jobs.num_jobs)), num_groups=num_neuron_cores)
         executors = []
         futures = {}
@@ -58,7 +58,7 @@ class Benchmark:
             kwargs = {
                 "warmup": self.warmup,
                 "iters": self.iters,
-                "jobs": [self.jobs[job_id] for job_id in rank_job_ids],
+                "jobs": self.jobs[rank_job_ids],
                 "results": [self.results[job_id] for job_id in rank_job_ids],
             }
             future = executor.submit(run_on_neuron_core, **kwargs)

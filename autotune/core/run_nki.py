@@ -5,18 +5,20 @@ from neuronpy.runtime.spike import SpikeExecutor
 
 from autotune.cache.results import ProfileResult, capture_error_message
 from autotune.core.compile import compile_kernel, create_spike_kernel, run_spike_kernel
-from autotune.core.job import ProfileJob
+from autotune.core.job import ProfileJobs
 from autotune.core.metrics import extract_metrics
 
 
-def run_on_neuron_core(
-    warmup: int, iters: int, jobs: List[ProfileJob], results: List[ProfileResult]
-) -> List[ProfileResult]:
+def run_on_neuron_core(warmup: int, iters: int, jobs: ProfileJobs, results: List[ProfileResult]) -> List[ProfileResult]:
     """Run a Python script with a specific NEURON_RT_VISIBLE_CORES setting"""
     neuron_core_id = os.environ.get("NEURON_RT_VISIBLE_CORES", "NOT SET")
+
+    # Pre-initialize all input tensors once for all jobs with the same shapes
+    jobs.initialize_input_tensors()
+
     spike = SpikeExecutor(verbose=0)
     spike_instance = spike.__enter__()
-    for job, result in zip(jobs, results):
+    for job, result in zip(jobs.jobs, results):
         try:
             assert job.index == result.index, f"job index {job.index} mismatch result index {result.index}"
             neff = compile_kernel(
