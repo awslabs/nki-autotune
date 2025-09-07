@@ -124,7 +124,7 @@ def get_kernel_by_name(kernel_name: KERNEL_DTYPE):
 
 
 def timeout_handler(signum, frame):
-    raise TimeoutError("Compilation timed out after 3 minutes")
+    raise TimeoutError("Compilation timed out after 5 minutes")
 
 
 def compile_kernel(
@@ -151,7 +151,7 @@ def compile_kernel(
     else:
         raise Exception(f"target_instance_family {target_instance_family} must be trn1 or trn2")
     signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(180)
+    signal.alarm(300)
     try:
         neff = compile_to_neff(
             trace_kernel=traced_kernel,

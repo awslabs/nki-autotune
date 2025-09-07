@@ -15,32 +15,8 @@ from autotune.generation.generate import generate_configs
 from autotune.modules.matmul import GEMMConfig, GEMMCorrectness
 
 
-def get_inputs(M: int, N: int, K: int, data_type, transposed_lhs: bool = False):
-    """Create tensors.
-
-    Args:
-        M, N, K: Matrix dimensions
-        data_type: NumPy data type for the tensors
-        transposed_lhs: Whether LHS matrix should be transposed
-
-    Returns:
-        Tuple of (lhs/lhsT, rhs) tensors
-    """
-    # Generate new tensors if not in cache
-    if transposed_lhs:
-        lhsT = np.random.normal(0, 0.001, size=(K, M)).astype(data_type)
-        rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
-        input_tensors = (lhsT, rhs)
-    else:
-        lhs = np.random.normal(0, 0.001, size=(M, K)).astype(data_type)
-        rhs = np.random.normal(0, 0.001, size=(K, N)).astype(data_type)
-        input_tensors = (lhs, rhs)
-
-    return input_tensors
-
-
 def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
-    data_type = "float32"
+    data_type = "bf16"
     if data_type == "float32":
         data_type = np.float32
         postprocessing = GEMMCorrectness(transposed_lhs=transposed_lhs)
@@ -64,22 +40,16 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         )
 
     kernel_params = {
-        "NUM_BLOCK_M": [1, 2, 4, 8, 16, 32],
-        "NUM_BLOCK_N": [1, 2, 4, 8, 16, 32],
-        "NUM_BLOCK_K": [1, 2, 4, 8, 16, 32],
+        "NUM_BLOCK_M": [1, 2, 4, 8, 16, 32, 64, 128],
+        "NUM_BLOCK_N": [1, 2, 4, 8, 16, 32, 64, 128],
+        "NUM_BLOCK_K": [1, 2, 4, 8, 16, 32, 64, 128],
         "loop_order": ["".join(perm) for perm in permutations("MKN")],
         "lhs_position": [0, 1, 2],
         "rhs_position": [0, 1, 2],
     }
     kernel_configs = generate_configs(**kernel_params)
 
-    for M, N, K in [
-        (512, 512, 512),
-        (4096, 4096, 4096),
-        (8192, 8192, 8192),
-        (16384, 16384, 16384),
-        (24576, 24576, 24576),
-    ]:
+    for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
         if transposed_lhs:
             lhs_shape = (K, M)
         else:
@@ -92,7 +62,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
                 valid_kernel_configs.append(kernel_config)
             except Exception as e:
                 pass
-        valid_kernel_configs = random.sample(valid_kernel_configs, 100)
+        valid_kernel_configs = random.sample(valid_kernel_configs, 500)
         for kernel_config in valid_kernel_configs:
             all_jobs.add_job(
                 kernel=meta_kernel,
@@ -110,7 +80,6 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
             compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
             postprocessing=postprocessing,
         )
-        break
 
 
 if __name__ == "__main__":

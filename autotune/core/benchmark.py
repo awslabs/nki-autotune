@@ -58,7 +58,7 @@ class Benchmark:
             kwargs = {
                 "warmup": self.warmup,
                 "iters": self.iters,
-                "jobs": self.jobs[rank_job_ids],
+                "jobs": self.jobs.subset(rank_job_ids),
                 "results": [self.results[job_id] for job_id in rank_job_ids],
             }
             future = executor.submit(run_on_neuron_core, **kwargs)
