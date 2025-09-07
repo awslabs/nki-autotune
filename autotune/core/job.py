@@ -2,7 +2,7 @@ import copy
 import os
 import pickle
 import shutil
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -41,7 +41,7 @@ class ProfileJob:
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
         compiler_flags: str,
         postprocessing: POSTPROCESSING_DTYPE,
-        data_type: np.dtype = np.float32,
+        data_type: np.dtype,
     ) -> None:
         self.index = index
         self.kernel = kernel
@@ -54,17 +54,15 @@ class ProfileJob:
 
     @property
     def input_tensors(self) -> Tuple[np.ndarray, ...]:
-        """
-        Generate or return cached input tensors based on the shapes.
-
-        Returns:
-            Tuple of numpy arrays with the specified shapes
-        """
+        """Return the cached input tensors."""
         if self._input_tensors is None:
-            self._input_tensors = tuple(
-                np.random.normal(0, 0.001, size=shape).astype(self.data_type) for shape in self.input_tensor_shapes
-            )
+            raise ValueError(f"Input tensors not initialized for job {self.index}")
         return self._input_tensors
+
+    @input_tensors.setter
+    def input_tensors(self, value: Tuple[np.ndarray, ...]):
+        """Set the input tensors for this job."""
+        self._input_tensors = value
 
     @property
     def cache_dir(self) -> str:
@@ -151,15 +149,16 @@ class ProfileJob:
 class ProfileJobs:
     def __init__(self) -> None:
         self.jobs: List[ProfileJob] = []
+        self._tensor_cache: Dict[Tuple, Tuple[np.ndarray, ...]] = {}
 
     def add_job(
         self,
         kernel: KERNEL_DTYPE,
         input_tensor_shapes: List[Tuple[int, ...]],
-        kernel_kwargs: KERNEL_KWARGS_DTYPE | None = None,
-        compiler_flags: str | None = None,
-        postprocessing: POSTPROCESSING_DTYPE | None = None,
-        data_type: np.dtype = np.float32,
+        data_type: np.dtype,
+        kernel_kwargs: KERNEL_KWARGS_DTYPE,
+        compiler_flags: str,
+        postprocessing: Optional[POSTPROCESSING_DTYPE] = None,
     ):
         if kernel_kwargs is None:
             kernel_kwargs = {}
@@ -224,6 +223,35 @@ class ProfileJobs:
 
         return result
 
-    def __getitem__(self, index):
-        """Allow indexing to access jobs in the original order they were added."""
-        return self.jobs[index]
+    def __getitem__(self, key):
+        """
+        Allow indexing to access jobs or create subsets.
+
+        Args:
+            key: Can be an int (single job), slice, or list of indices
+
+        Returns:
+            ProfileJob if key is int, ProfileJobs subset otherwise
+        """
+        if isinstance(key, int):
+            return self.jobs[key]
+        elif isinstance(key, (slice, list)):
+            subset_jobs = ProfileJobs()
+            if isinstance(key, slice):
+                subset_jobs.jobs = self.jobs[key]
+            else:  # list of indices
+                subset_jobs.jobs = [self.jobs[i] for i in key]
+            # Share the tensor cache with the subset
+            subset_jobs._tensor_cache = self._tensor_cache
+            return subset_jobs
+        else:
+            raise TypeError(f"Invalid index type: {type(key)}")
+
+    def initialize_input_tensors(self) -> None:
+        for job in self.jobs:
+            cache_key = (tuple(job.input_tensor_shapes), job.data_type)
+            if cache_key not in self._tensor_cache:
+                self._tensor_cache[cache_key] = tuple(
+                    np.random.normal(0, 0.001, size=shape).astype(job.data_type) for shape in job.input_tensor_shapes
+                )
+            job.input_tensors = self._tensor_cache[cache_key]
