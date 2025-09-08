@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
-import random
 from itertools import permutations
 
 import numpy as np
@@ -49,7 +48,8 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
     }
     kernel_configs = generate_configs(**kernel_params)
 
-    for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
+    # for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
+    for M, N, K in [(4, 512, 4096)]:
         if transposed_lhs:
             lhs_shape = (K, M)
         else:
@@ -62,7 +62,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
                 valid_kernel_configs.append(kernel_config)
             except Exception as e:
                 pass
-        valid_kernel_configs = random.sample(valid_kernel_configs, 500)
+        # valid_kernel_configs = random.sample(valid_kernel_configs, 500)
         for kernel_config in valid_kernel_configs:
             all_jobs.add_job(
                 kernel=meta_kernel,

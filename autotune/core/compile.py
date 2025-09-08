@@ -4,15 +4,14 @@ import shutil
 import signal
 import sys
 import types
-from typing import Dict, Tuple
+from typing import Tuple
 
 import numpy as np
 from neuronpy.core.compile import CompilationTarget, compile_to_neff, trace
-from neuronpy.runtime.spike import CompiledKernel, SpikeExecutor
+from neuronpy.runtime.spike import CompiledKernel
 from neuronxcc.nki.compile import GenericKernel
 
 from autotune.cache.directories import split_file_info
-from autotune.core.metrics import extract_metrics
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
 
 
@@ -124,7 +123,7 @@ def get_kernel_by_name(kernel_name: KERNEL_DTYPE):
 
 
 def timeout_handler(signum, frame):
-    raise TimeoutError("Compilation timed out after 5 minutes")
+    raise TimeoutError("Compilation timed out after 10 minutes")
 
 
 def compile_kernel(
@@ -151,7 +150,7 @@ def compile_kernel(
     else:
         raise Exception(f"target_instance_family {target_instance_family} must be trn1 or trn2")
     signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(300)
+    signal.alarm(600)
     try:
         neff = compile_to_neff(
             trace_kernel=traced_kernel,
@@ -193,18 +192,3 @@ def run_spike_kernel(
     if type(kernel_outputs) is np.ndarray:
         kernel_outputs = tuple([kernel_outputs])
     return ntff_file, kernel_outputs
-
-
-def run_kernel(kernel_name: str, input_tensors: Tuple[np.ndarray, ...], **kwargs) -> Tuple[np.ndarray, Dict]:
-    tmp_dir = "/tmp/autotune-workspace"
-    neff = compile_kernel(kernel_name, kernel_name, input_tensors, tmp_dir, **kwargs)
-    spike_kernel = create_spike_kernel(neff, kernel_name, input_tensors, **kwargs)
-    with SpikeExecutor(verbose=0) as spike:
-        stats = spike.benchmark(
-            spike_kernel, *input_tensors, **kwargs, warmup_iterations=10, benchmark_iterations=100, device_id=0
-        )
-        ntff, kernel_output = run_spike_kernel(spike, spike_kernel, input_tensors, neff, **kwargs)
-    metrics = extract_metrics(neff, ntff)
-    metrics.update(stats)
-    upload_command = f'profile-upload -F "neff=@{neff}" -F "ntff=@{ntff}" -F name={kernel_name}'
-    return kernel_output, metrics
