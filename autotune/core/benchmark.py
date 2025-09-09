@@ -46,8 +46,8 @@ class Benchmark:
         return results
 
     def _run_on_neuron_cores(self):
-        """Main function to launch 32 worker subprocesses."""
-        num_neuron_cores = 32
+        """Main function to launch Neuron core worker subprocesses."""
+        num_neuron_cores = min(32, self.jobs.num_jobs)
         job_id_groups = split_jobs_into_groups(job_ids=list(range(self.jobs.num_jobs)), num_groups=num_neuron_cores)
         executors = []
         futures = {}
