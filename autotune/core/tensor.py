@@ -33,6 +33,23 @@ class TileCoordinates:
 
         return self.data[axis]
 
+    def __repr__(self) -> str:
+        """Return a string representation of the TileCoordinates object.
+
+        Returns:
+            A string showing all axes with their start_tile_index and num_tiles.
+        """
+        if not self.data:
+            return "TileCoordinates()"
+
+        axes_info = []
+        for axis in sorted(self.data.keys()):
+            start = self.data[axis]["start_tile_index"]
+            num = self.data[axis]["num_tiles"]
+            axes_info.append(f"{axis}: start={start}, num_tiles={num}")
+
+        return f"TileCoordinates({', '.join(axes_info)})"
+
 
 class HBMTensor:
     """High Bandwidth Memory tensor wrapper with named axes.

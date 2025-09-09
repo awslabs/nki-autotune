@@ -15,7 +15,7 @@ from autotune.modules.matmul import GEMMConfig, GEMMCorrectness
 
 
 def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
-    data_type = "bf16"
+    data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
         postprocessing = GEMMCorrectness(transposed_lhs=transposed_lhs)
@@ -46,10 +46,18 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         "lhs_position": [0, 1, 2],
         "rhs_position": [0, 1, 2],
     }
+    kernel_params = {
+        "NUM_BLOCK_M": [1],
+        "NUM_BLOCK_N": [4],
+        "NUM_BLOCK_K": [8],
+        "loop_order": ["NKM"],
+        "lhs_position": [1],
+        "rhs_position": [1],
+    }
     kernel_configs = generate_configs(**kernel_params)
 
     # for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
-    for M, N, K in [(4, 512, 4096)]:
+    for M, N, K in [(1024, 4096, 4659)]:
         if transposed_lhs:
             lhs_shape = (K, M)
         else:
@@ -58,8 +66,10 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         valid_kernel_configs = []
         for kernel_config in kernel_configs:
             try:
-                GEMMConfig()(lhs_shape=lhs_shape, rhs_shape=rhs_shape, transposed_lhs=transposed_lhs, **kernel_config)
+                gemm_config = GEMMConfig()
+                gemm_config(lhs_shape=lhs_shape, rhs_shape=rhs_shape, transposed_lhs=transposed_lhs, **kernel_config)
                 valid_kernel_configs.append(kernel_config)
+                print(gemm_config)
             except Exception as e:
                 pass
         # valid_kernel_configs = random.sample(valid_kernel_configs, 500)
