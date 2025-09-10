@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
-from itertools import permutations
 
 import numpy as np
 from neuronpy.core.language import bfloat16
@@ -10,8 +9,7 @@ from neuronpy.core.language import bfloat16
 from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
-from autotune.generation.generate import generate_configs
-from autotune.modules.matmul import GEMMConfig, GEMMCorrectness
+from autotune.modules.matmul import GEMMConfigGen, GEMMCorrectness
 
 
 def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
@@ -38,58 +36,46 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
             "lhs_rhs_meta_gemm",
         )
 
-    kernel_params = {
-        "NUM_BLOCK_M": [1, 2, 4, 8, 16, 32, 64, 128],
-        "NUM_BLOCK_N": [1, 2, 4, 8, 16, 32, 64, 128],
-        "NUM_BLOCK_K": [1, 2, 4, 8, 16, 32, 64, 128],
-        "loop_order": ["".join(perm) for perm in permutations("MKN")],
-        "lhs_position": [0, 1, 2],
-        "rhs_position": [0, 1, 2],
-    }
-    kernel_params = {
-        "NUM_BLOCK_M": [1],
-        "NUM_BLOCK_N": [4],
-        "NUM_BLOCK_K": [8],
-        "loop_order": ["NKM"],
-        "lhs_position": [1],
-        "rhs_position": [1],
-    }
-    kernel_configs = generate_configs(**kernel_params)
-
     # for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
-    for M, N, K in [(1024, 4096, 4659)]:
+    for M, N, K in [(128, 512, 1279)]:
         if transposed_lhs:
             lhs_shape = (K, M)
         else:
             lhs_shape = (M, K)
         rhs_shape = (K, N)
-        valid_kernel_configs = []
-        for kernel_config in kernel_configs:
-            try:
-                gemm_config = GEMMConfig()
-                gemm_config(lhs_shape=lhs_shape, rhs_shape=rhs_shape, transposed_lhs=transposed_lhs, **kernel_config)
-                valid_kernel_configs.append(kernel_config)
-                print(gemm_config)
-            except Exception as e:
-                pass
-        # valid_kernel_configs = random.sample(valid_kernel_configs, 500)
-        for kernel_config in valid_kernel_configs:
-            all_jobs.add_job(
-                kernel=meta_kernel,
-                input_tensor_shapes=[lhs_shape, rhs_shape],
-                data_type=data_type,
-                kernel_kwargs=kernel_config,
-                compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-                postprocessing=postprocessing,
-            )
-        all_jobs.add_job(
-            kernel=baseline_kernel,
-            input_tensor_shapes=[lhs_shape, rhs_shape],
-            data_type=data_type,
-            kernel_kwargs={},
-            compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
-            postprocessing=postprocessing,
-        )
+        gemm_config = GEMMConfigGen(transposed_lhs=transposed_lhs, lhs_shape=lhs_shape, rhs_shape=rhs_shape)
+        # Example usage of new config generation functionality
+
+        # Generate all possible configurations
+        configs = gemm_config.generate_configs()
+        for config in configs:
+            print(config)
+        # valid_kernel_configs = []
+        # for kernel_config in kernel_configs:
+        #     try:
+        #         gemm_config(lhs_shape=lhs_shape, rhs_shape=rhs_shape, transposed_lhs=transposed_lhs, **kernel_config)
+        #         valid_kernel_configs.append(kernel_config)
+        #         print(gemm_config)
+        #     except Exception as e:
+        #         pass
+        # # valid_kernel_configs = random.sample(valid_kernel_configs, 500)
+        # for kernel_config in valid_kernel_configs:
+        #     all_jobs.add_job(
+        #         kernel=meta_kernel,
+        #         input_tensor_shapes=[lhs_shape, rhs_shape],
+        #         data_type=data_type,
+        #         kernel_kwargs=kernel_config,
+        #         compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+        #         postprocessing=postprocessing,
+        #     )
+        # all_jobs.add_job(
+        #     kernel=baseline_kernel,
+        #     input_tensor_shapes=[lhs_shape, rhs_shape],
+        #     data_type=data_type,
+        #     kernel_kwargs={},
+        #     compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
+        #     postprocessing=postprocessing,
+        # )
 
 
 if __name__ == "__main__":
