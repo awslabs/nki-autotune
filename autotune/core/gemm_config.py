@@ -30,14 +30,15 @@ def str_to_dict(loop_order: str) -> Dict:
 
 def generate_configs(**kwargs) -> List[Dict]:
     """
-    Generate a list of configurations by combining all possible component options.
+    Generate all combinations of configuration options.
 
-    Parameters:
-    - **kwargs: Component names and their option lists
-        e.g., NUM_BLOCK_M=[1,2,4], template=["MN","MKN"]
+    Args:
+        **kwargs: Component names and their option lists.
+                  e.g., NUM_BLOCK_M=[1,2,4], template=["MN","MKN"]
 
     Returns:
-    - List of configuration dictionaries
+        List[Dict]: All possible configuration dictionaries from the
+                    Cartesian product of input options.
     """
     # Get all component names and their option lists
     component_names = list(kwargs.keys())
@@ -66,21 +67,21 @@ def _generate_blocks_for_axis(axis: str, dimension_size: int, tile_size: int) ->
     Generate valid block configurations for tiling a dimension.
 
     Each configuration divides the dimension into blocks, where each block contains
-    multiple tiles of size tile_size. All blocks except the last must be full,
-    and the last block must have remaining data that fits within one block_size.
+    multiple tiles. All blocks except the last must be full, and the last block
+    must have remaining data that fits within one block_size.
 
     Example: dimension_size=1279, tile_size=128
     - Valid: 3 blocks of 4 tiles each (block_size=512)
       → First 2 blocks: 1024, Last block covers remaining: 255
-    - Invalid: 4 blocks of 4 tiles each (block_size=512)
-      → First 3 blocks already cover 1536 > 1279
 
     Args:
+        axis: Axis identifier (unused, kept for compatibility)
         dimension_size: Size of the dimension to tile
         tile_size: Size of each hardware tile
 
     Returns:
-        List of dicts with keys: num_blocks, tiles_per_block, block_size, total_tiles
+        List[Dict[str, int]]: Configurations with keys: size, tile_size, num_blocks,
+                              tiles_per_block, block_size, total_tiles
     """
     valid_configs = []
 
@@ -127,6 +128,12 @@ def _generate_blocks_for_axis(axis: str, dimension_size: int, tile_size: int) ->
 
 
 class GEMMConfig:
+    """Configuration for GEMM (General Matrix Multiplication) operations.
+
+    Manages matrix blocking, tiling, and loop ordering parameters for
+    efficient computation on specialized hardware.
+    """
+
     def __init__(
         self,
         m_config: Dict[str, int],
@@ -136,6 +143,17 @@ class GEMMConfig:
         rhs_position: int,
         loop_order: str,
     ) -> None:
+        """
+        Initialize GEMM configuration with dimension and operation parameters.
+
+        Args:
+            m_config: Configuration for M dimension (matrix rows)
+            n_config: Configuration for N dimension (matrix columns)
+            k_config: Configuration for K dimension (contraction)
+            lhs_position: Relative position for left-hand side operations (0, 1, or 2)
+            rhs_position: Relative position for right-hand side operations (0, 1, or 2)
+            loop_order: String specifying loop nesting order (e.g., "MNK", "KNM")
+        """
         # Set dimension sizes
         self.M = m_config["size"]
         self.N = n_config["size"]
@@ -177,16 +195,23 @@ class GEMMConfig:
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
 
-    def _parse_absolute_position(self, relative_position: int, axes: Tuple[str, ...]):
+    def _parse_absolute_position(self, relative_position: int, axes: Tuple[str, ...]) -> int:
         """
-        Convert relative_position to absolute_position.
-        Relative position is wrt the axes.
-        |0| A0 |1| A1 |2|
-        - As small as possible to reduce redundant ops.
+        Convert relative position to absolute position in loop order.
+
+        Relative positions (0, 1, 2) map to gaps between/around axes:
+        |0| Axis0 |1| Axis1 |2|
+
+        Args:
+            relative_position: Position relative to axes (0, 1, or 2)
+            axes: Tuple of axis names to position relative to
+
+        Returns:
+            int: Absolute position in the loop order
 
         Example:
             If axes=('M','K') with positions [1,3] and relative_position=1:
-            Returns 2 (must be > 1 and <= 3, so minimum is 2)
+            Returns 2 (between the two axes)
         """
         axis_positions = sorted([self.loop_order[axis] for axis in axes])
         if relative_position == 0:
@@ -201,10 +226,10 @@ class GEMMConfig:
 
     def __repr__(self) -> str:
         """
-        Return a comprehensive string representation of the GEMM configuration.
+        Return a formatted string representation of the GEMM configuration.
 
         Returns:
-            Formatted string showing configuration parameters and computed values.
+            str: Tabulated view of all configuration parameters and values.
         """
         class_name = self.__class__.__name__
         header = f"{class_name}(lhs_position {self.op_positions['lhs']} rhs_position {self.op_positions['rhs']} loop_order {self.loop_order_str})"
@@ -237,27 +262,26 @@ class GEMMConfig:
 
 def generate_gemm_configs(M: int, N: int, K: int) -> List[Dict]:
     """
-    Generate all possible valid GEMM configurations for the given matrix dimensions.
+    Generate all valid GEMM configurations for given matrix dimensions.
 
-    Manages matrix blocking and tiling parameters for efficient GEMM computation on
-    specialized hardware. Validates that input matrix dimensions are compatible with
-    the specified blocking strategy and hardware tile constraints.
+    Creates configurations for matrix multiplication C = A @ B where:
+    - A has shape (M, K)
+    - B has shape (K, N)
+    - C has shape (M, N)
 
-    The function calculates block and tile arrangements using the formula:
-    Dimension = NUM_BLOCKS x TILES_IN_BLOCK x TILE_SIZE
+    Uses hardware-specific tile sizes and generates all valid combinations
+    of blocking strategies, loop orders, and operation positions.
 
     Args:
-        lhs_shape: Shape of the left-hand side matrix (K, M) if transposed, (M, K) otherwise
-        rhs_shape: Shape of the right-hand side matrix (K, N)
+        M: Number of rows in output matrix
+        N: Number of columns in output matrix
+        K: Contraction dimension size
 
     Returns:
-        List of GEMMConfig objects, each containing all values needed for computation:
-        - Matrix dimensions: M, N, K
-        - Hardware tile sizes: TILE_M, TILE_N, TILE_K
-        - Total tiles: TILES_IN_M, TILES_IN_N, TILES_IN_K
-        - Block counts: NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K
-        - Tiles per block: TILES_PER_BLOCK_M, TILES_PER_BLOCK_N, TILES_PER_BLOCK_K
-        - Block sizes: BLOCK_M, BLOCK_N, BLOCK_K
+        List[Dict]: Configuration dictionaries containing:
+            - m_config, n_config, k_config: Blocking parameters for each dimension
+            - loop_order: Nesting order for loops (permutation of "MNK")
+            - lhs_position, rhs_position: Operation placement in loop structure
     """
     # Single tile sizes (hardware constants)
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
@@ -279,8 +303,5 @@ def generate_gemm_configs(M: int, N: int, K: int) -> List[Dict]:
         lhs_position=lhs_positions,
         rhs_position=rhs_positions,
     )
-    gemm_configs = []
-    for config in configs:
-        gemm_configs.append(config)
 
-    return gemm_configs
+    return configs
