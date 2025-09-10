@@ -9,7 +9,7 @@ from neuronpy.core.language import bfloat16
 from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
-from autotune.modules.matmul import GEMMConfigGen, GEMMCorrectness
+from autotune.modules.matmul import GEMMCorrectness, generate_gemm_configs
 
 
 def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
@@ -43,11 +43,8 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         else:
             lhs_shape = (M, K)
         rhs_shape = (K, N)
-        gemm_config = GEMMConfigGen(transposed_lhs=transposed_lhs, lhs_shape=lhs_shape, rhs_shape=rhs_shape)
-        # Example usage of new config generation functionality
-
-        # Generate all possible configurations
-        configs = gemm_config.generate_configs()
+        # Generate all possible configurations using the new function
+        configs = generate_gemm_configs(transposed_lhs=transposed_lhs, lhs_shape=lhs_shape, rhs_shape=rhs_shape)
         for config in configs:
             print(config)
         # valid_kernel_configs = []

@@ -150,69 +150,63 @@ class GEMMConfig:
         return f"{header}\n{table}"
 
 
-class GEMMConfigGen:
+def generate_gemm_configs(
+    transposed_lhs: bool, lhs_shape: tuple[int, int], rhs_shape: tuple[int, int]
+) -> List[GEMMConfig]:
     """
-    Configuration and validation for GEMM (General Matrix Multiplication) operations.
+    Generate all possible valid GEMM configurations for the given matrix dimensions.
 
     Manages matrix blocking and tiling parameters for efficient GEMM computation on
     specialized hardware. Validates that input matrix dimensions are compatible with
     the specified blocking strategy and hardware tile constraints.
 
-    The class calculates block and tile arrangements using the formula:
+    The function calculates block and tile arrangements using the formula:
     Dimension = NUM_BLOCKS x TILES_IN_BLOCK x TILE_SIZE
+
+    Args:
+        transposed_lhs: Whether the left-hand side matrix is transposed
+        lhs_shape: Shape of the left-hand side matrix (K, M) if transposed, (M, K) otherwise
+        rhs_shape: Shape of the right-hand side matrix (K, N)
+
+    Returns:
+        List of GEMMConfig objects, each containing all values needed for computation:
+        - Matrix dimensions: M, N, K
+        - Hardware tile sizes: TILE_M, TILE_N, TILE_K
+        - Total tiles: TILES_IN_M, TILES_IN_N, TILES_IN_K
+        - Block counts: NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K
+        - Tiles per block: TILES_PER_BLOCK_M, TILES_PER_BLOCK_N, TILES_PER_BLOCK_K
+        - Block sizes: BLOCK_M, BLOCK_N, BLOCK_K
     """
+    # Extract dimensions from shapes
+    if transposed_lhs:
+        K, M = lhs_shape
+    else:
+        M, K = lhs_shape
+    K_, N = rhs_shape
 
-    def __init__(self, transposed_lhs: bool, lhs_shape: tuple[int, int], rhs_shape: tuple[int, int]) -> None:
-        """
-        Initialize GEMM config.
-        """
-        self.transposed_lhs = transposed_lhs
-        self.lhs_shape = lhs_shape
-        self.rhs_shape = rhs_shape
+    assert K == K_, f"Contraction dimension mismatch: LHS {lhs_shape} has K={K}, RHS {rhs_shape} has K={K_}"
 
-        if self.transposed_lhs:
-            self.K, self.M = lhs_shape
-        else:
-            self.M, self.K = lhs_shape
-        K_, self.N = rhs_shape
-        assert (
-            self.K == K_
-        ), f"Contraction dimension mismatch: LHS {lhs_shape} has K={self.K}, RHS {rhs_shape} has K={K_}"
+    # Single tile sizes (hardware constants)
+    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
+    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+    TILE_K = nl.tile_size.pmax  # 128
 
-        # Single tile sizes (hardware constants)
-        self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-        self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-        self.TILE_K = nl.tile_size.pmax  # 128
+    # Generate valid configurations for each dimension
+    dimension_sizes = {"M": M, "N": N, "K": K}
+    tile_sizes = {"M": TILE_M, "N": TILE_N, "K": TILE_K}
+    m_configs = _generate_valid_configs_for_dimension(M, TILE_M)
+    n_configs = _generate_valid_configs_for_dimension(N, TILE_N)
+    k_configs = _generate_valid_configs_for_dimension(K, TILE_K)
 
-    def generate_configs(self) -> List[GEMMConfig]:
-        """
-        Generate all possible valid GEMM configurations for the current matrix dimensions.
+    # Generate cartesian product of all combinations
+    all_configs = []
+    for m_config in m_configs:
+        for n_config in n_configs:
+            for k_config in k_configs:
+                config = GEMMConfig(dimension_sizes, tile_sizes, m_config, n_config, k_config)
+                all_configs.append(config)
 
-        Returns:
-            List of dictionaries, each containing all values needed for table display:
-            - Matrix dimensions: M, N, K
-            - Hardware tile sizes: TILE_M, TILE_N, TILE_K
-            - Total tiles: TILES_IN_M, TILES_IN_N, TILES_IN_K
-            - Block counts: NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K
-            - Tiles per block: TILES_PER_BLOCK_M, TILES_PER_BLOCK_N, TILES_PER_BLOCK_K
-            - Block sizes: BLOCK_M, BLOCK_N, BLOCK_K
-        """
-        # Generate valid configurations for each dimension
-        dimension_sizes = {"M": self.M, "N": self.N, "K": self.K}
-        tile_sizes = {"M": self.TILE_M, "N": self.TILE_N, "K": self.TILE_K}
-        m_configs = _generate_valid_configs_for_dimension(self.M, self.TILE_M)
-        n_configs = _generate_valid_configs_for_dimension(self.N, self.TILE_N)
-        k_configs = _generate_valid_configs_for_dimension(self.K, self.TILE_K)
-
-        # Generate cartesian product of all combinations
-        all_configs = []
-        for m_config in m_configs:
-            for n_config in n_configs:
-                for k_config in k_configs:
-                    config = GEMMConfig(dimension_sizes, tile_sizes, m_config, n_config, k_config)
-                    all_configs.append(config)
-
-        return all_configs
+    return all_configs
 
 
 class GEMMCorrectness:
