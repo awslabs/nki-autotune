@@ -6,10 +6,9 @@ import argparse
 import numpy as np
 from neuronpy.core.language import bfloat16
 
-from autotune.cache.visualize import plot_metric
-from autotune.core.benchmark import Benchmark
+from autotune.core.gemm_config import generate_gemm_configs
 from autotune.core.job import ProfileJobs
-from autotune.modules.matmul import GEMMCorrectness, generate_gemm_configs
+from autotune.modules.matmul import GEMMCorrectness
 
 
 def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
@@ -47,21 +46,15 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         configs = generate_gemm_configs(transposed_lhs=transposed_lhs, lhs_shape=lhs_shape, rhs_shape=rhs_shape)
         for config in configs:
             print(config)
-        # valid_kernel_configs = []
-        # for kernel_config in kernel_configs:
-        #     try:
-        #         gemm_config(lhs_shape=lhs_shape, rhs_shape=rhs_shape, transposed_lhs=transposed_lhs, **kernel_config)
-        #         valid_kernel_configs.append(kernel_config)
-        #         print(gemm_config)
-        #     except Exception as e:
-        #         pass
-        # # valid_kernel_configs = random.sample(valid_kernel_configs, 500)
-        # for kernel_config in valid_kernel_configs:
+        print(f"{len(configs)} GEMM configs")
+        # configs = random.sample(configs, 500)
+        # for config in configs:
+        #     print(config)
         #     all_jobs.add_job(
         #         kernel=meta_kernel,
         #         input_tensor_shapes=[lhs_shape, rhs_shape],
         #         data_type=data_type,
-        #         kernel_kwargs=kernel_config,
+        #         kernel_kwargs={"config": config},
         #         compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
         #         postprocessing=postprocessing,
         #     )
@@ -92,14 +85,14 @@ if __name__ == "__main__":
         add_jobs(all_jobs, transposed_lhs=True)
     if args.mode == "lhs_rhs" or args.mode == "both":
         add_jobs(all_jobs, transposed_lhs=False)
-    tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
-    tuner()
+    # tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
+    # tuner()
 
-    if args.mode == "lhsT_rhs" or args.mode == "both":
-        kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]
-        plot_metric(args.cache_dir, "min_ms", kernel_names)
-        plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
-    if args.mode == "lhs_rhs" or args.mode == "both":
-        kernel_names = ["lhs_rhs_gemm_np", "lhs_rhs_meta_gemm"]
-        plot_metric(args.cache_dir, "min_ms", kernel_names)
-        plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+    # if args.mode == "lhsT_rhs" or args.mode == "both":
+    #     kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]
+    #     plot_metric(args.cache_dir, "min_ms", kernel_names)
+    #     plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+    # if args.mode == "lhs_rhs" or args.mode == "both":
+    #     kernel_names = ["lhs_rhs_gemm_np", "lhs_rhs_meta_gemm"]
+    #     plot_metric(args.cache_dir, "min_ms", kernel_names)
+    #     plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
