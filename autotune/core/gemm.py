@@ -8,8 +8,8 @@ import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 
+from autotune.core.gemm_config import GEMMConfig
 from autotune.core.tensor import HBMTensor, SBUFTensor, TileCoordinates
-from autotune.modules.matmul import GEMMConfig, matmul_tiles
 
 
 class MetaGEMM:
@@ -215,32 +215,14 @@ def str_to_dict(loop_order: str) -> Dict:
 
 
 @nki.jit
-def lhsT_rhs_meta_gemm(
-    lhs: tensor,
-    rhs: tensor,
-    NUM_BLOCK_M: int,
-    NUM_BLOCK_N: int,
-    NUM_BLOCK_K: int,
-    loop_order: str,
-    lhs_position: int,
-    rhs_position: int,
-):
+def lhsT_rhs_meta_gemm(lhs: tensor, rhs: tensor, config: GEMMConfig):
     transposed_lhs = True
     gemm_instance = MetaGEMM(transposed_lhs, loop_order, lhs_position, rhs_position)
     return gemm_instance(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
 
 
 @nki.jit
-def lhs_rhs_meta_gemm(
-    lhs: tensor,
-    rhs: tensor,
-    NUM_BLOCK_M: int,
-    NUM_BLOCK_N: int,
-    NUM_BLOCK_K: int,
-    loop_order: str,
-    lhs_position: int,
-    rhs_position: int,
-):
+def lhs_rhs_meta_gemm(lhs: tensor, rhs: tensor, config: GEMMConfig):
     transposed_lhs = False
     gemm_instance = MetaGEMM(transposed_lhs, loop_order, lhs_position, rhs_position)
     return gemm_instance(lhs, rhs, NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K)
