@@ -6,6 +6,7 @@ import argparse
 import numpy as np
 from neuronpy.core.language import bfloat16
 
+from autotune.core.benchmark import Benchmark
 from autotune.core.gemm_config import generate_gemm_configs
 from autotune.core.job import ProfileJobs
 from autotune.modules.matmul import GEMMCorrectness
@@ -24,16 +25,10 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
 
     if transposed_lhs:
         baseline_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/modules/matmul.py", "lhsT_rhs_gemm_np")
-        meta_kernel = (
-            "/home/ec2-user/workplace/nki-autotune/autotune/generation/gemm_generate.py",
-            "lhsT_rhs_meta_gemm",
-        )
+        meta_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/core/gemm.py", "lhsT_rhs_meta_gemm")
     else:
         baseline_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/modules/matmul.py", "lhs_rhs_gemm_np")
-        meta_kernel = (
-            "/home/ec2-user/workplace/nki-autotune/autotune/generation/gemm_generate.py",
-            "lhs_rhs_meta_gemm",
-        )
+        meta_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/core/gemm.py", "lhs_rhs_meta_gemm")
 
     # for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
     for M, N, K in [(128, 512, 1279)]:
@@ -43,21 +38,16 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
             lhs_shape = (M, K)
         rhs_shape = (K, N)
         # Generate all possible configurations using the new function
-        configs = generate_gemm_configs(transposed_lhs=transposed_lhs, lhs_shape=lhs_shape, rhs_shape=rhs_shape)
+        configs = generate_gemm_configs(M=M, N=N, K=K)
         for config in configs:
-            print(config)
-        print(f"{len(configs)} GEMM configs")
-        # configs = random.sample(configs, 500)
-        # for config in configs:
-        #     print(config)
-        #     all_jobs.add_job(
-        #         kernel=meta_kernel,
-        #         input_tensor_shapes=[lhs_shape, rhs_shape],
-        #         data_type=data_type,
-        #         kernel_kwargs={"config": config},
-        #         compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
-        #         postprocessing=postprocessing,
-        #     )
+            all_jobs.add_job(
+                kernel=meta_kernel,
+                input_tensor_shapes=[lhs_shape, rhs_shape],
+                data_type=data_type,
+                kernel_kwargs={"config": config},
+                compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+                postprocessing=postprocessing,
+            )
         # all_jobs.add_job(
         #     kernel=baseline_kernel,
         #     input_tensor_shapes=[lhs_shape, rhs_shape],
@@ -85,8 +75,8 @@ if __name__ == "__main__":
         add_jobs(all_jobs, transposed_lhs=True)
     if args.mode == "lhs_rhs" or args.mode == "both":
         add_jobs(all_jobs, transposed_lhs=False)
-    # tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
-    # tuner()
+    tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
+    tuner()
 
     # if args.mode == "lhsT_rhs" or args.mode == "both":
     #     kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]

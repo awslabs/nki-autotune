@@ -1,9 +1,31 @@
 import math
 from itertools import permutations, product
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import neuronxcc.nki.language as nl
 import tabulate
+
+
+def str_to_dict(loop_order: str) -> Dict:
+    """
+    Convert a loop order string into a bidirectional mapping dictionary.
+
+    Args:
+        loop_order (str): String representing loop order (e.g., "MNK", "KNM").
+
+    Returns:
+        Dict: Bidirectional mapping where indices map to characters and vice versa.
+
+    Example:
+        >>> str_to_dict("MNK")
+        {0: 'M', 1: 'N', 2: 'K', 'M': 0, 'N': 1, 'K': 2}
+    """
+    assert sorted(loop_order) == sorted("MNK"), f"Invalid loop_order: {loop_order}. Must contain exactly M, N, and K."
+    loop_order_dict = {}
+    for position, axis in enumerate(loop_order):
+        loop_order_dict[position] = axis
+        loop_order_dict[axis] = position
+    return loop_order_dict
 
 
 def generate_configs(**kwargs) -> List[Dict]:
@@ -146,6 +168,37 @@ class GEMMConfig:
         self.PADDING_OVERHEAD_N = self.TILES_IN_N * self.TILE_N / self.N
         self.PADDING_OVERHEAD_K = self.TILES_IN_K * self.TILE_K / self.K
 
+        self.loop_order_str = loop_order
+        self.loop_order = str_to_dict(loop_order)
+
+        self.op_positions: Dict[str, int] = {}
+        self.op_positions["lhs"] = self._parse_absolute_position(lhs_position, ("M", "K"))
+        self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, ("K", "N"))
+        self.op_positions["result"] = self.loop_order["K"]
+        self.op_positions["save"] = self.loop_order["K"]
+
+    def _parse_absolute_position(self, relative_position: int, axes: Tuple[str, ...]):
+        """
+        Convert relative_position to absolute_position.
+        Relative position is wrt the axes.
+        |0| A0 |1| A1 |2|
+        - As small as possible to reduce redundant ops.
+
+        Example:
+            If axes=('M','K') with positions [1,3] and relative_position=1:
+            Returns 2 (must be > 1 and <= 3, so minimum is 2)
+        """
+        axis_positions = sorted([self.loop_order[axis] for axis in axes])
+        if relative_position == 0:
+            absolute_position = 0
+        elif relative_position == 1:
+            absolute_position = axis_positions[0] + 1
+        elif relative_position == 2:
+            absolute_position = axis_positions[1] + 1
+        else:
+            raise Exception(f"relative_position {relative_position} is out of bound for axes {axes}.")
+        return absolute_position
+
     def __repr__(self) -> str:
         """
         Return a comprehensive string representation of the GEMM configuration.
@@ -154,13 +207,13 @@ class GEMMConfig:
             Formatted string showing configuration parameters and computed values.
         """
         class_name = self.__class__.__name__
-        header = f"{class_name}"
+        header = f"{class_name}(lhs_position {self.op_positions['lhs']} rhs_position {self.op_positions['rhs']} loop_order {self.loop_order_str})"
 
         # Check if dimensions have been configured (after __call__ has been invoked)
         if not hasattr(self, "M"):
             return f"{header}\n  Status: Not configured - call with input matrices first"
 
-        # Create comprehensive table data with better organization
+        # Create complete table data including merged rows
         table_data = [
             ["Matrix dimensions", self.M, self.N, self.K],
             ["Hardware tile size", self.TILE_M, self.TILE_N, self.TILE_K],
@@ -171,19 +224,18 @@ class GEMMConfig:
             ["Padding Overhead", self.PADDING_OVERHEAD_M, self.PADDING_OVERHEAD_N, self.PADDING_OVERHEAD_K],
         ]
 
-        # Generate formatted table
+        # Generate the complete table with merged rows
         table = tabulate.tabulate(
             table_data,
-            headers=["Parameter", "M (rows)", "N (cols)", "K (inner)"],
+            headers=["Parameter", "M (rows)", "N (cols)", "K (contraction)"],
             tablefmt="simple_outline",
             numalign="right",
         )
+
         return f"{header}\n{table}"
 
 
-def generate_gemm_configs(
-    transposed_lhs: bool, lhs_shape: tuple[int, int], rhs_shape: tuple[int, int]
-) -> List[GEMMConfig]:
+def generate_gemm_configs(M: int, N: int, K: int) -> List[Dict]:
     """
     Generate all possible valid GEMM configurations for the given matrix dimensions.
 
@@ -195,7 +247,6 @@ def generate_gemm_configs(
     Dimension = NUM_BLOCKS x TILES_IN_BLOCK x TILE_SIZE
 
     Args:
-        transposed_lhs: Whether the left-hand side matrix is transposed
         lhs_shape: Shape of the left-hand side matrix (K, M) if transposed, (M, K) otherwise
         rhs_shape: Shape of the right-hand side matrix (K, N)
 
@@ -208,14 +259,6 @@ def generate_gemm_configs(
         - Tiles per block: TILES_PER_BLOCK_M, TILES_PER_BLOCK_N, TILES_PER_BLOCK_K
         - Block sizes: BLOCK_M, BLOCK_N, BLOCK_K
     """
-    # Extract dimensions from shapes
-    if transposed_lhs:
-        K, M = lhs_shape
-    else:
-        M, K = lhs_shape
-    K_, N = rhs_shape
-    assert K == K_, f"Contraction dimension mismatch: LHS {lhs_shape} has K={K}, RHS {rhs_shape} has K={K_}"
-
     # Single tile sizes (hardware constants)
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
@@ -238,7 +281,6 @@ def generate_gemm_configs(
     )
     gemm_configs = []
     for config in configs:
-        config = GEMMConfig(**config)
         gemm_configs.append(config)
 
     return gemm_configs
