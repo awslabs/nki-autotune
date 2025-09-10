@@ -1,4 +1,5 @@
 import math
+from typing import Dict, List
 
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
@@ -10,7 +11,146 @@ from autotune.core.tensor import SBUFTensor
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
 
+def _generate_valid_configs_for_dimension(dimension_size: int, tile_size: int) -> List[Dict[str, int]]:
+    """
+    Generate valid block configurations for tiling a dimension.
+
+    Each configuration divides the dimension into blocks, where each block contains
+    multiple tiles of size tile_size. All blocks except the last must be full,
+    and the last block must have remaining data that fits within one block_size.
+
+    Example: dimension_size=1279, tile_size=128
+    - Valid: 3 blocks of 4 tiles each (block_size=512)
+      → First 2 blocks: 1024, Last block covers remaining: 255
+    - Invalid: 4 blocks of 4 tiles each (block_size=512)
+      → First 3 blocks already cover 1536 > 1279
+
+    Args:
+        dimension_size: Size of the dimension to tile
+        tile_size: Size of each hardware tile
+
+    Returns:
+        List of dicts with keys: num_blocks, tiles_per_block, block_size, total_tiles
+    """
+    valid_configs = []
+
+    # Calculate the total tiles needed for this dimension
+    max_tiles_needed = math.ceil(dimension_size / tile_size)
+
+    # Try different numbers of blocks from 1 to max_tiles_needed
+    for num_blocks in range(1, max_tiles_needed + 1):
+        # Try different tiles_per_block values
+        # Start from 1 and go up to a reasonable maximum
+        max_tiles_per_block = max_tiles_needed
+
+        for tiles_per_block in range(1, max_tiles_per_block + 1):
+            block_size = tiles_per_block * tile_size
+
+            # Calculate total coverage with this configuration
+            # All blocks except the last are full
+            full_blocks_coverage = (num_blocks - 1) * block_size
+
+            # Check if we already exceed dimension_size with just full blocks
+            if full_blocks_coverage >= dimension_size:
+                # This means we don't need the last block, so it's invalid
+                continue
+
+            # Calculate what the last block needs to cover
+            remaining_size = dimension_size - full_blocks_coverage
+
+            # The last block must not be empty and should not exceed block_size
+            if remaining_size <= 0 or remaining_size > block_size:
+                continue
+
+            # This is a valid configuration
+            valid_configs.append(
+                {
+                    "num_blocks": num_blocks,
+                    "tiles_per_block": tiles_per_block,
+                    "block_size": block_size,
+                    "total_tiles": num_blocks * tiles_per_block,
+                }
+            )
+    return valid_configs
+
+
 class GEMMConfig:
+    def __init__(
+        self,
+        dimension_sizes: Dict[str, int],
+        tile_sizes: Dict[str, int],
+        m_config: Dict[str, int],
+        n_config: Dict[str, int],
+        k_config: Dict[str, int],
+    ) -> None:
+        # Set dimension sizes
+        self.M = dimension_sizes["M"]
+        self.N = dimension_sizes["N"]
+        self.K = dimension_sizes["K"]
+
+        # Set tile sizes
+        self.TILE_M = tile_sizes["M"]
+        self.TILE_N = tile_sizes["N"]
+        self.TILE_K = tile_sizes["K"]
+
+        # Set block configuration from configs
+        self.NUM_BLOCK_M = m_config["num_blocks"]
+        self.NUM_BLOCK_N = n_config["num_blocks"]
+        self.NUM_BLOCK_K = k_config["num_blocks"]
+
+        self.TILES_PER_BLOCK_M = m_config["tiles_per_block"]
+        self.TILES_PER_BLOCK_N = n_config["tiles_per_block"]
+        self.TILES_PER_BLOCK_K = k_config["tiles_per_block"]
+
+        self.BLOCK_M = m_config["block_size"]
+        self.BLOCK_N = n_config["block_size"]
+        self.BLOCK_K = k_config["block_size"]
+
+        # Set total tiles from configs
+        self.TILES_IN_M = m_config["total_tiles"]
+        self.TILES_IN_N = n_config["total_tiles"]
+        self.TILES_IN_K = k_config["total_tiles"]
+
+        self.PADDING_OVERHEAD_M = self.TILES_IN_M * self.TILE_M / self.M
+        self.PADDING_OVERHEAD_N = self.TILES_IN_N * self.TILE_N / self.N
+        self.PADDING_OVERHEAD_K = self.TILES_IN_K * self.TILE_K / self.K
+
+    def __repr__(self) -> str:
+        """
+        Return a comprehensive string representation of the GEMM configuration.
+
+        Returns:
+            Formatted string showing configuration parameters and computed values.
+        """
+        class_name = self.__class__.__name__
+        header = f"{class_name}"
+
+        # Check if dimensions have been configured (after __call__ has been invoked)
+        if not hasattr(self, "M"):
+            return f"{header}\n  Status: Not configured - call with input matrices first"
+
+        # Create comprehensive table data with better organization
+        table_data = [
+            ["Matrix dimensions", self.M, self.N, self.K],
+            ["Hardware tile size", self.TILE_M, self.TILE_N, self.TILE_K],
+            ["Total tiles", self.TILES_IN_M, self.TILES_IN_N, self.TILES_IN_K],
+            ["Block count", self.NUM_BLOCK_M, self.NUM_BLOCK_N, self.NUM_BLOCK_K],
+            ["Tiles per block", self.TILES_PER_BLOCK_M, self.TILES_PER_BLOCK_N, self.TILES_PER_BLOCK_K],
+            ["Block size", self.BLOCK_M, self.BLOCK_N, self.BLOCK_K],
+            ["Padding Overhead", self.PADDING_OVERHEAD_M, self.PADDING_OVERHEAD_N, self.PADDING_OVERHEAD_K],
+        ]
+
+        # Generate formatted table
+        table = tabulate.tabulate(
+            table_data,
+            headers=["Parameter", "M (rows)", "N (cols)", "K (inner)"],
+            tablefmt="simple_outline",
+            numalign="right",
+        )
+        return f"{header}\n{table}"
+
+
+class GEMMConfigGen:
     """
     Configuration and validation for GEMM (General Matrix Multiplication) operations.
 
@@ -19,52 +159,17 @@ class GEMMConfig:
     the specified blocking strategy and hardware tile constraints.
 
     The class calculates block and tile arrangements using the formula:
-    Dimension = NUM_BLOCKS x TILES_PER_BLOCK x TILE_SIZE
-
-    Hardware tile sizes:
-    - TILE_M: 128 (stationary dimension)
-    - TILE_N: 512 (moving dimension)
-    - TILE_K: 128 (contraction dimension)
+    Dimension = NUM_BLOCKS x TILES_IN_BLOCK x TILE_SIZE
     """
 
-    def __init__(self) -> None:
+    def __init__(self, transposed_lhs: bool, lhs_shape: tuple[int, int], rhs_shape: tuple[int, int]) -> None:
         """
         Initialize GEMM config.
         """
-        # Single tile sizes (hardware constants)
-        self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-        self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-        self.TILE_K = nl.tile_size.pmax  # 128
-
-    def __call__(
-        self,
-        transposed_lhs: bool,
-        lhs_shape: tuple[int, int],
-        rhs_shape: tuple[int, int],
-        NUM_BLOCK_M: int,
-        NUM_BLOCK_N: int,
-        NUM_BLOCK_K: int,
-        **kwargs,
-    ) -> None:
-        """
-        Configure GEMM operation parameters from input matrices and blocking configuration.
-
-        Extracts matrix dimensions, validates compatibility, and computes tile/block
-        arrangements for each dimension following: Dimension = NUM_BLOCKS × TILES_PER_BLOCK × TILE_SIZE
-
-        Args:
-            transposed_lhs: If True, treats LHS matrix as transposed (KxM instead of MxK)
-            input_tensors: Tuple of (lhs, rhs) matrices. LHS shape is (M,K) or (K,M) if transposed.
-            kernel_kwargs: Dict with NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K block counts.
-
-        Raises:
-            AssertionError: If contraction dimensions mismatch or block count exceeds available tiles.
-
-        Sets attributes:
-            Matrix dims (M, N, K), tile sizes (TILE_M/N/K), block config (NUM_BLOCK_*, BLOCK_*),
-            and tile counts (TILES_IN_*, TILES_IN_BLOCK_*) for GEMM kernel execution.
-        """
         self.transposed_lhs = transposed_lhs
+        self.lhs_shape = lhs_shape
+        self.rhs_shape = rhs_shape
+
         if self.transposed_lhs:
             self.K, self.M = lhs_shape
         else:
@@ -79,63 +184,35 @@ class GEMMConfig:
         self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
         self.TILE_K = nl.tile_size.pmax  # 128
 
-        self.NUM_BLOCK_M = NUM_BLOCK_M
-        self.NUM_BLOCK_N = NUM_BLOCK_N
-        self.NUM_BLOCK_K = NUM_BLOCK_K
-
-        self.TILES_IN_M = math.ceil(self.M / self.TILE_M)
-        assert (
-            self.TILES_IN_M >= self.NUM_BLOCK_M
-        ), f"NUM_BLOCK_M={self.NUM_BLOCK_M} exceeds available M tiles={self.TILES_IN_M}"
-        self.TILES_IN_BLOCK_M = math.ceil(self.TILES_IN_M / self.NUM_BLOCK_M)
-        self.BLOCK_M = int(self.TILES_IN_BLOCK_M * self.TILE_M)
-
-        self.TILES_IN_N = math.ceil(self.N / self.TILE_N)
-        assert (
-            self.TILES_IN_N >= self.NUM_BLOCK_N
-        ), f"NUM_BLOCK_N={self.NUM_BLOCK_N} exceeds available N tiles={self.TILES_IN_N}"
-        self.TILES_IN_BLOCK_N = math.ceil(self.TILES_IN_N / self.NUM_BLOCK_N)
-        self.BLOCK_N = int(self.TILES_IN_BLOCK_N * self.TILE_N)
-
-        self.TILES_IN_K = math.ceil(self.K / self.TILE_K)
-        assert (
-            self.TILES_IN_K >= self.NUM_BLOCK_K
-        ), f"NUM_BLOCK_K={self.NUM_BLOCK_K} exceeds available K tiles={self.TILES_IN_K}"
-        self.TILES_IN_BLOCK_K = math.ceil(self.TILES_IN_K / self.NUM_BLOCK_K)
-        self.BLOCK_K = int(self.TILES_IN_BLOCK_K * self.TILE_K)
-
-    def __repr__(self) -> str:
+    def generate_configs(self) -> List[GEMMConfig]:
         """
-        Return a comprehensive string representation of the GEMM configuration.
+        Generate all possible valid GEMM configurations for the current matrix dimensions.
 
         Returns:
-            Formatted string showing configuration parameters and computed values.
+            List of dictionaries, each containing all values needed for table display:
+            - Matrix dimensions: M, N, K
+            - Hardware tile sizes: TILE_M, TILE_N, TILE_K
+            - Total tiles: TILES_IN_M, TILES_IN_N, TILES_IN_K
+            - Block counts: NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K
+            - Tiles per block: TILES_PER_BLOCK_M, TILES_PER_BLOCK_N, TILES_PER_BLOCK_K
+            - Block sizes: BLOCK_M, BLOCK_N, BLOCK_K
         """
-        class_name = self.__class__.__name__
-        header = f"{class_name}(transposed_lhs={self.transposed_lhs})"
+        # Generate valid configurations for each dimension
+        dimension_sizes = {"M": self.M, "N": self.N, "K": self.K}
+        tile_sizes = {"M": self.TILE_M, "N": self.TILE_N, "K": self.TILE_K}
+        m_configs = _generate_valid_configs_for_dimension(self.M, self.TILE_M)
+        n_configs = _generate_valid_configs_for_dimension(self.N, self.TILE_N)
+        k_configs = _generate_valid_configs_for_dimension(self.K, self.TILE_K)
 
-        # Check if dimensions have been configured (after __call__ has been invoked)
-        if not hasattr(self, "M"):
-            return f"{header}\n  Status: Not configured - call with input matrices first"
+        # Generate cartesian product of all combinations
+        all_configs = []
+        for m_config in m_configs:
+            for n_config in n_configs:
+                for k_config in k_configs:
+                    config = GEMMConfig(dimension_sizes, tile_sizes, m_config, n_config, k_config)
+                    all_configs.append(config)
 
-        # Create comprehensive table data with better organization
-        table_data = [
-            ["Matrix dimensions", self.M, self.N, self.K],
-            ["Hardware tile size", self.TILE_M, self.TILE_N, self.TILE_K],
-            ["Total tiles", self.TILES_IN_M, self.TILES_IN_N, self.TILES_IN_K],
-            ["Block count", self.NUM_BLOCK_M, self.NUM_BLOCK_N, self.NUM_BLOCK_K],
-            ["Tiles per block", self.TILES_IN_BLOCK_M, self.TILES_IN_BLOCK_N, self.TILES_IN_BLOCK_K],
-            ["Block size", self.BLOCK_M, self.BLOCK_N, self.BLOCK_K],
-        ]
-
-        # Generate formatted table
-        table = tabulate.tabulate(
-            table_data,
-            headers=["Parameter", "M (rows)", "N (cols)", "K (inner)"],
-            tablefmt="simple_outline",
-            numalign="right",
-        )
-        return f"{header}\n{table}"
+        return all_configs
 
 
 class GEMMCorrectness:
