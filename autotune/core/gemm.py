@@ -72,8 +72,6 @@ class MetaGEMM:
         Returns:
             Any: _description_
         """
-        print(self.gemm_config)
-        print(self.loop_ranges)
         if self.transposed_lhs:
             self.lhs_hbm = HBMTensor(lhs, axes=("K", "M"))
         else:
