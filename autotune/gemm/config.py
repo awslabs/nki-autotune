@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from itertools import permutations, product
 from typing import Dict, List, Tuple
@@ -62,7 +65,7 @@ def generate_configs(**kwargs) -> List[Dict]:
     return configs
 
 
-def _generate_blocks_for_axis(axis: str, size: int, tile_size: int) -> List[Dict[str, int]]:
+def _generate_blocks_for_axis(size: int, tile_size: int) -> List[Dict[str, int]]:
     """
     Generate valid block configurations for tiling an axis.
 
@@ -276,9 +279,9 @@ def generate_gemm_configs(M: int, N: int, K: int) -> List[Dict]:
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
     TILE_K = nl.tile_size.pmax  # 128
 
-    m_configs = _generate_blocks_for_axis("M", M, TILE_M)
-    n_configs = _generate_blocks_for_axis("N", N, TILE_N)
-    k_configs = _generate_blocks_for_axis("K", K, TILE_K)
+    m_configs = _generate_blocks_for_axis(M, TILE_M)
+    n_configs = _generate_blocks_for_axis(N, TILE_N)
+    k_configs = _generate_blocks_for_axis(K, TILE_K)
     loop_orders = ["".join(loop_order) for loop_order in permutations("MNK")]
     lhs_positions = [0, 1, 2]
     rhs_positions = [0, 1, 2]

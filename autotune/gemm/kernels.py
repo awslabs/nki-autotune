@@ -1,7 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-
 from typing import Any, Dict
 
 import neuronxcc.nki as nki
@@ -9,9 +8,9 @@ import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 
-from autotune.core.gemm_config import GEMMConfig
 from autotune.core.tensor import HBMTensor, SBUFTensor, TileCoordinates
-from autotune.modules.matmul import calculate_tile_overlap_ranges
+from autotune.gemm.config import GEMMConfig
+from autotune.gemm.utils import calculate_tile_overlap_ranges
 
 
 class MetaGEMM:
