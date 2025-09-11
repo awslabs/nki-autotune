@@ -2,18 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import os
 
 import numpy as np
 from neuronpy.core.language import bfloat16
 
 from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
-from autotune.core.gemm_config import generate_gemm_configs
 from autotune.core.job import ProfileJobs
-from autotune.modules.matmul import GEMMCorrectness
+from autotune.gemm import GEMMCorrectness, generate_gemm_configs
 
 
 def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
+    # Dynamically find the project root directory
+    current_file = os.path.abspath(__file__)  # /path/to/nki-autotune/examples/gemm.py
+    examples_dir = os.path.dirname(current_file)  # /path/to/nki-autotune/examples/
+    project_root = os.path.dirname(examples_dir)  # /path/to/nki-autotune/
+
     data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
@@ -25,11 +30,11 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         raise NotImplementedError(f"{data_type} is not implemented.")
 
     if transposed_lhs:
-        baseline_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/modules/matmul.py", "lhsT_rhs_gemm_np")
-        meta_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/core/gemm.py", "lhsT_rhs_meta_gemm")
+        baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhsT_rhs_gemm_np")
+        meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhsT_rhs_meta_gemm")
     else:
-        baseline_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/modules/matmul.py", "lhs_rhs_gemm_np")
-        meta_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/core/gemm.py", "lhs_rhs_meta_gemm")
+        baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhs_rhs_gemm_np")
+        meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhs_rhs_meta_gemm")
 
     # for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
     for M, N, K in [(3757, 1647, 2539)]:
