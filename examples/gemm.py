@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import random
 
 import numpy as np
 from neuronpy.core.language import bfloat16
@@ -39,8 +40,8 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         rhs_shape = (K, N)
         # Generate all possible configurations using the new function
         configs = generate_gemm_configs(M=M, N=N, K=K)
+        configs = random.sample(configs, 1)
         for config in configs:
-            print(config)
             all_jobs.add_job(
                 kernel=meta_kernel,
                 input_tensor_shapes=[lhs_shape, rhs_shape],

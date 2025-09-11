@@ -62,69 +62,52 @@ def generate_configs(**kwargs) -> List[Dict]:
     return configs
 
 
-def _generate_blocks_for_axis(axis: str, dimension_size: int, tile_size: int) -> List[Dict[str, int]]:
+def _generate_blocks_for_axis(axis: str, size: int, tile_size: int) -> List[Dict[str, int]]:
     """
-    Generate valid block configurations for tiling a dimension.
+    Generate valid block configurations for tiling an axis.
 
-    Each configuration divides the dimension into blocks, where each block contains
-    multiple tiles. All blocks except the last must be full, and the last block
-    must have remaining data that fits within one block_size.
+    Each configuration divides the axis into blocks, where each block contains
+    multiple tiles.
+    The total number of tiles is the minimum required to fully cover the axis size.
 
-    Example: dimension_size=1279, tile_size=128
-    - Valid: 3 blocks of 4 tiles each (block_size=512)
-      → First 2 blocks: 1024, Last block covers remaining: 255
+    Example: size=1279, tile_size=128
+    - Needs 10 tiles in total
+    Valid configurations:
+    - 1 block, each with 10 tiles
+    - 2 blocks, each with 5 tiles
+    - 5 blocks, each with 2 tiles
+    - 10 blocks, each with 1 tile
 
     Args:
         axis: Axis identifier (unused, kept for compatibility)
-        dimension_size: Size of the dimension to tile
+        size: Size of the axis to tile
         tile_size: Size of each hardware tile
 
     Returns:
         List[Dict[str, int]]: Configurations with keys: size, tile_size, num_blocks,
                               tiles_per_block, block_size, total_tiles
     """
-    valid_configs = []
+    # Calculate total number of tiles needed to cover the axis
+    total_tiles = math.ceil(size / tile_size)
 
-    # Calculate the total tiles needed for this dimension
-    max_tiles_needed = math.ceil(dimension_size / tile_size)
-
-    # Try different numbers of blocks from 1 to max_tiles_needed
-    for num_blocks in range(1, max_tiles_needed + 1):
-        # Try different tiles_per_block values
-        # Start from 1 and go up to a reasonable maximum
-        max_tiles_per_block = max_tiles_needed
-
-        for tiles_per_block in range(1, max_tiles_per_block + 1):
+    # Find all divisors of total_tiles
+    configurations = []
+    for num_blocks in range(1, total_tiles + 1):
+        if total_tiles % num_blocks == 0:
+            tiles_per_block = total_tiles // num_blocks
             block_size = tiles_per_block * tile_size
 
-            # Calculate total coverage with this configuration
-            # All blocks except the last are full
-            full_blocks_coverage = (num_blocks - 1) * block_size
+            config = {
+                "size": size,
+                "tile_size": tile_size,
+                "num_blocks": num_blocks,
+                "tiles_per_block": tiles_per_block,
+                "block_size": block_size,
+                "total_tiles": total_tiles,
+            }
+            configurations.append(config)
 
-            # Check if we already exceed dimension_size with just full blocks
-            if full_blocks_coverage >= dimension_size:
-                # This means we don't need the last block, so it's invalid
-                continue
-
-            # Calculate what the last block needs to cover
-            remaining_size = dimension_size - full_blocks_coverage
-
-            # The last block must not be empty and should not exceed block_size
-            if remaining_size <= 0 or remaining_size > block_size:
-                continue
-
-            # This is a valid configuration
-            valid_configs.append(
-                {
-                    "size": dimension_size,
-                    "tile_size": tile_size,
-                    "num_blocks": num_blocks,
-                    "tiles_per_block": tiles_per_block,
-                    "block_size": block_size,
-                    "total_tiles": num_blocks * tiles_per_block,
-                }
-            )
-    return valid_configs
+    return configurations
 
 
 class GEMMConfig:
@@ -182,9 +165,13 @@ class GEMMConfig:
         self.TILES_IN_N = n_config["total_tiles"]
         self.TILES_IN_K = k_config["total_tiles"]
 
-        self.PADDING_OVERHEAD_M = self.TILES_IN_M * self.TILE_M / self.M
-        self.PADDING_OVERHEAD_N = self.TILES_IN_N * self.TILE_N / self.N
-        self.PADDING_OVERHEAD_K = self.TILES_IN_K * self.TILE_K / self.K
+        self.PADDED_M = self.TILES_IN_M * self.TILE_M
+        self.PADDED_N = self.TILES_IN_N * self.TILE_N
+        self.PADDED_K = self.TILES_IN_K * self.TILE_K
+
+        self.PADDING_OVERHEAD_M = self.PADDED_M / self.M
+        self.PADDING_OVERHEAD_N = self.PADDED_N / self.N
+        self.PADDING_OVERHEAD_K = self.PADDED_K / self.K
 
         self.loop_order_str = loop_order
         self.loop_order = str_to_dict(loop_order)
@@ -241,6 +228,7 @@ class GEMMConfig:
         # Create complete table data including merged rows
         table_data = [
             ["Matrix dimensions", self.M, self.N, self.K],
+            ["Padded matrix dimensions", self.PADDED_M, self.PADDED_N, self.PADDED_K],
             ["Hardware tile size", self.TILE_M, self.TILE_N, self.TILE_K],
             ["Total tiles", self.TILES_IN_M, self.TILES_IN_N, self.TILES_IN_K],
             ["Block count", self.NUM_BLOCK_M, self.NUM_BLOCK_N, self.NUM_BLOCK_K],

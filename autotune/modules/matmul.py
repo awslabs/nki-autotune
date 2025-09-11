@@ -1,4 +1,3 @@
-import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
 
@@ -96,66 +95,6 @@ def calculate_tile_overlap_ranges(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, 
         "global_starts": {"M": M_start, "N": N_start, "K": K_start},
         "result_offsets": (result_M_offset, result_N_offset),
     }
-
-
-def matmul_tiles(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBUFTensor, tile_transposed_lhs: bool):
-    """
-    Perform tiled matrix multiplication between SBUF tiles.
-
-    Computes result_tiles += matmul(lhs_tiles, rhs_tiles) for the overlapping regions within each block.
-
-    Args:
-        lhs_tiles: Left-hand side matrix tiles stored in SBUF memory
-        rhs_tiles: Right-hand side matrix tiles stored in SBUF memory
-        result_tiles: Output matrix tiles stored in SBUF memory where results
-            will be accumulated
-        tile_transposed_lhs: (bool) - Whether lhs_tiles is transposed at the tile level.
-        Note that this is not the same as lhsT_tiles.
-    """
-    if tile_transposed_lhs:
-        TILE_M, _, _, TILE_K = lhs_tiles.tensor.shape
-    else:
-        TILE_K, _, _, TILE_M = lhs_tiles.tensor.shape
-    _TILE_K, _, _, TILE_N = rhs_tiles.tensor.shape
-    _TILE_M, _, _, _TILE_N = result_tiles.tensor.shape
-    assert (
-        TILE_K == _TILE_K
-    ), f"lhs_tiles {lhs_tiles.tensor.shape} TILE_K mismatch with rhs_tiles {rhs_tiles.tensor.shape}"
-    assert (
-        TILE_M == _TILE_M and TILE_N == _TILE_N
-    ), f"result_tiles {result_tiles.tensor.shape} shape mismatch with lhs_tiles {lhs_tiles.tensor.shape} @ rhs_tiles {rhs_tiles.tensor.shape}"
-
-    # Calculate overlapping regions using the helper function
-    overlap_info = calculate_tile_overlap_ranges(lhs_tiles, rhs_tiles, result_tiles)
-    # for key in overlap_info:
-    #     print(key, overlap_info[key])
-    num_M_tiles, num_N_tiles, num_K_tiles = overlap_info["num_tiles"]
-    M_start = overlap_info["global_starts"]["M"]
-    N_start = overlap_info["global_starts"]["N"]
-    K_start = overlap_info["global_starts"]["K"]
-    result_M_offset, result_N_offset = overlap_info["result_offsets"]
-
-    # Iterate over tiles using nl.affine_range for hardware optimization
-    idx_res = nl.mgrid[0:TILE_M, 0:TILE_N]
-    for tile_idx_M in nl.affine_range(num_M_tiles):
-        global_M_tile = M_start + tile_idx_M
-        for tile_idx_N in nl.affine_range(num_N_tiles):
-            global_N_tile = N_start + tile_idx_N
-            """
-            Use PSUM buffer to accumulate into a single hardware tile
-            """
-            result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            for tile_idx_K in nl.affine_range(num_K_tiles):
-                global_K_tile = K_start + tile_idx_K
-                # Read tiles using global indices (the read_tile method now handles conversion)
-                lhs_tile = lhs_tiles.read_tile(tile_indices={"M": global_M_tile, "K": global_K_tile})
-                rhs_tile = rhs_tiles.read_tile(tile_indices={"K": global_K_tile, "N": global_N_tile})
-                result_tile += nisa.nc_matmul(lhs_tile, rhs_tile)
-            # Store result using local indices for direct tensor access
-            # FIXME: if K=1, just copy not add
-            result_tiles.tensor[
-                idx_res.p, result_M_offset + tile_idx_M, result_N_offset + tile_idx_N, idx_res.x
-            ] += result_tile[idx_res.p, idx_res.x]
 
 
 def lhs_rhs_gemm_np(lhs, rhs):
