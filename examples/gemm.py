@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
-import random
 
 import numpy as np
 from neuronpy.core.language import bfloat16
 
+from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.gemm_config import generate_gemm_configs
 from autotune.core.job import ProfileJobs
@@ -32,7 +32,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         meta_kernel = ("/home/ec2-user/workplace/nki-autotune/autotune/core/gemm.py", "lhs_rhs_meta_gemm")
 
     # for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
-    for M, N, K in [(128, 512, 1279)]:
+    for M, N, K in [(3757, 1647, 2539)]:
         if transposed_lhs:
             lhs_shape = (K, M)
         else:
@@ -40,7 +40,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         rhs_shape = (K, N)
         # Generate all possible configurations using the new function
         configs = generate_gemm_configs(M=M, N=N, K=K)
-        configs = random.sample(configs, 1)
+        # configs = random.sample(configs, 1)
         for config in configs:
             all_jobs.add_job(
                 kernel=meta_kernel,
@@ -50,14 +50,14 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
                 compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
                 postprocessing=postprocessing,
             )
-        # all_jobs.add_job(
-        #     kernel=baseline_kernel,
-        #     input_tensor_shapes=[lhs_shape, rhs_shape],
-        #     data_type=data_type,
-        #     kernel_kwargs={},
-        #     compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
-        #     postprocessing=postprocessing,
-        # )
+        all_jobs.add_job(
+            kernel=baseline_kernel,
+            input_tensor_shapes=[lhs_shape, rhs_shape],
+            data_type=data_type,
+            kernel_kwargs={},
+            compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
+            postprocessing=postprocessing,
+        )
 
 
 if __name__ == "__main__":
@@ -80,11 +80,11 @@ if __name__ == "__main__":
     tuner = Benchmark(jobs=all_jobs, cache_root_dir=args.cache_dir)
     tuner()
 
-    # if args.mode == "lhsT_rhs" or args.mode == "both":
-    #     kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]
-    #     plot_metric(args.cache_dir, "min_ms", kernel_names)
-    #     plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
-    # if args.mode == "lhs_rhs" or args.mode == "both":
-    #     kernel_names = ["lhs_rhs_gemm_np", "lhs_rhs_meta_gemm"]
-    #     plot_metric(args.cache_dir, "min_ms", kernel_names)
-    #     plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+    if args.mode == "lhsT_rhs" or args.mode == "both":
+        kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]
+        plot_metric(args.cache_dir, "min_ms", kernel_names)
+        plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+    if args.mode == "lhs_rhs" or args.mode == "both":
+        kernel_names = ["lhs_rhs_gemm_np", "lhs_rhs_meta_gemm"]
+        plot_metric(args.cache_dir, "min_ms", kernel_names)
+        plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
