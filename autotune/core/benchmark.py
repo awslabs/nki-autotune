@@ -1,12 +1,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from tqdm import tqdm
 
 from autotune.cache.results import ProfileResults
-from autotune.core.job import ProfileJobs
+from autotune.core.job import ProfileJobs, compile_jobs
 from autotune.core.parallel import set_neuron_core, split_jobs_into_groups
 from autotune.core.run_nki import run_on_neuron_core
 
@@ -16,16 +17,39 @@ class Benchmark:
     Compile and benchmark NKI kernel on NeuronDevice.
     """
 
-    def __init__(self, jobs: ProfileJobs, cache_root_dir: str, warmup: int = 10, iters: int = 100):
+    def __init__(self, jobs: ProfileJobs, warmup: int = 10, iters: int = 100):
         self.jobs = jobs
-        self.cache_root_dir = cache_root_dir
         self.warmup = warmup
         self.iters = iters
 
     def __call__(self):
         self.results = ProfileResults(sort_key="min_ms", lower_is_better=True)
-        self._run_on_neuron_cores()
+        self._compile_all_kernels()
+        # self._run_on_neuron_cores()
         self.results.dump_summary()
+
+    def _compile_all_kernels(self):
+        """Main function to launch Neuron core worker subprocesses."""
+        num_workers = min(os.cpu_count() - 1, self.jobs.num_jobs)
+        job_id_groups = split_jobs_into_groups(job_ids=list(range(self.jobs.num_jobs)), num_groups=num_workers)
+        futures = {}
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            for rank, rank_job_ids in enumerate(job_id_groups):
+                rank_jobs = self.jobs.subset(rank_job_ids)
+                future = executor.submit(compile_jobs, rank_jobs, self.results.sort_key, self.results.lower_is_better)
+                futures[future] = (rank, rank_job_ids)
+
+        with tqdm(
+            total=self.jobs.num_jobs,
+            desc=f"Compiling {self.jobs.num_jobs} kernels on {num_workers} CPUs",
+            unit="kernels",
+        ) as pbar:
+            for future in as_completed(futures):
+                rank, rank_job_ids = futures[future]
+                updated_results = future.result()
+                for updated_result in updated_results:
+                    self.results.results.append(updated_result)
+                pbar.update(len(updated_results))
 
     def _run_on_neuron_cores(self):
         """Main function to launch Neuron core worker subprocesses."""
