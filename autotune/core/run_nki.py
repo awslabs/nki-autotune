@@ -131,7 +131,6 @@ def run_on_neuron_core(
             cache_dir=job.cache_dir,
             matmul_mac_count=matmul_mac_count,
         )
-        job.init_job_dir()
         results.append(result)
 
     # Pre-initialize all input tensors once for all jobs with the same shapes
