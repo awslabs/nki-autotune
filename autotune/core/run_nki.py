@@ -3,12 +3,12 @@ from typing import List
 from neuronpy.runtime.spike import SpikeExecutor
 
 from autotune.cache.results import ProfileResult, capture_error_message
-from autotune.core.compile import compile_kernel, create_spike_kernel, run_spike_kernel
+from autotune.core.compile import create_spike_kernel, run_spike_kernel
 from autotune.core.job import ProfileJobs
-from autotune.core.metrics import extract_metrics, tensor_to_matmul_mac_count
+from autotune.core.metrics import extract_metrics
 
 
-def compile_all_kernels(jobs: ProfileJobs, results: List[ProfileResult]) -> None:
+def compile_kernels(jobs: ProfileJobs, cache_root_dir: str, sort_key: str, lower_is_better: bool) -> None:
     """
     Compile all kernels on CPU without requiring SpikeExecutor.
 
@@ -16,9 +16,19 @@ def compile_all_kernels(jobs: ProfileJobs, results: List[ProfileResult]) -> None
         jobs: ProfileJobs containing all jobs to compile
         results: List of ProfileResult objects to update with compilation results
     """
-    for job, result in zip(jobs.jobs, results):
+    results = []
+    for job in jobs.jobs:
         try:
-            assert job.index == result.index, f"job index {job.index} mismatch result index {result.index}"
+            result = ProfileResult(
+                index=job.index,
+                main_metric=sort_key,
+                lower_is_better=lower_is_better,
+                kernel=job.kernel,
+                kernel_kwargs=job.kernel_kwargs,
+                compiler_flags=job.compiler_flags,
+                cache_dir=job.cache_dir,
+                matmul_mac_count=job.matmul_mac_count,
+            )
 
             # Compile kernel (CPU-only operation)
             neff = compile_kernel(
@@ -120,7 +130,6 @@ def run_on_neuron_core(
     results = []
     for job in jobs:
         job.cache_root_dir = cache_root_dir
-        matmul_mac_count = tensor_to_matmul_mac_count(job.input_tensor_shapes)
         result = ProfileResult(
             index=job.index,
             main_metric=sort_key,
@@ -129,17 +138,14 @@ def run_on_neuron_core(
             kernel_kwargs=job.kernel_kwargs,
             compiler_flags=job.compiler_flags,
             cache_dir=job.cache_dir,
-            matmul_mac_count=matmul_mac_count,
+            matmul_mac_count=job.matmul_mac_count,
         )
         results.append(result)
 
     # Pre-initialize all input tensors once for all jobs with the same shapes
     jobs.initialize_input_tensors()
 
-    # Phase 1: Compile all kernels (CPU-only, no SpikeExecutor needed)
-    compile_all_kernels(jobs, results)
-
-    # Phase 2: Run benchmarks on Neuron (requires SpikeExecutor)
+    # Run benchmarks on Neuron (requires SpikeExecutor)
     run_neuron_benchmarks(warmup, iters, jobs, results)
 
     return results

@@ -2,11 +2,15 @@ import copy
 import os
 import pickle
 import shutil
+import signal
+import tempfile
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from autotune.core.compile import process_compiler_flags
+from autotune.cache.results import ProfileResult, capture_error_message
+from autotune.core.compile import compile_kernel, process_compiler_flags
+from autotune.core.metrics import tensor_to_matmul_mac_count
 from autotune.typing import (
     INPUT_TENSORS_DTYPE,
     KERNEL_DTYPE,
@@ -42,6 +46,7 @@ class ProfileJob:
         compiler_flags: str,
         postprocessing: POSTPROCESSING_DTYPE,
         data_type: np.dtype,
+        cache_root_dir: str,
     ) -> None:
         self.index = index
         self.kernel = kernel
@@ -49,6 +54,7 @@ class ProfileJob:
         self.kernel_kwargs = kernel_kwargs
         self.postprocessing = postprocessing
         self.data_type = data_type
+        self.cache_root_dir = cache_root_dir
         self.target_instance_family, self.compiler_flags = process_compiler_flags(compiler_flags)
         self._input_tensors = None  # Cache for generated tensors
 
@@ -56,7 +62,7 @@ class ProfileJob:
     def input_tensors(self) -> Tuple[np.ndarray, ...]:
         """Return the cached input tensors."""
         if self._input_tensors is None:
-            raise ValueError(f"Input tensors not initialized for job {self.index}")
+            raise ValueError(f"Job input tensors are not initialized")
         return self._input_tensors
 
     @input_tensors.setter
@@ -70,26 +76,6 @@ class ProfileJob:
         _, kernel_name = self.kernel
         cache_dir = f"{self.cache_root_dir}/{kernel_name}/{input_tensor_shapes_str}/id{self.index}"
         return cache_dir
-
-    @property
-    def cache_root_dir(self) -> str:
-        """
-        Get the root directory for caching.
-
-        Returns:
-            str: The root directory path
-        """
-        return self._cache_root_dir
-
-    @cache_root_dir.setter
-    def cache_root_dir(self, value: str) -> None:
-        """
-        Set the root directory for caching.
-
-        Args:
-            value: Path to the root directory
-        """
-        self._cache_root_dir = value
 
     def get_arg_shapes(self):
         arg_shapes = [arg.shape for arg in self.input_tensors]
@@ -147,7 +133,8 @@ class ProfileJob:
 
 
 class ProfileJobs:
-    def __init__(self) -> None:
+    def __init__(self, cache_root_dir: str) -> None:
+        self.cache_root_dir = cache_root_dir
         self.jobs: List[ProfileJob] = []
         self._tensor_cache: Dict[Tuple, Tuple[np.ndarray, ...]] = {}
 
@@ -167,7 +154,14 @@ class ProfileJobs:
         if postprocessing is None:
             postprocessing = dummy_postprocessing
         job = ProfileJob(
-            self.num_jobs, kernel, input_tensor_shapes, kernel_kwargs, compiler_flags, postprocessing, data_type
+            self.num_jobs,
+            kernel,
+            input_tensor_shapes,
+            kernel_kwargs,
+            compiler_flags,
+            postprocessing,
+            data_type,
+            self.cache_root_dir,
         )
         self.jobs.append(job)
 
@@ -243,7 +237,7 @@ class ProfileJobs:
             TypeError: If key is not a slice or list
         """
         if isinstance(key, (slice, list)):
-            subset_jobs = ProfileJobs()
+            subset_jobs = ProfileJobs(self.cache_root_dir)
             if isinstance(key, slice):
                 subset_jobs.jobs = self.jobs[key]
             else:  # list of indices
@@ -265,3 +259,52 @@ class ProfileJobs:
                     np.random.normal(0, 0.001, size=shape).astype(job.data_type) for shape in job.input_tensor_shapes
                 )
             job.input_tensors = self._tensor_cache[cache_key]
+
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("Compilation timed out after 10 minutes")
+
+
+def compile_jobs(jobs: ProfileJobs, sort_key: str, lower_is_better: bool) -> List[ProfileResult]:
+    results = []
+    jobs.initialize_input_tensors()
+    for job in jobs.jobs:
+        result = ProfileResult(
+            index=job.index,
+            main_metric=sort_key,
+            lower_is_better=lower_is_better,
+            kernel=job.kernel,
+            kernel_kwargs=job.kernel_kwargs,
+            compiler_flags=job.compiler_flags,
+            cache_dir=job.cache_dir,
+        )
+        tmp_dir = tempfile.mkdtemp(prefix="nki_compile_")
+        try:
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(600)
+            matmul_mac_count = tensor_to_matmul_mac_count(job.input_tensor_shapes)
+            result.add_fields(matmul_mac_count=matmul_mac_count)
+            neff = compile_kernel(
+                kernel_name=job.kernel,
+                input_tensors=job.input_tensors,
+                kernel_kwargs=job.kernel_kwargs,
+                target_instance_family=job.target_instance_family,
+                compiler_flags=job.compiler_flags,
+                output_dir=tmp_dir,
+            )
+            job.init_job_dir()
+            for item_name in os.listdir(tmp_dir):
+                src_path = os.path.join(tmp_dir, item_name)
+                dst_path = os.path.join(job.cache_dir, item_name)
+                shutil.move(src_path, dst_path)
+            neff_filename = os.path.basename(neff)
+            neff = os.path.join(job.cache_dir, neff_filename)
+            result.add_fields(neff=neff)
+        except Exception as e:
+            error_msg = capture_error_message(e)
+            result.add_error(error_msg)
+        finally:
+            signal.alarm(0)
+            shutil.rmtree(tmp_dir)
+            results.append(result)
+    return results
