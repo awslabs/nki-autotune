@@ -1,8 +1,10 @@
 import importlib
 import importlib.util
+import os
 import shutil
 import signal
 import sys
+import tempfile
 import types
 from typing import Tuple
 
@@ -151,16 +153,29 @@ def compile_kernel(
         raise Exception(f"target_instance_family {target_instance_family} must be trn1 or trn2")
     signal.signal(signal.SIGALRM, timeout_handler)
     signal.alarm(600)
+    temp_dir = tempfile.mkdtemp(prefix="nki_compile_")
     try:
         neff = compile_to_neff(
             trace_kernel=traced_kernel,
-            output_dir=output_dir,
+            output_dir=temp_dir,
             target=target,
             additional_compiler_args=compiler_flags,
             save_artifacts=True,
         )
-        return neff
+
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir)
+        for item_name in os.listdir(temp_dir):
+            src_path = os.path.join(temp_dir, item_name)
+            dst_path = os.path.join(output_dir, item_name)
+            shutil.move(src_path, dst_path)
+        neff_filename = os.path.basename(neff)
+        final_neff_path = os.path.join(output_dir, neff_filename)
+        return final_neff_path
     finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
         signal.alarm(0)
 
 

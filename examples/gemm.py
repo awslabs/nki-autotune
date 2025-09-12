@@ -37,7 +37,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhs_rhs_meta_gemm")
 
     # for M, N, K in [(4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
-    for M, N, K in [(3757, 1647, 2539)]:
+    for M, N, K in [(1236, 2847, 1539)]:
         if transposed_lhs:
             lhs_shape = (K, M)
         else:
