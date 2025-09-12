@@ -64,7 +64,7 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int, data_type: str):
         sampled_indices = random.sample(range(autotune_jobs.num_jobs), 100)
         sampled_jobs = ProfileJobs()
         for idx in sampled_indices:
-            job = autotune_jobs[idx]
+            job = autotune_jobs.jobs[idx]
             sampled_jobs.jobs.append(job)
         jobs.extend(sampled_jobs)
     else:
