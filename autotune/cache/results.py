@@ -4,7 +4,7 @@ import pickle
 import sys
 import traceback
 import warnings
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from autotune.typing.infra_types import KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
 
@@ -45,13 +45,28 @@ class ProfileResult:
 
     @property
     def main_metric_val(self) -> float:
-        if "error" in self.attributes:
+        if "error" in self.attributes or self.main_metric not in self.attributes:
             if self.lower_is_better:
-                return float("inf")
+                val = float("inf")
             else:
-                return float("-inf")
+                val = float("-inf")
         else:
-            return getattr(self, self.main_metric)
+            val = getattr(self, self.main_metric)
+        return val
+
+    @property
+    def sort_val(self) -> Tuple[float, float]:
+        if self.lower_is_better:
+            score = self.main_metric_val
+        else:
+            score = -self.main_metric_val
+        if "error" in self.attributes:
+            priority = 2
+        elif self.main_metric not in self.attributes:
+            priority = 1
+        else:
+            priority = 0
+        return (priority, score)
 
     def to_dict(self) -> Dict:
         """Convert to dictionary representation including only attributes in self.attributes."""
@@ -303,14 +318,7 @@ class ProfileResults:
         json_data = {}
         for filepath, results in results_by_filepath.items():
             # Sort results using the same logic as to_dict_list
-            try:
-                sorted_results = sorted(
-                    results,
-                    key=lambda result: result.main_metric_val,
-                    reverse=not self.lower_is_better,  # Reverse sort if higher values are better
-                )
-            except:
-                sorted_results = results
+            sorted_results = sorted(results, key=lambda result: result.sort_val)
 
             # Count results with postprocessing_result: true
             correct_count = sum(
