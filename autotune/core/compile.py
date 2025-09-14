@@ -136,7 +136,7 @@ def compile_kernel(
     elif isinstance(kernel, GenericKernel):
         traced_kernel = kernel
     else:
-        raise TypeError(f"{type(kernel)} {kernel} is not supported.")
+        traced_kernel = kernel
     traced_kernel.specialize(*input_tensors, **kernel_kwargs)
     if target_instance_family == "trn1":
         target = CompilationTarget.TRN1
