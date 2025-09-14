@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import shutil
 import signal
@@ -49,6 +50,10 @@ class ProfileJob:
     ) -> None:
         self.attributes = []
         target_instance_family, compiler_flags = process_compiler_flags(compiler_flags)
+        input_tensor_shapes_str = "_".join("x".join(str(dim) for dim in shape) for shape in input_tensor_shapes)
+        _, kernel_name = kernel
+        workload_dir = f"{cache_root_dir}/{kernel_name}/{input_tensor_shapes_str}"
+        cache_dir = f"{workload_dir}/id{index}"
         self.add_attributes(
             index=index,
             kernel=kernel,
@@ -57,9 +62,11 @@ class ProfileJob:
             kernel_kwargs=kernel_kwargs,
             target_instance_family=target_instance_family,
             compiler_flags=compiler_flags,
+            cache_dir=cache_dir,
         )
         self.postprocessing = postprocessing
-        self.cache_root_dir = cache_root_dir
+        self.metric_name = "min_ms"
+        self.workload_dir = workload_dir
 
     @property
     def input_tensors(self) -> Tuple[np.ndarray, ...]:
@@ -74,26 +81,26 @@ class ProfileJob:
         """Set the input tensors for this job."""
         self._input_tensors = value
 
-    @property
-    def cache_dir(self) -> str:
-        input_tensor_shapes_str = "_".join("x".join(str(dim) for dim in shape) for shape in self.input_tensor_shapes)
-        _, kernel_name = self.kernel
-        cache_dir = f"{self.cache_root_dir}/{kernel_name}/{input_tensor_shapes_str}/id{self.index}"
-        return cache_dir
-
     def init_job_dir(self):
         if os.path.exists(self.cache_dir):
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
 
+    def to_dict(self) -> Dict:
+        """Convert to dictionary representation including only attributes in self.attributes."""
+        result = {}
+        for attr in self.attributes:
+            result[attr] = str(getattr(self, attr))
+        return result
+
     def __repr__(self) -> str:
         attribute_strs = []
         for attribute in self.attributes:
             if attribute == "error":
-                attribute_str = f"{attribute}={getattr(self, attribute)[:100]}"
+                attribute_str = getattr(self, attribute).split("\n")[0]
             else:
-                attribute_str = f"{attribute}={getattr(self, attribute)}"
-            attribute_strs.append(attribute_str)
+                attribute_str = getattr(self, attribute)
+            attribute_strs.append(f"{attribute}={attribute_str}")
         attributes_str = ", ".join(attribute_strs)
         repr_str = f"ProfileJob({attributes_str})"
         return repr_str
@@ -113,6 +120,20 @@ class ProfileJob:
     @property
     def has_error(self) -> bool:
         return hasattr(self, "error")
+
+    @property
+    def is_correct(self) -> bool:
+        return hasattr(self, "postprocessing_result") and self.postprocessing_result == True
+
+    @property
+    def sort_val(self) -> Tuple[int, float]:
+        if self.has_error:
+            val = (2, float("inf"))
+        elif not hasattr(self, self.metric_name):
+            val = (1, float("inf"))
+        else:
+            val = (1, getattr(self, self.metric_name))
+        return val
 
     def add_error(self, error_msg: str):
         """
@@ -157,17 +178,20 @@ class ProfileJobs:
         if len(self.jobs) == 0:
             return "ProfileJobs(jobs: None)"
 
-        if len(self.jobs) <= 3:
+        if len(self.jobs) <= 4:
             # For small collections, show all jobs
-            jobs_str = ",\n  ".join(str(job) for job in self.jobs)
+            jobs_str = ",\n  ".join(str(job) for job in self.jobs.values())
             result = f"ProfileJobs({len(self.jobs)} jobs):\n  {jobs_str}"
         else:
             # For larger collections, show first and last jobs with count
+            job_indices = sorted(self.jobs.keys())
             result = (
                 f"ProfileJobs({len(self.jobs)} jobs):\n"
-                f"  {self.jobs[0]},\n"
-                f"  ...({len(self.jobs) - 2} more jobs)...,\n"
-                f"  {self.jobs[-1]}"
+                f"  {self.jobs[job_indices[0]]},\n"
+                f"  {self.jobs[job_indices[1]]},\n"
+                f"  ...({len(self.jobs) - 4} more jobs)...,\n"
+                f"  {self.jobs[job_indices[-2]]},\n"
+                f"  {self.jobs[job_indices[-1]]}"
             )
 
         return result
@@ -187,6 +211,59 @@ class ProfileJobs:
                     np.random.normal(0, 0.001, size=shape).astype(job.data_type) for shape in job.input_tensor_shapes
                 )
             job.input_tensors = self._tensor_cache[cache_key]
+
+    def dump_json(self):
+        """
+        Dump the summary to JSON files.
+        Results within each cache directory are sorted by the sort_key.
+
+        Raises:
+            OSError: If the directory cannot be created or the file cannot be written
+        """
+        filename = "perf_metrics.json"
+        jobs_by_workload_dir: Dict[str, List[int]] = {}
+
+        for job_index in self.jobs:
+            job = self.jobs[job_index]
+            if job.workload_dir not in jobs_by_workload_dir:
+                jobs_by_workload_dir[job.workload_dir] = []
+            jobs_by_workload_dir[job.workload_dir].append(job_index)
+
+        for workload_dir in jobs_by_workload_dir:
+            job_indices = jobs_by_workload_dir[workload_dir]
+            sorted_job_indices = sorted(job_indices, key=lambda job_index: self.jobs[job_index].sort_val)
+
+            correct_count = 0
+            error_count = 0
+            error_types: Dict[str, int] = {}
+            for job_index in sorted_job_indices:
+                job = self.jobs[job_index]
+                if job.is_correct:
+                    correct_count += 1
+                if job.has_error:
+                    error_count += 1
+                    error_type = job.error.split("\n")[0]
+                    if error_type not in error_types:
+                        error_types[error_type] = 0
+                    error_types[error_type] += 1
+
+            json_data = {
+                "metadata": {
+                    "num_results": len(sorted_job_indices),
+                    "num_correct_results": correct_count,
+                    "num_error_results": error_count,
+                    "error_types": error_types,
+                },
+                "results": [self.jobs[job_index].to_dict() for job_index in sorted_job_indices],
+            }
+
+            try:
+                os.makedirs(workload_dir, exist_ok=True)
+                filepath = os.path.join(workload_dir, "perf_metrics.json")
+                with open(filepath, "w") as f:
+                    json.dump(json_data, f, indent=2, sort_keys=True)
+            except Exception as e:
+                raise OSError(f"Failed to save metrics to {filepath}: {str(e)}")
 
 
 def timeout_handler(signum, frame):
