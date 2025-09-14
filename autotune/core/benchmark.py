@@ -22,7 +22,7 @@ class Benchmark:
 
     def __call__(self):
         self._compile_all_kernels()
-        # self.jobs.dump_summary()
+        self.jobs.dump_json()
         # self._run_on_neuron_cores()
 
     def _compile_all_kernels(self):
