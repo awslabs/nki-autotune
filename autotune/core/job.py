@@ -1,6 +1,5 @@
 import copy
 import os
-import pickle
 import shutil
 import signal
 import tempfile
@@ -8,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from autotune.cache.results import ProfileResult, capture_error_message
+from autotune.cache.results import capture_error_message
 from autotune.core.compile import compile_kernel, process_compiler_flags
 from autotune.core.metrics import tensor_to_matmul_mac_count
 from autotune.typing import (
@@ -42,28 +41,33 @@ class ProfileJob:
         index: int,
         kernel: KERNEL_DTYPE,
         input_tensor_shapes: List[Tuple[int, ...]],
+        data_type: np.dtype,
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
         compiler_flags: str,
-        postprocessing: POSTPROCESSING_DTYPE,
-        data_type: np.dtype,
+        postprocessing: Optional[POSTPROCESSING_DTYPE],
         cache_root_dir: str,
     ) -> None:
-        self.index = index
-        self.kernel = kernel
-        self.input_tensor_shapes = input_tensor_shapes
-        self.kernel_kwargs = kernel_kwargs
+        self.attributes = []
+        target_instance_family, compiler_flags = process_compiler_flags(compiler_flags)
+        self.add_attributes(
+            index=index,
+            kernel=kernel,
+            input_tensor_shapes=input_tensor_shapes,
+            data_type=data_type,
+            kernel_kwargs=kernel_kwargs,
+            target_instance_family=target_instance_family,
+            compiler_flags=compiler_flags,
+        )
         self.postprocessing = postprocessing
-        self.data_type = data_type
         self.cache_root_dir = cache_root_dir
-        self.target_instance_family, self.compiler_flags = process_compiler_flags(compiler_flags)
-        self._input_tensors = None  # Cache for generated tensors
 
     @property
     def input_tensors(self) -> Tuple[np.ndarray, ...]:
         """Return the cached input tensors."""
-        if self._input_tensors is None:
-            raise ValueError(f"Job input tensors are not initialized")
-        return self._input_tensors
+        if hasattr(self, "_input_tensors"):
+            return self._input_tensors
+        else:
+            raise ValueError(f"ProfileJob input tensors are not initialized")
 
     @input_tensors.setter
     def input_tensors(self, value: Tuple[np.ndarray, ...]):
@@ -77,125 +81,76 @@ class ProfileJob:
         cache_dir = f"{self.cache_root_dir}/{kernel_name}/{input_tensor_shapes_str}/id{self.index}"
         return cache_dir
 
-    def get_arg_shapes(self):
-        arg_shapes = [arg.shape for arg in self.input_tensors]
-        return arg_shapes
-
     def init_job_dir(self):
         if os.path.exists(self.cache_dir):
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
 
-    def save(self):
-        """
-        Save the ProfileJob instance to its cache directory.
-        """
-        filepath = os.path.join(self.cache_dir, "profile_job.pkl")
+    def __repr__(self) -> str:
+        attribute_strs = []
+        for attribute in self.attributes:
+            if attribute == "error":
+                attribute_str = f"{attribute}={getattr(self, attribute)[:100]}"
+            else:
+                attribute_str = f"{attribute}={getattr(self, attribute)}"
+            attribute_strs.append(attribute_str)
+        attributes_str = ", ".join(attribute_strs)
+        repr_str = f"ProfileJob({attributes_str})"
+        return repr_str
 
-        state = {}
-        for key in ["index", "kernel", "input_tensors", "kernel_kwargs", "compiler_flags", "cache_dir"]:
-            value = getattr(self, key)
-            state[key] = value
-
-        # Save using pickle
-        with open(filepath, "wb") as f:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    @classmethod
-    def load(cls, filepath: str) -> Dict:
+    def add_attributes(self, **kwargs):
         """
-        Load a ProfileJob instance from disk.
+        Add additional attributes to this instance.
 
         Args:
-            filepath: Path to the saved file
-
-        Returns:
-            ProfileJob: The loaded ProfileJob instance
-
-        Raises:
-            FileNotFoundError: If the file doesn't exist
+            **kwargs: Arbitrary keyword arguments to add as attributes.
         """
-        filepath = os.path.join(filepath, "profile_job.pkl")
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"ProfileJob file not found: {filepath}")
+        for key, value in kwargs.items():
+            assert not hasattr(self, key), f"Attribute {key} already exists in ProfileJob."
+            setattr(self, key, value)
+            self.attributes.append(key)
 
-        # Load the state
-        with open(filepath, "rb") as f:
-            state = pickle.load(f)
+    @property
+    def has_error(self) -> bool:
+        return hasattr(self, "error")
 
-        return state
+    def add_error(self, error_msg: str):
+        """
+        Add error information, but only if no error has been recorded yet.
+        This ensures we keep the earliest error encountered.
 
-    def __repr__(self) -> str:
-        arg_shapes = [str(arg.shape) for arg in self.input_tensors]
-        kwargs_str = ", ".join(f"{k}={v}" for k, v in self.kernel_kwargs.items())
-
-        return f"ProfileJob(kernel={self.kernel}, input_tensor_shapes={arg_shapes}, " f"kwargs={{{kwargs_str}}})"
+        Args:
+            error_msg: The error message to record
+        """
+        if not self.has_error:
+            self.add_attributes(error=error_msg)
 
 
 class ProfileJobs:
     def __init__(self, cache_root_dir: str) -> None:
         self.cache_root_dir = cache_root_dir
-        self.jobs: List[ProfileJob] = []
+        self.jobs: Dict[int, ProfileJob] = {}
         self._tensor_cache: Dict[Tuple, Tuple[np.ndarray, ...]] = {}
 
-    def add_job(
-        self,
-        kernel: KERNEL_DTYPE,
-        input_tensor_shapes: List[Tuple[int, ...]],
-        data_type: np.dtype,
-        kernel_kwargs: KERNEL_KWARGS_DTYPE,
-        compiler_flags: str,
-        postprocessing: Optional[POSTPROCESSING_DTYPE] = None,
-    ):
-        if kernel_kwargs is None:
-            kernel_kwargs = {}
-        if compiler_flags is None:
-            compiler_flags = ""
-        if postprocessing is None:
-            postprocessing = dummy_postprocessing
-        job = ProfileJob(
-            self.num_jobs,
-            kernel,
-            input_tensor_shapes,
-            kernel_kwargs,
-            compiler_flags,
-            postprocessing,
-            data_type,
-            self.cache_root_dir,
-        )
-        self.jobs.append(job)
+    def add_job(self, **kwargs):
+        job_index = len(self.jobs)
+        job = ProfileJob(index=job_index, cache_root_dir=self.cache_root_dir, **kwargs)
+        self.jobs[job_index] = job
 
-    def extend(self, other_jobs: "ProfileJobs") -> "ProfileJobs":
+    def extend(self, other_jobs: "ProfileJobs") -> None:
         """
         Concatenate another ProfileJobs object to this one.
         This modifies the current object and also returns it for chaining.
 
         Args:
             other_jobs: Another ProfileJobs instance to append
-
-        Returns:
-            self: The modified ProfileJobs instance
         """
-
-        # Get the current number of jobs as the starting index
-        start_idx = self.num_jobs
-
-        # Deep copy each job and update only the index
-        for i, original_job in enumerate(other_jobs.jobs):
-            # Create a deep copy of the original job
+        job_index_offset = len(self.jobs)
+        for job_index in other_jobs.jobs:
+            original_job = other_jobs.jobs[job_index]
             job = copy.deepcopy(original_job)
-
-            # Update only the index
-            job.index = start_idx + i
-
-            # Add to our jobs list
-            self.jobs.append(job)
-
-        return self
-
-    @property
-    def num_jobs(self) -> int:
-        return len(self.jobs)
+            job.index = job_index_offset + job_index
+            self.jobs[job.index] = job
 
     def __repr__(self) -> str:
         """Return a string representation of ProfileJobs."""
@@ -217,42 +172,15 @@ class ProfileJobs:
 
         return result
 
-    def __iter__(self):
-        """Allow iteration over ProfileJobs."""
-        return iter(self.jobs)
-
-    def subset(self, key):
-        """
-        Create a subset of ProfileJobs using a slice or list of indices.
-
-        To access a single job, use ProfileJobs.jobs[index] directly.
-
-        Args:
-            key: A slice or list of indices to select jobs
-
-        Returns:
-            ProfileJobs: A new ProfileJobs instance containing the subset
-
-        Raises:
-            TypeError: If key is not a slice or list
-        """
-        if isinstance(key, (slice, list)):
-            subset_jobs = ProfileJobs(self.cache_root_dir)
-            if isinstance(key, slice):
-                subset_jobs.jobs = self.jobs[key]
-            else:  # list of indices
-                subset_jobs.jobs = [self.jobs[i] for i in key]
-            # Share the tensor cache with the subset
-            subset_jobs._tensor_cache = self._tensor_cache
-            return subset_jobs
-        else:
-            raise TypeError(
-                f"subset() only accepts slice or list, got {type(key).__name__}. "
-                f"To access a single job, use ProfileJobs.jobs[index] directly."
-            )
+    def subset(self, indices: List[int]) -> "ProfileJobs":
+        subset_jobs = ProfileJobs(self.cache_root_dir)
+        subset_jobs.jobs = {index: self.jobs[index] for index in indices}
+        subset_jobs._tensor_cache = self._tensor_cache
+        return subset_jobs
 
     def initialize_input_tensors(self) -> None:
-        for job in self.jobs:
+        for job_index in self.jobs:
+            job = self.jobs[job_index]
             cache_key = (tuple(job.input_tensor_shapes), job.data_type)
             if cache_key not in self._tensor_cache:
                 self._tensor_cache[cache_key] = tuple(
@@ -265,25 +193,16 @@ def timeout_handler(signum, frame):
     raise TimeoutError("Compilation timed out after 10 minutes")
 
 
-def compile_jobs(jobs: ProfileJobs, sort_key: str, lower_is_better: bool) -> List[ProfileResult]:
-    results = []
+def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
     jobs.initialize_input_tensors()
-    for job in jobs.jobs:
-        result = ProfileResult(
-            index=job.index,
-            main_metric=sort_key,
-            lower_is_better=lower_is_better,
-            kernel=job.kernel,
-            kernel_kwargs=job.kernel_kwargs,
-            compiler_flags=job.compiler_flags,
-            cache_dir=job.cache_dir,
-        )
+    for job_index in jobs.jobs:
+        job = jobs.jobs[job_index]
         tmp_dir = tempfile.mkdtemp(prefix="nki_compile_")
         try:
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(600)
             matmul_mac_count = tensor_to_matmul_mac_count(job.input_tensor_shapes)
-            result.add_fields(matmul_mac_count=matmul_mac_count)
+            job.add_attributes(matmul_mac_count=matmul_mac_count)
             neff = compile_kernel(
                 kernel_name=job.kernel,
                 input_tensors=job.input_tensors,
@@ -299,12 +218,11 @@ def compile_jobs(jobs: ProfileJobs, sort_key: str, lower_is_better: bool) -> Lis
                 shutil.move(src_path, dst_path)
             neff_filename = os.path.basename(neff)
             neff = os.path.join(job.cache_dir, neff_filename)
-            result.add_fields(neff=neff)
+            job.add_attributes(neff=neff)
         except Exception as e:
             error_msg = capture_error_message(e)
-            result.add_error(error_msg)
+            job.add_error(error_msg)
         finally:
             signal.alarm(0)
             shutil.rmtree(tmp_dir)
-            results.append(result)
-    return results
+    return jobs

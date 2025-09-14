@@ -3,7 +3,6 @@ import os
 import pickle
 import sys
 import traceback
-import warnings
 from typing import Dict, List, Tuple
 
 from autotune.typing.infra_types import KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
@@ -23,7 +22,6 @@ class ProfileResult:
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
         compiler_flags: str,
         cache_dir: str,
-        **kwargs,
     ):
         """
         Initialize a performance result.
@@ -31,17 +29,19 @@ class ProfileResult:
         self.index = index
         self.main_metric = main_metric
         self.lower_is_better = lower_is_better
-        self.attributes = set()
-        self.add_fields(kernel=kernel)
-        self.add_fields(kernel_kwargs=kernel_kwargs)
-        self.add_fields(compiler_flags=compiler_flags)
-        self.add_fields(cache_dir=cache_dir)
-        self.add_fields(**kwargs)
+        self.kernel = kernel
+        self.kernel_kwargs = kernel_kwargs
+        self.compiler_flags = compiler_flags
+        self.cache_dir = cache_dir
 
     def __repr__(self) -> str:
         """Enhanced representation showing only attributes in self.attributes"""
         attributes = [f"{k}={getattr(self, k)}" for k in self.attributes]
         return f"ProfileResult({', '.join(attributes)})"
+
+    @property
+    def has_error(self) -> bool:
+        return hasattr(self, "error")
 
     @property
     def main_metric_val(self) -> float:
@@ -86,23 +86,8 @@ class ProfileResult:
         """
 
         for key, value in kwargs.items():
-            if key in self.attributes:
-                existing_value = getattr(self, key)
-                if isinstance(existing_value, dict) and isinstance(value, dict):
-                    existing_value.update(value)
-                elif isinstance(existing_value, list) and isinstance(value, list):
-                    existing_value.extend(value)
-                elif isinstance(existing_value, set) and isinstance(value, set):
-                    existing_value.update(value)
-                else:
-                    warnings.warn(
-                        f"Cannot add to existing attribute '{key}'. Attribute type {type(existing_value).__name__} "
-                        f"does not support addition or is incompatible with {type(value).__name__}.",
-                        UserWarning,
-                    )
-            else:
-                setattr(self, key, value)
-                self.attributes.add(key)
+            assert not hasattr(self, key), f"Attribute {key} already exists in ProfileResult."
+            setattr(self, key, value)
 
     def remove_fields(self, *keys):
         """
@@ -162,45 +147,6 @@ class ProfileResult:
 
         return filepath
 
-    @classmethod
-    def load(cls, filepath: str) -> "ProfileResult":
-        """
-        Load a ProfileResult instance from disk.
-
-        Args:
-            filepath: Path to the saved file
-
-        Returns:
-            ProfileResult: The loaded ProfileResult instance
-
-        Raises:
-            FileNotFoundError: If the file doesn't exist
-        """
-        filepath = os.path.join(filepath, "performance_result.pkl")
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"ProfileResult file not found: {filepath}")
-
-        # Load the state
-        with open(filepath, "rb") as f:
-            state = pickle.load(f)
-
-        # Extract required constructor arguments
-        main_metric = state.pop("main_metric")
-        lower_is_better = state.pop("lower_is_better")
-        attributes = state.pop("attributes")
-
-        # Create a new instance with minimal constructor arguments (no job)
-        instance = cls(main_metric=main_metric, lower_is_better=lower_is_better)
-
-        # Override the attributes set (it will be empty from initialization without job)
-        instance.attributes = attributes
-
-        # Add all the saved attributes
-        for key, value in state.items():
-            setattr(instance, key, value)
-
-        return instance
-
 
 class ProfileResults:
     """
@@ -215,19 +161,11 @@ class ProfileResults:
             sort_key: The metric name to use for sorting results
             lower_is_better: Whether lower values of the sort key are better (default: True)
         """
-        self.results: List[ProfileResult] = []
+        self.results: Dict[int, ProfileResult] = {}
         self.sort_key = sort_key
         self.lower_is_better = lower_is_better
 
-    def add_result(
-        self,
-        index: int,
-        kernel: KERNEL_DTYPE,
-        kernel_kwargs: KERNEL_KWARGS_DTYPE,
-        compiler_flags: str,
-        cache_dir: str,
-        **kwargs,
-    ) -> ProfileResult:
+    def add_result(self, result: ProfileResult) -> None:
         """
         Add a new performance result.
 
@@ -240,18 +178,7 @@ class ProfileResults:
         Raises:
             ValueError: If sort_key is not provided in kwargs (only when sort_key is not empty)
         """
-        result = ProfileResult(
-            index=index,
-            main_metric=self.sort_key,
-            lower_is_better=self.lower_is_better,
-            kernel=kernel,
-            kernel_kwargs=kernel_kwargs,
-            compiler_flags=compiler_flags,
-            cache_dir=cache_dir,
-            **kwargs,
-        )
-        self.results.append(result)
-        return result
+        self.results[result.index] = result
 
     def get_best_result(self) -> ProfileResult:
         """
@@ -307,7 +234,8 @@ class ProfileResults:
         results_by_filepath = {}
         filename = "perf_metrics.json"
 
-        for result in self.results:
+        for result_index in self.results:
+            result = self.results[result_index]
             workload_cache_dir = os.path.dirname(result.cache_dir)
             filepath = os.path.join(workload_cache_dir, filename)
             if filepath not in results_by_filepath:
@@ -363,53 +291,6 @@ class ProfileResults:
                     json.dump(json_data[filepath], f, indent=2, sort_keys=True)
             except Exception as e:
                 raise OSError(f"Failed to save metrics to {filepath}: {str(e)}")
-
-    @classmethod
-    def load(cls, filepath: str) -> "ProfileResults":
-        """
-        Load metrics from a JSON file.
-
-        Args:
-            filepath: Path to the JSON file to load
-
-        Returns:
-            A new ProfileResults instance with the loaded results
-
-        Raises:
-            FileNotFoundError: If the file doesn't exist
-            json.JSONDecodeError: If the file contains invalid JSON
-        """
-        with open(filepath, "r") as f:
-            data = json.load(f)
-
-        # Extract metadata if available
-        metadata = data.get("metadata", {})
-        sort_key = metadata.get("sort_key", "")
-        lower_is_better = metadata.get("lower_is_better", True)
-
-        # Create a new instance with appropriate size
-        results_data = data.get("results", [])
-        metrics = cls(sort_key=sort_key, lower_is_better=lower_is_better)
-
-        # Load results
-        for result_dict in results_data:
-            metrics.add_result(**result_dict)
-
-        return metrics
-
-    def __len__(self) -> int:
-        """Return the number of results."""
-        return len(self.results)
-
-    def __getitem__(self, index: int) -> ProfileResult:
-        """Access results by index."""
-        return self.results[index]
-
-    def __setitem__(self, index: int, value: ProfileResult) -> None:
-        """Set a result at the specified index."""
-        if not isinstance(value, ProfileResult):
-            raise TypeError(f"Expected ProfileResult instance, got {type(value).__name__}")
-        self.results[index] = value
 
     def __repr__(self) -> str:
         """Return a string representation of the ProfileResults instance."""

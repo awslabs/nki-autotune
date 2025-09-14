@@ -36,15 +36,24 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhs_rhs_gemm_np")
         meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhs_rhs_meta_gemm")
 
-    # for M, N, K in [(1236, 2847, 1539), (1024, 2048, 2048), (4096, 4096, 4096), (8192, 8192, 8192), (16384, 16384, 16384), (24576, 24576, 24576)]:
-    for M, N, K in [(3757, 1647, 2539)]:
+    shapes = [
+        (1236, 2847, 1539),
+        (1024, 2048, 2048),
+        (3757, 1647, 2539),
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+        (8192, 8192, 8192),
+        (16384, 16384, 16384),
+        (24576, 24576, 24576),
+    ]
+    for M, N, K in [(2048, 2048, 2048)]:
         if transposed_lhs:
             lhs_shape = (K, M)
         else:
             lhs_shape = (M, K)
         rhs_shape = (K, N)
         configs = generate_gemm_configs(M=M, N=N, K=K)
-        configs = random.sample(configs, 100)
+        configs = random.sample(configs, 10)
         for config in configs:
             all_jobs.add_job(
                 kernel=meta_kernel,
@@ -85,7 +94,7 @@ if __name__ == "__main__":
     tuner()
 
     # if args.mode == "lhsT_rhs" or args.mode == "both":
-    #     kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]
+    #     kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm", "nki_matmul_nmk_order"]
     #     plot_metric(args.cache_dir, "min_ms", kernel_names)
     #     plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
     # if args.mode == "lhs_rhs" or args.mode == "both":

@@ -104,9 +104,7 @@ def run_neuron_benchmarks(warmup: int, iters: int, jobs: ProfileJobs, results: L
                 result.add_error(error_msg)
 
 
-def run_on_neuron_core(
-    warmup: int, iters: int, jobs: ProfileJobs, cache_root_dir: str, sort_key: str, lower_is_better: bool
-) -> List[ProfileResult]:
+def run_on_neuron_core(warmup: int, iters: int, jobs: ProfileJobs) -> List[ProfileResult]:
     """
     Run kernels with separated CPU compilation and Neuron execution phases.
 
@@ -118,29 +116,10 @@ def run_on_neuron_core(
         warmup: Number of warmup iterations
         iters: Number of benchmark iterations
         jobs: ProfileJobs containing all jobs to run
-        cache_root_dir: Root directory for cache storage
-        sort_key: The metric name to use for sorting results
-        lower_is_better: Whether lower values of the sort key are better
 
     Returns:
         List of ProfileResult objects with benchmark results
     """
-
-    # Initialize ProfileResult objects for each job
-    results = []
-    for job in jobs:
-        job.cache_root_dir = cache_root_dir
-        result = ProfileResult(
-            index=job.index,
-            main_metric=sort_key,
-            lower_is_better=lower_is_better,
-            kernel=job.kernel,
-            kernel_kwargs=job.kernel_kwargs,
-            compiler_flags=job.compiler_flags,
-            cache_dir=job.cache_dir,
-            matmul_mac_count=job.matmul_mac_count,
-        )
-        results.append(result)
 
     # Pre-initialize all input tensors once for all jobs with the same shapes
     jobs.initialize_input_tensors()
