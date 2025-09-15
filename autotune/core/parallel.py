@@ -3,7 +3,7 @@ import random
 from typing import List
 
 
-def split_jobs_into_groups(job_ids: List[int], num_groups: int):
+def split_jobs_into_groups(job_ids: List[int], num_groups: int) -> List[List[int]]:
     """
     Split job_ids into evenly distributed groups with randomized order.
     Ensures no empty groups are created and number of groups <= num_groups.

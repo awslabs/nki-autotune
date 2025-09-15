@@ -5,7 +5,7 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 
-from autotune.cache.results import get_best_result
+from autotune.cache.results import capture_error_message, get_best_result
 
 
 def numerical_key(dim_string: str) -> List:
@@ -99,9 +99,8 @@ def collect_metrics_data_with_stats(directory: str, metric_name: str):
                 input_sizes = parse_dirname(dirname)
                 metrics_data[input_sizes] = {"best": best_metric, "mean": mean_metric}
             except Exception as e:
-                # If there's any issue getting the best result or metric, skip this directory
-                print(e)
-                continue
+                error_msg = capture_error_message(e)
+                print(error_msg)
     return metrics_data
 
 
@@ -126,6 +125,7 @@ def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
     all_kernels_metrics = {}
     for kernel_name in kernel_names:
         metrics = collect_metrics_data_with_stats(f"{cache_root_dir}/{kernel_name}", metric_name)
+        print(metrics)
         all_kernels_metrics[kernel_name] = metrics
 
     all_inputs_strings = set()
@@ -162,7 +162,6 @@ def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
                     best_val = metrics[dim_string]["best"]
                     mean_val = metrics[dim_string]["mean"]
                     best_values.append(best_val)
-                    # print(metric_name, mean_val, best_val)
 
                     # Calculate error bars based on which value is higher
                     if mean_val <= best_val:

@@ -1,52 +1,12 @@
-from typing import List
-
 from neuronpy.runtime.spike import SpikeExecutor
 
-from autotune.cache.results import ProfileResult, capture_error_message
+from autotune.cache.results import capture_error_message
 from autotune.core.compile import create_spike_kernel, run_spike_kernel
 from autotune.core.job import ProfileJobs
 from autotune.core.metrics import extract_metrics
 
 
-def compile_kernels(jobs: ProfileJobs, cache_root_dir: str, sort_key: str, lower_is_better: bool) -> None:
-    """
-    Compile all kernels on CPU without requiring SpikeExecutor.
-
-    Args:
-        jobs: ProfileJobs containing all jobs to compile
-        results: List of ProfileResult objects to update with compilation results
-    """
-    results = []
-    for job in jobs.jobs:
-        try:
-            result = ProfileResult(
-                index=job.index,
-                main_metric=sort_key,
-                lower_is_better=lower_is_better,
-                kernel=job.kernel,
-                kernel_kwargs=job.kernel_kwargs,
-                compiler_flags=job.compiler_flags,
-                cache_dir=job.cache_dir,
-                matmul_mac_count=job.matmul_mac_count,
-            )
-
-            # Compile kernel (CPU-only operation)
-            neff = compile_kernel(
-                kernel_name=job.kernel,
-                input_tensors=job.input_tensors,
-                kernel_kwargs=job.kernel_kwargs,
-                target_instance_family=job.target_instance_family,
-                compiler_flags=job.compiler_flags,
-                output_dir=job.cache_dir,
-            )
-            result.add_fields(neff=neff)
-
-        except Exception as e:
-            error_msg = capture_error_message(e)
-            result.add_error(error_msg)
-
-
-def run_neuron_benchmarks(warmup: int, iters: int, jobs: ProfileJobs, results: List[ProfileResult]) -> None:
+def run_neuron_benchmarks(jobs: ProfileJobs, warmup: int, iters: int) -> None:
     """
     Run benchmarks on Neuron cores using SpikeExecutor.
 
@@ -57,19 +17,14 @@ def run_neuron_benchmarks(warmup: int, iters: int, jobs: ProfileJobs, results: L
         results: List of ProfileResult objects to update with benchmark results
     """
     with SpikeExecutor(verbose=0) as spike:
-        for job, result in zip(jobs.jobs, results):
-            # Skip if compilation failed (no neff in result)
-            if not hasattr(result, "neff") or result.neff is None:
+        for job_index in jobs.jobs:
+            job = jobs.jobs[job_index]
+            # Skip if job already failed
+            if job.has_error:
                 continue
 
-            neff = result.neff
-
             try:
-
-                # Create spike kernel (requires SpikeExecutor context)
-                spike_kernel = create_spike_kernel(neff, job.kernel, job.input_tensors, job.kernel_kwargs)
-
-                # Benchmark kernel (requires SpikeExecutor)
+                spike_kernel = create_spike_kernel(job.neff, job.kernel, job.input_tensors, job.kernel_kwargs)
                 stats = spike.benchmark(
                     spike_kernel,
                     *job.input_tensors,
@@ -78,33 +33,27 @@ def run_neuron_benchmarks(warmup: int, iters: int, jobs: ProfileJobs, results: L
                     benchmark_iterations=iters,
                     device_id=0,
                 )
-
-                # Run kernel and capture trace (requires SpikeExecutor)
                 ntff_file, kernel_outputs = run_spike_kernel(
-                    spike, spike_kernel, job.input_tensors, neff, job.kernel_kwargs
+                    spike, spike_kernel, job.input_tensors, job.neff, job.kernel_kwargs
                 )
-                result.add_fields(ntff=ntff_file, **stats)
-
-                # Postprocessing (CPU operation, but done here for logical flow)
+                job.add_attributes(ntff=ntff_file, **stats)
                 job.postprocessing(job.input_tensors, job.kernel_kwargs, kernel_outputs)
-                result.add_fields(postprocessing_result=True)
-
-                # Extract metrics (CPU operation, but done here for logical flow)
+                job.add_attributes(postprocessing_result=True)
                 metrics = extract_metrics(
-                    neff,
+                    job.neff,
                     ntff_file,
-                    latency=result.min_ms,
-                    matmul_mac_count=result.matmul_mac_count,
+                    latency=job.min_ms,
+                    matmul_mac_count=job.matmul_mac_count,
                     target_instance_family=job.target_instance_family,
                 )
-                result.add_fields(**metrics)
+                job.add_attributes(**metrics)
 
             except Exception as e:
                 error_msg = capture_error_message(e)
-                result.add_error(error_msg)
+                job.add_error(error_msg)
 
 
-def run_on_neuron_core(warmup: int, iters: int, jobs: ProfileJobs) -> List[ProfileResult]:
+def run_on_neuron_core(warmup: int, iters: int, jobs: ProfileJobs) -> ProfileJobs:
     """
     Run kernels with separated CPU compilation and Neuron execution phases.
 
@@ -116,15 +65,12 @@ def run_on_neuron_core(warmup: int, iters: int, jobs: ProfileJobs) -> List[Profi
         warmup: Number of warmup iterations
         iters: Number of benchmark iterations
         jobs: ProfileJobs containing all jobs to run
-
-    Returns:
-        List of ProfileResult objects with benchmark results
     """
 
     # Pre-initialize all input tensors once for all jobs with the same shapes
     jobs.initialize_input_tensors()
 
     # Run benchmarks on Neuron (requires SpikeExecutor)
-    run_neuron_benchmarks(warmup, iters, jobs, results)
+    run_neuron_benchmarks(jobs, warmup, iters)
 
-    return results
+    return jobs
