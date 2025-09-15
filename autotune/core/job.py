@@ -40,6 +40,7 @@ class ProfileJob:
     def __init__(
         self,
         index: int,
+        main_metric: str,
         kernel: KERNEL_DTYPE,
         input_tensor_shapes: List[Tuple[int, ...]],
         data_type: np.dtype,
@@ -48,7 +49,7 @@ class ProfileJob:
         postprocessing: Optional[POSTPROCESSING_DTYPE],
         cache_root_dir: str,
     ) -> None:
-        self.attributes = []
+        self.attributes: List[str] = []
         target_instance_family, compiler_flags = process_compiler_flags(compiler_flags)
         input_tensor_shapes_str = "_".join("x".join(str(dim) for dim in shape) for shape in input_tensor_shapes)
         _, kernel_name = kernel
@@ -68,7 +69,7 @@ class ProfileJob:
             self.postprocessing = postprocessing
         else:
             self.postprocessing = dummy_postprocessing
-        self.metric_name = "min_ms"
+        self.main_metric = main_metric
         self.workload_dir = workload_dir
 
     @property
@@ -92,8 +93,14 @@ class ProfileJob:
     def to_dict(self) -> Dict:
         """Convert to dictionary representation including only attributes in self.attributes."""
         result = {}
-        for attr in self.attributes:
-            result[attr] = str(getattr(self, attr))
+        for attr_name in self.attributes:
+            val = getattr(self, attr_name)
+            try:
+                # Test if the value is JSON serializable
+                json.dumps(val)
+                result[attr_name] = val
+            except Exception:
+                result[attr_name] = str(val)
         return result
 
     def __repr__(self) -> str:
@@ -132,10 +139,10 @@ class ProfileJob:
     def sort_val(self) -> Tuple[int, float]:
         if self.has_error:
             val = (2, float("inf"))
-        elif not hasattr(self, self.metric_name):
+        elif not hasattr(self, self.main_metric):
             val = (1, float("inf"))
         else:
-            val = (1, getattr(self, self.metric_name))
+            val = (0, getattr(self, self.main_metric))
         return val
 
     def add_error(self, error_msg: str):
@@ -155,10 +162,11 @@ class ProfileJobs:
         self.cache_root_dir = cache_root_dir
         self.jobs: Dict[int, ProfileJob] = {}
         self._tensor_cache: Dict[Tuple, Tuple[np.ndarray, ...]] = {}
+        self.main_metric = "min_ms"
 
     def add_job(self, **kwargs):
         job_index = len(self.jobs)
-        job = ProfileJob(index=job_index, cache_root_dir=self.cache_root_dir, **kwargs)
+        job = ProfileJob(index=job_index, main_metric=self.main_metric, cache_root_dir=self.cache_root_dir, **kwargs)
         self.jobs[job_index] = job
 
     def extend(self, other_jobs: "ProfileJobs") -> None:
@@ -256,6 +264,7 @@ class ProfileJobs:
                     "num_correct_results": correct_count,
                     "num_error_results": error_count,
                     "error_types": error_types,
+                    "main_metric": self.main_metric,
                 },
                 "results": [self.jobs[job_index].to_dict() for job_index in sorted_job_indices],
             }

@@ -5,8 +5,6 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 
-from autotune.cache.results import capture_error_message, get_best_result
-
 
 def numerical_key(dim_string: str) -> List:
     """
@@ -65,42 +63,21 @@ def collect_metrics_data_with_stats(directory: str, metric_name: str):
 
     # Scan the directories to find all MNK combinations
     for dirname in os.listdir(directory):
+        input_sizes = parse_dirname(dirname)
         json_path = os.path.join(directory, dirname, "perf_metrics.json")
         if os.path.exists(json_path):
             with open(json_path, "r") as f:
                 data = json.load(f)
-
-            # Get all results without errors
+            main_metric = data["metadata"]["main_metric"]
             valid_results = [r for r in data.get("results", []) if "error" not in r]
-
-            if not valid_results:
+            valid_results = [r for r in valid_results if metric_name in r]
+            sorted_valid_results = sorted(valid_results, key=lambda result: result[main_metric])
+            if not sorted_valid_results:
                 continue
-
-            # Filter results that contain the metric_name
-            valid_metric_results = [r for r in valid_results if metric_name in r]
-
-            if not valid_metric_results:
-                # Skip this directory if no results have the metric
-                continue
-
-            try:
-                best_config = get_best_result(data)
-                # Skip if the requested metric isn't in the best config
-                if metric_name not in best_config:
-                    continue
-
-                best_metric = best_config[metric_name]
-
-                # Calculate mean metric using only results that have this metric
-                all_metrics = [r[metric_name] for r in valid_metric_results]
-                mean_metric = np.mean(all_metrics) if all_metrics else None
-
-                # Store metrics only if we successfully calculated them
-                input_sizes = parse_dirname(dirname)
-                metrics_data[input_sizes] = {"best": best_metric, "mean": mean_metric}
-            except Exception as e:
-                error_msg = capture_error_message(e)
-                print(error_msg)
+            sorted_metrics = [result[metric_name] for result in sorted_valid_results]
+            best_metric = sorted_metrics[0]
+            mean_metric = np.mean(sorted_metrics)
+            metrics_data[input_sizes] = {"best": best_metric, "mean": mean_metric}
     return metrics_data
 
 
@@ -125,7 +102,6 @@ def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
     all_kernels_metrics = {}
     for kernel_name in kernel_names:
         metrics = collect_metrics_data_with_stats(f"{cache_root_dir}/{kernel_name}", metric_name)
-        print(metrics)
         all_kernels_metrics[kernel_name] = metrics
 
     all_inputs_strings = set()
