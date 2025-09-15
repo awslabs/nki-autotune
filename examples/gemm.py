@@ -8,7 +8,7 @@ import random
 import numpy as np
 from neuronpy.core.language import bfloat16
 
-from autotune.core.benchmark import Benchmark
+from autotune.cache.visualize import plot_metric
 from autotune.core.job import ProfileJobs
 from autotune.gemm import GEMMCorrectness, generate_gemm_configs
 
@@ -85,19 +85,19 @@ if __name__ == "__main__":
         "--cache-dir", type=str, default="/mnt/efs/autotune-dev-cache", help="Root directory for the benchmark cache"
     )
     args = parser.parse_args()
-    all_jobs = ProfileJobs(cache_root_dir=args.cache_dir)
-    if args.mode == "lhsT_rhs" or args.mode == "both":
-        add_jobs(all_jobs, transposed_lhs=True)
-    if args.mode == "lhs_rhs" or args.mode == "both":
-        add_jobs(all_jobs, transposed_lhs=False)
-    tuner = Benchmark(jobs=all_jobs)
-    tuner()
-
+    # all_jobs = ProfileJobs(cache_root_dir=args.cache_dir)
     # if args.mode == "lhsT_rhs" or args.mode == "both":
-    #     kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm", "nki_matmul_nmk_order"]
-    #     plot_metric(args.cache_dir, "min_ms", kernel_names)
-    #     plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+    #     add_jobs(all_jobs, transposed_lhs=True)
     # if args.mode == "lhs_rhs" or args.mode == "both":
-    #     kernel_names = ["lhs_rhs_gemm_np", "lhs_rhs_meta_gemm"]
-    #     plot_metric(args.cache_dir, "min_ms", kernel_names)
-    #     plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+    #     add_jobs(all_jobs, transposed_lhs=False)
+    # tuner = Benchmark(jobs=all_jobs)
+    # tuner()
+
+    if args.mode == "lhsT_rhs" or args.mode == "both":
+        kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]
+        plot_metric(args.cache_dir, "min_ms", kernel_names)
+        plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
+    if args.mode == "lhs_rhs" or args.mode == "both":
+        kernel_names = ["lhs_rhs_gemm_np", "lhs_rhs_meta_gemm"]
+        plot_metric(args.cache_dir, "min_ms", kernel_names)
+        plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)

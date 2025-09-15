@@ -64,7 +64,10 @@ class ProfileJob:
             compiler_flags=compiler_flags,
             cache_dir=cache_dir,
         )
-        self.postprocessing = postprocessing
+        if postprocessing:
+            self.postprocessing = postprocessing
+        else:
+            self.postprocessing = dummy_postprocessing
         self.metric_name = "min_ms"
         self.workload_dir = workload_dir
 
