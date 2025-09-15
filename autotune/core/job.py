@@ -23,20 +23,24 @@ from autotune.typing import (
 def dummy_postprocessing(
     input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_outputs: OUTPUT_TENSORS_DTYPE
 ) -> None:
-    pass
+    """No-op postprocessing function used as default."""
 
 
 def run_with_args_and_kwargs(func, args, kwargs):
+    """Execute function with both positional and keyword arguments."""
     return func(args, kwargs)
 
 
 def get_batch_size(num_samples: int, total_num_samples: int):
+    """Calculate optimal batch size within constraints."""
     batch_size = max(num_samples, 1000)
     batch_size = min(batch_size, total_num_samples)
     return batch_size
 
 
 class ProfileJob:
+    """Represents a single kernel profiling job with its configuration and performance metrics."""
+
     def __init__(
         self,
         index: int,
@@ -49,6 +53,19 @@ class ProfileJob:
         postprocessing: Optional[POSTPROCESSING_DTYPE],
         cache_root_dir: str,
     ) -> None:
+        """Initialize a profiling job with kernel configuration and cache settings.
+
+        Args:
+            index: Unique identifier for this job.
+            main_metric: Primary performance metric to optimize.
+            kernel: Kernel function to profile.
+            input_tensor_shapes: Shapes of input tensors.
+            data_type: Data type for input tensors.
+            kernel_kwargs: Additional kernel arguments.
+            compiler_flags: Compilation flags and target configuration.
+            postprocessing: Optional post-processing function for outputs.
+            cache_root_dir: Root directory for caching results.
+        """
         self.attributes: List[str] = []
         target_instance_family, compiler_flags = process_compiler_flags(compiler_flags)
         input_tensor_shapes_str = "_".join("x".join(str(dim) for dim in shape) for shape in input_tensor_shapes)
@@ -86,6 +103,7 @@ class ProfileJob:
         self._input_tensors = value
 
     def init_job_dir(self):
+        """Initialize the cache directory for this job, removing any existing content."""
         if os.path.exists(self.cache_dir):
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
@@ -116,8 +134,7 @@ class ProfileJob:
         return repr_str
 
     def add_attributes(self, **kwargs):
-        """
-        Add additional attributes to this instance.
+        """Add new attributes to the job and track them in the attributes list.
 
         Args:
             **kwargs: Arbitrary keyword arguments to add as attributes.
@@ -146,36 +163,36 @@ class ProfileJob:
         return val
 
     def add_error(self, error_msg: str):
-        """
-        Add error information, but only if no error has been recorded yet.
-        This ensures we keep the earliest error encountered.
+        """Record an error message, keeping only the first error encountered.
 
         Args:
-            error_msg: The error message to record
+            error_msg: The error message to record.
         """
         if not self.has_error:
             self.add_attributes(error=error_msg)
 
 
 class ProfileJobs:
+    """Collection of ProfileJob instances with batch management and caching utilities."""
+
     def __init__(self, cache_root_dir: str) -> None:
+        """Initialize job collection with cache directory and empty job list."""
         self.cache_root_dir = cache_root_dir
         self.jobs: Dict[int, ProfileJob] = {}
         self._tensor_cache: Dict[Tuple, Tuple[np.ndarray, ...]] = {}
         self.main_metric = "min_ms"
 
     def add_job(self, **kwargs):
+        """Create and add a new ProfileJob to the collection."""
         job_index = len(self.jobs)
         job = ProfileJob(index=job_index, main_metric=self.main_metric, cache_root_dir=self.cache_root_dir, **kwargs)
         self.jobs[job_index] = job
 
     def extend(self, other_jobs: "ProfileJobs") -> None:
-        """
-        Concatenate another ProfileJobs object to this one.
-        This modifies the current object and also returns it for chaining.
+        """Append all jobs from another ProfileJobs collection.
 
         Args:
-            other_jobs: Another ProfileJobs instance to append
+            other_jobs: ProfileJobs instance to append.
         """
         job_index_offset = len(self.jobs)
         for job_index in other_jobs.jobs:
@@ -208,12 +225,21 @@ class ProfileJobs:
         return result
 
     def subset(self, indices: List[int]) -> "ProfileJobs":
+        """Create a new ProfileJobs containing only specified job indices.
+
+        Args:
+            indices: List of job indices to include.
+
+        Returns:
+            New ProfileJobs with selected jobs.
+        """
         subset_jobs = ProfileJobs(self.cache_root_dir)
         subset_jobs.jobs = {index: self.jobs[index] for index in indices}
         subset_jobs._tensor_cache = self._tensor_cache
         return subset_jobs
 
     def initialize_input_tensors(self) -> None:
+        """Generate and cache random input tensors for all jobs."""
         for job_index in self.jobs:
             job = self.jobs[job_index]
             cache_key = (tuple(job.input_tensor_shapes), job.data_type)
@@ -224,12 +250,10 @@ class ProfileJobs:
             job.input_tensors = self._tensor_cache[cache_key]
 
     def dump_json(self):
-        """
-        Dump the summary to JSON files.
-        Results within each cache directory are sorted by the sort_key.
+        """Save performance metrics to JSON files, organized by workload directory.
 
         Raises:
-            OSError: If the directory cannot be created or the file cannot be written
+            OSError: If the directory cannot be created or the file cannot be written.
         """
         filename = "perf_metrics.json"
         jobs_by_workload_dir: Dict[str, List[int]] = {}
@@ -279,10 +303,19 @@ class ProfileJobs:
 
 
 def timeout_handler(signum, frame):
+    """Signal handler to raise TimeoutError for compilation timeout."""
     raise TimeoutError("Compilation timed out after 10 minutes")
 
 
 def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
+    """Compile all kernel jobs with timeout protection and error handling.
+
+    Args:
+        jobs: Collection of jobs to compile.
+
+    Returns:
+        Updated ProfileJobs with compilation results.
+    """
     jobs.initialize_input_tensors()
     for job_index in jobs.jobs:
         job = jobs.jobs[job_index]
@@ -300,11 +333,6 @@ def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
                 compiler_flags=job.compiler_flags,
                 output_dir=tmp_dir,
             )
-            job.init_job_dir()
-            for item_name in os.listdir(tmp_dir):
-                src_path = os.path.join(tmp_dir, item_name)
-                dst_path = os.path.join(job.cache_dir, item_name)
-                shutil.move(src_path, dst_path)
             neff_filename = os.path.basename(neff)
             neff = os.path.join(job.cache_dir, neff_filename)
             job.add_attributes(neff=neff)
@@ -313,5 +341,11 @@ def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
             job.add_error(error_msg)
         finally:
             signal.alarm(0)
+            if os.listdir(tmp_dir):
+                job.init_job_dir()
+                for item_name in os.listdir(tmp_dir):
+                    src_path = os.path.join(tmp_dir, item_name)
+                    dst_path = os.path.join(job.cache_dir, item_name)
+                    shutil.move(src_path, dst_path)
             shutil.rmtree(tmp_dir)
     return jobs

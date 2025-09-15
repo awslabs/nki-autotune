@@ -33,6 +33,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
     if transposed_lhs:
         baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhsT_rhs_gemm_np")
         meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhsT_rhs_meta_gemm")
+        manual_kernel = (f"{project_root}/private/test_nki_matmul.py", "nki_matmul_nmk_order")
     else:
         baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhs_rhs_gemm_np")
         meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhs_rhs_meta_gemm")
@@ -54,7 +55,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
             lhs_shape = (M, K)
         rhs_shape = (K, N)
         configs = generate_gemm_configs(M=M, N=N, K=K)
-        configs = random.sample(configs, 10)
+        configs = random.sample(configs, 100)
         for config in configs:
             all_jobs.add_job(
                 kernel=meta_kernel,
@@ -72,6 +73,15 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
             compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
             postprocessing=postprocessing,
         )
+        if transposed_lhs:
+            all_jobs.add_job(
+                kernel=manual_kernel,
+                input_tensor_shapes=[lhs_shape, rhs_shape],
+                data_type=data_type,
+                kernel_kwargs={},
+                compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+                postprocessing=postprocessing,
+            )
 
 
 if __name__ == "__main__":
@@ -95,7 +105,7 @@ if __name__ == "__main__":
     tuner()
 
     if args.mode == "lhsT_rhs" or args.mode == "both":
-        kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]
+        kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm", "nki_matmul_nmk_order"]
         plot_metric(args.cache_dir, "min_ms", kernel_names)
         plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
     if args.mode == "lhs_rhs" or args.mode == "both":
