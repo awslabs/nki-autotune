@@ -1,4 +1,4 @@
-from autotune.cache.visualize import plot_metric
+from autotune.core.visualize import plot_metric
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"

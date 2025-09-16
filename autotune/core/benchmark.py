@@ -68,7 +68,7 @@ class Benchmark:
             job = self.jobs.jobs[job_id]
             if not job.has_error:
                 valid_job_indices.append(job_id)
-        num_neuron_cores = 32
+        num_neuron_cores = 128
         num_workers = min(num_neuron_cores, len(valid_job_indices))
         job_id_groups = split_jobs_into_groups(job_ids=valid_job_indices, num_groups=num_workers)
 

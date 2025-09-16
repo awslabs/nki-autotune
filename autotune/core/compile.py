@@ -10,7 +10,7 @@ from neuronpy.core.compile import CompilationTarget, compile_to_neff, trace
 from neuronpy.runtime.spike import CompiledKernel
 from neuronxcc.nki.compile import GenericKernel
 
-from autotune.cache.directories import split_file_info
+from autotune.core.utils import split_file_info
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
 
 
@@ -40,6 +40,7 @@ def process_compiler_flags(compiler_flags: str):
     elif "--target=trn2" in compiler_flags:
         target_instance_family = "trn2"
         compiler_flags = compiler_flags.replace("--target=trn2", "")
+        compiler_flags += " --lnc=1"
     else:
         raise NotImplementedError(
             f"Only support --target=trn1 or --target=trn2 in compiler flags. Received {compiler_flags}."

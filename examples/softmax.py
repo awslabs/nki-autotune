@@ -8,9 +8,9 @@ from itertools import product
 import numpy as np
 from neuronpy.core.language import bfloat16
 
-from autotune.cache.visualize import plot_metric
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
+from autotune.core.visualize import plot_metric
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kernel_library.softmax import softmax_gemm_correctness_postprocessing

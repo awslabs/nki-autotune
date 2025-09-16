@@ -8,9 +8,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from autotune.cache.results import capture_error_message
 from autotune.core.compile import compile_kernel, process_compiler_flags
 from autotune.core.metrics import tensor_to_matmul_mac_count
+from autotune.core.utils import capture_error_message
 from autotune.typing import (
     INPUT_TENSORS_DTYPE,
     KERNEL_DTYPE,
