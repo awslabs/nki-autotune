@@ -14,41 +14,6 @@ from autotune.core.utils import split_file_info
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
 
 
-def process_compiler_flags(compiler_flags: str):
-    """
-    Process compiler flags string to extract target instance family and clean remaining flags.
-
-    This function extracts the target instance family (trn1 or trn2) from compiler flags,
-    removes that target flag from the string, and normalizes whitespace in the remaining flags.
-
-    Args:
-        compiler_flags: A string containing compiler flags, which must include either
-                       '--target=trn1' or '--target=trn2'
-
-    Returns:
-        tuple: A tuple containing:
-            - target_instance_family (str): The extracted target instance family ('trn1' or 'trn2')
-            - compiler_flags (str): The remaining compiler flags with normalized whitespace
-
-    Raises:
-        NotImplementedError: If the compiler flags do not contain either '--target=trn1'
-                             or '--target=trn2'
-    """
-    if "--target=trn1" in compiler_flags:
-        target_instance_family = "trn1"
-        compiler_flags = compiler_flags.replace("--target=trn1", "")
-    elif "--target=trn2" in compiler_flags:
-        target_instance_family = "trn2"
-        compiler_flags = compiler_flags.replace("--target=trn2", "")
-        compiler_flags += " --lnc=1"
-    else:
-        raise NotImplementedError(
-            f"Only support --target=trn1 or --target=trn2 in compiler flags. Received {compiler_flags}."
-        )
-    compiler_flags = " ".join(compiler_flags.split())
-    return target_instance_family, compiler_flags
-
-
 def split_data_by_core(data, core_id, total_cores):
     """
     Split a list of data evenly among cores.
@@ -145,6 +110,8 @@ def compile_kernel(
         target = CompilationTarget.TRN2
     else:
         raise Exception(f"target_instance_family {target_instance_family} must be trn1 or trn2")
+    if target_instance_family == "trn2":
+        compiler_flags += " --lnc=1"
     neff = compile_to_neff(
         trace_kernel=traced_kernel,
         output_dir=output_dir,

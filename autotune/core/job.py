@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from autotune.core.compile import compile_kernel, process_compiler_flags
+from autotune.core.compile import compile_kernel
 from autotune.core.metrics import tensor_to_matmul_mac_count
 from autotune.core.utils import capture_error_message
 from autotune.typing import (
@@ -67,7 +67,6 @@ class ProfileJob:
             cache_root_dir: Root directory for caching results.
         """
         self.attributes: List[str] = []
-        target_instance_family, compiler_flags = process_compiler_flags(compiler_flags)
         input_tensor_shapes_str = "_".join("x".join(str(dim) for dim in shape) for shape in input_tensor_shapes)
         _, kernel_name = kernel
         workload_dir = f"{cache_root_dir}/{kernel_name}/{input_tensor_shapes_str}"
@@ -78,7 +77,6 @@ class ProfileJob:
             input_tensor_shapes=input_tensor_shapes,
             data_type=data_type,
             kernel_kwargs=kernel_kwargs,
-            target_instance_family=target_instance_family,
             compiler_flags=compiler_flags,
             cache_dir=cache_dir,
         )
@@ -175,9 +173,15 @@ class ProfileJob:
 class ProfileJobs:
     """Collection of ProfileJob instances with batch management and caching utilities."""
 
-    def __init__(self, cache_root_dir: str) -> None:
-        """Initialize job collection with cache directory and empty job list."""
+    def __init__(self, cache_root_dir: str, target_instance_family: str) -> None:
+        """Initialize job collection with cache directory and empty job list.
+
+        Args:
+            cache_root_dir: Root directory for caching results.
+            target_instance_family: Target instance family ('trn1' or 'trn2') for all jobs.
+        """
         self.cache_root_dir = cache_root_dir
+        self.target_instance_family = target_instance_family
         self.jobs: Dict[int, ProfileJob] = {}
         self._tensor_cache: Dict[Tuple, Tuple[np.ndarray, ...]] = {}
         self.main_metric = "min_ms"
@@ -233,7 +237,7 @@ class ProfileJobs:
         Returns:
             New ProfileJobs with selected jobs.
         """
-        subset_jobs = ProfileJobs(self.cache_root_dir)
+        subset_jobs = ProfileJobs(self.cache_root_dir, target_instance_family=self.target_instance_family)
         subset_jobs.jobs = {index: self.jobs[index] for index in indices}
         subset_jobs._tensor_cache = self._tensor_cache
         return subset_jobs
@@ -329,7 +333,7 @@ def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
                 kernel_name=job.kernel,
                 input_tensors=job.input_tensors,
                 kernel_kwargs=job.kernel_kwargs,
-                target_instance_family=job.target_instance_family,
+                target_instance_family=jobs.target_instance_family,
                 compiler_flags=job.compiler_flags,
                 output_dir=tmp_dir,
             )

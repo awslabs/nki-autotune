@@ -44,7 +44,7 @@ def run_neuron_benchmarks(jobs: ProfileJobs, warmup: int, iters: int) -> None:
                     ntff_file,
                     latency=job.min_ms,
                     matmul_mac_count=job.matmul_mac_count,
-                    target_instance_family=job.target_instance_family,
+                    target_instance_family=jobs.target_instance_family,
                 )
                 job.add_attributes(**metrics)
 
