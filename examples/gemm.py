@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import random
 
 import numpy as np
 from neuronpy.core.language import bfloat16
@@ -28,7 +29,6 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
         postprocessing = None
     else:
         raise NotImplementedError(f"{data_type} is not implemented.")
-    target_instance_family = "trn2"
 
     if transposed_lhs:
         baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhsT_rhs_gemm_np")
@@ -55,14 +55,14 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
             lhs_shape = (M, K)
         rhs_shape = (K, N)
         configs = generate_gemm_configs(M=M, N=N, K=K)
-        # configs = random.sample(configs, 10)
+        configs = random.sample(configs, 100)
         for config in configs:
             all_jobs.add_job(
                 kernel=meta_kernel,
                 input_tensor_shapes=[lhs_shape, rhs_shape],
                 data_type=data_type,
                 kernel_kwargs={"config": config},
-                compiler_flags=f"--target={target_instance_family} --auto-cast=none --internal-tensorizer-opt-level=nki",
+                compiler_flags="--auto-cast=none --internal-tensorizer-opt-level=nki",
                 postprocessing=postprocessing,
             )
         all_jobs.add_job(
@@ -70,7 +70,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
             input_tensor_shapes=[lhs_shape, rhs_shape],
             data_type=data_type,
             kernel_kwargs={},
-            compiler_flags=f"--target={target_instance_family} --auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
+            compiler_flags="--auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
             postprocessing=postprocessing,
         )
         if transposed_lhs:
@@ -79,7 +79,7 @@ def add_jobs(all_jobs: ProfileJobs, transposed_lhs: bool = False):
                 input_tensor_shapes=[lhs_shape, rhs_shape],
                 data_type=data_type,
                 kernel_kwargs={},
-                compiler_flags=f"--target={target_instance_family} --auto-cast=none --internal-tensorizer-opt-level=nki",
+                compiler_flags="--auto-cast=none --internal-tensorizer-opt-level=nki",
                 postprocessing=postprocessing,
             )
 
@@ -94,7 +94,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--cache-dir", type=str, help="Root directory for the benchmark cache")
     args = parser.parse_args()
-    all_jobs = ProfileJobs(cache_root_dir=args.cache_dir)
+    all_jobs = ProfileJobs(cache_root_dir=args.cache_dir, target_instance_family="trn2")
     if args.mode == "lhsT_rhs" or args.mode == "both":
         add_jobs(all_jobs, transposed_lhs=True)
     if args.mode == "lhs_rhs" or args.mode == "both":

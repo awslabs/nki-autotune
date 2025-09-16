@@ -30,7 +30,7 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         kernel=("kernel_library/softmax.py", "softmax_gemm_np"),
         input_tensor_shapes=[lhs.shape, rhs.shape],
         kernel_kwargs={},
-        compiler_flags="--target=trn1 --auto-cast=none --model-type=transformer",
+        compiler_flags="--auto-cast=none --model-type=transformer",
         postprocessing=postprocessing,
         data_type=data_type,
     )
@@ -40,25 +40,27 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     NUM_BLOCK_N_options = [1]
     NUM_BLOCK_K_options = [10]
     params = list(product(NUM_BLOCK_M_options, NUM_BLOCK_N_options, NUM_BLOCK_K_options))
-    autotune_jobs = ProfileJobs()
+    autotune_jobs = ProfileJobs(cache_root_dir=jobs.cache_root_dir, target_instance_family=jobs.target_instance_family)
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K in params:
         autotune_jobs.add_job(
             kernel=("kernel_library/softmax.py", "online_softmax_linear_MKN"),
             input_tensor_shapes=[lhs.shape, rhs.shape],
             kernel_kwargs={"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K},
-            compiler_flags="--target=trn1 --auto-cast=none --internal-tensorizer-opt-level=nki",
+            compiler_flags="--auto-cast=none --internal-tensorizer-opt-level=nki",
             postprocessing=postprocessing,
             data_type=data_type,
         )
     # Limit to 100 jobs if there are too many
-    if autotune_jobs.num_jobs > 100:
+    if len(autotune_jobs.jobs) > 100:
         import random
 
-        sampled_indices = random.sample(range(autotune_jobs.num_jobs), 100)
-        sampled_jobs = ProfileJobs()
+        sampled_indices = random.sample(range(len(autotune_jobs.jobs)), 100)
+        sampled_jobs = ProfileJobs(
+            cache_root_dir=jobs.cache_root_dir, target_instance_family=jobs.target_instance_family
+        )
         for idx in sampled_indices:
-            job = autotune_jobs[idx]
-            sampled_jobs.jobs.append(job)
+            job = autotune_jobs.jobs[idx]
+            sampled_jobs.jobs[len(sampled_jobs.jobs)] = job
         jobs.extend(sampled_jobs)
     else:
         jobs.extend(autotune_jobs)
@@ -69,10 +71,10 @@ if __name__ == "__main__":
     mn_shapes = [10240]
     k_shapes = [128]
     MNK = list(product(mn_shapes, mn_shapes, k_shapes))
-    jobs = ProfileJobs()
+    jobs = ProfileJobs(cache_root_dir=cache_root_dir, target_instance_family="trn1")
     for M, N, K in MNK:
         create_jobs(jobs, M, N, K)
-    tuner = Benchmark(jobs=jobs, cache_root_dir=cache_root_dir)
+    tuner = Benchmark(jobs=jobs)
     tuner()
     kernels = ["softmax_gemm_np", "online_softmax_linear_MKN"]
     plot_metric(cache_root_dir, "min_ms", kernels)
