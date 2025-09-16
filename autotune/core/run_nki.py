@@ -1,9 +1,9 @@
 from neuronpy.runtime.spike import SpikeExecutor
 
-from autotune.cache.results import capture_error_message
 from autotune.core.compile import create_spike_kernel, run_spike_kernel
 from autotune.core.job import ProfileJobs
 from autotune.core.metrics import extract_metrics
+from autotune.core.utils import capture_error_message
 
 
 def run_neuron_benchmarks(jobs: ProfileJobs, warmup: int, iters: int) -> None:
