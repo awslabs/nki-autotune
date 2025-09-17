@@ -53,10 +53,8 @@ def calculate_mfu(mac_count: int, time_ms: float, target_instance_family: str) -
     """
     if any(target_instance_family.startswith(family) for family in {"sunda", "trainium", "trn1", "inf2"}):
         pe_freq = 2.8 * 1e9  # Hz (2.8 GHz)
-        num_lnc = 1
     elif any(target_instance_family.startswith(family) for family in {"trn2", "inf3", "gen3", "cayman"}):
         pe_freq = 2.4 * 1e9  # Hz (2.4 GHz)
-        num_lnc = 2
     else:
         raise NotImplementedError("Unknown target instance: " + target_instance_family)
 
@@ -64,7 +62,7 @@ def calculate_mfu(mac_count: int, time_ms: float, target_instance_family: str) -
     flops = 2 * mac_count
     actual_latency_s = time_ms / 1000
     actual_pe_cycles = actual_latency_s * pe_freq
-    theoretical_pe_cycles = flops / (2 * 128 * 128 * num_lnc)
+    theoretical_pe_cycles = flops / (2 * 128 * 128)
     mfu = theoretical_pe_cycles / actual_pe_cycles
     return mfu
 
