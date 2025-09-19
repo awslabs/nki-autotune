@@ -41,7 +41,7 @@ def set_neuron_core(core_id: int):
     Sets the NEURON_RT_VISIBLE_CORES environment variable.
     """
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_id)
-    os.environ["NEURON_RT_VIRTUAL_CORE_SIZE"] = "1"
+    os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
 
 
 def set_neuron_core_dynamic(core_counter: Value, lock: Lock):
