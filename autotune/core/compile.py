@@ -8,6 +8,7 @@ from typing import Tuple
 import numpy as np
 from neuronpy.core.compile import CompilationTarget, compile_to_neff, trace
 from neuronpy.runtime.spike import CompiledKernel
+from neuronxcc.nki.compile import GenericKernel
 
 from autotune.core.utils import split_file_info
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
@@ -98,6 +99,8 @@ def compile_kernel(
     kernel = get_kernel_by_name(kernel_name)
     if isinstance(kernel, types.FunctionType):
         traced_kernel = trace(kernel)
+    elif isinstance(kernel, GenericKernel):
+        traced_kernel = kernel
     else:
         traced_kernel = kernel
     traced_kernel.specialize(*input_tensors, **kernel_kwargs)
@@ -126,8 +129,10 @@ def create_spike_kernel(
     kernel = get_kernel_by_name(kernel_name)
     if isinstance(kernel, types.FunctionType):
         traced_kernel = trace(kernel)
-    else:
+    elif isinstance(kernel, GenericKernel):
         traced_kernel = kernel
+    else:
+        raise TypeError(f"{type(kernel)} {kernel} is not supported.")
     traced_kernel.specialize(*input_tensors, **kernel_kwargs)
     spike_kernel = CompiledKernel(traced_kernel.copy_kernel(), neff_path)
     return spike_kernel
