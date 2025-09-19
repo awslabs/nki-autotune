@@ -115,39 +115,6 @@ class Benchmark:
         pbar.close()
         executor.shutdown(wait=True)
 
-    def _run_on_neuron_cores_dynamic_load_balancing(self):
-        valid_job_indices = []
-        for job_id in self.jobs.jobs:
-            job = self.jobs.jobs[job_id]
-            if not job.has_error:
-                valid_job_indices.append(job_id)
-        num_neuron_cores = 32
-        num_workers = min(num_neuron_cores, len(valid_job_indices))
-        counter = mp.Value("i", 0)
-        lock = mp.Lock()
-        pbar = tqdm(
-            total=len(valid_job_indices),
-            desc=f"Running {len(valid_job_indices)} kernels on {num_workers} Neuron cores",
-            unit="kernels",
-        )
-        executor = ProcessPoolExecutor(
-            max_workers=num_neuron_workers, initializer=set_neuron_core_dynamic, initargs=(counter, lock)
-        )
-        futures = []
-        for valid_job in valid_job_indices:
-            kwargs = {"warmup": self.warmup, "iters": self.iters, "jobs": self.jobs.subset([valid_job])}
-            future = executor.submit(run_on_neuron_core_dynamic, **kwargs)
-            futures.append(future)
-        for future in as_completed(futures):
-            updated_jobs = future.result()
-            for job_index in updated_jobs.jobs:
-                updated_job = updated_jobs.jobs[job_index]
-                self.jobs.jobs[job_index] = updated_job
-            pbar.update(len(updated_jobs.jobs))
-
-        pbar.close()
-        executor.shutdown(wait=True)
-
     def _run_on_neuron_cores(self):
         """Execute compiled kernels on available Neuron cores for performance profiling."""
         valid_job_indices = []

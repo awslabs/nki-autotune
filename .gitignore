@@ -96,9 +96,3 @@ remote/config.sh
 # Downloaded cache from remote autotune runs
 cache/
 generated_kernels/
-autotune-cache/
-autotune-dev-cache/
-aws_neuron_venv_pytorch/
-autotune-dev-cache-golden/
-aws/
-awscliv2.zip
