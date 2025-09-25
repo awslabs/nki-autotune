@@ -58,7 +58,7 @@ def collect_metrics_data_with_stats(directory: str, metric_name: str):
     metrics_data = {}
 
     if not os.path.exists(directory):
-        print(f"Directory not found: {directory}")
+        print(f"Directory not found, skip plotting: {directory}")
         return metrics_data
 
     # Scan the directories to find all MNK combinations

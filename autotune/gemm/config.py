@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import random
 from itertools import permutations, product
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import neuronxcc.nki.language as nl
 import tabulate
@@ -184,6 +185,7 @@ class GEMMConfig:
         self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, ("K", "N"))
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
+        self.op_positions["x_op"] = self.loop_order["K"]
 
     def _parse_absolute_position(self, relative_position: int, axes: Tuple[str, ...]) -> int:
         """
@@ -251,9 +253,9 @@ class GEMMConfig:
         return f"{header}\n{table}"
 
 
-def generate_gemm_configs(M: int, N: int, K: int) -> List[Dict]:
+def sample_gemm_configs(M: int, N: int, K: int, max_configs: Optional[int]) -> List[Dict]:
     """
-    Generate all valid GEMM configurations for given matrix dimensions.
+    Sample all valid GEMM configurations for given matrix dimensions.
 
     Creates configurations for matrix multiplication C = A @ B where:
     - A has shape (M, K)
@@ -267,6 +269,7 @@ def generate_gemm_configs(M: int, N: int, K: int) -> List[Dict]:
         M: Number of rows in output matrix
         N: Number of columns in output matrix
         K: Contraction dimension size
+        max_configs: number of random samples. If None, return all configs.
 
     Returns:
         List[Dict]: Configuration dictionaries containing:
@@ -294,5 +297,7 @@ def generate_gemm_configs(M: int, N: int, K: int) -> List[Dict]:
         lhs_position=lhs_positions,
         rhs_position=rhs_positions,
     )
+    if max_configs:
+        configs = random.sample(configs, max_configs)
 
     return configs

@@ -38,7 +38,7 @@ class Benchmark:
 
     def _compile_all_kernels(self):
         """Compile all kernel jobs in parallel using multiple CPU workers."""
-        cpu_count = os.cpu_count() or 1  # Handle None case
+        cpu_count = os.cpu_count() or 1
         num_workers = min(max(cpu_count - 1, 1), len(self.jobs.jobs))
         num_jobs = len(self.jobs.jobs)
         job_id_groups = split_jobs_into_groups(job_ids=list(range(num_jobs)), num_groups=num_workers)
