@@ -11,7 +11,7 @@ from neuronpy.core.language import bfloat16
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
 from autotune.core.visualize import plot_metric
-from autotune.gemm import GEMMCorrectness, generate_gemm_configs
+from autotune.gemm import GEMMCorrectness, sample_gemm_configs
 
 
 def generate_shapes() -> List[Tuple[int, int, int]]:
@@ -36,7 +36,7 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
     examples_dir = os.path.dirname(current_file)  # /path/to/nki-autotune/examples/
     project_root = os.path.dirname(examples_dir)  # /path/to/nki-autotune/
 
-    data_type = "bf16"
+    data_type = "float32"
     if data_type == "float32":
         data_type = np.float32
         postprocessing = GEMMCorrectness(transposed_lhs=transposed_lhs)
@@ -62,8 +62,7 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
         else:
             lhs_shape = (M, K)
         rhs_shape = (K, N)
-        configs = generate_gemm_configs(M=M, N=N, K=K)
-        # configs = random.sample(configs, 100)
+        configs = sample_gemm_configs(M=M, N=N, K=K, max_configs=3)
         for config in configs:
             job_list.append(
                 {
@@ -109,7 +108,7 @@ def run_jobs_in_batches(job_list: List[Dict[str, Any]], cache_dir: str, batch_si
         batch_size: Maximum jobs per batch (default: 10000)
     """
     total_jobs = len(job_list)
-    num_batches = (total_jobs + batch_size - 1) // batch_size  # Ceiling division
+    num_batches = (total_jobs + batch_size - 1) // batch_size
 
     for batch_num in range(num_batches):
         start_idx = batch_num * batch_size

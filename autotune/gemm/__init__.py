@@ -11,7 +11,7 @@ This package contains all GEMM-related functionality including:
 - Utility functions
 """
 
-from autotune.gemm.config import GEMMConfig, generate_gemm_configs
+from autotune.gemm.config import GEMMConfig, sample_gemm_configs
 from autotune.gemm.kernels import MetaGEMM, lhs_rhs_meta_gemm, lhsT_rhs_meta_gemm
 from autotune.gemm.utils import calculate_tile_overlap_ranges
 from autotune.gemm.validation import GEMMCorrectness
@@ -19,7 +19,7 @@ from autotune.gemm.validation import GEMMCorrectness
 __all__ = [
     # Configuration
     "GEMMConfig",
-    "generate_gemm_configs",
+    "sample_gemm_configs",
     # Kernels
     "lhsT_rhs_meta_gemm",
     "lhs_rhs_meta_gemm",
