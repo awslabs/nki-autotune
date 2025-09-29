@@ -70,7 +70,7 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
                     "input_tensor_shapes": [lhs_shape, rhs_shape],
                     "data_type": data_type,
                     "kernel_kwargs": {"config": config},
-                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki",
+                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki --tensorizer-options='--dump-after-all'",
                     "postprocessing": postprocessing,
                 }
             )
@@ -91,7 +91,7 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
                     "input_tensor_shapes": [lhs_shape, rhs_shape],
                     "data_type": data_type,
                     "kernel_kwargs": {},
-                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki",
+                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki --tensorizer-options='--dump-after-all'",
                     "postprocessing": postprocessing,
                 }
             )
