@@ -1,51 +1,57 @@
-from typing import List, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
 
-class InTensor:
-    def __init__(self, name: str, axes: Tuple[str, ...], blocking_axis: str, tensor: np.ndarray) -> None:
-        assert blocking_axis in axes, f"Blocking axis {blocking_axis} is missing in {axes}."
-        assert np.ndim(tensor) == len(
-            axes
-        ), f"Number of axes mismatch. Axes has {len(axes)}, tensor has {np.ndim(tensor)}."
+class Tensor:
+    def __init__(self, name: str, axes: Tuple[str, ...], data: np.ndarray, fusion_axis: Optional[str] = None) -> None:
+        if fusion_axis:
+            assert fusion_axis in axes, f"Fusion axis {fusion_axis} is missing in {axes}."
+        assert np.ndim(data) == len(axes), f"Number of axes mismatch. Axes has {len(axes)}, data has {np.ndim(data)}."
         self.name = name
         self.axes = axes
-        self.blocking_axis = blocking_axis
-        self.parallel_axes: List[str] = []
-        for axis in axes:
-            if axis != blocking_axis:
-                self.parallel_axes.append(axis)
-        self.tensor = tensor
+        self.fusion_axis = fusion_axis
+        self.data = data
 
     def read(self, start: int, size: int) -> np.ndarray:
         slices = []
         for axis in self.axes:
-            if axis == self.blocking_axis:
+            if axis == self.fusion_axis:
                 slices.append(slice(start, start + size))
             else:
                 slices.append(slice(None))
-        return self.tensor[tuple(slices)]
+        return self.data[tuple(slices)]
 
     @property
-    def blocking_size(self) -> int:
-        blocking_axis_index = self.axes.index(self.blocking_axis)
-        blocking_size = self.tensor.shape[blocking_axis_index]
-        return blocking_size
+    def parallel_axes(self) -> Tuple[str]:
+        parallel_axes = []
+        for axis in self.axes:
+            if axis != self.fusion_axis:
+                parallel_axes.append(axis)
+        return tuple(parallel_axes)
+
+    @property
+    def fusion_size(self) -> int:
+        if self.fusion_axis:
+            fusion_axis_index = self.axes.index(self.fusion_axis)
+            fusion_size = self.data.shape[fusion_axis_index]
+            return fusion_size
+        else:
+            raise Exception(f"{self} does not have fusion size")
 
     @property
     def parallel_shape(self) -> Tuple[int, ...]:
-        """Returns the shape of parallel axes (all axes except blocking axis)."""
+        """Returns the shape of parallel axes (all axes except fusion axis)."""
         shape = []
         for i, axis in enumerate(self.axes):
-            if axis != self.blocking_axis:
-                shape.append(self.tensor.shape[i])
+            if axis != self.fusion_axis:
+                shape.append(self.data.shape[i])
         return tuple(shape)
 
     @property
     def full_shape(self) -> Tuple[int, ...]:
-        """Returns the full shape of the tensor."""
-        return self.tensor.shape
+        """Returns the full shape of the data."""
+        return self.data.shape
 
     def __repr__(self) -> str:
-        return f"InTensor({self.name}: {self.axes}{self.tensor.shape}, blocking={self.blocking_axis})"
+        return f"Tensor({self.name}: {self.axes}{self.full_shape}, fusion_axis={self.fusion_axis}, data={self.data})"
