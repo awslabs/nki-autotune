@@ -13,7 +13,7 @@ class Tensor:
         self.fusion_axis = fusion_axis
         self.data = data
 
-    def read(self, start: int, size: int) -> np.ndarray:
+    def get_fusion_slice(self, start: int, size: int) -> np.ndarray:
         slices = []
         for axis in self.axes:
             if axis == self.fusion_axis:
@@ -31,13 +31,13 @@ class Tensor:
         return tuple(parallel_axes)
 
     @property
-    def fusion_size(self) -> int:
+    def fusion_size(self) -> Optional[int]:
         if self.fusion_axis:
             fusion_axis_index = self.axes.index(self.fusion_axis)
             fusion_size = self.data.shape[fusion_axis_index]
-            return fusion_size
         else:
-            raise Exception(f"{self} does not have fusion size")
+            fusion_size = None
+        return fusion_size
 
     @property
     def parallel_shape(self) -> Tuple[int, ...]:

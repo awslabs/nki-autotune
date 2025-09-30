@@ -253,7 +253,7 @@ class GEMMConfig:
         return f"{header}\n{table}"
 
 
-def sample_gemm_configs(M: int, N: int, K: int, max_configs: Optional[int]) -> List[Dict]:
+def sample_gemm_configs(M: int, N: int, K: int, max_configs: Optional[int] = None) -> List[Dict]:
     """
     Sample all valid GEMM configurations for given matrix dimensions.
 
@@ -297,7 +297,7 @@ def sample_gemm_configs(M: int, N: int, K: int, max_configs: Optional[int]) -> L
         lhs_position=lhs_positions,
         rhs_position=rhs_positions,
     )
-    if max_configs:
+    if max_configs is not None:
         configs = random.sample(configs, max_configs)
 
     return configs
