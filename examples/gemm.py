@@ -17,8 +17,9 @@ from autotune.gemm import GEMMCorrectness, sample_gemm_configs
 def generate_shapes() -> List[Tuple[int, int, int]]:
     """Generate (M, N, K) shape tuples for GEMM benchmarking."""
     shapes = []
-    for size in range(512, 1024 * 16 + 1, 512):
+    for size in range(512, 1024 * 10 + 1, 512):
         shapes.append((size, size, size))
+        break
     return shapes
 
 
@@ -50,6 +51,7 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
         baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhsT_rhs_gemm_np")
         meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhsT_rhs_meta_gemm")
         nki_matmul_nmk_order = (f"{project_root}/private/test_nki_matmul.py", "nki_matmul_nmk_order")
+        atlas_alg = (f"{project_root}/private/nki_gemm_100_mfu.py", "atlas_gemm")
     else:
         baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhs_rhs_gemm_np")
         meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhs_rhs_meta_gemm")
@@ -62,7 +64,7 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
         else:
             lhs_shape = (M, K)
         rhs_shape = (K, N)
-        configs = sample_gemm_configs(M=M, N=N, K=K, max_configs=3)
+        configs = sample_gemm_configs(M=M, N=N, K=K, max_configs=0)
         for config in configs:
             job_list.append(
                 {
@@ -70,7 +72,7 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
                     "input_tensor_shapes": [lhs_shape, rhs_shape],
                     "data_type": data_type,
                     "kernel_kwargs": {"config": config},
-                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki --tensorizer-options='--dump-after-all'",
+                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki",
                     "postprocessing": postprocessing,
                 }
             )
@@ -91,7 +93,17 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
                     "input_tensor_shapes": [lhs_shape, rhs_shape],
                     "data_type": data_type,
                     "kernel_kwargs": {},
-                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki --tensorizer-options='--dump-after-all'",
+                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki",
+                    "postprocessing": postprocessing,
+                }
+            )
+            job_list.append(
+                {
+                    "kernel": atlas_alg,
+                    "input_tensor_shapes": [lhs_shape, rhs_shape],
+                    "data_type": data_type,
+                    "kernel_kwargs": {},
+                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki",
                     "postprocessing": postprocessing,
                 }
             )
