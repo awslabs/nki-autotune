@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """Test script for FusionChain implementation with 2D tensor RMSNorm+Matmul fusion."""
 
-import os
-import sys
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import numpy as np
 
 from fusion.fusion_chain import FusionChain
