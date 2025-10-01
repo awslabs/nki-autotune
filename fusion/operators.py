@@ -1,65 +1,90 @@
-from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+"""Operator definitions for fusion framework."""
+
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
-from fusion.tensors import Tensor
+from fusion.fusion_typing import AccumulatorType, FxFunction, GbFunction, HbFunction, StateType
 
 
-class Operator(ABC):
-    def __init__(self, name: str, input_tensors: Tuple[str, ...]) -> None:
-        self.name = name
-        self.input_tensors = input_tensors
+@dataclass
+class BlockingOperator:
+    """
+    Defines the blocking operator X in "X + Accumulation" pattern.
 
-    @abstractmethod
-    def step(self, input_tensors: Tuple[Tensor, ...]):
-        raise NotImplementedError("Step for the base class is not implemented.")
+    The blocking operator fx accumulates state that must be computed
+    sequentially and creates a dependency barrier in standard execution.
 
-    @abstractmethod
-    def get_initial_value(self, input_tensors: Tuple[Tensor, ...]) -> Tensor:
-        raise NotImplementedError("get_initial_value for the base class is not implemented.")
+    Example: For RMSNorm, fx accumulates sum of squares: O¹_k = O¹_{k-1} + V¹_k²
+    """
 
-    def get_input_tensors(self, all_input_tensors: Dict[str, Tensor]) -> Tuple[Tensor, ...]:
-        input_tensors: List[Tensor] = []
-        for tensor_name in self.input_tensors:
-            tensor = all_input_tensors[tensor_name]
-            input_tensors.append(tensor)
-        input_tensors_tuple = tuple(input_tensors)
-        return input_tensors_tuple
+    fx: FxFunction  # State update function: O¹_k = fx(O¹_{k-1}, V¹_k)
+    initial_state: StateType  # Initial state O¹_0
+
+    def update_state(self, current_state: StateType, input_value: np.ndarray) -> StateType:
+        """Update the blocking state with new input."""
+        return self.fx(current_state, input_value)
 
 
-class SumSquaresFx(Operator):
-    def __init__(self, input_tensor: str) -> None:
-        super().__init__(name="Sum of Squares", input_tensors=(input_tensor,))
+@dataclass
+class AccumulationOperator:
+    """
+    Defines the accumulation operation in "X + Accumulation" pattern.
 
-    def get_initial_value(self, input_tensors: Tuple[Tensor, ...]) -> Tensor:
-        assert (
-            len(input_tensors) == 1
-        ), f"SumSquaresFx get_initial_value expects one input tensor, received {len(input_tensors)}"
-        input_tensor = input_tensors[0]
-        init_result = np.zeros(shape=input_tensor.parallel_shape, dtype=np.float32)
-        tensor = Tensor(name="prev_sum_squares", axes=input_tensor.parallel_axes, data=init_result)
-        return tensor
+    The accumulation operation consists of:
+    - gB: Transforms the blocking state (e.g., normalization factor)
+    - hB: Preprocesses inputs for accumulation (e.g., element-wise multiply)
 
-    def step(self, input_tensors: Tuple[Tensor, ...]) -> None:
-        assert (
-            len(input_tensors) == 2
-        ), f"SumSquaresFx step expects two input tensors: prev_sum and input tensor, received {len(input_tensors)}"
-        prev_sum, input_tensor = input_tensors
-        squared = np.square(input_tensor.data)
-        fusion_axis_index = input_tensor.axes.index(input_tensor.fusion_axis)
-        sum_squared = np.sum(squared, axis=fusion_axis_index)
-        prev_sum.data = prev_sum.data + sum_squared
+    Together they compute: B_k = gB(O¹_k) * hB(V¹_k, V²_k)
+
+    Example: For RMSNorm+Matmul:
+    - gB(state) = 1/√(state/K + ε)
+    - hB(v1, v2) = v1 * v2
+    """
+
+    gB: GbFunction  # Transform blocking state to scaling factor
+    hB: HbFunction  # Preprocess accumulation inputs
+    initial_accumulator: AccumulatorType  # Initial accumulator Õ²_0
+
+    def transform_state(self, blocking_state: StateType) -> float:
+        """Transform blocking state using gB function."""
+        return self.gB(blocking_state)
+
+    def preprocess_inputs(self, v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+        """Preprocess inputs for accumulation using hB function."""
+        return self.hB(v1, v2)
+
+    def compute_accumulation_term(self, blocking_state: StateType, v1: np.ndarray, v2: np.ndarray) -> Any:
+        """Compute the accumulation term B_k = gB(O¹_k) * hB(V¹_k, V²_k)."""
+        gb_value = self.transform_state(blocking_state)
+        hb_value = self.preprocess_inputs(v1, v2)
+        return gb_value * hb_value
 
 
-class RMSNormGb(Operator):
-    def __init__(self, input_tensor: str) -> None:
-        super().__init__(name="RMS Normalization", input_tensors=(input_tensor,))
+# Helper functions for creating common operators
 
-    def get_initial_value(self, input_tensors: Tuple[Tensor, ...]):
-        raise NotImplementedError("RMSNormGb has no initial value.")
 
-    def step(self, input_tensors: Tuple[Tensor, ...]):
-        assert len(input_tensors) == 1, f"RMSNormGb step expects one tensor, received {len(input_tensors)}"
-        input_tensor = input_tensors[0]
-        print(input_tensor)
+def create_rmsnorm_blocking_operator(initial_state: float = 0.0) -> BlockingOperator:
+    """Create blocking operator for RMSNorm (sum of squares)."""
+
+    def fx(state: float, v1_k: np.ndarray) -> float:
+        return state + float(v1_k**2)
+
+    return BlockingOperator(fx=fx, initial_state=initial_state)
+
+
+def create_rmsnorm_accumulation_operator(
+    K: int, epsilon: float = 1e-6, initial_accumulator: float = 0.0
+) -> AccumulationOperator:
+    """Create accumulation operator for RMSNorm+Matmul."""
+
+    def gB(blocking_state: float) -> float:
+        # Normalization factor: 1/√(mean_square + ε)
+        return 1.0 / (blocking_state / K + epsilon) ** 0.5
+
+    def hB(v1_k: np.ndarray, v2_k: np.ndarray) -> np.ndarray:
+        # Element-wise multiplication for matmul
+        return v1_k * v2_k
+
+    return AccumulationOperator(gB=gB, hB=hB, initial_accumulator=initial_accumulator)

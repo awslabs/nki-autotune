@@ -1,56 +1,43 @@
-from typing import Optional, Tuple
+"""Tensor wrapper for fusion operations."""
+
+from typing import Any, Tuple, Union
 
 import numpy as np
 
 
 class Tensor:
-    def __init__(self, name: str, axes: Tuple[str, ...], data: np.ndarray, fusion_axis: Optional[str] = None) -> None:
-        if fusion_axis:
-            assert fusion_axis in axes, f"Fusion axis {fusion_axis} is missing in {axes}."
-        assert np.ndim(data) == len(axes), f"Number of axes mismatch. Axes has {len(axes)}, data has {np.ndim(data)}."
-        self.name = name
-        self.axes = axes
-        self.fusion_axis = fusion_axis
+    """Numpy array wrapper with fusion-specific helpers."""
+
+    def __init__(self, data: Union[np.ndarray, list, float]):
+        """Initialize a Tensor from various input types."""
+        # Handle numpy scalar types
+        if isinstance(data, (np.floating, np.integer, np.complexfloating)):
+            data = np.array(data)
+        elif isinstance(data, (list, float, int, complex)):
+            data = np.array(data)
+        elif not isinstance(data, np.ndarray):
+            raise TypeError(f"Unsupported type for Tensor: {type(data)}")
+
         self.data = data
+        self.shape = data.shape
+        self.ndim = data.ndim
+        self.dtype = data.dtype
+        self.size = data.size
 
-    def get_fusion_slice(self, start: int, size: int) -> "Tensor":
-        slices = []
-        for axis in self.axes:
-            if axis == self.fusion_axis:
-                slices.append(slice(start, start + size))
-            else:
-                slices.append(slice(None))
-        data_slice = self.data[tuple(slices)]
-        tensor_slice = Tensor(name=f"{self.name}_slice", axes=self.axes, data=data_slice, fusion_axis=self.fusion_axis)
-        return tensor_slice
+    def __getitem__(self, idx: Union[int, slice, Tuple[Union[int, slice], ...]]) -> Any:
+        """Support indexing for fusion axis iteration."""
+        result = self.data[idx]
+        # Return scalar or numpy array directly for compatibility
+        return result
 
-    @property
-    def parallel_axes(self) -> Tuple[str]:
-        parallel_axes = []
-        for axis in self.axes:
-            if axis != self.fusion_axis:
-                parallel_axes.append(axis)
-        return tuple(parallel_axes)
-
-    @property
-    def fusion_size(self) -> int:
-        fusion_axis_index = self.axes.index(self.fusion_axis)
-        fusion_size = self.data.shape[fusion_axis_index]
-        return fusion_size
-
-    @property
-    def parallel_shape(self) -> Tuple[int, ...]:
-        """Returns the shape of parallel axes (all axes except fusion axis)."""
-        shape = []
-        for i, axis in enumerate(self.axes):
-            if axis != self.fusion_axis:
-                shape.append(self.data.shape[i])
-        return tuple(shape)
-
-    @property
-    def full_shape(self) -> Tuple[int, ...]:
-        """Returns the full shape of the data."""
-        return self.data.shape
+    def __len__(self) -> int:
+        """Length along first dimension (fusion axis)."""
+        return self.shape[0] if self.ndim > 0 else 1
 
     def __repr__(self) -> str:
-        return f"Tensor(name={self.name}, axes={self.axes}, shape={self.full_shape}, fusion_axis={self.fusion_axis}, data={self.data})"
+        """String representation."""
+        return f"Tensor(shape={self.shape}, dtype={self.dtype})"
+
+    def __str__(self) -> str:
+        """String conversion."""
+        return str(self.data)
