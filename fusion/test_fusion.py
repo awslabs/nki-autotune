@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Test script for FusionChain implementation with 2D tensor RMSNorm+Matmul fusion."""
 
+import os
 import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
@@ -14,10 +17,10 @@ from fusion.tensors import Tensor
 def test_2d_rmsnorm_matmul_fusion():
     """
     Test FusionChain with 2D tensors using custom fx, gB, hB functions.
-    Demonstrates RMSNorm+Matmul fusion on batched inputs.
+    Demonstrates RMSNorm+Matmul fusion on batched inputs - processes all batches at once.
     """
     print("=" * 80)
-    print("2D Tensor RMSNorm + Matmul Fusion Test")
+    print("2D Tensor RMSNorm + Matmul Fusion Test (Batch Processing)")
     print("=" * 80)
 
     # Set parameters
@@ -39,65 +42,57 @@ def test_2d_rmsnorm_matmul_fusion():
     print(f"  V1: {V1_2d.shape}")
     print(f"  V2: {V2_2d.shape}")
 
-    # Process each batch element independently
-    results_fused = []
-    results_standard = []
+    # Define custom fx function (blocking operator)
+    def fx(state, v1_k):
+        """
+        RMSNorm blocking operator: accumulate sum of squares.
+        O¹_k = O¹_{k-1} + V¹_k²
+        """
+        return state + v1_k**2
 
-    print(f"\nProcessing {batch_size} batches...")
+    # Define custom gB function (transformation)
+    def gB(blocking_state):
+        """
+        Transform blocking state to normalization factor.
+        gB(O¹_k) = 1 / √(O¹_k/K + ε)
+        """
+        return 1.0 / np.sqrt(blocking_state / hidden_dim + epsilon)
 
-    for batch_idx in range(batch_size):
-        # Extract batch element
-        V1 = Tensor(V1_2d[batch_idx])
-        V2 = Tensor(V2_2d[batch_idx])
+    # Define custom hB function (accumulation preprocessing)
+    def hB(v1_k, v2_k):
+        """
+        Preprocess inputs for accumulation (element-wise multiply).
+        hB(V¹_k, V²_k) = V¹_k * V²_k
+        """
+        return v1_k * v2_k
 
-        # Define custom fx function (blocking operator)
-        def fx(state, v1_k):
-            """
-            RMSNorm blocking operator: accumulate sum of squares.
-            O¹_k = O¹_{k-1} + V¹_k²
-            """
-            return state + v1_k**2
+    # Create operators with custom functions
+    blocking_op = BlockingOperator(fx=fx, initial_state=0.0)  # O¹_0 = 0
+    accumulation_op = AccumulationOperator(gB=gB, hB=hB, initial_accumulator=0.0)  # Õ²_0 = 0
 
-        # Define custom gB function (transformation)
-        def gB(blocking_state):
-            """
-            Transform blocking state to normalization factor.
-            gB(O¹_k) = 1 / √(O¹_k/K + ε)
-            """
-            return 1.0 / np.sqrt(blocking_state / hidden_dim + epsilon)
+    # Create FusionChain
+    chain = FusionChain(blocking_operator=blocking_op, accumulation_operator=accumulation_op, K=hidden_dim)
 
-        # Define custom hB function (accumulation preprocessing)
-        def hB(v1_k, v2_k):
-            """
-            Preprocess inputs for accumulation (element-wise multiply).
-            hB(V¹_k, V²_k) = V¹_k * V²_k
-            """
-            return v1_k * v2_k
+    # Process all batches at once using 2D tensors
+    V1 = Tensor(V1_2d)  # Shape: (batch_size, hidden_dim)
+    V2 = Tensor(V2_2d)  # Shape: (batch_size, hidden_dim)
 
-        # Create operators with custom functions
-        blocking_op = BlockingOperator(fx=fx, initial_state=0.0)  # O¹_0 = 0
+    print(f"\nProcessing all {batch_size} batches in parallel...")
 
-        accumulation_op = AccumulationOperator(gB=gB, hB=hB, initial_accumulator=0.0)  # Õ²_0 = 0
+    # Execute both algorithms on the entire batch
+    result_fused = chain.execute_fused(V1, V2)
+    result_standard = chain.execute_standard(V1, V2)
 
-        # Create FusionChain
-        chain = FusionChain(blocking_operator=blocking_op, accumulation_operator=accumulation_op, K=hidden_dim)
-
-        # Execute both algorithms
-        result_fused = chain.execute_fused(V1, V2)
-        result_standard = chain.execute_standard(V1, V2)
-
-        results_fused.append(result_fused.data)
-        results_standard.append(result_standard.data)
-
-        # Show progress for first few batches
-        if batch_idx < 3:
-            print(f"  Batch {batch_idx}: Fused={result_fused.data:.6f}, Standard={result_standard.data:.6f}")
-
-    # Stack results into 1D arrays
-    results_fused = np.array(results_fused)
-    results_standard = np.array(results_standard)
+    # Results are now 1D arrays with one result per batch
+    results_fused = result_fused.data
+    results_standard = result_standard.data
 
     print(f"\nOutput shape: {results_fused.shape}")
+
+    # Show some example outputs
+    print(f"\nExample outputs (first 5 batches):")
+    for i in range(min(5, batch_size)):
+        print(f"  Batch {i}: Fused={results_fused[i]:.6f}, Standard={results_standard[i]:.6f}")
 
     # Verify correctness
     print("\n" + "-" * 40)
@@ -108,29 +103,16 @@ def test_2d_rmsnorm_matmul_fusion():
         atol=1e-4,  # Adjusted for float32 precision
         rtol=1e-4,  # Adjusted for float32 precision
     )
+
+    # Additional verification
+    abs_diff = np.abs(results_fused - results_standard)
+    print(f"\nError Statistics:")
+    print(f"  Max absolute difference: {np.max(abs_diff):.2e}")
+    print(f"  Mean absolute difference: {np.mean(abs_diff):.2e}")
+    print(f"  Std absolute difference: {np.std(abs_diff):.2e}")
+
     return True
 
 
-def main():
-    """Run the test demonstration."""
-    print("\n" + "-" * 80)
-    print(" " * 20 + "FUSIONCHAIN TEST")
-    print("-" * 80)
-
-    success = test_2d_rmsnorm_matmul_fusion()
-
-    # Final summary
-    print("\n" + "-" * 80)
-    if success:
-        print(" " * 25 + "TEST PASSED!")
-        print("-" * 80)
-    else:
-        print(" " * 25 + "TEST FAILED")
-        print("-" * 80)
-        sys.exit(1)
-
-    print("\n")
-
-
 if __name__ == "__main__":
-    main()
+    test_2d_rmsnorm_matmul_fusion()

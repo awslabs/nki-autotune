@@ -1,32 +1,38 @@
-"""Type definitions for the fusion framework."""
+"""Type definitions for the MegaFuse fusion framework."""
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable, Union
 
 import numpy as np
 
-# Core type aliases
-StateType = Any  # Blocking operator state O¹_k
-AccumulatorType = Any  # Accumulator state Õ²_k
-ScalarType = float  # Scaling factors and gB values
+# Core type aliases for operator functions
+StateType = Union[float, np.ndarray]
+AccumulatorType = Union[float, np.ndarray]
 
-# Function signatures for the fusion pattern
-FxFunction = Callable[[StateType, np.ndarray], StateType]
-GbFunction = Callable[[StateType], ScalarType]
-HbFunction = Callable[[np.ndarray, np.ndarray], np.ndarray]
+# Blocking operator function: O¹_k = fx(O¹_{k-1}, V¹_k)
+FxFunction = Callable[[StateType, float], StateType]
 
+# Accumulation transform: Transforms blocking state to scaling factor
+GbFunction = Callable[[StateType], float]
 
-@dataclass
-class FusionState:
-    """Maintains state during fusion execution."""
-
-    blocking_state: StateType  # O¹_k
-    accumulator: AccumulatorType  # Õ²_k
-    prev_gb_value: float  # g_B(O¹_{k-1}) for scaling computation
+# Input preprocessing: Preprocesses inputs for accumulation
+HbFunction = Callable[[float, float], float]
 
 
 @dataclass
 class FusionConfig:
     """Configuration for fusion execution."""
 
-    epsilon: float = 1e-10  # Small value to avoid division by zero
+    epsilon: float = 1e-6  # Numerical stability parameter
+    verify: bool = False  # Whether to verify against standard execution
+    tolerance: float = 1e-4  # Tolerance for verification
+
+
+@dataclass
+class FusionState:
+    """Maintains state during fusion execution."""
+
+    blocking_state: StateType
+    accumulator: AccumulatorType
+    prev_gb_value: float
+    step: int = 0
