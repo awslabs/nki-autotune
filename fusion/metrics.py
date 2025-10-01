@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def check_correctness(desired, actual, atol, rtol):
+def check_correctness(desired: np.ndarray, actual: np.ndarray, atol: float, rtol: float):
     abs_diff = np.abs(actual - desired)
     # Avoid division by zero in relative difference calculation
     rel_diff = np.divide(abs_diff, np.abs(desired), out=np.zeros_like(abs_diff), where=np.abs(desired) != 0)
