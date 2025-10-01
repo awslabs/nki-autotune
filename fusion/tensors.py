@@ -13,14 +13,16 @@ class Tensor:
         self.fusion_axis = fusion_axis
         self.data = data
 
-    def get_fusion_slice(self, start: int, size: int) -> np.ndarray:
+    def get_fusion_slice(self, start: int, size: int) -> "Tensor":
         slices = []
         for axis in self.axes:
             if axis == self.fusion_axis:
                 slices.append(slice(start, start + size))
             else:
                 slices.append(slice(None))
-        return self.data[tuple(slices)]
+        data_slice = self.data[tuple(slices)]
+        tensor_slice = Tensor(name=f"{self.name}_slice", axes=self.axes, data=data_slice, fusion_axis=self.fusion_axis)
+        return tensor_slice
 
     @property
     def parallel_axes(self) -> Tuple[str]:
@@ -31,12 +33,9 @@ class Tensor:
         return tuple(parallel_axes)
 
     @property
-    def fusion_size(self) -> Optional[int]:
-        if self.fusion_axis:
-            fusion_axis_index = self.axes.index(self.fusion_axis)
-            fusion_size = self.data.shape[fusion_axis_index]
-        else:
-            fusion_size = None
+    def fusion_size(self) -> int:
+        fusion_axis_index = self.axes.index(self.fusion_axis)
+        fusion_size = self.data.shape[fusion_axis_index]
         return fusion_size
 
     @property
@@ -54,4 +53,4 @@ class Tensor:
         return self.data.shape
 
     def __repr__(self) -> str:
-        return f"Tensor({self.name}: {self.axes}{self.full_shape}, fusion_axis={self.fusion_axis}, data={self.data})"
+        return f"Tensor(name={self.name}, axes={self.axes}, shape={self.full_shape}, fusion_axis={self.fusion_axis}, data={self.data})"
