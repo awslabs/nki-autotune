@@ -137,20 +137,20 @@ def check_correctness(desired, actual, atol, rtol, verbose: bool = False):
         regions_summary = generate_mismatch_summary(mismatches, desired, actual)
         err_msg = (
             f"Correctness check FAILED\n"
-            f"Mismatched elements: {total_mismatches} / {total_elements} ({mismatch_percentage:.6f}%)\n"
-            f"Max absolute difference: {max_abs_diff}\n"
-            f"Max relative difference: {max_rel_diff}\n"
-            f"Tolerance used: atol={atol}, rtol={rtol}"
-            f"{regions_summary}"
+            f"  Tolerance used: atol={atol}, rtol={rtol}\n"
+            f"  Mismatched elements: {total_mismatches} / {total_elements} ({mismatch_percentage:.6f}%)\n"
+            f"  Max absolute difference: {max_abs_diff}\n"
+            f"  Max relative difference: {max_rel_diff}\n"
+            f"  {regions_summary}"
         )
         raise AssertionError(err_msg)
     if verbose:
         print(
             f"Correctness check PASSED\n"
-            f"Total elements: {total_elements}\n"
-            f"Max absolute difference: {max_abs_diff}\n"
-            f"Max relative difference: {max_rel_diff}\n"
-            f"Tolerance used: atol={atol}, rtol={rtol}"
+            f"  Tolerance used: atol={atol}, rtol={rtol}\n"
+            f"  Total elements: {total_elements}\n"
+            f"  Max absolute difference: {max_abs_diff}\n"
+            f"  Max relative difference: {max_rel_diff}"
         )
 
 

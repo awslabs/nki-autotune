@@ -3,7 +3,7 @@
 import math
 from typing import List
 
-from fusion.operators import FxOperator, Operator
+from fusion.operators import Operator
 from fusion.tensors import Tensor
 
 
@@ -15,7 +15,7 @@ class FusionChain:
     enabling fusion of complex patterns.
     """
 
-    def __init__(self, fx: FxOperator, gbs: List[Operator], hbs: List[Operator]):
+    def __init__(self, fx: Operator, gbs: List[Operator], hbs: List[Operator]):
         """
         Initialize FusionChain with a sequence of operators.
         """
@@ -27,7 +27,7 @@ class FusionChain:
         tensors = [self.all_tensors[tensor_name] for tensor_name in tensor_names]
         return tensors
 
-    def execute(self, fusion_axis: str, fusion_block_size: int, input_tensors: List[Tensor]) -> Tensor:
+    def execute(self, fusion_axis: str, fusion_step_size: int, input_tensors: List[Tensor]) -> Tensor:
         """
         Execute the fusion chain on the provided inputs.
 
@@ -47,19 +47,34 @@ class FusionChain:
                 else:
                     assert fusion_size == tensor_fusion_size, f"Fusion size mismatch in input tensors"
         assert fusion_size > 0, "Did not find fusion axis in the input tensors"
-        num_fusion_steps = math.ceil(fusion_size / fusion_block_size)
+        num_fusion_steps = math.ceil(fusion_size / fusion_step_size)
         self.all_tensors = {tensor.name: tensor for tensor in input_tensors}
 
         fx_input_tensors = self.get_tensors(self.fx.input_tensors)
-        prev_O1 = self.fx.initialize_output(fusion_axis, fx_input_tensors)
-        curr_O1 = Tensor(name="curr_O1", axes=prev_O1.axes, data=prev_O1.data)
+        prev_O1 = self.fx.initialize_output(fx_input_tensors, fusion_axis=fusion_axis)
+        curr_O1 = Tensor(name=prev_O1.name.replace("prev", "curr"), axes=prev_O1.axes, data=prev_O1.data)
+
+        # TODO: test with one operator fusion first
+        gb_op = self.gbs[0]
+        hb_op = self.hbs[0]
+        prev_gb_out = gb_op.initialize_output(input_tensors=[curr_O1])
+        curr_gb_out = Tensor(
+            name=prev_gb_out.name.replace("prev", "curr"), axes=prev_gb_out.axes, data=prev_gb_out.data
+        )
+
         for fusion_step in range(num_fusion_steps):
-            fusion_axis_start = fusion_step * fusion_block_size
-            fx_forward_inputs = []
+            print(f"fusion_step {fusion_step}")
+            fusion_axis_start = fusion_step * fusion_step_size
+            fx_forward_inputs = [prev_O1]
             for tensor in fx_input_tensors:
                 fx_forward_inputs.append(
-                    tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_block_size)
+                    tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_step_size)
                 )
-            self.fx.forward(curr_O1=curr_O1, prev_O1=prev_O1, input_tensors=fx_forward_inputs)
+            self.fx.forward(input_tensors=fx_forward_inputs, output_tensor=curr_O1)
+            gb_op.forward(input_tensors=[curr_O1], output_tensor=curr_gb_out)
+            if fusion_step > 0:
+                scale_factor = curr_gb_out.data / prev_gb_out.data
+                print(scale_factor.shape)
+            prev_gb_out.data = curr_gb_out.data
             prev_O1.data = curr_O1.data
         return curr_O1
