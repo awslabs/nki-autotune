@@ -118,7 +118,7 @@ def tensor_to_matmul_mac_count(input_tensor_shapes: List[Tuple[int, ...]]) -> in
     return mac_count
 
 
-def check_correctness(desired, actual, atol, rtol):
+def check_correctness(desired, actual, atol, rtol, verbose: bool = False):
     abs_diff = np.abs(actual - desired)
     # Avoid division by zero in relative difference calculation
     rel_diff = np.divide(abs_diff, np.abs(desired), out=np.zeros_like(abs_diff), where=np.abs(desired) != 0)
@@ -129,24 +129,29 @@ def check_correctness(desired, actual, atol, rtol):
     total_mismatches = np.sum(mismatches)
     total_elements = desired.size
 
+    mismatch_percentage = (total_mismatches / total_elements) * 100
+    max_abs_diff = np.max(abs_diff)
+    max_rel_diff = np.max(rel_diff)
+
     if total_mismatches > 0:
-        # Calculate statistics
-        mismatch_percentage = (total_mismatches / total_elements) * 100
-        max_abs_diff = np.max(abs_diff)
-        max_rel_diff = np.max(rel_diff)
-
-        # Generate error message with statistics and mismatch regions
         regions_summary = generate_mismatch_summary(mismatches, desired, actual)
-
         err_msg = (
-            f"Mismatched elements:\n"
-            f"{total_mismatches} / {total_elements} ({mismatch_percentage:.6f}%)\n"
+            f"Correctness check FAILED\n"
+            f"Mismatched elements: {total_mismatches} / {total_elements} ({mismatch_percentage:.6f}%)\n"
             f"Max absolute difference: {max_abs_diff}\n"
             f"Max relative difference: {max_rel_diff}\n"
+            f"Tolerance used: atol={atol}, rtol={rtol}"
             f"{regions_summary}"
         )
-
         raise AssertionError(err_msg)
+    if verbose:
+        print(
+            f"Correctness check PASSED\n"
+            f"Total elements: {total_elements}\n"
+            f"Max absolute difference: {max_abs_diff}\n"
+            f"Max relative difference: {max_rel_diff}\n"
+            f"Tolerance used: atol={atol}, rtol={rtol}"
+        )
 
 
 def generate_mismatch_summary(mismatches, desired, actual):
