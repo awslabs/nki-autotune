@@ -5,7 +5,7 @@ import numpy as np
 
 from autotune.core.metrics import check_correctness
 from fusion.fusion_chain import FusionChain
-from fusion.operators import Operator
+from fusion.operators import FxOperator, Operator
 from fusion.tensors import Tensor
 
 
@@ -26,26 +26,24 @@ def find_single_diff(list1: List[str], list2: List[str]):
         raise ValueError(f"Expected exactly 1 difference, found {len(diff)}")
 
 
-class SumSquares(Operator):
+class SumSquares(FxOperator):
     def __init__(self, input_tensor: str) -> None:
         super().__init__([input_tensor])
 
-    def forward(self, inputs: List[Tensor], next_output: Tensor) -> None:
-        assert (
-            len(inputs) == 2
-        ), f"SumSquares expects two input tensors: (prev_sum_squares, input_tensor), received {len(inputs)}"
-        prev_sum_squares, input_tensor = inputs
-        sum_axis = find_single_diff(prev_sum_squares.axes, input_tensor.axes)
+    def forward(self, curr_O1: Tensor, prev_O1: Tensor, input_tensors: List[Tensor]) -> None:
+        assert len(input_tensors) == 1, f"SumSquares expects one input tensor, received {len(input_tensors)}"
+        input_tensor = input_tensors[0]
+        sum_axis = find_single_diff(prev_O1.axes, input_tensor.axes)
         block_sum_squares = np.sum(np.square(input_tensor.data), axis=input_tensor.axes.index(sum_axis))
-        next_output.data = prev_sum_squares.data + block_sum_squares
+        curr_O1.data = prev_O1.data + block_sum_squares
 
-    def initialize_output(self, fusion_axis: str, inputs: List[Tensor]) -> Tensor:
-        assert len(inputs) == 1, f"SumSquares expects one input tensor, received {len(inputs)}"
-        tensor = inputs[0]
+    def initialize_output(self, fusion_axis: str, input_tensors: List[Tensor]) -> Tensor:
+        assert len(input_tensors) == 1, f"SumSquares expects one input tensor to do init, received {len(input_tensors)}"
+        tensor = input_tensors[0]
         init_sum_shape = tensor.get_parallel_shape(fusion_axis)
         init_sum_parallel_axes = tensor.get_parallel_axes(fusion_axis)
         init_sum = np.zeros(shape=init_sum_shape, dtype=np.float32)
-        init_tensor = Tensor(name=f"prev_{tensor.name}_sum_of_squares", axes=init_sum_parallel_axes, data=init_sum)
+        init_tensor = Tensor(name=f"prev_O1", axes=init_sum_parallel_axes, data=init_sum)
         return init_tensor
 
 
@@ -73,7 +71,7 @@ class Matmul(Operator):
 
 
 class RMSNormMatmulFusion(FusionChain):
-    def __init__(self, fx: Operator, gbs: List[Operator], hbs: List[Operator]):
+    def __init__(self, fx: FxOperator, gbs: List[Operator], hbs: List[Operator]):
         super().__init__(fx, gbs, hbs)
 
 
@@ -91,7 +89,6 @@ def test_rmsnorm_matmul_fusion():
     output_dim = 128
     epsilon = 1e-6
 
-    np.random.seed(42)
     lhs = Tensor(name="LHS", axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim).astype(np.float32))
     rhs = Tensor(name="RHS", axes=["hidden", "output"], data=np.random.randn(hidden_dim, output_dim).astype(np.float32))
 
