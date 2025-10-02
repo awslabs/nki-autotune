@@ -1,6 +1,7 @@
 """FusionChain implementation for universal kernel fusion based on the MegaFuse paper."""
 
-from typing import List
+import math
+from typing import Dict, List
 
 from fusion.operators import Operator
 from fusion.tensors import Tensor
@@ -22,14 +23,38 @@ class FusionChain:
         self.gbs = gbs
         self.hbs = hbs
 
-    def execute(self, block_size: int, input_tensors: List[Tensor]) -> Tensor:
+    def execute(self, fusion_axis: str, fusion_block_size: int, input_tensors: List[Tensor]) -> Tensor:
         """
         Execute the fusion chain on the provided inputs.
 
         Args:
+            fusion_block_size: granularity of the fusion axis each forward step
             input_tensors: input tensors
-            block_size: granularity of the fusion axis each forward step
 
         Returns:
             Output tensor after applying all operators
         """
+        fusion_size = 0
+        for tensor in input_tensors:
+            if fusion_axis in tensor.axes:
+                tensor_fusion_size = tensor.get_axis_size(fusion_axis)
+                if fusion_size == 0:
+                    fusion_size = tensor_fusion_size
+                else:
+                    assert fusion_size == tensor_fusion_size, f"Fusion size mismatch in input tensors"
+        assert fusion_size > 0, "Did not find fusion axis in the input tensors"
+        self.all_tensors: Dict[str, Tensor] = {}
+        for tensor in input_tensors:
+            self.all_tensors[tensor.name] = tensor
+        num_fusion_steps = math.ceil(fusion_size / fusion_block_size)
+        fx_input_tensors = [self.all_tensors[tensor_name] for tensor_name in self.fx.input_tensors]
+        prev_O1 = self.fx.initialize_output(fusion_axis, fx_input_tensors)
+        curr_O1 = Tensor(name=prev_O1.name.replace("prev", "curr"), axes=prev_O1.axes, data=prev_O1.data)
+        for fusion_step in range(num_fusion_steps):
+            fx_forward_inputs = [prev_O1]
+            for tensor in fx_input_tensors:
+                fx_forward_inputs.append(tensor)
+            print(curr_O1.data)
+            self.fx.forward(inputs=fx_forward_inputs, next_output=curr_O1)
+            print(curr_O1.data)
+            break
