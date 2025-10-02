@@ -13,7 +13,13 @@ class Tensor:
         self.axes = axes
         self.data = data
 
-    # def get_fusion_axis_slice
+    def get_axis_slice(self, axis: str, start: int, size: int) -> "Tensor":
+        axis_index = self.axes.index(axis)
+        slices = [slice(None)] * len(self.data.shape)
+        slices[axis_index] = slice(start, start + size)
+        sliced_data = self.data[tuple(slices)]
+        sliced_name = f"{self.name}_slice_{axis}_{start}_{start+size}"
+        return Tensor(name=sliced_name, axes=self.axes, data=sliced_data)
 
     def get_axis_size(self, axis: str) -> int:
         axis_index = self.axes.index(axis)

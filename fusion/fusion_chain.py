@@ -51,10 +51,12 @@ class FusionChain:
         prev_O1 = self.fx.initialize_output(fusion_axis, fx_input_tensors)
         curr_O1 = Tensor(name=prev_O1.name.replace("prev", "curr"), axes=prev_O1.axes, data=prev_O1.data)
         for fusion_step in range(num_fusion_steps):
+            fusion_axis_start = fusion_step * fusion_block_size
             fx_forward_inputs = [prev_O1]
             for tensor in fx_input_tensors:
-                fx_forward_inputs.append(tensor)
-            print(curr_O1.data)
+                fx_forward_inputs.append(
+                    tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_block_size)
+                )
             self.fx.forward(inputs=fx_forward_inputs, next_output=curr_O1)
-            print(curr_O1.data)
-            break
+            prev_O1.data = curr_O1.data
+        return curr_O1

@@ -3,6 +3,7 @@ from typing import List
 
 import numpy as np
 
+from autotune.core.metrics import check_correctness
 from fusion.fusion_chain import FusionChain
 from fusion.operators import Operator
 from fusion.tensors import Tensor
@@ -99,8 +100,8 @@ def test_rmsnorm_matmul_fusion():
     matmul_op = Matmul(["LHS", "RHS"])
     fusion = RMSNormMatmulFusion(fx=sum_squares_op, gbs=[rms_factor_op], hbs=[matmul_op])
     result_fused = fusion.execute(fusion_axis="hidden", fusion_block_size=128, input_tensors=[lhs, rhs])
-    # result_standard = fusion.execute(block_size=hidden_dim, input_tensors=[lhs, rhs])
-    # check_correctness(result_standard.data, result_fused.data, 1e-4, 1e-4)
+    result_standard = fusion.execute(fusion_axis="hidden", fusion_block_size=hidden_dim, input_tensors=[lhs, rhs])
+    check_correctness(result_standard.data, result_fused.data, 1e-4, 1e-4, verbose=True)
 
 
 if __name__ == "__main__":
