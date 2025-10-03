@@ -77,16 +77,36 @@ class Matmul(Operator):
     def __init__(self, input_tensors: List[str]) -> None:
         super().__init__(input_tensors)
 
-    def forward(self, inputs: List[Tensor], next_output: Tensor) -> None:
-        pass
+    def forward(self, input_tensors: List[Tensor], output_tensor: Tensor) -> None:
+        assert len(input_tensors) == 2, f"Matmul forward expects LHS, RHS tensors, received {len(input_tensors)}"
+        lhs, rhs = input_tensors
+        output_tensor.data = np.matmul(lhs.data, rhs.data)
 
-    def initialize_output(self, inputs: List[Tensor]) -> Tensor:
-        pass
+    def initialize_output(self, input_tensors: List[Tensor], fusion_axis: str) -> Tensor:
+        assert (
+            len(input_tensors) == 2
+        ), f"Matmul initialize_output expects LHS, RHS tensors, received {len(input_tensors)}"
+        lhs, rhs = input_tensors
+        output_shape = lhs.get_parallel_shape(fusion_axis) + rhs.get_parallel_shape(fusion_axis)
+        output_axes = lhs.get_parallel_axes(fusion_axis) + rhs.get_parallel_axes(fusion_axis)
+        init_matmul = np.zeros(shape=output_shape, dtype=lhs.data.dtype)
+        init_tensor = Tensor(name=f"matmul", axes=output_axes, data=init_matmul)
+        return init_tensor
 
 
 class RMSNormMatmulFusion(FusionChain):
     def __init__(self, fx: Operator, gbs: List[Operator], hbs: List[Operator]):
         super().__init__(fx, gbs, hbs)
+
+
+def rmsnorm_matmul_golden(lhs, rhs, epsilon):
+    x = lhs.data
+    weight = rhs.data
+    square_mean = np.mean(x**2, axis=-1, keepdims=True)
+    rms = np.sqrt(square_mean + epsilon)
+    x_normalized = x / rms
+    result = np.matmul(x_normalized, weight)
+    return result
 
 
 def test_rmsnorm_matmul_fusion():
@@ -98,10 +118,12 @@ def test_rmsnorm_matmul_fusion():
     - rhs: (1024, 128) - hidden dimension x output dimension
     - Output: (512, 128)
     """
-    seq_len = 512
+    seq_len = 128
     hidden_dim = 1024
     output_dim = 128
     epsilon = 1e-6
+    atol = 1e-4
+    rtol = 1e-4
 
     lhs = Tensor(name="LHS", axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim).astype(np.float32))
     rhs = Tensor(name="RHS", axes=["hidden", "output"], data=np.random.randn(hidden_dim, output_dim).astype(np.float32))
@@ -110,9 +132,13 @@ def test_rmsnorm_matmul_fusion():
     rms_factor_op = NormFactor("curr_O1", epsilon, hidden_dim)
     matmul_op = Matmul(["LHS", "RHS"])
     fusion = RMSNormMatmulFusion(fx=sum_squares_op, gbs=[rms_factor_op], hbs=[matmul_op])
-    result_fused = fusion.execute(fusion_axis="hidden", fusion_step_size=128, input_tensors=[lhs, rhs])
+    result_fused = fusion.execute(fusion_axis="hidden", fusion_step_size=256, input_tensors=[lhs, rhs])
     result_standard = fusion.execute(fusion_axis="hidden", fusion_step_size=hidden_dim, input_tensors=[lhs, rhs])
-    check_correctness(result_standard.data, result_fused.data, 1e-4, 1e-4, verbose=True)
+    check_correctness(result_standard.data, result_fused.data, atol, rtol, verbose=True)
+
+    golden = rmsnorm_matmul_golden(lhs, rhs, epsilon)
+    check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
+    check_correctness(golden, result_fused.data, atol, rtol, verbose=True)
 
 
 if __name__ == "__main__":

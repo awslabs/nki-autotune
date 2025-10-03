@@ -54,7 +54,7 @@ class FusionChain:
         prev_O1 = self.fx.initialize_output(fx_input_tensors, fusion_axis=fusion_axis)
         curr_O1 = Tensor(name=prev_O1.name.replace("prev", "curr"), axes=prev_O1.axes, data=prev_O1.data)
 
-        # TODO: test with one operator fusion first
+        # NOTE: test with one operator fusion first
         gb_op = self.gbs[0]
         hb_op = self.hbs[0]
         prev_gb_out = gb_op.initialize_output(input_tensors=[curr_O1])
@@ -62,8 +62,12 @@ class FusionChain:
             name=prev_gb_out.name.replace("prev", "curr"), axes=prev_gb_out.axes, data=prev_gb_out.data
         )
 
+        hb_input_tensors = self.get_tensors(hb_op.input_tensors)
+        hb_out = hb_op.initialize_output(hb_input_tensors, fusion_axis=fusion_axis)
+        prev_O2 = Tensor(name="prev_O2", axes=hb_out.axes, data=hb_out.data)
+        curr_O2 = Tensor(name="curr_O2", axes=prev_O2.axes, data=prev_O2.data)
+
         for fusion_step in range(num_fusion_steps):
-            print(f"fusion_step {fusion_step}")
             fusion_axis_start = fusion_step * fusion_step_size
             fx_forward_inputs = [prev_O1]
             for tensor in fx_input_tensors:
@@ -72,9 +76,19 @@ class FusionChain:
                 )
             self.fx.forward(input_tensors=fx_forward_inputs, output_tensor=curr_O1)
             gb_op.forward(input_tensors=[curr_O1], output_tensor=curr_gb_out)
+            hb_forward_inputs: List[Tensor] = []
+            for tensor in hb_input_tensors:
+                hb_forward_inputs.append(
+                    tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_step_size)
+                )
+            hb_op.forward(input_tensors=hb_forward_inputs, output_tensor=hb_out)
+            bias = curr_gb_out.data[:, None] * hb_out.data
             if fusion_step > 0:
                 scale_factor = curr_gb_out.data / prev_gb_out.data
-                print(scale_factor.shape)
+                curr_O2.data = scale_factor[:, None] * prev_O2.data + bias
+            else:
+                curr_O2.data = bias
             prev_gb_out.data = curr_gb_out.data
             prev_O1.data = curr_O1.data
-        return curr_O1
+            prev_O2.data = curr_O2.data
+        return curr_O2
