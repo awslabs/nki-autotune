@@ -119,6 +119,7 @@ def tensor_to_matmul_mac_count(input_tensor_shapes: List[Tuple[int, ...]]) -> in
 
 
 def check_correctness(desired, actual, atol, rtol, verbose: bool = False):
+    assert desired.shape == actual.shape, f"Shape mismatch: desired {desired.shape}, actual {actual.shape}"
     abs_diff = np.abs(actual - desired)
     # Avoid division by zero in relative difference calculation
     rel_diff = np.divide(abs_diff, np.abs(desired), out=np.zeros_like(abs_diff), where=np.abs(desired) != 0)
