@@ -3,8 +3,31 @@
 import math
 from typing import List
 
-from fusion.operators import GbOperator, HbOperator, StatefulOperator
+import numpy as np
+
+from fusion.operators import FxOperator, GbOperator, HbOperator
 from fusion.tensors import Tensor
+
+
+def broadcast_multiply(tensor_a: Tensor, tensor_b: Tensor) -> np.ndarray:
+    """
+    Broadcast tensor_a to tensor_b's shape and perform element-wise multiplication.
+
+    Args:
+        tensor_a: First tensor (typically with fewer dimensions)
+        tensor_b: Second tensor (target shape for broadcasting)
+
+    Returns:
+        New Tensor with the result of broadcasting tensor_a to tensor_b's shape
+        and performing element-wise multiplication
+    """
+    dim_diff = len(tensor_b.data.shape) - len(tensor_a.data.shape)
+    indexing = [slice(None)] * len(tensor_a.data.shape)
+    for _ in range(dim_diff):
+        indexing.append(None)
+    broadcasted_a = tensor_a.data[tuple(indexing)]
+    result_data = broadcasted_a * tensor_b.data
+    return result_data
 
 
 class FusionChain:
@@ -15,16 +38,17 @@ class FusionChain:
     enabling fusion of complex patterns.
     """
 
-    def __init__(self, fx: StatefulOperator, gbs: List[GbOperator], hbs: List[HbOperator]):
+    def __init__(self, fx: FxOperator, gbs: List[GbOperator], hbs: List[HbOperator]):
         """
         Initialize FusionChain with a sequence of operators.
         """
         self.fx = fx
         self.gbs = gbs
         self.hbs = hbs
+        assert len(gbs) == len(hbs), f"Number of gB and hB functions mismatch"
 
     def get_tensors(self, tensor_names: List[str]) -> List[Tensor]:
-        tensors = [self.all_tensors[tensor_name] for tensor_name in tensor_names]
+        tensors = [self.input_tensors[tensor_name] for tensor_name in tensor_names]
         return tensors
 
     def execute(self, fusion_axis: str, fusion_step_size: int, input_tensors: List[Tensor]) -> Tensor:
@@ -48,53 +72,66 @@ class FusionChain:
                     assert fusion_size == tensor_fusion_size, f"Fusion size mismatch in input tensors"
         assert fusion_size > 0, "Did not find fusion axis in the input tensors"
         num_fusion_steps = math.ceil(fusion_size / fusion_step_size)
-        self.all_tensors = {tensor.name: tensor for tensor in input_tensors}
+        num_fused_operators = len(self.gbs)
+        self.input_tensors = {tensor.name: tensor for tensor in input_tensors}
 
-        fx_input_tensors = self.get_tensors(self.fx.input_tensors)
-        prev_O1 = self.fx.initialize_output(fx_input_tensors, fusion_axis=fusion_axis, output_tensor_name="prev_O1")
-        curr_O1 = Tensor(name=prev_O1.name.replace("prev", "curr"), axes=prev_O1.axes, data=prev_O1.data)
-
-        # NOTE: test with one operator fusion first
-        gb_op = self.gbs[0]
-        prev_gb_out = gb_op.initialize_output(input_tensors=[prev_O1], output_tensor_name="prev_gb_out")
-        curr_gb_out = gb_op.initialize_output(input_tensors=[curr_O1], output_tensor_name="curr_gb_out")
-
-        hb_op = self.hbs[0]
-        hb_input_tensors = self.get_tensors(hb_op.input_tensors)
-        hb_out = hb_op.initialize_output(
-            input_tensors=hb_input_tensors, output_tensor_name="hb_out", fusion_axis=fusion_axis
-        )
-        prev_O2 = hb_op.initialize_output(
-            input_tensors=hb_input_tensors, output_tensor_name="prev_O2", fusion_axis=fusion_axis
-        )
-        curr_O2 = hb_op.initialize_output(
-            input_tensors=hb_input_tensors, output_tensor_name="curr_O2", fusion_axis=fusion_axis
-        )
-
+        """
+        O_prev_i_k: O_{i-1,k}
+        O_prev_i_prev_k: O_{i-1,k-1}
+        O_i_prev_k: O_{i,k-1}
+        O_i_k: O_{i,k}
+        """
         for fusion_step in range(num_fusion_steps):
-            print(f"Fusion step {fusion_step}")
+            print("-" * 20, f"Fusion step {fusion_step}", "-" * 20)
             fusion_axis_start = fusion_step * fusion_step_size
-            fx_forward_inputs: List[Tensor] = []
-            for tensor in fx_input_tensors:
-                fx_forward_inputs.append(
+            fx_input_tensors: List[Tensor] = []
+            for tensor in self.get_tensors(self.fx.input_tensors):
+                fx_input_tensors.append(
                     tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_step_size)
                 )
-            self.fx.forward(prev_output=prev_O1, input_tensors=fx_forward_inputs, curr_output=curr_O1)
-            gb_op.forward(input_tensors=[curr_O1], output_tensor=curr_gb_out)
+            print(f"fx_input_tensors = {fx_input_tensors}")
+            if fusion_step == 0:
+                O_prev_i_k = self.fx.initialize_output(
+                    fx_input_tensors, fusion_axis=fusion_axis, output_tensor_name="O_{i-1,k}"
+                )
+                O_prev_i_prev_k = None
+            self.fx.forward(
+                prev_output=O_prev_i_prev_k,
+                input_tensors=fx_input_tensors,
+                curr_output=O_prev_i_k,
+                reduction_axis=fusion_axis,
+            )
+            for operator_counter in range(num_fused_operators):
+                gb_op = self.gbs[operator_counter]
+                hb_op = self.hbs[operator_counter]
+                print(f"Operator {operator_counter}: gB = {gb_op}, hB = {hb_op}")
 
-            hb_forward_inputs: List[Tensor] = []
-            for tensor in hb_input_tensors:
-                hb_forward_inputs.append(
-                    tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_step_size)
-                )
-            hb_op.forward(input_tensors=hb_forward_inputs, output_tensor=hb_out)
-            bias = curr_gb_out.data[:, None] * hb_out.data
-            if fusion_step > 0:
-                scale_factor = curr_gb_out.data / prev_gb_out.data
-                curr_O2.data = scale_factor[:, None] * prev_O2.data + bias
-            else:
-                curr_O2.data = bias
-            prev_gb_out.data = curr_gb_out.data
-            prev_O1.data = curr_O1.data
-            prev_O2.data = curr_O2.data
-        return curr_O2
+        # for fusion_step in range(num_fusion_steps):
+        #     if fusion_step == 0:
+        #         self.fx.forward(
+        #             prev_output=None, input_tensors=fx_input_tensors, curr_output=curr_O[0], reduction_axis=fusion_axis
+        #         )
+        #         # FIXME: develop one fusion op first
+        #         gb_op = self.gbs[0]
+        #         hb_op = self.hbs[0]
+
+        #         gb_out = gb_op.initialize_output(dependent_output=curr_OX, output_tensor_name="gb_out")
+        #         gb_op.forward(dependent_output=curr_OX, output_tensor=gb_out)
+
+        #         hb_input_tensors: List[Tensor] = []
+        #         for tensor in self.get_tensors(hb_op.input_tensors):
+        #             hb_input_tensors.append(
+        #                 tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_step_size)
+        #             )
+        #         hb_out = hb_op.initialize_output(
+        #             input_tensors=hb_input_tensors, output_tensor_name="hb_out", fusion_axis=fusion_axis
+        #         )
+        #         hb_op.forward(input_tensors=hb_input_tensors, output_tensor=hb_out)
+
+        #         curr_out = hb_op.initialize_output(
+        #             input_tensors=hb_input_tensors, output_tensor_name="curr_out", fusion_axis=fusion_axis
+        #         )
+        #         curr_out.data = broadcast_multiply(gb_out, hb_out)
+        #     prev_OX = curr_OX
+        #     prev_out = curr_out
+        # return curr_out
