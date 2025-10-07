@@ -3,26 +3,10 @@ from typing import List, Optional
 
 import numpy as np
 
+from autotune.core.metrics import check_correctness
 from fusion.fusion_chain import FusionChain
 from fusion.operators import FxOperator, GbOperator, HbOperator
 from fusion.tensors import Tensor
-
-
-def find_single_diff(list1: List[str], list2: List[str]):
-    """
-    Check if exactly one string is missing between two lists.
-    Returns the missing string if found, otherwise raises an error.
-    """
-    set1 = set(list1)
-    set2 = set(list2)
-
-    # Find all differences between the two sets
-    diff = set1.symmetric_difference(set2)
-
-    if len(diff) == 1:
-        return diff.pop()
-    else:
-        raise ValueError(f"Expected exactly 1 difference, found {len(diff)}")
 
 
 class SumSquares(FxOperator):
@@ -32,9 +16,6 @@ class SumSquares(FxOperator):
     def forward(
         self, prev_output: Optional[Tensor], input_tensors: List[Tensor], curr_output: Tensor, reduction_axis: str
     ) -> None:
-        print(
-            f"prev_output = {prev_output}. input_tensors = {input_tensors}. curr_output = {curr_output}. reduction_axis = {reduction_axis}"
-        )
         assert (
             len(input_tensors) == 1
         ), f"SumSquares forward expects input_tensor, received {len(input_tensors)} tensors"
@@ -97,7 +78,12 @@ class Matmul(HbOperator):
 def rmsnorm_matmul_golden(lhs: Tensor, rhs: Tensor, epsilon: float) -> np.ndarray:
     x = lhs.data
     weight = rhs.data
-    square_mean = np.mean(x**2, axis=-1, keepdims=True)
+
+    # Explicit intermediate steps
+    squares = x**2  # Explicit squares computation
+    sum_of_squares = np.sum(squares, axis=-1, keepdims=True)  # Explicit sum of squares
+    square_mean = sum_of_squares / x.shape[-1]  # Convert sum to mean
+
     rms = np.sqrt(square_mean + epsilon)
     x_normalized = x / rms
     result = np.matmul(x_normalized, weight)
@@ -133,7 +119,7 @@ def test_rmsnorm_matmul_fusion():
 
     golden = rmsnorm_matmul_golden(lhs, rhs, epsilon)
     # check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
-    # check_correctness(golden, result_fused.data, atol, rtol, verbose=True)
+    check_correctness(golden, result_fused.data, atol, rtol, verbose=True)
 
 
 if __name__ == "__main__":
