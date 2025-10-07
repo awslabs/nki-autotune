@@ -220,7 +220,7 @@ def summarize_2d_mismatches(mismatches, desired, actual):
 
     # Format region strings with values for top regions
     region_strings = []
-    num_regions_with_values = min(5, len(region_info))  # Show values for top 5 regions
+    num_regions_with_values = min(3, len(region_info))  # Show values for top 3 regions
 
     for i, (size, r_start, c_start, r_end, c_end) in enumerate(region_info):
         # Only display top 10 regions if there are more than 10
