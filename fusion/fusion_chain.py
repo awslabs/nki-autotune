@@ -191,7 +191,10 @@ class FusionChain:
                         output_tensor_name=f"hb_{operator_counter}",
                         fusion_axis=fusion_axis,
                     )
-                    hb_op.forward(input_tensors=hb_input_tensors, output_tensor=intermediates[f"hb_{operator_counter}"])
+
+                hb_op.forward(input_tensors=hb_input_tensors, output_tensor=intermediates[f"hb_{operator_counter}"])
+
+                if fusion_step == 0:
                     bias = broadcast_multiply(
                         intermediates[f"curr_gb_{operator_counter-1}"], intermediates[f"hb_{operator_counter}"]
                     )

@@ -114,11 +114,11 @@ def test_rmsnorm_matmul_fusion():
     matmul_op = Matmul(["LHS", "RHS"])
     fusion = FusionChain(fx=sum_squares_op, gbs=[rms_factor_op], hbs=[matmul_op])
     result_fused = fusion.execute(fusion_axis="hidden", fusion_step_size=256, input_tensors=[lhs, rhs])
-    # result_standard = fusion.execute(fusion_axis="hidden", fusion_step_size=hidden_dim, input_tensors=[lhs, rhs])
-    # check_correctness(result_standard.data, result_fused.data, atol, rtol, verbose=True)
+    result_standard = fusion.execute(fusion_axis="hidden", fusion_step_size=hidden_dim, input_tensors=[lhs, rhs])
+    check_correctness(result_standard.data, result_fused.data, atol, rtol, verbose=True)
 
     golden = rmsnorm_matmul_golden(lhs, rhs, epsilon)
-    # check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
+    check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
     check_correctness(golden, result_fused.data, atol, rtol, verbose=True)
 
 
