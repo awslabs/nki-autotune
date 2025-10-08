@@ -31,10 +31,11 @@ class HbOperator(ABC):
         self.input_tensors = input_tensors
 
     @abstractmethod
-    def forward(self, input_tensors: List[Tensor], output_tensor: Tensor) -> None:
+    def forward(self, input_tensors: List[Tensor], output_tensor: Tensor, fusion_axis: str) -> None:
         """
         Execute the operator forward pass.
         Update output in place.
+        FIXME: the assumption that hB operator consumes the fusion axis is wrong.
         """
 
     @abstractmethod

@@ -111,7 +111,7 @@ class FusionChain:
         assert fusion_size > 0, "Did not find fusion axis in the input tensors"
         num_fusion_steps = math.ceil(fusion_size / fusion_step_size)
         self.input_tensors = {tensor.name: tensor for tensor in input_tensors}
-        print(self.input_tensors)
+        print(f"input_tensors = {self.input_tensors}")
 
         intermediates: Dict[str, Optional[Tensor]] = {"O_0_old": None}
         for fusion_step in range(num_fusion_steps):
@@ -159,7 +159,8 @@ class FusionChain:
                         output_tensor_name=f"h_{operator_counter}",
                         fusion_axis=fusion_axis,
                     )
-                hb_op.forward(input_tensors=hb_input_tensors, output_tensor=h_out)
+                hb_op.forward(input_tensors=hb_input_tensors, output_tensor=h_out, fusion_axis=fusion_axis)
+                # FIXME: Should combine gB, hB as one operator to compute the bias
                 bias = broadcast_multiply(intermediates[f"g_{operator_counter}_new"], h_out)
 
                 if fusion_step == 0:
