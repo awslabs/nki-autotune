@@ -220,13 +220,15 @@ def summarize_2d_mismatches(mismatches, desired, actual):
     region_info.sort(key=lambda x: (-x[0], x[1], x[2]))
 
     # Format region strings with values for top regions
+    topK_with_vals = 3
+    topK = 5
     region_strings = []
-    num_regions_with_values = min(3, len(region_info))  # Show values for top 3 regions
+    num_regions_with_values = min(topK_with_vals, len(region_info))  # Show values for topK_with_vals regions
 
     for i, (size, r_start, c_start, r_end, c_end) in enumerate(region_info):
-        # Only display top 10 regions if there are more than 10
-        if i >= 10 and len(region_info) > 10:
-            remaining = len(region_info) - 10
+        # Only display top topK regions if there are more than topK
+        if i >= topK and len(region_info) > topK:
+            remaining = len(region_info) - topK
             region_strings.append(f"... {remaining} more regions not shown")
             break
 
@@ -269,12 +271,9 @@ def summarize_2d_mismatches(mismatches, desired, actual):
 
         region_strings.append(region_str)
 
-    if len(region_strings) == 1:
-        return f"Elements {region_strings[0]} are wrong."
-    else:
-        total_regions = len(region_info)
-        header = f"Found {total_regions} mismatched regions, sorted by size (largest first):"
-        return f"{header}\n" + "".join(region_strings)
+    total_regions = len(region_info)
+    header = f"Found {total_regions} mismatched regions, sorted by size (largest first):"
+    return f"{header}\n" + "".join(region_strings)
 
 
 def _format_array(arr, indent="", show_ellipsis=False):
