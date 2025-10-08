@@ -2,7 +2,7 @@
 
 import math
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -31,18 +31,18 @@ def broadcast_multiply(tensor_a: Tensor, tensor_b: Tensor) -> np.ndarray:
     return result_data
 
 
-def find_largest_curr_O_value(data: Dict[str, Tensor]) -> Tensor:
+def find_largest_O_new_value(data: Dict[str, Optional[Tensor]]) -> Tensor:
     """
-    Find the largest key with pattern "curr_O_{int}" and return its value.
+    Find the largest key with pattern "O_{int}_new" and return its value.
 
     Args:
         data: Dictionary with string keys and any values
 
     Returns:
-        The value associated with the largest "curr_O_{int}" key,
+        The value associated with the largest "O_{int}_new" key,
         or None if no matching keys are found
     """
-    pattern = re.compile(r"^curr_O_(\d+)$")
+    pattern = re.compile(r"^O_(\d+)_new$")
     max_num = -1
     for key in data.keys():
         match = pattern.match(key)
@@ -51,7 +51,21 @@ def find_largest_curr_O_value(data: Dict[str, Tensor]) -> Tensor:
             if num > max_num:
                 max_num = num
                 max_key = key
-    return data[max_key]
+    out = data[max_key]
+    assert out
+    return out
+
+
+def update_intermediates(intermediates: Dict[str, Optional[Tensor]]):
+    new_tensor_names: List[str] = []
+    for tensor_name in intermediates:
+        if "new" in tensor_name:
+            new_tensor_names.append(tensor_name)
+    for new_tensor_name in new_tensor_names:
+        old_tensor_name = new_tensor_name.replace("new", "old")
+        new_tensor = intermediates[new_tensor_name]
+        assert new_tensor
+        intermediates[old_tensor_name] = Tensor(name=old_tensor_name, axes=new_tensor.axes, data=new_tensor.data)
 
 
 class FusionChain:
@@ -75,44 +89,6 @@ class FusionChain:
         tensors = [self.input_tensors[tensor_name] for tensor_name in tensor_names]
         return tensors
 
-    def initialize_intermediates(self, fusion_axis: str, fusion_step_size: int):
-        num_fused_operators = len(self.gbs)
-        curr_intermediates: Dict[str, Tensor] = {}
-        prev_intermediates: Dict[str, Tensor] = {}
-        fx_input_tensors: List[Tensor] = []
-        for tensor in self.get_tensors(self.fx.input_tensors):
-            fx_input_tensors.append(tensor.get_axis_slice(fusion_axis, start=0, size=fusion_step_size))
-        curr_intermediates["O_0"] = self.fx.initialize_output(
-            fx_input_tensors, fusion_axis=fusion_axis, output_tensor_name="curr_O_0"
-        )
-        prev_intermediates["O_0"] = self.fx.initialize_output(
-            fx_input_tensors, fusion_axis=fusion_axis, output_tensor_name="curr_O_0"
-        )
-        for operator_counter in range(1, num_fused_operators + 1):
-            gb_op = self.gbs[operator_counter - 1]
-            hb_op = self.hbs[operator_counter - 1]
-            curr_intermediates[f"gB_O_{operator_counter-1}"] = gb_op.initialize_output(
-                dependent_output=curr_intermediates[f"O_{operator_counter-1}"],
-                output_tensor_name=f"gB_O_{operator_counter-1}",
-            )
-            prev_intermediates[f"gB_O_{operator_counter-1}"] = gb_op.initialize_output(
-                dependent_output=prev_intermediates[f"O_{operator_counter-1}"],
-                output_tensor_name=f"gB_O_{operator_counter-1}",
-            )
-
-            hb_input_tensors: List[Tensor] = []
-            for tensor in self.get_tensors(hb_op.input_tensors):
-                hb_input_tensors.append(tensor.get_axis_slice(fusion_axis, start=0, size=fusion_step_size))
-            curr_intermediates[f"O_{operator_counter}"] = hb_op.initialize_output(
-                input_tensors=hb_input_tensors, output_tensor_name=f"O_{operator_counter}", fusion_axis=fusion_axis
-            )
-            prev_intermediates[f"O_{operator_counter}"] = hb_op.initialize_output(
-                input_tensors=hb_input_tensors, output_tensor_name=f"O_{operator_counter}", fusion_axis=fusion_axis
-            )
-
-        print(f"curr_intermediates = {curr_intermediates.keys()}")
-        print(f"prev_intermediates = {prev_intermediates.keys()}")
-
     def execute(self, fusion_axis: str, fusion_step_size: int, input_tensors: List[Tensor]) -> Tensor:
         """
         Execute the fusion chain on the provided inputs.
@@ -135,12 +111,9 @@ class FusionChain:
         assert fusion_size > 0, "Did not find fusion axis in the input tensors"
         num_fusion_steps = math.ceil(fusion_size / fusion_step_size)
         self.input_tensors = {tensor.name: tensor for tensor in input_tensors}
+        print(self.input_tensors)
 
-        """
-        curr: k
-        prev: k-1
-        """
-        intermediates: Dict[str, Tensor] = {}
+        intermediates: Dict[str, Optional[Tensor]] = {"O_0_old": None}
         for fusion_step in range(num_fusion_steps):
             print("-" * 20, f"Fusion step {fusion_step}", "-" * 20)
             fusion_axis_start = fusion_step * fusion_step_size
@@ -151,84 +124,61 @@ class FusionChain:
                     tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_step_size)
                 )
             if fusion_step == 0:
-                intermediates["curr_O_0"] = self.fx.initialize_output(
-                    fx_input_tensors, fusion_axis=fusion_axis, output_tensor_name="curr_O_0"
+                intermediates["O_0_new"] = self.fx.initialize_output(
+                    fx_input_tensors, fusion_axis=fusion_axis, output_tensor_name="O_0_new"
                 )
-                self.fx.forward(
-                    prev_output=None,
-                    input_tensors=fx_input_tensors,
-                    curr_output=intermediates["curr_O_0"],
-                    reduction_axis=fusion_axis,
-                )
-            else:
-                self.fx.forward(
-                    prev_output=intermediates["prev_O_0"],
-                    input_tensors=fx_input_tensors,
-                    curr_output=intermediates["curr_O_0"],
-                    reduction_axis=fusion_axis,
-                )
+            assert intermediates["O_0_new"]
+            self.fx.forward(
+                prev_output=intermediates["O_0_old"],
+                input_tensors=fx_input_tensors,
+                curr_output=intermediates["O_0_new"],
+                reduction_axis=fusion_axis,
+            )
             for operator_counter in range(1, len(self.gbs) + 1):
+                print(f"Fusion operator {operator_counter}")
                 gb_op = self.gbs[operator_counter - 1]
                 if fusion_step == 0:
-                    intermediates[f"curr_gb_{operator_counter-1}"] = gb_op.initialize_output(
-                        dependent_output=intermediates[f"curr_O_{operator_counter-1}"],
-                        output_tensor_name=f"curr_gb_{operator_counter-1}",
+                    intermediates[f"g_{operator_counter}_new"] = gb_op.initialize_output(
+                        dependent_output=intermediates[f"O_{operator_counter-1}_new"],
+                        output_tensor_name=f"g_{operator_counter}_new",
                     )
                 gb_op.forward(
-                    dependent_output=intermediates[f"curr_O_{operator_counter-1}"],
-                    output_tensor=intermediates[f"curr_gb_{operator_counter-1}"],
+                    dependent_output=intermediates[f"O_{operator_counter-1}_new"],
+                    output_tensor=intermediates[f"g_{operator_counter}_new"],
                 )
+
                 hb_op = self.hbs[operator_counter - 1]
                 hb_input_tensors: List[Tensor] = []
                 for tensor in self.get_tensors(hb_op.input_tensors):
                     hb_input_tensors.append(
                         tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_step_size)
                     )
-
                 if fusion_step == 0:
-                    intermediates[f"hb_{operator_counter}"] = hb_op.initialize_output(
+                    h_out = hb_op.initialize_output(
                         input_tensors=hb_input_tensors,
-                        output_tensor_name=f"hb_{operator_counter}",
+                        output_tensor_name=f"h_{operator_counter}",
                         fusion_axis=fusion_axis,
                     )
-
-                hb_op.forward(input_tensors=hb_input_tensors, output_tensor=intermediates[f"hb_{operator_counter}"])
+                hb_op.forward(input_tensors=hb_input_tensors, output_tensor=h_out)
+                bias = broadcast_multiply(intermediates[f"g_{operator_counter}_new"], h_out)
 
                 if fusion_step == 0:
-                    bias = broadcast_multiply(
-                        intermediates[f"curr_gb_{operator_counter-1}"], intermediates[f"hb_{operator_counter}"]
-                    )
-                    intermediates[f"curr_O_{operator_counter}"] = Tensor(
-                        name=f"curr_O_{operator_counter}", axes=intermediates[f"hb_{operator_counter}"].axes, data=bias
+                    intermediates[f"O_{operator_counter}_new"] = Tensor(
+                        name=f"O_{operator_counter}_new", axes=h_out.axes, data=bias
                     )
                 else:
                     scale_factor = Tensor(
                         name="scale",
-                        axes=intermediates[f"curr_gb_{operator_counter-1}"].axes,
+                        axes=intermediates[f"g_{operator_counter}_new"].axes,
                         data=(
-                            intermediates[f"curr_gb_{operator_counter-1}"].data
-                            / intermediates[f"prev_gb_{operator_counter-1}"].data
+                            intermediates[f"g_{operator_counter}_new"].data
+                            / intermediates[f"g_{operator_counter}_old"].data
                         ),
                     )
-                    bias = broadcast_multiply(
-                        intermediates[f"curr_gb_{operator_counter-1}"], intermediates[f"hb_{operator_counter}"]
+                    intermediates[f"O_{operator_counter}_new"].data = (
+                        broadcast_multiply(scale_factor, intermediates[f"O_{operator_counter}_old"]) + bias
                     )
-                    intermediates[f"curr_O_{operator_counter}"].data = (
-                        broadcast_multiply(scale_factor, intermediates[f"prev_O_{operator_counter}"]) + bias
-                    )
-            print(intermediates.keys())
-
-            """Update prev tensors"""
-            curr_tensor_names = []
-            for tensor_name in intermediates:
-                if "curr" in tensor_name:
-                    curr_tensor_names.append(tensor_name)
-            for curr_tensor_name in curr_tensor_names:
-                curr_tensor = intermediates[curr_tensor_name]
-                prev_tensor_name = curr_tensor_name.replace("curr", "prev")
-                intermediates[prev_tensor_name] = Tensor(
-                    name=prev_tensor_name, axes=curr_tensor.axes, data=curr_tensor.data
-                )
-        output = find_largest_curr_O_value(intermediates)
+            update_intermediates(intermediates)
+        output = find_largest_O_new_value(intermediates)
         print(f"output = {output}")
         return output
