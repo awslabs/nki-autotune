@@ -34,8 +34,7 @@ class Rowmax(FxOperator):
         input_tensor = input_tensors[0]
         init_shape = input_tensor.get_parallel_shape(self.reduction_axis)
         init_parallel_axes = input_tensor.get_parallel_axes(self.reduction_axis)
-        # Initialize with -infinity for max operation
-        init_data = np.full(shape=init_shape, fill_value=-np.inf)
+        init_data = np.zeros(shape=init_shape)
         init_tensor = Tensor(name=output_tensor_name, axes=init_parallel_axes, data=init_data)
         return init_tensor
 
@@ -55,6 +54,7 @@ class SumExpBias(BiasOperator):
         assert len(outputs_new) >= 1, f"SumExpBias needs O_0 (rowmax), received {len(outputs_new)} outputs"
 
         P_slice = input_tensors[0]
+        # FIXME: needs manual tracking to know which outputs to use
         O_0_rowmax = outputs_new[0]  # Current rowmax O_0_k
 
         # Broadcast rowmax for subtraction: P_k - O_0_k
@@ -86,6 +86,7 @@ class SumExpScale(ScaleOperator):
         super().__init__()
 
     def forward(self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor: Tensor) -> None:
+        # FIXME: needs manual tracking to know which outputs to use
         O_0_old = outputs_old[0]  # Previous rowmax O_0_{k-1}
         O_0_new = outputs_new[0]  # Current rowmax O_0_k
 
@@ -115,13 +116,15 @@ class AttentionOutputBias(BiasOperator):
         assert len(input_tensors) == 2, f"AttentionOutputBias expects P and V tensors, received {len(input_tensors)}"
         assert len(outputs_new) >= 2, f"AttentionOutputBias needs O_0 and O_1, received {len(outputs_new)}"
 
-        P_slice = input_tensors[0]
-        V_slice = input_tensors[1]
-        O_0_rowmax = outputs_new[0]  # Rowmax
-        O_1_sum_exp = outputs_new[1]  # Sum of exponentials
+        P_slice, V_slice = input_tensors
+        O_0_rowmax, O_1_sum_exp = outputs_new
 
         # Compute softmax weights: exp(P_k - O_0_k) / O_1_k
         rowmax_broadcasted = O_0_rowmax.data[:, np.newaxis]
+        """
+        FIXME: exp_normalized computation can be cached.
+        Need to allow operators to return multiple tensors and save in intermedaites.
+        """
         exp_normalized = np.exp(P_slice.data - rowmax_broadcasted)
 
         sum_exp_broadcasted = O_1_sum_exp.data[:, np.newaxis]
@@ -240,24 +243,10 @@ def test_flash_attention_fusion():
     fusion = FusionChain(
         fx=rowmax_op, bias_ops=[sum_exp_bias_op, attention_bias_op], scale_ops=[sum_exp_scale_op, attention_scale_op]
     )
-
-    # Test with full step size (should match golden exactly)
-    print("\n" + "=" * 80)
-    print("Testing Flash Attention with fusion_step_size = seq_len (no fusion)")
-    print("=" * 80)
     result_standard = fusion.execute(fusion_axis="fusion", fusion_step_size=seq_len, input_tensors=[P, V])
+    result_fused = fusion.execute(fusion_axis="fusion", fusion_step_size=64, input_tensors=[P, V])
     check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
-
-    # Test with smaller step size (actual fusion)
-    print("\n" + "=" * 80)
-    print("Testing Flash Attention with fusion_step_size = 32 (with fusion)")
-    print("=" * 80)
-    result_fused = fusion.execute(fusion_axis="fusion", fusion_step_size=32, input_tensors=[P, V])
     check_correctness(golden, result_fused.data, atol, rtol, verbose=True)
-
-    print("\n" + "=" * 80)
-    print("Flash Attention fusion test passed!")
-    print("=" * 80)
 
 
 if __name__ == "__main__":
