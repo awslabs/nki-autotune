@@ -7,53 +7,54 @@ from fusion.tensors import Tensor
 
 
 class FxOperator(ABC):
-    def __init__(self, input_tensors: List[str]) -> None:
+    def __init__(self, input_tensors: List[str], **kwargs) -> None:
         super().__init__()
         self.input_tensors = input_tensors
 
     @abstractmethod
-    def forward(
-        self, prev_output: Optional[Tensor], input_tensors: List[Tensor], curr_output: Tensor, reduction_axis: str
-    ) -> None:
+    def forward(self, output_old: Optional[Tensor], input_tensors: List[Tensor], output_new: Tensor) -> None:
         """
         Execute the operator forward pass.
-        Update curr_output in place.
+        Update output_new in place.
         """
 
     @abstractmethod
-    def initialize_output(self, input_tensors: List[Tensor], fusion_axis: str, output_tensor_name: str) -> Tensor:
+    def initialize_output(self, input_tensors: List[Tensor], output_tensor_name: str) -> Tensor:
         """Initialize the output tensor given input_tensors."""
 
 
-class HbOperator(ABC):
-    def __init__(self, input_tensors: List[str]) -> None:
+class BiasOperator(ABC):
+    def __init__(self, input_tensors: List[str], **kwargs) -> None:
         super().__init__()
         self.input_tensors = input_tensors
 
     @abstractmethod
-    def forward(self, input_tensors: List[Tensor], output_tensor: Tensor, fusion_axis: str) -> None:
-        """
-        Execute the operator forward pass.
-        Update output in place.
-        FIXME: the assumption that hB operator consumes the fusion axis is wrong.
-        """
-
-    @abstractmethod
-    def initialize_output(self, input_tensors: List[Tensor], output_tensor_name: str, fusion_axis: str) -> Tensor:
-        """Initialize the output tensor given input_tensors."""
-
-
-class GbOperator(ABC):
-    def __init__(self) -> None:
-        super().__init__()
-
-    @abstractmethod
-    def forward(self, dependent_output: Tensor, output_tensor: Tensor) -> None:
+    def forward(self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor: Tensor) -> None:
         """
         Execute the operator forward pass.
         Update output_tensor in place.
         """
 
     @abstractmethod
-    def initialize_output(self, dependent_output: Tensor, output_tensor_name: str) -> Tensor:
-        """Initialize the output tensor given dependent_output."""
+    def initialize_output(
+        self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor_name: str
+    ) -> Tensor:
+        """Initialize the output tensor."""
+
+
+class ScaleOperator(ABC):
+    def __init__(self, **kwargs) -> None:
+        super().__init__()
+
+    @abstractmethod
+    def forward(self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor: Tensor) -> None:
+        """
+        Execute the operator forward pass.
+        Update output_tensor in place.
+        """
+
+    @abstractmethod
+    def initialize_output(
+        self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor_name: str
+    ) -> Tensor:
+        """Initialize the output tensor."""
