@@ -5,98 +5,260 @@ import numpy as np
 
 from autotune.core.metrics import check_correctness
 from fusion.fusion_chain import FusionChain
-from fusion.operators import FxOperator, GbOperator, HbOperator
+from fusion.operators import BiasOperator, FxOperator, ScaleOperator
 from fusion.tensors import Tensor
 
 
 class Rowmax(FxOperator):
-    def __init__(self, input_tensor: str) -> None:
-        super().__init__([input_tensor])
+    """
+    Computes incremental row maximum for online fusion.
+    O_0_k = max(O_0_{k-1}, rowmax(P_k))
+    """
 
-    def forward(
-        self, prev_output: Optional[Tensor], input_tensors: List[Tensor], curr_output: Tensor, reduction_axis: str
-    ) -> None:
-        assert len(input_tensors) == 1, f"Rowmax forward expects input_tensor, received {len(input_tensors)} tensors"
+    def __init__(self, input_tensors: List[str], reduction_axis: str) -> None:
+        super().__init__(input_tensors)
+        self.reduction_axis = reduction_axis
+
+    def forward(self, output_old: Optional[Tensor], input_tensors: List[Tensor], output_new: Tensor) -> None:
+        assert len(input_tensors) == 1, f"Rowmax forward expects 1 input tensor, received {len(input_tensors)}"
         input_tensor = input_tensors[0]
-        row_max = np.max(input_tensor.data, axis=input_tensor.axes.index(reduction_axis))
-        if prev_output:
-            curr_output.data = np.maximum(prev_output.data, row_max)
+        row_max = np.max(input_tensor.data, axis=input_tensor.axes.index(self.reduction_axis))
+
+        if output_old:
+            output_new.data = np.maximum(output_old.data, row_max)
         else:
-            curr_output.data = row_max
+            output_new.data = row_max
 
-    def initialize_output(self, input_tensors: List[Tensor], fusion_axis: str, output_tensor_name: str) -> Tensor:
-        assert (
-            len(input_tensors) == 1
-        ), f"Rowmax initialize output expects one input tensor, received {len(input_tensors)}"
+    def initialize_output(self, input_tensors: List[Tensor], output_tensor_name: str) -> Tensor:
+        assert len(input_tensors) == 1, f"Rowmax expects 1 input tensor, received {len(input_tensors)}"
         input_tensor = input_tensors[0]
-        init_shape = input_tensor.get_parallel_shape(fusion_axis)
-        init_parallel_axes = input_tensor.get_parallel_axes(fusion_axis)
-        init_data = np.zeros(shape=init_shape)
+        init_shape = input_tensor.get_parallel_shape(self.reduction_axis)
+        init_parallel_axes = input_tensor.get_parallel_axes(self.reduction_axis)
+        # Initialize with -infinity for max operation
+        init_data = np.full(shape=init_shape, fill_value=-np.inf)
         init_tensor = Tensor(name=output_tensor_name, axes=init_parallel_axes, data=init_data)
         return init_tensor
 
 
-class SumExp(HbOperator):
-    def __init__(self, input_tensor: str) -> None:
-        super().__init__([input_tensor])
+class SumExpBias(BiasOperator):
+    """
+    Computes bias term for sum of exponentials: rowsum(exp(P_k - O_0_k))
+    Used in O_1 accumulation for softmax denominator.
+    """
 
-    def forward(self, input_tensors: List[Tensor], output_tensor: Tensor, fusion_axis: str) -> None:
-        assert len(input_tensors) == 1, f"SumExp forward expects one tensor, received {len(input_tensors)}"
-        input_tensor = input_tensors[0]
-        output_tensor.data = np.sum(np.exp(input_tensor.data), axis=input_tensor.axes.index(fusion_axis))
+    def __init__(self, input_tensors: List[str], reduction_axis: str) -> None:
+        super().__init__(input_tensors)
+        self.reduction_axis = reduction_axis
 
-    def initialize_output(self, input_tensors: List[Tensor], output_tensor_name: str, fusion_axis: str) -> Tensor:
-        assert len(input_tensors) == 1, f"SumExp forward expects one tensor, received {len(input_tensors)}"
+    def forward(self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor: Tensor) -> None:
+        assert len(input_tensors) == 1, f"SumExpBias expects 1 input tensor, received {len(input_tensors)}"
+        assert len(outputs_new) >= 1, f"SumExpBias needs O_0 (rowmax), received {len(outputs_new)} outputs"
+
+        P_slice = input_tensors[0]
+        O_0_rowmax = outputs_new[0]  # Current rowmax O_0_k
+
+        # Broadcast rowmax for subtraction: P_k - O_0_k
+        rowmax_broadcasted = O_0_rowmax.data[:, np.newaxis]
+        exp_normalized = np.exp(P_slice.data - rowmax_broadcasted)
+        sum_exp = np.sum(exp_normalized, axis=P_slice.axes.index(self.reduction_axis))
+
+        output_tensor.data = sum_exp
+
+    def initialize_output(
+        self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor_name: str
+    ) -> Tensor:
+        assert len(input_tensors) == 1, f"SumExpBias expects 1 input tensor, received {len(input_tensors)}"
         input_tensor = input_tensors[0]
-        output_shape = input_tensor.get_parallel_shape(fusion_axis)
-        output_axes = input_tensor.get_parallel_axes(fusion_axis)
+        output_shape = input_tensor.get_parallel_shape(self.reduction_axis)
+        output_axes = input_tensor.get_parallel_axes(self.reduction_axis)
         init_data = np.zeros(shape=output_shape)
         init_tensor = Tensor(name=output_tensor_name, axes=output_axes, data=init_data)
         return init_tensor
 
 
-class SumExpGb(GbOperator):
+class SumExpScale(ScaleOperator):
+    """
+    Computes scaling factor for sum_exp accumulation: exp(O_0_{k-1} - O_0_k)
+    This corrects the previous partial sum when rowmax changes.
+    """
+
     def __init__(self) -> None:
         super().__init__()
 
-    def forward(self, dependent_output: Tensor, output_tensor: Tensor) -> None:
-        output_tensor.data = 1 / np.exp(dependent_output.data)
+    def forward(self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor: Tensor) -> None:
+        O_0_old = outputs_old[0]  # Previous rowmax O_0_{k-1}
+        O_0_new = outputs_new[0]  # Current rowmax O_0_k
 
-    def initialize_output(self, dependent_output: Tensor, output_tensor_name: str) -> Tensor:
-        init_data = np.zeros(shape=dependent_output.data.shape)
-        init_tensor = Tensor(name=output_tensor_name, axes=dependent_output.axes, data=init_data)
+        # Scale factor: exp(O_0_old - O_0_new)
+        output_tensor.data = np.exp(O_0_old.data - O_0_new.data)
+
+    def initialize_output(
+        self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor_name: str
+    ) -> Tensor:
+        O_0_old = outputs_old[0]
+        init_tensor = Tensor(name=output_tensor_name, axes=O_0_old.axes, data=np.zeros(shape=O_0_old.data.shape))
         return init_tensor
 
 
-def softmax_matmul_golden(P: Tensor, V: Tensor) -> np.ndarray:
-    p_mat = P.data
-    v_mat = V.data
+class AttentionOutputBias(BiasOperator):
+    """
+    Computes attention output bias: (exp(P_k - O_0_k) / O_1_k) @ V_k
+    This is the weighted sum with the value matrix.
+    """
 
-    rowmax = np.max(p_mat, axis=-1)
-    sum_exp = np.sum(np.exp(p_mat - rowmax), axis=-1)
-    return sum_exp
+    def __init__(self, input_tensors: List[str], P_reduction_axis: str, matmul_axis: str) -> None:
+        super().__init__(input_tensors)
+        self.P_reduction_axis = P_reduction_axis
+        self.matmul_axis = matmul_axis
+
+    def forward(self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor: Tensor) -> None:
+        assert len(input_tensors) == 2, f"AttentionOutputBias expects P and V tensors, received {len(input_tensors)}"
+        assert len(outputs_new) >= 2, f"AttentionOutputBias needs O_0 and O_1, received {len(outputs_new)}"
+
+        P_slice = input_tensors[0]
+        V_slice = input_tensors[1]
+        O_0_rowmax = outputs_new[0]  # Rowmax
+        O_1_sum_exp = outputs_new[1]  # Sum of exponentials
+
+        # Compute softmax weights: exp(P_k - O_0_k) / O_1_k
+        rowmax_broadcasted = O_0_rowmax.data[:, np.newaxis]
+        exp_normalized = np.exp(P_slice.data - rowmax_broadcasted)
+
+        sum_exp_broadcasted = O_1_sum_exp.data[:, np.newaxis]
+        softmax_weights = exp_normalized / sum_exp_broadcasted
+
+        # Matrix multiplication: softmax_weights @ V_k
+        attention_output = np.matmul(softmax_weights, V_slice.data)
+        output_tensor.data = attention_output
+
+    def initialize_output(
+        self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor_name: str
+    ) -> Tensor:
+        assert len(input_tensors) == 2, f"AttentionOutputBias expects P and V, received {len(input_tensors)}"
+
+        P_slice = input_tensors[0]
+        V_slice = input_tensors[1]
+
+        # Output shape: [seq_len, hidden_dim]
+        output_shape = P_slice.get_parallel_shape(self.matmul_axis) + V_slice.get_parallel_shape(self.matmul_axis)
+        output_axes = P_slice.get_parallel_axes(self.matmul_axis) + V_slice.get_parallel_axes(self.matmul_axis)
+
+        init_data = np.zeros(shape=output_shape)
+        init_tensor = Tensor(name=output_tensor_name, axes=output_axes, data=init_data)
+        return init_tensor
 
 
-def test_softmax_matmul_fusion():
-    seq_len = 1024
-    hidden_dim = 512
-    atol = 1e-4
-    rtol = 1e-4
-    P = Tensor(name="P", axes=["seq", "fusion"], data=np.random.randn(seq_len, seq_len))
-    V = Tensor(name="V", axes=["fusion", "seq"], data=np.random.randn(seq_len, hidden_dim))
-    input_tensors = [P, V]
+class AttentionOutputScale(ScaleOperator):
+    """
+    Computes scaling factor for attention output: exp(O_0_{k-1} - O_0_k) * O_1_{k-1} / O_1_k
+    This accounts for both rowmax change and normalization factor change.
+    """
 
-    golden = softmax_matmul_golden(P, V)
+    def __init__(self) -> None:
+        super().__init__()
 
-    rowmax_op = Rowmax("P")
-    sum_exp_op = SumExp("P")
-    sum_exp_gb_op = SumExpGb()
-    fusion = FusionChain(fx=rowmax_op, gbs=[sum_exp_gb_op], hbs=[sum_exp_op])
-    result_standard = fusion.execute(fusion_axis="fusion", fusion_step_size=seq_len, input_tensors=input_tensors)
+    def forward(self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor: Tensor) -> None:
+        O_0_old = outputs_old[0]  # Previous rowmax
+        O_0_new = outputs_new[0]  # Current rowmax
+        O_1_old = outputs_old[1]  # Previous sum_exp
+        O_1_new = outputs_new[1]  # Current sum_exp
+
+        # Scale factor: exp(O_0_old - O_0_new) * O_1_old / O_1_new
+        output_tensor.data = np.exp(O_0_old.data - O_0_new.data) * (O_1_old.data / O_1_new.data)
+
+    def initialize_output(
+        self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor_name: str
+    ) -> Tensor:
+        O_0_old = outputs_old[0]
+        init_tensor = Tensor(name=output_tensor_name, axes=O_0_old.axes, data=np.zeros(shape=O_0_old.data.shape))
+        return init_tensor
+
+
+def flash_attention_golden(Q: Tensor, K: Tensor, V: Tensor) -> np.ndarray:
+    """
+    Standard attention computation: softmax(Q @ K^T) @ V
+
+    Args:
+        Q: Query tensor [seq_len, hidden_dim]
+        K: Key tensor [seq_len, hidden_dim]
+        V: Value tensor [seq_len, hidden_dim]
+
+    Returns:
+        Attention output [seq_len, hidden_dim]
+    """
+    # Compute attention scores: Q @ K^T
+    P = np.matmul(Q.data, K.data.T)
+
+    # Apply softmax
+    rowmax = np.max(P, axis=-1, keepdims=True)
+    exp_normalized = np.exp(P - rowmax)
+    sum_exp = np.sum(exp_normalized, axis=-1, keepdims=True)
+    softmax_weights = exp_normalized / sum_exp
+
+    # Compute attention output: softmax @ V
+    attention_output = np.matmul(softmax_weights, V.data)
+
+    return attention_output
+
+
+def test_flash_attention_fusion():
+    """
+    Test Flash Attention fusion: softmax(Q @ K^T) @ V
+
+    Example dimensions:
+    - Q: (seq_len, hidden_dim) - Query
+    - K: (seq_len, hidden_dim) - Key
+    - V: (seq_len, hidden_dim) - Value
+    - P = Q @ K^T: (seq_len, seq_len) - Attention scores
+    - Output: (seq_len, hidden_dim) - Attention output
+    """
+    seq_len = 128
+    hidden_dim = 64
+    atol = 1e-5
+    rtol = 1e-5
+
+    # Create input tensors
+    Q = Tensor(name="Q", axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim))
+    K = Tensor(name="K", axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim))
+    V = Tensor(name="V", axes=["fusion", "hidden"], data=np.random.randn(seq_len, hidden_dim))
+
+    # Precompute P = Q @ K^T
+    P_data = np.matmul(Q.data, K.data.T)
+    P = Tensor(name="P", axes=["seq", "fusion"], data=P_data)
+
+    # Golden reference
+    golden = flash_attention_golden(Q, K, V)
+
+    # Create fusion chain operators
+    rowmax_op = Rowmax(input_tensors=["P"], reduction_axis="fusion")
+    sum_exp_bias_op = SumExpBias(input_tensors=["P"], reduction_axis="fusion")
+    sum_exp_scale_op = SumExpScale()
+    attention_bias_op = AttentionOutputBias(input_tensors=["P", "V"], P_reduction_axis="fusion", matmul_axis="fusion")
+    attention_scale_op = AttentionOutputScale()
+
+    # Create fusion chain
+    fusion = FusionChain(
+        fx=rowmax_op, bias_ops=[sum_exp_bias_op, attention_bias_op], scale_ops=[sum_exp_scale_op, attention_scale_op]
+    )
+
+    # Test with full step size (should match golden exactly)
+    print("\n" + "=" * 80)
+    print("Testing Flash Attention with fusion_step_size = seq_len (no fusion)")
+    print("=" * 80)
+    result_standard = fusion.execute(fusion_axis="fusion", fusion_step_size=seq_len, input_tensors=[P, V])
     check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
-    result_fused = fusion.execute(fusion_axis="fusion", fusion_step_size=256, input_tensors=input_tensors)
+
+    # Test with smaller step size (actual fusion)
+    print("\n" + "=" * 80)
+    print("Testing Flash Attention with fusion_step_size = 32 (with fusion)")
+    print("=" * 80)
+    result_fused = fusion.execute(fusion_axis="fusion", fusion_step_size=32, input_tensors=[P, V])
     check_correctness(golden, result_fused.data, atol, rtol, verbose=True)
+
+    print("\n" + "=" * 80)
+    print("Flash Attention fusion test passed!")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    test_softmax_matmul_fusion()
+    test_flash_attention_fusion()
