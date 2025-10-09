@@ -129,7 +129,11 @@ class FusionChain:
                 output_old=intermediates["O_0_old"], input_tensors=fx_input_tensors, output_new=intermediates["O_0_new"]
             )
             for operator_counter in range(1, len(self.bias_ops) + 1):
-                print("-" * 20, f"Fusion step {fusion_step} Operator {operator_counter}", "-" * 20)
+                print(
+                    "-" * 20,
+                    f"Fusion step {fusion_step}/{num_fusion_steps} Operator {operator_counter}/{len(self.bias_ops)}",
+                    "-" * 20,
+                )
                 bias_op = self.bias_ops[operator_counter - 1]
                 bias_input_tensors: List[Tensor] = []
                 for tensor in self.get_tensors(bias_op.input_tensors):
@@ -146,7 +150,7 @@ class FusionChain:
                     input_tensors=bias_input_tensors,
                     output_tensor=bias_tensor,
                 )
-                print(f"bias_tensor = {bias_tensor}")
+                print(bias_tensor)
 
                 if fusion_step == 0:
                     intermediates[f"O_{operator_counter}_new"] = Tensor(
@@ -164,11 +168,11 @@ class FusionChain:
                         outputs_new=[intermediates[f"O_{i}_new"] for i in range(operator_counter)],
                         output_tensor=scale_tensor,
                     )
-                    print(f"scale_tensor = {scale_tensor}")
+                    print(scale_tensor)
                     intermediates[f"O_{operator_counter}_new"].data = (
                         broadcast_multiply(scale_tensor, intermediates[f"O_{operator_counter}_old"]) + bias_tensor.data
                     )
+                print(intermediates[f"O_{operator_counter}_new"])
             update_intermediates(intermediates)
         output = find_largest_O_new_value(intermediates)
-        print(f"output = {output}")
         return output
