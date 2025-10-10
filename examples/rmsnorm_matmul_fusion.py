@@ -1,63 +1,67 @@
 #!/usr/bin/env python3
-from typing import List, Optional
+from typing import Dict, List
 
 import numpy as np
 
 from autotune.core.metrics import check_correctness
 from fusion.fusion_chain import FusionChain
-from fusion.operators import BiasOperator, FxOperator, ScaleOperator
+from fusion.operators import Operator
 from fusion.tensors import Tensor
 
 
-class SumSquares(FxOperator):
+class SumSquares(Operator):
     def __init__(self, input_tensors: List[str], sum_axis: str) -> None:
         super().__init__(input_tensors)
         self.sum_axis = sum_axis
 
-    def forward(self, output_old: Optional[Tensor], input_tensors: List[Tensor], output_new: Tensor) -> None:
+    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
         assert (
             len(input_tensors) == 1
         ), f"SumSquares forward expects input_tensor, received {len(input_tensors)} tensors"
         input_tensor = input_tensors[0]
         sum_squares = np.sum(np.square(input_tensor.data), axis=input_tensor.axes.index(self.sum_axis))
-        if output_old:
+        output_new = intermediate_tensors[f"O_{self.operator_index}_new"]
+        if f"O_{self.operator_index}_old" in intermediate_tensors:
+            output_old = intermediate_tensors[f"O_{self.operator_index}_old"]
             output_new.data = output_old.data + sum_squares
         else:
             output_new.data = sum_squares
 
-    def initialize_output(self, input_tensors: List[Tensor], output_tensor_name: str) -> Tensor:
+    def initialize_output(
+        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
+    ) -> Dict[str, Tensor]:
         assert (
             len(input_tensors) == 1
         ), f"SumSquares initialize output expects one input tensor, received {len(input_tensors)}"
-        tensor = input_tensors[0]
-        init_sum_shape = tensor.get_parallel_shape(self.sum_axis)
-        init_sum_parallel_axes = tensor.get_parallel_axes(self.sum_axis)
+        input_tensor = input_tensors[0]
+        init_sum_shape = input_tensor.get_parallel_shape(self.sum_axis)
+        init_sum_parallel_axes = input_tensor.get_parallel_axes(self.sum_axis)
         init_sum = np.zeros(shape=init_sum_shape)
-        init_tensor = Tensor(name=output_tensor_name, axes=init_sum_parallel_axes, data=init_sum)
-        return init_tensor
+        init_tensor = Tensor(axes=init_sum_parallel_axes, data=init_sum)
+        return {f"O_{self.operator_index}_new": init_tensor}
 
 
-class RMSNormMatmul(BiasOperator):
+class RMSNormMatmul(Operator):
     def __init__(self, input_tensors: List[str], epsilon: float, num_elements: int, matmul_axis: str) -> None:
         super().__init__(input_tensors)
         self.epsilon = epsilon
         self.num_elements = num_elements
         self.matmul_axis = matmul_axis
 
-    def forward(self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor: Tensor) -> None:
+    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
         assert (
             len(input_tensors) == 2
         ), f"RMSNormMatmul forward expects two input tensors, received {len(input_tensors)}"
-        sum_squares = outputs_new[-1]
         lhs, rhs = input_tensors
+        sum_squares = intermediate_tensors[f"O_{self.operator_index - 1}_new"]
 
         mat_prod = np.matmul(lhs.data, rhs.data)
         norm_factor = np.sqrt(sum_squares.data / self.num_elements + self.epsilon)
-        output_tensor.data = mat_prod / norm_factor[:, None]
+        intermediate_tensors[f"bias_{self.operator_index}"].data = mat_prod / norm_factor[:, None]
 
     def initialize_output(
-        self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor_name: str
-    ) -> Tensor:
+        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
+    ) -> Dict[str, Tensor]:
         assert (
             len(input_tensors) == 2
         ), f"RMSNormMatmul initialize_output expects LHS, RHS tensors, received {len(input_tensors)}."
@@ -65,29 +69,30 @@ class RMSNormMatmul(BiasOperator):
         output_shape = lhs.get_parallel_shape(self.matmul_axis) + rhs.get_parallel_shape(self.matmul_axis)
         output_axes = lhs.get_parallel_axes(self.matmul_axis) + rhs.get_parallel_axes(self.matmul_axis)
         init_data = np.zeros(shape=output_shape)
-        init_tensor = Tensor(name=output_tensor_name, axes=output_axes, data=init_data)
-        return init_tensor
+        init_tensor = Tensor(axes=output_axes, data=init_data)
+        return {f"bias_{self.operator_index}": init_tensor}
 
 
-class Scale(ScaleOperator):
+class Scale(Operator):
     def __init__(self, epsilon: float, num_elements: int) -> None:
-        super().__init__()
+        super().__init__(input_tensors=[])
         self.epsilon = epsilon
         self.num_elements = num_elements
 
-    def forward(self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor: Tensor) -> None:
-        output_old = outputs_old[-1]
-        output_new = outputs_new[-1]
-        output_tensor.data = np.sqrt(output_old.data / self.num_elements + self.epsilon) / np.sqrt(
+    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+        output_old = intermediate_tensors[f"O_{self.operator_index-1}_old"]
+        output_new = intermediate_tensors[f"O_{self.operator_index-1}_new"]
+        scale_tensor = intermediate_tensors[f"scale_{self.operator_index}"]
+        scale_tensor.data = np.sqrt(output_old.data / self.num_elements + self.epsilon) / np.sqrt(
             output_new.data / self.num_elements + self.epsilon
         )
 
     def initialize_output(
-        self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor_name: str
-    ) -> Tensor:
-        output_old = outputs_old[-1]
-        init_tensor = Tensor(name=output_tensor_name, axes=output_old.axes, data=np.zeros(shape=output_old.data.shape))
-        return init_tensor
+        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
+    ) -> Dict[str, Tensor]:
+        output_old = intermediate_tensors[f"O_{self.operator_index-1}_old"]
+        init_tensor = Tensor(axes=output_old.axes, data=np.zeros(shape=output_old.data.shape))
+        return {f"scale_{self.operator_index}": init_tensor}
 
 
 def rmsnorm_matmul_golden(lhs: Tensor, rhs: Tensor, epsilon: float) -> np.ndarray:
@@ -121,15 +126,17 @@ def test_rmsnorm_matmul_fusion():
     atol = 1e-5
     rtol = 1e-5
 
-    lhs = Tensor(name="LHS", axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim))
-    rhs = Tensor(name="RHS", axes=["hidden", "output"], data=np.random.randn(hidden_dim, output_dim))
+    lhs = Tensor(axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim))
+    rhs = Tensor(axes=["hidden", "output"], data=np.random.randn(hidden_dim, output_dim))
+    input_tensors = {"LHS": lhs, "RHS": rhs}
 
-    sum_squares_op = SumSquares(["LHS"], sum_axis="hidden")
-    rms_matmul_op = RMSNormMatmul(["LHS", "RHS"], epsilon, hidden_dim, matmul_axis="hidden")
-    scale_op = Scale(epsilon, hidden_dim)
-    fusion = FusionChain(fx=sum_squares_op, bias_ops=[rms_matmul_op], scale_ops=[scale_op])
-    result_fused = fusion.execute(fusion_axis="hidden", fusion_step_size=256, input_tensors=[lhs, rhs])
-    result_standard = fusion.execute(fusion_axis="hidden", fusion_step_size=hidden_dim, input_tensors=[lhs, rhs])
+    fusion = FusionChain(
+        fx=SumSquares(["LHS"], sum_axis="hidden"),
+        bias_ops=[RMSNormMatmul(["LHS", "RHS"], epsilon, hidden_dim, matmul_axis="hidden")],
+        scale_ops=[Scale(epsilon, hidden_dim)],
+    )
+    result_fused = fusion.execute(fusion_axis="hidden", fusion_step_size=256, input_tensors=input_tensors)
+    result_standard = fusion.execute(fusion_axis="hidden", fusion_step_size=hidden_dim, input_tensors=input_tensors)
     golden = rmsnorm_matmul_golden(lhs, rhs, epsilon)
     check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
     check_correctness(golden, result_fused.data, atol, rtol, verbose=True)

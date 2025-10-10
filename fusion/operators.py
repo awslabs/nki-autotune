@@ -1,60 +1,44 @@
 """Operator definitions for the MegaFuse fusion framework."""
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Dict, List
 
 from fusion.tensors import Tensor
 
 
-class FxOperator(ABC):
+class Operator(ABC):
     def __init__(self, input_tensors: List[str], **kwargs) -> None:
+        """_summary_
+
+        Args:
+            index (int): _description_
+            input_tensors (List[str]): set of operator input tensor names that are directly from the kernel input
+        """
         super().__init__()
         self.input_tensors = input_tensors
 
+    @property
+    def operator_index(self) -> int:
+        """Get the operator index."""
+        return self.index
+
+    @operator_index.setter
+    def operator_index(self, value: int) -> None:
+        """Set the operator index."""
+        self.index = value
+
     @abstractmethod
-    def forward(self, output_old: Optional[Tensor], input_tensors: List[Tensor], output_new: Tensor) -> None:
+    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
         """
         Execute the operator forward pass.
-        Update output_new in place.
-        """
-
-    @abstractmethod
-    def initialize_output(self, input_tensors: List[Tensor], output_tensor_name: str) -> Tensor:
-        """Initialize the output tensor given input_tensors."""
-
-
-class BiasOperator(ABC):
-    def __init__(self, input_tensors: List[str], **kwargs) -> None:
-        super().__init__()
-        self.input_tensors = input_tensors
-
-    @abstractmethod
-    def forward(self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor: Tensor) -> None:
-        """
-        Execute the operator forward pass.
-        Update output_tensor in place.
+        intermediate_tensors are forward input tensors that are not kernel inputs
+        Update output_tensors in place.
         """
 
     @abstractmethod
     def initialize_output(
-        self, outputs_new: List[Tensor], input_tensors: List[Tensor], output_tensor_name: str
-    ) -> Tensor:
-        """Initialize the output tensor."""
-
-
-class ScaleOperator(ABC):
-    def __init__(self, **kwargs) -> None:
-        super().__init__()
-
-    @abstractmethod
-    def forward(self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor: Tensor) -> None:
+        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
+    ) -> Dict[str, Tensor]:
         """
-        Execute the operator forward pass.
-        Update output_tensor in place.
+        Initialize the operator output tensors.
         """
-
-    @abstractmethod
-    def initialize_output(
-        self, outputs_old: List[Tensor], outputs_new: List[Tensor], output_tensor_name: str
-    ) -> Tensor:
-        """Initialize the output tensor."""

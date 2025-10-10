@@ -8,8 +8,7 @@ import numpy as np
 class Tensor:
     """Numpy array wrapper with fusion-specific helpers."""
 
-    def __init__(self, name: str, axes: List[str], data: np.ndarray):
-        self.name = name
+    def __init__(self, axes: List[str], data: np.ndarray):
         self.axes = axes
         self.data = data
 
@@ -18,8 +17,7 @@ class Tensor:
         slices = [slice(None)] * len(self.data.shape)
         slices[axis_index] = slice(start, start + size)
         sliced_data = self.data[tuple(slices)]
-        sliced_name = f"{self.name}_slice_{axis}_{start}_{start+size}"
-        return Tensor(name=sliced_name, axes=self.axes, data=sliced_data)
+        return Tensor(axes=self.axes, data=sliced_data)
 
     def get_axis_size(self, axis: str) -> int:
         axis_index = self.axes.index(axis)
@@ -41,4 +39,4 @@ class Tensor:
         return parallel_axes
 
     def __repr__(self) -> str:
-        return f"Tensor(name={self.name}, axes={self.axes}, shape={self.data.shape}, dtype={self.data.dtype})"
+        return f"Tensor(axes={self.axes}, shape={self.data.shape}, dtype={self.data.dtype})"
