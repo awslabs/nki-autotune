@@ -95,13 +95,17 @@ class FusionChain:
         tensors = [self.input_tensors[tensor_name] for tensor_name in tensor_names]
         return tensors
 
-    def execute(self, fusion_axis: str, fusion_step_size: int, input_tensors: Dict[str, Tensor]) -> Tensor:
+    def execute(
+        self, fusion_axis: str, fusion_step_size: int, input_tensors: Dict[str, Tensor], verbose: bool = True
+    ) -> Tensor:
         """
         Execute the fusion chain on the provided inputs.
 
         Args:
-            fusion_block_size: granularity of the fusion axis each forward step
-            input_tensors: input tensors
+            fusion_axis: The axis along which to perform fusion
+            fusion_step_size: Granularity of the fusion axis each forward step
+            input_tensors: Input tensors
+            verbose: Whether to print iteration information
 
         Returns:
             Output tensor after applying all operators
@@ -119,9 +123,18 @@ class FusionChain:
         num_fusion_steps = math.ceil(fusion_size / fusion_step_size)
         self.input_tensors = input_tensors
 
+        # Collect iteration info for verbose output
+        iteration_info = []
+
         intermediates: Dict[str, Tensor] = {}
         for fusion_step in range(num_fusion_steps):
             fusion_axis_start = fusion_step * fusion_step_size
+            fusion_axis_end = min(fusion_axis_start + fusion_step_size, fusion_size)
+
+            # Add fusion step header
+            step_info = [
+                f"Fusion Step {fusion_step + 1}/{num_fusion_steps}: {fusion_axis}[{fusion_axis_start}:{fusion_axis_end}]"
+            ]
 
             fx_input_tensors: List[Tensor] = []
             for tensor in self.get_input_tensors(self.fx.input_tensors):
@@ -133,12 +146,9 @@ class FusionChain:
                     self.fx.initialize_output(intermediate_tensors=intermediates, input_tensors=fx_input_tensors)
                 )
             self.fx.forward(intermediate_tensors=intermediates, input_tensors=fx_input_tensors)
+            step_info.append(f"  - fx: {self.fx.__class__.__name__}")
+
             for operator_counter in range(1, len(self.bias_ops) + 1):
-                print(
-                    "-" * 20,
-                    f"Fusion step {fusion_step}/{num_fusion_steps} Operator {operator_counter}/{len(self.bias_ops)}",
-                    "-" * 20,
-                )
                 bias_op = self.bias_ops[operator_counter - 1]
                 bias_input_tensors: List[Tensor] = []
                 for tensor in self.get_input_tensors(bias_op.input_tensors):
@@ -151,12 +161,16 @@ class FusionChain:
                 bias_op.forward(intermediate_tensors=intermediates, input_tensors=bias_input_tensors)
 
                 if fusion_step == 0:
+                    step_info.append(f"  - bias_{operator_counter}: {bias_op.__class__.__name__}")
                     intermediates[f"O_{operator_counter}_new"] = Tensor(
                         axes=intermediates[f"bias_{operator_counter}"].axes,
                         data=intermediates[f"bias_{operator_counter}"].data,
                     )
+                    step_info.append(f"  - O_{operator_counter}_new = bias_{operator_counter}")
                 else:
                     scale_op = self.scale_ops[operator_counter - 1]
+                    step_info.append(f"  - scale_{operator_counter}: {scale_op.__class__.__name__}")
+                    step_info.append(f"  - bias_{operator_counter}: {bias_op.__class__.__name__}")
                     intermediates.update(
                         scale_op.initialize_output(intermediate_tensors=intermediates, input_tensors=[])
                     )
@@ -167,6 +181,19 @@ class FusionChain:
                         )
                         + intermediates[f"bias_{operator_counter}"].data
                     )
+                    step_info.append(
+                        f"  - O_{operator_counter}_new = scale_{operator_counter} * O_{operator_counter}_old + bias_{operator_counter}"
+                    )
+
+            # Add step info to collection
+            iteration_info.extend(step_info)
+            if fusion_step < num_fusion_steps - 1:
+                iteration_info.append("")  # Add blank line between steps
+
             update_intermediates(intermediates)
+
+        # Print all iteration info at once if verbose
+        if verbose:
+            print("\n".join(iteration_info))
         output = find_largest_O_new_value(intermediates)
         return output
