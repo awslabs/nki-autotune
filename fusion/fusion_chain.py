@@ -96,7 +96,7 @@ class FusionChain:
         return tensors
 
     def execute(
-        self, fusion_axis: str, fusion_step_size: int, input_tensors: Dict[str, Tensor], verbose: bool = True
+        self, fusion_axis: str, fusion_step_size: int, input_tensors: Dict[str, Tensor], verbose: bool = False
     ) -> Tensor:
         """
         Execute the fusion chain on the provided inputs.
