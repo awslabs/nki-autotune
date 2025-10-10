@@ -221,13 +221,14 @@ def test_flash_attention_fusion():
     rtol = 1e-5
 
     # Create input tensors
-    Q = Tensor(name="Q", axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim))
-    K = Tensor(name="K", axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim))
-    V = Tensor(name="V", axes=["fusion", "hidden"], data=np.random.randn(seq_len, hidden_dim))
+    Q = Tensor(axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim))
+    K = Tensor(axes=["seq", "hidden"], data=np.random.randn(seq_len, hidden_dim))
+    V = Tensor(axes=["fusion", "hidden"], data=np.random.randn(seq_len, hidden_dim))
 
     # Precompute P = Q @ K^T
     P_data = np.matmul(Q.data, K.data.T)
-    P = Tensor(name="P", axes=["seq", "fusion"], data=P_data)
+    P = Tensor(axes=["seq", "fusion"], data=P_data)
+    input_tensors = {"P": P, "V": V}
 
     # Golden reference
     golden = flash_attention_golden(Q, K, V)
@@ -243,8 +244,8 @@ def test_flash_attention_fusion():
     fusion = FusionChain(
         fx=rowmax_op, bias_ops=[sum_exp_bias_op, attention_bias_op], scale_ops=[sum_exp_scale_op, attention_scale_op]
     )
-    result_standard = fusion.execute(fusion_axis="fusion", fusion_step_size=seq_len, input_tensors=[P, V])
-    result_fused = fusion.execute(fusion_axis="fusion", fusion_step_size=64, input_tensors=[P, V])
+    result_standard = fusion.execute(fusion_axis="fusion", fusion_step_size=seq_len, input_tensors=input_tensors)
+    result_fused = fusion.execute(fusion_axis="fusion", fusion_step_size=64, input_tensors=input_tensors)
     check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
     check_correctness(golden, result_fused.data, atol, rtol, verbose=True)
 
