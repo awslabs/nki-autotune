@@ -59,6 +59,8 @@ venv.bak/
 .idea/
 *.swp
 *.swo
+.clinerules
+memory-bank
 
 # macOS
 .DS_Store

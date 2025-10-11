@@ -135,7 +135,7 @@ def test_rmsnorm_matmul_fusion():
         bias_ops=[RMSNormMatmul(["LHS", "RHS"], epsilon, hidden_dim, matmul_axis="hidden")],
         scale_ops=[Scale(epsilon, hidden_dim)],
     )
-    result_fused = fusion.execute(fusion_axis="hidden", fusion_step_size=256, input_tensors=input_tensors)
+    result_fused = fusion.execute(fusion_axis="hidden", fusion_step_size=256, input_tensors=input_tensors, verbose=True)
     result_standard = fusion.execute(fusion_axis="hidden", fusion_step_size=hidden_dim, input_tensors=input_tensors)
     golden = rmsnorm_matmul_golden(lhs, rhs, epsilon)
     check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
