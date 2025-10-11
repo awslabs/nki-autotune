@@ -262,7 +262,7 @@ def test_flash_attention_fusion():
     check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
 
     # Test with smaller step size (fused execution)
-    result_fused = fusion.execute(fusion_axis="fusion", fusion_step_size=32, input_tensors=input_tensors)
+    result_fused = fusion.execute(fusion_axis="fusion", fusion_step_size=32, input_tensors=input_tensors, verbose=True)
     check_correctness(golden, result_fused.data, atol, rtol, verbose=True)
 
 
