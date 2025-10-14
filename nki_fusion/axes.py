@@ -76,7 +76,7 @@ def generate_blocks_for_axis(size: int, tile_size: int) -> List[Dict]:
 
 def generate_parallel_axes_configs(
     input_tensors: Dict[str, np.ndarray], parallel_axes: List[Tuple[str, int, int]]
-) -> List[Tuple[Axis, ...]]:
+) -> List[List[Axis]]:
     """
     Return a list of parallel axes configs.
     Each config is a list of Axis, one per parallel axis.
@@ -90,5 +90,24 @@ def generate_parallel_axes_configs(
             axis = Axis(name=tensor_name, axis_index=axis_index, size=size, tile_size=tile_size, **config)
             axis_configs.append(axis)
         all_axis_configs.append(axis_configs)
-    all_combinations = list(product(*all_axis_configs))
+    all_combinations = [list(combo) for combo in product(*all_axis_configs)]
     return all_combinations
+
+
+def generate_sequential_axes_configs(
+    input_tensors: Dict[str, np.ndarray], sequential_axes: List[Tuple[str, int]], tile_size: int
+) -> List[Axis]:
+    sequential_size = None
+    for tensor_name, axis_index in sequential_axes:
+        size = input_tensors[tensor_name].shape[axis_index]
+        if sequential_size:
+            assert sequential_size == size, f"Different sequential sizes are not supported."
+        else:
+            sequential_size = size
+    assert sequential_size
+    block_configs = generate_blocks_for_axis(size=sequential_size, tile_size=tile_size)
+    axis_configs = []
+    for config in block_configs:
+        axis = Axis(name=tensor_name, axis_index=axis_index, size=sequential_size, tile_size=tile_size, **config)
+        axis_configs.append(axis)
+    return axis_configs
