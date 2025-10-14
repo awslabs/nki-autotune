@@ -99,10 +99,9 @@ def rmsnorm_matmul_golden(lhs: Tensor, rhs: Tensor, epsilon: float) -> np.ndarra
     x = lhs.data
     weight = rhs.data
 
-    # Explicit intermediate steps
-    squares = x**2  # Explicit squares computation
-    sum_of_squares = np.sum(squares, axis=-1, keepdims=False)  # Explicit sum of squares
-    square_mean = sum_of_squares / x.shape[-1]  # Convert sum to mean
+    squares = x**2
+    sum_of_squares = np.sum(squares, axis=-1, keepdims=False)
+    square_mean = sum_of_squares / x.shape[-1]
 
     rms = np.sqrt(square_mean + epsilon)
     x_normalized = x / rms[:, None]
