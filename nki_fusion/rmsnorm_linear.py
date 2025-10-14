@@ -1,7 +1,7 @@
 import neuronxcc.nki.language as nl
 import numpy as np
 
-from nki_fusion.axes import generate_parallel_axes_configs
+from nki_fusion.axes import generate_parallel_axes_configs, generate_sequential_axes_configs
 
 
 def rmsnorm_matmul_golden(lhs, rhs, epsilon: float) -> np.ndarray:
@@ -27,12 +27,18 @@ def test_rmsnorm_matmul_fusion():
     TILE_K = nl.tile_size.pmax  # 128
     input_tensors = {"lhs": np.random.randn(seq_len, hidden_dim), "rhs": np.random.randn(hidden_dim, output_dim)}
     parallel_axes = [("lhs", 0, TILE_M), ("rhs", 1, TILE_N)]
-    sequential_axes = [("lhs", 1, TILE_K), ("rhs", 0, TILE_K)]
+    sequential_axes = [("lhs", 1), ("rhs", 0)]
+
     parallel_axes_configs = generate_parallel_axes_configs(input_tensors=input_tensors, parallel_axes=parallel_axes)
+    sequential_axes_configs = generate_sequential_axes_configs(
+        input_tensors=input_tensors, sequential_axes=sequential_axes, tile_size=TILE_K
+    )
+
     for parallel_axis_config in parallel_axes_configs:
         print(parallel_axis_config)
-    # parallel_axes = [Axis("lhs", 0, TILE_M), Axis("rhs", 1, TILE_N)]
-    # sequential_axes = [Axis("lhs", 1, TILE_K), Axis("rhs", 0, TILE_K)]
+
+    for sequential_axes_config in sequential_axes_configs:
+        print(sequential_axes_config)
 
     # chain = FusionChain()
     # chain.execute(input_tensors=input_tensors, parallel_axes=parallel_axes, sequential_axes=sequential_axes)
