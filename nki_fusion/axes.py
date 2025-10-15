@@ -1,8 +1,13 @@
 import math
 from itertools import product
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, TypedDict
 
 import numpy as np
+
+
+class AxesConfig(TypedDict):
+    parallel_axes_config: List["ParallelAxis"]
+    sequential_axis_config: "SequentialAxis"
 
 
 class Axis:
@@ -19,6 +24,61 @@ class Axis:
     def __repr__(self) -> str:
         return (
             f"Axis(size={self.size}, "
+            f"num_blocks={self.num_blocks}, "
+            f"tiles_per_block={self.tiles_per_block}, "
+            f"tile_size={self.tile_size}, "
+            f"block_size={self.block_size}, "
+            f"total_tiles={self.total_tiles})"
+        )
+
+
+class ParallelAxis(Axis):
+    def __init__(
+        self,
+        tensor_name: str,
+        axis_index: int,
+        size: int,
+        tile_size: int,
+        num_blocks: int,
+        tiles_per_block: int,
+        block_size: int,
+        total_tiles: int,
+    ) -> None:
+        super().__init__(size, tile_size, num_blocks, tiles_per_block, block_size, total_tiles)
+        self.tensor_name = tensor_name
+        self.axis_index = axis_index
+
+    def __repr__(self) -> str:
+        return (
+            f"ParallelAxis({self.tensor_name}[{self.axis_index}], "
+            f"size={self.size}, "
+            f"num_blocks={self.num_blocks}, "
+            f"tiles_per_block={self.tiles_per_block}, "
+            f"tile_size={self.tile_size}, "
+            f"block_size={self.block_size}, "
+            f"total_tiles={self.total_tiles})"
+        )
+
+
+class SequentialAxis(Axis):
+    def __init__(
+        self,
+        tensor_axes: List[Tuple[str, int]],
+        size: int,
+        tile_size: int,
+        num_blocks: int,
+        tiles_per_block: int,
+        block_size: int,
+        total_tiles: int,
+    ) -> None:
+        super().__init__(size, tile_size, num_blocks, tiles_per_block, block_size, total_tiles)
+        self.tensor_axes = tensor_axes
+
+    def __repr__(self) -> str:
+        tensor_axes_str = ", ".join([f"{name}[{idx}]" for name, idx in self.tensor_axes])
+        return (
+            f"SequentialAxis({tensor_axes_str}, "
+            f"size={self.size}, "
             f"num_blocks={self.num_blocks}, "
             f"tiles_per_block={self.tiles_per_block}, "
             f"tile_size={self.tile_size}, "
@@ -65,10 +125,10 @@ def generate_blocks_for_axis(size: int, tile_size: int) -> List[Dict]:
 
 def generate_parallel_axes_configs(
     input_tensors: Dict[str, np.ndarray], parallel_axes: List[Tuple[str, int, int]]
-) -> List[List[Axis]]:
+) -> List[List[ParallelAxis]]:
     """
     Return a list of parallel axes configs.
-    Each config is a list of Axis, one per parallel axis.
+    Each config is a list of ParallelAxis, one per parallel axis.
     """
     parallel_axis_configs = []
     for tensor_name, axis_index, tile_size in parallel_axes:
@@ -76,7 +136,9 @@ def generate_parallel_axes_configs(
         block_configs = generate_blocks_for_axis(size=size, tile_size=tile_size)
         axis_configs = []
         for config in block_configs:
-            axis = Axis(size=size, tile_size=tile_size, **config)
+            axis = ParallelAxis(
+                tensor_name=tensor_name, axis_index=axis_index, size=size, tile_size=tile_size, **config
+            )
             axis_configs.append(axis)
         parallel_axis_configs.append(axis_configs)
     return parallel_axis_configs
@@ -84,7 +146,7 @@ def generate_parallel_axes_configs(
 
 def generate_sequential_axes_configs(
     input_tensors: Dict[str, np.ndarray], sequential_axes: List[Tuple[str, int]], tile_size: int
-) -> List[Axis]:
+) -> List[SequentialAxis]:
     sequential_size = None
     for tensor_name, axis_index in sequential_axes:
         size = input_tensors[tensor_name].shape[axis_index]
@@ -96,7 +158,7 @@ def generate_sequential_axes_configs(
     block_configs = generate_blocks_for_axis(size=sequential_size, tile_size=tile_size)
     axis_configs = []
     for config in block_configs:
-        axis = Axis(size=sequential_size, tile_size=tile_size, **config)
+        axis = SequentialAxis(tensor_axes=sequential_axes, size=sequential_size, tile_size=tile_size, **config)
         axis_configs.append(axis)
     return axis_configs
 
@@ -106,7 +168,7 @@ def generate_axes_configs(
     parallel_axes: List[Tuple[str, int, int]],
     sequential_axes: List[Tuple[str, int]],
     sequential_tile_size: int,
-) -> List[Dict[str, List[Axis]]]:
+) -> List[AxesConfig]:
     """Generate all valid combinations of axes configurations for fusion.
 
     Args:
@@ -117,8 +179,8 @@ def generate_axes_configs(
 
     Returns:
         List of configuration dictionaries with keys:
-            - "parallel_axes_config": List of Axis objects for parallel axes
-            - "sequential_axis_config": Single Axis object for sequential axis
+            - "parallel_axes_config": List of ParallelAxis objects for parallel axes
+            - "sequential_axis_config": Single SequentialAxis object for sequential axis
     """
     parallel_axes_configs = generate_parallel_axes_configs(input_tensors=input_tensors, parallel_axes=parallel_axes)
     sequential_axis_configs = generate_sequential_axes_configs(

@@ -1,7 +1,10 @@
+import random
+
 import neuronxcc.nki.language as nl
 import numpy as np
 
 from nki_fusion.axes import generate_axes_configs
+from nki_fusion.fusion_chain import FusionChain
 
 
 def rmsnorm_matmul_golden(lhs, rhs, epsilon: float) -> np.ndarray:
@@ -35,8 +38,13 @@ def test_rmsnorm_matmul_fusion():
         sequential_axes=sequential_axes,
         sequential_tile_size=TILE_K,
     )
-    for config in axes_configs:
-        print(config)
+    random.seed(16384)
+    config = random.choice(axes_configs)
+
+    chain = FusionChain(
+        parallel_axes_config=config["parallel_axes_config"], sequential_axis_config=config["sequential_axis_config"]
+    )
+    chain.execute(input_tensors=input_tensors)
 
 
 if __name__ == "__main__":
