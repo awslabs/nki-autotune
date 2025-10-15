@@ -4,14 +4,14 @@ import os
 import shutil
 import signal
 import tempfile
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from autotune.core.compile import compile_kernel
-from autotune.core.metrics import tensor_to_matmul_mac_count
 from autotune.core.utils import capture_error_message
 from autotune.typing import (
+    INPUT_TENSOR_SHAPES_DTYPE,
     INPUT_TENSORS_DTYPE,
     KERNEL_DTYPE,
     KERNEL_KWARGS_DTYPE,
@@ -46,7 +46,8 @@ class ProfileJob:
         index: int,
         main_metric: str,
         kernel: KERNEL_DTYPE,
-        input_tensor_shapes: List[Tuple[int, ...]],
+        input_tensor_shapes: INPUT_TENSOR_SHAPES_DTYPE,
+        mac_count: int,
         data_type: np.dtype,
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
         compiler_flags: str,
@@ -79,6 +80,7 @@ class ProfileJob:
             kernel_kwargs=kernel_kwargs,
             compiler_flags=compiler_flags,
             cache_dir=cache_dir,
+            mac_count=mac_count,
         )
         if postprocessing:
             self.postprocessing = postprocessing
@@ -88,7 +90,7 @@ class ProfileJob:
         self.workload_dir = workload_dir
 
     @property
-    def input_tensors(self) -> Tuple[np.ndarray, ...]:
+    def input_tensors(self) -> INPUT_TENSORS_DTYPE:
         """Return the cached input tensors."""
         if hasattr(self, "_input_tensors"):
             return self._input_tensors
@@ -96,7 +98,7 @@ class ProfileJob:
             raise ValueError(f"ProfileJob input tensors are not initialized")
 
     @input_tensors.setter
-    def input_tensors(self, value: Tuple[np.ndarray, ...]):
+    def input_tensors(self, value: INPUT_TENSORS_DTYPE):
         """Set the input tensors for this job."""
         self._input_tensors = value
 
@@ -183,13 +185,33 @@ class ProfileJobs:
         self.cache_root_dir = cache_root_dir
         self.target_instance_family = target_instance_family
         self.jobs: Dict[int, ProfileJob] = {}
-        self._tensor_cache: Dict[Tuple, Tuple[np.ndarray, ...]] = {}
+        self._tensor_cache: Dict[Tuple[Tuple[int, ...], np.dtype], np.ndarray] = {}
         self.main_metric = "min_ms"
 
-    def add_job(self, **kwargs):
+    def add_job(
+        self,
+        kernel: KERNEL_DTYPE,
+        input_tensor_shapes: INPUT_TENSOR_SHAPES_DTYPE,
+        data_type,
+        kernel_kwargs: Dict[str, Any],
+        compiler_flags: str,
+        postprocessing: POSTPROCESSING_DTYPE,
+        mac_count: int = 0,
+    ):
         """Create and add a new ProfileJob to the collection."""
         job_index = len(self.jobs)
-        job = ProfileJob(index=job_index, main_metric=self.main_metric, cache_root_dir=self.cache_root_dir, **kwargs)
+        job = ProfileJob(
+            index=job_index,
+            main_metric=self.main_metric,
+            kernel=kernel,
+            input_tensor_shapes=input_tensor_shapes,
+            mac_count=mac_count,
+            data_type=data_type,
+            kernel_kwargs=kernel_kwargs,
+            compiler_flags=compiler_flags,
+            postprocessing=postprocessing,
+            cache_root_dir=self.cache_root_dir,
+        )
         self.jobs[job_index] = job
 
     def extend(self, other_jobs: "ProfileJobs") -> None:
@@ -246,12 +268,14 @@ class ProfileJobs:
         """Generate and cache random input tensors for all jobs."""
         for job_index in self.jobs:
             job = self.jobs[job_index]
-            cache_key = (tuple(job.input_tensor_shapes), job.data_type)
-            if cache_key not in self._tensor_cache:
-                self._tensor_cache[cache_key] = tuple(
-                    np.random.normal(0, 0.001, size=shape).astype(job.data_type) for shape in job.input_tensor_shapes
-                )
-            job.input_tensors = self._tensor_cache[cache_key]
+            job_input_tensors: INPUT_TENSORS_DTYPE = {}
+            for tensor_name in job.input_tensor_shapes:
+                tensor_shape = job.input_tensor_shapes[tensor_name]
+                cache_key = (tensor_shape, job.data_type)
+                if cache_key not in self._tensor_cache:
+                    self._tensor_cache[cache_key] = np.random.normal(0, 0.001, size=tensor_shape).astype(job.data_type)
+                job_input_tensors[tensor_name] = self._tensor_cache[cache_key]
+            job.input_tensors = job_input_tensors
 
     def dump_json(self):
         """Save performance metrics to JSON files, organized by workload directory.
@@ -327,8 +351,6 @@ def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
         try:
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(600)
-            matmul_mac_count = tensor_to_matmul_mac_count(job.input_tensor_shapes)
-            job.add_attributes(matmul_mac_count=matmul_mac_count)
             neff = compile_kernel(
                 kernel_name=job.kernel,
                 input_tensors=job.input_tensors,
