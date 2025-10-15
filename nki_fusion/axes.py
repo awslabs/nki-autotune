@@ -7,18 +7,8 @@ import numpy as np
 
 class Axis:
     def __init__(
-        self,
-        name: str,
-        axis_index: int,
-        size: int,
-        tile_size: int,
-        num_blocks: int,
-        tiles_per_block: int,
-        block_size: int,
-        total_tiles: int,
+        self, size: int, tile_size: int, num_blocks: int, tiles_per_block: int, block_size: int, total_tiles: int
     ) -> None:
-        self.name = name
-        self.index = axis_index
         self.size = size
         self.tile_size = tile_size
         self.num_blocks = num_blocks
@@ -28,8 +18,7 @@ class Axis:
 
     def __repr__(self) -> str:
         return (
-            f"Axis({self.name}[{self.index}], "
-            f"size={self.size}, "
+            f"Axis(size={self.size}, "
             f"num_blocks={self.num_blocks}, "
             f"tiles_per_block={self.tiles_per_block}, "
             f"tile_size={self.tile_size}, "
@@ -81,17 +70,16 @@ def generate_parallel_axes_configs(
     Return a list of parallel axes configs.
     Each config is a list of Axis, one per parallel axis.
     """
-    all_axis_configs = []
+    parallel_axis_configs = []
     for tensor_name, axis_index, tile_size in parallel_axes:
         size = input_tensors[tensor_name].shape[axis_index]
         block_configs = generate_blocks_for_axis(size=size, tile_size=tile_size)
         axis_configs = []
         for config in block_configs:
-            axis = Axis(name=tensor_name, axis_index=axis_index, size=size, tile_size=tile_size, **config)
+            axis = Axis(size=size, tile_size=tile_size, **config)
             axis_configs.append(axis)
-        all_axis_configs.append(axis_configs)
-    all_combinations = [list(combo) for combo in product(*all_axis_configs)]
-    return all_combinations
+        parallel_axis_configs.append(axis_configs)
+    return parallel_axis_configs
 
 
 def generate_sequential_axes_configs(
@@ -108,6 +96,45 @@ def generate_sequential_axes_configs(
     block_configs = generate_blocks_for_axis(size=sequential_size, tile_size=tile_size)
     axis_configs = []
     for config in block_configs:
-        axis = Axis(name=tensor_name, axis_index=axis_index, size=sequential_size, tile_size=tile_size, **config)
+        axis = Axis(size=sequential_size, tile_size=tile_size, **config)
         axis_configs.append(axis)
     return axis_configs
+
+
+def generate_axes_configs(
+    input_tensors: Dict[str, np.ndarray],
+    parallel_axes: List[Tuple[str, int, int]],
+    sequential_axes: List[Tuple[str, int]],
+    sequential_tile_size: int,
+) -> List[Dict[str, List[Axis]]]:
+    """Generate all valid combinations of axes configurations for fusion.
+
+    Args:
+        input_tensors: Dictionary mapping tensor names to numpy arrays
+        parallel_axes: List of (tensor_name, axis_index, tile_size) for parallel axes
+        sequential_axes: List of (tensor_name, axis_index) for sequential axes
+        sequential_tile_size: Tile size for the sequential axis
+
+    Returns:
+        List of configuration dictionaries with keys:
+            - "parallel_axes_config": List of Axis objects for parallel axes
+            - "sequential_axis_config": Single Axis object for sequential axis
+    """
+    parallel_axes_configs = generate_parallel_axes_configs(input_tensors=input_tensors, parallel_axes=parallel_axes)
+    sequential_axis_configs = generate_sequential_axes_configs(
+        input_tensors=input_tensors, sequential_axes=sequential_axes, tile_size=sequential_tile_size
+    )
+
+    axes_configs = []
+
+    if parallel_axes_configs:
+        parallel_combinations = list(product(*parallel_axes_configs))
+    else:
+        parallel_combinations = [[]]
+
+    for parallel_combo in parallel_combinations:
+        for sequential_config in sequential_axis_configs:
+            axes_config = {"parallel_axes_config": list(parallel_combo), "sequential_axis_config": sequential_config}
+            axes_configs.append(axes_config)
+
+    return axes_configs
