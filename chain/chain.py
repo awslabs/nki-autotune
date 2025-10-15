@@ -1,6 +1,7 @@
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import neuronxcc.nki as nki
+import neuronxcc.nki.language as nl
 from neuronxcc.nki.typing import tensor
 
 from chain.axes import Axis
@@ -9,14 +10,21 @@ from chain.axes import Axis
 class Chain:
     """Manages parallel axis sharding for standard fusion chains."""
 
-    def __init__(self, parallel_axes: List[Axis]) -> None:
+    def __init__(self, parallel_axes: Tuple[Axis]) -> None:
         """Initialize chain with parallel axis configurations."""
         self.parallel_axes = parallel_axes
+        num_parallel_blocks = 1
+        for parallel_axis in parallel_axes:
+            num_parallel_blocks *= parallel_axis.num_blocks
+        self.num_parallel_blocks = num_parallel_blocks
 
     def __call__(self, input_tensors: Dict[str, tensor], verbose: bool = False):
         """Execute fusion chain with given input tensors."""
-        print(self.parallel_axes)
-        print(input_tensors)
+        for counter in nl.affine_range(self.num_parallel_blocks):
+            stride = self.num_parallel_blocks
+            for parallel_axis in self.parallel_axes:
+                stride = stride // parallel_axis.num_blocks
+                block_index = (counter // stride) % parallel_axis.num_blocks
 
 
 @nki.jit
