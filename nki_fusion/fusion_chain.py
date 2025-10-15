@@ -1,23 +1,16 @@
 from typing import Dict, List
 
-import neuronxcc.nki.language as nl
 import numpy as np
 
-from nki_fusion.axes import Axis
+from nki_fusion.axes import ParallelAxis, SequentialAxis
 
 
 class FusionChain:
-    def __init__(self) -> None:
-        self.TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-        self.TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-        self.TILE_K = nl.tile_size.pmax  # 128
+    def __init__(self, parallel_axes_config: List[ParallelAxis], sequential_axis_config: SequentialAxis) -> None:
+        self.parallel_axes_config = parallel_axes_config
+        self.sequential_axis_config = sequential_axis_config
 
-    def execute(
-        self,
-        input_tensors: Dict[str, np.ndarray],
-        parallel_axes: List[Axis],
-        sequential_axis: Axis,
-        verbose: bool = False,
-    ):
-        for parallel_axis in parallel_axes:
-            print(parallel_axis)
+    def execute(self, input_tensors: Dict[str, np.ndarray], verbose: bool = False):
+        print(self.parallel_axes_config)
+        print(self.sequential_axis_config)
+        print(input_tensors)
