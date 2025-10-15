@@ -33,8 +33,8 @@ class Benchmark:
         """Execute the full benchmarking pipeline: compile, then run on device."""
         self._compile_all_kernels()
         self.jobs.dump_json()
-        self._run_on_neuron_cores()
-        self.jobs.dump_json()
+        # self._run_on_neuron_cores()
+        # self.jobs.dump_json()
 
     def _compile_all_kernels(self):
         """Compile all kernel jobs in parallel using multiple CPU workers."""

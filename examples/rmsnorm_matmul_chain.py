@@ -1,14 +1,14 @@
 import argparse
 import os
-import random
-from itertools import product
 
 import neuronxcc.nki.language as nl
 import numpy as np
 
+from autotune.core.benchmark import Benchmark
+from autotune.core.job import ProfileJobs
 from autotune.core.metrics import check_correctness
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
-from chain.axes import generate_axis_configs
+from chain.axes import sample_axes_configs
 
 
 def rmsnorm_matmul_golden(lhs, rhs, epsilon: float) -> np.ndarray:
@@ -22,7 +22,7 @@ def rmsnorm_matmul_golden(lhs, rhs, epsilon: float) -> np.ndarray:
     return result
 
 
-class FusionCorrectness:
+class ChainCorrectness:
     def __init__(self, epsilon: float = 1e-6) -> None:
         self.epsilon = epsilon
 
@@ -61,37 +61,24 @@ def run_rmsnorm_matmul_fusion_benchmark(cache_dir: str) -> None:
     TILE_K = nl.tile_size.pmax  # 128
 
     input_tensor_shapes = {"lhs": (seq_len, hidden_dim), "rhs": (hidden_dim, output_dim)}
+    parallel_axes = [("lhs", 0, TILE_M), ("rhs", 1, TILE_N)]
+    axes_config = sample_axes_configs(input_tensor_shapes, parallel_axes)
 
-    parallel_axes_configs = [
-        generate_axis_configs(tensor_axes=[("lhs", 0)], size=seq_len, tile_size=TILE_M),
-        generate_axis_configs(tensor_axes=[("rhs", 1)], size=hidden_dim, tile_size=TILE_N),
-    ]
-    parallel_axes_configs = list(product(*parallel_axes_configs))
-    parallel_axes_config = random.choice(parallel_axes_configs)
-    print(parallel_axes_config)
+    kernel = (f"{project_root}/chain/chain.py", "chain_wrapper")
+    postprocessing = ChainCorrectness(epsilon=1e-6)
 
-    # fusion_kernel = (f"{project_root}/nki_fusion/fusion_chain.py", "fusion_chain_wrapper")
-    # postprocessing = FusionCorrectness(epsilon=1e-6)
-
-    # all_jobs = ProfileJobs(cache_root_dir=cache_dir, target_instance_family="trn2")
-
-    # for config in axes_configs:
-    #     all_jobs.add_job(
-    #         kernel=fusion_kernel,
-    #         input_tensor_shapes=[lhs_shape, rhs_shape],
-    #         data_type=data_type,
-    #         kernel_kwargs={
-    #             "tensor_names": ["lhs", "rhs"],
-    #             "parallel_axes_config": config["parallel_axes_config"],
-    #             "sequential_axis_config": config["sequential_axis_config"],
-    #         },
-    #         compiler_flags="--auto-cast=none --internal-tensorizer-opt-level=nki",
-    #         postprocessing=postprocessing,
-    #     )
-
-    # print(f"Running {len(axes_configs)} job configurations")
-    # tuner = Benchmark(jobs=all_jobs)
-    # tuner()
+    all_jobs = ProfileJobs(cache_root_dir=cache_dir, target_instance_family="trn2")
+    all_jobs.add_job(
+        kernel=kernel,
+        input_tensor_shapes=input_tensor_shapes,
+        data_type=data_type,
+        kernel_kwargs={"parallel_axes": axes_config},
+        compiler_flags="--auto-cast=none --internal-tensorizer-opt-level=nki",
+        postprocessing=postprocessing,
+        mac_count=0,
+    )
+    tuner = Benchmark(jobs=all_jobs)
+    tuner()
 
 
 if __name__ == "__main__":

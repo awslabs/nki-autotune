@@ -20,7 +20,7 @@ class Chain:
 
 
 @nki.jit
-def fusion_chain_wrapper(input_tensors: Dict[str, tensor], parallel_axes: List[Axis]):
+def chain_wrapper(input_tensors: Dict[str, tensor], parallel_axes: List[Axis]):
     """NKI-compiled wrapper for Chain execution.
 
     Args:
@@ -28,7 +28,7 @@ def fusion_chain_wrapper(input_tensors: Dict[str, tensor], parallel_axes: List[A
         parallel_axes: List of parallel axis configurations
 
     Returns:
-        Output tensor from fusion chain
+        Output tensor from chain
     """
     chain = Chain(parallel_axes=parallel_axes)
     output = chain(input_tensors=input_tensors)

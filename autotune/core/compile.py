@@ -100,7 +100,7 @@ def compile_kernel(
         traced_kernel = trace(kernel)
     else:
         traced_kernel = kernel
-    traced_kernel.specialize(*input_tensors, **kernel_kwargs)
+    traced_kernel.specialize(input_tensors, **kernel_kwargs)
     if target_instance_family == "trn1":
         target = CompilationTarget.TRN1
     elif target_instance_family == "trn2":

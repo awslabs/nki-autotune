@@ -1,5 +1,7 @@
 import math
-from typing import List, Tuple
+import random
+from itertools import product
+from typing import Dict, List, Tuple
 
 
 class Axis:
@@ -34,40 +36,49 @@ class Axis:
         )
 
 
-def generate_axis_configs(tensor_axes: List[Tuple[str, int]], size: int, tile_size: int) -> List[Axis]:
+def sample_axes_configs(
+    input_tensor_shapes: Dict[str, Tuple[int, ...]], parallel_axes: List[Tuple[str, int, int]]
+) -> Tuple[Axis, ...]:
     """
-    Generate valid block configurations for tiling an axis.
+    Sample a valid tiling configuration for parallel axes.
 
-    Divides the axis into evenly-sized blocks, each containing multiple tiles.
-    Returns all divisor-based configurations that fully cover the axis size.
+    For each parallel axis, generates all divisor-based block configurations that evenly
+    divide the total tiles. Returns a random permutation of configurations across axes.
 
     Args:
-        size: Size of the axis to tile
-        tile_size: Size of each hardware tile
+        input_tensor_shapes: Mapping from tensor names to their shapes
+        parallel_axes: List of (tensor_name, axis_index, tile_size) tuples
 
     Returns:
-        List[Dict[str, int]]: Configurations with keys: size, tile_size, num_blocks,
-                            tiles_per_block, block_size, total_tiles
+        Tuple[Axis, ...]: Randomly selected configuration with one Axis per parallel axis
     """
-    # Calculate total number of tiles needed to cover the axis
-    total_tiles = math.ceil(size / tile_size)
 
-    # Find all divisors of total_tiles
-    configurations: List[Axis] = []
-    for num_blocks in range(1, total_tiles + 1):
-        if total_tiles % num_blocks == 0:
-            tiles_per_block = total_tiles // num_blocks
-            block_size = tiles_per_block * tile_size
+    all_configs: List[List[Axis]] = []
+    for parallel_axis in parallel_axes:
+        tensor_name, axis_index, tile_size = parallel_axis
+        tensor_shape = input_tensor_shapes[tensor_name]
+        size = tensor_shape[axis_index]
 
-            config = Axis(
-                tensor_axes=tensor_axes,
-                size=size,
-                tile_size=tile_size,
-                num_blocks=num_blocks,
-                tiles_per_block=tiles_per_block,
-                block_size=block_size,
-                total_tiles=total_tiles,
-            )
-            configurations.append(config)
+        total_tiles = math.ceil(size / tile_size)
+        axis_configs: List[Axis] = []
+        for num_blocks in range(1, total_tiles + 1):
+            if total_tiles % num_blocks == 0:
+                tiles_per_block = total_tiles // num_blocks
+                block_size = tiles_per_block * tile_size
 
-    return configurations
+                config = Axis(
+                    tensor_axes=[(tensor_name, axis_index)],
+                    size=size,
+                    tile_size=tile_size,
+                    num_blocks=num_blocks,
+                    tiles_per_block=tiles_per_block,
+                    block_size=block_size,
+                    total_tiles=total_tiles,
+                )
+                axis_configs.append(config)
+        all_configs.append(axis_configs)
+
+    config_permutations = list(product(*all_configs))
+    axes_config = random.choice(config_permutations)
+
+    return axes_config
