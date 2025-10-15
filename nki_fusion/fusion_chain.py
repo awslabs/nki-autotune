@@ -16,7 +16,7 @@ class FusionChain:
         self,
         input_tensors: Dict[str, np.ndarray],
         parallel_axes: List[Axis],
-        sequential_axes: List[Axis],
+        sequential_axis: Axis,
         verbose: bool = False,
     ):
         for parallel_axis in parallel_axes:
