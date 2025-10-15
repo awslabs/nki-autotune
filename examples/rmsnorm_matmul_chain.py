@@ -51,9 +51,9 @@ def run_rmsnorm_matmul_fusion_benchmark(cache_dir: str) -> None:
     nki_fusion_dir = os.path.dirname(current_file)
     project_root = os.path.dirname(nki_fusion_dir)
 
-    seq_len = 256
-    hidden_dim = 1024
-    output_dim = 512
+    seq_len = 2048
+    hidden_dim = 128
+    output_dim = 1024
     data_type = np.float32
 
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
