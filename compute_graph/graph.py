@@ -25,6 +25,11 @@ class InitialGraphGenerator:
         for counter in range(num_parallel_counters):
             self._generate_subgraph(counter, parallel_config)
 
+        self.graph.graph["workload_metadata"] = {
+            "parallel_axes": self.workload.parallel_axes,
+            "input_tensors": self.workload.input_tensors,
+        }
+
         return self.graph
 
     def _compute_parallel_structure(self) -> Dict:

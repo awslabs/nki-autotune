@@ -240,13 +240,12 @@ def _format_tile_indices(tile_indices: Dict[int, int], tensor_name: str = "") ->
     return f"[{', '.join(indices)}]"
 
 
-def save_graph_as_dot(
-    graph: nx.DiGraph, output_file: str, title: str, metadata: Dict[str, Any], keep_dot: bool = False
-) -> None:
+def save_graph_as_dot(graph: nx.DiGraph, output_file: str, title: str, keep_dot: bool = False) -> None:
     """Generate DOT script and render to PNG using Graphviz."""
     import os
     import subprocess
 
+    metadata = graph.graph.get("workload_metadata", {})
     dot_script = graph_to_dot(graph, title, metadata)
 
     if output_file.endswith(".png"):
