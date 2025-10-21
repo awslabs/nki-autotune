@@ -3,7 +3,7 @@ from typing import Dict, List
 import neuronxcc.nki as nki
 import numpy as np
 
-from chain.axes import Axis
+from compute_graph.axes import Axis
 
 
 class FusionChain:
