@@ -40,15 +40,7 @@ def test_graph_generation() -> None:
     generator = InitialGraphGenerator(workload)
     graph = generator.generate()
 
-    save_graph_as_dot(
-        graph,
-        output_file="rmsnorm_matmul_graph.png",
-        title="RMSNorm-Matmul Compute Graph",
-        metadata={
-            "parallel_axes": [("lhs", 0, TILE_M), ("rhs", 1, TILE_N)],
-            "input_tensors": {"lhs": (seq_len, hidden_dim), "rhs": (hidden_dim, output_dim)},
-        },
-    )
+    save_graph_as_dot(graph, output_file="rmsnorm_matmul_graph.png", title="RMSNorm-Matmul Compute Graph")
 
 
 if __name__ == "__main__":
