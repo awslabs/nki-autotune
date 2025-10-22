@@ -2,9 +2,17 @@ from typing import Any, Dict, List
 
 import networkx as nx
 
+from compute_graph.graph import ComputeGraph
 
-def graph_to_dot(graph: nx.DiGraph, title: str, metadata: Dict[str, Any], deduplicate: bool = True) -> str:
-    """Convert NetworkX compute graph to Graphviz DOT format."""
+
+def graph_to_dot(compute_graph: ComputeGraph, title: str, deduplicate: bool = True) -> str:
+    """Convert ComputeGraph to Graphviz DOT format."""
+    graph = compute_graph.graph
+    metadata = {
+        "parallel_axes": [(axis.tensor_name, axis.axis_index, axis.tile_size) for axis in compute_graph.parallel_axes],
+        "input_tensors": compute_graph.input_tensors,
+    }
+
     lines = []
 
     lines.append("digraph ComputeGraph {")
@@ -24,7 +32,7 @@ def graph_to_dot(graph: nx.DiGraph, title: str, metadata: Dict[str, Any], dedupl
     lines.append('    fontname="Arial Bold";')
     lines.append("    ")
 
-    num_counters = max(graph.nodes[n].get("parallel_counter", 0) for n in graph.nodes()) + 1
+    num_counters = compute_graph.num_parallel_tiles
 
     if deduplicate:
         equivalence_classes = _find_equivalent_subgraphs(graph, num_counters)
@@ -240,13 +248,12 @@ def _format_tile_indices(tile_indices: Dict[int, int], tensor_name: str = "") ->
     return f"[{', '.join(indices)}]"
 
 
-def save_graph_as_dot(graph: nx.DiGraph, output_file: str, title: str, keep_dot: bool = False) -> None:
+def save_graph_as_dot(graph: ComputeGraph, output_file: str, title: str, keep_dot: bool = False) -> None:
     """Generate DOT script and render to PNG using Graphviz."""
     import os
     import subprocess
 
-    metadata = graph.graph.get("workload_metadata", {})
-    dot_script = graph_to_dot(graph, title, metadata)
+    dot_script = graph_to_dot(graph, title)
 
     if output_file.endswith(".png"):
         png_file = output_file
