@@ -1,121 +1,82 @@
 import math
-from typing import TYPE_CHECKING, Any, Dict, Tuple
+from typing import Dict, List
 
 import networkx as nx
 
-from compute_graph.operators import Operator, Workload
+from compute_graph.axes import linear_counter_to_indices, make_axes
+from compute_graph.operators import Operator
+from compute_graph.primitives import AXIS, INPUT_TENSOR_SHAPE
 
-if TYPE_CHECKING:
-    from compute_graph.axes import Axis
 
+class ComputeGraph:
+    """compute graph specification."""
 
-class InitialGraphGenerator:
-    """Generates naive completely parallel compute graphs from workload specifications."""
+    def __init__(
+        self,
+        input_tensors: Dict[str, INPUT_TENSOR_SHAPE],
+        parallel_axes: List[AXIS],
+        operators: List[Operator],
+        output_tensors: List[str],
+    ) -> None:
+        self.input_tensors = input_tensors
+        self.parallel_axes = make_axes(input_tensors, parallel_axes)
+        self.operators = operators
+        self.output_tensors = output_tensors
+        self.num_parallel_tiles = math.prod([axis.num_tiles for axis in self.parallel_axes])
+        self._generate_graph()
 
-    def __init__(self, workload: Workload) -> None:
-        self.workload = workload
-        self.graph = nx.DiGraph()
-        self.node_counter = 0
+    def __repr__(self) -> str:
+        ops_str = ",\n    ".join(str(op) for op in self.operators)
+        return (
+            f"ComputeGraph(\n"
+            f"  input_tensors={self.input_tensors},\n"
+            f"  parallel_axes={self.parallel_axes},\n"
+            f"  operators=[\n"
+            f"    {ops_str}\n"
+            f"  ]\n"
+            f")"
+        )
 
-    def generate(self) -> nx.DiGraph:
+    def _generate_graph(self) -> None:
         """Generate initial completely parallel compute graph."""
-        parallel_config = self._compute_parallel_structure()
-        num_parallel_counters = parallel_config["total_blocks"]
+        self.graph = nx.DiGraph()
+        for parallel_counter in range(self.num_parallel_tiles):
+            self._generate_subgraph(parallel_counter)
 
-        for counter in range(num_parallel_counters):
-            self._generate_subgraph(counter, parallel_config)
-
-        self.graph.graph["workload_metadata"] = {
-            "parallel_axes": self.workload.parallel_axes,
-            "input_tensors": self.workload.input_tensors,
-        }
-
-        return self.graph
-
-    def _compute_parallel_structure(self) -> Dict:
-        """Compute parallel tiling structure for all parallel axes."""
-        parallel_info = []
-        total_blocks = 1
-
-        for tensor_name, axis_idx, tile_size in self.workload.parallel_axes:
-            tensor_shape = self.workload.input_tensors[tensor_name]
-            size = tensor_shape[axis_idx]
-            num_tiles = math.ceil(size / tile_size)
-            total_blocks *= num_tiles
-
-            parallel_info.append(
-                {
-                    "tensor_name": tensor_name,
-                    "axis_idx": axis_idx,
-                    "tile_size": tile_size,
-                    "size": size,
-                    "num_tiles": num_tiles,
-                }
-            )
-
-        return {"axes": parallel_info, "total_blocks": total_blocks}
-
-    def _get_parallel_indices(self, counter: int, config: Dict) -> Dict[str, int]:
-        """Convert linear counter to parallel axis indices."""
-        indices = {}
-        stride = config["total_blocks"]
-
-        for axis_info in config["axes"]:
-            stride = stride // axis_info["num_tiles"]
-            tile_idx = (counter // stride) % axis_info["num_tiles"]
-            key = f"{axis_info['tensor_name']}_{axis_info['axis_idx']}"
-            indices[key] = tile_idx
-
-        return indices
-
-    def _generate_subgraph(self, counter: int, config: Dict) -> None:
+    def _generate_subgraph(self, counter: int) -> None:
         """Generate Load -> Compute -> Store subgraph for one parallel counter."""
-        parallel_indices = self._get_parallel_indices(counter, config)
+        print(f"Generating subgraph {counter}")
+        parallel_indices = linear_counter_to_indices(counter, self.parallel_axes)
 
-        load_nodes = {}
-        for tensor_name in self.workload.input_tensors.keys():
-            load_node_id = self._create_load_node(tensor_name, counter, parallel_indices)
-            load_nodes[tensor_name] = load_node_id
+        """
+        Go through the operators
+        For each operator:
+        Add load nodes if it needs input tensors from self.input_tensors
+        Add compute node for the operation itself
+        If the node output is in self.output_tensors, store to output HBM
+        """
+        print(parallel_indices)
+        print(self.parallel_axes)
+        for operator in self.operators:
+            for input_tensor in operator.inputs:
+                if input_tensor in self.input_tensors:
+                    load_node = self._create_load_node(input_tensor, counter, parallel_indices)
 
-        prev_compute_node = None
-        compute_outputs = {}
-
-        for op_idx, op in enumerate(self.workload.operators):
-            compute_node_id = self._create_compute_node(op, op_idx, counter, parallel_indices)
-
-            for input_name in op.inputs:
-                if input_name in load_nodes:
-                    self.graph.add_edge(load_nodes[input_name], compute_node_id)
-                elif input_name in compute_outputs:
-                    self.graph.add_edge(compute_outputs[input_name], compute_node_id)
-
-            if prev_compute_node is not None:
-                if not self.graph.has_edge(prev_compute_node, compute_node_id):
-                    self.graph.add_edge(prev_compute_node, compute_node_id)
-
-            compute_outputs[f"op_{op_idx}_output"] = compute_node_id
-            prev_compute_node = compute_node_id
-
-        store_node_id = self._create_store_node(counter, parallel_indices)
-        self.graph.add_edge(prev_compute_node, store_node_id)
-
-    def _create_load_node(self, tensor_name: str, counter: int, parallel_indices: Dict[str, int]) -> int:
+    def _create_load_node(self, tensor_name: str, counter: int, parallel_indices: Dict[str, Dict[int, int]]) -> int:
         """Create a load node for input tensor."""
-        node_id = self.node_counter
-        self.node_counter += 1
-
+        node_id = self.graph.number_of_nodes()
         tile_indices = {}
-        for key, tile_idx in parallel_indices.items():
-            if key.startswith(tensor_name):
-                axis_idx = int(key.split("_")[-1])
-                tile_indices[axis_idx] = tile_idx
+        for axis in self.parallel_axes:
+            if axis.tensor_name == tensor_name:
+                tile_index = parallel_indices[tensor_name][axis.axis_index]
+                tile_indices[axis.axis_index] = tile_index
 
         self.graph.add_node(
             node_id,
             type="load",
             tensor_name=tensor_name,
             tile_indices=tile_indices,
-            buffer_name=f"{tensor_name}_buffer_{counter}",
+            buffer_name=f"{tensor_name}_sbuf_{counter}",
             parallel_counter=counter,
         )
         return node_id
@@ -150,25 +111,3 @@ class InitialGraphGenerator:
             parallel_counter=counter,
         )
         return node_id
-
-
-class ComputeGraph:
-    """Manages parallel axis sharding for standard fusion chains."""
-
-    def __init__(self, parallel_axes: "Tuple[Axis]") -> None:
-        """Initialize chain with parallel axis configurations."""
-        self.parallel_axes = parallel_axes
-        num_parallel_blocks = 1
-        for parallel_axis in parallel_axes:
-            num_parallel_blocks *= parallel_axis.num_blocks
-        self.num_parallel_blocks = num_parallel_blocks
-
-    def __call__(self, input_tensors: Dict[str, Any], verbose: bool = False):
-        """Execute fusion chain with given input tensors."""
-        import neuronxcc.nki.language as nl
-
-        for counter in nl.affine_range(self.num_parallel_blocks):
-            stride = self.num_parallel_blocks
-            for parallel_axis in self.parallel_axes:
-                stride = stride // parallel_axis.num_blocks
-                block_index = (counter // stride) % parallel_axis.num_blocks
