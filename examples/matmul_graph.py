@@ -25,6 +25,9 @@ def test_data_reuse_transformation() -> None:
         operators=[Operator("matmul", inputs=["lhs", "rhs"], outputs=["O_1"])],
         output_tensors=["O_1"],
     )
+    print(graph)
+    print(graph.nodes)
+    print(graph.edges)
 
     save_graph_as_dot(graph, output_file="matmul_initial.png", title="Initial Matmul ComputeGraph")
 
