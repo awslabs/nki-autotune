@@ -2,6 +2,7 @@ import numpy as np
 
 from compute_graph.graph import ComputeGraph
 from compute_graph.operators import Operator
+from compute_graph.visualize import save_graph_as_dot
 
 
 def matmul_golden(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -24,9 +25,8 @@ def test_data_reuse_transformation() -> None:
         operators=[Operator("matmul", inputs=["lhs", "rhs"], outputs=["O_1"])],
         output_tensors=["O_1"],
     )
-    print(graph)
 
-    # save_graph_as_dot(graph, output_file="matmul_before_data_reuse.png", title="Before Data Reuse")
+    save_graph_as_dot(graph, output_file="matmul_initial.png", title="Initial Matmul ComputeGraph")
 
     # merge_opportunities = analyze_data_reuse_opportunities(graph)
     # print(f"\n=== Data Reuse Analysis ===")
