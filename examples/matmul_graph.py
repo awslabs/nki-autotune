@@ -22,7 +22,7 @@ def test_data_reuse_transformation() -> None:
     graph = ComputeGraph(
         input_tensors={"lhs": (M, K), "rhs": (K, N)},
         parallel_axes=[("lhs", 0, TILE_M), ("rhs", 1, TILE_N)],
-        operators=[Operator("matmul", inputs=["lhs", "rhs"], outputs=["O_1"])],
+        operators=[Operator("matmul", inputs=["lhs", "rhs"], output="O_1")],
         output_tensors=["O_1"],
     )
     print(graph)

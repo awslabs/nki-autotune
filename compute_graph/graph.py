@@ -99,7 +99,6 @@ class ComputeGraph:
 
     def _generate_subgraph(self, subgraph_index: int) -> None:
         """Generate Load -> Compute -> Store subgraph for one parallel counter."""
-        print(f"Generating subgraph {subgraph_index}")
         parallel_indices = linear_counter_to_indices(subgraph_index, self.parallel_axes)
 
         """
@@ -109,14 +108,16 @@ class ComputeGraph:
         Add compute node for the operation itself
         If the node output is in self.output_tensors, store to output HBM
         """
-        print(parallel_indices)
+        print(f"Subgraph {subgraph_index} {parallel_indices}")
         for operator in self.operators:
-            source_nodes = []
+            compute_node = self._create_compute_node(operator, parallel_indices)
             for input_tensor in operator.inputs:
                 if input_tensor in self.input_tensors:
                     load_node = self._create_load_node(input_tensor, parallel_indices)
-                    source_nodes.append(load_node)
-            # self._create_compute_node(operator, counter, parallel_indices)
+                    self.edges.append((load_node, compute_node))
+            if operator.output in self.output_tensors:
+                store_node = self._create_store_node(operator.output, parallel_indices)
+                self.edges.append((compute_node, store_node))
 
     def _create_load_node(self, tensor_name: str, parallel_indices: Dict[str, Dict[int, int]]) -> int:
         """Create a load node for input tensor."""
@@ -130,30 +131,22 @@ class ComputeGraph:
         self.nodes[node_id] = LoadNode(index=node_id, input_tensor=tensor_name, load_indices=tensor_indices)
         return node_id
 
-    def _create_compute_node(self, op: Operator, counter: int, parallel_indices: Dict[str, Dict[int, int]]) -> int:
+    def _create_compute_node(self, op: Operator, parallel_indices: Dict[str, Dict[int, int]]) -> int:
         """Create a compute node for operator."""
-        node_id = self.graph.number_of_nodes()
-        self.graph.add_node(
-            node_id,
-            type="compute",
-            op_type=op.op_type,
-            inputs=op.inputs,
-            params=op.params,
-            output_buffer=f"{op.outputs}_buffer",
-            parallel_counter=counter,
+        node_id = len(self.nodes)
+        self.nodes[node_id] = ComputeNode(
+            index=node_id, op_type=op.op_type, inputs=op.inputs, params=op.params, output_buffer=f"{op.output}"
         )
         return node_id
 
-    def _create_store_node(self, counter: int, parallel_indices: Dict[str, int]) -> int:
+    def _create_store_node(self, tensor_name: str, parallel_indices: Dict[str, Dict[int, int]]) -> int:
         """Create a store node for output tensor."""
-        node_id = self.node_counter
-        self.node_counter += 1
+        node_id = len(self.nodes)
 
-        self.graph.add_node(
-            node_id,
-            type="store",
-            tensor_name=self.workload.output_tensor,
-            tile_indices=parallel_indices,
-            parallel_counter=counter,
-        )
+        tensor_indices = {}
+        for axis in self.parallel_axes:
+            if axis.tensor_name == tensor_name:
+                tile_index = parallel_indices[tensor_name][axis.axis_index]
+                tensor_indices[axis.axis_index] = (tile_index, axis.tile_size)
+        self.nodes[node_id] = StoreNode(index=node_id, output_tensor=tensor_name, store_indices=tensor_indices)
         return node_id
