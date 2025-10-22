@@ -1,3 +1,5 @@
+import math
+import re
 from typing import Any, Dict, List
 
 import networkx as nx
@@ -5,12 +7,18 @@ import networkx as nx
 from compute_graph.graph import ComputeGraph
 
 
+def _get_counter_nodes(graph: nx.DiGraph, counter: int) -> List[int]:
+    """Get all nodes belonging to a specific parallel counter."""
+    return [n for n in graph.nodes() if graph.nodes[n].get("parallel_counter") == counter]
+
+
 def graph_to_dot(compute_graph: ComputeGraph, title: str, deduplicate: bool = True) -> str:
     """Convert ComputeGraph to Graphviz DOT format."""
     graph = compute_graph.graph
+    input_tensors = compute_graph.input_tensors
     metadata = {
         "parallel_axes": [(axis.tensor_name, axis.axis_index, axis.tile_size) for axis in compute_graph.parallel_axes],
-        "input_tensors": compute_graph.input_tensors,
+        "input_tensors": input_tensors,
     }
 
     lines = []
@@ -25,8 +33,7 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str, deduplicate: bool = Tr
     lines.append('    edge [fontname="Arial", fontsize=9];')
     lines.append("    ")
 
-    title_text = title
-    lines.append(f'    label="{title_text}";')
+    lines.append(f'    label="{title}";')
     lines.append('    labelloc="t";')
     lines.append("    fontsize=14;")
     lines.append('    fontname="Arial Bold";')
@@ -36,14 +43,12 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str, deduplicate: bool = Tr
 
     if deduplicate:
         equivalence_classes = _find_equivalent_subgraphs(graph, num_counters)
-        counters_to_draw = [equiv_class[0] for equiv_class in equivalence_classes]
     else:
         equivalence_classes = [[i] for i in range(num_counters)]
-        counters_to_draw = list(range(num_counters))
 
-    for equiv_idx, equiv_class in enumerate(equivalence_classes):
+    for equiv_class in equivalence_classes:
         counter = equiv_class[0]
-        counter_nodes = [n for n in graph.nodes() if graph.nodes[n].get("parallel_counter") == counter]
+        counter_nodes = _get_counter_nodes(graph, counter)
         if not counter_nodes:
             continue
 
@@ -63,7 +68,7 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str, deduplicate: bool = Tr
 
         for node_id in sorted(counter_nodes):
             node_data = graph.nodes[node_id]
-            node_label, node_color = _format_node(node_data, node_id)
+            node_label, node_color = _format_node(node_data, node_id, input_tensors)
             lines.append(f'        node_{node_id} [label="{node_label}", fillcolor="{node_color}"];')
 
         lines.append("        ")
@@ -93,7 +98,7 @@ def _find_equivalent_subgraphs(graph: nx.DiGraph, num_counters: int) -> List[Lis
     subgraph_signatures = {}
 
     for counter in range(num_counters):
-        counter_nodes = [n for n in graph.nodes() if graph.nodes[n].get("parallel_counter") == counter]
+        counter_nodes = _get_counter_nodes(graph, counter)
         if not counter_nodes:
             continue
 
@@ -139,8 +144,6 @@ def _compute_subgraph_signature(graph: nx.DiGraph, counter_nodes: List[int]) -> 
 
 def _format_parallel_structure(metadata: Dict[str, Any], num_counters: int) -> str:
     """Format parallel structure showing tile counts for each axis."""
-    import math
-
     if "parallel_axes" not in metadata or "input_tensors" not in metadata:
         return f"p has {num_counters} values"
 
@@ -170,37 +173,44 @@ def _format_counter_range(equiv_class: List[int]) -> str:
 
 
 def _get_counter_tile_indices(graph: nx.DiGraph, counter: int) -> str:
-    """Get readable tile indices for a parallel counter."""
-    counter_nodes = [n for n in graph.nodes() if graph.nodes[n].get("parallel_counter") == counter]
+    """Get readable tensor indices for a parallel counter."""
+    counter_nodes = _get_counter_nodes(graph, counter)
     if not counter_nodes:
         return ""
 
     first_node = counter_nodes[0]
     node_data = graph.nodes[first_node]
 
-    if "tile_indices" in node_data:
-        tile_indices = node_data["tile_indices"]
-        if isinstance(tile_indices, dict):
+    if "tensor_indices" in node_data:
+        tensor_name = node_data.get("tensor_name", "tensor")
+        tensor_indices = node_data["tensor_indices"]
+        if isinstance(tensor_indices, dict):
             parts = []
-            for axis_idx, tile_idx in sorted(tile_indices.items()):
-                parts.append(f"tile_{axis_idx}={tile_idx}")
+            for axis_idx, (tile_index, tile_size) in sorted(tensor_indices.items()):
+                parts.append(f"{tensor_name}_{axis_idx}_tile={tile_index}")
             return ", ".join(parts)
 
     return f"counter={counter}"
 
 
-def _format_node(node_data: Dict[str, Any], node_id: int) -> tuple[str, str]:
+def _genericize_buffer_name(buffer_name: str) -> str:
+    """Replace specific parallel counter with generic variable."""
+    return re.sub(r"_(\d+)$", r"_<p>", buffer_name)
+
+
+def _format_node(node_data: Dict[str, Any], node_id: int, input_tensors: Dict[str, tuple]) -> tuple[str, str]:
     """Format node label and color based on node type."""
     node_type = node_data.get("type", "unknown")
 
     if node_type == "load":
         tensor_name = node_data.get("tensor_name", "?")
         buffer_name = node_data.get("buffer_name", "?")
-        tile_indices = node_data.get("tile_indices", {})
+        tensor_indices = node_data.get("tensor_indices", {})
+        tensor_shape = input_tensors.get(tensor_name, ())
 
         generic_buffer_name = _genericize_buffer_name(buffer_name)
-        tile_str = _format_tile_indices(tile_indices, tensor_name)
-        label = f"{generic_buffer_name} =\\nnl.load({tensor_name}{tile_str})"
+        slice_str = _format_tensor_slices(tensor_name, tensor_indices, tensor_shape)
+        label = f"{generic_buffer_name} =\\nnl.load({tensor_name}{slice_str})"
         color = "#FFEAA7"
 
     elif node_type == "compute":
@@ -215,10 +225,11 @@ def _format_node(node_data: Dict[str, Any], node_id: int) -> tuple[str, str]:
 
     elif node_type == "store":
         tensor_name = node_data.get("tensor_name", "?")
-        tile_indices = node_data.get("tile_indices", {})
+        tensor_indices = node_data.get("tensor_indices", {})
+        tensor_shape = input_tensors.get(tensor_name, ())
 
-        tile_str = _format_tile_indices(tile_indices, tensor_name)
-        label = f"nl.store({tensor_name}{tile_str},\\nbuffer)"
+        slice_str = _format_tensor_slices(tensor_name, tensor_indices, tensor_shape)
+        label = f"nl.store({tensor_name}{slice_str},\\nbuffer)"
         color = "#A8E6CF"
 
     else:
@@ -228,24 +239,20 @@ def _format_node(node_data: Dict[str, Any], node_id: int) -> tuple[str, str]:
     return label, color
 
 
-def _genericize_buffer_name(buffer_name: str) -> str:
-    """Replace specific parallel counter with generic variable."""
-    import re
-
-    return re.sub(r"_(\d+)$", r"_<p>", buffer_name)
-
-
-def _format_tile_indices(tile_indices: Dict[int, int], tensor_name: str = "") -> str:
-    """Format tile indices for display with generic tile variables."""
-    if not tile_indices:
+def _format_tensor_slices(tensor_name: str, tensor_indices: Dict[int, tuple[int, int]], tensor_shape: tuple) -> str:
+    """Format tensor indices with tile expressions for parallel axes and : for non-parallel axes."""
+    if not tensor_shape:
         return ""
 
-    if tensor_name:
-        indices = [f"{tensor_name}_{axis_idx}_tile" for axis_idx in sorted(tile_indices.keys())]
-    else:
-        indices = [str(tile_indices[k]) for k in sorted(tile_indices.keys())]
+    slices = []
+    for axis_idx in range(len(tensor_shape)):
+        if axis_idx in tensor_indices:
+            tile_index, tile_size = tensor_indices[axis_idx]
+            slices.append(f"{tensor_name}_{axis_idx}_tile * {tile_size}")
+        else:
+            slices.append(":")
 
-    return f"[{', '.join(indices)}]"
+    return f"[{', '.join(slices)}]"
 
 
 def save_graph_as_dot(graph: ComputeGraph, output_file: str, title: str, keep_dot: bool = False) -> None:

@@ -58,42 +58,42 @@ class ComputeGraph:
         print(parallel_indices)
         print(self.parallel_axes)
         for operator in self.operators:
+            source_nodes = []
             for input_tensor in operator.inputs:
                 if input_tensor in self.input_tensors:
                     load_node = self._create_load_node(input_tensor, counter, parallel_indices)
+                    source_nodes.append(load_node)
+            self._create_compute_node(operator, counter, parallel_indices)
 
     def _create_load_node(self, tensor_name: str, counter: int, parallel_indices: Dict[str, Dict[int, int]]) -> int:
         """Create a load node for input tensor."""
-        node_id = self.graph.number_of_nodes()
-        tile_indices = {}
+        tensor_indices = {}
         for axis in self.parallel_axes:
             if axis.tensor_name == tensor_name:
                 tile_index = parallel_indices[tensor_name][axis.axis_index]
-                tile_indices[axis.axis_index] = tile_index
+                tensor_indices[axis.axis_index] = (tile_index, axis.tile_size)
 
+        node_id = self.graph.number_of_nodes()
         self.graph.add_node(
             node_id,
             type="load",
             tensor_name=tensor_name,
-            tile_indices=tile_indices,
-            buffer_name=f"{tensor_name}_sbuf_{counter}",
+            tensor_indices=tensor_indices,
+            buffer_name=f"{tensor_name}_buffer_{counter}",
             parallel_counter=counter,
         )
         return node_id
 
-    def _create_compute_node(self, op: Operator, op_idx: int, counter: int, parallel_indices: Dict[str, int]) -> int:
+    def _create_compute_node(self, op: Operator, counter: int, parallel_indices: Dict[str, Dict[int, int]]) -> int:
         """Create a compute node for operator."""
-        node_id = self.node_counter
-        self.node_counter += 1
-
+        node_id = self.graph.number_of_nodes()
         self.graph.add_node(
             node_id,
             type="compute",
             op_type=op.op_type,
-            op_index=op_idx,
             inputs=op.inputs,
             params=op.params,
-            output_buffer=f"op_{op_idx}_buffer_{counter}",
+            output_buffer=f"{op.outputs}_buffer",
             parallel_counter=counter,
         )
         return node_id
