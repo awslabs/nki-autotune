@@ -26,10 +26,8 @@ def test_data_reuse_transformation() -> None:
         output_tensors=["O_1"],
     )
     print(graph)
-    print(f"Nodes: {graph.graph.number_of_nodes()}")
-    print(f"Edges: {graph.graph.number_of_edges()}")
-    for node_id in graph.graph.nodes():
-        print(f"  Node {node_id}: {graph.get_node(node_id)}")
+    print(graph.nodes)
+    print(graph.edges)
 
     save_graph_as_dot(graph, output_file="matmul_initial.png", title="Initial Matmul ComputeGraph")
 
