@@ -22,6 +22,19 @@ class Axis:
 
 
 def make_axes(input_tensors: Dict[str, INPUT_TENSOR_SHAPE], axes: List[AXIS]) -> List[Axis]:
+    """
+    Create Axis objects from axis specifications and input tensor shapes.
+
+    For each axis specification, computes the actual dimension size from the input
+    tensor shape and calculates the number of tiles needed based on the tile size.
+
+    Args:
+        input_tensors: Dictionary mapping tensor names to their shapes
+        axes: List of (tensor_name, axis_index, tile_size) tuples
+
+    Returns:
+        List of Axis objects with computed size and num_tiles
+    """
     processed_axes = []
     for tensor_name, axis_idx, tile_size in axes:
         size = input_tensors[tensor_name][axis_idx]
