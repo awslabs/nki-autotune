@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Tuple
 
-from compute_graph.graph import ComputeGraph, LoadNode
+from compute_graph.graph import ComputeGraph
 
 
 def _get_successors(node_id: int, edges: List[Tuple[int, int]]) -> List[int]:
@@ -130,86 +130,22 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     return "\n".join(lines)
 
 
-def _get_counter_tile_indices(nodes: Dict, counter: int, node_to_subgraph: Dict[int, int]) -> str:
-    """Get readable tensor indices for a parallel counter."""
-    counter_nodes = [n for n in nodes.keys() if node_to_subgraph.get(n) == counter]
-    if not counter_nodes:
-        return ""
-
-    first_node_id = counter_nodes[0]
-    node_data = nodes[first_node_id]
-
-    if isinstance(node_data, LoadNode) and node_data.load_indices:
-        tensor_name = node_data.input_tensor
-        tensor_indices = node_data.load_indices
-        parts = []
-        for axis_idx, (tile_index, tile_size) in sorted(tensor_indices.items()):
-            parts.append(f"{tensor_name}_{axis_idx}_tile={tile_index}")
-        return ", ".join(parts)
-
-    return f"counter={counter}"
-
-
 def _format_node(node_data: Any, node_id: int, input_tensors: Dict[str, tuple]) -> tuple[str, str]:
     """Format node label and color based on node type."""
     node_type = node_data.type
 
+    label = repr(node_data)
+
     if node_type == "load":
-        tensor_name = node_data.input_tensor
-        buffer_name = node_data.dest
-        tensor_indices = node_data.load_indices
-        tensor_shape = input_tensors.get(tensor_name, ())
-
-        slice_str = _format_tensor_slices(tensor_name, tensor_indices, tensor_shape)
-        label = f"{buffer_name} =\\nnl.load({tensor_name}{slice_str})"
         color = "#FFEAA7"
-
     elif node_type == "compute":
-        op_type = node_data.op_type
-        output_buffer = node_data.dest
-        inputs = node_data.inputs
-
-        inputs_str = ", ".join(inputs)
-        label = f"{output_buffer} =\\n{op_type}({inputs_str})"
         color = "#A8D8EA"
-
     elif node_type == "store":
-        src_tensor = node_data.src_tensor
-        dest_tensor = node_data.dest
-        store_indices = node_data.store_indices
-
-        if store_indices:
-            slices = []
-            for axis_idx, (tile_index, tile_size) in sorted(store_indices.items()):
-                slices.append(f"{tile_index} * {tile_size}")
-            slice_str = f"[{', '.join(slices)}]"
-        else:
-            slice_str = ""
-
-        label = f"nl.store({src_tensor},\\n{dest_tensor}{slice_str})"
         color = "#A8E6CF"
-
     else:
-        label = f"node_{node_id}"
         color = "#E8E8E8"
 
     return label, color
-
-
-def _format_tensor_slices(tensor_name: str, tensor_indices: Dict[int, tuple[int, int]], tensor_shape: tuple) -> str:
-    """Format tensor indices with tile expressions for parallel axes and : for non-parallel axes."""
-    if not tensor_shape:
-        return ""
-
-    slices = []
-    for axis_idx in range(len(tensor_shape)):
-        if axis_idx in tensor_indices:
-            tile_index, tile_size = tensor_indices[axis_idx]
-            slices.append(f"{tile_index} * {tile_size}")
-        else:
-            slices.append(":")
-
-    return f"[{', '.join(slices)}]"
 
 
 def save_graph(graph: ComputeGraph, output_file: str, title: str, keep_dot: bool = False) -> None:
