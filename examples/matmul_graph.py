@@ -22,11 +22,25 @@ def test_data_reuse_transformation() -> None:
     graph = ComputeGraph(
         input_tensors={"lhs": (M, K), "rhs": (K, N)},
         parallel_axes=[("lhs", 0, TILE_M), ("rhs", 1, TILE_N)],
-        operators=[Operator("rmsnorm", src=["lhs"], output="O1"), Operator("matmul", src=["O1", "rhs"], output="O2")],
+        operators=[Operator("rmsnorm", src=["lhs"], dest="O1"), Operator("matmul", src=["O1", "rhs"], dest="O2")],
         output_tensors=["O2"],
     )
-
     save_graph(graph, output_file="matmul_initial.png", title="Initial Matmul ComputeGraph")
+
+    seq_len = 256
+    hidden = 512
+    attention_graph = ComputeGraph(
+        input_tensors={"Q": (seq_len, hidden), "K": (seq_len, hidden), "V": (seq_len, hidden)},
+        parallel_axes=[("Q", 0, TILE_M), ("V", 1, TILE_N)],
+        operators=[
+            Operator("transpose", src=["K"], dest="K_T"),
+            Operator("matmul", src=["Q", "K_T"], dest="O1"),
+            Operator("softmax", src=["O1"], dest="O2"),
+            Operator("matmul", src=["O2", "V"], dest="O3"),
+        ],
+        output_tensors=["O3"],
+    )
+    save_graph(attention_graph, output_file="attention.png", title="Attention ComputeGraph")
 
     # merge_opportunities = analyze_data_reuse_opportunities(graph)
     # print(f"\n=== Data Reuse Analysis ===")
