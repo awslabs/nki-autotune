@@ -1,53 +1,22 @@
 import math
-from typing import Dict, List
-
-from compute_graph.primitives import AXIS, INPUT_TENSOR_SHAPE
 
 
 class Axis:
-    def __init__(self, tensor_name: str, axis_index: int, tile_size: int, size: int, num_tiles: int) -> None:
-        self.tensor_name = tensor_name
-        self.axis_index = axis_index
-        self.tile_size = tile_size
+    def __init__(self, size: int, tile_size: int, depepdency: str) -> None:
         self.size = size
-        self.num_tiles = num_tiles
+        self.tile_size = tile_size
+        self.num_tiles = math.ceil(size / tile_size)
+        self.dependency = depepdency
 
     def __repr__(self) -> str:
-        return (
-            f"Axis({self.tensor_name}[{self.axis_index}], "
-            f"size={self.size}, "
-            f"tile_size={self.tile_size}, "
-            f"num_tiles={self.num_tiles})"
-        )
+        return f"({self.dependency[:3]}){self.num_tiles}x{self.tile_size}={self.size}"
 
 
-def make_axes(input_tensors: Dict[str, INPUT_TENSOR_SHAPE], axes: List[AXIS]) -> List[Axis]:
-    """
-    Create Axis objects from axis specifications and input tensor shapes.
-
-    For each axis specification, computes the actual dimension size from the input
-    tensor shape and calculates the number of tiles needed based on the tile size.
-
-    Args:
-        input_tensors: Dictionary mapping tensor names to their shapes
-        axes: List of (tensor_name, axis_index, tile_size) tuples
-
-    Returns:
-        List of Axis objects with computed size and num_tiles
-    """
-    processed_axes = []
-    for tensor_name, axis_idx, tile_size in axes:
-        size = input_tensors[tensor_name][axis_idx]
-        num_tiles = math.ceil(size / tile_size)
-        axis = Axis(tensor_name, axis_idx, tile_size, size, num_tiles)
-        processed_axes.append(axis)
-    return processed_axes
-
-
-def linear_counter_to_indices(counter: int, axes: List[Axis]) -> Dict[str, Dict[int, int]]:
+def linear_counter_to_indices(counter: int, axes: list[Axis]) -> dict[str, dict[int, int]]:
     """
     Convert linear counter to parallel axis indices.
     """
+    print(counter, axes)
     indices = {}
     total_blocks = math.prod([axis.num_tiles for axis in axes])
     stride = total_blocks
