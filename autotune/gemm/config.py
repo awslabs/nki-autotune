@@ -4,13 +4,13 @@
 import math
 import random
 from itertools import permutations, product
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import neuronxcc.nki.language as nl
 import tabulate
 
 
-def str_to_dict(loop_order: str) -> Dict:
+def str_to_dict(loop_order: str) -> dict:
     """
     Convert a loop order string into a bidirectional mapping dictionary.
 
@@ -32,7 +32,7 @@ def str_to_dict(loop_order: str) -> Dict:
     return loop_order_dict
 
 
-def generate_configs(**kwargs) -> List[Dict]:
+def generate_configs(**kwargs) -> list[dict]:
     """
     Generate all combinations of configuration options.
 
@@ -66,7 +66,7 @@ def generate_configs(**kwargs) -> List[Dict]:
     return configs
 
 
-def generate_blocks_for_axis(size: int, tile_size: int) -> List[Dict[str, int]]:
+def generate_blocks_for_axis(size: int, tile_size: int) -> list[dict[str, int]]:
     """
     Generate valid block configurations for tiling an axis.
 
@@ -123,9 +123,9 @@ class GEMMConfig:
 
     def __init__(
         self,
-        m_config: Dict[str, int],
-        n_config: Dict[str, int],
-        k_config: Dict[str, int],
+        m_config: dict[str, int],
+        n_config: dict[str, int],
+        k_config: dict[str, int],
         lhs_position: int,
         rhs_position: int,
         loop_order: str,
@@ -180,14 +180,14 @@ class GEMMConfig:
         self.loop_order_str = loop_order
         self.loop_order = str_to_dict(loop_order)
 
-        self.op_positions: Dict[str, int] = {}
+        self.op_positions: dict[str, int] = {}
         self.op_positions["lhs"] = self._parse_absolute_position(lhs_position, ("M", "K"))
         self.op_positions["rhs"] = self._parse_absolute_position(rhs_position, ("K", "N"))
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
         self.op_positions["x_op"] = self.loop_order["K"]
 
-    def _parse_absolute_position(self, relative_position: int, axes: Tuple[str, ...]) -> int:
+    def _parse_absolute_position(self, relative_position: int, axes: tuple[str, ...]) -> int:
         """
         Convert relative position to absolute position in loop order.
 
@@ -253,7 +253,7 @@ class GEMMConfig:
         return f"{header}\n{table}"
 
 
-def sample_gemm_configs(M: int, N: int, K: int, max_configs: Optional[int] = None) -> List[Dict]:
+def sample_gemm_configs(M: int, N: int, K: int, max_configs: Optional[int] = None) -> list[dict]:
     """
     Sample all valid GEMM configurations for given matrix dimensions.
 

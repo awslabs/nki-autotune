@@ -1,5 +1,4 @@
 import math
-from typing import Dict, Tuple
 
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
@@ -15,7 +14,7 @@ class TileCoordinates:
         self.data[axis] = {"start_tile_index": start_tile_index, "num_tiles": num_tiles}
         self.axes.add(axis)
 
-    def __getitem__(self, axis: str) -> Dict[str, int]:
+    def __getitem__(self, axis: str) -> dict[str, int]:
         """Access coordinate information for a specific axis.
 
         Args:
@@ -67,7 +66,7 @@ class HBMTensor:
                enabling efficient lookup of tensor dimensions by name
     """
 
-    def __init__(self, tensor, axes: Tuple[str, ...]) -> None:
+    def __init__(self, tensor, axes: tuple[str, ...]) -> None:
         """Initialize HBM tensor wrapper with named axes.
 
         Args:
@@ -80,7 +79,7 @@ class HBMTensor:
         """
         self.tensor = tensor
         self.axes = axes
-        self.sizes: Dict[str, int] = {}
+        self.sizes: dict[str, int] = {}
         assert len(axes) == len(
             tensor.shape
         ), f"Tensor {tensor.shape} has {len(tensor.shape)} axes, but was given {axes} {len(axes)} axes."
@@ -89,7 +88,7 @@ class HBMTensor:
 
 
 class SBUFTensor:
-    def __init__(self, par_axis: str, tile_sizes: Dict[str, int], tile_coordinates: TileCoordinates) -> None:
+    def __init__(self, par_axis: str, tile_sizes: dict[str, int], tile_coordinates: TileCoordinates) -> None:
         """Initialize SBUF tensor with specified tile sizes.
 
         Args:
@@ -225,7 +224,7 @@ class SBUFTensor:
                             tileT, dtype=self.tensor.dtype
                         )
 
-    def read_tile(self, tile_indices: Dict[str, int]):
+    def read_tile(self, tile_indices: dict[str, int]):
         """Extract a specific tile from the tensor using global tile indices.
 
         Args:

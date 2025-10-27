@@ -1,12 +1,11 @@
 import json
 import os
-from typing import List
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-def numerical_key(dim_string: str) -> List:
+def numerical_key(dim_string: str) -> list:
     """
     Convert a dimension string to a list of integers for proper numerical sorting.
     For strings like '1x2048x1024_1024x2048', converts to [1, 2048, 1024, 1024, 2048]
@@ -81,7 +80,7 @@ def collect_metrics_data_with_stats(directory: str, metric_name: str):
     return metrics_data
 
 
-def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: List[str]):
+def plot_metric(cache_root_dir: str, metric_name: str, kernel_names: list[str]):
     """
     Create a single line plot showing the specified metric for all (M,N,K) combinations,
     comparing different kernel implementations. Plots the best values with error bars

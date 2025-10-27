@@ -1,19 +1,19 @@
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 from compute_graph.graph import ComputeGraph
 
 
-def _get_successors(node_id: int, edges: List[Tuple[int, int]]) -> List[int]:
+def _get_successors(node_id: int, edges: list[tuple[int, int]]) -> list[int]:
     """Get successor nodes from edge list."""
     return [target for source, target in edges if source == node_id]
 
 
-def _get_predecessors(node_id: int, edges: List[Tuple[int, int]]) -> List[int]:
+def _get_predecessors(node_id: int, edges: list[tuple[int, int]]) -> list[int]:
     """Get predecessor nodes from edge list."""
     return [source for source, target in edges if target == node_id]
 
 
-def _infer_subgraph_assignments(graph: ComputeGraph) -> Dict[int, int]:
+def _infer_subgraph_assignments(graph: ComputeGraph) -> dict[int, int]:
     """Infer which subgraph each node belongs to based on tile indices.
 
     Returns a dict mapping node_id -> subgraph_id
@@ -37,7 +37,7 @@ def _infer_subgraph_assignments(graph: ComputeGraph) -> Dict[int, int]:
     return node_to_subgraph
 
 
-def _get_connected_component(start_node: int, nodes: Dict, edges: List[Tuple[int, int]]) -> List[int]:
+def _get_connected_component(start_node: int, nodes: dict, edges: list[tuple[int, int]]) -> list[int]:
     """Get all nodes in the same connected component."""
     component = set()
     stack = [start_node]
@@ -60,8 +60,8 @@ def _get_connected_component(start_node: int, nodes: Dict, edges: List[Tuple[int
 
 
 def _get_counter_nodes(
-    nodes: Dict, edges: List[Tuple[int, int]], counter: int, node_to_subgraph: Dict[int, int]
-) -> List[int]:
+    nodes: dict, edges: list[tuple[int, int]], counter: int, node_to_subgraph: dict[int, int]
+) -> list[int]:
     """Get all nodes belonging to a specific subgraph."""
     return [n for n in nodes.keys() if node_to_subgraph.get(n) == counter]
 
@@ -130,7 +130,7 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     return "\n".join(lines)
 
 
-def _format_node(node_data: Any, node_id: int, input_tensors: Dict[str, tuple]) -> tuple[str, str]:
+def _format_node(node_data: Any, node_id: int, input_tensors: dict[str, tuple]) -> tuple[str, str]:
     """Format node label and color based on node type."""
     node_type = node_data.type
 

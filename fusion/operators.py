@@ -1,13 +1,12 @@
 """Operator definitions for the MegaFuse fusion framework."""
 
 from abc import ABC, abstractmethod
-from typing import Dict, List
 
 from fusion.tensors import Tensor
 
 
 class Operator(ABC):
-    def __init__(self, input_tensors: List[str], **kwargs) -> None:
+    def __init__(self, input_tensors: list[str], **kwargs) -> None:
         """_summary_
 
         Args:
@@ -28,7 +27,7 @@ class Operator(ABC):
         self.index = value
 
     @abstractmethod
-    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+    def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
         """
         Execute the operator forward pass.
         intermediate_tensors are forward input tensors that are not kernel inputs
@@ -37,8 +36,8 @@ class Operator(ABC):
 
     @abstractmethod
     def initialize_output(
-        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
-    ) -> Dict[str, Tensor]:
+        self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
+    ) -> dict[str, Tensor]:
         """
         Initialize the operator output tensors.
         """
