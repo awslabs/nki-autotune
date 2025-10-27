@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from typing import Dict, List
 
 import numpy as np
 
@@ -10,11 +9,11 @@ from fusion.tensors import Tensor
 
 
 class SumSquares(Operator):
-    def __init__(self, input_tensors: List[str], sum_axis: str) -> None:
+    def __init__(self, input_tensors: list[str], sum_axis: str) -> None:
         super().__init__(input_tensors)
         self.sum_axis = sum_axis
 
-    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+    def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
         assert (
             len(input_tensors) == 1
         ), f"SumSquares forward expects input_tensor, received {len(input_tensors)} tensors"
@@ -28,8 +27,8 @@ class SumSquares(Operator):
             output_new.data = sum_squares
 
     def initialize_output(
-        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
-    ) -> Dict[str, Tensor]:
+        self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
+    ) -> dict[str, Tensor]:
         assert (
             len(input_tensors) == 1
         ), f"SumSquares initialize output expects one input tensor, received {len(input_tensors)}"
@@ -42,13 +41,13 @@ class SumSquares(Operator):
 
 
 class RMSNormMatmul(Operator):
-    def __init__(self, input_tensors: List[str], epsilon: float, num_elements: int, matmul_axis: str) -> None:
+    def __init__(self, input_tensors: list[str], epsilon: float, num_elements: int, matmul_axis: str) -> None:
         super().__init__(input_tensors)
         self.epsilon = epsilon
         self.num_elements = num_elements
         self.matmul_axis = matmul_axis
 
-    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+    def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
         assert (
             len(input_tensors) == 2
         ), f"RMSNormMatmul forward expects two input tensors, received {len(input_tensors)}"
@@ -60,8 +59,8 @@ class RMSNormMatmul(Operator):
         intermediate_tensors[f"bias_{self.operator_index}"].data = mat_prod / norm_factor[:, None]
 
     def initialize_output(
-        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
-    ) -> Dict[str, Tensor]:
+        self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
+    ) -> dict[str, Tensor]:
         assert (
             len(input_tensors) == 2
         ), f"RMSNormMatmul initialize_output expects LHS, RHS tensors, received {len(input_tensors)}."
@@ -79,7 +78,7 @@ class Scale(Operator):
         self.epsilon = epsilon
         self.num_elements = num_elements
 
-    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+    def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
         output_old = intermediate_tensors[f"O_{self.operator_index-1}_old"]
         output_new = intermediate_tensors[f"O_{self.operator_index-1}_new"]
         scale_tensor = intermediate_tensors[f"scale_{self.operator_index}"]
@@ -88,8 +87,8 @@ class Scale(Operator):
         )
 
     def initialize_output(
-        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
-    ) -> Dict[str, Tensor]:
+        self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
+    ) -> dict[str, Tensor]:
         output_old = intermediate_tensors[f"O_{self.operator_index-1}_old"]
         init_tensor = Tensor(axes=output_old.axes, data=np.zeros(shape=output_old.data.shape))
         return {f"scale_{self.operator_index}": init_tensor}

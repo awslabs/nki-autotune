@@ -4,7 +4,7 @@ import os
 import shutil
 import signal
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 import numpy as np
 
@@ -67,7 +67,7 @@ class ProfileJob:
             postprocessing: Optional post-processing function for outputs.
             cache_root_dir: Root directory for caching results.
         """
-        self.attributes: List[str] = []
+        self.attributes: list[str] = []
         input_tensor_shapes_str = "_".join("x".join(str(dim) for dim in shape) for shape in input_tensor_shapes)
         _, kernel_name = kernel
         workload_dir = f"{cache_root_dir}/{kernel_name}/{input_tensor_shapes_str}"
@@ -108,7 +108,7 @@ class ProfileJob:
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """Convert to dictionary representation including only attributes in self.attributes."""
         result = {}
         for attr_name in self.attributes:
@@ -153,7 +153,7 @@ class ProfileJob:
         return hasattr(self, "postprocessing_result") and self.postprocessing_result == True
 
     @property
-    def sort_val(self) -> Tuple[int, float]:
+    def sort_val(self) -> tuple[int, float]:
         if self.has_error:
             val = (2, float("inf"))
         elif not hasattr(self, self.main_metric):
@@ -184,8 +184,8 @@ class ProfileJobs:
         """
         self.cache_root_dir = cache_root_dir
         self.target_instance_family = target_instance_family
-        self.jobs: Dict[int, ProfileJob] = {}
-        self._tensor_cache: Dict[Tuple[Tuple[int, ...], np.dtype], np.ndarray] = {}
+        self.jobs: dict[int, ProfileJob] = {}
+        self._tensor_cache: dict[tuple[tuple[int, ...], np.dtype], np.ndarray] = {}
         self.main_metric = "min_ms"
 
     def add_job(
@@ -193,7 +193,7 @@ class ProfileJobs:
         kernel: KERNEL_DTYPE,
         input_tensor_shapes: INPUT_TENSOR_SHAPES_DTYPE,
         data_type,
-        kernel_kwargs: Dict[str, Any],
+        kernel_kwargs: dict[str, Any],
         compiler_flags: str,
         postprocessing: POSTPROCESSING_DTYPE,
         mac_count: int = 0,
@@ -250,7 +250,7 @@ class ProfileJobs:
 
         return result
 
-    def subset(self, indices: List[int]) -> "ProfileJobs":
+    def subset(self, indices: list[int]) -> "ProfileJobs":
         """Create a new ProfileJobs containing only specified job indices.
 
         Args:
@@ -284,7 +284,7 @@ class ProfileJobs:
             OSError: If the directory cannot be created or the file cannot be written.
         """
         filename = "perf_metrics.json"
-        jobs_by_workload_dir: Dict[str, List[int]] = {}
+        jobs_by_workload_dir: dict[str, list[int]] = {}
 
         for job_index in self.jobs:
             job = self.jobs[job_index]
@@ -298,7 +298,7 @@ class ProfileJobs:
 
             correct_count = 0
             error_count = 0
-            error_types: Dict[str, int] = {}
+            error_types: dict[str, int] = {}
             for job_index in sorted_job_indices:
                 job = self.jobs[job_index]
                 if job.is_correct:

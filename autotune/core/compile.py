@@ -3,7 +3,6 @@ import importlib.util
 import shutil
 import sys
 import types
-from typing import Tuple
 
 import numpy as np
 from neuronpy.core.compile import CompilationTarget, compile_to_neff, trace
@@ -135,7 +134,7 @@ def create_spike_kernel(
 
 def run_spike_kernel(
     spike, spike_kernel, input_tensors, neff: str, kernel_kwargs: KERNEL_KWARGS_DTYPE
-) -> Tuple[str, tuple[np.ndarray, ...]]:
+) -> tuple[str, tuple[np.ndarray, ...]]:
     directory, neff_name, file_type = split_file_info(neff)
     if file_type != "neff":
         raise ValueError(f"{neff} is not a neff file.")

@@ -3,7 +3,7 @@
 
 import argparse
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import numpy as np
 from neuronpy.core.language import bfloat16
@@ -14,7 +14,7 @@ from autotune.core.visualize import plot_metric
 from autotune.gemm import GEMMCorrectness, sample_gemm_configs
 
 
-def generate_shapes() -> List[Tuple[int, int, int]]:
+def generate_shapes() -> list[tuple[int, int, int]]:
     """Generate (M, N, K) shape tuples for GEMM benchmarking."""
     shapes = []
     for size in range(512, 1024 * 10 + 1, 512):
@@ -23,7 +23,7 @@ def generate_shapes() -> List[Tuple[int, int, int]]:
     return shapes
 
 
-def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool) -> List[Dict[str, Any]]:
+def collect_job_configs(shapes: list[tuple[int, int, int]], transposed_lhs: bool) -> list[dict[str, Any]]:
     """Collect all job configurations for GEMM benchmarking.
 
     Args:
@@ -111,7 +111,7 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
     return job_list
 
 
-def run_jobs_in_batches(job_list: List[Dict[str, Any]], cache_dir: str, batch_size) -> None:
+def run_jobs_in_batches(job_list: list[dict[str, Any]], cache_dir: str, batch_size) -> None:
     """Execute jobs in batches to prevent machine crashes from too many concurrent jobs.
 
     Args:

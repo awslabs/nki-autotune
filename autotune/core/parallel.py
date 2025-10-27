@@ -1,9 +1,8 @@
 import os
 import random
-from typing import List
 
 
-def split_jobs_into_groups(job_ids: List[int], num_groups: int) -> List[List[int]]:
+def split_jobs_into_groups(job_ids: list[int], num_groups: int) -> list[list[int]]:
     """
     Split job_ids into evenly distributed groups with randomized order.
     Ensures no empty groups are created and number of groups <= num_groups.
@@ -16,7 +15,7 @@ def split_jobs_into_groups(job_ids: List[int], num_groups: int) -> List[List[int
 
     # Calculate effective number of groups (no more than jobs available)
     effective_num_groups = min(len(job_ids), num_groups)
-    groups: List[List[int]] = [[] for _ in range(effective_num_groups)]
+    groups: list[list[int]] = [[] for _ in range(effective_num_groups)]
 
     # Create a copy and shuffle it to randomize job distribution
     shuffled_job_ids = job_ids.copy()

@@ -1,14 +1,12 @@
 """Tensor wrapper for fusion operations."""
 
-from typing import List
-
 import numpy as np
 
 
 class Tensor:
     """Numpy array wrapper with fusion-specific helpers."""
 
-    def __init__(self, axes: List[str], data: np.ndarray):
+    def __init__(self, axes: list[str], data: np.ndarray):
         self.axes = axes
         self.data = data
 
@@ -24,14 +22,14 @@ class Tensor:
         size = self.data.shape[axis_index]
         return size
 
-    def get_parallel_shape(self, fusion_axis: str) -> List[int]:
+    def get_parallel_shape(self, fusion_axis: str) -> list[int]:
         parallel_shape = []
         for axis, size in zip(self.axes, self.data.shape):
             if axis != fusion_axis:
                 parallel_shape.append(size)
         return parallel_shape
 
-    def get_parallel_axes(self, fusion_axis: str) -> List[str]:
+    def get_parallel_axes(self, fusion_axis: str) -> list[str]:
         parallel_axes = []
         for axis in self.axes:
             if axis != fusion_axis:

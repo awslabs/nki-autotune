@@ -1,15 +1,13 @@
-from typing import Dict, List, Tuple
-
 import networkx as nx
 
 
-def analyze_data_reuse_opportunities(graph: nx.DiGraph) -> List[List[int]]:
+def analyze_data_reuse_opportunities(graph: nx.DiGraph) -> list[list[int]]:
     """Find groups of load nodes that can be merged via data reuse.
 
     Returns:
         List of merge groups, where each group contains node IDs that load identical data.
     """
-    load_groups: Dict[Tuple, List[int]] = {}
+    load_groups: dict[tuple, list[int]] = {}
 
     for node_id in graph.nodes():
         node_data = graph.nodes[node_id]
@@ -31,7 +29,7 @@ def analyze_data_reuse_opportunities(graph: nx.DiGraph) -> List[List[int]]:
     return merge_opportunities
 
 
-def apply_data_reuse_merge(graph: nx.DiGraph, merge_group: List[int]) -> nx.DiGraph:
+def apply_data_reuse_merge(graph: nx.DiGraph, merge_group: list[int]) -> nx.DiGraph:
     """Execute a specific data reuse merge for a group of load nodes.
 
     Args:

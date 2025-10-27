@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict
+from typing import Any
 
 import neuronxcc.nki as nki
 import neuronxcc.nki.isa as nisa
@@ -99,9 +99,9 @@ class MetaGEMM:
         self.maybe_store(curr_position=0)
         return self.result_hbm
 
-    def maybe_init(self, curr_position: int, loop_vars: Dict):
+    def maybe_init(self, curr_position: int, loop_vars: dict):
         if self.gemm_config.op_positions["lhs"] == curr_position:
-            lhs_tile_sizes: Dict[str, int] = {}
+            lhs_tile_sizes: dict[str, int] = {}
             lhs_tile_coordinates = TileCoordinates()
             for axis in self.axes["lhs"]:
                 lhs_tile_sizes[axis] = getattr(self.gemm_config, f"TILE_{axis}")
@@ -119,7 +119,7 @@ class MetaGEMM:
             if not self.transposed_lhs:
                 self.lhs_tiles.tile_transpose()
         if self.gemm_config.op_positions["rhs"] == curr_position:
-            rhs_tile_sizes: Dict[str, int] = {}
+            rhs_tile_sizes: dict[str, int] = {}
             rhs_tile_coordinates = TileCoordinates()
             for axis in self.axes["rhs"]:
                 rhs_tile_sizes[axis] = getattr(self.gemm_config, f"TILE_{axis}")
@@ -215,7 +215,7 @@ def matmul_tiles(lhs_tiles: SBUFTensor, rhs_tiles: SBUFTensor, result_tiles: SBU
 
 
 @nki.jit
-def lhsT_rhs_meta_gemm(lhs: tensor, rhs: tensor, config: Dict):
+def lhsT_rhs_meta_gemm(lhs: tensor, rhs: tensor, config: dict):
     transposed_lhs = True
     gemm_config = GEMMConfig(**config)
     gemm_kernel = MetaGEMM(transposed_lhs, gemm_config)
@@ -223,7 +223,7 @@ def lhsT_rhs_meta_gemm(lhs: tensor, rhs: tensor, config: Dict):
 
 
 @nki.jit
-def lhs_rhs_meta_gemm(lhs: tensor, rhs: tensor, config: Dict):
+def lhs_rhs_meta_gemm(lhs: tensor, rhs: tensor, config: dict):
     transposed_lhs = False
     gemm_config = GEMMConfig(**config)
     gemm_kernel = MetaGEMM(transposed_lhs, gemm_config)

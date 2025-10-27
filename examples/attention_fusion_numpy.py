@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from typing import Dict, List
 
 import numpy as np
 
@@ -15,11 +14,11 @@ class Rowmax(Operator):
     O_0_k = max(O_0_{k-1}, rowmax(P_k))
     """
 
-    def __init__(self, input_tensors: List[str], reduction_axis: str) -> None:
+    def __init__(self, input_tensors: list[str], reduction_axis: str) -> None:
         super().__init__(input_tensors)
         self.reduction_axis = reduction_axis
 
-    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+    def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
         assert len(input_tensors) == 1, f"Rowmax forward expects 1 input tensor, received {len(input_tensors)}"
         input_tensor = input_tensors[0]
         row_max = np.max(input_tensor.data, axis=input_tensor.axes.index(self.reduction_axis))
@@ -32,8 +31,8 @@ class Rowmax(Operator):
             output_new.data = row_max
 
     def initialize_output(
-        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
-    ) -> Dict[str, Tensor]:
+        self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
+    ) -> dict[str, Tensor]:
         assert len(input_tensors) == 1, f"Rowmax expects 1 input tensor, received {len(input_tensors)}"
         input_tensor = input_tensors[0]
         init_shape = input_tensor.get_parallel_shape(self.reduction_axis)
@@ -49,11 +48,11 @@ class SumExpBias(Operator):
     Also caches exp(P_k - O_0_k) for reuse in attention output computation.
     """
 
-    def __init__(self, input_tensors: List[str], reduction_axis: str) -> None:
+    def __init__(self, input_tensors: list[str], reduction_axis: str) -> None:
         super().__init__(input_tensors)
         self.reduction_axis = reduction_axis
 
-    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+    def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
         assert len(input_tensors) == 1, f"SumExpBias expects 1 input tensor, received {len(input_tensors)}"
 
         P_slice = input_tensors[0]
@@ -71,8 +70,8 @@ class SumExpBias(Operator):
         intermediate_tensors[f"bias_{self.operator_index}"].data = sum_exp
 
     def initialize_output(
-        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
-    ) -> Dict[str, Tensor]:
+        self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
+    ) -> dict[str, Tensor]:
         assert len(input_tensors) == 1, f"SumExpBias expects 1 input tensor, received {len(input_tensors)}"
         input_tensor = input_tensors[0]
 
@@ -97,7 +96,7 @@ class SumExpScale(Operator):
     def __init__(self) -> None:
         super().__init__(input_tensors=[])
 
-    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+    def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
         O_0_old = intermediate_tensors[f"O_{self.operator_index - 1}_old"]  # Previous rowmax O_0_{k-1}
         O_0_new = intermediate_tensors[f"O_{self.operator_index - 1}_new"]  # Current rowmax O_0_k
 
@@ -106,8 +105,8 @@ class SumExpScale(Operator):
         scale_tensor.data = np.exp(O_0_old.data - O_0_new.data)
 
     def initialize_output(
-        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
-    ) -> Dict[str, Tensor]:
+        self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
+    ) -> dict[str, Tensor]:
         O_0_old = intermediate_tensors[f"O_{self.operator_index - 1}_old"]
         init_tensor = Tensor(axes=O_0_old.axes, data=np.zeros(shape=O_0_old.data.shape))
         return {f"scale_{self.operator_index}": init_tensor}
@@ -119,12 +118,12 @@ class AttentionOutputBias(Operator):
     Uses cached exp_normalized to avoid recomputation.
     """
 
-    def __init__(self, input_tensors: List[str], P_reduction_axis: str, matmul_axis: str) -> None:
+    def __init__(self, input_tensors: list[str], P_reduction_axis: str, matmul_axis: str) -> None:
         super().__init__(input_tensors)
         self.P_reduction_axis = P_reduction_axis
         self.matmul_axis = matmul_axis
 
-    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+    def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
         assert len(input_tensors) == 2, f"AttentionOutputBias expects P and V tensors, received {len(input_tensors)}"
 
         P_slice, V_slice = input_tensors
@@ -142,8 +141,8 @@ class AttentionOutputBias(Operator):
         intermediate_tensors[f"bias_{self.operator_index}"].data = attention_output
 
     def initialize_output(
-        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
-    ) -> Dict[str, Tensor]:
+        self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
+    ) -> dict[str, Tensor]:
         assert len(input_tensors) == 2, f"AttentionOutputBias expects P and V, received {len(input_tensors)}"
 
         P_slice = input_tensors[0]
@@ -167,7 +166,7 @@ class AttentionOutputScale(Operator):
     def __init__(self) -> None:
         super().__init__(input_tensors=[])
 
-    def forward(self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]) -> None:
+    def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
         O_0_old = intermediate_tensors[f"O_0_old"]  # Previous rowmax
         O_0_new = intermediate_tensors[f"O_0_new"]  # Current rowmax
         O_1_old = intermediate_tensors[f"O_1_old"]  # Previous sum_exp
@@ -181,8 +180,8 @@ class AttentionOutputScale(Operator):
         )
 
     def initialize_output(
-        self, intermediate_tensors: Dict[str, Tensor], input_tensors: List[Tensor]
-    ) -> Dict[str, Tensor]:
+        self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
+    ) -> dict[str, Tensor]:
         # Get shape from O_2 (attention output)
         attention_output = intermediate_tensors[f"bias_{self.operator_index}"]
         init_tensor = Tensor(axes=attention_output.axes, data=np.zeros(shape=attention_output.data.shape))

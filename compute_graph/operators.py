@@ -1,10 +1,7 @@
-from typing import Dict, List
-
-
 class Operator:
     """Defines a compute operation in the workload."""
 
-    def __init__(self, op: str, src: List[str], dest: str, params: Dict = {}) -> None:
+    def __init__(self, op: str, src: list[str], dest: str, params: dict = {}) -> None:
         self.op = op
         self.src = src
         self.dest = dest

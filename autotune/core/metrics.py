@@ -1,6 +1,5 @@
 import json
 import subprocess
-from typing import Dict, List, Tuple
 
 import numpy as np
 from neuronxcc.starfish.penguin.ir.ir import BIRKernel, NativeKernelTemplate, TensorContractTensorOp
@@ -68,7 +67,7 @@ def calculate_mfu(mac_count: int, time_ms: float, target_instance_family: str) -
 
 
 def calculate_mfu_from_shapes(
-    lhsT_shape: Tuple[int, ...], rhs_shape: Tuple[int, ...], time_ms: float, target_instance_family: str
+    lhsT_shape: tuple[int, ...], rhs_shape: tuple[int, ...], time_ms: float, target_instance_family: str
 ) -> float:
     """
     Calculate model PE utilization for a GEMM operation using matrix shapes.
@@ -94,7 +93,7 @@ def calculate_mfu_from_shapes(
 
 def extract_metrics(
     neff: str, ntff: str, latency: float, matmul_mac_count: int, target_instance_family: str
-) -> Dict[str, float]:
+) -> dict[str, float]:
     dump_json_cmd = f"neuron-profile view -n {neff} -s {ntff} --output-format summary-json"
     process = subprocess.run(dump_json_cmd, shell=True, capture_output=True, text=True, check=True)
     json_str = process.stdout
@@ -110,7 +109,7 @@ def extract_metrics(
     return metrics
 
 
-def tensor_to_matmul_mac_count(input_tensor_shapes: List[Tuple[int, ...]]) -> int:
+def tensor_to_matmul_mac_count(input_tensor_shapes: list[tuple[int, ...]]) -> int:
     if len(input_tensor_shapes) == 2 and len(input_tensor_shapes[0]) == 2 and len(input_tensor_shapes[1]) == 2:
         mac_count = input_tensor_shapes[0][0] * input_tensor_shapes[0][1] * input_tensor_shapes[1][1]
     else:

@@ -1,5 +1,3 @@
-from typing import Dict, List
-
 import neuronxcc.nki as nki
 import numpy as np
 
@@ -7,11 +5,11 @@ from compute_graph.axes import Axis
 
 
 class FusionChain:
-    def __init__(self, parallel_axes_config: List[Axis], sequential_axis_config: Axis) -> None:
+    def __init__(self, parallel_axes_config: list[Axis], sequential_axis_config: Axis) -> None:
         self.parallel_axes_config = parallel_axes_config
         self.sequential_axis_config = sequential_axis_config
 
-    def __call__(self, input_tensors: Dict[str, np.ndarray], verbose: bool = False):
+    def __call__(self, input_tensors: dict[str, np.ndarray], verbose: bool = False):
         print(self.parallel_axes_config)
         print(self.sequential_axis_config)
         print(input_tensors)
@@ -19,7 +17,7 @@ class FusionChain:
 
 @nki.jit
 def fusion_chain_wrapper(
-    *input_tensors, tensor_names: List[str], parallel_axes_config: List[Axis], sequential_axis_config: Axis
+    *input_tensors, tensor_names: list[str], parallel_axes_config: list[Axis], sequential_axis_config: Axis
 ):
     """
     NKI wrapper for FusionChain that accepts individual tensors.

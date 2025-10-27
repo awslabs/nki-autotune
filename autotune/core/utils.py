@@ -3,7 +3,6 @@
 import os
 import sys
 import traceback
-from typing import Tuple
 
 
 def capture_error_message(e) -> str:
@@ -22,7 +21,7 @@ def capture_error_message(e) -> str:
     return error_string
 
 
-def split_file_info(filepath: str) -> Tuple[str, str, str]:
+def split_file_info(filepath: str) -> tuple[str, str, str]:
     """
     Split a file path into its directory, filename, and file type components.
 

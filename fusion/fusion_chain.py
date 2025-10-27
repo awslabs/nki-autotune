@@ -2,7 +2,6 @@
 
 import math
 import re
-from typing import Dict, List
 
 import numpy as np
 
@@ -31,7 +30,7 @@ def broadcast_multiply(tensor_a: Tensor, tensor_b: Tensor) -> np.ndarray:
     return result_data
 
 
-def find_largest_O_new_value(data: Dict[str, Tensor]) -> Tensor:
+def find_largest_O_new_value(data: dict[str, Tensor]) -> Tensor:
     """
     Find the largest key with pattern "O_{int}_new" and return its value.
 
@@ -56,8 +55,8 @@ def find_largest_O_new_value(data: Dict[str, Tensor]) -> Tensor:
     return out
 
 
-def update_intermediates(intermediates: Dict[str, Tensor]):
-    new_tensor_names: List[str] = []
+def update_intermediates(intermediates: dict[str, Tensor]):
+    new_tensor_names: list[str] = []
     for tensor_name in intermediates:
         if "new" in tensor_name:
             new_tensor_names.append(tensor_name)
@@ -76,7 +75,7 @@ class FusionChain:
     enabling fusion of complex patterns.
     """
 
-    def __init__(self, fx: Operator, bias_ops: List[Operator], scale_ops: List[Operator]):
+    def __init__(self, fx: Operator, bias_ops: list[Operator], scale_ops: list[Operator]):
         """
         Initialize FusionChain with a sequence of operators.
         """
@@ -91,12 +90,12 @@ class FusionChain:
             bias_op.operator_index = operator_index + 1
             scale_op.operator_index = operator_index + 1
 
-    def get_input_tensors(self, tensor_names: List[str]) -> List[Tensor]:
+    def get_input_tensors(self, tensor_names: list[str]) -> list[Tensor]:
         tensors = [self.input_tensors[tensor_name] for tensor_name in tensor_names]
         return tensors
 
     def execute(
-        self, fusion_axis: str, fusion_step_size: int, input_tensors: Dict[str, Tensor], verbose: bool = False
+        self, fusion_axis: str, fusion_step_size: int, input_tensors: dict[str, Tensor], verbose: bool = False
     ) -> Tensor:
         """
         Execute the fusion chain on the provided inputs.
@@ -126,7 +125,7 @@ class FusionChain:
         # Collect iteration info for verbose output
         iteration_info = []
 
-        intermediates: Dict[str, Tensor] = {}
+        intermediates: dict[str, Tensor] = {}
         for fusion_step in range(num_fusion_steps):
             fusion_axis_start = fusion_step * fusion_step_size
             fusion_axis_end = min(fusion_axis_start + fusion_step_size, fusion_size)
@@ -136,7 +135,7 @@ class FusionChain:
                 f"Fusion Step {fusion_step + 1}/{num_fusion_steps}: {fusion_axis}[{fusion_axis_start}:{fusion_axis_end}]"
             ]
 
-            fx_input_tensors: List[Tensor] = []
+            fx_input_tensors: list[Tensor] = []
             for tensor in self.get_input_tensors(self.fx.input_tensors):
                 fx_input_tensors.append(
                     tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_step_size)
@@ -150,7 +149,7 @@ class FusionChain:
 
             for operator_counter in range(1, len(self.bias_ops) + 1):
                 bias_op = self.bias_ops[operator_counter - 1]
-                bias_input_tensors: List[Tensor] = []
+                bias_input_tensors: list[Tensor] = []
                 for tensor in self.get_input_tensors(bias_op.input_tensors):
                     bias_input_tensors.append(
                         tensor.get_axis_slice(fusion_axis, start=fusion_axis_start, size=fusion_step_size)
