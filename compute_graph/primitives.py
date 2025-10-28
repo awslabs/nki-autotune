@@ -1,5 +1,0 @@
-INPUT_TENSOR_SHAPE = tuple[int, ...]
-AXIS = tuple[str, int, int]
-AXIS_LOC = tuple[int, int]
-AXES_LOC = dict[int, AXIS_LOC]
-TENSOR = tuple[str, AXES_LOC]

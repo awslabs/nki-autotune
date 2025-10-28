@@ -2,10 +2,12 @@ import networkx as nx
 
 
 def analyze_data_reuse_opportunities(graph: nx.DiGraph) -> list[list[int]]:
-    """Find groups of load nodes that can be merged via data reuse.
+    """
+    Args:
+        graph: Compute graph with load nodes to analyze
 
     Returns:
-        List of merge groups, where each group contains node IDs that load identical data.
+        List of merge groups, where each group contains node IDs that load identical data
     """
     load_groups: dict[tuple, list[int]] = {}
 
@@ -30,14 +32,13 @@ def analyze_data_reuse_opportunities(graph: nx.DiGraph) -> list[list[int]]:
 
 
 def apply_data_reuse_merge(graph: nx.DiGraph, merge_group: list[int]) -> nx.DiGraph:
-    """Execute a specific data reuse merge for a group of load nodes.
-
+    """
     Args:
-        graph: The compute graph to transform.
-        merge_group: List of load node IDs to merge into a single shared load.
+        graph: Compute graph to transform
+        merge_group: List of load node IDs to merge into a single shared load
 
     Returns:
-        Modified graph with redundant loads removed and edges redirected.
+        Modified graph with redundant loads removed and edges redirected
     """
     if len(merge_group) < 2:
         return graph
@@ -58,13 +59,12 @@ def apply_data_reuse_merge(graph: nx.DiGraph, merge_group: list[int]) -> nx.DiGr
 
 
 def apply_all_data_reuse(graph: nx.DiGraph) -> nx.DiGraph:
-    """Apply data reuse transformation to all opportunities in the graph.
-
+    """
     Args:
-        graph: The compute graph to transform.
+        graph: Compute graph to transform
 
     Returns:
-        Transformed graph with all data reuse opportunities applied.
+        Transformed graph with all data reuse opportunities applied
     """
     merge_opportunities = analyze_data_reuse_opportunities(graph)
 
