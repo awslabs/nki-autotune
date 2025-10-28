@@ -4,7 +4,7 @@ from compute_graph.tensors import Axis, HBMTensor, TensorBuffer
 
 
 class ComputeGraph:
-    """compute graph specification."""
+    """Compute graph with load-compute-store nodes and dependency edges."""
 
     def __init__(
         self,
@@ -12,6 +12,12 @@ class ComputeGraph:
         operators: list[Operator],
         output_tensors: dict[str, tuple[Axis, ...]],
     ) -> None:
+        """
+        Args:
+            input_tensors: Dictionary mapping tensor names to axis configurations
+            operators: List of compute operators in the graph
+            output_tensors: Dictionary mapping output tensor names to axis configurations
+        """
 
         self.input_tensors: dict[str, HBMTensor] = {
             name: HBMTensor(name, list(axes)) for name, axes in input_tensors.items()
@@ -41,13 +47,11 @@ class ComputeGraph:
 
     def _compute_num_parallel_tiles(self, tensors: dict[str, HBMTensor]) -> int:
         """
-        Compute total number of parallel tiles across all HBM tensors.
-
         Args:
             tensors: Dictionary of HBM tensors
 
         Returns:
-            Product of num_tiles for all parallel axes
+            Product of num_tiles for all parallel axes across tensors
         """
         num_parallel_tiles = 1
         for tensor in tensors.values():
@@ -60,14 +64,12 @@ class ComputeGraph:
         self, parallel_index: int, tensors: dict[str, HBMTensor]
     ) -> dict[str, dict[int, tuple[int, ...]]]:
         """
-        Process parallel axes and compute tile indices.
-
         Args:
             parallel_index: Linear counter across all parallel tiles
             tensors: Dictionary of HBM tensors
 
         Returns:
-            Dictionary mapping {tensor_name: {axis_idx: tuple of tile index}}
+            Dictionary mapping tensor names to their axis tile coordinates
         """
         stride = self.num_parallel_tiles
         tile_indices: dict[str, dict[int, tuple[int, ...]]] = {}
@@ -85,7 +87,7 @@ class ComputeGraph:
         return tile_indices
 
     def _generate_graph(self) -> None:
-        """Generate initial completely parallel compute graph."""
+        """Generate complete compute graph with all subgraphs."""
         self.nodes: dict[int, Node] = {}
         self.edges = []
         self.global_intermediates: dict[str, int] = {}
@@ -93,7 +95,10 @@ class ComputeGraph:
             self._generate_subgraph(parallel_counter)
 
     def _generate_subgraph(self, subgraph_index: int) -> None:
-        """Generate Load -> Compute -> Store subgraph for one parallel counter."""
+        """
+        Args:
+            subgraph_index: Index of the parallel subgraph to generate
+        """
         input_tile_indices = self._process_parallel_axes(subgraph_index, self.input_tensors)
         output_tile_indices = self._process_parallel_axes(subgraph_index, self.output_tensors)
 
@@ -111,11 +116,9 @@ class ComputeGraph:
 
     def _create_load_node(self, tensor_name: str, tile_indices: dict[int, tuple[int, ...]]) -> int:
         """
-        Create a load node for input tensor.
-
         Args:
             tensor_name: Name of the HBM tensor to load
-            tile_indices: Precomputed tile indices for all parallel axes
+            tile_indices: Tile coordinates for all parallel axes
 
         Returns:
             Node ID of the created load node
@@ -140,7 +143,14 @@ class ComputeGraph:
         return node_id
 
     def _create_compute_node(self, operator: Operator, subgraph_intermediates: dict[str, int]) -> int:
-        """Create a compute node for operator."""
+        """
+        Args:
+            operator: Operator to create compute node for
+            subgraph_intermediates: Mapping of tensor names to node IDs
+
+        Returns:
+            Node ID of the created compute node
+        """
         node_id = len(self.nodes)
         dest_name = self._get_intermediate_name(basename=operator.dest)
         src_buffers: list[TensorBuffer] = []
@@ -168,12 +178,10 @@ class ComputeGraph:
         self, tensor_name: str, tile_indices: dict[int, tuple[int, ...]], subgraph_intermediates: dict[str, int]
     ) -> int:
         """
-        Create a store node for output tensor.
-
         Args:
             tensor_name: Name of the HBM tensor to store to
-            tile_indices: Precomputed tile indices for all parallel axes
-            subgraph_intermediates: Dictionary mapping tensor names to node IDs
+            tile_indices: Tile coordinates for all parallel axes
+            subgraph_intermediates: Mapping of tensor names to node IDs
 
         Returns:
             Node ID of the created store node
@@ -195,6 +203,13 @@ class ComputeGraph:
         return node_id
 
     def _get_intermediate_name(self, basename: str) -> str:
+        """
+        Args:
+            basename: Base name for the intermediate tensor
+
+        Returns:
+            Unique name with counter suffix
+        """
         if basename in self.global_intermediates:
             self.global_intermediates[basename] += 1
         else:

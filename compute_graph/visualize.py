@@ -4,19 +4,36 @@ from compute_graph.graph import ComputeGraph
 
 
 def _get_successors(node_id: int, edges: list[tuple[int, int]]) -> list[int]:
-    """Get successor nodes from edge list."""
+    """
+    Args:
+        node_id: Node to find successors for
+        edges: List of (source, target) edge tuples
+
+    Returns:
+        List of successor node IDs
+    """
     return [target for source, target in edges if source == node_id]
 
 
 def _get_predecessors(node_id: int, edges: list[tuple[int, int]]) -> list[int]:
-    """Get predecessor nodes from edge list."""
+    """
+    Args:
+        node_id: Node to find predecessors for
+        edges: List of (source, target) edge tuples
+
+    Returns:
+        List of predecessor node IDs
+    """
     return [source for source, target in edges if target == node_id]
 
 
 def _infer_subgraph_assignments(graph: ComputeGraph) -> dict[int, int]:
-    """Infer which subgraph each node belongs to based on tile indices.
+    """
+    Args:
+        graph: ComputeGraph to analyze
 
-    Returns a dict mapping node_id -> subgraph_id
+    Returns:
+        Dictionary mapping node IDs to subgraph IDs
     """
     node_to_subgraph = {}
     subgraph_id = 0
@@ -38,7 +55,15 @@ def _infer_subgraph_assignments(graph: ComputeGraph) -> dict[int, int]:
 
 
 def _get_connected_component(start_node: int, nodes: dict, edges: list[tuple[int, int]]) -> list[int]:
-    """Get all nodes in the same connected component."""
+    """
+    Args:
+        start_node: Starting node for traversal
+        nodes: Dictionary of graph nodes
+        edges: List of (source, target) edge tuples
+
+    Returns:
+        Sorted list of all node IDs in the connected component
+    """
     component = set()
     stack = [start_node]
 
@@ -62,12 +87,28 @@ def _get_connected_component(start_node: int, nodes: dict, edges: list[tuple[int
 def _get_counter_nodes(
     nodes: dict, edges: list[tuple[int, int]], counter: int, node_to_subgraph: dict[int, int]
 ) -> list[int]:
-    """Get all nodes belonging to a specific subgraph."""
+    """
+    Args:
+        nodes: Dictionary of graph nodes
+        edges: List of (source, target) edge tuples
+        counter: Subgraph ID to filter by
+        node_to_subgraph: Mapping of node IDs to subgraph IDs
+
+    Returns:
+        List of node IDs belonging to the specified subgraph
+    """
     return [n for n in nodes.keys() if node_to_subgraph.get(n) == counter]
 
 
 def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
-    """Convert ComputeGraph to Graphviz DOT format."""
+    """
+    Args:
+        compute_graph: ComputeGraph to convert
+        title: Title for the graph visualization
+
+    Returns:
+        DOT format string for Graphviz rendering
+    """
     nodes = compute_graph.nodes
     edges = compute_graph.edges
     input_tensors = compute_graph.input_tensors
@@ -130,8 +171,16 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     return "\n".join(lines)
 
 
-def _format_node(node_data: Any, node_id: int, input_tensors: dict[str, tuple]) -> tuple[str, str]:
-    """Format node label and color based on node type."""
+def _format_node(node_data: Any, node_id: int, input_tensors: Any) -> tuple[str, str]:
+    """
+    Args:
+        node_data: Node object
+        node_id: Node identifier
+        input_tensors: Dictionary of input tensors (unused)
+
+    Returns:
+        Tuple of (label, color) for the node
+    """
     node_type = node_data.type
 
     label = repr(node_data)
@@ -149,7 +198,13 @@ def _format_node(node_data: Any, node_id: int, input_tensors: dict[str, tuple]) 
 
 
 def save_graph(graph: ComputeGraph, output_file: str, title: str, keep_dot: bool = False) -> None:
-    """Generate DOT script and render to PNG using Graphviz."""
+    """
+    Args:
+        graph: ComputeGraph to visualize
+        output_file: Output filename (.png or .dot)
+        title: Title for the graph visualization
+        keep_dot: Whether to keep the intermediate DOT file
+    """
     import os
     import subprocess
 

@@ -2,7 +2,15 @@ from compute_graph.tensors import HBMTensor, TensorBuffer
 
 
 class Node:
+    """Base class for compute graph nodes."""
+
     def __init__(self, index: int, node_type: str, dest: TensorBuffer | HBMTensor) -> None:
+        """
+        Args:
+            index: Unique node identifier
+            node_type: Type of node ("load", "compute", or "store")
+            dest: Destination tensor (buffer or HBM)
+        """
         self.index = index
         self.type = node_type
         self.dest = dest
@@ -10,9 +18,18 @@ class Node:
 
 
 class LoadNode(Node):
+    """Node representing a load operation from HBM to SBUF."""
+
     def __init__(
         self, index: int, src: HBMTensor, dest: TensorBuffer, src_coordinates: dict[int, tuple[int, ...]]
     ) -> None:
+        """
+        Args:
+            index: Unique node identifier
+            src: Source HBM tensor
+            dest: Destination tensor buffer
+            src_coordinates: Dictionary mapping axis index to tile coordinates
+        """
         super().__init__(index=index, node_type="load", dest=dest)
         self.src = src
         self.src_coordinates = src_coordinates
@@ -31,7 +48,17 @@ class LoadNode(Node):
 
 
 class ComputeNode(Node):
+    """Node representing a compute operation on tensor buffers."""
+
     def __init__(self, index: int, op: str, src: list[TensorBuffer], dest: TensorBuffer, params: dict) -> None:
+        """
+        Args:
+            index: Unique node identifier
+            op: Operation name
+            src: List of source tensor buffers
+            dest: Destination tensor buffer
+            params: Operation-specific parameters
+        """
         super().__init__(index=index, node_type="compute", dest=dest)
         self.op = op
         self.src = src
@@ -44,9 +71,18 @@ class ComputeNode(Node):
 
 
 class StoreNode(Node):
+    """Node representing a store operation from SBUF to HBM."""
+
     def __init__(
         self, index: int, src: TensorBuffer, dest: HBMTensor, dest_coordinates: dict[int, tuple[int, ...]]
     ) -> None:
+        """
+        Args:
+            index: Unique node identifier
+            src: Source tensor buffer
+            dest: Destination HBM tensor
+            dest_coordinates: Dictionary mapping axis index to tile coordinates
+        """
         super().__init__(index=index, node_type="store", dest=dest)
         self.src = src
         self.dest_coordinates = dest_coordinates
