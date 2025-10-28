@@ -1,4 +1,16 @@
-from compute_graph.axes import Axis
+import math
+
+
+class Axis:
+    def __init__(self, size: int, tile_size: int, dependency: str) -> None:
+        self.size = size
+        self.tile_size = tile_size
+        self.num_tiles = math.ceil(size / tile_size)
+        self.dependency = dependency
+        assert dependency in ["parallel", "sequential"]
+
+    def __repr__(self) -> str:
+        return f"({self.dependency[:3]}){self.num_tiles}x{self.tile_size}={self.size}"
 
 
 class TensorCoordinate:
@@ -39,23 +51,24 @@ class HBMTensor:
 
 
 class TensorBuffer:
-    def __init__(self, name: str, hbm_coordinates: list[TensorCoordinate]) -> None:
+    def __init__(self, name: str, shape: tuple[int, ...]) -> None:
         """
         SBUF tensor with shape and name.
 
         Args:
-            name: Name of the SBUF tensor
-            shape: Shape of the SBUF tensor
+            name: Name of the HBM tensor
+            axes: size, tile size of each axis
         """
         self.name = name
-        self.hbm_coordinates = hbm_coordinates
+        self.shape = shape
 
     def __repr__(self) -> str:
-        coords_repr = ", ".join([repr(coord) for coord in self.hbm_coordinates])
-        return f"TensorBuffer({self.name}, [{coords_repr}])"
+        return f"TensorBuffer({self.name}, {self.shape})"
 
 
-def compute_num_parallel_tiles(hbm_tensors: list[HBMTensor]) -> int:
+def compute_num_parallel_tiles(
+    hbm_tensors: dict[str, tuple[int, ...]], parallel_axes: list[tuple[str, int, int]]
+) -> int:
     """
     Compute total number of parallel tiles across all HBM tensors.
 
@@ -66,8 +79,10 @@ def compute_num_parallel_tiles(hbm_tensors: list[HBMTensor]) -> int:
         Product of num_tiles for all parallel axes
     """
     num_parallel_tiles = 1
-    for tensor in hbm_tensors:
-        for axis in tensor.axes:
-            if axis.dependency == "parallel":
-                num_parallel_tiles *= axis.num_tiles
+    for parallel_axis in parallel_axes:
+        tensor_name, axis_idx, tile_size = parallel_axis
+        tensor_shape = hbm_tensors[tensor_name]
+        size = tensor_shape[axis_idx]
+        num_tiles = math.ceil(size / tile_size)
+        num_parallel_tiles *= num_tiles
     return num_parallel_tiles
