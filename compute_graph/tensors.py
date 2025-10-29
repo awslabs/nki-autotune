@@ -21,6 +21,17 @@ class Axis:
         return f"({self.dependency[:3]}){self.num_tiles}x{self.tile_size}={self.size}"
 
 
+class TileRange:
+    def __init__(self, start_tile_index: int, end_tile_index: int, stride: int) -> None:
+        self.start_tile_index = start_tile_index
+        self.end_tile_index = end_tile_index
+        self.stride = stride
+        self.num_tiles = (end_tile_index - start_tile_index) // stride
+
+    def __repr__(self) -> str:
+        return f"{self.start_tile_index}:{self.end_tile_index}:{self.stride}"
+
+
 class HBMTensor:
     """Represents a tensor stored in HBM with tiling configuration."""
 
