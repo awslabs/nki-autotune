@@ -19,12 +19,11 @@ def test_data_reuse_transformation() -> None:
 
     M = 256
     K = 999
-    N = 1024
+    N = 512
 
     lhs = Axis(M, TILE_M, "parallel"), Axis(K, TILE_K, "sequential")
     rhs = Axis(K, TILE_K, "sequential"), Axis(N, TILE_N, "parallel")
     output = Axis(M, TILE_M, "parallel"), Axis(N, TILE_N, "parallel")
-
     rmsnorm_matmul_graph = ComputeGraph(
         input_tensors={"lhs": lhs, "rhs": rhs},
         operators=[RMSNorm(src="lhs", dest="O1"), Matmul(src=["O1", "rhs"], dest="output")],

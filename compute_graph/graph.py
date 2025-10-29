@@ -1,6 +1,6 @@
-from compute_graph.nodes import ComputeNode, LoadNode, Node, StoreNode
+from compute_graph.nodes import AllocateNode, ComputeNode, LoadNode, Node, StoreNode
 from compute_graph.operators import Operator
-from compute_graph.tensors import Axis, HBMTensor, TensorBuffer
+from compute_graph.tensors import Axis, HBMTensor, TensorBuffer, TileRange
 
 
 class ComputeGraph:
@@ -60,9 +60,9 @@ class ComputeGraph:
                     num_parallel_tiles *= axis.num_tiles
         return num_parallel_tiles
 
-    def _process_parallel_axes(
+    def _linear_index_to_coordinates(
         self, parallel_index: int, tensors: dict[str, HBMTensor]
-    ) -> dict[str, dict[int, tuple[int, ...]]]:
+    ) -> dict[str, dict[int, TileRange]]:
         """
         Args:
             parallel_index: Linear counter across all parallel tiles
@@ -72,7 +72,7 @@ class ComputeGraph:
             Dictionary mapping tensor names to their axis tile coordinates
         """
         stride = self.num_parallel_tiles
-        tile_indices: dict[str, dict[int, tuple[int, ...]]] = {}
+        tile_indices: dict[str, dict[int, TileRange]] = {}
 
         for tensor_name, tensor in tensors.items():
             for axis_idx, axis in enumerate(tensor.axes):
@@ -82,7 +82,8 @@ class ComputeGraph:
 
                     if tensor_name not in tile_indices:
                         tile_indices[tensor_name] = {}
-                    tile_indices[tensor_name][axis_idx] = (tile_idx,)
+                    tile_range = TileRange(tile_idx, tile_idx + 1, 1)
+                    tile_indices[tensor_name][axis_idx] = tile_range
 
         return tile_indices
 
@@ -99,50 +100,78 @@ class ComputeGraph:
         Args:
             subgraph_index: Index of the parallel subgraph to generate
         """
-        input_tile_indices = self._process_parallel_axes(subgraph_index, self.input_tensors)
-        output_tile_indices = self._process_parallel_axes(subgraph_index, self.output_tensors)
+        input_tile_indices = self._linear_index_to_coordinates(subgraph_index, self.input_tensors)
+        output_tile_indices = self._linear_index_to_coordinates(subgraph_index, self.output_tensors)
 
         print(f"Subgraph {subgraph_index}, {input_tile_indices}, {output_tile_indices}")
-        subgraph_intermediates: dict[str, int] = {}
+        loaded_inputs: dict[str, int] = {}
         for tensor_name in self.input_tensors:
-            load_node = self._create_load_node(tensor_name, input_tile_indices[tensor_name])
-            subgraph_intermediates[tensor_name] = load_node
+            allocate_node_id = self._create_allocate_node(tensor_name, input_tile_indices[tensor_name])
+            allocated_buffer = self.nodes[allocate_node_id].dest
+            assert type(allocated_buffer) is TensorBuffer
+            load_node_id = self._create_load_node(
+                tensor_name, input_tile_indices[tensor_name], allocated_buffer, allocate_node_id
+            )
+            loaded_inputs[tensor_name] = load_node_id
+
+        print(f"loaded_inputs = {loaded_inputs}")
+        subgraph_intermediates: dict[str, int] = {}
         for operator in self.operators:
-            compute_node = self._create_compute_node(operator, subgraph_intermediates)
+            compute_node = self._create_compute_node(operator, loaded_inputs, subgraph_intermediates)
             subgraph_intermediates[operator.dest] = compute_node
         for tensor_name in self.output_tensors:
             self._create_store_node(tensor_name, output_tile_indices[tensor_name], subgraph_intermediates)
         print()
 
-    def _create_load_node(self, tensor_name: str, tile_indices: dict[int, tuple[int, ...]]) -> int:
+    def _create_allocate_node(self, tensor_name: str, tile_indices: dict[int, TileRange]) -> int:
+        """
+        Args:
+            tensor_name: Name of the HBM tensor to allocate buffer for
+            tile_indices: Tile coordinates for all parallel axes
+
+        Returns:
+            Tuple of (node ID, allocated TensorBuffer)
+        """
+        hbm_tensor = self.input_tensors[tensor_name]
+        buffer_shape = []
+        for axis_idx, axis in enumerate(hbm_tensor.axes):
+            if axis.dependency == "parallel":
+                tile_range = tile_indices[axis_idx]
+                buffer_shape.append(axis.tile_size * tile_range.num_tiles)
+            else:
+                buffer_shape.append(axis.size)
+
+        buffer_name = self._get_intermediate_name(basename=tensor_name)
+        node_id = len(self.nodes)
+        allocate_node = AllocateNode(index=node_id, shape=tuple(buffer_shape), dest_name=buffer_name)
+        print(allocate_node)
+        self.nodes[node_id] = allocate_node
+        return node_id
+
+    def _create_load_node(
+        self, tensor_name: str, tile_indices: dict[int, TileRange], dest_buffer: TensorBuffer, allocate_node_id: int
+    ) -> int:
         """
         Args:
             tensor_name: Name of the HBM tensor to load
             tile_indices: Tile coordinates for all parallel axes
+            dest_buffer: Pre-allocated destination buffer
+            allocate_node_id: Node ID of the corresponding allocate node
 
         Returns:
             Node ID of the created load node
         """
         hbm_tensor = self.input_tensors[tensor_name]
-
-        buffer_shape = []
-        for axis_idx, axis in enumerate(hbm_tensor.axes):
-            if axis.dependency == "parallel":
-                tiles = tile_indices[axis_idx]
-                buffer_shape.append(axis.tile_size * len(tiles))
-            else:
-                buffer_shape.append(axis.size)
-
-        buffer_name = self._get_intermediate_name(basename=tensor_name)
-        dest_tensor = TensorBuffer(name=buffer_name, shape=tuple(buffer_shape))
-
         node_id = len(self.nodes)
-        load_node = LoadNode(index=node_id, src=hbm_tensor, dest=dest_tensor, src_coordinates=tile_indices)
+        load_node = LoadNode(index=node_id, src=hbm_tensor, dest=dest_buffer, src_coordinates=tile_indices)
         print(load_node)
         self.nodes[node_id] = load_node
+        self.edges.append((allocate_node_id, node_id))
         return node_id
 
-    def _create_compute_node(self, operator: Operator, subgraph_intermediates: dict[str, int]) -> int:
+    def _create_compute_node(
+        self, operator: Operator, loaded_inputs: dict[str, int], intermediates: dict[str, int]
+    ) -> int:
         """
         Args:
             operator: Operator to create compute node for
@@ -151,55 +180,68 @@ class ComputeGraph:
         Returns:
             Node ID of the created compute node
         """
-        node_id = len(self.nodes)
         dest_name = self._get_intermediate_name(basename=operator.dest)
+        assert dest_name not in intermediates, f"{operator} intermediate {dest_name} already exists in the subgraph"
         src_buffers: list[TensorBuffer] = []
-        src_shapes = {}
+        src_shapes: dict[str, tuple[int, ...]] = {}
+        src_node_ids: list[int] = []
         for src_name in operator.src:
-            subgraph_src_node = self.nodes[subgraph_intermediates[src_name]]
+            if src_name in intermediates:
+                src_node_id = intermediates[src_name]
+            elif src_name in loaded_inputs:
+                src_node_id = loaded_inputs[src_name]
+            else:
+                raise ValueError(f"Source tensor {src_name} not found in subgraph")
+            src_node_ids.append(src_node_id)
+            subgraph_src_node = self.nodes[src_node_id]
             assert type(subgraph_src_node.dest) == TensorBuffer
             src_buffers.append(subgraph_src_node.dest)
             src_shapes[src_name] = subgraph_src_node.dest.shape
         output_shape = operator.forward(src_shapes=src_shapes)
-        dest_tensor = TensorBuffer(name=dest_name, shape=output_shape)
+
+        allocate_node_id = len(self.nodes)
+        allocate_node = AllocateNode(index=allocate_node_id, shape=output_shape, dest_name=dest_name)
+        print(allocate_node)
+        self.nodes[allocate_node_id] = allocate_node
+
+        dest_tensor = allocate_node.dest
+        compute_node_id = len(self.nodes)
+        assert type(dest_tensor) is TensorBuffer
         compute_node = ComputeNode(
-            index=node_id, op=operator.op, src=src_buffers, dest=dest_tensor, params=operator.params
+            index=compute_node_id, op=operator.op, src=src_buffers, dest=dest_tensor, params=operator.params
         )
         print(compute_node)
-        self.nodes[node_id] = compute_node
+        self.nodes[compute_node_id] = compute_node
 
-        for src_name in operator.src:
-            src_node_id = subgraph_intermediates[src_name]
-            self.edges.append((src_node_id, node_id))
+        self.edges.append((allocate_node_id, compute_node_id))
+        for src_node_id in src_node_ids:
+            self.edges.append((src_node_id, compute_node_id))
 
-        return node_id
+        return compute_node_id
 
     def _create_store_node(
-        self, tensor_name: str, tile_indices: dict[int, tuple[int, ...]], subgraph_intermediates: dict[str, int]
+        self, output_tensor_name: str, output_tile_indices: dict[int, TileRange], intermediates: dict[str, int]
     ) -> int:
         """
         Args:
             tensor_name: Name of the HBM tensor to store to
             tile_indices: Tile coordinates for all parallel axes
-            subgraph_intermediates: Mapping of tensor names to node IDs
+            intermediates: Mapping of tensor names to node IDs
 
         Returns:
             Node ID of the created store node
         """
-        hbm_tensor = self.output_tensors[tensor_name]
+        hbm_tensor = self.output_tensors[output_tensor_name]
 
-        src_node = self.nodes[subgraph_intermediates[tensor_name]]
+        src_node_id = intermediates[output_tensor_name]
+        src_node = self.nodes[src_node_id]
         assert type(src_node.dest) == TensorBuffer
-        src_buffer = src_node.dest
 
         node_id = len(self.nodes)
-        store_node = StoreNode(index=node_id, src=src_buffer, dest=hbm_tensor, dest_coordinates=tile_indices)
+        store_node = StoreNode(index=node_id, src=src_node.dest, dest=hbm_tensor, dest_coordinates=output_tile_indices)
         print(store_node)
         self.nodes[node_id] = store_node
-
-        src_node_id = subgraph_intermediates[tensor_name]
         self.edges.append((src_node_id, node_id))
-
         return node_id
 
     def _get_intermediate_name(self, basename: str) -> str:
