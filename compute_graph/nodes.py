@@ -60,12 +60,12 @@ class LoadNode(Node):
 class ComputeNode(Node):
     """Node representing a compute operation on tensor buffers."""
 
-    def __init__(self, index: int, op: str, src: list[TensorBuffer], dest: TensorBuffer, params: dict) -> None:
+    def __init__(self, index: int, op: str, src: dict[str, TensorBuffer], dest: TensorBuffer, params: dict) -> None:
         """
         Args:
             index: Unique node identifier
             op: Operation name
-            src: List of source tensor buffers
+            src: Dict of source tensor buffers
             dest: Destination tensor buffer
             params: Operation-specific parameters
         """
@@ -75,7 +75,7 @@ class ComputeNode(Node):
         self.params = params
 
     def __repr__(self) -> str:
-        src_str = ", ".join([str(buf) for buf in self.src])
+        src_str = ", ".join([str(buf) for buf in self.src.values()])
         params_str = f", params={self.params}" if self.params else ""
         return f"{self.index}:compute({self.op}: [{src_str}] -> {self.dest}{params_str})"
 
