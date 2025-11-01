@@ -9,13 +9,13 @@ class Axis:
         Args:
             size: Total size of the axis
             tile_size: Size of each tile along this axis
-            dependency: Either "parallel" or "sequential"
+            dependency: Either "parallel" or "reduction"
         """
         self.size = size
         self.tile_size = tile_size
         self.num_tiles = math.ceil(size / tile_size)
         self.dependency = dependency
-        assert dependency in ["parallel", "sequential"]
+        assert dependency in ["parallel", "reduction"]
 
     def __repr__(self) -> str:
         return f"({self.dependency[:3]}){self.num_tiles}x{self.tile_size}={self.size}"
@@ -35,7 +35,7 @@ class TileRange:
 class HBMTensor:
     """Represents a tensor stored in HBM with tiling configuration."""
 
-    def __init__(self, name: str, axes: list[Axis]) -> None:
+    def __init__(self, name: str, axes: tuple[Axis, ...]) -> None:
         """
         Args:
             name: Name of the HBM tensor
