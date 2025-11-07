@@ -84,6 +84,8 @@ class ComputeGraph:
             print(f"Subgraph {subgraph_index}, {input_tile_indices}, {output_tile_indices}")
             for operator in self.operators:
                 self._create_operator(operator, local_intermediates, input_tile_indices)
+            for output_name in self.output_tensors:
+                self._create_store_node(output_name, output_tile_indices[output_name], local_intermediates)
             print()
 
     def _create_operator(
