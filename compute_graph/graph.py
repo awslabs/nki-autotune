@@ -77,79 +77,91 @@ class ComputeGraph:
         self.nodes: dict[int, Node] = {}
         self.edges: list[tuple[int, int]] = []
         self.global_intermediates: dict[str, int] = {}
-        for parallel_counter in range(self.num_parallel_tiles):
-            self._generate_subgraph(parallel_counter)
+        for subgraph_index in range(self.num_parallel_tiles):
+            input_tile_indices = self._linear_index_to_coordinates(subgraph_index, self.input_tensors)
+            output_tile_indices = self._linear_index_to_coordinates(subgraph_index, self.output_tensors)
+            local_intermediates: dict[str, int] = {}
+            print(f"Subgraph {subgraph_index}, {input_tile_indices}, {output_tile_indices}")
+            for operator in self.operators:
+                self._create_operator(operator, local_intermediates, input_tile_indices)
+            print()
 
-    def _generate_subgraph(self, subgraph_index: int) -> None:
-        """
-        Args:
-            subgraph_index: Index of the parallel subgraph to generate
-        """
-        input_tile_indices = self._linear_index_to_coordinates(subgraph_index, self.input_tensors)
-        output_tile_indices = self._linear_index_to_coordinates(subgraph_index, self.output_tensors)
-        local_intermediates: dict[str, int] = {}
+    def _create_operator(
+        self,
+        operator: Operator,
+        local_intermediates: dict[str, int],
+        input_tile_indices: dict[str, dict[int, TileRange]],
+    ):
+        operator_srcs: dict[str, int] = {}
+        for src in operator.src:
+            operator_srcs[src] = self._resolve_operator_source(src, local_intermediates, input_tile_indices)
+        src_shapes = self._extract_source_shapes(operator_srcs)
+        dest_buffer_node_id = self._ensure_operator_destination(operator, local_intermediates, src_shapes)
+        compute_node_id = self._create_compute_node(operator, operator_srcs, dest_buffer_node_id, local_intermediates)
+        self._connect_operator_edges(operator_srcs, compute_node_id, dest_buffer_node_id)
 
-        print(f"Subgraph {subgraph_index}, {input_tile_indices}, {output_tile_indices}")
-        for operator in self.operators:
-            operator_srcs: dict[str, int] = {}
-            for src in operator.src:
-                if src in self.input_tensors:
-                    allocate_node_id = self._create_allocate_node(src, input_tile_indices[src])
-                    allocated_buffer = self.nodes[allocate_node_id].dest
-                    assert type(allocated_buffer) is TensorBuffer
-                    load_node_id = self._create_load_node(src, input_tile_indices[src], allocated_buffer)
-                    self.edges.append((allocate_node_id, load_node_id))
-                    operator_srcs[src] = load_node_id
-                elif src in local_intermediates:
-                    parent_compute_node = local_intermediates[src]
-                    operator_srcs[src] = parent_compute_node
-                else:
-                    raise ValueError(f"Unknown source tensor {src}. Check ComputeGraph definition.")
-            if operator.dest not in local_intermediates:
-                buffer_name = self._get_intermediate_name(basename=operator.dest)
-                src_shapes: dict[str, tuple[int, ...]] = {}
-                for src in operator_srcs:
-                    node_id = operator_srcs[src]
-                    buffer = self.nodes[node_id].dest
-                    assert type(buffer) is TensorBuffer
-                    src_shapes[src] = buffer.shape
-                dest_shape = operator.forward(src_shapes)
-                node_id = len(self.nodes)
-                allocate_dest_node = AllocateNode(index=node_id, shape=tuple(dest_shape), dest_name=buffer_name)
-                print(allocate_dest_node)
-                self.nodes[node_id] = allocate_dest_node
-                operator_dest_node_id = node_id
-            else:
-                operator_dest_node_id = local_intermediates[operator.dest]
-            compute_node_id = self._create_compute_node(operator, operator_srcs, operator_dest_node_id)
-            local_intermediates[operator.dest] = compute_node_id
-            for src in operator_srcs:
-                node_id = operator_srcs[src]
-                self.edges.append((node_id, compute_node_id))
-            self.edges.append((operator_dest_node_id, compute_node_id))
-        print()
+    def _resolve_operator_source(
+        self, src_name: str, local_intermediates: dict[str, int], input_tile_indices: dict[str, dict[int, TileRange]]
+    ) -> int:
+        """Returns node ID for the given source tensor."""
+        if src_name in self.input_tensors:
+            src_node_id = self._create_input_tensor_node(src_name, input_tile_indices)
+        elif src_name in local_intermediates:
+            src_node_id = local_intermediates[src_name]
+        else:
+            raise ValueError(f"Unknown source tensor {src_name}")
+        return src_node_id
 
-    def _create_allocate_node(self, tensor_name: str, tile_indices: dict[int, TileRange]) -> int:
-        """
-        Args:
-            tensor_name: Name of the HBM tensor to allocate buffer for
-            tile_indices: Tile coordinates for all parallel axes
+    def _extract_source_shapes(self, operator_srcs: dict[str, int]) -> dict[str, tuple[int, ...]]:
+        """Extract shapes from resolved source nodes."""
+        src_shapes = {}
+        for src_name, node_id in operator_srcs.items():
+            buffer = self.nodes[node_id].dest
+            assert type(buffer) is TensorBuffer
+            src_shapes[src_name] = buffer.shape
+        return src_shapes
 
-        Returns:
-            Tuple of (node ID, allocated TensorBuffer)
-        """
+    def _ensure_operator_destination(
+        self, operator: Operator, local_intermediates: dict[str, int], src_shapes: dict[str, tuple[int, ...]]
+    ) -> int:
+        """Ensures destination buffer exists, returns node ID (AllocateNode for new buffer, or ComputeNode if reusing)."""
+        if operator.dest in local_intermediates:
+            dest_buffer_node_id = local_intermediates[operator.dest]
+        else:
+            dest_shape = operator.forward(src_shapes)
+            buffer_name = self._get_intermediate_name(basename=operator.dest)
+            dest_buffer_node_id = self._create_allocate_node(buffer_name, dest_shape)
+        return dest_buffer_node_id
+
+    def _connect_operator_edges(self, operator_srcs: dict[str, int], compute_node_id: int, dest_buffer_node_id: int):
+        """Create edges from sources and destination buffer node to compute node."""
+        for node_id in operator_srcs.values():
+            self.edges.append((node_id, compute_node_id))
+        self.edges.append((dest_buffer_node_id, compute_node_id))
+
+    def _create_input_tensor_node(self, tensor_name: str, tile_indices: dict[str, dict[int, TileRange]]) -> int:
+        """Creates allocate and load nodes for input tensor, returns load node ID."""
         hbm_tensor = self.input_tensors[tensor_name]
         buffer_shape = []
         for axis_idx, axis in enumerate(hbm_tensor.axes):
             if axis.dependency == "parallel":
-                tile_range = tile_indices[axis_idx]
+                tile_range = tile_indices[tensor_name][axis_idx]
                 buffer_shape.append(axis.tile_size * tile_range.num_tiles)
             else:
                 buffer_shape.append(axis.size)
 
         buffer_name = self._get_intermediate_name(basename=tensor_name)
+        allocate_node_id = self._create_allocate_node(buffer_name, tuple(buffer_shape))
+        allocated_buffer = self.nodes[allocate_node_id].dest
+        assert type(allocated_buffer) is TensorBuffer
+        load_node_id = self._create_load_node(tensor_name, tile_indices[tensor_name], allocated_buffer)
+        self.edges.append((allocate_node_id, load_node_id))
+        return load_node_id
+
+    def _create_allocate_node(self, buffer_name: str, shape: tuple[int, ...]) -> int:
+        """Creates and registers an AllocateNode, returns its node ID."""
         node_id = len(self.nodes)
-        allocate_node = AllocateNode(index=node_id, shape=tuple(buffer_shape), dest_name=buffer_name)
+        allocate_node = AllocateNode(index=node_id, shape=shape, dest_name=buffer_name)
         print(allocate_node)
         self.nodes[node_id] = allocate_node
         return node_id
@@ -172,11 +184,15 @@ class ComputeGraph:
         self.nodes[node_id] = load_node
         return node_id
 
-    def _create_compute_node(self, operator: Operator, sources: dict[str, int], dest: int) -> int:
+    def _create_compute_node(
+        self, operator: Operator, sources: dict[str, int], dest: int, local_intermediates: dict[str, int]
+    ) -> int:
         """
         Args:
             operator: Operator to create compute node for
             sources: List of source TensorBuffers
+            dest: Destination buffer node ID
+            local_intermediates: Dictionary to register the compute node as producer
 
         Returns:
             Node ID of the created compute node
@@ -195,6 +211,7 @@ class ComputeGraph:
         )
         self.nodes[node_id] = compute_node
         print(compute_node)
+        local_intermediates[operator.dest] = node_id
         return node_id
 
     def _create_store_node(
