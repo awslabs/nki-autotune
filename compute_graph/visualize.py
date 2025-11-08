@@ -1,6 +1,7 @@
 from typing import Any
 
 from compute_graph.graph import ComputeGraph
+from compute_graph.nodes import AllocateNode, ComputeNode, LoadNode, StoreNode
 
 
 def _get_successors(node_id: int, edges: list[tuple[int, int]]) -> list[int]:
@@ -181,16 +182,16 @@ def _format_node(node_data: Any, node_id: int, input_tensors: Any) -> tuple[str,
     Returns:
         Tuple of (label, color) for the node
     """
-    node_type = node_data.type
-
     label = repr(node_data)
 
-    if node_type == "load":
+    if isinstance(node_data, LoadNode):
         color = "#FFEAA7"
-    elif node_type == "compute":
+    elif isinstance(node_data, ComputeNode):
         color = "#A8D8EA"
-    elif node_type == "store":
+    elif isinstance(node_data, StoreNode):
         color = "#A8E6CF"
+    elif isinstance(node_data, AllocateNode):
+        color = "#E8E8E8"
     else:
         color = "#E8E8E8"
 
