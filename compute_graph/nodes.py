@@ -4,16 +4,13 @@ from compute_graph.tensors import HBMTensor, TensorBuffer, TileRange
 class Node:
     """Base class for compute graph nodes."""
 
-    def __init__(self, index: int, node_type: str, dest: TensorBuffer | HBMTensor) -> None:
+    def __init__(self, index: int, dest: TensorBuffer | HBMTensor) -> None:
         """
         Args:
             index: Unique node identifier
-            node_type: Type of node ("load", "compute", or "store")
             dest: Destination tensor (buffer or HBM)
         """
-        assert node_type in ["allocate", "load", "compute", "store"], f"Invalid node type {node_type}"
         self.index = index
-        self.type = node_type
         self.dest = dest
 
     def __repr__(self) -> str:
@@ -23,7 +20,7 @@ class Node:
 class AllocateNode(Node):
     def __init__(self, index: int, shape: tuple[int, ...], dest_name: str) -> None:
         dest_buffer = TensorBuffer(name=dest_name, shape=shape)
-        super().__init__(index=index, node_type="allocate", dest=dest_buffer)
+        super().__init__(index=index, dest=dest_buffer)
 
     def __repr__(self) -> str:
         assert isinstance(self.dest, TensorBuffer)
@@ -41,7 +38,7 @@ class LoadNode(Node):
             dest: Destination tensor buffer
             src_coordinates: Dictionary mapping axis index to tile coordinates
         """
-        super().__init__(index=index, node_type="load", dest=dest)
+        super().__init__(index=index, dest=dest)
         self.src = src
         self.src_coordinates = src_coordinates
 
@@ -69,7 +66,7 @@ class ComputeNode(Node):
             dest: Destination tensor buffer
             params: Operation-specific parameters
         """
-        super().__init__(index=index, node_type="compute", dest=dest)
+        super().__init__(index=index, dest=dest)
         self.op = op
         self.src = src
         self.params = params
@@ -91,7 +88,7 @@ class StoreNode(Node):
             dest: Destination HBM tensor
             dest_coordinates: Dictionary mapping axis index to tile coordinates
         """
-        super().__init__(index=index, node_type="store", dest=dest)
+        super().__init__(index=index, dest=dest)
         self.src = src
         self.dest_coordinates = dest_coordinates
 
