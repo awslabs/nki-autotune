@@ -1,8 +1,9 @@
+import neuronxcc.nki.language as nl
 import numpy as np
 
 from compute_graph.graph import ComputeGraph
-from compute_graph.operators import ActivationReduce, TensorScalar
-from compute_graph.tensors import Axis
+from compute_graph.operators import Activation, Matmul, TensorScalar, Transpose
+from compute_graph.tensors import HBMTensor
 from compute_graph.visualize import save_graph
 
 
@@ -15,25 +16,34 @@ def test_graph_gen() -> None:
     """Test data reuse graph transformation with a single merge."""
     TILE_M = 128
     TILE_N = 512
-    TILE_K = 128
+    TILE_K = 999
 
     M = 256
     K = 999
     N = 512
 
-    lhs = Axis(M, TILE_M, "parallel"), Axis(K, TILE_K, "reduction")
-    rhs = Axis(K, TILE_K, "reduction"), Axis(N, TILE_N, "parallel")
-    sum_squares = Axis(M, TILE_M, "parallel"), Axis(1, 1, "parallel")
-    output = Axis(M, TILE_M, "parallel"), Axis(N, TILE_N, "parallel")
+    lhs = HBMTensor("lhs", (M, K), (TILE_M, TILE_K), ("parallel", "reduction"))
+    rhs = HBMTensor("rhs", (K, N), (TILE_K, TILE_N), ("reduction", "parallel"))
     epsilon = 1e-6
+
     rmsnorm_matmul_graph = ComputeGraph(
-        input_tensors={"lhs": lhs, "rhs": rhs},
         operators=[
-            ActivationReduce(op="square", src="lhs", dest="sum_squares", reduce_op="sum", reduction_axis=1),
-            TensorScalar(op="mult", src="sum_squares", dest="sum_squares", scalar=1 / K, op1="add", scalar1=epsilon),
-        ],
-        output_tensors={"sum_squares": sum_squares},
+            Activation(dest="lhs_square", op=np.square, data="lhs", reduce_op=np.add, reduce_res="lhs_sum_square"),
+            TensorScalar(
+                dest="rmsnorm_factor",
+                data="lhs_sum_square",
+                op0=np.multiply,
+                operand0=1 / K,
+                op1=np.add,
+                operand1=epsilon,
+            ),
+            Activation(dest="rmsnorm_factor", op=nl.rsqrt, data="rmsnorm_factor"),
+            TensorScalar(dest="lhs_norm", data="lhs", op0=np.multiply, operand0="rmsnorm_factor"),
+            Transpose(dest="lhs_norm", data="lhs_norm"),
+            Matmul(dest="output", stationary="lhs_norm", moving="rhs"),
+        ]
     )
+    rmsnorm_matmul_graph.specialize(inputs=[lhs, rhs], output_names=["output"])
     save_graph(rmsnorm_matmul_graph, output_file="rmsnorm_matmul.png", title="RMSNorm + Matmul ComputeGraph")
 
 

@@ -1,7 +1,6 @@
 from typing import Any
 
 from compute_graph.graph import ComputeGraph
-from compute_graph.nodes import AllocateNode, ComputeNode, LoadNode, StoreNode
 
 
 def _get_successors(node_id: int, edges: list[tuple[int, int]]) -> list[int]:
@@ -112,7 +111,6 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     """
     nodes = compute_graph.nodes
     edges = compute_graph.edges
-    input_tensors = compute_graph.input_tensors
 
     node_to_subgraph = _infer_subgraph_assignments(compute_graph)
     num_counters = max(node_to_subgraph.values()) + 1 if node_to_subgraph else 0
@@ -148,7 +146,7 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
 
         for node_id in sorted(counter_nodes):
             node_data = nodes[node_id]
-            node_label, node_color = _format_node(node_data, node_id, input_tensors)
+            node_label, node_color = _format_node(node_data, node_id)
             lines.append(f'        node_{node_id} [label="{node_label}", fillcolor="{node_color}"];')
 
         lines.append("        ")
@@ -172,25 +170,25 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     return "\n".join(lines)
 
 
-def _format_node(node_data: Any, node_id: int, input_tensors: Any) -> tuple[str, str]:
+def _format_node(node_data: Any, node_id: int) -> tuple[str, str]:
     """
     Args:
         node_data: Node object
         node_id: Node identifier
-        input_tensors: Dictionary of input tensors (unused)
 
     Returns:
         Tuple of (label, color) for the node
     """
     label = repr(node_data)
 
-    if isinstance(node_data, LoadNode):
+    node_type = node_data.node_type
+    if node_type == "load":
         color = "#FFEAA7"
-    elif isinstance(node_data, ComputeNode):
+    elif node_type == "compute":
         color = "#A8D8EA"
-    elif isinstance(node_data, StoreNode):
+    elif node_type == "store":
         color = "#A8E6CF"
-    elif isinstance(node_data, AllocateNode):
+    elif node_type == "allocate":
         color = "#E8E8E8"
     else:
         color = "#E8E8E8"
