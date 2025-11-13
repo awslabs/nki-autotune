@@ -1,106 +1,55 @@
-from compute_graph.tensors import HBMTensor, TensorBuffer, TileRange
+from neuronxcc.nki.compiler.backends.neuron.sema import NKIFunc
+
+from compute_graph.tensors import HBMTensor, TensorBuffer
 
 
 class Node:
     """Base class for compute graph nodes."""
 
-    def __init__(self, index: int, dest: TensorBuffer | HBMTensor) -> None:
+    def __init__(self, op_code: str, dest: str, **kwargs) -> None:
         """
         Args:
             index: Unique node identifier
-            dest: Destination tensor (buffer or HBM)
+            tensors: Tensors involved in the node (buffer or HBM)
         """
-        self.index = index
+        self.op_code = op_code
         self.dest = dest
+        self.tensors = {}
+        self.kwargs = kwargs
+
+    @property
+    def node_type(self) -> str:
+        if "nisa." in self.op_code:
+            node_type = "compute"
+        elif self.op_code == "nl.load":
+            node_type = "load"
+        elif self.op_code == "nl.ndarray":
+            node_type = "allocate"
+        elif self.op_code == "nl.store":
+            node_type = "store"
+        else:
+            raise ValueError(f"Unknown node type: {self.op_code}")
+        return node_type
+
+    def get_tensor_names(self) -> list[str]:
+        raise NotImplementedError(f"get_tensor_names is not implemented for {self}")
+
+    def specialize_tensor(self, tensor_name: str, tensor: HBMTensor | TensorBuffer) -> None:
+        assert tensor_name in self.get_tensor_names(), f"Tensor {tensor_name} not found in node {self}"
+        self.tensors[tensor_name] = tensor
 
     def __repr__(self) -> str:
-        raise NotImplementedError("Base Node class __repr__() is not implemented.")
-
-
-class AllocateNode(Node):
-    def __init__(self, index: int, shape: tuple[int, ...], dest_name: str) -> None:
-        dest_buffer = TensorBuffer(name=dest_name, shape=shape)
-        super().__init__(index=index, dest=dest_buffer)
-
-    def __repr__(self) -> str:
-        assert isinstance(self.dest, TensorBuffer)
-        return f"{self.index}:allocate({self.dest})"
-
-
-class LoadNode(Node):
-    """Node representing a load operation from HBM to SBUF."""
-
-    def __init__(self, index: int, src: HBMTensor, dest: TensorBuffer, src_coordinates: dict[int, TileRange]) -> None:
-        """
-        Args:
-            index: Unique node identifier
-            src: Source HBM tensor
-            dest: Destination tensor buffer
-            src_coordinates: Dictionary mapping axis index to tile coordinates
-        """
-        super().__init__(index=index, dest=dest)
-        self.src = src
-        self.src_coordinates = src_coordinates
-
-    def __repr__(self) -> str:
-        indices = []
-        for axis_idx in range(len(self.src.axes)):
-            if axis_idx in self.src_coordinates:
-                tile_range = self.src_coordinates[axis_idx]
-                indices.append(str(tile_range))
+        kwargs_strs = []
+        for k, v in self.kwargs.items():
+            if isinstance(v, NKIFunc):
+                kwargs_strs.append(f"{k}=nl.{v.__name__}")
+            elif v in self.tensors:
+                kwargs_strs.append(f"{k}={self.tensors[v]}")
             else:
-                indices.append(":")
-        index_str = ", ".join(indices)
-        return f"{self.index}:load({self.src}[{index_str}] -> {self.dest})"
-
-
-class ComputeNode(Node):
-    """Node representing a compute operation on tensor buffers."""
-
-    def __init__(self, index: int, op: str, src: dict[str, TensorBuffer], dest: TensorBuffer, params: dict) -> None:
-        """
-        Args:
-            index: Unique node identifier
-            op: Operation name
-            src: Dict of source tensor buffers
-            dest: Destination tensor buffer
-            params: Operation-specific parameters
-        """
-        super().__init__(index=index, dest=dest)
-        self.op = op
-        self.src = src
-        self.params = params
-
-    def __repr__(self) -> str:
-        src_str = ", ".join([str(buf) for buf in self.src.values()])
-        params_str = f", params={self.params}" if self.params else ""
-        return f"{self.index}:compute({self.op}: [{src_str}] -> {self.dest}{params_str})"
-
-
-class StoreNode(Node):
-    """Node representing a store operation from SBUF to HBM."""
-
-    def __init__(self, index: int, src: TensorBuffer, dest: HBMTensor, dest_coordinates: dict[int, TileRange]) -> None:
-        """
-        Args:
-            index: Unique node identifier
-            src: Source tensor buffer
-            dest: Destination HBM tensor
-            dest_coordinates: Dictionary mapping axis index to tile coordinates
-        """
-        super().__init__(index=index, dest=dest)
-        self.src = src
-        self.dest_coordinates = dest_coordinates
-
-    def __repr__(self) -> str:
-        indices = []
-        assert type(self.dest) is HBMTensor
-        for axis_idx in range(len(self.dest.axes)):
-            if axis_idx in self.dest_coordinates:
-                tile_idx = self.dest_coordinates[axis_idx]
-                indices.append(str(tile_idx))
-            else:
-                indices.append(":")
-
-        index_str = ", ".join(indices)
-        return f"{self.index}:store({self.src} -> {self.dest}[{index_str}])"
+                kwargs_strs.append(f"{k}={v}")
+        kwargs_str = f", ".join(kwargs_strs)
+        if self.dest in self.tensors:
+            dest_str = self.tensors[self.dest]
+        else:
+            dest_str = self.dest
+        return f"{dest_str} = {self.op_code}({kwargs_str})"

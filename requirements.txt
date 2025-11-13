@@ -1,9 +1,8 @@
 matplotlib
 dill
 pytest
-seaborn
 pre-commit
-neuronx-cc==2.*
+# neuronx-cc==2.*
 isort
 black
 astor
