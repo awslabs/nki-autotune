@@ -21,19 +21,6 @@ python -m build --wheel
 ```
 This will create a `.whl` file in the `dist/` directory, something like `dist/nki_autotune-0.1.0a0-py3-none-any.whl`.
 
-## Remote Development (Trainium/Inferentia)
-
-Since NKI kernels require Neuron SDK and Trainium/Inferentia hardware, you can set up a hybrid development workflow to edit code locally while running it on remote AWS instances.
-
-### Example Usage
-
-```bash
-# Run GEMM benchmark with real-time feedback
-python remote_tools/dev_run.py examples/gemm.py --mode both --cache-dir /tmp/cache
-```
-
-**For detailed setup instructions, configuration options, and troubleshooting, see [remote_tools/README.md](remote_tools/README.md)**
-
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
