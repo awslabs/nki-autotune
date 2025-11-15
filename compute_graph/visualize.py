@@ -1,6 +1,7 @@
 from typing import Any
 
 from compute_graph.graph import ComputeGraph
+from compute_graph.tensors import HBMTensor
 
 
 def _get_successors(node_id: int, edges: list[tuple[int, int]]) -> list[int]:
@@ -133,6 +134,20 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     lines.append('    fontname="Arial Bold";')
     lines.append("    ")
 
+    if hasattr(compute_graph, "hbm") and compute_graph.hbm:
+        lines.append("    subgraph cluster_hbm {")
+        lines.append('        label="HBM Inputs";')
+        lines.append('        style="rounded";')
+        lines.append('        color="#FF6B6B";')
+        lines.append("        ")
+
+        for idx, hbm_tensor in enumerate(compute_graph.hbm):
+            node_label, node_color = _format_hbm_tensor(hbm_tensor)
+            lines.append(f'        hbm_{idx} [label="{node_label}", fillcolor="{node_color}"];')
+
+        lines.append("    }")
+        lines.append("    ")
+
     for counter in range(num_counters):
         counter_nodes = _get_counter_nodes(nodes, edges, counter, node_to_subgraph)
         if not counter_nodes:
@@ -193,6 +208,19 @@ def _format_node(node_data: Any, node_id: int) -> tuple[str, str]:
     else:
         color = "#E8E8E8"
 
+    return label, color
+
+
+def _format_hbm_tensor(hbm_tensor: HBMTensor) -> tuple[str, str]:
+    """
+    Args:
+        hbm_tensor: HBMTensor object
+
+    Returns:
+        Tuple of (label, color) for the HBM tensor node
+    """
+    label = repr(hbm_tensor)
+    color = "#FFB6C1"
     return label, color
 
 

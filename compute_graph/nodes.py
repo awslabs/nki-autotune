@@ -14,7 +14,7 @@ class Node:
         """
         self.op_code = op_code
         self.dest = dest
-        self.tensors = {}
+        self.tensors: dict[str, HBMTensor | TensorBuffer] = {}
         self.kwargs = kwargs
 
     @property
@@ -31,12 +31,22 @@ class Node:
             raise ValueError(f"Unknown node type: {self.op_code}")
         return node_type
 
-    def get_tensor_names(self) -> list[str]:
-        raise NotImplementedError(f"get_tensor_names is not implemented for {self}")
+    @property
+    def tensor_names(self) -> list[str]:
+        """
+        Priority: HBM inputs, buffer inputs, outputs
+        """
+        raise NotImplementedError(f"tensor_names property is not implemented for {self}")
+
+    def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
+        raise NotImplementedError(f"infer_tensor_shape is not implemented for {self}")
 
     def specialize_tensor(self, tensor_name: str, tensor: HBMTensor | TensorBuffer) -> None:
-        assert tensor_name in self.get_tensor_names(), f"Tensor {tensor_name} not found in node {self}"
+        assert tensor_name in self.tensor_names, f"Tensor {tensor_name} not found in node {self}"
         self.tensors[tensor_name] = tensor
+
+    def clear_specialization(self) -> None:
+        self.tensors.clear()
 
     def __repr__(self) -> str:
         kwargs_strs = []

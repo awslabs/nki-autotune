@@ -2,7 +2,7 @@ import neuronxcc.nki.language as nl
 import numpy as np
 
 from compute_graph.graph import ComputeGraph
-from compute_graph.operators import Activation, Matmul, TensorScalar, Transpose
+from compute_graph.operators import Activation, Matmul, TensorScalar
 from compute_graph.tensors import HBMTensor
 from compute_graph.visualize import save_graph
 
@@ -39,7 +39,6 @@ def test_graph_gen() -> None:
             ),
             Activation(dest="rmsnorm_factor", op=nl.rsqrt, data="rmsnorm_factor"),
             TensorScalar(dest="lhs_norm", data="lhs", op0=np.multiply, operand0="rmsnorm_factor"),
-            Transpose(dest="lhs_norm", data="lhs_norm"),
             Matmul(dest="output", stationary="lhs_norm", moving="rhs"),
         ]
     )

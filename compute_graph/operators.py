@@ -10,8 +10,27 @@ class TensorScalar(Node):
     def __init__(self, dest: str, **kwargs) -> None:
         super().__init__(op_code="nisa.tensor_scalar", dest=dest, **kwargs)
 
-    def get_tensor_names(self) -> list[str]:
-        tensor_names = [self.dest, self.kwargs["data"]]
+    def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
+        data_tensor_name = self.kwargs["data"]
+        assert (
+            data_tensor_name in self.tensors
+        ), f"Data tensor {data_tensor_name} not specialized. Cannot infer tensor shapes."
+        data_tensor = self.tensors[data_tensor_name]
+        data_shape = data_tensor.shape
+        if tensor_name == self.dest:
+            tensor_shape = data_shape
+        else:
+            raise ValueError(f"Tensor name {tensor_name} not found in {self}")
+        return tensor_shape
+
+    @property
+    def tensor_names(self) -> list[str]:
+        tensor_names = [self.kwargs["data"]]
+        if isinstance(self.kwargs["operand0"], str):
+            tensor_names.append(self.kwargs["operand0"])
+        if "operand1" in self.kwargs and isinstance(self.kwargs["operand1"], str):
+            tensor_names.append(self.kwargs["operand1"])
+        tensor_names.append(self.dest)
         return tensor_names
 
 
@@ -27,10 +46,27 @@ class Activation(Node):
     def __init__(self, dest: str, **kwargs) -> None:
         super().__init__(op_code="nisa.activation", dest=dest, **kwargs)
 
-    def get_tensor_names(self) -> list[str]:
-        tensor_names = [self.dest, self.kwargs["data"]]
+    def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
+        data_tensor_name = self.kwargs["data"]
+        assert (
+            data_tensor_name in self.tensors
+        ), f"Data tensor {data_tensor_name} not specialized. Cannot infer tensor shapes."
+        data_tensor = self.tensors[data_tensor_name]
+        data_shape = data_tensor.shape
+        if tensor_name == self.kwargs["reduce_res"]:
+            tensor_shape = (*data_shape[:-1], 1)
+        elif tensor_name == self.dest:
+            tensor_shape = data_shape
+        else:
+            raise ValueError(f"Tensor name {tensor_name} not found in {self}")
+        return tensor_shape
+
+    @property
+    def tensor_names(self) -> list[str]:
+        tensor_names = [self.kwargs["data"]]
         if "reduce_res" in self.kwargs:
             tensor_names.append(self.kwargs["reduce_res"])
+        tensor_names.append(self.dest)
         return tensor_names
 
 
@@ -46,8 +82,9 @@ class Transpose(Node):
         """
         super().__init__(op_code="nisa.nc_transpose", dest=dest, **kwargs)
 
-    def get_tensor_names(self) -> list[str]:
-        tensor_names = [self.dest, self.kwargs["data"]]
+    @property
+    def tensor_names(self) -> list[str]:
+        tensor_names = [self.kwargs["data"], self.dest]
         return tensor_names
 
 
@@ -62,8 +99,29 @@ class Matmul(Node):
         """
         super().__init__(op_code="nisa.nc_matmul", dest=dest, **kwargs)
 
-    def get_tensor_names(self) -> list[str]:
-        tensor_names = [self.dest, self.kwargs["stationary"], self.kwargs["moving"]]
+    def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
+        lhs_tensor_name = self.kwargs["stationary"]
+        rhs_tensor_name = self.kwargs["moving"]
+        assert (
+            lhs_tensor_name in self.tensors
+        ), f"lhs_tensor {lhs_tensor_name} not specialized. Cannot infer tensor shapes."
+        assert (
+            rhs_tensor_name in self.tensors
+        ), f"rhs_tensor {rhs_tensor_name} not specialized. Cannot infer tensor shapes."
+        lhs_tensor = self.tensors[lhs_tensor_name]
+        rhs_tensor = self.tensors[rhs_tensor_name]
+        M, K = lhs_tensor.shape
+        _K, N = rhs_tensor.shape
+        assert K == _K, f"Matmul contraction dimension mismatch: {lhs_tensor.shape} and {rhs_tensor.shape}"
+        if tensor_name == self.dest:
+            tensor_shape = (M, N)
+        else:
+            raise ValueError(f"Tensor name {tensor_name} not found in {self}")
+        return tensor_shape
+
+    @property
+    def tensor_names(self) -> list[str]:
+        tensor_names = [self.kwargs["stationary"], self.kwargs["moving"], self.dest]
         return tensor_names
 
 
@@ -75,7 +133,8 @@ class Allocate(Node):
     def __init__(self, dest: str, **kwargs) -> None:
         super().__init__(op_code="nl.ndarray", dest=dest, **kwargs)
 
-    def get_tensor_names(self) -> list[str]:
+    @property
+    def tensor_names(self) -> list[str]:
         return [self.dest]
 
 
@@ -87,5 +146,6 @@ class Load(Node):
     def __init__(self, dest: str, **kwargs) -> None:
         super().__init__(op_code="nl.load", dest=dest, **kwargs)
 
-    def get_tensor_names(self) -> list[str]:
+    @property
+    def tensor_names(self) -> list[str]:
         return [self.dest, self.kwargs["src"]]
