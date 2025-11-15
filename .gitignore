@@ -60,6 +60,7 @@ venv.bak/
 *.swp
 *.swo
 .clinerules
+.claude
 memory-bank
 
 # macOS
