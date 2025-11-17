@@ -4,11 +4,7 @@ from compute_graph.tensors import HBMTensor, TensorBuffer
 
 
 class ComputeGraph:
-    """
-    Compute graph with allocate-load-compute-store nodes and dependency edges.
-    - Supply indices information for tensors involved in each node.
-    - Add allocate and load nodes
-    """
+    """Compute graph with allocate-load-compute-store nodes and dependency edges."""
 
     def __init__(self, operators: list[Node]) -> None:
         """
@@ -18,11 +14,11 @@ class ComputeGraph:
         self.operators = operators
 
     def specialize(self, inputs: list[HBMTensor], output_names: list[str]) -> None:
-        """
-        Specialize with given inputs
+        """Specialize graph with given input tensors and output names.
 
         Args:
-            input_tensors: Dictionary mapping tensor names to axis configurations
+            inputs: List of HBM input tensors
+            output_names: List of output tensor names
         """
         self.num_parallel_tiles = compute_num_parallel_tiles(inputs)
         self.hbm = inputs
@@ -36,10 +32,6 @@ class ComputeGraph:
             for operator in self.operators:
                 self.resolve_operator_tensors(subgraph_index, operator, subgraph_hbm, subgraph_buffer)
             print(subgraph_buffer)
-            #         self._create_compute_node(operator, local_intermediates)
-            #     # self._create_operator_outputs(operator, local_intermediates)
-            #     # for output_name in self.output_tensors:
-            #     #     self._create_store_node(output_name, output_tile_indices[output_name], local_intermediates)
             print()
 
     def __repr__(self) -> str:
@@ -51,15 +43,24 @@ class ComputeGraph:
 
     def resolve_operator_tensors(
         self, subgraph_index: int, operator: Node, hbm: list[HBMTensor], buffer: dict[str, int]
-    ):
+    ) -> None:
+        """Resolve and specialize all tensors for an operator in a subgraph.
+
+        Args:
+            subgraph_index: Index of the current parallel subgraph
+            operator: Operator node to resolve tensors for
+            hbm: List of sharded HBM tensors for this subgraph
+            buffer: Mapping of tensor names to source node IDs
+        """
         operator.clear_specialization()
         print(operator)
         hbm_tensor_lookup = {hbm_tensor.name: hbm_tensor for hbm_tensor in hbm}
         for tensor_name in operator.tensor_names:
-            print(f"Resolve tensor {tensor_name}")
             if tensor_name in buffer:
+                print(f"Access {tensor_name} from buffer")
                 source_node_id = buffer[tensor_name]
             elif tensor_name in hbm_tensor_lookup:
+                print(f"Load {tensor_name} from HBM")
                 hbm_tensor = hbm_tensor_lookup[tensor_name]
                 allocate_node_id = self._create_allocate_node(
                     buffer_name=f"{tensor_name}_{subgraph_index}", shape=hbm_tensor.shape
@@ -70,6 +71,7 @@ class ComputeGraph:
                 self.edges.append((allocate_node_id, load_node_id))
                 source_node_id = load_node_id
             else:
+                print(f"Allocate {tensor_name} in buffer")
                 tensor_shape = operator.infer_tensor_shape(tensor_name)
                 source_node_id = self._create_allocate_node(
                     buffer_name=f"{tensor_name}_{subgraph_index}", shape=tensor_shape
@@ -81,7 +83,15 @@ class ComputeGraph:
         print()
 
     def _create_allocate_node(self, buffer_name: str, shape: tuple[int, ...]) -> int:
-        """Creates and registers an AllocateNode, returns its node ID."""
+        """Creates and registers an Allocate node, returns its node ID.
+
+        Args:
+            buffer_name: Name for the allocated buffer
+            shape: Shape of the tensor buffer to allocate
+
+        Returns:
+            Node ID of the created allocate node
+        """
         node_id = len(self.nodes)
         allocate_node = Allocate(dest=buffer_name, shape=shape)
         allocate_node.specialize_tensor(buffer_name, TensorBuffer(buffer_name, shape))
@@ -90,6 +100,15 @@ class ComputeGraph:
         return node_id
 
     def _create_load_node(self, hbm_tensor: HBMTensor, allocate_node: Allocate) -> int:
+        """Creates and registers a Load node, returns its node ID.
+
+        Args:
+            hbm_tensor: Source HBM tensor to load from
+            allocate_node: Target allocate node for the loaded data
+
+        Returns:
+            Node ID of the created load node
+        """
         node_id = len(self.nodes)
         load_node = Load(dest=allocate_node.dest, src=hbm_tensor.name)
         load_node.specialize_tensor(hbm_tensor.name, hbm_tensor)
@@ -98,90 +117,12 @@ class ComputeGraph:
         self.nodes[node_id] = load_node
         return node_id
 
-    def _create_compute_node(self, operator: Node, local_intermediates: dict[str, int]) -> int:
-        """
-        Args:
-            operator: Operator to create compute node for
-            local_intermediates: Dictionary to register the compute node as producer
-
-        Returns:
-            Node ID of the created compute node
-        """
-        print(operator)
-        for tensor_name in operator.get_tensor_names():
-            if tensor_name in local_intermediates:
-                node_id = local_intermediates[tensor_name]
-                node = self.nodes[node_id]
-                print(node.tensors)
-                # operator.specialize_tensor(tensor_name, self.nodes[node_id].dest)
-        # input_buffers: dict[str, TensorBuffer] = {}
-        # for node_id in input_node_ids:
-        #     buffer = self.nodes[node_id].dest
-        #     assert type(buffer) is TensorBuffer
-        #     input_buffers[operator.input_tensor_names[node_id]] = buffer
-        # dest_buffer = self.nodes[dest].dest
-        # assert type(dest_buffer) is TensorBuffer
-        # node_id = len(self.nodes)
-        # compute_node = ComputeNode(
-        #     index=node_id, operator=operator, input_tensors=src_buffers, output_tensors=dest_buffer
-        # )
-        # self.nodes[node_id] = compute_node
-        # print(compute_node)
-        # local_intermediates[operator.dest] = node_id
-        # return node_id
-
-    def _create_operator_outputs(self, operator, local_intermediates: dict[str, int]):
-        for tensor_name in operator.output_tensors:
-            if tensor_name in self.output_tensors:
-                raise Exception
-            elif tensor_name in local_intermediates:
-                node_id = local_intermediates[tensor_name]
-            else:
-                raise ValueError(f"Tensor '{tensor_name}' does not exist")
-            local_intermediates[tensor_name] = node_id
-
-    def _create_store_node(self, output_tensor_name: str, output_tile_indices, intermediates: dict[str, int]) -> int:
-        """
-        Args:
-            tensor_name: Name of the HBM tensor to store to
-            tile_indices: Tile coordinates for all parallel axes
-            intermediates: Mapping of tensor names to node IDs
-
-        Returns:
-            Node ID of the created store node
-        """
-        hbm_tensor = self.output_tensors[output_tensor_name]
-
-        src_node_id = intermediates[output_tensor_name]
-        src_node = self.nodes[src_node_id]
-        assert type(src_node.dest) == TensorBuffer
-
-        node_id = len(self.nodes)
-        store_node = StoreNode(index=node_id, src=src_node.dest, dest=hbm_tensor, dest_coordinates=output_tile_indices)
-        print(store_node)
-        self.nodes[node_id] = store_node
-        self.edges.append((src_node_id, node_id))
-        return node_id
-
-    def _get_intermediate_name(self, basename: str) -> str:
-        """
-        Args:
-            basename: Base name for the intermediate tensor
-
-        Returns:
-            Unique name with counter suffix
-        """
-        if basename in self.buffer_name_counter:
-            self.buffer_name_counter[basename] += 1
-        else:
-            self.buffer_name_counter[basename] = 0
-        return f"{basename}_{self.buffer_name_counter[basename]}"
-
 
 def compute_num_parallel_tiles(tensors: list[HBMTensor]) -> int:
-    """
+    """Compute total number of parallel tiles across all tensor axes.
+
     Args:
-        tensors: Dictionary of HBM tensors
+        tensors: List of HBM tensors
 
     Returns:
         Product of num_tiles for all parallel axes across tensors
@@ -195,6 +136,16 @@ def compute_num_parallel_tiles(tensors: list[HBMTensor]) -> int:
 
 
 def shard_tensors(parallel_index: int, parallel_size: int, tensors: list[HBMTensor]) -> list[HBMTensor]:
+    """Shard tensors for a specific parallel tile index.
+
+    Args:
+        parallel_index: Index of the current parallel tile
+        parallel_size: Total number of parallel tiles
+        tensors: List of HBM tensors to shard
+
+    Returns:
+        List of sharded HBM tensors with updated tile indices
+    """
     stride = parallel_size
     sharded_tensors: list[HBMTensor] = []
     for tensor in tensors:
