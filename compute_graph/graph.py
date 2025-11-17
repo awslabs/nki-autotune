@@ -94,6 +94,8 @@ class ComputeGraph:
         self.nodes[node_id] = operator_copy
         for source_node_id in source_node_ids:
             self.edges.append((source_node_id, node_id))
+        for tensor_name in operator_copy.write_tensor_names:
+            buffer[tensor_name] = node_id
         return node_id
 
     def _create_allocate_node(self, buffer_name: str, shape: tuple[int, ...]) -> int:

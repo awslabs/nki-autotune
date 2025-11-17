@@ -24,14 +24,17 @@ class TensorScalar(Node):
         return tensor_shape
 
     @property
-    def tensor_names(self) -> list[str]:
+    def read_tensor_names(self) -> list[str]:
         tensor_names = [self.kwargs["data"]]
         if isinstance(self.kwargs["operand0"], str):
             tensor_names.append(self.kwargs["operand0"])
         if "operand1" in self.kwargs and isinstance(self.kwargs["operand1"], str):
             tensor_names.append(self.kwargs["operand1"])
-        tensor_names.append(self.dest)
         return tensor_names
+
+    @property
+    def write_tensor_names(self) -> list[str]:
+        return [self.dest]
 
 
 class Activation(Node):
@@ -62,12 +65,15 @@ class Activation(Node):
         return tensor_shape
 
     @property
-    def tensor_names(self) -> list[str]:
-        tensor_names = [self.kwargs["data"]]
+    def read_tensor_names(self) -> list[str]:
+        return [self.kwargs["data"]]
+
+    @property
+    def write_tensor_names(self) -> list[str]:
+        write_names = [self.dest]
         if "reduce_res" in self.kwargs:
-            tensor_names.append(self.kwargs["reduce_res"])
-        tensor_names.append(self.dest)
-        return tensor_names
+            write_names.append(self.kwargs["reduce_res"])
+        return write_names
 
 
 class Transpose(Node):
@@ -83,9 +89,12 @@ class Transpose(Node):
         super().__init__(op_code="nisa.nc_transpose", dest=dest, **kwargs)
 
     @property
-    def tensor_names(self) -> list[str]:
-        tensor_names = [self.kwargs["data"], self.dest]
-        return tensor_names
+    def read_tensor_names(self) -> list[str]:
+        return [self.kwargs["data"]]
+
+    @property
+    def write_tensor_names(self) -> list[str]:
+        return [self.dest]
 
 
 class Matmul(Node):
@@ -120,9 +129,12 @@ class Matmul(Node):
         return tensor_shape
 
     @property
-    def tensor_names(self) -> list[str]:
-        tensor_names = [self.kwargs["stationary"], self.kwargs["moving"], self.dest]
-        return tensor_names
+    def read_tensor_names(self) -> list[str]:
+        return [self.kwargs["stationary"], self.kwargs["moving"]]
+
+    @property
+    def write_tensor_names(self) -> list[str]:
+        return [self.dest]
 
 
 class Allocate(Node):
@@ -134,7 +146,11 @@ class Allocate(Node):
         super().__init__(op_code="nl.ndarray", dest=dest, **kwargs)
 
     @property
-    def tensor_names(self) -> list[str]:
+    def read_tensor_names(self) -> list[str]:
+        return []
+
+    @property
+    def write_tensor_names(self) -> list[str]:
         return [self.dest]
 
 
@@ -147,5 +163,9 @@ class Load(Node):
         super().__init__(op_code="nl.load", dest=dest, **kwargs)
 
     @property
-    def tensor_names(self) -> list[str]:
-        return [self.dest, self.kwargs["src"]]
+    def read_tensor_names(self) -> list[str]:
+        return [self.kwargs["src"]]
+
+    @property
+    def write_tensor_names(self) -> list[str]:
+        return [self.dest]
