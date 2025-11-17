@@ -1,3 +1,5 @@
+import copy
+
 from compute_graph.nodes import Node
 from compute_graph.operators import Allocate, Load
 from compute_graph.tensors import HBMTensor, TensorBuffer
@@ -30,8 +32,9 @@ class ComputeGraph:
             subgraph_buffer: dict[str, int] = {}  # Track the latest tensor
             subgraph_hbm = shard_tensors(subgraph_index, self.num_parallel_tiles, inputs)
             for operator in self.operators:
-                self.resolve_operator_tensors(subgraph_index, operator, subgraph_hbm, subgraph_buffer)
-            print(subgraph_buffer)
+                source_node_ids = self.resolve_operator_tensors(subgraph_index, operator, subgraph_hbm, subgraph_buffer)
+                self._create_compute_node(source_node_ids, operator, subgraph_buffer)
+                print()
             print()
 
     def __repr__(self) -> str:
@@ -43,7 +46,7 @@ class ComputeGraph:
 
     def resolve_operator_tensors(
         self, subgraph_index: int, operator: Node, hbm: list[HBMTensor], buffer: dict[str, int]
-    ) -> None:
+    ) -> list[int]:
         """Resolve and specialize all tensors for an operator in a subgraph.
 
         Args:
@@ -55,6 +58,7 @@ class ComputeGraph:
         operator.clear_specialization()
         print(operator)
         hbm_tensor_lookup = {hbm_tensor.name: hbm_tensor for hbm_tensor in hbm}
+        source_node_ids: list[int] = []
         for tensor_name in operator.tensor_names:
             if tensor_name in buffer:
                 print(f"Access {tensor_name} from buffer")
@@ -79,8 +83,18 @@ class ComputeGraph:
             buffer[tensor_name] = source_node_id
             source_node = self.nodes[source_node_id]
             operator.specialize_tensor(tensor_name, source_node.tensors[source_node.dest])
-        print(operator)
-        print()
+            source_node_ids.append(source_node_id)
+        return source_node_ids
+
+    def _create_compute_node(self, source_node_ids: list[int], operator: Node, buffer: dict[str, int]) -> int:
+        assert operator.is_specialized, f"{operator} is not yet fully specialized"
+        operator_copy = copy.deepcopy(operator)
+        node_id = len(self.nodes)
+        print(operator_copy, operator_copy.tensor_names)
+        self.nodes[node_id] = operator_copy
+        for source_node_id in source_node_ids:
+            self.edges.append((source_node_id, node_id))
+        return node_id
 
     def _create_allocate_node(self, buffer_name: str, shape: tuple[int, ...]) -> int:
         """Creates and registers an Allocate node, returns its node ID.

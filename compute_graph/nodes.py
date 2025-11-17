@@ -38,6 +38,15 @@ class Node:
         """
         raise NotImplementedError(f"tensor_names property is not implemented for {self}")
 
+    @property
+    def is_specialized(self) -> bool:
+        specialized = True
+        for tensor_name in self.tensor_names:
+            if tensor_name not in self.tensors:
+                specialized = False
+                break
+        return specialized
+
     def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
         raise NotImplementedError(f"infer_tensor_shape is not implemented for {self}")
 
