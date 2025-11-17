@@ -32,11 +32,19 @@ class Node:
         return node_type
 
     @property
+    def read_tensor_names(self) -> list[str]:
+        """Input tensors read by this node."""
+        raise NotImplementedError(f"read_tensor_names property is not implemented for {self}")
+
+    @property
+    def write_tensor_names(self) -> list[str]:
+        """Output tensors written by this node."""
+        raise NotImplementedError(f"write_tensor_names property is not implemented for {self}")
+
+    @property
     def tensor_names(self) -> list[str]:
-        """
-        Priority: HBM inputs, buffer inputs, outputs
-        """
-        raise NotImplementedError(f"tensor_names property is not implemented for {self}")
+        """All tensors accessed by this node (read + write)."""
+        return self.read_tensor_names + self.write_tensor_names
 
     @property
     def is_specialized(self) -> bool:
