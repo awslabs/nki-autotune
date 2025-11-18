@@ -17,9 +17,8 @@ from autotune.gemm import GEMMCorrectness, sample_gemm_configs
 def generate_shapes() -> list[tuple[int, int, int]]:
     """Generate (M, N, K) shape tuples for GEMM benchmarking."""
     shapes = []
-    for size in range(512, 1024 * 10 + 1, 512):
+    for size in range(512, 1024 + 1, 512):
         shapes.append((size, size, size))
-        break
     return shapes
 
 
@@ -50,8 +49,6 @@ def collect_job_configs(shapes: list[tuple[int, int, int]], transposed_lhs: bool
     if transposed_lhs:
         baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhsT_rhs_gemm_np")
         meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhsT_rhs_meta_gemm")
-        nki_matmul_nmk_order = (f"{project_root}/private/test_nki_matmul.py", "nki_matmul_nmk_order")
-        atlas_alg = (f"{project_root}/private/nki_gemm_100_mfu.py", "atlas_gemm")
     else:
         baseline_kernel = (f"{project_root}/autotune/gemm/validation.py", "lhs_rhs_gemm_np")
         meta_kernel = (f"{project_root}/autotune/gemm/kernels.py", "lhs_rhs_meta_gemm")
@@ -64,49 +61,30 @@ def collect_job_configs(shapes: list[tuple[int, int, int]], transposed_lhs: bool
         else:
             lhs_shape = (M, K)
         rhs_shape = (K, N)
-        configs = sample_gemm_configs(M=M, N=N, K=K, max_configs=0)
+        configs = sample_gemm_configs(M=M, N=N, K=K, max_configs=10)
         for config in configs:
             job_list.append(
                 {
                     "kernel": meta_kernel,
-                    "input_tensor_shapes": [lhs_shape, rhs_shape],
+                    "input_tensor_shapes": {"lhs": lhs_shape, "rhs": rhs_shape},
                     "data_type": data_type,
                     "kernel_kwargs": {"config": config},
                     "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki",
                     "postprocessing": postprocessing,
+                    "mac_count": M * N * K,
                 }
             )
         job_list.append(
             {
                 "kernel": baseline_kernel,
-                "input_tensor_shapes": [lhs_shape, rhs_shape],
+                "input_tensor_shapes": {"lhs": lhs_shape, "rhs": rhs_shape},
                 "data_type": data_type,
                 "kernel_kwargs": {},
                 "compiler_flags": "--auto-cast=none --model-type=transformer --tensorizer-options='--print-nki'",
                 "postprocessing": postprocessing,
+                "mac_count": M * N * K,
             }
         )
-        if transposed_lhs:
-            job_list.append(
-                {
-                    "kernel": nki_matmul_nmk_order,
-                    "input_tensor_shapes": [lhs_shape, rhs_shape],
-                    "data_type": data_type,
-                    "kernel_kwargs": {},
-                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki",
-                    "postprocessing": postprocessing,
-                }
-            )
-            job_list.append(
-                {
-                    "kernel": atlas_alg,
-                    "input_tensor_shapes": [lhs_shape, rhs_shape],
-                    "data_type": data_type,
-                    "kernel_kwargs": {},
-                    "compiler_flags": "--auto-cast=none --internal-tensorizer-opt-level=nki",
-                    "postprocessing": postprocessing,
-                }
-            )
 
     return job_list
 
@@ -158,7 +136,7 @@ if __name__ == "__main__":
         run_jobs_in_batches(all_job_configs, args.cache_dir, batch_size=20000)
 
     if args.mode == "lhsT_rhs" or args.mode == "both":
-        kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm", "nki_matmul_nmk_order"]
+        kernel_names = ["lhsT_rhs_gemm_np", "lhsT_rhs_meta_gemm"]
         plot_metric(args.cache_dir, "min_ms", kernel_names)
         plot_metric(args.cache_dir, "mfu_estimated_percent", kernel_names)
     if args.mode == "lhs_rhs" or args.mode == "both":

@@ -68,7 +68,9 @@ class ProfileJob:
             cache_root_dir: Root directory for caching results.
         """
         self.attributes: list[str] = []
-        input_tensor_shapes_str = "_".join("x".join(str(dim) for dim in shape) for shape in input_tensor_shapes)
+        input_tensor_shapes_str = "_".join(
+            "x".join(str(dim) for dim in shape) for shape in input_tensor_shapes.values()
+        )
         _, kernel_name = kernel
         workload_dir = f"{cache_root_dir}/{kernel_name}/{input_tensor_shapes_str}"
         cache_dir = f"{workload_dir}/id{index}"
@@ -305,7 +307,7 @@ class ProfileJobs:
                     correct_count += 1
                 if job.has_error:
                     error_count += 1
-                    error_type = job.error.split("\n")[0]
+                    error_type = getattr(job, "error").split("\n")[0]
                     if error_type not in error_types:
                         error_types[error_type] = 0
                     error_types[error_type] += 1

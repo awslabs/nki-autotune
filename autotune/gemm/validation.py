@@ -20,7 +20,7 @@ class GEMMCorrectness:
     ):
         data_type = np.float32
         atol, rtol = 1e-5, 1e-2
-        lhs, rhs = input_tensors
+        lhs, rhs = input_tensors.values()
         if self.transposed_lhs:
             golden = nl.static_cast(lhsT_rhs_gemm_np(lhs, rhs), data_type)
         else:

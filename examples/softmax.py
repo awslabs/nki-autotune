@@ -28,11 +28,12 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
         postprocessing = None
     jobs.add_job(
         kernel=("kernel_library/softmax.py", "softmax_gemm_np"),
-        input_tensor_shapes=[lhs.shape, rhs.shape],
+        input_tensor_shapes={"lhs": lhs.shape, "rhs": rhs.shape},
         kernel_kwargs={},
         compiler_flags="--auto-cast=none --model-type=transformer",
         postprocessing=postprocessing,
         data_type=data_type,
+        mac_count=batch * M * K * N,
     )
 
     sizes = range(17)
@@ -44,11 +45,12 @@ def create_jobs(jobs: ProfileJobs, M: int, N: int, K: int):
     for NUM_BLOCK_M, NUM_BLOCK_N, NUM_BLOCK_K in params:
         autotune_jobs.add_job(
             kernel=("kernel_library/softmax.py", "online_softmax_linear_MKN"),
-            input_tensor_shapes=[lhs.shape, rhs.shape],
+            input_tensor_shapes={"lhs": lhs.shape, "rhs": rhs.shape},
             kernel_kwargs={"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K},
             compiler_flags="--auto-cast=none --internal-tensorizer-opt-level=nki",
             postprocessing=postprocessing,
             data_type=data_type,
+            mac_count=batch * M * K * N,
         )
     # Limit to 100 jobs if there are too many
     if len(autotune_jobs.jobs) > 100:

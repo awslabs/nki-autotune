@@ -99,7 +99,7 @@ def compile_kernel(
         traced_kernel = trace(kernel)
     else:
         traced_kernel = kernel
-    traced_kernel.specialize(input_tensors, **kernel_kwargs)
+    traced_kernel.specialize(*input_tensors.values(), **kernel_kwargs)
     if target_instance_family == "trn1":
         target = CompilationTarget.TRN1
     elif target_instance_family == "trn2":
@@ -127,7 +127,7 @@ def create_spike_kernel(
         traced_kernel = trace(kernel)
     else:
         traced_kernel = kernel
-    traced_kernel.specialize(*input_tensors, **kernel_kwargs)
+    traced_kernel.specialize(*input_tensors.values(), **kernel_kwargs)
     spike_kernel = CompiledKernel(traced_kernel.copy_kernel(), neff_path)
     return spike_kernel
 
@@ -138,7 +138,9 @@ def run_spike_kernel(
     directory, neff_name, file_type = split_file_info(neff)
     if file_type != "neff":
         raise ValueError(f"{neff} is not a neff file.")
-    kernel_outputs = spike.run(spike_kernel, *input_tensors, save_trace=True, artifacts_dir=directory, **kernel_kwargs)
+    kernel_outputs = spike.run(
+        spike_kernel, *input_tensors.values(), save_trace=True, artifacts_dir=directory, **kernel_kwargs
+    )
     ntff_file = f"{directory}/{neff_name}.ntff"
     shutil.move(f"{directory}/profile.ntff", ntff_file)
     if type(kernel_outputs) is np.ndarray:
