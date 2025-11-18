@@ -40,16 +40,22 @@ class NKICodegen:
         )
 
     def _generate_signature(self, kernel_name: str) -> str:
-        """Generate function signature from graph inputs and outputs."""
+        """Generate function signature from graph inputs only."""
         input_names = [tensor.name for tensor in self.graph.hbm]
-        output_names = [tensor.name for tensor in self.graph.outputs]
-        all_params = input_names + output_names
-        params_str = ", ".join(all_params)
+        params_str = ", ".join(input_names)
         return f"def {kernel_name}({params_str}):"
 
     def _generate_body(self) -> str:
         """Generate function body with code for all nodes."""
         lines = []
+
+        for output_tensor in self.graph.outputs:
+            shape = output_tensor.shape
+            lines.append(f"    {output_tensor.name} = nl.ndarray({shape}, dtype=nl.float32, buffer=nl.shared_hbm)")
+
+        if self.graph.outputs:
+            lines.append("")
+
         current_subgraph = None
 
         for node_id in sorted(self.graph.nodes.keys()):
@@ -65,6 +71,15 @@ class NKICodegen:
             code = node.codegen()
             for code_line in code.split("\n"):
                 lines.append(f"    {code_line}")
+
+        if self.graph.outputs:
+            lines.append("")
+            output_names = [tensor.name for tensor in self.graph.outputs]
+            if len(output_names) == 1:
+                lines.append(f"    return {output_names[0]}")
+            else:
+                return_str = ", ".join(output_names)
+                lines.append(f"    return {return_str}")
 
         return "\n".join(lines)
 

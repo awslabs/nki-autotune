@@ -328,7 +328,7 @@ class Load(Node):
             lines = []
             idx_name = f"i_{dest}"
             lines.append(f"{idx_name} = nl.mgrid[0:{M}, 0:{K}]")
-            lines.append(f"nl.load({dest}[{idx_name}.p, {idx_name}.x], src={src}[{idx_name}.p, {idx_name}.x])")
+            lines.append(f"{dest}[{idx_name}.p, {idx_name}.x] = nl.load({src}[{idx_name}.p, {idx_name}.x])")
             return "\n".join(lines)
         else:
             raise ValueError(f"Unsupported tensor shape {shape} for Load")
