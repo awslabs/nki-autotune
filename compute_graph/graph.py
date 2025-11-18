@@ -1,7 +1,7 @@
 import copy
 
 from compute_graph.nodes import Node
-from compute_graph.operators import Allocate, Load
+from compute_graph.operators import Allocate, Load, Store
 from compute_graph.tensors import HBMTensor, TensorBuffer
 
 
@@ -15,26 +15,41 @@ class ComputeGraph:
         """
         self.operators = operators
 
-    def specialize(self, inputs: list[HBMTensor], output_names: list[str]) -> None:
-        """Specialize graph with given input tensors and output names.
+    def specialize(self, inputs: list[HBMTensor], outputs: list[HBMTensor]) -> None:
+        """Specialize graph with given input and output tensors.
 
         Args:
             inputs: List of HBM input tensors
-            output_names: List of output tensor names
+            outputs: List of HBM output tensors
         """
         self.num_parallel_tiles = compute_num_parallel_tiles(inputs)
         self.hbm = inputs
+        self.outputs = outputs
         self.nodes: dict[int, Node] = {}
         self.edges: list[tuple[int, int]] = []
         self.buffer_name_counter: dict[str, int] = {}
         for subgraph_index in range(self.num_parallel_tiles):
             print(f"Subgraph {subgraph_index}")
-            subgraph_buffer: dict[str, int] = {}  # Track the latest tensor
+            subgraph_buffer: dict[str, int] = {}
             subgraph_hbm = shard_tensors(subgraph_index, self.num_parallel_tiles, inputs)
             for operator in self.operators:
                 source_node_ids = self.resolve_operator_tensors(subgraph_index, operator, subgraph_hbm, subgraph_buffer)
                 self._create_compute_node(source_node_ids, operator, subgraph_buffer)
                 print()
+            subgraph_outputs = shard_tensors(subgraph_index, self.num_parallel_tiles, outputs)
+            for output_hbm in subgraph_outputs:
+                output_name = output_hbm.name
+                if output_name not in subgraph_buffer:
+                    raise ValueError(
+                        f"Output tensor '{output_name}' not found in buffer. Available: {list(subgraph_buffer.keys())}"
+                    )
+                buffer_node_id = subgraph_buffer[output_name]
+                buffer_node = self.nodes[buffer_node_id]
+                buffer_tensor = buffer_node.tensors[output_name]
+                assert isinstance(buffer_tensor, TensorBuffer)
+                store_node_id = self._create_store_node(buffer_tensor, output_hbm)
+                self.edges.append((buffer_node_id, store_node_id))
+                print(f"Store {output_name} to HBM")
             print()
 
     def __repr__(self) -> str:
@@ -131,6 +146,24 @@ class ComputeGraph:
         load_node.specialize_tensor(allocate_node.dest, allocate_node.tensors[allocate_node.dest])
         print(load_node)
         self.nodes[node_id] = load_node
+        return node_id
+
+    def _create_store_node(self, buffer_tensor: TensorBuffer, output_hbm_tensor: HBMTensor) -> int:
+        """Creates and registers a Store node, returns its node ID.
+
+        Args:
+            buffer_tensor: Source buffer tensor to store from
+            output_hbm_tensor: Target HBM tensor to store to
+
+        Returns:
+            Node ID of the created store node
+        """
+        node_id = len(self.nodes)
+        store_node = Store(dest=output_hbm_tensor.name, value=buffer_tensor.name)
+        store_node.specialize_tensor(buffer_tensor.name, buffer_tensor)
+        store_node.specialize_tensor(output_hbm_tensor.name, output_hbm_tensor)
+        print(store_node)
+        self.nodes[node_id] = store_node
         return node_id
 
 

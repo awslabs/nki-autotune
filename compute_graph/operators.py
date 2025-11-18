@@ -169,3 +169,20 @@ class Load(Node):
     @property
     def write_tensor_names(self) -> list[str]:
         return [self.dest]
+
+
+class Store(Node):
+    """
+    Store operator.
+    """
+
+    def __init__(self, dest: str, **kwargs) -> None:
+        super().__init__(op_code="nl.store", dest=dest, **kwargs)
+
+    @property
+    def read_tensor_names(self) -> list[str]:
+        return [self.kwargs["value"]]
+
+    @property
+    def write_tensor_names(self) -> list[str]:
+        return [self.dest]
