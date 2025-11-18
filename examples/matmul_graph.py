@@ -17,10 +17,10 @@ def test_graph_gen() -> None:
     """Test data reuse graph transformation with a single merge."""
     TILE_M = 128
     TILE_N = 512
-    TILE_K = 999
+    TILE_K = 512
 
     M = 256
-    K = 999
+    K = 1024
     N = 512
 
     lhs = HBMTensor("lhs", (M, K), (TILE_M, TILE_K), ("parallel", "reduction"))
@@ -49,7 +49,7 @@ def test_graph_gen() -> None:
 
     codegen = NKICodegen(rmsnorm_matmul_graph)
     kernel_code = codegen.generate_kernel("rmsnorm_matmul_kernel")
-    output_file = "generated_kernels/rmsnorm_matmul_kernel.py"
+    output_file = "cache/rmsnorm_matmul_kernel.py"
     with open(output_file, "w") as f:
         f.write(kernel_code)
 
