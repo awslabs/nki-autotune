@@ -1,6 +1,7 @@
 import neuronxcc.nki.language as nl
 import numpy as np
 
+from compute_graph.codegen import NKICodegen
 from compute_graph.graph import ComputeGraph
 from compute_graph.operators import Activation, Matmul, TensorScalar
 from compute_graph.tensors import HBMTensor
@@ -45,6 +46,12 @@ def test_graph_gen() -> None:
     )
     rmsnorm_matmul_graph.specialize(inputs=[lhs, rhs], outputs=[output])
     save_graph(rmsnorm_matmul_graph, output_file="rmsnorm_matmul.png", title="RMSNorm + Matmul ComputeGraph")
+
+    codegen = NKICodegen(rmsnorm_matmul_graph)
+    kernel_code = codegen.generate_kernel("rmsnorm_matmul_kernel")
+    output_file = "generated_kernels/rmsnorm_matmul_kernel.py"
+    with open(output_file, "w") as f:
+        f.write(kernel_code)
 
 
 if __name__ == "__main__":
