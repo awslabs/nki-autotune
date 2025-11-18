@@ -89,6 +89,7 @@ artifacts/
 private
 *.neff
 *.ntff
+generated_kernels/
 
 # Remote development configuration (contains sensitive info)
 remote_tools/.remote_config

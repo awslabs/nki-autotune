@@ -58,6 +58,10 @@ class Node:
     def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
         raise NotImplementedError(f"infer_tensor_shape is not implemented for {self}")
 
+    def codegen(self) -> str:
+        """Generate NKI code for this node."""
+        raise NotImplementedError(f"codegen is not implemented for {self}")
+
     def specialize_tensor(self, tensor_name: str, tensor: HBMTensor | TensorBuffer) -> None:
         assert tensor_name in self.tensor_names, f"Tensor {tensor_name} not found in node {self}"
         self.tensors[tensor_name] = tensor
