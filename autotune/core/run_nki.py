@@ -27,7 +27,7 @@ def run_neuron_benchmarks(jobs: ProfileJobs, warmup: int, iters: int) -> None:
                 spike_kernel = create_spike_kernel(job.neff, job.kernel, job.input_tensors, job.kernel_kwargs)
                 stats = spike.benchmark(
                     spike_kernel,
-                    *job.input_tensors,
+                    *job.input_tensors.values(),
                     **job.kernel_kwargs,
                     warmup_iterations=warmup,
                     benchmark_iterations=iters,
@@ -43,7 +43,7 @@ def run_neuron_benchmarks(jobs: ProfileJobs, warmup: int, iters: int) -> None:
                     job.neff,
                     ntff_file,
                     latency=job.min_ms,
-                    matmul_mac_count=job.matmul_mac_count,
+                    matmul_mac_count=job.mac_count,
                     target_instance_family=jobs.target_instance_family,
                 )
                 job.add_attributes(**metrics)
