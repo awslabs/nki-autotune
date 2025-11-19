@@ -3,7 +3,7 @@ import subprocess
 
 from compute_graph.graph import ComputeGraph
 from compute_graph.nodes import Node
-from compute_graph.tensors import HBMTensor
+from compute_graph.tensors import Tensor
 
 NODE_TYPE_COLORS: dict[str, str] = {"load": "#FFEAA7", "compute": "#A8D8EA", "store": "#A8E6CF", "allocate": "#E8E8E8"}
 
@@ -240,10 +240,10 @@ def _format_node(node_data: Node) -> tuple[str, str]:
     return label, color
 
 
-def _format_hbm_tensor(hbm_tensor: HBMTensor) -> tuple[str, str]:
+def _format_hbm_tensor(hbm_tensor: Tensor) -> tuple[str, str]:
     """
     Args:
-        hbm_tensor: HBMTensor object
+        hbm_tensor: Tensor object
 
     Returns:
         Tuple of (label, color) for the HBM tensor node

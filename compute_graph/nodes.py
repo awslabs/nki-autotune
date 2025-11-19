@@ -1,6 +1,6 @@
 from neuronxcc.nki.compiler.backends.neuron.sema import NKIFunc
 
-from compute_graph.tensors import HBMTensor, TensorBuffer
+from compute_graph.tensors import Tensor
 
 
 class Node:
@@ -14,7 +14,7 @@ class Node:
         """
         self.op_code = op_code
         self.dest = dest
-        self.tensors: dict[str, HBMTensor | TensorBuffer] = {}
+        self.tensors: dict[str, Tensor] = {}
         self.kwargs = kwargs
 
     @property
@@ -61,10 +61,6 @@ class Node:
     def codegen(self) -> str:
         """Generate NKI code for this node."""
         raise NotImplementedError(f"codegen is not implemented for {self}")
-
-    def specialize_tensor(self, tensor_name: str, tensor: HBMTensor | TensorBuffer) -> None:
-        assert tensor_name in self.tensor_names, f"Tensor {tensor_name} not found in node {self}"
-        self.tensors[tensor_name] = tensor
 
     def clear_specialization(self) -> None:
         self.tensors.clear()
