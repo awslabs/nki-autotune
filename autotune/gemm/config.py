@@ -186,6 +186,8 @@ class GEMMConfig:
         self.op_positions["result"] = self.loop_order["K"]
         self.op_positions["save"] = self.loop_order["K"]
         self.op_positions["x_op"] = self.loop_order["K"]
+        self.lhs_rel_position = lhs_position
+        self.rhs_rel_position = rhs_position
 
     def _parse_absolute_position(self, relative_position: int, axes: Tuple[str, ...]) -> int:
         """
