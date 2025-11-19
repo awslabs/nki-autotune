@@ -31,9 +31,7 @@ class Benchmark:
 
     def __call__(self):
         """Execute the full benchmarking pipeline: compile, then run on device."""
-        self._compile_all_kernels()
-        self.jobs.dump_json()
-        self._run_on_neuron_cores()
+        self._compile_and_run_dynamic_load_balancing()
         self.jobs.dump_json()
 
     def _compile_all_kernels(self):
@@ -98,3 +96,60 @@ class Benchmark:
         pbar.close()
         for executor in executors:
             executor.shutdown(wait=True)
+    
+    def _compile_and_run_dynamic_load_balancing(self):
+        # --- Compile Setup --- #
+        cpu_count = os.cpu_count() or 1
+        num_cpu_workers = min(max(cpu_count - 1, 1), len(self.jobs.jobs))
+        num_jobs = len(self.jobs.jobs)
+        job_id_groups = split_jobs_into_groups(job_ids=list(range(num_jobs)), num_groups=num_cpu_workers)
+        compiler_executor = ProcessPoolExecutor(max_workers=num_cpu_workers)
+        c_pbar = tqdm(total=num_jobs, desc=f"Compiling {num_jobs} kernels on {num_cpu_workers} CPUs", unit="kernels")
+
+        # --- Neuron Execute Setup --- #
+        num_neuron_workers = 128
+        counter = mp.Value("i", 0)
+        lock = mp.Lock()
+        runner_executor = ProcessPoolExecutor(
+            max_workers=num_neuron_workers, initializer=set_neuron_core_dynamic, initargs=(counter, lock)
+        )
+        e_pbar = tqdm(
+            total=num_jobs,
+            desc=f"Processing/Running {num_jobs} kernels on {num_neuron_workers} Neuron cores",
+            unit="kernels",
+        )
+
+        # --- Compile + Execute --- #
+        pending_futures = set()
+        compiled_futures = set()
+        for rank_job_ids in job_id_groups:
+            rank_jobs = self.jobs.subset(rank_job_ids)
+            compiling_future = compiler_executor.submit(compile_jobs, rank_jobs)
+            compiled_futures.add(compiling_future)
+            pending_futures.add(compiling_future)
+
+        while pending_futures:
+            for future in as_completed(pending_futures):
+                pending_futures.remove(future)
+                updated_jobs = future.result()
+                for job_index in updated_jobs.jobs:
+                    updated_job = updated_jobs.jobs[job_index]
+                    self.jobs.jobs[job_index] = updated_job
+                    if future in compiled_futures:
+                        if not updated_job.has_error:
+                            kwargs = {"warmup": self.warmup, "iters": self.iters, "jobs": self.jobs.subset([job_index])}
+                            executing_future = runner_executor.submit(
+                                run_on_neuron_core_dynamic, **kwargs
+                            )  # TODO (shraya): changed from run_on_neuron_core_dynamic
+                            pending_futures.add(executing_future)
+                        else:
+                            e_pbar.update(1)
+                        c_pbar.update(len(updated_jobs.jobs))
+                    else:
+                        e_pbar.update(1)
+
+        # --- Cleanup --- #
+        c_pbar.close()
+        e_pbar.close()
+        compiler_executor.shutdown(wait=True)
+        runner_executor.shutdown(wait=True)
