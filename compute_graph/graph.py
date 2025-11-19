@@ -1,8 +1,9 @@
-import copy
+import neuronxcc.nki.language as nl
 
+from compute_graph.memory import Memory
 from compute_graph.nodes import Node
-from compute_graph.operators import Allocate, Load, Store
-from compute_graph.tensors import HBMTensor, TensorBuffer
+from compute_graph.operators import Allocate, Load
+from compute_graph.tensors import Axis, Tensor
 
 
 class ComputeGraph:
@@ -15,199 +16,89 @@ class ComputeGraph:
         """
         self.operators = operators
 
-    def specialize(self, inputs: list[HBMTensor], outputs: list[HBMTensor]) -> None:
+    def specialize(self, inputs: dict[str, tuple[int, ...]], outputs: list[str]) -> None:
         """Specialize graph with given input and output tensors.
 
         Args:
             inputs: List of HBM input tensors
             outputs: List of HBM output tensors
         """
-        self.num_parallel_tiles = compute_num_parallel_tiles(inputs)
         self.hbm = inputs
-        self.outputs = outputs
+        self.buffer = Memory("Buffer")
         self.nodes: dict[int, Node] = {}
         self.edges: list[tuple[int, int]] = []
-        self.buffer_name_counter: dict[str, int] = {}
-        for subgraph_index in range(self.num_parallel_tiles):
-            print(f"Subgraph {subgraph_index}")
-            subgraph_buffer: dict[str, int] = {}
-            subgraph_hbm = shard_tensors(subgraph_index, self.num_parallel_tiles, inputs)
-            for operator in self.operators:
-                source_node_ids = self.resolve_operator_tensors(subgraph_index, operator, subgraph_hbm, subgraph_buffer)
-                self._create_compute_node(source_node_ids, operator, subgraph_buffer)
-                print()
-            subgraph_outputs = shard_tensors(subgraph_index, self.num_parallel_tiles, outputs)
-            for output_hbm in subgraph_outputs:
-                output_name = output_hbm.name
-                if output_name not in subgraph_buffer:
-                    raise ValueError(
-                        f"Output tensor '{output_name}' not found in buffer. Available: {list(subgraph_buffer.keys())}"
-                    )
-                buffer_node_id = subgraph_buffer[output_name]
-                buffer_node = self.nodes[buffer_node_id]
-                buffer_tensor = buffer_node.tensors[output_name]
-                assert isinstance(buffer_tensor, TensorBuffer)
-                store_node_id = self._create_store_node(buffer_tensor, output_hbm)
-                self.edges.append((buffer_node_id, store_node_id))
-                print(f"Store {output_name} to HBM")
-            print()
+        for operator in self.operators:
+            self.specialize_operator(operator)
 
-    def __repr__(self) -> str:
-        operators_str = "\n    ".join(str(op) for op in self.operators)
-
-        result = f"ComputeGraph(\n" f"  operators=[\n" f"    {operators_str}\n" f"  ]\n"
-        result += ")"
-        return result
-
-    def resolve_operator_tensors(
-        self, subgraph_index: int, operator: Node, hbm: list[HBMTensor], buffer: dict[str, int]
-    ) -> list[int]:
-        """Resolve and specialize all tensors for an operator in a subgraph.
-
-        Args:
-            subgraph_index: Index of the current parallel subgraph
-            operator: Operator node to resolve tensors for
-            hbm: List of sharded HBM tensors for this subgraph
-            buffer: Mapping of tensor names to source node IDs
-        """
-        operator.clear_specialization()
-        print(operator)
-        hbm_tensor_lookup = {hbm_tensor.name: hbm_tensor for hbm_tensor in hbm}
-        source_node_ids: list[int] = []
-        for tensor_name in operator.tensor_names:
-            if tensor_name in buffer:
-                print(f"Access {tensor_name} from buffer")
-                source_node_id = buffer[tensor_name]
-            elif tensor_name in hbm_tensor_lookup:
-                print(f"Load {tensor_name} from HBM")
-                hbm_tensor = hbm_tensor_lookup[tensor_name]
-                allocate_node_id = self._create_allocate_node(
-                    buffer_name=f"{tensor_name}_{subgraph_index}", shape=hbm_tensor.shape
-                )
-                allocate_node = self.nodes[allocate_node_id]
-                assert isinstance(allocate_node, Allocate)
-                load_node_id = self._create_load_node(hbm_tensor, allocate_node)
-                self.edges.append((allocate_node_id, load_node_id))
-                source_node_id = load_node_id
+    def specialize_operator(self, operator: Node) -> list[int]:
+        print("-" * 10, f"{operator}", "-" * 10)
+        for tensor_name in operator.read_tensor_names:
+            if tensor_name in self.buffer.tensors:
+                tensor = self.buffer.tensors[tensor_name]
+                print(f"Read {tensor} from buffer")
+                raise NotImplementedError
+            elif tensor_name in self.hbm:
+                self._load_from_hbm(tensor_name)
             else:
-                print(f"Allocate {tensor_name} in buffer")
-                tensor_shape = operator.infer_tensor_shape(tensor_name)
-                source_node_id = self._create_allocate_node(
-                    buffer_name=f"{tensor_name}_{subgraph_index}", shape=tensor_shape
-                )
-            buffer[tensor_name] = source_node_id
-            source_node = self.nodes[source_node_id]
-            operator.specialize_tensor(tensor_name, source_node.tensors[source_node.dest])
-            source_node_ids.append(source_node_id)
-        return source_node_ids
+                raise ValueError(f"{tensor_name} does not exist")
+        for tensor_name in operator.write_tensor_names:
+            if tensor_name in self.buffer.tensors:
+                tensor = self.buffer.tensors[tensor_name]
+                print(f"Write {tensor} to buffer")
+                raise NotImplementedError
+            else:
+                self._allocate_output_tensor(operator, tensor_name)
+        print()
 
-    def _create_compute_node(self, source_node_ids: list[int], operator: Node, buffer: dict[str, int]) -> int:
-        assert operator.is_specialized, f"{operator} is not yet fully specialized"
-        operator_copy = copy.deepcopy(operator)
+    def _load_from_hbm(self, hbm_tensor: str):
+        print(f"Load {hbm_tensor} from HBM")
+        pmax = nl.tile_size.pmax
+        par_size, free_size = self.hbm[hbm_tensor]
+        assert par_size % pmax == 0
+        num_load_nodes = par_size // pmax
+        free_axis = Axis(start_tile=0, end_tile=1, stride=1, tile_size=free_size)
+        for i in range(num_load_nodes):
+            par_axis = Axis(start_tile=i, end_tile=i + 1, stride=1, tile_size=pmax)
+            loaded_tensor = Tensor(name=f"{hbm_tensor}_{i}", axes=(par_axis, free_axis))
+            allocate_node = Allocate(dest=loaded_tensor.name, shape=loaded_tensor.shape, buffer="nl.sbuf")
+            self.add_node(allocate_node)
+            load_node = Load(dest=allocate_node.dest, src=hbm_tensor, axes=(par_axis, free_axis))
+            load_node_id = self.add_node(load_node)
+            self.buffer.add_tensor(hbm_tensor, load_node_id)
+
+    def _allocate_output_tensor(self, operator: Node, tensor_name: str):
+        print(f"Allocate new {tensor_name}")
+        print(operator.read_tensor_names)
+        print(self.buffer)
+        tensor_shape = operator.infer_tensor_shape(tensor_name)
+
+    def add_node(self, node: Node) -> int:
         node_id = len(self.nodes)
-        print(operator_copy, operator_copy.tensor_names)
-        self.nodes[node_id] = operator_copy
-        for source_node_id in source_node_ids:
-            self.edges.append((source_node_id, node_id))
-        for tensor_name in operator_copy.write_tensor_names:
-            buffer[tensor_name] = node_id
-        return node_id
-
-    def _create_allocate_node(self, buffer_name: str, shape: tuple[int, ...]) -> int:
-        """Creates and registers an Allocate node, returns its node ID.
-
-        Args:
-            buffer_name: Name for the allocated buffer
-            shape: Shape of the tensor buffer to allocate
-
-        Returns:
-            Node ID of the created allocate node
-        """
-        node_id = len(self.nodes)
-        allocate_node = Allocate(dest=buffer_name, shape=shape)
-        allocate_node.specialize_tensor(buffer_name, TensorBuffer(buffer_name, shape))
-        print(allocate_node)
-        self.nodes[node_id] = allocate_node
-        return node_id
-
-    def _create_load_node(self, hbm_tensor: HBMTensor, allocate_node: Allocate) -> int:
-        """Creates and registers a Load node, returns its node ID.
-
-        Args:
-            hbm_tensor: Source HBM tensor to load from
-            allocate_node: Target allocate node for the loaded data
-
-        Returns:
-            Node ID of the created load node
-        """
-        node_id = len(self.nodes)
-        load_node = Load(dest=allocate_node.dest, src=hbm_tensor.name)
-        load_node.specialize_tensor(hbm_tensor.name, hbm_tensor)
-        load_node.specialize_tensor(allocate_node.dest, allocate_node.tensors[allocate_node.dest])
-        print(load_node)
-        self.nodes[node_id] = load_node
-        return node_id
-
-    def _create_store_node(self, buffer_tensor: TensorBuffer, output_hbm_tensor: HBMTensor) -> int:
-        """Creates and registers a Store node, returns its node ID.
-
-        Args:
-            buffer_tensor: Source buffer tensor to store from
-            output_hbm_tensor: Target HBM tensor to store to
-
-        Returns:
-            Node ID of the created store node
-        """
-        node_id = len(self.nodes)
-        store_node = Store(dest=output_hbm_tensor.name, value=buffer_tensor.name)
-        store_node.specialize_tensor(buffer_tensor.name, buffer_tensor)
-        store_node.specialize_tensor(output_hbm_tensor.name, output_hbm_tensor)
-        print(store_node)
-        self.nodes[node_id] = store_node
+        self.nodes[node_id] = node
+        print(node)
         return node_id
 
 
-def compute_num_parallel_tiles(tensors: list[HBMTensor]) -> int:
-    """Compute total number of parallel tiles across all tensor axes.
-
-    Args:
-        tensors: List of HBM tensors
-
-    Returns:
-        Product of num_tiles for all parallel axes across tensors
-    """
-    num_parallel_tiles = 1
-    for tensor in tensors:
-        for axis in tensor.axes:
-            if axis.dependency == "parallel":
-                num_parallel_tiles *= axis.num_tiles
-    return num_parallel_tiles
-
-
-def shard_tensors(parallel_index: int, parallel_size: int, tensors: list[HBMTensor]) -> list[HBMTensor]:
-    """Shard tensors for a specific parallel tile index.
-
+def shard_tensor(parallel_index: int, parallel_size: int, tensor: str):
+    """Shard a tensor for a specific parallel tile index.
     Args:
         parallel_index: Index of the current parallel tile
         parallel_size: Total number of parallel tiles
-        tensors: List of HBM tensors to shard
+        tensor: HBM tensor to shard
 
     Returns:
-        List of sharded HBM tensors with updated tile indices
+        Sharded HBM tensor with updated tile indices
     """
     stride = parallel_size
-    sharded_tensors: list[HBMTensor] = []
-    for tensor in tensors:
-        sharded_indices: list[tuple[int, int, int]] = []
-        for axis in tensor.axes:
-            if axis.dependency == "parallel":
-                stride = stride // axis.num_tiles
-                start_tile = (parallel_index // stride) % axis.num_tiles
-                end_tile = start_tile + 1
-            else:
-                start_tile = 0
-                end_tile = axis.num_tiles
-            sharded_indices.append((start_tile, end_tile, axis.stride))
-        sharded_tensor = tensor.access(sharded_indices)
-        sharded_tensors.append(sharded_tensor)
-    return sharded_tensors
+    sharded_indices: list[tuple[int, int, int]] = []
+    for axis in tensor.axes:
+        if axis.dependency == "parallel":
+            stride = stride // axis.num_tiles
+            start_tile = (parallel_index // stride) % axis.num_tiles
+            end_tile = start_tile + 1
+        else:
+            start_tile = 0
+            end_tile = axis.num_tiles
+        sharded_indices.append((start_tile, end_tile, axis.stride))
+    sharded_tensor = tensor.access(sharded_indices)
+    return sharded_tensor

@@ -4,7 +4,6 @@ import numpy as np
 from compute_graph.codegen import NKICodegen
 from compute_graph.graph import ComputeGraph
 from compute_graph.operators import Activation, Matmul, TensorScalar
-from compute_graph.tensors import HBMTensor
 from compute_graph.visualize import save_graph
 
 
@@ -23,9 +22,6 @@ def test_graph_gen() -> None:
     K = 1024
     N = 512
 
-    lhs = HBMTensor("lhs", (M, K), (TILE_M, TILE_K), ("parallel", "reduction"))
-    rhs = HBMTensor("rhs", (K, N), (TILE_K, TILE_N), ("reduction", "parallel"))
-    output = HBMTensor("output", (M, N), (TILE_M, TILE_N), ("parallel", "parallel"))
     epsilon = 1e-6
 
     rmsnorm_matmul_graph = ComputeGraph(
@@ -44,7 +40,7 @@ def test_graph_gen() -> None:
             Matmul(dest="output", stationary="lhs_norm", moving="rhs"),
         ]
     )
-    rmsnorm_matmul_graph.specialize(inputs=[lhs, rhs], outputs=[output])
+    rmsnorm_matmul_graph.specialize(inputs={"lhs": (M, K), "rhs": (K, N)}, outputs=["output"])
     save_graph(rmsnorm_matmul_graph, output_file="rmsnorm_matmul.png", title="RMSNorm + Matmul ComputeGraph")
 
     codegen = NKICodegen(rmsnorm_matmul_graph)
