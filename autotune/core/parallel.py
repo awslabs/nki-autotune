@@ -1,6 +1,12 @@
+import atexit
 import os
 import random
+from multiprocessing import Lock, Value
 from typing import List
+
+from neuronpy.runtime.spike import SpikeExecutor
+
+worker_spike_executor = None
 
 
 def split_jobs_into_groups(job_ids: List[int], num_groups: int) -> List[List[int]]:
@@ -37,3 +43,15 @@ def set_neuron_core(core_id: int):
     """
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_id)
     os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
+
+def set_neuron_core_dynamic(core_counter: Value, lock: Lock):
+    with lock:
+        set_neuron_core(core_counter.value)
+        core_counter.value += 1
+    global worker_spike_executor
+    worker_spike_executor = SpikeExecutor(verbose=0)
+
+    def cleanup_spike():
+        worker_spike_executor.sc.close()
+
+    atexit.register(cleanup_spike)
