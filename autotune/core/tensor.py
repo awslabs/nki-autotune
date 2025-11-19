@@ -115,6 +115,8 @@ class SBUFTensor:
             f"Do not have exactly the same axes."
         )
         self.tile_coordinates = tile_coordinates
+        self.multibuffering = multibuffering
+        self.tensor = None
 
     def load(self, source: HBMTensor) -> None:
         """Load data from HBM tensor into SBUF tiles with automatic padding.
@@ -131,6 +133,9 @@ class SBUFTensor:
         self.max_par_size = source.sizes[self.par_axis]
         self.max_free_size = source.sizes[self.free_axis]
 
+        if self.tensor is None:
+            self.init_as_zero(dtype=source.tensor.dtype)
+
         self.init_as_zero(dtype=source.tensor.dtype)
         par_indices = nl.arange(self.tile_sizes[self.par_axis])[:, None]
         free_indices = nl.arange(self.tile_sizes[self.free_axis])[None, :]
@@ -144,9 +149,9 @@ class SBUFTensor:
             for free_tile_id in nl.affine_range(self.tile_coordinates[self.free_axis]["num_tiles"]):
                 free_start = (free_tile_offset + free_tile_id) * self.tile_sizes[self.free_axis]
                 free_mask = free_start + free_indices < self.max_free_size
-                self.tensor[par_indices, par_tile_id, free_tile_id, free_indices] = nl.load(
-                    source.tensor[par_start + par_indices, free_start + free_indices], mask=par_mask & free_mask
-                )
+                self.tensor[par_indices, block_id % self.multibuffering, par_tile_id, free_tile_id, free_indices] = nl.load(
+                        source.tensor[par_start + par_indices, free_start + free_indices], mask=par_mask & free_mask
+                    )
 
     def init_as_zero(self, dtype):
         """
@@ -157,12 +162,21 @@ class SBUFTensor:
             num_tiles (Dict[str, int]): _description_
             dtype (_type_): _description_
         """
-        tensor_shape = (
-            self.tile_sizes[self.par_axis],
-            self.tile_coordinates[self.par_axis]["num_tiles"],
-            self.tile_coordinates[self.free_axis]["num_tiles"],
-            self.tile_sizes[self.free_axis],
-        )
+        if self.multibuffering:
+            tensor_shape = (
+                    nl.par_dim(self.tile_sizes[self.par_axis]),
+                    self.multibuffering,
+                    self.tile_coordinates[self.par_axis]["num_tiles"],
+                    self.tile_coordinates[self.free_axis]["num_tiles"],
+                    self.tile_sizes[self.free_axis],
+            )
+        else:
+            tensor_shape = (
+                self.tile_sizes[self.par_axis],
+                self.tile_coordinates[self.par_axis]["num_tiles"],
+                self.tile_coordinates[self.free_axis]["num_tiles"],
+                self.tile_sizes[self.free_axis],    
+            )
         self.tensor = nl.zeros(tensor_shape, dtype=dtype, buffer=nl.sbuf)
 
     def dump(self):
@@ -186,7 +200,7 @@ class SBUFTensor:
                 )
         return result
 
-    def tile_transpose(self):
+    def tile_transpose(self, block_id):
         """Transpose tensor tile-by-tile in place.
 
         Performs transpose operation on each tile,
@@ -199,7 +213,7 @@ class SBUFTensor:
             tileT_dtype = np.float32
 
         idx_transp = nl.mgrid[0:pmax, 0:pmax]
-        par_tile_size, num_par_tiles, num_free_tiles, free_tile_size = self.tensor.shape
+        multibuffer, par_tile_size, num_par_tiles, num_free_tiles, free_tile_size = self.tensor.shape
         num_par_transp_tiles = math.ceil(par_tile_size / pmax)
         num_free_transp_tiles = math.ceil(free_tile_size / pmax)
         par_tile_offset = self.tile_coordinates[self.par_axis]["start_tile_index"]
@@ -219,13 +233,13 @@ class SBUFTensor:
 
                         tileT = nl.ndarray((nl.par_dim(pmax), pmax), dtype=tileT_dtype, buffer=nl.psum)
                         tileT[idx_transp.p, idx_transp.x] = nisa.nc_transpose(
-                            self.tensor[par_indices, par_tile_id, free_tile_id, free_indices], mask=mask
+                            self.tensor[par_indices, block_id % self.multibuffering, par_tile_id, free_tile_id, free_indices], mask=mask
                         )
-                        self.tensor[par_indices, par_tile_id, free_tile_id, free_indices] = nl.copy(
+                        self.tensor[par_indices, block_id % self.multibuffering, par_tile_id, free_tile_id, free_indices] = nl.copy(
                             tileT, dtype=self.tensor.dtype
                         )
 
-    def read_tile(self, tile_indices: Dict[str, int]):
+    def read_tile(self, tile_indices: Dict[str, int], block_id=0):
         """Extract a specific tile from the tensor using global tile indices.
 
         Args:
@@ -234,7 +248,10 @@ class SBUFTensor:
         Returns:
             The requested tile as a tensor
         """
-        par_tile_size, par_num_tiles, free_num_tiles, free_tile_size = self.tensor.shape
+        if self.multibuffering:
+            par_tile_size, multibuff, par_num_tiles, free_num_tiles, free_tile_size = self.tensor.shape
+        else:
+            par_tile_size, par_num_tiles, free_num_tiles, free_tile_size = self.tensor.shape
 
         # Convert global indices to local indices
         par_tile_index = tile_indices[self.par_axis] - self.tile_coordinates[self.par_axis]["start_tile_index"]
@@ -252,6 +269,10 @@ class SBUFTensor:
 
         idx_tile = nl.mgrid[0:par_tile_size, 0:free_tile_size]
         tile = self.tensor[idx_tile.p, par_tile_index, free_tile_index, idx_tile.x]
+        if self.multibuffering:
+            tile = self.tensor[idx_tile.p, block_id % self.multibuffering, par_tile_index, free_tile_index, idx_tile.x]
+        else:
+            tile = self.tensor[idx_tile.p, par_tile_index, free_tile_index, idx_tile.x]
         return tile
 
     def save_to_hbm(self, result):
@@ -299,7 +320,7 @@ class SBUFTensor:
 
                 # Read tile using global indices
                 tile_indices = {self.par_axis: global_row_tile, self.free_axis: global_column_tile}
-                tile_data = self.read_tile(tile_indices)
+                tile_data = self.read_tile(tile_indices, block_id=0)
 
                 # Store tile to result tensor
                 nl.store(

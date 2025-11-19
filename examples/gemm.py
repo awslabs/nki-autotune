@@ -37,7 +37,7 @@ def collect_job_configs(shapes: List[Tuple[int, int, int]], transposed_lhs: bool
     examples_dir = os.path.dirname(current_file)  # /path/to/nki-autotune/examples/
     project_root = os.path.dirname(examples_dir)  # /path/to/nki-autotune/
 
-    data_type = "float32"
+    data_type = "bf16"
     if data_type == "float32":
         data_type = np.float32
         postprocessing = GEMMCorrectness(transposed_lhs=transposed_lhs)
