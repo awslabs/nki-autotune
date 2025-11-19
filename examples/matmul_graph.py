@@ -1,10 +1,8 @@
 import neuronxcc.nki.language as nl
 import numpy as np
 
-from compute_graph.codegen import NKICodegen
 from compute_graph.graph import ComputeGraph
 from compute_graph.operators import Activation, Matmul, TensorScalar
-from compute_graph.visualize import save_graph
 
 
 def matmul_golden(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -40,14 +38,18 @@ def test_graph_gen() -> None:
             Matmul(dest="output", stationary="lhs_norm", moving="rhs"),
         ]
     )
-    rmsnorm_matmul_graph.specialize(inputs={"lhs": (M, K), "rhs": (K, N)}, outputs=["output"])
-    save_graph(rmsnorm_matmul_graph, output_file="rmsnorm_matmul.png", title="RMSNorm + Matmul ComputeGraph")
+    rmsnorm_matmul_graph.trace(inputs={"lhs": (M, K), "rhs": (K, N)}, outputs=["output"])
+    # save_graph(
+    #     rmsnorm_matmul_graph,
+    #     output_file="/fsx/weittang/kernelgen-cache/rmsnorm_matmul.png",
+    #     title="RMSNorm + Matmul ComputeGraph",
+    # )
 
-    codegen = NKICodegen(rmsnorm_matmul_graph)
-    kernel_code = codegen.generate_kernel("rmsnorm_matmul_kernel")
-    output_file = "cache/rmsnorm_matmul_kernel.py"
-    with open(output_file, "w") as f:
-        f.write(kernel_code)
+    # codegen = NKICodegen(rmsnorm_matmul_graph)
+    # kernel_code = codegen.generate_kernel("rmsnorm_matmul_kernel")
+    # output_file = "/fsx/weittang/kernelgen-cache/rmsnorm_matmul_kernel.py"
+    # with open(output_file, "w") as f:
+    #     f.write(kernel_code)
 
 
 if __name__ == "__main__":

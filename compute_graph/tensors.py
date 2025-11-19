@@ -27,20 +27,18 @@ class Tensor:
 
     def __repr__(self) -> str:
         axes_str = ", ".join(str(axis) for axis in self.axes)
-        return f"Tensor({self.name}, axes=[{axes_str}])"
+        return f"Tensor({self.name}[{axes_str}])"
 
 
-class TensorBuffer:
-    """Represents an on-chip SBUF/PSUM tensor buffer."""
+def shape_to_axes(shape: tuple[int, ...]) -> tuple[Axis, ...]:
+    axes: list[Axis] = []
+    for size in shape:
+        axis = Axis(start_tile=0, end_tile=1, stride=1, tile_size=size)
+        axes.append(axis)
+    return tuple(axes)
 
-    def __init__(self, name: str, shape: tuple[int, ...]) -> None:
-        """
-        Args:
-            name: Name of the tensor buffer
-            shape: Shape of the tensor buffer
-        """
-        self.name = name
-        self.shape = shape
 
-    def __repr__(self) -> str:
-        return f"TensorBuffer({self.name}, {self.shape})"
+def create_tensor(name: str, shape: tuple[int, ...]) -> Tensor:
+    axes = shape_to_axes(shape)
+    tensor = Tensor(name=name, axes=axes)
+    return tensor

@@ -55,6 +55,9 @@ class Node:
                 break
         return specialized
 
+    def specialize(self, tensor_name: str, tensor: Tensor):
+        self.tensors[tensor_name] = tensor
+
     def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
         raise NotImplementedError(f"infer_tensor_shape is not implemented for {self}")
 
