@@ -13,30 +13,47 @@ class BufferNode:
         self.inputs = inputs
         self.outputs = outputs
         self.tensor_axes = tensor_axes
-        self.axis_sizes: dict[str, dict[str, int]] = {}
+        self.axis_sizes: dict[str, int] = {}
 
     @property
     def is_specialized(self) -> bool:
         specialized = True
         for tensor in self.inputs:
-            if tensor in self.axis_sizes:
-                tensor_axes = self.tensor_axes[tensor]
-                for axis in tensor_axes:
-                    if axis not in self.axis_sizes[tensor]:
-                        specialized = False
-                        break
-            else:
-                specialized = False
-                break
+            for axis in self.tensor_axes[tensor]:
+                if axis not in self.axis_sizes:
+                    specialized = False
+                    break
         return specialized
 
-    def specialize(self, tensor_name: str, axis: str, size: int) -> None:
-        if tensor_name not in self.axis_sizes:
-            self.axis_sizes[tensor_name] = {}
-        self.axis_sizes[tensor_name][axis] = size
+    def specialize(self, axis: str, size: int) -> None:
+        if axis in self.axis_sizes:
+            raise ValueError(f"Cannot overwrite axis size {axis} in {self}.")
+        self.axis_sizes[axis] = size
 
     def get_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
-        raise NotImplementedError(f"get_tensor_shape is not implemented for {self}")
+        """Get the shape of a tensor by looking up axis sizes.
+
+        Args:
+            tensor_name: Name of the tensor to get shape for
+
+        Returns:
+            Tuple of axis sizes representing the tensor shape
+
+        Raises:
+            ValueError: If tensor_name is not in tensor_axes or if any required axis is not specialized
+        """
+        if tensor_name not in self.tensor_axes:
+            raise ValueError(f"Tensor '{tensor_name}' not found in tensor_axes of {self}")
+
+        axes = self.tensor_axes[tensor_name]
+        shape = []
+
+        for axis in axes:
+            if axis not in self.axis_sizes:
+                raise ValueError(f"Axis '{axis}' for tensor '{tensor_name}' is not specialized yet in {self}. ")
+            shape.append(self.axis_sizes[axis])
+
+        return tuple(shape)
 
     def codegen(self) -> str:
         """Generate NKI code for this node."""
