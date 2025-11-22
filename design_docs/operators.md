@@ -9,7 +9,7 @@ operator = {
     "op_code": "nisa.nc_matmul",
     "inputs": ["A", "B"],
     "outputs": ["C"],
-    "tensors": {
+    "tensor_axes": {
         "A": ["K", "M"],
         "B": ["K", "N"],
         "C": ["M", "N"]
@@ -37,13 +37,6 @@ For the matmul example:
 - K appears in inputs A, B but not in output C → K is reduction
 - Computation: `C[M, N] = sum_K(A[K, M] * B[K, N])`
 
-### 3. No Explicit Loops in Graph IR
-
-The graph IR is a **declarative representation** without explicit loop constructs:
-- Tensor dimensions implicitly define iteration spaces
-- Loop order and structure are determined during code generation
-- Graph transformations operate on operators and tensors, not loops
-
 ## Key Design Features
 
 ### Constant Dimension for Reductions
@@ -57,5 +50,5 @@ Reduced dimensions are kept with size 1 using the string constant `1`:
 
 ### Operator Categories
 
-**Compute**: TensorScalar, Activation, Transpose, Matmul
-**Memory**: Allocate, Load, Store
+**On-chip Operators**: TensorScalar, Activation, Transpose, Matmul, and other nisa computation operators. `nl.ndarray` Allocate operator.
+**HBM Operators**: Load, Store
