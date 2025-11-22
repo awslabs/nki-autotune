@@ -17,13 +17,7 @@ class BufferNode:
 
     @property
     def is_specialized(self) -> bool:
-        specialized = True
-        for tensor in self.inputs:
-            for axis in self.tensor_axes[tensor]:
-                if axis not in self.axis_sizes:
-                    specialized = False
-                    break
-        return specialized
+        return all(axis in self.axis_sizes for tensor in self.inputs for axis in self.tensor_axes[tensor])
 
     def specialize(self, axis: str, size: int) -> None:
         if axis in self.axis_sizes:
@@ -62,155 +56,268 @@ class BufferNode:
     def clear_specialization(self) -> None:
         self.axis_sizes.clear()
 
+    def __repr__(self) -> str:
+        """String representation of the node."""
+        return f"{self.op_code}(inputs={self.inputs}, outputs={self.outputs})"
+
 
 class TensorScalar(BufferNode):
     """
-    Tensor-scalar operator.
-    dest[...] = nisa.tensor_scalar(data, op0, operand0, op1, operand1)
+    Tensor-scalar operator: Apply up to two math operators to input data tile
+    by broadcasting scalar/vector operands.
+
+    NKI Specification:
+    - Data/Dest shape: (P, F) where P=partition axis, F=free axis
+    - Operand tensors (if not scalar): (P, 1) - broadcasts along partition axis
+    - Operation: dest = (data op0 operand0) op1 operand1
+    - Engine: Vector, Scalar, or GpSimd Engine
+
+    Semantic Axes (hardcoded):
+    - "P": Partition axis (for parallelism)
+    - "F": Free axis (for data layout)
+    - "1": Reduced/singleton dimension
     """
 
-    def __init__(self, dest: str, **kwargs) -> None:
-        super().__init__(op_code="nisa.tensor_scalar", dest=dest, **kwargs)
+    def __init__(
+        self,
+        dest: str,
+        data: str,
+        op0,
+        operand0: float | str,
+        op1: str | None = None,
+        operand1: float | str | None = None,
+    ) -> None:
+        """
+        Args:
+            dest: Destination tensor name
+            data: Input data tensor name
+            op0: First operator (e.g., np.multiply, np.add)
+            operand0: First operand (scalar value or tensor name with shape (P, 1))
+            op1: Second operator (optional)
+            operand1: Second operand (optional, scalar value or tensor name with shape (P, 1))
+        """
+        inputs = [data]
+        tensor_axes = {data: ["P", "F"], dest: ["P", "F"]}
 
-    def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
-        data_tensor_name = self.kwargs["data"]
-        assert (
-            data_tensor_name in self.tensors
-        ), f"Data tensor {data_tensor_name} not specialized. Cannot infer tensor shapes."
-        data_tensor = self.tensors[data_tensor_name]
-        data_shape = data_tensor.shape
-        if tensor_name == self.dest:
-            tensor_shape = data_shape
-        else:
-            raise ValueError(f"Tensor name {tensor_name} not found in {self}")
-        return tensor_shape
+        if isinstance(operand0, str):
+            inputs.append(operand0)
+            tensor_axes[operand0] = ["P", "1"]
 
-    @property
-    def read_tensor_names(self) -> list[str]:
-        tensor_names = [self.kwargs["data"]]
-        if isinstance(self.kwargs["operand0"], str):
-            tensor_names.append(self.kwargs["operand0"])
-        if "operand1" in self.kwargs and isinstance(self.kwargs["operand1"], str):
-            tensor_names.append(self.kwargs["operand1"])
-        return tensor_names
+        if isinstance(operand1, str):
+            inputs.append(operand1)
+            tensor_axes[operand1] = ["P", "1"]
 
-    @property
-    def write_tensor_names(self) -> list[str]:
-        return [self.dest]
+        super().__init__(op_code="nisa.tensor_scalar", inputs=inputs, outputs=[dest], tensor_axes=tensor_axes)
+
+        self.dest = dest
+        self.data = data
+        self.op0 = op0
+        self.operand0 = operand0
+        self.op1 = op1
+        self.operand1 = operand1
+
+    def __repr__(self) -> str:
+        args = [f"data={self.data}[P, F]"]
+
+        if self.op0 is not None:
+            op0_name = getattr(self.op0, "__name__", str(self.op0))
+            args.append(f"op0={op0_name}")
+
+            if isinstance(self.operand0, str):
+                args.append(f"operand0={self.operand0}[P, 1]")
+            else:
+                args.append(f"operand0={self.operand0}")
+
+        if self.op1 is not None:
+            op1_name = getattr(self.op1, "__name__", str(self.op1))
+            args.append(f"op1={op1_name}")
+
+            if isinstance(self.operand1, str):
+                args.append(f"operand1={self.operand1}[P, 1]")
+            else:
+                args.append(f"operand1={self.operand1}")
+
+        args_str = ", ".join(args)
+        return f"{self.dest}[P, F] = nisa.tensor_scalar({args_str})"
 
 
 class Activation(BufferNode):
     """
-    Activation operator with optional reduce.
+    Activation operator: Apply an activation function on every element of the input tile.
+
+    NKI Specification:
+    - Data/Dest shape: (P ≤ 128, F) where P=partition, F=free
+    - reduce_res shape: (P, 1) - reduces free axis to size 1
+    - Engine: Scalar Engine (float32 precision)
+
     With reduce:
-        activate_res[...] = nisa.activation(op, data[...], reduce_op, reduce_res[...])
+        dest[P, F] = nisa.activation(op, data[P, F], reduce_op, reduce_res[P, 1])
     No reduce:
-        activate_res[...] = nisa.activation(op, data[...])
+        dest[P, F] = nisa.activation(op, data[P, F])
+
+    Semantic Axes (hardcoded):
+    - "P": Partition axis (≤ 128)
+    - "F": Free axis (reduced if reduce_op specified)
+    - "1": Reduced/singleton dimension
     """
 
-    def __init__(self, dest: str, **kwargs) -> None:
-        super().__init__(op_code="nisa.activation", dest=dest, **kwargs)
+    def __init__(self, dest: str, op, data: str, reduce_op=None, reduce_res: str | None = None) -> None:
+        """
+        Args:
+            dest: Destination tensor name (activation result)
+            op: Activation operation (e.g., nl.relu, nl.tanh, np.square)
+            data: Input data tensor name
+            reduce_op: Optional reduction operator on free dimension (e.g., np.add, np.max)
+            reduce_res: Optional reduction result tensor name with shape (P, 1)
+        """
+        inputs = [data]
+        outputs = [dest]
 
-    def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
-        data_tensor_name = self.kwargs["data"]
-        assert (
-            data_tensor_name in self.tensors
-        ), f"Data tensor {data_tensor_name} not specialized. Cannot infer tensor shapes."
-        data_tensor = self.tensors[data_tensor_name]
-        data_shape = data_tensor.shape
-        if tensor_name == self.kwargs["reduce_res"]:
-            tensor_shape = (*data_shape[:-1], 1)
-        elif tensor_name == self.dest:
-            tensor_shape = data_shape
-        else:
-            raise ValueError(f"Tensor name {tensor_name} not found in {self}")
-        return tensor_shape
+        tensor_axes = {data: ["P", "F"], dest: ["P", "F"]}
 
-    @property
-    def read_tensor_names(self) -> list[str]:
-        return [self.kwargs["data"]]
+        if reduce_res is not None:
+            outputs.append(reduce_res)
+            tensor_axes[reduce_res] = ["P", "1"]
 
-    @property
-    def write_tensor_names(self) -> list[str]:
-        write_names = [self.dest]
-        if "reduce_res" in self.kwargs:
-            write_names.append(self.kwargs["reduce_res"])
-        return write_names
+        super().__init__(op_code="nisa.activation", inputs=inputs, outputs=outputs, tensor_axes=tensor_axes)
+
+        self.dest = dest
+        self.op = op
+        self.data = data
+        self.reduce_op = reduce_op
+        self.reduce_res = reduce_res
+
+    def __repr__(self) -> str:
+        op_name = getattr(self.op, "__name__", str(self.op))
+        args = [f"op={op_name}", f"data={self.data}[P, F]"]
+
+        result = f"{self.dest}[P, F]"
+        if self.reduce_res is not None:
+            reduce_op_name = getattr(self.reduce_op, "__name__", str(self.reduce_op))
+            args.append(f"reduce_op={reduce_op_name}")
+            args.append(f"reduce_res={self.reduce_res}[P, 1]")
+            result = f"{self.dest}[P, F], {self.reduce_res}[P, 1]"
+
+        args_str = ", ".join(args)
+        return f"{result} = nisa.activation({args_str})"
 
 
 class Transpose(BufferNode):
-    """Transpose operator."""
+    """
+    Transpose operator: Perform a 2D transpose swapping partition and free axes.
 
-    def __init__(self, dest: str, **kwargs) -> None:
+    NKI Specification:
+    - Input shape: (P, F) where P=partition, F=free
+    - Output shape: (F, P) - axes swapped
+    - Engine: Tensor or Vector Engine
+
+    Constraints:
+    - Tensor Engine: Input shape ≤ (128, 128)
+    - Vector Engine: Input shape ≤ (32, 32)
+
+    Semantic Axes (hardcoded):
+    - Input: "P" (partition), "F" (free)
+    - Output: "F" (partition), "P" (free)
+
+    Operation: dest[F, P] = nisa.nc_transpose(data[P, F])
+    """
+
+    def __init__(self, dest: str, data: str) -> None:
         """
         Args:
-            data: Source tensor name
             dest: Destination tensor name
-            transpose_axes: List of axes to transpose
+            data: Source tensor name
         """
-        super().__init__(op_code="nisa.nc_transpose", dest=dest, **kwargs)
+        tensor_axes = {data: ["P", "F"], dest: ["F", "P"]}  # Swapped
 
-    @property
-    def read_tensor_names(self) -> list[str]:
-        return [self.kwargs["data"]]
+        super().__init__(op_code="nisa.nc_transpose", inputs=[data], outputs=[dest], tensor_axes=tensor_axes)
 
-    @property
-    def write_tensor_names(self) -> list[str]:
-        return [self.dest]
+        self.dest = dest
+        self.data = data
+
+    def __repr__(self) -> str:
+        return f"{self.dest}[F, P] = nisa.nc_transpose(data={self.data}[P, F])"
 
 
 class Matmul(BufferNode):
-    """Matrix multiplication operator."""
+    """
+    Matrix multiplication operator: Compute stationary.T @ moving.
 
-    def __init__(self, dest: str, **kwargs) -> None:
+    NKI Specification:
+    - Stationary shape: (K ≤ 128, M ≤ 128) where K=contraction, M=rows
+    - Moving shape: (K ≤ 128, N ≤ 512) where K=contraction, N=cols
+    - Result shape: (M, N)
+    - Engine: Tensor Engine (accumulation in float32)
+
+    Operation: dest[M, N] = stationary[K, M].T @ moving[K, N]
+                          = [M, K] @ [K, N]
+                          = [M, N]
+
+    Key insight: Both inputs share the SAME partition axis K (contraction dimension).
+                 Result uses the FREE axes M and N from both inputs.
+
+    Semantic Axes (hardcoded):
+    - "K": Contraction axis (partition, must match in both inputs)
+    - "M": Rows axis (free axis of stationary, becomes partition of result)
+    - "N": Columns axis (free axis of moving, becomes free axis of result)
+
+    Constraints:
+    - Stationary: K ≤ 128, M ≤ 128
+    - Moving: K ≤ 128, N ≤ 512
+    """
+
+    def __init__(self, dest: str, stationary: str, moving: str) -> None:
         """
         Args:
-            src: List of two source tensor names [A, B]
             dest: Destination tensor name
+            stationary: Stationary (LHS) tensor name with shape [K, M]
+            moving: Moving (RHS) tensor name with shape [K, N]
         """
-        super().__init__(op_code="nisa.nc_matmul", dest=dest, **kwargs)
+        tensor_axes = {stationary: ["K", "M"], moving: ["K", "N"], dest: ["M", "N"]}
 
-    def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
-        lhs_tensor_name = self.kwargs["stationary"]
-        rhs_tensor_name = self.kwargs["moving"]
-        assert (
-            lhs_tensor_name in self.tensors
-        ), f"lhs_tensor {lhs_tensor_name} not specialized. Cannot infer tensor shapes."
-        assert (
-            rhs_tensor_name in self.tensors
-        ), f"rhs_tensor {rhs_tensor_name} not specialized. Cannot infer tensor shapes."
-        lhs_tensor = self.tensors[lhs_tensor_name]
-        rhs_tensor = self.tensors[rhs_tensor_name]
-        M, K = lhs_tensor.shape
-        _K, N = rhs_tensor.shape
-        assert K == _K, f"Matmul contraction dimension mismatch: {lhs_tensor.shape} and {rhs_tensor.shape}"
-        if tensor_name == self.dest:
-            tensor_shape = (M, N)
-        else:
-            raise ValueError(f"Tensor name {tensor_name} not found in {self}")
-        return tensor_shape
+        super().__init__(op_code="nisa.nc_matmul", inputs=[stationary, moving], outputs=[dest], tensor_axes=tensor_axes)
 
-    @property
-    def read_tensor_names(self) -> list[str]:
-        return [self.kwargs["stationary"], self.kwargs["moving"]]
+        self.dest = dest
+        self.stationary = stationary
+        self.moving = moving
 
-    @property
-    def write_tensor_names(self) -> list[str]:
-        return [self.dest]
+    def __repr__(self) -> str:
+        return f"{self.dest}[M, N] = nisa.nc_matmul(stationary={self.stationary}[K, M], moving={self.moving}[K, N])"
 
 
 class Allocate(BufferNode):
     """
-    Allocate operator.
+    Allocate operator: Create a new tensor in on-chip memory.
+
+    NKI Specification (nl.ndarray):
+    - Signature: ndarray(shape, dtype, *, buffer=None, name='', **kwargs)
+    - shape: Tuple of integers defining tensor dimensions
+    - dtype: Data type (e.g., nl.float32, nl.int32, nl.bfloat16)
+    - buffer: Memory location (nl.sbuf, nl.psum, nl.shared_hbm)
+    - name: Optional tensor name
+
+    Axes are inferred from shape as dim0, dim1, dim2, etc.
+    Example: shape (128, 512) → axes ["dim0", "dim1"]
     """
 
-    def __init__(self, dest: str, **kwargs) -> None:
-        super().__init__(op_code="nl.ndarray", dest=dest, **kwargs)
+    def __init__(self, dest: str, shape: tuple[int, ...], dtype: str, buffer: str = "nl.sbuf") -> None:
+        """
+        Args:
+            dest: Destination tensor name (used as 'name' parameter)
+            shape: Concrete shape tuple (e.g., (128, 512))
+            dtype: Data type string (e.g., "nl.float32", "nl.int32")
+            buffer: Memory buffer (default: "nl.sbuf", can be "nl.psum", "nl.shared_hbm")
+        """
+        axes = [f"dim{i}" for i in range(len(shape))]
+        tensor_axes = {dest: axes}
 
-    @property
-    def read_tensor_names(self) -> list[str]:
-        return []
+        super().__init__(op_code="nl.ndarray", inputs=[], outputs=[dest], tensor_axes=tensor_axes)
 
-    @property
-    def write_tensor_names(self) -> list[str]:
-        return [self.dest]
+        self.dest = dest
+        self.shape = shape
+        self.dtype = dtype
+        self.buffer = buffer
+
+    def __repr__(self) -> str:
+        axes_str = "[" + ", ".join(self.tensor_axes[self.dest]) + "]"
+        return f"{self.dest}{axes_str} = nl.ndarray(shape={self.shape}, dtype={self.dtype}, buffer={self.buffer}, name='{self.dest}')"
