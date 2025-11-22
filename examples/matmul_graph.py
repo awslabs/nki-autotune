@@ -1,8 +1,8 @@
 import neuronxcc.nki.language as nl
 import numpy as np
 
+from compute_graph.buffer_ops import Activation, Matmul, TensorScalar
 from compute_graph.graph import ComputeGraph
-from compute_graph.operators import Activation, Matmul, TensorScalar
 
 
 def matmul_golden(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:

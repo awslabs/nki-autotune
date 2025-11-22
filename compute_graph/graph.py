@@ -1,4 +1,4 @@
-from compute_graph.nodes import Node
+from compute_graph.hbm_ops import Node
 from compute_graph.tensors import Tensor, create_tensor
 
 
