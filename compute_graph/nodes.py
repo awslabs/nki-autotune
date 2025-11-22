@@ -1,85 +1,46 @@
-from neuronxcc.nki.compiler.backends.neuron.sema import NKIFunc
+class BufferNode:
+    """Base class for on-chip operators."""
 
-from compute_graph.tensors import Tensor
-
-
-class Node:
-    """Base class for compute graph nodes."""
-
-    def __init__(self, op_code: str, dest: str, **kwargs) -> None:
+    def __init__(self, op_code: str, inputs: list[str], outputs: list[str], tensor_axes: dict[str, list[str]]) -> None:
         """
         Args:
-            index: Unique node identifier
-            tensors: Tensors involved in the node (buffer or HBM)
+            op_code: Operation code identifier
+            inputs: List of input tensor names
+            outputs: List of output tensor names
+            tensor_axes: Mapping of tensor names to their axis names
         """
         self.op_code = op_code
-        self.dest = dest
-        self.tensors: dict[str, Tensor] = {}
-        self.kwargs = kwargs
-
-    @property
-    def node_type(self) -> str:
-        if "nisa." in self.op_code:
-            node_type = "compute"
-        elif self.op_code == "nl.load":
-            node_type = "load"
-        elif self.op_code == "nl.ndarray":
-            node_type = "allocate"
-        elif self.op_code == "nl.store":
-            node_type = "store"
-        else:
-            raise ValueError(f"Unknown node type: {self.op_code}")
-        return node_type
-
-    @property
-    def read_tensor_names(self) -> list[str]:
-        """Input tensors read by this node."""
-        raise NotImplementedError(f"read_tensor_names property is not implemented for {self}")
-
-    @property
-    def write_tensor_names(self) -> list[str]:
-        """Output tensors written by this node."""
-        raise NotImplementedError(f"write_tensor_names property is not implemented for {self}")
-
-    @property
-    def tensor_names(self) -> list[str]:
-        """All tensors accessed by this node (read + write)."""
-        return self.read_tensor_names + self.write_tensor_names
+        self.inputs = inputs
+        self.outputs = outputs
+        self.tensor_axes = tensor_axes
+        self.axis_sizes: dict[str, dict[str, int]] = {}
 
     @property
     def is_specialized(self) -> bool:
         specialized = True
-        for tensor_name in self.tensor_names:
-            if tensor_name not in self.tensors:
+        for tensor in self.inputs:
+            if tensor in self.axis_sizes:
+                tensor_axes = self.tensor_axes[tensor]
+                for axis in tensor_axes:
+                    if axis not in self.axis_sizes[tensor]:
+                        specialized = False
+                        break
+            else:
                 specialized = False
                 break
         return specialized
 
-    def specialize(self, tensor_name: str, tensor: Tensor):
-        self.tensors[tensor_name] = tensor
+    def specialize(self, tensor_name: str, axis: str, size: int) -> None:
+        if tensor_name not in self.axis_sizes:
+            self.axis_sizes[tensor_name] = {}
+        self.axis_sizes[tensor_name][axis] = size
 
-    def infer_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
-        raise NotImplementedError(f"infer_tensor_shape is not implemented for {self}")
+    def get_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
+        raise NotImplementedError(f"get_tensor_shape is not implemented for {self}")
 
     def codegen(self) -> str:
         """Generate NKI code for this node."""
         raise NotImplementedError(f"codegen is not implemented for {self}")
 
     def clear_specialization(self) -> None:
-        self.tensors.clear()
-
-    def __repr__(self) -> str:
-        kwargs_strs = []
-        for k, v in self.kwargs.items():
-            if isinstance(v, NKIFunc):
-                kwargs_strs.append(f"{k}=nl.{v.__name__}")
-            elif v in self.tensors:
-                kwargs_strs.append(f"{k}={self.tensors[v]}")
-            else:
-                kwargs_strs.append(f"{k}={v}")
-        kwargs_str = f", ".join(kwargs_strs)
-        if self.dest in self.tensors:
-            dest_str = self.tensors[self.dest]
-        else:
-            dest_str = self.dest
-        return f"{dest_str} = {self.op_code}({kwargs_str})"
+        self.axis_sizes.clear()

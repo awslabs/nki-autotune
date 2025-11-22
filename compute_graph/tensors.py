@@ -30,15 +30,10 @@ class Tensor:
         return f"Tensor({self.name}[{axes_str}])"
 
 
-def shape_to_axes(shape: tuple[int, ...]) -> tuple[Axis, ...]:
+def create_tensor(name: str, shape: tuple[int, ...]) -> Tensor:
     axes: list[Axis] = []
     for size in shape:
         axis = Axis(start_tile=0, end_tile=1, stride=1, tile_size=size)
         axes.append(axis)
-    return tuple(axes)
-
-
-def create_tensor(name: str, shape: tuple[int, ...]) -> Tensor:
-    axes = shape_to_axes(shape)
-    tensor = Tensor(name=name, axes=axes)
+    tensor = Tensor(name=name, axes=tuple(axes))
     return tensor
