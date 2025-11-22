@@ -13,7 +13,7 @@ class Axis:
         return f"{self.start_tile}:{self.end_tile}:{self.stride}x{self.tile_size}={self.size}"
 
 
-class Tensor:
+class HBMTensor:
     """Represents a tensor stored in HBM with tiling configuration."""
 
     def __init__(self, name: str, axes: tuple[Axis, ...]) -> None:
@@ -30,10 +30,16 @@ class Tensor:
         return f"Tensor({self.name}[{axes_str}])"
 
 
-def create_tensor(name: str, shape: tuple[int, ...]) -> Tensor:
+def create_tensor(name: str, shape: tuple[int, ...]) -> HBMTensor:
     axes: list[Axis] = []
     for size in shape:
         axis = Axis(start_tile=0, end_tile=1, stride=1, tile_size=size)
         axes.append(axis)
-    tensor = Tensor(name=name, axes=tuple(axes))
+    tensor = HBMTensor(name=name, axes=tuple(axes))
     return tensor
+
+
+class BufferTensor:
+    def __init__(self, name: str, shape: tuple[int, ...]) -> None:
+        self.name = name
+        self.shape = shape
