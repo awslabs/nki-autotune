@@ -5,17 +5,8 @@ from compute_graph.buffer_ops import Activation, Matmul, TensorScalar
 from compute_graph.graph import ComputeGraph
 
 
-def matmul_golden(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    result = np.matmul(lhs, rhs)
-    return result
-
-
 def test_graph_gen() -> None:
     """Test data reuse graph transformation with a single merge."""
-    TILE_M = 128
-    TILE_N = 512
-    TILE_K = 512
-
     M = 256
     K = 1024
     N = 512
@@ -35,7 +26,7 @@ def test_graph_gen() -> None:
             ),
             Activation(dest="rmsnorm_factor", op=nl.rsqrt, data="rmsnorm_factor"),
             TensorScalar(dest="lhs_norm", data="lhs", op0=np.multiply, operand0="rmsnorm_factor"),
-            Matmul(dest="output", lhs="lhs_norm", rhs="rhs"),
+            Matmul(dest="output", lhs="lhs_norm", rhs="rhs", lhs_transposed=False),
         ]
     )
     rmsnorm_matmul_graph.specialize(inputs={"lhs": (M, K), "rhs": (K, N)}, output="output")

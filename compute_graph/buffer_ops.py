@@ -1,81 +1,85 @@
 class BufferNode:
     """Base class for on-chip operators."""
 
-    def __init__(self, op_code: str, inputs: list[str], outputs: list[str], tensor_axes: dict[str, list[str]]) -> None:
+    def __init__(
+        self,
+        input_semantics: list[str],
+        output_semantics: list[str],
+        semantic_to_axes: dict[str, list[str]],
+        semantic_to_name: dict[str, str],
+    ) -> None:
         """
         Args:
-            op_code: Operation code identifier
-            inputs: List of input tensor names
-            outputs: List of output tensor names
-            tensor_axes: Mapping of tensor names to their axis names
+            input_semantics: Semantic names of input tensors
+            output_semantics: Semantic names of output tensors
+            semantic_to_axes: Maps semantic names to their axis lists
+            semantic_to_name: Maps semantic names to tensor variable names
         """
-        self.op_code = op_code
-        self.inputs = inputs
-        self.outputs = outputs
-        self.tensor_axes = tensor_axes
+        self.input_semantics = input_semantics
+        self.output_semantics = output_semantics
+        self.semantic_to_axes = semantic_to_axes
+        self.semantic_to_name = semantic_to_name
+        for semantic_name in input_semantics + output_semantics:
+            assert semantic_name in semantic_to_axes, f"Semantic tensor {semantic_name} is missing axes"
+            assert semantic_name in semantic_to_name, f"Semantic tensor {semantic_name} is missing variable name"
         self.axis_sizes: dict[str, int] = {}
         self._populate_constant_axes()
 
     def _populate_constant_axes(self) -> None:
-        """Detect and populate axis_sizes for constant axes (numeric strings).
-
-        Constant axes are axis names that can be parsed as positive integers,
-        such as "1" for singleton dimensions or "128" for fixed tile sizes.
-        This allows operators to use numeric strings as constant dimensions
-        without requiring explicit specialization.
-        """
-        seen_constants = set()
-        for tensor_name, axes in self.tensor_axes.items():
+        """Populate axis_sizes for constant axes (numeric axis names like "1" or "128")."""
+        for semantic_name in self.semantic_to_axes:
+            axes = self.semantic_to_axes[semantic_name]
             for axis in axes:
-                if axis not in seen_constants:
-                    try:
-                        size = int(axis)
-                        if size > 0:
-                            self.axis_sizes[axis] = size
-                            seen_constants.add(axis)
-                    except ValueError:
-                        pass
+                try:
+                    size = int(axis)
+                    self.axis_sizes[axis] = size
+                except ValueError:
+                    pass
 
     @property
     def is_specialized(self) -> bool:
-        all_tensors = self.inputs + self.outputs
-        return all(axis in self.axis_sizes for tensor in all_tensors for axis in self.tensor_axes[tensor])
+        specialized = True
+        semantics = self.input_semantics + self.output_semantics
+        for semantic_name in semantics:
+            axes = self.semantic_to_axes[semantic_name]
+            for axis in axes:
+                if axis not in self.axis_sizes:
+                    specialized = False
+        return specialized
 
-    def specialize(self, tensor_name: str, shape: tuple[int, ...]) -> None:
-        print(f"Specialize {tensor_name} {shape}")
-        for axis, size in zip(self.tensor_axes[tensor_name], shape):
-            if axis in self.axis_sizes:
-                if self.axis_sizes[axis] != size:
-                    raise ValueError(
-                        f"Cannot overwrite axis size {tensor_name}.{axis}: "
-                        f"already set to {self.axis_sizes[axis]}, trying to set to {size} in {self}."
-                    )
-                continue
+    def specialize(self, semantic_name: str, shape: tuple[int, ...]) -> None:
+        expected_axes = self.semantic_to_axes[semantic_name]
+        if len(shape) != len(expected_axes):
+            raise ValueError(
+                f"Shape mismatch for '{semantic_name}': expected {len(expected_axes)} dimensions {expected_axes} "
+                f"but got {len(shape)} dimensions {shape}"
+            )
+        for axis, size in zip(expected_axes, shape):
+            if axis in self.axis_sizes and self.axis_sizes[axis] != size:
+                raise ValueError(
+                    f"Cannot overwrite axis size {semantic_name}.{axis}: "
+                    f"already set to {self.axis_sizes[axis]}, trying to set to {size} in {self}."
+                )
             self.axis_sizes[axis] = size
 
-    def get_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
+    def get_tensor_shape(self, semantic_name: str) -> tuple[int, ...]:
         """Get the shape of a tensor by looking up axis sizes.
 
         Args:
-            tensor_name: Name of the tensor to get shape for
+            semantic_name: Name of the tensor to get shape for
 
         Returns:
             Tuple of axis sizes representing the tensor shape
 
         Raises:
-            ValueError: If tensor_name is not in tensor_axes or if any required axis is not specialized
+            ValueError: If semantic_name is not in tensor_axes or if any required axis is not specialized
         """
-        if tensor_name not in self.tensor_axes:
-            raise ValueError(f"Tensor '{tensor_name}' not found in tensor_axes of {self}")
-
-        axes = self.tensor_axes[tensor_name]
+        axes = self.semantic_to_axes[semantic_name]
         shape: list[int] = []
-
         for axis in axes:
             if axis not in self.axis_sizes:
-                raise ValueError(f"Axis '{axis}' for tensor '{tensor_name}' is not specialized yet in {self}. ")
+                raise ValueError(f"Axis '{axis}' for tensor '{semantic_name}' is not specialized yet in {self}. ")
             shape.append(self.axis_sizes[axis])
-
         return tuple(shape)
 
     def codegen(self) -> str:
@@ -85,50 +89,30 @@ class BufferNode:
     def clear_specialization(self) -> None:
         self.axis_sizes.clear()
 
-    def _format_tensor(self, tensor_name: str) -> str:
-        """Format tensor name with its axes, showing sizes if specialized.
-
-        Args:
-            tensor_name: Name of the tensor to format
-
-        Returns:
-            Formatted string like "tensor[P, F]" or "tensor[P=128, F=512]" if specialized
-        """
-        axes = self.tensor_axes.get(tensor_name, [])
-
-        if axes:
-            axis_strs = []
-            for axis in axes:
-                if axis in self.axis_sizes:
-                    axis_strs.append(f"{self.axis_sizes[axis]}")
-                else:
-                    axis_strs.append(axis)
-            result = f"{tensor_name}[{', '.join(axis_strs)}]"
-        else:
-            result = tensor_name
-
+    def _format_tensor(self, semantic_name: str) -> str:
+        """Format tensor as 'name[axes]' showing sizes if specialized."""
+        axes = self.semantic_to_axes[semantic_name]
+        axis_strs = []
+        for axis in axes:
+            if axis in self.axis_sizes:
+                axis_strs.append(f"{self.axis_sizes[axis]}")
+            else:
+                axis_strs.append(axis)
+        tensor_name = self.semantic_to_name[semantic_name]
+        axis_str = ", ".join(axis_strs)
+        result = f"{tensor_name}[{axis_str}]"
         return result
 
     def __repr__(self) -> str:
         """String representation of the node."""
-        return f"{self.op_code}(inputs={self.inputs}, outputs={self.outputs})"
+        raise NotImplementedError(f"repr is not implemented for the base BufferNode class.")
 
 
 class TensorScalar(BufferNode):
-    """
-    Tensor-scalar operator: Apply up to two math operators to input data tile
-    by broadcasting scalar/vector operands.
+    """Element-wise operations on data tiles with scalar/vector operands.
 
-    NKI Specification:
-    - Data/Dest shape: (P, F) where P=partition axis, F=free axis
-    - Operand tensors (if not scalar): (P, 1) - broadcasts along partition axis
-    - Operation: dest = (data op0 operand0) op1 operand1
-    - Engine: Vector, Scalar, or GpSimd Engine
-
-    Semantic Axes (hardcoded):
-    - "P": Partition axis (for parallelism)
-    - "F": Free axis (for data layout)
-    - "1": Reduced/singleton dimension
+    Supports chaining up to two operations with broadcasting along partition axis.
+    Data and destination have shape (P, F); operands are scalars or (P, 1) vectors.
     """
 
     def __init__(
@@ -137,136 +121,115 @@ class TensorScalar(BufferNode):
         """
         Args:
             dest: Destination tensor name
-            data: Input data tensor name
-            op0: First operator (e.g., np.multiply, np.add)
-            operand0: First operand (scalar value or tensor name with shape (P, 1))
-            op1: Second operator (optional)
-            operand1: Second operand (optional, scalar value or tensor name with shape (P, 1))
+            data: Input tensor name
+            op0: First operator
+            operand0: First operand (scalar or tensor name)
+            op1: Second operator
+            operand1: Second operand (scalar or tensor name)
         """
-        inputs = [data]
-        tensor_axes = {data: ["P", "F"], dest: ["P", "F"]}
+        input_semantics = ["data"]
+        output_semantics = ["dest"]
+        semantic_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
+        semantic_to_name = {"data": data, "dest": dest}
 
         if isinstance(operand0, str):
-            inputs.append(operand0)
-            tensor_axes[operand0] = ["P", "1"]
+            input_semantics.append("operand0")
+            semantic_to_axes["operand0"] = ["P", "1"]
+            semantic_to_name["operand0"] = operand0
 
         if isinstance(operand1, str):
-            inputs.append(operand1)
-            tensor_axes[operand1] = ["P", "1"]
+            input_semantics.append("operand1")
+            semantic_to_axes["operand1"] = ["P", "1"]
+            semantic_to_name["operand1"] = operand1
 
-        super().__init__(op_code="nisa.tensor_scalar", inputs=inputs, outputs=[dest], tensor_axes=tensor_axes)
+        super().__init__(
+            input_semantics=input_semantics,
+            output_semantics=output_semantics,
+            semantic_to_axes=semantic_to_axes,
+            semantic_to_name=semantic_to_name,
+        )
 
-        self.dest = dest
-        self.data = data
         self.op0 = op0
         self.operand0 = operand0
         self.op1 = op1
         self.operand1 = operand1
 
     def __repr__(self) -> str:
-        args = [f"data={self._format_tensor(self.data)}"]
+        args = [f"data={self._format_tensor('data')}"]
 
-        if self.op0 is not None:
-            op0_name = getattr(self.op0, "__name__", str(self.op0))
-            args.append(f"op0={op0_name}")
+        op0_name = getattr(self.op0, "__name__", str(self.op0))
+        args.append(f"op0={op0_name}")
 
-            if isinstance(self.operand0, str):
-                args.append(f"operand0={self._format_tensor(self.operand0)}")
-            else:
-                args.append(f"operand0={self.operand0}")
+        if isinstance(self.operand0, str):
+            args.append(f"operand0={self._format_tensor('operand0')}")
+        else:
+            args.append(f"operand0={self.operand0}")
 
         if self.op1 is not None:
             op1_name = getattr(self.op1, "__name__", str(self.op1))
             args.append(f"op1={op1_name}")
 
             if isinstance(self.operand1, str):
-                args.append(f"operand1={self._format_tensor(self.operand1)}")
+                args.append(f"operand1={self._format_tensor('operand1')}")
             else:
                 args.append(f"operand1={self.operand1}")
 
         args_str = ", ".join(args)
-        return f"{self._format_tensor(self.dest)} = nisa.tensor_scalar({args_str})"
+        return f"{self._format_tensor('dest')} = nisa.tensor_scalar({args_str})"
 
 
 class Activation(BufferNode):
-    """
-    Activation operator: Apply an activation function on every element of the input tile.
+    """Apply activation functions element-wise to input tiles.
 
-    NKI Specification:
-    - Data/Dest shape: (P ≤ 128, F) where P=partition, F=free
-    - reduce_res shape: (P, 1) - reduces free axis to size 1
-    - Engine: Scalar Engine (float32 precision)
-
-    With reduce:
-        dest[P, F] = nisa.activation(op, data[P, F], reduce_op, reduce_res[P, 1])
-    No reduce:
-        dest[P, F] = nisa.activation(op, data[P, F])
-
-    Semantic Axes (hardcoded):
-    - "P": Partition axis (≤ 128)
-    - "F": Free axis (reduced if reduce_op specified)
-    - "1": Reduced/singleton dimension
+    Optionally reduces along the free axis to shape (P, 1).
+    Input and output shapes: (P, F) where P is partition, F is free axis.
     """
 
     def __init__(self, dest: str, op, data: str, reduce_op=None, reduce_res: str | None = None) -> None:
         """
         Args:
-            dest: Destination tensor name (activation result)
-            op: Activation operation (e.g., nl.relu, nl.tanh, np.square)
-            data: Input data tensor name
-            reduce_op: Optional reduction operator on free dimension (e.g., np.add, np.max)
-            reduce_res: Optional reduction result tensor name with shape (P, 1)
+            dest: Destination tensor name
+            op: Activation operation
+            data: Input tensor name
+            reduce_op: Reduction operator for free dimension
+            reduce_res: Reduction result tensor name
         """
-        inputs = [data]
-        outputs = [dest]
+        input_semantics = ["data"]
+        output_semantics = ["dest"]
+        semantic_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
+        semantic_to_name = {"dest": dest, "data": data}
+        if reduce_res:
+            output_semantics.append("reduce_res")
+            semantic_to_axes["reduce_res"] = ["P", "1"]
+            semantic_to_name["reduce_res"] = reduce_res
+        super().__init__(
+            input_semantics=input_semantics,
+            output_semantics=output_semantics,
+            semantic_to_axes=semantic_to_axes,
+            semantic_to_name=semantic_to_name,
+        )
 
-        tensor_axes = {data: ["P", "F"], dest: ["P", "F"]}
-
-        if reduce_res is not None:
-            outputs.append(reduce_res)
-            tensor_axes[reduce_res] = ["P", "1"]
-
-        super().__init__(op_code="nisa.activation", inputs=inputs, outputs=outputs, tensor_axes=tensor_axes)
-
-        self.dest = dest
         self.op = op
-        self.data = data
         self.reduce_op = reduce_op
-        self.reduce_res = reduce_res
 
     def __repr__(self) -> str:
         op_name = getattr(self.op, "__name__", str(self.op))
-        args = [f"op={op_name}", f"data={self._format_tensor(self.data)}"]
-
-        result = self._format_tensor(self.dest)
-        if self.reduce_res is not None:
+        data_str = self._format_tensor("data")
+        args = [f"op={op_name}", f"data={data_str}"]
+        result = self._format_tensor("dest")
+        if "reduce_res" in self.semantic_to_name and self.semantic_to_name["reduce_res"]:
             reduce_op_name = getattr(self.reduce_op, "__name__", str(self.reduce_op))
+            reduce_res_str = self._format_tensor("reduce_res")
             args.append(f"reduce_op={reduce_op_name}")
-            args.append(f"reduce_res={self._format_tensor(self.reduce_res)}")
-            result = f"{self._format_tensor(self.dest)}"
-
+            args.append(f"reduce_res={reduce_res_str}")
         args_str = ", ".join(args)
         return f"{result} = nisa.activation({args_str})"
 
 
 class Transpose(BufferNode):
-    """
-    Transpose operator: Perform a 2D transpose swapping partition and free axes.
+    """2D transpose swapping partition and free axes.
 
-    NKI Specification:
-    - Input shape: (P, F) where P=partition, F=free
-    - Output shape: (F, P) - axes swapped
-    - Engine: Tensor or Vector Engine
-
-    Constraints:
-    - Tensor Engine: Input shape ≤ (128, 128)
-    - Vector Engine: Input shape ≤ (32, 32)
-
-    Semantic Axes (hardcoded):
-    - Input: "P" (partition), "F" (free)
-    - Output: "F" (partition), "P" (free)
-
-    Operation: dest[F, P] = nisa.nc_transpose(data[P, F])
+    Transforms input (P, F) to output (F, P).
     """
 
     def __init__(self, dest: str, data: str) -> None:
@@ -275,89 +238,122 @@ class Transpose(BufferNode):
             dest: Destination tensor name
             data: Source tensor name
         """
-        tensor_axes = {data: ["P", "F"], dest: ["F", "P"]}  # Swapped
+        input_semantics = ["data"]
+        output_semantics = ["dest"]
+        semantic_to_axes = {"data": ["P", "F"], "dest": ["F", "P"]}
+        semantic_to_name = {"data": data, "dest": dest}
 
-        super().__init__(op_code="nisa.nc_transpose", inputs=[data], outputs=[dest], tensor_axes=tensor_axes)
-
-        self.dest = dest
-        self.data = data
+        super().__init__(
+            input_semantics=input_semantics,
+            output_semantics=output_semantics,
+            semantic_to_axes=semantic_to_axes,
+            semantic_to_name=semantic_to_name,
+        )
 
     def __repr__(self) -> str:
-        return f"{self._format_tensor(self.dest)} = nisa.nc_transpose(data={self._format_tensor(self.data)})"
+        return f"{self._format_tensor('dest')} = nisa.nc_transpose(data={self._format_tensor('data')})"
 
 
-class Matmul(BufferNode):
-    """
-    Matrix multiplication operator: Compute lhs @ rhs with standard matmul semantics.
+class TileTranspose(BufferNode):
+    """In-tile transpose maintaining (P, F) shape.
 
-    Specification:
-    - LHS shape: (M, K) with axes ["M", "K"]
-    - RHS shape: (K, N) with axes ["K", "N"]
-    - Result shape: (M, N) with axes ["M", "N"]
-    - Operation: dest[M, N] = lhs[M, K] @ rhs[K, N]
-    - Engine: Tensor Engine (accumulation in float32)
-
-    Semantic Axes:
-    - "M": Rows axis (output rows, first axis of result)
-    - "K": Contraction axis (shared between lhs and rhs)
-    - "N": Columns axis (output columns, second axis of result)
-
-    Constraints:
-    - LHS: M ≤ 128, K ≤ 128
-    - RHS: K ≤ 128, N ≤ 512
+    Rearranges element layout within the tile without changing axes,
+    unlike nc_transpose which swaps partition and free dimensions.
     """
 
-    def __init__(self, dest: str, lhs: str, rhs: str) -> None:
+    def __init__(self, dest: str, data: str) -> None:
         """
         Args:
             dest: Destination tensor name
-            lhs: Left-hand side tensor name with shape [M, K]
-            rhs: Right-hand side tensor name with shape [K, N]
+            data: Source tensor name
         """
-        tensor_axes = {lhs: ["M", "K"], rhs: ["K", "N"], dest: ["M", "N"]}
+        input_semantics = ["data"]
+        output_semantics = ["dest"]
+        semantic_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
+        semantic_to_name = {"data": data, "dest": dest}
 
-        super().__init__(op_code="nisa.nc_matmul", inputs=[lhs, rhs], outputs=[dest], tensor_axes=tensor_axes)
-
-        self.dest = dest
-        self.lhs = lhs
-        self.rhs = rhs
+        super().__init__(
+            input_semantics=input_semantics,
+            output_semantics=output_semantics,
+            semantic_to_axes=semantic_to_axes,
+            semantic_to_name=semantic_to_name,
+        )
 
     def __repr__(self) -> str:
-        return f"{self._format_tensor(self.dest)} = {self._format_tensor(self.lhs)} @ {self._format_tensor(self.rhs)}"
+        return f"{self._format_tensor('dest')} = TileTranspose(data={self._format_tensor('data')})"
+
+
+class Matmul(BufferNode):
+    """Matrix multiplication: lhs @ rhs with optional lhs transpose.
+
+    Computes (M, K) @ (K, N) → (M, N), or (K, M).T @ (K, N) → (M, N).
+    M, K, N represent rows, contraction, and columns axes respectively.
+    """
+
+    def __init__(self, dest: str, lhs: str, rhs: str, lhs_transposed: bool) -> None:
+        """
+        Args:
+            dest: Destination tensor name
+            lhs: Left operand (M, K) or (K, M) if transposed
+            rhs: Right operand (K, N)
+            lhs_transposed: Whether lhs is transposed
+        """
+        input_semantics = ["lhs", "rhs"]
+        output_semantics = ["dest"]
+
+        if lhs_transposed:
+            semantic_to_axes = {"lhs": ["K", "M"], "rhs": ["K", "N"], "dest": ["M", "N"]}
+        else:
+            semantic_to_axes = {"lhs": ["M", "K"], "rhs": ["K", "N"], "dest": ["M", "N"]}
+
+        semantic_to_name = {"lhs": lhs, "rhs": rhs, "dest": dest}
+
+        super().__init__(
+            input_semantics=input_semantics,
+            output_semantics=output_semantics,
+            semantic_to_axes=semantic_to_axes,
+            semantic_to_name=semantic_to_name,
+        )
+
+        self.lhs_transposed = lhs_transposed
+
+    def __repr__(self) -> str:
+        return f"{self._format_tensor('dest')} = {self._format_tensor('lhs')} @ {self._format_tensor('rhs')}"
 
 
 class Allocate(BufferNode):
-    """
-    Allocate operator: Create a new tensor in on-chip memory.
+    """Allocate a tensor in on-chip memory.
 
-    NKI Specification (nl.ndarray):
-    - Signature: ndarray(shape, dtype, *, buffer=None, name='', **kwargs)
-    - shape: Tuple of integers defining tensor dimensions
-    - dtype: Data type (e.g., nl.float32, nl.int32, nl.bfloat16)
-    - buffer: Memory location (nl.sbuf, nl.psum, nl.shared_hbm)
-    - name: Optional tensor name
-
-    Axes are inferred from shape as dim0, dim1, dim2, etc.
-    Example: shape (128, 512) → axes ["dim0", "dim1"]
+    Creates nl.ndarray with specified shape, dtype, and buffer location.
+    Axes are auto-generated as dim0, dim1, etc. based on shape.
     """
 
     def __init__(self, dest: str, shape: tuple[int, ...], dtype: str, buffer: str = "nl.sbuf") -> None:
         """
         Args:
-            dest: Destination tensor name (used as 'name' parameter)
-            shape: Concrete shape tuple (e.g., (128, 512))
-            dtype: Data type string (e.g., "nl.float32", "nl.int32")
-            buffer: Memory buffer (default: "nl.sbuf", can be "nl.psum", "nl.shared_hbm")
+            dest: Tensor name
+            shape: Shape tuple
+            dtype: Data type (e.g., "nl.float32")
+            buffer: Memory buffer location
         """
         axes = [f"dim{i}" for i in range(len(shape))]
-        tensor_axes = {dest: axes}
 
-        super().__init__(op_code="nl.ndarray", inputs=[], outputs=[dest], tensor_axes=tensor_axes)
+        input_semantics = []
+        output_semantics = ["dest"]
+        semantic_to_axes = {"dest": axes}
+        semantic_to_name = {"dest": dest}
 
-        self.dest = dest
+        super().__init__(
+            input_semantics=input_semantics,
+            output_semantics=output_semantics,
+            semantic_to_axes=semantic_to_axes,
+            semantic_to_name=semantic_to_name,
+        )
+
         self.shape = shape
         self.dtype = dtype
         self.buffer = buffer
 
     def __repr__(self) -> str:
-        return f"{self._format_tensor(self.dest)} = nl.ndarray(shape={self.shape}, dtype={self.dtype}, buffer={self.buffer}, name='{self.dest}')"
+        dest_name = self.semantic_to_name["dest"]
+        return f"{self._format_tensor('dest')} = nl.ndarray(shape={self.shape}, dtype={self.dtype}, buffer={self.buffer}, name='{dest_name}')"
