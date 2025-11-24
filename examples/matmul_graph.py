@@ -35,21 +35,10 @@ def test_graph_gen() -> None:
             ),
             Activation(dest="rmsnorm_factor", op=nl.rsqrt, data="rmsnorm_factor"),
             TensorScalar(dest="lhs_norm", data="lhs", op0=np.multiply, operand0="rmsnorm_factor"),
-            Matmul(dest="output", stationary="lhs_norm", moving="rhs"),
+            Matmul(dest="output", lhs="lhs_norm", rhs="rhs"),
         ]
     )
-    rmsnorm_matmul_graph.trace(inputs={"lhs": (M, K), "rhs": (K, N)}, outputs=["output"])
-    # save_graph(
-    #     rmsnorm_matmul_graph,
-    #     output_file="/fsx/weittang/kernelgen-cache/rmsnorm_matmul.png",
-    #     title="RMSNorm + Matmul ComputeGraph",
-    # )
-
-    # codegen = NKICodegen(rmsnorm_matmul_graph)
-    # kernel_code = codegen.generate_kernel("rmsnorm_matmul_kernel")
-    # output_file = "/fsx/weittang/kernelgen-cache/rmsnorm_matmul_kernel.py"
-    # with open(output_file, "w") as f:
-    #     f.write(kernel_code)
+    rmsnorm_matmul_graph.specialize(inputs={"lhs": (M, K), "rhs": (K, N)}, output="output")
 
 
 if __name__ == "__main__":
