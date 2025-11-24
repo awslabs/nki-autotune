@@ -14,15 +14,44 @@ class BufferNode:
         self.outputs = outputs
         self.tensor_axes = tensor_axes
         self.axis_sizes: dict[str, int] = {}
+        self._populate_constant_axes()
+
+    def _populate_constant_axes(self) -> None:
+        """Detect and populate axis_sizes for constant axes (numeric strings).
+
+        Constant axes are axis names that can be parsed as positive integers,
+        such as "1" for singleton dimensions or "128" for fixed tile sizes.
+        This allows operators to use numeric strings as constant dimensions
+        without requiring explicit specialization.
+        """
+        seen_constants = set()
+        for tensor_name, axes in self.tensor_axes.items():
+            for axis in axes:
+                if axis not in seen_constants:
+                    try:
+                        size = int(axis)
+                        if size > 0:
+                            self.axis_sizes[axis] = size
+                            seen_constants.add(axis)
+                    except ValueError:
+                        pass
 
     @property
     def is_specialized(self) -> bool:
-        return all(axis in self.axis_sizes for tensor in self.inputs for axis in self.tensor_axes[tensor])
+        all_tensors = self.inputs + self.outputs
+        return all(axis in self.axis_sizes for tensor in all_tensors for axis in self.tensor_axes[tensor])
 
-    def specialize(self, axis: str, size: int) -> None:
-        if axis in self.axis_sizes:
-            raise ValueError(f"Cannot overwrite axis size {axis} in {self}.")
-        self.axis_sizes[axis] = size
+    def specialize(self, tensor_name: str, shape: tuple[int, ...]) -> None:
+        print(f"Specialize {tensor_name} {shape}")
+        for axis, size in zip(self.tensor_axes[tensor_name], shape):
+            if axis in self.axis_sizes:
+                if self.axis_sizes[axis] != size:
+                    raise ValueError(
+                        f"Cannot overwrite axis size {tensor_name}.{axis}: "
+                        f"already set to {self.axis_sizes[axis]}, trying to set to {size} in {self}."
+                    )
+                continue
+            self.axis_sizes[axis] = size
 
     def get_tensor_shape(self, tensor_name: str) -> tuple[int, ...]:
         """Get the shape of a tensor by looking up axis sizes.
@@ -40,7 +69,7 @@ class BufferNode:
             raise ValueError(f"Tensor '{tensor_name}' not found in tensor_axes of {self}")
 
         axes = self.tensor_axes[tensor_name]
-        shape = []
+        shape: list[int] = []
 
         for axis in axes:
             if axis not in self.axis_sizes:
@@ -55,6 +84,30 @@ class BufferNode:
 
     def clear_specialization(self) -> None:
         self.axis_sizes.clear()
+
+    def _format_tensor(self, tensor_name: str) -> str:
+        """Format tensor name with its axes, showing sizes if specialized.
+
+        Args:
+            tensor_name: Name of the tensor to format
+
+        Returns:
+            Formatted string like "tensor[P, F]" or "tensor[P=128, F=512]" if specialized
+        """
+        axes = self.tensor_axes.get(tensor_name, [])
+
+        if axes:
+            axis_strs = []
+            for axis in axes:
+                if axis in self.axis_sizes:
+                    axis_strs.append(f"{self.axis_sizes[axis]}")
+                else:
+                    axis_strs.append(axis)
+            result = f"{tensor_name}[{', '.join(axis_strs)}]"
+        else:
+            result = tensor_name
+
+        return result
 
     def __repr__(self) -> str:
         """String representation of the node."""
@@ -79,13 +132,7 @@ class TensorScalar(BufferNode):
     """
 
     def __init__(
-        self,
-        dest: str,
-        data: str,
-        op0,
-        operand0: float | str,
-        op1: str | None = None,
-        operand1: float | str | None = None,
+        self, dest: str, data: str, op0, operand0: float | str, op1=None, operand1: float | str | None = None
     ) -> None:
         """
         Args:
@@ -117,14 +164,14 @@ class TensorScalar(BufferNode):
         self.operand1 = operand1
 
     def __repr__(self) -> str:
-        args = [f"data={self.data}[P, F]"]
+        args = [f"data={self._format_tensor(self.data)}"]
 
         if self.op0 is not None:
             op0_name = getattr(self.op0, "__name__", str(self.op0))
             args.append(f"op0={op0_name}")
 
             if isinstance(self.operand0, str):
-                args.append(f"operand0={self.operand0}[P, 1]")
+                args.append(f"operand0={self._format_tensor(self.operand0)}")
             else:
                 args.append(f"operand0={self.operand0}")
 
@@ -133,12 +180,12 @@ class TensorScalar(BufferNode):
             args.append(f"op1={op1_name}")
 
             if isinstance(self.operand1, str):
-                args.append(f"operand1={self.operand1}[P, 1]")
+                args.append(f"operand1={self._format_tensor(self.operand1)}")
             else:
                 args.append(f"operand1={self.operand1}")
 
         args_str = ", ".join(args)
-        return f"{self.dest}[P, F] = nisa.tensor_scalar({args_str})"
+        return f"{self._format_tensor(self.dest)} = nisa.tensor_scalar({args_str})"
 
 
 class Activation(BufferNode):
@@ -189,14 +236,14 @@ class Activation(BufferNode):
 
     def __repr__(self) -> str:
         op_name = getattr(self.op, "__name__", str(self.op))
-        args = [f"op={op_name}", f"data={self.data}[P, F]"]
+        args = [f"op={op_name}", f"data={self._format_tensor(self.data)}"]
 
-        result = f"{self.dest}[P, F]"
+        result = self._format_tensor(self.dest)
         if self.reduce_res is not None:
             reduce_op_name = getattr(self.reduce_op, "__name__", str(self.reduce_op))
             args.append(f"reduce_op={reduce_op_name}")
-            args.append(f"reduce_res={self.reduce_res}[P, 1]")
-            result = f"{self.dest}[P, F], {self.reduce_res}[P, 1]"
+            args.append(f"reduce_res={self._format_tensor(self.reduce_res)}")
+            result = f"{self._format_tensor(self.dest)}"
 
         args_str = ", ".join(args)
         return f"{result} = nisa.activation({args_str})"
@@ -236,53 +283,47 @@ class Transpose(BufferNode):
         self.data = data
 
     def __repr__(self) -> str:
-        return f"{self.dest}[F, P] = nisa.nc_transpose(data={self.data}[P, F])"
+        return f"{self._format_tensor(self.dest)} = nisa.nc_transpose(data={self._format_tensor(self.data)})"
 
 
 class Matmul(BufferNode):
     """
-    Matrix multiplication operator: Compute stationary.T @ moving.
+    Matrix multiplication operator: Compute lhs @ rhs with standard matmul semantics.
 
-    NKI Specification:
-    - Stationary shape: (K ≤ 128, M ≤ 128) where K=contraction, M=rows
-    - Moving shape: (K ≤ 128, N ≤ 512) where K=contraction, N=cols
-    - Result shape: (M, N)
+    Specification:
+    - LHS shape: (M, K) with axes ["M", "K"]
+    - RHS shape: (K, N) with axes ["K", "N"]
+    - Result shape: (M, N) with axes ["M", "N"]
+    - Operation: dest[M, N] = lhs[M, K] @ rhs[K, N]
     - Engine: Tensor Engine (accumulation in float32)
 
-    Operation: dest[M, N] = stationary[K, M].T @ moving[K, N]
-                          = [M, K] @ [K, N]
-                          = [M, N]
-
-    Key insight: Both inputs share the SAME partition axis K (contraction dimension).
-                 Result uses the FREE axes M and N from both inputs.
-
-    Semantic Axes (hardcoded):
-    - "K": Contraction axis (partition, must match in both inputs)
-    - "M": Rows axis (free axis of stationary, becomes partition of result)
-    - "N": Columns axis (free axis of moving, becomes free axis of result)
+    Semantic Axes:
+    - "M": Rows axis (output rows, first axis of result)
+    - "K": Contraction axis (shared between lhs and rhs)
+    - "N": Columns axis (output columns, second axis of result)
 
     Constraints:
-    - Stationary: K ≤ 128, M ≤ 128
-    - Moving: K ≤ 128, N ≤ 512
+    - LHS: M ≤ 128, K ≤ 128
+    - RHS: K ≤ 128, N ≤ 512
     """
 
-    def __init__(self, dest: str, stationary: str, moving: str) -> None:
+    def __init__(self, dest: str, lhs: str, rhs: str) -> None:
         """
         Args:
             dest: Destination tensor name
-            stationary: Stationary (LHS) tensor name with shape [K, M]
-            moving: Moving (RHS) tensor name with shape [K, N]
+            lhs: Left-hand side tensor name with shape [M, K]
+            rhs: Right-hand side tensor name with shape [K, N]
         """
-        tensor_axes = {stationary: ["K", "M"], moving: ["K", "N"], dest: ["M", "N"]}
+        tensor_axes = {lhs: ["M", "K"], rhs: ["K", "N"], dest: ["M", "N"]}
 
-        super().__init__(op_code="nisa.nc_matmul", inputs=[stationary, moving], outputs=[dest], tensor_axes=tensor_axes)
+        super().__init__(op_code="nisa.nc_matmul", inputs=[lhs, rhs], outputs=[dest], tensor_axes=tensor_axes)
 
         self.dest = dest
-        self.stationary = stationary
-        self.moving = moving
+        self.lhs = lhs
+        self.rhs = rhs
 
     def __repr__(self) -> str:
-        return f"{self.dest}[M, N] = nisa.nc_matmul(stationary={self.stationary}[K, M], moving={self.moving}[K, N])"
+        return f"{self._format_tensor(self.dest)} = {self._format_tensor(self.lhs)} @ {self._format_tensor(self.rhs)}"
 
 
 class Allocate(BufferNode):
@@ -319,5 +360,4 @@ class Allocate(BufferNode):
         self.buffer = buffer
 
     def __repr__(self) -> str:
-        axes_str = "[" + ", ".join(self.tensor_axes[self.dest]) + "]"
-        return f"{self.dest}{axes_str} = nl.ndarray(shape={self.shape}, dtype={self.dtype}, buffer={self.buffer}, name='{self.dest}')"
+        return f"{self._format_tensor(self.dest)} = nl.ndarray(shape={self.shape}, dtype={self.dtype}, buffer={self.buffer}, name='{self.dest}')"
