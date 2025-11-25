@@ -22,16 +22,16 @@ class BufferOp:
         self.output_args = output_args
         self.arg_to_axes = arg_to_axes
         self.arg_to_var = arg_to_var
-        for semantic_name in input_args + output_args:
-            assert semantic_name in arg_to_axes, f"Semantic tensor {semantic_name} is missing axes"
-            assert semantic_name in arg_to_var, f"Semantic tensor {semantic_name} is missing variable name"
+        for arg in input_args + output_args:
+            assert arg in arg_to_axes, f"Tensor arg {arg} is missing axes"
+            assert arg in arg_to_var, f"Tensor arg {arg} is missing variable name"
         self.axis_sizes: dict[str, int] = {}
         self._populate_constant_axes()
 
     def _populate_constant_axes(self) -> None:
         """Populate axis_sizes for constant axes (numeric axis names like "1" or "128")."""
-        for semantic_name in self.arg_to_axes:
-            axes = self.arg_to_axes[semantic_name]
+        for arg in self.arg_to_axes:
+            axes = self.arg_to_axes[arg]
             for axis in axes:
                 try:
                     size = int(axis)
@@ -41,55 +41,45 @@ class BufferOp:
 
     @property
     def input_names(self) -> list[str]:
-        var_names: list[str] = []
-        for semantic_name in self.input_args:
-            var_name = self.arg_to_var[semantic_name]
-            var_names.append(var_name)
-        return var_names
+        return [self.arg_to_var[arg] for arg in self.input_args]
 
     @property
     def is_specialized(self) -> bool:
-        specialized = True
-        semantics = self.input_args + self.output_args
-        for semantic_name in semantics:
-            axes = self.arg_to_axes[semantic_name]
-            for axis in axes:
-                if axis not in self.axis_sizes:
-                    specialized = False
-        return specialized
+        args = self.input_args + self.output_args
+        return all(axis in self.axis_sizes for arg in args for axis in self.arg_to_axes[arg])
 
-    def specialize(self, semantic_name: str, shape: tuple[int, ...]) -> None:
-        expected_axes = self.arg_to_axes[semantic_name]
+    def specialize(self, arg: str, shape: tuple[int, ...]) -> None:
+        expected_axes = self.arg_to_axes[arg]
         if len(shape) != len(expected_axes):
             raise ValueError(
-                f"Shape mismatch for '{semantic_name}': expected {len(expected_axes)} dimensions {expected_axes} "
+                f"Shape mismatch for '{arg}': expected {len(expected_axes)} dimensions {expected_axes} "
                 f"but got {len(shape)} dimensions {shape}"
             )
         for axis, size in zip(expected_axes, shape):
             if axis in self.axis_sizes and self.axis_sizes[axis] != size:
                 raise ValueError(
-                    f"Axis size conflict {semantic_name}.{axis}: "
+                    f"Axis size conflict {arg}.{axis}: "
                     f"already set to {self.axis_sizes[axis]}, trying to set to {size} in {self}."
                 )
             self.axis_sizes[axis] = size
 
-    def get_tensor_shape(self, semantic_name: str) -> tuple[int, ...]:
+    def get_tensor_shape(self, arg: str) -> tuple[int, ...]:
         """Get the shape of a tensor by looking up axis sizes.
 
         Args:
-            semantic_name: Name of the tensor to get shape for
+            arg: Name of the tensor to get shape for
 
         Returns:
             Tuple of axis sizes representing the tensor shape
 
         Raises:
-            ValueError: If semantic_name is not in tensor_axes or if any required axis is not specialized
+            ValueError: If arg is not in tensor_axes or if any required axis is not specialized
         """
-        axes = self.arg_to_axes[semantic_name]
+        axes = self.arg_to_axes[arg]
         shape = []
         for axis in axes:
             if axis not in self.axis_sizes:
-                raise ValueError(f"Axis '{axis}' for tensor '{semantic_name}' is not specialized yet in {self}. ")
+                raise ValueError(f"Axis '{axis}' for tensor '{arg}' is not specialized yet in {self}. ")
             shape.append(self.axis_sizes[axis])
         return tuple(shape)
 
@@ -100,16 +90,16 @@ class BufferOp:
     def clear_specialization(self) -> None:
         self.axis_sizes.clear()
 
-    def _format_tensor(self, semantic_name: str) -> str:
+    def _format_tensor(self, arg: str) -> str:
         """Format tensor as 'name[axes]' showing sizes if specialized."""
-        axes = self.arg_to_axes[semantic_name]
+        axes = self.arg_to_axes[arg]
         axis_strs = []
         for axis in axes:
             if axis in self.axis_sizes:
                 axis_strs.append(f"{self.axis_sizes[axis]}")
             else:
                 axis_strs.append(axis)
-        tensor_name = self.arg_to_var[semantic_name]
+        tensor_name = self.arg_to_var[arg]
         axis_str = ", ".join(axis_strs)
         result = f"{tensor_name}[{axis_str}]"
         return result

@@ -1,4 +1,4 @@
-from compute_graph.buffer_tensor import SBUFTensor
+from compute_graph.buffer_tensor import BufferTensor
 from compute_graph.hbm_tensor import HBMTensor
 
 
@@ -7,13 +7,13 @@ class Load:
     Load operator.
     """
 
-    def __init__(self, dest: SBUFTensor, src: HBMTensor) -> None:
+    def __init__(self, dest: BufferTensor, src: HBMTensor) -> None:
         self.dest = dest
         self.src = src
+        assert dest.buffer == "SBUF", f"Cannot load {dest} from HBM"
 
     def __repr__(self) -> str:
-        code = f"{self.dest} = Load(src={self.src})"
-        return code
+        return f"{self.dest} = Load(src={self.src})"
 
 
 class Store:
@@ -21,10 +21,10 @@ class Store:
     Store operator.
     """
 
-    def __init__(self, dest: HBMTensor, value: SBUFTensor) -> None:
+    def __init__(self, dest: HBMTensor, value: BufferTensor) -> None:
         self.dest = dest
         self.value = value
+        assert value.buffer == "SBUF", f"Cannot store {value} to HBM"
 
     def __repr__(self) -> str:
-        code = f"Store(dst={self.dest}, value={self.value})"
-        return code
+        return f"Store(dst={self.dest}, value={self.value})"

@@ -1,4 +1,4 @@
-from compute_graph.buffer_tensor import SBUFTensor
+from compute_graph.buffer_tensor import BufferTensor
 from compute_graph.hbm_tensor import HBMTensor
 
 
@@ -26,15 +26,22 @@ class HBM:
         return "\n".join(lines)
 
 
-class SBUF:
-    def __init__(self) -> None:
-        self.tensors: dict[str, SBUFTensor] = {}
+class Buffer:
+    """
+    SBUF or PSUM buffer
+    """
 
-    def add_tensor(self, tensor: SBUFTensor) -> None:
+    def __init__(self, buffer: str) -> None:
+        assert buffer in ["SBUF", "PSUM"], f"Illegal buffer type {buffer}"
+        self.buffer = buffer
+        self.tensors: dict[str, BufferTensor] = {}
+
+    def add_tensor(self, tensor: BufferTensor) -> None:
+        assert tensor.buffer == self.buffer, f"Cannot add {tensor} to {self.buffer} buffer"
         self.tensors[tensor.name] = tensor
 
     def __repr__(self) -> str:
-        lines = [f"SBUF ({len(self.tensors)} tensors):"]
+        lines = [f"{self.buffer} ({len(self.tensors)} tensors):"]
         if self.tensors:
             lines.append("  Tensors:")
             for tensor in self.tensors.values():
