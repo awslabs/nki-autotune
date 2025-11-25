@@ -1,4 +1,4 @@
-from compute_graph.tensors import Axis, BufferTensor, HBMTensor
+from compute_graph.tensors import HBMTensor, SBUFTensor
 
 
 class Load:
@@ -6,14 +6,12 @@ class Load:
     Load operator.
     """
 
-    def __init__(self, dest: str, dest_axes: tuple[Axis, ...], src: str, src_axes: tuple[Axis, ...]) -> None:
+    def __init__(self, dest: SBUFTensor, src: HBMTensor) -> None:
         self.dest = dest
-        self.dest_axes = dest_axes
         self.src = src
-        self.src_axes = src_axes
 
     def __repr__(self) -> str:
-        code = f"{self.dest}{list(self.dest_axes)} = nl.load(src={self.src}{list(self.src_axes)})"
+        code = f"{self.dest} = Load(src={self.src})"
         return code
 
 
@@ -22,10 +20,10 @@ class Store:
     Store operator.
     """
 
-    def __init__(self, dst: HBMTensor, value: BufferTensor) -> None:
-        self.dst = dst
+    def __init__(self, dest: HBMTensor, value: SBUFTensor) -> None:
+        self.dest = dest
         self.value = value
 
     def __repr__(self) -> str:
-        code = f"nl.store({self.dst}, value={self.value})"
+        code = f"Store(dst={self.dest}, value={self.value})"
         return code

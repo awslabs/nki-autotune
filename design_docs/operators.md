@@ -2,53 +2,59 @@
 
 ## Operator Representation
 
-Operators in the graph IR are defined with the following structure:
+Operators use **BufferNode** base class with semantic-based API:
 
 ```python
-operator = {
-    "op_code": "nisa.nc_matmul",
-    "inputs": ["A", "B"],
-    "outputs": ["C"],
-    "tensor_axes": {
-        "A": ["K", "M"],
-        "B": ["K", "N"],
-        "C": ["M", "N"]
-    }
-}
+Matmul(
+    dest="output",
+    lhs="lhs_norm",
+    rhs="rhs",
+    lhs_transposed=False
+)
+# Semantic axes: lhs=[M,K], rhs=[K,N], dest=[M,N]
 ```
-Check [NKI ISA documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/nki.isa.html) for the proper operator semantics.
+
+Check [NKI ISA documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/nki.isa.html) for operator semantics.
+
+## BufferNode Architecture
+
+### Core Components
+
+- **semantic_to_axes**: Maps semantic names to axis lists (e.g., `{"lhs": ["M", "K"]}`)
+- **semantic_to_name**: Maps semantic names to tensor variable names (e.g., `{"lhs": "lhs_norm"}`)
+- **axis_sizes**: Dictionary tracking axis specialization (e.g., `{"M": 256}`)
+
+### Specialization
+
+Operators specialize via shape propagation:
+```python
+operator.specialize(semantic_name="lhs", shape=(256, 1024))
+# Maps axes M=256, K=1024
+```
+
+Validation ensures:
+- All input/output semantics have axes and names
+- Axis sizes are consistent across operators
+- Constant axes (numeric strings like "1", "128") auto-populate
 
 ## Design Principles
 
-### 1. Dimension Names Define Indexing
+### 1. Axis Order Defines Indexing
 
-- **Order matters**: `["K", "M"]` means the tensor is indexed as `A[K, M]`
-- Dimension names serve as both the axis label and the index variable
-- Example: `"A": ["K", "M"]` means tensor A is indexed by dimensions K and M in that order
+- `["M", "K"]` means tensor is indexed as `A[M, K]`
+- Axis names are symbolic until specialized
 
-### 2. Automatic Reduction/Parallel Classification
+### 2. Constant Axes for Reductions
 
-Index semantics are inferred from tensor dimensions:
-- **Parallel dimensions**: Appear in output tensor
-- **Reduction dimensions**: Appear only in inputs, not in output
+Reduced dimensions use size 1 as string constant `"1"`:
+```python
+semantic_to_axes = {
+    "data": ["P", "F"],
+    "reduce_res": ["P", "1"]  # F axis reduced
+}
+```
 
-For the matmul example:
-- Output C has dimensions `["M", "N"]` → M, N are parallel
-- K appears in inputs A, B but not in output C → K is reduction
-- Computation: `C[M, N] = sum_K(A[K, M] * B[K, N])`
+## Implemented Operators
 
-## Key Design Features
-
-### Constant Dimension for Reductions
-
-Reduced dimensions are kept with size 1 using the string constant `1`:
-- `tensor_dims = {"reduce_result": ["M", "1"]}`  # M kept, last dim reduced to 1
-- Only `str` or `str 1` allowed in dimension specifications
-
-### Dimension Tracking
-- Graph resolves correspondence during specialization
-
-### Operator Categories
-
-**On-chip Operators**: TensorScalar, Activation, Transpose, Matmul, and other nisa computation operators. `nl.ndarray` Allocate operator.
-**HBM Operators**: Load, Store
+**On-chip**: TensorScalar, Activation, Transpose, TileTranspose, Matmul, Allocate
+**HBM**: Load, Store

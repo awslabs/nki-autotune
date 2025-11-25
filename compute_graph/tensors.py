@@ -27,10 +27,10 @@ class HBMTensor:
 
     def __repr__(self) -> str:
         axes_str = ", ".join(str(axis) for axis in self.axes)
-        return f"Tensor({self.name}[{axes_str}])"
+        return f"HBMTensor({self.name}[{axes_str}])"
 
 
-def create_tensor(name: str, shape: tuple[int, ...]) -> HBMTensor:
+def create_hbm_tensor(name: str, shape: tuple[int, ...]) -> HBMTensor:
     axes: list[Axis] = []
     for size in shape:
         axis = Axis(start_tile=0, end_tile=1, stride=1, tile_size=size)
@@ -39,7 +39,19 @@ def create_tensor(name: str, shape: tuple[int, ...]) -> HBMTensor:
     return tensor
 
 
-class BufferTensor:
+class SBUFTensor:
     def __init__(self, name: str, shape: tuple[int, ...]) -> None:
         self.name = name
         self.shape = shape
+
+    def __repr__(self) -> str:
+        return f"SBUFTensor({self.name}, shape={self.shape})"
+
+
+class PSUMTensor:
+    def __init__(self, name: str, shape: tuple[int, ...]) -> None:
+        self.name = name
+        self.shape = shape
+
+    def __repr__(self) -> str:
+        return f"PSUMTensor({self.name}, shape={self.shape})"
