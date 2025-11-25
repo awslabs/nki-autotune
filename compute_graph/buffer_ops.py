@@ -1,3 +1,6 @@
+import neuronxcc.nki.language as nl
+
+
 class BufferNode:
     """Base class for on-chip operators."""
 
@@ -37,6 +40,14 @@ class BufferNode:
                     pass
 
     @property
+    def input_names(self) -> list[str]:
+        var_names: list[str] = []
+        for semantic_name in self.input_semantics:
+            var_name = self.semantic_to_name[semantic_name]
+            var_names.append(var_name)
+        return var_names
+
+    @property
     def is_specialized(self) -> bool:
         specialized = True
         semantics = self.input_semantics + self.output_semantics
@@ -57,7 +68,7 @@ class BufferNode:
         for axis, size in zip(expected_axes, shape):
             if axis in self.axis_sizes and self.axis_sizes[axis] != size:
                 raise ValueError(
-                    f"Cannot overwrite axis size {semantic_name}.{axis}: "
+                    f"Axis size conflict {semantic_name}.{axis}: "
                     f"already set to {self.axis_sizes[axis]}, trying to set to {size} in {self}."
                 )
             self.axis_sizes[axis] = size
@@ -75,7 +86,7 @@ class BufferNode:
             ValueError: If semantic_name is not in tensor_axes or if any required axis is not specialized
         """
         axes = self.semantic_to_axes[semantic_name]
-        shape: list[int] = []
+        shape = []
         for axis in axes:
             if axis not in self.axis_sizes:
                 raise ValueError(f"Axis '{axis}' for tensor '{semantic_name}' is not specialized yet in {self}. ")
@@ -175,7 +186,7 @@ class TensorScalar(BufferNode):
                 args.append(f"operand1={self.operand1}")
 
         args_str = ", ".join(args)
-        return f"{self._format_tensor('dest')} = nisa.tensor_scalar({args_str})"
+        return f"{self._format_tensor('dest')} = TensorScalar({args_str})"
 
 
 class Activation(BufferNode):
@@ -223,7 +234,7 @@ class Activation(BufferNode):
             args.append(f"reduce_op={reduce_op_name}")
             args.append(f"reduce_res={reduce_res_str}")
         args_str = ", ".join(args)
-        return f"{result} = nisa.activation({args_str})"
+        return f"{result} = Activation({args_str})"
 
 
 class Transpose(BufferNode):
@@ -318,22 +329,21 @@ class Matmul(BufferNode):
         self.lhs_transposed = lhs_transposed
 
     def __repr__(self) -> str:
-        return f"{self._format_tensor('dest')} = {self._format_tensor('lhs')} @ {self._format_tensor('rhs')}"
+        return f"{self._format_tensor('dest')} = Matmul(lhs={self._format_tensor('lhs')}, rhs={self._format_tensor('rhs')})"
 
 
 class Allocate(BufferNode):
     """Allocate a tensor in on-chip memory.
 
-    Creates nl.ndarray with specified shape, dtype, and buffer location.
+    Creates nl.ndarray with specified shape, and buffer location.
     Axes are auto-generated as dim0, dim1, etc. based on shape.
     """
 
-    def __init__(self, dest: str, shape: tuple[int, ...], dtype: str, buffer: str = "nl.sbuf") -> None:
+    def __init__(self, dest: str, shape: tuple[int, ...]) -> None:
         """
         Args:
             dest: Tensor name
             shape: Shape tuple
-            dtype: Data type (e.g., "nl.float32")
             buffer: Memory buffer location
         """
         axes = [f"dim{i}" for i in range(len(shape))]
@@ -350,10 +360,13 @@ class Allocate(BufferNode):
             semantic_to_name=semantic_to_name,
         )
 
+        for i in range(len(shape)):
+            axis = axes[i]
+            size = shape[i]
+            self.axis_sizes[axis] = size
+
         self.shape = shape
-        self.dtype = dtype
-        self.buffer = buffer
+        self.buffer = nl.sbuf
 
     def __repr__(self) -> str:
-        dest_name = self.semantic_to_name["dest"]
-        return f"{self._format_tensor('dest')} = nl.ndarray(shape={self.shape}, dtype={self.dtype}, buffer={self.buffer}, name='{dest_name}')"
+        return f"{self.semantic_to_name['dest']} = Allocate(shape={self.shape}, buffer={self.buffer.name})"

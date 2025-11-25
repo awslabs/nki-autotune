@@ -27,9 +27,10 @@ def test_graph_gen() -> None:
             Activation(dest="rmsnorm_factor", op=nl.rsqrt, data="rmsnorm_factor"),
             TensorScalar(dest="lhs_norm", data="lhs", op0=np.multiply, operand0="rmsnorm_factor"),
             Matmul(dest="output", lhs="lhs_norm", rhs="rhs", lhs_transposed=False),
-        ]
+        ],
+        input_shapes={"lhs": (M, K), "rhs": (K, N)},
+        output="output",
     )
-    rmsnorm_matmul_graph.specialize(inputs={"lhs": (M, K), "rhs": (K, N)}, output="output")
 
 
 if __name__ == "__main__":
