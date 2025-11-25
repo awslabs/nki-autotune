@@ -1,9 +1,9 @@
 import os
 import subprocess
 
+from compute_graph.buffer_tensor import Tensor
 from compute_graph.graph import ComputeGraph
 from compute_graph.hbm_ops import Node
-from compute_graph.tensors import Tensor
 
 NODE_TYPE_COLORS: dict[str, str] = {"load": "#FFEAA7", "compute": "#A8D8EA", "store": "#A8E6CF", "allocate": "#E8E8E8"}
 

@@ -1,7 +1,8 @@
 class Axis:
     """Represents a tensor axis with tiling information."""
 
-    def __init__(self, start_tile: int, end_tile: int, stride: int, tile_size: int) -> None:
+    def __init__(self, name: str, start_tile: int, end_tile: int, stride: int, tile_size: int) -> None:
+        self.name = name
         self.start_tile = start_tile
         self.end_tile = end_tile
         self.stride = stride
@@ -10,7 +11,7 @@ class Axis:
         self.size = self.num_tiles * self.tile_size
 
     def __repr__(self) -> str:
-        return f"{self.start_tile}:{self.end_tile}:{self.stride}x{self.tile_size}={self.size}"
+        return f"{self.name}:({self.start_tile},{self.end_tile},{self.stride})x{self.tile_size}={self.size}"
 
 
 class HBMTensor:
@@ -32,26 +33,8 @@ class HBMTensor:
 
 def create_hbm_tensor(name: str, shape: tuple[int, ...]) -> HBMTensor:
     axes: list[Axis] = []
-    for size in shape:
-        axis = Axis(start_tile=0, end_tile=1, stride=1, tile_size=size)
+    for i, size in enumerate(shape):
+        axis = Axis(name=f"{name}_axis_{i}", start_tile=0, end_tile=1, stride=1, tile_size=size)
         axes.append(axis)
     tensor = HBMTensor(name=name, axes=tuple(axes))
     return tensor
-
-
-class SBUFTensor:
-    def __init__(self, name: str, shape: tuple[int, ...]) -> None:
-        self.name = name
-        self.shape = shape
-
-    def __repr__(self) -> str:
-        return f"SBUFTensor({self.name}, shape={self.shape})"
-
-
-class PSUMTensor:
-    def __init__(self, name: str, shape: tuple[int, ...]) -> None:
-        self.name = name
-        self.shape = shape
-
-    def __repr__(self) -> str:
-        return f"PSUMTensor({self.name}, shape={self.shape})"
