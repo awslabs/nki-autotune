@@ -1,37 +1,37 @@
 import neuronxcc.nki.language as nl
 
 
-class BufferNode:
+class BufferOp:
     """Base class for on-chip operators."""
 
     def __init__(
         self,
-        input_semantics: list[str],
-        output_semantics: list[str],
-        semantic_to_axes: dict[str, list[str]],
-        semantic_to_name: dict[str, str],
+        input_args: list[str],
+        output_args: list[str],
+        arg_to_axes: dict[str, list[str]],
+        arg_to_var: dict[str, str],
     ) -> None:
         """
         Args:
-            input_semantics: Semantic names of input tensors
-            output_semantics: Semantic names of output tensors
-            semantic_to_axes: Maps semantic names to their axis lists
-            semantic_to_name: Maps semantic names to tensor variable names
+            input_args: Input tensor args
+            output_args: Output tensor args
+            arg_to_axes: Maps tensor arg to their axes
+            arg_to_var: Maps arg to variable name
         """
-        self.input_semantics = input_semantics
-        self.output_semantics = output_semantics
-        self.semantic_to_axes = semantic_to_axes
-        self.semantic_to_name = semantic_to_name
-        for semantic_name in input_semantics + output_semantics:
-            assert semantic_name in semantic_to_axes, f"Semantic tensor {semantic_name} is missing axes"
-            assert semantic_name in semantic_to_name, f"Semantic tensor {semantic_name} is missing variable name"
+        self.input_args = input_args
+        self.output_args = output_args
+        self.arg_to_axes = arg_to_axes
+        self.arg_to_var = arg_to_var
+        for semantic_name in input_args + output_args:
+            assert semantic_name in arg_to_axes, f"Semantic tensor {semantic_name} is missing axes"
+            assert semantic_name in arg_to_var, f"Semantic tensor {semantic_name} is missing variable name"
         self.axis_sizes: dict[str, int] = {}
         self._populate_constant_axes()
 
     def _populate_constant_axes(self) -> None:
         """Populate axis_sizes for constant axes (numeric axis names like "1" or "128")."""
-        for semantic_name in self.semantic_to_axes:
-            axes = self.semantic_to_axes[semantic_name]
+        for semantic_name in self.arg_to_axes:
+            axes = self.arg_to_axes[semantic_name]
             for axis in axes:
                 try:
                     size = int(axis)
@@ -42,24 +42,24 @@ class BufferNode:
     @property
     def input_names(self) -> list[str]:
         var_names: list[str] = []
-        for semantic_name in self.input_semantics:
-            var_name = self.semantic_to_name[semantic_name]
+        for semantic_name in self.input_args:
+            var_name = self.arg_to_var[semantic_name]
             var_names.append(var_name)
         return var_names
 
     @property
     def is_specialized(self) -> bool:
         specialized = True
-        semantics = self.input_semantics + self.output_semantics
+        semantics = self.input_args + self.output_args
         for semantic_name in semantics:
-            axes = self.semantic_to_axes[semantic_name]
+            axes = self.arg_to_axes[semantic_name]
             for axis in axes:
                 if axis not in self.axis_sizes:
                     specialized = False
         return specialized
 
     def specialize(self, semantic_name: str, shape: tuple[int, ...]) -> None:
-        expected_axes = self.semantic_to_axes[semantic_name]
+        expected_axes = self.arg_to_axes[semantic_name]
         if len(shape) != len(expected_axes):
             raise ValueError(
                 f"Shape mismatch for '{semantic_name}': expected {len(expected_axes)} dimensions {expected_axes} "
@@ -85,7 +85,7 @@ class BufferNode:
         Raises:
             ValueError: If semantic_name is not in tensor_axes or if any required axis is not specialized
         """
-        axes = self.semantic_to_axes[semantic_name]
+        axes = self.arg_to_axes[semantic_name]
         shape = []
         for axis in axes:
             if axis not in self.axis_sizes:
@@ -102,24 +102,24 @@ class BufferNode:
 
     def _format_tensor(self, semantic_name: str) -> str:
         """Format tensor as 'name[axes]' showing sizes if specialized."""
-        axes = self.semantic_to_axes[semantic_name]
+        axes = self.arg_to_axes[semantic_name]
         axis_strs = []
         for axis in axes:
             if axis in self.axis_sizes:
                 axis_strs.append(f"{self.axis_sizes[axis]}")
             else:
                 axis_strs.append(axis)
-        tensor_name = self.semantic_to_name[semantic_name]
+        tensor_name = self.arg_to_var[semantic_name]
         axis_str = ", ".join(axis_strs)
         result = f"{tensor_name}[{axis_str}]"
         return result
 
     def __repr__(self) -> str:
         """String representation of the node."""
-        raise NotImplementedError(f"repr is not implemented for the base BufferNode class.")
+        raise NotImplementedError(f"repr is not implemented for the base BufferOp class.")
 
 
-class TensorScalar(BufferNode):
+class TensorScalar(BufferOp):
     """Element-wise operations on data tiles with scalar/vector operands.
 
     Supports chaining up to two operations with broadcasting along partition axis.
@@ -138,27 +138,22 @@ class TensorScalar(BufferNode):
             op1: Second operator
             operand1: Second operand (scalar or tensor name)
         """
-        input_semantics = ["data"]
-        output_semantics = ["dest"]
-        semantic_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
-        semantic_to_name = {"data": data, "dest": dest}
+        input_args = ["data"]
+        output_args = ["dest"]
+        arg_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
+        arg_to_var = {"data": data, "dest": dest}
 
         if isinstance(operand0, str):
-            input_semantics.append("operand0")
-            semantic_to_axes["operand0"] = ["P", "1"]
-            semantic_to_name["operand0"] = operand0
+            input_args.append("operand0")
+            arg_to_axes["operand0"] = ["P", "1"]
+            arg_to_var["operand0"] = operand0
 
         if isinstance(operand1, str):
-            input_semantics.append("operand1")
-            semantic_to_axes["operand1"] = ["P", "1"]
-            semantic_to_name["operand1"] = operand1
+            input_args.append("operand1")
+            arg_to_axes["operand1"] = ["P", "1"]
+            arg_to_var["operand1"] = operand1
 
-        super().__init__(
-            input_semantics=input_semantics,
-            output_semantics=output_semantics,
-            semantic_to_axes=semantic_to_axes,
-            semantic_to_name=semantic_to_name,
-        )
+        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
 
         self.op0 = op0
         self.operand0 = operand0
@@ -189,7 +184,7 @@ class TensorScalar(BufferNode):
         return f"{self._format_tensor('dest')} = TensorScalar({args_str})"
 
 
-class Activation(BufferNode):
+class Activation(BufferOp):
     """Apply activation functions element-wise to input tiles.
 
     Optionally reduces along the free axis to shape (P, 1).
@@ -205,20 +200,15 @@ class Activation(BufferNode):
             reduce_op: Reduction operator for free dimension
             reduce_res: Reduction result tensor name
         """
-        input_semantics = ["data"]
-        output_semantics = ["dest"]
-        semantic_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
-        semantic_to_name = {"dest": dest, "data": data}
+        input_args = ["data"]
+        output_args = ["dest"]
+        arg_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
+        arg_to_var = {"dest": dest, "data": data}
         if reduce_res:
-            output_semantics.append("reduce_res")
-            semantic_to_axes["reduce_res"] = ["P", "1"]
-            semantic_to_name["reduce_res"] = reduce_res
-        super().__init__(
-            input_semantics=input_semantics,
-            output_semantics=output_semantics,
-            semantic_to_axes=semantic_to_axes,
-            semantic_to_name=semantic_to_name,
-        )
+            output_args.append("reduce_res")
+            arg_to_axes["reduce_res"] = ["P", "1"]
+            arg_to_var["reduce_res"] = reduce_res
+        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
 
         self.op = op
         self.reduce_op = reduce_op
@@ -228,7 +218,7 @@ class Activation(BufferNode):
         data_str = self._format_tensor("data")
         args = [f"op={op_name}", f"data={data_str}"]
         result = self._format_tensor("dest")
-        if "reduce_res" in self.semantic_to_name and self.semantic_to_name["reduce_res"]:
+        if "reduce_res" in self.arg_to_var and self.arg_to_var["reduce_res"]:
             reduce_op_name = getattr(self.reduce_op, "__name__", str(self.reduce_op))
             reduce_res_str = self._format_tensor("reduce_res")
             args.append(f"reduce_op={reduce_op_name}")
@@ -237,7 +227,7 @@ class Activation(BufferNode):
         return f"{result} = Activation({args_str})"
 
 
-class Transpose(BufferNode):
+class Transpose(BufferOp):
     """2D transpose swapping partition and free axes.
 
     Transforms input (P, F) to output (F, P).
@@ -249,23 +239,18 @@ class Transpose(BufferNode):
             dest: Destination tensor name
             data: Source tensor name
         """
-        input_semantics = ["data"]
-        output_semantics = ["dest"]
-        semantic_to_axes = {"data": ["P", "F"], "dest": ["F", "P"]}
-        semantic_to_name = {"data": data, "dest": dest}
+        input_args = ["data"]
+        output_args = ["dest"]
+        arg_to_axes = {"data": ["P", "F"], "dest": ["F", "P"]}
+        arg_to_var = {"data": data, "dest": dest}
 
-        super().__init__(
-            input_semantics=input_semantics,
-            output_semantics=output_semantics,
-            semantic_to_axes=semantic_to_axes,
-            semantic_to_name=semantic_to_name,
-        )
+        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = nisa.nc_transpose(data={self._format_tensor('data')})"
 
 
-class TileTranspose(BufferNode):
+class TileTranspose(BufferOp):
     """In-tile transpose maintaining (P, F) shape.
 
     Rearranges element layout within the tile without changing axes,
@@ -278,23 +263,18 @@ class TileTranspose(BufferNode):
             dest: Destination tensor name
             data: Source tensor name
         """
-        input_semantics = ["data"]
-        output_semantics = ["dest"]
-        semantic_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
-        semantic_to_name = {"data": data, "dest": dest}
+        input_args = ["data"]
+        output_args = ["dest"]
+        arg_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
+        arg_to_var = {"data": data, "dest": dest}
 
-        super().__init__(
-            input_semantics=input_semantics,
-            output_semantics=output_semantics,
-            semantic_to_axes=semantic_to_axes,
-            semantic_to_name=semantic_to_name,
-        )
+        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = TileTranspose(data={self._format_tensor('data')})"
 
 
-class Matmul(BufferNode):
+class Matmul(BufferOp):
     """Matrix multiplication: lhs @ rhs with optional lhs transpose.
 
     Computes (M, K) @ (K, N) → (M, N), or (K, M).T @ (K, N) → (M, N).
@@ -309,22 +289,17 @@ class Matmul(BufferNode):
             rhs: Right operand (K, N)
             lhs_transposed: Whether lhs is transposed
         """
-        input_semantics = ["lhs", "rhs"]
-        output_semantics = ["dest"]
+        input_args = ["lhs", "rhs"]
+        output_args = ["dest"]
 
         if lhs_transposed:
-            semantic_to_axes = {"lhs": ["K", "M"], "rhs": ["K", "N"], "dest": ["M", "N"]}
+            arg_to_axes = {"lhs": ["K", "M"], "rhs": ["K", "N"], "dest": ["M", "N"]}
         else:
-            semantic_to_axes = {"lhs": ["M", "K"], "rhs": ["K", "N"], "dest": ["M", "N"]}
+            arg_to_axes = {"lhs": ["M", "K"], "rhs": ["K", "N"], "dest": ["M", "N"]}
 
-        semantic_to_name = {"lhs": lhs, "rhs": rhs, "dest": dest}
+        arg_to_var = {"lhs": lhs, "rhs": rhs, "dest": dest}
 
-        super().__init__(
-            input_semantics=input_semantics,
-            output_semantics=output_semantics,
-            semantic_to_axes=semantic_to_axes,
-            semantic_to_name=semantic_to_name,
-        )
+        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
 
         self.lhs_transposed = lhs_transposed
 
@@ -332,7 +307,7 @@ class Matmul(BufferNode):
         return f"{self._format_tensor('dest')} = Matmul(lhs={self._format_tensor('lhs')}, rhs={self._format_tensor('rhs')})"
 
 
-class Allocate(BufferNode):
+class Allocate(BufferOp):
     """Allocate a tensor in on-chip memory.
 
     Creates nl.ndarray with specified shape, and buffer location.
@@ -348,17 +323,12 @@ class Allocate(BufferNode):
         """
         axes = [f"dim{i}" for i in range(len(shape))]
 
-        input_semantics = []
-        output_semantics = ["dest"]
-        semantic_to_axes = {"dest": axes}
-        semantic_to_name = {"dest": dest}
+        input_args = []
+        output_args = ["dest"]
+        arg_to_axes = {"dest": axes}
+        arg_to_var = {"dest": dest}
 
-        super().__init__(
-            input_semantics=input_semantics,
-            output_semantics=output_semantics,
-            semantic_to_axes=semantic_to_axes,
-            semantic_to_name=semantic_to_name,
-        )
+        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
 
         for i in range(len(shape)):
             axis = axes[i]
@@ -369,4 +339,4 @@ class Allocate(BufferNode):
         self.buffer = nl.sbuf
 
     def __repr__(self) -> str:
-        return f"{self.semantic_to_name['dest']} = Allocate(shape={self.shape}, buffer={self.buffer.name})"
+        return f"{self.arg_to_var['dest']} = Allocate(shape={self.shape}, buffer={self.buffer.name})"
