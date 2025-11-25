@@ -1,8 +1,8 @@
 from compute_graph.buffer_ops import Allocate, BufferOp, Matmul, TileTranspose
-from compute_graph.buffer_tensor import SBUFTensor
+from compute_graph.buffer_tensor import BufferTensor
 from compute_graph.hbm_ops import Load, Store
 from compute_graph.hbm_tensor import create_hbm_tensor
-from compute_graph.memory import HBM, SBUF
+from compute_graph.memory import HBM, Buffer
 
 
 class ComputeGraph:
@@ -24,8 +24,8 @@ class ComputeGraph:
         for node in nodes:
             print(node)
 
-    def _trace(self, operators: list[BufferOp], output_tensor_name: str):
-        sbuf = SBUF()
+    def _trace(self, operators: list[BufferOp], output_tensor_name: str) -> list:
+        sbuf = Buffer(buffer="SBUF")
         nodes = []
         for operator in operators:
             for input_arg in operator.input_args:
@@ -34,7 +34,7 @@ class ComputeGraph:
                     sbuf_tensor = sbuf.tensors[tensor_name]
                 elif tensor_name in self.hbm.input_tensors:
                     hbm_tensor = self.hbm.input_tensors[tensor_name]
-                    sbuf_tensor = SBUFTensor(name=tensor_name, shape=hbm_tensor.shape)
+                    sbuf_tensor = BufferTensor(name=tensor_name, shape=hbm_tensor.shape, buffer="SBUF")
                     sbuf.add_tensor(sbuf_tensor)
                     allocate_node = Allocate(dest=sbuf_tensor.name, shape=sbuf_tensor.shape)
                     nodes.append(allocate_node)
@@ -51,7 +51,9 @@ class ComputeGraph:
                 if tensor_name in sbuf.tensors:
                     sbuf_tensor = sbuf.tensors[tensor_name]
                 else:
-                    sbuf_tensor = SBUFTensor(name=tensor_name, shape=operator.get_tensor_shape(output_arg))
+                    sbuf_tensor = BufferTensor(
+                        name=tensor_name, shape=operator.get_tensor_shape(output_arg), buffer="SBUF"
+                    )
                     sbuf.add_tensor(sbuf_tensor)
                     allocate_node = Allocate(dest=sbuf_tensor.name, shape=sbuf_tensor.shape)
                     nodes.append(allocate_node)
