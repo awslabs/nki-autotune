@@ -1,7 +1,7 @@
 import neuronxcc.nki.language as nl
 import numpy as np
 
-from compute_graph.buffer_ops import Activation, Matmul, TensorScalar
+from compute_graph.compute_ops import Activation, Matmul, TensorScalar
 from compute_graph.graph import ComputeGraph
 
 

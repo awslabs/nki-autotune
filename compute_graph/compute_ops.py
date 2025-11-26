@@ -1,7 +1,9 @@
-import neuronxcc.nki.language as nl
+from typing import Any
+
+from compute_graph.buffer_tensor import BufferTensor
 
 
-class BufferOp:
+class ComputeOp:
     """Base class for on-chip operators."""
 
     def __init__(
@@ -48,8 +50,17 @@ class BufferOp:
         args = self.input_args + self.output_args
         return all(axis in self.axis_sizes for arg in args for axis in self.arg_to_axes[arg])
 
-    def specialize(self, arg: str, shape: tuple[int, ...]) -> None:
+    def specialize(self, arg: str, shape: tuple[int, ...], tensor: BufferTensor) -> None:
         expected_axes = self.arg_to_axes[arg]
+        print(f"Specialize {arg} with {tensor}")
+        print(expected_axes)
+        """
+        TODO:
+        Operator defines fixed semantic axes to indicate tensor transforms pattern
+        Need to map opeartor semantic axes definition to the actual tensor logical axes names
+        So as to propagate logical axes info down the chain of operators
+        Need a clean and modular method to do this
+        """
         if len(shape) != len(expected_axes):
             raise ValueError(
                 f"Shape mismatch for '{arg}': expected {len(expected_axes)} dimensions {expected_axes} "
@@ -106,10 +117,10 @@ class BufferOp:
 
     def __repr__(self) -> str:
         """String representation of the node."""
-        raise NotImplementedError(f"repr is not implemented for the base BufferOp class.")
+        raise NotImplementedError(f"repr is not implemented for the base ComputeOp class.")
 
 
-class TensorScalar(BufferOp):
+class TensorScalar(ComputeOp):
     """Element-wise operations on data tiles with scalar/vector operands.
 
     Supports chaining up to two operations with broadcasting along partition axis.
@@ -117,7 +128,13 @@ class TensorScalar(BufferOp):
     """
 
     def __init__(
-        self, dest: str, data: str, op0, operand0: float | str, op1=None, operand1: float | str | None = None
+        self,
+        dest: str,
+        data: str,
+        op0: Any,
+        operand0: float | str,
+        op1: Any = None,
+        operand1: float | str | None = None,
     ) -> None:
         """
         Args:
@@ -174,14 +191,14 @@ class TensorScalar(BufferOp):
         return f"{self._format_tensor('dest')} = TensorScalar({args_str})"
 
 
-class Activation(BufferOp):
+class Activation(ComputeOp):
     """Apply activation functions element-wise to input tiles.
 
     Optionally reduces along the free axis to shape (P, 1).
     Input and output shapes: (P, F) where P is partition, F is free axis.
     """
 
-    def __init__(self, dest: str, op, data: str, reduce_op=None, reduce_res: str | None = None) -> None:
+    def __init__(self, dest: str, op: Any, data: str, reduce_op: Any = None, reduce_res: str | None = None) -> None:
         """
         Args:
             dest: Destination tensor name
@@ -217,7 +234,7 @@ class Activation(BufferOp):
         return f"{result} = Activation({args_str})"
 
 
-class Transpose(BufferOp):
+class Transpose(ComputeOp):
     """2D transpose swapping partition and free axes.
 
     Transforms input (P, F) to output (F, P).
@@ -240,7 +257,7 @@ class Transpose(BufferOp):
         return f"{self._format_tensor('dest')} = nisa.nc_transpose(data={self._format_tensor('data')})"
 
 
-class TileTranspose(BufferOp):
+class TileTranspose(ComputeOp):
     """In-tile transpose maintaining (P, F) shape.
 
     Rearranges element layout within the tile without changing axes,
@@ -264,7 +281,7 @@ class TileTranspose(BufferOp):
         return f"{self._format_tensor('dest')} = TileTranspose(data={self._format_tensor('data')})"
 
 
-class Matmul(BufferOp):
+class Matmul(ComputeOp):
     """Matrix multiplication: lhs @ rhs with optional lhs transpose.
 
     Computes (M, K) @ (K, N) → (M, N), or (K, M).T @ (K, N) → (M, N).
@@ -295,38 +312,3 @@ class Matmul(BufferOp):
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = Matmul(lhs={self._format_tensor('lhs')}, rhs={self._format_tensor('rhs')})"
-
-
-class Allocate(BufferOp):
-    """Allocate a tensor in on-chip memory.
-
-    Creates nl.ndarray with specified shape, and buffer location.
-    Axes are auto-generated as dim0, dim1, etc. based on shape.
-    """
-
-    def __init__(self, dest: str, shape: tuple[int, ...]) -> None:
-        """
-        Args:
-            dest: Tensor name
-            shape: Shape tuple
-            buffer: Memory buffer location
-        """
-        axes = [f"dim{i}" for i in range(len(shape))]
-
-        input_args = []
-        output_args = ["dest"]
-        arg_to_axes = {"dest": axes}
-        arg_to_var = {"dest": dest}
-
-        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
-
-        for i in range(len(shape)):
-            axis = axes[i]
-            size = shape[i]
-            self.axis_sizes[axis] = size
-
-        self.shape = shape
-        self.buffer = nl.sbuf
-
-    def __repr__(self) -> str:
-        return f"{self.arg_to_var['dest']} = Allocate(shape={self.shape}, buffer={self.buffer.name})"

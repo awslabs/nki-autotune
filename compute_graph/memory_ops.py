@@ -12,6 +12,8 @@ class Load:
         self.src = src
         assert dest.buffer == "SBUF", f"Cannot load {dest} from HBM"
 
+        dest.add_axis_names([axis.name for axis in src.axes])
+
     def __repr__(self) -> str:
         return f"{self.dest} = Load(src={self.src})"
 
@@ -28,3 +30,19 @@ class Store:
 
     def __repr__(self) -> str:
         return f"Store(dst={self.dest}, value={self.value})"
+
+
+class Allocate:
+    """Allocate a tensor in on-chip memory.
+
+    Creates nl.ndarray with specified shape, and buffer location.
+    """
+
+    def __init__(self, tensor: BufferTensor) -> None:
+        self.tensor = tensor
+
+    def __repr__(self) -> str:
+        return f"{self.tensor.name} = Allocate(shape={self.tensor.shape}, buffer={self.tensor.buffer})"
+
+
+Node = Load | Store | Allocate
