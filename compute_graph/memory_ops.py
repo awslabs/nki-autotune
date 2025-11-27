@@ -12,8 +12,6 @@ class Load:
         self.src = src
         assert dest.buffer == "SBUF", f"Cannot load {dest} from HBM"
 
-        dest.add_axis_names([axis.name for axis in src.axes])
-
     def __repr__(self) -> str:
         return f"{self.dest} = Load(src={self.src})"
 

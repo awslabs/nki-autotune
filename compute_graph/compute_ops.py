@@ -1,6 +1,6 @@
 from typing import Any
 
-from compute_graph.buffer_tensor import BufferTensor
+from compute_graph.buffer_tensor import BufferAxis, BufferTensor
 
 
 class ComputeOp:
@@ -13,13 +13,6 @@ class ComputeOp:
         arg_to_axes: dict[str, list[str]],
         arg_to_var: dict[str, str],
     ) -> None:
-        """
-        Args:
-            input_args: Input tensor args
-            output_args: Output tensor args
-            arg_to_axes: Maps tensor arg to their axes
-            arg_to_var: Maps arg to variable name
-        """
         self.input_args = input_args
         self.output_args = output_args
         self.arg_to_axes = arg_to_axes
@@ -27,17 +20,17 @@ class ComputeOp:
         for arg in input_args + output_args:
             assert arg in arg_to_axes, f"Tensor arg {arg} is missing axes"
             assert arg in arg_to_var, f"Tensor arg {arg} is missing variable name"
-        self.axis_sizes: dict[str, int] = {}
+        self.symbolic_axes: dict[str, BufferAxis] = {}
         self._populate_constant_axes()
 
     def _populate_constant_axes(self) -> None:
-        """Populate axis_sizes for constant axes (numeric axis names like "1" or "128")."""
+        """Populate symbolic_axes for constant axes (numeric axis names like "1" or "128")."""
         for arg in self.arg_to_axes:
             axes = self.arg_to_axes[arg]
             for axis in axes:
                 try:
                     size = int(axis)
-                    self.axis_sizes[axis] = size
+                    self.symbolic_axes[axis] = BufferAxis(name=axis, size=size)
                 except ValueError:
                     pass
 
@@ -48,66 +41,61 @@ class ComputeOp:
     @property
     def is_specialized(self) -> bool:
         args = self.input_args + self.output_args
-        return all(axis in self.axis_sizes for arg in args for axis in self.arg_to_axes[arg])
+        return all(axis in self.symbolic_axes for arg in args for axis in self.arg_to_axes[arg])
 
-    def specialize(self, arg: str, shape: tuple[int, ...], tensor: BufferTensor) -> None:
-        expected_axes = self.arg_to_axes[arg]
-        print(f"Specialize {arg} with {tensor}")
-        print(expected_axes)
-        """
-        TODO:
-        Operator defines fixed semantic axes to indicate tensor transforms pattern
-        Need to map opeartor semantic axes definition to the actual tensor logical axes names
-        So as to propagate logical axes info down the chain of operators
-        Need a clean and modular method to do this
-        """
-        if len(shape) != len(expected_axes):
-            raise ValueError(
-                f"Shape mismatch for '{arg}': expected {len(expected_axes)} dimensions {expected_axes} "
-                f"but got {len(shape)} dimensions {shape}"
-            )
-        for axis, size in zip(expected_axes, shape):
-            if axis in self.axis_sizes and self.axis_sizes[axis] != size:
-                raise ValueError(
-                    f"Axis size conflict {arg}.{axis}: "
-                    f"already set to {self.axis_sizes[axis]}, trying to set to {size} in {self}."
-                )
-            self.axis_sizes[axis] = size
-
-    def get_tensor_shape(self, arg: str) -> tuple[int, ...]:
-        """Get the shape of a tensor by looking up axis sizes.
+    def specialize(self, arg: str, tensor: BufferTensor) -> None:
+        """Map operator symbolic axes to tensor's BufferAxis objects.
 
         Args:
-            arg: Name of the tensor to get shape for
-
-        Returns:
-            Tuple of axis sizes representing the tensor shape
-
-        Raises:
-            ValueError: If arg is not in tensor_axes or if any required axis is not specialized
+            arg: The operator argument name (e.g., "lhs", "rhs", "data")
+            tensor: The BufferTensor providing concrete axis info
         """
+        expected_axes = self.arg_to_axes[arg]
+        if len(tensor.axes) != len(expected_axes):
+            raise ValueError(
+                f"Shape mismatch for '{arg}': expected {len(expected_axes)} dimensions {expected_axes} "
+                f"but got {len(tensor.axes)} dimensions {tensor.shape}"
+            )
+        for symbolic, buffer_axis in zip(expected_axes, tensor.axes):
+            if symbolic in self.symbolic_axes:
+                if self.symbolic_axes[symbolic].size != buffer_axis.size:
+                    raise ValueError(
+                        f"Axis size conflict {arg}.{symbolic}: "
+                        f"expected {self.symbolic_axes[symbolic].size}, got {buffer_axis.size} in {self}."
+                    )
+            else:
+                self.symbolic_axes[symbolic] = buffer_axis
+
+    def get_tensor_shape(self, arg: str) -> tuple[int, ...]:
+        """Get the shape of a tensor by looking up axis sizes."""
         axes = self.arg_to_axes[arg]
         shape = []
         for axis in axes:
-            if axis not in self.axis_sizes:
+            if axis not in self.symbolic_axes:
                 raise ValueError(f"Axis '{axis}' for tensor '{arg}' is not specialized yet in {self}. ")
-            shape.append(self.axis_sizes[axis])
+            shape.append(self.symbolic_axes[axis].size)
         return tuple(shape)
+
+    def get_output_axes(self, arg: str) -> tuple[BufferAxis, ...]:
+        """Get the output BufferAxis tuple for an output tensor."""
+        symbolic_axes = self.arg_to_axes[arg]
+        return tuple(self.symbolic_axes[axis] for axis in symbolic_axes)
 
     def codegen(self) -> str:
         """Generate NKI code for this node."""
         raise NotImplementedError(f"codegen is not implemented for {self}")
 
     def clear_specialization(self) -> None:
-        self.axis_sizes.clear()
+        self.symbolic_axes.clear()
+        self._populate_constant_axes()
 
     def _format_tensor(self, arg: str) -> str:
         """Format tensor as 'name[axes]' showing sizes if specialized."""
         axes = self.arg_to_axes[arg]
         axis_strs = []
         for axis in axes:
-            if axis in self.axis_sizes:
-                axis_strs.append(f"{self.axis_sizes[axis]}")
+            if axis in self.symbolic_axes:
+                axis_strs.append(f"{self.symbolic_axes[axis].size}")
             else:
                 axis_strs.append(axis)
         tensor_name = self.arg_to_var[arg]
@@ -136,15 +124,6 @@ class TensorScalar(ComputeOp):
         op1: Any = None,
         operand1: float | str | None = None,
     ) -> None:
-        """
-        Args:
-            dest: Destination tensor name
-            data: Input tensor name
-            op0: First operator
-            operand0: First operand (scalar or tensor name)
-            op1: Second operator
-            operand1: Second operand (scalar or tensor name)
-        """
         input_args = ["data"]
         output_args = ["dest"]
         arg_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
@@ -199,14 +178,6 @@ class Activation(ComputeOp):
     """
 
     def __init__(self, dest: str, op: Any, data: str, reduce_op: Any = None, reduce_res: str | None = None) -> None:
-        """
-        Args:
-            dest: Destination tensor name
-            op: Activation operation
-            data: Input tensor name
-            reduce_op: Reduction operator for free dimension
-            reduce_res: Reduction result tensor name
-        """
         input_args = ["data"]
         output_args = ["dest"]
         arg_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
@@ -241,11 +212,6 @@ class Transpose(ComputeOp):
     """
 
     def __init__(self, dest: str, data: str) -> None:
-        """
-        Args:
-            dest: Destination tensor name
-            data: Source tensor name
-        """
         input_args = ["data"]
         output_args = ["dest"]
         arg_to_axes = {"data": ["P", "F"], "dest": ["F", "P"]}
@@ -265,11 +231,6 @@ class TileTranspose(ComputeOp):
     """
 
     def __init__(self, dest: str, data: str) -> None:
-        """
-        Args:
-            dest: Destination tensor name
-            data: Source tensor name
-        """
         input_args = ["data"]
         output_args = ["dest"]
         arg_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
@@ -289,13 +250,6 @@ class Matmul(ComputeOp):
     """
 
     def __init__(self, dest: str, lhs: str, rhs: str, lhs_transposed: bool) -> None:
-        """
-        Args:
-            dest: Destination tensor name
-            lhs: Left operand (M, K) or (K, M) if transposed
-            rhs: Right operand (K, N)
-            lhs_transposed: Whether lhs is transposed
-        """
         input_args = ["lhs", "rhs"]
         output_args = ["dest"]
 
