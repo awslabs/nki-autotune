@@ -1,16 +1,27 @@
-class BufferTensor:
-    def __init__(self, name: str, shape: tuple[int, ...], buffer: str) -> None:
+class BufferAxis:
+    """Represents a single axis of a buffer tensor with name and size."""
+
+    def __init__(self, name: str, size: int) -> None:
         self.name = name
-        self.shape = shape
+        self.size = size
+
+
+class BufferTensor:
+    """Tensor stored in on-chip buffer (SBUF or PSUM)."""
+
+    def __init__(self, name: str, axes: tuple[BufferAxis, ...], buffer: str) -> None:
+        self.name = name
+        self.axes = axes
         self.buffer = buffer
         assert buffer in ["SBUF", "PSUM"], f"Illegal buffer type {buffer}"
-        self.axis_names = ["unknown"] * len(shape)
 
-    def add_axis_names(self, axis_names: list[str]) -> None:
-        assert len(axis_names) == len(
-            self.shape
-        ), f"axis_names length {len(axis_names)} != shape length {len(self.shape)}"
-        self.axis_names = axis_names
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(ax.size for ax in self.axes)
+
+    @property
+    def axis_names(self) -> list[str]:
+        return [ax.name for ax in self.axes]
 
     def __repr__(self) -> str:
         axes_str = ", ".join(f"{name}:{size}" for name, size in zip(self.axis_names, self.shape))

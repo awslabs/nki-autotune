@@ -1,4 +1,4 @@
-from compute_graph.buffer_tensor import BufferTensor
+from compute_graph.buffer_tensor import BufferAxis, BufferTensor
 from compute_graph.compute_ops import ComputeOp, Matmul, TileTranspose
 from compute_graph.hbm_tensor import create_hbm_tensor
 from compute_graph.memory import HBM, Buffer
@@ -32,7 +32,8 @@ class ComputeGraph:
                     sbuf_tensor = sbuf.tensors[tensor_name]
                 elif tensor_name in self.hbm.input_tensors:
                     hbm_tensor = self.hbm.input_tensors[tensor_name]
-                    sbuf_tensor = BufferTensor(name=tensor_name, shape=hbm_tensor.shape, buffer="SBUF")
+                    buffer_axes = tuple(BufferAxis(name=ax.name, size=ax.size) for ax in hbm_tensor.axes)
+                    sbuf_tensor = BufferTensor(name=tensor_name, axes=buffer_axes, buffer="SBUF")
                     sbuf.add_tensor(sbuf_tensor)
                     allocate_node = Allocate(tensor=sbuf_tensor)
                     nodes.append(allocate_node)
@@ -44,15 +45,16 @@ class ComputeGraph:
                     raise ValueError(
                         f"Tensor '{tensor_name}' (input arg: '{input_arg}') not found for operator {operator}"
                     )
-                operator.specialize(input_arg, sbuf_tensor.shape, sbuf_tensor)
+                operator.specialize(input_arg, sbuf_tensor)
             assert operator.is_specialized
+            print(operator)
             for output_arg in operator.output_args:
                 tensor_name = operator.arg_to_var[output_arg]
                 if tensor_name in sbuf.tensors:
                     sbuf_tensor = sbuf.tensors[tensor_name]
                 else:
                     sbuf_tensor = BufferTensor(
-                        name=tensor_name, shape=operator.get_tensor_shape(output_arg), buffer="SBUF"
+                        name=tensor_name, axes=operator.get_output_axes(output_arg), buffer="SBUF"
                     )
                     sbuf.add_tensor(sbuf_tensor)
                     allocate_node = Allocate(tensor=sbuf_tensor)
@@ -62,9 +64,10 @@ class ComputeGraph:
                 tensor_name = operator.arg_to_var[output_arg]
                 sbuf_tensor = sbuf.tensors[tensor_name]
                 if tensor_name == output_tensor_name:
-                    hbm_tensor = create_hbm_tensor(tensor_name, sbuf_tensor.shape)
+                    hbm_tensor = create_hbm_tensor(tensor_name, sbuf_tensor.shape, sbuf_tensor.axis_names)
                     self.hbm.add_output(hbm_tensor)
                     store_node = Store(dest=hbm_tensor, value=sbuf_tensor)
+                    print(store_node)
                     nodes.append(store_node)
             print()
         return nodes

@@ -1,4 +1,4 @@
-class Axis:
+class HBMAxis:
     """Represents a tensor axis with tiling information."""
 
     def __init__(self, name: str, start_tile: int, end_tile: int, stride: int, tile_size: int) -> None:
@@ -17,24 +17,32 @@ class Axis:
 class HBMTensor:
     """Represents a tensor stored in HBM with tiling configuration."""
 
-    def __init__(self, name: str, axes: tuple[Axis, ...]) -> None:
+    def __init__(self, name: str, axes: tuple[HBMAxis, ...]) -> None:
         """
         Args:
             name: Name of the HBM tensor
         """
         self.name = name
         self.axes = axes
-        self.shape = tuple([axis.size for axis in axes])
+        self.shape = tuple(axis.size for axis in axes)
 
     def __repr__(self) -> str:
         axes_str = ", ".join(str(axis) for axis in self.axes)
         return f"HBMTensor({self.name}[{axes_str}])"
 
 
-def create_hbm_tensor(name: str, shape: tuple[int, ...]) -> HBMTensor:
-    axes: list[Axis] = []
+def create_hbm_tensor(name: str, shape: tuple[int, ...], axis_names: list[str] | None = None) -> HBMTensor:
+    """Create an HBMTensor with default tiling (single tile per axis).
+
+    Args:
+        name: Tensor name
+        shape: Tensor shape
+        axis_names: Optional axis names. If None, auto-generates as "{name}_axis_{i}"
+    """
+    axes: list[HBMAxis] = []
     for i, size in enumerate(shape):
-        axis = Axis(name=f"{name}_axis_{i}", start_tile=0, end_tile=1, stride=1, tile_size=size)
+        ax_name = axis_names[i] if axis_names else f"{name}_axis_{i}"
+        axis = HBMAxis(name=ax_name, start_tile=0, end_tile=1, stride=1, tile_size=size)
         axes.append(axis)
     tensor = HBMTensor(name=name, axes=tuple(axes))
     return tensor
