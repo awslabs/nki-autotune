@@ -1,6 +1,6 @@
 from compute_graph.buffer_tensor import BufferAxis, BufferTensor
 from compute_graph.compute_ops import ComputeOp, Matmul, TileTranspose
-from compute_graph.hbm_tensor import create_hbm_tensor
+from compute_graph.hbm_tensor import create_hbm_tensor, get_parallel_axes
 from compute_graph.memory import HBM, Buffer
 from compute_graph.memory_ops import Allocate, Load, Node, Store
 
@@ -21,6 +21,8 @@ class ComputeGraph:
         operators = self._insert_transpose(operators)
         nodes = self._trace(operators, output)
         print(self.hbm)
+        parallel_axes = get_parallel_axes(list(self.hbm.input_tensors.values()), list(self.hbm.output_tensors.values()))
+        print(parallel_axes)
 
     def _trace(self, operators: list[ComputeOp], output_tensor_name: str) -> list[Node | ComputeOp]:
         sbuf = Buffer(buffer="SBUF")

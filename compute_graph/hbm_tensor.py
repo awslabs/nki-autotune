@@ -31,6 +31,33 @@ class HBMTensor:
         return f"HBMTensor({self.name}[{axes_str}])"
 
 
+def get_parallel_axes(input_tensors: list[HBMTensor], output_tensors: list[HBMTensor]) -> set[str]:
+    """Determine parallel axes from input and output HBM tensors.
+
+    Parallel axes are those that appear in both input and output tensors,
+    matched by exact axis name. These axes can be processed independently
+    in parallel.
+
+    Args:
+        input_tensors: List of input HBM tensors
+        output_tensors: List of output HBM tensors
+
+    Returns:
+        Set of axis names that are parallel (appear in both inputs and outputs)
+    """
+    input_axes: set[str] = set()
+    for tensor in input_tensors:
+        for axis in tensor.axes:
+            input_axes.add(axis.name)
+
+    output_axes: set[str] = set()
+    for tensor in output_tensors:
+        for axis in tensor.axes:
+            output_axes.add(axis.name)
+
+    return input_axes & output_axes
+
+
 def create_hbm_tensor(name: str, shape: tuple[int, ...], axis_names: list[str] | None = None) -> HBMTensor:
     """Create an HBMTensor with default tiling (single tile per axis).
 

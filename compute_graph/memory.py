@@ -16,11 +16,11 @@ class HBM:
     def __repr__(self) -> str:
         lines = [f"HBM ({len(self.input_tensors)} inputs, {len(self.output_tensors)} outputs):"]
         if self.input_tensors:
-            lines.append("  Inputs:")
+            lines.append("  Input tensors:")
             for tensor in self.input_tensors.values():
                 lines.append(f"    {tensor}")
         if self.output_tensors:
-            lines.append("  Outputs:")
+            lines.append("  Output tensors:")
             for tensor in self.output_tensors.values():
                 lines.append(f"    {tensor}")
         return "\n".join(lines)
