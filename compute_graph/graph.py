@@ -1,8 +1,12 @@
+import logging
+
 from compute_graph.buffer_tensor import BufferAxis, BufferTensor
 from compute_graph.compute_ops import ComputeOp, Matmul, TileTranspose
-from compute_graph.hbm_tensor import create_hbm_tensor, get_parallel_axes
+from compute_graph.hbm_tensor import create_hbm_tensor, get_parallel_axes, shard_tensors
 from compute_graph.memory import HBM, Buffer
 from compute_graph.memory_ops import Allocate, Load, Node, Store
+
+logger = logging.getLogger(__name__)
 
 
 class ComputeGraph:
@@ -20,9 +24,24 @@ class ComputeGraph:
             self.hbm.add_input(hbm_tensor)
         operators = self._insert_transpose(operators)
         nodes = self._trace(operators, output)
-        print(self.hbm)
-        parallel_axes = get_parallel_axes(list(self.hbm.input_tensors.values()), list(self.hbm.output_tensors.values()))
-        print(parallel_axes)
+        logger.debug("Nodes: %s", nodes)
+        logger.debug("HBM: %s", self.hbm)
+        self._init_graph()
+
+    def _init_graph(self) -> None:
+        parallel_axes = get_parallel_axes(self.hbm.input_tensors, self.hbm.output_tensors)
+        sharded_input_tensors = shard_tensors(self.hbm.input_tensors, parallel_axes)
+        sharded_output_tensors = shard_tensors(self.hbm.output_tensors, parallel_axes)
+        if len(sharded_input_tensors) != len(sharded_output_tensors):
+            raise ValueError(
+                f"Input and output parallel tile counts don't match: {len(sharded_input_tensors)} vs {len(sharded_output_tensors)}"
+            )
+        num_parallel_tiles = len(sharded_input_tensors)
+        logger.debug("Parallel axes: %s, num_tiles: %d", parallel_axes, num_parallel_tiles)
+        for graph_idx in range(num_parallel_tiles):
+            subgraph_input_tensors = sharded_input_tensors[graph_idx]
+            subgraph_output_tensors = sharded_output_tensors[graph_idx]
+            logger.debug("Subgraph %d\n%s\n%s", graph_idx, subgraph_input_tensors, subgraph_output_tensors)
 
     def _trace(self, operators: list[ComputeOp], output_tensor_name: str) -> list[Node | ComputeOp]:
         sbuf = Buffer(buffer="SBUF")
@@ -41,15 +60,12 @@ class ComputeGraph:
                     nodes.append(allocate_node)
                     load_node = Load(dest=sbuf_tensor, src=hbm_tensor)
                     nodes.append(load_node)
-                    print(allocate_node)
-                    print(load_node)
                 else:
                     raise ValueError(
                         f"Tensor '{tensor_name}' (input arg: '{input_arg}') not found for operator {operator}"
                     )
                 operator.specialize(input_arg, sbuf_tensor)
             assert operator.is_specialized
-            print(operator)
             for output_arg in operator.output_args:
                 tensor_name = operator.arg_to_var[output_arg]
                 if tensor_name in sbuf.tensors:
@@ -69,9 +85,7 @@ class ComputeGraph:
                     hbm_tensor = create_hbm_tensor(tensor_name, sbuf_tensor.shape, sbuf_tensor.axis_names)
                     self.hbm.add_output(hbm_tensor)
                     store_node = Store(dest=hbm_tensor, value=sbuf_tensor)
-                    print(store_node)
                     nodes.append(store_node)
-            print()
         return nodes
 
     def _insert_transpose(self, operators: list[ComputeOp]) -> list[ComputeOp]:

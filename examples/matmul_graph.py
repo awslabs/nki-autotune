@@ -1,8 +1,18 @@
+import logging
+
 import neuronxcc.nki.language as nl
 import numpy as np
 
 from compute_graph.compute_ops import Activation, Matmul, TensorScalar
 from compute_graph.graph import ComputeGraph
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    filename="/fsx/weittang/kernelgen_cache/debug.log",
+    filemode="w",
+    format="%(asctime)s - %(levelname)s - %(name)s\n%(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 
 def test_graph_gen() -> None:
