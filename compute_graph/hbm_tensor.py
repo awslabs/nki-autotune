@@ -31,7 +31,7 @@ class HBMTensor:
         return f"HBMTensor({self.name}[{axes_str}])"
 
 
-def get_parallel_axes(input_tensors: list[HBMTensor], output_tensors: list[HBMTensor]) -> set[str]:
+def get_parallel_axes(input_tensors: dict[str, HBMTensor], output_tensors: dict[str, HBMTensor]) -> list[str]:
     """Determine parallel axes from input and output HBM tensors.
 
     Parallel axes are those that appear in both input and output tensors,
@@ -39,23 +39,101 @@ def get_parallel_axes(input_tensors: list[HBMTensor], output_tensors: list[HBMTe
     in parallel.
 
     Args:
-        input_tensors: List of input HBM tensors
-        output_tensors: List of output HBM tensors
+        input_tensors: Dict of input HBM tensors (name -> tensor)
+        output_tensors: Dict of output HBM tensors (name -> tensor)
 
     Returns:
-        Set of axis names that are parallel (appear in both inputs and outputs)
+        List of axis names that are parallel, sorted alphabetically
     """
     input_axes: set[str] = set()
-    for tensor in input_tensors:
+    for tensor in input_tensors.values():
         for axis in tensor.axes:
             input_axes.add(axis.name)
 
     output_axes: set[str] = set()
-    for tensor in output_tensors:
+    for tensor in output_tensors.values():
         for axis in tensor.axes:
             output_axes.add(axis.name)
 
-    return input_axes & output_axes
+    return sorted(input_axes & output_axes)
+
+
+def _get_axis_sizes(tensors: dict[str, HBMTensor], axis_names: set[str]) -> dict[str, int]:
+    """Extract axis sizes from tensors for given axis names."""
+    axis_sizes: dict[str, int] = {}
+    for tensor in tensors.values():
+        for axis in tensor.axes:
+            if axis.name in axis_names:
+                if axis.name in axis_sizes:
+                    if axis_sizes[axis.name] != axis.size:
+                        raise ValueError(
+                            f"Axis '{axis.name}' has inconsistent sizes: " f"{axis_sizes[axis.name]} vs {axis.size}"
+                        )
+                else:
+                    axis_sizes[axis.name] = axis.size
+    return axis_sizes
+
+
+def shard_tensors(
+    tensors: dict[str, HBMTensor], parallel_axes: list[str], tile_size: int = 128
+) -> list[dict[str, HBMTensor]]:
+    """Shard tensors along parallel axes into tiles.
+
+    Args:
+        tensors: Dict of HBM tensors (name -> tensor)
+        parallel_axes: Ordered list of parallel axis names
+        tile_size: Tile size for partitioning (default 128)
+
+    Returns:
+        List of tensor dicts, one per parallel tile (indexed by graph_idx)
+
+    Raises:
+        ValueError: If any parallel axis size is not divisible by tile_size
+    """
+    axis_sizes = _get_axis_sizes(tensors, set(parallel_axes))
+
+    num_tiles_per_axis: dict[str, int] = {}
+    for axis_name in parallel_axes:
+        size = axis_sizes[axis_name]
+        if size % tile_size != 0:
+            raise ValueError(f"Axis '{axis_name}' size {size} is not divisible by tile_size {tile_size}")
+        num_tiles_per_axis[axis_name] = size // tile_size
+
+    total_tiles = 1
+    for num_tiles in num_tiles_per_axis.values():
+        total_tiles *= num_tiles
+
+    result: list[dict[str, HBMTensor]] = []
+    for graph_idx in range(total_tiles):
+        tile_indices: dict[str, int] = {}
+        remaining = graph_idx
+        for axis_name in parallel_axes:
+            num_tiles = num_tiles_per_axis[axis_name]
+            tile_indices[axis_name] = remaining % num_tiles
+            remaining //= num_tiles
+
+        sharded_tensors: dict[str, HBMTensor] = {}
+        for tensor_name, tensor in tensors.items():
+            new_axes: list[HBMAxis] = []
+            for axis in tensor.axes:
+                if axis.name in tile_indices:
+                    tile_idx = tile_indices[axis.name]
+                    new_axis = HBMAxis(
+                        name=axis.name, start_tile=tile_idx, end_tile=tile_idx + 1, stride=1, tile_size=tile_size
+                    )
+                else:
+                    new_axis = HBMAxis(
+                        name=axis.name,
+                        start_tile=axis.start_tile,
+                        end_tile=axis.end_tile,
+                        stride=axis.stride,
+                        tile_size=axis.tile_size,
+                    )
+                new_axes.append(new_axis)
+            sharded_tensors[tensor_name] = HBMTensor(name=tensor_name, axes=tuple(new_axes))
+        result.append(sharded_tensors)
+
+    return result
 
 
 def create_hbm_tensor(name: str, shape: tuple[int, ...], axis_names: list[str] | None = None) -> HBMTensor:
