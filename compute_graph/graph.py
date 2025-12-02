@@ -10,8 +10,88 @@ logger = logging.getLogger(__name__)
 
 
 class SubGraph:
-    def __init__(self) -> None:
-        pass
+    def __init__(
+        self,
+        index: int,
+        compute_ops: list[ComputeOp],
+        input_tensors: dict[str, HBMTensor],
+        output_tensors: dict[str, HBMTensor],
+    ) -> None:
+        """Build subgraph from compute ops, creating load/store/allocate nodes and dependency edges."""
+        logger.debug(f"\nSubgraph {index}")
+        logger.debug(input_tensors)
+        logger.debug(output_tensors)
+        self.index = index
+        self.input_tensors = input_tensors
+        self.output_tensors = output_tensors
+
+        self.nodes: list[MemoryOp | ComputeOp] = []
+        self.edges: list[tuple[int, int]] = []
+        self.tensor_producer: dict[str, tuple[int, BufferTensor]] = {}
+
+        self._load_input_hbm()
+
+        for compute_op in compute_ops:
+            logger.debug(compute_op)
+            source_node_indices: list[int] = []
+            for input_arg in compute_op.input_args:
+                tensor_name = compute_op.arg_to_var[input_arg]
+                node_idx, buffer_tensor = self.tensor_producer[tensor_name]
+                compute_op.specialize(input_arg, buffer_tensor)
+                source_node_indices.append(node_idx)
+            assert compute_op.is_specialized
+            self._create_intermediate_tensors(compute_op)
+
+            op_idx = len(self.nodes)
+            self.nodes.append(compute_op)
+            for node_idx in source_node_indices:
+                self.edges.append((node_idx, op_idx))
+
+            for output_arg in compute_op.output_args:
+                tensor_name = compute_op.arg_to_var[output_arg]
+                producer_idx, buffer_tensor = self.tensor_producer[tensor_name]
+                self.edges.append((producer_idx, op_idx))
+                self.tensor_producer[tensor_name] = (op_idx, buffer_tensor)
+                if tensor_name in output_tensors:
+                    hbm_tensor = output_tensors[tensor_name]
+                    store_node = Store(dest=hbm_tensor, value=buffer_tensor)
+                    store_idx = len(self.nodes)
+                    self.nodes.append(store_node)
+                    self.edges.append((op_idx, store_idx))
+        for node in self.nodes:
+            logger.debug(node)
+        logger.debug(f"Edges: {self.edges}")
+
+    def _load_input_hbm(self) -> None:
+        """Load input HBM tensors into SBUF buffers and track as tensor producers."""
+        for tensor_name in self.input_tensors:
+            hbm_tensor = self.input_tensors[tensor_name]
+            buffer_axes = tuple(BufferAxis(name=ax.name, size=ax.size) for ax in hbm_tensor.axes)
+            buffer_tensor = BufferTensor(name=tensor_name, axes=buffer_axes, buffer="SBUF")
+
+            allocate_node = Allocate(tensor=buffer_tensor)
+            alloc_idx = len(self.nodes)
+            self.nodes.append(allocate_node)
+
+            load_node = Load(dest=buffer_tensor, src=hbm_tensor)
+            load_idx = len(self.nodes)
+            self.nodes.append(load_node)
+
+            self.edges.append((alloc_idx, load_idx))
+            self.tensor_producer[tensor_name] = (load_idx, buffer_tensor)
+
+    def _create_intermediate_tensors(self, compute_op: ComputeOp) -> None:
+        """Allocate SBUF buffer tensors for intermediate compute op outputs. FIXME: may not be sbuf."""
+        for output_arg in compute_op.output_args:
+            tensor_name = compute_op.arg_to_var[output_arg]
+            if tensor_name not in self.tensor_producer:
+                buffer_tensor = BufferTensor(
+                    name=tensor_name, axes=compute_op.get_output_axes(output_arg), buffer="SBUF"
+                )
+                allocate_node = Allocate(tensor=buffer_tensor)
+                producer_idx = len(self.nodes)
+                self.nodes.append(allocate_node)
+                self.tensor_producer[tensor_name] = (producer_idx, buffer_tensor)
 
 
 class ComputeGraph:
@@ -34,162 +114,68 @@ class ComputeGraph:
         logger.debug(self.hbm)
 
         parallel_axes = get_parallel_axes(self.hbm.input_tensors, self.hbm.output_tensors)
+        logger.debug(parallel_axes)
         sharded_inputs = shard_tensors(self.hbm.input_tensors, parallel_axes)
         sharded_outputs = shard_tensors(self.hbm.output_tensors, parallel_axes)
-        logger.debug(parallel_axes)
-        for input_shard, output_shard in zip(sharded_inputs, sharded_outputs):
-            logger.debug(f"{input_shard}\n{output_shard}")
 
         self.nodes: list[MemoryOp | ComputeOp] = []
         self.edges: list[tuple[int, int]] = []
+        self.sbuf = Buffer(buffer="SBUF")
         for graph_idx in range(len(sharded_inputs)):
-            logger.debug(f"\nSubgraph {graph_idx}")
-            for op in operators:
-                op.clear_specialization()
-
             subgraph_input_tensors = sharded_inputs[graph_idx]
             subgraph_output_tensors = sharded_outputs[graph_idx]
-            nodes, edges = trace(operators, output, subgraph_input_tensors, subgraph_output_tensors)
+
+            for op in operators:
+                op.clear_specialization()
+            subgraph = SubGraph(graph_idx, operators, subgraph_input_tensors, subgraph_output_tensors)
 
             offset = len(self.nodes)
-            for from_idx, to_idx in edges:
+            for from_idx, to_idx in subgraph.edges:
                 self.edges.append((from_idx + offset, to_idx + offset))
-            self.nodes.extend(nodes)
-
-            for node in nodes:
-                logger.debug(node)
-            logger.debug(f"Edges: {edges}")
+            self.nodes.extend(subgraph.nodes)
 
 
 def infer_output(
     compute_ops: list[ComputeOp], output_tensor_name: str, input_tensors: dict[str, HBMTensor]
 ) -> HBMTensor:
     """Infer output tensor shape by tracing compute operations."""
-    sbuf_tensors: dict[str, BufferTensor] = {}
+    buffer_tensors: dict[str, BufferTensor] = {}
     result: HBMTensor | None = None
 
     for compute_op in compute_ops:
         for input_arg in compute_op.input_args:
             tensor_name = compute_op.arg_to_var[input_arg]
-            if tensor_name in sbuf_tensors:
-                sbuf_tensor = sbuf_tensors[tensor_name]
+            if tensor_name in buffer_tensors:
+                buffer_tensor = buffer_tensors[tensor_name]
             elif tensor_name in input_tensors:
                 hbm_tensor = input_tensors[tensor_name]
                 buffer_axes = tuple(BufferAxis(name=ax.name, size=ax.size) for ax in hbm_tensor.axes)
-                sbuf_tensor = BufferTensor(name=tensor_name, axes=buffer_axes, buffer="SBUF")
-                sbuf_tensors[tensor_name] = sbuf_tensor
+                buffer_tensor = BufferTensor(name=tensor_name, axes=buffer_axes, buffer="SBUF")
+                buffer_tensors[tensor_name] = buffer_tensor
             else:
                 raise ValueError(f"Tensor '{tensor_name}' (input arg: '{input_arg}') not found for {compute_op}")
-            compute_op.specialize(input_arg, sbuf_tensor)
-
+            compute_op.specialize(input_arg, buffer_tensor)
         assert compute_op.is_specialized
-
         for output_arg in compute_op.output_args:
             tensor_name = compute_op.arg_to_var[output_arg]
-            if tensor_name not in sbuf_tensors:
-                sbuf_tensor = BufferTensor(name=tensor_name, axes=compute_op.get_output_axes(output_arg), buffer="SBUF")
-                sbuf_tensors[tensor_name] = sbuf_tensor
-
+            if tensor_name not in buffer_tensors:
+                buffer_tensor = BufferTensor(
+                    name=tensor_name, axes=compute_op.get_output_axes(output_arg), buffer="SBUF"
+                )
+                buffer_tensors[tensor_name] = buffer_tensor
             if tensor_name == output_tensor_name:
                 if result is not None:
                     raise ValueError(f"Ambiguous output tensor '{output_tensor_name}': defined by multiple ops")
-                sbuf_tensor = sbuf_tensors[tensor_name]
-                result = create_hbm_tensor(tensor_name, sbuf_tensor.shape, sbuf_tensor.axis_names)
-
+                buffer_tensor = buffer_tensors[tensor_name]
+                result = create_hbm_tensor(tensor_name, buffer_tensor.shape, buffer_tensor.axis_names)
     if result is None:
         raise ValueError(f"Output tensor '{output_tensor_name}' not found in compute ops")
 
     return result
 
 
-def trace(
-    compute_ops: list[ComputeOp],
-    output_tensor_name: str,
-    input_tensors: dict[str, HBMTensor],
-    output_tensors: dict[str, HBMTensor],
-) -> tuple[list[MemoryOp | ComputeOp], list[tuple[int, int]]]:
-    """Build graph nodes and edges by tracing compute_ops with given tensors."""
-    sbuf = Buffer(buffer="SBUF")
-    nodes: list[MemoryOp | ComputeOp] = []
-    edges: list[tuple[int, int]] = []
-    tensor_producer: dict[str, int] = {}
-
-    for compute_op in compute_ops:
-        for input_arg in compute_op.input_args:
-            tensor_name = compute_op.arg_to_var[input_arg]
-            if tensor_name in sbuf.tensors:
-                sbuf_tensor = sbuf.tensors[tensor_name]
-            elif tensor_name in input_tensors:
-                hbm_tensor = input_tensors[tensor_name]
-                buffer_axes = tuple(BufferAxis(name=ax.name, size=ax.size) for ax in hbm_tensor.axes)
-                sbuf_tensor = BufferTensor(name=tensor_name, axes=buffer_axes, buffer="SBUF")
-                sbuf.add_tensor(sbuf_tensor)
-
-                allocate_node = Allocate(tensor=sbuf_tensor)
-                alloc_idx = len(nodes)
-                nodes.append(allocate_node)
-
-                load_node = Load(dest=sbuf_tensor, src=hbm_tensor)
-                load_idx = len(nodes)
-                nodes.append(load_node)
-
-                edges.append((alloc_idx, load_idx))
-                tensor_producer[tensor_name] = load_idx
-            else:
-                raise ValueError(f"Tensor '{tensor_name}' (input arg: '{input_arg}') not found for {compute_op}")
-            compute_op.specialize(input_arg, sbuf_tensor)
-
-        assert compute_op.is_specialized
-
-        output_alloc_count = sum(
-            1 for output_arg in compute_op.output_args if compute_op.arg_to_var[output_arg] not in sbuf.tensors
-        )
-        op_idx = len(nodes) + output_alloc_count
-
-        for input_arg in compute_op.input_args:
-            tensor_name = compute_op.arg_to_var[input_arg]
-            if tensor_name in tensor_producer:
-                edges.append((tensor_producer[tensor_name], op_idx))
-
-        for output_arg in compute_op.output_args:
-            tensor_name = compute_op.arg_to_var[output_arg]
-            if tensor_name in sbuf.tensors:
-                sbuf_tensor = sbuf.tensors[tensor_name]
-            else:
-                sbuf_tensor = BufferTensor(name=tensor_name, axes=compute_op.get_output_axes(output_arg), buffer="SBUF")
-                sbuf.add_tensor(sbuf_tensor)
-                allocate_node = Allocate(tensor=sbuf_tensor)
-                alloc_idx = len(nodes)
-                nodes.append(allocate_node)
-                edges.append((alloc_idx, op_idx))
-
-        nodes.append(compute_op)
-
-        for output_arg in compute_op.output_args:
-            tensor_name = compute_op.arg_to_var[output_arg]
-            tensor_producer[tensor_name] = op_idx
-
-        for output_arg in compute_op.output_args:
-            tensor_name = compute_op.arg_to_var[output_arg]
-            sbuf_tensor = sbuf.tensors[tensor_name]
-            if tensor_name == output_tensor_name:
-                if tensor_name in output_tensors:
-                    hbm_tensor = output_tensors[tensor_name]
-                else:
-                    hbm_tensor = create_hbm_tensor(tensor_name, sbuf_tensor.shape, sbuf_tensor.axis_names)
-                    output_tensors[tensor_name] = hbm_tensor
-                store_node = Store(dest=hbm_tensor, value=sbuf_tensor)
-                store_idx = len(nodes)
-                nodes.append(store_node)
-                edges.append((op_idx, store_idx))
-
-    return nodes, edges
-
-
 def insert_tile_transpose(compute_ops: list[ComputeOp]) -> list[ComputeOp]:
-    """
-    Insert out-of-place tile level transpose.
-    """
+    """Insert out-of-place tile level transpose."""
     full_compute_ops: list[ComputeOp] = []
     for compute_op in compute_ops:
         if isinstance(compute_op, Matmul) and not compute_op.lhs_transposed:
