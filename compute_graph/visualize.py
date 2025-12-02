@@ -1,9 +1,10 @@
 import os
 import subprocess
 
-from compute_graph.buffer_tensor import BufferTensor
+from compute_graph.compute_ops import ComputeOp
 from compute_graph.graph import ComputeGraph
-from compute_graph.memory_ops import Node
+from compute_graph.hbm_tensor import HBMTensor
+from compute_graph.memory_ops import Allocate, Load, MemoryOp, Store
 
 NODE_TYPE_COLORS: dict[str, str] = {"load": "#FFEAA7", "compute": "#A8D8EA", "store": "#A8E6CF", "allocate": "#E8E8E8"}
 
@@ -60,7 +61,7 @@ def _infer_subgraph_assignments(
     subgraph_id = 0
     visited = set()
 
-    for node_id in sorted(graph.nodes.keys()):
+    for node_id in range(len(graph.nodes)):
         if node_id in visited:
             continue
 
@@ -107,17 +108,17 @@ def _get_connected_component(
     return sorted(component)
 
 
-def _get_counter_nodes(nodes: dict[int, Node], counter: int, node_to_subgraph: dict[int, int]) -> list[int]:
+def _get_counter_nodes(nodes: list[MemoryOp | ComputeOp], counter: int, node_to_subgraph: dict[int, int]) -> list[int]:
     """
     Args:
-        nodes: Dictionary of graph nodes
+        nodes: List of graph nodes
         counter: Subgraph ID to filter by
         node_to_subgraph: Mapping of node IDs to subgraph IDs
 
     Returns:
         List of node IDs belonging to the specified subgraph
     """
-    return [n for n in nodes.keys() if node_to_subgraph.get(n) == counter]
+    return [n for n in range(len(nodes)) if node_to_subgraph.get(n) == counter]
 
 
 def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
@@ -133,9 +134,9 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     edges = compute_graph.edges
 
     for source, target in edges:
-        if source not in nodes:
+        if source >= len(nodes):
             raise ValueError(f"Edge references non-existent source node: {source}")
-        if target not in nodes:
+        if target >= len(nodes):
             raise ValueError(f"Edge references non-existent target node: {target}")
 
     successors, predecessors = _build_adjacency_lists(edges)
@@ -160,28 +161,28 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     lines.append('    fontname="Arial Bold";')
     lines.append("    ")
 
-    if hasattr(compute_graph, "hbm") and compute_graph.hbm:
+    if hasattr(compute_graph, "hbm") and compute_graph.hbm.input_tensors:
         lines.append("    subgraph cluster_hbm_inputs {")
         lines.append('        label="HBM Inputs";')
         lines.append('        style="rounded";')
         lines.append(f'        color="{CLUSTER_COLORS["hbm_input"]}";')
         lines.append("        ")
 
-        for idx, hbm_tensor in enumerate(compute_graph.hbm):
+        for idx, hbm_tensor in enumerate(compute_graph.hbm.input_tensors.values()):
             node_label, node_color = _format_hbm_tensor(hbm_tensor)
             lines.append(f'        hbm_input_{idx} [label="{node_label}", fillcolor="{node_color}"];')
 
         lines.append("    }")
         lines.append("    ")
 
-    if hasattr(compute_graph, "outputs") and compute_graph.outputs:
+    if hasattr(compute_graph, "hbm") and compute_graph.hbm.output_tensors:
         lines.append("    subgraph cluster_hbm_outputs {")
         lines.append('        label="HBM Outputs";')
         lines.append('        style="rounded";')
         lines.append(f'        color="{CLUSTER_COLORS["hbm_output"]}";')
         lines.append("        ")
 
-        for idx, hbm_tensor in enumerate(compute_graph.outputs):
+        for idx, hbm_tensor in enumerate(compute_graph.hbm.output_tensors.values()):
             node_label, node_color = _format_hbm_tensor(hbm_tensor)
             lines.append(f'        hbm_output_{idx} [label="{node_label}", fillcolor="{node_color}"];')
 
@@ -227,20 +228,38 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     return "\n".join(lines)
 
 
-def _format_node(node_data: Node) -> tuple[str, str]:
+def _get_node_type(node_data: MemoryOp | ComputeOp) -> str:
     """
     Args:
-        node_data: Node object
+        node_data: Node object (MemoryOp or ComputeOp)
+
+    Returns:
+        Node type string for coloring
+    """
+    node_type = "compute"
+    if isinstance(node_data, Load):
+        node_type = "load"
+    elif isinstance(node_data, Store):
+        node_type = "store"
+    elif isinstance(node_data, Allocate):
+        node_type = "allocate"
+    return node_type
+
+
+def _format_node(node_data: MemoryOp | ComputeOp) -> tuple[str, str]:
+    """
+    Args:
+        node_data: Node object (MemoryOp or ComputeOp)
 
     Returns:
         Tuple of (label, color) for the node
     """
     label = _escape_dot_string(repr(node_data))
-    color = NODE_TYPE_COLORS.get(node_data.node_type, DEFAULT_NODE_COLOR)
+    color = NODE_TYPE_COLORS.get(_get_node_type(node_data), DEFAULT_NODE_COLOR)
     return label, color
 
 
-def _format_hbm_tensor(hbm_tensor: BufferTensor) -> tuple[str, str]:
+def _format_hbm_tensor(hbm_tensor: HBMTensor) -> tuple[str, str]:
     """
     Args:
         hbm_tensor: Tensor object
@@ -260,12 +279,6 @@ def save_graph(graph: ComputeGraph, output_file: str, title: str, keep_dot: bool
         title: Title for the graph visualization
         keep_dot: Whether to keep the intermediate DOT file
     """
-    output_path = os.path.abspath(output_file)
-    cwd = os.getcwd()
-
-    if not output_path.startswith(cwd):
-        raise ValueError(f"Output file must be within current directory: {output_file}")
-
     dot_script = graph_to_dot(graph, title)
 
     if output_file.endswith(".png"):
