@@ -2,7 +2,11 @@ from compute_graph.buffer_tensor import BufferTensor
 from compute_graph.hbm_tensor import HBMTensor
 
 
-class Load:
+class MemoryOp:
+    """Base class for memory operations."""
+
+
+class Load(MemoryOp):
     """
     Load operator.
     """
@@ -16,7 +20,7 @@ class Load:
         return f"{self.dest} = Load(src={self.src})"
 
 
-class Store:
+class Store(MemoryOp):
     """
     Store operator.
     """
@@ -30,7 +34,7 @@ class Store:
         return f"Store(dst={self.dest}, value={self.value})"
 
 
-class Allocate:
+class Allocate(MemoryOp):
     """Allocate a tensor in on-chip memory.
 
     Creates nl.ndarray with specified shape, and buffer location.
@@ -41,6 +45,3 @@ class Allocate:
 
     def __repr__(self) -> str:
         return f"{self.tensor.name} = Allocate(shape={self.tensor.shape}, buffer={self.tensor.buffer})"
-
-
-Node = Load | Store | Allocate

@@ -1,16 +1,19 @@
 import logging
+import os
 
 import neuronxcc.nki.language as nl
 import numpy as np
 
 from compute_graph.compute_ops import Activation, Matmul, TensorScalar
 from compute_graph.graph import ComputeGraph
+from compute_graph.visualize import save_graph
 
+cache_root = os.environ.get("NKI_CACHE_ROOT", "/fsx/weittang/kernelgen_cache")
 logging.basicConfig(
     level=logging.DEBUG,
-    filename="/fsx/weittang/kernelgen_cache/debug.log",
+    filename=f"{cache_root}/debug.log",
     filemode="w",
-    format="%(asctime)s - %(levelname)s - %(name)s\n%(message)s",
+    format="%(message)-400s" + "%(asctime)s - %(levelname)s - %(name)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
@@ -19,7 +22,7 @@ def test_graph_gen() -> None:
     """Test data reuse graph transformation with a single merge."""
     M = 256
     K = 1024
-    N = 512
+    N = 128
 
     epsilon = 1e-6
 
@@ -41,6 +44,7 @@ def test_graph_gen() -> None:
         input_shapes={"lhs": (M, K), "rhs": (K, N)},
         output="output",
     )
+    save_graph(rmsnorm_matmul_graph, output_file=f"{cache_root}/graph.png", title="RMSNorm + Matmul")
 
 
 if __name__ == "__main__":
