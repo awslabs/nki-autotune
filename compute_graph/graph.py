@@ -29,7 +29,8 @@ class ComputeGraph:
             self.hbm.add_input(hbm_tensor)
         operators = insert_tile_transpose(operators)
 
-        trace(operators, output, self.hbm.input_tensors, self.hbm.output_tensors)
+        output_tensor = infer_output(operators, output, self.hbm.input_tensors)
+        self.hbm.add_output(output_tensor)
         logger.debug(self.hbm)
 
         parallel_axes = get_parallel_axes(self.hbm.input_tensors, self.hbm.output_tensors)
@@ -58,6 +59,47 @@ class ComputeGraph:
             for node in nodes:
                 logger.debug(node)
             logger.debug(f"Edges: {edges}")
+
+
+def infer_output(
+    compute_ops: list[ComputeOp], output_tensor_name: str, input_tensors: dict[str, HBMTensor]
+) -> HBMTensor:
+    """Infer output tensor shape by tracing compute operations."""
+    sbuf_tensors: dict[str, BufferTensor] = {}
+    result: HBMTensor | None = None
+
+    for compute_op in compute_ops:
+        for input_arg in compute_op.input_args:
+            tensor_name = compute_op.arg_to_var[input_arg]
+            if tensor_name in sbuf_tensors:
+                sbuf_tensor = sbuf_tensors[tensor_name]
+            elif tensor_name in input_tensors:
+                hbm_tensor = input_tensors[tensor_name]
+                buffer_axes = tuple(BufferAxis(name=ax.name, size=ax.size) for ax in hbm_tensor.axes)
+                sbuf_tensor = BufferTensor(name=tensor_name, axes=buffer_axes, buffer="SBUF")
+                sbuf_tensors[tensor_name] = sbuf_tensor
+            else:
+                raise ValueError(f"Tensor '{tensor_name}' (input arg: '{input_arg}') not found for {compute_op}")
+            compute_op.specialize(input_arg, sbuf_tensor)
+
+        assert compute_op.is_specialized
+
+        for output_arg in compute_op.output_args:
+            tensor_name = compute_op.arg_to_var[output_arg]
+            if tensor_name not in sbuf_tensors:
+                sbuf_tensor = BufferTensor(name=tensor_name, axes=compute_op.get_output_axes(output_arg), buffer="SBUF")
+                sbuf_tensors[tensor_name] = sbuf_tensor
+
+            if tensor_name == output_tensor_name:
+                if result is not None:
+                    raise ValueError(f"Ambiguous output tensor '{output_tensor_name}': defined by multiple ops")
+                sbuf_tensor = sbuf_tensors[tensor_name]
+                result = create_hbm_tensor(tensor_name, sbuf_tensor.shape, sbuf_tensor.axis_names)
+
+    if result is None:
+        raise ValueError(f"Output tensor '{output_tensor_name}' not found in compute ops")
+
+    return result
 
 
 def trace(
