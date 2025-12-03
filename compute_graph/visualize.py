@@ -41,8 +41,6 @@ NODE_TYPE_COLORS: dict[str, str] = {"load": "#FFEAA7", "compute": "#A8D8EA", "st
 
 CLUSTER_COLORS: dict[str, str] = {"hbm_input": "#FF6B6B", "hbm_output": "#4ECDC4", "subgraph": "#888888"}
 
-EDGE_COLORS: dict[str, str] = {"cross_subgraph": "#FF6B6B"}
-
 DEFAULT_NODE_COLOR = "#E8E8E8"
 HBM_TENSOR_COLOR = "#FFB6C1"
 
@@ -58,100 +56,6 @@ def _escape_dot_string(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-def _build_adjacency_lists(edges: list[tuple[int, int]]) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
-    """
-    Args:
-        edges: List of (source, target) edge tuples
-
-    Returns:
-        Tuple of (successors, predecessors) adjacency lists
-    """
-    successors: dict[int, list[int]] = {}
-    predecessors: dict[int, list[int]] = {}
-
-    for source, target in edges:
-        successors.setdefault(source, []).append(target)
-        predecessors.setdefault(target, []).append(source)
-
-    return successors, predecessors
-
-
-def _infer_subgraph_assignments(
-    graph: ComputeGraph, successors: dict[int, list[int]], predecessors: dict[int, list[int]]
-) -> dict[int, int]:
-    """
-    Args:
-        graph: ComputeGraph to analyze
-        successors: Pre-built adjacency list of successor nodes
-        predecessors: Pre-built adjacency list of predecessor nodes
-
-    Returns:
-        Dictionary mapping node IDs to subgraph IDs
-    """
-    node_to_subgraph = {}
-    subgraph_id = 0
-    visited = set()
-
-    for node_id in range(len(graph.nodes)):
-        if node_id in visited:
-            continue
-
-        component = _get_connected_component(node_id, successors, predecessors)
-
-        for comp_node_id in component:
-            node_to_subgraph[comp_node_id] = subgraph_id
-            visited.add(comp_node_id)
-
-        subgraph_id += 1
-
-    return node_to_subgraph
-
-
-def _get_connected_component(
-    start_node: int, successors: dict[int, list[int]], predecessors: dict[int, list[int]]
-) -> list[int]:
-    """
-    Args:
-        start_node: Starting node for traversal
-        successors: Adjacency list of successor nodes
-        predecessors: Adjacency list of predecessor nodes
-
-    Returns:
-        Sorted list of all node IDs in the connected component
-    """
-    component = set()
-    stack = [start_node]
-
-    while stack:
-        node_id = stack.pop()
-        if node_id in component:
-            continue
-        component.add(node_id)
-
-        for neighbor in successors.get(node_id, []):
-            if neighbor not in component:
-                stack.append(neighbor)
-
-        for neighbor in predecessors.get(node_id, []):
-            if neighbor not in component:
-                stack.append(neighbor)
-
-    return sorted(component)
-
-
-def _get_counter_nodes(nodes: list[MemoryOp | ComputeOp], counter: int, node_to_subgraph: dict[int, int]) -> list[int]:
-    """
-    Args:
-        nodes: List of graph nodes
-        counter: Subgraph ID to filter by
-        node_to_subgraph: Mapping of node IDs to subgraph IDs
-
-    Returns:
-        List of node IDs belonging to the specified subgraph
-    """
-    return [n for n in range(len(nodes)) if node_to_subgraph.get(n) == counter]
-
-
 def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     """
     Args:
@@ -161,19 +65,6 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     Returns:
         DOT format string for Graphviz rendering
     """
-    nodes = compute_graph.nodes
-    edges = compute_graph.edges
-
-    for source, target in edges:
-        if source >= len(nodes):
-            raise ValueError(f"Edge references non-existent source node: {source}")
-        if target >= len(nodes):
-            raise ValueError(f"Edge references non-existent target node: {target}")
-
-    successors, predecessors = _build_adjacency_lists(edges)
-    node_to_subgraph = _infer_subgraph_assignments(compute_graph, successors, predecessors)
-    num_counters = max(node_to_subgraph.values()) + 1 if node_to_subgraph else 0
-
     lines = []
 
     lines.append("digraph ComputeGraph {")
@@ -220,39 +111,28 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
         lines.append("    }")
         lines.append("    ")
 
-    for counter in range(num_counters):
-        counter_nodes = _get_counter_nodes(nodes, counter, node_to_subgraph)
-        if not counter_nodes:
-            continue
+    for subgraph in compute_graph.subgraphs:
+        sg_idx = subgraph.index
+        nodes = subgraph.nodes
+        edges = subgraph.edges
 
-        counter_nodes_set = set(counter_nodes)
-
-        lines.append(f"    subgraph cluster_{counter} {{")
-        lines.append(f'        label="Subgraph {counter}";')
+        lines.append(f"    subgraph cluster_{sg_idx} {{")
+        lines.append(f'        label="Subgraph {sg_idx}";')
         lines.append('        style="rounded";')
         lines.append(f'        color="{CLUSTER_COLORS["subgraph"]}";')
         lines.append("        ")
 
-        for node_id in sorted(counter_nodes):
-            node_data = nodes[node_id]
+        for node_id, node_data in enumerate(nodes):
             node_label, node_color = _format_node(node_data)
-            lines.append(f'        node_{node_id} [label="{node_label}", fillcolor="{node_color}"];')
+            lines.append(f'        node_{sg_idx}_{node_id} [label="{node_label}", fillcolor="{node_color}"];')
 
         lines.append("        ")
 
-        for node_id in sorted(counter_nodes):
-            for succ in successors.get(node_id, []):
-                if succ in counter_nodes_set:
-                    lines.append(f"        node_{node_id} -> node_{succ};")
+        for source, target in edges:
+            lines.append(f"        node_{sg_idx}_{source} -> node_{sg_idx}_{target};")
 
         lines.append("    }")
         lines.append("    ")
-
-    for source, target in edges:
-        source_counter = node_to_subgraph.get(source)
-        target_counter = node_to_subgraph.get(target)
-        if source_counter != target_counter:
-            lines.append(f'    node_{source} -> node_{target} [style=dashed, color="{EDGE_COLORS["cross_subgraph"]}"];')
 
     lines.append("}")
 

@@ -3,7 +3,7 @@ import logging
 from compute_graph.buffer_tensor import BufferAxis, BufferTensor
 from compute_graph.compute_ops import ComputeOp, Matmul, TileTranspose
 from compute_graph.hbm_tensor import HBMTensor, create_hbm_tensor, get_parallel_axes, shard_tensors
-from compute_graph.memory import HBM, Buffer
+from compute_graph.memory import HBM
 from compute_graph.memory_ops import Allocate, Load, MemoryOp, Store
 
 logger = logging.getLogger(__name__)
@@ -32,17 +32,14 @@ class SubGraph:
         logger.debug(input_tensors)
         logger.debug(output_tensors)
         self.index = index
-        self.input_tensors = input_tensors
-        self.output_tensors = output_tensors
 
         self.nodes: list[MemoryOp | ComputeOp] = []
         self.edges: list[tuple[int, int]] = []
         self.tensor_producer: dict[str, tuple[int, BufferTensor]] = {}
 
-        self._load_input_hbm()
+        self._load_input_hbm(input_tensors)
 
         for compute_op in compute_ops:
-            logger.debug(compute_op)
 
             input_edges: list[int] = []
             for input_arg in compute_op.input_args:
@@ -74,8 +71,8 @@ class SubGraph:
                     _, buffer_tensor = self.tensor_producer[tensor_name]
                     self.tensor_producer[tensor_name] = (op_idx, buffer_tensor)
 
-                if tensor_name in self.output_tensors:
-                    hbm_tensor = self.output_tensors[tensor_name]
+                if tensor_name in output_tensors:
+                    hbm_tensor = output_tensors[tensor_name]
                     store_node = Store(dest=hbm_tensor, value=buffer_tensor)
                     store_idx = len(self.nodes)
                     self.nodes.append(store_node)
@@ -84,10 +81,10 @@ class SubGraph:
             logger.debug(node)
         logger.debug(f"Edges: {self.edges}")
 
-    def _load_input_hbm(self) -> None:
+    def _load_input_hbm(self, input_tensors: dict[str, HBMTensor]) -> None:
         """Load input HBM tensors into SBUF buffers and track as tensor producers."""
-        for tensor_name in self.input_tensors:
-            hbm_tensor = self.input_tensors[tensor_name]
+        for tensor_name in input_tensors:
+            hbm_tensor = input_tensors[tensor_name]
             buffer_axes = tuple(BufferAxis(name=ax.name, size=ax.size) for ax in hbm_tensor.axes)
             buffer_tensor = BufferTensor(name=tensor_name, axes=buffer_axes, buffer="SBUF")
 
@@ -123,25 +120,16 @@ class ComputeGraph:
         logger.debug(self.hbm)
 
         parallel_axes = get_parallel_axes(self.hbm.input_tensors, self.hbm.output_tensors)
-        logger.debug(parallel_axes)
+        logger.debug(f"parallel_axes = {parallel_axes}")
         sharded_inputs = shard_tensors(self.hbm.input_tensors, parallel_axes)
         sharded_outputs = shard_tensors(self.hbm.output_tensors, parallel_axes)
 
-        self.nodes: list[MemoryOp | ComputeOp] = []
-        self.edges: list[tuple[int, int]] = []
-        self.sbuf = Buffer(buffer="SBUF")
+        self.subgraphs: list[SubGraph] = []
         for graph_idx in range(len(sharded_inputs)):
-            subgraph_input_tensors = sharded_inputs[graph_idx]
-            subgraph_output_tensors = sharded_outputs[graph_idx]
-
             for op in operators:
                 op.clear_specialization()
-            subgraph = SubGraph(graph_idx, operators, subgraph_input_tensors, subgraph_output_tensors)
-
-            offset = len(self.nodes)
-            for from_idx, to_idx in subgraph.edges:
-                self.edges.append((from_idx + offset, to_idx + offset))
-            self.nodes.extend(subgraph.nodes)
+            subgraph = SubGraph(graph_idx, operators, sharded_inputs[graph_idx], sharded_outputs[graph_idx])
+            self.subgraphs.append(subgraph)
 
 
 def infer_output(
