@@ -17,7 +17,17 @@ class SubGraph:
         input_tensors: dict[str, HBMTensor],
         output_tensors: dict[str, HBMTensor],
     ) -> None:
-        """Build subgraph from compute ops, creating load/store/allocate nodes and dependency edges."""
+        """
+        Build a subgraph for a single parallel tile.
+
+        Transforms compute ops into a dependency graph with memory operations:
+        - Loads input HBM tensors into SBUF buffers
+        - Allocates SBUF buffers for intermediate results
+        - Stores final results back to HBM
+
+        Populates self.nodes with MemoryOp and ComputeOp nodes, and self.edges
+        with (producer_idx, consumer_idx) tuples representing data dependencies.
+        """
         logger.debug(f"\nSubgraph {index}")
         logger.debug(input_tensors)
         logger.debug(output_tensors)
@@ -33,27 +43,39 @@ class SubGraph:
 
         for compute_op in compute_ops:
             logger.debug(compute_op)
-            source_node_indices: list[int] = []
+
+            input_edges: list[int] = []
             for input_arg in compute_op.input_args:
                 tensor_name = compute_op.arg_to_var[input_arg]
-                node_idx, buffer_tensor = self.tensor_producer[tensor_name]
+                producer_idx, buffer_tensor = self.tensor_producer[tensor_name]
                 compute_op.specialize(input_arg, buffer_tensor)
-                source_node_indices.append(node_idx)
+                input_edges.append(producer_idx)
             assert compute_op.is_specialized
-            self._create_intermediate_tensors(compute_op)
 
             op_idx = len(self.nodes)
             self.nodes.append(compute_op)
-            for node_idx in source_node_indices:
-                self.edges.append((node_idx, op_idx))
+
+            for producer_idx in input_edges:
+                self.edges.append((producer_idx, op_idx))
 
             for output_arg in compute_op.output_args:
                 tensor_name = compute_op.arg_to_var[output_arg]
-                producer_idx, buffer_tensor = self.tensor_producer[tensor_name]
-                self.edges.append((producer_idx, op_idx))
-                self.tensor_producer[tensor_name] = (op_idx, buffer_tensor)
-                if tensor_name in output_tensors:
-                    hbm_tensor = output_tensors[tensor_name]
+
+                if tensor_name not in self.tensor_producer:
+                    buffer_tensor = BufferTensor(
+                        name=tensor_name, axes=compute_op.get_output_axes(output_arg), buffer="SBUF"
+                    )
+                    allocate_node = Allocate(tensor=buffer_tensor)
+                    alloc_idx = len(self.nodes)
+                    self.nodes.append(allocate_node)
+                    self.edges.append((alloc_idx, op_idx))
+                    self.tensor_producer[tensor_name] = (op_idx, buffer_tensor)
+                else:
+                    _, buffer_tensor = self.tensor_producer[tensor_name]
+                    self.tensor_producer[tensor_name] = (op_idx, buffer_tensor)
+
+                if tensor_name in self.output_tensors:
+                    hbm_tensor = self.output_tensors[tensor_name]
                     store_node = Store(dest=hbm_tensor, value=buffer_tensor)
                     store_idx = len(self.nodes)
                     self.nodes.append(store_node)
@@ -79,19 +101,6 @@ class SubGraph:
 
             self.edges.append((alloc_idx, load_idx))
             self.tensor_producer[tensor_name] = (load_idx, buffer_tensor)
-
-    def _create_intermediate_tensors(self, compute_op: ComputeOp) -> None:
-        """Allocate SBUF buffer tensors for intermediate compute op outputs. FIXME: may not be sbuf."""
-        for output_arg in compute_op.output_args:
-            tensor_name = compute_op.arg_to_var[output_arg]
-            if tensor_name not in self.tensor_producer:
-                buffer_tensor = BufferTensor(
-                    name=tensor_name, axes=compute_op.get_output_axes(output_arg), buffer="SBUF"
-                )
-                allocate_node = Allocate(tensor=buffer_tensor)
-                producer_idx = len(self.nodes)
-                self.nodes.append(allocate_node)
-                self.tensor_producer[tensor_name] = (producer_idx, buffer_tensor)
 
 
 class ComputeGraph:
