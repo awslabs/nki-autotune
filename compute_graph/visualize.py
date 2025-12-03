@@ -1,3 +1,4 @@
+import logging
 import os
 import subprocess
 
@@ -5,6 +6,36 @@ from compute_graph.compute_ops import ComputeOp
 from compute_graph.graph import ComputeGraph
 from compute_graph.hbm_tensor import HBMTensor
 from compute_graph.memory_ops import Allocate, Load, MemoryOp, Store
+
+
+class MultilineFormatter(logging.Formatter):
+    """Formatter that aligns multiline messages with indentation."""
+
+    def __init__(self, msg_width: int) -> None:
+        super().__init__(datefmt="%Y-%m-%d %H:%M:%S")
+        self.msg_width = msg_width
+
+    def format(self, record: logging.LogRecord) -> str:
+        metadata = f"{self.formatTime(record)} - {record.levelname} - {record.name}"
+        message = record.getMessage()
+        lines = message.split("\n")
+
+        first_line = f"{lines[0]:<{self.msg_width}}{metadata}"
+
+        if len(lines) == 1:
+            return first_line
+
+        continuation = "\n".join(lines[1:])
+        return f"{first_line}\n{continuation}"
+
+
+def setup_logging(log_file: str, level: int = logging.DEBUG, msg_width: int = 200) -> None:
+    """Configure logging with multiline-aligned formatter."""
+    handler = logging.FileHandler(log_file, mode="w")
+    handler.setFormatter(MultilineFormatter(msg_width=msg_width))
+    logging.root.addHandler(handler)
+    logging.root.setLevel(level)
+
 
 NODE_TYPE_COLORS: dict[str, str] = {"load": "#FFEAA7", "compute": "#A8D8EA", "store": "#A8E6CF", "allocate": "#E8E8E8"}
 

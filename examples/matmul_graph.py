@@ -6,16 +6,11 @@ import numpy as np
 
 from compute_graph.compute_ops import Activation, Matmul, TensorScalar
 from compute_graph.graph import ComputeGraph
-from compute_graph.visualize import save_graph
+from compute_graph.visualize import save_graph, setup_logging
 
 cache_root = os.environ.get("NKI_CACHE_ROOT", "/fsx/weittang/kernelgen_cache")
-logging.basicConfig(
-    level=logging.DEBUG,
-    filename=f"{cache_root}/debug.log",
-    filemode="w",
-    format="%(message)-400s" + "%(asctime)s - %(levelname)s - %(name)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+setup_logging(f"{cache_root}/debug.log")
+logger = logging.getLogger(__name__)
 
 
 def test_graph_gen() -> None:
