@@ -146,11 +146,25 @@ class TensorScalar(ComputeOp):
         self.op1 = op1
         self.operand1 = operand1
 
+    def codegen(self) -> str:
+        """Generate NKI code for tensor_scalar operation."""
+        dest = self.arg_to_var["dest"]
+        data = self.arg_to_var["data"]
+        operand0 = self.arg_to_var.get("operand0", self.operand0)
+
+        args = [f"data={data}", f"op0={self.op0}", f"operand0={operand0}"]
+
+        if self.op1 is not None:
+            operand1 = self.arg_to_var.get("operand1", self.operand1)
+            args.append(f"op1={self.op1}")
+            args.append(f"operand1={operand1}")
+
+        args_str = ", ".join(args)
+        return f"nisa.tensor_scalar({dest}, {args_str})"
+
     def __repr__(self) -> str:
         args = [f"data={self._format_tensor('data')}"]
-
-        op0_name = getattr(self.op0, "__name__", str(self.op0))
-        args.append(f"op0={op0_name}")
+        args.append(f"op0={self.op0}")
 
         if isinstance(self.operand0, str):
             args.append(f"operand0={self._format_tensor('operand0')}")
@@ -158,8 +172,7 @@ class TensorScalar(ComputeOp):
             args.append(f"operand0={self.operand0}")
 
         if self.op1 is not None:
-            op1_name = getattr(self.op1, "__name__", str(self.op1))
-            args.append(f"op1={op1_name}")
+            args.append(f"op1={self.op1}")
 
             if isinstance(self.operand1, str):
                 args.append(f"operand1={self._format_tensor('operand1')}")
@@ -191,15 +204,28 @@ class Activation(ComputeOp):
         self.op = op
         self.reduce_op = reduce_op
 
+    def codegen(self) -> str:
+        """Generate NKI code for activation operation."""
+        dest = self.arg_to_var["dest"]
+        data = self.arg_to_var["data"]
+
+        args = [f"op={self.op}", f"data={data}"]
+
+        if self.reduce_op is not None and "reduce_res" in self.arg_to_var:
+            reduce_res = self.arg_to_var["reduce_res"]
+            args.append(f"reduce_op={self.reduce_op}")
+            args.append(f"reduce_res={reduce_res}")
+
+        args_str = ", ".join(args)
+        return f"nisa.activation({dest}, {args_str})"
+
     def __repr__(self) -> str:
-        op_name = getattr(self.op, "__name__", str(self.op))
         data_str = self._format_tensor("data")
-        args = [f"op={op_name}", f"data={data_str}"]
+        args = [f"op={self.op}", f"data={data_str}"]
         result = self._format_tensor("dest")
         if "reduce_res" in self.arg_to_var and self.arg_to_var["reduce_res"]:
-            reduce_op_name = getattr(self.reduce_op, "__name__", str(self.reduce_op))
             reduce_res_str = self._format_tensor("reduce_res")
-            args.append(f"reduce_op={reduce_op_name}")
+            args.append(f"reduce_op={self.reduce_op}")
             args.append(f"reduce_res={reduce_res_str}")
         args_str = ", ".join(args)
         return f"{result} = Activation({args_str})"
@@ -219,6 +245,12 @@ class Transpose(ComputeOp):
 
         super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
 
+    def codegen(self) -> str:
+        """Generate NKI code for nc_transpose operation."""
+        dest = self.arg_to_var["dest"]
+        data = self.arg_to_var["data"]
+        return f"nisa.nc_transpose({dest}, {data})"
+
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = nisa.nc_transpose(data={self._format_tensor('data')})"
 
@@ -237,6 +269,12 @@ class TileTranspose(ComputeOp):
         arg_to_var = {"data": data, "dest": dest}
 
         super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
+
+    def codegen(self) -> str:
+        """Generate NKI code for in-tile transpose using nc_transpose."""
+        dest = self.arg_to_var["dest"]
+        data = self.arg_to_var["data"]
+        return f"nisa.nc_transpose({dest}, {data})"
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = TileTranspose(data={self._format_tensor('data')})"
@@ -263,6 +301,19 @@ class Matmul(ComputeOp):
         super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
 
         self.lhs_transposed = lhs_transposed
+
+    def codegen(self) -> str:
+        """Generate NKI code for nc_matmul operation.
+
+        nc_matmul computes: dst = stationary.T @ moving
+        For lhs @ rhs where lhs is (M, K) and rhs is (K, N):
+        - stationary = lhs (will be transposed internally)
+        - moving = rhs
+        """
+        dest = self.arg_to_var["dest"]
+        lhs = self.arg_to_var["lhs"]
+        rhs = self.arg_to_var["rhs"]
+        return f"{dest} = nisa.nc_matmul({lhs}, {rhs})"
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = Matmul(lhs={self._format_tensor('lhs')}, rhs={self._format_tensor('rhs')})"
