@@ -1,4 +1,9 @@
-from compute_graph.graph import ComputeGraph
+import logging
+from collections import defaultdict, deque
+
+from compute_graph.graph import ComputeGraph, SubGraph
+
+logger = logging.getLogger(__name__)
 
 
 class NKICodegen:
@@ -7,17 +12,18 @@ class NKICodegen:
     def __init__(self, graph: ComputeGraph) -> None:
         """
         Args:
-            graph: Specialized ComputeGraph to generate code from
+            graph: ComputeGraph to generate code from
         """
-        if not hasattr(graph, "nodes") or not graph.nodes:
-            raise ValueError("Graph must be specialized before code generation")
+        if not graph.subgraphs:
+            raise ValueError("Graph must have subgraphs before code generation")
         self.graph = graph
 
-    def generate_kernel(self, kernel_name: str) -> str:
+    def generate_kernel(self, kernel_name: str, kernel_path: str) -> str:
         """Generate complete NKI kernel code.
 
         Args:
             kernel_name: Name for the generated kernel function
+            kernel_path: Path to write the generated kernel file
 
         Returns:
             Complete NKI kernel code as a string
@@ -28,6 +34,9 @@ class NKICodegen:
         body = self._generate_body()
 
         kernel_code = f"{imports}\n\n{decorator}\n{signature}\n{body}"
+        with open(kernel_path, "w") as f:
+            f.write(kernel_code)
+        logger.info(f"{kernel_name} written to {kernel_path}")
         return kernel_code
 
     def _generate_imports(self) -> str:
@@ -40,62 +49,89 @@ class NKICodegen:
         )
 
     def _generate_signature(self, kernel_name: str) -> str:
-        """Generate function signature from graph inputs only."""
-        input_names = [tensor.name for tensor in self.graph.hbm]
+        """Generate function signature from graph inputs."""
+        input_names = list(self.graph.hbm.input_tensors.keys())
         params_str = ", ".join(input_names)
         return f"def {kernel_name}({params_str}):"
 
     def _generate_body(self) -> str:
-        """Generate function body with code for all nodes."""
-        lines = []
+        """Generate function body with code for all subgraphs."""
+        lines: list[str] = []
 
-        for output_tensor in self.graph.outputs:
-            shape = output_tensor.shape
-            lines.append(f"    {output_tensor.name} = nl.ndarray({shape}, dtype=nl.float32, buffer=nl.shared_hbm)")
+        for name, tensor in self.graph.hbm.input_tensors.items():
+            lines.append(
+                f'    assert {name}.shape == {tensor.shape}, f"Expected {name}.shape={tensor.shape}, got {{{name}.shape}}"'
+            )
 
-        if self.graph.outputs:
+        if self.graph.hbm.input_tensors:
             lines.append("")
 
-        current_subgraph = None
+        for name, tensor in self.graph.hbm.output_tensors.items():
+            shape = tensor.shape
+            lines.append(f"    {name} = nl.ndarray({shape}, dtype=nl.float32, buffer=nl.shared_hbm)")
 
-        for node_id in sorted(self.graph.nodes.keys()):
-            node = self.graph.nodes[node_id]
-            subgraph_idx = self._get_subgraph_index(node)
+        if self.graph.hbm.output_tensors:
+            lines.append("")
 
-            if subgraph_idx != current_subgraph:
-                if current_subgraph is not None:
-                    lines.append("")
-                lines.append(f"    # Subgraph {subgraph_idx}")
-                current_subgraph = subgraph_idx
+        for subgraph in self.graph.subgraphs:
+            subgraph_lines = self._generate_subgraph(subgraph)
+            lines.extend(subgraph_lines)
+            lines.append("")
 
+        output_names = list(self.graph.hbm.output_tensors.keys())
+        if len(output_names) == 1:
+            lines.append(f"    return {output_names[0]}")
+        elif len(output_names) > 1:
+            return_str = ", ".join(output_names)
+            lines.append(f"    return {return_str}")
+
+        return "\n".join(lines)
+
+    def _generate_subgraph(self, subgraph: SubGraph) -> list[str]:
+        """Generate code for a single subgraph using topological sort."""
+        lines: list[str] = []
+        lines.append(f"    # Subgraph {subgraph.index}")
+
+        # Topologically sort nodes based on edges
+        sorted_indices = self._topological_sort(len(subgraph.nodes), subgraph.edges)
+
+        for idx in sorted_indices:
+            node = subgraph.nodes[idx]
             code = node.codegen()
             for code_line in code.split("\n"):
                 lines.append(f"    {code_line}")
 
-        if self.graph.outputs:
-            lines.append("")
-            output_names = [tensor.name for tensor in self.graph.outputs]
-            if len(output_names) == 1:
-                lines.append(f"    return {output_names[0]}")
-            else:
-                return_str = ", ".join(output_names)
-                lines.append(f"    return {return_str}")
+        return lines
 
-        return "\n".join(lines)
-
-    def _get_subgraph_index(self, node) -> int:
-        """Extract subgraph index from node's actual buffer names.
+    def _topological_sort(self, num_nodes: int, edges: list[tuple[int, int]]) -> list[int]:
+        """Topologically sort nodes based on dependency edges.
 
         Args:
-            node: Node to extract subgraph index from
+            num_nodes: Total number of nodes
+            edges: List of (producer_idx, consumer_idx) tuples
 
         Returns:
-            Subgraph index (0-based)
+            List of node indices in topological order
         """
-        for tensor in node.tensors.values():
-            tensor_name = tensor.name
-            if "_" in tensor_name:
-                parts = tensor_name.split("_")
-                if parts[-1].isdigit():
-                    return int(parts[-1])
-        return 0
+        in_degree = [0] * num_nodes
+        successors: dict[int, list[int]] = defaultdict(list)
+
+        for producer, consumer in edges:
+            successors[producer].append(consumer)
+            in_degree[consumer] += 1
+
+        queue = deque(i for i in range(num_nodes) if in_degree[i] == 0)
+        result: list[int] = []
+
+        while queue:
+            node = queue.popleft()
+            result.append(node)
+            for successor in successors[node]:
+                in_degree[successor] -= 1
+                if in_degree[successor] == 0:
+                    queue.append(successor)
+
+        if len(result) != num_nodes:
+            raise ValueError("Cycle detected in subgraph dependencies")
+
+        return result
