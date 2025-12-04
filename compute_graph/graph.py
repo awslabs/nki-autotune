@@ -2,21 +2,15 @@ import logging
 
 from compute_graph.buffer_tensor import BufferAxis, BufferTensor
 from compute_graph.compute_ops import ComputeOp, Matmul, TileTranspose
-from compute_graph.hbm_tensor import HBMTensor, create_hbm_tensor, get_parallel_axes, shard_tensors
-from compute_graph.memory import HBM
+from compute_graph.hbm_tensor import HBMTensor, create_hbm_tensor, get_num_shards, get_parallel_axes, shard_tensors
+from compute_graph.memory import HBM, Buffer
 from compute_graph.memory_ops import Allocate, Load, MemoryOp, Store
 
 logger = logging.getLogger(__name__)
 
 
 class SubGraph:
-    def __init__(
-        self,
-        index: int,
-        compute_ops: list[ComputeOp],
-        input_tensors: dict[str, HBMTensor],
-        output_tensors: dict[str, HBMTensor],
-    ) -> None:
+    def __init__(self, index: int, compute_ops: list[ComputeOp], hbm: HBM, parallel_axes: list[str]) -> None:
         """
         Build a subgraph for a single parallel tile.
 
@@ -28,10 +22,12 @@ class SubGraph:
         Populates self.nodes with MemoryOp and ComputeOp nodes, and self.edges
         with (producer_idx, consumer_idx) tuples representing data dependencies.
         """
+        self.index = index
+        input_tensors = shard_tensors(hbm.input_tensors, parallel_axes, index)
+        output_tensors = shard_tensors(hbm.output_tensors, parallel_axes, index)
         logger.debug(f"\nSubgraph {index}")
         logger.debug(input_tensors)
         logger.debug(output_tensors)
-        self.index = index
 
         self.nodes: list[MemoryOp | ComputeOp] = []
         self.edges: list[tuple[int, int]] = []
@@ -115,21 +111,23 @@ class ComputeGraph:
             self.hbm.add_input(hbm_tensor)
         operators = insert_tile_transpose(operators)
 
+        self.sbuf = Buffer("SBUF")
+
         output_tensor = infer_output(operators, output, self.hbm.input_tensors)
         self.hbm.add_output(output_tensor)
         logger.debug(self.hbm)
 
         parallel_axes = get_parallel_axes(self.hbm.input_tensors, self.hbm.output_tensors)
         logger.debug(f"parallel_axes = {parallel_axes}")
-        sharded_inputs = shard_tensors(self.hbm.input_tensors, parallel_axes)
-        sharded_outputs = shard_tensors(self.hbm.output_tensors, parallel_axes)
+        num_shards = get_num_shards(self.hbm.input_tensors, parallel_axes)
 
         self.subgraphs: list[SubGraph] = []
-        for graph_idx in range(len(sharded_inputs)):
+        for graph_idx in range(num_shards):
             for op in operators:
                 op.clear_specialization()
-            subgraph = SubGraph(graph_idx, operators, sharded_inputs[graph_idx], sharded_outputs[graph_idx])
+            subgraph = SubGraph(graph_idx, operators, self.hbm, parallel_axes)
             self.subgraphs.append(subgraph)
+            logger.debug(subgraph.tensor_producer)
 
 
 def infer_output(
