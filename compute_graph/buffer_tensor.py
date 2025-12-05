@@ -5,6 +5,9 @@ class BufferAxis:
         self.name = name
         self.size = size
 
+    def __repr__(self) -> str:
+        return f"'{self.name}':{self.size}"
+
 
 class BufferTensor:
     """Tensor stored in on-chip buffer (SBUF or PSUM)."""
@@ -24,5 +27,5 @@ class BufferTensor:
         return [ax.name for ax in self.axes]
 
     def __repr__(self) -> str:
-        axes_str = ", ".join(f"{name}:{size}" for name, size in zip(self.axis_names, self.shape))
+        axes_str = ", ".join(f"{axis}" for axis in self.axes)
         return f"{self.buffer}Tensor({self.name}[{axes_str}])"

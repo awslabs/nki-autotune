@@ -1,114 +1,9 @@
 from typing import Any
 
-from compute_graph.buffer_tensor import BufferAxis, BufferTensor
+from compute_graph.operators import Operator
 
 
-class ComputeOp:
-    """Base class for on-chip operators."""
-
-    def __init__(
-        self,
-        input_args: list[str],
-        output_args: list[str],
-        arg_to_axes: dict[str, list[str]],
-        arg_to_var: dict[str, str],
-    ) -> None:
-        self.input_args = input_args
-        self.output_args = output_args
-        self.arg_to_axes = arg_to_axes
-        self.arg_to_var = arg_to_var
-        for arg in input_args + output_args:
-            assert arg in arg_to_axes, f"Tensor arg {arg} is missing axes"
-            assert arg in arg_to_var, f"Tensor arg {arg} is missing variable name"
-        self.symbolic_axes: dict[str, BufferAxis] = {}
-        self._populate_constant_axes()
-
-    def _populate_constant_axes(self) -> None:
-        """Populate symbolic_axes for constant axes (numeric axis names like "1" or "128")."""
-        for arg in self.arg_to_axes:
-            axes = self.arg_to_axes[arg]
-            for axis in axes:
-                try:
-                    size = int(axis)
-                    self.symbolic_axes[axis] = BufferAxis(name=axis, size=size)
-                except ValueError:
-                    pass
-
-    @property
-    def input_names(self) -> list[str]:
-        return [self.arg_to_var[arg] for arg in self.input_args]
-
-    @property
-    def is_specialized(self) -> bool:
-        args = self.input_args + self.output_args
-        return all(axis in self.symbolic_axes for arg in args for axis in self.arg_to_axes[arg])
-
-    def specialize(self, arg: str, tensor: BufferTensor) -> None:
-        """Map operator symbolic axes to tensor's BufferAxis objects.
-
-        Args:
-            arg: The operator argument name (e.g., "lhs", "rhs", "data")
-            tensor: The BufferTensor providing concrete axis info
-        """
-        expected_axes = self.arg_to_axes[arg]
-        if len(tensor.axes) != len(expected_axes):
-            raise ValueError(
-                f"Shape mismatch for '{arg}': expected {len(expected_axes)} dimensions {expected_axes} "
-                f"but got {len(tensor.axes)} dimensions {tensor.shape}"
-            )
-        for symbolic, buffer_axis in zip(expected_axes, tensor.axes):
-            if symbolic in self.symbolic_axes:
-                if self.symbolic_axes[symbolic].size != buffer_axis.size:
-                    raise ValueError(
-                        f"Axis size conflict {arg}.{symbolic}: "
-                        f"expected {self.symbolic_axes[symbolic].size}, got {buffer_axis.size} in {self}."
-                    )
-            else:
-                self.symbolic_axes[symbolic] = buffer_axis
-
-    def get_tensor_shape(self, arg: str) -> tuple[int, ...]:
-        """Get the shape of a tensor by looking up axis sizes."""
-        axes = self.arg_to_axes[arg]
-        shape = []
-        for axis in axes:
-            if axis not in self.symbolic_axes:
-                raise ValueError(f"Axis '{axis}' for tensor '{arg}' is not specialized yet in {self}. ")
-            shape.append(self.symbolic_axes[axis].size)
-        return tuple(shape)
-
-    def get_output_axes(self, arg: str) -> tuple[BufferAxis, ...]:
-        """Get the output BufferAxis tuple for an output tensor."""
-        symbolic_axes = self.arg_to_axes[arg]
-        return tuple(self.symbolic_axes[axis] for axis in symbolic_axes)
-
-    def codegen(self) -> str:
-        """Generate NKI code for this node."""
-        raise NotImplementedError(f"codegen is not implemented for {self}")
-
-    def clear_specialization(self) -> None:
-        self.symbolic_axes.clear()
-        self._populate_constant_axes()
-
-    def _format_tensor(self, arg: str) -> str:
-        """Format tensor as 'name[axes]' showing sizes if specialized."""
-        axes = self.arg_to_axes[arg]
-        axis_strs = []
-        for axis in axes:
-            if axis in self.symbolic_axes:
-                axis_strs.append(f"{self.symbolic_axes[axis].size}")
-            else:
-                axis_strs.append(axis)
-        tensor_name = self.arg_to_var[arg]
-        axis_str = ", ".join(axis_strs)
-        result = f"{tensor_name}[{axis_str}]"
-        return result
-
-    def __repr__(self) -> str:
-        """String representation of the node."""
-        raise NotImplementedError(f"repr is not implemented for the base ComputeOp class.")
-
-
-class TensorScalar(ComputeOp):
+class TensorScalar(Operator):
     """Element-wise operations on data tiles with scalar/vector operands.
 
     Supports chaining up to two operations with broadcasting along partition axis.
@@ -124,22 +19,24 @@ class TensorScalar(ComputeOp):
         op1: Any = None,
         operand1: float | str | None = None,
     ) -> None:
-        input_args = ["data"]
-        output_args = ["dest"]
-        arg_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
+        read_args = ("data",)
+        write_args = ("dest",)
+        axis_semantics = {"data": ("P", "F"), "dest": ("P", "F")}
         arg_to_var = {"data": data, "dest": dest}
 
         if isinstance(operand0, str):
-            input_args.append("operand0")
-            arg_to_axes["operand0"] = ["P", "1"]
+            read_args += ("operand0",)
+            axis_semantics["operand0"] = ("P", "1")
             arg_to_var["operand0"] = operand0
 
         if isinstance(operand1, str):
-            input_args.append("operand1")
-            arg_to_axes["operand1"] = ["P", "1"]
+            read_args += ("operand1",)
+            axis_semantics["operand1"] = ("P", "1")
             arg_to_var["operand1"] = operand1
 
-        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
+        super().__init__(
+            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
+        )
 
         self.op0 = op0
         self.operand0 = operand0
@@ -150,12 +47,12 @@ class TensorScalar(ComputeOp):
         """Generate NKI code for tensor_scalar operation."""
         dest = self.arg_to_var["dest"]
         data = self.arg_to_var["data"]
-        operand0 = self.arg_to_var.get("operand0", self.operand0)
+        operand0 = self.arg_to_var["operand0"]
 
         args = [f"data={data}", f"op0={self.op0}", f"operand0={operand0}"]
 
         if self.op1 is not None:
-            operand1 = self.arg_to_var.get("operand1", self.operand1)
+            operand1 = self.arg_to_var["operand1"]
             args.append(f"op1={self.op1}")
             args.append(f"operand1={operand1}")
 
@@ -166,7 +63,7 @@ class TensorScalar(ComputeOp):
         args = [f"data={self._format_tensor('data')}"]
         args.append(f"op0={self.op0}")
 
-        if isinstance(self.operand0, str):
+        if isinstance(self.arg_to_var, str):
             args.append(f"operand0={self._format_tensor('operand0')}")
         else:
             args.append(f"operand0={self.operand0}")
@@ -183,7 +80,7 @@ class TensorScalar(ComputeOp):
         return f"{self._format_tensor('dest')} = TensorScalar({args_str})"
 
 
-class Activation(ComputeOp):
+class Activation(Operator):
     """Apply activation functions element-wise to input tiles.
 
     Optionally reduces along the free axis to shape (P, 1).
@@ -191,15 +88,17 @@ class Activation(ComputeOp):
     """
 
     def __init__(self, dest: str, op: Any, data: str, reduce_op: Any = None, reduce_res: str | None = None) -> None:
-        input_args = ["data"]
-        output_args = ["dest"]
-        arg_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
+        read_args = ("data",)
+        write_args = ("dest",)
+        axis_semantics = {"data": ("P", "F"), "dest": ("P", "F")}
         arg_to_var = {"dest": dest, "data": data}
         if reduce_res:
-            output_args.append("reduce_res")
-            arg_to_axes["reduce_res"] = ["P", "1"]
+            write_args += ("reduce_res",)
+            axis_semantics["reduce_res"] = ("P", "1")
             arg_to_var["reduce_res"] = reduce_res
-        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
+        super().__init__(
+            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
+        )
 
         self.op = op
         self.reduce_op = reduce_op
@@ -231,19 +130,21 @@ class Activation(ComputeOp):
         return f"{result} = Activation({args_str})"
 
 
-class Transpose(ComputeOp):
+class Transpose(Operator):
     """2D transpose swapping partition and free axes.
 
     Transforms input (P, F) to output (F, P).
     """
 
     def __init__(self, dest: str, data: str) -> None:
-        input_args = ["data"]
-        output_args = ["dest"]
-        arg_to_axes = {"data": ["P", "F"], "dest": ["F", "P"]}
+        read_args = ("data",)
+        write_args = ("dest",)
+        axis_semantics = {"data": ("P", "F"), "dest": ("F", "P")}
         arg_to_var = {"data": data, "dest": dest}
 
-        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
+        super().__init__(
+            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
+        )
 
     def codegen(self) -> str:
         """Generate NKI code for nc_transpose operation."""
@@ -255,7 +156,7 @@ class Transpose(ComputeOp):
         return f"{self._format_tensor('dest')} = nisa.nc_transpose(data={self._format_tensor('data')})"
 
 
-class TileTranspose(ComputeOp):
+class TileTranspose(Operator):
     """In-tile transpose maintaining (P, F) shape.
 
     Rearranges element layout within the tile without changing axes,
@@ -263,12 +164,14 @@ class TileTranspose(ComputeOp):
     """
 
     def __init__(self, dest: str, data: str) -> None:
-        input_args = ["data"]
-        output_args = ["dest"]
-        arg_to_axes = {"data": ["P", "F"], "dest": ["P", "F"]}
+        read_args = ("data",)
+        write_args = ("dest",)
+        axis_semantics = {"data": ("P", "F"), "dest": ("P", "F")}
         arg_to_var = {"data": data, "dest": dest}
 
-        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
+        super().__init__(
+            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
+        )
 
     def codegen(self) -> str:
         """Generate NKI code for in-tile transpose using nc_transpose."""
@@ -280,7 +183,7 @@ class TileTranspose(ComputeOp):
         return f"{self._format_tensor('dest')} = TileTranspose(data={self._format_tensor('data')})"
 
 
-class Matmul(ComputeOp):
+class Matmul(Operator):
     """Matrix multiplication: lhs @ rhs with optional lhs transpose.
 
     Computes (M, K) @ (K, N) → (M, N), or (K, M).T @ (K, N) → (M, N).
@@ -288,17 +191,19 @@ class Matmul(ComputeOp):
     """
 
     def __init__(self, dest: str, lhs: str, rhs: str, lhs_transposed: bool) -> None:
-        input_args = ["lhs", "rhs"]
-        output_args = ["dest"]
+        read_args = ("lhs", "rhs")
+        write_args = ("dest",)
 
         if lhs_transposed:
-            arg_to_axes = {"lhs": ["K", "M"], "rhs": ["K", "N"], "dest": ["M", "N"]}
+            axis_semantics = {"lhs": ("K", "M"), "rhs": ("K", "N"), "dest": ("M", "N")}
         else:
-            arg_to_axes = {"lhs": ["M", "K"], "rhs": ["K", "N"], "dest": ["M", "N"]}
+            axis_semantics = {"lhs": ("M", "K"), "rhs": ("K", "N"), "dest": ("M", "N")}
 
         arg_to_var = {"lhs": lhs, "rhs": rhs, "dest": dest}
 
-        super().__init__(input_args=input_args, output_args=output_args, arg_to_axes=arg_to_axes, arg_to_var=arg_to_var)
+        super().__init__(
+            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
+        )
 
         self.lhs_transposed = lhs_transposed
 

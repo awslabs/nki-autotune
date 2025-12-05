@@ -2,10 +2,10 @@ import logging
 import os
 import subprocess
 
-from compute_graph.compute_ops import ComputeOp
 from compute_graph.graph import ComputeGraph
 from compute_graph.hbm_tensor import HBMTensor
-from compute_graph.memory_ops import Allocate, Load, MemoryOp, Store
+from compute_graph.memory_ops import Allocate, Load, Store
+from compute_graph.operators import Operator
 
 
 class MultilineFormatter(logging.Formatter):
@@ -29,7 +29,7 @@ class MultilineFormatter(logging.Formatter):
         return f"{first_line}\n{continuation}"
 
 
-def setup_logging(log_file: str, level: int = logging.DEBUG, msg_width: int = 200) -> None:
+def setup_logging(log_file: str, level: int = logging.DEBUG, msg_width: int = 300) -> None:
     """Configure logging with multiline-aligned formatter."""
     handler = logging.FileHandler(log_file, mode="w")
     handler.setFormatter(MultilineFormatter(msg_width=msg_width))
@@ -139,7 +139,7 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     return "\n".join(lines)
 
 
-def _get_node_type(node_data: MemoryOp | ComputeOp) -> str:
+def _get_node_type(node_data: Operator) -> str:
     """
     Args:
         node_data: Node object (MemoryOp or ComputeOp)
@@ -157,7 +157,7 @@ def _get_node_type(node_data: MemoryOp | ComputeOp) -> str:
     return node_type
 
 
-def _format_node(node_data: MemoryOp | ComputeOp) -> tuple[str, str]:
+def _format_node(node_data: Operator) -> tuple[str, str]:
     """
     Args:
         node_data: Node object (MemoryOp or ComputeOp)
