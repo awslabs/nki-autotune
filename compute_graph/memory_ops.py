@@ -1,66 +1,77 @@
 from compute_graph.buffer_tensor import BufferTensor
 from compute_graph.hbm_tensor import HBMTensor
+from compute_graph.operators import Operator
 
 
-class MemoryOp:
-    """Base class for memory operations."""
-
-    def codegen(self) -> str:
-        """Generate NKI code for this memory operation."""
-        raise NotImplementedError(f"codegen not implemented for {type(self).__name__}")
-
-
-class Load(MemoryOp):
+class Load(Operator):
     """Load data from HBM to SBUF."""
 
-    def __init__(self, dest: BufferTensor, src: HBMTensor) -> None:
-        self.dest = dest
-        self.src = src
-        assert dest.buffer == "SBUF", f"Cannot load {dest} from HBM"
+    def __init__(self, dest: str, src: str) -> None:
+        super().__init__(
+            read_args=("src",),
+            write_args=("dest",),
+            arg_to_var={"src": src, "dest": dest},
+            axis_semantics={"src": ("P", "F"), "dest": ("P", "F")},
+        )
 
     def codegen(self) -> str:
         """Generate nl.load from HBM to SBUF."""
-        indices = _generate_hbm_indices(self.src)
-        return f"{self.dest.name} = nl.load({self.src.name}[{indices}])"
+        hbm_tensor = self.arg_to_tensor["src"]
+        assert isinstance(hbm_tensor, HBMTensor)
+        indices = _generate_hbm_indices(hbm_tensor)
+        buffer_tensor = self.arg_to_tensor["dest"]
+        assert isinstance(buffer_tensor, BufferTensor)
+        return f"{buffer_tensor} = nl.load({hbm_tensor}[{indices}])"
 
     def __repr__(self) -> str:
-        return f"{self.dest} = Load(src={self.src})"
+        return f"{self._format_tensor('dest')} = Load(src={self._format_tensor('src')})"
 
 
-class Store(MemoryOp):
+class Store(Operator):
     """Store data from SBUF to HBM."""
 
-    def __init__(self, dest: HBMTensor, value: BufferTensor) -> None:
-        self.dest = dest
-        self.value = value
-        assert value.buffer == "SBUF", f"Cannot store {value} to HBM"
+    def __init__(self, dest: str, value: str) -> None:
+        super().__init__(
+            read_args=("value",),
+            write_args=("dest",),
+            arg_to_var={"value": value, "dest": dest},
+            axis_semantics={"value": ("P", "F"), "dest": ("P", "F")},
+        )
 
     def codegen(self) -> str:
-        """Generate nl.store from SBUF to HBM."""
-        indices = _generate_hbm_indices(self.dest)
-        return f"nl.store({self.dest.name}[{indices}], value={self.value.name})"
+        """Generate nl.load from HBM to SBUF."""
+        hbm_tensor = self.arg_to_tensor["src"]
+        assert isinstance(hbm_tensor, HBMTensor)
+        indices = _generate_hbm_indices(hbm_tensor)
+        buffer_tensor = self.arg_to_tensor["dest"]
+        assert isinstance(buffer_tensor, BufferTensor)
+        return f"nl.store({hbm_tensor}[{indices}], value={buffer_tensor})"
 
     def __repr__(self) -> str:
-        return f"Store(dst={self.dest}, value={self.value})"
+        return f"Store(dest={self._format_tensor('dest')}, value={self._format_tensor('value')})"
 
 
-class Allocate(MemoryOp):
+class Allocate(Operator):
     """Allocate a tensor in on-chip memory.
 
     Creates nl.ndarray with specified shape, and buffer location.
     """
 
-    def __init__(self, tensor: BufferTensor) -> None:
-        self.tensor = tensor
+    def __init__(self, tensor: str, buffer: str) -> None:
+        super().__init__(
+            read_args=(), write_args=("tensor",), arg_to_var={"tensor": tensor}, axis_semantics={"tensor": ("P", "F")}
+        )
+        self.buffer = buffer
+        assert buffer in ["SBUF", "PSUM"], f"Illegal buffer type {buffer}"
 
     def codegen(self) -> str:
         """Generate nl.ndarray allocation."""
-        buffer_map = {"SBUF": "nl.sbuf", "PSUM": "nl.psum"}
-        buffer = buffer_map.get(self.tensor.buffer, "nl.sbuf")
-        return f"{self.tensor.name} = nl.ndarray({self.tensor.shape}, dtype=nl.float32, buffer={buffer})"
+        tensor = self.arg_to_tensor["tensor"]
+        assert isinstance(tensor, BufferTensor)
+        return f"{tensor.name} = nl.ndarray({tensor.shape}, dtype=nl.float32, buffer={self.buffer})"
 
     def __repr__(self) -> str:
-        return f"{self.tensor.name} = Allocate(shape={self.tensor.shape}, buffer={self.tensor.buffer})"
+        return f"{self._format_tensor('tensor')} = Allocate(buffer={self.buffer})"
 
 
 def _generate_hbm_indices(tensor: HBMTensor) -> str:
