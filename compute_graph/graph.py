@@ -29,7 +29,6 @@ class SubGraph:
         logger.debug(f"\nSubgraph {index}")
         logger.debug(input_tensors)
         logger.debug(output_tensors)
-        logger.debug(sbuf)
 
         self.nodes: list[Operator] = []
         self.edges: list[tuple[int, int]] = []
@@ -43,6 +42,7 @@ class ComputeGraph:
         Args:
             operators: List of compute operators in the graph
         """
+        tile_size = 128
         self.hbm = HBM()
         for tensor_name in input_shapes:
             tensor_shape = input_shapes[tensor_name]
@@ -52,34 +52,35 @@ class ComputeGraph:
         self.sbuf = Buffer("SBUF")
         self.operators, self.edges = self._trace(operators, output)
         logger.debug(self.hbm)
-        logger.debug(f"Edges: {self.edges}")
+        logger.debug(self.sbuf)
 
         parallel_axes = get_parallel_axes(self.hbm.input_tensors, self.hbm.output_tensors)
         logger.debug(f"parallel_axes = {parallel_axes}")
-        num_shards = get_num_shards(self.hbm.input_tensors, parallel_axes)
+        num_shards = get_num_shards(self.hbm.input_tensors, parallel_axes, tile_size)
+        shard_sbuf_tensors(self.sbuf, parallel_axes, num_shards, tile_size)
+        logger.debug(self.sbuf)
         self.subgraphs: list[SubGraph] = []
         for graph_idx in range(num_shards):
             subgraph = SubGraph(graph_idx, operators, parallel_axes, self.hbm, self.sbuf)
             self.subgraphs.append(subgraph)
 
     def _trace(self, operators: list[Operator], output: str) -> tuple[list[Operator], list[tuple[int, int]]]:
-        ctx = _TraceContext(self.hbm)
+        ctx = _TraceContext(self.hbm, self.sbuf)
         for operator in operators:
             logger.debug("-" * 10 + f"{operator}" + "-" * 10)
             ctx.resolve_read_args(operator)
             ctx.resolve_write_args(operator)
             ctx.add_operator_with_edges(operator)
             ctx.maybe_add_store(operator, output)
-        logger.debug(ctx.sbuf)
         return ctx.all_operators, ctx.edges
 
 
 class _TraceContext:
     """Context for tracing operators and building the dependency graph."""
 
-    def __init__(self, hbm: HBM) -> None:
+    def __init__(self, hbm: HBM, sbuf: Buffer) -> None:
         self.hbm = hbm
-        self.sbuf = Buffer("SBUF")
+        self.sbuf = sbuf
         self.tensor_producer: dict[str, int] = {}
         self.all_operators: list[Operator] = []
         self.edges: list[tuple[int, int]] = []
@@ -194,3 +195,32 @@ def insert_tile_transpose(compute_ops: list[Operator]) -> list[Operator]:
             compute_op.arg_to_var["lhs"] = lhs_tileT
         full_compute_ops.append(compute_op)
     return full_compute_ops
+
+
+def shard_sbuf_tensors(sbuf: Buffer, parallel_axes: list[str], num_shards: int, tile_size: int = 128) -> None:
+    """Shard all buffer tensors in sbuf, creating {name}_0, {name}_1, ... for each tensor.
+
+    Replaces original tensors with sharded versions in the buffer.
+    For each original tensor 'xxx', creates 'xxx_0', 'xxx_1', ... 'xxx_{num_shards-1}'.
+
+    Args:
+        sbuf: Buffer containing tensors to shard
+        parallel_axes: List of axis names to shard (reduced to tile_size)
+        num_shards: Number of shards to create for each tensor
+        tile_size: Size of each sharded axis (default 128)
+    """
+    original_tensors = dict(sbuf.tensors)
+    sbuf.tensors.clear()
+
+    for tensor_name, tensor in original_tensors.items():
+        for shard_idx in range(num_shards):
+            sharded_axes = []
+            for axis in tensor.axes:
+                if axis.name in parallel_axes:
+                    sharded_axes.append(BufferAxis(name=axis.name, size=tile_size))
+                else:
+                    sharded_axes.append(axis)
+
+            sharded_name = f"{tensor_name}_{shard_idx}"
+            sharded_tensor = BufferTensor(name=sharded_name, axes=tuple(sharded_axes), buffer=tensor.buffer)
+            sbuf.add_tensor(sharded_tensor)
