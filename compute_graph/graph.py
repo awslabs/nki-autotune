@@ -63,80 +63,114 @@ class ComputeGraph:
             self.subgraphs.append(subgraph)
 
     def _trace(self, operators: list[Operator], output: str) -> tuple[list[Operator], list[tuple[int, int]]]:
-        sbuf = Buffer("SBUF")
-        tensor_producer: dict[str, int] = {}
-        all_operators: list[Operator] = []
-        edges: list[tuple[int, int]] = []
+        ctx = _TraceContext(self.hbm)
         for operator in operators:
             logger.debug("-" * 10 + f"{operator}" + "-" * 10)
-            for read_arg in operator.read_args:
-                read_var = operator.arg_to_var[read_arg]
-                logger.debug(f"Resolve read_arg {read_arg}={read_var}")
-                potential_hbm_name = f"{read_var}_hbm"
-                if read_var in sbuf.tensors:
-                    read_tensor = sbuf.tensors[read_var]
-                elif potential_hbm_name in self.hbm.input_tensors:
-                    input_hbm_tensor = self.hbm.input_tensors[potential_hbm_name]
+            ctx.resolve_read_args(operator)
+            ctx.resolve_write_args(operator)
+            ctx.add_operator_with_edges(operator)
+            ctx.maybe_add_store(operator, output)
+        logger.debug(ctx.sbuf)
+        return ctx.all_operators, ctx.edges
 
-                    buffer_axes = tuple(BufferAxis(name=ax.name, size=ax.size) for ax in input_hbm_tensor.axes)
-                    read_tensor = BufferTensor(name=read_var, axes=buffer_axes, buffer="SBUF")
-                    sbuf.add_tensor(read_tensor)
-                    allocate_op = Allocate(tensor=read_var, buffer="SBUF")
-                    allocate_op.specialize("tensor", read_tensor)
-                    alloc_idx = append_operator(all_operators, allocate_op)
 
-                    load_op = Load(dest=read_var, src=input_hbm_tensor.name)
-                    load_op.specialize("src", input_hbm_tensor)
-                    load_op.specialize("dest", read_tensor)
-                    load_idx = append_operator(all_operators, load_op)
+class _TraceContext:
+    """Context for tracing operators and building the dependency graph."""
 
-                    edges.append((alloc_idx, load_idx))
-                    tensor_producer[read_var] = load_idx
-                else:
-                    raise ValueError(f"{operator} read arg {read_arg}={read_var} does not exist")
-                operator.specialize(read_arg, read_tensor)
-                logger.debug(f"{operator}\n")
+    def __init__(self, hbm: HBM) -> None:
+        self.hbm = hbm
+        self.sbuf = Buffer("SBUF")
+        self.tensor_producer: dict[str, int] = {}
+        self.all_operators: list[Operator] = []
+        self.edges: list[tuple[int, int]] = []
 
-            for write_arg in operator.write_args:
-                write_var = operator.arg_to_var[write_arg]
-                logger.debug(f"Resolve write_arg {write_arg}={write_var}")
-                if write_var in sbuf.tensors:
-                    write_tensor = sbuf.tensors[write_var]
-                else:
-                    allocate_op = Allocate(tensor=write_var, buffer="SBUF")
-                    buffer_axes = operator.get_tensor_axes(write_arg)
-                    write_tensor = BufferTensor(name=write_var, axes=buffer_axes, buffer="SBUF")
-                    sbuf.add_tensor(write_tensor)
-                    allocate_op.specialize("tensor", write_tensor)
-                    alloc_idx = append_operator(all_operators, allocate_op)
-                    tensor_producer[write_var] = alloc_idx
-                operator.specialize(write_arg, write_tensor)
-                logger.debug(f"{operator}\n")
+    def resolve_read_args(self, operator: Operator) -> None:
+        """Resolve read arguments by looking up existing tensors or creating allocate+load from HBM."""
+        for read_arg in operator.read_args:
+            read_var = operator.arg_to_var[read_arg]
+            logger.debug(f"Resolve read_arg {read_arg}={read_var}")
+            if read_var in self.sbuf.tensors:
+                read_tensor = self.sbuf.tensors[read_var]
+            else:
+                read_tensor = self._load_from_hbm(operator, read_arg, read_var)
+            operator.specialize(read_arg, read_tensor)
+            logger.debug(f"{operator}\n")
 
-            op_idx = append_operator(all_operators, operator)
-            for read_arg in operator.read_args:
-                read_var = operator.arg_to_var[read_arg]
-                edges.append((tensor_producer[read_var], op_idx))
-            for write_arg in operator.write_args:
-                write_var = operator.arg_to_var[write_arg]
-                edges.append((tensor_producer[write_var], op_idx))
-                tensor_producer[write_var] = op_idx
-            for write_arg in operator.write_args:
-                write_var = operator.arg_to_var[write_arg]
-                write_tensor = operator.arg_to_tensor[write_arg]
-                if write_var == output:
-                    store_op = Store(dest=f"{output}_hbm", value=write_var)
-                    store_op.specialize("value", write_tensor)
-                    hbm_tensor = create_hbm_tensor(
-                        f"{output}_hbm", write_tensor.shape, axis_names=[axis.name for axis in write_tensor.axes]
-                    )
-                    self.hbm.add_output(hbm_tensor)
-                    store_op.specialize("dest", hbm_tensor)
-                    store_idx = append_operator(all_operators, store_op)
-                    edges.append((tensor_producer[write_var], store_idx))
+    def _load_from_hbm(self, operator: Operator, read_arg: str, read_var: str) -> BufferTensor:
+        """Create allocate+load operations to load tensor from HBM input."""
+        potential_hbm_name = f"{read_var}_hbm"
+        if potential_hbm_name not in self.hbm.input_tensors:
+            raise ValueError(f"{operator} read arg {read_arg}={read_var} does not exist")
 
-        logger.debug(sbuf)
-        return all_operators, edges
+        input_hbm_tensor = self.hbm.input_tensors[potential_hbm_name]
+        buffer_axes = tuple(BufferAxis(name=ax.name, size=ax.size) for ax in input_hbm_tensor.axes)
+        read_tensor = BufferTensor(name=read_var, axes=buffer_axes, buffer="SBUF")
+        self.sbuf.add_tensor(read_tensor)
+
+        allocate_op = Allocate(tensor=read_var, buffer="SBUF")
+        allocate_op.specialize("tensor", read_tensor)
+        alloc_idx = append_operator(self.all_operators, allocate_op)
+
+        load_op = Load(dest=read_var, src=input_hbm_tensor.name)
+        load_op.specialize("src", input_hbm_tensor)
+        load_op.specialize("dest", read_tensor)
+        load_idx = append_operator(self.all_operators, load_op)
+
+        self.edges.append((alloc_idx, load_idx))
+        self.tensor_producer[read_var] = load_idx
+        return read_tensor
+
+    def resolve_write_args(self, operator: Operator) -> None:
+        """Resolve write arguments by looking up existing tensors or creating allocate."""
+        for write_arg in operator.write_args:
+            write_var = operator.arg_to_var[write_arg]
+            logger.debug(f"Resolve write_arg {write_arg}={write_var}")
+            if write_var in self.sbuf.tensors:
+                write_tensor = self.sbuf.tensors[write_var]
+            else:
+                write_tensor = self._allocate_tensor(operator, write_arg, write_var)
+            operator.specialize(write_arg, write_tensor)
+            logger.debug(f"{operator}\n")
+
+    def _allocate_tensor(self, operator: Operator, write_arg: str, write_var: str) -> BufferTensor:
+        """Create allocate operation for a new tensor."""
+        allocate_op = Allocate(tensor=write_var, buffer="SBUF")
+        buffer_axes = operator.get_tensor_axes(write_arg)
+        assert all(isinstance(ax, BufferAxis) for ax in buffer_axes)
+        write_tensor = BufferTensor(name=write_var, axes=buffer_axes, buffer="SBUF")  # type: ignore[arg-type]
+        self.sbuf.add_tensor(write_tensor)
+        allocate_op.specialize("tensor", write_tensor)
+        alloc_idx = append_operator(self.all_operators, allocate_op)
+        self.tensor_producer[write_var] = alloc_idx
+        return write_tensor
+
+    def add_operator_with_edges(self, operator: Operator) -> None:
+        """Add operator to graph and create edges from tensor producers."""
+        op_idx = append_operator(self.all_operators, operator)
+        for read_arg in operator.read_args:
+            read_var = operator.arg_to_var[read_arg]
+            self.edges.append((self.tensor_producer[read_var], op_idx))
+        for write_arg in operator.write_args:
+            write_var = operator.arg_to_var[write_arg]
+            self.edges.append((self.tensor_producer[write_var], op_idx))
+            self.tensor_producer[write_var] = op_idx
+
+    def maybe_add_store(self, operator: Operator, output: str) -> None:
+        """Add store operation if operator writes to the output tensor."""
+        for write_arg in operator.write_args:
+            write_var = operator.arg_to_var[write_arg]
+            if write_var != output:
+                continue
+            write_tensor = operator.arg_to_tensor[write_arg]
+            store_op = Store(dest=f"{output}_hbm", value=write_var)
+            store_op.specialize("value", write_tensor)
+            hbm_tensor = create_hbm_tensor(
+                f"{output}_hbm", write_tensor.shape, axis_names=[axis.name for axis in write_tensor.axes]
+            )
+            self.hbm.add_output(hbm_tensor)
+            store_op.specialize("dest", hbm_tensor)
+            store_idx = append_operator(self.all_operators, store_op)
+            self.edges.append((self.tensor_producer[write_var], store_idx))
 
 
 def append_operator(operators: list[Operator], operator: Operator) -> int:

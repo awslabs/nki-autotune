@@ -40,7 +40,7 @@ def setup_logging(log_file: str, level: int = logging.DEBUG, msg_width: int = 30
 
 NODE_TYPE_COLORS: dict[str, str] = {"load": "#FFEAA7", "compute": "#A8D8EA", "store": "#A8E6CF", "allocate": "#E8E8E8"}
 
-CLUSTER_COLORS: dict[str, str] = {"hbm": "#FF6B6B", "operators": "#666666", "subgraph": "#888888"}
+CLUSTER_COLORS: dict[str, str] = {"hbm": "#FF6B6B", "operators": "#666666"}
 
 DEFAULT_NODE_COLOR = "#E8E8E8"
 HBM_INPUT_COLOR = "#FFB6C1"
@@ -113,40 +113,6 @@ def _wrap_label(label: str, max_width: int = 50) -> str:
             wrapped_args = ",\n  ".join(args)
             result = f"{op_name}\n  {wrapped_args})"
     return result
-
-
-def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
-    """
-    Args:
-        compute_graph: ComputeGraph to convert
-        title: Title for the graph visualization
-
-    Returns:
-        DOT format string for Graphviz rendering
-    """
-    lines = _dot_header(title)
-
-    # Add HBM tensors
-    if hasattr(compute_graph, "hbm"):
-        lines.extend(_hbm_to_dot(compute_graph.hbm))
-
-    # Add subgraphs using modular operators_to_dot
-    for subgraph in compute_graph.subgraphs:
-        sg_idx = subgraph.index
-        lines.append(f"    subgraph cluster_{sg_idx} {{")
-        lines.append(f'        label="Subgraph {sg_idx}";')
-        lines.append('        style="rounded";')
-        lines.append(f'        color="{CLUSTER_COLORS["subgraph"]}";')
-        lines.append("        ")
-
-        lines.extend(operators_to_dot(subgraph.nodes, subgraph.edges, node_prefix=f"node_{sg_idx}", indent="        "))
-
-        lines.append("    }")
-        lines.append("    ")
-
-    lines.append("}")
-
-    return "\n".join(lines)
 
 
 def _get_node_type(node_data: Operator) -> str:
@@ -402,25 +368,3 @@ def save_graph(graph: ComputeGraph, output_dir: str, title: str, keep_dot: bool 
         subgraph_title = f"{title} - Subgraph {subgraph.index}"
         subgraph_dot = single_graph_to_dot(subgraph.nodes, subgraph.edges, subgraph_title)
         _save_dot_to_file(subgraph_dot, os.path.join(output_dir, f"subgraph_{subgraph.index}.png"), keep_dot)
-
-
-def save_operators_graph(
-    operators: list[Operator],
-    edges: list[tuple[int, int]],
-    output_file: str,
-    title: str,
-    hbm: HBM | None = None,
-    keep_dot: bool = False,
-) -> None:
-    """Save a visualization of operators and edges to a file.
-
-    Args:
-        operators: List of operators to visualize
-        edges: List of (source_idx, target_idx) edges
-        output_file: Output filename (.png or .dot)
-        title: Title for the graph visualization
-        hbm: Optional HBM object to show input/output tensors
-        keep_dot: Whether to keep the intermediate DOT file
-    """
-    dot_script = single_graph_to_dot(operators, edges, title, hbm)
-    _save_dot_to_file(dot_script, output_file, keep_dot)
