@@ -63,7 +63,7 @@ class TensorScalar(Operator):
         args = [f"data={self._format_tensor('data')}"]
         args.append(f"op0={self.op0}")
 
-        if isinstance(self.arg_to_var, str):
+        if isinstance(self.operand0, str):
             args.append(f"operand0={self._format_tensor('operand0')}")
         else:
             args.append(f"operand0={self.operand0}")
