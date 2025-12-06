@@ -4,6 +4,7 @@ import subprocess
 
 from compute_graph.graph import ComputeGraph
 from compute_graph.hbm_tensor import HBMTensor
+from compute_graph.memory import HBM
 from compute_graph.memory_ops import Allocate, Load, Store
 from compute_graph.operators import Operator
 
@@ -39,10 +40,11 @@ def setup_logging(log_file: str, level: int = logging.DEBUG, msg_width: int = 30
 
 NODE_TYPE_COLORS: dict[str, str] = {"load": "#FFEAA7", "compute": "#A8D8EA", "store": "#A8E6CF", "allocate": "#E8E8E8"}
 
-CLUSTER_COLORS: dict[str, str] = {"hbm_input": "#FF6B6B", "hbm_output": "#4ECDC4", "subgraph": "#888888"}
+CLUSTER_COLORS: dict[str, str] = {"hbm": "#FF6B6B", "operators": "#666666", "subgraph": "#888888"}
 
 DEFAULT_NODE_COLOR = "#E8E8E8"
-HBM_TENSOR_COLOR = "#FFB6C1"
+HBM_INPUT_COLOR = "#FFB6C1"
+HBM_OUTPUT_COLOR = "#98FB98"
 
 
 def _escape_dot_string(s: str) -> str:
@@ -56,6 +58,63 @@ def _escape_dot_string(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
+def _split_top_level_args(args_str: str) -> list[str]:
+    """Split arguments string at top-level commas only (respecting bracket nesting)."""
+    args = []
+    current = []
+    depth = 0
+    for char in args_str:
+        if char in "([{":
+            depth += 1
+            current.append(char)
+        elif char in ")]}":
+            depth -= 1
+            current.append(char)
+        elif char == "," and depth == 0:
+            args.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if current:
+        args.append("".join(current).strip())
+    return args
+
+
+def _wrap_label(label: str, max_width: int = 50) -> str:
+    """Wrap long label strings into multiple lines for better readability.
+
+    Args:
+        label: The label string to wrap
+        max_width: Maximum characters per line
+
+    Returns:
+        Label with newlines inserted at logical break points
+    """
+    result = label
+    if " = " in label:
+        parts = label.split(" = ", 1)
+        dest_part = parts[0]
+        op_part = parts[1]
+        if len(op_part) > max_width:
+            paren_idx = op_part.find("(")
+            if paren_idx != -1:
+                op_name = op_part[: paren_idx + 1]
+                args_part = op_part[paren_idx + 1 : -1]
+                args = _split_top_level_args(args_part)
+                wrapped_args = ",\n  ".join(args)
+                op_part = f"{op_name}\n  {wrapped_args})"
+        result = f"{dest_part} =\n{op_part}"
+    elif len(label) > max_width:
+        paren_idx = label.find("(")
+        if paren_idx != -1:
+            op_name = label[: paren_idx + 1]
+            args_part = label[paren_idx + 1 : -1]
+            args = _split_top_level_args(args_part)
+            wrapped_args = ",\n  ".join(args)
+            result = f"{op_name}\n  {wrapped_args})"
+    return result
+
+
 def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     """
     Args:
@@ -65,71 +124,22 @@ def graph_to_dot(compute_graph: ComputeGraph, title: str) -> str:
     Returns:
         DOT format string for Graphviz rendering
     """
-    lines = []
+    lines = _dot_header(title)
 
-    lines.append("digraph ComputeGraph {")
-    lines.append("    rankdir=TB;")
-    lines.append('    bgcolor="white";')
-    lines.append("    pad=0.5;")
-    lines.append("    dpi=300;")
-    lines.append("    ")
-    lines.append('    node [fontname="Arial", fontsize=11, style="filled,rounded", shape=box];')
-    lines.append('    edge [fontname="Arial", fontsize=9];')
-    lines.append("    ")
+    # Add HBM tensors
+    if hasattr(compute_graph, "hbm"):
+        lines.extend(_hbm_to_dot(compute_graph.hbm))
 
-    lines.append(f'    label="{_escape_dot_string(title)}";')
-    lines.append('    labelloc="t";')
-    lines.append("    fontsize=14;")
-    lines.append('    fontname="Arial Bold";')
-    lines.append("    ")
-
-    if hasattr(compute_graph, "hbm") and compute_graph.hbm.input_tensors:
-        lines.append("    subgraph cluster_hbm_inputs {")
-        lines.append('        label="HBM Inputs";')
-        lines.append('        style="rounded";')
-        lines.append(f'        color="{CLUSTER_COLORS["hbm_input"]}";')
-        lines.append("        ")
-
-        for idx, hbm_tensor in enumerate(compute_graph.hbm.input_tensors.values()):
-            node_label, node_color = _format_hbm_tensor(hbm_tensor)
-            lines.append(f'        hbm_input_{idx} [label="{node_label}", fillcolor="{node_color}"];')
-
-        lines.append("    }")
-        lines.append("    ")
-
-    if hasattr(compute_graph, "hbm") and compute_graph.hbm.output_tensors:
-        lines.append("    subgraph cluster_hbm_outputs {")
-        lines.append('        label="HBM Outputs";')
-        lines.append('        style="rounded";')
-        lines.append(f'        color="{CLUSTER_COLORS["hbm_output"]}";')
-        lines.append("        ")
-
-        for idx, hbm_tensor in enumerate(compute_graph.hbm.output_tensors.values()):
-            node_label, node_color = _format_hbm_tensor(hbm_tensor)
-            lines.append(f'        hbm_output_{idx} [label="{node_label}", fillcolor="{node_color}"];')
-
-        lines.append("    }")
-        lines.append("    ")
-
+    # Add subgraphs using modular operators_to_dot
     for subgraph in compute_graph.subgraphs:
         sg_idx = subgraph.index
-        nodes = subgraph.nodes
-        edges = subgraph.edges
-
         lines.append(f"    subgraph cluster_{sg_idx} {{")
         lines.append(f'        label="Subgraph {sg_idx}";')
         lines.append('        style="rounded";')
         lines.append(f'        color="{CLUSTER_COLORS["subgraph"]}";')
         lines.append("        ")
 
-        for node_id, node_data in enumerate(nodes):
-            node_label, node_color = _format_node(node_data)
-            lines.append(f'        node_{sg_idx}_{node_id} [label="{node_label}", fillcolor="{node_color}"];')
-
-        lines.append("        ")
-
-        for source, target in edges:
-            lines.append(f"        node_{sg_idx}_{source} -> node_{sg_idx}_{target};")
+        lines.extend(operators_to_dot(subgraph.nodes, subgraph.edges, node_prefix=f"node_{sg_idx}", indent="        "))
 
         lines.append("    }")
         lines.append("    ")
@@ -165,33 +175,174 @@ def _format_node(node_data: Operator) -> tuple[str, str]:
     Returns:
         Tuple of (label, color) for the node
     """
-    label = _escape_dot_string(repr(node_data))
+    label = _escape_dot_string(_wrap_label(repr(node_data)))
     color = NODE_TYPE_COLORS.get(_get_node_type(node_data), DEFAULT_NODE_COLOR)
     return label, color
 
 
-def _format_hbm_tensor(hbm_tensor: HBMTensor) -> tuple[str, str]:
+def _format_hbm_tensor(hbm_tensor: HBMTensor, is_input: bool = True) -> tuple[str, str]:
     """
     Args:
         hbm_tensor: Tensor object
+        is_input: Whether this is an input tensor (affects color and label)
 
     Returns:
         Tuple of (label, color) for the HBM tensor node
     """
-    label = _escape_dot_string(repr(hbm_tensor))
-    return label, HBM_TENSOR_COLOR
+    suffix = " (Input)" if is_input else " (Output)"
+    label = _escape_dot_string(repr(hbm_tensor) + suffix)
+    color = HBM_INPUT_COLOR if is_input else HBM_OUTPUT_COLOR
+    return label, color
 
 
-def save_graph(graph: ComputeGraph, output_file: str, title: str, keep_dot: bool = False) -> None:
-    """
+def operators_to_dot(
+    operators: list[Operator], edges: list[tuple[int, int]], node_prefix: str = "node", indent: str = "    "
+) -> list[str]:
+    """Generate DOT lines for a set of operators and edges.
+
     Args:
-        graph: ComputeGraph to visualize
-        output_file: Output filename (.png or .dot)
+        operators: List of operators to visualize
+        edges: List of (source_idx, target_idx) edges
+        node_prefix: Prefix for node IDs (e.g., "node" -> "node_0", "node_1")
+        indent: Indentation string for DOT lines
+
+    Returns:
+        List of DOT format lines for nodes and edges
+    """
+    lines = []
+
+    # Generate nodes
+    for node_id, node_data in enumerate(operators):
+        node_label, node_color = _format_node(node_data)
+        lines.append(f'{indent}{node_prefix}_{node_id} [label="{node_label}", fillcolor="{node_color}"];')
+
+    lines.append(f"{indent}")
+
+    # Generate edges
+    for source, target in edges:
+        lines.append(f"{indent}{node_prefix}_{source} -> {node_prefix}_{target};")
+
+    return lines
+
+
+def _hbm_to_dot(hbm: HBM, indent: str = "    ") -> list[str]:
+    """Generate DOT lines for HBM input/output tensors in a single cluster.
+
+    Args:
+        hbm: HBM object containing input and output tensors
+        indent: Indentation string for DOT lines
+
+    Returns:
+        List of DOT format lines for unified HBM cluster
+    """
+    lines = []
+
+    if not hbm.input_tensors and not hbm.output_tensors:
+        return lines
+
+    lines.append(f"{indent}subgraph cluster_hbm {{")
+    lines.append(f'{indent}    label="HBM";')
+    lines.append(f'{indent}    style="rounded";')
+    lines.append(f'{indent}    color="{CLUSTER_COLORS["hbm"]}";')
+    lines.append(f"{indent}    ")
+
+    num_inputs = len(hbm.input_tensors)
+    for idx, hbm_tensor in enumerate(hbm.input_tensors.values()):
+        node_label, node_color = _format_hbm_tensor(hbm_tensor, is_input=True)
+        lines.append(f'{indent}    hbm_input_{idx} [label="{node_label}", fillcolor="{node_color}"];')
+
+    num_outputs = len(hbm.output_tensors)
+    for idx, hbm_tensor in enumerate(hbm.output_tensors.values()):
+        node_label, node_color = _format_hbm_tensor(hbm_tensor, is_input=False)
+        lines.append(f'{indent}    hbm_output_{idx} [label="{node_label}", fillcolor="{node_color}"];')
+
+    lines.append(f"{indent}    ")
+    for i in range(num_inputs - 1):
+        lines.append(f"{indent}    hbm_input_{i} -> hbm_input_{i + 1} [style=invis];")
+    if num_inputs > 0 and num_outputs > 0:
+        lines.append(f"{indent}    hbm_input_{num_inputs - 1} -> hbm_output_0 [style=invis];")
+    for i in range(num_outputs - 1):
+        lines.append(f"{indent}    hbm_output_{i} -> hbm_output_{i + 1} [style=invis];")
+
+    lines.append(f"{indent}}}")
+    lines.append(f"{indent}")
+
+    return lines
+
+
+def _dot_header(title: str) -> list[str]:
+    """Generate DOT header lines."""
+    lines = [
+        "digraph ComputeGraph {",
+        "    rankdir=TB;",
+        '    bgcolor="white";',
+        "    pad=0.5;",
+        "    dpi=300;",
+        "    ",
+        '    node [fontname="Arial", fontsize=11, style="filled,rounded", shape=box, color="#333333", penwidth=1.5];',
+        '    edge [fontname="Arial", fontsize=9];',
+        "    ",
+        f'    label="{_escape_dot_string(title)}";',
+        '    labelloc="t";',
+        "    fontsize=14;",
+        '    fontname="Arial Bold";',
+        "    ",
+    ]
+    return lines
+
+
+def single_graph_to_dot(
+    operators: list[Operator], edges: list[tuple[int, int]], title: str, hbm: HBM | None = None
+) -> str:
+    """Generate complete DOT for a single graph (operators + edges).
+
+    Args:
+        operators: List of operators to visualize
+        edges: List of (source_idx, target_idx) edges
         title: Title for the graph visualization
+        hbm: Optional HBM object to show input/output tensors
+
+    Returns:
+        DOT format string for Graphviz rendering
+    """
+    lines = _dot_header(title)
+
+    # Add HBM tensors if provided
+    if hbm is not None:
+        lines.extend(_hbm_to_dot(hbm))
+
+    # Add operators and edges in a cluster
+    if operators:
+        lines.append("    subgraph cluster_operators {")
+        lines.append('        label="Operators";')
+        lines.append('        style="rounded";')
+        lines.append('        color="#666666";')
+        lines.append("        ")
+        lines.extend(operators_to_dot(operators, edges, node_prefix="node", indent="        "))
+        lines.append("    }")
+        lines.append("    ")
+    else:
+        lines.extend(operators_to_dot(operators, edges, node_prefix="node", indent="    "))
+
+    if hbm is not None and operators and hbm.input_tensors:
+        lines.append("    ")
+        for idx, op in enumerate(operators):
+            if isinstance(op, Load):
+                lines.append(f"    hbm_input_0 -> node_{idx} [style=invis];")
+                break
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _save_dot_to_file(dot_script: str, output_file: str, keep_dot: bool = False) -> None:
+    """Save DOT script to file and render as PNG.
+
+    Args:
+        dot_script: DOT format string
+        output_file: Output filename (without extension, or .png/.dot)
         keep_dot: Whether to keep the intermediate DOT file
     """
-    dot_script = graph_to_dot(graph, title)
-
     if output_file.endswith(".png"):
         png_file = output_file
         dot_file = output_file.replace(".png", ".dot")
@@ -205,7 +356,7 @@ def save_graph(graph: ComputeGraph, output_file: str, title: str, keep_dot: bool
     try:
         with open(dot_file, "w") as f:
             f.write(dot_script)
-    except (OSError, IOError) as e:
+    except OSError as e:
         raise IOError(f"Failed to write DOT file {dot_file}: {e}") from e
 
     try:
@@ -225,3 +376,51 @@ def save_graph(graph: ComputeGraph, output_file: str, title: str, keep_dot: bool
         print("Graphviz 'dot' command not found. Please install Graphviz.")
         print(f"DOT script saved to: {dot_file}")
         print(f"Render manually: dot -Tpng -o {png_file} {dot_file}")
+
+
+def save_graph(graph: ComputeGraph, output_dir: str, title: str, keep_dot: bool = False) -> None:
+    """Save ComputeGraph visualization to output directory.
+
+    Saves:
+    - main_graph.png: The full graph with all operators and edges
+    - subgraph_{index}.png: Individual subgraph for each SubGraph
+
+    Args:
+        graph: ComputeGraph to visualize
+        output_dir: Output directory for PNG files
+        title: Title for the graph visualization
+        keep_dot: Whether to keep the intermediate DOT files
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save main graph (ComputeGraph.operators and .edges)
+    main_dot = single_graph_to_dot(graph.operators, graph.edges, title, graph.hbm)
+    _save_dot_to_file(main_dot, os.path.join(output_dir, "main_graph.png"), keep_dot)
+
+    # Save each subgraph
+    for subgraph in graph.subgraphs:
+        subgraph_title = f"{title} - Subgraph {subgraph.index}"
+        subgraph_dot = single_graph_to_dot(subgraph.nodes, subgraph.edges, subgraph_title)
+        _save_dot_to_file(subgraph_dot, os.path.join(output_dir, f"subgraph_{subgraph.index}.png"), keep_dot)
+
+
+def save_operators_graph(
+    operators: list[Operator],
+    edges: list[tuple[int, int]],
+    output_file: str,
+    title: str,
+    hbm: HBM | None = None,
+    keep_dot: bool = False,
+) -> None:
+    """Save a visualization of operators and edges to a file.
+
+    Args:
+        operators: List of operators to visualize
+        edges: List of (source_idx, target_idx) edges
+        output_file: Output filename (.png or .dot)
+        title: Title for the graph visualization
+        hbm: Optional HBM object to show input/output tensors
+        keep_dot: Whether to keep the intermediate DOT file
+    """
+    dot_script = single_graph_to_dot(operators, edges, title, hbm)
+    _save_dot_to_file(dot_script, output_file, keep_dot)

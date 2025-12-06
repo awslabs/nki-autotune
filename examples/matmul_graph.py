@@ -37,7 +37,7 @@ def test_graph_gen() -> None:
         input_shapes={"lhs": (M, K), "rhs": (K, N)},
         output="output",
     )
-    save_graph(rmsnorm_matmul_graph, output_file=f"{cache_root}/graph.png", title="RMSNorm + Matmul")
+    save_graph(rmsnorm_matmul_graph, output_dir=f"{cache_root}", title="RMSNorm + Matmul")
     codegen = NKICodegen(rmsnorm_matmul_graph)
     codegen.generate_kernel("rmsnorm_matmul_kernel", f"{cache_root}/rmsnorm_matmul_kernel.py")
 
