@@ -2,8 +2,8 @@ import logging
 
 from compute_graph.buffer_tensor import BufferAxis, BufferTensor
 from compute_graph.compute_ops import Matmul, TileTranspose
-from compute_graph.hbm_tensor import HBMTensor, create_hbm_tensor, shard_tensors
-from compute_graph.memory import HBM
+from compute_graph.hbm_tensor import HBMTensor, create_hbm_tensor, get_num_shards, get_parallel_axes, shard_tensors
+from compute_graph.memory import HBM, Buffer
 from compute_graph.memory_ops import Allocate, Load, Store
 from compute_graph.operators import Operator
 
@@ -112,18 +112,20 @@ class ComputeGraph:
             self.hbm.add_input(hbm_tensor)
         operators = insert_tile_transpose(operators)
         operators = self._trace(operators, output)
+        for operator in operators:
+            assert operator.is_specialized
+            logger.debug(operator)
+        logger.debug(self.hbm)
 
-        # self.sbuf = Buffer("SBUF")
-
-        # parallel_axes = get_parallel_axes(self.hbm.input_tensors, self.hbm.output_tensors)
-        # logger.debug(f"parallel_axes = {parallel_axes}")
-        # num_shards = get_num_shards(self.hbm.input_tensors, parallel_axes)
-
-        # self.subgraphs: list[SubGraph] = []
+        parallel_axes = get_parallel_axes(self.hbm.input_tensors, self.hbm.output_tensors)
+        logger.debug(f"parallel_axes = {parallel_axes}")
+        num_shards = get_num_shards(self.hbm.input_tensors, parallel_axes)
+        self.sbuf = Buffer("SBUF")
+        self.subgraphs: list[SubGraph] = []
         # for graph_idx in range(num_shards):
         #     for op in operators:
         #         op.clear_specialization()
-        #     subgraph = SubGraph(graph_idx, operators, self.hbm, parallel_axes)
+        # subgraph = SubGraph(graph_idx, operators, self.hbm, parallel_axes)
         #     self.subgraphs.append(subgraph)
         #     logger.debug(subgraph.tensor_producer)
 
@@ -152,9 +154,7 @@ class ComputeGraph:
                     load_op.specialize("dest", read_tensor)
                     append_operator(all_operators, load_op)
                 else:
-                    allocate_op = Allocate(tensor=read_var, buffer="nl.sbuf")
-                    # allocate_op.specialize("tensor", )
-                    append_operator(all_operators, allocate_op)
+                    raise ValueError(f"{operator} read arg {read_arg}={read_var} does not exist")
                 operator.specialize(read_arg, read_tensor)
                 var_to_tensor[read_var] = read_tensor
                 logger.debug(f"{operator}\n")
@@ -175,9 +175,17 @@ class ComputeGraph:
                 logger.debug(f"{operator}\n")
             assert operator.is_specialized
             append_operator(all_operators, operator)
-            for write_var in operator.write_vars:
+            for write_arg in operator.write_args:
+                write_var = operator.arg_to_var[write_arg]
+                write_tensor = operator.arg_to_tensor[write_arg]
                 if write_var == output:
                     store_op = Store(dest=f"{output}_hbm", value=write_var)
+                    store_op.specialize("value", write_tensor)
+                    hbm_tensor = create_hbm_tensor(
+                        f"{output}_hbm", write_tensor.shape, axis_names=[axis.name for axis in write_tensor.axes]
+                    )
+                    self.hbm.add_output(hbm_tensor)
+                    store_op.specialize(write_arg, hbm_tensor)
                     append_operator(all_operators, store_op)
         return all_operators
 
