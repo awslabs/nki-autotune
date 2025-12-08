@@ -1,8 +1,9 @@
+import copy
 import logging
 
 from compute_graph.buffer_tensor import BufferAxis, BufferTensor
 from compute_graph.compute_ops import Matmul, TileTranspose
-from compute_graph.hbm_tensor import create_hbm_tensor, get_num_shards, get_parallel_axes, shard_tensors
+from compute_graph.hbm_tensor import HBMTensor, create_hbm_tensor, get_num_shards, get_parallel_axes, shard_tensors
 from compute_graph.memory import HBM, Buffer
 from compute_graph.memory_ops import Allocate, Load, Store
 from compute_graph.operators import Operator
@@ -11,27 +12,54 @@ logger = logging.getLogger(__name__)
 
 
 class SubGraph:
-    def __init__(self, index: int, operators: list[Operator], parallel_axes: list[str], hbm: HBM, sbuf: Buffer) -> None:
-        """
-        Build a subgraph for a single parallel tile.
+    """Subgraph for a single parallel tile.
 
-        Transforms compute ops into a dependency graph with memory operations:
-        - Loads input HBM tensors into SBUF buffers
-        - Allocates SBUF buffers for intermediate results
-        - Stores final results back to HBM
+    Copies operators from traced graph and re-specializes with sharded tensors.
+    Graph structure (nodes, edges) is identical across subgraphs; only tensor shapes differ.
+    """
 
-        Populates self.nodes with allocate, load, store and TileTranspose operators
-        Populates self.edges with (producer_idx, consumer_idx) tuples representing data dependencies.
-        """
+    def __init__(
+        self,
+        index: int,
+        operators: list[Operator],
+        edges: list[tuple[int, int]],
+        parallel_axes: list[str],
+        hbm: HBM,
+        sbuf: Buffer,
+    ) -> None:
         self.index = index
-        input_tensors = shard_tensors(hbm.input_tensors, parallel_axes, index)
-        output_tensors = shard_tensors(hbm.output_tensors, parallel_axes, index)
-        logger.debug(f"\nSubgraph {index}")
-        logger.debug(input_tensors)
-        logger.debug(output_tensors)
+        self.input_tensors = shard_tensors(hbm.input_tensors, parallel_axes, index)
+        self.output_tensors = shard_tensors(hbm.output_tensors, parallel_axes, index)
 
-        self.nodes: list[Operator] = []
-        self.edges: list[tuple[int, int]] = []
+        self.nodes = [copy.deepcopy(op) for op in operators]
+        for op in self.nodes:
+            op.clear_specialization()
+            self._specialize_operator(op, sbuf)
+
+        self.edges = edges.copy()
+
+    def _specialize_operator(self, op: Operator, sbuf: Buffer) -> None:
+        """Re-specialize operator with sharded HBM and SBUF tensors."""
+        for arg in op.read_args + op.write_args:
+            var = op.arg_to_var[arg]
+            tensor = self._lookup_tensor(var, sbuf)
+            op.specialize(arg, tensor)
+
+    def _lookup_tensor(self, var: str, sbuf: Buffer) -> HBMTensor | BufferTensor:
+        """Find tensor by variable name in sharded HBM or SBUF."""
+        result: HBMTensor | BufferTensor | None = None
+
+        if var.endswith("_hbm"):
+            result = self.input_tensors.get(var) or self.output_tensors.get(var)
+
+        if result is None:
+            sbuf_name = f"{var}_{self.index}"
+            result = sbuf.tensors.get(sbuf_name)
+
+        if result is None:
+            raise ValueError(f"Tensor {var} not found (tried SBUF: {var}_{self.index}, HBM: {var})")
+
+        return result
 
 
 class ComputeGraph:
@@ -61,7 +89,7 @@ class ComputeGraph:
         logger.debug(self.sbuf)
         self.subgraphs: list[SubGraph] = []
         for graph_idx in range(num_shards):
-            subgraph = SubGraph(graph_idx, operators, parallel_axes, self.hbm, self.sbuf)
+            subgraph = SubGraph(graph_idx, self.operators, self.edges, parallel_axes, self.hbm, self.sbuf)
             self.subgraphs.append(subgraph)
 
     def _trace(self, operators: list[Operator], output: str) -> tuple[list[Operator], list[tuple[int, int]]]:
