@@ -45,19 +45,26 @@ class TensorScalar(Operator):
 
     def codegen(self) -> str:
         """Generate NKI code for tensor_scalar operation."""
-        dest = self.arg_to_var["dest"]
-        data = self.arg_to_var["data"]
-        operand0 = self.arg_to_var["operand0"]
+        dest = self.arg_to_tensor["dest"].name
+        data = self.arg_to_tensor["data"].name
+
+        if isinstance(self.operand0, str):
+            operand0 = self.arg_to_tensor["operand0"].name
+        else:
+            operand0 = self.operand0
 
         args = [f"data={data}", f"op0={self.op0}", f"operand0={operand0}"]
 
         if self.op1 is not None:
-            operand1 = self.arg_to_var["operand1"]
+            if isinstance(self.operand1, str):
+                operand1 = self.arg_to_tensor["operand1"].name
+            else:
+                operand1 = self.operand1
             args.append(f"op1={self.op1}")
             args.append(f"operand1={operand1}")
 
         args_str = ", ".join(args)
-        return f"nisa.tensor_scalar({dest}, {args_str})"
+        return f"{dest} = nisa.tensor_scalar({args_str})"
 
     def __repr__(self) -> str:
         args = [f"data={self._format_tensor('data')}"]
@@ -105,18 +112,18 @@ class Activation(Operator):
 
     def codegen(self) -> str:
         """Generate NKI code for activation operation."""
-        dest = self.arg_to_var["dest"]
-        data = self.arg_to_var["data"]
+        dest = self.arg_to_tensor["dest"].name
+        data = self.arg_to_tensor["data"].name
 
         args = [f"op={self.op}", f"data={data}"]
 
-        if self.reduce_op is not None and "reduce_res" in self.arg_to_var:
-            reduce_res = self.arg_to_var["reduce_res"]
+        if self.reduce_op is not None and "reduce_res" in self.arg_to_tensor:
+            reduce_res = self.arg_to_tensor["reduce_res"].name
             args.append(f"reduce_op={self.reduce_op}")
             args.append(f"reduce_res={reduce_res}")
 
         args_str = ", ".join(args)
-        return f"nisa.activation({dest}, {args_str})"
+        return f"{dest} = nisa.activation({args_str})"
 
     def __repr__(self) -> str:
         data_str = self._format_tensor("data")
@@ -148,9 +155,9 @@ class Transpose(Operator):
 
     def codegen(self) -> str:
         """Generate NKI code for nc_transpose operation."""
-        dest = self.arg_to_var["dest"]
-        data = self.arg_to_var["data"]
-        return f"nisa.nc_transpose({dest}, {data})"
+        dest = self.arg_to_tensor["dest"].name
+        data = self.arg_to_tensor["data"].name
+        return f"{dest} = nisa.nc_transpose({data})"
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = nisa.nc_transpose(data={self._format_tensor('data')})"
@@ -175,9 +182,9 @@ class TileTranspose(Operator):
 
     def codegen(self) -> str:
         """Generate NKI code for in-tile transpose using nc_transpose."""
-        dest = self.arg_to_var["dest"]
-        data = self.arg_to_var["data"]
-        return f"nisa.nc_transpose({dest}, {data})"
+        dest = self.arg_to_tensor["dest"].name
+        data = self.arg_to_tensor["data"].name
+        return f"{dest} = nisa.nc_transpose({data})"
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = TileTranspose(data={self._format_tensor('data')})"
@@ -215,9 +222,9 @@ class Matmul(Operator):
         - stationary = lhs (will be transposed internally)
         - moving = rhs
         """
-        dest = self.arg_to_var["dest"]
-        lhs = self.arg_to_var["lhs"]
-        rhs = self.arg_to_var["rhs"]
+        dest = self.arg_to_tensor["dest"].name
+        lhs = self.arg_to_tensor["lhs"].name
+        rhs = self.arg_to_tensor["rhs"].name
         return f"{dest} = nisa.nc_matmul({lhs}, {rhs})"
 
     def __repr__(self) -> str:

@@ -21,7 +21,7 @@ class Load(Operator):
         indices = _generate_hbm_indices(hbm_tensor)
         buffer_tensor = self.arg_to_tensor["dest"]
         assert isinstance(buffer_tensor, BufferTensor)
-        return f"{buffer_tensor} = nl.load({hbm_tensor}[{indices}])"
+        return f"{buffer_tensor.name} = nl.load({hbm_tensor.name}[{indices}])"
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = Load(src={self._format_tensor('src')})"
@@ -39,13 +39,13 @@ class Store(Operator):
         )
 
     def codegen(self) -> str:
-        """Generate nl.load from HBM to SBUF."""
-        hbm_tensor = self.arg_to_tensor["src"]
+        """Generate nl.store from SBUF to HBM."""
+        hbm_tensor = self.arg_to_tensor["dest"]
         assert isinstance(hbm_tensor, HBMTensor)
         indices = _generate_hbm_indices(hbm_tensor)
-        buffer_tensor = self.arg_to_tensor["dest"]
+        buffer_tensor = self.arg_to_tensor["value"]
         assert isinstance(buffer_tensor, BufferTensor)
-        return f"nl.store({hbm_tensor}[{indices}], value={buffer_tensor})"
+        return f"nl.store({hbm_tensor.name}[{indices}], value={buffer_tensor.name})"
 
     def __repr__(self) -> str:
         return f"Store(dest={self._format_tensor('dest')}, value={self._format_tensor('value')})"
@@ -68,7 +68,8 @@ class Allocate(Operator):
         """Generate nl.ndarray allocation."""
         tensor = self.arg_to_tensor["tensor"]
         assert isinstance(tensor, BufferTensor)
-        return f"{tensor.name} = nl.ndarray({tensor.shape}, dtype=nl.float32, buffer={self.buffer})"
+        buffer_name = "nl.sbuf" if self.buffer == "SBUF" else "nl.psum"
+        return f"{tensor.name} = nl.ndarray({tensor.shape}, dtype=nl.float32, buffer={buffer_name})"
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('tensor')} = Allocate(buffer={self.buffer})"
