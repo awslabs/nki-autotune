@@ -1,0 +1,68 @@
+digraph MatmulComputeGraphInstructionCombining {
+    rankdir=TB;
+    bgcolor="white";
+    pad=0.5;
+    dpi=300;
+
+    // Graph styling
+    node [fontname="Arial", fontsize=11, style="filled,rounded", shape=box];
+    edge [fontname="Arial", fontsize=9];
+
+    // Title
+    label="Compute Graph: Instruction Combining\nCompute: scale → bias → activation on input tensor";
+    labelloc="t";
+    fontsize=14;
+    fontname="Arial Bold";
+
+    // Option 1: Separate Instructions
+    subgraph cluster_separate {
+        label="Option 1: Separate Instructions";
+        penwidth=2;
+        color="#FF6B6B";
+
+        alloc_input_sep [label="input_sbuf =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_temp1_sep [label="temp1 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_temp2_sep [label="temp2 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_result_sep [label="result =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+
+        load_sep [label="nl.load(input,\ndst=input_sbuf)", fillcolor="#FFEAA7"];
+
+        multiply_sep [label="nl.multiply(input_sbuf,\nscale, dst=temp1)", fillcolor="#A8D8EA"];
+        add_sep [label="nl.add(temp1, bias,\ndst=temp2)", fillcolor="#A8D8EA"];
+        exp_sep [label="nl.exp(temp2,\ndst=result)", fillcolor="#A8D8EA"];
+
+        store_sep [label="nl.store(result,\ndst=output)", fillcolor="#A8E6CF"];
+
+        alloc_input_sep -> load_sep [label="input_sbuf", color="#666666"];
+        alloc_temp1_sep -> multiply_sep [label="temp1", color="#666666"];
+        alloc_temp2_sep -> add_sep [label="temp2", color="#666666"];
+        alloc_result_sep -> exp_sep [label="result", color="#666666"];
+        load_sep -> multiply_sep [label="input_sbuf", color="#666666"];
+        multiply_sep -> add_sep [label="temp1", color="#666666"];
+        add_sep -> exp_sep [label="temp2", color="#666666"];
+        exp_sep -> store_sep [label="result", color="#666666"];
+    }
+
+    // Option 2: Combined Instruction
+    subgraph cluster_combined {
+        label="Option 2: Combined Instruction (fused)";
+        penwidth=2;
+        color="#4169E1";
+
+        alloc_input_comb [label="input_sbuf =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_result_comb [label="result =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+
+        load_comb [label="nl.load(input,\ndst=input_sbuf)", fillcolor="#FFEAA7"];
+
+        activation_comb [label="nl.activation(input_sbuf,\n           op=exp,\n           bias=bias,\n           scale=scale,\n           dst=result)\n[Fused: multiply+add+exp]",
+                        fillcolor="#A8D8EA", penwidth=3, style="filled,rounded,bold"];
+
+        store_comb [label="nl.store(result,\ndst=output)", fillcolor="#A8E6CF"];
+
+        alloc_input_comb -> load_comb [label="input_sbuf", color="#666666"];
+        alloc_result_comb -> activation_comb [label="result", color="#666666"];
+        load_comb -> activation_comb [label="input_sbuf", color="#666666"];
+        activation_comb -> store_comb [label="result", color="#666666"];
+    }
+
+}

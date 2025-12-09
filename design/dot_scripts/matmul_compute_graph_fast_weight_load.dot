@@ -1,0 +1,50 @@
+digraph MatmulComputeGraphFastWeightLoad {
+    rankdir=TB;
+    bgcolor="white";
+    pad=0.5;
+    dpi=300;
+
+    // Graph styling
+    node [fontname="Arial", fontsize=11, style="filled,rounded", shape=box];
+    edge [fontname="Arial", fontsize=9];
+
+    // Title
+    label="Compute Graph: Stationary/Moving Swap\nL[M,K] @ R[K,N] = Output[M,N]\nSubgraph 0 after swap (M=64 small → R becomes stationary for fast load)";
+    labelloc="t";
+    fontsize=14;
+    fontname="Arial Bold";
+
+    // Subgraph 0 after swap
+    subgraph cluster_0 {
+        label="Subgraph 0 (after swap)\n(M_tile=0, N_tile=0)";
+
+        alloc_L [label="L_sbuf_0 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_R [label="R_sbuf_0 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_L_T [label="L_T_0 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_temp [label="temp_0 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_out [label="out_sbuf_0 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+
+        load_L [label="nl.load(L[0, :],\ndst=L_sbuf_0)\n[64, 128]", fillcolor="#FFEAA7"];
+        load_R [label="nl.load(R[:, 0],\ndst=R_sbuf_0)\n[128, 512]", fillcolor="#FFEAA7"];
+
+        transpose_L [label="L_T_0 =\ntranspose(L_sbuf_0)\n[128, 64]\n(always needed)", fillcolor="#DDA0DD"];
+
+        compute [label="nc_matmul(R_sbuf_0, L_T_0,\nresult=temp_0)\n(R stationary: fast, 4×)\nResult: [512, 64]", fillcolor="#A8D8EA", penwidth=2];
+
+        transpose_out [label="out_sbuf_0 =\ntranspose(temp_0)\n[64, 512]\n(extra cost from swap)", fillcolor="#DDA0DD", penwidth=2];
+
+        store [label="nl.store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
+
+        alloc_L -> load_L [label="L_sbuf_0", color="#666666"];
+        alloc_R -> load_R [label="R_sbuf_0", color="#666666"];
+        alloc_L_T -> transpose_L [label="L_T_0", color="#666666"];
+        alloc_temp -> compute [label="temp_0", color="#666666"];
+        alloc_out -> transpose_out [label="out_sbuf_0", color="#666666"];
+        load_L -> transpose_L [label="L_sbuf_0", color="#666666"];
+        transpose_L -> compute [label="L_T_0", color="#666666"];
+        load_R -> compute [label="R_sbuf_0", color="#666666"];
+        compute -> transpose_out [label="temp_0", color="#666666"];
+        transpose_out -> store [label="out_sbuf_0", color="#666666"];
+    }
+
+}

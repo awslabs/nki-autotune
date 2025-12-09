@@ -1,0 +1,104 @@
+digraph MatmulComputeGraphOptimized {
+    rankdir=TB;
+    bgcolor="white";
+    pad=0.5;
+    dpi=300;
+
+    // Graph styling
+    node [fontname="Arial", fontsize=11, style="filled,rounded", shape=box];
+    edge [fontname="Arial", fontsize=9];
+
+    // Title
+    label="Compute Graph: Data Reuse\nL[M,K] @ R[K,N] = Output[M,N]\nEdge labels show tensor data flow";
+    labelloc="t";
+    fontsize=14;
+    fontname="Arial Bold";
+
+    // Merged subgraph 0+1: Outputs[0,0] and [0,1]
+    subgraph cluster_merged_01 {
+        label="Merged Subgraph 0+1: Output[0,:]";
+        penwidth=2;
+
+        // Allocate nodes (shared L_sbuf_0, separate R and out buffers)
+        alloc_L_shared [label="L_sbuf_0 =\nnl.ndarray(...)", fillcolor="#E8E8E8", penwidth=2];
+        alloc_R_00 [label="R_sbuf_0 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_out_00 [label="out_sbuf_0 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_R_01 [label="R_sbuf_1 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_out_01 [label="out_sbuf_1 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+
+        // Shared L load for this merged subgraph
+        load_L_shared [label="nl.load(L[0, :],\ndst=L_sbuf_0)", fillcolor="#FFEAA7", penwidth=2];
+
+        // Compute Output[0,0]
+        load_R_00 [label="nl.load(R[:, 0],\ndst=R_sbuf_0)", fillcolor="#FFEAA7"];
+        compute_00 [label="nl.matmul(L_sbuf_0,\nR_sbuf_0, out_sbuf_0)", fillcolor="#A8D8EA"];
+        store_00 [label="nl.store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
+
+        // Compute Output[0,1]
+        load_R_01 [label="nl.load(R[:, 1],\ndst=R_sbuf_1)", fillcolor="#FFEAA7"];
+        compute_01 [label="nl.matmul(L_sbuf_0,\nR_sbuf_1, out_sbuf_1)", fillcolor="#A8D8EA"];
+        store_01 [label="nl.store(out_sbuf_1,\ndst=Output[0,1])", fillcolor="#A8E6CF"];
+
+        // Allocate edges
+        alloc_L_shared -> load_L_shared [label="L_sbuf_0", color="#666666"];
+        alloc_R_00 -> load_R_00 [label="R_sbuf_0", color="#666666"];
+        alloc_out_00 -> compute_00 [label="out_sbuf_0", color="#666666"];
+        alloc_R_01 -> load_R_01 [label="R_sbuf_1", color="#666666"];
+        alloc_out_01 -> compute_01 [label="out_sbuf_1", color="#666666"];
+
+        // Data flow edges
+        load_L_shared -> compute_00 [label="L_sbuf_0", color="#666666", penwidth=2];
+        load_L_shared -> compute_01 [label="L_sbuf_0", color="#666666", penwidth=2];
+        load_R_00 -> compute_00 [label="R_sbuf_0", color="#666666"];
+        load_R_01 -> compute_01 [label="R_sbuf_1", color="#666666"];
+        compute_00 -> store_00 [label="out_sbuf_0", color="#666666"];
+        compute_01 -> store_01 [label="out_sbuf_1", color="#666666"];
+    }
+
+    // Subgraph 2: Output[1,0]
+    subgraph cluster_output_10 {
+        label="Subgraph 2: Output[1,0]";
+
+        alloc_L_10 [label="L_sbuf_2 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_R_10 [label="R_sbuf_2 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_out_10 [label="out_sbuf_2 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        load_L_10 [label="nl.load(L[1, :],\ndst=L_sbuf_2)", fillcolor="#FFEAA7"];
+        load_R_10 [label="nl.load(R[:, 0],\ndst=R_sbuf_2)", fillcolor="#FFEAA7"];
+        compute_10 [label="nl.matmul(L_sbuf_2,\nR_sbuf_2, out_sbuf_2)", fillcolor="#A8D8EA"];
+        store_10 [label="nl.store(out_sbuf_2,\ndst=Output[1,0])", fillcolor="#A8E6CF"];
+
+        // Allocate edges
+        alloc_L_10 -> load_L_10 [label="L_sbuf_2", color="#666666"];
+        alloc_R_10 -> load_R_10 [label="R_sbuf_2", color="#666666"];
+        alloc_out_10 -> compute_10 [label="out_sbuf_2", color="#666666"];
+
+        // Data flow edges
+        load_L_10 -> compute_10 [label="L_sbuf_2", color="#666666"];
+        load_R_10 -> compute_10 [label="R_sbuf_2", color="#666666"];
+        compute_10 -> store_10 [label="out_sbuf_2", color="#666666"];
+    }
+
+    // Subgraph 3: Output[1,1]
+    subgraph cluster_output_11 {
+        label="Subgraph 3: Output[1,1]";
+
+        alloc_L_11 [label="L_sbuf_3 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_R_11 [label="R_sbuf_3 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_out_11 [label="out_sbuf_3 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        load_L_11 [label="nl.load(L[1, :],\ndst=L_sbuf_3)", fillcolor="#FFEAA7"];
+        load_R_11 [label="nl.load(R[:, 1],\ndst=R_sbuf_3)", fillcolor="#FFEAA7"];
+        compute_11 [label="nl.matmul(L_sbuf_3,\nR_sbuf_3, out_sbuf_3)", fillcolor="#A8D8EA"];
+        store_11 [label="nl.store(out_sbuf_3,\ndst=Output[1,1])", fillcolor="#A8E6CF"];
+
+        // Allocate edges
+        alloc_L_11 -> load_L_11 [label="L_sbuf_3", color="#666666"];
+        alloc_R_11 -> load_R_11 [label="R_sbuf_3", color="#666666"];
+        alloc_out_11 -> compute_11 [label="out_sbuf_3", color="#666666"];
+
+        // Data flow edges
+        load_L_11 -> compute_11 [label="L_sbuf_3", color="#666666"];
+        load_R_11 -> compute_11 [label="R_sbuf_3", color="#666666"];
+        compute_11 -> store_11 [label="out_sbuf_3", color="#666666"];
+    }
+
+}

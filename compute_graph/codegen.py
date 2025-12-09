@@ -9,35 +9,30 @@ logger = logging.getLogger(__name__)
 class NKICodegen:
     """Generates NKI kernel code from a ComputeGraph."""
 
-    def __init__(self, graph: ComputeGraph) -> None:
+    def __init__(self, graph: ComputeGraph, kernel_name: str) -> None:
         """
         Args:
             graph: ComputeGraph to generate code from
+            kernel_name: Name for the generated kernel function
         """
         if not graph.subgraphs:
             raise ValueError("Graph must have subgraphs before code generation")
         self.graph = graph
+        self.kernel_name = kernel_name
+        self.code = self._generate_kernel()
 
-    def generate_kernel(self, kernel_name: str, kernel_path: str) -> str:
+    def _generate_kernel(self) -> str:
         """Generate complete NKI kernel code.
-
-        Args:
-            kernel_name: Name for the generated kernel function
-            kernel_path: Path to write the generated kernel file
 
         Returns:
             Complete NKI kernel code as a string
         """
         imports = self._generate_imports()
         decorator = "@nki.jit"
-        signature = self._generate_signature(kernel_name)
+        signature = self._generate_signature(self.kernel_name)
         body = self._generate_body()
 
-        kernel_code = f"{imports}\n\n{decorator}\n{signature}\n{body}"
-        with open(kernel_path, "w") as f:
-            f.write(kernel_code)
-        logger.info(f"{kernel_name} written to {kernel_path}")
-        return kernel_code
+        return f"{imports}\n\n{decorator}\n{signature}\n{body}"
 
     def _generate_imports(self) -> str:
         """Generate import statements."""
