@@ -1,0 +1,60 @@
+digraph MatmulComputeGraphLoadCoalescing {
+    rankdir=TB;
+    bgcolor="white";
+    pad=0.5;
+    dpi=300;
+
+    // Graph styling
+    node [fontname="Arial", fontsize=11, style="filled,rounded", shape=box];
+    edge [fontname="Arial", fontsize=9];
+
+    // Title
+    label="Compute Graph: Load Coalescing\nL[M,K] @ R[K,N] = Output[M,N]\nCoalesce loads from Subgraphs 0 & 2 into one large DMA transfer";
+    labelloc="t";
+    fontsize=14;
+    fontname="Arial Bold";
+
+    // Merged subgraph 0+2 with coalesced loads
+    subgraph cluster_merged_02 {
+        label="Merged Subgraph 0+2 (Load Coalesced)";
+        penwidth=2;
+        color="#4169E1";
+
+        // Allocate nodes (coalesced buffers)
+        alloc_L_coalesced [label="L_sbuf_coalesced =\nnl.ndarray([2, ...])", fillcolor="#E8E8E8", penwidth=3, style="filled,rounded,bold"];
+        alloc_R_0 [label="R_sbuf_0 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_R_2 [label="R_sbuf_2 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
+        alloc_out_coalesced [label="out_sbuf_coalesced =\nnl.ndarray([2, ...])", fillcolor="#E8E8E8", penwidth=2];
+
+        // Coalesced load
+        load_L_coalesced [label="nl.load(L[0:2, :],\ndst=L_sbuf_coalesced)\n(coalesced: [256, 128])",
+                          fillcolor="#FFEAA7", penwidth=3, style="filled,rounded,bold"];
+
+        // sg0 operations
+        load_R_0 [label="nl.load(R[:, 0],\ndst=R_sbuf_0)", fillcolor="#FFEAA7"];
+        compute_0 [label="nl.matmul(L_sbuf_coalesced[0,:],\nR_sbuf_0, out_sbuf_coalesced[0,:])", fillcolor="#A8D8EA"];
+
+        // sg2 operations
+        load_R_2 [label="nl.load(R[:, 0],\ndst=R_sbuf_2)", fillcolor="#FFEAA7"];
+        compute_2 [label="nl.matmul(L_sbuf_coalesced[1,:],\nR_sbuf_2, out_sbuf_coalesced[1,:])", fillcolor="#A8D8EA"];
+
+        // Coalesced store
+        store_coalesced [label="nl.store(out_sbuf_coalesced,\ndst=Output[0:2, 0])\n(coalesced: [256, 512])",
+                         fillcolor="#A8E6CF", penwidth=2];
+
+        // Allocate edges
+        alloc_L_coalesced -> load_L_coalesced [label="L_sbuf_coalesced", color="#666666"];
+        alloc_R_0 -> load_R_0 [label="R_sbuf_0", color="#666666"];
+        alloc_R_2 -> load_R_2 [label="R_sbuf_2", color="#666666"];
+        alloc_out_coalesced -> compute_0 [label="out_sbuf_coalesced", color="#666666"];
+        alloc_out_coalesced -> compute_2 [label="out_sbuf_coalesced", color="#666666"];
+
+        // Data flow
+        load_L_coalesced -> compute_0 [label="L_sbuf_coalesced[0,:]", color="#666666", penwidth=2];
+        load_L_coalesced -> compute_2 [label="L_sbuf_coalesced[1,:]", color="#666666", penwidth=2];
+        load_R_0 -> compute_0 [label="R_sbuf_0", color="#666666"];
+        load_R_2 -> compute_2 [label="R_sbuf_2", color="#666666"];
+        compute_0 -> store_coalesced [label="out_sbuf_coalesced[0,:]", color="#666666"];
+        compute_2 -> store_coalesced [label="out_sbuf_coalesced[1,:]", color="#666666"];
+    }
+}

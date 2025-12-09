@@ -74,8 +74,9 @@ def generate_kernel(M: int, K: int, N: int) -> tuple[str, str, dict[str, tuple[i
     save_graph(rmsnorm_matmul_graph, output_dir=f"{cache_root}", title="RMSNorm + Matmul")
     kernel_name = "rmsnorm_matmul_kernel"
     kernel_path = f"{cache_root}/{kernel_name}.py"
-    codegen = NKICodegen(rmsnorm_matmul_graph)
-    codegen.generate_kernel(kernel_name, kernel_path)
+    kernel_code = NKICodegen(rmsnorm_matmul_graph, kernel_name).code
+    with open(kernel_path, "w") as f:
+        f.write(kernel_code)
 
     return kernel_path, kernel_name, input_tensor_shapes
 
