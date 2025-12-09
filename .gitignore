@@ -83,6 +83,7 @@ Desktop.ini
 *.pkl
 *.out
 *.err
+!/design/figures/*.png
 
 # Artifacts
 artifacts/
