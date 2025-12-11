@@ -3,10 +3,10 @@ import os
 import subprocess
 
 from compute_graph.graph import ComputeGraph, SubGraph
-from compute_graph.hbm_tensor import HBMTensor
 from compute_graph.memory import HBM
-from compute_graph.memory_ops import Allocate, Load, Store
-from compute_graph.operators import Operator
+from compute_graph.node.hbm_tensor import HBMTensor
+from compute_graph.node.memory import Allocate, Load, Store
+from compute_graph.node.node import Node
 
 
 class MultilineFormatter(logging.Formatter):
@@ -40,7 +40,7 @@ def setup_logging(log_file: str, level: int = logging.DEBUG, msg_width: int = 30
 
 NODE_TYPE_COLORS: dict[str, str] = {"load": "#FFEAA7", "compute": "#A8D8EA", "store": "#A8E6CF", "allocate": "#E8E8E8"}
 
-CLUSTER_COLORS: dict[str, str] = {"hbm": "#FF6B6B", "operators": "#666666"}
+CLUSTER_COLORS: dict[str, str] = {"hbm": "#FF6B6B", "nodes": "#666666"}
 
 DEFAULT_NODE_COLOR = "#E8E8E8"
 HBM_INPUT_COLOR = "#FFB6C1"
@@ -115,7 +115,7 @@ def _wrap_label(label: str, max_width: int = 50) -> str:
     return result
 
 
-def _get_node_type(node_data: Operator) -> str:
+def _get_node_type(node_data: Node) -> str:
     """
     Args:
         node_data: Node object (MemoryOp or ComputeOp)
@@ -133,7 +133,7 @@ def _get_node_type(node_data: Operator) -> str:
     return node_type
 
 
-def _format_node(node_data: Operator) -> tuple[str, str]:
+def _format_node(node_data: Node) -> tuple[str, str]:
     """
     Args:
         node_data: Node object (MemoryOp or ComputeOp)
@@ -161,13 +161,13 @@ def _format_hbm_tensor(hbm_tensor: HBMTensor, is_input: bool = True) -> tuple[st
     return label, color
 
 
-def operators_to_dot(
-    operators: list[Operator], edges: list[tuple[int, int]], node_prefix: str = "node", indent: str = "    "
+def nodes_to_dot(
+    nodes: list[Node], edges: list[tuple[int, int]], node_prefix: str = "node", indent: str = "    "
 ) -> list[str]:
-    """Generate DOT lines for a set of operators and edges.
+    """Generate DOT lines for a set of nodes and edges.
 
     Args:
-        operators: List of operators to visualize
+        nodes: List of nodes to visualize
         edges: List of (source_idx, target_idx) edges
         node_prefix: Prefix for node IDs (e.g., "node" -> "node_0", "node_1")
         indent: Indentation string for DOT lines
@@ -178,7 +178,7 @@ def operators_to_dot(
     lines = []
 
     # Generate nodes
-    for node_id, node_data in enumerate(operators):
+    for node_id, node_data in enumerate(nodes):
         node_label, node_color = _format_node(node_data)
         lines.append(f'{indent}{node_prefix}_{node_id} [label="{node_label}", fillcolor="{node_color}"];')
 
@@ -253,9 +253,9 @@ def _subgraphs_to_dot(subgraphs: list[SubGraph], indent: str = "    ") -> list[s
         lines.append(f"{indent}subgraph cluster_subgraph_{subgraph.index} {{")
         lines.append(f'{indent}    label="Subgraph {subgraph.index}";')
         lines.append(f'{indent}    style="rounded";')
-        lines.append(f'{indent}    color="{CLUSTER_COLORS["operators"]}";')
+        lines.append(f'{indent}    color="{CLUSTER_COLORS["nodes"]}";')
         lines.append(f"{indent}    ")
-        lines.extend(operators_to_dot(subgraph.nodes, subgraph.edges, node_prefix=node_prefix, indent=f"{indent}    "))
+        lines.extend(nodes_to_dot(subgraph.nodes, subgraph.edges, node_prefix=node_prefix, indent=f"{indent}    "))
         lines.append(f"{indent}}}")
         lines.append(f"{indent}")
 
@@ -299,13 +299,11 @@ def _dot_header(title: str) -> list[str]:
     return lines
 
 
-def single_graph_to_dot(
-    operators: list[Operator], edges: list[tuple[int, int]], title: str, hbm: HBM | None = None
-) -> str:
-    """Generate complete DOT for a single graph (operators + edges).
+def single_graph_to_dot(nodes: list[Node], edges: list[tuple[int, int]], title: str, hbm: HBM | None = None) -> str:
+    """Generate complete DOT for a single graph (nodes + edges).
 
     Args:
-        operators: List of operators to visualize
+        nodes: List of nodes to visualize
         edges: List of (source_idx, target_idx) edges
         title: Title for the graph visualization
         hbm: Optional HBM object to show input/output tensors
@@ -319,23 +317,23 @@ def single_graph_to_dot(
     if hbm is not None:
         lines.extend(_hbm_to_dot(hbm))
 
-    # Add operators and edges in a cluster
-    if operators:
-        lines.append("    subgraph cluster_operators {")
-        lines.append('        label="Operators";')
+    # Add nodes and edges in a cluster
+    if nodes:
+        lines.append("    subgraph cluster_nodes {")
+        lines.append('        label="Nodes";')
         lines.append('        style="rounded";')
         lines.append('        color="#666666";')
         lines.append("        ")
-        lines.extend(operators_to_dot(operators, edges, node_prefix="node", indent="        "))
+        lines.extend(nodes_to_dot(nodes, edges, node_prefix="node", indent="        "))
         lines.append("    }")
         lines.append("    ")
     else:
-        lines.extend(operators_to_dot(operators, edges, node_prefix="node", indent="    "))
+        lines.extend(nodes_to_dot(nodes, edges, node_prefix="node", indent="    "))
 
-    if hbm is not None and operators and hbm.input_tensors:
+    if hbm is not None and nodes and hbm.input_tensors:
         lines.append("    ")
-        for idx, op in enumerate(operators):
-            if isinstance(op, Load):
+        for idx, node in enumerate(nodes):
+            if isinstance(node, Load):
                 lines.append(f"    hbm_input_0 -> node_{idx} [style=invis];")
                 break
 
@@ -402,7 +400,7 @@ def save_graph(graph: ComputeGraph, output_dir: str, title: str, keep_dot: bool 
     os.makedirs(output_dir, exist_ok=True)
 
     # Save main graph (ComputeGraph.operators and .edges)
-    main_dot = single_graph_to_dot(graph.operators, graph.edges, title, graph.hbm)
+    main_dot = single_graph_to_dot(graph.nodes, graph.edges, title, graph.hbm)
     _save_dot_to_file(main_dot, os.path.join(output_dir, "main_graph.png"), keep_dot)
 
     # Save all subgraphs in one figure

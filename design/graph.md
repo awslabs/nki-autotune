@@ -13,15 +13,16 @@ class ComputeGraph(nx.DiGraph):
 
 ```python
 class Node:
-    read_args: list[str]
-    write_args: list[str]
+    read_args: tuple[str, ...]
+    write_args: tuple[str, ...]
+    arg_to_var: dict[str, str]
     arg_to_axes: dict[str, tuple[str, ...]]
 
-class HBMInputNode(Node): ...   # read_args=[], write_args=["data"]
-class HBMOutputNode(Node): ...  # read_args=["data"], write_args=[]
-class LoadNode(Node): ...       # read_args=["src"], write_args=["dest"]
-class StoreNode(Node): ...      # read_args=["src"], write_args=["dest"]
-class MatmulNode(Node): ...     # lhs=[M,K], rhs=[K,N], dest=[M,N]
+class HBMInput(Node): ...   # read_args=[], write_args=["data"]
+class HBMOutput(Node): ...  # read_args=["data"], write_args=[]
+class Load(Node): ...       # read_args=["src"], write_args=["dest"]
+class Store(Node): ...      # read_args=["src"], write_args=["dest"]
+class Matmul(Node): ...     # lhs=[M,K], rhs=[K,N], dest=[M,N]
 ```
 
 ```python

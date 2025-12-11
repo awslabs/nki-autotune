@@ -1,9 +1,9 @@
 from compute_graph.buffer_tensor import BufferTensor
-from compute_graph.hbm_tensor import HBMTensor
-from compute_graph.operators import Operator
+from compute_graph.node.hbm_tensor import HBMTensor
+from compute_graph.node.node import Node
 
 
-class Load(Operator):
+class Load(Node):
     """Load data from HBM to SBUF."""
 
     def __init__(self, dest: str, src: str) -> None:
@@ -11,7 +11,7 @@ class Load(Operator):
             read_args=("src",),
             write_args=("dest",),
             arg_to_var={"src": src, "dest": dest},
-            axis_semantics={"src": ("P", "F"), "dest": ("P", "F")},
+            arg_to_axes={"src": ("P", "F"), "dest": ("P", "F")},
         )
 
     def codegen(self) -> str:
@@ -27,7 +27,7 @@ class Load(Operator):
         return f"{self._format_tensor('dest')} = Load(src={self._format_tensor('src')})"
 
 
-class Store(Operator):
+class Store(Node):
     """Store data from SBUF to HBM."""
 
     def __init__(self, dest: str, value: str) -> None:
@@ -35,7 +35,7 @@ class Store(Operator):
             read_args=("value",),
             write_args=("dest",),
             arg_to_var={"value": value, "dest": dest},
-            axis_semantics={"value": ("P", "F"), "dest": ("P", "F")},
+            arg_to_axes={"value": ("P", "F"), "dest": ("P", "F")},
         )
 
     def codegen(self) -> str:
@@ -51,7 +51,7 @@ class Store(Operator):
         return f"Store(dest={self._format_tensor('dest')}, value={self._format_tensor('value')})"
 
 
-class Allocate(Operator):
+class Allocate(Node):
     """Allocate a tensor in on-chip memory.
 
     Creates nl.ndarray with specified shape, and buffer location.
@@ -59,7 +59,7 @@ class Allocate(Operator):
 
     def __init__(self, tensor: str, buffer: str) -> None:
         super().__init__(
-            read_args=(), write_args=("tensor",), arg_to_var={"tensor": tensor}, axis_semantics={"tensor": ("P", "F")}
+            read_args=(), write_args=("tensor",), arg_to_var={"tensor": tensor}, arg_to_axes={"tensor": ("P", "F")}
         )
         self.buffer = buffer
         assert buffer in ["SBUF", "PSUM"], f"Illegal buffer type {buffer}"
