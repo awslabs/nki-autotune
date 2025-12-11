@@ -2,7 +2,7 @@ import logging
 import os
 import subprocess
 
-from compute_graph.graph import ComputeGraph
+from compute_graph.graph import ComputeGraph, SubGraph
 from compute_graph.hbm_tensor import HBMTensor
 from compute_graph.memory import HBM
 from compute_graph.memory_ops import Allocate, Load, Store
@@ -236,6 +236,48 @@ def _hbm_to_dot(hbm: HBM, indent: str = "    ") -> list[str]:
     return lines
 
 
+def _subgraphs_to_dot(subgraphs: list[SubGraph], indent: str = "    ") -> list[str]:
+    """Generate DOT lines for all subgraphs in a single figure.
+
+    Args:
+        subgraphs: List of SubGraph objects to visualize
+        indent: Indentation string for DOT lines
+
+    Returns:
+        List of DOT format lines for all subgraphs as clusters
+    """
+    lines = []
+
+    for subgraph in subgraphs:
+        node_prefix = f"sg{subgraph.index}_node"
+        lines.append(f"{indent}subgraph cluster_subgraph_{subgraph.index} {{")
+        lines.append(f'{indent}    label="Subgraph {subgraph.index}";')
+        lines.append(f'{indent}    style="rounded";')
+        lines.append(f'{indent}    color="{CLUSTER_COLORS["operators"]}";')
+        lines.append(f"{indent}    ")
+        lines.extend(operators_to_dot(subgraph.nodes, subgraph.edges, node_prefix=node_prefix, indent=f"{indent}    "))
+        lines.append(f"{indent}}}")
+        lines.append(f"{indent}")
+
+    return lines
+
+
+def all_subgraphs_to_dot(subgraphs: list[SubGraph], title: str) -> str:
+    """Generate complete DOT for all subgraphs in one figure.
+
+    Args:
+        subgraphs: List of SubGraph objects to visualize
+        title: Title for the combined visualization
+
+    Returns:
+        DOT format string for Graphviz rendering
+    """
+    lines = _dot_header(title)
+    lines.extend(_subgraphs_to_dot(subgraphs))
+    lines.append("}")
+    return "\n".join(lines)
+
+
 def _dot_header(title: str) -> list[str]:
     """Generate DOT header lines."""
     lines = [
@@ -363,8 +405,8 @@ def save_graph(graph: ComputeGraph, output_dir: str, title: str, keep_dot: bool 
     main_dot = single_graph_to_dot(graph.operators, graph.edges, title, graph.hbm)
     _save_dot_to_file(main_dot, os.path.join(output_dir, "main_graph.png"), keep_dot)
 
-    # Save each subgraph
-    for subgraph in graph.subgraphs:
-        subgraph_title = f"{title} - Subgraph {subgraph.index}"
-        subgraph_dot = single_graph_to_dot(subgraph.nodes, subgraph.edges, subgraph_title)
-        _save_dot_to_file(subgraph_dot, os.path.join(output_dir, f"subgraph_{subgraph.index}.png"), keep_dot)
+    # Save all subgraphs in one figure
+    if graph.subgraphs:
+        subgraphs_title = f"{title} - All Subgraphs"
+        subgraphs_dot = all_subgraphs_to_dot(graph.subgraphs, subgraphs_title)
+        _save_dot_to_file(subgraphs_dot, os.path.join(output_dir, "subgraphs.png"), keep_dot)
