@@ -21,7 +21,7 @@ class Load(Operator):
         indices = _generate_hbm_indices(hbm_tensor)
         buffer_tensor = self.arg_to_tensor["dest"]
         assert isinstance(buffer_tensor, BufferTensor)
-        return f"{buffer_tensor.name} = nl.load({hbm_tensor.name}[{indices}])"
+        return f"nisa.dma_copy(dst={buffer_tensor.name}, src={hbm_tensor.name}[{indices}])"
 
     def __repr__(self) -> str:
         return f"{self._format_tensor('dest')} = Load(src={self._format_tensor('src')})"
