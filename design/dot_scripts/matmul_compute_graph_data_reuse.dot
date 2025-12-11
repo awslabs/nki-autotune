@@ -31,12 +31,12 @@ digraph MatmulComputeGraphOptimized {
 
         // Compute Output[0,0]
         load_R_00 [label="nl.load(R[:, 0],\ndst=R_sbuf_0)", fillcolor="#FFEAA7"];
-        compute_00 [label="nl.matmul(L_sbuf_0,\nR_sbuf_0, out_sbuf_0)", fillcolor="#A8D8EA"];
+        compute_00 [label="out_sbuf_0 =\nnisa.nc_matmul(L_sbuf_0, R_sbuf_0)", fillcolor="#A8D8EA"];
         store_00 [label="nl.store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
 
         // Compute Output[0,1]
         load_R_01 [label="nl.load(R[:, 1],\ndst=R_sbuf_1)", fillcolor="#FFEAA7"];
-        compute_01 [label="nl.matmul(L_sbuf_0,\nR_sbuf_1, out_sbuf_1)", fillcolor="#A8D8EA"];
+        compute_01 [label="out_sbuf_1 =\nnisa.nc_matmul(L_sbuf_0, R_sbuf_1)", fillcolor="#A8D8EA"];
         store_01 [label="nl.store(out_sbuf_1,\ndst=Output[0,1])", fillcolor="#A8E6CF"];
 
         // Allocate edges
@@ -64,7 +64,7 @@ digraph MatmulComputeGraphOptimized {
         alloc_out_10 [label="out_sbuf_2 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
         load_L_10 [label="nl.load(L[1, :],\ndst=L_sbuf_2)", fillcolor="#FFEAA7"];
         load_R_10 [label="nl.load(R[:, 0],\ndst=R_sbuf_2)", fillcolor="#FFEAA7"];
-        compute_10 [label="nl.matmul(L_sbuf_2,\nR_sbuf_2, out_sbuf_2)", fillcolor="#A8D8EA"];
+        compute_10 [label="out_sbuf_2 =\nnisa.nc_matmul(L_sbuf_2, R_sbuf_2)", fillcolor="#A8D8EA"];
         store_10 [label="nl.store(out_sbuf_2,\ndst=Output[1,0])", fillcolor="#A8E6CF"];
 
         // Allocate edges
@@ -87,7 +87,7 @@ digraph MatmulComputeGraphOptimized {
         alloc_out_11 [label="out_sbuf_3 =\nnl.ndarray(...)", fillcolor="#E8E8E8"];
         load_L_11 [label="nl.load(L[1, :],\ndst=L_sbuf_3)", fillcolor="#FFEAA7"];
         load_R_11 [label="nl.load(R[:, 1],\ndst=R_sbuf_3)", fillcolor="#FFEAA7"];
-        compute_11 [label="nl.matmul(L_sbuf_3,\nR_sbuf_3, out_sbuf_3)", fillcolor="#A8D8EA"];
+        compute_11 [label="out_sbuf_3 =\nnisa.nc_matmul(L_sbuf_3, R_sbuf_3)", fillcolor="#A8D8EA"];
         store_11 [label="nl.store(out_sbuf_3,\ndst=Output[1,1])", fillcolor="#A8E6CF"];
 
         // Allocate edges
