@@ -2,11 +2,11 @@ import copy
 import logging
 
 from compute_graph.buffer_tensor import BufferAxis, BufferTensor
-from compute_graph.compute_ops import Matmul, TileTranspose
-from compute_graph.hbm_tensor import HBMTensor, create_hbm_tensor, get_num_shards, get_parallel_axes, shard_tensors
 from compute_graph.memory import HBM, Buffer
-from compute_graph.memory_ops import Allocate, Load, Store
-from compute_graph.operators import Operator
+from compute_graph.node.compute import Matmul, TileTranspose
+from compute_graph.node.hbm_tensor import HBMTensor, create_hbm_tensor, get_num_shards, get_parallel_axes, shard_tensors
+from compute_graph.node.memory import Allocate, Load, Store
+from compute_graph.node.node import Node
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class SubGraph:
     def __init__(
         self,
         index: int,
-        operators: list[Operator],
+        operators: list[Node],
         edges: list[tuple[int, int]],
         parallel_axes: list[str],
         hbm: HBM,
@@ -34,11 +34,11 @@ class SubGraph:
         self.nodes = [copy.deepcopy(op) for op in operators]
         for op in self.nodes:
             op.clear_specialization()
-            self._specialize_operator(op, sbuf)
+            self._specialize_node(op, sbuf)
 
         self.edges = edges.copy()
 
-    def _specialize_operator(self, op: Operator, sbuf: Buffer) -> None:
+    def _specialize_node(self, op: Node, sbuf: Buffer) -> None:
         """Re-specialize operator with sharded HBM and SBUF tensors."""
         for arg in op.read_args + op.write_args:
             var = op.arg_to_var[arg]
@@ -65,7 +65,7 @@ class SubGraph:
 class ComputeGraph:
     """Compute graph with allocate-load-compute-store nodes and dependency edges."""
 
-    def __init__(self, operators: list[Operator], input_shapes: dict[str, tuple[int, ...]], output: str) -> None:
+    def __init__(self, operators: list[Node], input_shapes: dict[str, tuple[int, ...]], output: str) -> None:
         """
         Args:
             operators: List of compute operators in the graph
@@ -78,7 +78,7 @@ class ComputeGraph:
             self.hbm.add_input(hbm_tensor)
         operators = insert_tile_transpose(operators)
         self.sbuf = Buffer("SBUF")
-        self.operators, self.edges = self._trace(operators, output)
+        self.nodes, self.edges = self._trace(operators, output)
         logger.debug(self.hbm)
         logger.debug(self.sbuf)
 
@@ -89,18 +89,18 @@ class ComputeGraph:
         logger.debug(self.sbuf)
         self.subgraphs: list[SubGraph] = []
         for graph_idx in range(num_shards):
-            subgraph = SubGraph(graph_idx, self.operators, self.edges, parallel_axes, self.hbm, self.sbuf)
+            subgraph = SubGraph(graph_idx, self.nodes, self.edges, parallel_axes, self.hbm, self.sbuf)
             self.subgraphs.append(subgraph)
 
-    def _trace(self, operators: list[Operator], output: str) -> tuple[list[Operator], list[tuple[int, int]]]:
+    def _trace(self, nodes: list[Node], output: str) -> tuple[list[Node], list[tuple[int, int]]]:
         ctx = _TraceContext(self.hbm, self.sbuf)
-        for operator in operators:
-            logger.debug("-" * 10 + f"{operator}" + "-" * 10)
-            ctx.resolve_read_args(operator)
-            ctx.resolve_write_args(operator)
-            ctx.add_operator_with_edges(operator)
-            ctx.maybe_add_store(operator, output)
-        return ctx.all_operators, ctx.edges
+        for node in nodes:
+            logger.debug("-" * 10 + f"{node}" + "-" * 10)
+            ctx.resolve_read_args(node)
+            ctx.resolve_write_args(node)
+            ctx.add_node_with_edges(node)
+            ctx.maybe_add_store(node, output)
+        return ctx.all_nodes, ctx.edges
 
 
 class _TraceContext:
@@ -110,26 +110,26 @@ class _TraceContext:
         self.hbm = hbm
         self.sbuf = sbuf
         self.tensor_producer: dict[str, int] = {}
-        self.all_operators: list[Operator] = []
+        self.all_nodes: list[Node] = []
         self.edges: list[tuple[int, int]] = []
 
-    def resolve_read_args(self, operator: Operator) -> None:
+    def resolve_read_args(self, node: Node) -> None:
         """Resolve read arguments by looking up existing tensors or creating allocate+load from HBM."""
-        for read_arg in operator.read_args:
-            read_var = operator.arg_to_var[read_arg]
+        for read_arg in node.read_args:
+            read_var = node.arg_to_var[read_arg]
             logger.debug(f"Resolve read_arg {read_arg}={read_var}")
             if read_var in self.sbuf.tensors:
                 read_tensor = self.sbuf.tensors[read_var]
             else:
-                read_tensor = self._load_from_hbm(operator, read_arg, read_var)
-            operator.specialize(read_arg, read_tensor)
-            logger.debug(f"{operator}\n")
+                read_tensor = self._load_from_hbm(node, read_arg, read_var)
+            node.specialize(read_arg, read_tensor)
+            logger.debug(f"{node}\n")
 
-    def _load_from_hbm(self, operator: Operator, read_arg: str, read_var: str) -> BufferTensor:
+    def _load_from_hbm(self, node: Node, read_arg: str, read_var: str) -> BufferTensor:
         """Create allocate+load operations to load tensor from HBM input."""
         potential_hbm_name = f"{read_var}_hbm"
         if potential_hbm_name not in self.hbm.input_tensors:
-            raise ValueError(f"{operator} read arg {read_arg}={read_var} does not exist")
+            raise ValueError(f"{node} read arg {read_arg}={read_var} does not exist")
 
         input_hbm_tensor = self.hbm.input_tensors[potential_hbm_name]
         buffer_axes = tuple(BufferAxis(name=ax.name, size=ax.size) for ax in input_hbm_tensor.axes)
@@ -138,59 +138,59 @@ class _TraceContext:
 
         allocate_op = Allocate(tensor=read_var, buffer="SBUF")
         allocate_op.specialize("tensor", read_tensor)
-        alloc_idx = append_operator(self.all_operators, allocate_op)
+        alloc_idx = append_node(self.all_nodes, allocate_op)
 
         load_op = Load(dest=read_var, src=input_hbm_tensor.name)
         load_op.specialize("src", input_hbm_tensor)
         load_op.specialize("dest", read_tensor)
-        load_idx = append_operator(self.all_operators, load_op)
+        load_idx = append_node(self.all_nodes, load_op)
 
         self.edges.append((alloc_idx, load_idx))
         self.tensor_producer[read_var] = load_idx
         return read_tensor
 
-    def resolve_write_args(self, operator: Operator) -> None:
+    def resolve_write_args(self, node: Node) -> None:
         """Resolve write arguments by looking up existing tensors or creating allocate."""
-        for write_arg in operator.write_args:
-            write_var = operator.arg_to_var[write_arg]
+        for write_arg in node.write_args:
+            write_var = node.arg_to_var[write_arg]
             logger.debug(f"Resolve write_arg {write_arg}={write_var}")
             if write_var in self.sbuf.tensors:
                 write_tensor = self.sbuf.tensors[write_var]
             else:
-                write_tensor = self._allocate_tensor(operator, write_arg, write_var)
-            operator.specialize(write_arg, write_tensor)
-            logger.debug(f"{operator}\n")
+                write_tensor = self._allocate_tensor(node, write_arg, write_var)
+            node.specialize(write_arg, write_tensor)
+            logger.debug(f"{node}\n")
 
-    def _allocate_tensor(self, operator: Operator, write_arg: str, write_var: str) -> BufferTensor:
+    def _allocate_tensor(self, node: Node, write_arg: str, write_var: str) -> BufferTensor:
         """Create allocate operation for a new tensor."""
         allocate_op = Allocate(tensor=write_var, buffer="SBUF")
-        buffer_axes = operator.get_tensor_axes(write_arg)
+        buffer_axes = node.get_tensor_axes(write_arg)
         assert all(isinstance(ax, BufferAxis) for ax in buffer_axes)
         write_tensor = BufferTensor(name=write_var, axes=buffer_axes, buffer="SBUF")  # type: ignore[arg-type]
         self.sbuf.add_tensor(write_tensor)
         allocate_op.specialize("tensor", write_tensor)
-        alloc_idx = append_operator(self.all_operators, allocate_op)
+        alloc_idx = append_node(self.all_nodes, allocate_op)
         self.tensor_producer[write_var] = alloc_idx
         return write_tensor
 
-    def add_operator_with_edges(self, operator: Operator) -> None:
-        """Add operator to graph and create edges from tensor producers."""
-        op_idx = append_operator(self.all_operators, operator)
-        for read_arg in operator.read_args:
-            read_var = operator.arg_to_var[read_arg]
-            self.edges.append((self.tensor_producer[read_var], op_idx))
-        for write_arg in operator.write_args:
-            write_var = operator.arg_to_var[write_arg]
-            self.edges.append((self.tensor_producer[write_var], op_idx))
-            self.tensor_producer[write_var] = op_idx
+    def add_node_with_edges(self, node: Node) -> None:
+        """Add node to graph and create edges from tensor producers."""
+        node_idx = append_node(self.all_nodes, node)
+        for read_arg in node.read_args:
+            read_var = node.arg_to_var[read_arg]
+            self.edges.append((self.tensor_producer[read_var], node_idx))
+        for write_arg in node.write_args:
+            write_var = node.arg_to_var[write_arg]
+            self.edges.append((self.tensor_producer[write_var], node_idx))
+            self.tensor_producer[write_var] = node_idx
 
-    def maybe_add_store(self, operator: Operator, output: str) -> None:
-        """Add store operation if operator writes to the output tensor."""
-        for write_arg in operator.write_args:
-            write_var = operator.arg_to_var[write_arg]
+    def maybe_add_store(self, node: Node, output: str) -> None:
+        """Add store operation if node writes to the output tensor."""
+        for write_arg in node.write_args:
+            write_var = node.arg_to_var[write_arg]
             if write_var != output:
                 continue
-            write_tensor = operator.arg_to_tensor[write_arg]
+            write_tensor = node.arg_to_tensor[write_arg]
             store_op = Store(dest=f"{output}_hbm", value=write_var)
             store_op.specialize("value", write_tensor)
             hbm_tensor = create_hbm_tensor(
@@ -198,22 +198,22 @@ class _TraceContext:
             )
             self.hbm.add_output(hbm_tensor)
             store_op.specialize("dest", hbm_tensor)
-            store_idx = append_operator(self.all_operators, store_op)
+            store_idx = append_node(self.all_nodes, store_op)
             self.edges.append((self.tensor_producer[write_var], store_idx))
 
 
-def append_operator(operators: list[Operator], operator: Operator) -> int:
-    """Append operator to list and return its index."""
-    logger.debug(operator)
-    assert operator.is_specialized, f"{operator} is not fully specialized"
-    idx = len(operators)
-    operators.append(operator)
+def append_node(nodes: list[Node], node: Node) -> int:
+    """Append node to list and return its index."""
+    logger.debug(node)
+    assert node.is_specialized, f"{node} is not fully specialized"
+    idx = len(nodes)
+    nodes.append(node)
     return idx
 
 
-def insert_tile_transpose(compute_ops: list[Operator]) -> list[Operator]:
+def insert_tile_transpose(compute_ops: list[Node]) -> list[Node]:
     """Insert out-of-place tile level transpose."""
-    full_compute_ops: list[Operator] = []
+    full_compute_ops: list[Node] = []
     for compute_op in compute_ops:
         if isinstance(compute_op, Matmul) and not compute_op.lhs_transposed:
             lhs_name = compute_op.arg_to_var["lhs"]

@@ -8,8 +8,8 @@ from autotune.core.job import ProfileJobs
 from autotune.core.metrics import check_correctness
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 from compute_graph.codegen import NKICodegen
-from compute_graph.compute_ops import Activation, Matmul, TensorScalar
 from compute_graph.graph import ComputeGraph
+from compute_graph.node.compute import Activation, Matmul, TensorScalar
 from compute_graph.visualize import save_graph, setup_logging
 
 cache_root = os.environ.get("NKI_CACHE_ROOT", "/fsx/weittang/kernelgen_cache")

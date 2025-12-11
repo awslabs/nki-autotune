@@ -1,9 +1,9 @@
 from typing import Any
 
-from compute_graph.operators import Operator
+from compute_graph.node.node import Node
 
 
-class TensorScalar(Operator):
+class TensorScalar(Node):
     """Element-wise operations on data tiles with scalar/vector operands.
 
     Supports chaining up to two operations with broadcasting along partition axis.
@@ -21,22 +21,20 @@ class TensorScalar(Operator):
     ) -> None:
         read_args = ("data",)
         write_args = ("dest",)
-        axis_semantics = {"data": ("P", "F"), "dest": ("P", "F")}
+        arg_to_axes = {"data": ("P", "F"), "dest": ("P", "F")}
         arg_to_var = {"data": data, "dest": dest}
 
         if isinstance(operand0, str):
             read_args += ("operand0",)
-            axis_semantics["operand0"] = ("P", "1")
+            arg_to_axes["operand0"] = ("P", "1")
             arg_to_var["operand0"] = operand0
 
         if isinstance(operand1, str):
             read_args += ("operand1",)
-            axis_semantics["operand1"] = ("P", "1")
+            arg_to_axes["operand1"] = ("P", "1")
             arg_to_var["operand1"] = operand1
 
-        super().__init__(
-            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
-        )
+        super().__init__(read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, arg_to_axes=arg_to_axes)
 
         self.op0 = op0
         self.operand0 = operand0
@@ -87,7 +85,7 @@ class TensorScalar(Operator):
         return f"{self._format_tensor('dest')} = TensorScalar({args_str})"
 
 
-class Activation(Operator):
+class Activation(Node):
     """Apply activation functions element-wise to input tiles.
 
     Optionally reduces along the free axis to shape (P, 1).
@@ -97,15 +95,13 @@ class Activation(Operator):
     def __init__(self, dest: str, op: Any, data: str, reduce_op: Any = None, reduce_res: str | None = None) -> None:
         read_args = ("data",)
         write_args = ("dest",)
-        axis_semantics = {"data": ("P", "F"), "dest": ("P", "F")}
+        arg_to_axes = {"data": ("P", "F"), "dest": ("P", "F")}
         arg_to_var = {"dest": dest, "data": data}
         if reduce_res:
             write_args += ("reduce_res",)
-            axis_semantics["reduce_res"] = ("P", "1")
+            arg_to_axes["reduce_res"] = ("P", "1")
             arg_to_var["reduce_res"] = reduce_res
-        super().__init__(
-            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
-        )
+        super().__init__(read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, arg_to_axes=arg_to_axes)
 
         self.op = op
         self.reduce_op = reduce_op
@@ -137,7 +133,7 @@ class Activation(Operator):
         return f"{result} = Activation({args_str})"
 
 
-class Transpose(Operator):
+class Transpose(Node):
     """2D transpose swapping partition and free axes.
 
     Transforms input (P, F) to output (F, P).
@@ -146,12 +142,10 @@ class Transpose(Operator):
     def __init__(self, dest: str, data: str) -> None:
         read_args = ("data",)
         write_args = ("dest",)
-        axis_semantics = {"data": ("P", "F"), "dest": ("F", "P")}
+        arg_to_axes = {"data": ("P", "F"), "dest": ("F", "P")}
         arg_to_var = {"data": data, "dest": dest}
 
-        super().__init__(
-            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
-        )
+        super().__init__(read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, arg_to_axes=arg_to_axes)
 
     def codegen(self) -> str:
         """Generate NKI code for nc_transpose operation."""
@@ -163,7 +157,7 @@ class Transpose(Operator):
         return f"{self._format_tensor('dest')} = nisa.nc_transpose(data={self._format_tensor('data')})"
 
 
-class TileTranspose(Operator):
+class TileTranspose(Node):
     """In-tile transpose maintaining (P, F) shape.
 
     Rearranges element layout within the tile without changing axes,
@@ -173,12 +167,10 @@ class TileTranspose(Operator):
     def __init__(self, dest: str, data: str) -> None:
         read_args = ("data",)
         write_args = ("dest",)
-        axis_semantics = {"data": ("P", "F"), "dest": ("P", "F")}
+        arg_to_axes = {"data": ("P", "F"), "dest": ("P", "F")}
         arg_to_var = {"data": data, "dest": dest}
 
-        super().__init__(
-            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
-        )
+        super().__init__(read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, arg_to_axes=arg_to_axes)
 
     def codegen(self) -> str:
         """Generate NKI code for in-tile transpose using nc_transpose."""
@@ -190,7 +182,7 @@ class TileTranspose(Operator):
         return f"{self._format_tensor('dest')} = TileTranspose(data={self._format_tensor('data')})"
 
 
-class Matmul(Operator):
+class Matmul(Node):
     """Matrix multiplication: lhs @ rhs with optional lhs transpose.
 
     Computes (M, K) @ (K, N) → (M, N), or (K, M).T @ (K, N) → (M, N).
@@ -202,15 +194,13 @@ class Matmul(Operator):
         write_args = ("dest",)
 
         if lhs_transposed:
-            axis_semantics = {"lhs": ("K", "M"), "rhs": ("K", "N"), "dest": ("M", "N")}
+            arg_to_axes = {"lhs": ("K", "M"), "rhs": ("K", "N"), "dest": ("M", "N")}
         else:
-            axis_semantics = {"lhs": ("M", "K"), "rhs": ("K", "N"), "dest": ("M", "N")}
+            arg_to_axes = {"lhs": ("M", "K"), "rhs": ("K", "N"), "dest": ("M", "N")}
 
         arg_to_var = {"lhs": lhs, "rhs": rhs, "dest": dest}
 
-        super().__init__(
-            read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, axis_semantics=axis_semantics
-        )
+        super().__init__(read_args=read_args, write_args=write_args, arg_to_var=arg_to_var, arg_to_axes=arg_to_axes)
 
         self.lhs_transposed = lhs_transposed
 

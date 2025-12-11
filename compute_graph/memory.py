@@ -1,5 +1,5 @@
 from compute_graph.buffer_tensor import BufferTensor
-from compute_graph.hbm_tensor import HBMTensor
+from compute_graph.node.hbm_tensor import HBMTensor
 
 
 class HBM:
