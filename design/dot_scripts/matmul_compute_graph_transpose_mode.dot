@@ -9,7 +9,7 @@ digraph MatmulComputeGraphTransposeMode {
     edge [fontname="Arial", fontsize=9];
 
     // Title
-    label="Transpose Mode Transform: Before and After\nChoose optimal transpose method when transposed input is needed";
+    label="Transpose Mode Transform: Before and After\nChoose optimal transpose method when transposed input is needed\nEdge labels show tensor indices: axis:(start,end)";
     labelloc="t";
     fontsize=14;
     fontname="Arial Bold";
@@ -36,12 +36,12 @@ digraph MatmulComputeGraphTransposeMode {
             compute_dma [label="matmul(L_sbuf_0,\nR_sbuf_0, out_sbuf_0)", fillcolor="#A8D8EA"];
             store_dma [label="store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
 
-            alloc_L_dma -> load_dma [label="L_sbuf_0", color="#666666"];
-            alloc_R_dma -> load_R_dma [label="R_sbuf_0", color="#666666"];
-            alloc_out_dma -> compute_dma [label="out_sbuf_0", color="#666666"];
-            load_dma -> compute_dma [label="L_sbuf_0", color="#666666"];
-            load_R_dma -> compute_dma [label="R_sbuf_0", color="#666666"];
-            compute_dma -> store_dma [label="out_sbuf_0", color="#666666"];
+            alloc_L_dma -> load_dma [label="L_sbuf_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            alloc_R_dma -> load_R_dma [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            alloc_out_dma -> compute_dma [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            load_dma -> compute_dma [label="L_sbuf_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            load_R_dma -> compute_dma [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            compute_dma -> store_dma [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
         }
     }
 
@@ -70,14 +70,14 @@ digraph MatmulComputeGraphTransposeMode {
             compute_compute [label="matmul(L_sbuf_0,\nR_sbuf_0, out_sbuf_0)", fillcolor="#A8D8EA"];
             store_compute [label="store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
 
-            alloc_L_temp_compute -> load_compute [label="L_sbuf_temp_0", color="#666666"];
-            alloc_L_compute -> transpose_compute [label="L_sbuf_0", color="#666666"];
-            alloc_R_compute -> load_R_compute [label="R_sbuf_0", color="#666666"];
-            alloc_out_compute -> compute_compute [label="out_sbuf_0", color="#666666"];
-            load_compute -> transpose_compute [label="L_sbuf_temp_0", color="#666666"];
-            transpose_compute -> compute_compute [label="L_sbuf_0", color="#666666"];
-            load_R_compute -> compute_compute [label="R_sbuf_0", color="#666666"];
-            compute_compute -> store_compute [label="out_sbuf_0", color="#666666"];
+            alloc_L_temp_compute -> load_compute [label="L_sbuf_temp_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            alloc_L_compute -> transpose_compute [label="L_sbuf_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            alloc_R_compute -> load_R_compute [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            alloc_out_compute -> compute_compute [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            load_compute -> transpose_compute [label="L_sbuf_temp_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            transpose_compute -> compute_compute [label="L_sbuf_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            load_R_compute -> compute_compute [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            compute_compute -> store_compute [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
         }
     }
 

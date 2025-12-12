@@ -9,7 +9,7 @@ digraph MatmulComputeGraphInstructionCombining {
     edge [fontname="Arial", fontsize=9];
 
     // Title
-    label="Instruction Combining Transform: Before and After\nFuse scale → bias → activation into single instruction";
+    label="Instruction Combining Transform: Before and After\nFuse scale -> bias -> activation into single instruction\nEdge labels show tensor indices: axis:(start,end)";
     labelloc="t";
     fontsize=14;
     fontname="Arial Bold";
@@ -39,14 +39,14 @@ digraph MatmulComputeGraphInstructionCombining {
 
             store_sep [label="store(result,\ndst=output)", fillcolor="#A8E6CF"];
 
-            alloc_input_sep -> load_sep [label="input_sbuf", color="#666666"];
-            alloc_temp1_sep -> multiply_sep [label="temp1", color="#666666"];
-            alloc_temp2_sep -> add_sep [label="temp2", color="#666666"];
-            alloc_result_sep -> exp_sep [label="result", color="#666666"];
-            load_sep -> multiply_sep [label="input_sbuf", color="#666666"];
-            multiply_sep -> add_sep [label="temp1", color="#666666"];
-            add_sep -> exp_sep [label="temp2", color="#666666"];
-            exp_sep -> store_sep [label="result", color="#666666"];
+            alloc_input_sep -> load_sep [label="input_sbuf\nbuf:(0->1) D:(0->1)", color="#666666"];
+            alloc_temp1_sep -> multiply_sep [label="temp1\nbuf:(0->1) D:(0->1)", color="#666666"];
+            alloc_temp2_sep -> add_sep [label="temp2\nbuf:(0->1) D:(0->1)", color="#666666"];
+            alloc_result_sep -> exp_sep [label="result\nbuf:(0->1) D:(0->1)", color="#666666"];
+            load_sep -> multiply_sep [label="input_sbuf\nbuf:(0->1) D:(0->1)", color="#666666"];
+            multiply_sep -> add_sep [label="temp1\nbuf:(0->1) D:(0->1)", color="#666666"];
+            add_sep -> exp_sep [label="temp2\nbuf:(0->1) D:(0->1)", color="#666666"];
+            exp_sep -> store_sep [label="result\nbuf:(0->1) D:(0->1)", color="#666666"];
         }
     }
 
@@ -72,10 +72,10 @@ digraph MatmulComputeGraphInstructionCombining {
 
             store_comb [label="store(result,\ndst=output)", fillcolor="#A8E6CF"];
 
-            alloc_input_comb -> load_comb [label="input_sbuf", color="#666666"];
-            alloc_result_comb -> activation_comb [label="result", color="#666666"];
-            load_comb -> activation_comb [label="input_sbuf", color="#666666"];
-            activation_comb -> store_comb [label="result", color="#666666"];
+            alloc_input_comb -> load_comb [label="input_sbuf\nbuf:(0->1) D:(0->1)", color="#666666"];
+            alloc_result_comb -> activation_comb [label="result\nbuf:(0->1) D:(0->1)", color="#666666"];
+            load_comb -> activation_comb [label="input_sbuf\nbuf:(0->1) D:(0->1)", color="#666666"];
+            activation_comb -> store_comb [label="result\nbuf:(0->1) D:(0->1)", color="#666666"];
         }
     }
 

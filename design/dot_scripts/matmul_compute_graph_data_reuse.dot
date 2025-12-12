@@ -9,7 +9,7 @@ digraph MatmulComputeGraphDataReuse {
     edge [fontname="Arial", fontsize=9];
 
     // Title
-    label="Data Reuse Transform: Before and After\nMerge subgraphs that share L[0, :]\nEdge labels show tensor data flow";
+    label="Data Reuse Transform: Before and After\nMerge subgraphs that share L[0, :]\nEdge labels show tensor indices: axis:(start,end)";
     labelloc="t";
     fontsize=14;
     fontname="Arial Bold";
@@ -33,12 +33,12 @@ digraph MatmulComputeGraphDataReuse {
             before_compute_0 [label="matmul(L_sbuf_0,\nR_sbuf_0, out_sbuf_0)", fillcolor="#A8D8EA"];
             before_store_0 [label="store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
 
-            before_alloc_L_0 -> before_load_L_0 [label="L_sbuf_0", color="#666666"];
-            before_alloc_R_0 -> before_load_R_0 [label="R_sbuf_0", color="#666666"];
-            before_alloc_out_0 -> before_compute_0 [label="out_sbuf_0", color="#666666"];
-            before_load_L_0 -> before_compute_0 [label="L_sbuf_0", color="#666666"];
-            before_load_R_0 -> before_compute_0 [label="R_sbuf_0", color="#666666"];
-            before_compute_0 -> before_store_0 [label="out_sbuf_0", color="#666666"];
+            before_alloc_L_0 -> before_load_L_0 [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_alloc_R_0 -> before_load_R_0 [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_alloc_out_0 -> before_compute_0 [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            before_load_L_0 -> before_compute_0 [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_load_R_0 -> before_compute_0 [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_compute_0 -> before_store_0 [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
         }
 
         // Subgraph 1: Output[0,1]
@@ -53,12 +53,12 @@ digraph MatmulComputeGraphDataReuse {
             before_compute_1 [label="matmul(L_sbuf_1,\nR_sbuf_1, out_sbuf_1)", fillcolor="#A8D8EA"];
             before_store_1 [label="store(out_sbuf_1,\ndst=Output[0,1])", fillcolor="#A8E6CF"];
 
-            before_alloc_L_1 -> before_load_L_1 [label="L_sbuf_1", color="#666666"];
-            before_alloc_R_1 -> before_load_R_1 [label="R_sbuf_1", color="#666666"];
-            before_alloc_out_1 -> before_compute_1 [label="out_sbuf_1", color="#666666"];
-            before_load_L_1 -> before_compute_1 [label="L_sbuf_1", color="#666666"];
-            before_load_R_1 -> before_compute_1 [label="R_sbuf_1", color="#666666"];
-            before_compute_1 -> before_store_1 [label="out_sbuf_1", color="#666666"];
+            before_alloc_L_1 -> before_load_L_1 [label="L_sbuf_1\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_alloc_R_1 -> before_load_R_1 [label="R_sbuf_1\nbuf:(0->1) K:(0->1) N:(1->2)", color="#666666"];
+            before_alloc_out_1 -> before_compute_1 [label="out_sbuf_1\nbuf:(0->1) M:(0->1) N:(1->2)", color="#666666"];
+            before_load_L_1 -> before_compute_1 [label="L_sbuf_1\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_load_R_1 -> before_compute_1 [label="R_sbuf_1\nbuf:(0->1) K:(0->1) N:(1->2)", color="#666666"];
+            before_compute_1 -> before_store_1 [label="out_sbuf_1\nbuf:(0->1) M:(0->1) N:(1->2)", color="#666666"];
         }
     }
 
@@ -95,19 +95,19 @@ digraph MatmulComputeGraphDataReuse {
             store_01 [label="store(out_sbuf_1,\ndst=Output[0,1])", fillcolor="#A8E6CF"];
 
             // Allocate edges
-            alloc_L_shared -> load_L_shared [label="L_sbuf_0", color="#666666"];
-            alloc_R_00 -> load_R_00 [label="R_sbuf_0", color="#666666"];
-            alloc_out_00 -> compute_00 [label="out_sbuf_0", color="#666666"];
-            alloc_R_01 -> load_R_01 [label="R_sbuf_1", color="#666666"];
-            alloc_out_01 -> compute_01 [label="out_sbuf_1", color="#666666"];
+            alloc_L_shared -> load_L_shared [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            alloc_R_00 -> load_R_00 [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            alloc_out_00 -> compute_00 [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            alloc_R_01 -> load_R_01 [label="R_sbuf_1\nbuf:(0->1) K:(0->1) N:(1->2)", color="#666666"];
+            alloc_out_01 -> compute_01 [label="out_sbuf_1\nbuf:(0->1) M:(0->1) N:(1->2)", color="#666666"];
 
             // Data flow edges
-            load_L_shared -> compute_00 [label="L_sbuf_0", color="#666666", penwidth=2];
-            load_L_shared -> compute_01 [label="L_sbuf_0", color="#666666", penwidth=2];
-            load_R_00 -> compute_00 [label="R_sbuf_0", color="#666666"];
-            load_R_01 -> compute_01 [label="R_sbuf_1", color="#666666"];
-            compute_00 -> store_00 [label="out_sbuf_0", color="#666666"];
-            compute_01 -> store_01 [label="out_sbuf_1", color="#666666"];
+            load_L_shared -> compute_00 [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666", penwidth=2];
+            load_L_shared -> compute_01 [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666", penwidth=2];
+            load_R_00 -> compute_00 [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            load_R_01 -> compute_01 [label="R_sbuf_1\nbuf:(0->1) K:(0->1) N:(1->2)", color="#666666"];
+            compute_00 -> store_00 [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            compute_01 -> store_01 [label="out_sbuf_1\nbuf:(0->1) M:(0->1) N:(1->2)", color="#666666"];
         }
     }
 

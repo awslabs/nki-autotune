@@ -9,7 +9,7 @@ digraph MatmulComputeGraphFastWeightLoad {
     edge [fontname="Arial", fontsize=9];
 
     // Title
-    label="Fast Weight Load Transform: Before and After\nSwap stationary/moving when M is small (M=64)\nR becomes stationary for 4× faster load";
+    label="Fast Weight Load Transform: Before and After\nSwap stationary/moving when M is small (M=64)\nR becomes stationary for 4x faster load\nEdge labels show tensor indices: axis:(start,end)";
     labelloc="t";
     fontsize=14;
     fontname="Arial Bold";
@@ -38,14 +38,14 @@ digraph MatmulComputeGraphFastWeightLoad {
 
             before_store [label="store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
 
-            before_alloc_L -> before_load_L [label="L_sbuf_0", color="#666666"];
-            before_alloc_R -> before_load_R [label="R_sbuf_0", color="#666666"];
-            before_alloc_L_T -> before_transpose_L [label="L_T_0", color="#666666"];
-            before_alloc_out -> before_compute [label="out_sbuf_0", color="#666666"];
-            before_load_L -> before_transpose_L [label="L_sbuf_0", color="#666666"];
-            before_transpose_L -> before_compute [label="L_T_0", color="#666666"];
-            before_load_R -> before_compute [label="R_sbuf_0", color="#666666"];
-            before_compute -> before_store [label="out_sbuf_0", color="#666666"];
+            before_alloc_L -> before_load_L [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_alloc_R -> before_load_R [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_alloc_L_T -> before_transpose_L [label="L_T_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            before_alloc_out -> before_compute [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            before_load_L -> before_transpose_L [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_transpose_L -> before_compute [label="L_T_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            before_load_R -> before_compute [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_compute -> before_store [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
         }
     }
 
@@ -70,22 +70,22 @@ digraph MatmulComputeGraphFastWeightLoad {
 
             transpose_L [label="L_T_0 =\ntranspose(L_sbuf_0)\n[128, 64]", fillcolor="#DDA0DD"];
 
-            compute [label="nc_matmul(R_sbuf_0, L_T_0,\nresult=temp_0)\n(R stationary: fast, 4×)\nResult: [512, 64]", fillcolor="#A8D8EA", penwidth=2];
+            compute [label="nc_matmul(R_sbuf_0, L_T_0,\nresult=temp_0)\n(R stationary: fast, 4x)\nResult: [512, 64]", fillcolor="#A8D8EA", penwidth=2];
 
             transpose_out [label="out_sbuf_0 =\ntranspose(temp_0)\n[64, 512]\n(extra cost from swap)", fillcolor="#DDA0DD", penwidth=2];
 
             store [label="store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
 
-            alloc_L -> load_L [label="L_sbuf_0", color="#666666"];
-            alloc_R -> load_R [label="R_sbuf_0", color="#666666"];
-            alloc_L_T -> transpose_L [label="L_T_0", color="#666666"];
-            alloc_temp -> compute [label="temp_0", color="#666666"];
-            alloc_out -> transpose_out [label="out_sbuf_0", color="#666666"];
-            load_L -> transpose_L [label="L_sbuf_0", color="#666666"];
-            transpose_L -> compute [label="L_T_0", color="#666666"];
-            load_R -> compute [label="R_sbuf_0", color="#666666"];
-            compute -> transpose_out [label="temp_0", color="#666666"];
-            transpose_out -> store [label="out_sbuf_0", color="#666666"];
+            alloc_L -> load_L [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            alloc_R -> load_R [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            alloc_L_T -> transpose_L [label="L_T_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            alloc_temp -> compute [label="temp_0\nbuf:(0->1) N:(0->1) M:(0->1)", color="#666666"];
+            alloc_out -> transpose_out [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            load_L -> transpose_L [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            transpose_L -> compute [label="L_T_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            load_R -> compute [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            compute -> transpose_out [label="temp_0\nbuf:(0->1) N:(0->1) M:(0->1)", color="#666666"];
+            transpose_out -> store [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
         }
     }
 
