@@ -9,7 +9,7 @@ digraph MatmulComputeGraphLoadCoalescing {
     edge [fontname="Arial", fontsize=9];
 
     // Title
-    label="Load Coalescing Transform: Before and After\nCoalesce L loads from Subgraphs 0 & 2 into one large DMA transfer";
+    label="Load Coalescing Transform: Before and After\nCoalesce L loads from Subgraphs 0 & 2 into one large DMA transfer\nEdge labels show tensor indices: axis:(start,end)";
     labelloc="t";
     fontsize=14;
     fontname="Arial Bold";
@@ -33,12 +33,12 @@ digraph MatmulComputeGraphLoadCoalescing {
             before_compute_0 [label="matmul(L_sbuf_0,\nR_sbuf_0, out_sbuf_0)", fillcolor="#A8D8EA"];
             before_store_0 [label="store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
 
-            before_alloc_L_0 -> before_load_L_0 [label="L_sbuf_0", color="#666666"];
-            before_alloc_R_0 -> before_load_R_0 [label="R_sbuf_0", color="#666666"];
-            before_alloc_out_0 -> before_compute_0 [label="out_sbuf_0", color="#666666"];
-            before_load_L_0 -> before_compute_0 [label="L_sbuf_0", color="#666666"];
-            before_load_R_0 -> before_compute_0 [label="R_sbuf_0", color="#666666"];
-            before_compute_0 -> before_store_0 [label="out_sbuf_0", color="#666666"];
+            before_alloc_L_0 -> before_load_L_0 [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_alloc_R_0 -> before_load_R_0 [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_alloc_out_0 -> before_compute_0 [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            before_load_L_0 -> before_compute_0 [label="L_sbuf_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_load_R_0 -> before_compute_0 [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_compute_0 -> before_store_0 [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
         }
 
         // Subgraph 2: Output[1,0]
@@ -53,12 +53,12 @@ digraph MatmulComputeGraphLoadCoalescing {
             before_compute_2 [label="matmul(L_sbuf_2,\nR_sbuf_2, out_sbuf_2)", fillcolor="#A8D8EA"];
             before_store_2 [label="store(out_sbuf_2,\ndst=Output[1,0])", fillcolor="#A8E6CF"];
 
-            before_alloc_L_2 -> before_load_L_2 [label="L_sbuf_2", color="#666666"];
-            before_alloc_R_2 -> before_load_R_2 [label="R_sbuf_2", color="#666666"];
-            before_alloc_out_2 -> before_compute_2 [label="out_sbuf_2", color="#666666"];
-            before_load_L_2 -> before_compute_2 [label="L_sbuf_2", color="#666666"];
-            before_load_R_2 -> before_compute_2 [label="R_sbuf_2", color="#666666"];
-            before_compute_2 -> before_store_2 [label="out_sbuf_2", color="#666666"];
+            before_alloc_L_2 -> before_load_L_2 [label="L_sbuf_2\nbuf:(0->1) M:(1->2) K:(0->1)", color="#666666"];
+            before_alloc_R_2 -> before_load_R_2 [label="R_sbuf_2\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_alloc_out_2 -> before_compute_2 [label="out_sbuf_2\nbuf:(0->1) M:(1->2) N:(0->1)", color="#666666"];
+            before_load_L_2 -> before_compute_2 [label="L_sbuf_2\nbuf:(0->1) M:(1->2) K:(0->1)", color="#666666"];
+            before_load_R_2 -> before_compute_2 [label="R_sbuf_2\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_compute_2 -> before_store_2 [label="out_sbuf_2\nbuf:(0->1) M:(1->2) N:(0->1)", color="#666666"];
         }
     }
 
@@ -98,19 +98,19 @@ digraph MatmulComputeGraphLoadCoalescing {
                              fillcolor="#A8E6CF", penwidth=2];
 
             // Allocate edges
-            alloc_L_coalesced -> load_L_coalesced [label="L_sbuf_coalesced", color="#666666"];
-            alloc_R_0 -> load_R_0 [label="R_sbuf_0", color="#666666"];
-            alloc_R_2 -> load_R_2 [label="R_sbuf_2", color="#666666"];
-            alloc_out_coalesced -> compute_0 [label="out_sbuf_coalesced", color="#666666"];
-            alloc_out_coalesced -> compute_2 [label="out_sbuf_coalesced", color="#666666"];
+            alloc_L_coalesced -> load_L_coalesced [label="L_sbuf_coalesced\nbuf:(0->2) M:(0->2) K:(0->1)", color="#666666"];
+            alloc_R_0 -> load_R_0 [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            alloc_R_2 -> load_R_2 [label="R_sbuf_2\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            alloc_out_coalesced -> compute_0 [label="out_sbuf_coalesced\nbuf:(0->2) M:(0->2) N:(0->1)", color="#666666"];
+            alloc_out_coalesced -> compute_2 [label="out_sbuf_coalesced\nbuf:(0->2) M:(0->2) N:(0->1)", color="#666666"];
 
             // Data flow
-            load_L_coalesced -> compute_0 [label="L_sbuf_coalesced[0,:]", color="#666666", penwidth=2];
-            load_L_coalesced -> compute_2 [label="L_sbuf_coalesced[1,:]", color="#666666", penwidth=2];
-            load_R_0 -> compute_0 [label="R_sbuf_0", color="#666666"];
-            load_R_2 -> compute_2 [label="R_sbuf_2", color="#666666"];
-            compute_0 -> store_coalesced [label="out_sbuf_coalesced[0,:]", color="#666666"];
-            compute_2 -> store_coalesced [label="out_sbuf_coalesced[1,:]", color="#666666"];
+            load_L_coalesced -> compute_0 [label="L_sbuf_coalesced[0,:]\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666", penwidth=2];
+            load_L_coalesced -> compute_2 [label="L_sbuf_coalesced[1,:]\nbuf:(1->2) M:(1->2) K:(0->1)", color="#666666", penwidth=2];
+            load_R_0 -> compute_0 [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            load_R_2 -> compute_2 [label="R_sbuf_2\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            compute_0 -> store_coalesced [label="out_sbuf_coalesced[0,:]\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            compute_2 -> store_coalesced [label="out_sbuf_coalesced[1,:]\nbuf:(1->2) M:(1->2) N:(0->1)", color="#666666"];
         }
     }
 

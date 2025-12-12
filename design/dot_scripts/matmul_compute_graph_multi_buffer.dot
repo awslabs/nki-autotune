@@ -9,7 +9,7 @@ digraph MatmulComputeGraphMultiBuffer {
     edge [fontname="Arial", fontsize=9];
 
     // Title
-    label="Multi-Buffer Transform: Before and After\nAllocate L_sbuf_multi once, partition for parallel subgraphs 1 & 2";
+    label="Multi-Buffer Transform: Before and After\nAllocate L_sbuf_multi once, partition for parallel subgraphs 1 & 2\nEdge labels show tensor indices: axis:(start,end)";
     labelloc="t";
     fontsize=14;
     fontname="Arial Bold";
@@ -33,12 +33,12 @@ digraph MatmulComputeGraphMultiBuffer {
             before_compute_1 [label="matmul(L_sbuf_1,\nR_sbuf_1, out_sbuf_1)", fillcolor="#A8D8EA"];
             before_store_1 [label="store(out_sbuf_1,\ndst=Output[0,1])", fillcolor="#A8E6CF"];
 
-            before_alloc_L_1 -> before_load_L_1 [label="L_sbuf_1", color="#666666"];
-            before_alloc_R_1 -> before_load_R_1 [label="R_sbuf_1", color="#666666"];
-            before_alloc_out_1 -> before_compute_1 [label="out_sbuf_1", color="#666666"];
-            before_load_L_1 -> before_compute_1 [label="L_sbuf_1", color="#666666"];
-            before_load_R_1 -> before_compute_1 [label="R_sbuf_1", color="#666666"];
-            before_compute_1 -> before_store_1 [label="out_sbuf_1", color="#666666"];
+            before_alloc_L_1 -> before_load_L_1 [label="L_sbuf_1\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_alloc_R_1 -> before_load_R_1 [label="R_sbuf_1\nbuf:(0->1) K:(0->1) N:(1->2)", color="#666666"];
+            before_alloc_out_1 -> before_compute_1 [label="out_sbuf_1\nbuf:(0->1) M:(0->1) N:(1->2)", color="#666666"];
+            before_load_L_1 -> before_compute_1 [label="L_sbuf_1\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            before_load_R_1 -> before_compute_1 [label="R_sbuf_1\nbuf:(0->1) K:(0->1) N:(1->2)", color="#666666"];
+            before_compute_1 -> before_store_1 [label="out_sbuf_1\nbuf:(0->1) M:(0->1) N:(1->2)", color="#666666"];
         }
 
         // Subgraph 2: Output[1,0]
@@ -53,12 +53,12 @@ digraph MatmulComputeGraphMultiBuffer {
             before_compute_2 [label="matmul(L_sbuf_2,\nR_sbuf_2, out_sbuf_2)", fillcolor="#A8D8EA"];
             before_store_2 [label="store(out_sbuf_2,\ndst=Output[1,0])", fillcolor="#A8E6CF"];
 
-            before_alloc_L_2 -> before_load_L_2 [label="L_sbuf_2", color="#666666"];
-            before_alloc_R_2 -> before_load_R_2 [label="R_sbuf_2", color="#666666"];
-            before_alloc_out_2 -> before_compute_2 [label="out_sbuf_2", color="#666666"];
-            before_load_L_2 -> before_compute_2 [label="L_sbuf_2", color="#666666"];
-            before_load_R_2 -> before_compute_2 [label="R_sbuf_2", color="#666666"];
-            before_compute_2 -> before_store_2 [label="out_sbuf_2", color="#666666"];
+            before_alloc_L_2 -> before_load_L_2 [label="L_sbuf_2\nbuf:(0->1) M:(1->2) K:(0->1)", color="#666666"];
+            before_alloc_R_2 -> before_load_R_2 [label="R_sbuf_2\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_alloc_out_2 -> before_compute_2 [label="out_sbuf_2\nbuf:(0->1) M:(1->2) N:(0->1)", color="#666666"];
+            before_load_L_2 -> before_compute_2 [label="L_sbuf_2\nbuf:(0->1) M:(1->2) K:(0->1)", color="#666666"];
+            before_load_R_2 -> before_compute_2 [label="R_sbuf_2\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            before_compute_2 -> before_store_2 [label="out_sbuf_2\nbuf:(0->1) M:(1->2) N:(0->1)", color="#666666"];
         }
     }
 
@@ -95,22 +95,22 @@ digraph MatmulComputeGraphMultiBuffer {
             store_2 [label="store(out_sbuf_2,\ndst=Output[1,0])", fillcolor="#A8E6CF"];
 
             // Allocate edges (multi-buffer connects to both loads)
-            alloc_L_multi -> load_L_1 [label="L_sbuf_multi", color="#666666", penwidth=2];
-            alloc_L_multi -> load_L_2 [label="L_sbuf_multi", color="#666666", penwidth=2];
-            alloc_R_1 -> load_R_1 [label="R_sbuf_1", color="#666666"];
-            alloc_out_1 -> compute_1 [label="out_sbuf_1", color="#666666"];
-            alloc_R_2 -> load_R_2 [label="R_sbuf_2", color="#666666"];
-            alloc_out_2 -> compute_2 [label="out_sbuf_2", color="#666666"];
+            alloc_L_multi -> load_L_1 [label="L_sbuf_multi\nbuf:(0->2) M:(0->1) K:(0->1)", color="#666666", penwidth=2];
+            alloc_L_multi -> load_L_2 [label="L_sbuf_multi\nbuf:(0->2) M:(1->2) K:(0->1)", color="#666666", penwidth=2];
+            alloc_R_1 -> load_R_1 [label="R_sbuf_1\nbuf:(0->1) K:(0->1) N:(1->2)", color="#666666"];
+            alloc_out_1 -> compute_1 [label="out_sbuf_1\nbuf:(0->1) M:(0->1) N:(1->2)", color="#666666"];
+            alloc_R_2 -> load_R_2 [label="R_sbuf_2\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            alloc_out_2 -> compute_2 [label="out_sbuf_2\nbuf:(0->1) M:(1->2) N:(0->1)", color="#666666"];
 
             // Internal edges for sg1
-            load_L_1 -> compute_1 [label="L_sbuf_multi[0]", color="#666666"];
-            load_R_1 -> compute_1 [label="R_sbuf_1", color="#666666"];
-            compute_1 -> store_1 [label="out_sbuf_1", color="#666666"];
+            load_L_1 -> compute_1 [label="L_sbuf_multi[0]\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            load_R_1 -> compute_1 [label="R_sbuf_1\nbuf:(0->1) K:(0->1) N:(1->2)", color="#666666"];
+            compute_1 -> store_1 [label="out_sbuf_1\nbuf:(0->1) M:(0->1) N:(1->2)", color="#666666"];
 
             // Internal edges for sg2
-            load_L_2 -> compute_2 [label="L_sbuf_multi[1]", color="#666666"];
-            load_R_2 -> compute_2 [label="R_sbuf_2", color="#666666"];
-            compute_2 -> store_2 [label="out_sbuf_2", color="#666666"];
+            load_L_2 -> compute_2 [label="L_sbuf_multi[1]\nbuf:(1->2) M:(1->2) K:(0->1)", color="#666666"];
+            load_R_2 -> compute_2 [label="R_sbuf_2\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            compute_2 -> store_2 [label="out_sbuf_2\nbuf:(0->1) M:(1->2) N:(0->1)", color="#666666"];
         }
     }
 
