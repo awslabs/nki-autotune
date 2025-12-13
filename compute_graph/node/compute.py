@@ -113,7 +113,7 @@ class Activation(Node):
 
         args = [f"op={self.op}", f"data={data}"]
 
-        if self.reduce_op is not None and "reduce_res" in self.arg_to_tensor:
+        if self.reduce_op and "reduce_res" in self.arg_to_tensor:
             reduce_res = self.arg_to_tensor["reduce_res"].name
             args.append(f"reduce_op={self.reduce_op}")
             args.append(f"reduce_res={reduce_res}")
@@ -124,13 +124,13 @@ class Activation(Node):
     def __repr__(self) -> str:
         data_str = self._format_tensor("data")
         args = [f"op={self.op}", f"data={data_str}"]
-        result = self._format_tensor("dest")
-        if "reduce_res" in self.arg_to_var and self.arg_to_var["reduce_res"]:
+        if self.reduce_op:
             reduce_res_str = self._format_tensor("reduce_res")
             args.append(f"reduce_op={self.reduce_op}")
             args.append(f"reduce_res={reduce_res_str}")
         args_str = ", ".join(args)
-        return f"{result} = Activation({args_str})"
+        dest_str = self._format_tensor("dest")
+        return f"{dest_str} = Activation({args_str})"
 
 
 class Transpose(Node):

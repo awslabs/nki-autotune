@@ -2,10 +2,9 @@ import logging
 import os
 import subprocess
 
-from compute_graph.graph import ComputeGraph, SubGraph
-from compute_graph.memory import HBM
-from compute_graph.node.hbm_tensor import HBMTensor
-from compute_graph.node.memory import Allocate, Load, Store
+from compute_graph.graph import ComputeGraph
+from compute_graph.memory import Memory
+from compute_graph.node.memory import Allocate, HBMInput, Load, Store
 from compute_graph.node.node import Node
 
 
@@ -38,13 +37,16 @@ def setup_logging(log_file: str, level: int = logging.DEBUG, msg_width: int = 30
     logging.root.setLevel(level)
 
 
-NODE_TYPE_COLORS: dict[str, str] = {"load": "#FFEAA7", "compute": "#A8D8EA", "store": "#A8E6CF", "allocate": "#E8E8E8"}
-
-CLUSTER_COLORS: dict[str, str] = {"hbm": "#FF6B6B", "nodes": "#666666"}
+NODE_TYPE_COLORS: dict[str, str] = {
+    "load": "#FFEAA7",
+    "compute": "#A8D8EA",
+    "store": "#A8E6CF",
+    "allocate": "#E8E8E8",
+    "hbm_input": "#FFB6C1",
+}
+MEMORY_COLORS: dict[str, str] = {"HBM": "#FFB6C1", "SBUF": "#98FB98", "PSUM": "#87CEEB"}
 
 DEFAULT_NODE_COLOR = "#E8E8E8"
-HBM_INPUT_COLOR = "#FFB6C1"
-HBM_OUTPUT_COLOR = "#98FB98"
 
 
 def _escape_dot_string(s: str) -> str:
@@ -58,63 +60,6 @@ def _escape_dot_string(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-def _split_top_level_args(args_str: str) -> list[str]:
-    """Split arguments string at top-level commas only (respecting bracket nesting)."""
-    args = []
-    current = []
-    depth = 0
-    for char in args_str:
-        if char in "([{":
-            depth += 1
-            current.append(char)
-        elif char in ")]}":
-            depth -= 1
-            current.append(char)
-        elif char == "," and depth == 0:
-            args.append("".join(current).strip())
-            current = []
-        else:
-            current.append(char)
-    if current:
-        args.append("".join(current).strip())
-    return args
-
-
-def _wrap_label(label: str, max_width: int = 50) -> str:
-    """Wrap long label strings into multiple lines for better readability.
-
-    Args:
-        label: The label string to wrap
-        max_width: Maximum characters per line
-
-    Returns:
-        Label with newlines inserted at logical break points
-    """
-    result = label
-    if " = " in label:
-        parts = label.split(" = ", 1)
-        dest_part = parts[0]
-        op_part = parts[1]
-        if len(op_part) > max_width:
-            paren_idx = op_part.find("(")
-            if paren_idx != -1:
-                op_name = op_part[: paren_idx + 1]
-                args_part = op_part[paren_idx + 1 : -1]
-                args = _split_top_level_args(args_part)
-                wrapped_args = ",\n  ".join(args)
-                op_part = f"{op_name}\n  {wrapped_args})"
-        result = f"{dest_part} =\n{op_part}"
-    elif len(label) > max_width:
-        paren_idx = label.find("(")
-        if paren_idx != -1:
-            op_name = label[: paren_idx + 1]
-            args_part = label[paren_idx + 1 : -1]
-            args = _split_top_level_args(args_part)
-            wrapped_args = ",\n  ".join(args)
-            result = f"{op_name}\n  {wrapped_args})"
-    return result
-
-
 def _get_node_type(node_data: Node) -> str:
     """
     Args:
@@ -123,52 +68,79 @@ def _get_node_type(node_data: Node) -> str:
     Returns:
         Node type string for coloring
     """
+    node_type_map: dict[type, str] = {Load: "load", Store: "store", Allocate: "allocate", HBMInput: "hbm_input"}
     node_type = "compute"
-    if isinstance(node_data, Load):
-        node_type = "load"
-    elif isinstance(node_data, Store):
-        node_type = "store"
-    elif isinstance(node_data, Allocate):
-        node_type = "allocate"
+    for cls, type_name in node_type_map.items():
+        if isinstance(node_data, cls):
+            node_type = type_name
+            break
     return node_type
 
 
-def _format_node(node_data: Node) -> tuple[str, str]:
+def _lookup_tensor(var: str, hbm: Memory, sbuf: Memory, psum: Memory) -> object | None:
+    """Look up tensor by variable name in hbm, sbuf, or psum."""
+    result = None
+    for memory in [hbm, sbuf, psum]:
+        if var in memory.tensors:
+            result = memory.tensors[var]
+            break
+    return result
+
+
+def _format_node(node_data: Node, hbm: Memory, sbuf: Memory, psum: Memory) -> tuple[str, str]:
     """
     Args:
         node_data: Node object (MemoryOp or ComputeOp)
+        hbm: HBM memory containing tensors
+        sbuf: SBUF memory containing tensors
+        psum: PSUM memory containing tensors
 
     Returns:
         Tuple of (label, color) for the node
     """
-    label = _escape_dot_string(_wrap_label(repr(node_data)))
+    node_type = type(node_data).__name__
+    args = []
+    for arg in node_data.read_args + node_data.write_args:
+        var = node_data.arg_to_var[arg]
+        tensor = _lookup_tensor(var, hbm, sbuf, psum)
+        display_val = tensor if tensor else var
+        args.append(f"{arg}={display_val}")
+    args_str = "\\n".join(args)
+    label = f"{node_type}\\n{args_str}"
     color = NODE_TYPE_COLORS.get(_get_node_type(node_data), DEFAULT_NODE_COLOR)
     return label, color
 
 
-def _format_hbm_tensor(hbm_tensor: HBMTensor, is_input: bool = True) -> tuple[str, str]:
-    """
-    Args:
-        hbm_tensor: Tensor object
-        is_input: Whether this is an input tensor (affects color and label)
+def _format_edge_label(edge_data: dict) -> str:
+    """Format edge label showing from_arg -> to_arg and tensor indices."""
+    from_arg = edge_data.get("from_arg", "")
+    to_arg = edge_data.get("to_arg", "")
+    tensor_indices = edge_data.get("tensor_indices", ())
 
-    Returns:
-        Tuple of (label, color) for the HBM tensor node
-    """
-    suffix = " (Input)" if is_input else " (Output)"
-    label = _escape_dot_string(repr(hbm_tensor) + suffix)
-    color = HBM_INPUT_COLOR if is_input else HBM_OUTPUT_COLOR
-    return label, color
+    lines = [f"{from_arg} -> {to_arg}"]
+    if tensor_indices:
+        indices_str = ", ".join(f"{tr.start_tile}:{tr.end_tile}" for tr in tensor_indices)
+        lines.append(f"[{indices_str}]")
+    return "\\n".join(lines)
 
 
 def nodes_to_dot(
-    nodes: list[Node], edges: list[tuple[int, int]], node_prefix: str = "node", indent: str = "    "
+    nodes: list[Node],
+    edges: list[tuple[int, int, dict]],
+    hbm: Memory,
+    sbuf: Memory,
+    psum: Memory,
+    node_prefix: str = "node",
+    indent: str = "    ",
 ) -> list[str]:
     """Generate DOT lines for a set of nodes and edges.
 
     Args:
         nodes: List of nodes to visualize
-        edges: List of (source_idx, target_idx) edges
+        edges: List of (source_idx, target_idx, edge_data) tuples
+        hbm: HBM memory containing tensors
+        sbuf: SBUF memory containing tensors
+        psum: PSUM memory containing tensors
         node_prefix: Prefix for node IDs (e.g., "node" -> "node_0", "node_1")
         indent: Indentation string for DOT lines
 
@@ -177,58 +149,37 @@ def nodes_to_dot(
     """
     lines = []
 
-    # Generate nodes
     for node_id, node_data in enumerate(nodes):
-        node_label, node_color = _format_node(node_data)
-        lines.append(f'{indent}{node_prefix}_{node_id} [label="{node_label}", fillcolor="{node_color}"];')
+        node_label, node_color = _format_node(node_data, hbm, sbuf, psum)
+        lines.append(f'{indent}{node_prefix}_{node_id} [label="[{node_id}] {node_label}", fillcolor="{node_color}"];')
 
     lines.append(f"{indent}")
 
-    # Generate edges
-    for source, target in edges:
-        lines.append(f"{indent}{node_prefix}_{source} -> {node_prefix}_{target};")
+    for source, target, edge_data in edges:
+        edge_label = _format_edge_label(edge_data)
+        lines.append(f'{indent}{node_prefix}_{source} -> {node_prefix}_{target} [label="{edge_label}"];')
 
     return lines
 
 
-def _hbm_to_dot(hbm: HBM, indent: str = "    ") -> list[str]:
-    """Generate DOT lines for HBM input/output tensors in a single cluster.
+def _memory_to_dot(memory: Memory, indent: str = "    ") -> list[str]:
+    """Generate DOT lines for a memory cluster showing its tensors."""
+    if not memory.tensors:
+        return []
 
-    Args:
-        hbm: HBM object containing input and output tensors
-        indent: Indentation string for DOT lines
-
-    Returns:
-        List of DOT format lines for unified HBM cluster
-    """
     lines = []
+    cluster_id = memory.location.lower()
+    color = MEMORY_COLORS.get(memory.location, DEFAULT_NODE_COLOR)
 
-    if not hbm.input_tensors and not hbm.output_tensors:
-        return lines
-
-    lines.append(f"{indent}subgraph cluster_hbm {{")
-    lines.append(f'{indent}    label="HBM";')
+    lines.append(f"{indent}subgraph cluster_{cluster_id} {{")
+    lines.append(f'{indent}    label="{memory.location}";')
     lines.append(f'{indent}    style="rounded";')
-    lines.append(f'{indent}    color="{CLUSTER_COLORS["hbm"]}";')
+    lines.append(f'{indent}    color="{color}";')
     lines.append(f"{indent}    ")
 
-    num_inputs = len(hbm.input_tensors)
-    for idx, hbm_tensor in enumerate(hbm.input_tensors.values()):
-        node_label, node_color = _format_hbm_tensor(hbm_tensor, is_input=True)
-        lines.append(f'{indent}    hbm_input_{idx} [label="{node_label}", fillcolor="{node_color}"];')
-
-    num_outputs = len(hbm.output_tensors)
-    for idx, hbm_tensor in enumerate(hbm.output_tensors.values()):
-        node_label, node_color = _format_hbm_tensor(hbm_tensor, is_input=False)
-        lines.append(f'{indent}    hbm_output_{idx} [label="{node_label}", fillcolor="{node_color}"];')
-
-    lines.append(f"{indent}    ")
-    for i in range(num_inputs - 1):
-        lines.append(f"{indent}    hbm_input_{i} -> hbm_input_{i + 1} [style=invis];")
-    if num_inputs > 0 and num_outputs > 0:
-        lines.append(f"{indent}    hbm_input_{num_inputs - 1} -> hbm_output_0 [style=invis];")
-    for i in range(num_outputs - 1):
-        lines.append(f"{indent}    hbm_output_{i} -> hbm_output_{i + 1} [style=invis];")
+    for idx, tensor in enumerate(memory.tensors.values()):
+        tensor_label = _escape_dot_string(repr(tensor))
+        lines.append(f'{indent}    {cluster_id}_{idx} [label="{tensor_label}", fillcolor="{color}"];')
 
     lines.append(f"{indent}}}")
     lines.append(f"{indent}")
@@ -236,53 +187,11 @@ def _hbm_to_dot(hbm: HBM, indent: str = "    ") -> list[str]:
     return lines
 
 
-def _subgraphs_to_dot(subgraphs: list[SubGraph], indent: str = "    ") -> list[str]:
-    """Generate DOT lines for all subgraphs in a single figure.
-
-    Args:
-        subgraphs: List of SubGraph objects to visualize
-        indent: Indentation string for DOT lines
-
-    Returns:
-        List of DOT format lines for all subgraphs as clusters
-    """
-    lines = []
-
-    for subgraph in subgraphs:
-        node_prefix = f"sg{subgraph.index}_node"
-        lines.append(f"{indent}subgraph cluster_subgraph_{subgraph.index} {{")
-        lines.append(f'{indent}    label="Subgraph {subgraph.index}";')
-        lines.append(f'{indent}    style="rounded";')
-        lines.append(f'{indent}    color="{CLUSTER_COLORS["nodes"]}";')
-        lines.append(f"{indent}    ")
-        lines.extend(nodes_to_dot(subgraph.nodes, subgraph.edges, node_prefix=node_prefix, indent=f"{indent}    "))
-        lines.append(f"{indent}}}")
-        lines.append(f"{indent}")
-
-    return lines
-
-
-def all_subgraphs_to_dot(subgraphs: list[SubGraph], title: str) -> str:
-    """Generate complete DOT for all subgraphs in one figure.
-
-    Args:
-        subgraphs: List of SubGraph objects to visualize
-        title: Title for the combined visualization
-
-    Returns:
-        DOT format string for Graphviz rendering
-    """
-    lines = _dot_header(title)
-    lines.extend(_subgraphs_to_dot(subgraphs))
-    lines.append("}")
-    return "\n".join(lines)
-
-
 def _dot_header(title: str) -> list[str]:
     """Generate DOT header lines."""
     lines = [
         "digraph ComputeGraph {",
-        "    rankdir=TB;",
+        "    rankdir=LR;",
         '    bgcolor="white";',
         "    pad=0.5;",
         "    dpi=300;",
@@ -299,43 +208,24 @@ def _dot_header(title: str) -> list[str]:
     return lines
 
 
-def single_graph_to_dot(nodes: list[Node], edges: list[tuple[int, int]], title: str, hbm: HBM | None = None) -> str:
+def single_graph_to_dot(
+    nodes: list[Node], edges: list[tuple[int, int, dict]], title: str, hbm: Memory, sbuf: Memory, psum: Memory
+) -> str:
     """Generate complete DOT for a single graph (nodes + edges).
 
     Args:
         nodes: List of nodes to visualize
-        edges: List of (source_idx, target_idx) edges
+        edges: List of (source_idx, target_idx, edge_data) tuples
         title: Title for the graph visualization
-        hbm: Optional HBM object to show input/output tensors
+        hbm: HBM memory for tensor lookup
+        sbuf: SBUF memory for tensor lookup
+        psum: PSUM memory for tensor lookup
 
     Returns:
         DOT format string for Graphviz rendering
     """
     lines = _dot_header(title)
-
-    # Add HBM tensors if provided
-    if hbm is not None:
-        lines.extend(_hbm_to_dot(hbm))
-
-    # Add nodes and edges in a cluster
-    if nodes:
-        lines.append("    subgraph cluster_nodes {")
-        lines.append('        label="Nodes";')
-        lines.append('        style="rounded";')
-        lines.append('        color="#666666";')
-        lines.append("        ")
-        lines.extend(nodes_to_dot(nodes, edges, node_prefix="node", indent="        "))
-        lines.append("    }")
-        lines.append("    ")
-    else:
-        lines.extend(nodes_to_dot(nodes, edges, node_prefix="node", indent="    "))
-
-    if hbm is not None and nodes and hbm.input_tensors:
-        lines.append("    ")
-        for idx, node in enumerate(nodes):
-            if isinstance(node, Load):
-                lines.append(f"    hbm_input_0 -> node_{idx} [style=invis];")
-                break
+    lines.extend(nodes_to_dot(nodes, edges, hbm, sbuf, psum, node_prefix="node", indent="    "))
 
     lines.append("}")
     return "\n".join(lines)
@@ -387,10 +277,6 @@ def _save_dot_to_file(dot_script: str, output_file: str, keep_dot: bool = False)
 def save_graph(graph: ComputeGraph, output_dir: str, title: str, keep_dot: bool = False) -> None:
     """Save ComputeGraph visualization to output directory.
 
-    Saves:
-    - main_graph.png: The full graph with all operators and edges
-    - subgraph_{index}.png: Individual subgraph for each SubGraph
-
     Args:
         graph: ComputeGraph to visualize
         output_dir: Output directory for PNG files
@@ -399,12 +285,8 @@ def save_graph(graph: ComputeGraph, output_dir: str, title: str, keep_dot: bool 
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save main graph (ComputeGraph.operators and .edges)
-    main_dot = single_graph_to_dot(graph.nodes, graph.edges, title, graph.hbm)
-    _save_dot_to_file(main_dot, os.path.join(output_dir, "main_graph.png"), keep_dot)
+    nodes = [graph.nodes[node_id]["node"] for node_id in sorted(graph.nodes())]
+    edges = list(graph.edges(data=True))
 
-    # Save all subgraphs in one figure
-    if graph.subgraphs:
-        subgraphs_title = f"{title} - All Subgraphs"
-        subgraphs_dot = all_subgraphs_to_dot(graph.subgraphs, subgraphs_title)
-        _save_dot_to_file(subgraphs_dot, os.path.join(output_dir, "subgraphs.png"), keep_dot)
+    main_dot = single_graph_to_dot(nodes, edges, title, graph.hbm, graph.sbuf, graph.psum)
+    _save_dot_to_file(main_dot, os.path.join(output_dir, "main_graph.png"), keep_dot)

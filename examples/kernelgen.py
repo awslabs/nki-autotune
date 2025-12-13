@@ -109,4 +109,4 @@ def run_benchmark(
 if __name__ == "__main__":
     M, K, N = 256, 128, 128
     kernel_path, kernel_name, input_tensor_shapes = generate_kernel(M, K, N)
-    run_benchmark(kernel_path, kernel_name, input_tensor_shapes, mac_count=M * N * K)
+    # run_benchmark(kernel_path, kernel_name, input_tensor_shapes, mac_count=M * N * K)
