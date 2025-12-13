@@ -75,6 +75,15 @@ class Allocate(Node):
         return f"{self._format_tensor('tensor')} = Allocate(buffer={self.buffer})"
 
 
+class HBMInput(Node):
+    """Source node representing an HBM tensor input."""
+
+    def __init__(self, tensor: str) -> None:
+        super().__init__(
+            read_args=(), write_args=("tensor",), arg_to_axes={"tensor": ("A", "B")}, arg_to_var={"tensor": tensor}
+        )
+
+
 def _generate_hbm_indices(tensor: HBMTensor) -> str:
     """Generate index expressions for HBM tensor access.
 

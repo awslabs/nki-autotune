@@ -1,7 +1,8 @@
 import logging
 from collections import defaultdict, deque
+from typing import Any
 
-from compute_graph.graph import ComputeGraph, SubGraph
+from compute_graph.graph import ComputeGraph
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class NKICodegen:
 
         return "\n".join(lines)
 
-    def _generate_subgraph(self, subgraph: SubGraph) -> list[str]:
+    def _generate_subgraph(self, subgraph: Any) -> list[str]:
         """Generate code for a single subgraph using topological sort."""
         lines: list[str] = []
         lines.append(f"    # Subgraph {subgraph.index}")

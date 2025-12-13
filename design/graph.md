@@ -8,8 +8,8 @@ class ComputeGraph(nx.DiGraph):
     def add_op(self, node_id: int, node: Node) -> None:
         self.add_node(
             node_id,
-            in_args=node.in_args,
-            out_args=node.out_args,
+            read_args=node.read_args,
+            write_args=node.write_args,
             arg_to_axes=node.arg_to_axes,
             arg_to_var=node.arg_to_var)
 
@@ -21,15 +21,13 @@ class ComputeGraph(nx.DiGraph):
 
 ```python
 class Node:
-    in_args: tuple[str, ...]
-    out_args: tuple[str, ...]
+    read_args: tuple[str, ...] # read-only
+    write_args: tuple[str, ...] # Node modifies
     arg_to_axes: dict[str, tuple[str, ...]]
     arg_to_var: dict[str, str]
 
-class HBMInput(Node): ...   # in_args=[], out_args=["data"]
-class HBMOutput(Node): ...  # in_args=["data"], out_args=[]
-class Load(Node): ...       # in_args=["src"], out_args=["dest"]
-class Store(Node): ...      # in_args=["src"], out_args=["dest"]
+class Load(Node): ...       # read_args=["src"], write_args=["dest"]
+class Store(Node): ...      # read_args=["src"], write_args=["dest"]
 class Matmul(Node): ...     # lhs=[M,K], rhs=[K,N], dest=[M,N]
 ```
 

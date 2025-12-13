@@ -1,7 +1,7 @@
 import logging
 
-from compute_graph.buffer_tensor import BufferAxis, BufferTensor
-from compute_graph.node.hbm_tensor import HBMAxis, HBMTensor
+from compute_graph.buffer_tensor import BufferAxis
+from compute_graph.node.hbm_tensor import HBMAxis
 
 logger = logging.getLogger(__name__)
 
@@ -13,8 +13,8 @@ class Node:
         self,
         read_args: tuple[str, ...],
         write_args: tuple[str, ...],
-        arg_to_var: dict[str, str],
         arg_to_axes: dict[str, tuple[str, ...]],
+        arg_to_var: dict[str, str],
     ) -> None:
         """
         read_args: operator args to read
@@ -30,20 +30,19 @@ class Node:
             assert arg in arg_to_axes, f"Tensor arg {arg} is missing axis semantics"
             assert arg in arg_to_var, f"Tensor arg {arg} is missing variable name"
 
-        self.axis_specialization = self._populate_constant_axes()
-        self.arg_to_tensor: dict[str, HBMTensor | BufferTensor] = {}
+        self.axes = self._populate_constant_axes()
 
     def _populate_constant_axes(self) -> dict[str, BufferAxis | HBMAxis]:
-        axis_specialization: dict[str, BufferAxis | HBMAxis] = {}
+        axes: dict[str, BufferAxis | HBMAxis] = {}
         for arg in self.arg_to_axes:
             arg_axes = self.arg_to_axes[arg]
             for semantic in arg_axes:
                 try:
                     size = int(semantic)
-                    axis_specialization[semantic] = BufferAxis(name=semantic, size=size)
+                    axes[semantic] = BufferAxis(name=semantic, size=size)
                 except ValueError:
                     pass
-        return axis_specialization
+        return axes
 
     @property
     def read_vars(self) -> tuple[str, ...]:
@@ -59,75 +58,31 @@ class Node:
         specialized = True
         for arg in args:
             for axis in self.arg_to_axes[arg]:
-                if axis not in self.axis_specialization:
+                if axis not in self.axes:
                     specialized = False
         return specialized
 
-    def specialize(self, arg: str, tensor: BufferTensor | HBMTensor) -> None:
-        """Map operator symbolic axes to tensor's BufferAxis objects.
-
-        Args:
-            arg: The operator argument name (e.g., "lhs", "rhs", "data")
-            tensor: The BufferTensor providing concrete axis info
-        """
-        arg_to_axes = self.arg_to_axes[arg]
-        if len(tensor.axes) != len(arg_to_axes):
-            raise ValueError(
-                f"Shape mismatch for '{arg}': expected {len(arg_to_axes)} dimensions {arg_to_axes} "
-                f"but got {len(tensor.axes)} dimensions for shape {tensor.shape}"
-            )
-        for semantic, tensor_axis in zip(arg_to_axes, tensor.axes):
-            if semantic in self.axis_specialization:
-                expected_size = self.axis_specialization[semantic].size
-                if expected_size != tensor_axis.size:
-                    raise ValueError(
-                        f"Axis size conflict {arg}.{semantic}: "
-                        f"expected {expected_size}, got {tensor_axis.size} in {self}."
-                    )
-            else:
-                self.axis_specialization[semantic] = tensor_axis
-        self.arg_to_tensor[arg] = tensor
-
     def get_tensor_axes(self, arg: str) -> tuple[HBMAxis, ...] | tuple[BufferAxis, ...]:
-        """FIXME: pylance type warning"""
         arg_to_axes = self.arg_to_axes[arg]
         arg_axes: tuple[HBMAxis, ...] | tuple[BufferAxis, ...] = ()
         for semantic in arg_to_axes:
-            axis = self.axis_specialization[semantic]
+            axis = self.axes[semantic]
             arg_axes += (axis,)
         return arg_axes
-
-    def get_tensor_shape(self, arg: str) -> tuple[int, ...]:
-        """Get the shape of a tensor by looking up axis sizes."""
-        tensor = self.arg_to_tensor[arg]
-        return tensor.shape
 
     def codegen(self) -> str:
         """Generate NKI code for this node."""
         raise NotImplementedError(f"codegen is not implemented for {self}")
 
-    def clear_specialization(self) -> None:
-        self.axis_specialization = self._populate_constant_axes()
-        self.arg_to_tensor: dict[str, HBMTensor | BufferTensor] = {}
-
     def _format_tensor(self, arg: str) -> str:
         """Format tensor as 'name[axes]' showing sizes if specialized."""
-        if arg in self.arg_to_tensor:
-            tensor = self.arg_to_tensor[arg]
-            result = f"{tensor}"
-        else:
-            var = self.arg_to_var[arg]
-            axes = self.arg_to_axes[arg]
-            axis_strs = []
-            for axis in axes:
-                if axis in self.axis_specialization:
-                    axis_strs.append(f"{self.axis_specialization[axis].size}")
-                else:
-                    axis_strs.append(axis)
-            axis_str = ", ".join(axis_strs)
-            result = f"{var}[{axis_str}]"
-        return result
+        var = self.arg_to_var[arg]
+        return var
 
     def __repr__(self) -> str:
-        """String representation of the node."""
-        raise NotImplementedError(f"repr is not implemented for the base ComputeOp class.")
+        args = []
+        for arg in self.read_args:
+            args.append(f"{arg}={self.arg_to_var[arg]}")
+        for arg in self.write_args:
+            args.append(f"{arg}={self.arg_to_var[arg]}")
+        return f"{type(self).__name__}({', '.join(args)})"
