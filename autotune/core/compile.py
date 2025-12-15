@@ -5,8 +5,9 @@ import sys
 import types
 
 import numpy as np
-from neuronpy.core.compile import CompilationTarget, compile_to_neff, trace
-from neuronpy.runtime.spike import CompiledKernel
+from nkipy.core.compile import CompilationTarget, compile_to_neff, trace
+
+from nkipy.runtime import CompiledKernel
 
 from autotune.core.utils import split_file_info
 from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
@@ -93,7 +94,7 @@ def compile_kernel(
     compiler_flags: str,
     output_dir: str,
 ) -> str:
-    """Standalone function to create and compile a NKI or NeuronPy kernel"""
+    """Standalone function to create and compile a NKI or nkipy kernel"""
     kernel = get_kernel_by_name(kernel_name)
     if isinstance(kernel, types.FunctionType):
         traced_kernel = trace(kernel)

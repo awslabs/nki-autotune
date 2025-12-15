@@ -6,5 +6,5 @@ setup(
     description="NKI Autotune - Kernel optimization tools",
     packages=find_packages(),
     python_requires=">=3.10",
-    install_requires=["matplotlib", "dill", "pytest", "pre-commit", "neuronx-cc==2.*"],
+    install_requires=["numpy", "matplotlib", "networkx", "tabulate", "tqdm"],
 )
