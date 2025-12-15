@@ -1,4 +1,4 @@
-from neuronpy.runtime.spike import SpikeExecutor
+from nkipy.runtime import BaremetalExecutor, CompiledKernel
 
 from autotune.core.compile import create_spike_kernel, run_spike_kernel
 from autotune.core.job import ProfileJobs
@@ -16,7 +16,7 @@ def run_neuron_benchmarks(jobs: ProfileJobs, warmup: int, iters: int) -> None:
         jobs: ProfileJobs containing all jobs to run
         results: List of ProfileResult objects to update with benchmark results
     """
-    with SpikeExecutor(verbose=0) as spike:
+    with BaremetalExecutor(verbose=0) as spike:
         for job_index in jobs.jobs:
             job = jobs.jobs[job_index]
             # Skip if job already failed

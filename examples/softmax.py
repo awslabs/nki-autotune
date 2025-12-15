@@ -6,7 +6,7 @@ import sys
 from itertools import product
 
 import numpy as np
-from neuronpy.core.language import bfloat16
+from nkipy.core.language import bfloat16
 
 from autotune.core.benchmark import Benchmark
 from autotune.core.job import ProfileJobs
