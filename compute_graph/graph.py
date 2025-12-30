@@ -5,8 +5,7 @@ import networkx as nx
 from compute_graph.buffer_tensor import BufferAxis
 from compute_graph.memory import Memory
 from compute_graph.node.compute import Matmul, TileTranspose
-from compute_graph.node.hbm_tensor import create_hbm_tensor
-from compute_graph.node.memory import Allocate, HBMInput, Load, Store
+from compute_graph.node.memory import Allocate, HBMInput, Load
 from compute_graph.node.node import Node
 from compute_graph.tensor import Tensor, TileRange, create_tensor
 
@@ -36,27 +35,66 @@ class ComputeGraph(nx.DiGraph):
         operators = insert_tile_transpose(operators)
         self._trace(operators, output)
 
-        # parallel_axes = get_parallel_axes(self.hbm.input_tensors, self.hbm.output_tensors)
-        # logger.debug(f"parallel_axes = {parallel_axes}")
-        # num_shards = get_num_shards(self.hbm.input_tensors, parallel_axes, tile_size)
-        # shard_sbuf_tensors(self.sbuf, parallel_axes, num_shards, tile_size)
-        # logger.debug(self.sbuf)
-        # self.subgraphs: list[SubGraph] = []
-        # for graph_idx in range(num_shards):
-        #     subgraph = SubGraph(graph_idx, self.nodes, self.edges, parallel_axes, self.hbm, self.sbuf)
-        #     self.subgraphs.append(subgraph)
+    def _add_node(self, node: Node) -> int:
+        """Add a node to the graph and return its ID."""
+        node_id = len(self.nodes)
+        self.add_node(node_id, node=node)
+        return node_id
+
+    def _add_edge(
+        self, from_id: int, from_arg: str, to_id: int, to_arg: str, tensor_indices: tuple[TileRange, ...]
+    ) -> None:
+        """Add an edge between two nodes with argument and tensor index metadata."""
+        from_node = self.nodes[from_id]["node"]
+        to_node = self.nodes[to_id]["node"]
+
+        from_args = from_node.read_args + from_node.write_args
+        if from_arg not in from_args:
+            raise ValueError(f"from_arg '{from_arg}' not in node {from_id} args: {from_args}")
+
+        to_args = to_node.read_args + to_node.write_args
+        if to_arg not in to_args:
+            raise ValueError(f"to_arg '{to_arg}' not in node {to_id} args: {to_args}")
+
+        self.add_edge(from_id, to_id, from_arg=from_arg, to_arg=to_arg, tensor_indices=tensor_indices)
 
     def _trace(self, nodes: list[Node], output: str) -> None:
+        """Trace operators to build graph nodes and edges."""
         for node in nodes:
             logger.debug("-" * 10 + f"{node}" + "-" * 10)
-            self.resolve_read_args(node)
-            # ctx.resolve_write_args(node)
-            # ctx.add_node_with_edges(node)
-            # ctx.maybe_add_store(node, output)
-            break
+            read_producers = self.resolve_read_args(node)
+            write_allocates = self.resolve_write_args(node)
 
-    def resolve_read_args(self, node: Node) -> None:
-        """Resolve read arguments by looking up existing tensors or creating allocate+load from HBM."""
+            node_id = self._add_node(node)
+
+            for read_arg, producer_id in read_producers.items():
+                read_var = node.arg_to_var[read_arg]
+                tensor = self.sbuf.tensors.get(read_var) or self.psum.tensors.get(read_var)
+                assert tensor, f"Tensor {read_var} not found in sbuf or psum"
+                tensor_indices = tuple(TileRange(0, 1) for _ in range(tensor.num_axes))
+                producer_node: Node = self.nodes[producer_id]["node"]
+                from_arg = None
+                for wa in producer_node.write_args:
+                    if producer_node.arg_to_var[wa] == read_var:
+                        from_arg = wa
+                        break
+                assert from_arg, f"Could not find write_arg for {read_var} in producer {producer_node}"
+                self._add_edge(producer_id, from_arg, node_id, read_arg, tensor_indices)
+
+            for write_arg, allocate_id in write_allocates.items():
+                write_var = node.arg_to_var[write_arg]
+                tensor = self.sbuf.tensors.get(write_var) or self.psum.tensors.get(write_var)
+                assert tensor, f"Tensor {write_var} not found in sbuf or psum"
+                tensor_indices = tuple(TileRange(0, 1) for _ in range(tensor.num_axes))
+                self._add_edge(allocate_id, "tensor", node_id, write_arg, tensor_indices)
+
+            for write_arg in node.write_args:
+                write_var = node.arg_to_var[write_arg]
+                self.tensor_producer[write_var] = node_id
+
+    def resolve_read_args(self, node: Node) -> dict[str, int]:
+        """Resolve read arguments. Returns {read_arg: producer_node_id}."""
+        producers: dict[str, int] = {}
         for read_arg in node.read_args:
             read_var = node.arg_to_var[read_arg]
             logger.debug(f"Resolve read_arg {read_arg}={read_var}")
@@ -66,6 +104,29 @@ class ComputeGraph(nx.DiGraph):
                 read_tensor = self.psum.tensors[read_var]
             else:
                 read_tensor = self._load_from_hbm(node, read_arg)
+            logger.debug(f"read_tensor = {read_tensor}")
+            producers[read_arg] = self.tensor_producer[read_var]
+            arg_axes = node.arg_to_axes[read_arg]
+            for i, axis_name in enumerate(arg_axes):
+                if axis_name not in node.axes:
+                    node.axes[axis_name] = BufferAxis(name=axis_name, size=read_tensor.axes[i].size)
+        return producers
+
+    def resolve_write_args(self, node: Node) -> dict[str, int]:
+        """Resolve write arguments. Returns {write_arg: allocate_node_id} for newly allocated tensors only."""
+        allocates: dict[str, int] = {}
+        for write_arg in node.write_args:
+            write_var = node.arg_to_var[write_arg]
+            logger.debug(f"Resolve write_arg {write_arg}={write_var}")
+            if write_var in self.sbuf.tensors:
+                write_tensor = self.sbuf.tensors[write_var]
+            elif write_var in self.psum.tensors:
+                write_tensor = self.psum.tensors[write_var]
+            else:
+                write_tensor = self._allocate_tensor(node, write_arg, write_var)
+                allocates[write_arg] = self.tensor_producer[write_var]
+            logger.debug(f"write_tensor = {write_tensor}")
+        return allocates
 
     def _load_from_hbm(self, node: Node, read_arg: str) -> Tensor:
         """Create allocate+load operations to load tensor from HBM input."""
@@ -91,92 +152,18 @@ class ComputeGraph(nx.DiGraph):
         )
 
         self.tensor_producer[read_var] = load_id
-        logger.debug(self.tensor_producer)
         return sbuf_tensor
-
-    def _add_node(self, node: Node) -> int:
-        node_id = len(self.nodes)
-        self.add_node(node_id, node=node)
-        return node_id
-
-    def _add_edge(
-        self, from_id: int, from_arg: str, to_id: int, to_arg: str, tensor_indices: tuple[TileRange, ...]
-    ) -> None:
-        from_node = self.nodes[from_id]["node"]
-        to_node = self.nodes[to_id]["node"]
-
-        from_args = from_node.read_args + from_node.write_args
-        if from_arg not in from_args:
-            raise ValueError(f"from_arg '{from_arg}' not in node {from_id} args: {from_args}")
-
-        to_args = to_node.read_args + to_node.write_args
-        if to_arg not in to_args:
-            raise ValueError(f"to_arg '{to_arg}' not in node {to_id} args: {to_args}")
-
-        self.add_edge(from_id, to_id, from_arg=from_arg, to_arg=to_arg, tensor_indices=tensor_indices)
-
-
-class _TraceContext:
-    """Context for tracing operators and building the dependency graph."""
-
-    def __init__(self, hbm: Memory, sbuf: Memory) -> None:
-        self.hbm = hbm
-        self.sbuf = sbuf
-        self.tensor_producer: dict[str, int] = {}
-        self.all_nodes: list[Node] = []
-        self.edges: list[tuple[int, int]] = []
-
-    def resolve_write_args(self, node: Node) -> None:
-        """Resolve write arguments by looking up existing tensors or creating allocate."""
-        for write_arg in node.write_args:
-            write_var = node.arg_to_var[write_arg]
-            logger.debug(f"Resolve write_arg {write_arg}={write_var}")
-            if write_var in self.sbuf.tensors:
-                write_tensor = self.sbuf.tensors[write_var]
-            else:
-                write_tensor = self._allocate_tensor(node, write_arg, write_var)
-            node.specialize(write_arg, write_tensor)
-            logger.debug(f"{node}\n")
 
     def _allocate_tensor(self, node: Node, write_arg: str, write_var: str) -> Tensor:
         """Create allocate operation for a new tensor."""
+        arg_axes = node.arg_to_axes[write_arg]
+        shape = tuple(node.axes[axis_name].size for axis_name in arg_axes)
+        tensor = create_tensor(name=write_var, shape=shape, location="SBUF")
+        self.sbuf.add_tensor(tensor)
         allocate_op = Allocate(tensor=write_var, buffer="SBUF")
-        buffer_axes = node.get_tensor_axes(write_arg)
-        assert all(isinstance(ax, BufferAxis) for ax in buffer_axes)
-        write_tensor = Tensor(name=write_var, axes=buffer_axes, buffer="SBUF")  # type: ignore[arg-type]
-        self.sbuf.add_tensor(write_tensor)
-        allocate_op.specialize("tensor", write_tensor)
-        alloc_idx = append_node(self.all_nodes, allocate_op)
-        self.tensor_producer[write_var] = alloc_idx
-        return write_tensor
-
-    def add_node_with_edges(self, node: Node) -> None:
-        """Add node to graph and create edges from tensor producers."""
-        node_idx = append_node(self.all_nodes, node)
-        for read_arg in node.read_args:
-            read_var = node.arg_to_var[read_arg]
-            self.edges.append((self.tensor_producer[read_var], node_idx))
-        for write_arg in node.write_args:
-            write_var = node.arg_to_var[write_arg]
-            self.edges.append((self.tensor_producer[write_var], node_idx))
-            self.tensor_producer[write_var] = node_idx
-
-    def maybe_add_store(self, node: Node, output: str) -> None:
-        """Add store operation if node writes to the output tensor."""
-        for write_arg in node.write_args:
-            write_var = node.arg_to_var[write_arg]
-            if write_var != output:
-                continue
-            write_tensor = node.arg_to_tensor[write_arg]
-            store_op = Store(dest=f"{output}_hbm", value=write_var)
-            store_op.specialize("value", write_tensor)
-            hbm_tensor = create_hbm_tensor(
-                f"{output}_hbm", write_tensor.shape, axis_names=[axis.name for axis in write_tensor.axes]
-            )
-            self.hbm.add_output(hbm_tensor)
-            store_op.specialize("dest", hbm_tensor)
-            store_idx = append_node(self.all_nodes, store_op)
-            self.edges.append((self.tensor_producer[write_var], store_idx))
+        allocate_id = self._add_node(allocate_op)
+        self.tensor_producer[write_var] = allocate_id
+        return tensor
 
 
 def append_node(nodes: list[Node], node: Node) -> int:
