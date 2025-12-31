@@ -10,7 +10,8 @@ import logging
 import os
 
 import numpy as np
-from nkipy_kernelgen import trace
+from nkipy_kernelgen import apply_passes, trace
+from nkipy_kernelgen.transforms import remove_linalg_zero_fill
 
 from compute_graph.visualize import setup_logging
 
@@ -48,4 +49,6 @@ def rmsnorm_matmul(lhs, rhs):
 
 if __name__ == "__main__":
     mlir_module = rmsnorm_matmul.to_mlir()
+    logger.info(mlir_module)
+    mlir_module = apply_passes(mlir_module, [remove_linalg_zero_fill])
     logger.info(mlir_module)
