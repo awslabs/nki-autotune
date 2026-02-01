@@ -1,28 +1,24 @@
-## NKI_autotune
+## NKI Autotune
+
 Automatically profile and select the best meta parameters for NKI kernels.
 
 ## Installation
-1. Follow AWS Neuron [tutorial](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/setup/torch-neuronx.html#setup-torch-neuronx) to install Neuron packages.
-```
-pip install -r requirements.txt
-```
-2. Install NKIPy.
-3. Install autotune.
-```
-pre-commit install
-pip install -e .
+
+1. Follow the [NKI setup guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/get-started/setup-env.html) to install Neuron drivers and compilers.
+2. Install [NKIPy](https://github.com/aws-neuron/nkipy) for spike runtime simulation.
+3. Clone and install packages:
+
+```bash
+cd nki-autotune
+pip install -e autotune -e nkigym
 ```
 
-## BUILD
-Make sure you have the necessary build tools:
+4. (Optional) Install development tools:
+
+```bash
+pip install pre-commit
+pre-commit install
 ```
-pip install --upgrade pip wheel build
-```
-Build the wheel:
-```
-python -m build --wheel
-```
-This will create a `.whl` file in the `dist/` directory, something like `dist/nki_autotune-0.1.0a0-py3-none-any.whl`.
 
 ## Security
 

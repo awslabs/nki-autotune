@@ -6,7 +6,6 @@ import types
 
 import numpy as np
 from nkipy.core.compile import CompilationTarget, compile_to_neff, trace
-
 from nkipy.runtime import CompiledKernel
 
 from autotune.core.utils import split_file_info

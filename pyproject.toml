@@ -5,6 +5,6 @@ include = '\.pyi?$'
 skip-magic-trailing-comma = true
 
 [tool.isort]
-known_first_party = ["nki-autotune"]
+known_first_party = ["autotune", "nkigym"]
 profile = "black"
 line_length = 120

@@ -1,0 +1,45 @@
+"""Code generation utilities for NKI Gym.
+
+Provides utilities for executing dynamically generated source code
+and extracting callable functions.
+"""
+
+import inspect
+from collections.abc import Callable
+
+import numpy as np
+
+
+def get_source(func: Callable) -> str:
+    """Get source code for a function (dynamic or static).
+
+    Args:
+        func: A callable function, either statically defined or dynamically
+              generated (with __source__ attribute).
+
+    Returns:
+        Source code string for the function.
+    """
+    source = getattr(func, "__source__", None)
+    if source is None:
+        source = inspect.getsource(func)
+    return source
+
+
+def exec_source_to_func(source: str, func_name: str) -> Callable[..., np.ndarray]:
+    """Execute source code and return the named function.
+
+    Args:
+        source: Python source code string containing a function definition.
+        func_name: Name of the function to extract from executed namespace.
+
+    Returns:
+        Callable function from the executed source with __source__ attribute attached.
+    """
+    namespace: dict[str, object] = {"np": np}
+    exec(source, namespace)
+    func = namespace.get(func_name)
+    if func is None:
+        raise ValueError(f"Function '{func_name}' not found in executed source")
+    func.__source__ = source
+    return func

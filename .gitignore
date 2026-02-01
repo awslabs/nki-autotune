@@ -61,6 +61,7 @@ venv.bak/
 *.swo
 .clinerules
 .claude
+.kiro
 memory-bank
 
 # macOS

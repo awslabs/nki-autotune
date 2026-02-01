@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nkigym"
+version = "0.1.0"
+description = "NKI Gym - Kernel development environment"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pytest",
+    "hypothesis",
+    "pre-commit",
+]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]

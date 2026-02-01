@@ -1,4 +1,4 @@
-from nkipy.runtime import BaremetalExecutor, CompiledKernel
+from nkipy.runtime import BaremetalExecutor
 
 from autotune.core.compile import create_spike_kernel, run_spike_kernel
 from autotune.core.job import ProfileJobs
