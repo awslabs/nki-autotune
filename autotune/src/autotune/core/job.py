@@ -23,19 +23,13 @@ from autotune.typing import (
 def dummy_postprocessing(
     input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_outputs: OUTPUT_TENSORS_DTYPE
 ) -> None:
-    """No-op postprocessing function used as default."""
+    """No-op postprocessing function used as default.
 
-
-def run_with_args_and_kwargs(func, args, kwargs):
-    """Execute function with both positional and keyword arguments."""
-    return func(args, kwargs)
-
-
-def get_batch_size(num_samples: int, total_num_samples: int):
-    """Calculate optimal batch size within constraints."""
-    batch_size = max(num_samples, 1000)
-    batch_size = min(batch_size, total_num_samples)
-    return batch_size
+    Args:
+        input_tensors: Dictionary mapping tensor names to numpy arrays.
+        kernel_kwargs: Additional keyword arguments for the kernel.
+        kernel_outputs: Tuple of output arrays from kernel execution.
+    """
 
 
 class ProfileJob:
@@ -47,6 +41,7 @@ class ProfileJob:
         main_metric: str,
         kernel: KERNEL_DTYPE,
         input_tensor_shapes: INPUT_TENSOR_SHAPES_DTYPE,
+        output_tensor_shapes: dict[str, tuple[int, ...]],
         mac_count: int,
         data_type: np.dtype,
         kernel_kwargs: KERNEL_KWARGS_DTYPE,
@@ -61,6 +56,8 @@ class ProfileJob:
             main_metric: Primary performance metric to optimize.
             kernel: Kernel function to profile.
             input_tensor_shapes: Shapes of input tensors.
+            output_tensor_shapes: Shapes of output tensors, mapping tensor name to shape tuple.
+            mac_count: Number of MAC operations for performance calculation.
             data_type: Data type for input tensors.
             kernel_kwargs: Additional kernel arguments.
             compiler_flags: Compilation flags and target configuration.
@@ -78,6 +75,7 @@ class ProfileJob:
             index=index,
             kernel=kernel,
             input_tensor_shapes=input_tensor_shapes,
+            output_tensor_shapes=output_tensor_shapes,
             data_type=data_type,
             kernel_kwargs=kernel_kwargs,
             compiler_flags=compiler_flags,
@@ -116,7 +114,6 @@ class ProfileJob:
         for attr_name in self.attributes:
             val = getattr(self, attr_name)
             try:
-                # Test if the value is JSON serializable
                 json.dumps(val)
                 result[attr_name] = val
             except Exception:
@@ -194,19 +191,32 @@ class ProfileJobs:
         self,
         kernel: KERNEL_DTYPE,
         input_tensor_shapes: INPUT_TENSOR_SHAPES_DTYPE,
+        output_tensor_shapes: dict[str, tuple[int, ...]],
         data_type,
         kernel_kwargs: dict[str, Any],
         compiler_flags: str,
         postprocessing: POSTPROCESSING_DTYPE,
         mac_count: int = 0,
     ):
-        """Create and add a new ProfileJob to the collection."""
+        """Create and add a new ProfileJob to the collection.
+
+        Args:
+            kernel: Kernel function to profile.
+            input_tensor_shapes: Shapes of input tensors.
+            output_tensor_shapes: Shapes of output tensors, mapping tensor name to shape tuple.
+            data_type: Data type for input tensors.
+            kernel_kwargs: Additional kernel arguments.
+            compiler_flags: Compilation flags and target configuration.
+            postprocessing: Optional post-processing function for outputs.
+            mac_count: Number of MAC operations for performance calculation.
+        """
         job_index = len(self.jobs)
         job = ProfileJob(
             index=job_index,
             main_metric=self.main_metric,
             kernel=kernel,
             input_tensor_shapes=input_tensor_shapes,
+            output_tensor_shapes=output_tensor_shapes,
             mac_count=mac_count,
             data_type=data_type,
             kernel_kwargs=kernel_kwargs,
@@ -303,14 +313,14 @@ class ProfileJobs:
             error_types: dict[str, int] = {}
             for job_index in sorted_job_indices:
                 job = self.jobs[job_index]
-                if job.is_correct:
-                    correct_count += 1
                 if job.has_error:
                     error_count += 1
                     error_type = getattr(job, "error").split("\n")[0]
                     if error_type not in error_types:
                         error_types[error_type] = 0
                     error_types[error_type] += 1
+                elif job.is_correct:
+                    correct_count += 1
 
             json_data = {
                 "metadata": {
@@ -353,9 +363,11 @@ def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
         try:
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(600)
+            output_tensors = [(name, shape, job.data_type) for name, shape in job.output_tensor_shapes.items()]
             neff = compile_kernel(
                 kernel_name=job.kernel,
                 input_tensors=job.input_tensors,
+                output_tensors=output_tensors,
                 kernel_kwargs=job.kernel_kwargs,
                 target_instance_family=jobs.target_instance_family,
                 compiler_flags=job.compiler_flags,

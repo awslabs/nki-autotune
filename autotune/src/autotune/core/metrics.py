@@ -2,39 +2,6 @@ import json
 import subprocess
 
 import numpy as np
-from neuronxcc.starfish.penguin.ir.ir import BIRKernel, NativeKernelTemplate, TensorContractTensorOp
-from neuronxcc.starfish.penguin.targets.tonga.TongaISAInst import MatMulOp, MatMulSparseOp
-
-
-def get_matmul_mac_count(traced_kernel):
-    flops = 0
-    for inst in traced_kernel._code.insts:
-        if isinstance(inst, (MatMulOp, MatMulSparseOp, NativeKernelTemplate, BIRKernel)):
-            flops += inst.total_arithmetic_ops
-        elif isinstance(inst, (TensorContractTensorOp)):
-            lhs_shape = inst.lhs_shape
-            rhs_shape = inst.rhs_shape
-            if len(lhs_shape) == 2:
-                batch_factor = 1
-                M, K = lhs_shape
-            elif len(lhs_shape) == 3:
-                batch_factor, M, K = lhs_shape
-            else:
-                raise ValueError(f"Unrecognized lhs_shape {lhs_shape}. Expecting (batch (optional), M, K)")
-            if len(rhs_shape) == 2:
-                _batch_factor = 1
-                _K, N = rhs_shape
-            elif len(rhs_shape) == 3:
-                _batch_factor, _K, N = rhs_shape
-            else:
-                raise ValueError(f"Unrecognized rhs_shape {rhs_shape}. Expecting (batch (optional), K, N)")
-            assert (
-                K == _K and batch_factor == _batch_factor
-            ), f"Incompatible matrix shapes. Received LHS {lhs_shape}. RHS {rhs_shape}."
-            flops += 2 * batch_factor * M * N * K
-    # One MAC is 2 flops
-    mac_count = flops // 2
-    return mac_count
 
 
 def calculate_mfu(mac_count: int, time_ms: float, target_instance_family: str) -> float:
@@ -66,31 +33,6 @@ def calculate_mfu(mac_count: int, time_ms: float, target_instance_family: str) -
     return mfu
 
 
-def calculate_mfu_from_shapes(
-    lhsT_shape: tuple[int, ...], rhs_shape: tuple[int, ...], time_ms: float, target_instance_family: str
-) -> float:
-    """
-    Calculate model PE utilization for a GEMM operation using matrix shapes.
-
-    Parameters:
-    lhsT_shape (tuple): Shape of matrix A (k, m)
-    rhs_shape (tuple): Shape of matrix B (k, n)
-    time_ms (float): Execution time in milliseconds
-    target_instance_family (str): Target hardware instance family
-
-    Returns:
-    float: PE utilization percentage
-    """
-    k, m = lhsT_shape
-    _k, n = rhs_shape
-    assert k == _k, f"Incompatible matrix dimensions: lhsT {lhsT_shape} and rhs {rhs_shape}"
-
-    # Calculate MAC count
-    mac_count = m * k * n
-    mfu = calculate_mfu(mac_count, time_ms, target_instance_family)
-    return mfu
-
-
 def extract_metrics(
     neff: str, ntff: str, latency: float, matmul_mac_count: int, target_instance_family: str
 ) -> dict[str, float]:
@@ -107,14 +49,6 @@ def extract_metrics(
     mfu = calculate_mfu(matmul_mac_count, latency, target_instance_family)
     metrics["mfu_estimated_percent"] = mfu
     return metrics
-
-
-def tensor_to_matmul_mac_count(input_tensor_shapes: list[tuple[int, ...]]) -> int:
-    if len(input_tensor_shapes) == 2 and len(input_tensor_shapes[0]) == 2 and len(input_tensor_shapes[1]) == 2:
-        mac_count = input_tensor_shapes[0][0] * input_tensor_shapes[0][1] * input_tensor_shapes[1][1]
-    else:
-        mac_count = 0
-    return mac_count
 
 
 def check_correctness(desired, actual, atol, rtol, verbose: bool = False):
