@@ -10,8 +10,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from nkigym.codegen import exec_source_to_func
-from nkigym.visualize import get_source
+from nkigym.codegen import exec_source_to_func, get_source
 
 logger = logging.getLogger(__name__)
 

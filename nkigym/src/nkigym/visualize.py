@@ -1,8 +1,6 @@
 import logging
 
-from nkigym.codegen import get_source
-
-__all__ = ["get_source", "setup_logging", "MultilineFormatter"]
+__all__ = ["setup_logging", "MultilineFormatter"]
 
 
 class MultilineFormatter(logging.Formatter):

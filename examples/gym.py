@@ -4,19 +4,16 @@ This demonstrates how to analyze NumPy functions for tiling using
 the analyze_dimension function from nkigym.
 """
 
-import logging
 import os
+from pathlib import Path
 
 import numpy as np
 
+from nkigym.codegen import get_source
 from nkigym.data_reuse import analyze_data_reuse, merge_reusable_tensors
 from nkigym.tiling import generate_tiled_function
-from nkigym.visualize import get_source, setup_logging
 
-CACHE_ROOT = "/fsx/weittang/kernelgen_cache"
-os.makedirs(CACHE_ROOT, exist_ok=True)
-setup_logging(f"{CACHE_ROOT}/debug.log")
-logger = logging.getLogger(__name__)
+CACHE_ROOT = "/fsx/weittang/gym_cache"
 
 
 def matmul(mat_a: np.ndarray, mat_b: np.ndarray) -> np.ndarray:
@@ -34,21 +31,25 @@ def matmul(mat_a: np.ndarray, mat_b: np.ndarray) -> np.ndarray:
 
 def main() -> None:
     """Run the tiling and data reuse analysis demo."""
-    logger.debug("Starting tiling analysis demo")
+    os.makedirs(CACHE_ROOT, exist_ok=True)
+    cache_path = Path(CACHE_ROOT)
+
     m, k, n = 256, 256, 512
     input_shapes: dict[str, tuple[int, int]] = {"mat_a": (m, k), "mat_b": (k, n)}
 
+    mat_a = np.random.randn(m, k)
+    mat_b = np.random.randn(k, n)
+    expected = matmul(mat_a, mat_b)
+
     tiled_matmul = generate_tiled_function(matmul, input_shapes)
-    logger.info(get_source(tiled_matmul))
+    (cache_path / "tiled_matmul.py").write_text(get_source(tiled_matmul))
+    np.testing.assert_allclose(tiled_matmul(mat_a, mat_b), expected)
 
     groups = analyze_data_reuse(tiled_matmul)
-    logger.info(groups)
-
-    if not groups:
-        raise RuntimeError("No reusable tensor groups found")
-
-    transformed = merge_reusable_tensors(tiled_matmul, groups[0][0], groups[0][1])
-    logger.info(get_source(transformed))
+    for group in groups:
+        tiled_matmul = merge_reusable_tensors(tiled_matmul, group[0], group[1])
+        np.testing.assert_allclose(tiled_matmul(mat_a, mat_b), expected)
+    (cache_path / "transformed_matmul.py").write_text(get_source(tiled_matmul))
 
 
 if __name__ == "__main__":
