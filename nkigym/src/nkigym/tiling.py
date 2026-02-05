@@ -14,7 +14,7 @@ import numpy as np
 
 from nkigym.codegen import exec_source_to_func
 from nkigym.dim_tracker import TracedOp, _DimTracker
-from nkigym.numpy_ops import OP_SEMANTICS
+from nkigym.nki_ops import OP_REGISTRY, tracing_enabled
 from nkigym.tensor import TracedTensor
 
 logger = logging.getLogger(__name__)
@@ -436,7 +436,8 @@ def analyze_dimension(func: Callable[..., np.ndarray], input_shapes: dict[str, t
         dims = [tracker.new_dim(size) for size in shape]
         traced_tensors[name] = TracedTensor(name, shape, dims, tracker)
 
-    result = func(**traced_tensors)
+    with tracing_enabled():
+        result = func(**traced_tensors)
 
     if not isinstance(result, TracedTensor):
         raise TypeError(f"Function must return TracedTensor, got {type(result)}")
@@ -506,9 +507,9 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
     with explicit slice offsets. Handles both parallel and reduction tiling.
     No loops are generated - all tiles are fully unrolled.
 
-    Uses the OP_SEMANTICS table for operator-agnostic code generation:
+    Uses the OP_REGISTRY table for operator-agnostic code generation:
     - generate_expr(inputs): Creates the initial computation
-    - combine_partials(result_var, inputs): Creates in-place accumulation
+    - reduce(result_var, inputs): Creates in-place accumulation
 
     Args:
         func: NumPy function to tile.
@@ -518,8 +519,8 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
         Python source code string for the tiled function.
 
     Raises:
-        NotImplementedError: If an operator is not in OP_SEMANTICS or
-            has reduction dimensions but no combine_partials function.
+        NotImplementedError: If an operator is not in OP_REGISTRY or
+            has reduction dimensions but no reduce function.
     """
     analysis = analyze_dimension(func, input_shapes)
     logger.debug(analysis)
@@ -530,7 +531,7 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
 
     lines.append(f"def tiled_{func.__name__}({', '.join(param_names)}):")
     output_shape = analysis.tensor_shapes[OUTPUT_TENSOR_NAME]
-    lines.append(f"    {output_name} = np.empty({output_shape}, dtype=np.float32)")
+    lines.append(f"    {output_name} = nkigym.ndarray({output_shape}, dtype=np.float32)")
 
     reduction_positions = list(analysis.iter_reduction_tile_positions())
     has_reduction_tiling = len(reduction_positions) > 1 or (len(reduction_positions) == 1 and reduction_positions[0])
@@ -545,10 +546,10 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
                 intermediate_map: dict[str, str] = {}
 
                 for op in analysis.ops:
-                    if op.op_name not in OP_SEMANTICS:
+                    if op.op_name not in OP_REGISTRY:
                         raise NotImplementedError(f"Operator '{op.op_name}' not supported")
 
-                    semantics = OP_SEMANTICS[op.op_name]
+                    nki_op = OP_REGISTRY[op.op_name]
                     op_inputs: list[str] = []
 
                     for inp_name in op.inputs:
@@ -568,21 +569,20 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
                     if op.output == OUTPUT_TENSOR_NAME:
                         if is_first_tile:
                             result_var = name_gen.next_name()
-                            expr = semantics.generate_expr(op_inputs)
+                            expr = nki_op.generate_expr(op_inputs)
                             lines.append(f"    {result_var} = {expr}")
                             acc_var = result_var
                         else:
-                            if semantics.combine_partials is None:
+                            combine_expr = nki_op.reduce(acc_var, op_inputs)
+                            if combine_expr is None:
                                 raise NotImplementedError(
-                                    f"Operator '{semantics.op_name}' has reduction dimensions "
-                                    "but no combine_partials"
+                                    f"Operator '{nki_op.op_name}' has reduction dimensions " "but no reduce"
                                 )
-                            acc_expr = semantics.combine_partials(acc_var, op_inputs)
-                            lines.append(f"    {acc_expr}")
+                            lines.append(f"    {combine_expr}")
                         intermediate_map[op.output] = acc_var
                     else:
                         result_var = name_gen.next_name()
-                        expr = semantics.generate_expr(op_inputs)
+                        expr = nki_op.generate_expr(op_inputs)
                         lines.append(f"    {result_var} = {expr}")
                         intermediate_map[op.output] = result_var
 
@@ -594,10 +594,10 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
             intermediate_map = {}
 
             for op in analysis.ops:
-                if op.op_name not in OP_SEMANTICS:
+                if op.op_name not in OP_REGISTRY:
                     raise NotImplementedError(f"Operator '{op.op_name}' not supported")
 
-                semantics = OP_SEMANTICS[op.op_name]
+                nki_op = OP_REGISTRY[op.op_name]
                 op_inputs = []
                 for inp_name in op.inputs:
                     if inp_name in input_shapes:
@@ -614,7 +614,7 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
                 output_var = name_gen.next_name()
                 intermediate_map[op.output] = output_var
 
-                expr = semantics.generate_expr(op_inputs)
+                expr = nki_op.generate_expr(op_inputs)
                 lines.append(f"    {output_var} = {expr}")
 
             output_slice = analysis.slice_params[OUTPUT_TENSOR_NAME][subgraph_idx]

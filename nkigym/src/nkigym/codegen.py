@@ -9,6 +9,8 @@ from collections.abc import Callable
 
 import numpy as np
 
+import nkigym
+
 
 def get_source(func: Callable) -> str:
     """Get source code for a function (dynamic or static).
@@ -36,7 +38,7 @@ def exec_source_to_func(source: str, func_name: str) -> Callable[..., np.ndarray
     Returns:
         Callable function from the executed source with __source__ attribute attached.
     """
-    namespace: dict[str, object] = {"np": np}
+    namespace: dict[str, object] = {"np": np, "nkigym": nkigym}
     exec(source, namespace)
     func = namespace.get(func_name)
     if func is None:

@@ -29,6 +29,7 @@ from data_reuse_golden import (
 )
 from hypothesis import given, settings
 
+import nkigym
 from nkigym.codegen import get_source
 from nkigym.data_reuse import analyze_data_reuse, merge_reusable_tensors, normalize_reuse_groups
 from nkigym.tiling import generate_tiled_function
@@ -270,7 +271,7 @@ class TestMergeReusableTensorsNumerical:
         to the original function.
 
         This property test:
-        1. Generates random matmul shapes (m, k, n as multiples of 128)
+        1. Generates random nc_matmul shapes (k, m, n as multiples of 128)
         2. Creates a tiled matmul function using generate_tiled_function
         3. Identifies reuse groups using analyze_data_reuse
         4. If reuse groups exist, merges tensors from the first group
@@ -284,8 +285,8 @@ class TestMergeReusableTensorsNumerical:
         b_shape = input_shapes["b"]
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            """Compute matrix multiplication."""
-            return np.matmul(a, b)
+            """Compute matrix multiplication using nc_matmul."""
+            return nkigym.nc_matmul(a, b)
 
         tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape})
 

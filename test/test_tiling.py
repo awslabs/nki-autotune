@@ -25,23 +25,24 @@ from tiling_golden import (
     GOLDEN_SINGLE_MATMUL_SOURCE,
 )
 
-from nkigym.numpy_ops import OP_SEMANTICS
+import nkigym
+from nkigym.nki_ops import OP_REGISTRY
 from nkigym.tiling import analyze_dimension, generate_tiled_function, generate_tiled_source
 
 SINGLE_MATMUL_NUMERICAL_SHAPES: list[tuple[tuple[int, int], tuple[int, int]]] = [
     ((128, 128), (128, 128)),
-    ((256, 128), (128, 128)),
+    ((128, 256), (128, 128)),
     ((128, 128), (128, 256)),
-    ((256, 128), (128, 256)),
-    ((512, 128), (128, 128)),
-    ((512, 256), (256, 512)),
-    ((128, 512), (512, 128)),
+    ((128, 256), (128, 256)),
+    ((128, 512), (128, 128)),
+    ((256, 512), (256, 512)),
+    ((512, 128), (512, 128)),
 ]
 
 DOUBLE_MATMUL_NUMERICAL_SHAPES: list[tuple[tuple[int, int], tuple[int, int], tuple[int, int]]] = [
     ((128, 128), (128, 128), (128, 128)),
-    ((256, 128), (128, 128), (128, 128)),
-    ((256, 128), (128, 128), (128, 256)),
+    ((128, 256), (128, 128), (256, 128)),
+    ((128, 256), (128, 128), (256, 256)),
     ((256, 256), (256, 256), (256, 256)),
 ]
 
@@ -222,10 +223,10 @@ class TestNumericalCorrectness:
             dtype: NumPy dtype to test (float32 or float64).
             matmul_func: Fixture providing the matmul function.
         """
-        a = make_random_array((256, 128), seed=42, dtype=dtype)
+        a = make_random_array((128, 256), seed=42, dtype=dtype)
         b = make_random_array((128, 256), seed=43, dtype=dtype)
 
-        input_shapes = {"a": (256, 128), "b": (128, 256)}
+        input_shapes = {"a": (128, 256), "b": (128, 256)}
         tiled_fn = generate_tiled_function(matmul_func, input_shapes)
 
         expected = matmul_func(a, b)
@@ -258,15 +259,15 @@ class TestNumericalCorrectness:
             seed_a: Random seed for first input array.
             seed_b: Random seed for second input array.
         """
-        a_shape = (m * 128, k * 128)
+        a_shape = (k * 128, m * 128)
         b_shape = (k * 128, n * 128)
 
         a = make_random_array(a_shape, seed=seed_a)
         b = make_random_array(b_shape, seed=seed_b)
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            """Compute matrix multiplication."""
-            return np.matmul(a, b)
+            """Compute matrix multiplication using nkigym.nc_matmul."""
+            return nkigym.nc_matmul(a, b)
 
         expected = matmul(a, b)
 
@@ -389,11 +390,11 @@ def valid_input_name(draw: st.DrawFn) -> str:
 
 @st.composite
 def matmul_input_shapes_with_names(draw: st.DrawFn) -> dict[str, tuple[int, int]]:
-    """Generate valid input shapes for a matmul operation with custom names.
+    """Generate valid input shapes for nc_matmul with custom names.
 
-    Generates two input names and compatible shapes for matrix multiplication:
-    - First input: (m, k)
-    - Second input: (k, n)
+    Generates two input names and compatible shapes for nc_matmul:
+    - First input: (k, m) where k is the reduction dimension
+    - Second input: (k, n) where k is the reduction dimension
     where m, k, n are multiples of 128.
 
     Args:
@@ -409,7 +410,7 @@ def matmul_input_shapes_with_names(draw: st.DrawFn) -> dict[str, tuple[int, int]
     k = draw(st.integers(min_value=1, max_value=4)) * 128
     n = draw(st.integers(min_value=1, max_value=4)) * 128
 
-    return {name1: (m, k), name2: (k, n)}
+    return {name1: (k, m), name2: (k, n)}
 
 
 class TestCodeGenerationProperties:
@@ -440,17 +441,17 @@ class TestCodeGenerationProperties:
         n=st.integers(min_value=1, max_value=4),
     )
     def test_dimension_classification_parallel_vs_reduction(self, m: int, k: int, n: int):
-        """Property: Dimension classification is correct for matmul operations.
+        """Property: Dimension classification is correct for nc_matmul operations.
 
         **Validates: Requirements 1.1**
 
-        For any valid matmul input shapes (m, k) and (k, n), the dimension
+        For any valid nc_matmul input shapes (k, m) and (k, n), the dimension
         analysis SHALL classify the output dimensions (m, n) as "parallel"
         and the contracted dimension (k) as "reduction".
 
-        For matmul C[m,n] = A[m,k] @ B[k,n]:
-        - d0 (M dimension): parallel - appears in output
-        - d1 (K dimension): reduction - contracted over
+        For nc_matmul C[m,n] = A[k,m].T @ B[k,n]:
+        - d0 (K dimension): reduction - contracted over
+        - d1 (M dimension): parallel - appears in output
         - d2 (N dimension): parallel - appears in output
 
         Args:
@@ -458,12 +459,12 @@ class TestCodeGenerationProperties:
             k: Multiplier for K dimension (1-4, scaled by 128).
             n: Multiplier for N dimension (1-4, scaled by 128).
         """
-        a_shape = (m * 128, k * 128)
+        a_shape = (k * 128, m * 128)
         b_shape = (k * 128, n * 128)
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            """Compute matrix multiplication."""
-            return np.matmul(a, b)
+            """Compute matrix multiplication using nc_matmul."""
+            return nkigym.nc_matmul(a, b)
 
         analysis = analyze_dimension(matmul, {"a": a_shape, "b": b_shape})
 
@@ -472,13 +473,13 @@ class TestCodeGenerationProperties:
             f"Input shapes: a={a_shape}, b={b_shape}"
         )
 
-        assert analysis.dim_info["d0"].iter_type == "parallel", (
-            f"Expected d0 (M dimension) to be 'parallel', got '{analysis.dim_info['d0'].iter_type}'\n"
+        assert analysis.dim_info["d0"].iter_type == "reduction", (
+            f"Expected d0 (K dimension) to be 'reduction', got '{analysis.dim_info['d0'].iter_type}'\n"
             f"Input shapes: a={a_shape}, b={b_shape}"
         )
 
-        assert analysis.dim_info["d1"].iter_type == "reduction", (
-            f"Expected d1 (K dimension) to be 'reduction', got '{analysis.dim_info['d1'].iter_type}'\n"
+        assert analysis.dim_info["d1"].iter_type == "parallel", (
+            f"Expected d1 (M dimension) to be 'parallel', got '{analysis.dim_info['d1'].iter_type}'\n"
             f"Input shapes: a={a_shape}, b={b_shape}"
         )
 
@@ -487,13 +488,13 @@ class TestCodeGenerationProperties:
             f"Input shapes: a={a_shape}, b={b_shape}"
         )
 
-        assert analysis.dim_info["d0"].size == m * 128, (
-            f"Expected d0 size {m * 128}, got {analysis.dim_info['d0'].size}\n"
+        assert analysis.dim_info["d0"].size == k * 128, (
+            f"Expected d0 size {k * 128}, got {analysis.dim_info['d0'].size}\n"
             f"Input shapes: a={a_shape}, b={b_shape}"
         )
 
-        assert analysis.dim_info["d1"].size == k * 128, (
-            f"Expected d1 size {k * 128}, got {analysis.dim_info['d1'].size}\n"
+        assert analysis.dim_info["d1"].size == m * 128, (
+            f"Expected d1 size {m * 128}, got {analysis.dim_info['d1'].size}\n"
             f"Input shapes: a={a_shape}, b={b_shape}"
         )
 
@@ -520,9 +521,9 @@ class TestCodeGenerationProperties:
 
         func_code = f"""
 def matmul({', '.join(input_names)}):
-    return np.matmul({input_names[0]}, {input_names[1]})
+    return nkigym.nc_matmul({input_names[0]}, {input_names[1]})
 """
-        local_ns: dict = {"np": np}
+        local_ns: dict = {"nkigym": nkigym}
         exec(func_code, local_ns)
         matmul_func = local_ns["matmul"]
 
@@ -555,9 +556,9 @@ def matmul({', '.join(input_names)}):
 
         func_code = f"""
 def matmul({', '.join(input_names)}):
-    return np.matmul({input_names[0]}, {input_names[1]})
+    return nkigym.nc_matmul({input_names[0]}, {input_names[1]})
 """
-        local_ns: dict = {"np": np}
+        local_ns: dict = {"nkigym": nkigym}
         exec(func_code, local_ns)
         matmul_func = local_ns["matmul"]
 
@@ -723,327 +724,102 @@ class TestErrorHandling:
         )
 
 
-class TestOpSemantics:
-    """Tests for OP_SEMANTICS expression generation functions.
+class TestOpRegistry:
+    """Tests for OP_REGISTRY expression generation functions.
 
-    This class verifies that all operations in OP_SEMANTICS correctly generate
+    This class verifies that all operations in OP_REGISTRY correctly generate
     NumPy expressions and accumulation expressions for reduction tiling.
 
-    The OP_SEMANTICS dictionary defines how each operator generates code:
+    The OP_REGISTRY dictionary maps operation names to NkiOp instances:
     - generate_expr: Creates the NumPy expression for the operation
-    - combine_partials: Creates the in-place accumulation expression (for reduction ops)
+    - reduce: Creates the in-place accumulation expression (for reduction ops)
 
     Attributes:
         None
 
     Example:
-        Run operation semantics tests::
+        Run operation registry tests::
 
-            pytest test/test_tiling.py::TestOpSemantics -v
+            pytest test/test_tiling.py::TestOpRegistry -v
     """
 
-    def test_matmul_generate_expr(self):
-        """Verify matmul generates correct np.matmul expression.
+    def test_nc_matmul_generate_expr(self):
+        """Verify nc_matmul generates correct nkigym.nc_matmul expression.
 
-        **Validates: Requirements 4.1**
-
-        The matmul operation SHALL generate an expression of the form
-        'np.matmul(input1, input2)' for two input variables.
+        The nc_matmul operation SHALL generate an expression of the form
+        'nkigym.nc_matmul(input1, input2)' for KM x KN layout inputs.
         """
-        semantics = OP_SEMANTICS["matmul"]
+        nki_op = OP_REGISTRY["nc_matmul"]
         inputs = ["a", "b"]
-        expr = semantics.generate_expr(inputs)
+        expr = nki_op.generate_expr(inputs)
 
-        assert expr == "np.matmul(a, b)", f"Expected 'np.matmul(a, b)', got '{expr}'"
+        assert expr == "nkigym.nc_matmul(a, b)", f"Expected 'nkigym.nc_matmul(a, b)', got '{expr}'"
 
-    def test_matmul_generate_expr_with_different_names(self):
-        """Verify matmul generates correct expression with arbitrary input names.
+    def test_nc_matmul_generate_expr_with_different_names(self):
+        """Verify nc_matmul generates correct expression with arbitrary input names.
 
-        **Validates: Requirements 4.1**
-
-        The matmul operation SHALL correctly substitute any valid input names
+        The nc_matmul operation SHALL correctly substitute any valid input names
         into the generated expression.
         """
-        semantics = OP_SEMANTICS["matmul"]
+        nki_op = OP_REGISTRY["nc_matmul"]
         inputs = ["tensor_0", "tensor_1"]
-        expr = semantics.generate_expr(inputs)
+        expr = nki_op.generate_expr(inputs)
 
-        assert expr == "np.matmul(tensor_0, tensor_1)", f"Expected 'np.matmul(tensor_0, tensor_1)', got '{expr}'"
+        assert (
+            expr == "nkigym.nc_matmul(tensor_0, tensor_1)"
+        ), f"Expected 'nkigym.nc_matmul(tensor_0, tensor_1)', got '{expr}'"
 
-    def test_add_generate_expr(self):
-        """Verify add generates correct np.add expression.
+    def test_nc_matmul_reduce(self):
+        """Verify nc_matmul generates correct in-place accumulation expression.
 
-        **Validates: Requirements 4.2**
-
-        The add operation SHALL generate an expression of the form
-        'np.add(input1, input2)' for two input variables.
+        The nc_matmul reduce function SHALL generate an expression of the
+        form 'result += nkigym.nc_matmul(input1, input2)' for additive accumulation.
         """
-        semantics = OP_SEMANTICS["add"]
-        inputs = ["x", "y"]
-        expr = semantics.generate_expr(inputs)
-
-        assert expr == "np.add(x, y)", f"Expected 'np.add(x, y)', got '{expr}'"
-
-    def test_add_generate_expr_with_different_names(self):
-        """Verify add generates correct expression with arbitrary input names.
-
-        **Validates: Requirements 4.2**
-
-        The add operation SHALL correctly substitute any valid input names
-        into the generated expression.
-        """
-        semantics = OP_SEMANTICS["add"]
-        inputs = ["tensor_5", "tensor_6"]
-        expr = semantics.generate_expr(inputs)
-
-        assert expr == "np.add(tensor_5, tensor_6)", f"Expected 'np.add(tensor_5, tensor_6)', got '{expr}'"
-
-    def test_multiply_generate_expr(self):
-        """Verify multiply generates correct np.multiply expression.
-
-        **Validates: Requirements 4.3**
-
-        The multiply operation SHALL generate an expression of the form
-        'np.multiply(input1, input2)' for two input variables.
-        """
-        semantics = OP_SEMANTICS["multiply"]
-        inputs = ["a", "b"]
-        expr = semantics.generate_expr(inputs)
-
-        assert expr == "np.multiply(a, b)", f"Expected 'np.multiply(a, b)', got '{expr}'"
-
-    def test_multiply_generate_expr_with_different_names(self):
-        """Verify multiply generates correct expression with arbitrary input names.
-
-        **Validates: Requirements 4.3**
-
-        The multiply operation SHALL correctly substitute any valid input names
-        into the generated expression.
-        """
-        semantics = OP_SEMANTICS["multiply"]
-        inputs = ["left", "right"]
-        expr = semantics.generate_expr(inputs)
-
-        assert expr == "np.multiply(left, right)", f"Expected 'np.multiply(left, right)', got '{expr}'"
-
-    def test_reduce_sum_generate_expr(self):
-        """Verify reduce_sum generates correct np.sum expression with axis parameter.
-
-        **Validates: Requirements 4.4**
-
-        The reduce_sum operation SHALL generate an expression of the form
-        'np.sum(input, axis=1)' for a single input variable.
-        """
-        semantics = OP_SEMANTICS["reduce_sum"]
-        inputs = ["data"]
-        expr = semantics.generate_expr(inputs)
-
-        assert expr == "np.sum(data, axis=1)", f"Expected 'np.sum(data, axis=1)', got '{expr}'"
-
-    def test_reduce_sum_generate_expr_with_different_name(self):
-        """Verify reduce_sum generates correct expression with arbitrary input name.
-
-        **Validates: Requirements 4.4**
-
-        The reduce_sum operation SHALL correctly substitute any valid input name
-        into the generated expression.
-        """
-        semantics = OP_SEMANTICS["reduce_sum"]
-        inputs = ["tensor_3"]
-        expr = semantics.generate_expr(inputs)
-
-        assert expr == "np.sum(tensor_3, axis=1)", f"Expected 'np.sum(tensor_3, axis=1)', got '{expr}'"
-
-    def test_reduce_max_generate_expr(self):
-        """Verify reduce_max generates correct np.max expression with axis parameter.
-
-        **Validates: Requirements 4.5**
-
-        The reduce_max operation SHALL generate an expression of the form
-        'np.max(input, axis=1)' for a single input variable.
-        """
-        semantics = OP_SEMANTICS["reduce_max"]
-        inputs = ["values"]
-        expr = semantics.generate_expr(inputs)
-
-        assert expr == "np.max(values, axis=1)", f"Expected 'np.max(values, axis=1)', got '{expr}'"
-
-    def test_reduce_max_generate_expr_with_different_name(self):
-        """Verify reduce_max generates correct expression with arbitrary input name.
-
-        **Validates: Requirements 4.5**
-
-        The reduce_max operation SHALL correctly substitute any valid input name
-        into the generated expression.
-        """
-        semantics = OP_SEMANTICS["reduce_max"]
-        inputs = ["tensor_7"]
-        expr = semantics.generate_expr(inputs)
-
-        assert expr == "np.max(tensor_7, axis=1)", f"Expected 'np.max(tensor_7, axis=1)', got '{expr}'"
-
-    def test_matmul_combine_partials(self):
-        """Verify matmul generates correct in-place accumulation expression.
-
-        **Validates: Requirements 4.6**
-
-        The matmul combine_partials function SHALL generate an expression of the
-        form 'result += np.matmul(input1, input2)' for additive accumulation.
-        """
-        semantics = OP_SEMANTICS["matmul"]
-        assert semantics.combine_partials is not None, "matmul should have combine_partials"
-
+        nki_op = OP_REGISTRY["nc_matmul"]
         result_var = "output"
         inputs = ["a", "b"]
-        expr = semantics.combine_partials(result_var, inputs)
+        expr = nki_op.reduce(result_var, inputs)
 
-        assert expr == "output += np.matmul(a, b)", f"Expected 'output += np.matmul(a, b)', got '{expr}'"
+        assert expr == "output += nkigym.nc_matmul(a, b)", f"Expected 'output += nkigym.nc_matmul(a, b)', got '{expr}'"
 
-    def test_matmul_combine_partials_with_different_names(self):
-        """Verify matmul combine_partials with arbitrary variable names.
+    def test_nc_matmul_reduce_with_different_names(self):
+        """Verify nc_matmul reduce with arbitrary variable names.
 
-        **Validates: Requirements 4.6**
-
-        The matmul combine_partials function SHALL correctly substitute any valid
+        The nc_matmul reduce function SHALL correctly substitute any valid
         variable names into the generated accumulation expression.
         """
-        semantics = OP_SEMANTICS["matmul"]
+        nki_op = OP_REGISTRY["nc_matmul"]
         result_var = "tensor_10"
         inputs = ["tensor_8", "tensor_9"]
-        expr = semantics.combine_partials(result_var, inputs)
+        expr = nki_op.reduce(result_var, inputs)
 
-        assert (
-            expr == "tensor_10 += np.matmul(tensor_8, tensor_9)"
-        ), f"Expected 'tensor_10 += np.matmul(tensor_8, tensor_9)', got '{expr}'"
-
-    def test_reduce_sum_combine_partials(self):
-        """Verify reduce_sum generates correct in-place accumulation expression.
-
-        **Validates: Requirements 4.6**
-
-        The reduce_sum combine_partials function SHALL generate an expression of
-        the form 'result += np.sum(input, axis=1)' for additive accumulation.
-        """
-        semantics = OP_SEMANTICS["reduce_sum"]
-        assert semantics.combine_partials is not None, "reduce_sum should have combine_partials"
-
-        result_var = "acc"
-        inputs = ["data"]
-        expr = semantics.combine_partials(result_var, inputs)
-
-        assert expr == "acc += np.sum(data, axis=1)", f"Expected 'acc += np.sum(data, axis=1)', got '{expr}'"
-
-    def test_reduce_sum_combine_partials_with_different_names(self):
-        """Verify reduce_sum combine_partials with arbitrary variable names.
-
-        **Validates: Requirements 4.6**
-
-        The reduce_sum combine_partials function SHALL correctly substitute any
-        valid variable names into the generated accumulation expression.
-        """
-        semantics = OP_SEMANTICS["reduce_sum"]
-        result_var = "tensor_5"
-        inputs = ["tensor_4"]
-        expr = semantics.combine_partials(result_var, inputs)
-
-        assert (
-            expr == "tensor_5 += np.sum(tensor_4, axis=1)"
-        ), f"Expected 'tensor_5 += np.sum(tensor_4, axis=1)', got '{expr}'"
-
-    def test_reduce_max_combine_partials(self):
-        """Verify reduce_max generates correct in-place accumulation expression.
-
-        **Validates: Requirements 4.6**
-
-        The reduce_max combine_partials function SHALL generate an expression of
-        the form 'result = np.maximum(result, np.max(input, axis=1))' for
-        element-wise maximum accumulation.
-        """
-        semantics = OP_SEMANTICS["reduce_max"]
-        assert semantics.combine_partials is not None, "reduce_max should have combine_partials"
-
-        result_var = "max_val"
-        inputs = ["values"]
-        expr = semantics.combine_partials(result_var, inputs)
-
-        assert (
-            expr == "max_val = np.maximum(max_val, np.max(values, axis=1))"
-        ), f"Expected 'max_val = np.maximum(max_val, np.max(values, axis=1))', got '{expr}'"
-
-    def test_reduce_max_combine_partials_with_different_names(self):
-        """Verify reduce_max combine_partials with arbitrary variable names.
-
-        **Validates: Requirements 4.6**
-
-        The reduce_max combine_partials function SHALL correctly substitute any
-        valid variable names into the generated accumulation expression.
-        """
-        semantics = OP_SEMANTICS["reduce_max"]
-        result_var = "tensor_2"
-        inputs = ["tensor_1"]
-        expr = semantics.combine_partials(result_var, inputs)
-
-        assert (
-            expr == "tensor_2 = np.maximum(tensor_2, np.max(tensor_1, axis=1))"
-        ), f"Expected 'tensor_2 = np.maximum(tensor_2, np.max(tensor_1, axis=1))', got '{expr}'"
-
-    def test_add_has_no_combine_partials(self):
-        """Verify add operation does not have combine_partials.
-
-        **Validates: Requirements 4.2**
-
-        The add operation SHALL NOT have a combine_partials function since it
-        does not have reduction dimensions.
-        """
-        semantics = OP_SEMANTICS["add"]
-        assert semantics.combine_partials is None, "add should not have combine_partials (no reduction dimensions)"
-
-    def test_multiply_has_no_combine_partials(self):
-        """Verify multiply operation does not have combine_partials.
-
-        **Validates: Requirements 4.3**
-
-        The multiply operation SHALL NOT have a combine_partials function since
-        it does not have reduction dimensions.
-        """
-        semantics = OP_SEMANTICS["multiply"]
-        assert semantics.combine_partials is None, "multiply should not have combine_partials (no reduction dimensions)"
+        expected = "tensor_10 += nkigym.nc_matmul(tensor_8, tensor_9)"
+        assert expr == expected, f"Expected '{expected}', got '{expr}'"
 
     def test_all_ops_have_op_name(self):
-        """Verify all operations in OP_SEMANTICS have correct op_name attribute.
+        """Verify all operations in OP_REGISTRY have correct op_name attribute.
 
-        **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5**
-
-        Each operation in OP_SEMANTICS SHALL have an op_name attribute that
+        Each operation in OP_REGISTRY SHALL have an op_name attribute that
         matches its dictionary key.
         """
-        for op_key, semantics in OP_SEMANTICS.items():
+        for op_key, nki_op in OP_REGISTRY.items():
             assert (
-                semantics.op_name == op_key
-            ), f"op_name mismatch for '{op_key}': expected '{op_key}', got '{semantics.op_name}'"
+                nki_op.op_name == op_key
+            ), f"op_name mismatch for '{op_key}': expected '{op_key}', got '{nki_op.op_name}'"
 
     def test_all_ops_have_generate_expr(self):
-        """Verify all operations in OP_SEMANTICS have generate_expr function.
+        """Verify all operations in OP_REGISTRY have generate_expr method.
 
-        **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5**
-
-        Each operation in OP_SEMANTICS SHALL have a generate_expr function
+        Each operation in OP_REGISTRY SHALL have a generate_expr method
         that is callable.
         """
-        for op_key, semantics in OP_SEMANTICS.items():
-            assert semantics.generate_expr is not None, f"'{op_key}' should have generate_expr function"
-            assert callable(semantics.generate_expr), f"'{op_key}' generate_expr should be callable"
+        for op_key, nki_op in OP_REGISTRY.items():
+            assert hasattr(nki_op, "generate_expr"), f"'{op_key}' should have generate_expr method"
+            assert callable(nki_op.generate_expr), f"'{op_key}' generate_expr should be callable"
 
     def test_expected_ops_present(self):
-        """Verify all expected operations are present in OP_SEMANTICS.
+        """Verify nc_matmul is present in OP_REGISTRY.
 
-        **Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.5**
-
-        OP_SEMANTICS SHALL contain entries for: matmul, add, multiply,
-        reduce_sum, and reduce_max.
+        OP_REGISTRY SHALL contain an entry for nc_matmul.
         """
-        expected_ops = {"matmul", "add", "multiply", "reduce_sum", "reduce_max"}
-        actual_ops = set(OP_SEMANTICS.keys())
-
-        missing_ops = expected_ops - actual_ops
-        assert not missing_ops, f"Missing operations in OP_SEMANTICS: {missing_ops}"
+        assert "nc_matmul" in OP_REGISTRY, "nc_matmul should be in OP_REGISTRY"

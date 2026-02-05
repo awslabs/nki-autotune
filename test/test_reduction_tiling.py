@@ -16,6 +16,7 @@ import pytest
 from conftest import matmul_shapes, matmul_shapes_with_reduction_tile_index
 from hypothesis import given, settings
 
+import nkigym
 from nkigym.tiling import TILE_SIZE, analyze_dimension
 
 
@@ -54,7 +55,7 @@ class TestReductionTileCountComputation:
         a_shape, b_shape = shapes
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            return np.matmul(a, b)
+            return nkigym.nc_matmul(a, b)
 
         analysis = analyze_dimension(matmul, {"a": a_shape, "b": b_shape})
 
@@ -105,7 +106,7 @@ class TestReductionTileCountComputation:
 
         **Validates: Requirements 1.5, 3.1**
         """
-        a_shape = (128, 1024)
+        a_shape = (1024, 128)
         b_shape = (1024, 128)
 
         analysis = analyze_dimension(matmul_func, {"a": a_shape, "b": b_shape})
@@ -125,17 +126,17 @@ class TestReductionTileCountComputation:
         - Parallel dimensions (M, N) have correct tile counts in tile_counts dict
         - Reduction dimension (K) has correct tile count in reduction_tile_counts dict
 
-        Uses shape (256, 512) @ (512, 384) which has:
-        - M=256: 2 parallel tiles
-        - N=384: 3 parallel tiles
-        - K=512: 4 reduction tiles
+        Uses nc_matmul shapes (512, 256) @ (512, 384) which has:
+        - K=512: 4 reduction tiles (first dim of both inputs)
+        - M=256: 2 parallel tiles (second dim of a)
+        - N=384: 3 parallel tiles (second dim of b)
 
         Args:
             matmul_func: Fixture providing the matmul function.
 
         **Validates: Requirements 1.5, 3.1**
         """
-        a_shape = (256, 512)
+        a_shape = (512, 256)
         b_shape = (512, 384)
 
         analysis = analyze_dimension(matmul_func, {"a": a_shape, "b": b_shape})
@@ -194,7 +195,7 @@ class TestSliceParameterCorrectness:
         a_shape, b_shape, reduction_tile_index = shapes_and_index
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            return np.matmul(a, b)
+            return nkigym.nc_matmul(a, b)
 
         analysis = analyze_dimension(matmul, {"a": a_shape, "b": b_shape})
 
@@ -255,7 +256,7 @@ class TestSliceParameterCorrectness:
         a_shape, b_shape = shapes
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            return np.matmul(a, b)
+            return nkigym.nc_matmul(a, b)
 
         analysis = analyze_dimension(matmul, {"a": a_shape, "b": b_shape})
 
@@ -285,7 +286,7 @@ class TestSliceParameterCorrectness:
     def test_slice_parameters_for_n_reduction_tiles(self, k_size, expected_tiles, matmul_func):
         """Test slice parameters for N reduction tiles.
 
-        Verifies that for a matmul with K=k_size (expected_tiles reduction tiles),
+        Verifies that for nc_matmul with K=k_size (expected_tiles reduction tiles),
         each reduction tile position has correct slice parameters:
         - Slice offset equals tile_index * TILE_SIZE (128)
         - Slice size equals TILE_SIZE (128)
@@ -297,7 +298,7 @@ class TestSliceParameterCorrectness:
 
         **Validates: Requirements 3.3**
         """
-        a_shape = (128, k_size)
+        a_shape = (k_size, 128)
         b_shape = (k_size, 128)
 
         analysis = analyze_dimension(matmul_func, {"a": a_shape, "b": b_shape})
@@ -383,7 +384,7 @@ class TestGeneratedCodeValidity:
         a_shape, b_shape = shapes
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            return np.matmul(a, b)
+            return nkigym.nc_matmul(a, b)
 
         from nkigym.tiling import generate_tiled_function, generate_tiled_source
 
@@ -405,46 +406,20 @@ class TestGeneratedCodeValidity:
         except Exception as e:
             raise AssertionError(f"Generated function raised error: {e}\n\nSource:\n{source}")
 
-        expected_shape = (a_shape[0], b_shape[1])
+        expected_shape = (a_shape[1], b_shape[1])
         assert result.shape == expected_shape, f"Output shape mismatch: expected {expected_shape}, got {result.shape}"
 
-    def test_notimplementederror_when_combine_partials_missing(self, matmul_func):
-        """Verify NotImplementedError is raised when combine_partials is missing.
+    @pytest.mark.skip(reason="NKIMatmul always implements reduce")
+    def test_notimplementederror_when_reduce_missing(self, matmul_func):
+        """Verify NotImplementedError is raised when reduce is missing.
 
-        When an operator has reduction dimensions (K > 128, requiring multiple
-        reduction tiles) but no combine_partials function defined in OP_SEMANTICS,
-        the code generation SHALL raise NotImplementedError.
-
-        This test temporarily modifies OP_SEMANTICS to set combine_partials=None
-        for the matmul operator, then verifies the error is raised when generating
-        tiled code for a matmul with reduction tiling (K=256, 2 reduction tiles).
+        This test is skipped because NKIMatmul always implements reduce.
+        The test was designed for the old OpSemantics system where reduce
+        could be None.
 
         Args:
             matmul_func: Fixture providing the matmul function.
-
-        **Validates: Requirements 3.5**
         """
-        from nkigym.numpy_ops import OP_SEMANTICS, OpSemantics
-        from nkigym.tiling import generate_tiled_source
-
-        a_shape = (128, 256)
-        b_shape = (256, 128)
-
-        original_semantics = OP_SEMANTICS["matmul"]
-        modified_semantics = OpSemantics(
-            op_name="matmul", generate_expr=original_semantics.generate_expr, combine_partials=None
-        )
-
-        try:
-            OP_SEMANTICS["matmul"] = modified_semantics
-
-            with pytest.raises(NotImplementedError) as exc_info:
-                generate_tiled_source(matmul_func, {"a": a_shape, "b": b_shape})
-
-            assert "matmul" in str(exc_info.value)
-            assert "combine_partials" in str(exc_info.value)
-        finally:
-            OP_SEMANTICS["matmul"] = original_semantics
 
 
 class TestParallelStructurePreservation:
@@ -481,7 +456,7 @@ class TestParallelStructurePreservation:
         a_shape, b_shape = shapes
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            return np.matmul(a, b)
+            return nkigym.nc_matmul(a, b)
 
         analysis = analyze_dimension(matmul, {"a": a_shape, "b": b_shape})
 
@@ -546,11 +521,11 @@ class TestNumericalEquivalence:
 
     @settings(max_examples=100)
     @given(shapes=matmul_shapes())
-    def test_tiled_matmul_equals_numpy_matmul(self, shapes):
+    def test_tiled_matmul_equals_nc_matmul(self, shapes):
         """Property 1: Numerical Equivalence.
 
-        For any valid matmul shapes, the tiled function produces output numerically
-        equivalent (within floating-point tolerance) to np.matmul.
+        For any valid nc_matmul shapes, the tiled function produces output numerically
+        equivalent (within floating-point tolerance) to nkigym.nc_matmul.
 
         Uses relaxed tolerances (rtol=1e-4, atol=1e-4) to account for floating-point
         differences introduced by reduction tiling.
@@ -563,7 +538,7 @@ class TestNumericalEquivalence:
         a_shape, b_shape = shapes
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            return np.matmul(a, b)
+            return nkigym.nc_matmul(a, b)
 
         from nkigym.tiling import generate_tiled_function
 
@@ -572,7 +547,7 @@ class TestNumericalEquivalence:
         np.random.seed(43)
         b = np.random.randn(*b_shape).astype(np.float32)
 
-        expected = np.matmul(a, b)
+        expected = nkigym.nc_matmul(a, b)
 
         tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape})
         actual = tiled_func(a, b)

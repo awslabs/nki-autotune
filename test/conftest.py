@@ -6,12 +6,14 @@ import numpy as np
 import pytest
 from hypothesis import strategies as st
 
+import nkigym
+
 
 @pytest.fixture
 def matmul_func() -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
     """Fixture providing a standard matmul function for testing.
 
-    Returns a function that computes matrix multiplication C = A @ B.
+    Returns a function that computes matrix multiplication using nkigym.nc_matmul.
     This fixture reduces code duplication across test files by providing
     a consistent matmul implementation.
 
@@ -23,13 +25,13 @@ def matmul_func() -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
         """Compute matrix multiplication.
 
         Args:
-            a: First input matrix of shape (m, k).
-            b: Second input matrix of shape (k, n).
+            a: First input matrix of shape (K, M).
+            b: Second input matrix of shape (K, N).
 
         Returns:
-            Matrix product of shape (m, n).
+            Matrix product of shape (M, N).
         """
-        return np.matmul(a, b)
+        return nkigym.nc_matmul(a, b)
 
     return matmul
 
@@ -38,7 +40,7 @@ def matmul_func() -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
 def double_matmul_func() -> Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
     """Fixture providing a standard double matmul function for testing.
 
-    Returns a function that computes double matrix multiplication D = (A @ B) @ C.
+    Returns a function that computes double matrix multiplication using nkigym.nc_matmul.
     This fixture reduces code duplication across test files by providing
     a consistent double matmul implementation.
 
@@ -50,14 +52,14 @@ def double_matmul_func() -> Callable[[np.ndarray, np.ndarray, np.ndarray], np.nd
         """Compute double matrix multiplication.
 
         Args:
-            a: First input matrix of shape (m, k1).
-            b: Second input matrix of shape (k1, k2).
-            c: Third input matrix of shape (k2, n).
+            a: First input matrix of shape (K1, M).
+            b: Second input matrix of shape (K1, K2).
+            c: Third input matrix of shape (K2, N).
 
         Returns:
-            Matrix product of shape (m, n).
+            Matrix product of shape (M, N).
         """
-        return np.matmul(np.matmul(a, b), c)
+        return nkigym.nc_matmul(nkigym.nc_matmul(a, b), c)
 
     return double_matmul
 
@@ -150,9 +152,9 @@ def valid_shape_multiple_of_128(draw: st.DrawFn) -> tuple[int, int]:
 
 @st.composite
 def matmul_input_shapes(draw: st.DrawFn) -> dict[str, tuple[int, int]]:
-    """Generate valid input shapes for a matmul operation.
+    """Generate valid input shapes for nc_matmul operation.
 
-    Generates compatible shapes for matrix multiplication A[m, k] @ B[k, n]
+    Generates compatible shapes for nc_matmul: C[m, n] = A[k, m].T @ B[k, n]
     where m, k, n are multiples of 128.
 
     Args:
@@ -160,13 +162,13 @@ def matmul_input_shapes(draw: st.DrawFn) -> dict[str, tuple[int, int]]:
 
     Returns:
         Dictionary with keys 'a' and 'b' mapping to shape tuples:
-        - 'a': (m, k) shape for first matrix
+        - 'a': (k, m) shape for first matrix
         - 'b': (k, n) shape for second matrix
     """
     m = draw(st.integers(min_value=1, max_value=4)) * TILE_SIZE
     k = draw(st.integers(min_value=1, max_value=4)) * TILE_SIZE
     n = draw(st.integers(min_value=1, max_value=4)) * TILE_SIZE
-    return {"a": (m, k), "b": (k, n)}
+    return {"a": (k, m), "b": (k, n)}
 
 
 valid_dim_size = st.integers(min_value=1, max_value=8).map(lambda x: x * TILE_SIZE)
@@ -175,26 +177,26 @@ valid_dim_size = st.integers(min_value=1, max_value=8).map(lambda x: x * TILE_SI
 
 @st.composite
 def matmul_shapes(draw: st.DrawFn) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Generate valid matmul shapes where all dimensions are multiples of TILE_SIZE.
+    """Generate valid nc_matmul shapes where all dimensions are multiples of TILE_SIZE.
 
-    This strategy generates shapes for matrix multiplication A[m, k] @ B[k, n]
+    This strategy generates shapes for nc_matmul: C[m, n] = A[k, m].T @ B[k, n]
     with a wider range of sizes (up to 8 tiles) compared to matmul_input_shapes.
 
     Args:
         draw: Hypothesis draw function for generating values.
 
     Returns:
-        Tuple of (a_shape, b_shape) for A[m, k] @ B[k, n].
+        Tuple of (a_shape, b_shape) for A[k, m] @ B[k, n].
     """
     m = draw(valid_dim_size)
     k = draw(valid_dim_size)
     n = draw(valid_dim_size)
-    return ((m, k), (k, n))
+    return ((k, m), (k, n))
 
 
 @st.composite
 def matmul_shapes_with_reduction_tile_index(draw: st.DrawFn) -> tuple[tuple[int, int], tuple[int, int], int]:
-    """Generate valid matmul shapes with a valid reduction tile index.
+    """Generate valid nc_matmul shapes with a valid reduction tile index.
 
     This strategy is useful for testing reduction tiling where we need to
     verify behavior at specific reduction tile positions.
@@ -204,7 +206,7 @@ def matmul_shapes_with_reduction_tile_index(draw: st.DrawFn) -> tuple[tuple[int,
 
     Returns:
         Tuple of (a_shape, b_shape, reduction_tile_index) where:
-        - a_shape: Shape of first matrix (m, k)
+        - a_shape: Shape of first matrix (k, m)
         - b_shape: Shape of second matrix (k, n)
         - reduction_tile_index: Valid index into reduction tiles (0 to k//TILE_SIZE - 1)
     """
@@ -213,4 +215,4 @@ def matmul_shapes_with_reduction_tile_index(draw: st.DrawFn) -> tuple[tuple[int,
     n = draw(valid_dim_size)
     num_reduction_tiles = k // TILE_SIZE
     reduction_tile_index = draw(st.integers(min_value=0, max_value=num_reduction_tiles - 1))
-    return ((m, k), (k, n), reduction_tile_index)
+    return ((k, m), (k, n), reduction_tile_index)
