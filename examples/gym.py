@@ -11,6 +11,7 @@ import numpy as np
 
 from nkigym.codegen import get_source
 from nkigym.data_reuse import analyze_data_reuse, merge_reusable_tensors
+from nkigym.numpy_to_nki import lower_numpy_to_nki
 from nkigym.tiling import generate_tiled_function
 
 CACHE_ROOT = "/fsx/weittang/gym_cache"
@@ -50,6 +51,9 @@ def main() -> None:
         tiled_matmul = merge_reusable_tensors(tiled_matmul, group[0], group[1])
         np.testing.assert_allclose(tiled_matmul(mat_a, mat_b), expected)
     (cache_path / "transformed_matmul.py").write_text(get_source(tiled_matmul))
+
+    nki_source = lower_numpy_to_nki(tiled_matmul)
+    (cache_path / "nki_matmul.py").write_text(nki_source)
 
 
 if __name__ == "__main__":
