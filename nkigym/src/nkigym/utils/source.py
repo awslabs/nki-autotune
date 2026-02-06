@@ -1,7 +1,7 @@
-"""Code generation utilities for NKI Gym.
+"""Source code manipulation utilities for NKI Gym.
 
-Provides utilities for executing dynamically generated source code
-and extracting callable functions.
+Provides source code round-tripping: extracting source from callables
+and compiling source strings back into callable functions.
 """
 
 import inspect
@@ -37,6 +37,9 @@ def exec_source_to_func(source: str, func_name: str) -> Callable[..., np.ndarray
 
     Returns:
         Callable function from the executed source with __source__ attribute attached.
+
+    Raises:
+        ValueError: If the named function is not found in the executed source.
     """
     namespace: dict[str, object] = {"np": np, "nkigym": nkigym}
     exec(source, namespace)

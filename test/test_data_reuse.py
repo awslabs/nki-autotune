@@ -30,9 +30,9 @@ from data_reuse_golden import (
 from hypothesis import given, settings
 
 import nkigym
-from nkigym.codegen import get_source
-from nkigym.data_reuse import analyze_data_reuse, merge_reusable_tensors, normalize_reuse_groups
 from nkigym.tiling import generate_tiled_function
+from nkigym.transforms import analyze_data_reuse, merge_reusable_tensors, normalize_reuse_groups
+from nkigym.utils import get_source
 
 
 def assert_reuse_groups_equal(actual: list[tuple[str, ...]], expected: list[tuple[str, ...]]) -> None:

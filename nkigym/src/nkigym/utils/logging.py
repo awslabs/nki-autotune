@@ -1,10 +1,20 @@
+"""Logging utilities for NKI Gym.
+
+Provides a multiline-aligned formatter and logging configuration helper.
+"""
+
 import logging
 
 __all__ = ["setup_logging", "MultilineFormatter"]
 
 
 class MultilineFormatter(logging.Formatter):
-    """Formatter that aligns multiline messages with indentation."""
+    """Formatter that aligns multiline messages with indentation.
+
+    Attributes:
+        msg_width: Width for message alignment.
+        show_metadata: Whether to append timestamp/level/name metadata.
+    """
 
     def __init__(self, msg_width: int, show_metadata: bool = True) -> None:
         """Initialize the formatter.

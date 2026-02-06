@@ -26,7 +26,7 @@ from tiling_golden import (
 )
 
 import nkigym
-from nkigym.nki_ops import OP_REGISTRY
+from nkigym.ops import OP_REGISTRY
 from nkigym.tiling import analyze_dimension, generate_tiled_function, generate_tiled_source
 
 SINGLE_MATMUL_NUMERICAL_SHAPES: list[tuple[tuple[int, int], tuple[int, int]]] = [

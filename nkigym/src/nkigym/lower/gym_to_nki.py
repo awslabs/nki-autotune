@@ -1,13 +1,18 @@
 """NKIGym to NKI lowering module.
 
 This module provides lowering from nkigym intermediate representation
-to NKI (Neuron Kernel Interface) kernel code.
+to NKI (Neuron Kernel Interface) kernel code. The lowering is nearly
+1:1, translating each nkigym operation to its NKI equivalent with
+explicit buffer management (HBM, SBUF, PSUM).
 
 The lowering works by:
 1. Parsing nkigym source code via AST
 2. Pattern matching AST nodes to operation types
 3. Using OP_REGISTRY's generate_nki() methods for compute operations
 4. Generating explicit buffer allocations and DMA copies for loads/stores
+
+To support a new operator in lowering, ensure its NkiOp.generate_nki()
+method is implemented and the operator is registered in OP_REGISTRY.
 """
 
 import ast
@@ -15,8 +20,8 @@ import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from nkigym.codegen import get_source
-from nkigym.nki_ops import OP_REGISTRY
+from nkigym.ops import OP_REGISTRY
+from nkigym.utils.source import get_source
 
 
 @dataclass

@@ -13,10 +13,10 @@ from nkipy.runtime import BaremetalExecutor
 
 import nkigym
 from autotune.core.compile import TensorStub, compile_kernel, create_spike_kernel, run_spike_kernel
-from nkigym.codegen import get_source
-from nkigym.data_reuse import analyze_data_reuse, merge_reusable_tensors
-from nkigym.gym_to_nki import lower_gym_to_nki
+from nkigym.lower import lower_gym_to_nki
 from nkigym.tiling import generate_tiled_function
+from nkigym.transforms import analyze_data_reuse, merge_reusable_tensors
+from nkigym.utils import get_source
 
 CACHE_ROOT = "/fsx/weittang/gym_cache"
 

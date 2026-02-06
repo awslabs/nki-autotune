@@ -2,10 +2,10 @@
 
 This module provides TracedTensor, a symbolic tensor that tracks
 dimension information during tracing. Operations are handled by
-NkiOp classes in nki_ops.py.
+NkiOp classes in nkigym.ops.
 """
 
-from nkigym.dim_tracker import _DimTracker
+from nkigym.tiling.dim_tracker import _DimTracker
 
 
 class TracedTensor:

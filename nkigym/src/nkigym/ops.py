@@ -1,15 +1,19 @@
-"""NKI custom operator definitions.
+"""NKI operator definitions.
 
 This module provides base classes and implementations for NKI (Neuron Kernel Interface)
 operators that can be used with TracedTensor for symbolic tracing.
 
 NKI operators follow hardware-native semantics:
-- nc_matmul expects KM × KN layout (partition dimension first)
+- nc_matmul expects KM x KN layout (partition dimension first)
 - Dimension tracking integrates with the existing _DimTracker
 
 Tracing is enabled via context manager:
 - Normal calls return numpy arrays (simulation)
 - Inside tracing_enabled() context, calls return TracedTensor
+
+To add a new operator:
+1. Subclass NkiOp and implement all abstract methods
+2. Register an instance in OP_REGISTRY with the operator name as key
 """
 
 import threading
@@ -22,7 +26,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
-    from nkigym.tensor import TracedTensor
+    from nkigym.tiling.tensor import TracedTensor
 
 
 _tracing_context = threading.local()
@@ -62,8 +66,8 @@ class NkiOp(ABC):
     TracedTensor for dimension tracking and code generation.
 
     Dispatches based on tracing context:
-    - Inside tracing_enabled() → tracing (returns TracedTensor)
-    - Outside tracing context → simulation (returns numpy array)
+    - Inside tracing_enabled() -> tracing (returns TracedTensor)
+    - Outside tracing context -> simulation (returns numpy array)
 
     Attributes:
         op_name: Name of the operation (e.g., "nc_matmul").
@@ -130,7 +134,7 @@ class NkiOp(ABC):
             inputs: List of input variable names.
 
         Returns:
-            Numpy expression string (e.g., "np.matmul(a.T, b)").
+            Numpy expression string (e.g., "nkigym.nc_matmul(a, b)").
         """
 
     @abstractmethod
@@ -149,9 +153,9 @@ class NkiOp(ABC):
 class NKIMatmul(NkiOp):
     """NKI matrix multiplication following nc_matmul semantics.
 
-    Expects inputs in KM × KN layout where K is the partition dimension:
-    - lhs (stationary): [K, M] where K ≤ 128 (pmax), M ≤ 128 (stationary fmax)
-    - rhs (moving): [K, N] where K ≤ 128 (pmax), N ≤ 512 (moving fmax)
+    Expects inputs in KM x KN layout where K is the partition dimension:
+    - lhs (stationary): [K, M] where K <= 128 (pmax), M <= 128 (stationary fmax)
+    - rhs (moving): [K, N] where K <= 128 (pmax), N <= 512 (moving fmax)
     - result: [M, N]
 
     The K dimension is contracted (unified) during the operation.
@@ -169,7 +173,7 @@ class NKIMatmul(NkiOp):
         """Execute tracing for nc_matmul on TracedTensors.
 
         Contracts K dimension (axis 0 of both inputs):
-        lhs[K, M] @ rhs[K, N] → result[M, N]
+        lhs[K, M] @ rhs[K, N] -> result[M, N]
 
         Args:
             lhs: Left-hand side (stationary) tensor of shape [K, M].
@@ -181,7 +185,7 @@ class NKIMatmul(NkiOp):
         Raises:
             ValueError: If inputs don't have exactly 2 dimensions.
         """
-        from nkigym.tensor import TracedTensor
+        from nkigym.tiling.tensor import TracedTensor
 
         if len(lhs.shape) != 2 or len(rhs.shape) != 2:
             raise ValueError(f"nc_matmul requires 2D tensors, got shapes {lhs.shape} and {rhs.shape}")
@@ -214,7 +218,7 @@ class NKIMatmul(NkiOp):
         """Execute numpy equivalent of nc_matmul.
 
         Computes lhs.T @ rhs where:
-        - lhs: [K, M] → lhs.T: [M, K]
+        - lhs: [K, M] -> lhs.T: [M, K]
         - rhs: [K, N]
         - result: [M, N]
 
@@ -252,6 +256,10 @@ class NKIMatmul(NkiOp):
 
 
 OP_REGISTRY: dict[str, NkiOp] = {"nc_matmul": NKIMatmul()}
+"""Registry mapping operation names to NkiOp instances.
+
+To add a new operator, create a subclass of NkiOp and add an instance here.
+"""
 
 
 def ndarray(shape: tuple[int, ...], dtype: type = np.float32) -> NDArray:
