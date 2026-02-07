@@ -1,10 +1,15 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import importlib
 import importlib.util
+import inspect
 import os
 import shutil
 import sys
 import tempfile
 import types
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,6 +36,39 @@ class TensorStub:
     name: str
 
 
+def resolve_kernel_ref(kernel: Callable) -> KERNEL_DTYPE:
+    """Convert a kernel function to a picklable (filepath, name) tuple.
+
+    Handles plain functions and @nki.jit-wrapped functions by unwrapping
+    to find the underlying function's source file.
+
+    Args:
+        kernel: The kernel function or decorated wrapper.
+
+    Returns:
+        Tuple of (absolute_filepath, function_name).
+
+    Raises:
+        TypeError: If the source file cannot be determined.
+    """
+    func = kernel
+    if hasattr(func, "func"):
+        func = func.func
+    elif hasattr(func, "__wrapped__"):
+        func = func.__wrapped__
+
+    try:
+        source_file = os.path.abspath(inspect.getfile(func))
+    except TypeError as e:
+        raise TypeError(
+            f"Cannot determine source file for kernel {kernel!r}. "
+            f"Ensure the kernel is defined in a .py file, not interactively."
+        ) from e
+
+    func_name = func.__name__
+    return (source_file, func_name)
+
+
 def get_kernel_by_name(kernel_name: KERNEL_DTYPE) -> types.FunctionType:
     """Load a kernel function by its module path and function name.
 
@@ -54,7 +92,6 @@ def compile_kernel(
     input_tensors: INPUT_TENSORS_DTYPE,
     output_tensors: list[tuple[str, tuple[int, ...], np.dtype]],
     kernel_kwargs: KERNEL_KWARGS_DTYPE,
-    target_instance_family: str,
     compiler_flags: str,
     output_dir: str,
 ) -> str:
@@ -65,15 +102,11 @@ def compile_kernel(
         input_tensors: Dictionary mapping tensor names to numpy arrays.
         output_tensors: List of (name, shape, dtype) tuples describing kernel outputs.
         kernel_kwargs: Additional keyword arguments for the kernel.
-        target_instance_family: Target hardware family (only "trn2" is supported).
         compiler_flags: Additional compiler arguments.
         output_dir: Directory to store compilation artifacts.
 
     Returns:
         Path to the generated NEFF file.
-
-    Raises:
-        ValueError: If target_instance_family is not "trn2".
     """
     tempfile.tempdir = "/tmp/nki_artifacts"
     os.makedirs(tempfile.tempdir, exist_ok=True)
@@ -84,11 +117,9 @@ def compile_kernel(
 
     kernel_outputs = [TensorStub(shape=shape, dtype=dtype, name=name) for name, shape, dtype in output_tensors]
 
-    if target_instance_family != "trn2":
-        raise ValueError(f"target_instance_family must be 'trn2', got '{target_instance_family}'")
-
     full_compiler_flags = f"--internal-compiler-debug-mode=penguin {compiler_flags}".strip()
 
+    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
     compile_nki_ir_kernel_to_neff(
         kernel_func=kernel,
         kernel_inputs_dict=kernel_inputs_dict,
@@ -189,15 +220,9 @@ def run_spike_kernel(
     )
     ntff_file = f"{directory}/{neff_name}.ntff"
     profile_ntff = os.path.abspath("./profile.ntff")
-    try:
-        if os.path.exists(profile_ntff):
-            shutil.copy2(profile_ntff, ntff_file)
-            try:
-                os.remove(profile_ntff)
-            except OSError:
-                pass
-    except (OSError, FileNotFoundError):
-        pass
-    if type(kernel_outputs) is np.ndarray:
+    if os.path.exists(profile_ntff):
+        shutil.copy2(profile_ntff, ntff_file)
+        os.remove(profile_ntff)
+    if isinstance(kernel_outputs, np.ndarray):
         kernel_outputs = tuple([kernel_outputs])
     return ntff_file, kernel_outputs

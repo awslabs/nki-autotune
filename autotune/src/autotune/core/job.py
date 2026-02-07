@@ -1,35 +1,42 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import json
 import os
 import shutil
 import signal
 import tempfile
-from typing import Any, Optional
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
-from autotune.core.compile import compile_kernel
+from autotune.core.compile import compile_kernel, resolve_kernel_ref
 from autotune.core.utils import capture_error_message
 from autotune.typing import (
+    CORRECTNESS_CHECK_DTYPE,
     INPUT_TENSOR_SHAPES_DTYPE,
     INPUT_TENSORS_DTYPE,
     KERNEL_DTYPE,
     KERNEL_KWARGS_DTYPE,
-    OUTPUT_TENSORS_DTYPE,
-    POSTPROCESSING_DTYPE,
 )
 
 
-def dummy_postprocessing(
-    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_outputs: OUTPUT_TENSORS_DTYPE
-) -> None:
-    """No-op postprocessing function used as default.
+def workload_name(kernel_name: str, input_tensor_shapes: dict[str, tuple[int, ...]]) -> str:
+    """Generate a canonical workload name from kernel and input shapes.
+
+    Used for cache directory paths, JSON output, and visualization labels.
 
     Args:
-        input_tensors: Dictionary mapping tensor names to numpy arrays.
-        kernel_kwargs: Additional keyword arguments for the kernel.
-        kernel_outputs: Tuple of output arrays from kernel execution.
+        kernel_name: The kernel function name.
+        input_tensor_shapes: Mapping of tensor names to shapes.
+
+    Returns:
+        Canonical string like 'nki_matmul_kernel/128x512_512x1024'.
     """
+    shapes_str = "_".join("x".join(str(d) for d in shape) for shape in input_tensor_shapes.values())
+    return f"{kernel_name}/{shapes_str}"
 
 
 class ProfileJob:
@@ -40,13 +47,14 @@ class ProfileJob:
         index: int,
         main_metric: str,
         kernel: KERNEL_DTYPE,
+        input_tensors: INPUT_TENSORS_DTYPE,
         input_tensor_shapes: INPUT_TENSOR_SHAPES_DTYPE,
-        output_tensor_shapes: dict[str, tuple[int, ...]],
+        output_shapes: dict[str, tuple[int, ...]],
         mac_count: int,
         data_type: np.dtype,
-        kernel_kwargs: KERNEL_KWARGS_DTYPE,
+        scalar_kwargs: KERNEL_KWARGS_DTYPE,
         compiler_flags: str,
-        postprocessing: Optional[POSTPROCESSING_DTYPE],
+        correctness_check: CORRECTNESS_CHECK_DTYPE,
         cache_root_dir: str,
     ) -> None:
         """Initialize a profiling job with kernel configuration and cache settings.
@@ -54,73 +62,69 @@ class ProfileJob:
         Args:
             index: Unique identifier for this job.
             main_metric: Primary performance metric to optimize.
-            kernel: Kernel function to profile.
+            kernel: Tuple of (filepath, function_name) identifying the kernel.
+            input_tensors: Dictionary mapping tensor names to numpy arrays.
             input_tensor_shapes: Shapes of input tensors.
-            output_tensor_shapes: Shapes of output tensors, mapping tensor name to shape tuple.
+            output_shapes: Shapes of output tensors, mapping tensor name to shape tuple.
             mac_count: Number of MAC operations for performance calculation.
             data_type: Data type for input tensors.
-            kernel_kwargs: Additional kernel arguments.
+            scalar_kwargs: Non-tensor keyword arguments for the kernel.
             compiler_flags: Compilation flags and target configuration.
-            postprocessing: Optional post-processing function for outputs.
+            correctness_check: Tuple of (golden_fn, atol, rtol) for correctness
+                verification, or None to skip.
             cache_root_dir: Root directory for caching results.
         """
         self.attributes: list[str] = []
-        input_tensor_shapes_str = "_".join(
-            "x".join(str(dim) for dim in shape) for shape in input_tensor_shapes.values()
-        )
-        _, kernel_name = kernel
-        workload_dir = f"{cache_root_dir}/{kernel_name}/{input_tensor_shapes_str}"
-        cache_dir = f"{workload_dir}/id{index}"
+        _, kernel_func_name = kernel
+        wl_name = workload_name(kernel_func_name, input_tensor_shapes)
+        wl_dir = f"{cache_root_dir}/{wl_name}"
+        cache_dir = f"{wl_dir}/id{index}"
         self.add_attributes(
             index=index,
             kernel=kernel,
             input_tensor_shapes=input_tensor_shapes,
-            output_tensor_shapes=output_tensor_shapes,
+            output_shapes=output_shapes,
             data_type=data_type,
-            kernel_kwargs=kernel_kwargs,
+            scalar_kwargs=scalar_kwargs,
             compiler_flags=compiler_flags,
             cache_dir=cache_dir,
             mac_count=mac_count,
         )
-        if postprocessing:
-            self.postprocessing = postprocessing
-        else:
-            self.postprocessing = dummy_postprocessing
+        self._input_tensors = input_tensors
+        self.correctness_check = correctness_check
         self.main_metric = main_metric
-        self.workload_dir = workload_dir
+        self.workload_dir = wl_dir
 
     @property
     def input_tensors(self) -> INPUT_TENSORS_DTYPE:
-        """Return the cached input tensors."""
-        if hasattr(self, "_input_tensors"):
-            return self._input_tensors
-        else:
-            raise ValueError(f"ProfileJob input tensors are not initialized")
+        """Return the input tensors."""
+        return self._input_tensors
 
     @input_tensors.setter
-    def input_tensors(self, value: INPUT_TENSORS_DTYPE):
+    def input_tensors(self, value: INPUT_TENSORS_DTYPE) -> None:
         """Set the input tensors for this job."""
         self._input_tensors = value
 
-    def init_job_dir(self):
+    def init_job_dir(self) -> None:
         """Initialize the cache directory for this job, removing any existing content."""
         if os.path.exists(self.cache_dir):
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
 
     def to_dict(self) -> dict:
-        """Convert to dictionary representation including only attributes in self.attributes."""
+        """Convert to dictionary representation including only tracked attributes."""
         result = {}
         for attr_name in self.attributes:
             val = getattr(self, attr_name)
             try:
                 json.dumps(val)
                 result[attr_name] = val
-            except Exception:
+            except (TypeError, ValueError):
                 result[attr_name] = str(val)
         return result
 
     def __repr__(self) -> str:
+        """Return a string representation of ProfileJob."""
         attribute_strs = []
         for attribute in self.attributes:
             if attribute == "error":
@@ -129,14 +133,16 @@ class ProfileJob:
                 attribute_str = getattr(self, attribute)
             attribute_strs.append(f"{attribute}={attribute_str}")
         attributes_str = ", ".join(attribute_strs)
-        repr_str = f"ProfileJob({attributes_str})"
-        return repr_str
+        return f"ProfileJob({attributes_str})"
 
-    def add_attributes(self, **kwargs):
+    def add_attributes(self, **kwargs: Any) -> None:
         """Add new attributes to the job and track them in the attributes list.
 
         Args:
             **kwargs: Arbitrary keyword arguments to add as attributes.
+
+        Raises:
+            AssertionError: If an attribute already exists.
         """
         for key, value in kwargs.items():
             assert not hasattr(self, key), f"Attribute {key} already exists in ProfileJob."
@@ -145,23 +151,25 @@ class ProfileJob:
 
     @property
     def has_error(self) -> bool:
+        """Whether this job encountered an error."""
         return hasattr(self, "error")
 
     @property
     def is_correct(self) -> bool:
-        return hasattr(self, "postprocessing_result") and self.postprocessing_result == True
+        """Whether correctness verification passed."""
+        return hasattr(self, "correctness_result") and self.correctness_result is True
 
     @property
     def sort_val(self) -> tuple[int, float]:
+        """Sorting key: (priority, metric_value). Lower is better."""
         if self.has_error:
-            val = (2, float("inf"))
+            return (2, float("inf"))
         elif not hasattr(self, self.main_metric):
-            val = (1, float("inf"))
+            return (1, float("inf"))
         else:
-            val = (0, getattr(self, self.main_metric))
-        return val
+            return (0, getattr(self, self.main_metric))
 
-    def add_error(self, error_msg: str):
+    def add_error(self, error_msg: str) -> None:
         """Record an error message, keeping only the first error encountered.
 
         Args:
@@ -172,56 +180,70 @@ class ProfileJob:
 
 
 class ProfileJobs:
-    """Collection of ProfileJob instances with batch management and caching utilities."""
+    """Collection of ProfileJob instances with batch management."""
 
-    def __init__(self, cache_root_dir: str, target_instance_family: str) -> None:
+    def __init__(self, cache_root_dir: str) -> None:
         """Initialize job collection with cache directory and empty job list.
 
         Args:
             cache_root_dir: Root directory for caching results.
-            target_instance_family: Target instance family ('trn1' or 'trn2') for all jobs.
         """
         self.cache_root_dir = cache_root_dir
-        self.target_instance_family = target_instance_family
         self.jobs: dict[int, ProfileJob] = {}
-        self._tensor_cache: dict[tuple[tuple[int, ...], np.dtype], np.ndarray] = {}
         self.main_metric = "min_ms"
 
     def add_job(
         self,
-        kernel: KERNEL_DTYPE,
-        input_tensor_shapes: INPUT_TENSOR_SHAPES_DTYPE,
-        output_tensor_shapes: dict[str, tuple[int, ...]],
-        data_type,
+        kernel: Callable,
         kernel_kwargs: dict[str, Any],
+        output_shapes: dict[str, tuple[int, ...]],
         compiler_flags: str,
-        postprocessing: POSTPROCESSING_DTYPE,
-        mac_count: int = 0,
-    ):
+        correctness_check: CORRECTNESS_CHECK_DTYPE = None,
+    ) -> None:
         """Create and add a new ProfileJob to the collection.
 
+        Numpy arrays in kernel_kwargs are treated as tensor inputs (shapes and
+        dtype inferred from them). Non-array values are passed as scalar keyword
+        arguments. MAC count is automatically computed by tracing nc_matmul calls.
+
         Args:
-            kernel: Kernel function to profile.
-            input_tensor_shapes: Shapes of input tensors.
-            output_tensor_shapes: Shapes of output tensors, mapping tensor name to shape tuple.
-            data_type: Data type for input tensors.
-            kernel_kwargs: Additional kernel arguments.
-            compiler_flags: Compilation flags and target configuration.
-            postprocessing: Optional post-processing function for outputs.
-            mac_count: Number of MAC operations for performance calculation.
+            kernel: The NKI kernel function (or @nki.jit-wrapped).
+            kernel_kwargs: All kernel arguments. Numpy arrays are tensor inputs;
+                non-array values are scalar keyword arguments.
+            output_shapes: Shapes of output tensors, mapping name to shape tuple.
+            compiler_flags: Compilation flags string.
+            correctness_check: Tuple of (golden_fn, atol, rtol) for correctness
+                verification, or None to skip.
+
+        Raises:
+            ValueError: If kernel_kwargs contains no numpy arrays.
         """
+        from autotune.core.analyze import compute_mac_count
+
+        kernel_ref = resolve_kernel_ref(kernel)
+        tensor_inputs = {k: v for k, v in kernel_kwargs.items() if isinstance(v, np.ndarray)}
+        scalar_kwargs = {k: v for k, v in kernel_kwargs.items() if not isinstance(v, np.ndarray)}
+
+        if not tensor_inputs:
+            raise ValueError("kernel_kwargs must contain at least one numpy array as a tensor input.")
+
+        input_tensor_shapes = {name: arr.shape for name, arr in tensor_inputs.items()}
+        data_type = next(iter(tensor_inputs.values())).dtype
+        mac_count = compute_mac_count(kernel, kernel_kwargs)
+
         job_index = len(self.jobs)
         job = ProfileJob(
             index=job_index,
             main_metric=self.main_metric,
-            kernel=kernel,
+            kernel=kernel_ref,
+            input_tensors=tensor_inputs,
             input_tensor_shapes=input_tensor_shapes,
-            output_tensor_shapes=output_tensor_shapes,
+            output_shapes=output_shapes,
             mac_count=mac_count,
             data_type=data_type,
-            kernel_kwargs=kernel_kwargs,
+            scalar_kwargs=scalar_kwargs,
             compiler_flags=compiler_flags,
-            postprocessing=postprocessing,
+            correctness_check=correctness_check,
             cache_root_dir=self.cache_root_dir,
         )
         self.jobs[job_index] = job
@@ -245,11 +267,9 @@ class ProfileJobs:
             return "ProfileJobs(jobs: None)"
 
         if len(self.jobs) <= 4:
-            # For small collections, show all jobs
             jobs_str = ",\n  ".join(str(job) for job in self.jobs.values())
             result = f"ProfileJobs({len(self.jobs)} jobs):\n  {jobs_str}"
         else:
-            # For larger collections, show first and last jobs with count
             job_indices = sorted(self.jobs.keys())
             result = (
                 f"ProfileJobs({len(self.jobs)} jobs):\n"
@@ -271,25 +291,11 @@ class ProfileJobs:
         Returns:
             New ProfileJobs with selected jobs.
         """
-        subset_jobs = ProfileJobs(self.cache_root_dir, target_instance_family=self.target_instance_family)
+        subset_jobs = ProfileJobs(self.cache_root_dir)
         subset_jobs.jobs = {index: self.jobs[index] for index in indices}
-        subset_jobs._tensor_cache = self._tensor_cache
         return subset_jobs
 
-    def initialize_input_tensors(self) -> None:
-        """Generate and cache random input tensors for all jobs."""
-        for job_index in self.jobs:
-            job = self.jobs[job_index]
-            job_input_tensors: INPUT_TENSORS_DTYPE = {}
-            for tensor_name in job.input_tensor_shapes:
-                tensor_shape = job.input_tensor_shapes[tensor_name]
-                cache_key = (tensor_shape, job.data_type)
-                if cache_key not in self._tensor_cache:
-                    self._tensor_cache[cache_key] = np.random.normal(0, 0.001, size=tensor_shape).astype(job.data_type)
-                job_input_tensors[tensor_name] = self._tensor_cache[cache_key]
-            job.input_tensors = job_input_tensors
-
-    def dump_json(self):
+    def dump_json(self) -> None:
         """Save performance metrics to JSON files, organized by workload directory.
 
         Raises:
@@ -304,15 +310,14 @@ class ProfileJobs:
                 jobs_by_workload_dir[job.workload_dir] = []
             jobs_by_workload_dir[job.workload_dir].append(job_index)
 
-        for workload_dir in jobs_by_workload_dir:
-            job_indices = jobs_by_workload_dir[workload_dir]
-            sorted_job_indices = sorted(job_indices, key=lambda job_index: self.jobs[job_index].sort_val)
+        for wl_dir, job_indices in jobs_by_workload_dir.items():
+            sorted_job_indices = sorted(job_indices, key=lambda ji: self.jobs[ji].sort_val)
 
             correct_count = 0
             error_count = 0
             error_types: dict[str, int] = {}
-            for job_index in sorted_job_indices:
-                job = self.jobs[job_index]
+            for ji in sorted_job_indices:
+                job = self.jobs[ji]
                 if job.has_error:
                     error_count += 1
                     error_type = getattr(job, "error").split("\n")[0]
@@ -330,19 +335,19 @@ class ProfileJobs:
                     "error_types": error_types,
                     "main_metric": self.main_metric,
                 },
-                "results": [self.jobs[job_index].to_dict() for job_index in sorted_job_indices],
+                "results": [self.jobs[ji].to_dict() for ji in sorted_job_indices],
             }
 
             try:
-                os.makedirs(workload_dir, exist_ok=True)
-                filepath = os.path.join(workload_dir, "perf_metrics.json")
+                os.makedirs(wl_dir, exist_ok=True)
+                filepath = os.path.join(wl_dir, filename)
                 with open(filepath, "w") as f:
                     json.dump(json_data, f, indent=2, sort_keys=True)
             except Exception as e:
                 raise OSError(f"Failed to save metrics to {filepath}: {str(e)}")
 
 
-def timeout_handler(signum, frame):
+def timeout_handler(signum: int, frame: Any) -> None:
     """Signal handler to raise TimeoutError for compilation timeout."""
     raise TimeoutError("Compilation timed out after 10 minutes")
 
@@ -356,20 +361,18 @@ def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
     Returns:
         Updated ProfileJobs with compilation results.
     """
-    jobs.initialize_input_tensors()
     for job_index in jobs.jobs:
         job = jobs.jobs[job_index]
         tmp_dir = tempfile.mkdtemp(prefix="nki_compile_")
         try:
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(600)
-            output_tensors = [(name, shape, job.data_type) for name, shape in job.output_tensor_shapes.items()]
+            output_tensors = [(name, shape, job.data_type) for name, shape in job.output_shapes.items()]
             neff = compile_kernel(
                 kernel_name=job.kernel,
                 input_tensors=job.input_tensors,
                 output_tensors=output_tensors,
-                kernel_kwargs=job.kernel_kwargs,
-                target_instance_family=jobs.target_instance_family,
+                kernel_kwargs=job.scalar_kwargs,
                 compiler_flags=job.compiler_flags,
                 output_dir=tmp_dir,
             )

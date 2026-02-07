@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import neuronxcc.nki.isa as nisa
 import neuronxcc.nki.language as nl
 import numpy as np
@@ -9,47 +12,55 @@ from autotune.modules.layout import transpose_tiles_in_block
 from autotune.modules.matmul import GEMMCompatibility
 from autotune.modules.reductions import compute_max_vals
 from autotune.modules.scalar_ops import blocked_activation, scale_block
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_KWARGS_DTYPE, OUTPUT_TENSORS_DTYPE
 
 
-def softmax_gemm_correctness_postprocessing(
-    input_tensors: INPUT_TENSORS_DTYPE, kernel_kwargs: KERNEL_KWARGS_DTYPE, kernel_outputs: OUTPUT_TENSORS_DTYPE
-) -> None:
-    lhs, rhs = input_tensors
-    atol, rtol = 1e-5, 1e-5
-    golden = softmax_gemm_np(lhs, rhs)
-    kernel_output = nl.static_cast(kernel_outputs[0], np.float32)
-    np.testing.assert_allclose(
-        actual=kernel_output, desired=golden, atol=atol, rtol=rtol, err_msg="kernel_output vs golden", verbose=True
-    )
-
-
-def softmax_gemm_np(lhs, rhs):
-    """
-    Apply softmax to lhs first, then perform GEMM with rhs.
+def softmax_gemm_golden(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Golden reference for softmax + GEMM.
 
     Args:
-        lhs: Left-hand side matrix of shape (batch, M, K)
-        rhs: Right-hand side matrix of shape (K, N)
+        lhs: Left-hand side matrix of shape (batch, M, K).
+        rhs: Right-hand side matrix of shape (K, N).
 
     Returns:
-        Matrix of shape (batch, M, N) resulting from (softmax(lhs) @ rhs)
+        Expected softmax-GEMM result as float32.
     """
-    # Apply softmax to lhs along K dimension (axis=-1)
+    return softmax_gemm_np(lhs, rhs).astype(np.float32)
+
+
+def softmax_gemm_np(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Apply softmax to lhs along K dimension, then perform GEMM with rhs.
+
+    Args:
+        lhs: Left-hand side matrix of shape (batch, M, K).
+        rhs: Right-hand side matrix of shape (K, N).
+
+    Returns:
+        Matrix of shape (batch, M, N) resulting from softmax(lhs) @ rhs.
+    """
     lhs_max = np.max(lhs, axis=-1, keepdims=True)
     exp_lhs = np.exp(lhs - lhs_max)
     sum_exp = np.sum(exp_lhs, axis=-1, keepdims=True)
     softmax_lhs = exp_lhs / sum_exp
 
-    # Perform batch matrix multiplication with rhs
     result = np.matmul(softmax_lhs, rhs)
 
     return result
 
 
-def online_softmax_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int):
-    """
-    Online Softmax + GEMM algorithm with vectorized block processing using MKN loop ordering.
+def online_softmax_gemm_np_mkn(
+    lhs: np.ndarray, rhs: np.ndarray, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int
+) -> np.ndarray:
+    """Online Softmax + GEMM algorithm with vectorized block processing using MKN loop ordering.
+
+    Args:
+        lhs: Left-hand side matrix of shape (batch, M, K).
+        rhs: Right-hand side matrix of shape (K, N).
+        NUM_BLOCK_M: Number of blocks along M dimension.
+        NUM_BLOCK_N: Number of blocks along N dimension.
+        NUM_BLOCK_K: Number of blocks along K dimension.
+
+    Returns:
+        Output matrix of shape (batch, M, N).
     """
     batch, M, K = lhs.shape
     K_check, N = rhs.shape
@@ -57,82 +68,62 @@ def online_softmax_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM
     if K != K_check:
         raise ValueError(f"Incompatible dimensions: lhs K dimension is {K} and rhs K dimension is {K_check}")
 
-    # Calculate block sizes in each dimension
     BLOCK_M = M // NUM_BLOCK_M
     BLOCK_N = N // NUM_BLOCK_N
     BLOCK_K = K // NUM_BLOCK_K
 
-    # Initialize output matrix
     output = np.zeros((batch, M, N))
 
-    # Process each batch
     for b in range(batch):
-        # Process blocks of M dimension
         for block_m in range(NUM_BLOCK_M):
             m_start = block_m * BLOCK_M
             m_end = min(M, (block_m + 1) * BLOCK_M)
             m_size = m_end - m_start
 
-            # Initialize state arrays for the entire M block
-            a_vals = np.zeros((m_size, 1))  # Current max values
-            a_prev = np.zeros((m_size, 1))  # Previous max values
-            b_vals = np.zeros((m_size, 1))  # Current normalization terms
-            b_prev = np.zeros((m_size, 1))  # Previous normalization terms
-            outputs = np.zeros((m_size, N))  # Collect outputs for all N
+            a_vals = np.zeros((m_size, 1))
+            a_prev = np.zeros((m_size, 1))
+            b_vals = np.zeros((m_size, 1))
+            b_prev = np.zeros((m_size, 1))
+            outputs = np.zeros((m_size, N))
 
-            # Process K dimension in blocks
             for block_k in range(NUM_BLOCK_K):
                 k_start = block_k * BLOCK_K
                 k_end = min(K, (block_k + 1) * BLOCK_K)
 
-                # Extract current K block for all M rows in this block
-                lhs_block = lhs[b, m_start:m_end, k_start:k_end]  # Shape: (m_size, BLOCK_K)
+                lhs_block = lhs[b, m_start:m_end, k_start:k_end]
 
-                # Calculate block max values once for all N
-                block_max_vals = np.max(lhs_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
+                block_max_vals = np.max(lhs_block, axis=1, keepdims=True)
 
                 if block_k == 0:
-                    # For first K block, simply set the values directly
                     a_vals = block_max_vals
                 else:
-                    # For subsequent blocks, update max and calculate scaling
                     a_vals = np.maximum(a_prev, block_max_vals)
-                    scale_factor = np.exp(a_prev - a_vals)  # Shape: (m_size, 1)
+                    scale_factor = np.exp(a_prev - a_vals)
 
-                # Calculate exp(x - a) for all elements in the block
-                exp_block = np.exp(lhs_block - a_vals)  # Shape: (m_size, BLOCK_K)
-                # Calculate sum of exp values for this block
-                exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)  # Shape: (m_size, 1)
+                exp_block = np.exp(lhs_block - a_vals)
+                exp_sum_block = np.sum(exp_block, axis=1, keepdims=True)
 
                 if block_k == 0:
                     b_vals = exp_sum_block
                 else:
-                    # Update b values (normalization term)
                     b_vals = b_prev * scale_factor + exp_sum_block
-                    # Apply rescaling to existing outputs (for all N blocks at once)
                     combined_rescale = scale_factor * (b_prev / b_vals)
                     outputs *= combined_rescale
 
-                # Normalize exp_block for softmax weighting
                 softmax_block = exp_block / b_vals
 
-                # Process each N block with the pre-calculated softmax weights
                 for block_n in range(NUM_BLOCK_N):
                     n_start = block_n * BLOCK_N
                     n_end = min(N, (block_n + 1) * BLOCK_N)
 
-                    # Extract current N block for this K block
-                    rhs_block = rhs[k_start:k_end, n_start:n_end]  # Shape: (BLOCK_K, n_size)
+                    rhs_block = rhs[k_start:k_end, n_start:n_end]
 
-                    # Calculate contribution and add to outputs
                     contribution = np.matmul(softmax_block, rhs_block)
                     outputs[:, n_start:n_end] += contribution
 
-                # Store current values as previous for next iteration
                 a_prev[:] = a_vals
                 b_prev[:] = b_vals
 
-            # Store final results for this M block
             output[b, m_start:m_end, :] = outputs
 
     return output
@@ -142,6 +133,19 @@ def online_softmax_gemm_np_mkn(lhs, rhs, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM
 def online_softmax_linear_MKN(
     lhs: tensor, rhs: tensor, NUM_BLOCK_M: int, NUM_BLOCK_N: int, NUM_BLOCK_K: int, norm_dtype=nl.float32
 ):
+    """Online softmax + linear NKI kernel with MKN loop ordering.
+
+    Args:
+        lhs: Input tensor of shape (batch, M, K).
+        rhs: Weight tensor of shape (K, N).
+        NUM_BLOCK_M: Number of blocks along M dimension.
+        NUM_BLOCK_N: Number of blocks along N dimension.
+        NUM_BLOCK_K: Number of blocks along K dimension.
+        norm_dtype: Data type for normalization accumulators.
+
+    Returns:
+        Output tensor of shape (batch, M, N).
+    """
     assert len(lhs.shape) == 3, f"Expecting (batch, M, K) in LHS. Received {lhs.shape}."
     mm = GEMMCompatibility(transposed_lhs=False)
     mm((lhs, rhs), {"NUM_BLOCK_M": NUM_BLOCK_M, "NUM_BLOCK_N": NUM_BLOCK_N, "NUM_BLOCK_K": NUM_BLOCK_K})
@@ -195,7 +199,6 @@ def online_softmax_linear_MKN(
                     )
                     matmul_blocks_tile_transposed_lhs(exp_block, rhs_block, result_block, block_id_N)
 
-                # Update previous values
                 a_prev[...] = nl.copy(a_vals[...], dtype=a_vals.dtype)
                 b_prev[...] = nl.copy(b_vals[...], dtype=b_vals.dtype)
 
@@ -205,6 +208,16 @@ def online_softmax_linear_MKN(
 
 
 def compute_combined_scale(scale_factor, b_vals, b_prev):
+    """Compute combined rescaling factor as scale_factor * (b_prev / b_vals).
+
+    Args:
+        scale_factor: Exponential scale factor tensor.
+        b_vals: Current normalization term tensor.
+        b_prev: Previous normalization term tensor.
+
+    Returns:
+        Combined scale factor tensor.
+    """
     assert b_vals.shape == scale_factor.shape
     assert b_prev.shape == scale_factor.shape
 
@@ -230,6 +243,12 @@ def compute_combined_scale(scale_factor, b_vals, b_prev):
 
 
 def scale_prev_result(result_block, scale_factor):
+    """Rescale all tiles in result_block by scale_factor.
+
+    Args:
+        result_block: Result tensor of shape (TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N).
+        scale_factor: Scale factor tensor of shape (TILE_M, TILES_IN_BLOCK_M, 1, 1).
+    """
     TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N = result_block.shape
     assert scale_factor.shape == (TILE_M, TILES_IN_BLOCK_M, 1, 1)
     idx_scale_factor = nl.mgrid[0:TILE_M, 0:1]
@@ -245,12 +264,14 @@ def scale_prev_result(result_block, scale_factor):
 
 
 def compute_safe_exp(input_block, a_vals):
-    """
-    exp_block = np.exp(input_block - a_vals)
+    """Compute exp(input_block - a_vals) element-wise using NKI activation ISA.
 
     Args:
-        input_block (_type_): (par_size, *block_sizes, bcast_size)
-        a_vals (_type_): (par_size, *block_sizes, 1)
+        input_block: Input tensor of shape (par_size, *block_sizes, bcast_size).
+        a_vals: Max values tensor of shape (par_size, *block_sizes, 1).
+
+    Returns:
+        Exponentiated tensor with the same shape as input_block.
     """
     assert a_vals.shape[:-1] == input_block.shape[:-1]
     exp_block = nl.ndarray(input_block.shape, dtype=input_block.dtype, buffer=nl.sbuf)
@@ -284,27 +305,18 @@ def compute_safe_exp(input_block, a_vals):
 
 
 def compute_scale_factors(scale_factor, a_vals, a_prev):
-    """
-    Computes scale factors by applying exp(a_prev - a_vals) element-wise.
+    """Compute scale factors by applying exp(a_prev - a_vals) element-wise.
 
-    This function calculates scaling factors by applying the exponential function to
-    the difference between previous activation values and current activation values.
-    The computation is performed independently for each block in the multi-dimensional tensor.
+    Calculates scaling factors using the exponential function on the difference
+    between previous and current activation values. Processes block by block.
 
     Args:
-        a_vals (nl.ndarray): Current activation values tensor with shape (par_size, *block_sizes, free_size).
-        a_prev (nl.ndarray): Previous activation values tensor with the same shape as a_vals.
-
-    Returns:
-        nl.ndarray: Scale factors tensor with the same shape as inputs, containing
-                    exp(a_prev - a_vals) for each element.
+        scale_factor: Output tensor to write scale factors into.
+        a_vals: Current activation values tensor with shape (par_size, *block_sizes, free_size).
+        a_prev: Previous activation values tensor with the same shape as a_vals.
 
     Raises:
         AssertionError: If a_vals and a_prev have different shapes.
-
-    Note:
-        This function processes the input tensors block by block, where blocks are determined
-        by the middle dimensions of the input tensors.
     """
     assert a_vals.shape == a_prev.shape
     par_size = a_vals.shape[0]
@@ -330,16 +342,16 @@ def compute_scale_factors(scale_factor, a_vals, a_prev):
 
 
 def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks, block_id_N):
-    """
-    Accumulate matmul result tiles between lhs and rhs into result_block
-    LHS is transposed at the tile level.
-    Note that this is not the same as lhsT.
-    'matmul_block' module computes lhsT @ rhs.
+    """Accumulate matmul result tiles between tile-transposed LHS and RHS.
+
+    Computes tileT_lhs_block.T @ rhs_block and accumulates into result_blocks.
+    LHS is transposed at the tile level (not the same as full matrix transpose).
 
     Args:
-    tileT_lhs_block: TILE_M, TILES_IN_BLOCK_M, unity, BLOCK_K
-    rhs_block: TILE_K, TILES_IN_BLOCK_K, TILES_IN_BLOCK_N, TILE_N
-    result_block : TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N
+        tileT_lhs_block: Tile-transposed LHS of shape (TILE_M, TILES_IN_BLOCK_M, 1, BLOCK_K).
+        rhs_block: RHS tensor of shape (TILE_K, TILES_IN_BLOCK_K, TILES_IN_BLOCK_N, TILE_N).
+        result_blocks: Accumulator of shape (TILE_M, NUM_BLOCK_N, TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILE_N).
+        block_id_N: Current N block index for result accumulation.
     """
     TILE_M, TILES_IN_BLOCK_M, unity, BLOCK_K = tileT_lhs_block.shape
     TILE_K, TILES_IN_BLOCK_K, TILES_IN_BLOCK_N, TILE_N = rhs_block.shape
@@ -361,9 +373,6 @@ def matmul_blocks_tile_transposed_lhs(tileT_lhs_block, rhs_block, result_blocks,
     for tile_id_M in nl.affine_range(TILES_IN_BLOCK_M):
         for tile_id_N in nl.affine_range(TILES_IN_BLOCK_N):
             result_tile = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            """
-            Use PSUM buffer to accumulate into a single hardware tile
-            """
             for tile_id_K in nl.affine_range(TILES_IN_BLOCK_K):
                 k_ofs = tile_id_K * TILE_K
                 result_tile += nisa.nc_matmul(

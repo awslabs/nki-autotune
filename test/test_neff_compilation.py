@@ -10,6 +10,7 @@ with Trainium hardware or simulation support.
 """
 
 import os
+import subprocess
 
 import nki
 import nki.isa as nisa
@@ -19,7 +20,17 @@ import pytest
 
 from autotune.core.compile import compile_kernel
 
-NEURON_COMPILER_AVAILABLE = os.environ.get("NEURON_COMPILER_AVAILABLE", "0") == "1"
+
+def _neuron_devices_available() -> bool:
+    """Check if Neuron devices are available by running neuron-ls."""
+    try:
+        result = subprocess.run(["neuron-ls"], capture_output=True, timeout=10)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+NEURON_DEVICES_AVAILABLE = _neuron_devices_available()
 
 
 @nki.jit
@@ -109,43 +120,17 @@ def nki_matmul_block_free_dimension_(lhsT, rhs):
     return result
 
 
-class MatmulTransposedLhsCorrectness:
-    """Postprocessing to verify matmul with transposed LHS.
+def matmul_transposed_lhs_golden(lhsT: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Compute golden reference for transposed-LHS matmul.
 
-    This class compares kernel output against a numpy reference implementation
-    to verify numerical correctness of the compiled matmul kernel.
+    Args:
+        lhsT: Transposed left-hand side matrix of shape [K, M].
+        rhs: Right-hand side matrix of shape [K, N].
 
-    The kernel computes C = lhsT.T @ rhs, so this postprocessor verifies
-    that the actual output matches the expected numpy matmul result.
-
-    Example:
-        Use as postprocessing function::
-
-            postprocess = MatmulTransposedLhsCorrectness()
-            postprocess(input_tensors, kernel_kwargs, kernel_outputs)
+    Returns:
+        Expected result of lhsT.T @ rhs.
     """
-
-    def __call__(
-        self, input_tensors: dict[str, np.ndarray], kernel_kwargs: dict, kernel_outputs: tuple[np.ndarray, ...]
-    ) -> None:
-        """Compare kernel output with numpy reference implementation.
-
-        Args:
-            input_tensors: Dictionary mapping tensor names to numpy arrays.
-                Must contain 'lhsT' (K×M) and 'rhs' (K×N) tensors.
-            kernel_kwargs: Dictionary of kernel keyword arguments (unused).
-            kernel_outputs: Tuple of kernel output arrays. First element
-                should be the result matrix (M×N).
-
-        Raises:
-            AssertionError: If kernel output does not match expected result
-                within tolerance (rtol=1e-3, atol=1e-3).
-        """
-        lhsT = input_tensors["lhsT"]
-        rhs = input_tensors["rhs"]
-        expected = lhsT.T @ rhs
-        actual = kernel_outputs[0]
-        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
+    return lhsT.T @ rhs
 
 
 class TestCompileKernel:
@@ -153,24 +138,11 @@ class TestCompileKernel:
 
     This class verifies that compile_kernel correctly compiles NKI kernels
     to NEFF format using the compile_nki_ir_kernel_to_neff API.
-
-    Example:
-        Run compile_kernel tests::
-
-            pytest test/test_neff_compilation.py::TestCompileKernel -v
     """
 
-    @pytest.mark.skipif(
-        not NEURON_COMPILER_AVAILABLE,
-        reason="Requires NeuronX compiler with Trainium hardware. Set NEURON_COMPILER_AVAILABLE=1 to run.",
-    )
+    @pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices (neuron-ls must succeed).")
     def test_compile_kernel_produces_neff(self, tmp_path):
         """Verify compile_kernel produces a valid NEFF file.
-
-        **Validates: Requirements 1.1, 1.8**
-
-        For valid input tensors and kernel configuration, compile_kernel SHALL
-        return a path to an existing NEFF file.
 
         Args:
             tmp_path: Pytest fixture providing a temporary directory.
@@ -193,7 +165,6 @@ class TestCompileKernel:
             input_tensors=input_tensors,
             output_tensors=output_tensors,
             kernel_kwargs={},
-            target_instance_family="trn2",
             compiler_flags="",
             output_dir=str(tmp_path),
         )
@@ -207,49 +178,30 @@ class TestMultiKernelWorkload:
 
     This class verifies that the autotune infrastructure can compile multiple
     kernel configurations with different matrix sizes in a single batch.
-
-    Example:
-        Run multi-kernel workload tests::
-
-            pytest test/test_neff_compilation.py::TestMultiKernelWorkload -v
     """
 
-    @pytest.mark.skipif(
-        not NEURON_COMPILER_AVAILABLE,
-        reason="Requires NeuronX compiler with Trainium hardware. Set NEURON_COMPILER_AVAILABLE=1 to run.",
-    )
+    @pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices (neuron-ls must succeed).")
     def test_multi_kernel_compilation(self, tmp_path):
         """Verify compilation succeeds for multiple kernel configurations.
-
-        **Validates: Requirements 2.2, 2.3, 2.4, 2.5**
-
-        For multiple valid matrix configurations, ProfileJobs and compile_jobs
-        SHALL successfully compile all kernels and produce valid NEFF files.
 
         Args:
             tmp_path: Pytest fixture providing a temporary directory.
         """
         from autotune.core.job import ProfileJobs, compile_jobs
 
-        kernel_file = os.path.abspath(__file__)
-        kernel_name = (kernel_file, "nki_matmul_block_free_dimension_")
-
-        jobs = ProfileJobs(cache_root_dir=str(tmp_path), target_instance_family="trn2")
+        jobs = ProfileJobs(cache_root_dir=str(tmp_path))
 
         test_sizes = [(256, 1024, 128), (512, 1024, 256), (256, 2048, 128)]
 
         for M, N, K in test_sizes:
-            input_tensor_shapes = {"lhsT": (K, M), "rhs": (K, N)}
-            output_tensor_shapes = {"result": (M, N)}
-
+            lhsT = np.zeros((K, M), dtype=np.float32)
+            rhs = np.zeros((K, N), dtype=np.float32)
             jobs.add_job(
-                kernel=kernel_name,
-                input_tensor_shapes=input_tensor_shapes,
-                output_tensor_shapes=output_tensor_shapes,
-                data_type=np.float32,
-                kernel_kwargs={},
+                kernel=nki_matmul_block_free_dimension_,
+                kernel_kwargs={"lhsT": lhsT, "rhs": rhs},
+                output_shapes={"result": (M, N)},
                 compiler_flags="",
-                postprocessing=MatmulTransposedLhsCorrectness(),
+                correctness_check=(matmul_transposed_lhs_golden, 1e-3, 1e-3),
             )
 
         compiled_jobs = compile_jobs(jobs)

@@ -1,30 +1,24 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import subprocess
 
 import numpy as np
 
 
-def calculate_mfu(mac_count: int, time_ms: float, target_instance_family: str) -> float:
-    """
-    Calculate Model Flops Utilization based on a given MAC.
+def calculate_mfu(mac_count: int, time_ms: float) -> float:
+    """Calculate Model Flops Utilization based on a given MAC.
 
-    Parameters:
-    mac_count (int): Number of multiply-accumulate operations
-    time_ms (float): Execution time in milliseconds
-    target_instance_family (str): Target hardware instance family (e.g., "trn1", "trn2")
+    Args:
+        mac_count: Number of multiply-accumulate operations.
+        time_ms: Execution time in milliseconds.
 
     Returns:
-    float: PE utilization percentage
-    FIXME: check dtype
+        PE utilization percentage.
     """
-    if any(target_instance_family.startswith(family) for family in {"sunda", "trainium", "trn1", "inf2"}):
-        pe_freq = 2.8 * 1e9  # Hz (2.8 GHz)
-    elif any(target_instance_family.startswith(family) for family in {"trn2", "inf3", "gen3", "cayman"}):
-        pe_freq = 2.4 * 1e9  # Hz (2.4 GHz)
-    else:
-        raise NotImplementedError("Unknown target instance: " + target_instance_family)
+    pe_freq = 2.4e9
 
-    # Calculate total FLOPS (2 operations per MAC - multiply and add)
     flops = 2 * mac_count
     actual_latency_s = time_ms / 1000
     actual_pe_cycles = actual_latency_s * pe_freq
@@ -33,31 +27,49 @@ def calculate_mfu(mac_count: int, time_ms: float, target_instance_family: str) -
     return mfu
 
 
-def extract_metrics(
-    neff: str, ntff: str, latency: float, matmul_mac_count: int, target_instance_family: str
-) -> dict[str, float]:
+def extract_metrics(neff: str, ntff: str, latency: float, matmul_mac_count: int) -> dict[str, float]:
+    """Extract performance metrics from NEFF/NTFF files using neuron-profile.
+
+    Args:
+        neff: Path to the NEFF file.
+        ntff: Path to the NTFF trace file.
+        latency: Measured latency in milliseconds.
+        matmul_mac_count: Number of MAC operations for MFU calculation.
+
+    Returns:
+        Dictionary of metric names to values, including estimated MFU.
+    """
     dump_json_cmd = f"neuron-profile view -n {neff} -s {ntff} --output-format summary-json"
     process = subprocess.run(dump_json_cmd, shell=True, capture_output=True, text=True, check=True)
     json_str = process.stdout
 
     data = json.loads(json_str)
 
-    # Get the first (and only) key in the dictionary
     first_key = next(iter(data))
     metrics = data[first_key]
 
-    mfu = calculate_mfu(matmul_mac_count, latency, target_instance_family)
+    mfu = calculate_mfu(matmul_mac_count, latency)
     metrics["mfu_estimated_percent"] = mfu
     return metrics
 
 
-def check_correctness(desired, actual, atol, rtol, verbose: bool = False):
+def check_correctness(desired: np.ndarray, actual: np.ndarray, atol: float, rtol: float, verbose: bool = False) -> None:
+    """Check numerical correctness between desired and actual arrays.
+
+    Args:
+        desired: Expected reference array.
+        actual: Actual output array to verify.
+        atol: Absolute tolerance threshold.
+        rtol: Relative tolerance threshold.
+        verbose: If True, print summary on success.
+
+    Raises:
+        AssertionError: If mismatched elements exceed tolerance.
+    """
     assert desired.shape == actual.shape, f"Shape mismatch: desired {desired.shape}, actual {actual.shape}"
     abs_diff = np.abs(actual - desired)
-    # Avoid division by zero in relative difference calculation
     rel_diff = np.divide(abs_diff, np.abs(desired), out=np.zeros_like(abs_diff), where=np.abs(desired) != 0)
 
-    # Calculate tolerance threshold using numpy's allclose formula
     tolerance = atol + rtol * np.abs(desired)
     mismatches = abs_diff > tolerance
     total_mismatches = np.sum(mismatches)
@@ -88,17 +100,34 @@ def check_correctness(desired, actual, atol, rtol, verbose: bool = False):
         )
 
 
-def generate_mismatch_summary(mismatches, desired, actual):
-    """Generate a summary of contiguous regions with mismatches."""
-    if len(mismatches.shape) == 2:  # For 2D arrays
+def generate_mismatch_summary(mismatches: np.ndarray, desired: np.ndarray, actual: np.ndarray) -> str:
+    """Generate a summary of contiguous regions with mismatches.
+
+    Args:
+        mismatches: Boolean array indicating mismatched positions.
+        desired: Expected reference array.
+        actual: Actual output array.
+
+    Returns:
+        Formatted string summarizing mismatched regions.
+    """
+    if len(mismatches.shape) == 2:
         return summarize_2d_mismatches(mismatches, desired, actual)
     else:
-        # For other dimensions
         return summarize_nd_mismatches(mismatches, desired, actual)
 
 
-def summarize_2d_mismatches(mismatches, desired, actual):
-    """Summarize mismatches in 2D arrays as contiguous regions, sorted by size."""
+def summarize_2d_mismatches(mismatches: np.ndarray, desired: np.ndarray, actual: np.ndarray) -> str:
+    """Summarize mismatches in 2D arrays as contiguous regions, sorted by size.
+
+    Args:
+        mismatches: 2D boolean array indicating mismatched positions.
+        desired: Expected reference array.
+        actual: Actual output array.
+
+    Returns:
+        Formatted string describing mismatched regions with sample values.
+    """
     total_mismatches = np.sum(mismatches)
 
     if total_mismatches == 0:
@@ -109,24 +138,19 @@ def summarize_2d_mismatches(mismatches, desired, actual):
         r, c = row[0], col[0]
         return f"Only element [{r}, {c}] is wrong.\n  Desired: {desired[r, c]}\n  Actual:  {actual[r, c]}"
 
-    # Find contiguous regions
-    region_info = []  # Will store (size, r_start, c_start, r_end, c_end) tuples
+    region_info = []
     rows, cols = mismatches.shape
 
-    # Process the array to find rectangular regions
     visited = np.zeros_like(mismatches, dtype=bool)
 
     for r in range(rows):
         for c in range(cols):
             if mismatches[r, c] and not visited[r, c]:
-                # Find the largest rectangle starting at (r,c)
                 max_r, max_c = r, c
 
-                # Extend rows
                 while max_r + 1 < rows and mismatches[max_r + 1, c]:
                     max_r += 1
 
-                # Find the maximum width for this range of rows
                 width = 1
                 while c + width < cols:
                     can_extend = True
@@ -139,27 +163,20 @@ def summarize_2d_mismatches(mismatches, desired, actual):
                     else:
                         break
 
-                # Mark this region as visited
                 visited[r : max_r + 1, c : c + width] = True
 
-                # Calculate region size
                 region_size = (max_r - r + 1) * width
 
-                # Add region info: (size, r_start, c_start, r_end, c_end)
                 region_info.append((region_size, r, c, max_r, c + width - 1))
 
-    # Sort regions by size (descending) and then by coordinates (ascending)
-    # For ties in size, sort by row_start, then col_start
     region_info.sort(key=lambda x: (-x[0], x[1], x[2]))
 
-    # Format region strings with values for top regions
     topK_with_vals = 3
     topK = 5
     region_strings = []
-    num_regions_with_values = min(topK_with_vals, len(region_info))  # Show values for topK_with_vals regions
+    num_regions_with_values = min(topK_with_vals, len(region_info))
 
     for i, (size, r_start, c_start, r_end, c_end) in enumerate(region_info):
-        # Only display top topK regions if there are more than topK
         if i >= topK and len(region_info) > topK:
             remaining = len(region_info) - topK
             region_strings.append(f"... {remaining} more regions not shown")
@@ -173,25 +190,20 @@ def summarize_2d_mismatches(mismatches, desired, actual):
         else:
             region_str = f"\nRegion {i+1}: [{r_start}:{r_end+1}, {c_start}:{c_end+1}] (size: {size})"
             if i < num_regions_with_values:
-                # Extract the region
                 desired_region = desired[r_start : r_end + 1, c_start : c_end + 1]
                 actual_region = actual[r_start : r_end + 1, c_start : c_end + 1]
 
-                # Format the values - show a sample if the region is large
                 height = r_end - r_start + 1
                 width = c_end - c_start + 1
 
                 if height <= 3 and width <= 4:
-                    # Show full region if small
                     region_str += "\n  Desired:\n" + _format_array(desired_region, "    ")
                     region_str += "\n  Actual:\n" + _format_array(actual_region, "    ")
                 else:
-                    # Show a sample for large regions
                     region_str += f" (showing sample of {height}x{width} region)"
                     sample_h = min(3, height)
                     sample_w = min(4, width)
 
-                    # Show top-left corner
                     desired_sample = desired_region[:sample_h, :sample_w]
                     actual_sample = actual_region[:sample_h, :sample_w]
 
@@ -209,8 +221,17 @@ def summarize_2d_mismatches(mismatches, desired, actual):
     return f"{header}\n" + "".join(region_strings)
 
 
-def _format_array(arr, indent="", show_ellipsis=False):
-    """Format a numpy array for display with proper indentation."""
+def _format_array(arr: np.ndarray, indent: str = "", show_ellipsis: bool = False) -> str:
+    """Format a numpy array for display with proper indentation.
+
+    Args:
+        arr: Array to format.
+        indent: String prefix for each line.
+        show_ellipsis: If True, append ellipsis to indicate truncation.
+
+    Returns:
+        Formatted string representation of the array.
+    """
     with np.printoptions(precision=6, suppress=True, threshold=100):
         lines = str(arr).split("\n")
         formatted = []
@@ -225,8 +246,17 @@ def _format_array(arr, indent="", show_ellipsis=False):
         return result
 
 
-def summarize_nd_mismatches(mismatches, desired, actual):
-    """Handle mismatches in arrays with dimensions other than 2."""
+def summarize_nd_mismatches(mismatches: np.ndarray, desired: np.ndarray, actual: np.ndarray) -> str:
+    """Summarize mismatches in arrays with dimensions other than 2.
+
+    Args:
+        mismatches: Boolean array indicating mismatched positions.
+        desired: Expected reference array.
+        actual: Actual output array.
+
+    Returns:
+        Formatted string with mismatch count and example values.
+    """
     total_mismatches = np.sum(mismatches)
     if total_mismatches == 1:
         coords = np.where(mismatches)
@@ -234,9 +264,7 @@ def summarize_nd_mismatches(mismatches, desired, actual):
         idx = tuple(dim[0] for dim in coords)
         return f"Only element [{coord_str}] is wrong.\n  Desired: {desired[idx]}\n  Actual:  {actual[idx]}"
 
-    # For higher dimensions, just report the total and some examples with values
     coords = np.where(mismatches)
-    # Get up to 5 examples
     examples = []
     for i in range(min(5, total_mismatches)):
         coord_list = [str(dim[i]) for dim in coords]

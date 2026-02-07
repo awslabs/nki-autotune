@@ -1,14 +1,20 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import TYPE_CHECKING
 
 from tqdm import tqdm
 
 from autotune.core.job import ProfileJobs, compile_jobs
 from autotune.core.parallel import set_neuron_core, split_jobs_into_groups
 from autotune.core.run_nki import run_on_neuron_core
+
+if TYPE_CHECKING:
+    from autotune.core.results import BenchmarkResults
 
 
 class Benchmark:
@@ -17,7 +23,7 @@ class Benchmark:
     Handles parallel compilation and execution of kernel jobs with performance profiling.
     """
 
-    def __init__(self, jobs: ProfileJobs, warmup: int = 10, iters: int = 100):
+    def __init__(self, jobs: ProfileJobs, warmup: int, iters: int) -> None:
         """Initialize benchmark configuration.
 
         Args:
@@ -29,14 +35,25 @@ class Benchmark:
         self.warmup = warmup
         self.iters = iters
 
-    def __call__(self):
-        """Execute the full benchmarking pipeline: compile, then run on device."""
+    def run(self) -> BenchmarkResults:
+        """Execute the full benchmarking pipeline and return results.
+
+        Compiles all kernels in parallel on CPU, then runs them on Neuron
+        cores for profiling. Results are saved to JSON and returned as a
+        queryable BenchmarkResults object.
+
+        Returns:
+            BenchmarkResults loaded from the cache directory.
+        """
+        from autotune.core.results import BenchmarkResults
+
         self._compile_all_kernels()
         self.jobs.dump_json()
         self._run_on_neuron_cores()
         self.jobs.dump_json()
+        return BenchmarkResults.load(self.jobs.cache_root_dir)
 
-    def _compile_all_kernels(self):
+    def _compile_all_kernels(self) -> None:
         """Compile all kernel jobs in parallel using multiple CPU workers."""
         cpu_count = os.cpu_count() or 1
         num_workers = min(max(cpu_count - 1, 1), len(self.jobs.jobs))
@@ -61,13 +78,9 @@ class Benchmark:
         pbar.close()
         executor.shutdown(wait=True)
 
-    def _run_on_neuron_cores(self):
+    def _run_on_neuron_cores(self) -> None:
         """Execute compiled kernels on available Neuron cores for performance profiling."""
-        valid_job_indices = []
-        for job_id in self.jobs.jobs:
-            job = self.jobs.jobs[job_id]
-            if not job.has_error:
-                valid_job_indices.append(job_id)
+        valid_job_indices = [job_id for job_id in self.jobs.jobs if not self.jobs.jobs[job_id].has_error]
         num_neuron_cores = 128
         num_workers = min(num_neuron_cores, len(valid_job_indices))
         job_id_groups = split_jobs_into_groups(job_ids=valid_job_indices, num_groups=num_workers)

@@ -409,18 +409,6 @@ class TestGeneratedCodeValidity:
         expected_shape = (a_shape[1], b_shape[1])
         assert result.shape == expected_shape, f"Output shape mismatch: expected {expected_shape}, got {result.shape}"
 
-    @pytest.mark.skip(reason="NKIMatmul always implements reduce")
-    def test_notimplementederror_when_reduce_missing(self, matmul_func):
-        """Verify NotImplementedError is raised when reduce is missing.
-
-        This test is skipped because NKIMatmul always implements reduce.
-        The test was designed for the old OpSemantics system where reduce
-        could be None.
-
-        Args:
-            matmul_func: Fixture providing the matmul function.
-        """
-
 
 class TestParallelStructurePreservation:
     """Property tests for parallel structure preservation.
