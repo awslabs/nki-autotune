@@ -5,7 +5,6 @@ import importlib
 import importlib.util
 import inspect
 import os
-import shutil
 import sys
 import tempfile
 import types
@@ -218,11 +217,7 @@ def run_spike_kernel(
     kernel_outputs = spike.run(
         spike_kernel, *input_tensors.values(), save_trace=True, artifacts_dir=directory, **kernel_kwargs
     )
-    ntff_file = f"{directory}/{neff_name}.ntff"
-    profile_ntff = os.path.abspath("./profile.ntff")
-    if os.path.exists(profile_ntff):
-        shutil.copy2(profile_ntff, ntff_file)
-        os.remove(profile_ntff)
+    ntff_file = os.path.join(directory, "profile.ntff")
     if isinstance(kernel_outputs, np.ndarray):
         kernel_outputs = tuple([kernel_outputs])
     return ntff_file, kernel_outputs
