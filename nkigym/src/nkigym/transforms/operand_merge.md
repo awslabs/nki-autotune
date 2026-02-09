@@ -15,7 +15,7 @@ The algorithm:
 Like all transforms, operand merge has two steps:
 
 1. **`analyze(func)`** — inspect the IR and return a list of merge pairs.
-2. **`transform(func, group)`** — apply a single pair, returning a new callable.
+2. **`transform(func, pair)`** — apply a single pair, returning a new callable.
 
 ## Examples
 
@@ -30,12 +30,16 @@ must be <= 128 (Trn DMA tile constraint).
 ```python
 tensor_1 = b[0:128, 0:128]
 tensor_4 = b[0:128, 128:256]
+tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+tensor_5 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128])
 ```
 
 **After** (`tensor_4` absorbed into `tensor_1`):
 
 ```python
 tensor_1 = b[0:128, 0:256]
+tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+tensor_5 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_1[0:128, 128:256])
 ```
 
 Merging on the first dimension is also valid when the result fits
@@ -46,12 +50,16 @@ within 128:
 ```python
 tensor_0 = a[0:64, 0:128]
 tensor_3 = a[64:128, 0:128]
+tensor_2 = nkigym.nc_matmul(tensor_0[0:64, 0:128], tensor_1[0:64, 0:128])
+tensor_4 = nkigym.nc_matmul(tensor_3[0:64, 0:128], tensor_1[0:64, 0:128])
 ```
 
 **After** (`tensor_3` absorbed into `tensor_0`):
 
 ```python
 tensor_0 = a[0:128, 0:128]
+tensor_2 = nkigym.nc_matmul(tensor_0[0:64, 0:128], tensor_1[0:64, 0:128])
+tensor_4 = nkigym.nc_matmul(tensor_0[64:128, 0:128], tensor_1[0:64, 0:128])
 ```
 
 If the merged first dimension would exceed 128, it is not an
@@ -76,10 +84,10 @@ can be the differing one, subject to tile limits (N <= 512, M <= 128).
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
-output[0:128, 0:128] = tensor_2
+output[0:128, 0:128] = tensor_2[0:128, 0:128]
 
 tensor_5 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 128:256])
-output[0:128, 128:256] = tensor_5
+output[0:128, 128:256] = tensor_5[0:128, 0:128]
 ```
 
 **After** (merged N = 256, `tensor_5` absorbed into `tensor_2`):
@@ -96,10 +104,10 @@ output[0:128, 128:256] = tensor_2[0:128, 128:256]
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:64], tensor_1[0:128, 0:128])
-output[0:64, 0:128] = tensor_2
+output[0:64, 0:128] = tensor_2[0:64, 0:128]
 
 tensor_4 = nkigym.nc_matmul(tensor_0[0:128, 64:128], tensor_1[0:128, 0:128])
-output[64:128, 0:128] = tensor_4
+output[64:128, 0:128] = tensor_4[0:64, 0:128]
 ```
 
 **After** (merged M = 128, `tensor_4` absorbed into `tensor_2`):
