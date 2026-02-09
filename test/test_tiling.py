@@ -730,7 +730,7 @@ class TestOpRegistry:
     This class verifies that all operations in OP_REGISTRY correctly generate
     NumPy expressions and accumulation expressions for reduction tiling.
 
-    The OP_REGISTRY dictionary maps operation names to NkiOp instances:
+    The OP_REGISTRY dictionary maps operation names to NKIOp instances:
     - generate_expr: Creates the NumPy expression for the operation
     - reduce: Creates the in-place accumulation expression (for reduction ops)
 

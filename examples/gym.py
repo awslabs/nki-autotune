@@ -1,20 +1,22 @@
-"""NKI workload specification for dimension analysis.
+"""NKI Gym tiling, reuse, and operand merge demo.
 
-This demonstrates how to analyze NKI functions for tiling using
-the analyze_dimension function from nkigym.
+Demonstrates the full transform pipeline on a tiled matmul:
+
+1. Generate a tiled function from a high-level NKI op.
+2. Apply data reuse and operand merging interleaved, one atomic
+   step at a time, saving each intermediate IR and verifying
+   numerical correctness on the CPU numpy simulator.
 """
 
 import os
+import random
 from pathlib import Path
 
 import numpy as np
 
 import nkigym
-from autotune import Benchmark, ProfileJobs
-from autotune.core.compile import get_kernel_by_name
-from nkigym.lower import lower_gym_to_nki
 from nkigym.tiling import generate_tiled_function
-from nkigym.transforms import analyze_data_reuse, merge_reusable_tensors
+from nkigym.transforms import DataReuseTransform, OperandMergeTransform
 from nkigym.utils import get_source
 
 CACHE_ROOT = "/fsx/weittang/gym_cache"
@@ -34,7 +36,7 @@ def matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 
 
 def main() -> None:
-    """Run the tiling and data reuse analysis demo."""
+    """Run the tiling and interleaved transform demo."""
     os.makedirs(CACHE_ROOT, exist_ok=True)
     cache_path = Path(CACHE_ROOT)
 
@@ -45,45 +47,34 @@ def main() -> None:
     rhs = np.random.randn(k, n)
     expected = matmul(lhs, rhs)
 
-    (cache_path / "nkigym_matmul.py").write_text(get_source(matmul))
-    np.testing.assert_allclose(matmul(lhs, rhs), expected)
-    print("matmul matches golden")
+    func = generate_tiled_function(matmul, input_shapes)
+    np.testing.assert_allclose(func(lhs, rhs), expected)
+    (cache_path / "nkigym_user.py").write_text(f'"""{matmul.__name__} (user source)"""\n' + get_source(matmul))
+    (cache_path / "nkigym_matmul_0.py").write_text(f'"""step 0: tiled function (baseline)"""\n' + get_source(func))
 
-    tiled_matmul = generate_tiled_function(matmul, input_shapes)
-    (cache_path / "tiled_matmul.py").write_text(get_source(tiled_matmul))
-    np.testing.assert_allclose(tiled_matmul(lhs, rhs), expected)
-    print("tiled_matmul matches golden")
-    nki_source = lower_gym_to_nki(tiled_matmul)
-    (cache_path / "nki_matmul.py").write_text(nki_source)
+    reuse = DataReuseTransform()
+    merge = OperandMergeTransform()
+    max_steps = 1
 
-    groups = analyze_data_reuse(tiled_matmul)
-    for i, group in enumerate(groups):
-        tiled_matmul = merge_reusable_tensors(tiled_matmul, group[0], group[1])
-        np.testing.assert_allclose(tiled_matmul(lhs, rhs), expected)
-        print(f"merged_matmul (pass {i + 1}) matches golden")
-    (cache_path / "transformed_matmul.py").write_text(get_source(tiled_matmul))
+    for step in range(1, max_steps + 1):
+        reuse_pairs = reuse.analyze(func)
+        merge_opps = merge.analyze(func)
 
-    nki_source = lower_gym_to_nki(tiled_matmul)
-    (cache_path / "nki_matmul_transformed.py").write_text(nki_source)
+        candidates = [(reuse, p, f"data reuse ({p})") for p in reuse_pairs] + [
+            (merge, o, f"operand merge ({o.description})") for o in merge_opps
+        ]
 
-    nki_matmul = get_kernel_by_name((str(cache_path / "nki_matmul.py"), "nki_tiled_matmul"))
-    nki_matmul_transformed = get_kernel_by_name((str(cache_path / "nki_matmul_transformed.py"), "nki_tiled_matmul"))
+        if not candidates:
+            break
 
-    lhs_f32 = lhs.astype(np.float32)
-    rhs_f32 = rhs.astype(np.float32)
+        transform, option, desc = random.choice(candidates)
+        func = transform.transform(func, option)
 
-    jobs = ProfileJobs(cache_root_dir=str(cache_path / "benchmark"))
-    for kernel in [nki_matmul, nki_matmul_transformed]:
-        jobs.add_job(
-            kernel=kernel,
-            kernel_kwargs={"lhs": lhs_f32, "rhs": rhs_f32},
-            output_shapes={"output": (m, n)},
-            compiler_flags="--auto-cast=none",
-            correctness_check=(matmul, 1e-3, 1e-3),
-        )
+        result = func(lhs, rhs)
+        np.testing.assert_allclose(result, expected, rtol=1e-5)
 
-    results = Benchmark(jobs=jobs, warmup=5, iters=10).run()
-    results.summary()
+        filename = f"nkigym_matmul_{step}.py"
+        (cache_path / filename).write_text(f'"""step {step}: {desc}"""\n' + get_source(func))
 
 
 if __name__ == "__main__":

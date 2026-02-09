@@ -11,7 +11,7 @@ The lowering works by:
 3. Using OP_REGISTRY's generate_nki() methods for compute operations
 4. Generating explicit buffer allocations and DMA copies for loads/stores
 
-To support a new operator in lowering, ensure its NkiOp.generate_nki()
+To support a new operator in lowering, ensure its NKIOp.generate_nki()
 method is implemented and the operator is registered in OP_REGISTRY.
 """
 

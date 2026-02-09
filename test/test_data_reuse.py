@@ -290,16 +290,12 @@ class TestMergeReusableTensorsNumerical:
 
         tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape})
 
-        reuse_groups = analyze_data_reuse(tiled_func)
+        reuse_pairs = analyze_data_reuse(tiled_func)
 
-        if not reuse_groups:
+        if not reuse_pairs:
             return
 
-        first_group = reuse_groups[0]
-        if len(first_group) < 2:
-            return
-
-        tensor_a, tensor_b = first_group[0], first_group[1]
+        tensor_a, tensor_b = reuse_pairs[0]
 
         merged_func = merge_reusable_tensors(tiled_func, tensor_a, tensor_b)
 

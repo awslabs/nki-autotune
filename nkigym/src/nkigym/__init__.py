@@ -3,7 +3,7 @@
 Pipeline: workload spec -> tiling -> transforms -> lower to NKI
 
 Subpackages:
-    ops: Operator definitions and registry (NkiOp, NKIMatmul, OP_REGISTRY)
+    ops: Operator definitions and registry (NKIOp, NKIMatmul, OP_REGISTRY)
     tiling: Dimension analysis and tiled code generation
     transforms: Optimization passes on the tiled IR (e.g., data reuse)
     lower: Lowering from nkigym IR to target kernel code (e.g., NKI)

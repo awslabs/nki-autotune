@@ -15,6 +15,7 @@ Every transform follows the analyze/transform protocol defined by the
 Available transforms:
 
 - ``DataReuseTransform`` — deduplicates identical tensor loads.
+- ``OperandMergeTransform`` — merges adjacent operations on contiguous slices.
 """
 
 from nkigym.transforms.base import Transform
@@ -24,5 +25,14 @@ from nkigym.transforms.data_reuse import (
     merge_reusable_tensors,
     normalize_reuse_groups,
 )
+from nkigym.transforms.operand_merge import OperandMergeTransform, analyze_operand_merge
 
-__all__ = ["Transform", "DataReuseTransform", "analyze_data_reuse", "merge_reusable_tensors", "normalize_reuse_groups"]
+__all__ = [
+    "Transform",
+    "DataReuseTransform",
+    "analyze_data_reuse",
+    "merge_reusable_tensors",
+    "normalize_reuse_groups",
+    "OperandMergeTransform",
+    "analyze_operand_merge",
+]

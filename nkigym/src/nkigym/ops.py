@@ -12,7 +12,7 @@ Tracing is enabled via context manager:
 - Inside tracing_enabled() context, calls return TracedTensor
 
 To add a new operator:
-1. Subclass NkiOp and implement all abstract methods
+1. Subclass NKIOp and implement all abstract methods
 2. Register an instance in OP_REGISTRY with the operator name as key
 """
 
@@ -45,7 +45,7 @@ def is_tracing() -> bool:
 def tracing_enabled() -> Generator[None, None, None]:
     """Context manager to enable tracing mode.
 
-    Inside this context, NkiOp calls will perform tracing (returning TracedTensor)
+    Inside this context, NKIOp calls will perform tracing (returning TracedTensor)
     instead of simulation (returning numpy arrays).
 
     Example:
@@ -59,7 +59,7 @@ def tracing_enabled() -> Generator[None, None, None]:
         _tracing_context.enabled = False
 
 
-class NkiOp(ABC):
+class NKIOp(ABC):
     """Base class for NKI custom operators.
 
     Subclasses implement hardware-native operations that integrate with
@@ -161,7 +161,7 @@ class NkiOp(ABC):
         """
 
 
-class NKIMatmul(NkiOp):
+class NKIMatmul(NKIOp):
     """NKI matrix multiplication following nc_matmul semantics.
 
     Expects inputs in KM x KN layout where K is the partition dimension:
@@ -277,10 +277,10 @@ class NKIMatmul(NkiOp):
         return (input_shapes[0][1], input_shapes[1][1])
 
 
-OP_REGISTRY: dict[str, NkiOp] = {"nc_matmul": NKIMatmul()}
-"""Registry mapping operation names to NkiOp instances.
+OP_REGISTRY: dict[str, NKIOp] = {"nc_matmul": NKIMatmul()}
+"""Registry mapping operation names to NKIOp instances.
 
-To add a new operator, create a subclass of NkiOp and add an instance here.
+To add a new operator, create a subclass of NKIOp and add an instance here.
 """
 
 

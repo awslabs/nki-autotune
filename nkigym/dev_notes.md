@@ -38,7 +38,7 @@ Full review of both packages backing `examples/gym.py` and `examples/tensor_add_
 
 ### Planned: broader operator support
 
-Only `nc_matmul` has full codegen + lowering (PSUM allocation, accumulation, buffer tracking). Other ops fall through to generic temp + `tensor_copy`. New operators need `generate_nki()` and `reduce()` on `NkiOp` subclasses, plus PSUM tracking updates in the lowerer.
+Only `nc_matmul` has full codegen + lowering (PSUM allocation, accumulation, buffer tracking). Other ops fall through to generic temp + `tensor_copy`. New operators need `generate_nki()` and `reduce()` on `NKIOp` subclasses, plus PSUM tracking updates in the lowerer.
 
 ### Planned: multi-output kernels in autotune
 

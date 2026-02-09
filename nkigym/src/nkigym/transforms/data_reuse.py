@@ -7,14 +7,15 @@ tiling pass.
 Example::
 
     reuse = DataReuseTransform()
-    groups = reuse.analyze(tiled_func)
-    for group in groups:
-        tiled_func = reuse.transform(tiled_func, group)
+    pairs = reuse.analyze(tiled_func)
+    for pair in pairs:
+        tiled_func = reuse.transform(tiled_func, pair)
 """
 
 import ast
 import logging
 from collections.abc import Callable
+from itertools import combinations
 
 import numpy as np
 
@@ -175,30 +176,30 @@ class DataReuseTransform(Transform):
     Identifies tensor slices that access identical data in different
     subgraphs and merges them into a single load.
 
-    ``analyze()`` returns reuse groups: tuples of tensor variable names
-    that share identical slice patterns. ``transform()`` applies a single
-    group, merging all members into the first (canonical) tensor.
+    ``analyze()`` returns pairs of tensor variable names that share
+    identical slice patterns. ``transform()`` merges a single pair.
 
     Example::
 
         reuse = DataReuseTransform()
-        groups = reuse.analyze(tiled_func)
-        for group in groups:
-            tiled_func = reuse.transform(tiled_func, group)
+        pairs = reuse.analyze(tiled_func)
+        for pair in pairs:
+            tiled_func = reuse.transform(tiled_func, pair)
     """
 
     name = "data_reuse"
 
-    def analyze(self, func: Callable) -> list[tuple[str, ...]]:
-        """Identify tensor slices that can be merged across subgraphs.
+    def analyze(self, func: Callable) -> list[tuple[str, str]]:
+        """Identify pairs of tensor slices that can be merged across subgraphs.
 
         Args:
             func: Pre-tiled function containing slice assignments like
                   ``a_sg0 = a[0:128, 0:128]``.
 
         Returns:
-            List of reuse groups. Each group is a tuple of tensor variable
-            names that access identical data (e.g., ``('b_sg0', 'b_sg1')``).
+            List of mergeable pairs. Each pair is a tuple of two tensor
+            variable names that access identical data
+            (e.g., ``('b_sg0', 'b_sg1')``).
         """
         source = get_source(func)
         tree = ast.parse(source)
@@ -211,25 +212,27 @@ class DataReuseTransform(Transform):
                 slice_groups[slice_key] = []
             slice_groups[slice_key].append(var_name)
 
-        return [tuple(vars) for vars in slice_groups.values() if len(vars) >= 2]
+        pairs: list[tuple[str, str]] = []
+        for vars in slice_groups.values():
+            if len(vars) >= 2:
+                pairs.extend(combinations(vars, 2))
+        return pairs
 
-    def transform(self, func: Callable, group: tuple[str, ...]) -> Callable[..., np.ndarray]:
-        """Apply a single reuse group.
+    def transform(self, func: Callable, pair: tuple[str, str]) -> Callable[..., np.ndarray]:
+        """Merge a single pair of reusable tensor slices.
 
-        Merges all members into the first (canonical) tensor, removing
-        redundant assignments and replacing references.
+        Removes the second tensor's assignment and replaces all its
+        references with the first tensor.
 
         Args:
             func: Pre-tiled function to transform.
-            group: A single reuse group from ``analyze()``.
+            pair: A pair of tensor names from ``analyze()``.
 
         Returns:
-            New callable with the group's redundant loads merged.
+            New callable with the pair's redundant load merged.
         """
-        canonical = group[0]
-        for other in group[1:]:
-            func = self._merge_pair(func, canonical, other)
-        return func
+        tensor_a, tensor_b = pair
+        return self._merge_pair(func, tensor_a, tensor_b)
 
     def _merge_pair(self, func: Callable, tensor_a: str, tensor_b: str) -> Callable[..., np.ndarray]:
         """Merge two reusable tensor slices into a single assignment.
@@ -285,16 +288,16 @@ class DataReuseTransform(Transform):
 _default_transform = DataReuseTransform()
 
 
-def analyze_data_reuse(func: Callable) -> list[tuple[str, ...]]:
-    """Identify tensor slices that can be merged across subgraphs.
+def analyze_data_reuse(func: Callable) -> list[tuple[str, str]]:
+    """Identify pairs of tensor slices that can be merged across subgraphs.
 
-    Convenience wrapper around DataReuseTransform.analyze().
+    Convenience wrapper around ``DataReuseTransform.analyze()``.
 
     Args:
         func: Pre-tiled function containing slice assignments.
 
     Returns:
-        List of reuse group tuples.
+        List of mergeable pairs.
     """
     return _default_transform.analyze(func)
 
