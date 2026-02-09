@@ -249,6 +249,8 @@ def _is_compute(node: ast.AST) -> ComputeInfo | None:
     for arg in value.args:
         if isinstance(arg, ast.Name):
             inputs.append(arg.id)
+        elif isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name):
+            inputs.append(arg.value.id)
 
     return ComputeInfo(dst_name=target.id, op_name=op_name, inputs=inputs)
 
@@ -268,7 +270,12 @@ def _is_accumulate(node: ast.AST) -> AccumulateInfo | None:
         return None
     if not isinstance(node.op, ast.Add):
         return None
-    if not isinstance(node.target, ast.Name):
+
+    if isinstance(node.target, ast.Name):
+        target_name = node.target.id
+    elif isinstance(node.target, ast.Subscript) and isinstance(node.target.value, ast.Name):
+        target_name = node.target.value.id
+    else:
         return None
 
     value = node.value
@@ -286,8 +293,10 @@ def _is_accumulate(node: ast.AST) -> AccumulateInfo | None:
     for arg in value.args:
         if isinstance(arg, ast.Name):
             inputs.append(arg.id)
+        elif isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name):
+            inputs.append(arg.value.id)
 
-    return AccumulateInfo(target_name=node.target.id, op_name=op_name, inputs=inputs)
+    return AccumulateInfo(target_name=target_name, op_name=op_name, inputs=inputs)
 
 
 def _is_store(node: ast.AST, output_name: str) -> StoreInfo | None:
@@ -314,11 +323,16 @@ def _is_store(node: ast.AST, output_name: str) -> StoreInfo | None:
         return None
     if target.value.id != output_name:
         return None
-    if not isinstance(value, ast.Name):
+
+    if isinstance(value, ast.Name):
+        src_name = value.id
+    elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
+        src_name = value.value.id
+    else:
         return None
 
     slices = _extract_subscript_slices(target.slice)
-    return StoreInfo(dst_name=target.value.id, src_name=value.id, slices=slices)
+    return StoreInfo(dst_name=target.value.id, src_name=src_name, slices=slices)
 
 
 def _generate_output_alloc(info: OutputAllocInfo, first_input_name: str) -> str:

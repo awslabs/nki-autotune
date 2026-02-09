@@ -149,6 +149,17 @@ class NkiOp(ABC):
             In-place accumulation expression, or None if op doesn't perform reduction.
         """
 
+    @abstractmethod
+    def output_shape(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+        """Compute the output tensor shape from input tensor shapes.
+
+        Args:
+            input_shapes: List of input tensor shapes.
+
+        Returns:
+            Shape tuple of the output tensor.
+        """
+
 
 class NKIMatmul(NkiOp):
     """NKI matrix multiplication following nc_matmul semantics.
@@ -253,6 +264,17 @@ class NKIMatmul(NkiOp):
             In-place addition expression.
         """
         return f"{result_var} += nkigym.nc_matmul({inputs[0]}, {inputs[1]})"
+
+    def output_shape(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+        """Compute output shape for nc_matmul: [K,M] @ [K,N] -> [M,N].
+
+        Args:
+            input_shapes: List of [lhs_shape, rhs_shape].
+
+        Returns:
+            Shape tuple (M, N).
+        """
+        return (input_shapes[0][1], input_shapes[1][1])
 
 
 OP_REGISTRY: dict[str, NkiOp] = {"nc_matmul": NKIMatmul()}

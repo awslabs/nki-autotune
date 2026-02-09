@@ -66,6 +66,20 @@ def _generate_slice_expr(tensor_name: str, slice_info: TensorSliceInfo) -> str:
     return f"{tensor_name}[{', '.join(slices)}]"
 
 
+def _full_slice_expr(var_name: str, shape: tuple[int, ...]) -> str:
+    """Generate a full-range slice expression like 'tensor_0[0:128, 0:128]'.
+
+    Args:
+        var_name: Variable name to slice.
+        shape: Shape of the tensor.
+
+    Returns:
+        Full-range slice expression string.
+    """
+    slices = [f"0:{s}" for s in shape]
+    return f"{var_name}[{', '.join(slices)}]"
+
+
 def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[str, tuple[int, ...]]) -> str:
     """Generate source code string for a tiled version of the function.
 
@@ -103,6 +117,7 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
     has_reduction_tiling = len(reduction_positions) > 1 or (len(reduction_positions) == 1 and reduction_positions[0])
 
     name_gen = TensorNameGenerator()
+    var_shapes: dict[str, tuple[int, ...]] = {}
 
     for subgraph_idx, parallel_pos in analysis.iter_tile_positions():
         if has_reduction_tiling:
@@ -117,16 +132,23 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
 
                     nki_op = OP_REGISTRY[op.op_name]
                     op_inputs: list[str] = []
+                    op_input_shapes: list[tuple[int, ...]] = []
 
                     for inp_name in op.inputs:
                         if inp_name in input_shapes:
                             slice_info = analysis.compute_reduction_slice_params(inp_name, parallel_pos, reduction_pos)
                             slice_expr = _generate_slice_expr(inp_name, slice_info)
                             tile_var = name_gen.next_name()
+                            tile_shape = tuple(slice_info.sizes)
+                            var_shapes[tile_var] = tile_shape
                             lines.append(f"    {tile_var} = {slice_expr}")
-                            op_inputs.append(tile_var)
+                            op_inputs.append(_full_slice_expr(tile_var, tile_shape))
+                            op_input_shapes.append(tile_shape)
                         elif inp_name in intermediate_map:
-                            op_inputs.append(intermediate_map[inp_name])
+                            var_name = intermediate_map[inp_name]
+                            shape = var_shapes[var_name]
+                            op_inputs.append(_full_slice_expr(var_name, shape))
+                            op_input_shapes.append(shape)
                         else:
                             raise RuntimeError(f"Unknown input tensor '{inp_name}' - not in inputs or intermediates")
 
@@ -135,11 +157,14 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
                     if op.output == OUTPUT_TENSOR_NAME:
                         if is_first_tile:
                             result_var = name_gen.next_name()
+                            result_shape = nki_op.output_shape(op_input_shapes)
+                            var_shapes[result_var] = result_shape
                             expr = nki_op.generate_expr(op_inputs)
                             lines.append(f"    {result_var} = {expr}")
                             acc_var = result_var
                         else:
-                            combine_expr = nki_op.reduce(acc_var, op_inputs)
+                            acc_sliced = _full_slice_expr(acc_var, var_shapes[acc_var])
+                            combine_expr = nki_op.reduce(acc_sliced, op_inputs)
                             if combine_expr is None:
                                 raise NotImplementedError(
                                     f"Operator '{nki_op.op_name}' has reduction dimensions " "but no reduce"
@@ -148,6 +173,8 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
                         intermediate_map[op.output] = acc_var
                     else:
                         result_var = name_gen.next_name()
+                        result_shape = nki_op.output_shape(op_input_shapes)
+                        var_shapes[result_var] = result_shape
                         expr = nki_op.generate_expr(op_inputs)
                         lines.append(f"    {result_var} = {expr}")
                         intermediate_map[op.output] = result_var
@@ -157,7 +184,10 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
                 raise ValueError(f"Expected 2D output, got {len(output_slice.offsets)} dimensions")
             row_off, col_off = output_slice.offsets[0], output_slice.offsets[1]
             row_sz, col_sz = output_slice.sizes[0], output_slice.sizes[1]
-            lines.append(f"    {output_name}[{row_off}:{row_off + row_sz}, {col_off}:{col_off + col_sz}] = {acc_var}\n")
+            acc_sliced = _full_slice_expr(acc_var, var_shapes[acc_var])
+            lines.append(
+                f"    {output_name}[{row_off}:{row_off + row_sz}, {col_off}:{col_off + col_sz}] = {acc_sliced}\n"
+            )
         else:
             intermediate_map = {}
 
@@ -167,20 +197,29 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
 
                 nki_op = OP_REGISTRY[op.op_name]
                 op_inputs = []
+                op_input_shapes: list[tuple[int, ...]] = []
                 for inp_name in op.inputs:
                     if inp_name in input_shapes:
                         slice_info = analysis.slice_params[inp_name][subgraph_idx]
                         slice_expr = _generate_slice_expr(inp_name, slice_info)
                         tile_var = name_gen.next_name()
+                        tile_shape = tuple(slice_info.sizes)
+                        var_shapes[tile_var] = tile_shape
                         lines.append(f"    {tile_var} = {slice_expr}")
-                        op_inputs.append(tile_var)
+                        op_inputs.append(_full_slice_expr(tile_var, tile_shape))
+                        op_input_shapes.append(tile_shape)
                     elif inp_name in intermediate_map:
-                        op_inputs.append(intermediate_map[inp_name])
+                        var_name = intermediate_map[inp_name]
+                        shape = var_shapes[var_name]
+                        op_inputs.append(_full_slice_expr(var_name, shape))
+                        op_input_shapes.append(shape)
                     else:
                         raise RuntimeError(f"Unknown input tensor '{inp_name}' - not in inputs or intermediates")
 
                 output_var = name_gen.next_name()
                 intermediate_map[op.output] = output_var
+                result_shape = nki_op.output_shape(op_input_shapes)
+                var_shapes[output_var] = result_shape
 
                 expr = nki_op.generate_expr(op_inputs)
                 lines.append(f"    {output_var} = {expr}")
@@ -191,8 +230,9 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
             row_off, col_off = output_slice.offsets[0], output_slice.offsets[1]
             row_sz, col_sz = output_slice.sizes[0], output_slice.sizes[1]
             result_var = intermediate_map[OUTPUT_TENSOR_NAME]
+            result_sliced = _full_slice_expr(result_var, var_shapes[result_var])
             lines.append(
-                f"    {output_name}[{row_off}:{row_off + row_sz}, {col_off}:{col_off + col_sz}] = {result_var}\n"
+                f"    {output_name}[{row_off}:{row_off + row_sz}, {col_off}:{col_off + col_sz}] = {result_sliced}\n"
             )
 
     lines.append(f"    return {output_name}")
