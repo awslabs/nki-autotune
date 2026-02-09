@@ -4,16 +4,12 @@ Identifies tensor slices that can be merged across subgraphs, reducing
 redundant load operations. Operates on the tiled IR produced by the
 tiling pass.
 
-Example usage via class interface::
+Example::
 
     reuse = DataReuseTransform()
-    optimized = reuse(tiled_func)          # analyze + transform all
-
-Example usage via free functions (backward-compatible)::
-
-    groups = analyze_data_reuse(tiled_func)
+    groups = reuse.analyze(tiled_func)
     for group in groups:
-        tiled_func = merge_reusable_tensors(tiled_func, group[0], group[1])
+        tiled_func = reuse.transform(tiled_func, group)
 """
 
 import ast
@@ -179,16 +175,16 @@ class DataReuseTransform(Transform):
     Identifies tensor slices that access identical data in different
     subgraphs and merges them into a single load.
 
-    Analysis returns reuse groups: lists of tensor variable names that
-    share identical slice patterns. Transform merges each group into
-    a single canonical tensor reference.
+    ``analyze()`` returns reuse groups: tuples of tensor variable names
+    that share identical slice patterns. ``transform()`` applies a single
+    group, merging all members into the first (canonical) tensor.
 
     Example::
 
         reuse = DataReuseTransform()
         groups = reuse.analyze(tiled_func)
-        # groups: [('b_sg0', 'b_sg1'), ('a_sg0', 'a_sg1')]
-        optimized = reuse.transform(tiled_func, groups)
+        for group in groups:
+            tiled_func = reuse.transform(tiled_func, group)
     """
 
     name = "data_reuse"
@@ -201,8 +197,8 @@ class DataReuseTransform(Transform):
                   ``a_sg0 = a[0:128, 0:128]``.
 
         Returns:
-            List of tuples, where each tuple contains tensor variable names
-            that access identical data (e.g., ('b_sg0', 'b_sg1', 'b_sg2')).
+            List of reuse groups. Each group is a tuple of tensor variable
+            names that access identical data (e.g., ``('b_sg0', 'b_sg1')``).
         """
         source = get_source(func)
         tree = ast.parse(source)
@@ -217,26 +213,25 @@ class DataReuseTransform(Transform):
 
         return [tuple(vars) for vars in slice_groups.values() if len(vars) >= 2]
 
-    def transform(self, func: Callable, analysis: list[tuple[str, ...]]) -> Callable[..., np.ndarray]:
-        """Apply all merges from analysis results.
+    def transform(self, func: Callable, group: tuple[str, ...]) -> Callable[..., np.ndarray]:
+        """Apply a single reuse group.
 
-        For each reuse group, merges all members into the first (canonical)
-        tensor. Processes groups sequentially, each producing a new function.
+        Merges all members into the first (canonical) tensor, removing
+        redundant assignments and replacing references.
 
         Args:
             func: Pre-tiled function to transform.
-            analysis: Reuse groups from analyze().
+            group: A single reuse group from ``analyze()``.
 
         Returns:
-            New callable with all redundant loads merged.
+            New callable with the group's redundant loads merged.
         """
-        for group in analysis:
-            canonical = group[0]
-            for other in group[1:]:
-                func = self.merge(func, canonical, other)
+        canonical = group[0]
+        for other in group[1:]:
+            func = self._merge_pair(func, canonical, other)
         return func
 
-    def merge(self, func: Callable, tensor_a: str, tensor_b: str) -> Callable[..., np.ndarray]:
+    def _merge_pair(self, func: Callable, tensor_a: str, tensor_b: str) -> Callable[..., np.ndarray]:
         """Merge two reusable tensor slices into a single assignment.
 
         Removes tensor_b's assignment and replaces all references to tensor_b
@@ -307,7 +302,7 @@ def analyze_data_reuse(func: Callable) -> list[tuple[str, ...]]:
 def merge_reusable_tensors(func: Callable, tensor_a: str, tensor_b: str) -> Callable[..., np.ndarray]:
     """Merge two reusable tensor slices into a single assignment.
 
-    Convenience wrapper around DataReuseTransform.merge().
+    Convenience wrapper around DataReuseTransform._merge_pair().
 
     Args:
         func: Pre-tiled function containing slice assignments.
@@ -317,4 +312,4 @@ def merge_reusable_tensors(func: Callable, tensor_a: str, tensor_b: str) -> Call
     Returns:
         New callable with tensor_b merged into tensor_a.
     """
-    return _default_transform.merge(func, tensor_a, tensor_b)
+    return _default_transform._merge_pair(func, tensor_a, tensor_b)

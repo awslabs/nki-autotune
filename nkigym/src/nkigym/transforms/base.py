@@ -1,17 +1,14 @@
 """Base class for NKI Gym IR transforms.
 
 All transforms follow the analyze-then-transform pattern:
-1. analyze(): Inspect a tiled function to find optimization opportunities
-2. transform(): Apply the optimization, returning a new callable
 
-Subclasses define the analysis result type and transform logic.
-The __call__ convenience method runs both phases in sequence.
+1. ``analyze(func)`` — inspect a tiled function and return a list of
+   individual transform opportunities.
+2. ``transform(func, option)`` — apply a single opportunity, returning
+   a new callable.
 
-To add a new transform:
-1. Subclass Transform
-2. Implement analyze() returning your analysis type
-3. Implement transform() applying optimizations from analysis
-4. Register the transform in transforms/__init__.py
+The autotuner calls ``analyze()`` to discover opportunities, selects which
+to apply, and calls ``transform()`` for each.
 """
 
 from abc import ABC, abstractmethod
@@ -24,9 +21,9 @@ import numpy as np
 class Transform(ABC):
     """Base class for nkigym IR transforms.
 
-    Each transform operates on the tiled IR (a callable with __source__)
-    produced by the tiling pass, and returns a new callable with the
-    optimization applied.
+    Each transform operates on the tiled IR (a callable with ``__source__``)
+    produced by the tiling pass. ``analyze()`` returns a list of transform
+    opportunities; ``transform()`` applies one at a time.
 
     Attributes:
         name: Human-readable name for logging and diagnostics.
@@ -35,36 +32,25 @@ class Transform(ABC):
     name: str
 
     @abstractmethod
-    def analyze(self, func: Callable) -> Any:
+    def analyze(self, func: Callable) -> list[Any]:
         """Analyze a tiled function to find optimization opportunities.
 
         Args:
             func: A tiled function (with __source__ attribute) to analyze.
 
         Returns:
-            Transform-specific analysis result describing what can be optimized.
+            List of transform opportunities. Each element is a single option
+            that can be passed to ``transform()``.
         """
 
     @abstractmethod
-    def transform(self, func: Callable, analysis: Any) -> Callable[..., np.ndarray]:
-        """Apply the transform based on analysis results.
+    def transform(self, func: Callable, option: Any) -> Callable[..., np.ndarray]:
+        """Apply a single transform opportunity.
 
         Args:
             func: A tiled function to transform.
-            analysis: Analysis result from analyze().
+            option: A single opportunity from ``analyze()``.
 
         Returns:
             New callable with the optimization applied.
         """
-
-    def __call__(self, func: Callable) -> Callable[..., np.ndarray]:
-        """Convenience: analyze then transform in one step.
-
-        Args:
-            func: A tiled function to optimize.
-
-        Returns:
-            New callable with all optimizations from analysis applied.
-        """
-        analysis = self.analyze(func)
-        return self.transform(func, analysis)
