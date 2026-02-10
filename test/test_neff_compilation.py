@@ -18,7 +18,7 @@ import nki.language as nl
 import numpy as np
 import pytest
 
-from autotune.core.compile import compile_kernel
+from autotune.compiler.compile import compile_kernel
 
 
 def _neuron_devices_available() -> bool:
@@ -187,7 +187,7 @@ class TestMultiKernelWorkload:
         Args:
             tmp_path: Pytest fixture providing a temporary directory.
         """
-        from autotune.core.job import ProfileJobs, compile_jobs
+        from autotune.job import ProfileJobs, compile_jobs
 
         jobs = ProfileJobs(cache_root_dir=str(tmp_path))
 

@@ -12,15 +12,16 @@ from typing import Any
 
 import numpy as np
 
-from autotune.core.compile import compile_kernel, resolve_kernel_ref
-from autotune.core.utils import capture_error_message
-from autotune.typing import (
+from autotune.analysis.analyze import compute_mac_count
+from autotune.compiler.compile import compile_kernel, resolve_kernel_ref
+from autotune.types import (
     CORRECTNESS_CHECK_DTYPE,
     INPUT_TENSOR_SHAPES_DTYPE,
     INPUT_TENSORS_DTYPE,
     KERNEL_DTYPE,
     KERNEL_KWARGS_DTYPE,
 )
+from autotune.utils import capture_error_message
 
 
 def workload_name(kernel_name: str, input_tensor_shapes: dict[str, tuple[int, ...]]) -> str:
@@ -111,7 +112,7 @@ class ProfileJob:
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary representation including only tracked attributes."""
         result = {}
         for attr_name in self.attributes:
@@ -218,8 +219,6 @@ class ProfileJobs:
         Raises:
             ValueError: If kernel_kwargs contains no numpy arrays.
         """
-        from autotune.core.analyze import compute_mac_count
-
         kernel_ref = resolve_kernel_ref(kernel)
         tensor_inputs = {k: v for k, v in kernel_kwargs.items() if isinstance(v, np.ndarray)}
         scalar_kwargs = {k: v for k, v in kernel_kwargs.items() if not isinstance(v, np.ndarray)}

@@ -5,16 +5,13 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import TYPE_CHECKING
 
 from tqdm import tqdm
 
-from autotune.core.job import ProfileJobs, compile_jobs
-from autotune.core.parallel import set_neuron_core, split_jobs_into_groups
-from autotune.core.run_nki import run_on_neuron_core
-
-if TYPE_CHECKING:
-    from autotune.core.results import BenchmarkResults
+from autotune.analysis.results import BenchmarkResults
+from autotune.job import ProfileJobs, compile_jobs
+from autotune.runner.parallel import set_neuron_core, split_jobs_into_groups
+from autotune.runner.run_nki import run_on_neuron_core
 
 
 class Benchmark:
@@ -45,8 +42,6 @@ class Benchmark:
         Returns:
             BenchmarkResults loaded from the cache directory.
         """
-        from autotune.core.results import BenchmarkResults
-
         self._compile_all_kernels()
         self.jobs.dump_json()
         self._run_on_neuron_cores()

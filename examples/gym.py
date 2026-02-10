@@ -11,7 +11,7 @@ import numpy as np
 
 import nkigym
 from autotune import Benchmark, ProfileJobs
-from autotune.core.compile import get_kernel_by_name
+from autotune.compiler.compile import get_kernel_by_name
 from nkigym.lower import lower_gym_to_nki
 from nkigym.tiling import generate_tiled_function
 from nkigym.transforms import analyze_data_reuse, merge_reusable_tensors

@@ -1,4 +1,6 @@
-from autotune.core.visualize import plot_metric
+"""Generate comparison plots for all kernel workload pairs."""
+
+from autotune.analysis.visualize import plot_metric
 
 if __name__ == "__main__":
     cache_root_dir = "/mnt/efs/autotune-cache"
