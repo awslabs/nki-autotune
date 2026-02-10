@@ -19,7 +19,7 @@ from nkigym.tiling import generate_tiled_function
 from nkigym.transforms import DataReuseTransform, OperandMergeTransform
 from nkigym.utils import get_source
 
-CACHE_ROOT = "/fsx/weittang/gym_cache"
+CACHE_ROOT = "/fsx/weittang/gym_cache/transforms"
 
 
 def matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -40,6 +40,8 @@ def main() -> None:
     os.makedirs(CACHE_ROOT, exist_ok=True)
     cache_path = Path(CACHE_ROOT)
 
+    random.seed(42)
+
     k, m, n = 256, 256, 512
     input_shapes: dict[str, tuple[int, int]] = {"lhs": (k, m), "rhs": (k, n)}
 
@@ -54,7 +56,7 @@ def main() -> None:
 
     reuse = DataReuseTransform()
     merge = OperandMergeTransform()
-    max_steps = 1
+    max_steps = 10
 
     for step in range(1, max_steps + 1):
         reuse_pairs = reuse.analyze(func)
@@ -69,12 +71,11 @@ def main() -> None:
 
         transform, option, desc = random.choice(candidates)
         func = transform.transform(func, option)
+        filename = f"nkigym_matmul_{step}.py"
+        (cache_path / filename).write_text(f'"""step {step}: {desc}"""\n' + get_source(func))
 
         result = func(lhs, rhs)
         np.testing.assert_allclose(result, expected, rtol=1e-5)
-
-        filename = f"nkigym_matmul_{step}.py"
-        (cache_path / filename).write_text(f'"""step {step}: {desc}"""\n' + get_source(func))
 
 
 if __name__ == "__main__":
