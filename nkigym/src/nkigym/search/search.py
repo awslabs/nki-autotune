@@ -67,12 +67,15 @@ class _TransformGraph:
         nodes: Map from source string to ``_Node``.
         edges: Map from ``(parent_src, opp_idx)`` to child source string.
         frontier: Source strings of nodes with unexplored opportunities.
+        _frontier_index: Map from frontier source string to its index in
+            ``frontier``, enabling O(1) add/remove.
         transforms: Transforms defining the search space.
     """
 
     nodes: dict[str, _Node] = field(default_factory=dict)
     edges: dict[tuple[str, int], str] = field(default_factory=dict)
     frontier: list[str] = field(default_factory=list)
+    _frontier_index: dict[str, int] = field(default_factory=dict)
     transforms: list[Transform] = field(default_factory=list)
 
     def __init__(self, func: Callable, transforms: list[Transform]) -> None:
@@ -85,10 +88,33 @@ class _TransformGraph:
         self.nodes = {}
         self.edges = {}
         self.frontier = []
+        self._frontier_index = {}
         self.transforms = transforms
 
         root_src = get_source(func)
         self._add_node(func, root_src, depth=0)
+
+    def _frontier_add(self, src: str) -> None:
+        """Add a source string to the frontier in O(1).
+
+        Args:
+            src: Source string to add.
+        """
+        self._frontier_index[src] = len(self.frontier)
+        self.frontier.append(src)
+
+    def _frontier_remove(self, src: str) -> None:
+        """Remove a source string from the frontier in O(1) via swap-and-pop.
+
+        Args:
+            src: Source string to remove.
+        """
+        idx = self._frontier_index.pop(src)
+        last = self.frontier[-1]
+        if idx < len(self.frontier) - 1:
+            self.frontier[idx] = last
+            self._frontier_index[last] = idx
+        self.frontier.pop()
 
     def _add_node(self, func: Callable, src: str, depth: int) -> None:
         """Register a new node in the graph.
@@ -109,7 +135,7 @@ class _TransformGraph:
 
         unexplored = list(range(len(opportunities)))
         self.nodes[src] = _Node(src=src, func=func, opportunities=opportunities, unexplored=unexplored, depth=depth)
-        self.frontier.append(src)
+        self._frontier_add(src)
 
     def expand_one(self, rng: random.Random) -> None:
         """Expand one unexplored opportunity from a random frontier node.
@@ -135,7 +161,7 @@ class _TransformGraph:
         self.edges[(parent_src, opp_idx)] = child_src
 
         if not node.unexplored:
-            self.frontier.remove(parent_src)
+            self._frontier_remove(parent_src)
 
         self._add_node(child_func, child_src, depth=node.depth + 1)
 

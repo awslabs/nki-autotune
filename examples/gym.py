@@ -89,7 +89,7 @@ def main() -> None:
             correctness_check=(matmul, 1e-3, 1e-3),
         )
 
-    results = Benchmark(jobs, warmup=100, iters=1000).run()
+    results = Benchmark(jobs, warmup=10, iters=100).run()
     results.summary(top_k=len(kernel_refs))
 
 

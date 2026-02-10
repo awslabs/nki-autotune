@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 
 from nkigym.transforms.base import Transform
-from nkigym.utils.source import exec_source_to_func, get_source
+from nkigym.utils.source import exec_tree_to_func, get_source
 
 logger = logging.getLogger(__name__)
 
@@ -249,29 +249,28 @@ def _classify_stmt(stmt: ast.stmt, idx: int) -> dict:
     return result
 
 
-def _parse_function_body(func: Callable) -> tuple[str, list[str], dict[str, list[dict]]]:
+def _parse_function_body(func: Callable) -> tuple[str, list[str], dict[str, list[dict]], ast.Module]:
     """Parse a tiled function's source into classified statements.
 
     Args:
         func: A tiled function (with ``__source__`` attribute).
 
     Returns:
-        Tuple of ``(func_name, param_names, classified)`` where
+        Tuple of ``(func_name, param_names, classified, tree)`` where
         ``classified`` is a dict keyed by statement type
         (``"load"``, ``"op"``, ``"store"``, ``"aug_assign"``, etc.)
-        plus ``"all"`` for the flat positional list.
+        plus ``"all"`` for the flat positional list, and ``tree`` is the
+        parsed ``ast.Module``.
 
     Raises:
         ValueError: If no function definition is found in the source.
     """
     source = get_source(func)
     tree = ast.parse(source)
-
-    func_defs = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
-    if not func_defs:
+    func_def = tree.body[0]
+    if not isinstance(func_def, ast.FunctionDef):
         raise ValueError("No function definition found in source")
 
-    func_def = func_defs[0]
     func_name = func_def.name
     param_names = [arg.arg for arg in func_def.args.args]
     all_stmts = [_classify_stmt(stmt, idx) for idx, stmt in enumerate(func_def.body)]
@@ -280,7 +279,7 @@ def _parse_function_body(func: Callable) -> tuple[str, list[str], dict[str, list
     for s in all_stmts:
         by_type.setdefault(s["type"], []).append(s)
 
-    return func_name, param_names, by_type
+    return func_name, param_names, by_type, tree
 
 
 def _greedy_pair_opportunities(
@@ -352,6 +351,7 @@ def _find_merge_opportunities(classified: dict[str, list[dict]]) -> list[MergeOp
     loads = classified.get("load", [])
     stores = classified.get("store", [])
     aug_assigns = classified.get("aug_assign", [])
+    var_usage = _build_var_usage_index(all_stmts)
 
     opportunities: list[MergeOpportunity] = []
 
@@ -374,7 +374,7 @@ def _find_merge_opportunities(classified: dict[str, list[dict]]) -> list[MergeOp
             stmt_first = load_a if load_a["idx"] < load_b["idx"] else load_b
             stmt_second = load_b if load_a["idx"] < load_b["idx"] else load_a
 
-            if not _check_dependency_safe(stmt_first["idx"], stmt_second["idx"], stmt_second["var"], all_stmts):
+            if not _check_dependency_safe(stmt_first["idx"], stmt_second["idx"], stmt_second["var"], var_usage):
                 return None
 
             return MergeOpportunity(
@@ -462,7 +462,7 @@ def _find_merge_opportunities(classified: dict[str, list[dict]]) -> list[MergeOp
             stmt_first = op_a if op_a["idx"] < op_b["idx"] else op_b
             stmt_second = op_b if op_a["idx"] < op_b["idx"] else op_a
 
-            if not _check_dependency_safe(stmt_first["idx"], stmt_second["idx"], stmt_second.get("var", ""), all_stmts):
+            if not _check_dependency_safe(stmt_first["idx"], stmt_second["idx"], stmt_second.get("var", ""), var_usage):
                 return None
 
             return MergeOpportunity(
@@ -484,7 +484,37 @@ def _find_merge_opportunities(classified: dict[str, list[dict]]) -> list[MergeOp
     return opportunities
 
 
-def _check_dependency_safe(idx_lo: int, idx_hi: int, absorbed_var: str, all_stmts: list[dict]) -> bool:
+def _build_var_usage_index(all_stmts: list[dict]) -> dict[str, list[int]]:
+    """Build an index mapping variable names to statement indices that use them.
+
+    Args:
+        all_stmts: Full flat list of classified statements.
+
+    Returns:
+        Dict mapping variable name to sorted list of statement indices
+        that reference it.
+    """
+    usage: dict[str, set[int]] = {}
+    for stmt in all_stmts:
+        stype = stmt["type"]
+        idx = stmt["idx"]
+        if stype in ("op", "aug_assign"):
+            for arg in stmt.get("args", []):
+                name = arg.get("name")
+                if name:
+                    usage.setdefault(name, set()).add(idx)
+        elif stype == "store":
+            name = stmt.get("value_var")
+            if name:
+                usage.setdefault(name, set()).add(idx)
+        elif stype == "load":
+            name = stmt.get("source_tensor")
+            if name:
+                usage.setdefault(name, set()).add(idx)
+    return {var: sorted(indices) for var, indices in usage.items()}
+
+
+def _check_dependency_safe(idx_lo: int, idx_hi: int, absorbed_var: str, var_usage: dict[str, list[int]]) -> bool:
     """Check that merging two statements does not violate data dependencies.
 
     The absorbed statement's variable must not be used by any statement
@@ -494,42 +524,22 @@ def _check_dependency_safe(idx_lo: int, idx_hi: int, absorbed_var: str, all_stmt
         idx_lo: Statement index of the kept (earlier) statement.
         idx_hi: Statement index of the absorbed (later) statement.
         absorbed_var: Variable name produced by the absorbed statement.
-        all_stmts: Full flat list of classified statements.
+        var_usage: Pre-built index mapping variable names to sorted lists
+            of statement indices that use them.
 
     Returns:
         True if merging is safe, False otherwise.
     """
-    for stmt in all_stmts:
-        if stmt["idx"] <= idx_lo or stmt["idx"] >= idx_hi:
+    indices = var_usage.get(absorbed_var)
+    if indices is None:
+        return True
+    for idx in indices:
+        if idx <= idx_lo:
             continue
-        if _stmt_uses_var(stmt, absorbed_var):
-            return False
-
+        if idx >= idx_hi:
+            break
+        return False
     return True
-
-
-def _stmt_uses_var(stmt: dict, var: str) -> bool:
-    """Check if a classified statement uses a given variable.
-
-    Args:
-        stmt: A classified statement dict.
-        var: The variable name to check for.
-
-    Returns:
-        True if the statement references the variable.
-    """
-    stype = stmt["type"]
-
-    if stype in ("op", "aug_assign"):
-        return any(arg.get("name") == var for arg in stmt.get("args", []))
-
-    if stype == "store":
-        return stmt.get("value_var") == var
-
-    if stype == "load":
-        return stmt.get("source_tensor") == var
-
-    return False
 
 
 def _resolve_arg_signature(arg_info: dict, loads: list[dict]) -> tuple:
@@ -686,6 +696,26 @@ def _find_store_for_var(stores: list[dict], var: str) -> dict | None:
     return None
 
 
+def _set_loc(source: ast.AST, target: ast.AST) -> None:
+    """Copy source location from one AST node to another and its descendants.
+
+    Copies ``lineno``, ``col_offset``, ``end_lineno``, and
+    ``end_col_offset`` from ``source`` to ``target`` and all of
+    ``target``'s child nodes. This avoids a full-tree
+    ``ast.fix_missing_locations`` pass after AST mutations.
+
+    Args:
+        source: AST node to copy location from.
+        target: AST node (and its descendants) to set location on.
+    """
+    attrs = ("lineno", "col_offset", "end_lineno", "end_col_offset")
+    loc = {a: getattr(source, a, 0) for a in attrs}
+    for node in ast.walk(target):
+        for a, v in loc.items():
+            if not hasattr(node, a):
+                setattr(node, a, v)
+
+
 def _update_subscript_dim(node: ast.Subscript, dim: int, merged: tuple[int, int]) -> None:
     """Update a single dimension of a subscript's slice range.
 
@@ -698,11 +728,19 @@ def _update_subscript_dim(node: ast.Subscript, dim: int, merged: tuple[int, int]
     if isinstance(slice_node, ast.Tuple):
         sl = slice_node.elts[dim]
         if isinstance(sl, ast.Slice):
-            sl.lower = ast.Constant(value=merged[0])
-            sl.upper = ast.Constant(value=merged[1])
+            new_lower = ast.Constant(value=merged[0])
+            new_upper = ast.Constant(value=merged[1])
+            _set_loc(sl, new_lower)
+            _set_loc(sl, new_upper)
+            sl.lower = new_lower
+            sl.upper = new_upper
     elif isinstance(slice_node, ast.Slice) and dim == 0:
-        slice_node.lower = ast.Constant(value=merged[0])
-        slice_node.upper = ast.Constant(value=merged[1])
+        new_lower = ast.Constant(value=merged[0])
+        new_upper = ast.Constant(value=merged[1])
+        _set_loc(slice_node, new_lower)
+        _set_loc(slice_node, new_upper)
+        slice_node.lower = new_lower
+        slice_node.upper = new_upper
 
 
 def _relative_slices(abs_slices: list[tuple[int, int]], merge_dim: int, merged_start: int) -> list[tuple[int, int]]:
@@ -726,11 +764,14 @@ def _relative_slices(abs_slices: list[tuple[int, int]], merge_dim: int, merged_s
     ]
 
 
-def _build_slices_node(slices: list[tuple[int, int]]) -> ast.expr:
+def _build_slices_node(slices: list[tuple[int, int]], loc: ast.AST | None = None) -> ast.expr:
     """Build an AST slice expression from a list of ``(start, stop)`` tuples.
 
     Args:
         slices: List of ``(start, stop)`` tuples, one per dimension.
+        loc: Optional AST node to copy source location from. When
+            provided, all newly created nodes inherit its location,
+            avoiding a later ``ast.fix_missing_locations`` pass.
 
     Returns:
         An AST node suitable for use as a Subscript slice: a single
@@ -738,8 +779,12 @@ def _build_slices_node(slices: list[tuple[int, int]]) -> ast.expr:
     """
     slice_nodes = [ast.Slice(lower=ast.Constant(value=s), upper=ast.Constant(value=e)) for s, e in slices]
     if len(slice_nodes) == 1:
-        return slice_nodes[0]
-    return ast.Tuple(elts=slice_nodes, ctx=ast.Load())
+        result = slice_nodes[0]
+    else:
+        result = ast.Tuple(elts=slice_nodes, ctx=ast.Load())
+    if loc is not None:
+        _set_loc(loc, result)
+    return result
 
 
 def _rewrite_consumer_subscripts(stmt: ast.stmt, subscript_map: dict[str, list[tuple[int, int]]]) -> None:
@@ -763,18 +808,20 @@ def _rewrite_consumer_subscripts(stmt: ast.stmt, subscript_map: dict[str, list[t
             continue
         for idx, arg in enumerate(node.args):
             if isinstance(arg, ast.Name) and arg.id in subscript_map:
-                node.args[idx] = ast.Subscript(
+                new_sub = ast.Subscript(
                     value=ast.Name(id=arg.id, ctx=ast.Load()),
-                    slice=_build_slices_node(subscript_map[arg.id]),
+                    slice=_build_slices_node(subscript_map[arg.id], loc=arg),
                     ctx=ast.Load(),
                 )
+                _set_loc(arg, new_sub)
+                node.args[idx] = new_sub
             elif isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name) and arg.value.id in subscript_map:
                 rel_slices = subscript_map[arg.value.id]
                 existing = _parse_subscript_slices(arg)
                 offset_slices = [
                     (rel_s + sub_s, rel_s + sub_e) for (rel_s, _rel_e), (sub_s, sub_e) in zip(rel_slices, existing)
                 ]
-                arg.slice = _build_slices_node(offset_slices)
+                arg.slice = _build_slices_node(offset_slices, loc=arg)
 
 
 def _rename_vars_in_stmt(stmt: ast.stmt, renames: dict[str, str]) -> None:
@@ -826,7 +873,7 @@ class OperandMergeTransform(Transform):
             List of ``MergeOpportunity`` objects, each representing a
             single merge that can be passed to ``transform()``.
         """
-        _, _, classified = _parse_function_body(func)
+        _, _, classified, _ = _parse_function_body(func)
         return _find_merge_opportunities(classified)
 
     def transform(self, func: Callable, option: MergeOpportunity) -> Callable[..., np.ndarray]:
@@ -843,15 +890,12 @@ class OperandMergeTransform(Transform):
         Returns:
             New callable with the merged operation applied.
         """
-        func_name, _, classified = _parse_function_body(func)
+        func_name, _, classified, tree = _parse_function_body(func)
         all_stmts = classified["all"]
         loads = classified.get("load", [])
         stores = classified.get("store", [])
 
-        source = get_source(func)
-        tree = ast.parse(source)
-
-        func_def = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+        func_def = tree.body[0]
 
         stmt_a = all_stmts[option.stmt_a]
         stmt_b = all_stmts[option.stmt_b]
@@ -914,10 +958,9 @@ class OperandMergeTransform(Transform):
             new_body.append(body_stmt)
 
         func_def.body = new_body
-        ast.fix_missing_locations(tree)
-        new_source = ast.unparse(tree)
-        logger.debug("Merged source:\n%s", new_source)
-        return exec_source_to_func(new_source, func_name)
+        result = exec_tree_to_func(tree, func_name)
+        logger.debug("Merged source:\n%s", result.__source__)
+        return result
 
     def _widen_kept_stmt(self, body_stmt: ast.stmt, option: MergeOpportunity, all_stmts: list[dict]) -> None:
         """Widen the kept statement's slice to the merged range.
