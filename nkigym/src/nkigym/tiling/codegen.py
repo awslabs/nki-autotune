@@ -80,7 +80,9 @@ def _full_slice_expr(var_name: str, shape: tuple[int, ...]) -> str:
     return f"{var_name}[{', '.join(slices)}]"
 
 
-def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[str, tuple[int, ...]]) -> str:
+def generate_tiled_source(
+    func: Callable[..., np.ndarray], input_shapes: dict[str, tuple[int, ...]], output_dtype: type
+) -> str:
     """Generate source code string for a tiled version of the function.
 
     Produces flattened/unrolled code where each subgraph is expanded inline
@@ -94,6 +96,7 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
     Args:
         func: NumPy function to tile.
         input_shapes: Maps parameter name to shape tuple.
+        output_dtype: NumPy dtype for the output array allocation.
 
     Returns:
         Python source code string for the tiled function.
@@ -111,7 +114,7 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
 
     lines.append(f"def tiled_{func.__name__}({', '.join(param_names)}):")
     output_shape = analysis.tensor_shapes[OUTPUT_TENSOR_NAME]
-    lines.append(f"    {output_name} = nkigym.ndarray({output_shape}, dtype=np.float32)")
+    lines.append(f"    {output_name} = nkigym.ndarray({output_shape}, dtype=np.{np.dtype(output_dtype).name})")
 
     reduction_positions = list(analysis.iter_reduction_tile_positions())
     has_reduction_tiling = len(reduction_positions) > 1 or (len(reduction_positions) == 1 and reduction_positions[0])
@@ -241,7 +244,7 @@ def generate_tiled_source(func: Callable[..., np.ndarray], input_shapes: dict[st
 
 
 def generate_tiled_function(
-    func: Callable[..., np.ndarray], input_shapes: dict[str, tuple[int, ...]]
+    func: Callable[..., np.ndarray], input_shapes: dict[str, tuple[int, ...]], output_dtype: type
 ) -> Callable[..., np.ndarray]:
     """Generate a callable tiled version of the function.
 
@@ -251,10 +254,11 @@ def generate_tiled_function(
     Args:
         func: NumPy function to tile.
         input_shapes: Maps parameter name to shape tuple.
+        output_dtype: NumPy dtype for the output array allocation.
 
     Returns:
         Callable tiled function with same signature as original.
     """
-    source = generate_tiled_source(func, input_shapes)
+    source = generate_tiled_source(func, input_shapes, output_dtype)
     tiled_func_name = f"tiled_{func.__name__}"
     return exec_source_to_func(source, tiled_func_name)

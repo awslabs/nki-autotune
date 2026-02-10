@@ -127,7 +127,7 @@ class TestTiledFunctionGeneration:
             matmul_func: Fixture providing the matmul function.
         """
         input_shapes = {"a": a_shape, "b": b_shape}
-        actual_source = generate_tiled_source(matmul_func, input_shapes)
+        actual_source = generate_tiled_source(matmul_func, input_shapes, output_dtype=np.float32)
         expected_source = GOLDEN_SINGLE_MATMUL_SOURCE[(a_shape, b_shape)]
         assert normalize_source(actual_source) == normalize_source(expected_source)
 
@@ -146,7 +146,7 @@ class TestTiledFunctionGeneration:
             double_matmul_func: Fixture providing the double matmul function.
         """
         input_shapes = {"a": a_shape, "b": b_shape, "c": c_shape}
-        actual_source = generate_tiled_source(double_matmul_func, input_shapes)
+        actual_source = generate_tiled_source(double_matmul_func, input_shapes, output_dtype=np.float32)
         expected_source = GOLDEN_DOUBLE_MATMUL_SOURCE[(a_shape, b_shape, c_shape)]
         assert normalize_source(actual_source) == normalize_source(expected_source)
 
@@ -184,7 +184,7 @@ class TestNumericalCorrectness:
         expected = matmul_func(a, b)
 
         input_shapes = {"a": a_shape, "b": b_shape}
-        tiled_matmul = generate_tiled_function(matmul_func, input_shapes)
+        tiled_matmul = generate_tiled_function(matmul_func, input_shapes, output_dtype=a.dtype)
         actual = tiled_matmul(a, b)
 
         assert_arrays_close(actual, expected)
@@ -210,7 +210,7 @@ class TestNumericalCorrectness:
         expected = double_matmul_func(a, b, c)
 
         input_shapes = {"a": a_shape, "b": b_shape, "c": c_shape}
-        tiled_fn = generate_tiled_function(double_matmul_func, input_shapes)
+        tiled_fn = generate_tiled_function(double_matmul_func, input_shapes, output_dtype=a.dtype)
         actual = tiled_fn(a, b, c)
 
         assert_arrays_close(actual, expected)
@@ -227,7 +227,7 @@ class TestNumericalCorrectness:
         b = make_random_array((128, 256), seed=43, dtype=dtype)
 
         input_shapes = {"a": (128, 256), "b": (128, 256)}
-        tiled_fn = generate_tiled_function(matmul_func, input_shapes)
+        tiled_fn = generate_tiled_function(matmul_func, input_shapes, output_dtype=dtype)
 
         expected = matmul_func(a, b)
         actual = tiled_fn(a, b)
@@ -272,7 +272,7 @@ class TestNumericalCorrectness:
         expected = matmul(a, b)
 
         input_shapes = {"a": a_shape, "b": b_shape}
-        tiled_matmul = generate_tiled_function(matmul, input_shapes)
+        tiled_matmul = generate_tiled_function(matmul, input_shapes, output_dtype=a.dtype)
         actual = tiled_matmul(a, b)
 
         assert actual.shape == expected.shape, f"Shape mismatch: actual {actual.shape} vs expected {expected.shape}"
@@ -527,7 +527,7 @@ def matmul({', '.join(input_names)}):
         exec(func_code, local_ns)
         matmul_func = local_ns["matmul"]
 
-        source = generate_tiled_source(matmul_func, input_shapes)
+        source = generate_tiled_source(matmul_func, input_shapes, output_dtype=np.float32)
 
         generated_params = _extract_function_signature_params(source)
 
@@ -562,7 +562,7 @@ def matmul({', '.join(input_names)}):
         exec(func_code, local_ns)
         matmul_func = local_ns["matmul"]
 
-        source = generate_tiled_source(matmul_func, input_shapes)
+        source = generate_tiled_source(matmul_func, input_shapes, output_dtype=np.float32)
 
         assignment_pattern = re.compile(r"^\s+(\w+)\s*=", re.MULTILINE)
         all_assignments = assignment_pattern.findall(source)
@@ -689,7 +689,7 @@ class TestErrorHandling:
             return np.matmul(a, b)
 
         with pytest.raises(ValueError) as exc_info:
-            generate_tiled_source(matmul, input_shapes)
+            generate_tiled_source(matmul, input_shapes, output_dtype=np.float32)
 
         error_message = str(exc_info.value)
         assert reserved_name in error_message, (
@@ -713,7 +713,7 @@ class TestErrorHandling:
             return np.matmul(a, b)
 
         with pytest.raises(ValueError) as exc_info:
-            generate_tiled_source(matmul, input_shapes)
+            generate_tiled_source(matmul, input_shapes, output_dtype=np.float32)
 
         error_message = str(exc_info.value)
         assert "output" in error_message, (

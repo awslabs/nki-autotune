@@ -388,13 +388,13 @@ class TestGeneratedCodeValidity:
 
         from nkigym.tiling import generate_tiled_function, generate_tiled_source
 
-        source = generate_tiled_source(matmul, {"a": a_shape, "b": b_shape})
+        source = generate_tiled_source(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32)
         try:
             compile(source, "<string>", "exec")
         except SyntaxError as e:
             raise AssertionError(f"Generated code has syntax error: {e}\n\nSource:\n{source}")
 
-        tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape})
+        tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32)
 
         np.random.seed(42)
         a = np.random.randn(*a_shape).astype(np.float32)
@@ -537,7 +537,7 @@ class TestNumericalEquivalence:
 
         expected = nkigym.nc_matmul(a, b)
 
-        tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape})
+        tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape}, output_dtype=a.dtype)
         actual = tiled_func(a, b)
 
         assert actual.shape == expected.shape, f"Shape mismatch: expected {expected.shape}, got {actual.shape}"

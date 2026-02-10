@@ -288,7 +288,7 @@ class TestMergeReusableTensorsNumerical:
             """Compute matrix multiplication using nc_matmul."""
             return nkigym.nc_matmul(a, b)
 
-        tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape})
+        tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32)
 
         reuse_pairs = analyze_data_reuse(tiled_func)
 
