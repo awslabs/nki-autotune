@@ -284,7 +284,7 @@ To add a new operator, create a subclass of NKIOp and add an instance here.
 """
 
 
-def ndarray(shape: tuple[int, ...], dtype: type = np.float32) -> NDArray:
+def ndarray(shape: tuple[int, ...], dtype: type) -> NDArray:
     """Allocate a tensor.
 
     In simulation mode, returns a numpy array. When lowered to NKI,
@@ -292,7 +292,7 @@ def ndarray(shape: tuple[int, ...], dtype: type = np.float32) -> NDArray:
 
     Args:
         shape: Shape of the tensor.
-        dtype: Data type (default np.float32).
+        dtype: Data type for the tensor.
 
     Returns:
         Allocated numpy array.

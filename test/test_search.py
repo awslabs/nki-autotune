@@ -7,6 +7,7 @@ and operand_merge_golden.py.
 Run with: pytest test/test_search.py -v
 """
 
+import math
 from collections.abc import Callable
 
 from conftest import assert_arrays_close, make_random_array
@@ -40,7 +41,7 @@ class TestExhaustiveSearch:
         finds nothing to merge.
         """
         transforms = [DataReuseTransform()]
-        leaves = search(tiled_matmul_1x1, transforms)
+        leaves = search(tiled_matmul_1x1, transforms, math.inf, None, 0, None, False, None)
 
         assert len(leaves) == 1
         assert get_source(leaves[0]) == get_source(tiled_matmul_1x1)
@@ -52,7 +53,7 @@ class TestExhaustiveSearch:
         multiple convergent paths.
         """
         transforms = [DataReuseTransform()]
-        leaves = search(tiled_matmul_2x2, transforms)
+        leaves = search(tiled_matmul_2x2, transforms, math.inf, None, 0, None, False, None)
 
         sources = [get_source(f) for f in leaves]
         assert len(sources) == len(set(sources))
@@ -64,7 +65,7 @@ class TestExhaustiveSearch:
         then verifies each leaf produces the same output as the original.
         """
         transforms = [DataReuseTransform()]
-        leaves = search(tiled_matmul_2x2, transforms)
+        leaves = search(tiled_matmul_2x2, transforms, math.inf, None, 0, None, False, None)
 
         a = make_random_array((256, 128), seed=42)
         b = make_random_array((128, 256), seed=43)
@@ -82,7 +83,7 @@ class TestExhaustiveSearch:
         would be larger.
         """
         transforms = [DataReuseTransform()]
-        leaves = search(tiled_matmul_2x2, transforms)
+        leaves = search(tiled_matmul_2x2, transforms, math.inf, None, 0, None, False, None)
 
         sources = _get_unique_sources(leaves)
         assert len(sources) == len(leaves)
@@ -94,7 +95,7 @@ class TestExhaustiveSearch:
         yielding two nodes: the root and the transformed state.
         """
         transforms = [DataReuseTransform()]
-        results = search(tiled_matmul_2x1, transforms)
+        results = search(tiled_matmul_2x1, transforms, math.inf, None, 0, None, False, None)
 
         assert len(results) == 2
         sources = _get_unique_sources(results)
@@ -108,7 +109,7 @@ class TestExhaustiveSearch:
         Returns all unique nodes including intermediate states.
         """
         transforms = [DataReuseTransform(), OperandMergeTransform()]
-        results = search(tiled_matmul_1x2, transforms)
+        results = search(tiled_matmul_1x2, transforms, math.inf, None, 0, None, False, None)
 
         assert len(results) >= 1
         sources = _get_unique_sources(results)
@@ -117,7 +118,7 @@ class TestExhaustiveSearch:
     def test_multiple_transforms_numerical_correctness(self) -> None:
         """Leaves from multi-transform search preserve numerical correctness."""
         transforms = [DataReuseTransform(), OperandMergeTransform()]
-        leaves = search(tiled_matmul_1x2, transforms)
+        leaves = search(tiled_matmul_1x2, transforms, math.inf, None, 0, None, False, None)
 
         a = make_random_array((128, 128), seed=42)
         b = make_random_array((128, 256), seed=43)
@@ -134,7 +135,7 @@ class TestExhaustiveSearch:
         that can be merged.
         """
         transforms = [OperandMergeTransform()]
-        leaves = search(tiled_matmul_post_reuse_1x2, transforms)
+        leaves = search(tiled_matmul_post_reuse_1x2, transforms, math.inf, None, 0, None, False, None)
 
         assert len(leaves) >= 1
 
@@ -154,8 +155,8 @@ class TestTargetedSearch:
         """Same seed produces identical results across runs."""
         transforms = [DataReuseTransform()]
 
-        result1 = search(tiled_matmul_2x2, transforms, num_targets=5, seed=42)
-        result2 = search(tiled_matmul_2x2, transforms, num_targets=5, seed=42)
+        result1 = search(tiled_matmul_2x2, transforms, 5, 42, 0, None, False, None)
+        result2 = search(tiled_matmul_2x2, transforms, 5, 42, 0, None, False, None)
 
         sources1 = [get_source(f) for f in result1]
         sources2 = [get_source(f) for f in result2]
@@ -164,7 +165,7 @@ class TestTargetedSearch:
     def test_unique_dedup(self) -> None:
         """All leaves are unique by source (graph dedup)."""
         transforms = [DataReuseTransform()]
-        leaves = search(tiled_matmul_2x2, transforms, num_targets=20, seed=42)
+        leaves = search(tiled_matmul_2x2, transforms, 20, 42, 0, None, False, None)
 
         sources = [get_source(f) for f in leaves]
         assert len(sources) == len(set(sources))
@@ -173,7 +174,7 @@ class TestTargetedSearch:
     def test_num_targets_bounds(self) -> None:
         """Returns at most num_targets unique leaves."""
         transforms = [DataReuseTransform()]
-        leaves = search(tiled_matmul_2x2, transforms, num_targets=10, seed=42)
+        leaves = search(tiled_matmul_2x2, transforms, 10, 42, 0, None, False, None)
 
         assert len(leaves) <= 10
         sources = [get_source(f) for f in leaves]
@@ -186,7 +187,7 @@ class TestTargetedSearch:
         leaf regardless of num_targets.
         """
         transforms = [DataReuseTransform()]
-        leaves = search(tiled_matmul_1x1, transforms, num_targets=5, seed=42)
+        leaves = search(tiled_matmul_1x1, transforms, 5, 42, 0, None, False, None)
 
         assert len(leaves) == 1
         assert get_source(leaves[0]) == get_source(tiled_matmul_1x1)
@@ -194,7 +195,7 @@ class TestTargetedSearch:
     def test_numerical_correctness(self) -> None:
         """All targeted search leaves preserve numerical correctness."""
         transforms = [DataReuseTransform()]
-        leaves = search(tiled_matmul_2x2, transforms, num_targets=10, seed=42)
+        leaves = search(tiled_matmul_2x2, transforms, 10, 42, 0, None, False, None)
 
         a = make_random_array((256, 128), seed=42)
         b = make_random_array((128, 256), seed=43)
@@ -207,7 +208,7 @@ class TestTargetedSearch:
     def test_multiple_transforms(self) -> None:
         """Targeted search with both transforms returns unique nodes."""
         transforms = [DataReuseTransform(), OperandMergeTransform()]
-        results = search(tiled_matmul_1x2, transforms, num_targets=10, seed=42)
+        results = search(tiled_matmul_1x2, transforms, 10, 42, 0, None, False, None)
 
         assert len(results) >= 1
         assert len(results) <= 10
@@ -217,7 +218,7 @@ class TestTargetedSearch:
     def test_multiple_transforms_numerical(self) -> None:
         """Targeted search with both transforms preserves numerical correctness."""
         transforms = [DataReuseTransform(), OperandMergeTransform()]
-        leaves = search(tiled_matmul_1x2, transforms, num_targets=5, seed=42)
+        leaves = search(tiled_matmul_1x2, transforms, 5, 42, 0, None, False, None)
 
         a = make_random_array((128, 128), seed=42)
         b = make_random_array((128, 256), seed=43)
@@ -230,14 +231,14 @@ class TestTargetedSearch:
     def test_seed_none_is_unseeded(self) -> None:
         """seed=None does not crash and produces results."""
         transforms = [DataReuseTransform()]
-        leaves = search(tiled_matmul_2x1, transforms, num_targets=3)
+        leaves = search(tiled_matmul_2x1, transforms, 3, None, 0, None, False, None)
 
         assert len(leaves) >= 1
 
     def test_post_reuse_operand_merge(self) -> None:
         """Targeted search on a post-reuse fixture with OperandMergeTransform."""
         transforms = [OperandMergeTransform()]
-        leaves = search(tiled_matmul_post_reuse_1x2, transforms, num_targets=5, seed=42)
+        leaves = search(tiled_matmul_post_reuse_1x2, transforms, 5, 42, 0, None, False, None)
 
         a = make_random_array((128, 128), seed=42)
         b = make_random_array((128, 256), seed=43)

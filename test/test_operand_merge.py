@@ -848,7 +848,7 @@ class TestE2EPipeline:
         b = make_random_array((128, 256), seed=43)
         expected = matmul(a, b)
 
-        tiled = generate_tiled_function(matmul, {"a": (128, 128), "b": (128, 256)})
+        tiled = generate_tiled_function(matmul, {"a": (128, 128), "b": (128, 256)}, output_dtype=a.dtype)
 
         reuse = DataReuseTransform()
         for group in reuse.analyze(tiled):
@@ -879,7 +879,7 @@ class TestE2EPipeline:
         b = make_random_array((128, 256), seed=43)
         expected = matmul(a, b)
 
-        tiled = generate_tiled_function(matmul, {"a": (128, 256), "b": (128, 256)})
+        tiled = generate_tiled_function(matmul, {"a": (128, 256), "b": (128, 256)}, output_dtype=a.dtype)
 
         reuse = DataReuseTransform()
         for group in reuse.analyze(tiled):

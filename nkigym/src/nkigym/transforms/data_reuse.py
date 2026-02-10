@@ -20,7 +20,7 @@ from itertools import combinations
 import numpy as np
 
 from nkigym.transforms.base import Transform
-from nkigym.utils.source import exec_source_to_func, get_source
+from nkigym.utils.source import exec_tree_to_func, get_source
 
 logger = logging.getLogger(__name__)
 
@@ -89,21 +89,22 @@ def _extract_subscript_key(subscript: ast.Subscript) -> tuple:
     return (source_tensor, slice_key)
 
 
-def _find_tensor_assignments(tree: ast.AST) -> dict[str, tuple]:
+def _find_tensor_assignments(stmts: list[ast.stmt]) -> dict[str, tuple]:
     """Find all tensor slice assignments and extract their slice keys.
 
-    Walks the AST to find assignments of the form ``var = tensor[slice]``
-    and returns a mapping from variable name to slice key.
+    Iterates over the function body statements to find assignments of the
+    form ``var = tensor[slice]`` and returns a mapping from variable name
+    to slice key.
 
     Args:
-        tree: Parsed AST of the function source.
+        stmts: List of AST statements from the function body.
 
     Returns:
         Dict mapping tensor variable names to their slice keys.
     """
     assignments: dict[str, tuple] = {}
 
-    for node in ast.walk(tree):
+    for node in stmts:
         if not isinstance(node, ast.Assign):
             continue
         if len(node.targets) != 1:
@@ -126,48 +127,42 @@ def _find_tensor_assignments(tree: ast.AST) -> dict[str, tuple]:
     return assignments
 
 
-class _MergeTensorTransformer(ast.NodeTransformer):
-    """AST transformer to merge two tensor slices into a shared slice.
+def _merge_tensor_pair_inplace(func_def: ast.FunctionDef, tensor_a: str, tensor_b: str, shared_name: str) -> None:
+    """Merge two tensor slices by mutating the function body in-place.
 
-    Transforms the AST by:
-    1. Renaming tensor_a's assignment target to shared_name
-    2. Removing tensor_b's assignment entirely
-    3. Replacing all Name references to either tensor with shared_name
+    Performs three operations:
+    1. Filters out tensor_b's assignment statement.
+    2. Renames tensor_a's assignment target to shared_name.
+    3. Replaces all Name references to tensor_a or tensor_b with shared_name.
+
+    Since only ``.id`` attributes on existing Name nodes are mutated and
+    statements are removed (no new AST nodes created),
+    ``ast.fix_missing_locations`` is not needed.
+
+    Args:
+        func_def: The ``ast.FunctionDef`` node to mutate.
+        tensor_a: Name of the first tensor slice (becomes shared_name).
+        tensor_b: Name of the second tensor slice (assignment removed).
+        shared_name: The name to use for the merged tensor reference.
     """
+    names_to_replace = {tensor_a, tensor_b}
+    new_body: list[ast.stmt] = []
+    for stmt in func_def.body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == tensor_b
+        ):
+            continue
+        new_body.append(stmt)
 
-    def __init__(self, tensor_a: str, tensor_b: str, shared_name: str) -> None:
-        """Initialize the transformer.
+    for stmt in new_body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name) and node.id in names_to_replace:
+                node.id = shared_name
 
-        Args:
-            tensor_a: Name of the first tensor slice to merge (becomes shared_name).
-            tensor_b: Name of the second tensor slice (assignment will be removed).
-            shared_name: The name to use for the merged tensor reference.
-        """
-        self.tensor_a = tensor_a
-        self.tensor_b = tensor_b
-        self.shared_name = shared_name
-
-    def visit_Assign(self, node: ast.Assign) -> ast.Assign | None:
-        """Transform assignment nodes."""
-        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            target_name = node.targets[0].id
-
-            if target_name == self.tensor_b:
-                return None
-
-            if target_name == self.tensor_a:
-                node.value = self.visit(node.value)
-                node.targets[0].id = self.shared_name
-                return node
-
-        self.generic_visit(node)
-        return node
-
-    def visit_Name(self, node: ast.Name) -> ast.Name:
-        """Replace tensor references with shared name."""
-        if node.id in (self.tensor_a, self.tensor_b):
-            node.id = self.shared_name
-        return node
+    func_def.body = new_body
 
 
 class DataReuseTransform(Transform):
@@ -203,8 +198,11 @@ class DataReuseTransform(Transform):
         """
         source = get_source(func)
         tree = ast.parse(source)
+        func_def = tree.body[0]
+        if not isinstance(func_def, ast.FunctionDef):
+            raise ValueError("No function definition found in source")
 
-        assignments = _find_tensor_assignments(tree)
+        assignments = _find_tensor_assignments(func_def.body)
 
         slice_groups: dict[tuple, list[str]] = {}
         for var_name, slice_key in assignments.items():
@@ -257,8 +255,11 @@ class DataReuseTransform(Transform):
 
         source = get_source(func)
         tree = ast.parse(source)
+        func_def = tree.body[0]
+        if not isinstance(func_def, ast.FunctionDef):
+            raise ValueError("No function definition found in source")
 
-        tensor_assignments = _find_tensor_assignments(tree)
+        tensor_assignments = _find_tensor_assignments(func_def.body)
 
         if tensor_a not in tensor_assignments:
             raise ValueError(f"Tensor '{tensor_a}' not found")
@@ -272,17 +273,8 @@ class DataReuseTransform(Transform):
         if slice_a != slice_b:
             raise ValueError(f"Tensors '{tensor_a}' and '{tensor_b}' do not share identical slices")
 
-        transformer = _MergeTensorTransformer(tensor_a, tensor_b, tensor_a)
-        transformed_tree = transformer.visit(tree)
-
-        ast.fix_missing_locations(transformed_tree)
-        source = ast.unparse(transformed_tree)
-
-        func_defs = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
-        if not func_defs:
-            raise ValueError("No function definition found in source")
-        func_name = func_defs[0].name
-        return exec_source_to_func(source, func_name)
+        _merge_tensor_pair_inplace(func_def, tensor_a, tensor_b, tensor_a)
+        return exec_tree_to_func(tree, func_def.name)
 
 
 _default_transform = DataReuseTransform()
