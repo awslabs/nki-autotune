@@ -216,6 +216,8 @@ def _classify_stmt(stmt: ast.stmt, idx: int) -> dict:
         result["target_slices"] = _parse_subscript_slices(target)
         if isinstance(value, ast.Name):
             result["value_var"] = value.id
+        elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
+            result["value_var"] = value.value.id
         return result
 
     if not isinstance(target, ast.Name):
@@ -740,26 +742,39 @@ def _build_slices_node(slices: list[tuple[int, int]]) -> ast.expr:
     return ast.Tuple(elts=slice_nodes, ctx=ast.Load())
 
 
-def _subscript_bare_consumers(stmt: ast.stmt, var: str, slices: list[tuple[int, int]]) -> None:
-    """Replace bare Name references to ``var`` in Call args with Subscript expressions.
+def _rewrite_consumer_subscripts(stmt: ast.stmt, subscript_map: dict[str, list[tuple[int, int]]]) -> None:
+    """Rewrite consumer references to merged variables with correct subscript offsets.
 
-    Walks the AST statement and replaces every bare ``ast.Name(id=var)``
-    that appears as a positional argument in a ``Call`` node with
-    ``ast.Subscript(value=ast.Name(id=var), slice=<slices>)``.
+    Handles two cases for Call arguments referencing a merged variable:
+
+    1. **Bare Name** (e.g., ``var``): replaced with
+       ``var[rel_s:rel_e, ...]`` using the relative slices directly.
+    2. **Existing Subscript** (e.g., ``var[sub_s:sub_e, ...]``): offset
+       by the relative position so the rewritten subscript becomes
+       ``var[rel_s + sub_s : rel_s + sub_e, ...]``.
 
     Args:
         stmt: An AST statement node to modify in-place.
-        var: The variable name to subscript.
-        slices: The original slice ranges to use for the subscript.
+        subscript_map: Mapping from variable name to its relative slices
+            (from ``_relative_slices``).
     """
     for node in ast.walk(stmt):
         if not isinstance(node, ast.Call):
             continue
         for idx, arg in enumerate(node.args):
-            if isinstance(arg, ast.Name) and arg.id == var:
+            if isinstance(arg, ast.Name) and arg.id in subscript_map:
                 node.args[idx] = ast.Subscript(
-                    value=ast.Name(id=var, ctx=ast.Load()), slice=_build_slices_node(slices), ctx=ast.Load()
+                    value=ast.Name(id=arg.id, ctx=ast.Load()),
+                    slice=_build_slices_node(subscript_map[arg.id]),
+                    ctx=ast.Load(),
                 )
+            elif isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name) and arg.value.id in subscript_map:
+                rel_slices = subscript_map[arg.value.id]
+                existing = _parse_subscript_slices(arg)
+                offset_slices = [
+                    (rel_s + sub_s, rel_s + sub_e) for (rel_s, _rel_e), (sub_s, sub_e) in zip(rel_slices, existing)
+                ]
+                arg.slice = _build_slices_node(offset_slices)
 
 
 def _rename_vars_in_stmt(stmt: ast.stmt, renames: dict[str, str]) -> None:
@@ -892,8 +907,8 @@ class OperandMergeTransform(Transform):
             if store_a and i == store_a["idx"] and store_b_info:
                 self._widen_kept_store(body_stmt, store_a, store_b_info)
 
-            for var, slices in subscript_map.items():
-                _subscript_bare_consumers(body_stmt, var, slices)
+            if subscript_map:
+                _rewrite_consumer_subscripts(body_stmt, subscript_map)
 
             _rename_vars_in_stmt(body_stmt, renames)
             new_body.append(body_stmt)
@@ -937,7 +952,11 @@ class OperandMergeTransform(Transform):
 
     @staticmethod
     def _widen_kept_store(body_stmt: ast.stmt, store_a: dict, store_b: dict) -> None:
-        """Widen the kept store's target slice.
+        """Widen the kept store's target and value slices.
+
+        After an op merge the result tensor is wider, so both the output
+        target slice and the value subscript (if present) must be
+        expanded to cover the merged range.
 
         Args:
             body_stmt: The AST store statement to modify.
@@ -956,6 +975,14 @@ class OperandMergeTransform(Transform):
             if s_a[d] != s_b[d]:
                 merged_store = (min(s_a[d][0], s_b[d][0]), max(s_a[d][1], s_b[d][1]))
                 _update_subscript_dim(target, d, merged_store)
+
+                value = body_stmt.value
+                if isinstance(value, ast.Subscript):
+                    value_slices = _parse_subscript_slices(value)
+                    if d < len(value_slices):
+                        vs, ve = value_slices[d]
+                        merged_value = (vs, vs + (merged_store[1] - merged_store[0]))
+                        _update_subscript_dim(value, d, merged_value)
                 break
 
 

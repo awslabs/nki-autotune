@@ -8,7 +8,11 @@ from collections.abc import Callable
 from typing import Any
 
 _NDARRAY_SHAPE = re.compile(r"(\w+)\s*=\s*\w+\.ndarray\(shape=\((\d+),\s*(\d+)\)")
-_NC_MATMUL = re.compile(r"nc_matmul\(\w+,\s*(\w+),\s*(\w+)")
+_NC_MATMUL = re.compile(
+    r"nc_matmul\(\w+(?:\[.*?\])?,\s*"
+    r"(\w+)(?:\[(\d+):(\d+),\s*(\d+):(\d+)\])?,\s*"
+    r"(\w+)(?:\[(\d+):(\d+),\s*(\d+):(\d+)\])?"
+)
 
 
 def _unwrap_kernel(kernel: Callable) -> Callable:
@@ -26,6 +30,30 @@ def _unwrap_kernel(kernel: Callable) -> Callable:
     elif hasattr(func, "__wrapped__"):
         func = func.__wrapped__
     return func
+
+
+def _resolve_operand_shape(
+    name: str, slice_groups: tuple[str | None, str | None, str | None, str | None], shapes: dict[str, tuple[int, int]]
+) -> tuple[int, int] | None:
+    """Resolve the effective shape of an nc_matmul operand.
+
+    If a 2D slice subscript is present (e.g., tensor[0:128, 128:256]),
+    computes shape from (end - start) per dimension. Otherwise falls back
+    to the declared ndarray shape.
+
+    Args:
+        name: The buffer variable name.
+        slice_groups: Four regex groups (row_start, row_end, col_start, col_end),
+            each None when no slice is present.
+        shapes: Mapping of variable names to declared (rows, cols) shapes.
+
+    Returns:
+        A (rows, cols) tuple, or None if the shape cannot be resolved.
+    """
+    row_start, row_end, col_start, col_end = slice_groups
+    if row_start is not None:
+        return (int(row_end) - int(row_start), int(col_end) - int(col_start))
+    return shapes.get(name)
 
 
 def compute_mac_count(kernel: Callable, kernel_kwargs: dict[str, Any]) -> int:
@@ -52,7 +80,8 @@ def compute_mac_count(kernel: Callable, kernel_kwargs: dict[str, Any]) -> int:
 
     total = 0
     for m in _NC_MATMUL.finditer(source):
-        stat, mov = shapes.get(m.group(1)), shapes.get(m.group(2))
+        stat = _resolve_operand_shape(m.group(1), (m.group(2), m.group(3), m.group(4), m.group(5)), shapes)
+        mov = _resolve_operand_shape(m.group(6), (m.group(7), m.group(8), m.group(9), m.group(10)), shapes)
         if stat and mov:
             total += stat[0] * stat[1] * mov[1]
 

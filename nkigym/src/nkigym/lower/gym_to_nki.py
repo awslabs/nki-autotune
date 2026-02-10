@@ -250,7 +250,7 @@ def _is_compute(node: ast.AST) -> ComputeInfo | None:
         if isinstance(arg, ast.Name):
             inputs.append(arg.id)
         elif isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name):
-            inputs.append(arg.value.id)
+            inputs.append(ast.unparse(arg))
 
     return ComputeInfo(dst_name=target.id, op_name=op_name, inputs=inputs)
 
@@ -294,7 +294,7 @@ def _is_accumulate(node: ast.AST) -> AccumulateInfo | None:
         if isinstance(arg, ast.Name):
             inputs.append(arg.id)
         elif isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name):
-            inputs.append(arg.value.id)
+            inputs.append(ast.unparse(arg))
 
     return AccumulateInfo(target_name=target_name, op_name=op_name, inputs=inputs)
 
