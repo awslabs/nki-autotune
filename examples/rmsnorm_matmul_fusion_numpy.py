@@ -2,18 +2,32 @@
 
 import numpy as np
 
-from autotune.core.metrics import check_correctness
+from autotune.analysis.metrics import check_correctness
 from fusion.fusion_chain import FusionChain
 from fusion.operators import Operator
 from fusion.tensors import Tensor
 
 
 class SumSquares(Operator):
+    """Computes incremental sum of squares along a given axis for RMSNorm."""
+
     def __init__(self, input_tensors: list[str], sum_axis: str) -> None:
+        """Initialize SumSquares operator.
+
+        Args:
+            input_tensors: Names of input tensors.
+            sum_axis: Axis along which to sum squares.
+        """
         super().__init__(input_tensors)
         self.sum_axis = sum_axis
 
     def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
+        """Accumulate sum of squared elements from the input tensor.
+
+        Args:
+            intermediate_tensors: Shared tensor state across operators.
+            input_tensors: Single input tensor to square and sum.
+        """
         assert (
             len(input_tensors) == 1
         ), f"SumSquares forward expects input_tensor, received {len(input_tensors)} tensors"
@@ -29,6 +43,15 @@ class SumSquares(Operator):
     def initialize_output(
         self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
     ) -> dict[str, Tensor]:
+        """Allocate zero-initialized accumulator for sum of squares.
+
+        Args:
+            intermediate_tensors: Shared tensor state across operators.
+            input_tensors: Single input tensor used to determine output shape.
+
+        Returns:
+            Dictionary mapping output name to initialized Tensor.
+        """
         assert (
             len(input_tensors) == 1
         ), f"SumSquares initialize output expects one input tensor, received {len(input_tensors)}"
@@ -41,13 +64,29 @@ class SumSquares(Operator):
 
 
 class RMSNormMatmul(Operator):
+    """Fused RMSNorm normalization followed by matrix multiplication."""
+
     def __init__(self, input_tensors: list[str], epsilon: float, num_elements: int, matmul_axis: str) -> None:
+        """Initialize RMSNormMatmul operator.
+
+        Args:
+            input_tensors: Names of input tensors (LHS and RHS).
+            epsilon: Small constant for numerical stability in normalization.
+            num_elements: Number of elements used to compute the mean of squares.
+            matmul_axis: Axis contracted in the matrix multiplication.
+        """
         super().__init__(input_tensors)
         self.epsilon = epsilon
         self.num_elements = num_elements
         self.matmul_axis = matmul_axis
 
     def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
+        """Compute normalized matmul: (lhs / rms_norm) @ rhs.
+
+        Args:
+            intermediate_tensors: Shared tensor state across operators.
+            input_tensors: Two tensors: LHS (to normalize) and RHS (weight).
+        """
         assert (
             len(input_tensors) == 2
         ), f"RMSNormMatmul forward expects two input tensors, received {len(input_tensors)}"
@@ -61,6 +100,15 @@ class RMSNormMatmul(Operator):
     def initialize_output(
         self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
     ) -> dict[str, Tensor]:
+        """Allocate zero-initialized output tensor for fused matmul result.
+
+        Args:
+            intermediate_tensors: Shared tensor state across operators.
+            input_tensors: Two tensors (LHS, RHS) used to determine output shape.
+
+        Returns:
+            Dictionary mapping bias name to initialized Tensor.
+        """
         assert (
             len(input_tensors) == 2
         ), f"RMSNormMatmul initialize_output expects LHS, RHS tensors, received {len(input_tensors)}."
@@ -73,12 +121,26 @@ class RMSNormMatmul(Operator):
 
 
 class Scale(Operator):
+    """Computes RMSNorm correction scale when partial sum of squares changes."""
+
     def __init__(self, epsilon: float, num_elements: int) -> None:
+        """Initialize Scale operator.
+
+        Args:
+            epsilon: Small constant for numerical stability.
+            num_elements: Number of elements used to compute the mean of squares.
+        """
         super().__init__(input_tensors=[])
         self.epsilon = epsilon
         self.num_elements = num_elements
 
     def forward(self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]) -> None:
+        """Compute ratio of old to new RMS normalization factors.
+
+        Args:
+            intermediate_tensors: Shared tensor state across operators.
+            input_tensors: Unused (scale derived from intermediate state).
+        """
         output_old = intermediate_tensors[f"O_{self.operator_index-1}_old"]
         output_new = intermediate_tensors[f"O_{self.operator_index-1}_new"]
         scale_tensor = intermediate_tensors[f"scale_{self.operator_index}"]
@@ -89,12 +151,31 @@ class Scale(Operator):
     def initialize_output(
         self, intermediate_tensors: dict[str, Tensor], input_tensors: list[Tensor]
     ) -> dict[str, Tensor]:
+        """Allocate zero-initialized scale tensor.
+
+        Args:
+            intermediate_tensors: Shared tensor state across operators.
+            input_tensors: Unused.
+
+        Returns:
+            Dictionary mapping scale name to initialized Tensor.
+        """
         output_old = intermediate_tensors[f"O_{self.operator_index-1}_old"]
         init_tensor = Tensor(axes=output_old.axes, data=np.zeros(shape=output_old.data.shape))
         return {f"scale_{self.operator_index}": init_tensor}
 
 
 def rmsnorm_matmul_golden(lhs: Tensor, rhs: Tensor, epsilon: float) -> np.ndarray:
+    """Compute golden reference for RMSNorm + MatMul: rmsnorm(lhs) @ rhs.
+
+    Args:
+        lhs: Input tensor to normalize.
+        rhs: Weight tensor for the matrix multiplication.
+        epsilon: Small constant for numerical stability.
+
+    Returns:
+        Result of normalized lhs multiplied by rhs.
+    """
     x = lhs.data
     weight = rhs.data
 
@@ -108,14 +189,11 @@ def rmsnorm_matmul_golden(lhs: Tensor, rhs: Tensor, epsilon: float) -> np.ndarra
     return result
 
 
-def test_rmsnorm_matmul_fusion():
-    """
-    Test RMSNorm + MatMul fusion: rmsnorm(lhs) @ rhs
+def test_rmsnorm_matmul_fusion() -> None:
+    """Test RMSNorm + MatMul fusion: rmsnorm(lhs) @ rhs.
 
-    Example dimensions:
-    - lhs: (512, 1024) - sequence length x hidden dimension
-    - rhs: (1024, 128) - hidden dimension x output dimension
-    - Output: (512, 128)
+    Verifies that the fused online computation matches the standard
+    RMSNorm golden reference for both full and tiled step sizes.
     """
     seq_len = 128
     hidden_dim = 1024

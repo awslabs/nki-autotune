@@ -16,8 +16,8 @@ from neuronxcc.nki_standalone import NKI_IR_VERSION, compile_nki_ir_kernel_to_ne
 from nkipy.core.backend.hlo import HLOModule, HLOTensor
 from nkipy.runtime import CompiledKernel
 
-from autotune.core.utils import split_file_info
-from autotune.typing import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
+from autotune.types import INPUT_TENSORS_DTYPE, KERNEL_DTYPE, KERNEL_KWARGS_DTYPE
+from autotune.utils import split_file_info
 
 
 @dataclass
@@ -145,7 +145,7 @@ class MinimalTracedKernel:
     HLOModule with input/output tensor information.
     """
 
-    def __init__(self, func, input_tensors: INPUT_TENSORS_DTYPE, output_tensors: list[TensorStub]):
+    def __init__(self, func: Callable, input_tensors: INPUT_TENSORS_DTYPE, output_tensors: list[TensorStub]):
         """Initialize the minimal traced kernel.
 
         Args:
@@ -161,7 +161,8 @@ class MinimalTracedKernel:
         self._code.set_results(output_hlo_tensors)
 
     @property
-    def __name__(self):
+    def __name__(self) -> str:
+        """Return the name of the underlying kernel function."""
         return self.func.__name__
 
 

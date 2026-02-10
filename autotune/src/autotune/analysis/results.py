@@ -8,6 +8,8 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+from tabulate import tabulate
+
 
 class ResultEntry:
     """Wraps a single result dictionary from perf_metrics.json.
@@ -201,7 +203,6 @@ class BenchmarkResults:
             columns: List of column names to display. If None, uses a default set.
             top_k: Number of top entries to show per workload.
         """
-        from tabulate import tabulate
 
         if columns is None:
             columns = ["index", "min_ms", "mean_ms", "mfu_estimated_percent", "correctness_result"]
@@ -269,7 +270,6 @@ class BenchmarkResults:
             metric: Metric to compare (e.g., 'min_ms', 'mfu_estimated_percent').
             kernel_names: List of kernel names to compare.
         """
-        from tabulate import tabulate
 
         shape_map: dict[str, dict[str, float | None]] = {}
 

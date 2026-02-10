@@ -1,11 +1,13 @@
+"""Run compiled NKI kernels on Neuron hardware for benchmarking."""
+
 import os
 
 from nkipy.runtime import BaremetalExecutor
 
-from autotune.core.compile import TensorStub, create_spike_kernel, run_spike_kernel
-from autotune.core.job import ProfileJobs
-from autotune.core.metrics import check_correctness, extract_metrics
-from autotune.core.utils import capture_error_message
+from autotune.analysis.metrics import check_correctness, extract_metrics
+from autotune.compiler.compile import TensorStub, create_spike_kernel, run_spike_kernel
+from autotune.job import ProfileJobs
+from autotune.utils import capture_error_message
 
 
 def run_neuron_benchmarks(jobs: ProfileJobs, warmup: int, iters: int) -> None:

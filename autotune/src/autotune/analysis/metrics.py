@@ -234,12 +234,7 @@ def _format_array(arr: np.ndarray, indent: str = "", show_ellipsis: bool = False
     """
     with np.printoptions(precision=6, suppress=True, threshold=100):
         lines = str(arr).split("\n")
-        formatted = []
-        for i, line in enumerate(lines):
-            if i == 0:
-                formatted.append(indent + line)
-            else:
-                formatted.append(indent + line)
+        formatted = [indent + line for line in lines]
         result = "\n".join(formatted)
         if show_ellipsis:
             result = result.replace("]", ", ...]")
