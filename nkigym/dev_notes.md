@@ -43,3 +43,51 @@ Only `nc_matmul` has full codegen + lowering (PSUM allocation, accumulation, buf
 ### Planned: multi-output kernels in autotune
 
 `run_nki.py:56` assumes single output (`kernel_outputs[0]`). `compile.py:220-228` silently swallows NTFF file move errors. Both need updating for multi-output kernels.
+
+---
+
+## 2026-02-11
+
+### Search performance profiling and optimization (`profile` branch)
+
+Profiled `search()` on 1024x1024x1024 matmul (8x8 tiles, ~2560 statements). Baseline: 61.3s for 50 targets. 70% of runtime was Python AST operations.
+
+**Profile breakdown (baseline):**
+
+| Cost | Time | Calls |
+|------|------|-------|
+| `compile()` (ast.parse + exec_tree_to_func) | 16.1s | 578 |
+| `ast.unparse()` | 12.9s | 144 |
+| `ast.walk()` (rename in data_reuse) | 14.2s | 6.5M |
+| `simulate()` (verification) | 5.0s | 74,752 |
+
+**Optimizations applied (61.3s → 49.0s, -20%):**
+
+1. **AST caching for read-only analysis**: `get_ast(func)` returns cached `func.__ast__` without reparsing. `analyze()` uses cache; `transform()` parses fresh (needs mutable tree). Eliminated 2/3 of redundant `ast.parse` calls. `_collect_opportunities` dropped from 15.5s to 4.0s.
+
+2. **Batch DataReuse transforms**: `analyze()` returns batch options (list-of-pairs per reuse group with 3+ members). `_merge_batch_inplace()` collapses entire equivalence classes in a single AST pass instead of N-1 separate parse-walk-unparse cycles. Canonical name uses assignment order, not lexicographic sort.
+
+**Attempted but reverted:**
+
+- `copy.deepcopy` on cached ASTs: 6x regression (319s). Deep-copying 25K-node ASTs is 20x slower than re-parsing from source.
+- `ast.dump`-based dedup key: comparable cost to `ast.unparse` (11.8s vs 12.9s). No meaningful improvement over source-string dedup.
+
+**Transform independence analysis:**
+
+- DataReuse across different reuse groups: intrinsically independent (batchable).
+- DataReuse within same group: end state is deterministic regardless of merge order.
+- OperandMerge with shared statements: intrinsically mutually exclusive.
+- OperandMerge creating new merges: intrinsic — new opportunities emerge from applied transforms.
+- DataReuse enabling OperandMerge: intrinsic semantic dependency.
+- The analyze-transform-analyze loop is logically necessary for OperandMerge and the DataReuse→OperandMerge handoff.
+
+**Remaining bottleneck — Python AST is the ceiling:**
+
+| Per-step cost | Time | Why |
+|------|------|-----|
+| `ast.parse()` in transform | ~68ms | Need mutable tree |
+| `compile()` in exec_tree_to_func | ~68ms | Need callable for verification |
+| `ast.unparse()` in exec_tree_to_func | ~88ms | Need source for dedup |
+| `exec()` + verify | ~35ms | Correctness check |
+
+For ~109 steps: ~28s in AST ops vs ~4s in actual compute (7:1 ratio). Every operation on the ~25K-node AST is O(N). With verify-every-node, ~4 full traversals per step are irreducible in the current architecture. Further gains require either a domain-specific IR for search (transforms on `transforms` branch) or reducing AST size.
