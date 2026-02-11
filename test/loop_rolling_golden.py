@@ -6,6 +6,8 @@ tiling configurations. Used by test_loop_rolling.py for validation.
 
 from collections.abc import Callable
 
+import numpy as np
+
 import nkigym
 from nkigym.tiling import generate_tiled_function
 
@@ -23,11 +25,11 @@ def _make_tiled(a_shape: tuple[int, int], b_shape: tuple[int, int]) -> Callable:
         Tiled callable with __source__ attribute.
     """
 
-    def matmul(a, b):
+    def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         """Compute matrix multiplication."""
         return nkigym.nc_matmul(a, b)
 
-    return generate_tiled_function(matmul, {"a": a_shape, "b": b_shape})
+    return generate_tiled_function(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32)
 
 
 GOLDEN: dict[str, tuple[tuple[int, int], tuple[int, int], str]] = {}

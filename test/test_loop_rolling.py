@@ -12,7 +12,7 @@ import pytest
 from conftest import make_random_array, normalize_source
 from loop_rolling_golden import GOLDEN, ROLL_ONCE, _make_tiled
 
-from nkigym.lower.loop_rolling import _roll_once, roll_loops
+from nkigym.codegen.loop_rolling import _roll_once, roll_loops
 from nkigym.utils.source import exec_source_to_func, get_source
 
 ROLL_ONCE_CASES = [(name, *vals) for name, vals in ROLL_ONCE.items()]

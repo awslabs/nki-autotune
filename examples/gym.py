@@ -18,7 +18,7 @@ import numpy as np
 import nkigym
 from autotune import Benchmark, ProfileJobs
 from autotune.compiler.compile import get_kernel_by_name
-from nkigym.lower import lower_gym_to_nki
+from nkigym.codegen import lower_gym_to_nki
 from nkigym.search import search
 from nkigym.tiling import generate_tiled_function
 from nkigym.transforms import DataReuseTransform, OperandMergeTransform
