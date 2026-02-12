@@ -268,6 +268,8 @@ EXPECTED_REUSE: dict[Callable, list[tuple[str, str]]] = {
 
 
 MERGED_MATMUL_2X1_B = """\
+import numpy as np
+import nkigym
 def tiled_matmul_2x1(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     \"\"\"2 subgraphs (2 M tiles) - B is fully shared.\"\"\"
     output = nkigym.ndarray((256, 128), dtype=np.float32)
@@ -280,6 +282,8 @@ def tiled_matmul_2x1(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 """
 
 MERGED_MATMUL_1X2_A = """\
+import numpy as np
+import nkigym
 def tiled_matmul_1x2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     \"\"\"2 subgraphs (2 N tiles) - A is fully shared.\"\"\"
     output = nkigym.ndarray((128, 256), dtype=np.float32)
@@ -292,6 +296,8 @@ def tiled_matmul_1x2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 """
 
 MERGED_MATMUL_2X2_A01 = """\
+import numpy as np
+import nkigym
 def tiled_matmul_2x2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     \"\"\"4 subgraphs (2x2 grid) - both A and B have partial sharing.\"\"\"
     output = nkigym.ndarray((256, 256), dtype=np.float32)
@@ -310,6 +316,8 @@ def tiled_matmul_2x2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 """
 
 MERGED_MATMUL_2X2_B02 = """\
+import numpy as np
+import nkigym
 def tiled_matmul_2x2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     \"\"\"4 subgraphs (2x2 grid) - both A and B have partial sharing.\"\"\"
     output = nkigym.ndarray((256, 256), dtype=np.float32)
@@ -328,6 +336,8 @@ def tiled_matmul_2x2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 """
 
 MERGED_MATMUL_4X1_B = """\
+import numpy as np
+import nkigym
 def tiled_matmul_4x1(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     \"\"\"4 subgraphs (4 M tiles) - B is fully shared by all 4.\"\"\"
     output = nkigym.ndarray((512, 128), dtype=np.float32)
@@ -346,6 +356,8 @@ def tiled_matmul_4x1(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 """
 
 MERGED_DOUBLE_MATMUL_2X1_B = """\
+import numpy as np
+import nkigym
 def tiled_double_matmul_2x1(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     \"\"\"Double matmul, 2 subgraphs - B and C are fully shared.\"\"\"
     output = nkigym.ndarray((256, 128), dtype=np.float32)
@@ -362,6 +374,8 @@ def tiled_double_matmul_2x1(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.n
 """
 
 MERGED_DOUBLE_MATMUL_2X1_C = """\
+import numpy as np
+import nkigym
 def tiled_double_matmul_2x1(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     \"\"\"Double matmul, 2 subgraphs - B and C are fully shared.\"\"\"
     output = nkigym.ndarray((256, 128), dtype=np.float32)
@@ -378,6 +392,8 @@ def tiled_double_matmul_2x1(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.n
 """
 
 MERGED_MATMUL_4X1_ALL_B = """\
+import numpy as np
+import nkigym
 def tiled_matmul_4x1(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     \"\"\"4 subgraphs (4 M tiles) - B is fully shared by all 4.\"\"\"
     output = nkigym.ndarray((512, 128), dtype=np.float32)
@@ -394,6 +410,8 @@ def tiled_matmul_4x1(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 """
 
 MERGED_MATMUL_2X2_ALL_GROUPS = """\
+import numpy as np
+import nkigym
 def tiled_matmul_2x2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     \"\"\"4 subgraphs (2x2 grid) - both A and B have partial sharing.\"\"\"
     output = nkigym.ndarray((256, 256), dtype=np.float32)

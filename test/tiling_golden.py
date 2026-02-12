@@ -486,7 +486,9 @@ GOLDEN_SINGLE_MATMUL_SOURCE = {
         (128, 128),
         (128, 128),
     ): """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -499,7 +501,9 @@ def tiled_matmul(a, b):
         (128, 256),
         (128, 128),
     ): """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -517,7 +521,9 @@ def tiled_matmul(a, b):
         (128, 256),
         (128, 256),
     ): """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 256), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -545,7 +551,9 @@ def tiled_matmul(a, b):
         (256, 128),
         (256, 128),
     ): """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -561,7 +569,9 @@ def tiled_matmul(a, b):
         (256, 256),
         (256, 256),
     ): """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 256), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -601,7 +611,9 @@ def tiled_matmul(a, b):
         (128, 512),
         (128, 512),
     ): """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((512, 512), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -689,7 +701,9 @@ def tiled_matmul(a, b):
         (1024, 128),
         (1024, 128),
     ): """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -727,7 +741,9 @@ GOLDEN_DOUBLE_MATMUL_SOURCE = {
         (128, 128),
         (128, 128),
     ): """\
-def tiled_double_matmul(a, b, c):
+import numpy as np
+import nkigym
+def double_matmul(a, b, c):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -743,7 +759,9 @@ def tiled_double_matmul(a, b, c):
         (128, 128),
         (256, 128),
     ): """\
-def tiled_double_matmul(a, b, c):
+import numpy as np
+import nkigym
+def double_matmul(a, b, c):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -764,7 +782,9 @@ def tiled_double_matmul(a, b, c):
         (128, 128),
         (256, 256),
     ): """\
-def tiled_double_matmul(a, b, c):
+import numpy as np
+import nkigym
+def double_matmul(a, b, c):
     output = nkigym.ndarray((128, 256), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]

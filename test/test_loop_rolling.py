@@ -44,7 +44,7 @@ class TestRollOnce:
         result = _roll_once(get_source(tiled))
         assert normalize_source(result) == normalize_source(expected_source)
 
-        rolled = exec_source_to_func(result, "tiled_matmul")
+        rolled = exec_source_to_func(result, "matmul")
         a = make_random_array(a_shape, seed=42)
         b = make_random_array(b_shape, seed=43)
         np.testing.assert_allclose(rolled(a, b), tiled(a, b), rtol=1e-4, atol=1e-4)

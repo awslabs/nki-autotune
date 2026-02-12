@@ -4,6 +4,6 @@ Provides code generation helpers and logging configuration.
 """
 
 from nkigym.utils.logging import MultilineFormatter, setup_logging
-from nkigym.utils.source import exec_source_to_func, get_source
+from nkigym.utils.source import exec_source_to_func, get_source, import_func
 
-__all__ = ["get_source", "exec_source_to_func", "setup_logging", "MultilineFormatter"]
+__all__ = ["get_source", "exec_source_to_func", "import_func", "setup_logging", "MultilineFormatter"]

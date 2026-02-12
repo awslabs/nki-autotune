@@ -4,19 +4,17 @@ Analyzes NumPy functions to extract dimension information and compute
 tile parameters for data-parallel subgraph generation.
 """
 
-import logging
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from itertools import product
+from typing import Literal
 
 import numpy as np
 
 from nkigym.ops import tracing_enabled
 from nkigym.tiling.dim_tracker import TracedOp, _DimTracker
 from nkigym.tiling.tensor import TracedTensor
-
-logger = logging.getLogger(__name__)
 
 TILE_SIZE = 128
 OUTPUT_TENSOR_NAME = "output"
@@ -54,7 +52,7 @@ class DimInfo:
 
     id: str
     size: int
-    iter_type: str = "parallel"
+    iter_type: Literal["parallel", "reduction"] = "parallel"
 
     def __repr__(self) -> str:
         """Return formatted string representation."""
@@ -178,6 +176,46 @@ class DimensionAnalysis:
         for idx, positions in enumerate(product(*ranges)):
             yield idx, dict(zip(parallel_dims, positions))
 
+    def _compute_slice_for_position(self, tensor_id: str, position: dict[str, int]) -> TensorSliceInfo:
+        """Compute slice parameters for a tensor at a single merged tile position.
+
+        For each dimension of the tensor:
+        - If the dimension appears in ``position``: offset = tile_index * TILE_SIZE,
+          size = TILE_SIZE.
+        - Otherwise: offset = 0, size = original dimension size.
+
+        Args:
+            tensor_id: Name of the tensor.
+            position: Merged mapping of {dim_id: tile_index} covering both
+                parallel and reduction dimensions as needed.
+
+        Returns:
+            TensorSliceInfo with offsets, sizes, and strides for all dimensions.
+
+        Raises:
+            ValueError: If the tensor's dimension count does not match its shape.
+        """
+        dims = self.tensor_dims[tensor_id]
+        shape = self.tensor_shapes[tensor_id]
+
+        if len(dims) != len(shape):
+            raise ValueError(f"Dimension mismatch for '{tensor_id}': {len(dims)} dims vs {len(shape)} shape")
+
+        offsets: list[int] = []
+        sizes: list[int] = []
+        strides: list[int] = []
+
+        for i, dim_id in enumerate(dims):
+            if dim_id in position:
+                offsets.append(position[dim_id] * TILE_SIZE)
+                sizes.append(TILE_SIZE)
+            else:
+                offsets.append(0)
+                sizes.append(shape[i])
+            strides.append(1)
+
+        return TensorSliceInfo(offsets=offsets, sizes=sizes, strides=strides)
+
     def compute_reduction_slice_params(
         self, tensor_id: str, parallel_position: dict[str, int], reduction_position: dict[str, int]
     ) -> TensorSliceInfo:
@@ -196,34 +234,7 @@ class DimensionAnalysis:
         Returns:
             TensorSliceInfo with offsets, sizes, and strides for all dimensions.
         """
-        dims = self.tensor_dims[tensor_id]
-        shape = self.tensor_shapes[tensor_id]
-
-        offsets: list[int] = []
-        sizes: list[int] = []
-        strides: list[int] = []
-
-        if len(dims) != len(shape):
-            raise ValueError(f"Dimension mismatch for '{tensor_id}': {len(dims)} dims vs {len(shape)} shape")
-
-        for i, dim_id in enumerate(dims):
-            original_size = shape[i]
-
-            if dim_id in parallel_position:
-                tile_idx = parallel_position[dim_id]
-                offsets.append(tile_idx * TILE_SIZE)
-                sizes.append(TILE_SIZE)
-            elif dim_id in reduction_position:
-                tile_idx = reduction_position[dim_id]
-                offsets.append(tile_idx * TILE_SIZE)
-                sizes.append(TILE_SIZE)
-            else:
-                offsets.append(0)
-                sizes.append(original_size)
-
-            strides.append(1)
-
-        return TensorSliceInfo(offsets=offsets, sizes=sizes, strides=strides)
+        return self._compute_slice_for_position(tensor_id, {**parallel_position, **reduction_position})
 
     def compute_all_slice_params(self) -> None:
         """Compute slice parameters for all tensors at all tile positions.
@@ -235,132 +246,67 @@ class DimensionAnalysis:
         - If parallel dim: offset = tile_index * TILE_SIZE, size = TILE_SIZE
         - If reduction dim: offset = 0, size = original_size
         """
-        for tensor_id, dims in self.tensor_dims.items():
+        for tensor_id in self.tensor_dims:
             if tensor_id not in self.tensor_shapes:
                 continue
-
-            shape = self.tensor_shapes[tensor_id]
             self.slice_params[tensor_id] = {}
-
-            if len(dims) != len(shape):
-                raise ValueError(f"Dimension mismatch for '{tensor_id}': {len(dims)} dims vs {len(shape)} shape")
-
             for subgraph_idx, tile_position in self.iter_tile_positions():
-                offsets = []
-                sizes = []
-                strides = []
-
-                for i, dim_id in enumerate(dims):
-                    original_size = shape[i]
-
-                    if dim_id in tile_position:
-                        tile_idx = tile_position[dim_id]
-                        offsets.append(tile_idx * TILE_SIZE)
-                        sizes.append(TILE_SIZE)
-                    else:
-                        offsets.append(0)
-                        sizes.append(original_size)
-
-                    strides.append(1)
-
-                self.slice_params[tensor_id][subgraph_idx] = TensorSliceInfo(
-                    offsets=offsets, sizes=sizes, strides=strides
-                )
-
-    def assert_equal(self, expected: "DimensionAnalysis") -> None:
-        """Assert this analysis equals another, with detailed error messages.
-
-        Args:
-            expected: The expected golden DimensionAnalysis.
-
-        Raises:
-            AssertionError: If any field differs between self and expected.
-        """
-        assert (
-            self.dim_order == expected.dim_order
-        ), f"dim_order mismatch:\n  actual: {self.dim_order}\n  expected: {expected.dim_order}"
-        assert (
-            self.dim_info == expected.dim_info
-        ), f"dim_info mismatch:\n  actual: {self.dim_info}\n  expected: {expected.dim_info}"
-        assert (
-            self.tensor_dims == expected.tensor_dims
-        ), f"tensor_dims mismatch:\n  actual: {self.tensor_dims}\n  expected: {expected.tensor_dims}"
-        assert (
-            self.tensor_shapes == expected.tensor_shapes
-        ), f"tensor_shapes mismatch:\n  actual: {self.tensor_shapes}\n  expected: {expected.tensor_shapes}"
-        assert (
-            self.tile_counts == expected.tile_counts
-        ), f"tile_counts mismatch:\n  actual: {self.tile_counts}\n  expected: {expected.tile_counts}"
-        assert (
-            self.num_subgraphs == expected.num_subgraphs
-        ), f"num_subgraphs mismatch:\n  actual: {self.num_subgraphs}\n  expected: {expected.num_subgraphs}"
-
-        actual_positions = list(self.iter_tile_positions())
-        expected_positions = list(expected.iter_tile_positions())
-        assert (
-            actual_positions == expected_positions
-        ), f"iter_tile_positions mismatch:\n  actual: {actual_positions}\n  expected: {expected_positions}"
-
-        assert (
-            self.slice_params == expected.slice_params
-        ), f"slice_params mismatch:\n  actual: {self.slice_params}\n  expected: {expected.slice_params}"
-
-        assert (
-            self.output == expected.output
-        ), f"output mismatch:\n  actual: {self.output}\n  expected: {expected.output}"
-
-        assert (
-            self.reduction_tile_counts == expected.reduction_tile_counts
-        ), f"reduction_tile_counts mismatch:\n  actual: {self.reduction_tile_counts}\n  expected: {expected.reduction_tile_counts}"
-
-        actual_reduction_positions = list(self.iter_reduction_tile_positions())
-        expected_reduction_positions = list(expected.iter_reduction_tile_positions())
-        assert (
-            actual_reduction_positions == expected_reduction_positions
-        ), f"iter_reduction_tile_positions mismatch:\n  actual: {actual_reduction_positions}\n  expected: {expected_reduction_positions}"
+                self.slice_params[tensor_id][subgraph_idx] = self._compute_slice_for_position(tensor_id, tile_position)
 
     def __repr__(self) -> str:
         """Return formatted string representation of the analysis."""
-        lines = []
-        lines.append("=" * 60)
-        lines.append("Dimension Analysis")
-        lines.append("=" * 60)
-        lines.append(f"Dimensions: {', '.join(self.dim_order)}")
-        lines.append("")
-        lines.append("Tensor mappings:")
-        for tensor_id, dims in self.tensor_dims.items():
-            lines.append(f"  {tensor_id}: ({', '.join(dims)})")
-        lines.append("")
-        lines.append(f"Output: {self.output}")
-        lines.append("")
-        lines.append("Iterator types:")
-        for dim_id in self.dim_order:
-            lines.append(f"  {self.dim_info[dim_id]}")
-        lines.append("")
-        lines.append(f"Parallel dims (tileable): {self.get_parallel_dims()}")
-        lines.append(f"Reduction dims: {self.get_reduction_dims()}")
-        lines.append("")
-        lines.append(f"Tile counts: {self.tile_counts}")
-        lines.append(f"Number of subgraphs: {self.num_subgraphs}")
-        lines.append("")
-        lines.append(f"Reduction tile counts: {self.reduction_tile_counts}")
-        lines.append(f"Number of reduction tiles: {self.get_num_reduction_tiles()}")
-        lines.append("")
-        lines.append("Tile positions:")
-        for idx, pos in self.iter_tile_positions():
-            lines.append(f"  subgraph {idx}: {pos}")
-        lines.append("")
-        lines.append("Reduction tile positions:")
-        for pos in self.iter_reduction_tile_positions():
-            lines.append(f"  {pos}")
-        lines.append("")
-        lines.append("Slice parameters:")
-        for tensor_id, positions in self.slice_params.items():
-            lines.append(f"  {tensor_id}:")
-            for subgraph_idx, info in positions.items():
-                lines.append(f"    subgraph {subgraph_idx}: {info}")
-        lines.append("=" * 60)
-        return "\n".join(lines)
+        return format_analysis(self)
+
+
+def format_analysis(analysis: "DimensionAnalysis") -> str:
+    """Format a DimensionAnalysis as a human-readable multi-line string.
+
+    Args:
+        analysis: The analysis to format.
+
+    Returns:
+        Formatted string with dimension info, tile counts, and slice params.
+    """
+    lines = []
+    lines.append("=" * 60)
+    lines.append("Dimension Analysis")
+    lines.append("=" * 60)
+    lines.append(f"Dimensions: {', '.join(analysis.dim_order)}")
+    lines.append("")
+    lines.append("Tensor mappings:")
+    for tensor_id, dims in analysis.tensor_dims.items():
+        lines.append(f"  {tensor_id}: ({', '.join(dims)})")
+    lines.append("")
+    lines.append(f"Output: {analysis.output}")
+    lines.append("")
+    lines.append("Iterator types:")
+    for dim_id in analysis.dim_order:
+        lines.append(f"  {analysis.dim_info[dim_id]}")
+    lines.append("")
+    lines.append(f"Parallel dims (tileable): {analysis.get_parallel_dims()}")
+    lines.append(f"Reduction dims: {analysis.get_reduction_dims()}")
+    lines.append("")
+    lines.append(f"Tile counts: {analysis.tile_counts}")
+    lines.append(f"Number of subgraphs: {analysis.num_subgraphs}")
+    lines.append("")
+    lines.append(f"Reduction tile counts: {analysis.reduction_tile_counts}")
+    lines.append(f"Number of reduction tiles: {analysis.get_num_reduction_tiles()}")
+    lines.append("")
+    lines.append("Tile positions:")
+    for idx, pos in analysis.iter_tile_positions():
+        lines.append(f"  subgraph {idx}: {pos}")
+    lines.append("")
+    lines.append("Reduction tile positions:")
+    for pos in analysis.iter_reduction_tile_positions():
+        lines.append(f"  {pos}")
+    lines.append("")
+    lines.append("Slice parameters:")
+    for tensor_id, positions in analysis.slice_params.items():
+        lines.append(f"  {tensor_id}:")
+        for subgraph_idx, info in positions.items():
+            lines.append(f"    subgraph {subgraph_idx}: {info}")
+    lines.append("=" * 60)
+    return "\n".join(lines)
 
 
 def analyze_dimension(func: Callable[..., np.ndarray], input_shapes: dict[str, tuple[int, ...]]) -> DimensionAnalysis:

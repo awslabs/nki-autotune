@@ -288,6 +288,8 @@ def _find_best_run(working_stmts: list[ast.stmt]) -> _LoopRun | None:
     best_coverage = 0
 
     for k in range(1, n // 2 + 1):
+        if k * (n // k) <= best_coverage:
+            continue
         p = 0
         while p + 2 * k <= n:
             ref = _normalize_block(working_stmts[p : p + k])

@@ -71,9 +71,52 @@ class NKIOp(ABC):
 
     Attributes:
         op_name: Name of the operation (e.g., "nc_matmul").
+        operand_names: Positional names for each operand slot.
+        read_positions: Indices into operand_names that are read by this op.
+        write_positions: Indices into operand_names that are written by this op.
+        tile_limits: Hardware tile size limits per dimension name.
     """
 
     op_name: str
+    operand_names: tuple[str, ...] = ()
+    read_positions: tuple[int, ...] = ()
+    write_positions: tuple[int, ...] = ()
+    tile_limits: dict[str, int] = {}
+
+    def can_merge_dim(self, dim: int, new_size: int) -> bool:
+        """Check whether merging along a dimension respects hardware limits.
+
+        Args:
+            dim: Dimension index in the operand.
+            new_size: Proposed merged size for that dimension.
+
+        Returns:
+            True if the merged size is within the tile limit for that dimension,
+            or if the op has no tile limits.
+        """
+        if not self.tile_limits:
+            return True
+        dim_names = list(self.tile_limits.keys())
+        if dim >= len(dim_names):
+            return True
+        limit = self.tile_limits[dim_names[dim]]
+        return new_size <= limit
+
+    def can_merge_operand_dim(self, operand_idx: int, dim: int, new_size: int) -> bool:
+        """Check whether merging a specific operand's dimension respects limits.
+
+        Subclasses override this to provide operand-aware dimension mapping.
+        Default delegates to ``can_merge_dim(dim, new_size)``.
+
+        Args:
+            operand_idx: Index of the input operand (0-based, excludes output).
+            dim: Dimension index within the operand.
+            new_size: Proposed merged size.
+
+        Returns:
+            True if the merged size is within the tile limit.
+        """
+        return self.can_merge_dim(dim, new_size)
 
     def __call__(self, *args: NDArray) -> NDArray:
         """Execute the operation.
@@ -161,6 +204,150 @@ class NKIOp(ABC):
         """
 
 
+class LoadOp(NKIOp):
+    """Load operation: copies a slice from an input tensor to a local tile.
+
+    Operands: (src, dst) where src is the input tensor slice and dst is the
+    local tile variable.
+
+    Attributes:
+        op_name: "load"
+        operand_names: ("src", "dst")
+        read_positions: (0,) -- reads from src
+        write_positions: (1,) -- writes to dst
+    """
+
+    op_name = "load"
+    operand_names = ("src", "dst")
+    read_positions = (0,)
+    write_positions = (1,)
+    tile_limits: dict[str, int] = {}
+
+    def _trace(self, *args: "TracedTensor") -> "TracedTensor":
+        """Not used for LoadOp."""
+        raise NotImplementedError("LoadOp does not support tracing")
+
+    def generate_nki(self, inputs: list[str], output: str) -> str:
+        """Not used for LoadOp."""
+        raise NotImplementedError("LoadOp uses program-level codegen")
+
+    def simulate(self, *args: NDArray) -> NDArray:
+        """Not used for LoadOp."""
+        raise NotImplementedError("LoadOp does not support simulation")
+
+    def generate_expr(self, inputs: list[str]) -> str:
+        """Not used for LoadOp."""
+        raise NotImplementedError("LoadOp uses program-level codegen")
+
+    def reduce(self, result_var: str, inputs: list[str]) -> str | None:
+        """LoadOp does not perform reduction."""
+        return None
+
+    def output_shape(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+        """Not used for LoadOp."""
+        raise NotImplementedError("LoadOp does not compute output shapes")
+
+
+class StoreOp(NKIOp):
+    """Store operation: copies a local tile to an output tensor slice.
+
+    Operands: (src, dst) where src is the local tile and dst is the
+    output tensor slice.
+
+    Attributes:
+        op_name: "store"
+        operand_names: ("src", "dst")
+        read_positions: (0,) -- reads from src
+        write_positions: (1,) -- writes to dst
+    """
+
+    op_name = "store"
+    operand_names = ("src", "dst")
+    read_positions = (0,)
+    write_positions = (1,)
+    tile_limits: dict[str, int] = {}
+
+    def _trace(self, *args: "TracedTensor") -> "TracedTensor":
+        """Not used for StoreOp."""
+        raise NotImplementedError("StoreOp does not support tracing")
+
+    def generate_nki(self, inputs: list[str], output: str) -> str:
+        """Not used for StoreOp."""
+        raise NotImplementedError("StoreOp uses program-level codegen")
+
+    def simulate(self, *args: NDArray) -> NDArray:
+        """Not used for StoreOp."""
+        raise NotImplementedError("StoreOp does not support simulation")
+
+    def generate_expr(self, inputs: list[str]) -> str:
+        """Not used for StoreOp."""
+        raise NotImplementedError("StoreOp uses program-level codegen")
+
+    def reduce(self, result_var: str, inputs: list[str]) -> str | None:
+        """StoreOp does not perform reduction."""
+        return None
+
+    def output_shape(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+        """Not used for StoreOp."""
+        raise NotImplementedError("StoreOp does not compute output shapes")
+
+
+class AllocOp(NKIOp):
+    """Allocation operation: allocates an output tensor.
+
+    Per-dtype singletons keep the statement uniformly (op, operands) with no
+    extra metadata. Shape is derivable from the operand's slices.
+
+    Operands: (tensor,) where tensor is the allocated variable with
+    full-range slices encoding the shape.
+
+    Attributes:
+        op_name: "alloc_<dtype>" (e.g., "alloc_float32").
+        operand_names: ("tensor",)
+        read_positions: () -- no reads
+        write_positions: (0,) -- writes the allocation
+        dtype: Numpy dtype instance.
+    """
+
+    operand_names = ("tensor",)
+    read_positions = ()
+    write_positions = (0,)
+    tile_limits: dict[str, int] = {}
+
+    def __init__(self, dtype: type) -> None:
+        """Initialize an AllocOp for a specific dtype.
+
+        Args:
+            dtype: Numpy dtype (e.g., np.float32, np.float64).
+        """
+        self.dtype = dtype
+        self.op_name = f"alloc_{np.dtype(dtype).name}"
+
+    def _trace(self, *args: "TracedTensor") -> "TracedTensor":
+        """Not used for AllocOp."""
+        raise NotImplementedError("AllocOp does not support tracing")
+
+    def generate_nki(self, inputs: list[str], output: str) -> str:
+        """Not used for AllocOp."""
+        raise NotImplementedError("AllocOp uses program-level codegen")
+
+    def simulate(self, *args: NDArray) -> NDArray:
+        """Not used for AllocOp."""
+        raise NotImplementedError("AllocOp does not support simulation")
+
+    def generate_expr(self, inputs: list[str]) -> str:
+        """Not used for AllocOp."""
+        raise NotImplementedError("AllocOp uses program-level codegen")
+
+    def reduce(self, result_var: str, inputs: list[str]) -> str | None:
+        """AllocOp does not perform reduction."""
+        return None
+
+    def output_shape(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+        """Not used for AllocOp."""
+        raise NotImplementedError("AllocOp does not compute output shapes")
+
+
 class NKIMatmul(NKIOp):
     """NKI matrix multiplication following nc_matmul semantics.
 
@@ -171,6 +358,12 @@ class NKIMatmul(NKIOp):
 
     The K dimension is contracted (unified) during the operation.
 
+    Attributes:
+        operand_names: ("lhs", "rhs", "dst")
+        read_positions: (0, 1) -- reads lhs and rhs
+        write_positions: (2,) -- writes dst
+        tile_limits: {"M": 128, "K": 128, "N": 512}
+
     Example:
         >>> nc_matmul = NKIMatmul()
         >>> lhs = TracedTensor("lhs", (128, 64), ["K", "M"], tracker)
@@ -179,6 +372,35 @@ class NKIMatmul(NKIOp):
     """
 
     op_name = "nc_matmul"
+    operand_names = ("lhs", "rhs", "dst")
+    read_positions = (0, 1)
+    write_positions = (2,)
+    tile_limits = {"M": 128, "K": 128, "N": 512}
+
+    _operand_dim_names: tuple[tuple[str, ...], ...] = (("K", "M"), ("K", "N"))
+
+    def can_merge_operand_dim(self, operand_idx: int, dim: int, new_size: int) -> bool:
+        """Check tile limit for a specific operand dimension of nc_matmul.
+
+        Maps (operand_idx, dim) to the abstract dimension name (M, K, N)
+        and checks against the corresponding tile limit.
+
+        Args:
+            operand_idx: 0 for lhs [K, M], 1 for rhs [K, N].
+            dim: Dimension within the operand.
+            new_size: Proposed merged size.
+
+        Returns:
+            True if within the tile limit.
+        """
+        if operand_idx < len(self._operand_dim_names):
+            dim_names = self._operand_dim_names[operand_idx]
+            if dim < len(dim_names):
+                dim_name = dim_names[dim]
+                limit = self.tile_limits.get(dim_name)
+                if limit is not None:
+                    return new_size <= limit
+        return True
 
     def _trace(self, lhs: "TracedTensor", rhs: "TracedTensor") -> "TracedTensor":
         """Execute tracing for nc_matmul on TracedTensors.
@@ -277,11 +499,93 @@ class NKIMatmul(NKIOp):
         return (input_shapes[0][1], input_shapes[1][1])
 
 
-OP_REGISTRY: dict[str, NKIOp] = {"nc_matmul": NKIMatmul()}
-"""Registry mapping operation names to NKIOp instances.
+class ElementwiseOp(NKIOp):
+    """Elementwise operation with keyword arguments.
 
-To add a new operator, create a subclass of NKIOp and add an instance here.
-"""
+    Handles operations like tensor_tensor, activation, and tensor_scalar
+    that take tensor inputs plus keyword arguments specifying the operation.
+    Output shape matches the first input's shape.
+
+    Instances are parameterized by kwargs and compare equal if kwargs match.
+
+    Attributes:
+        op_name: Operation name (e.g., "tensor_tensor").
+        kwargs_repr: Sorted tuple of (key, repr_string) for kwargs.
+    """
+
+    read_positions = ()
+    write_positions = ()
+    tile_limits: dict[str, int] = {}
+
+    def __init__(self, op_name: str, kwargs_repr: tuple[tuple[str, str], ...] = ()) -> None:
+        """Initialize an ElementwiseOp.
+
+        Args:
+            op_name: Operation name (e.g., "tensor_tensor").
+            kwargs_repr: Sorted tuple of (key, repr_string) for kwargs.
+        """
+        self.op_name = op_name
+        self.kwargs_repr = kwargs_repr
+
+    def __eq__(self, other: object) -> bool:
+        """Check equality based on op_name and kwargs."""
+        if not isinstance(other, ElementwiseOp):
+            return NotImplemented
+        return self.op_name == other.op_name and self.kwargs_repr == other.kwargs_repr
+
+    def __hash__(self) -> int:
+        """Hash based on op_name and kwargs."""
+        return hash((self.op_name, self.kwargs_repr))
+
+    def _trace(self, *args: "TracedTensor") -> "TracedTensor":
+        """Not used for ElementwiseOp."""
+        raise NotImplementedError("ElementwiseOp does not support tracing")
+
+    def generate_nki(self, inputs: list[str], output: str) -> str:
+        """Not used for ElementwiseOp."""
+        raise NotImplementedError("ElementwiseOp uses program-level codegen")
+
+    def simulate(self, *args: NDArray) -> NDArray:
+        """Not used for ElementwiseOp."""
+        raise NotImplementedError("ElementwiseOp does not support simulation")
+
+    def generate_expr(self, inputs: list[str]) -> str:
+        """Not used for ElementwiseOp."""
+        raise NotImplementedError("ElementwiseOp uses program-level codegen")
+
+    def reduce(self, result_var: str, inputs: list[str]) -> str | None:
+        """ElementwiseOp does not perform reduction."""
+        return None
+
+    def output_shape(self, input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+        """Output shape matches first input shape.
+
+        Args:
+            input_shapes: List of input tensor shapes.
+
+        Returns:
+            Shape of the first input.
+        """
+        return input_shapes[0]
+
+
+LOAD_OP = LoadOp()
+STORE_OP = StoreOp()
+ALLOC_F32_OP = AllocOp(np.float32)
+ALLOC_F64_OP = AllocOp(np.float64)
+NC_MATMUL_OP = NKIMatmul()
+
+ALLOC_OPS: dict[str, AllocOp] = {"float32": ALLOC_F32_OP, "float64": ALLOC_F64_OP}
+
+ELEMENTWISE_OP_NAMES: set[str] = {"tensor_tensor", "activation", "tensor_scalar"}
+
+OP_REGISTRY: dict[str, NKIOp] = {
+    "nc_matmul": NC_MATMUL_OP,
+    "load": LOAD_OP,
+    "store": STORE_OP,
+    "alloc_float32": ALLOC_F32_OP,
+    "alloc_float64": ALLOC_F64_OP,
+}
 
 
 def ndarray(shape: tuple[int, ...], dtype: type) -> NDArray:

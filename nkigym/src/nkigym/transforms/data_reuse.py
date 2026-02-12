@@ -1,28 +1,21 @@
 """Data reuse analysis and transform for tiled compute graphs.
 
 Identifies tensor slices that can be merged across subgraphs, reducing
-redundant load operations. Operates on the tiled IR produced by the
-tiling pass.
+redundant load operations. Operates on the tuple-based program IR.
 
 Example::
 
     reuse = DataReuseTransform()
-    pairs = reuse.analyze(tiled_func)
+    pairs = reuse.analyze_ir(program)
     for pair in pairs:
-        tiled_func = reuse.transform(tiled_func, pair)
+        program = reuse.transform_ir(program, pair)
 """
 
-import ast
-import logging
-from collections.abc import Callable
 from itertools import combinations
 
-import numpy as np
-
+from nkigym.ir import Operand, Program, Statement
+from nkigym.ops import LoadOp
 from nkigym.transforms.base import Transform
-from nkigym.utils.source import exec_tree_to_func, get_source
-
-logger = logging.getLogger(__name__)
 
 
 def normalize_reuse_groups(groups: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
@@ -39,130 +32,17 @@ def normalize_reuse_groups(groups: list[tuple[str, ...]]) -> list[tuple[str, ...
     return sorted([tuple(sorted(g)) for g in groups])
 
 
-def _node_to_tuple(node: ast.expr) -> tuple:
-    """Convert an AST expression node to a hashable tuple for comparison.
+def _rename_operands(operands: tuple[Operand, ...], rename_map: dict[str, str]) -> tuple[Operand, ...]:
+    """Replace variable names in operand tuples according to rename_map.
 
     Args:
-        node: An AST expression node (Slice, Constant, Tuple, etc.).
+        operands: Tuple of (var_name, slices) pairs.
+        rename_map: Mapping from old variable names to new names.
 
     Returns:
-        A hashable tuple representation of the node.
+        New operands tuple with renamed variables.
     """
-    if isinstance(node, ast.Slice):
-        lower = _node_to_tuple(node.lower) if node.lower else None
-        upper = _node_to_tuple(node.upper) if node.upper else None
-        step = _node_to_tuple(node.step) if node.step else None
-        return ("slice", lower, upper, step)
-    elif isinstance(node, ast.Constant):
-        return ("const", node.value)
-    elif isinstance(node, ast.Tuple):
-        return ("tuple", tuple(_node_to_tuple(elt) for elt in node.elts))
-    elif isinstance(node, ast.Name):
-        return ("name", node.id)
-    else:
-        return ("unknown", ast.dump(node))
-
-
-def _extract_subscript_key(subscript: ast.Subscript) -> tuple:
-    """Extract a hashable key from a subscript node.
-
-    Args:
-        subscript: An AST Subscript node representing tensor[slice].
-
-    Returns:
-        A tuple of (source_tensor_name, slice_key) for grouping.
-
-    Raises:
-        ValueError: If the subscript base is not a simple name.
-    """
-    if not isinstance(subscript.value, ast.Name):
-        raise ValueError("Subscript base must be a simple name")
-
-    source_tensor = subscript.value.id
-    slice_node = subscript.slice
-
-    if isinstance(slice_node, ast.Tuple):
-        slice_key = tuple(_node_to_tuple(elt) for elt in slice_node.elts)
-    else:
-        slice_key = (_node_to_tuple(slice_node),)
-
-    return (source_tensor, slice_key)
-
-
-def _find_tensor_assignments(stmts: list[ast.stmt]) -> dict[str, tuple]:
-    """Find all tensor slice assignments and extract their slice keys.
-
-    Iterates over the function body statements to find assignments of the
-    form ``var = tensor[slice]`` and returns a mapping from variable name
-    to slice key.
-
-    Args:
-        stmts: List of AST statements from the function body.
-
-    Returns:
-        Dict mapping tensor variable names to their slice keys.
-    """
-    assignments: dict[str, tuple] = {}
-
-    for node in stmts:
-        if not isinstance(node, ast.Assign):
-            continue
-        if len(node.targets) != 1:
-            continue
-
-        target = node.targets[0]
-        if not isinstance(target, ast.Name):
-            continue
-
-        value = node.value
-        if not isinstance(value, ast.Subscript):
-            continue
-        if not isinstance(value.value, ast.Name):
-            continue
-
-        var_name = target.id
-        slice_key = _extract_subscript_key(value)
-        assignments[var_name] = slice_key
-
-    return assignments
-
-
-def _merge_tensor_pair_inplace(func_def: ast.FunctionDef, tensor_a: str, tensor_b: str, shared_name: str) -> None:
-    """Merge two tensor slices by mutating the function body in-place.
-
-    Performs three operations:
-    1. Filters out tensor_b's assignment statement.
-    2. Renames tensor_a's assignment target to shared_name.
-    3. Replaces all Name references to tensor_a or tensor_b with shared_name.
-
-    Since only ``.id`` attributes on existing Name nodes are mutated and
-    statements are removed (no new AST nodes created),
-    ``ast.fix_missing_locations`` is not needed.
-
-    Args:
-        func_def: The ``ast.FunctionDef`` node to mutate.
-        tensor_a: Name of the first tensor slice (becomes shared_name).
-        tensor_b: Name of the second tensor slice (assignment removed).
-        shared_name: The name to use for the merged tensor reference.
-    """
-    names_to_replace = {tensor_a, tensor_b}
-    new_body: list[ast.stmt] = []
-    for stmt in func_def.body:
-        if (
-            isinstance(stmt, ast.Assign)
-            and len(stmt.targets) == 1
-            and isinstance(stmt.targets[0], ast.Name)
-            and stmt.targets[0].id == tensor_b
-        ):
-            continue
-        new_body.append(stmt)
-
-    for stmt in new_body:
-        for node in ast.walk(stmt):
-            if isinstance(node, ast.Name) and node.id in names_to_replace:
-                node.id = shared_name
-
-    func_def.body = new_body
+    return tuple((rename_map.get(var, var), slices) for var, slices in operands)
 
 
 class DataReuseTransform(Transform):
@@ -171,140 +51,91 @@ class DataReuseTransform(Transform):
     Identifies tensor slices that access identical data in different
     subgraphs and merges them into a single load.
 
-    ``analyze()`` returns pairs of tensor variable names that share
-    identical slice patterns. ``transform()`` merges a single pair.
+    ``analyze_ir()`` returns pairs of tensor variable names that share
+    identical slice patterns. ``transform_ir()`` merges a single pair.
 
     Example::
 
         reuse = DataReuseTransform()
-        pairs = reuse.analyze(tiled_func)
+        pairs = reuse.analyze_ir(program)
         for pair in pairs:
-            tiled_func = reuse.transform(tiled_func, pair)
+            program = reuse.transform_ir(program, pair)
     """
 
     name = "data_reuse"
 
-    def analyze(self, func: Callable) -> list[tuple[str, str]]:
+    def analyze_ir(self, program: Program) -> list[tuple[str, str]]:
         """Identify pairs of tensor slices that can be merged across subgraphs.
 
+        Groups load statements by (src_var, src_slices) and returns pairs
+        of dst variables that share identical load patterns.
+
         Args:
-            func: Pre-tiled function containing slice assignments like
-                  ``a_sg0 = a[0:128, 0:128]``.
+            program: Program tuple (name, params, stmts, return_var).
 
         Returns:
             List of mergeable pairs. Each pair is a tuple of two tensor
             variable names that access identical data
-            (e.g., ``('b_sg0', 'b_sg1')``).
+            (e.g., ``('tensor_0', 'tensor_3')``).
         """
-        source = get_source(func)
-        tree = ast.parse(source)
-        func_def = tree.body[0]
-        if not isinstance(func_def, ast.FunctionDef):
-            raise ValueError("No function definition found in source")
+        stmts = program.stmts
 
-        assignments = _find_tensor_assignments(func_def.body)
-
-        slice_groups: dict[tuple, list[str]] = {}
-        for var_name, slice_key in assignments.items():
-            if slice_key not in slice_groups:
-                slice_groups[slice_key] = []
-            slice_groups[slice_key].append(var_name)
+        load_groups: dict[tuple, list[str]] = {}
+        for op, operands in stmts:
+            if not isinstance(op, LoadOp):
+                continue
+            src_var, src_slices = operands[0]
+            dst_var, _ = operands[1]
+            key = (src_var, src_slices)
+            load_groups.setdefault(key, []).append(dst_var)
 
         pairs: list[tuple[str, str]] = []
-        for vars in slice_groups.values():
-            if len(vars) >= 2:
-                pairs.extend(combinations(vars, 2))
+        for dst_vars in load_groups.values():
+            if len(dst_vars) >= 2:
+                pairs.extend(combinations(dst_vars, 2))
         return pairs
 
-    def transform(self, func: Callable, pair: tuple[str, str]) -> Callable[..., np.ndarray]:
+    def transform_ir(self, program: Program, pair: tuple[str, str]) -> Program:
         """Merge a single pair of reusable tensor slices.
 
-        Removes the second tensor's assignment and replaces all its
+        Removes the second tensor's load statement and replaces all its
         references with the first tensor.
 
         Args:
-            func: Pre-tiled function to transform.
-            pair: A pair of tensor names from ``analyze()``.
+            program: Program tuple to transform.
+            pair: A pair of tensor names from ``analyze_ir()``.
 
         Returns:
-            New callable with the pair's redundant load merged.
-        """
-        tensor_a, tensor_b = pair
-        return self._merge_pair(func, tensor_a, tensor_b)
-
-    def _merge_pair(self, func: Callable, tensor_a: str, tensor_b: str) -> Callable[..., np.ndarray]:
-        """Merge two reusable tensor slices into a single assignment.
-
-        Removes tensor_b's assignment and replaces all references to tensor_b
-        with tensor_a.
-
-        Args:
-            func: Pre-tiled function containing slice assignments.
-            tensor_a: Tensor slice name to keep as the canonical reference.
-            tensor_b: Tensor slice name to merge into tensor_a.
-
-        Returns:
-            New callable with tensor_b merged into tensor_a.
+            New program tuple with the pair's redundant load merged.
 
         Raises:
-            ValueError: If tensor names are invalid, tensors don't exist, or tensors
-                        do not share identical slices.
+            ValueError: If tensor names are identical or don't share slices.
         """
-        if tensor_a == tensor_b:
-            raise ValueError(f"Cannot merge {tensor_a} with itself")
+        keep, drop = pair
+        if keep == drop:
+            raise ValueError(f"Cannot merge {keep} with itself")
 
-        source = get_source(func)
-        tree = ast.parse(source)
-        func_def = tree.body[0]
-        if not isinstance(func_def, ast.FunctionDef):
-            raise ValueError("No function definition found in source")
+        name, params, stmts, return_var, preamble = program
 
-        tensor_assignments = _find_tensor_assignments(func_def.body)
+        load_sources: dict[str, tuple] = {}
+        for op, operands in stmts:
+            if isinstance(op, LoadOp):
+                dst_var = operands[1][0]
+                src_key = (operands[0][0], operands[0][1])
+                load_sources[dst_var] = src_key
 
-        if tensor_a not in tensor_assignments:
-            raise ValueError(f"Tensor '{tensor_a}' not found")
-        if tensor_b not in tensor_assignments:
-            raise ValueError(f"Tensor '{tensor_b}' not found")
+        for tensor_name in (keep, drop):
+            if tensor_name not in load_sources:
+                raise ValueError(f"Tensor '{tensor_name}' not found in program loads")
 
-        slice_a = tensor_assignments[tensor_a]
-        slice_b = tensor_assignments[tensor_b]
-        logger.debug(slice_a)
-        logger.debug(slice_b)
-        if slice_a != slice_b:
-            raise ValueError(f"Tensors '{tensor_a}' and '{tensor_b}' do not share identical slices")
+        if load_sources[keep] != load_sources[drop]:
+            raise ValueError(f"Tensors '{keep}' and '{drop}' do not share identical slices")
 
-        _merge_tensor_pair_inplace(func_def, tensor_a, tensor_b, tensor_a)
-        return exec_tree_to_func(tree, func_def.name)
+        rename_map = {drop: keep}
+        new_stmts: list[Statement] = []
+        for op, operands in stmts:
+            if isinstance(op, LoadOp) and operands[1][0] == drop:
+                continue
+            new_stmts.append((op, _rename_operands(operands, rename_map)))
 
-
-_default_transform = DataReuseTransform()
-
-
-def analyze_data_reuse(func: Callable) -> list[tuple[str, str]]:
-    """Identify pairs of tensor slices that can be merged across subgraphs.
-
-    Convenience wrapper around ``DataReuseTransform.analyze()``.
-
-    Args:
-        func: Pre-tiled function containing slice assignments.
-
-    Returns:
-        List of mergeable pairs.
-    """
-    return _default_transform.analyze(func)
-
-
-def merge_reusable_tensors(func: Callable, tensor_a: str, tensor_b: str) -> Callable[..., np.ndarray]:
-    """Merge two reusable tensor slices into a single assignment.
-
-    Convenience wrapper around DataReuseTransform._merge_pair().
-
-    Args:
-        func: Pre-tiled function containing slice assignments.
-        tensor_a: Tensor slice name to keep.
-        tensor_b: Tensor slice name to merge into tensor_a.
-
-    Returns:
-        New callable with tensor_b merged into tensor_a.
-    """
-    return _default_transform._merge_pair(func, tensor_a, tensor_b)
+        return Program(name, params, tuple(new_stmts), return_var, preamble)

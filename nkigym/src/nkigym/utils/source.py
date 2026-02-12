@@ -4,9 +4,11 @@ Provides source code round-tripping: extracting source from callables
 and compiling source strings back into callable functions.
 """
 
-import ast
+import importlib.util
 import inspect
+import textwrap
 from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 
@@ -25,7 +27,7 @@ def get_source(func: Callable) -> str:
     """
     source = getattr(func, "__source__", None)
     if source is None:
-        source = inspect.getsource(func)
+        source = textwrap.dedent(inspect.getsource(func))
     return source
 
 
@@ -51,29 +53,23 @@ def exec_source_to_func(source: str, func_name: str) -> Callable[..., np.ndarray
     return func
 
 
-def exec_tree_to_func(tree: ast.Module, func_name: str) -> Callable[..., np.ndarray]:
-    """Compile an AST tree directly and return the named function.
-
-    Avoids the string round-trip of ``exec(source_string)`` by compiling
-    the AST directly. The unparsed source is still attached as
-    ``__source__`` for deduplication and future re-parsing.
+def import_func(file_path: Path, func_name: str) -> Callable:
+    """Import a function by name from a Python source file.
 
     Args:
-        tree: An ``ast.Module`` node with locations already set.
-        func_name: Name of the function to extract from executed namespace.
+        file_path: Path to the Python source file.
+        func_name: Name of the function to import from the module.
 
     Returns:
-        Callable function with ``__source__`` attribute attached.
+        The imported callable.
 
     Raises:
-        ValueError: If the named function is not found in the executed code.
+        ImportError: If the module spec cannot be created or has no loader.
+        AttributeError: If the function is not found in the module.
     """
-    code = compile(tree, "<nkigym>", "exec")
-    source = ast.unparse(tree)
-    namespace: dict[str, object] = {"np": np, "nkigym": nkigym}
-    exec(code, namespace)
-    func = namespace.get(func_name)
-    if func is None:
-        raise ValueError(f"Function '{func_name}' not found in compiled tree")
-    func.__source__ = source
-    return func
+    spec = importlib.util.spec_from_file_location(file_path.stem, file_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {file_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return getattr(mod, func_name)

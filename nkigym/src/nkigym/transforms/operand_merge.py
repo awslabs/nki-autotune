@@ -5,68 +5,38 @@ the same tensor and can be merged into a single wider operation. This
 reduces the total number of load/store/compute statements, improving
 hardware utilization.
 
+Operates on the tuple-based program IR. Hardware tile limits are delegated
+to ``op.can_merge_dim()`` rather than a hardcoded table.
+
 Example::
 
     merge = OperandMergeTransform()
-    opportunities = merge.analyze(tiled_func)
+    opportunities = merge.analyze_ir(program)
     for opp in opportunities:
-        tiled_func = merge.transform(tiled_func, opp)
+        program = merge.transform_ir(program, opp)
 """
 
-from __future__ import annotations
-
-import ast
-import logging
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
-import numpy as np
-
+from nkigym.ir import Operand, Program, Statement
+from nkigym.ops import AllocOp, ElementwiseOp, LoadOp, NKIOp, StoreOp
 from nkigym.transforms.base import Transform
-from nkigym.utils.source import exec_tree_to_func, get_source
-
-logger = logging.getLogger(__name__)
-
-TILE_LIMITS: dict[str, dict[str, int]] = {
-    "nc_matmul": {"M": 128, "K": 128, "N": 512},
-    "activation": {"partition": 128},
-    "tensor_scalar": {},
-    "tensor_tensor": {},
-}
-"""Hardware tile size limits per operation type.
-
-Each entry maps an operation name to its maximum tile dimensions.
-Merged slices must not exceed these limits on any dimension.
-
-- ``nc_matmul``: free dimension on moving side (N) max 512, stationary
-  (M) max 128, contraction (K) max 128.
-- ``activation``: partition dimension max 128. Free dimension is limited
-  by SBUF partition size but is left unchecked here.
-- ``tensor_scalar``: broadcast (P, 1) -- no free-dimension limit.
-- ``tensor_tensor``: constrained by operand matching rules, no additional
-  numeric limit.
-"""
 
 
 @dataclass
 class MergeOpportunity:
-    """A single merge opportunity found by ``analyze()``.
+    """A single merge opportunity found by ``analyze_ir()``.
 
     Attributes:
         op_type: The operation type string (e.g., ``"nc_matmul"``,
-            ``"load"``, ``"activation"``, ``"tensor_scalar"``,
-            ``"tensor_tensor"``).
-        stmt_a: The AST statement index (position in function body)
-            of the first operation.
-        stmt_b: The AST statement index of the second operation
+            ``"load"``).
+        stmt_a: The statement index of the first operation.
+        stmt_b: The statement index of the second operation
             (to be absorbed).
         differing_operand_idx: Index of the operand that differs between
-            the two ops (0-based among the operands). For loads this is
-            the slice dimension index that differs.
+            the two ops. For loads this is the slice dimension index.
         merged_slice: A ``(start, stop)`` tuple for the merged
-            free-dimension range of the differing operand after
-            merging.
+            free-dimension range of the differing operand.
         description: Human-readable description for logging.
     """
 
@@ -78,969 +48,771 @@ class MergeOpportunity:
     description: str
 
 
-def _parse_slice(node: ast.Slice) -> tuple[int, int]:
-    """Extract ``(start, stop)`` from an AST Slice node.
-
-    The tiled IR always uses ``ast.Constant`` for start and stop values.
-
-    Args:
-        node: An AST Slice node with constant start/stop.
-
-    Returns:
-        Tuple of ``(start, stop)`` integers.
-
-    Raises:
-        ValueError: If start or stop is not an ``ast.Constant``.
-    """
-    if not isinstance(node.lower, ast.Constant) or not isinstance(node.upper, ast.Constant):
-        raise ValueError(f"Expected constant slice bounds, got {ast.dump(node)}")
-    return (node.lower.value, node.upper.value)
-
-
-def _parse_subscript_slices(node: ast.Subscript) -> list[tuple[int, int]]:
-    """Extract all dimension slices from a subscript expression.
-
-    Handles both single-dimension (``tensor[0:128]``) and
-    multi-dimension (``tensor[0:128, 128:256]``) subscripts.
-
-    Args:
-        node: An AST Subscript node.
-
-    Returns:
-        List of ``(start, stop)`` tuples, one per dimension.
-
-    Raises:
-        ValueError: If the slice structure is unexpected.
-    """
-    slice_node = node.slice
-    if isinstance(slice_node, ast.Tuple):
-        return [_parse_slice(elt) for elt in slice_node.elts]
-    if isinstance(slice_node, ast.Slice):
-        return [_parse_slice(slice_node)]
-    raise ValueError(f"Unexpected subscript slice type: {ast.dump(slice_node)}")
-
-
-def _get_nkigym_func_name(call_node: ast.Call) -> str | None:
-    """Extract the function name from a ``nkigym.X(...)`` call.
-
-    Args:
-        call_node: An AST Call node.
-
-    Returns:
-        The function name (e.g., ``"nc_matmul"``, ``"ndarray"``),
-        or ``None`` if the call is not to ``nkigym.<name>``.
-    """
-    func = call_node.func
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "nkigym":
-        return func.attr
-    return None
-
-
-def _extract_arg_info(arg: ast.expr) -> dict:
-    """Extract information from a call argument.
-
-    For Name nodes, returns the variable name. For Subscript nodes,
-    returns the variable name and its slices.
-
-    Args:
-        arg: An AST expression node (argument to a call).
-
-    Returns:
-        Dict with ``"name"`` and optionally ``"slices"`` keys.
-    """
-    if isinstance(arg, ast.Name):
-        return {"name": arg.id, "slices": None}
-    if isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name):
-        return {"name": arg.value.id, "slices": _parse_subscript_slices(arg)}
-    return {"name": None, "slices": None}
-
-
-def _classify_stmt(stmt: ast.stmt, idx: int) -> dict:
-    """Classify a single AST statement from the tiled IR.
-
-    Determines the statement type and extracts relevant fields.
-
-    Args:
-        stmt: An AST statement node.
-        idx: The statement's index in the function body.
-
-    Returns:
-        Dict with keys:
-            - ``"type"``: one of ``"alloc"``, ``"load"``, ``"op"``,
-              ``"store"``, ``"aug_assign"``, ``"return"``, ``"other"``
-            - ``"idx"``: the statement index
-            - Additional keys depending on type (see below).
-
-        For ``"load"``:
-            ``"var"``, ``"source_tensor"``, ``"slices"``
-
-        For ``"alloc"``:
-            ``"var"``
-
-        For ``"op"``:
-            ``"var"``, ``"op_name"``, ``"args"``, ``"kwargs"``
-
-        For ``"store"``:
-            ``"target"``, ``"target_slices"``, ``"value_var"``
-
-        For ``"aug_assign"``:
-            ``"var"``, ``"op_name"``, ``"args"``, ``"kwargs"``
-    """
-    result: dict = {"type": "other", "idx": idx}
-
-    if isinstance(stmt, ast.Return):
-        result["type"] = "return"
-        return result
-
-    if isinstance(stmt, ast.AugAssign):
-        result["type"] = "aug_assign"
-        if isinstance(stmt.target, ast.Name):
-            result["var"] = stmt.target.id
-        if isinstance(stmt.value, ast.Call):
-            op_name = _get_nkigym_func_name(stmt.value)
-            if op_name:
-                result["op_name"] = op_name
-                result["args"] = [_extract_arg_info(a) for a in stmt.value.args]
-                result["kwargs"] = {kw.arg: kw.value for kw in stmt.value.keywords if kw.arg is not None}
-        return result
-
-    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
-        return result
-
-    target = stmt.targets[0]
-    value = stmt.value
-
-    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-        result["type"] = "store"
-        result["target"] = target.value.id
-        result["target_slices"] = _parse_subscript_slices(target)
-        if isinstance(value, ast.Name):
-            result["value_var"] = value.id
-        elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
-            result["value_var"] = value.value.id
-        return result
-
-    if not isinstance(target, ast.Name):
-        return result
-
-    var_name = target.id
-
-    if isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
-        result["type"] = "load"
-        result["var"] = var_name
-        result["source_tensor"] = value.value.id
-        result["slices"] = _parse_subscript_slices(value)
-        return result
-
-    if isinstance(value, ast.Call):
-        op_name = _get_nkigym_func_name(value)
-        if op_name == "ndarray":
-            result["type"] = "alloc"
-            result["var"] = var_name
-            return result
-        if op_name:
-            result["type"] = "op"
-            result["var"] = var_name
-            result["op_name"] = op_name
-            result["args"] = [_extract_arg_info(a) for a in value.args]
-            result["kwargs"] = {kw.arg: kw.value for kw in value.keywords if kw.arg is not None}
-            return result
-
-    return result
-
-
-def _parse_function_body(func: Callable) -> tuple[str, list[str], dict[str, list[dict]], ast.Module]:
-    """Parse a tiled function's source into classified statements.
-
-    Args:
-        func: A tiled function (with ``__source__`` attribute).
-
-    Returns:
-        Tuple of ``(func_name, param_names, classified, tree)`` where
-        ``classified`` is a dict keyed by statement type
-        (``"load"``, ``"op"``, ``"store"``, ``"aug_assign"``, etc.)
-        plus ``"all"`` for the flat positional list, and ``tree`` is the
-        parsed ``ast.Module``.
-
-    Raises:
-        ValueError: If no function definition is found in the source.
-    """
-    source = get_source(func)
-    tree = ast.parse(source)
-    func_def = tree.body[0]
-    if not isinstance(func_def, ast.FunctionDef):
-        raise ValueError("No function definition found in source")
-
-    func_name = func_def.name
-    param_names = [arg.arg for arg in func_def.args.args]
-    all_stmts = [_classify_stmt(stmt, idx) for idx, stmt in enumerate(func_def.body)]
-
-    by_type: dict[str, list[dict]] = {"all": all_stmts}
-    for s in all_stmts:
-        by_type.setdefault(s["type"], []).append(s)
-
-    return func_name, param_names, by_type, tree
-
-
-def _greedy_pair_opportunities(
-    groups: dict[Any, list[dict]],
-    check_pair: Callable[[dict, dict], MergeOpportunity | None],
-    sort_key: Callable[[dict], Any] | None = None,
-) -> list[MergeOpportunity]:
-    """Greedily pair grouped statements into merge opportunities.
-
-    Iterates each group and pairs statements using a first-match greedy
-    strategy. Once a statement is paired it is excluded from further
-    consideration within the same ``analyze()`` call.
-
-    Args:
-        groups: Mapping from group key to list of classified statement dicts.
-        check_pair: Callable that receives two candidate statements and
-            returns a ``MergeOpportunity`` if they can be merged, or
-            ``None`` to skip.
-        sort_key: Optional key function to sort each group before pairing.
-
-    Returns:
-        List of ``MergeOpportunity`` objects produced by ``check_pair``.
-    """
-    used_stmts: set[int] = set()
-    opportunities: list[MergeOpportunity] = []
-
-    for members in groups.values():
-        if len(members) < 2:
-            continue
-
-        ordered = sorted(members, key=sort_key) if sort_key else members
-
-        for i in range(len(ordered)):
-            if ordered[i]["idx"] in used_stmts:
-                continue
-
-            for j in range(i + 1, len(ordered)):
-                if ordered[j]["idx"] in used_stmts:
-                    continue
-
-                opp = check_pair(ordered[i], ordered[j])
-                if opp is None:
-                    continue
-
-                opportunities.append(opp)
-                used_stmts.add(opp.stmt_a)
-                used_stmts.add(opp.stmt_b)
-                break
-
-    return opportunities
-
-
-def _find_merge_opportunities(classified: dict[str, list[dict]]) -> list[MergeOpportunity]:
-    """Find all merge opportunities (load and op) in classified statements.
-
-    Scans loads for adjacent pairs that can be merged into wider loads,
-    then scans ops for pairs that differ on exactly one subscripted
-    argument with adjacent slices.
-
-    Args:
-        classified: Dict keyed by statement type from
-            ``_parse_function_body()``.
-
-    Returns:
-        List of ``MergeOpportunity`` objects for both load and op
-        merging.
-    """
-    all_stmts = classified["all"]
-    loads = classified.get("load", [])
-    stores = classified.get("store", [])
-    aug_assigns = classified.get("aug_assign", [])
-    var_usage = _build_var_usage_index(all_stmts)
-
-    opportunities: list[MergeOpportunity] = []
-
-    if len(loads) >= 2:
-        load_groups: dict[tuple, list[dict]] = {}
-        for load in loads:
-            slices = load["slices"]
-            if len(slices) < 2:
-                continue
-            partition_key = (load["source_tensor"], slices[0])
-            load_groups.setdefault(partition_key, []).append(load)
-
-        def check_load_pair(load_a: dict, load_b: dict) -> MergeOpportunity | None:
-            adj = _check_adjacent_slices(load_a["slices"], load_b["slices"])
-            if adj is None:
-                return None
-
-            dim, merged = adj
-
-            stmt_first = load_a if load_a["idx"] < load_b["idx"] else load_b
-            stmt_second = load_b if load_a["idx"] < load_b["idx"] else load_a
-
-            if not _check_dependency_safe(stmt_first["idx"], stmt_second["idx"], stmt_second["var"], var_usage):
-                return None
-
-            return MergeOpportunity(
-                op_type="load",
-                stmt_a=stmt_first["idx"],
-                stmt_b=stmt_second["idx"],
-                differing_operand_idx=dim,
-                merged_slice=merged,
-                description=(
-                    f"Merge load {stmt_first['var']} and {stmt_second['var']} "
-                    f"from {stmt_first['source_tensor']}[dim {dim}: "
-                    f"{load_a['slices'][dim]} + {load_b['slices'][dim]} -> {merged}]"
-                ),
-            )
-
-        opportunities.extend(
-            _greedy_pair_opportunities(load_groups, check_load_pair, sort_key=lambda ld: ld["slices"][-1][0])
-        )
-
-    mergeable_ops = {"nc_matmul", "tensor_tensor", "activation", "tensor_scalar"}
-    ops = [s for s in classified.get("op", []) if s.get("op_name") in mergeable_ops]
-    if len(ops) >= 2:
-        op_groups: dict[str, list[dict]] = {}
-        for op in ops:
-            op_groups.setdefault(op["op_name"], []).append(op)
-
-        def check_op_pair(op_a: dict, op_b: dict) -> MergeOpportunity | None:
-            args_a = op_a.get("args", [])
-            args_b = op_b.get("args", [])
-
-            if len(args_a) != len(args_b):
-                return None
-
-            if not _kwargs_equal(op_a.get("kwargs", {}), op_b.get("kwargs", {})):
-                return None
-
-            differing_args = [
-                k
-                for k in range(len(args_a))
-                if _resolve_arg_signature(args_a[k], loads) != _resolve_arg_signature(args_b[k], loads)
-            ]
-            if len(differing_args) != 1:
-                return None
-
-            diff_idx = differing_args[0]
-            arg_a = args_a[diff_idx]
-            arg_b = args_b[diff_idx]
-
-            slices_a = arg_a["slices"]
-            slices_b = arg_b["slices"]
-
-            if slices_a is None:
-                load_a = _resolve_arg_to_load(arg_a, loads)
-                if load_a:
-                    slices_a = load_a["slices"]
-            if slices_b is None:
-                load_b = _resolve_arg_to_load(arg_b, loads)
-                if load_b:
-                    slices_b = load_b["slices"]
-
-            if slices_a is None or slices_b is None:
-                return None
-
-            adj = _check_adjacent_slices(slices_a, slices_b)
-            if adj is None:
-                return None
-
-            dim, merged = adj
-            op_name = op_a["op_name"]
-
-            if op_name == "nc_matmul":
-                if not _check_nc_matmul_limits(diff_idx, merged):
-                    return None
-
-            store_a = _find_store_for_var(stores, op_a["var"])
-            store_b = _find_store_for_var(stores, op_b["var"])
-            if store_a and store_b:
-                s_adj = _check_adjacent_slices(store_a["target_slices"], store_b["target_slices"])
-                if s_adj is None:
-                    return None
-
-            if _has_aug_assign_accumulation(op_a, aug_assigns) or _has_aug_assign_accumulation(op_b, aug_assigns):
-                return None
-
-            stmt_first = op_a if op_a["idx"] < op_b["idx"] else op_b
-            stmt_second = op_b if op_a["idx"] < op_b["idx"] else op_a
-
-            if not _check_dependency_safe(stmt_first["idx"], stmt_second["idx"], stmt_second.get("var", ""), var_usage):
-                return None
-
-            return MergeOpportunity(
-                op_type=op_name,
-                stmt_a=stmt_first["idx"],
-                stmt_b=stmt_second["idx"],
-                differing_operand_idx=diff_idx,
-                merged_slice=merged,
-                description=(
-                    f"Merge {op_name} at stmt {stmt_first['idx']} and "
-                    f"{stmt_second['idx']} on arg {diff_idx} "
-                    f"[dim {dim}: {slices_a[dim]} + "
-                    f"{slices_b[dim]} -> {merged}]"
-                ),
-            )
-
-        opportunities.extend(_greedy_pair_opportunities(op_groups, check_op_pair))
-
-    return opportunities
-
-
-def _build_var_usage_index(all_stmts: list[dict]) -> dict[str, list[int]]:
-    """Build an index mapping variable names to statement indices that use them.
-
-    Args:
-        all_stmts: Full flat list of classified statements.
-
-    Returns:
-        Dict mapping variable name to sorted list of statement indices
-        that reference it.
-    """
-    usage: dict[str, set[int]] = {}
-    for stmt in all_stmts:
-        stype = stmt["type"]
-        idx = stmt["idx"]
-        if stype in ("op", "aug_assign"):
-            for arg in stmt.get("args", []):
-                name = arg.get("name")
-                if name:
-                    usage.setdefault(name, set()).add(idx)
-        elif stype == "store":
-            name = stmt.get("value_var")
-            if name:
-                usage.setdefault(name, set()).add(idx)
-        elif stype == "load":
-            name = stmt.get("source_tensor")
-            if name:
-                usage.setdefault(name, set()).add(idx)
-    return {var: sorted(indices) for var, indices in usage.items()}
-
-
-def _check_dependency_safe(idx_lo: int, idx_hi: int, absorbed_var: str, var_usage: dict[str, list[int]]) -> bool:
-    """Check that merging two statements does not violate data dependencies.
-
-    The absorbed statement's variable must not be used by any statement
-    between index ``idx_lo`` and ``idx_hi`` (exclusive on both ends).
-
-    Args:
-        idx_lo: Statement index of the kept (earlier) statement.
-        idx_hi: Statement index of the absorbed (later) statement.
-        absorbed_var: Variable name produced by the absorbed statement.
-        var_usage: Pre-built index mapping variable names to sorted lists
-            of statement indices that use them.
-
-    Returns:
-        True if merging is safe, False otherwise.
-    """
-    indices = var_usage.get(absorbed_var)
-    if indices is None:
-        return True
-    for idx in indices:
-        if idx <= idx_lo:
-            continue
-        if idx >= idx_hi:
-            break
-        return False
-    return True
-
-
-def _resolve_arg_signature(arg_info: dict, loads: list[dict]) -> tuple:
-    """Create a hashable signature resolving Name args through loads.
-
-    If the argument is a bare Name referencing a load, uses the load's
-    ``(source_tensor, slices)`` as the signature for comparison.
-
-    Args:
-        arg_info: Dict from ``_extract_arg_info``.
-        loads: Classified load statements.
-
-    Returns:
-        A hashable tuple representing the resolved argument identity.
-    """
-    if arg_info["slices"] is not None:
-        return (arg_info["name"], tuple(arg_info["slices"]))
-    load = _resolve_arg_to_load(arg_info, loads)
-    if load is not None:
-        return ("load", load["source_tensor"], tuple(load["slices"]))
-    return (arg_info["name"],)
-
-
-def _kwargs_equal(kw_a: dict, kw_b: dict) -> bool:
-    """Check if two keyword argument dicts are structurally equal.
-
-    Compares AST node dumps for value equality since AST nodes
-    are not directly comparable.
-
-    Args:
-        kw_a: First keyword argument dict (arg_name -> ast node).
-        kw_b: Second keyword argument dict (arg_name -> ast node).
-
-    Returns:
-        True if all keyword arguments match.
-    """
-    if set(kw_a.keys()) != set(kw_b.keys()):
-        return False
-    return all(ast.dump(kw_a[key]) == ast.dump(kw_b[key]) for key in kw_a)
-
-
-def _check_adjacent_slices(
-    slices_a: list[tuple[int, int]], slices_b: list[tuple[int, int]]
-) -> tuple[int, tuple[int, int]] | None:
-    """Check if two slice lists differ on exactly one dimension with adjacent ranges.
-
-    Args:
-        slices_a: Slice list from the first subscript argument.
-        slices_b: Slice list from the second subscript argument.
-
-    Returns:
-        Tuple of ``(differing_dim_index, merged_slice)`` if adjacent,
-        or ``None`` if not mergeable.
-    """
-    if len(slices_a) != len(slices_b):
-        return None
-
-    differing_dims = []
-    for d in range(len(slices_a)):
-        if slices_a[d] != slices_b[d]:
-            differing_dims.append(d)
-
-    if len(differing_dims) != 1:
-        return None
-
-    dim = differing_dims[0]
-    sa_start, sa_stop = slices_a[dim]
-    sb_start, sb_stop = slices_b[dim]
-
-    if sa_stop == sb_start:
-        return (dim, (sa_start, sb_stop))
-    if sb_stop == sa_start:
-        return (dim, (sb_start, sa_stop))
-    return None
-
-
-def _check_nc_matmul_limits(differing_arg_idx: int, merged_slice: tuple[int, int]) -> bool:
-    """Check that a merged nc_matmul does not exceed hardware tile limits.
-
-    For nc_matmul(lhs[K,M], rhs[K,N]):
-    - If differing arg is rhs (idx 1), the merged N dimension must be <= 512.
-    - If differing arg is lhs (idx 0), the merged M dimension must be <= 128.
-
-    Args:
-        differing_arg_idx: Which positional arg differs (0=lhs, 1=rhs).
-        merged_slice: The ``(start, stop)`` of the merged range.
-
-    Returns:
-        True if within hardware limits.
-    """
-    limits = TILE_LIMITS["nc_matmul"]
-    merged_size = merged_slice[1] - merged_slice[0]
-
-    if differing_arg_idx == 1:
-        return merged_size <= limits["N"]
-    if differing_arg_idx == 0:
-        return merged_size <= limits["M"]
-    return True
-
-
-def _has_aug_assign_accumulation(op: dict, aug_assigns: list[dict]) -> bool:
-    """Check if an op's result variable is the target of an aug_assign.
-
-    When an op has ``+=`` accumulations (from reduction tiling), merging the
-    initial assignment without also merging the accumulations would produce
-    shape mismatches.
-
-    Args:
-        op: Classified dict for an op statement.
-        aug_assigns: Classified aug_assign statements.
-
-    Returns:
-        True if the op's result variable is accumulated via aug_assign.
-    """
-    var = op.get("var")
-    if not var:
-        return False
-    return any(s.get("var") == var for s in aug_assigns)
-
-
-def _resolve_arg_to_load(arg_info: dict, loads: list[dict]) -> dict | None:
-    """Resolve a Name argument to its defining load statement.
-
-    Args:
-        arg_info: Argument dict from ``_extract_arg_info``.
-        loads: Classified load statements.
-
-    Returns:
-        The load statement dict, or ``None`` if the arg does not
-        reference a load variable.
-    """
-    name = arg_info.get("name")
-    if name is None:
-        return None
-    for s in loads:
-        if s["var"] == name:
-            return s
-    return None
-
-
-def _find_store_for_var(stores: list[dict], var: str) -> dict | None:
-    """Find the store statement that writes a variable to output.
-
-    Args:
-        stores: Classified store statements.
-        var: Variable name to look for.
-
-    Returns:
-        The store statement dict, or ``None``.
-    """
-    for s in stores:
-        if s.get("value_var") == var:
-            return s
-    return None
-
-
-def _set_loc(source: ast.AST, target: ast.AST) -> None:
-    """Copy source location from one AST node to another and its descendants.
-
-    Copies ``lineno``, ``col_offset``, ``end_lineno``, and
-    ``end_col_offset`` from ``source`` to ``target`` and all of
-    ``target``'s child nodes. This avoids a full-tree
-    ``ast.fix_missing_locations`` pass after AST mutations.
-
-    Args:
-        source: AST node to copy location from.
-        target: AST node (and its descendants) to set location on.
-    """
-    attrs = ("lineno", "col_offset", "end_lineno", "end_col_offset")
-    loc = {a: getattr(source, a, 0) for a in attrs}
-    for node in ast.walk(target):
-        for a, v in loc.items():
-            if not hasattr(node, a):
-                setattr(node, a, v)
-
-
-def _update_subscript_dim(node: ast.Subscript, dim: int, merged: tuple[int, int]) -> None:
-    """Update a single dimension of a subscript's slice range.
-
-    Args:
-        node: An AST Subscript node to modify in-place.
-        dim: The dimension index to update.
-        merged: ``(start, stop)`` for the new slice range.
-    """
-    slice_node = node.slice
-    if isinstance(slice_node, ast.Tuple):
-        sl = slice_node.elts[dim]
-        if isinstance(sl, ast.Slice):
-            new_lower = ast.Constant(value=merged[0])
-            new_upper = ast.Constant(value=merged[1])
-            _set_loc(sl, new_lower)
-            _set_loc(sl, new_upper)
-            sl.lower = new_lower
-            sl.upper = new_upper
-    elif isinstance(slice_node, ast.Slice) and dim == 0:
-        new_lower = ast.Constant(value=merged[0])
-        new_upper = ast.Constant(value=merged[1])
-        _set_loc(slice_node, new_lower)
-        _set_loc(slice_node, new_upper)
-        slice_node.lower = new_lower
-        slice_node.upper = new_upper
-
-
-def _relative_slices(abs_slices: list[tuple[int, int]], merge_dim: int, merged_start: int) -> list[tuple[int, int]]:
-    """Convert absolute source-tensor slices to relative loaded-tensor slices.
-
-    After a load ``var = source[s0:e0, s1:e1]``, the loaded tensor ``var``
-    has shape ``[e0-s0, e1-s1]`` and indices start from 0. Consumers that
-    subscript into ``var`` must use relative indices, not the absolute
-    source-tensor indices.
-
-    Args:
-        abs_slices: Absolute slices from the classified load statement.
-        merge_dim: The dimension being merged (widened).
-        merged_start: The start of the merged range on ``merge_dim``.
-
-    Returns:
-        List of ``(start, stop)`` tuples relative to the loaded tensor.
-    """
-    return [
-        (s - merged_start, e - merged_start) if d == merge_dim else (0, e - s) for d, (s, e) in enumerate(abs_slices)
-    ]
-
-
-def _build_slices_node(slices: list[tuple[int, int]], loc: ast.AST | None = None) -> ast.expr:
-    """Build an AST slice expression from a list of ``(start, stop)`` tuples.
-
-    Args:
-        slices: List of ``(start, stop)`` tuples, one per dimension.
-        loc: Optional AST node to copy source location from. When
-            provided, all newly created nodes inherit its location,
-            avoiding a later ``ast.fix_missing_locations`` pass.
-
-    Returns:
-        An AST node suitable for use as a Subscript slice: a single
-        ``ast.Slice`` if one dimension, or an ``ast.Tuple`` of slices.
-    """
-    slice_nodes = [ast.Slice(lower=ast.Constant(value=s), upper=ast.Constant(value=e)) for s, e in slices]
-    if len(slice_nodes) == 1:
-        result = slice_nodes[0]
-    else:
-        result = ast.Tuple(elts=slice_nodes, ctx=ast.Load())
-    if loc is not None:
-        _set_loc(loc, result)
-    return result
-
-
-def _rewrite_consumer_subscripts(stmt: ast.stmt, subscript_map: dict[str, list[tuple[int, int]]]) -> None:
-    """Rewrite consumer references to merged variables with correct subscript offsets.
-
-    Handles two cases for Call arguments referencing a merged variable:
-
-    1. **Bare Name** (e.g., ``var``): replaced with
-       ``var[rel_s:rel_e, ...]`` using the relative slices directly.
-    2. **Existing Subscript** (e.g., ``var[sub_s:sub_e, ...]``): offset
-       by the relative position so the rewritten subscript becomes
-       ``var[rel_s + sub_s : rel_s + sub_e, ...]``.
-
-    Args:
-        stmt: An AST statement node to modify in-place.
-        subscript_map: Mapping from variable name to its relative slices
-            (from ``_relative_slices``).
-    """
-    for node in ast.walk(stmt):
-        if not isinstance(node, ast.Call):
-            continue
-        for idx, arg in enumerate(node.args):
-            if isinstance(arg, ast.Name) and arg.id in subscript_map:
-                new_sub = ast.Subscript(
-                    value=ast.Name(id=arg.id, ctx=ast.Load()),
-                    slice=_build_slices_node(subscript_map[arg.id], loc=arg),
-                    ctx=ast.Load(),
-                )
-                _set_loc(arg, new_sub)
-                node.args[idx] = new_sub
-            elif isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name) and arg.value.id in subscript_map:
-                rel_slices = subscript_map[arg.value.id]
-                existing = _parse_subscript_slices(arg)
-                offset_slices = [
-                    (rel_s + sub_s, rel_s + sub_e) for (rel_s, _rel_e), (sub_s, sub_e) in zip(rel_slices, existing)
-                ]
-                arg.slice = _build_slices_node(offset_slices, loc=arg)
-
-
-def _rename_vars_in_stmt(stmt: ast.stmt, renames: dict[str, str]) -> None:
-    """Rename all variable references in a statement.
-
-    Args:
-        stmt: An AST statement node to modify in-place.
-        renames: Mapping from old variable names to new names.
-    """
-    if not renames:
-        return
-    for node in ast.walk(stmt):
-        if isinstance(node, ast.Name) and node.id in renames:
-            node.id = renames[node.id]
-
-
 class OperandMergeTransform(Transform):
     """Transform that merges adjacent operations on contiguous tensor slices.
 
     Identifies pairs of statements that perform the same operation but on
     adjacent slices of a tensor, differing on exactly one operand dimension.
     These can be combined into a single wider operation without exceeding
-    hardware tile limits.
+    hardware tile limits (checked via ``op.can_merge_dim()``).
 
-    ``analyze()`` returns a list of ``MergeOpportunity`` objects.
-    ``transform()`` applies one opportunity at a time.
+    ``analyze_ir()`` returns a list of ``MergeOpportunity`` objects.
+    ``transform_ir()`` applies one opportunity at a time.
 
     Example::
 
         merge = OperandMergeTransform()
-        opportunities = merge.analyze(tiled_func)
+        opportunities = merge.analyze_ir(program)
         for opp in opportunities:
-            tiled_func = merge.transform(tiled_func, opp)
+            program = merge.transform_ir(program, opp)
     """
 
     name = "operand_merge"
 
-    def analyze(self, func: Callable) -> list[MergeOpportunity]:
-        """Analyze a tiled function to find merge opportunities.
-
-        Parses the IR source, groups statements by their structure, and
-        identifies pairs that operate on contiguous slices differing on
-        exactly one dimension.
+    @staticmethod
+    def _check_adjacent_slices(
+        slices_a: tuple[tuple[int, int], ...], slices_b: tuple[tuple[int, int], ...]
+    ) -> tuple[int, tuple[int, int]] | None:
+        """Check if two slice tuples differ on exactly one dimension with adjacent ranges.
 
         Args:
-            func: A tiled function (with ``__source__`` attribute) to analyze.
+            slices_a: Slice tuple from the first operand.
+            slices_b: Slice tuple from the second operand.
 
         Returns:
-            List of ``MergeOpportunity`` objects, each representing a
-            single merge that can be passed to ``transform()``.
+            Tuple of ``(differing_dim_index, merged_slice)`` if adjacent,
+            or ``None`` if not mergeable.
         """
-        _, _, classified, _ = _parse_function_body(func)
-        return _find_merge_opportunities(classified)
+        if len(slices_a) != len(slices_b):
+            return None
 
-    def transform(self, func: Callable, option: MergeOpportunity) -> Callable[..., np.ndarray]:
+        differing_dims: list[int] = []
+        for d in range(len(slices_a)):
+            if slices_a[d] != slices_b[d]:
+                differing_dims.append(d)
+
+        if len(differing_dims) != 1:
+            return None
+
+        dim = differing_dims[0]
+        sa_start, sa_stop = slices_a[dim]
+        sb_start, sb_stop = slices_b[dim]
+
+        if sa_stop == sb_start:
+            return (dim, (sa_start, sb_stop))
+        if sb_stop == sa_start:
+            return (dim, (sb_start, sa_stop))
+        return None
+
+    @staticmethod
+    def _resolve_load_slices(var_name: str, stmts: tuple[Statement, ...]) -> tuple[tuple[int, int], ...] | None:
+        """Resolve a variable name to its load source slices.
+
+        Args:
+            var_name: Variable name that might be a loaded tensor.
+            stmts: All program statements.
+
+        Returns:
+            The source slices from the load, or None if not a load variable.
+        """
+        for op, operands in stmts:
+            if isinstance(op, LoadOp) and operands[1][0] == var_name:
+                return operands[0][1]
+        return None
+
+    @staticmethod
+    def _find_load_idx(var_name: str, stmts: tuple[Statement, ...]) -> int | None:
+        """Find the statement index of a load that produces a variable.
+
+        Args:
+            var_name: Variable name.
+            stmts: All program statements.
+
+        Returns:
+            Statement index or None.
+        """
+        for i, (op, operands) in enumerate(stmts):
+            if isinstance(op, LoadOp) and operands[1][0] == var_name:
+                return i
+        return None
+
+    @staticmethod
+    def _find_store_idx(var_name: str, stmts: tuple[Statement, ...]) -> int | None:
+        """Find the statement index of a store that reads a variable.
+
+        Args:
+            var_name: Source variable name for the store.
+            stmts: All program statements.
+
+        Returns:
+            Statement index or None.
+        """
+        for i, (op, operands) in enumerate(stmts):
+            if isinstance(op, StoreOp) and operands[0][0] == var_name:
+                return i
+        return None
+
+    @staticmethod
+    def _get_store_for_var(var_name: str, stmts: tuple[Statement, ...]) -> tuple[int, tuple[Operand, ...]] | None:
+        """Get the store statement for a computed variable.
+
+        Args:
+            var_name: Variable name produced by a compute op.
+            stmts: All program statements.
+
+        Returns:
+            Tuple of (index, operands) or None.
+        """
+        for i, (op, operands) in enumerate(stmts):
+            if isinstance(op, StoreOp) and operands[0][0] == var_name:
+                return (i, operands)
+        return None
+
+    @staticmethod
+    def _build_var_usage(stmts: tuple[Statement, ...]) -> dict[str, list[int]]:
+        """Build index mapping variable names to all statement indices where they appear as operands.
+
+        Args:
+            stmts: All program statements.
+
+        Returns:
+            Dict mapping variable name to sorted list of statement indices
+            that reference it (including the statement that defines it).
+        """
+        usage: dict[str, set[int]] = {}
+        for i, (op, operands) in enumerate(stmts):
+            for var, _ in operands:
+                usage.setdefault(var, set()).add(i)
+        return {var: sorted(indices) for var, indices in usage.items()}
+
+    @staticmethod
+    def _check_dependency_safe(idx_lo: int, idx_hi: int, absorbed_var: str, var_usage: dict[str, list[int]]) -> bool:
+        """Check that merging two statements does not violate data dependencies.
+
+        Args:
+            idx_lo: Statement index of the kept (earlier) statement.
+            idx_hi: Statement index of the absorbed (later) statement.
+            absorbed_var: Variable name produced by the absorbed statement.
+            var_usage: Pre-built usage index.
+
+        Returns:
+            True if merging is safe.
+        """
+        indices = var_usage.get(absorbed_var)
+        if indices is None:
+            return True
+        for idx in indices:
+            if idx <= idx_lo:
+                continue
+            if idx >= idx_hi:
+                break
+            return False
+        return True
+
+    @staticmethod
+    def _resolve_operand_slices(operand: Operand, stmts: tuple[Statement, ...]) -> tuple[tuple[int, int], ...] | None:
+        """Resolve operand slices, following through loads if needed.
+
+        Args:
+            operand: (var_name, slices) pair.
+            stmts: All program statements.
+
+        Returns:
+            The effective slices, or None if unresolvable.
+        """
+        var, slices = operand
+        if slices:
+            return slices
+        return OperandMergeTransform._resolve_load_slices(var, stmts)
+
+    @staticmethod
+    def _operand_signature(operand: Operand, stmts: tuple[Statement, ...]) -> tuple:
+        """Create a hashable signature for an operand, resolving through loads.
+
+        Args:
+            operand: (var_name, slices) pair.
+            stmts: All program statements.
+
+        Returns:
+            Hashable tuple for comparison.
+        """
+        var, slices = operand
+        if slices:
+            return (var, slices)
+        load_slices = OperandMergeTransform._resolve_load_slices(var, stmts)
+        if load_slices is not None:
+            for op, operands in stmts:
+                if isinstance(op, LoadOp) and operands[1][0] == var:
+                    return ("load", operands[0][0], operands[0][1])
+        return (var,)
+
+    @staticmethod
+    def _has_accumulation(var_name: str, stmts: tuple[Statement, ...], compute_vars: set[str]) -> bool:
+        """Check if a compute variable is also the target of an accumulation.
+
+        Args:
+            var_name: Variable name produced by a compute op.
+            stmts: All program statements.
+            compute_vars: Set of variable names defined by compute ops so far.
+
+        Returns:
+            True if the variable is accumulated via a later compute stmt.
+        """
+        seen_first = False
+        for op, operands in stmts:
+            if isinstance(op, (LoadOp, StoreOp, AllocOp)):
+                continue
+            dst_var = operands[-1][0]
+            if dst_var == var_name:
+                if seen_first:
+                    return True
+                seen_first = True
+        return False
+
+    @staticmethod
+    def _widen_slice(
+        slices: tuple[tuple[int, int], ...], dim: int, merged: tuple[int, int]
+    ) -> tuple[tuple[int, int], ...]:
+        """Widen a single dimension in a slice tuple.
+
+        Args:
+            slices: Original slice tuple.
+            dim: Dimension to widen.
+            merged: New (start, stop) for that dimension.
+
+        Returns:
+            New slice tuple with the widened dimension.
+        """
+        return (*slices[:dim], merged, *slices[dim + 1 :])
+
+    @staticmethod
+    def _relative_slices(
+        abs_slices: tuple[tuple[int, int], ...], merge_dim: int, merged_start: int
+    ) -> tuple[tuple[int, int], ...]:
+        """Convert absolute source-tensor slices to relative loaded-tensor slices.
+
+        Args:
+            abs_slices: Absolute slices from the load statement.
+            merge_dim: The dimension being merged (widened).
+            merged_start: The start of the merged range on merge_dim.
+
+        Returns:
+            Tuple of (start, stop) pairs relative to the loaded tensor.
+        """
+        return tuple(
+            (s - merged_start, e - merged_start) if d == merge_dim else (0, e - s)
+            for d, (s, e) in enumerate(abs_slices)
+        )
+
+    @staticmethod
+    def _offset_slices(
+        rel_slices: tuple[tuple[int, int], ...], existing_slices: tuple[tuple[int, int], ...]
+    ) -> tuple[tuple[int, int], ...]:
+        """Offset existing subscript slices by relative position.
+
+        Args:
+            rel_slices: Relative slices from _relative_slices.
+            existing_slices: Existing subscript slices to offset.
+
+        Returns:
+            New slices with offset applied.
+        """
+        return tuple((rel_s + sub_s, rel_s + sub_e) for (rel_s, _), (sub_s, sub_e) in zip(rel_slices, existing_slices))
+
+    @staticmethod
+    def _apply_subscript_map(
+        operands: tuple[Operand, ...], subscript_map: dict[str, tuple[tuple[int, int], ...]]
+    ) -> tuple[Operand, ...]:
+        """Rewrite operand slices using a subscript offset map.
+
+        For operands whose variable is in the map:
+        - If the operand has no slices (bare name), use the relative slices directly.
+        - If the operand has slices, offset them by the relative position.
+
+        Args:
+            operands: Original operands tuple.
+            subscript_map: Mapping from variable name to relative slices.
+
+        Returns:
+            New operands tuple with rewritten slices.
+        """
+        new_ops: list[Operand] = []
+        for var, slices in operands:
+            if var in subscript_map:
+                rel = subscript_map[var]
+                if not slices:
+                    new_ops.append((var, rel))
+                else:
+                    new_ops.append((var, OperandMergeTransform._offset_slices(rel, slices)))
+            else:
+                new_ops.append((var, slices))
+        return tuple(new_ops)
+
+    @staticmethod
+    def _find_merge_opportunities(stmts: tuple[Statement, ...]) -> list[MergeOpportunity]:
+        """Find all merge opportunities in a program's statements.
+
+        Args:
+            stmts: Program statements tuple.
+
+        Returns:
+            List of MergeOpportunity objects.
+        """
+        var_usage = OperandMergeTransform._build_var_usage(stmts)
+        opportunities: list[MergeOpportunity] = []
+
+        compute_vars: set[str] = set()
+        for op, operands in stmts:
+            if not isinstance(op, (LoadOp, StoreOp, AllocOp)):
+                compute_vars.add(operands[-1][0])
+
+        opportunities.extend(OperandMergeTransform._find_load_merge_opportunities(stmts, var_usage))
+        opportunities.extend(OperandMergeTransform._find_compute_merge_opportunities(stmts, var_usage, compute_vars))
+
+        return opportunities
+
+    @staticmethod
+    def _find_load_merge_opportunities(
+        stmts: tuple[Statement, ...], var_usage: dict[str, list[int]]
+    ) -> list[MergeOpportunity]:
+        """Find load merge opportunities.
+
+        Args:
+            stmts: Program statements.
+            var_usage: Pre-built usage index.
+
+        Returns:
+            List of MergeOpportunity for loads.
+        """
+        loads: list[tuple[int, tuple[Operand, ...]]] = []
+        for i, (op, operands) in enumerate(stmts):
+            if isinstance(op, LoadOp):
+                loads.append((i, operands))
+
+        if len(loads) < 2:
+            return []
+
+        load_groups: dict[tuple, list[tuple[int, tuple[Operand, ...]]]] = {}
+        for idx, operands in loads:
+            src_var, src_slices = operands[0]
+            if len(src_slices) < 2:
+                continue
+            partition_key = (src_var, src_slices[0])
+            load_groups.setdefault(partition_key, []).append((idx, operands))
+
+        used: set[int] = set()
+        opportunities: list[MergeOpportunity] = []
+
+        for members in load_groups.values():
+            if len(members) < 2:
+                continue
+
+            ordered = sorted(members, key=lambda m: m[1][0][1][-1][0])
+
+            for i in range(len(ordered)):
+                if ordered[i][0] in used:
+                    continue
+                for j in range(i + 1, len(ordered)):
+                    if ordered[j][0] in used:
+                        continue
+
+                    idx_a, ops_a = ordered[i]
+                    idx_b, ops_b = ordered[j]
+                    src_slices_a = ops_a[0][1]
+                    src_slices_b = ops_b[0][1]
+
+                    adj = OperandMergeTransform._check_adjacent_slices(src_slices_a, src_slices_b)
+                    if adj is None:
+                        continue
+
+                    dim, merged = adj
+
+                    first_idx = min(idx_a, idx_b)
+                    second_idx = max(idx_a, idx_b)
+                    first_ops = ops_a if idx_a <= idx_b else ops_b
+                    second_ops = ops_b if idx_a <= idx_b else ops_a
+
+                    if not OperandMergeTransform._check_dependency_safe(
+                        first_idx, second_idx, second_ops[1][0], var_usage
+                    ):
+                        continue
+
+                    opportunities.append(
+                        MergeOpportunity(
+                            op_type="load",
+                            stmt_a=first_idx,
+                            stmt_b=second_idx,
+                            differing_operand_idx=dim,
+                            merged_slice=merged,
+                            description=(
+                                f"Merge load {first_ops[1][0]} and {second_ops[1][0]} "
+                                f"[dim {dim}: {src_slices_a[dim]} + {src_slices_b[dim]} -> {merged}]"
+                            ),
+                        )
+                    )
+                    used.add(first_idx)
+                    used.add(second_idx)
+                    break
+
+        return opportunities
+
+    @staticmethod
+    def _find_compute_merge_opportunities(
+        stmts: tuple[Statement, ...], var_usage: dict[str, list[int]], compute_vars: set[str]
+    ) -> list[MergeOpportunity]:
+        """Find compute op merge opportunities.
+
+        Args:
+            stmts: Program statements.
+            var_usage: Pre-built usage index.
+            compute_vars: Set of compute variable names.
+
+        Returns:
+            List of MergeOpportunity for compute ops.
+        """
+        compute_stmts: list[tuple[int, NKIOp, tuple[Operand, ...]]] = []
+        for i, (op, operands) in enumerate(stmts):
+            if isinstance(op, (LoadOp, StoreOp, AllocOp)):
+                continue
+            compute_stmts.append((i, op, operands))
+
+        if len(compute_stmts) < 2:
+            return []
+
+        op_groups: dict[str, list[tuple[int, NKIOp, tuple[Operand, ...]]]] = {}
+        for entry in compute_stmts:
+            op_groups.setdefault(entry[1].op_name, []).append(entry)
+
+        used: set[int] = set()
+        opportunities: list[MergeOpportunity] = []
+
+        for members in op_groups.values():
+            if len(members) < 2:
+                continue
+
+            for i in range(len(members)):
+                if members[i][0] in used:
+                    continue
+                for j in range(i + 1, len(members)):
+                    if members[j][0] in used:
+                        continue
+
+                    opp = OperandMergeTransform._check_compute_pair(
+                        members[i], members[j], stmts, var_usage, compute_vars
+                    )
+                    if opp is not None:
+                        opportunities.append(opp)
+                        used.add(opp.stmt_a)
+                        used.add(opp.stmt_b)
+                        break
+
+        return opportunities
+
+    @staticmethod
+    def _check_compute_pair(
+        entry_a: tuple[int, NKIOp, tuple[Operand, ...]],
+        entry_b: tuple[int, NKIOp, tuple[Operand, ...]],
+        stmts: tuple[Statement, ...],
+        var_usage: dict[str, list[int]],
+        compute_vars: set[str],
+    ) -> MergeOpportunity | None:
+        """Check if two compute statements can be merged.
+
+        Args:
+            entry_a: (index, op, operands) for first compute.
+            entry_b: (index, op, operands) for second compute.
+            stmts: All program statements.
+            var_usage: Pre-built usage index.
+            compute_vars: Set of compute variable names.
+
+        Returns:
+            MergeOpportunity or None.
+        """
+        idx_a, op_a, operands_a = entry_a
+        idx_b, op_b, operands_b = entry_b
+
+        if isinstance(op_a, ElementwiseOp) or isinstance(op_b, ElementwiseOp):
+            if op_a != op_b:
+                return None
+
+        input_ops_a = operands_a[:-1]
+        input_ops_b = operands_b[:-1]
+
+        if len(input_ops_a) != len(input_ops_b):
+            return None
+
+        differing_args: list[int] = []
+        for k in range(len(input_ops_a)):
+            if OperandMergeTransform._operand_signature(
+                input_ops_a[k], stmts
+            ) != OperandMergeTransform._operand_signature(input_ops_b[k], stmts):
+                differing_args.append(k)
+
+        if len(differing_args) != 1:
+            return None
+
+        diff_idx = differing_args[0]
+
+        slices_a = OperandMergeTransform._resolve_operand_slices(input_ops_a[diff_idx], stmts)
+        slices_b = OperandMergeTransform._resolve_operand_slices(input_ops_b[diff_idx], stmts)
+
+        if slices_a is None or slices_b is None:
+            return None
+
+        adj = OperandMergeTransform._check_adjacent_slices(slices_a, slices_b)
+        if adj is None:
+            return None
+
+        dim, merged = adj
+        merged_size = merged[1] - merged[0]
+
+        if not op_a.can_merge_operand_dim(diff_idx, dim, merged_size):
+            return None
+
+        var_a = operands_a[-1][0]
+        var_b = operands_b[-1][0]
+
+        store_a = OperandMergeTransform._get_store_for_var(var_a, stmts)
+        store_b = OperandMergeTransform._get_store_for_var(var_b, stmts)
+        if store_a and store_b:
+            s_adj = OperandMergeTransform._check_adjacent_slices(store_a[1][1][1], store_b[1][1][1])
+            if s_adj is None:
+                return None
+
+        if OperandMergeTransform._has_accumulation(
+            var_a, stmts, compute_vars
+        ) or OperandMergeTransform._has_accumulation(var_b, stmts, compute_vars):
+            return None
+
+        first_idx = min(idx_a, idx_b)
+        second_idx = max(idx_a, idx_b)
+        second_var = var_b if idx_a <= idx_b else var_a
+
+        if not OperandMergeTransform._check_dependency_safe(first_idx, second_idx, second_var, var_usage):
+            return None
+
+        return MergeOpportunity(
+            op_type=op_a.op_name,
+            stmt_a=first_idx,
+            stmt_b=second_idx,
+            differing_operand_idx=diff_idx,
+            merged_slice=merged,
+            description=(
+                f"Merge {op_a.op_name} at stmt {first_idx} and "
+                f"{second_idx} on arg {diff_idx} "
+                f"[dim {dim}: {slices_a[dim]} + {slices_b[dim]} -> {merged}]"
+            ),
+        )
+
+    def analyze_ir(self, program: Program) -> list[MergeOpportunity]:
+        """Analyze a program to find merge opportunities.
+
+        Args:
+            program: Program tuple (name, params, stmts, return_var).
+
+        Returns:
+            List of MergeOpportunity objects.
+        """
+        stmts = program.stmts
+        return self._find_merge_opportunities(stmts)
+
+    def transform_ir(self, program: Program, option: MergeOpportunity) -> Program:
         """Apply a single merge opportunity.
 
-        Merges the absorbed statement into the kept statement by widening
-        the slice on the differing dimension and removing the absorbed
-        statement and its associated load/store chain.
-
         Args:
-            func: A tiled function to transform.
-            option: A single ``MergeOpportunity`` from ``analyze()``.
+            program: Program tuple to transform.
+            option: A single MergeOpportunity from ``analyze_ir()``.
 
         Returns:
-            New callable with the merged operation applied.
+            New program tuple with the merged operation applied.
         """
-        func_name, _, classified, tree = _parse_function_body(func)
-        all_stmts = classified["all"]
-        loads = classified.get("load", [])
-        stores = classified.get("store", [])
+        name, params, stmts, return_var, preamble = program
 
-        func_def = tree.body[0]
-
-        stmt_a = all_stmts[option.stmt_a]
-        stmt_b = all_stmts[option.stmt_b]
+        stmt_a_op, stmt_a_operands = stmts[option.stmt_a]
+        stmt_b_op, stmt_b_operands = stmts[option.stmt_b]
 
         to_remove: set[int] = {option.stmt_b}
-        renames: dict[str, str] = {stmt_b["var"]: stmt_a["var"]}
+        renames: dict[str, str] = {}
 
-        subscript_map: dict[str, list[tuple[int, int]]] = {}
         if option.op_type == "load":
-            merge_dim = option.differing_operand_idx
-            merged_start = option.merged_slice[0]
-            subscript_map[stmt_a["var"]] = _relative_slices(stmt_a["slices"], merge_dim, merged_start)
-            subscript_map[stmt_b["var"]] = _relative_slices(stmt_b["slices"], merge_dim, merged_start)
-        else:
-            arg_b = stmt_b["args"][option.differing_operand_idx]
-            if arg_b["slices"] is None:
-                load_b = _resolve_arg_to_load(arg_b, loads)
-                if load_b:
-                    to_remove.add(load_b["idx"])
-            store_b = _find_store_for_var(stores, stmt_b["var"])
-            if store_b:
-                to_remove.add(store_b["idx"])
+            return self._apply_load_merge(name, params, stmts, return_var, preamble, option)
 
-        store_a = _find_store_for_var(stores, stmt_a["var"])
-        store_b_info = _find_store_for_var(stores, stmt_b["var"]) if option.op_type != "load" else None
+        var_a = stmt_a_operands[-1][0]
+        var_b = stmt_b_operands[-1][0]
+        renames[var_b] = var_a
+
+        diff_idx = option.differing_operand_idx
+        arg_b = stmt_b_operands[diff_idx]
+        if not arg_b[1]:
+            load_idx = self._find_load_idx(arg_b[0], stmts)
+            if load_idx is not None:
+                to_remove.add(load_idx)
+
+        store_b_idx = self._find_store_idx(var_b, stmts)
+        if store_b_idx is not None:
+            to_remove.add(store_b_idx)
 
         widen_load_idx: int | None = None
         widen_load_dim: int | None = None
-        if option.op_type != "load":
-            arg_a_info = stmt_a["args"][option.differing_operand_idx]
-            arg_b_info = stmt_b["args"][option.differing_operand_idx]
-            if arg_a_info["slices"] is None:
-                load_a = _resolve_arg_to_load(arg_a_info, loads)
-                load_b = _resolve_arg_to_load(arg_b_info, loads)
-                if load_a and load_b:
-                    adj = _check_adjacent_slices(load_a["slices"], load_b["slices"])
-                    if adj:
-                        widen_load_idx = load_a["idx"]
-                        widen_load_dim = adj[0]
+        arg_a = stmt_a_operands[diff_idx]
+        if not arg_a[1]:
+            load_a_idx = self._find_load_idx(arg_a[0], stmts)
+            load_b_idx = self._find_load_idx(arg_b[0], stmts) if not arg_b[1] else None
+            if load_a_idx is not None and load_b_idx is not None:
+                load_a_src = stmts[load_a_idx][1][0][1]
+                load_b_src = stmts[load_b_idx][1][0][1]
+                adj = self._check_adjacent_slices(load_a_src, load_b_src)
+                if adj:
+                    widen_load_idx = load_a_idx
+                    widen_load_dim = adj[0]
 
-        new_body = []
-        for i, body_stmt in enumerate(func_def.body):
+        store_a_info = self._get_store_for_var(var_a, stmts)
+        store_b_info = self._get_store_for_var(var_b, stmts)
+
+        new_stmts: list[Statement] = []
+        for i, (op, operands) in enumerate(stmts):
             if i in to_remove:
                 continue
 
             if i == option.stmt_a:
-                self._widen_kept_stmt(body_stmt, option, all_stmts)
+                operands = self._widen_compute_stmt(operands, option, stmts)
 
             if widen_load_idx is not None and i == widen_load_idx and widen_load_dim is not None:
-                if isinstance(body_stmt, ast.Assign) and isinstance(body_stmt.value, ast.Subscript):
-                    _update_subscript_dim(body_stmt.value, widen_load_dim, option.merged_slice)
+                src_var, src_slices = operands[0]
+                new_src_slices = self._widen_slice(src_slices, widen_load_dim, option.merged_slice)
+                dst_var, dst_slices = operands[1]
+                new_dst_shape = tuple(stop - start for start, stop in new_src_slices)
+                new_dst_slices = tuple((0, s) for s in new_dst_shape)
+                operands = ((src_var, new_src_slices), (dst_var, new_dst_slices))
 
-            if store_a and i == store_a["idx"] and store_b_info:
-                self._widen_kept_store(body_stmt, store_a, store_b_info)
+            if store_a_info and i == store_a_info[0] and store_b_info:
+                operands = self._widen_store(operands, store_a_info[1], store_b_info[1])
 
-            if subscript_map:
-                _rewrite_consumer_subscripts(body_stmt, subscript_map)
+            if renames:
+                operands = tuple((renames.get(var, var), slices) for var, slices in operands)
 
-            _rename_vars_in_stmt(body_stmt, renames)
-            new_body.append(body_stmt)
+            new_stmts.append((op, operands))
 
-        func_def.body = new_body
-        result = exec_tree_to_func(tree, func_name)
-        logger.debug("Merged source:\n%s", result.__source__)
-        return result
+        return Program(name, params, tuple(new_stmts), return_var, preamble)
 
-    def _widen_kept_stmt(self, body_stmt: ast.stmt, option: MergeOpportunity, all_stmts: list[dict]) -> None:
-        """Widen the kept statement's slice to the merged range.
+    def _apply_load_merge(
+        self,
+        prog_name: str,
+        params: tuple[str, ...],
+        stmts: tuple[Statement, ...],
+        return_var: str,
+        preamble: str,
+        option: MergeOpportunity,
+    ) -> Program:
+        """Apply a load merge opportunity.
 
         Args:
-            body_stmt: The AST statement node to modify.
-            option: The merge opportunity.
-            all_stmts: Flat list of all classified statements.
+            prog_name: Program name.
+            params: Program parameters.
+            stmts: Current statements.
+            return_var: Return variable name.
+            preamble: Original function preamble.
+            option: The load merge opportunity.
+
+        Returns:
+            New program tuple.
         """
-        if option.op_type == "load":
-            if isinstance(body_stmt, ast.Assign) and isinstance(body_stmt.value, ast.Subscript):
-                _update_subscript_dim(body_stmt.value, option.differing_operand_idx, option.merged_slice)
-            return
+        stmt_a_op, stmt_a_operands = stmts[option.stmt_a]
+        stmt_b_op, stmt_b_operands = stmts[option.stmt_b]
 
-        if not isinstance(body_stmt, ast.Assign) or not isinstance(body_stmt.value, ast.Call):
-            return
+        merge_dim = option.differing_operand_idx
+        merged_start = option.merged_slice[0]
 
-        diff_arg = body_stmt.value.args[option.differing_operand_idx]
-        stmt_a = all_stmts[option.stmt_a]
-        stmt_b = all_stmts[option.stmt_b]
+        var_a = stmt_a_operands[1][0]
+        var_b = stmt_b_operands[1][0]
 
-        if isinstance(diff_arg, ast.Subscript):
-            arg_a_info = stmt_a["args"][option.differing_operand_idx]
-            arg_b_info = stmt_b["args"][option.differing_operand_idx]
-            slices_a = arg_a_info["slices"]
-            slices_b = arg_b_info["slices"]
-            if slices_a and slices_b:
-                for d in range(len(slices_a)):
-                    if slices_a[d] != slices_b[d]:
-                        _update_subscript_dim(diff_arg, d, option.merged_slice)
-                        break
+        subscript_map: dict[str, tuple[tuple[int, int], ...]] = {
+            var_a: self._relative_slices(stmt_a_operands[0][1], merge_dim, merged_start),
+            var_b: self._relative_slices(stmt_b_operands[0][1], merge_dim, merged_start),
+        }
 
-    @staticmethod
-    def _widen_kept_store(body_stmt: ast.stmt, store_a: dict, store_b: dict) -> None:
+        renames = {var_b: var_a}
+        to_remove = {option.stmt_b}
+
+        new_stmts: list[Statement] = []
+        for i, (op, operands) in enumerate(stmts):
+            if i in to_remove:
+                continue
+
+            if i == option.stmt_a:
+                src_var, src_slices = operands[0]
+                new_src_slices = self._widen_slice(src_slices, merge_dim, option.merged_slice)
+                dst_var, dst_slices = operands[1]
+                new_dst_shape = tuple(stop - start for start, stop in new_src_slices)
+                new_dst_slices = tuple((0, s) for s in new_dst_shape)
+                operands = ((src_var, new_src_slices), (dst_var, new_dst_slices))
+            else:
+                operands = self._apply_subscript_map(operands, subscript_map)
+
+            operands = tuple((renames.get(var, var), slices) for var, slices in operands)
+            new_stmts.append((op, operands))
+
+        return Program(prog_name, params, tuple(new_stmts), return_var, preamble)
+
+    def _widen_compute_stmt(
+        self, operands: tuple[Operand, ...], option: MergeOpportunity, stmts: tuple[Statement, ...]
+    ) -> tuple[Operand, ...]:
+        """Widen the kept compute statement's differing operand.
+
+        Args:
+            operands: Original operands of the kept stmt.
+            option: The merge opportunity.
+            stmts: All program statements.
+
+        Returns:
+            New operands tuple with widened slice.
+        """
+        diff_idx = option.differing_operand_idx
+        var, slices = operands[diff_idx]
+
+        if slices:
+            orig_a = stmts[option.stmt_a][1][diff_idx][1]
+            orig_b = stmts[option.stmt_b][1][diff_idx][1]
+            for d in range(len(orig_a)):
+                if orig_a[d] != orig_b[d]:
+                    new_slices = self._widen_slice(slices, d, option.merged_slice)
+                    new_operands = list(operands)
+                    new_operands[diff_idx] = (var, new_slices)
+                    return tuple(new_operands)
+
+        return operands
+
+    def _widen_store(
+        self,
+        operands: tuple[Operand, ...],
+        store_a_operands: tuple[Operand, ...],
+        store_b_operands: tuple[Operand, ...],
+    ) -> tuple[Operand, ...]:
         """Widen the kept store's target and value slices.
 
-        After an op merge the result tensor is wider, so both the output
-        target slice and the value subscript (if present) must be
-        expanded to cover the merged range.
-
         Args:
-            body_stmt: The AST store statement to modify.
-            store_a: Classified dict for the kept store.
-            store_b: Classified dict for the absorbed store.
+            operands: Current store operands.
+            store_a_operands: Original operands of store A.
+            store_b_operands: Original operands of store B.
+
+        Returns:
+            New operands with widened slices.
         """
-        if not isinstance(body_stmt, ast.Assign):
-            return
-        target = body_stmt.targets[0]
-        if not isinstance(target, ast.Subscript):
-            return
+        src_var, src_slices = operands[0]
+        dst_var, dst_slices = operands[1]
+        target_a = store_a_operands[1][1]
+        target_b = store_b_operands[1][1]
 
-        s_a = store_a["target_slices"]
-        s_b = store_b["target_slices"]
-        for d in range(len(s_a)):
-            if s_a[d] != s_b[d]:
-                merged_store = (min(s_a[d][0], s_b[d][0]), max(s_a[d][1], s_b[d][1]))
-                _update_subscript_dim(target, d, merged_store)
+        for d in range(len(target_a)):
+            if target_a[d] != target_b[d]:
+                merged_target = (min(target_a[d][0], target_b[d][0]), max(target_a[d][1], target_b[d][1]))
+                new_dst_slices = self._widen_slice(dst_slices, d, merged_target)
 
-                value = body_stmt.value
-                if isinstance(value, ast.Subscript):
-                    value_slices = _parse_subscript_slices(value)
-                    if d < len(value_slices):
-                        vs, ve = value_slices[d]
-                        merged_value = (vs, vs + (merged_store[1] - merged_store[0]))
-                        _update_subscript_dim(value, d, merged_value)
-                break
+                if src_slices:
+                    vs, ve = src_slices[d]
+                    merged_value = (vs, vs + (merged_target[1] - merged_target[0]))
+                    new_src_slices = self._widen_slice(src_slices, d, merged_value)
+                    return ((src_var, new_src_slices), (dst_var, new_dst_slices))
+                return ((src_var, src_slices), (dst_var, new_dst_slices))
 
-
-_default_transform = OperandMergeTransform()
-
-
-def analyze_operand_merge(func: Callable) -> list[MergeOpportunity]:
-    """Find operand merge opportunities in a tiled function.
-
-    Convenience wrapper around ``OperandMergeTransform.analyze()``.
-
-    Args:
-        func: A tiled function with ``__source__`` attribute.
-
-    Returns:
-        List of ``MergeOpportunity`` objects.
-    """
-    return _default_transform.analyze(func)
+        return operands

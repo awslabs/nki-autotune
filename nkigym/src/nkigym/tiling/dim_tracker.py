@@ -4,10 +4,7 @@ This module provides _DimTracker, a union-find data structure for tracking
 dimension equivalences during symbolic tracing.
 """
 
-import logging
 from dataclasses import dataclass
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass

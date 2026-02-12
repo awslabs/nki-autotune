@@ -30,9 +30,24 @@ from data_reuse_golden import (
 from hypothesis import given, settings
 
 import nkigym
-from nkigym.tiling import generate_tiled_function
-from nkigym.transforms import analyze_data_reuse, merge_reusable_tensors, normalize_reuse_groups
+from nkigym.ir import callable_to_ir, ir_to_callable
+from nkigym.tiling import generate_tiled_ir
+from nkigym.transforms import DataReuseTransform, normalize_reuse_groups
 from nkigym.utils import get_source
+
+_reuse = DataReuseTransform()
+
+
+def _analyze_data_reuse(func: Callable) -> list[tuple[str, str]]:
+    """Analyze data reuse on a callable by converting to IR first."""
+    return _reuse.analyze_ir(callable_to_ir(func))
+
+
+def _merge_reusable_tensors(func: Callable, tensor_a: str, tensor_b: str) -> Callable:
+    """Merge reusable tensors on a callable by converting to/from IR."""
+    program = callable_to_ir(func)
+    new_program = _reuse.transform_ir(program, (tensor_a, tensor_b))
+    return ir_to_callable(new_program)
 
 
 def assert_reuse_groups_equal(actual: list[tuple[str, ...]], expected: list[tuple[str, ...]]) -> None:
@@ -91,7 +106,7 @@ class TestAnalyzeDataReuse:
         Args:
             func: Pre-tiled function to analyze for data reuse opportunities.
         """
-        reuse_groups = analyze_data_reuse(func)
+        reuse_groups = _analyze_data_reuse(func)
         expected = EXPECTED_REUSE[func]
         assert_reuse_groups_equal(reuse_groups, expected)
 
@@ -130,7 +145,7 @@ class TestMergeReusableTensorsSource:
             tensor_a: Name of first tensor to merge.
             tensor_b: Name of second tensor to merge into tensor_a.
         """
-        merged_func = merge_reusable_tensors(func, tensor_a, tensor_b)
+        merged_func = _merge_reusable_tensors(func, tensor_a, tensor_b)
         actual_source = get_source(merged_func)
         expected_source = EXPECTED_MERGE_TRANSFORMS[(func, tensor_a, tensor_b)]
         assert normalize_source(actual_source) == normalize_source(expected_source)
@@ -175,7 +190,7 @@ class TestMergeReusableTensorsErrors:
             error_match: Regex pattern that error message should match.
         """
         with pytest.raises(expected_error, match=error_match):
-            merge_reusable_tensors(func, tensor_a, tensor_b)
+            _merge_reusable_tensors(func, tensor_a, tensor_b)
 
 
 class TestMergeReusableTensorsNumerical:
@@ -188,56 +203,28 @@ class TestMergeReusableTensorsNumerical:
     **Validates: Requirements 2.2, 5.3**
     """
 
-    def test_merge_b_tensors_2x1_numerical(self) -> None:
-        """Verify merging B tensors in 2x1 matmul preserves numerical correctness.
-
-        Tests that merging b_sg0 and b_sg1 (which share identical slices)
-        in a 2x1 tiled matmul produces the same output as the original function.
-
-        **Validates: Requirements 2.2, 5.3**
-        """
-        a = make_random_array((256, 128), seed=42)
-        b = make_random_array((128, 128), seed=43)
-
-        expected = tiled_matmul_2x1(a, b)
-
-        merged_func = merge_reusable_tensors(tiled_matmul_2x1, "b_sg0", "b_sg1")
-        actual = merged_func(a, b)
-
-        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-8)
-
-    def test_merge_a_tensors_1x2_numerical(self) -> None:
-        """Verify merging A tensors in 1x2 matmul preserves numerical correctness.
-
-        Tests that merging a_sg0 and a_sg1 (which share identical slices)
-        in a 1x2 tiled matmul produces the same output as the original function.
+    @pytest.mark.parametrize(
+        "fixture,tensor_a,tensor_b,a_shape,b_shape",
+        [
+            (tiled_matmul_2x1, "b_sg0", "b_sg1", (256, 128), (128, 128)),
+            (tiled_matmul_1x2, "a_sg0", "a_sg1", (128, 128), (128, 256)),
+            (tiled_matmul_2x2, "a_sg0", "a_sg1", (256, 128), (128, 256)),
+        ],
+        ids=["merge_b_2x1", "merge_a_1x2", "merge_partial_2x2"],
+    )
+    def test_merge_numerical(
+        self, fixture: Callable, tensor_a: str, tensor_b: str, a_shape: tuple[int, int], b_shape: tuple[int, int]
+    ) -> None:
+        """Verify merging reusable tensors preserves numerical correctness.
 
         **Validates: Requirements 2.2, 5.3**
         """
-        a = make_random_array((128, 128), seed=42)
-        b = make_random_array((128, 256), seed=43)
+        a = make_random_array(a_shape, seed=42)
+        b = make_random_array(b_shape, seed=43)
 
-        expected = tiled_matmul_1x2(a, b)
+        expected = fixture(a, b)
 
-        merged_func = merge_reusable_tensors(tiled_matmul_1x2, "a_sg0", "a_sg1")
-        actual = merged_func(a, b)
-
-        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-8)
-
-    def test_merge_partial_2x2_numerical(self) -> None:
-        """Verify partial merge in 2x2 matmul preserves numerical correctness.
-
-        Tests that merging a_sg0 and a_sg1 (one of several reuse groups)
-        in a 2x2 tiled matmul produces the same output as the original function.
-
-        **Validates: Requirements 2.2, 5.3**
-        """
-        a = make_random_array((256, 128), seed=42)
-        b = make_random_array((128, 256), seed=43)
-
-        expected = tiled_matmul_2x2(a, b)
-
-        merged_func = merge_reusable_tensors(tiled_matmul_2x2, "a_sg0", "a_sg1")
+        merged_func = _merge_reusable_tensors(fixture, tensor_a, tensor_b)
         actual = merged_func(a, b)
 
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-8)
@@ -256,7 +243,7 @@ class TestMergeReusableTensorsNumerical:
 
         expected = tiled_double_matmul_2x1(a, b, c)
 
-        merged_func = merge_reusable_tensors(tiled_double_matmul_2x1, "b_sg0", "b_sg1")
+        merged_func = _merge_reusable_tensors(tiled_double_matmul_2x1, "b_sg0", "b_sg1")
         actual = merged_func(a, b, c)
 
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-8)
@@ -272,7 +259,7 @@ class TestMergeReusableTensorsNumerical:
 
         This property test:
         1. Generates random nc_matmul shapes (k, m, n as multiples of 128)
-        2. Creates a tiled matmul function using generate_tiled_function
+        2. Creates a tiled matmul function using generate_tiled_ir + ir_to_callable
         3. Identifies reuse groups using analyze_data_reuse
         4. If reuse groups exist, merges tensors from the first group
         5. Verifies numerical equivalence between original and merged functions
@@ -288,16 +275,16 @@ class TestMergeReusableTensorsNumerical:
             """Compute matrix multiplication using nc_matmul."""
             return nkigym.nc_matmul(a, b)
 
-        tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32)
+        tiled_func = ir_to_callable(generate_tiled_ir(matmul, {"a": a_shape, "b": b_shape}, np.float32))
 
-        reuse_pairs = analyze_data_reuse(tiled_func)
+        reuse_pairs = _analyze_data_reuse(tiled_func)
 
         if not reuse_pairs:
             return
 
         tensor_a, tensor_b = reuse_pairs[0]
 
-        merged_func = merge_reusable_tensors(tiled_func, tensor_a, tensor_b)
+        merged_func = _merge_reusable_tensors(tiled_func, tensor_a, tensor_b)
 
         np.random.seed(42)
         a = np.random.randn(*a_shape).astype(np.float32)
@@ -341,9 +328,9 @@ class TestIterativeMerge:
 
         **Validates: Requirements 2.5**
         """
-        merged_func = merge_reusable_tensors(tiled_matmul_4x1, "b_sg0", "b_sg1")
-        merged_func2 = merge_reusable_tensors(merged_func, "b_sg0", "b_sg2")
-        merged_func3 = merge_reusable_tensors(merged_func2, "b_sg0", "b_sg3")
+        merged_func = _merge_reusable_tensors(tiled_matmul_4x1, "b_sg0", "b_sg1")
+        merged_func2 = _merge_reusable_tensors(merged_func, "b_sg0", "b_sg2")
+        merged_func3 = _merge_reusable_tensors(merged_func2, "b_sg0", "b_sg3")
 
         assert normalize_source(get_source(merged_func3)) == normalize_source(MERGED_MATMUL_4X1_ALL_B)
 
@@ -364,10 +351,10 @@ class TestIterativeMerge:
 
         **Validates: Requirements 2.5**
         """
-        merged_func = merge_reusable_tensors(tiled_matmul_2x2, "a_sg0", "a_sg1")
-        merged_func2 = merge_reusable_tensors(merged_func, "a_sg2", "a_sg3")
-        merged_func3 = merge_reusable_tensors(merged_func2, "b_sg0", "b_sg2")
-        merged_func4 = merge_reusable_tensors(merged_func3, "b_sg1", "b_sg3")
+        merged_func = _merge_reusable_tensors(tiled_matmul_2x2, "a_sg0", "a_sg1")
+        merged_func2 = _merge_reusable_tensors(merged_func, "a_sg2", "a_sg3")
+        merged_func3 = _merge_reusable_tensors(merged_func2, "b_sg0", "b_sg2")
+        merged_func4 = _merge_reusable_tensors(merged_func3, "b_sg1", "b_sg3")
 
         assert normalize_source(get_source(merged_func4)) == normalize_source(MERGED_MATMUL_2X2_ALL_GROUPS)
 
@@ -377,4 +364,39 @@ class TestIterativeMerge:
         expected = tiled_matmul_2x2(a, b)
         actual = merged_func4(a, b)
 
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-8)
+
+
+class TestDataReuseIRDirect:
+    """Tests for DataReuseTransform.analyze_ir/transform_ir on program tuples directly."""
+
+    def test_analyze_ir_finds_reuse_pairs(self) -> None:
+        """Verify analyze_ir returns reuse pairs from a program tuple."""
+
+        program = callable_to_ir(tiled_matmul_2x1)
+        transform = DataReuseTransform()
+        pairs = transform.analyze_ir(program)
+        assert len(pairs) > 0
+        for pair in pairs:
+            assert len(pair) == 2
+
+    def test_transform_ir_returns_valid_program(self) -> None:
+        """Verify transform_ir returns a valid program with fewer statements."""
+
+        program = callable_to_ir(tiled_matmul_2x1)
+        transform = DataReuseTransform()
+        pairs = transform.analyze_ir(program)
+        assert len(pairs) > 0
+
+        new_program = transform.transform_ir(program, pairs[0])
+        assert new_program.name == program.name
+        assert new_program.params == program.params
+        assert new_program.return_var == program.return_var
+        assert len(new_program.stmts) < len(program.stmts)
+
+        func = ir_to_callable(new_program)
+        a = make_random_array((256, 128), seed=42)
+        b = make_random_array((128, 128), seed=43)
+        expected = tiled_matmul_2x1(a, b)
+        actual = func(a, b)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-8)

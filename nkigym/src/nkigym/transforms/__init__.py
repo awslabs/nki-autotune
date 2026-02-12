@@ -9,8 +9,8 @@ over combinations to find the best kernel.
 Every transform follows the analyze/transform protocol defined by the
 ``Transform`` base class:
 
-1. ``analyze(func)`` — inspect the IR and return a list of opportunities.
-2. ``transform(func, option)`` — apply a single opportunity, returning a new callable.
+1. ``analyze_ir(program)`` — inspect the IR and return a list of opportunities.
+2. ``transform_ir(program, option)`` — apply a single opportunity, returning a new program tuple.
 
 Available transforms:
 
@@ -19,20 +19,7 @@ Available transforms:
 """
 
 from nkigym.transforms.base import Transform
-from nkigym.transforms.data_reuse import (
-    DataReuseTransform,
-    analyze_data_reuse,
-    merge_reusable_tensors,
-    normalize_reuse_groups,
-)
-from nkigym.transforms.operand_merge import OperandMergeTransform, analyze_operand_merge
+from nkigym.transforms.data_reuse import DataReuseTransform, normalize_reuse_groups
+from nkigym.transforms.operand_merge import OperandMergeTransform
 
-__all__ = [
-    "Transform",
-    "DataReuseTransform",
-    "analyze_data_reuse",
-    "merge_reusable_tensors",
-    "normalize_reuse_groups",
-    "OperandMergeTransform",
-    "analyze_operand_merge",
-]
+__all__ = ["Transform", "DataReuseTransform", "normalize_reuse_groups", "OperandMergeTransform"]

@@ -13,11 +13,12 @@ Run with: pytest test/test_reduction_tiling.py -v
 
 import numpy as np
 import pytest
-from conftest import matmul_shapes, matmul_shapes_with_reduction_tile_index
+from conftest import make_random_array, matmul_shapes, matmul_shapes_with_reduction_tile_index
 from hypothesis import given, settings
 
 import nkigym
-from nkigym.tiling import TILE_SIZE, analyze_dimension
+from nkigym.ir import ir_to_callable, ir_to_source
+from nkigym.tiling import TILE_SIZE, analyze_dimension, generate_tiled_ir
 
 
 class TestReductionTileCountComputation:
@@ -386,20 +387,16 @@ class TestGeneratedCodeValidity:
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
             return nkigym.nc_matmul(a, b)
 
-        from nkigym.tiling import generate_tiled_function, generate_tiled_source
-
-        source = generate_tiled_source(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32)
+        source = ir_to_source(generate_tiled_ir(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32))
         try:
             compile(source, "<string>", "exec")
         except SyntaxError as e:
             raise AssertionError(f"Generated code has syntax error: {e}\n\nSource:\n{source}")
 
-        tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32)
+        tiled_func = ir_to_callable(generate_tiled_ir(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32))
 
-        np.random.seed(42)
-        a = np.random.randn(*a_shape).astype(np.float32)
-        np.random.seed(43)
-        b = np.random.randn(*b_shape).astype(np.float32)
+        a = make_random_array(a_shape, seed=42)
+        b = make_random_array(b_shape, seed=43)
 
         try:
             result = tiled_func(a, b)
@@ -528,16 +525,12 @@ class TestNumericalEquivalence:
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
             return nkigym.nc_matmul(a, b)
 
-        from nkigym.tiling import generate_tiled_function
-
-        np.random.seed(42)
-        a = np.random.randn(*a_shape).astype(np.float32)
-        np.random.seed(43)
-        b = np.random.randn(*b_shape).astype(np.float32)
+        a = make_random_array(a_shape, seed=42)
+        b = make_random_array(b_shape, seed=43)
 
         expected = nkigym.nc_matmul(a, b)
 
-        tiled_func = generate_tiled_function(matmul, {"a": a_shape, "b": b_shape}, output_dtype=a.dtype)
+        tiled_func = ir_to_callable(generate_tiled_ir(matmul, {"a": a_shape, "b": b_shape}, output_dtype=a.dtype))
         actual = tiled_func(a, b)
 
         assert actual.shape == expected.shape, f"Shape mismatch: expected {expected.shape}, got {actual.shape}"

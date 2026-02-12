@@ -15,7 +15,7 @@ import re
 
 import numpy as np
 import pytest
-from conftest import assert_arrays_close, make_random_array, normalize_source, shape_id
+from conftest import assert_arrays_close, assert_dimension_analysis_equal, make_random_array, normalize_source, shape_id
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from tiling_golden import (
@@ -26,8 +26,9 @@ from tiling_golden import (
 )
 
 import nkigym
+from nkigym.ir import ir_to_callable, ir_to_source
 from nkigym.ops import OP_REGISTRY
-from nkigym.tiling import analyze_dimension, generate_tiled_function, generate_tiled_source
+from nkigym.tiling import analyze_dimension, generate_tiled_ir
 
 SINGLE_MATMUL_NUMERICAL_SHAPES: list[tuple[tuple[int, int], tuple[int, int]]] = [
     ((128, 128), (128, 128)),
@@ -76,7 +77,7 @@ class TestDimensionAnalysis:
         """
         analysis = analyze_dimension(matmul_func, {"a": a_shape, "b": b_shape})
         expected = EXPECTED_SINGLE_MATMUL[(a_shape, b_shape)]
-        analysis.assert_equal(expected)
+        assert_dimension_analysis_equal(analysis, expected)
 
     @pytest.mark.parametrize(
         "a_shape,b_shape,c_shape",
@@ -94,7 +95,7 @@ class TestDimensionAnalysis:
         """
         analysis = analyze_dimension(double_matmul_func, {"a": a_shape, "b": b_shape, "c": c_shape})
         expected = EXPECTED_DOUBLE_MATMUL[(a_shape, b_shape, c_shape)]
-        analysis.assert_equal(expected)
+        assert_dimension_analysis_equal(analysis, expected)
 
 
 class TestTiledFunctionGeneration:
@@ -127,7 +128,7 @@ class TestTiledFunctionGeneration:
             matmul_func: Fixture providing the matmul function.
         """
         input_shapes = {"a": a_shape, "b": b_shape}
-        actual_source = generate_tiled_source(matmul_func, input_shapes, output_dtype=np.float32)
+        actual_source = ir_to_source(generate_tiled_ir(matmul_func, input_shapes, output_dtype=np.float32))
         expected_source = GOLDEN_SINGLE_MATMUL_SOURCE[(a_shape, b_shape)]
         assert normalize_source(actual_source) == normalize_source(expected_source)
 
@@ -146,7 +147,7 @@ class TestTiledFunctionGeneration:
             double_matmul_func: Fixture providing the double matmul function.
         """
         input_shapes = {"a": a_shape, "b": b_shape, "c": c_shape}
-        actual_source = generate_tiled_source(double_matmul_func, input_shapes, output_dtype=np.float32)
+        actual_source = ir_to_source(generate_tiled_ir(double_matmul_func, input_shapes, output_dtype=np.float32))
         expected_source = GOLDEN_DOUBLE_MATMUL_SOURCE[(a_shape, b_shape, c_shape)]
         assert normalize_source(actual_source) == normalize_source(expected_source)
 
@@ -184,7 +185,7 @@ class TestNumericalCorrectness:
         expected = matmul_func(a, b)
 
         input_shapes = {"a": a_shape, "b": b_shape}
-        tiled_matmul = generate_tiled_function(matmul_func, input_shapes, output_dtype=a.dtype)
+        tiled_matmul = ir_to_callable(generate_tiled_ir(matmul_func, input_shapes, output_dtype=a.dtype))
         actual = tiled_matmul(a, b)
 
         assert_arrays_close(actual, expected)
@@ -210,7 +211,7 @@ class TestNumericalCorrectness:
         expected = double_matmul_func(a, b, c)
 
         input_shapes = {"a": a_shape, "b": b_shape, "c": c_shape}
-        tiled_fn = generate_tiled_function(double_matmul_func, input_shapes, output_dtype=a.dtype)
+        tiled_fn = ir_to_callable(generate_tiled_ir(double_matmul_func, input_shapes, output_dtype=a.dtype))
         actual = tiled_fn(a, b, c)
 
         assert_arrays_close(actual, expected)
@@ -227,7 +228,7 @@ class TestNumericalCorrectness:
         b = make_random_array((128, 256), seed=43, dtype=dtype)
 
         input_shapes = {"a": (128, 256), "b": (128, 256)}
-        tiled_fn = generate_tiled_function(matmul_func, input_shapes, output_dtype=dtype)
+        tiled_fn = ir_to_callable(generate_tiled_ir(matmul_func, input_shapes, output_dtype=dtype))
 
         expected = matmul_func(a, b)
         actual = tiled_fn(a, b)
@@ -272,7 +273,7 @@ class TestNumericalCorrectness:
         expected = matmul(a, b)
 
         input_shapes = {"a": a_shape, "b": b_shape}
-        tiled_matmul = generate_tiled_function(matmul, input_shapes, output_dtype=a.dtype)
+        tiled_matmul = ir_to_callable(generate_tiled_ir(matmul, input_shapes, output_dtype=a.dtype))
         actual = tiled_matmul(a, b)
 
         assert actual.shape == expected.shape, f"Shape mismatch: actual {actual.shape} vs expected {expected.shape}"
@@ -527,7 +528,7 @@ def matmul({', '.join(input_names)}):
         exec(func_code, local_ns)
         matmul_func = local_ns["matmul"]
 
-        source = generate_tiled_source(matmul_func, input_shapes, output_dtype=np.float32)
+        source = ir_to_source(generate_tiled_ir(matmul_func, input_shapes, output_dtype=np.float32))
 
         generated_params = _extract_function_signature_params(source)
 
@@ -562,7 +563,7 @@ def matmul({', '.join(input_names)}):
         exec(func_code, local_ns)
         matmul_func = local_ns["matmul"]
 
-        source = generate_tiled_source(matmul_func, input_shapes, output_dtype=np.float32)
+        source = ir_to_source(generate_tiled_ir(matmul_func, input_shapes, output_dtype=np.float32))
 
         assignment_pattern = re.compile(r"^\s+(\w+)\s*=", re.MULTILINE)
         all_assignments = assignment_pattern.findall(source)
@@ -689,7 +690,7 @@ class TestErrorHandling:
             return np.matmul(a, b)
 
         with pytest.raises(ValueError) as exc_info:
-            generate_tiled_source(matmul, input_shapes, output_dtype=np.float32)
+            ir_to_source(generate_tiled_ir(matmul, input_shapes, output_dtype=np.float32))
 
         error_message = str(exc_info.value)
         assert reserved_name in error_message, (
@@ -713,7 +714,7 @@ class TestErrorHandling:
             return np.matmul(a, b)
 
         with pytest.raises(ValueError) as exc_info:
-            generate_tiled_source(matmul, input_shapes, output_dtype=np.float32)
+            ir_to_source(generate_tiled_ir(matmul, input_shapes, output_dtype=np.float32))
 
         error_message = str(exc_info.value)
         assert "output" in error_message, (

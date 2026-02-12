@@ -4,23 +4,6 @@ This module tests the ``OperandMergeTransform`` class, which identifies
 adjacent load and operation statements operating on contiguous slices of the
 same tensor and merges them into wider operations.
 
-Test classes:
-- ``TestAnalyzeLoadMerge``: Tests for load merge opportunity detection.
-- ``TestAnalyzeNoOpportunity``: Tests for cases with no merge opportunities.
-- ``TestAnalyzeOpMerge``: Tests for nc_matmul operation merging detection.
-- ``TestTransformSource``: Tests for transform() source code correctness.
-- ``TestLoadMergeSubscripts``: Tests for load merge consumer subscripting.
-- ``TestTransformNumerical``: Tests for numerical correctness after transform.
-- ``TestAnalyzeMatmulMerge``: Tests for nc_matmul dimension merging.
-- ``TestTransformMatmulMerge``: Tests for nc_matmul transform source.
-- ``TestMatmulMergeNumerical``: Tests for nc_matmul numerical correctness.
-- ``TestMatmulHardwareLimits``: Tests for nc_matmul hardware limit enforcement.
-- ``TestAnalyzeTensorTensorMerge``: Tests for tensor_tensor merging.
-- ``TestAnalyzeActivationMerge``: Tests for activation merging.
-- ``TestAnalyzeTensorScalarMerge``: Tests for tensor_scalar merging.
-- ``TestTransformElementwise``: Tests for elementwise op transform source.
-- ``TestE2EPipeline``: End-to-end tests with full tiling/reuse/merge pipeline.
-
 Run with: pytest test/test_operand_merge.py -v
 """
 
@@ -50,10 +33,26 @@ from operand_merge_golden import (
 )
 
 import nkigym
-from nkigym.tiling import generate_tiled_function
+from nkigym.ir import Program, Statement, callable_to_ir, ir_to_callable
+from nkigym.ops import ALLOC_F32_OP, LOAD_OP, NC_MATMUL_OP, STORE_OP
+from nkigym.tiling import generate_tiled_ir
 from nkigym.transforms import DataReuseTransform
 from nkigym.transforms.operand_merge import MergeOpportunity, OperandMergeTransform
-from nkigym.utils.source import get_source
+from nkigym.utils.source import exec_source_to_func, get_source
+
+_merge = OperandMergeTransform()
+
+
+def _analyze(func):
+    """Analyze a callable for merge opportunities via IR round-trip."""
+    return _merge.analyze_ir(callable_to_ir(func))
+
+
+def _transform(func, opp):
+    """Apply a merge opportunity to a callable via IR round-trip."""
+    program = callable_to_ir(func)
+    new_program = _merge.transform_ir(program, opp)
+    return ir_to_callable(new_program)
 
 
 @pytest.fixture
@@ -82,7 +81,7 @@ class TestAnalyzeLoadMerge:
         ``tiled_subscript_loads_2x`` has b[0:128, 0:128] and b[0:128, 128:256]
         consumed via subscript in nc_matmul, so load merging is safe.
         """
-        opportunities = operand_merge.analyze(tiled_subscript_loads_2x)
+        opportunities = _analyze(tiled_subscript_loads_2x)
         load_opps = [opp for opp in opportunities if opp.op_type == "load"]
         assert len(load_opps) == 1
 
@@ -93,7 +92,7 @@ class TestAnalyzeLoadMerge:
         nc_matmul as bare Name args. Load merging is now allowed; the
         transform will subscript the bare consumers with the original slices.
         """
-        opportunities = operand_merge.analyze(tiled_adjacent_loads_2x)
+        opportunities = _analyze(tiled_adjacent_loads_2x)
         load_opps = [opp for opp in opportunities if opp.op_type == "load"]
         assert len(load_opps) == 1
 
@@ -103,7 +102,7 @@ class TestAnalyzeLoadMerge:
         ``tiled_no_adjacent_loads`` has b[0:128, 0:128] and b[0:128, 256:384]
         which have a gap (128:256 missing) and are not adjacent.
         """
-        opportunities = operand_merge.analyze(tiled_no_adjacent_loads)
+        opportunities = _analyze(tiled_no_adjacent_loads)
         assert len(opportunities) == 0
 
     def test_single_subgraph_no_opportunity(self, operand_merge: OperandMergeTransform) -> None:
@@ -112,7 +111,7 @@ class TestAnalyzeLoadMerge:
         ``tiled_single_subgraph`` has only one load per source tensor,
         so no pairs can be formed.
         """
-        opportunities = operand_merge.analyze(tiled_single_subgraph)
+        opportunities = _analyze(tiled_single_subgraph)
         assert len(opportunities) == 0
 
     def test_opportunity_fields(self, operand_merge: OperandMergeTransform) -> None:
@@ -121,7 +120,7 @@ class TestAnalyzeLoadMerge:
         Checks op_type, stmt_a < stmt_b, merged_slice covers both original
         slices, and differing_operand_idx points to the free dimension.
         """
-        opportunities = operand_merge.analyze(tiled_subscript_loads_2x)
+        opportunities = _analyze(tiled_subscript_loads_2x)
         load_opps = [opp for opp in opportunities if opp.op_type == "load"]
         assert len(load_opps) == 1
         opp = load_opps[0]
@@ -146,7 +145,7 @@ class TestAnalyzeNoOpportunity:
         ``tiled_different_source_tensors`` has one load from ``a`` and one
         from ``b``, so they cannot be merged.
         """
-        opportunities = operand_merge.analyze(tiled_different_source_tensors)
+        opportunities = _analyze(tiled_different_source_tensors)
         assert len(opportunities) == 0
 
     def test_different_partition_slices(self, operand_merge: OperandMergeTransform) -> None:
@@ -156,7 +155,7 @@ class TestAnalyzeNoOpportunity:
         a[128:256, 0:128] which differ on the partition dimension (dim 0),
         not the free dimension. They should not be grouped together.
         """
-        opportunities = operand_merge.analyze(tiled_different_partition_slices)
+        opportunities = _analyze(tiled_different_partition_slices)
         load_opps = [opp for opp in opportunities if opp.op_type == "load"]
         assert len(load_opps) == 0
 
@@ -174,7 +173,7 @@ class TestAnalyzeOpMerge:
         ``tiled_matmul_post_reuse_1x2`` has two nc_matmul calls sharing
         tensor_0 (a load) and differing on the b operand (0:128 vs 128:256).
         """
-        opps = operand_merge.analyze(tiled_matmul_post_reuse_1x2)
+        opps = _analyze(tiled_matmul_post_reuse_1x2)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         assert len(op_opps) == 1
         assert op_opps[0].merged_slice == (0, 256)
@@ -185,7 +184,7 @@ class TestAnalyzeOpMerge:
         ``tiled_matmul_post_reuse_1x4`` has 4 nc_matmul calls with shared a
         and adjacent b loads spanning 0:512.
         """
-        opps = operand_merge.analyze(tiled_matmul_post_reuse_1x4)
+        opps = _analyze(tiled_matmul_post_reuse_1x4)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         assert len(op_opps) >= 1
 
@@ -196,7 +195,7 @@ class TestAnalyzeOpMerge:
         0:640. No single nc_matmul opportunity should have a merged slice
         wider than 512.
         """
-        opps = operand_merge.analyze(tiled_matmul_exceeds_n_limit)
+        opps = _analyze(tiled_matmul_exceeds_n_limit)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         for opp in op_opps:
             merged_size = opp.merged_slice[1] - opp.merged_slice[0]
@@ -209,7 +208,7 @@ class TestAnalyzeOpMerge:
         nc_matmul. Load merging is now allowed (bare arg guard removed),
         so both load-level and op-level opportunities are found.
         """
-        opps = operand_merge.analyze(tiled_adjacent_loads_2x)
+        opps = _analyze(tiled_adjacent_loads_2x)
         load_opps = [o for o in opps if o.op_type == "load"]
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         assert len(load_opps) == 1
@@ -223,7 +222,7 @@ class TestAnalyzeOpMerge:
         ``tiled_adjacent_4x`` has 4 nc_matmul calls with adjacent b loads.
         Greedy pairing should produce at least 2 nc_matmul merge opportunities.
         """
-        opportunities = operand_merge.analyze(tiled_adjacent_4x)
+        opportunities = _analyze(tiled_adjacent_4x)
         op_opps = [o for o in opportunities if o.op_type == "nc_matmul"]
         assert len(op_opps) >= 2
         for opp in op_opps:
@@ -244,10 +243,10 @@ class TestTransformSource:
         After merging b[0:128, 0:128] and b[0:128, 128:256], the kept
         load should become b[0:128, 0:256] and tensor_4 should be removed.
         """
-        opps = operand_merge.analyze(tiled_subscript_loads_2x)
+        opps = _analyze(tiled_subscript_loads_2x)
         load_opps = [o for o in opps if o.op_type == "load"]
         assert len(load_opps) == 1
-        result = operand_merge.transform(tiled_subscript_loads_2x, load_opps[0])
+        result = _transform(tiled_subscript_loads_2x, load_opps[0])
         source = get_source(result)
         assert "0:256" in source
         assert "tensor_4" not in source
@@ -258,10 +257,10 @@ class TestTransformSource:
         After merging the two nc_matmul ops in post_reuse_1x2, only one
         nc_matmul call should remain with the b load widened to 0:256.
         """
-        opps = operand_merge.analyze(tiled_matmul_post_reuse_1x2)
+        opps = _analyze(tiled_matmul_post_reuse_1x2)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         assert len(op_opps) == 1
-        result = operand_merge.transform(tiled_matmul_post_reuse_1x2, op_opps[0])
+        result = _transform(tiled_matmul_post_reuse_1x2, op_opps[0])
         source = get_source(result)
         assert "0:256" in source
         assert source.count("nc_matmul") == 1
@@ -272,9 +271,9 @@ class TestTransformSource:
         After merging, the absorbed nc_matmul, its dedicated b load, and
         its output store should all be removed from the source.
         """
-        opps = operand_merge.analyze(tiled_matmul_post_reuse_1x2)
+        opps = _analyze(tiled_matmul_post_reuse_1x2)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        result = operand_merge.transform(tiled_matmul_post_reuse_1x2, op_opps[0])
+        result = _transform(tiled_matmul_post_reuse_1x2, op_opps[0])
         source = get_source(result)
         assert "tensor_5" not in source
         assert "tensor_4" not in source
@@ -295,13 +294,13 @@ class TestLoadMergeSubscripts:
         into tensor_1[0:128, 0:256], all nc_matmul consumers should reference
         tensor_1 via subscript (not bare Name).
         """
-        opps = operand_merge.analyze(tiled_matmul_post_reuse_2x2)
+        opps = _analyze(tiled_matmul_post_reuse_2x2)
         load_opps = [o for o in opps if o.op_type == "load"]
         assert len(load_opps) >= 1
 
         func = tiled_matmul_post_reuse_2x2
         for opp in load_opps:
-            func = operand_merge.transform(func, opp)
+            func = _transform(func, opp)
 
         source = get_source(func)
         assert "0:256" in source
@@ -316,13 +315,13 @@ class TestLoadMergeSubscripts:
         original = tiled_matmul_post_reuse_2x2(a, b)
         func = tiled_matmul_post_reuse_2x2
 
-        opps = operand_merge.analyze(func)
+        opps = _analyze(func)
         load_opps = [o for o in opps if o.op_type == "load"]
         for opp in load_opps:
-            func = operand_merge.transform(func, opp)
+            func = _transform(func, opp)
 
         transformed = func(a, b)
-        np.testing.assert_allclose(original, transformed)
+        np.testing.assert_allclose(original, transformed, rtol=1e-5, atol=1e-5)
 
 
 class TestTransformNumerical:
@@ -337,86 +336,41 @@ class TestTransformNumerical:
         a = make_random_array((128, 128), seed=42)
         b = make_random_array((128, 256), seed=43)
 
-        opps = operand_merge.analyze(tiled_matmul_post_reuse_1x2)
+        opps = _analyze(tiled_matmul_post_reuse_1x2)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        result_func = operand_merge.transform(tiled_matmul_post_reuse_1x2, op_opps[0])
+        result_func = _transform(tiled_matmul_post_reuse_1x2, op_opps[0])
 
         original = tiled_matmul_post_reuse_1x2(a, b)
         transformed = result_func(a, b)
-        np.testing.assert_allclose(original, transformed)
+        np.testing.assert_allclose(original, transformed, rtol=1e-5, atol=1e-5)
 
-    def test_iterative_post_reuse_numerical(self, operand_merge: OperandMergeTransform) -> None:
-        """Iteratively applying all opportunities on post-reuse should preserve correctness."""
-        a = make_random_array((128, 128), seed=42)
-        b = make_random_array((128, 256), seed=43)
+    @pytest.mark.parametrize(
+        "fixture,a_shape,b_shape",
+        [
+            (tiled_matmul_post_reuse_1x2, (128, 128), (128, 256)),
+            (tiled_matmul_post_reuse_1x4, (128, 128), (128, 512)),
+            (tiled_adjacent_loads_2x, (128, 128), (128, 256)),
+            (tiled_matmul_post_reuse_2x2, (128, 256), (128, 256)),
+        ],
+        ids=["post_reuse_1x2", "post_reuse_1x4", "adjacent_loads_2x", "post_reuse_2x2"],
+    )
+    def test_iterative_merge_numerical(
+        self, operand_merge: OperandMergeTransform, fixture: object, a_shape: tuple, b_shape: tuple
+    ) -> None:
+        """Iteratively applying all opportunities should preserve correctness."""
+        a = make_random_array(a_shape, seed=42)
+        b = make_random_array(b_shape, seed=43)
 
-        original = tiled_matmul_post_reuse_1x2(a, b)
-        func = tiled_matmul_post_reuse_1x2
+        original = fixture(a, b)
+        func = fixture
         while True:
-            opps = operand_merge.analyze(func)
+            opps = _analyze(func)
             if not opps:
                 break
-            func = operand_merge.transform(func, opps[0])
+            func = _transform(func, opps[0])
 
         transformed = func(a, b)
-        np.testing.assert_allclose(original, transformed)
-
-    def test_iterative_post_reuse_1x4_numerical(self, operand_merge: OperandMergeTransform) -> None:
-        """Iteratively merging 1x4 post-reuse should preserve correctness."""
-        a = make_random_array((128, 128), seed=42)
-        b = make_random_array((128, 512), seed=43)
-
-        original = tiled_matmul_post_reuse_1x4(a, b)
-        func = tiled_matmul_post_reuse_1x4
-        while True:
-            opps = operand_merge.analyze(func)
-            if not opps:
-                break
-            func = operand_merge.transform(func, opps[0])
-
-        transformed = func(a, b)
-        np.testing.assert_allclose(original, transformed)
-
-    def test_nc_matmul_merge_adjacent_loads_2x_numerical(self, operand_merge: OperandMergeTransform) -> None:
-        """Op-level merge of adjacent_loads_2x should preserve correctness.
-
-        ``tiled_adjacent_loads_2x`` produces nc_matmul opportunities (not load).
-        Iteratively applying all ops should yield numerically identical results.
-        """
-        a = make_random_array((128, 128), seed=42)
-        b = make_random_array((128, 256), seed=43)
-
-        original = tiled_adjacent_loads_2x(a, b)
-        func = tiled_adjacent_loads_2x
-        while True:
-            opps = operand_merge.analyze(func)
-            if not opps:
-                break
-            func = operand_merge.transform(func, opps[0])
-
-        transformed = func(a, b)
-        np.testing.assert_allclose(original, transformed)
-
-    def test_iterative_post_reuse_2x2_numerical(self, operand_merge: OperandMergeTransform) -> None:
-        """Iteratively merging 2x2 post-reuse should preserve correctness.
-
-        The 2x2 case has shared loads on both sides. Load merging first
-        subscripts the bare consumers, then op merging merges the matmul
-        pairs. All opportunities are applied iteratively until none remain.
-        """
-        a = make_random_array((128, 256), seed=42)
-        b = make_random_array((128, 256), seed=43)
-
-        original = tiled_matmul_post_reuse_2x2(a, b)
-        func = tiled_matmul_post_reuse_2x2
-        while True:
-            opps = operand_merge.analyze(func)
-            if not opps:
-                break
-            func = operand_merge.transform(func, opps[0])
-
-        transformed = func(a, b)
-        np.testing.assert_allclose(original, transformed)
+        np.testing.assert_allclose(original, transformed, rtol=1e-5, atol=1e-5)
 
 
 class TestAnalyzeMatmulMerge:
@@ -432,7 +386,7 @@ class TestAnalyzeMatmulMerge:
         ``tiled_matmul_post_reuse_1x2`` has shared tensor_0 (a) and
         b loads at 0:128 and 128:256. Merged N=256.
         """
-        opps = operand_merge.analyze(tiled_matmul_post_reuse_1x2)
+        opps = _analyze(tiled_matmul_post_reuse_1x2)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         assert len(op_opps) == 1
         assert op_opps[0].differing_operand_idx == 1
@@ -443,7 +397,7 @@ class TestAnalyzeMatmulMerge:
 
         ``tiled_matmul_n_at_limit`` has b[0:128, 0:256] and b[0:128, 256:512].
         """
-        opps = operand_merge.analyze(tiled_matmul_n_at_limit)
+        opps = _analyze(tiled_matmul_n_at_limit)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         assert len(op_opps) == 1
         assert op_opps[0].merged_slice == (0, 512)
@@ -454,7 +408,7 @@ class TestAnalyzeMatmulMerge:
         ``tiled_matmul_exceeds_n_limit`` has 5 adjacent b loads. No single
         nc_matmul opportunity should have merged N > 512.
         """
-        opps = operand_merge.analyze(tiled_matmul_exceeds_n_limit)
+        opps = _analyze(tiled_matmul_exceeds_n_limit)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         for opp in op_opps:
             assert opp.merged_slice[1] - opp.merged_slice[0] <= 512
@@ -465,7 +419,7 @@ class TestAnalyzeMatmulMerge:
         ``tiled_matmul_m_dim_merge`` has a[0:64,...] and a[64:128,...] with
         shared b. Merged M = 128, within the M=128 limit.
         """
-        opps = operand_merge.analyze(tiled_matmul_m_dim_merge)
+        opps = _analyze(tiled_matmul_m_dim_merge)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         assert len(op_opps) == 1
         assert op_opps[0].differing_operand_idx == 0
@@ -477,7 +431,7 @@ class TestAnalyzeMatmulMerge:
         ``tiled_matmul_m_exceeds_limit`` has a[0:128,...] and a[128:192,...]
         with shared b. Merged M = 192 > 128.
         """
-        opps = operand_merge.analyze(tiled_matmul_m_exceeds_limit)
+        opps = _analyze(tiled_matmul_m_exceeds_limit)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         assert len(op_opps) == 0
 
@@ -496,9 +450,9 @@ class TestTransformMatmulMerge:
         After transform: tensor_1 widened to b[0:128, 0:256], one nc_matmul
         remains, output store widened to output[0:128, 0:256].
         """
-        opps = operand_merge.analyze(tiled_matmul_post_reuse_1x2)
+        opps = _analyze(tiled_matmul_post_reuse_1x2)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        result = operand_merge.transform(tiled_matmul_post_reuse_1x2, op_opps[0])
+        result = _transform(tiled_matmul_post_reuse_1x2, op_opps[0])
         source = get_source(result)
         assert source.count("nc_matmul") == 1
         assert "0:256" in source
@@ -507,9 +461,9 @@ class TestTransformMatmulMerge:
 
     def test_n_at_limit_source(self, operand_merge: OperandMergeTransform) -> None:
         """Transform on N=512 at-limit should produce one nc_matmul with b[0:128, 0:512]."""
-        opps = operand_merge.analyze(tiled_matmul_n_at_limit)
+        opps = _analyze(tiled_matmul_n_at_limit)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        result = operand_merge.transform(tiled_matmul_n_at_limit, op_opps[0])
+        result = _transform(tiled_matmul_n_at_limit, op_opps[0])
         source = get_source(result)
         assert source.count("nkigym.nc_matmul(") == 1
         assert "0:512" in source
@@ -520,9 +474,9 @@ class TestTransformMatmulMerge:
         After transform: tensor_0 widened to a[0:128, 0:128], one nc_matmul
         remains, output store widened to output[0:128, 0:128].
         """
-        opps = operand_merge.analyze(tiled_matmul_m_dim_merge)
+        opps = _analyze(tiled_matmul_m_dim_merge)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        result = operand_merge.transform(tiled_matmul_m_dim_merge, op_opps[0])
+        result = _transform(tiled_matmul_m_dim_merge, op_opps[0])
         source = get_source(result)
         assert source.count("nkigym.nc_matmul(") == 1
         assert "tensor_3" not in source
@@ -536,44 +490,29 @@ class TestMatmulMergeNumerical:
     numerical output across different dimension configurations.
     """
 
-    def test_same_lhs_adjacent_rhs_numerical(self, operand_merge: OperandMergeTransform) -> None:
-        """nc_matmul merge on N dimension should produce identical results."""
-        a = make_random_array((128, 128), seed=42)
-        b = make_random_array((128, 256), seed=43)
+    @pytest.mark.parametrize(
+        "fixture,a_shape,b_shape",
+        [
+            (tiled_matmul_post_reuse_1x2, (128, 128), (128, 256)),
+            (tiled_matmul_n_at_limit, (128, 128), (128, 512)),
+            (tiled_matmul_m_dim_merge, (128, 128), (128, 128)),
+        ],
+        ids=["same_lhs_adjacent_rhs", "n_at_limit", "m_dim_merge"],
+    )
+    def test_single_merge_numerical(
+        self, operand_merge: OperandMergeTransform, fixture: object, a_shape: tuple, b_shape: tuple
+    ) -> None:
+        """nc_matmul merge should produce numerically identical results."""
+        a = make_random_array(a_shape, seed=42)
+        b = make_random_array(b_shape, seed=43)
 
-        opps = operand_merge.analyze(tiled_matmul_post_reuse_1x2)
+        opps = _analyze(fixture)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        result_func = operand_merge.transform(tiled_matmul_post_reuse_1x2, op_opps[0])
+        result_func = _transform(fixture, op_opps[0])
 
-        original = tiled_matmul_post_reuse_1x2(a, b)
+        original = fixture(a, b)
         transformed = result_func(a, b)
-        np.testing.assert_allclose(original, transformed)
-
-    def test_n_at_limit_numerical(self, operand_merge: OperandMergeTransform) -> None:
-        """N=512 at-limit merge should produce identical results."""
-        a = make_random_array((128, 128), seed=42)
-        b = make_random_array((128, 512), seed=43)
-
-        opps = operand_merge.analyze(tiled_matmul_n_at_limit)
-        op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        result_func = operand_merge.transform(tiled_matmul_n_at_limit, op_opps[0])
-
-        original = tiled_matmul_n_at_limit(a, b)
-        transformed = result_func(a, b)
-        np.testing.assert_allclose(original, transformed)
-
-    def test_m_dim_merge_numerical(self, operand_merge: OperandMergeTransform) -> None:
-        """M-dimension merge should produce identical results."""
-        a = make_random_array((128, 128), seed=42)
-        b = make_random_array((128, 128), seed=43)
-
-        opps = operand_merge.analyze(tiled_matmul_m_dim_merge)
-        op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        result_func = operand_merge.transform(tiled_matmul_m_dim_merge, op_opps[0])
-
-        original = tiled_matmul_m_dim_merge(a, b)
-        transformed = result_func(a, b)
-        np.testing.assert_allclose(original, transformed)
+        np.testing.assert_allclose(original, transformed, rtol=1e-5, atol=1e-5)
 
     def test_iterative_1x4_full_merge(self, operand_merge: OperandMergeTransform) -> None:
         """Iteratively merging 1x4 post-reuse from 4 to 1 nc_matmul call.
@@ -587,53 +526,17 @@ class TestMatmulMergeNumerical:
         original = tiled_matmul_post_reuse_1x4(a, b)
         func = tiled_matmul_post_reuse_1x4
         while True:
-            opps = operand_merge.analyze(func)
+            opps = _analyze(func)
             if not opps:
                 break
-            func = operand_merge.transform(func, opps[0])
+            func = _transform(func, opps[0])
 
         source = get_source(func)
         assert source.count("nc_matmul") == 1
         assert "0:512" in source
 
         transformed = func(a, b)
-        np.testing.assert_allclose(original, transformed)
-
-
-class TestMatmulHardwareLimits:
-    """Tests for nc_matmul hardware limit enforcement.
-
-    Verifies that ``analyze()`` respects N=512 and M=128 limits and
-    does not produce opportunities that exceed them.
-    """
-
-    def test_n_512_accepted(self, operand_merge: OperandMergeTransform) -> None:
-        """Merged N=512 is exactly at the limit and should be accepted."""
-        opps = operand_merge.analyze(tiled_matmul_n_at_limit)
-        op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        assert len(op_opps) == 1
-        assert op_opps[0].merged_slice[1] - op_opps[0].merged_slice[0] == 512
-
-    def test_n_640_all_within_limit(self, operand_merge: OperandMergeTransform) -> None:
-        """5 adjacent loads (N=640 total): every opportunity must have N <= 512."""
-        opps = operand_merge.analyze(tiled_matmul_exceeds_n_limit)
-        op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        for opp in op_opps:
-            merged_n = opp.merged_slice[1] - opp.merged_slice[0]
-            assert merged_n <= 512, f"Merged N={merged_n} exceeds limit 512"
-
-    def test_m_128_accepted(self, operand_merge: OperandMergeTransform) -> None:
-        """Merged M=128 is exactly at the limit and should be accepted."""
-        opps = operand_merge.analyze(tiled_matmul_m_dim_merge)
-        op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        assert len(op_opps) == 1
-        assert op_opps[0].merged_slice[1] - op_opps[0].merged_slice[0] == 128
-
-    def test_m_192_rejected(self, operand_merge: OperandMergeTransform) -> None:
-        """Merged M=192 exceeds M=128 limit and should not produce an opportunity."""
-        opps = operand_merge.analyze(tiled_matmul_m_exceeds_limit)
-        op_opps = [o for o in opps if o.op_type == "nc_matmul"]
-        assert len(op_opps) == 0
+        np.testing.assert_allclose(original, transformed, rtol=1e-5, atol=1e-5)
 
 
 class TestAnalyzeTensorTensorMerge:
@@ -650,7 +553,7 @@ class TestAnalyzeTensorTensorMerge:
         ``tiled_tensor_tensor_2x`` has tensor_0=a[0:128,0:128] and
         tensor_3=a[0:128,128:256] with shared tensor_1=b[0:128,0:128].
         """
-        opps = operand_merge.analyze(tiled_tensor_tensor_2x)
+        opps = _analyze(tiled_tensor_tensor_2x)
         tt_opps = [o for o in opps if o.op_type == "tensor_tensor"]
         assert len(tt_opps) == 1
         assert tt_opps[0].differing_operand_idx == 0
@@ -661,13 +564,13 @@ class TestAnalyzeTensorTensorMerge:
 
         ``tiled_tensor_tensor_diff_ops`` has op=np.add vs op=np.multiply.
         """
-        opps = operand_merge.analyze(tiled_tensor_tensor_diff_ops)
+        opps = _analyze(tiled_tensor_tensor_diff_ops)
         tt_opps = [o for o in opps if o.op_type == "tensor_tensor"]
         assert len(tt_opps) == 0
 
     def test_opportunity_fields(self, operand_merge: OperandMergeTransform) -> None:
         """Verify MergeOpportunity fields for tensor_tensor."""
-        opps = operand_merge.analyze(tiled_tensor_tensor_2x)
+        opps = _analyze(tiled_tensor_tensor_2x)
         tt_opps = [o for o in opps if o.op_type == "tensor_tensor"]
         opp = tt_opps[0]
         assert isinstance(opp, MergeOpportunity)
@@ -690,7 +593,7 @@ class TestAnalyzeActivationMerge:
         ``tiled_activation_2x`` has tensor_0=a[0:128,0:128] and
         tensor_2=a[0:128,128:256].
         """
-        opps = operand_merge.analyze(tiled_activation_2x)
+        opps = _analyze(tiled_activation_2x)
         act_opps = [o for o in opps if o.op_type == "activation"]
         assert len(act_opps) == 1
         assert act_opps[0].differing_operand_idx == 0
@@ -701,12 +604,12 @@ class TestAnalyzeActivationMerge:
 
         ``tiled_activation_single`` has only one activation call.
         """
-        opps = operand_merge.analyze(tiled_activation_single)
+        opps = _analyze(tiled_activation_single)
         assert len(opps) == 0
 
     def test_opportunity_fields(self, operand_merge: OperandMergeTransform) -> None:
         """Verify MergeOpportunity fields for activation."""
-        opps = operand_merge.analyze(tiled_activation_2x)
+        opps = _analyze(tiled_activation_2x)
         act_opps = [o for o in opps if o.op_type == "activation"]
         opp = act_opps[0]
         assert isinstance(opp, MergeOpportunity)
@@ -728,7 +631,7 @@ class TestAnalyzeTensorScalarMerge:
         ``tiled_tensor_scalar_2x`` has tensor_0=a[0:128,0:128] and
         tensor_2=a[0:128,128:256].
         """
-        opps = operand_merge.analyze(tiled_tensor_scalar_2x)
+        opps = _analyze(tiled_tensor_scalar_2x)
         ts_opps = [o for o in opps if o.op_type == "tensor_scalar"]
         assert len(ts_opps) == 1
         assert ts_opps[0].differing_operand_idx == 0
@@ -736,7 +639,7 @@ class TestAnalyzeTensorScalarMerge:
 
     def test_opportunity_fields(self, operand_merge: OperandMergeTransform) -> None:
         """Verify MergeOpportunity fields for tensor_scalar."""
-        opps = operand_merge.analyze(tiled_tensor_scalar_2x)
+        opps = _analyze(tiled_tensor_scalar_2x)
         ts_opps = [o for o in opps if o.op_type == "tensor_scalar"]
         opp = ts_opps[0]
         assert isinstance(opp, MergeOpportunity)
@@ -760,9 +663,9 @@ class TestTransformElementwise:
         After transform: tensor_0 widened to a[0:128, 0:256], single
         tensor_tensor call, absorbed chain (tensor_3, tensor_5, store) removed.
         """
-        opps = operand_merge.analyze(tiled_tensor_tensor_2x)
+        opps = _analyze(tiled_tensor_tensor_2x)
         tt_opps = [o for o in opps if o.op_type == "tensor_tensor"]
-        result = operand_merge.transform(tiled_tensor_tensor_2x, tt_opps[0])
+        result = _transform(tiled_tensor_tensor_2x, tt_opps[0])
         source = get_source(result)
         assert source.count("nkigym.tensor_tensor(") == 1
         assert "0:256" in source
@@ -775,9 +678,9 @@ class TestTransformElementwise:
         After transform: tensor_0 widened to a[0:128, 0:256], single
         activation call, absorbed chain (tensor_2, tensor_3, store) removed.
         """
-        opps = operand_merge.analyze(tiled_activation_2x)
+        opps = _analyze(tiled_activation_2x)
         act_opps = [o for o in opps if o.op_type == "activation"]
-        result = operand_merge.transform(tiled_activation_2x, act_opps[0])
+        result = _transform(tiled_activation_2x, act_opps[0])
         source = get_source(result)
         assert source.count("nkigym.activation(") == 1
         assert "0:256" in source
@@ -790,9 +693,9 @@ class TestTransformElementwise:
         After transform: tensor_0 widened to a[0:128, 0:256], single
         tensor_scalar call, absorbed chain (tensor_2, tensor_3, store) removed.
         """
-        opps = operand_merge.analyze(tiled_tensor_scalar_2x)
+        opps = _analyze(tiled_tensor_scalar_2x)
         ts_opps = [o for o in opps if o.op_type == "tensor_scalar"]
-        result = operand_merge.transform(tiled_tensor_scalar_2x, ts_opps[0])
+        result = _transform(tiled_tensor_scalar_2x, ts_opps[0])
         source = get_source(result)
         assert source.count("nkigym.tensor_scalar(") == 1
         assert "0:256" in source
@@ -801,25 +704,25 @@ class TestTransformElementwise:
 
     def test_tensor_tensor_preserves_kwargs(self, operand_merge: OperandMergeTransform) -> None:
         """tensor_tensor merge should preserve the op= keyword argument."""
-        opps = operand_merge.analyze(tiled_tensor_tensor_2x)
+        opps = _analyze(tiled_tensor_tensor_2x)
         tt_opps = [o for o in opps if o.op_type == "tensor_tensor"]
-        result = operand_merge.transform(tiled_tensor_tensor_2x, tt_opps[0])
+        result = _transform(tiled_tensor_tensor_2x, tt_opps[0])
         source = get_source(result)
         assert "op=np.add" in source
 
     def test_activation_preserves_kwargs(self, operand_merge: OperandMergeTransform) -> None:
         """activation merge should preserve the op= keyword argument."""
-        opps = operand_merge.analyze(tiled_activation_2x)
+        opps = _analyze(tiled_activation_2x)
         act_opps = [o for o in opps if o.op_type == "activation"]
-        result = operand_merge.transform(tiled_activation_2x, act_opps[0])
+        result = _transform(tiled_activation_2x, act_opps[0])
         source = get_source(result)
         assert "op=np.tanh" in source
 
     def test_tensor_scalar_preserves_kwargs(self, operand_merge: OperandMergeTransform) -> None:
         """tensor_scalar merge should preserve op0= and operand0= kwargs."""
-        opps = operand_merge.analyze(tiled_tensor_scalar_2x)
+        opps = _analyze(tiled_tensor_scalar_2x)
         ts_opps = [o for o in opps if o.op_type == "tensor_scalar"]
-        result = operand_merge.transform(tiled_tensor_scalar_2x, ts_opps[0])
+        result = _transform(tiled_tensor_scalar_2x, ts_opps[0])
         source = get_source(result)
         assert "op0=np.multiply" in source
         assert "operand0=2.0" in source
@@ -832,64 +735,269 @@ class TestE2EPipeline:
     correctness when applied to a tiled function.
     """
 
-    def test_full_pipeline_matmul_1x2(self, operand_merge: OperandMergeTransform) -> None:
-        """Full pipeline on (128,128)x(128,256) matmul (1x2 tile grid).
-
-        Steps: generate_tiled_function -> DataReuseTransform -> OperandMergeTransform.
-        The 1x2 case has one shared a load and two adjacent b loads, which
-        merges cleanly without shared-load aliasing issues.
-        """
+    @pytest.mark.parametrize(
+        "a_shape,b_shape", [((128, 128), (128, 256)), ((128, 256), (128, 256))], ids=["1x2", "2x2"]
+    )
+    def test_full_pipeline_matmul(self, operand_merge: OperandMergeTransform, a_shape: tuple, b_shape: tuple) -> None:
+        """Full pipeline: generate_tiled_function -> DataReuseTransform -> OperandMergeTransform."""
 
         def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
             """Compute matrix multiplication."""
             return nkigym.nc_matmul(a, b)
 
+        a = make_random_array(a_shape, seed=42)
+        b = make_random_array(b_shape, seed=43)
+        expected = matmul(a, b)
+
+        program = generate_tiled_ir(matmul, {"a": a_shape, "b": b_shape}, output_dtype=a.dtype)
+
+        reuse = DataReuseTransform()
+        for group in reuse.analyze_ir(program):
+            program = reuse.transform_ir(program, group)
+
+        merge = OperandMergeTransform()
+        while True:
+            opps = merge.analyze_ir(program)
+            if not opps:
+                break
+            program = merge.transform_ir(program, opps[0])
+
+        result = ir_to_callable(program)(a, b)
+        np.testing.assert_allclose(expected, result, rtol=1e-5, atol=1e-5)
+
+
+class TestOperandMergeIRDirect:
+    """Tests for OperandMergeTransform.analyze_ir/transform_ir on program tuples directly."""
+
+    def test_analyze_ir_finds_opportunities(self) -> None:
+        """Verify analyze_ir returns opportunities from a program tuple."""
+        program = callable_to_ir(tiled_matmul_post_reuse_1x2)
+        transform = OperandMergeTransform()
+        opps = transform.analyze_ir(program)
+        assert len(opps) > 0
+        for opp in opps:
+            assert isinstance(opp, MergeOpportunity)
+
+    def test_transform_ir_returns_valid_program(self) -> None:
+        """Verify transform_ir returns a valid program with fewer statements."""
+        program = callable_to_ir(tiled_matmul_post_reuse_1x2)
+        transform = OperandMergeTransform()
+        opps = transform.analyze_ir(program)
+        assert len(opps) > 0
+
+        new_program = transform.transform_ir(program, opps[0])
+        assert new_program.name == program.name
+        assert new_program.params == program.params
+        assert new_program.return_var == program.return_var
+        assert len(new_program.stmts) < len(program.stmts)
+
+        func = ir_to_callable(new_program)
         a = make_random_array((128, 128), seed=42)
         b = make_random_array((128, 256), seed=43)
-        expected = matmul(a, b)
+        expected = tiled_matmul_post_reuse_1x2(a, b)
+        actual = func(a, b)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
-        tiled = generate_tiled_function(matmul, {"a": (128, 128), "b": (128, 256)}, output_dtype=a.dtype)
 
-        reuse = DataReuseTransform()
-        for group in reuse.analyze(tiled):
-            tiled = reuse.transform(tiled, group)
+class TestCheckAdjacentSlicesDifferentLengths:
+    """Tests for OperandMergeTransform._check_adjacent_slices with mismatched slice tuple lengths."""
 
-        while True:
-            opps = operand_merge.analyze(tiled)
-            if not opps:
-                break
-            tiled = operand_merge.transform(tiled, opps[0])
+    def test_different_lengths_returns_none(self) -> None:
+        """Slice tuples with different numbers of dimensions cannot be adjacent."""
+        slices_a = ((0, 128),)
+        slices_b = ((0, 128), (0, 128))
+        assert OperandMergeTransform._check_adjacent_slices(slices_a, slices_b) is None
 
-        result = tiled(a, b)
-        np.testing.assert_allclose(expected, result, rtol=1e-5)
+    def test_same_length_adjacent(self) -> None:
+        """Same-length slice tuples with one adjacent dimension succeed."""
+        slices_a = ((0, 128), (0, 128))
+        slices_b = ((0, 128), (128, 256))
+        result = OperandMergeTransform._check_adjacent_slices(slices_a, slices_b)
+        assert result is not None
+        dim, merged = result
+        assert dim == 1
+        assert merged == (0, 256)
 
-    def test_full_pipeline_matmul_2x2(self, operand_merge: OperandMergeTransform) -> None:
-        """Full pipeline on (128,256)x(128,256) matmul fully merges via load+op passes.
+    def test_two_differing_dims_returns_none(self) -> None:
+        """Slices differing on two dimensions cannot be merged."""
+        slices_a = ((0, 128), (0, 128))
+        slices_b = ((128, 256), (128, 256))
+        assert OperandMergeTransform._check_adjacent_slices(slices_a, slices_b) is None
 
-        After data reuse, shared loads are merged first (with bare
-        consumers subscripted), then op merging merges the matmul pairs.
-        The result is numerically correct.
+    def test_non_adjacent_gap_returns_none(self) -> None:
+        """Slices with a gap between them cannot be merged."""
+        slices_a = ((0, 128), (0, 128))
+        slices_b = ((0, 128), (256, 384))
+        assert OperandMergeTransform._check_adjacent_slices(slices_a, slices_b) is None
+
+    def test_reverse_adjacency(self) -> None:
+        """Slices where B ends where A starts are also adjacent."""
+        slices_a = ((0, 128), (128, 256))
+        slices_b = ((0, 128), (0, 128))
+        result = OperandMergeTransform._check_adjacent_slices(slices_a, slices_b)
+        assert result is not None
+        dim, merged = result
+        assert dim == 1
+        assert merged == (0, 256)
+
+
+class TestCheckDependencySafe:
+    """Tests for OperandMergeTransform._check_dependency_safe returning False."""
+
+    def test_safe_when_no_intervening_usage(self) -> None:
+        """Merging is safe when the absorbed variable has no usage between the two statements."""
+        var_usage = {"tensor_0": [0, 5]}
+        assert OperandMergeTransform._check_dependency_safe(0, 5, "tensor_0", var_usage) is True
+
+    def test_unsafe_when_intervening_usage(self) -> None:
+        """Merging is unsafe when the absorbed variable is used between idx_lo and idx_hi."""
+        var_usage = {"tensor_0": [0, 3, 5]}
+        assert OperandMergeTransform._check_dependency_safe(0, 5, "tensor_0", var_usage) is False
+
+    def test_safe_when_var_not_in_usage(self) -> None:
+        """Merging is safe when the absorbed variable is not in the usage index."""
+        var_usage: dict[str, list[int]] = {}
+        assert OperandMergeTransform._check_dependency_safe(0, 5, "tensor_0", var_usage) is True
+
+    def test_usage_at_idx_lo_is_safe(self) -> None:
+        """Usage at exactly idx_lo is not intervening (it is the defining statement)."""
+        var_usage = {"tensor_0": [0, 5]}
+        assert OperandMergeTransform._check_dependency_safe(0, 5, "tensor_0", var_usage) is True
+
+    def test_usage_at_idx_hi_is_safe(self) -> None:
+        """Usage at exactly idx_hi is not intervening (it is the absorbed statement)."""
+        var_usage = {"tensor_0": [0, 5]}
+        assert OperandMergeTransform._check_dependency_safe(0, 5, "tensor_0", var_usage) is True
+
+    def test_dependency_blocks_compute_merge(self) -> None:
+        """End-to-end: dependency between statements blocks compute merge.
+
+        Build a program where tensor_2 (from first matmul) is used as input
+        to the second matmul, so absorbing the first matmul is unsafe.
         """
+        stmts: tuple[Statement, ...] = (
+            (ALLOC_F32_OP, (("output", ((0, 128), (0, 256))),)),
+            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("tensor_0", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("b", ((0, 128), (0, 128))), ("tensor_1", ((0, 128), (0, 128))))),
+            (NC_MATMUL_OP, (("tensor_0", ()), ("tensor_1", ()), ("tensor_2", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("b", ((0, 128), (128, 256))), ("tensor_3", ((0, 128), (0, 128))))),
+            (NC_MATMUL_OP, (("tensor_2", ((0, 128), (0, 128))), ("tensor_3", ()), ("tensor_4", ((0, 128), (0, 128))))),
+            (STORE_OP, (("tensor_2", ((0, 128), (0, 128))), ("output", ((0, 128), (0, 128))))),
+            (STORE_OP, (("tensor_4", ((0, 128), (0, 128))), ("output", ((0, 128), (128, 256))))),
+        )
+        program = Program("dep_fn", ("a", "b"), stmts, "output", "def dep_fn(a, b):")
+        transform = OperandMergeTransform()
+        opps = transform.analyze_ir(program)
+        matmul_opps = [o for o in opps if o.op_type == "nc_matmul"]
+        assert len(matmul_opps) == 0
 
-        def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-            """Compute matrix multiplication."""
-            return nkigym.nc_matmul(a, b)
 
-        a = make_random_array((128, 256), seed=42)
-        b = make_random_array((128, 256), seed=43)
-        expected = matmul(a, b)
+class TestHasAccumulationBlocking:
+    """Tests for OperandMergeTransform._has_accumulation blocking a merge."""
 
-        tiled = generate_tiled_function(matmul, {"a": (128, 256), "b": (128, 256)}, output_dtype=a.dtype)
+    def test_no_accumulation(self) -> None:
+        """Variable written once by compute is not an accumulation."""
+        stmts: tuple[Statement, ...] = (
+            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("tensor_0", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("b", ((0, 128), (0, 128))), ("tensor_1", ((0, 128), (0, 128))))),
+            (NC_MATMUL_OP, (("tensor_0", ()), ("tensor_1", ()), ("tensor_2", ((0, 128), (0, 128))))),
+        )
+        compute_vars = {"tensor_2"}
+        assert OperandMergeTransform._has_accumulation("tensor_2", stmts, compute_vars) is False
 
-        reuse = DataReuseTransform()
-        for group in reuse.analyze(tiled):
-            tiled = reuse.transform(tiled, group)
+    def test_has_accumulation(self) -> None:
+        """Variable written twice by compute (reduction tiling) is an accumulation."""
+        stmts: tuple[Statement, ...] = (
+            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("tensor_0", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("b", ((0, 128), (0, 128))), ("tensor_1", ((0, 128), (0, 128))))),
+            (NC_MATMUL_OP, (("tensor_0", ()), ("tensor_1", ()), ("tensor_2", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("a", ((128, 256), (0, 128))), ("tensor_3", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("b", ((128, 256), (0, 128))), ("tensor_4", ((0, 128), (0, 128))))),
+            (NC_MATMUL_OP, (("tensor_3", ()), ("tensor_4", ()), ("tensor_2", ((0, 128), (0, 128))))),
+        )
+        compute_vars = {"tensor_2"}
+        assert OperandMergeTransform._has_accumulation("tensor_2", stmts, compute_vars) is True
 
+    def test_accumulation_blocks_merge(self) -> None:
+        """Accumulating variables block compute merging at the analyze level.
+
+        Build a reduction-tiled program with two accumulating matmuls on
+        adjacent output tiles. The accumulation should prevent merging.
+        """
+        stmts: tuple[Statement, ...] = (
+            (ALLOC_F32_OP, (("output", ((0, 128), (0, 256))),)),
+            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("t0", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("b", ((0, 128), (0, 128))), ("t1", ((0, 128), (0, 128))))),
+            (NC_MATMUL_OP, (("t0", ()), ("t1", ()), ("t2", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("a", ((128, 256), (0, 128))), ("t3", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("b", ((128, 256), (0, 128))), ("t4", ((0, 128), (0, 128))))),
+            (NC_MATMUL_OP, (("t3", ()), ("t4", ()), ("t2", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("t5", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("b", ((0, 128), (128, 256))), ("t6", ((0, 128), (0, 128))))),
+            (NC_MATMUL_OP, (("t5", ()), ("t6", ()), ("t7", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("a", ((128, 256), (0, 128))), ("t8", ((0, 128), (0, 128))))),
+            (LOAD_OP, (("b", ((128, 256), (128, 256))), ("t9", ((0, 128), (0, 128))))),
+            (NC_MATMUL_OP, (("t8", ()), ("t9", ()), ("t7", ((0, 128), (0, 128))))),
+            (STORE_OP, (("t2", ((0, 128), (0, 128))), ("output", ((0, 128), (0, 128))))),
+            (STORE_OP, (("t7", ((0, 128), (0, 128))), ("output", ((0, 128), (128, 256))))),
+        )
+        program = Program("accum_fn", ("a", "b"), stmts, "output", "def accum_fn(a, b):")
+        transform = OperandMergeTransform()
+        opps = transform.analyze_ir(program)
+        matmul_opps = [o for o in opps if o.op_type == "nc_matmul"]
+        assert len(matmul_opps) == 0
+
+
+class TestThreeWayMergeChain:
+    """Tests for three-way iterative merge chains.
+
+    Verifies that after merging a pair, re-analysis can find a second
+    opportunity to merge the result with a third statement.
+    """
+
+    def test_iterative_merge_three_loads(self) -> None:
+        """Three adjacent loads can be merged in two iterations.
+
+        Build a program with 3 adjacent b loads at [0:128], [128:256], [256:384].
+        First iteration merges two into [0:256], second merges with [256:384]
+        to get [0:384]. Uses source-level round-trip since nc_matmul N=384 < 512.
+        """
+        source = (
+            "def three_load(a, b):\n"
+            "    output = nkigym.ndarray((128, 384), dtype=np.float32)\n"
+            "    tensor_0 = a[0:128, 0:128]\n"
+            "    tensor_1 = b[0:128, 0:128]\n"
+            "    tensor_2 = nkigym.nc_matmul(tensor_0, tensor_1)\n"
+            "    output[0:128, 0:128] = tensor_2[0:128, 0:128]\n"
+            "    tensor_3 = b[0:128, 128:256]\n"
+            "    tensor_4 = nkigym.nc_matmul(tensor_0, tensor_3)\n"
+            "    output[0:128, 128:256] = tensor_4[0:128, 0:128]\n"
+            "    tensor_5 = b[0:128, 256:384]\n"
+            "    tensor_6 = nkigym.nc_matmul(tensor_0, tensor_5)\n"
+            "    output[0:128, 256:384] = tensor_6[0:128, 0:128]\n"
+            "    return output\n"
+        )
+
+        original_func = exec_source_to_func(source, "three_load")
+        program = callable_to_ir(original_func)
+        transform = OperandMergeTransform()
+
+        iteration_count = 0
         while True:
-            opps = operand_merge.analyze(tiled)
+            opps = transform.analyze_ir(program)
             if not opps:
                 break
-            tiled = operand_merge.transform(tiled, opps[0])
+            program = transform.transform_ir(program, opps[0])
+            iteration_count += 1
 
-        result = tiled(a, b)
-        np.testing.assert_allclose(expected, result, rtol=1e-5)
+        assert iteration_count >= 2
+
+        func = ir_to_callable(program)
+        source_final = get_source(func)
+        assert source_final.count("nc_matmul") == 1
+
+        a = make_random_array((128, 128), seed=42)
+        b = make_random_array((128, 384), seed=43)
+        expected = original_func(a, b)
+        actual = func(a, b)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)

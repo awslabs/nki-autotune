@@ -9,7 +9,8 @@ from collections.abc import Callable
 import numpy as np
 
 import nkigym
-from nkigym.tiling import generate_tiled_function
+from nkigym.ir import ir_to_callable
+from nkigym.tiling import generate_tiled_ir
 
 TILE = 128
 
@@ -29,7 +30,7 @@ def _make_tiled(a_shape: tuple[int, int], b_shape: tuple[int, int]) -> Callable:
         """Compute matrix multiplication."""
         return nkigym.nc_matmul(a, b)
 
-    return generate_tiled_function(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32)
+    return ir_to_callable(generate_tiled_ir(matmul, {"a": a_shape, "b": b_shape}, output_dtype=np.float32))
 
 
 GOLDEN: dict[str, tuple[tuple[int, int], tuple[int, int], str]] = {}
@@ -65,7 +66,9 @@ _g(
     (TILE, TILE),
     (TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -79,7 +82,9 @@ _g(
     (TILE, 2 * TILE),
     (TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 128), dtype=np.float32)
     for i_0 in range(2):
         tensor_0 = a[0:128, i_0 * 128:(i_0 + 1) * 128]
@@ -94,7 +99,9 @@ _g(
     (TILE, 3 * TILE),
     (TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((384, 128), dtype=np.float32)
     for i_0 in range(3):
         tensor_0 = a[0:128, i_0 * 128:(i_0 + 1) * 128]
@@ -109,7 +116,9 @@ _g(
     (TILE, 4 * TILE),
     (TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((512, 128), dtype=np.float32)
     for i_0 in range(4):
         tensor_0 = a[0:128, i_0 * 128:(i_0 + 1) * 128]
@@ -124,7 +133,9 @@ _g(
     (TILE, TILE),
     (TILE, 4 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 512), dtype=np.float32)
     for i_0 in range(4):
         tensor_0 = a[0:128, 0:128]
@@ -139,7 +150,9 @@ _g(
     (TILE, TILE),
     (TILE, 5 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 640), dtype=np.float32)
     for i_0 in range(5):
         tensor_0 = a[0:128, 0:128]
@@ -154,7 +167,9 @@ _g(
     (TILE, 2 * TILE),
     (TILE, 2 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 256), dtype=np.float32)
     for i_0 in range(2):
         for i_1 in range(2):
@@ -170,7 +185,9 @@ _g(
     (TILE, 3 * TILE),
     (TILE, 5 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((384, 640), dtype=np.float32)
     for i_0 in range(3):
         for i_1 in range(5):
@@ -186,7 +203,9 @@ _g(
     (TILE, 4 * TILE),
     (TILE, 4 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((512, 512), dtype=np.float32)
     for i_0 in range(4):
         for i_1 in range(4):
@@ -202,7 +221,9 @@ _g(
     (2 * TILE, TILE),
     (2 * TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -219,7 +240,9 @@ _g(
     (4 * TILE, TILE),
     (4 * TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -237,7 +260,9 @@ _g(
     (8 * TILE, TILE),
     (8 * TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -255,7 +280,9 @@ _g(
     (2 * TILE, 2 * TILE),
     (2 * TILE, 2 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 256), dtype=np.float32)
     for i_0 in range(2):
         for i_1 in range(2):
@@ -274,7 +301,9 @@ _g(
     (2 * TILE, 3 * TILE),
     (2 * TILE, 5 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((384, 640), dtype=np.float32)
     for i_0 in range(3):
         for i_1 in range(5):
@@ -293,7 +322,9 @@ _g(
     (3 * TILE, 2 * TILE),
     (3 * TILE, 3 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 384), dtype=np.float32)
     for i_0 in range(2):
         for i_1 in range(3):
@@ -314,7 +345,9 @@ _r(
     (TILE, TILE),
     (TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -328,7 +361,9 @@ _r(
     (TILE, 2 * TILE),
     (TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 128), dtype=np.float32)
     for i_0 in range(2):
         tensor_0 = a[0:128, i_0 * 128:(i_0 + 1) * 128]
@@ -343,7 +378,9 @@ _r(
     (TILE, 4 * TILE),
     (TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((512, 128), dtype=np.float32)
     for i_0 in range(4):
         tensor_0 = a[0:128, i_0 * 128:(i_0 + 1) * 128]
@@ -358,7 +395,9 @@ _r(
     (TILE, 2 * TILE),
     (TILE, 2 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 256), dtype=np.float32)
     for i_0 in range(2):
         tensor_0 = a[0:128, i_0 * 128:(i_0 + 1) * 128]
@@ -377,7 +416,9 @@ _r(
     (4 * TILE, TILE),
     (4 * TILE, TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
@@ -395,7 +436,9 @@ _r(
     (2 * TILE, 2 * TILE),
     (2 * TILE, 2 * TILE),
     """\
-def tiled_matmul(a, b):
+import numpy as np
+import nkigym
+def matmul(a, b):
     output = nkigym.ndarray((256, 256), dtype=np.float32)
     for i_0 in range(2):
         tensor_0 = a[0:128, i_0 * 128:(i_0 + 1) * 128]

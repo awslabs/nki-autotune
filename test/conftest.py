@@ -7,6 +7,7 @@ import pytest
 from hypothesis import strategies as st
 
 import nkigym
+from nkigym.tiling.analysis import DimensionAnalysis
 
 
 @pytest.fixture
@@ -216,3 +217,57 @@ def matmul_shapes_with_reduction_tile_index(draw: st.DrawFn) -> tuple[tuple[int,
     num_reduction_tiles = k // TILE_SIZE
     reduction_tile_index = draw(st.integers(min_value=0, max_value=num_reduction_tiles - 1))
     return ((k, m), (k, n), reduction_tile_index)
+
+
+def assert_dimension_analysis_equal(actual: DimensionAnalysis, expected: DimensionAnalysis) -> None:
+    """Assert two DimensionAnalysis objects are equal with detailed error messages.
+
+    Args:
+        actual: The actual DimensionAnalysis result.
+        expected: The expected golden DimensionAnalysis.
+
+    Raises:
+        AssertionError: If any field differs between actual and expected.
+    """
+    assert (
+        actual.dim_order == expected.dim_order
+    ), f"dim_order mismatch:\n  actual: {actual.dim_order}\n  expected: {expected.dim_order}"
+    assert (
+        actual.dim_info == expected.dim_info
+    ), f"dim_info mismatch:\n  actual: {actual.dim_info}\n  expected: {expected.dim_info}"
+    assert (
+        actual.tensor_dims == expected.tensor_dims
+    ), f"tensor_dims mismatch:\n  actual: {actual.tensor_dims}\n  expected: {expected.tensor_dims}"
+    assert (
+        actual.tensor_shapes == expected.tensor_shapes
+    ), f"tensor_shapes mismatch:\n  actual: {actual.tensor_shapes}\n  expected: {expected.tensor_shapes}"
+    assert (
+        actual.tile_counts == expected.tile_counts
+    ), f"tile_counts mismatch:\n  actual: {actual.tile_counts}\n  expected: {expected.tile_counts}"
+    assert (
+        actual.num_subgraphs == expected.num_subgraphs
+    ), f"num_subgraphs mismatch:\n  actual: {actual.num_subgraphs}\n  expected: {expected.num_subgraphs}"
+
+    actual_positions = list(actual.iter_tile_positions())
+    expected_positions = list(expected.iter_tile_positions())
+    assert (
+        actual_positions == expected_positions
+    ), f"iter_tile_positions mismatch:\n  actual: {actual_positions}\n  expected: {expected_positions}"
+
+    assert (
+        actual.slice_params == expected.slice_params
+    ), f"slice_params mismatch:\n  actual: {actual.slice_params}\n  expected: {expected.slice_params}"
+
+    assert (
+        actual.output == expected.output
+    ), f"output mismatch:\n  actual: {actual.output}\n  expected: {expected.output}"
+
+    assert (
+        actual.reduction_tile_counts == expected.reduction_tile_counts
+    ), f"reduction_tile_counts mismatch:\n  actual: {actual.reduction_tile_counts}\n  expected: {expected.reduction_tile_counts}"
+
+    actual_reduction_positions = list(actual.iter_reduction_tile_positions())
+    expected_reduction_positions = list(expected.iter_reduction_tile_positions())
+    assert (
+        actual_reduction_positions == expected_reduction_positions
+    ), f"iter_reduction_tile_positions mismatch:\n  actual: {actual_reduction_positions}\n  expected: {expected_reduction_positions}"

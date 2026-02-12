@@ -18,13 +18,9 @@ import numpy as np
 import nkigym
 from autotune import Benchmark, ProfileJobs
 from autotune.compiler.compile import get_kernel_by_name
-from nkigym.codegen import lower_gym_to_nki
+from nkigym.codegen import lower_ir_to_nki
 from nkigym.search import search
-from nkigym.tiling import generate_tiled_function
 from nkigym.transforms import DataReuseTransform, OperandMergeTransform
-from nkigym.utils import get_source
-
-CACHE_ROOT = "/fsx/weittang/gym_cache/matmul"
 
 
 def matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -42,47 +38,41 @@ def matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 
 def main() -> None:
     """Run tiling, search-based transform exploration, codegen, and hardware profiling."""
+    CACHE_ROOT = "/fsx/weittang/gym_cache/matmul"
     cache_path = Path(CACHE_ROOT)
-    cache_path.mkdir(parents=True, exist_ok=True)
-    (cache_path / "nkigym_user.py").write_text(f'"""{matmul.__name__} (user source)"""\n' + get_source(matmul))
-
     k, m, n = 1024, 1024, 1024
-    input_shapes: dict[str, tuple[int, int]] = {"lhs": (k, m), "rhs": (k, n)}
-
-    lhs = np.random.randn(k, m).astype(np.float32)
-    rhs = np.random.randn(k, n).astype(np.float32)
-
-    func = generate_tiled_function(matmul, input_shapes, output_dtype=np.float32)
+    lhs = np.random.randn(k, m)
+    rhs = np.random.randn(k, n)
     kernel_kwargs = {"lhs": lhs, "rhs": rhs}
-    gym_funcs = search(
-        func,
+
+    variants = search(
+        matmul,
         transforms=[DataReuseTransform(), OperandMergeTransform()],
         num_targets=50,
         seed=42,
-        min_depth=10,
+        min_depth=1,
         save_cache=cache_path,
-        verify=True,
         kernel_kwargs=kernel_kwargs,
     )
 
-    nki_func_name = "nki_tiled_matmul"
+    nki_func_name = "nki_matmul"
     jobs = ProfileJobs(cache_root_dir=CACHE_ROOT)
 
-    for step, gym_func in enumerate(gym_funcs):
-        nki_source = lower_gym_to_nki(gym_func)
+    for step, variant in enumerate(variants):
+        nki_source = lower_ir_to_nki(variant)
         nki_path = str(cache_path / f"nki_matmul_{step}.py")
         Path(nki_path).write_text(nki_source)
         kernel = get_kernel_by_name((nki_path, nki_func_name))
         jobs.add_job(
             kernel=kernel,
-            kernel_kwargs=kernel_kwargs,
+            kernel_kwargs={"lhs": lhs.astype(np.float16), "rhs": rhs.astype(np.float16)},
             output_shapes={"result": (m, n)},
             compiler_flags="",
             correctness_check=(matmul, 1e-3, 1e-3),
         )
 
     results = Benchmark(jobs, warmup=10, iters=100).run()
-    results.summary(top_k=len(gym_funcs))
+    results.summary(top_k=len(variants))
 
 
 if __name__ == "__main__":
