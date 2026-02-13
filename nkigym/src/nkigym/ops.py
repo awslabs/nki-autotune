@@ -443,7 +443,7 @@ class NKIMatmul(NKIOp):
         Returns:
             NKI code string calling nisa.nc_matmul with pre-allocated PSUM buffer.
         """
-        alloc = f'{output} = nl.zeros(({inputs[0]}.shape[1], {inputs[1]}.shape[1]), dtype={inputs[0]}.dtype, buffer=nl.psum, name="{output}")'
+        alloc = f'{output} = nl.zeros(({inputs[0]}.shape[1], {inputs[1]}.shape[1]), dtype=nl.float32, buffer=nl.psum, name="{output}")'
         matmul = f"nisa.nc_matmul({output}, {inputs[0]}, {inputs[1]})"
         return f"{alloc}\n{matmul}"
 
