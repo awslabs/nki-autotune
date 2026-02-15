@@ -38,7 +38,7 @@ from nkigym.ops import ALLOC_F32_OP, LOAD_OP, NC_MATMUL_OP, STORE_OP
 from nkigym.tiling import generate_tiled_ir
 from nkigym.transforms import DataReuseTransform
 from nkigym.transforms.operand_merge import MergeOpportunity, OperandMergeTransform
-from nkigym.utils.source import exec_source_to_func, get_source
+from nkigym.utils.source import callable_to_source, source_to_callable
 
 _merge = OperandMergeTransform()
 
@@ -247,7 +247,7 @@ class TestTransformSource:
         load_opps = [o for o in opps if o.op_type == "load"]
         assert len(load_opps) == 1
         result = _transform(tiled_subscript_loads_2x, load_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert "0:256" in source
         assert "tensor_4" not in source
 
@@ -261,7 +261,7 @@ class TestTransformSource:
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         assert len(op_opps) == 1
         result = _transform(tiled_matmul_post_reuse_1x2, op_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert "0:256" in source
         assert source.count("nc_matmul") == 1
 
@@ -274,7 +274,7 @@ class TestTransformSource:
         opps = _analyze(tiled_matmul_post_reuse_1x2)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         result = _transform(tiled_matmul_post_reuse_1x2, op_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert "tensor_5" not in source
         assert "tensor_4" not in source
 
@@ -302,7 +302,7 @@ class TestLoadMergeSubscripts:
         for opp in load_opps:
             func = _transform(func, opp)
 
-        source = get_source(func)
+        source = callable_to_source(func)
         assert "0:256" in source
         assert "tensor_1[" in source
         assert "0:128, 0:128]" in source or "0:128, 128:256]" in source
@@ -453,7 +453,7 @@ class TestTransformMatmulMerge:
         opps = _analyze(tiled_matmul_post_reuse_1x2)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         result = _transform(tiled_matmul_post_reuse_1x2, op_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert source.count("nc_matmul") == 1
         assert "0:256" in source
         assert "tensor_4" not in source
@@ -464,7 +464,7 @@ class TestTransformMatmulMerge:
         opps = _analyze(tiled_matmul_n_at_limit)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         result = _transform(tiled_matmul_n_at_limit, op_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert source.count("nkigym.nc_matmul(") == 1
         assert "0:512" in source
 
@@ -477,7 +477,7 @@ class TestTransformMatmulMerge:
         opps = _analyze(tiled_matmul_m_dim_merge)
         op_opps = [o for o in opps if o.op_type == "nc_matmul"]
         result = _transform(tiled_matmul_m_dim_merge, op_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert source.count("nkigym.nc_matmul(") == 1
         assert "tensor_3" not in source
         assert "tensor_4" not in source
@@ -531,7 +531,7 @@ class TestMatmulMergeNumerical:
                 break
             func = _transform(func, opps[0])
 
-        source = get_source(func)
+        source = callable_to_source(func)
         assert source.count("nc_matmul") == 1
         assert "0:512" in source
 
@@ -666,7 +666,7 @@ class TestTransformElementwise:
         opps = _analyze(tiled_tensor_tensor_2x)
         tt_opps = [o for o in opps if o.op_type == "tensor_tensor"]
         result = _transform(tiled_tensor_tensor_2x, tt_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert source.count("nkigym.tensor_tensor(") == 1
         assert "0:256" in source
         assert "tensor_3 = " not in source
@@ -681,7 +681,7 @@ class TestTransformElementwise:
         opps = _analyze(tiled_activation_2x)
         act_opps = [o for o in opps if o.op_type == "activation"]
         result = _transform(tiled_activation_2x, act_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert source.count("nkigym.activation(") == 1
         assert "0:256" in source
         assert "tensor_2 = " not in source
@@ -696,7 +696,7 @@ class TestTransformElementwise:
         opps = _analyze(tiled_tensor_scalar_2x)
         ts_opps = [o for o in opps if o.op_type == "tensor_scalar"]
         result = _transform(tiled_tensor_scalar_2x, ts_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert source.count("nkigym.tensor_scalar(") == 1
         assert "0:256" in source
         assert "tensor_2 = " not in source
@@ -707,7 +707,7 @@ class TestTransformElementwise:
         opps = _analyze(tiled_tensor_tensor_2x)
         tt_opps = [o for o in opps if o.op_type == "tensor_tensor"]
         result = _transform(tiled_tensor_tensor_2x, tt_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert "op=np.add" in source
 
     def test_activation_preserves_kwargs(self, operand_merge: OperandMergeTransform) -> None:
@@ -715,7 +715,7 @@ class TestTransformElementwise:
         opps = _analyze(tiled_activation_2x)
         act_opps = [o for o in opps if o.op_type == "activation"]
         result = _transform(tiled_activation_2x, act_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert "op=np.tanh" in source
 
     def test_tensor_scalar_preserves_kwargs(self, operand_merge: OperandMergeTransform) -> None:
@@ -723,7 +723,7 @@ class TestTransformElementwise:
         opps = _analyze(tiled_tensor_scalar_2x)
         ts_opps = [o for o in opps if o.op_type == "tensor_scalar"]
         result = _transform(tiled_tensor_scalar_2x, ts_opps[0])
-        source = get_source(result)
+        source = callable_to_source(result)
         assert "op0=np.multiply" in source
         assert "operand0=2.0" in source
 
@@ -876,14 +876,18 @@ class TestCheckDependencySafe:
         to the second matmul, so absorbing the first matmul is unsafe.
         """
         stmts: tuple[Statement, ...] = (
-            (ALLOC_F32_OP, (("output", ((0, 128), (0, 256))),)),
-            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("tensor_0", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("b", ((0, 128), (0, 128))), ("tensor_1", ((0, 128), (0, 128))))),
-            (NC_MATMUL_OP, (("tensor_0", ()), ("tensor_1", ()), ("tensor_2", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("b", ((0, 128), (128, 256))), ("tensor_3", ((0, 128), (0, 128))))),
-            (NC_MATMUL_OP, (("tensor_2", ((0, 128), (0, 128))), ("tensor_3", ()), ("tensor_4", ((0, 128), (0, 128))))),
-            (STORE_OP, (("tensor_2", ((0, 128), (0, 128))), ("output", ((0, 128), (0, 128))))),
-            (STORE_OP, (("tensor_4", ((0, 128), (0, 128))), ("output", ((0, 128), (128, 256))))),
+            Statement(ALLOC_F32_OP, (("output", ((0, 128), (0, 256))),), True),
+            Statement(LOAD_OP, (("a", ((0, 128), (0, 128))), ("tensor_0", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("b", ((0, 128), (0, 128))), ("tensor_1", ((0, 128), (0, 128)))), True),
+            Statement(NC_MATMUL_OP, (("tensor_0", ()), ("tensor_1", ()), ("tensor_2", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("b", ((0, 128), (128, 256))), ("tensor_3", ((0, 128), (0, 128)))), True),
+            Statement(
+                NC_MATMUL_OP,
+                (("tensor_2", ((0, 128), (0, 128))), ("tensor_3", ()), ("tensor_4", ((0, 128), (0, 128)))),
+                True,
+            ),
+            Statement(STORE_OP, (("tensor_2", ((0, 128), (0, 128))), ("output", ((0, 128), (0, 128)))), True),
+            Statement(STORE_OP, (("tensor_4", ((0, 128), (0, 128))), ("output", ((0, 128), (128, 256)))), True),
         )
         program = Program("dep_fn", ("a", "b"), stmts, "output", "def dep_fn(a, b):")
         transform = OperandMergeTransform()
@@ -898,9 +902,9 @@ class TestHasAccumulationBlocking:
     def test_no_accumulation(self) -> None:
         """Variable written once by compute is not an accumulation."""
         stmts: tuple[Statement, ...] = (
-            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("tensor_0", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("b", ((0, 128), (0, 128))), ("tensor_1", ((0, 128), (0, 128))))),
-            (NC_MATMUL_OP, (("tensor_0", ()), ("tensor_1", ()), ("tensor_2", ((0, 128), (0, 128))))),
+            Statement(LOAD_OP, (("a", ((0, 128), (0, 128))), ("tensor_0", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("b", ((0, 128), (0, 128))), ("tensor_1", ((0, 128), (0, 128)))), True),
+            Statement(NC_MATMUL_OP, (("tensor_0", ()), ("tensor_1", ()), ("tensor_2", ((0, 128), (0, 128)))), True),
         )
         compute_vars = {"tensor_2"}
         assert OperandMergeTransform._has_accumulation("tensor_2", stmts, compute_vars) is False
@@ -908,12 +912,12 @@ class TestHasAccumulationBlocking:
     def test_has_accumulation(self) -> None:
         """Variable written twice by compute (reduction tiling) is an accumulation."""
         stmts: tuple[Statement, ...] = (
-            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("tensor_0", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("b", ((0, 128), (0, 128))), ("tensor_1", ((0, 128), (0, 128))))),
-            (NC_MATMUL_OP, (("tensor_0", ()), ("tensor_1", ()), ("tensor_2", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("a", ((128, 256), (0, 128))), ("tensor_3", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("b", ((128, 256), (0, 128))), ("tensor_4", ((0, 128), (0, 128))))),
-            (NC_MATMUL_OP, (("tensor_3", ()), ("tensor_4", ()), ("tensor_2", ((0, 128), (0, 128))))),
+            Statement(LOAD_OP, (("a", ((0, 128), (0, 128))), ("tensor_0", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("b", ((0, 128), (0, 128))), ("tensor_1", ((0, 128), (0, 128)))), True),
+            Statement(NC_MATMUL_OP, (("tensor_0", ()), ("tensor_1", ()), ("tensor_2", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("a", ((128, 256), (0, 128))), ("tensor_3", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("b", ((128, 256), (0, 128))), ("tensor_4", ((0, 128), (0, 128)))), True),
+            Statement(NC_MATMUL_OP, (("tensor_3", ()), ("tensor_4", ()), ("tensor_2", ((0, 128), (0, 128)))), False),
         )
         compute_vars = {"tensor_2"}
         assert OperandMergeTransform._has_accumulation("tensor_2", stmts, compute_vars) is True
@@ -925,21 +929,21 @@ class TestHasAccumulationBlocking:
         adjacent output tiles. The accumulation should prevent merging.
         """
         stmts: tuple[Statement, ...] = (
-            (ALLOC_F32_OP, (("output", ((0, 128), (0, 256))),)),
-            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("t0", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("b", ((0, 128), (0, 128))), ("t1", ((0, 128), (0, 128))))),
-            (NC_MATMUL_OP, (("t0", ()), ("t1", ()), ("t2", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("a", ((128, 256), (0, 128))), ("t3", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("b", ((128, 256), (0, 128))), ("t4", ((0, 128), (0, 128))))),
-            (NC_MATMUL_OP, (("t3", ()), ("t4", ()), ("t2", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("a", ((0, 128), (0, 128))), ("t5", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("b", ((0, 128), (128, 256))), ("t6", ((0, 128), (0, 128))))),
-            (NC_MATMUL_OP, (("t5", ()), ("t6", ()), ("t7", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("a", ((128, 256), (0, 128))), ("t8", ((0, 128), (0, 128))))),
-            (LOAD_OP, (("b", ((128, 256), (128, 256))), ("t9", ((0, 128), (0, 128))))),
-            (NC_MATMUL_OP, (("t8", ()), ("t9", ()), ("t7", ((0, 128), (0, 128))))),
-            (STORE_OP, (("t2", ((0, 128), (0, 128))), ("output", ((0, 128), (0, 128))))),
-            (STORE_OP, (("t7", ((0, 128), (0, 128))), ("output", ((0, 128), (128, 256))))),
+            Statement(ALLOC_F32_OP, (("output", ((0, 128), (0, 256))),), True),
+            Statement(LOAD_OP, (("a", ((0, 128), (0, 128))), ("t0", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("b", ((0, 128), (0, 128))), ("t1", ((0, 128), (0, 128)))), True),
+            Statement(NC_MATMUL_OP, (("t0", ()), ("t1", ()), ("t2", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("a", ((128, 256), (0, 128))), ("t3", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("b", ((128, 256), (0, 128))), ("t4", ((0, 128), (0, 128)))), True),
+            Statement(NC_MATMUL_OP, (("t3", ()), ("t4", ()), ("t2", ((0, 128), (0, 128)))), False),
+            Statement(LOAD_OP, (("a", ((0, 128), (0, 128))), ("t5", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("b", ((0, 128), (128, 256))), ("t6", ((0, 128), (0, 128)))), True),
+            Statement(NC_MATMUL_OP, (("t5", ()), ("t6", ()), ("t7", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("a", ((128, 256), (0, 128))), ("t8", ((0, 128), (0, 128)))), True),
+            Statement(LOAD_OP, (("b", ((128, 256), (128, 256))), ("t9", ((0, 128), (0, 128)))), True),
+            Statement(NC_MATMUL_OP, (("t8", ()), ("t9", ()), ("t7", ((0, 128), (0, 128)))), False),
+            Statement(STORE_OP, (("t2", ((0, 128), (0, 128))), ("output", ((0, 128), (0, 128)))), True),
+            Statement(STORE_OP, (("t7", ((0, 128), (0, 128))), ("output", ((0, 128), (128, 256)))), True),
         )
         program = Program("accum_fn", ("a", "b"), stmts, "output", "def accum_fn(a, b):")
         transform = OperandMergeTransform()
@@ -978,7 +982,7 @@ class TestThreeWayMergeChain:
             "    return output\n"
         )
 
-        original_func = exec_source_to_func(source, "three_load")
+        original_func = source_to_callable(source, "three_load")
         program = callable_to_ir(original_func)
         transform = OperandMergeTransform()
 
@@ -993,7 +997,7 @@ class TestThreeWayMergeChain:
         assert iteration_count >= 2
 
         func = ir_to_callable(program)
-        source_final = get_source(func)
+        source_final = callable_to_source(func)
         assert source_final.count("nc_matmul") == 1
 
         a = make_random_array((128, 128), seed=42)

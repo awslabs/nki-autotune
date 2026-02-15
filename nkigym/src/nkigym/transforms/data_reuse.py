@@ -81,11 +81,11 @@ class DataReuseTransform(Transform):
         stmts = program.stmts
 
         load_groups: dict[tuple, list[str]] = {}
-        for op, operands in stmts:
-            if not isinstance(op, LoadOp):
+        for stmt in stmts:
+            if not isinstance(stmt.op, LoadOp):
                 continue
-            src_var, src_slices = operands[0]
-            dst_var, _ = operands[1]
+            src_var, src_slices = stmt.operands[0]
+            dst_var, _ = stmt.operands[1]
             key = (src_var, src_slices)
             load_groups.setdefault(key, []).append(dst_var)
 
@@ -118,10 +118,10 @@ class DataReuseTransform(Transform):
         name, params, stmts, return_var, preamble = program
 
         load_sources: dict[str, tuple] = {}
-        for op, operands in stmts:
-            if isinstance(op, LoadOp):
-                dst_var = operands[1][0]
-                src_key = (operands[0][0], operands[0][1])
+        for stmt in stmts:
+            if isinstance(stmt.op, LoadOp):
+                dst_var = stmt.operands[1][0]
+                src_key = (stmt.operands[0][0], stmt.operands[0][1])
                 load_sources[dst_var] = src_key
 
         for tensor_name in (keep, drop):
@@ -133,9 +133,9 @@ class DataReuseTransform(Transform):
 
         rename_map = {drop: keep}
         new_stmts: list[Statement] = []
-        for op, operands in stmts:
-            if isinstance(op, LoadOp) and operands[1][0] == drop:
+        for stmt in stmts:
+            if isinstance(stmt.op, LoadOp) and stmt.operands[1][0] == drop:
                 continue
-            new_stmts.append((op, _rename_operands(operands, rename_map)))
+            new_stmts.append(Statement(stmt.op, _rename_operands(stmt.operands, rename_map), stmt.first_write))
 
         return Program(name, params, tuple(new_stmts), return_var, preamble)

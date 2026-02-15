@@ -19,7 +19,7 @@ Example::
 from dataclasses import dataclass
 
 from nkigym.ir import Operand, Program, Statement
-from nkigym.ops import AllocOp, ElementwiseOp, LoadOp, NKIOp, StoreOp
+from nkigym.ops import AllocOp, LoadOp, NKIOp, StoreOp
 from nkigym.transforms.base import Transform
 
 
@@ -115,9 +115,9 @@ class OperandMergeTransform(Transform):
         Returns:
             The source slices from the load, or None if not a load variable.
         """
-        for op, operands in stmts:
-            if isinstance(op, LoadOp) and operands[1][0] == var_name:
-                return operands[0][1]
+        for stmt in stmts:
+            if isinstance(stmt.op, LoadOp) and stmt.operands[1][0] == var_name:
+                return stmt.operands[0][1]
         return None
 
     @staticmethod
@@ -131,8 +131,8 @@ class OperandMergeTransform(Transform):
         Returns:
             Statement index or None.
         """
-        for i, (op, operands) in enumerate(stmts):
-            if isinstance(op, LoadOp) and operands[1][0] == var_name:
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt.op, LoadOp) and stmt.operands[1][0] == var_name:
                 return i
         return None
 
@@ -147,8 +147,8 @@ class OperandMergeTransform(Transform):
         Returns:
             Statement index or None.
         """
-        for i, (op, operands) in enumerate(stmts):
-            if isinstance(op, StoreOp) and operands[0][0] == var_name:
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt.op, StoreOp) and stmt.operands[0][0] == var_name:
                 return i
         return None
 
@@ -163,9 +163,9 @@ class OperandMergeTransform(Transform):
         Returns:
             Tuple of (index, operands) or None.
         """
-        for i, (op, operands) in enumerate(stmts):
-            if isinstance(op, StoreOp) and operands[0][0] == var_name:
-                return (i, operands)
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt.op, StoreOp) and stmt.operands[0][0] == var_name:
+                return (i, stmt.operands)
         return None
 
     @staticmethod
@@ -180,8 +180,8 @@ class OperandMergeTransform(Transform):
             that reference it (including the statement that defines it).
         """
         usage: dict[str, set[int]] = {}
-        for i, (op, operands) in enumerate(stmts):
-            for var, _ in operands:
+        for i, stmt in enumerate(stmts):
+            for var, _ in stmt.operands:
                 usage.setdefault(var, set()).add(i)
         return {var: sorted(indices) for var, indices in usage.items()}
 
@@ -241,9 +241,9 @@ class OperandMergeTransform(Transform):
             return (var, slices)
         load_slices = OperandMergeTransform._resolve_load_slices(var, stmts)
         if load_slices is not None:
-            for op, operands in stmts:
-                if isinstance(op, LoadOp) and operands[1][0] == var:
-                    return ("load", operands[0][0], operands[0][1])
+            for stmt in stmts:
+                if isinstance(stmt.op, LoadOp) and stmt.operands[1][0] == var:
+                    return ("load", stmt.operands[0][0], stmt.operands[0][1])
         return (var,)
 
     @staticmethod
@@ -259,10 +259,10 @@ class OperandMergeTransform(Transform):
             True if the variable is accumulated via a later compute stmt.
         """
         seen_first = False
-        for op, operands in stmts:
-            if isinstance(op, (LoadOp, StoreOp, AllocOp)):
+        for stmt in stmts:
+            if isinstance(stmt.op, (LoadOp, StoreOp, AllocOp)):
                 continue
-            dst_var = operands[-1][0]
+            dst_var = stmt.operands[-1][0]
             if dst_var == var_name:
                 if seen_first:
                     return True
@@ -362,9 +362,9 @@ class OperandMergeTransform(Transform):
         opportunities: list[MergeOpportunity] = []
 
         compute_vars: set[str] = set()
-        for op, operands in stmts:
-            if not isinstance(op, (LoadOp, StoreOp, AllocOp)):
-                compute_vars.add(operands[-1][0])
+        for stmt in stmts:
+            if not isinstance(stmt.op, (LoadOp, StoreOp, AllocOp)):
+                compute_vars.add(stmt.operands[-1][0])
 
         opportunities.extend(OperandMergeTransform._find_load_merge_opportunities(stmts, var_usage))
         opportunities.extend(OperandMergeTransform._find_compute_merge_opportunities(stmts, var_usage, compute_vars))
@@ -385,9 +385,9 @@ class OperandMergeTransform(Transform):
             List of MergeOpportunity for loads.
         """
         loads: list[tuple[int, tuple[Operand, ...]]] = []
-        for i, (op, operands) in enumerate(stmts):
-            if isinstance(op, LoadOp):
-                loads.append((i, operands))
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt.op, LoadOp):
+                loads.append((i, stmt.operands))
 
         if len(loads) < 2:
             return []
@@ -471,10 +471,10 @@ class OperandMergeTransform(Transform):
             List of MergeOpportunity for compute ops.
         """
         compute_stmts: list[tuple[int, NKIOp, tuple[Operand, ...]]] = []
-        for i, (op, operands) in enumerate(stmts):
-            if isinstance(op, (LoadOp, StoreOp, AllocOp)):
+        for i, stmt in enumerate(stmts):
+            if isinstance(stmt.op, (LoadOp, StoreOp, AllocOp)):
                 continue
-            compute_stmts.append((i, op, operands))
+            compute_stmts.append((i, stmt.op, stmt.operands))
 
         if len(compute_stmts) < 2:
             return []
@@ -531,9 +531,8 @@ class OperandMergeTransform(Transform):
         idx_a, op_a, operands_a = entry_a
         idx_b, op_b, operands_b = entry_b
 
-        if isinstance(op_a, ElementwiseOp) or isinstance(op_b, ElementwiseOp):
-            if op_a != op_b:
-                return None
+        if op_a != op_b:
+            return None
 
         input_ops_a = operands_a[:-1]
         input_ops_b = operands_b[:-1]
@@ -628,8 +627,10 @@ class OperandMergeTransform(Transform):
         """
         name, params, stmts, return_var, preamble = program
 
-        stmt_a_op, stmt_a_operands = stmts[option.stmt_a]
-        stmt_b_op, stmt_b_operands = stmts[option.stmt_b]
+        stmt_a = stmts[option.stmt_a]
+        stmt_b = stmts[option.stmt_b]
+        stmt_a_operands = stmt_a.operands
+        stmt_b_operands = stmt_b.operands
 
         to_remove: set[int] = {option.stmt_b}
         renames: dict[str, str] = {}
@@ -654,32 +655,55 @@ class OperandMergeTransform(Transform):
 
         widen_load_idx: int | None = None
         widen_load_dim: int | None = None
+        widen_load_merged: tuple[int, int] | None = None
         arg_a = stmt_a_operands[diff_idx]
         if not arg_a[1]:
             load_a_idx = self._find_load_idx(arg_a[0], stmts)
             load_b_idx = self._find_load_idx(arg_b[0], stmts) if not arg_b[1] else None
             if load_a_idx is not None and load_b_idx is not None:
-                load_a_src = stmts[load_a_idx][1][0][1]
-                load_b_src = stmts[load_b_idx][1][0][1]
+                load_a_src = stmts[load_a_idx].operands[0][1]
+                load_b_src = stmts[load_b_idx].operands[0][1]
                 adj = self._check_adjacent_slices(load_a_src, load_b_src)
                 if adj:
                     widen_load_idx = load_a_idx
                     widen_load_dim = adj[0]
+                    widen_load_merged = adj[1]
+        else:
+            load_a_idx = self._find_load_idx(arg_a[0], stmts)
+            if load_a_idx is not None:
+                orig_a = stmt_a_operands[diff_idx][1]
+                orig_b = stmt_b_operands[diff_idx][1]
+                load_src = stmts[load_a_idx].operands[0][1]
+                load_dst = stmts[load_a_idx].operands[1][1]
+                for d in range(len(orig_a)):
+                    if orig_a[d] != orig_b[d]:
+                        merged_width = option.merged_slice[1] - option.merged_slice[0]
+                        dst_width = load_dst[d][1] - load_dst[d][0]
+                        if merged_width > dst_width:
+                            widen_load_idx = load_a_idx
+                            widen_load_dim = d
+                            src_start = load_src[d][0]
+                            widen_load_merged = (src_start + option.merged_slice[0], src_start + option.merged_slice[1])
+                        break
 
         store_a_info = self._get_store_for_var(var_a, stmts)
         store_b_info = self._get_store_for_var(var_b, stmts)
 
         new_stmts: list[Statement] = []
-        for i, (op, operands) in enumerate(stmts):
+        for i, stmt in enumerate(stmts):
             if i in to_remove:
                 continue
+
+            op = stmt.op
+            operands = stmt.operands
+            first_write = stmt.first_write
 
             if i == option.stmt_a:
                 operands = self._widen_compute_stmt(operands, option, stmts)
 
             if widen_load_idx is not None and i == widen_load_idx and widen_load_dim is not None:
                 src_var, src_slices = operands[0]
-                new_src_slices = self._widen_slice(src_slices, widen_load_dim, option.merged_slice)
+                new_src_slices = self._widen_slice(src_slices, widen_load_dim, widen_load_merged)
                 dst_var, dst_slices = operands[1]
                 new_dst_shape = tuple(stop - start for start, stop in new_src_slices)
                 new_dst_slices = tuple((0, s) for s in new_dst_shape)
@@ -691,7 +715,7 @@ class OperandMergeTransform(Transform):
             if renames:
                 operands = tuple((renames.get(var, var), slices) for var, slices in operands)
 
-            new_stmts.append((op, operands))
+            new_stmts.append(Statement(op, operands, first_write))
 
         return Program(name, params, tuple(new_stmts), return_var, preamble)
 
@@ -717,8 +741,10 @@ class OperandMergeTransform(Transform):
         Returns:
             New program tuple.
         """
-        stmt_a_op, stmt_a_operands = stmts[option.stmt_a]
-        stmt_b_op, stmt_b_operands = stmts[option.stmt_b]
+        stmt_a = stmts[option.stmt_a]
+        stmt_b = stmts[option.stmt_b]
+        stmt_a_operands = stmt_a.operands
+        stmt_b_operands = stmt_b.operands
 
         merge_dim = option.differing_operand_idx
         merged_start = option.merged_slice[0]
@@ -735,10 +761,11 @@ class OperandMergeTransform(Transform):
         to_remove = {option.stmt_b}
 
         new_stmts: list[Statement] = []
-        for i, (op, operands) in enumerate(stmts):
+        for i, stmt in enumerate(stmts):
             if i in to_remove:
                 continue
 
+            operands = stmt.operands
             if i == option.stmt_a:
                 src_var, src_slices = operands[0]
                 new_src_slices = self._widen_slice(src_slices, merge_dim, option.merged_slice)
@@ -750,7 +777,7 @@ class OperandMergeTransform(Transform):
                 operands = self._apply_subscript_map(operands, subscript_map)
 
             operands = tuple((renames.get(var, var), slices) for var, slices in operands)
-            new_stmts.append((op, operands))
+            new_stmts.append(Statement(stmt.op, operands, stmt.first_write))
 
         return Program(prog_name, params, tuple(new_stmts), return_var, preamble)
 
@@ -771,8 +798,8 @@ class OperandMergeTransform(Transform):
         var, slices = operands[diff_idx]
 
         if slices:
-            orig_a = stmts[option.stmt_a][1][diff_idx][1]
-            orig_b = stmts[option.stmt_b][1][diff_idx][1]
+            orig_a = stmts[option.stmt_a].operands[diff_idx][1]
+            orig_b = stmts[option.stmt_b].operands[diff_idx][1]
             for d in range(len(orig_a)):
                 if orig_a[d] != orig_b[d]:
                     new_slices = self._widen_slice(slices, d, option.merged_slice)

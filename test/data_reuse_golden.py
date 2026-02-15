@@ -1,22 +1,11 @@
-"""Golden values for data reuse analysis tests.
+"""Golden values for data reuse tests.
 
-This module defines pre-tiled fixture functions and their expected reuse groups.
-Tests pass these functions directly to analyze_data_reuse, which parses their
-source code to identify tensor slices that access identical data.
-
-Naming convention for fixture functions:
-- tiled_matmul_{M}x{N}: Single matmul with MxN tile grid
-- tiled_double_matmul_{M}x{N}: Double matmul with MxN tile grid
-
-Reuse patterns for matmul C[m,n] = A[m,k] @ B[k,n]:
-- A varies with M tiles (row dimension)
-- B varies with N tiles (column dimension)
-- When M > 1, N = 1: B is shared across all subgraphs
-- When M = 1, N > 1: A is shared across all subgraphs
-- When M > 1, N > 1: Both A and B have partial sharing
+Defines pre-tiled fixture functions, expected merge sources, and unified
+test cases for the data reuse analysis and transform pipeline.
 """
 
 from collections.abc import Callable
+from typing import NamedTuple
 
 import numpy as np
 
@@ -91,72 +80,6 @@ def tiled_matmul_4x1(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return output
 
 
-def tiled_matmul_1x4(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """4 subgraphs (4 N tiles) - A is fully shared by all 4."""
-    output = nkigym.ndarray((128, 512), dtype=np.float32)
-    a_sg0 = a[0:128, 0:128]
-    b_sg0 = b[0:128, 0:128]
-    output[0:128, 0:128] = nkigym.nc_matmul(a_sg0, b_sg0)
-    a_sg1 = a[0:128, 0:128]
-    b_sg1 = b[0:128, 128:256]
-    output[0:128, 128:256] = nkigym.nc_matmul(a_sg1, b_sg1)
-    a_sg2 = a[0:128, 0:128]
-    b_sg2 = b[0:128, 256:384]
-    output[0:128, 256:384] = nkigym.nc_matmul(a_sg2, b_sg2)
-    a_sg3 = a[0:128, 0:128]
-    b_sg3 = b[0:128, 384:512]
-    output[0:128, 384:512] = nkigym.nc_matmul(a_sg3, b_sg3)
-    return output
-
-
-def tiled_matmul_3x3(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """9 subgraphs (3x3 grid) - both A and B have partial sharing across rows/columns.
-
-    A shape: (384, 128) = 3 tiles in M dimension
-    B shape: (128, 384) = 3 tiles in N dimension
-    Output shape: (384, 384)
-
-    Reuse patterns:
-    - A tensors: 3 groups of 3 (same row shares A)
-      - (a_sg0, a_sg1, a_sg2) - row 0
-      - (a_sg3, a_sg4, a_sg5) - row 1
-      - (a_sg6, a_sg7, a_sg8) - row 2
-    - B tensors: 3 groups of 3 (same column shares B)
-      - (b_sg0, b_sg3, b_sg6) - column 0
-      - (b_sg1, b_sg4, b_sg7) - column 1
-      - (b_sg2, b_sg5, b_sg8) - column 2
-    """
-    output = nkigym.ndarray((384, 384), dtype=np.float32)
-    a_sg0 = a[0:128, 0:128]
-    b_sg0 = b[0:128, 0:128]
-    output[0:128, 0:128] = nkigym.nc_matmul(a_sg0, b_sg0)
-    a_sg1 = a[0:128, 0:128]
-    b_sg1 = b[0:128, 128:256]
-    output[0:128, 128:256] = nkigym.nc_matmul(a_sg1, b_sg1)
-    a_sg2 = a[0:128, 0:128]
-    b_sg2 = b[0:128, 256:384]
-    output[0:128, 256:384] = nkigym.nc_matmul(a_sg2, b_sg2)
-    a_sg3 = a[128:256, 0:128]
-    b_sg3 = b[0:128, 0:128]
-    output[128:256, 0:128] = nkigym.nc_matmul(a_sg3, b_sg3)
-    a_sg4 = a[128:256, 0:128]
-    b_sg4 = b[0:128, 128:256]
-    output[128:256, 128:256] = nkigym.nc_matmul(a_sg4, b_sg4)
-    a_sg5 = a[128:256, 0:128]
-    b_sg5 = b[0:128, 256:384]
-    output[128:256, 256:384] = nkigym.nc_matmul(a_sg5, b_sg5)
-    a_sg6 = a[256:384, 0:128]
-    b_sg6 = b[0:128, 0:128]
-    output[256:384, 0:128] = nkigym.nc_matmul(a_sg6, b_sg6)
-    a_sg7 = a[256:384, 0:128]
-    b_sg7 = b[0:128, 128:256]
-    output[256:384, 128:256] = nkigym.nc_matmul(a_sg7, b_sg7)
-    a_sg8 = a[256:384, 0:128]
-    b_sg8 = b[0:128, 256:384]
-    output[256:384, 256:384] = nkigym.nc_matmul(a_sg8, b_sg8)
-    return output
-
-
 def tiled_double_matmul_1x1(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     """Double matmul, single subgraph - no reuse."""
     a_sg0 = a[0:128, 0:128]
@@ -181,90 +104,6 @@ def tiled_double_matmul_2x1(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.n
     c_sg1 = c[0:128, 0:128]
     output[128:256, 0:128] = nkigym.nc_matmul(temp_sg1, c_sg1)
     return output
-
-
-def tiled_double_matmul_2x2(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
-    """Double matmul, 4 subgraphs - B is fully shared, A and C have partial sharing."""
-    output = nkigym.ndarray((256, 256), dtype=np.float32)
-    a_sg0 = a[0:128, 0:128]
-    b_sg0 = b[0:128, 0:128]
-    temp_sg0 = nkigym.nc_matmul(a_sg0, b_sg0)
-    c_sg0 = c[0:128, 0:128]
-    output[0:128, 0:128] = nkigym.nc_matmul(temp_sg0, c_sg0)
-    a_sg1 = a[0:128, 0:128]
-    b_sg1 = b[0:128, 0:128]
-    temp_sg1 = nkigym.nc_matmul(a_sg1, b_sg1)
-    c_sg1 = c[0:128, 128:256]
-    output[0:128, 128:256] = nkigym.nc_matmul(temp_sg1, c_sg1)
-    a_sg2 = a[128:256, 0:128]
-    b_sg2 = b[0:128, 0:128]
-    temp_sg2 = nkigym.nc_matmul(a_sg2, b_sg2)
-    c_sg2 = c[0:128, 0:128]
-    output[128:256, 0:128] = nkigym.nc_matmul(temp_sg2, c_sg2)
-    a_sg3 = a[128:256, 0:128]
-    b_sg3 = b[0:128, 0:128]
-    temp_sg3 = nkigym.nc_matmul(a_sg3, b_sg3)
-    c_sg3 = c[0:128, 128:256]
-    output[128:256, 128:256] = nkigym.nc_matmul(temp_sg3, c_sg3)
-    return output
-
-
-EXPECTED_REUSE: dict[Callable, list[tuple[str, str]]] = {
-    tiled_matmul_1x1: [],
-    tiled_matmul_2x1: [("b_sg0", "b_sg1")],
-    tiled_matmul_1x2: [("a_sg0", "a_sg1")],
-    tiled_matmul_2x2: [("a_sg0", "a_sg1"), ("a_sg2", "a_sg3"), ("b_sg0", "b_sg2"), ("b_sg1", "b_sg3")],
-    tiled_matmul_4x1: [
-        ("b_sg0", "b_sg1"),
-        ("b_sg0", "b_sg2"),
-        ("b_sg0", "b_sg3"),
-        ("b_sg1", "b_sg2"),
-        ("b_sg1", "b_sg3"),
-        ("b_sg2", "b_sg3"),
-    ],
-    tiled_matmul_1x4: [
-        ("a_sg0", "a_sg1"),
-        ("a_sg0", "a_sg2"),
-        ("a_sg0", "a_sg3"),
-        ("a_sg1", "a_sg2"),
-        ("a_sg1", "a_sg3"),
-        ("a_sg2", "a_sg3"),
-    ],
-    tiled_matmul_3x3: [
-        ("a_sg0", "a_sg1"),
-        ("a_sg0", "a_sg2"),
-        ("a_sg1", "a_sg2"),
-        ("a_sg3", "a_sg4"),
-        ("a_sg3", "a_sg5"),
-        ("a_sg4", "a_sg5"),
-        ("a_sg6", "a_sg7"),
-        ("a_sg6", "a_sg8"),
-        ("a_sg7", "a_sg8"),
-        ("b_sg0", "b_sg3"),
-        ("b_sg0", "b_sg6"),
-        ("b_sg3", "b_sg6"),
-        ("b_sg1", "b_sg4"),
-        ("b_sg1", "b_sg7"),
-        ("b_sg4", "b_sg7"),
-        ("b_sg2", "b_sg5"),
-        ("b_sg2", "b_sg8"),
-        ("b_sg5", "b_sg8"),
-    ],
-    tiled_double_matmul_1x1: [],
-    tiled_double_matmul_2x1: [("b_sg0", "b_sg1"), ("c_sg0", "c_sg1")],
-    tiled_double_matmul_2x2: [
-        ("a_sg0", "a_sg1"),
-        ("a_sg2", "a_sg3"),
-        ("b_sg0", "b_sg1"),
-        ("b_sg0", "b_sg2"),
-        ("b_sg0", "b_sg3"),
-        ("b_sg1", "b_sg2"),
-        ("b_sg1", "b_sg3"),
-        ("b_sg2", "b_sg3"),
-        ("c_sg0", "c_sg2"),
-        ("c_sg1", "c_sg3"),
-    ],
-}
 
 
 MERGED_MATMUL_2X1_B = """\
@@ -426,20 +265,128 @@ def tiled_matmul_2x2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return output
 """
 
-EXPECTED_MERGE_TRANSFORMS: dict[tuple[Callable, str, str], str] = {
-    (tiled_matmul_2x1, "b_sg0", "b_sg1"): MERGED_MATMUL_2X1_B,
-    (tiled_matmul_1x2, "a_sg0", "a_sg1"): MERGED_MATMUL_1X2_A,
-    (tiled_matmul_2x2, "a_sg0", "a_sg1"): MERGED_MATMUL_2X2_A01,
-    (tiled_matmul_2x2, "b_sg0", "b_sg2"): MERGED_MATMUL_2X2_B02,
-    (tiled_matmul_4x1, "b_sg0", "b_sg1"): MERGED_MATMUL_4X1_B,
-    (tiled_double_matmul_2x1, "b_sg0", "b_sg1"): MERGED_DOUBLE_MATMUL_2X1_B,
-    (tiled_double_matmul_2x1, "c_sg0", "c_sg1"): MERGED_DOUBLE_MATMUL_2X1_C,
-}
+
+class DataReuseCase(NamedTuple):
+    """A single data reuse test case.
+
+    Attributes:
+        id: Test case identifier for pytest parametrize.
+        func: Pre-tiled starting function.
+        expected_pairs: Expected reuse pairs from analysis.
+        merges: Ordered sequence of (tensor_a, tensor_b) merges to apply.
+        expected_source: Expected source after all merges, or None if no merges.
+        input_shapes: Input array shapes in parameter order for numerical check.
+    """
+
+    id: str
+    func: Callable
+    expected_pairs: list[tuple[str, str]]
+    merges: list[tuple[str, str]]
+    expected_source: str | None
+    input_shapes: list[tuple[int, ...]]
 
 
-MERGE_ERROR_CASES: list[tuple[Callable, str, str, type, str]] = [
-    (tiled_matmul_2x1, "nonexistent_sg0", "b_sg1", ValueError, "not found"),
-    (tiled_matmul_2x1, "b_sg0", "nonexistent_sg1", ValueError, "not found"),
-    (tiled_matmul_2x1, "a_sg0", "a_sg1", ValueError, "not share identical slices"),
-    (tiled_matmul_2x1, "b_sg0", "b_sg0", ValueError, "Cannot merge .* with itself"),
+CASES: list[DataReuseCase] = [
+    DataReuseCase(
+        id="matmul_1x1_no_reuse",
+        func=tiled_matmul_1x1,
+        expected_pairs=[],
+        merges=[],
+        expected_source=None,
+        input_shapes=[(128, 128), (128, 128)],
+    ),
+    DataReuseCase(
+        id="double_matmul_1x1_no_reuse",
+        func=tiled_double_matmul_1x1,
+        expected_pairs=[],
+        merges=[],
+        expected_source=None,
+        input_shapes=[(128, 128), (128, 128), (128, 128)],
+    ),
+    DataReuseCase(
+        id="matmul_2x1_merge_b",
+        func=tiled_matmul_2x1,
+        expected_pairs=[("b_sg0", "b_sg1")],
+        merges=[("b_sg0", "b_sg1")],
+        expected_source=MERGED_MATMUL_2X1_B,
+        input_shapes=[(256, 128), (128, 128)],
+    ),
+    DataReuseCase(
+        id="matmul_1x2_merge_a",
+        func=tiled_matmul_1x2,
+        expected_pairs=[("a_sg0", "a_sg1")],
+        merges=[("a_sg0", "a_sg1")],
+        expected_source=MERGED_MATMUL_1X2_A,
+        input_shapes=[(128, 128), (128, 256)],
+    ),
+    DataReuseCase(
+        id="matmul_2x2_merge_a01",
+        func=tiled_matmul_2x2,
+        expected_pairs=[("a_sg0", "a_sg1"), ("a_sg2", "a_sg3"), ("b_sg0", "b_sg2"), ("b_sg1", "b_sg3")],
+        merges=[("a_sg0", "a_sg1")],
+        expected_source=MERGED_MATMUL_2X2_A01,
+        input_shapes=[(256, 128), (128, 256)],
+    ),
+    DataReuseCase(
+        id="matmul_2x2_merge_b02",
+        func=tiled_matmul_2x2,
+        expected_pairs=[("a_sg0", "a_sg1"), ("a_sg2", "a_sg3"), ("b_sg0", "b_sg2"), ("b_sg1", "b_sg3")],
+        merges=[("b_sg0", "b_sg2")],
+        expected_source=MERGED_MATMUL_2X2_B02,
+        input_shapes=[(256, 128), (128, 256)],
+    ),
+    DataReuseCase(
+        id="matmul_4x1_merge_b01",
+        func=tiled_matmul_4x1,
+        expected_pairs=[
+            ("b_sg0", "b_sg1"),
+            ("b_sg0", "b_sg2"),
+            ("b_sg0", "b_sg3"),
+            ("b_sg1", "b_sg2"),
+            ("b_sg1", "b_sg3"),
+            ("b_sg2", "b_sg3"),
+        ],
+        merges=[("b_sg0", "b_sg1")],
+        expected_source=MERGED_MATMUL_4X1_B,
+        input_shapes=[(512, 128), (128, 128)],
+    ),
+    DataReuseCase(
+        id="double_matmul_2x1_merge_b",
+        func=tiled_double_matmul_2x1,
+        expected_pairs=[("b_sg0", "b_sg1"), ("c_sg0", "c_sg1")],
+        merges=[("b_sg0", "b_sg1")],
+        expected_source=MERGED_DOUBLE_MATMUL_2X1_B,
+        input_shapes=[(256, 128), (128, 128), (128, 128)],
+    ),
+    DataReuseCase(
+        id="double_matmul_2x1_merge_c",
+        func=tiled_double_matmul_2x1,
+        expected_pairs=[("b_sg0", "b_sg1"), ("c_sg0", "c_sg1")],
+        merges=[("c_sg0", "c_sg1")],
+        expected_source=MERGED_DOUBLE_MATMUL_2X1_C,
+        input_shapes=[(256, 128), (128, 128), (128, 128)],
+    ),
+    DataReuseCase(
+        id="matmul_4x1_merge_all_b",
+        func=tiled_matmul_4x1,
+        expected_pairs=[
+            ("b_sg0", "b_sg1"),
+            ("b_sg0", "b_sg2"),
+            ("b_sg0", "b_sg3"),
+            ("b_sg1", "b_sg2"),
+            ("b_sg1", "b_sg3"),
+            ("b_sg2", "b_sg3"),
+        ],
+        merges=[("b_sg0", "b_sg1"), ("b_sg0", "b_sg2"), ("b_sg0", "b_sg3")],
+        expected_source=MERGED_MATMUL_4X1_ALL_B,
+        input_shapes=[(512, 128), (128, 128)],
+    ),
+    DataReuseCase(
+        id="matmul_2x2_merge_all_groups",
+        func=tiled_matmul_2x2,
+        expected_pairs=[("a_sg0", "a_sg1"), ("a_sg2", "a_sg3"), ("b_sg0", "b_sg2"), ("b_sg1", "b_sg3")],
+        merges=[("a_sg0", "a_sg1"), ("a_sg2", "a_sg3"), ("b_sg0", "b_sg2"), ("b_sg1", "b_sg3")],
+        expected_source=MERGED_MATMUL_2X2_ALL_GROUPS,
+        input_shapes=[(256, 128), (128, 256)],
+    ),
 ]

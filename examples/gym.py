@@ -1,34 +1,49 @@
-"""NKI Gym tiling, search-based codegen, and hardware profiling demo.
+"""NKI Gym walkthrough: golden NumPy, nkigym simulation, tiling, and codegen.
 
-Demonstrates the full pipeline on a tiled matmul:
-
-1. Generate a tiled function from a high-level NKI op.
-2. Use graph-based search to explore the transform space and
-   generate up to 50 unique kernel variants via data reuse and
-   operand merge transforms.
-3. Lower every nkigym variant to an NKI kernel and write to cache.
-4. Compile and benchmark all NKI kernels on Neuron hardware via
-   the autotune ProfileJobs / Benchmark backend.
+Demonstrates:
+1. Numerical equivalence between pure NumPy and nkigym GymOp simulation.
+2. Converting a nkigym function to the GymProgram IR.
+3. Calling the GymProgram directly as a numpy simulator.
+4. Tiling a GymProgram into 128x128 tiles with reduction accumulation.
+5. Rendering a tiled GymProgram as Python source code.
+6. Simulating the tiled program and verifying numerical correctness.
 """
 
+import argparse
+import logging
 from pathlib import Path
 
 import numpy as np
 
 import nkigym
-from autotune import Benchmark, ProfileJobs
-from autotune.compiler.compile import get_kernel_by_name
-from nkigym.codegen import lower_ir_to_nki
-from nkigym.search import search
-from nkigym.transforms import DataReuseTransform, OperandMergeTransform
+from nkigym.ir import func_to_program, program_to_func
+from nkigym.tiling import tile_program
+from nkigym.utils import setup_logging
+
+logger = logging.getLogger(__name__)
 
 
-def matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Perform NKI matrix multiplication.
+def golden_matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Pure NumPy matrix multiplication (golden reference).
+
+    Neuron matmul convention: lhs is [K, M], rhs is [K, N], output is [M, N].
 
     Args:
-        lhs: Left-hand side tensor of shape [K, M] (partition x free).
-        rhs: Right-hand side tensor of shape [K, N] (partition x free).
+        lhs: Left-hand side tensor of shape [K, M].
+        rhs: Right-hand side tensor of shape [K, N].
+
+    Returns:
+        Output tensor of shape [M, N].
+    """
+    return lhs.T @ rhs
+
+
+def nkigym_matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """NKI Gym matrix multiplication (NumPy simulation mode).
+
+    Args:
+        lhs: Left-hand side tensor of shape [K, M].
+        rhs: Right-hand side tensor of shape [K, N].
 
     Returns:
         Output tensor of shape [M, N].
@@ -36,43 +51,40 @@ def matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     return nkigym.nc_matmul(lhs, rhs)
 
 
-def main() -> None:
-    """Run tiling, search-based transform exploration, codegen, and hardware profiling."""
-    CACHE_ROOT = "/fsx/weittang/gym_cache/matmul"
-    cache_path = Path(CACHE_ROOT)
-    k, m, n = 1024, 1024, 1024
-    lhs = np.random.randn(k, m)
-    rhs = np.random.randn(k, n)
-    kernel_kwargs = {"lhs": lhs, "rhs": rhs}
-
-    variants = search(
-        matmul,
-        transforms=[DataReuseTransform(), OperandMergeTransform()],
-        num_targets=50,
-        seed=42,
-        min_depth=1,
-        save_cache=cache_path,
-        kernel_kwargs=kernel_kwargs,
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="NKI Gym walkthrough example")
+    parser.add_argument(
+        "--cache-dir", type=Path, default=Path("cache"), help="Directory for storing output logs (default: cache)"
     )
+    return parser.parse_args()
 
-    nki_func_name = "nki_matmul"
-    jobs = ProfileJobs(cache_root_dir=CACHE_ROOT)
 
-    for step, variant in enumerate(variants):
-        nki_source = lower_ir_to_nki(variant)
-        nki_path = str(cache_path / f"nki_matmul_{step}.py")
-        Path(nki_path).write_text(nki_source)
-        kernel = get_kernel_by_name((nki_path, nki_func_name))
-        jobs.add_job(
-            kernel=kernel,
-            kernel_kwargs={"lhs": lhs.astype(np.float16), "rhs": rhs.astype(np.float16)},
-            output_shapes={"result": (m, n)},
-            compiler_flags="",
-            correctness_check=(matmul, 1e-3, 1e-3),
-        )
+def main() -> None:
+    """Run the full NKI Gym pipeline: parse, simulate, tile, codegen."""
+    args = parse_args()
+    cache_dir = args.cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    log_path = cache_dir / "gym.log"
+    setup_logging(str(log_path))
 
-    results = Benchmark(jobs, warmup=10, iters=100).run()
-    results.summary(top_k=len(variants))
+    k, m, n = 256, 256, 256
+    rng = np.random.default_rng(42)
+    lhs = rng.standard_normal((k, m)).astype(np.float64)
+    rhs = rng.standard_normal((k, n)).astype(np.float64)
+    atol = 1e-10
+    rtol = 1e-10
+
+    golden = golden_matmul(lhs, rhs)
+    np.testing.assert_allclose(golden, nkigym_matmul(lhs, rhs), rtol=rtol, atol=atol)
+
+    program = func_to_program(nkigym_matmul, {"lhs": (k, m), "rhs": (k, n)}, np.float64)
+    logger.info(program)
+    np.testing.assert_allclose(golden, program_to_func(program)(lhs, rhs), rtol=rtol, atol=atol)
+
+    tiled = tile_program(program)
+    logger.info(tiled)
+    np.testing.assert_allclose(golden, program_to_func(tiled)(lhs, rhs), rtol=rtol, atol=atol)
 
 
 if __name__ == "__main__":

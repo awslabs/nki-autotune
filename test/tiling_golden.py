@@ -1,510 +1,31 @@
-"""Golden values for dimension analysis tests.
+"""Golden source strings for tiling tests.
 
-This module contains expected DimensionAnalysis results and generated source code
-strings for various matmul configurations. Used by test_tiling.py for validation.
+This module contains expected generated source code strings for various matmul
+configurations. Used by test_tiling.py for validation.
+
+Each golden string is a standalone variable named SINGLE_<a_shape>_<b_shape> or
+DOUBLE_<a_shape>_<b_shape>_<c_shape>. The lookup dicts at the bottom map shape
+tuples to these variables.
 """
 
-from nkigym.tiling import DimensionAnalysis, DimInfo, TensorSliceInfo
-
-EXPECTED_SINGLE_MATMUL = {
-    ((128, 128), (128, 128)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 128, "reduction"),
-            "d1": DimInfo("d1", 128, "parallel"),
-            "d2": DimInfo("d2", 128, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (128, 128), "b": (128, 128), "output": (128, 128)},
-        tile_counts={"d1": 1, "d2": 1},
-        num_subgraphs=1,
-        slice_params={
-            "a": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-            "b": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-            "output": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-        },
-        output="output",
-        reduction_tile_counts={"d0": 1},
-    ),
-    ((128, 256), (128, 128)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 128, "reduction"),
-            "d1": DimInfo("d1", 256, "parallel"),
-            "d2": DimInfo("d2", 128, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (128, 256), "b": (128, 128), "output": (256, 128)},
-        tile_counts={"d1": 2, "d2": 1},
-        num_subgraphs=2,
-        slice_params={
-            "a": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1]), 1: TensorSliceInfo([0, 128], [128, 128], [1, 1])},
-            "b": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1]), 1: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-            "output": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([128, 0], [128, 128], [1, 1]),
-            },
-        },
-        output="output",
-        reduction_tile_counts={"d0": 1},
-    ),
-    ((128, 256), (128, 256)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 128, "reduction"),
-            "d1": DimInfo("d1", 256, "parallel"),
-            "d2": DimInfo("d2", 256, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (128, 256), "b": (128, 256), "output": (256, 256)},
-        tile_counts={"d1": 2, "d2": 2},
-        num_subgraphs=4,
-        slice_params={
-            "a": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                2: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                3: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-            },
-            "b": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                2: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                3: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-            },
-            "output": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                2: TensorSliceInfo([128, 0], [128, 128], [1, 1]),
-                3: TensorSliceInfo([128, 128], [128, 128], [1, 1]),
-            },
-        },
-        output="output",
-        reduction_tile_counts={"d0": 1},
-    ),
-    ((256, 128), (256, 128)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 256, "reduction"),
-            "d1": DimInfo("d1", 128, "parallel"),
-            "d2": DimInfo("d2", 128, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (256, 128), "b": (256, 128), "output": (128, 128)},
-        tile_counts={"d1": 1, "d2": 1},
-        num_subgraphs=1,
-        slice_params={
-            "a": {0: TensorSliceInfo([0, 0], [256, 128], [1, 1])},
-            "b": {0: TensorSliceInfo([0, 0], [256, 128], [1, 1])},
-            "output": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-        },
-        output="output",
-        reduction_tile_counts={"d0": 2},
-    ),
-    ((128, 512), (128, 128)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 128, "reduction"),
-            "d1": DimInfo("d1", 512, "parallel"),
-            "d2": DimInfo("d2", 128, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (128, 512), "b": (128, 128), "output": (512, 128)},
-        tile_counts={"d1": 4, "d2": 1},
-        num_subgraphs=4,
-        slice_params={
-            "a": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                2: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                3: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-            },
-            "b": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                2: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                3: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-            },
-            "output": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([128, 0], [128, 128], [1, 1]),
-                2: TensorSliceInfo([256, 0], [128, 128], [1, 1]),
-                3: TensorSliceInfo([384, 0], [128, 128], [1, 1]),
-            },
-        },
-        output="output",
-        reduction_tile_counts={"d0": 1},
-    ),
-    ((256, 256), (256, 128)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 256, "reduction"),
-            "d1": DimInfo("d1", 256, "parallel"),
-            "d2": DimInfo("d2", 128, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (256, 256), "b": (256, 128), "output": (256, 128)},
-        tile_counts={"d1": 2, "d2": 1},
-        num_subgraphs=2,
-        slice_params={
-            "a": {0: TensorSliceInfo([0, 0], [256, 128], [1, 1]), 1: TensorSliceInfo([0, 128], [256, 128], [1, 1])},
-            "b": {0: TensorSliceInfo([0, 0], [256, 128], [1, 1]), 1: TensorSliceInfo([0, 0], [256, 128], [1, 1])},
-            "output": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([128, 0], [128, 128], [1, 1]),
-            },
-        },
-        output="output",
-        reduction_tile_counts={"d0": 2},
-    ),
-    ((256, 256), (256, 256)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 256, "reduction"),
-            "d1": DimInfo("d1", 256, "parallel"),
-            "d2": DimInfo("d2", 256, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (256, 256), "b": (256, 256), "output": (256, 256)},
-        tile_counts={"d1": 2, "d2": 2},
-        num_subgraphs=4,
-        slice_params={
-            "a": {
-                0: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                1: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                2: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                3: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-            },
-            "b": {
-                0: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                2: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                3: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-            },
-            "output": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                2: TensorSliceInfo([128, 0], [128, 128], [1, 1]),
-                3: TensorSliceInfo([128, 128], [128, 128], [1, 1]),
-            },
-        },
-        output="output",
-        reduction_tile_counts={"d0": 2},
-    ),
-    ((512, 128), (512, 128)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 512, "reduction"),
-            "d1": DimInfo("d1", 128, "parallel"),
-            "d2": DimInfo("d2", 128, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (512, 128), "b": (512, 128), "output": (128, 128)},
-        tile_counts={"d1": 1, "d2": 1},
-        num_subgraphs=1,
-        slice_params={
-            "a": {0: TensorSliceInfo([0, 0], [512, 128], [1, 1])},
-            "b": {0: TensorSliceInfo([0, 0], [512, 128], [1, 1])},
-            "output": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-        },
-        output="output",
-        reduction_tile_counts={"d0": 4},
-    ),
-    ((256, 512), (256, 512)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 256, "reduction"),
-            "d1": DimInfo("d1", 512, "parallel"),
-            "d2": DimInfo("d2", 512, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (256, 512), "b": (256, 512), "output": (512, 512)},
-        tile_counts={"d1": 4, "d2": 4},
-        num_subgraphs=16,
-        slice_params={
-            "a": {
-                0: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                1: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                2: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                3: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                4: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                5: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                6: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                7: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                8: TensorSliceInfo([0, 256], [256, 128], [1, 1]),
-                9: TensorSliceInfo([0, 256], [256, 128], [1, 1]),
-                10: TensorSliceInfo([0, 256], [256, 128], [1, 1]),
-                11: TensorSliceInfo([0, 256], [256, 128], [1, 1]),
-                12: TensorSliceInfo([0, 384], [256, 128], [1, 1]),
-                13: TensorSliceInfo([0, 384], [256, 128], [1, 1]),
-                14: TensorSliceInfo([0, 384], [256, 128], [1, 1]),
-                15: TensorSliceInfo([0, 384], [256, 128], [1, 1]),
-            },
-            "b": {
-                0: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                2: TensorSliceInfo([0, 256], [256, 128], [1, 1]),
-                3: TensorSliceInfo([0, 384], [256, 128], [1, 1]),
-                4: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                5: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                6: TensorSliceInfo([0, 256], [256, 128], [1, 1]),
-                7: TensorSliceInfo([0, 384], [256, 128], [1, 1]),
-                8: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                9: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                10: TensorSliceInfo([0, 256], [256, 128], [1, 1]),
-                11: TensorSliceInfo([0, 384], [256, 128], [1, 1]),
-                12: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                13: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                14: TensorSliceInfo([0, 256], [256, 128], [1, 1]),
-                15: TensorSliceInfo([0, 384], [256, 128], [1, 1]),
-            },
-            "output": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                2: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                3: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-                4: TensorSliceInfo([128, 0], [128, 128], [1, 1]),
-                5: TensorSliceInfo([128, 128], [128, 128], [1, 1]),
-                6: TensorSliceInfo([128, 256], [128, 128], [1, 1]),
-                7: TensorSliceInfo([128, 384], [128, 128], [1, 1]),
-                8: TensorSliceInfo([256, 0], [128, 128], [1, 1]),
-                9: TensorSliceInfo([256, 128], [128, 128], [1, 1]),
-                10: TensorSliceInfo([256, 256], [128, 128], [1, 1]),
-                11: TensorSliceInfo([256, 384], [128, 128], [1, 1]),
-                12: TensorSliceInfo([384, 0], [128, 128], [1, 1]),
-                13: TensorSliceInfo([384, 128], [128, 128], [1, 1]),
-                14: TensorSliceInfo([384, 256], [128, 128], [1, 1]),
-                15: TensorSliceInfo([384, 384], [128, 128], [1, 1]),
-            },
-        },
-        output="output",
-        reduction_tile_counts={"d0": 2},
-    ),
-    ((128, 512), (128, 512)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 128, "reduction"),
-            "d1": DimInfo("d1", 512, "parallel"),
-            "d2": DimInfo("d2", 512, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (128, 512), "b": (128, 512), "output": (512, 512)},
-        tile_counts={"d1": 4, "d2": 4},
-        num_subgraphs=16,
-        slice_params={
-            "a": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                2: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                3: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                4: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                5: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                6: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                7: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                8: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                9: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                10: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                11: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                12: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-                13: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-                14: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-                15: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-            },
-            "b": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                2: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                3: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-                4: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                5: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                6: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                7: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-                8: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                9: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                10: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                11: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-                12: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                13: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                14: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                15: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-            },
-            "output": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                2: TensorSliceInfo([0, 256], [128, 128], [1, 1]),
-                3: TensorSliceInfo([0, 384], [128, 128], [1, 1]),
-                4: TensorSliceInfo([128, 0], [128, 128], [1, 1]),
-                5: TensorSliceInfo([128, 128], [128, 128], [1, 1]),
-                6: TensorSliceInfo([128, 256], [128, 128], [1, 1]),
-                7: TensorSliceInfo([128, 384], [128, 128], [1, 1]),
-                8: TensorSliceInfo([256, 0], [128, 128], [1, 1]),
-                9: TensorSliceInfo([256, 128], [128, 128], [1, 1]),
-                10: TensorSliceInfo([256, 256], [128, 128], [1, 1]),
-                11: TensorSliceInfo([256, 384], [128, 128], [1, 1]),
-                12: TensorSliceInfo([384, 0], [128, 128], [1, 1]),
-                13: TensorSliceInfo([384, 128], [128, 128], [1, 1]),
-                14: TensorSliceInfo([384, 256], [128, 128], [1, 1]),
-                15: TensorSliceInfo([384, 384], [128, 128], [1, 1]),
-            },
-        },
-        output="output",
-        reduction_tile_counts={"d0": 1},
-    ),
-    ((1024, 128), (1024, 128)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2"],
-        dim_info={
-            "d0": DimInfo("d0", 1024, "reduction"),
-            "d1": DimInfo("d1", 128, "parallel"),
-            "d2": DimInfo("d2", 128, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "output": ["d1", "d2"]},
-        tensor_shapes={"a": (1024, 128), "b": (1024, 128), "output": (128, 128)},
-        tile_counts={"d1": 1, "d2": 1},
-        num_subgraphs=1,
-        slice_params={
-            "a": {0: TensorSliceInfo([0, 0], [1024, 128], [1, 1])},
-            "b": {0: TensorSliceInfo([0, 0], [1024, 128], [1, 1])},
-            "output": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-        },
-        output="output",
-        reduction_tile_counts={"d0": 8},
-    ),
-}
-
-EXPECTED_DOUBLE_MATMUL = {
-    ((128, 128), (128, 128), (128, 128)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2", "d3"],
-        dim_info={
-            "d0": DimInfo("d0", 128, "reduction"),
-            "d1": DimInfo("d1", 128, "reduction"),
-            "d2": DimInfo("d2", 128, "parallel"),
-            "d3": DimInfo("d3", 128, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "c": ["d1", "d3"], "output": ["d2", "d3"]},
-        tensor_shapes={"a": (128, 128), "b": (128, 128), "c": (128, 128), "output": (128, 128)},
-        tile_counts={"d2": 1, "d3": 1},
-        num_subgraphs=1,
-        slice_params={
-            "a": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-            "b": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-            "c": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-            "output": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-        },
-        output="output",
-        reduction_tile_counts={"d0": 1, "d1": 1},
-    ),
-    ((128, 256), (128, 128), (128, 128)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2", "d3"],
-        dim_info={
-            "d0": DimInfo("d0", 128, "reduction"),
-            "d1": DimInfo("d1", 256, "reduction"),
-            "d2": DimInfo("d2", 128, "parallel"),
-            "d3": DimInfo("d3", 128, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "c": ["d1", "d3"], "output": ["d2", "d3"]},
-        tensor_shapes={"a": (128, 256), "b": (128, 128), "c": (128, 128), "output": (128, 128)},
-        tile_counts={"d2": 1, "d3": 1},
-        num_subgraphs=1,
-        slice_params={
-            "a": {0: TensorSliceInfo([0, 0], [128, 256], [1, 1])},
-            "b": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-            "c": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-            "output": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-        },
-        output="output",
-        reduction_tile_counts={"d0": 1, "d1": 2},
-    ),
-    ((128, 256), (128, 128), (128, 256)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2", "d3"],
-        dim_info={
-            "d0": DimInfo("d0", 128, "reduction"),
-            "d1": DimInfo("d1", 256, "reduction"),
-            "d2": DimInfo("d2", 128, "parallel"),
-            "d3": DimInfo("d3", 256, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "c": ["d1", "d3"], "output": ["d2", "d3"]},
-        tensor_shapes={"a": (128, 256), "b": (128, 128), "c": (128, 256), "output": (128, 256)},
-        tile_counts={"d2": 1, "d3": 2},
-        num_subgraphs=2,
-        slice_params={
-            "a": {0: TensorSliceInfo([0, 0], [128, 256], [1, 1]), 1: TensorSliceInfo([0, 0], [128, 256], [1, 1])},
-            "b": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1]), 1: TensorSliceInfo([0, 0], [128, 128], [1, 1])},
-            "c": {0: TensorSliceInfo([0, 0], [128, 128], [1, 1]), 1: TensorSliceInfo([0, 128], [128, 128], [1, 1])},
-            "output": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-            },
-        },
-        output="output",
-        reduction_tile_counts={"d0": 1, "d1": 2},
-    ),
-    ((256, 256), (256, 256), (256, 256)): DimensionAnalysis(
-        dim_order=["d0", "d1", "d2", "d3"],
-        dim_info={
-            "d0": DimInfo("d0", 256, "reduction"),
-            "d1": DimInfo("d1", 256, "reduction"),
-            "d2": DimInfo("d2", 256, "parallel"),
-            "d3": DimInfo("d3", 256, "parallel"),
-        },
-        tensor_dims={"a": ["d0", "d1"], "b": ["d0", "d2"], "c": ["d1", "d3"], "output": ["d2", "d3"]},
-        tensor_shapes={"a": (256, 256), "b": (256, 256), "c": (256, 256), "output": (256, 256)},
-        tile_counts={"d2": 2, "d3": 2},
-        num_subgraphs=4,
-        slice_params={
-            "a": {
-                0: TensorSliceInfo([0, 0], [256, 256], [1, 1]),
-                1: TensorSliceInfo([0, 0], [256, 256], [1, 1]),
-                2: TensorSliceInfo([0, 0], [256, 256], [1, 1]),
-                3: TensorSliceInfo([0, 0], [256, 256], [1, 1]),
-            },
-            "b": {
-                0: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                1: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                2: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                3: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-            },
-            "c": {
-                0: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-                2: TensorSliceInfo([0, 0], [256, 128], [1, 1]),
-                3: TensorSliceInfo([0, 128], [256, 128], [1, 1]),
-            },
-            "output": {
-                0: TensorSliceInfo([0, 0], [128, 128], [1, 1]),
-                1: TensorSliceInfo([0, 128], [128, 128], [1, 1]),
-                2: TensorSliceInfo([128, 0], [128, 128], [1, 1]),
-                3: TensorSliceInfo([128, 128], [128, 128], [1, 1]),
-            },
-        },
-        output="output",
-        reduction_tile_counts={"d0": 2, "d1": 2},
-    ),
-}
-
-GOLDEN_SINGLE_MATMUL_SOURCE = {
-    (
-        (128, 128),
-        (128, 128),
-    ): """\
+SINGLE_128x128_128x128 = """\
 import numpy as np
 import nkigym
 def matmul(a, b):
-    output = nkigym.ndarray((128, 128), dtype=np.float32)
+    output = np.empty((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
     output[0:128, 0:128] = tensor_2[0:128, 0:128]
 
     return output
-""",
-    (
-        (128, 256),
-        (128, 128),
-    ): """\
+"""
+
+SINGLE_128x256_128x128 = """\
 import numpy as np
 import nkigym
 def matmul(a, b):
-    output = nkigym.ndarray((256, 128), dtype=np.float32)
+    output = np.empty((256, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
@@ -516,15 +37,29 @@ def matmul(a, b):
     output[128:256, 0:128] = tensor_5[0:128, 0:128]
 
     return output
-""",
-    (
-        (128, 256),
-        (128, 256),
-    ): """\
+"""
+
+SINGLE_128x128_128x256 = """\
 import numpy as np
 import nkigym
 def matmul(a, b):
-    output = nkigym.ndarray((256, 256), dtype=np.float32)
+    output = np.empty((128, 256), dtype=np.float32)
+    tensor_0 = a[0:128, 0:128]
+    tensor_1 = b[0:128, 0:128]
+    tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+    output[0:128, 0:128] = tensor_2[0:128, 0:128]
+    tensor_3 = a[0:128, 0:128]
+    tensor_4 = b[0:128, 128:256]
+    tensor_5 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128])
+    output[0:128, 128:256] = tensor_5[0:128, 0:128]
+    return output
+"""
+
+SINGLE_128x256_128x256 = """\
+import numpy as np
+import nkigym
+def matmul(a, b):
+    output = np.empty((256, 256), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
@@ -546,15 +81,37 @@ def matmul(a, b):
     output[128:256, 128:256] = tensor_11[0:128, 0:128]
 
     return output
-""",
-    (
-        (256, 128),
-        (256, 128),
-    ): """\
+"""
+
+SINGLE_128x512_128x128 = """\
 import numpy as np
 import nkigym
 def matmul(a, b):
-    output = nkigym.ndarray((128, 128), dtype=np.float32)
+    output = np.empty((512, 128), dtype=np.float32)
+    tensor_0 = a[0:128, 0:128]
+    tensor_1 = b[0:128, 0:128]
+    tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+    output[0:128, 0:128] = tensor_2[0:128, 0:128]
+    tensor_3 = a[0:128, 128:256]
+    tensor_4 = b[0:128, 0:128]
+    tensor_5 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128])
+    output[128:256, 0:128] = tensor_5[0:128, 0:128]
+    tensor_6 = a[0:128, 256:384]
+    tensor_7 = b[0:128, 0:128]
+    tensor_8 = nkigym.nc_matmul(tensor_6[0:128, 0:128], tensor_7[0:128, 0:128])
+    output[256:384, 0:128] = tensor_8[0:128, 0:128]
+    tensor_9 = a[0:128, 384:512]
+    tensor_10 = b[0:128, 0:128]
+    tensor_11 = nkigym.nc_matmul(tensor_9[0:128, 0:128], tensor_10[0:128, 0:128])
+    output[384:512, 0:128] = tensor_11[0:128, 0:128]
+    return output
+"""
+
+SINGLE_256x128_256x128 = """\
+import numpy as np
+import nkigym
+def matmul(a, b):
+    output = np.empty((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
@@ -564,15 +121,13 @@ def matmul(a, b):
     output[0:128, 0:128] = tensor_2[0:128, 0:128]
 
     return output
-""",
-    (
-        (256, 256),
-        (256, 256),
-    ): """\
+"""
+
+SINGLE_256x256_256x256 = """\
 import numpy as np
 import nkigym
 def matmul(a, b):
-    output = nkigym.ndarray((256, 256), dtype=np.float32)
+    output = np.empty((256, 256), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
@@ -606,15 +161,154 @@ def matmul(a, b):
     output[128:256, 128:256] = tensor_17[0:128, 0:128]
 
     return output
-""",
-    (
-        (128, 512),
-        (128, 512),
-    ): """\
+"""
+
+SINGLE_256x512_256x512 = """\
 import numpy as np
 import nkigym
 def matmul(a, b):
-    output = nkigym.ndarray((512, 512), dtype=np.float32)
+    output = np.empty((512, 512), dtype=np.float32)
+    tensor_0 = a[0:128, 0:128]
+    tensor_1 = b[0:128, 0:128]
+    tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+    tensor_3 = a[128:256, 0:128]
+    tensor_4 = b[128:256, 0:128]
+    tensor_2[0:128, 0:128] += nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128])
+    output[0:128, 0:128] = tensor_2[0:128, 0:128]
+    tensor_5 = a[0:128, 0:128]
+    tensor_6 = b[0:128, 128:256]
+    tensor_7 = nkigym.nc_matmul(tensor_5[0:128, 0:128], tensor_6[0:128, 0:128])
+    tensor_8 = a[128:256, 0:128]
+    tensor_9 = b[128:256, 128:256]
+    tensor_7[0:128, 0:128] += nkigym.nc_matmul(tensor_8[0:128, 0:128], tensor_9[0:128, 0:128])
+    output[0:128, 128:256] = tensor_7[0:128, 0:128]
+    tensor_10 = a[0:128, 0:128]
+    tensor_11 = b[0:128, 256:384]
+    tensor_12 = nkigym.nc_matmul(tensor_10[0:128, 0:128], tensor_11[0:128, 0:128])
+    tensor_13 = a[128:256, 0:128]
+    tensor_14 = b[128:256, 256:384]
+    tensor_12[0:128, 0:128] += nkigym.nc_matmul(tensor_13[0:128, 0:128], tensor_14[0:128, 0:128])
+    output[0:128, 256:384] = tensor_12[0:128, 0:128]
+    tensor_15 = a[0:128, 0:128]
+    tensor_16 = b[0:128, 384:512]
+    tensor_17 = nkigym.nc_matmul(tensor_15[0:128, 0:128], tensor_16[0:128, 0:128])
+    tensor_18 = a[128:256, 0:128]
+    tensor_19 = b[128:256, 384:512]
+    tensor_17[0:128, 0:128] += nkigym.nc_matmul(tensor_18[0:128, 0:128], tensor_19[0:128, 0:128])
+    output[0:128, 384:512] = tensor_17[0:128, 0:128]
+    tensor_20 = a[0:128, 128:256]
+    tensor_21 = b[0:128, 0:128]
+    tensor_22 = nkigym.nc_matmul(tensor_20[0:128, 0:128], tensor_21[0:128, 0:128])
+    tensor_23 = a[128:256, 128:256]
+    tensor_24 = b[128:256, 0:128]
+    tensor_22[0:128, 0:128] += nkigym.nc_matmul(tensor_23[0:128, 0:128], tensor_24[0:128, 0:128])
+    output[128:256, 0:128] = tensor_22[0:128, 0:128]
+    tensor_25 = a[0:128, 128:256]
+    tensor_26 = b[0:128, 128:256]
+    tensor_27 = nkigym.nc_matmul(tensor_25[0:128, 0:128], tensor_26[0:128, 0:128])
+    tensor_28 = a[128:256, 128:256]
+    tensor_29 = b[128:256, 128:256]
+    tensor_27[0:128, 0:128] += nkigym.nc_matmul(tensor_28[0:128, 0:128], tensor_29[0:128, 0:128])
+    output[128:256, 128:256] = tensor_27[0:128, 0:128]
+    tensor_30 = a[0:128, 128:256]
+    tensor_31 = b[0:128, 256:384]
+    tensor_32 = nkigym.nc_matmul(tensor_30[0:128, 0:128], tensor_31[0:128, 0:128])
+    tensor_33 = a[128:256, 128:256]
+    tensor_34 = b[128:256, 256:384]
+    tensor_32[0:128, 0:128] += nkigym.nc_matmul(tensor_33[0:128, 0:128], tensor_34[0:128, 0:128])
+    output[128:256, 256:384] = tensor_32[0:128, 0:128]
+    tensor_35 = a[0:128, 128:256]
+    tensor_36 = b[0:128, 384:512]
+    tensor_37 = nkigym.nc_matmul(tensor_35[0:128, 0:128], tensor_36[0:128, 0:128])
+    tensor_38 = a[128:256, 128:256]
+    tensor_39 = b[128:256, 384:512]
+    tensor_37[0:128, 0:128] += nkigym.nc_matmul(tensor_38[0:128, 0:128], tensor_39[0:128, 0:128])
+    output[128:256, 384:512] = tensor_37[0:128, 0:128]
+    tensor_40 = a[0:128, 256:384]
+    tensor_41 = b[0:128, 0:128]
+    tensor_42 = nkigym.nc_matmul(tensor_40[0:128, 0:128], tensor_41[0:128, 0:128])
+    tensor_43 = a[128:256, 256:384]
+    tensor_44 = b[128:256, 0:128]
+    tensor_42[0:128, 0:128] += nkigym.nc_matmul(tensor_43[0:128, 0:128], tensor_44[0:128, 0:128])
+    output[256:384, 0:128] = tensor_42[0:128, 0:128]
+    tensor_45 = a[0:128, 256:384]
+    tensor_46 = b[0:128, 128:256]
+    tensor_47 = nkigym.nc_matmul(tensor_45[0:128, 0:128], tensor_46[0:128, 0:128])
+    tensor_48 = a[128:256, 256:384]
+    tensor_49 = b[128:256, 128:256]
+    tensor_47[0:128, 0:128] += nkigym.nc_matmul(tensor_48[0:128, 0:128], tensor_49[0:128, 0:128])
+    output[256:384, 128:256] = tensor_47[0:128, 0:128]
+    tensor_50 = a[0:128, 256:384]
+    tensor_51 = b[0:128, 256:384]
+    tensor_52 = nkigym.nc_matmul(tensor_50[0:128, 0:128], tensor_51[0:128, 0:128])
+    tensor_53 = a[128:256, 256:384]
+    tensor_54 = b[128:256, 256:384]
+    tensor_52[0:128, 0:128] += nkigym.nc_matmul(tensor_53[0:128, 0:128], tensor_54[0:128, 0:128])
+    output[256:384, 256:384] = tensor_52[0:128, 0:128]
+    tensor_55 = a[0:128, 256:384]
+    tensor_56 = b[0:128, 384:512]
+    tensor_57 = nkigym.nc_matmul(tensor_55[0:128, 0:128], tensor_56[0:128, 0:128])
+    tensor_58 = a[128:256, 256:384]
+    tensor_59 = b[128:256, 384:512]
+    tensor_57[0:128, 0:128] += nkigym.nc_matmul(tensor_58[0:128, 0:128], tensor_59[0:128, 0:128])
+    output[256:384, 384:512] = tensor_57[0:128, 0:128]
+    tensor_60 = a[0:128, 384:512]
+    tensor_61 = b[0:128, 0:128]
+    tensor_62 = nkigym.nc_matmul(tensor_60[0:128, 0:128], tensor_61[0:128, 0:128])
+    tensor_63 = a[128:256, 384:512]
+    tensor_64 = b[128:256, 0:128]
+    tensor_62[0:128, 0:128] += nkigym.nc_matmul(tensor_63[0:128, 0:128], tensor_64[0:128, 0:128])
+    output[384:512, 0:128] = tensor_62[0:128, 0:128]
+    tensor_65 = a[0:128, 384:512]
+    tensor_66 = b[0:128, 128:256]
+    tensor_67 = nkigym.nc_matmul(tensor_65[0:128, 0:128], tensor_66[0:128, 0:128])
+    tensor_68 = a[128:256, 384:512]
+    tensor_69 = b[128:256, 128:256]
+    tensor_67[0:128, 0:128] += nkigym.nc_matmul(tensor_68[0:128, 0:128], tensor_69[0:128, 0:128])
+    output[384:512, 128:256] = tensor_67[0:128, 0:128]
+    tensor_70 = a[0:128, 384:512]
+    tensor_71 = b[0:128, 256:384]
+    tensor_72 = nkigym.nc_matmul(tensor_70[0:128, 0:128], tensor_71[0:128, 0:128])
+    tensor_73 = a[128:256, 384:512]
+    tensor_74 = b[128:256, 256:384]
+    tensor_72[0:128, 0:128] += nkigym.nc_matmul(tensor_73[0:128, 0:128], tensor_74[0:128, 0:128])
+    output[384:512, 256:384] = tensor_72[0:128, 0:128]
+    tensor_75 = a[0:128, 384:512]
+    tensor_76 = b[0:128, 384:512]
+    tensor_77 = nkigym.nc_matmul(tensor_75[0:128, 0:128], tensor_76[0:128, 0:128])
+    tensor_78 = a[128:256, 384:512]
+    tensor_79 = b[128:256, 384:512]
+    tensor_77[0:128, 0:128] += nkigym.nc_matmul(tensor_78[0:128, 0:128], tensor_79[0:128, 0:128])
+    output[384:512, 384:512] = tensor_77[0:128, 0:128]
+    return output
+"""
+
+SINGLE_512x128_512x128 = """\
+import numpy as np
+import nkigym
+def matmul(a, b):
+    output = np.empty((128, 128), dtype=np.float32)
+    tensor_0 = a[0:128, 0:128]
+    tensor_1 = b[0:128, 0:128]
+    tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+    tensor_3 = a[128:256, 0:128]
+    tensor_4 = b[128:256, 0:128]
+    tensor_2[0:128, 0:128] += nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128])
+    tensor_5 = a[256:384, 0:128]
+    tensor_6 = b[256:384, 0:128]
+    tensor_2[0:128, 0:128] += nkigym.nc_matmul(tensor_5[0:128, 0:128], tensor_6[0:128, 0:128])
+    tensor_7 = a[384:512, 0:128]
+    tensor_8 = b[384:512, 0:128]
+    tensor_2[0:128, 0:128] += nkigym.nc_matmul(tensor_7[0:128, 0:128], tensor_8[0:128, 0:128])
+    output[0:128, 0:128] = tensor_2[0:128, 0:128]
+    return output
+"""
+
+SINGLE_128x512_128x512 = """\
+import numpy as np
+import nkigym
+def matmul(a, b):
+    output = np.empty((512, 512), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
@@ -696,15 +390,13 @@ def matmul(a, b):
     output[384:512, 384:512] = tensor_47[0:128, 0:128]
 
     return output
-""",
-    (
-        (1024, 128),
-        (1024, 128),
-    ): """\
+"""
+
+SINGLE_1024x128_1024x128 = """\
 import numpy as np
 import nkigym
 def matmul(a, b):
-    output = nkigym.ndarray((128, 128), dtype=np.float32)
+    output = np.empty((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
@@ -732,19 +424,13 @@ def matmul(a, b):
     output[0:128, 0:128] = tensor_2[0:128, 0:128]
 
     return output
-""",
-}
+"""
 
-GOLDEN_DOUBLE_MATMUL_SOURCE = {
-    (
-        (128, 128),
-        (128, 128),
-        (128, 128),
-    ): """\
+DOUBLE_128x128_128x128_128x128 = """\
 import numpy as np
 import nkigym
 def double_matmul(a, b, c):
-    output = nkigym.ndarray((128, 128), dtype=np.float32)
+    output = np.empty((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
@@ -753,16 +439,13 @@ def double_matmul(a, b, c):
     output[0:128, 0:128] = tensor_4[0:128, 0:128]
 
     return output
-""",
-    (
-        (128, 256),
-        (128, 128),
-        (256, 128),
-    ): """\
+"""
+
+DOUBLE_128x256_128x128_256x128 = """\
 import numpy as np
 import nkigym
 def double_matmul(a, b, c):
-    output = nkigym.ndarray((128, 128), dtype=np.float32)
+    output = np.empty((128, 128), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
@@ -776,16 +459,13 @@ def double_matmul(a, b, c):
     output[0:128, 0:128] = tensor_4[0:128, 0:128]
 
     return output
-""",
-    (
-        (128, 256),
-        (128, 128),
-        (256, 256),
-    ): """\
+"""
+
+DOUBLE_128x256_128x128_256x256 = """\
 import numpy as np
 import nkigym
 def double_matmul(a, b, c):
-    output = nkigym.ndarray((128, 256), dtype=np.float32)
+    output = np.empty((128, 256), dtype=np.float32)
     tensor_0 = a[0:128, 0:128]
     tensor_1 = b[0:128, 0:128]
     tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
@@ -811,5 +491,117 @@ def double_matmul(a, b, c):
     output[0:128, 128:256] = tensor_13[0:128, 0:128]
 
     return output
-""",
+"""
+
+DOUBLE_256x256_256x256_256x256 = """\
+import numpy as np
+import nkigym
+def double_matmul(a, b, c):
+    output = np.empty((256, 256), dtype=np.float32)
+    tensor_0 = a[0:128, 0:128]
+    tensor_1 = b[0:128, 0:128]
+    tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+    tensor_3 = c[0:128, 0:128]
+    tensor_4 = nkigym.nc_matmul(tensor_2[0:128, 0:128], tensor_3[0:128, 0:128])
+    tensor_5 = a[0:128, 128:256]
+    tensor_6 = b[0:128, 0:128]
+    tensor_7 = nkigym.nc_matmul(tensor_5[0:128, 0:128], tensor_6[0:128, 0:128])
+    tensor_8 = c[128:256, 0:128]
+    tensor_4[0:128, 0:128] += nkigym.nc_matmul(tensor_7[0:128, 0:128], tensor_8[0:128, 0:128])
+    tensor_9 = a[128:256, 0:128]
+    tensor_10 = b[128:256, 0:128]
+    tensor_11 = nkigym.nc_matmul(tensor_9[0:128, 0:128], tensor_10[0:128, 0:128])
+    tensor_12 = c[0:128, 0:128]
+    tensor_4[0:128, 0:128] += nkigym.nc_matmul(tensor_11[0:128, 0:128], tensor_12[0:128, 0:128])
+    tensor_13 = a[128:256, 128:256]
+    tensor_14 = b[128:256, 0:128]
+    tensor_15 = nkigym.nc_matmul(tensor_13[0:128, 0:128], tensor_14[0:128, 0:128])
+    tensor_16 = c[128:256, 0:128]
+    tensor_4[0:128, 0:128] += nkigym.nc_matmul(tensor_15[0:128, 0:128], tensor_16[0:128, 0:128])
+    output[0:128, 0:128] = tensor_4[0:128, 0:128]
+    tensor_17 = a[0:128, 0:128]
+    tensor_18 = b[0:128, 0:128]
+    tensor_19 = nkigym.nc_matmul(tensor_17[0:128, 0:128], tensor_18[0:128, 0:128])
+    tensor_20 = c[0:128, 128:256]
+    tensor_21 = nkigym.nc_matmul(tensor_19[0:128, 0:128], tensor_20[0:128, 0:128])
+    tensor_22 = a[0:128, 128:256]
+    tensor_23 = b[0:128, 0:128]
+    tensor_24 = nkigym.nc_matmul(tensor_22[0:128, 0:128], tensor_23[0:128, 0:128])
+    tensor_25 = c[128:256, 128:256]
+    tensor_21[0:128, 0:128] += nkigym.nc_matmul(tensor_24[0:128, 0:128], tensor_25[0:128, 0:128])
+    tensor_26 = a[128:256, 0:128]
+    tensor_27 = b[128:256, 0:128]
+    tensor_28 = nkigym.nc_matmul(tensor_26[0:128, 0:128], tensor_27[0:128, 0:128])
+    tensor_29 = c[0:128, 128:256]
+    tensor_21[0:128, 0:128] += nkigym.nc_matmul(tensor_28[0:128, 0:128], tensor_29[0:128, 0:128])
+    tensor_30 = a[128:256, 128:256]
+    tensor_31 = b[128:256, 0:128]
+    tensor_32 = nkigym.nc_matmul(tensor_30[0:128, 0:128], tensor_31[0:128, 0:128])
+    tensor_33 = c[128:256, 128:256]
+    tensor_21[0:128, 0:128] += nkigym.nc_matmul(tensor_32[0:128, 0:128], tensor_33[0:128, 0:128])
+    output[0:128, 128:256] = tensor_21[0:128, 0:128]
+    tensor_34 = a[0:128, 0:128]
+    tensor_35 = b[0:128, 128:256]
+    tensor_36 = nkigym.nc_matmul(tensor_34[0:128, 0:128], tensor_35[0:128, 0:128])
+    tensor_37 = c[0:128, 0:128]
+    tensor_38 = nkigym.nc_matmul(tensor_36[0:128, 0:128], tensor_37[0:128, 0:128])
+    tensor_39 = a[0:128, 128:256]
+    tensor_40 = b[0:128, 128:256]
+    tensor_41 = nkigym.nc_matmul(tensor_39[0:128, 0:128], tensor_40[0:128, 0:128])
+    tensor_42 = c[128:256, 0:128]
+    tensor_38[0:128, 0:128] += nkigym.nc_matmul(tensor_41[0:128, 0:128], tensor_42[0:128, 0:128])
+    tensor_43 = a[128:256, 0:128]
+    tensor_44 = b[128:256, 128:256]
+    tensor_45 = nkigym.nc_matmul(tensor_43[0:128, 0:128], tensor_44[0:128, 0:128])
+    tensor_46 = c[0:128, 0:128]
+    tensor_38[0:128, 0:128] += nkigym.nc_matmul(tensor_45[0:128, 0:128], tensor_46[0:128, 0:128])
+    tensor_47 = a[128:256, 128:256]
+    tensor_48 = b[128:256, 128:256]
+    tensor_49 = nkigym.nc_matmul(tensor_47[0:128, 0:128], tensor_48[0:128, 0:128])
+    tensor_50 = c[128:256, 0:128]
+    tensor_38[0:128, 0:128] += nkigym.nc_matmul(tensor_49[0:128, 0:128], tensor_50[0:128, 0:128])
+    output[128:256, 0:128] = tensor_38[0:128, 0:128]
+    tensor_51 = a[0:128, 0:128]
+    tensor_52 = b[0:128, 128:256]
+    tensor_53 = nkigym.nc_matmul(tensor_51[0:128, 0:128], tensor_52[0:128, 0:128])
+    tensor_54 = c[0:128, 128:256]
+    tensor_55 = nkigym.nc_matmul(tensor_53[0:128, 0:128], tensor_54[0:128, 0:128])
+    tensor_56 = a[0:128, 128:256]
+    tensor_57 = b[0:128, 128:256]
+    tensor_58 = nkigym.nc_matmul(tensor_56[0:128, 0:128], tensor_57[0:128, 0:128])
+    tensor_59 = c[128:256, 128:256]
+    tensor_55[0:128, 0:128] += nkigym.nc_matmul(tensor_58[0:128, 0:128], tensor_59[0:128, 0:128])
+    tensor_60 = a[128:256, 0:128]
+    tensor_61 = b[128:256, 128:256]
+    tensor_62 = nkigym.nc_matmul(tensor_60[0:128, 0:128], tensor_61[0:128, 0:128])
+    tensor_63 = c[0:128, 128:256]
+    tensor_55[0:128, 0:128] += nkigym.nc_matmul(tensor_62[0:128, 0:128], tensor_63[0:128, 0:128])
+    tensor_64 = a[128:256, 128:256]
+    tensor_65 = b[128:256, 128:256]
+    tensor_66 = nkigym.nc_matmul(tensor_64[0:128, 0:128], tensor_65[0:128, 0:128])
+    tensor_67 = c[128:256, 128:256]
+    tensor_55[0:128, 0:128] += nkigym.nc_matmul(tensor_66[0:128, 0:128], tensor_67[0:128, 0:128])
+    output[128:256, 128:256] = tensor_55[0:128, 0:128]
+    return output
+"""
+
+GOLDEN_SINGLE_MATMUL_SOURCE = {
+    ((128, 128), (128, 128)): SINGLE_128x128_128x128,
+    ((128, 256), (128, 128)): SINGLE_128x256_128x128,
+    ((128, 128), (128, 256)): SINGLE_128x128_128x256,
+    ((128, 256), (128, 256)): SINGLE_128x256_128x256,
+    ((128, 512), (128, 128)): SINGLE_128x512_128x128,
+    ((256, 128), (256, 128)): SINGLE_256x128_256x128,
+    ((256, 256), (256, 256)): SINGLE_256x256_256x256,
+    ((256, 512), (256, 512)): SINGLE_256x512_256x512,
+    ((512, 128), (512, 128)): SINGLE_512x128_512x128,
+    ((128, 512), (128, 512)): SINGLE_128x512_128x512,
+    ((1024, 128), (1024, 128)): SINGLE_1024x128_1024x128,
+}
+
+GOLDEN_DOUBLE_MATMUL_SOURCE = {
+    ((128, 128), (128, 128), (128, 128)): DOUBLE_128x128_128x128_128x128,
+    ((128, 256), (128, 128), (256, 128)): DOUBLE_128x256_128x128_256x128,
+    ((128, 256), (128, 128), (256, 256)): DOUBLE_128x256_128x128_256x256,
+    ((256, 256), (256, 256), (256, 256)): DOUBLE_256x256_256x256_256x256,
 }

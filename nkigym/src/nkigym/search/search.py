@@ -21,7 +21,7 @@ import numpy as np
 from nkigym.ir import Program, ir_to_callable, ir_to_source
 from nkigym.tiling import generate_tiled_ir
 from nkigym.transforms.base import Transform
-from nkigym.utils import get_source, import_func
+from nkigym.utils import callable_to_source, import_func
 
 
 def _collect_opportunities_ir(program: Program, transforms: list[Transform]) -> list[tuple[Transform, Any]]:
@@ -258,7 +258,7 @@ def search(
         shutil.rmtree(save_cache)
     save_cache.mkdir(parents=True)
     input_path = save_cache / "nkigym_input.py"
-    input_path.write_text("import numpy as np\n" + "import nkigym\n" + get_source(func))
+    input_path.write_text("import numpy as np\n" + "import nkigym\n" + callable_to_source(func))
     imported_func = import_func(input_path, func.__name__)
     expected = imported_func(**kernel_kwargs)
 

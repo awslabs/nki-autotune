@@ -13,7 +13,7 @@ import copy
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from nkigym.utils.source import exec_source_to_func, get_source
+from nkigym.utils.source import callable_to_source, source_to_callable
 
 
 @dataclass
@@ -505,7 +505,7 @@ def roll_loops(func: Callable) -> Callable:
     Returns:
         New callable with loops replacing repeated blocks.
     """
-    source = get_source(func)
+    source = callable_to_source(func)
 
     while True:
         new_source = _roll_once(source)
@@ -523,4 +523,4 @@ def roll_loops(func: Callable) -> Callable:
     if func_name is None:
         raise ValueError("No function definition found in source after loop rolling")
 
-    return exec_source_to_func(source, func_name)
+    return source_to_callable(source, func_name)

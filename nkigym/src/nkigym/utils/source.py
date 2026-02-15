@@ -15,7 +15,7 @@ import numpy as np
 import nkigym
 
 
-def get_source(func: Callable) -> str:
+def callable_to_source(func: Callable) -> str:
     """Get source code for a function (dynamic or static).
 
     Args:
@@ -31,7 +31,7 @@ def get_source(func: Callable) -> str:
     return source
 
 
-def exec_source_to_func(source: str, func_name: str) -> Callable[..., np.ndarray]:
+def source_to_callable(source: str, func_name: str) -> Callable[..., np.ndarray]:
     """Execute source code and return the named function.
 
     Args:

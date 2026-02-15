@@ -1,24 +1,11 @@
-"""Tests for NEFF compilation backend.
+"""Golden data for autotune backend tests."""
 
-This module contains tests for the compile_kernel function that uses the
-compile_nki_ir_kernel_to_neff API to compile NKI kernels to NEFF format.
-
-Run with: pytest test/test_neff_compilation.py -v
-
-Note: These tests require a properly configured NeuronX compiler environment
-with Trainium hardware or simulation support.
-"""
-
-import os
 import subprocess
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
-import pytest
-
-from autotune.compiler.compile import compile_kernel
 
 
 def _neuron_devices_available() -> bool:
@@ -31,6 +18,55 @@ def _neuron_devices_available() -> bool:
 
 
 NEURON_DEVICES_AVAILABLE = _neuron_devices_available()
+
+SHAPES = [(128, 128), (128, 256), (128, 512)]
+SCALAR_VALUES = [0.0, 1.5, -2.0]
+ATOL, RTOL = 1e-5, 1e-5
+WARMUP, ITERS = 2, 5
+
+
+@nki.jit
+def nki_tensor_add_scalar_(a_input, b_input, c):
+    """NKI kernel that computes a_input + b_input + c.
+
+    Args:
+        a_input: First input tensor of shape [P, F] where P <= 128.
+        b_input: Second input tensor of shape [P, F] where P <= 128.
+        c: Scalar value to add.
+
+    Returns:
+        result: Output tensor of shape [P, F].
+    """
+    P, F = a_input.shape
+    result = nl.ndarray((P, F), dtype=a_input.dtype, buffer=nl.shared_hbm)
+
+    a_tile = nl.ndarray((P, F), dtype=a_input.dtype, buffer=nl.sbuf)
+    b_tile = nl.ndarray((P, F), dtype=b_input.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=a_tile, src=a_input)
+    nisa.dma_copy(dst=b_tile, src=b_input)
+
+    sum_tile = nl.ndarray((P, F), dtype=a_input.dtype, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=sum_tile, data1=a_tile, data2=b_tile, op=nl.add)
+
+    result_tile = nl.ndarray((P, F), dtype=a_input.dtype, buffer=nl.sbuf)
+    nisa.tensor_scalar(result_tile, sum_tile, nl.add, c)
+
+    nisa.dma_copy(dst=result, src=result_tile)
+    return result
+
+
+def golden_add_scalar(a_input: np.ndarray, b_input: np.ndarray, c: float) -> np.ndarray:
+    """Golden reference for nki_tensor_add_scalar_.
+
+    Args:
+        a_input: First input array.
+        b_input: Second input array.
+        c: Scalar value to add.
+
+    Returns:
+        Result of a_input + b_input + c, cast to a_input's dtype.
+    """
+    return (a_input + b_input + c).astype(a_input.dtype)
 
 
 @nki.jit
@@ -131,82 +167,3 @@ def matmul_transposed_lhs_golden(lhsT: np.ndarray, rhs: np.ndarray) -> np.ndarra
         Expected result of lhsT.T @ rhs.
     """
     return lhsT.T @ rhs
-
-
-class TestCompileKernel:
-    """Tests for compile_kernel function.
-
-    This class verifies that compile_kernel correctly compiles NKI kernels
-    to NEFF format using the compile_nki_ir_kernel_to_neff API.
-    """
-
-    @pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices (neuron-ls must succeed).")
-    def test_compile_kernel_produces_neff(self, tmp_path):
-        """Verify compile_kernel produces a valid NEFF file.
-
-        Args:
-            tmp_path: Pytest fixture providing a temporary directory.
-        """
-        M = 256
-        N = 1024
-        K = 128
-
-        lhsT = np.zeros((K, M), dtype=np.float32)
-        rhs = np.zeros((K, N), dtype=np.float32)
-
-        input_tensors = {"lhsT": lhsT, "rhs": rhs}
-        output_tensors = [("result", (M, N), np.float32)]
-
-        kernel_file = os.path.abspath(__file__)
-        kernel_name = (kernel_file, "nki_matmul_block_free_dimension_")
-
-        neff_path = compile_kernel(
-            kernel_name=kernel_name,
-            input_tensors=input_tensors,
-            output_tensors=output_tensors,
-            kernel_kwargs={},
-            compiler_flags="",
-            output_dir=str(tmp_path),
-        )
-
-        assert neff_path.endswith(".neff"), f"Expected path ending with .neff, got: {neff_path}"
-        assert os.path.exists(neff_path), f"NEFF file does not exist at: {neff_path}"
-
-
-class TestMultiKernelWorkload:
-    """Tests for multi-kernel workload compilation using ProfileJobs infrastructure.
-
-    This class verifies that the autotune infrastructure can compile multiple
-    kernel configurations with different matrix sizes in a single batch.
-    """
-
-    @pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices (neuron-ls must succeed).")
-    def test_multi_kernel_compilation(self, tmp_path):
-        """Verify compilation succeeds for multiple kernel configurations.
-
-        Args:
-            tmp_path: Pytest fixture providing a temporary directory.
-        """
-        from autotune.job import ProfileJobs, compile_jobs
-
-        jobs = ProfileJobs(cache_root_dir=str(tmp_path))
-
-        test_sizes = [(256, 1024, 128), (512, 1024, 256), (256, 2048, 128)]
-
-        for M, N, K in test_sizes:
-            lhsT = np.zeros((K, M), dtype=np.float32)
-            rhs = np.zeros((K, N), dtype=np.float32)
-            jobs.add_job(
-                kernel=nki_matmul_block_free_dimension_,
-                kernel_kwargs={"lhsT": lhsT, "rhs": rhs},
-                output_shapes={"result": (M, N)},
-                compiler_flags="",
-                correctness_check=(matmul_transposed_lhs_golden, 1e-3, 1e-3),
-            )
-
-        compiled_jobs = compile_jobs(jobs)
-
-        for job_index, job in compiled_jobs.jobs.items():
-            assert not job.has_error, f"Job {job_index} failed with error: {getattr(job, 'error', 'unknown')}"
-            assert hasattr(job, "neff"), f"Job {job_index} missing neff attribute"
-            assert job.neff.endswith(".neff"), f"Job {job_index} neff path invalid: {job.neff}"
