@@ -1,7 +1,8 @@
-"""Source code manipulation utilities for NKI Gym.
+"""Source code utilities for extracting and compiling Python functions.
 
-Provides source code round-tripping: extracting source from callables
-and compiling source strings back into callable functions.
+Provides generic source code round-tripping with no framework dependencies:
+extracting source from callables and compiling source strings back into
+callable functions.
 """
 
 import importlib.util
@@ -9,10 +10,6 @@ import inspect
 import textwrap
 from collections.abc import Callable
 from pathlib import Path
-
-import numpy as np
-
-import nkigym
 
 
 def callable_to_source(func: Callable) -> str:
@@ -31,8 +28,11 @@ def callable_to_source(func: Callable) -> str:
     return source
 
 
-def source_to_callable(source: str, func_name: str) -> Callable[..., np.ndarray]:
+def source_to_callable(source: str, func_name: str) -> Callable:
     """Execute source code and return the named function.
+
+    The source is responsible for its own imports (e.g., ``import numpy as np``).
+    No framework-specific bindings are injected.
 
     Args:
         source: Python source code string containing a function definition.
@@ -44,7 +44,7 @@ def source_to_callable(source: str, func_name: str) -> Callable[..., np.ndarray]
     Raises:
         ValueError: If the named function is not found in the executed source.
     """
-    namespace: dict[str, object] = {"np": np, "nkigym": nkigym}
+    namespace: dict[str, object] = {}
     exec(source, namespace)
     func = namespace.get(func_name)
     if func is None:

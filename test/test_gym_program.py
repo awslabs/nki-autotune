@@ -5,11 +5,12 @@ import pytest
 from conftest import make_random_array
 
 import nkigym
-from nkigym.ir import GymProgram, GymStatement, TensorRef, func_to_program, program_to_func
+from nkigym.ir import GymProgram, GymStatement, TensorRef, program_to_source, source_to_program
+from nkigym.utils.source import callable_to_source, source_to_callable
 
 
-class TestFuncToProgram:
-    """Tests for func_to_program parsing with input_shapes."""
+class TestSourceToProgram:
+    """Tests for source_to_program parsing with input_shapes."""
 
     def test_matmul_kwargs(self) -> None:
         """Verify positional args are mapped to operand names with TensorRef."""
@@ -17,7 +18,7 @@ class TestFuncToProgram:
         def fn(lhs, rhs):
             return nkigym.nc_matmul(lhs, rhs)
 
-        program = func_to_program(fn, {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
+        program = source_to_program(callable_to_source(fn), {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
         assert program.stmts[0].kwargs == (
             ("stationary", TensorRef("lhs", (128, 64), ((0, 128), (0, 64)))),
             ("moving", TensorRef("rhs", (128, 32), ((0, 128), (0, 32)))),
@@ -29,7 +30,7 @@ class TestFuncToProgram:
         def fn(x):
             return nkigym.activation(x, op=np.tanh)
 
-        program = func_to_program(fn, {"x": (64, 64)}, np.float32)
+        program = source_to_program(callable_to_source(fn), {"x": (64, 64)}, np.float32)
         stmt = program.stmts[0]
         assert stmt.kwargs == (("data", TensorRef("x", (64, 64), ((0, 64), (0, 64)))), ("op", "np.tanh"))
 
@@ -39,7 +40,7 @@ class TestFuncToProgram:
         def fn(a, b):
             return nkigym.tensor_tensor(a, b, op=np.multiply)
 
-        program = func_to_program(fn, {"a": (64, 64), "b": (64, 64)}, np.float32)
+        program = source_to_program(callable_to_source(fn), {"a": (64, 64), "b": (64, 64)}, np.float32)
         stmt = program.stmts[0]
         assert stmt.kwargs == (
             ("data1", TensorRef("a", (64, 64), ((0, 64), (0, 64)))),
@@ -53,7 +54,7 @@ class TestFuncToProgram:
         def fn(data, scale):
             return nkigym.tensor_scalar(data, scale, op=np.add)
 
-        program = func_to_program(fn, {"data": (64, 64), "scale": ()}, np.float32)
+        program = source_to_program(callable_to_source(fn), {"data": (64, 64), "scale": ()}, np.float32)
         stmt = program.stmts[0]
         assert stmt.kwargs[0] == ("data", TensorRef("data", (64, 64), ((0, 64), (0, 64))))
         assert stmt.kwargs[1] == ("operand0", TensorRef("scale", (), ()))
@@ -65,7 +66,7 @@ class TestFuncToProgram:
         def fn(x):
             return nkigym.nc_transpose(x)
 
-        program = func_to_program(fn, {"x": (64, 128)}, np.float32)
+        program = source_to_program(callable_to_source(fn), {"x": (64, 128)}, np.float32)
         assert program.stmts[0].kwargs == (("data", TensorRef("x", (64, 128), ((0, 64), (0, 128)))),)
 
     def test_multi_statement(self) -> None:
@@ -75,7 +76,7 @@ class TestFuncToProgram:
             t = nkigym.nc_matmul(lhs, rhs)
             return nkigym.activation(t, op=np.tanh)
 
-        program = func_to_program(fn, {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
+        program = source_to_program(callable_to_source(fn), {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
         assert len(program.stmts) == 2
         assert program.stmts[0].op == "nc_matmul"
         assert program.stmts[0].output == TensorRef("t", (64, 32), ((0, 64), (0, 32)))
@@ -89,25 +90,21 @@ class TestFuncToProgram:
         def fn(a, b):
             return nkigym.tensor_tensor(a, b, op=np.add)
 
-        p1 = func_to_program(fn, {"a": (64, 64), "b": (64, 64)}, np.float32)
+        p1 = source_to_program(callable_to_source(fn), {"a": (64, 64), "b": (64, 64)}, np.float32)
 
         def fn2(a, b):
             return nkigym.tensor_tensor(a, b, op=np.multiply)
 
-        p2 = func_to_program(fn2, {"a": (64, 64), "b": (64, 64)}, np.float32)
+        p2 = source_to_program(callable_to_source(fn2), {"a": (64, 64), "b": (64, 64)}, np.float32)
         d = {p1: "add", p2: "mul"}
         assert len(d) == 2
         assert d[p1] == "add"
 
     def test_wrong_arg_count_raises(self) -> None:
         """Verify ValueError when positional arg count mismatches."""
-
-        def fn(a, b, c):
-            return nkigym.nc_matmul(a, b, c)
-
-        fn.__source__ = "def fn(a, b, c):\n    return nkigym.nc_matmul(a, b, c)\n"
+        source = "def fn(a, b, c):\n    return nkigym.nc_matmul(a, b, c)\n"
         with pytest.raises(ValueError, match="expects 2 positional args"):
-            func_to_program(fn, {"a": (4, 4), "b": (4, 4), "c": (4, 4)}, np.float32)
+            source_to_program(source, {"a": (4, 4), "b": (4, 4), "c": (4, 4)}, np.float32)
 
     def test_output_dtype_stored(self) -> None:
         """Verify output_dtype is stored on the program."""
@@ -115,7 +112,7 @@ class TestFuncToProgram:
         def fn(a, b):
             return nkigym.nc_matmul(a, b)
 
-        program = func_to_program(fn, {"a": (128, 128), "b": (128, 128)}, np.float64)
+        program = source_to_program(callable_to_source(fn), {"a": (128, 128), "b": (128, 128)}, np.float64)
         assert program.output_dtype is np.float64
 
     def test_output_shape_inferred(self) -> None:
@@ -124,7 +121,7 @@ class TestFuncToProgram:
         def fn(lhs, rhs):
             return nkigym.nc_matmul(lhs, rhs)
 
-        program = func_to_program(fn, {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
+        program = source_to_program(callable_to_source(fn), {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
         assert program.stmts[0].output.shape == (64, 32)
 
     def test_input_shapes_stored(self) -> None:
@@ -133,7 +130,7 @@ class TestFuncToProgram:
         def fn(lhs, rhs):
             return nkigym.nc_matmul(lhs, rhs)
 
-        program = func_to_program(fn, {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
+        program = source_to_program(callable_to_source(fn), {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
         assert program.input_shapes == (("lhs", (128, 64)), ("rhs", (128, 32)))
 
 
@@ -147,7 +144,7 @@ ELEMENTWISE_SHAPES = [(128, 128), (64, 32), (32, 64)]
 
 
 class TestProgramExecution:
-    """Tests for program_to_func execution."""
+    """Tests for program_to_source → source_to_callable execution."""
 
     @pytest.mark.parametrize("name,lhs_shape,rhs_shape", MATMUL_SHAPES, ids=[c[0] for c in MATMUL_SHAPES])
     def test_matmul(self, name: str, lhs_shape: tuple[int, int], rhs_shape: tuple[int, int]) -> None:
@@ -158,8 +155,8 @@ class TestProgramExecution:
 
         lhs = make_random_array(lhs_shape, seed=42)
         rhs = make_random_array(rhs_shape, seed=43)
-        program = func_to_program(fn, {"lhs": lhs_shape, "rhs": rhs_shape}, np.float32)
-        actual = program_to_func(program)(lhs, rhs)
+        program = source_to_program(callable_to_source(fn), {"lhs": lhs_shape, "rhs": rhs_shape}, np.float32)
+        actual = source_to_callable(program_to_source(program), program.name)(lhs, rhs)
         expected = np.matmul(lhs.T, rhs)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
@@ -171,8 +168,8 @@ class TestProgramExecution:
             return nkigym.activation(x, op=np.tanh)
 
         x = make_random_array(shape, seed=42)
-        program = func_to_program(fn, {"x": shape}, np.float32)
-        actual = program_to_func(program)(x)
+        program = source_to_program(callable_to_source(fn), {"x": shape}, np.float32)
+        actual = source_to_callable(program_to_source(program), program.name)(x)
         expected = np.tanh(x)
         np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
 
@@ -183,8 +180,8 @@ class TestProgramExecution:
             return nkigym.activation(x)
 
         x = make_random_array((64, 64), seed=42)
-        program = func_to_program(fn, {"x": (64, 64)}, np.float32)
-        actual = program_to_func(program)(x)
+        program = source_to_program(callable_to_source(fn), {"x": (64, 64)}, np.float32)
+        actual = source_to_callable(program_to_source(program), program.name)(x)
         np.testing.assert_array_equal(actual, x)
 
     @pytest.mark.parametrize(
@@ -214,7 +211,7 @@ class TestProgramExecution:
         )
         a = make_random_array(shape, seed=42)
         b = make_random_array(shape, seed=43)
-        actual = program_to_func(program)(a, b)
+        actual = source_to_callable(program_to_source(program), program.name)(a, b)
         expected = np_func(a, b)
         np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
 
@@ -226,8 +223,8 @@ class TestProgramExecution:
 
         data = make_random_array((64, 64), seed=42)
         scale = np.float32(2.5)
-        program = func_to_program(fn, {"data": (64, 64), "scale": ()}, np.float32)
-        actual = program_to_func(program)(data, scale)
+        program = source_to_program(callable_to_source(fn), {"data": (64, 64), "scale": ()}, np.float32)
+        actual = source_to_callable(program_to_source(program), program.name)(data, scale)
         expected = np.multiply(data, scale)
         np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
 
@@ -238,8 +235,8 @@ class TestProgramExecution:
             return nkigym.nc_transpose(x)
 
         x = make_random_array((64, 128), seed=42)
-        program = func_to_program(fn, {"x": (64, 128)}, np.float32)
-        actual = program_to_func(program)(x)
+        program = source_to_program(callable_to_source(fn), {"x": (64, 128)}, np.float32)
+        actual = source_to_callable(program_to_source(program), program.name)(x)
         expected = x.T
         np.testing.assert_array_equal(actual, expected)
 
@@ -252,8 +249,8 @@ class TestProgramExecution:
 
         lhs = make_random_array((128, 64), seed=42)
         rhs = make_random_array((128, 32), seed=43)
-        program = func_to_program(fn, {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
-        actual = program_to_func(program)(lhs, rhs)
+        program = source_to_program(callable_to_source(fn), {"lhs": (128, 64), "rhs": (128, 32)}, np.float32)
+        actual = source_to_callable(program_to_source(program), program.name)(lhs, rhs)
         expected = np.tanh(np.matmul(lhs.T, rhs))
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
@@ -267,8 +264,10 @@ class TestProgramExecution:
         a = make_random_array((128, 64), seed=42)
         b = make_random_array((128, 32), seed=43)
         c = make_random_array((64, 128), seed=44)
-        program = func_to_program(fn, {"a": (128, 64), "b": (128, 32), "c": (64, 128)}, np.float32)
-        actual = program_to_func(program)(a, b, c)
+        program = source_to_program(
+            callable_to_source(fn), {"a": (128, 64), "b": (128, 32), "c": (64, 128)}, np.float32
+        )
+        actual = source_to_callable(program_to_source(program), program.name)(a, b, c)
         t = np.matmul(a.T, b)
         expected = np.matmul(t.T, c)
         np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
@@ -279,9 +278,9 @@ class TestProgramExecution:
         def fn(a, b):
             return nkigym.nc_matmul(a, b)
 
-        program = func_to_program(fn, {"a": (4, 4), "b": (4, 4)}, np.float32)
+        program = source_to_program(callable_to_source(fn), {"a": (4, 4), "b": (4, 4)}, np.float32)
         with pytest.raises(TypeError, match="missing.*required.*argument"):
-            program_to_func(program)(np.zeros((4, 4)))
+            source_to_callable(program_to_source(program), program.name)(np.zeros((4, 4)))
 
     def test_matches_direct_nkigym(self) -> None:
         """Verify compiled program matches direct nkigym function call."""
@@ -292,7 +291,7 @@ class TestProgramExecution:
 
         lhs = make_random_array((128, 256), seed=42)
         rhs = make_random_array((128, 128), seed=43)
-        program = func_to_program(fn, {"lhs": (128, 256), "rhs": (128, 128)}, np.float32)
-        actual = program_to_func(program)(lhs, rhs)
+        program = source_to_program(callable_to_source(fn), {"lhs": (128, 256), "rhs": (128, 128)}, np.float32)
+        actual = source_to_callable(program_to_source(program), program.name)(lhs, rhs)
         expected = fn(lhs, rhs)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)

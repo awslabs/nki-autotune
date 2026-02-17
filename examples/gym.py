@@ -16,9 +16,10 @@ from pathlib import Path
 import numpy as np
 
 import nkigym
-from nkigym.ir import func_to_program, program_to_func
+from nkigym.ir import program_to_source, source_to_program
 from nkigym.tiling import tile_program
 from nkigym.utils import setup_logging
+from nkigym.utils.source import callable_to_source, source_to_callable
 
 logger = logging.getLogger(__name__)
 
@@ -78,13 +79,16 @@ def main() -> None:
     golden = golden_matmul(lhs, rhs)
     np.testing.assert_allclose(golden, nkigym_matmul(lhs, rhs), rtol=rtol, atol=atol)
 
-    program = func_to_program(nkigym_matmul, {"lhs": (k, m), "rhs": (k, n)}, np.float64)
+    source = callable_to_source(nkigym_matmul)
+    program = source_to_program(source, {"lhs": (k, m), "rhs": (k, n)}, np.float64)
     logger.info(program)
-    np.testing.assert_allclose(golden, program_to_func(program)(lhs, rhs), rtol=rtol, atol=atol)
+    program_source = program_to_source(program)
+    np.testing.assert_allclose(golden, source_to_callable(program_source, program.name)(lhs, rhs), rtol=rtol, atol=atol)
 
     tiled = tile_program(program)
     logger.info(tiled)
-    np.testing.assert_allclose(golden, program_to_func(tiled)(lhs, rhs), rtol=rtol, atol=atol)
+    tiled_source = program_to_source(tiled)
+    np.testing.assert_allclose(golden, source_to_callable(tiled_source, tiled.name)(lhs, rhs), rtol=rtol, atol=atol)
 
 
 if __name__ == "__main__":

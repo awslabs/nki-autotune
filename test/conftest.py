@@ -4,7 +4,6 @@ from collections.abc import Callable
 
 import numpy as np
 import pytest
-from hypothesis import strategies as st
 
 import nkigym
 
@@ -64,29 +63,6 @@ def double_matmul_func() -> Callable[[np.ndarray, np.ndarray, np.ndarray], np.nd
     return double_matmul
 
 
-def assert_arrays_close(actual: np.ndarray, expected: np.ndarray, rtol: float = 1e-4, atol: float = 1e-4) -> None:
-    """Assert two arrays are numerically close with informative error messages.
-
-    Uses relaxed tolerances (rtol=1e-4, atol=1e-4) to account for floating-point
-    differences introduced by reduction tiling, where the order of operations
-    changes due to tiling the reduction dimension.
-
-    Args:
-        actual: Result from tiled function.
-        expected: Result from original function.
-        rtol: Relative tolerance.
-        atol: Absolute tolerance.
-
-    Raises:
-        AssertionError: If arrays differ beyond tolerance.
-    """
-    assert actual.shape == expected.shape, f"Shape mismatch: actual {actual.shape} vs expected {expected.shape}"
-    assert actual.dtype == expected.dtype, f"Dtype mismatch: actual {actual.dtype} vs expected {expected.dtype}"
-    np.testing.assert_allclose(
-        actual, expected, rtol=rtol, atol=atol, err_msg="Tiled function output differs from original"
-    )
-
-
 def normalize_source(source: str) -> str:
     """Normalize source code for comparison.
 
@@ -116,27 +92,3 @@ def make_random_array(shape: tuple[int, ...], seed: int, dtype: np.dtype = np.fl
     """
     rng = np.random.default_rng(seed)
     return rng.uniform(-1.0, 1.0, size=shape).astype(dtype)
-
-
-TILE_SIZE = 128
-
-
-@st.composite
-def matmul_input_shapes(draw: st.DrawFn) -> dict[str, tuple[int, int]]:
-    """Generate valid input shapes for nc_matmul operation.
-
-    Generates compatible shapes for nc_matmul: C[m, n] = A[k, m].T @ B[k, n]
-    where m, k, n are multiples of 128.
-
-    Args:
-        draw: Hypothesis draw function for generating values.
-
-    Returns:
-        Dictionary with keys 'a' and 'b' mapping to shape tuples:
-        - 'a': (k, m) shape for first matrix
-        - 'b': (k, n) shape for second matrix
-    """
-    m = draw(st.integers(min_value=1, max_value=4)) * TILE_SIZE
-    k = draw(st.integers(min_value=1, max_value=4)) * TILE_SIZE
-    n = draw(st.integers(min_value=1, max_value=4)) * TILE_SIZE
-    return {"a": (k, m), "b": (k, n)}

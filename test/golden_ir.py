@@ -3,7 +3,6 @@
 import numpy as np
 import pytest
 
-import nkigym
 from nkigym.ir import GymProgram, GymStatement, TensorRef
 
 
@@ -12,59 +11,13 @@ def _ref(name: str, shape: tuple[int, ...] = (128, 128)) -> TensorRef:
     return TensorRef(name, shape, tuple((0, s) for s in shape))
 
 
-def _fn_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Matmul: stationary.T @ moving."""
-    return nkigym.nc_matmul(a, b)
-
-
-def _fn_double_matmul(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
-    """Double matmul: (a.T @ b).T @ c."""
-    return nkigym.nc_matmul(nkigym.nc_matmul(a, b), c)
-
-
-def _fn_tensor_tensor(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Element-wise add."""
-    return nkigym.tensor_tensor(a, b, op=np.add)
-
-
-def _fn_activation(a: np.ndarray) -> np.ndarray:
-    """Tanh activation."""
-    return nkigym.activation(a, op=np.tanh)
-
-
-def _fn_assigned(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Matmul with assigned variable."""
-    result = nkigym.nc_matmul(a, b)
-    return result
-
-
-def _fn_transpose(a: np.ndarray) -> np.ndarray:
-    """Transpose."""
-    return nkigym.nc_transpose(a)
-
-
-def _fn_tensor_scalar(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Tensor-scalar multiply."""
-    return nkigym.tensor_scalar(a, b, op=np.multiply)
-
-
-def _fn_exp(a: np.ndarray) -> np.ndarray:
-    """Exp activation."""
-    return nkigym.activation(a, op=np.exp)
-
-
-def _fn_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Element-wise multiply."""
-    return nkigym.tensor_tensor(a, b, op=np.multiply)
-
-
-FUNC_TO_PROGRAM_CASES = [
+SOURCE_TO_PROGRAM_CASES = [
     pytest.param(
-        _fn_matmul,
+        "def matmul(a, b):\n    return nkigym.nc_matmul(a, b)\n",
         {"a": (128, 128), "b": (128, 128)},
         np.float32,
         GymProgram(
-            name="_fn_matmul",
+            name="matmul",
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
             stmts=(GymStatement("nc_matmul", (("stationary", _ref("a")), ("moving", _ref("b"))), _ref("_return")),),
@@ -74,11 +27,11 @@ FUNC_TO_PROGRAM_CASES = [
         id="matmul_128x128",
     ),
     pytest.param(
-        _fn_matmul,
+        "def matmul(a, b):\n    return nkigym.nc_matmul(a, b)\n",
         {"a": (256, 128), "b": (256, 512)},
         np.float32,
         GymProgram(
-            name="_fn_matmul",
+            name="matmul",
             params=("a", "b"),
             input_shapes=(("a", (256, 128)), ("b", (256, 512))),
             stmts=(
@@ -94,11 +47,11 @@ FUNC_TO_PROGRAM_CASES = [
         id="matmul_nonsquare",
     ),
     pytest.param(
-        _fn_double_matmul,
+        "def double_matmul(a, b, c):\n    return nkigym.nc_matmul(nkigym.nc_matmul(a, b), c)\n",
         {"a": (128, 128), "b": (128, 128), "c": (128, 128)},
         np.float32,
         GymProgram(
-            name="_fn_double_matmul",
+            name="double_matmul",
             params=("a", "b", "c"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128)), ("c", (128, 128))),
             stmts=(
@@ -111,11 +64,11 @@ FUNC_TO_PROGRAM_CASES = [
         id="double_matmul",
     ),
     pytest.param(
-        _fn_tensor_tensor,
+        "def tensor_tensor(a, b):\n    return nkigym.tensor_tensor(a, b, op=np.add)\n",
         {"a": (128, 128), "b": (128, 128)},
         np.float32,
         GymProgram(
-            name="_fn_tensor_tensor",
+            name="tensor_tensor",
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
             stmts=(
@@ -129,11 +82,11 @@ FUNC_TO_PROGRAM_CASES = [
         id="tensor_tensor",
     ),
     pytest.param(
-        _fn_activation,
+        "def activation(a):\n    return nkigym.activation(a, op=np.tanh)\n",
         {"a": (128, 128)},
         np.float32,
         GymProgram(
-            name="_fn_activation",
+            name="activation",
             params=("a",),
             input_shapes=(("a", (128, 128)),),
             stmts=(GymStatement("activation", (("data", _ref("a")), ("op", "np.tanh")), _ref("_return")),),
@@ -143,11 +96,11 @@ FUNC_TO_PROGRAM_CASES = [
         id="activation",
     ),
     pytest.param(
-        _fn_assigned,
+        "def assigned(a, b):\n    result = nkigym.nc_matmul(a, b)\n    return result\n",
         {"a": (128, 128), "b": (128, 128)},
         np.float32,
         GymProgram(
-            name="_fn_assigned",
+            name="assigned",
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
             stmts=(GymStatement("nc_matmul", (("stationary", _ref("a")), ("moving", _ref("b"))), _ref("result")),),
@@ -157,11 +110,11 @@ FUNC_TO_PROGRAM_CASES = [
         id="assigned_var",
     ),
     pytest.param(
-        _fn_transpose,
+        "def transpose(a):\n    return nkigym.nc_transpose(a)\n",
         {"a": (128, 64)},
         np.float32,
         GymProgram(
-            name="_fn_transpose",
+            name="transpose",
             params=("a",),
             input_shapes=(("a", (128, 64)),),
             stmts=(
@@ -177,11 +130,11 @@ FUNC_TO_PROGRAM_CASES = [
         id="transpose",
     ),
     pytest.param(
-        _fn_tensor_scalar,
+        "def tensor_scalar(a, b):\n    return nkigym.tensor_scalar(a, b, op=np.multiply)\n",
         {"a": (128, 128), "b": (128, 1)},
         np.float32,
         GymProgram(
-            name="_fn_tensor_scalar",
+            name="tensor_scalar",
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 1))),
             stmts=(
@@ -201,11 +154,11 @@ FUNC_TO_PROGRAM_CASES = [
         id="tensor_scalar",
     ),
     pytest.param(
-        _fn_exp,
+        "def exp(a):\n    return nkigym.activation(a, op=np.exp)\n",
         {"a": (128, 128)},
         np.float32,
         GymProgram(
-            name="_fn_exp",
+            name="exp",
             params=("a",),
             input_shapes=(("a", (128, 128)),),
             stmts=(GymStatement("activation", (("data", _ref("a")), ("op", "np.exp")), _ref("_return")),),
@@ -215,11 +168,11 @@ FUNC_TO_PROGRAM_CASES = [
         id="activation_exp",
     ),
     pytest.param(
-        _fn_multiply,
+        "def multiply(a, b):\n    return nkigym.tensor_tensor(a, b, op=np.multiply)\n",
         {"a": (128, 128), "b": (128, 128)},
         np.float32,
         GymProgram(
-            name="_fn_multiply",
+            name="multiply",
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
             stmts=(
@@ -236,7 +189,7 @@ FUNC_TO_PROGRAM_CASES = [
     ),
 ]
 
-PROGRAM_TO_FUNC_CASES = [
+PROGRAM_TO_SOURCE_CASES = [
     pytest.param(
         GymProgram(
             name="matmul",
@@ -481,136 +434,57 @@ PROGRAM_TO_FUNC_CASES = [
     ),
 ]
 
-ROUND_TRIP_CASES = [
+F_ROUND_TRIP_CASES = [
     pytest.param(
-        _fn_matmul,
+        "import numpy as np\nimport nkigym\ndef matmul(a, b):\n    _return = nkigym.nc_matmul(a[0:128, 0:128], b[0:128, 0:128])\n    return _return\n\n",
         {"a": (128, 128), "b": (128, 128)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_matmul(a, b):\n"
-            "    _return = nkigym.nc_matmul(a[0:128, 0:128], b[0:128, 0:128])\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="matmul_128x128",
     ),
     pytest.param(
-        _fn_matmul,
+        "import numpy as np\nimport nkigym\ndef matmul(a, b):\n    _return = nkigym.nc_matmul(a[0:256, 0:128], b[0:256, 0:512])\n    return _return\n\n",
         {"a": (256, 128), "b": (256, 512)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_matmul(a, b):\n"
-            "    _return = nkigym.nc_matmul(a[0:256, 0:128], b[0:256, 0:512])\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="matmul_nonsquare",
     ),
     pytest.param(
-        _fn_double_matmul,
+        "import numpy as np\nimport nkigym\ndef double_matmul(a, b, c):\n    _nested_0 = nkigym.nc_matmul(a[0:128, 0:128], b[0:128, 0:128])\n    _return = nkigym.nc_matmul(_nested_0[0:128, 0:128], c[0:128, 0:128])\n    return _return\n\n",
         {"a": (128, 128), "b": (128, 128), "c": (128, 128)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_double_matmul(a, b, c):\n"
-            "    _nested_0 = nkigym.nc_matmul(a[0:128, 0:128], b[0:128, 0:128])\n"
-            "    _return = nkigym.nc_matmul(_nested_0[0:128, 0:128], c[0:128, 0:128])\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="double_matmul",
     ),
     pytest.param(
-        _fn_tensor_tensor,
+        "import numpy as np\nimport nkigym\ndef tensor_tensor(a, b):\n    _return = nkigym.tensor_tensor(a[0:128, 0:128], b[0:128, 0:128], op=np.add)\n    return _return\n\n",
         {"a": (128, 128), "b": (128, 128)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_tensor_tensor(a, b):\n"
-            "    _return = nkigym.tensor_tensor(a[0:128, 0:128], b[0:128, 0:128], op=np.add)\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="tensor_tensor",
     ),
     pytest.param(
-        _fn_activation,
+        "import numpy as np\nimport nkigym\ndef activation(a):\n    _return = nkigym.activation(a[0:128, 0:128], op=np.tanh)\n    return _return\n\n",
         {"a": (128, 128)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_activation(a):\n"
-            "    _return = nkigym.activation(a[0:128, 0:128], op=np.tanh)\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="activation_tanh",
     ),
     pytest.param(
-        _fn_transpose,
+        "import numpy as np\nimport nkigym\ndef transpose(a):\n    _return = nkigym.nc_transpose(a[0:128, 0:64])\n    return _return\n\n",
         {"a": (128, 64)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_transpose(a):\n"
-            "    _return = nkigym.nc_transpose(a[0:128, 0:64])\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="transpose",
     ),
     pytest.param(
-        _fn_transpose,
+        "import numpy as np\nimport nkigym\ndef transpose(a):\n    _return = nkigym.nc_transpose(a[0:64, 0:256])\n    return _return\n\n",
         {"a": (64, 256)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_transpose(a):\n"
-            "    _return = nkigym.nc_transpose(a[0:64, 0:256])\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="transpose_wide",
     ),
     pytest.param(
-        _fn_tensor_scalar,
+        "import numpy as np\nimport nkigym\ndef tensor_scalar(a, b):\n    _return = nkigym.tensor_scalar(a[0:128, 0:128], b[0:128, 0:1], op=np.multiply)\n    return _return\n\n",
         {"a": (128, 128), "b": (128, 1)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_tensor_scalar(a, b):\n"
-            "    _return = nkigym.tensor_scalar(a[0:128, 0:128], b[0:128, 0:1], op=np.multiply)\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="tensor_scalar",
     ),
     pytest.param(
-        _fn_exp,
+        "import numpy as np\nimport nkigym\ndef exp(a):\n    _return = nkigym.activation(a[0:128, 0:128], op=np.exp)\n    return _return\n\n",
         {"a": (128, 128)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_exp(a):\n"
-            "    _return = nkigym.activation(a[0:128, 0:128], op=np.exp)\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="activation_exp",
     ),
     pytest.param(
-        _fn_multiply,
+        "import numpy as np\nimport nkigym\ndef multiply(a, b):\n    _return = nkigym.tensor_tensor(a[0:128, 0:128], b[0:128, 0:128], op=np.multiply)\n    return _return\n\n",
         {"a": (128, 128), "b": (128, 128)},
-        (
-            "import numpy as np\n"
-            "import nkigym\n"
-            "def _fn_multiply(a, b):\n"
-            "    _return = nkigym.tensor_tensor(a[0:128, 0:128], b[0:128, 0:128], op=np.multiply)\n"
-            "    return _return\n"
-            "\n"
-        ),
         id="tensor_tensor_multiply",
     ),
 ]
+
+P_ROUND_TRIP_CASES = [pytest.param(case.values[3], id=case.id) for case in SOURCE_TO_PROGRAM_CASES]

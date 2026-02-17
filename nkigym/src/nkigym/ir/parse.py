@@ -1,36 +1,29 @@
-"""Parse nkigym callables into GymProgram IR."""
+"""GymProgram IR: source parsing and source rendering.
+
+Provides bidirectional translation between Python source code using nkigym
+ops and the GymProgram IR:
+
+- ``source_to_program``: parse source AST into a specialized GymProgram
+- ``program_to_source``: render a GymProgram back to Python source
+"""
 
 import ast
-from collections.abc import Callable
 from typing import Any
 
 from nkigym.ir.tensor import TensorRef
 from nkigym.ir.types import GymProgram, GymStatement
 from nkigym.ops.base import GymOp
-from nkigym.utils.source import callable_to_source
 
 
-def _full_slices(shape: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
-    """Build full-range slices from a shape.
+def source_to_program(source: str, input_shapes: dict[str, tuple[int, ...]], output_dtype: type) -> GymProgram:
+    """Parse nkigym source code into a specialized GymProgram.
 
-    Args:
-        shape: Tensor shape tuple.
-
-    Returns:
-        Per-axis (0, size) bounds.
-    """
-    return tuple((0, s) for s in shape)
-
-
-def func_to_program(func: Callable, input_shapes: dict[str, tuple[int, ...]], output_dtype: type) -> GymProgram:
-    """Parse a nkigym callable into a specialized GymProgram.
-
-    Parses the function AST, specializes with the given input shapes,
+    Parses the source AST, specializes with the given input shapes,
     infers output shapes through the op chain, and produces a fully-typed
     program where every tensor reference carries shape and slice info.
 
     Args:
-        func: A callable using nkigym ops.
+        source: Python source code containing a function using nkigym ops.
         input_shapes: Mapping from parameter names to shape tuples.
         output_dtype: Numpy dtype type for output allocation.
 
@@ -40,7 +33,6 @@ def func_to_program(func: Callable, input_shapes: dict[str, tuple[int, ...]], ou
     Raises:
         ValueError: If the function structure is not recognized.
     """
-    source = callable_to_source(func)
     tree = ast.parse(source)
     func_def = None
     for node in tree.body:
@@ -92,6 +84,51 @@ def func_to_program(func: Callable, input_shapes: dict[str, tuple[int, ...]], ou
         return_var=return_var,
         output_dtype=output_dtype,
     )
+
+
+def program_to_source(program: GymProgram) -> str:
+    """Render a GymProgram as Python source code.
+
+    Each statement is rendered directly from its TensorRef with no
+    cross-statement shape tracking.
+
+    Args:
+        program: A GymProgram.
+
+    Returns:
+        Complete Python source code string with imports.
+    """
+    lines: list[str] = ["import numpy as np", "import nkigym"]
+
+    params_str = ", ".join(program.params)
+    lines.append(f"def {program.name}({params_str}):")
+
+    for stmt in program.stmts:
+        if stmt.op == "np_empty":
+            lines.append(_render_np_empty(stmt))
+        elif stmt.op == "np_slice":
+            lines.append(_render_np_slice(stmt))
+        elif stmt.op == "np_store":
+            lines.append(_render_np_store(stmt))
+        else:
+            lines.append(_render_compute(stmt))
+
+    lines.append(f"    return {program.return_var}")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def _full_slices(shape: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
+    """Build full-range slices from a shape.
+
+    Args:
+        shape: Tensor shape tuple.
+
+    Returns:
+        Per-axis (0, size) bounds.
+    """
+    return tuple((0, s) for s in shape)
 
 
 def _specialize(
@@ -233,17 +270,22 @@ def _is_nkigym_call(call: ast.Call) -> bool:
 def _arg_name(node: ast.expr) -> str:
     """Extract variable name from an AST expression.
 
+    Handles both plain names (``a``) and subscripted names (``a[0:128, 0:128]``),
+    returning just the base variable name in either case.
+
     Args:
-        node: AST expression node (expected ``ast.Name``).
+        node: AST expression node.
 
     Returns:
         Variable name string.
 
     Raises:
-        ValueError: If the expression is not a simple Name.
+        ValueError: If the expression is not a Name or Subscript of a Name.
     """
     if isinstance(node, ast.Name):
         return node.id
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+        return node.value.id
     raise ValueError(f"Expected a variable name, got {ast.dump(node)}")
 
 
@@ -269,3 +311,103 @@ def _expr_to_str(node: ast.expr) -> str:
     if isinstance(node, ast.Constant):
         return repr(node.value)
     raise ValueError(f"Unsupported kwarg expression: {ast.dump(node)}")
+
+
+def _subscript(ref: TensorRef) -> str:
+    """Render a TensorRef as a subscripted variable.
+
+    Scalar tensors (empty slices) are rendered as plain variable names.
+
+    Args:
+        ref: Tensor reference with name and slices.
+
+    Returns:
+        String like ``tensor_0[0:128, 0:128]`` or ``scalar`` for scalars.
+    """
+    if not ref.slices:
+        return ref.name
+    slices = ", ".join(f"{s}:{e}" for s, e in ref.slices)
+    return f"{ref.name}[{slices}]"
+
+
+def _render_np_empty(stmt: GymStatement) -> str:
+    """Render an np_empty statement.
+
+    Args:
+        stmt: The np_empty GymStatement.
+
+    Returns:
+        Source line like ``output = np.empty((128, 128), dtype=np.float32)``.
+    """
+    dtype = ""
+    for key, value in stmt.kwargs:
+        if key == "dtype":
+            dtype = value
+    shape_str = ", ".join(str(s) for s in stmt.output.shape)
+    return f"    {stmt.output.name} = np.empty(({shape_str}), dtype={dtype})"
+
+
+def _render_np_slice(stmt: GymStatement) -> str:
+    """Render an np_slice statement.
+
+    Args:
+        stmt: The np_slice GymStatement.
+
+    Returns:
+        Source line like ``tensor_0 = a[0:128, 0:128]``.
+    """
+    src = None
+    for key, value in stmt.kwargs:
+        if key == "src":
+            src = value
+    slices = ", ".join(f"{s}:{e}" for s, e in src.slices)
+    return f"    {stmt.output.name} = {src.name}[{slices}]"
+
+
+def _render_np_store(stmt: GymStatement) -> str:
+    """Render an np_store statement.
+
+    Args:
+        stmt: The np_store GymStatement.
+
+    Returns:
+        Source line like ``output[0:128, 0:128] = tensor_2[0:128, 0:128]``.
+    """
+    src = None
+    dst = None
+    for key, value in stmt.kwargs:
+        if key == "src":
+            src = value
+        elif key == "dst":
+            dst = value
+    return f"    {_subscript(dst)} = {_subscript(src)}"
+
+
+def _render_compute(stmt: GymStatement) -> str:
+    """Render a compute GymStatement.
+
+    Handles both first-write (``var = nkigym.op(...)``) and accumulation
+    (``var[subscripts] += nkigym.op(...)``).
+
+    Args:
+        stmt: The compute GymStatement.
+
+    Returns:
+        Source line like ``tensor_2 = nkigym.nc_matmul(...)``.
+    """
+    acc_ref = None
+    args: list[str] = []
+    for key, value in stmt.kwargs:
+        if key == "acc":
+            acc_ref = value
+        elif isinstance(value, TensorRef):
+            args.append(_subscript(value))
+        else:
+            args.append(f"{key}={value}")
+
+    args_str = ", ".join(args)
+    call = f"nkigym.{stmt.op}({args_str})"
+
+    if acc_ref is not None:
+        return f"    {_subscript(acc_ref)} += {call}"
+    return f"    {stmt.output.name} = {call}"

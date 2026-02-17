@@ -7,11 +7,12 @@ Verifies that for each input shape configuration:
 
 import numpy as np
 import pytest
-from conftest import assert_arrays_close, make_random_array, normalize_source
+from conftest import make_random_array, normalize_source
 from tiling_golden import GOLDEN_DOUBLE_MATMUL_SOURCE, GOLDEN_SINGLE_MATMUL_SOURCE
 
-from nkigym.ir import func_to_program, program_to_func, program_to_source
+from nkigym.ir import program_to_source, source_to_program
 from nkigym.tiling import tile_program
+from nkigym.utils.source import callable_to_source, source_to_callable
 
 
 def _shape_id(shapes: tuple[tuple[int, int], ...]) -> str:
@@ -42,7 +43,8 @@ class TestSingleMatmulTiling:
             b_shape: Shape of the second input matrix.
             matmul_func: Fixture providing the matmul function.
         """
-        program = func_to_program(matmul_func, {"a": a_shape, "b": b_shape}, np.float32)
+        source = callable_to_source(matmul_func)
+        program = source_to_program(source, {"a": a_shape, "b": b_shape}, np.float32)
         tiled = tile_program(program)
 
         actual_source = program_to_source(tiled)
@@ -52,8 +54,8 @@ class TestSingleMatmulTiling:
         a = make_random_array(a_shape, seed=42)
         b = make_random_array(b_shape, seed=43)
         expected = matmul_func(a, b)
-        actual = program_to_func(tiled)(a, b)
-        assert_arrays_close(actual, expected)
+        actual = source_to_callable(actual_source, tiled.name)(a, b)
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
 
 
 class TestDoubleMatmulTiling:
@@ -75,7 +77,8 @@ class TestDoubleMatmulTiling:
             c_shape: Shape of the third input matrix.
             double_matmul_func: Fixture providing the double matmul function.
         """
-        program = func_to_program(double_matmul_func, {"a": a_shape, "b": b_shape, "c": c_shape}, np.float32)
+        source = callable_to_source(double_matmul_func)
+        program = source_to_program(source, {"a": a_shape, "b": b_shape, "c": c_shape}, np.float32)
         tiled = tile_program(program)
 
         actual_source = program_to_source(tiled)
@@ -86,5 +89,5 @@ class TestDoubleMatmulTiling:
         b = make_random_array(b_shape, seed=43)
         c = make_random_array(c_shape, seed=44)
         expected = double_matmul_func(a, b, c)
-        actual = program_to_func(tiled)(a, b, c)
-        assert_arrays_close(actual, expected)
+        actual = source_to_callable(actual_source, tiled.name)(a, b, c)
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)

@@ -74,14 +74,14 @@ class TestSourceToCallable:
         with pytest.raises(SyntaxError):
             source_to_callable(EXEC_BAD_SYNTAX_SOURCE, "broken")
 
-    def test_numpy_available_in_namespace(self) -> None:
-        """Source code can use np (numpy) from the execution namespace."""
+    def test_numpy_available_via_import(self) -> None:
+        """Source code can use np (numpy) via its own import."""
         func = source_to_callable(EXEC_NUMPY_SOURCE, "zeros")
         result = func()
         assert result.shape == (3,)
         assert (result == 0).all()
 
-    def test_nkigym_available_in_namespace(self) -> None:
-        """Source code can reference nkigym from the execution namespace."""
+    def test_nkigym_available_via_import(self) -> None:
+        """Source code can reference nkigym via its own import."""
         func = source_to_callable(EXEC_NKIGYM_SOURCE, "get_mod")
         assert func() is nkigym_mod
