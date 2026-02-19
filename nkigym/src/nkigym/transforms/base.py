@@ -1,11 +1,11 @@
 """Base class for NKI Gym IR transforms.
 
-All transforms follow the analyze-then-transform pattern on the tuple IR:
+All transforms follow the analyze-then-transform pattern on GymProgram:
 
-1. ``analyze_ir(program)`` — inspect a program tuple and return a list of
+1. ``analyze_ir(program)`` — inspect a GymProgram and return a list of
    individual transform opportunities.
 2. ``transform_ir(program, option)`` — apply a single opportunity, returning
-   a new program tuple.
+   a new GymProgram.
 
 The autotuner calls ``analyze_ir()`` to discover opportunities, selects which
 to apply, and calls ``transform_ir()`` for each.
@@ -14,14 +14,14 @@ to apply, and calls ``transform_ir()`` for each.
 from abc import ABC, abstractmethod
 from typing import Any
 
-from nkigym.ir import Program
+from nkigym.ir import GymProgram
 
 
 class Transform(ABC):
     """Base class for nkigym IR transforms.
 
     Subclasses implement ``analyze_ir`` and ``transform_ir`` which operate
-    on the tuple-based program IR directly.
+    on GymProgram directly.
 
     Attributes:
         name: Human-readable name for logging and diagnostics.
@@ -30,11 +30,11 @@ class Transform(ABC):
     name: str
 
     @abstractmethod
-    def analyze_ir(self, program: Program) -> list[Any]:
-        """Find optimization opportunities on the tuple-based program.
+    def analyze_ir(self, program: GymProgram) -> list[Any]:
+        """Find optimization opportunities on a GymProgram.
 
         Args:
-            program: Program tuple (name, params, stmts, return_var).
+            program: A tiled GymProgram.
 
         Returns:
             List of transform opportunities. Each element is a single option
@@ -42,13 +42,13 @@ class Transform(ABC):
         """
 
     @abstractmethod
-    def transform_ir(self, program: Program, option: Any) -> Program:
-        """Apply one opportunity, return new program tuple.
+    def transform_ir(self, program: GymProgram, option: Any) -> GymProgram:
+        """Apply one opportunity, return new GymProgram.
 
         Args:
-            program: Program tuple to transform.
+            program: GymProgram to transform.
             option: A single opportunity from ``analyze_ir()``.
 
         Returns:
-            New program tuple with the optimization applied.
+            New GymProgram with the optimization applied.
         """

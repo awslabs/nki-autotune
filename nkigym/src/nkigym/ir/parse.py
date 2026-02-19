@@ -343,6 +343,8 @@ def _render_np_empty(stmt: GymStatement) -> str:
     for key, value in stmt.kwargs:
         if key == "dtype":
             dtype = value
+    if not dtype:
+        raise ValueError(f"np_empty statement for '{stmt.output.name}' missing 'dtype' kwarg")
     shape_str = ", ".join(str(s) for s in stmt.output.shape)
     return f"    {stmt.output.name} = np.empty(({shape_str}), dtype={dtype})"
 
@@ -360,6 +362,8 @@ def _render_np_slice(stmt: GymStatement) -> str:
     for key, value in stmt.kwargs:
         if key == "src":
             src = value
+    if src is None:
+        raise ValueError(f"np_slice statement for '{stmt.output.name}' missing 'src' kwarg")
     slices = ", ".join(f"{s}:{e}" for s, e in src.slices)
     return f"    {stmt.output.name} = {src.name}[{slices}]"
 
@@ -380,6 +384,10 @@ def _render_np_store(stmt: GymStatement) -> str:
             src = value
         elif key == "dst":
             dst = value
+    if src is None:
+        raise ValueError(f"np_store statement for '{stmt.output.name}' missing 'src' kwarg")
+    if dst is None:
+        raise ValueError(f"np_store statement for '{stmt.output.name}' missing 'dst' kwarg")
     return f"    {_subscript(dst)} = {_subscript(src)}"
 
 

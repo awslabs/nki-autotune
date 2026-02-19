@@ -1,7 +1,7 @@
 """Data reuse analysis and transform for tiled compute graphs.
 
 Identifies tensor slices that can be merged across subgraphs, reducing
-redundant load operations. Operates on the tuple-based program IR.
+redundant load operations. Operates on the GymProgram IR.
 
 Example::
 
@@ -13,36 +13,42 @@ Example::
 
 from itertools import combinations
 
-from nkigym.ir import Operand, Program, Statement
-from nkigym.ops import LoadOp
+from nkigym.ir import GymProgram, GymStatement, TensorRef
 from nkigym.transforms.base import Transform
 
 
-def normalize_reuse_groups(groups: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
-    """Normalize reuse groups for order-independent comparison.
-
-    Sorts elements within each tuple and sorts the list of tuples.
+def _rename_ref(ref: TensorRef, rename_map: dict[str, str]) -> TensorRef:
+    """Replace variable name in a TensorRef according to rename_map.
 
     Args:
-        groups: List of reuse group tuples.
-
-    Returns:
-        Normalized list with sorted tuples in sorted order.
-    """
-    return sorted([tuple(sorted(g)) for g in groups])
-
-
-def _rename_operands(operands: tuple[Operand, ...], rename_map: dict[str, str]) -> tuple[Operand, ...]:
-    """Replace variable names in operand tuples according to rename_map.
-
-    Args:
-        operands: Tuple of (var_name, slices) pairs.
+        ref: Tensor reference to rename.
         rename_map: Mapping from old variable names to new names.
 
     Returns:
-        New operands tuple with renamed variables.
+        New TensorRef with renamed variable, or original if not in map.
     """
-    return tuple((rename_map.get(var, var), slices) for var, slices in operands)
+    new_name = rename_map.get(ref.name, ref.name)
+    return TensorRef(new_name, ref.shape, ref.slices)
+
+
+def _rename_kwargs(
+    kwargs: tuple[tuple[str, object], ...], rename_map: dict[str, str]
+) -> tuple[tuple[str, object], ...]:
+    """Replace variable names in kwargs TensorRef values according to rename_map.
+
+    Args:
+        kwargs: Statement keyword argument pairs.
+        rename_map: Mapping from old variable names to new names.
+
+    Returns:
+        New kwargs tuple with renamed TensorRef values.
+    """
+    new_kwargs: list[tuple[str, object]] = []
+    for key, value in kwargs:
+        if isinstance(value, TensorRef):
+            value = _rename_ref(value, rename_map)
+        new_kwargs.append((key, value))
+    return tuple(new_kwargs)
 
 
 class DataReuseTransform(Transform):
@@ -64,30 +70,33 @@ class DataReuseTransform(Transform):
 
     name = "data_reuse"
 
-    def analyze_ir(self, program: Program) -> list[tuple[str, str]]:
+    def analyze_ir(self, program: GymProgram) -> list[tuple[str, str]]:
         """Identify pairs of tensor slices that can be merged across subgraphs.
 
-        Groups load statements by (src_var, src_slices) and returns pairs
+        Groups np_slice statements by (src_name, src_slices) and returns pairs
         of dst variables that share identical load patterns.
 
         Args:
-            program: Program tuple (name, params, stmts, return_var).
+            program: GymProgram tuple.
 
         Returns:
             List of mergeable pairs. Each pair is a tuple of two tensor
             variable names that access identical data
             (e.g., ``('tensor_0', 'tensor_3')``).
         """
-        stmts = program.stmts
-
-        load_groups: dict[tuple, list[str]] = {}
-        for stmt in stmts:
-            if not isinstance(stmt.op, LoadOp):
+        load_groups: dict[tuple[str, tuple[tuple[int, int], ...]], list[str]] = {}
+        for stmt in program.stmts:
+            if stmt.op != "np_slice":
                 continue
-            src_var, src_slices = stmt.operands[0]
-            dst_var, _ = stmt.operands[1]
-            key = (src_var, src_slices)
-            load_groups.setdefault(key, []).append(dst_var)
+            src_ref = None
+            for key, value in stmt.kwargs:
+                if key == "src":
+                    src_ref = value
+            if src_ref is None:
+                raise ValueError("np_slice statement missing 'src' kwarg")
+            key = (src_ref.name, src_ref.slices)
+            dst_name = stmt.output.name
+            load_groups.setdefault(key, []).append(dst_name)
 
         pairs: list[tuple[str, str]] = []
         for dst_vars in load_groups.values():
@@ -95,18 +104,18 @@ class DataReuseTransform(Transform):
                 pairs.extend(combinations(dst_vars, 2))
         return pairs
 
-    def transform_ir(self, program: Program, pair: tuple[str, str]) -> Program:
+    def transform_ir(self, program: GymProgram, pair: tuple[str, str]) -> GymProgram:
         """Merge a single pair of reusable tensor slices.
 
         Removes the second tensor's load statement and replaces all its
         references with the first tensor.
 
         Args:
-            program: Program tuple to transform.
+            program: GymProgram to transform.
             pair: A pair of tensor names from ``analyze_ir()``.
 
         Returns:
-            New program tuple with the pair's redundant load merged.
+            New GymProgram with the pair's redundant load merged.
 
         Raises:
             ValueError: If tensor names are identical or don't share slices.
@@ -115,14 +124,17 @@ class DataReuseTransform(Transform):
         if keep == drop:
             raise ValueError(f"Cannot merge {keep} with itself")
 
-        name, params, stmts, return_var, preamble = program
-
-        load_sources: dict[str, tuple] = {}
-        for stmt in stmts:
-            if isinstance(stmt.op, LoadOp):
-                dst_var = stmt.operands[1][0]
-                src_key = (stmt.operands[0][0], stmt.operands[0][1])
-                load_sources[dst_var] = src_key
+        load_sources: dict[str, tuple[str, tuple[tuple[int, int], ...]]] = {}
+        for stmt in program.stmts:
+            if stmt.op == "np_slice":
+                dst_name = stmt.output.name
+                src_ref = None
+                for key, value in stmt.kwargs:
+                    if key == "src":
+                        src_ref = value
+                if src_ref is None:
+                    raise ValueError("np_slice statement missing 'src' kwarg")
+                load_sources[dst_name] = (src_ref.name, src_ref.slices)
 
         for tensor_name in (keep, drop):
             if tensor_name not in load_sources:
@@ -132,10 +144,23 @@ class DataReuseTransform(Transform):
             raise ValueError(f"Tensors '{keep}' and '{drop}' do not share identical slices")
 
         rename_map = {drop: keep}
-        new_stmts: list[Statement] = []
-        for stmt in stmts:
-            if isinstance(stmt.op, LoadOp) and stmt.operands[1][0] == drop:
+        new_stmts: list[GymStatement] = []
+        for stmt in program.stmts:
+            if stmt.op == "np_slice" and stmt.output.name == drop:
                 continue
-            new_stmts.append(Statement(stmt.op, _rename_operands(stmt.operands, rename_map), stmt.first_write))
+            new_stmts.append(
+                GymStatement(
+                    op=stmt.op,
+                    kwargs=_rename_kwargs(stmt.kwargs, rename_map),
+                    output=_rename_ref(stmt.output, rename_map),
+                )
+            )
 
-        return Program(name, params, tuple(new_stmts), return_var, preamble)
+        return GymProgram(
+            name=program.name,
+            params=program.params,
+            input_shapes=program.input_shapes,
+            stmts=tuple(new_stmts),
+            return_var=program.return_var,
+            output_dtype=program.output_dtype,
+        )

@@ -18,20 +18,21 @@ from typing import Any
 
 import numpy as np
 
-from nkigym.ir import Program, ir_to_callable, ir_to_source
-from nkigym.tiling import generate_tiled_ir
+from nkigym.ir import GymProgram, program_to_source, source_to_program
+from nkigym.tiling import tile_program
 from nkigym.transforms.base import Transform
 from nkigym.utils import callable_to_source, import_func
+from nkigym.utils.source import source_to_callable
 
 
-def _collect_opportunities_ir(program: Program, transforms: list[Transform]) -> list[tuple[Transform, Any]]:
+def _collect_opportunities_ir(program: GymProgram, transforms: list[Transform]) -> list[tuple[Transform, Any]]:
     """Collect all available transform opportunities for a program.
 
     Calls ``analyze_ir()`` on each transform and flattens the results into
     ``(transform, option)`` pairs.
 
     Args:
-        program: Program tuple to analyze.
+        program: GymProgram tuple to analyze.
         transforms: List of transforms to query for opportunities.
 
     Returns:
@@ -49,13 +50,13 @@ class _Node:
     """A node in the transform state graph.
 
     Attributes:
-        program: Program tuple for this state (used as dedup key).
+        program: GymProgram tuple for this state (used as dedup key).
         opportunities: All ``(transform, option)`` pairs available here.
         unexplored: Indices into ``opportunities`` not yet expanded.
         depth: Depth at which this node was first discovered.
     """
 
-    program: Program
+    program: GymProgram
     opportunities: list[tuple[Transform, Any]]
     unexplored: list[int]
     depth: int
@@ -73,19 +74,19 @@ class _TransformGraph:
     Attributes:
         nodes: Map from program tuple to ``_Node``.
         edges: Map from ``(parent_program, opp_idx)`` to child program tuple.
-        frontier: Program tuples of nodes with unexplored opportunities.
+        frontier: GymProgram tuples of nodes with unexplored opportunities.
         _frontier_index: Map from frontier program to its index in
             ``frontier``, enabling O(1) add/remove.
         transforms: Transforms defining the search space.
     """
 
-    nodes: dict[Program, _Node] = field(default_factory=dict)
-    edges: dict[tuple[Program, int], Program] = field(default_factory=dict)
-    frontier: list[Program] = field(default_factory=list)
-    _frontier_index: dict[Program, int] = field(default_factory=dict)
+    nodes: dict[GymProgram, _Node] = field(default_factory=dict)
+    edges: dict[tuple[GymProgram, int], GymProgram] = field(default_factory=dict)
+    frontier: list[GymProgram] = field(default_factory=list)
+    _frontier_index: dict[GymProgram, int] = field(default_factory=dict)
     transforms: list[Transform] = field(default_factory=list)
 
-    def __init__(self, program: Program, transforms: list[Transform]) -> None:
+    def __init__(self, program: GymProgram, transforms: list[Transform]) -> None:
         """Initialize the graph with a root node.
 
         Args:
@@ -100,20 +101,20 @@ class _TransformGraph:
 
         self._add_node(program, depth=0)
 
-    def _frontier_add(self, program: Program) -> None:
+    def _frontier_add(self, program: GymProgram) -> None:
         """Add a program to the frontier in O(1).
 
         Args:
-            program: Program tuple to add.
+            program: GymProgram tuple to add.
         """
         self._frontier_index[program] = len(self.frontier)
         self.frontier.append(program)
 
-    def _frontier_remove(self, program: Program) -> None:
+    def _frontier_remove(self, program: GymProgram) -> None:
         """Remove a program from the frontier in O(1) via swap-and-pop.
 
         Args:
-            program: Program tuple to remove.
+            program: GymProgram tuple to remove.
         """
         idx = self._frontier_index.pop(program)
         last = self.frontier[-1]
@@ -122,11 +123,11 @@ class _TransformGraph:
             self._frontier_index[last] = idx
         self.frontier.pop()
 
-    def _add_node(self, program: Program, depth: int) -> bool:
+    def _add_node(self, program: GymProgram, depth: int) -> bool:
         """Register a new node in the graph.
 
         Args:
-            program: Program tuple for this state.
+            program: GymProgram tuple for this state.
             depth: Discovery depth.
 
         Returns:
@@ -202,10 +203,10 @@ def _process_variant(
     variant_idx = depth_counts.get(node.depth, 0)
     depth_counts[node.depth] = variant_idx + 1
     filename = f"nkigym_d{node.depth}_v{variant_idx}.py"
-    source = ir_to_source(node.program)
+    source = program_to_source(node.program)
     (cache_dir / filename).write_text(source)
 
-    func = ir_to_callable(node.program)
+    func = source_to_callable(source, node.program.name)
     actual = func(**kernel_kwargs)
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
@@ -218,7 +219,7 @@ def search(
     min_depth: int,
     save_cache: Path,
     kernel_kwargs: dict[str, Any],
-) -> list[Program]:
+) -> list[GymProgram]:
     """Search the transform state graph for unique kernel variants.
 
     Expands random frontier nodes until ``num_targets`` unique nodes at or
@@ -263,8 +264,10 @@ def search(
     expected = imported_func(**kernel_kwargs)
 
     output_dtype = next(iter(kernel_kwargs.values())).dtype
-    program = generate_tiled_ir(func, kernel_kwargs, output_dtype)
-    root_source = ir_to_source(program)
+    input_shapes = {k: v.shape for k, v in kernel_kwargs.items()}
+    source = callable_to_source(func)
+    program = tile_program(source_to_program(source, input_shapes, output_dtype))
+    root_source = program_to_source(program)
     root_func_path = save_cache / "nkigym_root.py"
     root_func_path.write_text(root_source)
 
@@ -273,7 +276,7 @@ def search(
     graph = _TransformGraph(program, transforms)
     rng = random.Random(seed) if seed is not None else random.Random()
 
-    qualifying: list[Program] = []
+    qualifying: list[GymProgram] = []
 
     root_node = next(iter(graph.nodes.values()))
     if root_node.depth >= min_depth:

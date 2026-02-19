@@ -57,8 +57,9 @@ class TestTensorTensorOp:
         """Verify simulate(a, b) matches the numpy operation."""
         a = make_random_array(shape, seed=42)
         b = make_random_array(shape, seed=43)
-        actual = TensorTensorOp(kwargs_repr=(("op", op_repr),)).simulate(a, b)
-        expected = getattr(np, op_id)(a, b)
+        op_fn = getattr(np, op_id)
+        actual = TensorTensorOp().simulate(a, b, op=op_fn)
+        expected = op_fn(a, b)
         np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
 
 
@@ -71,8 +72,9 @@ class TestTensorScalarOp:
         """Verify simulate(data, scalar) matches the numpy operation."""
         data = make_random_array(shape, seed=42)
         scalar = np.float32(2.5)
-        actual = TensorScalarOp(kwargs_repr=(("op", op_repr),)).simulate(data, scalar)
-        expected = getattr(np, op_id)(data, scalar)
+        op_fn = getattr(np, op_id)
+        actual = TensorScalarOp().simulate(data, scalar, op=op_fn)
+        expected = op_fn(data, scalar)
         np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
 
 
@@ -84,7 +86,7 @@ class TestActivationOp:
     def test_simulate(self, shape: tuple[int, int], op_repr: str | None, op_id: str) -> None:
         """Verify simulate(data) matches the numpy activation."""
         data = make_random_array(shape, seed=42)
-        kwargs = (("op", op_repr),) if op_repr is not None else ()
-        actual = ActivationOp(kwargs_repr=kwargs).simulate(data)
-        expected = getattr(np, op_id)(data) if op_repr is not None else data.copy()
+        op_fn = getattr(np, op_id) if op_repr is not None else None
+        actual = ActivationOp().simulate(data, op=op_fn)
+        expected = op_fn(data) if op_fn is not None else data.copy()
         np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)

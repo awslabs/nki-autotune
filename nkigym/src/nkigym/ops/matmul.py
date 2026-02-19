@@ -15,6 +15,7 @@ class MatmulOp(GymOp):
     op_name = "nc_matmul"
     inputs = (Tensor("stationary", ("K", "M")), Tensor("moving", ("K", "N")))
     outputs = (Tensor("result", ("M", "N")),)
+    tile_limits = {"K": 128, "M": 128, "N": 512}
 
     def simulate(
         self, stationary: np.ndarray, moving: np.ndarray, *, acc: np.ndarray | None = None, **kwargs: object

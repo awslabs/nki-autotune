@@ -1,48 +1,58 @@
 """Tests for data reuse analysis and transform.
 
-Each case specifies a starting tiled function, expected reuse pairs,
-merge steps to apply, expected post-merge source, and input shapes
-for numerical equivalence verification.
+Each case specifies a pre-tiled before golden, expected reuse pairs,
+a merge count, and a post-merge after golden. The single parametrized
+test validates analysis correctness, IR transformation, and numerical
+equivalence.
 
 Run with: pytest test/test_data_reuse.py -v
 """
 
 import numpy as np
 import pytest
-from conftest import make_random_array, normalize_source
+from conftest import _golden_to_program, make_random_array
 from data_reuse_golden import CASES
 
-from nkigym.ir import callable_to_ir, ir_to_callable
-from nkigym.transforms import DataReuseTransform, normalize_reuse_groups
-from nkigym.utils import callable_to_source
+from nkigym.ir import program_to_source
+from nkigym.transforms import DataReuseTransform
+from nkigym.utils import source_to_callable
 
 _reuse = DataReuseTransform()
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.id)
 def test_data_reuse(case):
-    """Verify data reuse analysis, merge source, and numerical correctness.
+    """Verify data reuse analysis, IR transformation, and numerical equivalence.
 
     For each case:
-    1. Convert the starting function to IR and verify the expected reuse pairs.
-    2. If merges are specified, apply them and verify the merged source matches.
-    3. Verify the merged function produces numerically equivalent output.
+    1. Parse before golden into a GymProgram.
+    2. Assert analyze_ir returns exact expected pairs.
+    3. Apply merge_count iterative merges.
+    4. Parse after golden into a GymProgram.
+    5. Assert transformed stmts match after golden stmts.
+    6. Verify numerical equivalence between before and after callables.
+
+    Args:
+        case: DataReuseCase with before/after goldens, expected pairs, and merge count.
     """
-    program = callable_to_ir(case.func)
-    pairs = _reuse.analyze_ir(program)
-    assert normalize_reuse_groups(pairs) == normalize_reuse_groups(case.expected_pairs)
+    before_program = _golden_to_program(case.before, case.params, case.input_shapes, case.output_dtype)
 
-    if not case.merges:
-        return
+    pairs = _reuse.analyze_ir(before_program)
+    assert pairs == case.expected_pairs
 
-    merged_program = program
-    for pair in case.merges:
-        merged_program = _reuse.transform_ir(merged_program, pair)
-    merged_func = ir_to_callable(merged_program)
+    merged_program = before_program
+    for _ in range(case.merge_count):
+        pairs = _reuse.analyze_ir(merged_program)
+        assert len(pairs) > 0
+        merged_program = _reuse.transform_ir(merged_program, pairs[0])
 
-    assert normalize_source(callable_to_source(merged_func)) == normalize_source(case.expected_source)
+    after_program = _golden_to_program(case.after, case.params, case.input_shapes, case.output_dtype)
+    assert merged_program.stmts == after_program.stmts
 
-    inputs = [make_random_array(shape, seed=42 + i) for i, shape in enumerate(case.input_shapes)]
-    expected = case.func(*inputs)
-    actual = merged_func(*inputs)
+    before_func = source_to_callable(program_to_source(before_program), before_program.name)
+    after_func = source_to_callable(program_to_source(merged_program), merged_program.name)
+
+    inputs = [make_random_array(case.input_shapes[p], seed=42 + i) for i, p in enumerate(sorted(case.input_shapes))]
+    expected = before_func(*inputs)
+    actual = after_func(*inputs)
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-8)

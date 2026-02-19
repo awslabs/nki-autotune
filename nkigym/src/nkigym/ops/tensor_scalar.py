@@ -21,7 +21,7 @@ class TensorScalarOp(GymOp):
     def simulate(
         self,
         data: np.ndarray,
-        operand0: np.ndarray,
+        operand0: float | np.ndarray,
         *,
         op: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
         **kwargs: object,

@@ -19,7 +19,7 @@ Available transforms:
 """
 
 from nkigym.transforms.base import Transform
-from nkigym.transforms.data_reuse import DataReuseTransform, normalize_reuse_groups
+from nkigym.transforms.data_reuse import DataReuseTransform
 from nkigym.transforms.operand_merge import OperandMergeTransform
 
-__all__ = ["Transform", "DataReuseTransform", "normalize_reuse_groups", "OperandMergeTransform"]
+__all__ = ["Transform", "DataReuseTransform", "OperandMergeTransform"]

@@ -82,13 +82,14 @@ def main() -> None:
     source = callable_to_source(nkigym_matmul)
     program = source_to_program(source, {"lhs": (k, m), "rhs": (k, n)}, np.float64)
     logger.info(program)
-    program_source = program_to_source(program)
-    np.testing.assert_allclose(golden, source_to_callable(program_source, program.name)(lhs, rhs), rtol=rtol, atol=atol)
 
-    tiled = tile_program(program)
-    logger.info(tiled)
-    tiled_source = program_to_source(tiled)
-    np.testing.assert_allclose(golden, source_to_callable(tiled_source, tiled.name)(lhs, rhs), rtol=rtol, atol=atol)
+    tiled_program = tile_program(program)
+    logger.info(tiled_program)
+    tiled_source = program_to_source(tiled_program)
+    (cache_dir / "nkigym_tiled.py").write_text(tiled_source)
+    np.testing.assert_allclose(
+        golden, source_to_callable(tiled_source, tiled_program.name)(lhs, rhs), rtol=rtol, atol=atol
+    )
 
 
 if __name__ == "__main__":

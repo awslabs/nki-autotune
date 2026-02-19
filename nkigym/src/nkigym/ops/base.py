@@ -33,11 +33,14 @@ class GymOp(ABC):
         op_name: Unique name for registry lookup.
         inputs: Static descriptors for each input operand.
         outputs: Static descriptors for each output.
+        tile_limits: Maximum tile sizes per named dimension. Empty means
+            no limits (any merge size accepted).
     """
 
     op_name: str
     inputs: tuple[Tensor, ...]
     outputs: tuple[Tensor, ...]
+    tile_limits: dict[str, int] = {}
 
     _registry: dict[str, type["GymOp"]] = {}
 
@@ -87,6 +90,47 @@ class GymOp(ABC):
     def output_axes(self) -> tuple[tuple[str | int, ...], ...]:
         """Axis layouts derived from ``outputs``."""
         return tuple(t.axes for t in self.outputs)
+
+    def can_merge_operand_dim(self, operand_idx: int, dim: int, merged_size: int) -> bool:
+        """Check whether merging a dimension to a given size is within tile limits.
+
+        Maps (operand_idx, dim) to the named axis via the ``inputs`` and
+        ``outputs`` descriptors, then checks ``tile_limits``. Integer
+        constant axes (fixed-size dimensions like broadcast ``1``) cannot
+        be widened. Named axes without a ``tile_limits`` entry are
+        unconstrained.
+
+        Args:
+            operand_idx: Index into the combined (inputs + outputs) list.
+            dim: Dimension index within that operand's axes tuple.
+            merged_size: Proposed merged size for this dimension.
+
+        Returns:
+            True if within limits or no limit exists for the named axis.
+            False if the axis is a fixed-size constant.
+
+        Raises:
+            IndexError: If operand_idx or dim is out of range.
+        """
+        all_tensors = self.inputs + self.outputs
+        if operand_idx >= len(all_tensors):
+            raise IndexError(
+                f"operand_idx {operand_idx} out of range for {self.op_name} "
+                f"with {len(all_tensors)} tensors (inputs + outputs)"
+            )
+        axes = all_tensors[operand_idx].axes
+        if dim >= len(axes):
+            raise IndexError(
+                f"dim {dim} out of range for {self.op_name} operand "
+                f"{all_tensors[operand_idx].name} with {len(axes)} axes"
+            )
+        axis_name = axes[dim]
+        if isinstance(axis_name, int):
+            return False
+        limit = self.tile_limits.get(axis_name)
+        if limit is None:
+            return True
+        return merged_size <= limit
 
     def __call__(self, *args: np.ndarray, **kwargs: object) -> np.ndarray:
         """Dispatch to simulate.

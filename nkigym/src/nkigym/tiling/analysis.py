@@ -248,6 +248,10 @@ def analyze_tiling(program: GymProgram) -> TilingAnalysis:
     analysis.dim_info = all_dims
 
     for dim_id, info in all_dims.items():
+        if info.size % TILE_SIZE != 0:
+            raise ValueError(
+                f"Dimension {dim_id} has size {info.size} which is not " f"divisible by TILE_SIZE={TILE_SIZE}"
+            )
         if dim_id in return_dims:
             info.iter_type = "parallel"
             analysis.parallel_dims.append(dim_id)

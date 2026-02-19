@@ -52,13 +52,13 @@ class _LoopRun:
 
 
 def _is_alloc_stmt(stmt: ast.stmt) -> bool:
-    """Check if a statement is an nkigym.ndarray allocation.
+    """Check if a statement is an np.empty allocation.
 
     Args:
         stmt: AST statement node.
 
     Returns:
-        True if the statement is an nkigym.ndarray call.
+        True if the statement is an np.empty call.
     """
     if not isinstance(stmt, ast.Assign):
         return False
@@ -69,7 +69,7 @@ def _is_alloc_stmt(stmt: ast.stmt) -> bool:
         return False
     if not isinstance(call.func.value, ast.Name):
         return False
-    return call.func.value.id == "nkigym" and call.func.attr == "ndarray"
+    return call.func.value.id == "np" and call.func.attr == "empty"
 
 
 def _classify_body_zones(body: list[ast.stmt]) -> tuple[int, int]:
