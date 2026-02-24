@@ -1,19 +1,16 @@
-"""Loop rolling codegen pass for NKI Gym.
+"""Loop rolling codegen pass.
 
 Detects repeating statement patterns in fully-unrolled tiled functions
 and rolls them into for loops. Iterates until convergence to produce
 maximally nested loop structures.
 
-This is a deterministic codegen pass (not a transform) that always
-maximally compresses the IR.
+This is a generic Python AST pass (str -> str) that works on any
+Python function source, not tied to specific frameworks.
 """
 
 import ast
 import copy
-from collections.abc import Callable
 from dataclasses import dataclass, field
-
-from nkigym.utils.source import callable_to_source, source_to_callable
 
 
 @dataclass
@@ -51,39 +48,27 @@ class _LoopRun:
     varying: list[VaryingConstant] = field(default_factory=list)
 
 
+_NO_RUN = _LoopRun(start_idx=0, block_size=0, trip_count=0)
+
+
 def _is_alloc_stmt(stmt: ast.stmt) -> bool:
-    """Check if a statement is an np.empty allocation.
-
-    Args:
-        stmt: AST statement node.
-
-    Returns:
-        True if the statement is an np.empty call.
-    """
-    if not isinstance(stmt, ast.Assign):
-        return False
-    if not isinstance(stmt.value, ast.Call):
-        return False
-    call = stmt.value
-    if not isinstance(call.func, ast.Attribute):
-        return False
-    if not isinstance(call.func.value, ast.Name):
-        return False
-    return call.func.value.id == "np" and call.func.attr == "empty"
+    """Check if a statement is an np.empty allocation."""
+    return (
+        isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Attribute)
+        and isinstance(stmt.value.func.value, ast.Name)
+        and stmt.value.func.value.id == "np"
+        and stmt.value.func.attr == "empty"
+    )
 
 
 def _classify_body_zones(body: list[ast.stmt]) -> tuple[int, int]:
     """Partition a statement list into prologue, working, epilogue zones.
 
-    Prologue: leading nkigym.ndarray allocations.
+    Prologue: leading np.empty allocations.
     Epilogue: trailing return statement.
     Working: everything in between.
-
-    Args:
-        body: List of AST statements.
-
-    Returns:
-        Tuple of (prologue_end, epilogue_start) indices.
     """
     prologue_end = 0
     for i, stmt in enumerate(body):
@@ -99,73 +84,66 @@ def _classify_body_zones(body: list[ast.stmt]) -> tuple[int, int]:
     return prologue_end, epilogue_start
 
 
-def _normalize_block(stmts: list[ast.stmt]) -> str:
-    """Normalize a block for structural comparison.
-
-    Renames local variables (assignment targets, for targets) to
-    positional names (_v0, _v1, ...) and replaces all int constants
-    with 0. Recurses into for loop bodies.
-
-    Args:
-        stmts: List of AST statements forming the block.
-
-    Returns:
-        Normalized ast.dump string for comparison.
-    """
-    stmts_copy = [copy.deepcopy(s) for s in stmts]
+def _collect_target_mapping(stmts: list[ast.stmt]) -> dict[str, str]:
+    """Map assignment and for-loop targets to positional variable names."""
     var_map: dict[str, str] = {}
-    counter = [0]
+    counter = 0
 
-    def _next_var() -> str:
-        """Return the next positional variable name (_v0, _v1, ...)."""
-        name = f"_v{counter[0]}"
-        counter[0] += 1
-        return name
-
-    def _collect_targets(stmt_list: list[ast.stmt]) -> None:
-        """Map assignment and for-loop targets to positional variable names."""
+    def _process(stmt_list: list[ast.stmt]) -> None:
+        """Recursively collect target names from a statement list."""
+        nonlocal counter
         for stmt in stmt_list:
             if isinstance(stmt, ast.Assign):
                 for target in stmt.targets:
                     if isinstance(target, ast.Name) and target.id not in var_map:
-                        var_map[target.id] = _next_var()
+                        var_map[target.id] = f"_v{counter}"
+                        counter += 1
             elif isinstance(stmt, ast.For):
                 if isinstance(stmt.target, ast.Name) and stmt.target.id not in var_map:
-                    var_map[stmt.target.id] = _next_var()
-                _collect_targets(stmt.body)
+                    var_map[stmt.target.id] = f"_v{counter}"
+                    counter += 1
+                _process(stmt.body)
 
-    _collect_targets(stmts_copy)
+    _process(stmts)
+    return var_map
 
-    class _Normalizer(ast.NodeTransformer):
-        """Replace local names with positional names and zero out int constants."""
 
-        def visit_Name(self, node: ast.Name) -> ast.Name:
-            if node.id in var_map:
-                node.id = var_map[node.id]
-            return node
+class _AstNormalizer(ast.NodeTransformer):
+    """Replace local names with positional names and zero out int constants."""
 
-        def visit_Constant(self, node: ast.Constant) -> ast.Constant:
-            if isinstance(node.value, int):
-                node.value = 0
-            return node
+    def __init__(self, var_map: dict[str, str]) -> None:
+        """Initialize with a variable-to-positional-name mapping."""
+        self.var_map = var_map
 
-    normalizer = _Normalizer()
+    def visit_Name(self, node: ast.Name) -> ast.Name:
+        """Replace local variable names with positional equivalents."""
+        if node.id in self.var_map:
+            node.id = self.var_map[node.id]
+        return node
+
+    def visit_Constant(self, node: ast.Constant) -> ast.Constant:
+        """Zero out integer constants for structural comparison."""
+        if isinstance(node.value, int):
+            node.value = 0
+        return node
+
+
+def _normalize_block(stmts: list[ast.stmt]) -> str:
+    """Normalize a block of statements for structural comparison.
+
+    Renames local variables to positional names (_v0, _v1, ...) and
+    replaces all int constants with 0.
+    """
+    stmts_copy = [copy.deepcopy(s) for s in stmts]
+    var_map = _collect_target_mapping(stmts_copy)
+    normalizer = _AstNormalizer(var_map)
     for i, stmt in enumerate(stmts_copy):
         stmts_copy[i] = normalizer.visit(stmt)
-
     return "\n".join(ast.dump(s) for s in stmts_copy)
 
 
 def _collect_int_constants(node: ast.AST) -> list[tuple[tuple[tuple[str, int | None], ...], int]]:
-    """Collect all int constants from an AST node in DFS order.
-
-    Args:
-        node: AST node to walk.
-
-    Returns:
-        List of (path, value) pairs. Path is a tuple of navigation
-        steps from the node to the constant.
-    """
+    """Collect all int constants from an AST node in DFS order."""
     results: list[tuple[tuple[tuple[str, int | None], ...], int]] = []
     _walk_constants(node, (), results)
     return results
@@ -176,13 +154,7 @@ def _walk_constants(
     path: tuple[tuple[str, int | None], ...],
     results: list[tuple[tuple[tuple[str, int | None], ...], int]],
 ) -> None:
-    """Recursively walk AST collecting int constants with their paths.
-
-    Args:
-        node: Current AST node.
-        path: Current navigation path from root.
-        results: Accumulator for (path, value) pairs.
-    """
+    """Recursively walk AST collecting int constants with their paths."""
     if isinstance(node, ast.Constant) and isinstance(node.value, int):
         results.append((path, node.value))
         return
@@ -195,45 +167,56 @@ def _walk_constants(
             _walk_constants(field_value, path + ((field_name, None),), results)
 
 
-def _is_arithmetic(values: list[int]) -> tuple[int, int] | None:
+def _is_arithmetic(values: list[int]) -> tuple[bool, int, int]:
     """Check if values form an arithmetic progression.
 
-    Args:
-        values: List of integer values.
-
-    Returns:
-        Tuple of (base, stride) if arithmetic, None otherwise.
+    Returns (is_valid, base, stride). When is_valid is False, base
+    and stride are zero.
     """
-    if len(values) < 2:
-        return (values[0], 0) if values else None
+    base = 0
+    stride = 0
+    is_valid = bool(values)
+    if is_valid:
+        base = values[0]
+        stride = values[1] - values[0] if len(values) >= 2 else 0
+        is_valid = all(v == base + i * stride for i, v in enumerate(values))
+    return (is_valid, base, stride)
 
-    base = values[0]
-    stride = values[1] - values[0]
 
-    for i, v in enumerate(values):
-        if v != base + i * stride:
-            return None
+def _check_stmt_varying(
+    blocks: list[list[ast.stmt]], stmt_offset: int, trip_count: int, varying: list[VaryingConstant]
+) -> bool:
+    """Check one statement position across blocks for arithmetic patterns.
 
-    return (base, stride)
+    Appends any varying constants found to the varying list.
+    Returns False if constant counts mismatch or any position fails
+    the arithmetic progression check.
+    """
+    all_constants = [_collect_int_constants(blocks[bi][stmt_offset]) for bi in range(trip_count)]
+    num_constants = len(all_constants[0])
+    valid = all(len(bc) == num_constants for bc in all_constants[1:])
+
+    if valid:
+        for const_idx in range(num_constants):
+            values = [all_constants[bi][const_idx][1] for bi in range(trip_count)]
+            is_ap, base, stride = _is_arithmetic(values)
+            if not is_ap:
+                valid = False
+                break
+            if stride != 0:
+                path = all_constants[0][const_idx][0]
+                varying.append(VaryingConstant(path=path, stmt_offset=stmt_offset, base=base, stride=stride))
+
+    return valid
 
 
 def _extract_varying(
     working_stmts: list[ast.stmt], block_size: int, trip_count: int, start_idx: int
-) -> list[VaryingConstant] | None:
+) -> tuple[bool, list[VaryingConstant]]:
     """Extract varying constants from a run of structurally identical blocks.
 
-    Walks corresponding AST nodes in parallel across all blocks. Each
-    int constant position must form an arithmetic progression.
-
-    Args:
-        working_stmts: Full list of working statements.
-        block_size: Number of statements per block.
-        trip_count: Number of consecutive blocks.
-        start_idx: Starting index in working_stmts.
-
-    Returns:
-        List of VaryingConstant for non-zero-stride positions,
-        or None if any position fails the AP check.
+    Returns (valid, varying_list). When valid is False, the varying
+    list should be ignored.
     """
     blocks = []
     for i in range(trip_count):
@@ -241,127 +224,91 @@ def _extract_varying(
         blocks.append(working_stmts[offset : offset + block_size])
 
     varying: list[VaryingConstant] = []
-
-    for stmt_offset in range(block_size):
-        all_constants = []
-        for block_idx in range(trip_count):
-            constants = _collect_int_constants(blocks[block_idx][stmt_offset])
-            all_constants.append(constants)
-
-        num_constants = len(all_constants[0])
-        for block_constants in all_constants[1:]:
-            if len(block_constants) != num_constants:
-                return None
-
-        for const_idx in range(num_constants):
-            values = [all_constants[block_idx][const_idx][1] for block_idx in range(trip_count)]
-            ap = _is_arithmetic(values)
-            if ap is None:
-                return None
-
-            base, stride = ap
-            if stride != 0:
-                path = all_constants[0][const_idx][0]
-                varying.append(VaryingConstant(path=path, stmt_offset=stmt_offset, base=base, stride=stride))
-
-    return varying
+    valid = all(_check_stmt_varying(blocks, so, trip_count, varying) for so in range(block_size))
+    return (valid, varying)
 
 
-def _find_best_run(working_stmts: list[ast.stmt]) -> _LoopRun | None:
+def _count_matching_blocks(
+    working_stmts: list[ast.stmt], start: int, block_size: int, n: int, cache: dict[int, str]
+) -> int:
+    """Count consecutive structurally identical blocks starting at a position."""
+    if start not in cache:
+        cache[start] = _normalize_block(working_stmts[start : start + block_size])
+    ref = cache[start]
+    count = 1
+    while start + (count + 1) * block_size <= n:
+        pos = start + count * block_size
+        if pos not in cache:
+            cache[pos] = _normalize_block(working_stmts[pos : pos + block_size])
+        if cache[pos] != ref:
+            break
+        count += 1
+    return count
+
+
+def _find_best_run(working_stmts: list[ast.stmt]) -> _LoopRun:
     """Find the repeating run with largest coverage among statements.
 
-    Tries all block sizes K from largest to smallest, and for each K
-    scans all starting positions for consecutive structurally identical
-    blocks whose constants form arithmetic progressions.
+    Scans all block sizes K and positions P, scoring each candidate run
+    as count * K (total statements covered). Blocks match when their
+    normalized AST structure is identical (variables renamed to positional
+    placeholders, integer constants zeroed). A candidate is valid only if
+    every integer constant across its blocks forms an arithmetic progression.
 
-    Args:
-        working_stmts: List of AST statements to search.
+    Ties are broken by discovery order (smallest K, earliest P).
 
-    Returns:
-        Best _LoopRun found, or None if no repeating pattern exists.
+    Returns _NO_RUN sentinel (trip_count=0) if no repeating pattern exists.
     """
     n = len(working_stmts)
-    if n < 2:
-        return None
-
-    best: _LoopRun | None = None
+    best = _NO_RUN
     best_coverage = 0
-
     for k in range(1, n // 2 + 1):
         if k * (n // k) <= best_coverage:
             continue
+        cache: dict[int, str] = {}
         p = 0
         while p + 2 * k <= n:
-            ref = _normalize_block(working_stmts[p : p + k])
-            count = 1
-            while p + (count + 1) * k <= n:
-                cand = _normalize_block(working_stmts[p + count * k : p + (count + 1) * k])
-                if cand != ref:
-                    break
-                count += 1
-
-            if count >= 2:
-                coverage = count * k
-                if coverage > best_coverage:
-                    varying = _extract_varying(working_stmts, k, count, p)
-                    if varying is not None:
-                        best = _LoopRun(p, k, count, varying)
-                        best_coverage = coverage
-
+            count = _count_matching_blocks(working_stmts, p, k, n, cache)
+            if count >= 2 and count * k > best_coverage:
+                valid, varying = _extract_varying(working_stmts, k, count, p)
+                if valid:
+                    best = _LoopRun(p, k, count, varying)
+                    best_coverage = count * k
             p += 1
-
     return best
+
+
+def _stride_expr(base_expr: ast.expr, stride: int) -> ast.expr:
+    """Wrap an expression with a stride multiplier (identity when stride=1)."""
+    if stride == 1:
+        result = base_expr
+    else:
+        result = ast.BinOp(left=base_expr, op=ast.Mult(), right=ast.Constant(value=stride))
+    return result
 
 
 def _make_expr(loop_var: str, base: int, stride: int) -> ast.expr:
     """Create an AST expression for a varying constant.
 
-    Applies simplification rules (checked in order):
-    - stride=0: just ``base``
-    - base=0: ``i * stride`` (or just ``i`` when stride=1)
-    - base divisible by stride: ``(i + base//stride) * stride``
-    - general: ``i * stride + base``
-
-    Args:
-        loop_var: Name of the loop iteration variable.
-        base: First value of the arithmetic progression.
-        stride: Common difference.
-
-    Returns:
-        AST expression node.
+    Simplification rules: stride=0 gives base; base=0 gives i*stride;
+    base divisible by stride gives (i+offset)*stride; else i*stride+base.
     """
-    if stride == 0:
-        return ast.Constant(value=base)
-
     loop_name = ast.Name(id=loop_var, ctx=ast.Load())
-
-    if base == 0:
-        if stride == 1:
-            return loop_name
-        return ast.BinOp(left=loop_name, op=ast.Mult(), right=ast.Constant(value=stride))
-
-    if base % stride == 0:
-        offset = base // stride
-        inner = ast.BinOp(left=loop_name, op=ast.Add(), right=ast.Constant(value=offset))
-        if stride == 1:
-            return inner
-        return ast.BinOp(left=inner, op=ast.Mult(), right=ast.Constant(value=stride))
-
-    mult = ast.BinOp(left=loop_name, op=ast.Mult(), right=ast.Constant(value=stride))
-    return ast.BinOp(left=mult, op=ast.Add(), right=ast.Constant(value=base))
+    if stride == 0:
+        result = ast.Constant(value=base)
+    elif base == 0:
+        result = _stride_expr(loop_name, stride)
+    elif base % stride == 0:
+        inner = ast.BinOp(left=loop_name, op=ast.Add(), right=ast.Constant(value=base // stride))
+        result = _stride_expr(inner, stride)
+    else:
+        mult = ast.BinOp(left=loop_name, op=ast.Mult(), right=ast.Constant(value=stride))
+        result = ast.BinOp(left=mult, op=ast.Add(), right=ast.Constant(value=base))
+    return result
 
 
 def _set_at_path(root: ast.AST, path: tuple[tuple[str, int | None], ...], new_node: ast.AST) -> None:
-    """Replace the node at a given path with a new node.
-
-    Navigates from root through the path steps, then replaces the
-    final node with new_node.
-
-    Args:
-        root: Root AST node to navigate from.
-        path: Tuple of (field_name, index_or_none) steps.
-        new_node: Replacement AST node.
-    """
+    """Replace the node at a given path with a new node."""
     node = root
     for step in path[:-1]:
         field_name, index = step
@@ -383,14 +330,6 @@ def _build_for(run: _LoopRun, working_stmts: list[ast.stmt], loop_var: str) -> a
 
     Deep-copies the first block as a template, replaces varying
     constants with arithmetic expressions, and wraps in a for loop.
-
-    Args:
-        run: Detected repeating run.
-        working_stmts: Full list of working statements.
-        loop_var: Name for the loop iteration variable.
-
-    Returns:
-        ast.For node containing the rolled loop.
     """
     template = [copy.deepcopy(s) for s in working_stmts[run.start_idx : run.start_idx + run.block_size]]
 
@@ -409,14 +348,7 @@ def _build_for(run: _LoopRun, working_stmts: list[ast.stmt], loop_var: str) -> a
 
 
 def _count_loop_depth(tree: ast.AST) -> int:
-    """Count the number of distinct loop variable names in the AST.
-
-    Args:
-        tree: AST to search.
-
-    Returns:
-        Number of distinct i_N loop variables found.
-    """
+    """Count the number of distinct i_N loop variable names in the AST."""
     loop_vars: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
@@ -431,31 +363,26 @@ def _try_roll_in_body(body: list[ast.stmt], loop_var: str) -> bool:
 
     Searches the given body for repeating patterns. If none found
     at this level, recurses into for loop bodies.
-
-    Args:
-        body: List of AST statements (mutated in place).
-        loop_var: Name for the new loop variable.
-
-    Returns:
-        True if a roll was applied, False otherwise.
     """
     prologue_end, epilogue_start = _classify_body_zones(body)
     working = body[prologue_end:epilogue_start]
 
     run = _find_best_run(working)
-    if run is not None:
+    rolled = False
+    if run.trip_count > 0:
         for_node = _build_for(run, working, loop_var)
         actual_start = prologue_end + run.start_idx
         actual_end = actual_start + run.trip_count * run.block_size
         body[actual_start:actual_end] = [for_node]
-        return True
+        rolled = True
 
-    for stmt in body:
-        if isinstance(stmt, ast.For):
-            if _try_roll_in_body(stmt.body, loop_var):
-                return True
+    if not rolled:
+        for stmt in body:
+            if isinstance(stmt, ast.For) and _try_roll_in_body(stmt.body, loop_var):
+                rolled = True
+                break
 
-    return False
+    return rolled
 
 
 def _roll_once(source: str) -> str:
@@ -463,14 +390,7 @@ def _roll_once(source: str) -> str:
 
     Parses the source, finds the best repeating run anywhere in the
     AST (including inside existing for loop bodies), and replaces it
-    with a for loop. Returns the source unchanged if no pattern is found.
-
-    Args:
-        source: Python source code string.
-
-    Returns:
-        New source string with one pattern rolled, or the input
-        unchanged if no pattern was found.
+    with a for loop.
     """
     tree = ast.parse(source)
 
@@ -480,47 +400,32 @@ def _roll_once(source: str) -> str:
             func_def = node
             break
 
-    if func_def is None:
-        return source
+    result = source
+    if func_def is not None:
+        next_idx = _count_loop_depth(tree)
+        loop_var = f"i_{next_idx}"
+        if _try_roll_in_body(func_def.body, loop_var):
+            ast.fix_missing_locations(tree)
+            result = ast.unparse(tree)
 
-    next_idx = _count_loop_depth(tree)
-    loop_var = f"i_{next_idx}"
-
-    if not _try_roll_in_body(func_def.body, loop_var):
-        return source
-
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree)
+    return result
 
 
-def roll_loops(func: Callable) -> Callable:
+def roll_loops(source: str) -> str:
     """Roll all repeating statement patterns into for loops.
 
     Iteratively detects repeating blocks and collapses them into loops
     until no more patterns remain. Produces maximally nested loops.
 
     Args:
-        func: nkigym function with __source__ attribute.
+        source: Python source code string containing a function definition.
 
     Returns:
-        New callable with loops replacing repeated blocks.
+        Rolled source code with loops replacing repeated blocks.
     """
-    source = callable_to_source(func)
-
     while True:
         new_source = _roll_once(source)
         if new_source == source:
             break
         source = new_source
-
-    tree = ast.parse(source)
-    func_name = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            func_name = node.name
-            break
-
-    if func_name is None:
-        raise ValueError("No function definition found in source after loop rolling")
-
-    return source_to_callable(source, func_name)
+    return source

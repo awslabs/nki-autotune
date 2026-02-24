@@ -11,7 +11,7 @@ Run with: pytest test/test_data_reuse.py -v
 import numpy as np
 import pytest
 from conftest import make_random_array
-from data_reuse_golden import CASES
+from golden.data_reuse import CASES, DataReuseCase
 
 from nkigym.ir import program_to_source, source_to_program
 from nkigym.transforms import DataReuseTransform
@@ -21,7 +21,7 @@ _reuse = DataReuseTransform()
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.id)
-def test_data_reuse(case):
+def test_data_reuse(case: DataReuseCase) -> None:
     """Verify data reuse analysis, IR transformation, and numerical equivalence.
 
     For each case:

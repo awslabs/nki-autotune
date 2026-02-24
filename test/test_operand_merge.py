@@ -9,7 +9,7 @@ Run with: pytest test/test_operand_merge.py -v
 
 import pytest
 from conftest import assert_programs_numerically_equal
-from operand_merge_golden import CASES, CORNER_CASES, OperandMergeCase
+from golden.operand_merge import CASES, CORNER_CASES, OperandMergeCase
 
 from nkigym.transforms.operand_merge import OperandMergeTransform
 

@@ -2,13 +2,13 @@
 
 from typing import NamedTuple
 
-from operand_merge_golden.accumulation import (  # noqa: F401
+from golden.operand_merge_accumulation import (  # noqa: F401
     ACCUMULATION_BLOCKS_AFTER_1_MERGE,
     ACCUMULATION_BLOCKS_AFTER_2_MERGES,
     ACCUMULATION_BLOCKS_AFTER_3_MERGES,
     ACCUMULATION_BLOCKS_PROGRAM,
 )
-from operand_merge_golden.basic import (  # noqa: F401
+from golden.operand_merge_basic import (  # noqa: F401
     AFTER_ADJACENT_LOADS_2X,
     AFTER_ADJACENT_LOADS_2X_PARTIAL,
     BEFORE_ADJACENT_LOADS_2X,
@@ -17,12 +17,12 @@ from operand_merge_golden.basic import (  # noqa: F401
     BEFORE_NO_ADJACENT_LOADS,
     BEFORE_SINGLE_SUBGRAPH,
 )
-from operand_merge_golden.corner_cases import (  # noqa: F401
+from golden.operand_merge_corner_cases import (  # noqa: F401
     BEFORE_ALREADY_MERGED,
     BEFORE_HETEROGENEOUS_OPS,
     BEFORE_SINGLE_ACTIVATION,
 )
-from operand_merge_golden.elementwise import (  # noqa: F401
+from golden.operand_merge_elementwise import (  # noqa: F401
     AFTER_ACTIVATION_2X,
     AFTER_TENSOR_SCALAR_2X,
     AFTER_TENSOR_TENSOR_2X,
@@ -32,20 +32,20 @@ from operand_merge_golden.elementwise import (  # noqa: F401
     BEFORE_TENSOR_TENSOR_2X,
     BEFORE_TENSOR_TENSOR_DIFF_OPS,
 )
-from operand_merge_golden.limits import (  # noqa: F401
+from golden.operand_merge_limits import (  # noqa: F401
     AFTER_EXCEEDS_N_LIMIT,
     AFTER_EXCEEDS_N_LIMIT_PARTIAL,
     AFTER_N_AT_LIMIT,
     BEFORE_MATMUL_EXCEEDS_N_LIMIT,
     BEFORE_MATMUL_N_AT_LIMIT,
 )
-from operand_merge_golden.limits_m import (  # noqa: F401
+from golden.operand_merge_limits_m import (  # noqa: F401
     AFTER_M_DIM_MERGE,
     AFTER_M_EXCEEDS_LIMIT,
     BEFORE_MATMUL_M_DIM_MERGE,
     BEFORE_MATMUL_M_EXCEEDS_LIMIT,
 )
-from operand_merge_golden.post_reuse import (  # noqa: F401
+from golden.operand_merge_post_reuse import (  # noqa: F401
     AFTER_POST_REUSE_1X2,
     AFTER_POST_REUSE_1X4,
     AFTER_POST_REUSE_2X2,
@@ -54,8 +54,8 @@ from operand_merge_golden.post_reuse import (  # noqa: F401
     BEFORE_MATMUL_POST_REUSE_1X4,
     BEFORE_MATMUL_POST_REUSE_2X2,
 )
-from operand_merge_golden.scaling import AFTER_ADJACENT_4X, AFTER_ADJACENT_4X_PARTIAL, BEFORE_ADJACENT_4X  # noqa: F401
-from operand_merge_golden.structured import (  # noqa: F401
+from golden.operand_merge_scaling import AFTER_ADJACENT_4X, AFTER_ADJACENT_4X_PARTIAL, BEFORE_ADJACENT_4X  # noqa: F401
+from golden.operand_merge_structured import (  # noqa: F401
     DEPENDENCY_BLOCKS_AFTER_1_MERGE,
     DEPENDENCY_BLOCKS_AFTER_2_MERGES,
     DEPENDENCY_BLOCKS_PROGRAM,

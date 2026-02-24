@@ -1,11 +1,12 @@
 """Tests for autotune benchmarking and NEFF compilation backend."""
 
 import os
+from pathlib import Path
 
-import autotune_golden
+import golden.autotune as autotune_golden
 import numpy as np
 import pytest
-from autotune_golden import (
+from golden.autotune import (
     ATOL,
     ITERS,
     NEURON_DEVICES_AVAILABLE,
@@ -21,49 +22,69 @@ from autotune_golden import (
 
 from autotune import Benchmark, BenchmarkResults, ProfileJobs, load_results
 from autotune.compiler.compile import compile_kernel
+from autotune.job import compile_jobs
+
+
+def _create_add_scalar_jobs(tmp_path: Path) -> ProfileJobs:
+    """Create tensor-add-scalar profile jobs for all shape/scalar combinations.
+
+    Args:
+        tmp_path: Directory for cache root.
+
+    Returns:
+        ProfileJobs with 9 entries (3 shapes x 3 scalars).
+    """
+    jobs = ProfileJobs(cache_root_dir=str(tmp_path))
+    for shape in SHAPES:
+        for scalar in SCALAR_VALUES:
+            a = np.random.randn(*shape).astype(np.float32)
+            b = np.random.randn(*shape).astype(np.float32)
+            jobs.add_job(
+                kernel=nki_tensor_add_scalar_,
+                kernel_kwargs={"a_input": a, "b_input": b, "c": scalar},
+                output_shapes={"result": shape},
+                compiler_flags="",
+                correctness_check=(golden_add_scalar, ATOL, RTOL),
+            )
+    return jobs
+
+
+def _validate_benchmark_entries(results: BenchmarkResults) -> None:
+    """Assert each benchmark entry has no errors and valid timing data.
+
+    Args:
+        results: BenchmarkResults to validate.
+    """
+    for _wl_name, wl in results.workloads.items():
+        assert len(wl.entries) == len(SCALAR_VALUES)
+        for entry in wl.entries:
+            assert not entry.has_error, f"Entry has error: {entry.data.get('error')}"
+            assert entry.data.get("correctness_result") is True
+            assert entry.data["min_ms"] > 0
+            assert entry.data["mean_ms"] > 0
+            assert entry.data["max_ms"] >= entry.data["min_ms"]
+            assert entry.data["iterations"] == ITERS
+            assert entry.data["warmup_iterations"] == WARMUP
 
 
 class TestBenchmarkTensorAddScalar:
     """End-to-end test for the autotune pipeline using a tensor-add-scalar kernel."""
 
     @pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices (neuron-ls must succeed).")
-    def test_full_pipeline(self, tmp_path):
+    def test_full_pipeline(self, tmp_path: Path) -> None:
         """Verify the full benchmark pipeline: compile, run, check correctness, analyze results.
 
         Args:
             tmp_path: Pytest fixture providing a temporary directory.
         """
-        jobs = ProfileJobs(cache_root_dir=str(tmp_path))
-
-        for shape in SHAPES:
-            for scalar in SCALAR_VALUES:
-                a = np.random.randn(*shape).astype(np.float32)
-                b = np.random.randn(*shape).astype(np.float32)
-                jobs.add_job(
-                    kernel=nki_tensor_add_scalar_,
-                    kernel_kwargs={"a_input": a, "b_input": b, "c": scalar},
-                    output_shapes={"result": shape},
-                    compiler_flags="",
-                    correctness_check=(golden_add_scalar, ATOL, RTOL),
-                )
-
+        jobs = _create_add_scalar_jobs(tmp_path)
         assert len(jobs.jobs) == 9
 
         results = Benchmark(jobs, warmup=WARMUP, iters=ITERS).run()
-
         assert isinstance(results, BenchmarkResults)
         assert len(results.workloads) == len(SHAPES)
 
-        for wl_name, wl in results.workloads.items():
-            assert len(wl.entries) == len(SCALAR_VALUES)
-            for entry in wl.entries:
-                assert not entry.has_error, f"Entry has error: {entry.data.get('error')}"
-                assert entry.data.get("correctness_result") is True
-                assert entry.data["min_ms"] > 0
-                assert entry.data["mean_ms"] > 0
-                assert entry.data["max_ms"] >= entry.data["min_ms"]
-                assert entry.data["iterations"] == ITERS
-                assert entry.data["warmup_iterations"] == WARMUP
+        _validate_benchmark_entries(results)
 
         reloaded = BenchmarkResults.load(str(tmp_path))
         assert len(reloaded.workloads) == len(results.workloads)
@@ -75,7 +96,7 @@ class TestBenchmarkTensorAddScalar:
 
         best = results.best_configs()
         assert len(best) == len(SHAPES)
-        for wl_name, entry in best.items():
+        for _wl_name, entry in best.items():
             assert entry.min_ms > 0
 
         filtered = results.filter(lambda e: e.min_ms > 0)
@@ -93,7 +114,7 @@ class TestCompileKernel:
     """
 
     @pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices (neuron-ls must succeed).")
-    def test_compile_kernel_produces_neff(self, tmp_path):
+    def test_compile_kernel_produces_neff(self, tmp_path: Path) -> None:
         """Verify compile_kernel produces a valid NEFF file.
 
         Args:
@@ -133,14 +154,12 @@ class TestMultiKernelWorkload:
     """
 
     @pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices (neuron-ls must succeed).")
-    def test_multi_kernel_compilation(self, tmp_path):
+    def test_multi_kernel_compilation(self, tmp_path: Path) -> None:
         """Verify compilation succeeds for multiple kernel configurations.
 
         Args:
             tmp_path: Pytest fixture providing a temporary directory.
         """
-        from autotune.job import ProfileJobs, compile_jobs
-
         jobs = ProfileJobs(cache_root_dir=str(tmp_path))
 
         test_sizes = [(256, 1024, 128), (512, 1024, 256), (256, 2048, 128)]

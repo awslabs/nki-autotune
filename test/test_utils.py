@@ -1,7 +1,7 @@
 """Unit tests for nkigym.utils.source module."""
 
 import pytest
-from utils_golden import (
+from golden.utils import (
     CUSTOM_SOURCE,
     EXEC_BAD_SYNTAX_SOURCE,
     EXEC_GREET_SOURCE,
@@ -29,7 +29,7 @@ class TestCallableToSource:
         """When __source__ is set, callable_to_source returns it directly."""
 
         def dummy() -> None:
-            pass
+            """No-op function for testing __source__ attribute."""
 
         dummy.__source__ = "def dummy(): pass"
         result = callable_to_source(dummy)

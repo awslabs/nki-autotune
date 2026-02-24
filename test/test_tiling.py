@@ -6,10 +6,12 @@ Verifies that for each input shape configuration:
 - Tiled function produces numerically correct results
 """
 
+from collections.abc import Callable
+
 import numpy as np
 import pytest
 from conftest import make_random_array, normalize_source
-from tiling_golden import (
+from golden.tiling import (
     GOLDEN_DOUBLE_MATMUL_PROGRAM,
     GOLDEN_DOUBLE_MATMUL_SOURCE,
     GOLDEN_SINGLE_MATMUL_PROGRAM,
@@ -41,7 +43,9 @@ class TestSingleMatmulTiling:
         list(GOLDEN_SINGLE_MATMUL_SOURCE.keys()),
         ids=[_shape_id(k) for k in GOLDEN_SINGLE_MATMUL_SOURCE.keys()],
     )
-    def test_golden_source_and_numerical(self, a_shape: tuple[int, int], b_shape: tuple[int, int], matmul_func) -> None:
+    def test_golden_source_and_numerical(
+        self, a_shape: tuple[int, int], b_shape: tuple[int, int], matmul_func: Callable
+    ) -> None:
         """Verify tiled source matches golden string and output is numerically correct.
 
         Args:
@@ -76,7 +80,7 @@ class TestDoubleMatmulTiling:
         ids=[_shape_id(k) for k in GOLDEN_DOUBLE_MATMUL_SOURCE.keys()],
     )
     def test_golden_source_and_numerical(
-        self, a_shape: tuple[int, int], b_shape: tuple[int, int], c_shape: tuple[int, int], double_matmul_func
+        self, a_shape: tuple[int, int], b_shape: tuple[int, int], c_shape: tuple[int, int], double_matmul_func: Callable
     ) -> None:
         """Verify tiled source matches golden string and output is numerically correct.
 

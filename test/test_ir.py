@@ -1,10 +1,12 @@
 """Tests for IR: source_to_program, program_to_source, and round trips."""
 
+from collections.abc import Callable
+
 import numpy as np
 import pytest
-from golden_ir import F_ROUND_TRIP_CASES, P_ROUND_TRIP_CASES, PROGRAM_TO_SOURCE_CASES, SOURCE_TO_PROGRAM_CASES
+from golden.ir import F_ROUND_TRIP_CASES, P_ROUND_TRIP_CASES, PROGRAM_TO_SOURCE_CASES, SOURCE_TO_PROGRAM_CASES
 
-from nkigym.ir import program_to_source, source_to_program
+from nkigym.ir import GymProgram, program_to_source, source_to_program
 from nkigym.utils.source import source_to_callable
 
 
@@ -18,7 +20,9 @@ class TestSourceToProgram:
     """Tests for source_to_program parsing nkigym source into GymProgram."""
 
     @pytest.mark.parametrize("source,input_shapes,dtype,expected", SOURCE_TO_PROGRAM_CASES)
-    def test_parse(self, source, input_shapes, dtype, expected) -> None:
+    def test_parse(
+        self, source: str, input_shapes: dict[str, tuple[int, ...]], dtype: type[np.generic], expected: GymProgram
+    ) -> None:
         """Verify source_to_program produces expected GymProgram."""
         actual = source_to_program(source, input_shapes, dtype)
         assert actual == expected
@@ -40,7 +44,9 @@ class TestProgramToSource:
     """Tests for program_to_source and source_to_callable with hand-crafted GymPrograms."""
 
     @pytest.mark.parametrize("program,expected_source,input_shapes,expected_fn", PROGRAM_TO_SOURCE_CASES)
-    def test_source_and_execution(self, program, expected_source, input_shapes, expected_fn) -> None:
+    def test_source_and_execution(
+        self, program: GymProgram, expected_source: str, input_shapes: dict[str, tuple[int, ...]], expected_fn: Callable
+    ) -> None:
         """Verify source rendering matches expected string and execution is numerically correct."""
         actual_source = program_to_source(program)
         assert actual_source == expected_source
@@ -56,13 +62,13 @@ class TestRoundTrip:
     """Tests for source↔program round-trip stability."""
 
     @pytest.mark.parametrize("source,input_shapes", F_ROUND_TRIP_CASES)
-    def test_source_round_trip(self, source, input_shapes) -> None:
+    def test_source_round_trip(self, source: str, input_shapes: dict[str, tuple[int, ...]]) -> None:
         """Verify source survives one round trip: program_to_source(source_to_program(s)) == s."""
         program = source_to_program(source, input_shapes, np.float32)
         assert program_to_source(program) == source
 
     @pytest.mark.parametrize("program", P_ROUND_TRIP_CASES)
-    def test_program_round_trip(self, program) -> None:
+    def test_program_round_trip(self, program: GymProgram) -> None:
         """Verify program is stable: program_to_source → source_to_program gives back the same program."""
         source = program_to_source(program)
         result = source_to_program(source, dict(program.input_shapes), program.output_dtype)
