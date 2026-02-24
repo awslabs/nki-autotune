@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 import nkigym
-from nkigym.search import search
+from nkigym.search import benchmark_variants, search
 from nkigym.transforms import DataReuseTransform, OperandMergeTransform
 from nkigym.utils import setup_logging
 
@@ -52,8 +52,8 @@ def main() -> None:
 
     k, m, n = 256, 256, 256
     rng = np.random.default_rng(42)
-    lhs = rng.standard_normal((k, m)).astype(np.float64)
-    rhs = rng.standard_normal((k, n)).astype(np.float64)
+    lhs = rng.standard_normal((k, m)).astype(np.float32)
+    rhs = rng.standard_normal((k, n)).astype(np.float32)
 
     variants = search(
         func=nkigym_matmul,
@@ -65,6 +65,17 @@ def main() -> None:
         kernel_kwargs={"lhs": lhs, "rhs": rhs},
     )
     logger.info("Search produced %d unique variants", len(variants))
+
+    results = benchmark_variants(
+        cache_dir=cache_dir,
+        func_name="nkigym_matmul",
+        kernel_kwargs={"lhs": lhs, "rhs": rhs},
+        output_name="output",
+        output_shape=(m, n),
+        warmup=2,
+        iters=5,
+    )
+    results.summary(top_k=5)
 
 
 if __name__ == "__main__":

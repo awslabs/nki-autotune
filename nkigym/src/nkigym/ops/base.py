@@ -1,9 +1,16 @@
 """GymOp abstract base class and Tensor for numpy-level operation wrappers."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from nkigym.codegen.context import _LoweringContext
+    from nkigym.ir.types import GymStatement
 
 
 @dataclass(frozen=True)
@@ -125,12 +132,11 @@ class GymOp(ABC):
                 f"{all_tensors[operand_idx].name} with {len(axes)} axes"
             )
         axis_name = axes[dim]
-        if isinstance(axis_name, int):
-            return False
-        limit = self.tile_limits.get(axis_name)
-        if limit is None:
-            return True
-        return merged_size <= limit
+        allowed = not isinstance(axis_name, int)
+        if allowed:
+            limit = self.tile_limits.get(axis_name)
+            allowed = limit is None or merged_size <= limit
+        return allowed
 
     def __call__(self, *args: np.ndarray, **kwargs: object) -> np.ndarray:
         """Dispatch to simulate.
@@ -166,5 +172,18 @@ class GymOp(ABC):
 
         Returns:
             Output shape tuple.
+        """
+        ...
+
+    @abstractmethod
+    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+        """Lower a GymStatement for this op to NKI source lines.
+
+        Args:
+            stmt: The IR statement to lower.
+            ctx: Mutable lowering context tracking buffers and aliases.
+
+        Returns:
+            List of NKI source code lines.
         """
         ...

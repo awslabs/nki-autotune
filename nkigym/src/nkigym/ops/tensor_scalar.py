@@ -4,6 +4,8 @@ from collections.abc import Callable
 
 import numpy as np
 
+from nkigym.codegen.context import get_kwarg
+from nkigym.ir.tensor import TensorRef
 from nkigym.ops.base import GymOp, Tensor
 
 
@@ -18,14 +20,7 @@ class TensorScalarOp(GymOp):
     inputs = (Tensor("data", ("P", "F")), Tensor("operand0", ("P", 1)))
     outputs = (Tensor("result", ("P", "F")),)
 
-    def simulate(
-        self,
-        data: np.ndarray,
-        operand0: float | np.ndarray,
-        *,
-        op: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
-        **kwargs: object,
-    ) -> np.ndarray:
+    def simulate(self, data: np.ndarray, operand0: float | np.ndarray, **kwargs: object) -> np.ndarray:
         """Apply element-wise tensor-scalar operation.
 
         Args:
@@ -36,8 +31,7 @@ class TensorScalarOp(GymOp):
         Returns:
             Result array of same shape as data.
         """
-        if op is None:
-            op = np.multiply
+        op: Callable[[np.ndarray, object], np.ndarray] = kwargs.get("op", np.multiply)
         return op(data, operand0)
 
     def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
@@ -50,3 +44,39 @@ class TensorScalarOp(GymOp):
             Same shape as data.
         """
         return input_shapes[0]
+
+    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+        """Lower tensor_scalar to ``nisa.tensor_scalar``.
+
+        Args:
+            stmt: The tensor_scalar statement.
+            ctx: Lowering context.
+
+        Returns:
+            List of NKI source lines.
+        """
+        data_ref = get_kwarg(stmt, "data")
+        operand_ref = get_kwarg(stmt, "operand0")
+        op_str = get_kwarg(stmt, "op")
+
+        if not isinstance(data_ref, TensorRef):
+            raise ValueError("tensor_scalar missing data operand")
+
+        data = ctx.subscript(data_ref)
+        out_name = stmt.output.name
+        ctx.buffers[out_name] = "SBUF"
+
+        operand = str(operand_ref)
+        if isinstance(operand_ref, TensorRef):
+            operand = ctx.subscript(operand_ref)
+
+        op_kwarg = ""
+        if op_str is not None:
+            nki_op = str(op_str).replace("np.", "nl.")
+            op_kwarg = f", op0={nki_op}"
+
+        shape_str = repr(stmt.output.shape)
+        return [
+            f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
+            f"nisa.tensor_scalar(dst={out_name}, data={data}{op_kwarg}, operand0={operand})",
+        ]

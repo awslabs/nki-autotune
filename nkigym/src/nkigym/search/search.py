@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from nkigym.codegen.gym_to_nki import lower_to_nki
 from nkigym.ir import GymProgram, program_to_source, source_to_program
 from nkigym.tiling import tile_program
 from nkigym.transforms.base import Transform
@@ -196,22 +197,29 @@ def _verify_node(node: _Node, kernel_kwargs: dict[str, Any], expected: np.ndarra
     source = program_to_source(node.program)
     func = source_to_callable(source, node.program.name)
     actual = func(**kernel_kwargs)
-    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
 
 
 def _save_variant(node: _Node, depth_counts: dict[int, int], cache_dir: Path) -> None:
-    """Write a qualifying variant source file to disk.
+    """Write qualifying variant source files to disk.
+
+    Saves both the nkigym IR source and the NKI-lowered kernel source.
 
     Args:
         node: Graph node to save.
         depth_counts: Map from depth to variant count; updated in place.
-        cache_dir: Directory to write the source file.
+        cache_dir: Directory to write the source files.
     """
     variant_idx = depth_counts.get(node.depth, 0)
     depth_counts[node.depth] = variant_idx + 1
-    filename = f"nkigym_d{node.depth}_v{variant_idx}.py"
+    gym_dir = cache_dir / "nkigym"
+    gym_dir.mkdir(parents=True, exist_ok=True)
     source = program_to_source(node.program)
-    (cache_dir / filename).write_text(source)
+    (gym_dir / f"nkigym_d{node.depth}_v{variant_idx}.py").write_text(source)
+    nki_dir = cache_dir / "nki"
+    nki_dir.mkdir(parents=True, exist_ok=True)
+    nki_source = lower_to_nki(node.program)
+    (nki_dir / f"nki_d{node.depth}_v{variant_idx}.py").write_text(nki_source)
 
 
 def _format_depth_table(depth_node_counts: dict[int, int], min_depth: int) -> str:
@@ -273,7 +281,9 @@ def _prepare_root(func: Callable, save_cache: Path, kernel_kwargs: dict[str, Any
     Returns:
         Tuple of (tiled GymProgram, expected output array).
     """
-    input_path = save_cache / "nkigym_input.py"
+    gym_dir = save_cache / "nkigym"
+    gym_dir.mkdir(parents=True, exist_ok=True)
+    input_path = gym_dir / "nkigym_input.py"
     input_path.write_text("import numpy as np\nimport nkigym\n" + callable_to_source(func))
     imported_func = import_func(input_path, func.__name__)
     expected = imported_func(**kernel_kwargs)
@@ -282,7 +292,7 @@ def _prepare_root(func: Callable, save_cache: Path, kernel_kwargs: dict[str, Any
     input_shapes = {k: v.shape for k, v in kernel_kwargs.items()}
     source = callable_to_source(func)
     program = tile_program(source_to_program(source, input_shapes, output_dtype))
-    (save_cache / "nkigym_root.py").write_text(program_to_source(program))
+    (gym_dir / "nkigym_root.py").write_text(program_to_source(program))
     return program, expected
 
 

@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from nkigym.codegen.context import get_kwarg
+from nkigym.ir.tensor import TensorRef
 from nkigym.ops.base import GymOp, Tensor
 
 
@@ -17,9 +19,7 @@ class MatmulOp(GymOp):
     outputs = (Tensor("result", ("M", "N")),)
     tile_limits = {"K": 128, "M": 128, "N": 512}
 
-    def simulate(
-        self, stationary: np.ndarray, moving: np.ndarray, *, acc: np.ndarray | None = None, **kwargs: object
-    ) -> np.ndarray:
+    def simulate(self, stationary: np.ndarray, moving: np.ndarray, **kwargs: object) -> np.ndarray:
         """Compute stationary.T @ moving, optionally accumulating.
 
         Args:
@@ -30,9 +30,10 @@ class MatmulOp(GymOp):
         Returns:
             Result array of shape [M, N], or acc + result if acc is provided.
         """
+        acc = kwargs.get("acc")
         result = np.matmul(stationary.T, moving)
         if acc is not None:
-            return acc + result
+            result = acc + result
         return result
 
     def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
@@ -45,3 +46,40 @@ class MatmulOp(GymOp):
             Shape tuple (M, N).
         """
         return (input_shapes[0][1], input_shapes[1][1])
+
+    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+        """Lower nc_matmul to PSUM alloc + nisa.nc_matmul, or accumulate.
+
+        Args:
+            stmt: The nc_matmul statement.
+            ctx: Lowering context.
+
+        Returns:
+            List of NKI source lines.
+        """
+        stat_ref = get_kwarg(stmt, "stationary")
+        mov_ref = get_kwarg(stmt, "moving")
+        acc_ref = get_kwarg(stmt, "acc")
+
+        if not isinstance(stat_ref, TensorRef):
+            raise ValueError("nc_matmul missing stationary operand")
+        if not isinstance(mov_ref, TensorRef):
+            raise ValueError("nc_matmul missing moving operand")
+
+        stat_name = ctx.subscript(stat_ref)
+        mov_name = ctx.subscript(mov_ref)
+        out_name = stmt.output.name
+        ctx.buffers[out_name] = "PSUM"
+
+        lines: list[str] = []
+        if isinstance(acc_ref, TensorRef):
+            canonical = ctx.resolve(acc_ref.name)
+            ctx.aliases[out_name] = canonical
+            lines = [f"nisa.nc_matmul(dst={canonical}, stationary={stat_name}, moving={mov_name})"]
+        else:
+            shape_str = repr(stmt.output.shape)
+            lines = [
+                f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.psum)",
+                f"nisa.nc_matmul(dst={out_name}, stationary={stat_name}, moving={mov_name})",
+            ]
+        return lines

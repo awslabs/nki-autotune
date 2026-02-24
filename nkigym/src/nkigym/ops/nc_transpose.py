@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from nkigym.codegen.context import get_kwarg
+from nkigym.ir.tensor import TensorRef
 from nkigym.ops.base import GymOp, Tensor
 
 
@@ -33,3 +35,28 @@ class NcTransposeOp(GymOp):
             Transposed shape tuple (F, P).
         """
         return (input_shapes[0][1], input_shapes[0][0])
+
+    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+        """Lower nc_transpose to ``nisa.nc_transpose``.
+
+        Args:
+            stmt: The nc_transpose statement.
+            ctx: Lowering context.
+
+        Returns:
+            List of NKI source lines.
+        """
+        data_ref = get_kwarg(stmt, "data")
+
+        if not isinstance(data_ref, TensorRef):
+            raise ValueError("nc_transpose missing data operand")
+
+        data = ctx.subscript(data_ref)
+        out_name = stmt.output.name
+        ctx.buffers[out_name] = "SBUF"
+
+        shape_str = repr(stmt.output.shape)
+        return [
+            f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
+            f"nisa.nc_transpose(dst={out_name}, data={data})",
+        ]
