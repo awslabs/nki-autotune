@@ -6,9 +6,11 @@ redundant load operations. Operates on the GymProgram IR.
 Example::
 
     reuse = DataReuseTransform()
-    pairs = reuse.analyze_ir(program)
-    for pair in pairs:
-        program = reuse.transform_ir(program, pair)
+    while True:
+        pairs = reuse.analyze_ir(program)
+        if not pairs:
+            break
+        program = reuse.transform_ir(program, pairs[0])
 """
 
 from itertools import combinations
@@ -63,9 +65,11 @@ class DataReuseTransform(Transform):
     Example::
 
         reuse = DataReuseTransform()
-        pairs = reuse.analyze_ir(program)
-        for pair in pairs:
-            program = reuse.transform_ir(program, pair)
+        while True:
+            pairs = reuse.analyze_ir(program)
+            if not pairs:
+                break
+            program = reuse.transform_ir(program, pairs[0])
     """
 
     name = "data_reuse"

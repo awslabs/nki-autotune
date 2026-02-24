@@ -184,9 +184,8 @@ def _emit_tile_ops(
 
         if use_acc:
             new_kwargs.append(("acc", TensorRef(acc_var, acc_shape, _full_slices(acc_shape))))
-            dst_var = acc_var
-        else:
-            dst_var = name_gen.next_name()
+
+        dst_var = name_gen.next_name()
 
         compute_stmt = GymStatement(
             op=op_name, kwargs=tuple(new_kwargs), output=TensorRef(dst_var, out_shape, _full_slices(out_shape))
@@ -246,9 +245,8 @@ def tile_program(program: GymProgram) -> GymProgram:
                 )
                 stmts.extend(tile_stmts)
 
-                if is_first:
-                    acc_var = result_var
-                    acc_shape = result_shape
+                acc_var = result_var
+                acc_shape = result_shape
         else:
             combined_pos = dict(parallel_pos)
             tile_stmts, result_var, result_shape = _emit_tile_ops(

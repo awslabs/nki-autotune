@@ -9,8 +9,8 @@ Every variant is verified against the root function for numerical
 correctness.
 """
 
+import logging
 import random
-import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +23,8 @@ from nkigym.tiling import tile_program
 from nkigym.transforms.base import Transform
 from nkigym.utils import callable_to_source, import_func
 from nkigym.utils.source import source_to_callable
+
+logger = logging.getLogger(__name__)
 
 
 def _collect_opportunities_ir(program: GymProgram, transforms: list[Transform]) -> list[tuple[Transform, Any]]:
@@ -209,6 +211,7 @@ def _process_variant(
     func = source_to_callable(source, node.program.name)
     actual = func(**kernel_kwargs)
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+    logger.info("Verified variant %s (depth=%d, stmts=%d)", filename, node.depth, len(node.program.stmts))
 
 
 def search(
@@ -255,9 +258,7 @@ def search(
     Returns:
         List of unique callables, deduplicated by program tuple.
     """
-    if save_cache.exists():
-        shutil.rmtree(save_cache)
-    save_cache.mkdir(parents=True)
+    save_cache.mkdir(parents=True, exist_ok=True)
     input_path = save_cache / "nkigym_input.py"
     input_path.write_text("import numpy as np\n" + "import nkigym\n" + callable_to_source(func))
     imported_func = import_func(input_path, func.__name__)
@@ -275,6 +276,7 @@ def search(
 
     graph = _TransformGraph(program, transforms)
     rng = random.Random(seed) if seed is not None else random.Random()
+    logger.info("Search root: %d stmts, %d opportunities", len(program.stmts), len(graph.nodes[program].opportunities))
 
     qualifying: list[GymProgram] = []
 
@@ -289,4 +291,5 @@ def search(
             _process_variant(new_node, depth_counts, save_cache, kernel_kwargs, expected)
             qualifying.append(new_node.program)
 
+    logger.info("Search complete: %d unique variants, %d total nodes explored", len(qualifying), len(graph.nodes))
     return qualifying

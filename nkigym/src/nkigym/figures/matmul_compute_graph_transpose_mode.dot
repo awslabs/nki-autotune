@@ -1,0 +1,87 @@
+digraph MatmulComputeGraphTransposeMode {
+    rankdir=LR;
+    bgcolor="white";
+    pad=0.5;
+    dpi=300;
+
+    // Graph styling
+    node [fontname="Arial", fontsize=11, style="filled,rounded", shape=box];
+    edge [fontname="Arial", fontsize=9];
+
+    // Title
+    label="Transpose Mode Transform: Before and After\nChoose optimal transpose method when transposed input is needed\nEdge labels show tensor indices: axis:(start,end)";
+    labelloc="t";
+    fontsize=14;
+    fontname="Arial Bold";
+
+    // ==================== BEFORE ====================
+    subgraph cluster_before {
+        label="BEFORE: DMA Transpose (memory-efficient, slow bandwidth)";
+        style="dashed";
+        color="#888888";
+        fontsize=12;
+
+        subgraph cluster_dma {
+            label="Subgraph 0\n(transpose during load)";
+            penwidth=2;
+            color="#FF6B6B";
+
+            alloc_L_dma [label="L_sbuf_0 =\nndarray(...)", fillcolor="#E8E8E8"];
+            alloc_R_dma [label="R_sbuf_0 =\nndarray(...)", fillcolor="#E8E8E8"];
+            alloc_out_dma [label="out_sbuf_0 =\nndarray(...)", fillcolor="#E8E8E8"];
+
+            load_dma [label="dma_transpose(L[0, :],\ndst=L_sbuf_0)\n(transpose during DMA)\n[Slow bandwidth]",
+                      fillcolor="#FFB347", penwidth=2];
+            load_R_dma [label="load(R[:, 0],\ndst=R_sbuf_0)", fillcolor="#FFEAA7"];
+            compute_dma [label="matmul(L_sbuf_0,\nR_sbuf_0, out_sbuf_0)", fillcolor="#A8D8EA"];
+            store_dma [label="store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
+
+            alloc_L_dma -> load_dma [label="L_sbuf_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            alloc_R_dma -> load_R_dma [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            alloc_out_dma -> compute_dma [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            load_dma -> compute_dma [label="L_sbuf_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            load_R_dma -> compute_dma [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            compute_dma -> store_dma [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+        }
+    }
+
+    // ==================== AFTER ====================
+    subgraph cluster_after {
+        label="AFTER: Compute Transpose (bandwidth-efficient, uses more SBUF)";
+        style="dashed";
+        color="#888888";
+        fontsize=12;
+
+        subgraph cluster_compute {
+            label="Subgraph 0\n(separate load + transpose)";
+            penwidth=2;
+            color="#4169E1";
+
+            alloc_L_temp_compute [label="L_sbuf_temp_0 =\nndarray(...)", fillcolor="#E8E8E8"];
+            alloc_L_compute [label="L_sbuf_0 =\nndarray(...)", fillcolor="#E8E8E8"];
+            alloc_R_compute [label="R_sbuf_0 =\nndarray(...)", fillcolor="#E8E8E8"];
+            alloc_out_compute [label="out_sbuf_0 =\nndarray(...)", fillcolor="#E8E8E8"];
+
+            load_compute [label="load(L[0, :],\ndst=L_sbuf_temp_0)\n(no transpose)\n[Fast bandwidth]",
+                          fillcolor="#FFEAA7", penwidth=2];
+            transpose_compute [label="L_sbuf_0 =\nnc_transpose(L_sbuf_temp_0)\n(transpose on TensorE)",
+                               fillcolor="#DDA0DD", penwidth=2];
+            load_R_compute [label="load(R[:, 0],\ndst=R_sbuf_0)", fillcolor="#FFEAA7"];
+            compute_compute [label="matmul(L_sbuf_0,\nR_sbuf_0, out_sbuf_0)", fillcolor="#A8D8EA"];
+            store_compute [label="store(out_sbuf_0,\ndst=Output[0,0])", fillcolor="#A8E6CF"];
+
+            alloc_L_temp_compute -> load_compute [label="L_sbuf_temp_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            alloc_L_compute -> transpose_compute [label="L_sbuf_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            alloc_R_compute -> load_R_compute [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            alloc_out_compute -> compute_compute [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+            load_compute -> transpose_compute [label="L_sbuf_temp_0\nbuf:(0->1) M:(0->1) K:(0->1)", color="#666666"];
+            transpose_compute -> compute_compute [label="L_sbuf_0\nbuf:(0->1) K:(0->1) M:(0->1)", color="#666666"];
+            load_R_compute -> compute_compute [label="R_sbuf_0\nbuf:(0->1) K:(0->1) N:(0->1)", color="#666666"];
+            compute_compute -> store_compute [label="out_sbuf_0\nbuf:(0->1) M:(0->1) N:(0->1)", color="#666666"];
+        }
+    }
+
+    // Layout hint
+    store_dma -> alloc_L_temp_compute [style="invis", weight=0];
+
+}

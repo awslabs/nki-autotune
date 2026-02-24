@@ -1,0 +1,76 @@
+digraph NKIGymArchitecture {
+    rankdir=TB;
+    node [fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=10];
+
+    // Cluster: User Input
+    subgraph cluster_input {
+        label="User Input";
+        style=rounded;
+        bgcolor="#E3F2FD";
+        color="#1976D2";
+
+        numpy_spec [label="NumPy Workload\nSpecification", shape=box, style="rounded,filled", fillcolor="#BBDEFB"];
+    }
+
+    // CPU (Correctness Reference)
+    cpu [label="CPU\n(NumPy)", shape=box, style="rounded,filled", fillcolor="#C8E6C9", color="#388E3C"];
+
+    // Lowering Pipeline (single box)
+    pipeline [label="Lowering Pipeline\n(see pipeline diagram)", shape=box, style="rounded,filled", fillcolor="#E1BEE7", color="#7B1FA2"];
+
+    // Cluster: Search
+    subgraph cluster_search {
+        label="Search & Agent";
+        style=rounded;
+        bgcolor="#FFF3E0";
+        color="#F57C00";
+
+        mcts [label="MCTS\n(state selection)", shape=box, style="rounded,filled", fillcolor="#FFE0B2"];
+        llm [label="LLM Agent\n(action proposal)", shape=box, style="rounded,filled", fillcolor="#FFCC80"];
+        failure_summary [label="Failure\nSummary", shape=note, style=filled, fillcolor="#FFE0B2"];
+    }
+
+    // Cluster: State
+    subgraph cluster_state {
+        label="State Encoding";
+        style=rounded;
+        bgcolor="#ECEFF1";
+        color="#546E7A";
+
+        state [label="• NumPy\n• MLIR\n• Perf metrics", shape=box, style="rounded,filled", fillcolor="#CFD8DC"];
+    }
+
+    // Trainium (single box, outputs as edge labels)
+    trainium [label="Trainium\nExecution", shape=box, style="rounded,filled", fillcolor="#C8E6C9", color="#388E3C"];
+
+    // Verification
+    verification [label="Verification\n(numerical comparison)", shape=box, style="rounded,filled", fillcolor="#FFCDD2", color="#D32F2F"];
+
+    // Actions
+    actions [label="Actions\n• Manual rules\n• Direct MLIR edits\n• NumPy edits", shape=box, style="rounded,filled", fillcolor="#FFCC80"];
+
+    // Edges: User input flow
+    numpy_spec -> cpu;
+    numpy_spec -> pipeline;
+
+    // Edges: Pipeline to execution
+    pipeline -> trainium;
+
+    // Edges: Optimization loop
+    pipeline -> state;
+    state -> mcts;
+    mcts -> llm;
+    failure_summary -> llm;
+    llm -> actions;
+    actions -> pipeline;
+
+    // Edges: Trainium outputs
+    trainium -> state;
+    trainium -> verification;
+
+    // Edges: Verification
+    cpu -> verification;
+    verification -> failure_summary [label="fail", color="#D32F2F", fontcolor="#D32F2F"];
+    verification -> mcts [label="pass", color="#388E3C", fontcolor="#388E3C"];
+}

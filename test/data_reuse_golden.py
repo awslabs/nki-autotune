@@ -37,7 +37,6 @@ class DataReuseCase(NamedTuple):
     Attributes:
         id: Test case identifier for pytest parametrize.
         before: Golden fixture function representing the pre-merge state.
-        params: Parameter names in sorted order.
         input_shapes: Mapping from parameter names to shape tuples.
         output_dtype: Numpy dtype type for output allocation.
         expected_pairs: Exact reuse pairs returned by analyze_ir on the before program.
@@ -47,7 +46,6 @@ class DataReuseCase(NamedTuple):
 
     id: str
     before: object
-    params: tuple[str, ...]
     input_shapes: dict[str, tuple[int, ...]]
     output_dtype: type
     expected_pairs: list[tuple[str, str]]
@@ -280,7 +278,6 @@ CASES: list[DataReuseCase] = [
     DataReuseCase(
         id="matmul_1x1_no_reuse",
         before=before_matmul_1x1,
-        params=("a", "b"),
         input_shapes={"a": (128, 128), "b": (128, 128)},
         output_dtype=np.float32,
         expected_pairs=[],
@@ -290,7 +287,6 @@ CASES: list[DataReuseCase] = [
     DataReuseCase(
         id="matmul_2x1_merge_b",
         before=before_matmul_2x1,
-        params=("a", "b"),
         input_shapes={"a": (128, 256), "b": (128, 128)},
         output_dtype=np.float32,
         expected_pairs=[("tensor_1", "tensor_4")],
@@ -300,7 +296,6 @@ CASES: list[DataReuseCase] = [
     DataReuseCase(
         id="matmul_1x2_merge_a",
         before=before_matmul_1x2,
-        params=("a", "b"),
         input_shapes={"a": (128, 128), "b": (128, 256)},
         output_dtype=np.float32,
         expected_pairs=[("tensor_0", "tensor_3")],
@@ -310,7 +305,6 @@ CASES: list[DataReuseCase] = [
     DataReuseCase(
         id="matmul_2x2_partial",
         before=before_matmul_2x2,
-        params=("a", "b"),
         input_shapes={"a": (128, 256), "b": (128, 256)},
         output_dtype=np.float32,
         expected_pairs=[
@@ -325,7 +319,6 @@ CASES: list[DataReuseCase] = [
     DataReuseCase(
         id="matmul_2x2_full",
         before=before_matmul_2x2,
-        params=("a", "b"),
         input_shapes={"a": (128, 256), "b": (128, 256)},
         output_dtype=np.float32,
         expected_pairs=[
@@ -340,7 +333,6 @@ CASES: list[DataReuseCase] = [
     DataReuseCase(
         id="matmul_4x1_partial",
         before=before_matmul_4x1,
-        params=("a", "b"),
         input_shapes={"a": (128, 512), "b": (128, 128)},
         output_dtype=np.float32,
         expected_pairs=[
@@ -357,7 +349,6 @@ CASES: list[DataReuseCase] = [
     DataReuseCase(
         id="matmul_4x1_full",
         before=before_matmul_4x1,
-        params=("a", "b"),
         input_shapes={"a": (128, 512), "b": (128, 128)},
         output_dtype=np.float32,
         expected_pairs=[
@@ -374,7 +365,6 @@ CASES: list[DataReuseCase] = [
     DataReuseCase(
         id="double_matmul_2x1_full",
         before=before_double_matmul_2x1,
-        params=("a", "b", "c"),
         input_shapes={"a": (128, 128), "b": (128, 256), "c": (128, 128)},
         output_dtype=np.float32,
         expected_pairs=[("tensor_0", "tensor_5"), ("tensor_3", "tensor_8")],

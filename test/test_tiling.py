@@ -1,6 +1,7 @@
 """Tests for the tiling pass.
 
 Verifies that for each input shape configuration:
+- Generated tiled program matches a hardcoded golden GymProgram
 - Generated tiled source matches a hardcoded golden string
 - Tiled function produces numerically correct results
 """
@@ -8,7 +9,12 @@ Verifies that for each input shape configuration:
 import numpy as np
 import pytest
 from conftest import make_random_array, normalize_source
-from tiling_golden import GOLDEN_DOUBLE_MATMUL_SOURCE, GOLDEN_SINGLE_MATMUL_SOURCE
+from tiling_golden import (
+    GOLDEN_DOUBLE_MATMUL_PROGRAM,
+    GOLDEN_DOUBLE_MATMUL_SOURCE,
+    GOLDEN_SINGLE_MATMUL_PROGRAM,
+    GOLDEN_SINGLE_MATMUL_SOURCE,
+)
 
 from nkigym.ir import program_to_source, source_to_program
 from nkigym.tiling import tile_program
@@ -51,6 +57,9 @@ class TestSingleMatmulTiling:
         expected_source = GOLDEN_SINGLE_MATMUL_SOURCE[(a_shape, b_shape)]
         assert normalize_source(actual_source) == normalize_source(expected_source)
 
+        expected_program = GOLDEN_SINGLE_MATMUL_PROGRAM[(a_shape, b_shape)]
+        assert tiled == expected_program
+
         a = make_random_array(a_shape, seed=42)
         b = make_random_array(b_shape, seed=43)
         expected = matmul_func(a, b)
@@ -84,6 +93,9 @@ class TestDoubleMatmulTiling:
         actual_source = program_to_source(tiled)
         expected_source = GOLDEN_DOUBLE_MATMUL_SOURCE[(a_shape, b_shape, c_shape)]
         assert normalize_source(actual_source) == normalize_source(expected_source)
+
+        expected_program = GOLDEN_DOUBLE_MATMUL_PROGRAM[(a_shape, b_shape, c_shape)]
+        assert tiled == expected_program
 
         a = make_random_array(a_shape, seed=42)
         b = make_random_array(b_shape, seed=43)

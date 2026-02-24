@@ -1,0 +1,22 @@
+digraph NKIGymArchitecture {
+    rankdir=LR;
+    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Main pipeline nodes
+    numpy [label="NumPy\n(@trace)", fillcolor="#E0E0E0"];
+    linalg [label="linalg\n(tensor)", fillcolor="#FFF3E0"];
+    scf_linalg [label="scf+linalg\n(tensor)", fillcolor="#E8F5E9"];
+    memref [label="memref+scf+linalg\n(buffer)", fillcolor="#F3E5F5"];
+    nisa [label="NISA", fillcolor="#D1ECF1"];
+
+    // Main flow
+    numpy -> linalg [label="trace"];
+    linalg -> scf_linalg [label="tiling"];
+    scf_linalg -> memref [label="bufferization"];
+    memref -> nisa [label="mechanical\nlowering"];
+
+    // Self-loops for optimization
+    numpy -> numpy [label="LLM edits\n(algebraic)", style=dashed, color="#1976D2", fontcolor="#1976D2"];
+    memref -> memref [label="manual rules\n+ LLM edits", style=dashed, color="#1976D2", fontcolor="#1976D2"];
+}

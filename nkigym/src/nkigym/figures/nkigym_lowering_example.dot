@@ -1,0 +1,111 @@
+digraph NKIGymLoweringExample {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Title
+    labelloc="t";
+    label="NKI Gym Lowering Example\nData Reuse Transformation";
+    fontsize=14;
+
+    // Stage 1: Initial naive tiles
+    subgraph cluster_initial {
+        label="1. Initial Tiles (naive)";
+        fontsize=11;
+        style=filled;
+        fillcolor="#E8F5E9";
+        color="#28A745";
+
+        tile0 [
+            label=<<table border="0" cellborder="1" cellspacing="0">
+                <tr><td bgcolor="#c3e6cb"><b>Tile 0</b></td></tr>
+                <tr><td align="left">load A[0,:]</td></tr>
+                <tr><td align="left">load B[:,0]</td></tr>
+                <tr><td align="left">matmul</td></tr>
+                <tr><td align="left">store C[0,0]</td></tr>
+            </table>>
+            shape=none
+        ];
+
+        tile1 [
+            label=<<table border="0" cellborder="1" cellspacing="0">
+                <tr><td bgcolor="#c3e6cb"><b>Tile 1</b></td></tr>
+                <tr><td align="left">load A[0,:]</td></tr>
+                <tr><td align="left">load B[:,1]</td></tr>
+                <tr><td align="left">matmul</td></tr>
+                <tr><td align="left">store C[0,1]</td></tr>
+            </table>>
+            shape=none
+        ];
+
+        redundant [
+            label="A[0,:] loaded twice!"
+            shape=plaintext
+            fontcolor="#E65100"
+            fontsize=9
+        ];
+    }
+
+    // Stage 2: After data reuse transform
+    subgraph cluster_transformed {
+        label="2. After Data Reuse Transform";
+        fontsize=11;
+        style=filled;
+        fillcolor="#D4EDDA";
+        color="#28A745";
+
+        tile_merged [
+            label=<<table border="0" cellborder="1" cellspacing="0">
+                <tr><td bgcolor="#c3e6cb" colspan="2"><b>Merged Tiles</b></td></tr>
+                <tr><td align="left">load A[0,:]</td><td bgcolor="#c3e6cb">shared</td></tr>
+                <tr><td align="left">load B[:,0]</td><td></td></tr>
+                <tr><td align="left">load B[:,1]</td><td></td></tr>
+                <tr><td align="left">matmul → C[0,0]</td><td></td></tr>
+                <tr><td align="left">matmul → C[0,1]</td><td></td></tr>
+                <tr><td align="left">store C[0,0:2]</td><td></td></tr>
+            </table>>
+            shape=none
+        ];
+
+        benefit [
+            label="1 load instead of 2"
+            shape=plaintext
+            fontcolor="#28A745"
+            fontsize=9
+        ];
+    }
+
+    // Stage 3: Lowered to NISA
+    subgraph cluster_nisa {
+        label="3. Lowered to Nisa";
+        fontsize=11;
+        style=filled;
+        fillcolor="#D1ECF1";
+        color="#17A2B8";
+
+        nisa_code [
+            label=<<table border="0" cellborder="0" cellspacing="2">
+                <tr><td align="left"><font face="Courier">scf.for %i = 0 to 2:</font></td></tr>
+                <tr><td align="left"><font face="Courier">  %a = load A[0,:]</font></td></tr>
+                <tr><td align="left"><font face="Courier">  %b = load B[:,%i]</font></td></tr>
+                <tr><td align="left"><font face="Courier">  nisa.matmul(%a,%b)</font></td></tr>
+            </table>>
+            shape=box
+            style=filled
+            fillcolor="white"
+        ];
+
+        note [
+            label="Hoisting already applied"
+            shape=plaintext
+            fontcolor="#17A2B8"
+            fontsize=9
+        ];
+    }
+
+    // Edges
+    tile0 -> tile_merged [label="transform" style=dashed];
+    tile1 -> tile_merged [label="" style=dashed];
+    tile_merged -> nisa_code [label="lower_to_nisa"];
+}

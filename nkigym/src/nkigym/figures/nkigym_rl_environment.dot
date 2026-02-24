@@ -1,0 +1,21 @@
+digraph nkigym_rl {
+    rankdir=LR;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // Kernel IR states
+    s0 [label="Kernel\nState A", shape=box, style="rounded,filled", fillcolor="#e3f2fd"];
+    s1 [label="Kernel\nState B", shape=box, style="rounded,filled", fillcolor="#e3f2fd"];
+    s2 [label="Kernel\nState C", shape=box, style="rounded,filled", fillcolor="#e3f2fd"];
+    s3 [label="Kernel\nState D", shape=box, style="rounded,filled", fillcolor="#e3f2fd"];
+
+    // Performance transforms (simple directed graph with cycles)
+    s0 -> s1 [label="transform X"];
+    s0 -> s2 [label="transform Y"];
+    s1 -> s2 [label="transform Z"];
+    s1 -> s3 [label="transform X"];
+    s2 -> s0 [label="transform Y"];
+    s2 -> s3 [label="transform Z"];
+    s3 -> s1 [label="transform X"];
+}

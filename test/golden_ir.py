@@ -5,12 +5,6 @@ import pytest
 
 from nkigym.ir import GymProgram, GymStatement, TensorRef
 
-
-def _ref(name: str, shape: tuple[int, ...] = (128, 128)) -> TensorRef:
-    """Build a TensorRef with full-range slices."""
-    return TensorRef(name, shape, tuple((0, s) for s in shape))
-
-
 SOURCE_TO_PROGRAM_CASES = [
     pytest.param(
         "def matmul(a, b):\n    return nkigym.nc_matmul(a, b)\n",
@@ -20,7 +14,16 @@ SOURCE_TO_PROGRAM_CASES = [
             name="matmul",
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
-            stmts=(GymStatement("nc_matmul", (("stationary", _ref("a")), ("moving", _ref("b"))), _ref("_return")),),
+            stmts=(
+                GymStatement(
+                    "nc_matmul",
+                    (
+                        ("stationary", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
+                        ("moving", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
             return_var="_return",
             output_dtype=np.float32,
         ),
@@ -37,8 +40,11 @@ SOURCE_TO_PROGRAM_CASES = [
             stmts=(
                 GymStatement(
                     "nc_matmul",
-                    (("stationary", _ref("a", (256, 128))), ("moving", _ref("b", (256, 512)))),
-                    _ref("_return", (128, 512)),
+                    (
+                        ("stationary", TensorRef("a", (256, 128), ((0, 256), (0, 128)))),
+                        ("moving", TensorRef("b", (256, 512), ((0, 256), (0, 512)))),
+                    ),
+                    TensorRef("_return", (128, 512), ((0, 128), (0, 512))),
                 ),
             ),
             return_var="_return",
@@ -55,8 +61,22 @@ SOURCE_TO_PROGRAM_CASES = [
             params=("a", "b", "c"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128)), ("c", (128, 128))),
             stmts=(
-                GymStatement("nc_matmul", (("stationary", _ref("a")), ("moving", _ref("b"))), _ref("_nested_0")),
-                GymStatement("nc_matmul", (("stationary", _ref("_nested_0")), ("moving", _ref("c"))), _ref("_return")),
+                GymStatement(
+                    "nc_matmul",
+                    (
+                        ("stationary", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
+                        ("moving", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("_nested_0", (128, 128), ((0, 128), (0, 128))),
+                ),
+                GymStatement(
+                    "nc_matmul",
+                    (
+                        ("stationary", TensorRef("_nested_0", (128, 128), ((0, 128), (0, 128)))),
+                        ("moving", TensorRef("c", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
+                ),
             ),
             return_var="_return",
             output_dtype=np.float32,
@@ -73,7 +93,13 @@ SOURCE_TO_PROGRAM_CASES = [
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
             stmts=(
                 GymStatement(
-                    "tensor_tensor", (("data1", _ref("a")), ("data2", _ref("b")), ("op", "np.add")), _ref("_return")
+                    "tensor_tensor",
+                    (
+                        ("data1", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
+                        ("data2", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),
+                        ("op", "np.add"),
+                    ),
+                    TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
                 ),
             ),
             return_var="_return",
@@ -89,7 +115,13 @@ SOURCE_TO_PROGRAM_CASES = [
             name="activation",
             params=("a",),
             input_shapes=(("a", (128, 128)),),
-            stmts=(GymStatement("activation", (("data", _ref("a")), ("op", "np.tanh")), _ref("_return")),),
+            stmts=(
+                GymStatement(
+                    "activation",
+                    (("data", TensorRef("a", (128, 128), ((0, 128), (0, 128)))), ("op", "np.tanh")),
+                    TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
             return_var="_return",
             output_dtype=np.float32,
         ),
@@ -103,7 +135,16 @@ SOURCE_TO_PROGRAM_CASES = [
             name="assigned",
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
-            stmts=(GymStatement("nc_matmul", (("stationary", _ref("a")), ("moving", _ref("b"))), _ref("result")),),
+            stmts=(
+                GymStatement(
+                    "nc_matmul",
+                    (
+                        ("stationary", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
+                        ("moving", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("result", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
             return_var="result",
             output_dtype=np.float32,
         ),
@@ -141,11 +182,11 @@ SOURCE_TO_PROGRAM_CASES = [
                 GymStatement(
                     "tensor_scalar",
                     (
-                        ("data", _ref("a")),
+                        ("data", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
                         ("operand0", TensorRef("b", (128, 1), ((0, 128), (0, 1)))),
                         ("op", "np.multiply"),
                     ),
-                    _ref("_return"),
+                    TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
                 ),
             ),
             return_var="_return",
@@ -161,7 +202,13 @@ SOURCE_TO_PROGRAM_CASES = [
             name="exp",
             params=("a",),
             input_shapes=(("a", (128, 128)),),
-            stmts=(GymStatement("activation", (("data", _ref("a")), ("op", "np.exp")), _ref("_return")),),
+            stmts=(
+                GymStatement(
+                    "activation",
+                    (("data", TensorRef("a", (128, 128), ((0, 128), (0, 128)))), ("op", "np.exp")),
+                    TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
             return_var="_return",
             output_dtype=np.float32,
         ),
@@ -178,14 +225,42 @@ SOURCE_TO_PROGRAM_CASES = [
             stmts=(
                 GymStatement(
                     "tensor_tensor",
-                    (("data1", _ref("a")), ("data2", _ref("b")), ("op", "np.multiply")),
-                    _ref("_return"),
+                    (
+                        ("data1", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
+                        ("data2", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),
+                        ("op", "np.multiply"),
+                    ),
+                    TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
                 ),
             ),
             return_var="_return",
             output_dtype=np.float32,
         ),
         id="tensor_tensor_multiply",
+    ),
+    pytest.param(
+        "def acc_matmul(a, b, c):\n    return nkigym.nc_matmul(a, b, acc=c)\n",
+        {"a": (128, 128), "b": (128, 128), "c": (128, 128)},
+        np.float32,
+        GymProgram(
+            name="acc_matmul",
+            params=("a", "b", "c"),
+            input_shapes=(("a", (128, 128)), ("b", (128, 128)), ("c", (128, 128))),
+            stmts=(
+                GymStatement(
+                    "nc_matmul",
+                    (
+                        ("stationary", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
+                        ("moving", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),
+                        ("acc", TensorRef("c", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
+            return_var="_return",
+            output_dtype=np.float32,
+        ),
+        id="acc_matmul",
     ),
 ]
 
@@ -196,13 +271,35 @@ PROGRAM_TO_SOURCE_CASES = [
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
             stmts=(
-                GymStatement("np_empty", (("dtype", "np.float32"),), _ref("output")),
-                GymStatement("np_slice", (("src", _ref("a")),), _ref("tensor_0")),
-                GymStatement("np_slice", (("src", _ref("b")),), _ref("tensor_1")),
                 GymStatement(
-                    "nc_matmul", (("stationary", _ref("tensor_0")), ("moving", _ref("tensor_1"))), _ref("tensor_2")
+                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
                 ),
-                GymStatement("np_store", (("src", _ref("tensor_2")), ("dst", _ref("output"))), _ref("output")),
+                GymStatement(
+                    "np_slice",
+                    (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
+                    TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                ),
+                GymStatement(
+                    "np_slice",
+                    (("src", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),),
+                    TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
+                ),
+                GymStatement(
+                    "nc_matmul",
+                    (
+                        ("stationary", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
+                        ("moving", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
+                ),
+                GymStatement(
+                    "np_store",
+                    (
+                        ("src", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
+                        ("dst", TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("output", (128, 128), ((0, 128), (0, 128))),
+                ),
             ),
             return_var="output",
             output_dtype=np.float32,
@@ -229,9 +326,22 @@ PROGRAM_TO_SOURCE_CASES = [
             params=("a",),
             input_shapes=(("a", (128, 128)),),
             stmts=(
-                GymStatement("np_empty", (("dtype", "np.float32"),), _ref("output")),
-                GymStatement("np_slice", (("src", _ref("a")),), _ref("tensor_0")),
-                GymStatement("np_store", (("src", _ref("tensor_0")), ("dst", _ref("output"))), _ref("output")),
+                GymStatement(
+                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
+                ),
+                GymStatement(
+                    "np_slice",
+                    (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
+                    TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                ),
+                GymStatement(
+                    "np_store",
+                    (
+                        ("src", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
+                        ("dst", TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("output", (128, 128), ((0, 128), (0, 128))),
+                ),
             ),
             return_var="output",
             output_dtype=np.float32,
@@ -256,28 +366,54 @@ PROGRAM_TO_SOURCE_CASES = [
             params=("a", "b"),
             input_shapes=(("a", (256, 128)), ("b", (256, 128))),
             stmts=(
-                GymStatement("np_empty", (("dtype", "np.float32"),), _ref("output")),
                 GymStatement(
-                    "np_slice", (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),), _ref("tensor_0")
+                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
                 ),
                 GymStatement(
-                    "np_slice", (("src", TensorRef("b", (256, 128), ((0, 128), (0, 128)))),), _ref("tensor_1")
+                    "np_slice",
+                    (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),),
+                    TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
                 ),
                 GymStatement(
-                    "nc_matmul", (("stationary", _ref("tensor_0")), ("moving", _ref("tensor_1"))), _ref("tensor_2")
-                ),
-                GymStatement(
-                    "np_slice", (("src", TensorRef("a", (256, 128), ((128, 256), (0, 128)))),), _ref("tensor_3")
-                ),
-                GymStatement(
-                    "np_slice", (("src", TensorRef("b", (256, 128), ((128, 256), (0, 128)))),), _ref("tensor_4")
+                    "np_slice",
+                    (("src", TensorRef("b", (256, 128), ((0, 128), (0, 128)))),),
+                    TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
                 ),
                 GymStatement(
                     "nc_matmul",
-                    (("stationary", _ref("tensor_3")), ("moving", _ref("tensor_4")), ("acc", _ref("tensor_2"))),
-                    _ref("tensor_2"),
+                    (
+                        ("stationary", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
+                        ("moving", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
                 ),
-                GymStatement("np_store", (("src", _ref("tensor_2")), ("dst", _ref("output"))), _ref("output")),
+                GymStatement(
+                    "np_slice",
+                    (("src", TensorRef("a", (256, 128), ((128, 256), (0, 128)))),),
+                    TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
+                ),
+                GymStatement(
+                    "np_slice",
+                    (("src", TensorRef("b", (256, 128), ((128, 256), (0, 128)))),),
+                    TensorRef("tensor_4", (128, 128), ((0, 128), (0, 128))),
+                ),
+                GymStatement(
+                    "nc_matmul",
+                    (
+                        ("stationary", TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128)))),
+                        ("moving", TensorRef("tensor_4", (128, 128), ((0, 128), (0, 128)))),
+                        ("acc", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
+                ),
+                GymStatement(
+                    "np_store",
+                    (
+                        ("src", TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128)))),
+                        ("dst", TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("output", (128, 128), ((0, 128), (0, 128))),
+                ),
             ),
             return_var="output",
             output_dtype=np.float32,
@@ -292,8 +428,8 @@ PROGRAM_TO_SOURCE_CASES = [
             "    tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])\n"
             "    tensor_3 = a[128:256, 0:128]\n"
             "    tensor_4 = b[128:256, 0:128]\n"
-            "    tensor_2[0:128, 0:128] += nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128])\n"
-            "    output[0:128, 0:128] = tensor_2[0:128, 0:128]\n"
+            "    tensor_5 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128], acc=tensor_2[0:128, 0:128])\n"
+            "    output[0:128, 0:128] = tensor_5[0:128, 0:128]\n"
             "    return output\n"
             "\n"
         ),
@@ -307,15 +443,36 @@ PROGRAM_TO_SOURCE_CASES = [
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
             stmts=(
-                GymStatement("np_empty", (("dtype", "np.float32"),), _ref("output")),
-                GymStatement("np_slice", (("src", _ref("a")),), _ref("tensor_0")),
-                GymStatement("np_slice", (("src", _ref("b")),), _ref("tensor_1")),
+                GymStatement(
+                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
+                ),
+                GymStatement(
+                    "np_slice",
+                    (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
+                    TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                ),
+                GymStatement(
+                    "np_slice",
+                    (("src", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),),
+                    TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
+                ),
                 GymStatement(
                     "tensor_tensor",
-                    (("data1", _ref("tensor_0")), ("data2", _ref("tensor_1")), ("op", "np.add")),
-                    _ref("tensor_2"),
+                    (
+                        ("data1", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
+                        ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
+                        ("op", "np.add"),
+                    ),
+                    TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
                 ),
-                GymStatement("np_store", (("src", _ref("tensor_2")), ("dst", _ref("output"))), _ref("output")),
+                GymStatement(
+                    "np_store",
+                    (
+                        ("src", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
+                        ("dst", TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("output", (128, 128), ((0, 128), (0, 128))),
+                ),
             ),
             return_var="output",
             output_dtype=np.float32,
@@ -395,8 +552,14 @@ PROGRAM_TO_SOURCE_CASES = [
             params=("a", "b"),
             input_shapes=(("a", (128, 128)), ("b", (128, 1))),
             stmts=(
-                GymStatement("np_empty", (("dtype", "np.float32"),), _ref("output")),
-                GymStatement("np_slice", (("src", _ref("a")),), _ref("tensor_0")),
+                GymStatement(
+                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
+                ),
+                GymStatement(
+                    "np_slice",
+                    (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
+                    TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                ),
                 GymStatement(
                     "np_slice",
                     (("src", TensorRef("b", (128, 1), ((0, 128), (0, 1)))),),
@@ -405,13 +568,20 @@ PROGRAM_TO_SOURCE_CASES = [
                 GymStatement(
                     "tensor_scalar",
                     (
-                        ("data", _ref("tensor_0")),
+                        ("data", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                         ("operand0", TensorRef("tensor_1", (128, 1), ((0, 128), (0, 1)))),
                         ("op", "np.multiply"),
                     ),
-                    _ref("tensor_2"),
+                    TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
                 ),
-                GymStatement("np_store", (("src", _ref("tensor_2")), ("dst", _ref("output"))), _ref("output")),
+                GymStatement(
+                    "np_store",
+                    (
+                        ("src", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
+                        ("dst", TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+                    ),
+                    TensorRef("output", (128, 128), ((0, 128), (0, 128))),
+                ),
             ),
             return_var="output",
             output_dtype=np.float32,
@@ -484,6 +654,11 @@ F_ROUND_TRIP_CASES = [
         "import numpy as np\nimport nkigym\ndef multiply(a, b):\n    _return = nkigym.tensor_tensor(a[0:128, 0:128], b[0:128, 0:128], op=np.multiply)\n    return _return\n\n",
         {"a": (128, 128), "b": (128, 128)},
         id="tensor_tensor_multiply",
+    ),
+    pytest.param(
+        "import numpy as np\nimport nkigym\ndef acc_matmul(a, b, c):\n    _return = nkigym.nc_matmul(a[0:128, 0:128], b[0:128, 0:128], acc=c[0:128, 0:128])\n    return _return\n\n",
+        {"a": (128, 128), "b": (128, 128), "c": (128, 128)},
+        id="acc_matmul",
     ),
 ]
 

@@ -1,0 +1,44 @@
+digraph pipeline_comparison {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=10];
+
+    subgraph cluster_mlir {
+        label="MLIR KernelGen";
+        style=filled;
+        fillcolor="#e3f2fd";
+        color="#1976d2";
+        fontcolor="#1976d2";
+
+        m1 [label="NumPy\n(@trace)", shape=box, style="rounded,filled", fillcolor="#bbdefb"];
+        m2 [label="Traced MLIR\n(linalg/tensor)", shape=box, style="rounded,filled", fillcolor="#bbdefb"];
+        m3 [label="Tiled MLIR\n(scf.for loops)", shape=box, style="rounded,filled", fillcolor="#bbdefb"];
+        m4 [label="Bufferized MLIR\n(memref)", shape=box, style="rounded,filled", fillcolor="#bbdefb"];
+        m5 [label="NISA IR", shape=box, style="rounded,filled", fillcolor="#90caf9"];
+
+        m1 -> m2 [label="custom\ntracing"];
+        m2 -> m3 [label="MLIR\nTileUsingForOp"];
+        m3 -> m4 [label="MLIR\none-shot-bufferize"];
+        m4 -> m5 [label="custom\nlinalg-to-nisa"];
+    }
+
+    subgraph cluster_autotune {
+        label="Autotune Compute Graph";
+        style=filled;
+        fillcolor="#fff3e0";
+        color="#f57c00";
+        fontcolor="#f57c00";
+
+        a1 [label="Workload\nSpec", shape=box, style="rounded,filled", fillcolor="#ffe0b2"];
+        a2 [label="Compute Graph\n(DAG nodes)", shape=box, style="rounded,filled", fillcolor="#ffe0b2"];
+        a3 [label="Auto Graph\nTransformations", shape=box, style="rounded,filled", fillcolor="#ffe0b2"];
+        a5 [label="NKI Kernel", shape=box, style="rounded,filled", fillcolor="#ffcc80"];
+
+        a1 -> a2 [label="build\ngraph"];
+        a2 -> a3 [label="rewrite\nrules"];
+        a3 -> a3 [label="search", style=bold, color="#f57c00"];
+        a3 -> a5 [label="codegen"];
+    }
+
+}

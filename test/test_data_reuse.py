@@ -10,12 +10,12 @@ Run with: pytest test/test_data_reuse.py -v
 
 import numpy as np
 import pytest
-from conftest import _golden_to_program, make_random_array
+from conftest import make_random_array
 from data_reuse_golden import CASES
 
-from nkigym.ir import program_to_source
+from nkigym.ir import program_to_source, source_to_program
 from nkigym.transforms import DataReuseTransform
-from nkigym.utils import source_to_callable
+from nkigym.utils import callable_to_source, source_to_callable
 
 _reuse = DataReuseTransform()
 
@@ -35,7 +35,7 @@ def test_data_reuse(case):
     Args:
         case: DataReuseCase with before/after goldens, expected pairs, and merge count.
     """
-    before_program = _golden_to_program(case.before, case.params, case.input_shapes, case.output_dtype)
+    before_program = source_to_program(callable_to_source(case.before), case.input_shapes, case.output_dtype)
 
     pairs = _reuse.analyze_ir(before_program)
     assert pairs == case.expected_pairs
@@ -46,7 +46,7 @@ def test_data_reuse(case):
         assert len(pairs) > 0
         merged_program = _reuse.transform_ir(merged_program, pairs[0])
 
-    after_program = _golden_to_program(case.after, case.params, case.input_shapes, case.output_dtype)
+    after_program = source_to_program(callable_to_source(case.after), case.input_shapes, case.output_dtype)
     assert merged_program.stmts == after_program.stmts
 
     before_func = source_to_callable(program_to_source(before_program), before_program.name)

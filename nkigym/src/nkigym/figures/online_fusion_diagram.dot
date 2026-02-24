@@ -1,0 +1,136 @@
+digraph OnlineFusion {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica"];
+    edge [fontname="Helvetica"];
+
+    // Title
+    labelloc="t";
+    label="Online Fusion: Breaking Sequential Dependencies";
+    fontsize=16;
+
+    // Before cluster - Sequential/Blocking
+    subgraph cluster_before {
+        label="Before: Sequential Execution (Blocking)";
+        fontsize=12;
+        style=filled;
+        fillcolor="#FFEBEE";
+        color="#C62828";
+
+        // Op 1 - Blocking operator (e.g., RMSNorm)
+        op1 [
+            label=<<table border="0" cellborder="0" cellspacing="2">
+                <tr><td><b>Op 1</b></td></tr>
+                <tr><td><font point-size="9">(RMSNorm)</font></td></tr>
+            </table>>
+            shape=box
+            style="rounded,filled"
+            fillcolor="white"
+        ];
+
+        // Op 2 - Accumulation (e.g., Matmul)
+        op2 [
+            label=<<table border="0" cellborder="0" cellspacing="2">
+                <tr><td><b>Op 2</b></td></tr>
+                <tr><td><font point-size="9">(Matmul)</font></td></tr>
+            </table>>
+            shape=box
+            style="rounded,filled"
+            fillcolor="white"
+        ];
+
+        // Self-loops for reduction dimension
+        op1:e -> op1:e [
+            label="↺ k"
+            fontsize=10
+            color="#1565C0"
+            fontcolor="#1565C0"
+        ];
+
+        op2:e -> op2:e [
+            label="↺ k"
+            fontsize=10
+            color="#1565C0"
+            fontcolor="#1565C0"
+        ];
+
+        // Blocking dependency
+        op1 -> op2 [
+            label="wait for\nall k iterations"
+            fontsize=9
+            style=dashed
+            color="#C62828"
+            fontcolor="#C62828"
+        ];
+
+        // Annotation
+        before_note [
+            label="Each op must complete\nits reduction loop before\nnext op can start"
+            shape=plaintext
+            fontsize=9
+            fontcolor="#666666"
+        ];
+    }
+
+    // Arrow between clusters
+    arrow_node [
+        label="Online\nFusion"
+        shape=rarrow
+        style=filled
+        fillcolor="#FFF9C4"
+        color="#F9A825"
+        width=1.2
+        height=0.8
+    ];
+
+    // After cluster - Fused/Overlapped
+    subgraph cluster_after {
+        label="After: Fused Execution (Overlapped)";
+        fontsize=12;
+        style=filled;
+        fillcolor="#E8F5E9";
+        color="#2E7D32";
+
+        // Fused subgraph
+        subgraph cluster_fused {
+            label="Single Fused Loop (↺ k)";
+            fontsize=10;
+            style="rounded,filled";
+            fillcolor="#C8E6C9";
+            color="#43A047";
+
+            fused_op1 [
+                label="RMSNorm"
+                shape=box
+                style="rounded,filled"
+                fillcolor="white"
+            ];
+
+            fused_op2 [
+                label="Matmul"
+                shape=box
+                style="rounded,filled"
+                fillcolor="white"
+            ];
+
+            fused_op1 -> fused_op2 [
+                label="partial result\n+ scaling"
+                fontsize=9
+                color="#2E7D32"
+                fontcolor="#2E7D32"
+            ];
+        }
+
+        // Annotation
+        after_note [
+            label="Recurrence relation:\nÕ₁ₖ = sₖ · Õ₁ₖ₋₁ + Bₖ\n\nOps execute together\nin single loop iteration"
+            shape=plaintext
+            fontsize=9
+            fontcolor="#666666"
+        ];
+    }
+
+    // Layout edges (invisible)
+    op2 -> arrow_node [style=invis];
+    arrow_node -> fused_op1 [style=invis];
+}

@@ -3,14 +3,19 @@
 Finds pairs of the same operation where only a single operand differs, and that single differing operand can be combined along an adjacent
 dimension. When found, the two operations are merged into a single wider operation.
 
+Each merge is an atomic transform: it reduces exactly one instruction and updates its consumers. It never backtracks changes onto producers or forward onto consumers of a different type. The three atomic merge types are:
+
+1. **Load merge** — reduces one load, remaps downstream compute and store references to subscripts of the wider load.
+2. **Compute merge** — reduces one compute op, remaps downstream references to subscripts of the wider output. Requires differing operands to reference the same variable (i.e., prerequisite load merges must be applied first).
+3. **Store merge** — reduces one store, widening the kept store's src and dst slices. Requires both stores to reference the same source variable with adjacent slices (i.e., prerequisite compute merges must be applied first).
+
 The algorithm:
 
 1. Group operations by type.
 2. For each pair of the same type, compare operands.
 3. If all operands match except one, check whether the differing operand
    pair is adjacent and within hardware limits for that op.
-4. Verify data dependencies — merging must not change the computation.
-5. If so, report a merge opportunity.
+4. If so, report a merge opportunity.
 
 Like all transforms, operand merge has two steps:
 
@@ -90,12 +95,19 @@ tensor_5 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 128:256])
 output[0:128, 128:256] = tensor_5[0:128, 0:128]
 ```
 
-**After** (merged N = 256, `tensor_5` absorbed into `tensor_2`):
+**After compute merge** (merged N = 256, `tensor_5` absorbed into `tensor_2`):
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:256])
 output[0:128, 0:128] = tensor_2[0:128, 0:128]
 output[0:128, 128:256] = tensor_2[0:128, 128:256]
+```
+
+**After store merge** (stores merged into single wider store):
+
+```python
+tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:256])
+output[0:128, 0:256] = tensor_2[0:128, 0:256]
 ```
 
 **LHS merge** — same RHS, adjacent LHS slices along M:
@@ -110,12 +122,19 @@ tensor_4 = nkigym.nc_matmul(tensor_0[0:128, 64:128], tensor_1[0:128, 0:128])
 output[64:128, 0:128] = tensor_4[0:64, 0:128]
 ```
 
-**After** (merged M = 128, `tensor_4` absorbed into `tensor_2`):
+**After compute merge** (merged M = 128, `tensor_4` absorbed into `tensor_2`):
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
 output[0:64, 0:128] = tensor_2[0:64, 0:128]
 output[64:128, 0:128] = tensor_2[64:128, 0:128]
+```
+
+**After store merge** (stores merged into single wider store):
+
+```python
+tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+output[0:128, 0:128] = tensor_2[0:128, 0:128]
 ```
 
 If the merged dimension would exceed the limit, it is not an option:
@@ -182,6 +201,7 @@ Merged dim 0 would be 0:256 (size 256 > 128) — **rejected**.
 | Operator | Dimension | Max size |
 |---|---|---|
 | `load` | partition dim (dim 0) | 128 |
+| `store` | partition dim (dim 0) | 128 |
 | `nc_matmul` | M (stationary free) | 128 |
 | `nc_matmul` | K (contraction) | 128 |
 | `nc_matmul` | N (moving free) | 512 |
