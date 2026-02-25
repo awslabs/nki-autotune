@@ -73,6 +73,7 @@ class ActivationOp(GymOp):
 
         data = ctx.subscript(data_ref)
         out_name = stmt.output.name
+        out_sub = ctx.subscript(stmt.output)
         ctx.buffers[out_name] = "SBUF"
 
         func_str = "nl.identity"
@@ -82,5 +83,5 @@ class ActivationOp(GymOp):
         shape_str = repr(stmt.output.shape)
         return [
             f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
-            f"nisa.activation(dst={out_name}, op={func_str}, data={data})",
+            f"nisa.activation(dst={out_sub}, op={func_str}, data={data})",
         ]

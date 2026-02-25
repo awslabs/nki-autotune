@@ -7,6 +7,8 @@ import logging
 
 __all__ = ["setup_logging", "MultilineFormatter"]
 
+_NOISY_LOGGERS = ("nki.compiler.backends.neuron.TraceKernel",)
+
 
 class MultilineFormatter(logging.Formatter):
     """Formatter that aligns multiline messages with indentation.
@@ -16,7 +18,7 @@ class MultilineFormatter(logging.Formatter):
         show_metadata: Whether to append timestamp/level/name metadata.
     """
 
-    def __init__(self, msg_width: int, show_metadata: bool = True) -> None:
+    def __init__(self, msg_width: int, show_metadata: bool) -> None:
         """Initialize the formatter.
 
         Args:
@@ -39,29 +41,30 @@ class MultilineFormatter(logging.Formatter):
         message = record.getMessage()
         lines = message.split("\n")
 
+        first_line = lines[0]
         if self.show_metadata:
             metadata = f"{self.formatTime(record)} - {record.levelname} - {record.name}"
             first_line = f"{lines[0]:<{self.msg_width}}{metadata}"
-        else:
-            first_line = lines[0]
 
-        if len(lines) == 1:
-            return first_line
-
-        continuation = "\n".join(lines[1:])
-        return f"{first_line}\n{continuation}"
+        result = first_line
+        if len(lines) > 1:
+            continuation = "\n".join(lines[1:])
+            result = f"{first_line}\n{continuation}"
+        return result
 
 
-def setup_logging(log_file: str, level: int = logging.DEBUG, msg_width: int = 300, show_metadata: bool = False) -> None:
+def setup_logging(log_file: str, level: int, msg_width: int, show_metadata: bool) -> None:
     """Configure logging with multiline-aligned formatter.
 
     Args:
         log_file: Path to the log file.
-        level: Logging level (default: DEBUG).
-        msg_width: Width for message alignment (default: 300).
+        level: Logging level.
+        msg_width: Width for message alignment.
         show_metadata: Whether to append timestamp/level/name metadata to log lines.
     """
     handler = logging.FileHandler(log_file, mode="w")
     handler.setFormatter(MultilineFormatter(msg_width=msg_width, show_metadata=show_metadata))
     logging.root.addHandler(handler)
     logging.root.setLevel(level)
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)

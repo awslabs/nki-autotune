@@ -104,12 +104,13 @@ class SliceOp(GymOp):
         shape_str = repr(stmt.output.shape)
         src_subscript = ctx.subscript(src_ref)
 
+        out_sub = ctx.subscript(stmt.output)
         ctx.buffers[out_name] = "SBUF"
         lines = [f"{out_name} = {src_subscript}"]
         if src_buffer != "SBUF":
             lines = [
                 f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
-                f"nisa.dma_copy(dst={out_name}, src={src_subscript})",
+                f"nisa.dma_copy(dst={out_sub}, src={src_subscript})",
             ]
         return lines
 
@@ -184,9 +185,11 @@ class StoreOp(GymOp):
             staging_name = f"_staging_{ctx.staging_counter}"
             ctx.staging_counter += 1
             shape_str = repr(src_ref.shape)
+            parts = ", ".join(f"0:{s}" for s in src_ref.shape)
+            staging_sub = f"{staging_name}[{parts}]"
             lines = [
                 f"{staging_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
-                f"nisa.tensor_copy(dst={staging_name}, src={src_subscript})",
-                f"nisa.dma_copy(dst={dst_subscript}, src={staging_name})",
+                f"nisa.tensor_copy(dst={staging_sub}, src={src_subscript})",
+                f"nisa.dma_copy(dst={dst_subscript}, src={staging_sub})",
             ]
         return lines

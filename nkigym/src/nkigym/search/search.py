@@ -8,6 +8,7 @@ Every new node is verified against the root function for numerical
 correctness.  Qualifying variants (depth >= min_depth) are saved to disk.
 """
 
+import ast
 import logging
 import random
 from collections.abc import Callable
@@ -18,7 +19,17 @@ from typing import Any
 import numpy as np
 
 from nkigym.codegen.gym_to_nki import lower_to_nki
+from nkigym.codegen.loop_rolling import roll_loops
 from nkigym.ir import GymProgram, program_to_source, source_to_program
+from nkigym.search.compile import (  # noqa: F401
+    CompilationPool,
+    SearchResults,
+    VariantResult,
+    _capture_error,
+    run_on_hardware,
+)
+from nkigym.search.mac_count import compute_mac_count
+from nkigym.search.report import SearchReport
 from nkigym.tiling import tile_program
 from nkigym.transforms.base import Transform
 from nkigym.utils import callable_to_source, import_func
@@ -27,21 +38,41 @@ from nkigym.utils.source import source_to_callable
 logger = logging.getLogger(__name__)
 
 PROGRESS_INTERVAL = 500
+_WARMUP = 10
+_ITERS = 100
+
+_NL_AFFINE_RANGE = ast.Attribute(value=ast.Name(id="nl", ctx=ast.Load()), attr="affine_range", ctx=ast.Load())
+
+
+class _RangeToAffine(ast.NodeTransformer):
+    """Replace ``range(N)`` with ``nl.affine_range(N)`` in for-loop iterators."""
+
+    def visit_For(self, node: ast.For) -> ast.For:
+        """Rewrite for-loop iterator from range to nl.affine_range."""
+        self.generic_visit(node)
+        it = node.iter
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range":
+            it.func = ast.copy_location(_NL_AFFINE_RANGE, it.func)
+        return node
+
+
+def _use_affine_range(source: str) -> str:
+    """Replace ``range`` with ``nl.affine_range`` in for-loop iterators.
+
+    Args:
+        source: NKI kernel source code string.
+
+    Returns:
+        Source with for-loop ranges replaced by nl.affine_range.
+    """
+    tree = ast.parse(source)
+    tree = _RangeToAffine().visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
 
 
 def _collect_opportunities_ir(program: GymProgram, transforms: list[Transform]) -> list[tuple[Transform, Any]]:
-    """Collect all available transform opportunities for a program.
-
-    Calls ``analyze_ir()`` on each transform and flattens the results into
-    ``(transform, option)`` pairs.
-
-    Args:
-        program: GymProgram tuple to analyze.
-        transforms: List of transforms to query for opportunities.
-
-    Returns:
-        Flat list of ``(transform, option)`` pairs across all transforms.
-    """
+    """Collect all ``(transform, option)`` pairs available for a program."""
     opportunities: list[tuple[Transform, Any]] = []
     for transform in transforms:
         for option in transform.analyze_ir(program):
@@ -58,30 +89,26 @@ class _Node:
         opportunities: All ``(transform, option)`` pairs available here.
         unexplored: Indices into ``opportunities`` not yet expanded.
         depth: Depth at which this node was first discovered.
+        variant_idx: Per-depth variant counter, assigned when qualifying.
     """
 
     program: GymProgram
     opportunities: list[tuple[Transform, Any]]
     unexplored: list[int]
     depth: int
+    variant_idx: int
 
 
 @dataclass
 class _TransformGraph:
     """Lazily-expanded transform state graph.
 
-    Nodes are deduplicated by program tuple (hashable, no source rendering
-    needed).  The ``frontier`` tracks nodes with unexplored opportunity
-    indices.  Every node (not just terminal leaves) is a valid kernel
-    candidate.
-
     Attributes:
         nodes: Map from program tuple to ``_Node``.
         edges: Map from ``(parent_program, opp_idx)`` to child program.
         frontier: GymProgram tuples with unexplored opportunities.
-        _frontier_index: Frontier program to index for O(1) removal.
         transforms: Transforms defining the search space.
-        total_expansions: Count of ``expand_one`` calls.
+        total_programs_visited: Total programs visited (root + expansions).
     """
 
     nodes: dict[GymProgram, _Node] = field(default_factory=dict)
@@ -89,39 +116,25 @@ class _TransformGraph:
     frontier: list[GymProgram] = field(default_factory=list)
     _frontier_index: dict[GymProgram, int] = field(default_factory=dict)
     transforms: list[Transform] = field(default_factory=list)
-    total_expansions: int = 0
+    total_programs_visited: int = 0
 
     def __init__(self, program: GymProgram, transforms: list[Transform]) -> None:
-        """Initialize the graph with a root node.
-
-        Args:
-            program: Root program tuple.
-            transforms: Transforms whose opportunities define the graph.
-        """
+        """Initialize the graph with a root node."""
         self.nodes = {}
         self.edges = {}
         self.frontier = []
         self._frontier_index = {}
         self.transforms = transforms
-        self.total_expansions = 0
-
+        self.total_programs_visited = 1
         self._add_node(program, depth=0)
 
     def _frontier_add(self, program: GymProgram) -> None:
-        """Add a program to the frontier in O(1).
-
-        Args:
-            program: GymProgram tuple to add.
-        """
+        """Add a program to the frontier in O(1)."""
         self._frontier_index[program] = len(self.frontier)
         self.frontier.append(program)
 
     def _frontier_remove(self, program: GymProgram) -> None:
-        """Remove a program from the frontier in O(1) via swap-and-pop.
-
-        Args:
-            program: GymProgram tuple to remove.
-        """
+        """Remove a program from the frontier in O(1) via swap-and-pop."""
         idx = self._frontier_index.pop(program)
         last = self.frontier[-1]
         if idx < len(self.frontier) - 1:
@@ -132,10 +145,6 @@ class _TransformGraph:
     def _add_node(self, program: GymProgram, depth: int) -> bool:
         """Register a new node in the graph.
 
-        Args:
-            program: GymProgram tuple for this state.
-            depth: Discovery depth.
-
         Returns:
             True if a new node was created, False if already present.
         """
@@ -144,7 +153,7 @@ class _TransformGraph:
             opportunities = _collect_opportunities_ir(program, self.transforms)
             unexplored = list(range(len(opportunities)))
             self.nodes[program] = _Node(
-                program=program, opportunities=opportunities, unexplored=unexplored, depth=depth
+                program=program, opportunities=opportunities, unexplored=unexplored, depth=depth, variant_idx=-1
             )
             if opportunities:
                 self._frontier_add(program)
@@ -153,133 +162,113 @@ class _TransformGraph:
     def expand_one(self, rng: random.Random) -> tuple[bool, GymProgram]:
         """Expand one unexplored opportunity from a random frontier node.
 
-        Picks a random frontier node, picks a random unexplored opportunity
-        index, applies the transform, and records the edge.
-
-        Args:
-            rng: Random number generator for selection.
-
         Returns:
-            Tuple of (is_new, child_program).  is_new is True when the
-            child was a previously unseen program.
+            Tuple of (is_new, child_program).
         """
-        self.total_expansions += 1
-
+        self.total_programs_visited += 1
         parent_program = rng.choice(self.frontier)
         node = self.nodes[parent_program]
-
         idx_pos = rng.randrange(len(node.unexplored))
         opp_idx = node.unexplored.pop(idx_pos)
-
         transform, option = node.opportunities[opp_idx]
         child_program = transform.transform_ir(node.program, option)
-
         self.edges[(parent_program, opp_idx)] = child_program
-
         if not node.unexplored:
             self._frontier_remove(parent_program)
-
         is_new = self._add_node(child_program, depth=node.depth + 1)
         return is_new, child_program
 
 
 def _verify_node(node: _Node, kernel_kwargs: dict[str, Any], expected: np.ndarray) -> None:
-    """Compile and run a node, assert numerical correctness.
-
-    Args:
-        node: Graph node to verify.
-        kernel_kwargs: Keyword arguments for the kernel call.
-        expected: Expected output array.
-
-    Raises:
-        AssertionError: If numerical verification fails.
-    """
+    """Compile and run a node, assert numerical correctness."""
     source = program_to_source(node.program)
     func = source_to_callable(source, node.program.name)
     actual = func(**kernel_kwargs)
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
 
 
-def _save_variant(node: _Node, depth_counts: dict[int, int], cache_dir: Path) -> None:
-    """Write qualifying variant source files to disk.
-
-    Saves both the nkigym IR source and the NKI-lowered kernel source.
+def _assign_variant_idx(node: _Node, depth_counts: dict[int, int]) -> None:
+    """Assign the next per-depth variant index to a qualifying node.
 
     Args:
-        node: Graph node to save.
-        depth_counts: Map from depth to variant count; updated in place.
-        cache_dir: Directory to write the source files.
+        node: The node to assign a variant index to.
+        depth_counts: Mutable counter tracking next index per depth.
     """
-    variant_idx = depth_counts.get(node.depth, 0)
-    depth_counts[node.depth] = variant_idx + 1
+    node.variant_idx = depth_counts.get(node.depth, 0)
+    depth_counts[node.depth] = node.variant_idx + 1
+
+
+def _save_variant(node: _Node, cache_dir: Path) -> tuple[str, str]:
+    """Write variant source files to disk.
+
+    Returns:
+        Tuple of (nki_path, error).
+    """
     gym_dir = cache_dir / "nkigym"
     gym_dir.mkdir(parents=True, exist_ok=True)
     source = program_to_source(node.program)
-    (gym_dir / f"nkigym_d{node.depth}_v{variant_idx}.py").write_text(source)
+    (gym_dir / f"nkigym_d{node.depth}_v{node.variant_idx}.py").write_text(source)
     nki_dir = cache_dir / "nki"
     nki_dir.mkdir(parents=True, exist_ok=True)
-    nki_source = lower_to_nki(node.program)
-    (nki_dir / f"nki_d{node.depth}_v{variant_idx}.py").write_text(nki_source)
+    nki_path = str(nki_dir / f"nki_d{node.depth}_v{node.variant_idx}.py")
+    error = ""
+    try:
+        nki_source = _use_affine_range(roll_loops(lower_to_nki(node.program)))
+        Path(nki_path).write_text(nki_source)
+    except Exception as e:
+        error = _capture_error(e)
+    return (nki_path, error)
 
 
-def _format_depth_table(depth_node_counts: dict[int, int], min_depth: int) -> str:
-    """Format depth distribution as a two-row aligned table.
+@dataclass
+class _SearchContext:
+    """Bundled parameters for the search loop."""
 
-    Uses a uniform column width (minimum 4) so columns stay stable
-    across successive progress lines.  Non-qualifying and qualifying
-    depths are separated by ``|``.
-
-    Args:
-        depth_node_counts: Map from depth to node count.
-        min_depth: Minimum depth threshold for qualifying variants.
-
-    Returns:
-        Two-line string with aligned depth and node-count rows.
-    """
-    sorted_items = sorted(depth_node_counts.items())
-    depths = [str(d) for d, _ in sorted_items]
-    counts = [str(c) for _, c in sorted_items]
-    col_w = max([4] + [len(s) for s in depths] + [len(s) for s in counts])
-
-    left_d: list[str] = []
-    left_c: list[str] = []
-    right_d: list[str] = []
-    right_c: list[str] = []
-    for i, (d, _) in enumerate(sorted_items):
-        cell_d = depths[i].rjust(col_w)
-        cell_c = counts[i].rjust(col_w)
-        if d >= min_depth:
-            right_d.append(cell_d)
-            right_c.append(cell_c)
-        else:
-            left_d.append(cell_d)
-            left_c.append(cell_c)
-
-    sep = " | " if left_d and right_d else ""
-    depth_line = " ".join(left_d) + sep + " ".join(right_d)
-    count_line = " ".join(left_c) + sep + " ".join(right_c)
-    return f"  depth  {depth_line}\n  nodes  {count_line}"
+    save_cache: Path
+    kernel_kwargs: dict[str, Any]
+    expected: np.ndarray
+    pool: CompilationPool
+    report: SearchReport
 
 
-def _log_progress(unique_count: int, qualifying_count: int, depth_node_counts: dict[int, int], min_depth: int) -> None:
-    """Log periodic search progress with depth distribution table."""
-    table = _format_depth_table(depth_node_counts, min_depth)
-    logger.info("Progress: %d unique (%d qualifying)\n%s", unique_count, qualifying_count, table)
+def _save_and_submit(node: _Node, ctx: _SearchContext, errors: list[VariantResult]) -> None:
+    """Save variant to disk and submit to compilation pool if enabled."""
+    nki_path, error = _save_variant(node, ctx.save_cache)
+    ctx.report.add_variant(nki_path, node.depth, node.variant_idx)
+    if error:
+        errors.append(
+            VariantResult(nki_path=nki_path, min_ms=0.0, mean_ms=0.0, mac_count=0, mfu=0.0, correct=False, error=error)
+        )
+        ctx.report.update_variant(nki_path, status="error", error=error)
+    if ctx.pool is not None and not error:
+        ctx.report.update_variant(nki_path, status="compiled")
+        ctx.pool.submit(nki_path)
+
+
+def _emit_progress(
+    report: SearchReport,
+    root_node: _Node,
+    graph: _TransformGraph,
+    qualifying_programs: int,
+    min_depth: int,
+    depth_dist: dict[int, int],
+) -> None:
+    """Write current search progress to the JSON report."""
+    report.update_search(
+        root_stmts=len(root_node.program.stmts),
+        root_opportunities=len(root_node.opportunities),
+        unique_programs=len(graph.nodes),
+        qualifying_programs=qualifying_programs,
+        min_depth=min_depth,
+        total_programs_visited=graph.total_programs_visited,
+        depth_distribution=depth_dist,
+    )
 
 
 def _prepare_root(func: Callable, save_cache: Path, kernel_kwargs: dict[str, Any]) -> tuple[GymProgram, np.ndarray]:
     """Tile the user function and compute expected output.
 
-    Writes ``nkigym_input.py`` and ``nkigym_root.py`` to the cache
-    directory.
-
-    Args:
-        func: Root user function.
-        save_cache: Directory for writing files.
-        kernel_kwargs: Keyword arguments for the kernel call.
-
-    Returns:
-        Tuple of (tiled GymProgram, expected output array).
+    Writes ``nkigym_input.py`` and ``nkigym_root.py`` to the cache directory.
     """
     gym_dir = save_cache / "nkigym"
     gym_dir.mkdir(parents=True, exist_ok=True)
@@ -297,28 +286,20 @@ def _prepare_root(func: Callable, save_cache: Path, kernel_kwargs: dict[str, Any
 
 
 def _run_search(
-    graph: _TransformGraph,
-    rng: random.Random,
-    min_depth: int,
-    num_targets: float,
-    save_cache: Path,
-    kernel_kwargs: dict[str, Any],
-    expected: np.ndarray,
-) -> list[GymProgram]:
-    """Execute search loop: verify every node, save qualifying ones.
-
-    Returns:
-        Qualifying GymProgram list.
-    """
+    graph: _TransformGraph, rng: random.Random, min_depth: int, num_targets: float, ctx: _SearchContext
+) -> tuple[list[GymProgram], list[VariantResult]]:
+    """Execute search loop: verify every node, save qualifying ones."""
     qualifying: list[GymProgram] = []
+    lowering_errors: list[VariantResult] = []
     depth_counts: dict[int, int] = {}
-    depth_node_counts: dict[int, int] = {0: 1}
+    depth_dist: dict[int, int] = {0: 1}
     last_progress_count = 0
 
     root_node = next(iter(graph.nodes.values()))
-    _verify_node(root_node, kernel_kwargs, expected)
+    _verify_node(root_node, ctx.kernel_kwargs, ctx.expected)
     if root_node.depth >= min_depth:
-        _save_variant(root_node, depth_counts, save_cache)
+        _assign_variant_idx(root_node, depth_counts)
+        _save_and_submit(root_node, ctx, lowering_errors)
         qualifying.append(root_node.program)
 
     while len(qualifying) < num_targets and graph.frontier:
@@ -326,32 +307,84 @@ def _run_search(
         if not is_new:
             continue
         child_node = graph.nodes[child_program]
-        child_depth = child_node.depth
-        depth_node_counts[child_depth] = depth_node_counts.get(child_depth, 0) + 1
-        _verify_node(child_node, kernel_kwargs, expected)
-        if child_depth >= min_depth:
-            _save_variant(child_node, depth_counts, save_cache)
+        depth_dist[child_node.depth] = depth_dist.get(child_node.depth, 0) + 1
+        _verify_node(child_node, ctx.kernel_kwargs, ctx.expected)
+        if child_node.depth >= min_depth:
+            _assign_variant_idx(child_node, depth_counts)
+            _save_and_submit(child_node, ctx, lowering_errors)
             qualifying.append(child_node.program)
         unique_count = len(graph.nodes)
         if unique_count - last_progress_count >= PROGRESS_INTERVAL:
-            _log_progress(unique_count, len(qualifying), depth_node_counts, min_depth)
+            _emit_progress(ctx.report, root_node, graph, len(qualifying), min_depth, depth_dist)
             last_progress_count = unique_count
 
-    _log_search_summary(graph, qualifying, min_depth)
-    return qualifying
+    _emit_progress(ctx.report, root_node, graph, len(qualifying), min_depth, depth_dist)
+    return (qualifying, lowering_errors)
 
 
-def _log_search_summary(graph: _TransformGraph, qualifying: list[GymProgram], min_depth: int) -> None:
-    """Log final search summary with deduplication statistics."""
-    unique = len(graph.nodes)
-    expansions = graph.total_expansions
-    duplicates = expansions - (unique - 1)
-    if expansions > 0:
-        dedup_pct = duplicates / expansions * 100
-    else:
-        dedup_pct = 0.0
-    logger.info("Search complete: %d unique programs, %d qualifying (depth >= %d)", unique, len(qualifying), min_depth)
-    logger.info("Deduplication: %d expansions, %d duplicates (%.1f%%)", expansions, duplicates, dedup_pct)
+def _make_pool(
+    program: GymProgram, kernel_kwargs: dict[str, Any], expected: np.ndarray, save_cache: Path
+) -> CompilationPool:
+    """Create a CompilationPool for parallel NKI compilation."""
+    first_val = next(iter(kernel_kwargs.values()))
+    return CompilationPool(
+        func_name=program.name,
+        input_shapes={k: v.shape for k, v in kernel_kwargs.items()},
+        input_dtype_name=first_val.dtype.name,
+        output_name="output",
+        output_shape=expected.shape,
+        output_dtype_name=expected.dtype.name,
+        cache_dir=save_cache,
+    )
+
+
+def _finalize_benchmark(
+    pool: CompilationPool,
+    func_name: str,
+    kernel_kwargs: dict[str, np.ndarray],
+    expected: np.ndarray,
+    report: SearchReport,
+    mac_count: int,
+) -> list[VariantResult]:
+    """Wait for compilation and run hardware benchmarks."""
+    compile_results = pool.wait_all()
+    pool.shutdown()
+    succeeded = sum(1 for cr in compile_results if not cr.error)
+    report.set_compilation(succeeded=succeeded, failed=len(compile_results) - succeeded)
+    variant_results = run_on_hardware(compile_results, func_name, kernel_kwargs, expected, _WARMUP, _ITERS, mac_count)
+    _update_report_variants(report, variant_results)
+    report.sort_variants()
+    return variant_results
+
+
+def _update_report_variants(report: SearchReport, results: list[VariantResult]) -> None:
+    """Update variant entries in the report from benchmark results."""
+    for r in results:
+        status = "benchmarked" if not r.error else "error"
+        report.update_variant(
+            r.nki_path,
+            status=status,
+            min_ms=r.min_ms,
+            mean_ms=r.mean_ms,
+            mac_count=r.mac_count,
+            mfu=r.mfu,
+            correct=r.correct,
+            error=r.error if r.error else None,
+        )
+
+
+def _log_search_summary(report: SearchReport, qualifying: int, results: list[VariantResult]) -> None:
+    """Log final search summary and report path.
+
+    Args:
+        report: The search report that was written to disk.
+        qualifying: Number of qualifying variants found.
+        results: All variant results including errors.
+    """
+    succeeded = sum(1 for r in results if not r.error)
+    failed = len(results) - succeeded
+    logger.info("Search complete: %d qualifying, %d succeeded, %d failed", qualifying, succeeded, failed)
+    logger.info("Results: %s", report.path)
 
 
 def search(
@@ -362,12 +395,8 @@ def search(
     min_depth: int,
     save_cache: Path,
     kernel_kwargs: dict[str, Any],
-) -> list[GymProgram]:
+) -> SearchResults:
     """Search the transform state graph for unique kernel variants.
-
-    Expands random frontier nodes until ``num_targets`` unique nodes at or
-    beyond ``min_depth`` are discovered, or the frontier is exhausted.
-    Every node is verified for numerical correctness.
 
     Args:
         func: Root tiled function.
@@ -379,13 +408,24 @@ def search(
         kernel_kwargs: Keyword arguments for the kernel call.
 
     Returns:
-        List of qualifying GymProgram tuples.
+        SearchResults with qualifying variants and benchmark data.
     """
     save_cache.mkdir(parents=True, exist_ok=True)
+    report = SearchReport(save_cache / "results.json")
     program, expected = _prepare_root(func, save_cache, kernel_kwargs)
+    mac_count = compute_mac_count(program)
 
     graph = _TransformGraph(program, transforms)
     rng = random.Random(seed)
     logger.info("Search root: %d stmts, %d opportunities", len(program.stmts), len(graph.nodes[program].opportunities))
 
-    return _run_search(graph, rng, min_depth, num_targets, save_cache, kernel_kwargs, expected)
+    pool = _make_pool(program, kernel_kwargs, expected, save_cache)
+    ctx = _SearchContext(
+        save_cache=save_cache, kernel_kwargs=kernel_kwargs, expected=expected, pool=pool, report=report
+    )
+    qualifying, lowering_errors = _run_search(graph, rng, min_depth, num_targets, ctx)
+    variant_results = _finalize_benchmark(pool, program.name, kernel_kwargs, expected, report, mac_count)
+
+    all_results = lowering_errors + variant_results
+    _log_search_summary(report, len(qualifying), all_results)
+    return SearchResults(variants=qualifying, variant_results=all_results)

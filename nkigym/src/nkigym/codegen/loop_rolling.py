@@ -228,6 +228,41 @@ def _extract_varying(
     return (valid, varying)
 
 
+def _collect_assigned_names(stmts: list[ast.stmt]) -> set[str]:
+    """Collect all assignment target names from a list of statements."""
+    names: set[str] = set()
+    for stmt in stmts:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+    return names
+
+
+def _collect_referenced_names(stmts: list[ast.stmt]) -> set[str]:
+    """Collect all Name references (loads) from a list of statements."""
+    names: set[str] = set()
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                names.add(node.id)
+    return names
+
+
+def _check_scope_safe(working_stmts: list[ast.stmt], start_idx: int, block_size: int, trip_count: int) -> bool:
+    """Check that rolling a run won't hide definitions used after the loop.
+
+    Returns False if any variable defined inside the rolled region is
+    referenced by statements after the rolled region.
+    """
+    end_idx = start_idx + trip_count * block_size
+    rolled_region = working_stmts[start_idx:end_idx]
+    after_region = working_stmts[end_idx:]
+    defined = _collect_assigned_names(rolled_region)
+    used_after = _collect_referenced_names(after_region)
+    return not (defined & used_after)
+
+
 def _count_matching_blocks(
     working_stmts: list[ast.stmt], start: int, block_size: int, n: int, cache: dict[int, str]
 ) -> int:
@@ -271,7 +306,7 @@ def _find_best_run(working_stmts: list[ast.stmt]) -> _LoopRun:
             count = _count_matching_blocks(working_stmts, p, k, n, cache)
             if count >= 2 and count * k > best_coverage:
                 valid, varying = _extract_varying(working_stmts, k, count, p)
-                if valid:
+                if valid and _check_scope_safe(working_stmts, p, k, count):
                     best = _LoopRun(p, k, count, varying)
                     best_coverage = count * k
             p += 1

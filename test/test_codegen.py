@@ -14,7 +14,7 @@ import nkigym
 from autotune.compiler.compile import TensorStub, compile_kernel, create_spike_kernel, run_spike_kernel
 from nkigym.codegen import lower_to_nki
 from nkigym.ir import GymProgram, GymStatement, TensorRef, source_to_program
-from nkigym.search.benchmark import benchmark_variants
+from nkigym.search.compile import CompilationPool, run_on_hardware
 from nkigym.tiling import tile_program
 from nkigym.utils import callable_to_source
 
@@ -25,7 +25,7 @@ def _has_line(code: str, pattern: str) -> bool:
 
 
 def _count_occurrences(code: str, pattern: str) -> int:
-    """Count how many lines match a regex pattern."""
+    """Count lines matching a regex pattern."""
     return sum(1 for line in code.splitlines() if re.search(pattern, line))
 
 
@@ -297,7 +297,7 @@ def test_np_slice_lowering() -> None:
     code = lower_to_nki(SINGLE_TILE_MATMUL)
 
     assert _has_line(code, r"_t0 = nl\.ndarray\(.*, buffer=nl\.sbuf\)")
-    assert _has_line(code, r"nisa\.dma_copy\(dst=_t0, src=a")
+    assert _has_line(code, r"nisa\.dma_copy\(dst=_t0\[0:128, 0:128\], src=a")
 
 
 def test_psum_staging() -> None:
@@ -305,8 +305,8 @@ def test_psum_staging() -> None:
     code = lower_to_nki(SINGLE_TILE_MATMUL)
 
     assert _has_line(code, r"_staging_0 = nl\.ndarray\(.*, buffer=nl\.sbuf\)")
-    assert _has_line(code, r"nisa\.tensor_copy\(dst=_staging_0, src=_t2\[0:128, 0:128\]\)")
-    assert _has_line(code, r"nisa\.dma_copy\(dst=output\[0:128, 0:128\], src=_staging_0\)")
+    assert _has_line(code, r"nisa\.tensor_copy\(dst=_staging_0\[0:128, 0:128\], src=_t2\[0:128, 0:128\]\)")
+    assert _has_line(code, r"nisa\.dma_copy\(dst=output\[0:128, 0:128\], src=_staging_0\[0:128, 0:128\]\)")
 
 
 def test_sbuf_direct_store() -> None:
@@ -322,7 +322,8 @@ def test_tensor_tensor_op() -> None:
     code = lower_to_nki(ELEMENTWISE_PROGRAM)
 
     assert _has_line(
-        code, r"nisa\.tensor_tensor\(dst=_t2, data1=_t0\[0:128, 0:128\], data2=_t1\[0:128, 0:128\], op=nl\.multiply\)"
+        code,
+        r"nisa\.tensor_tensor\(dst=_t2\[0:128, 0:128\], data1=_t0\[0:128, 0:128\], data2=_t1\[0:128, 0:128\], op=nl\.multiply\)",
     )
 
 
@@ -331,22 +332,21 @@ def test_tensor_scalar_op() -> None:
     code = lower_to_nki(TENSOR_SCALAR_PROGRAM)
 
     assert _has_line(
-        code, r"nisa\.tensor_scalar\(dst=_t2, data=_t0\[0:128, 0:128\], op0=nl\.add, operand0=_t1\[0:128, 0:1\]\)"
+        code,
+        r"nisa\.tensor_scalar\(dst=_t2\[0:128, 0:128\], data=_t0\[0:128, 0:128\], op0=nl\.add, operand0=_t1\[0:128, 0:1\]\)",
     )
 
 
 def test_activation_op() -> None:
     """activation produces nisa.activation with mapped function."""
     code = lower_to_nki(ACTIVATION_PROGRAM)
-
-    assert _has_line(code, r"nisa\.activation\(dst=_t1, op=nl\.tanh, data=_t0\[0:128, 0:128\]\)")
+    assert _has_line(code, r"nisa\.activation\(dst=_t1\[0:128, 0:128\], op=nl\.tanh, data=_t0\[0:128, 0:128\]\)")
 
 
 def test_nc_transpose_op() -> None:
     """nc_transpose produces nisa.nc_transpose."""
     code = lower_to_nki(TRANSPOSE_PROGRAM)
-
-    assert _has_line(code, r"nisa\.nc_transpose\(dst=_t1, data=_t0\[0:128, 0:64\]\)")
+    assert _has_line(code, r"nisa\.nc_transpose\(dst=_t1\[0:64, 0:128\], data=_t0\[0:128, 0:64\]\)")
 
 
 def test_pipeline_integration() -> None:
@@ -423,7 +423,6 @@ def test_nki_matmul_hardware(tmp_path: Path) -> None:
     b = rng.standard_normal((128, 128)).astype(np.float32)
     input_tensors = {"a": a, "b": b}
     kernel_name = (str(kernel_path), "single_matmul")
-
     neff_path = compile_kernel(
         kernel_name=kernel_name,
         input_tensors=input_tensors,
@@ -432,10 +431,8 @@ def test_nki_matmul_hardware(tmp_path: Path) -> None:
         compiler_flags="",
         output_dir=str(tmp_path),
     )
-
     output_stubs = [TensorStub(shape=(128, 128), dtype=np.float32, name="output")]
     spike_kernel = create_spike_kernel(neff_path, kernel_name, input_tensors, output_stubs, {})
-
     os.environ["NEURON_RT_VISIBLE_CORES"] = "0"
     with BaremetalExecutor(verbose=0) as spike:
         _, outputs = run_spike_kernel(spike, spike_kernel, input_tensors, neff_path, {})
@@ -479,22 +476,25 @@ def test_nki_elementwise_hardware(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices")
 def test_benchmark_variants_pipeline(tmp_path: Path) -> None:
-    """Lower matmul variant, benchmark via autotune backend, verify results."""
-    code = lower_to_nki(SINGLE_TILE_MATMUL)
+    """Lower matmul variant, compile and benchmark via integrated pipeline."""
     (tmp_path / "nki").mkdir()
-    (tmp_path / "nki" / "nki_d0_v0.py").write_text(code)
-
+    nki_path = tmp_path / "nki" / "nki_d0_v0.py"
+    nki_path.write_text(lower_to_nki(SINGLE_TILE_MATMUL))
     rng = np.random.default_rng(42)
     a, b = rng.standard_normal((128, 128)).astype(np.float32), rng.standard_normal((128, 128)).astype(np.float32)
-
-    results = benchmark_variants(
-        cache_dir=tmp_path,
+    sh = (128, 128)
+    pool = CompilationPool(
         func_name="single_matmul",
-        kernel_kwargs={"a": a, "b": b},
+        input_shapes={"a": sh, "b": sh},
+        input_dtype_name="float32",
         output_name="output",
-        output_shape=(128, 128),
-        warmup=2,
-        iters=3,
+        output_shape=sh,
+        output_dtype_name="float32",
+        cache_dir=tmp_path,
     )
-
-    assert len(results.workloads) > 0
+    pool.submit(str(nki_path))
+    compile_results = pool.wait_all()
+    pool.shutdown()
+    expected = nkigym.nc_matmul(a, b)
+    results = run_on_hardware(compile_results, "single_matmul", {"a": a, "b": b}, expected, 2, 3, 128**3)
+    assert len(results) > 0

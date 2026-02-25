@@ -65,6 +65,7 @@ class TensorTensorOp(GymOp):
         d1 = ctx.subscript(d1_ref)
         d2 = ctx.subscript(d2_ref)
         out_name = stmt.output.name
+        out_sub = ctx.subscript(stmt.output)
         ctx.buffers[out_name] = "SBUF"
 
         op_part = ""
@@ -75,5 +76,5 @@ class TensorTensorOp(GymOp):
         shape_str = repr(stmt.output.shape)
         return [
             f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
-            f"nisa.tensor_tensor(dst={out_name}, data1={d1}, data2={d2}{op_part})",
+            f"nisa.tensor_tensor(dst={out_sub}, data1={d1}, data2={d2}{op_part})",
         ]

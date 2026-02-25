@@ -7,7 +7,7 @@ of independent transforms can converge to the same state.  This module
 provides systematic exploration and sampling of that search space.
 """
 
-from nkigym.search.benchmark import benchmark_variants
+from nkigym.search.compile import SearchResults
 from nkigym.search.search import search
 
-__all__ = ["benchmark_variants", "search"]
+__all__ = ["SearchResults", "search"]

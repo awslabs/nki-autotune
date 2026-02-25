@@ -69,17 +69,20 @@ class MatmulOp(GymOp):
         stat_name = ctx.subscript(stat_ref)
         mov_name = ctx.subscript(mov_ref)
         out_name = stmt.output.name
+        out_sub = ctx.subscript(stmt.output)
         ctx.buffers[out_name] = "PSUM"
 
         lines: list[str] = []
         if isinstance(acc_ref, TensorRef):
             canonical = ctx.resolve(acc_ref.name)
+            acc_sub = ctx.subscript(acc_ref)
             ctx.aliases[out_name] = canonical
-            lines = [f"nisa.nc_matmul(dst={canonical}, stationary={stat_name}, moving={mov_name})"]
+            ctx.alias_offsets[out_name] = tuple(s for s, _ in acc_ref.slices)
+            lines = [f"nisa.nc_matmul(dst={acc_sub}, stationary={stat_name}, moving={mov_name})"]
         else:
             shape_str = repr(stmt.output.shape)
             lines = [
                 f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.psum)",
-                f"nisa.nc_matmul(dst={out_name}, stationary={stat_name}, moving={mov_name})",
+                f"nisa.nc_matmul(dst={out_sub}, stationary={stat_name}, moving={mov_name})",
             ]
         return lines

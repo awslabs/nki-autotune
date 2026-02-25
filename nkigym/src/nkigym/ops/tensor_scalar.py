@@ -64,6 +64,7 @@ class TensorScalarOp(GymOp):
 
         data = ctx.subscript(data_ref)
         out_name = stmt.output.name
+        out_sub = ctx.subscript(stmt.output)
         ctx.buffers[out_name] = "SBUF"
 
         operand = str(operand_ref)
@@ -78,5 +79,5 @@ class TensorScalarOp(GymOp):
         shape_str = repr(stmt.output.shape)
         return [
             f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
-            f"nisa.tensor_scalar(dst={out_name}, data={data}{op_kwarg}, operand0={operand})",
+            f"nisa.tensor_scalar(dst={out_sub}, data={data}{op_kwarg}, operand0={operand})",
         ]

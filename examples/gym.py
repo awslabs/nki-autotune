@@ -7,17 +7,13 @@ is written to the cache directory and verified for numerical correctness.
 
 import argparse
 import logging
-import math
 from pathlib import Path
 
 import numpy as np
 
 import nkigym
-from nkigym.search import benchmark_variants, search
+from nkigym.search import search
 from nkigym.transforms import DataReuseTransform, OperandMergeTransform
-from nkigym.utils import setup_logging
-
-logger = logging.getLogger(__name__)
 
 
 def nkigym_matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -37,45 +33,32 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="NKI Gym search example")
     parser.add_argument(
-        "--cache-dir", type=Path, default=Path("cache"), help="Directory for storing output logs (default: cache)"
+        "--cache-dir", type=Path, default=Path("cache"), help="Directory for storing output (default: cache)"
     )
     return parser.parse_args()
 
 
 def main() -> None:
     """Run transform search on a tiled matmul workload."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     args = parse_args()
     cache_dir = args.cache_dir
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    log_path = cache_dir / "gym.log"
-    setup_logging(str(log_path))
 
     k, m, n = 256, 256, 256
     rng = np.random.default_rng(42)
     lhs = rng.standard_normal((k, m)).astype(np.float32)
     rhs = rng.standard_normal((k, n)).astype(np.float32)
 
-    variants = search(
+    search(
         func=nkigym_matmul,
         transforms=[DataReuseTransform(), OperandMergeTransform()],
-        num_targets=math.inf,
+        num_targets=1000,
         seed=42,
         min_depth=10,
         save_cache=cache_dir,
         kernel_kwargs={"lhs": lhs, "rhs": rhs},
     )
-    logger.info("Search produced %d unique variants", len(variants))
-
-    results = benchmark_variants(
-        cache_dir=cache_dir,
-        func_name="nkigym_matmul",
-        kernel_kwargs={"lhs": lhs, "rhs": rhs},
-        output_name="output",
-        output_shape=(m, n),
-        warmup=2,
-        iters=5,
-    )
-    results.summary(top_k=5)
 
 
 if __name__ == "__main__":
