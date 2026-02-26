@@ -78,6 +78,6 @@ class TensorScalarOp(GymOp):
 
         shape_str = repr(stmt.output.shape)
         return [
-            f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
+            f"{out_name} = nl.ndarray({shape_str}, dtype={ctx.dtype}, buffer=nl.sbuf)",
             f"nisa.tensor_scalar(dst={out_sub}, data={data}{op_kwarg}, operand0={operand})",
         ]

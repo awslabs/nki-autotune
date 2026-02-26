@@ -82,6 +82,6 @@ class ActivationOp(GymOp):
 
         shape_str = repr(stmt.output.shape)
         return [
-            f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
+            f"{out_name} = nl.ndarray({shape_str}, dtype={ctx.dtype}, buffer=nl.sbuf)",
             f"nisa.activation(dst={out_sub}, op={func_str}, data={data})",
         ]

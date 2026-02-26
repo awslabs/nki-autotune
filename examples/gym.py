@@ -45,16 +45,16 @@ def main() -> None:
     args = parse_args()
     cache_dir = args.cache_dir
 
-    k, m, n = 256, 256, 256
-    rng = np.random.default_rng(42)
-    lhs = rng.standard_normal((k, m)).astype(np.float32)
-    rhs = rng.standard_normal((k, n)).astype(np.float32)
+    k, m, n = 2048, 2048, 2048
+    rng = np.random.default_rng()
+    lhs = rng.standard_normal((k, m)).astype(np.float16)
+    rhs = rng.standard_normal((k, n)).astype(np.float16)
 
     search(
         func=nkigym_matmul,
         transforms=[DataReuseTransform(), OperandMergeTransform()],
-        num_targets=100,
-        seed=42,
+        num_targets=1000,
+        seed=-1,
         min_depth=10,
         save_cache=cache_dir,
         kernel_kwargs={"lhs": lhs, "rhs": rhs},

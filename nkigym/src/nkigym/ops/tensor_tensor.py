@@ -75,6 +75,6 @@ class TensorTensorOp(GymOp):
 
         shape_str = repr(stmt.output.shape)
         return [
-            f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
+            f"{out_name} = nl.ndarray({shape_str}, dtype={ctx.dtype}, buffer=nl.sbuf)",
             f"nisa.tensor_tensor(dst={out_sub}, data1={d1}, data2={d2}{op_part})",
         ]

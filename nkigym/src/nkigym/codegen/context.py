@@ -17,6 +17,7 @@ class _LoweringContext:
 
     Attributes:
         params: Input parameter names (all live in HBM).
+        dtype: NKI dtype string for SBUF buffers (e.g., ``"nl.float16"``).
         buffers: Variable name to buffer location string.
         aliases: Maps accumulation output names to canonical PSUM variable.
         alias_offsets: Maps alias names to their start offsets per axis.
@@ -24,6 +25,7 @@ class _LoweringContext:
     """
 
     params: tuple[str, ...]
+    dtype: str = "nl.float32"
     buffers: dict[str, str] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)
     alias_offsets: dict[str, tuple[int, ...]] = field(default_factory=dict)

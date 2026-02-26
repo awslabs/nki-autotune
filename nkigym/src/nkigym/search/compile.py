@@ -341,7 +341,7 @@ def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkC
             mfu = _calculate_mfu(cfg.mac_count, min_ms)
         outputs = spike.run(compiled, *cfg.kernel_kwargs.values())
         actual = outputs if isinstance(outputs, np.ndarray) else outputs[0]
-        np.testing.assert_allclose(actual, cfg.expected, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(actual, cfg.expected, rtol=1e-3, atol=1e-3)
         correct = True
     except Exception as e:
         error = _capture_error(e)

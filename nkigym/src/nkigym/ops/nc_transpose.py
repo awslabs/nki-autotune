@@ -58,6 +58,6 @@ class NcTransposeOp(GymOp):
 
         shape_str = repr(stmt.output.shape)
         return [
-            f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
+            f"{out_name} = nl.ndarray({shape_str}, dtype={ctx.dtype}, buffer=nl.sbuf)",
             f"nisa.nc_transpose(dst={out_sub}, data={data})",
         ]

@@ -184,7 +184,7 @@ def _verify_node(node: _Node, kernel_kwargs: dict[str, Any], expected: np.ndarra
     source = program_to_source(node.program)
     func = source_to_callable(source, node.program.name)
     actual = func(**kernel_kwargs)
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
 
 
 def _assign_variant_idx(node: _Node, depth_counts: dict[int, int]) -> None:
@@ -285,9 +285,8 @@ def _prepare_root(func: Callable, save_cache: Path, kernel_kwargs: dict[str, Any
     input_path = gym_dir / "nkigym_input.py"
     input_path.write_text("import numpy as np\nimport nkigym\n" + callable_to_source(func))
     imported_func = import_func(input_path, func.__name__)
-    expected = imported_func(**kernel_kwargs)
-
     output_dtype = next(iter(kernel_kwargs.values())).dtype
+    expected = imported_func(**kernel_kwargs).astype(output_dtype)
     input_shapes = {k: v.shape for k, v in kernel_kwargs.items()}
     source = callable_to_source(func)
     program = tile_program(source_to_program(source, input_shapes, output_dtype))
@@ -428,7 +427,7 @@ def search(
     mac_count = compute_mac_count(program)
 
     graph = _TransformGraph(program, transforms)
-    rng = random.Random(seed)
+    rng = random.Random() if seed < 0 else random.Random(seed)
     logger.info("Search root: %d stmts, %d opportunities", len(program.stmts), len(graph.nodes[program].opportunities))
 
     pool = _make_pool(program, kernel_kwargs, expected, save_cache)

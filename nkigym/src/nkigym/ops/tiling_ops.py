@@ -109,7 +109,7 @@ class SliceOp(GymOp):
         lines = [f"{out_name} = {src_subscript}"]
         if src_buffer != "SBUF":
             lines = [
-                f"{out_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
+                f"{out_name} = nl.ndarray({shape_str}, dtype={ctx.dtype}, buffer=nl.sbuf)",
                 f"nisa.dma_copy(dst={out_sub}, src={src_subscript})",
             ]
         return lines
@@ -188,7 +188,7 @@ class StoreOp(GymOp):
             parts = ", ".join(f"0:{s}" for s in src_ref.shape)
             staging_sub = f"{staging_name}[{parts}]"
             lines = [
-                f"{staging_name} = nl.ndarray({shape_str}, dtype=nl.float32, buffer=nl.sbuf)",
+                f"{staging_name} = nl.ndarray({shape_str}, dtype={ctx.dtype}, buffer=nl.sbuf)",
                 f"nisa.tensor_copy(dst={staging_sub}, src={src_subscript})",
                 f"nisa.dma_copy(dst={dst_subscript}, src={staging_sub})",
             ]

@@ -4,6 +4,8 @@ Thin orchestrator that walks each GymStatement and dispatches to
 the per-op ``to_nki`` method defined on GymOp subclasses.
 """
 
+import numpy as np
+
 from nkigym.codegen.context import _LoweringContext
 from nkigym.ir.types import GymProgram
 from nkigym.ops.base import GymOp
@@ -26,7 +28,8 @@ def lower_to_nki(program: GymProgram) -> str:
     Raises:
         KeyError: If an unknown op is encountered.
     """
-    ctx = _LoweringContext(params=program.params)
+    dtype_str = f"nl.{np.dtype(program.output_dtype).name}"
+    ctx = _LoweringContext(params=program.params, dtype=dtype_str)
     for param_name in program.params:
         ctx.buffers[param_name] = "HBM"
 
