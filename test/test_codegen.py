@@ -3,20 +3,31 @@
 import ast
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
-from golden.autotune import NEURON_DEVICES_AVAILABLE
-from nkipy.runtime import BaremetalExecutor
 
 import nkigym
-from autotune.compiler.compile import TensorStub, compile_kernel, create_spike_kernel, run_spike_kernel
 from nkigym.codegen import lower_to_nki
 from nkigym.ir import GymProgram, GymStatement, TensorRef, source_to_program
 from nkigym.search.compile import CompilationPool, run_on_hardware
 from nkigym.tiling import tile_program
 from nkigym.utils import callable_to_source
+
+
+def _neuron_devices_available() -> bool:
+    """Check if Neuron devices are available by running neuron-ls."""
+    try:
+        result = subprocess.run(["neuron-ls"], capture_output=True, timeout=10)
+        available = result.returncode == 0
+    except FileNotFoundError:
+        available = False
+    return available
+
+
+NEURON_DEVICES_AVAILABLE = _neuron_devices_available()
 
 
 def _has_line(code: str, pattern: str) -> bool:
@@ -388,90 +399,73 @@ def test_merged_load_subscript() -> None:
     assert _has_line(code, r"moving=_t1\[0:128, 128:256\]")
 
 
-@pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices")
+_SH_128 = (128, 128)
+_NEURON_SKIP = pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices")
+
+
+def _make_pool(func_name: str, shapes: dict[str, tuple[int, ...]], cache_dir: Path) -> CompilationPool:
+    """Create a CompilationPool with standard float32 config."""
+    return CompilationPool(
+        func_name=func_name,
+        input_shapes=shapes,
+        input_dtype_name="float32",
+        output_name="output",
+        output_shape=_SH_128,
+        output_dtype_name="float32",
+        cache_dir=cache_dir,
+    )
+
+
+@_NEURON_SKIP
 def test_nki_matmul_compiles(tmp_path: Path) -> None:
     """Lowered NKI matmul kernel compiles to NEFF successfully."""
-    code = lower_to_nki(SINGLE_TILE_MATMUL)
-    kernel_path = tmp_path / "nki_matmul.py"
-    kernel_path.write_text(code)
-
-    a = np.zeros((128, 128), dtype=np.float32)
-    b = np.zeros((128, 128), dtype=np.float32)
-
-    neff_path = compile_kernel(
-        kernel_name=(str(kernel_path), "single_matmul"),
-        input_tensors={"a": a, "b": b},
-        output_tensors=[("output", (128, 128), np.float32)],
-        kernel_kwargs={},
-        compiler_flags="",
-        output_dir=str(tmp_path),
-    )
-
-    assert os.path.exists(neff_path)
-    assert neff_path.endswith(".neff")
+    (tmp_path / "nki").mkdir()
+    nki_path = tmp_path / "nki" / "nki_matmul.py"
+    nki_path.write_text(lower_to_nki(SINGLE_TILE_MATMUL))
+    pool = _make_pool("single_matmul", {"a": _SH_128, "b": _SH_128}, tmp_path)
+    pool.submit(str(nki_path))
+    results = pool.wait_all()
+    pool.shutdown()
+    assert len(results) == 1
+    assert results[0].neff_path
+    assert os.path.exists(results[0].neff_path)
 
 
-@pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices")
+@_NEURON_SKIP
 def test_nki_matmul_hardware(tmp_path: Path) -> None:
     """Compile lowered NKI matmul, run on Neuron, verify numerical output."""
-    code = lower_to_nki(SINGLE_TILE_MATMUL)
-    kernel_path = tmp_path / "nki_matmul.py"
-    kernel_path.write_text(code)
-
+    (tmp_path / "nki").mkdir()
+    nki_path = tmp_path / "nki" / "nki_matmul.py"
+    nki_path.write_text(lower_to_nki(SINGLE_TILE_MATMUL))
     rng = np.random.default_rng(42)
-    a = rng.standard_normal((128, 128)).astype(np.float32)
-    b = rng.standard_normal((128, 128)).astype(np.float32)
-    input_tensors = {"a": a, "b": b}
-    kernel_name = (str(kernel_path), "single_matmul")
-    neff_path = compile_kernel(
-        kernel_name=kernel_name,
-        input_tensors=input_tensors,
-        output_tensors=[("output", (128, 128), np.float32)],
-        kernel_kwargs={},
-        compiler_flags="",
-        output_dir=str(tmp_path),
-    )
-    output_stubs = [TensorStub(shape=(128, 128), dtype=np.float32, name="output")]
-    spike_kernel = create_spike_kernel(neff_path, kernel_name, input_tensors, output_stubs, {})
-    os.environ["NEURON_RT_VISIBLE_CORES"] = "0"
-    with BaremetalExecutor(verbose=0) as spike:
-        _, outputs = run_spike_kernel(spike, spike_kernel, input_tensors, neff_path, {})
-
-    expected = a.T @ b
-    np.testing.assert_allclose(outputs[0], expected, rtol=1e-2, atol=1e-2)
+    a, b = rng.standard_normal(_SH_128).astype(np.float32), rng.standard_normal(_SH_128).astype(np.float32)
+    pool = _make_pool("single_matmul", {"a": _SH_128, "b": _SH_128}, tmp_path)
+    pool.submit(str(nki_path))
+    compile_results = pool.wait_all()
+    pool.shutdown()
+    expected = nkigym.nc_matmul(a, b)
+    results = run_on_hardware(compile_results, "single_matmul", {"a": a, "b": b}, expected, 2, 3, 128**3)
+    assert len(results) == 1
+    assert results[0].correct
+    assert results[0].min_ms > 0
 
 
-@pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices")
+@_NEURON_SKIP
 def test_nki_elementwise_hardware(tmp_path: Path) -> None:
     """Compile lowered NKI elementwise kernel, run on Neuron, verify output."""
-    code = lower_to_nki(ELEMENTWISE_PROGRAM)
-    kernel_path = tmp_path / "nki_ewise.py"
-    kernel_path.write_text(code)
-
+    (tmp_path / "nki").mkdir()
+    nki_path = tmp_path / "nki" / "nki_ewise.py"
+    nki_path.write_text(lower_to_nki(ELEMENTWISE_PROGRAM))
     rng = np.random.default_rng(42)
-    a = rng.standard_normal((128, 128)).astype(np.float32)
-    b = rng.standard_normal((128, 128)).astype(np.float32)
-    input_tensors = {"a": a, "b": b}
-    kernel_name = (str(kernel_path), "ewise_fn")
-
-    neff_path = compile_kernel(
-        kernel_name=kernel_name,
-        input_tensors=input_tensors,
-        output_tensors=[("output", (128, 128), np.float32)],
-        kernel_kwargs={},
-        compiler_flags="",
-        output_dir=str(tmp_path),
-    )
-
-    output_stubs = [TensorStub(shape=(128, 128), dtype=np.float32, name="output")]
-    spike_kernel = create_spike_kernel(neff_path, kernel_name, input_tensors, output_stubs, {})
-
-    os.environ["NEURON_RT_VISIBLE_CORES"] = "0"
-    with BaremetalExecutor(verbose=0) as spike:
-        _, outputs = run_spike_kernel(spike, spike_kernel, input_tensors, neff_path, {})
-
+    a, b = rng.standard_normal(_SH_128).astype(np.float32), rng.standard_normal(_SH_128).astype(np.float32)
+    pool = _make_pool("ewise_fn", {"a": _SH_128, "b": _SH_128}, tmp_path)
+    pool.submit(str(nki_path))
+    compile_results = pool.wait_all()
+    pool.shutdown()
     expected = a * b
-    np.testing.assert_allclose(outputs[0], expected, rtol=1e-5, atol=1e-5)
+    results = run_on_hardware(compile_results, "ewise_fn", {"a": a, "b": b}, expected, 2, 3, 0)
+    assert len(results) == 1
+    assert results[0].correct
 
 
 @pytest.mark.skipif(not NEURON_DEVICES_AVAILABLE, reason="Requires Neuron devices")

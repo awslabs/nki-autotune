@@ -2,10 +2,9 @@
 
 import numpy as np
 
-from autotune.analysis.metrics import check_correctness
-from fusion.fusion_chain import FusionChain
-from fusion.operators import Operator
-from fusion.tensors import Tensor
+from .fusion_chain import FusionChain
+from .operators import Operator
+from .tensors import Tensor
 
 
 class Rowmax(Operator):
@@ -328,10 +327,10 @@ def test_flash_attention_fusion() -> None:
     )
 
     result_standard = fusion.execute(fusion_axis="fusion", fusion_step_size=seq_len, input_tensors=input_tensors)
-    check_correctness(golden, result_standard.data, atol, rtol, verbose=True)
+    np.testing.assert_allclose(result_standard.data, golden, atol=atol, rtol=rtol)
 
     result_fused = fusion.execute(fusion_axis="fusion", fusion_step_size=32, input_tensors=input_tensors, verbose=True)
-    check_correctness(golden, result_fused.data, atol, rtol, verbose=True)
+    np.testing.assert_allclose(result_fused.data, golden, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
