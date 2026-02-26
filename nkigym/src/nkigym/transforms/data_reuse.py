@@ -29,8 +29,9 @@ def _rename_ref(ref: TensorRef, rename_map: dict[str, str]) -> TensorRef:
     Returns:
         New TensorRef with renamed variable, or original if not in map.
     """
-    new_name = rename_map.get(ref.name, ref.name)
-    return TensorRef(new_name, ref.shape, ref.slices)
+    new_name = rename_map.get(ref.name)
+    result = TensorRef(new_name, ref.shape, ref.slices) if new_name is not None else ref
+    return result
 
 
 def _rename_kwargs(
@@ -46,11 +47,39 @@ def _rename_kwargs(
         New kwargs tuple with renamed TensorRef values.
     """
     new_kwargs: list[tuple[str, object]] = []
+    changed = False
     for key, value in kwargs:
-        if isinstance(value, TensorRef):
-            value = _rename_ref(value, rename_map)
+        if isinstance(value, TensorRef) and value.name in rename_map:
+            value = TensorRef(rename_map[value.name], value.shape, value.slices)
+            changed = True
         new_kwargs.append((key, value))
-    return tuple(new_kwargs)
+    return tuple(new_kwargs) if changed else kwargs
+
+
+def _validate_merge_pair(program: GymProgram, keep: str, drop: str) -> None:
+    """Validate that two tensor names can be merged.
+
+    Checks both names exist as np_slice outputs and share identical
+    source slices.
+
+    Args:
+        program: The GymProgram containing the statements.
+        keep: Variable name to keep.
+        drop: Variable name to drop.
+
+    Raises:
+        ValueError: If names are missing or slices don't match.
+    """
+    load_sources: dict[str, tuple[str, tuple[tuple[int, int], ...]]] = {}
+    for stmt in program.stmts:
+        if stmt.op == "np_slice":
+            src_ref = stmt.kwargs[0][1]
+            load_sources[stmt.output.name] = (src_ref.name, src_ref.slices)
+    for tensor_name in (keep, drop):
+        if tensor_name not in load_sources:
+            raise ValueError(f"Tensor '{tensor_name}' not found in program loads")
+    if load_sources[keep] != load_sources[drop]:
+        raise ValueError(f"Tensors '{keep}' and '{drop}' do not share identical slices")
 
 
 class DataReuseTransform(Transform):
@@ -127,25 +156,7 @@ class DataReuseTransform(Transform):
         keep, drop = pair
         if keep == drop:
             raise ValueError(f"Cannot merge {keep} with itself")
-
-        load_sources: dict[str, tuple[str, tuple[tuple[int, int], ...]]] = {}
-        for stmt in program.stmts:
-            if stmt.op == "np_slice":
-                dst_name = stmt.output.name
-                src_ref = None
-                for key, value in stmt.kwargs:
-                    if key == "src":
-                        src_ref = value
-                if src_ref is None:
-                    raise ValueError("np_slice statement missing 'src' kwarg")
-                load_sources[dst_name] = (src_ref.name, src_ref.slices)
-
-        for tensor_name in (keep, drop):
-            if tensor_name not in load_sources:
-                raise ValueError(f"Tensor '{tensor_name}' not found in program loads")
-
-        if load_sources[keep] != load_sources[drop]:
-            raise ValueError(f"Tensors '{keep}' and '{drop}' do not share identical slices")
+        _validate_merge_pair(program, keep, drop)
 
         rename_map = {drop: keep}
         new_stmts: list[GymStatement] = []

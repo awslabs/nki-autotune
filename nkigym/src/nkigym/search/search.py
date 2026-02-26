@@ -28,12 +28,12 @@ from nkigym.search.compile import (  # noqa: F401
     _capture_error,
     run_on_hardware,
 )
+from nkigym.search.interpret import interpret_program
 from nkigym.search.mac_count import compute_mac_count
 from nkigym.search.report import SearchReport
 from nkigym.tiling import tile_program
 from nkigym.transforms.base import Transform
 from nkigym.utils import callable_to_source, import_func
-from nkigym.utils.source import source_to_callable
 
 logger = logging.getLogger(__name__)
 
@@ -179,12 +179,11 @@ class _TransformGraph:
         return is_new, child_program
 
 
-def _verify_node(node: _Node, kernel_kwargs: dict[str, Any], expected: np.ndarray) -> None:
-    """Compile and run a node, assert numerical correctness."""
-    source = program_to_source(node.program)
-    func = source_to_callable(source, node.program.name)
-    actual = func(**kernel_kwargs)
-    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
+def _verify_node(node: _Node, kernel_kwargs: dict[str, Any], expected: np.ndarray, tol: float) -> None:
+    """Interpret a node's program directly and check numerical correctness."""
+    actual = interpret_program(node.program, kernel_kwargs)
+    if np.max(np.abs(actual - expected)) > tol:
+        raise AssertionError("Variant failed numerical verification")
 
 
 def _assign_variant_idx(node: _Node, depth_counts: dict[int, int]) -> None:
@@ -229,6 +228,7 @@ class _SearchContext:
     expected: np.ndarray
     pool: CompilationPool
     report: SearchReport
+    tol: float
 
 
 def _save_and_submit(node: _Node, ctx: _SearchContext, errors: list[VariantResult]) -> None:
@@ -305,7 +305,7 @@ def _run_search(
     last_progress_count = 0
 
     root_node = next(iter(graph.nodes.values()))
-    _verify_node(root_node, ctx.kernel_kwargs, ctx.expected)
+    _verify_node(root_node, ctx.kernel_kwargs, ctx.expected, ctx.tol)
     if root_node.depth >= min_depth:
         _assign_variant_idx(root_node, depth_counts)
         _save_and_submit(root_node, ctx, lowering_errors)
@@ -317,7 +317,7 @@ def _run_search(
             continue
         child_node = graph.nodes[child_program]
         depth_dist[child_node.depth] = depth_dist.get(child_node.depth, 0) + 1
-        _verify_node(child_node, ctx.kernel_kwargs, ctx.expected)
+        _verify_node(child_node, ctx.kernel_kwargs, ctx.expected, ctx.tol)
         if child_node.depth >= min_depth:
             _assign_variant_idx(child_node, depth_counts)
             _save_and_submit(child_node, ctx, lowering_errors)
@@ -431,8 +431,9 @@ def search(
     logger.info("Search root: %d stmts, %d opportunities", len(program.stmts), len(graph.nodes[program].opportunities))
 
     pool = _make_pool(program, kernel_kwargs, expected, save_cache)
+    tol = 1e-4 + 1e-4 * float(np.max(np.abs(expected)))
     ctx = _SearchContext(
-        save_cache=save_cache, kernel_kwargs=kernel_kwargs, expected=expected, pool=pool, report=report
+        save_cache=save_cache, kernel_kwargs=kernel_kwargs, expected=expected, pool=pool, report=report, tol=tol
     )
     qualifying, lowering_errors = _run_search(graph, rng, min_depth, num_targets, ctx)
     variant_results = _finalize_benchmark(pool, program.name, kernel_kwargs, expected, report, mac_count)

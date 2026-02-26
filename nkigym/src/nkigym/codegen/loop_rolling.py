@@ -10,6 +10,7 @@ Python function source, not tied to specific frameworks.
 
 import ast
 import copy
+import re
 from dataclasses import dataclass, field
 
 
@@ -108,38 +109,30 @@ def _collect_target_mapping(stmts: list[ast.stmt]) -> dict[str, str]:
     return var_map
 
 
-class _AstNormalizer(ast.NodeTransformer):
-    """Replace local names with positional names and zero out int constants."""
-
-    def __init__(self, var_map: dict[str, str]) -> None:
-        """Initialize with a variable-to-positional-name mapping."""
-        self.var_map = var_map
-
-    def visit_Name(self, node: ast.Name) -> ast.Name:
-        """Replace local variable names with positional equivalents."""
-        if node.id in self.var_map:
-            node.id = self.var_map[node.id]
-        return node
-
-    def visit_Constant(self, node: ast.Constant) -> ast.Constant:
-        """Zero out integer constants for structural comparison."""
-        if isinstance(node.value, int):
-            node.value = 0
-        return node
+_INT_CONSTANT_RE = re.compile(r"(?<=Constant\(value=)\d+")
 
 
-def _normalize_block(stmts: list[ast.stmt]) -> str:
+def _normalize_block(stmts: list[ast.stmt], dump_cache: dict[int, str]) -> str:
     """Normalize a block of statements for structural comparison.
 
     Renames local variables to positional names (_v0, _v1, ...) and
-    replaces all int constants with 0.
+    replaces all int constants with 0. Operates on ast.dump strings
+    to avoid deep-copying AST nodes. Uses dump_cache to avoid
+    redundant ast.dump calls for the same statement objects.
     """
-    stmts_copy = [copy.deepcopy(s) for s in stmts]
-    var_map = _collect_target_mapping(stmts_copy)
-    normalizer = _AstNormalizer(var_map)
-    for i, stmt in enumerate(stmts_copy):
-        stmts_copy[i] = normalizer.visit(stmt)
-    return "\n".join(ast.dump(s) for s in stmts_copy)
+    var_map = _collect_target_mapping(stmts)
+    parts = []
+    for s in stmts:
+        key = id(s)
+        if key not in dump_cache:
+            dump_cache[key] = ast.dump(s)
+        parts.append(dump_cache[key])
+    raw = "\n".join(parts)
+    if var_map:
+        pattern = "|".join(re.escape(k) for k in sorted(var_map, key=len, reverse=True))
+        raw = re.sub(f"id='({pattern})'", lambda m: f"id='{var_map[m.group(1)]}'", raw)
+    raw = _INT_CONSTANT_RE.sub("0", raw)
+    return raw
 
 
 def _collect_int_constants(node: ast.AST) -> list[tuple[tuple[tuple[str, int | None], ...], int]]:
@@ -264,17 +257,22 @@ def _check_scope_safe(working_stmts: list[ast.stmt], start_idx: int, block_size:
 
 
 def _count_matching_blocks(
-    working_stmts: list[ast.stmt], start: int, block_size: int, n: int, cache: dict[int, str]
+    working_stmts: list[ast.stmt],
+    start: int,
+    block_size: int,
+    n: int,
+    cache: dict[int, str],
+    dump_cache: dict[int, str],
 ) -> int:
     """Count consecutive structurally identical blocks starting at a position."""
     if start not in cache:
-        cache[start] = _normalize_block(working_stmts[start : start + block_size])
+        cache[start] = _normalize_block(working_stmts[start : start + block_size], dump_cache)
     ref = cache[start]
     count = 1
     while start + (count + 1) * block_size <= n:
         pos = start + count * block_size
         if pos not in cache:
-            cache[pos] = _normalize_block(working_stmts[pos : pos + block_size])
+            cache[pos] = _normalize_block(working_stmts[pos : pos + block_size], dump_cache)
         if cache[pos] != ref:
             break
         count += 1
@@ -297,13 +295,14 @@ def _find_best_run(working_stmts: list[ast.stmt]) -> _LoopRun:
     n = len(working_stmts)
     best = _NO_RUN
     best_coverage = 0
+    dump_cache: dict[int, str] = {}
     for k in range(1, n // 2 + 1):
         if k * (n // k) <= best_coverage:
             continue
         cache: dict[int, str] = {}
         p = 0
         while p + 2 * k <= n:
-            count = _count_matching_blocks(working_stmts, p, k, n, cache)
+            count = _count_matching_blocks(working_stmts, p, k, n, cache, dump_cache)
             if count >= 2 and count * k > best_coverage:
                 valid, varying = _extract_varying(working_stmts, k, count, p)
                 if valid and _check_scope_safe(working_stmts, p, k, count):
