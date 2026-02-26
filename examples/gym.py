@@ -53,7 +53,7 @@ def main() -> None:
     search(
         func=nkigym_matmul,
         transforms=[DataReuseTransform(), OperandMergeTransform()],
-        num_targets=1000,
+        num_targets=100,
         seed=42,
         min_depth=10,
         save_cache=cache_dir,

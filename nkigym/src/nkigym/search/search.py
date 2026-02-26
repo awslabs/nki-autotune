@@ -237,7 +237,17 @@ def _save_and_submit(node: _Node, ctx: _SearchContext, errors: list[VariantResul
     ctx.report.add_variant(nki_path, node.depth, node.variant_idx)
     if error:
         errors.append(
-            VariantResult(nki_path=nki_path, min_ms=0.0, mean_ms=0.0, mac_count=0, mfu=0.0, correct=False, error=error)
+            VariantResult(
+                nki_path=nki_path,
+                min_ms=0.0,
+                mean_ms=0.0,
+                p50_ms=0.0,
+                p99_ms=0.0,
+                mac_count=0,
+                mfu=0.0,
+                correct=False,
+                error=error,
+            )
         )
         ctx.report.update_variant(nki_path, status="error", error=error)
     if ctx.pool is not None and not error:
@@ -366,6 +376,8 @@ def _update_report_variants(report: SearchReport, results: list[VariantResult]) 
             status=status,
             min_ms=r.min_ms,
             mean_ms=r.mean_ms,
+            p50_ms=r.p50_ms,
+            p99_ms=r.p99_ms,
             mac_count=r.mac_count,
             mfu=r.mfu,
             correct=r.correct,

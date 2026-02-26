@@ -63,6 +63,8 @@ class VariantResult(NamedTuple):
     nki_path: str
     min_ms: float
     mean_ms: float
+    p50_ms: float
+    p99_ms: float
     mac_count: int
     mfu: float
     correct: bool
@@ -311,17 +313,30 @@ def _create_compiled_kernel(neff_path: str, nki_path: str, cfg: _BenchmarkConfig
     return CompiledKernel(_TracedKernel(kernel, hlo), neff_path)
 
 
+def _percentile(sorted_vals: list[float], pct: float) -> float:
+    """Return the pct-th percentile from a pre-sorted list via nearest-rank."""
+    idx = max(0, min(int(pct / 100 * len(sorted_vals)), len(sorted_vals) - 1))
+    return sorted_vals[idx]
+
+
 def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkConfig) -> VariantResult:
     """Benchmark a single compiled variant on a Neuron core."""
-    min_ms = mean_ms = mfu = 0.0
+    min_ms = mean_ms = p50_ms = p99_ms = mfu = 0.0
     correct = False
     error = ""
     try:
         compiled = _create_compiled_kernel(cr.neff_path, cr.nki_path, cfg)
         stats = spike.benchmark(
-            compiled, *cfg.kernel_kwargs.values(), warmup_iterations=cfg.warmup, benchmark_iterations=cfg.iters
+            compiled,
+            *cfg.kernel_kwargs.values(),
+            warmup_iterations=cfg.warmup,
+            benchmark_iterations=cfg.iters,
+            mode="device",
         )
         min_ms, mean_ms = stats.min_ms, stats.mean_ms
+        sorted_durations = sorted(stats.durations_ms)
+        p50_ms = _percentile(sorted_durations, 50)
+        p99_ms = _percentile(sorted_durations, 99)
         if cfg.mac_count > 0 and min_ms > 0:
             mfu = _calculate_mfu(cfg.mac_count, min_ms)
         outputs = spike.run(compiled, *cfg.kernel_kwargs.values())
@@ -334,6 +349,8 @@ def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkC
         nki_path=cr.nki_path,
         min_ms=min_ms,
         mean_ms=mean_ms,
+        p50_ms=p50_ms,
+        p99_ms=p99_ms,
         mac_count=cfg.mac_count,
         mfu=mfu,
         correct=correct,
@@ -369,6 +386,21 @@ def _dispatch_to_cores(groups: list[list[tuple[str, str]]], cfg: _BenchmarkConfi
     return all_results
 
 
+def _compile_failure_result(cr: CompileResult, mac_count: int) -> VariantResult:
+    """Convert a failed CompileResult into a VariantResult preserving the error."""
+    return VariantResult(
+        nki_path=cr.nki_path,
+        min_ms=0.0,
+        mean_ms=0.0,
+        p50_ms=0.0,
+        p99_ms=0.0,
+        mac_count=mac_count,
+        mfu=0.0,
+        correct=False,
+        error=cr.error,
+    )
+
+
 def run_on_hardware(
     compile_results: list[CompileResult],
     func_name: str,
@@ -393,13 +425,7 @@ def run_on_hardware(
         List of VariantResult for all variants including compile failures.
     """
     valid = [(cr.nki_path, cr.neff_path) for cr in compile_results if not cr.error]
-    all_results: list[VariantResult] = [
-        VariantResult(
-            nki_path=cr.nki_path, min_ms=0.0, mean_ms=0.0, mac_count=mac_count, mfu=0.0, correct=False, error=cr.error
-        )
-        for cr in compile_results
-        if cr.error
-    ]
+    all_results = [_compile_failure_result(cr, mac_count) for cr in compile_results if cr.error]
     if valid:
         cfg = _BenchmarkConfig(
             func_name=func_name,

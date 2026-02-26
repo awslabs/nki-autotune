@@ -94,6 +94,8 @@ class SearchReport:
             "status": "pending",
             "min_ms": None,
             "mean_ms": None,
+            "p50_ms": None,
+            "p99_ms": None,
             "mac_count": None,
             "mfu": None,
             "correct": None,
