@@ -11,7 +11,7 @@ BEFORE_SINGLE_ACTIVATION = GymProgram(
     ("a",),
     (("a", (128, 128)),),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), R("output", (128, 128), ((0, 128), (0, 128)))),
+        GymStatement("np_empty", (("dtype", np.float32),), R("output", (128, 128), ((0, 128), (0, 128)))),
         GymStatement(
             "np_slice",
             (("src", R("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -19,7 +19,7 @@ BEFORE_SINGLE_ACTIVATION = GymProgram(
         ),
         GymStatement(
             "activation",
-            (("data", R("tensor_0", (128, 128), ((0, 128), (0, 128)))), ("op", "np.tanh")),
+            (("data", R("tensor_0", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
             R("tensor_1", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
@@ -41,7 +41,7 @@ BEFORE_HETEROGENEOUS_OPS = GymProgram(
     ("a", "b", "c"),
     (("a", (128, 128)), ("b", (128, 128)), ("c", (128, 128))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), R("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), R("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", R("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -75,7 +75,7 @@ BEFORE_HETEROGENEOUS_OPS = GymProgram(
         ),
         GymStatement(
             "activation",
-            (("data", R("tensor_3", (128, 128), ((0, 128), (0, 128)))), ("op", "np.tanh")),
+            (("data", R("tensor_3", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
             R("tensor_4", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
@@ -97,7 +97,7 @@ BEFORE_ALREADY_MERGED = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), R("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), R("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", R("a", (128, 128), ((0, 128), (0, 128)))),),

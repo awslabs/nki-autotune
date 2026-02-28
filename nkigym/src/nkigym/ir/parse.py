@@ -10,7 +10,9 @@ ops and the GymProgram IR:
 import ast
 from typing import Any
 
-from nkigym.ir.tensor import TensorRef
+import numpy as np
+
+from nkigym.ir.tensor import TensorRef, full_slices
 from nkigym.ir.types import GymProgram, GymStatement
 from nkigym.ops.base import GymOp
 
@@ -114,18 +116,6 @@ def _has_np_empty(func_def: ast.FunctionDef) -> bool:
     return False
 
 
-def _full_slices(shape: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
-    """Build full-range slices from a shape.
-
-    Args:
-        shape: Tensor shape tuple.
-
-    Returns:
-        Per-axis (0, size) bounds.
-    """
-    return tuple((0, s) for s in shape)
-
-
 def _parse_one_slice(node: ast.expr) -> tuple[int, int]:
     """Parse a single AST Slice node into a (start, stop) pair.
 
@@ -178,7 +168,7 @@ def _parse_arg_ref(node: ast.expr, var_shapes: dict[str, tuple[int, ...]]) -> Te
         return TensorRef(node.value.id, tile_shape, slices)
     if isinstance(node, ast.Name):
         shape = var_shapes.get(node.id, ())
-        return TensorRef(node.id, shape, _full_slices(shape))
+        return TensorRef(node.id, shape, full_slices(shape))
     raise ValueError(f"Expected Name or Subscript, got {ast.dump(node)}")
 
 
@@ -216,22 +206,22 @@ def _specialize(
         for operand_name, var_name in tensor_kwargs:
             shape = var_shapes[var_name]
             input_shapes.append(shape)
-            new_kwargs.append((operand_name, TensorRef(var_name, shape, _full_slices(shape))))
+            new_kwargs.append((operand_name, TensorRef(var_name, shape, full_slices(shape))))
 
         for key, value in config_kwargs:
             if isinstance(value, str) and value in var_shapes:
                 shape = var_shapes[value]
-                new_kwargs.append((key, TensorRef(value, shape, _full_slices(shape))))
+                new_kwargs.append((key, TensorRef(value, shape, full_slices(shape))))
             else:
                 new_kwargs.append((key, value))
 
-        out_shape = op_cls().output_shape(tuple(input_shapes))
+        out_shape = op_cls.output_shape(tuple(input_shapes))
         out_name = stmt.output.name
         var_shapes[out_name] = out_shape
 
         result.append(
             GymStatement(
-                op=stmt.op, kwargs=tuple(new_kwargs), output=TensorRef(out_name, out_shape, _full_slices(out_shape))
+                op=stmt.op, kwargs=tuple(new_kwargs), output=TensorRef(out_name, out_shape, full_slices(out_shape))
             )
         )
 
@@ -282,7 +272,7 @@ def _flatten_call(call: ast.Call, output: str, stmts: list[GymStatement], counte
         if isinstance(kw.value, (ast.Name, ast.Subscript)):
             kwargs.append((kw.arg, _arg_name(kw.value)))
         else:
-            kwargs.append((kw.arg, _expr_to_str(kw.value)))
+            kwargs.append((kw.arg, _eval_expr(kw.value)))
 
     stmts.append(GymStatement(op=op_name, kwargs=tuple(kwargs), output=TensorRef(output, (), ())))
 
@@ -347,28 +337,56 @@ def _arg_name(node: ast.expr) -> str:
     raise ValueError(f"Expected a variable name, got {ast.dump(node)}")
 
 
-def _expr_to_str(node: ast.expr) -> str:
-    """Convert an AST expression to its source string.
+def _eval_expr(node: ast.expr) -> object:
+    """Evaluate an AST expression to a Python object.
 
-    Handles dotted names (e.g., ``np.tanh``), simple names, and
-    numeric/string constants.
+    Resolves ``np.X`` attribute accesses to the actual numpy object
+    and ``ast.Constant`` nodes to their literal values.
 
     Args:
         node: AST expression node.
 
     Returns:
-        Source-level string representation.
+        The resolved Python object.
 
     Raises:
         ValueError: If the expression type is not supported.
     """
+    result: object = None
     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-        return f"{node.value.id}.{node.attr}"
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Constant):
-        return repr(node.value)
-    raise ValueError(f"Unsupported kwarg expression: {ast.dump(node)}")
+        if node.value.id == "np":
+            result = getattr(np, node.attr)
+    elif isinstance(node, ast.Constant):
+        result = node.value
+    if result is None:
+        raise ValueError(f"Unsupported kwarg expression: {ast.dump(node)}")
+    return result
+
+
+_NP_UFUNC_ALIASES: dict[str, str] = {"absolute": "abs"}
+
+
+def _value_to_source(value: object) -> str:
+    """Convert a Python object to its nkigym source representation.
+
+    Renders numpy ufuncs as ``np.<name>``, numpy dtypes as
+    ``np.<dtype_name>``, and other values via ``repr()``.
+
+    Args:
+        value: Python object from IR kwargs.
+
+    Returns:
+        Source-level string representation.
+    """
+    result = repr(value)
+    if isinstance(value, np.ufunc):
+        name = _NP_UFUNC_ALIASES.get(value.__name__, value.__name__)
+        result = f"np.{name}"
+    elif isinstance(value, np.dtype):
+        result = f"np.{value.name}"
+    elif isinstance(value, type) and issubclass(value, np.generic):
+        result = f"np.{np.dtype(value).name}"
+    return result
 
 
 def _subscript(ref: TensorRef) -> str:
@@ -397,14 +415,14 @@ def _render_np_empty(stmt: GymStatement) -> str:
     Returns:
         Source line like ``output = np.empty((128, 128), dtype=np.float32)``.
     """
-    dtype = ""
+    dtype = None
     for key, value in stmt.kwargs:
         if key == "dtype":
             dtype = value
-    if not dtype:
+    if dtype is None:
         raise ValueError(f"np_empty statement for '{stmt.output.name}' missing 'dtype' kwarg")
     shape_str = ", ".join(str(s) for s in stmt.output.shape)
-    return f"    {stmt.output.name} = np.empty(({shape_str}), dtype={dtype})"
+    return f"    {stmt.output.name} = np.empty(({shape_str}), dtype={_value_to_source(dtype)})"
 
 
 def _render_np_slice(stmt: GymStatement) -> str:
@@ -465,7 +483,7 @@ def _render_compute(stmt: GymStatement) -> str:
         elif isinstance(value, TensorRef):
             args.append(_subscript(value))
         else:
-            args.append(f"{key}={value}")
+            args.append(f"{key}={_value_to_source(value)}")
 
     args_str = ", ".join(args)
     return f"    {stmt.output.name} = nkigym.{stmt.op}({args_str})"
@@ -625,14 +643,14 @@ def _parse_tiled_np_empty(
         ValueError: If the dtype kwarg is missing.
     """
     shape = tuple(elt.value for elt in call.args[0].elts)
-    dtype_str = ""
+    dtype_val = None
     for kw in call.keywords:
         if kw.arg == "dtype":
-            dtype_str = _expr_to_str(kw.value)
-    if not dtype_str:
+            dtype_val = _eval_expr(kw.value)
+    if dtype_val is None:
         raise ValueError(f"np.empty for '{target_name}' missing dtype kwarg")
-    out_ref = TensorRef(target_name, shape, _full_slices(shape))
-    stmts.append(GymStatement("np_empty", (("dtype", dtype_str),), out_ref))
+    out_ref = TensorRef(target_name, shape, full_slices(shape))
+    stmts.append(GymStatement("np_empty", (("dtype", dtype_val),), out_ref))
     var_shapes[target_name] = shape
 
 
@@ -652,7 +670,7 @@ def _parse_tiled_slice(
     tile_shape = tuple(e - s for s, e in slices)
     src_shape = var_shapes.get(src_name, tuple(e for _, e in slices))
     src_ref = TensorRef(src_name, src_shape, slices)
-    dst_ref = TensorRef(target_name, tile_shape, _full_slices(tile_shape))
+    dst_ref = TensorRef(target_name, tile_shape, full_slices(tile_shape))
     stmts.append(GymStatement("np_slice", (("src", src_ref),), dst_ref))
     var_shapes[target_name] = tile_shape
 
@@ -686,10 +704,10 @@ def _parse_tiled_compute(
             acc_ref = _parse_arg_ref(kw.value, var_shapes)
             kwargs_list.append(("acc", acc_ref))
         else:
-            kwargs_list.append((kw.arg, _expr_to_str(kw.value)))
+            kwargs_list.append((kw.arg, _eval_expr(kw.value)))
 
-    out_shape = op_cls().output_shape(tuple(input_shape_list))
-    out_ref = TensorRef(target_name, out_shape, _full_slices(out_shape))
+    out_shape = op_cls.output_shape(tuple(input_shape_list))
+    out_ref = TensorRef(target_name, out_shape, full_slices(out_shape))
     stmts.append(GymStatement(op_name, tuple(kwargs_list), out_ref))
     var_shapes[target_name] = out_shape
 
@@ -714,7 +732,7 @@ def _parse_tiled_store(
 
     if isinstance(value, ast.Name):
         src_shape = var_shapes.get(value.id, ())
-        src_ref = TensorRef(value.id, src_shape, _full_slices(src_shape))
+        src_ref = TensorRef(value.id, src_shape, full_slices(src_shape))
     elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
         src_slices = _parse_subscript_slices(value.slice)
         src_shape = tuple(e - s for s, e in src_slices)

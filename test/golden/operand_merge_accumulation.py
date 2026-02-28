@@ -9,7 +9,7 @@ ACCUMULATION_BLOCKS_PROGRAM = GymProgram(
     ("a", "b"),
     (("a", (256, 128)), ("b", (256, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),),
@@ -111,7 +111,7 @@ ACCUMULATION_BLOCKS_AFTER_1_MERGE = GymProgram(
     ("a", "b"),
     (("a", (256, 128)), ("b", (256, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),),
@@ -208,7 +208,7 @@ ACCUMULATION_BLOCKS_AFTER_2_MERGES = GymProgram(
     ("a", "b"),
     (("a", (256, 128)), ("b", (256, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),),
@@ -300,7 +300,7 @@ ACCUMULATION_BLOCKS_AFTER_3_MERGES = GymProgram(
     ("a", "b"),
     (("a", (256, 128)), ("b", (256, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),),

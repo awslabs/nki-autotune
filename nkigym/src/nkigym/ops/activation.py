@@ -4,17 +4,10 @@ from collections.abc import Callable
 
 import numpy as np
 
-from nkigym.codegen.context import get_kwarg
+from nkigym.codegen.context import _LoweringContext, get_kwarg, value_to_nki
 from nkigym.ir.tensor import TensorRef
+from nkigym.ir.types import GymStatement
 from nkigym.ops.base import GymOp, Tensor
-
-_ACTIVATION_MAP: dict[str, str] = {
-    "np.tanh": "nl.tanh",
-    "np.exp": "nl.exp",
-    "np.log": "nl.log",
-    "np.abs": "nl.abs",
-    "np.sqrt": "nl.sqrt",
-}
 
 
 class ActivationOp(GymOp):
@@ -28,7 +21,8 @@ class ActivationOp(GymOp):
     inputs = (Tensor("data", ("P", "F")),)
     outputs = (Tensor("result", ("P", "F")),)
 
-    def simulate(self, data: np.ndarray, **kwargs: object) -> np.ndarray:
+    @classmethod
+    def simulate(cls, data: np.ndarray, **kwargs: object) -> np.ndarray:  # type: ignore[override]
         """Apply activation function to input.
 
         Args:
@@ -38,13 +32,14 @@ class ActivationOp(GymOp):
         Returns:
             Activated array of same shape.
         """
-        op: Callable[[np.ndarray], np.ndarray] = kwargs.get("op")
+        op: Callable[[np.ndarray], np.ndarray] = kwargs.get("op")  # type: ignore[assignment]
         result = data
         if op is not None:
             result = op(data)
         return result
 
-    def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    @classmethod
+    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
         """Output shape matches input shape.
 
         Args:
@@ -55,7 +50,8 @@ class ActivationOp(GymOp):
         """
         return input_shapes[0]
 
-    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+    @classmethod
+    def to_nki(cls, stmt: GymStatement, ctx: _LoweringContext) -> list[str]:  # type: ignore[override]
         """Lower activation to ``nisa.activation``.
 
         Args:
@@ -78,7 +74,7 @@ class ActivationOp(GymOp):
 
         func_str = "nl.identity"
         if op_str is not None:
-            func_str = _ACTIVATION_MAP.get(str(op_str), str(op_str))
+            func_str = value_to_nki(op_str)
 
         shape_str = repr(stmt.output.shape)
         return [

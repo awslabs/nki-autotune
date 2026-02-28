@@ -9,7 +9,7 @@ DEPENDENCY_BLOCKS_PROGRAM = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -30,7 +30,7 @@ DEPENDENCY_BLOCKS_PROGRAM = GymProgram(
         ),
         GymStatement(
             "activation",
-            (("data", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))), ("op", "np.tanh")),
+            (("data", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
             TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
@@ -73,7 +73,7 @@ DEPENDENCY_BLOCKS_AFTER_1_MERGE = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -94,7 +94,7 @@ DEPENDENCY_BLOCKS_AFTER_1_MERGE = GymProgram(
         ),
         GymStatement(
             "activation",
-            (("data", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))), ("op", "np.tanh")),
+            (("data", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
             TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
@@ -132,7 +132,7 @@ DEPENDENCY_BLOCKS_AFTER_2_MERGES = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -153,7 +153,7 @@ DEPENDENCY_BLOCKS_AFTER_2_MERGES = GymProgram(
         ),
         GymStatement(
             "activation",
-            (("data", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))), ("op", "np.tanh")),
+            (("data", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
             TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(

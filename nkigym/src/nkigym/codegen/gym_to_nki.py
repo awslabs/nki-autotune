@@ -4,11 +4,35 @@ Thin orchestrator that walks each GymStatement and dispatches to
 the per-op ``to_nki`` method defined on GymOp subclasses.
 """
 
+import re
+
 import numpy as np
 
 from nkigym.codegen.context import _LoweringContext
 from nkigym.ir.types import GymProgram
 from nkigym.ops.base import GymOp
+
+_TENSOR_RE = re.compile(r"^tensor_(\d+)$")
+
+
+def _next_tensor_index(program: GymProgram) -> int:
+    """Find the next available tensor variable index.
+
+    Scans statement output names matching ``tensor_N`` and returns
+    one past the highest index found.
+
+    Args:
+        program: The GymProgram to scan.
+
+    Returns:
+        Next available tensor index.
+    """
+    max_idx = -1
+    for stmt in program.stmts:
+        m = _TENSOR_RE.match(stmt.output.name)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+    return max_idx + 1
 
 
 def lower_to_nki(program: GymProgram) -> str:
@@ -29,14 +53,14 @@ def lower_to_nki(program: GymProgram) -> str:
         KeyError: If an unknown op is encountered.
     """
     dtype_str = f"nl.{np.dtype(program.output_dtype).name}"
-    ctx = _LoweringContext(params=program.params, dtype=dtype_str)
+    ctx = _LoweringContext(params=program.params, dtype=dtype_str, tensor_counter=_next_tensor_index(program))
     for param_name in program.params:
         ctx.buffers[param_name] = "HBM"
 
     body_lines: list[str] = []
     for stmt in program.stmts:
-        op = GymOp.get(stmt.op)()
-        body_lines.extend(op.to_nki(stmt, ctx))
+        op_cls = GymOp.get(stmt.op)
+        body_lines.extend(op_cls.to_nki(stmt, ctx))
 
     body_lines.append(f"return {program.return_var}")
 

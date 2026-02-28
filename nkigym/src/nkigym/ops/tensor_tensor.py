@@ -4,8 +4,9 @@ from collections.abc import Callable
 
 import numpy as np
 
-from nkigym.codegen.context import get_kwarg
+from nkigym.codegen.context import _LoweringContext, get_kwarg, value_to_nki
 from nkigym.ir.tensor import TensorRef
+from nkigym.ir.types import GymStatement
 from nkigym.ops.base import GymOp, Tensor
 
 
@@ -20,7 +21,8 @@ class TensorTensorOp(GymOp):
     inputs = (Tensor("data1", ("P", "F")), Tensor("data2", ("P", "F")))
     outputs = (Tensor("result", ("P", "F")),)
 
-    def simulate(self, data1: np.ndarray, data2: np.ndarray, **kwargs: object) -> np.ndarray:
+    @classmethod
+    def simulate(cls, data1: np.ndarray, data2: np.ndarray, **kwargs: object) -> np.ndarray:  # type: ignore[override]
         """Apply element-wise binary operation.
 
         Args:
@@ -31,10 +33,11 @@ class TensorTensorOp(GymOp):
         Returns:
             Result array of same shape.
         """
-        op: Callable[[np.ndarray, np.ndarray], np.ndarray] = kwargs.get("op", np.add)
+        op: Callable[[np.ndarray, np.ndarray], np.ndarray] = kwargs.get("op", np.add)  # type: ignore[assignment]
         return op(data1, data2)
 
-    def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    @classmethod
+    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
         """Output shape matches first input shape.
 
         Args:
@@ -45,7 +48,8 @@ class TensorTensorOp(GymOp):
         """
         return input_shapes[0]
 
-    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+    @classmethod
+    def to_nki(cls, stmt: GymStatement, ctx: _LoweringContext) -> list[str]:  # type: ignore[override]
         """Lower tensor_tensor to ``nisa.tensor_tensor``.
 
         Args:
@@ -70,8 +74,7 @@ class TensorTensorOp(GymOp):
 
         op_part = ""
         if op_str is not None:
-            nki_op = str(op_str).replace("np.", "nl.")
-            op_part = f", op={nki_op}"
+            op_part = f", op={value_to_nki(op_str)}"
 
         shape_str = repr(stmt.output.shape)
         return [

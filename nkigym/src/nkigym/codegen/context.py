@@ -7,8 +7,35 @@ without creating circular dependencies.
 
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from nkigym.ir.tensor import TensorRef
 from nkigym.ir.types import GymStatement
+
+_NKI_UFUNC_ALIASES: dict[str, str] = {"absolute": "abs"}
+
+
+def value_to_nki(value: object) -> str:
+    """Convert a Python object to its NKI source representation.
+
+    Renders numpy ufuncs as ``nl.<name>``, numpy dtypes as
+    ``nl.<dtype_name>``, and other values via ``repr()``.
+
+    Args:
+        value: Python object from IR kwargs.
+
+    Returns:
+        NKI source-level string representation.
+    """
+    result = repr(value)
+    if isinstance(value, np.ufunc):
+        name = _NKI_UFUNC_ALIASES.get(value.__name__, value.__name__)
+        result = f"nl.{name}"
+    elif isinstance(value, np.dtype):
+        result = f"nl.{value.name}"
+    elif isinstance(value, type) and issubclass(value, np.generic):
+        result = f"nl.{np.dtype(value).name}"
+    return result
 
 
 @dataclass
@@ -21,15 +48,15 @@ class _LoweringContext:
         buffers: Variable name to buffer location string.
         aliases: Maps accumulation output names to canonical PSUM variable.
         alias_offsets: Maps alias names to their start offsets per axis.
-        staging_counter: Monotonic counter for staging variable names.
+        tensor_counter: Monotonic counter for generated tensor variable names.
     """
 
     params: tuple[str, ...]
-    dtype: str = "nl.float32"
+    dtype: str
     buffers: dict[str, str] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)
     alias_offsets: dict[str, tuple[int, ...]] = field(default_factory=dict)
-    staging_counter: int = 0
+    tensor_counter: int = 0
 
     def resolve(self, name: str) -> str:
         """Resolve a variable name through the alias chain.

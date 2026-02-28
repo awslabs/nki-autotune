@@ -45,7 +45,7 @@ def main() -> None:
     args = parse_args()
     cache_dir = args.cache_dir
 
-    k, m, n = 2048, 2048, 2048
+    k, m, n = 256, 256, 256
     rng = np.random.default_rng()
     lhs = rng.standard_normal((k, m)).astype(np.float16)
     rhs = rng.standard_normal((k, n)).astype(np.float16)

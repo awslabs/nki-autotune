@@ -6,8 +6,7 @@ import numpy as np
 import pytest
 
 import nkigym
-from nkigym.ir import GymProgram, program_to_source
-from nkigym.utils import source_to_callable
+from nkigym.ir import GymProgram
 
 
 @pytest.fixture
@@ -98,10 +97,9 @@ def make_random_array(shape: tuple[int, ...], seed: int) -> np.ndarray:
 def assert_programs_numerically_equal(before: GymProgram, after: GymProgram, rtol: float, atol: float) -> None:
     """Assert two GymPrograms produce identical outputs for random inputs.
 
-    Converts both programs to callables via program_to_source ->
-    source_to_callable, generates deterministic random inputs from the
-    before program's input_shapes, and compares outputs with
-    assert_allclose.
+    Executes both programs via GymProgram.__call__(), generates
+    deterministic random inputs from the before program's input_shapes,
+    and compares outputs with assert_allclose.
 
     Args:
         before: Reference program.
@@ -109,10 +107,8 @@ def assert_programs_numerically_equal(before: GymProgram, after: GymProgram, rto
         rtol: Relative tolerance for assert_allclose.
         atol: Absolute tolerance for assert_allclose.
     """
-    before_func = source_to_callable(program_to_source(before), before.name)
-    after_func = source_to_callable(program_to_source(after), after.name)
     input_shapes = dict(before.input_shapes)
-    inputs = [make_random_array(input_shapes[p], seed=42 + i) for i, p in enumerate(sorted(input_shapes))]
-    expected = before_func(*inputs)
-    actual = after_func(*inputs)
+    kwargs = {p: make_random_array(input_shapes[p], seed=42 + i) for i, p in enumerate(sorted(input_shapes))}
+    expected = before(**kwargs)
+    actual = after(**kwargs)
     np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)

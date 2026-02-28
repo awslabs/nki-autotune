@@ -97,7 +97,7 @@ SOURCE_TO_PROGRAM_CASES = [
                     (
                         ("data1", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
                         ("data2", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),
-                        ("op", "np.add"),
+                        ("op", np.add),
                     ),
                     TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
                 ),
@@ -118,7 +118,7 @@ SOURCE_TO_PROGRAM_CASES = [
             stmts=(
                 GymStatement(
                     "activation",
-                    (("data", TensorRef("a", (128, 128), ((0, 128), (0, 128)))), ("op", "np.tanh")),
+                    (("data", TensorRef("a", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
                     TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
                 ),
             ),
@@ -184,7 +184,7 @@ SOURCE_TO_PROGRAM_CASES = [
                     (
                         ("data", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
                         ("operand0", TensorRef("b", (128, 1), ((0, 128), (0, 1)))),
-                        ("op", "np.multiply"),
+                        ("op", np.multiply),
                     ),
                     TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
                 ),
@@ -205,7 +205,7 @@ SOURCE_TO_PROGRAM_CASES = [
             stmts=(
                 GymStatement(
                     "activation",
-                    (("data", TensorRef("a", (128, 128), ((0, 128), (0, 128)))), ("op", "np.exp")),
+                    (("data", TensorRef("a", (128, 128), ((0, 128), (0, 128)))), ("op", np.exp)),
                     TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
                 ),
             ),
@@ -228,7 +228,7 @@ SOURCE_TO_PROGRAM_CASES = [
                     (
                         ("data1", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),
                         ("data2", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),
-                        ("op", "np.multiply"),
+                        ("op", np.multiply),
                     ),
                     TensorRef("_return", (128, 128), ((0, 128), (0, 128))),
                 ),
@@ -272,7 +272,7 @@ PROGRAM_TO_SOURCE_CASES = [
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
             stmts=(
                 GymStatement(
-                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
+                    "np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
                 ),
                 GymStatement(
                     "np_slice",
@@ -327,7 +327,7 @@ PROGRAM_TO_SOURCE_CASES = [
             input_shapes=(("a", (128, 128)),),
             stmts=(
                 GymStatement(
-                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
+                    "np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
                 ),
                 GymStatement(
                     "np_slice",
@@ -367,7 +367,7 @@ PROGRAM_TO_SOURCE_CASES = [
             input_shapes=(("a", (256, 128)), ("b", (256, 128))),
             stmts=(
                 GymStatement(
-                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
+                    "np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
                 ),
                 GymStatement(
                     "np_slice",
@@ -444,7 +444,7 @@ PROGRAM_TO_SOURCE_CASES = [
             input_shapes=(("a", (128, 128)), ("b", (128, 128))),
             stmts=(
                 GymStatement(
-                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
+                    "np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
                 ),
                 GymStatement(
                     "np_slice",
@@ -461,7 +461,7 @@ PROGRAM_TO_SOURCE_CASES = [
                     (
                         ("data1", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                         ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
-                        ("op", "np.add"),
+                        ("op", np.add),
                     ),
                     TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
                 ),
@@ -506,9 +506,7 @@ PROGRAM_TO_SOURCE_CASES = [
             params=("a",),
             input_shapes=(("a", (128, 64)),),
             stmts=(
-                GymStatement(
-                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (64, 128), ((0, 64), (0, 128)))
-                ),
+                GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (64, 128), ((0, 64), (0, 128)))),
                 GymStatement(
                     "np_slice",
                     (("src", TensorRef("a", (128, 64), ((0, 128), (0, 64)))),),
@@ -553,7 +551,7 @@ PROGRAM_TO_SOURCE_CASES = [
             input_shapes=(("a", (128, 128)), ("b", (128, 1))),
             stmts=(
                 GymStatement(
-                    "np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
+                    "np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))
                 ),
                 GymStatement(
                     "np_slice",
@@ -570,7 +568,7 @@ PROGRAM_TO_SOURCE_CASES = [
                     (
                         ("data", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                         ("operand0", TensorRef("tensor_1", (128, 1), ((0, 128), (0, 1)))),
-                        ("op", "np.multiply"),
+                        ("op", np.multiply),
                     ),
                     TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
                 ),

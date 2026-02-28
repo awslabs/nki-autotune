@@ -9,7 +9,7 @@ BEFORE_MATMUL_M_DIM_MERGE = GymProgram(
     ("a", "b"),
     (("a", (256, 128)), ("b", (128, 128))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (256, 128), ((0, 128), (0, 64)))),),
@@ -68,7 +68,7 @@ AFTER_M_DIM_MERGE = GymProgram(
     ("a", "b"),
     (("a", (256, 128)), ("b", (128, 128))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),),
@@ -106,7 +106,7 @@ BEFORE_MATMUL_M_EXCEEDS_LIMIT = GymProgram(
     ("a", "b"),
     (("a", (128, 192)), ("b", (128, 128))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (192, 128), ((0, 192), (0, 128)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (192, 128), ((0, 192), (0, 128)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 192), ((0, 128), (0, 128)))),),
@@ -165,7 +165,7 @@ AFTER_M_EXCEEDS_LIMIT = GymProgram(
     ("a", "b"),
     (("a", (128, 192)), ("b", (128, 128))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (192, 128), ((0, 192), (0, 128)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (192, 128), ((0, 192), (0, 128)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 192), ((0, 128), (0, 192)))),),

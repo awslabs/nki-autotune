@@ -7,24 +7,10 @@ for memory operations and nkigym GymOp calls for compute.
 
 from typing import Any
 
-import numpy as np
-
-from nkigym.ir.tensor import TensorRef, ref_name
+from nkigym.ir.tensor import TensorRef, full_slices, ref_name
 from nkigym.ir.types import GymProgram, GymStatement
 from nkigym.ops.base import GymOp
 from nkigym.tiling.analysis import OUTPUT_TENSOR_NAME, TilingAnalysis, analyze_tiling
-
-
-def _full_slices(shape: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
-    """Build full-range slices from a shape.
-
-    Args:
-        shape: Tensor shape tuple.
-
-    Returns:
-        Per-axis (0, size) bounds.
-    """
-    return tuple((0, s) for s in shape)
 
 
 class TensorNameGenerator:
@@ -67,7 +53,7 @@ def _make_slice_stmt(
     dst_var = name_gen.next_name()
     tile_shape = tuple(stop - start for start, stop in slices)
     src_ref = TensorRef(src_var, src_shape, tuple(slices))
-    dst_ref = TensorRef(dst_var, tile_shape, _full_slices(tile_shape))
+    dst_ref = TensorRef(dst_var, tile_shape, full_slices(tile_shape))
     kwargs: tuple[tuple[str, Any], ...] = (("src", src_ref),)
     return GymStatement(op="np_slice", kwargs=kwargs, output=dst_ref), dst_var, tile_shape
 
@@ -86,24 +72,24 @@ def _make_store_stmt(
     Returns:
         A GymStatement for the store operation.
     """
-    src_ref = TensorRef(src_var, src_shape, _full_slices(src_shape))
+    src_ref = TensorRef(src_var, src_shape, full_slices(src_shape))
     dst_ref = TensorRef(OUTPUT_TENSOR_NAME, output_shape, tuple(dst_slices))
     kwargs: tuple[tuple[str, Any], ...] = (("src", src_ref), ("dst", dst_ref))
     return GymStatement(op="np_store", kwargs=kwargs, output=dst_ref)
 
 
-def _make_alloc_stmt(output_shape: tuple[int, ...], dtype_name: str) -> GymStatement:
+def _make_alloc_stmt(output_shape: tuple[int, ...], output_dtype: type) -> GymStatement:
     """Create an np_empty statement for allocating the output tensor.
 
     Args:
         output_shape: Shape of the output tensor.
-        dtype_name: Numpy dtype string (e.g., ``"np.float32"``).
+        output_dtype: Numpy dtype type (e.g., ``np.float32``).
 
     Returns:
         A GymStatement for the allocation.
     """
-    output_ref = TensorRef(OUTPUT_TENSOR_NAME, output_shape, _full_slices(output_shape))
-    kwargs: tuple[tuple[str, Any], ...] = (("dtype", dtype_name),)
+    output_ref = TensorRef(OUTPUT_TENSOR_NAME, output_shape, full_slices(output_shape))
+    kwargs: tuple[tuple[str, Any], ...] = (("dtype", output_dtype),)
     return GymStatement(op="np_empty", kwargs=kwargs, output=output_ref)
 
 
@@ -159,12 +145,12 @@ def _emit_tile_ops(
                 var_slices = analysis.compute_slices(var_name, position)
                 slice_stmt, tile_var, tile_shape = _make_slice_stmt(var_name, src_shape, var_slices, name_gen)
                 stmts.append(slice_stmt)
-                new_kwargs.append((operand_name, TensorRef(tile_var, tile_shape, _full_slices(tile_shape))))
+                new_kwargs.append((operand_name, TensorRef(tile_var, tile_shape, full_slices(tile_shape))))
                 input_shapes.append(tile_shape)
             elif var_name in intermediate_map:
                 mapped_var = intermediate_map[var_name]
                 mapped_shape = intermediate_shapes[var_name]
-                new_kwargs.append((operand_name, TensorRef(mapped_var, mapped_shape, _full_slices(mapped_shape))))
+                new_kwargs.append((operand_name, TensorRef(mapped_var, mapped_shape, full_slices(mapped_shape))))
                 input_shapes.append(mapped_shape)
             else:
                 raise RuntimeError(
@@ -180,15 +166,15 @@ def _emit_tile_ops(
         use_acc = is_return_op and not is_first_reduction and acc_var is not None
 
         op_cls = GymOp.get(op_name)
-        out_shape = op_cls().output_shape(tuple(input_shapes))
+        out_shape = op_cls.output_shape(tuple(input_shapes))
 
         if use_acc:
-            new_kwargs.append(("acc", TensorRef(acc_var, acc_shape, _full_slices(acc_shape))))
+            new_kwargs.append(("acc", TensorRef(acc_var, acc_shape, full_slices(acc_shape))))
 
         dst_var = name_gen.next_name()
 
         compute_stmt = GymStatement(
-            op=op_name, kwargs=tuple(new_kwargs), output=TensorRef(dst_var, out_shape, _full_slices(out_shape))
+            op=op_name, kwargs=tuple(new_kwargs), output=TensorRef(dst_var, out_shape, full_slices(out_shape))
         )
         stmts.append(compute_stmt)
         intermediate_map[orig_stmt.output.name] = dst_var
@@ -219,9 +205,8 @@ def tile_program(program: GymProgram) -> GymProgram:
 
     output_shape = analysis.var_shapes[program.return_var]
 
-    dtype_name = f"np.{np.dtype(program.output_dtype).name}"
     stmts: list[GymStatement] = []
-    stmts.append(_make_alloc_stmt(output_shape, dtype_name))
+    stmts.append(_make_alloc_stmt(output_shape, program.output_dtype))
 
     name_gen = TensorNameGenerator()
 

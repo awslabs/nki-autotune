@@ -1,16 +1,10 @@
 """GymOp abstract base class and Tensor for numpy-level operation wrappers."""
 
-from __future__ import annotations
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Any
 
 import numpy as np
-
-if TYPE_CHECKING:
-    from nkigym.codegen.context import _LoweringContext
-    from nkigym.ir.types import GymStatement
 
 
 @dataclass(frozen=True)
@@ -34,7 +28,8 @@ class GymOp(ABC):
     """Thin stateless wrapper over a numpy operation.
 
     All state is class-level. Subclasses set class attributes and
-    implement ``simulate`` with standard numpy. No ``__init__`` needed.
+    implement ``simulate``, ``output_shape``, and ``to_nki`` as
+    classmethods. No instantiation needed for dispatch.
 
     Attributes:
         op_name: Unique name for registry lookup.
@@ -83,22 +78,8 @@ class GymOp(ABC):
         """
         return dict(cls._registry)
 
-    @property
-    def operand_names(self) -> tuple[str, ...]:
-        """Input operand names derived from ``inputs``."""
-        return tuple(t.name for t in self.inputs)
-
-    @property
-    def input_axes(self) -> tuple[tuple[str | int, ...], ...]:
-        """Axis layouts derived from ``inputs``."""
-        return tuple(t.axes for t in self.inputs)
-
-    @property
-    def output_axes(self) -> tuple[tuple[str | int, ...], ...]:
-        """Axis layouts derived from ``outputs``."""
-        return tuple(t.axes for t in self.outputs)
-
-    def can_merge_operand_dim(self, operand_idx: int, dim: int, merged_size: int) -> bool:
+    @classmethod
+    def can_merge_operand_dim(cls, operand_idx: int, dim: int, merged_size: int) -> bool:
         """Check whether merging a dimension to a given size is within tile limits.
 
         Maps (operand_idx, dim) to the named axis via the ``inputs`` and
@@ -119,27 +100,27 @@ class GymOp(ABC):
         Raises:
             IndexError: If operand_idx or dim is out of range.
         """
-        all_tensors = self.inputs + self.outputs
+        all_tensors = cls.inputs + cls.outputs
         if operand_idx >= len(all_tensors):
             raise IndexError(
-                f"operand_idx {operand_idx} out of range for {self.op_name} "
+                f"operand_idx {operand_idx} out of range for {cls.op_name} "
                 f"with {len(all_tensors)} tensors (inputs + outputs)"
             )
         axes = all_tensors[operand_idx].axes
         if dim >= len(axes):
             raise IndexError(
-                f"dim {dim} out of range for {self.op_name} operand "
+                f"dim {dim} out of range for {cls.op_name} operand "
                 f"{all_tensors[operand_idx].name} with {len(axes)} axes"
             )
         axis_name = axes[dim]
-        allowed = not isinstance(axis_name, int)
-        if allowed:
-            limit = self.tile_limits.get(axis_name)
+        allowed = False
+        if isinstance(axis_name, str):
+            limit = cls.tile_limits.get(axis_name)
             allowed = limit is None or merged_size <= limit
         return allowed
 
     def __call__(self, *args: np.ndarray, **kwargs: object) -> np.ndarray:
-        """Dispatch to simulate.
+        """Dispatch to simulate (supports callable instances).
 
         Args:
             *args: Input numpy arrays.
@@ -150,8 +131,9 @@ class GymOp(ABC):
         """
         return self.simulate(*args, **kwargs)
 
+    @classmethod
     @abstractmethod
-    def simulate(self, *args: np.ndarray, **kwargs: object) -> np.ndarray:
+    def simulate(cls, *args: np.ndarray, **kwargs: object) -> np.ndarray:
         """Run the op on CPU with numpy.
 
         Args:
@@ -163,8 +145,9 @@ class GymOp(ABC):
         """
         ...
 
+    @classmethod
     @abstractmethod
-    def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
         """Infer output shape from input shapes.
 
         Args:
@@ -175,13 +158,14 @@ class GymOp(ABC):
         """
         ...
 
+    @classmethod
     @abstractmethod
-    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+    def to_nki(cls, stmt: Any, ctx: Any) -> list[str]:
         """Lower a GymStatement for this op to NKI source lines.
 
         Args:
-            stmt: The IR statement to lower.
-            ctx: Mutable lowering context tracking buffers and aliases.
+            stmt: The IR statement (GymStatement) to lower.
+            ctx: Mutable lowering context (_LoweringContext).
 
         Returns:
             List of NKI source code lines.

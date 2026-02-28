@@ -598,7 +598,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (128, 128)), ("b", (128, 128))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -634,7 +634,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (128, 256)), ("b", (128, 128))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (256, 128), ((0, 256), (0, 128)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (256, 128), ((0, 256), (0, 128)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (128, 256), ((0, 128), (0, 128)))),),
@@ -696,7 +696,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (128, 128)), ("b", (128, 256))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -758,7 +758,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (128, 256)), ("b", (128, 256))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (128, 256), ((0, 128), (0, 128)))),),
@@ -872,7 +872,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (128, 512)), ("b", (128, 128))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (512, 128), ((0, 512), (0, 128)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (512, 128), ((0, 512), (0, 128)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (128, 512), ((0, 128), (0, 128)))),),
@@ -986,7 +986,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (256, 128)), ("b", (256, 128))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),),
@@ -1041,7 +1041,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (256, 256)), ("b", (256, 256))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (256, 256), ((0, 128), (0, 128)))),),
@@ -1231,7 +1231,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (256, 512)), ("b", (256, 512))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (512, 512), ((0, 512), (0, 512)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (512, 512), ((0, 512), (0, 512)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (256, 512), ((0, 128), (0, 128)))),),
@@ -1961,7 +1961,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (512, 128)), ("b", (512, 128))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (512, 128), ((0, 128), (0, 128)))),),
@@ -2054,7 +2054,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (128, 512)), ("b", (128, 512))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (512, 512), ((0, 512), (0, 512)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (512, 512), ((0, 512), (0, 512)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (128, 512), ((0, 128), (0, 128)))),),
@@ -2480,7 +2480,7 @@ GOLDEN_SINGLE_MATMUL_PROGRAM = {
         params=("a", "b"),
         input_shapes=(("a", (1024, 128)), ("b", (1024, 128))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (1024, 128), ((0, 128), (0, 128)))),),
@@ -2652,7 +2652,7 @@ GOLDEN_DOUBLE_MATMUL_PROGRAM = {
         params=("a", "b", "c"),
         input_shapes=(("a", (128, 128)), ("b", (128, 128)), ("c", (128, 128))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -2701,7 +2701,7 @@ GOLDEN_DOUBLE_MATMUL_PROGRAM = {
         params=("a", "b", "c"),
         input_shapes=(("a", (128, 256)), ("b", (128, 128)), ("c", (256, 128))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (128, 256), ((0, 128), (0, 128)))),),
@@ -2782,7 +2782,7 @@ GOLDEN_DOUBLE_MATMUL_PROGRAM = {
         params=("a", "b", "c"),
         input_shapes=(("a", (128, 256)), ("b", (128, 128)), ("c", (256, 256))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (128, 256), ((0, 128), (0, 128)))),),
@@ -2934,7 +2934,7 @@ GOLDEN_DOUBLE_MATMUL_PROGRAM = {
         params=("a", "b", "c"),
         input_shapes=(("a", (256, 256)), ("b", (256, 256)), ("c", (256, 256))),
         stmts=(
-            GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
+            GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
             GymStatement(
                 "np_slice",
                 (("src", TensorRef("a", (256, 256), ((0, 128), (0, 128)))),),

@@ -4,8 +4,9 @@ from collections.abc import Callable
 
 import numpy as np
 
-from nkigym.codegen.context import get_kwarg
+from nkigym.codegen.context import _LoweringContext, get_kwarg, value_to_nki
 from nkigym.ir.tensor import TensorRef
+from nkigym.ir.types import GymStatement
 from nkigym.ops.base import GymOp, Tensor
 
 
@@ -20,7 +21,8 @@ class TensorScalarOp(GymOp):
     inputs = (Tensor("data", ("P", "F")), Tensor("operand0", ("P", 1)))
     outputs = (Tensor("result", ("P", "F")),)
 
-    def simulate(self, data: np.ndarray, operand0: float | np.ndarray, **kwargs: object) -> np.ndarray:
+    @classmethod
+    def simulate(cls, data: np.ndarray, operand0: float | np.ndarray, **kwargs: object) -> np.ndarray:  # type: ignore[override]
         """Apply element-wise tensor-scalar operation.
 
         Args:
@@ -31,10 +33,11 @@ class TensorScalarOp(GymOp):
         Returns:
             Result array of same shape as data.
         """
-        op: Callable[[np.ndarray, object], np.ndarray] = kwargs.get("op", np.multiply)
+        op: Callable[[np.ndarray, object], np.ndarray] = kwargs.get("op", np.multiply)  # type: ignore[assignment]
         return op(data, operand0)
 
-    def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    @classmethod
+    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
         """Output shape matches first input (data) shape.
 
         Args:
@@ -45,7 +48,8 @@ class TensorScalarOp(GymOp):
         """
         return input_shapes[0]
 
-    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+    @classmethod
+    def to_nki(cls, stmt: GymStatement, ctx: _LoweringContext) -> list[str]:  # type: ignore[override]
         """Lower tensor_scalar to ``nisa.tensor_scalar``.
 
         Args:
@@ -73,8 +77,7 @@ class TensorScalarOp(GymOp):
 
         op_kwarg = ""
         if op_str is not None:
-            nki_op = str(op_str).replace("np.", "nl.")
-            op_kwarg = f", op0={nki_op}"
+            op_kwarg = f", op0={value_to_nki(op_str)}"
 
         shape_str = repr(stmt.output.shape)
         return [

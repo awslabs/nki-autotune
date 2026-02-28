@@ -51,7 +51,7 @@ SINGLE_TILE_MATMUL = _P(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 128))),
     (
-        _S("np_empty", (("dtype", "np.float32"),), _T("output", (128, 128), _FULL_128x128)),
+        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("b", (128, 128), _FULL_128x128)),), _T("_t1", (128, 128), _FULL_128x128)),
         _S(
@@ -74,7 +74,7 @@ ACCUM_MATMUL = _P(
     ("a", "b"),
     (("a", (256, 128)), ("b", (256, 128))),
     (
-        _S("np_empty", (("dtype", "np.float32"),), _T("output", (128, 128), _FULL_128x128)),
+        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("a", (256, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("b", (256, 128), _FULL_128x128)),), _T("_t1", (128, 128), _FULL_128x128)),
         _S(
@@ -108,7 +108,7 @@ ELEMENTWISE_PROGRAM = _P(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 128))),
     (
-        _S("np_empty", (("dtype", "np.float32"),), _T("output", (128, 128), _FULL_128x128)),
+        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("b", (128, 128), _FULL_128x128)),), _T("_t1", (128, 128), _FULL_128x128)),
         _S(
@@ -116,7 +116,7 @@ ELEMENTWISE_PROGRAM = _P(
             (
                 ("data1", _T("_t0", (128, 128), _FULL_128x128)),
                 ("data2", _T("_t1", (128, 128), _FULL_128x128)),
-                ("op", "np.multiply"),
+                ("op", np.multiply),
             ),
             _T("_t2", (128, 128), _FULL_128x128),
         ),
@@ -135,7 +135,7 @@ TENSOR_SCALAR_PROGRAM = _P(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 1))),
     (
-        _S("np_empty", (("dtype", "np.float32"),), _T("out", (128, 128), _FULL_128x128)),
+        _S("np_empty", (("dtype", np.float32),), _T("out", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("b", (128, 1), ((0, 128), (0, 1)))),), _T("_t1", (128, 1), ((0, 128), (0, 1)))),
         _S(
@@ -143,7 +143,7 @@ TENSOR_SCALAR_PROGRAM = _P(
             (
                 ("data", _T("_t0", (128, 128), _FULL_128x128)),
                 ("operand0", _T("_t1", (128, 1), ((0, 128), (0, 1)))),
-                ("op", "np.add"),
+                ("op", np.add),
             ),
             _T("_t2", (128, 128), _FULL_128x128),
         ),
@@ -162,11 +162,11 @@ ACTIVATION_PROGRAM = _P(
     ("a",),
     (("a", (128, 128)),),
     (
-        _S("np_empty", (("dtype", "np.float32"),), _T("out", (128, 128), _FULL_128x128)),
+        _S("np_empty", (("dtype", np.float32),), _T("out", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
         _S(
             "activation",
-            (("data", _T("_t0", (128, 128), _FULL_128x128)), ("op", "np.tanh")),
+            (("data", _T("_t0", (128, 128), _FULL_128x128)), ("op", np.tanh)),
             _T("_t1", (128, 128), _FULL_128x128),
         ),
         _S(
@@ -186,7 +186,7 @@ TRANSPOSE_PROGRAM = _P(
     ("a",),
     (("a", (128, 64)),),
     (
-        _S("np_empty", (("dtype", "np.float32"),), _T("out", (64, 128), (_64, _128))),
+        _S("np_empty", (("dtype", np.float32),), _T("out", (64, 128), (_64, _128))),
         _S("np_slice", (("src", _T("a", (128, 64), (_128, _64))),), _T("_t0", (128, 64), (_128, _64))),
         _S("nc_transpose", (("data", _T("_t0", (128, 64), (_128, _64))),), _T("_t1", (64, 128), (_64, _128))),
         _S(
@@ -204,7 +204,7 @@ MULTI_TILE_PROGRAM = _P(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        _S("np_empty", (("dtype", "np.float32"),), _T("output", (128, 256), (_128, (0, 256)))),
+        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 256), (_128, (0, 256)))),
         _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("b", (128, 256), (_128, _128))),), _T("_t1", (128, 128), _FULL_128x128)),
         _S(
@@ -242,7 +242,7 @@ MERGED_LOAD_MATMUL = _P(
     ("a", "b"),
     (("a", (256, 256)), ("b", (256, 256))),
     (
-        _S("np_empty", (("dtype", "np.float32"),), _T("output", (128, 128), _FULL_128x128)),
+        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
         _S("np_slice", (("src", _T("a", (256, 256), (_128, _256))),), _T("_t0", (128, 256), (_128, _256))),
         _S("np_slice", (("src", _T("b", (256, 256), (_128, _256))),), _T("_t1", (128, 256), (_128, _256))),
         _S(
@@ -315,9 +315,9 @@ def test_psum_staging() -> None:
     """Store of matmul result stages through SBUF via tensor_copy."""
     code = lower_to_nki(SINGLE_TILE_MATMUL)
 
-    assert _has_line(code, r"_staging_0 = nl\.ndarray\(.*, buffer=nl\.sbuf\)")
-    assert _has_line(code, r"nisa\.tensor_copy\(dst=_staging_0\[0:128, 0:128\], src=_t2\[0:128, 0:128\]\)")
-    assert _has_line(code, r"nisa\.dma_copy\(dst=output\[0:128, 0:128\], src=_staging_0\[0:128, 0:128\]\)")
+    assert _has_line(code, r"tensor_0 = nl\.ndarray\(.*, buffer=nl\.sbuf\)")
+    assert _has_line(code, r"nisa\.tensor_copy\(dst=tensor_0\[0:128, 0:128\], src=_t2\[0:128, 0:128\]\)")
+    assert _has_line(code, r"nisa\.dma_copy\(dst=output\[0:128, 0:128\], src=tensor_0\[0:128, 0:128\]\)")
 
 
 def test_sbuf_direct_store() -> None:

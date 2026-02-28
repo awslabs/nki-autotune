@@ -2,8 +2,9 @@
 
 import numpy as np
 
-from nkigym.codegen.context import get_kwarg
+from nkigym.codegen.context import _LoweringContext, get_kwarg, value_to_nki
 from nkigym.ir.tensor import TensorRef
+from nkigym.ir.types import GymStatement
 from nkigym.ops.base import GymOp, Tensor
 
 
@@ -17,24 +18,28 @@ class EmptyOp(GymOp):
     inputs = ()
     outputs = (Tensor("result", ("P", "F")),)
 
-    def simulate(self, *, shape0: object, shape1: object, dtype: object, **kwargs: object) -> np.ndarray:
-        """Allocate an empty array.
+    @classmethod
+    def simulate(cls, *args: np.ndarray, **kwargs: object) -> np.ndarray:
+        """Allocate an empty array using output_shape and dtype from kwargs.
 
         Args:
-            shape0: First dimension size (resolved to int).
-            shape1: Second dimension size (resolved to int).
-            dtype: Numpy dtype (resolved from string like ``np.float32``).
+            *args: Unused (EmptyOp has no inputs).
+            **kwargs: Must include ``output_shape`` and ``dtype``.
 
         Returns:
             Uninitialized numpy array of the given shape and dtype.
         """
-        return np.empty((int(shape0), int(shape1)), dtype=dtype)
+        dtype = np.dtype(kwargs["dtype"])  # type: ignore[arg-type]
+        shape: tuple[int, ...] = kwargs["output_shape"]  # type: ignore[assignment]
+        return np.empty(shape, dtype=dtype)
 
-    def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    @classmethod
+    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
         """Not used for EmptyOp since shape comes from kwargs."""
         raise NotImplementedError("EmptyOp shape is determined by kwargs, not input shapes")
 
-    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+    @classmethod
+    def to_nki(cls, stmt: GymStatement, ctx: _LoweringContext) -> list[str]:  # type: ignore[override]
         """Lower np_empty to ``nl.ndarray(..., buffer=nl.shared_hbm)``.
 
         Args:
@@ -47,7 +52,7 @@ class EmptyOp(GymOp):
         dtype = get_kwarg(stmt, "dtype")
         if dtype is None:
             raise ValueError(f"np_empty for '{stmt.output.name}' missing dtype kwarg")
-        dtype_str = str(dtype).replace("np.", "nl.")
+        dtype_str = value_to_nki(dtype)
         shape_str = repr(stmt.output.shape)
         name = stmt.output.name
         ctx.buffers[name] = "SHARED_HBM"
@@ -64,29 +69,34 @@ class SliceOp(GymOp):
     inputs = (Tensor("src", ("P", "F")),)
     outputs = (Tensor("result", ("P", "F")),)
 
-    def simulate(
-        self, src: np.ndarray, *, start0: object, stop0: object, start1: object, stop1: object, **kwargs: object
-    ) -> np.ndarray:
-        """Extract a 2D slice from the source array.
+    @classmethod
+    def simulate(cls, *args: np.ndarray, **kwargs: object) -> np.ndarray:
+        """Return the pre-sliced source array.
+
+        The caller (GymProgram.__call__) resolves TensorRef slices before
+        dispatching, so the source is already the correct view.
 
         Args:
-            src: Source numpy array.
-            start0: Row start index.
-            stop0: Row stop index.
-            start1: Column start index.
-            stop1: Column stop index.
+            *args: Single source array (already sliced by the resolver).
+            **kwargs: Ignored.
 
         Returns:
-            Sliced view of the source array.
+            The source array unchanged.
         """
-        return src[int(start0) : int(stop0), int(start1) : int(stop1)]
+        return args[0]
 
-    def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    @classmethod
+    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
         """Not used for SliceOp since shape comes from kwargs."""
         raise NotImplementedError("SliceOp shape is determined by kwargs, not input shapes")
 
-    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
-        """Lower np_slice to SBUF alloc + dma_copy.
+    @classmethod
+    def to_nki(cls, stmt: GymStatement, ctx: _LoweringContext) -> list[str]:  # type: ignore[override]
+        """Lower np_slice to indexing or DMA copy.
+
+        SBUF and PSUM sources use pure indexing (buffer inherited from
+        source).  HBM sources require explicit SBUF allocation and
+        ``nisa.dma_copy`` because NKI does not support direct HBM indexing.
 
         Args:
             stmt: The np_slice statement.
@@ -101,13 +111,14 @@ class SliceOp(GymOp):
 
         src_buffer = ctx.buffer_of(src_ref.name)
         out_name = stmt.output.name
-        shape_str = repr(stmt.output.shape)
         src_subscript = ctx.subscript(src_ref)
 
-        out_sub = ctx.subscript(stmt.output)
-        ctx.buffers[out_name] = "SBUF"
-        lines = [f"{out_name} = {src_subscript}"]
-        if src_buffer != "SBUF":
+        lines: list[str] = [f"{out_name} = {src_subscript}"]
+        ctx.buffers[out_name] = src_buffer
+        if src_buffer in ("HBM", "SHARED_HBM"):
+            ctx.buffers[out_name] = "SBUF"
+            shape_str = repr(stmt.output.shape)
+            out_sub = ctx.subscript(stmt.output)
             lines = [
                 f"{out_name} = nl.ndarray({shape_str}, dtype={ctx.dtype}, buffer=nl.sbuf)",
                 f"nisa.dma_copy(dst={out_sub}, src={src_subscript})",
@@ -127,38 +138,32 @@ class StoreOp(GymOp):
     inputs = (Tensor("src", ("P", "F")), Tensor("dst", ("P", "F")))
     outputs = (Tensor("result", ("P", "F")),)
 
-    def simulate(
-        self,
-        src: np.ndarray,
-        dst: np.ndarray,
-        *,
-        start0: object,
-        stop0: object,
-        start1: object,
-        stop1: object,
-        **kwargs: object,
-    ) -> np.ndarray:
-        """Write src into a slice of dst.
+    @classmethod
+    def simulate(cls, *args: np.ndarray, **kwargs: object) -> np.ndarray:
+        """Write src into dst_view via mutation, return None.
+
+        The caller resolves both ``src`` and ``dst`` TensorRefs before
+        dispatching.  ``args[1]`` is a pre-sliced numpy view of the
+        destination; mutation through the view updates the original
+        array in the environment.
 
         Args:
-            src: Source tile array.
-            dst: Destination array to write into.
-            start0: Row start index in dst.
-            stop0: Row stop index in dst.
-            start1: Column start index in dst.
-            stop1: Column stop index in dst.
+            *args: ``(src_tile, dst_view)`` — source data and destination view.
+            **kwargs: Ignored.
 
         Returns:
-            The dst array (mutated in place).
+            None to signal no env assignment needed.
         """
-        dst[int(start0) : int(stop0), int(start1) : int(stop1)] = src
-        return dst
+        args[1][:] = args[0]
+        return None  # type: ignore[return-value]
 
-    def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    @classmethod
+    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
         """Not used for StoreOp since shape comes from kwargs."""
         raise NotImplementedError("StoreOp shape is determined by kwargs, not input shapes")
 
-    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+    @classmethod
+    def to_nki(cls, stmt: GymStatement, ctx: _LoweringContext) -> list[str]:  # type: ignore[override]
         """Lower np_store to dma_copy, with PSUM staging if needed.
 
         Args:
@@ -182,8 +187,8 @@ class StoreOp(GymOp):
 
         lines: list[str] = [f"nisa.dma_copy(dst={dst_subscript}, src={src_subscript})"]
         if src_buffer == "PSUM":
-            staging_name = f"_staging_{ctx.staging_counter}"
-            ctx.staging_counter += 1
+            staging_name = f"tensor_{ctx.tensor_counter}"
+            ctx.tensor_counter += 1
             shape_str = repr(src_ref.shape)
             parts = ", ".join(f"0:{s}" for s in src_ref.shape)
             staging_sub = f"{staging_name}[{parts}]"

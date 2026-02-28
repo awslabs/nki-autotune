@@ -2,8 +2,9 @@
 
 import numpy as np
 
-from nkigym.codegen.context import get_kwarg
+from nkigym.codegen.context import _LoweringContext, get_kwarg
 from nkigym.ir.tensor import TensorRef
+from nkigym.ir.types import GymStatement
 from nkigym.ops.base import GymOp, Tensor
 
 
@@ -19,7 +20,8 @@ class MatmulOp(GymOp):
     outputs = (Tensor("result", ("M", "N")),)
     tile_limits = {"K": 128, "M": 128, "N": 512}
 
-    def simulate(self, stationary: np.ndarray, moving: np.ndarray, **kwargs: object) -> np.ndarray:
+    @classmethod
+    def simulate(cls, stationary: np.ndarray, moving: np.ndarray, **kwargs: object) -> np.ndarray:  # type: ignore[override]
         """Compute stationary.T @ moving, optionally accumulating.
 
         Upcasts to float32 for accumulation to match NKI PSUM hardware
@@ -37,10 +39,11 @@ class MatmulOp(GymOp):
         acc = kwargs.get("acc")
         result = np.matmul(stationary.astype(np.float32).T, moving.astype(np.float32))
         if acc is not None:
-            result = acc.astype(np.float32) + result
+            result = acc.astype(np.float32) + result  # type: ignore[union-attr]
         return result
 
-    def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    @classmethod
+    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
         """Compute output shape: [K,M] x [K,N] -> [M,N].
 
         Args:
@@ -51,7 +54,8 @@ class MatmulOp(GymOp):
         """
         return (input_shapes[0][1], input_shapes[1][1])
 
-    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+    @classmethod
+    def to_nki(cls, stmt: GymStatement, ctx: _LoweringContext) -> list[str]:  # type: ignore[override]
         """Lower nc_matmul to PSUM alloc + nisa.nc_matmul, or accumulate.
 
         Args:

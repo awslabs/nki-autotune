@@ -488,8 +488,8 @@ def _check_compute_pair(
     dim, merged = adj
     merged_size = merged[1] - merged[0]
 
-    op_instance = GymOp.get(stmt_a.op)()
-    if not op_instance.can_merge_operand_dim(operand_pos, dim, merged_size):
+    op_cls = GymOp.get(stmt_a.op)
+    if not op_cls.can_merge_operand_dim(operand_pos, dim, merged_size):
         return None
 
     trial_args: list[object] = []
@@ -502,15 +502,10 @@ def _check_compute_pair(
             else:
                 shape = tuple(e - s for s, e in v.slices)
             trial_args.append(np.zeros(shape, dtype=np.float32))
-        elif isinstance(v, str):
-            try:
-                trial_args.append(float(v))
-            except ValueError:
-                continue
-        else:
+        elif isinstance(v, (int, float)):
             trial_args.append(v)
     try:
-        op_instance.simulate(*trial_args)
+        op_cls.simulate(*trial_args)  # type: ignore[arg-type]
     except (ValueError, TypeError):
         return None
 

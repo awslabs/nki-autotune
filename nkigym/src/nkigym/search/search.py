@@ -28,7 +28,6 @@ from nkigym.search.compile import (  # noqa: F401
     _capture_error,
     run_on_hardware,
 )
-from nkigym.search.interpret import interpret_program
 from nkigym.search.mac_count import compute_mac_count
 from nkigym.search.report import SearchReport
 from nkigym.tiling import tile_program
@@ -180,8 +179,8 @@ class _TransformGraph:
 
 
 def _verify_node(node: _Node, kernel_kwargs: dict[str, Any], expected: np.ndarray, tol: float) -> None:
-    """Interpret a node's program directly and check numerical correctness."""
-    actual = interpret_program(node.program, kernel_kwargs)
+    """Execute a node's program and check numerical correctness."""
+    actual = node.program(**kernel_kwargs)
     if np.max(np.abs(actual - expected)) > tol:
         raise AssertionError("Variant failed numerical verification")
 
@@ -431,7 +430,7 @@ def search(
     logger.info("Search root: %d stmts, %d opportunities", len(program.stmts), len(graph.nodes[program].opportunities))
 
     pool = _make_pool(program, kernel_kwargs, expected, save_cache)
-    tol = 1e-4 + 1e-4 * float(np.max(np.abs(expected)))
+    tol = 1e-3 + 1e-3 * float(np.max(np.abs(expected)))
     ctx = _SearchContext(
         save_cache=save_cache, kernel_kwargs=kernel_kwargs, expected=expected, pool=pool, report=report, tol=tol
     )

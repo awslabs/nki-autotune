@@ -9,7 +9,7 @@ BEFORE_MATMUL_POST_REUSE_1X2 = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -68,7 +68,7 @@ AFTER_POST_REUSE_1X2 = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -106,7 +106,7 @@ BEFORE_MATMUL_POST_REUSE_1X4 = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 512))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 512), ((0, 128), (0, 512)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 512), ((0, 128), (0, 512)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -207,7 +207,7 @@ AFTER_POST_REUSE_1X4 = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 512))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 512), ((0, 128), (0, 512)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 512), ((0, 128), (0, 512)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -245,7 +245,7 @@ BEFORE_MATMUL_POST_REUSE_2X2 = GymProgram(
     ("a", "b"),
     (("a", (128, 256)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 128)))),),
@@ -341,7 +341,7 @@ AFTER_POST_REUSE_2X2_PARTIAL = GymProgram(
     ("a", "b"),
     (("a", (128, 256)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 256)))),),
@@ -427,7 +427,7 @@ AFTER_POST_REUSE_2X2 = GymProgram(
     ("a", "b"),
     (("a", (128, 256)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (256, 256), ((0, 256), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 256)))),),

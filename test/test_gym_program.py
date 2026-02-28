@@ -32,7 +32,7 @@ class TestSourceToProgram:
 
         program = source_to_program(callable_to_source(fn), {"x": (64, 64)}, np.float32)
         stmt = program.stmts[0]
-        assert stmt.kwargs == (("data", TensorRef("x", (64, 64), ((0, 64), (0, 64)))), ("op", "np.tanh"))
+        assert stmt.kwargs == (("data", TensorRef("x", (64, 64), ((0, 64), (0, 64)))), ("op", np.tanh))
 
     def test_tensor_tensor_with_op_kwarg(self) -> None:
         """Verify tensor_tensor captures op kwarg."""
@@ -45,7 +45,7 @@ class TestSourceToProgram:
         assert stmt.kwargs == (
             ("data1", TensorRef("a", (64, 64), ((0, 64), (0, 64)))),
             ("data2", TensorRef("b", (64, 64), ((0, 64), (0, 64)))),
-            ("op", "np.multiply"),
+            ("op", np.multiply),
         )
 
     def test_tensor_scalar_with_op_kwarg(self) -> None:
@@ -58,7 +58,7 @@ class TestSourceToProgram:
         stmt = program.stmts[0]
         assert stmt.kwargs[0] == ("data", TensorRef("data", (64, 64), ((0, 64), (0, 64))))
         assert stmt.kwargs[1] == ("operand0", TensorRef("scale", (), ()))
-        assert stmt.kwargs[2] == ("op", "np.add")
+        assert stmt.kwargs[2] == ("op", np.add)
 
     def test_transpose_no_kwargs(self) -> None:
         """Verify nc_transpose has only positional-mapped kwargs."""
@@ -82,7 +82,7 @@ class TestSourceToProgram:
         assert program.stmts[0].output == TensorRef("t", (64, 32), ((0, 64), (0, 32)))
         assert program.stmts[1].op == "activation"
         assert program.stmts[1].kwargs[0] == ("data", TensorRef("t", (64, 32), ((0, 64), (0, 32))))
-        assert program.stmts[1].kwargs[1] == ("op", "np.tanh")
+        assert program.stmts[1].kwargs[1] == ("op", np.tanh)
 
     def test_program_is_hashable(self) -> None:
         """Verify GymProgram remains hashable."""
@@ -186,7 +186,7 @@ class TestProgramExecution:
 
     @pytest.mark.parametrize(
         "op_attr,np_func",
-        [("np.add", np.add), ("np.multiply", np.multiply), ("np.subtract", np.subtract)],
+        [(np.add, np.add), (np.multiply, np.multiply), (np.subtract, np.subtract)],
         ids=["add", "multiply", "subtract"],
     )
     def test_tensor_tensor(self, op_attr: str, np_func) -> None:

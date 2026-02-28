@@ -154,15 +154,15 @@ Added a `dump_cache: dict[int, str]` keyed by `id(stmt)` → `ast.dump(stmt)`, c
 
 **Why correct:** Within a single `_find_best_run` invocation, the AST is not modified — mutations only happen in `_build_for` after the best run is selected, and each `_roll_once` call re-parses the source fresh. So `id(stmt)` is stable and the cached dump remains valid for the duration of the search. The `dump_cache` is local to `_find_best_run` and discarded after each call, so no stale entries persist across rolling iterations.
 
-#### 3. Direct IR interpreter for verification (13s → 1.5s)
+#### 3. Direct IR execution for verification (13s → 1.5s)
 
-`search/interpret.py` (new, 105 lines), `search/search.py:_verify_node` (line 183)
+`ir/types.py:GymStatement.__call__`, `search/search.py:_verify_node` (line 183)
 
 The old `_verify_node` called `program_to_source` (IR → Python source string) → `source_to_callable` (source → `exec` → extract function) → `func(**kwargs)` for each of the 1,601 unique programs. The `exec` call alone took 5.1s; `program_to_source` added 1.9s.
 
-Replaced with `interpret_program`, which walks `GymProgram.stmts` directly and dispatches each statement to `GymOp.simulate()`. `np_empty` → `np.empty`, `np_slice` → numpy slicing, `np_store` → numpy assignment, compute ops → `GymOp.get(op).simulate(*args, **kwargs)`. `GymOp` instances are cached in a module-level `_OP_CACHE` dict to avoid repeated instantiation.
+Replaced with `GymProgram.__call__(**kernel_kwargs)`, which iterates statements directly: each `GymStatement.__call__(env)` resolves its own TensorRef kwargs via `_resolve_args`, dispatches to `GymOp.get(op)().simulate()`, and writes the result to env. GymOp is stateless (no instance caching needed).
 
-**Why correct:** `interpret_program` calls the exact same `GymOp.simulate()` methods as the original `source_to_callable` path. The generated source code is a mechanical rendering of the IR — each statement maps 1:1 to the interpreter's dispatch. The interpreter handles all IR operations: `np_empty`, `np_slice`, `np_store`, and compute ops (including `acc` keyword for accumulation). Slicing uses the same `(start, stop)` tuples from `TensorRef.slices`. The interpreter was validated against the original path: all 196 tests pass and all 1,601 unique programs produce identical results.
+**Why correct:** `GymStatement.__call__` calls the exact same `GymOp.simulate()` methods as the original `source_to_callable` path. The generated source code is a mechanical rendering of the IR — each statement maps 1:1 to the dispatcher. All IR operations (tiling + compute) go through the same uniform path. Slicing uses `TensorRef.to_slices()` to convert `(start, stop)` pairs. Validated against the original path: all 196 tests pass and all 1,601 unique programs produce identical results.
 
 #### 4. Replace `np.testing.assert_allclose` with direct numpy (7s → ~0.1s)
 
@@ -170,7 +170,7 @@ Replaced with `interpret_program`, which walks `GymProgram.stmts` directly and d
 
 `np.testing.assert_allclose` builds detailed error messages (including per-element mismatch reports) on every call, even when the assertion passes. Replaced with `np.max(np.abs(actual - expected)) > tol`, which short-circuits without allocating error strings.
 
-Tolerance is precomputed once as `tol = 1e-4 + 1e-4 * float(np.max(np.abs(expected)))`, matching the semantics of `rtol=1e-4, atol=1e-4` in `assert_allclose` (which checks `|actual - expected| <= atol + rtol * |expected|`). The precomputed `tol` uses the maximum of `|expected|` as a conservative upper bound, stored in `_SearchContext.tol` to avoid recomputation per node.
+Tolerance is precomputed once as `tol = 1e-3 + 1e-3 * float(np.max(np.abs(expected)))`, matching the semantics of `rtol=1e-3, atol=1e-3` in `assert_allclose` (which checks `|actual - expected| <= atol + rtol * |expected|`). The `1e-3` level is needed because tiled matmul accumulates K-dimension sub-products separately — float32 intermediate results can differ enough to round to adjacent float16 values (one ULP ~0.015 for values ~25). The precomputed `tol` uses the maximum of `|expected|` as a conservative upper bound, stored in `_SearchContext.tol` to avoid recomputation per node.
 
 **Why correct:** The tolerance formula `atol + rtol * max(|expected|)` is strictly looser than the per-element `atol + rtol * |expected[i]|` check in `assert_allclose`. Any pair passing `assert_allclose` also passes this check. The converse is not guaranteed, but in practice the difference is negligible for the uniform-magnitude matrices produced by tiled matmul.
 

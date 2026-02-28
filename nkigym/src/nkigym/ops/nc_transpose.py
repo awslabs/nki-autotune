@@ -2,8 +2,9 @@
 
 import numpy as np
 
-from nkigym.codegen.context import get_kwarg
+from nkigym.codegen.context import _LoweringContext, get_kwarg
 from nkigym.ir.tensor import TensorRef
+from nkigym.ir.types import GymStatement
 from nkigym.ops.base import GymOp, Tensor
 
 
@@ -14,7 +15,8 @@ class NcTransposeOp(GymOp):
     inputs = (Tensor("data", ("P", "F")),)
     outputs = (Tensor("result", ("F", "P")),)
 
-    def simulate(self, data: np.ndarray, **kwargs: object) -> np.ndarray:
+    @classmethod
+    def simulate(cls, data: np.ndarray, **kwargs: object) -> np.ndarray:  # type: ignore[override]
         """Transpose the input array.
 
         Args:
@@ -25,7 +27,8 @@ class NcTransposeOp(GymOp):
         """
         return np.transpose(data)
 
-    def output_shape(self, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
+    @classmethod
+    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
         """Compute output shape: [P, F] -> [F, P].
 
         Args:
@@ -36,7 +39,8 @@ class NcTransposeOp(GymOp):
         """
         return (input_shapes[0][1], input_shapes[0][0])
 
-    def to_nki(self, stmt: "GymStatement", ctx: "_LoweringContext") -> list[str]:
+    @classmethod
+    def to_nki(cls, stmt: GymStatement, ctx: _LoweringContext) -> list[str]:  # type: ignore[override]
         """Lower nc_transpose to ``nisa.nc_transpose``.
 
         Args:

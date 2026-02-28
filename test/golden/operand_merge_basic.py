@@ -9,7 +9,7 @@ BEFORE_NO_ADJACENT_LOADS = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 384))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 384), ((0, 128), (0, 384)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 384), ((0, 128), (0, 384)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -73,7 +73,7 @@ BEFORE_SINGLE_SUBGRAPH = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 128))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -111,7 +111,7 @@ BEFORE_DIFFERENT_SOURCE_TENSORS = GymProgram(
     ("a", "b", "c"),
     (("a", (128, 128)), ("b", (128, 128)), ("c", (128, 128))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -175,7 +175,7 @@ BEFORE_DIFFERENT_PARTITION_SLICES = GymProgram(
     ("a", "b"),
     (("a", (256, 128)), ("b", (128, 128))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (256, 128), ((0, 256), (0, 128)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (256, 128), ((0, 256), (0, 128)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),),
@@ -239,7 +239,7 @@ BEFORE_ADJACENT_LOADS_2X = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -303,7 +303,7 @@ AFTER_ADJACENT_LOADS_2X_PARTIAL = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
@@ -362,7 +362,7 @@ AFTER_ADJACENT_LOADS_2X = GymProgram(
     ("a", "b"),
     (("a", (128, 128)), ("b", (128, 256))),
     (
-        GymStatement("np_empty", (("dtype", "np.float32"),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
             "np_slice",
             (("src", TensorRef("a", (128, 128), ((0, 128), (0, 128)))),),
