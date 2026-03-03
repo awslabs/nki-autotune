@@ -9,7 +9,7 @@ from nkigym.ops.matmul import MatmulOp
 from nkigym.ops.nc_transpose import NcTransposeOp
 from nkigym.ops.tensor_scalar import TensorScalarOp
 from nkigym.ops.tensor_tensor import TensorTensorOp
-from nkigym.ops.tiling_ops import EmptyOp, SliceOp, StoreOp
+from nkigym.ops.tiling_ops import AllocateOp, IndexingOp, LoadOp, StoreOp
 
 __all__ = [
     "GymOp",
@@ -19,7 +19,8 @@ __all__ = [
     "ActivationOp",
     "TensorTensorOp",
     "TensorScalarOp",
-    "EmptyOp",
-    "SliceOp",
+    "AllocateOp",
+    "LoadOp",
+    "IndexingOp",
     "StoreOp",
 ]

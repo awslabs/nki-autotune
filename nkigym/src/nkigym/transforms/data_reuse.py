@@ -16,6 +16,7 @@ Example::
 from itertools import combinations
 
 from nkigym.ir import GymProgram, GymStatement, TensorRef
+from nkigym.ops.tiling_ops import LoadOp
 from nkigym.transforms.base import Transform
 
 
@@ -72,7 +73,7 @@ def _validate_merge_pair(program: GymProgram, keep: str, drop: str) -> None:
     """
     load_sources: dict[str, tuple[str, tuple[tuple[int, int], ...]]] = {}
     for stmt in program.stmts:
-        if stmt.op == "np_slice":
+        if stmt.op is LoadOp:
             src_ref = stmt.kwargs[0][1]
             load_sources[stmt.output.name] = (src_ref.name, src_ref.slices)
     for tensor_name in (keep, drop):
@@ -119,7 +120,7 @@ class DataReuseTransform(Transform):
         """
         load_groups: dict[tuple[str, tuple[tuple[int, int], ...]], list[str]] = {}
         for stmt in program.stmts:
-            if stmt.op != "np_slice":
+            if stmt.op is not LoadOp:
                 continue
             src_ref = None
             for key, value in stmt.kwargs:
@@ -161,7 +162,7 @@ class DataReuseTransform(Transform):
         rename_map = {drop: keep}
         new_stmts: list[GymStatement] = []
         for stmt in program.stmts:
-            if stmt.op == "np_slice" and stmt.output.name == drop:
+            if stmt.op is LoadOp and stmt.output.name == drop:
                 continue
             new_stmts.append(
                 GymStatement(
@@ -173,8 +174,7 @@ class DataReuseTransform(Transform):
 
         return GymProgram(
             name=program.name,
-            params=program.params,
-            input_shapes=program.input_shapes,
+            kwargs=program.kwargs,
             stmts=tuple(new_stmts),
             return_var=program.return_var,
             output_dtype=program.output_dtype,

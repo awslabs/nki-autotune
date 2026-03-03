@@ -18,9 +18,10 @@ from typing import Any
 
 import numpy as np
 
-from nkigym.codegen.gym_to_nki import lower_to_nki
-from nkigym.codegen.loop_rolling import roll_loops
-from nkigym.ir import GymProgram, program_to_source, source_to_program
+from nkigym.function_to_program import program_to_source, source_to_program, tile_program
+from nkigym.ir import GymProgram
+from nkigym.program_to_nki.gym_to_nki import lower_to_nki
+from nkigym.program_to_nki.loop_rolling import roll_loops
 from nkigym.search.compile import (  # noqa: F401
     CompilationPool,
     SearchResults,
@@ -30,7 +31,6 @@ from nkigym.search.compile import (  # noqa: F401
 )
 from nkigym.search.mac_count import compute_mac_count
 from nkigym.search.report import SearchReport
-from nkigym.tiling import tile_program
 from nkigym.transforms.base import Transform
 from nkigym.utils import callable_to_source, import_func
 
@@ -286,9 +286,8 @@ def _prepare_root(func: Callable, save_cache: Path, kernel_kwargs: dict[str, Any
     imported_func = import_func(input_path, func.__name__)
     output_dtype = next(iter(kernel_kwargs.values())).dtype
     expected = imported_func(**kernel_kwargs).astype(output_dtype)
-    input_shapes = {k: v.shape for k, v in kernel_kwargs.items()}
     source = callable_to_source(func)
-    program = tile_program(source_to_program(source, input_shapes, output_dtype))
+    program = tile_program(source_to_program(source, kernel_kwargs))
     (gym_dir / "nkigym_root.py").write_text(program_to_source(program))
     return program, expected
 

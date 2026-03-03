@@ -8,7 +8,7 @@ import pytest
 from conftest import make_random_array, normalize_source
 from golden.loop_rolling import CASES, to_source
 
-from nkigym.codegen.loop_rolling import _roll_once, roll_loops
+from nkigym.program_to_nki.loop_rolling import _roll_once, roll_loops
 from nkigym.utils import source_to_callable
 
 

@@ -10,7 +10,6 @@ from itertools import product
 
 from nkigym.ir.tensor import TensorRef, ref_name
 from nkigym.ir.types import GymProgram, GymStatement
-from nkigym.ops.base import GymOp
 
 TILE_SIZE = 128
 OUTPUT_TENSOR_NAME = "output"
@@ -198,7 +197,7 @@ def analyze_tiling(program: GymProgram) -> TilingAnalysis:
         analysis.var_shapes[param] = shape
 
     for stmt in program.stmts:
-        op_cls = GymOp.get(stmt.op)
+        op_cls = stmt.op
         n_inputs = len(op_cls.inputs)
         tensor_kwargs = stmt.kwargs[:n_inputs]
 

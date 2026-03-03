@@ -24,10 +24,10 @@ from typing import Any
 import numpy as np
 
 from nkigym.ir import GymProgram, GymStatement, TensorRef
-from nkigym.ops import GymOp
+from nkigym.ops.tiling_ops import AllocateOp, LoadOp, StoreOp
 from nkigym.transforms.base import Transform
 
-TILING_OPS = frozenset({"np_slice", "np_store", "np_empty"})
+TILING_OPS = frozenset({LoadOp, StoreOp, AllocateOp})
 
 
 def _is_compute(stmt: GymStatement) -> bool:
@@ -58,7 +58,7 @@ def _get_kwarg_ref(stmt: GymStatement, key: str) -> TensorRef:
     for k, v in stmt.kwargs:
         if k == key:
             return v
-    raise ValueError(f"{stmt.op} statement missing '{key}' kwarg")
+    raise ValueError(f"{stmt.op.op_name} statement missing '{key}' kwarg")
 
 
 def _is_identity(ref: TensorRef) -> bool:
@@ -202,9 +202,9 @@ class StmtIndex:
         usage: dict[str, set[int]] = {}
 
         for i, stmt in enumerate(stmts):
-            if stmt.op == "np_slice":
+            if stmt.op is LoadOp:
                 loads_by_output[stmt.output.name] = i
-            elif stmt.op == "np_store":
+            elif stmt.op is StoreOp:
                 src_ref = _get_kwarg_ref(stmt, "src")
                 stores_by_src[src_ref.name] = i
 
@@ -312,7 +312,7 @@ def _find_load_merge_opportunities(index: StmtIndex) -> list[MergeOpportunity]:
         List of MergeOpportunity for loads.
     """
     stmts = index.stmts
-    loads = [(i, stmt) for i, stmt in enumerate(stmts) if stmt.op == "np_slice"]
+    loads = [(i, stmt) for i, stmt in enumerate(stmts) if stmt.op is LoadOp]
     if len(loads) < 2:
         return []
 
@@ -395,7 +395,7 @@ def _find_compute_merge_opportunities(index: StmtIndex) -> list[MergeOpportunity
     if len(compute_stmts) < 2:
         return []
 
-    op_groups: dict[str, list[tuple[int, GymStatement]]] = {}
+    op_groups: dict[type, list[tuple[int, GymStatement]]] = {}
     for entry in compute_stmts:
         op_groups.setdefault(entry[1].op, []).append(entry)
 
@@ -488,7 +488,7 @@ def _check_compute_pair(
     dim, merged = adj
     merged_size = merged[1] - merged[0]
 
-    op_cls = GymOp.get(stmt_a.op)
+    op_cls = stmt_a.op
     if not op_cls.can_merge_operand_dim(operand_pos, dim, merged_size):
         return None
 
@@ -513,14 +513,14 @@ def _check_compute_pair(
     second_idx = max(idx_a, idx_b)
 
     return MergeOpportunity(
-        op_type=stmt_a.op,
+        op_type=stmt_a.op.op_name,
         stmt_a=first_idx,
         stmt_b=second_idx,
         differing_operand_idx=diff_idx,
         differing_dim=dim,
         merged_slice=merged,
         description=(
-            f"Merge {stmt_a.op} at stmt {first_idx} and "
+            f"Merge {stmt_a.op.op_name} at stmt {first_idx} and "
             f"{second_idx} on arg {diff_idx} "
             f"[dim {dim}: {slices_a[dim]} + {slices_b[dim]} -> {merged}]"
         ),
@@ -537,9 +537,7 @@ def _replace_stmts(program: GymProgram, new_stmts: tuple[GymStatement, ...]) -> 
     Returns:
         New GymProgram with updated statements.
     """
-    return GymProgram(
-        program.name, program.params, program.input_shapes, new_stmts, program.return_var, program.output_dtype
-    )
+    return GymProgram(program.name, program.kwargs, new_stmts, program.return_var, program.output_dtype)
 
 
 def _remap_ref(ref: TensorRef, subscript_map: dict[str, tuple[tuple[int, int], ...]]) -> TensorRef:
@@ -661,7 +659,7 @@ def _compute_output_dim(stmt: GymStatement, diff_idx: int, diff_dim: int) -> int
     Returns:
         Output dimension index, or None if no mapping exists.
     """
-    op_cls = GymOp.get(stmt.op)
+    op_cls = stmt.op
     operand_pos = sum(1 for i, (_, v) in enumerate(stmt.kwargs) if isinstance(v, TensorRef) and i < diff_idx)
     input_axes = op_cls.inputs[operand_pos].axes if operand_pos < len(op_cls.inputs) else ()
     output_axes = op_cls.outputs[0].axes
@@ -921,7 +919,7 @@ def _find_store_merge_opportunities(index: StmtIndex) -> list[MergeOpportunity]:
         List of MergeOpportunity for stores.
     """
     stmts = index.stmts
-    stores = [(i, stmt) for i, stmt in enumerate(stmts) if stmt.op == "np_store"]
+    stores = [(i, stmt) for i, stmt in enumerate(stmts) if stmt.op is StoreOp]
     if len(stores) < 2:
         return []
 

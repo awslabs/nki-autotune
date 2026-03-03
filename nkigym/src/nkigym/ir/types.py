@@ -16,12 +16,12 @@ class GymStatement(NamedTuple):
     ``("op", np.tanh)``, ``("dtype", np.float16)``).
 
     Attributes:
-        op: GymOp name (e.g., ``"nc_matmul"``).
+        op: GymOp subclass for this operation.
         kwargs: All arguments as ``(param_name, value)`` pairs.
         output: Output tensor reference.
     """
 
-    op: str
+    op: type[GymOp]
     kwargs: tuple[tuple[str, Any], ...]
     output: TensorRef
 
@@ -37,7 +37,7 @@ class GymStatement(NamedTuple):
             env: Variable environment mapping names to arrays.
         """
         args, kwargs = _resolve_args(self, env)
-        result = GymOp.get(self.op).simulate(*args, **kwargs)
+        result = self.op.simulate(*args, **kwargs)
         if result is not None:
             env[self.output.name] = result
 
@@ -45,21 +45,19 @@ class GymStatement(NamedTuple):
 class GymProgram(NamedTuple):
     """Immutable program IR: a named function as a sequence of GymOp calls.
 
-    Programs are hashable and can be used as dictionary keys for
-    deduplication in the transform search graph.
+    Graph deduplication keys on ``stmts`` only because ``kwargs`` contains
+    unhashable dicts/arrays and is constant across all search variants.
 
     Attributes:
         name: Function name.
-        params: Input parameter names.
-        input_shapes: Per-parameter expected shapes as ``(name, shape)`` pairs.
+        kwargs: Input arrays and non-tensor args from the original caller.
         stmts: Sequence of GymStatement operations.
         return_var: Variable name returned by the function.
         output_dtype: Numpy dtype type for output allocation.
     """
 
     name: str
-    params: tuple[str, ...]
-    input_shapes: tuple[tuple[str, tuple[int, ...]], ...]
+    kwargs: dict[str, Any]
     stmts: tuple[GymStatement, ...]
     return_var: str
     output_dtype: type
@@ -67,8 +65,10 @@ class GymProgram(NamedTuple):
     def __repr__(self) -> str:
         """Return a readable multi-line representation."""
         lines = [f"GymProgram(name={self.name!r},"]
-        lines.append(f"  params={self.params!r},")
-        lines.append(f"  input_shapes={self.input_shapes!r},")
+        kwarg_summary = {
+            k: f"ndarray{v.shape}" if isinstance(v, np.ndarray) else repr(v) for k, v in self.kwargs.items()
+        }
+        lines.append(f"  kwargs={kwarg_summary},")
         lines.append("  stmts=(")
         for stmt in self.stmts:
             lines.append(f"    {stmt!r},")
@@ -76,6 +76,22 @@ class GymProgram(NamedTuple):
         lines.append(f"  return_var={self.return_var!r},")
         lines.append(f"  output_dtype={self.output_dtype!r})")
         return "\n".join(lines)
+
+    def __hash__(self) -> int:
+        """Hash on stmts only (kwargs is constant across search variants)."""
+        return hash(self.stmts)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare on stmts only (kwargs is constant across search variants)."""
+        result = NotImplemented
+        if isinstance(other, GymProgram):
+            result = self.stmts == other.stmts
+        return result
+
+    @property
+    def params(self) -> tuple[str, ...]:
+        """Input parameter names derived from kwargs keys."""
+        return tuple(self.kwargs.keys())
 
     def __call__(self, **inputs: np.ndarray) -> np.ndarray:
         """Execute the program by interpreting IR statements directly.

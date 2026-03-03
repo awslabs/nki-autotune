@@ -10,11 +10,26 @@ import numpy as np
 import pytest
 
 import nkigym
-from nkigym.codegen import lower_to_nki
-from nkigym.ir import GymProgram, GymStatement, TensorRef, source_to_program
+from nkigym.function_to_program import source_to_program, tile_program
+from nkigym.ir import GymProgram, GymStatement, TensorRef
+from nkigym.ops import (
+    ActivationOp,
+    AllocateOp,
+    LoadOp,
+    MatmulOp,
+    NcTransposeOp,
+    StoreOp,
+    TensorScalarOp,
+    TensorTensorOp,
+)
+from nkigym.program_to_nki import lower_to_nki
 from nkigym.search.compile import CompilationPool, run_on_hardware
-from nkigym.tiling import tile_program
 from nkigym.utils import callable_to_source
+
+
+def _kw(shapes: dict) -> dict:
+    """Create zero-filled kwargs from shape dict."""
+    return {k: np.zeros(v, dtype=np.float32) for k, v in shapes.items()}
 
 
 def _neuron_devices_available() -> bool:
@@ -40,27 +55,24 @@ def _count_occurrences(code: str, pattern: str) -> int:
     return sum(1 for line in code.splitlines() if re.search(pattern, line))
 
 
-_T = TensorRef
-_S = GymStatement
-_P = GymProgram
+_T, _S, _P = TensorRef, GymStatement, GymProgram
 _128 = (0, 128)
 _FULL_128x128 = (_128, _128)
 
 SINGLE_TILE_MATMUL = _P(
     "single_matmul",
-    ("a", "b"),
-    (("a", (128, 128)), ("b", (128, 128))),
+    _kw({"a": (128, 128), "b": (128, 128)}),
     (
-        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("b", (128, 128), _FULL_128x128)),), _T("_t1", (128, 128), _FULL_128x128)),
+        _S(AllocateOp, (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("b", (128, 128), _FULL_128x128)),), _T("_t1", (128, 128), _FULL_128x128)),
         _S(
-            "nc_matmul",
+            MatmulOp,
             (("stationary", _T("_t0", (128, 128), _FULL_128x128)), ("moving", _T("_t1", (128, 128), _FULL_128x128))),
             _T("_t2", (128, 128), _FULL_128x128),
         ),
         _S(
-            "np_store",
+            StoreOp,
             (("src", _T("_t2", (128, 128), _FULL_128x128)), ("dst", _T("output", (128, 128), _FULL_128x128))),
             _T("output", (128, 128), _FULL_128x128),
         ),
@@ -71,21 +83,20 @@ SINGLE_TILE_MATMUL = _P(
 
 ACCUM_MATMUL = _P(
     "accum_matmul",
-    ("a", "b"),
-    (("a", (256, 128)), ("b", (256, 128))),
+    _kw({"a": (256, 128), "b": (256, 128)}),
     (
-        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("a", (256, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("b", (256, 128), _FULL_128x128)),), _T("_t1", (128, 128), _FULL_128x128)),
+        _S(AllocateOp, (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("a", (256, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("b", (256, 128), _FULL_128x128)),), _T("_t1", (128, 128), _FULL_128x128)),
         _S(
-            "nc_matmul",
+            MatmulOp,
             (("stationary", _T("_t0", (128, 128), _FULL_128x128)), ("moving", _T("_t1", (128, 128), _FULL_128x128))),
             _T("_t2", (128, 128), _FULL_128x128),
         ),
-        _S("np_slice", (("src", _T("a", (256, 128), ((128, 256), _128))),), _T("_t3", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("b", (256, 128), ((128, 256), _128))),), _T("_t4", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("a", (256, 128), ((128, 256), _128))),), _T("_t3", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("b", (256, 128), ((128, 256), _128))),), _T("_t4", (128, 128), _FULL_128x128)),
         _S(
-            "nc_matmul",
+            MatmulOp,
             (
                 ("stationary", _T("_t3", (128, 128), _FULL_128x128)),
                 ("moving", _T("_t4", (128, 128), _FULL_128x128)),
@@ -94,7 +105,7 @@ ACCUM_MATMUL = _P(
             _T("_t5", (128, 128), _FULL_128x128),
         ),
         _S(
-            "np_store",
+            StoreOp,
             (("src", _T("_t5", (128, 128), _FULL_128x128)), ("dst", _T("output", (128, 128), _FULL_128x128))),
             _T("output", (128, 128), _FULL_128x128),
         ),
@@ -105,14 +116,13 @@ ACCUM_MATMUL = _P(
 
 ELEMENTWISE_PROGRAM = _P(
     "ewise_fn",
-    ("a", "b"),
-    (("a", (128, 128)), ("b", (128, 128))),
+    _kw({"a": (128, 128), "b": (128, 128)}),
     (
-        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("b", (128, 128), _FULL_128x128)),), _T("_t1", (128, 128), _FULL_128x128)),
+        _S(AllocateOp, (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("b", (128, 128), _FULL_128x128)),), _T("_t1", (128, 128), _FULL_128x128)),
         _S(
-            "tensor_tensor",
+            TensorTensorOp,
             (
                 ("data1", _T("_t0", (128, 128), _FULL_128x128)),
                 ("data2", _T("_t1", (128, 128), _FULL_128x128)),
@@ -121,7 +131,7 @@ ELEMENTWISE_PROGRAM = _P(
             _T("_t2", (128, 128), _FULL_128x128),
         ),
         _S(
-            "np_store",
+            StoreOp,
             (("src", _T("_t2", (128, 128), _FULL_128x128)), ("dst", _T("output", (128, 128), _FULL_128x128))),
             _T("output", (128, 128), _FULL_128x128),
         ),
@@ -132,14 +142,13 @@ ELEMENTWISE_PROGRAM = _P(
 
 TENSOR_SCALAR_PROGRAM = _P(
     "ts_fn",
-    ("a", "b"),
-    (("a", (128, 128)), ("b", (128, 1))),
+    _kw({"a": (128, 128), "b": (128, 1)}),
     (
-        _S("np_empty", (("dtype", np.float32),), _T("out", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("b", (128, 1), ((0, 128), (0, 1)))),), _T("_t1", (128, 1), ((0, 128), (0, 1)))),
+        _S(AllocateOp, (("dtype", np.float32),), _T("out", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("b", (128, 1), ((0, 128), (0, 1)))),), _T("_t1", (128, 1), ((0, 128), (0, 1)))),
         _S(
-            "tensor_scalar",
+            TensorScalarOp,
             (
                 ("data", _T("_t0", (128, 128), _FULL_128x128)),
                 ("operand0", _T("_t1", (128, 1), ((0, 128), (0, 1)))),
@@ -148,7 +157,7 @@ TENSOR_SCALAR_PROGRAM = _P(
             _T("_t2", (128, 128), _FULL_128x128),
         ),
         _S(
-            "np_store",
+            StoreOp,
             (("src", _T("_t2", (128, 128), _FULL_128x128)), ("dst", _T("out", (128, 128), _FULL_128x128))),
             _T("out", (128, 128), _FULL_128x128),
         ),
@@ -159,18 +168,17 @@ TENSOR_SCALAR_PROGRAM = _P(
 
 ACTIVATION_PROGRAM = _P(
     "act_fn",
-    ("a",),
-    (("a", (128, 128)),),
+    _kw({"a": (128, 128)}),
     (
-        _S("np_empty", (("dtype", np.float32),), _T("out", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
+        _S(AllocateOp, (("dtype", np.float32),), _T("out", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
         _S(
-            "activation",
+            ActivationOp,
             (("data", _T("_t0", (128, 128), _FULL_128x128)), ("op", np.tanh)),
             _T("_t1", (128, 128), _FULL_128x128),
         ),
         _S(
-            "np_store",
+            StoreOp,
             (("src", _T("_t1", (128, 128), _FULL_128x128)), ("dst", _T("out", (128, 128), _FULL_128x128))),
             _T("out", (128, 128), _FULL_128x128),
         ),
@@ -183,14 +191,13 @@ _64 = (0, 64)
 
 TRANSPOSE_PROGRAM = _P(
     "trans_fn",
-    ("a",),
-    (("a", (128, 64)),),
+    _kw({"a": (128, 64)}),
     (
-        _S("np_empty", (("dtype", np.float32),), _T("out", (64, 128), (_64, _128))),
-        _S("np_slice", (("src", _T("a", (128, 64), (_128, _64))),), _T("_t0", (128, 64), (_128, _64))),
-        _S("nc_transpose", (("data", _T("_t0", (128, 64), (_128, _64))),), _T("_t1", (64, 128), (_64, _128))),
+        _S(AllocateOp, (("dtype", np.float32),), _T("out", (64, 128), (_64, _128))),
+        _S(LoadOp, (("src", _T("a", (128, 64), (_128, _64))),), _T("_t0", (128, 64), (_128, _64))),
+        _S(NcTransposeOp, (("data", _T("_t0", (128, 64), (_128, _64))),), _T("_t1", (64, 128), (_64, _128))),
         _S(
-            "np_store",
+            StoreOp,
             (("src", _T("_t1", (64, 128), (_64, _128))), ("dst", _T("out", (64, 128), (_64, _128)))),
             _T("out", (64, 128), (_64, _128)),
         ),
@@ -201,31 +208,30 @@ TRANSPOSE_PROGRAM = _P(
 
 MULTI_TILE_PROGRAM = _P(
     "multi_tile",
-    ("a", "b"),
-    (("a", (128, 128)), ("b", (128, 256))),
+    _kw({"a": (128, 128), "b": (128, 256)}),
     (
-        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 256), (_128, (0, 256)))),
-        _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("b", (128, 256), (_128, _128))),), _T("_t1", (128, 128), _FULL_128x128)),
+        _S(AllocateOp, (("dtype", np.float32),), _T("output", (128, 256), (_128, (0, 256)))),
+        _S(LoadOp, (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t0", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("b", (128, 256), (_128, _128))),), _T("_t1", (128, 128), _FULL_128x128)),
         _S(
-            "nc_matmul",
+            MatmulOp,
             (("stationary", _T("_t0", (128, 128), _FULL_128x128)), ("moving", _T("_t1", (128, 128), _FULL_128x128))),
             _T("_t2", (128, 128), _FULL_128x128),
         ),
         _S(
-            "np_store",
+            StoreOp,
             (("src", _T("_t2", (128, 128), _FULL_128x128)), ("dst", _T("output", (128, 256), (_128, _128)))),
             _T("output", (128, 256), (_128, _128)),
         ),
-        _S("np_slice", (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t3", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("b", (128, 256), (_128, (128, 256)))),), _T("_t4", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("a", (128, 128), _FULL_128x128)),), _T("_t3", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("b", (128, 256), (_128, (128, 256)))),), _T("_t4", (128, 128), _FULL_128x128)),
         _S(
-            "nc_matmul",
+            MatmulOp,
             (("stationary", _T("_t3", (128, 128), _FULL_128x128)), ("moving", _T("_t4", (128, 128), _FULL_128x128))),
             _T("_t5", (128, 128), _FULL_128x128),
         ),
         _S(
-            "np_store",
+            StoreOp,
             (("src", _T("_t5", (128, 128), _FULL_128x128)), ("dst", _T("output", (128, 256), (_128, (128, 256))))),
             _T("output", (128, 256), (_128, (128, 256))),
         ),
@@ -239,19 +245,18 @@ _128_256 = (128, 256)
 
 MERGED_LOAD_MATMUL = _P(
     "merged_matmul",
-    ("a", "b"),
-    (("a", (256, 256)), ("b", (256, 256))),
+    _kw({"a": (256, 256), "b": (256, 256)}),
     (
-        _S("np_empty", (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
-        _S("np_slice", (("src", _T("a", (256, 256), (_128, _256))),), _T("_t0", (128, 256), (_128, _256))),
-        _S("np_slice", (("src", _T("b", (256, 256), (_128, _256))),), _T("_t1", (128, 256), (_128, _256))),
+        _S(AllocateOp, (("dtype", np.float32),), _T("output", (128, 128), _FULL_128x128)),
+        _S(LoadOp, (("src", _T("a", (256, 256), (_128, _256))),), _T("_t0", (128, 256), (_128, _256))),
+        _S(LoadOp, (("src", _T("b", (256, 256), (_128, _256))),), _T("_t1", (128, 256), (_128, _256))),
         _S(
-            "nc_matmul",
+            MatmulOp,
             (("stationary", _T("_t0", (128, 128), _FULL_128x128)), ("moving", _T("_t1", (128, 128), _FULL_128x128))),
             _T("_t2", (128, 128), _FULL_128x128),
         ),
         _S(
-            "nc_matmul",
+            MatmulOp,
             (
                 ("stationary", _T("_t0", (128, 128), (_128, _128_256))),
                 ("moving", _T("_t1", (128, 128), (_128, _128_256))),
@@ -260,7 +265,7 @@ MERGED_LOAD_MATMUL = _P(
             _T("_t3", (128, 128), _FULL_128x128),
         ),
         _S(
-            "np_store",
+            StoreOp,
             (("src", _T("_t3", (128, 128), _FULL_128x128)), ("dst", _T("output", (128, 128), _FULL_128x128))),
             _T("output", (128, 128), _FULL_128x128),
         ),
@@ -368,7 +373,7 @@ def test_pipeline_integration() -> None:
         return nkigym.nc_matmul(a, b)
 
     source = callable_to_source(matmul)
-    program = source_to_program(source, {"a": (128, 128), "b": (128, 128)}, np.float32)
+    program = source_to_program(source, _kw({"a": (128, 128), "b": (128, 128)}))
     tiled = tile_program(program)
     code = lower_to_nki(tiled)
 

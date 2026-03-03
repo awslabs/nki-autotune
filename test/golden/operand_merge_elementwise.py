@@ -3,25 +3,31 @@
 import numpy as np
 
 from nkigym.ir import GymProgram, GymStatement, TensorRef
+from nkigym.ops import ActivationOp, AllocateOp, LoadOp, StoreOp, TensorScalarOp, TensorTensorOp
+
+
+def _kw(shapes: dict) -> dict:
+    """Create zero-filled kwargs from shape dict."""
+    return {k: np.zeros(v, dtype=np.float32) for k, v in shapes.items()}
+
 
 BEFORE_TENSOR_TENSOR_2X = GymProgram(
     "tiled_tensor_tensor_2x",
-    ("a", "b"),
-    (("a", (128, 256)), ("b", (128, 128))),
+    _kw({"a": (128, 256), "b": (128, 128)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 128)))),),
             TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),),
             TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_tensor",
+            TensorTensorOp,
             (
                 ("data1", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                 ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
@@ -30,7 +36,7 @@ BEFORE_TENSOR_TENSOR_2X = GymProgram(
             TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (0, 128)))),
@@ -38,12 +44,12 @@ BEFORE_TENSOR_TENSOR_2X = GymProgram(
             TensorRef("output", (128, 256), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (128, 256)))),),
             TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_tensor",
+            TensorTensorOp,
             (
                 ("data1", TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128)))),
                 ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
@@ -52,7 +58,7 @@ BEFORE_TENSOR_TENSOR_2X = GymProgram(
             TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (128, 256)))),
@@ -63,26 +69,24 @@ BEFORE_TENSOR_TENSOR_2X = GymProgram(
     "output",
     np.float32,
 )
-
 
 AFTER_TENSOR_TENSOR_2X = GymProgram(
     "tiled_tensor_tensor_2x",
-    ("a", "b"),
-    (("a", (128, 256)), ("b", (128, 128))),
+    _kw({"a": (128, 256), "b": (128, 128)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 256)))),),
             TensorRef("tensor_0", (128, 256), ((0, 128), (0, 256))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),),
             TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_tensor",
+            TensorTensorOp,
             (
                 ("data1", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                 ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
@@ -91,7 +95,7 @@ AFTER_TENSOR_TENSOR_2X = GymProgram(
             TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (0, 128)))),
@@ -99,7 +103,7 @@ AFTER_TENSOR_TENSOR_2X = GymProgram(
             TensorRef("output", (128, 256), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_tensor",
+            TensorTensorOp,
             (
                 ("data1", TensorRef("tensor_0", (128, 128), ((0, 128), (128, 256)))),
                 ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
@@ -108,7 +112,7 @@ AFTER_TENSOR_TENSOR_2X = GymProgram(
             TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (128, 256)))),
@@ -120,25 +124,23 @@ AFTER_TENSOR_TENSOR_2X = GymProgram(
     np.float32,
 )
 
-
 BEFORE_TENSOR_TENSOR_DIFF_OPS = GymProgram(
     "tiled_tensor_tensor_diff_ops",
-    ("a", "b"),
-    (("a", (128, 256)), ("b", (128, 128))),
+    _kw({"a": (128, 256), "b": (128, 128)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 128)))),),
             TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),),
             TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_tensor",
+            TensorTensorOp,
             (
                 ("data1", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                 ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
@@ -147,7 +149,7 @@ BEFORE_TENSOR_TENSOR_DIFF_OPS = GymProgram(
             TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (0, 128)))),
@@ -155,12 +157,12 @@ BEFORE_TENSOR_TENSOR_DIFF_OPS = GymProgram(
             TensorRef("output", (128, 256), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (128, 256)))),),
             TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_tensor",
+            TensorTensorOp,
             (
                 ("data1", TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128)))),
                 ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
@@ -169,7 +171,7 @@ BEFORE_TENSOR_TENSOR_DIFF_OPS = GymProgram(
             TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (128, 256)))),
@@ -181,25 +183,23 @@ BEFORE_TENSOR_TENSOR_DIFF_OPS = GymProgram(
     np.float32,
 )
 
-
 AFTER_TENSOR_TENSOR_DIFF_OPS = GymProgram(
     "tiled_tensor_tensor_diff_ops",
-    ("a", "b"),
-    (("a", (128, 256)), ("b", (128, 128))),
+    _kw({"a": (128, 256), "b": (128, 128)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 256)))),),
             TensorRef("tensor_0", (128, 256), ((0, 128), (0, 256))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("b", (128, 128), ((0, 128), (0, 128)))),),
             TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_tensor",
+            TensorTensorOp,
             (
                 ("data1", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                 ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
@@ -208,7 +208,7 @@ AFTER_TENSOR_TENSOR_DIFF_OPS = GymProgram(
             TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (0, 128)))),
@@ -216,7 +216,7 @@ AFTER_TENSOR_TENSOR_DIFF_OPS = GymProgram(
             TensorRef("output", (128, 256), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_tensor",
+            TensorTensorOp,
             (
                 ("data1", TensorRef("tensor_0", (128, 128), ((0, 128), (128, 256)))),
                 ("data2", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
@@ -225,7 +225,7 @@ AFTER_TENSOR_TENSOR_DIFF_OPS = GymProgram(
             TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (128, 256)))),
@@ -237,25 +237,23 @@ AFTER_TENSOR_TENSOR_DIFF_OPS = GymProgram(
     np.float32,
 )
 
-
 BEFORE_ACTIVATION_2X = GymProgram(
     "tiled_activation_2x",
-    ("a",),
-    (("a", (128, 256)),),
+    _kw({"a": (128, 256)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 128)))),),
             TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "activation",
+            ActivationOp,
             (("data", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
             TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (0, 128)))),
@@ -263,17 +261,17 @@ BEFORE_ACTIVATION_2X = GymProgram(
             TensorRef("output", (128, 256), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (128, 256)))),),
             TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "activation",
+            ActivationOp,
             (("data", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
             TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (128, 256)))),
@@ -285,25 +283,23 @@ BEFORE_ACTIVATION_2X = GymProgram(
     np.float32,
 )
 
-
 AFTER_ACTIVATION_2X = GymProgram(
     "tiled_activation_2x",
-    ("a",),
-    (("a", (128, 256)),),
+    _kw({"a": (128, 256)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 256)))),),
             TensorRef("tensor_0", (128, 256), ((0, 128), (0, 256))),
         ),
         GymStatement(
-            "activation",
+            ActivationOp,
             (("data", TensorRef("tensor_0", (128, 256), ((0, 128), (0, 256)))), ("op", np.tanh)),
             TensorRef("tensor_1", (128, 256), ((0, 128), (0, 256))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_1", (128, 256), ((0, 128), (0, 256)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
@@ -315,20 +311,18 @@ AFTER_ACTIVATION_2X = GymProgram(
     np.float32,
 )
 
-
 BEFORE_TENSOR_SCALAR_2X = GymProgram(
     "tiled_tensor_scalar_2x",
-    ("a",),
-    (("a", (128, 256)),),
+    _kw({"a": (128, 256)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 128)))),),
             TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_scalar",
+            TensorScalarOp,
             (
                 ("data", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                 ("op0", np.multiply),
@@ -337,7 +331,7 @@ BEFORE_TENSOR_SCALAR_2X = GymProgram(
             TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (0, 128)))),
@@ -345,12 +339,12 @@ BEFORE_TENSOR_SCALAR_2X = GymProgram(
             TensorRef("output", (128, 256), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (128, 256)))),),
             TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "tensor_scalar",
+            TensorScalarOp,
             (
                 ("data", TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
                 ("op0", np.multiply),
@@ -359,7 +353,7 @@ BEFORE_TENSOR_SCALAR_2X = GymProgram(
             TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (128, 256)))),
@@ -371,20 +365,18 @@ BEFORE_TENSOR_SCALAR_2X = GymProgram(
     np.float32,
 )
 
-
 AFTER_TENSOR_SCALAR_2X = GymProgram(
     "tiled_tensor_scalar_2x",
-    ("a",),
-    (("a", (128, 256)),),
+    _kw({"a": (128, 256)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), TensorRef("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", TensorRef("a", (128, 256), ((0, 128), (0, 256)))),),
             TensorRef("tensor_0", (128, 256), ((0, 128), (0, 256))),
         ),
         GymStatement(
-            "tensor_scalar",
+            TensorScalarOp,
             (
                 ("data", TensorRef("tensor_0", (128, 256), ((0, 128), (0, 256)))),
                 ("op0", np.multiply),
@@ -393,7 +385,7 @@ AFTER_TENSOR_SCALAR_2X = GymProgram(
             TensorRef("tensor_1", (128, 256), ((0, 128), (0, 256))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", TensorRef("tensor_1", (128, 256), ((0, 128), (0, 256)))),
                 ("dst", TensorRef("output", (128, 256), ((0, 128), (0, 256)))),

@@ -8,9 +8,8 @@ import re
 
 import numpy as np
 
-from nkigym.codegen.context import _LoweringContext
 from nkigym.ir.types import GymProgram
-from nkigym.ops.base import GymOp
+from nkigym.program_to_nki.context import _LoweringContext
 
 _TENSOR_RE = re.compile(r"^tensor_(\d+)$")
 
@@ -59,8 +58,7 @@ def lower_to_nki(program: GymProgram) -> str:
 
     body_lines: list[str] = []
     for stmt in program.stmts:
-        op_cls = GymOp.get(stmt.op)
-        body_lines.extend(op_cls.to_nki(stmt, ctx))
+        body_lines.extend(stmt.op.to_nki(stmt, ctx))
 
     body_lines.append(f"return {program.return_var}")
 

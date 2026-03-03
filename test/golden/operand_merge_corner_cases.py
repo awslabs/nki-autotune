@@ -3,27 +3,33 @@
 import numpy as np
 
 from nkigym.ir import GymProgram, GymStatement, TensorRef
+from nkigym.ops import ActivationOp, AllocateOp, LoadOp, MatmulOp, StoreOp
+
+
+def _kw(shapes: dict) -> dict:
+    """Create zero-filled kwargs from shape dict."""
+    return {k: np.zeros(v, dtype=np.float32) for k, v in shapes.items()}
+
 
 R = TensorRef
 
 BEFORE_SINGLE_ACTIVATION = GymProgram(
     "tiled_single_activation",
-    ("a",),
-    (("a", (128, 128)),),
+    _kw({"a": (128, 128)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), R("output", (128, 128), ((0, 128), (0, 128)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), R("output", (128, 128), ((0, 128), (0, 128)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", R("a", (128, 128), ((0, 128), (0, 128)))),),
             R("tensor_0", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "activation",
+            ActivationOp,
             (("data", R("tensor_0", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
             R("tensor_1", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", R("tensor_1", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", R("output", (128, 128), ((0, 128), (0, 128)))),
@@ -35,25 +41,23 @@ BEFORE_SINGLE_ACTIVATION = GymProgram(
     np.float32,
 )
 
-
 BEFORE_HETEROGENEOUS_OPS = GymProgram(
     "tiled_heterogeneous_ops",
-    ("a", "b", "c"),
-    (("a", (128, 128)), ("b", (128, 128)), ("c", (128, 128))),
+    _kw({"a": (128, 128), "b": (128, 128), "c": (128, 128)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), R("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), R("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", R("a", (128, 128), ((0, 128), (0, 128)))),),
             R("tensor_0", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", R("b", (128, 128), ((0, 128), (0, 128)))),),
             R("tensor_1", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "nc_matmul",
+            MatmulOp,
             (
                 ("stationary", R("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                 ("moving", R("tensor_1", (128, 128), ((0, 128), (0, 128)))),
@@ -61,7 +65,7 @@ BEFORE_HETEROGENEOUS_OPS = GymProgram(
             R("tensor_2", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", R("tensor_2", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", R("output", (128, 256), ((0, 128), (0, 128)))),
@@ -69,17 +73,17 @@ BEFORE_HETEROGENEOUS_OPS = GymProgram(
             R("output", (128, 256), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", R("c", (128, 128), ((0, 128), (0, 128)))),),
             R("tensor_3", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "activation",
+            ActivationOp,
             (("data", R("tensor_3", (128, 128), ((0, 128), (0, 128)))), ("op", np.tanh)),
             R("tensor_4", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", R("tensor_4", (128, 128), ((0, 128), (0, 128)))),
                 ("dst", R("output", (128, 256), ((0, 128), (128, 256)))),
@@ -91,25 +95,23 @@ BEFORE_HETEROGENEOUS_OPS = GymProgram(
     np.float32,
 )
 
-
 BEFORE_ALREADY_MERGED = GymProgram(
     "tiled_already_merged",
-    ("a", "b"),
-    (("a", (128, 128)), ("b", (128, 256))),
+    _kw({"a": (128, 128), "b": (128, 256)}),
     (
-        GymStatement("np_empty", (("dtype", np.float32),), R("output", (128, 256), ((0, 128), (0, 256)))),
+        GymStatement(AllocateOp, (("dtype", np.float32),), R("output", (128, 256), ((0, 128), (0, 256)))),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", R("a", (128, 128), ((0, 128), (0, 128)))),),
             R("tensor_0", (128, 128), ((0, 128), (0, 128))),
         ),
         GymStatement(
-            "np_slice",
+            LoadOp,
             (("src", R("b", (128, 256), ((0, 128), (0, 256)))),),
             R("tensor_1", (128, 256), ((0, 128), (0, 256))),
         ),
         GymStatement(
-            "nc_matmul",
+            MatmulOp,
             (
                 ("stationary", R("tensor_0", (128, 128), ((0, 128), (0, 128)))),
                 ("moving", R("tensor_1", (128, 256), ((0, 128), (0, 256)))),
@@ -117,7 +119,7 @@ BEFORE_ALREADY_MERGED = GymProgram(
             R("tensor_2", (128, 256), ((0, 128), (0, 256))),
         ),
         GymStatement(
-            "np_store",
+            StoreOp,
             (
                 ("src", R("tensor_2", (128, 256), ((0, 128), (0, 256)))),
                 ("dst", R("output", (128, 256), ((0, 128), (0, 256)))),

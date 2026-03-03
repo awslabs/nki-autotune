@@ -7,15 +7,19 @@ import numpy as np
 import pytest
 from conftest import assert_programs_numerically_equal
 
-import nkigym
-from nkigym.ir import source_to_program
-from nkigym.tiling import tile_program
-from nkigym.transforms import DataReuseTransform
-from nkigym.transforms.operand_merge import OperandMergeTransform
-from nkigym.utils import callable_to_source
+import nkigym  # type: ignore[import]
+from nkigym.function_to_program import source_to_program, tile_program  # type: ignore[import]
+from nkigym.transforms import DataReuseTransform  # type: ignore[import]
+from nkigym.transforms.operand_merge import OperandMergeTransform  # type: ignore[import]
+from nkigym.utils import callable_to_source  # type: ignore[import]
 
 _reuse = DataReuseTransform()
 _merge = OperandMergeTransform()
+
+
+def _make_kwargs(shapes: dict[str, tuple[int, ...]], dtype: type) -> dict[str, np.ndarray]:
+    """Create zero-filled kernel kwargs from shapes and dtype."""
+    return {name: np.zeros(shape, dtype=dtype) for name, shape in shapes.items()}
 
 
 @pytest.mark.parametrize("a_shape,b_shape", [((128, 128), (128, 256)), ((128, 256), (128, 256))], ids=["1x2", "2x2"])
@@ -29,10 +33,10 @@ def test_e2e_pipeline(a_shape: tuple[int, int], b_shape: tuple[int, int]) -> Non
 
     def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         """Compute matrix multiplication."""
-        return nkigym.nc_matmul(a, b)
+        return nkigym.nc_matmul(a, b)  # type: ignore[attr-defined]
 
     source = callable_to_source(matmul)
-    before = source_to_program(source, {"a": a_shape, "b": b_shape}, np.float32)
+    before = source_to_program(source, _make_kwargs({"a": a_shape, "b": b_shape}, np.float32))
     program = tile_program(before)
 
     while True:

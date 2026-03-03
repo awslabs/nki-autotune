@@ -4,10 +4,10 @@ from collections.abc import Callable
 
 import numpy as np
 
-from nkigym.codegen.context import _LoweringContext, get_kwarg, value_to_nki
 from nkigym.ir.tensor import TensorRef
 from nkigym.ir.types import GymStatement
 from nkigym.ops.base import GymOp, Tensor
+from nkigym.program_to_nki.context import get_kwarg, value_to_nki
 
 
 class TensorTensorOp(GymOp):
@@ -49,7 +49,7 @@ class TensorTensorOp(GymOp):
         return input_shapes[0]
 
     @classmethod
-    def to_nki(cls, stmt: GymStatement, ctx: _LoweringContext) -> list[str]:  # type: ignore[override]
+    def to_nki(cls, stmt: GymStatement, ctx: "_LoweringContext") -> list[str]:  # type: ignore[override]
         """Lower tensor_tensor to ``nisa.tensor_tensor``.
 
         Args:

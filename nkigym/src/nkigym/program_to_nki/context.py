@@ -176,4 +176,4 @@ def _assert_no_duplicate_kwargs(stmt: GymStatement) -> None:
         AssertionError: If duplicate kwarg keys are found.
     """
     keys = [k for k, _ in stmt.kwargs]
-    assert len(keys) == len(set(keys)), f"Duplicate kwargs in {stmt.op} stmt '{stmt.output.name}': {keys}"
+    assert len(keys) == len(set(keys)), f"Duplicate kwargs in {stmt.op.op_name} stmt '{stmt.output.name}': {keys}"

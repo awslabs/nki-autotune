@@ -16,8 +16,14 @@ from nkigym.ir.tensor import TensorRef, full_slices
 from nkigym.ir.types import GymProgram, GymStatement
 from nkigym.ops.base import GymOp
 
+"""
+Tiling op classes (AllocateOp, LoadOp, StoreOp) are looked up via
+GymOp.get() at call time to avoid circular imports between
+nkigym.ir.parse and nkigym.ops.tiling_ops.
+"""
 
-def source_to_program(source: str, input_shapes: dict[str, tuple[int, ...]], output_dtype: type) -> GymProgram:
+
+def source_to_program(source: str, kernel_kwargs: dict[str, Any]) -> GymProgram:
     """Parse nkigym source code into a specialized GymProgram.
 
     Handles both high-level source (``nkigym.<op>(a, b)`` calls with shape
@@ -26,8 +32,7 @@ def source_to_program(source: str, input_shapes: dict[str, tuple[int, ...]], out
 
     Args:
         source: Python source code containing a function using nkigym ops.
-        input_shapes: Mapping from parameter names to shape tuples.
-        output_dtype: Numpy dtype type for output allocation.
+        kernel_kwargs: Caller keyword arguments (numpy arrays for tensors).
 
     Returns:
         Specialized GymProgram with TensorRef on all tensor references.
@@ -35,10 +40,12 @@ def source_to_program(source: str, input_shapes: dict[str, tuple[int, ...]], out
     Raises:
         ValueError: If the function structure is not recognized.
     """
+    input_shapes = {k: v.shape for k, v in kernel_kwargs.items() if isinstance(v, np.ndarray)}
+    output_dtype = next(v.dtype.type for v in kernel_kwargs.values() if isinstance(v, np.ndarray))
     func_def = _find_func_def(source)
     if _has_np_empty(func_def):
-        return _parse_tiled_body(func_def, input_shapes, output_dtype)
-    return _parse_highlevel_body(func_def, input_shapes, output_dtype)
+        return _parse_tiled_body(func_def, kernel_kwargs, input_shapes, output_dtype)
+    return _parse_highlevel_body(func_def, kernel_kwargs, input_shapes, output_dtype)
 
 
 def program_to_source(program: GymProgram) -> str:
@@ -59,12 +66,15 @@ def program_to_source(program: GymProgram) -> str:
     lines.append(f"def {program.name}({params_str}):")
 
     for stmt in program.stmts:
-        if stmt.op == "np_empty":
-            lines.append(_render_np_empty(stmt))
-        elif stmt.op == "np_slice":
-            lines.append(_render_np_slice(stmt))
-        elif stmt.op == "np_store":
-            lines.append(_render_np_store(stmt))
+        op_name = stmt.op.__name__ if hasattr(stmt.op, "__name__") else stmt.op
+        if op_name == "AllocateOp":
+            lines.append(_render_allocate(stmt))
+        elif op_name == "LoadOp":
+            lines.append(_render_load(stmt))
+        elif op_name == "StoreOp":
+            lines.append(_render_store(stmt))
+        elif op_name == "IndexingOp":
+            lines.append(_render_indexing(stmt))
         else:
             lines.append(_render_compute(stmt))
 
@@ -195,7 +205,7 @@ def _specialize(
 
     result: list[GymStatement] = []
     for stmt in stmts:
-        op_cls = GymOp.get(stmt.op)
+        op_cls = stmt.op
         n_inputs = len(op_cls.inputs)
 
         tensor_kwargs = stmt.kwargs[:n_inputs]
@@ -274,7 +284,7 @@ def _flatten_call(call: ast.Call, output: str, stmts: list[GymStatement], counte
         else:
             kwargs.append((kw.arg, _eval_expr(kw.value)))
 
-    stmts.append(GymStatement(op=op_name, kwargs=tuple(kwargs), output=TensorRef(output, (), ())))
+    stmts.append(GymStatement(op=op_cls, kwargs=tuple(kwargs), output=TensorRef(output, (), ())))
 
 
 def _parse_call(call: ast.Call, output: str) -> list[GymStatement]:
@@ -406,11 +416,11 @@ def _subscript(ref: TensorRef) -> str:
     return f"{ref.name}[{slices}]"
 
 
-def _render_np_empty(stmt: GymStatement) -> str:
-    """Render an np_empty statement.
+def _render_allocate(stmt: GymStatement) -> str:
+    """Render an allocate statement.
 
     Args:
-        stmt: The np_empty GymStatement.
+        stmt: The allocate GymStatement.
 
     Returns:
         Source line like ``output = np.empty((128, 128), dtype=np.float32)``.
@@ -420,38 +430,57 @@ def _render_np_empty(stmt: GymStatement) -> str:
         if key == "dtype":
             dtype = value
     if dtype is None:
-        raise ValueError(f"np_empty statement for '{stmt.output.name}' missing 'dtype' kwarg")
+        raise ValueError(f"allocate statement for '{stmt.output.name}' missing 'dtype' kwarg")
     shape_str = ", ".join(str(s) for s in stmt.output.shape)
     return f"    {stmt.output.name} = np.empty(({shape_str}), dtype={_value_to_source(dtype)})"
 
 
-def _render_np_slice(stmt: GymStatement) -> str:
-    """Render an np_slice statement.
+def _render_load(stmt: GymStatement) -> str:
+    """Render a load statement.
 
     Args:
-        stmt: The np_slice GymStatement.
+        stmt: The load GymStatement.
 
     Returns:
-        Source line like ``tensor_0 = a[0:128, 0:128]``.
+        Source line like ``tensor_0 = nkigym.load(a[0:128, 0:128])``.
     """
     src = None
     for key, value in stmt.kwargs:
         if key == "src":
             src = value
     if src is None:
-        raise ValueError(f"np_slice statement for '{stmt.output.name}' missing 'src' kwarg")
+        raise ValueError(f"load statement for '{stmt.output.name}' missing 'src' kwarg")
+    slices = ", ".join(f"{s}:{e}" for s, e in src.slices)
+    return f"    {stmt.output.name} = nkigym.load({src.name}[{slices}])"
+
+
+def _render_indexing(stmt: GymStatement) -> str:
+    """Render an indexing statement (pure on-chip subscript).
+
+    Args:
+        stmt: The indexing GymStatement.
+
+    Returns:
+        Source line like ``tensor_6 = tensor_5[0:128, 0:128]``.
+    """
+    src = None
+    for key, value in stmt.kwargs:
+        if key == "src":
+            src = value
+    if src is None:
+        raise ValueError(f"indexing statement for '{stmt.output.name}' missing 'src' kwarg")
     slices = ", ".join(f"{s}:{e}" for s, e in src.slices)
     return f"    {stmt.output.name} = {src.name}[{slices}]"
 
 
-def _render_np_store(stmt: GymStatement) -> str:
-    """Render an np_store statement.
+def _render_store(stmt: GymStatement) -> str:
+    """Render a store statement.
 
     Args:
-        stmt: The np_store GymStatement.
+        stmt: The store GymStatement.
 
     Returns:
-        Source line like ``output[0:128, 0:128] = tensor_2[0:128, 0:128]``.
+        Source line like ``nkigym.store(tensor_2[0:128, 0:128], output[0:128, 0:128])``.
     """
     src = None
     dst = None
@@ -461,10 +490,10 @@ def _render_np_store(stmt: GymStatement) -> str:
         elif key == "dst":
             dst = value
     if src is None:
-        raise ValueError(f"np_store statement for '{stmt.output.name}' missing 'src' kwarg")
+        raise ValueError(f"store statement for '{stmt.output.name}' missing 'src' kwarg")
     if dst is None:
-        raise ValueError(f"np_store statement for '{stmt.output.name}' missing 'dst' kwarg")
-    return f"    {_subscript(dst)} = {_subscript(src)}"
+        raise ValueError(f"store statement for '{stmt.output.name}' missing 'dst' kwarg")
+    return f"    nkigym.store({_subscript(src)}, {_subscript(dst)})"
 
 
 def _render_compute(stmt: GymStatement) -> str:
@@ -486,11 +515,15 @@ def _render_compute(stmt: GymStatement) -> str:
             args.append(f"{key}={_value_to_source(value)}")
 
     args_str = ", ".join(args)
-    return f"    {stmt.output.name} = nkigym.{stmt.op}({args_str})"
+    op_name = stmt.op.op_name if hasattr(stmt.op, "op_name") else stmt.op
+    return f"    {stmt.output.name} = nkigym.{op_name}({args_str})"
 
 
 def _parse_highlevel_body(
-    func_def: ast.FunctionDef, input_shapes: dict[str, tuple[int, ...]], output_dtype: type
+    func_def: ast.FunctionDef,
+    kernel_kwargs: dict[str, Any],
+    input_shapes: dict[str, tuple[int, ...]],
+    output_dtype: type,
 ) -> GymProgram:
     """Parse a high-level function body into a GymProgram.
 
@@ -543,17 +576,15 @@ def _parse_highlevel_body(
     specialized = _specialize(stmts, params, input_shapes)
 
     return GymProgram(
-        name=name,
-        params=params,
-        input_shapes=tuple((p, input_shapes[p]) for p in params),
-        stmts=tuple(specialized),
-        return_var=return_var,
-        output_dtype=output_dtype,
+        name=name, kwargs=kernel_kwargs, stmts=tuple(specialized), return_var=return_var, output_dtype=output_dtype
     )
 
 
 def _parse_tiled_body(
-    func_def: ast.FunctionDef, input_shapes: dict[str, tuple[int, ...]], output_dtype: type
+    func_def: ast.FunctionDef,
+    kernel_kwargs: dict[str, Any],
+    input_shapes: dict[str, tuple[int, ...]],
+    output_dtype: type,
 ) -> GymProgram:
     """Parse a tiled function body into a GymProgram.
 
@@ -591,6 +622,12 @@ def _parse_tiled_body(
                 return_var = node.value.id
             continue
 
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value
+            if _is_nkigym_call(call) and call.func.attr == "store":
+                _parse_tiled_store_call(call, var_shapes, stmts)
+                continue
+
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = node.targets[0]
 
@@ -605,26 +642,13 @@ def _parse_tiled_body(
                             _parse_tiled_compute(target.id, node.value, var_shapes, stmts)
                             continue
 
-                if isinstance(node.value, ast.Subscript):
-                    _parse_tiled_slice(target.id, node.value, var_shapes, stmts)
-                    continue
-
-            if isinstance(target, ast.Subscript):
-                _parse_tiled_store(target, node.value, var_shapes, stmts)
-                continue
-
         raise ValueError(f"Unsupported tiled statement: {ast.dump(node)}")
 
     if not return_var:
         raise ValueError("Function must have a return statement")
 
     return GymProgram(
-        name=name,
-        params=params,
-        input_shapes=tuple((p, input_shapes[p]) for p in params),
-        stmts=tuple(stmts),
-        return_var=return_var,
-        output_dtype=output_dtype,
+        name=name, kwargs=kernel_kwargs, stmts=tuple(stmts), return_var=return_var, output_dtype=output_dtype
     )
 
 
@@ -650,29 +674,8 @@ def _parse_tiled_np_empty(
     if dtype_val is None:
         raise ValueError(f"np.empty for '{target_name}' missing dtype kwarg")
     out_ref = TensorRef(target_name, shape, full_slices(shape))
-    stmts.append(GymStatement("np_empty", (("dtype", dtype_val),), out_ref))
+    stmts.append(GymStatement(GymOp.get("allocate"), (("dtype", dtype_val),), out_ref))
     var_shapes[target_name] = shape
-
-
-def _parse_tiled_slice(
-    target_name: str, subscript: ast.Subscript, var_shapes: dict[str, tuple[int, ...]], stmts: list[GymStatement]
-) -> None:
-    """Parse a subscript assignment (np_slice) into a GymStatement.
-
-    Args:
-        target_name: Variable name being assigned.
-        subscript: AST Subscript node (``src[slices]``).
-        var_shapes: Mutable dict tracking variable shapes.
-        stmts: Mutable list of statements to append to.
-    """
-    src_name = subscript.value.id
-    slices = _parse_subscript_slices(subscript.slice)
-    tile_shape = tuple(e - s for s, e in slices)
-    src_shape = var_shapes.get(src_name, tuple(e for _, e in slices))
-    src_ref = TensorRef(src_name, src_shape, slices)
-    dst_ref = TensorRef(target_name, tile_shape, full_slices(tile_shape))
-    stmts.append(GymStatement("np_slice", (("src", src_ref),), dst_ref))
-    var_shapes[target_name] = tile_shape
 
 
 def _parse_tiled_compute(
@@ -706,39 +709,23 @@ def _parse_tiled_compute(
         else:
             kwargs_list.append((kw.arg, _eval_expr(kw.value)))
 
-    out_shape = op_cls.output_shape(tuple(input_shape_list))
+    try:
+        out_shape = op_cls.output_shape(tuple(input_shape_list))
+    except NotImplementedError:
+        out_shape = input_shape_list[0] if input_shape_list else ()
     out_ref = TensorRef(target_name, out_shape, full_slices(out_shape))
-    stmts.append(GymStatement(op_name, tuple(kwargs_list), out_ref))
+    stmts.append(GymStatement(op_cls, tuple(kwargs_list), out_ref))
     var_shapes[target_name] = out_shape
 
 
-def _parse_tiled_store(
-    target: ast.Subscript, value: ast.expr, var_shapes: dict[str, tuple[int, ...]], stmts: list[GymStatement]
-) -> None:
-    """Parse a subscripted assignment (np_store) into a GymStatement.
+def _parse_tiled_store_call(call: ast.Call, var_shapes: dict[str, tuple[int, ...]], stmts: list[GymStatement]) -> None:
+    """Parse a ``nkigym.store(src, dst)`` call into a GymStatement.
 
     Args:
-        target: AST Subscript node for the destination (``dst[slices]``).
-        value: AST expression for the source (name or ``name[slices]``).
+        call: AST Call node for ``nkigym.store(src_ref, dst_ref)``.
         var_shapes: Mutable dict tracking variable shapes.
         stmts: Mutable list of statements to append to.
-
-    Raises:
-        ValueError: If the value expression type is not recognized.
     """
-    dst_name = target.value.id
-    dst_slices = _parse_subscript_slices(target.slice)
-    dst_shape = var_shapes.get(dst_name, tuple(e for _, e in dst_slices))
-
-    if isinstance(value, ast.Name):
-        src_shape = var_shapes.get(value.id, ())
-        src_ref = TensorRef(value.id, src_shape, full_slices(src_shape))
-    elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name):
-        src_slices = _parse_subscript_slices(value.slice)
-        src_shape = tuple(e - s for s, e in src_slices)
-        src_ref = TensorRef(value.value.id, src_shape, src_slices)
-    else:
-        raise ValueError(f"Unsupported np_store source: {ast.dump(value)}")
-
-    dst_ref = TensorRef(dst_name, dst_shape, dst_slices)
-    stmts.append(GymStatement("np_store", (("src", src_ref), ("dst", dst_ref)), dst_ref))
+    src_ref = _parse_arg_ref(call.args[0], var_shapes)
+    dst_ref = _parse_arg_ref(call.args[1], var_shapes)
+    stmts.append(GymStatement(GymOp.get("store"), (("src", src_ref), ("dst", dst_ref)), dst_ref))

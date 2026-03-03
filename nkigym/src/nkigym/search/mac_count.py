@@ -7,6 +7,7 @@ once from the root program.
 """
 
 from nkigym.ir import GymProgram, TensorRef
+from nkigym.ops.matmul import MatmulOp
 
 
 def compute_mac_count(program: GymProgram) -> int:
@@ -23,7 +24,7 @@ def compute_mac_count(program: GymProgram) -> int:
     """
     total = 0
     for stmt in program.stmts:
-        if stmt.op != "nc_matmul":
+        if stmt.op is not MatmulOp:
             continue
         stat_shape = _get_operand_shape(stmt, "stationary")
         mov_shape = _get_operand_shape(stmt, "moving")

@@ -11,13 +11,15 @@ Subpackages:
     ir: Conversion between callable, source, and IR representations
 """
 
-from nkigym.ops import ActivationOp, GymOp, MatmulOp, NcTransposeOp, TensorScalarOp, TensorTensorOp
+from nkigym.ops import ActivationOp, GymOp, LoadOp, MatmulOp, NcTransposeOp, StoreOp, TensorScalarOp, TensorTensorOp
 
 nc_matmul = MatmulOp()
 nc_transpose = NcTransposeOp()
 activation = ActivationOp()
 tensor_tensor = TensorTensorOp()
 tensor_scalar = TensorScalarOp()
+load = LoadOp()
+store = StoreOp()
 
 __all__ = [
     "GymOp",
@@ -26,9 +28,13 @@ __all__ = [
     "ActivationOp",
     "TensorTensorOp",
     "TensorScalarOp",
+    "LoadOp",
+    "StoreOp",
     "nc_matmul",
     "nc_transpose",
     "activation",
     "tensor_tensor",
     "tensor_scalar",
+    "load",
+    "store",
 ]
