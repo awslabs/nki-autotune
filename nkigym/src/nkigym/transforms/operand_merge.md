@@ -1,214 +1,199 @@
 # Operand Merge
 
-Finds pairs of the same operation where only a single operand differs, and that single differing operand can be combined along an adjacent
-dimension. When found, the two operations are merged into a single wider operation.
+Finds pairs of the same operation where operands differ on exactly one named
+axis with adjacent slices. When found, the two operations are merged into a
+single wider operation.
 
-Each merge is an atomic transform: it reduces exactly one instruction and updates its consumers. It never backtracks changes onto producers or forward onto consumers of a different type. The three atomic merge types are:
+Each merge is an atomic transform: it reduces exactly one instruction and
+updates its consumers. The algorithm is uniform across all op types — loads,
+computes, and stores are not special-cased. Every `GymOp` declares its
+inputs/outputs with named axes (e.g., `("K", "M")`) and a `tile_limits` dict.
+The merge algorithm uses these to determine which dimensions can widen and by
+how much.
 
-1. **Load merge** — reduces one load, remaps downstream compute and store references to subscripts of the wider load.
-2. **Compute merge** — reduces one compute op, remaps downstream references to subscripts of the wider output. Requires differing operands to reference the same variable (i.e., prerequisite load merges must be applied first).
-3. **Store merge** — reduces one store, widening the kept store's src and dst slices. Requires both stores to reference the same source variable with adjacent slices (i.e., prerequisite compute merges must be applied first).
+## Algorithm
 
-The algorithm:
-
-1. Group operations by type.
-2. For each pair of the same type, compare operands.
-3. If all operands match except one, check whether the differing operand
-   pair is adjacent and within hardware limits for that op.
-4. If so, report a merge opportunity.
+1. Group statements by `stmt.op`.
+2. For each pair within a group:
+   a. Non-tensor kwargs must match exactly.
+   b. All TensorRef kwargs must reference the same variable names.
+   c. Find dimensions where slices differ. Map each to its named axis via
+      `op.inputs[pos].axes[dim]`.
+   d. All diffs must map to the **same** named axis.
+   e. Each differing slice pair must be adjacent.
+   f. The merged size must satisfy `op.can_merge_operand_dim()`.
+3. If all checks pass, report a merge opportunity.
 
 Like all transforms, operand merge has two steps:
 
 1. **`analyze(func)`** — inspect the IR and return a list of merge pairs.
 2. **`transform(func, pair)`** — apply a single pair, returning a new callable.
 
+### Transform
+
+Each atomic merge does two things:
+
+1. **Merge** two ops into one wider op by widening all kwargs that differ on
+   axis `A` to the merged range (output widens on the same axis).
+2. **Update consumers** by rewriting their indexing slices to point into the
+   correct portion of the wider output.
+
 ## Examples
 
-### Loads
+### `load`
 
-Two loads from the same source tensor that differ on exactly one
-dimension with adjacent ranges. The merged first dimension (partition)
-must be <= 128 (Trn DMA tile constraint).
+Axes: `src = (P, F)`, output = `(P, F)`. Tile limits: `{P: 128}`.
 
-**Before:**
+Two loads from the same source tensor. Both src kwargs reference the same
+variable; slices differ on one axis.
+
+**Free-dim merge** (axis F, no limit):
 
 ```python
-tensor_1 = b[0:128, 0:128]
-tensor_4 = b[0:128, 128:256]
+tensor_1 = nkigym.load(b[0:128, 0:128])
+tensor_4 = nkigym.load(b[0:128, 128:256])
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
 tensor_5 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128])
 ```
 
-**After** (`tensor_4` absorbed into `tensor_1`):
+After (`tensor_4` absorbed into `tensor_1`):
 
 ```python
-tensor_1 = b[0:128, 0:256]
+tensor_1 = nkigym.load(b[0:128, 0:256])
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
 tensor_5 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_1[0:128, 128:256])
 ```
 
-Merging on the first dimension is also valid when the result fits
-within 128:
-
-**Before:**
+**Partition-dim merge** (axis P, limit 128):
 
 ```python
-tensor_0 = a[0:64, 0:128]
-tensor_3 = a[64:128, 0:128]
-tensor_2 = nkigym.nc_matmul(tensor_0[0:64, 0:128], tensor_1[0:64, 0:128])
-tensor_4 = nkigym.nc_matmul(tensor_3[0:64, 0:128], tensor_1[0:64, 0:128])
+tensor_0 = nkigym.load(a[0:64, 0:128])
+tensor_3 = nkigym.load(a[64:128, 0:128])
 ```
 
-**After** (`tensor_3` absorbed into `tensor_0`):
+Merged P = 0:128 (size 128 <= 128) — **accepted**.
 
 ```python
-tensor_0 = a[0:128, 0:128]
-tensor_2 = nkigym.nc_matmul(tensor_0[0:64, 0:128], tensor_1[0:64, 0:128])
-tensor_4 = nkigym.nc_matmul(tensor_0[64:128, 0:128], tensor_1[0:64, 0:128])
+tensor_0 = nkigym.load(a[0:128, 0:128])
+tensor_3 = nkigym.load(a[128:256, 0:128])
 ```
 
-If the merged first dimension would exceed 128, it is not an
-option:
-
-```python
-tensor_0 = a[0:128, 0:128]
-tensor_3 = a[128:256, 0:128]
-```
-
-Merged dim 0 would be 0:256 (size 256 > 128) — **rejected**.
+Merged P = 0:256 (size 256 > 128) — **rejected**.
 
 ### `nc_matmul`
 
-Two matmul calls (`nc_matmul(lhs[K,M], rhs[K,N])`) that share one
-operand and differ on the other with adjacent slices. Either operand
-can be the differing one, subject to tile limits (N <= 512, M <= 128).
+Axes: `stationary = (K, M)`, `moving = (K, N)`, output = `(M, N)`.
+Tile limits: `{K: 128, M: 128, N: 512}`.
 
-**RHS merge** — same LHS, adjacent RHS slices along N:
+Two matmuls where all tensor kwargs reference the same variables but slices
+differ on one axis. Either operand can be the differing one.
 
-**Before:**
+**Moving merge** (axis N):
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
-output[0:128, 0:128] = tensor_2[0:128, 0:128]
+nkigym.store(tensor_2[0:128, 0:128], output[0:128, 0:128])
 
 tensor_5 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 128:256])
-output[0:128, 128:256] = tensor_5[0:128, 0:128]
+nkigym.store(tensor_5[0:128, 0:128], output[0:128, 128:256])
 ```
 
-**After compute merge** (merged N = 256, `tensor_5` absorbed into `tensor_2`):
+After matmul merge (merged N = 256, `tensor_5` absorbed into `tensor_2`):
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:256])
-output[0:128, 0:128] = tensor_2[0:128, 0:128]
-output[0:128, 128:256] = tensor_2[0:128, 128:256]
+nkigym.store(tensor_2[0:128, 0:128], output[0:128, 0:128])
+nkigym.store(tensor_2[0:128, 128:256], output[0:128, 128:256])
 ```
 
-**After store merge** (stores merged into single wider store):
+After store merge:
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:256])
-output[0:128, 0:256] = tensor_2[0:128, 0:256]
+nkigym.store(tensor_2[0:128, 0:256], output[0:128, 0:256])
 ```
 
-**LHS merge** — same RHS, adjacent LHS slices along M:
-
-**Before:**
+**Stationary merge** (axis M):
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:64], tensor_1[0:128, 0:128])
-output[0:64, 0:128] = tensor_2[0:64, 0:128]
+nkigym.store(tensor_2[0:64, 0:128], output[0:64, 0:128])
 
 tensor_4 = nkigym.nc_matmul(tensor_0[0:128, 64:128], tensor_1[0:128, 0:128])
-output[64:128, 0:128] = tensor_4[0:64, 0:128]
+nkigym.store(tensor_4[0:64, 0:128], output[64:128, 0:128])
 ```
 
-**After compute merge** (merged M = 128, `tensor_4` absorbed into `tensor_2`):
+After matmul merge (merged M = 128, `tensor_4` absorbed into `tensor_2`):
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
-output[0:64, 0:128] = tensor_2[0:64, 0:128]
-output[64:128, 0:128] = tensor_2[64:128, 0:128]
+nkigym.store(tensor_2[0:64, 0:128], output[0:64, 0:128])
+nkigym.store(tensor_2[64:128, 0:128], output[64:128, 0:128])
 ```
 
-**After store merge** (stores merged into single wider store):
+After store merge:
 
 ```python
 tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
-output[0:128, 0:128] = tensor_2[0:128, 0:128]
+nkigym.store(tensor_2[0:128, 0:128], output[0:128, 0:128])
 ```
 
-If the merged dimension would exceed the limit, it is not an option:
+**Limit examples** (axis N, limit 512):
+
+Merged N = 0:512 (size 512) — **accepted** (at limit).
+
+Merged N = 0:640 (size 640 > 512) — **rejected**.
+
+### `store`
+
+Axes: `src = (P, F)`, `dst = (P, F)`, output = `(P, F)`. Tile limits:
+`{P: 128}`.
+
+Two stores to the same destination. Both src and dst kwargs reference the same
+variables; slices differ on the same axis (both P or both F).
+
+**Free-dim merge** (axis F):
 
 ```python
-tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:256])
-tensor_5 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 256:512])
+nkigym.store(tensor_2[0:128, 0:128], output[0:128, 0:128])
+nkigym.store(tensor_2[0:128, 128:256], output[0:128, 128:256])
 ```
 
-Merged N would be 0:512 (size 512) — **accepted** (at limit).
+After:
 
 ```python
-tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:384])
-tensor_5 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 384:640])
+nkigym.store(tensor_2[0:128, 0:256], output[0:128, 0:256])
 ```
 
-Merged N would be 0:640 (size 640 > 512) — **rejected**.
-
-### Stores
-
-Two stores to the same output tensor that differ on exactly one
-dimension with adjacent ranges. The merged first dimension (partition)
-must be <= 128, same as loads.
-
-**Before:**
+**Partition-dim merge** (axis P, limit 128):
 
 ```python
-output[0:128, 0:128] = tensor_2[0:128, 0:128]
-output[0:128, 128:256] = tensor_2[0:128, 128:256]
+nkigym.store(tensor_2[0:64, 0:128], output[0:64, 0:128])
+nkigym.store(tensor_2[64:128, 0:128], output[64:128, 0:128])
 ```
 
-**After:**
+After:
 
 ```python
-output[0:128, 0:256] = tensor_2[0:128, 0:256]
+nkigym.store(tensor_2[0:128, 0:128], output[0:128, 0:128])
 ```
 
-Merging on the first dimension:
-
-**Before:**
-
-```python
-output[0:64, 0:128] = tensor_2[0:64, 0:128]
-output[64:128, 0:128] = tensor_2[64:128, 0:128]
-```
-
-**After:**
-
-```python
-output[0:128, 0:128] = tensor_2[0:128, 0:128]
-```
-
-If the merged first dimension would exceed 128, it is not an option:
-
-```python
-output[0:128, 0:128] = tensor_2[0:128, 0:128]
-output[128:256, 0:128] = tensor_2[128:256, 0:128]
-```
-
-Merged dim 0 would be 0:256 (size 256 > 128) — **rejected**.
+Merged P = 0:256 (size 256 > 128) — **rejected**.
 
 ## Operator tile size constraints (Trn2 / NeuronCore-v3)
 
-| Operator | Dimension | Max size |
+Each `GymOp` subclass declares `tile_limits: dict[str, int]` mapping named
+axes to maximum sizes. `can_merge_operand_dim()` checks these. Axes not in
+`tile_limits` are unconstrained. Integer-constant axes (e.g., `1` for
+broadcast) cannot be widened.
+
+| Operator | Axis | Limit |
 |---|---|---|
-| `load` | partition dim (dim 0) | 128 |
-| `store` | partition dim (dim 0) | 128 |
-| `nc_matmul` | M (stationary free) | 128 |
-| `nc_matmul` | K (contraction) | 128 |
-| `nc_matmul` | N (moving free) | 512 |
-| `nc_transpose` | Tensor Engine | 128 x 128 |
-| `activation` | partition dim | 128 |
-| `activation` | free dim | SBUF partition size |
-| `tensor_reduce` | partition dim | 128 |
-| `tensor_reduce` | free dim | SBUF partition size |
-| `tensor_scalar` | operands | broadcast as (P, 1) vectors |
-| `tensor_tensor` | inputs | must match partition size and elements per partition |
+| `load` | P | 128 |
+| `store` | P | 128 |
+| `nc_matmul` | K | 128 |
+| `nc_matmul` | M | 128 |
+| `nc_matmul` | N | 512 |
+| `nc_transpose` | P, F | 128 |
+| `activation` | P | 128 |
+| `tensor_reduce` | P | 128 |
