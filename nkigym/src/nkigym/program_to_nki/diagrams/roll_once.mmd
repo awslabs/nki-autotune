@@ -1,0 +1,7 @@
+flowchart TB
+    A["ast.parse(source)"] --> B["find FunctionDef"]
+    B --> C["_count_loop_depth → i_N"]
+    C --> D["_try_roll_in_body(func.body, i_N)"]
+    D --> E{"rolled?"}
+    E -- yes --> F["ast.fix_missing_locations\nast.unparse → new source"]
+    E -- no --> G["return source unchanged"]

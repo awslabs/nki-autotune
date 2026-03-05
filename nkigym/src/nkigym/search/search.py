@@ -322,13 +322,16 @@ def _finalize_benchmark(
     expected: np.ndarray,
     report: SearchReport,
     mac_count: int,
+    input_dtype_name: str,
 ) -> list[VariantResult]:
     """Wait for compilation and run hardware benchmarks."""
     compile_results = pool.wait_all()
     pool.shutdown()
     succeeded = sum(1 for cr in compile_results if not cr.error)
     report.set_compilation(succeeded=succeeded, failed=len(compile_results) - succeeded)
-    variant_results = run_on_hardware(compile_results, func_name, kernel_kwargs, expected, _WARMUP, _ITERS, mac_count)
+    variant_results = run_on_hardware(
+        compile_results, func_name, kernel_kwargs, expected, _WARMUP, _ITERS, mac_count, input_dtype_name
+    )
     _update_report_variants(report, variant_results)
     report.sort_variants()
     return variant_results
@@ -394,6 +397,7 @@ def search(
     report = SearchReport(save_cache / "results.json")
     program, expected = _prepare_root(func, save_cache, kernel_kwargs)
     mac_count = compute_mac_count(program)
+    input_dtype_name = next(iter(kernel_kwargs.values())).dtype.name
 
     graph = _TransformGraph(program, transforms)
     rng = random.Random() if seed < 0 else random.Random(seed)
@@ -405,7 +409,9 @@ def search(
         save_cache=save_cache, kernel_kwargs=kernel_kwargs, expected=expected, pool=pool, report=report, tol=tol
     )
     qualifying, lowering_errors = _run_search(graph, rng, min_depth, num_targets, ctx)
-    variant_results = _finalize_benchmark(pool, program.name, kernel_kwargs, expected, report, mac_count)
+    variant_results = _finalize_benchmark(
+        pool, program.name, kernel_kwargs, expected, report, mac_count, input_dtype_name
+    )
 
     all_results = lowering_errors + variant_results
     _log_search_summary(report, len(qualifying), all_results)

@@ -449,7 +449,7 @@ def test_nki_matmul_hardware(tmp_path: Path) -> None:
     compile_results = pool.wait_all()
     pool.shutdown()
     expected = nkigym.nc_matmul(a, b)
-    results = run_on_hardware(compile_results, "single_matmul", {"a": a, "b": b}, expected, 2, 3, 128**3)
+    results = run_on_hardware(compile_results, "single_matmul", {"a": a, "b": b}, expected, 2, 3, 128**3, "float32")
     assert len(results) == 1
     assert results[0].correct
     assert results[0].min_ms > 0
@@ -468,7 +468,7 @@ def test_nki_elementwise_hardware(tmp_path: Path) -> None:
     compile_results = pool.wait_all()
     pool.shutdown()
     expected = a * b
-    results = run_on_hardware(compile_results, "ewise_fn", {"a": a, "b": b}, expected, 2, 3, 0)
+    results = run_on_hardware(compile_results, "ewise_fn", {"a": a, "b": b}, expected, 2, 3, 0, "float32")
     assert len(results) == 1
     assert results[0].correct
 
@@ -495,5 +495,5 @@ def test_benchmark_variants_pipeline(tmp_path: Path) -> None:
     compile_results = pool.wait_all()
     pool.shutdown()
     expected = nkigym.nc_matmul(a, b)
-    results = run_on_hardware(compile_results, "single_matmul", {"a": a, "b": b}, expected, 2, 3, 128**3)
+    results = run_on_hardware(compile_results, "single_matmul", {"a": a, "b": b}, expected, 2, 3, 128**3, "float32")
     assert len(results) > 0

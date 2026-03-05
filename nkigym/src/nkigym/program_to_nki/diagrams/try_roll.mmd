@@ -1,0 +1,13 @@
+flowchart TB
+    A["_try_roll_in_body(body)"] --> B["_classify_body_zones"]
+    B --> C["prologue | working | epilogue"]
+    C --> D["_prepare_search_data"]
+    D --> E["_find_best_run(working)"]
+    E --> F{"run found?"}
+    F -- yes --> G["_find_all_runs_for_k\n(all non-overlapping runs)"]
+    G --> H["_build_for each run\nreplace stmts with for-loops"]
+    F -- no --> I["recurse into\nexisting for-loop bodies"]
+    I --> J{"found in\nchild?"}
+    J -- yes --> K["return True"]
+    J -- no --> L["return False"]
+    H --> K

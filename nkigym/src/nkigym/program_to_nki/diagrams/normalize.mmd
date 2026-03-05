@@ -1,0 +1,8 @@
+flowchart LR
+    subgraph before["Block 0 (raw AST dump)"]
+        A["tensor_3 = nl.ndarray(128,128)\nnisa.dma_copy(tensor_3, lhs[128:256])\nnisa.nc_matmul(tensor_2, tensor_3)"]
+    end
+    subgraph after["Block 0 (normalized)"]
+        B["_v0 = nl.ndarray(0,0)\nnisa.dma_copy(_v0, lhs[0:0])\nnisa.nc_matmul(tensor_2, _v0)"]
+    end
+    before -->|"rename locals\nzero ints"| after

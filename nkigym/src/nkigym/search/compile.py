@@ -15,14 +15,24 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import numpy as np
-from neuronxcc.nki_standalone import NKI_IR_VERSION, compile_nki_ir_kernel_to_neff
-from nkipy.core.backend.hlo import HLOModule, HLOTensor
-from nkipy.runtime import BaremetalExecutor, CompiledKernel
+from neuronxcc.nki_standalone import NKI_IR_VERSION, compile_nki_ir_kernel_to_neff  # type: ignore[import-untyped]
+from nkipy.core.backend.hlo import HLOModule, HLOTensor  # type: ignore[import-untyped]
+from nkipy.runtime import BaremetalExecutor, CompiledKernel  # type: ignore[import-untyped]
 
 from nkigym.ir import GymProgram
 from nkigym.program_to_nki.loop_rolling import roll_loops
 
 logger = logging.getLogger(__name__)
+
+_PE_FREQ_HZ = 2.4e9
+_BF16_FLOPS_PER_CYCLE = 2 * 128 * 128
+
+_TRN2_FLOPS_PER_CYCLE: dict[str, int] = {
+    "float8_e4m3fn": 4 * 128 * 128,
+    "float8_e5m2": 4 * 128 * 128,
+    "float16": 2 * 128 * 128,
+    "bfloat16": 2 * 128 * 128,
+}
 
 
 def _init_compile_worker() -> None:
@@ -95,6 +105,7 @@ class _BenchmarkConfig:
     warmup: int
     iters: int
     mac_count: int
+    input_dtype_name: str
 
 
 class _TracedKernel:
@@ -133,6 +144,8 @@ def _load_kernel(nki_path: str, func_name: str) -> Any:
     """Load a kernel function from an NKI source file."""
     module_name = f"nki_kernel_{Path(nki_path).stem}"
     spec = importlib.util.spec_from_file_location(module_name, nki_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load module from {nki_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
@@ -327,12 +340,18 @@ def _split_into_groups(items: list[Any], num_groups: int) -> list[list[Any]]:
     return groups
 
 
-def _calculate_mfu(mac_count: int, time_ms: float) -> float:
-    """Calculate estimated MFU for trn2 (2.4 GHz, 128x128 PE)."""
-    pe_freq = 2.4e9
+def _calculate_mfu(mac_count: int, time_ms: float, dtype_name: str) -> float:
+    """Calculate MFU for trn2 NeuronCore-v3 TensorEngine (2.4 GHz).
+
+    FLOPS/cycle by dtype: FP8(E4/E5) 4*128*128, BF16/FP16 2*128*128.
+    Falls back to BF16 for unrecognized dtypes.
+    """
+    if dtype_name not in _TRN2_FLOPS_PER_CYCLE:
+        logger.warning("Unknown dtype %r for MFU; using BF16 peak", dtype_name)
+    flops_per_cycle = _TRN2_FLOPS_PER_CYCLE.get(dtype_name, _BF16_FLOPS_PER_CYCLE)
     flops = 2 * mac_count
-    actual_pe_cycles = (time_ms / 1000) * pe_freq
-    theoretical_pe_cycles = flops / (2 * 128 * 128)
+    actual_pe_cycles = (time_ms / 1000) * _PE_FREQ_HZ
+    theoretical_pe_cycles = flops / flops_per_cycle
     return theoretical_pe_cycles / actual_pe_cycles
 
 
@@ -371,7 +390,7 @@ def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkC
         p50_ms = _percentile(sorted_durations, 50)
         p99_ms = _percentile(sorted_durations, 99)
         if cfg.mac_count > 0 and min_ms > 0:
-            mfu = _calculate_mfu(cfg.mac_count, min_ms)
+            mfu = _calculate_mfu(cfg.mac_count, min_ms, cfg.input_dtype_name)
         outputs = spike.run(compiled, *cfg.kernel_kwargs.values())
         actual = outputs if isinstance(outputs, np.ndarray) else outputs[0]
         np.testing.assert_allclose(actual, cfg.expected, rtol=1e-3, atol=1e-3)
@@ -442,21 +461,9 @@ def run_on_hardware(
     warmup: int,
     iters: int,
     mac_count: int,
+    input_dtype_name: str,
 ) -> list[VariantResult]:
-    """Run compiled variants on Neuron hardware in parallel across up to 128 cores.
-
-    Args:
-        compile_results: Results from compilation (may include failures).
-        func_name: Kernel function name.
-        kernel_kwargs: Input tensors dict.
-        expected: Expected output for correctness check.
-        warmup: Warmup iterations.
-        iters: Benchmark iterations.
-        mac_count: Total MAC count (same for all variants).
-
-    Returns:
-        List of VariantResult for all variants including compile failures.
-    """
+    """Run compiled variants on Neuron hardware in parallel across up to 128 cores."""
     valid = [(cr.nki_path, cr.neff_path) for cr in compile_results if not cr.error]
     all_results = [_compile_failure_result(cr, mac_count) for cr in compile_results if cr.error]
     if valid:
@@ -470,6 +477,7 @@ def run_on_hardware(
             warmup=warmup,
             iters=iters,
             mac_count=mac_count,
+            input_dtype_name=input_dtype_name,
         )
         groups = _split_into_groups(valid, 128)
         logger.info("Running %d variants on %d Neuron cores", len(valid), len(groups))

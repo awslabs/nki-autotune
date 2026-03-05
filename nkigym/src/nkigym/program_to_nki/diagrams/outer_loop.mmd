@@ -1,0 +1,8 @@
+flowchart TB
+    subgraph roll_loops["roll_loops (fixpoint)"]
+        direction TB
+        A["source code"] --> B["_roll_once"]
+        B --> C{"source\nchanged?"}
+        C -- yes --> B
+        C -- no --> D["return rolled source"]
+    end

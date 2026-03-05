@@ -9,47 +9,14 @@ Python function source, not tied to specific frameworks.
 """
 
 import ast
-import copy
 import re
-from dataclasses import dataclass, field
 
+import numpy as np
 
-@dataclass
-class VaryingConstant:
-    """A constant that varies across blocks in an arithmetic progression.
+from ._loop_rolling_ast import _NO_RUN, VaryingConstant, _build_for, _LoopRun
 
-    Attributes:
-        path: Navigation path from statement root to the constant node.
-            Each step is (field_name, index_or_none).
-        stmt_offset: Index of the statement within the block.
-        base: First value in the arithmetic progression.
-        stride: Common difference between consecutive values.
-    """
-
-    path: tuple[tuple[str, int | None], ...]
-    stmt_offset: int
-    base: int
-    stride: int
-
-
-@dataclass
-class _LoopRun:
-    """A detected repeating run of structurally identical blocks.
-
-    Attributes:
-        start_idx: Starting index in the working statements list.
-        block_size: Number of statements per block (K).
-        trip_count: Number of consecutive matching blocks (N).
-        varying: List of constants that vary across blocks.
-    """
-
-    start_idx: int
-    block_size: int
-    trip_count: int
-    varying: list[VaryingConstant] = field(default_factory=list)
-
-
-_NO_RUN = _LoopRun(start_idx=0, block_size=0, trip_count=0)
+_INT_CONSTANT_RE = re.compile(r"Constant\(value=\d+")
+_NAME_RE = re.compile(r"id='[^']*'")
 
 
 def _is_alloc_stmt(stmt: ast.stmt) -> bool:
@@ -65,12 +32,7 @@ def _is_alloc_stmt(stmt: ast.stmt) -> bool:
 
 
 def _classify_body_zones(body: list[ast.stmt]) -> tuple[int, int]:
-    """Partition a statement list into prologue, working, epilogue zones.
-
-    Prologue: leading np.empty allocations.
-    Epilogue: trailing return statement.
-    Working: everything in between.
-    """
+    """Partition a statement list into prologue, working, epilogue zones."""
     prologue_end = 0
     for i, stmt in enumerate(body):
         if _is_alloc_stmt(stmt):
@@ -109,45 +71,28 @@ def _collect_target_mapping(stmts: list[ast.stmt]) -> dict[str, str]:
     return var_map
 
 
-_INT_CONSTANT_RE = re.compile(r"(?<=Constant\(value=)\d+")
-_NAME_RE = re.compile(r"id='[^']*'")
+def _normalize_block(stmts: list[ast.stmt], zeroed_cache: dict[int, str]) -> str:
+    """Normalize a block for structural comparison (positional names, zeroed ints).
 
-
-def _normalize_block(stmts: list[ast.stmt], dump_cache: dict[int, str]) -> str:
-    """Normalize a block of statements for structural comparison.
-
-    Renames local variables to positional names (_v0, _v1, ...) and
-    replaces all int constants with 0. Operates on ast.dump strings
-    to avoid deep-copying AST nodes. Uses dump_cache to avoid
-    redundant ast.dump calls for the same statement objects.
+    Uses pre-zeroed dump strings (int constants already replaced) so only
+    the variable-renaming regex is needed here.
     """
     var_map = _collect_target_mapping(stmts)
-    parts = []
-    for s in stmts:
-        key = id(s)
-        if key not in dump_cache:
-            dump_cache[key] = ast.dump(s)
-        parts.append(dump_cache[key])
+    parts = [zeroed_cache[id(s)] for s in stmts]
     raw = "\n".join(parts)
     if var_map:
         pattern = "|".join(re.escape(k) for k in sorted(var_map, key=len, reverse=True))
         raw = re.sub(f"id='({pattern})'", lambda m: f"id='{var_map[m.group(1)]}'", raw)
-    raw = _INT_CONSTANT_RE.sub("0", raw)
     return raw
 
 
 def _fingerprint_stmt(stmt: ast.stmt, dump_cache: dict[int, str]) -> int:
-    """Compute a structural fingerprint for fast rejection in block matching.
-
-    Erases all names and integer constants so structurally identical
-    statements (differing only in variable names and constants) produce
-    the same hash. Used as a prefilter before full _normalize_block.
-    """
+    """Hash a statement with names and ints erased for fast rejection."""
     key = id(stmt)
     if key not in dump_cache:
         dump_cache[key] = ast.dump(stmt)
     raw = dump_cache[key]
-    normalized = _INT_CONSTANT_RE.sub("0", _NAME_RE.sub("id='_'", raw))
+    normalized = _INT_CONSTANT_RE.sub("Constant(value=0", _NAME_RE.sub("id='_'", raw))
     return hash(normalized)
 
 
@@ -177,11 +122,7 @@ def _walk_constants(
 
 
 def _is_arithmetic(values: list[int]) -> tuple[bool, int, int]:
-    """Check if values form an arithmetic progression.
-
-    Returns (is_valid, base, stride). When is_valid is False, base
-    and stride are zero.
-    """
+    """Check if values form an arithmetic progression."""
     base = 0
     stride = 0
     is_valid = bool(values)
@@ -195,12 +136,7 @@ def _is_arithmetic(values: list[int]) -> tuple[bool, int, int]:
 def _check_stmt_varying(
     blocks: list[list[ast.stmt]], stmt_offset: int, trip_count: int, varying: list[VaryingConstant]
 ) -> bool:
-    """Check one statement position across blocks for arithmetic patterns.
-
-    Appends any varying constants found to the varying list.
-    Returns False if constant counts mismatch or any position fails
-    the arithmetic progression check.
-    """
+    """Check one statement position across blocks for arithmetic patterns."""
     all_constants = [_collect_int_constants(blocks[bi][stmt_offset]) for bi in range(trip_count)]
     num_constants = len(all_constants[0])
     valid = all(len(bc) == num_constants for bc in all_constants[1:])
@@ -222,11 +158,7 @@ def _check_stmt_varying(
 def _extract_varying(
     working_stmts: list[ast.stmt], block_size: int, trip_count: int, start_idx: int
 ) -> tuple[bool, list[VaryingConstant]]:
-    """Extract varying constants from a run of structurally identical blocks.
-
-    Returns (valid, varying_list). When valid is False, the varying
-    list should be ignored.
-    """
+    """Extract varying constants from a run of structurally identical blocks."""
     blocks = []
     for i in range(trip_count):
         offset = start_idx + i * block_size
@@ -248,28 +180,60 @@ def _collect_assigned_names(stmts: list[ast.stmt]) -> set[str]:
     return names
 
 
-def _collect_referenced_names(stmts: list[ast.stmt]) -> set[str]:
-    """Collect all Name references (loads) from a list of statements."""
-    names: set[str] = set()
+def _precompute_name_data(stmts: list[ast.stmt]) -> tuple[list[set[str]], list[frozenset[str]], list[frozenset[str]]]:
+    """Precompute suffix reference unions and per-statement name sets in one pass.
+
+    Single ast.walk pass collects both the suffix-ref sets (for scope safety)
+    and per-statement assigned/referenced sets (for external-name filtering).
+    Returns (suffix_refs, per_assigned, per_referenced).
+    """
+    n = len(stmts)
+    per_assigned: list[frozenset[str]] = []
+    per_referenced: list[frozenset[str]] = []
     for stmt in stmts:
+        assigned: set[str] = set()
+        referenced: set[str] = set()
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    assigned.add(target.id)
         for node in ast.walk(stmt):
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                names.add(node.id)
-    return names
+                referenced.add(node.id)
+        per_assigned.append(frozenset(assigned))
+        per_referenced.append(frozenset(referenced))
+    suffix_refs: list[set[str]] = [set() for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        suffix_refs[i] = suffix_refs[i + 1] | per_referenced[i]
+    return suffix_refs, per_assigned, per_referenced
 
 
-def _check_scope_safe(working_stmts: list[ast.stmt], start_idx: int, block_size: int, trip_count: int) -> bool:
-    """Check that rolling a run won't hide definitions used after the loop.
+def _block_ext_names(
+    per_assigned: list[frozenset[str]], per_referenced: list[frozenset[str]], start: int, block_size: int
+) -> frozenset[str]:
+    """Compute external names (referenced minus assigned) for a statement block."""
+    assigned: set[str] = set()
+    referenced: set[str] = set()
+    for i in range(start, start + block_size):
+        assigned |= per_assigned[i]
+        referenced |= per_referenced[i]
+    return frozenset(referenced - assigned)
 
-    Returns False if any variable defined inside the rolled region is
-    referenced by statements after the rolled region.
-    """
-    end_idx = start_idx + trip_count * block_size
-    rolled_region = working_stmts[start_idx:end_idx]
-    after_region = working_stmts[end_idx:]
-    defined = _collect_assigned_names(rolled_region)
-    used_after = _collect_referenced_names(after_region)
-    return not (defined & used_after)
+
+def _ext_names_match(
+    per_assigned: list[frozenset[str]],
+    per_referenced: list[frozenset[str]],
+    ext_cache: dict[int, frozenset[str]],
+    pos: int,
+    block_size: int,
+) -> bool:
+    """Check if consecutive blocks at pos and pos+block_size share external names."""
+    if pos not in ext_cache:
+        ext_cache[pos] = _block_ext_names(per_assigned, per_referenced, pos, block_size)
+    cand = pos + block_size
+    if cand not in ext_cache:
+        ext_cache[cand] = _block_ext_names(per_assigned, per_referenced, cand, block_size)
+    return ext_cache[pos] == ext_cache[cand]
 
 
 def _count_matching_blocks(
@@ -278,127 +242,120 @@ def _count_matching_blocks(
     block_size: int,
     n: int,
     cache: dict[int, str],
-    dump_cache: dict[int, str],
+    zeroed_cache: dict[int, str],
     fingerprints: list[int],
 ) -> int:
     """Count consecutive structurally identical blocks starting at a position."""
-    if start not in cache:
-        cache[start] = _normalize_block(working_stmts[start : start + block_size], dump_cache)
-    ref = cache[start]
     count = 1
     while start + (count + 1) * block_size <= n:
         pos = start + count * block_size
         if any(fingerprints[start + i] != fingerprints[pos + i] for i in range(block_size)):
             break
+        if start not in cache:
+            cache[start] = _normalize_block(working_stmts[start : start + block_size], zeroed_cache)
         if pos not in cache:
-            cache[pos] = _normalize_block(working_stmts[pos : pos + block_size], dump_cache)
-        if cache[pos] != ref:
+            cache[pos] = _normalize_block(working_stmts[pos : pos + block_size], zeroed_cache)
+        if cache[pos] != cache[start]:
             break
         count += 1
     return count
 
 
-def _find_best_run(working_stmts: list[ast.stmt]) -> _LoopRun:
-    """Find the repeating run with largest coverage among statements.
+def _block_match_positions(fps: np.ndarray, k: int) -> list[int]:
+    """Find positions where K-element fingerprint blocks match their successor."""
+    n = len(fps)
+    num_positions = n - 2 * k + 1
+    stride = fps.strides[0]
+    block_a = np.lib.stride_tricks.as_strided(fps, shape=(num_positions, k), strides=(stride, stride))
+    block_b = np.lib.stride_tricks.as_strided(fps[k:], shape=(num_positions, k), strides=(stride, stride))
+    return np.flatnonzero(np.all(block_a == block_b, axis=1)).tolist()
 
-    Scans all block sizes K and positions P, scoring each candidate run
-    as count * K (total statements covered). Blocks match when their
-    normalized AST structure is identical (variables renamed to positional
-    placeholders, integer constants zeroed). A candidate is valid only if
-    every integer constant across its blocks forms an arithmetic progression.
 
-    Ties are broken by discovery order (smallest K, earliest P).
+def _prepare_search_data(
+    working_stmts: list[ast.stmt],
+) -> tuple[list[int], dict[int, str], np.ndarray, list[set[str]], list[frozenset[str]], list[frozenset[str]]]:
+    """Build all precomputed data structures for the loop rolling search."""
+    dump_cache: dict[int, str] = {}
+    fingerprints = [_fingerprint_stmt(s, dump_cache) for s in working_stmts]
+    zeroed_cache = {sid: _INT_CONSTANT_RE.sub("Constant(value=0", v) for sid, v in dump_cache.items()}
+    fps = np.array(fingerprints, dtype=np.int64)
+    suffix_refs, stmt_assigned, stmt_refs = _precompute_name_data(working_stmts)
+    return fingerprints, zeroed_cache, fps, suffix_refs, stmt_assigned, stmt_refs
 
-    Returns _NO_RUN sentinel (trip_count=0) if no repeating pattern exists.
-    """
+
+def _find_best_run(
+    working_stmts: list[ast.stmt],
+    fingerprints: list[int],
+    zeroed_cache: dict[int, str],
+    fps: np.ndarray,
+    suffix_refs: list[set[str]],
+    stmt_assigned: list[frozenset[str]],
+    stmt_refs: list[frozenset[str]],
+) -> _LoopRun:
+    """Find the repeating run with largest coverage among statements."""
     n = len(working_stmts)
     best = _NO_RUN
     best_coverage = 0
-    dump_cache: dict[int, str] = {}
-    fingerprints = [_fingerprint_stmt(s, dump_cache) for s in working_stmts]
     for k in range(1, n // 2 + 1):
         if k * (n // k) <= best_coverage:
             continue
+        match_positions = _block_match_positions(fps, k)
         cache: dict[int, str] = {}
-        p = 0
-        while p + 2 * k <= n:
-            count = _count_matching_blocks(working_stmts, p, k, n, cache, dump_cache, fingerprints)
-            if count >= 2 and count * k > best_coverage:
+        ext_cache: dict[int, frozenset[str]] = {}
+        for p in match_positions:
+            if n - p <= best_coverage:
+                break
+            if not _ext_names_match(stmt_assigned, stmt_refs, ext_cache, p, k):
+                continue
+            count = _count_matching_blocks(working_stmts, p, k, n, cache, zeroed_cache, fingerprints)
+            while count >= 2 and count * k > best_coverage:
+                if _collect_assigned_names(working_stmts[p : p + count * k]) & suffix_refs[p + count * k]:
+                    count -= 1
+                    continue
                 valid, varying = _extract_varying(working_stmts, k, count, p)
-                if valid and _check_scope_safe(working_stmts, p, k, count):
+                if valid:
                     best = _LoopRun(p, k, count, varying)
                     best_coverage = count * k
-            p += 1
+                    break
+                count -= 1
     return best
 
 
-def _stride_expr(base_expr: ast.expr, stride: int) -> ast.expr:
-    """Wrap an expression with a stride multiplier (identity when stride=1)."""
-    if stride == 1:
-        result = base_expr
-    else:
-        result = ast.BinOp(left=base_expr, op=ast.Mult(), right=ast.Constant(value=stride))
-    return result
-
-
-def _make_expr(loop_var: str, base: int, stride: int) -> ast.expr:
-    """Create an AST expression for a varying constant.
-
-    Simplification rules: stride=0 gives base; base=0 gives i*stride;
-    base divisible by stride gives (i+offset)*stride; else i*stride+base.
-    """
-    loop_name = ast.Name(id=loop_var, ctx=ast.Load())
-    if stride == 0:
-        result = ast.Constant(value=base)
-    elif base == 0:
-        result = _stride_expr(loop_name, stride)
-    elif base % stride == 0:
-        inner = ast.BinOp(left=loop_name, op=ast.Add(), right=ast.Constant(value=base // stride))
-        result = _stride_expr(inner, stride)
-    else:
-        mult = ast.BinOp(left=loop_name, op=ast.Mult(), right=ast.Constant(value=stride))
-        result = ast.BinOp(left=mult, op=ast.Add(), right=ast.Constant(value=base))
-    return result
-
-
-def _set_at_path(root: ast.AST, path: tuple[tuple[str, int | None], ...], new_node: ast.AST) -> None:
-    """Replace the node at a given path with a new node."""
-    node = root
-    for step in path[:-1]:
-        field_name, index = step
-        value = getattr(node, field_name)
-        if index is not None:
-            node = value[index]
-        else:
-            node = value
-
-    field_name, index = path[-1]
-    if index is not None:
-        getattr(node, field_name)[index] = new_node
-    else:
-        setattr(node, field_name, new_node)
-
-
-def _build_for(run: _LoopRun, working_stmts: list[ast.stmt], loop_var: str) -> ast.For:
-    """Build an ast.For node from a detected LoopRun.
-
-    Deep-copies the first block as a template, replaces varying
-    constants with arithmetic expressions, and wraps in a for loop.
-    """
-    template = [copy.deepcopy(s) for s in working_stmts[run.start_idx : run.start_idx + run.block_size]]
-
-    for vc in run.varying:
-        expr = _make_expr(loop_var, vc.base, vc.stride)
-        _set_at_path(template[vc.stmt_offset], vc.path, expr)
-
-    return ast.For(
-        target=ast.Name(id=loop_var, ctx=ast.Store()),
-        iter=ast.Call(
-            func=ast.Name(id="range", ctx=ast.Load()), args=[ast.Constant(value=run.trip_count)], keywords=[]
-        ),
-        body=template,
-        orelse=[],
-    )
+def _find_all_runs_for_k(
+    working_stmts: list[ast.stmt],
+    block_size: int,
+    fingerprints: list[int],
+    zeroed_cache: dict[int, str],
+    fps: np.ndarray,
+    suffix_refs: list[set[str]],
+    stmt_assigned: list[frozenset[str]],
+    stmt_refs: list[frozenset[str]],
+) -> list[_LoopRun]:
+    """Find all non-overlapping valid runs for a given block size."""
+    n = len(working_stmts)
+    match_positions = _block_match_positions(fps, block_size)
+    runs: list[_LoopRun] = []
+    occupied_end = 0
+    cache: dict[int, str] = {}
+    ext_cache: dict[int, frozenset[str]] = {}
+    for p in match_positions:
+        if p < occupied_end:
+            continue
+        if not _ext_names_match(stmt_assigned, stmt_refs, ext_cache, p, block_size):
+            continue
+        count = _count_matching_blocks(working_stmts, p, block_size, n, cache, zeroed_cache, fingerprints)
+        while count >= 2:
+            end = p + count * block_size
+            if _collect_assigned_names(working_stmts[p:end]) & suffix_refs[end]:
+                count -= 1
+                continue
+            valid, varying = _extract_varying(working_stmts, block_size, count, p)
+            if valid:
+                runs.append(_LoopRun(p, block_size, count, varying))
+                occupied_end = end
+                break
+            count -= 1
+    return runs
 
 
 def _count_loop_depth(tree: ast.AST) -> int:
@@ -413,21 +370,20 @@ def _count_loop_depth(tree: ast.AST) -> int:
 
 
 def _try_roll_in_body(body: list[ast.stmt], loop_var: str) -> bool:
-    """Try to find and apply one repeating run in a statement list.
-
-    Searches the given body for repeating patterns. If none found
-    at this level, recurses into for loop bodies.
-    """
+    """Try to find and apply one repeating run in a statement list."""
     prologue_end, epilogue_start = _classify_body_zones(body)
     working = body[prologue_end:epilogue_start]
+    fingerprints, zeroed, fps, suffix_refs, assigned, refs = _prepare_search_data(working)
 
-    run = _find_best_run(working)
+    run = _find_best_run(working, fingerprints, zeroed, fps, suffix_refs, assigned, refs)
     rolled = False
     if run.trip_count > 0:
-        for_node = _build_for(run, working, loop_var)
-        actual_start = prologue_end + run.start_idx
-        actual_end = actual_start + run.trip_count * run.block_size
-        body[actual_start:actual_end] = [for_node]
+        all_runs = _find_all_runs_for_k(working, run.block_size, fingerprints, zeroed, fps, suffix_refs, assigned, refs)
+        for r in reversed(all_runs):
+            for_node = _build_for(r, working, loop_var)
+            actual_start = prologue_end + r.start_idx
+            actual_end = actual_start + r.trip_count * r.block_size
+            body[actual_start:actual_end] = [for_node]
         rolled = True
 
     if not rolled:
@@ -440,12 +396,7 @@ def _try_roll_in_body(body: list[ast.stmt], loop_var: str) -> bool:
 
 
 def _roll_once(source: str) -> str:
-    """Apply one loop rolling step to the source.
-
-    Parses the source, finds the best repeating run anywhere in the
-    AST (including inside existing for loop bodies), and replaces it
-    with a for loop.
-    """
+    """Apply one loop rolling step to the source."""
     tree = ast.parse(source)
 
     func_def = None
@@ -467,9 +418,6 @@ def _roll_once(source: str) -> str:
 
 def roll_loops(source: str) -> str:
     """Roll all repeating statement patterns into for loops.
-
-    Iteratively detects repeating blocks and collapses them into loops
-    until no more patterns remain. Produces maximally nested loops.
 
     Args:
         source: Python source code string containing a function definition.
