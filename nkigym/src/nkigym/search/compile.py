@@ -1,5 +1,6 @@
 """Compile and benchmark NKI kernel variants on Neuron hardware."""
 
+import ast
 import importlib.util
 import logging
 import os
@@ -19,6 +20,7 @@ from nkipy.core.backend.hlo import HLOModule, HLOTensor
 from nkipy.runtime import BaremetalExecutor, CompiledKernel
 
 from nkigym.ir import GymProgram
+from nkigym.program_to_nki.loop_rolling import roll_loops
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +144,36 @@ def _timeout_handler(signum: int, frame: Any) -> None:
     raise TimeoutError("Compilation timed out after 10 minutes")
 
 
+_NL_AFFINE_RANGE = ast.Attribute(value=ast.Name(id="nl", ctx=ast.Load()), attr="affine_range", ctx=ast.Load())
+
+
+class _RangeToAffine(ast.NodeTransformer):
+    """Replace range(N) with nl.affine_range(N) in for-loop iterators."""
+
+    def visit_For(self, node: ast.For) -> ast.For:
+        """Rewrite for-loop iterator from range to nl.affine_range."""
+        self.generic_visit(node)
+        it = node.iter
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range":
+            it.func = ast.copy_location(_NL_AFFINE_RANGE, it.func)
+        return node
+
+
+def _use_affine_range(source: str) -> str:
+    """Replace range with nl.affine_range in for-loop iterators."""
+    tree = ast.parse(source)
+    tree = _RangeToAffine().visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
+def _roll_nki_source(nki_path: str) -> None:
+    """Apply loop rolling and affine_range substitution to an NKI file."""
+    source = Path(nki_path).read_text()
+    source = _use_affine_range(roll_loops(source))
+    Path(nki_path).write_text(source)
+
+
 def _compile_nki_kernel(
     nki_path: str,
     func_name: str,
@@ -199,6 +231,7 @@ def _compile_worker(
         in_dtype = np.dtype(input_dtype_name)
         out_dtype = np.dtype(output_dtype_name)
         input_tensors = {name: np.zeros(shape, dtype=in_dtype) for name, shape in input_shapes.items()}
+        _roll_nki_source(nki_path)
         neff_path = _compile_nki_kernel(
             nki_path, func_name, input_tensors, output_name, output_shape, out_dtype, compile_dir
         )

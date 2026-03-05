@@ -8,9 +8,9 @@ Every new node is verified against the root function for numerical
 correctness.  Qualifying variants (depth >= min_depth) are saved to disk.
 """
 
-import ast
 import logging
 import random
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,7 +21,6 @@ import numpy as np
 from nkigym.function_to_program import program_to_source, source_to_program, tile_program
 from nkigym.ir import GymProgram
 from nkigym.program_to_nki.gym_to_nki import lower_to_nki
-from nkigym.program_to_nki.loop_rolling import roll_loops
 from nkigym.search.compile import (  # noqa: F401
     CompilationPool,
     SearchResults,
@@ -39,35 +38,6 @@ logger = logging.getLogger(__name__)
 PROGRESS_INTERVAL = 500
 _WARMUP = 10
 _ITERS = 100
-
-_NL_AFFINE_RANGE = ast.Attribute(value=ast.Name(id="nl", ctx=ast.Load()), attr="affine_range", ctx=ast.Load())
-
-
-class _RangeToAffine(ast.NodeTransformer):
-    """Replace ``range(N)`` with ``nl.affine_range(N)`` in for-loop iterators."""
-
-    def visit_For(self, node: ast.For) -> ast.For:
-        """Rewrite for-loop iterator from range to nl.affine_range."""
-        self.generic_visit(node)
-        it = node.iter
-        if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range":
-            it.func = ast.copy_location(_NL_AFFINE_RANGE, it.func)
-        return node
-
-
-def _use_affine_range(source: str) -> str:
-    """Replace ``range`` with ``nl.affine_range`` in for-loop iterators.
-
-    Args:
-        source: NKI kernel source code string.
-
-    Returns:
-        Source with for-loop ranges replaced by nl.affine_range.
-    """
-    tree = ast.parse(source)
-    tree = _RangeToAffine().visit(tree)
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree)
 
 
 def _collect_opportunities_ir(program: GymProgram, transforms: list[Transform]) -> list[tuple[Transform, Any]]:
@@ -211,7 +181,7 @@ def _save_variant(node: _Node, cache_dir: Path) -> tuple[str, str]:
     nki_path = str(nki_dir / f"nki_d{node.depth}_v{node.variant_idx}.py")
     error = ""
     try:
-        nki_source = _use_affine_range(roll_loops(lower_to_nki(node.program)))
+        nki_source = lower_to_nki(node.program)
         Path(nki_path).write_text(nki_source)
     except Exception as e:
         error = _capture_error(e)
@@ -419,7 +389,8 @@ def search(
     Returns:
         SearchResults with qualifying variants and benchmark data.
     """
-    save_cache.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(save_cache, ignore_errors=True)
+    save_cache.mkdir(parents=True)
     report = SearchReport(save_cache / "results.json")
     program, expected = _prepare_root(func, save_cache, kernel_kwargs)
     mac_count = compute_mac_count(program)

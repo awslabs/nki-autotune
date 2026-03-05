@@ -110,6 +110,7 @@ def _collect_target_mapping(stmts: list[ast.stmt]) -> dict[str, str]:
 
 
 _INT_CONSTANT_RE = re.compile(r"(?<=Constant\(value=)\d+")
+_NAME_RE = re.compile(r"id='[^']*'")
 
 
 def _normalize_block(stmts: list[ast.stmt], dump_cache: dict[int, str]) -> str:
@@ -133,6 +134,21 @@ def _normalize_block(stmts: list[ast.stmt], dump_cache: dict[int, str]) -> str:
         raw = re.sub(f"id='({pattern})'", lambda m: f"id='{var_map[m.group(1)]}'", raw)
     raw = _INT_CONSTANT_RE.sub("0", raw)
     return raw
+
+
+def _fingerprint_stmt(stmt: ast.stmt, dump_cache: dict[int, str]) -> int:
+    """Compute a structural fingerprint for fast rejection in block matching.
+
+    Erases all names and integer constants so structurally identical
+    statements (differing only in variable names and constants) produce
+    the same hash. Used as a prefilter before full _normalize_block.
+    """
+    key = id(stmt)
+    if key not in dump_cache:
+        dump_cache[key] = ast.dump(stmt)
+    raw = dump_cache[key]
+    normalized = _INT_CONSTANT_RE.sub("0", _NAME_RE.sub("id='_'", raw))
+    return hash(normalized)
 
 
 def _collect_int_constants(node: ast.AST) -> list[tuple[tuple[tuple[str, int | None], ...], int]]:
@@ -263,6 +279,7 @@ def _count_matching_blocks(
     n: int,
     cache: dict[int, str],
     dump_cache: dict[int, str],
+    fingerprints: list[int],
 ) -> int:
     """Count consecutive structurally identical blocks starting at a position."""
     if start not in cache:
@@ -271,6 +288,8 @@ def _count_matching_blocks(
     count = 1
     while start + (count + 1) * block_size <= n:
         pos = start + count * block_size
+        if any(fingerprints[start + i] != fingerprints[pos + i] for i in range(block_size)):
+            break
         if pos not in cache:
             cache[pos] = _normalize_block(working_stmts[pos : pos + block_size], dump_cache)
         if cache[pos] != ref:
@@ -296,13 +315,14 @@ def _find_best_run(working_stmts: list[ast.stmt]) -> _LoopRun:
     best = _NO_RUN
     best_coverage = 0
     dump_cache: dict[int, str] = {}
+    fingerprints = [_fingerprint_stmt(s, dump_cache) for s in working_stmts]
     for k in range(1, n // 2 + 1):
         if k * (n // k) <= best_coverage:
             continue
         cache: dict[int, str] = {}
         p = 0
         while p + 2 * k <= n:
-            count = _count_matching_blocks(working_stmts, p, k, n, cache, dump_cache)
+            count = _count_matching_blocks(working_stmts, p, k, n, cache, dump_cache, fingerprints)
             if count >= 2 and count * k > best_coverage:
                 valid, varying = _extract_varying(working_stmts, k, count, p)
                 if valid and _check_scope_safe(working_stmts, p, k, count):

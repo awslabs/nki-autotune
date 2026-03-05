@@ -197,3 +197,63 @@ The compilation wait (47s) was previously hidden — compilations ran in paralle
 **Remaining bottleneck — compilation latency is the ceiling:**
 
 The 47s compilation wait is neuronxcc compiling 100 NKI kernels to NEFF. This runs on 191 CPU workers in parallel and is dominated by the compiler itself. Further gains require either fewer qualifying variants (reduce `num_targets`) or faster compilation (compiler-side). The `operand_merge.py` transforms (5.6s of NamedTuple reconstruction) are the next CPU-side target but require cleaning up the file's pre-existing style violations (1,085 lines vs 500 limit) before any edits are accepted by the style hooks.
+
+---
+
+## 2026-03-05
+
+### `roll_loops` bottleneck: fingerprint prefilter + parallelization (`profile` branch)
+
+Profiled `examples/gym.py` on 512×256×512 matmul (4×2×4 tiling, `num_targets=100`). Baseline: 902s end-to-end. 95% of runtime was `_save_variant`, which calls `roll_loops` serially in the main thread.
+
+**Profile breakdown (baseline, 902s):**
+
+| Cost | Time | % |
+|------|------|---|
+| `_save_variant` (serialized `roll_loops` × 100 variants) | ~812s | 90% |
+| Hardware benchmark (compile + run) | ~72s | 8% |
+| Search (transform exploration + verify) | ~4s | <1% |
+
+Within `_save_variant`, `roll_loops` takes 6–12s per variant on ~191 lines of NKI code. `lower_to_nki` is 1ms, `_use_affine_range` is 12ms — both negligible. The root cause is `_find_best_run`, which uses an $O(n^2 \times m)$ algorithm: for each block size K (1..n/2) × each starting position, it calls `_normalize_block` — an expensive string operation (`ast.dump` + regex rename + regex constant-zeroing). On 183 working statements with ~4 convergence iterations, that's ~8s per variant.
+
+**Optimizations applied (902s → 90s, 10× speedup):**
+
+#### 1. Fingerprint prefilter in `_find_best_run` (~8s → ~0.3s per variant)
+
+`program_to_nki/loop_rolling.py:_fingerprint_stmt`, `_count_matching_blocks`, `_find_best_run`
+
+Pre-compute a cheap per-statement "structural fingerprint" — hash of `ast.dump` with all names erased (`id='...'` → `id='_'`) and all integer constants zeroed. Fingerprints are computed once per `_find_best_run` call, reusing the existing `dump_cache` to avoid redundant `ast.dump` calls.
+
+In `_count_matching_blocks`, compare fingerprints element-wise before falling back to full `_normalize_block`. Non-matching blocks (the vast majority) are rejected via integer comparison in O(K) rather than O(K × string_ops). Only fingerprint-matching blocks proceed to full normalization for correctness confirmation.
+
+**Why correct:** The fingerprint is strictly more aggressive than `_normalize_block` — it erases *all* names (not just locally-defined ones), so it may produce false positives (different blocks hashing identically) but never false negatives (matching blocks hashing differently). Full `_normalize_block` + string comparison handles the false positive case. This is a prefilter, not a replacement.
+
+Added `_NAME_RE = re.compile(r"id='[^']*'")` and `_fingerprint_stmt` function (+19 lines total, file at 485/500).
+
+#### 2. Move `roll_loops` into parallel compile workers
+
+`search/search.py`, `search/compile.py`
+
+Moved the `roll_loops` → `_use_affine_range` → write chain from the serialized main-thread `_save_variant` into `_compile_worker`, which runs in 191 parallel `ProcessPoolExecutor` workers. `_save_variant` now only calls `lower_to_nki` and writes the unrolled NKI source. The compile worker reads the file, applies `roll_loops` + `_use_affine_range`, writes it back, then compiles to NEFF — all within the same parallel worker process.
+
+Moved `_NL_AFFINE_RANGE`, `_RangeToAffine`, `_use_affine_range` from `search.py` to `compile.py`. Added `_roll_nki_source` helper in `compile.py`. Removed `import ast` and `roll_loops` import from `search.py`.
+
+**Behavior change:** `roll_loops` errors now surface as compilation errors (`CompileResult.error`) rather than lowering errors in `_save_variant`. Both paths produce `VariantResult` entries with full tracebacks — the classification shift is more accurate since rolling is part of the compile pipeline.
+
+**Why correct:** `roll_loops` is a pure `str → str` AST pass with no dependencies on the search state or other variants. It is safe to run in any process. The NKI source file serves as the interface — the main thread writes unrolled NKI, the worker reads it, rolls it, and overwrites before compiling.
+
+search.py: −32 lines (412/500). compile.py: +32 lines (480/500).
+
+**Post-optimization profile (90s):**
+
+| Cost | Time | % |
+|------|------|---|
+| Hardware benchmark (compile + run) | ~72s | 80% |
+| `_save_variant` (lower_to_nki only) | ~1.1s | 1% |
+| `_save_and_submit` | ~3.7s | 4% |
+| Search + verification | ~3.5s | 4% |
+| Compilation pool wait (includes parallel rolling) | ~8s | 9% |
+
+**Remaining bottleneck — hardware compilation and execution:**
+
+The 72s hardware phase (neuronxcc compilation + Neuron core execution) is the irreducible floor. The CPU-side work (`_save_variant` + search) now totals ~8s. Further pipeline speedup requires either fewer variants or faster neuronxcc compilation.

@@ -68,6 +68,7 @@ class LoadOp(GymOp):
     op_name = "load"
     inputs = (Tensor("src", ("P", "F")),)
     outputs = (Tensor("result", ("P", "F")),)
+    tile_limits = {"P": 128}
 
     @classmethod
     def simulate(cls, *args: np.ndarray, **kwargs: object) -> np.ndarray:
@@ -179,6 +180,7 @@ class StoreOp(GymOp):
     op_name = "store"
     inputs = (Tensor("src", ("P", "F")), Tensor("dst", ("P", "F")))
     outputs = (Tensor("result", ("P", "F")),)
+    tile_limits = {"P": 128}
 
     @classmethod
     def simulate(cls, *args: np.ndarray, **kwargs: object) -> np.ndarray:
