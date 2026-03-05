@@ -24,9 +24,8 @@ class MatmulOp(GymOp):
     def simulate(cls, stationary: np.ndarray, moving: np.ndarray, **kwargs: object) -> np.ndarray:  # type: ignore[override]
         """Compute stationary.T @ moving, optionally accumulating.
 
-        Upcasts to float32 for accumulation to match NKI PSUM hardware
-        behavior. The caller (StoreOp) handles downcasting when writing
-        back to the output buffer.
+        Operates at whatever precision the caller provides (float64 in
+        simulation). No explicit upcasting or downcasting.
 
         Args:
             stationary: Left-hand side array of shape [K, M].
@@ -34,12 +33,12 @@ class MatmulOp(GymOp):
             acc: Accumulation buffer to add the result into.
 
         Returns:
-            Result array of shape [M, N] in float32 (PSUM precision).
+            Result array of shape [M, N].
         """
         acc = kwargs.get("acc")
-        result = np.matmul(stationary.astype(np.float32).T, moving.astype(np.float32))
+        result = np.matmul(stationary.T, moving)
         if acc is not None:
-            result = acc.astype(np.float32) + result  # type: ignore[union-attr]
+            result = acc + result  # type: ignore[union-attr]
         return result
 
     @classmethod

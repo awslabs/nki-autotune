@@ -105,7 +105,7 @@ class GymProgram(NamedTuple):
         Returns:
             The output array (value of the return variable).
         """
-        env: dict[str, np.ndarray] = dict(inputs)
+        env: dict[str, np.ndarray] = {k: v.astype(np.float64) for k, v in inputs.items()}
         for stmt in self.stmts:
             stmt(env)
         return env[self.return_var]

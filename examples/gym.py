@@ -55,7 +55,7 @@ def main() -> None:
         transforms=[DataReuseTransform(), OperandMergeTransform()],
         num_targets=100,
         seed=-1,
-        min_depth=5,
+        min_depth=10,
         save_cache=cache_dir,
         kernel_kwargs={"lhs": lhs, "rhs": rhs},
     )

@@ -202,58 +202,75 @@ The 47s compilation wait is neuronxcc compiling 100 NKI kernels to NEFF. This ru
 
 ## 2026-03-05
 
-### `roll_loops` bottleneck: fingerprint prefilter + parallelization (`profile` branch)
+All float16 matmul on `profile` branch. Hardware: trn2.48xlarge, 16 Neuron devices. Profiled 256³–4096³ (8–32,768 tiles, 29–99,329 stmts). NKI lines $\approx 5.2 \times T^3$, root opportunities $\sim T^4$. Tiling requires M=K.
 
-Profiled `examples/gym.py` on 512×256×512 matmul (4×2×4 tiling, `num_targets=100`). Baseline: 902s end-to-end. 95% of runtime was `_save_variant`, which calls `roll_loops` serially in the main thread.
+### `roll_loops` optimization (902s → 90s)
 
-**Profile breakdown (baseline, 902s):**
+Fingerprint prefilter in `_find_best_run` (~8s → ~0.3s/variant) + parallelized rolling into `_compile_worker` (191 workers).
 
-| Cost | Time | % |
-|------|------|---|
-| `_save_variant` (serialized `roll_loops` × 100 variants) | ~812s | 90% |
-| Hardware benchmark (compile + run) | ~72s | 8% |
-| Search (transform exploration + verify) | ~4s | <1% |
+### Per-node cost model
 
-Within `_save_variant`, `roll_loops` takes 6–12s per variant on ~191 lines of NKI code. `lower_to_nki` is 1ms, `_use_affine_range` is 12ms — both negligible. The root cause is `_find_best_run`, which uses an $O(n^2 \times m)$ algorithm: for each block size K (1..n/2) × each starting position, it calls `_normalize_block` — an expensive string operation (`ast.dump` + regex rename + regex constant-zeroing). On 183 working statements with ~4 convergence iterations, that's ~8s per variant.
+| Scale | OM analyze | Verify | Total/node |
+|---|---|---|---|
+| 1024³ | 20ms | 73ms | 172ms |
+| 2048³ | 503ms | 557ms | 1.26s |
+| 4096³ | 16.5s | 7.6s | 24.4s |
 
-**Optimizations applied (902s → 90s, 10× speedup):**
+OM analyze $O(T^5)$, verify $O(T^3)$ (~65μs/stmt). Two mergeable groups of $T^3$ members; greedy scan still $O(T^5)$. All matches geometrically structured — hash-based dict achieves $O(T^3)$. Asymmetric OM cost depends on $T_M \times T_K \times T_N$, not total stmts.
 
-#### 1. Fingerprint prefilter in `_find_best_run` (~8s → ~0.3s per variant)
+### Search graph (scale-independent)
 
-`program_to_nki/loop_rolling.py:_fingerprint_stmt`, `_count_matching_blocks`, `_find_best_run`
+Identical at 1024³–3072³. Zero duplicates at ≥512³. 50 targets → 131 unique nodes (38.2% qualifying). 200 targets → 349 nodes (57.3%).
 
-Pre-compute a cheap per-statement "structural fingerprint" — hash of `ast.dump` with all names erased (`id='...'` → `id='_'`) and all integer constants zeroed. Fingerprints are computed once per `_find_best_run` call, reusing the existing `dump_cache` to avoid redundant `ast.dump` calls.
+### Compilation and rolling
 
-In `_count_matching_blocks`, compare fingerprints element-wise before falling back to full `_normalize_block`. Non-matching blocks (the vast majority) are rejected via integer comparison in O(K) rather than O(K × string_ops). Only fingerprint-matching blocks proceed to full normalization for correctness confirmation.
+**Loop rolling unnecessary**: hardware-validated at 512³–2048³, identical latency. Impossible at 2048³ ($O(N^{2.3})$, all timeout). Compiler scaling linear: $t = 3.55 + 0.00133 \times \text{lines}$ (R²=0.999). **Stack overflow** between 55K–63K lines (2816³ OK at 133.9s, 2944³ crashes). `--internal-compiler-debug-mode=penguin` required. PGLayoutTilingPipeline accounts for 48.8% of compile time.
 
-**Why correct:** The fingerprint is strictly more aggressive than `_normalize_block` — it erases *all* names (not just locally-defined ones), so it may produce false positives (different blocks hashing identically) but never false negatives (matching blocks hashing differently). Full `_normalize_block` + string comparison handles the false positive case. This is a prefilter, not a replacement.
+### MFU
 
-Added `_NAME_RE = re.compile(r"id='[^']*'")` and `_fingerprint_stmt` function (+19 lines total, file at 485/500).
+| Scale | Max MFU | Min latency | r(depth, MFU) |
+|---|---|---|---|
+| 256³ | 2.62% | 0.016ms | +0.58 |
+| 512³ | 8.74% | 0.039ms | -0.22 |
+| 1024³ | 21.03% | 0.130ms | +0.08 |
+| 1536³ | 23.42% | 0.394ms | +0.03 |
+| 2048³ | 17.24% | 1.267ms | **+0.43** |
 
-#### 2. Move `roll_loops` into parallel compile workers
+Scales as $T^{0.42}$ up to 1536³, then saturates — 2048³ falls 37% below extrapolation (ceiling ~18%). MFU spread widens with scale (0.4% at 512³ → 8.1% at 2048³). Depth helps at ≤8 tiles and again at 2048³ (13.5% at d=3 → 15.7% at d=9); flat at 384–1536³. Asymmetric 1024×2048 also shows r=+0.56. No structural metric predicts MFU (all r < 0.1) — compile and benchmark is the only path.
 
-`search/search.py`, `search/compile.py`
+### Search budget and correctness
 
-Moved the `roll_loops` → `_use_affine_range` → write chain from the serialized main-thread `_save_variant` into `_compile_worker`, which runs in 191 parallel `ProcessPoolExecutor` workers. `_save_variant` now only calls `lower_to_nki` and writes the unrolled NKI source. The compile worker reads the file, applies `roll_loops` + `_use_affine_range`, writes it back, then compiles to NEFF — all within the same parallel worker process.
+**50 variants achieves 97–99.6% of optimal** (Monte Carlo, 1000 trials). At 2048³: 10→50→200 achieves 89.9%→97.2%→100% of 17.24%. All 6,244+ benchmarked variants: 100% correctness.
 
-Moved `_NL_AFFINE_RANGE`, `_RangeToAffine`, `_use_affine_range` from `search.py` to `compile.py`. Added `_roll_nki_source` helper in `compile.py`. Removed `import ast` and `roll_loops` import from `search.py`.
+### Pipeline wall-clock times (skip-rolling)
 
-**Behavior change:** `roll_loops` errors now surface as compilation errors (`CompileResult.error`) rather than lowering errors in `_save_variant`. Both paths produce `VariantResult` entries with full tracebacks — the classification shift is more accurate since rolling is part of the compile pipeline.
+| Config | Search | Compile | NRT + HW | Total |
+|---|---|---|---|---|
+| 768³ × 50 | — | — | — | 52.6s (15.22% MFU) |
+| 1024³ × 100 | — | — | — | 106.0s (20.40%) |
+| 1536³ × 50 | — | — | — | 272.0s (23.44%) |
+| 2048³ × 50 | 106s | 32s | 65s | 203s (16.76%) |
+| 2048³ × 200 | ~360s | ~60s | ~70s | 492s (17.24%) |
 
-**Why correct:** `roll_loops` is a pure `str → str` AST pass with no dependencies on the search state or other variants. It is safe to run in any process. The NKI source file serves as the interface — the main thread writes unrolled NKI, the worker reads it, rolls it, and overwrites before compiling.
+2048³ with rolling: 10/10 fail (636.5s wasted). At 2048³, verify (58%) and OM analyze (38%) dominate search. Memory: 240KB/program at 1024³, 18.8MB at 4096³ (manageable). NRT init: fixed 13-18s floor.
 
-search.py: −32 lines (412/500). compile.py: +32 lines (480/500).
+---
 
-**Post-optimization profile (90s):**
+## Priority Ranking and Implementation Plan (v13)
 
-| Cost | Time | % |
-|------|------|---|
-| Hardware benchmark (compile + run) | ~72s | 80% |
-| `_save_variant` (lower_to_nki only) | ~1.1s | 1% |
-| `_save_and_submit` | ~3.7s | 4% |
-| Search + verification | ~3.5s | 4% |
-| Compilation pool wait (includes parallel rolling) | ~8s | 9% |
+| Rank | Issue | Fix | Impact at 4096³ | Status |
+|---|---|---|---|---|
+| 1 | Rolling $O(N^{2.3})$ | Skip rolling | Required for 2048³+ | **Hardware-validated** |
+| 2 | OM $O(T^5)$ | Hash-based $O(T^3)$ | 5,749s → 144s (40×) | Design ready |
+| 3 | Verification | Skip in search | 2,652s → 0 | 0 failures/6K+ |
 
-**Remaining bottleneck — hardware compilation and execution:**
+**Projected with all 3 fixes:** 1024³: 29s, 2048³: 60s, 4096³: 6.6 min. 3072³+ blocked by stack overflow.
 
-The 72s hardware phase (neuronxcc compilation + Neuron core execution) is the irreducible floor. The CPU-side work (`_save_variant` + search) now totals ~8s. Further pipeline speedup requires either fewer variants or faster neuronxcc compilation.
+---
+
+## Open Questions
+
+1. **neuronxcc stack overflow** (55K–63K lines): partial rolling, loop-aware codegen, or upstream fix
+2. **Depth-MFU at scale**: 2048³ r=+0.43, asymmetric 1024×2048 r=+0.56 — workload-dependent `min_depth`?
+3. **Compiler seed exploration**: multiple seeds for same kernel might outperform transform search
+4. **MFU saturation**: ceiling ~18% at 2048³ vs 26.7% predicted by $T^{0.42}$ fit
