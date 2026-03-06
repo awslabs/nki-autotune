@@ -1,13 +1,17 @@
 flowchart TB
-    A["_try_roll_in_body(body)"] --> B["_classify_body_zones"]
+    A["_try_roll_in_body(body)"] --> B["classify_body_zones"]
     B --> C["prologue | working | epilogue"]
-    C --> D["_prepare_search_data"]
-    D --> E["_find_best_run(working)"]
-    E --> F{"run found?"}
-    F -- yes --> G["_find_all_runs_for_k\n(all non-overlapping runs)"]
+    C --> D["prepare_search_data → _SearchData"]
+    D --> E["_try_spatial_roll"]
+    E --> F{"spatial\nrun found?"}
+    F -- yes --> G["find_all_runs_for_k\n(all non-overlapping runs)"]
     G --> H["_build_for each run\nreplace stmts with for-loops"]
-    F -- no --> I["recurse into\nexisting for-loop bodies"]
-    I --> J{"found in\nchild?"}
-    J -- yes --> K["return True"]
-    J -- no --> L["return False"]
-    H --> K
+    F -- no --> I["_try_reduction_roll"]
+    I --> J{"reduction\nchain found?"}
+    J -- yes --> K["_apply_reduction_chain\npeel + for-loop"]
+    J -- no --> L["recurse into\nexisting for-loop bodies"]
+    L --> M{"found in\nchild?"}
+    M -- yes --> N["return True"]
+    M -- no --> O["return False"]
+    H --> N
+    K --> N

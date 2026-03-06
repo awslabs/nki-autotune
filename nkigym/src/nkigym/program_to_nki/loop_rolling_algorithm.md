@@ -1,7 +1,7 @@
 ---
 title: "Loop Rolling Algorithm"
 subtitle: "Detecting and collapsing repeating statement patterns into for-loops"
-date: 2026-03-05
+date: 2026-03-06
 geometry: margin=0.9in
 fontsize: 11pt
 header-includes:
@@ -66,14 +66,26 @@ source, locates the `FunctionDef`, assigns the next loop variable name
 \caption{Left: fixpoint loop. Center: single rolling step. Right: recursive body search with shared precomputation.}
 \end{figure}
 
-**`_try_roll_in_body`** calls `_prepare_search_data` once to build all
-precomputed data structures, then searches for the best repeating run.
-When a run is found, `_find_all_runs_for_k` collects all non-overlapping
-runs at the same block size, and each is replaced by a for-loop.
-If no patterns are found at the current level, the algorithm recurses
-depth-first into existing for-loop bodies (first match wins).
+**`_try_roll_in_body`** calls `prepare_search_data` once to build a
+`_SearchData` bundle (fingerprints, zeroed dumps, numpy fingerprint array,
+suffix references, per-statement assigned/referenced name sets). This bundle
+is passed to both rolling strategies, eliminating redundant precomputation.
 
-# Core Algorithm: `_find_best_run`
+The algorithm tries two strategies in order:
+
+1. **Spatial rolling** (`_try_spatial_roll`): finds identical repeating blocks
+   where only integer constants vary in arithmetic progressions. Uses
+   `find_all_runs_for_k` to collect all non-overlapping runs at the best
+   block size, replacing each with a for-loop.
+2. **Reduction chain rolling** (`_try_reduction_roll`): finds accumulation
+   patterns where each block's output feeds into the next block via a carried
+   variable (e.g., `acc=prev_result`). Emits a peeled first iteration
+   followed by a for-loop.
+
+If neither strategy finds a pattern at the current level, the algorithm
+recurses depth-first into existing for-loop bodies (first match wins).
+
+# Spatial Rolling
 
 Given $N$ working statements, find the repeating run with maximum
 **coverage** $= K \times C$, where $K$ is block size and $C$ is trip count.
@@ -175,6 +187,87 @@ and retries, continuing down to count $= 2$. This recovers shorter valid
 sub-runs (e.g., 5 out of 7 blocks when only the last 2 have
 cross-references).
 
+# Reduction Chain Rolling
+
+Reduction chains are accumulation patterns where each block feeds its output
+into the next block via a carried variable:
+
+\small
+
+```python
+tensor_2 = nc_matmul(tensor_0, tensor_1)                   # peel (no acc)
+tensor_5 = nc_matmul(tensor_3, tensor_4, acc=tensor_2)     # chain block 1
+tensor_8 = nc_matmul(tensor_6, tensor_7, acc=tensor_5)     # chain block 2
+tensor_11 = nc_matmul(tensor_9, tensor_10, acc=tensor_8)   # chain block 3
+```
+
+\normalsize
+
+These cannot be spatially rolled because: (1) the first block has a
+different structure (no `acc=` argument), (2) each block references a
+variable from the *previous* block (cross-block dependency), and (3) the
+scope safety check would reject the region since intermediate variables
+leak to the next block.
+
+## Detection
+
+The algorithm detects reduction chains in three steps:
+
+1. **Fingerprint matching on chain blocks.** Starting from block size $K$,
+   find positions where $\geq 2$ consecutive blocks have matching
+   per-statement fingerprints. The peel block (at position $P - K$) is
+   allowed to differ by at most 1 fingerprint from the chain blocks.
+
+2. **Carried variable detection.** For each candidate chain, compute the
+   external name sets (referenced $-$ assigned) of each block. All blocks
+   should share a common base of external names, with exactly one
+   **varying** external name per block. These varying names must form a
+   chain: block $i$ assigns the name that block $i+1$ reads externally.
+
+3. **Scope safety.** Verify that no variable defined in the peel+chain
+   region leaks to post-chain code, except the final output variable (which
+   is renamed to the accumulator name).
+
+**Pruning** mirrors spatial rolling: block sizes whose maximum possible
+coverage $K \times \lfloor N/K \rfloor$ cannot beat the current best are
+skipped.
+
+## Code Generation
+
+The chain is emitted as a **peel + for-loop**:
+
+1. **Peel:** deep-copy the peel block, rename the carried output variable
+   to `acc_N`.
+2. **Loop:** build a for-loop from the chain blocks using `_build_for`,
+   then rename both the carried input and carried output to `acc_N`.
+3. **Post-chain:** rename the last output variable to `acc_N` in all
+   subsequent statements.
+
+\small
+
+```python
+acc_0 = nc_matmul(tensor_0, tensor_1)                      # peel
+for i_0 in range(3):
+    tensor_3 = a[(i_0+1)*128:(i_0+2)*128, 0:128]
+    tensor_4 = b[(i_0+1)*128:(i_0+2)*128, 0:128]
+    acc_0 = nc_matmul(tensor_3, tensor_4, acc=acc_0)       # loop body
+output[0:128, 0:128] = acc_0[0:128, 0:128]
+```
+
+\normalsize
+
+## Interaction with Spatial Rolling
+
+When both spatial and reduction patterns exist (e.g., a 2x3 tiled matmul
+with 3 reduction steps), the fixpoint loop handles them in sequence:
+
+1. First iterations: spatial rolling collapses the row/column tile loops.
+2. Later iterations: reduction rolling (applied inside the nested spatial
+   loops) collapses the accumulation chain.
+
+Reduction chains with only 2 blocks (trip count 1) are left unrolled, since
+a for-loop with `range(1)` provides no benefit.
+
 # Code Generation: `_build_for`
 
 Once a valid `_LoopRun(start_idx, block_size, trip_count, varying)` is found:
@@ -186,7 +279,7 @@ Once a valid `_LoopRun(start_idx, block_size, trip_count, varying)` is found:
 |:---|:---|
 | $\text{stride} = 0$ | `base` (literal constant) |
 | $\text{base} = 0$ | `i * stride` |
-| $\text{base} \bmod \text{stride} = 0$ | `(i + base/stride) * stride` |
+| $\text{stride} > 0$ and $\text{base} \bmod \text{stride} = 0$ | `(i + base/stride) * stride` |
 | otherwise | `i * stride + base` |
 
 3. Wrap in `ast.For(target=i_N, iter=range(trip_count), body=template)`.
@@ -198,12 +291,12 @@ Before searching, the function body is partitioned into three zones:
 
 | Zone | Detection | Treatment |
 |:---|:---|:---|
-| **Prologue** | Leading `np.empty(...)` allocations | Excluded from search |
+| **Prologue** | Leading numpy allocation calls (`np.empty`, `np.zeros`, `np.ones`, `np.full`, and `*_like` variants) | Excluded from search |
 | **Working** | Everything between prologue and epilogue | Searched for patterns |
 | **Epilogue** | Trailing `return` statement | Excluded from search |
 
-Only the working zone is passed to `_find_best_run`. The prologue exclusion
-prevents allocation statements from being rolled into loops.
+Only the working zone is passed to the rolling strategies. The prologue
+exclusion prevents allocation statements from being rolled into loops.
 
 # Complexity
 
@@ -211,7 +304,8 @@ For $N$ working statements:
 
 - **Precomputation:** $O(N)$ `ast.dump` calls (cached), $O(N)$ `ast.walk` for
   per-statement name sets and suffix reference unions (single merged pass),
-  $O(N)$ regex substitutions for pre-zeroed dump strings.
+  $O(N)$ regex substitutions for pre-zeroed dump strings. Results are bundled
+  in a `_SearchData` tuple shared across both rolling strategies.
 - **Outer loop:** $O(N/2)$ block sizes, each with a numpy vectorized
   fingerprint match (`_block_match_positions`).
 - **External-name filter:** $O(K)$ set unions per candidate position. Rejects
@@ -245,7 +339,7 @@ The external-name prefilter provides the largest single improvement by
 eliminating 97--100\% of false-positive fingerprint matches before expensive
 normalization. Pre-zeroed dump strings remove a redundant regex pass.
 Merging the `ast.walk` pass and sharing precomputed data between
-`_find_best_run` and `_find_all_runs_for_k` eliminate duplicate work.
+spatial and reduction rolling strategies eliminate duplicate work.
 
 ## Per-Iteration Profile
 
@@ -287,10 +381,9 @@ changes such as period detection to prune block sizes.
    elided. Different-sized tiles cannot be part of the same run at the
    outer level.
 
-3. **Prologue detection is framework-specific.** `_is_alloc_stmt` only
-   recognizes `np.empty(...)`. NKI code uses `nl.ndarray(...)`, which is
-   not detected as prologue. Benign in practice (the output allocation
-   simply becomes part of the working zone).
+3. **Single carried variable.** Reduction chain detection requires exactly
+   one varying external name per block. Multi-accumulator patterns (two
+   independent reductions interleaved in the same block) cannot be rolled.
 
 4. **Unparse--reparse normalization.** The `ast.unparse` $\to$ `ast.parse`
    cycle between fixpoint iterations is essential: it normalizes AST

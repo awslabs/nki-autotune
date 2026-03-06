@@ -1,7 +1,0 @@
-flowchart LR
-    A["All K,P\ncandidates"] -->|"vectorized\nhash match"| B["Step 1:\nFingerprint"]
-    B -->|"O(K) set\nunions"| C["Step 2:\nExt Names"]
-    C -->|"regex\nrename"| D["Step 3:\nNormalize"]
-    D -->|"DFS int\ncollect"| E["Step 4:\nAP Check"]
-    E -->|"suffix\nrefs"| F["Step 5:\nScope"]
-    F --> G["Valid\nRun"]

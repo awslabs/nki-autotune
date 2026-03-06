@@ -163,7 +163,7 @@ def roll2_3x5_red2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def roll2_2x3_red3(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Rolled 2x3 red3 matmul after 2 rolls (nested loops)."""
+    """Rolled 2x3 red3 matmul after 2 rolls (nested loops, reduction unrolled)."""
     output = np.empty((256, 384), dtype=np.float32)
     for i_0 in range(2):
         for i_1 in range(3):
@@ -177,4 +177,48 @@ def roll2_2x3_red3(a: np.ndarray, b: np.ndarray) -> np.ndarray:
             tensor_7 = b[256:384, i_1 * 128 : (i_1 + 1) * 128]
             tensor_8 = nkigym.nc_matmul(tensor_6[0:128, 0:128], tensor_7[0:128, 0:128], acc=tensor_5[0:128, 0:128])
             output[i_0 * 128 : (i_0 + 1) * 128, i_1 * 128 : (i_1 + 1) * 128] = tensor_8[0:128, 0:128]
+    return output
+
+
+def roll1_red4(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Rolled red4 matmul after 1 roll (peel + reduction loop)."""
+    output = np.empty((128, 128), dtype=np.float32)
+    tensor_0 = a[0:128, 0:128]
+    tensor_1 = b[0:128, 0:128]
+    acc_0 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+    for i_0 in range(3):
+        tensor_3 = a[(i_0 + 1) * 128 : (i_0 + 2) * 128, 0:128]
+        tensor_4 = b[(i_0 + 1) * 128 : (i_0 + 2) * 128, 0:128]
+        acc_0 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128], acc=acc_0[0:128, 0:128])
+    output[0:128, 0:128] = acc_0[0:128, 0:128]
+    return output
+
+
+def roll1_red8(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Rolled red8 matmul after 1 roll (peel + reduction loop)."""
+    output = np.empty((128, 128), dtype=np.float32)
+    tensor_0 = a[0:128, 0:128]
+    tensor_1 = b[0:128, 0:128]
+    acc_0 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+    for i_0 in range(7):
+        tensor_3 = a[(i_0 + 1) * 128 : (i_0 + 2) * 128, 0:128]
+        tensor_4 = b[(i_0 + 1) * 128 : (i_0 + 2) * 128, 0:128]
+        acc_0 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128], acc=acc_0[0:128, 0:128])
+    output[0:128, 0:128] = acc_0[0:128, 0:128]
+    return output
+
+
+def roll3_2x3_red3(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Rolled 2x3 red3 matmul after 3 rolls (spatial + reduction)."""
+    output = np.empty((256, 384), dtype=np.float32)
+    for i_0 in range(2):
+        for i_1 in range(3):
+            tensor_0 = a[0:128, i_0 * 128 : (i_0 + 1) * 128]
+            tensor_1 = b[0:128, i_1 * 128 : (i_1 + 1) * 128]
+            acc_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
+            for i_2 in range(2):
+                tensor_3 = a[(i_2 + 1) * 128 : (i_2 + 2) * 128, i_0 * 128 : (i_0 + 1) * 128]
+                tensor_4 = b[(i_2 + 1) * 128 : (i_2 + 2) * 128, i_1 * 128 : (i_1 + 1) * 128]
+                acc_2 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128], acc=acc_2[0:128, 0:128])
+            output[i_0 * 128 : (i_0 + 1) * 128, i_1 * 128 : (i_1 + 1) * 128] = acc_2[0:128, 0:128]
     return output
