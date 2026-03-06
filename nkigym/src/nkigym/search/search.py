@@ -70,20 +70,21 @@ class _Node:
 
 @dataclass
 class _TransformGraph:
-    """Lazily-expanded transform state graph.
+    """Lazily-expanded transform state graph with depth-uniform sampling.
 
     Attributes:
         nodes: Map from program tuple to ``_Node``.
         edges: Map from ``(parent_program, opp_idx)`` to child program.
-        frontier: GymProgram tuples with unexplored opportunities.
+        _depth_buckets: Frontier programs grouped by depth.
+        _bucket_pos: Map from frontier program to position in its bucket.
         transforms: Transforms defining the search space.
         total_programs_visited: Total programs visited (root + expansions).
     """
 
     nodes: dict[GymProgram, _Node] = field(default_factory=dict)
     edges: dict[tuple[GymProgram, int], GymProgram] = field(default_factory=dict)
-    frontier: list[GymProgram] = field(default_factory=list)
-    _frontier_index: dict[GymProgram, int] = field(default_factory=dict)
+    _depth_buckets: dict[int, list[GymProgram]] = field(default_factory=dict)
+    _bucket_pos: dict[GymProgram, int] = field(default_factory=dict)
     transforms: list[Transform] = field(default_factory=list)
     total_programs_visited: int = 0
 
@@ -91,32 +92,34 @@ class _TransformGraph:
         """Initialize the graph with a root node."""
         self.nodes = {}
         self.edges = {}
-        self.frontier = []
-        self._frontier_index = {}
+        self._depth_buckets = {}
+        self._bucket_pos = {}
         self.transforms = transforms
         self.total_programs_visited = 1
         self._add_node(program, depth=0)
 
     def _frontier_add(self, program: GymProgram) -> None:
-        """Add a program to the frontier in O(1)."""
-        self._frontier_index[program] = len(self.frontier)
-        self.frontier.append(program)
+        """Add a program to its depth bucket in O(1)."""
+        depth = self.nodes[program].depth
+        bucket = self._depth_buckets.setdefault(depth, [])
+        self._bucket_pos[program] = len(bucket)
+        bucket.append(program)
 
     def _frontier_remove(self, program: GymProgram) -> None:
-        """Remove a program from the frontier in O(1) via swap-and-pop."""
-        idx = self._frontier_index.pop(program)
-        last = self.frontier[-1]
-        if idx < len(self.frontier) - 1:
-            self.frontier[idx] = last
-            self._frontier_index[last] = idx
-        self.frontier.pop()
+        """Remove a program from its depth bucket in O(1) via swap-and-pop."""
+        depth = self.nodes[program].depth
+        bucket = self._depth_buckets[depth]
+        idx = self._bucket_pos.pop(program)
+        last = bucket[-1]
+        if idx < len(bucket) - 1:
+            bucket[idx] = last
+            self._bucket_pos[last] = idx
+        bucket.pop()
+        if not bucket:
+            del self._depth_buckets[depth]
 
     def _add_node(self, program: GymProgram, depth: int) -> bool:
-        """Register a new node in the graph.
-
-        Returns:
-            True if a new node was created, False if already present.
-        """
+        """Register a new node. Returns True if new."""
         is_new = program not in self.nodes
         if is_new:
             opportunities = _collect_opportunities_ir(program, self.transforms)
@@ -129,13 +132,18 @@ class _TransformGraph:
         return is_new
 
     def expand_one(self, rng: random.Random) -> tuple[bool, GymProgram]:
-        """Expand one unexplored opportunity from a random frontier node.
+        """Expand one opportunity using depth-uniform sampling.
+
+        Uniformly samples a depth, then randomly picks a frontier node
+        from that depth group. Ensures equal expansion rate across all
+        depths regardless of per-depth population size.
 
         Returns:
             Tuple of (is_new, child_program).
         """
         self.total_programs_visited += 1
-        parent_program = rng.choice(self.frontier)
+        d = rng.choice(list(self._depth_buckets.keys()))
+        parent_program = rng.choice(self._depth_buckets[d])
         node = self.nodes[parent_program]
         idx_pos = rng.randrange(len(node.unexplored))
         opp_idx = node.unexplored.pop(idx_pos)
@@ -279,7 +287,7 @@ def _run_search(
         _save_and_submit(root_node, ctx, lowering_errors)
         qualifying.append(root_node.program)
 
-    while len(qualifying) < num_targets and graph.frontier:
+    while len(qualifying) < num_targets and graph._depth_buckets:
         is_new, child_program = graph.expand_one(rng)
         if not is_new:
             continue

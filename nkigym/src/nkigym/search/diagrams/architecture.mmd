@@ -1,0 +1,21 @@
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '18px', 'fontFamily': 'arial'}, 'flowchart': {'nodeSpacing': 30, 'rankSpacing': 40, 'htmlLabels': true}}}%%
+graph TD
+    TG["<b>_TransformGraph</b><br/>frontier with O(1) swap-and-pop"]:::main
+    LOOP["<b>Main Thread Loop</b><br/>expand_one → verify → lower → submit<br/>~0.2s per variant"]:::main
+    CP["<b>CompilationPool</b> (191 workers)<br/>roll_loops + compile_to_neff<br/>~45s per kernel"]:::compile
+    WAIT["<b>pool.wait_all()</b><br/>block for remaining compilations"]:::main
+    HW["<b>Hardware Benchmark</b><br/>NEFFs on up to 128 Neuron cores"]:::bench
+    OUT["<b>results.json</b>"]:::out
+
+    TG -- "random frontier node" --> LOOP
+    LOOP -- "qualifying .nki file" --> CP
+    LOOP -- "next expand_one" --> TG
+    LOOP -- "num_targets reached" --> WAIT
+    CP -- "CompileResult (.neff)" --> WAIT
+    WAIT --> HW
+    HW --> OUT
+
+    classDef main fill:#e8eef7,stroke:#4466dd,stroke-width:2px,color:#222
+    classDef compile fill:#e0ffe0,stroke:#44aa44,stroke-width:2px,color:#222
+    classDef bench fill:#44aa44,stroke:#227722,color:#fff,stroke-width:2px
+    classDef out fill:#ddaa44,stroke:#aa7722,color:#fff,stroke-width:2px
