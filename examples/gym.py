@@ -45,7 +45,7 @@ def main() -> None:
     args = parse_args()
     cache_dir = args.cache_dir
 
-    k, m, n = 1024, 1024, 1024
+    k, m, n = 2048, 2048, 2048
     rng = np.random.default_rng()
     lhs = rng.standard_normal((k, m)).astype(np.float16)
     rhs = rng.standard_normal((k, n)).astype(np.float16)
@@ -55,7 +55,7 @@ def main() -> None:
         transforms=[DataReuseTransform(), OperandMergeTransform()],
         num_targets=100,
         seed=-1,
-        min_depth=10,
+        min_depth=20,
         save_cache=cache_dir,
         kernel_kwargs={"lhs": lhs, "rhs": rhs},
     )

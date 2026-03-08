@@ -1,274 +1,287 @@
 ---
-title: "NKIGym IR Guide: From Python to NKI Kernels"
+title: "NKIGym Guide: From Python to NKI Kernels"
 author: "NKI Autotune"
-date: "2026-03-03"
+date: "2026-03-07"
 geometry: margin=1in
 ---
 
-# NKIGym IR Guide
+# NKIGym Guide
 
-**Running example**: `tanh(a.T @ b)` where `a: [256, 128]`, `b: [256, 128]` --> result `[128, 128]`.
+| Layer | Representation |
+|---|---|
+| **User Function** | Python source using `nkigym.*` ops |
+| | *codegen* |
+| **NKI kernel** | `nki.isa.*` / `nki.language.*` statements + loops (immutable, hashable NamedTuples) |
+| | *transforms* (NKI kernel → NKI kernel) |
 
-| Layer | Representation | Code |
-|---|---|---|
-| **User Function** | Python source using `nkigym.*` ops | |
-| | *codegen* | `function_to_program/` |
-| **GymProgram** | `GymProgram` NamedTuple (immutable, hashable) | `ir/`, `transforms/` |
-| | *codegen* | `program_to_nki/` |
-| **NKI** | `nki.isa.*` / `nki.language.*` source | compiled by `neuronxcc` |
-
-**Codegen** = level changes (`function_to_program/`, `program_to_nki/`). **Transforms** = GymProgram --> GymProgram (same level, `transforms/`).
+**Codegen** = user function → NKI kernel. **Transforms** = NKI kernel → NKI kernel (same level).
 
 ---
 
-## 1. User Function (codegen: function --> GymProgram)
+## 1. Codegen: User Function → NKI Kernel
 
-`source_to_program(source, kwargs) --> GymProgram` (in `function_to_program/`). `kwargs` maps parameter names to values --- numpy arrays for tensor inputs, other Python objects for non-tensor arguments. Shapes are inferred from the arrays; `output_dtype` is inferred from input tensor dtypes (raises if they differ).
+Codegen takes a user function and produces an NKI kernel in one step --- tiling each dimension into 128-wide chunks, introducing loop structure, and lowering to NKI ISA calls.
 
-```python
-source_to_program(matmul_tanh, kwargs={"a": np.zeros((256, 128), dtype=np.float32),
-                                       "b": np.zeros((256, 128), dtype=np.float32)})
-```
+`codegen(func, kwargs)` produces an NKI kernel. `kwargs` maps parameter names to numpy arrays. Shapes are inferred from the arrays; output dtype follows the input tensor dtypes.
+
+**Running example**: `tanh(a.T @ b)` where `a: float16[512, 256]`, `b: float16[512, 256]` → result `float16[256, 256]`.
 
 ### 1.1 User function
 
 ```python
 def matmul_tanh(a, b):
     c = nkigym.nc_matmul(a, b)
-    return nkigym.activation(c, op=np.tanh)
+    result = nkigym.activation(c, op=np.tanh)
+    return result
 ```
 
-### 1.2 Tiled function
+### 1.2 NKI kernel
 
-K=256 exceeds tile limit 128, so codegen splits into 2 reduction tiles with accumulation:
+Codegen tiles dimensions into 128-wide chunks (T_K=4, T_M=2, T_N=2), introduces nested loops, and lowers each construct to NKI ISA calls:
 
-```python
-def matmul_tanh(a, b):
-    tile_0 = nkigym.nc_matmul(a[0:128, 0:128], b[0:128, 0:128])
-    tile_1 = nkigym.nc_matmul(a[128:256, 0:128], b[128:256, 0:128],
-                               acc=tile_0[0:128, 0:128])
-    return nkigym.activation(tile_1[0:128, 0:128], op=np.tanh)
-```
-
-### 1.3 Tiled function with IO
-
-Codegen wraps compute with explicit IO ops --- `np.empty` (allocate), `nkigym.load` (load tile from HBM), `nkigym.store` (write tile to HBM). These are distinct from genuine numpy slicing. Indexing into on-chip results (SBUF/PSUM) uses plain slicing --- the parser distinguishes this from HBM loads and emits `IndexingOp` in the IR.
-
-```python
-def matmul_tanh(a, b):
-    output = np.empty((128, 128), dtype=np.float32)
-
-    tensor_0 = nkigym.load(a[0:128, 0:128])
-    tensor_1 = nkigym.load(b[0:128, 0:128])
-    tensor_2 = nkigym.nc_matmul(tensor_0[0:128, 0:128], tensor_1[0:128, 0:128])
-
-    tensor_3 = nkigym.load(a[128:256, 0:128])
-    tensor_4 = nkigym.load(b[128:256, 0:128])
-    tensor_5 = nkigym.nc_matmul(tensor_3[0:128, 0:128], tensor_4[0:128, 0:128],
-                                 acc=tensor_2[0:128, 0:128])
-
-    tensor_6 = tensor_5[0:128, 0:128]          # index into PSUM (not HBM load)
-    tensor_7 = nkigym.activation(tensor_6[0:128, 0:128], op=np.tanh)
-
-    nkigym.store(tensor_7[0:128, 0:128], output[0:128, 0:128])
-    return output
-```
-
-Parsing this function mechanically produces the GymProgram with `AllocateOp`, `LoadOp`, `MatmulOp`, `IndexingOp`, `ActivationOp`, `StoreOp` statements.
-
-**Statement types**: `AllocateOp` (allocate), `LoadOp` (load tile from HBM), `IndexingOp` (pure indexing into SBUF/PSUM), compute ops (`MatmulOp`, etc.), `StoreOp` (write tile to HBM).
-
----
-
-## 2. GymProgram (in `ir/`)
-
-Translation from function (section 1.3) to GymProgram is purely mechanical --- each function statement maps 1:1 to a GymStatement, with `np.empty` becoming `AllocateOp`, `nkigym.load` becoming `LoadOp`, `nkigym.store` becoming `StoreOp`, and `nkigym.*` compute calls becoming their corresponding op class.
-
-Both representations are directly callable: `matmul(a, b)` runs the function with numpy, `program(a=a, b=b)` interprets the IR by dispatching `stmt.op.simulate()` op by op. Same numpy result either way --- useful for verification.
-
-**IR types**:
-
-```python
-class TensorRef(NamedTuple):
-    name: str                            # variable name
-    shape: tuple[int, ...]               # tensor shape
-    slices: tuple[tuple[int, int], ...]  # per-axis (start, stop), always present
-
-class GymStatement(NamedTuple):
-    op: type[GymOp]                      # the GymOp subclass itself (e.g. MatmulOp)
-    kwargs: tuple[tuple[str, Any], ...]  # (name, value) pairs --- Python objects, not strings
-    output: TensorRef
-
-class GymProgram(NamedTuple):
-    name: str
-    kwargs: dict[str, Any]               # input arrays + non-tensor args (the original caller kwargs)
-    stmts: tuple[GymStatement, ...]
-    return_var: str
-    output_dtype: type                   # inferred from input tensor dtypes (must all match)
-```
-
-**Running example** parsed from section 1.3:
-
-```python
-GymProgram(
-    name="matmul_tanh",
-    kwargs={"a": np.zeros((256, 128), dtype=np.float32),
-            "b": np.zeros((256, 128), dtype=np.float32)},
-    stmts=(
-        GymStatement(AllocateOp, (("dtype", np.float32),),
-            TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
-
-        GymStatement(LoadOp,
-            (("src", TensorRef("a", (256, 128), ((0, 128), (0, 128)))),),
-            TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
-        GymStatement(LoadOp,
-            (("src", TensorRef("b", (256, 128), ((0, 128), (0, 128)))),),
-            TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128)))),
-        GymStatement(MatmulOp,
-            (("stationary", TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128)))),
-             ("moving",     TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))))),
-            TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128)))),
-
-        GymStatement(LoadOp,
-            (("src", TensorRef("a", (256, 128), ((128, 256), (0, 128)))),),
-            TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128)))),
-        GymStatement(LoadOp,
-            (("src", TensorRef("b", (256, 128), ((128, 256), (0, 128)))),),
-            TensorRef("tensor_4", (128, 128), ((0, 128), (0, 128)))),
-        GymStatement(MatmulOp,
-            (("stationary", TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128)))),
-             ("moving",     TensorRef("tensor_4", (128, 128), ((0, 128), (0, 128)))),
-             ("acc",        TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))))),
-            TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128)))),
-
-        GymStatement(IndexingOp,
-            (("src", TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128)))),),
-            TensorRef("tensor_6", (128, 128), ((0, 128), (0, 128)))),
-        GymStatement(ActivationOp,
-            (("data", TensorRef("tensor_6", (128, 128), ((0, 128), (0, 128)))),
-             ("op", np.tanh)),
-            TensorRef("tensor_7", (128, 128), ((0, 128), (0, 128)))),
-
-        GymStatement(StoreOp,
-            (("src", TensorRef("tensor_7", (128, 128), ((0, 128), (0, 128)))),
-             ("dst", TensorRef("output",   (128, 128), ((0, 128), (0, 128))))),
-            TensorRef("output", (128, 128), ((0, 128), (0, 128)))),
-    ),
-    return_var="output",
-    output_dtype=np.float32,
-)
-```
-
-`op` stores the `GymOp` subclass directly --- dispatch is `stmt.op.simulate(...)` / `stmt.op.to_nki(stmt, ctx)` with no registry lookup. `kwargs` replaces the old `params` + `input_shapes` fields --- param names are `kwargs.keys()`, shapes/dtype are read from the numpy arrays. Graph deduplication keys on `stmts` only --- search optimizes a single specialized kernel at a time, so `kwargs` is constant across all variants.
-
----
-
-## 3. Transforms (GymProgram --> GymProgram, in `transforms/`)
-
-```python
-class Transform(ABC):
-    def analyze_ir(self, program: GymProgram) -> list[Any]: ...
-    def transform_ir(self, program: GymProgram, option: Any) -> GymProgram: ...
-```
-
-**OperandMergeTransform** --- finds pairs of the same operator and tries to merge their operands into a wider operation. No distinction between load/compute/store --- the same logic applies uniformly. Checked against `stmt.op.tile_limits`.
-
-```
-Before:  tensor_1 = load(b[0:128, 0:128])
-         tensor_4 = load(b[0:128, 128:256])
-After:   tensor_1 = load(b[0:128, 0:256])       # tensor_4 eliminated, consumers remapped
-
-Before:  tensor_2 = nc_matmul(stationary=t0, moving=t1[0:128, 0:128])
-         tensor_5 = nc_matmul(stationary=t3, moving=t1[0:128, 128:256])
-After:   tensor_2 = nc_matmul(stationary=t0, moving=t1[0:128, 0:256])
-
-Before:  store(tensor_2[0:128, 0:128], output[0:128, 0:128])
-         store(tensor_5[0:128, 0:128], output[0:128, 128:256])
-After:   store(tensor_2[0:128, 0:256], output[0:128, 0:256])
-```
-
-**DataReuseTransform** --- eliminates redundant loads:
-
-```
-Before:  tensor_0 = a[0:128, 0:128]    # subgraph 1
-         tensor_3 = a[0:128, 0:128]    # subgraph 2 (redundant)
-After:   tensor_0 = a[0:128, 0:128]    # tensor_3 eliminated, uses rewritten
-```
-
-### Search
-
-`search(func, transforms, ...) --> SearchResults`
-
-| Phase | Operation | I/O |
-|---|---|---|
-| **Codegen** | `function_to_program/` | User Function --> GymProgram |
-| **Transforms** | Find opportunities | GymProgram --> list[option] |
-| | Apply transform | GymProgram --> GymProgram |
-| | Deduplicate | `stmts` hashing |
-| | Verify | `program(**kwargs)` via `stmt.op.simulate()` |
-| **Codegen** | `program_to_nki/` | GymProgram --> NKI source |
-| **Compile** | neuronxcc | NKI source --> NEFF |
-| **Benchmark** | run\_on\_hardware | NEFF --> metrics |
-
-Search explores thousands of GymProgram variants (cheap `__call__` evaluation). Only qualifying variants cross to NKI and hardware.
-
----
-
-## 4. NKI (codegen: GymProgram --> NKI)
-
-`lower_to_nki(GymProgram) --> str` (in `program_to_nki/`). Dispatches `stmt.op.to_nki(stmt, ctx)` directly, then `roll_loops()` + `_use_affine_range()` compress repeating blocks into loops.
-
-**Lowering rules**:
-
-| GymStatement op | NKI output |
+| User-level construct | NKI output |
 |---|---|
-| `AllocateOp` | `nl.ndarray(..., buffer=nl.shared_hbm)` |
-| `LoadOp` | alloc SBUF + `nisa.dma_copy` (HBM only) |
-| `IndexingOp` | pure indexing (SBUF/PSUM) |
-| `MatmulOp` (first) | alloc PSUM + `nisa.nc_matmul` |
-| `MatmulOp` (acc=) | reuse PSUM via alias |
-| `ActivationOp` | `nisa.activation(...)` on SBUF |
-| `StoreOp` from SBUF | `nisa.dma_copy` to HBM |
-| `StoreOp` from PSUM | `nisa.tensor_copy` --> SBUF staging --> `nisa.dma_copy` to HBM |
+| HBM output allocation | `nl.ndarray(shape, dtype=dtype, buffer=nl.shared_hbm)` |
+| accumulator | `nl.ndarray(shape, dtype=nl.float32, buffer=nl.psum)` |
+| HBM → SBUF load | `nl.ndarray(shape, buffer=nl.sbuf)` + `nisa.dma_copy(dst=tensor, src=hbm_src[slice])` |
+| SBUF → HBM store | `nisa.dma_copy(dst=hbm_dst[slice], src=tensor[slice])` |
+| `c = nkigym.nc_matmul(a, b)` | `nisa.nc_matmul(dst=psum, stationary=a_tile, moving=b_tile)` |
+| PSUM → SBUF staging | `nl.ndarray(staging, buffer=nl.sbuf)` + `nisa.tensor_copy(staging, psum_src)` |
+| `result = nkigym.activation(c, op=np.tanh)` | `nisa.activation(dst=sbuf, data=staged, op=nl.tanh)` |
+| parallel tile dimension | `nl.affine_range(N)` |
+| reduction tile dimension | `nl.sequential_range(N)` |
 
-**Memory**: HBM (input/output) --> SBUF (tiles) --> PSUM (accumulation, float32).
-
-Running example `tanh(a.T @ b)`, single output tile with 2 reduction tiles:
+**Running example** NKI kernel (`a: [512, 256]`, `b: [512, 256]`):
 
 ```python
 @nki.jit
 def matmul_tanh(a, b):
-    output = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.shared_hbm)
-
-    # Reduction tile 0: K=[0:128]
-    tensor_0 = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=tensor_0[0:128, 0:128], src=a[0:128, 0:128])
-    tensor_1 = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=tensor_1[0:128, 0:128], src=b[0:128, 0:128])
-    tensor_2 = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=tensor_2[0:128, 0:128],
-                   stationary=tensor_0[0:128, 0:128],
-                   moving=tensor_1[0:128, 0:128])
-
-    # Reduction tile 1: K=[128:256], accumulate into tensor_2
-    tensor_3 = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=tensor_3[0:128, 0:128], src=a[128:256, 0:128])
-    tensor_4 = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=tensor_4[0:128, 0:128], src=b[128:256, 0:128])
-    nisa.nc_matmul(dst=tensor_2[0:128, 0:128],
-                   stationary=tensor_3[0:128, 0:128],
-                   moving=tensor_4[0:128, 0:128])
-
-    # IndexingOp (PSUM) + ActivationOp (needs SBUF, so PSUM-->SBUF staging)
-    tensor_6 = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=tensor_6[0:128, 0:128], src=tensor_2[0:128, 0:128])
-    tensor_7 = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(dst=tensor_7[0:128, 0:128],
-                    data=tensor_6[0:128, 0:128], op=nl.tanh)
-
-    # StoreOp
-    nisa.dma_copy(dst=output[0:128, 0:128], src=tensor_7[0:128, 0:128])
+    assert a.shape == (512, 256) and b.shape == (512, 256)
+    assert a.dtype == np.float16 and b.dtype == np.float16
+    output = nl.ndarray((256, 256), dtype=a.dtype, buffer=nl.shared_hbm)
+    for p0 in nl.affine_range(2):
+        for p1 in nl.affine_range(2):
+            tensor_0 = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
+            for r0 in nl.sequential_range(4):
+                tensor_1 = nl.ndarray((128, 128), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=tensor_1[0:128, 0:128],
+                              src=a[r0 * 128:(r0 + 1) * 128,
+                                    p0 * 128:(p0 + 1) * 128])
+                tensor_2 = nl.ndarray((128, 128), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=tensor_2[0:128, 0:128],
+                              src=b[r0 * 128:(r0 + 1) * 128,
+                                    p1 * 128:(p1 + 1) * 128])
+                nisa.nc_matmul(dst=tensor_0[0:128, 0:128],
+                               stationary=tensor_1[0:128, 0:128],
+                               moving=tensor_2[0:128, 0:128])
+            tensor_3 = nl.ndarray((128, 128), dtype=a.dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=tensor_3[0:128, 0:128], src=tensor_0[0:128, 0:128])
+            tensor_4 = nl.ndarray((128, 128), dtype=a.dtype, buffer=nl.sbuf)
+            nisa.activation(dst=tensor_4[0:128, 0:128],
+                            data=tensor_3[0:128, 0:128], op=nl.tanh)
+            nisa.dma_copy(dst=output[p0 * 128:(p0 + 1) * 128,
+                                     p1 * 128:(p1 + 1) * 128],
+                          src=tensor_4[0:128, 0:128])
     return output
 ```
 
-With larger output tilings (e.g., 256x256 with 2x2 parallel tiles), `roll_loops()` compresses repeating tile blocks into `nl.affine_range` loops.
+**~25 lines** regardless of tile count --- scaling to 1024³ or 4096³ only changes loop trip counts. This is a real, runnable NKI kernel (the naive baseline). Transforms improve it from here.
+
+---
+
+## 2. Transforms (NKI kernel → NKI kernel)
+
+All transforms use **peel-and-modify**: peel the last two iterations from an `affine_range` loop (trip count T → T−2) into a new trip-count-1 loop with a fresh variable name, then apply the atomic modification to the peeled block. The remaining loop is unchanged. Since `affine_range` iterations are independent, peeling from the boundary is always valid and gives adjacent iterations.
+
+### 2.1 OperandMerge
+
+Operand merge merges two same-op instructions from the peeled iterations into one wider instruction. Any pair of same-op instructions whose operands can be merged (e.g., adjacent slices, compatible shapes) is a candidate --- this applies to `nl.ndarray`, `nisa.dma_copy`, `nisa.nc_matmul`, `nisa.tensor_copy`, `nisa.activation`, etc.
+
+**Before** (each p1 iteration loads a 128-wide B tile):
+
+```python
+for p1 in affine_range(T_N):
+    tensor_1 = nl.ndarray((128, 128), buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_1[0:128, 0:128],
+                  src=b[r0*128:(r0+1)*128, p1*128:(p1+1)*128])
+    nisa.nc_matmul(..., moving=tensor_1[0:128, 0:128])
+```
+
+**After peel** (last two iterations extracted, loop body duplicated with concrete indices):
+
+```python
+for p1 in affine_range(T_N - 2):                             # remaining, unchanged
+    tensor_1 = nl.ndarray((128, 128), buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_1[0:128, 0:128],
+                  src=b[r0*128:(r0+1)*128, p1*128:(p1+1)*128])
+    nisa.nc_matmul(..., moving=tensor_1[0:128, 0:128])
+
+for p2 in affine_range(1):                                    # peeled
+    tensor_2 = nl.ndarray((128, 128), buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_2[0:128, 0:128],
+                  src=b[r0*128:(r0+1)*128, (T_N-2)*128:(T_N-1)*128])
+    nisa.nc_matmul(..., moving=tensor_2[0:128, 0:128])
+    tensor_3 = nl.ndarray((128, 128), buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_3[0:128, 0:128],
+                  src=b[r0*128:(r0+1)*128, (T_N-1)*128:T_N*128])
+    nisa.nc_matmul(..., moving=tensor_3[0:128, 0:128])
+```
+
+**After modify** (merge `nl.ndarray` for tensor_2 + tensor_3, update consumers):
+
+```python
+for p1 in affine_range(T_N - 2):                             # remaining, unchanged
+    tensor_1 = nl.ndarray((128, 128), buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_1[0:128, 0:128],
+                  src=b[r0*128:(r0+1)*128, p1*128:(p1+1)*128])
+    nisa.nc_matmul(..., moving=tensor_1[0:128, 0:128])
+
+for p2 in affine_range(1):                                    # peeled, merged
+    tensor_2 = nl.ndarray((128, 256), buffer=nl.sbuf)         # merged
+    nisa.dma_copy(dst=tensor_2[0:128, 0:128],
+                  src=b[r0*128:(r0+1)*128, (T_N-2)*128:(T_N-1)*128])
+    nisa.dma_copy(dst=tensor_2[0:128, 128:256],
+                  src=b[r0*128:(r0+1)*128, (T_N-1)*128:T_N*128])
+    nisa.nc_matmul(..., moving=tensor_2[0:128, 0:128])
+    nisa.nc_matmul(..., moving=tensor_2[0:128, 128:256])
+```
+
+One atomic step: merge `nl.ndarray`, update consumers. The **next** atomic step (found by search) can merge the two `nisa.dma_copy` in the peeled block (boundary iterations are adjacent → contiguous source slices). The search discovers which steps compose into deeper optimizations.
+
+### 2.2 DataReuseTransform
+
+Data reuse deduplicates identical compute operations within a peeled block. If a compute statement doesn't depend on the peeled loop variable, both copies are identical and one can be removed.
+
+**Before** (tensor_0 load inside p1 loop, but depends only on p0 --- loaded redundantly T_N times):
+
+```python
+for p1 in affine_range(T_N):
+    tensor_0 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_0, src=a[..., p0*128:(p0+1)*128])
+    tensor_1 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_1, src=b[..., p1*128:(p1+1)*128])
+    nisa.nc_matmul(..., stationary=tensor_0, moving=tensor_1)
+```
+
+**After peel** (last two iterations extracted with concrete indices):
+
+```python
+for p1 in affine_range(T_N - 2):                              # remaining, unchanged
+    tensor_0 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_0, src=a[..., p0*128:(p0+1)*128])
+    tensor_1 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_1, src=b[..., p1*128:(p1+1)*128])
+    nisa.nc_matmul(..., stationary=tensor_0, moving=tensor_1)
+
+for p2 in affine_range(1):                                     # peeled
+    tensor_2 = nl.ndarray(..., buffer=nl.sbuf)                  # A alloc, iter T_N-2
+    nisa.dma_copy(dst=tensor_2, src=a[..., p0*128:(p0+1)*128]) # A load, iter T_N-2
+    tensor_3 = nl.ndarray(..., buffer=nl.sbuf)                  # B alloc, iter T_N-2
+    nisa.dma_copy(dst=tensor_3, src=b[..., (T_N-2)*128:(T_N-1)*128])
+    nisa.nc_matmul(..., stationary=tensor_2, moving=tensor_3)
+    tensor_4 = nl.ndarray(..., buffer=nl.sbuf)                  # A alloc, iter T_N-1
+    nisa.dma_copy(dst=tensor_4, src=a[..., p0*128:(p0+1)*128]) # A load, iter T_N-1 (identical to tensor_2)
+    tensor_5 = nl.ndarray(..., buffer=nl.sbuf)                  # B alloc, iter T_N-1
+    nisa.dma_copy(dst=tensor_5, src=b[..., (T_N-1)*128:T_N*128])
+    nisa.nc_matmul(..., stationary=tensor_4, moving=tensor_5)
+```
+
+**After modify** (deduplicate `nisa.dma_copy` for A load --- tensor_4 load is identical to tensor_2, replace and update consumers):
+
+```python
+for p1 in affine_range(T_N - 2):                              # remaining, unchanged
+    tensor_0 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_0, src=a[..., p0*128:(p0+1)*128])
+    tensor_1 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_1, src=b[..., p1*128:(p1+1)*128])
+    nisa.nc_matmul(..., stationary=tensor_0, moving=tensor_1)
+
+for p2 in affine_range(1):                                     # peeled
+    tensor_2 = nl.ndarray(..., buffer=nl.sbuf)                  # A alloc, iter T_N-2
+    nisa.dma_copy(dst=tensor_2, src=a[..., p0*128:(p0+1)*128]) # one copy (was 2)
+    tensor_3 = nl.ndarray(..., buffer=nl.sbuf)                  # B alloc, iter T_N-2
+    nisa.dma_copy(dst=tensor_3, src=b[..., (T_N-2)*128:(T_N-1)*128])
+    nisa.nc_matmul(..., stationary=tensor_2, moving=tensor_3)
+    tensor_4 = nl.ndarray(..., buffer=nl.sbuf)                  # A alloc, iter T_N-1 (now unused)
+    tensor_5 = nl.ndarray(..., buffer=nl.sbuf)                  # B alloc, iter T_N-1
+    nisa.dma_copy(dst=tensor_5, src=b[..., (T_N-1)*128:T_N*128])
+    nisa.nc_matmul(..., stationary=tensor_2, moving=tensor_5)   # shares tensor_2
+```
+
+**After DCE** (removes unused `tensor_4`):
+
+```python
+for p1 in affine_range(T_N - 2):                              # remaining, unchanged
+    tensor_0 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_0, src=a[..., p0*128:(p0+1)*128])
+    tensor_1 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_1, src=b[..., p1*128:(p1+1)*128])
+    nisa.nc_matmul(..., stationary=tensor_0, moving=tensor_1)
+
+for p2 in affine_range(1):                                     # peeled
+    tensor_2 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_2, src=a[..., p0*128:(p0+1)*128])
+    tensor_3 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_3, src=b[..., (T_N-2)*128:(T_N-1)*128])
+    nisa.nc_matmul(..., stationary=tensor_2, moving=tensor_3)
+    tensor_5 = nl.ndarray(..., buffer=nl.sbuf)
+    nisa.dma_copy(dst=tensor_5, src=b[..., (T_N-1)*128:T_N*128])
+    nisa.nc_matmul(..., stationary=tensor_2, moving=tensor_5)
+```
+
+Both `nisa.nc_matmul` now share a single tensor_2 load. Repeated peeling extends reuse across more iterations.
+
+---
+
+## 3. Search
+
+Depth-uniform frontier sampling with NKI kernel deduplication via hashing. Each expand applies one atomic transform. Correctness verification compiles and runs each variant on hardware, comparing against numpy reference output.
+
+![Search architecture](diagrams/search.png)
+
+---
+
+## 4. Design Rules
+
+**Naming**:
+- Intermediates are `tensor_N` with a monotonic counter. Input parameters (`a`, `b`) and `output` keep their original names.
+- Loop variables: `p0/p1/...` for parallel loops (one per output tile dimension), `r0/r1/...` for reduction loops. Peeled blocks get fresh variable names (`p2`, `p3`, ...).
+
+**Slicing**:
+- Every tensor reference carries explicit `[start:end]` slices on all axes --- no bare tensor names, no `:` shorthand.
+
+**Loops**:
+- Each output tile dimension gets its own parallel loop (`nl.affine_range`, independent iterations). Reduction loops use `nl.sequential_range` (carry accumulator state).
+- Loops are always explicit, even with trip count 1 --- loops indicate code blocks.
+- Structure: nested parallel loops → sequential reduction loops → store chain.
+
+**IO and accumulation**:
+- IO is explicit via `nisa.dma_copy` --- loads (`HBM → SBUF`) and stores (`SBUF → HBM`) are separate statements with `dst=` and `src=`.
+- Accumulation is zero-initialized with uniform reduction loops (every matmul writes to the same `dst=` PSUM buffer, no peeled first iteration). PSUM is zero-initialized on allocation in hardware.
+
+**Assertions**: the function asserts concrete shapes and dtypes --- it is specialized for a specific input configuration.
+
+**Atomicity and direction**:
+- Each transform is atomic on a single NKI op type: it modifies one statement and updates its consumers.
+- Transforms never backtrack to modify predecessor statements (forward-only).
+- Atomic steps are independent --- the search may interleave other transforms between steps of a multi-step optimization.
+
+**Peel-and-modify**:
+- The general mechanism for all transforms on looped code.
+- Peel the last two iterations from a loop (trip count T → T−2) into a new trip-count-1 loop with a fresh variable name.
+- Apply the atomic modification to the peeled block. The remaining loop is unchanged.
+- Since `affine_range` iterations are independent, peeling from the boundary is always valid and gives adjacent iterations.
+
+**Declarations vs compute**:
+- `nl.ndarray` are declarations (allocations), not compute --- they are not deduplicated by data reuse transforms.
+- Unused declarations are removed by dead code elimination (DCE).
+- DCE runs automatically after each atomic transform as a cleanup pass, before deduplication.
+
+**Loop preservation**:
+- No loop-level transforms (reorder, tile, fuse) exist as independent search actions.
+- Loop restructuring is always a mechanical consequence of statement-level transforms.
+- This preserves loops throughout the pipeline --- no loop rolling needed.
+
+**Search strategy**:
+- Complex optimizations decompose into sequences of atomic forward steps. Each step enables the next by exposing new opportunities in consumer statements. The search discovers these sequences by exploring depth.
+- The NKI kernel preserves loop structure with symbolic affine expressions on every tensor slice. Transform analysis examines these expressions to identify opportunities --- without unrolling.
