@@ -1,181 +1,112 @@
-"""Data reuse analysis and transform for tiled compute graphs.
+"""Data reuse transform for NKIKernel: deduplicate identical DMA loads.
 
-Identifies tensor slices that can be merged across subgraphs, reducing
-redundant load operations. Operates on the GymProgram IR.
-
-Example::
-
-    reuse = DataReuseTransform()
-    while True:
-        pairs = reuse.analyze_ir(program)
-        if not pairs:
-            break
-        program = reuse.transform_ir(program, pairs[0])
+Scans all blocks for NKIDmaCopy statements loading from HBM (src.name in
+kernel.params). Groups by (src.name, src.slices). Emits TransformOption
+for each pair with identical source. Cross-block pairs trigger block
+concatenation via resolve_option.
 """
 
 from itertools import combinations
 
-from nkigym.ir import GymProgram, GymStatement, TensorRef
-from nkigym.ops.tiling_ops import LoadOp
-from nkigym.transforms.base import Transform
+from nkigym.codegen.types import NKIKernel, _rename_stmt
+from nkigym.ops.dma_copy import NKIDmaCopy
+from nkigym.transforms.base import NKITransform, StmtRef, TransformOption
+from nkigym.transforms.block_merge import replace_block, resolve_option
 
 
-def _rename_ref(ref: TensorRef, rename_map: dict[str, str]) -> TensorRef:
-    """Replace variable name in a TensorRef according to rename_map.
+class DataReuseTransform(NKITransform):
+    """Deduplicate identical DMA loads across blocks.
 
-    Args:
-        ref: Tensor reference to rename.
-        rename_map: Mapping from old variable names to new names.
-
-    Returns:
-        New TensorRef with renamed variable, or original if not in map.
-    """
-    new_name = rename_map.get(ref.name)
-    result = TensorRef(new_name, ref.shape, ref.slices) if new_name is not None else ref
-    return result
-
-
-def _rename_kwargs(
-    kwargs: tuple[tuple[str, object], ...], rename_map: dict[str, str]
-) -> tuple[tuple[str, object], ...]:
-    """Replace variable names in kwargs TensorRef values according to rename_map.
-
-    Args:
-        kwargs: Statement keyword argument pairs.
-        rename_map: Mapping from old variable names to new names.
-
-    Returns:
-        New kwargs tuple with renamed TensorRef values.
-    """
-    new_kwargs: list[tuple[str, object]] = []
-    changed = False
-    for key, value in kwargs:
-        if isinstance(value, TensorRef) and value.name in rename_map:
-            value = TensorRef(rename_map[value.name], value.shape, value.slices)
-            changed = True
-        new_kwargs.append((key, value))
-    return tuple(new_kwargs) if changed else kwargs
-
-
-def _validate_merge_pair(program: GymProgram, keep: str, drop: str) -> None:
-    """Validate that two tensor names can be merged.
-
-    Checks both names exist as np_slice outputs and share identical
-    source slices.
-
-    Args:
-        program: The GymProgram containing the statements.
-        keep: Variable name to keep.
-        drop: Variable name to drop.
-
-    Raises:
-        ValueError: If names are missing or slices don't match.
-    """
-    load_sources: dict[str, tuple[str, tuple[tuple[int, int], ...]]] = {}
-    for stmt in program.stmts:
-        if stmt.op is LoadOp:
-            src_ref = stmt.kwargs[0][1]
-            load_sources[stmt.output.name] = (src_ref.name, src_ref.slices)
-    for tensor_name in (keep, drop):
-        if tensor_name not in load_sources:
-            raise ValueError(f"Tensor '{tensor_name}' not found in program loads")
-    if load_sources[keep] != load_sources[drop]:
-        raise ValueError(f"Tensors '{keep}' and '{drop}' do not share identical slices")
-
-
-class DataReuseTransform(Transform):
-    """Transform that merges redundant tensor loads across subgraphs.
-
-    Identifies tensor slices that access identical data in different
-    subgraphs and merges them into a single load.
-
-    ``analyze_ir()`` returns pairs of tensor variable names that share
-    identical slice patterns. ``transform_ir()`` merges a single pair.
-
-    Example::
-
-        reuse = DataReuseTransform()
-        while True:
-            pairs = reuse.analyze_ir(program)
-            if not pairs:
-                break
-            program = reuse.transform_ir(program, pairs[0])
+    ``analyze()`` finds pairs of DMA loads with identical HBM source.
+    ``apply()`` removes the duplicate and renames downstream refs.
     """
 
     name = "data_reuse"
 
-    def analyze_ir(self, program: GymProgram) -> list[tuple[str, str]]:
-        """Identify pairs of tensor slices that can be merged across subgraphs.
-
-        Groups np_slice statements by (src_name, src_slices) and returns pairs
-        of dst variables that share identical load patterns.
+    def analyze(self, kernel: NKIKernel) -> list[TransformOption]:
+        """Find pairs of DMA loads with identical HBM source slices.
 
         Args:
-            program: GymProgram tuple.
+            kernel: The NKI kernel to analyze.
 
         Returns:
-            List of mergeable pairs. Each pair is a tuple of two tensor
-            variable names that access identical data
-            (e.g., ``('tensor_0', 'tensor_3')``).
+            List of TransformOption pairs.
         """
-        load_groups: dict[tuple[str, tuple[tuple[int, int], ...]], list[str]] = {}
-        for stmt in program.stmts:
-            if stmt.op is not LoadOp:
-                continue
-            src_ref = None
-            for key, value in stmt.kwargs:
-                if key == "src":
-                    src_ref = value
-            if src_ref is None:
-                raise ValueError("np_slice statement missing 'src' kwarg")
-            key = (src_ref.name, src_ref.slices)
-            dst_name = stmt.output.name
-            load_groups.setdefault(key, []).append(dst_name)
+        return _find_reuse_pairs(kernel)
 
-        pairs: list[tuple[str, str]] = []
-        for dst_vars in load_groups.values():
-            if len(dst_vars) >= 2:
-                pairs.extend(combinations(dst_vars, 2))
-        return pairs
-
-    def transform_ir(self, program: GymProgram, pair: tuple[str, str]) -> GymProgram:
-        """Merge a single pair of reusable tensor slices.
-
-        Removes the second tensor's load statement and replaces all its
-        references with the first tensor.
+    def apply(self, kernel: NKIKernel, option: TransformOption) -> NKIKernel:
+        """Remove a duplicate DMA load and rename downstream references.
 
         Args:
-            program: GymProgram to transform.
-            pair: A pair of tensor names from ``analyze_ir()``.
+            kernel: The NKI kernel to transform.
+            option: A TransformOption from ``analyze()``.
 
         Returns:
-            New GymProgram with the pair's redundant load merged.
-
-        Raises:
-            ValueError: If tensor names are identical or don't share slices.
+            New NKIKernel with the duplicate removed.
         """
-        keep, drop = pair
-        if keep == drop:
-            raise ValueError(f"Cannot merge {keep} with itself")
-        _validate_merge_pair(program, keep, drop)
+        return _apply_reuse(kernel, option)
 
-        rename_map = {drop: keep}
-        new_stmts: list[GymStatement] = []
-        for stmt in program.stmts:
-            if stmt.op is LoadOp and stmt.output.name == drop:
+
+def _find_reuse_pairs(kernel: NKIKernel) -> list[TransformOption]:
+    """Scan all blocks for duplicate DMA loads from HBM parameters.
+
+    Args:
+        kernel: The NKI kernel.
+
+    Returns:
+        List of TransformOption pairs for identical loads.
+    """
+    hbm_names = set(kernel.params)
+    groups: dict[tuple[str, tuple[tuple[int, int], ...]], list[StmtRef]] = {}
+    for block in kernel.blocks:
+        for si, stmt in enumerate(block.body):
+            if not isinstance(stmt, NKIDmaCopy):
                 continue
-            new_stmts.append(
-                GymStatement(
-                    op=stmt.op,
-                    kwargs=_rename_kwargs(stmt.kwargs, rename_map),
-                    output=_rename_ref(stmt.output, rename_map),
-                )
-            )
+            if stmt.src.name not in hbm_names:
+                continue
+            key = (stmt.src.name, stmt.src.slices)
+            groups.setdefault(key, []).append(StmtRef(block.name, si))
+    pairs: list[TransformOption] = []
+    for refs in groups.values():
+        if len(refs) >= 2:
+            pairs.extend(TransformOption(a, b) for a, b in combinations(refs, 2))
+    return pairs
 
-        return GymProgram(
-            name=program.name,
-            kwargs=program.kwargs,
-            stmts=tuple(new_stmts),
-            return_var=program.return_var,
-            output_dtype=program.output_dtype,
-        )
+
+def _apply_reuse(kernel: NKIKernel, option: TransformOption) -> NKIKernel:
+    """Remove a duplicate DMA load and rename all downstream consumers.
+
+    Args:
+        kernel: The NKI kernel.
+        option: The reuse pair to apply.
+
+    Returns:
+        New kernel with duplicate removed.
+    """
+    result_kernel, block, idx_a, idx_b = resolve_option(kernel, option)
+    stmt_a = block.body[idx_a]
+    stmt_b = block.body[idx_b]
+    assert isinstance(stmt_a, NKIDmaCopy)
+    assert isinstance(stmt_b, NKIDmaCopy)
+    keep_name = stmt_a.dst.name
+    drop_name = stmt_b.dst.name
+    new_body = _remove_and_rename(block.body, idx_b, drop_name, keep_name)
+    new_block = block._replace(body=new_body)
+    return replace_block(result_kernel, block.name, new_block)
+
+
+def _remove_and_rename(body: tuple, drop_idx: int, old_name: str, new_name: str) -> tuple:
+    """Remove a statement and rename old_name to new_name in remaining stmts.
+
+    Args:
+        body: Block body tuple.
+        drop_idx: Index of statement to remove.
+        old_name: Tensor name to replace.
+        new_name: Replacement tensor name.
+
+    Returns:
+        New body tuple with statement removed and names renamed.
+    """
+    filtered = [s for i, s in enumerate(body) if i != drop_idx]
+    rename_map = {old_name: new_name}
+    return tuple(_rename_stmt(s, rename_map) for s in filtered)

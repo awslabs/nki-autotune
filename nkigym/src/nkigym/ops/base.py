@@ -1,173 +1,73 @@
-"""GymOp abstract base class and Tensor for numpy-level operation wrappers."""
+"""NKIOp frozen dataclass base with registry, simulate, mac_count, and render."""
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
-import numpy as np
+from nkigym.ir.tensor import TensorRef
+
+
+def _render_ref(ref: TensorRef) -> str:
+    """Render TensorRef as 'name[start:end, start:end]'.
+
+    Args:
+        ref: Tensor reference with name and slices.
+
+    Returns:
+        Subscripted string representation.
+    """
+    slices = ", ".join(f"{s}:{e}" for s, e in ref.slices)
+    return f"{ref.name}[{slices}]"
 
 
 @dataclass(frozen=True)
-class Tensor:
-    """Static descriptor for an op's input or output tensor.
+class NKIOp:
+    """Base for all NKI statements.
 
-    Declares the operand name and its axis layout. Each axis is either
-    a ``str`` (named dimension that scales with tiling) or an ``int``
-    (constant size, e.g. ``1`` for broadcast dims like ``[P, 1]``).
-
-    Attributes:
-        name: Operand slot name (e.g., ``"stationary"``, ``"data"``).
-        axes: Dimension layout (e.g., ``("K", "M")`` or ``("P", 1)``).
+    Subclasses with a non-empty ``op_name`` are auto-registered.
+    Compute ops override ``simulate`` and optionally ``mac_count``.
+    Pure IR nodes (alloc, dma_copy, tensor_copy) only implement ``render``.
     """
 
-    name: str
-    axes: tuple[str | int, ...]
+    op_name: ClassVar[str] = ""
+    _registry: ClassVar[dict[str, type["NKIOp"]]] = {}
 
-
-class GymOp(ABC):
-    """Thin stateless wrapper over a numpy operation.
-
-    All state is class-level. Subclasses set class attributes and
-    implement ``simulate``, ``output_shape``, and ``to_nki`` as
-    classmethods. No instantiation needed for dispatch.
-
-    Attributes:
-        op_name: Unique name for registry lookup.
-        inputs: Static descriptors for each input operand.
-        outputs: Static descriptors for each output.
-        tile_limits: Maximum tile sizes per named dimension. Empty means
-            no limits (any merge size accepted).
-    """
-
-    op_name: str
-    inputs: tuple[Tensor, ...]
-    outputs: tuple[Tensor, ...]
-    tile_limits: dict[str, int] = {}
-
-    _registry: dict[str, type["GymOp"]] = {}
-
-    def __init_subclass__(cls, **kwargs: object) -> None:
-        """Auto-register concrete GymOp subclasses by op_name."""
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Auto-register subclasses with non-empty op_name."""
         super().__init_subclass__(**kwargs)
-        if hasattr(cls, "op_name") and not getattr(cls, "_abstract", False):
-            GymOp._registry[cls.op_name] = cls
+        if cls.op_name:
+            NKIOp._registry[cls.op_name] = cls
 
     @classmethod
-    def get(cls, name: str) -> type["GymOp"]:
-        """Look up a registered op by name.
-
-        Args:
-            name: The op_name to look up.
+    def all_ops(cls) -> dict[str, type["NKIOp"]]:
+        """Return a copy of all registered NKIOp subclasses.
 
         Returns:
-            The GymOp subclass registered under that name.
-
-        Raises:
-            KeyError: If no op is registered with the given name.
-        """
-        if name not in cls._registry:
-            raise KeyError(f"Unknown op: {name}")
-        return cls._registry[name]
-
-    @classmethod
-    def all_ops(cls) -> dict[str, type["GymOp"]]:
-        """Return a copy of all registered GymOp subclasses.
-
-        Returns:
-            Dictionary mapping op_name to GymOp subclass.
+            Dictionary mapping op_name to NKIOp subclass.
         """
         return dict(cls._registry)
 
-    @classmethod
-    def can_merge_operand_dim(cls, operand_idx: int, dim: int, merged_size: int) -> bool:
-        """Check whether merging a dimension to a given size is within tile limits.
+    def mac_count(self) -> int:
+        """Count MACs for this op invocation.
 
-        Maps (operand_idx, dim) to the named axis via the ``inputs`` and
-        ``outputs`` descriptors, then checks ``tile_limits``. Integer
-        constant axes (fixed-size dimensions like broadcast ``1``) cannot
-        be widened. Named axes without a ``tile_limits`` entry are
-        unconstrained.
-
-        Args:
-            operand_idx: Index into the combined (inputs + outputs) list.
-            dim: Dimension index within that operand's axes tuple.
-            merged_size: Proposed merged size for this dimension.
+        Default returns 0. Override in compute-heavy ops.
 
         Returns:
-            True if within limits or no limit exists for the named axis.
-            False if the axis is a fixed-size constant.
-
-        Raises:
-            IndexError: If operand_idx or dim is out of range.
+            Number of multiply-accumulate operations.
         """
-        all_tensors = cls.inputs + cls.outputs
-        if operand_idx >= len(all_tensors):
-            raise IndexError(
-                f"operand_idx {operand_idx} out of range for {cls.op_name} "
-                f"with {len(all_tensors)} tensors (inputs + outputs)"
-            )
-        axes = all_tensors[operand_idx].axes
-        if dim >= len(axes):
-            raise IndexError(
-                f"dim {dim} out of range for {cls.op_name} operand "
-                f"{all_tensors[operand_idx].name} with {len(axes)} axes"
-            )
-        axis_name = axes[dim]
-        allowed = False
-        if isinstance(axis_name, str):
-            limit = cls.tile_limits.get(axis_name)
-            allowed = limit is None or merged_size <= limit
-        return allowed
+        return 0
 
-    def __call__(self, *args: np.ndarray, **kwargs: object) -> np.ndarray:
-        """Dispatch to simulate (supports callable instances).
+    def simulate(self, env: dict[str, Any]) -> None:
+        """Execute this statement in the simulation environment.
 
         Args:
-            *args: Input numpy arrays.
-            **kwargs: Op-specific parameters (e.g., ``op=np.tanh``).
+            env: Mutable variable environment mapping names to numpy arrays.
+        """
+        raise NotImplementedError
+
+    def render(self) -> str:
+        """Render this statement as an NKI source line.
 
         Returns:
-            Numpy array result.
+            NKI source code string.
         """
-        return self.simulate(*args, **kwargs)
-
-    @classmethod
-    @abstractmethod
-    def simulate(cls, *args: np.ndarray, **kwargs: object) -> np.ndarray:
-        """Run the op on CPU with numpy.
-
-        Args:
-            *args: Input numpy arrays.
-            **kwargs: Op-specific parameters.
-
-        Returns:
-            Numpy array result.
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def output_shape(cls, input_shapes: tuple[tuple[int, ...], ...]) -> tuple[int, ...]:
-        """Infer output shape from input shapes.
-
-        Args:
-            input_shapes: Tuple of input tensor shapes.
-
-        Returns:
-            Output shape tuple.
-        """
-        ...
-
-    @classmethod
-    @abstractmethod
-    def to_nki(cls, stmt: Any, ctx: Any) -> list[str]:
-        """Lower a GymStatement for this op to NKI source lines.
-
-        Args:
-            stmt: The IR statement (GymStatement) to lower.
-            ctx: Mutable lowering context (_LoweringContext).
-
-        Returns:
-            List of NKI source code lines.
-        """
-        ...
+        raise NotImplementedError

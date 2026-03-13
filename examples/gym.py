@@ -47,8 +47,8 @@ def main() -> None:
 
     k, m, n = 2048, 2048, 2048
     rng = np.random.default_rng()
-    lhs = rng.standard_normal((k, m)).astype(np.float16)
-    rhs = rng.standard_normal((k, n)).astype(np.float16)
+    lhs = rng.standard_normal((k, m))
+    rhs = rng.standard_normal((k, n))
 
     search(
         func=nkigym_matmul,
@@ -57,7 +57,7 @@ def main() -> None:
         seed=-1,
         min_depth=20,
         save_cache=cache_dir,
-        kernel_kwargs={"lhs": lhs, "rhs": rhs},
+        kernel_kwargs={"lhs": lhs.astype(np.float16), "rhs": rhs.astype(np.float16)},
     )
 
 

@@ -1,25 +1,18 @@
 """Transform passes for NKI Gym.
 
-Transforms are atomic rewrites of the tiled IR. Each transform is
-independent and self-contained: it inspects the IR, finds optimization
-opportunities, and applies them. One transform may expose opportunities
-for the next, but they have no internal coupling. The autotuner searches
-over combinations to find the best kernel.
+Transforms are atomic rewrites on NKIKernel. Each transform is
+independent and self-contained: it inspects the kernel, finds optimization
+opportunities, and applies them one at a time.
 
-Every transform follows the analyze/transform protocol defined by the
-``Transform`` base class:
+Every transform follows the analyze/apply protocol defined by the
+``NKITransform`` base class:
 
-1. ``analyze_ir(program)`` — inspect the IR and return a list of opportunities.
-2. ``transform_ir(program, option)`` — apply a single opportunity, returning a new program tuple.
-
-Available transforms:
-
-- ``DataReuseTransform`` — deduplicates identical tensor loads.
-- ``OperandMergeTransform`` — merges adjacent operations on contiguous slices.
+1. ``analyze(kernel)`` — inspect the kernel and return a list of TransformOptions.
+2. ``apply(kernel, option)`` — apply a single option, returning a new kernel.
 """
 
-from nkigym.transforms.base import Transform
+from nkigym.transforms.base import NKITransform, StmtRef, TransformOption
 from nkigym.transforms.data_reuse import DataReuseTransform
 from nkigym.transforms.operand_merge import OperandMergeTransform
 
-__all__ = ["Transform", "DataReuseTransform", "OperandMergeTransform"]
+__all__ = ["DataReuseTransform", "NKITransform", "OperandMergeTransform", "StmtRef", "TransformOption"]

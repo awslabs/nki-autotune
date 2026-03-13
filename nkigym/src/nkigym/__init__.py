@@ -1,40 +1,48 @@
 """NKI Gym - Tunable kernel environment for AWS Trainium hardware.
 
-Pipeline: workload spec -> tiling -> transforms -> lower to NKI
+Pipeline: user function -> codegen -> NKIKernel -> transforms -> render -> NKI source
 
 Subpackages:
-    ops: Operator definitions and registry (GymOp, MatmulOp, etc.)
-    tiling: Dimension analysis and tiled code generation
-    transforms: Optimization passes on the tiled IR (e.g., data reuse)
-    codegen: Lowering from nkigym IR to target kernel code (e.g., NKI)
+    ops: Operator definitions and registry (NKIOp, NKIMatmul, etc.)
+    codegen: AST-based codegen producing NKIKernel directly
+    transforms: Optimization passes on NKIKernel (data reuse, operand merge)
+    search: Transform graph search with hardware benchmarking
     utils: Code generation helpers and logging
-    ir: Conversion between callable, source, and IR representations
+    ir: Tensor reference types (TensorRef)
 """
 
-from nkigym.ops import ActivationOp, GymOp, LoadOp, MatmulOp, NcTransposeOp, StoreOp, TensorScalarOp, TensorTensorOp
+from typing import Any
 
-nc_matmul = MatmulOp()
-nc_transpose = NcTransposeOp()
-activation = ActivationOp()
-tensor_tensor = TensorTensorOp()
-tensor_scalar = TensorScalarOp()
-load = LoadOp()
-store = StoreOp()
+import numpy as np
 
-__all__ = [
-    "GymOp",
-    "MatmulOp",
-    "NcTransposeOp",
-    "ActivationOp",
-    "TensorTensorOp",
-    "TensorScalarOp",
-    "LoadOp",
-    "StoreOp",
-    "nc_matmul",
-    "nc_transpose",
-    "activation",
-    "tensor_tensor",
-    "tensor_scalar",
-    "load",
-    "store",
-]
+from nkigym.ops.base import NKIOp
+from nkigym.ops.matmul import NKIMatmul
+
+
+def nc_matmul(*args: Any, **kwargs: Any) -> Any:
+    """Matrix multiply: stationary.T @ moving, with optional accumulation.
+
+    Returns:
+        Numpy array result of shape [M, N].
+    """
+    stationary, moving = args[0], args[1]
+    acc = kwargs.get("acc")
+    result = np.matmul(stationary.T, moving)
+    if acc is not None:
+        result = np.asarray(acc) + result
+    return result
+
+
+def activation(*args: Any, **kwargs: Any) -> Any:
+    """Apply element-wise activation function.
+
+    Returns:
+        Activated numpy array.
+    """
+    data = args[0]
+    op_fn = kwargs.get("op")
+    result = op_fn(data) if op_fn is not None else data
+    return result
+
+
+__all__ = ["NKIOp", "NKIMatmul", "nc_matmul", "activation"]

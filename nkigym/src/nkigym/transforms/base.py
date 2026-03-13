@@ -1,27 +1,46 @@
-"""Base class for NKI Gym IR transforms.
+"""NKITransform ABC and option types for NKIKernel transforms.
 
-All transforms follow the analyze-then-transform pattern on GymProgram:
+All transforms follow the analyze-then-apply pattern on NKIKernel:
 
-1. ``analyze_ir(program)`` — inspect a GymProgram and return a list of
-   individual transform opportunities.
-2. ``transform_ir(program, option)`` — apply a single opportunity, returning
-   a new GymProgram.
-
-The autotuner calls ``analyze_ir()`` to discover opportunities, selects which
-to apply, and calls ``transform_ir()`` for each.
+1. ``analyze(kernel)`` — inspect an NKIKernel and return a list of TransformOptions.
+2. ``apply(kernel, option)`` — apply a single option, returning a new NKIKernel.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import NamedTuple
 
-from nkigym.ir import GymProgram
+from nkigym.codegen.types import NKIKernel
 
 
-class Transform(ABC):
-    """Base class for nkigym IR transforms.
+class StmtRef(NamedTuple):
+    """Reference to a specific statement within a block.
 
-    Subclasses implement ``analyze_ir`` and ``transform_ir`` which operate
-    on GymProgram directly.
+    Attributes:
+        block_name: Name of the block (e.g. ``"_block_0"``).
+        stmt_idx: Index of the statement within the block body.
+    """
+
+    block_name: str
+    stmt_idx: int
+
+
+class TransformOption(NamedTuple):
+    """A single transform opportunity identified by analyze().
+
+    Attributes:
+        ref_a: First statement reference.
+        ref_b: Second statement reference.
+    """
+
+    ref_a: StmtRef
+    ref_b: StmtRef
+
+
+class NKITransform(ABC):
+    """Base class for NKIKernel transforms.
+
+    Subclasses implement ``analyze`` and ``apply`` which operate
+    on NKIKernel directly.
 
     Attributes:
         name: Human-readable name for logging and diagnostics.
@@ -30,25 +49,27 @@ class Transform(ABC):
     name: str
 
     @abstractmethod
-    def analyze_ir(self, program: GymProgram) -> list[Any]:
-        """Find optimization opportunities on a GymProgram.
+    def analyze(self, kernel: NKIKernel) -> list[TransformOption]:
+        """Find optimization opportunities on an NKIKernel.
 
         Args:
-            program: A tiled GymProgram.
+            kernel: An NKI kernel.
 
         Returns:
-            List of transform opportunities. Each element is a single option
-            that can be passed to ``transform_ir()``.
+            List of TransformOption instances.
         """
 
     @abstractmethod
-    def transform_ir(self, program: GymProgram, option: Any) -> GymProgram:
-        """Apply one opportunity, return new GymProgram.
+    def apply(self, kernel: NKIKernel, option: TransformOption) -> NKIKernel:
+        """Apply one opportunity, return new NKIKernel.
 
         Args:
-            program: GymProgram to transform.
-            option: A single opportunity from ``analyze_ir()``.
+            kernel: NKIKernel to transform.
+            option: A single option from ``analyze()``.
 
         Returns:
-            New GymProgram with the optimization applied.
+            New NKIKernel with the optimization applied.
         """
+
+
+Transform = NKITransform

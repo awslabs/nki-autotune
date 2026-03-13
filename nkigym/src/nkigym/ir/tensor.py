@@ -1,4 +1,4 @@
-"""Typed tensor reference for GymProgram IR."""
+"""Typed tensor reference for NKI Gym IR."""
 
 from typing import Any, NamedTuple
 
