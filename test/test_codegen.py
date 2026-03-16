@@ -17,15 +17,24 @@ def matmul_tanh(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return nkigym.activation(c, op=np.tanh)
 
 
-_KWARGS = {"a": np.zeros((256, 256), dtype=np.float16), "b": np.zeros((256, 256), dtype=np.float16)}
+_RNG = np.random.default_rng(42)
+_KWARGS = {
+    "a": _RNG.standard_normal((256, 256)).astype(np.float16),
+    "b": _RNG.standard_normal((256, 256)).astype(np.float16),
+}
 
 
 class TestCodegen:
     """End-to-end codegen(func, kwargs) -> NKIKernel."""
 
     def test_full_kernel(self) -> None:
-        """Codegen produces expected golden kernel."""
-        assert codegen(matmul_tanh, _KWARGS) == MATMUL_TANH_KERNEL
+        """Codegen produces expected golden kernel and matches numpy semantics."""
+        kernel = codegen(matmul_tanh, _KWARGS)
+        assert kernel == MATMUL_TANH_KERNEL
+        kwargs_f64 = {k: v.astype(np.float64) for k, v in _KWARGS.items()}
+        expected = matmul_tanh(**kwargs_f64)
+        actual = kernel.simulate(_KWARGS)
+        np.testing.assert_allclose(actual, expected)
 
 
 class TestNormalize:

@@ -8,7 +8,6 @@ Modules:
 
 from nkigym.codegen.codegen import codegen
 from nkigym.codegen.dce import dce
-from nkigym.codegen.simulate import simulate
 from nkigym.codegen.types import NKIBlock, NKIKernel, normalize
 from nkigym.ops import NKIActivation, NKIAlloc, NKIDmaCopy, NKIMatmul, NKIOp, NKITensorCopy
 
@@ -24,5 +23,4 @@ __all__ = [
     "codegen",
     "dce",
     "normalize",
-    "simulate",
 ]

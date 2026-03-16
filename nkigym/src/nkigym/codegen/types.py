@@ -2,7 +2,9 @@
 
 import dataclasses
 import re
-from typing import NamedTuple
+from typing import Any, NamedTuple
+
+import numpy as np
 
 from nkigym.ir.tensor import TensorRef
 from nkigym.ops.base import NKIOp
@@ -22,6 +24,15 @@ class NKIBlock(NamedTuple):
     name: str
     params: tuple[str, ...]
     body: tuple[NKIOp, ...]
+
+    def simulate(self, env: dict[str, Any]) -> None:
+        """Execute each statement in this block against the environment.
+
+        Args:
+            env: Mutable mapping of variable names to numpy arrays.
+        """
+        for stmt in self.body:
+            stmt.simulate(env)
 
     def render(self) -> str:
         """Render this block as a Python function definition.
@@ -54,6 +65,21 @@ class NKIKernel(NamedTuple):
     dtype: str
     output_shape: tuple[int, ...]
     blocks: tuple[NKIBlock, ...]
+
+    def simulate(self, kwargs: dict[str, np.ndarray]) -> np.ndarray:
+        """Execute the kernel with numpy, returning the output array.
+
+        Args:
+            kwargs: Input arrays keyed by parameter name.
+
+        Returns:
+            The output numpy array.
+        """
+        env: dict[str, Any] = {k: np.asarray(v, dtype=np.float64) for k, v in kwargs.items()}
+        env["output"] = np.zeros(self.output_shape, dtype=np.float64)
+        for block in self.blocks:
+            block.simulate(env)
+        return env["output"]
 
     @property
     def mac_count(self) -> int:

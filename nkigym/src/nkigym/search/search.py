@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from nkigym.codegen import codegen, dce, normalize, simulate
+from nkigym.codegen import codegen, dce, normalize
 from nkigym.codegen.types import NKIKernel
 from nkigym.search.compile import (  # noqa: F401
     CompilationPool,
@@ -155,7 +155,7 @@ class _TransformGraph:
 
 def _verify_node(node: _Node, sim_kwargs: dict[str, Any], expected: np.ndarray) -> None:
     """Simulate a node's kernel and check numerical correctness."""
-    actual = simulate(node.kernel, sim_kwargs)
+    actual = node.kernel.simulate(sim_kwargs)
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
 
 
