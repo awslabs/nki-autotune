@@ -60,7 +60,8 @@ def concat_blocks(block_a: NKIBlock, block_b: NKIBlock) -> NKIBlock:
             rename_map[old_name] = f"tensor_{max_idx}"
     renamed_body = tuple(_rename_stmt(s, rename_map) for s in block_b.body) if rename_map else block_b.body
     merged_params = tuple(dict.fromkeys(list(block_a.params) + list(block_b.params)))
-    return NKIBlock(name=block_a.name, params=merged_params, body=block_a.body + renamed_body)
+    name = _merged_block_name(block_a.name, block_b.name)
+    return NKIBlock(name=name, params=merged_params, body=block_a.body + renamed_body)
 
 
 def rename_refs(block: NKIBlock, old: str, new: str) -> NKIBlock:
@@ -148,6 +149,32 @@ def remove_block(kernel: NKIKernel, name: str) -> NKIKernel:
     return kernel._replace(blocks=blocks)
 
 
+def _block_indices(name: str) -> list[int]:
+    """Extract numeric indices from a block name like ``_block_0_1_2``.
+
+    Args:
+        name: Block name with ``_block_`` prefix.
+
+    Returns:
+        Sorted list of integer indices.
+    """
+    return [int(x) for x in name.removeprefix("_block_").split("_")]
+
+
+def _merged_block_name(name_a: str, name_b: str) -> str:
+    """Combine two block names into a sorted merged name.
+
+    Args:
+        name_a: First block name (e.g. ``"_block_0"``).
+        name_b: Second block name (e.g. ``"_block_1"``).
+
+    Returns:
+        Merged name with sorted indices (e.g. ``"_block_0_1"``).
+    """
+    indices = sorted(set(_block_indices(name_a) + _block_indices(name_b)))
+    return "_block_" + "_".join(str(i) for i in indices)
+
+
 def _find_block(kernel: NKIKernel, name: str) -> NKIBlock:
     """Look up a block by name.
 
@@ -176,9 +203,10 @@ def _collect_tensor_names(block: NKIBlock) -> set[str]:
     Returns:
         Set of tensor variable names.
     """
+    params = set(block.params)
     names: set[str] = set()
     for stmt in block.body:
-        names.update(_stmt_names(stmt))
+        names.update(n for n in _stmt_names(stmt) if n not in params)
     return names
 
 

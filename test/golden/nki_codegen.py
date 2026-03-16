@@ -10,104 +10,223 @@ from nkigym.ops.dma_copy import NKIDmaCopy
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.tensor_copy import NKITensorCopy
 
-_T = (128, 128)
-_S = ((0, 128), (0, 128))
-_O = (256, 256)
+OUTPUT_SHAPE = (256, 256)
 _PARAMS = ("a", "b", "output")
-
-
-def _r(name: str, shape: tuple[int, ...], slices: tuple[tuple[int, int], ...]) -> TensorRef:
-    """Create a TensorRef shorthand.
-
-    Args:
-        name: Variable name.
-        shape: Tensor shape.
-        slices: Per-axis (start, stop) bounds.
-
-    Returns:
-        TensorRef instance.
-    """
-    return TensorRef(name, shape, slices)
-
-
-def _sbuf_alloc(idx: int) -> NKIAlloc:
-    """Create an SBUF alloc for tensor_<idx>.
-
-    Args:
-        idx: Tensor index.
-
-    Returns:
-        NKIAlloc for SBUF.
-    """
-    return NKIAlloc(dst=f"tensor_{idx}", shape=_T, dtype="nl.float16", buffer="sbuf")
-
-
-def _block_body(
-    base: int, a_slices_0: tuple, b_slices_0: tuple, a_slices_1: tuple, b_slices_1: tuple, out_slices: tuple
-) -> tuple:
-    """Build the 16-statement body for one matmul+tanh block.
-
-    Args:
-        base: Starting tensor index for this block.
-        a_slices_0: HBM slices for 'a' at reduction position 0.
-        b_slices_0: HBM slices for 'b' at reduction position 0.
-        a_slices_1: HBM slices for 'a' at reduction position 1.
-        b_slices_1: HBM slices for 'b' at reduction position 1.
-        out_slices: Output HBM slices.
-
-    Returns:
-        Tuple of 16 NKIStmt instances.
-    """
-    psum = _r(f"tensor_{base}", _T, _S)
-    return (
-        NKIAlloc(dst=f"tensor_{base}", shape=_T, dtype="nl.float32", buffer="psum"),
-        _sbuf_alloc(base + 1),
-        NKIDmaCopy(dst=_r(f"tensor_{base + 1}", _T, _S), src=_r("a", _T, a_slices_0)),
-        _sbuf_alloc(base + 2),
-        NKIDmaCopy(dst=_r(f"tensor_{base + 2}", _T, _S), src=_r("b", _T, b_slices_0)),
-        NKIMatmul(dst=psum, stationary=_r(f"tensor_{base + 1}", _T, _S), moving=_r(f"tensor_{base + 2}", _T, _S)),
-        _sbuf_alloc(base + 3),
-        NKIDmaCopy(dst=_r(f"tensor_{base + 3}", _T, _S), src=_r("a", _T, a_slices_1)),
-        _sbuf_alloc(base + 4),
-        NKIDmaCopy(dst=_r(f"tensor_{base + 4}", _T, _S), src=_r("b", _T, b_slices_1)),
-        NKIMatmul(dst=psum, stationary=_r(f"tensor_{base + 3}", _T, _S), moving=_r(f"tensor_{base + 4}", _T, _S)),
-        _sbuf_alloc(base + 5),
-        NKITensorCopy(dst=_r(f"tensor_{base + 5}", _T, _S), src=psum),
-        _sbuf_alloc(base + 6),
-        NKIActivation(dst=_r(f"tensor_{base + 6}", _T, _S), src=_r(f"tensor_{base + 5}", _T, _S), op="nl.tanh"),
-        NKIDmaCopy(dst=_r("output", _O, out_slices), src=_r(f"tensor_{base + 6}", _T, _S)),
-    )
-
-
-_HI = (128, 256)
-
-
-MATMUL_TANH_BLOCK_0 = NKIBlock(
-    name="_block_0", params=_PARAMS, body=_block_body(0, _S, _S, ((128, 256), (0, 128)), ((128, 256), (0, 128)), _S)
-)
 
 MATMUL_TANH_KERNEL = NKIKernel(
     name="matmul_tanh",
     params=("a", "b"),
-    input_shapes=(_O, _O),
+    input_shapes=(OUTPUT_SHAPE, OUTPUT_SHAPE),
     dtype="nl.float16",
-    output_shape=_O,
+    output_shape=OUTPUT_SHAPE,
     blocks=(
-        MATMUL_TANH_BLOCK_0,
+        NKIBlock(
+            name="_block_0",
+            params=_PARAMS,
+            body=(
+                NKIAlloc(dst="tensor_0", shape=(128, 128), dtype="nl.float32", buffer="psum"),
+                NKIAlloc(dst="tensor_1", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_2", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("b", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIMatmul(
+                    dst=TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                    stationary=TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
+                    moving=TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_3", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((128, 256), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_4", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_4", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("b", (128, 128), ((128, 256), (0, 128))),
+                ),
+                NKIMatmul(
+                    dst=TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                    stationary=TensorRef("tensor_3", (128, 128), ((0, 128), (0, 128))),
+                    moving=TensorRef("tensor_4", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_5", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKITensorCopy(
+                    dst=TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_6", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIActivation(
+                    dst=TensorRef("tensor_6", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
+                    op="nl.tanh",
+                ),
+                NKIDmaCopy(
+                    dst=TensorRef("output", OUTPUT_SHAPE, ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_6", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
+        ),
         NKIBlock(
             name="_block_1",
             params=_PARAMS,
-            body=_block_body(7, _S, ((0, 128), _HI), ((128, 256), (0, 128)), ((128, 256), _HI), ((0, 128), _HI)),
+            body=(
+                NKIAlloc(dst="tensor_7", shape=(128, 128), dtype="nl.float32", buffer="psum"),
+                NKIAlloc(dst="tensor_8", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_8", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_9", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_9", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("b", (128, 128), ((0, 128), (128, 256))),
+                ),
+                NKIMatmul(
+                    dst=TensorRef("tensor_7", (128, 128), ((0, 128), (0, 128))),
+                    stationary=TensorRef("tensor_8", (128, 128), ((0, 128), (0, 128))),
+                    moving=TensorRef("tensor_9", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_10", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_10", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((128, 256), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_11", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_11", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("b", (128, 128), ((128, 256), (128, 256))),
+                ),
+                NKIMatmul(
+                    dst=TensorRef("tensor_7", (128, 128), ((0, 128), (0, 128))),
+                    stationary=TensorRef("tensor_10", (128, 128), ((0, 128), (0, 128))),
+                    moving=TensorRef("tensor_11", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_12", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKITensorCopy(
+                    dst=TensorRef("tensor_12", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_7", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_13", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIActivation(
+                    dst=TensorRef("tensor_13", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_12", (128, 128), ((0, 128), (0, 128))),
+                    op="nl.tanh",
+                ),
+                NKIDmaCopy(
+                    dst=TensorRef("output", OUTPUT_SHAPE, ((0, 128), (128, 256))),
+                    src=TensorRef("tensor_13", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
         ),
         NKIBlock(
             name="_block_2",
             params=_PARAMS,
-            body=_block_body(14, ((0, 128), _HI), _S, ((128, 256), _HI), ((128, 256), (0, 128)), (_HI, (0, 128))),
+            body=(
+                NKIAlloc(dst="tensor_14", shape=(128, 128), dtype="nl.float32", buffer="psum"),
+                NKIAlloc(dst="tensor_15", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_15", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((0, 128), (128, 256))),
+                ),
+                NKIAlloc(dst="tensor_16", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_16", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("b", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIMatmul(
+                    dst=TensorRef("tensor_14", (128, 128), ((0, 128), (0, 128))),
+                    stationary=TensorRef("tensor_15", (128, 128), ((0, 128), (0, 128))),
+                    moving=TensorRef("tensor_16", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_17", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_17", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((128, 256), (128, 256))),
+                ),
+                NKIAlloc(dst="tensor_18", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_18", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("b", (128, 128), ((128, 256), (0, 128))),
+                ),
+                NKIMatmul(
+                    dst=TensorRef("tensor_14", (128, 128), ((0, 128), (0, 128))),
+                    stationary=TensorRef("tensor_17", (128, 128), ((0, 128), (0, 128))),
+                    moving=TensorRef("tensor_18", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_19", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKITensorCopy(
+                    dst=TensorRef("tensor_19", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_14", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_20", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIActivation(
+                    dst=TensorRef("tensor_20", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_19", (128, 128), ((0, 128), (0, 128))),
+                    op="nl.tanh",
+                ),
+                NKIDmaCopy(
+                    dst=TensorRef("output", OUTPUT_SHAPE, ((128, 256), (0, 128))),
+                    src=TensorRef("tensor_20", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
         ),
         NKIBlock(
             name="_block_3",
             params=_PARAMS,
-            body=_block_body(21, ((0, 128), _HI), ((0, 128), _HI), ((128, 256), _HI), ((128, 256), _HI), (_HI, _HI)),
+            body=(
+                NKIAlloc(dst="tensor_21", shape=(128, 128), dtype="nl.float32", buffer="psum"),
+                NKIAlloc(dst="tensor_22", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_22", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((0, 128), (128, 256))),
+                ),
+                NKIAlloc(dst="tensor_23", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_23", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("b", (128, 128), ((0, 128), (128, 256))),
+                ),
+                NKIMatmul(
+                    dst=TensorRef("tensor_21", (128, 128), ((0, 128), (0, 128))),
+                    stationary=TensorRef("tensor_22", (128, 128), ((0, 128), (0, 128))),
+                    moving=TensorRef("tensor_23", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_24", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_24", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((128, 256), (128, 256))),
+                ),
+                NKIAlloc(dst="tensor_25", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_25", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("b", (128, 128), ((128, 256), (128, 256))),
+                ),
+                NKIMatmul(
+                    dst=TensorRef("tensor_21", (128, 128), ((0, 128), (0, 128))),
+                    stationary=TensorRef("tensor_24", (128, 128), ((0, 128), (0, 128))),
+                    moving=TensorRef("tensor_25", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_26", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKITensorCopy(
+                    dst=TensorRef("tensor_26", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_21", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_27", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIActivation(
+                    dst=TensorRef("tensor_27", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_26", (128, 128), ((0, 128), (0, 128))),
+                    op="nl.tanh",
+                ),
+                NKIDmaCopy(
+                    dst=TensorRef("output", OUTPUT_SHAPE, ((128, 256), (128, 256))),
+                    src=TensorRef("tensor_27", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
         ),
     ),
 )
@@ -220,9 +339,15 @@ NORMALIZE_BEFORE = NKIKernel(
             name="_block_0",
             params=("a", "output"),
             body=(
-                NKIAlloc(dst="tensor_5", shape=_T, dtype="nl.float16", buffer="sbuf"),
-                NKIDmaCopy(dst=_r("tensor_5", _T, _S), src=_r("a", _T, _S)),
-                NKIDmaCopy(dst=_r("output", _T, _S), src=_r("tensor_5", _T, _S)),
+                NKIAlloc(dst="tensor_5", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIDmaCopy(
+                    dst=TensorRef("output", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
+                ),
             ),
         ),
     ),
@@ -239,9 +364,15 @@ NORMALIZE_AFTER = NKIKernel(
             name="_block_0",
             params=("a", "output"),
             body=(
-                NKIAlloc(dst="tensor_0", shape=_T, dtype="nl.float16", buffer="sbuf"),
-                NKIDmaCopy(dst=_r("tensor_0", _T, _S), src=_r("a", _T, _S)),
-                NKIDmaCopy(dst=_r("output", _T, _S), src=_r("tensor_0", _T, _S)),
+                NKIAlloc(dst="tensor_0", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIDmaCopy(
+                    dst=TensorRef("output", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                ),
             ),
         ),
     ),
@@ -259,22 +390,36 @@ STMT_RENDER_CASES = [
         id="alloc_sbuf",
     ),
     pytest.param(
-        NKIDmaCopy(dst=_r("tensor_1", _T, _S), src=_r("a", _T, _S)),
+        NKIDmaCopy(
+            dst=TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
+            src=TensorRef("a", (128, 128), ((0, 128), (0, 128))),
+        ),
         "nisa.dma_copy(dst=tensor_1[0:128, 0:128], src=a[0:128, 0:128])",
         id="dma_copy",
     ),
     pytest.param(
-        NKIMatmul(dst=_r("tensor_0", _T, _S), stationary=_r("tensor_1", _T, _S), moving=_r("tensor_2", _T, _S)),
+        NKIMatmul(
+            dst=TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+            stationary=TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
+            moving=TensorRef("tensor_2", (128, 128), ((0, 128), (0, 128))),
+        ),
         "nisa.nc_matmul(dst=tensor_0[0:128, 0:128], stationary=tensor_1[0:128, 0:128], moving=tensor_2[0:128, 0:128])",
         id="matmul",
     ),
     pytest.param(
-        NKITensorCopy(dst=_r("tensor_5", _T, _S), src=_r("tensor_0", _T, _S)),
+        NKITensorCopy(
+            dst=TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
+            src=TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+        ),
         "nisa.tensor_copy(dst=tensor_5[0:128, 0:128], src=tensor_0[0:128, 0:128])",
         id="tensor_copy",
     ),
     pytest.param(
-        NKIActivation(dst=_r("tensor_6", _T, _S), src=_r("tensor_5", _T, _S), op="nl.tanh"),
+        NKIActivation(
+            dst=TensorRef("tensor_6", (128, 128), ((0, 128), (0, 128))),
+            src=TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
+            op="nl.tanh",
+        ),
         "nisa.activation(dst=tensor_6[0:128, 0:128], data=tensor_5[0:128, 0:128], op=nl.tanh)",
         id="activation",
     ),

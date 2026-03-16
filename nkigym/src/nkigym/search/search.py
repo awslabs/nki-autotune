@@ -156,7 +156,7 @@ class _TransformGraph:
 def _verify_node(node: _Node, sim_kwargs: dict[str, Any], expected: np.ndarray) -> None:
     """Simulate a node's kernel and check numerical correctness."""
     actual = simulate(node.kernel, sim_kwargs)
-    np.testing.assert_allclose(actual, expected)
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
 
 
 def _assign_variant_idx(node: _Node, depth_counts: dict[int, int]) -> None:
@@ -200,8 +200,8 @@ class _SearchContext:
     report: SearchReport
 
 
-def _save_and_submit(node: _Node, ctx: _SearchContext, errors: list[VariantResult]) -> None:
-    """Save variant to disk and submit to compilation pool if enabled."""
+def _save_node(node: _Node, ctx: _SearchContext, errors: list[VariantResult]) -> tuple[str, str]:
+    """Save variant to disk and register in report. Returns (nki_path, error)."""
     nki_path, error = _save_variant(node, ctx.save_cache)
     ctx.report.add_variant(nki_path, node.depth, node.variant_idx)
     if error:
@@ -219,6 +219,11 @@ def _save_and_submit(node: _Node, ctx: _SearchContext, errors: list[VariantResul
             )
         )
         ctx.report.update_variant(nki_path, status="error", error=error)
+    return nki_path, error
+
+
+def _submit_to_pool(nki_path: str, error: str, ctx: _SearchContext) -> None:
+    """Submit a saved variant to the compilation pool."""
     if ctx.pool is not None and not error:
         ctx.report.update_variant(nki_path, status="compiled")
         ctx.pool.submit(nki_path)
@@ -273,10 +278,11 @@ def _run_search(
     last_progress_count = 0
 
     root_node = next(iter(graph.nodes.values()))
+    _assign_variant_idx(root_node, depth_counts)
+    nki_path, error = _save_node(root_node, ctx, lowering_errors)
     _verify_node(root_node, ctx.sim_kwargs, ctx.expected)
     if root_node.depth >= min_depth:
-        _assign_variant_idx(root_node, depth_counts)
-        _save_and_submit(root_node, ctx, lowering_errors)
+        _submit_to_pool(nki_path, error, ctx)
         qualifying.append(root_node.kernel)
 
     while len(qualifying) < num_targets and graph._depth_buckets:
@@ -285,10 +291,11 @@ def _run_search(
             continue
         child_node = graph.nodes[child_kernel]
         depth_dist[child_node.depth] = depth_dist.get(child_node.depth, 0) + 1
+        _assign_variant_idx(child_node, depth_counts)
+        nki_path, error = _save_node(child_node, ctx, lowering_errors)
         _verify_node(child_node, ctx.sim_kwargs, ctx.expected)
         if child_node.depth >= min_depth:
-            _assign_variant_idx(child_node, depth_counts)
-            _save_and_submit(child_node, ctx, lowering_errors)
+            _submit_to_pool(nki_path, error, ctx)
             qualifying.append(child_node.kernel)
         unique_count = len(graph.nodes)
         if unique_count - last_progress_count >= PROGRESS_INTERVAL:

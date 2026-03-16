@@ -6,9 +6,12 @@ for each pair with identical source. Cross-block pairs trigger block
 concatenation via resolve_option.
 """
 
+import dataclasses
 from itertools import combinations
 
-from nkigym.codegen.types import NKIKernel, _rename_stmt
+from nkigym.codegen.types import NKIKernel
+from nkigym.ir.tensor import TensorRef
+from nkigym.ops.base import NKIOp
 from nkigym.ops.dma_copy import NKIDmaCopy
 from nkigym.transforms.base import NKITransform, StmtRef, TransformOption
 from nkigym.transforms.block_merge import replace_block, resolve_option
@@ -96,17 +99,43 @@ def _apply_reuse(kernel: NKIKernel, option: TransformOption) -> NKIKernel:
 
 
 def _remove_and_rename(body: tuple, drop_idx: int, old_name: str, new_name: str) -> tuple:
-    """Remove a statement and rename old_name to new_name in remaining stmts.
+    """Remove statement at drop_idx and rename consumer references.
+
+    Only renames TensorRef fields (consumers), not NKIAlloc dst strings
+    (producers). Orphaned allocs are handled by DCE.
 
     Args:
         body: Block body tuple.
-        drop_idx: Index of statement to remove.
-        old_name: Tensor name to replace.
+        drop_idx: Statement index to remove.
+        old_name: Tensor name to replace in consumers.
         new_name: Replacement tensor name.
 
     Returns:
-        New body tuple with statement removed and names renamed.
+        New body tuple with statement removed and consumer refs renamed.
     """
     filtered = [s for i, s in enumerate(body) if i != drop_idx]
     rename_map = {old_name: new_name}
-    return tuple(_rename_stmt(s, rename_map) for s in filtered)
+    return tuple(_rename_refs(s, rename_map) for s in filtered)
+
+
+def _rename_refs(stmt: NKIOp, rename_map: dict[str, str]) -> NKIOp:
+    """Rename TensorRef fields only, leaving NKIAlloc dst strings untouched.
+
+    Args:
+        stmt: An NKI statement.
+        rename_map: Mapping from old names to new names.
+
+    Returns:
+        New statement with renamed TensorRef fields.
+    """
+    kwargs: dict[str, object] = {}
+    changed = False
+    for fld in dataclasses.fields(stmt):
+        val = getattr(stmt, fld.name)
+        if isinstance(val, TensorRef) and rename_map.get(val.name, val.name) != val.name:
+            kwargs[fld.name] = TensorRef(rename_map[val.name], val.shape, val.slices)
+            changed = True
+        else:
+            kwargs[fld.name] = val
+    result = type(stmt)(**kwargs) if changed else stmt
+    return result
