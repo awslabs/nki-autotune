@@ -20,6 +20,7 @@ from nkigym.transforms.base import NKITransform, StmtRef, TransformOption
 from nkigym.transforms.block_merge import check_adjacent, replace_block, resolve_option, widen_slice
 
 _FIELD_TO_AXES: dict[str, str] = {"src": "data"}
+_BUFFER_DIM_LIMITS = (128, 512)
 
 
 class OperandMergeTransform(NKITransform):
@@ -75,8 +76,8 @@ def _find_dma_pairs(block: NKIBlock) -> list[TransformOption]:
     pairs: list[TransformOption] = []
     for members in groups.values():
         for (i, dma_a), (j, dma_b) in combinations(members, 2):
-            dim, _ = check_adjacent(dma_a.src.slices, dma_b.src.slices)
-            if dim >= 0:
+            dim, merged = check_adjacent(dma_a.src.slices, dma_b.src.slices)
+            if dim >= 0 and merged[1] - merged[0] <= _BUFFER_DIM_LIMITS[dim]:
                 pairs.append(TransformOption(StmtRef(block.name, i), StmtRef(block.name, j)))
     return pairs
 
@@ -159,8 +160,8 @@ def _activation_pairs(block_name: str, acts: list[tuple[int, NKIActivation]]) ->
     pairs: list[TransformOption] = []
     for members in groups.values():
         for (i, a), (j, b) in combinations(members, 2):
-            dim, _ = check_adjacent(a.src.slices, b.src.slices)
-            if dim >= 0:
+            dim, merged = check_adjacent(a.src.slices, b.src.slices)
+            if dim >= 0 and merged[1] - merged[0] <= _BUFFER_DIM_LIMITS[dim]:
                 pairs.append(TransformOption(StmtRef(block_name, i), StmtRef(block_name, j)))
     return pairs
 

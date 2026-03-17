@@ -419,6 +419,36 @@ ACTIVATION_MERGE_AFTER = NKIKernel(
     ),
 )
 
+DMA_PARTITION_MERGE_KERNEL = NKIKernel(
+    name="test",
+    params=("a",),
+    input_shapes=((256, 128),),
+    dtype="nl.float16",
+    output_shape=(128, 128),
+    blocks=(
+        NKIBlock(
+            name="_block_0",
+            params=("a", "output"),
+            body=(
+                NKIAlloc(dst="tensor_0", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((0, 128), (0, 128))),
+                ),
+                NKIAlloc(dst="tensor_1", shape=(128, 128), dtype="nl.float16", buffer="sbuf"),
+                NKIDmaCopy(
+                    dst=TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("a", (128, 128), ((128, 256), (0, 128))),
+                ),
+                NKIDmaCopy(
+                    dst=TensorRef("output", (128, 128), ((0, 128), (0, 128))),
+                    src=TensorRef("tensor_0", (128, 128), ((0, 128), (0, 128))),
+                ),
+            ),
+        ),
+    ),
+)
+
 ACTIVATION_DIFFERENT_OPS_KERNEL = NKIKernel(
     name="test",
     params=("a",),

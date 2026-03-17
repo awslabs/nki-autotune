@@ -4,8 +4,9 @@ Provides graph-based search over the space of transform application
 sequences.  A ``_TransformGraph`` lazily expands the state graph using
 kernel-tuple deduplication (no source rendering in the hot path).
 
-Every new node is verified against the root function for numerical
-correctness.  Qualifying variants (depth >= min_depth) are saved to disk.
+Only qualifying variants (depth >= min_depth) are saved to disk, verified
+for numerical correctness, and submitted for hardware benchmarking.
+Shallow nodes are explored but not persisted or tested.
 """
 
 import logging
@@ -32,7 +33,7 @@ from nkigym.transforms.base import NKITransform
 
 logger = logging.getLogger(__name__)
 
-PROGRESS_INTERVAL = 500
+PROGRESS_INTERVAL = 50
 _WARMUP = 10
 _ITERS = 100
 
@@ -278,12 +279,14 @@ def _run_search(
     last_progress_count = 0
 
     root_node = next(iter(graph.nodes.values()))
-    _assign_variant_idx(root_node, depth_counts)
-    nki_path, error = _save_node(root_node, ctx, lowering_errors)
-    _verify_node(root_node, ctx.sim_kwargs, ctx.expected)
     if root_node.depth >= min_depth:
+        _assign_variant_idx(root_node, depth_counts)
+        nki_path, error = _save_node(root_node, ctx, lowering_errors)
+        _verify_node(root_node, ctx.sim_kwargs, ctx.expected)
         _submit_to_pool(nki_path, error, ctx)
         qualifying.append(root_node.kernel)
+
+    _emit_progress(ctx.report, root_node, graph, len(qualifying), min_depth, depth_dist)
 
     while len(qualifying) < num_targets and graph._depth_buckets:
         is_new, child_kernel = graph.expand_one(rng)
@@ -291,10 +294,10 @@ def _run_search(
             continue
         child_node = graph.nodes[child_kernel]
         depth_dist[child_node.depth] = depth_dist.get(child_node.depth, 0) + 1
-        _assign_variant_idx(child_node, depth_counts)
-        nki_path, error = _save_node(child_node, ctx, lowering_errors)
-        _verify_node(child_node, ctx.sim_kwargs, ctx.expected)
         if child_node.depth >= min_depth:
+            _assign_variant_idx(child_node, depth_counts)
+            nki_path, error = _save_node(child_node, ctx, lowering_errors)
+            _verify_node(child_node, ctx.sim_kwargs, ctx.expected)
             _submit_to_pool(nki_path, error, ctx)
             qualifying.append(child_node.kernel)
         unique_count = len(graph.nodes)
@@ -317,7 +320,7 @@ def _make_pool(
         input_dtype_name=first_val.dtype.name,
         output_name="output",
         output_shape=expected.shape,
-        output_dtype_name=expected.dtype.name,
+        output_dtype_name=first_val.dtype.name,
         cache_dir=save_cache,
     )
 

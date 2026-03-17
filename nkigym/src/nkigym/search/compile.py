@@ -437,7 +437,7 @@ def run_on_hardware(
             kernel_kwargs=kernel_kwargs,
             output_name="output",
             output_shape=expected.shape,
-            output_dtype=expected.dtype,
+            output_dtype=np.dtype(input_dtype_name),
             expected=expected,
             warmup=warmup,
             iters=iters,

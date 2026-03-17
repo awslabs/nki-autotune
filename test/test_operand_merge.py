@@ -13,6 +13,7 @@ from golden.nki_transforms import (
     DMA_MERGE_AFTER,
     DMA_MERGE_BEFORE,
     DMA_MERGE_OPTIONS,
+    DMA_PARTITION_MERGE_KERNEL,
     M_AXIS_KERNEL,
 )
 
@@ -38,6 +39,10 @@ class TestDmaMerge:
         expected = DMA_MERGE_BEFORE.simulate(kwargs)
         result = OperandMergeTransform().apply(DMA_MERGE_BEFORE, DMA_MERGE_OPTIONS[0]).simulate(kwargs)
         np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
+
+    def test_partition_axis_rejected(self) -> None:
+        """Partition-axis DMA merge to 256 exceeds buffer limit, rejected."""
+        assert OperandMergeTransform().analyze(DMA_PARTITION_MERGE_KERNEL) == []
 
 
 class TestComputeMerge:

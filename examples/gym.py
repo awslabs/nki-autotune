@@ -54,7 +54,7 @@ def main() -> None:
         func=nkigym_matmul,
         transforms=[DataReuseTransform(), OperandMergeTransform()],
         num_targets=100,
-        seed=-1,
+        seed=42,
         min_depth=20,
         save_cache=cache_dir,
         kernel_kwargs={"lhs": lhs.astype(np.float16), "rhs": rhs.astype(np.float16)},

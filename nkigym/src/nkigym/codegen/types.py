@@ -102,10 +102,9 @@ class NKIKernel(NamedTuple):
         """
         params_str = ", ".join(self.params)
         lines = ["@nki.jit", f"def {self.name}({params_str}):"]
-        np_dtype = self.dtype.replace("nl.", "np.")
         for param, shape in zip(self.params, self.input_shapes):
             lines.append(f"    assert {param}.shape == {shape}")
-            lines.append(f"    assert {param}.dtype == {np_dtype}")
+            lines.append(f"    assert {param}.dtype == {self.dtype}")
         lines.append(
             f"    output = nl.ndarray({self.output_shape}, dtype={self.params[0]}.dtype, buffer=nl.shared_hbm)"
         )
@@ -122,7 +121,7 @@ class NKIKernel(NamedTuple):
             Complete Python source string with imports, main function,
             and block functions.
         """
-        lines = ["import nki", "import nki.language as nl", "import nki.isa as nisa", "import numpy as np", "", ""]
+        lines = ["import nki", "import nki.language as nl", "import nki.isa as nisa", "", ""]
         lines.extend(self._render_main_lines())
         for block in self.blocks:
             lines.append("")
