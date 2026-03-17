@@ -423,4 +423,45 @@ STMT_RENDER_CASES = [
         "nisa.activation(dst=tensor_6[0:128, 0:128], data=tensor_5[0:128, 0:128], op=nl.tanh)",
         id="activation",
     ),
+    pytest.param(
+        NKIAlloc(dst="tensor_0", shape=(128, 256), dtype="nl.float16", buffer="sbuf"),
+        "tensor_0 = nl.ndarray((128, 256), dtype=nl.float16, buffer=nl.sbuf)",
+        id="alloc_sbuf_wide",
+    ),
+    pytest.param(
+        NKIAlloc(dst="tensor_0", shape=(128, 256), dtype="nl.float32", buffer="psum"),
+        "tensor_0 = nl.ndarray((128, 256), dtype=nl.float32, buffer=nl.psum)",
+        id="alloc_psum_wide",
+    ),
+    pytest.param(
+        NKIAlloc(dst="tensor_0", shape=(128, 128), dtype="nl.bfloat16", buffer="sbuf"),
+        "tensor_0 = nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.sbuf)",
+        id="alloc_bfloat16",
+    ),
+    pytest.param(
+        NKIDmaCopy(
+            dst=TensorRef("tensor_1", (128, 128), ((0, 128), (0, 128))),
+            src=TensorRef("a", (128, 128), ((128, 256), (0, 128))),
+        ),
+        "nisa.dma_copy(dst=tensor_1[0:128, 0:128], src=a[128:256, 0:128])",
+        id="dma_offset_src",
+    ),
+    pytest.param(
+        NKIActivation(
+            dst=TensorRef("tensor_6", (128, 128), ((0, 128), (0, 128))),
+            src=TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
+            op="nl.exp",
+        ),
+        "nisa.activation(dst=tensor_6[0:128, 0:128], data=tensor_5[0:128, 0:128], op=nl.exp)",
+        id="activation_exp",
+    ),
+    pytest.param(
+        NKIActivation(
+            dst=TensorRef("tensor_6", (128, 128), ((0, 128), (0, 128))),
+            src=TensorRef("tensor_5", (128, 128), ((0, 128), (0, 128))),
+            op="nl.identity",
+        ),
+        "nisa.activation(dst=tensor_6[0:128, 0:128], data=tensor_5[0:128, 0:128], op=nl.identity)",
+        id="activation_identity",
+    ),
 ]
