@@ -279,12 +279,11 @@ def _run_search(
     last_progress_count = 0
 
     root_node = next(iter(graph.nodes.values()))
-    if root_node.depth >= min_depth:
-        _assign_variant_idx(root_node, depth_counts)
-        nki_path, error = _save_node(root_node, ctx, lowering_errors)
-        _verify_node(root_node, ctx.sim_kwargs, ctx.expected)
-        _submit_to_pool(nki_path, error, ctx)
-        qualifying.append(root_node.kernel)
+    _assign_variant_idx(root_node, depth_counts)
+    nki_path, error = _save_node(root_node, ctx, lowering_errors)
+    _verify_node(root_node, ctx.sim_kwargs, ctx.expected)
+    _submit_to_pool(nki_path, error, ctx)
+    qualifying.append(root_node.kernel)
 
     _emit_progress(ctx.report, root_node, graph, len(qualifying), min_depth, depth_dist)
 
