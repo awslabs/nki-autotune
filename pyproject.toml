@@ -9,5 +9,8 @@ known_first_party = ["autotune", "nkigym"]
 profile = "black"
 line_length = 120
 
+[tool.pyright]
+reportMissingImports = "none"
+
 [tool.pytest.ini_options]
 pythonpath = ["nkigym/src"]

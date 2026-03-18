@@ -2,6 +2,10 @@
 
 import numpy as np
 from golden.nki_data_reuse import (
+    DATA_REUSE_AFTER,
+    DATA_REUSE_BEFORE,
+    DATA_REUSE_NO_MATCH,
+    DATA_REUSE_OPTIONS,
     DIFFERENT_SLICES_KERNEL,
     THREE_BLOCK_AFTER,
     THREE_BLOCK_BEFORE,
@@ -10,7 +14,6 @@ from golden.nki_data_reuse import (
     WITHIN_BLOCK_BEFORE,
     WITHIN_BLOCK_OPTIONS,
 )
-from golden.nki_transforms import DATA_REUSE_AFTER, DATA_REUSE_BEFORE, DATA_REUSE_NO_MATCH, DATA_REUSE_OPTIONS
 
 from nkigym.transforms.data_reuse import DataReuseTransform
 

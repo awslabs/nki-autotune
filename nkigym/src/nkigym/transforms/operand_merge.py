@@ -17,16 +17,30 @@ from nkigym.ops.base import NKIOp
 from nkigym.ops.dma_copy import NKIDmaCopy
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.transforms.base import NKITransform, StmtRef, TransformOption
-from nkigym.transforms.block_merge import check_adjacent, replace_block, resolve_option, widen_slice
+from nkigym.transforms.block_merge import (
+    check_adjacent,
+    find_adjacent_pairs,
+    replace_block,
+    resolve_option,
+    widen_slice,
+)
 
 _FIELD_TO_AXES: dict[str, str] = {"src": "data"}
 _BUFFER_DIM_LIMITS = (128, 512)
 
 
 class OperandMergeTransform(NKITransform):
-    """Merge adjacent DMA loads or compute stmts into wider operations."""
+    """Merge adjacent DMA loads or compute stmts into wider operations.
+
+    Per-block analysis is cached by ``id(block)`` so unchanged blocks
+    (same Python object across transforms) skip full body scans.
+    """
 
     name = "operand_merge"
+
+    def __init__(self) -> None:
+        """Initialize with empty block analysis cache."""
+        self._block_cache: dict[int, list] = {}
 
     def analyze(self, kernel: NKIKernel) -> list[TransformOption]:
         """Find all merge opportunities across all blocks.
@@ -37,7 +51,7 @@ class OperandMergeTransform(NKITransform):
         Returns:
             List of TransformOption pairs.
         """
-        return _find_merge_pairs(kernel)
+        return _find_merge_pairs(kernel, self._block_cache)
 
     def apply(self, kernel: NKIKernel, option: TransformOption) -> NKIKernel:
         """Apply one merge to the kernel.
@@ -52,80 +66,104 @@ class OperandMergeTransform(NKITransform):
         return _apply_merge(kernel, option)
 
 
-def _find_merge_pairs(kernel: NKIKernel) -> list[TransformOption]:
-    """Collect DMA merge and compute merge pairs from all blocks."""
+def _find_merge_pairs(kernel: NKIKernel, cache: dict[int, list]) -> list[TransformOption]:
+    """Collect DMA merge and compute merge pairs, using per-block cache.
+
+    Caches per-block groups keyed by id(block). Only new/changed blocks
+    trigger full DMA and compute group analysis. Groups are flattened
+    into a single list of TransformOption pairs.
+
+    Args:
+        kernel: The NKI kernel.
+        cache: Per-block cache mapping id(block) to groups.
+
+    Returns:
+        All merge options across all blocks.
+    """
     pairs: list[TransformOption] = []
     for block in kernel.blocks:
-        pairs.extend(_find_dma_pairs(block))
-        pairs.extend(_find_compute_pairs(block))
+        bid = id(block)
+        block_groups = cache.get(bid)
+        if block_groups is None:
+            block_groups = _find_dma_groups(block) + _find_compute_groups(block)
+            cache[bid] = block_groups
+        for group in block_groups:
+            pairs.extend(group)
     return pairs
 
 
-def _find_dma_pairs(block: NKIBlock) -> list[TransformOption]:
-    """Find DMA load pairs with adjacent HBM sources in one block.
+def _find_dma_groups(block: NKIBlock) -> list[list[TransformOption]]:
+    """Find DMA load groups with adjacent HBM sources in one block.
 
     Groups DMA loads by (alloc.dtype, alloc.buffer, dma.src.name).
-    Checks pairs for adjacent HBM source slices. Emits options with
-    DMA stmt indices (not alloc indices).
+    Uses end-to-start matching for O(n) adjacency detection per group.
+    Returns one group per key group containing all valid adjacent pairs.
     """
     dma_info = _build_dma_alloc_map(block)
-    groups: dict[tuple, list[tuple[int, NKIDmaCopy]]] = {}
+    key_groups: dict[tuple, list[tuple[int, tuple[tuple[int, int], ...]]]] = {}
     for dma_idx, (dma, alloc) in dma_info.items():
         key = (alloc.dtype, alloc.buffer, dma.src.name)
-        groups.setdefault(key, []).append((dma_idx, dma))
-    pairs: list[TransformOption] = []
-    for members in groups.values():
-        for (i, dma_a), (j, dma_b) in combinations(members, 2):
-            dim, merged = check_adjacent(dma_a.src.slices, dma_b.src.slices)
-            if dim >= 0 and merged[1] - merged[0] <= _BUFFER_DIM_LIMITS[dim]:
-                pairs.append(TransformOption(StmtRef(block.name, i), StmtRef(block.name, j)))
-    return pairs
+        key_groups.setdefault(key, []).append((dma_idx, dma.src.slices))
+    result: list[list[TransformOption]] = []
+    for members in key_groups.values():
+        group = [
+            TransformOption(StmtRef(block.name, idx_a), StmtRef(block.name, idx_b))
+            for idx_a, idx_b, _dim, _merged in find_adjacent_pairs(members, _BUFFER_DIM_LIMITS)
+        ]
+        if group:
+            result.append(group)
+    return result
 
 
 def _build_dma_alloc_map(block: NKIBlock) -> dict[int, tuple[NKIDmaCopy, NKIAlloc]]:
     """Map DMA stmt index to (dma_stmt, alloc_stmt).
 
+    Single-pass: collects allocs and matches DMA loads in one iteration.
     Only includes DMAs that are the sole load into an allocated buffer.
+    Allocs always precede their consumers in the body (codegen invariant).
     """
     alloc_by_name: dict[str, NKIAlloc] = {}
-    for s in block.body:
-        if isinstance(s, NKIAlloc):
-            alloc_by_name[s.dst] = s
     seen_allocs: set[str] = set()
     result: dict[int, tuple[NKIDmaCopy, NKIAlloc]] = {}
     for i, s in enumerate(block.body):
-        if isinstance(s, NKIDmaCopy) and s.dst.name in alloc_by_name and s.dst.name not in seen_allocs:
+        if isinstance(s, NKIAlloc):
+            alloc_by_name[s.dst] = s
+        elif isinstance(s, NKIDmaCopy) and s.dst.name in alloc_by_name and s.dst.name not in seen_allocs:
             seen_allocs.add(s.dst.name)
             result[i] = (s, alloc_by_name[s.dst.name])
     return result
 
 
-def _find_compute_pairs(block: NKIBlock) -> list[TransformOption]:
-    """Find compute stmt pairs with adjacent operand slices."""
-    pairs: list[TransformOption] = []
+def _find_compute_groups(block: NKIBlock) -> list[list[TransformOption]]:
+    """Find compute stmt groups with adjacent operand slices."""
+    groups: list[list[TransformOption]] = []
     matmuls = [(i, s) for i, s in enumerate(block.body) if isinstance(s, NKIMatmul)]
-    pairs.extend(_matmul_pairs(block.name, matmuls))
+    groups.extend(_matmul_groups(block.name, matmuls))
     acts = [(i, s) for i, s in enumerate(block.body) if isinstance(s, NKIActivation)]
-    pairs.extend(_activation_pairs(block.name, acts))
-    return pairs
+    groups.extend(_activation_groups(block.name, acts))
+    return groups
 
 
-def _matmul_pairs(block_name: str, matmuls: list[tuple[int, NKIMatmul]]) -> list[TransformOption]:
-    """Check matmul pairs grouped by (stationary.name, moving.name).
+def _matmul_groups(block_name: str, matmuls: list[tuple[int, NKIMatmul]]) -> list[list[TransformOption]]:
+    """Check matmul groups by (stationary.name, moving.name).
 
     Within each group, checks for single-axis operand adjacency
     within tile limits.
     """
-    groups: dict[tuple, list[tuple[int, NKIMatmul]]] = {}
+    key_groups: dict[tuple, list[tuple[int, NKIMatmul]]] = {}
     for idx, stmt in matmuls:
         key = (stmt.stationary.name, stmt.moving.name)
-        groups.setdefault(key, []).append((idx, stmt))
-    pairs: list[TransformOption] = []
-    for members in groups.values():
-        for (i, a), (j, b) in combinations(members, 2):
-            if _matmul_mergeable(a, b):
-                pairs.append(TransformOption(StmtRef(block_name, i), StmtRef(block_name, j)))
-    return pairs
+        key_groups.setdefault(key, []).append((idx, stmt))
+    result: list[list[TransformOption]] = []
+    for members in key_groups.values():
+        group = [
+            TransformOption(StmtRef(block_name, i), StmtRef(block_name, j))
+            for (i, a), (j, b) in combinations(members, 2)
+            if _matmul_mergeable(a, b)
+        ]
+        if group:
+            result.append(group)
+    return result
 
 
 def _matmul_mergeable(a: NKIMatmul, b: NKIMatmul) -> bool:
@@ -151,19 +189,22 @@ def _matmul_mergeable(a: NKIMatmul, b: NKIMatmul) -> bool:
     return result
 
 
-def _activation_pairs(block_name: str, acts: list[tuple[int, NKIActivation]]) -> list[TransformOption]:
-    """Check activation pairs grouped by (src.name, op)."""
-    groups: dict[tuple, list[tuple[int, NKIActivation]]] = {}
+def _activation_groups(block_name: str, acts: list[tuple[int, NKIActivation]]) -> list[list[TransformOption]]:
+    """Check activation groups by (src.name, op)."""
+    key_groups: dict[tuple, list[tuple[int, NKIActivation]]] = {}
     for idx, stmt in acts:
         key = (stmt.src.name, stmt.op)
-        groups.setdefault(key, []).append((idx, stmt))
-    pairs: list[TransformOption] = []
-    for members in groups.values():
+        key_groups.setdefault(key, []).append((idx, stmt))
+    result: list[list[TransformOption]] = []
+    for members in key_groups.values():
+        group: list[TransformOption] = []
         for (i, a), (j, b) in combinations(members, 2):
             dim, merged = check_adjacent(a.src.slices, b.src.slices)
             if dim >= 0 and merged[1] - merged[0] <= _BUFFER_DIM_LIMITS[dim]:
-                pairs.append(TransformOption(StmtRef(block_name, i), StmtRef(block_name, j)))
-    return pairs
+                group.append(TransformOption(StmtRef(block_name, i), StmtRef(block_name, j)))
+        if group:
+            result.append(group)
+    return result
 
 
 def _apply_merge(kernel: NKIKernel, option: TransformOption) -> NKIKernel:

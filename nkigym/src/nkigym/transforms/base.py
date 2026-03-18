@@ -7,6 +7,7 @@ All transforms follow the analyze-then-apply pattern on NKIKernel:
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import NamedTuple
 
 from nkigym.codegen.types import NKIKernel
@@ -49,14 +50,14 @@ class NKITransform(ABC):
     name: str
 
     @abstractmethod
-    def analyze(self, kernel: NKIKernel) -> list[TransformOption]:
+    def analyze(self, kernel: NKIKernel) -> Sequence[TransformOption]:
         """Find optimization opportunities on an NKIKernel.
 
         Args:
             kernel: An NKI kernel.
 
         Returns:
-            List of TransformOption instances.
+            Sequence of TransformOption instances.
         """
 
     @abstractmethod

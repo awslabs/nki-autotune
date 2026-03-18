@@ -30,6 +30,45 @@ class NKIActivation(NKIOp):
     OUTPUT_AXES: ClassVar[tuple[str, str]] = ("P", "F")
     TILE_LIMITS: ClassVar[dict[str, int]] = {}
 
+    def dst_name(self) -> str:
+        """Return the destination tensor name.
+
+        Returns:
+            Destination name string.
+        """
+        return self.dst.name
+
+    def tensor_names(self) -> tuple[str, ...]:
+        """Return all tensor names.
+
+        Returns:
+            Tuple of destination and source names.
+        """
+        return (self.dst.name, self.src.name)
+
+    def input_names(self) -> tuple[str, ...]:
+        """Return input tensor names.
+
+        Returns:
+            Tuple containing the source name.
+        """
+        return (self.src.name,)
+
+    def renamed(self, rename_map: dict[str, str]) -> "NKIActivation":
+        """Return a copy with refs renamed, or self if unchanged.
+
+        Args:
+            rename_map: Mapping from old names to new names.
+
+        Returns:
+            Renamed NKIActivation or self.
+        """
+        new_dst = self.dst.renamed(rename_map)
+        new_src = self.src.renamed(rename_map)
+        changed = new_dst is not self.dst or new_src is not self.src
+        result: NKIActivation = NKIActivation(dst=new_dst, src=new_src, op=self.op) if changed else self
+        return result
+
     def simulate(self, env: dict[str, Any]) -> None:
         """Apply element-wise activation in the simulation environment.
 

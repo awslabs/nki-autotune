@@ -4,10 +4,7 @@ Provides block concatenation, statement reference resolution, tensor
 renaming, slice adjacency checking, and kernel block replacement.
 """
 
-import dataclasses
-
-from nkigym.codegen.types import NKIBlock, NKIKernel, _rename_stmt
-from nkigym.ir.tensor import TensorRef
+from nkigym.codegen.types import NKIBlock, NKIKernel
 from nkigym.ops.base import NKIOp
 from nkigym.transforms.base import TransformOption
 
@@ -58,7 +55,7 @@ def concat_blocks(block_a: NKIBlock, block_b: NKIBlock) -> NKIBlock:
         for old_name in sorted(conflicts):
             max_idx += 1
             rename_map[old_name] = f"tensor_{max_idx}"
-    renamed_body = tuple(_rename_stmt(s, rename_map) for s in block_b.body) if rename_map else block_b.body
+    renamed_body = tuple(s.renamed(rename_map) for s in block_b.body) if rename_map else block_b.body
     merged_params = tuple(dict.fromkeys(list(block_a.params) + list(block_b.params)))
     name = _merged_block_name(block_a.name, block_b.name)
     return NKIBlock(name=name, params=merged_params, body=block_a.body + renamed_body)
@@ -76,7 +73,7 @@ def rename_refs(block: NKIBlock, old: str, new: str) -> NKIBlock:
         New block with renamed references.
     """
     rename_map = {old: new}
-    return block._replace(body=tuple(_rename_stmt(s, rename_map) for s in block.body))
+    return block._replace(body=tuple(s.renamed(rename_map) for s in block.body))
 
 
 def check_adjacent(
@@ -102,6 +99,64 @@ def check_adjacent(
         elif sb_stop == sa_start:
             result = (dim, (sb_start, sa_stop))
     return result
+
+
+def find_adjacent_pairs(
+    items: list[tuple[int, tuple[tuple[int, int], ...]]], limits: tuple[int, ...]
+) -> list[tuple[int, int, int, tuple[int, int]]]:
+    """Find all adjacent (idx_a, idx_b, dim, merged_range) via end-to-start matching.
+
+    For each dimension d, groups items by all other dimensions, then matches
+    items whose end on dim d equals another item's start. O(n * ndim) instead
+    of O(n^2).
+
+    Args:
+        items: List of (index, slices) pairs.
+        limits: Per-dimension maximum merged size.
+
+    Returns:
+        List of (idx_a, idx_b, dim, merged_range) tuples.
+    """
+    results: list[tuple[int, int, int, tuple[int, int]]] = []
+    ndim = len(items[0][1]) if items else 0
+    for d in range(ndim):
+        _adjacent_on_dim(items, d, limits, results)
+    return results
+
+
+def _adjacent_on_dim(
+    items: list[tuple[int, tuple[tuple[int, int], ...]]],
+    dim: int,
+    limits: tuple[int, ...],
+    results: list[tuple[int, int, int, tuple[int, int]]],
+) -> None:
+    """Find adjacent pairs on a single dimension via end-to-start matching.
+
+    Groups items by non-target dimensions, then within each subgroup
+    matches items whose end on dim equals another's start. Inlined
+    for performance (eliminates 4.5M function calls in the search).
+
+    Args:
+        items: List of (index, slices) pairs.
+        dim: Dimension to check adjacency on.
+        limits: Per-dimension maximum merged size.
+        results: Mutable list to append results to.
+    """
+    subgroups: dict[tuple[tuple[int, int], ...], list[tuple[int, tuple[tuple[int, int], ...]]]] = {}
+    for idx, slices in items:
+        other = slices[:dim] + slices[dim + 1 :]
+        subgroups.setdefault(other, []).append((idx, slices))
+    limit = limits[dim]
+    for sub in subgroups.values():
+        by_end: dict[int, list[tuple[int, tuple[tuple[int, int], ...]]]] = {}
+        for idx, slices in sub:
+            by_end.setdefault(slices[dim][1], []).append((idx, slices))
+        for idx, slices in sub:
+            for m_idx, m_slices in by_end.get(slices[dim][0], []):
+                merged_start = m_slices[dim][0]
+                merged_end = slices[dim][1]
+                if merged_end - merged_start <= limit:
+                    results.append((m_idx, idx, dim, (merged_start, merged_end)))
 
 
 def widen_slice(
@@ -210,23 +265,16 @@ def _collect_tensor_names(block: NKIBlock) -> set[str]:
     return names
 
 
-def _stmt_names(stmt: NKIOp) -> list[str]:
-    """Extract variable names from a statement (alloc dst + TensorRef names).
+def _stmt_names(stmt: NKIOp) -> tuple[str, ...]:
+    """Extract variable names from a statement via tensor_names().
 
     Args:
         stmt: An NKI statement.
 
     Returns:
-        List of variable names.
+        Tuple of variable names.
     """
-    names: list[str] = []
-    for fld in dataclasses.fields(stmt):
-        val = getattr(stmt, fld.name)
-        if isinstance(val, TensorRef):
-            names.append(val.name)
-        elif fld.name == "dst" and isinstance(val, str):
-            names.append(val)
-    return names
+    return stmt.tensor_names()
 
 
 def _max_tensor_idx(names: set[str]) -> int:

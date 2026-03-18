@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import numpy as np
-from neuronxcc.nki_standalone import NKI_IR_VERSION, compile_nki_ir_kernel_to_neff  # type: ignore[import-untyped]
-from nkipy.core.backend.hlo import HLOModule, HLOTensor  # type: ignore[import-untyped]
-from nkipy.runtime import BaremetalExecutor, CompiledKernel  # type: ignore[import-untyped]
+from neuronxcc.nki_standalone import NKI_IR_VERSION, compile_nki_ir_kernel_to_neff
+from nkipy.core.backend.hlo import HLOModule, HLOTensor
+from nkipy.runtime import BaremetalExecutor, CompiledKernel
 
 logger = logging.getLogger(__name__)
 
@@ -283,26 +283,14 @@ class CompilationPool:
         return results
 
     def shutdown(self) -> None:
-        """Shut down the process pool."""
+        """Shut down the process pool without waiting for workers to exit.
+
+        All futures are already resolved after ``wait_all()``, so worker
+        processes can terminate asynchronously.  ``wait=False`` lets us
+        skip joining the idle worker processes.
+        """
         if self._executor is not None:
-            self._executor.shutdown(wait=True)
-
-
-def _set_neuron_core(core_id: int) -> None:
-    """Worker initializer to pin a Neuron core."""
-    os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_id)
-    os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
-
-
-def _split_into_groups(items: list[Any], num_groups: int) -> list[list[Any]]:
-    """Distribute items across groups via round-robin."""
-    groups: list[list[Any]] = []
-    if items:
-        effective = min(len(items), num_groups)
-        groups = [[] for _ in range(effective)]
-        for i, item in enumerate(items):
-            groups[i % effective].append(item)
-    return groups
+            self._executor.shutdown(wait=False)
 
 
 def _calculate_mfu(mac_count: int, time_ms: float, dtype_name: str) -> float:
@@ -375,8 +363,10 @@ def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkC
     )
 
 
-def _run_core_worker(nki_neff_pairs: list[tuple[str, str]], cfg: _BenchmarkConfig) -> list[VariantResult]:
-    """Run benchmarks for a batch of variants on one Neuron core."""
+def _run_core_worker(core_id: int, nki_neff_pairs: list[tuple[str, str]], cfg: _BenchmarkConfig) -> list[VariantResult]:
+    """Run benchmarks for a batch of variants on one pinned Neuron core."""
+    os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_id)
+    os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
     os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
     results: list[VariantResult] = []
     with BaremetalExecutor(verbose=0) as spike:
@@ -384,23 +374,6 @@ def _run_core_worker(nki_neff_pairs: list[tuple[str, str]], cfg: _BenchmarkConfi
             cr = CompileResult(nki_path=nki_path, neff_path=neff_path, error="")
             results.append(_benchmark_one(spike, cr, cfg))
     return results
-
-
-def _dispatch_to_cores(groups: list[list[tuple[str, str]]], cfg: _BenchmarkConfig) -> list[VariantResult]:
-    """Spawn one ProcessPoolExecutor per Neuron core and collect results."""
-    all_results: list[VariantResult] = []
-    executors: list[ProcessPoolExecutor] = []
-    futures: dict[Future, int] = {}
-    for rank, group in enumerate(groups):
-        executor = ProcessPoolExecutor(max_workers=1, initializer=_set_neuron_core, initargs=(rank,))
-        executors.append(executor)
-        future = executor.submit(_run_core_worker, group, cfg)
-        futures[future] = rank
-    for future in as_completed(futures):
-        all_results.extend(future.result())
-    for executor in executors:
-        executor.shutdown(wait=True)
-    return all_results
 
 
 def _compile_failure_result(cr: CompileResult, mac_count: int) -> VariantResult:
@@ -418,8 +391,7 @@ def _compile_failure_result(cr: CompileResult, mac_count: int) -> VariantResult:
     )
 
 
-def run_on_hardware(
-    compile_results: list[CompileResult],
+def _make_benchmark_cfg(
     func_name: str,
     kernel_kwargs: dict[str, np.ndarray],
     expected: np.ndarray,
@@ -427,27 +399,59 @@ def run_on_hardware(
     iters: int,
     mac_count: int,
     input_dtype_name: str,
-) -> list[VariantResult]:
-    """Run compiled variants on Neuron hardware in parallel across up to 128 cores."""
-    valid = [(cr.nki_path, cr.neff_path) for cr in compile_results if not cr.error]
-    all_results = [_compile_failure_result(cr, mac_count) for cr in compile_results if cr.error]
-    if valid:
-        cfg = _BenchmarkConfig(
-            func_name=func_name,
-            kernel_kwargs=kernel_kwargs,
-            output_name="output",
-            output_shape=expected.shape,
-            output_dtype=np.dtype(input_dtype_name),
-            expected=expected,
-            warmup=warmup,
-            iters=iters,
-            mac_count=mac_count,
-            input_dtype_name=input_dtype_name,
-        )
-        groups = _split_into_groups(valid, 128)
-        logger.info("Running %d variants on %d Neuron cores", len(valid), len(groups))
-        all_results.extend(_dispatch_to_cores(groups, cfg))
-        logger.info("Hardware run complete: %d results", len(all_results))
-    else:
-        logger.warning("No successfully compiled variants to benchmark")
-    return all_results
+) -> _BenchmarkConfig:
+    """Build a _BenchmarkConfig from the common benchmark parameters."""
+    return _BenchmarkConfig(
+        func_name=func_name,
+        kernel_kwargs=kernel_kwargs,
+        output_name="output",
+        output_shape=expected.shape,
+        output_dtype=np.dtype(input_dtype_name),
+        expected=expected,
+        warmup=warmup,
+        iters=iters,
+        mac_count=mac_count,
+        input_dtype_name=input_dtype_name,
+    )
+
+
+def _collect_hw_results(hw_futures: list[Future]) -> list[VariantResult]:
+    """Wait for all hardware benchmark futures and collect results."""
+    results: list[VariantResult] = []
+    for hw_future in as_completed(hw_futures):
+        results.extend(hw_future.result())
+    return results
+
+
+def stream_compile_and_run(
+    pool: CompilationPool,
+    func_name: str,
+    kernel_kwargs: dict[str, np.ndarray],
+    expected: np.ndarray,
+    warmup: int,
+    iters: int,
+    mac_count: int,
+    input_dtype_name: str,
+) -> tuple[int, int, list[VariantResult]]:
+    """Stream compilation results into hardware benchmarks as they complete."""
+    cfg = _make_benchmark_cfg(func_name, kernel_kwargs, expected, warmup, iters, mac_count, input_dtype_name)
+    compile_errors: list[VariantResult] = []
+    hw_futures: list[Future] = []
+    hw_executor = ProcessPoolExecutor(max_workers=128)
+    core_id = 0
+    for future in as_completed(pool._futures):
+        cr = future.result()
+        if cr.error:
+            compile_errors.append(_compile_failure_result(cr, mac_count))
+        else:
+            pair = [(cr.nki_path, cr.neff_path)]
+            hw_futures.append(hw_executor.submit(_run_core_worker, core_id, pair, cfg))
+            core_id += 1
+    pool.shutdown()
+    failed = len(pool._futures) - core_id
+    logger.info("Compilation: %d succeeded, %d failed", core_id, failed)
+    logger.info("Running %d variants on %d Neuron cores", core_id, core_id)
+    hw_results = _collect_hw_results(hw_futures)
+    hw_executor.shutdown(wait=False)
+    logger.info("Hardware run complete: %d results", len(compile_errors) + len(hw_results))
+    return core_id, failed, compile_errors + hw_results

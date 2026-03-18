@@ -46,6 +46,41 @@ class NKIOp:
         """
         return dict(cls._registry)
 
+    def dst_name(self) -> str:
+        """Return the destination tensor name.
+
+        Returns:
+            Destination name string.
+        """
+        raise NotImplementedError
+
+    def tensor_names(self) -> tuple[str, ...]:
+        """Return all tensor names referenced by this statement.
+
+        Returns:
+            Tuple of variable names in field order.
+        """
+        raise NotImplementedError
+
+    def input_names(self) -> tuple[str, ...]:
+        """Return non-destination tensor names.
+
+        Returns:
+            Tuple of input variable names.
+        """
+        raise NotImplementedError
+
+    def renamed(self, rename_map: dict[str, str]) -> "NKIOp":
+        """Return a copy with tensor names renamed, or self if unchanged.
+
+        Args:
+            rename_map: Mapping from old names to new names.
+
+        Returns:
+            New statement with renamed variables, or self.
+        """
+        raise NotImplementedError
+
     def mac_count(self) -> int:
         """Count MACs for this op invocation.
 

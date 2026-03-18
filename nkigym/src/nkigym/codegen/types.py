@@ -1,12 +1,10 @@
 """Container types for NKI kernel IR: NKIBlock, NKIKernel, and normalize."""
 
-import dataclasses
 import re
 from typing import Any, NamedTuple
 
 import numpy as np
 
-from nkigym.ir.tensor import TensorRef
 from nkigym.ops.base import NKIOp
 
 _TENSOR_RE = re.compile(r"^tensor_(\d+)$")
@@ -131,28 +129,6 @@ class NKIKernel(NamedTuple):
         return "\n".join(lines)
 
 
-def _stmt_tensor_names(stmt: NKIOp) -> list[str]:
-    """Extract all variable names referenced by a statement.
-
-    Iterates dataclass fields: collects TensorRef.name values and
-    bare str fields named ``"dst"`` (for NKIAlloc).
-
-    Args:
-        stmt: An NKI statement.
-
-    Returns:
-        List of variable names in field order.
-    """
-    names: list[str] = []
-    for fld in dataclasses.fields(stmt):
-        val = getattr(stmt, fld.name)
-        if isinstance(val, TensorRef):
-            names.append(val.name)
-        elif fld.name == "dst" and isinstance(val, str):
-            names.append(val)
-    return names
-
-
 def _iter_all_names(kernel: "NKIKernel") -> list[str]:
     """Flatten all tensor names from all blocks in appearance order.
 
@@ -165,7 +141,7 @@ def _iter_all_names(kernel: "NKIKernel") -> list[str]:
     names: list[str] = []
     for block in kernel.blocks:
         for stmt in block.body:
-            names.extend(_stmt_tensor_names(stmt))
+            names.extend(stmt.tensor_names())
     return names
 
 
@@ -187,45 +163,6 @@ def _collect_tensor_names(kernel: "NKIKernel") -> list[str]:
     return ordered
 
 
-def _rename_ref(ref: TensorRef, rename_map: dict[str, str]) -> TensorRef:
-    """Apply rename map to a TensorRef.
-
-    Args:
-        ref: Original tensor reference.
-        rename_map: Mapping from old names to new names.
-
-    Returns:
-        TensorRef with renamed variable name.
-    """
-    new_name = rename_map.get(ref.name, ref.name)
-    return TensorRef(new_name, ref.shape, ref.slices)
-
-
-def _rename_stmt(stmt: NKIOp, rename_map: dict[str, str]) -> NKIOp:
-    """Apply rename map to all variable names in a statement.
-
-    Iterates dataclass fields generically: renames TensorRef fields
-    and bare str ``"dst"`` fields via the rename map.
-
-    Args:
-        stmt: Original NKI statement.
-        rename_map: Mapping from old names to new names.
-
-    Returns:
-        New statement with renamed variables.
-    """
-    kwargs: dict[str, object] = {}
-    for fld in dataclasses.fields(stmt):
-        val = getattr(stmt, fld.name)
-        if isinstance(val, TensorRef):
-            kwargs[fld.name] = _rename_ref(val, rename_map)
-        elif fld.name == "dst" and isinstance(val, str):
-            kwargs[fld.name] = rename_map.get(val, val)
-        else:
-            kwargs[fld.name] = val
-    return type(stmt)(**kwargs)
-
-
 def normalize(kernel: NKIKernel) -> NKIKernel:
     """Rename tensor_N variables to canonical first-appearance order.
 
@@ -245,7 +182,7 @@ def normalize(kernel: NKIKernel) -> NKIKernel:
     blocks = kernel.blocks
     if rename_map:
         blocks = tuple(
-            NKIBlock(name=block.name, params=block.params, body=tuple(_rename_stmt(s, rename_map) for s in block.body))
+            NKIBlock(name=block.name, params=block.params, body=tuple(s.renamed(rename_map) for s in block.body))
             for block in kernel.blocks
         )
 

@@ -28,6 +28,46 @@ class NKIMatmul(NKIOp):
     OUTPUT_AXES: ClassVar[tuple[str, str]] = ("M", "N")
     TILE_LIMITS: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": 512}
 
+    def dst_name(self) -> str:
+        """Return the destination tensor name.
+
+        Returns:
+            Destination name string.
+        """
+        return self.dst.name
+
+    def tensor_names(self) -> tuple[str, ...]:
+        """Return all tensor names.
+
+        Returns:
+            Tuple of destination, stationary, and moving names.
+        """
+        return (self.dst.name, self.stationary.name, self.moving.name)
+
+    def input_names(self) -> tuple[str, ...]:
+        """Return input tensor names.
+
+        Returns:
+            Tuple of stationary and moving names.
+        """
+        return (self.stationary.name, self.moving.name)
+
+    def renamed(self, rename_map: dict[str, str]) -> "NKIMatmul":
+        """Return a copy with refs renamed, or self if unchanged.
+
+        Args:
+            rename_map: Mapping from old names to new names.
+
+        Returns:
+            Renamed NKIMatmul or self.
+        """
+        new_dst = self.dst.renamed(rename_map)
+        new_stat = self.stationary.renamed(rename_map)
+        new_mov = self.moving.renamed(rename_map)
+        changed = new_dst is not self.dst or new_stat is not self.stationary or new_mov is not self.moving
+        result: NKIMatmul = NKIMatmul(dst=new_dst, stationary=new_stat, moving=new_mov) if changed else self
+        return result
+
     def mac_count(self) -> int:
         """Count MACs: K * M * N for stationary [K, M] @ moving [K, N].
 

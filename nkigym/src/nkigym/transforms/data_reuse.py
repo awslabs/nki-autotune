@@ -4,12 +4,22 @@ Scans all blocks for NKIDmaCopy statements loading from HBM (src.name in
 kernel.params). Groups by (src.name, src.slices). Emits TransformOption
 for each pair with identical source. Cross-block pairs trigger block
 concatenation via resolve_option.
+
+Block-level analysis is cached by ``id(block)`` so unchanged blocks
+(same Python object across transforms) skip full body scans.
+
+Pair enumeration is lazy: ``_LazyPairSeq`` stores ref groups and computes
+C(n,2) pairs on demand via combinatorial unranking, avoiding creation of
+millions of TransformOption objects that are never accessed.
 """
 
+import bisect
 import dataclasses
-from itertools import combinations
+from collections.abc import Sequence
+from math import isqrt
+from typing import overload
 
-from nkigym.codegen.types import NKIKernel
+from nkigym.codegen.types import NKIBlock, NKIKernel
 from nkigym.ir.tensor import TensorRef
 from nkigym.ops.base import NKIOp
 from nkigym.ops.dma_copy import NKIDmaCopy
@@ -17,25 +27,110 @@ from nkigym.transforms.base import NKITransform, StmtRef, TransformOption
 from nkigym.transforms.block_merge import replace_block, resolve_option
 
 
+class _LazyPairSeq(Sequence[TransformOption]):
+    """Virtual sequence of TransformOption pairs from ref groups.
+
+    Computes pairs on demand via combinatorial unranking, preserving
+    the same ordering as ``itertools.combinations(refs, 2)``.
+    Avoids materializing millions of TransformOption objects.
+    """
+
+    def __init__(self, groups: list[list[StmtRef]]) -> None:
+        """Build offset table from ref groups.
+
+        Args:
+            groups: List of ref lists, each with 2+ refs.
+        """
+        offsets: list[int] = []
+        total = 0
+        for refs in groups:
+            offsets.append(total)
+            n = len(refs)
+            total += n * (n - 1) // 2
+        self._groups = groups
+        self._offsets = tuple(offsets)
+        self._total = total
+
+    def __len__(self) -> int:
+        """Total number of pairs across all groups."""
+        return self._total
+
+    @overload
+    def __getitem__(self, idx: int) -> TransformOption:
+        """Get a single pair by flat index."""
+        ...
+
+    @overload
+    def __getitem__(self, idx: slice) -> list[TransformOption]:
+        """Get a range of pairs by slice."""
+        ...
+
+    def __getitem__(self, idx: int | slice) -> TransformOption | list[TransformOption]:
+        """Compute the idx-th pair via combinatorial unranking."""
+        result: TransformOption | list[TransformOption]
+        if isinstance(idx, slice):
+            result = [self[i] for i in range(*idx.indices(len(self)))]
+        else:
+            seg = bisect.bisect_right(self._offsets, idx) - 1
+            result = _unrank_pair(self._groups[seg], idx - self._offsets[seg])
+        return result
+
+    def __eq__(self, other: object) -> bool:
+        """Element-wise comparison with lists (for tests)."""
+        result = False
+        if isinstance(other, (list, _LazyPairSeq)):
+            result = len(self) == len(other) and all(self[i] == other[i] for i in range(len(self)))
+        return result
+
+
+def _unrank_pair(refs: list[StmtRef], local: int) -> TransformOption:
+    """Unrank a combination index to a TransformOption pair.
+
+    Given refs of length n, maps flat index ``local`` (in [0, C(n,2)))
+    to the corresponding pair in ``combinations(refs, 2)`` order.
+
+    Args:
+        refs: List of statement references.
+        local: Flat index within this group's pairs.
+
+    Returns:
+        TransformOption for the pair at position ``local``.
+    """
+    n = len(refs)
+    discriminant = (2 * n - 1) ** 2 - 8 * local
+    i = (2 * n - 1 - isqrt(discriminant)) // 2
+    row_start = i * (2 * n - i - 1) // 2
+    if row_start > local:
+        i -= 1
+        row_start = i * (2 * n - i - 1) // 2
+    j = i + 1 + (local - row_start)
+    return TransformOption(refs[i], refs[j])
+
+
 class DataReuseTransform(NKITransform):
     """Deduplicate identical DMA loads across blocks.
 
     ``analyze()`` finds pairs of DMA loads with identical HBM source.
     ``apply()`` removes the duplicate and renames downstream refs.
+    Per-block analysis is cached by ``id(block)`` to skip unchanged blocks.
     """
 
     name = "data_reuse"
 
-    def analyze(self, kernel: NKIKernel) -> list[TransformOption]:
+    def __init__(self) -> None:
+        """Initialize with empty block analysis cache."""
+        self._block_cache: dict[int, list] = {}
+
+    def analyze(self, kernel: NKIKernel) -> _LazyPairSeq:
         """Find pairs of DMA loads with identical HBM source slices.
 
         Args:
             kernel: The NKI kernel to analyze.
 
         Returns:
-            List of TransformOption pairs.
+            Lazy sequence of TransformOption pairs.
         """
-        return _find_reuse_pairs(kernel)
+        return _find_reuse_pairs(kernel, self._block_cache)
 
     def apply(self, kernel: NKIKernel, option: TransformOption) -> NKIKernel:
         """Remove a duplicate DMA load and rename downstream references.
@@ -50,30 +145,48 @@ class DataReuseTransform(NKITransform):
         return _apply_reuse(kernel, option)
 
 
-def _find_reuse_pairs(kernel: NKIKernel) -> list[TransformOption]:
-    """Scan all blocks for duplicate DMA loads from HBM parameters.
+def _scan_block_dma(block: NKIBlock, hbm_names: set[str]) -> list:
+    """Scan a block for HBM DMA loads, return (key, StmtRef) entries.
+
+    Args:
+        block: The block to scan.
+        hbm_names: Set of HBM parameter names.
+
+    Returns:
+        List of (grouping_key, stmt_ref) entries for HBM DMA loads.
+    """
+    entries: list = []
+    for si, stmt in enumerate(block.body):
+        if isinstance(stmt, NKIDmaCopy) and stmt.src.name in hbm_names:
+            entries.append(((stmt.src.name, stmt.src.slices), StmtRef(block.name, si)))
+    return entries
+
+
+def _find_reuse_pairs(kernel: NKIKernel, cache: dict[int, list]) -> _LazyPairSeq:
+    """Scan blocks for duplicate DMA loads, using per-block cache.
+
+    Returns a lazy sequence that computes C(n,2) pairs on demand via
+    combinatorial unranking — same ordering as combinations(refs, 2).
 
     Args:
         kernel: The NKI kernel.
+        cache: Per-block cache mapping id(block) to DMA entries.
 
     Returns:
-        List of TransformOption pairs for identical loads.
+        Lazy sequence of TransformOption pairs for identical loads.
     """
     hbm_names = set(kernel.params)
-    groups: dict[tuple[str, tuple[tuple[int, int], ...]], list[StmtRef]] = {}
+    ref_groups: dict[tuple, list[StmtRef]] = {}
     for block in kernel.blocks:
-        for si, stmt in enumerate(block.body):
-            if not isinstance(stmt, NKIDmaCopy):
-                continue
-            if stmt.src.name not in hbm_names:
-                continue
-            key = (stmt.src.name, stmt.src.slices)
-            groups.setdefault(key, []).append(StmtRef(block.name, si))
-    pairs: list[TransformOption] = []
-    for refs in groups.values():
-        if len(refs) >= 2:
-            pairs.extend(TransformOption(a, b) for a, b in combinations(refs, 2))
-    return pairs
+        bid = id(block)
+        entries = cache.get(bid)
+        if entries is None:
+            entries = _scan_block_dma(block, hbm_names)
+            cache[bid] = entries
+        for key, ref in entries:
+            ref_groups.setdefault(key, []).append(ref)
+    groups = [refs for refs in ref_groups.values() if len(refs) >= 2]
+    return _LazyPairSeq(groups)
 
 
 def _apply_reuse(kernel: NKIKernel, option: TransformOption) -> NKIKernel:

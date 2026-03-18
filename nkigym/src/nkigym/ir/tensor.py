@@ -24,6 +24,18 @@ class TensorRef(NamedTuple):
         """
         return tuple(slice(s, e) for s, e in self.slices)
 
+    def renamed(self, rename_map: dict[str, str]) -> "TensorRef":
+        """Return a copy with name replaced per rename_map, or self if unchanged.
+
+        Args:
+            rename_map: Mapping from old names to new names.
+
+        Returns:
+            Renamed TensorRef or self if name not in map.
+        """
+        new_name = rename_map.get(self.name, self.name)
+        return TensorRef(new_name, self.shape, self.slices) if new_name != self.name else self
+
 
 def full_slices(shape: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
     """Build full-range slices from a shape.
