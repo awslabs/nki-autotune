@@ -5,6 +5,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
+from nkigym.codegen.roll import _block_skeleton, _extract_offsets, _render_rolled_helper, _rolled_helper_name
 from nkigym.ops.base import NKIOp
 
 _TENSOR_RE = re.compile(r"^tensor_(\d+)$")
@@ -92,11 +93,11 @@ class NKIKernel(NamedTuple):
                 total += stmt.mac_count()
         return total
 
-    def _render_main_lines(self) -> list[str]:
-        """Render the main @nki.jit kernel function lines.
+    def _render_preamble(self) -> list[str]:
+        """Render @nki.jit header, assertions, and output allocation.
 
         Returns:
-            List of source lines for the main function.
+            List of source lines through the output alloc statement.
         """
         params_str = ", ".join(self.params)
         lines = ["@nki.jit", f"def {self.name}({params_str}):"]
@@ -106,27 +107,162 @@ class NKIKernel(NamedTuple):
         lines.append(
             f"    output = nl.ndarray({self.output_shape}, dtype={self.params[0]}.dtype, buffer=nl.shared_hbm)"
         )
+        return lines
+
+    def _render_main_lines(self) -> list[str]:
+        """Render the main @nki.jit kernel function lines.
+
+        Returns:
+            List of source lines for the main function.
+        """
+        lines = self._render_preamble()
+        call_params = ", ".join(list(self.params) + ["output"])
         for block in self.blocks:
-            call_params = ", ".join(list(self.params) + ["output"])
             lines.append(f"    {block.name}({call_params})")
         lines.append("    return output")
         return lines
 
-    def render(self) -> str:
+    def _render_rolled_lines(self) -> list[str]:
+        """Render rolled kernel: group blocks, extract offsets, emit helpers.
+
+        Returns:
+            List of source lines for the rolled kernel.
+        """
+        hbm = set(self.params) | {"output"}
+        groups: dict[tuple[NKIOp, ...], list[int]] = {}
+        for idx, block in enumerate(self.blocks):
+            skel = _block_skeleton(block.body, hbm)
+            groups.setdefault(skel, []).append(idx)
+        rolled_groups, singletons, helpers = _build_rolled_groups(self.blocks, self.params, groups, hbm)
+        return _assemble_rolled_lines(self, rolled_groups, singletons, helpers)
+
+    def render(self, roll: bool) -> str:
         """Render complete NKI kernel as Python source code.
+
+        Args:
+            roll: If True, deduplicate identical blocks into helpers.
 
         Returns:
             Complete Python source string with imports, main function,
             and block functions.
         """
         lines = ["import nki", "import nki.language as nl", "import nki.isa as nisa", "", ""]
-        lines.extend(self._render_main_lines())
-        for block in self.blocks:
-            lines.append("")
-            lines.append("")
-            lines.append(block.render())
+        if roll:
+            lines.extend(self._render_rolled_lines())
+        else:
+            lines.extend(self._render_main_lines())
+            for block in self.blocks:
+                lines.extend(["", "", block.render()])
         lines.append("")
         return "\n".join(lines)
+
+
+def _build_rolled_groups(
+    blocks: tuple[NKIBlock, ...], params: tuple[str, ...], groups: dict[tuple[NKIOp, ...], list[int]], hbm: set[str]
+) -> tuple[list[tuple[str, list[int], list[tuple[int, ...]]]], set[int], list[list[str]]]:
+    """Build rolled helper data from skeleton groups.
+
+    Args:
+        blocks: Kernel blocks.
+        params: Kernel parameter names.
+        groups: Skeleton to block-index mapping.
+        hbm: Set of HBM tensor names.
+
+    Returns:
+        Tuple of (rolled_groups, singleton_indices, helper_sections).
+    """
+    rolled_groups: list[tuple[str, list[int], list[tuple[int, ...]]]] = []
+    singletons: set[int] = set()
+    helpers: list[list[str]] = []
+    for indices in groups.values():
+        if len(indices) == 1:
+            singletons.add(indices[0])
+            continue
+        unique_vecs, varying_map = _extract_offsets(blocks, indices, hbm)
+        param_names = [f"off_{i}" for i in range(len(unique_vecs))]
+        helper_name = _rolled_helper_name([blocks[i].name for i in indices])
+        offset_grid = [tuple(vec[pos] for vec in unique_vecs) for pos in range(len(indices))]
+        rolled_groups.append((helper_name, indices, offset_grid))
+        helpers.append(
+            _render_rolled_helper(blocks[indices[0]].body, params, varying_map, param_names, helper_name, hbm)
+        )
+    return rolled_groups, singletons, helpers
+
+
+def _render_offset_table(offset_grid: list[tuple[int, ...]]) -> str:
+    """Render offset grid as tuple-of-tuples literal.
+
+    Args:
+        offset_grid: List of offset tuples, one per block position.
+
+    Returns:
+        Tuple literal string like ``((0, 0), (0, 128), ...)``.
+    """
+    entries = [f"{t!r}" for t in offset_grid]
+    return "(" + ", ".join(entries) + ")"
+
+
+def _append_group_loop(
+    lines: list[str], group_idx: int, helper_name: str, call_prefix: str, offset_grid: list[tuple[int, ...]]
+) -> None:
+    """Append offset table, for-loop, and helper call to lines.
+
+    Args:
+        lines: Mutable list of source lines.
+        group_idx: Unique index for naming ``_offsets_N`` / ``_i_N``.
+        helper_name: Helper function name.
+        call_prefix: Comma-joined kernel params + output.
+        offset_grid: Offset tuples for each loop iteration.
+    """
+    n_offsets = len(offset_grid[0]) if offset_grid else 0
+    ivar = f"_i_{group_idx}"
+    offset_args = ", ".join(f"_offsets_{group_idx}[{ivar}][{k}]" for k in range(n_offsets))
+    call_args = f"{call_prefix}, {offset_args}" if offset_args else call_prefix
+    lines.append(f"    _offsets_{group_idx} = {_render_offset_table(offset_grid)}")
+    lines.append(f"    for {ivar} in range({len(offset_grid)}):")
+    lines.append(f"        {helper_name}({call_args})")
+
+
+def _assemble_rolled_lines(
+    kernel: "NKIKernel",
+    rolled_groups: list[tuple[str, list[int], list[tuple[int, ...]]]],
+    singletons: set[int],
+    helpers: list[list[str]],
+) -> list[str]:
+    """Assemble main function + helpers for rolled output.
+
+    Args:
+        kernel: NKI kernel for metadata.
+        rolled_groups: List of (helper_name, block_indices, offset_grid).
+        singletons: Block indices rendered as standalone helpers.
+        helpers: Pre-rendered helper function line lists.
+
+    Returns:
+        List of source lines.
+    """
+    group_start: dict[int, int] = {}
+    group_members: set[int] = set()
+    for g_idx, rolled in enumerate(rolled_groups):
+        group_members.update(rolled[1])
+        group_start[rolled[1][0]] = g_idx
+    lines = kernel._render_preamble()
+    call_prefix = ", ".join(list(kernel.params) + ["output"])
+    for block_idx, block in enumerate(kernel.blocks):
+        if block_idx in singletons:
+            lines.append(f"    {block.name}({call_prefix})")
+        elif block_idx in group_start:
+            g_idx = group_start[block_idx]
+            helper_name, _, offset_grid = rolled_groups[g_idx]
+            _append_group_loop(lines, g_idx, helper_name, call_prefix, offset_grid)
+        elif block_idx in group_members:
+            continue
+    lines.append("    return output")
+    for block_idx in sorted(singletons):
+        lines.extend(["", "", kernel.blocks[block_idx].render()])
+    for section in helpers:
+        lines.extend(["", ""])
+        lines.extend(section)
+    return lines
 
 
 def _iter_all_names(kernel: "NKIKernel") -> list[str]:

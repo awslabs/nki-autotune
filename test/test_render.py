@@ -20,4 +20,4 @@ class TestRender:
 
     def test_full_render(self) -> None:
         """Rendered source matches golden string."""
-        assert MATMUL_TANH_KERNEL.render() == MATMUL_TANH_RENDERED
+        assert MATMUL_TANH_KERNEL.render(False) == MATMUL_TANH_RENDERED

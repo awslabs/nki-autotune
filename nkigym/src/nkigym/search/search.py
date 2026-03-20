@@ -208,7 +208,7 @@ def _save_variant(node: _Node, cache_dir: Path) -> tuple[str, str]:
     nki_path = str(nki_dir / f"nki_d{node.depth}_v{node.variant_idx}.py")
     error = ""
     try:
-        nki_source = normalize(node.kernel).render()
+        nki_source = normalize(node.kernel).render(False)
         Path(nki_path).write_text(nki_source)
     except Exception as e:
         error = _capture_error(e)
@@ -286,7 +286,7 @@ def _prepare_root(
     sim_kwargs = {k: v.astype(np.float64) for k, v in kernel_kwargs.items()}
     expected = func(**sim_kwargs)
     kernel = codegen(func, kernel_kwargs)
-    (nki_dir / "nki_root.py").write_text(kernel.render())
+    (nki_dir / "nki_root.py").write_text(kernel.render(False))
     return kernel, expected, sim_kwargs
 
 
