@@ -50,6 +50,7 @@ class _Analysis(NamedTuple):
         reduction_dims: Ordered list of reduction dim IDs.
         tile_counts: Parallel dim ID to tile count.
         reduction_tile_counts: Reduction dim ID to tile count.
+        dim_tile_sizes: Dim ID to tile size (from op TILE_LIMITS).
         return_var: Name of the return variable.
     """
 
@@ -59,6 +60,7 @@ class _Analysis(NamedTuple):
     reduction_dims: list[str]
     tile_counts: dict[str, int]
     reduction_tile_counts: dict[str, int]
+    dim_tile_sizes: dict[str, int]
     return_var: str
 
 
@@ -76,9 +78,9 @@ def analyze_dims(
         Dimension analysis result.
     """
     var_dims, var_shapes, dim_info, _dim_counter, rename_map = _init_params(params, input_shapes)
-    _unify_ops(op_calls, var_dims, var_shapes, dim_info, rename_map)
+    dim_to_tile_size = _unify_ops(op_calls, var_dims, var_shapes, dim_info, rename_map)
     return_var = op_calls[-1].output_var
-    return _classify_dims(var_dims, var_shapes, dim_info, rename_map, return_var)
+    return _classify_dims(var_dims, var_shapes, dim_info, rename_map, return_var, dim_to_tile_size)
 
 
 def _init_params(
@@ -173,6 +175,7 @@ def _unify_one_op(
     var_shapes: dict[str, tuple[int, ...]],
     dim_info: dict[str, _DimInfo],
     rename_map: dict[str, str],
+    dim_to_tile_size: dict[str, int],
 ) -> None:
     """Unify dimensions for a single op call and register its output.
 
@@ -182,6 +185,7 @@ def _unify_one_op(
         var_shapes: Mutable variable-to-shape mapping.
         dim_info: Mutable dimension info mapping.
         rename_map: Mutable rename chain.
+        dim_to_tile_size: Mutable dim ID to tile size mapping.
     """
     operand_axes: dict[str, tuple[str, ...]] = getattr(op_call.stmt_type, "OPERAND_AXES", {})
     output_axes: tuple[str, ...] = getattr(op_call.stmt_type, "OUTPUT_AXES", ())
@@ -192,6 +196,11 @@ def _unify_one_op(
         var_dim_ids = var_dims[var_name]
         for axis_idx, axis_label in enumerate(axes):
             _unify_axis(axis_label, var_dim_ids[axis_idx], axis_to_dim, dim_info, rename_map)
+    tile_limits: dict[str, int] = getattr(op_call.stmt_type, "TILE_LIMITS", {})
+    for axis, limit in tile_limits.items():
+        if axis in axis_to_dim:
+            dim_id = _canonical(axis_to_dim[axis], rename_map)
+            dim_to_tile_size[dim_id] = limit
     _register_output(op_call, output_axes, axis_to_dim, var_dims, var_shapes, dim_info, rename_map)
 
 
@@ -231,7 +240,7 @@ def _unify_ops(
     var_shapes: dict[str, tuple[int, ...]],
     dim_info: dict[str, _DimInfo],
     rename_map: dict[str, str],
-) -> None:
+) -> dict[str, int]:
     """Unify dimensions across all op calls.
 
     Args:
@@ -240,9 +249,14 @@ def _unify_ops(
         var_shapes: Mutable variable-to-shape mapping.
         dim_info: Mutable dimension info mapping.
         rename_map: Mutable rename chain.
+
+    Returns:
+        Mapping from canonical dim ID to tile size from op TILE_LIMITS.
     """
+    dim_to_tile_size: dict[str, int] = {}
     for op_call in op_calls:
-        _unify_one_op(op_call, var_dims, var_shapes, dim_info, rename_map)
+        _unify_one_op(op_call, var_dims, var_shapes, dim_info, rename_map, dim_to_tile_size)
+    return dim_to_tile_size
 
 
 def _collect_unique_dims(dim_info: dict[str, _DimInfo], rename_map: dict[str, str]) -> dict[str, _DimInfo]:
@@ -287,6 +301,7 @@ def _classify_dims(
     dim_info: dict[str, _DimInfo],
     rename_map: dict[str, str],
     return_var: str,
+    dim_to_tile_size: dict[str, int],
 ) -> _Analysis:
     """Classify dimensions as parallel or reduction and compute tile counts.
 
@@ -296,6 +311,7 @@ def _classify_dims(
         dim_info: Dimension info lookup.
         rename_map: Rename chain.
         return_var: Return variable name.
+        dim_to_tile_size: Dim ID to tile size from op TILE_LIMITS.
 
     Returns:
         Complete analysis result.
@@ -306,15 +322,19 @@ def _classify_dims(
     reduction_dims: list[str] = []
     tile_counts: dict[str, int] = {}
     reduction_tile_counts: dict[str, int] = {}
+    dim_tile_sizes: dict[str, int] = {}
     for dim_id, info in all_dims.items():
-        if info.size % _TILE != 0:
-            raise ValueError(f"Dimension {dim_id} size {info.size} not divisible by {_TILE}")
+        preferred = dim_to_tile_size.get(dim_id, _TILE)
+        tile_size = preferred if info.size % preferred == 0 else _TILE
+        if info.size % tile_size != 0:
+            raise ValueError(f"Dimension {dim_id} size {info.size} not divisible by {tile_size}")
+        dim_tile_sizes[dim_id] = tile_size
         if dim_id in return_dims:
             parallel_dims.append(dim_id)
-            tile_counts[dim_id] = info.size // _TILE
+            tile_counts[dim_id] = info.size // tile_size
         else:
             reduction_dims.append(dim_id)
-            reduction_tile_counts[dim_id] = info.size // _TILE
+            reduction_tile_counts[dim_id] = info.size // tile_size
     return _Analysis(
         var_dims=_canonicalize_var_dims(var_dims, rename_map),
         var_shapes=var_shapes,
@@ -322,6 +342,7 @@ def _classify_dims(
         reduction_dims=reduction_dims,
         tile_counts=tile_counts,
         reduction_tile_counts=reduction_tile_counts,
+        dim_tile_sizes=dim_tile_sizes,
         return_var=return_var,
     )
 
@@ -342,8 +363,9 @@ def compute_slices(var_name: str, position: dict[str, int], analysis: _Analysis)
     slices: list[tuple[int, int]] = []
     for dim_id, size in zip(dims, shape):
         if dim_id is not None and dim_id in position:
-            offset = position[dim_id] * _TILE
-            slices.append((offset, offset + _TILE))
+            tile_size = analysis.dim_tile_sizes[dim_id]
+            offset = position[dim_id] * tile_size
+            slices.append((offset, offset + tile_size))
         else:
             slices.append((0, size))
     return tuple(slices)
