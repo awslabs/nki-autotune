@@ -77,6 +77,10 @@ class VariantResult(NamedTuple):
     mfu: float
     correct: bool
     error: str
+    arithmetic_intensity: float = 0.0
+    roofline_bound: str = ""
+    roofline_peak_tflops: float = 0.0
+    roofline_efficiency: float = 0.0
 
 
 @dataclass
@@ -102,6 +106,7 @@ class _BenchmarkConfig:
     iters: int
     mac_count: int
     input_dtype_name: str
+    roofline_map: dict[str, tuple[float, str, float]] = field(default_factory=dict)
 
 
 class _TracedKernel:
@@ -324,6 +329,18 @@ def _percentile(sorted_vals: list[float], pct: float) -> float:
     return sorted_vals[idx]
 
 
+def _enrich_roofline(cfg: _BenchmarkConfig, nki_path: str, min_ms: float) -> tuple[float, str, float, float]:
+    """Look up roofline data and compute efficiency from measured latency."""
+    entry = cfg.roofline_map.get(nki_path)
+    ai, bound, peak, eff = 0.0, "", 0.0, 0.0
+    if entry is not None:
+        ai, bound, peak = entry
+        if peak > 0 and min_ms > 0:
+            achieved = (cfg.mac_count * 2) / (min_ms / 1000) / 1e12
+            eff = achieved / peak
+    return ai, bound, peak, eff
+
+
 def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkConfig) -> VariantResult:
     """Benchmark a single compiled variant on a Neuron core."""
     min_ms = mean_ms = p50_ms = p99_ms = mfu = 0.0
@@ -350,6 +367,8 @@ def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkC
         correct = True
     except Exception as e:
         error = _capture_error(e)
+
+    ai, r_bound, r_peak, r_eff = _enrich_roofline(cfg, cr.nki_path, min_ms)
     return VariantResult(
         nki_path=cr.nki_path,
         min_ms=min_ms,
@@ -360,6 +379,10 @@ def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkC
         mfu=mfu,
         correct=correct,
         error=error,
+        arithmetic_intensity=ai,
+        roofline_bound=r_bound,
+        roofline_peak_tflops=r_peak,
+        roofline_efficiency=r_eff,
     )
 
 
@@ -399,6 +422,7 @@ def _make_benchmark_cfg(
     iters: int,
     mac_count: int,
     input_dtype_name: str,
+    roofline_map: dict[str, tuple[float, str, float]],
 ) -> _BenchmarkConfig:
     """Build a _BenchmarkConfig from the common benchmark parameters."""
     return _BenchmarkConfig(
@@ -412,6 +436,7 @@ def _make_benchmark_cfg(
         iters=iters,
         mac_count=mac_count,
         input_dtype_name=input_dtype_name,
+        roofline_map=roofline_map,
     )
 
 
@@ -423,18 +448,8 @@ def _collect_hw_results(hw_futures: list[Future]) -> list[VariantResult]:
     return results
 
 
-def stream_compile_and_run(
-    pool: CompilationPool,
-    func_name: str,
-    kernel_kwargs: dict[str, np.ndarray],
-    expected: np.ndarray,
-    warmup: int,
-    iters: int,
-    mac_count: int,
-    input_dtype_name: str,
-) -> tuple[int, int, list[VariantResult]]:
+def stream_compile_and_run(pool: CompilationPool, cfg: _BenchmarkConfig) -> tuple[int, int, list[VariantResult]]:
     """Stream compilation results into hardware benchmarks as they complete."""
-    cfg = _make_benchmark_cfg(func_name, kernel_kwargs, expected, warmup, iters, mac_count, input_dtype_name)
     compile_errors: list[VariantResult] = []
     hw_futures: list[Future] = []
     hw_executor = ProcessPoolExecutor(max_workers=128)
@@ -442,7 +457,7 @@ def stream_compile_and_run(
     for future in as_completed(pool._futures):
         cr = future.result()
         if cr.error:
-            compile_errors.append(_compile_failure_result(cr, mac_count))
+            compile_errors.append(_compile_failure_result(cr, cfg.mac_count))
         else:
             pair = [(cr.nki_path, cr.neff_path)]
             hw_futures.append(hw_executor.submit(_run_core_worker, core_id, pair, cfg))

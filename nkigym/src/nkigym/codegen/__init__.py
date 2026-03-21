@@ -8,6 +8,7 @@ Modules:
 
 from nkigym.codegen.codegen import codegen
 from nkigym.codegen.dce import dce
+from nkigym.codegen.roofline import RooflineAnalysis, analyze_roofline
 from nkigym.codegen.types import NKIBlock, NKIKernel, normalize
 from nkigym.ops import NKIActivation, NKIAlloc, NKIDmaCopy, NKIMatmul, NKIOp, NKITensorCopy
 
@@ -20,6 +21,8 @@ __all__ = [
     "NKIMatmul",
     "NKIOp",
     "NKITensorCopy",
+    "RooflineAnalysis",
+    "analyze_roofline",
     "codegen",
     "dce",
     "normalize",

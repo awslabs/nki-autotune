@@ -21,12 +21,14 @@ from typing import Any
 import numpy as np
 
 from nkigym.codegen import codegen, dce, normalize
+from nkigym.codegen.roofline import analyze_roofline
 from nkigym.codegen.types import NKIKernel
 from nkigym.search.compile import (  # noqa: F401
     CompilationPool,
     SearchResults,
     VariantResult,
     _capture_error,
+    _make_benchmark_cfg,
     stream_compile_and_run,
 )
 from nkigym.search.report import SearchReport
@@ -225,11 +227,14 @@ class _SearchContext:
     expected: np.ndarray
     pool: CompilationPool
     report: SearchReport
+    roofline_map: dict[str, tuple[float, str, float]] = field(default_factory=dict)
 
 
 def _save_node(node: _Node, ctx: _SearchContext, errors: list[VariantResult]) -> tuple[str, str]:
-    """Save variant to disk and register in report. Returns (nki_path, error)."""
+    """Save variant to disk, run roofline analysis, and register in report."""
     nki_path, error = _save_variant(node, ctx.save_cache)
+    ra = analyze_roofline(node.kernel)
+    ctx.roofline_map[nki_path] = (ra.arithmetic_intensity, ra.bound, ra.roofline_peak_tflops)
     ctx.report.add_variant(nki_path, node.depth, node.variant_idx)
     if error:
         errors.append(
@@ -357,9 +362,10 @@ def _finalize_benchmark(
 ) -> list[VariantResult]:
     """Verify nodes, then stream compilations into hardware benchmarks."""
     _verify_batch(pending_verify, ctx.sim_kwargs, ctx.expected)
-    succeeded, failed, variant_results = stream_compile_and_run(
-        ctx.pool, func_name, ctx.kernel_kwargs, ctx.expected, _WARMUP, _ITERS, mac_count, input_dtype_name
+    cfg = _make_benchmark_cfg(
+        func_name, ctx.kernel_kwargs, ctx.expected, _WARMUP, _ITERS, mac_count, input_dtype_name, ctx.roofline_map
     )
+    succeeded, failed, variant_results = stream_compile_and_run(ctx.pool, cfg)
     ctx.report.set_compilation(succeeded=succeeded, failed=failed)
     _update_report_variants(ctx.report, variant_results)
     ctx.report.sort_variants()
@@ -381,6 +387,10 @@ def _update_report_variants(report: SearchReport, results: list[VariantResult]) 
             mfu=r.mfu,
             correct=r.correct,
             error=r.error if r.error else None,
+            arithmetic_intensity=r.arithmetic_intensity,
+            roofline_bound=r.roofline_bound,
+            roofline_peak_tflops=r.roofline_peak_tflops,
+            roofline_efficiency=r.roofline_efficiency,
         )
 
 

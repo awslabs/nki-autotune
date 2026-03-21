@@ -16,8 +16,6 @@ _EMPTY_REPORT: dict[str, Any] = {
         "qualifying_programs": 0,
         "min_depth": 0,
         "total_programs_visited": 0,
-        "duplicates": 0,
-        "dedup_pct": 0.0,
         "depth_distribution": {},
     },
     "compilation": {"succeeded": 0, "failed": 0},
@@ -64,8 +62,6 @@ class SearchReport:
             total_programs_visited: Total programs visited (root + expansions).
             depth_distribution: Map from depth to node count.
         """
-        duplicates = max(0, total_programs_visited - unique_programs)
-        dedup_pct = (duplicates / total_programs_visited * 100) if total_programs_visited > 0 else 0.0
         self._data["search"] = {
             "root_stmts": root_stmts,
             "root_opportunities": root_opportunities,
@@ -73,8 +69,6 @@ class SearchReport:
             "qualifying_programs": qualifying_programs,
             "min_depth": min_depth,
             "total_programs_visited": total_programs_visited,
-            "duplicates": duplicates,
-            "dedup_pct": round(dedup_pct, 1),
             "depth_distribution": {str(k): v for k, v in sorted(depth_distribution.items())},
         }
         self._write()
@@ -100,6 +94,10 @@ class SearchReport:
             "mfu": None,
             "correct": None,
             "error": None,
+            "arithmetic_intensity": None,
+            "roofline_bound": None,
+            "roofline_peak_tflops": None,
+            "roofline_efficiency": None,
         }
         self._variant_index[nki_path] = len(self._data["variants"])
         self._data["variants"].append(entry)
