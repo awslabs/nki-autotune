@@ -170,24 +170,56 @@ class _TransformGraph:
                 self._frontier_add(kernel, depth)
         return is_new
 
-    def expand_one(self, rng: random.Random) -> tuple[bool, NKIKernel]:
-        """Expand one opportunity using depth-uniform sampling.
+    def expand_one(self, rng: random.Random, chain_length: int) -> tuple[bool, NKIKernel]:
+        """Expand using depth-uniform sampling, chaining chain_length transforms.
 
-        Returns:
-            Tuple of (is_new, child_kernel).
+        Picks a random expandable node, then applies chain_length sequential
+        random transforms from it.  Intermediates are ephemeral — only the
+        final endpoint is registered at depth = parent.depth + chain_length.
+        Returns (made_progress, endpoint_kernel).
         """
         self.total_kernels_visited += 1
         d = rng.choice(list(self._depth_buckets.keys()))
         parent_kernel = rng.choice(self._depth_buckets[d])
-        node = self._node_by_id[id(parent_kernel)]
-        idx_pos = rng.randrange(len(node.unexplored))
-        opp_idx = node.unexplored.pop(idx_pos)
-        transform, option = node.opportunities[opp_idx]
-        child_kernel = dce(transform.apply(node.kernel, option))
+        node = self._dedup[parent_kernel]
+        current_kernel = node.kernel
+        steps = 0
+        current_kernel, steps = self._chain_transforms(rng, node, current_kernel, chain_length)
         if not node.unexplored:
             self._frontier_remove(parent_kernel)
-        is_new = self._add_node(child_kernel, depth=node.depth + 1)
-        return is_new, child_kernel
+        is_new = False
+        if steps > 0:
+            is_new = self._add_node(current_kernel, depth=node.depth + steps)
+            current_kernel = self._dedup[current_kernel].kernel
+        return is_new, current_kernel
+
+    def _chain_transforms(
+        self, rng: random.Random, parent_node: _Node, current_kernel: NKIKernel, chain_length: int
+    ) -> tuple[NKIKernel, int]:
+        """Apply chain_length sequential transforms, returning endpoint and step count.
+
+        First transform consumes one opportunity from parent_node (for graph
+        exhaustion tracking).  Remaining transforms analyze the intermediate
+        kernel for fresh opportunities using uncached transform instances
+        (ephemeral kernels can trigger id() reuse in block caches).
+        """
+        steps = 0
+        for i in range(chain_length):
+            if i == 0:
+                if not parent_node.unexplored:
+                    break
+                idx_pos = rng.randrange(len(parent_node.unexplored))
+                opp_idx = parent_node.unexplored.pop(idx_pos)
+                transform, option = parent_node.opportunities[opp_idx]
+            else:
+                uncached = [type(t)() for t in self.transforms]
+                opps = _collect_opportunities(current_kernel, uncached)
+                if len(opps) == 0:
+                    break
+                transform, option = opps[rng.randrange(len(opps))]
+            current_kernel = dce(transform.apply(current_kernel, option))
+            steps += 1
+        return current_kernel, steps
 
 
 def _verify_batch(nodes: list[_Node], sim_kwargs: dict[str, Any], expected: np.ndarray) -> None:
@@ -299,7 +331,12 @@ _SearchResult = tuple[list[NKIKernel], list[VariantResult], list[_Node]]
 
 
 def _run_search(
-    graph: _TransformGraph, rng: random.Random, min_depth: int, num_targets: float, ctx: _SearchContext
+    graph: _TransformGraph,
+    rng: random.Random,
+    min_depth: int,
+    num_transforms_per_step: int,
+    num_targets: int,
+    ctx: _SearchContext,
 ) -> _SearchResult:
     """Execute search loop: save and submit immediately, defer verification.
 
@@ -321,7 +358,7 @@ def _run_search(
     _emit_progress(ctx.report, root_node, graph, len(qualifying), min_depth, depth_dist)
 
     while len(qualifying) < num_targets and graph._depth_buckets:
-        is_new, child_kernel = graph.expand_one(rng)
+        is_new, child_kernel = graph.expand_one(rng, num_transforms_per_step)
         if not is_new:
             continue
         child_node = graph.node_for(child_kernel)
@@ -405,7 +442,8 @@ def _log_search_summary(report: SearchReport, qualifying: int, results: list[Var
 def search(
     func: Callable,
     transforms: list[NKITransform],
-    num_targets: float,
+    num_targets: int,
+    num_transforms_per_step: int,
     seed: int,
     min_depth: int,
     save_cache: Path,
@@ -432,7 +470,9 @@ def search(
         pool=pool,
         report=report,
     )
-    qualifying, lowering_errors, pending_verify = _run_search(graph, rng, min_depth, num_targets, ctx)
+    qualifying, lowering_errors, pending_verify = _run_search(
+        graph, rng, min_depth, num_transforms_per_step, num_targets, ctx
+    )
     variant_results = _finalize_benchmark(ctx, pending_verify, kernel.name, mac_count, input_dtype_name)
     all_results = lowering_errors + variant_results
     _log_search_summary(report, len(qualifying), all_results)

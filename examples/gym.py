@@ -33,7 +33,10 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="NKI Gym search example")
     parser.add_argument(
-        "--cache-dir", type=Path, default=Path("cache"), help="Directory for storing output (default: cache)"
+        "--cache-dir",
+        type=Path,
+        default=Path("/fsx/weittang/gym_cache"),
+        help="Directory for storing output (default: /fsx/weittang/gym_cache)",
     )
     return parser.parse_args()
 
@@ -53,8 +56,9 @@ def main() -> None:
     search(
         func=nkigym_matmul,
         transforms=[DataReuseTransform(), OperandMergeTransform()],
-        num_targets=500,
-        seed=0,
+        num_targets=100,
+        num_transforms_per_step=1,
+        seed=42,
         min_depth=20,
         save_cache=cache_dir,
         kernel_kwargs={"lhs": lhs.astype(np.float16), "rhs": rhs.astype(np.float16)},
