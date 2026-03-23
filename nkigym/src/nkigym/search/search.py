@@ -29,6 +29,7 @@ from nkigym.search.compile import (
     stream_compile_and_run,
 )
 from nkigym.search.report import SearchReport
+from nkigym.simulate import simulate_kernel
 from nkigym.utils.source import callable_to_source
 
 logger = logging.getLogger(__name__)
@@ -97,11 +98,12 @@ class _SearchContext:
     workload: _Workload
 
 
-def _save_variant(idx: int, schedule: Schedule, ctx: _SearchContext) -> tuple[str, str]:
-    """Write variant NKI source file to disk. Returns (nki_path, error)."""
+def _save_variant(idx: int, schedule: Schedule, ctx: _SearchContext) -> tuple[str, str, str]:
+    """Write variant NKI source file to disk. Returns (nki_path, nki_source, error)."""
     nki_dir = ctx.save_cache / "nki"
     nki_dir.mkdir(parents=True, exist_ok=True)
     nki_path = str(nki_dir / f"nki_v{idx}.py")
+    nki_source = ""
     error = ""
     try:
         w = ctx.workload
@@ -109,27 +111,50 @@ def _save_variant(idx: int, schedule: Schedule, ctx: _SearchContext) -> tuple[st
         Path(nki_path).write_text(nki_source)
     except Exception as e:
         error = _capture_error(e)
-    return (nki_path, error)
+    return (nki_path, nki_source, error)
+
+
+def _failure_result(nki_path: str, error: str) -> VariantResult:
+    """Create a VariantResult for a variant that failed verification."""
+    return VariantResult(
+        nki_path=nki_path,
+        min_ms=0.0,
+        mean_ms=0.0,
+        p50_ms=0.0,
+        p99_ms=0.0,
+        mac_count=0,
+        mfu=0.0,
+        correct=False,
+        error=error,
+    )
+
+
+def _cpu_verify(nki_source: str, func_name: str, kernel_kwargs: dict[str, Any], expected: np.ndarray) -> str:
+    """Verify kernel correctness via CPU simulation.
+
+    Simulates the rendered NKI kernel using numpy at float64 and
+    compares against the expected reference output.
+
+    Returns:
+        Empty string on success, error traceback on failure.
+    """
+    error = ""
+    try:
+        actual = simulate_kernel(nki_source, func_name, kernel_kwargs)
+        np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
+    except Exception as e:
+        error = _capture_error(e)
+    return error
 
 
 def _save_and_submit(idx: int, schedule: Schedule, ctx: _SearchContext, errors: list[VariantResult]) -> None:
-    """Save variant to disk, register in report, and submit for compilation."""
-    nki_path, error = _save_variant(idx, schedule, ctx)
+    """Save variant, verify correctness via CPU sim, and submit for compilation."""
+    nki_path, nki_source, error = _save_variant(idx, schedule, ctx)
     ctx.report.add_variant(nki_path, depth=0, variant_idx=idx)
+    if not error:
+        error = _cpu_verify(nki_source, ctx.workload.func_name, ctx.kernel_kwargs, ctx.expected)
     if error:
-        errors.append(
-            VariantResult(
-                nki_path=nki_path,
-                min_ms=0.0,
-                mean_ms=0.0,
-                p50_ms=0.0,
-                p99_ms=0.0,
-                mac_count=0,
-                mfu=0.0,
-                correct=False,
-                error=error,
-            )
-        )
+        errors.append(_failure_result(nki_path, error))
         ctx.report.update_variant(nki_path, status="error", error=error)
     elif ctx.pool is not None:
         ctx.report.update_variant(nki_path, status="compiled")
@@ -165,7 +190,7 @@ def _run_search(schedules: list[Schedule], ctx: _SearchContext) -> list[VariantR
         unique_schedules=len(schedules),
         qualifying_schedules=len(schedules) - len(lowering_errors),
         total_visited=len(schedules),
-        depth_distribution={"0": len(schedules)},
+        depth_distribution={0: len(schedules)},
     )
     return lowering_errors
 
@@ -190,7 +215,9 @@ def _finalize_benchmark(
     ctx: _SearchContext, func_name: str, mac_count: int, input_dtype_name: str
 ) -> list[VariantResult]:
     """Stream compilations into hardware benchmarks."""
-    cfg = _make_benchmark_cfg(func_name, ctx.kernel_kwargs, ctx.expected, _WARMUP, _ITERS, mac_count, input_dtype_name)
+    cfg = _make_benchmark_cfg(
+        func_name, ctx.kernel_kwargs, ctx.expected.shape, _WARMUP, _ITERS, mac_count, input_dtype_name
+    )
     succeeded, failed, variant_results = stream_compile_and_run(ctx.pool, cfg)
     ctx.report.set_compilation(succeeded=succeeded, failed=failed)
     _update_report_variants(ctx.report, variant_results)
