@@ -1,8 +1,9 @@
-"""NKI Gym search: exhaustive exploration of transform variants.
+"""NKI Gym search: combinatorial schedule exploration of kernel variants.
 
-Tiles a matmul workload and searches the space of atomic transforms
-(data reuse, operand merge) for all unique kernel variants. Each variant
-is written to the cache directory and verified for numerical correctness.
+Demonstrates the schedule search pipeline: define a user function
+with ``nkigym.<op>(...)`` calls, and the search automatically parses
+dimensions, enumerates schedules, renders NKI kernels, compiles, and
+benchmarks on hardware.
 """
 
 import argparse
@@ -13,20 +14,20 @@ import numpy as np
 
 import nkigym
 from nkigym.search import search
-from nkigym.transforms import DataReuseTransform, OperandMergeTransform
 
 
-def nkigym_matmul(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """NKI Gym matrix multiplication (NumPy simulation mode).
+def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Matrix multiply: stationary @ moving.
 
     Args:
-        lhs: Left-hand side tensor of shape [K, M].
-        rhs: Right-hand side tensor of shape [K, N].
+        a: Stationary tensor of shape [K, M].
+        b: Moving tensor of shape [K, N].
 
     Returns:
         Output tensor of shape [M, N].
     """
-    return nkigym.nc_matmul(lhs, rhs)
+    c = nkigym.nc_matmul(a, b)
+    return c
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,27 +43,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run transform search on a tiled matmul workload."""
+    """Run schedule search on a 2048x2048 matmul workload."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     args = parse_args()
     cache_dir = args.cache_dir
 
-    k, m, n = 2048, 2048, 2048
-    rng = np.random.default_rng()
-    lhs = rng.standard_normal((k, m))
-    rhs = rng.standard_normal((k, n))
+    rng = np.random.default_rng(42)
+    a = rng.standard_normal((2048, 2048)).astype(np.float32)
+    b = rng.standard_normal((2048, 2048)).astype(np.float32)
 
-    search(
-        func=nkigym_matmul,
-        transforms=[DataReuseTransform(), OperandMergeTransform()],
-        num_targets=100,
-        num_transforms_per_step=1,
-        seed=42,
-        min_depth=20,
-        save_cache=cache_dir,
-        kernel_kwargs={"lhs": lhs.astype(np.float16), "rhs": rhs.astype(np.float16)},
-    )
+    search(func=matmul, num_targets=99999, seed=42, save_cache=cache_dir, kernel_kwargs={"a": a, "b": b})
 
 
 if __name__ == "__main__":

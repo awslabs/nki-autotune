@@ -28,6 +28,7 @@ _TRN2_FLOPS_PER_CYCLE: dict[str, int] = {
     "float8_e5m2": 4 * 128 * 128,
     "float16": 2 * 128 * 128,
     "bfloat16": 2 * 128 * 128,
+    "float32": 2 * 128 * 128,
 }
 
 
@@ -77,10 +78,6 @@ class VariantResult(NamedTuple):
     mfu: float
     correct: bool
     error: str
-    arithmetic_intensity: float = 0.0
-    roofline_bound: str = ""
-    roofline_peak_tflops: float = 0.0
-    roofline_efficiency: float = 0.0
 
 
 @dataclass
@@ -106,7 +103,6 @@ class _BenchmarkConfig:
     iters: int
     mac_count: int
     input_dtype_name: str
-    roofline_map: dict[str, tuple[float, str, float]] = field(default_factory=dict)
 
 
 class _TracedKernel:
@@ -299,10 +295,13 @@ class CompilationPool:
 
 
 def _calculate_mfu(mac_count: int, time_ms: float, dtype_name: str) -> float:
-    """Calculate MFU for trn2 NeuronCore-v3 TensorEngine (2.4 GHz).
+    """Calculate MFU percentage for trn2 NeuronCore-v3 TensorEngine (2.4 GHz).
 
     FLOPS/cycle by dtype: FP8(E4/E5) 4*128*128, BF16/FP16 2*128*128.
     Falls back to BF16 for unrecognized dtypes.
+
+    Returns:
+        MFU as a percentage (e.g. 24.0 means 24% utilization).
     """
     if dtype_name not in _TRN2_FLOPS_PER_CYCLE:
         logger.warning("Unknown dtype %r for MFU; using BF16 peak", dtype_name)
@@ -310,7 +309,7 @@ def _calculate_mfu(mac_count: int, time_ms: float, dtype_name: str) -> float:
     flops = 2 * mac_count
     actual_pe_cycles = (time_ms / 1000) * _PE_FREQ_HZ
     theoretical_pe_cycles = flops / flops_per_cycle
-    return theoretical_pe_cycles / actual_pe_cycles
+    return 100.0 * theoretical_pe_cycles / actual_pe_cycles
 
 
 def _create_compiled_kernel(neff_path: str, nki_path: str, cfg: _BenchmarkConfig) -> CompiledKernel:
@@ -327,18 +326,6 @@ def _percentile(sorted_vals: list[float], pct: float) -> float:
     """Return the pct-th percentile from a pre-sorted list via nearest-rank."""
     idx = max(0, min(int(pct / 100 * len(sorted_vals)), len(sorted_vals) - 1))
     return sorted_vals[idx]
-
-
-def _enrich_roofline(cfg: _BenchmarkConfig, nki_path: str, min_ms: float) -> tuple[float, str, float, float]:
-    """Look up roofline data and compute efficiency from measured latency."""
-    entry = cfg.roofline_map.get(nki_path)
-    ai, bound, peak, eff = 0.0, "", 0.0, 0.0
-    if entry is not None:
-        ai, bound, peak = entry
-        if peak > 0 and min_ms > 0:
-            achieved = (cfg.mac_count * 2) / (min_ms / 1000) / 1e12
-            eff = achieved / peak
-    return ai, bound, peak, eff
 
 
 def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkConfig) -> VariantResult:
@@ -368,7 +355,6 @@ def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkC
     except Exception as e:
         error = _capture_error(e)
 
-    ai, r_bound, r_peak, r_eff = _enrich_roofline(cfg, cr.nki_path, min_ms)
     return VariantResult(
         nki_path=cr.nki_path,
         min_ms=min_ms,
@@ -379,10 +365,6 @@ def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkC
         mfu=mfu,
         correct=correct,
         error=error,
-        arithmetic_intensity=ai,
-        roofline_bound=r_bound,
-        roofline_peak_tflops=r_peak,
-        roofline_efficiency=r_eff,
     )
 
 
@@ -422,13 +404,12 @@ def _make_benchmark_cfg(
     iters: int,
     mac_count: int,
     input_dtype_name: str,
-    roofline_map: dict[str, tuple[float, str, float]],
 ) -> _BenchmarkConfig:
     """Build a _BenchmarkConfig from the common benchmark parameters."""
     return _BenchmarkConfig(
         func_name=func_name,
         kernel_kwargs=kernel_kwargs,
-        output_name="output",
+        output_name="hbm_tensor_0",
         output_shape=expected.shape,
         output_dtype=np.dtype(input_dtype_name),
         expected=expected,
@@ -436,7 +417,6 @@ def _make_benchmark_cfg(
         iters=iters,
         mac_count=mac_count,
         input_dtype_name=input_dtype_name,
-        roofline_map=roofline_map,
     )
 
 

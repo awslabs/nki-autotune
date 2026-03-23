@@ -1,77 +1,24 @@
-"""DMA copy NKI statement."""
+"""DMA transfer op definition for schedule-based rendering."""
 
-from dataclasses import dataclass
-from typing import Any
+from typing import ClassVar
 
-from nkigym.ir.tensor import TensorRef
-from nkigym.ops.base import NKIOp, _render_ref
+from nkigym.ops.base import NKIOp
 
 
-@dataclass(frozen=True)
 class NKIDmaCopy(NKIOp):
-    """DMA copy: ``nisa.dma_copy(dst=ref, src=ref)``.
+    """DMA copy: ``nisa.dma_copy(dst=..., src=...)``.
+
+    Transfers data between HBM and SBUF. Direction determined by
+    input/output tensor memory spaces.
 
     Attributes:
-        dst: Destination tensor reference.
-        src: Source tensor reference.
+        op_name: Registry key ``"dma_copy"``.
+        OPERAND_AXES: Single operand ``src`` with axes ``(P, F)``.
+        OUTPUT_AXES: Output axes ``(P, F)``.
+        TILE_LIMITS: Partition axis capped at 128.
     """
 
-    dst: TensorRef
-    src: TensorRef
-
-    def dst_name(self) -> str:
-        """Return the destination tensor name.
-
-        Returns:
-            Destination name string.
-        """
-        return self.dst.name
-
-    def tensor_names(self) -> tuple[str, ...]:
-        """Return all tensor names.
-
-        Returns:
-            Tuple of destination and source names.
-        """
-        return (self.dst.name, self.src.name)
-
-    def input_names(self) -> tuple[str, ...]:
-        """Return input tensor names.
-
-        Returns:
-            Tuple containing the source name.
-        """
-        return (self.src.name,)
-
-    def renamed(self, rename_map: dict[str, str]) -> "NKIDmaCopy":
-        """Return a copy with refs renamed, or self if unchanged.
-
-        Args:
-            rename_map: Mapping from old names to new names.
-
-        Returns:
-            Renamed NKIDmaCopy or self.
-        """
-        new_dst = self.dst.renamed(rename_map)
-        new_src = self.src.renamed(rename_map)
-        result: NKIDmaCopy = (
-            self if (new_dst is self.dst and new_src is self.src) else NKIDmaCopy(dst=new_dst, src=new_src)
-        )
-        return result
-
-    def simulate(self, env: dict[str, Any]) -> None:
-        """Copy slice data from src to dst without type casting.
-
-        Args:
-            env: Mutable variable environment.
-        """
-        src_data = env[self.src.name][self.src.to_slices()]
-        env[self.dst.name][self.dst.to_slices()] = src_data
-
-    def render(self) -> str:
-        """Render as NKI DMA copy statement.
-
-        Returns:
-            NKI source line.
-        """
-        return f"nisa.dma_copy(dst={_render_ref(self.dst)}, src={_render_ref(self.src)})"
+    op_name: ClassVar[str] = "dma_copy"
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("P", "F")}
+    OUTPUT_AXES: ClassVar[tuple[str, ...]] = ("P", "F")
+    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}

@@ -1,1 +1,0 @@
-"""Golden test data package."""

@@ -4,7 +4,6 @@ Unifies axis labels across ops, classifies dimensions as parallel
 or reduction, and computes tile counts and slice bounds.
 """
 
-from itertools import product
 from typing import NamedTuple
 
 from nkigym.ops.base import NKIOp
@@ -200,7 +199,7 @@ def _unify_one_op(
     for axis, limit in tile_limits.items():
         if axis in axis_to_dim:
             dim_id = _canonical(axis_to_dim[axis], rename_map)
-            dim_to_tile_size[dim_id] = limit
+            dim_to_tile_size[dim_id] = max(dim_to_tile_size.get(dim_id, 0), limit)
     _register_output(op_call, output_axes, axis_to_dim, var_dims, var_shapes, dim_info, rename_map)
 
 
@@ -324,7 +323,7 @@ def _classify_dims(
     reduction_tile_counts: dict[str, int] = {}
     dim_tile_sizes: dict[str, int] = {}
     for dim_id, info in all_dims.items():
-        preferred = dim_to_tile_size.get(dim_id, _TILE)
+        preferred = min(dim_to_tile_size.get(dim_id, _TILE), info.size)
         tile_size = preferred if info.size % preferred == 0 else _TILE
         if info.size % tile_size != 0:
             raise ValueError(f"Dimension {dim_id} size {info.size} not divisible by {tile_size}")
@@ -347,57 +346,21 @@ def _classify_dims(
     )
 
 
-def compute_slices(var_name: str, position: dict[str, int], analysis: _Analysis) -> tuple[tuple[int, int], ...]:
-    """Compute slice bounds for a variable at a given tile position.
+def has_reduction(op_call: _OpCall) -> bool:
+    """Check if an op has any reduction dimensions.
+
+    An op has reduction if any operand axis label is not in OUTPUT_AXES.
 
     Args:
-        var_name: Variable name.
-        position: Combined parallel + reduction position dict.
-        analysis: Dimension analysis result.
+        op_call: Parsed op call to check.
 
     Returns:
-        Tuple of (start, stop) pairs, one per axis.
+        True if the op has at least one reduction dimension.
     """
-    dims = analysis.var_dims[var_name]
-    shape = analysis.var_shapes[var_name]
-    slices: list[tuple[int, int]] = []
-    for dim_id, size in zip(dims, shape):
-        if dim_id is not None and dim_id in position:
-            tile_size = analysis.dim_tile_sizes[dim_id]
-            offset = position[dim_id] * tile_size
-            slices.append((offset, offset + tile_size))
-        else:
-            slices.append((0, size))
-    return tuple(slices)
-
-
-def iter_tile_positions(analysis: _Analysis) -> list[tuple[int, dict[str, int]]]:
-    """Generate all parallel tile positions.
-
-    Args:
-        analysis: Dimension analysis result.
-
-    Returns:
-        List of (index, position_dict) tuples.
-    """
-    result: list[tuple[int, dict[str, int]]] = [(0, {})]
-    if analysis.parallel_dims:
-        ranges = [range(analysis.tile_counts[d]) for d in analysis.parallel_dims]
-        result = [(idx, dict(zip(analysis.parallel_dims, pos))) for idx, pos in enumerate(product(*ranges))]
-    return result
-
-
-def iter_reduction_positions(analysis: _Analysis) -> list[dict[str, int]]:
-    """Generate all reduction tile positions.
-
-    Args:
-        analysis: Dimension analysis result.
-
-    Returns:
-        List of position dicts.
-    """
-    result: list[dict[str, int]] = [{}]
-    if analysis.reduction_dims:
-        ranges = [range(analysis.reduction_tile_counts[d]) for d in analysis.reduction_dims]
-        result = [dict(zip(analysis.reduction_dims, pos)) for pos in product(*ranges)]
-    return result
+    operand_axes: dict[str, tuple[str, ...]] = getattr(op_call.stmt_type, "OPERAND_AXES", {})
+    output_axes: tuple[str, ...] = getattr(op_call.stmt_type, "OUTPUT_AXES", ())
+    output_set = set(output_axes)
+    all_input_axes: set[str] = set()
+    for axes in operand_axes.values():
+        all_input_axes.update(axes)
+    return bool(all_input_axes - output_set)

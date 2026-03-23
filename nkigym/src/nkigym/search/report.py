@@ -4,20 +4,13 @@ Manages a live-overwritten JSON file that tracks search exploration,
 compilation status, and per-variant benchmark results.
 """
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
 
 _EMPTY_REPORT: dict[str, Any] = {
-    "search": {
-        "root_stmts": 0,
-        "root_opportunities": 0,
-        "unique_programs": 0,
-        "qualifying_programs": 0,
-        "min_depth": 0,
-        "total_programs_visited": 0,
-        "depth_distribution": {},
-    },
+    "search": {"unique_schedules": 0, "qualifying_schedules": 0, "total_visited": 0, "depth_distribution": {}},
     "compilation": {"succeeded": 0, "failed": 0},
     "variants": [],
 }
@@ -37,38 +30,25 @@ class SearchReport:
             path: File path for the JSON report.
         """
         self.path = path
-        self._data: dict[str, Any] = json.loads(json.dumps(_EMPTY_REPORT))
+        self._data: dict[str, Any] = copy.deepcopy(_EMPTY_REPORT)
         self._variant_index: dict[str, int] = {}
         self._write()
 
     def update_search(
-        self,
-        root_stmts: int,
-        root_opportunities: int,
-        unique_programs: int,
-        qualifying_programs: int,
-        min_depth: int,
-        total_programs_visited: int,
-        depth_distribution: dict[int, int],
+        self, unique_schedules: int, qualifying_schedules: int, total_visited: int, depth_distribution: dict[int, int]
     ) -> None:
         """Update the search section of the report.
 
         Args:
-            root_stmts: Number of statements in the root program.
-            root_opportunities: Number of transform opportunities at root.
-            unique_programs: Total unique programs discovered.
-            qualifying_programs: Number of qualifying variants saved.
-            min_depth: Minimum depth threshold.
-            total_programs_visited: Total programs visited (root + expansions).
+            unique_schedules: Total unique schedules discovered.
+            qualifying_schedules: Number of qualifying variants saved.
+            total_visited: Total schedules visited (root + expansions).
             depth_distribution: Map from depth to node count.
         """
         self._data["search"] = {
-            "root_stmts": root_stmts,
-            "root_opportunities": root_opportunities,
-            "unique_programs": unique_programs,
-            "qualifying_programs": qualifying_programs,
-            "min_depth": min_depth,
-            "total_programs_visited": total_programs_visited,
+            "unique_schedules": unique_schedules,
+            "qualifying_schedules": qualifying_schedules,
+            "total_visited": total_visited,
             "depth_distribution": {str(k): v for k, v in sorted(depth_distribution.items())},
         }
         self._write()
@@ -94,10 +74,6 @@ class SearchReport:
             "mfu": None,
             "correct": None,
             "error": None,
-            "arithmetic_intensity": None,
-            "roofline_bound": None,
-            "roofline_peak_tflops": None,
-            "roofline_efficiency": None,
         }
         self._variant_index[nki_path] = len(self._data["variants"])
         self._data["variants"].append(entry)

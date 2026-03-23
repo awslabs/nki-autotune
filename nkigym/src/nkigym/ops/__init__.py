@@ -1,13 +1,23 @@
-"""NKI operator definitions.
-
-Importing each op module triggers NKIOp auto-registration.
-"""
+"""NKI operator definitions --- importing triggers auto-registration."""
 
 from nkigym.ops.activation import NKIActivation
-from nkigym.ops.alloc import NKIAlloc
+from nkigym.ops.add import NKIAdd
 from nkigym.ops.base import NKIOp
 from nkigym.ops.dma_copy import NKIDmaCopy
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.multiply import NKIMultiply
 from nkigym.ops.tensor_copy import NKITensorCopy
+from nkigym.ops.tensor_reduce import NKITensorReduce
+from nkigym.ops.tensor_scalar import NKITensorScalar
 
-__all__ = ["NKIOp", "NKIMatmul", "NKIActivation", "NKIAlloc", "NKIDmaCopy", "NKITensorCopy"]
+__all__ = [
+    "NKIOp",
+    "NKIMatmul",
+    "NKIActivation",
+    "NKIAdd",
+    "NKIDmaCopy",
+    "NKIMultiply",
+    "NKITensorCopy",
+    "NKITensorReduce",
+    "NKITensorScalar",
+]
