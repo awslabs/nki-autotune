@@ -5,32 +5,57 @@ from collections.abc import Callable
 import numpy as np
 
 
-def lhsT_rhs_gemm_golden(lhsT: np.ndarray, rhs: np.ndarray, config: dict) -> np.ndarray:
+def lhsT_rhs_gemm_golden(**kwargs: np.ndarray) -> np.ndarray:
     """Golden reference for GEMM with transposed LHS.
 
+    Accepts keyword arguments matching either rendered kernel (a, b)
+    or MetaGEMM kernel (lhs, rhs, config) calling conventions.
+
     Args:
-        lhsT: Transposed left-hand side matrix.
-        rhs: Right-hand side matrix.
-        config: GEMM config dict (unused, accepted for API compatibility).
+        **kwargs: Tensor inputs keyed by parameter name.
 
     Returns:
         Expected matmul result as float32.
     """
-    return lhsT_rhs_gemm_np(lhsT, rhs).astype(np.float32)
+    lhs, rhs = _extract_gemm_inputs(kwargs)
+    return lhsT_rhs_gemm_np(lhs, rhs).astype(np.float32)
 
 
-def lhs_rhs_gemm_golden(lhs: np.ndarray, rhs: np.ndarray, config: dict) -> np.ndarray:
+def lhs_rhs_gemm_golden(**kwargs: np.ndarray) -> np.ndarray:
     """Golden reference for standard GEMM.
 
+    Accepts keyword arguments matching either rendered kernel (a, b)
+    or MetaGEMM kernel (lhs, rhs, config) calling conventions.
+
     Args:
-        lhs: Left-hand side matrix.
-        rhs: Right-hand side matrix.
-        config: GEMM config dict (unused, accepted for API compatibility).
+        **kwargs: Tensor inputs keyed by parameter name.
 
     Returns:
         Expected matmul result as float32.
     """
+    lhs, rhs = _extract_gemm_inputs(kwargs)
     return lhs_rhs_gemm_np(lhs, rhs).astype(np.float32)
+
+
+def _extract_gemm_inputs(kwargs: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Extract LHS and RHS arrays from keyword arguments.
+
+    Supports both (a, b) and (lhs, rhs) naming conventions.
+
+    Args:
+        kwargs: Keyword arguments containing the two matrix inputs.
+
+    Returns:
+        Tuple of (lhs, rhs) numpy arrays.
+
+    Raises:
+        KeyError: If neither naming convention is found.
+    """
+    name_map = {"a": ("a", "b"), "lhs": ("lhs", "rhs")}
+    for key, (lhs_key, rhs_key) in name_map.items():
+        if key in kwargs:
+            return kwargs[lhs_key], kwargs[rhs_key]
+    raise KeyError(f"Expected (a, b) or (lhs, rhs) keys, got: {list(kwargs.keys())}")
 
 
 def gemm_correctness_check(transposed_lhs: bool) -> tuple[Callable, float, float]:

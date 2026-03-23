@@ -8,6 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from tqdm import tqdm
 
+from autotune.analysis.export import export_results
 from autotune.analysis.results import BenchmarkResults
 from autotune.job import ProfileJobs, compile_jobs
 from autotune.runner.parallel import set_neuron_core, split_jobs_into_groups
@@ -46,6 +47,7 @@ class Benchmark:
         self.jobs.dump_json()
         self._run_on_neuron_cores()
         self.jobs.dump_json()
+        export_results(self.jobs)
         return BenchmarkResults.load(self.jobs.cache_root_dir)
 
     def _compile_all_kernels(self) -> None:

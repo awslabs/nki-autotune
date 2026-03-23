@@ -1,15 +1,14 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# SPDX-License-Identifier: Apache-2.0
+"""Compile and run NKI kernels on Neuron hardware."""
 
 import importlib
 import importlib.util
 import inspect
 import os
 import sys
-import tempfile
 import types
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from neuronxcc.nki_standalone import NKI_IR_VERSION, compile_nki_ir_kernel_to_neff
@@ -35,6 +34,23 @@ class TensorStub:
     name: str
 
 
+def _unwrap_kernel(kernel: Any) -> Any:
+    """Unwrap @nki.jit or similar decorators to get the raw function.
+
+    Args:
+        kernel: Possibly wrapped kernel function.
+
+    Returns:
+        The underlying function object.
+    """
+    func = kernel
+    if hasattr(func, "func"):
+        func = func.func
+    elif hasattr(func, "__wrapped__"):
+        func = func.__wrapped__
+    return func
+
+
 def resolve_kernel_ref(kernel: Callable) -> KERNEL_DTYPE:
     """Convert a kernel function to a picklable (filepath, name) tuple.
 
@@ -50,11 +66,7 @@ def resolve_kernel_ref(kernel: Callable) -> KERNEL_DTYPE:
     Raises:
         TypeError: If the source file cannot be determined.
     """
-    func = kernel
-    if hasattr(func, "func"):
-        func = func.func
-    elif hasattr(func, "__wrapped__"):
-        func = func.__wrapped__
+    func = _unwrap_kernel(kernel)
 
     try:
         source_file = os.path.abspath(inspect.getfile(func))
@@ -76,9 +88,14 @@ def get_kernel_by_name(kernel_name: KERNEL_DTYPE) -> types.FunctionType:
 
     Returns:
         The kernel function loaded from the specified module.
+
+    Raises:
+        ImportError: If the module cannot be loaded from the path.
     """
     module_path, func_name = kernel_name
     spec = importlib.util.spec_from_file_location(func_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {module_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[func_name] = module
     spec.loader.exec_module(module)
@@ -107,9 +124,6 @@ def compile_kernel(
     Returns:
         Path to the generated NEFF file.
     """
-    tempfile.tempdir = "/tmp/nki_artifacts"
-    os.makedirs(tempfile.tempdir, exist_ok=True)
-
     kernel = get_kernel_by_name(kernel_name)
 
     kernel_inputs_dict = {**input_tensors, **kernel_kwargs}
@@ -145,7 +159,7 @@ class MinimalTracedKernel:
     HLOModule with input/output tensor information.
     """
 
-    def __init__(self, func: Callable, input_tensors: INPUT_TENSORS_DTYPE, output_tensors: list[TensorStub]):
+    def __init__(self, func: Callable, input_tensors: INPUT_TENSORS_DTYPE, output_tensors: list[TensorStub]) -> None:
         """Initialize the minimal traced kernel.
 
         Args:
@@ -186,11 +200,8 @@ def create_spike_kernel(
         A CompiledKernel ready for execution on Neuron hardware.
     """
     kernel = get_kernel_by_name(kernel_name)
-    if isinstance(kernel, types.FunctionType):
-        func = kernel
-    elif hasattr(kernel, "func"):
-        func = kernel.func
-    else:
+    func = _unwrap_kernel(kernel)
+    if not callable(func):
         raise TypeError(f"Unsupported kernel type: {type(kernel)}")
     traced_kernel = MinimalTracedKernel(func, input_tensors, output_tensors)
     spike_kernel = CompiledKernel(traced_kernel, neff_path)
@@ -198,7 +209,11 @@ def create_spike_kernel(
 
 
 def run_spike_kernel(
-    spike, spike_kernel, input_tensors, neff: str, kernel_kwargs: KERNEL_KWARGS_DTYPE
+    spike: Any,
+    spike_kernel: CompiledKernel,
+    input_tensors: INPUT_TENSORS_DTYPE,
+    neff: str,
+    kernel_kwargs: KERNEL_KWARGS_DTYPE,
 ) -> tuple[str, tuple[np.ndarray, ...]]:
     """Run a compiled kernel and collect profiling data.
 
@@ -212,7 +227,7 @@ def run_spike_kernel(
     Returns:
         Tuple of (ntff_file_path, kernel_outputs).
     """
-    directory, neff_name, file_type = split_file_info(neff)
+    directory, _neff_name, file_type = split_file_info(neff)
     if file_type != "neff":
         raise ValueError(f"{neff} is not a neff file.")
     kernel_outputs = spike.run(

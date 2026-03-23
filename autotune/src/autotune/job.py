@@ -351,6 +351,20 @@ def timeout_handler(signum: int, frame: Any) -> None:
     raise TimeoutError("Compilation timed out after 10 minutes")
 
 
+def _save_kernel_source(job: ProfileJob) -> None:
+    """Copy the kernel source file into the job cache dir.
+
+    Args:
+        job: A compiled ProfileJob with cache_dir and kernel ref.
+    """
+    cache_dir: str = getattr(job, "cache_dir")
+    kernel_ref: tuple[str, str] = getattr(job, "kernel")
+    module_path = kernel_ref[0]
+
+    if os.path.isfile(module_path):
+        shutil.copy2(module_path, os.path.join(cache_dir, "kernel.py"))
+
+
 def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
     """Compile all kernel jobs with timeout protection and error handling.
 
@@ -389,5 +403,6 @@ def compile_jobs(jobs: ProfileJobs) -> ProfileJobs:
                     src_path = os.path.join(tmp_dir, item_name)
                     dst_path = os.path.join(job.cache_dir, item_name)
                     shutil.move(src_path, dst_path)
+                _save_kernel_source(job)
             shutil.rmtree(tmp_dir)
     return jobs
