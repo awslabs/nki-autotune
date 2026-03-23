@@ -50,8 +50,8 @@ def main() -> None:
     cache_dir = args.cache_dir
 
     rng = np.random.default_rng(42)
-    a = rng.standard_normal((2048, 2048)).astype(np.float32)
-    b = rng.standard_normal((2048, 2048)).astype(np.float32)
+    a = rng.standard_normal((2048, 2048)).astype(np.float16)
+    b = rng.standard_normal((2048, 2048)).astype(np.float16)
 
     search(func=matmul, num_targets=99999, seed=42, save_cache=cache_dir, kernel_kwargs={"a": a, "b": b})
 

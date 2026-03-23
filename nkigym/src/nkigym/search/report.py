@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 _EMPTY_REPORT: dict[str, Any] = {
-    "search": {"unique_schedules": 0, "qualifying_schedules": 0, "total_visited": 0, "depth_distribution": {}},
+    "search": {"unique_schedules": 0, "qualifying_schedules": 0, "total_visited": 0},
     "compilation": {"succeeded": 0, "failed": 0},
     "variants": [],
 }
@@ -34,22 +34,18 @@ class SearchReport:
         self._variant_index: dict[str, int] = {}
         self._write()
 
-    def update_search(
-        self, unique_schedules: int, qualifying_schedules: int, total_visited: int, depth_distribution: dict[int, int]
-    ) -> None:
+    def update_search(self, unique_schedules: int, qualifying_schedules: int, total_visited: int) -> None:
         """Update the search section of the report.
 
         Args:
             unique_schedules: Total unique schedules discovered.
             qualifying_schedules: Number of qualifying variants saved.
             total_visited: Total schedules visited (root + expansions).
-            depth_distribution: Map from depth to node count.
         """
         self._data["search"] = {
             "unique_schedules": unique_schedules,
             "qualifying_schedules": qualifying_schedules,
             "total_visited": total_visited,
-            "depth_distribution": {str(k): v for k, v in sorted(depth_distribution.items())},
         }
         self._write()
 

@@ -144,7 +144,9 @@ def enumerate_blocking(analysis: _Analysis) -> list[tuple[DimSchedule, ...]]:
     return [tuple(combo) for combo in itertools.product(*per_dim_options)]
 
 
-def enumerate_all(analysis: _Analysis, op_calls: list[_OpCall], params: tuple[str, ...]) -> list[Schedule]:
+def enumerate_all(
+    analysis: _Analysis, op_calls: list[_OpCall], params: tuple[str, ...], input_dtype_bytes: int
+) -> list[Schedule]:
     """Generate all valid schedules via cross-product enumeration.
 
     Enumerates loop orders x op placements x blocking, validates
@@ -154,6 +156,7 @@ def enumerate_all(analysis: _Analysis, op_calls: list[_OpCall], params: tuple[st
         analysis: Dimension analysis result.
         op_calls: Parsed operation calls.
         params: Input parameter names.
+        input_dtype_bytes: Size of one input element in bytes.
 
     Returns:
         List of unique valid Schedule descriptors.
@@ -165,7 +168,7 @@ def enumerate_all(analysis: _Analysis, op_calls: list[_OpCall], params: tuple[st
     results: list[Schedule] = []
     for lo, pl, bl in itertools.product(orders, placements, blockings):
         sched = Schedule(loop_order=lo, dim_schedules=bl, op_placements=pl)
-        if sched not in seen and validate(analysis, sched, params):
+        if sched not in seen and validate(analysis, sched, params, input_dtype_bytes):
             seen.add(sched)
             results.append(sched)
     return results

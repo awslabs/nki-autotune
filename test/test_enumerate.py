@@ -64,12 +64,12 @@ def test_add_default_schedule() -> None:
 
 def test_enumerate_all_produces_valid_schedules() -> None:
     """All enumerated matmul schedules pass validation (no duplicates)."""
-    schedules = enumerate_all(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"))
+    schedules = enumerate_all(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"), 2)
     assert len(schedules) == len(set(schedules))
     assert len(schedules) > 0
 
 
 def test_enumerate_all_default_included() -> None:
     """Default schedule is always in the enumerated set."""
-    schedules = enumerate_all(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"))
+    schedules = enumerate_all(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"), 2)
     assert MATMUL_256_DEFAULT in schedules

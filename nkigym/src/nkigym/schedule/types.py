@@ -12,7 +12,7 @@ from typing import NamedTuple
 from nkigym.codegen.analysis import _Analysis
 
 _SBUF_PARTITION_LIMIT = 128
-_MAX_BUFFER_ELEMENTS = 1048576
+_SBUF_CAPACITY_BYTES = 24 * 1024 * 1024
 
 
 class DimSchedule(NamedTuple):
@@ -296,34 +296,37 @@ def _acc_buffer_elements(analysis: _Analysis, schedule: Schedule) -> int:
     return total
 
 
-def _valid_buffer_capacity(analysis: _Analysis, schedule: Schedule, params: tuple[str, ...]) -> bool:
-    """Check that no single on-chip buffer exceeds capacity.
+def _valid_buffer_capacity(
+    analysis: _Analysis, schedule: Schedule, params: tuple[str, ...], input_dtype_bytes: int
+) -> bool:
+    """Check that total SBUF usage fits hardware capacity.
 
-    Rejects schedules where any SBUF load or the PSUM accumulator
-    exceeds ``_MAX_BUFFER_ELEMENTS`` (1M elements = 4MB at float32).
+    Sums load buffer bytes across all params plus staging buffer
+    bytes (if reduction exists) and checks against 24 MB SBUF.
 
     Args:
         analysis: Dimension analysis result.
         schedule: Schedule descriptor.
         params: Input parameter names.
+        input_dtype_bytes: Size of one input element in bytes.
 
     Returns:
-        True if all buffers are within capacity limits.
+        True if total SBUF usage is within hardware capacity.
     """
-    loads_ok = all(
-        _load_buffer_elements(i, schedule, analysis, params) <= _MAX_BUFFER_ELEMENTS for i in range(len(params))
-    )
-    acc_ok = _acc_buffer_elements(analysis, schedule) <= _MAX_BUFFER_ELEMENTS
-    return loads_ok and acc_ok
+    total_elements = sum(_load_buffer_elements(i, schedule, analysis, params) for i in range(len(params)))
+    if analysis.reduction_dims:
+        total_elements += _acc_buffer_elements(analysis, schedule)
+    return total_elements * input_dtype_bytes <= _SBUF_CAPACITY_BYTES
 
 
-def validate(analysis: _Analysis, schedule: Schedule, params: tuple[str, ...]) -> bool:
+def validate(analysis: _Analysis, schedule: Schedule, params: tuple[str, ...], input_dtype_bytes: int) -> bool:
     """Check whether a schedule is valid for the given analysis.
 
     Args:
         analysis: Dimension analysis result.
         schedule: Schedule to validate.
         params: Input parameter names.
+        input_dtype_bytes: Size of one input element in bytes.
 
     Returns:
         True if the schedule passes all validation checks.
@@ -333,5 +336,5 @@ def validate(analysis: _Analysis, schedule: Schedule, params: tuple[str, ...]) -
         and _valid_blocking(analysis, schedule)
         and _valid_sbuf_sizes(analysis, params)
         and _valid_acc_partition(analysis)
-        and _valid_buffer_capacity(analysis, schedule, params)
+        and _valid_buffer_capacity(analysis, schedule, params, input_dtype_bytes)
     )

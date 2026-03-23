@@ -190,7 +190,6 @@ def _run_search(schedules: list[Schedule], ctx: _SearchContext) -> list[VariantR
         unique_schedules=len(schedules),
         qualifying_schedules=len(schedules) - len(lowering_errors),
         total_visited=len(schedules),
-        depth_distribution={0: len(schedules)},
     )
     return lowering_errors
 
@@ -271,7 +270,8 @@ def search(
     mac_count = _compute_mac_count(workload.analysis)
     input_dtype_name = next(iter(kernel_kwargs.values())).dtype.name
 
-    all_schedules = enumerate_all(workload.analysis, workload.op_calls, workload.params)
+    input_dtype_bytes = np.dtype(input_dtype_name).itemsize
+    all_schedules = enumerate_all(workload.analysis, workload.op_calls, workload.params, input_dtype_bytes)
     selected = _select_schedules(all_schedules, num_targets, seed)
     logger.info("Enumerated %d valid schedules, selected %d", len(all_schedules), len(selected))
 
