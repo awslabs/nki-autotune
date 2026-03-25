@@ -37,8 +37,10 @@ MULTIPLY = _Op("multiply")
 SUBTRACT = _Op("subtract")
 MAXIMUM = _Op("maximum")
 MAX = _Op("max")
+SQUARE = _Op("square")
+RSQRT = _Op("rsqrt")
 
-_UNARY_FNS: dict[_Op, Any] = {TANH: np.tanh, EXP: np.exp}
+_UNARY_FNS: dict[_Op, Any] = {TANH: np.tanh, EXP: np.exp, SQUARE: np.square, RSQRT: lambda x: 1.0 / np.sqrt(x)}
 
 _BINARY_FNS: dict[_Op, Any] = {ADD: np.add, MULTIPLY: np.multiply, SUBTRACT: np.subtract, MAXIMUM: np.maximum}
 
@@ -87,12 +89,23 @@ def _tensor_copy(dst: np.ndarray, src: np.ndarray) -> None:
     dst[:] = src.reshape(dst.shape)
 
 
-def _activation(dst: np.ndarray, data: np.ndarray, op: _Op) -> None:
-    """Apply element-wise unary activation function."""
+def _activation(dst: np.ndarray, data: np.ndarray, op: _Op, **kwargs: Any) -> None:
+    """Apply element-wise unary activation, optionally with reduction.
+
+    When ``reduce_op`` and ``reduce_res`` are given, also reduces the
+    activated data across the free axis and accumulates into reduce_res.
+    """
     fn = _UNARY_FNS.get(op)
     if fn is None:
         raise ValueError(f"Unknown activation: {op}")
-    dst[:] = fn(data).reshape(dst.shape)
+    activated = fn(data)
+    dst[:] = activated.reshape(dst.shape)
+    reduce_res = kwargs.get("reduce_res")
+    if reduce_res is not None:
+        reduce_op = kwargs["reduce_op"]
+        d2d = _flatten_2d(activated)
+        reduced = reduce_op.reduce(d2d, axis=1)
+        reduce_res[:] += reduced.reshape(reduce_res.shape)
 
 
 def _tensor_tensor(dst: np.ndarray, data1: np.ndarray, data2: np.ndarray, op: _Op) -> None:
@@ -103,19 +116,27 @@ def _tensor_tensor(dst: np.ndarray, data1: np.ndarray, data2: np.ndarray, op: _O
     dst[:] = fn(data1, data2).reshape(dst.shape)
 
 
-def _tensor_scalar(dst: np.ndarray, data: np.ndarray, operand0: np.ndarray, op0: _Op) -> None:
-    """Apply element-wise op between tile and broadcast column vector.
+def _tensor_scalar(dst: np.ndarray, data: np.ndarray, operand0: Any, op0: _Op, **kwargs: Any) -> None:
+    """Apply element-wise op between tile and scalar/column vector.
 
-    operand0 is lower-dimensional than data; trailing dimensions
-    are padded with size-1 axes so numpy broadcasts correctly
-    along the partition (first) dimension.
+    operand0 may be a lower-dimensional array (broadcast via padding)
+    or a scalar literal.  Supports compound ``op1``/``operand1``.
     """
-    pad = data.ndim - operand0.ndim
-    expanded = operand0.reshape(operand0.shape + (1,) * pad)
+    expanded = operand0
+    if isinstance(operand0, np.ndarray) and data.ndim > operand0.ndim:
+        pad = data.ndim - operand0.ndim
+        expanded = operand0.reshape(operand0.shape + (1,) * pad)
     fn = _BINARY_FNS.get(op0)
     if fn is None:
         raise ValueError(f"Unknown scalar op: {op0}")
-    dst[:] = fn(data, expanded).reshape(dst.shape)
+    result = fn(data, expanded)
+    op1 = kwargs.get("op1")
+    if op1 is not None:
+        fn1 = _BINARY_FNS.get(op1)
+        if fn1 is None:
+            raise ValueError(f"Unknown scalar op1: {op1}")
+        result = fn1(result, kwargs["operand1"])
+    dst[:] = result.reshape(dst.shape)
 
 
 def _tensor_reduce(dst: np.ndarray, data: np.ndarray, op: _Op) -> None:
@@ -130,6 +151,23 @@ def _tensor_reduce(dst: np.ndarray, data: np.ndarray, op: _Op) -> None:
     d2d = _flatten_2d(data)
     reduced = getattr(d2d, method)(axis=1)
     dst[:] = reduced.reshape(dst.shape)
+
+
+def _nc_transpose(dst: np.ndarray, data: np.ndarray) -> None:
+    """PE array transpose: swap partition and free dims.
+
+    Flattens to 2D, transposes, and reshapes back to original
+    multi-dim shape.  Correct for square tiles; approximate for
+    non-square (sufficient for rmsnorm_matmul where tiles are 128x128).
+    """
+    d2d = _flatten_2d(data)
+    transposed = d2d.T.copy()
+    dst[:] = transposed.reshape(dst.shape)
+
+
+def _nl_copy(src: np.ndarray, **kwargs: Any) -> np.ndarray:
+    """Copy data between memory spaces (mock nl.copy)."""
+    return src.copy()
 
 
 def _build_nl() -> SimpleNamespace:
@@ -149,6 +187,9 @@ def _build_nl() -> SimpleNamespace:
         subtract=SUBTRACT,
         maximum=MAXIMUM,
         max=MAX,
+        square=SQUARE,
+        rsqrt=RSQRT,
+        copy=_nl_copy,
     )
 
 
@@ -157,6 +198,7 @@ def _build_nisa() -> SimpleNamespace:
     return SimpleNamespace(
         dma_copy=_dma_copy,
         nc_matmul=_nc_matmul,
+        nc_transpose=_nc_transpose,
         tensor_copy=_tensor_copy,
         activation=_activation,
         tensor_tensor=_tensor_tensor,
@@ -170,7 +212,7 @@ def _build_globals() -> dict[str, Any]:
     nl_ns = _build_nl()
     nisa_ns = _build_nisa()
     nki_ns = SimpleNamespace(jit=_nki_jit, language=nl_ns, isa=nisa_ns)
-    return {"nki": nki_ns, "nl": nl_ns, "nisa": nisa_ns, "__builtins__": __builtins__}
+    return {"nki": nki_ns, "nl": nl_ns, "nisa": nisa_ns, "np": np, "__builtins__": __builtins__}
 
 
 def _is_nki_import(line: str) -> bool:

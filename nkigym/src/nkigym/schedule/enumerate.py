@@ -13,16 +13,17 @@ from nkigym.codegen.analysis import _Analysis, _OpCall
 from nkigym.schedule.types import DimSchedule, Schedule, _total_tiles, _var_dim_ids, validate
 
 
-def _build_items(analysis: _Analysis, op_calls: list[_OpCall]) -> list[tuple[str, int]]:
+def _build_items(analysis: _Analysis, op_calls: list[_OpCall], passes_per_dim: dict[str, int]) -> list[tuple[str, int]]:
     """Build the set of loop items from analysis.
 
     Each parallel dim produces one item ``(dim_id, 0)``.
-    Each reduction dim produces one item per pass ``(dim_id, pass_idx)``.
-    Currently supports single-pass reduction (one pass per reduction dim).
+    Each reduction dim produces items ``(dim_id, 0), ..., (dim_id, n-1)``
+    where *n* comes from ``passes_per_dim`` (defaults to 1).
 
     Args:
         analysis: Dimension analysis result.
         op_calls: Parsed operation calls.
+        passes_per_dim: Reduction dim ID to number of passes.
 
     Returns:
         List of ``(dim_id, pass_index)`` items.
@@ -31,7 +32,9 @@ def _build_items(analysis: _Analysis, op_calls: list[_OpCall]) -> list[tuple[str
     for d in analysis.parallel_dims:
         items.append((d, 0))
     for d in analysis.reduction_dims:
-        items.append((d, 0))
+        n_passes = passes_per_dim.get(d, 1)
+        for p in range(n_passes):
+            items.append((d, p))
     return items
 
 
@@ -53,7 +56,9 @@ def _valid_pass_order(perm: tuple[tuple[str, int], ...]) -> bool:
     return ok
 
 
-def enumerate_loop_orders(analysis: _Analysis, op_calls: list[_OpCall]) -> list[tuple[tuple[str, int], ...]]:
+def enumerate_loop_orders(
+    analysis: _Analysis, op_calls: list[_OpCall], passes_per_dim: dict[str, int]
+) -> list[tuple[tuple[str, int], ...]]:
     """Generate all valid loop orderings.
 
     Valid orderings are permutations of items where same-dim passes
@@ -62,11 +67,12 @@ def enumerate_loop_orders(analysis: _Analysis, op_calls: list[_OpCall]) -> list[
     Args:
         analysis: Dimension analysis result.
         op_calls: Parsed operation calls.
+        passes_per_dim: Reduction dim ID to number of passes.
 
     Returns:
         List of valid loop_order tuples.
     """
-    items = _build_items(analysis, op_calls)
+    items = _build_items(analysis, op_calls, passes_per_dim)
     return [p for p in itertools.permutations(items) if _valid_pass_order(p)]
 
 
@@ -145,7 +151,7 @@ def enumerate_blocking(analysis: _Analysis) -> list[tuple[DimSchedule, ...]]:
 
 
 def enumerate_all(
-    analysis: _Analysis, op_calls: list[_OpCall], params: tuple[str, ...], input_dtype_bytes: int
+    analysis: _Analysis, op_calls: list[_OpCall], params: tuple[str, ...], passes_per_dim: dict[str, int]
 ) -> list[Schedule]:
     """Generate all valid schedules via cross-product enumeration.
 
@@ -156,41 +162,46 @@ def enumerate_all(
         analysis: Dimension analysis result.
         op_calls: Parsed operation calls.
         params: Input parameter names.
-        input_dtype_bytes: Size of one input element in bytes.
+        passes_per_dim: Reduction dim ID to number of passes.
 
     Returns:
         List of unique valid Schedule descriptors.
     """
-    orders = enumerate_loop_orders(analysis, op_calls)
+    orders = enumerate_loop_orders(analysis, op_calls, passes_per_dim)
     placements = enumerate_op_placements(analysis, params)
     blockings = enumerate_blocking(analysis)
     seen: set[Schedule] = set()
     results: list[Schedule] = []
     for lo, pl, bl in itertools.product(orders, placements, blockings):
         sched = Schedule(loop_order=lo, dim_schedules=bl, op_placements=pl)
-        if sched not in seen and validate(analysis, sched, params, input_dtype_bytes):
+        if sched not in seen and validate(analysis, sched, params):
             seen.add(sched)
             results.append(sched)
     return results
 
 
-def default_schedule(analysis: _Analysis, op_calls: list[_OpCall], params: tuple[str, ...]) -> Schedule:
+def default_schedule(
+    analysis: _Analysis, op_calls: list[_OpCall], params: tuple[str, ...], passes_per_dim: dict[str, int]
+) -> Schedule:
     """Generate the naive default schedule.
 
-    Parallel dims outermost, reduction dims innermost.
+    Parallel dims outermost, reduction passes innermost.
     ``tiles_per_block=1`` everywhere.  All loads at natural level.
 
     Args:
         analysis: Dimension analysis result.
         op_calls: Parsed operation calls.
         params: Input parameter names.
+        passes_per_dim: Reduction dim ID to number of passes.
 
     Returns:
         Default Schedule descriptor.
     """
     items: list[tuple[str, int]] = [(d, 0) for d in analysis.parallel_dims]
     for d in analysis.reduction_dims:
-        items.append((d, 0))
+        n_passes = passes_per_dim.get(d, 1)
+        for p in range(n_passes):
+            items.append((d, p))
     loop_order = tuple(items)
     all_dims = analysis.parallel_dims + analysis.reduction_dims
     dim_schedules = tuple(DimSchedule(d, analysis.dim_tile_sizes[d], 1) for d in all_dims)

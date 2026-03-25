@@ -5,11 +5,21 @@ Extracts ``_OpCall`` entries from a user function that uses
 """
 
 import ast
+import operator
 
 import numpy as np
 
 from nkigym.codegen.analysis import _OpCall
+from nkigym.ops.activation import NKIActivation
+from nkigym.ops.activation_1d import NKIActivation1D
 from nkigym.ops.base import NKIOp
+
+_BINOP_FNS: dict[type, object] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
 
 
 def find_func_def(source: str) -> ast.FunctionDef:
@@ -41,10 +51,28 @@ def _is_nkigym_call(call: ast.Call) -> bool:
     return isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "nkigym"
 
 
+def _eval_binop(node: ast.BinOp) -> object:
+    """Evaluate a binary operation on constant operands.
+
+    Args:
+        node: AST BinOp node.
+
+    Returns:
+        Result of the binary operation.
+    """
+    left = _eval_expr(node.left)
+    right = _eval_expr(node.right)
+    op_fn = _BINOP_FNS.get(type(node.op))
+    if op_fn is None:
+        raise ValueError(f"Unsupported binary op: {ast.dump(node)}")
+    return op_fn(left, right)
+
+
 def _eval_expr(node: ast.expr) -> object:
     """Evaluate an AST expression to a Python object.
 
-    Resolves ``np.X`` attribute accesses and literal constants.
+    Resolves ``np.X`` attribute accesses, literal constants,
+    binary operations, and unary negation.
 
     Args:
         node: AST expression node.
@@ -53,11 +81,14 @@ def _eval_expr(node: ast.expr) -> object:
         The resolved Python object.
     """
     result = None
-    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-        if node.value.id == "np":
-            result = getattr(np, node.attr)
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "np":
+        result = getattr(np, node.attr)
     elif isinstance(node, ast.Constant):
         result = node.value
+    elif isinstance(node, ast.BinOp):
+        result = _eval_binop(node)
+    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        result = -_eval_expr(node.operand)
     if result is None:
         raise ValueError(f"Unsupported kwarg expression: {ast.dump(node)}")
     return result
@@ -77,6 +108,45 @@ def _arg_name(node: ast.expr) -> str:
     return node.id
 
 
+def _maybe_reclassify_activation(op: _OpCall, output_axes_map: dict[str, tuple[str, ...]]) -> _OpCall:
+    """Reclassify NKIActivation to NKIActivation1D if input is 1D.
+
+    Args:
+        op: Parsed op call to check.
+        output_axes_map: Maps variable name to output axes of its producer op.
+
+    Returns:
+        Original or reclassified op call.
+    """
+    is_1d = (
+        op.stmt_type is NKIActivation
+        and op.input_vars[0] in output_axes_map
+        and len(output_axes_map[op.input_vars[0]]) == 1
+    )
+    return op._replace(stmt_type=NKIActivation1D) if is_1d else op
+
+
+def _resolve_op_variants(op_calls: list[_OpCall]) -> list[_OpCall]:
+    """Post-parse pass to reclassify ops based on producer output shapes.
+
+    Traces the SSA chain to determine operand dimensionality and
+    reclassifies NKIActivation to NKIActivation1D when input is 1D.
+
+    Args:
+        op_calls: Parsed op calls from the function body.
+
+    Returns:
+        Op calls with reclassified types where appropriate.
+    """
+    output_axes_map: dict[str, tuple[str, ...]] = {}
+    result: list[_OpCall] = []
+    for op in op_calls:
+        resolved = _maybe_reclassify_activation(op, output_axes_map)
+        output_axes_map[resolved.output_var] = getattr(resolved.stmt_type, "OUTPUT_AXES", ())
+        result.append(resolved)
+    return result
+
+
 def parse_body(func_def: ast.FunctionDef) -> list[_OpCall]:
     """Parse function body into a list of _OpCall.
 
@@ -91,7 +161,7 @@ def parse_body(func_def: ast.FunctionDef) -> list[_OpCall]:
     for node in func_def.body:
         if not _try_parse_node(node, op_calls, counter):
             raise ValueError(f"Unsupported statement: {ast.dump(node)}")
-    return op_calls
+    return _resolve_op_variants(op_calls)
 
 
 def _try_parse_node(node: ast.stmt, op_calls: list[_OpCall], counter: list[int]) -> bool:
@@ -157,6 +227,28 @@ def _try_parse_return(node: ast.Return, op_calls: list[_OpCall], counter: list[i
     return result
 
 
+def _disambiguate_op(op_name: str, call: ast.Call) -> str:
+    """Disambiguate user function name to internal op registry key.
+
+    - ``activation`` with ``reduce_op`` kwarg → ``activation_reduce``
+    - ``tensor_scalar`` with < 2 positional args → ``tensor_scalar_const``
+
+    Args:
+        op_name: User-facing function name from AST.
+        call: AST Call node with keyword arguments.
+
+    Returns:
+        Internal op registry key.
+    """
+    kwarg_names = {kw.arg for kw in call.keywords}
+    result = op_name
+    if op_name == "activation" and "reduce_op" in kwarg_names:
+        result = "activation_reduce"
+    elif op_name == "tensor_scalar" and len(call.args) < 2:
+        result = "tensor_scalar_const"
+    return result
+
+
 def _flatten_call(call: ast.Call, output: str, op_calls: list[_OpCall], counter: list[int]) -> None:
     """Flatten a nkigym call (possibly nested) into _OpCall entries.
 
@@ -167,7 +259,7 @@ def _flatten_call(call: ast.Call, output: str, op_calls: list[_OpCall], counter:
         counter: Mutable counter for intermediate variable names.
     """
     assert isinstance(call.func, ast.Attribute)
-    op_name = call.func.attr
+    op_name = _disambiguate_op(call.func.attr, call)
     registry = NKIOp.all_ops()
     if op_name not in registry:
         raise ValueError(f"Unknown op: {op_name!r}")

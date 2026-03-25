@@ -17,6 +17,7 @@ import numpy as np
 
 from nkigym.codegen.analysis import _Analysis, _OpCall, analyze_dims
 from nkigym.codegen.parse import find_func_def, parse_body
+from nkigym.codegen.passes import _PassAssignment, assign_passes
 from nkigym.schedule.enumerate import enumerate_all
 from nkigym.schedule.render import render_schedule
 from nkigym.schedule.types import Schedule
@@ -46,6 +47,7 @@ class _Workload:
     op_calls: list[_OpCall]
     params: tuple[str, ...]
     func_name: str
+    pa: _PassAssignment
 
 
 def _parse_workload(func: Callable, kernel_kwargs: dict[str, Any]) -> _Workload:
@@ -64,7 +66,8 @@ def _parse_workload(func: Callable, kernel_kwargs: dict[str, Any]) -> _Workload:
     op_calls = parse_body(func_def)
     input_shapes = tuple(kernel_kwargs[p].shape for p in params)
     analysis = analyze_dims(op_calls, params, input_shapes)
-    return _Workload(analysis=analysis, op_calls=op_calls, params=params, func_name=func_def.name)
+    pa = assign_passes(op_calls, analysis)
+    return _Workload(analysis=analysis, op_calls=op_calls, params=params, func_name=func_def.name, pa=pa)
 
 
 def _compute_mac_count(analysis: _Analysis) -> int:
@@ -107,7 +110,7 @@ def _save_variant(idx: int, schedule: Schedule, ctx: _SearchContext) -> tuple[st
     error = ""
     try:
         w = ctx.workload
-        nki_source = render_schedule(w.analysis, schedule, w.op_calls, w.params, w.func_name)
+        nki_source = render_schedule(w.analysis, schedule, w.op_calls, w.params, w.func_name, w.pa)
         Path(nki_path).write_text(nki_source)
     except Exception as e:
         error = _capture_error(e)
@@ -242,6 +245,16 @@ def _update_report_variants(report: SearchReport, results: list[VariantResult]) 
         )
 
 
+def _enumerate_and_select(
+    workload: _Workload, kernel_kwargs: dict[str, Any], num_targets: int, seed: int
+) -> list[Schedule]:
+    """Enumerate valid schedules and select a subset for benchmarking."""
+    all_schedules = enumerate_all(workload.analysis, workload.op_calls, workload.params, workload.pa.passes_per_dim)
+    selected = _select_schedules(all_schedules, num_targets, seed)
+    logger.info("Enumerated %d valid schedules, selected %d", len(all_schedules), len(selected))
+    return selected
+
+
 def search(
     func: Callable, num_targets: int, seed: int, save_cache: Path, kernel_kwargs: dict[str, Any]
 ) -> SearchResults:
@@ -269,11 +282,7 @@ def search(
     expected = func(**sim_kwargs)
     mac_count = _compute_mac_count(workload.analysis)
     input_dtype_name = next(iter(kernel_kwargs.values())).dtype.name
-
-    input_dtype_bytes = np.dtype(input_dtype_name).itemsize
-    all_schedules = enumerate_all(workload.analysis, workload.op_calls, workload.params, input_dtype_bytes)
-    selected = _select_schedules(all_schedules, num_targets, seed)
-    logger.info("Enumerated %d valid schedules, selected %d", len(all_schedules), len(selected))
+    selected = _enumerate_and_select(workload, kernel_kwargs, num_targets, seed)
 
     pool = _make_pool(workload.func_name, kernel_kwargs, expected, save_cache)
     ctx = _SearchContext(

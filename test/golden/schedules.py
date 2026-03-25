@@ -35,3 +35,10 @@ MATMUL_ADD_DEFAULT = Schedule(
     dim_schedules=(DimSchedule("d1", 128, 1), DimSchedule("d3", 256, 1), DimSchedule("d0", 128, 1)),
     op_placements=(2, 2, 2),
 )
+
+
+RMSNORM_MATMUL_DEFAULT = Schedule(
+    loop_order=(("d0", 0), ("d3", 0), ("d1", 0), ("d1", 1)),
+    dim_schedules=(DimSchedule("d0", 128, 1), DimSchedule("d3", 256, 1), DimSchedule("d1", 128, 1)),
+    op_placements=(2, 2),
+)

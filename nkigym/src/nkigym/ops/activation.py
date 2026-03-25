@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _op_display_name
 
 
 class NKIActivation(NKIOp):
@@ -35,6 +35,5 @@ class NKIActivation(NKIOp):
             NKI activation source line.
         """
         kwargs = dict(config_kwargs)
-        value = kwargs.get("op", "identity")
-        name = value if isinstance(value, str) else getattr(value, "__name__", str(value))
+        name = _op_display_name(kwargs.get("op", "identity"))
         return f"nisa.activation(dst={dst_expr}, data={operand_exprs['data']}, op=nl.{name})"

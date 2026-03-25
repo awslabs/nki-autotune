@@ -9,6 +9,9 @@ Design doc reference: nkigym_ir_guide.md sections 2 and 5.
 """
 
 from nkigym.codegen.analysis import _Analysis, _OpCall, has_reduction
+from nkigym.codegen.passes import _PassAssignment
+from nkigym.schedule.render_mp_helpers import _emit_dma_loops
+from nkigym.schedule.render_multipass import render_multi_pass
 from nkigym.schedule.render_names import _assign_names, _Names
 from nkigym.schedule.render_slices import (
     _acc_compute_slices,
@@ -29,15 +32,26 @@ from nkigym.schedule.types import Schedule, _ds_map, _first_reduction_position, 
 
 
 def render_schedule(
-    analysis: _Analysis, schedule: Schedule, op_calls: list[_OpCall], params: tuple[str, ...], func_name: str
+    analysis: _Analysis,
+    schedule: Schedule,
+    op_calls: list[_OpCall],
+    params: tuple[str, ...],
+    func_name: str,
+    pa: _PassAssignment,
 ) -> str:
     """Render complete NKI kernel source from schedule + workload."""
-    names = _assign_names(analysis, schedule, op_calls, params)
-    lines = _preamble(func_name, params, analysis, names)
-    lines.extend(_level_lines(0, analysis, schedule, op_calls, params, names))
-    lines.append(f"    return {names.hbm}")
-    lines.append("")
-    return "\n".join(lines)
+    is_multi = any(n > 1 for n in pa.passes_per_dim.values())
+    result = ""
+    if is_multi:
+        result = render_multi_pass(analysis, schedule, op_calls, params, func_name, pa)
+    else:
+        names = _assign_names(analysis, schedule, op_calls, params)
+        lines = _preamble(func_name, params, analysis, names)
+        lines.extend(_level_lines(0, analysis, schedule, op_calls, params, names))
+        lines.append(f"    return {names.hbm}")
+        lines.append("")
+        result = "\n".join(lines)
+    return result
 
 
 def _preamble(func_name: str, params: tuple[str, ...], analysis: _Analysis, names: _Names) -> list[str]:
@@ -117,7 +131,7 @@ def _post_ops(
     return lines
 
 
-def _tile_loop_lines(indent: int, schedule: Schedule, analysis: _Analysis) -> tuple[list[str], int]:
+def _tile_loop_lines(indent: int, schedule: Schedule, names: _Names) -> tuple[list[str], int]:
     """Emit tile-within-block loops for any dim with tiles_per_block > 1."""
     ds = _ds_map(schedule)
     lines: list[str] = []
@@ -125,7 +139,8 @@ def _tile_loop_lines(indent: int, schedule: Schedule, analysis: _Analysis) -> tu
     for _level, (dim_id, _pass) in enumerate(schedule.loop_order):
         if ds[dim_id].tiles_per_block > 1:
             inner_pad = "    " * (indent + extra)
-            lines.append(f"{inner_pad}for t_{dim_id} in nl.affine_range({ds[dim_id].tiles_per_block}):")
+            var = names.tile_vars[dim_id]
+            lines.append(f"{inner_pad}for {var} in nl.affine_range({ds[dim_id].tiles_per_block}):")
             extra += 1
     return lines, extra
 
@@ -139,9 +154,9 @@ def _compute_lines(
     names: _Names,
 ) -> list[str]:
     """Emit compute ops at the innermost level."""
-    lines, extra = _tile_loop_lines(indent, schedule, analysis)
+    lines, extra = _tile_loop_lines(indent, schedule, names)
     final_pad = "    " * (indent + extra)
-    acc_sl = _acc_compute_slices(analysis, schedule)
+    acc_sl = _acc_compute_slices(analysis, schedule, names.tile_vars)
     for op in op_calls:
         if has_reduction(op):
             lines.append(f"{final_pad}{_render_one_compute(op, acc_sl, analysis, schedule, params, names)}")
@@ -158,34 +173,9 @@ def _render_one_compute(
     operand_exprs: dict[str, str] = {}
     for operand_name, var_name in zip(operand_names, op.input_vars):
         pidx = param_index[var_name]
-        sl = _sbuf_compute_slices(pidx, analysis, schedule, params)
+        sl = _sbuf_compute_slices(pidx, analysis, schedule, params, names.tile_vars)
         operand_exprs[operand_name] = f"{names.load_sbufs[pidx]}[{sl}]"
-    return op.stmt_type.render_compute(f"{names.psum}[{acc_sl}]", operand_exprs)
-
-
-def _emit_dma_loops(
-    name: str, indent: int, nt_par: int, nt_free: tuple[int, ...]
-) -> tuple[list[str], str, tuple[str, ...], int]:
-    """Emit nested affine_range loops for per-tile DMA."""
-    loop_lines: list[str] = []
-    extra = 0
-    par_lv = "0"
-    if nt_par > 1:
-        par_lv = f"{name}_d0"
-        pad = "    " * (indent + extra)
-        loop_lines.append(f"{pad}for {par_lv} in nl.affine_range({nt_par}):")
-        extra += 1
-    free_lvs: list[str] = []
-    for k, nt in enumerate(nt_free):
-        if nt > 1:
-            lv = f"{name}_d{k + 1}"
-            pad = "    " * (indent + extra)
-            loop_lines.append(f"{pad}for {lv} in nl.affine_range({nt}):")
-            free_lvs.append(lv)
-            extra += 1
-        else:
-            free_lvs.append("0")
-    return loop_lines, par_lv, tuple(free_lvs), extra
+    return op.stmt_type.render_compute(f"{names.psum}[{acc_sl}]", operand_exprs, op.config_kwargs)
 
 
 def _load_lines(
@@ -201,7 +191,7 @@ def _load_lines(
     nt_free = tuple(sbuf_shape[2 + k] for k in range(num_free))
     lines = [f"{pad}{sbuf_name} = nl.ndarray({sbuf_shape}, dtype={param}.dtype, buffer=nl.sbuf)"]
     if nt_par > 1 or any(n > 1 for n in nt_free):
-        loop_lines, par_lv, free_lvs, extra = _emit_dma_loops(f"_ld{param_idx}", indent, nt_par, nt_free)
+        loop_lines, par_lv, free_lvs, extra = _emit_dma_loops(names.counter, indent, nt_par, nt_free)
         lines.extend(loop_lines)
         inner_pad = "    " * (indent + extra)
         sbuf_sl = _dma_load_sbuf_tile_slice(param_idx, analysis, schedule, params, par_lv, free_lvs)
@@ -328,7 +318,7 @@ def _store_lines(
     src = var_to_buf[analysis.return_var]
     lines: list[str] = []
     if nt_par > 1 or any(n > 1 for n in nt_free):
-        loop_lines, par_lv, free_lvs, extra = _emit_dma_loops("_st0", indent, nt_par, nt_free)
+        loop_lines, par_lv, free_lvs, extra = _emit_dma_loops(names.counter, indent, nt_par, nt_free)
         lines.extend(loop_lines)
         inner_pad = "    " * (indent + extra)
         out_sl = _dma_store_hbm_tile_slice(analysis, schedule, par_lv, free_lvs)

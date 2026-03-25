@@ -160,3 +160,42 @@ def matmul_red_middle_kernel(a, b):
         nisa.dma_copy(dst=hbm_tensor_0[i_0 * 128:i_0 * 128 + 128, 0:256], src=sbuf_tensor_2[0:128, 0:1, 0:1, 0:256])
     return hbm_tensor_0
 """
+
+RENDER_7 = """\
+import numpy as np
+import nki
+import nki.language as nl
+import nki.isa as nisa
+
+
+@nki.jit
+def rmsnorm_matmul(a, b):
+    hbm_tensor_0 = nl.ndarray((256, 256), dtype=a.dtype, buffer=nl.shared_hbm)
+    for i_0 in nl.affine_range(2):
+        for i_1 in nl.affine_range(1):
+            psum_tensor_0 = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.psum)
+            for i_2 in nl.affine_range(2):
+                sbuf_tensor_0 = nl.ndarray((128, 1, 1, 128), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=sbuf_tensor_0[0:128, 0:1, 0:1, 0:128], src=a[i_0 * 128:i_0 * 128 + 128, i_2 * 128:i_2 * 128 + 128])
+                sbuf_tensor_1 = nl.ndarray((128, 1, 1, 128), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=sbuf_tensor_1[0:128, 0:1, 0:1, 0:128], op=nl.square, data=sbuf_tensor_0[0:128, 0:1, 0:1, 0:128], reduce_op=np.add, reduce_res=psum_tensor_0[0:128, 0:1])
+            sbuf_tensor_2 = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=sbuf_tensor_2[0:128, 0:1], src=psum_tensor_0[0:128, 0:1])
+            nisa.tensor_scalar(dst=sbuf_tensor_2[0:128, 0:1], data=sbuf_tensor_2[0:128, 0:1], operand0=0.00048828125, op0=nl.multiply, op1=nl.add, operand1=1e-06)
+            nisa.activation(dst=sbuf_tensor_2[0:128, 0:1], data=sbuf_tensor_2[0:128, 0:1], op=nl.rsqrt)
+            psum_tensor_1 = nl.ndarray((128, 1, 1, 256), dtype=nl.float32, buffer=nl.psum)
+            for i_3 in nl.affine_range(2):
+                sbuf_tensor_3 = nl.ndarray((128, 1, 1, 128), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=sbuf_tensor_3[0:128, 0:1, 0:1, 0:128], src=a[i_0 * 128:i_0 * 128 + 128, i_3 * 128:i_3 * 128 + 128])
+                sbuf_tensor_4 = nl.ndarray((128, 1, 1, 256), dtype=b.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=sbuf_tensor_4[0:128, 0:1, 0:1, 0:256], src=b[i_3 * 128:i_3 * 128 + 128, i_1 * 256:i_1 * 256 + 256])
+                nisa.tensor_scalar(dst=sbuf_tensor_3[0:128, 0:1, 0:1, 0:128], data=sbuf_tensor_3[0:128, 0:1, 0:1, 0:128], operand0=sbuf_tensor_2[0:128, 0:1], op0=nl.multiply)
+                psum_tensor_2 = nl.ndarray((128, 1, 1, 128), dtype=a.dtype, buffer=nl.psum)
+                nisa.nc_transpose(dst=psum_tensor_2[0:128, 0:1, 0:1, 0:128], data=sbuf_tensor_3[0:128, 0:1, 0:1, 0:128])
+                nisa.tensor_copy(dst=sbuf_tensor_3[0:128, 0:1, 0:1, 0:128], src=psum_tensor_2[0:128, 0:1, 0:1, 0:128])
+                nisa.nc_matmul(dst=psum_tensor_1[0:128, 0:1, 0:1, 0:256], stationary=sbuf_tensor_3[0:128, 0:1, 0:1, 0:128], moving=sbuf_tensor_4[0:128, 0:1, 0:1, 0:256])
+            sbuf_tensor_5 = nl.ndarray((128, 1, 1, 256), dtype=a.dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=sbuf_tensor_5[0:128, 0:1, 0:1, 0:256], src=psum_tensor_1[0:128, 0:1, 0:1, 0:256])
+            nisa.dma_copy(dst=hbm_tensor_0[i_0 * 128:i_0 * 128 + 128, i_1 * 256:i_1 * 256 + 256], src=sbuf_tensor_5[0:128, 0:1, 0:1, 0:256])
+    return hbm_tensor_0
+"""

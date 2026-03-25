@@ -4,8 +4,27 @@ import numpy as np
 
 from nkigym.codegen.analysis import _Analysis, _OpCall
 from nkigym.ops.activation import NKIActivation
+from nkigym.ops.activation_1d import NKIActivation1D
+from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.add import NKIAdd
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.tensor_scalar import NKITensorScalar
+from nkigym.ops.tensor_scalar_const import NKITensorScalarConst
+from nkigym.ops.transpose import NKITranspose
+
+RMSNORM_MATMUL_OP_CALLS = [
+    _OpCall(NKIActivationReduce, ("a",), (("op", "square"), ("reduce_op", np.add)), "sum_sq"),
+    _OpCall(
+        NKITensorScalarConst,
+        ("sum_sq",),
+        (("op0", np.multiply), ("operand0", 0.00048828125), ("op1", np.add), ("operand1", 1e-06)),
+        "scaled",
+    ),
+    _OpCall(NKIActivation1D, ("scaled",), (("op", "rsqrt"),), "rsqrt_val"),
+    _OpCall(NKITensorScalar, ("a", "rsqrt_val"), (("op0", np.multiply),), "a_normed"),
+    _OpCall(NKITranspose, ("a_normed",), (), "a_t"),
+    _OpCall(NKIMatmul, ("a_t", "b"), (), "result"),
+]
 
 MATMUL_256_ANALYSIS = _Analysis(
     var_dims={"a": ("d0", "d1"), "b": ("d0", "d3"), "c": ("d1", "d3")},
@@ -78,3 +97,34 @@ MATMUL_ADD_ANALYSIS = _Analysis(
 )
 MATMUL_ADD_OP_CALLS = [_OpCall(NKIMatmul, ("a", "b"), (), "c"), _OpCall(NKIAdd, ("c", "bias"), (), "result")]
 MATMUL_ADD_PARAMS = ("a", "b", "bias")
+
+
+RMSNORM_MATMUL_ANALYSIS = _Analysis(
+    var_dims={
+        "a": ("d0", "d1"),
+        "b": ("d1", "d3"),
+        "sum_sq": ("d0",),
+        "scaled": ("d0",),
+        "rsqrt_val": ("d0",),
+        "a_normed": ("d0", "d1"),
+        "a_t": ("d1", "d0"),
+        "result": ("d0", "d3"),
+    },
+    var_shapes={
+        "a": (256, 256),
+        "b": (256, 256),
+        "sum_sq": (256,),
+        "scaled": (256,),
+        "rsqrt_val": (256,),
+        "a_normed": (256, 256),
+        "a_t": (256, 256),
+        "result": (256, 256),
+    },
+    parallel_dims=["d0", "d3"],
+    reduction_dims=["d1"],
+    tile_counts={"d0": 2, "d3": 1},
+    reduction_tile_counts={"d1": 2},
+    dim_tile_sizes={"d0": 128, "d1": 128, "d3": 256},
+    return_var="result",
+)
+RMSNORM_MATMUL_PARAMS = ("a", "b")

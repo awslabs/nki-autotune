@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _op_display_name
 
 
 class NKITensorScalar(NKIOp):
@@ -38,6 +38,5 @@ class NKITensorScalar(NKIOp):
             NKI tensor_scalar source line.
         """
         kwargs = dict(config_kwargs)
-        value = kwargs.get("op0", "add")
-        name = value if isinstance(value, str) else getattr(value, "__name__", str(value))
+        name = _op_display_name(kwargs.get("op0", "add"))
         return f"nisa.tensor_scalar(dst={dst_expr}, data={operand_exprs['data']}, operand0={operand_exprs['operand0']}, op0=nl.{name})"

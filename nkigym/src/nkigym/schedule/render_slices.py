@@ -109,12 +109,12 @@ def _sbuf_load_shape(
     return _multidim_shape(dims, ts_map, nt_map)
 
 
-def _nt_slice_one(level: int, dim_id: str, tpb: int, entered: bool) -> str:
+def _nt_slice_one(level: int, tile_var: str, tpb: int, entered: bool) -> str:
     """Generate num_tiles slice for selecting one tile at compute time.
 
     Args:
         level: Loop level for this dimension (for ``i_`` block var).
-        dim_id: Dimension ID (for ``t_`` tile-within-block var).
+        tile_var: Loop variable name for tile-within-block iteration.
         tpb: Tiles per block.
         entered: Whether this dim was entered before the current scope.
 
@@ -124,16 +124,20 @@ def _nt_slice_one(level: int, dim_id: str, tpb: int, entered: bool) -> str:
     if entered and tpb == 1:
         expr = "0:1"
     elif entered:
-        expr = f"t_{dim_id}:t_{dim_id} + 1"
+        expr = f"{tile_var}:{tile_var} + 1"
     elif tpb > 1:
-        expr = f"i_{level} * {tpb} + t_{dim_id}:i_{level} * {tpb} + t_{dim_id} + 1"
+        expr = f"i_{level} * {tpb} + {tile_var}:i_{level} * {tpb} + {tile_var} + 1"
     else:
         expr = f"i_{level}:i_{level} + 1"
     return expr
 
 
 def _multidim_one_tile_slices(
-    dims: tuple[str, ...], ds_map: dict[str, DimSchedule], lo: tuple[tuple[str, int], ...], threshold: int
+    dims: tuple[str, ...],
+    ds_map: dict[str, DimSchedule],
+    lo: tuple[tuple[str, int], ...],
+    threshold: int,
+    tile_vars: dict[str, str],
 ) -> str:
     """Build multi-dim slices selecting one tile per dim.
 
@@ -145,6 +149,7 @@ def _multidim_one_tile_slices(
         ds_map: DimSchedule map from ``_ds_map``.
         lo: Loop order.
         threshold: Loop level threshold for entered check.
+        tile_vars: Mapping from dim_id to loop variable name for tile loops.
 
     Returns:
         Comma-separated slice expressions.
@@ -153,16 +158,16 @@ def _multidim_one_tile_slices(
     free = dims[1:]
     parts: list[str] = [f"0:{ds_map[par].tile_size}"]
     j = _dim_position(par, lo)
-    parts.append(_nt_slice_one(j, par, ds_map[par].tiles_per_block, j < threshold))
+    parts.append(_nt_slice_one(j, tile_vars.get(par, ""), ds_map[par].tiles_per_block, j < threshold))
     for d in free:
         j = _dim_position(d, lo)
-        parts.append(_nt_slice_one(j, d, ds_map[d].tiles_per_block, j < threshold))
+        parts.append(_nt_slice_one(j, tile_vars.get(d, ""), ds_map[d].tiles_per_block, j < threshold))
     for d in free:
         parts.append(f"0:{ds_map[d].tile_size}")
     return ", ".join(parts)
 
 
-def _acc_compute_slices(analysis: _Analysis, schedule: Schedule) -> str:
+def _acc_compute_slices(analysis: _Analysis, schedule: Schedule, tile_vars: dict[str, str]) -> str:
     """Generate multi-dim accumulator slices for the compute destination.
 
     Dims outside reduction are entered; dims inside are not.
@@ -170,6 +175,7 @@ def _acc_compute_slices(analysis: _Analysis, schedule: Schedule) -> str:
     Args:
         analysis: Dimension analysis result.
         schedule: Schedule descriptor.
+        tile_vars: Mapping from dim_id to loop variable name for tile loops.
 
     Returns:
         Comma-separated slice expressions.
@@ -177,10 +183,12 @@ def _acc_compute_slices(analysis: _Analysis, schedule: Schedule) -> str:
     return_dims = _var_dim_ids(analysis, analysis.return_var)
     red_pos = _first_reduction_position(schedule.loop_order, analysis)
     ds = _ds_map(schedule)
-    return _multidim_one_tile_slices(return_dims, ds, schedule.loop_order, red_pos)
+    return _multidim_one_tile_slices(return_dims, ds, schedule.loop_order, red_pos, tile_vars)
 
 
-def _sbuf_compute_slices(param_idx: int, analysis: _Analysis, schedule: Schedule, params: tuple[str, ...]) -> str:
+def _sbuf_compute_slices(
+    param_idx: int, analysis: _Analysis, schedule: Schedule, params: tuple[str, ...], tile_vars: dict[str, str]
+) -> str:
     """Generate multi-dim SBUF sub-tile slices for operands at compute time.
 
     Dims entered before the load level are inside; others are outside.
@@ -190,6 +198,7 @@ def _sbuf_compute_slices(param_idx: int, analysis: _Analysis, schedule: Schedule
         analysis: Dimension analysis result.
         schedule: Schedule descriptor.
         params: Input parameter names.
+        tile_vars: Mapping from dim_id to loop variable name for tile loops.
 
     Returns:
         Comma-separated slice expressions.
@@ -198,7 +207,7 @@ def _sbuf_compute_slices(param_idx: int, analysis: _Analysis, schedule: Schedule
     dims = _var_dim_ids(analysis, param)
     load_level = _load_loop_level(param_idx, schedule, analysis, params)
     ds = _ds_map(schedule)
-    return _multidim_one_tile_slices(dims, ds, schedule.loop_order, load_level)
+    return _multidim_one_tile_slices(dims, ds, schedule.loop_order, load_level, tile_vars)
 
 
 def _hbm_load_slices(param_idx: int, analysis: _Analysis, schedule: Schedule, params: tuple[str, ...]) -> str:

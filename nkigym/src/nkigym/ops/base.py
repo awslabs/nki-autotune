@@ -3,6 +3,18 @@
 from typing import Any, ClassVar
 
 
+def _op_display_name(value: object) -> str:
+    """Extract display name from an NKI op value (str or callable).
+
+    Args:
+        value: Either a string name or an object with ``__name__``.
+
+    Returns:
+        Human-readable name suitable for NKI source rendering.
+    """
+    return value if isinstance(value, str) else getattr(value, "__name__", str(value))
+
+
 class NKIOp:
     """Base for all NKI operator definitions.
 
@@ -37,12 +49,15 @@ class NKIOp:
         return dict(cls._registry)
 
     @classmethod
-    def render_compute(cls, dst_expr: str, operand_exprs: dict[str, str]) -> str:
+    def render_compute(
+        cls, dst_expr: str, operand_exprs: dict[str, str], config_kwargs: tuple[tuple[str, object], ...]
+    ) -> str:
         """Render schedule compute line with pre-computed slice expressions.
 
         Args:
             dst_expr: Destination expression (e.g. ``"psum_acc[0:128, 0:128]"``).
             operand_exprs: Operand name to subscripted expression mapping.
+            config_kwargs: Non-tensor keyword arguments from the op call.
 
         Returns:
             NKI source line for this compute operation.

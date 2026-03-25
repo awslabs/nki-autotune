@@ -10,9 +10,9 @@ Design doc reference: nkigym_ir_guide.md sections 2-4.
 from typing import NamedTuple
 
 from nkigym.codegen.analysis import _Analysis
+from nkigym.ops.matmul import NKIMatmul
 
 _SBUF_PARTITION_LIMIT = 128
-_SBUF_CAPACITY_BYTES = 24 * 1024 * 1024
 
 
 class DimSchedule(NamedTuple):
@@ -247,86 +247,57 @@ def _valid_acc_partition(analysis: _Analysis) -> bool:
     return ts <= _SBUF_PARTITION_LIMIT
 
 
-def _load_buffer_elements(param_idx: int, schedule: Schedule, analysis: _Analysis, params: tuple[str, ...]) -> int:
-    """Compute total element count for one SBUF load buffer.
+def _acc_free_dim(analysis: _Analysis, schedule: Schedule) -> int:
+    """Compute PSUM accumulator free-dim elements per partition.
 
-    Each dim contributes ``tile_size * num_tiles`` where num_tiles is
-    ``tiles_per_block`` (entered) or ``total_tiles`` (outside).
-
-    Args:
-        param_idx: Index into params / op_placements.
-        schedule: Schedule descriptor.
-        analysis: Dimension analysis result.
-        params: Input parameter names.
-
-    Returns:
-        Total number of elements in the buffer.
-    """
-    param = params[param_idx]
-    dims = _var_dim_ids(analysis, param) if param in analysis.var_dims else ()
-    load_level = _load_loop_level(param_idx, schedule, analysis, params)
-    ds = _ds_map(schedule)
-    total = 1
-    for d in dims:
-        nt = ds[d].tiles_per_block if _dim_position(d, schedule.loop_order) < load_level else _total_tiles(d, analysis)
-        total *= ds[d].tile_size * nt
-    return total
-
-
-def _acc_buffer_elements(analysis: _Analysis, schedule: Schedule) -> int:
-    """Compute total element count for the PSUM accumulator buffer.
-
-    Dims outside reduction hold ``tiles_per_block`` tiles.
-    Dims inside reduction hold ``total_tiles`` tiles.
+    The accumulator shape is (partition, num_tiles..., tile_sizes...).
+    Free-dim is everything after the partition dimension.  Dims
+    outside the first reduction use ``tiles_per_block``; dims inside
+    use ``total_tiles``.
 
     Args:
         analysis: Dimension analysis result.
         schedule: Schedule descriptor.
 
     Returns:
-        Total number of elements in the accumulator.
+        Number of free-dim elements per partition.
     """
     return_dims = _var_dim_ids(analysis, analysis.return_var)
     red_pos = _first_reduction_position(schedule.loop_order, analysis)
     ds = _ds_map(schedule)
-    total = 1
+    free = 1
     for d in return_dims:
         nt = ds[d].tiles_per_block if _dim_position(d, schedule.loop_order) < red_pos else _total_tiles(d, analysis)
-        total *= ds[d].tile_size * nt
-    return total
+        free *= ds[d].tile_size * nt
+    first_dim = return_dims[0] if return_dims else ""
+    partition = analysis.dim_tile_sizes.get(first_dim, 1)
+    return free // max(partition, 1)
 
 
-def _valid_buffer_capacity(
-    analysis: _Analysis, schedule: Schedule, params: tuple[str, ...], input_dtype_bytes: int
-) -> bool:
-    """Check that total SBUF usage fits hardware capacity.
+def _valid_matmul_acc(analysis: _Analysis, schedule: Schedule) -> bool:
+    """Check matmul accumulator free-dim within nc_matmul limits.
 
-    Sums load buffer bytes across all params plus staging buffer
-    bytes (if reduction exists) and checks against 24 MB SBUF.
+    On NeuronCore-v2/v3 each PSUM bank holds 512 float32 elements
+    (the ``nc_matmul`` moving free-dim limit).  The compiler reload
+    path supports up to ``ACC_FREE_DIM_LIMIT`` elements per partition.
 
     Args:
         analysis: Dimension analysis result.
         schedule: Schedule descriptor.
-        params: Input parameter names.
-        input_dtype_bytes: Size of one input element in bytes.
 
     Returns:
-        True if total SBUF usage is within hardware capacity.
+        True if accumulator free-dim is within limits.
     """
-    total_elements = sum(_load_buffer_elements(i, schedule, analysis, params) for i in range(len(params)))
-    if analysis.reduction_dims:
-        total_elements += _acc_buffer_elements(analysis, schedule)
-    return total_elements * input_dtype_bytes <= _SBUF_CAPACITY_BYTES
+    return _acc_free_dim(analysis, schedule) <= NKIMatmul.ACC_FREE_DIM_LIMIT
 
 
-def validate(analysis: _Analysis, schedule: Schedule, params: tuple[str, ...], input_dtype_bytes: int) -> bool:
+def validate(analysis: _Analysis, schedule: Schedule, params: tuple[str, ...]) -> bool:
     """Check whether a schedule is valid for the given analysis.
 
     Args:
         analysis: Dimension analysis result.
         schedule: Schedule to validate.
         params: Input parameter names.
-        input_dtype_bytes: Size of one input element in bytes.
 
     Returns:
         True if the schedule passes all validation checks.
@@ -336,5 +307,5 @@ def validate(analysis: _Analysis, schedule: Schedule, params: tuple[str, ...], i
         and _valid_blocking(analysis, schedule)
         and _valid_sbuf_sizes(analysis, params)
         and _valid_acc_partition(analysis)
-        and _valid_buffer_capacity(analysis, schedule, params, input_dtype_bytes)
+        and _valid_matmul_acc(analysis, schedule)
     )

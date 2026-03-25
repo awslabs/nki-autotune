@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _op_display_name
 
 
 class NKITensorReduce(NKIOp):
@@ -37,6 +37,5 @@ class NKITensorReduce(NKIOp):
             NKI tensor_reduce source line.
         """
         kwargs = dict(config_kwargs)
-        value = kwargs.get("op", "add")
-        name = value if isinstance(value, str) else getattr(value, "__name__", str(value))
+        name = _op_display_name(kwargs.get("op", "add"))
         return f"nisa.tensor_reduce(dst={dst_expr}, data={operand_exprs['data']}, op=nl.{name})"

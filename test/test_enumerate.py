@@ -19,10 +19,12 @@ from nkigym.schedule.enumerate import (
     enumerate_op_placements,
 )
 
+_SINGLE_PASS: dict[str, int] = {}
+
 
 def test_matmul_loop_orders() -> None:
     """256x256 matmul with 3 dims produces 6 permutations."""
-    orders = enumerate_loop_orders(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS)
+    orders = enumerate_loop_orders(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, _SINGLE_PASS)
     assert sorted(orders) == sorted(MATMUL_256_LOOP_ORDERS)
 
 
@@ -40,7 +42,7 @@ def test_matmul_blocking() -> None:
 
 def test_add_loop_orders() -> None:
     """Element-wise add with 2 parallel dims produces 2 permutations."""
-    orders = enumerate_loop_orders(ADD_ONLY_ANALYSIS, ADD_ONLY_OP_CALLS)
+    orders = enumerate_loop_orders(ADD_ONLY_ANALYSIS, ADD_ONLY_OP_CALLS, _SINGLE_PASS)
     assert sorted(orders) == sorted(ADD_ONLY_LOOP_ORDERS)
 
 
@@ -52,24 +54,24 @@ def test_add_blocking() -> None:
 
 def test_matmul_default_schedule() -> None:
     """Default matmul schedule: parallel dims first, tpb=1, natural placements."""
-    result = default_schedule(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"))
+    result = default_schedule(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"), _SINGLE_PASS)
     assert result == MATMUL_256_DEFAULT
 
 
 def test_add_default_schedule() -> None:
     """Default add schedule: parallel dims first, tpb=1, natural placements."""
-    result = default_schedule(ADD_ONLY_ANALYSIS, ADD_ONLY_OP_CALLS, ("x", "y"))
+    result = default_schedule(ADD_ONLY_ANALYSIS, ADD_ONLY_OP_CALLS, ("x", "y"), _SINGLE_PASS)
     assert result == ADD_ONLY_DEFAULT
 
 
 def test_enumerate_all_produces_valid_schedules() -> None:
     """All enumerated matmul schedules pass validation (no duplicates)."""
-    schedules = enumerate_all(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"), 2)
+    schedules = enumerate_all(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"), _SINGLE_PASS)
     assert len(schedules) == len(set(schedules))
     assert len(schedules) > 0
 
 
 def test_enumerate_all_default_included() -> None:
     """Default schedule is always in the enumerated set."""
-    schedules = enumerate_all(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"), 2)
+    schedules = enumerate_all(MATMUL_256_ANALYSIS, MATMUL_256_OP_CALLS, ("a", "b"), _SINGLE_PASS)
     assert MATMUL_256_DEFAULT in schedules
