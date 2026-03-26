@@ -11,12 +11,19 @@ import traceback
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+if TYPE_CHECKING:
+    from nkipy.runtime import BaremetalExecutor, CompiledKernel
 
 import numpy as np
-from neuronxcc.nki_standalone import NKI_IR_VERSION, compile_nki_ir_kernel_to_neff
-from nkipy.core.backend.hlo import HLOModule, HLOTensor
-from nkipy.runtime import BaremetalExecutor, CompiledKernel
+
+"""
+neuronxcc, nkipy.core.backend.hlo, and nkipy.runtime are imported lazily so
+that the module can be loaded on hosts that lack the Neuron runtime (libnrt.so).
+The coordinator only needs numpy and stdlib for serialization; the heavy imports
+are resolved inside the functions that actually touch the compiler or hardware.
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +44,13 @@ def _init_compile_worker() -> None:
 
     Redirects stdout/stderr to /dev/null at the OS file-descriptor level
     so bare print() calls in neuronxcc are suppressed. Also sets the
-    NKI TraceKernel logger to WARNING.
+    NKI TraceKernel logger to WARNING.  Ensures the venv ``bin/`` dir is
+    on PATH so ``neuronx-cc`` is discoverable by the compiler subprocess.
     """
+    venv_bin = os.path.dirname(sys.executable)
+    path = os.environ.get("PATH", "")
+    if venv_bin not in path.split(os.pathsep):
+        os.environ["PATH"] = venv_bin + os.pathsep + path
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
@@ -170,6 +182,8 @@ def _compile_nki_kernel(
     Raises:
         RuntimeError: If NEFF file is not produced.
     """
+    from neuronxcc.nki_standalone import NKI_IR_VERSION, compile_nki_ir_kernel_to_neff
+
     tempfile.tempdir = "/tmp/nki_artifacts"
     os.makedirs(tempfile.tempdir, exist_ok=True)
     kernel = _load_kernel(nki_path, func_name)
@@ -311,8 +325,11 @@ def _calculate_mfu(mac_count: int, time_ms: float, dtype_name: str) -> float:
     return 100.0 * theoretical_pe_cycles / actual_pe_cycles
 
 
-def _create_compiled_kernel(neff_path: str, nki_path: str, cfg: _BenchmarkConfig) -> CompiledKernel:
+def _create_compiled_kernel(neff_path: str, nki_path: str, cfg: _BenchmarkConfig) -> "CompiledKernel":
     """Create a CompiledKernel from a NEFF for BaremetalExecutor."""
+    from nkipy.core.backend.hlo import HLOModule, HLOTensor
+    from nkipy.runtime import CompiledKernel
+
     kernel = _load_kernel(nki_path, cfg.func_name)
     hlo = HLOModule(name=cfg.func_name)
     for name, tensor in cfg.kernel_kwargs.items():
@@ -327,7 +344,7 @@ def _percentile(sorted_vals: list[float], pct: float) -> float:
     return sorted_vals[idx]
 
 
-def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkConfig) -> VariantResult:
+def _benchmark_one(spike: "BaremetalExecutor", cr: CompileResult, cfg: _BenchmarkConfig) -> VariantResult:
     """Benchmark a single compiled variant on a Neuron core."""
     min_ms = mean_ms = p50_ms = p99_ms = mfu = 0.0
     correct = False
@@ -366,6 +383,8 @@ def _benchmark_one(spike: BaremetalExecutor, cr: CompileResult, cfg: _BenchmarkC
 
 def _run_core_worker(core_id: int, nki_neff_pairs: list[tuple[str, str]], cfg: _BenchmarkConfig) -> list[VariantResult]:
     """Run benchmarks for a batch of variants on one pinned Neuron core."""
+    from nkipy.runtime import BaremetalExecutor
+
     os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_id)
     os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
     os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
@@ -423,8 +442,23 @@ def _collect_hw_results(hw_futures: list[Future]) -> list[VariantResult]:
     return results
 
 
-def stream_compile_and_run(pool: CompilationPool, cfg: _BenchmarkConfig) -> tuple[int, int, list[VariantResult]]:
-    """Stream compilation results into hardware benchmarks as they complete."""
+def stream_compile_and_run(
+    pool: CompilationPool,
+    cfg: _BenchmarkConfig,
+) -> tuple[int, int, list[VariantResult]]:
+    """Stream compilation results into local hardware benchmarks.
+
+    Args:
+        pool: Compilation pool with pending futures.
+        cfg: Benchmark configuration.
+    """
+    return _stream_compile_and_run_local(pool, cfg)
+
+
+def _stream_compile_and_run_local(
+    pool: CompilationPool, cfg: _BenchmarkConfig
+) -> tuple[int, int, list[VariantResult]]:
+    """Original local benchmark path: one variant per Neuron core."""
     compile_errors: list[VariantResult] = []
     hw_futures: list[Future] = []
     hw_executor = ProcessPoolExecutor(max_workers=128)
@@ -445,3 +479,5 @@ def stream_compile_and_run(pool: CompilationPool, cfg: _BenchmarkConfig) -> tupl
     hw_executor.shutdown(wait=False)
     logger.info("Hardware run complete: %d results", len(compile_errors) + len(hw_results))
     return core_id, failed, compile_errors + hw_results
+
+

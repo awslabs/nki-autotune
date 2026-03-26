@@ -9,7 +9,7 @@ import logging
 import random
 import shutil
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -96,25 +96,24 @@ class _SearchContext:
     save_cache: Path
     kernel_kwargs: dict[str, Any]
     expected: np.ndarray
-    pool: CompilationPool
+    pool: CompilationPool | None
     report: SearchReport
     workload: _Workload
+    verified_paths: list[str] = field(default_factory=list)
+    rendered_sources: dict[str, str] = field(default_factory=dict)
 
 
-def _save_variant(idx: int, schedule: Schedule, ctx: _SearchContext) -> tuple[str, str, str]:
-    """Write variant NKI source file to disk. Returns (nki_path, nki_source, error)."""
-    nki_dir = ctx.save_cache / "nki"
-    nki_dir.mkdir(parents=True, exist_ok=True)
-    nki_path = str(nki_dir / f"nki_v{idx}.py")
+def _render_variant(idx: int, schedule: Schedule, ctx: _SearchContext) -> tuple[str, str, str]:
+    """Render variant NKI source. Returns (nki_name, nki_source, error)."""
+    nki_name = f"nki_v{idx}.py"
     nki_source = ""
     error = ""
     try:
         w = ctx.workload
         nki_source = render_schedule(w.analysis, schedule, w.op_calls, w.params, w.func_name, w.pa)
-        Path(nki_path).write_text(nki_source)
     except Exception as e:
         error = _capture_error(e)
-    return (nki_path, nki_source, error)
+    return (nki_name, nki_source, error)
 
 
 def _failure_result(nki_path: str, error: str) -> VariantResult:
@@ -150,16 +149,26 @@ def _cpu_verify(nki_source: str, func_name: str, kernel_kwargs: dict[str, Any], 
     return error
 
 
-def _save_and_submit(idx: int, schedule: Schedule, ctx: _SearchContext, errors: list[VariantResult]) -> None:
-    """Save variant, verify correctness via CPU sim, and submit for compilation."""
-    nki_path, nki_source, error = _save_variant(idx, schedule, ctx)
-    ctx.report.add_variant(nki_path, depth=0, variant_idx=idx)
+def _save_and_submit_local(
+    idx: int, schedule: Schedule, ctx: _SearchContext, errors: list[VariantResult]
+) -> None:
+    """Render, write to Lustre, CPU-verify, and submit for local compilation."""
+    nki_name, nki_source, error = _render_variant(idx, schedule, ctx)
+    nki_dir = ctx.save_cache / "nki"
+    nki_dir.mkdir(parents=True, exist_ok=True)
+    nki_path = str(nki_dir / nki_name)
     if not error:
-        error = _cpu_verify(nki_source, ctx.workload.func_name, ctx.kernel_kwargs, ctx.expected)
+        Path(nki_path).write_text(nki_source)
+    ctx.report.add_variant(nki_path, depth=0, variant_idx=idx)
     if error:
         errors.append(_failure_result(nki_path, error))
         ctx.report.update_variant(nki_path, status="error", error=error)
-    elif ctx.pool is not None:
+        return
+    error = _cpu_verify(nki_source, ctx.workload.func_name, ctx.kernel_kwargs, ctx.expected)
+    if error:
+        errors.append(_failure_result(nki_path, error))
+        ctx.report.update_variant(nki_path, status="error", error=error)
+    else:
         ctx.report.update_variant(nki_path, status="compiled")
         ctx.pool.submit(nki_path)
 
@@ -180,21 +189,52 @@ def _select_schedules(all_schedules: list[Schedule], num_targets: int, seed: int
     return selected
 
 
-def _run_search(schedules: list[Schedule], ctx: _SearchContext) -> list[VariantResult]:
-    """Render, save, and submit all selected schedules.
+def _run_search_local(schedules: list[Schedule], ctx: _SearchContext) -> list[VariantResult]:
+    """Render, write, verify, and submit schedules for local compilation.
 
     Returns:
-        List of lowering errors (schedules that failed to render).
+        List of lowering errors (schedules that failed to render or verify).
     """
     lowering_errors: list[VariantResult] = []
     for idx, schedule in enumerate(schedules):
-        _save_and_submit(idx, schedule, ctx, lowering_errors)
+        _save_and_submit_local(idx, schedule, ctx, lowering_errors)
     ctx.report.update_search(
         unique_schedules=len(schedules),
         qualifying_schedules=len(schedules) - len(lowering_errors),
         total_visited=len(schedules),
     )
     return lowering_errors
+
+
+def _run_search_remote(schedules: list[Schedule], ctx: _SearchContext) -> list[VariantResult]:
+    """Render all schedules into memory for remote distribution.
+
+    NKI sources are kept in ``ctx.rendered_sources`` and embedded
+    directly into per-host manifest files on Lustre (one file per host),
+    avoiding per-source Lustre metadata overhead.
+
+    Returns:
+        List of render errors.
+    """
+    render_errors: list[VariantResult] = []
+    for idx, schedule in enumerate(schedules):
+        nki_name, nki_source, error = _render_variant(idx, schedule, ctx)
+        nki_path = f"nki/{nki_name}"
+        ctx.report.add_variant(nki_path, depth=0, variant_idx=idx)
+        if error:
+            render_errors.append(_failure_result(nki_path, error))
+            ctx.report.update_variant(nki_path, status="error", error=error)
+        else:
+            ctx.rendered_sources[nki_name] = nki_source
+            ctx.report.update_variant(nki_path, status="rendered")
+            ctx.verified_paths.append(nki_name)
+
+    ctx.report.update_search(
+        unique_schedules=len(schedules),
+        qualifying_schedules=len(schedules) - len(render_errors),
+        total_visited=len(schedules),
+    )
+    return render_errors
 
 
 def _make_pool(
@@ -214,9 +254,12 @@ def _make_pool(
 
 
 def _finalize_benchmark(
-    ctx: _SearchContext, func_name: str, mac_count: int, input_dtype_name: str
+    ctx: _SearchContext,
+    func_name: str,
+    mac_count: int,
+    input_dtype_name: str,
 ) -> list[VariantResult]:
-    """Stream compilations into hardware benchmarks."""
+    """Stream local compilations into hardware benchmarks."""
     cfg = _make_benchmark_cfg(
         func_name, ctx.kernel_kwargs, ctx.expected.shape, _WARMUP, _ITERS, mac_count, input_dtype_name
     )
@@ -227,12 +270,58 @@ def _finalize_benchmark(
     return variant_results
 
 
+def _finalize_distributed(
+    ctx: _SearchContext,
+    func_name: str,
+    mac_count: int,
+    input_dtype_name: str,
+    hosts: list[str],
+) -> list[VariantResult]:
+    """Distribute CPU verification, compilation, and benchmarking to remote hosts."""
+    from nkigym.search.remote import distribute
+
+    cfg = _make_benchmark_cfg(
+        func_name, ctx.kernel_kwargs, ctx.expected.shape, _WARMUP, _ITERS, mac_count, input_dtype_name
+    )
+    raw_results = distribute(ctx.verified_paths, cfg, hosts, ctx.save_cache, ctx.expected, ctx.rendered_sources)
+    variant_results = [
+        r._replace(nki_path=_normalize_nki_path(r.nki_path)) for r in raw_results
+    ]
+
+    """
+    Write NKI sources to Lustre for archival after benchmarks complete
+    (non-blocking — results are already collected).  Uses a single JSON
+    bundle to minimize Lustre metadata operations.
+    """
+    import json as _json
+
+    bundle_path = ctx.save_cache / "sources.json"
+    bundle_path.write_text(_json.dumps(ctx.rendered_sources))
+
+    succeeded = sum(1 for r in variant_results if not r.error)
+    failed = len(variant_results) - succeeded
+    ctx.report.set_compilation(succeeded=succeeded, failed=failed)
+    _update_report_variants(ctx.report, variant_results)
+    ctx.report.sort_variants()
+    return variant_results
+
+
+def _normalize_nki_path(nki_path: str) -> str:
+    """Normalize an nki_path to the report key format ``nki/<name>.py``.
+
+    Workers produce local paths like ``/tmp/.../nki/nki_v0.py``; the
+    report indexes by ``nki/nki_v0.py``.
+    """
+    basename = Path(nki_path).name
+    return f"nki/{basename}"
+
+
 def _update_report_variants(report: SearchReport, results: list[VariantResult]) -> None:
     """Update variant entries in the report from benchmark results."""
     for r in results:
         status = "benchmarked" if not r.error else "error"
         report.update_variant(
-            r.nki_path,
+            _normalize_nki_path(r.nki_path),
             status=status,
             min_ms=r.min_ms,
             mean_ms=r.mean_ms,
@@ -256,7 +345,12 @@ def _enumerate_and_select(
 
 
 def search(
-    func: Callable, num_targets: int, seed: int, save_cache: Path, kernel_kwargs: dict[str, Any]
+    func: Callable,
+    num_targets: int,
+    seed: int,
+    save_cache: Path,
+    kernel_kwargs: dict[str, Any],
+    hosts: list[str] | None = None,
 ) -> SearchResults:
     """Search the combinatorial schedule space for kernel variants.
 
@@ -264,16 +358,23 @@ def search(
     selects up to ``num_targets`` for benchmarking, renders each to NKI source,
     compiles, and benchmarks on hardware.
 
+    Neuron core count is auto-detected on each worker host when using
+    distributed mode (hosts is not None).
+
     Args:
         func: User function using ``nkigym.<op>(...)`` calls.
         num_targets: Maximum number of schedules to benchmark.
         seed: Random seed for selection (0 for system entropy).
         save_cache: Directory for output artifacts.
         kernel_kwargs: Input arrays keyed by parameter name.
+        hosts: SSH hostnames for distributed benchmarking, or ``None`` for local.
 
     Returns:
         Combined search and benchmark results.
     """
+    import time
+
+    t0 = time.monotonic()
     shutil.rmtree(save_cache, ignore_errors=True)
     save_cache.mkdir(parents=True)
     report = SearchReport(save_cache / "results.json")
@@ -283,8 +384,10 @@ def search(
     mac_count = _compute_mac_count(workload.analysis)
     input_dtype_name = next(iter(kernel_kwargs.values())).dtype.name
     selected = _enumerate_and_select(workload, kernel_kwargs, num_targets, seed)
+    logger.info("Enumeration: %.1fs", time.monotonic() - t0)
 
-    pool = _make_pool(workload.func_name, kernel_kwargs, expected, save_cache)
+    t1 = time.monotonic()
+    pool = None if hosts else _make_pool(workload.func_name, kernel_kwargs, expected, save_cache)
     ctx = _SearchContext(
         save_cache=save_cache,
         kernel_kwargs=kernel_kwargs,
@@ -293,8 +396,22 @@ def search(
         report=report,
         workload=workload,
     )
-    lowering_errors = _run_search(selected, ctx)
-    variant_results = _finalize_benchmark(ctx, workload.func_name, mac_count, input_dtype_name)
+    if hosts:
+        lowering_errors = _run_search_remote(selected, ctx)
+    else:
+        lowering_errors = _run_search_local(selected, ctx)
+    report.flush()
+    logger.info("Rendering: %.1fs (%d verified, %d errors)", time.monotonic() - t1, len(ctx.verified_paths), len(lowering_errors))
+
+    if hosts:
+        variant_results = _finalize_distributed(
+            ctx, workload.func_name, mac_count, input_dtype_name, hosts
+        )
+    else:
+        variant_results = _finalize_benchmark(
+            ctx, workload.func_name, mac_count, input_dtype_name
+        )
+
     all_results = lowering_errors + variant_results
     succeeded = sum(1 for r in all_results if not r.error)
     failed = len(all_results) - succeeded

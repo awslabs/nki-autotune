@@ -19,6 +19,10 @@ _EMPTY_REPORT: dict[str, Any] = {
 class SearchReport:
     """Manages a live JSON report file for search and benchmark progress.
 
+    Writes to disk are deferred during batch operations and flushed
+    explicitly via :meth:`flush`, or automatically on :meth:`sort_variants`
+    and :meth:`set_compilation`.
+
     Attributes:
         path: Path to the JSON report file.
     """
@@ -32,6 +36,7 @@ class SearchReport:
         self.path = path
         self._data: dict[str, Any] = copy.deepcopy(_EMPTY_REPORT)
         self._variant_index: dict[str, int] = {}
+        self._dirty = False
         self._write()
 
     def update_search(self, unique_schedules: int, qualifying_schedules: int, total_visited: int) -> None:
@@ -47,7 +52,7 @@ class SearchReport:
             "qualifying_schedules": qualifying_schedules,
             "total_visited": total_visited,
         }
-        self._write()
+        self._dirty = True
 
     def add_variant(self, nki_path: str, depth: int, variant_idx: int) -> None:
         """Append a new pending variant entry.
@@ -73,7 +78,7 @@ class SearchReport:
         }
         self._variant_index[nki_path] = len(self._data["variants"])
         self._data["variants"].append(entry)
-        self._write()
+        self._dirty = True
 
     def update_variant(self, nki_path: str, **fields: Any) -> None:
         """Update fields on an existing variant entry.
@@ -85,10 +90,10 @@ class SearchReport:
         idx = self._variant_index.get(nki_path)
         if idx is not None:
             self._data["variants"][idx].update(fields)
-            self._write()
+            self._dirty = True
 
     def set_compilation(self, succeeded: int, failed: int) -> None:
-        """Update the compilation section.
+        """Update the compilation section and flush to disk.
 
         Args:
             succeeded: Number of successfully compiled variants.
@@ -104,11 +109,17 @@ class SearchReport:
         self._variant_index = {v["nki_path"]: i for i, v in enumerate(variants)}
         self._write()
 
+    def flush(self) -> None:
+        """Write pending changes to disk if dirty."""
+        if self._dirty:
+            self._write()
+
     def _write(self) -> None:
         """Atomically write the report to disk."""
         tmp_path = self.path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(self._data, indent=2) + "\n")
         tmp_path.rename(self.path)
+        self._dirty = False
 
 
 def _variant_sort_key(v: dict[str, Any]) -> tuple[int, float]:

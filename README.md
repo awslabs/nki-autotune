@@ -13,7 +13,7 @@ cd nki-autotune
 pip install -e autotune -e nkigym
 ```
 
-4. (Optional) Install development tools:
+4. Install development tools:
 
 ```bash
 pip install pre-commit

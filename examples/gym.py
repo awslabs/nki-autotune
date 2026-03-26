@@ -30,25 +30,43 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return c
 
 
+_DEFAULT_HOSTS = ["gym-1", "gym-2", "gym-3", "gym-4", "gym-5"]
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="NKI Gym search example")
     parser.add_argument("--cache-dir", type=Path, required=True, help="Directory for storing output artifacts")
+    parser.add_argument(
+        "--hosts",
+        nargs="+",
+        default=_DEFAULT_HOSTS,
+        help="SSH hostnames for distributed benchmarking (default: gym-1..gym-5)",
+    )
+    parser.add_argument("--local", action="store_true", help="Run benchmarks locally instead of via SSH")
     return parser.parse_args()
 
 
 def main() -> None:
-    """Run schedule search on a 1024x1024 matmul workload."""
+    """Run schedule search on a 2048x2048 matmul workload."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     args = parse_args()
     cache_dir = args.cache_dir
 
     rng = np.random.default_rng(42)
-    a = rng.standard_normal((1024, 1024)).astype(np.float16)
-    b = rng.standard_normal((1024, 1024)).astype(np.float16)
+    a = rng.standard_normal((2048, 2048)).astype(np.float16)
+    b = rng.standard_normal((2048, 2048)).astype(np.float16)
 
-    search(func=matmul, num_targets=99999, seed=42, save_cache=cache_dir, kernel_kwargs={"a": a, "b": b})
+    hosts = None if args.local else args.hosts
+    search(
+        func=matmul,
+        num_targets=99999,
+        seed=42,
+        save_cache=cache_dir,
+        kernel_kwargs={"a": a, "b": b},
+        hosts=hosts,
+    )
 
 
 if __name__ == "__main__":
