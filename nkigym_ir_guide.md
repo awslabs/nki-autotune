@@ -294,6 +294,92 @@ The result is the **reference output** — a float64 array that any correctly re
 
 ---
 
+## 4. Dimension Analysis
+
+To tile and schedule a math function for hardware, we need to know what dimensions exist, how they relate across ops, and which are parallel vs reduction. This is derived mechanically from `NKIOp.OPERAND_AXES` and `OUTPUT_AXES`.
+
+### 4.1 Dimension Assignment and Unification
+
+Each input parameter gets fresh dimension IDs. Walking the op calls in order, we match each input variable's dimensions to the op's `OPERAND_AXES` labels. When two operands share an axis label, their corresponding dimension IDs are **unified** (merged into one). When a shared axis label maps to dimension IDs that are already assigned and equal, we **assert** consistency — no merge is needed, but we verify the math function is well-formed. If they are already assigned to *different* dimensions, that is a **dimension conflict error**.
+
+Three outcomes when operands share an axis label:
+1. **Unify**: one or both dimensions are fresh → merge into one ID
+2. **Assert**: both already assigned to the same ID → consistent, no action
+3. **Error**: both already assigned to different IDs → math function is malformed
+
+For the running example:
+
+**Initial assignment:**
+- `Q → (d0, d1)` — (seq_q, d_k)
+- `K → (d2, d3)` — (seq_k, d_k)
+- `V → (d4, d5)` — (seq_k, d_v)
+
+**Unification walk:**
+
+| # | Math function call | Dimension assignment |
+|---|---|---|
+| 0 | `Q_t = nkigym.transpose(Q)` | Q(d0,d1) → Q_t(d1,d0) |
+| 1 | `K_t = nkigym.transpose(K)` | K(d2,d3) → K_t(d3,d2) |
+| 2 | `S = nkigym.nc_matmul(Q_t, K_t)` | stationary Q_t(d1,d0): K=d1, M=d0; moving K_t(d3,d2): K=d3, N=d2; shared K → **unify** d3→d1; S(d0,d2) |
+| 3 | `scaled_S = nkigym.tensor_scalar(S, op0="multiply", operand0=scale)` | scaled_S(d0,d2) |
+| 4 | `masked_S = nkigym.affine_select(scaled_S, ...)` | masked_S(d0,d2) |
+| 5 | `max_S = nkigym.tensor_reduce(masked_S, op="max")` | max_S(d0) |
+| 6 | `shifted_S = nkigym.tensor_scalar(masked_S, max_S, op0="subtract")` | P axis: d0 from data, d0 from operand0 → **assert** d0=d0 ✓; shifted_S(d0,d2) |
+| 7 | `exp_S = nkigym.activation(shifted_S, op="exp")` | exp_S(d0,d2) |
+| 8 | `sum_exp = nkigym.tensor_reduce(exp_S, op="add")` | sum_exp(d0) |
+| 9 | `inv_sum = nkigym.activation(sum_exp, op="reciprocal")` | inv_sum(d0) |
+| 10 | `exp_S_t = nkigym.transpose(exp_S)` | exp_S_t(d2,d0) |
+| 11 | `attn = nkigym.nc_matmul(exp_S_t, V)` | stationary exp_S_t(d2,d0): K=d2, M=d0; moving V(d4,d5): K=d4, N=d5; shared K → **unify** d4→d2; attn(d0,d5) |
+| 12 | `output = nkigym.tensor_scalar(attn, inv_sum, op0="multiply")` | P axis: d0 from data, d0 from operand0 → **assert** d0=d0 ✓; output(d0,d5) |
+
+After the walk, 4 unique dimensions remain: **d0, d1, d2, d5**.
+
+### 4.2 Parallel vs Reduction
+
+An axis label present in `OPERAND_AXES` but absent from `OUTPUT_AXES` is consumed by the op — it's a **reduction axis**. For example, `NKIMatmul` has K in both operands but not in the output; `NKITensorReduce` has F in the input but not the output.
+
+```python
+def has_reduction(op: NKIOp) -> bool:
+    input_labels = {l for axes in op.OPERAND_AXES.values() for l in axes}
+    output_labels = {l for axes in op.OUTPUT_AXES.values() for l in axes}
+    return bool(input_labels - output_labels)
+```
+
+A dimension's **global classification** depends on whether it appears in the final output:
+
+- **Parallel**: dimension is in the return variable's axes → independent tiles, can execute in any order
+- **Reduction**: dimension is not in the return variable → must be accumulated across tiles
+
+```python
+def classify_dims(dims, return_var_axes):
+    return {d: "parallel" if d in return_var_axes else "reduction" for d in dims}
+```
+
+For the running example, `output` has axes `(d0, d5)`:
+
+| Dim | Type | Why |
+|---|---|---|
+| d0 | parallel | in output(d0, d5) |
+| d1 | reduction | consumed by matmul K axis |
+| d2 | reduction | consumed by matmul K axis and tensor_reduce F axis |
+| d5 | parallel | in output(d0, d5) |
+
+### 4.3 Tile Sizes
+
+Each dimension's tile size is always the maximum across all `MAX_TILE_SIZES` entries from ops that use it:
+
+1. Collect all `MAX_TILE_SIZES` entries for a dimension across all ops where it appears.
+2. `tile_size = max(all limits for this dim)`.
+
+When an op's limit for a dimension is smaller than the tile size, the renderer emits an in-place loop that packs multiple op invocations to cover the full tile. For example, d2 has tile_size 512 (from nc_matmul N:512), but transpose has F:128 — so the renderer emits 4 transpose calls per tile to cover 512 elements.
+
+| Dim | Limits collected from ops | tile_size |
+|---|---|---|
+| d0 | P:128 (transpose, tensor_scalar, affine_select, tensor_reduce, activation), M:128 (nc_matmul), F:128 (transpose) | 128 |
+| d1 | F:128 (transpose Q, transpose K), K:128 (nc_matmul) | 128 |
+| d2 | P:128 (transpose K), N:512 (nc_matmul₁), F:128 (transpose exp_S), K:128 (nc_matmul₂) | 512 |
+| d5 | N:512 (nc_matmul₂) | 512 |
+
 <!-- ---
 
 ## 2. Parsed Ops + Analysis
