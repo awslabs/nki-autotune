@@ -69,9 +69,10 @@ class NKIOp:
     ENGINE: str
 
     @abstract
-    def simulate(self, **kwargs):
+    def __call__(self, **kwargs):
         """
-        CPU simulation using Numpy in default float64
+        CPU simulation using Numpy in default float64.
+        Takes input arrays + config, returns output array(s).
         """
 
     @abstract
@@ -95,10 +96,9 @@ class RenderContext:
 ### 2.1 NKI Operator Subclasses
 ```python
 class NKIMatmul(NKIOp):
-    """dst += stationary.T @ moving (Tensor Engine)
+    """stationary.T @ moving (Tensor Engine)
 
     stationary(K, M).T @ moving(K, N) → output(M, N).
-    Accumulates into PSUM across K tiles.
     """
 
     NAME = "nc_matmul"
@@ -107,8 +107,8 @@ class NKIMatmul(NKIOp):
     MAX_TILE_SIZES = {"K": 128, "M": 128, "N": 512}
     ENGINE = "TensorEngine"
 
-    def simulate(self, dst, stationary, moving):
-        dst[:] += stationary.T @ moving
+    def __call__(self, stationary, moving):
+        return stationary.T @ moving
 
     def render(self, ctx):
         dst = ctx.outputs["output"]
@@ -132,8 +132,8 @@ class NKITranspose(NKIOp):
     MAX_TILE_SIZES = {"P": 128, "F": 128}
     ENGINE = "TensorEngine"
 
-    def simulate(self, dst, data):
-        dst[:] = data.reshape(data.shape[0], -1).T
+    def __call__(self, data):
+        return data.T
 
     def render(self, ctx):
         dst = ctx.outputs["output"]
@@ -157,11 +157,11 @@ class NKITensorScalar(NKIOp):
     MAX_TILE_SIZES = {"P": 128}
     ENGINE = "VectorEngine"
 
-    def simulate(self, dst, data, operand0, op0):
+    def __call__(self, data, operand0, op0):
         ops = {"multiply": np.multiply, "subtract": np.subtract, "add": np.add}
         if isinstance(operand0, np.ndarray):
             operand0 = operand0[..., np.newaxis]
-        dst[:] = ops[op0](data, operand0)
+        return ops[op0](data, operand0)
 
     def render(self, ctx):
         dst = ctx.outputs["output"]
@@ -192,15 +192,16 @@ class NKIAffineSelect(NKIOp):
     MAX_TILE_SIZES = {"P": 128}
     ENGINE = "GpSimd"
 
-    def simulate(self, dst, data, cmp_op, on_false_value,
-                 channel_multiplier, step, p_start, f_start):
-        p_idx = np.arange(dst.shape[0])[:, np.newaxis] + p_start
-        f_idx = np.arange(dst.shape[-1])[np.newaxis, :] + f_start
+    def __call__(self, data, cmp_op, on_false_value,
+                 channel_multiplier, step):
+        P, F = data.shape
+        p_idx = np.arange(P)[:, np.newaxis]
+        f_idx = np.arange(F)[np.newaxis, :]
         cmps = {"greater_equal": np.greater_equal}
         mask = cmps[cmp_op](
             p_idx * channel_multiplier + f_idx * step, 0
         )
-        dst[:] = np.where(mask, data, on_false_value)
+        return np.where(mask, data, on_false_value)
 
     def render(self, ctx):
         dst = ctx.outputs["output"]
@@ -236,9 +237,9 @@ class NKITensorReduce(NKIOp):
     MAX_TILE_SIZES = {"P": 128}
     ENGINE = "VectorEngine"
 
-    def simulate(self, dst, data, op):
+    def __call__(self, data, op):
         reduce = {"max": np.max, "add": np.sum}
-        dst[:] = reduce[op](data.reshape(data.shape[0], -1), axis=1)
+        return reduce[op](data, axis=1)
 
     def render(self, ctx):
         dst = ctx.outputs["output"]
@@ -263,13 +264,13 @@ class NKIActivation(NKIOp):
     MAX_TILE_SIZES = {"P": 128}
     ENGINE = "ScalarEngine"
 
-    def simulate(self, dst, data, op):
+    def __call__(self, data, op):
         fns = {
             "exp": np.exp, "tanh": np.tanh, "square": np.square,
             "reciprocal": lambda x: 1.0 / x,
             "rsqrt": lambda x: 1.0 / np.sqrt(x),
         }
-        dst[:] = fns[op](data)
+        return fns[op](data)
 
     def render(self, ctx):
         dst = ctx.outputs["output"]
@@ -277,6 +278,21 @@ class NKIActivation(NKIOp):
         op_name = ctx.config_kwargs["op"]
         return f"nisa.activation(dst={dst.NAME}, data={data.NAME}, op=nl.{op_name})"
 ```
+
+## 3. Simulation
+
+The math function is plain Python — each `nkigym.*` call dispatches to `NKIOp.__call__()` which executes the op with numpy at float64 precision. No parsing or IR needed; just call the function directly:
+
+```python
+q = np.random.randn(512, 128)
+k = np.random.randn(512, 128)
+v = np.random.randn(512, 1024)
+output = attention(q, k, v, scale=1.0 / np.sqrt(128))
+```
+
+The result is the **reference output** — a float64 array that any correctly rendered and compiled NKI kernel must match (within hardware precision tolerance).
+
+---
 
 <!-- ---
 
