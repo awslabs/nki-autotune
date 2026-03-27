@@ -184,7 +184,7 @@ def _compile_nki_kernel(
     """
     from neuronxcc.nki_standalone import NKI_IR_VERSION, compile_nki_ir_kernel_to_neff
 
-    tempfile.tempdir = "/tmp/nki_artifacts"
+    tempfile.tempdir = output_dir
     os.makedirs(tempfile.tempdir, exist_ok=True)
     kernel = _load_kernel(nki_path, func_name)
     stubs = [TensorStub(shape=output_shape, dtype=output_dtype, name=output_name)]
@@ -396,10 +396,10 @@ def _run_core_worker(core_id: int, nki_neff_pairs: list[tuple[str, str]], cfg: _
     return results
 
 
-def _compile_failure_result(cr: CompileResult, mac_count: int) -> VariantResult:
-    """Convert a failed CompileResult into a VariantResult preserving the error."""
+def _make_failure(nki_path: str, error: str, mac_count: int = 0) -> VariantResult:
+    """Create a failed VariantResult for any stage of the pipeline."""
     return VariantResult(
-        nki_path=cr.nki_path,
+        nki_path=nki_path,
         min_ms=0.0,
         mean_ms=0.0,
         p50_ms=0.0,
@@ -407,8 +407,13 @@ def _compile_failure_result(cr: CompileResult, mac_count: int) -> VariantResult:
         mac_count=mac_count,
         mfu=0.0,
         correct=False,
-        error=cr.error,
+        error=error,
     )
+
+
+def _compile_failure_result(cr: CompileResult, mac_count: int) -> VariantResult:
+    """Convert a failed CompileResult into a VariantResult preserving the error."""
+    return _make_failure(cr.nki_path, cr.error, mac_count)
 
 
 def _make_benchmark_cfg(
@@ -442,10 +447,7 @@ def _collect_hw_results(hw_futures: list[Future]) -> list[VariantResult]:
     return results
 
 
-def stream_compile_and_run(
-    pool: CompilationPool,
-    cfg: _BenchmarkConfig,
-) -> tuple[int, int, list[VariantResult]]:
+def stream_compile_and_run(pool: CompilationPool, cfg: _BenchmarkConfig) -> tuple[int, int, list[VariantResult]]:
     """Stream compilation results into local hardware benchmarks.
 
     Args:
@@ -455,29 +457,54 @@ def stream_compile_and_run(
     return _stream_compile_and_run_local(pool, cfg)
 
 
-def _stream_compile_and_run_local(
-    pool: CompilationPool, cfg: _BenchmarkConfig
-) -> tuple[int, int, list[VariantResult]]:
-    """Original local benchmark path: one variant per Neuron core."""
+def _detect_neuron_cores() -> int:
+    """Detect available Neuron cores via neuron-ls."""
+    import json as _json
+    import subprocess as _subprocess
+
+    result = _subprocess.run(["neuron-ls", "--json-output"], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        raise RuntimeError(f"neuron-ls failed: {result.stderr[:500]}")
+    devices = _json.loads(result.stdout)
+    total_cores = sum(d["nc_count"] for d in devices)
+    if total_cores == 0:
+        raise RuntimeError("neuron-ls reports 0 Neuron cores")
+    return total_cores
+
+
+def _stream_compile_and_run_local(pool: CompilationPool, cfg: _BenchmarkConfig) -> tuple[int, int, list[VariantResult]]:
+    """Compile all variants, then batch-benchmark across Neuron cores."""
     compile_errors: list[VariantResult] = []
-    hw_futures: list[Future] = []
-    hw_executor = ProcessPoolExecutor(max_workers=128)
-    core_id = 0
+    nki_neff_pairs: list[tuple[str, str]] = []
     for future in as_completed(pool._futures):
         cr = future.result()
         if cr.error:
             compile_errors.append(_compile_failure_result(cr, cfg.mac_count))
         else:
-            pair = [(cr.nki_path, cr.neff_path)]
-            hw_futures.append(hw_executor.submit(_run_core_worker, core_id, pair, cfg))
-            core_id += 1
+            nki_neff_pairs.append((cr.nki_path, cr.neff_path))
     pool.shutdown()
-    failed = len(pool._futures) - core_id
-    logger.info("Compilation: %d succeeded, %d failed", core_id, failed)
-    logger.info("Running %d variants on %d Neuron cores", core_id, core_id)
-    hw_results = _collect_hw_results(hw_futures)
-    hw_executor.shutdown(wait=False)
+
+    succeeded = len(nki_neff_pairs)
+    failed = len(pool._futures) - succeeded
+    logger.info("Compilation: %d succeeded, %d failed", succeeded, failed)
+
+    neuron_cores = _detect_neuron_cores()
+    num_hw_workers = min(neuron_cores, len(nki_neff_pairs))
+    logger.info("Running %d variants on %d Neuron cores", succeeded, num_hw_workers)
+
+    hw_results: list[VariantResult] = []
+    if nki_neff_pairs:
+        core_batches: list[list[tuple[str, str]]] = [[] for _ in range(num_hw_workers)]
+        for i, pair in enumerate(nki_neff_pairs):
+            core_batches[i % num_hw_workers].append(pair)
+
+        hw_executor = ProcessPoolExecutor(max_workers=num_hw_workers)
+        hw_futures: list[Future] = []
+        for core_id, batch in enumerate(core_batches):
+            if batch:
+                hw_futures.append(hw_executor.submit(_run_core_worker, core_id, batch, cfg))
+        hw_results = _collect_hw_results(hw_futures)
+        hw_executor.shutdown(wait=True)
+
     logger.info("Hardware run complete: %d results", len(compile_errors) + len(hw_results))
-    return core_id, failed, compile_errors + hw_results
-
-
+    return succeeded, failed, compile_errors + hw_results

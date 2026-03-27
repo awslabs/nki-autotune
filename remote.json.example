@@ -1,0 +1,6 @@
+{
+  "venv_python": "/home/ubuntu/venvs/kernel-env/bin/python",
+  "hosts": ["worker-1", "worker-2"],
+  "ssh_timeout_sec": 3600,
+  "neuron_platform_target": "trn2"
+}
