@@ -7,16 +7,7 @@ geometry: margin=1in
 
 # NKIGym Guide
 
-**NKIGym** takes a user function written with `nkigym.*` ops and explores execution strategies on Trainium hardware. Four IR levels:
-
-| Level | Representation | Section |
-|---|---|---|
-| 1. Math Function | User-written `nkigym.*` ops | §1 |
-| 2. Parsed Ops + Analysis | Op calls, dimension unification, pass assignment | §2 |
-| 3. Schedule | Loop order, blocking, placements | §3 |
-| 4. NKI Kernel | Rendered NKI source code | §4 |
-
-**Running example**: naive single-head attention `softmax(Q @ K^T) @ V`. Inputs use standard ML layout `(seq, hidden)`:
+**Running example**: causal single-head attention `softmax(mask(scale * Q @ K^T)) @ V`. Inputs use standard ML layout `(seq, hidden)`:
 
 - `q: float16[512, 128]` — `(seq_q, d_k)`
 - `k: float16[512, 128]` — `(seq_k, d_k)`
@@ -26,70 +17,282 @@ geometry: margin=1in
 ---
 
 ## 1. Math Function
-
+The top-level IR math function only defines the math computations. There are no load/store operators or hardware tiling, and it ignores the memory hierarchy.
 ```python
-def attention(q, k, v):
-    q_t = nkigym.transpose(q)
-    k_t = nkigym.transpose(k)
-    scores = nkigym.nc_matmul(q_t, k_t)
-    max_s = nkigym.tensor_reduce(scores, op=np.max)
-    shifted = nkigym.tensor_scalar(scores, max_s, op0=np.subtract)
-    exp_s = nkigym.activation(shifted, op=np.exp)
-    sum_exp = nkigym.tensor_reduce(exp_s, op=np.add)
+def attention(Q, K, V, scale):
+    Q_t = nkigym.transpose(Q)
+    K_t = nkigym.transpose(K)
+    S = nkigym.nc_matmul(Q_t, K_t)
+    scaled_S = nkigym.tensor_scalar(S, op0="multiply", operand0=scale)
+    masked_S = nkigym.affine_select(scaled_S, cmp_op="greater_equal",
+                                     on_false_value=-np.inf,
+                                     channel_multiplier=1, step=-1)
+    max_S = nkigym.tensor_reduce(masked_S, op="max")
+    shifted_S = nkigym.tensor_scalar(masked_S, max_S, op0="subtract")
+    exp_S = nkigym.activation(shifted_S, op="exp")
+    sum_exp = nkigym.tensor_reduce(exp_S, op="add")
     inv_sum = nkigym.activation(sum_exp, op="reciprocal")
-    attn = nkigym.tensor_scalar(exp_s, inv_sum, op0=np.multiply)
-    attn_t = nkigym.transpose(attn)
-    output = nkigym.nc_matmul(attn_t, v)
+    exp_S_t = nkigym.transpose(exp_S)
+    attn = nkigym.nc_matmul(exp_S_t, V)
+    output = nkigym.tensor_scalar(attn, inv_sum, op0="multiply")
     return output
 ```
 
-Ops use return-value style. Every `nkigym.*` op mirrors a real `nisa.*` or `nl.*` ISA operation — no ops are invented.
+## 2. NKI Gym Operators
 
-**`nc_matmul(stationary, moving)`** computes `stationary^T @ moving`. Both inputs have K (contraction) at dim 0.
+Every `nkigym.*` op mirrors a real `nisa.*` or `nl.*` ISA operation — no ops are invented.
 
-- `nc_matmul(q_t, k_t)`: q_t`(d_k, seq_q)`.T @ k_t`(d_k, seq_k)` = scores`(seq_q, seq_k)`. This is Q @ K^T.
-- `nc_matmul(attn_t, v)`: attn_t`(seq_k, seq_q)`.T @ v`(seq_k, d_v)` = output`(seq_q, d_v)`. This is attn @ V.
+```python
+class Tensor:
+    """
+    Represents a N-dimensional NKI tensor in the shape of:
+    [TILE_SIZES[AXES[0]], NUM_TILES[AXES[0]]
+        NUM_TILES[AXES[1]], ..., NUM_TILES[AXES[N-1]],
+        TILE_SIZES[AXES[1]], ..., TILE_SIZES[AXES[N-1]]
+    ]
+    """
+    NAME: str
+    AXES: tuple[str, ...]
+    TILE_SIZES: dict[str, int]
+    NUM_TILES: dict[str, int]
+    LOCATION: str # SBUF, PSUM
 
-**`transpose(q)`** and **`transpose(k)`** put the contraction dim `d_k` at position 0 for the first matmul. **`transpose(attn)`** swaps `(seq_q, seq_k)` → `(seq_k, seq_q)` for the second matmul. All three are real hardware operations (`nisa.nc_transpose`), not free views.
+class NKIOp:
+    """
+    Represents a NKI operator semantics
+    Suuports multi outputs
+    """
+    NAME: str
+    OPERAND_AXES: dict[str, tuple[str, ...]]
+    OUTPUT_AXES: dict[str, tuple[str, str, ...]]
+    MAX_TILE_SIZES: dict[str, int]
+    ENGINE: str
 
-**Softmax normalization** uses multiply-by-reciprocal (NKI ISA has no divide): `nisa.activation(op=nl.reciprocal)` computes `1/x`, then `tensor_scalar` multiplies `exp_s * (1/sum_exp)`.
+    @abstract
+    def simulate(self, **kwargs):
+        """
+        CPU simulation using Numpy in default float64
+        """
 
----
+    @abstract
+    def render(self, ctx: "RenderContext"):
+        """
+        Render into NKI kernel source codes
+        """
+
+class RenderContext:
+    """
+    Everything an NKIOp.render() needs to emit NKI source.
+    Built by the renderer for each op call site.
+    """
+    outputs: dict[str, Tensor]
+    operands: dict[str, Tensor]
+    config_kwargs: dict[str, Any]
+    tile_idx: dict[str, str]  # dim_id → loop var expr (e.g. "i_0")
+    tile_start: dict[str, str]  # dim_id → element offset expr (e.g. "i_0 * 128")
+```
+
+### 2.1 NKI Operator Subclasses
+```python
+class NKIMatmul(NKIOp):
+    """dst += stationary.T @ moving (Tensor Engine)
+
+    stationary(K, M).T @ moving(K, N) → output(M, N).
+    Accumulates into PSUM across K tiles.
+    """
+
+    NAME = "nc_matmul"
+    OPERAND_AXES = {"stationary": ("K", "M"), "moving": ("K", "N")}
+    OUTPUT_AXES = {"output": ("M", "N")}
+    MAX_TILE_SIZES = {"K": 128, "M": 128, "N": 512}
+    ENGINE = "TensorEngine"
+
+    def simulate(self, dst, stationary, moving):
+        dst[:] += stationary.T @ moving
+
+    def render(self, ctx):
+        dst = ctx.outputs["output"]
+        stat = ctx.operands["stationary"]
+        mov = ctx.operands["moving"]
+        return f"nisa.nc_matmul(dst={dst.NAME}, stationary={stat.NAME}, moving={mov.NAME})"
+
+
+class NKITranspose(NKIOp):
+    """Swap partition and free dims (Tensor Engine or Vector Engine)
+
+    data(P, F) → output(F, P).
+    Tensor Engine path: SBUF→PSUM, both dims ≤ 128.
+    Vector Engine path: SBUF/PSUM→SBUF/PSUM, both dims ≤ 32.
+    Real hardware op, not a free view.
+    """
+
+    NAME = "nc_transpose"
+    OPERAND_AXES = {"data": ("P", "F")}
+    OUTPUT_AXES = {"output": ("F", "P")}
+    MAX_TILE_SIZES = {"P": 128, "F": 128}
+    ENGINE = "TensorEngine"
+
+    def simulate(self, dst, data):
+        dst[:] = data.reshape(data.shape[0], -1).T
+
+    def render(self, ctx):
+        dst = ctx.outputs["output"]
+        src = ctx.operands["data"]
+        return f"nisa.nc_transpose(dst={dst.NAME}, data={src.NAME})"
+
+
+class NKITensorScalar(NKIOp):
+    """Element-wise binary op with broadcast (Vector/Scalar/GpSimd)
+
+    data(P, F) <op0> operand0 → output(P, F).
+    operand0 can be a scalar constant or a (P,) column vector;
+    it broadcasts across the free axis.
+    ISA supports compound (data <op0> operand0) <op1> operand1;
+    nkigym decomposes compound ops into separate calls.
+    """
+
+    NAME = "tensor_scalar"
+    OPERAND_AXES = {"data": ("P", "F"), "operand0": ("P",)}
+    OUTPUT_AXES = {"output": ("P", "F")}
+    MAX_TILE_SIZES = {"P": 128}
+    ENGINE = "VectorEngine"
+
+    def simulate(self, dst, data, operand0, op0):
+        ops = {"multiply": np.multiply, "subtract": np.subtract, "add": np.add}
+        if isinstance(operand0, np.ndarray):
+            operand0 = operand0[..., np.newaxis]
+        dst[:] = ops[op0](data, operand0)
+
+    def render(self, ctx):
+        dst = ctx.outputs["output"]
+        data = ctx.operands["data"]
+        op_name = ctx.config_kwargs["op0"]
+        op0 = ctx.operands.get("operand0")
+        if op0 is not None:
+            op0_expr = op0.NAME
+        else:
+            op0_expr = ctx.config_kwargs["operand0"]
+        return (
+            f"nisa.tensor_scalar(dst={dst.NAME}, data={data.NAME}, "
+            f"operand0={op0_expr}, op0=nl.{op_name})"
+        )
+
+
+class NKIAffineSelect(NKIOp):
+    """Position-predicated element select (GpSimd Engine)
+
+    Generates affine_value = offset + p*channel_multiplier + f*step
+    per element, compares to 0. Selects data or on_false_value.
+    Renderer computes offset from tile_start at render time.
+    """
+
+    NAME = "affine_select"
+    OPERAND_AXES = {"data": ("P", "F")}
+    OUTPUT_AXES = {"output": ("P", "F")}
+    MAX_TILE_SIZES = {"P": 128}
+    ENGINE = "GpSimd"
+
+    def simulate(self, dst, data, cmp_op, on_false_value,
+                 channel_multiplier, step, p_start, f_start):
+        p_idx = np.arange(dst.shape[0])[:, np.newaxis] + p_start
+        f_idx = np.arange(dst.shape[-1])[np.newaxis, :] + f_start
+        cmps = {"greater_equal": np.greater_equal}
+        mask = cmps[cmp_op](
+            p_idx * channel_multiplier + f_idx * step, 0
+        )
+        dst[:] = np.where(mask, data, on_false_value)
+
+    def render(self, ctx):
+        dst = ctx.outputs["output"]
+        data = ctx.operands["data"]
+        kw = ctx.config_kwargs
+        p_dim, f_dim = data.AXES[0], data.AXES[1]
+        offset = (
+            f"{ctx.tile_start[p_dim]} * {kw['channel_multiplier']}"
+            f" + {ctx.tile_start[f_dim]} * {kw['step']}"
+        )
+        return (
+            f"nisa.affine_select(dst={dst.NAME}, "
+            f"pattern=[[{kw['step']}, {data.TILE_SIZES[f_dim]}]], "
+            f"offset={offset}, "
+            f"channel_multiplier={kw['channel_multiplier']}, "
+            f"cmp_op=nl.{kw['cmp_op']}, "
+            f"on_true_tile={data.NAME}, "
+            f"on_false_value={kw['on_false_value']})"
+        )
+
+
+class NKITensorReduce(NKIOp):
+    """Reduce free axis (Vector Engine)
+
+    data(P, F) → output(P,).
+    Collapses free dimension with the specified reduction op.
+    Both input and output can be SBUF or PSUM.
+    """
+
+    NAME = "tensor_reduce"
+    OPERAND_AXES = {"data": ("P", "F")}
+    OUTPUT_AXES = {"output": ("P",)}
+    MAX_TILE_SIZES = {"P": 128}
+    ENGINE = "VectorEngine"
+
+    def simulate(self, dst, data, op):
+        reduce = {"max": np.max, "add": np.sum}
+        dst[:] = reduce[op](data.reshape(data.shape[0], -1), axis=1)
+
+    def render(self, ctx):
+        dst = ctx.outputs["output"]
+        data = ctx.operands["data"]
+        op_name = ctx.config_kwargs["op"]
+        return f"nisa.tensor_reduce(dst={dst.NAME}, data={data.NAME}, op=nl.{op_name})"
+
+
+class NKIActivation(NKIOp):
+    """Element-wise unary activation (Scalar Engine)
+
+    output = op(data). Works on both 2D (P, F) and 1D (P,) tiles.
+    ISA computes op(data * scale + bias) with optional reduction;
+    nkigym decomposes scale/bias into separate tensor_scalar ops,
+    so this op models only the unary activation.
+    Input/output can be SBUF or PSUM.
+    """
+
+    NAME = "activation"
+    OPERAND_AXES = {"data": ("P", "F")}
+    OUTPUT_AXES = {"output": ("P", "F")}
+    MAX_TILE_SIZES = {"P": 128}
+    ENGINE = "ScalarEngine"
+
+    def simulate(self, dst, data, op):
+        fns = {
+            "exp": np.exp, "tanh": np.tanh, "square": np.square,
+            "reciprocal": lambda x: 1.0 / x,
+            "rsqrt": lambda x: 1.0 / np.sqrt(x),
+        }
+        dst[:] = fns[op](data)
+
+    def render(self, ctx):
+        dst = ctx.outputs["output"]
+        data = ctx.operands["data"]
+        op_name = ctx.config_kwargs["op"]
+        return f"nisa.activation(dst={dst.NAME}, data={data.NAME}, op=nl.{op_name})"
+```
+
+<!-- ---
 
 ## 2. Parsed Ops + Analysis
 
-### 2.1 Parse
-
-`parse_body()` extracts one `_OpCall` per `nkigym.*` call. Each has: `stmt_type` (op class from registry), `input_vars`, `config_kwargs`, `output_var`. Post-parse reclassification converts `NKIActivation` → `NKIActivation1D` when the input is 1D.
-
-Running example produces 11 op calls:
-
-| # | stmt_type | input_vars | output_var | config_kwargs |
-|---|---|---|---|---|
-| 0 | `NKITranspose` | `(q,)` | `q_t` | |
-| 1 | `NKITranspose` | `(k,)` | `k_t` | |
-| 2 | `NKIMatmul` | `(q_t, k_t)` | `scores` | |
-| 3 | `NKITensorReduce` | `(scores,)` | `max_s` | `(("op", np.max),)` |
-| 4 | `NKITensorScalar` | `(scores, max_s)` | `shifted` | `(("op0", np.subtract),)` |
-| 5 | `NKIActivation` | `(shifted,)` | `exp_s` | `(("op", np.exp),)` |
-| 6 | `NKITensorReduce` | `(exp_s,)` | `sum_exp` | `(("op", np.add),)` |
-| 7 | `NKIActivation1D` | `(sum_exp,)` | `inv_sum` | `(("op", "reciprocal"),)` |
-| 8 | `NKITensorScalar` | `(exp_s, inv_sum)` | `attn` | `(("op0", np.multiply),)` |
-| 9 | `NKITranspose` | `(attn,)` | `attn_t` | |
-| 10 | `NKIMatmul` | `(attn_t, v)` | `output` | |
-
-Parse does NOT add infrastructure ops (DMA loads, PSUM→SBUF staging, DMA stores). Those are generated during rendering (§4).
-
 ### 2.2 Analysis
 
-`analyze_dims()` takes the 11 op calls + parameter shapes and:
+`analyze_dims()` takes the 13 op calls + parameter shapes and:
 
 1. **Assigns dimension IDs**: `q → (d0, d1)`, `k → (d2, d3)`, `v → (d4, d5)`.
 2. **Unifies dimensions** across ops using `OPERAND_AXES` axis labels:
    - Ops 0–1 transpose: q`(d0, d1)` → q_t`(d1, d0)`. k`(d2, d3)` → k_t`(d3, d2)`.
    - Op 2 matmul1: K=d1 unifies d3→d1. Output scores → (d0, d2).
-   - Op 9 transpose: attn`(d0, d2)` → attn_t`(d2, d0)`.
-   - Op 10 matmul2: K=d2 unifies d4→d2. Output → (d0, d5).
+   - Ops 3–4 (scale, mask): shape-preserving, no new unifications.
+   - Op 10 transpose: exp_s`(d0, d2)` → exp_s_t`(d2, d0)`.
+   - Op 11 matmul2: K=d2 unifies d4→d2. Output → (d0, d5).
 3. **Computes tile sizes**: `tile_size = max(all TILE_LIMITS)`, capped at 128 when the dim appears at position 0 (partition axis) of any tensor.
 4. **Classifies dimensions**: dims in the return variable → parallel; rest → reduction.
 
@@ -109,18 +312,20 @@ d2 gets `max(N:512, K:128) = 512` from TILE_LIMITS, but the **partition-axis cap
 | Barrier | Op | Reduces over | Pass |
 |---|---|---|---|
 | Op 2 | `NKIMatmul` (scores) | d1 | d1 pass 0 |
-| Op 3 | `NKITensorReduce` (max_s) | d2 | d2 pass 0 |
-| Op 6 | `NKITensorReduce` (sum_exp) | d2 | d2 pass 1 |
-| Op 10 | `NKIMatmul` (output) | d2 | d2 pass 2 |
+| Op 5 | `NKITensorReduce` (max_s) | d2 | d2 pass 0 |
+| Op 8 | `NKITensorReduce` (sum_exp) | d2 | d2 pass 1 |
+| Op 11 | `NKIMatmul` (attn) | d2 | d2 pass 2 |
 
 Non-barrier ops are classified by position relative to barriers:
 
 | Classification | Ops | Description |
 |---|---|---|
 | **pre_compute** for (d1, 0) | 0 (transpose q), 1 (transpose k) | Transpose inputs before matmul1 |
-| **pre_compute** for (d2, 1) | 4 (subtract), 5 (exp) | 2D ops before d2 pass 1 barrier |
-| **inter_pass** after (d2, 1) | 7 (reciprocal) | 1D op between d2 passes 1 and 2 |
-| **pre_compute** for (d2, 2) | 8 (multiply), 9 (transpose) | 2D ops before d2 pass 2 barrier |
+| **pre_compute** for (d2, 0) | 3 (scale), 4 (affine_select) | Scale and mask before d2 pass 0 barrier |
+| **pre_compute** for (d2, 1) | 6 (subtract), 7 (exp) | 2D ops before d2 pass 1 barrier |
+| **inter_pass** after (d2, 1) | 9 (reciprocal) | 1D op between d2 passes 1 and 2 |
+| **pre_compute** for (d2, 2) | 10 (transpose) | Transpose exp_s before matmul2 |
+| **post_compute** after (d2, 2) | 12 (multiply) | Normalize output by inv_sum |
 
 **Inter-pass ops** are 1D column-vector operations that execute once after a pass completes (not recomputed per d2 tile). The reciprocal of `sum_exp` runs between passes 1 and 2.
 
@@ -227,7 +432,7 @@ The render produces NKI source from (analysis + schedule + op calls). Infrastruc
 
 ```python
 @nki.jit
-def attention(q, k, v):
+def attention(q, k, v, scale):
     hbm_tensor_0 = nl.ndarray((512, 1024), dtype=q.dtype, buffer=nl.shared_hbm)
     for i_0 in nl.affine_range(4):                   # d0: seq_q tiles
         for i_1 in nl.affine_range(2):               # d5: d_v tiles
@@ -236,12 +441,15 @@ def attention(q, k, v):
             for i_2 in nl.sequential_range(4):       # d2 tiles
                 # load q tile → nc_transpose → tensor_copy to SBUF
                 # load k tile → nc_transpose → tensor_copy to SBUF
-                # matmul1 → stage to SBUF → tensor_reduce(max) into running_max
+                # matmul1 → stage to SBUF
+                # → tensor_scalar(multiply, scale) → tensor_copy to SBUF
+                # → affine_select(causal) → tensor_reduce(max) into running_max
 
             """ Pass 1: running sum (uses completed max) """
             running_sum = nl.ndarray(..., buffer=nl.psum)
             for i_3 in nl.sequential_range(4):       # d2 tiles
                 # load q, k → transpose each → matmul1 → stage
+                # → scale → affine_select(causal)
                 # → subtract(running_max) → exp → reduce(add)
             # inter-pass: reciprocal(running_sum) in SBUF
 
@@ -249,13 +457,15 @@ def attention(q, k, v):
             psum_acc = nl.ndarray(..., buffer=nl.psum)
             for i_4 in nl.affine_range(4):           # d2 tiles (K for matmul2)
                 # load q, k → transpose each → matmul1 → stage
-                # → subtract → exp → multiply(reciprocal)
-                # → transpose → load v tile → matmul2 into psum_acc
-            # stage psum_acc → SBUF, DMA store to hbm_tensor_0
+                # → scale → affine_select(causal)
+                # → subtract → exp → transpose
+                # → load v tile → matmul2 into psum_acc
+            # tensor_scalar(multiply, reciprocal) → stage psum_acc → SBUF
+            # DMA store to hbm_tensor_0
     return hbm_tensor_0
 ```
 
-**Per-pass recomputation**: transpose + matmul1 + softmax intermediates recomputed in every d2 pass because their d2-dimension outputs don't persist in SBUF across passes. The final transpose (attn → attn_t) appears only in pass 2. Inter-pass scalars (running_max, running_sum, reciprocal) persist between passes.
+**Per-pass recomputation**: transpose + matmul1 + scale + mask + softmax intermediates recomputed in every d2 pass because their d2-dimension outputs don't persist in SBUF across passes. Inter-pass scalars (running_max, running_sum, reciprocal) persist between passes.
 
 ---
 
@@ -263,45 +473,12 @@ def attention(q, k, v):
 
 Ops are auto-discovered via `NKIOp.__init_subclass__`. Each subclass declares `OPERAND_AXES`, `OUTPUT_AXES`, `TILE_LIMITS`.
 
-### 5.1 Compute Ops
-
-| nkigym Op | ISA Call | Semantics | OPERAND_AXES | OUTPUT_AXES | TILE_LIMITS |
-|---|---|---|---|---|---|
-| `NKIMatmul` | `nisa.nc_matmul` | dst += stationary.T @ moving | stationary:(K,M), moving:(K,N) | (M,N) | K:128, M:128, N:512 |
-| `NKITranspose` | `nisa.nc_transpose` + `nisa.tensor_copy` | Swap P↔F via PE array | data:(P,F) | (F,P) | P:128 |
-| `NKITensorReduce` | `nisa.tensor_reduce` | Reduce free axis | data:(P,F) | (P,) | P:128 |
-| `NKITensorScalar` | `nisa.tensor_scalar` | Binary op: 2D tile × 1D column | data:(P,F), operand0:(P,) | (P,F) | P:128 |
-| `NKITensorScalarConst` | `nisa.tensor_scalar` | Compound op with literal operands | data:(P,) | (P,) | P:128 |
-| `NKIActivation` | `nisa.activation` | Element-wise unary (2D) | data:(P,F) | (P,F) | P:128 |
-| `NKIActivation1D` | `nisa.activation` | Element-wise unary (1D) | data:(P,) | (P,) | P:128 |
-| `NKIActivationReduce` | `nisa.activation` (with reduce) | Fused activation + free-axis reduce | data:(P,F) | (P,) | P:128 |
-| `NKIAdd` | `nisa.tensor_tensor` | Element-wise add | data1:(P,F), data2:(P,F) | (P,F) | — |
-| `NKIMultiply` | `nisa.tensor_tensor` | Element-wise multiply | data1:(P,F), data2:(P,F) | (P,F) | — |
-
 ### 5.2 Infrastructure Ops
 
 | nkigym Op | ISA Call | Semantics |
 |---|---|---|
 | `NKIDmaCopy` | `nisa.dma_copy` | HBM ↔ SBUF transfer |
 | `NKITensorCopy` | `nisa.tensor_copy` | PSUM → SBUF staging |
-
-### 5.3 Available NKI Operations
-
-Each `nkigym.*` op maps to a real `nisa.*` call. The `nl.*` constants used as operation parameters:
-
-| Category | `nl.*` constants | Parameter | ISA calls |
-|---|---|---|---|
-| Binary | `nl.add`, `nl.subtract`, `nl.multiply`, `nl.maximum` | `op0`/`op1`, `op` | `nisa.tensor_scalar`, `nisa.tensor_tensor` |
-| Unary | `nl.exp`, `nl.tanh`, `nl.square`, `nl.rsqrt`, `nl.reciprocal` | `op` | `nisa.activation` |
-| Reduce | `nl.add`, `nl.max` | `op` | `nisa.tensor_reduce` |
-
-NKI ISA has **no divide**. Division is multiply-by-reciprocal: `nisa.activation(op=nl.reciprocal)` computes `1/x`, then `nisa.tensor_scalar` multiplies.
-
-### 5.4 Classification
-
-`has_reduction(op)` returns True when any input axis label is absent from `OUTPUT_AXES`. Both `NKIMatmul` (K ∉ output) and `NKITensorReduce` (F ∉ output) are reduction ops. Adding a new op requires: op class in `ops/`, import in `ops/__init__.py`, simulation in `simulate/simulate.py`.
-
----
 
 ## 6. Design Rules
 
@@ -321,4 +498,4 @@ NKI ISA has **no divide**. Division is multiply-by-reciprocal: `nisa.activation(
 
 **IO is explicit**: `nisa.dma_copy` for HBM↔SBUF, `nisa.tensor_copy` for PSUM→SBUF. All ISA calls use `dst=`, no return values.
 
-**Naming**: `{memspace}_tensor_N` per memory space. Input params keep user names. PSUM always `nl.float32`.
+**Naming**: `{memspace}_tensor_N` per memory space. Input params keep user names. PSUM always `nl.float32`. -->
