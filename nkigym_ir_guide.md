@@ -294,11 +294,45 @@ The result is the **reference output** — a float64 array that any correctly re
 
 ---
 
-## 4. Dimension Analysis
+## 4. Parse
+
+AST parsing extracts the computation graph from the math function source. `ast.parse(inspect.getsource(fn))` walks the function body and produces an ordered list of op calls:
+
+```python
+class OpCall(NamedTuple):
+    op_type: type[NKIOp]
+    input_vars: tuple[str, ...]
+    output_var: str
+    config_kwargs: dict[str, Any]
+```
+
+For the running example, parsing `attention` produces:
+
+| # | op_type | input_vars | output_var | config_kwargs |
+|---|---|---|---|---|
+| 0 | NKITranspose | (Q,) | Q_t | {} |
+| 1 | NKITranspose | (K,) | K_t | {} |
+| 2 | NKIMatmul | (Q_t, K_t) | S | {} |
+| 3 | NKITensorScalar | (S,) | scaled_S | {op0: "multiply", operand0: scale} |
+| 4 | NKIAffineSelect | (scaled_S,) | masked_S | {cmp_op: "greater_equal", ...} |
+| 5 | NKITensorReduce | (masked_S,) | max_S | {op: "max"} |
+| 6 | NKITensorScalar | (masked_S, max_S) | shifted_S | {op0: "subtract"} |
+| 7 | NKIActivation | (shifted_S,) | exp_S | {op: "exp"} |
+| 8 | NKITensorReduce | (exp_S,) | sum_exp | {op: "add"} |
+| 9 | NKIActivation | (sum_exp,) | inv_sum | {op: "reciprocal"} |
+| 10 | NKITranspose | (exp_S,) | exp_S_t | {} |
+| 11 | NKIMatmul | (exp_S_t, V) | attn | {} |
+| 12 | NKITensorScalar | (attn, inv_sum) | output | {op0: "multiply"} |
+
+The parser also identifies the function's input parameters (`Q, K, V, scale`) and the return variable (`output`). Intermediate tensor names (`Q_t`, `S`, `masked_S`, etc.) are extracted from the AST assignment targets, preserving the user's naming from the math function. This `list[OpCall]` is the shared input for dimension analysis (§5) and render (§7) — the render uses these names in the generated kernel for readability.
+
+---
+
+## 5. Dimension Analysis
 
 To tile and schedule a math function for hardware, we need to know what dimensions exist, how they relate across ops, and which are parallel vs reduction. This is derived mechanically from `NKIOp.OPERAND_AXES` and `OUTPUT_AXES`.
 
-### 4.1 Dimension Assignment and Unification
+### 5.1 Dimension Assignment and Unification
 
 Each input parameter gets fresh dimension IDs. Walking the op calls in order, we match each input variable's dimensions to the op's `OPERAND_AXES` labels. When two operands share an axis label, their corresponding dimension IDs are **unified** (merged into one). When a shared axis label maps to dimension IDs that are already assigned and equal, we **assert** consistency — no merge is needed, but we verify the math function is well-formed. If they are already assigned to *different* dimensions, that is a **dimension conflict error**.
 
@@ -334,7 +368,7 @@ For the running example:
 
 After the walk, 4 unique dimensions remain: **d0, d1, d2, d5**.
 
-### 4.2 Parallel vs Reduction
+### 5.2 Parallel vs Reduction
 
 An axis label present in `OPERAND_AXES` but absent from `OUTPUT_AXES` is consumed by the op — it's a **reduction axis**. For example, `NKIMatmul` has K in both operands but not in the output; `NKITensorReduce` has F in the input but not the output.
 
@@ -364,7 +398,7 @@ For the running example, `output` has axes `(d0, d5)`:
 | d2 | reduction | consumed by matmul K axis and tensor_reduce F axis |
 | d5 | parallel | in output(d0, d5) |
 
-### 4.3 Tile Sizes
+### 5.3 Tile Sizes
 
 Each dimension's tile size is always the maximum across all `MAX_TILE_SIZES` entries from ops that use it:
 
@@ -380,9 +414,9 @@ When an op's limit for a dimension is smaller than the tile size, the renderer e
 | d2 | P:128 (transpose K), N:512 (nc_matmul₁), F:128 (transpose exp_S), K:128 (nc_matmul₂) | 512 |
 | d5 | N:512 (nc_matmul₂) | 512 |
 
-## 5. Schedule
+## 6. Schedule
 
-A `Schedule` is an immutable, hashable descriptor that captures *how* to execute the math function — independently of *what* to compute (which comes from §1–4).
+A `Schedule` is an immutable, hashable descriptor that captures *how* to execute the math function — independently of *what* to compute (which comes from §1–5).
 
 ```python
 class Loop(NamedTuple):
@@ -395,7 +429,7 @@ class Schedule(NamedTuple):
     load_placements: dict[str, int]  # tensor name → level (0..num_dependent_dims)
 ```
 
-### 5.1 Loop Order
+### 6.1 Loop Order
 
 `loop_order` maps each `Loop` to a `depth` integer. Dict iteration order defines execution order. Each `Loop` represents a **two-level loop** — a block loop and a tile loop:
 
@@ -423,7 +457,7 @@ Parallel dims each increase the depth by 1. Reduction dims that require multiple
 
 d2 appears 3 times because the math function has 3 barrier ops that fully reduce over d2: `tensor_reduce(max)`, `tensor_reduce(sum)`, and `nc_matmul` (matmul2). Each barrier requires a complete sweep — the next cannot start until the previous reduction is finished across all d2 tiles.
 
-### 5.2 Load Placements
+### 6.2 Load Placements
 
 `load_placements` maps each input tensor name to an integer level from 0 to `num_dependent_dims`. The level controls how deep into the loop nest the DMA load is placed, relative to the tensor's dependent dims. Compute and store placements are not free parameters — compute runs immediately when operands are available, stores run immediately when results are ready.
 
@@ -445,7 +479,7 @@ For the running example:
 | K | (d2, d1) | d1, d2 | 0, 1, 2 |
 | V | (d2, d5) | d5, d2 | 0, 1, 2 |
 
-### 5.3 Enumeration
+### 6.3 Enumeration
 
 The schedule space is the cross-product of three independent axes:
 
@@ -474,97 +508,97 @@ Hardware validation prunes infeasible schedules. In the `Tensor` layout, `TILE_S
 
 $$\text{Full space} = 120 \times 24 \times 27 = 77{,}760 \text{ candidates}$$
 
-<!-- ---
+## 7. Render (Specialization)
 
-### 3.5 Schedule Transformations (Design Direction)
+Rendering is a **specialization** step: it takes the math function (§1), the op call list (§4), dimension analysis (§5), a schedule (§6), and **concrete input shapes and dtypes** to produce an NKI kernel tailored to those specific inputs. Each unique combination of input shapes and dtypes requires its own tuned kernel. Infrastructure ops (DMA loads, PSUM→SBUF staging, DMA stores) are generated by the renderer — they do not appear in the math function.
 
-Exhaustive enumeration works for the attention example (4320 candidates) but won't scale to workloads with more dimensions. Schedule-to-schedule transformations enable local search:
-
-| Transform | What changes | Performance impact |
-|---|---|---|
-| **Loop interchange** | Swap two adjacent items in `loop_order` | Data reuse: outer dims reuse more. 2–10x. |
-| **Pass relocation** | Move a parallel dim relative to reduction passes | Eliminates redundant iterations. 2–5x. |
-| **Blocking change** | Change `tiles_per_block` for one dim | DMA/compute overlap. 1.5–3x. |
-| **Placement change** | Raise/lower one load's level | Memory traffic vs SBUF pressure. 1.2–2x. |
-
-**Completeness**: adjacent swaps generate any permutation, blocking/placement each reach any valid value independently. The space is connected — any schedule reachable from any other. Constraint: same-dim passes must maintain relative order (swapping (d2,0)↔(d2,1) is invalid).
-
-**Example — pass relocation**: Move d5 from position 1 to between passes 1 and 2:
+### 7.1 Render Pipeline
 
 ```
-Default:   ((d0, 0), (d5, 0), (d2, 0), (d2, 1), (d2, 2))
-Relocated: ((d0, 0), (d2, 0), (d2, 1), (d5, 0), (d2, 2))
+render(math_function, analysis, schedule, input_shapes, dtypes) → NKI kernel source
 ```
 
-Default: passes 0–2 all nest inside the d5 loop, but passes 0–1 (softmax) don't depend on d5 — the d5 iterations are redundant work. Relocated: passes 0–1 run with context {d0} only — 2x fewer iterations (4 d0 × 4 d2 = 16 per pass, vs 4 d0 × 2 d5 × 4 d2 = 32). Pass 2 retains context {d0, d5} for the matmul2 accumulation that produces the (seq_q, d_v) output.
+1. **Emit preamble**: imports (`nki`, `nki.language as nl`, `nki.isa as nisa`), `@nki.jit` decorator, function signature with input params, shape and dtype assertions for each input, HBM output allocation.
 
-**What matters most for attention:**
+**Tensor naming**: input/output tensors use the same names as the math function (`q`, `k`, `v`, `output`). Intermediate tensors are named `{location}_{var_name}` where `location` is `sbuf` or `psum` and `var_name` is the variable name from the parsed math function (§4). Examples: `sbuf_Q_t`, `psum_S`, `sbuf_masked_S`.
+2. **Emit loop nest**: walk `schedule.loop_order` — each Loop emits a block loop (`nl.affine_range(num_blocks)`) and a tile loop (`nl.affine_range(tiles_per_block)`). Depth determines nesting; same-depth loops are sequential siblings.
+3. **Emit DMA loads**: for each input tensor, place the `nisa.dma_copy(HBM→SBUF)` at the level specified by `schedule.load_placements`. Allocate an SBUF buffer with shape determined by `Tensor.NUM_TILES` (§6.2).
+4. **Emit compute ops**: at the innermost loop level, walk the math function's op calls. For each op, build a `RenderContext` (§2) and call `NKIOp.render(ctx)`. Reduction ops (matmul, tensor_reduce) accumulate into PSUM.
+5. **Emit staging**: after reduction loops complete, `nisa.tensor_copy(PSUM→SBUF)` stages the accumulator for subsequent ops or store.
+6. **Emit post-reduction ops**: ops that consume reduction results (e.g., multiply by inv_sum) render after staging, operating on SBUF data.
+7. **Emit DMA store**: `nisa.dma_copy(SBUF→HBM)` writes the final output tile back.
 
-- **Pass relocation of d5**: softmax passes (0, 1) don't depend on d5 — relocating d5 after them eliminates redundant iterations and reduces q/k DMA traffic in those passes.
-- **d2 blocking**: larger blocks reduce matmul initiation overhead; the NKI compiler can interleave DMA, Tensor Engine, Vector Engine, and Scalar Engine across more tiles.
-- **Load-v placement**: hoisting v (level 0) loads all v tiles once into SBUF. For attention, v is 512×1024 fp16 = 1 MB (fits in 24 MB SBUF). Eliminates redundant DMA when d2 tiles are reused.
+### 7.2 RenderContext Construction
 
----
+For each op call site, the renderer builds a `RenderContext`:
 
-## 4. NKI Kernel
+- `outputs`: output `Tensor` with axes, tile sizes, and buffer name from the render's naming scheme
+- `operands`: input `Tensor`(s) with SBUF buffer references and slice expressions for the current tile
+- `config_kwargs`: pass-through from the math function call (e.g., `op0="multiply"`, `cmp_op="greater_equal"`)
+- `tile_idx`: maps each dim_id to the current loop variable (e.g., `{"d0": "i_0", "d2": "i_2"}`)
+- `tile_start`: maps each dim_id to the element offset expression (e.g., `{"d0": "i_0 * 128", "d2": "i_2 * 512"}`)
 
-The render produces NKI source from (analysis + schedule + op calls). Infrastructure (loads, staging, stores) is generated here, not during parsing.
+Each `NKIOp.render(ctx)` returns an NKI source line using `nisa.*` calls with `dst=` syntax.
 
-### 4.1 Rendered Structure (Default Schedule)
+### 7.3 Example Output
+
+For the Llama-style example (`q[4096, 128], k[4096, 128], v[4096, 128]`) with the example schedule from §6.1 (all `tiles_per_block=1`, all loads at level 0):
 
 ```python
+import nki
+import nki.language as nl
+import nki.isa as nisa
+
+
 @nki.jit
 def attention(q, k, v, scale):
-    hbm_tensor_0 = nl.ndarray((512, 1024), dtype=q.dtype, buffer=nl.shared_hbm)
-    for i_0 in nl.affine_range(4):                   # d0: seq_q tiles
-        for i_1 in nl.affine_range(2):               # d5: d_v tiles
-            """ Pass 0: running max over d2 """
-            running_max = nl.ndarray(..., buffer=nl.psum)
-            for i_2 in nl.sequential_range(4):       # d2 tiles
-                # load q tile → nc_transpose → tensor_copy to SBUF
-                # load k tile → nc_transpose → tensor_copy to SBUF
-                # matmul1 → stage to SBUF
-                # → tensor_scalar(multiply, scale) → tensor_copy to SBUF
-                # → affine_select(causal) → tensor_reduce(max) into running_max
+    assert q.shape == (4096, 128), f"Expected q shape (4096, 128), got {q.shape}"
+    assert k.shape == (4096, 128), f"Expected k shape (4096, 128), got {k.shape}"
+    assert v.shape == (4096, 128), f"Expected v shape (4096, 128), got {v.shape}"
+    assert q.dtype == nl.float16
+    assert k.dtype == nl.float16
+    assert v.dtype == nl.float16
 
-            """ Pass 1: running sum (uses completed max) """
-            running_sum = nl.ndarray(..., buffer=nl.psum)
-            for i_3 in nl.sequential_range(4):       # d2 tiles
-                # load q, k → transpose each → matmul1 → stage
-                # → scale → affine_select(causal)
-                # → subtract(running_max) → exp → reduce(add)
-            # inter-pass: reciprocal(running_sum) in SBUF
+    output_hbm = nl.ndarray((4096, 128), dtype=nl.float16, buffer=nl.shared_hbm)
 
-            """ Pass 2: matmul2 accumulation """
-            psum_acc = nl.ndarray(..., buffer=nl.psum)
-            for i_4 in nl.affine_range(4):           # d2 tiles (K for matmul2)
-                # load q, k → transpose each → matmul1 → stage
-                # → scale → affine_select(causal)
-                # → subtract → exp → transpose
-                # → load v tile → matmul2 into psum_acc
-            # tensor_scalar(multiply, reciprocal) → stage psum_acc → SBUF
-            # DMA store to hbm_tensor_0
-    return hbm_tensor_0
+    """ Load all tiles (level 0 placement) """
+    sbuf_q = nl.ndarray((...), dtype=q.dtype, buffer=nl.sbuf)
+    sbuf_k = nl.ndarray((...), dtype=k.dtype, buffer=nl.sbuf)
+    sbuf_v = nl.ndarray((...), dtype=v.dtype, buffer=nl.sbuf)
+    # nisa.dma_copy for each tile of q, k, v
+
+    for i_d0 in nl.affine_range(32):                # d0 block loop (32 blocks)
+        for i_d5 in nl.affine_range(1):             # d5 block loop (1 block)
+            for i_d1 in nl.affine_range(1):         # d1 block loop (1 block)
+                """ d1 reduction: matmul1 """
+                # NKITranspose.render → nisa.nc_transpose (Q)
+                # NKITranspose.render → nisa.nc_transpose (K)
+                # NKIMatmul.render   → nisa.nc_matmul (Q_t @ K_t → S)
+
+            """ d2 reduction 1: running max """
+            for i_d2 in nl.affine_range(8):         # d2 block loop (8 blocks)
+                # NKITensorScalar.render → nisa.tensor_scalar (scale)
+                # NKIAffineSelect.render → nisa.affine_select (causal mask)
+                # NKITensorReduce.render → nisa.tensor_reduce (max)
+
+            """ d2 reduction 2: running sum """
+            for i_d2 in nl.affine_range(8):
+                # recompute: scale, mask
+                # NKITensorScalar.render → nisa.tensor_scalar (subtract max)
+                # NKIActivation.render   → nisa.activation (exp)
+                # NKITensorReduce.render → nisa.tensor_reduce (sum)
+            # NKIActivation.render → nisa.activation (reciprocal)
+
+            """ d2 reduction 3: matmul2 """
+            for i_d2 in nl.affine_range(8):
+                # recompute: scale, mask, subtract, exp, transpose
+                # NKIMatmul.render → nisa.nc_matmul (exp_S_t @ V → attn)
+
+            # nisa.tensor_copy (PSUM → SBUF)
+            # NKITensorScalar.render → nisa.tensor_scalar (multiply inv_sum)
+            # nisa.dma_copy (SBUF → HBM)
+
+    return output_hbm
 ```
 
-**Per-pass recomputation**: transpose + matmul1 + scale + mask + softmax intermediates recomputed in every d2 pass because their d2-dimension outputs don't persist in SBUF across passes. Inter-pass scalars (running_max, running_sum, reciprocal) persist between passes.
-
-## 6. Design Rules
-
-**Separation of concerns**: the schedule captures *how* to execute independently of *what* to execute (from analysis). The NKI kernel is a rendering output.
-
-**All orderings are correct**: the only constraint is that same-dim reduction passes maintain relative order. Hardware validation filters infeasible schedules.
-
-**Combinatorial enumeration**: full space = loop orders × placements × blocking. Each schedule is an independent grid point.
-
-**Partition-axis cap**: `tile_size = max(TILE_LIMITS)`, capped at 128 when the dim appears at position 0 of any tensor. Resolves conflicts where a dim serves as both free axis (N:512) and partition axis (K:128).
-
-**Cross-tile reduction**: matmul accumulates in PSUM across K tiles. `tensor_reduce` accumulates in SBUF via read-modify-write.
-
-**Sequential passes**: when a full reduction must complete before the next op starts, the dim appears multiple times in `loop_order` as `(dim_id, pass_0), (dim_id, pass_1), ...`.
-
-**Per-pass recomputation**: d2-dimension intermediates recomputed per pass (SBUF holds one tile at a time). 1D inter-pass results persist between passes.
-
-**IO is explicit**: `nisa.dma_copy` for HBM↔SBUF, `nisa.tensor_copy` for PSUM→SBUF. All ISA calls use `dst=`, no return values.
-
-**Naming**: `{memspace}_tensor_N` per memory space. Input params keep user names. PSUM always `nl.float32`. -->
+Each `nisa.*` call is produced by the corresponding `NKIOp.render(ctx)` — the renderer constructs the `RenderContext` and delegates to the op subclass.
