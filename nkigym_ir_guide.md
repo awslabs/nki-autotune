@@ -99,6 +99,9 @@ class NKIMatmul(NKIOp):
     """stationary.T @ moving (Tensor Engine)
 
     stationary(K, M).T @ moving(K, N) → output(M, N).
+    Accumulates into PSUM in fp32 regardless of input dtype.
+    PSUM allocation is the renderer's responsibility (before the
+    reduction loop); this op only emits the nc_matmul call.
     """
 
     NAME = "nc_matmul"
