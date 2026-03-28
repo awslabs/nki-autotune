@@ -428,55 +428,58 @@ class Loop(NamedTuple):
     tiles_per_block: int
 
 class Schedule(NamedTuple):
-    loop_order: dict[Loop, int]  # Loop → depth; dict order = execution order
-    load_placements: dict[str, int]  # tensor name → level (0..num_dependent_dims)
+    loop_order: tuple[tuple[Loop, tuple[int, int]], ...]  # ((Loop, (level, order)), ...)
+    load_placements: tuple[tuple[str, int], ...]  # ((tensor_name, relative_pos), ...)
 ```
 
 ### 6.1 Loop Order
 
-`loop_order` maps each `Loop` to a `depth` integer. Dict iteration order defines execution order. Each `Loop` represents a **two-level loop** — a block loop and a tile loop:
+`loop_order` is a tuple of `(Loop, (level, order))` pairs. The two integers fully determine nesting and execution order:
+
+- **`level`**: nesting level. Different levels mean nested loops (outer vs inner).
+- **`order`**: execution order within that level. Same level, different order means sequential (back-to-back) loops.
+
+Each `Loop` represents a **two-level loop** — a block loop and a tile loop:
 
 ```
 for block in range(num_blocks):                 # block loop: num_blocks = total_tiles / tiles_per_block
     for tile in range(tiles_per_block):          # tile loop: iterate within the block
 ```
 
-`depth` is the nesting level — loops at the same depth are siblings (sequential), loops at increasing depth are nested.
-
-Parallel dims each increase the depth by 1. Reduction dims that require multiple sequential loops (e.g., running max, running sum, matmul accumulation) repeat at the **same depth** — they are back-to-back sibling loops, not nested.
+Parallel dims each increase the level. Reduction dims that require multiple sequential sweeps (e.g., running max, running sum, matmul accumulation) share the same level but have distinct order indices — they run back-to-back, not nested.
 
 `tiles_per_block` controls blocking — how many tiles are grouped into one block. Must divide the total tile count. Larger `tiles_per_block` means larger SBUF buffers (holding more tiles at once) but fewer DMA round-trips — the loaded block is reused across all tile iterations within it.
 
 **Example loops** for the running example:
 
-| Pos | Loop (dim_id, tile_size, tpb) | depth | Meaning |
-|---|---|---|---|
-| 0 | (d0, 128, 1) | 0 | Outer parallel loop: seq_q |
-| 1 | (d5, 512, 1) | 1 | Parallel loop: d_v |
-| 2 | (d1, 128, 1) | 2 | d_k reduction (matmul1 K axis) |
-| 3 | (d2, 512, 1) | 2 | seq_k reduction (running max) |
-| 4 | (d2, 512, 1) | 2 | seq_k reduction (running sum) — needs completed max from pos 3 |
-| 5 | (d2, 512, 1) | 2 | seq_k reduction (matmul2 K axis) — needs completed inv_sum from pos 4 |
+| Loop (dim_id, tile_size, tpb) | (level, order) | Meaning |
+|---|---|---|
+| (d0, 128, 1) | (0, 0) | Outer parallel loop: seq_q |
+| (d5, 512, 1) | (1, 0) | Parallel loop: d_v |
+| (d1, 128, 1) | (2, 0) | d_k reduction (matmul1 K axis) |
+| (d2, 512, 1) | (2, 1) | seq_k reduction (running max) |
+| (d2, 512, 1) | (2, 2) | seq_k reduction (running sum) — needs completed max |
+| (d2, 512, 1) | (2, 3) | seq_k reduction (matmul2 K axis) — needs completed inv_sum |
 
 d2 appears 3 times because the math function has 3 barrier ops that fully reduce over d2: `tensor_reduce(max)`, `tensor_reduce(sum)`, and `nc_matmul` (matmul2). Each barrier requires a complete sweep — the next cannot start until the previous reduction is finished across all d2 tiles.
 
 ### 6.2 Load Placements
 
-`load_placements` maps each input tensor name to an integer level from 0 to `num_dependent_dims`. The level controls how deep into the loop nest the DMA load is placed, relative to the tensor's dependent dims. Compute and store placements are not free parameters — compute runs immediately when operands are available, stores run immediately when results are ready.
+`load_placements` maps each input tensor name to an integer `relative_pos` from 0 to `num_dependent_dims`. The `relative_pos` controls how deep into the loop nest the DMA load is placed, relative to the tensor's dependent dims. Compute and store placements are not free parameters — compute runs immediately when operands are available, stores run immediately when results are ready.
 
-`num_dependent_dims` is the number of unique loop dimensions that appear in the tensor's axes (after unification), ordered by their position in `loops`. Each level moves the load point one dependent loop deeper. Since each Loop is a block loop + tile loop, "outside" means before the block loop, and "inside" means between the block and tile loops:
+`num_dependent_dims` is the number of unique loop dimensions that appear in the tensor's axes (after unification), ordered by their position in `loop_order`. Each `relative_pos` moves the load point one dependent loop deeper. Since each Loop is a block loop + tile loop, "outside" means before the block loop, and "inside" means between the block and tile loops:
 
-- **Level 0**: outside all dependent loops (before their block loops) → `NUM_TILES = total_tiles` for all dependent axes
-- **Level k**: inside the first k dependent loops (between their block and tile loops) → `NUM_TILES = tiles_per_block` for those k axes, `total_tiles` for the rest
-- **Level N**: inside all dependent loops → `NUM_TILES = tiles_per_block` for all dependent axes
+- **relative_pos 0**: outside all dependent loops (before their block loops) → `NUM_TILES = total_tiles` for all dependent axes
+- **relative_pos k**: inside the first k dependent loops (between their block and tile loops) → `NUM_TILES = tiles_per_block` for those k axes, `total_tiles` for the rest
+- **relative_pos N**: inside all dependent loops → `NUM_TILES = tiles_per_block` for all dependent axes
 
 To hold just 1 tile for a dimension, set `tiles_per_block=1` on the Loop and place the tensor inside — no separate case needed.
 
-A tensor with N dependent dims has N+1 relative levels.
+A tensor with N dependent dims has N+1 valid `relative_pos` values.
 
 For the running example:
 
-| Tensor | Axes (after unification) | Dependent dims (loop order) | Relative levels |
+| Tensor | Axes (after unification) | Dependent dims (loop order) | Valid relative_pos |
 |---|---|---|---|
 | Q | (d0, d1) | d0, d1 | 0, 1, 2 |
 | K | (d2, d1) | d1, d2 | 0, 1, 2 |
@@ -490,7 +493,7 @@ The schedule space is the cross-product of three independent axes:
 
 **Axis 2 — Blocking**: for each unique dimension, `tiles_per_block` can be any divisor of `total_tiles` (= dim_size / tile_size). The number of choices per dimension is the divisor count of its total tiles.
 
-**Axis 3 — Load placements**: for each input tensor with $N$ dependent dims, the level ranges from 0 to $N$, giving $N+1$ choices.
+**Axis 3 — Load placements**: for each input tensor with $N$ dependent dims, `relative_pos` ranges from 0 to $N$, giving $N+1$ choices.
 
 $$\text{Full space} = \text{loop orders} \times \prod_{\text{dims}} |\text{divisors}(total\_tiles_i)| \times \prod_{\text{tensors}} (N_j + 1)$$
 
@@ -507,7 +510,7 @@ Hardware validation prunes infeasible schedules. In the `Tensor` layout, `TILE_S
 
 - **Loop orders**: $6! / 3! = 120$ (4 unique dims after unification: d0, d1, d2, d5; d2 appears 3× for its 3 barrier ops → 6 entries, d2s maintain relative order)
 - **Blocking**: $6 \times 1 \times 4 \times 1 = 24$
-- **Load placements**: $3 \times 3 \times 3 = 27$ (Q, K, V each have 2 dependent dims → 3 levels)
+- **Load placements**: $3 \times 3 \times 3 = 27$ (Q, K, V each have 2 dependent dims → 3 valid `relative_pos` values)
 
 $$\text{Full space} = 120 \times 24 \times 27 = 77{,}760 \text{ candidates}$$
 
@@ -524,8 +527,8 @@ render(math_function, analysis, schedule, input_shapes, dtypes) → NKI kernel s
 1. **Emit preamble**: imports (`nki`, `nki.language as nl`, `nki.isa as nisa`), `@nki.jit` decorator, function signature with input params, shape and dtype assertions for each input, HBM output allocation.
 
 **Tensor naming**: input/output tensors use the same names as the math function (`q`, `k`, `v`, `output`). Intermediate tensors are named `{location}_{var_name}` where `location` is `sbuf` or `psum` and `var_name` is the variable name from the parsed math function (§4). Examples: `sbuf_Q_t`, `psum_S`, `sbuf_masked_S`.
-2. **Emit loop nest**: walk `schedule.loop_order` — each Loop emits a block loop (`nl.affine_range(num_blocks)`) and a tile loop (`nl.affine_range(tiles_per_block)`). Depth determines nesting; same-depth loops are sequential siblings.
-3. **Emit DMA loads**: for each input tensor, place the `nisa.dma_copy(HBM→SBUF)` at the level specified by `schedule.load_placements`. Allocate an SBUF buffer with shape determined by `Tensor.NUM_TILES` (§6.2).
+2. **Emit loop nest**: walk `schedule.loop_order` — each Loop emits a block loop (`nl.affine_range(num_blocks)`) and a tile loop (`nl.affine_range(tiles_per_block)`). `level` determines nesting; same-level loops run sequentially by `order`.
+3. **Emit DMA loads**: for each input tensor, place the `nisa.dma_copy(HBM→SBUF)` at the `relative_pos` specified by `schedule.load_placements`. Allocate an SBUF buffer with shape determined by `Tensor.NUM_TILES` (§6.2).
 4. **Emit compute ops**: at the innermost loop level, walk the math function's op calls. For each op, build a `RenderContext` (§2) and call `NKIOp.render(ctx)`. Reduction ops (matmul, tensor_reduce) accumulate into PSUM.
 5. **Emit staging**: after reduction loops complete, `nisa.tensor_copy(PSUM→SBUF)` stages the accumulator for subsequent ops or store.
 6. **Emit post-reduction ops**: ops that consume reduction results (e.g., multiply by inv_sum) render after staging, operating on SBUF data.
@@ -545,7 +548,7 @@ Each `NKIOp.render(ctx)` returns an NKI source line using `nisa.*` calls with `d
 
 ### 7.3 Example Output
 
-For the Llama-style example (`q[4096, 128], k[4096, 128], v[4096, 128]`) with the example schedule from §6.1 (all `tiles_per_block=1`, all loads at level 0):
+For the Llama-style example (`q[4096, 128], k[4096, 128], v[4096, 128]`) with the example schedule from §6.1 (all `tiles_per_block=1`, all loads at `relative_pos=0`):
 
 ```python
 import nki
@@ -564,7 +567,7 @@ def attention(q, k, v, scale):
 
     output_hbm = nl.ndarray((4096, 128), dtype=nl.float16, buffer=nl.shared_hbm)
 
-    """ Load all tiles (level 0 placement) """
+    """ Load all tiles (relative_pos=0 placement) """
     sbuf_q = nl.ndarray((...), dtype=q.dtype, buffer=nl.sbuf)
     sbuf_k = nl.ndarray((...), dtype=k.dtype, buffer=nl.sbuf)
     sbuf_v = nl.ndarray((...), dtype=v.dtype, buffer=nl.sbuf)
