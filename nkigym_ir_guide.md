@@ -380,6 +380,71 @@ When an op's limit for a dimension is smaller than the tile size, the renderer e
 | d2 | P:128 (transpose K), N:512 (nc_matmul₁), F:128 (transpose exp_S), K:128 (nc_matmul₂) | 512 |
 | d5 | N:512 (nc_matmul₂) | 512 |
 
+## 5. Schedule
+
+A `Schedule` is an immutable, hashable descriptor that captures *how* to execute the math function — independently of *what* to compute (which comes from §1–4).
+
+```python
+class Loop(NamedTuple):
+    dim_id: str
+    tile_size: int
+    tiles_per_block: int
+
+class Schedule(NamedTuple):
+    loop_order: dict[Loop, int]  # Loop → depth; dict order = execution order
+    load_placements: dict[str, int]  # tensor name → level (0..num_dependent_dims)
+```
+
+### 5.1 Loop Order
+
+`loop_order` maps each `Loop` to a `depth` integer. Dict iteration order defines execution order. Each `Loop` represents a **two-level loop** — a block loop and a tile loop:
+
+```
+for block in range(num_blocks):                 # block loop: num_blocks = total_tiles / tiles_per_block
+    for tile in range(tiles_per_block):          # tile loop: iterate within the block
+```
+
+`depth` is the nesting level — loops at the same depth are siblings (sequential), loops at increasing depth are nested.
+
+Parallel dims each increase the depth by 1. Reduction dims that require multiple sequential loops (e.g., running max, running sum, matmul accumulation) repeat at the **same depth** — they are back-to-back sibling loops, not nested.
+
+`tiles_per_block` controls blocking — how many tiles are grouped into one block. Must divide the total tile count. Larger `tiles_per_block` means larger SBUF buffers (holding more tiles at once) but fewer DMA round-trips — the loaded block is reused across all tile iterations within it.
+
+**Example loops** for the running example:
+
+| Pos | Loop (dim_id, tile_size, tpb) | depth | Meaning |
+|---|---|---|---|
+| 0 | (d0, 128, 1) | 0 | Outer parallel loop: seq_q |
+| 1 | (d5, 512, 1) | 1 | Parallel loop: d_v |
+| 2 | (d1, 128, 1) | 2 | d_k reduction (matmul1 K axis) |
+| 3 | (d2, 512, 1) | 2 | seq_k reduction (running max) |
+| 4 | (d2, 512, 1) | 2 | seq_k reduction (running sum) — needs completed max from pos 3 |
+| 5 | (d2, 512, 1) | 2 | seq_k reduction (matmul2 K axis) — needs completed inv_sum from pos 4 |
+
+d2 appears 3 times because the math function has 3 barrier ops that fully reduce over d2: `tensor_reduce(max)`, `tensor_reduce(sum)`, and `nc_matmul` (matmul2). Each barrier requires a complete sweep — the next cannot start until the previous reduction is finished across all d2 tiles.
+
+### 5.2 Load Placements
+
+`load_placements` maps each input tensor name to an integer level from 0 to `num_dependent_dims`. The level controls how deep into the loop nest the DMA load is placed, relative to the tensor's dependent dims. Compute and store placements are not free parameters — compute runs immediately when operands are available, stores run immediately when results are ready.
+
+`num_dependent_dims` is the number of unique loop dimensions that appear in the tensor's axes (after unification), ordered by their position in `loops`. Each level moves the load point one dependent loop deeper. Since each Loop is a block loop + tile loop, "outside" means before the block loop, and "inside" means between the block and tile loops:
+
+- **Level 0**: outside all dependent loops (before their block loops) → `NUM_TILES = total_tiles` for all dependent axes
+- **Level k**: inside the first k dependent loops (between their block and tile loops) → `NUM_TILES = tiles_per_block` for those k axes, `total_tiles` for the rest
+- **Level N**: inside all dependent loops → `NUM_TILES = tiles_per_block` for all dependent axes
+
+To hold just 1 tile for a dimension, set `tiles_per_block=1` on the Loop and place the tensor inside — no separate case needed.
+
+A tensor with N dependent dims has N+1 relative levels.
+
+For the running example:
+
+| Tensor | Axes (after unification) | Dependent dims (loop order) | Relative levels |
+|---|---|---|---|
+| Q | (d0, d1) | d0, d1 | 0, 1, 2 |
+| K | (d2, d1) | d1, d2 | 0, 1, 2 |
+| V | (d2, d5) | d5, d2 | 0, 1, 2 |
+
 <!-- ---
 
 ## 2. Parsed Ops + Analysis
@@ -568,19 +633,6 @@ def attention(q, k, v, scale):
 ```
 
 **Per-pass recomputation**: transpose + matmul1 + scale + mask + softmax intermediates recomputed in every d2 pass because their d2-dimension outputs don't persist in SBUF across passes. Inter-pass scalars (running_max, running_sum, reciprocal) persist between passes.
-
----
-
-## 5. Op Registry
-
-Ops are auto-discovered via `NKIOp.__init_subclass__`. Each subclass declares `OPERAND_AXES`, `OUTPUT_AXES`, `TILE_LIMITS`.
-
-### 5.2 Infrastructure Ops
-
-| nkigym Op | ISA Call | Semantics |
-|---|---|---|
-| `NKIDmaCopy` | `nisa.dma_copy` | HBM ↔ SBUF transfer |
-| `NKITensorCopy` | `nisa.tensor_copy` | PSUM → SBUF staging |
 
 ## 6. Design Rules
 
