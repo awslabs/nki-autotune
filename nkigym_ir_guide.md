@@ -445,121 +445,36 @@ For the running example:
 | K | (d2, d1) | d1, d2 | 0, 1, 2 |
 | V | (d2, d5) | d5, d2 | 0, 1, 2 |
 
-<!-- ---
-
-## 2. Parsed Ops + Analysis
-
-### 2.2 Analysis
-
-`analyze_dims()` takes the 13 op calls + parameter shapes and:
-
-1. **Assigns dimension IDs**: `q → (d0, d1)`, `k → (d2, d3)`, `v → (d4, d5)`.
-2. **Unifies dimensions** across ops using `OPERAND_AXES` axis labels:
-   - Ops 0–1 transpose: q`(d0, d1)` → q_t`(d1, d0)`. k`(d2, d3)` → k_t`(d3, d2)`.
-   - Op 2 matmul1: K=d1 unifies d3→d1. Output scores → (d0, d2).
-   - Ops 3–4 (scale, mask): shape-preserving, no new unifications.
-   - Op 10 transpose: exp_s`(d0, d2)` → exp_s_t`(d2, d0)`.
-   - Op 11 matmul2: K=d2 unifies d4→d2. Output → (d0, d5).
-3. **Computes tile sizes**: `tile_size = max(all TILE_LIMITS)`, capped at 128 when the dim appears at position 0 (partition axis) of any tensor.
-4. **Classifies dimensions**: dims in the return variable → parallel; rest → reduction.
-
-| Dim | Size | Partition axis? | tile_size | count | Type |
-|---|---|---|---|---|---|
-| d0 (seq_q) | 512 | yes | 128 | 4 | parallel |
-| d1 (d_k) | 128 | yes (q_t, k_t) | 128 | 1 | reduction |
-| d2 (seq_k) | 512 | yes (attn_t, v) | 128 | 4 | reduction |
-| d5 (d_v) | 1024 | no | 512 | 2 | parallel |
-
-d2 gets `max(N:512, K:128) = 512` from TILE_LIMITS, but the **partition-axis cap** reduces it to 128 because d2 appears at position 0 in `attn_t(d2, d0)` and `v(d2, d5)`. d1 has 1 tile — its loop is `affine_range(1)` (no-op), so it is omitted from the enumeration analysis below.
-
-### 2.3 Pass Assignment
-
-`assign_passes()` walks the op calls and identifies **barrier ops** — ops with cross-tile reduction (`has_reduction` = True). Each barrier increments a per-dimension pass counter.
-
-| Barrier | Op | Reduces over | Pass |
-|---|---|---|---|
-| Op 2 | `NKIMatmul` (scores) | d1 | d1 pass 0 |
-| Op 5 | `NKITensorReduce` (max_s) | d2 | d2 pass 0 |
-| Op 8 | `NKITensorReduce` (sum_exp) | d2 | d2 pass 1 |
-| Op 11 | `NKIMatmul` (attn) | d2 | d2 pass 2 |
-
-Non-barrier ops are classified by position relative to barriers:
-
-| Classification | Ops | Description |
-|---|---|---|
-| **pre_compute** for (d1, 0) | 0 (transpose q), 1 (transpose k) | Transpose inputs before matmul1 |
-| **pre_compute** for (d2, 0) | 3 (scale), 4 (affine_select) | Scale and mask before d2 pass 0 barrier |
-| **pre_compute** for (d2, 1) | 6 (subtract), 7 (exp) | 2D ops before d2 pass 1 barrier |
-| **inter_pass** after (d2, 1) | 9 (reciprocal) | 1D op between d2 passes 1 and 2 |
-| **pre_compute** for (d2, 2) | 10 (transpose) | Transpose exp_s before matmul2 |
-| **post_compute** after (d2, 2) | 12 (multiply) | Normalize output by inv_sum |
-
-**Inter-pass ops** are 1D column-vector operations that execute once after a pass completes (not recomputed per d2 tile). The reciprocal of `sum_exp` runs between passes 1 and 2.
-
----
-
-## 3. Schedule
-
-A `Schedule` is an immutable, hashable NamedTuple:
-
-```python
-class Schedule(NamedTuple):
-    loop_order: tuple[tuple[str, int], ...]
-    dim_schedules: tuple[DimSchedule, ...]
-    op_placements: tuple[int, ...]
-```
-
-### 3.1 Loop Order
-
-`loop_order` is a sequence of items `(dim_id, pass_index)`. Parallel dims use `pass_index=0`; reduction passes use `0, 1, 2, ...`.
-
-Walking left to right, parallel dims accumulate into the **nesting context**. Reduction passes inherit the current context but don't extend it. The context determines which dims wrap a pass's loop.
-
-**Default loop_order** for the running example:
-
-```
-((d0, 0), (d5, 0), (d2, 0), (d2, 1), (d2, 2))
-```
-
-| Pos | Item | Context | Meaning |
-|---|---|---|---|
-| 0 | (d0, 0) | {d0} | Outer parallel loop: seq_q |
-| 1 | (d5, 0) | {d0, d5} | Inner parallel loop: d_v |
-| 2 | (d2, 0) | {d0, d5} | Pass 0: sequential d2 loop (running max) |
-| 3 | (d2, 1) | {d0, d5} | Pass 1: sequential d2 loop (running sum) |
-| 4 | (d2, 2) | {d0, d5} | Pass 2: affine d2 loop (matmul2 accumulation) |
-
-### 3.2 Blocking and Placements
-
-**`DimSchedule`**: per-dim `(dim_id, tile_size, tiles_per_block)`. Default: `tpb=1`.
-
-**`op_placements`**: per-input-param level from 0 to `num_dependent_dims`. Controls load buffer sizing via the **sentinel mechanism**:
-
-- Level 0: all dims outside → load all tiles once (largest buffer, max reuse)
-- Level N (natural): all dims active → reload each iteration (smallest buffer)
-
-Buffer shape: `(tile_size_par, num_tiles_par, num_tiles_free_0, ..., tile_size_free_0, ...)`. `num_tiles` = `total_tiles` (outside) or `tiles_per_block` (active).
-
-### 3.3 Enumeration
+### 5.3 Enumeration
 
 The schedule space is the cross-product of three independent axes:
 
-**Axis 1 — Loop Orders**: permutations of the 5 items where d2 passes maintain relative order. $C(5,2) \times 2! = 20$ valid orderings.
+**Axis 1 — Loop order**: permutations of the $L$ loop entries. If a dimension appears $r$ times (multiple reduction sweeps), those $r$ entries must maintain their relative order. The constraint reduces the space from $L!$ to $L! / \prod r_i!$ where $r_i$ is the repeat count of each dimension.
 
-**Axis 2 — Op Placements**: per-load level from 0 to `num_dependent_dims`. Load q has 1 effective dim (d0), load k has 1 (d2), load v has 2 (d5, d2). $2 \times 2 \times 3 = 12$ combinations.
+**Axis 2 — Blocking**: for each unique dimension, `tiles_per_block` can be any divisor of `total_tiles` (= dim_size / tile_size). The number of choices per dimension is the divisor count of its total tiles.
 
-**Axis 3 — Blocking**: divisors of total tile count per dim. d0: {1,2,4}, d5: {1,2}, d2: {1,2,4}. $3 \times 2 \times 3 = 18$ combinations.
+**Axis 3 — Load placements**: for each input tensor with $N$ dependent dims, the level ranges from 0 to $N$, giving $N+1$ choices.
 
-$$\text{Full space} = 20 \times 12 \times 18 = 4320 \text{ candidates}$$
+$$\text{Full space} = \text{loop orders} \times \prod_{\text{dims}} |\text{divisors}(total\_tiles_i)| \times \prod_{\text{tensors}} (N_j + 1)$$
 
-Validation (§3.4) prunes to feasible schedules. Every survivor is rendered, compiled, and benchmarked.
+Hardware validation prunes infeasible schedules. In the `Tensor` layout, `TILE_SIZES[AXES[0]]` is the partition dimension (≤ 128 by hardware), while `NUM_TILES` for all axes — including tiles_per_block and num_blocks — expand into the free dimension. Larger blocking grows the free dim, which must stay within SBUF capacity (24 MB) and PSUM accumulator limits. Every survivor is rendered, compiled, and benchmarked.
 
-### 3.4 Validation
+**Running example** with typical Llama-style single-head attention shapes: `q[4096, 128], k[4096, 128], v[4096, 128]`:
 
-1. **SBUF partition**: dim 0 of each buffer ≤ 128.
-2. **PSUM partition**: accumulator dim 0 ≤ 128.
-3. **PSUM free-dim**: accumulator free-dim ≤ `ACC_FREE_DIM_LIMIT` (2048).
-4. **Blocking**: `tiles_per_block` divides total tiles.
+| Dim | Size | tile_size | total_tiles | Valid tpb (divisors) | Count |
+|---|---|---|---|---|---|
+| d0 (seq_q) | 4096 | 128 | 32 | {1, 2, 4, 8, 16, 32} | 6 |
+| d1 (d_k) | 128 | 128 | 1 | {1} | 1 |
+| d2 (seq_k) | 4096 | 512 | 8 | {1, 2, 4, 8} | 4 |
+| d5 (d_v) | 128 | 512 | 1 | {1} | 1 |
+
+- **Loop orders**: $6! / 3! = 120$ (4 unique dims after unification: d0, d1, d2, d5; d2 appears 3× for its 3 barrier ops → 6 entries, d2s maintain relative order)
+- **Blocking**: $6 \times 1 \times 4 \times 1 = 24$
+- **Load placements**: $3 \times 3 \times 3 = 27$ (Q, K, V each have 2 dependent dims → 3 levels)
+
+$$\text{Full space} = 120 \times 24 \times 27 = 77{,}760 \text{ candidates}$$
+
+<!-- ---
 
 ### 3.5 Schedule Transformations (Design Direction)
 
