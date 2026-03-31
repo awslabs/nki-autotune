@@ -286,6 +286,8 @@ class NKITensorReduce(NKIOp):
     MAX_TILE_SIZES = {"P": 128}
     ENGINE = "VectorEngine"
 
+    _NKI_REDUCE_OPS = {"max": "maximum", "add": "add"}
+
     def __call__(self, data, op):
         reduce = {"max": np.max, "add": np.sum}
         return reduce[op](data, axis=1)
@@ -293,7 +295,7 @@ class NKITensorReduce(NKIOp):
     def render(self, ctx):
         dst = ctx.outputs["output"]
         data = ctx.operands["data"]
-        op_name = ctx.config_kwargs["op"]
+        op_name = self._NKI_REDUCE_OPS[ctx.config_kwargs["op"]]
         return f"nisa.tensor_reduce(dst={dst.NAME}, data={data.NAME}, op=nl.{op_name}, axis=1)"
 
 
@@ -379,7 +381,7 @@ The parser also identifies the function's input parameters (`Q, K, V, scale`) an
 
 ## 5. Dimension Analysis
 
-To tile and schedule a math function for hardware, we need to know what dimensions exist, how they relate across ops, and which are parallel vs reduction. This is derived mechanically from `NKIOp.OPERAND_AXES` and `OUTPUT_AXES`.
+To tile and schedule a math function for hardware, we need to know what dimensions exist, how they relate across ops, and which are independent vs dependent. This is derived mechanically from `NKIOp.OPERAND_AXES` and `OUTPUT_AXES`.
 
 ### 5.1 Dimension Assignment and Unification
 
@@ -417,35 +419,40 @@ For the running example:
 
 After the walk, 4 unique dimensions remain: **d0, d1, d2, d5**.
 
-### 5.2 Parallel vs Reduction
+### 5.2 Dimension Dependencies
 
-An axis label present in `OPERAND_AXES` but absent from `OUTPUT_AXES` is consumed by the op — it's a **reduction axis**. For example, `NKIMatmul` has K in both operands but not in the output; `NKITensorReduce` has F in the input but not the output.
+Dimensions form **dependency groups** based on data flow. An axis label present in `OPERAND_AXES` but absent from `OUTPUT_AXES` is consumed by that op — all tiles along that dimension must be processed before the op's output is complete. Dimensions that share this property (consumed by ops in the same data-flow chain) form a dependency group.
 
 ```python
-def has_reduction(op: NKIOp) -> bool:
+def is_consumed_by(op: NKIOp) -> set[str]:
     input_labels = {l for axes in op.OPERAND_AXES.values() for l in axes}
     output_labels = {l for axes in op.OUTPUT_AXES.values() for l in axes}
-    return bool(input_labels - output_labels)
+    return input_labels - output_labels
 ```
 
-A dimension's **global classification** depends on whether it appears in the final output:
+A dimension's grouping depends on whether it appears in the final output's axes:
 
-- **Parallel**: dimension is in the return variable's axes → independent tiles, can execute in any order
-- **Reduction**: dimension is not in the return variable → must be accumulated across tiles
+- **Independent**: dimension is in the return variable's axes → forms a dependency group by itself. Tiles can execute in any order.
+- **Dependent**: dimension is not in the return variable's axes → shares a dependency group with other non-output dimensions. All tiles across the group must be swept before the output tile is ready.
 
 ```python
-def classify_dims(dims, return_var_axes):
-    return {d: "parallel" if d in return_var_axes else "reduction" for d in dims}
+def dependency_groups(dims, return_var_axes):
+    independent = [(d,) for d in dims if d in return_var_axes]
+    dependent = tuple(d for d in dims if d not in return_var_axes)
+    groups = independent + ([dependent] if dependent else [])
+    return tuple(groups)
 ```
 
 For the running example, `output` has axes `(d0, d5)`:
 
-| Dim | Type | Why |
+| Dim | Group | Why |
 |---|---|---|
-| d0 | parallel | in output(d0, d5) |
-| d1 | reduction | consumed by matmul K axis |
-| d2 | reduction | consumed by matmul K axis and tensor_reduce F axis |
-| d5 | parallel | in output(d0, d5) |
+| d0 | {d0} — independent | in output(d0, d5) |
+| d1 | {d1, d2} — dependent | consumed by matmul K axis |
+| d2 | {d1, d2} — dependent | consumed by matmul K axis and tensor_reduce F axis |
+| d5 | {d5} — independent | in output(d0, d5) |
+
+Independent dimensions (d0, d5) each form a group of size 1 — their tiles are self-contained. Dependent dimensions (d1, d2) form a shared group — all tiles across both must be swept before the output tile is ready. As a group, {d1, d2} is independent from {d0} and {d5}.
 
 ### 5.3 Tile Sizes
 
@@ -467,22 +474,23 @@ Ops whose limit for a dimension is smaller than the tile size emit **in-place su
 
 ### 5.4 Analysis Result
 
-The dimension analysis produces an `Analysis` — the complete tiling and data-flow metadata consumed by the schedule enumerator (§6) and renderer (§7):
+The dimension analysis produces an `Analysis` — the complete tiling and data-flow metadata consumed by the loop nest enumerator (§6) and renderer (§7):
 
 ```python
 class Analysis(NamedTuple):
     dims: dict[str, Dim]
+    dependency_groups: tuple[tuple[str, ...], ...]
     var_axes: dict[str, tuple[str, ...]]
     return_var: str
 
 class Dim(NamedTuple):
     dim_id: str
-    classification: str  # "parallel" or "reduction"
     tile_size: int
     input_size: int
 ```
 
-- **`dims`**: all unique dimensions after unification, each with its classification (§5.2) and tile size (§5.3).
+- **`dims`**: all unique dimensions after unification, each with its tile size (§5.3).
+- **`dependency_groups`**: dimension groupings from §5.2. Each tuple is a group of dimension IDs that are data-dependent on each other. Independent dimensions appear as singleton tuples.
 - **`var_axes`**: maps every variable name (inputs, intermediates, output) to its ordered tuple of dimension IDs. E.g., `{"Q": ("d0", "d1"), "S": ("d0", "d2"), "output": ("d0", "d5"), ...}`.
 - **`return_var`**: the name of the function's return variable (e.g., `"output"`).
 
@@ -490,68 +498,215 @@ For the running example:
 
 | Field | Value |
 |---|---|
-| `dims` | `{"d0": Dim("d0", "parallel", 128, 512), "d1": Dim("d1", "reduction", 128, 128), "d2": Dim("d2", "reduction", 512, 512), "d5": Dim("d5", "parallel", 512, 1024)}` |
+| `dims` | `{"d0": Dim("d0", 128, 512), "d1": Dim("d1", 128, 128), "d2": Dim("d2", 512, 512), "d5": Dim("d5", 512, 1024)}` |
+| `dependency_groups` | `(("d0",), ("d5",), ("d1", "d2"))` |
 | `var_axes` | `{"Q": ("d0","d1"), "K": ("d2","d1"), "V": ("d2","d5"), "Q_t": ("d1","d0"), "K_t": ("d1","d2"), "S": ("d0","d2"), ...}` |
 | `return_var` | `"output"` |
 
-## 6. Schedule
+## 6. Kernel Spec
 
 A `Schedule` is an immutable, hashable descriptor that captures *how* to execute the math function — independently of *what* to compute (which comes from §1–5).
 
 ```python
 class Loop(NamedTuple):
-    dim_id: str
-    tiles_per_block: int
+    dim_id: str            # global dimension ID from analysis (e.g. "d0")
+    tile_size: int         # hardware tile size from §5.3
+    tiles_per_block: int   # block size — §6.3
 
 class Schedule(NamedTuple):
-    loop_order: tuple[tuple[Loop, tuple[int, int]], ...]  # ((Loop, (level, order)), ...)
-    load_placements: tuple[tuple[str, int], ...]  # ((tensor_name, relative_pos), ...)
+    loop_order: tuple[tuple[Loop, tuple[int, int]], ...]  # (Loop, (level, order)) — §6.2
+    load_placements: tuple[tuple[str, int], ...]          # (tensor_name, relative_pos) — §6.4
 ```
 
-### 6.1 Loop Order
+Each `loop_order` entry pairs a `Loop` with a `(level, order)` tuple. `level` is the nesting depth — different levels nest. `order` is sequential execution order within the same level — same level, different order means back-to-back loops (§6.2).
 
-`loop_order` is a tuple of `(Loop, (level, order))` pairs. The two integers fully determine nesting and execution order:
+### 6.1 Single Dimension Loop
 
-- **`level`**: nesting level. Different levels mean nested loops (outer vs inner).
-- **`order`**: execution order within that level. Same level, different order means sequential (back-to-back) loops.
-
-Each `Loop` represents a **two-level loop** — a block loop and a tile loop:
+Each dimension produces a double loop — a **block loop** and a **tile loop**:
 
 ```
-for block in range(num_blocks):                 # block loop: num_blocks = total_tiles / tiles_per_block
-    for tile in range(tiles_per_block):          # tile loop: iterate within the block
+for block_iter in range(total_tiles // tiles_per_block):   # block loop
+    for tile_iter in range(tiles_per_block):                # tile loop
+        [ops execute here, one tile at a time]
 ```
 
-Parallel dims each increase the level. Reduction dims that require multiple sequential sweeps (e.g., running max, running sum, matmul accumulation) share the same level but have distinct order indices — they run back-to-back, not nested.
+Hardware computes on a single tile at a time — this is fixed. The double loop structure creates a slot between the block and tile loops where DMA loads (§6.4) can be placed. `tiles_per_block` controls the block size (§6.3).
 
-`tiles_per_block` controls blocking — how many tiles are grouped into one block. Must divide the total tile count. Larger `tiles_per_block` means larger SBUF buffers (holding more tiles at once) but fewer DMA round-trips — the loaded block is reused across all tile iterations within it.
+For code style consistency, the renderer **always emits both loops** regardless of `tiles_per_block` value or whether DMA loads are placed. When `tiles_per_block = 1`, the tile loop runs 1 iteration. When `tiles_per_block = total_tiles`, the block loop runs 1 iteration. Neither case collapses to a single loop — the double structure is always explicit.
 
-**Example loops** for the running example:
+### 6.2 Loop Order
 
-| Loop (dim_id, tpb) | (level, order) | Meaning |
+The loop order determines which dimension loops are nested (enclosing each other) vs. executed back-to-back (sequentially at the same nesting depth). It is derived directly from the operator dependency graph.
+
+#### Operator dependency graph
+
+The operator dependency graph is constructed directly from the math function — each operator is a node, each data dependency is an edge labeled with the tensor name and its dimensions.
+
+![Operator dependency graph for attention. Every node is an operator from the math function. Nodes that reduce/accumulate are labeled with their dimension. Dashed edges marked "blocks" are blocking boundaries — a dimension's loop cannot cross them. d1 has 1 boundary; d2 has 3.](diagrams/op_dependency_graph.png)
+
+#### Analyzing dimensions from the graph
+
+To determine valid loop orders, examine each dimension's role across the entire graph. The question for each dimension: does any operator–consumer pair make it blocking?
+
+Two kinds of incomplete results arise when a dimension is only partially iterated:
+
+- **Partial result**: valid and usable by consumers — a correct slice of the output, just not the full output. Example: one output row tile of a matmul along the non-accumulation axis.
+- **Intermediate result**: not valid, cannot be used by consumers. Example: a matmul accumulator halfway through its accumulation dimension — a sum of some but not all products, meaningless to downstream ops.
+
+A dimension is **blocking** for an operator–consumer pair when the operator produces intermediates on that dimension and the consumer cannot use them.
+
+The general principle: **a dimension can be freely repositioned in the loop nest — blocking pairs are the only constraints.** Each blocking pair creates a phase boundary: the phase must complete all tiles before its consumer can proceed. Other dimensions' items can be interleaved between a dimension's phases, changing relative nesting.
+
+**d0** appears in virtually every tensor (Q[d0,d1], S[d0,d2], max_S[d0], attn[d0,d5], ...). Every operator–consumer pair along d0 produces partials — each d0 tile is independently valid. **0 blocking pairs** → the d0 item can go anywhere in the permutation.
+
+**d5** appears only in V[d2,d5], attn[d0,d5], and output[d0,d5]. Every pair along d5 (V → matmul2, matmul2 → output_scale) produces partials. **0 blocking pairs** → the d5 item can go anywhere in the permutation.
+
+**d1** appears in Q[d0,d1], K[d2,d1], Q_t[d1,d0], K_t[d1,d2]. The first nc_matmul accumulates over d1 to produce S[d0,d2]. Its consumer (tensor_scalar: scale) expects a completed dot product — a mid-accumulation value is an intermediate. After matmul1 produces S, d1 disappears from the graph. **1 blocking pair** (matmul → scale) → 1 phase. The d1 item can go anywhere in the permutation.
+
+**d2** spans most of the graph, from S[d0,d2] through attn[d0,d5]. **3 blocking pairs**, sequential in the data flow:
+
+1. tensor_reduce(max) → tensor_scalar(subtract): subtract expects the true max over all d2 tiles; a partial max is an intermediate.
+2. tensor_reduce(add) → activation(reciprocal): reciprocal expects the true sum over all d2 tiles; a partial sum is an intermediate.
+3. nc_matmul → tensor_scalar(×inv_sum): multiply cannot start until matmul2 finishes accumulating all d2 tiles; a mid-accumulation value is an intermediate.
+
+Each blocking pair requires its preceding ops to complete a full d2 iteration, giving **3 phases**: {scale, mask, reduce_max}, {subtract, exp, reduce_sum}, {transpose_exp, matmul2}. The 3 phase items must maintain sequential order in the permutation, but other dimensions' items can be interleaved between them.
+
+| Dimension | Blocking pairs | Phases |
 |---|---|---|
-| (d0, 1) | (0, 0) | Outer parallel loop: seq_q |
-| (d5, 1) | (1, 0) | Parallel loop: d_v |
-| (d1, 1) | (2, 0) | d_k reduction (matmul1 K axis) |
-| (d2, 1) | (2, 1) | seq_k reduction (running max) |
-| (d2, 1) | (2, 2) | seq_k reduction (running sum) — needs completed max |
-| (d2, 1) | (2, 3) | seq_k reduction (matmul2 K axis) — needs completed inv_sum |
+| d0 | 0 | 1 |
+| d5 | 0 | 1 |
+| d1 | 1: nc_matmul → tensor_scalar(scale) | 1 |
+| d2 | 3: reduce(max) → subtract, reduce(add) → reciprocal, matmul → multiply | 3 |
+| **Total items** | | **6** |
 
-d2 appears 3 times because the math function has 3 barrier ops that fully reduce over d2: `tensor_reduce(max)`, `tensor_reduce(sum)`, and `nc_matmul` (matmul2). Each barrier requires a complete sweep — the next cannot start until the previous reduction is finished across all d2 tiles.
+A mathematical transformation like online softmax can change whether an operator–consumer pair blocks. For example, reformulating the downstream matmul to accept intermediate reduction results with correction factors removes that blocking pair from the graph. Such transformations run before this analysis, but do not change the enumeration algorithm.
 
-### 6.2 Load Placements
+#### Enumeration
 
-`load_placements` maps each input tensor name to an integer `relative_pos` from 0 to `num_dependent_dims`. The `relative_pos` controls how deep into the loop nest the DMA load is placed, relative to the tensor's dependent dims. Load placement is the **only** allocation with a real search space — hoisting a load outward amortizes DMA latency across more tiles at the cost of larger SBUF buffers. All other on-chip allocations are either **deterministic** (accumulation targets like matmul/reduce outputs must be outside the loop they accumulate across, dictated by the math data flow) or **trivially minimum-scope** (SSA intermediates and cross-pass buffers have no DMA cost to amortize, so they always go at the innermost possible scope to conserve SBUF/PSUM capacity).
+Each phase from the analysis above becomes a **loop** — a complete iteration over all tiles of that dimension. A free dimension has one loop. A constrained dimension has one loop per phase (each phase iterates over all tiles of that dimension independently). The **loop order** is the sequence of these loops, and different orderings produce different nesting structures (§6.1).
 
-`num_dependent_dims` is the number of unique loop dimensions that appear in the tensor's axes (after unification), ordered by their position in `loop_order`. Each `relative_pos` moves the load point one dependent loop deeper. Since each Loop is a block loop + tile loop, "outside" means before the block loop, and "inside" means between the block and tile loops:
+For attention, 6 loops:
 
-- **relative_pos 0**: outside all dependent loops (before their block loops) → `NUM_TILES = total_tiles` for all dependent axes
-- **relative_pos k**: inside the first k dependent loops (between their block and tile loops) → `NUM_TILES = tiles_per_block` for those k axes, `total_tiles` for the rest
-- **relative_pos N**: inside all dependent loops → `NUM_TILES = tiles_per_block` for all dependent axes
+| Loop | What it iterates | Ops in this phase |
+|---|---|---|
+| (d0, 0) | all d0 tiles | all ops (d0 is free) |
+| (d5, 0) | all d5 tiles | matmul2, multiply (d5 is free) |
+| (d1, 0) | all d1 tiles | transpose Q, K → matmul1 |
+| (d2, 0) | all d2 tiles | scale, mask → reduce_max |
+| (d2, 1) | all d2 tiles | subtract, exp → reduce_sum |
+| (d2, 2) | all d2 tiles | transpose_exp → matmul2 |
 
-To hold just 1 tile for a dimension, set `tiles_per_block=1` on the Loop and place the tensor inside — no separate case needed.
+A **loop order** is a permutation of these 6 loops. The only constraint: same-dimension loops must maintain their data-flow order ((d2, 0) before (d2, 1) before (d2, 2)). $6!$ counts all possible orderings of 6 loops; dividing by $3!$ removes the orderings that violate d2's phase constraint:
 
-A tensor with N dependent dims has N+1 valid `relative_pos` values.
+$$\frac{6!}{1! \cdot 1! \cdot 1! \cdot 3!} = 120 \text{ valid loop orders}$$
+
+In general, for $n$ total loops where dimension $d$ has $p_d$ phases:
+
+$$\text{loop orders} = \frac{n!}{\prod_d p_d!}$$
+
+#### Nesting structure
+
+Each item maps to a two-level loop (block + tile) from §6.1. The item's position in the permutation determines a `(level, order)` pair that controls how loops nest:
+
+- **Different levels** → nested loops (outer level encloses inner)
+- **Same level, different order** → back-to-back sequential loops at the same depth
+
+The encoding rules:
+
+1. Each free dim gets its own level with `order = 0`.
+2. Constrained dims share a level, each incrementing order.
+3. A free dim following constrained dims advances to a new level.
+4. Same-dim phases always share their originally assigned level.
+
+#### Running example (attention)
+
+**Default loop order** — free dims outermost, constrained dims innermost:
+
+| Item | level | order |
+|---|---|---|
+| (d0, 0) | 0 | 0 |
+| (d5, 0) | 1 | 0 |
+| (d1, 0) | 2 | 0 |
+| (d2, 0) | 2 | 1 |
+| (d2, 1) | 2 | 2 |
+| (d2, 2) | 2 | 3 |
+
+d1 and all three d2 phases share level 2, executing back-to-back:
+
+```
+for d0_block: for d0_tile:                                          # level 0
+  for d5_block: for d5_tile:                                        # level 1
+    for d1_block: for d1_tile: [transpose Q, K → matmul1]          # level 2, order 0
+    for d2_block: for d2_tile: [scale, mask → reduce_max]           # level 2, order 1
+    for d2_block: for d2_tile: [sub, exp → reduce_sum; reciprocal]  # level 2, order 2
+    for d2_block: for d2_tile: [transpose exp_S → matmul2]          # level 2, order 3
+    [output_scale]                                                   # post-compute
+```
+
+**Alternative loop order** — d5 nested inside d2 phase 2 (matmul2 uses both d2 and d5):
+
+| Item | level | order |
+|---|---|---|
+| (d0, 0) | 0 | 0 |
+| (d1, 0) | 1 | 0 |
+| (d2, 0) | 1 | 1 |
+| (d2, 1) | 1 | 2 |
+| (d2, 2) | 1 | 3 |
+| (d5, 0) | 2 | 0 |
+
+Constrained dims at level 1 (back-to-back), d5 at level 2 nested inside d2 phase 2:
+
+```
+for d0_block: for d0_tile:                                          # level 0
+  for d1_block: for d1_tile: [transpose Q, K → matmul1]            # level 1, order 0
+  for d2_block: for d2_tile: [scale, mask → reduce_max]             # level 1, order 1
+  for d2_block: for d2_tile: [sub, exp → reduce_sum; reciprocal]    # level 1, order 2
+  for d2_block: for d2_tile:                                         # level 1, order 3
+    for d5_block: for d5_tile: [transpose exp_S → matmul2]          # level 2
+  [output_scale]
+```
+
+The default iterates all d2 tiles per d5 tile; this alternative iterates all d5 tiles per d2 tile. Both are valid — matmul2 accumulates over d2 regardless. The difference is memory access pattern and buffer sizing.
+
+All 120 orderings are structurally valid loop nestings. Hardware validation (§6.5) prunes combinations that violate SBUF capacity or PSUM accumulator limits.
+
+### 6.3 Tiles Per Block
+
+`tiles_per_block` is a per-dimension parameter that controls the block size — how many tiles are grouped before the tile loop iterates over them. Larger `tiles_per_block` means larger SBUF buffers but fewer DMA round-trips: the loaded block is reused across `tiles_per_block` compute iterations. Must divide `total_tiles`.
+
+With `tiles_per_block > 1`, the block/tile split becomes meaningful:
+
+```
+for i_d0_block in range(32 // 4):            # block: 8 iterations
+  [DMA load: 4 tiles of Q along d0]
+  for i_d0_tile in range(4):                 # tile: 4 iterations per block
+    ...
+```
+
+When no DMA load is placed on a dimension (e.g., reduction phases that operate on on-chip intermediates), the double loop still appears — no loads fire between them, but the structure is preserved.
+
+**Enumeration.** For each unique dimension, `tiles_per_block` can be any divisor of `total_tiles` (= `dim_size / tile_size`). The total number of combinations is the product of divisor counts across all dimensions:
+
+$$\prod_{\text{dims}} |\text{divisors}(total\_tiles_i)|$$
+
+For the running example: $3 \times 1 \times 1 \times 2 = 6$ (d0: 4 tiles → 3 divisors, d1: 1 tile → 1, d2: 1 tile → 1, d5: 2 tiles → 2).
+
+### 6.4 Load Placements
+
+`load_placements` maps each input tensor to an integer `relative_pos` — how deep into the loop nest the DMA load is placed. The N dependent dimensions of a tensor create N+1 placement slots:
+
+- **Slot 0**: outside all dependent loops (before the outermost dependent dim's block loop)
+- **Slot k**: between the k-th dependent dim's block and tile loops
+- **Slot N**: between the N-th (innermost) dependent dim's block and tile loops
+
+Placing a load at slot k means it is automatically inside the block loops of dims 1..k (since they are enclosing). The load fires once per block iteration of the k-th dim. Deeper placement → more frequent reloads but smaller SBUF buffers.
+
+Each slot determines the DMA buffer size along every dependent axis:
+
+- **Dims 1..k** (load is inside their block loop): `NUM_TILES = tiles_per_block` — only the current block is in SBUF
+- **Dims k+1..N** (load is outside their loop): `NUM_TILES = total_tiles` — the full extent is loaded
+
+Load placement is the **only** allocation with a real search space — hoisting a load outward amortizes DMA latency across more compute iterations at the cost of larger SBUF buffers. All other on-chip allocations are either **deterministic** (accumulation targets like matmul/reduce outputs must be outside the loop they accumulate across, dictated by the math data flow) or **trivially minimum-scope** (SSA intermediates and cross-pass buffers have no DMA cost to amortize, so they always go at the innermost possible scope to conserve SBUF/PSUM capacity).
 
 For the running example:
 
@@ -561,38 +716,38 @@ For the running example:
 | K | (d2, d1) | d1, d2 | 0, 1, 2 |
 | V | (d2, d5) | d5, d2 | 0, 1, 2 |
 
-### 6.3 Enumeration
+### 6.5 Enumeration
 
-The schedule space is the cross-product of three independent axes:
+The search space is the cross-product of three independent axes:
 
-**Axis 1 — Loop order**: permutations of the $L$ loop entries. If a dimension appears $r$ times (multiple reduction sweeps), those $r$ entries must maintain their relative order. The constraint reduces the space from $L!$ to $L! / \prod r_i!$ where $r_i$ is the repeat count of each dimension.
+**Axis 1 — Loop order** (§6.2): permutations of items (free dims + constrained dim phases) where same-dim phases maintain order. Count = $n! / \prod_d p_d!$.
 
-**Axis 2 — Blocking**: for each unique dimension, `tiles_per_block` can be any divisor of `total_tiles` (= dim_size / tile_size). The number of choices per dimension is the divisor count of its total tiles.
+**Axis 2 — Tiles per block**: for each unique dimension, `tiles_per_block` can be any divisor of `total_tiles` (= dim_size / tile_size). The number of choices per dimension is the divisor count of its total tiles.
 
-**Axis 3 — Load placements**: for each input tensor with $N$ dependent dims, `relative_pos` ranges from 0 to $N$, giving $N+1$ choices.
+**Axis 3 — Load placements**: for each input tensor, `relative_pos` determines placement depth. The number of valid slots depends on the tensor's dependent dims and their nesting structure (§6.4).
 
-$$\text{Full space} = \text{loop orders} \times \prod_{\text{dims}} |\text{divisors}(total\_tiles_i)| \times \prod_{\text{tensors}} (N_j + 1)$$
+$$\text{Full space} = \text{loop orders} \times \prod_{\text{dims}} |\text{divisors}(total\_tiles_i)| \times \prod_{\text{tensors}} \text{valid\_slots}_j$$
 
-Hardware validation prunes infeasible schedules. In the `Tensor` layout, `TILE_SIZES[AXES[0]]` is the partition dimension (≤ 128 by hardware), while `NUM_TILES` for all axes — including tiles_per_block and num_blocks — expand into the free dimension. Larger blocking grows the free dim, which must stay within SBUF capacity (24 MB) and PSUM accumulator limits. Every survivor is rendered, compiled, and benchmarked.
+Hardware validation prunes infeasible candidates. In the `Tensor` layout, `TILE_SIZES[AXES[0]]` is the partition dimension (≤ 128 by hardware), while `NUM_TILES` for all axes expand into the free dimension. Larger `tiles_per_block` grows the free dim, which must stay within SBUF capacity (24 MB) and PSUM accumulator limits. Every survivor is rendered, compiled, and benchmarked.
 
-**Running example** with typical Llama-style single-head attention shapes: `q[4096, 128], k[4096, 128], v[4096, 128]`:
+**Running example** with typical Llama-style shapes: `q[4096, 128], k[4096, 128], v[4096, 128]`:
 
-| Dim | Size | tile_size | total_tiles | Valid tpb (divisors) | Count |
+| Dim | Size | tile_size | total_tiles | Valid tiles_per_block (divisors) | Count |
 |---|---|---|---|---|---|
 | d0 (seq_q) | 4096 | 128 | 32 | {1, 2, 4, 8, 16, 32} | 6 |
 | d1 (d_k) | 128 | 128 | 1 | {1} | 1 |
 | d2 (seq_k) | 4096 | 512 | 8 | {1, 2, 4, 8} | 4 |
 | d5 (d_v) | 128 | 128 | 1 | {1} | 1 |
 
-- **Loop orders**: $6! / 3! = 120$ (4 unique dims after unification: d0, d1, d2, d5; d2 appears 3× for its 3 barrier ops → 6 entries, d2s maintain relative order)
-- **Blocking**: $6 \times 1 \times 4 \times 1 = 24$
-- **Load placements**: $3 \times 3 \times 3 = 27$ (Q, K, V each have 2 dependent dims → 3 valid `relative_pos` values)
+- **Loop orders**: $6! / 3! = 120$ (6 items: d0, d5, d1, d2×3 passes)
+- **Tiles per block**: $6 \times 1 \times 4 \times 1 = 24$
+- **Load placements**: $3 \times 3 \times 3 = 27$ (Q: 3 slots, K: 3 slots, V: 3 slots)
 
 $$\text{Full space} = 120 \times 24 \times 27 = 77{,}760 \text{ candidates}$$
 
 ## 7. Render (Specialization)
 
-Rendering is a **specialization** step: it takes the math function (§1), the op call list (§4), dimension analysis (§5), a schedule (§6), and **concrete input shapes and dtypes** to produce an NKI kernel tailored to those specific inputs. Each unique combination of input shapes and dtypes requires its own tuned kernel. Infrastructure ops (DMA loads, PSUM→SBUF staging, DMA stores) are generated by the renderer — they do not appear in the math function.
+Rendering is a **specialization** step: it takes the math function (§1), the op call list (§4), dimension analysis (§5), a loop nest (§6), and **concrete input shapes and dtypes** to produce an NKI kernel tailored to those specific inputs. Each unique combination of input shapes and dtypes requires its own tuned kernel. Infrastructure ops (DMA loads, PSUM→SBUF staging, DMA stores) are generated by the renderer — they do not appear in the math function.
 
 ### 7.1 Render Pipeline
 
@@ -609,9 +764,9 @@ render(op_calls: list[OpCall], analysis: Analysis, schedule: Schedule, input_sha
 1. **Emit preamble**: imports (`nki`, `nki.language as nl`, `nki.isa as nisa`), `@nki.jit` decorator, function signature with input params, shape and dtype assertions for each input, HBM output allocation.
 
 **Tensor naming**: input/output tensors use the same names as the math function (`q`, `k`, `v`, `output`). Intermediate tensors are named `{location}_{var_name}` where `location` is `sbuf` or `psum` and `var_name` is the variable name from the parsed math function (§4). Examples: `sbuf_Q_t`, `psum_S`, `sbuf_masked_S`.
-2. **Emit loop nest**: walk `schedule.loop_order` — each Loop emits a block loop (`nl.affine_range(num_blocks)`) and a tile loop (`nl.affine_range(tiles_per_block)`). `level` determines nesting; same-level loops run sequentially by `order`.
-3. **Emit DMA loads**: for each input tensor, place the `nisa.dma_copy(HBM→SBUF)` at the `relative_pos` specified by `schedule.load_placements`. Allocate an SBUF buffer with shape determined by `Tensor.NUM_TILES` (§6.2).
-4. **Emit PSUM accumulators**: before each reduction loop, emit `nl.ndarray(..., buffer=nl.psum)` followed by `nisa.memset(buf, value=...)`. Always this two-step sequence — never `nl.zeros`.
+2. **Emit loop nest**: walk the `loop_order` from the `Schedule`. Each entry's `(level, order)` determines nesting: entries at different levels produce nested loops (`nl.affine_range`), entries at the same level with different orders produce back-to-back sequential loops. Each `Loop` emits a block loop (`nl.affine_range(total_tiles // tiles_per_block)`) and tile loop (`nl.affine_range(tiles_per_block)`).
+3. **Emit DMA loads**: for each input tensor, place the `nisa.dma_copy(HBM→SBUF)` at the `relative_pos` specified by `schedule.load_placements` (§6.4). Allocate an SBUF buffer with shape determined by `Tensor.NUM_TILES`.
+4. **Emit PSUM accumulators**: before each dependent-dim loop, emit `nl.ndarray(..., buffer=nl.psum)` followed by `nisa.memset(buf, value=...)`. Always this two-step sequence — never `nl.zeros`.
    - **`nc_matmul`**: `nl.ndarray` + `nisa.memset(buf, value=0.0)`. Hardware accumulates — each matmul call adds its partial product to the same PSUM address, so a single buffer suffices.
    - **`tensor_reduce`**: when the reduction axis spans $T$ tiles in the loop, `nl.ndarray` a PSUM partial-results buffer with $T$ columns (one per tile), then `nisa.memset` with identity value (`0.0` for `add`, `-3.4e38` for `max`). Inside the loop, each tile's reduction result writes to its own column. After the loop, a second `nisa.tensor_reduce` collapses all columns into the final scalar result. This gather-then-reduce pattern is necessary because `tensor_reduce` overwrites its destination — unlike `nc_matmul`, it does not accumulate.
 5. **Emit compute ops**: each op is emitted as soon as all its operands are available — not deferred to the innermost level. For each op, build a `RenderContext` (§2) and call `NKIOp.render(ctx)`. Vector/Scalar/GpSimd ops (tensor_scalar, activation, affine_select) operate on SBUF; the renderer stages PSUM→SBUF before these ops and SBUF→PSUM after if needed.
@@ -632,7 +787,9 @@ Each `NKIOp.render(ctx)` returns one or more NKI source lines using `nisa.*` cal
 
 ### 7.3 Example Output
 
-Generic attention with symbolic shapes `q[S_q, D_k]`, `k[S_k, D_k]`, `v[S_k, D_v]` and all loads at `relative_pos=max`. Tile sizes from §5.3: $t_0 = 128$ (d0), $t_1 = 128$ (d1), $t_2 = 512$ (d2), $t_5 = \min(512, D_v)$ (d5). Block counts: $\text{num\_blocks}_i = S_i / (t_i \cdot \text{tiles\_per\_block}_i)$.
+Generic attention with symbolic shapes `q[S_q, D_k]`, `k[S_k, D_k]`, `v[S_k, D_v]` and all `tiles_per_block=1` with `relative_pos=max`. Tile sizes from §5.3: $t_0 = 128$ (d0), $t_1 = 128$ (d1), $t_2 = 512$ (d2), $t_5 = \min(512, D_v)$ (d5). Total tiles per dim: $\text{total\_tiles}_i = S_i / t_i$.
+
+The actual generated code always emits the double loop per §6.1 (e.g., `for i_d0_outer in nl.affine_range(total // 1)` + `for i_d0_inner in nl.affine_range(1)`). Below, the inner loops are elided for readability since `tiles_per_block=1` makes them single-iteration.
 
 ```python
 import numpy as np
@@ -650,374 +807,269 @@ def attention_kernel(q, k, v, scale):
     output: (d0=S_q, d5=D_v)
     """
 
-    d0_block_size = d0_tiles_per_block * t_0
-    d1_block_size = d1_tiles_per_block * t_1
-    d2_block_size = d2_tiles_per_block * t_2
-    d5_block_size = d5_tiles_per_block * t_5
+    d0_total_tiles = S_q // t_0
+    d1_total_tiles = D_k // t_1
+    d2_total_tiles = S_k // t_2
+    d5_total_tiles = D_v // t_5
 
     output_hbm = nl.ndarray((S_q, D_v), dtype=q.dtype, buffer=nl.shared_hbm)
 
-    for i_d0_blk in nl.affine_range(d0_num_blocks):
-      d0_blk_off = i_d0_blk * d0_block_size
-      for i_d0_tile in nl.affine_range(d0_tiles_per_block):
-        d0_off = d0_blk_off + i_d0_tile * t_0
-        for i_d5_blk in nl.affine_range(d5_num_blocks):
-          d5_blk_off = i_d5_blk * d5_block_size
-          for i_d5_tile in nl.affine_range(d5_tiles_per_block):
-            d5_off = d5_blk_off + i_d5_tile * t_5
+    for i_d0 in nl.affine_range(d0_total_tiles):
+      d0_off = i_d0 * t_0
+      for i_d5 in nl.affine_range(d5_total_tiles):
+        d5_off = i_d5 * t_5
 
-            # psum_S — axes=(d0, d2): d0 after tile, d2 before blk
-            psum_S = nl.ndarray(
-                (t_0, 1, d2_num_blocks, 1, d2_tiles_per_block, t_2),
-                dtype=nl.float32, buffer=nl.psum)
-            nisa.memset(psum_S, value=0.0)
+        """ psum_S — axes=(d0, d2): holds all d2 tiles for matmul1 accumulation.
+        d0: 1 tile (inside loop), d2: d2_total_tiles (accumulator spans full dim). """
+        psum_S = nl.ndarray(
+            (t_0, 1, 1, d2_total_tiles, 1, t_2),
+            dtype=nl.float32, buffer=nl.psum)
+        nisa.memset(psum_S, value=0.0)
 
-            for i_d1_blk in nl.affine_range(d1_num_blocks):
-              d1_blk_off = i_d1_blk * d1_block_size
+        for i_d1 in nl.affine_range(d1_total_tiles):
+          d1_off = i_d1 * t_1
 
-              # sbuf_Q — axes=(d0, d1): d0 after tile, d1 between blk/tile
-              sbuf_Q = nl.ndarray(
-                  (t_0, 1, 1, 1, d1_tiles_per_block, t_1),
-                  dtype=q.dtype, buffer=nl.sbuf)
+          """ sbuf_Q — axes=(d0, d1): 1 tile each (tiles_per_block=1 for both). """
+          sbuf_Q = nl.ndarray(
+              (t_0, 1, 1, 1, 1, t_1),
+              dtype=q.dtype, buffer=nl.sbuf)
+          nisa.dma_copy(
+              dst=sbuf_Q[0:t_0, 0, 0, 0, 0, 0:t_1],
+              src=q[d0_off:d0_off+t_0, d1_off:d1_off+t_1])
+
+          psum_Q_t = nl.ndarray(
+              (t_1, 1, 1, 1, 1, t_0),
+              dtype=nl.float32, buffer=nl.psum)
+          nisa.nc_transpose(
+              dst=psum_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0],
+              data=sbuf_Q[0:t_0, 0, 0, 0, 0, 0:t_1])
+          sbuf_Q_t = nl.ndarray(
+              (t_1, 1, 1, 1, 1, t_0),
+              dtype=q.dtype, buffer=nl.sbuf)
+          nisa.tensor_copy(
+              dst=sbuf_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0],
+              src=psum_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0])
+
+          for i_d2 in nl.affine_range(d2_total_tiles):
+            d2_off = i_d2 * t_2
+
+            """ Sub-loop: d2 tile_size (512) exceeds nc_transpose P:128.
+            Each sub-iteration transposes a (128, t_1) chunk of K
+            and feeds it to nc_matmul at the corresponding output slice. """
+            for i_d2_sub in nl.affine_range(t_2 // 128):
+
+              sbuf_K_sub = nl.ndarray(
+                  (128, 1, 1, 1, 1, t_1),
+                  dtype=k.dtype, buffer=nl.sbuf)
               nisa.dma_copy(
-                  dst=sbuf_Q[0:t_0, 0, 0, 0, 0:d1_tiles_per_block, 0:t_1],
-                  src=q[d0_off:d0_off+t_0,
-                        d1_blk_off:d1_blk_off+d1_block_size])
+                  dst=sbuf_K_sub[0:128, 0, 0, 0, 0, 0:t_1],
+                  src=k[d2_off + i_d2_sub * 128
+                        : d2_off + (i_d2_sub + 1) * 128,
+                        d1_off:d1_off+t_1])
 
-              for i_d1_tile in nl.affine_range(d1_tiles_per_block):
-                d1_off = d1_blk_off + i_d1_tile * t_1
+              psum_K_t_sub = nl.ndarray(
+                  (t_1, 1, 1, 1, 1, 128),
+                  dtype=nl.float32, buffer=nl.psum)
+              nisa.nc_transpose(
+                  dst=psum_K_t_sub[0:t_1, 0, 0, 0, 0, 0:128],
+                  data=sbuf_K_sub[0:128, 0, 0, 0, 0, 0:t_1])
+              sbuf_K_t_sub = nl.ndarray(
+                  (t_1, 1, 1, 1, 1, 128),
+                  dtype=k.dtype, buffer=nl.sbuf)
+              nisa.tensor_copy(
+                  dst=sbuf_K_t_sub[0:t_1, 0, 0, 0, 0, 0:128],
+                  src=psum_K_t_sub[0:t_1, 0, 0, 0, 0, 0:128])
 
-                # psum_Q_t — axes=(d1, d0): d1 after tile, d0 after tile
-                psum_Q_t = nl.ndarray(
-                    (t_1, 1, 1, 1, 1, t_0),
-                    dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_transpose(
-                    dst=psum_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0],
-                    data=sbuf_Q[0:t_0, 0, 0, 0, i_d1_tile, 0:t_1])
+              nisa.nc_matmul(
+                  dst=psum_S[0:t_0, 0, 0, i_d2, 0,
+                             i_d2_sub * 128 : (i_d2_sub + 1) * 128],
+                  stationary=sbuf_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0],
+                  moving=sbuf_K_t_sub[0:t_1, 0, 0, 0, 0, 0:128])
 
-                # sbuf_Q_t — copy transpose to SBUF for matmul input
-                sbuf_Q_t = nl.ndarray(
-                    (t_1, 1, 1, 1, 1, t_0),
-                    dtype=q.dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(
-                    dst=sbuf_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0],
-                    src=psum_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0])
+        """ Gather-then-reduce for max: one column per d2 tile. """
+        psum_partial_max = nl.ndarray(
+            (t_0, 1, d2_total_tiles), dtype=nl.float32, buffer=nl.psum)
+        nisa.memset(psum_partial_max, value=-3.4028235e38)
 
-                for i_d2_blk in nl.affine_range(d2_num_blocks):
-                  for i_d2_tile in nl.affine_range(d2_tiles_per_block):
-                    d2_off = (i_d2_blk * d2_tiles_per_block + i_d2_tile) * t_2
+        for i_d2 in nl.affine_range(d2_total_tiles):
+          d2_off = i_d2 * t_2
+          sbuf_S = nl.ndarray(
+              (t_0, 1, 1, 1, 1, t_2),
+              dtype=nl.float32, buffer=nl.sbuf)
+          nisa.tensor_copy(
+              dst=sbuf_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              src=psum_S[0:t_0, 0, 0, i_d2, 0, 0:t_2])
+          sbuf_scaled_S = nl.ndarray(
+              (t_0, 1, 1, 1, 1, t_2),
+              dtype=nl.float32, buffer=nl.sbuf)
+          nisa.tensor_scalar(
+              dst=sbuf_scaled_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              data=sbuf_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              op0=nl.multiply, operand0=scale)
+          sbuf_masked_S = nl.ndarray(
+              (t_0, 1, 1, 1, 1, t_2),
+              dtype=nl.float32, buffer=nl.sbuf)
+          nisa.affine_select(
+              dst=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              pattern=[[-1, t_2]],
+              offset=d0_off - d2_off,
+              channel_multiplier=1,
+              on_true_tile=sbuf_scaled_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              on_false_value=-3.4028235e38,
+              cmp_op=nl.greater_equal)
+          nisa.tensor_reduce(
+              dst=psum_partial_max[0:t_0, 0, i_d2],
+              op=nl.maximum,
+              data=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              axis=(1,))
+          nisa.tensor_copy(
+              dst=psum_S[0:t_0, 0, 0, i_d2, 0, 0:t_2],
+              src=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2])
 
-                    """ nc_transpose sub-loop: d2 partition exceeds P:128.
-                    Each sub-iteration transposes a (128, t_1) chunk of K
-                    and feeds it to nc_matmul at the corresponding output slice.
-                    Emitted by NKITranspose.render() and NKIMatmul.render(). """
-                    for i_d2_sub in nl.affine_range(t_2 // 128):
+        psum_max_S = nl.ndarray(
+            (t_0, 1, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.tensor_reduce(
+            psum_max_S[0:t_0, 0, 0:1],
+            nl.maximum, psum_partial_max[0:t_0, 0, 0:d2_total_tiles], 1)
+        sbuf_max_S = nl.ndarray(
+            (t_0, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=sbuf_max_S[0:t_0, 0, 0:1],
+            src=psum_max_S[0:t_0, 0, 0:1])
 
-                      # sbuf_K_sub — load one (128, t_1) chunk of K
-                      sbuf_K_sub = nl.ndarray(
-                          (128, 1, 1, 1, 1, t_1),
-                          dtype=k.dtype, buffer=nl.sbuf)
-                      nisa.dma_copy(
-                          dst=sbuf_K_sub[0:128, 0, 0, 0, 0, 0:t_1],
-                          src=k[d2_off + i_d2_sub * 128
-                                : d2_off + (i_d2_sub + 1) * 128,
-                                d1_off:d1_off+t_1])
+        """ Gather-then-reduce for sum: one column per d2 tile. """
+        psum_partial_sum = nl.ndarray(
+            (t_0, 1, d2_total_tiles), dtype=nl.float32, buffer=nl.psum)
+        nisa.memset(psum_partial_sum, value=0.0)
 
-                      # transpose K chunk: (128, t_1) → (t_1, 128)
-                      psum_K_t_sub = nl.ndarray(
-                          (t_1, 1, 1, 1, 1, 128),
-                          dtype=nl.float32, buffer=nl.psum)
-                      nisa.nc_transpose(
-                          dst=psum_K_t_sub[0:t_1, 0, 0, 0, 0, 0:128],
-                          data=sbuf_K_sub[0:128, 0, 0, 0, 0, 0:t_1])
-                      sbuf_K_t_sub = nl.ndarray(
-                          (t_1, 1, 1, 1, 1, 128),
-                          dtype=k.dtype, buffer=nl.sbuf)
-                      nisa.tensor_copy(
-                          dst=sbuf_K_t_sub[0:t_1, 0, 0, 0, 0, 0:128],
-                          src=psum_K_t_sub[0:t_1, 0, 0, 0, 0, 0:128])
+        for i_d2 in nl.affine_range(d2_total_tiles):
+          sbuf_masked_S = nl.ndarray(
+              (t_0, 1, 1, 1, 1, t_2),
+              dtype=nl.float32, buffer=nl.sbuf)
+          nisa.tensor_copy(
+              dst=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              src=psum_S[0:t_0, 0, 0, i_d2, 0, 0:t_2])
+          sbuf_shifted_S = nl.ndarray(
+              (t_0, 1, 1, 1, 1, t_2),
+              dtype=nl.float32, buffer=nl.sbuf)
+          nisa.tensor_scalar(
+              dst=sbuf_shifted_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              data=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              op0=nl.subtract,
+              operand0=sbuf_max_S[0:t_0, 0, 0:1])
+          sbuf_exp_S = nl.ndarray(
+              (t_0, 1, 1, 1, 1, t_2),
+              dtype=nl.float32, buffer=nl.sbuf)
+          nisa.activation(
+              dst=sbuf_exp_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              op=nl.exp,
+              data=sbuf_shifted_S[0:t_0, 0, 0, 0, 0, 0:t_2])
+          nisa.tensor_reduce(
+              dst=psum_partial_sum[0:t_0, 0, i_d2],
+              op=nl.add,
+              data=sbuf_exp_S[0:t_0, 0, 0, 0, 0, 0:t_2],
+              axis=(1,))
+          nisa.tensor_copy(
+              dst=psum_S[0:t_0, 0, 0, i_d2, 0, 0:t_2],
+              src=sbuf_exp_S[0:t_0, 0, 0, 0, 0, 0:t_2])
 
-                      # Q_t @ K_t_sub -> S slice: contract d1, output (d0, d2)
-                      nisa.nc_matmul(
-                          dst=psum_S[0:t_0, 0, i_d2_blk, 0, i_d2_tile,
-                                     i_d2_sub * 128 : (i_d2_sub + 1) * 128],
-                          stationary=sbuf_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0],
-                          moving=sbuf_K_t_sub[0:t_1, 0, 0, 0, 0, 0:128])
+        psum_sum_exp = nl.ndarray(
+            (t_0, 1, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.tensor_reduce(
+            psum_sum_exp[0:t_0, 0, 0:1],
+            nl.add, psum_partial_sum[0:t_0, 0, 0:d2_total_tiles], 1)
+        sbuf_sum_exp = nl.ndarray(
+            (t_0, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=sbuf_sum_exp[0:t_0, 0, 0:1],
+            src=psum_sum_exp[0:t_0, 0, 0:1])
 
-            # psum_partial_max — one column per d2 tile for gather-then-reduce
-            d2_total_tiles = d2_num_blocks * d2_tiles_per_block
-            psum_partial_max = nl.ndarray(
-                (t_0, 1, d2_total_tiles), dtype=nl.float32, buffer=nl.psum)
-            nisa.memset(psum_partial_max, value=-3.4028235e38)
+        sbuf_inv_sum = nl.ndarray(
+            (t_0, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(
+            dst=sbuf_inv_sum[0:t_0, 0, 0:1],
+            op=nl.reciprocal,
+            data=sbuf_sum_exp[0:t_0, 0, 0:1])
 
-            for i_d2_blk in nl.affine_range(d2_num_blocks):
-              for i_d2_tile in nl.affine_range(d2_tiles_per_block):
-                d2_col = i_d2_blk * d2_tiles_per_block + i_d2_tile
-                d2_off = d2_col * t_2
-                sbuf_S = nl.ndarray(
-                    (t_0, 1, 1, 1, 1, t_2),
-                    dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(
-                    dst=sbuf_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    src=psum_S[0:t_0, 0, i_d2_blk, 0, i_d2_tile, 0:t_2])
-                sbuf_scaled_S = nl.ndarray(
-                    (t_0, 1, 1, 1, 1, t_2),
-                    dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_scalar(
-                    dst=sbuf_scaled_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    data=sbuf_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    op0=nl.multiply, operand0=scale)
-                sbuf_masked_S = nl.ndarray(
-                    (t_0, 1, 1, 1, 1, t_2),
-                    dtype=nl.float32, buffer=nl.sbuf)
-                nisa.affine_select(
-                    dst=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    pattern=[[-1, t_2]],
-                    offset=d0_off - d2_off,
-                    channel_multiplier=1,
-                    on_true_tile=sbuf_scaled_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    on_false_value=-3.4028235e38,
-                    cmp_op=nl.greater_equal)
-                nisa.tensor_reduce(
-                    dst=psum_partial_max[0:t_0, 0, d2_col],
-                    op=nl.maximum,
-                    data=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    axis=(1,))
-                nisa.tensor_copy(
-                    dst=psum_S[0:t_0, 0, i_d2_blk, 0, i_d2_tile, 0:t_2],
-                    src=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2])
+        """ psum_attn — axes=(d0, d5): matmul2 accumulator. """
+        psum_attn = nl.ndarray(
+            (t_0, 1, 1, 1, 1, t_5),
+            dtype=nl.float32, buffer=nl.psum)
+        nisa.memset(psum_attn, value=0.0)
 
-            # collapse all partial maxes into a single column
-            psum_max_S = nl.ndarray(
-                (t_0, 1, 1), dtype=nl.float32, buffer=nl.psum)
-            nisa.tensor_reduce(
-                psum_max_S[0:t_0, 0, 0:1],
-                nl.maximum, psum_partial_max[0:t_0, 0, 0:d2_total_tiles], 1)
-            sbuf_max_S = nl.ndarray(
-                (t_0, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(
-                dst=sbuf_max_S[0:t_0, 0, 0:1],
-                src=psum_max_S[0:t_0, 0, 0:1])
+        for i_d2 in nl.affine_range(d2_total_tiles):
+          d2_off = i_d2 * t_2
 
-            # psum_partial_sum — one column per d2 tile for gather-then-reduce
-            psum_partial_sum = nl.ndarray(
-                (t_0, 1, d2_total_tiles), dtype=nl.float32, buffer=nl.psum)
-            nisa.memset(psum_partial_sum, value=0.0)
+          """ Sub-loop: d2 tile_size (512) exceeds nc_transpose P:128 and F:128.
+          Each sub-iteration transposes a (t_0, 128) chunk of exp_S,
+          loads the corresponding (128, t_5) chunk of V,
+          and accumulates into psum_attn. """
+          for i_d2_sub in nl.affine_range(t_2 // 128):
 
-            for i_d2_blk in nl.affine_range(d2_num_blocks):
-              for i_d2_tile in nl.affine_range(d2_tiles_per_block):
-                d2_col = i_d2_blk * d2_tiles_per_block + i_d2_tile
-                sbuf_masked_S = nl.ndarray(
-                    (t_0, 1, 1, 1, 1, t_2),
-                    dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(
-                    dst=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    src=psum_S[0:t_0, 0, i_d2_blk, 0, i_d2_tile, 0:t_2])
-                sbuf_shifted_S = nl.ndarray(
-                    (t_0, 1, 1, 1, 1, t_2),
-                    dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_scalar(
-                    dst=sbuf_shifted_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    data=sbuf_masked_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    op0=nl.subtract,
-                    operand0=sbuf_max_S[0:t_0, 0, 0:1])
-                sbuf_exp_S = nl.ndarray(
-                    (t_0, 1, 1, 1, 1, t_2),
-                    dtype=nl.float32, buffer=nl.sbuf)
-                nisa.activation(
-                    dst=sbuf_exp_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    op=nl.exp,
-                    data=sbuf_shifted_S[0:t_0, 0, 0, 0, 0, 0:t_2])
-                nisa.tensor_reduce(
-                    dst=psum_partial_sum[0:t_0, 0, d2_col],
-                    op=nl.add,
-                    data=sbuf_exp_S[0:t_0, 0, 0, 0, 0, 0:t_2],
-                    axis=(1,))
-                nisa.tensor_copy(
-                    dst=psum_S[0:t_0, 0, i_d2_blk, 0, i_d2_tile, 0:t_2],
-                    src=sbuf_exp_S[0:t_0, 0, 0, 0, 0, 0:t_2])
-
-            # collapse all partial sums into a single column
-            psum_sum_exp = nl.ndarray(
-                (t_0, 1, 1), dtype=nl.float32, buffer=nl.psum)
-            nisa.tensor_reduce(
-                psum_sum_exp[0:t_0, 0, 0:1],
-                nl.add, psum_partial_sum[0:t_0, 0, 0:d2_total_tiles], 1)
-
-            # sbuf_sum_exp — copy sum to SBUF for reciprocal
-            sbuf_sum_exp = nl.ndarray(
-                (t_0, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(
-                dst=sbuf_sum_exp[0:t_0, 0, 0:1],
-                src=psum_sum_exp[0:t_0, 0, 0:1])
-
-            # sbuf_inv_sum — axes=(d0,): d0 after tile
-            sbuf_inv_sum = nl.ndarray(
-                (t_0, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(
-                dst=sbuf_inv_sum[0:t_0, 0, 0:1],
-                op=nl.reciprocal,
-                data=sbuf_sum_exp[0:t_0, 0, 0:1])
-
-            # psum_attn — axes=(d0, d5): d0 after tile, d5 after tile
-            psum_attn = nl.ndarray(
-                (t_0, 1, 1, 1, 1, t_5),
-                dtype=nl.float32, buffer=nl.psum)
-            nisa.memset(psum_attn, value=0.0)
-
-            for i_d2_blk in nl.affine_range(d2_num_blocks):
-              for i_d2_tile in nl.affine_range(d2_tiles_per_block):
-                d2_off = (i_d2_blk * d2_tiles_per_block + i_d2_tile) * t_2
-
-                """ nc_transpose sub-loop: d2 exceeds P:128 and F:128.
-                Each sub-iteration transposes a (t_0, 128) chunk of exp_S,
-                loads the corresponding (128, t_5) chunk of V,
-                and accumulates into psum_attn.
-                Emitted by NKITranspose.render() and NKIMatmul.render(). """
-                for i_d2_sub in nl.affine_range(t_2 // 128):
-
-                  # copy exp_S sub-tile from psum_S to SBUF
-                  sbuf_exp_S_sub = nl.ndarray(
-                      (t_0, 1, 1, 1, 1, 128),
-                      dtype=nl.float32, buffer=nl.sbuf)
-                  nisa.tensor_copy(
-                      dst=sbuf_exp_S_sub[0:t_0, 0, 0, 0, 0, 0:128],
-                      src=psum_S[0:t_0, 0, i_d2_blk, 0, i_d2_tile,
-                                 i_d2_sub * 128 : (i_d2_sub + 1) * 128])
-
-                  # transpose: (d0=t_0, d2_sub=128) → (d2_sub=128, d0=t_0)
-                  psum_exp_S_t_sub = nl.ndarray(
-                      (128, 1, 1, 1, 1, t_0),
-                      dtype=nl.float32, buffer=nl.psum)
-                  nisa.nc_transpose(
-                      dst=psum_exp_S_t_sub[0:128, 0, 0, 0, 0, 0:t_0],
-                      data=sbuf_exp_S_sub[0:t_0, 0, 0, 0, 0, 0:128])
-                  sbuf_exp_S_t_sub = nl.ndarray(
-                      (128, 1, 1, 1, 1, t_0),
-                      dtype=nl.float32, buffer=nl.sbuf)
-                  nisa.tensor_copy(
-                      dst=sbuf_exp_S_t_sub[0:128, 0, 0, 0, 0, 0:t_0],
-                      src=psum_exp_S_t_sub[0:128, 0, 0, 0, 0, 0:t_0])
-
-                  # load V sub-tile: (128, t_5)
-                  sbuf_V_sub = nl.ndarray(
-                      (128, 1, 1, 1, 1, t_5),
-                      dtype=v.dtype, buffer=nl.sbuf)
-                  nisa.dma_copy(
-                      dst=sbuf_V_sub[0:128, 0, 0, 0, 0, 0:t_5],
-                      src=v[d2_off + i_d2_sub * 128
-                            : d2_off + (i_d2_sub + 1) * 128,
-                            d5_off:d5_off+t_5])
-
-                  # exp_S_t_sub @ V_sub -> attn: accumulates over d2 chunks
-                  nisa.nc_matmul(
-                      dst=psum_attn[0:t_0, 0, 0, 0, 0, 0:t_5],
-                      stationary=sbuf_exp_S_t_sub[0:128, 0, 0, 0, 0, 0:t_0],
-                      moving=sbuf_V_sub[0:128, 0, 0, 0, 0, 0:t_5])
-
-            # sbuf_attn — axes=(d0, d5): d0 after tile, d5 after tile
-            sbuf_attn = nl.ndarray(
-                (t_0, 1, 1, 1, 1, t_5),
+            sbuf_exp_S_sub = nl.ndarray(
+                (t_0, 1, 1, 1, 1, 128),
                 dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(
-                dst=sbuf_attn[0:t_0, 0, 0, 0, 0, 0:t_5],
-                src=psum_attn[0:t_0, 0, 0, 0, 0, 0:t_5])
-            sbuf_output = nl.ndarray(
-                (t_0, 1, 1, 1, 1, t_5),
-                dtype=q.dtype, buffer=nl.sbuf)
-            nisa.tensor_scalar(
-                dst=sbuf_output[0:t_0, 0, 0, 0, 0, 0:t_5],
-                data=sbuf_attn[0:t_0, 0, 0, 0, 0, 0:t_5],
-                op0=nl.multiply,
-                operand0=sbuf_inv_sum[0:t_0, 0, 0:1])
+                dst=sbuf_exp_S_sub[0:t_0, 0, 0, 0, 0, 0:128],
+                src=psum_S[0:t_0, 0, 0, i_d2, 0,
+                           i_d2_sub * 128 : (i_d2_sub + 1) * 128])
+
+            psum_exp_S_t_sub = nl.ndarray(
+                (128, 1, 1, 1, 1, t_0),
+                dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(
+                dst=psum_exp_S_t_sub[0:128, 0, 0, 0, 0, 0:t_0],
+                data=sbuf_exp_S_sub[0:t_0, 0, 0, 0, 0, 0:128])
+            sbuf_exp_S_t_sub = nl.ndarray(
+                (128, 1, 1, 1, 1, t_0),
+                dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(
+                dst=sbuf_exp_S_t_sub[0:128, 0, 0, 0, 0, 0:t_0],
+                src=psum_exp_S_t_sub[0:128, 0, 0, 0, 0, 0:t_0])
+
+            sbuf_V_sub = nl.ndarray(
+                (128, 1, 1, 1, 1, t_5),
+                dtype=v.dtype, buffer=nl.sbuf)
             nisa.dma_copy(
-                dst=output_hbm[d0_off:d0_off+t_0,
-                               d5_off:d5_off+t_5],
-                src=sbuf_output[0:t_0, 0, 0, 0, 0, 0:t_5])
+                dst=sbuf_V_sub[0:128, 0, 0, 0, 0, 0:t_5],
+                src=v[d2_off + i_d2_sub * 128
+                      : d2_off + (i_d2_sub + 1) * 128,
+                      d5_off:d5_off+t_5])
+
+            nisa.nc_matmul(
+                dst=psum_attn[0:t_0, 0, 0, 0, 0, 0:t_5],
+                stationary=sbuf_exp_S_t_sub[0:128, 0, 0, 0, 0, 0:t_0],
+                moving=sbuf_V_sub[0:128, 0, 0, 0, 0, 0:t_5])
+
+        sbuf_attn = nl.ndarray(
+            (t_0, 1, 1, 1, 1, t_5),
+            dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            dst=sbuf_attn[0:t_0, 0, 0, 0, 0, 0:t_5],
+            src=psum_attn[0:t_0, 0, 0, 0, 0, 0:t_5])
+        sbuf_output = nl.ndarray(
+            (t_0, 1, 1, 1, 1, t_5),
+            dtype=q.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=sbuf_output[0:t_0, 0, 0, 0, 0, 0:t_5],
+            data=sbuf_attn[0:t_0, 0, 0, 0, 0, 0:t_5],
+            op0=nl.multiply,
+            operand0=sbuf_inv_sum[0:t_0, 0, 0:1])
+        nisa.dma_copy(
+            dst=output_hbm[d0_off:d0_off+t_0,
+                           d5_off:d5_off+t_5],
+            src=sbuf_output[0:t_0, 0, 0, 0, 0, 0:t_5])
 
     return output_hbm
 ```
 
-Each tensor's shape comment shows its axes, the symbolic shape `(tile_par, nb_0, nb_1, nt_0, nt_1, tile_free)`, and which placement rule determined each nb/nt value:
-- **after tile**: nb=1, nt=1 (inside both block and tile loops)
-- **between blk/tile**: nb=1, nt=tiles_per_block (inside block loop, before tile loop)
-- **before blk**: nb=num_blocks, nt=tiles_per_block (outside all loops for that dim)
+Each tensor's shape comment shows its axes and the symbolic shape `(tile_par, nb_0, nb_1, nt_0, nt_1, tile_free)`. The nb and nt values for each axis come from the load placement (§6.2):
+- **after compute loop**: nb=1, nt=1 (inside both load and compute loops)
+- **between load/compute**: nb=1, nt=tiles_per_block (inside load loop, before compute loop)
+- **before load loop**: nb=total_tiles/tiles_per_block, nt=tiles_per_block (outside all loops for that dim)
 
 ---
 
-## 8. Related Work
-
-NKIGym sits at the intersection of auto-scheduling, tile-level kernel generation, and hardware-specific compilation. This section surveys the landscape and identifies where NKIGym's design diverges from prior systems.
-
-### 8.1 Auto-Scheduling Frameworks
-
-**TVM ecosystem.** AutoTVM (Chen et al., NeurIPS 2018) searches over schedule knobs within expert-written templates using a learned XGBoost cost model. Ansor (Zheng et al., OSDI 2020) eliminates templates by auto-generating sketches from the computation DAG and navigating the space with evolutionary search + learned cost models. TensorIR/MetaSchedule (Feng et al., ASPLOS 2023) generalizes Ansor with first-class tensorized instruction support. All operate on scalar loop nests derived from tensor expressions, with search spaces in the millions requiring learned cost models.
-
-**Halide.** Separates algorithm from schedule (Ragan-Kelley et al., 2013). Adams et al. (2019) introduced beam search with a neural cost model trained on randomly generated programs. Established the algorithm/schedule split that NKIGym inherits, but targets image processing pipelines on CPUs/GPUs at the loop level.
-
-**Key difference from NKIGym:** These systems reason about scalar loop nests and target mainstream hardware (GPUs, CPUs). NKIGym reasons about ISA-level tile operations on a fixed accelerator memory hierarchy, yielding a search space small enough (tens of thousands) for exhaustive evaluation without learned cost models.
-
-### 8.2 Tile-Level Kernel Generators
-
-**Triton** (Tillet et al., 2019; OpenAI) provides a Python DSL for tile-level GPU programming. Users write tile operations (`tl.load`, `tl.dot`, `tl.exp`); the compiler lowers to PTX. `triton.autotune` benchmarks user-enumerated configurations — no automatic space generation.
-
-**ThunderKittens** (Spector et al., 2024) is a C++ template library with warp-level tile abstractions for H100 GPUs. Achieves FlashAttention-level performance through composable primitives, but requires fully manual scheduling.
-
-**CUTLASS/CuTe** (NVIDIA) provides composable GEMM building blocks with CuTe's layout algebra for rigorous memory layout reasoning. Pre-defined configurations; no automatic search.
-
-**Key difference from NKIGym:** These systems provide tile abstractions but no automatic schedule search or dimension analysis. NKIGym automates both — users write only the math function; tiling structure, loop ordering, and data movement are derived and searched automatically.
-
-### 8.3 Polyhedral and Constraint-Based Compilation
-
-**Pluto/PPCG** (Bondhugula et al., 2008; Verdoolaege et al., 2013) use ILP to find optimal affine schedules for static loop nests. **Tiramisu** (Baghdadi et al., CGO 2019) layers a 4-level IR over polyhedral analysis with manual or learned scheduling.
-
-**AKG** (Zhao et al., PLDI 2024) is the closest polyhedral system to NKIGym: it generates kernels for Huawei Ascend NPUs by composing ISA-level primitives with polyhedral scheduling and ILP-based optimization. It targets a custom DL accelerator ISA, but uses fundamentally different machinery — polyhedral dependence analysis over scalar iteration domains vs. NKIGym's op-level dimension unification.
-
-### 8.4 Exhaustive and Superoptimization Approaches
-
-**Roller** (Zhu et al., OSDI 2022) constrains tile shapes to memory-aligned "rTiles," enabling near-exhaustive constructive search that completes in seconds. Operates at the loop/tile level for GPUs.
-
-**Mirage** (Wu & Jia et al., OSDI 2025) is the closest system in philosophy: it exhaustively enumerates a structured 3-level program space (kernel graph, thread-block graph, shared-memory tensor graph) with algebraic equivalence pruning. Discovered novel GPU kernels competitive with FlashAttention without user scheduling. Key distinction: Mirage searches over *program structure* (what ops to compose), while NKIGym searches over *schedule structure* (how to execute a fixed op sequence).
-
-**Equality saturation** (Yang et al., MLSys 2021) uses e-graphs to explore exponentially many equivalent tensor program rewrites efficiently. Operates at the graph rewrite level, orthogonal to NKIGym's tile-level scheduling.
-
-### 8.5 Hardware-Specific Accelerator DSLs
-
-**Exo** (Ikarashi et al., PLDI 2022) delegates hardware-specific scheduling to user-written rewrite rules, enabling custom accelerator support without modifying the compiler. Philosophically aligned with NKI's explicit-control model but requires manual scheduling.
-
-No published autotuning framework targets NKI or AWS Trainium. Other accelerator DSLs — Cerebras CSL (PE-level C), Graphcore Poplar (tile/vertex C++), SambaNova SambaFlow (high-level PyTorch) — similarly lack automatic schedule search.
-
-### 8.6 Graph-Level Optimizers
-
-XLA, TorchInductor, and TVM Relay operate at the operator fusion level — choosing which ops to fuse and how to lay out data across ops. These are orthogonal to NKIGym, which optimizes *within* a fused kernel.
-
-### 8.7 Where NKIGym Diverges
-
-The table below positions NKIGym against the closest systems on two axes: abstraction level and search strategy.
-
-| System | Abstraction | Search | Target |
-|---|---|---|---|
-| Ansor | Scalar loop nests | Learned cost model + evolutionary | GPU, CPU |
-| Triton | Tile-level DSL | User-enumerated grid | GPU |
-| AKG | ISA-level (polyhedral) | ILP + heuristic | Huawei Ascend |
-| Mirage | Multi-level program IR | Exhaustive + verification | NVIDIA GPU |
-| Roller | Loop/tile (rTile) | Constructive/analytical | GPU, CPU |
-| **NKIGym** | **ISA-level (op-level IR)** | **Exhaustive enumeration** | **AWS Trainium** |
-
-Five design choices distinguish NKIGym from the landscape:
-
-1. **Op-level IR with 1:1 ISA mapping.** Each `NKIOp` maps to exactly one `nisa.*` instruction. This is lower than Triton (many-to-many mapping from tile ops to PTX) and more structured than raw NKI (no abstraction over ISA calls). The IR sits between "compiler lowers for you" and "you write assembly."
-
-2. **Unification-based dimension analysis.** NKIGym derives tiling structure by propagating dimension identities through `OPERAND_AXES`/`OUTPUT_AXES` declarations across the op graph (§5.1). This replaces both polyhedral dependence analysis (which reasons about scalar index expressions) and TVM's tensor expression analysis (which analyzes lambda bodies). The formulation is simpler and sufficient because the ISA ops have fixed, declared axis semantics.
-
-3. **Barrier-driven multi-pass reductions.** A reduction dimension can appear multiple times in the loop order when sequential barrier ops each require a complete sweep (§6.1: d2 appears 3× for max, sum, and matmul2 in attention). The `(level, order)` addressing scheme with same-level sequential loops captures this naturally. Prior auto-schedulers model reductions as single loops.
-
-4. **Load placement as the sole non-deterministic allocation.** NKIGym identifies that DMA load hoisting is the only allocation with a real search space — accumulation targets are deterministic (dictated by data flow) and intermediates are trivially minimum-scope (§6.2). This decomposition, specific to the SBUF/PSUM/HBM hierarchy, eliminates an entire class of scheduling decisions from the search.
-
-5. **Tractable exhaustive search.** The structured decomposition into three independent axes — loop order ($L!/\prod r_i!$ permutations), blocking (divisor counts), and load placement ($N+1$ choices per tensor) — keeps the space at tens of thousands of candidates. This enables brute-force evaluation without learned cost models, evolutionary search, or sampling heuristics. The tradeoff is hardware-specificity: the decomposition assumes Trainium's fixed memory hierarchy.
-
----
-
-## 9. Future Work
+## 8. Future Work
 
 - **Boundary handling for non-divisible input shapes.** The current guide assumes all input dimensions are exact multiples of their tile sizes. Real workloads often have ragged last tiles (e.g., a sequence length of 1000 with tile size 128 leaves a remainder of 104). Supporting this requires `nl.ds(offset, size)` dynamic slicing to emit variable-length last tiles, with masking or predication where needed. The reference attention kernel (`attention_cte.py`) already uses `nl.ds` for this purpose.
