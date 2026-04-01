@@ -534,141 +534,168 @@ Hardware computes on a single tile at a time — this is fixed. The double loop 
 
 For code style consistency, the renderer **always emits both loops** regardless of `tiles_per_block` value or whether DMA loads are placed. When `tiles_per_block = 1`, the tile loop runs 1 iteration. When `tiles_per_block = total_tiles`, the block loop runs 1 iteration. Neither case collapses to a single loop — the double structure is always explicit.
 
-### 6.2 Loop Order
+### 6.2 Eager Mode Loop Nest
 
-The loop order determines which dimension loops are nested (enclosing each other) vs. executed back-to-back (sequentially at the same nesting depth). It is derived directly from the operator dependency graph.
+The **eager mode** is the baseline loop nest: each operator from the math function runs to completion before the next begins. Every intermediate tensor is fully materialized across all its tiles. No ops share loops — 13 ops produce 13 sequential loop nests.
 
-#### Operator dependency graph
+#### Deriving an op's loop nest
 
-The operator dependency graph is constructed directly from the math function — each operator is a node, each data dependency is an edge labeled with the tensor name and its dimensions.
+Each op's loop structure follows mechanically from its tensor dimensions (§5.1) and consumed axes (§5.2):
 
-![Operator dependency graph for attention. Every node is an operator from the math function. Nodes that reduce/accumulate are labeled with their dimension. Dashed edges marked "blocks" are blocking boundaries — a dimension's loop cannot cross them. d1 has 1 boundary; d2 has 3.](diagrams/op_dependency_graph.png)
+1. **Parallel loops**: one double loop (§6.1) per dimension in the op's output tensor.
+2. **Reduction loop**: if the op consumes a dimension (present in operand axes but absent from output axes), nest an inner double loop for that dimension. Initialize the accumulator before the reduction loop.
 
-#### Analyzing dimensions from the graph
+For the running example, dimensions: d0 (seq_q), d1 (d_k), d2 (seq_k), d5 (d_v).
 
-To determine valid loop orders, examine each dimension's role across the entire graph. The question for each dimension: does any operator–consumer pair make it blocking?
+| # | Op | Output dims | Consumed dim | Init |
+|---|---|---|---|---|
+| 0 | nc_transpose(Q) → Q_t | d0, d1 | — | — |
+| 1 | nc_transpose(K) → K_t | d1, d2 | — | — |
+| 2 | nc_matmul(Q_t, K_t) → S | d0, d2 | d1 | 0 |
+| 3 | tensor_scalar(S, scale) → scaled_S | d0, d2 | — | — |
+| 4 | affine_select(scaled_S) → masked_S | d0, d2 | — | — |
+| 5 | tensor_reduce(masked_S, max) → max_S | d0 | d2 | $-\infty$ |
+| 6 | tensor_scalar(masked_S, max_S) → shifted_S | d0, d2 | — | — |
+| 7 | activation(shifted_S, exp) → exp_S | d0, d2 | — | — |
+| 8 | tensor_reduce(exp_S, add) → sum_exp | d0 | d2 | 0 |
+| 9 | activation(sum_exp, reciprocal) → inv_sum | d0 | — | — |
+| 10 | nc_transpose(exp_S) → exp_S_t | d0, d2 | — | — |
+| 11 | nc_matmul(exp_S_t, V) → attn | d0, d5 | d2 | 0 |
+| 12 | tensor_scalar(attn, inv_sum) → output | d0, d5 | — | — |
 
-Two kinds of incomplete results arise when a dimension is only partially iterated:
+#### Running example
 
-- **Partial result**: valid and usable by consumers — a correct slice of the output, just not the full output. Example: one output row tile of a matmul along the non-accumulation axis.
-- **Intermediate result**: not valid, cannot be used by consumers. Example: a matmul accumulator halfway through its accumulation dimension — a sum of some but not all products, meaningless to downstream ops.
+The full eager mode loop nest for attention. Each dimension has a double loop (block + tile) per §6.1. `dX_num_blocks` and `dX_tiles_per_block` are the block count and tiles-per-block for dimension X. Ops execute sequentially — each runs over all its tiles before the next begins.
 
-A dimension is **blocking** for an operator–consumer pair when the operator produces intermediates on that dimension and the consumer cannot use them.
+![Eager mode loop nest for attention. Outer boxes group non-blocking consecutive ops. Inner boxes highlight reduction loops. Dashed arrows labeled BLOCKS mark the 4 blocking boundaries where the consumer requires the producer's complete output. Plain arrows connect non-blocking transitions where each tile is independently valid.](diagrams/eager_loopnest.png)
 
-The general principle: **a dimension can be freely repositioned in the loop nest — blocking pairs are the only constraints.** Each blocking pair creates a phase boundary: the phase must complete all tiles before its consumer can proceed. Other dimensions' items can be interleaved between a dimension's phases, changing relative nesting.
+```python
+""" Op 0: nc_transpose(Q) → Q_t(d1, d0) """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        for i_d1_block in range(d1_num_blocks):
+            for i_d1_tile in range(d1_tiles_per_block):
+                i_d1 = i_d1_block * d1_tiles_per_block + i_d1_tile
+                Q_t[i_d1, i_d0] = nc_transpose(Q[i_d0, i_d1])
 
-**d0** appears in virtually every tensor (Q[d0,d1], S[d0,d2], max_S[d0], attn[d0,d5], ...). Every operator–consumer pair along d0 produces partials — each d0 tile is independently valid. **0 blocking pairs** → the d0 item can go anywhere in the permutation.
+""" Op 1: nc_transpose(K) → K_t(d1, d2) """
+for i_d1_block in range(d1_num_blocks):
+    for i_d1_tile in range(d1_tiles_per_block):
+        i_d1 = i_d1_block * d1_tiles_per_block + i_d1_tile
+        for i_d2_block in range(d2_num_blocks):
+            for i_d2_tile in range(d2_tiles_per_block):
+                i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                K_t[i_d1, i_d2] = nc_transpose(K[i_d2, i_d1])
 
-**d5** appears only in V[d2,d5], attn[d0,d5], and output[d0,d5]. Every pair along d5 (V → matmul2, matmul2 → output_scale) produces partials. **0 blocking pairs** → the d5 item can go anywhere in the permutation.
+""" Op 2: nc_matmul(Q_t, K_t) → S(d0, d2), accumulate over d1 """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        for i_d2_block in range(d2_num_blocks):
+            for i_d2_tile in range(d2_tiles_per_block):
+                i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                S[i_d0, i_d2] = 0
+                for i_d1_block in range(d1_num_blocks):
+                    for i_d1_tile in range(d1_tiles_per_block):
+                        i_d1 = i_d1_block * d1_tiles_per_block + i_d1_tile
+                        S[i_d0, i_d2] += nc_matmul(Q_t[i_d1, i_d0], K_t[i_d1, i_d2])
 
-**d1** appears in Q[d0,d1], K[d2,d1], Q_t[d1,d0], K_t[d1,d2]. The first nc_matmul accumulates over d1 to produce S[d0,d2]. Its consumer (tensor_scalar: scale) expects a completed dot product — a mid-accumulation value is an intermediate. After matmul1 produces S, d1 disappears from the graph. **1 blocking pair** (matmul → scale) → 1 phase. The d1 item can go anywhere in the permutation.
+""" Op 3: tensor_scalar(S, multiply, scale) → scaled_S(d0, d2) """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        for i_d2_block in range(d2_num_blocks):
+            for i_d2_tile in range(d2_tiles_per_block):
+                i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                scaled_S[i_d0, i_d2] = tensor_scalar(S[i_d0, i_d2], multiply, scale)
 
-**d2** spans most of the graph, from S[d0,d2] through attn[d0,d5]. **3 blocking pairs**, sequential in the data flow:
+""" Op 4: affine_select(scaled_S) → masked_S(d0, d2) """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        for i_d2_block in range(d2_num_blocks):
+            for i_d2_tile in range(d2_tiles_per_block):
+                i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                masked_S[i_d0, i_d2] = affine_select(scaled_S[i_d0, i_d2])
 
-1. tensor_reduce(max) → tensor_scalar(subtract): subtract expects the true max over all d2 tiles; a partial max is an intermediate.
-2. tensor_reduce(add) → activation(reciprocal): reciprocal expects the true sum over all d2 tiles; a partial sum is an intermediate.
-3. nc_matmul → tensor_scalar(×inv_sum): multiply cannot start until matmul2 finishes accumulating all d2 tiles; a mid-accumulation value is an intermediate.
+""" Op 5: tensor_reduce(masked_S, max) → max_S(d0), reduce over d2 """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        max_S[i_d0] = -inf
+        for i_d2_block in range(d2_num_blocks):
+            for i_d2_tile in range(d2_tiles_per_block):
+                i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                max_S[i_d0] = max(max_S[i_d0], tensor_reduce(masked_S[i_d0, i_d2]))
 
-Each blocking pair requires its preceding ops to complete a full d2 iteration, giving **3 phases**: {scale, mask, reduce_max}, {subtract, exp, reduce_sum}, {transpose_exp, matmul2}. The 3 phase items must maintain sequential order in the permutation, but other dimensions' items can be interleaved between them.
+""" Op 6: tensor_scalar(masked_S, max_S, subtract) → shifted_S(d0, d2) """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        for i_d2_block in range(d2_num_blocks):
+            for i_d2_tile in range(d2_tiles_per_block):
+                i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                shifted_S[i_d0, i_d2] = tensor_scalar(masked_S[i_d0, i_d2], max_S[i_d0], subtract)
 
-| Dimension | Blocking pairs | Phases |
-|---|---|---|
-| d0 | 0 | 1 |
-| d5 | 0 | 1 |
-| d1 | 1: nc_matmul → tensor_scalar(scale) | 1 |
-| d2 | 3: reduce(max) → subtract, reduce(add) → reciprocal, matmul → multiply | 3 |
-| **Total items** | | **6** |
+""" Op 7: activation(shifted_S, exp) → exp_S(d0, d2) """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        for i_d2_block in range(d2_num_blocks):
+            for i_d2_tile in range(d2_tiles_per_block):
+                i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                exp_S[i_d0, i_d2] = activation(shifted_S[i_d0, i_d2], exp)
 
-A mathematical transformation like online softmax can change whether an operator–consumer pair blocks. For example, reformulating the downstream matmul to accept intermediate reduction results with correction factors removes that blocking pair from the graph. Such transformations run before this analysis, but do not change the enumeration algorithm.
+""" Op 8: tensor_reduce(exp_S, add) → sum_exp(d0), reduce over d2 """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        sum_exp[i_d0] = 0
+        for i_d2_block in range(d2_num_blocks):
+            for i_d2_tile in range(d2_tiles_per_block):
+                i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                sum_exp[i_d0] += tensor_reduce(exp_S[i_d0, i_d2])
 
-#### Enumeration
+""" Op 9: activation(sum_exp, reciprocal) → inv_sum(d0) """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        inv_sum[i_d0] = activation(sum_exp[i_d0], reciprocal)
 
-Each phase from the analysis above becomes a **loop** — a complete iteration over all tiles of that dimension. A free dimension has one loop. A constrained dimension has one loop per phase (each phase iterates over all tiles of that dimension independently). The **loop order** is the sequence of these loops, and different orderings produce different nesting structures (§6.1).
+""" Op 10: nc_transpose(exp_S) → exp_S_t(d2, d0) """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        for i_d2_block in range(d2_num_blocks):
+            for i_d2_tile in range(d2_tiles_per_block):
+                i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                exp_S_t[i_d2, i_d0] = nc_transpose(exp_S[i_d0, i_d2])
 
-For attention, 6 loops:
+""" Op 11: nc_matmul(exp_S_t, V) → attn(d0, d5), accumulate over d2 """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        for i_d5_block in range(d5_num_blocks):
+            for i_d5_tile in range(d5_tiles_per_block):
+                i_d5 = i_d5_block * d5_tiles_per_block + i_d5_tile
+                attn[i_d0, i_d5] = 0
+                for i_d2_block in range(d2_num_blocks):
+                    for i_d2_tile in range(d2_tiles_per_block):
+                        i_d2 = i_d2_block * d2_tiles_per_block + i_d2_tile
+                        attn[i_d0, i_d5] += nc_matmul(exp_S_t[i_d2, i_d0], V[i_d2, i_d5])
 
-| Loop | What it iterates | Ops in this phase |
-|---|---|---|
-| (d0, 0) | all d0 tiles | all ops (d0 is free) |
-| (d5, 0) | all d5 tiles | matmul2, multiply (d5 is free) |
-| (d1, 0) | all d1 tiles | transpose Q, K → matmul1 |
-| (d2, 0) | all d2 tiles | scale, mask → reduce_max |
-| (d2, 1) | all d2 tiles | subtract, exp → reduce_sum |
-| (d2, 2) | all d2 tiles | transpose_exp → matmul2 |
-
-A **loop order** is a permutation of these 6 loops. The only constraint: same-dimension loops must maintain their data-flow order ((d2, 0) before (d2, 1) before (d2, 2)). $6!$ counts all possible orderings of 6 loops; dividing by $3!$ removes the orderings that violate d2's phase constraint:
-
-$$\frac{6!}{1! \cdot 1! \cdot 1! \cdot 3!} = 120 \text{ valid loop orders}$$
-
-In general, for $n$ total loops where dimension $d$ has $p_d$ phases:
-
-$$\text{loop orders} = \frac{n!}{\prod_d p_d!}$$
-
-#### Nesting structure
-
-Each item maps to a two-level loop (block + tile) from §6.1. The item's position in the permutation determines a `(level, order)` pair that controls how loops nest:
-
-- **Different levels** → nested loops (outer level encloses inner)
-- **Same level, different order** → back-to-back sequential loops at the same depth
-
-The encoding rules:
-
-1. Each free dim gets its own level with `order = 0`.
-2. Constrained dims share a level, each incrementing order.
-3. A free dim following constrained dims advances to a new level.
-4. Same-dim phases always share their originally assigned level.
-
-#### Running example (attention)
-
-**Default loop order** — free dims outermost, constrained dims innermost:
-
-| Item | level | order |
-|---|---|---|
-| (d0, 0) | 0 | 0 |
-| (d5, 0) | 1 | 0 |
-| (d1, 0) | 2 | 0 |
-| (d2, 0) | 2 | 1 |
-| (d2, 1) | 2 | 2 |
-| (d2, 2) | 2 | 3 |
-
-d1 and all three d2 phases share level 2, executing back-to-back:
-
+""" Op 12: tensor_scalar(attn, inv_sum, multiply) → output(d0, d5) """
+for i_d0_block in range(d0_num_blocks):
+    for i_d0_tile in range(d0_tiles_per_block):
+        i_d0 = i_d0_block * d0_tiles_per_block + i_d0_tile
+        for i_d5_block in range(d5_num_blocks):
+            for i_d5_tile in range(d5_tiles_per_block):
+                i_d5 = i_d5_block * d5_tiles_per_block + i_d5_tile
+                output[i_d0, i_d5] = tensor_scalar(attn[i_d0, i_d5], inv_sum[i_d0], multiply)
 ```
-for d0_block: for d0_tile:                                          # level 0
-  for d5_block: for d5_tile:                                        # level 1
-    for d1_block: for d1_tile: [transpose Q, K → matmul1]          # level 2, order 0
-    for d2_block: for d2_tile: [scale, mask → reduce_max]           # level 2, order 1
-    for d2_block: for d2_tile: [sub, exp → reduce_sum; reciprocal]  # level 2, order 2
-    for d2_block: for d2_tile: [transpose exp_S → matmul2]          # level 2, order 3
-    [output_scale]                                                   # post-compute
-```
 
-**Alternative loop order** — d5 nested inside d2 phase 2 (matmul2 uses both d2 and d5):
-
-| Item | level | order |
-|---|---|---|
-| (d0, 0) | 0 | 0 |
-| (d1, 0) | 1 | 0 |
-| (d2, 0) | 1 | 1 |
-| (d2, 1) | 1 | 2 |
-| (d2, 2) | 1 | 3 |
-| (d5, 0) | 2 | 0 |
-
-Constrained dims at level 1 (back-to-back), d5 at level 2 nested inside d2 phase 2:
-
-```
-for d0_block: for d0_tile:                                          # level 0
-  for d1_block: for d1_tile: [transpose Q, K → matmul1]            # level 1, order 0
-  for d2_block: for d2_tile: [scale, mask → reduce_max]             # level 1, order 1
-  for d2_block: for d2_tile: [sub, exp → reduce_sum; reciprocal]    # level 1, order 2
-  for d2_block: for d2_tile:                                         # level 1, order 3
-    for d5_block: for d5_tile: [transpose exp_S → matmul2]          # level 2
-  [output_scale]
-```
-
-The default iterates all d2 tiles per d5 tile; this alternative iterates all d5 tiles per d2 tile. Both are valid — matmul2 accumulates over d2 regardless. The difference is memory access pattern and buffer sizing.
-
-All 120 orderings are structurally valid loop nestings. Hardware validation (§6.5) prunes combinations that violate SBUF capacity or PSUM accumulator limits.
+Every intermediate is fully materialized. The execution order matches the math function exactly: each op sees completed inputs, correct by construction.
 
 ### 6.3 Tiles Per Block
 
@@ -677,9 +704,9 @@ All 120 orderings are structurally valid loop nestings. Hardware validation (§6
 With `tiles_per_block > 1`, the block/tile split becomes meaningful:
 
 ```
-for i_d0_block in range(32 // 4):            # block: 8 iterations
+for i_d0_blocklock in range(32 // 4):            # block: 8 iterations
   [DMA load: 4 tiles of Q along d0]
-  for i_d0_tile in range(4):                 # tile: 4 iterations per block
+  for i_d0_tileile in range(4):                 # tile: 4 iterations per block
     ...
 ```
 
@@ -720,7 +747,7 @@ For the running example:
 
 The search space is the cross-product of three independent axes:
 
-**Axis 1 — Loop order** (§6.2): permutations of items (free dims + constrained dim phases) where same-dim phases maintain order. Count = $n! / \prod_d p_d!$.
+**Axis 1 — Loop order** (§6.2): permutations of items (parallel dims + reduction dim phases) where ordering chains (same-dim phases + cross-dim data dependencies) maintain sequence. Count = $n! / \prod_i c_i!$ where $c_i$ are chain lengths.
 
 **Axis 2 — Tiles per block**: for each unique dimension, `tiles_per_block` can be any divisor of `total_tiles` (= dim_size / tile_size). The number of choices per dimension is the divisor count of its total tiles.
 
@@ -739,11 +766,11 @@ Hardware validation prunes infeasible candidates. In the `Tensor` layout, `TILE_
 | d2 (seq_k) | 4096 | 512 | 8 | {1, 2, 4, 8} | 4 |
 | d5 (d_v) | 128 | 128 | 1 | {1} | 1 |
 
-- **Loop orders**: $6! / 3! = 120$ (6 items: d0, d5, d1, d2×3 passes)
+- **Loop orders**: 18 (from 30 chain-valid, after buffer-reuse pruning)
 - **Tiles per block**: $6 \times 1 \times 4 \times 1 = 24$
 - **Load placements**: $3 \times 3 \times 3 = 27$ (Q: 3 slots, K: 3 slots, V: 3 slots)
 
-$$\text{Full space} = 120 \times 24 \times 27 = 77{,}760 \text{ candidates}$$
+$$\text{Full space} = 18 \times 24 \times 27 = 11{,}664 \text{ candidates}$$
 
 ## 7. Render (Specialization)
 
@@ -807,26 +834,26 @@ def attention_kernel(q, k, v, scale):
     output: (d0=S_q, d5=D_v)
     """
 
-    d0_total_tiles = S_q // t_0
-    d1_total_tiles = D_k // t_1
-    d2_total_tiles = S_k // t_2
-    d5_total_tiles = D_v // t_5
+    d0_tileotal_tiles = S_q // t_0
+    d1_tileotal_tiles = D_k // t_1
+    d2_tileotal_tiles = S_k // t_2
+    d5_tileotal_tiles = D_v // t_5
 
     output_hbm = nl.ndarray((S_q, D_v), dtype=q.dtype, buffer=nl.shared_hbm)
 
-    for i_d0 in nl.affine_range(d0_total_tiles):
+    for i_d0 in nl.affine_range(d0_tileotal_tiles):
       d0_off = i_d0 * t_0
-      for i_d5 in nl.affine_range(d5_total_tiles):
+      for i_d5 in nl.affine_range(d5_tileotal_tiles):
         d5_off = i_d5 * t_5
 
         """ psum_S — axes=(d0, d2): holds all d2 tiles for matmul1 accumulation.
-        d0: 1 tile (inside loop), d2: d2_total_tiles (accumulator spans full dim). """
+        d0: 1 tile (inside loop), d2: d2_tileotal_tiles (accumulator spans full dim). """
         psum_S = nl.ndarray(
-            (t_0, 1, 1, d2_total_tiles, 1, t_2),
+            (t_0, 1, 1, d2_tileotal_tiles, 1, t_2),
             dtype=nl.float32, buffer=nl.psum)
         nisa.memset(psum_S, value=0.0)
 
-        for i_d1 in nl.affine_range(d1_total_tiles):
+        for i_d1 in nl.affine_range(d1_tileotal_tiles):
           d1_off = i_d1 * t_1
 
           """ sbuf_Q — axes=(d0, d1): 1 tile each (tiles_per_block=1 for both). """
@@ -850,7 +877,7 @@ def attention_kernel(q, k, v, scale):
               dst=sbuf_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0],
               src=psum_Q_t[0:t_1, 0, 0, 0, 0, 0:t_0])
 
-          for i_d2 in nl.affine_range(d2_total_tiles):
+          for i_d2 in nl.affine_range(d2_tileotal_tiles):
             d2_off = i_d2 * t_2
 
             """ Sub-loop: d2 tile_size (512) exceeds nc_transpose P:128.
@@ -888,10 +915,10 @@ def attention_kernel(q, k, v, scale):
 
         """ Gather-then-reduce for max: one column per d2 tile. """
         psum_partial_max = nl.ndarray(
-            (t_0, 1, d2_total_tiles), dtype=nl.float32, buffer=nl.psum)
+            (t_0, 1, d2_tileotal_tiles), dtype=nl.float32, buffer=nl.psum)
         nisa.memset(psum_partial_max, value=-3.4028235e38)
 
-        for i_d2 in nl.affine_range(d2_total_tiles):
+        for i_d2 in nl.affine_range(d2_tileotal_tiles):
           d2_off = i_d2 * t_2
           sbuf_S = nl.ndarray(
               (t_0, 1, 1, 1, 1, t_2),
@@ -930,7 +957,7 @@ def attention_kernel(q, k, v, scale):
             (t_0, 1, 1), dtype=nl.float32, buffer=nl.psum)
         nisa.tensor_reduce(
             psum_max_S[0:t_0, 0, 0:1],
-            nl.maximum, psum_partial_max[0:t_0, 0, 0:d2_total_tiles], 1)
+            nl.maximum, psum_partial_max[0:t_0, 0, 0:d2_tileotal_tiles], 1)
         sbuf_max_S = nl.ndarray(
             (t_0, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(
@@ -939,10 +966,10 @@ def attention_kernel(q, k, v, scale):
 
         """ Gather-then-reduce for sum: one column per d2 tile. """
         psum_partial_sum = nl.ndarray(
-            (t_0, 1, d2_total_tiles), dtype=nl.float32, buffer=nl.psum)
+            (t_0, 1, d2_tileotal_tiles), dtype=nl.float32, buffer=nl.psum)
         nisa.memset(psum_partial_sum, value=0.0)
 
-        for i_d2 in nl.affine_range(d2_total_tiles):
+        for i_d2 in nl.affine_range(d2_tileotal_tiles):
           sbuf_masked_S = nl.ndarray(
               (t_0, 1, 1, 1, 1, t_2),
               dtype=nl.float32, buffer=nl.sbuf)
@@ -977,7 +1004,7 @@ def attention_kernel(q, k, v, scale):
             (t_0, 1, 1), dtype=nl.float32, buffer=nl.psum)
         nisa.tensor_reduce(
             psum_sum_exp[0:t_0, 0, 0:1],
-            nl.add, psum_partial_sum[0:t_0, 0, 0:d2_total_tiles], 1)
+            nl.add, psum_partial_sum[0:t_0, 0, 0:d2_tileotal_tiles], 1)
         sbuf_sum_exp = nl.ndarray(
             (t_0, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(
@@ -997,7 +1024,7 @@ def attention_kernel(q, k, v, scale):
             dtype=nl.float32, buffer=nl.psum)
         nisa.memset(psum_attn, value=0.0)
 
-        for i_d2 in nl.affine_range(d2_total_tiles):
+        for i_d2 in nl.affine_range(d2_tileotal_tiles):
           d2_off = i_d2 * t_2
 
           """ Sub-loop: d2 tile_size (512) exceeds nc_transpose P:128 and F:128.
