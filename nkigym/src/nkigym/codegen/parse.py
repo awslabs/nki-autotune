@@ -19,6 +19,7 @@ _BINOP_FNS: dict[type, object] = {
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
     ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
 }
 
 

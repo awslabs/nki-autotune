@@ -1,11 +1,11 @@
-"""Combinatorial schedule search for NKI Gym.
+"""Schedule search for NKI Gym.
 
-Enumerates all valid schedules from loop orders x op placements x blocking.
-Each unique schedule is rendered to NKI source, compiled, and benchmarked
-on hardware.
+Provides two search strategies:
+- ``search``: exhaustive enumeration of loop orders x placements x blocking.
+- ``graph_search``: random transform sampling via a variant graph.
 """
 
 from nkigym.search.compile import SearchResults
-from nkigym.search.search import search
+from nkigym.search.search import graph_search, search
 
-__all__ = ["SearchResults", "search"]
+__all__ = ["SearchResults", "graph_search", "search"]

@@ -18,6 +18,7 @@ from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_1d import NKIActivation1D
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.add import NKIAdd
+from nkigym.ops.affine_select import NKIAffineSelect
 from nkigym.ops.base import NKIOp
 from nkigym.ops.dma_copy import NKIDmaCopy
 from nkigym.ops.matmul import NKIMatmul
@@ -44,7 +45,12 @@ def _rsqrt(x: Any) -> Any:
     return 1.0 / np.sqrt(x)
 
 
-_STR_OPS: dict[str, Any] = {"square": np.square, "rsqrt": _rsqrt}
+def _reciprocal(x: Any) -> Any:
+    """Reciprocal: 1 / x."""
+    return 1.0 / x
+
+
+_STR_OPS: dict[str, Any] = {"square": np.square, "rsqrt": _rsqrt, "reciprocal": _reciprocal}
 
 
 def activation(*args: Any, **kwargs: Any) -> Any:
@@ -122,6 +128,15 @@ def tensor_scalar(*args: Any, **kwargs: Any) -> Any:
     return result
 
 
+def nc_transpose(x: Any) -> Any:
+    """PE array transpose (alias for transpose in simulation).
+
+    Returns:
+        Transposed numpy array.
+    """
+    return x.T
+
+
 def transpose(x: Any) -> Any:
     """Transpose a 2D tensor (dimension swap, no copy).
 
@@ -129,6 +144,43 @@ def transpose(x: Any) -> Any:
         Transposed numpy array.
     """
     return x.T
+
+
+def affine_select(
+    data: Any, cmp_op: str = "greater_equal", on_false_value: float = 0.0, channel_multiplier: int = 1, step: int = -1
+) -> Any:
+    """Position-predicated element select using affine index pattern.
+
+    Generates affine_value = p * channel_multiplier + f * step per
+    element, compares to 0 with cmp_op, selects data or on_false_value.
+
+    Returns:
+        Masked numpy array.
+    """
+    rows, cols = data.shape
+    p_idx = np.arange(rows)[:, np.newaxis]
+    f_idx = np.arange(cols)[np.newaxis, :]
+    cmp_fns: dict[str, Any] = {"greater_equal": np.greater_equal}
+    mask = cmp_fns[cmp_op](p_idx * channel_multiplier + f_idx * step, 0)
+    return np.where(mask, data, on_false_value)
+
+
+def activation_reduce(*args: Any, **kwargs: Any) -> tuple[Any, Any]:
+    """Apply element-wise activation then reduce across the free axis.
+
+    Returns:
+        Tuple of (activated array, reduced 1D array).
+    """
+    data = args[0]
+    bias = args[1] if len(args) > 1 else 0.0
+    op_name = kwargs.get("op", "exp")
+    reduce_op_name = kwargs.get("reduce_op", "add")
+    op_fns: dict[str, Any] = {"exp": np.exp, "square": np.square}
+    reduce_fns: dict[str, Any] = {"add": np.add}
+    shifted = data + _expand_operand(data, bias) if len(args) > 1 else data
+    activated = op_fns[op_name](shifted)
+    reduced = reduce_fns[reduce_op_name].reduce(activated, axis=-1)
+    return activated, reduced
 
 
 def ndarray(shape: tuple[int, ...], **kwargs: Any) -> np.ndarray:
@@ -143,6 +195,7 @@ def ndarray(shape: tuple[int, ...], **kwargs: Any) -> np.ndarray:
 
 __all__ = [
     "NKIOp",
+    "NKIAffineSelect",
     "NKIMatmul",
     "NKIActivation",
     "NKIActivation1D",
@@ -156,8 +209,11 @@ __all__ = [
     "NKITensorScalarConst",
     "NKITranspose",
     "nc_matmul",
+    "nc_transpose",
     "activation",
+    "activation_reduce",
     "add",
+    "affine_select",
     "multiply",
     "tensor_reduce",
     "tensor_scalar",

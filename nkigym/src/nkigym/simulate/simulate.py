@@ -39,12 +39,22 @@ MAXIMUM = _Op("maximum")
 MAX = _Op("max")
 SQUARE = _Op("square")
 RSQRT = _Op("rsqrt")
+RECIPROCAL = _Op("reciprocal")
+GREATER_EQUAL = _Op("greater_equal")
 
-_UNARY_FNS: dict[_Op, Any] = {TANH: np.tanh, EXP: np.exp, SQUARE: np.square, RSQRT: lambda x: 1.0 / np.sqrt(x)}
+_UNARY_FNS: dict[_Op, Any] = {
+    TANH: np.tanh,
+    EXP: np.exp,
+    SQUARE: np.square,
+    RSQRT: lambda x: 1.0 / np.sqrt(x),
+    RECIPROCAL: lambda x: 1.0 / x,
+}
 
 _BINARY_FNS: dict[_Op, Any] = {ADD: np.add, MULTIPLY: np.multiply, SUBTRACT: np.subtract, MAXIMUM: np.maximum}
 
 _REDUCE_METHODS: dict[_Op, str] = {MAX: "max", ADD: "sum"}
+
+_CMP_FNS: dict[_Op, Any] = {GREATER_EQUAL: np.greater_equal}
 
 _HBM = SimpleNamespace(name="shared_hbm")
 _SBUF = SimpleNamespace(name="sbuf")
@@ -153,6 +163,34 @@ def _tensor_reduce(dst: np.ndarray, data: np.ndarray, op: _Op) -> None:
     dst[:] = reduced.reshape(dst.shape)
 
 
+def _affine_select(
+    dst: np.ndarray,
+    on_true_tile: np.ndarray,
+    on_false_value: float,
+    cmp_op: _Op,
+    channel_multiplier: int = 1,
+    step: int = -1,
+    **kwargs: Any,
+) -> None:
+    """Position-predicated element select using affine pattern.
+
+    Generates affine_value = p * channel_multiplier + f * step per
+    element, compares to 0 with cmp_op, selects on_true_tile or
+    on_false_value.
+    """
+    d2d = _flatten_2d(on_true_tile)
+    rows, cols = d2d.shape
+    p_idx = np.arange(rows)[:, np.newaxis]
+    f_idx = np.arange(cols)[np.newaxis, :]
+    affine_val = p_idx * channel_multiplier + f_idx * step
+    cmp_fn = _CMP_FNS.get(cmp_op)
+    if cmp_fn is None:
+        raise ValueError(f"Unknown cmp_op: {cmp_op}")
+    mask = cmp_fn(affine_val, 0)
+    result = np.where(mask, d2d, on_false_value)
+    dst[:] = result.reshape(dst.shape)
+
+
 def _nc_transpose(dst: np.ndarray, data: np.ndarray) -> None:
     """PE array transpose: swap partition and free dims.
 
@@ -189,6 +227,8 @@ def _build_nl() -> SimpleNamespace:
         max=MAX,
         square=SQUARE,
         rsqrt=RSQRT,
+        reciprocal=RECIPROCAL,
+        greater_equal=GREATER_EQUAL,
         copy=_nl_copy,
     )
 
@@ -204,6 +244,7 @@ def _build_nisa() -> SimpleNamespace:
         tensor_tensor=_tensor_tensor,
         tensor_scalar=_tensor_scalar,
         tensor_reduce=_tensor_reduce,
+        affine_select=_affine_select,
     )
 
 

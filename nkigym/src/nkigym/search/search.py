@@ -3,6 +3,9 @@
 Enumerates all valid schedules as the cross-product of loop orders,
 op placements, and blocking factors.  Each unique schedule is rendered
 to NKI source, compiled, and benchmarked on hardware.
+
+Also provides ``graph_search`` for random transform sampling — a
+graph-based alternative that grows the variant space incrementally.
 """
 
 import inspect
@@ -20,7 +23,7 @@ import numpy as np
 from nkigym.codegen.analysis import _Analysis, _OpCall, analyze_dims
 from nkigym.codegen.parse import find_func_def, parse_body
 from nkigym.codegen.passes import _PassAssignment, assign_passes
-from nkigym.schedule.enumerate import enumerate_all
+from nkigym.schedule.enumerate import default_schedule, enumerate_all
 from nkigym.schedule.render import render_schedule
 from nkigym.schedule.types import Schedule
 from nkigym.search.compile import (
@@ -32,6 +35,7 @@ from nkigym.search.compile import (
     _make_failure,
     stream_compile_and_run,
 )
+from nkigym.search.graph import TransformGraph
 from nkigym.search.report import SearchReport
 from nkigym.simulate import simulate_kernel
 from nkigym.utils.source import callable_to_source
@@ -104,6 +108,115 @@ class _SearchContext:
     workload: _Workload
     verified_paths: list[str] = field(default_factory=list)
     rendered_sources: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class _SearchSetup:
+    """Common initialization state shared by search strategies."""
+
+    remote_cfg: dict | None
+    hosts: list[str] | None
+    report: SearchReport
+    workload: _Workload
+    mac_count: int
+    input_dtype_name: str
+
+
+def _init_search(
+    func: Callable, save_cache: Path, kernel_kwargs: dict[str, Any], remote_config: Path | None
+) -> _SearchSetup:
+    """Common initialization for both search strategies.
+
+    Parses the workload, creates the cache directory and report,
+    and resolves remote configuration.
+
+    Args:
+        func: User function.
+        save_cache: Output directory.
+        kernel_kwargs: Input arrays.
+        remote_config: Optional remote config path.
+
+    Returns:
+        Initialized search setup.
+    """
+    from nkigym.search.remote import load_remote_config
+
+    remote_cfg = load_remote_config(remote_config) if remote_config else None
+    hosts = remote_cfg["hosts"] if remote_cfg else None
+    shutil.rmtree(save_cache, ignore_errors=True)
+    save_cache.mkdir(parents=True)
+    report = SearchReport(save_cache / "results.json")
+    workload = _parse_workload(func, kernel_kwargs)
+    mac_count = _compute_mac_count(workload.analysis)
+    input_dtype_name = next(iter(kernel_kwargs.values())).dtype.name
+    return _SearchSetup(
+        remote_cfg=remote_cfg,
+        hosts=hosts,
+        report=report,
+        workload=workload,
+        mac_count=mac_count,
+        input_dtype_name=input_dtype_name,
+    )
+
+
+def _make_context(
+    setup: _SearchSetup, func: Callable, save_cache: Path, kernel_kwargs: dict[str, Any]
+) -> _SearchContext:
+    """Create a _SearchContext from setup and runtime inputs.
+
+    Args:
+        setup: Common search setup.
+        func: User function for computing expected output.
+        save_cache: Output directory.
+        kernel_kwargs: Input arrays.
+
+    Returns:
+        Ready-to-use search context.
+    """
+    sim_kwargs = {k: v.astype(np.float64) for k, v in kernel_kwargs.items()}
+    expected = func(**sim_kwargs)
+    pool = None if setup.hosts else _make_pool(setup.workload.func_name, kernel_kwargs, expected, save_cache)
+    return _SearchContext(
+        save_cache=save_cache,
+        kernel_kwargs=kernel_kwargs,
+        expected=expected,
+        pool=pool,
+        report=setup.report,
+        workload=setup.workload,
+    )
+
+
+def _finalize_results(
+    ctx: _SearchContext, setup: _SearchSetup, lowering_errors: list[VariantResult], func: Callable, seed: int
+) -> list[VariantResult]:
+    """Run compilation/benchmarking and collect results.
+
+    Args:
+        ctx: Search context.
+        setup: Common search setup.
+        lowering_errors: Pre-compilation errors.
+        func: User function (for remote source extraction).
+        seed: Random seed.
+
+    Returns:
+        All variant results (lowering errors + benchmark results).
+    """
+    if setup.hosts:
+        assert setup.remote_cfg is not None
+        user_func_source = inspect.getsource(func)
+        variant_results = _finalize_distributed(
+            ctx,
+            setup.workload.func_name,
+            setup.mac_count,
+            setup.input_dtype_name,
+            setup.hosts,
+            setup.remote_cfg,
+            user_func_source,
+            seed,
+        )
+    else:
+        variant_results = _finalize_benchmark(ctx, setup.workload.func_name, setup.mac_count, setup.input_dtype_name)
+    return lowering_errors + variant_results
 
 
 def _render_variant(idx: int, schedule: Schedule, ctx: _SearchContext) -> tuple[str, str, str]:
@@ -370,55 +483,152 @@ def search(
     Returns:
         Combined search and benchmark results.
     """
-    from nkigym.search.remote import load_remote_config
-
-    remote_cfg = load_remote_config(remote_config) if remote_config else None
-    hosts = remote_cfg["hosts"] if remote_cfg else None
-
     t0 = time.monotonic()
-    shutil.rmtree(save_cache, ignore_errors=True)
-    save_cache.mkdir(parents=True)
-    report = SearchReport(save_cache / "results.json")
-    workload = _parse_workload(func, kernel_kwargs)
-    mac_count = _compute_mac_count(workload.analysis)
-    input_dtype_name = next(iter(kernel_kwargs.values())).dtype.name
-    selected = _enumerate_and_select(workload, kernel_kwargs, num_targets, seed)
+    setup = _init_search(func, save_cache, kernel_kwargs, remote_config)
+    selected = _enumerate_and_select(setup.workload, kernel_kwargs, num_targets, seed)
     logger.info("Enumeration: %.1fs", time.monotonic() - t0)
 
     t1 = time.monotonic()
-    sim_kwargs = {k: v.astype(np.float64) for k, v in kernel_kwargs.items()}
-    expected = func(**sim_kwargs)
-    pool = None if hosts else _make_pool(workload.func_name, kernel_kwargs, expected, save_cache)
-    ctx = _SearchContext(
-        save_cache=save_cache,
-        kernel_kwargs=kernel_kwargs,
-        expected=expected,
-        pool=pool,
-        report=report,
-        workload=workload,
-    )
-    if hosts:
+    ctx = _make_context(setup, func, save_cache, kernel_kwargs)
+    if setup.hosts:
         lowering_errors = _run_search_remote(selected, ctx)
     else:
         lowering_errors = _run_search_local(selected, ctx)
-    report.flush()
+    setup.report.flush()
     verified_count = len(selected) - len(lowering_errors)
     logger.info(
         "Rendering: %.1fs (%d verified, %d errors)", time.monotonic() - t1, verified_count, len(lowering_errors)
     )
 
-    if hosts:
-        assert remote_cfg is not None
-        user_func_source = inspect.getsource(func)
-        variant_results = _finalize_distributed(
-            ctx, workload.func_name, mac_count, input_dtype_name, hosts, remote_cfg, user_func_source, seed
-        )
-    else:
-        variant_results = _finalize_benchmark(ctx, workload.func_name, mac_count, input_dtype_name)
-
-    all_results = lowering_errors + variant_results
+    all_results = _finalize_results(ctx, setup, lowering_errors, func, seed)
     succeeded = sum(1 for r in all_results if not r.error)
     failed = len(all_results) - succeeded
     logger.info("Search complete: %d variants, %d succeeded, %d failed", len(selected), succeeded, failed)
-    logger.info("Results: %s", report.path)
+    logger.info("Results: %s", setup.report.path)
     return SearchResults(variants=selected, variant_results=all_results)
+
+
+def _build_graph(workload: _Workload, num_targets: int, seed: int) -> TransformGraph:
+    """Build a transform graph with a default seed and grow it.
+
+    Args:
+        workload: Parsed workload.
+        num_targets: Target number of variants.
+        seed: Random seed (0 for system entropy).
+
+    Returns:
+        Populated TransformGraph.
+    """
+    graph = TransformGraph(
+        analysis=workload.analysis,
+        op_calls=workload.op_calls,
+        params=workload.params,
+        func_name=workload.func_name,
+        pa=workload.pa,
+    )
+    root_schedule = default_schedule(workload.analysis, workload.op_calls, workload.params, workload.pa.passes_per_dim)
+    try:
+        root_source = render_schedule(
+            workload.analysis, root_schedule, workload.op_calls, workload.params, workload.func_name, workload.pa
+        )
+        graph.add_seed(root_source, root_schedule)
+    except Exception as exc:
+        logger.warning("Cannot render default schedule: %s", exc)
+        logger.info("Graph search: 0 variants (render unsupported for this workload)")
+        return graph
+    rng = np.random.default_rng(seed if seed != 0 else None)
+    added = graph.random_grow(num_targets, rng)
+    logger.info("Graph search: %d variants (1 seed + %d grown)", len(graph), added)
+    return graph
+
+
+def _graph_verify_and_submit(graph: TransformGraph, ctx: _SearchContext) -> list[VariantResult]:
+    """CPU-verify graph variants and submit for compilation.
+
+    Args:
+        graph: Populated transform graph.
+        ctx: Search context with pool, report, etc.
+
+    Returns:
+        List of lowering/verification errors.
+    """
+    lowering_errors: list[VariantResult] = []
+    sources = graph.variants()
+    nki_dir = ctx.save_cache / "nki"
+    nki_dir.mkdir(parents=True, exist_ok=True)
+    for idx, nki_source in enumerate(sources):
+        nki_name = f"nki_v{idx}.py"
+        nki_path = f"nki/{nki_name}"
+        abs_path = str(nki_dir / nki_name)
+        Path(abs_path).write_text(nki_source)
+        ctx.report.add_variant(nki_path, depth=0, variant_idx=idx)
+        error = _cpu_verify(nki_source, ctx.workload.func_name, ctx.kernel_kwargs, ctx.expected)
+        if error:
+            lowering_errors.append(_make_failure(nki_path, error))
+            ctx.report.update_variant(nki_path, status="error", error=error)
+        else:
+            ctx.report.update_variant(nki_path, status="compiled")
+            if ctx.pool is not None:
+                ctx.pool.submit(abs_path)
+            else:
+                ctx.rendered_sources[nki_name] = nki_source
+                ctx.verified_paths.append(nki_name)
+    num_verified = len(sources) - len(lowering_errors)
+    ctx.report.update_search(
+        unique_schedules=len(sources), qualifying_schedules=num_verified, total_visited=len(sources)
+    )
+    return lowering_errors
+
+
+def graph_search(
+    func: Callable,
+    num_targets: int,
+    seed: int,
+    save_cache: Path,
+    kernel_kwargs: dict[str, Any],
+    remote_config: Path | None = None,
+) -> SearchResults:
+    """Graph-based search using random transform sampling.
+
+    Instead of exhaustively enumerating all schedule permutations,
+    builds a transform graph starting from the default schedule and
+    randomly grows it to ``num_targets`` variants.
+
+    Args:
+        func: User function using ``nkigym.<op>(...)`` calls.
+        num_targets: Target number of kernel variants.
+        seed: Random seed for reproducibility (0 for system entropy).
+        save_cache: Directory for output artifacts.
+        kernel_kwargs: Input arrays keyed by parameter name.
+        remote_config: Path to ``remote.json`` config file, or None for local.
+
+    Returns:
+        Combined search and benchmark results.
+    """
+    t0 = time.monotonic()
+    setup = _init_search(func, save_cache, kernel_kwargs, remote_config)
+    graph = _build_graph(setup.workload, num_targets, seed)
+    logger.info("Graph exploration: %.1fs", time.monotonic() - t0)
+
+    if len(graph) == 0:
+        logger.info("No renderable variants found; skipping verification and benchmarking.")
+        setup.report.update_search(unique_schedules=0, qualifying_schedules=0, total_visited=0)
+        setup.report.flush()
+        return SearchResults(variants=[], variant_results=[])
+
+    t1 = time.monotonic()
+    ctx = _make_context(setup, func, save_cache, kernel_kwargs)
+    lowering_errors = _graph_verify_and_submit(graph, ctx)
+    setup.report.flush()
+    verified_count = len(graph) - len(lowering_errors)
+    logger.info(
+        "Verification: %.1fs (%d verified, %d errors)", time.monotonic() - t1, verified_count, len(lowering_errors)
+    )
+
+    all_results = _finalize_results(ctx, setup, lowering_errors, func, seed)
+    schedules = graph.schedules()
+    succeeded = sum(1 for r in all_results if not r.error)
+    failed = len(all_results) - succeeded
+    logger.info("Graph search complete: %d variants, %d succeeded, %d failed", len(graph), succeeded, failed)
+    logger.info("Results: %s", setup.report.path)
+    return SearchResults(variants=schedules, variant_results=all_results)

@@ -4,6 +4,7 @@ from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_1d import NKIActivation1D
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.add import NKIAdd
+from nkigym.ops.affine_select import NKIAffineSelect
 from nkigym.ops.base import NKIOp
 from nkigym.ops.dma_copy import NKIDmaCopy
 from nkigym.ops.matmul import NKIMatmul
@@ -16,6 +17,7 @@ from nkigym.ops.transpose import NKITranspose
 
 __all__ = [
     "NKIOp",
+    "NKIAffineSelect",
     "NKIMatmul",
     "NKIActivation",
     "NKIActivation1D",
