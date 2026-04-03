@@ -10,10 +10,10 @@ Usage::
     python examples/remote_profile.py --cache-dir /home/ubuntu/cache/remote_profile
 """
 
-import argparse
 import logging
 
-from autotune.runner.remote import remote_profile
+from autotune.runner.api import remote_profile
+from autotune.runner.types import ProfileConfig
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
@@ -34,30 +34,26 @@ def nki_tensor_copy(a):
     return output
 """
 
-NUM_VARIANTS = 100
-HOSTS = ["gym-1", "gym-2", "gym-3", "gym-4", "gym-5"]
-
 
 def main() -> None:
     """Profile 100 kernel variants and print results."""
-    parser = argparse.ArgumentParser(description="Profile NKI kernels on remote Trainium hosts")
-    parser.add_argument(
-        "--cache-dir",
-        type=str,
-        default=None,
-        help="Directory to save profile results (e.g. /home/ubuntu/cache/remote_profile)",
-    )
-    args = parser.parse_args()
-
-    kernels = {f"copy_v{i}.py": KERNEL_SOURCE for i in range(NUM_VARIANTS)}
+    kernels = {f"copy_v{i}.py": KERNEL_SOURCE for i in range(100)}
 
     output = remote_profile(
         kernels=kernels,
         input_specs={"a": ((128, 512), "bfloat16")},
-        hosts=HOSTS,
-        cache_dir=args.cache_dir,
-        warmup=10,
-        iters=100,
+        hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5"],
+        cache_dir="/home/ubuntu/cache/remote_profile_test_5w",
+        config=ProfileConfig(warmup=10, iters=100),
+    )
+    print(output)
+
+    output = remote_profile(
+        kernels=kernels,
+        input_specs={"a": ((128, 512), "bfloat16")},
+        hosts=["gym-1"],
+        cache_dir="/home/ubuntu/cache/remote_profile_test_1w",
+        config=ProfileConfig(warmup=10, iters=100),
     )
     print(output)
 
