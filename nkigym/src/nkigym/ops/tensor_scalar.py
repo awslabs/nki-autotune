@@ -1,42 +1,72 @@
-"""Element-wise tile-scalar op definition for schedule-based rendering."""
+"""Element-wise tile-scalar op: nisa.tensor_scalar.
+
+data(P, F) <op0> operand0 -> output(P, F).
+operand0 can be a scalar constant or a (P,) column vector;
+it broadcasts across the free axis.
+"""
 
 from typing import ClassVar
 
-from nkigym.ops.base import NKIOp, _op_display_name
+import numpy as np
+
+from nkigym.codegen.ir import RenderContext
+from nkigym.ops.base import NKIOp
 
 
 class NKITensorScalar(NKIOp):
-    """Tensor-scalar: ``nisa.tensor_scalar(dst=..., data=..., operand0=..., op0=...)``.
-
-    Element-wise op between a tile and a column vector.
-    The ``operand0`` operand is 1D ``(P,)``; it broadcasts across the free axis.
+    """Tensor-scalar: element-wise op with broadcast.
 
     Attributes:
-        op_name: Registry key ``"tensor_scalar"``.
-        OPERAND_AXES: ``data`` is ``(P, F)``, ``operand0`` is ``(P,)``.
-        OUTPUT_AXES: Output axes ``(P, F)``.
-        TILE_LIMITS: Partition axis capped at 128.
+        NAME: ``"tensor_scalar"``.
+        OPERAND_AXES: data is ``(P, F)``, operand0 is ``(P,)``.
+        OUTPUT_AXES: output is ``(P, F)``.
+        MAX_TILE_SIZES: P capped at 128.
+        ENGINE: VectorEngine.
     """
 
-    op_name: ClassVar[str] = "tensor_scalar"
+    NAME: ClassVar[str] = "tensor_scalar"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "operand0": ("P",)}
-    OUTPUT_AXES: ClassVar[tuple[str, ...]] = ("P", "F")
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F")}
+    MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
+    ENGINE: ClassVar[str] = "VectorEngine"
 
-    @classmethod
-    def render_post_compute(
-        cls, dst_expr: str, operand_exprs: dict[str, str], config_kwargs: tuple[tuple[str, object], ...]
-    ) -> str:
-        """Render tensor_scalar as a post-compute op.
+    _BINARY_OPS: ClassVar[dict[str, object]] = {"multiply": np.multiply, "subtract": np.subtract, "add": np.add}
+
+    def __call__(self, data: np.ndarray, operand0: object, op0: str, **_: object) -> np.ndarray:
+        """CPU simulation: data <op0> operand0.
 
         Args:
-            dst_expr: Destination SBUF expression.
-            operand_exprs: Must contain ``"data"`` and ``"operand0"`` keys.
-            config_kwargs: Must contain ``("op0", <func>)`` for the operation.
+            data: Array of shape (P, F).
+            operand0: Scalar or column vector of shape (P,).
+            op0: Binary operation name (multiply, subtract, add).
 
         Returns:
-            NKI tensor_scalar source line.
+            Result array with same shape as data.
         """
-        kwargs = dict(config_kwargs)
-        name = _op_display_name(kwargs.get("op0", "add"))
-        return f"nisa.tensor_scalar(dst={dst_expr}, data={operand_exprs['data']}, operand0={operand_exprs['operand0']}, op0=nl.{name})"
+        broadcast_op0 = operand0
+        if isinstance(operand0, np.ndarray):
+            broadcast_op0 = operand0[..., np.newaxis]
+        return self._BINARY_OPS[op0](data, broadcast_op0)
+
+    def render_isa(self, ctx: RenderContext) -> str:
+        """Emit nisa.tensor_scalar call.
+
+        Args:
+            ctx: Render context.
+
+        Returns:
+            NKI source line for tensor_scalar.
+        """
+        dst = ctx.outputs["output"]
+        data = ctx.operands["data"]
+        op_name = ctx.config_kwargs["op0"]
+        op0 = ctx.operands.get("operand0")
+        if op0 is not None:
+            op0_expr = op0.default_indexed_slice()
+        else:
+            op0_expr = str(ctx.config_kwargs["operand0"])
+        return (
+            f"nisa.tensor_scalar(dst={dst.default_indexed_slice()}, "
+            f"data={data.default_indexed_slice()}, "
+            f"op0=nl.{op_name}, operand0={op0_expr})"
+        )

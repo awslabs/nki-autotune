@@ -1,41 +1,69 @@
-"""Free-axis reduction op definition for schedule-based rendering."""
+"""Free-axis reduction op: nisa.tensor_reduce.
+
+data(P, F) -> output(P,). Collapses free dimension with the
+specified reduction op. Optional negate flag.
+"""
 
 from typing import ClassVar
 
-from nkigym.ops.base import NKIOp, _op_display_name
+import numpy as np
+
+from nkigym.codegen.ir import RenderContext
+from nkigym.ops.base import NKIOp
 
 
 class NKITensorReduce(NKIOp):
-    """Tensor reduce: ``nisa.tensor_reduce(dst=..., data=..., op=...)``.
-
-    Collapses the free axis, producing a 1D output.
+    """Tensor reduce: collapse free axis.
 
     Attributes:
-        op_name: Registry key ``"tensor_reduce"``.
-        OPERAND_AXES: Single operand ``data`` with axes ``(P, F)``.
-        OUTPUT_AXES: Output axes ``(P,)`` --- free axis collapsed.
-        TILE_LIMITS: Partition axis capped at 128.
+        NAME: ``"tensor_reduce"``.
+        OPERAND_AXES: data is ``(P, F)``.
+        OUTPUT_AXES: output is ``(P,)``.
+        MAX_TILE_SIZES: P capped at 128.
+        ENGINE: VectorEngine.
     """
 
-    op_name: ClassVar[str] = "tensor_reduce"
+    NAME: ClassVar[str] = "tensor_reduce"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F")}
-    OUTPUT_AXES: ClassVar[tuple[str, ...]] = ("P",)
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P",)}
+    MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
+    ENGINE: ClassVar[str] = "VectorEngine"
 
-    @classmethod
-    def render_post_compute(
-        cls, dst_expr: str, operand_exprs: dict[str, str], config_kwargs: tuple[tuple[str, object], ...]
-    ) -> str:
-        """Render tensor_reduce as a post-compute op.
+    _NKI_REDUCE_OPS: ClassVar[dict[str, str]] = {"max": "maximum", "add": "add"}
+    _REDUCE_FNS: ClassVar[dict[str, object]] = {"max": np.max, "add": np.sum}
+
+    def __call__(self, data: np.ndarray, op: str, negate: bool, **_: object) -> np.ndarray:
+        """CPU simulation: reduce along free axis.
 
         Args:
-            dst_expr: Destination SBUF expression.
-            operand_exprs: Must contain ``"data"`` key with source expression.
-            config_kwargs: Must contain ``("op", <func>)`` for the reduction.
+            data: Array of shape (P, F).
+            op: Reduction operation (max, add).
+            negate: Whether to negate the result.
 
         Returns:
-            NKI tensor_reduce source line.
+            1D array of shape (P,).
         """
-        kwargs = dict(config_kwargs)
-        name = _op_display_name(kwargs.get("op", "add"))
-        return f"nisa.tensor_reduce(dst={dst_expr}, data={operand_exprs['data']}, op=nl.{name})"
+        result = self._REDUCE_FNS[op](data, axis=1)
+        if negate:
+            result = -result
+        return result
+
+    def render_isa(self, ctx: RenderContext) -> str:
+        """Emit nisa.tensor_reduce call.
+
+        Args:
+            ctx: Render context.
+
+        Returns:
+            NKI source line for tensor_reduce.
+        """
+        dst = ctx.outputs["output"]
+        data = ctx.operands["data"]
+        op_name = self._NKI_REDUCE_OPS[ctx.config_kwargs["reduce_op"]]
+        negate = ctx.config_kwargs.get("negate", False)
+        negate_str = ", negate=True" if negate else ""
+        return (
+            f"nisa.tensor_reduce(dst={dst.default_indexed_slice()}, "
+            f"data={data.default_indexed_slice()}, "
+            f"op=nl.{op_name}, axis=1{negate_str})"
+        )

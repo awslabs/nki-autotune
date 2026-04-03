@@ -1,50 +1,84 @@
-"""Compound activation+reduce op definition for schedule-based rendering.
+"""Compound activation+reduce op: nisa.activation_reduce.
 
-Applies an element-wise activation then reduces across the free axis,
-producing a 1D column vector.  Maps to ``nisa.activation`` with
-``reduce_op`` and ``reduce_res`` keyword arguments.
+op(data + bias) -> output(P, F), simultaneously
+reduce_op(output) along free axis -> reduce_res(P,).
+Dual-output: produces both activation and reduction results.
 """
 
 from typing import ClassVar
 
-from nkigym.ops.base import NKIOp, _op_display_name
+import numpy as np
+
+from nkigym.codegen.ir import RenderContext
+from nkigym.ops.base import NKIOp
 
 
 class NKIActivationReduce(NKIOp):
-    """Activation+reduce: ``nisa.activation(dst=..., data=..., op=..., reduce_op=..., reduce_res=...)``.
-
-    Applies element-wise activation then reduces across the free axis.
-    Output is 1D ``(P,)`` — free axis collapsed (barrier op for pass 0).
+    """Activation+reduce: dual-output activation with simultaneous reduction.
 
     Attributes:
-        op_name: Registry key ``"activation_reduce"``.
-        OPERAND_AXES: Single operand ``data`` with axes ``(P, F)``.
-        OUTPUT_AXES: Output axes ``(P,)`` --- free axis collapsed.
-        TILE_LIMITS: Partition axis capped at 128.
+        NAME: ``"activation_reduce"``.
+        OPERAND_AXES: data is ``(P, F)``, bias is ``(P,)``.
+        OUTPUT_AXES: output is ``(P, F)``, reduce_res is ``(P,)``.
+        MAX_TILE_SIZES: P capped at 128.
+        ENGINE: ScalarEngine.
     """
 
-    op_name: ClassVar[str] = "activation_reduce"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F")}
-    OUTPUT_AXES: ClassVar[tuple[str, ...]] = ("P",)
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    NAME: ClassVar[str] = "activation_reduce"
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "bias": ("P",)}
+    OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F"), "reduce_res": ("P",)}
+    MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
+    ENGINE: ClassVar[str] = "ScalarEngine"
+    SCHEDULE_OUTPUT_AXES: ClassVar[tuple[str, ...]] = ("P",)
 
-    @classmethod
-    def render_compute(
-        cls, dst_expr: str, operand_exprs: dict[str, str], config_kwargs: tuple[tuple[str, object], ...]
-    ) -> str:
-        """Render activation+reduce compute line.
+    _NKI_REDUCE_OPS: ClassVar[dict[str, str]] = {"max": "maximum", "add": "add"}
+    _ACTIVATION_FNS: ClassVar[dict[str, object]] = {
+        "exp": np.exp,
+        "tanh": np.tanh,
+        "square": np.square,
+        "reciprocal": lambda x: 1.0 / x,
+    }
+    _REDUCE_FNS: ClassVar[dict[str, object]] = {"max": np.max, "add": np.sum}
+
+    def __call__(
+        self, data: np.ndarray, bias: np.ndarray, op: str, reduce_op: str, **_: object
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """CPU simulation: activation with simultaneous reduction.
 
         Args:
-            dst_expr: PSUM reduce_res destination expression.
-            operand_exprs: Must contain ``"data"`` and ``"_scratch_dst"`` keys.
-            config_kwargs: Must contain ``("op", ...)``, ``("reduce_op", ...)``.
+            data: Array of shape (P, F).
+            bias: Column vector of shape (P,).
+            op: Activation function name.
+            reduce_op: Reduction operation name.
 
         Returns:
-            NKI activation source line with reduce_op and reduce_res.
+            Tuple of (activation output, reduction result).
         """
-        kwargs = dict(config_kwargs)
-        op_name = _op_display_name(kwargs.get("op", "square"))
-        reduce_name = _op_display_name(kwargs.get("reduce_op", "add"))
-        scratch = operand_exprs.get("_scratch_dst", "sbuf_scratch")
-        data = operand_exprs["data"]
-        return f"nisa.activation(dst={scratch}, op=nl.{op_name}, data={data}, reduce_op=np.{reduce_name}, reduce_res={dst_expr})"
+        elem_result = self._ACTIVATION_FNS[op](data + bias[..., np.newaxis])
+        reduce_result = self._REDUCE_FNS[reduce_op](elem_result, axis=1)
+        return elem_result, reduce_result
+
+    def render_isa(self, ctx: RenderContext) -> str:
+        """Emit nisa.activation_reduce call.
+
+        Args:
+            ctx: Render context.
+
+        Returns:
+            NKI source line for activation_reduce.
+        """
+        dst = ctx.outputs["output"]
+        red = ctx.outputs["reduce_res"]
+        data = ctx.operands["data"]
+        bias = ctx.operands["bias"]
+        op_name = ctx.config_kwargs["op"]
+        reduce_name = self._NKI_REDUCE_OPS[ctx.config_kwargs["reduce_op"]]
+        return (
+            f"nisa.activation_reduce("
+            f"dst={dst.default_indexed_slice()}, "
+            f"data={data.default_indexed_slice()}, "
+            f"op=nl.{op_name}, "
+            f"bias={bias.default_indexed_slice()}, "
+            f"reduce_op=nl.{reduce_name}, "
+            f"reduce_res={red.default_indexed_slice()})"
+        )
