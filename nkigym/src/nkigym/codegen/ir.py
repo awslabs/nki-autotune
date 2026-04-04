@@ -43,8 +43,8 @@ class Tensor:
         """Multi-dim NKI shape tuple.
 
         Convention: ``(ts_par, nb_all..., tpb_all..., ts_free...)``.
-        Size-1 entries in nb/tpb are dropped so the neuronxcc compiler
-        sees compact shapes (e.g. 2D or 3D) instead of 6D+.
+        All nb/tpb entries are always included (even size-1) so
+        every tensor has a consistent 6D shape.
 
         Returns:
             Shape tuple for nl.ndarray allocation.
@@ -56,13 +56,9 @@ class Tensor:
             all_dims = list(self.axes)
             parts.append(self.tile_size[par])
             for a in all_dims:
-                nb = self.num_blocks.get(a, 1)
-                if nb > 1:
-                    parts.append(nb)
+                parts.append(self.num_blocks.get(a, 1))
             for a in all_dims:
-                tpb = self.tiles_per_block.get(a, 1)
-                if tpb > 1:
-                    parts.append(tpb)
+                parts.append(self.tiles_per_block.get(a, 1))
             for a in free:
                 parts.append(self.tile_size[a])
         return tuple(parts)
@@ -97,12 +93,20 @@ class Tensor:
             parts: list[str] = [f"0:{self.tile_size[par]}"]
             for a in all_dims:
                 nb_sz = self.num_blocks.get(a, 1)
-                if nb_sz > 1:
-                    parts.append(nb_exprs[a] if a in nb_exprs else f"0:{nb_sz}")
+                if nb_sz == 1:
+                    parts.append("0")
+                elif a in nb_exprs:
+                    parts.append(nb_exprs[a])
+                else:
+                    parts.append(f"0:{nb_sz}")
             for a in all_dims:
                 tpb_sz = self.tiles_per_block.get(a, 1)
-                if tpb_sz > 1:
-                    parts.append(tpb_exprs[a] if a in tpb_exprs else f"0:{tpb_sz}")
+                if tpb_sz == 1:
+                    parts.append("0")
+                elif a in tpb_exprs:
+                    parts.append(tpb_exprs[a])
+                else:
+                    parts.append(f"0:{tpb_sz}")
             for a in free:
                 parts.append(f"0:{self.tile_size[a]}")
             result = f"{self.name}[{', '.join(parts)}]"
@@ -132,6 +136,7 @@ class RenderContext:
         config_kwargs: Non-tensor keyword arguments from the op call.
         tile_idx: Dim ID to loop variable expression (e.g. ``"i_block_d0"``).
         tile_start: Dim ID to element offset expression (e.g. ``"i_block_d0 * 128"``).
+        dim_global_tile_sizes: Dim ID to global (uncapped) tile size.
     """
 
     outputs: dict[str, Tensor] = field(default_factory=dict)
@@ -139,3 +144,4 @@ class RenderContext:
     config_kwargs: dict[str, Any] = field(default_factory=dict)
     tile_idx: dict[str, str] = field(default_factory=dict)
     tile_start: dict[str, str] = field(default_factory=dict)
+    dim_global_tile_sizes: dict[str, int] = field(default_factory=dict)

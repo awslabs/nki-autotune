@@ -8,6 +8,7 @@ or pre-compute based on their position relative to barriers.
 from typing import NamedTuple
 
 from nkigym.codegen.analysis import _Analysis, _OpCall, has_reduction
+from nkigym.ops.base import _get_output_axes_tuple
 
 _NO_BARRIER: tuple[int, str, int] = (-1, "", -1)
 
@@ -43,7 +44,7 @@ def _reduced_dim(op_call: _OpCall, analysis: _Analysis) -> str:
         The reduction dim ID that this op reduces over.
     """
     operand_axes: dict[str, tuple[str, ...]] = getattr(op_call.stmt_type, "OPERAND_AXES", {})
-    output_axes: tuple[str, ...] = getattr(op_call.stmt_type, "OUTPUT_AXES", ())
+    output_axes = _get_output_axes_tuple(op_call.stmt_type)
     output_set = set(output_axes)
     all_input_axes: set[str] = set()
     for axes in operand_axes.values():
@@ -137,7 +138,7 @@ def _is_1d_op(op: _OpCall) -> bool:
     Returns:
         True if all operand and output axes are 1D.
     """
-    output_axes: tuple[str, ...] = getattr(op.stmt_type, "OUTPUT_AXES", ())
+    output_axes = _get_output_axes_tuple(op.stmt_type)
     return len(output_axes) == 1
 
 

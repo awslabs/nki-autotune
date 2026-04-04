@@ -16,39 +16,281 @@ geometry: margin=1in
 
 ---
 
-## 1. Math Function
-The top-level IR math function only defines the math computations. There are no load/store operators or hardware tiling, and it ignores the memory hierarchy.
+## 1. Logical Computation
+
+The math function defines what to compute — no loads/stores, no tiling, no memory hierarchy. Each `nkigym.*` call maps 1:1 to a real `nisa.*` ISA instruction, but the math function only specifies the logical data flow.
+
 ```python
 def attention(Q, K, V, scale):
     Q_t = nkigym.nc_transpose(Q)
     K_t = nkigym.nc_transpose(K)
     S = nkigym.nc_matmul(Q_t, K_t)
-    masked_S = nkigym.affine_select(S, cmp_op="greater_equal",
-                                     on_false_value=-np.inf,
-                                     channel_multiplier=1, step=-1)
+    masked_S = nkigym.affine_select(
+        pattern=[[-1, S.shape[1]]], channel_multiplier=1,
+        on_true_tile=S, on_false_value=-np.inf,
+        cmp_op="greater_equal")
     scaled_S = nkigym.tensor_scalar(masked_S, op0="multiply",
                                      operand0=scale)
-    neg_max_S = nkigym.tensor_reduce(scaled_S, reduce_op="max",
-                          negate=True)
-    exp_S, sum_exp = nkigym.activation_reduce(scaled_S, neg_max_S,
-                          op="exp", reduce_op="add")
-    inv_sum = nkigym.activation(sum_exp, op="reciprocal")
+    neg_max_S = nkigym.tensor_reduce(op="max", data=scaled_S,
+                                      axis=1, negate=True)
+    exp_S, sum_exp = nkigym.activation_reduce(
+        op="exp", data=scaled_S, reduce_op="add",
+        bias=neg_max_S)
+    inv_sum = nkigym.activation(op="reciprocal", data=sum_exp)
     exp_S_t = nkigym.nc_transpose(exp_S)
     attn = nkigym.nc_matmul(exp_S_t, V)
-    output = nkigym.tensor_scalar(attn, inv_sum, op0="multiply")
+    output = nkigym.tensor_scalar(attn, op0="multiply",
+                                   operand0=inv_sum)
     return output
 ```
 
-![Math function DAG — Op 7 and Op 9 are topologically independent, converging only at Op 10](diagrams/math_function_dag.png)
+### 1.1 NKI Gym Operators
 
-## 2. NKI Gym Operators
+Every `nkigym.*` op mirrors a real `nisa.*` or `nl.*` ISA operation — no ops are invented. At the logical level, an op only declares its axis semantics and a CPU simulation. No hardware constraints, tiling, or memory placement.
 
-Every `nkigym.*` op mirrors a real `nisa.*` or `nl.*` ISA operation — no ops are invented.
+```python
+class NKIOp:
+    """Logical NKI operator — axis semantics and CPU simulation only."""
+    NAME: str
+    OPERAND_AXES: dict[str, tuple[str, ...]]
+    OUTPUT_AXES: dict[str, tuple[str, str, ...]]
+
+    @abstractmethod
+    def __call__(self, **kwargs):
+        """CPU simulation using Numpy in default float64.
+        Takes input arrays + config, returns output array(s).
+        """
+```
+
+#### Operator Subclasses
+
+```python
+class NKIMatmul(NKIOp):
+    """stationary(K, M).T @ moving(K, N) → output(M, N).
+    K is the contraction (accumulation) axis.
+    """
+
+    NAME = "nc_matmul"
+    OPERAND_AXES = {"stationary": ("K", "M"), "moving": ("K", "N")}
+    OUTPUT_AXES = {"output": ("M", "N")}
+
+    def __call__(self, stationary, moving):
+        return stationary.T @ moving
+
+
+class NKITranspose(NKIOp):
+    """data(P, F) → output(F, P). Real hardware op, not a free view."""
+
+    NAME = "nc_transpose"
+    OPERAND_AXES = {"data": ("P", "F")}
+    OUTPUT_AXES = {"output": ("F", "P")}
+
+    def __call__(self, data):
+        return data.T
+
+
+class NKITensorScalar(NKIOp):
+    """(data <op0> operand0) <op1> operand1 → output(P, F).
+    operand0/operand1: scalar constant or (P,) column vector,
+    broadcast across the free axis.
+    reverse0/reverse1 swap operand order for non-commutative ops.
+    """
+
+    NAME = "tensor_scalar"
+    OPERAND_AXES = {"data": ("P", "F"), "operand0": ("P",), "operand1": ("P",)}
+    OUTPUT_AXES = {"output": ("P", "F")}
+
+    def __call__(self, data, op0, operand0, reverse0=False,
+                 op1=None, operand1=None, reverse1=False):
+        ops = {"multiply": np.multiply, "subtract": np.subtract, "add": np.add}
+        b = operand0[..., np.newaxis] if isinstance(operand0, np.ndarray) else operand0
+        result = ops[op0](b, data) if reverse0 else ops[op0](data, b)
+        if op1 is not None:
+            c = operand1[..., np.newaxis] if isinstance(operand1, np.ndarray) else operand1
+            result = ops[op1](c, result) if reverse1 else ops[op1](result, c)
+        return result
+
+
+class NKIAffineSelect(NKIOp):
+    """Position-predicated element select.
+    affine_value = offset + p * channel_multiplier + Σ(idx_i * step_i).
+    Compares affine_value to 0; selects on_true_tile or on_false_value.
+    pattern: list of [step, count] pairs describing free-axis layout.
+    """
+
+    NAME = "affine_select"
+    OPERAND_AXES = {"on_true_tile": ("P", "F")}
+    OUTPUT_AXES = {"output": ("P", "F")}
+
+    def __call__(self, pattern, channel_multiplier, on_true_tile,
+                 on_false_value, cmp_op="equal", offset=0):
+        P = on_true_tile.shape[0]
+        F = int(np.prod([n for _, n in pattern]))
+        p_idx = np.arange(P)[:, np.newaxis]
+        f_vals = np.array([0])
+        for step, count in pattern:
+            f_vals = (f_vals[:, np.newaxis] + np.arange(count) * step).ravel()
+        affine = offset + p_idx * channel_multiplier + f_vals[np.newaxis, :]
+        cmps = {"greater_equal": np.greater_equal, "equal": np.equal}
+        mask = cmps[cmp_op](affine, 0)
+        return np.where(mask, on_true_tile.reshape(P, F), on_false_value)
+
+
+class NKITensorReduce(NKIOp):
+    """Reduce along specified axis with optional negation.
+    data(P, F) → output(P,).
+    axis must be trailing free dimension(s); partition axis cannot be reduced.
+    """
+
+    NAME = "tensor_reduce"
+    OPERAND_AXES = {"data": ("P", "F")}
+    OUTPUT_AXES = {"output": ("P",)}
+
+    def __call__(self, op, data, axis, negate=False, keepdims=False):
+        reduce = {"max": np.max, "add": np.sum}
+        result = reduce[op](data, axis=axis, keepdims=keepdims)
+        if negate:
+            result = -result
+        return result
+
+
+class NKIActivationReduce(NKIOp):
+    """op(data * scale + bias) → output(P, F), and simultaneously
+    reduce_op(output) along free axis → reduce_res(P,).
+    reduce_op only supports "add".
+    """
+
+    NAME = "activation_reduce"
+    OPERAND_AXES = {"data": ("P", "F"), "bias": ("P",)}
+    OUTPUT_AXES = {"output": ("P", "F"), "reduce_res": ("P",)}
+
+    def __call__(self, op, data, reduce_op, bias=None, scale=1.0):
+        fns = {
+            "exp": np.exp, "tanh": np.tanh, "square": np.square,
+            "reciprocal": lambda x: 1.0 / x,
+        }
+        b = 0.0 if bias is None else bias[..., np.newaxis]
+        s = scale[..., np.newaxis] if isinstance(scale, np.ndarray) else scale
+        elem = fns[op](data * s + b)
+        red = {"add": np.sum}[reduce_op](elem, axis=1)
+        return elem, red
+
+
+class NKIActivation(NKIOp):
+    """output = op(data * scale + bias).
+    Applies unary activation element-wise.
+    """
+
+    NAME = "activation"
+    OPERAND_AXES = {"data": ("P", "F"), "bias": ("P",)}
+    OUTPUT_AXES = {"output": ("P", "F")}
+
+    def __call__(self, op, data, bias=None, scale=1.0):
+        fns = {
+            "exp": np.exp, "tanh": np.tanh, "square": np.square,
+            "reciprocal": lambda x: 1.0 / x,
+            "rsqrt": lambda x: 1.0 / np.sqrt(x),
+        }
+        b = 0.0 if bias is None else bias[..., np.newaxis]
+        s = scale[..., np.newaxis] if isinstance(scale, np.ndarray) else scale
+        return fns[op](data * s + b)
+```
+
+### 1.2 CPU Simulation
+
+The math function is plain Python — each `nkigym.*` call dispatches to `NKIOp.__call__()` which executes the op with numpy at float64 precision. No parsing or IR needed; just call the function directly:
+
+```python
+q = np.random.randn(4096, 128)
+k = np.random.randn(4096, 128)
+v = np.random.randn(4096, 128)
+output = attention(q, k, v, scale=1.0 / np.sqrt(128))
+```
+
+The result is the **reference output** — a float64 array that any correctly rendered and compiled NKI kernel must match (within hardware precision tolerance).
+
+---
+
+## 2. Initial Eager Mode Kernel
+
+The initial eager mode kernel chains `NKIOp.render()` calls — one per op in math function order. Each op emits its own independent loop nest; the kernel is their concatenation. This is correct by construction but naive in performance: every intermediate is a full-range buffer, and no loops are shared between ops. Variant transforms (§3 programmatic, §4 math) optimize from this baseline.
+
+### 2.1 Hardware Model
+
+To generate a concrete NKI kernel, we map logical axes to physical hardware resources. The `Hardware` class defines the physical limits of the NeuronCore memory hierarchy:
+
+```python
+class Hardware:
+    """Per-tensor limits of Trainium 2 NeuronCore.
+
+    These are per-tensor constraints — a single tensor allocation
+    must satisfy them. No whole-kernel capacity analysis; whether
+    all tensors fit simultaneously is the compiler's problem.
+
+    NKI source: nki.language.tile_size, nki.isa.validation
+    """
+    SBUF_PARTITION_MAX = 128       # nl.tile_size.pmax — max partition elements
+    SBUF_PARTITION_BYTES = 212984  # usable bytes per SBUF partition (224 KiB - 16 KiB reserved - 8)
+    PSUM_FREE_MAX = 512            # nl.tile_size.psum_fmax — fp32 elements per PSUM bank
+    TRANSPOSE_BLOCK = 128          # Tensor Engine nc_transpose: both P and F ≤ 128
+
+    @staticmethod
+    def sbuf_free_max(dtype_bytes: int) -> int:
+        """Max free dim for a single SBUF tensor = SBUF_PARTITION_BYTES // dtype_bytes.
+        fp32 → 53246, bf16 → 106492.
+        """
+        return Hardware.SBUF_PARTITION_BYTES // dtype_bytes
+```
+
+The SBUF free dimension limit is dtype-dependent — a single SBUF tensor's free axis is bounded by bytes per partition divided by element size. PSUM free max (512) is always in fp32 elements since PSUM accumulates in fp32.
+
+Each NKIOp declares `AXIS_ROLES` — a mapping from logical axis names to physical roles. The base class derives concrete per-tensor limits from `Hardware` + `AXIS_ROLES` + `NAME`:
+
+```python
+class NKIOp:
+    """Extended with hardware-aware rendering (adds to §1.1 logical definition)."""
+    AXIS_ROLES: dict[str, str]   # logical axis → "partition" | "free" | "accumulation"
+
+    def max_tile_sizes(self, dtype_bytes: int = 4) -> dict[str, int]:
+        """Derive per-axis tile limits from Hardware constants.
+
+        - partition → SBUF_PARTITION_MAX (128)
+        - accumulation → SBUF_PARTITION_MAX (128)
+        - free + PSUM ops (nc_matmul, nc_transpose) → PSUM_FREE_MAX (512)
+        - free + other ops → sbuf_free_max(dtype_bytes)
+
+        Transpose overrides: both dims ≤ TRANSPOSE_BLOCK.
+        """
+        limits: dict[str, int] = {}
+        for axis, role in self.AXIS_ROLES.items():
+            if role == "partition":
+                limits[axis] = Hardware.SBUF_PARTITION_MAX
+            elif role == "accumulation":
+                limits[axis] = Hardware.SBUF_PARTITION_MAX
+            elif role == "free":
+                if self.NAME in _PSUM_OPS:
+                    limits[axis] = Hardware.PSUM_FREE_MAX
+                else:
+                    limits[axis] = Hardware.sbuf_free_max(dtype_bytes)
+        return limits
+```
+
+| Op | AXIS_ROLES | Derived per-tensor limits (fp32) |
+|---|---|---|
+| NKIMatmul | K→accumulation, M→partition, N→free | K≤128, M≤128, N≤512 (PSUM bank) |
+| NKITranspose | P→partition, F→free | P≤128, F≤128 (override: TRANSPOSE_BLOCK) |
+| NKITensorScalar | P→partition, F→free | P≤128, F≤53246 (SBUF bytes) |
+| NKIAffineSelect | P→partition, F→free | P≤128, F≤53246 |
+| NKITensorReduce | P→partition, F→free | P≤128, F≤53246 |
+| NKIActivationReduce | P→partition, F→free | P≤128, F≤53246 |
+| NKIActivation | P→partition, F→free | P≤128, F≤53246 |
+
+`Tensor` represents a tiled on-chip buffer. The renderer decides memory location (SBUF/PSUM) at code-gen time — Tensor itself has no LOCATION field.
 
 ```python
 class Tensor:
     """
-    Represents a N-dimensional NKI tensor in the shape of:
+    N-dimensional NKI tensor in the shape of:
     [tile_size[AXES[0]],
         num_blocks[AXES[0]], ..., num_blocks[AXES[N-1]],
         tiles_per_block[AXES[0]], ..., tiles_per_block[AXES[N-1]],
@@ -60,30 +302,24 @@ class Tensor:
     tile_size: dict[str, int]
     num_blocks: dict[str, int]
     tiles_per_block: dict[str, int]
-    LOCATION: str # SBUF, PSUM
 
+class RenderContext:
+    """Everything an NKIOp.render() needs to emit NKI source.
+    Built for each op call site during kernel generation.
+    """
+    outputs: dict[str, Tensor]
+    operands: dict[str, Tensor]
+    config_kwargs: dict[str, Any]
+    tile_idx: dict[str, str]  # dim_id → loop var expr (e.g. "i_0")
+    tile_start: dict[str, str]  # dim_id → element offset expr (e.g. "i_0 * 128")
+```
+
+`NKIOp.render()` emits a complete loop nest for one op:
+
+```python
 class NKIOp:
-    """
-    Represents a NKI operator semantics
-    Supports multi outputs
-    """
-    NAME: str
-    OPERAND_AXES: dict[str, tuple[str, ...]]
-    OUTPUT_AXES: dict[str, tuple[str, str, ...]]
-    MAX_TILE_SIZES: dict[str, int]
-    ENGINE: str
-
-    @abstractmethod
-    def __call__(self, **kwargs):
-        """
-        CPU simulation using Numpy in default float64.
-        Takes input arrays + config, returns output array(s).
-        """
-
     def render(self, ctx: "RenderContext") -> str:
         """
-        Emit a complete loop nest for this op.
-
         1. Allocate full-range output buffer in SBUF.
         2. Parallel double loops (block + tile) for each
            dimension in OUTPUT_AXES.
@@ -102,7 +338,7 @@ class NKIOp:
         Both loops are always emitted regardless of
         tiles_per_block value. The slot between block
         and tile loops is where DMA loads are placed
-        (§3.2).
+        (§2.3).
         """
         lines = []
         out = next(iter(ctx.outputs.values()))
@@ -152,49 +388,26 @@ class NKIOp:
     @abstractmethod
     def render_isa(self, ctx: "RenderContext") -> str:
         """Emit the ISA call inside the innermost loop.
-        If any tile dim exceeds MAX_TILE_SIZES, emit
+        If any tile dim exceeds max_tile_sizes(), emit
         an in-place sub-loop that iterates in chunks.
         """
-
-class RenderContext:
-    """
-    Everything an NKIOp.render() needs to emit NKI source.
-    Built for each op call site during kernel generation.
-    """
-    outputs: dict[str, Tensor]
-    operands: dict[str, Tensor]
-    config_kwargs: dict[str, Any]
-    tile_idx: dict[str, str]  # dim_id → loop var expr (e.g. "i_0")
-    tile_start: dict[str, str]  # dim_id → element offset expr (e.g. "i_0 * 128")
 ```
 
-### 2.1 NKI Operator Subclasses
+#### render_isa() Implementations
+
+Each op's `render_isa()` emits the ISA call, adding sub-loops when tile dimensions exceed `max_tile_sizes()`:
+
 ```python
 class NKIMatmul(NKIOp):
-    """stationary.T @ moving (Tensor Engine)
-
-    stationary(K, M).T @ moving(K, N) → output(M, N).
-    Accumulates into PSUM in fp32 regardless of input dtype.
-    Sub-loop: if K exceeds K:128, render() emits a sub-loop that splits the
-    contraction axis into 128-element chunks, each accumulating into
-    the same PSUM output via hardware accumulation.
-    """
-
-    NAME = "nc_matmul"
-    OPERAND_AXES = {"stationary": ("K", "M"), "moving": ("K", "N")}
-    OUTPUT_AXES = {"output": ("M", "N")}
-    MAX_TILE_SIZES = {"K": 128, "M": 128, "N": 512}
-    ENGINE = "TensorEngine"
-
-    def __call__(self, stationary, moving):
-        return stationary.T @ moving
+    AXIS_ROLES = {"K": "accumulation", "M": "partition", "N": "free"}
 
     def render_isa(self, ctx):
         dst = ctx.outputs["output"]
         stat = ctx.operands["stationary"]
         mov = ctx.operands["moving"]
+        limits = self.max_tile_sizes()
         k_size = stat.tile_size[stat.AXES[0]]
-        k_max = self.MAX_TILE_SIZES["K"]
+        k_max = limits["K"]
         if k_size > k_max:
             lines = [f"for i_k_sub in nl.affine_range({k_size // k_max}):"]
             stat_slice = f"{stat.NAME}[i_k_sub*{k_max}:(i_k_sub+1)*{k_max}, ...]"
@@ -207,34 +420,20 @@ class NKIMatmul(NKIOp):
 
 
 class NKITranspose(NKIOp):
-    """Swap partition and free dims (Tensor Engine or Vector Engine)
+    AXIS_ROLES = {"P": "partition", "F": "free"}
 
-    data(P, F) → output(F, P).
-    Tensor Engine path: SBUF→PSUM, both dims ≤ 128.
-    Vector Engine path: SBUF/PSUM→SBUF/PSUM, both dims ≤ 32.
-    Real hardware op, not a free view.
-
-    Sub-loop: if P or F exceeds 128, render() emits a
-    sub-loop that transposes (128, 128) chunks, writing each
-    to the corresponding slice of the output.
-    """
-
-    NAME = "nc_transpose"
-    OPERAND_AXES = {"data": ("P", "F")}
-    OUTPUT_AXES = {"output": ("F", "P")}
-    MAX_TILE_SIZES = {"P": 128, "F": 128}
-    ENGINE = "TensorEngine"
-
-    def __call__(self, data):
-        return data.T
+    def max_tile_sizes(self) -> dict[str, int]:
+        """Both dims limited by TRANSPOSE_BLOCK, not general rules."""
+        return {"P": Hardware.TRANSPOSE_BLOCK, "F": Hardware.TRANSPOSE_BLOCK}
 
     def render_isa(self, ctx):
         dst = ctx.outputs["output"]
         src = ctx.operands["data"]
+        limits = self.max_tile_sizes()
         p_size = src.tile_size[src.AXES[0]]
         f_size = src.tile_size[src.AXES[1]]
-        p_max = self.MAX_TILE_SIZES["P"]
-        f_max = self.MAX_TILE_SIZES["F"]
+        p_max = limits["P"]
+        f_max = limits["F"]
         if p_size > p_max or f_size > f_max:
             p_subs = p_size // p_max
             f_subs = f_size // f_max
@@ -258,26 +457,7 @@ class NKITranspose(NKIOp):
 
 
 class NKITensorScalar(NKIOp):
-    """Element-wise binary op with broadcast (Vector/Scalar/GpSimd)
-
-    data(P, F) <op0> operand0 → output(P, F).
-    operand0 can be a scalar constant or a (P,) column vector;
-    it broadcasts across the free axis.
-    ISA supports compound (data <op0> operand0) <op1> operand1;
-    nkigym decomposes compound ops into separate calls.
-    """
-
-    NAME = "tensor_scalar"
-    OPERAND_AXES = {"data": ("P", "F"), "operand0": ("P",)}
-    OUTPUT_AXES = {"output": ("P", "F")}
-    MAX_TILE_SIZES = {"P": 128}
-    ENGINE = "VectorEngine"
-
-    def __call__(self, data, operand0, op0):
-        ops = {"multiply": np.multiply, "subtract": np.subtract, "add": np.add}
-        if isinstance(operand0, np.ndarray):
-            operand0 = operand0[..., np.newaxis]
-        return ops[op0](data, operand0)
+    AXIS_ROLES = {"P": "partition", "F": "free"}
 
     def render_isa(self, ctx):
         dst = ctx.outputs["output"]
@@ -295,73 +475,33 @@ class NKITensorScalar(NKIOp):
 
 
 class NKIAffineSelect(NKIOp):
-    """Position-predicated element select (GpSimd Engine)
-
-    Generates affine_value = offset + p*channel_multiplier + f*step
-    per element, compares to 0. Selects data or on_false_value.
-    Renderer computes offset from tile_start at render time.
-    """
-
-    NAME = "affine_select"
-    OPERAND_AXES = {"data": ("P", "F")}
-    OUTPUT_AXES = {"output": ("P", "F")}
-    MAX_TILE_SIZES = {"P": 128}
-    ENGINE = "GpSimd"
-
-    def __call__(self, data, cmp_op, on_false_value,
-                 channel_multiplier, step):
-        P, F = data.shape
-        p_idx = np.arange(P)[:, np.newaxis]
-        f_idx = np.arange(F)[np.newaxis, :]
-        cmps = {"greater_equal": np.greater_equal}
-        mask = cmps[cmp_op](
-            p_idx * channel_multiplier + f_idx * step, 0
-        )
-        return np.where(mask, data, on_false_value)
+    AXIS_ROLES = {"P": "partition", "F": "free"}
 
     def render_isa(self, ctx):
         dst = ctx.outputs["output"]
-        data = ctx.operands["data"]
+        src = ctx.operands["on_true_tile"]
         kw = ctx.config_kwargs
-        p_dim, f_dim = data.AXES[0], data.AXES[1]
+        pattern = kw["pattern"]
+        step = pattern[0][0]
+        p_dim, f_dim = src.AXES[0], src.AXES[1]
         offset = (
             f"{ctx.tile_start[p_dim]} * {kw['channel_multiplier']}"
-            f" + {ctx.tile_start[f_dim]} * {kw['step']}"
+            f" + {ctx.tile_start[f_dim]} * {step}"
         )
         return (
             f"nisa.affine_select(dst={dst.NAME}, "
-            f"pattern=[[{kw['step']}, {data.tile_size[f_dim]}]], "
+            f"pattern=[[{step}, {src.tile_size[f_dim]}]], "
             f"offset={offset}, "
             f"channel_multiplier={kw['channel_multiplier']}, "
             f"cmp_op=nl.{kw['cmp_op']}, "
-            f"on_true_tile={data.NAME}, "
+            f"on_true_tile={src.NAME}, "
             f"on_false_value={kw['on_false_value']})"
         )
 
 
 class NKITensorReduce(NKIOp):
-    """Reduce free axis with optional negation (Vector Engine)
-
-    data(P, F) → output(P,).
-    Collapses free dimension with the specified reduction op.
-    When negate=True, the output is negated after reduction.
-    Both input and output can be SBUF or PSUM.
-    """
-
-    NAME = "tensor_reduce"
-    OPERAND_AXES = {"data": ("P", "F")}
-    OUTPUT_AXES = {"output": ("P",)}
-    MAX_TILE_SIZES = {"P": 128}
-    ENGINE = "VectorEngine"
-
+    AXIS_ROLES = {"P": "partition", "F": "free"}
     _NKI_REDUCE_OPS = {"max": "maximum", "add": "add"}
-
-    def __call__(self, data, op, negate=False):
-        reduce = {"max": np.max, "add": np.sum}
-        result = reduce[op](data, axis=1)
-        if negate:
-            result = -result
-        return result
 
     def render_isa(self, ctx):
         dst = ctx.outputs["output"]
@@ -373,33 +513,8 @@ class NKITensorReduce(NKIOp):
 
 
 class NKIActivationReduce(NKIOp):
-    """Element-wise activation with simultaneous free-axis reduction (Scalar Engine)
-
-    op(data + bias) → output(P, F), and simultaneously
-    reduce_op(output) along free axis → reduce_res(P,).
-    Dual-output: produces both the activation result and the
-    reduction result in a single ISA call.
-    bias is a (P,) column vector broadcast across the free axis
-    (typically the negated row-wise max for numerically stable exp).
-    """
-
-    NAME = "activation_reduce"
-    OPERAND_AXES = {"data": ("P", "F"), "bias": ("P",)}
-    OUTPUT_AXES = {"output": ("P", "F"), "reduce_res": ("P",)}
-    MAX_TILE_SIZES = {"P": 128}
-    ENGINE = "ScalarEngine"
-
-    _NKI_REDUCE_OPS = {"max": "maximum", "add": "add"}
-
-    def __call__(self, data, bias, op, reduce_op):
-        fns = {
-            "exp": np.exp, "tanh": np.tanh, "square": np.square,
-            "reciprocal": lambda x: 1.0 / x,
-        }
-        reduce = {"max": np.max, "add": np.sum}
-        elem_result = fns[op](data + bias[..., np.newaxis])
-        reduce_result = reduce[reduce_op](elem_result, axis=1)
-        return elem_result, reduce_result
+    AXIS_ROLES = {"P": "partition", "F": "free"}
+    _NKI_REDUCE_OPS = {"add": "add"}
 
     def render_isa(self, ctx):
         dst = ctx.outputs["output"]
@@ -409,35 +524,14 @@ class NKIActivationReduce(NKIOp):
         op_name = ctx.config_kwargs["op"]
         reduce_name = self._NKI_REDUCE_OPS[ctx.config_kwargs["reduce_op"]]
         return (
-            f"nisa.activation_reduce(dst={dst.NAME}, data={data.NAME}, "
-            f"op=nl.{op_name}, bias={bias.NAME}, "
-            f"reduce_op=nl.{reduce_name}, reduce_res={red.NAME})"
+            f"nisa.activation_reduce(dst={dst.NAME}, op=nl.{op_name}, "
+            f"data={data.NAME}, reduce_op=nl.{reduce_name}, "
+            f"reduce_res={red.NAME}, bias={bias.NAME})"
         )
 
 
 class NKIActivation(NKIOp):
-    """Element-wise unary activation (Scalar Engine)
-
-    output = op(data). Works on both 2D (P, F) and 1D (P,) tiles.
-    ISA computes op(data * scale + bias) with optional reduction;
-    nkigym decomposes scale/bias into separate tensor_scalar ops,
-    so this op models only the unary activation.
-    Input/output can be SBUF or PSUM.
-    """
-
-    NAME = "activation"
-    OPERAND_AXES = {"data": ("P", "F")}
-    OUTPUT_AXES = {"output": ("P", "F")}
-    MAX_TILE_SIZES = {"P": 128}
-    ENGINE = "ScalarEngine"
-
-    def __call__(self, data, op):
-        fns = {
-            "exp": np.exp, "tanh": np.tanh, "square": np.square,
-            "reciprocal": lambda x: 1.0 / x,
-            "rsqrt": lambda x: 1.0 / np.sqrt(x),
-        }
-        return fns[op](data)
+    AXIS_ROLES = {"P": "partition", "F": "free"}
 
     def render_isa(self, ctx):
         dst = ctx.outputs["output"]
@@ -446,35 +540,16 @@ class NKIActivation(NKIOp):
         return f"nisa.activation(dst={dst.NAME}, data={data.NAME}, op=nl.{op_name})"
 ```
 
-### 2.2 CPU Simulation
+### 2.2 Eager Loop Nest: Chaining `NKIOp.render()`
 
-The math function is plain Python — each `nkigym.*` call dispatches to `NKIOp.__call__()` which executes the op with numpy at float64 precision. No parsing or IR needed; just call the function directly:
-
-```python
-q = np.random.randn(4096, 128)
-k = np.random.randn(4096, 128)
-v = np.random.randn(4096, 128)
-output = attention(q, k, v, scale=1.0 / np.sqrt(128))
-```
-
-The result is the **reference output** — a float64 array that any correctly rendered and compiled NKI kernel must match (within hardware precision tolerance).
-
----
-
-## 3. Initial Eager Mode Kernel
-
-The initial eager mode kernel chains `NKIOp.render()` calls — one per op in math function order. Each op emits its own independent loop nest; the kernel is their concatenation. This is correct by construction but naive in performance: every intermediate is a full-range buffer, and no loops are shared between ops. Variant transforms (§4 programmatic, §5 math) optimize from this baseline.
-
-### 3.1 Eager Loop Nest: Chaining `NKIOp.render()`
-
-The eager loop nest is a simple orchestrator. Before rendering, an analysis pass walks the math function to build `Tensor` and `RenderContext` objects for each op — assigning dimension IDs (unifying shared axes), computing tile sizes from `MAX_TILE_SIZES`, and setting `tiles_per_block=1` everywhere. Then the generator concatenates each op's `render()` output in math function order:
+The eager loop nest is a simple orchestrator. Before rendering, an analysis pass walks the math function to build `Tensor` and `RenderContext` objects for each op — assigning dimension IDs (unifying shared axes), computing tile sizes from `max_tile_sizes()` (derived from `Hardware` constants + `AXIS_ROLES`), and setting `tiles_per_block=1` everywhere. Then the generator concatenates each op's `render()` output in math function order:
 
 ```python
 for op, ctx in zip(math_function.ops, render_contexts):
     kernel_lines += op.render(ctx)
 ```
 
-Each `render()` call emits its own complete, independent loop nest (§2.1). The result is 11 back-to-back loop nests — one per op — communicating through full-range intermediate buffers. The running example produces:
+Each `render()` call emits its own complete, independent loop nest (§2.1 `render()`). The result is 11 back-to-back loop nests — one per op — communicating through full-range intermediate buffers. The running example produces:
 
 | # | Op | Output dims | Consumed dim | Init |
 |---|---|---|---|---|
@@ -496,18 +571,18 @@ Dimensions after unification: **d0** (seq_q, 128×32), **d1** (d_k, 128×1), **d
 - **Loop variables**: `i_block_d{id}` / `i_tile_d{id}` (e.g., `i_block_d0`, `i_tile_d2`).
 - **Tensor buffers**: `{location}_{name}` (e.g., `sbuf_Q_t`, `psum_S`). DMA staging buffers use the input parameter name (e.g., `sbuf_Q`).
 
-### 3.2 NKI Kernel with Greedy DMA Placement
+### 2.3 NKI Kernel with Greedy DMA Placement
 
-The eager loop nest (§3.1) operates on abstract tensors. To produce a concrete NKI kernel, we assign each tensor to a memory space and insert explicit DMA where needed. Only two kinds of `nisa.dma_copy` appear:
+The eager loop nest (§2.2) operates on abstract tensors. To produce a concrete NKI kernel, we assign each tensor to a memory space and insert explicit DMA where needed. Only two kinds of `nisa.dma_copy` appear:
 
 - **Input loads**: `Q`, `K`, `V` are loaded from HBM to SBUF before the op that first uses them. Each load is placed at the **innermost loop level** — the greediest (most frequent) placement. Marked with `# DMA load` comments in the kernel.
 - **Output store**: the final `output` tensor is stored from SBUF to HBM after the last op. Marked with `# DMA store` comments in the kernel.
 
-Each intermediate tensor (`Q_t`, `S`, `scaled_S`, …) is allocated as a **full-range** `nl.ndarray` buffer in SBUF right before the op that produces it. Their shapes span the complete tensor dimensions so they persist across operators — each op writes tile-indexed slices into its output buffer; subsequent ops read from the same buffer at the appropriate tile positions. This makes the data flow between separate loop nests explicit and mathematically correct, though the total SBUF allocation far exceeds hardware capacity (the running example needs ~260 MB of SBUF for intermediates alone, vs 24 MB available). Variant transforms (§4) shrink these buffers by fusing loop nests (eliminating intermediates entirely), hoisting loads, and reordering dimensions.
+Each intermediate tensor (`Q_t`, `S`, `scaled_S`, …) is allocated as a **full-range** `nl.ndarray` buffer in SBUF right before the op that produces it. Their shapes span the complete tensor dimensions so they persist across operators — each op writes tile-indexed slices into its output buffer; subsequent ops read from the same buffer at the appropriate tile positions. This makes the data flow between separate loop nests explicit and mathematically correct, though the total SBUF allocation far exceeds hardware capacity (the running example needs ~260 MB of SBUF for intermediates alone, vs 24 MB available). Variant transforms (§3) shrink these buffers by fusing loop nests (eliminating intermediates entirely), hoisting loads, and reordering dimensions.
 
 ```python
 @nki.jit
-def attention_kernel(Q, K, V):
+def attention_kernel(Q, K, V, scale):
     """ Q: (4096, 128)  K: (4096, 128)  V: (4096, 128) """
     """ d0: 128x32  d1: 128x1  d2: 512x8  d5: 128x1  (tile_size x num_blocks) """
     output = nl.ndarray((4096, 128), dtype=Q.dtype, buffer=nl.shared_hbm)
@@ -520,7 +595,7 @@ def attention_kernel(Q, K, V):
                 for i_tile_d1 in nl.affine_range(1):
                     sbuf_Q = nl.ndarray((128, 1, 1, 1, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)              # DMA load Q
                     nisa.dma_copy(dst=sbuf_Q[0:128, 0, 0, 0, 0, 0:128], src=Q[i_block_d0*128:i_block_d0*128+128, i_block_d1*128:i_block_d1*128+128])
-                    nisa.nc_transpose(dst=sbuf_Q_t[0:128, i_block_d1, i_block_d0, i_tile_d1, i_tile_d0, 0:128], src=sbuf_Q[0:128, 0, 0, 0, 0, 0:128])
+                    nisa.nc_transpose(dst=sbuf_Q_t[0:128, i_block_d1, i_block_d0, i_tile_d1, i_tile_d0, 0:128], data=sbuf_Q[0:128, 0, 0, 0, 0, 0:128])
 
     """ Op 1: nisa.nc_transpose -- K(d2, d1) -> K_t(d1, d2) """
     sbuf_K_t = nl.ndarray((128, 1, 8, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
@@ -531,7 +606,7 @@ def attention_kernel(Q, K, V):
                     for i_p_sub in nl.affine_range(4):                                                       # sub-loop: P=512 > MAX_P=128
                         sbuf_K = nl.ndarray((128, 1, 1, 1, 1, 128), dtype=K.dtype, buffer=nl.sbuf)          # DMA load K (128-row chunk)
                         nisa.dma_copy(dst=sbuf_K[0:128, 0, 0, 0, 0, 0:128], src=K[i_block_d2*512+i_p_sub*128:i_block_d2*512+i_p_sub*128+128, i_block_d1*128:i_block_d1*128+128])
-                        nisa.nc_transpose(dst=sbuf_K_t[0:128, i_block_d1, i_block_d2, i_tile_d1, i_tile_d2, i_p_sub*128:i_p_sub*128+128], src=sbuf_K[0:128, 0, 0, 0, 0, 0:128])
+                        nisa.nc_transpose(dst=sbuf_K_t[0:128, i_block_d1, i_block_d2, i_tile_d1, i_tile_d2, i_p_sub*128:i_p_sub*128+128], data=sbuf_K[0:128, 0, 0, 0, 0, 0:128])
 
     """ Op 2: nisa.nc_matmul -- Q_t(d1, d0) x K_t(d1, d2) -> S(d0, d2), accumulate over d1 """
     sbuf_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=nl.float32, buffer=nl.sbuf)
@@ -546,15 +621,15 @@ def attention_kernel(Q, K, V):
                     nisa.tensor_copy(dst=sbuf_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], src=psum_S[0:128, 0, 0, 0, 0, 0:512])
 
     """ Op 3: nisa.affine_select -- S(d0, d2) -> masked_S(d0, d2) """
-    sbuf_masked_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
+    sbuf_masked_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=nl.float32, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             for i_block_d2 in nl.affine_range(8):
                 for i_tile_d2 in nl.affine_range(1):
-                    nisa.affine_select(dst=sbuf_masked_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], pred=sbuf_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512])
+                    nisa.affine_select(dst=sbuf_masked_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], pattern=[[-1, 512]], offset=i_block_d0*128 - i_block_d2*512, channel_multiplier=1, cmp_op=nl.greater_equal, on_true_tile=sbuf_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], on_false_value=-np.inf)
 
     """ Op 4: nisa.tensor_scalar -- masked_S(d0, d2) x scale -> scaled_S(d0, d2) """
-    sbuf_scaled_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
+    sbuf_scaled_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=nl.float32, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             for i_block_d2 in nl.affine_range(8):
@@ -576,15 +651,14 @@ def attention_kernel(Q, K, V):
     sbuf_sum_exp = nl.ndarray((128, 32, 1), dtype=nl.float32, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
-            psum_sum_exp = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.psum)
-            nisa.memset(dst=psum_sum_exp[0:128, 0, 0:1], value=0.0)
+            psum_partial_sum = nl.ndarray((128, 8), dtype=nl.float32, buffer=nl.psum)
             for i_block_d2 in nl.affine_range(8):
                 for i_tile_d2 in nl.affine_range(1):
-                    nisa.activation_reduce(dst=sbuf_exp_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], data=sbuf_scaled_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], op=nl.exp, bias=sbuf_neg_max_S[0:128, i_block_d0, 0:1], reduce_op=nl.add, reduce_res=psum_sum_exp[0:128, 0, 0:1])
-            nisa.tensor_copy(dst=sbuf_sum_exp[0:128, i_block_d0, 0:1], src=psum_sum_exp[0:128, 0, 0:1])
+                    nisa.activation_reduce(dst=sbuf_exp_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], op=nl.exp, data=sbuf_scaled_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], bias=sbuf_neg_max_S[0:128, i_block_d0, 0:1], reduce_op=nl.add, reduce_res=psum_partial_sum[0:128, i_block_d2:i_block_d2+1])
+            nisa.tensor_reduce(dst=sbuf_sum_exp[0:128, i_block_d0, 0:1], data=psum_partial_sum[0:128, 0:8], op=nl.add, axis=1)
 
     """ Op 7: nisa.activation -- reciprocal(sum_exp(d0)) -> inv_sum(d0) """
-    sbuf_inv_sum = nl.ndarray((128, 32, 1), dtype=Q.dtype, buffer=nl.sbuf)
+    sbuf_inv_sum = nl.ndarray((128, 32, 1), dtype=nl.float32, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             nisa.activation(dst=sbuf_inv_sum[0:128, i_block_d0, 0:1], data=sbuf_sum_exp[0:128, i_block_d0, 0:1], op=nl.reciprocal)
@@ -596,7 +670,7 @@ def attention_kernel(Q, K, V):
             for i_block_d2 in nl.affine_range(8):
                 for i_tile_d2 in nl.affine_range(1):
                     for i_f_sub in nl.affine_range(4):                                                       # sub-loop: F=512 > MAX_F=128
-                        nisa.nc_transpose(dst=sbuf_exp_S_t[i_f_sub*128:i_f_sub*128+128, i_block_d2, i_block_d0, i_tile_d2, i_tile_d0, 0:128], src=sbuf_exp_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, i_f_sub*128:i_f_sub*128+128])
+                        nisa.nc_transpose(dst=sbuf_exp_S_t[i_f_sub*128:i_f_sub*128+128, i_block_d2, i_block_d0, i_tile_d2, i_tile_d0, 0:128], data=sbuf_exp_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, i_f_sub*128:i_f_sub*128+128])
 
     """ Op 9: nisa.nc_matmul -- exp_S_t(d2, d0) x V(d2, d5) -> attn(d0, d5), accumulate over d2 """
     sbuf_attn = nl.ndarray((128, 32, 1, 1, 1, 128), dtype=nl.float32, buffer=nl.sbuf)
@@ -625,13 +699,13 @@ def attention_kernel(Q, K, V):
     return output
 ```
 
-## 4. Programmatic Transforms
+## 3. Programmatic Transforms
 
 Programmatic transforms are mechanical rearrangements of the loop nest that do not change the math — they only change how and when ops execute. All transforms must respect the topological computation order: every op's inputs must be computed before the op runs. The math function (§1) defines one valid topological order, and the eager mode variant follows it exactly. Transforms may reorder loops and fuse ops, but the resulting execution order must remain a valid topological sort of the computation graph — no op can consume a tensor that hasn't been produced yet.
 
 Four transforms generate the search space.
 
-### 4.1 Loop Fusion
+### 3.1 Loop Fusion
 
 Adjacent ops whose loops iterate over the same dimensions can share a single loop nest instead of having separate nests. Fusion eliminates redundant loop overhead and — critically — keeps intermediate tiles on-chip between producer and consumer, avoiding HBM round-trips. A dimension is **blocking** when the full reduction over that dimension must complete before a valid result exists (e.g., matmul accumulation, reduce_max). A dimension is **non-blocking** when partial results are already correct, just incomplete. Fusion is legal across any non-blocking boundary. It is forbidden across a blocking boundary for the blocking dimension: the reduction must complete before the consumer starts.
 
@@ -644,7 +718,7 @@ for i_block_d0 in nl.affine_range(32):
     for i_tile_d0 in nl.affine_range(1):
         for i_block_d2 in nl.affine_range(8):
             for i_tile_d2 in nl.affine_range(1):
-                nisa.affine_select(dst=sbuf_masked_S[...], pred=sbuf_S[...])
+                nisa.affine_select(dst=sbuf_masked_S[...], on_true_tile=sbuf_S[...], ...)
 
 """ Op 4: nisa.tensor_scalar -- masked_S(d0, d2) x scale -> scaled_S(d0, d2) """
 sbuf_scaled_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
@@ -665,15 +739,15 @@ for i_block_d0 in nl.affine_range(32):
         for i_block_d2 in nl.affine_range(8):
             for i_tile_d2 in nl.affine_range(1):
                 sbuf_masked_S = nl.ndarray((128, 1, 1, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)  # per-tile, not full-range
-                nisa.affine_select(dst=sbuf_masked_S[...], pred=sbuf_S[...])
+                nisa.affine_select(dst=sbuf_masked_S[...], on_true_tile=sbuf_S[...], ...)
                 nisa.tensor_scalar(dst=sbuf_scaled_S[...], data=sbuf_masked_S[...], op0=nl.multiply, operand0=scale)
 ```
 
-### 4.2 Load Placement
+### 3.2 Load Placement
 
-A DMA load can be **hoisted** (moved above a loop) or **sunk** (moved below a loop) from its current position in the loop nest. Hoisting means the loaded data persists across all iterations of that loop, amortizing DMA latency at the cost of a larger SBUF buffer. Sinking means the buffer is smaller (only one tile at a time) but the load executes more frequently. The slot between block and tile loops (§3.1) provides the placement points at each nesting level.
+A DMA load can be **hoisted** (moved above a loop) or **sunk** (moved below a loop) from its current position in the loop nest. Hoisting means the loaded data persists across all iterations of that loop, amortizing DMA latency at the cost of a larger SBUF buffer. Sinking means the buffer is smaller (only one tile at a time) but the load executes more frequently. The slot between block and tile loops (§2.2) provides the placement points at each nesting level.
 
-In the greedy baseline (§3.2), all loads start at the innermost position. After loop fusion and reordering, loads may need to move in either direction to balance SBUF pressure against DMA frequency.
+In the greedy baseline (§2.3), all loads start at the innermost position. After loop fusion and reordering, loads may need to move in either direction to balance SBUF pressure against DMA frequency.
 
 **Before** — `sbuf_V` loaded inside the d2 reduction loop, reloaded every iteration:
 
@@ -709,7 +783,7 @@ for i_block_d0 in nl.affine_range(32):
                 nisa.tensor_copy(dst=sbuf_attn[...], src=psum_attn[...])
 ```
 
-### 4.3 Loop Reordering
+### 3.3 Loop Reordering
 
 The order of dimension loops can be permuted, subject to: (1) same-dimension phase ordering (block before tile), (2) cross-dimension data dependencies (if phase B consumes a tensor produced by phase A of a different dimension, A must precede B), and (3) in-place buffer reuse constraints (a parallel dim not in the buffer's dimensions cannot wrap phases that write the buffer).
 
@@ -743,7 +817,7 @@ for i_block_d2 in nl.affine_range(8):                           # d2 outermost
                 nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
 ```
 
-### 4.4 Tiles Per Block
+### 3.4 Tiles Per Block
 
 `tiles_per_block` is a per-dimension parameter that controls the block size — how many tiles are grouped before the tile loop iterates. Larger `tiles_per_block` means larger SBUF buffers but fewer DMA round-trips: the loaded block is reused across `tiles_per_block` compute iterations. Must divide `total_tiles`.
 
@@ -774,11 +848,13 @@ for i_block_d2 in nl.affine_range(2):                           # 2 blocks (8 / 
         nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
 ```
 
-## 5. Math Transforms
+## 4. Math Transforms
 
-Math transforms restructure the algorithm itself — changing the computation to break blocking dependencies. Programmatic transforms (§4) cannot fuse loops across blocking dependencies; math transforms eliminate those dependencies so that programmatic transforms can then optimize the resulting loop nest.
+Math transforms restructure the algorithm itself — changing the computation to break blocking dependencies. Programmatic transforms (§3) cannot fuse loops across blocking dependencies; math transforms eliminate those dependencies so that programmatic transforms can then optimize the resulting loop nest.
 
-### 5.1 Online Fusion
+### 4.1 Online Fusion
+
+![Math function DAG — Op 7 and Op 9 are topologically independent, converging only at Op 10](diagrams/math_function_dag.png)
 
 A **blocking dependency** exists when a consumer op requires the producer to complete its full reduction loop before the consumer can start. To identify blocking pairs, first fuse any elementwise ops between two reductions into the second reduction's body — elementwise ops don't introduce new blocking barriers. In the source-level attention pipeline:
 
@@ -798,7 +874,7 @@ After fusing elementwise ops into their consuming reductions, three blocking pai
 
 Some of these match the **X + Accumulation** pattern from the [online fusion paper draft](/home/ubuntu/online_fusion/main.pdf), which enables **online fusion** — a math-level transformation that eliminates the blocking barrier.
 
-#### 5.1.1 The X + Accumulation Pattern
+#### 4.1.1 The X + Accumulation Pattern
 
 **Standard X + Accumulation** (Algorithm 2 in the paper draft). Two sequential loops over the same blocking dimension with $K$ tiles:
 
@@ -859,12 +935,12 @@ We classify each blocking pair:
 | Producer → Consumer | Blocking dim | Handled by | Why |
 |---|---|---|---|
 | Op 2 (matmul over d1) → Op 5 (reduce max over d2) | d1 | **Not fusable** | Different blocking dims (d1 vs d2); no X+Accumulation pattern |
-| Op 5 (reduce max over d2) → Op 6 (exp + sum over d2) | d2 | **Online fusion** | X+Accumulation pattern (§5.1.2) |
-| Op 6 (exp_S depends on max) → Op 9 (matmul over d2) | d2 | **Online fusion** | Same X (running max), same $s_k$ (§5.1.3) |
+| Op 5 (reduce max over d2) → Op 6 (exp + sum over d2) | d2 | **Online fusion** | X+Accumulation pattern (§4.1.2) |
+| Op 6 (exp_S depends on max) → Op 9 (matmul over d2) | d2 | **Online fusion** | Same X (running max), same $s_k$ (§4.1.3) |
 
 Online fusion breaks the Op 5→6 and Op 6→9 barriers, pulling Ops 5, 6, 8, 9 into a single d2 loop. Op 7 is topologically independent from Op 9 (§1 DAG). Op 10 depends on Op 9's output but runs after the d2 reduction completes. Neither is part of the online fusion transforms. The result is the flash attention algorithm.
 
-#### 5.1.2 Online Fusion: Op 5→6
+#### 4.1.2 Online Fusion: Op 5→6
 
 **Before.** Ops 5 and 6 run in two separate d2 loops. Op 5 reduces max over the full d2 range to produce `neg_max_S`. Op 6 uses `neg_max_S` as a bias — it cannot start until Op 5 completes:
 
@@ -880,18 +956,17 @@ nisa.tensor_reduce(dst=sbuf_neg_max_S[0:128, 0, 0:1],
     data=psum_partial_max[0:128, 0:8], op=nl.maximum, axis=1, negate=True)
 
 """ Op 6: activation_reduce exp+sum over d2 -> exp_S, sum_exp """
-psum_sum_exp = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.psum)
-nisa.memset(dst=psum_sum_exp[0:128, 0, 0:1], value=0.0)
+psum_partial_sum = nl.ndarray((128, 8), dtype=nl.float32, buffer=nl.psum)
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop 2 """
     for i_tile_d2 in nl.affine_range(1):
         nisa.activation_reduce(dst=sbuf_exp_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
             data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
             op=nl.exp, bias=sbuf_neg_max_S[0:128, 0, 0:1],
-            reduce_op=nl.add, reduce_res=psum_sum_exp[0:128, 0, 0:1])
-nisa.tensor_copy(dst=sbuf_sum_exp[0:128, 0, 0:1], src=psum_sum_exp[0:128, 0, 0:1])
+            reduce_op=nl.add, reduce_res=psum_partial_sum[0:128, i_block_d2:i_block_d2+1])
+nisa.tensor_reduce(dst=sbuf_sum_exp[0:128, 0, 0:1], data=psum_partial_sum[0:128, 0:8], op=nl.add, axis=1)
 ```
 
-**Pattern match.** Map each component of the Standard X + Accumulation pattern (§5.1.1) to attention ops:
+**Pattern match.** Map each component of the Standard X + Accumulation pattern (§4.1.1) to attention ops:
 
 | Algorithm 2 Component | Attention Mapping |
 |---|---|
@@ -966,29 +1041,32 @@ for i_block_d2 in nl.affine_range(8):                                          "
         sbuf_neg_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=sbuf_neg_max[0:128, 0, 0:1],
             data=sbuf_new_max[0:128, 0, 0:1], op0=nl.multiply, operand0=-1.0)
-        nisa.activation_reduce(dst=sbuf_exp_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
-            data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
-            op=nl.exp, bias=sbuf_neg_max[0:128, 0, 0:1],
-            reduce_op=nl.add, reduce_res=psum_running_sum[0:128, 0, 0:1])
+        nisa.activation(dst=sbuf_exp_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
+            op=nl.exp, data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
+            bias=sbuf_neg_max[0:128, 0, 0:1],
+            reduce_op=nl.add, reduce_res=psum_running_sum[0:128, 0, 0:1],
+            reduce_cmd=nisa.reduce_cmd.reduce)
 ```
 
-#### 5.1.3 Online Fusion: Ops 6, 8, 9
+Note: The naive kernel (§2.3) uses `nisa.activation_reduce` with per-block PSUM slots — each slot is written once, so the reset is harmless. Online fusion changes the math: instead of separate slots + cross-block combine, there's a running accumulator rescaled each iteration. The transform rewrites `activation_reduce` → `nisa.activation(..., reduce_cmd=reduce)` which adds to the existing accumulator without resetting.
 
-Op 9 (matmul) accumulates `exp_S_t @ V` over d2. Each tile's `exp_S` depends on the running max — the same X output as §5.1.2. This is a second application of online fusion with the same X reduction and the same scale coefficient $s_k = e^{m_{k-1} - m_k}$.
+#### 4.1.3 Online Fusion: Ops 6, 8, 9
+
+Op 9 (matmul) accumulates `exp_S_t @ V` over d2. Each tile's `exp_S` depends on the running max — the same X output as §4.1.2. This is a second application of online fusion with the same X reduction and the same scale coefficient $s_k = e^{m_{k-1} - m_k}$.
 
 First, prepare two d2 loops. Op 8 (transpose) is elementwise — fold it into Op 9's d2 loop body.
 
 **Before.** Two d2 loops after elementwise prep:
 
 ```python
-""" Fused Ops 5+6: d2 loop (from §5.1.2) """
+""" Fused Ops 5+6: d2 loop (from §4.1.2) """
 sbuf_running_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_max[0:128, 0, 0:1], value=-np.inf)
 psum_running_sum = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.psum)
 nisa.memset(dst=psum_running_sum[0:128, 0, 0:1], value=0.0)
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop A """
     for i_tile_d2 in nl.affine_range(1):
-        """ ... X step + scale + bias + accumulate from §5.1.2 ... """
+        """ ... X step + scale + bias + accumulate from §4.1.2 ... """
 
 """ Fused Ops 8+9: d2 loop """
 for i_block_d5 in nl.affine_range(1):
@@ -1009,12 +1087,12 @@ for i_block_d5 in nl.affine_range(1):
                         moving=sbuf_V[i_k_sub*128:i_k_sub*128+128, 0, 0, 0, 0, 0:128])
 ```
 
-**Pattern match.** Same Algorithm 2 structure as §5.1.2, with a different accumulation body:
+**Pattern match.** Same Algorithm 2 structure as §4.1.2, with a different accumulation body:
 
 | Algorithm 2 Component | Attention Mapping (Ops 6, 8, 9) |
 |---|---|
 | Blocking dim $K$ | d2 (seq_k), $K = 8$ tile blocks |
-| $f_X(\mathbf{O_0}_{k-1}, \mathbf{V_0}_k)$ | Same as §5.1.2 — $\max(\mathbf{O_0}_{k-1}, \text{rowmax}(\mathbf{V_0}_k))$ |
+| $f_X(\mathbf{O_0}_{k-1}, \mathbf{V_0}_k)$ | Same as §4.1.2 — $\max(\mathbf{O_0}_{k-1}, \text{rowmax}(\mathbf{V_0}_k))$ |
 | $g_B(\mathbf{O_0}_K)$ | Same $e^{-m}$ — `exp_S` uses the same max |
 | $h_B(\mathbf{V_1}_k)$ | $\text{transpose}(\exp(\mathbf{V_1}_k))^T \cdot \mathbf{V}_k$ — matmul body per tile |
 | $\mathbf{B}_k = g_B \cdot h_B$ | $\exp(\mathbf{S}_k - m_K)^T @ \mathbf{V}_k$ — one tile's matmul contribution |
@@ -1038,7 +1116,7 @@ for i_block_d5 in nl.affine_range(1):
 
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop A+B """
     for i_tile_d2 in nl.affine_range(1):
-        """ X step: per-tile max → update running max (same as §5.1.2) """
+        """ X step: per-tile max → update running max (same as §4.1.2) """
         psum_tile_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.psum)
         nisa.tensor_reduce(dst=psum_tile_max[0:128, 0, 0:1],
             data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
@@ -1077,10 +1155,11 @@ for i_block_d2 in nl.affine_range(8):                                          "
         nisa.tensor_scalar(dst=sbuf_neg_max[0:128, 0, 0:1],
             data=sbuf_new_max[0:128, 0, 0:1], op0=nl.multiply, operand0=-1.0)
         sbuf_exp_S = nl.ndarray((128, 1, 1, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.activation_reduce(dst=sbuf_exp_S[0:128, 0, 0, 0, 0, 0:512],
-            data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
-            op=nl.exp, bias=sbuf_neg_max[0:128, 0, 0:1],
-            reduce_op=nl.add, reduce_res=psum_running_sum[0:128, 0, 0:1])
+        nisa.activation(dst=sbuf_exp_S[0:128, 0, 0, 0, 0, 0:512],
+            op=nl.exp, data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
+            bias=sbuf_neg_max[0:128, 0, 0:1],
+            reduce_op=nl.add, reduce_res=psum_running_sum[0:128, 0, 0:1],
+            reduce_cmd=nisa.reduce_cmd.reduce)
 
         """ Accumulator 2: transpose + matmul (Ops 8+9 body) """
         sbuf_exp_S_t = nl.ndarray((512, 1, 1, 1, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
@@ -1100,7 +1179,7 @@ for i_block_d2 in nl.affine_range(8):                                          "
 
 `sbuf_exp_S` shrinks to per-tile since it is produced and consumed within the same d2 iteration. Op 7 is topologically independent from Op 9 (§1 DAG). Op 10 depends on Op 9's output but runs after the d2 reduction completes. Neither is part of this transform.
 
-## 6. Future Work
+## 5. Future Work
 
 - **Boundary handling for non-divisible input shapes.** The current guide assumes all input dimensions are exact multiples of their tile sizes. Real workloads often have ragged last tiles (e.g., a sequence length of 1000 with tile size 128 leaves a remainder of 104). Supporting this requires `nl.ds(offset, size)` dynamic slicing to emit variable-length last tiles, with masking or predication where needed. The reference attention kernel ([`attention_cte.py`](/home/ubuntu/KaenaNeuronKernelLibrary/src/nkilib_src/nkilib/core/attention/attention_cte.py)) already uses `nl.ds` for this purpose.
 

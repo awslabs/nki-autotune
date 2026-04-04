@@ -12,7 +12,7 @@ import numpy as np
 from nkigym.codegen.analysis import _OpCall
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_1d import NKIActivation1D
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _get_output_axes_tuple
 
 _BINOP_FNS: dict[type, object] = {
     ast.Add: operator.add,
@@ -68,11 +68,47 @@ def _eval_binop(node: ast.BinOp) -> object:
     return op_fn(left, right)
 
 
+def _eval_np_attr(node: ast.Attribute) -> object:
+    """Resolve ``np.X`` attribute access to the numpy object."""
+    if isinstance(node.value, ast.Name) and node.value.id == "np":
+        return getattr(np, node.attr)
+    raise ValueError(f"Unsupported attribute: {ast.dump(node)}")
+
+
+def _eval_unary(node: ast.UnaryOp) -> object:
+    """Evaluate unary negation."""
+    if isinstance(node.op, ast.USub):
+        return -_eval_expr(node.operand)
+    raise ValueError(f"Unsupported unary op: {ast.dump(node)}")
+
+
+def _eval_list(node: ast.List) -> list[object]:
+    """Evaluate an AST List node to a Python list.
+
+    Args:
+        node: AST List node.
+
+    Returns:
+        List of evaluated elements.
+    """
+    return [_eval_expr(elt) for elt in node.elts]
+
+
+_EVAL_DISPATCH: dict[type, object] = {
+    ast.Attribute: _eval_np_attr,
+    ast.Constant: lambda n: n.value,
+    ast.BinOp: _eval_binop,
+    ast.UnaryOp: _eval_unary,
+    ast.Name: lambda n: n.id,
+    ast.List: _eval_list,
+}
+
+
 def _eval_expr(node: ast.expr) -> object:
     """Evaluate an AST expression to a Python object.
 
     Resolves ``np.X`` attribute accesses, literal constants,
-    binary operations, and unary negation.
+    binary operations, unary negation, and variable names.
 
     Args:
         node: AST expression node.
@@ -80,18 +116,10 @@ def _eval_expr(node: ast.expr) -> object:
     Returns:
         The resolved Python object.
     """
-    result = None
-    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "np":
-        result = getattr(np, node.attr)
-    elif isinstance(node, ast.Constant):
-        result = node.value
-    elif isinstance(node, ast.BinOp):
-        result = _eval_binop(node)
-    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        result = -_eval_expr(node.operand)
-    if result is None:
+    handler = _EVAL_DISPATCH.get(type(node))
+    if handler is None:
         raise ValueError(f"Unsupported kwarg expression: {ast.dump(node)}")
-    return result
+    return handler(node)
 
 
 def _arg_name(node: ast.expr) -> str:
@@ -142,7 +170,7 @@ def _resolve_op_variants(op_calls: list[_OpCall]) -> list[_OpCall]:
     result: list[_OpCall] = []
     for op in op_calls:
         resolved = _maybe_reclassify_activation(op, output_axes_map)
-        output_axes_map[resolved.output_var] = getattr(resolved.stmt_type, "OUTPUT_AXES", ())
+        output_axes_map[resolved.output_var] = _get_output_axes_tuple(resolved.stmt_type)
         result.append(resolved)
     return result
 
@@ -242,10 +270,10 @@ def _disambiguate_op(op_name: str, call: ast.Call) -> str:
     """
     kwarg_names = {kw.arg for kw in call.keywords}
     result = op_name
-    if op_name == "activation" and "reduce_op" in kwarg_names:
+    if op_name == "transpose":
+        result = "nc_transpose"
+    elif op_name == "activation" and "reduce_op" in kwarg_names:
         result = "activation_reduce"
-    elif op_name == "tensor_scalar" and len(call.args) < 2:
-        result = "tensor_scalar_const"
     return result
 
 

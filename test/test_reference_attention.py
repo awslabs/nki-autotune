@@ -24,10 +24,12 @@ def _attention(Q: np.ndarray, K: np.ndarray, V: np.ndarray, scale: float) -> np.
     Q_t = nkigym.nc_transpose(Q)
     K_t = nkigym.nc_transpose(K)
     S = nkigym.nc_matmul(Q_t, K_t)
-    masked_S = nkigym.affine_select(S, cmp_op="greater_equal", on_false_value=-np.inf, channel_multiplier=1, step=-1)
+    masked_S = nkigym.affine_select(
+        S, pattern=[[-1, S.shape[1]]], channel_multiplier=1, on_false_value=-np.inf, cmp_op="greater_equal"
+    )
     scaled_S = nkigym.tensor_scalar(masked_S, scale, op0="multiply")
-    neg_max_S = nkigym.tensor_reduce(scaled_S, reduce_op="max", negate=True)
-    exp_S, sum_exp = nkigym.activation_reduce(scaled_S, neg_max_S, op="exp", reduce_op="add")
+    neg_max_S = nkigym.tensor_reduce(scaled_S, op="max", negate=True)
+    exp_S, sum_exp = nkigym.activation_reduce(scaled_S, op="exp", reduce_op="add", bias=neg_max_S)
     inv_sum = nkigym.activation(sum_exp, op="reciprocal")
     exp_S_t = nkigym.nc_transpose(exp_S)
     attn = nkigym.nc_matmul(exp_S_t, V)

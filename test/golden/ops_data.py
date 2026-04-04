@@ -49,3 +49,43 @@ ACTIVATION_REDUCE_EXP_1 = np.array([[np.exp(0.0), np.exp(1.0)], [np.exp(0.0), np
 
 ACTIVATION_REDUCE_SUM_1 = np.array([1.0 + np.e, 1.0 + np.e], dtype=np.float64)
 """rowsum of exp result."""
+
+"""
+--- New feature test data below ---
+"""
+
+ACTIVATION_BIAS_SCALE_DATA = np.array([[0.0, 1.0], [-1.0, 2.0]], dtype=np.float64)
+ACTIVATION_BIAS_SCALE_BIAS = np.array([0.5, -0.5], dtype=np.float64)
+ACTIVATION_BIAS_SCALE_SCALE = 2.0
+ACTIVATION_BIAS_SCALE_EXPECTED = np.array(
+    [[np.exp(0.0 * 2.0 + 0.5), np.exp(1.0 * 2.0 + 0.5)], [np.exp(-1.0 * 2.0 - 0.5), np.exp(2.0 * 2.0 - 0.5)]],
+    dtype=np.float64,
+)
+"""exp(data * 2.0 + bias[:, None])."""
+
+TS_REVERSE_DATA = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float64)
+TS_REVERSE_OPERAND0 = 10.0
+TS_REVERSE0_EXPECTED = np.array([[9.0, 8.0, 7.0], [6.0, 5.0, 4.0]], dtype=np.float64)
+"""reverse0: operand0 - data = 10 - data."""
+
+TS_COMPOUND_DATA = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float64)
+TS_COMPOUND_COL = np.array([100.0, 200.0], dtype=np.float64)
+TS_COMPOUND_EXPECTED = np.array([[105.0, 205.0, 305.0], [805.0, 1005.0, 1205.0]], dtype=np.float64)
+"""data * col_vec + 5.0 (compound op: multiply then add)."""
+
+TR_KEEPDIMS_DATA = np.array([[1.0, 3.0, 2.0], [6.0, 4.0, 5.0]], dtype=np.float64)
+TR_KEEPDIMS_MAX_EXPECTED = np.array([[3.0], [6.0]], dtype=np.float64)
+"""max along axis=1 with keepdims=True."""
+
+AR_SCALE_DATA = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
+AR_SCALE = 0.5
+AR_SCALE_ELEM_EXPECTED = np.array(
+    [[np.exp(1.0 * 0.5), np.exp(2.0 * 0.5)], [np.exp(3.0 * 0.5), np.exp(4.0 * 0.5)]], dtype=np.float64
+)
+"""exp(data * 0.5), no bias."""
+AR_SCALE_RED_EXPECTED = np.array([np.exp(0.5) + np.exp(1.0), np.exp(1.5) + np.exp(2.0)], dtype=np.float64)
+"""rowsum of exp(data * 0.5)."""
+
+AS_OFFSET_DATA = np.ones((3, 3), dtype=np.float64)
+AS_OFFSET_EXPECTED = np.array([[1.0, 1.0, -99.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], dtype=np.float64)
+"""affine_select with offset=1, channel_multiplier=1, step=-1, cmp_op=greater_equal."""

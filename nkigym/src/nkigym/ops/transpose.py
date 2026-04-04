@@ -22,28 +22,22 @@ class NKITranspose(NKIOp):
         OPERAND_AXES: data is ``(P, F)``.
         OUTPUT_AXES: output is ``(F, P)`` -- swapped.
         MAX_TILE_SIZES: P and F capped at 128.
-        ENGINE: TensorEngine.
     """
 
     NAME: ClassVar[str] = "nc_transpose"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("F", "P")}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
-    ENGINE: ClassVar[str] = "TensorEngine"
 
     def __call__(self, data: np.ndarray, **_: object) -> np.ndarray:
-        """CPU simulation: data.T.
-
-        Args:
-            data: Array of shape (P, F).
-
-        Returns:
-            Transposed array.
-        """
+        """CPU simulation: data.T."""
         return data.T
 
     def render_isa(self, ctx: RenderContext) -> str:
         """Emit nisa.nc_transpose with optional sub-loops.
+
+        Partition overflow is computed from capping only (global tile
+        size > 128), not from natural dimension blocking.
 
         Args:
             ctx: Render context.
@@ -59,29 +53,39 @@ class NKITranspose(NKIOp):
         f_size = src.tile_size[f_axis]
         p_max = self.MAX_TILE_SIZES["P"]
         f_max = self.MAX_TILE_SIZES["F"]
+        p_global_ts = ctx.dim_global_tile_sizes.get(p_axis, p_size)
+        p_overflow = p_global_ts // p_size if p_size < p_global_ts else 1
 
-        if p_size <= p_max and f_size <= f_max:
-            result = f"nisa.nc_transpose(" f"dst={dst.default_indexed_slice()}, " f"src={src.default_indexed_slice()})"
+        needs_chunking = p_size > p_max or f_size > f_max or p_overflow > 1
+        if needs_chunking:
+            result = self._render_chunked(ctx, dst, src, p_axis, f_axis, p_size, f_size, p_max, f_max, p_overflow)
         else:
-            result = self._render_chunked(dst, src, p_size, f_size, p_max, f_max)
+            result = f"nisa.nc_transpose(dst={dst.default_indexed_slice()}, data={src.default_indexed_slice()})"
         return result
 
-    def _render_chunked(self, dst: Tensor, src: Tensor, p_size: int, f_size: int, p_max: int, f_max: int) -> str:
+    def _render_chunked(
+        self,
+        ctx: RenderContext,
+        dst: Tensor,
+        src: Tensor,
+        p_axis: str,
+        f_axis: str,
+        p_size: int,
+        f_size: int,
+        p_max: int,
+        f_max: int,
+        p_overflow: int,
+    ) -> str:
         """Emit sub-loop transpose for chunks exceeding MAX_TILE_SIZES.
 
-        Args:
-            dst: Destination tensor.
-            src: Source tensor.
-            p_size: Partition axis tile size.
-            f_size: Free axis tile size.
-            p_max: Max partition tile size.
-            f_max: Max free tile size.
-
-        Returns:
-            NKI source lines with sub-loops.
+        Transpose swaps axes, so sub-loop indices map to swapped
+        dest positions: P sub-blocks -> dest free chunks,
+        F sub-chunks -> dest partition blocks.
         """
-        p_subs = p_size // p_max
+        p_subs = p_overflow if p_overflow > 1 else (p_size // p_max)
         f_subs = f_size // f_max
+        use_nb_for_p = p_overflow > 1
+
         lines: list[str] = []
         indent = ""
         if p_subs > 1:
@@ -90,13 +94,48 @@ class NKITranspose(NKIOp):
         if f_subs > 1:
             lines.append(f"{indent}for i_f_sub in range({f_subs}):")
             indent += "    "
-        src_slice = src.default_indexed_slice()
-        dst_slice = dst.default_indexed_slice()
-        if p_subs > 1:
-            src_slice = src_slice.replace(f"0:{p_size}", f"i_p_sub*{p_max}:(i_p_sub+1)*{p_max}", 1)
-            dst_slice = dst_slice.replace(f"0:{p_size}", f"i_p_sub*{p_max}:(i_p_sub+1)*{p_max}", 1)
-        if f_subs > 1:
-            src_slice = src_slice.replace(f"0:{f_size}", f"i_f_sub*{f_max}:(i_f_sub+1)*{f_max}", 1)
-            dst_slice = dst_slice.replace(f"0:{f_size}", f"i_f_sub*{f_max}:(i_f_sub+1)*{f_max}", 1)
-        lines.append(f"{indent}nisa.nc_transpose(dst={dst_slice}, src={src_slice})")
+
+        src_slice = self._src_slice(src, p_axis, p_size, f_size, p_max, f_max, p_subs, f_subs, use_nb_for_p)
+        dst_slice = self._dst_slice(dst, f_axis, p_size, p_max, p_subs, f_subs, use_nb_for_p)
+        lines.append(f"{indent}nisa.nc_transpose(dst={dst_slice}, data={src_slice})")
         return "\n".join(lines)
+
+    def _src_slice(
+        self,
+        src: Tensor,
+        p_axis: str,
+        p_size: int,
+        f_size: int,
+        p_max: int,
+        f_max: int,
+        p_subs: int,
+        f_subs: int,
+        use_nb_for_p: bool,
+    ) -> str:
+        """Build source slice expression for chunked transpose."""
+        if use_nb_for_p and p_subs > 1:
+            src_nb = dict(src.default_nb)
+            src_nb[p_axis] = "i_p_sub"
+            result = src.indexed_slice(src_nb, src.default_tpb)
+        else:
+            result = src.default_indexed_slice()
+
+        if not use_nb_for_p and p_subs > 1:
+            result = result.replace(f"0:{p_size}", f"i_p_sub*{p_max}:(i_p_sub+1)*{p_max}", 1)
+        if f_subs > 1:
+            result = result.replace(f"0:{f_size}", f"i_f_sub*{f_max}:(i_f_sub+1)*{f_max}", 1)
+        return result
+
+    def _dst_slice(
+        self, dst: Tensor, f_axis: str, p_size: int, p_max: int, p_subs: int, f_subs: int, use_nb_for_p: bool
+    ) -> str:
+        """Build dest slice, accounting for P/F axis swap."""
+        if f_subs > 1:
+            result = dst.indexed_slice({f_axis: "i_f_sub"}, {})
+        else:
+            result = dst.default_indexed_slice()
+
+        if p_subs > 1:
+            p_logical = p_size * p_subs if use_nb_for_p else p_size
+            result = result.replace(f"0:{p_logical}", f"i_p_sub*{p_max}:(i_p_sub+1)*{p_max}", 1)
+        return result

@@ -40,3 +40,14 @@ ADD_ONLY_DEFAULT = Schedule(
     dim_schedules=(DimSchedule("d0", 128, 1), DimSchedule("d1", 128, 1)),
     op_placements=(2, 2),
 )
+
+ATTENTION_DEFAULT = Schedule(
+    loop_order=(("d0", 0), ("d5", 0), ("d1", 0), ("d2", 0), ("d2", 1), ("d2", 2)),
+    dim_schedules=(
+        DimSchedule("d0", 128, 1),
+        DimSchedule("d5", 128, 1),
+        DimSchedule("d1", 128, 1),
+        DimSchedule("d2", 512, 1),
+    ),
+    op_placements=(2, 2, 2),
+)

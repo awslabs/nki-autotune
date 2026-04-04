@@ -128,3 +128,51 @@ RMSNORM_MATMUL_ANALYSIS = _Analysis(
     return_var="result",
 )
 RMSNORM_MATMUL_PARAMS = ("a", "b")
+
+
+ATTENTION_PARAMS = ("Q", "K", "V")
+
+ATTENTION_ANALYSIS = _Analysis(
+    var_dims={
+        "Q": ("d0", "d1"),
+        "K": ("d2", "d1"),
+        "V": ("d2", "d5"),
+        "Q_t": ("d1", "d0"),
+        "K_t": ("d1", "d2"),
+        "S": ("d0", "d2"),
+        "scaled_S": ("d0", "d2"),
+        "masked_S": ("d0", "d2"),
+        "max_S": ("d0",),
+        "shifted_S": ("d0", "d2"),
+        "exp_S": ("d0", "d2"),
+        "sum_exp": ("d0",),
+        "inv_sum": ("d0",),
+        "exp_S_t": ("d2", "d0"),
+        "attn": ("d0", "d5"),
+        "output": ("d0", "d5"),
+    },
+    var_shapes={
+        "Q": (4096, 128),
+        "K": (4096, 128),
+        "V": (4096, 128),
+        "Q_t": (128, 4096),
+        "K_t": (128, 4096),
+        "S": (4096, 4096),
+        "scaled_S": (4096, 4096),
+        "masked_S": (4096, 4096),
+        "max_S": (4096,),
+        "shifted_S": (4096, 4096),
+        "exp_S": (4096, 4096),
+        "sum_exp": (4096,),
+        "inv_sum": (4096,),
+        "exp_S_t": (4096, 4096),
+        "attn": (4096, 128),
+        "output": (4096, 128),
+    },
+    parallel_dims=["d0", "d5"],
+    reduction_dims=["d1", "d2"],
+    tile_counts={"d0": 32, "d5": 1},
+    reduction_tile_counts={"d1": 1, "d2": 8},
+    dim_tile_sizes={"d0": 128, "d1": 128, "d2": 512, "d5": 128},
+    return_var="output",
+)

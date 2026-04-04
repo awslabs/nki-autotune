@@ -1,9 +1,10 @@
 """Position-predicated element select op: nisa.affine_select.
 
 Generates affine_value = offset + p*channel_multiplier + f*step
-per element, compares to 0. Selects data or on_false_value.
+per element, compares to 0. Selects on_true_tile or on_false_value.
 """
 
+import math
 from typing import ClassVar
 
 import numpy as np
@@ -12,8 +13,32 @@ from nkigym.codegen.ir import RenderContext
 from nkigym.ops.base import NKIOp
 
 
+def _format_float(value: float) -> str:
+    """Format a float for NKI code generation.
+
+    Converts special float values (inf, -inf, nan) to np.* expressions
+    so the generated kernel uses valid Python.
+
+    Args:
+        value: The float value to format.
+
+    Returns:
+        String representation valid in generated NKI code.
+    """
+    if math.isinf(value):
+        if value > 0:
+            result = "np.inf"
+        else:
+            result = "-np.inf"
+    elif math.isnan(value):
+        result = "np.nan"
+    else:
+        result = repr(value)
+    return result
+
+
 class NKIAffineSelect(NKIOp):
-    """Affine select: position-predicated element select (GpSimd Engine).
+    """Affine select: position-predicated element select.
 
     Generates an affine value per element and selects between
     the input tile and a constant based on comparison.
@@ -21,41 +46,51 @@ class NKIAffineSelect(NKIOp):
 
     Attributes:
         NAME: ``"affine_select"``.
-        OPERAND_AXES: Single operand ``data`` with axes ``(P, F)``.
+        OPERAND_AXES: Single operand ``on_true_tile`` with axes ``(P, F)``.
         OUTPUT_AXES: Output axes ``(P, F)``.
         MAX_TILE_SIZES: Partition axis capped at 128.
-        ENGINE: GpSimd.
     """
 
     NAME: ClassVar[str] = "affine_select"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F")}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"on_true_tile": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F")}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
-    ENGINE: ClassVar[str] = "GpSimd"
     NEEDS_TILE_POSITION: ClassVar[bool] = True
 
-    _CMP_FNS: ClassVar[dict[str, object]] = {"greater_equal": np.greater_equal}
+    _CMP_FNS: ClassVar[dict[str, object]] = {"greater_equal": np.greater_equal, "equal": np.equal}
 
     def __call__(
-        self, data: np.ndarray, cmp_op: str, on_false_value: float, channel_multiplier: int, step: int, **_: object
+        self,
+        pattern: list[list[int]],
+        channel_multiplier: int,
+        on_true_tile: np.ndarray,
+        on_false_value: float,
+        cmp_op: str = "equal",
+        offset: int = 0,
+        **_: object,
     ) -> np.ndarray:
         """CPU simulation: affine select with comparison.
 
         Args:
-            data: Array of shape (P, F).
-            cmp_op: Comparison operation.
-            on_false_value: Value when predicate is false.
+            pattern: List of [step, count] pairs defining free-axis layout.
             channel_multiplier: P-axis scale factor.
-            step: F-axis step.
+            on_true_tile: Array of shape (P, F).
+            on_false_value: Value when predicate is false.
+            cmp_op: Comparison operation name.
+            offset: Base offset for the affine expression.
 
         Returns:
-            Masked array with same shape as data.
+            Masked array with same shape as on_true_tile.
         """
-        rows, cols = data.shape
-        p_idx = np.arange(rows)[:, np.newaxis]
-        f_idx = np.arange(cols)[np.newaxis, :]
-        mask = self._CMP_FNS[cmp_op](p_idx * channel_multiplier + f_idx * step, 0)
-        return np.where(mask, data, on_false_value)
+        P = on_true_tile.shape[0]
+        F = int(np.prod([n for _, n in pattern]))
+        p_idx = np.arange(P)[:, np.newaxis]
+        f_vals = np.array([0])
+        for step, count in pattern:
+            f_vals = (f_vals[:, np.newaxis] + np.arange(count) * step).ravel()
+        affine = offset + p_idx * channel_multiplier + f_vals[np.newaxis, :]
+        mask = self._CMP_FNS[cmp_op](affine, 0)
+        return np.where(mask, on_true_tile.reshape(P, F), on_false_value)
 
     def render_isa(self, ctx: RenderContext) -> str:
         """Emit nisa.affine_select call with tile-position offset.
@@ -71,31 +106,32 @@ class NKIAffineSelect(NKIOp):
             NKI source line for affine_select.
         """
         dst = ctx.outputs["output"]
-        data = ctx.operands["data"]
+        on_true = ctx.operands["on_true_tile"]
         cmp_op = ctx.config_kwargs["cmp_op"]
-        on_false_value = ctx.config_kwargs["on_false_value"]
+        on_false_value = _format_float(ctx.config_kwargs["on_false_value"])
         channel_multiplier = ctx.config_kwargs.get("channel_multiplier", 1)
-        step = ctx.config_kwargs.get("step", -1)
-        offset_expr = self._compute_offset(data, ctx, channel_multiplier, step)
-        free_axis = data.axes[1]
-        free_size = data.tile_size[free_axis]
+        pattern = ctx.config_kwargs.get("pattern", [[-1, on_true.tile_size[on_true.axes[1]]]])
+        step = pattern[0][0]
+        free_axis = on_true.axes[1]
+        free_size = on_true.tile_size[free_axis]
+        offset_expr = self._compute_offset(on_true, ctx, channel_multiplier, step)
         return (
             f"nisa.affine_select(dst={dst.default_indexed_slice()}, "
             f"pattern=[[{step}, {free_size}]], "
             f"offset={offset_expr}, "
             f"channel_multiplier={channel_multiplier}, "
             f"cmp_op=nl.{cmp_op}, "
-            f"on_true_tile={data.default_indexed_slice()}, "
+            f"on_true_tile={on_true.default_indexed_slice()}, "
             f"on_false_value={on_false_value})"
         )
 
     def _compute_offset(
-        self, data: "nkigym.codegen.ir.Tensor", ctx: RenderContext, channel_multiplier: int, step: int
+        self, on_true: "nkigym.codegen.ir.Tensor", ctx: RenderContext, channel_multiplier: int, step: int
     ) -> str:
         """Compute the offset expression from tile position.
 
         Args:
-            data: Data operand Tensor.
+            on_true: on_true_tile operand Tensor.
             ctx: Render context with tile_start expressions.
             channel_multiplier: P-axis scale factor.
             step: F-axis step.
@@ -104,13 +140,13 @@ class NKIAffineSelect(NKIOp):
             Python expression string for offset.
         """
         parts: list[str] = []
-        if len(data.axes) >= 1 and channel_multiplier != 0:
-            p_dim = data.axes[0]
+        if len(on_true.axes) >= 1 and channel_multiplier != 0:
+            p_dim = on_true.axes[0]
             p_start = ctx.tile_start.get(p_dim)
             if p_start is not None:
                 parts.append(f"{p_start} * {channel_multiplier}")
-        if len(data.axes) >= 2 and step != 0:
-            f_dim = data.axes[1]
+        if len(on_true.axes) >= 2 and step != 0:
+            f_dim = on_true.axes[1]
             f_start = ctx.tile_start.get(f_dim)
             if f_start is not None:
                 parts.append(f"{f_start} * {step}")

@@ -14,6 +14,21 @@ from typing import Any, ClassVar
 from nkigym.codegen.ir import RenderContext
 
 
+def _op_display_name(op: object) -> str:
+    """Convert an op value to its NKI display name.
+
+    Handles numpy ufuncs, strings, and other callables.
+
+    Args:
+        op: Operation value (numpy function, string, or callable).
+
+    Returns:
+        String name suitable for ``nl.<name>`` rendering.
+    """
+    result = op if isinstance(op, str) else getattr(op, "__name__", str(op))
+    return result
+
+
 def _get_output_axes_tuple(cls: type) -> tuple[str, ...]:
     """Extract the primary output's axis labels from OUTPUT_AXES.
 
@@ -60,21 +75,18 @@ class NKIOp:
     - OPERAND_AXES: maps operand name to axis label tuple
     - OUTPUT_AXES: maps output name to axis label tuple
     - MAX_TILE_SIZES: per-axis tile size limits
-    - ENGINE: hardware engine name
 
     Attributes:
         NAME: Registry key and ISA call name.
         OPERAND_AXES: Maps operand name to axis label tuple.
         OUTPUT_AXES: Maps output name to axis label tuple.
         MAX_TILE_SIZES: Per-axis tile size overrides.
-        ENGINE: Hardware engine (e.g. TensorEngine, VectorEngine).
     """
 
     NAME: ClassVar[str] = ""
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {}
-    ENGINE: ClassVar[str] = ""
     _registry: ClassVar[dict[str, type["NKIOp"]]] = {}
 
     def __init_subclass__(cls, **kwargs: Any) -> None:

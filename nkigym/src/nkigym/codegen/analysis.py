@@ -6,7 +6,7 @@ or reduction, and computes tile counts and slice bounds.
 
 from typing import NamedTuple
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _get_output_axes_tuple
 
 _TILE = 128
 
@@ -187,15 +187,16 @@ def _unify_one_op(
         dim_to_tile_size: Mutable dim ID to tile size mapping.
     """
     operand_axes: dict[str, tuple[str, ...]] = getattr(op_call.stmt_type, "OPERAND_AXES", {})
-    output_axes: tuple[str, ...] = getattr(op_call.stmt_type, "OUTPUT_AXES", ())
+    output_axes: tuple[str, ...] = _get_output_axes_tuple(op_call.stmt_type)
     operand_names = list(operand_axes.keys())
     axis_to_dim: dict[str, str] = {}
     for operand_name, var_name in zip(operand_names, op_call.input_vars):
         axes = operand_axes[operand_name]
         var_dim_ids = var_dims[var_name]
         for axis_idx, axis_label in enumerate(axes):
-            _unify_axis(axis_label, var_dim_ids[axis_idx], axis_to_dim, dim_info, rename_map)
-    tile_limits: dict[str, int] = getattr(op_call.stmt_type, "TILE_LIMITS", {})
+            if axis_idx < len(var_dim_ids):
+                _unify_axis(axis_label, var_dim_ids[axis_idx], axis_to_dim, dim_info, rename_map)
+    tile_limits: dict[str, int] = getattr(op_call.stmt_type, "MAX_TILE_SIZES", {})
     for axis, limit in tile_limits.items():
         if axis in axis_to_dim:
             dim_id = _canonical(axis_to_dim[axis], rename_map)
@@ -226,6 +227,8 @@ def _register_output(
     out_dims: list[str] = []
     out_shape: list[int] = []
     for axis_label in output_axes:
+        if axis_label not in axis_to_dim:
+            continue
         dim_id = _canonical(axis_to_dim[axis_label], rename_map)
         out_dims.append(dim_id)
         out_shape.append(dim_info[dim_id].size)
@@ -358,7 +361,7 @@ def has_reduction(op_call: _OpCall) -> bool:
         True if the op has at least one reduction dimension.
     """
     operand_axes: dict[str, tuple[str, ...]] = getattr(op_call.stmt_type, "OPERAND_AXES", {})
-    output_axes: tuple[str, ...] = getattr(op_call.stmt_type, "OUTPUT_AXES", ())
+    output_axes: tuple[str, ...] = _get_output_axes_tuple(op_call.stmt_type)
     output_set = set(output_axes)
     all_input_axes: set[str] = set()
     for axes in operand_axes.values():

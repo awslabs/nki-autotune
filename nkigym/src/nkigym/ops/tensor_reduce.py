@@ -20,30 +20,32 @@ class NKITensorReduce(NKIOp):
         OPERAND_AXES: data is ``(P, F)``.
         OUTPUT_AXES: output is ``(P,)``.
         MAX_TILE_SIZES: P capped at 128.
-        ENGINE: VectorEngine.
     """
 
     NAME: ClassVar[str] = "tensor_reduce"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P",)}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
-    ENGINE: ClassVar[str] = "VectorEngine"
 
     _NKI_REDUCE_OPS: ClassVar[dict[str, str]] = {"max": "maximum", "add": "add"}
     _REDUCE_FNS: ClassVar[dict[str, object]] = {"max": np.max, "add": np.sum}
 
-    def __call__(self, data: np.ndarray, op: str, negate: bool, **_: object) -> np.ndarray:
-        """CPU simulation: reduce along free axis.
+    def __call__(
+        self, op: str, data: np.ndarray, axis: int, negate: bool = False, keepdims: bool = False, **_: object
+    ) -> np.ndarray:
+        """CPU simulation: reduce along specified axis.
 
         Args:
-            data: Array of shape (P, F).
             op: Reduction operation (max, add).
+            data: Array of shape (P, F).
+            axis: Axis to reduce along.
             negate: Whether to negate the result.
+            keepdims: Whether to keep the reduced dimension.
 
         Returns:
-            1D array of shape (P,).
+            Reduced array.
         """
-        result = self._REDUCE_FNS[op](data, axis=1)
+        result = self._REDUCE_FNS[op](data, axis=axis, keepdims=keepdims)
         if negate:
             result = -result
         return result
@@ -59,7 +61,7 @@ class NKITensorReduce(NKIOp):
         """
         dst = ctx.outputs["output"]
         data = ctx.operands["data"]
-        op_name = self._NKI_REDUCE_OPS[ctx.config_kwargs["reduce_op"]]
+        op_name = self._NKI_REDUCE_OPS[ctx.config_kwargs["op"]]
         negate = ctx.config_kwargs.get("negate", False)
         negate_str = ", negate=True" if negate else ""
         return (

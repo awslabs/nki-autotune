@@ -188,7 +188,7 @@ def tensor_scalar(data: np.ndarray, operand0: Any, *, op0: str, **kwargs: Any) -
         operand0 = kwargs.get("operand0")
     if operand0 is None:
         raise ValueError("operand0 is required")
-    result = _OP_TENSOR_SCALAR(data=data, operand0=operand0, op0=op0)
+    result = _OP_TENSOR_SCALAR(data=data, op0=op0, operand0=operand0)
     if _ACTIVE_TRACER is not None:
         source_name = _find_tensor_name(data)
         operand_map: dict[str, str] = {"data": source_name}
@@ -211,34 +211,47 @@ def tensor_scalar(data: np.ndarray, operand0: Any, *, op0: str, **kwargs: Any) -
 
 
 def affine_select(
-    data: np.ndarray, *, cmp_op: str, on_false_value: float, channel_multiplier: int, step: int
+    on_true_tile: np.ndarray,
+    *,
+    pattern: list[list[int]],
+    channel_multiplier: int,
+    on_false_value: float,
+    cmp_op: str = "equal",
+    offset: int = 0,
 ) -> np.ndarray:
     """Position-predicated element select.
 
     Args:
-        data: Array of shape (P, F).
-        cmp_op: Comparison operation.
-        on_false_value: Value when predicate is false.
+        on_true_tile: Array of shape (P, F).
+        pattern: List of [step, count] pairs.
         channel_multiplier: P-axis scale factor.
-        step: F-axis step.
+        on_false_value: Value when predicate is false.
+        cmp_op: Comparison operation.
+        offset: Base offset for the affine expression.
 
     Returns:
         Result array.
     """
     result = _OP_AFFINE_SELECT(
-        data=data, cmp_op=cmp_op, on_false_value=on_false_value, channel_multiplier=channel_multiplier, step=step
+        pattern=pattern,
+        channel_multiplier=channel_multiplier,
+        on_true_tile=on_true_tile,
+        on_false_value=on_false_value,
+        cmp_op=cmp_op,
+        offset=offset,
     )
     if _ACTIVE_TRACER is not None:
-        source_name = _find_tensor_name(data)
+        source_name = _find_tensor_name(on_true_tile)
         _trace_result(
             op=_OP_AFFINE_SELECT,
-            operand_map={"data": source_name},
-            operand_arrays={"data": data},
+            operand_map={"on_true_tile": source_name},
+            operand_arrays={"on_true_tile": on_true_tile},
             config_kwargs={
+                "pattern": pattern,
                 "cmp_op": cmp_op,
                 "on_false_value": on_false_value,
                 "channel_multiplier": channel_multiplier,
-                "step": step,
+                "offset": offset,
             },
             output_names=[_fresh_name(f"masked_{source_name}" if source_name else "masked")],
             result_arrays=[result],
@@ -246,18 +259,19 @@ def affine_select(
     return result
 
 
-def tensor_reduce(data: np.ndarray, *, reduce_op: str, negate: bool) -> np.ndarray:
-    """Reduce along the free axis.
+def tensor_reduce(data: np.ndarray, *, op: str, axis: int = 1, negate: bool = False) -> np.ndarray:
+    """Reduce along the specified axis.
 
     Args:
         data: Array of shape (P, F).
-        reduce_op: Reduction operation (max, add).
+        op: Reduction operation (max, add).
+        axis: Axis to reduce along.
         negate: Whether to negate the result.
 
     Returns:
-        1D array of shape (P,).
+        Reduced array.
     """
-    result = _OP_TENSOR_REDUCE(data=data, op=reduce_op, negate=negate)
+    result = _OP_TENSOR_REDUCE(op=op, data=data, axis=axis, negate=negate)
     if _ACTIVE_TRACER is not None:
         source_name = _find_tensor_name(data)
         prefix = "neg_" if negate else ""
@@ -265,59 +279,80 @@ def tensor_reduce(data: np.ndarray, *, reduce_op: str, negate: bool) -> np.ndarr
             op=_OP_TENSOR_REDUCE,
             operand_map={"data": source_name},
             operand_arrays={"data": data},
-            config_kwargs={"reduce_op": reduce_op, "negate": negate},
-            output_names=[_fresh_name(f"{prefix}{reduce_op}_{source_name}" if source_name else f"{prefix}{reduce_op}")],
+            config_kwargs={"op": op, "negate": negate},
+            output_names=[_fresh_name(f"{prefix}{op}_{source_name}" if source_name else f"{prefix}{op}")],
             result_arrays=[result],
         )
     return result
 
 
-def activation_reduce(data: np.ndarray, bias: np.ndarray, *, op: str, reduce_op: str) -> tuple[np.ndarray, np.ndarray]:
+def activation_reduce(
+    data: np.ndarray, *, op: str, reduce_op: str, bias: np.ndarray | None = None, scale: float = 1.0
+) -> tuple[np.ndarray, np.ndarray]:
     """Element-wise activation with simultaneous reduction.
 
     Args:
         data: Array of shape (P, F).
-        bias: Column vector of shape (P,).
         op: Activation function name.
         reduce_op: Reduction operation.
+        bias: Optional column vector of shape (P,).
+        scale: Optional scale factor.
 
     Returns:
         Tuple of (activation output, reduction result).
     """
-    elem_result, reduce_result = _OP_ACTIVATION_REDUCE(data=data, bias=bias, op=op, reduce_op=reduce_op)
+    elem_result, reduce_result = _OP_ACTIVATION_REDUCE(op=op, data=data, reduce_op=reduce_op, bias=bias, scale=scale)
     if _ACTIVE_TRACER is not None:
         source_name = _find_tensor_name(data)
         act_name = _fresh_name(f"{op}_{source_name}" if source_name else f"{op}_out")
         red_name = _fresh_name(f"{reduce_op}_{op}" if source_name else f"{reduce_op}_out")
+        operand_map: dict[str, str] = {"data": source_name}
+        operand_arrays: dict[str, np.ndarray] = {"data": data}
+        config: dict[str, Any] = {"op": op, "reduce_op": reduce_op}
+        if bias is not None:
+            operand_map["bias"] = _find_tensor_name(bias)
+            operand_arrays["bias"] = bias
+        if scale != 1.0:
+            config["scale"] = scale
         _trace_result(
             op=_OP_ACTIVATION_REDUCE,
-            operand_map={"data": source_name, "bias": _find_tensor_name(bias)},
-            operand_arrays={"data": data, "bias": bias},
-            config_kwargs={"op": op, "reduce_op": reduce_op},
+            operand_map=operand_map,
+            operand_arrays=operand_arrays,
+            config_kwargs=config,
             output_names=[act_name, red_name],
             result_arrays=[elem_result, reduce_result],
         )
     return elem_result, reduce_result
 
 
-def activation(data: np.ndarray, *, op: str) -> np.ndarray:
-    """Element-wise unary activation.
+def activation(data: np.ndarray, *, op: str, bias: np.ndarray | None = None, scale: float = 1.0) -> np.ndarray:
+    """Element-wise unary activation: op(data * scale + bias).
 
     Args:
         data: Array of shape (P, F) or (P,).
         op: Activation function name.
+        bias: Optional column vector of shape (P,).
+        scale: Optional scale factor.
 
     Returns:
         Activated array.
     """
-    result = _OP_ACTIVATION(data=data, op=op)
+    result = _OP_ACTIVATION(op=op, data=data, bias=bias, scale=scale)
     if _ACTIVE_TRACER is not None:
         source_name = _find_tensor_name(data)
+        operand_map: dict[str, str] = {"data": source_name}
+        operand_arrays: dict[str, np.ndarray] = {"data": data}
+        config: dict[str, Any] = {"op": op}
+        if bias is not None:
+            operand_map["bias"] = _find_tensor_name(bias)
+            operand_arrays["bias"] = bias
+        if scale != 1.0:
+            config["scale"] = scale
         _trace_result(
             op=_OP_ACTIVATION,
-            operand_map={"data": source_name},
-            operand_arrays={"data": data},
-            config_kwargs={"op": op},
+            operand_map=operand_map,
+            operand_arrays=operand_arrays,
+            config_kwargs=config,
             output_names=[_fresh_name(f"{op}_{source_name}" if source_name else f"{op}_out")],
             result_arrays=[result],
         )
