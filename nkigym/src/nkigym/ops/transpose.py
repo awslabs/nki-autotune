@@ -2,7 +2,7 @@
 
 data(P, F) -> output(F, P). Swaps partition and free dims.
 
-Sub-loop: if P or F exceeds 128, render_isa() emits nested
+Sub-loop: if P or F exceeds 128, render() emits nested
 sub-loops that transpose (128, 128) chunks.
 """
 
@@ -27,13 +27,14 @@ class NKITranspose(NKIOp):
     NAME: ClassVar[str] = "nc_transpose"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("F", "P")}
+    AXIS_ROLES: ClassVar[dict[str, str]] = {"P": "partition", "F": "free"}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
 
     def __call__(self, data: np.ndarray, **_: object) -> np.ndarray:
         """CPU simulation: data.T."""
         return data.T
 
-    def render_isa(self, ctx: RenderContext) -> str:
+    def render(self, ctx: RenderContext) -> list[str]:
         """Emit nisa.nc_transpose with optional sub-loops.
 
         Partition overflow is computed from capping only (global tile
@@ -43,7 +44,7 @@ class NKITranspose(NKIOp):
             ctx: Render context.
 
         Returns:
-            NKI source line(s) for nc_transpose.
+            NKI source lines for nc_transpose.
         """
         dst = ctx.outputs["output"]
         src = ctx.operands["data"]
@@ -60,7 +61,7 @@ class NKITranspose(NKIOp):
         if needs_chunking:
             result = self._render_chunked(ctx, dst, src, p_axis, f_axis, p_size, f_size, p_max, f_max, p_overflow)
         else:
-            result = f"nisa.nc_transpose(dst={dst.default_indexed_slice()}, data={src.default_indexed_slice()})"
+            result = [f"nisa.nc_transpose(dst={dst.default_indexed_slice()}, data={src.default_indexed_slice()})"]
         return result
 
     def _render_chunked(
@@ -75,7 +76,7 @@ class NKITranspose(NKIOp):
         p_max: int,
         f_max: int,
         p_overflow: int,
-    ) -> str:
+    ) -> list[str]:
         """Emit sub-loop transpose for chunks exceeding MAX_TILE_SIZES.
 
         Transpose swaps axes, so sub-loop indices map to swapped
@@ -98,7 +99,7 @@ class NKITranspose(NKIOp):
         src_slice = self._src_slice(src, p_axis, p_size, f_size, p_max, f_max, p_subs, f_subs, use_nb_for_p)
         dst_slice = self._dst_slice(dst, f_axis, p_size, p_max, p_subs, f_subs, use_nb_for_p)
         lines.append(f"{indent}nisa.nc_transpose(dst={dst_slice}, data={src_slice})")
-        return "\n".join(lines)
+        return lines
 
     def _src_slice(
         self,

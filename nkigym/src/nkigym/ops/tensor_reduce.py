@@ -25,6 +25,7 @@ class NKITensorReduce(NKIOp):
     NAME: ClassVar[str] = "tensor_reduce"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P",)}
+    AXIS_ROLES: ClassVar[dict[str, str]] = {"P": "partition", "F": "free"}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
 
     _NKI_REDUCE_OPS: ClassVar[dict[str, str]] = {"max": "maximum", "add": "add"}
@@ -50,22 +51,22 @@ class NKITensorReduce(NKIOp):
             result = -result
         return result
 
-    def render_isa(self, ctx: RenderContext) -> str:
+    def render(self, ctx: RenderContext) -> list[str]:
         """Emit nisa.tensor_reduce call.
 
         Args:
             ctx: Render context.
 
         Returns:
-            NKI source line for tensor_reduce.
+            NKI source lines for tensor_reduce.
         """
         dst = ctx.outputs["output"]
         data = ctx.operands["data"]
         op_name = self._NKI_REDUCE_OPS[ctx.config_kwargs["op"]]
         negate = ctx.config_kwargs.get("negate", False)
         negate_str = ", negate=True" if negate else ""
-        return (
+        return [
             f"nisa.tensor_reduce(dst={dst.default_indexed_slice()}, "
             f"data={data.default_indexed_slice()}, "
             f"op=nl.{op_name}, axis=1{negate_str})"
-        )
+        ]

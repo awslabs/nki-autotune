@@ -26,6 +26,7 @@ class NKIActivationReduce(NKIOp):
     NAME: ClassVar[str] = "activation_reduce"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "bias": ("P",)}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F"), "reduce_res": ("P",)}
+    AXIS_ROLES: ClassVar[dict[str, str]] = {"P": "partition", "F": "free"}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
     SCHEDULE_OUTPUT_AXES: ClassVar[tuple[str, ...]] = ("P",)
 
@@ -59,7 +60,7 @@ class NKIActivationReduce(NKIOp):
         reduce_result = self._REDUCE_FNS[reduce_op](elem_result, axis=1)
         return elem_result, reduce_result
 
-    def render_isa(self, ctx: RenderContext) -> str:
+    def render(self, ctx: RenderContext) -> list[str]:
         """Emit nisa.activation_reduce call.
 
         Each tile gets its own PSUM slot (allocated by the renderer), so
@@ -92,4 +93,4 @@ class NKIActivationReduce(NKIOp):
         scale = ctx.config_kwargs.get("scale")
         if scale is not None and scale != 1.0:
             parts.append(f"scale={scale}")
-        return f"nisa.activation_reduce({', '.join(parts)})"
+        return [f"nisa.activation_reduce({', '.join(parts)})"]

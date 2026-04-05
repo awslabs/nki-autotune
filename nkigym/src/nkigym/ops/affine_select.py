@@ -54,6 +54,7 @@ class NKIAffineSelect(NKIOp):
     NAME: ClassVar[str] = "affine_select"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"on_true_tile": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F")}
+    AXIS_ROLES: ClassVar[dict[str, str]] = {"P": "partition", "F": "free"}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
     NEEDS_TILE_POSITION: ClassVar[bool] = True
 
@@ -92,7 +93,7 @@ class NKIAffineSelect(NKIOp):
         mask = self._CMP_FNS[cmp_op](affine, 0)
         return np.where(mask, on_true_tile.reshape(P, F), on_false_value)
 
-    def render_isa(self, ctx: RenderContext) -> str:
+    def render(self, ctx: RenderContext) -> list[str]:
         """Emit nisa.affine_select call with tile-position offset.
 
         The offset accounts for the tile's position in the full tensor:
@@ -103,7 +104,7 @@ class NKIAffineSelect(NKIOp):
             ctx: Render context.
 
         Returns:
-            NKI source line for affine_select.
+            NKI source lines for affine_select.
         """
         dst = ctx.outputs["output"]
         on_true = ctx.operands["on_true_tile"]
@@ -115,7 +116,7 @@ class NKIAffineSelect(NKIOp):
         free_axis = on_true.axes[1]
         free_size = on_true.tile_size[free_axis]
         offset_expr = self._compute_offset(on_true, ctx, channel_multiplier, step)
-        return (
+        return [
             f"nisa.affine_select(dst={dst.default_indexed_slice()}, "
             f"pattern=[[{step}, {free_size}]], "
             f"offset={offset_expr}, "
@@ -123,7 +124,7 @@ class NKIAffineSelect(NKIOp):
             f"cmp_op=nl.{cmp_op}, "
             f"on_true_tile={on_true.default_indexed_slice()}, "
             f"on_false_value={on_false_value})"
-        )
+        ]
 
     def _compute_offset(
         self, on_true: "nkigym.codegen.ir.Tensor", ctx: RenderContext, channel_multiplier: int, step: int

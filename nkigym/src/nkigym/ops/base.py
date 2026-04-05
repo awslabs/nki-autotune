@@ -1,16 +1,16 @@
-"""NKIOp base class with __call__ simulation and render_isa code generation.
+"""NKIOp base class with __call__ simulation and render code generation.
 
 Each NKIOp subclass maps 1:1 to a real nisa.* ISA instruction.
 Subclasses implement __call__() for CPU simulation (numpy at float64)
-and render_isa() for emitting the ISA call body inside a loop nest.
+and render() for emitting a complete loop nest for one op.
 
-The eager kernel generator (codegen.eager) builds the loop nest and
-calls render_isa() for each op.
+Design doc reference: nkigym_ir_guide.md sections 1.1 and 2.1.
 """
 
 from abc import abstractmethod
 from typing import Any, ClassVar
 
+from nkigym.codegen.hardware import _PSUM_OPS, Hardware
 from nkigym.codegen.ir import RenderContext
 
 
@@ -74,19 +74,19 @@ class NKIOp:
     - NAME: maps to the nisa.* call name
     - OPERAND_AXES: maps operand name to axis label tuple
     - OUTPUT_AXES: maps output name to axis label tuple
-    - MAX_TILE_SIZES: per-axis tile size limits
+    - AXIS_ROLES: maps logical axis name to physical role
 
     Attributes:
         NAME: Registry key and ISA call name.
         OPERAND_AXES: Maps operand name to axis label tuple.
         OUTPUT_AXES: Maps output name to axis label tuple.
-        MAX_TILE_SIZES: Per-axis tile size overrides.
+        AXIS_ROLES: Maps logical axis to ``"partition"`` | ``"free"`` | ``"accumulation"``.
     """
 
     NAME: ClassVar[str] = ""
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
-    MAX_TILE_SIZES: ClassVar[dict[str, int]] = {}
+    AXIS_ROLES: ClassVar[dict[str, str]] = {}
     _registry: ClassVar[dict[str, type["NKIOp"]]] = {}
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -104,6 +104,41 @@ class NKIOp:
         """
         return dict(cls._registry)
 
+    def _free_limit(self, dtype_bytes: int) -> int:
+        """Max free-axis tile size for this op.
+
+        Args:
+            dtype_bytes: Element size in bytes.
+
+        Returns:
+            PSUM_FREE_MAX for TensorEngine ops, else sbuf_free_max.
+        """
+        result = Hardware.PSUM_FREE_MAX if self.NAME in _PSUM_OPS else Hardware.sbuf_free_max(dtype_bytes)
+        return result
+
+    def max_tile_sizes(self, dtype_bytes: int = 4) -> dict[str, int]:
+        """Derive per-axis tile limits from Hardware constants.
+
+        - partition -> SBUF_PARTITION_MAX (128)
+        - accumulation -> SBUF_PARTITION_MAX (128)
+        - free + PSUM ops (nc_matmul, nc_transpose) -> PSUM_FREE_MAX (512)
+        - free + other ops -> sbuf_free_max(dtype_bytes)
+
+        Transpose overrides: both dims <= TRANSPOSE_BLOCK.
+
+        Args:
+            dtype_bytes: Element size in bytes (default 4 for fp32).
+
+        Returns:
+            Maps axis label to max tile size.
+        """
+        role_limits = {
+            "partition": Hardware.SBUF_PARTITION_MAX,
+            "accumulation": Hardware.SBUF_PARTITION_MAX,
+            "free": self._free_limit(dtype_bytes),
+        }
+        return {axis: role_limits[role] for axis, role in self.AXIS_ROLES.items()}
+
     @abstractmethod
     def __call__(self, **kwargs: Any) -> Any:
         """CPU simulation using numpy at float64 precision.
@@ -112,15 +147,17 @@ class NKIOp:
         """
 
     @abstractmethod
-    def render_isa(self, ctx: RenderContext) -> str:
-        """Emit the ISA call inside the innermost loop.
+    def render(self, ctx: RenderContext) -> list[str]:
+        """Emit a complete loop nest for this op.
 
-        If any tile dim exceeds MAX_TILE_SIZES, emit an
-        in-place sub-loop that iterates in chunks.
+        Produces all code for one op: output buffer allocation,
+        parallel output loops, PSUM accumulator (if reduction),
+        reduction loops, DMA loads, ISA call, tensor_copy,
+        and DMA store (if final op).
 
         Args:
-            ctx: Render context with outputs, operands, config.
+            ctx: Render context with all metadata needed for code generation.
 
         Returns:
-            NKI source line(s) for the ISA call.
+            List of NKI source lines (without base indent).
         """

@@ -28,6 +28,7 @@ class NKITensorScalar(NKIOp):
     NAME: ClassVar[str] = "tensor_scalar"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "operand0": ("P",), "operand1": ("P",)}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F")}
+    AXIS_ROLES: ClassVar[dict[str, str]] = {"P": "partition", "F": "free"}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
 
     _BINARY_OPS: ClassVar[dict[str, object]] = {"multiply": np.multiply, "subtract": np.subtract, "add": np.add}
@@ -64,14 +65,14 @@ class NKITensorScalar(NKIOp):
             result = self._BINARY_OPS[op1](c, result) if reverse1 else self._BINARY_OPS[op1](result, c)
         return result
 
-    def render_isa(self, ctx: RenderContext) -> str:
+    def render(self, ctx: RenderContext) -> list[str]:
         """Emit nisa.tensor_scalar call.
 
         Args:
             ctx: Render context.
 
         Returns:
-            NKI source line for tensor_scalar.
+            NKI source lines for tensor_scalar.
         """
         dst = ctx.outputs["output"]
         data = ctx.operands["data"]
@@ -101,4 +102,4 @@ class NKITensorScalar(NKIOp):
             reverse1 = ctx.config_kwargs.get("reverse1", False)
             if reverse1:
                 parts.append("reverse1=True")
-        return f"nisa.tensor_scalar({', '.join(parts)})"
+        return [f"nisa.tensor_scalar({', '.join(parts)})"]

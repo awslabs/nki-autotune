@@ -24,6 +24,7 @@ class NKIActivation(NKIOp):
     NAME: ClassVar[str] = "activation"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "bias": ("P",)}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F")}
+    AXIS_ROLES: ClassVar[dict[str, str]] = {"P": "partition", "F": "free"}
     MAX_TILE_SIZES: ClassVar[dict[str, int]] = {"P": 128}
 
     _ACTIVATION_FNS: ClassVar[dict[str, object]] = {
@@ -52,14 +53,14 @@ class NKIActivation(NKIOp):
         s = scale[..., np.newaxis] if isinstance(scale, np.ndarray) else scale
         return self._ACTIVATION_FNS[op](data * s + b)
 
-    def render_isa(self, ctx: RenderContext) -> str:
+    def render(self, ctx: RenderContext) -> list[str]:
         """Emit nisa.activation call.
 
         Args:
             ctx: Render context.
 
         Returns:
-            NKI source line for activation.
+            NKI source lines for activation.
         """
         dst = ctx.outputs["output"]
         data = ctx.operands["data"]
@@ -71,4 +72,4 @@ class NKIActivation(NKIOp):
         scale = ctx.config_kwargs.get("scale")
         if scale is not None and scale != 1.0:
             parts.append(f"scale={scale}")
-        return f"nisa.activation({', '.join(parts)})"
+        return [f"nisa.activation({', '.join(parts)})"]
