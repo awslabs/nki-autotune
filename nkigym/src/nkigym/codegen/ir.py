@@ -125,6 +125,23 @@ class Tensor:
 
 
 @dataclass
+class OperandInfo:
+    """Per-operand metadata for NKIOp.render().
+
+    Attributes:
+        tensor_name: Traced tensor name (e.g. ``"a"``).
+        dims: Dimension IDs for this operand (e.g. ``("d0", "d1")``).
+        is_input: True if this is a kernel input (needs DMA load from HBM).
+        dtype_expr: Dtype expression for buffer allocation (e.g. ``"a.dtype"``).
+    """
+
+    tensor_name: str
+    dims: tuple[str, ...]
+    is_input: bool
+    dtype_expr: str
+
+
+@dataclass
 class RenderContext:
     """Everything an NKIOp.render() needs to emit NKI source.
 
@@ -137,6 +154,14 @@ class RenderContext:
         tile_idx: Dim ID to loop variable expression (e.g. ``"i_block_d0"``).
         tile_start: Dim ID to element offset expression (e.g. ``"i_block_d0 * 128"``).
         dim_global_tile_sizes: Dim ID to global (uncapped) tile size.
+        op_idx: Sequential op index for comment headers.
+        output_name: Traced output name without prefix (e.g. ``"S"``).
+        output_dims: Output dimension IDs in order.
+        output_dtype: Dtype expression for output buffers (e.g. ``"nl.float32"``).
+        consumed_dims: Dimension IDs reduced over (not in output).
+        dim_info: All dimension metadata.
+        operand_info: Per-operand metadata keyed by slot name.
+        is_final: Whether to emit DMA store for this op.
     """
 
     outputs: dict[str, Tensor] = field(default_factory=dict)
@@ -145,3 +170,11 @@ class RenderContext:
     tile_idx: dict[str, str] = field(default_factory=dict)
     tile_start: dict[str, str] = field(default_factory=dict)
     dim_global_tile_sizes: dict[str, int] = field(default_factory=dict)
+    op_idx: int = 0
+    output_name: str = ""
+    output_dims: tuple[str, ...] = ()
+    output_dtype: str = "nl.float32"
+    consumed_dims: list[str] = field(default_factory=list)
+    dim_info: dict[str, "DimInfo"] = field(default_factory=dict)
+    operand_info: dict[str, OperandInfo] = field(default_factory=dict)
+    is_final: bool = False

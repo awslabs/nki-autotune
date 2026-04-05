@@ -7,10 +7,14 @@ When tracing is active (via EagerTracer), calls are also recorded
 for kernel generation.
 """
 
+import inspect
+import linecache
+import sys
 from typing import Any
 
 import numpy as np
 
+from nkigym.codegen.eager import EagerTracer, generate_eager_kernel
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.affine_select import NKIAffineSelect
@@ -21,7 +25,6 @@ from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.transpose import NKITranspose
 
 _ACTIVE_TRACER: Any = None
-_NAME_COUNTER: dict[str, int] = {}
 _ARRAY_NAMES: dict[int, str] = {}
 
 _OP_MATMUL = NKIMatmul()
@@ -33,22 +36,35 @@ _OP_ACTIVATION_REDUCE = NKIActivationReduce()
 _OP_ACTIVATION = NKIActivation()
 
 
-def _fresh_name(base: str) -> str:
-    """Generate a unique name for a traced tensor.
+def _caller_var_names(depth: int) -> list[str]:
+    """Extract variable name(s) from the assignment in the caller's caller.
+
+    Inspects the source line at the given stack depth to find the
+    assignment target. Supports simple assignment (``x = ...``) and
+    tuple unpacking (``a, b = ...``).
 
     Args:
-        base: Base name (e.g. ``"Q_t"``).
+        depth: Stack frames to go up (2 = caller's caller).
 
     Returns:
-        Unique name string.
+        List of variable name strings.
+
+    Raises:
+        ValueError: If the call is not assigned to a variable.
     """
-    count = _NAME_COUNTER.get(base, 0)
-    _NAME_COUNTER[base] = count + 1
-    if count == 0:
-        result = base
+    frame = sys._getframe(depth)
+    source_line = linecache.getline(frame.f_code.co_filename, frame.f_lineno).strip()
+    eq_pos = source_line.find("=")
+    paren_pos = source_line.find("(")
+    has_assignment = eq_pos > 0 and (paren_pos < 0 or eq_pos < paren_pos)
+    if not has_assignment:
+        raise ValueError(f"nkigym op result must be assigned to a variable: {source_line!r}")
+    lhs = source_line[:eq_pos].strip()
+    if "," in lhs:
+        names = [n.strip() for n in lhs.split(",")]
     else:
-        result = f"{base}_{count}"
-    return result
+        names = [lhs]
+    return names
 
 
 def set_tracer(tracer: Any) -> None:
@@ -59,11 +75,6 @@ def set_tracer(tracer: Any) -> None:
     """
     global _ACTIVE_TRACER
     _ACTIVE_TRACER = tracer
-
-
-def reset_names() -> None:
-    """Reset the name counter for traced tensors."""
-    _NAME_COUNTER.clear()
 
 
 def reset_array_names() -> None:
@@ -135,6 +146,7 @@ def nc_matmul(stationary: np.ndarray, moving: np.ndarray) -> np.ndarray:
     Returns:
         Result array of shape (M, N).
     """
+    names = _caller_var_names(2)
     result = _OP_MATMUL(stationary=stationary, moving=moving)
     if _ACTIVE_TRACER is not None:
         _trace_result(
@@ -142,7 +154,7 @@ def nc_matmul(stationary: np.ndarray, moving: np.ndarray) -> np.ndarray:
             operand_map={"stationary": _find_tensor_name(stationary), "moving": _find_tensor_name(moving)},
             operand_arrays={"stationary": stationary, "moving": moving},
             config_kwargs={},
-            output_names=[_fresh_name("S")],
+            output_names=[names[0]],
             result_arrays=[result],
         )
     return result
@@ -157,16 +169,15 @@ def nc_transpose(data: np.ndarray) -> np.ndarray:
     Returns:
         Transposed array of shape (F, P).
     """
+    names = _caller_var_names(2)
     result = _OP_TRANSPOSE(data=data)
     if _ACTIVE_TRACER is not None:
-        source_name = _find_tensor_name(data)
-        out_name = f"{source_name}_t" if source_name else "T"
         _trace_result(
             op=_OP_TRANSPOSE,
-            operand_map={"data": source_name},
+            operand_map={"data": _find_tensor_name(data)},
             operand_arrays={"data": data},
             config_kwargs={},
-            output_names=[_fresh_name(out_name)],
+            output_names=[names[0]],
             result_arrays=[result],
         )
     return result
@@ -188,6 +199,7 @@ def tensor_scalar(data: np.ndarray, operand0: Any, *, op0: str, **kwargs: Any) -
         operand0 = kwargs.get("operand0")
     if operand0 is None:
         raise ValueError("operand0 is required")
+    names = _caller_var_names(2)
     result = _OP_TENSOR_SCALAR(data=data, op0=op0, operand0=operand0)
     if _ACTIVE_TRACER is not None:
         source_name = _find_tensor_name(data)
@@ -204,7 +216,7 @@ def tensor_scalar(data: np.ndarray, operand0: Any, *, op0: str, **kwargs: Any) -
             operand_map=operand_map,
             operand_arrays=operand_arrays,
             config_kwargs=config,
-            output_names=[_fresh_name(f"{source_name}_scaled" if source_name else "ts")],
+            output_names=[names[0]],
             result_arrays=[result],
         )
     return result
@@ -232,6 +244,7 @@ def affine_select(
     Returns:
         Result array.
     """
+    names = _caller_var_names(2)
     result = _OP_AFFINE_SELECT(
         pattern=pattern,
         channel_multiplier=channel_multiplier,
@@ -241,10 +254,9 @@ def affine_select(
         offset=offset,
     )
     if _ACTIVE_TRACER is not None:
-        source_name = _find_tensor_name(on_true_tile)
         _trace_result(
             op=_OP_AFFINE_SELECT,
-            operand_map={"on_true_tile": source_name},
+            operand_map={"on_true_tile": _find_tensor_name(on_true_tile)},
             operand_arrays={"on_true_tile": on_true_tile},
             config_kwargs={
                 "pattern": pattern,
@@ -253,7 +265,7 @@ def affine_select(
                 "channel_multiplier": channel_multiplier,
                 "offset": offset,
             },
-            output_names=[_fresh_name(f"masked_{source_name}" if source_name else "masked")],
+            output_names=[names[0]],
             result_arrays=[result],
         )
     return result
@@ -271,16 +283,15 @@ def tensor_reduce(data: np.ndarray, *, op: str, axis: int = 1, negate: bool = Fa
     Returns:
         Reduced array.
     """
+    names = _caller_var_names(2)
     result = _OP_TENSOR_REDUCE(op=op, data=data, axis=axis, negate=negate)
     if _ACTIVE_TRACER is not None:
-        source_name = _find_tensor_name(data)
-        prefix = "neg_" if negate else ""
         _trace_result(
             op=_OP_TENSOR_REDUCE,
-            operand_map={"data": source_name},
+            operand_map={"data": _find_tensor_name(data)},
             operand_arrays={"data": data},
             config_kwargs={"op": op, "negate": negate},
-            output_names=[_fresh_name(f"{prefix}{op}_{source_name}" if source_name else f"{prefix}{op}")],
+            output_names=[names[0]],
             result_arrays=[result],
         )
     return result
@@ -301,12 +312,12 @@ def activation_reduce(
     Returns:
         Tuple of (activation output, reduction result).
     """
+    names = _caller_var_names(2)
+    if len(names) < 2:
+        raise ValueError("activation_reduce returns two outputs; use tuple unpacking: a, b = ...")
     elem_result, reduce_result = _OP_ACTIVATION_REDUCE(op=op, data=data, reduce_op=reduce_op, bias=bias, scale=scale)
     if _ACTIVE_TRACER is not None:
-        source_name = _find_tensor_name(data)
-        act_name = _fresh_name(f"{op}_{source_name}" if source_name else f"{op}_out")
-        red_name = _fresh_name(f"{reduce_op}_{op}" if source_name else f"{reduce_op}_out")
-        operand_map: dict[str, str] = {"data": source_name}
+        operand_map: dict[str, str] = {"data": _find_tensor_name(data)}
         operand_arrays: dict[str, np.ndarray] = {"data": data}
         config: dict[str, Any] = {"op": op, "reduce_op": reduce_op}
         if bias is not None:
@@ -319,7 +330,7 @@ def activation_reduce(
             operand_map=operand_map,
             operand_arrays=operand_arrays,
             config_kwargs=config,
-            output_names=[act_name, red_name],
+            output_names=[names[0], names[1]],
             result_arrays=[elem_result, reduce_result],
         )
     return elem_result, reduce_result
@@ -337,10 +348,10 @@ def activation(data: np.ndarray, *, op: str, bias: np.ndarray | None = None, sca
     Returns:
         Activated array.
     """
+    names = _caller_var_names(2)
     result = _OP_ACTIVATION(op=op, data=data, bias=bias, scale=scale)
     if _ACTIVE_TRACER is not None:
-        source_name = _find_tensor_name(data)
-        operand_map: dict[str, str] = {"data": source_name}
+        operand_map: dict[str, str] = {"data": _find_tensor_name(data)}
         operand_arrays: dict[str, np.ndarray] = {"data": data}
         config: dict[str, Any] = {"op": op}
         if bias is not None:
@@ -353,10 +364,62 @@ def activation(data: np.ndarray, *, op: str, bias: np.ndarray | None = None, sca
             operand_map=operand_map,
             operand_arrays=operand_arrays,
             config_kwargs=config,
-            output_names=[_fresh_name(f"{op}_{source_name}" if source_name else f"{op}_out")],
+            output_names=[names[0]],
             result_arrays=[result],
         )
     return result
+
+
+def _classify_params(func: Any, kwargs: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    """Split function params into array inputs and scalars.
+
+    Args:
+        func: The user's math function.
+        kwargs: All keyword arguments passed to render().
+
+    Returns:
+        Tuple of (param_names, array_names, scalar_names).
+    """
+    param_names = list(inspect.signature(func).parameters.keys())
+    array_names: list[str] = []
+    scalar_names: list[str] = []
+    for name in param_names:
+        if name not in kwargs:
+            raise ValueError(f"Missing keyword argument: {name!r}")
+        if isinstance(kwargs[name], np.ndarray):
+            array_names.append(name)
+        else:
+            scalar_names.append(name)
+    return param_names, array_names, scalar_names
+
+
+def render(func: Any, **kwargs: Any) -> str:
+    """Trace a math function and generate NKI kernel source.
+
+    Args:
+        func: Math function using nkigym ops.
+        **kwargs: Named inputs (np.ndarray) and scalar params.
+
+    Returns:
+        Complete NKI kernel source string.
+    """
+    param_names, array_names, scalar_names = _classify_params(func, kwargs)
+
+    tracer = EagerTracer()
+    reset_array_names()
+    for name in array_names:
+        tracer.register_input(name, kwargs[name].shape)
+        _register_array(kwargs[name], name)
+
+    set_tracer(tracer)
+    try:
+        func(*[kwargs[n] for n in param_names])
+    finally:
+        set_tracer(None)
+
+    kernel_name = f"{func.__name__}_kernel"
+    scale_param = ", ".join(scalar_names)
+    return generate_eager_kernel(tracer, kernel_name, scale_param=scale_param)
 
 
 __all__ = [
@@ -375,7 +438,7 @@ __all__ = [
     "tensor_reduce",
     "activation_reduce",
     "activation",
+    "render",
     "set_tracer",
-    "reset_names",
     "reset_array_names",
 ]

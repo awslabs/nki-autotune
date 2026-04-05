@@ -8,7 +8,6 @@ from typing import ClassVar
 
 import numpy as np
 
-from nkigym.codegen.eager_types import DimInfo
 from nkigym.codegen.ir import RenderContext, Tensor
 from nkigym.ops.base import NKIOp
 
@@ -95,7 +94,7 @@ def _render_matmul_nest(ctx: RenderContext) -> list[str]:
     _emit_psum_to_sbuf(out_name, sbuf_out, psum_out, out_dims, lines, indent)
 
     if ctx.is_final:
-        _emit_dma_store(sbuf_out, out_dims, dim_info, lines, indent)
+        _emit_dma_store(out_name, sbuf_out, out_dims, dim_info, lines, indent)
 
     return lines
 
@@ -119,9 +118,7 @@ def _render_matmul_isa(ctx: RenderContext) -> list[str]:
     ]
 
 
-def _emit_double_loops(
-    dim_ids: tuple[str, ...] | list[str], dim_info: dict[str, DimInfo], lines: list[str], indent: str
-) -> str:
+def _emit_double_loops(dim_ids: tuple[str, ...] | list[str], dim_info: dict, lines: list[str], indent: str) -> str:
     """Emit block + tile double loops for each dimension.
 
     Args:
@@ -143,9 +140,7 @@ def _emit_double_loops(
     return current
 
 
-def _emit_input_loads(
-    ctx: RenderContext, dim_info: dict[str, DimInfo], lines: list[str], indent: str
-) -> dict[str, Tensor]:
+def _emit_input_loads(ctx: RenderContext, dim_info: dict, lines: list[str], indent: str) -> dict[str, Tensor]:
     """Emit staging buffer allocs and DMA loads for input operands.
 
     Args:
@@ -215,11 +210,12 @@ def _emit_psum_to_sbuf(
 
 
 def _emit_dma_store(
-    sbuf_out: Tensor, out_dims: tuple[str, ...], dim_info: dict[str, DimInfo], lines: list[str], indent: str
+    hbm_name: str, sbuf_out: Tensor, out_dims: tuple[str, ...], dim_info: dict, lines: list[str], indent: str
 ) -> None:
     """Emit DMA store from SBUF to HBM output.
 
     Args:
+        hbm_name: HBM output variable name.
         sbuf_out: Full-range SBUF output Tensor.
         out_dims: Output dimension IDs.
         dim_info: Dimension metadata.
@@ -228,12 +224,12 @@ def _emit_dma_store(
     """
     nb_exprs = {d: f"i_block_{d}" for d in out_dims}
     tpb_exprs = {d: f"i_tile_{d}" for d in out_dims}
-    hbm_dst = _hbm_slice_expr("output", out_dims, dim_info)
+    hbm_dst = _hbm_slice_expr(hbm_name, out_dims, dim_info)
     sbuf_src = sbuf_out.indexed_slice(nb_exprs, tpb_exprs)
     lines.append(f"{indent}nisa.dma_copy(dst={hbm_dst}, src={sbuf_src})")
 
 
-def _full_range_tensor(name: str, dim_ids: tuple[str, ...], dim_info: dict[str, DimInfo]) -> Tensor:
+def _full_range_tensor(name: str, dim_ids: tuple[str, ...], dim_info: dict) -> Tensor:
     """Build a full-range Tensor with all num_blocks and tiles_per_block.
 
     Args:
@@ -257,7 +253,7 @@ def _full_range_tensor(name: str, dim_ids: tuple[str, ...], dim_info: dict[str, 
     )
 
 
-def _tile_sized_tensor(name: str, dim_ids: tuple[str, ...], dim_info: dict[str, DimInfo], location: str) -> Tensor:
+def _tile_sized_tensor(name: str, dim_ids: tuple[str, ...], dim_info: dict, location: str) -> Tensor:
     """Build a tile-sized Tensor with num_blocks=1, tiles_per_block=1.
 
     Args:
@@ -282,7 +278,7 @@ def _tile_sized_tensor(name: str, dim_ids: tuple[str, ...], dim_info: dict[str, 
     )
 
 
-def _hbm_slice_expr(param_name: str, dim_ids: tuple[str, ...] | list[str], dim_info: dict[str, DimInfo]) -> str:
+def _hbm_slice_expr(param_name: str, dim_ids: tuple[str, ...] | list[str], dim_info: dict) -> str:
     """Build HBM slice expression for DMA load/store.
 
     Args:
