@@ -3,12 +3,12 @@
 stationary(K, M).T @ moving(K, N) -> output(M, N).
 Accumulates into PSUM in fp32 regardless of input dtype.
 
-Chunk+reshape design for interleave groups:
-- chunks_per_dim = unified_tile / op_tile (loop iterations per block)
-- gpi = op_tile / min_tile (groups consumed per chunk)
-- Read: sub_range(chunk, gpi) groups, reshape (gpi, min) -> (1, op_tile)
-- Compute at (op_K, op_M) x (op_K, op_N) native sizes
-- Write: reshape (1, op_tile) -> (gpi, min) back to groups
+Buffer layout:
+- Intra-op: 2D ``(op_tile_P, op_tile_F)``.
+- Inter-op: 4D ``(min_tile_M, total_tiles_M, total_tiles_N, min_tile_N)``.
+
+Flat tile index = ``i_block * intlv + i_interleave_group * gpi``.
+For gpi > 1, reshape merges consecutive groups into the free dim.
 """
 
 from typing import ClassVar
@@ -16,7 +16,7 @@ from typing import ClassVar
 import numpy as np
 
 from nkigym.ops.base import NKIOp, RenderContext
-from nkigym.ops.common import d1_slice, hbm_chunk_range, operand_slice, sub_range
+from nkigym.ops.common import flat_tile_index, flat_tile_range, hbm_chunk_range, intra_slice
 
 _I1 = " " * 4
 _I2 = " " * 8
@@ -29,7 +29,9 @@ MATMUL_FREE_MAX = 512
 
 
 def _emit_buffers(psum_name: str, sbuf_stat: str, sbuf_mov: str, sbuf_out: str, cfg: dict) -> list[str]:
-    """Emit buffer allocation lines for matmul (8-dim layout).
+    """Emit buffer allocation lines for matmul.
+
+    Intra-op buffers are 2D. Inter-op output is 4D.
 
     Args:
         psum_name: Name for PSUM accumulator buffer.
@@ -41,36 +43,21 @@ def _emit_buffers(psum_name: str, sbuf_stat: str, sbuf_mov: str, sbuf_out: str, 
     Returns:
         List of buffer allocation source lines.
     """
-    op_M, op_N = cfg["op_M"], cfg["op_N"]
-    min_M, min_N = cfg["min_M"], cfg["min_N"]
-    op_K = cfg["op_K"]
+    op_M, op_N, op_K = cfg["op_M"], cfg["op_N"], cfg["op_K"]
 
-    lines = [f"{psum_name} = nl.ndarray(" f"({op_M}, 1, 1, 1, 1, 1, 1, {op_N})," f" dtype=nl.float32, buffer=nl.psum)"]
+    lines = [f"{psum_name} = nl.ndarray(({op_M}, {op_N}), dtype=nl.float32, buffer=nl.psum)"]
     if cfg["stat_from_hbm"]:
-        lines.append(
-            f"{sbuf_stat} = nl.ndarray("
-            f"({op_K}, 1, 1, 1, 1, 1, 1, {op_M}),"
-            f" dtype=nl.{cfg['stat_dtype']}, buffer=nl.sbuf)"
-        )
+        lines.append(f"{sbuf_stat} = nl.ndarray(({op_K}, {op_M}), dtype=nl.{cfg['stat_dtype']}, buffer=nl.sbuf)")
     if cfg["mov_from_hbm"]:
-        lines.append(
-            f"{sbuf_mov} = nl.ndarray("
-            f"({op_K}, 1, 1, 1, 1, 1, 1, {op_N}),"
-            f" dtype=nl.{cfg['mov_dtype']}, buffer=nl.sbuf)"
-        )
+        lines.append(f"{sbuf_mov} = nl.ndarray(({op_K}, {op_N}), dtype=nl.{cfg['mov_dtype']}, buffer=nl.sbuf)")
     if cfg["is_final"]:
-        lines.append(
-            f"{sbuf_out} = nl.ndarray("
-            f"({op_M}, 1, 1, 1, 1, 1, 1, {op_N}),"
-            f" dtype=nl.{cfg['stat_dtype']}, buffer=nl.sbuf)"
-        )
+        lines.append(f"{sbuf_out} = nl.ndarray(({op_M}, {op_N}), dtype=nl.{cfg['stat_dtype']}, buffer=nl.sbuf)")
     else:
-        intlv_M, intlv_N = cfg["intlv_M"], cfg["intlv_N"]
-        nb_M, nb_N = cfg["num_blocks_M"], cfg["num_blocks_N"]
+        min_M, min_N = cfg["min_M"], cfg["min_N"]
+        total_M, total_N = cfg["total_M"], cfg["total_N"]
         lines.append(
             f"{sbuf_out} = nl.ndarray("
-            f"({min_M}, {nb_M}, {nb_N},"
-            f" 1, 1, {intlv_M}, {intlv_N}, {min_N}),"
+            f"({min_M}, {total_M}, {total_N}, {min_N}),"
             f" dtype=nl.{cfg['stat_dtype']}, buffer=nl.sbuf)"
         )
     return lines
@@ -87,7 +74,7 @@ def _emit_loops(
     num_blocks_K: int,
     chunks_K: int,
     psum_name: str,
-    psum_d1: str,
+    psum_sl: str,
 ) -> list[str]:
     """Emit the nested loop structure with memset.
 
@@ -102,22 +89,22 @@ def _emit_loops(
         num_blocks_K: Number of blocks in K.
         chunks_K: Chunk iterations for K.
         psum_name: PSUM buffer variable name.
-        psum_d1: Degree-1 slice for PSUM memset.
+        psum_sl: 2D slice for PSUM memset.
 
     Returns:
         List of loop source lines.
     """
     return [
-        f"for i_block_{dim_M} in range({num_blocks_M}):",
-        f"{_I1}for i_tile_{dim_M} in range(1):",
-        f"{_I2}for i_block_{dim_N} in range({num_blocks_N}):",
-        f"{_I3}for i_tile_{dim_N} in range(1):",
-        f"{_I4}for i_interleave_group_{dim_M} in range({chunks_M}):",
-        f"{_I5}for i_interleave_group_{dim_N} in range({chunks_N}):",
-        f"{_I6}nisa.memset(dst={psum_name}[{psum_d1}], value=0.0)",
-        f"{_I6}for i_block_{dim_K} in range({num_blocks_K}):",
-        f"{_I6}{_I1}for i_tile_{dim_K} in range(1):",
-        f"{_I6}{_I2}for i_interleave_group_{dim_K} in range({chunks_K}):",
+        f"for i_block_{dim_M} in nl.affine_range({num_blocks_M}):",
+        f"{_I1}for i_tile_{dim_M} in nl.affine_range(1):",
+        f"{_I2}for i_block_{dim_N} in nl.affine_range({num_blocks_N}):",
+        f"{_I3}for i_tile_{dim_N} in nl.affine_range(1):",
+        f"{_I4}for i_interleave_group_{dim_M} in nl.affine_range({chunks_M}):",
+        f"{_I5}for i_interleave_group_{dim_N} in nl.affine_range({chunks_N}):",
+        f"{_I6}nisa.memset(dst={psum_name}[{psum_sl}], value=0.0)",
+        f"{_I6}for i_block_{dim_K} in nl.affine_range({num_blocks_K}):",
+        f"{_I6}{_I1}for i_tile_{dim_K} in nl.affine_range(1):",
+        f"{_I6}{_I2}for i_interleave_group_{dim_K} in nl.affine_range({chunks_K}):",
     ]
 
 
@@ -135,30 +122,28 @@ def _emit_dma_loads(cfg: dict, sbuf_stat: str, sbuf_mov: str) -> list[str]:
     lines: list[str] = []
     inner = _I6 + _I3
     if cfg["stat_from_hbm"]:
-        stat_d1 = d1_slice(cfg["op_K"], cfg["op_M"])
+        stat_sl = intra_slice(cfg["op_K"], cfg["op_M"])
         k_rng = hbm_chunk_range(
             f"i_block_{cfg['dim_K']}", cfg["unified_K"], f"i_interleave_group_{cfg['dim_K']}", cfg["op_K"]
         )
         m_rng = hbm_chunk_range(
             f"i_block_{cfg['dim_M']}", cfg["unified_M"], f"i_interleave_group_{cfg['dim_M']}", cfg["op_M"]
         )
-        lines.append(
-            f"{inner}nisa.dma_copy(" f"dst={sbuf_stat}[{stat_d1}]," f" src={cfg['stat_name']}[{k_rng}, {m_rng}])"
-        )
+        lines.append(f"{inner}nisa.dma_copy(dst={sbuf_stat}[{stat_sl}], src={cfg['stat_name']}[{k_rng}, {m_rng}])")
     if cfg["mov_from_hbm"]:
-        mov_d1 = d1_slice(cfg["op_K"], cfg["op_N"])
+        mov_sl = intra_slice(cfg["op_K"], cfg["op_N"])
         k_rng = hbm_chunk_range(
             f"i_block_{cfg['dim_K']}", cfg["unified_K"], f"i_interleave_group_{cfg['dim_K']}", cfg["op_K"]
         )
         n_rng = hbm_chunk_range(
             f"i_block_{cfg['dim_N']}", cfg["unified_N"], f"i_interleave_group_{cfg['dim_N']}", cfg["op_N"]
         )
-        lines.append(f"{inner}nisa.dma_copy(" f"dst={sbuf_mov}[{mov_d1}]," f" src={cfg['mov_name']}[{k_rng}, {n_rng}])")
+        lines.append(f"{inner}nisa.dma_copy(dst={sbuf_mov}[{mov_sl}], src={cfg['mov_name']}[{k_rng}, {n_rng}])")
     return lines
 
 
 def _emit_compute(cfg: dict, psum_name: str, sbuf_stat: str, sbuf_mov: str) -> list[str]:
-    """Emit nc_matmul call with chunk reshape for interleave groups.
+    """Emit nc_matmul call with flat tile indexing for operand reads.
 
     Args:
         cfg: Configuration dict with tile sizes and operand info.
@@ -170,20 +155,20 @@ def _emit_compute(cfg: dict, psum_name: str, sbuf_stat: str, sbuf_mov: str) -> l
         List of nc_matmul source lines.
     """
     inner = _I6 + _I3
-    psum_d1 = d1_slice(cfg["op_M"], cfg["op_N"])
+    psum_sl = intra_slice(cfg["op_M"], cfg["op_N"])
 
     stat_expr = _operand_read_expr(cfg, "stat", sbuf_stat, cfg["op_K"], cfg["op_M"], cfg["gpi_M"])
     mov_expr = _operand_read_expr(cfg, "mov", sbuf_mov, cfg["op_K"], cfg["op_N"], cfg["gpi_N"])
 
-    return [f"{inner}nisa.nc_matmul(" f"dst={psum_name}[{psum_d1}]," f" stationary={stat_expr}," f" moving={mov_expr})"]
+    return [f"{inner}nisa.nc_matmul(dst={psum_name}[{psum_sl}], stationary={stat_expr}, moving={mov_expr})"]
 
 
 def _operand_read_expr(cfg: dict, role: str, sbuf_name: str, op_p: int, op_f: int, gpi_f: int) -> str:
-    """Build the source expression for an operand read with chunk reshape.
+    """Build the source expression for an operand read.
 
-    When gpi_f > 1, reshapes the full buffer first (merging interleave
-    groups into the free dim), then slices — NKI simulator requires
-    reshape on the full backing array, not on a sliced view.
+    For HBM operands: 2D intra-op slice.
+    For inter-op with gpi_f == 1: 4D flat tile index.
+    For inter-op with gpi_f > 1: reshape-then-slice to merge groups.
 
     Args:
         cfg: Configuration dict.
@@ -194,12 +179,11 @@ def _operand_read_expr(cfg: dict, role: str, sbuf_name: str, op_p: int, op_f: in
         gpi_f: Groups per iteration on the free dim.
 
     Returns:
-        Source expression string, with ``.reshape()`` if gpi_f > 1.
+        Source expression string.
     """
     from_hbm = cfg[f"{role}_from_hbm"]
     if from_hbm:
-        sl = d1_slice(op_p, op_f)
-        expr = f"{sbuf_name}[{sl}]"
+        expr = f"{sbuf_name}[{intra_slice(op_p, op_f)}]"
     elif gpi_f > 1:
         expr = _interop_reshape_read(cfg, role, op_f, gpi_f)
     else:
@@ -208,7 +192,7 @@ def _operand_read_expr(cfg: dict, role: str, sbuf_name: str, op_p: int, op_f: in
 
 
 def _interop_simple_read(cfg: dict, role: str) -> str:
-    """Read inter-op buffer with no reshape (gpi_f == 1).
+    """Read inter-op 4D buffer with flat tile index (gpi_f == 1).
 
     Args:
         cfg: Configuration dict.
@@ -220,20 +204,24 @@ def _interop_simple_read(cfg: dict, role: str) -> str:
     tensor_name = cfg[f"{role}_name"]
     dim_K = cfg["dim_K"]
     dim_F = cfg["dim_M"] if role == "stat" else cfg["dim_N"]
-    min_F = cfg["min_M"] if role == "stat" else cfg["min_N"]
-    k_grp = sub_range(f"i_interleave_group_{dim_K}", cfg["gpi_K"])
-    f_grp = sub_range(f"i_interleave_group_{dim_F}", 1)
-    sl = operand_slice(False, cfg["min_K"], f"i_block_{dim_K}", f"i_block_{dim_F}", k_grp, f_grp, min_F)
-    return f"sbuf_{tensor_name}[{sl}]"
+    min_K, min_F = cfg["min_K"], cfg["min_M"] if role == "stat" else cfg["min_N"]
+    intlv_K = cfg["intlv_K"]
+    intlv_F = cfg["intlv_M"] if role == "stat" else cfg["intlv_N"]
+
+    bk, ck = f"i_block_{dim_K}", f"i_interleave_group_{dim_K}"
+    bf, cf = f"i_block_{dim_F}", f"i_interleave_group_{dim_F}"
+
+    idx_K = flat_tile_index(bk, intlv_K, ck, cfg["gpi_K"])
+    idx_F = flat_tile_index(bf, intlv_F, cf, 1)
+    return f"sbuf_{tensor_name}[0:{min_K}, {idx_K}, {idx_F}, 0:{min_F}]"
 
 
 def _interop_reshape_read(cfg: dict, role: str, op_f: int, gpi_f: int) -> str:
-    """Read inter-op buffer with reshape-then-slice (gpi_f > 1).
+    """Read inter-op 4D buffer with reshape-then-slice (gpi_f > 1).
 
-    Reshapes the full buffer to merge interleave groups into the free
-    dim, then slices at block+chunk granularity. This avoids the NKI
-    simulator limitation where reshape on a sliced view uses the full
-    backing array size.
+    Reshapes the full buffer to merge gpi_f consecutive groups into
+    the free dim, then slices. This avoids the NKI simulator limitation
+    where reshape on a sliced view uses the full backing array size.
 
     Args:
         cfg: Configuration dict.
@@ -245,17 +233,22 @@ def _interop_reshape_read(cfg: dict, role: str, op_f: int, gpi_f: int) -> str:
         ``buffer.reshape(merged)[slice]`` expression string.
     """
     tensor_name = cfg[f"{role}_name"]
-    tensor_shape = cfg[f"{role}_shape"]
     dim_K = cfg["dim_K"]
     dim_F = cfg["dim_M"] if role == "stat" else cfg["dim_N"]
-    unified_F = cfg["unified_M"] if role == "stat" else cfg["unified_N"]
+    min_K = cfg["min_K"]
+    intlv_K = cfg["intlv_K"]
     intlv_F = cfg["intlv_M"] if role == "stat" else cfg["intlv_N"]
-    nb_K = tensor_shape[0] // cfg["unified_K"]
-    nb_F = tensor_shape[1] // unified_F
-    chunks_F = intlv_F // gpi_f
-    k_grp = sub_range(f"i_interleave_group_{dim_K}", cfg["gpi_K"])
-    reshape = f"({cfg['min_K']}, {nb_K}, {nb_F}, 1, 1, {cfg['intlv_K']}, {chunks_F}, {op_f})"
-    sl = f"0:{cfg['min_K']}, i_block_{dim_K}, i_block_{dim_F}, 0, 0, {k_grp}, i_interleave_group_{dim_F}, 0:{op_f}"
+    total_K = cfg["total_K"]
+    total_F = cfg["total_M"] if role == "stat" else cfg["total_N"]
+    chunks_per_block_F = intlv_F // gpi_f
+
+    bk, ck = f"i_block_{dim_K}", f"i_interleave_group_{dim_K}"
+    bf, cf = f"i_block_{dim_F}", f"i_interleave_group_{dim_F}"
+
+    reshape = f"({min_K}, {total_K}, {total_F // gpi_f}, {op_f})"
+    idx_K = flat_tile_index(bk, intlv_K, ck, cfg["gpi_K"])
+    idx_F = flat_tile_index(bf, chunks_per_block_F, cf, 1)
+    sl = f"0:{min_K}, {idx_K}, {idx_F}, 0:{op_f}"
     return f"sbuf_{tensor_name}.reshape({reshape})[{sl}]"
 
 
@@ -272,26 +265,34 @@ def _emit_writeback(cfg: dict, psum_name: str, sbuf_out: str) -> list[str]:
     """
     dim_M, dim_N = cfg["dim_M"], cfg["dim_N"]
     op_M, op_N = cfg["op_M"], cfg["op_N"]
-    psum_d1 = d1_slice(op_M, op_N)
-    psum_src = f"{psum_name}[{psum_d1}]"
+    psum_sl = intra_slice(op_M, op_N)
+    psum_src = f"{psum_name}[{psum_sl}]"
 
     lines: list[str] = []
     if cfg["is_final"]:
-        out_d1 = d1_slice(op_M, op_N)
-        lines.append(f"{_I6}nisa.tensor_copy(dst={sbuf_out}[{out_d1}], src={psum_src})")
+        out_sl = intra_slice(op_M, op_N)
+        lines.append(f"{_I6}nisa.tensor_copy(dst={sbuf_out}[{out_sl}], src={psum_src})")
         m_rng = hbm_chunk_range(f"i_block_{dim_M}", cfg["unified_M"], f"i_interleave_group_{dim_M}", op_M)
         n_rng = hbm_chunk_range(f"i_block_{dim_N}", cfg["unified_N"], f"i_interleave_group_{dim_N}", op_N)
-        lines.append(
-            f"{_I6}nisa.dma_copy(" f"dst=hbm_{cfg['output_name']}[{m_rng}, {n_rng}]," f" src={sbuf_out}[{out_d1}])"
-        )
+        lines.append(f"{_I6}nisa.dma_copy(dst=hbm_{cfg['output_name']}[{m_rng}, {n_rng}], src={sbuf_out}[{out_sl}])")
     else:
         min_M, min_N = cfg["min_M"], cfg["min_N"]
-        gpi_N = cfg["gpi_N"]
-        m_grp = sub_range(f"i_interleave_group_{dim_M}", cfg["gpi_M"])
-        n_grp = sub_range(f"i_interleave_group_{dim_N}", gpi_N)
-        out_sl = f"0:{min_M}, i_block_{dim_M}, i_block_{dim_N}, 0, 0, {m_grp}, {n_grp}, 0:{min_N}"
+        intlv_M, intlv_N = cfg["intlv_M"], cfg["intlv_N"]
+        gpi_M, gpi_N = cfg["gpi_M"], cfg["gpi_N"]
+
+        bm, cm = f"i_block_{dim_M}", f"i_interleave_group_{dim_M}"
+        bn, cn = f"i_block_{dim_N}", f"i_interleave_group_{dim_N}"
+
+        idx_M = flat_tile_index(bm, intlv_M, cm, gpi_M)
+
         if gpi_N > 1:
-            psum_src += f".reshape(({min_M}, 1, 1, 1, 1, 1, {gpi_N}, {min_N}))"
+            rng_N = flat_tile_range(bn, intlv_N, cn, gpi_N)
+            out_sl = f"0:{min_M}, {idx_M}, {rng_N}, 0:{min_N}"
+            psum_src += f".reshape(({min_M}, {gpi_N}, {min_N}))"
+        else:
+            idx_N = flat_tile_index(bn, intlv_N, cn, gpi_N)
+            out_sl = f"0:{min_M}, {idx_M}, {idx_N}, 0:{min_N}"
+
         lines.append(f"{_I6}nisa.tensor_copy(dst={sbuf_out}[{out_sl}], src={psum_src})")
     return lines
 
@@ -364,6 +365,10 @@ def _build_config(ctx: RenderContext, operand_map: dict[str, str], output_name: 
     op_M = min(unified_M, 128)
     op_N = min(unified_N, MATMUL_FREE_MAX)
 
+    num_blocks_K = stat.shape[0] // unified_K
+    num_blocks_M = stat.shape[1] // unified_M
+    num_blocks_N = mov.shape[1] // unified_N
+
     return {
         "dim_K": dim_K,
         "dim_M": dim_M,
@@ -386,9 +391,12 @@ def _build_config(ctx: RenderContext, operand_map: dict[str, str], output_name: 
         "chunks_K": unified_K // op_K,
         "chunks_M": unified_M // op_M,
         "chunks_N": unified_N // op_N,
-        "num_blocks_K": stat.shape[0] // unified_K,
-        "num_blocks_M": stat.shape[1] // unified_M,
-        "num_blocks_N": mov.shape[1] // unified_N,
+        "num_blocks_K": num_blocks_K,
+        "num_blocks_M": num_blocks_M,
+        "num_blocks_N": num_blocks_N,
+        "total_K": num_blocks_K * intlv_K,
+        "total_M": num_blocks_M * intlv_M,
+        "total_N": num_blocks_N * intlv_N,
         "stat_from_hbm": stat.location == "hbm",
         "mov_from_hbm": mov.location == "hbm",
         "stat_name": stat.name,
@@ -415,7 +423,7 @@ def _render_matmul(cfg: dict) -> list[str]:
     psum_name = f"psum_{cfg['output_name']}"
     sbuf_stat = f"sbuf_{cfg['stat_name']}"
     sbuf_mov = f"sbuf_{cfg['mov_name']}"
-    psum_d1 = d1_slice(cfg["op_M"], cfg["op_N"])
+    psum_sl = intra_slice(cfg["op_M"], cfg["op_N"])
 
     lines = [
         f'"""nisa.nc_matmul -- {cfg["stat_name"]}'
@@ -436,7 +444,7 @@ def _render_matmul(cfg: dict) -> list[str]:
             cfg["num_blocks_K"],
             cfg["chunks_K"],
             psum_name,
-            psum_d1,
+            psum_sl,
         )
     )
     lines.extend(_emit_dma_loads(cfg, sbuf_stat, sbuf_mov))

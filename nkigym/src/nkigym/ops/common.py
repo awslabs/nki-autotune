@@ -1,54 +1,79 @@
 """Shared utilities for NKIOp render methods.
 
-Buffer layout is 8-dimensional::
+Buffer layout:
+- Intra-op (staging/temp): 2D ``(op_tile_P, op_tile_F)``.
+- Inter-op: 4D ``(min_tile_P, total_tiles_P, total_tiles_F, min_tile_F)``
+  where ``total_tiles = num_blocks * interleave_groups_per_block``.
 
-    (min_tile_P, num_blocks_P, num_blocks_F,
-     tiles_per_block_P, tiles_per_block_F,
-     interleave_P, interleave_F, min_tile_F)
-
-All dimensions are always explicit in shapes, even when 1.
-Interleave groups per dimension = ``dim_tiles[d] // dim_min_tiles[d]``.
-Every op loops over ``unified // op_tile`` chunks per block.
-Each chunk consumes ``op_tile // min_tile`` groups (gpi).
+Flat tile index = ``i_block * intlv + i_interleave_group * gpi``.
 """
-
-
-def hbm_range(block_var: str, tile: int) -> str:
-    """Format an HBM slice expression: ``var*tile:var*tile+tile``."""
-    return f"{block_var}*{tile}:{block_var}*{tile}+{tile}"
 
 
 def hbm_chunk_range(block_var: str, unified: int, chunk_var: str, op_tile: int) -> str:
     """HBM slice with block and chunk offsets.
 
-    For ops whose op_tile > min_tile (e.g. matmul N=512),
-    computes ``block*unified + chunk*op_tile`` as start.
+    Computes ``block*unified + chunk*op_tile`` as start.
+
+    Args:
+        block_var: Block loop variable name.
+        unified: Unified tile size for this dimension.
+        chunk_var: Chunk (interleave group) loop variable name.
+        op_tile: Op tile size consumed per iteration.
+
+    Returns:
+        Range expression string.
     """
     start = f"{block_var}*{unified}+{chunk_var}*{op_tile}"
     return f"{start}:{start}+{op_tile}"
 
 
-def d1_slice(tile_p: int, tile_f: int) -> str:
-    """Degree-1 8-dim slice: partition range, all middle and interleave dims 0, free range."""
-    return f"0:{tile_p}, 0, 0, 0, 0, 0, 0, 0:{tile_f}"
+def intra_slice(tile_p: int, tile_f: int) -> str:
+    """2D slice for intra-op buffers: ``0:tile_p, 0:tile_f``.
 
+    Args:
+        tile_p: Partition axis tile size.
+        tile_f: Free axis tile size.
 
-def sub_range(chunk_var: str, gpi: int) -> str:
-    """Interleave group sub-range for a chunk: ``chunk*gpi:chunk*gpi+gpi``.
-
-    Returns the range of interleave groups consumed by one chunk iteration.
+    Returns:
+        Slice expression string.
     """
-    return f"{chunk_var}*{gpi}:{chunk_var}*{gpi}+{gpi}"
+    return f"0:{tile_p}, 0:{tile_f}"
 
 
-def operand_slice(
-    from_hbm: bool, min_p: int, block_p: str, block_f: str, group_p: str, group_f: str, min_f: int
-) -> str:
-    """Slice for reading an operand at a specific (block, group) position.
+def flat_tile_index(block_var: str, intlv: int, chunk_var: str, gpi: int) -> str:
+    """Flat tile index: ``block * intlv + chunk * gpi``.
 
-    For HBM operands (degree-1 staging buffer), all middle dims are 0.
-    For inter-op SBUF operands, block and group variables index the buffer.
+    Maps (block, chunk) coordinates to a single index in the
+    flattened total_tiles dimension of an inter-op buffer.
+
+    Args:
+        block_var: Block loop variable name.
+        intlv: Interleave groups per block (tiles per block).
+        chunk_var: Chunk (interleave group) loop variable name.
+        gpi: Groups per iteration for the consuming op.
+
+    Returns:
+        Index expression string.
     """
-    mid = "0, 0, 0, 0" if from_hbm else f"{block_p}, {block_f}, 0, 0"
-    grp = "0, 0" if from_hbm else f"{group_p}, {group_f}"
-    return f"0:{min_p}, {mid}, {grp}, 0:{min_f}"
+    block_term = f"{block_var}*{intlv}" if intlv != 1 else block_var
+    chunk_term = f"{chunk_var}*{gpi}" if gpi != 1 else chunk_var
+    return f"{block_term}+{chunk_term}"
+
+
+def flat_tile_range(block_var: str, intlv: int, chunk_var: str, gpi: int) -> str:
+    """Flat tile range spanning ``gpi`` consecutive tiles.
+
+    Used when an op consumes multiple interleave groups per
+    iteration (gpi > 1), producing a range slice.
+
+    Args:
+        block_var: Block loop variable name.
+        intlv: Interleave groups per block.
+        chunk_var: Chunk loop variable name.
+        gpi: Groups per iteration (range width).
+
+    Returns:
+        Range expression ``start:start+gpi``.
+    """
+    start = flat_tile_index(block_var, intlv, chunk_var, gpi)
+    return f"{start}:{start}+{gpi}"

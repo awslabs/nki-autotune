@@ -96,7 +96,6 @@ generated_kernels/
 # Remote development configuration (contains host-specific info)
 remote_tools/.remote_config
 remote*.json
-!remote.json.example
 
 # Remote sync configuration (user-specific)
 remote/config.sh

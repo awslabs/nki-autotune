@@ -235,21 +235,22 @@ A single dimension (e.g., d2 = seq_k) may appear across multiple ops in differen
 - **`dim_tiles[d]`** (unified tile) = max of all ISA limits across ops that touch dimension d, capped at the actual dimension size.
 - **`dim_min_tiles[d]`** (min tile) = min of all ISA limits across ops that touch dimension d, capped at the actual dimension size.
 
-The ratio `interleave_groups = dim_tiles[d] // dim_min_tiles[d]` is the **interleave count**. All on-chip buffers for that dimension store each tile as `(interleave_groups, min_tile)` rather than a flat `(unified_tile,)`. This is the **interleave layout** — a fixed 8-dimensional shape for every buffer:
+The ratio `interleave_groups = dim_tiles[d] // dim_min_tiles[d]` is the **interleave count**. All on-chip buffers for that dimension store each tile as `(interleave_groups, min_tile)` rather than a flat `(unified_tile,)`. This is the **interleave layout**.
 
-`(min_tile_P, num_blocks_P, num_blocks_F, tiles_per_block_P, tiles_per_block_F, interleave_P, interleave_F, min_tile_F)`
+**Hardware constraint.** Trainium DMA cannot operate on tensors with more than 5 meaningful (non-singleton) dimensions. This limits on-chip buffer shapes to low-dimensional layouts:
 
-All eight dimensions are always explicit, even when 1.
+- **Intra-op buffers** (staging, PSUM accumulators, temp): **2D** — `(op_tile_P, op_tile_F)`. One physical tile, reused every iteration.
+- **Inter-op buffers** (SBUF intermediates between ops): **4D** — `(tile_P, total_tiles_P, total_tiles_F, tile_F)`. The tile sizes are `min_tile` for each dimension; `total_tiles = dim_size / min_tile`, which flattens blocks × interleave into a single axis.
 
-**Why interleave?** Different ops need different tile sizes for the same dimension. Rather than reshaping the buffer at every op boundary, we store the data in the smallest common chunk (min_tile) and let each op consume however many chunks it needs. An op with a large tile limit (e.g., matmul N = 512) reads all 4 interleave groups at once and reshapes `(4, 128)` → `(1, 512)`. An op with a small limit (e.g., transpose F = 128) iterates one chunk at a time via sub-loops.
+Indexing into an inter-op buffer at block `i_block` and interleave group `i_ig`: `tile_index = i_block * intlv + i_ig`.
+
+**Why interleave?** Different ops need different tile sizes for the same dimension. Rather than reshaping the buffer at every op boundary, we store the data at the smallest common granularity (`min_tile`) and let each op consume however many slots it needs. An op with a large tile limit (e.g., matmul N = 512) reads 4 consecutive slots at once and reshapes `(4, 128)` → `(1, 512)`. An op with a small limit (e.g., transpose F = 128) iterates one slot at a time via sub-loops.
 
 **Chunk+reshape protocol.** Each op computes three quantities per dimension it touches:
 
-- `chunks = unified_tile // op_tile` — how many sub-loop iterations per block.
-- `gpi = op_tile // min_tile` — groups consumed per chunk iteration (groups-per-iteration).
-- The op loops `chunks` times, each iteration consuming `gpi` interleave groups. It reshapes `(gpi, min_tile)` → `(1, op_tile)` for the ISA call, then writes the result back as `(gpi, min_tile)`.
-
-When `gpi > 1`, the reshape is an explicit `.reshape()` call on the buffer before slicing — the NKI simulator requires reshape on the full backing array, not on a sliced view. When `gpi = 1`, no reshape is needed; slicing directly yields the correct shape.
+- `chunks = unified_tile // op_tile` — how many sub-loop iterations per unified tile.
+- `gpi = op_tile // min_tile` — slots consumed per chunk iteration (groups-per-iteration).
+- The op loops `chunks` times, each iteration consuming `gpi` interleave slots. When `gpi > 1`, the op reshapes the full 4D inter-op buffer to merge `total_tiles_F` and `tile_F` into one dimension, then slices at `op_tile` granularity. When `gpi = 1`, no reshape is needed; slicing one slot directly yields `(tile_P, 1, 1, tile_F)`.
 
 ### 2.3 Renderer Pipeline
 
@@ -269,19 +270,19 @@ The renderer (`render()`) works in three stages:
 
 Each `NKIOp` subclass implements its own `render()` method. While the details vary by op, they follow a common pattern:
 
-1. **Buffer allocation.** Allocate within-op buffers: a degree-1 PSUM buffer for the ISA output (matmul accumulates in fp32 PSUM; transpose writes to PSUM then copies to SBUF), degree-1 SBUF staging buffers for any HBM inputs, and the output SBUF buffer — either full-range (8-dim shape with actual `num_blocks`) for inter-op intermediates, or degree-1 for the final kernel output.
+1. **Buffer allocation.** Allocate intra-op buffers as 2D `(op_tile_P, op_tile_F)`: a PSUM buffer for the ISA output (matmul accumulates in fp32 PSUM; transpose writes to PSUM then copies to SBUF), SBUF staging buffers for any HBM inputs. The output SBUF buffer is either inter-op 4D `(tile_P, total_tiles_P, total_tiles_F, tile_F)` for intermediates, or intra-op 2D for the final kernel output.
 
-2. **Loop nest.** Nested loops over each output dimension, three levels deep per dimension: `i_block` (over `num_blocks`), `i_tile` (over `tiles_per_block`, always 1 in the baseline), and `i_interleave_group` (over `chunks`, i.e., `unified // op_tile`). All three loops are always emitted even when their trip count is 1. For ops with a reduction dimension (matmul's K), the reduction loops are nested inside the output loops.
+2. **Loop nest.** Nested loops over each output dimension, three levels deep per dimension: `i_block` (over `num_blocks`), `i_tile` (over `tiles_per_block`, always 1 in the baseline), and `i_ig` (over `chunks`, i.e., `unified // op_tile`). All three loops are always emitted even when their trip count is 1. For ops with a reduction dimension (matmul's K), the reduction loops are nested inside the output loops.
 
 3. **DMA loads.** For each HBM operand, emit `nisa.dma_copy` from HBM into the degree-1 staging buffer. The HBM slice is computed from the block variable × unified tile + chunk variable × op_tile.
 
-4. **ISA call with chunk reshape.** Emit the ISA instruction (e.g., `nisa.nc_matmul`, `nisa.nc_transpose`) reading from either the degree-1 staging buffer (HBM inputs) or the full-range inter-op buffer (prior op outputs). When an operand's `gpi > 1`, the read expression includes a `.reshape()` to merge interleave groups into the free dimension before slicing.
+4. **ISA call with chunk reshape.** Emit the ISA instruction (e.g., `nisa.nc_matmul`, `nisa.nc_transpose`) reading from either the 2D intra-op staging buffer (HBM inputs) or the 4D inter-op buffer (prior op outputs). When an operand's `gpi > 1`, the read expression includes a `.reshape()` on the inter-op buffer to merge `total_tiles_F` and `tile_F` before slicing at `op_tile` granularity.
 
 5. **Writeback.** Copy the result from PSUM to the output SBUF buffer (`nisa.tensor_copy`). For the final output, also emit `nisa.dma_copy` from SBUF to HBM. For inter-op intermediates, the SBUF write goes to the tile-indexed position so later ops can read it.
 
-**Matmul specifics.** `nisa.nc_matmul` computes `stationary(K, M).T @ moving(K, N) → output(M, N)`, accumulating into PSUM in fp32. The PSUM accumulator is memset to 0 before the K reduction loop. After all K iterations, `nisa.tensor_copy` moves the result to SBUF. When the moving operand's N interleave has `gpi > 1` (e.g., d2 with interleave 4 and matmul N = 512), the read expression reshapes the inter-op buffer to merge groups: `sbuf_tensor.reshape(merged_shape)[slice]`.
+**Matmul specifics.** `nisa.nc_matmul` computes `stationary(K, M).T @ moving(K, N) → output(M, N)`, accumulating into PSUM in fp32. The PSUM accumulator is memset to 0 before the K reduction loop. After all K iterations, `nisa.tensor_copy` moves the result to SBUF. When the moving operand's N interleave has `gpi > 1` (e.g., d2 with interleave 4 and matmul N = 512), the read expression reshapes the 4D inter-op buffer to merge `total_tiles_F` and `tile_F`, then slices at the matmul's N tile size: `sbuf_tensor.reshape(merged_shape)[slice]`.
 
-**Transpose specifics.** `nisa.nc_transpose` operates at a fixed 128 × 128 tile size. It reads from SBUF, writes to a degree-1 PSUM temp buffer, then `nisa.tensor_copy` moves the result to the output SBUF. The output buffer swaps the axis ordering (F before P in the 8-dim layout) since the transpose flips partition and free axes. When a dimension's unified tile exceeds 128, the chunk sub-loop iterates over 128-element slices.
+**Transpose specifics.** `nisa.nc_transpose` operates at a fixed 128 × 128 tile size. It reads from SBUF, writes to a 2D PSUM temp buffer `(128, 128)`, then `nisa.tensor_copy` moves the result to the output SBUF. The output inter-op buffer swaps P and F: `(tile_F, total_tiles_F, total_tiles_P, tile_P)` since the transpose flips partition and free axes. When a dimension's unified tile exceeds 128, the chunk sub-loop iterates over 128-element slices.
 
 ### 2.5 Attention Example: Op and Dimension Summary
 
@@ -303,27 +304,27 @@ The running example produces 11 back-to-back loop nests — one per op — commu
 
 Dimensions after unification:
 
-| Dim | Semantic | unified | min | interleave | num_blocks | chunks (matmul) | chunks (transpose) |
-|---|---|---|---|---|---|---|---|
-| d0 | seq_q | 128 | 128 | 1 | 32 | 1 | 1 |
-| d1 | d_k | 128 | 128 | 1 | 1 | 1 | 1 |
-| d2 | seq_k | 512 | 128 | 4 | 8 | 1 (N=512) | 4 (F=128) |
-| d5 | d_v | 128 | 128 | 1 | 1 | 1 | — |
+| Dim | Semantic | dim_size | unified | min_tile | interleave | total_tiles | chunks (matmul) | chunks (transpose) |
+|---|---|---|---|---|---|---|---|---|
+| d0 | seq_q | 4096 | 128 | 128 | 1 | 32 | 1 | 1 |
+| d1 | d_k | 128 | 128 | 128 | 1 | 1 | 1 | 1 |
+| d2 | seq_k | 4096 | 512 | 128 | 4 | 32 | 1 (N=512) | 4 (F=128) |
+| d5 | d_v | 128 | 128 | 128 | 1 | 1 | 1 | — |
 
-Only d2 has a non-trivial interleave factor: matmul wants N = 512, transpose wants F = 128, giving `unified = 512`, `min = 128`, `interleave = 4`. Matmul consumes all 4 groups in one chunk (`gpi = 4`, `chunks = 1`), reshaping `(4, 128)` → `(1, 512)`. Transpose iterates 4 chunks of 1 group each (`gpi = 1`, `chunks = 4`), processing one `(1, 128)` slice per sub-loop iteration.
+Only d2 has a non-trivial interleave factor: matmul wants N = 512, transpose wants F = 128, giving `unified = 512`, `min_tile = 128`, `interleave = 4`, `total_tiles = 32`. Matmul consumes all 4 slots per block in one chunk (`gpi = 4`, `chunks = 1`), reshaping `(4, 128)` → `(1, 512)`. Transpose iterates 4 chunks of 1 slot each (`gpi = 1`, `chunks = 4`), processing one 128-element slice per sub-loop iteration.
 
 ### 2.6 Buffer Degree and Shape Dimensions
 
-Two shape parameters in the 8-dim buffer layout control memory footprint and compute reuse:
+Two parameters control memory footprint and compute reuse:
 
-- **`num_blocks`** is the buffer degree — how many tile positions exist in the physical buffer. A full-range inter-op buffer has `num_blocks` equal to the total block count for that dimension (e.g., 32 for d0, 8 for d2). A degree-1 within-op buffer has `num_blocks = 1` everywhere. Reducing `num_blocks` shrinks the physical buffer; the extreme is degree 1 where only one tile exists and is overwritten every iteration.
+- **Buffer degree (full-range vs degree-1).** A full-range inter-op buffer stores all tile positions: 4D with `total_tiles = dim_size / min_tile` per dimension. A degree-1 intra-op buffer stores one physical tile: 2D `(op_tile_P, op_tile_F)`, reused every iteration. Fusion (§3.1) converts inter-op buffers to intra-op when producer and consumer share a loop.
 
 - **`tiles_per_block`** controls arithmetic intensity — how many compute iterations share one loaded block of data before the next DMA. The initial baseline sets `tiles_per_block = 1` everywhere; §3.4 explores increasing it.
 
-The initial baseline uses degree 1 for all within-op buffers and full-range for all inter-op intermediates. The total inter-op SBUF allocation far exceeds hardware capacity. Variant transforms (§3) shrink inter-op buffers by fusing loops, adjusting buffer degree, and reordering dimensions.
+The initial baseline uses 2D intra-op for all within-op buffers and 4D inter-op for all intermediates. The total inter-op SBUF allocation far exceeds hardware capacity. Variant transforms (§3) shrink inter-op buffers by fusing loops, adjusting buffer degree, and reordering dimensions.
 
 **Naming conventions:**
-- **Loop variables**: `i_block_d{id}`, `i_tile_d{id}`, `i_interleave_group_d{id}`.
+- **Loop variables**: `i_block_d{id}`, `i_tile_d{id}`, `i_ig_d{id}` (interleave group).
 - **Tensor buffers**: `sbuf_{name}` for SBUF, `psum_{name}` for PSUM. DMA staging buffers reuse the input parameter name (e.g., `sbuf_Q`).
 
 ## 3. Programmatic Transforms
@@ -340,7 +341,7 @@ Adjacent ops whose loops iterate over the same dimensions can share a single loo
 
 ```python
 """ Op 3: nisa.affine_select -- S(d0, d2) -> masked_S(d0, d2) """
-sbuf_masked_S = nl.ndarray((128, 32, 8, 1, 1, 1, 4, 128), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_masked_S = nl.ndarray((128, 32, 32, 128), dtype=Q.dtype, buffer=nl.sbuf)
 for i_block_d0 in nl.affine_range(32):
     for i_tile_d0 in nl.affine_range(1):
         for i_block_d2 in nl.affine_range(8):
@@ -348,7 +349,7 @@ for i_block_d0 in nl.affine_range(32):
                 nisa.affine_select(dst=sbuf_masked_S[...], on_true_tile=sbuf_S[...], ...)
 
 """ Op 4: nisa.tensor_scalar -- masked_S(d0, d2) x scale -> scaled_S(d0, d2) """
-sbuf_scaled_S = nl.ndarray((128, 32, 8, 1, 1, 1, 4, 128), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_scaled_S = nl.ndarray((128, 32, 32, 128), dtype=Q.dtype, buffer=nl.sbuf)
 for i_block_d0 in nl.affine_range(32):
     for i_tile_d0 in nl.affine_range(1):
         for i_block_d2 in nl.affine_range(8):
@@ -360,12 +361,12 @@ for i_block_d0 in nl.affine_range(32):
 
 ```python
 """ Ops 3+4 (fused): affine_select + tensor_scalar -> scaled_S(d0, d2) """
-sbuf_scaled_S = nl.ndarray((128, 32, 8, 1, 1, 1, 4, 128), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_scaled_S = nl.ndarray((128, 32, 32, 128), dtype=Q.dtype, buffer=nl.sbuf)
 for i_block_d0 in nl.affine_range(32):
     for i_tile_d0 in nl.affine_range(1):
         for i_block_d2 in nl.affine_range(8):
             for i_tile_d2 in nl.affine_range(1):
-                sbuf_masked_S = nl.ndarray((128, 1, 1, 1, 1, 1, 4, 128), dtype=Q.dtype, buffer=nl.sbuf)  # per-tile, not full-range
+                sbuf_masked_S = nl.ndarray((128, 512), dtype=Q.dtype, buffer=nl.sbuf)  # intra-op 2D, not full-range
                 nisa.affine_select(dst=sbuf_masked_S[...], on_true_tile=sbuf_S[...], ...)
                 nisa.tensor_scalar(dst=sbuf_scaled_S[...], data=sbuf_masked_S[...], op0=nl.multiply, operand0=scale)
 ```
@@ -384,16 +385,17 @@ for i_block_d0 in nl.affine_range(32):
     for i_tile_d0 in nl.affine_range(1):
         for i_block_d5 in nl.affine_range(1):
             for i_tile_d5 in nl.affine_range(1):
-                psum_attn = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 128), dtype=nl.float32, buffer=nl.psum)
+                psum_attn = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
                 for i_block_d2 in nl.affine_range(8):
                     for i_tile_d2 in nl.affine_range(1):
-                        sbuf_V = nl.ndarray((128, 1, 1, 1, 1, 4, 1, 128), dtype=V.dtype, buffer=nl.sbuf)  # inside d2
-                        nisa.dma_copy(dst=sbuf_V[...], src=V[...])
-                        nisa.nc_matmul(dst=psum_attn[...], stationary=sbuf_exp_S_t[...], moving=sbuf_V[...])
+                        for i_ig_d2 in nl.affine_range(4):
+                            sbuf_V = nl.ndarray((128, 128), dtype=V.dtype, buffer=nl.sbuf)  # 2D intra-op, inside d2
+                            nisa.dma_copy(dst=sbuf_V[...], src=V[...])
+                            nisa.nc_matmul(dst=psum_attn[...], stationary=sbuf_exp_S_t[...], moving=sbuf_V[...])
                 nisa.tensor_copy(dst=sbuf_attn[...], src=psum_attn[...])
 ```
 
-**After** — `sbuf_V` hoisted outside d2, loaded once per (d0, d5) tile; buffer grows to hold all d2 blocks:
+**After** — `sbuf_V` hoisted outside d2, loaded once per (d0, d5) tile; buffer grows from 2D intra-op to 4D:
 
 ```python
 """ Op 9: nisa.nc_matmul -- exp_S_t x V -> attn(d0, d5), accumulate over d2 """
@@ -401,12 +403,13 @@ for i_block_d0 in nl.affine_range(32):
     for i_tile_d0 in nl.affine_range(1):
         for i_block_d5 in nl.affine_range(1):
             for i_tile_d5 in nl.affine_range(1):
-                sbuf_V = nl.ndarray((128, 8, 1, 1, 1, 4, 1, 128), dtype=V.dtype, buffer=nl.sbuf)  # floated up, all d2 blocks
+                sbuf_V = nl.ndarray((128, 32, 1, 128), dtype=V.dtype, buffer=nl.sbuf)  # 4D, hoisted: all d2 tiles
                 nisa.dma_copy(dst=sbuf_V[...], src=V[...])
-                psum_attn = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 128), dtype=nl.float32, buffer=nl.psum)
+                psum_attn = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
                 for i_block_d2 in nl.affine_range(8):
                     for i_tile_d2 in nl.affine_range(1):
-                        nisa.nc_matmul(dst=psum_attn[...], stationary=sbuf_exp_S_t[...], moving=sbuf_V[...])
+                        for i_ig_d2 in nl.affine_range(4):
+                            nisa.nc_matmul(dst=psum_attn[...], stationary=sbuf_exp_S_t[...], moving=sbuf_V[...])
                 nisa.tensor_copy(dst=sbuf_attn[...], src=psum_attn[...])
 ```
 
@@ -422,7 +425,7 @@ for i_block_d0 in nl.affine_range(32):                          # d0 outermost
     for i_tile_d0 in nl.affine_range(1):
         for i_block_d2 in nl.affine_range(8):                   # d2 middle
             for i_tile_d2 in nl.affine_range(1):
-                psum_S = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)
+                psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
                 for i_block_d1 in nl.affine_range(1):           # d1 innermost (reduction)
                     for i_tile_d1 in nl.affine_range(1):
                         nisa.nc_matmul(dst=psum_S[...], stationary=sbuf_Q_t[...], moving=sbuf_K_t[...])
@@ -437,7 +440,7 @@ for i_block_d2 in nl.affine_range(8):                           # d2 outermost
     for i_tile_d2 in nl.affine_range(1):
         for i_block_d0 in nl.affine_range(32):                  # d0 middle
             for i_tile_d0 in nl.affine_range(1):
-                psum_S = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)
+                psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
                 for i_block_d1 in nl.affine_range(1):           # d1 innermost (reduction)
                     for i_tile_d1 in nl.affine_range(1):
                         nisa.nc_matmul(dst=psum_S[...], stationary=sbuf_Q_t[...], moving=sbuf_K_t[...])
@@ -454,7 +457,7 @@ for i_block_d2 in nl.affine_range(8):                           # d2 outermost
 """ Op 2 (d2 dimension): tiles_per_block=1 -- 8 blocks x 1 tile """
 for i_block_d2 in nl.affine_range(8):                           # 8 blocks
     for i_tile_d2 in nl.affine_range(1):                        # 1 tile per block
-        psum_S = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)
+        psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
         for i_block_d1 in nl.affine_range(1):
             for i_tile_d1 in nl.affine_range(1):
                 nisa.nc_matmul(dst=psum_S[...], stationary=sbuf_Q_t[...], moving=sbuf_K_t[...])
@@ -468,7 +471,7 @@ for i_block_d2 in nl.affine_range(8):                           # 8 blocks
 for i_block_d2 in nl.affine_range(2):                           # 2 blocks (8 / 4)
     """ DMA loads placed here -- load 4 tiles at once """
     for i_tile_d2 in nl.affine_range(4):                        # 4 tiles per block
-        psum_S = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)
+        psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
         for i_block_d1 in nl.affine_range(1):
             for i_tile_d1 in nl.affine_range(1):
                 nisa.nc_matmul(dst=psum_S[...], stationary=sbuf_Q_t[...], moving=sbuf_K_t[...])
@@ -573,24 +576,26 @@ Online fusion breaks the Op 5→6 and Op 6→9 barriers, pulling Ops 5, 6, 8, 9 
 
 ```python
 """ Op 5: tensor_reduce max over d2 -> neg_max_S """
-psum_partial_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 8), dtype=nl.float32, buffer=nl.psum)
+psum_partial_max = nl.ndarray((128, 8), dtype=nl.float32, buffer=nl.psum)
+sbuf_scaled_S_reshd = sbuf_scaled_S.reshape((128, 32, 4096))
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop 1 """
     for i_tile_d2 in nl.affine_range(1):
-        nisa.tensor_reduce(dst=psum_partial_max[0:128, 0, 0, 0, 0, 0, 0, i_block_d2:i_block_d2+1],
-            data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0, 0:4, 0:128],
+        nisa.tensor_reduce(dst=psum_partial_max[0:128, i_block_d2:i_block_d2+1],
+            data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
             op=nl.maximum, axis=1)
-nisa.tensor_reduce(dst=sbuf_neg_max_S[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-    data=psum_partial_max[0:128, 0, 0, 0, 0, 0, 0, 0:8], op=nl.maximum, axis=1, negate=True)
+nisa.tensor_reduce(dst=sbuf_neg_max_S[0:128, i_block_d0:i_block_d0+1],
+    data=psum_partial_max[0:128, 0:8], op=nl.maximum, axis=1, negate=True)
 
 """ Op 6: activation_reduce exp+sum over d2 -> exp_S, sum_exp """
-psum_partial_sum = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 8), dtype=nl.float32, buffer=nl.psum)
+psum_partial_sum = nl.ndarray((128, 8), dtype=nl.float32, buffer=nl.psum)
+sbuf_exp_S_reshd = sbuf_exp_S.reshape((128, 32, 4096))
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop 2 """
     for i_tile_d2 in nl.affine_range(1):
-        nisa.activation_reduce(dst=sbuf_exp_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0, 0:4, 0:128],
-            data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0, 0:4, 0:128],
-            op=nl.exp, bias=sbuf_neg_max_S[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            reduce_op=nl.add, reduce_res=psum_partial_sum[0:128, 0, 0, 0, 0, 0, 0, i_block_d2:i_block_d2+1])
-nisa.tensor_reduce(dst=sbuf_sum_exp[0:128, 0, 0, 0, 0, 0, 0, 0:1], data=psum_partial_sum[0:128, 0, 0, 0, 0, 0, 0, 0:8], op=nl.add, axis=1)
+        nisa.activation_reduce(dst=sbuf_exp_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
+            data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
+            op=nl.exp, bias=sbuf_neg_max_S[0:128, i_block_d0:i_block_d0+1],
+            reduce_op=nl.add, reduce_res=psum_partial_sum[0:128, i_block_d2:i_block_d2+1])
+nisa.tensor_reduce(dst=sbuf_sum_exp[0:128, i_block_d0:i_block_d0+1], data=psum_partial_sum[0:128, 0:8], op=nl.add, axis=1)
 ```
 
 **Pattern match.** Map each component of the Standard X + Accumulation pattern (§4.1.1) to attention ops:
@@ -598,7 +603,7 @@ nisa.tensor_reduce(dst=sbuf_sum_exp[0:128, 0, 0, 0, 0, 0, 0, 0:1], data=psum_par
 | Algorithm 2 Component | Attention Mapping |
 |---|---|
 | Blocking dim $K$ | d2 (seq_k), $K = 8$ tile blocks |
-| $\mathbf{V_0}_k$ (X input) | `sbuf_scaled_S[..., i_block_d2, ..., 0:4, 0:128]` — tile $k$ of scaled S |
+| $\mathbf{V_0}_k$ (X input) | `sbuf_scaled_S_reshd[..., i_block_d2*512:(i_block_d2+1)*512]` — tile $k$ of scaled S |
 | $f_X(\mathbf{O_0}_{k-1}, \mathbf{V_0}_k)$ | $\max(\mathbf{O_0}_{k-1}, \text{rowmax}(\mathbf{V_0}_k))$ — running max (Op 5) |
 | $\mathbf{O_0}_K$ | `neg_max_S` — complete row-max of S (negated for use as bias) |
 | $\mathbf{V_1}_k$ (Accumulation input) | Same `sbuf_scaled_S` tile — Op 6 reads the same data as Op 5 |
@@ -630,48 +635,50 @@ where $m_k$ is the running max after tile $k$. This is the correction factor: wh
 
 ```python
 """ Ops 5+6 fused: running max + exp + sum in one d2 loop """
-sbuf_running_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-nisa.memset(dst=sbuf_running_max[0:128, 0, 0, 0, 0, 0, 0, 0:1], value=-np.inf)
-psum_running_sum = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=nl.float32, buffer=nl.psum)
-nisa.memset(dst=psum_running_sum[0:128, 0, 0, 0, 0, 0, 0, 0:1], value=0.0)
+sbuf_running_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+nisa.memset(dst=sbuf_running_max[0:128, 0:1], value=-np.inf)
+psum_running_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.psum)
+nisa.memset(dst=psum_running_sum[0:128, 0:1], value=0.0)
+sbuf_scaled_S_reshd = sbuf_scaled_S.reshape((128, 32, 4096))
+sbuf_exp_S_reshd = sbuf_exp_S.reshape((128, 32, 4096))
 
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop 1+2 """
     for i_tile_d2 in nl.affine_range(1):
         """ X step: per-tile max → update running max """
-        psum_tile_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=nl.float32, buffer=nl.psum)
-        nisa.tensor_reduce(dst=psum_tile_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0, 0:4, 0:128],
+        psum_tile_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.tensor_reduce(dst=psum_tile_max[0:128, 0:1],
+            data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
             op=nl.maximum, axis=1)
 
-        psum_max_pair = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 2), dtype=nl.float32, buffer=nl.psum)
-        nisa.tensor_copy(dst=psum_max_pair[0:128, 0, 0, 0, 0, 0, 0, 0:1], src=sbuf_running_max[0:128, 0, 0, 0, 0, 0, 0, 0:1])
-        nisa.tensor_copy(dst=psum_max_pair[0:128, 0, 0, 0, 0, 0, 0, 1:2], src=psum_tile_max[0:128, 0, 0, 0, 0, 0, 0, 0:1])
-        sbuf_new_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.tensor_reduce(dst=sbuf_new_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=psum_max_pair[0:128, 0, 0, 0, 0, 0, 0, 0:2], op=nl.maximum, axis=1)
+        psum_max_pair = nl.ndarray((128, 2), dtype=nl.float32, buffer=nl.psum)
+        nisa.tensor_copy(dst=psum_max_pair[0:128, 0:1], src=sbuf_running_max[0:128, 0:1])
+        nisa.tensor_copy(dst=psum_max_pair[0:128, 1:2], src=psum_tile_max[0:128, 0:1])
+        sbuf_new_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=sbuf_new_max[0:128, 0:1],
+            data=psum_max_pair[0:128, 0:2], op=nl.maximum, axis=1)
 
         """ Scale: s_k = exp(m_{k-1} - m_k), then rescale running sum """
-        sbuf_max_diff = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=sbuf_max_diff[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=sbuf_running_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            op0=nl.subtract, operand0=sbuf_new_max[0:128, 0, 0, 0, 0, 0, 0, 0:1])
-        sbuf_max_scale = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.activation(dst=sbuf_max_scale[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=sbuf_max_diff[0:128, 0, 0, 0, 0, 0, 0, 0:1], op=nl.exp)
-        nisa.tensor_scalar(dst=psum_running_sum[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=psum_running_sum[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            op0=nl.multiply, operand0=sbuf_max_scale[0:128, 0, 0, 0, 0, 0, 0, 0:1])
-        nisa.tensor_copy(dst=sbuf_running_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            src=sbuf_new_max[0:128, 0, 0, 0, 0, 0, 0, 0:1])
+        sbuf_max_diff = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=sbuf_max_diff[0:128, 0:1],
+            data=sbuf_running_max[0:128, 0:1],
+            op0=nl.subtract, operand0=sbuf_new_max[0:128, 0:1])
+        sbuf_max_scale = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        nisa.activation(dst=sbuf_max_scale[0:128, 0:1],
+            data=sbuf_max_diff[0:128, 0:1], op=nl.exp)
+        nisa.tensor_scalar(dst=psum_running_sum[0:128, 0:1],
+            data=psum_running_sum[0:128, 0:1],
+            op0=nl.multiply, operand0=sbuf_max_scale[0:128, 0:1])
+        nisa.tensor_copy(dst=sbuf_running_max[0:128, 0:1],
+            src=sbuf_new_max[0:128, 0:1])
 
         """ Bias + accumulate: exp(V - m_k) with rowsum into running sum """
-        sbuf_neg_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=sbuf_neg_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=sbuf_new_max[0:128, 0, 0, 0, 0, 0, 0, 0:1], op0=nl.multiply, operand0=-1.0)
-        nisa.activation(dst=sbuf_exp_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0, 0:4, 0:128],
-            op=nl.exp, data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0, 0:4, 0:128],
-            bias=sbuf_neg_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            reduce_op=nl.add, reduce_res=psum_running_sum[0:128, 0, 0, 0, 0, 0, 0, 0:1],
+        sbuf_neg_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=sbuf_neg_max[0:128, 0:1],
+            data=sbuf_new_max[0:128, 0:1], op0=nl.multiply, operand0=-1.0)
+        nisa.activation(dst=sbuf_exp_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
+            op=nl.exp, data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
+            bias=sbuf_neg_max[0:128, 0:1],
+            reduce_op=nl.add, reduce_res=psum_running_sum[0:128, 0:1],
             reduce_cmd=nisa.reduce_cmd.reduce)
 ```
 
@@ -687,10 +694,10 @@ First, prepare two d2 loops. Op 8 (transpose) is elementwise — fold it into Op
 
 ```python
 """ Fused Ops 5+6: d2 loop (from §4.1.2) """
-sbuf_running_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-nisa.memset(dst=sbuf_running_max[0:128, 0, 0, 0, 0, 0, 0, 0:1], value=-np.inf)
-psum_running_sum = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=nl.float32, buffer=nl.psum)
-nisa.memset(dst=psum_running_sum[0:128, 0, 0, 0, 0, 0, 0, 0:1], value=0.0)
+sbuf_running_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+nisa.memset(dst=sbuf_running_max[0:128, 0:1], value=-np.inf)
+psum_running_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.psum)
+nisa.memset(dst=psum_running_sum[0:128, 0:1], value=0.0)
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop A """
     for i_tile_d2 in nl.affine_range(1):
         """ ... X step + scale + bias + accumulate from §4.1.2 ... """
@@ -698,22 +705,20 @@ for i_block_d2 in nl.affine_range(8):                                          "
 """ Fused Ops 8+9: d2 loop """
 for i_block_d5 in nl.affine_range(1):
     for i_tile_d5 in nl.affine_range(1):
-        psum_attn = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 128), dtype=nl.float32, buffer=nl.psum)
+        psum_attn = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
         for i_block_d2 in nl.affine_range(8):                                  """ d2 loop B """
             for i_tile_d2 in nl.affine_range(1):
-                sbuf_exp_S_t = nl.ndarray((128, 1, 1, 1, 1, 4, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
-                for i_interleave_group_d2 in nl.affine_range(4):                """ chunk sub-loop: d2 interleave """
-                    nisa.nc_transpose(dst=sbuf_exp_S_t[0:128, 0, 0, 0, 0, i_interleave_group_d2, 0, 0:128],
-                        src=sbuf_exp_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0, i_interleave_group_d2, 0:128])
-                sbuf_V = nl.ndarray((128, 1, 1, 1, 1, 4, 1, 128), dtype=V.dtype, buffer=nl.sbuf)
-                for i_interleave_group_d2 in nl.affine_range(4):                """ chunk sub-loop: d2 interleave """
-                    nisa.dma_copy(dst=sbuf_V[0:128, 0, 0, 0, 0, i_interleave_group_d2, 0, 0:128],
-                        src=V[i_block_d2*512+i_interleave_group_d2*128:i_block_d2*512+i_interleave_group_d2*128+128,
+                for i_ig_d2 in nl.affine_range(4):                             """ chunk sub-loop: d2 interleave """
+                    sbuf_exp_S_t = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.sbuf)
+                    nisa.nc_transpose(dst=sbuf_exp_S_t[0:128, 0:128],
+                        src=sbuf_exp_S[0:128, i_block_d0:i_block_d0+1, i_block_d2*4+i_ig_d2:i_block_d2*4+i_ig_d2+1, 0:128])
+                    sbuf_V = nl.ndarray((128, 128), dtype=V.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=sbuf_V[0:128, 0:128],
+                        src=V[i_block_d2*512+i_ig_d2*128:i_block_d2*512+i_ig_d2*128+128,
                              i_block_d5*128:i_block_d5*128+128])
-                for i_interleave_group_d2 in nl.affine_range(4):                """ chunk sub-loop: K accumulation """
-                    nisa.nc_matmul(dst=psum_attn[0:128, 0, 0, 0, 0, 0, 0, 0:128],
-                        stationary=sbuf_exp_S_t[0:128, 0, 0, 0, 0, i_interleave_group_d2, 0, 0:128],
-                        moving=sbuf_V[0:128, 0, 0, 0, 0, i_interleave_group_d2, 0, 0:128])
+                    nisa.nc_matmul(dst=psum_attn[0:128, 0:128],
+                        stationary=sbuf_exp_S_t[0:128, 0:128],
+                        moving=sbuf_V[0:128, 0:128])
 ```
 
 **Pattern match.** Same Algorithm 2 structure as §4.1.2, with a different accumulation body:
@@ -734,78 +739,77 @@ Since both online fusions share the same X (running max) and same $g_B(m) = e^{-
 
 ```python
 """ Ops 5+6+8+9 fused: one d2 loop """
-sbuf_running_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-nisa.memset(dst=sbuf_running_max[0:128, 0, 0, 0, 0, 0, 0, 0:1], value=-np.inf)
-psum_running_sum = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=nl.float32, buffer=nl.psum)
-nisa.memset(dst=psum_running_sum[0:128, 0, 0, 0, 0, 0, 0, 0:1], value=0.0)
+sbuf_running_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+nisa.memset(dst=sbuf_running_max[0:128, 0:1], value=-np.inf)
+psum_running_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.psum)
+nisa.memset(dst=psum_running_sum[0:128, 0:1], value=0.0)
+sbuf_scaled_S_reshd = sbuf_scaled_S.reshape((128, 32, 4096))
 for i_block_d5 in nl.affine_range(1):
     for i_tile_d5 in nl.affine_range(1):
-        psum_attn = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 128), dtype=nl.float32, buffer=nl.psum)
-        nisa.memset(dst=psum_attn[0:128, 0, 0, 0, 0, 0, 0, 0:128], value=0.0)
+        psum_attn = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
+        nisa.memset(dst=psum_attn[0:128, 0:128], value=0.0)
 
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop A+B """
     for i_tile_d2 in nl.affine_range(1):
         """ X step: per-tile max → update running max (same as §4.1.2) """
-        psum_tile_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=nl.float32, buffer=nl.psum)
-        nisa.tensor_reduce(dst=psum_tile_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0, 0:4, 0:128],
+        psum_tile_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.psum)
+        nisa.tensor_reduce(dst=psum_tile_max[0:128, 0:1],
+            data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
             op=nl.maximum, axis=1)
-        psum_max_pair = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 2), dtype=nl.float32, buffer=nl.psum)
-        nisa.tensor_copy(dst=psum_max_pair[0:128, 0, 0, 0, 0, 0, 0, 0:1], src=sbuf_running_max[0:128, 0, 0, 0, 0, 0, 0, 0:1])
-        nisa.tensor_copy(dst=psum_max_pair[0:128, 0, 0, 0, 0, 0, 0, 1:2], src=psum_tile_max[0:128, 0, 0, 0, 0, 0, 0, 0:1])
-        sbuf_new_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.tensor_reduce(dst=sbuf_new_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=psum_max_pair[0:128, 0, 0, 0, 0, 0, 0, 0:2], op=nl.maximum, axis=1)
+        psum_max_pair = nl.ndarray((128, 2), dtype=nl.float32, buffer=nl.psum)
+        nisa.tensor_copy(dst=psum_max_pair[0:128, 0:1], src=sbuf_running_max[0:128, 0:1])
+        nisa.tensor_copy(dst=psum_max_pair[0:128, 1:2], src=psum_tile_max[0:128, 0:1])
+        sbuf_new_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=sbuf_new_max[0:128, 0:1],
+            data=psum_max_pair[0:128, 0:2], op=nl.maximum, axis=1)
 
         """ Scale: s_k = exp(m_{k-1} - m_k) """
-        sbuf_max_diff = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=sbuf_max_diff[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=sbuf_running_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            op0=nl.subtract, operand0=sbuf_new_max[0:128, 0, 0, 0, 0, 0, 0, 0:1])
-        sbuf_max_scale = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.activation(dst=sbuf_max_scale[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=sbuf_max_diff[0:128, 0, 0, 0, 0, 0, 0, 0:1], op=nl.exp)
+        sbuf_max_diff = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=sbuf_max_diff[0:128, 0:1],
+            data=sbuf_running_max[0:128, 0:1],
+            op0=nl.subtract, operand0=sbuf_new_max[0:128, 0:1])
+        sbuf_max_scale = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        nisa.activation(dst=sbuf_max_scale[0:128, 0:1],
+            data=sbuf_max_diff[0:128, 0:1], op=nl.exp)
 
         """ Rescale BOTH accumulators by s_k """
-        nisa.tensor_scalar(dst=psum_running_sum[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=psum_running_sum[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            op0=nl.multiply, operand0=sbuf_max_scale[0:128, 0, 0, 0, 0, 0, 0, 0:1])
+        nisa.tensor_scalar(dst=psum_running_sum[0:128, 0:1],
+            data=psum_running_sum[0:128, 0:1],
+            op0=nl.multiply, operand0=sbuf_max_scale[0:128, 0:1])
         for i_block_d5 in nl.affine_range(1):
             for i_tile_d5 in nl.affine_range(1):
-                nisa.tensor_scalar(dst=psum_attn[0:128, 0, 0, 0, 0, 0, 0, 0:128],
-                    data=psum_attn[0:128, 0, 0, 0, 0, 0, 0, 0:128],
-                    op0=nl.multiply, operand0=sbuf_max_scale[0:128, 0, 0, 0, 0, 0, 0, 0:1])
+                nisa.tensor_scalar(dst=psum_attn[0:128, 0:128],
+                    data=psum_attn[0:128, 0:128],
+                    op0=nl.multiply, operand0=sbuf_max_scale[0:128, 0:1])
 
-        nisa.tensor_copy(dst=sbuf_running_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            src=sbuf_new_max[0:128, 0, 0, 0, 0, 0, 0, 0:1])
+        nisa.tensor_copy(dst=sbuf_running_max[0:128, 0:1],
+            src=sbuf_new_max[0:128, 0:1])
 
         """ Accumulator 1: exp + sum (Op 6 body) """
-        sbuf_neg_max = nl.ndarray((128, 1, 1, 1, 1, 1, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=sbuf_neg_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            data=sbuf_new_max[0:128, 0, 0, 0, 0, 0, 0, 0:1], op0=nl.multiply, operand0=-1.0)
-        sbuf_exp_S = nl.ndarray((128, 1, 1, 1, 1, 1, 4, 128), dtype=Q.dtype, buffer=nl.sbuf)
-        nisa.activation(dst=sbuf_exp_S[0:128, 0, 0, 0, 0, 0, 0:4, 0:128],
-            op=nl.exp, data=sbuf_scaled_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0, 0:4, 0:128],
-            bias=sbuf_neg_max[0:128, 0, 0, 0, 0, 0, 0, 0:1],
-            reduce_op=nl.add, reduce_res=psum_running_sum[0:128, 0, 0, 0, 0, 0, 0, 0:1],
+        sbuf_neg_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=sbuf_neg_max[0:128, 0:1],
+            data=sbuf_new_max[0:128, 0:1], op0=nl.multiply, operand0=-1.0)
+        sbuf_exp_S = nl.ndarray((128, 512), dtype=Q.dtype, buffer=nl.sbuf)
+        nisa.activation(dst=sbuf_exp_S[0:128, 0:512],
+            op=nl.exp, data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
+            bias=sbuf_neg_max[0:128, 0:1],
+            reduce_op=nl.add, reduce_res=psum_running_sum[0:128, 0:1],
             reduce_cmd=nisa.reduce_cmd.reduce)
 
         """ Accumulator 2: transpose + matmul (Ops 8+9 body) """
-        sbuf_exp_S_t = nl.ndarray((128, 1, 1, 1, 1, 4, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
-        for i_interleave_group_d2 in nl.affine_range(4):                       """ chunk sub-loop: d2 interleave """
-            nisa.nc_transpose(dst=sbuf_exp_S_t[0:128, 0, 0, 0, 0, i_interleave_group_d2, 0, 0:128],
-                src=sbuf_exp_S[0:128, 0, 0, 0, 0, 0, i_interleave_group_d2, 0:128])
-        for i_block_d5 in nl.affine_range(1):
-            for i_tile_d5 in nl.affine_range(1):
-                sbuf_V = nl.ndarray((128, 1, 1, 1, 1, 4, 1, 128), dtype=V.dtype, buffer=nl.sbuf)
-                for i_interleave_group_d2 in nl.affine_range(4):               """ chunk sub-loop: d2 interleave """
-                    nisa.dma_copy(dst=sbuf_V[0:128, 0, 0, 0, 0, i_interleave_group_d2, 0, 0:128],
-                        src=V[i_block_d2*512+i_interleave_group_d2*128:i_block_d2*512+i_interleave_group_d2*128+128,
+        for i_ig_d2 in nl.affine_range(4):                                    """ chunk sub-loop: d2 interleave """
+            sbuf_exp_S_t = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.sbuf)
+            nisa.nc_transpose(dst=sbuf_exp_S_t[0:128, 0:128],
+                src=sbuf_exp_S[0:128, i_ig_d2*128:(i_ig_d2+1)*128])
+            for i_block_d5 in nl.affine_range(1):
+                for i_tile_d5 in nl.affine_range(1):
+                    sbuf_V = nl.ndarray((128, 128), dtype=V.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=sbuf_V[0:128, 0:128],
+                        src=V[i_block_d2*512+i_ig_d2*128:i_block_d2*512+i_ig_d2*128+128,
                              i_block_d5*128:i_block_d5*128+128])
-                for i_interleave_group_d2 in nl.affine_range(4):               """ chunk sub-loop: K accumulation """
-                    nisa.nc_matmul(dst=psum_attn[0:128, 0, 0, 0, 0, 0, 0, 0:128],
-                        stationary=sbuf_exp_S_t[0:128, 0, 0, 0, 0, i_interleave_group_d2, 0, 0:128],
-                        moving=sbuf_V[0:128, 0, 0, 0, 0, i_interleave_group_d2, 0, 0:128])
+                    nisa.nc_matmul(dst=psum_attn[0:128, 0:128],
+                        stationary=sbuf_exp_S_t[0:128, 0:128],
+                        moving=sbuf_V[0:128, 0:128])
 ```
 
 `sbuf_exp_S` shrinks to per-tile since it is produced and consumed within the same d2 iteration. Op 7 is topologically independent from Op 9 (§1 DAG). Op 10 depends on Op 9's output but runs after the d2 reduction completes. Neither is part of this transform.
