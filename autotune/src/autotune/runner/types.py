@@ -82,8 +82,8 @@ class ProfileResult(NamedTuple):
     p99_ms: float
     mac_count: int
     mfu: float
-    cpu_sim: str
-    hardware_run: str
+    cpu_sim: dict
+    hardware_run: bool | str
 
 
 class BenchmarkConfig(NamedTuple):
@@ -108,7 +108,12 @@ def capture_error(exc: Exception) -> str:
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
-def make_failure(kernel_name: str, hardware_run: str, mac_count: int, cpu_sim: str = "") -> ProfileResult:
+def _sim_not_run() -> dict:
+    """Create a fresh 'not run' CPU simulation status."""
+    return {"passed": False, "error": "not run"}
+
+
+def make_failure(kernel_name: str, hardware_run: str, mac_count: int, cpu_sim: dict | None = None) -> ProfileResult:
     """Create a failed ProfileResult."""
     return ProfileResult(
         kernel_name=kernel_name,
@@ -118,12 +123,12 @@ def make_failure(kernel_name: str, hardware_run: str, mac_count: int, cpu_sim: s
         p99_ms=0.0,
         mac_count=mac_count,
         mfu=0.0,
-        cpu_sim=cpu_sim,
+        cpu_sim=cpu_sim if cpu_sim is not None else _sim_not_run(),
         hardware_run=hardware_run,
     )
 
 
-def compile_failure_result(cr: CompileResult, mac_count: int, cpu_sim: str = "") -> ProfileResult:
+def compile_failure_result(cr: CompileResult, mac_count: int, cpu_sim: dict | None = None) -> ProfileResult:
     """Convert a failed CompileResult into a ProfileResult."""
     return make_failure(cr.kernel_name, cr.error, mac_count, cpu_sim=cpu_sim)
 

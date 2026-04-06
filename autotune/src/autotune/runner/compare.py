@@ -3,7 +3,7 @@
 import numpy as np
 
 
-def assert_close(actual: np.ndarray, desired: np.ndarray, atol: float, rtol: float) -> str:
+def assert_close(actual: np.ndarray, desired: np.ndarray, atol: float, rtol: float) -> dict:
     """Assert two arrays are element-wise close and return a margin summary.
 
     Uses the same tolerance formula as ``np.testing.assert_allclose``:
@@ -16,7 +16,7 @@ def assert_close(actual: np.ndarray, desired: np.ndarray, atol: float, rtol: flo
         rtol: Relative tolerance.
 
     Returns:
-        Human-readable string with worst-case margin info.
+        Dict with keys: passed, threshold, diff, worst_margin.
 
     Raises:
         AssertionError: If any element exceeds the tolerance.
@@ -29,4 +29,4 @@ def assert_close(actual: np.ndarray, desired: np.ndarray, atol: float, rtol: flo
     worst_diff = float(abs_diff.flat[worst_idx])
     worst_thresh = float(threshold.flat[worst_idx])
     worst_margin = float(ratio.flat[worst_idx])
-    return f"PASS: atol+rtol*|desired|={worst_thresh:.2e}," f" |diff|={worst_diff:.2e}, worst_margin={worst_margin:.4f}"
+    return {"passed": True, "threshold": worst_thresh, "diff": worst_diff, "worst_margin": worst_margin}

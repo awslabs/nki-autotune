@@ -53,18 +53,23 @@ def _setup_env(payload: dict[str, Any]) -> None:
     ensure_venv_on_path()
 
 
-def _cpu_sim_status(sim_output: np.ndarray, sim_error: str, golden: np.ndarray, atol: float, rtol: float) -> str:
-    """Build a human-readable CPU simulation status string.
+def _cpu_sim_status(sim_output: np.ndarray, sim_error: str, golden: np.ndarray, atol: float, rtol: float) -> dict:
+    """Build a structured CPU simulation status dict.
 
     Compares NKI CPU sim output against golden numpy output.
+
+    Returns:
+        Dict with 'passed' (bool) and either margin details or 'error' string.
     """
-    status = f"FAIL: {sim_error[:200]}" if sim_error else ""
-    if not status:
+    result: dict = {"passed": False, "error": ""}
+    if sim_error:
+        result["error"] = sim_error[:200]
+    else:
         try:
-            status = assert_close(sim_output, golden, atol=atol, rtol=rtol)
+            result = assert_close(sim_output, golden, atol=atol, rtol=rtol)
         except AssertionError as e:
-            status = f"FAIL: {str(e)[:200]}"
-    return status
+            result["error"] = str(e)[:200]
+    return result
 
 
 def _process_kernel_job(kname: str, job: dict[str, Any], seed: int, nki_dir: Path) -> dict[str, Any]:

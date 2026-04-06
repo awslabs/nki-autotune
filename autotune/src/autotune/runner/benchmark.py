@@ -4,12 +4,13 @@ Worker-only module — imports nki and nkipy at top level. Not safe to
 import on the coordinator machine.
 """
 
-from typing import Any
+from typing import Any, cast
 
 import nki
 import numpy as np
 from nkipy.core.backend.hlo import HLOModule, HLOTensor
 from nkipy.runtime import BaremetalExecutor, CompiledKernel
+from spike.spike_model import BenchmarkResult
 
 from autotune.runner.compile import load_kernel
 from autotune.runner.types import (
@@ -17,6 +18,7 @@ from autotune.runner.types import (
     CompileResult,
     OutputSpec,
     ProfileResult,
+    _sim_not_run,
     calculate_mfu,
     capture_error,
     percentile,
@@ -71,12 +73,15 @@ def _run_timing(
         kernel_kwargs: Input tensors.
         config: Benchmark configuration.
     """
-    stats = spike.benchmark(
-        compiled,
-        *tensor_inputs(kernel_kwargs),
-        warmup_iterations=config.warmup,
-        benchmark_iterations=config.iters,
-        mode="device",
+    stats = cast(
+        BenchmarkResult,
+        spike.benchmark(
+            compiled,
+            *tensor_inputs(kernel_kwargs),
+            warmup_iterations=config.warmup,
+            benchmark_iterations=config.iters,
+            mode="device",
+        ),
     )
     min_ms = stats.min_ms
     mean_ms = stats.mean_ms
@@ -96,7 +101,7 @@ def benchmark_one(
     kernel_kwargs: dict[str, Any],
     out: OutputSpec,
     config: BenchmarkConfig,
-    cpu_sim: str = "",
+    cpu_sim: dict | None = None,
 ) -> ProfileResult:
     """Benchmark a single compiled variant on a Neuron core.
 
@@ -110,10 +115,10 @@ def benchmark_one(
         kernel_kwargs: Input tensors.
         out: Output tensor specification.
         config: Benchmark configuration.
-        cpu_sim: CPU simulation status string.
+        cpu_sim: CPU simulation status dict.
     """
     min_ms = mean_ms = p50_ms = p99_ms = mfu = 0.0
-    hardware_run = ""
+    hardware_run: bool | str = True
     try:
         compiled = create_compiled_kernel(cr.neff_path, cr.nki_path, func_name, kernel_kwargs, out)
         min_ms, mean_ms, p50_ms, p99_ms, mfu = _run_timing(spike, compiled, kernel_kwargs, config)
@@ -127,7 +132,7 @@ def benchmark_one(
         p99_ms=p99_ms,
         mac_count=config.mac_count,
         mfu=mfu,
-        cpu_sim=cpu_sim,
+        cpu_sim=cpu_sim if cpu_sim is not None else _sim_not_run(),
         hardware_run=hardware_run,
     )
 
