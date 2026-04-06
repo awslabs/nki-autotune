@@ -4,12 +4,14 @@ Worker-only module — imports nki.compiler at top level. Not safe to
 import on the coordinator machine.
 """
 
+import contextlib
 import importlib.util
 import os
 import re
 import signal
 import sys
 import tempfile
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +102,52 @@ def _separate_inputs(input_tensors: dict[str, Any]) -> tuple[dict[str, np.ndarra
     return tensors, scalars
 
 
+@contextlib.contextmanager
+def _capture_fd_stderr() -> Generator[str, None, None]:
+    """Redirect fd 2 to a temp file for C-level stderr capture.
+
+    Yields the path. Caller reads before exiting the with block.
+    """
+    fd, path = tempfile.mkstemp(suffix=".stderr")
+    saved = os.dup(2)
+    os.dup2(fd, 2)
+    os.close(fd)
+    try:
+        yield path
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        Path(path).unlink(missing_ok=True)
+
+
+def _run_compiler(kernel: Kernel, tensor_inputs: dict[str, np.ndarray], output_name: str, opts: CompileOptions) -> None:
+    """Run compile_to_bir and compile_bir_to_neff with stderr capture.
+
+    Captures C-level stderr so compiler diagnostics (e.g. ``Out of
+    memory in sbuf``) appear in the Python exception on failure.
+    """
+    frontend = TracerFrontend()
+    with _capture_fd_stderr() as stderr_path:
+        try:
+            bir, cr = compile_to_bir(
+                kernel, frontend=frontend, inputs=tensor_inputs, compile_opts=opts, output_names=[output_name]
+            )
+            input_arrays = [np.zeros(s.shape, dtype=np.dtype(s.dtype)) for s in cr.input_specs]
+            compile_bir_to_neff(
+                opts,
+                bir,
+                input_arrays,
+                cr.argument_names,
+                cr.output_names,
+                input_output_aliases=cr.input_output_aliases,
+            )
+        except Exception as exc:
+            stderr_content = Path(stderr_path).read_text().strip()
+            if stderr_content:
+                raise RuntimeError(stderr_content) from exc
+            raise
+
+
 def compile_nki_kernel(
     nki_path: str,
     func_name: str,
@@ -110,9 +158,6 @@ def compile_nki_kernel(
     output_dir: str,
 ) -> str:
     """Compile an NKI kernel file to NEFF via nki.compiler.
-
-    Uses the TracerFrontend to lower the kernel to MLIR, then compiles
-    to BIR and finally to a NEFF binary.
 
     Returns:
         Path to the compiled NEFF file.
@@ -128,15 +173,8 @@ def compile_nki_kernel(
     kernel = Kernel(kernel_func)
     neff_file = os.path.join(output_dir, "file.neff")
     opts = CompileOptions(target="trn2", lnc=1, output_path=neff_file, artifacts_dir=output_dir)
-    frontend = TracerFrontend()
-    bir, cr = compile_to_bir(
-        kernel, frontend=frontend, inputs=tensor_inputs, compile_opts=opts, output_names=[output_name]
-    )
+    _run_compiler(kernel, tensor_inputs, output_name, opts)
 
-    input_arrays = [np.zeros(s.shape, dtype=np.dtype(s.dtype)) for s in cr.input_specs]
-    compile_bir_to_neff(
-        opts, bir, input_arrays, cr.argument_names, cr.output_names, input_output_aliases=cr.input_output_aliases
-    )
     if not os.path.isfile(neff_file):
         raise RuntimeError(f"NEFF file not found at: {neff_file}")
     return neff_file

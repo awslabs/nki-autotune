@@ -609,7 +609,7 @@ def attention_kernel(Q, K, V, scale):
                         nisa.nc_transpose(dst=sbuf_K_t[0:128, i_block_d1, i_block_d2, i_tile_d1, i_tile_d2, i_p_sub*128:i_p_sub*128+128], data=sbuf_K[0:128, 0, 0, 0, 0, 0:128])
 
     """ Op 2: nisa.nc_matmul -- Q_t(d1, d0) x K_t(d1, d2) -> S(d0, d2), accumulate over d1 """
-    sbuf_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=nl.float32, buffer=nl.sbuf)
+    sbuf_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             for i_block_d2 in nl.affine_range(8):
@@ -621,7 +621,7 @@ def attention_kernel(Q, K, V, scale):
                     nisa.tensor_copy(dst=sbuf_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], src=psum_S[0:128, 0, 0, 0, 0, 0:512])
 
     """ Op 3: nisa.affine_select -- S(d0, d2) -> masked_S(d0, d2) """
-    sbuf_masked_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=nl.float32, buffer=nl.sbuf)
+    sbuf_masked_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             for i_block_d2 in nl.affine_range(8):
@@ -629,7 +629,7 @@ def attention_kernel(Q, K, V, scale):
                     nisa.affine_select(dst=sbuf_masked_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], pattern=[[-1, 512]], offset=i_block_d0*128 - i_block_d2*512, channel_multiplier=1, cmp_op=nl.greater_equal, on_true_tile=sbuf_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], on_false_value=-np.inf)
 
     """ Op 4: nisa.tensor_scalar -- masked_S(d0, d2) x scale -> scaled_S(d0, d2) """
-    sbuf_scaled_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=nl.float32, buffer=nl.sbuf)
+    sbuf_scaled_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             for i_block_d2 in nl.affine_range(8):
@@ -637,7 +637,7 @@ def attention_kernel(Q, K, V, scale):
                     nisa.tensor_scalar(dst=sbuf_scaled_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], data=sbuf_masked_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, 0:512], op0=nl.multiply, operand0=scale)
 
     """ Op 5: nisa.tensor_reduce -- max(scaled_S(d0, d2)) negate -> neg_max_S(d0), reduce over d2 """
-    sbuf_neg_max_S = nl.ndarray((128, 32, 1), dtype=nl.float32, buffer=nl.sbuf)
+    sbuf_neg_max_S = nl.ndarray((128, 32, 1), dtype=Q.dtype, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             psum_partial_max = nl.ndarray((128, 8), dtype=nl.float32, buffer=nl.psum)
@@ -648,7 +648,7 @@ def attention_kernel(Q, K, V, scale):
 
     """ Op 6: nisa.activation_reduce -- exp(scaled_S(d0, d2) + neg_max_S(d0)) -> exp_S(d0, d2) + add -> sum_exp(d0), reduce over d2 """
     sbuf_exp_S = nl.ndarray((128, 32, 8, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
-    sbuf_sum_exp = nl.ndarray((128, 32, 1), dtype=nl.float32, buffer=nl.sbuf)
+    sbuf_sum_exp = nl.ndarray((128, 32, 1), dtype=Q.dtype, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             psum_partial_sum = nl.ndarray((128, 8), dtype=nl.float32, buffer=nl.psum)
@@ -658,7 +658,7 @@ def attention_kernel(Q, K, V, scale):
             nisa.tensor_reduce(dst=sbuf_sum_exp[0:128, i_block_d0, 0:1], data=psum_partial_sum[0:128, 0:8], op=nl.add, axis=1)
 
     """ Op 7: nisa.activation -- reciprocal(sum_exp(d0)) -> inv_sum(d0) """
-    sbuf_inv_sum = nl.ndarray((128, 32, 1), dtype=nl.float32, buffer=nl.sbuf)
+    sbuf_inv_sum = nl.ndarray((128, 32, 1), dtype=Q.dtype, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             nisa.activation(dst=sbuf_inv_sum[0:128, i_block_d0, 0:1], data=sbuf_sum_exp[0:128, i_block_d0, 0:1], op=nl.reciprocal)
@@ -673,7 +673,7 @@ def attention_kernel(Q, K, V, scale):
                         nisa.nc_transpose(dst=sbuf_exp_S_t[i_f_sub*128:i_f_sub*128+128, i_block_d2, i_block_d0, i_tile_d2, i_tile_d0, 0:128], data=sbuf_exp_S[0:128, i_block_d0, i_block_d2, i_tile_d0, i_tile_d2, i_f_sub*128:i_f_sub*128+128])
 
     """ Op 9: nisa.nc_matmul -- exp_S_t(d2, d0) x V(d2, d5) -> attn(d0, d5), accumulate over d2 """
-    sbuf_attn = nl.ndarray((128, 32, 1, 1, 1, 128), dtype=nl.float32, buffer=nl.sbuf)
+    sbuf_attn = nl.ndarray((128, 32, 1, 1, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
     for i_block_d0 in nl.affine_range(32):
         for i_tile_d0 in nl.affine_range(1):
             for i_block_d5 in nl.affine_range(1):
@@ -1003,7 +1003,7 @@ where $m_k$ is the running max after tile $k$. This is the correction factor: wh
 
 ```python
 """ Ops 5+6 fused: running max + exp + sum in one d2 loop """
-sbuf_running_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+sbuf_running_max = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_max[0:128, 0, 0:1], value=-np.inf)
 psum_running_sum = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.psum)
 nisa.memset(dst=psum_running_sum[0:128, 0, 0:1], value=0.0)
@@ -1019,16 +1019,16 @@ for i_block_d2 in nl.affine_range(8):                                          "
         psum_max_pair = nl.ndarray((128, 1, 2), dtype=nl.float32, buffer=nl.psum)
         nisa.tensor_copy(dst=psum_max_pair[0:128, 0, 0:1], src=sbuf_running_max[0:128, 0, 0:1])
         nisa.tensor_copy(dst=psum_max_pair[0:128, 0, 1:2], src=psum_tile_max[0:128, 0, 0:1])
-        sbuf_new_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sbuf_new_max = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
         nisa.tensor_reduce(dst=sbuf_new_max[0:128, 0, 0:1],
             data=psum_max_pair[0:128, 0, 0:2], op=nl.maximum, axis=1)
 
         """ Scale: s_k = exp(m_{k-1} - m_k), then rescale running sum """
-        sbuf_max_diff = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sbuf_max_diff = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=sbuf_max_diff[0:128, 0, 0:1],
             data=sbuf_running_max[0:128, 0, 0:1],
             op0=nl.subtract, operand0=sbuf_new_max[0:128, 0, 0:1])
-        sbuf_max_scale = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sbuf_max_scale = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
         nisa.activation(dst=sbuf_max_scale[0:128, 0, 0:1],
             data=sbuf_max_diff[0:128, 0, 0:1], op=nl.exp)
         nisa.tensor_scalar(dst=psum_running_sum[0:128, 0, 0:1],
@@ -1038,7 +1038,7 @@ for i_block_d2 in nl.affine_range(8):                                          "
             src=sbuf_new_max[0:128, 0, 0:1])
 
         """ Bias + accumulate: exp(V - m_k) with rowsum into running sum """
-        sbuf_neg_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sbuf_neg_max = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=sbuf_neg_max[0:128, 0, 0:1],
             data=sbuf_new_max[0:128, 0, 0:1], op0=nl.multiply, operand0=-1.0)
         nisa.activation(dst=sbuf_exp_S[0:128, 0, i_block_d2, 0, i_tile_d2, 0:512],
@@ -1060,7 +1060,7 @@ First, prepare two d2 loops. Op 8 (transpose) is elementwise — fold it into Op
 
 ```python
 """ Fused Ops 5+6: d2 loop (from §4.1.2) """
-sbuf_running_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+sbuf_running_max = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_max[0:128, 0, 0:1], value=-np.inf)
 psum_running_sum = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.psum)
 nisa.memset(dst=psum_running_sum[0:128, 0, 0:1], value=0.0)
@@ -1105,7 +1105,7 @@ Since both online fusions share the same X (running max) and same $g_B(m) = e^{-
 
 ```python
 """ Ops 5+6+8+9 fused: one d2 loop """
-sbuf_running_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+sbuf_running_max = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_max[0:128, 0, 0:1], value=-np.inf)
 psum_running_sum = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.psum)
 nisa.memset(dst=psum_running_sum[0:128, 0, 0:1], value=0.0)
@@ -1124,16 +1124,16 @@ for i_block_d2 in nl.affine_range(8):                                          "
         psum_max_pair = nl.ndarray((128, 1, 2), dtype=nl.float32, buffer=nl.psum)
         nisa.tensor_copy(dst=psum_max_pair[0:128, 0, 0:1], src=sbuf_running_max[0:128, 0, 0:1])
         nisa.tensor_copy(dst=psum_max_pair[0:128, 0, 1:2], src=psum_tile_max[0:128, 0, 0:1])
-        sbuf_new_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sbuf_new_max = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
         nisa.tensor_reduce(dst=sbuf_new_max[0:128, 0, 0:1],
             data=psum_max_pair[0:128, 0, 0:2], op=nl.maximum, axis=1)
 
         """ Scale: s_k = exp(m_{k-1} - m_k) """
-        sbuf_max_diff = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sbuf_max_diff = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=sbuf_max_diff[0:128, 0, 0:1],
             data=sbuf_running_max[0:128, 0, 0:1],
             op0=nl.subtract, operand0=sbuf_new_max[0:128, 0, 0:1])
-        sbuf_max_scale = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sbuf_max_scale = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
         nisa.activation(dst=sbuf_max_scale[0:128, 0, 0:1],
             data=sbuf_max_diff[0:128, 0, 0:1], op=nl.exp)
 
@@ -1151,7 +1151,7 @@ for i_block_d2 in nl.affine_range(8):                                          "
             src=sbuf_new_max[0:128, 0, 0:1])
 
         """ Accumulator 1: exp + sum (Op 6 body) """
-        sbuf_neg_max = nl.ndarray((128, 1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        sbuf_neg_max = nl.ndarray((128, 1, 1), dtype=Q.dtype, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=sbuf_neg_max[0:128, 0, 0:1],
             data=sbuf_new_max[0:128, 0, 0:1], op0=nl.multiply, operand0=-1.0)
         sbuf_exp_S = nl.ndarray((128, 1, 1, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)
