@@ -2,39 +2,24 @@
 
 from autotune.runner.output import ProfileOutput
 from autotune.runner.remote import RemoteProfiler
-from autotune.runner.types import ProfileConfig, ProfileResult
+from autotune.runner.types import KernelJob, ProfileConfig, ProfileResult
 
 
-def _run_and_cache(
-    profiler: RemoteProfiler,
-    kernels: dict[str, str],
-    cache_dir: str,
-    cfg: ProfileConfig,
-    input_specs: dict[str, tuple[tuple[int, ...], str]],
-) -> list[ProfileResult]:
+def _run_and_cache(profiler: RemoteProfiler, kernels: dict[str, KernelJob], cache_dir: str) -> list[ProfileResult]:
     """Execute profiling and optionally save cache."""
-    results = profiler.profile(
-        kernels=kernels,
-        input_specs=input_specs,
-        scalar_params=cfg.scalar_params,
-        mac_count=cfg.mac_count,
-        seed=cfg.seed,
-        golden_source=cfg.golden_source,
-        golden_func_name=cfg.golden_func_name,
-        atol=cfg.atol,
-        rtol=cfg.rtol,
-    )
+    results = profiler.profile(kernels)
     if cache_dir:
         profiler.save_cache(cache_dir, kernels, results)
     return results
 
 
 def remote_profile(
-    kernels: dict[str, str],
-    input_specs: dict[str, tuple[tuple[int, ...], str]],
+    kernels: dict[str, KernelJob],
     hosts: list[str],
     cache_dir: str,
-    config: ProfileConfig,
+    warmup: int = 5,
+    iters: int = 20,
+    config: ProfileConfig = ProfileConfig(),
 ) -> ProfileOutput:
     """Profile NKI kernels across remote Trainium hosts.
 
@@ -42,11 +27,12 @@ def remote_profile(
     to remote workers, optionally saving results to a cache directory.
 
     Args:
-        kernels: Map of kernel filename to source code string.
-        input_specs: Map of param name to (shape, dtype_str).
+        kernels: Map of kernel filename to KernelJob.
         hosts: SSH hostnames (e.g. ["gym-1", "gym-2"]).
         cache_dir: Save results/sources/logs here (empty to skip).
-        config: Optional tuning for benchmarking, correctness, and infra.
+        warmup: Number of warmup iterations before timing.
+        iters: Number of benchmark iterations.
+        config: Optional infra tuning (SSH timeout, platform target, etc.).
 
     Returns:
         ProfileOutput with results, compiler logs, and elapsed time.
@@ -56,11 +42,12 @@ def remote_profile(
         venv_python=config.venv_python,
         ssh_timeout_sec=config.ssh_timeout_sec,
         neuron_platform_target=config.neuron_platform_target,
-        warmup=config.warmup,
-        iters=config.iters,
+        warmup=warmup,
+        iters=iters,
+        seed=config.seed,
         _collect_compiler_logs=bool(cache_dir),
     )
-    results = _run_and_cache(profiler, kernels, cache_dir, config, input_specs)
+    results = _run_and_cache(profiler, kernels, cache_dir)
 
     return ProfileOutput(
         results=results,

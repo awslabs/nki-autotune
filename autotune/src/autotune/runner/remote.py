@@ -1,8 +1,8 @@
 """Distribute NKI kernel profiling across remote Trainium hosts via SSH.
 
-The coordinator sends kernel source code and benchmark config to remote
-workers as a JSON payload over SSH stdin. Workers compile, benchmark,
-and return results as JSON on stdout.
+The coordinator sends per-kernel job configs and benchmark settings to
+remote workers as a JSON payload over SSH stdin. Workers compile,
+benchmark, and return results as JSON on stdout.
 """
 
 import base64
@@ -17,11 +17,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from autotune.runner.types import _DEFAULT_VENV_PYTHON, ProfileResult, make_failure
+from autotune.runner.types import _DEFAULT_VENV_PYTHON, KernelJob, ProfileResult, make_failure
 
 logger = logging.getLogger(__name__)
-
-_REQUIRED_CONFIG_KEYS = {"hosts", "ssh_timeout_sec"}
 
 _AUTOTUNE_ROOT = Path(__file__).parent.parent
 
@@ -47,11 +45,7 @@ def _get_worker_bundle() -> bytes:
 
 
 def _feed_stdin(proc: subprocess.Popen[bytes], bundle_line: bytes, payload: bytes) -> None:
-    """Write bundle + payload to proc stdin in a background thread.
-
-    First line: base64-encoded file bundle (read by bootstrap).
-    Remaining bytes: JSON work payload (read by worker.py).
-    """
+    """Write bundle + payload to proc stdin in a background thread."""
     stdin = proc.stdin
     if stdin is None:
         raise RuntimeError("Process stdin is None — cannot feed payload")
@@ -64,41 +58,10 @@ def _feed_stdin(proc: subprocess.Popen[bytes], bundle_line: bytes, payload: byte
         stdin.close()
 
 
-def _fail_host(results: list[ProfileResult], kernel_names: list[str], error_msg: str, mac_count: int) -> None:
+def _fail_host(results: list[ProfileResult], kernel_names: list[str], error_msg: str) -> None:
     """Append a failure ProfileResult for every kernel assigned to a host."""
     for kname in kernel_names:
-        results.append(make_failure(kname, error_msg, mac_count))
-
-
-def load_remote_config(config_path: str) -> dict[str, Any]:
-    """Load remote worker configuration from a JSON file.
-
-    Expected keys: ``hosts``, ``ssh_timeout_sec``.
-    Optional: ``venv_python``, ``neuron_platform_target``.
-
-    Raises:
-        FileNotFoundError: If the config file does not exist.
-        ValueError: If required keys are missing.
-    """
-    with open(config_path) as f:
-        cfg = json.load(f)
-    missing = _REQUIRED_CONFIG_KEYS - set(cfg)
-    if missing:
-        raise ValueError(f"remote config {config_path} missing keys: {missing}")
-    cfg.setdefault("neuron_platform_target", "trn2")
-    return cfg
-
-
-def _build_host_assignments(kernel_names: list[str], hosts: list[str]) -> dict[str, list[str]]:
-    """Round-robin distribute shuffled kernel names across hosts."""
-    shuffled = list(kernel_names)
-    random.shuffle(shuffled)
-    active_hosts = hosts[: len(kernel_names)] if len(kernel_names) < len(hosts) else hosts
-    assignments: dict[str, list[str]] = {h: [] for h in active_hosts}
-    for i, kname in enumerate(shuffled):
-        host = active_hosts[i % len(active_hosts)]
-        assignments[host].append(kname)
-    return assignments
+        results.append(make_failure(kname, error_msg, 0))
 
 
 _BOOTSTRAP_SCRIPT = (
@@ -139,14 +102,25 @@ def _build_ssh_cmd(host: str, venv_python: str) -> list[str]:
     ]
 
 
-def _launch_ssh_workers(
-    host_assignments: dict[str, list[str]], kernels: dict[str, str], payload_base: dict[str, Any], venv_python: str
-) -> tuple[dict[str, subprocess.Popen[bytes]], list[threading.Thread]]:
-    """Launch SSH workers for each host and feed payloads.
+def _build_host_assignments(kernel_names: list[str], hosts: list[str]) -> dict[str, list[str]]:
+    """Round-robin distribute shuffled kernel names across hosts."""
+    shuffled = list(kernel_names)
+    random.shuffle(shuffled)
+    active_hosts = hosts[: len(kernel_names)] if len(kernel_names) < len(hosts) else hosts
+    assignments: dict[str, list[str]] = {h: [] for h in active_hosts}
+    for i, kname in enumerate(shuffled):
+        host = active_hosts[i % len(active_hosts)]
+        assignments[host].append(kname)
+    return assignments
 
-    Returns:
-        Tuple of (host-to-process map, list of writer threads).
-    """
+
+def _launch_ssh_workers(
+    host_assignments: dict[str, list[str]],
+    kernels: dict[str, KernelJob],
+    payload_base: dict[str, Any],
+    venv_python: str,
+) -> tuple[dict[str, subprocess.Popen[bytes]], list[threading.Thread]]:
+    """Launch SSH workers for each host and feed payloads."""
     b64_bundle = _get_worker_bundle()
     procs: dict[str, subprocess.Popen[bytes]] = {}
     writers: list[threading.Thread] = []
@@ -154,8 +128,17 @@ def _launch_ssh_workers(
     for host, names in host_assignments.items():
         payload = dict(payload_base)
         payload["host"] = host
-        payload["kernel_names"] = names
-        payload["sources"] = {n: kernels[n] for n in names}
+        payload["kernel_jobs"] = {}
+        for n in names:
+            job = kernels[n]
+            payload["kernel_jobs"][n] = {
+                "source": job.source,
+                "tensor_specs": {name: (list(shape), dt) for name, (shape, dt) in job.input_specs.items()},
+                "golden_source": job.golden_source,
+                "golden_func_name": job.golden_func_name,
+                "atol": job.atol,
+                "rtol": job.rtol,
+            }
         payload_bytes = json.dumps(payload).encode("utf-8")
 
         cmd = _build_ssh_cmd(host, venv_python)
@@ -184,12 +167,7 @@ def _read_host_output(
 def _collect_host_outputs(
     procs: dict[str, subprocess.Popen[bytes]], timeout: int
 ) -> dict[str, tuple[bytes, bytes, int]]:
-    """Read all host outputs concurrently via threads.
-
-    Workers produce ~3MB of output (results + compiler logs) and the OS
-    pipe buffer is only 64KB. Sequential communicate() causes pipeline
-    stalls. Threading the reads eliminates this.
-    """
+    """Read all host outputs concurrently via threads."""
     host_outputs: dict[str, tuple[bytes, bytes, int]] = {}
     readers: list[threading.Thread] = []
     for host, proc in procs.items():
@@ -218,10 +196,8 @@ def _parse_host_result(
     stdout_data: bytes,
     stderr_data: bytes,
     assigned_kernels: list[str],
-    mac_count: int,
     all_results: list[ProfileResult],
     all_compiler_logs: dict[str, str],
-    all_sim_errors: dict[str, str],
 ) -> None:
     """Parse one host's JSON output and append to aggregate lists."""
     stderr_text = stderr_data.decode(errors="replace")
@@ -231,15 +207,13 @@ def _parse_host_result(
     try:
         data = json.loads(stdout_data)
     except (json.JSONDecodeError, ValueError) as e:
-        _fail_host(all_results, assigned_kernels, f"Malformed JSON from {host}: {e}", mac_count)
+        _fail_host(all_results, assigned_kernels, f"Malformed JSON from {host}: {e}")
         return
 
     for r in data["results"]:
         all_results.append(ProfileResult(**r))
     for kname, log_text in data.get("compiler_logs", {}).items():
         all_compiler_logs[kname] = log_text
-    for kname, err_text in data.get("sim_errors", {}).items():
-        all_sim_errors[kname] = err_text
     logger.info("Host %s: %d results", host, len(data["results"]))
 
 
@@ -247,44 +221,34 @@ def _process_host_outputs(
     procs: dict[str, subprocess.Popen[bytes]],
     host_outputs: dict[str, tuple[bytes, bytes, int]],
     host_assignments: dict[str, list[str]],
-    mac_count: int,
-) -> tuple[list[ProfileResult], dict[str, str], dict[str, str]]:
+) -> tuple[list[ProfileResult], dict[str, str]]:
     """Process outputs from all hosts into aggregate results."""
     all_results: list[ProfileResult] = []
     all_compiler_logs: dict[str, str] = {}
-    all_sim_errors: dict[str, str] = {}
 
     for host in procs:
         stdout_data, stderr_data, returncode = host_outputs.get(host, (b"", b"", -1))
         error = _host_error_message(host, returncode, stderr_data, stdout_data)
         if error:
             logger.error(error)
-            _fail_host(all_results, host_assignments[host], error, mac_count)
+            _fail_host(all_results, host_assignments[host], error)
             continue
-        _parse_host_result(
-            host,
-            stdout_data,
-            stderr_data,
-            host_assignments[host],
-            mac_count,
-            all_results,
-            all_compiler_logs,
-            all_sim_errors,
-        )
+        _parse_host_result(host, stdout_data, stderr_data, host_assignments[host], all_results, all_compiler_logs)
 
-    return all_results, all_compiler_logs, all_sim_errors
+    return all_results, all_compiler_logs
 
 
-def _write_cache_files(cache_dir: str, kernels: dict[str, str], compiler_logs: dict[str, str]) -> None:
+def _write_cache_files(cache_dir: str, kernels: dict[str, KernelJob], compiler_logs: dict[str, str]) -> None:
     """Write kernel sources and compiler logs to cache directory."""
     nki_dir = os.path.join(cache_dir, "nki")
     neff_dir = os.path.join(cache_dir, "neff")
     os.makedirs(nki_dir, exist_ok=True)
     os.makedirs(neff_dir, exist_ok=True)
 
-    for kname, source in kernels.items():
-        with open(os.path.join(nki_dir, kname), "w") as f:
-            f.write(source)
+    for kname, job in kernels.items():
+        filename = kname if kname.endswith(".py") else f"{kname}.py"
+        with open(os.path.join(nki_dir, filename), "w") as f:
+            f.write(job.source)
 
     for kname, log_text in compiler_logs.items():
         stem = Path(kname).stem
@@ -295,33 +259,28 @@ def _write_cache_files(cache_dir: str, kernels: dict[str, str], compiler_logs: d
 
 
 def _write_results_json(
-    cache_dir: str, kernels: dict[str, str], results: list[ProfileResult], profiler: "RemoteProfiler"
+    cache_dir: str, kernels: dict[str, KernelJob], results: list[ProfileResult], profiler: "RemoteProfiler"
 ) -> None:
-    """Write results.json with search metrics and per-variant data."""
-    successes = [r for r in results if not r.error]
+    """Write results.json with metrics and per-kernel data."""
+    successes = [r for r in results if not r.hardware_run]
     times = [r.min_ms for r in successes]
 
-    variants = []
+    kernel_entries = []
     for r in results:
         rd = r._asdict()
-        rd["nki_path"] = f"nki/{r.kernel_name}"
-        variants.append(rd)
+        filename = r.kernel_name if r.kernel_name.endswith(".py") else f"{r.kernel_name}.py"
+        rd["nki_path"] = f"nki/{filename}"
+        kernel_entries.append(rd)
 
     results_data = {
-        "metadata": {
-            "num_kernels": len(kernels),
-            "wallclock_s": profiler._last_elapsed,
-            "hosts": profiler.hosts,
-            "num_hosts": len(profiler.hosts),
-        },
+        "metadata": {"num_kernels": len(kernels), "wallclock_s": profiler._last_elapsed, "hosts": profiler.hosts},
         "metrics": {
             "best_min_ms": min(times) if times else None,
             "worst_min_ms": max(times) if times else None,
             "mean_min_ms": sum(times) / len(times) if times else None,
             "best_kernel": min(successes, key=lambda r: r.min_ms).kernel_name if successes else None,
         },
-        "variants": variants,
-        "sim_errors": profiler.sim_errors,
+        "kernels": kernel_entries,
     }
     with open(os.path.join(cache_dir, "results.json"), "w") as f:
         json.dump(results_data, f, indent=2)
@@ -346,85 +305,28 @@ class RemoteProfiler:
     neuron_platform_target: str = "trn2"
     warmup: int = 5
     iters: int = 20
+    seed: int = 42
     compiler_logs: dict[str, str] = field(default_factory=dict, repr=False)
-    sim_errors: dict[str, str] = field(default_factory=dict, repr=False)
     _last_elapsed: float = field(default=0.0, repr=False)
     _collect_compiler_logs: bool = field(default=False, repr=False)
 
-    @classmethod
-    def from_config(cls, config_path: str, **overrides: Any) -> "RemoteProfiler":
-        """Create a RemoteProfiler from a JSON config file.
-
-        Args:
-            config_path: Path to the remote config JSON.
-            **overrides: Override any config values.
-        """
-        cfg = load_remote_config(config_path)
-        kwargs = {
-            "hosts": cfg["hosts"],
-            "venv_python": cfg.get("venv_python", _DEFAULT_VENV_PYTHON),
-            "ssh_timeout_sec": cfg["ssh_timeout_sec"],
-            "neuron_platform_target": cfg.get("neuron_platform_target", "trn2"),
-        }
-        kwargs.update(overrides)
-        return cls(**kwargs)
-
-    def _build_payload_base(
-        self,
-        input_specs: dict[str, tuple[tuple[int, ...], str]],
-        scalar_params: dict[str, float],
-        mac_count: int,
-        seed: int,
-        golden_source: str,
-        golden_func_name: str,
-        atol: float,
-        rtol: float,
-    ) -> dict[str, Any]:
+    def _build_payload_base(self) -> dict[str, Any]:
         """Build the common payload dict shared by all hosts."""
-        input_dtype_name = next(iter(input_specs.values()))[1]
-        tensor_specs = {name: {"shape": list(shape), "dtype": dt} for name, (shape, dt) in input_specs.items()}
         return {
             "neuron_platform_target": self.neuron_platform_target,
+            "seed": self.seed,
             "config": {
                 "warmup": self.warmup,
                 "iters": self.iters,
-                "mac_count": mac_count,
-                "input_dtype_name": input_dtype_name,
-                "atol": atol,
-                "rtol": rtol,
                 "collect_compiler_logs": self._collect_compiler_logs,
             },
-            "tensor_specs": tensor_specs,
-            "scalar_params": scalar_params,
-            "seed": seed,
-            "golden_source": golden_source,
-            "golden_func_name": golden_func_name,
         }
 
-    def profile(
-        self,
-        kernels: dict[str, str],
-        input_specs: dict[str, tuple[tuple[int, ...], str]],
-        scalar_params: dict[str, float],
-        mac_count: int,
-        seed: int,
-        golden_source: str,
-        golden_func_name: str,
-        atol: float,
-        rtol: float,
-    ) -> list[ProfileResult]:
+    def profile(self, kernels: dict[str, KernelJob]) -> list[ProfileResult]:
         """Profile NKI kernels across remote hosts.
 
         Args:
-            kernels: Map of kernel filename to source code string.
-            input_specs: Map of param name to (shape, dtype_str).
-            scalar_params: Map of scalar param names to float values.
-            mac_count: MAC operations for MFU calculation (0 to skip).
-            seed: Random seed for reproducible tensor generation.
-            golden_source: Source code of golden reference (empty to skip).
-            golden_func_name: Name of the golden function (empty to skip).
-            atol: Absolute tolerance for correctness check.
-            rtol: Relative tolerance for correctness check.
+            kernels: Map of kernel filename to KernelJob.
 
         Returns:
             List of ProfileResult, one per kernel.
@@ -437,17 +339,11 @@ class RemoteProfiler:
             ", ".join(f"{h}({len(v)})" for h, v in host_assignments.items()),
         )
 
-        payload_base = self._build_payload_base(
-            input_specs, scalar_params, mac_count, seed, golden_source, golden_func_name, atol, rtol
-        )
-        return self._execute_workers(host_assignments, kernels, payload_base, mac_count)
+        payload_base = self._build_payload_base()
+        return self._execute_workers(host_assignments, kernels, payload_base)
 
     def _execute_workers(
-        self,
-        host_assignments: dict[str, list[str]],
-        kernels: dict[str, str],
-        payload_base: dict[str, Any],
-        mac_count: int,
+        self, host_assignments: dict[str, list[str]], kernels: dict[str, KernelJob], payload_base: dict[str, Any]
     ) -> list[ProfileResult]:
         """Launch workers, collect outputs, and update profiler state."""
         procs, writers = _launch_ssh_workers(host_assignments, kernels, payload_base, self.venv_python)
@@ -459,9 +355,7 @@ class RemoteProfiler:
 
             t0 = time.monotonic()
             host_outputs = _collect_host_outputs(procs, self.ssh_timeout_sec)
-            all_results, all_compiler_logs, all_sim_errors = _process_host_outputs(
-                procs, host_outputs, host_assignments, mac_count
-            )
+            all_results, all_compiler_logs = _process_host_outputs(procs, host_outputs, host_assignments)
         except BaseException:
             for proc in procs.values():
                 proc.kill()
@@ -470,19 +364,12 @@ class RemoteProfiler:
             raise
 
         self.compiler_logs = all_compiler_logs
-        self.sim_errors = all_sim_errors
         self._last_elapsed = time.monotonic() - t0
         logger.info("Profile complete: %d results in %.1fs", len(all_results), self._last_elapsed)
         return all_results
 
-    def save_cache(self, cache_dir: str, kernels: dict[str, str], results: list[ProfileResult]) -> None:
-        """Save profile results to disk following the standard cache layout.
-
-        Args:
-            cache_dir: Directory to write cache files to.
-            kernels: Map of kernel filename to source code string.
-            results: List of ProfileResult from the most recent profile() call.
-        """
+    def save_cache(self, cache_dir: str, kernels: dict[str, KernelJob], results: list[ProfileResult]) -> None:
+        """Save profile results to disk following the standard cache layout."""
         _write_cache_files(cache_dir, kernels, self.compiler_logs)
         _write_results_json(cache_dir, kernels, results, self)
         logger.info("Cache saved to %s", cache_dir)

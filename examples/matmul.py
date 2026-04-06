@@ -7,17 +7,20 @@ then compiles and benchmarks it on remote Trainium workers.
 Usage::
 
     source ~/venvs/kernel-env/bin/activate
-    python examples/matmul.py --hosts gym-1 gym-2
+    python examples/matmul.py
 """
+
+import inspect
 
 import numpy as np
 
 import nkigym
 from autotune.runner.api import remote_profile
+from autotune.runner.types import KernelJob
 
 
 def matmul_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Matrix multiply with numpy: lhs_T.T @ b.
+    """Matrix multiply with numpy: lhs_T.T @ rhs.
 
     Args:
         lhs_T: Stationary tensor of shape (K, M).
@@ -49,30 +52,34 @@ if __name__ == "__main__":
     atol = 1e-10
     rtol = 1e-10
 
-    a = np.random.randn(K, M)
-    b = np.random.randn(K, N)
+    lhs_T = np.random.randn(K, M)
+    rhs = np.random.randn(K, N)
 
-    out_np = matmul_numpy(a, b)
-    out_gym = matmul_nkigym(a, b)
+    out_np = matmul_numpy(lhs_T, rhs)
+    out_gym = matmul_nkigym(lhs_T, rhs)
     max_diff = np.max(np.abs(out_np - out_gym))
     print(f"max |diff|: {max_diff:.2e}")
     np.testing.assert_allclose(out_gym, out_np, rtol=rtol, atol=atol)
     print("PASS: matmul nkigym matches numpy")
-    kernel_src = nkigym.render(matmul_nkigym, a=a, b=b)
+    kernel_src = nkigym.render(matmul_nkigym, lhs_T=lhs_T, rhs=rhs)
 
-    kernel_job = {
-        "kernel_source": kernel_src,
-        "kernel_name": "matmul_nkigym_kernel",
-        "input_specs": {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")},
-        "golden_numpy": matmul_numpy,
-        "atol": atol,
-        "rtol": rtol,
+    golden_source = inspect.getsource(matmul_numpy)
+    kernels = {
+        "matmul_nkigym": KernelJob(
+            source=kernel_src,
+            input_specs={"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")},
+            golden_source=golden_source,
+            golden_func_name="matmul_numpy",
+            atol=atol,
+            rtol=rtol,
+        )
     }
+
     output = remote_profile(
+        kernels=kernels,
         hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5"],
         cache_dir="/home/ubuntu/cache/matmul_test",
         warmup=10,
         iters=100,
-        kernels=[kernel_job],
     )
     print(output)

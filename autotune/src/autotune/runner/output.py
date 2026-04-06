@@ -25,13 +25,13 @@ class ProfileOutput:
 
     @property
     def successes(self) -> list[ProfileResult]:
-        """Results that completed without error."""
-        return [r for r in self.results if not r.error]
+        """Results that completed without hardware errors."""
+        return [r for r in self.results if not r.hardware_run]
 
     @property
     def failures(self) -> list[ProfileResult]:
-        """Results that errored."""
-        return [r for r in self.results if r.error]
+        """Results that had hardware errors."""
+        return [r for r in self.results if r.hardware_run]
 
     def __str__(self) -> str:
         """Human-readable summary with per-kernel timing table."""
@@ -67,7 +67,7 @@ def _format_failures(failures: list[ProfileResult]) -> list[str]:
     for i, r in enumerate(failures):
         if i == 0:
             lines.append(f"\n{len(failures)} failures:")
-        lines.append(f"  {r.kernel_name}: {r.error[:200]}")
+        lines.append(f"  {r.kernel_name}: {r.hardware_run[:200]}")
     return lines
 
 

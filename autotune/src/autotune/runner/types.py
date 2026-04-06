@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 import traceback
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import ml_dtypes
 import numpy as np
@@ -43,6 +43,26 @@ def resolve_dtype(name: str) -> np.dtype:
     return _DTYPE_CACHE[name]
 
 
+class KernelJob(NamedTuple):
+    """Per-kernel configuration for remote profiling.
+
+    Attributes:
+        source: NKI kernel source code string.
+        input_specs: Map of param name to (shape, dtype_str).
+        golden_source: Source code of the golden numpy reference function.
+        golden_func_name: Name of the golden function.
+        atol: Absolute tolerance for CPU sim vs golden comparison.
+        rtol: Relative tolerance for CPU sim vs golden comparison.
+    """
+
+    source: str
+    input_specs: dict[str, tuple[tuple[int, ...], str]]
+    golden_source: str
+    golden_func_name: str
+    atol: float = 1e-2
+    rtol: float = 1e-2
+
+
 class CompileResult(NamedTuple):
     """Result of compiling a single NKI kernel to NEFF."""
 
@@ -62,8 +82,8 @@ class ProfileResult(NamedTuple):
     p99_ms: float
     mac_count: int
     mfu: float
-    correct: bool
-    error: str
+    cpu_sim: str
+    hardware_run: str
 
 
 class BenchmarkConfig(NamedTuple):
@@ -73,8 +93,6 @@ class BenchmarkConfig(NamedTuple):
     iters: int
     mac_count: int
     input_dtype_name: str
-    atol: float
-    rtol: float
 
 
 class OutputSpec(NamedTuple):
@@ -90,7 +108,7 @@ def capture_error(exc: Exception) -> str:
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
-def make_failure(kernel_name: str, error: str, mac_count: int) -> ProfileResult:
+def make_failure(kernel_name: str, hardware_run: str, mac_count: int, cpu_sim: str = "") -> ProfileResult:
     """Create a failed ProfileResult."""
     return ProfileResult(
         kernel_name=kernel_name,
@@ -100,17 +118,17 @@ def make_failure(kernel_name: str, error: str, mac_count: int) -> ProfileResult:
         p99_ms=0.0,
         mac_count=mac_count,
         mfu=0.0,
-        correct=False,
-        error=error,
+        cpu_sim=cpu_sim,
+        hardware_run=hardware_run,
     )
 
 
-def compile_failure_result(cr: CompileResult, mac_count: int) -> ProfileResult:
+def compile_failure_result(cr: CompileResult, mac_count: int, cpu_sim: str = "") -> ProfileResult:
     """Convert a failed CompileResult into a ProfileResult."""
-    return make_failure(cr.kernel_name, cr.error, mac_count)
+    return make_failure(cr.kernel_name, cr.error, mac_count, cpu_sim=cpu_sim)
 
 
-def tensor_inputs(kwargs: dict[str, Any]) -> list[np.ndarray]:
+def tensor_inputs(kwargs: dict) -> list[np.ndarray]:
     """Extract tensor (ndim > 0) values from kwargs, preserving order."""
     return [v for v in kwargs.values() if hasattr(v, "ndim") and v.ndim > 0]
 
@@ -148,21 +166,13 @@ def ensure_venv_on_path() -> None:
 
 
 class ProfileConfig(NamedTuple):
-    """Optional configuration for remote profiling.
+    """Infrastructure configuration for remote profiling.
 
-    Bundles rarely-changed parameters so that ``remote_profile`` keeps
-    a small required-argument surface. All fields have sensible defaults.
+    Per-kernel settings (golden, tolerances, input_specs) are in KernelJob.
+    This bundles infra params that rarely change.
     """
 
-    scalar_params: dict[str, float] = {}
-    mac_count: int = 0
     seed: int = 42
-    golden_source: str = ""
-    golden_func_name: str = ""
-    atol: float = 1e-2
-    rtol: float = 1e-2
-    warmup: int = 5
-    iters: int = 20
     ssh_timeout_sec: int = 600
     neuron_platform_target: str = "trn2"
     venv_python: str = _DEFAULT_VENV_PYTHON

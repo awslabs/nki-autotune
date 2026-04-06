@@ -89,28 +89,6 @@ def _run_timing(
     return min_ms, mean_ms, p50_ms, p99_ms, mfu
 
 
-def _check_correctness(
-    spike: BaremetalExecutor,
-    compiled: CompiledKernel,
-    kernel_kwargs: dict[str, Any],
-    golden: np.ndarray,
-    atol: float,
-    rtol: float,
-) -> None:
-    """Compare hardware output against golden reference.
-
-    Raises:
-        AssertionError: If outputs don't match within tolerance.
-    """
-    run_out = spike.run(compiled, *tensor_inputs(kernel_kwargs))
-    if isinstance(run_out, np.ndarray):
-        run_out = (run_out,)
-    actual = run_out[0]
-    if golden.dtype != actual.dtype:
-        actual = actual.astype(golden.dtype)
-    np.testing.assert_allclose(actual, golden, atol=atol, rtol=rtol)
-
-
 def benchmark_one(
     spike: BaremetalExecutor,
     cr: CompileResult,
@@ -118,30 +96,29 @@ def benchmark_one(
     kernel_kwargs: dict[str, Any],
     out: OutputSpec,
     config: BenchmarkConfig,
-    golden: np.ndarray,
+    cpu_sim: str = "",
 ) -> ProfileResult:
     """Benchmark a single compiled variant on a Neuron core.
+
+    Timing only — no numerical correctness checks. The cpu_sim field
+    carries the CPU simulation result from earlier in the pipeline.
 
     Args:
         spike: Active BaremetalExecutor session.
         cr: Compilation result with NEFF path.
         func_name: Kernel function name.
-        kernel_kwargs: Input tensors and scalar params.
+        kernel_kwargs: Input tensors.
         out: Output tensor specification.
         config: Benchmark configuration.
-        golden: Reference output. Empty (size 0) to skip correctness check.
+        cpu_sim: CPU simulation status string.
     """
     min_ms = mean_ms = p50_ms = p99_ms = mfu = 0.0
-    correct = False
-    error = ""
+    hardware_run = ""
     try:
         compiled = create_compiled_kernel(cr.neff_path, cr.nki_path, func_name, kernel_kwargs, out)
         min_ms, mean_ms, p50_ms, p99_ms, mfu = _run_timing(spike, compiled, kernel_kwargs, config)
-        if golden.size > 0:
-            _check_correctness(spike, compiled, kernel_kwargs, golden, config.atol, config.rtol)
-        correct = True
     except Exception as e:
-        error = capture_error(e)
+        hardware_run = capture_error(e)
     return ProfileResult(
         kernel_name=cr.kernel_name,
         min_ms=min_ms,
@@ -150,8 +127,8 @@ def benchmark_one(
         p99_ms=p99_ms,
         mac_count=config.mac_count,
         mfu=mfu,
-        correct=correct,
-        error=error,
+        cpu_sim=cpu_sim,
+        hardware_run=hardware_run,
     )
 
 
@@ -202,16 +179,19 @@ def generate_tensors(tensor_specs: dict[str, dict], seed: int) -> dict[str, np.n
 def compute_golden(golden_source: str, func_name: str, kernel_kwargs: dict[str, np.ndarray]) -> np.ndarray:
     """Execute a golden reference function to compute expected output.
 
+    Casts inputs to float32 to match the NKI CPU simulator precision
+    (nc_matmul simulator casts operands to float32).
+
     Args:
         golden_source: Source code containing the golden function.
         func_name: Name of the golden function.
-        kernel_kwargs: Input arrays (will be cast to float64).
+        kernel_kwargs: Input arrays (will be cast to float32).
 
     Returns:
-        Expected output at float64 precision.
+        Expected output at float32 precision.
     """
     g: dict[str, Any] = {"np": np, "__builtins__": __builtins__}
     exec(golden_source, g)  # noqa: S102
     func = g[func_name]
-    f64_kwargs = {k: v.astype(np.float64) for k, v in kernel_kwargs.items() if hasattr(v, "ndim") and v.ndim > 0}
-    return func(**f64_kwargs)
+    f32_kwargs = {k: v.astype(np.float32) for k, v in kernel_kwargs.items() if hasattr(v, "ndim") and v.ndim > 0}
+    return func(**f32_kwargs)
