@@ -185,7 +185,7 @@ def _host_error_message(host: str, returncode: int, stderr_data: bytes, stdout_d
     msg = _ERROR_TEMPLATES.get(returncode, "")
     if not msg and returncode != 0:
         stderr = stderr_data.decode(errors="replace")
-        msg = f"SSH worker on {host} exited {returncode}: {stderr[:2000]}"
+        msg = f"SSH worker on {host} exited {returncode}: {stderr}"
     if not msg and not stdout_data:
         msg = f"No results from {host} (empty stdout)"
     return msg

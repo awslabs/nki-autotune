@@ -1,4 +1,9 @@
-"""Kernel renderer: inspects a math function and emits NKI kernel source."""
+"""Kernel renderer: inspects a math function and emits NKI kernel source.
+
+Handles single-op and multi-op pipelines with inter-op buffer
+detection: outputs consumed by later ops get full-range SBUF
+buffers; only the final output gets degree-1 SBUF + DMA store.
+"""
 
 import ast
 import inspect
@@ -8,11 +13,17 @@ from collections.abc import Callable
 import numpy as np
 
 from nkigym.ops.base import NKIOp, RenderContext, Tensor
+from nkigym.ops.matmul import MATMUL_FREE_MAX
+from nkigym.ops.transpose import TRANSPOSE_BLOCK
 
 _INDENT = "    "
 
-
 _UNASSIGNED = (ast.Expr, ast.Return)
+
+_ISA_TILE_LIMITS: dict[str, dict[str, int]] = {
+    "nc_matmul": {"K": 128, "M": 128, "N": MATMUL_FREE_MAX},
+    "nc_transpose": {"P": TRANSPOSE_BLOCK, "F": TRANSPOSE_BLOCK},
+}
 
 
 def _extract_op_call(stmt: ast.stmt) -> tuple[ast.Call | None, str | None]:
@@ -47,13 +58,6 @@ def _resolve_op_class(call_node: ast.Call, func_globals: dict[str, object]) -> t
 
 def _find_ops(func: Callable[..., np.ndarray]) -> tuple[list[tuple[NKIOp, dict[str, str], str]], str]:
     """Find NKIOp subclasses and the return variable via AST inspection.
-
-    Looks for the ``result = OpClass()(key=var, ...)`` assignment pattern,
-    resolves each class name against the function's globals, and extracts
-    the operand map from keyword arguments.  Unassigned op calls raise
-    an error — the variable name becomes the output tensor name.
-
-    Also extracts the ``return <name>`` variable in the same pass.
 
     Args:
         func: Math function using nkigym ops.
@@ -94,16 +98,7 @@ def _find_ops(func: Callable[..., np.ndarray]) -> tuple[list[tuple[NKIOp, dict[s
 def _emit_header(
     func_name: str, param_names: list[str], input_specs: dict[str, tuple[tuple[int, ...], str]]
 ) -> list[str]:
-    """Emit imports, decorator, signature, and input checks.
-
-    Args:
-        func_name: Kernel function name.
-        param_names: Parameter names in order.
-        input_specs: Maps parameter name to ``(shape, dtype_str)``.
-
-    Returns:
-        List of source lines.
-    """
+    """Emit imports, decorator, signature, and input checks."""
     lines = [
         "import nki",
         "import nki.language as nl",
@@ -115,27 +110,20 @@ def _emit_header(
         f"def {func_name}_kernel({', '.join(f'{n}: Tensor' for n in param_names)}):",
     ]
     for name in param_names:
-        shape, dtype_str = input_specs[name]
+        shape, dtype_str, _ = _parse_input_spec(input_specs[name])
         shape_str = ", ".join(str(s) for s in shape)
         lines.append(f"{_INDENT}assert {name}.shape == ({shape_str})")
         lines.append(f"{_INDENT}assert {name}.dtype == nl.{dtype_str}")
     return lines
 
 
-def _resolve_output_shape(op: NKIOp, operand_map: dict[str, str], ctx: RenderContext) -> tuple[tuple[int, ...], str]:
-    """Trace the output shape and dtype from an op's operand axes.
-
-    Builds an axis-label-to-size mapping from the input operands,
-    then resolves the output shape via ``OUTPUT_AXES``.  The dtype
-    follows the first input operand.
-
-    Args:
-        op: The NKIOp instance.
-        operand_map: Maps op slot name to tensor name in ctx.
-        ctx: Running render context with tensors.
+def _resolve_output(
+    op: NKIOp, operand_map: dict[str, str], ctx: RenderContext
+) -> tuple[tuple[int, ...], str, tuple[str, ...]]:
+    """Trace output shape, dtype, and dim_ids from an op's operand axes.
 
     Returns:
-        ``(output_shape, dtype_str)`` for the op's output.
+        ``(output_shape, dtype_str, dim_ids)``.
     """
     axis_sizes: dict[str, int] = {}
     first_dtype: str | None = None
@@ -148,29 +136,151 @@ def _resolve_output_shape(op: NKIOp, operand_map: dict[str, str], ctx: RenderCon
 
     if first_dtype is None:
         raise ValueError(f"Op {op.NAME!r} has no input operands")
-
     if len(op.OUTPUT_AXES) != 1:
-        raise ValueError(
-            f"Op {op.NAME!r} has {len(op.OUTPUT_AXES)} outputs — " f"multi-output ops are not yet supported"
-        )
+        raise ValueError(f"Op {op.NAME!r} has {len(op.OUTPUT_AXES)} outputs — multi-output not supported")
 
     output_axes = next(iter(op.OUTPUT_AXES.values()))
     output_shape = tuple(axis_sizes[a] for a in output_axes)
-    return output_shape, first_dtype
+    return output_shape, first_dtype, output_axes
 
 
-def render(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> str:
+def _consumed_names(ops: list[tuple[NKIOp, dict[str, str], str]]) -> set[str]:
+    """Collect all tensor names consumed as operands by any op."""
+    names: set[str] = set()
+    for _, operand_map, _ in ops:
+        names.update(operand_map.values())
+    return names
+
+
+def _local_axis_map(
+    op: NKIOp, operand_map: dict[str, str], ctx: RenderContext, dim_counter: list[int]
+) -> dict[str, str]:
+    """Build a per-op-invocation abstract→concrete axis mapping.
+
+    Abstract axes (P, F, K, M, N) are scoped per op invocation.
+    Operands that already have dim_ids provide concrete mappings;
+    operands without dim_ids get fresh d0, d1, ... IDs.
+    """
+    local: dict[str, str] = {}
+    for slot, axes in op.OPERAND_AXES.items():
+        tensor = ctx.tensors[operand_map[slot]]
+        if tensor.dim_ids:
+            for abstract, concrete in zip(axes, tensor.dim_ids, strict=True):
+                if abstract in local and local[abstract] != concrete:
+                    raise ValueError(
+                        f"Op {op.NAME!r}: axis {abstract!r} maps to both"
+                        f" {local[abstract]!r} and {concrete!r} — check input dim_ids"
+                    )
+                local[abstract] = concrete
+        else:
+            for abstract in axes:
+                if abstract not in local:
+                    local[abstract] = f"d{dim_counter[0]}"
+                    dim_counter[0] += 1
+            tensor.dim_ids = tuple(local[a] for a in axes)
+    return local
+
+
+def _process_ops(
+    ops: list[tuple[NKIOp, dict[str, str], str]], ctx: RenderContext, return_name: str
+) -> tuple[list[dict[str, str]], dict[str, int], dict[str, int]]:
+    """Single forward pass: assign dim IDs, create output tensors, unify tiles.
+
+    Each op gets its own abstract→concrete axis mapping (scoped to
+    that invocation), so two transposes on different tensors get
+    different concrete dim IDs.
+
+    Returns:
+        ``(per_op_axis_maps, dim_tiles, dim_min_tiles)``
+    """
+    dim_counter = [0]
+    consumed = _consumed_names(ops)
+    per_op_maps: list[dict[str, str]] = []
+
+    for op, operand_map, output_name in ops:
+        local = _local_axis_map(op, operand_map, ctx, dim_counter)
+        per_op_maps.append(local)
+        _create_output_tensor(op, operand_map, output_name, ctx, local, return_name, consumed)
+
+    dim_tiles, dim_min_tiles = _unify_tile_sizes(ops, per_op_maps, ctx)
+    return per_op_maps, dim_tiles, dim_min_tiles
+
+
+def _create_output_tensor(
+    op: NKIOp,
+    operand_map: dict[str, str],
+    output_name: str,
+    ctx: RenderContext,
+    local_axis_map: dict[str, str],
+    return_name: str,
+    consumed: set[str],
+) -> None:
+    """Create the output tensor for one op and add it to ctx."""
+    output_shape, output_dtype, output_axes = _resolve_output(op, operand_map, ctx)
+    dim_ids = tuple(local_axis_map[a] for a in output_axes)
+    is_interop = output_name != return_name and output_name in consumed
+    location = "sbuf" if is_interop else "hbm"
+    ctx.tensors[output_name] = Tensor(
+        name=output_name, shape=output_shape, dtype=output_dtype, location=location, dim_ids=dim_ids
+    )
+
+
+def _collect_dim_sizes(ctx: RenderContext) -> dict[str, int]:
+    """Collect actual dimension sizes from all tensors in ctx."""
+    sizes: dict[str, int] = {}
+    for tensor in ctx.tensors.values():
+        for dim_id, size in zip(tensor.dim_ids, tensor.shape, strict=True):
+            sizes[dim_id] = size
+    return sizes
+
+
+def _unify_tile_sizes(
+    ops: list[tuple[NKIOp, dict[str, str], str]], per_op_maps: list[dict[str, str]], ctx: RenderContext
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Compute unified and min tile sizes across all ops.
+
+    For each concrete dimension, takes the max of all ISA limits
+    (unified) and the min of all ISA limits (min), both capped
+    at the actual dimension size.
+
+    Returns:
+        ``(dim_tiles, dim_min_tiles)``
+    """
+    dim_tiles: dict[str, int] = {}
+    dim_min_tiles: dict[str, int] = {}
+    for (op, _, _), local in zip(ops, per_op_maps, strict=True):
+        limits = _ISA_TILE_LIMITS.get(op.NAME, {})
+        for abstract_axis, limit in limits.items():
+            dim_id = local[abstract_axis]
+            dim_tiles[dim_id] = max(dim_tiles.get(dim_id, limit), limit)
+            dim_min_tiles[dim_id] = min(dim_min_tiles.get(dim_id, limit), limit)
+
+    dim_sizes = _collect_dim_sizes(ctx)
+    for dim_id in dim_tiles:
+        dim_tiles[dim_id] = min(dim_tiles[dim_id], dim_sizes[dim_id])
+    for dim_id in dim_min_tiles:
+        dim_min_tiles[dim_id] = min(dim_min_tiles[dim_id], dim_sizes[dim_id])
+    return dim_tiles, dim_min_tiles
+
+
+def _parse_input_spec(spec: tuple) -> tuple[tuple[int, ...], str, tuple[str, ...]]:
+    """Parse an input spec into (shape, dtype, dim_ids).
+
+    Accepts ``(shape, dtype)`` or ``(shape, dtype, dim_ids)``.
+    """
+    dim_ids = tuple(spec[2]) if len(spec) == 3 else ()
+    return spec[0], spec[1], dim_ids
+
+
+def render(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> str:
     """Inspect a math function and generate NKI kernel source.
-
-    Parses the function AST to find NKIOp subclass calls,
-    then calls each op's render() to emit the kernel body.
-    Output HBM tensors are allocated via ``nl.ndarray`` with
-    shape traced from operand axes and dtype from the first input.
 
     Args:
         func: Math function using nkigym ops.
         input_specs: Maps each parameter name to ``(shape, dtype_str)``
-            (e.g. ``{"lhs_T": ((2048, 2048), "bfloat16")}``).
+            or ``(shape, dtype_str, dim_ids)`` where dim_ids is a
+            tuple of concrete dimension labels like ``("d0", "d1")``.
+            Shared dim labels across inputs express shared dimensions.
 
     Returns:
         Complete NKI kernel source string.
@@ -182,30 +292,27 @@ def render(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[i
 
     ctx = RenderContext()
     for name in param_names:
-        shape, dtype_str = input_specs[name]
-        ctx.tensors[name] = Tensor(name=name, shape=shape, dtype=dtype_str, location="hbm")
+        shape, dtype_str, dim_ids = _parse_input_spec(input_specs[name])
+        ctx.tensors[name] = Tensor(name=name, shape=shape, dtype=dtype_str, location="hbm", dim_ids=dim_ids)
 
     ops, return_name = _find_ops(func)
+    _, dim_tiles, dim_min_tiles = _process_ops(ops, ctx, return_name)
+    ctx.dim_tiles = dim_tiles
+    ctx.dim_min_tiles = dim_min_tiles
 
-    for op, operand_map, output_name in ops:
-        output_shape, output_dtype = _resolve_output_shape(op, operand_map, ctx)
-        ctx.tensors[output_name] = Tensor(name=output_name, shape=output_shape, dtype=output_dtype, location="hbm")
-
-    if return_name not in ctx.tensors:
-        raise ValueError(f"Return variable {return_name!r} is not a known tensor")
     return_tensor = ctx.tensors[return_name]
     shape_str = ", ".join(str(s) for s in return_tensor.shape)
 
     lines = _emit_header(func.__name__, param_names, input_specs)
     lines.append(
-        f"{_INDENT}hbm_{return_name} = nl.ndarray(({shape_str}), dtype=nl.{return_tensor.dtype},"
-        f" buffer=nl.shared_hbm)"
+        f"{_INDENT}hbm_{return_name} = nl.ndarray(({shape_str}),"
+        f" dtype=nl.{return_tensor.dtype}, buffer=nl.shared_hbm)"
     )
 
-    for op, operand_map, _ in ops:
-        for line in op.render(ctx, operand_map):
+    for op, operand_map, output_name in ops:
+        is_final = output_name == return_name
+        for line in op.render(ctx, operand_map, output_name, is_final):
             lines.append(f"{_INDENT}{line}")
 
     lines.append(f"{_INDENT}return hbm_{return_name}")
-
     return "\n".join(lines)

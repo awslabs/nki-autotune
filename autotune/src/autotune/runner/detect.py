@@ -55,7 +55,7 @@ def detect_kernel_info(source: str) -> tuple[str, tuple[int, ...]]:
     for node in ast.walk(tree):
         if not func_name:
             func_name = _find_jit_name(node)
-        if not output_shape and _is_hbm_ndarray(node) and node.args:
+        if not output_shape and _is_hbm_ndarray(node) and isinstance(node, ast.Call) and node.args:
             output_shape = _extract_shape_tuple(node.args[0])
     if not func_name:
         raise ValueError("No @nki.jit decorated function found in source")
@@ -149,9 +149,13 @@ def detect_mac_count(source: str) -> int:
             mov_kw = [kw for kw in node.keywords if kw.arg == "moving"]
             if not stat_kw or not mov_kw:
                 continue
+            stat_val = stat_kw[0].value
+            mov_val = mov_kw[0].value
+            if not isinstance(stat_val, ast.Subscript) or not isinstance(mov_val, ast.Subscript):
+                continue
             try:
-                stat_dims = _range_dims(stat_kw[0].value)
-                mov_dims = _range_dims(mov_kw[0].value)
+                stat_dims = _range_dims(stat_val)
+                mov_dims = _range_dims(mov_val)
                 if len(stat_dims) < 2 or len(mov_dims) < 2:
                     continue
                 partition = stat_dims[0]
@@ -191,7 +195,7 @@ def detect_neuron_cores() -> int:
     """
     result = subprocess.run(["neuron-ls", "--json-output"], capture_output=True, text=True, timeout=10)
     if result.returncode != 0:
-        raise RuntimeError(f"neuron-ls failed: {result.stderr[:500]}")
+        raise RuntimeError(f"neuron-ls failed: {result.stderr}")
     devices = json.loads(result.stdout)
     total_cores = sum(d["nc_count"] for d in devices)
     if total_cores == 0:

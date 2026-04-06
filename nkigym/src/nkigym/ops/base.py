@@ -19,12 +19,14 @@ class Tensor:
         shape: Full shape (e.g. ``(2048, 2048)``).
         dtype: Dtype string (e.g. ``"bfloat16"``).
         location: Where it lives: ``"hbm"``, ``"sbuf"``, or ``"psum"``.
+        dim_ids: Axis label for each dimension (e.g. ``("K", "M")``).
     """
 
     name: str
     shape: tuple[int, ...]
     dtype: str
     location: str
+    dim_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -38,10 +40,15 @@ class RenderContext:
     Attributes:
         tensors: All tensors in scope, keyed by name.
         kwargs: Non-tensor keyword arguments from the op call.
+        dim_tiles: Maps axis label to unified tile size (max across ops).
+        dim_min_tiles: Maps axis label to min op tile size.
+            ``interleave_groups = dim_tiles[d] // dim_min_tiles[d]``.
     """
 
     tensors: dict[str, Tensor] = field(default_factory=dict)
     kwargs: dict[str, Any] = field(default_factory=dict)
+    dim_tiles: dict[str, int] = field(default_factory=dict)
+    dim_min_tiles: dict[str, int] = field(default_factory=dict)
 
 
 class NKIOp:
@@ -67,13 +74,17 @@ class NKIOp:
         """CPU simulation using numpy at float64 precision."""
 
     @abstractmethod
-    def render(self, ctx: RenderContext, operand_map: dict[str, str]) -> list[str]:
+    def render(self, ctx: RenderContext, operand_map: dict[str, str], output_name: str, is_final: bool) -> list[str]:
         """Emit NKI source lines for this op.
 
         Args:
-            ctx: Running render context with tensors and kwargs.
+            ctx: Running render context with tensors, dim_tiles, and kwargs.
             operand_map: Maps op slot name to tensor name in ctx
                 (e.g. ``{"stationary": "lhs_T", "moving": "rhs"}``).
+            output_name: Name of the output tensor.
+            is_final: Whether this op writes the final kernel output
+                (degree-1 SBUF + DMA store to HBM) or an inter-op
+                intermediate (full-range SBUF, no DMA store).
 
         Returns:
             List of NKI source lines (without base indent).

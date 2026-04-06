@@ -69,7 +69,7 @@ def _format_failures(failures: list[ProfileResult]) -> list[str]:
             lines.append(f"\n{len(failures)} failures:")
         error = r.hardware_run
         assert isinstance(error, str)
-        lines.append(f"  {r.kernel_name}: {error[:200]}")
+        lines.append(f"  {r.kernel_name}: {error}")
     return lines
 
 
