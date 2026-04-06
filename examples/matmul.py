@@ -14,53 +14,40 @@ import numpy as np
 
 import nkigym
 from autotune.runner.api import remote_profile
-from autotune.runner.types import ProfileConfig
-
-CACHE_DIR = "/home/ubuntu/cache/matmul_test"
-
-K, M, N = 2048, 2048, 2048
-MAC_COUNT = K * M * N
-
-GOLDEN_SOURCE = """\
-import numpy as np
 
 
-def golden_matmul(a, b):
-    return a.astype(np.float64).T @ b.astype(np.float64)
-"""
-
-
-def matmul_numpy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Matrix multiply with numpy: a.T @ b.
+def matmul_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Matrix multiply with numpy: lhs_T.T @ b.
 
     Args:
-        a: Stationary tensor of shape (K, M).
-        b: Moving tensor of shape (K, N).
+        lhs_T: Stationary tensor of shape (K, M).
+        rhs: Moving tensor of shape (K, N).
 
     Returns:
         Output tensor of shape (M, N).
     """
-    return a.T @ b
+    return lhs_T.T @ rhs
 
 
-def matmul_nkigym(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def matmul_nkigym(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     """Matrix multiply using nkigym logical ops.
 
     Args:
-        a: Stationary tensor of shape (K, M).
-        b: Moving tensor of shape (K, N).
+        lhs_T: Stationary tensor of shape (K, M).
+        rhs: Moving tensor of shape (K, N).
 
     Returns:
         Output tensor of shape (M, N).
     """
-    output = nkigym.nc_matmul(a, b)
+    output = nkigym.nc_matmul(lhs_T, rhs)
     return output
 
 
-HOSTS = ["gym-1", "gym-2", "gym-3", "gym-4", "gym-5"]
-
-
 if __name__ == "__main__":
+
+    K, M, N = 2048, 2048, 2048
+    atol = 1e-10
+    rtol = 1e-10
 
     a = np.random.randn(K, M)
     b = np.random.randn(K, N)
@@ -69,23 +56,23 @@ if __name__ == "__main__":
     out_gym = matmul_nkigym(a, b)
     max_diff = np.max(np.abs(out_np - out_gym))
     print(f"max |diff|: {max_diff:.2e}")
-    np.testing.assert_allclose(out_gym, out_np, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(out_gym, out_np, rtol=rtol, atol=atol)
     print("PASS: matmul nkigym matches numpy")
-
     kernel_src = nkigym.render(matmul_nkigym, a=a, b=b)
+
+    kernel_job = {
+        "kernel_source": kernel_src,
+        "kernel_name": "matmul_nkigym_kernel",
+        "input_specs": {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")},
+        "golden_numpy": matmul_numpy,
+        "atol": atol,
+        "rtol": rtol,
+    }
     output = remote_profile(
-        kernels={"matmul_kernel.py": kernel_src},
-        input_specs={"a": ((K, M), "bfloat16"), "b": ((K, N), "bfloat16")},
-        hosts=HOSTS,
-        cache_dir=CACHE_DIR,
-        config=ProfileConfig(
-            mac_count=MAC_COUNT,
-            golden_source=GOLDEN_SOURCE,
-            golden_func_name="golden_matmul",
-            atol=1e-3,
-            rtol=1e-3,
-            warmup=10,
-            iters=100,
-        ),
+        hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5"],
+        cache_dir="/home/ubuntu/cache/matmul_test",
+        warmup=10,
+        iters=100,
+        kernels=[kernel_job],
     )
     print(output)
