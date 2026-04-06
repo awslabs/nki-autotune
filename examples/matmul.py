@@ -59,13 +59,14 @@ if __name__ == "__main__":
     print(f"max |diff|: {max_diff:.2e}")
     np.testing.assert_allclose(out_gym, out_np, rtol=1e-10, atol=1e-10)
     print("PASS: matmul nkigym matches numpy")
-    kernel_src = nkigym.render(matmul_nkigym, lhs_T=lhs_T, rhs=rhs)
+    input_specs = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
+    kernel_src = nkigym.render(matmul_nkigym, input_specs=input_specs)
 
     golden_source = inspect.getsource(matmul_numpy)
     kernels = {
         "matmul_nkigym": KernelJob(
             source=kernel_src,
-            input_specs={"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")},
+            input_specs=input_specs,
             golden_source=golden_source,
             golden_func_name="matmul_numpy",
             atol=1e-3,
