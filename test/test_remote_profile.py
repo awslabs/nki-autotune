@@ -134,6 +134,8 @@ def _copy_job() -> KernelJob:
         input_specs={"a": ((128, 512), "bfloat16")},
         golden_source=GOLDEN_COPY,
         golden_func_name="golden_copy",
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 
@@ -144,6 +146,8 @@ def _add_job() -> KernelJob:
         input_specs={"a": ((128, 512), "bfloat16"), "b": ((128, 512), "bfloat16")},
         golden_source=GOLDEN_ADD,
         golden_func_name="golden_add",
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 
@@ -290,6 +294,8 @@ def bad_func(a):
                     input_specs={"a": ((128, 512), "bfloat16")},
                     golden_source=GOLDEN_COPY,
                     golden_func_name="golden_copy",
+                    atol=1e-2,
+                    rtol=1e-2,
                 )
             }
         )

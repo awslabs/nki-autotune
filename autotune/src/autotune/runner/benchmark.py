@@ -135,6 +135,12 @@ def benchmark_one(
 def simulate_one(nki_path: str, func_name: str, kernel_kwargs: dict[str, Any]) -> tuple[np.ndarray, str]:
     """Run a kernel through the NKI CPU simulator.
 
+    The simulator converts low-precision inputs (bfloat16, float8) to
+    float32 at the storage level before execution (unless NKI_PRECISE_FP
+    is set). nc_matmul then operates entirely in float32. This means
+    the CPU sim tests float32 accumulation order (tiled vs monolithic),
+    not low-precision arithmetic.
+
     Args:
         nki_path: Path to the kernel source file.
         func_name: Name of the @nki.jit decorated function.

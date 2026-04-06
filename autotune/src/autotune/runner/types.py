@@ -59,8 +59,8 @@ class KernelJob(NamedTuple):
     input_specs: dict[str, tuple[tuple[int, ...], str]]
     golden_source: str
     golden_func_name: str
-    atol: float = 1e-2
-    rtol: float = 1e-2
+    atol: float
+    rtol: float
 
 
 class CompileResult(NamedTuple):

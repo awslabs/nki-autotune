@@ -64,10 +64,16 @@ def _cpu_sim_status(sim_output: np.ndarray, sim_error: str, golden: np.ndarray, 
         try:
             np.testing.assert_allclose(sim_output, golden, atol=atol, rtol=rtol)
             abs_diff = np.abs(sim_output.astype(np.float64) - golden.astype(np.float64))
-            max_diff = float(np.max(abs_diff))
-            abs_golden = np.abs(golden.astype(np.float64))
-            max_pct = float(np.max(abs_diff / np.where(abs_golden > 0, abs_golden, 1.0))) * 100
-            status = f"PASS: max |diff|: {max_diff:.2e}, max |%diff|: {max_pct:.2e}%"
+            threshold = atol + rtol * np.abs(golden.astype(np.float64))
+            ratio = abs_diff / threshold
+            worst_idx = int(np.argmax(ratio))
+            worst_diff = float(abs_diff.flat[worst_idx])
+            worst_thresh = float(threshold.flat[worst_idx])
+            worst_margin = float(ratio.flat[worst_idx])
+            status = (
+                f"PASS: atol+rtol*|desired|={worst_thresh:.2e},"
+                f" |diff|={worst_diff:.2e}, worst_margin={worst_margin:.4f}"
+            )
         except AssertionError as e:
             status = f"FAIL: {str(e)[:200]}"
     return status

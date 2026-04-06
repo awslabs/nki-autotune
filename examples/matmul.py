@@ -49,8 +49,6 @@ def matmul_nkigym(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 if __name__ == "__main__":
 
     K, M, N = 2048, 2048, 2048
-    atol = 1e-10
-    rtol = 1e-10
 
     lhs_T = np.random.randn(K, M)
     rhs = np.random.randn(K, N)
@@ -59,7 +57,7 @@ if __name__ == "__main__":
     out_gym = matmul_nkigym(lhs_T, rhs)
     max_diff = np.max(np.abs(out_np - out_gym))
     print(f"max |diff|: {max_diff:.2e}")
-    np.testing.assert_allclose(out_gym, out_np, rtol=rtol, atol=atol)
+    np.testing.assert_allclose(out_gym, out_np, rtol=1e-10, atol=1e-10)
     print("PASS: matmul nkigym matches numpy")
     kernel_src = nkigym.render(matmul_nkigym, lhs_T=lhs_T, rhs=rhs)
 
@@ -70,14 +68,14 @@ if __name__ == "__main__":
             input_specs={"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")},
             golden_source=golden_source,
             golden_func_name="matmul_numpy",
-            atol=atol,
-            rtol=rtol,
+            atol=1e-3,
+            rtol=1e-3,
         )
     }
 
     output = remote_profile(
         kernels=kernels,
-        hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5"],
+        hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5", "gym-6"],
         cache_dir="/home/ubuntu/cache/matmul_test",
         warmup=10,
         iters=100,
