@@ -16,6 +16,7 @@ import numpy as np
 
 import nkigym
 from autotune.runner.api import remote_profile
+from autotune.runner.compare import assert_close
 from autotune.runner.types import KernelJob
 
 
@@ -55,12 +56,10 @@ if __name__ == "__main__":
 
     out_np = matmul_numpy(lhs_T, rhs)
     out_gym = matmul_nkigym(lhs_T, rhs)
-    max_diff = np.max(np.abs(out_np - out_gym))
-    print(f"max |diff|: {max_diff:.2e}")
-    np.testing.assert_allclose(out_gym, out_np, rtol=1e-10, atol=1e-10)
-    print("PASS: matmul nkigym matches numpy")
+    status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
+    print(status)
     input_specs = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-    kernel_src = nkigym.render(matmul_nkigym, input_specs=input_specs)
+    kernel_src = nkigym.render(matmul_nkigym, input_specs=input_specs, lhs_T=lhs_T, rhs=rhs)
 
     golden_source = inspect.getsource(matmul_numpy)
     kernels = {

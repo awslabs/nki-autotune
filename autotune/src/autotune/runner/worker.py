@@ -23,6 +23,7 @@ import numpy as np
 from nkipy.runtime import BaremetalExecutor
 
 from autotune.runner.benchmark import benchmark_one, compute_golden, generate_tensors, simulate_one
+from autotune.runner.compare import assert_close
 from autotune.runner.compile import compile_one, init_compile_worker
 from autotune.runner.detect import detect_kernel_info, detect_mac_count, detect_neuron_cores
 from autotune.runner.types import (
@@ -57,23 +58,10 @@ def _cpu_sim_status(sim_output: np.ndarray, sim_error: str, golden: np.ndarray, 
 
     Compares NKI CPU sim output against golden numpy output.
     """
-    status = ""
-    if sim_error:
-        status = f"FAIL: {sim_error[:200]}"
-    else:
+    status = f"FAIL: {sim_error[:200]}" if sim_error else ""
+    if not status:
         try:
-            np.testing.assert_allclose(sim_output, golden, atol=atol, rtol=rtol)
-            abs_diff = np.abs(sim_output.astype(np.float64) - golden.astype(np.float64))
-            threshold = atol + rtol * np.abs(golden.astype(np.float64))
-            ratio = abs_diff / threshold
-            worst_idx = int(np.argmax(ratio))
-            worst_diff = float(abs_diff.flat[worst_idx])
-            worst_thresh = float(threshold.flat[worst_idx])
-            worst_margin = float(ratio.flat[worst_idx])
-            status = (
-                f"PASS: atol+rtol*|desired|={worst_thresh:.2e},"
-                f" |diff|={worst_diff:.2e}, worst_margin={worst_margin:.4f}"
-            )
+            status = assert_close(sim_output, golden, atol=atol, rtol=rtol)
         except AssertionError as e:
             status = f"FAIL: {str(e)[:200]}"
     return status
