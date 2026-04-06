@@ -14,10 +14,11 @@ import inspect
 
 import numpy as np
 
-import nkigym
 from autotune.runner.api import remote_profile
 from autotune.runner.compare import assert_close
 from autotune.runner.types import KernelJob
+from nkigym.codegen.render import render
+from nkigym.ops.matmul import NKIMatmul
 
 
 def matmul_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -43,7 +44,7 @@ def matmul_nkigym(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     Returns:
         Output tensor of shape (M, N).
     """
-    output = nkigym.nc_matmul(lhs_T, rhs)
+    output = NKIMatmul()(stationary=lhs_T, moving=rhs)
     return output
 
 
@@ -59,7 +60,7 @@ if __name__ == "__main__":
     status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
     print(status)
     input_specs = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-    kernel_src = nkigym.render(matmul_nkigym, input_specs=input_specs, lhs_T=lhs_T, rhs=rhs)
+    kernel_src = render(matmul_nkigym, input_specs=input_specs)
 
     golden_source = inspect.getsource(matmul_numpy)
     kernels = {
@@ -80,4 +81,3 @@ if __name__ == "__main__":
         warmup=10,
         iters=100,
     )
-    print(output)

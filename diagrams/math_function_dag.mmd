@@ -1,0 +1,20 @@
+graph TD
+    Q([Input: Q]):::io --> Op0["Op 0: nc_transpose"]
+    K([Input: K]):::io --> Op1["Op 1: nc_transpose"]
+    Op0 -->|Q_t| Op2["Op 2: nc_matmul"]
+    Op1 -->|K_t| Op2
+    Op2 -->|S| Op3["Op 3: affine_select"]
+    Op3 -->|masked_S| Op4["Op 4: tensor_scalar"]
+    scale([Input: scale]):::io --> Op4
+    Op4 -->|scaled_S| Op5["Op 5: tensor_reduce(max)"]
+    Op4 -->|scaled_S| Op6["Op 6: activation_reduce"]
+    Op5 -->|neg_max_S| Op6
+    Op6 -->|sum_exp| Op7["Op 7: activation(reciprocal)"]
+    Op6 -->|exp_S| Op8["Op 8: nc_transpose"]
+    Op7 -->|inv_sum| Op10["Op 10: tensor_scalar(multiply)"]
+    Op8 -->|exp_S_t| Op9["Op 9: nc_matmul"]
+    V([Input: V]):::io --> Op9
+    Op9 -->|attn| Op10
+    Op10 --> output([Output: output]):::io
+
+    classDef io fill:#f9a825,stroke:#f57f17,color:#000
