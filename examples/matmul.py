@@ -44,8 +44,8 @@ def matmul_nkigym(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     Returns:
         Output tensor of shape (M, N).
     """
-    output = NKIMatmul()(stationary=lhs_T, moving=rhs)
-    return output
+    haha = NKIMatmul()(stationary=lhs_T, moving=rhs)
+    return haha
 
 
 if __name__ == "__main__":

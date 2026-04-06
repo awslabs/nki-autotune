@@ -46,6 +46,4 @@ class NKIMatmul(NKIOp):
         Returns:
             List of NKI source lines.
         """
-        print(ctx)
-        print(operand_map)
         return ["# dummy_line"]
