@@ -267,12 +267,12 @@ def _render_transpose(cfg: dict) -> list[str]:
     src_sl = _src_slice(cfg["from_hbm"], min_P, min_F, bp, bf, cp, cf, cfg["gpi_P"], cfg["gpi_F"])
     out_sl = _out_slice(cfg["is_final"], min_P, min_F, bp, bf, cp, cf, cfg["gpi_P"], cfg["gpi_F"])
 
-    lines.append(f"for {bf} in nl.affine_range({cfg['num_blocks_F']}):")
-    lines.append(f"{_I1}for i_tile_{dim_F} in nl.affine_range(1):")
-    lines.append(f"{_I2}for {bp} in nl.affine_range({cfg['num_blocks_P']}):")
-    lines.append(f"{_I3}for i_tile_{dim_P} in nl.affine_range(1):")
-    lines.append(f"{_I4}for {cp} in nl.affine_range({cfg['chunks_P']}):")
-    lines.append(f"{_I5}for {cf} in nl.affine_range({cfg['chunks_F']}):")
+    lines.append(f"for {bf} in range({cfg['num_blocks_F']}):")
+    lines.append(f"{_I1}for i_tile_{dim_F} in range(1):")
+    lines.append(f"{_I2}for {bp} in range({cfg['num_blocks_P']}):")
+    lines.append(f"{_I3}for i_tile_{dim_P} in range(1):")
+    lines.append(f"{_I4}for {cp} in range({cfg['chunks_P']}):")
+    lines.append(f"{_I5}for {cf} in range({cfg['chunks_F']}):")
 
     if cfg["from_hbm"]:
         p_rng = hbm_chunk_range(bp, cfg["unified_P"], cp, cfg["op_P"])

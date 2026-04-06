@@ -83,7 +83,7 @@ class ProfileResult(NamedTuple):
     mac_count: int
     mfu: float
     cpu_sim: dict
-    hardware_run: bool | str
+    hardware_output: str
 
 
 class BenchmarkConfig(NamedTuple):
@@ -113,7 +113,7 @@ def _sim_not_run() -> dict:
     return {"passed": False, "error": "not run"}
 
 
-def make_failure(kernel_name: str, hardware_run: str, mac_count: int, cpu_sim: dict | None = None) -> ProfileResult:
+def make_failure(kernel_name: str, hardware_output: str, mac_count: int, cpu_sim: dict | None = None) -> ProfileResult:
     """Create a failed ProfileResult."""
     return ProfileResult(
         kernel_name=kernel_name,
@@ -124,7 +124,7 @@ def make_failure(kernel_name: str, hardware_run: str, mac_count: int, cpu_sim: d
         mac_count=mac_count,
         mfu=0.0,
         cpu_sim=cpu_sim if cpu_sim is not None else _sim_not_run(),
-        hardware_run=hardware_run,
+        hardware_output=hardware_output,
     )
 
 

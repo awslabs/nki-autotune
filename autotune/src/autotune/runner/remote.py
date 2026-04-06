@@ -262,7 +262,7 @@ def _write_results_json(
     cache_dir: str, kernels: dict[str, KernelJob], results: list[ProfileResult], profiler: "RemoteProfiler"
 ) -> None:
     """Write results.json with metrics and per-kernel data."""
-    successes = [r for r in results if r.hardware_run is True]
+    successes = [r for r in results if r.hardware_output.startswith("[")]
     times = [r.min_ms for r in successes]
 
     kernel_entries = []

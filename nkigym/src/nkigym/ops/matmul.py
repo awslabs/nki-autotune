@@ -108,16 +108,16 @@ def _emit_loops(
         List of loop source lines.
     """
     return [
-        f"for i_block_{dim_M} in nl.affine_range({num_blocks_M}):",
-        f"{_I1}for i_tile_{dim_M} in nl.affine_range(1):",
-        f"{_I2}for i_block_{dim_N} in nl.affine_range({num_blocks_N}):",
-        f"{_I3}for i_tile_{dim_N} in nl.affine_range(1):",
-        f"{_I4}for i_interleave_group_{dim_M} in nl.affine_range({chunks_M}):",
-        f"{_I5}for i_interleave_group_{dim_N} in nl.affine_range({chunks_N}):",
+        f"for i_block_{dim_M} in range({num_blocks_M}):",
+        f"{_I1}for i_tile_{dim_M} in range(1):",
+        f"{_I2}for i_block_{dim_N} in range({num_blocks_N}):",
+        f"{_I3}for i_tile_{dim_N} in range(1):",
+        f"{_I4}for i_interleave_group_{dim_M} in range({chunks_M}):",
+        f"{_I5}for i_interleave_group_{dim_N} in range({chunks_N}):",
         f"{_I6}nisa.memset(dst={psum_name}[{psum_d1}], value=0.0)",
-        f"{_I6}for i_block_{dim_K} in nl.affine_range({num_blocks_K}):",
-        f"{_I6}{_I1}for i_tile_{dim_K} in nl.affine_range(1):",
-        f"{_I6}{_I2}for i_interleave_group_{dim_K} in nl.affine_range({chunks_K}):",
+        f"{_I6}for i_block_{dim_K} in range({num_blocks_K}):",
+        f"{_I6}{_I1}for i_tile_{dim_K} in range(1):",
+        f"{_I6}{_I2}for i_interleave_group_{dim_K} in range({chunks_K}):",
     ]
 
 

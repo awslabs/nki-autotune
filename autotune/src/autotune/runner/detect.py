@@ -100,14 +100,16 @@ def _range_dims(subscript: ast.Subscript) -> list[int]:
 
 
 def _enclosing_loop_product(node: ast.AST, parents: dict[int, ast.AST]) -> int:
-    """Walk up from node through parents, multiplying nl.affine_range(N) trip counts."""
+    """Walk up from node through parents, multiplying range(N) trip counts."""
     product = 1
     current = node
     while id(current) in parents:
         parent = parents[id(current)]
         if isinstance(parent, ast.For) and isinstance(parent.iter, ast.Call):
             call_str = ast.unparse(parent.iter.func) if isinstance(parent.iter.func, ast.Attribute) else ""
-            if call_str in ("nl.affine_range", "nl.sequential_range") and parent.iter.args:
+            if not call_str:
+                call_str = ast.unparse(parent.iter.func) if isinstance(parent.iter.func, ast.Name) else ""
+            if call_str in ("range", "nl.affine_range", "nl.sequential_range") and parent.iter.args:
                 arg = parent.iter.args[0]
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
                     product *= arg.value
