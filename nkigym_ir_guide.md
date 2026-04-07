@@ -266,9 +266,25 @@ Walk through the forward pass. Inputs Q, K, V have no dim_ids — the pass disco
 
 5. **`nc_matmul(S_t, V)`** — S_t has (d2, d0) → K=d2, M=d0. V has no dim_ids. K=d2 already in local map, allocate N=d4. Assign **V → (d2, d4)**. Output → **output gets (d0, d4)**.
 
-## 4. Initial NKI Kernel Codegen
+## 4. Initial KernelIR
 
-Each op's `render()` method emits a self-contained block: buffer allocations, loop nest, DMA loads, ISA call, and writeback. The renderer concatenates these blocks in math function order to produce the kernel.
+`KernelIR` is the intermediate representation that carries all state needed to render and transform a kernel. `build_ir(func, input_specs)` creates the base IR from a math function — it runs the dimension analysis (§3), computes tile sizes and interleave factors, then wraps everything in a `KernelIR` with each op in its own singleton fusion group (no transforms applied).
+
+```python
+@dataclass
+class KernelIR:
+    ops: list[tuple[NKIOp, dict[str, str], str]]
+    per_op_maps: list[dict[str, str]]
+    ctx: RenderContext
+    return_name: str
+    func_name: str
+    param_names: list[str]
+    input_specs: dict[str, tuple[tuple[int, ...], str]]
+    fusion_groups: list[list[int]]
+    buffer_degrees: dict[str, int]
+```
+
+`build_ir` performs three steps: (1) parse the math function to discover ops and their operand maps via AST inspection, (2) run dimension analysis — assign dim IDs, unify shared dimensions, create output tensors (§3), and (3) compute per-dimension tile sizes and interleave factors (§4.1–4.2). The result is a `KernelIR` ready for rendering (§4.3) or transforms (§5).
 
 ### 4.1 Determine Dimension Tile Size
 
@@ -301,7 +317,13 @@ for i_interleave_group_d{id} in range(max_tile_size/op_tile_size):
     (op_tile_size/min_tile_size, min_tile_size).reshape((1, op_tile_size))
 ```
 
-### 4.3 Per-Op Codegen Example: Double Matmul
+### 4.3 Rendering NKI Source from KernelIR
+
+`render_ir(ir)` converts a `KernelIR` to a complete NKI kernel source string. For the base IR, each op sits in its own singleton fusion group (`[[0], [1], ...]`), so each gets its own self-contained code block: buffer allocations, loop nest, DMA loads, ISA call, and writeback. The renderer iterates over fusion groups in order and concatenates their output.
+
+When transforms modify the `KernelIR` (changing fusion groups, loop order, etc.), `render_ir` produces the transformed kernel — fused groups emit shared loop nests, reordered dimensions change loop nesting, and adjusted `tiles_per_block` changes block/tile loop bounds. The same `render_ir` handles both base and transformed IRs.
+
+### 4.4 Example: Double Matmul
 
 **Naming conventions:** loop variables `i_block_d{id}`, `i_tile_d{id}`, `i_interleave_group_d{id}`; buffers `sbuf_{name}` (SBUF), `psum_{name}` (PSUM).
 
@@ -349,46 +371,79 @@ Matmul reshapes `(4, 128)` → `(1, 512)` and processes in 1 group. Transpose re
 
 ## 5. Programmatic Transforms
 
-Programmatic transforms are mechanical rearrangements of the loop nest that do not change the math — they only change how and when ops execute. All transforms must respect the topological computation order: every op's inputs must be computed before the op runs. The math function (§1) defines one valid topological order, and the eager mode variant follows it exactly. Transforms may reorder loops and fuse ops, but the resulting execution order must remain a valid topological sort of the computation graph — no op can consume a tensor that hasn't been produced yet.
+Programmatic transforms are mechanical rearrangements of the loop nest that do not change the math — they only change how and when ops execute. All transforms must respect the topological computation order: every op's inputs must be computed before the op runs. The math function (§1) defines one valid topological order, and the initial KernelIR (§4) follows it exactly. Transforms may reorder loops and fuse ops, but the resulting execution order must remain a valid topological sort of the computation graph — no op can consume a tensor that hasn't been produced yet.
+
+Transforms operate on the `KernelIR` (§4). Each transform produces a new `KernelIR` with modified transform state (e.g., different `fusion_groups`) while sharing immutable state (`ops`, `per_op_maps`, `ctx`).
+
+Each transform subclass implements `candidates(ir) → list[KernelIR]`, returning every possible single-step application of that transform. Each candidate is a clone with the relevant state modified.
+
+```python
+class Transform(ABC):
+    NAME: ClassVar[str] = ""
+
+    @abstractmethod
+    def candidates(self, ir: KernelIR) -> list[KernelIR]:
+        ...
+```
+
+Transforms compose: applying loop fusion to the base IR produces a set of variants; applying loop reordering to any of those produces further variants. The search (§7) explores this space by randomly walking the graph of transform applications.
 
 Four transforms generate the search space.
 
 ### 5.1 Loop Fusion
 
-Adjacent ops whose loops iterate over the same dimensions can share a single loop nest instead of having separate nests. Fusion eliminates redundant loop overhead and — critically — keeps intermediate tiles on-chip between producer and consumer, avoiding HBM round-trips. A dimension is **blocking** when the full reduction over that dimension must complete before a valid result exists (e.g., matmul accumulation, reduce_max). A dimension is **non-blocking** when partial results are already correct, just incomplete. Fusion is legal across any non-blocking boundary. It is forbidden across a blocking boundary for the blocking dimension: the reduction must complete before the consumer starts.
+Two adjacent ops can share a single loop nest when: (1) the consumer reads the producer's output, and (2) all dimensions of the intermediate tensor are non-blocking for both producer and consumer. Fusion keeps intermediate tiles on-chip between producer and consumer, avoiding HBM round-trips. A dimension is **blocking** when the full reduction over that dimension must complete before a valid result exists (e.g., matmul accumulation, reduce_max). A dimension is **non-blocking** when partial results are already correct, just incomplete. If any intermediate dimension is blocking for either op, fusion is rejected.
 
-**Before** — Ops 3 and 4 each have their own loop nest; `sbuf_masked_S` is a full-range buffer:
+In double matmul, Ops 2 (matmul $\rightarrow$ S) and 3 (transpose S $\rightarrow$ S_t): the consumer (transpose) reads the producer's output (S), and the intermediate S has dims (d0, d2) — both are output axes of the matmul (non-blocking) and input axes of the transpose (non-blocking). Fusion is legal. The matmul's d1 reduction stays as a private sub-loop inside the fused body, completing before the transpose reads the result. Contrast with Ops 3+4: the intermediate S_t has dims (d2, d0), and d2 is blocking for Op 4 (matmul accumulation axis). Fusion is rejected.
+
+**Before** — Ops 2 and 3 each have their own loop nest; `sbuf_S` is a full-range buffer:
 
 ```python
-""" Op 3: nisa.affine_select -- S(d0, d2) -> masked_S(d0, d2) """
-sbuf_masked_S = nl.ndarray((128, 32, 32, 128), dtype=Q.dtype, buffer=nl.sbuf)
-for i_block_d0 in nl.affine_range(32):
+""" Op 2: nisa.nc_matmul -- Q_t x K_t -> S(d0, d2) """
+sbuf_S = nl.ndarray((128, 16, 16, 128), dtype=Q.dtype, buffer=nl.sbuf)
+for i_block_d0 in nl.affine_range(16):
     for i_tile_d0 in nl.affine_range(1):
-        for i_block_d2 in nl.affine_range(8):
+        for i_block_d2 in nl.affine_range(4):
             for i_tile_d2 in nl.affine_range(1):
-                nisa.affine_select(dst=sbuf_masked_S[...], on_true_tile=sbuf_S[...], ...)
+                psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
+                nisa.memset(dst=psum_S[0:128, 0:512], value=0.0)
+                for i_block_d1 in nl.affine_range(1):
+                    for i_tile_d1 in nl.affine_range(1):
+                        nisa.nc_matmul(dst=psum_S[...], stationary=sbuf_Q_t[...], moving=sbuf_K_t[...])
+                nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
 
-""" Op 4: nisa.tensor_scalar -- masked_S(d0, d2) x scale -> scaled_S(d0, d2) """
-sbuf_scaled_S = nl.ndarray((128, 32, 32, 128), dtype=Q.dtype, buffer=nl.sbuf)
-for i_block_d0 in nl.affine_range(32):
-    for i_tile_d0 in nl.affine_range(1):
-        for i_block_d2 in nl.affine_range(8):
-            for i_tile_d2 in nl.affine_range(1):
-                nisa.tensor_scalar(dst=sbuf_scaled_S[...], data=sbuf_masked_S[...], op0=nl.multiply, operand0=scale)
+""" Op 3: nisa.nc_transpose -- S(d0, d2) -> S_t(d2, d0) """
+psum_S_t_tmp = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.psum)
+sbuf_S_t = nl.ndarray((128, 16, 16, 128), dtype=Q.dtype, buffer=nl.sbuf)
+for i_block_d2 in nl.affine_range(4):
+    for i_tile_d2 in nl.affine_range(1):
+        for i_block_d0 in nl.affine_range(16):
+            for i_tile_d0 in nl.affine_range(1):
+                for i_ig_d2 in nl.affine_range(4):
+                    nisa.nc_transpose(dst=psum_S_t_tmp[...], data=sbuf_S[...])
+                    nisa.tensor_copy(dst=sbuf_S_t[...], src=psum_S_t_tmp[...])
 ```
 
-**After** — single fused loop nest; `sbuf_masked_S` shrinks to per-tile:
+**After** — fusion merges groups `[[2], [3]]` → `[[2, 3]]` and sets `buffer_degrees = {"S": 1}`. The renderer derives the degree-1 buffer `(128, 1, 4, 128)` from this:
 
 ```python
-""" Ops 3+4 (fused): affine_select + tensor_scalar -> scaled_S(d0, d2) """
-sbuf_scaled_S = nl.ndarray((128, 32, 32, 128), dtype=Q.dtype, buffer=nl.sbuf)
-for i_block_d0 in nl.affine_range(32):
+""" Ops 2+3 (fused): matmul + transpose -> S_t(d2, d0) """
+sbuf_S_t = nl.ndarray((128, 16, 16, 128), dtype=Q.dtype, buffer=nl.sbuf)
+for i_block_d0 in nl.affine_range(16):
     for i_tile_d0 in nl.affine_range(1):
-        for i_block_d2 in nl.affine_range(8):
+        for i_block_d2 in nl.affine_range(4):
             for i_tile_d2 in nl.affine_range(1):
-                sbuf_masked_S = nl.ndarray((128, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)  # degree-1, not full-range
-                nisa.affine_select(dst=sbuf_masked_S[...], on_true_tile=sbuf_S[...], ...)
-                nisa.tensor_scalar(dst=sbuf_scaled_S[...], data=sbuf_masked_S[...], op0=nl.multiply, operand0=scale)
+                psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
+                nisa.memset(dst=psum_S[0:128, 0:512], value=0.0)
+                for i_block_d1 in nl.affine_range(1):
+                    for i_tile_d1 in nl.affine_range(1):
+                        nisa.nc_matmul(dst=psum_S[...], stationary=sbuf_Q_t[...], moving=sbuf_K_t[...])
+                sbuf_S = nl.ndarray((128, 1, 4, 128), dtype=Q.dtype, buffer=nl.sbuf)  # degree-1, not full-range
+                nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
+                for i_ig_d2 in nl.affine_range(4):
+                    psum_S_t_tmp = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.psum)
+                    nisa.nc_transpose(dst=psum_S_t_tmp[...], data=sbuf_S[...])
+                    nisa.tensor_copy(dst=sbuf_S_t[...], src=psum_S_t_tmp[...])
 ```
 
 ### 5.2 Load Placement
@@ -497,6 +552,54 @@ for i_block_d2 in nl.affine_range(2):                           # 2 blocks (8 / 
                 nisa.nc_matmul(dst=psum_S[...], stationary=sbuf_Q_t[...], moving=sbuf_K_t[...])
         nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
 ```
+
+### 5.5 Multi-Buffer
+
+When two ops are fused (§5.1), their intermediate buffer defaults to degree 1 — it holds one tile at a time. The multi-buffer transform increases the degree to N, allowing the buffer to hold N tiles simultaneously. This enables the hardware to pipeline the producer of iteration k+1 while the consumer of iteration k is still running.
+
+The transform only modifies `buffer_degrees` in the KernelIR. The renderer reads the degree and sizes the buffer accordingly: `num_tiles` along the fused dimension becomes N instead of 1.
+
+`buffer_degrees` is always explicit — every intra-group intermediate has an entry, even when the degree is 1. Loop fusion populates the entry (degree 1), and multi-buffer modifies it. This matches the "always emit loops even if trips=1" convention: no implicit defaults.
+
+**Before** — fused Ops 2+3, degree 1: `sbuf_S` holds one tile `(128, 1, 4, 128)`:
+
+```python
+fusion_groups = [[0], [1], [2, 3], [4]]
+buffer_degrees = {"S": 1}
+```
+
+```python
+""" Ops 2+3 (fused): sbuf_S degree=1 """
+for i_block_d0 in nl.affine_range(16):
+    for i_tile_d0 in nl.affine_range(1):
+        for i_block_d2 in nl.affine_range(4):
+            for i_tile_d2 in nl.affine_range(1):
+                """ producer: matmul -> S (one tile) """
+                sbuf_S = nl.ndarray((128, 1, 4, 128), dtype=Q.dtype, buffer=nl.sbuf)
+                ...
+                """ consumer: transpose S -> S_t (reads same tile) """
+                ...
+```
+
+**After** — degree 2: `sbuf_S` holds two tiles `(128, 2, 4, 128)`, enabling pipelined overlap:
+
+```python
+fusion_groups = [[0], [1], [2, 3], [4]]
+buffer_degrees = {"S": 2}
+```
+
+```python
+""" Ops 2+3 (fused): sbuf_S degree=2 (double-buffered) """
+for i_block_d0 in nl.affine_range(16):
+    for i_tile_d0 in nl.affine_range(1):
+        for i_block_d2 in nl.affine_range(4):
+            for i_tile_d2 in nl.affine_range(1):
+                """ producer writes slot (iter % 2), consumer reads slot ((iter-1) % 2) """
+                sbuf_S = nl.ndarray((128, 2, 4, 128), dtype=Q.dtype, buffer=nl.sbuf)
+                ...
+```
+
+The buffer's P-axis `num_tiles` grows from 1 to 2. The producer and consumer address different slots, allowing the hardware scheduler to overlap them across loop iterations.
 
 ## 6. Math Transforms
 
@@ -834,7 +937,62 @@ for i_block_d2 in nl.affine_range(8):                                          "
 
 `sbuf_exp_S` shrinks to per-tile since it is produced and consumed within the same d2 iteration. Op 7 is topologically independent from Op 9 (§1 DAG). Op 10 depends on Op 9's output but runs after the d2 reduction completes. Neither is part of this transform.
 
-## 7. Future Work
+## 7. Search Interface
+
+The search finds high-performing kernel variants by randomly exploring the transform graph and benchmarking each variant on hardware.
+
+### 7.1 Transform Graph
+
+The transform graph is a directed graph where **nodes** are kernel variants (`KernelIR` + rendered source) and **edges** are transform applications. Different transform paths can converge on the same node (same rendered source), so the graph is not necessarily a tree or DAG. It starts with one node — the base kernel from `build_ir()` — and grows by randomly picking a node, picking an applicable transform, and applying it to produce a new child node.
+
+```
+Node 0 (base)  ──[loop_fusion(ops 2,3)]──>  Node 1
+Node 0         ──[loop_reorder(d2>d0)]──>    Node 2
+Node 1         ──[loop_reorder(d2>d0)]──>    Node 3
+Node 2         ──[loop_fusion(ops 2,3)]──>   Node 3  (deduplicated)
+```
+
+Expansion runs until the graph reaches `num_variants` nodes or no node has applicable transforms left. Duplicate kernels (same rendered source) are rejected, so different transform paths that converge on the same kernel collapse into one node.
+
+```python
+class TransformGraph:
+    nodes: list[SearchNode]   """SearchNode = (ir, source)"""
+    edges: list[SearchEdge]   """SearchEdge = (transform_name, parent_idx, child_idx)"""
+
+    def expand(self, num_variants, render_fn, rng): ...
+```
+
+### 7.2 remote_search
+
+`remote_search` wraps `remote_profile` with transform graph expansion:
+
+```python
+ir = build_ir(double_matmul_nkigym, input_specs)
+
+results = remote_search(
+    initial_kernel=ir,
+    golden_source=golden_source,
+    golden_func_name="double_matmul_numpy",
+    hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5", "gym-6"],
+    cache_dir="/home/ubuntu/cache/double_matmul_search",
+    num_variants=100,
+    atol=0.5,
+    rtol=0.1,
+    warmup=10,
+    iters=100,
+)
+```
+
+Internally:
+
+1. Render the base IR to get the initial kernel source (node 0).
+2. Build a `TransformGraph` with all registered transforms (default: `[LoopFusion()]`).
+3. Randomly expand to `num_variants` nodes.
+4. Render each node's IR to source.
+5. Submit every variant as a `KernelJob` to `remote_profile`.
+6. Return the `ProfileOutput` with timing and correctness results for all variants.
+
+## 8. Future Work
 
 - **Boundary handling for non-divisible input shapes.** The current guide assumes all input dimensions are exact multiples of their tile sizes. Real workloads often have ragged last tiles (e.g., a sequence length of 1000 with tile size 128 leaves a remainder of 104). Supporting this requires `nl.ds(offset, size)` dynamic slicing to emit variable-length last tiles, with masking or predication where needed. The reference attention kernel ([`attention_cte.py`](/home/ubuntu/KaenaNeuronKernelLibrary/src/nkilib_src/nkilib/core/attention/attention_cte.py)) already uses `nl.ds` for this purpose.
 

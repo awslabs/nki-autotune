@@ -9,6 +9,7 @@ import ast
 import inspect
 import textwrap
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -304,16 +305,50 @@ def _parse_input_spec(spec: tuple) -> tuple[tuple[int, ...], str]:
     return spec[0], spec[1]
 
 
-def render(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> str:
-    """Inspect a math function and generate NKI kernel source.
+@dataclass
+class KernelIR:
+    """Intermediate representation of a kernel variant.
+
+    Carries structured state (ops, axis maps, context) plus
+    transform-specific configuration (fusion groups, etc.).
+    ``build_ir()`` creates the base IR with each op in its own
+    singleton fusion group; transforms produce modified copies.
+
+    Attributes:
+        ops: Op instances as (NKIOp, operand_map, output_name).
+        per_op_maps: Per-op abstract-to-concrete axis mappings.
+        ctx: Render context with tensors and tile sizes.
+        return_name: Name of the final output tensor.
+        func_name: Original math function name.
+        param_names: Ordered parameter names for the kernel signature.
+        input_specs: Maps parameter name to (shape, dtype_str).
+        fusion_groups: Which ops share loop nests, each inner
+            list contains op indices.
+    """
+
+    ops: list[tuple[NKIOp, dict[str, str], str]]
+    per_op_maps: list[dict[str, str]]
+    ctx: RenderContext
+    return_name: str
+    func_name: str
+    param_names: list[str]
+    input_specs: dict[str, tuple[tuple[int, ...], str]]
+    fusion_groups: list[list[int]]
+
+
+def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> KernelIR:
+    """Lower a math function to a base KernelIR.
+
+    Parses the function to discover ops, runs dimension analysis,
+    computes tile sizes, and wraps everything in a KernelIR with
+    each op in its own singleton fusion group.
 
     Args:
         func: Math function using nkigym ops.
         input_specs: Maps each parameter name to ``(shape, dtype_str)``.
-            Dimension IDs are discovered automatically from op structure.
 
     Returns:
-        Complete NKI kernel source string.
+        Base KernelIR ready for rendering or transforms.
     """
     param_names = list(inspect.signature(func).parameters.keys())
     for name in param_names:
@@ -326,23 +361,68 @@ def render(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> st
         ctx.tensors[name] = Tensor(name=name, shape=shape, dtype=dtype_str, location="hbm")
 
     ops, return_name = _find_ops(func)
-    _, dim_tiles, dim_min_tiles = _process_ops(ops, ctx, return_name)
+    per_op_maps, dim_tiles, dim_min_tiles = _process_ops(ops, ctx, return_name)
     ctx.dim_tiles = dim_tiles
     ctx.dim_min_tiles = dim_min_tiles
 
-    return_tensor = ctx.tensors[return_name]
+    fusion_groups = [[i] for i in range(len(ops))]
+
+    return KernelIR(
+        ops=ops,
+        per_op_maps=per_op_maps,
+        ctx=ctx,
+        return_name=return_name,
+        func_name=func.__name__,
+        param_names=param_names,
+        input_specs=input_specs,
+        fusion_groups=fusion_groups,
+    )
+
+
+def render_ir(ir: KernelIR) -> str:
+    """Render a KernelIR to NKI kernel source string.
+
+    For the base IR each op sits in its own singleton fusion group,
+    producing a self-contained code block per op. Transforms modify
+    the fusion groups; render_ir handles both base and transformed IRs.
+
+    Args:
+        ir: Kernel IR from ``build_ir`` or after transforms.
+
+    Returns:
+        Complete NKI kernel source string.
+    """
+    return_tensor = ir.ctx.tensors[ir.return_name]
     shape_str = ", ".join(str(s) for s in return_tensor.shape)
 
-    lines = _emit_header(func.__name__, param_names, input_specs)
+    lines = _emit_header(ir.func_name, ir.param_names, ir.input_specs)
     lines.append(
-        f"{_INDENT}hbm_{return_name} = nl.ndarray(({shape_str}),"
+        f"{_INDENT}hbm_{ir.return_name} = nl.ndarray(({shape_str}),"
         f" dtype=nl.{return_tensor.dtype}, buffer=nl.shared_hbm)"
     )
 
-    for op, operand_map, output_name in ops:
-        is_final = output_name == return_name
-        for line in op.render(ctx, operand_map, output_name, is_final):
-            lines.append(f"{_INDENT}{line}")
+    for group in ir.fusion_groups:
+        for op_idx in group:
+            op, operand_map, output_name = ir.ops[op_idx]
+            is_final = output_name == ir.return_name
+            for line in op.render(ir.ctx, operand_map, output_name, is_final):
+                lines.append(f"{_INDENT}{line}")
 
-    lines.append(f"{_INDENT}return hbm_{return_name}")
+    lines.append(f"{_INDENT}return hbm_{ir.return_name}")
     return "\n".join(lines)
+
+
+def render(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> str:
+    """Inspect a math function and generate NKI kernel source.
+
+    Convenience wrapper: calls ``build_ir`` then ``render_ir``.
+
+    Args:
+        func: Math function using nkigym ops.
+        input_specs: Maps each parameter name to ``(shape, dtype_str)``.
+
+    Returns:
+        Complete NKI kernel source string.
+    """
+    ir = build_ir(func, input_specs)
+    return render_ir(ir)
