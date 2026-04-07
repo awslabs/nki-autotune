@@ -211,129 +211,149 @@ The result is the **reference output** — a float64 array that any correctly re
 
 ---
 
-## 2. Initial Eager Mode Kernel
+## 2. Tensor Layout
 
-The renderer takes a math function (§1) and generates an NKI kernel: one independent loop nest per op, concatenated in math function order. Each op's `render()` emits its own complete loop nest. Within-op PSUM accumulators and DMA staging buffers are **degree 1** (one physical tile, reused every iteration). Inter-op intermediate SBUF buffers are **full-range** so that subsequent ops' independent loop nests can read from arbitrary tile positions. This is correct by construction but naive in performance: full-range intermediates far exceed hardware SBUF capacity, and no loops are shared between ops. Variant transforms (§3 programmatic, §4 math) optimize from this baseline.
+Every on-chip tensor uses a uniform **4D layout**: `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`. This is the central design decision — loop structure, buffer sizing, and all transforms operate on this single shape.
 
-### 2.1 Hardware Tile Limits
+**Hardware constraint.** Trainium DMA cannot operate on tensors with more than 5 meaningful (non-singleton) dimensions, so 4D is the maximum usable rank for a two-axis (P, F) tensor.
 
-Each ISA instruction imposes per-tensor limits on tile dimensions. The renderer stores these in a lookup table keyed by op name:
+Each dimension has four components whose product is the dimension size:
 
-| Op | Axes | Limits |
+$$\texttt{dim\_size} = \texttt{num\_blocks} \times \texttt{tiles\_per\_block} \times \texttt{interleave} \times \texttt{tile\_size}$$
+
+The first three components define the loop nest for that dimension, forming a stride hierarchy from largest to smallest:
+
+| Component | Stride | Loop var |
+|---|---|---|
+| `num_blocks` | `tiles_per_block * interleave` | `i_block` |
+| `tiles_per_block` | `interleave` | `i_tile` |
+| `interleave` | 1 | `i_ig` |
+
+Two components are hardware-determined, one is tunable, one is derived:
+
+- **`tile_size`** (hardware) — max of all hardware tile size limits across ops that touch the dimension.
+- **`interleave`** (hardware) — different ops may require different tile sizes on the same dimension (e.g., matmul N=512 vs transpose F=128). The buffer stores data at the smallest common granularity so each op consumes the right number of slots.
+- **`tiles_per_block`** (tunable) — controls arithmetic intensity. Data is loaded from HBM once per block, then reused across `tiles_per_block` compute iterations.
+- **`num_blocks`** (derived) — `dim_size / (tiles_per_block * interleave * tile_size)`. Falls out once the other three are set.
+
+The buffer's `num_tiles` axis is `num_blocks * tiles_per_block * interleave`. A tensor's placement in the loop nest determines how many of these loop levels fall *outside* vs *inside* the buffer allocation — shifting tensors up and down the loop nest changes the buffer's `num_tiles` without changing the loop structure itself. A tensor placed at the outermost level is full-range (`num_tiles = dim_size / tile_size`); a tensor placed inside all three loops is degree-1 (`num_tiles = 1`).
+
+## 3. Dimension Analysis
+
+A forward pass over all ops assigns concrete dimension IDs and computes the four components for each dimension. No tensor starts with dimension IDs — they are discovered automatically from op structure.
+
+For each op, build a local axis map from abstract axes (K, M, N or P, F) to concrete dimension IDs (d0, d1, ...). Operands that already carry dim_ids (from prior ops) provide the mapping; operands without dim_ids get fresh IDs allocated. When two operands of the same op share an abstract axis (e.g., matmul's K axis appears in both stationary and moving), their concrete dims are **unified** — the later operand's dim is renamed to match the earlier one, propagating backward through all tensors that share the old ID. This is how shared dimensions are discovered without any manual labeling.
+
+Example: double matmul `(Q @ K.T) @ V`:
+
+```python
+Q_t = NKITranspose()(data=Q)
+K_t = NKITranspose()(data=K)
+S = NKIMatmul()(stationary=Q_t, moving=K_t)
+S_t = NKITranspose()(data=S)
+output = NKIMatmul()(stationary=S_t, moving=V)
+```
+
+Walk through the forward pass. Inputs Q, K, V have no dim_ids — the pass discovers them:
+
+1. **`nc_transpose(Q)`** — Q has no dim_ids. Allocate P=d0, F=d1. Assign **Q → (d0, d1)**. `OUTPUT_AXES = ("F", "P")` → **Q_t gets (d1, d0)**.
+
+2. **`nc_transpose(K)`** — K has no dim_ids. Allocate P=d2, F=d3. Assign **K → (d2, d3)**. Output → **K_t gets (d3, d2)**.
+
+3. **`nc_matmul(Q_t, K_t)`** — Q_t has (d1, d0) → K=d1, M=d0. K_t has (d3, d2) → K=d3, N=d2. Abstract axis K maps to both d1 and d3 — **unify d3→d1**. This renames K's dim_ids from (d2, d3) to (d2, d1), and K_t from (d3, d2) to (d1, d2). Now K=d1 is consistent across both operands. `OUTPUT_AXES = ("M", "N")` → **S gets (d0, d2)**.
+
+4. **`nc_transpose(S)`** — S has (d0, d2) → P=d0, F=d2. Output → **S_t gets (d2, d0)**.
+
+5. **`nc_matmul(S_t, V)`** — S_t has (d2, d0) → K=d2, M=d0. V has no dim_ids. K=d2 already in local map, allocate N=d4. Assign **V → (d2, d4)**. Output → **output gets (d0, d4)**.
+
+## 4. Initial NKI Kernel Codegen
+
+Each op's `render()` method emits a self-contained block: buffer allocations, loop nest, DMA loads, ISA call, and writeback. The renderer concatenates these blocks in math function order to produce the kernel.
+
+### 4.1 Determine Dimension Tile Size
+
+Each ISA instruction imposes per-tensor limits on tile dimensions:
+
+| Op | Dimensions | Hardware Tile Size Limit |
 |---|---|---|
 | nc_matmul | K (accumulation), M (partition), N (free) | K ≤ 128, M ≤ 128, N ≤ 512 |
 | nc_transpose | P (partition), F (free) | P ≤ 128, F ≤ 128 |
 
 These are the only ops implemented so far. Other ops (tensor_scalar, affine_select, tensor_reduce, activation_reduce, activation) follow the same partition ≤ 128 pattern with large SBUF-based free limits — they will be added as needed.
 
-The limits are **per-tensor constraints** — a single tensor allocation must satisfy them. Whether all tensors fit simultaneously is the compiler's problem; if compilation fails due to total SBUF pressure, that variant is discarded.
+We assume `dim_size` is always a multiple of the smallest hardware limit across ops on that dimension. For each concrete dimension, collect all hardware limits from the table above, then compute:
+- `max_tile_size = min(max(hw_limits), dim_size)`.
+- `min_tile_size = min(hw_limits, dim_size)`.
 
-### 2.2 Tile Unification and Interleave Layout
+Inter-op buffers store the dimension as `(max_tile_size / min_tile_size, min_tile_size)` — data is laid out at the smallest granularity so that every op can read at its own tile size.
 
-A single dimension (e.g., d2 = seq_k) may appear across multiple ops in different roles — as matmul's N (limit 512) and transpose's F (limit 128). The renderer's analysis pass computes two global quantities per dimension:
+### 4.2 Interleaving Groups
 
-- **`dim_tiles[d]`** (unified tile) = max of all ISA limits across ops that touch dimension d, capped at the actual dimension size.
-- **`dim_min_tiles[d]`** (min tile) = min of all ISA limits across ops that touch dimension d, capped at the actual dimension size.
+Different ops may have different tile size limits on the same dimension. For example, `nc_matmul` can process N up to 512 elements, while `nc_transpose` is fixed at 128. The buffer stores data at `min_tile_size` granularity — the smallest op limit on that dimension. Ops that work at a larger tile size consume multiple buffer slots per iteration, grouped together as one **interleave group**. This lets all ops share a single buffer layout despite different tile size requirements.
 
-The ratio `interleave_groups = dim_tiles[d] // dim_min_tiles[d]` is the **interleave count**. All on-chip buffers for that dimension store each tile as `(interleave_groups, min_tile)` rather than a flat `(unified_tile,)`. This is the **interleave layout**.
+Each op computes a per-op tile size for each dimension it touches: `op_tile_size = min(max_tile_size, hw_limit)`. From this, two quantities determine how the op reads from the interleaved buffer:
+- `num_interleave_groups = max_tile_size / op_tile_size` — sub-loop iterations per unified tile (the `i_interleave_group_d{id}` loop).
+- `tiles_per_interleave_group` = `op_tile_size / min_tile_size` — buffer slots consumed per interleave group iteration.
 
-**Hardware constraint.** Trainium DMA cannot operate on tensors with more than 5 meaningful (non-singleton) dimensions. This limits on-chip buffer shapes to low-dimensional layouts:
+Per-op reshape:
+```python
+for i_interleave_group_d{id} in range(max_tile_size/op_tile_size):
+    (op_tile_size/min_tile_size, min_tile_size).reshape((1, op_tile_size))
+```
 
-- **Intra-op buffers** (staging, PSUM accumulators, temp): **2D** — `(op_tile_P, op_tile_F)`. One physical tile, reused every iteration.
-- **Inter-op buffers** (SBUF intermediates between ops): **4D** — `(tile_P, total_tiles_P, total_tiles_F, tile_F)`. The tile sizes are `min_tile` for each dimension; `total_tiles = dim_size / min_tile`, which flattens blocks × interleave into a single axis.
+### 4.3 Per-Op Codegen Example: Double Matmul
 
-Indexing into an inter-op buffer at block `i_block` and interleave group `i_ig`: `tile_index = i_block * intlv + i_ig`.
+**Naming conventions:** loop variables `i_block_d{id}`, `i_tile_d{id}`, `i_interleave_group_d{id}`; buffers `sbuf_{name}` (SBUF), `psum_{name}` (PSUM).
 
-**Why interleave?** Different ops need different tile sizes for the same dimension. Rather than reshaping the buffer at every op boundary, we store the data at the smallest common granularity (`min_tile`) and let each op consume however many slots it needs. An op with a large tile limit (e.g., matmul N = 512) reads 4 consecutive slots at once and reshapes `(4, 128)` → `(1, 512)`. An op with a small limit (e.g., transpose F = 128) iterates one slot at a time via sub-loops.
+Double matmul `(Q @ K.T) @ V` with `Q: (2048, 128)`, `K: (2048, 128)`, `V: (2048, 128)`:
 
-**Chunk+reshape protocol.** Each op computes three quantities per dimension it touches:
+```python
+Q_t = NKITranspose()(data=Q)
+K_t = NKITranspose()(data=K)
+S = NKIMatmul()(stationary=Q_t, moving=K_t)
+S_t = NKITranspose()(data=S)
+output = NKIMatmul()(stationary=S_t, moving=V)
+```
 
-- `chunks = unified_tile // op_tile` — how many sub-loop iterations per unified tile.
-- `gpi = op_tile // min_tile` — slots consumed per chunk iteration (groups-per-iteration).
-- The op loops `chunks` times, each iteration consuming `gpi` interleave slots. When `gpi > 1`, the op reshapes the full 4D inter-op buffer to merge `total_tiles_F` and `tile_F` into one dimension, then slices at `op_tile` granularity. When `gpi = 1`, no reshape is needed; slicing one slot directly yields `(tile_P, 1, 1, tile_F)`.
+**Dimension analysis** (§3):
 
-### 2.3 Renderer Pipeline
+1. **`nc_transpose(Q)`** — P=d0, F=d1. **Q → (d0, d1)**. **Q_t → (d1, d0)**.
+2. **`nc_transpose(K)`** — P=d2, F=d3. **K → (d2, d3)**. **K_t → (d3, d2)**.
+3. **`nc_matmul(Q_t, K_t)`** — K=d1, M=d0, K=d3 → **unify d3→d1**. N=d2. **S → (d0, d2)**.
+4. **`nc_transpose(S)`** — P=d0, F=d2. **S_t → (d2, d0)**.
+5. **`nc_matmul(S_t, V)`** — K=d2, M=d0. V has no dim_ids; K=d2 in map, allocate N=d4. **V → (d2, d4)**. **output → (d0, d4)**.
 
-The renderer (`render()`) works in three stages:
+Dimensions: d0=seq_q (2048), d1=d_k (128), d2=seq_k (2048), d4=d_v (128).
 
-**Stage 1 — AST inspection.** Parse the math function source to extract each `NKIOp()(kwargs)` call, its operand-to-variable mapping, and the output variable name. Unassigned op calls are rejected — the variable name becomes the tensor name in the generated kernel.
+**Tile sizes** (§4.1). d2 is touched by matmul as N (limit 512) and by transpose as F (limit 128), producing different hardware limits:
 
-**Stage 2 — Dimension assignment and tile unification.** A single forward pass over all ops:
+| Dim | dim_size | max_tile_size | min_tile_size |
+|---|---|---|---|
+| d0 (seq_q) | 2048 | 128 | 128 |
+| d1 (d_k) | 128 | 128 | 128 |
+| d2 (seq_k) | 2048 | 512 | 128 |
+| d4 (d_v) | 128 | 128 | 128 |
 
-1. For each op, build a *local axis map* from abstract axes (K, M, N or P, F) to concrete dimension IDs (d0, d1, ...). Operands that already carry dim_ids (from input specs or prior ops) provide the mapping; fresh IDs are allocated for new dimensions. This is scoped per op invocation, so two transposes on different tensors get different dimension IDs.
-2. Create the output tensor for each op. If the output is consumed by a later op (detected by scanning all operand maps), it is marked as inter-op SBUF; otherwise it is the final HBM output.
-3. Unify tile sizes: for each concrete dimension, compute `dim_tiles` (max across all ISA limits) and `dim_min_tiles` (min), both capped at the actual dimension size.
+**Interleave on d2** (§4.2). Buffer stores `(4, 128)`. Per-op breakdown:
 
-**Stage 3 — Per-op code emission.** For each op in source order, call `op.render(ctx, operand_map, output_name, is_final)`. Each op's render method emits a self-contained block of NKI source lines: buffer allocations, loop nests, DMA loads, ISA calls with chunk sub-loops, writeback, and optional DMA store. The renderer indents each block and concatenates them into the final kernel function.
-
-### 2.4 Per-Op Render Structure
-
-Each `NKIOp` subclass implements its own `render()` method. While the details vary by op, they follow a common pattern:
-
-1. **Buffer allocation.** Allocate intra-op buffers as 2D `(op_tile_P, op_tile_F)`: a PSUM buffer for the ISA output (matmul accumulates in fp32 PSUM; transpose writes to PSUM then copies to SBUF), SBUF staging buffers for any HBM inputs. The output SBUF buffer is either inter-op 4D `(tile_P, total_tiles_P, total_tiles_F, tile_F)` for intermediates, or intra-op 2D for the final kernel output.
-
-2. **Loop nest.** Nested loops over each output dimension, three levels deep per dimension: `i_block` (over `num_blocks`), `i_tile` (over `tiles_per_block`, always 1 in the baseline), and `i_ig` (over `chunks`, i.e., `unified // op_tile`). All three loops are always emitted even when their trip count is 1. For ops with a reduction dimension (matmul's K), the reduction loops are nested inside the output loops.
-
-3. **DMA loads.** For each HBM operand, emit `nisa.dma_copy` from HBM into the degree-1 staging buffer. The HBM slice is computed from the block variable × unified tile + chunk variable × op_tile.
-
-4. **ISA call with chunk reshape.** Emit the ISA instruction (e.g., `nisa.nc_matmul`, `nisa.nc_transpose`) reading from either the 2D intra-op staging buffer (HBM inputs) or the 4D inter-op buffer (prior op outputs). When an operand's `gpi > 1`, the read expression includes a `.reshape()` on the inter-op buffer to merge `total_tiles_F` and `tile_F` before slicing at `op_tile` granularity.
-
-5. **Writeback.** Copy the result from PSUM to the output SBUF buffer (`nisa.tensor_copy`). For the final output, also emit `nisa.dma_copy` from SBUF to HBM. For inter-op intermediates, the SBUF write goes to the tile-indexed position so later ops can read it.
-
-**Matmul specifics.** `nisa.nc_matmul` computes `stationary(K, M).T @ moving(K, N) → output(M, N)`, accumulating into PSUM in fp32. The PSUM accumulator is memset to 0 before the K reduction loop. After all K iterations, `nisa.tensor_copy` moves the result to SBUF. When the moving operand's N interleave has `gpi > 1` (e.g., d2 with interleave 4 and matmul N = 512), the read expression reshapes the 4D inter-op buffer to merge `total_tiles_F` and `tile_F`, then slices at the matmul's N tile size: `sbuf_tensor.reshape(merged_shape)[slice]`.
-
-**Transpose specifics.** `nisa.nc_transpose` operates at a fixed 128 × 128 tile size. It reads from SBUF, writes to a 2D PSUM temp buffer `(128, 128)`, then `nisa.tensor_copy` moves the result to the output SBUF. The output inter-op buffer swaps P and F: `(tile_F, total_tiles_F, total_tiles_P, tile_P)` since the transpose flips partition and free axes. When a dimension's unified tile exceeds 128, the chunk sub-loop iterates over 128-element slices.
-
-### 2.5 Attention Example: Op and Dimension Summary
-
-The running example produces 11 back-to-back loop nests — one per op — communicating through full-range SBUF intermediate buffers:
-
-| # | Op | Output dims | Consumed dim | Init |
+| Op on d2 | hw_limit | op_tile_size | num_interleave_groups | tiles_per_interleave_group |
 |---|---|---|---|---|
-| 0 | nc_transpose(Q) → Q_t | d1, d0 | — | — |
-| 1 | nc_transpose(K) → K_t | d1, d2 | — | — |
-| 2 | nc_matmul(Q_t, K_t) → S | d0, d2 | d1 | 0 |
-| 3 | affine_select(S) → masked_S | d0, d2 | — | — |
-| 4 | tensor_scalar(masked_S, scale) → scaled_S | d0, d2 | — | — |
-| 5 | tensor_reduce(scaled_S, max) → neg_max_S | d0 | d2 | $-\infty$ |
-| 6 | activation_reduce(scaled_S, neg_max_S) → (exp_S, sum_exp) | (d0, d2), (d0) | —, d2 | —, 0 |
-| 7 | activation(sum_exp, reciprocal) → inv_sum | d0 | — | — |
-| 8 | nc_transpose(exp_S) → exp_S_t | d2, d0 | — | — |
-| 9 | nc_matmul(exp_S_t, V) → attn | d0, d5 | d2 | 0 |
-| 10 | tensor_scalar(attn, inv_sum) → output | d0, d5 | — | — |
+| nc_matmul | 512 | 512 | 1 | 4 |
+| nc_transpose | 128 | 128 | 4 | 1 |
 
-Dimensions after unification:
+Matmul reshapes `(4, 128)` → `(1, 512)` and processes in 1 group. Transpose reads one `(1, 128)` slot per group across 4 groups.
 
-| Dim | Semantic | dim_size | unified | min_tile | interleave | total_tiles | chunks (matmul) | chunks (transpose) |
-|---|---|---|---|---|---|---|---|---|
-| d0 | seq_q | 4096 | 128 | 128 | 1 | 32 | 1 | 1 |
-| d1 | d_k | 128 | 128 | 128 | 1 | 1 | 1 | 1 |
-| d2 | seq_k | 4096 | 512 | 128 | 4 | 32 | 1 (N=512) | 4 (F=128) |
-| d5 | d_v | 128 | 128 | 128 | 1 | 1 | 1 | — |
+**Transpose codegen.** Fixed 128 × 128 tile. Reads from SBUF, writes to a degree-1 PSUM temp `(128, 1, 1, 128)`, then `nisa.tensor_copy` to the output SBUF. The output buffer swaps P and F axes.
 
-Only d2 has a non-trivial interleave factor: matmul wants N = 512, transpose wants F = 128, giving `unified = 512`, `min_tile = 128`, `interleave = 4`, `total_tiles = 32`. Matmul consumes all 4 slots per block in one chunk (`gpi = 4`, `chunks = 1`), reshaping `(4, 128)` → `(1, 512)`. Transpose iterates 4 chunks of 1 slot each (`gpi = 1`, `chunks = 4`), processing one 128-element slice per sub-loop iteration.
+**Matmul codegen.** Accumulates into PSUM in fp32 (memset to 0 before the K loop). After all K iterations, `nisa.tensor_copy` moves the result to SBUF.
 
-### 2.6 Buffer Degree and Shape Dimensions
-
-Two parameters control memory footprint and compute reuse:
-
-- **Buffer degree (full-range vs degree-1).** A full-range inter-op buffer stores all tile positions: 4D with `total_tiles = dim_size / min_tile` per dimension. A degree-1 intra-op buffer stores one physical tile: 2D `(op_tile_P, op_tile_F)`, reused every iteration. Fusion (§3.1) converts inter-op buffers to intra-op when producer and consumer share a loop.
-
-- **`tiles_per_block`** controls arithmetic intensity — how many compute iterations share one loaded block of data before the next DMA. The initial baseline sets `tiles_per_block = 1` everywhere; §3.4 explores increasing it.
-
-The initial baseline uses 2D intra-op for all within-op buffers and 4D inter-op for all intermediates. The total inter-op SBUF allocation far exceeds hardware capacity. Variant transforms (§3) shrink inter-op buffers by fusing loops, adjusting buffer degree, and reordering dimensions.
-
-**Naming conventions:**
-- **Loop variables**: `i_block_d{id}`, `i_tile_d{id}`, `i_ig_d{id}` (interleave group).
-- **Tensor buffers**: `sbuf_{name}` for SBUF, `psum_{name}` for PSUM. DMA staging buffers reuse the input parameter name (e.g., `sbuf_Q`).
-
-## 3. Programmatic Transforms
+## 5. Programmatic Transforms
 
 Programmatic transforms are mechanical rearrangements of the loop nest that do not change the math — they only change how and when ops execute. All transforms must respect the topological computation order: every op's inputs must be computed before the op runs. The math function (§1) defines one valid topological order, and the eager mode variant follows it exactly. Transforms may reorder loops and fuse ops, but the resulting execution order must remain a valid topological sort of the computation graph — no op can consume a tensor that hasn't been produced yet.
 
 Four transforms generate the search space.
 
-### 3.1 Loop Fusion
+### 5.1 Loop Fusion
 
 Adjacent ops whose loops iterate over the same dimensions can share a single loop nest instead of having separate nests. Fusion eliminates redundant loop overhead and — critically — keeps intermediate tiles on-chip between producer and consumer, avoiding HBM round-trips. A dimension is **blocking** when the full reduction over that dimension must complete before a valid result exists (e.g., matmul accumulation, reduce_max). A dimension is **non-blocking** when partial results are already correct, just incomplete. Fusion is legal across any non-blocking boundary. It is forbidden across a blocking boundary for the blocking dimension: the reduction must complete before the consumer starts.
 
@@ -366,14 +386,14 @@ for i_block_d0 in nl.affine_range(32):
     for i_tile_d0 in nl.affine_range(1):
         for i_block_d2 in nl.affine_range(8):
             for i_tile_d2 in nl.affine_range(1):
-                sbuf_masked_S = nl.ndarray((128, 512), dtype=Q.dtype, buffer=nl.sbuf)  # intra-op 2D, not full-range
+                sbuf_masked_S = nl.ndarray((128, 1, 1, 512), dtype=Q.dtype, buffer=nl.sbuf)  # degree-1, not full-range
                 nisa.affine_select(dst=sbuf_masked_S[...], on_true_tile=sbuf_S[...], ...)
                 nisa.tensor_scalar(dst=sbuf_scaled_S[...], data=sbuf_masked_S[...], op0=nl.multiply, operand0=scale)
 ```
 
-### 3.2 Load Placement
+### 5.2 Load Placement
 
-A DMA load can be **hoisted** (moved above a loop) or **sunk** (moved below a loop) from its current position in the loop nest. Hoisting means the loaded data persists across all iterations of that loop, amortizing DMA latency at the cost of a larger SBUF buffer. Sinking means the buffer is smaller (only one tile at a time) but the load executes more frequently. The slot between block and tile loops (§2.2) provides the placement points at each nesting level.
+A DMA load can be **hoisted** (moved above a loop) or **sunk** (moved below a loop) from its current position in the loop nest. Hoisting means the loaded data persists across all iterations of that loop, amortizing DMA latency at the cost of a larger SBUF buffer. Sinking means the buffer is smaller (only one tile at a time) but the load executes more frequently. The slot between block and tile loops (§2.1) provides the placement points at each nesting level.
 
 In the greedy baseline (§2.3), all loads start at the innermost position. After loop fusion and reordering, loads may need to move in either direction to balance SBUF pressure against DMA frequency.
 
@@ -389,13 +409,13 @@ for i_block_d0 in nl.affine_range(32):
                 for i_block_d2 in nl.affine_range(8):
                     for i_tile_d2 in nl.affine_range(1):
                         for i_ig_d2 in nl.affine_range(4):
-                            sbuf_V = nl.ndarray((128, 128), dtype=V.dtype, buffer=nl.sbuf)  # 2D intra-op, inside d2
+                            sbuf_V = nl.ndarray((128, 1, 1, 128), dtype=V.dtype, buffer=nl.sbuf)  # degree-1, inside d2
                             nisa.dma_copy(dst=sbuf_V[...], src=V[...])
                             nisa.nc_matmul(dst=psum_attn[...], stationary=sbuf_exp_S_t[...], moving=sbuf_V[...])
                 nisa.tensor_copy(dst=sbuf_attn[...], src=psum_attn[...])
 ```
 
-**After** — `sbuf_V` hoisted outside d2, loaded once per (d0, d5) tile; buffer grows from 2D intra-op to 4D:
+**After** — `sbuf_V` hoisted outside d2, loaded once per (d0, d5) tile; `num_tiles_F` grows from 1 to 32 (all d2 tiles):
 
 ```python
 """ Op 9: nisa.nc_matmul -- exp_S_t x V -> attn(d0, d5), accumulate over d2 """
@@ -403,7 +423,7 @@ for i_block_d0 in nl.affine_range(32):
     for i_tile_d0 in nl.affine_range(1):
         for i_block_d5 in nl.affine_range(1):
             for i_tile_d5 in nl.affine_range(1):
-                sbuf_V = nl.ndarray((128, 32, 1, 128), dtype=V.dtype, buffer=nl.sbuf)  # 4D, hoisted: all d2 tiles
+                sbuf_V = nl.ndarray((128, 32, 1, 128), dtype=V.dtype, buffer=nl.sbuf)  # hoisted: num_tiles_F=32 (all d2 tiles)
                 nisa.dma_copy(dst=sbuf_V[...], src=V[...])
                 psum_attn = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
                 for i_block_d2 in nl.affine_range(8):
@@ -413,7 +433,7 @@ for i_block_d0 in nl.affine_range(32):
                 nisa.tensor_copy(dst=sbuf_attn[...], src=psum_attn[...])
 ```
 
-### 3.3 Loop Reordering
+### 5.3 Loop Reordering
 
 The order of dimension loops can be permuted, subject to: (1) same-dimension phase ordering (block before tile), (2) cross-dimension data dependencies (if phase B consumes a tensor produced by phase A of a different dimension, A must precede B), and (3) in-place buffer reuse constraints (a parallel dim not in the buffer's dimensions cannot wrap phases that write the buffer).
 
@@ -447,7 +467,7 @@ for i_block_d2 in nl.affine_range(8):                           # d2 outermost
                 nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
 ```
 
-### 3.4 Tiles Per Block
+### 5.4 Tiles Per Block
 
 `tiles_per_block` is a per-dimension parameter that controls the block size — how many tiles are grouped before the tile loop iterates. Larger `tiles_per_block` means larger SBUF buffers but fewer DMA round-trips: the loaded block is reused across `tiles_per_block` compute iterations. Must divide `total_tiles`.
 
@@ -478,11 +498,11 @@ for i_block_d2 in nl.affine_range(2):                           # 2 blocks (8 / 
         nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
 ```
 
-## 4. Math Transforms
+## 6. Math Transforms
 
-Math transforms restructure the algorithm itself — changing the computation to break blocking dependencies. Programmatic transforms (§3) cannot fuse loops across blocking dependencies; math transforms eliminate those dependencies so that programmatic transforms can then optimize the resulting loop nest.
+Math transforms restructure the algorithm itself — changing the computation to break blocking dependencies. Programmatic transforms (§5) cannot fuse loops across blocking dependencies; math transforms eliminate those dependencies so that programmatic transforms can then optimize the resulting loop nest.
 
-### 4.1 Online Fusion
+### 6.1 Online Fusion
 
 ![Math function DAG — Op 7 and Op 9 are topologically independent, converging only at Op 10](diagrams/math_function_dag.png)
 
@@ -504,7 +524,7 @@ After fusing elementwise ops into their consuming reductions, three blocking pai
 
 Some of these match the **X + Accumulation** pattern from the [online fusion paper draft](/home/ubuntu/online_fusion/main.pdf), which enables **online fusion** — a math-level transformation that eliminates the blocking barrier.
 
-#### 4.1.1 The X + Accumulation Pattern
+#### 6.1.1 The X + Accumulation Pattern
 
 **Standard X + Accumulation** (Algorithm 2 in the paper draft). Two sequential loops over the same blocking dimension with $K$ tiles:
 
@@ -565,12 +585,12 @@ We classify each blocking pair:
 | Producer → Consumer | Blocking dim | Handled by | Why |
 |---|---|---|---|
 | Op 2 (matmul over d1) → Op 5 (reduce max over d2) | d1 | **Not fusable** | Different blocking dims (d1 vs d2); no X+Accumulation pattern |
-| Op 5 (reduce max over d2) → Op 6 (exp + sum over d2) | d2 | **Online fusion** | X+Accumulation pattern (§4.1.2) |
-| Op 6 (exp_S depends on max) → Op 9 (matmul over d2) | d2 | **Online fusion** | Same X (running max), same $s_k$ (§4.1.3) |
+| Op 5 (reduce max over d2) → Op 6 (exp + sum over d2) | d2 | **Online fusion** | X+Accumulation pattern (§6.1.2) |
+| Op 6 (exp_S depends on max) → Op 9 (matmul over d2) | d2 | **Online fusion** | Same X (running max), same $s_k$ (§6.1.3) |
 
 Online fusion breaks the Op 5→6 and Op 6→9 barriers, pulling Ops 5, 6, 8, 9 into a single d2 loop. Op 7 is topologically independent from Op 9 (§1 DAG). Op 10 depends on Op 9's output but runs after the d2 reduction completes. Neither is part of the online fusion transforms. The result is the flash attention algorithm.
 
-#### 4.1.2 Online Fusion: Op 5→6
+#### 6.1.2 Online Fusion: Op 5→6
 
 **Before.** Ops 5 and 6 run in two separate d2 loops. Op 5 reduces max over the full d2 range to produce `neg_max_S`. Op 6 uses `neg_max_S` as a bias — it cannot start until Op 5 completes:
 
@@ -598,7 +618,7 @@ for i_block_d2 in nl.affine_range(8):                                          "
 nisa.tensor_reduce(dst=sbuf_sum_exp[0:128, i_block_d0:i_block_d0+1], data=psum_partial_sum[0:128, 0:8], op=nl.add, axis=1)
 ```
 
-**Pattern match.** Map each component of the Standard X + Accumulation pattern (§4.1.1) to attention ops:
+**Pattern match.** Map each component of the Standard X + Accumulation pattern (§6.1.1) to attention ops:
 
 | Algorithm 2 Component | Attention Mapping |
 |---|---|
@@ -684,23 +704,23 @@ for i_block_d2 in nl.affine_range(8):                                          "
 
 Note: The naive kernel (§2.3) uses `nisa.activation_reduce` with per-block PSUM slots — each slot is written once, so the reset is harmless. Online fusion changes the math: instead of separate slots + cross-block combine, there's a running accumulator rescaled each iteration. The transform rewrites `activation_reduce` → `nisa.activation(..., reduce_cmd=reduce)` which adds to the existing accumulator without resetting.
 
-#### 4.1.3 Online Fusion: Ops 6, 8, 9
+#### 6.1.3 Online Fusion: Ops 6, 8, 9
 
-Op 9 (matmul) accumulates `exp_S_t @ V` over d2. Each tile's `exp_S` depends on the running max — the same X output as §4.1.2. This is a second application of online fusion with the same X reduction and the same scale coefficient $s_k = e^{m_{k-1} - m_k}$.
+Op 9 (matmul) accumulates `exp_S_t @ V` over d2. Each tile's `exp_S` depends on the running max — the same X output as §6.1.2. This is a second application of online fusion with the same X reduction and the same scale coefficient $s_k = e^{m_{k-1} - m_k}$.
 
 First, prepare two d2 loops. Op 8 (transpose) is elementwise — fold it into Op 9's d2 loop body.
 
 **Before.** Two d2 loops after elementwise prep:
 
 ```python
-""" Fused Ops 5+6: d2 loop (from §4.1.2) """
+""" Fused Ops 5+6: d2 loop (from §6.1.2) """
 sbuf_running_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_max[0:128, 0:1], value=-np.inf)
 psum_running_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.psum)
 nisa.memset(dst=psum_running_sum[0:128, 0:1], value=0.0)
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop A """
     for i_tile_d2 in nl.affine_range(1):
-        """ ... X step + scale + bias + accumulate from §4.1.2 ... """
+        """ ... X step + scale + bias + accumulate from §6.1.2 ... """
 
 """ Fused Ops 8+9: d2 loop """
 for i_block_d5 in nl.affine_range(1):
@@ -721,12 +741,12 @@ for i_block_d5 in nl.affine_range(1):
                         moving=sbuf_V[0:128, 0:128])
 ```
 
-**Pattern match.** Same Algorithm 2 structure as §4.1.2, with a different accumulation body:
+**Pattern match.** Same Algorithm 2 structure as §6.1.2, with a different accumulation body:
 
 | Algorithm 2 Component | Attention Mapping (Ops 6, 8, 9) |
 |---|---|
 | Blocking dim $K$ | d2 (seq_k), $K = 8$ tile blocks |
-| $f_X(\mathbf{O_0}_{k-1}, \mathbf{V_0}_k)$ | Same as §4.1.2 — $\max(\mathbf{O_0}_{k-1}, \text{rowmax}(\mathbf{V_0}_k))$ |
+| $f_X(\mathbf{O_0}_{k-1}, \mathbf{V_0}_k)$ | Same as §6.1.2 — $\max(\mathbf{O_0}_{k-1}, \text{rowmax}(\mathbf{V_0}_k))$ |
 | $g_B(\mathbf{O_0}_K)$ | Same $e^{-m}$ — `exp_S` uses the same max |
 | $h_B(\mathbf{V_1}_k)$ | $\text{transpose}(\exp(\mathbf{V_1}_k))^T \cdot \mathbf{V}_k$ — matmul body per tile |
 | $\mathbf{B}_k = g_B \cdot h_B$ | $\exp(\mathbf{S}_k - m_K)^T @ \mathbf{V}_k$ — one tile's matmul contribution |
@@ -751,7 +771,7 @@ for i_block_d5 in nl.affine_range(1):
 
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop A+B """
     for i_tile_d2 in nl.affine_range(1):
-        """ X step: per-tile max → update running max (same as §4.1.2) """
+        """ X step: per-tile max → update running max (same as §6.1.2) """
         psum_tile_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.psum)
         nisa.tensor_reduce(dst=psum_tile_max[0:128, 0:1],
             data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
@@ -814,7 +834,7 @@ for i_block_d2 in nl.affine_range(8):                                          "
 
 `sbuf_exp_S` shrinks to per-tile since it is produced and consumed within the same d2 iteration. Op 7 is topologically independent from Op 9 (§1 DAG). Op 10 depends on Op 9's output but runs after the d2 reduction completes. Neither is part of this transform.
 
-## 5. Future Work
+## 7. Future Work
 
 - **Boundary handling for non-divisible input shapes.** The current guide assumes all input dimensions are exact multiples of their tile sizes. Real workloads often have ragged last tiles (e.g., a sequence length of 1000 with tile size 128 leaves a remainder of 104). Supporting this requires `nl.ds(offset, size)` dynamic slicing to emit variable-length last tiles, with masking or predication where needed. The reference attention kernel ([`attention_cte.py`](/home/ubuntu/KaenaNeuronKernelLibrary/src/nkilib_src/nkilib/core/attention/attention_cte.py)) already uses `nl.ds` for this purpose.
 
