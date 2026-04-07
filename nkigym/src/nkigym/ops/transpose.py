@@ -17,7 +17,7 @@ from typing import ClassVar
 import numpy as np
 
 from nkigym.ops.base import NKIOp, RenderContext
-from nkigym.ops.common import flat_tile_index, hbm_chunk_range, intra_slice
+from nkigym.ops.common import emit_outer_loops, flat_tile_index, hbm_chunk_range, intra_slice
 
 _I1 = " " * 4
 _I2 = " " * 8
@@ -124,6 +124,7 @@ class NKITranspose(NKIOp):
     NAME: ClassVar[str] = "nc_transpose"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("F", "P")}
+    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
 
     def __call__(self, data: np.ndarray, **_: object) -> np.ndarray:
         """CPU simulation: data.T.
@@ -136,20 +137,33 @@ class NKITranspose(NKIOp):
         """
         return data.T
 
-    def render(self, ctx: RenderContext, operand_map: dict[str, str], output_name: str, is_final: bool) -> list[str]:
-        """Emit NKI source lines for nc_transpose.
-
-        Args:
-            ctx: Running render context with tensors and kwargs.
-            operand_map: Maps op slot name to tensor name in ctx.
-            output_name: Name of the output tensor.
-            is_final: Whether this writes the final kernel output.
-
-        Returns:
-            List of NKI source lines.
-        """
+    def render(
+        self,
+        ctx: RenderContext,
+        operand_map: dict[str, str],
+        output_name: str,
+        is_final: bool,
+        *,
+        dim_order: tuple[str, ...] | None = None,
+    ) -> list[str]:
+        """Emit full NKI source lines for standalone nc_transpose."""
         cfg = _build_config(ctx, operand_map, output_name, is_final)
+        if dim_order is not None:
+            cfg["dim_order"] = dim_order
         return _render_transpose(cfg)
+
+    def render_inner(
+        self,
+        ctx: RenderContext,
+        operand_map: dict[str, str],
+        output_name: str,
+        is_final: bool,
+        *,
+        pre_allocated: frozenset[str] = frozenset(),
+    ) -> list[str]:
+        """Emit inner lines for fused rendering (no outer block/tile loops)."""
+        cfg = _build_config(ctx, operand_map, output_name, is_final)
+        return _render_transpose_inner(cfg, pre_allocated)
 
 
 def _build_config(ctx: RenderContext, operand_map: dict[str, str], output_name: str, is_final: bool) -> dict:
@@ -203,6 +217,62 @@ def _build_config(ctx: RenderContext, operand_map: dict[str, str], output_name: 
     }
 
 
+def _render_transpose_inner(cfg: dict, pre_allocated: frozenset[str] = frozenset()) -> list[str]:
+    """Build transpose inner lines for fused rendering.
+
+    Reads from a degree-1 input buffer (idx_P=0, idx_F varies).
+    Writes to the output buffer using standard flat-tile indexing.
+    Indent starts at _I4 (after 4 shared outer loops).
+    """
+    dim_P, dim_F = cfg["dim_P"], cfg["dim_F"]
+    min_P, min_F = cfg["min_P"], cfg["min_F"]
+    sbuf_data = f"sbuf_{cfg['data_name']}"
+    psum_tmp = f"psum_{cfg['output_name']}_tmp"
+    sbuf_out = f"sbuf_{cfg['output_name']}"
+    bp, bf = f"i_block_{dim_P}", f"i_block_{dim_F}"
+    cp, cf = f"i_interleave_group_{dim_P}", f"i_interleave_group_{dim_F}"
+
+    psum_sl = intra_slice(TRANSPOSE_BLOCK, TRANSPOSE_BLOCK)
+
+    lines: list[str] = []
+
+    lines.append(
+        f"{_I4}{psum_tmp} = nl.ndarray(({TRANSPOSE_BLOCK}, {TRANSPOSE_BLOCK}), dtype=nl.{cfg['dtype']}, buffer=nl.psum)"
+    )
+
+    if sbuf_out not in pre_allocated:
+        if cfg["is_final"]:
+            lines.append(f"{_I4}{sbuf_out} = nl.ndarray(({min_F}, {min_P}), dtype=nl.{cfg['dtype']}, buffer=nl.sbuf)")
+        else:
+            total_F, total_P = cfg["total_F"], cfg["total_P"]
+            lines.append(
+                f"{_I4}{sbuf_out} = nl.ndarray("
+                f"({min_F}, {total_F}, {total_P}, {min_P}),"
+                f" dtype=nl.{cfg['dtype']}, buffer=nl.sbuf)"
+            )
+
+    lines.append(f"{_I4}for {cp} in nl.affine_range({cfg['chunks_P']}):")
+    lines.append(f"{_I5}for {cf} in nl.affine_range({cfg['chunks_F']}):")
+
+    src_sl = f"0:{min_P}, 0, {cf}, 0:{min_F}"
+    lines.append(f"{_I6}nisa.nc_transpose(dst={psum_tmp}[{psum_sl}], data={sbuf_data}[{src_sl}])")
+
+    out_sl = _out_slice(cfg, bp, bf, cp, cf)
+    lines.append(f"{_I6}nisa.tensor_copy(dst={sbuf_out}[{out_sl}], src={psum_tmp}[{psum_sl}])")
+
+    if cfg["is_final"]:
+        f_rng = hbm_chunk_range(bf, cfg["unified_F"], cf, cfg["op_F"])
+        p_rng = hbm_chunk_range(bp, cfg["unified_P"], cp, cfg["op_P"])
+        out_final_sl = intra_slice(min_F, min_P)
+        lines.append(
+            f"{_I6}nisa.dma_copy("
+            f"dst=hbm_{cfg['output_name']}[{f_rng}, {p_rng}],"
+            f" src={sbuf_out}[{out_final_sl}])"
+        )
+
+    return lines
+
+
 def _render_transpose(cfg: dict) -> list[str]:
     """Build the full transpose source lines from config.
 
@@ -229,10 +299,9 @@ def _render_transpose(cfg: dict) -> list[str]:
     src_sl = _src_slice(cfg, bp, bf, cp, cf)
     out_sl = _out_slice(cfg, bp, bf, cp, cf)
 
-    lines.append(f"for {bf} in nl.affine_range({cfg['num_blocks_F']}):")
-    lines.append(f"{_I1}for i_tile_{dim_F} in nl.affine_range(1):")
-    lines.append(f"{_I2}for {bp} in nl.affine_range({cfg['num_blocks_P']}):")
-    lines.append(f"{_I3}for i_tile_{dim_P} in nl.affine_range(1):")
+    dim_order = cfg.get("dim_order", (dim_F, dim_P))
+    num_blocks_by_dim = {dim_F: cfg["num_blocks_F"], dim_P: cfg["num_blocks_P"]}
+    lines.extend(emit_outer_loops(dim_order, num_blocks_by_dim))
     lines.append(f"{_I4}for {cp} in nl.affine_range({cfg['chunks_P']}):")
     lines.append(f"{_I5}for {cf} in nl.affine_range({cfg['chunks_F']}):")
 

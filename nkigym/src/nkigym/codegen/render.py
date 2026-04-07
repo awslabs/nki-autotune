@@ -58,15 +58,7 @@ def _resolve_op_class(call_node: ast.Call, func_globals: dict[str, object]) -> t
 
 
 def _find_ops(func: Callable[..., np.ndarray]) -> tuple[list[tuple[NKIOp, dict[str, str], str]], str]:
-    """Find NKIOp subclasses and the return variable via AST inspection.
-
-    Args:
-        func: Math function using nkigym ops.
-
-    Returns:
-        ``(ops, return_name)`` where *ops* is a list of
-        ``(NKIOp instance, operand_map, output_name)`` in source order.
-    """
+    """Find NKIOp subclasses and the return variable via AST inspection."""
     source = textwrap.dedent(inspect.getsource(func))
     tree = ast.parse(source)
     func_def = tree.body[0]
@@ -121,11 +113,7 @@ def _emit_header(
 def _resolve_output(
     op: NKIOp, operand_map: dict[str, str], ctx: RenderContext
 ) -> tuple[tuple[int, ...], str, tuple[str, ...]]:
-    """Trace output shape, dtype, and dim_ids from an op's operand axes.
-
-    Returns:
-        ``(output_shape, dtype_str, dim_ids)``.
-    """
+    """Trace output shape, dtype, and dim_ids from an op's operand axes."""
     axis_sizes: dict[str, int] = {}
     first_dtype: str | None = None
     for slot, axes in op.OPERAND_AXES.items():
@@ -190,16 +178,7 @@ def _local_axis_map(
     dim_counter: list[int],
     per_op_maps: list[dict[str, str]],
 ) -> dict[str, str]:
-    """Build a per-op-invocation abstract→concrete axis mapping.
-
-    Abstract axes (P, F, K, M, N) are scoped per op invocation.
-    Operands that already have dim_ids provide concrete mappings;
-    operands without dim_ids get fresh d0, d1, ... IDs.
-
-    When two operands map the same abstract axis to different
-    concrete dims, the later one is unified into the earlier one
-    by renaming across all tensors in ctx and prior per_op_maps.
-    """
+    """Build a per-op abstract→concrete axis mapping, unifying shared dims."""
     local: dict[str, str] = {}
     for slot, axes in op.OPERAND_AXES.items():
         tensor = ctx.tensors[operand_map[slot]]
@@ -274,15 +253,7 @@ def _collect_dim_sizes(ctx: RenderContext) -> dict[str, int]:
 def _unify_tile_sizes(
     ops: list[tuple[NKIOp, dict[str, str], str]], per_op_maps: list[dict[str, str]], ctx: RenderContext
 ) -> tuple[dict[str, int], dict[str, int]]:
-    """Compute unified and min tile sizes across all ops.
-
-    For each concrete dimension, takes the max of all ISA limits
-    (unified) and the min of all ISA limits (min), both capped
-    at the actual dimension size.
-
-    Returns:
-        ``(dim_tiles, dim_min_tiles)``
-    """
+    """Compute unified and min tile sizes across all ops."""
     dim_tiles: dict[str, int] = {}
     dim_min_tiles: dict[str, int] = {}
     for (op, _, _), local in zip(ops, per_op_maps, strict=True):
@@ -303,6 +274,16 @@ def _unify_tile_sizes(
 def _parse_input_spec(spec: tuple) -> tuple[tuple[int, ...], str]:
     """Parse an input spec into (shape, dtype)."""
     return spec[0], spec[1]
+
+
+def _default_singleton_dim_order(op: NKIOp, axis_map: dict[str, str]) -> tuple[str, ...]:
+    """Compute the default outer loop dim order for a singleton group.
+
+    Returns the op's output axes (mapped to concrete dim IDs),
+    excluding any blocking axes.
+    """
+    output_axes = next(iter(op.OUTPUT_AXES.values()))
+    return tuple(axis_map[a] for a in output_axes if a not in op.BLOCKING_AXES)
 
 
 @dataclass
@@ -334,6 +315,8 @@ class KernelIR:
     param_names: list[str]
     input_specs: dict[str, tuple[tuple[int, ...], str]]
     fusion_groups: list[list[int]]
+    buffer_degrees: dict[str, int]
+    group_dim_orders: list[tuple[str, ...]]
 
 
 def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> KernelIR:
@@ -366,6 +349,7 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> 
     ctx.dim_min_tiles = dim_min_tiles
 
     fusion_groups = [[i] for i in range(len(ops))]
+    group_dim_orders = [_default_singleton_dim_order(ops[g[0]][0], per_op_maps[g[0]]) for g in fusion_groups]
 
     return KernelIR(
         ops=ops,
@@ -376,21 +360,92 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> 
         param_names=param_names,
         input_specs=input_specs,
         fusion_groups=fusion_groups,
+        buffer_degrees={},
+        group_dim_orders=group_dim_orders,
     )
+
+
+def _find_fused_intermediate(ir: KernelIR, group: list[int]) -> str | None:
+    """Find the intermediate tensor between the first two ops of a fused group."""
+    result: str | None = None
+    if len(group) >= 2:
+        _, _, producer_out = ir.ops[group[0]]
+        _, consumer_opmap, _ = ir.ops[group[1]]
+        if producer_out in consumer_opmap.values():
+            result = producer_out
+    return result
+
+
+def _full_range_buffer_alloc(ir: KernelIR, output_name: str) -> str:
+    """Emit a full-range 4D SBUF buffer allocation for a tensor.
+
+    Shape: ``(min_0, total_0, total_1, min_1)`` where dim0 and dim1
+    are the tensor's two dimensions.
+    """
+    tensor = ir.ctx.tensors[output_name]
+    dim0_id, dim1_id = tensor.dim_ids
+    min_0 = ir.ctx.dim_min_tiles[dim0_id]
+    min_1 = ir.ctx.dim_min_tiles[dim1_id]
+    total_0 = tensor.shape[0] // min_0
+    total_1 = tensor.shape[1] // min_1
+    return (
+        f"sbuf_{output_name} = nl.ndarray("
+        f"({min_0}, {total_0}, {total_1}, {min_1}),"
+        f" dtype=nl.{tensor.dtype}, buffer=nl.sbuf)"
+    )
+
+
+def _render_fused_group(ir: KernelIR, group: list[int], dim_order: tuple[str, ...]) -> list[str]:
+    """Render a multi-op fused group with shared outer loops.
+
+    Uses ``dim_order`` for the outer block/tile loop ordering.
+    Full-range output buffers are allocated before the shared loops
+    so they persist across iterations.
+    """
+    intermediate_name = _find_fused_intermediate(ir, group)
+    if intermediate_name is None:
+        raise ValueError(f"No intermediate tensor found between ops {group[0]} and {group[1]}")
+
+    num_blocks_by_dim: dict[str, int] = {}
+    for dim_id in dim_order:
+        size = _dim_size(ir.ctx, dim_id)
+        if size is None:
+            raise ValueError(f"Cannot find size for dim {dim_id!r}")
+        num_blocks_by_dim[dim_id] = size // ir.ctx.dim_tiles[dim_id]
+
+    pre_allocated: set[str] = set()
+    lines: list[str] = []
+    consumed = _consumed_names(ir.ops)
+    for op_idx in group:
+        _, _, output_name = ir.ops[op_idx]
+        is_intermediate = output_name == intermediate_name
+        is_final = output_name == ir.return_name
+        if not is_intermediate and not is_final and output_name in consumed:
+            buf_name = f"sbuf_{output_name}"
+            lines.append(_full_range_buffer_alloc(ir, output_name))
+            pre_allocated.add(buf_name)
+
+    pre_allocated_frozen = frozenset(pre_allocated)
+
+    for i, dim_id in enumerate(dim_order):
+        indent = _INDENT * (i * 2)
+        lines.append(f"{indent}for i_block_{dim_id} in nl.affine_range({num_blocks_by_dim[dim_id]}):")
+        lines.append(f"{indent}{_INDENT}for i_tile_{dim_id} in nl.affine_range(1):")
+
+    for op_idx in group:
+        op, operand_map, output_name = ir.ops[op_idx]
+        is_final = output_name == ir.return_name
+        for line in op.render_inner(ir.ctx, operand_map, output_name, is_final, pre_allocated=pre_allocated_frozen):
+            lines.append(line)
+
+    return lines
 
 
 def render_ir(ir: KernelIR) -> str:
     """Render a KernelIR to NKI kernel source string.
 
-    For the base IR each op sits in its own singleton fusion group,
-    producing a self-contained code block per op. Transforms modify
-    the fusion groups; render_ir handles both base and transformed IRs.
-
-    Args:
-        ir: Kernel IR from ``build_ir`` or after transforms.
-
-    Returns:
-        Complete NKI kernel source string.
+    Singleton groups render each op standalone. Multi-op (fused) groups
+    emit shared outer loops and call each op's render_inner.
     """
     return_tensor = ir.ctx.tensors[ir.return_name]
     shape_str = ", ".join(str(s) for s in return_tensor.shape)
@@ -401,11 +456,16 @@ def render_ir(ir: KernelIR) -> str:
         f" dtype=nl.{return_tensor.dtype}, buffer=nl.shared_hbm)"
     )
 
-    for group in ir.fusion_groups:
-        for op_idx in group:
+    for group_idx, group in enumerate(ir.fusion_groups):
+        dim_order = ir.group_dim_orders[group_idx]
+        if len(group) == 1:
+            op_idx = group[0]
             op, operand_map, output_name = ir.ops[op_idx]
             is_final = output_name == ir.return_name
-            for line in op.render(ir.ctx, operand_map, output_name, is_final):
+            for line in op.render(ir.ctx, operand_map, output_name, is_final, dim_order=dim_order):
+                lines.append(f"{_INDENT}{line}")
+        else:
+            for line in _render_fused_group(ir, group, dim_order):
                 lines.append(f"{_INDENT}{line}")
 
     lines.append(f"{_INDENT}return hbm_{ir.return_name}")

@@ -11,14 +11,15 @@ Usage::
 """
 
 import inspect
+import shutil
+from pathlib import Path
 
 import numpy as np
 
-from autotune.runner.api import remote_profile
 from autotune.runner.compare import assert_close
-from autotune.runner.types import KernelJob
-from nkigym.codegen.render import render
+from nkigym.codegen.render import build_ir
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.search.api import remote_search
 
 
 def matmul_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -44,8 +45,8 @@ def matmul_nkigym(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     Returns:
         Output tensor of shape (M, N).
     """
-    haha = NKIMatmul()(stationary=lhs_T, moving=rhs)
-    return haha
+    result = NKIMatmul()(stationary=lhs_T, moving=rhs)
+    return result
 
 
 if __name__ == "__main__":
@@ -60,24 +61,21 @@ if __name__ == "__main__":
     status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
     print(status)
     input_specs = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-    kernel_src = render(matmul_nkigym, input_specs=input_specs)
+    ir = build_ir(matmul_nkigym, input_specs=input_specs)
 
     golden_source = inspect.getsource(matmul_numpy)
-    kernels = {
-        "matmul_nkigym": KernelJob(
-            source=kernel_src,
-            input_specs=input_specs,
-            golden_source=golden_source,
-            golden_func_name="matmul_numpy",
-            atol=1e-3,
-            rtol=1e-3,
-        )
-    }
-
-    output = remote_profile(
-        kernels=kernels,
+    cache_dir = Path("/home/ubuntu/cache/matmul_test")
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    remote_search(
+        initial_kernel=ir,
+        golden_source=golden_source,
+        golden_func_name="matmul_numpy",
         hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5", "gym-6"],
-        cache_dir="/home/ubuntu/cache/matmul_test",
+        cache_dir=str(cache_dir),
+        num_variants=10,
+        atol=1e-3,
+        rtol=1e-3,
         warmup=10,
         iters=100,
     )

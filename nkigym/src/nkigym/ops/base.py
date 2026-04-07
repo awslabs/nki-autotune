@@ -68,24 +68,42 @@ class NKIOp:
     NAME: ClassVar[str] = ""
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
+    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
 
     @abstractmethod
     def __call__(self, **kwargs: Any) -> Any:
         """CPU simulation using numpy at float64 precision."""
 
     @abstractmethod
-    def render(self, ctx: RenderContext, operand_map: dict[str, str], output_name: str, is_final: bool) -> list[str]:
-        """Emit NKI source lines for this op.
+    def render(
+        self,
+        ctx: RenderContext,
+        operand_map: dict[str, str],
+        output_name: str,
+        is_final: bool,
+        *,
+        dim_order: tuple[str, ...] | None = None,
+    ) -> list[str]:
+        """Emit full NKI source lines for standalone rendering."""
+
+    def render_inner(
+        self,
+        ctx: RenderContext,
+        operand_map: dict[str, str],
+        output_name: str,
+        is_final: bool,
+        *,
+        pre_allocated: frozenset[str] = frozenset(),
+    ) -> list[str]:
+        """Emit inner lines for fused rendering (no outer block/tile loops).
+
+        Override in subclasses that support fusion. Default raises.
 
         Args:
-            ctx: Running render context with tensors, dim_tiles, and kwargs.
-            operand_map: Maps op slot name to tensor name in ctx
-                (e.g. ``{"stationary": "lhs_T", "moving": "rhs"}``).
-            output_name: Name of the output tensor.
-            is_final: Whether this op writes the final kernel output
-                (degree-1 SBUF + DMA store to HBM) or an inter-op
-                intermediate (full-range SBUF, no DMA store).
-
-        Returns:
-            List of NKI source lines (without base indent).
+            ctx: Running render context.
+            operand_map: Maps op slot name to tensor name.
+            output_name: Output tensor name.
+            is_final: Whether this is the final output.
+            pre_allocated: Buffer names already allocated by the caller.
         """
+        raise NotImplementedError(f"{self.NAME} does not support fused rendering")

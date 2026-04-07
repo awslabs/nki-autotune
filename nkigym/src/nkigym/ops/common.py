@@ -60,6 +60,28 @@ def flat_tile_index(block_var: str, intlv: int, chunk_var: str, gpi: int) -> str
     return f"{block_term}+{chunk_term}"
 
 
+def emit_outer_loops(dim_order: tuple[str, ...], num_blocks_by_dim: dict[str, int]) -> list[str]:
+    """Emit outer block/tile loop nest for dimensions in the given order.
+
+    Each dimension gets a block loop and a tile loop (always 1),
+    producing ``2 * len(dim_order)`` nesting levels.
+
+    Args:
+        dim_order: Ordered dimension IDs for the outer loops.
+        num_blocks_by_dim: Maps dim ID to its block count.
+
+    Returns:
+        List of loop source lines with appropriate indentation.
+    """
+    lines: list[str] = []
+    for i, dim_id in enumerate(dim_order):
+        indent_b = " " * (4 * i * 2)
+        indent_t = " " * (4 * (i * 2 + 1))
+        lines.append(f"{indent_b}for i_block_{dim_id} in nl.affine_range({num_blocks_by_dim[dim_id]}):")
+        lines.append(f"{indent_t}for i_tile_{dim_id} in nl.affine_range(1):")
+    return lines
+
+
 def flat_tile_range(block_var: str, intlv: int, chunk_var: str, gpi: int) -> str:
     """Flat tile range spanning ``gpi`` consecutive tiles.
 

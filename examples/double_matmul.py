@@ -19,15 +19,16 @@ Usage::
 """
 
 import inspect
+import shutil
+from pathlib import Path
 
 import numpy as np
 
-from autotune.runner.api import remote_profile
 from autotune.runner.compare import assert_close
-from autotune.runner.types import KernelJob
-from nkigym.codegen.render import render
+from nkigym.codegen.render import build_ir
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
+from nkigym.search.api import remote_search
 
 
 def double_matmul_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
@@ -80,25 +81,21 @@ if __name__ == "__main__":
     print(f"CPU sim: {status}")
 
     input_specs = {"Q": ((seq_q, d_k), "bfloat16"), "K": ((seq_k, d_k), "bfloat16"), "V": ((seq_k, d_v), "bfloat16")}
-    kernel_src = render(double_matmul_nkigym, input_specs=input_specs)
+    ir = build_ir(double_matmul_nkigym, input_specs=input_specs)
 
     golden_source = inspect.getsource(double_matmul_numpy)
-    worker_specs = {name: (spec[0], spec[1]) for name, spec in input_specs.items()}
-    kernels = {
-        "double_matmul_nkigym": KernelJob(
-            source=kernel_src,
-            input_specs=worker_specs,
-            golden_source=golden_source,
-            golden_func_name="double_matmul_numpy",
-            atol=1e-3,
-            rtol=1e-3,
-        )
-    }
-
-    remote_profile(
-        kernels=kernels,
+    cache_dir = Path("/home/ubuntu/cache/double_matmul_test")
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    remote_search(
+        initial_kernel=ir,
+        golden_source=golden_source,
+        golden_func_name="double_matmul_numpy",
         hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5", "gym-6"],
-        cache_dir="/home/ubuntu/cache/double_matmul_test",
+        cache_dir=str(cache_dir),
+        num_variants=10,
+        atol=1e-3,
+        rtol=1e-3,
         warmup=10,
         iters=100,
     )
