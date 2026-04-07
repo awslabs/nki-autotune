@@ -29,4 +29,11 @@ def assert_close(actual: np.ndarray, desired: np.ndarray, atol: float, rtol: flo
     worst_diff = float(abs_diff.flat[worst_idx])
     worst_thresh = float(threshold.flat[worst_idx])
     worst_margin = float(ratio.flat[worst_idx])
-    return {"passed": True, "threshold": worst_thresh, "diff": worst_diff, "worst_margin": worst_margin}
+    return {
+        "passed": True,
+        "atol": atol,
+        "rtol": rtol,
+        "threshold": worst_thresh,
+        "diff": worst_diff,
+        "worst_margin": worst_margin,
+    }

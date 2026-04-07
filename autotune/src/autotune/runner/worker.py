@@ -61,7 +61,7 @@ def _cpu_sim_status(sim_output: np.ndarray, sim_error: str, golden: np.ndarray, 
     Returns:
         Dict with 'passed' (bool) and either margin details or 'error' string.
     """
-    result: dict = {"passed": False, "error": ""}
+    result: dict = {"passed": False, "atol": atol, "rtol": rtol, "error": ""}
     if sim_error:
         result["error"] = sim_error
     else:
@@ -69,6 +69,8 @@ def _cpu_sim_status(sim_output: np.ndarray, sim_error: str, golden: np.ndarray, 
             result = assert_close(sim_output, golden, atol=atol, rtol=rtol)
         except AssertionError as e:
             result["error"] = str(e)
+            result["atol"] = atol
+            result["rtol"] = rtol
     return result
 
 

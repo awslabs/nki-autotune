@@ -90,8 +90,8 @@ if __name__ == "__main__":
             input_specs=worker_specs,
             golden_source=golden_source,
             golden_func_name="double_matmul_numpy",
-            atol=0.5,
-            rtol=0.1,
+            atol=1e-3,
+            rtol=1e-3,
         )
     }
 
