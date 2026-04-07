@@ -110,7 +110,7 @@ def _emit_header(
         f"def {func_name}_kernel({', '.join(f'{n}: Tensor' for n in param_names)}):",
     ]
     for name in param_names:
-        shape, dtype_str, _ = _parse_input_spec(input_specs[name])
+        shape, dtype_str = _parse_input_spec(input_specs[name])
         shape_str = ", ".join(str(s) for s in shape)
         lines.append(f"{_INDENT}assert {name}.shape == ({shape_str})")
         lines.append(f"{_INDENT}assert {name}.dtype == nl.{dtype_str}")
@@ -152,14 +152,52 @@ def _consumed_names(ops: list[tuple[NKIOp, dict[str, str], str]]) -> set[str]:
     return names
 
 
+def _dim_size(ctx: RenderContext, dim_id: str) -> int | None:
+    """Return the size of *dim_id* from the first tensor that carries it."""
+    result: int | None = next(
+        (s for t in ctx.tensors.values() if t.dim_ids for d, s in zip(t.dim_ids, t.shape, strict=True) if d == dim_id),
+        None,
+    )
+    return result
+
+
+def _unify_dim(
+    op: NKIOp, ctx: RenderContext, per_op_maps: list[dict[str, str]], abstract: str, old_id: str, new_id: str
+) -> None:
+    """Validate sizes match, then rename *old_id* → *new_id* everywhere."""
+    old_size = _dim_size(ctx, old_id)
+    new_size = _dim_size(ctx, new_id)
+    if old_size is not None and new_size is not None and old_size != new_size:
+        raise ValueError(
+            f"Op {op.NAME!r}: axis {abstract!r} unifies"
+            f" {old_id!r} (size {old_size}) with"
+            f" {new_id!r} (size {new_size}) — size mismatch"
+        )
+    for tensor in ctx.tensors.values():
+        if tensor.dim_ids and old_id in tensor.dim_ids:
+            tensor.dim_ids = tuple(new_id if d == old_id else d for d in tensor.dim_ids)
+    for axis_map in per_op_maps:
+        for ax, concrete in axis_map.items():
+            if concrete == old_id:
+                axis_map[ax] = new_id
+
+
 def _local_axis_map(
-    op: NKIOp, operand_map: dict[str, str], ctx: RenderContext, dim_counter: list[int]
+    op: NKIOp,
+    operand_map: dict[str, str],
+    ctx: RenderContext,
+    dim_counter: list[int],
+    per_op_maps: list[dict[str, str]],
 ) -> dict[str, str]:
     """Build a per-op-invocation abstract→concrete axis mapping.
 
     Abstract axes (P, F, K, M, N) are scoped per op invocation.
     Operands that already have dim_ids provide concrete mappings;
     operands without dim_ids get fresh d0, d1, ... IDs.
+
+    When two operands map the same abstract axis to different
+    concrete dims, the later one is unified into the earlier one
+    by renaming across all tensors in ctx and prior per_op_maps.
     """
     local: dict[str, str] = {}
     for slot, axes in op.OPERAND_AXES.items():
@@ -167,11 +205,9 @@ def _local_axis_map(
         if tensor.dim_ids:
             for abstract, concrete in zip(axes, tensor.dim_ids, strict=True):
                 if abstract in local and local[abstract] != concrete:
-                    raise ValueError(
-                        f"Op {op.NAME!r}: axis {abstract!r} maps to both"
-                        f" {local[abstract]!r} and {concrete!r} — check input dim_ids"
-                    )
-                local[abstract] = concrete
+                    _unify_dim(op, ctx, per_op_maps, abstract, old_id=concrete, new_id=local[abstract])
+                else:
+                    local[abstract] = concrete
         else:
             for abstract in axes:
                 if abstract not in local:
@@ -198,7 +234,7 @@ def _process_ops(
     per_op_maps: list[dict[str, str]] = []
 
     for op, operand_map, output_name in ops:
-        local = _local_axis_map(op, operand_map, ctx, dim_counter)
+        local = _local_axis_map(op, operand_map, ctx, dim_counter, per_op_maps)
         per_op_maps.append(local)
         _create_output_tensor(op, operand_map, output_name, ctx, local, return_name, consumed)
 
@@ -263,13 +299,9 @@ def _unify_tile_sizes(
     return dim_tiles, dim_min_tiles
 
 
-def _parse_input_spec(spec: tuple) -> tuple[tuple[int, ...], str, tuple[str, ...]]:
-    """Parse an input spec into (shape, dtype, dim_ids).
-
-    Accepts ``(shape, dtype)`` or ``(shape, dtype, dim_ids)``.
-    """
-    dim_ids = tuple(spec[2]) if len(spec) == 3 else ()
-    return spec[0], spec[1], dim_ids
+def _parse_input_spec(spec: tuple) -> tuple[tuple[int, ...], str]:
+    """Parse an input spec into (shape, dtype)."""
+    return spec[0], spec[1]
 
 
 def render(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> str:
@@ -277,10 +309,8 @@ def render(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> st
 
     Args:
         func: Math function using nkigym ops.
-        input_specs: Maps each parameter name to ``(shape, dtype_str)``
-            or ``(shape, dtype_str, dim_ids)`` where dim_ids is a
-            tuple of concrete dimension labels like ``("d0", "d1")``.
-            Shared dim labels across inputs express shared dimensions.
+        input_specs: Maps each parameter name to ``(shape, dtype_str)``.
+            Dimension IDs are discovered automatically from op structure.
 
     Returns:
         Complete NKI kernel source string.
@@ -292,8 +322,8 @@ def render(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> st
 
     ctx = RenderContext()
     for name in param_names:
-        shape, dtype_str, dim_ids = _parse_input_spec(input_specs[name])
-        ctx.tensors[name] = Tensor(name=name, shape=shape, dtype=dtype_str, location="hbm", dim_ids=dim_ids)
+        shape, dtype_str = _parse_input_spec(input_specs[name])
+        ctx.tensors[name] = Tensor(name=name, shape=shape, dtype=dtype_str, location="hbm")
 
     ops, return_name = _find_ops(func)
     _, dim_tiles, dim_min_tiles = _process_ops(ops, ctx, return_name)

@@ -79,11 +79,7 @@ if __name__ == "__main__":
     status = assert_close(out_gym, out_np, atol=1e-6, rtol=1e-6)
     print(f"CPU sim: {status}")
 
-    input_specs = {
-        "Q": ((seq_q, d_k), "bfloat16", ("d0", "d1")),
-        "K": ((seq_k, d_k), "bfloat16", ("d2", "d1")),
-        "V": ((seq_k, d_v), "bfloat16", ("d2", "d3")),
-    }
+    input_specs = {"Q": ((seq_q, d_k), "bfloat16"), "K": ((seq_k, d_k), "bfloat16"), "V": ((seq_k, d_v), "bfloat16")}
     kernel_src = render(double_matmul_nkigym, input_specs=input_specs)
 
     golden_source = inspect.getsource(double_matmul_numpy)
