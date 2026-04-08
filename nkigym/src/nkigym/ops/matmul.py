@@ -2,13 +2,6 @@
 
 stationary(K, M).T @ moving(K, N) -> output(M, N).
 Accumulates into PSUM in fp32 regardless of input dtype.
-
-Buffer layout:
-- Intra-op: 2D ``(op_tile_P, op_tile_F)``.
-- Inter-op: 4D ``(min_tile_M, total_tiles_M, total_tiles_N, min_tile_N)``.
-
-Flat tile index = ``i_block * intlv + i_interleave_group * gpi``.
-For gpi > 1, reshape merges consecutive groups into the free dim.
 """
 
 from typing import ClassVar
@@ -16,14 +9,7 @@ from typing import ClassVar
 import numpy as np
 
 from nkigym.ops.base import NKIOp, RenderContext
-from nkigym.ops.common import emit_outer_loops, flat_tile_index, flat_tile_range, hbm_chunk_range, intra_slice
-
-_I1 = " " * 4
-_I2 = " " * 8
-_I3 = " " * 12
-_I4 = " " * 16
-_I5 = " " * 20
-_I6 = " " * 24
+from nkigym.ops.common import emit_outer_loops, flat_terms, flat_terms_merged, hbm_range, ind, intra_slice, linear_expr
 
 MATMUL_FREE_MAX = 512
 
@@ -40,7 +26,7 @@ def _emit_buffers(psum_name: str, sbuf_stat: str, sbuf_mov: str, sbuf_out: str, 
     if cfg["is_final"]:
         lines.append(f"{sbuf_out} = nl.ndarray(({op_M}, {op_N}), dtype=nl.{cfg['stat_dtype']}, buffer=nl.sbuf)")
     else:
-        min_M, min_N = cfg["min_M"], cfg["min_N"]
+        min_M, min_N = cfg["min_tile_M"], cfg["min_tile_N"]
         total_M, total_N = cfg["total_M"], cfg["total_N"]
         lines.append(
             f"{sbuf_out} = nl.ndarray("
@@ -50,78 +36,85 @@ def _emit_buffers(psum_name: str, sbuf_stat: str, sbuf_mov: str, sbuf_out: str, 
     return lines
 
 
-def _emit_loops(cfg: dict, psum_name: str, psum_sl: str) -> list[str]:
-    """Emit block/tile/ig loop nest with memset for M, N, K dims."""
+def _emit_loops(cfg: dict, psum_name: str, psum_sl: str, dim_order: tuple[str, ...]) -> tuple[list[str], int, int]:
+    """Emit block/psum_batch/tile/ig loop nest with memset for M, N, K dims.
+
+    Returns:
+        ``(lines, memset_depth, inner_depth)`` where *memset_depth*
+        is the depth for memset/writeback and *inner_depth* is
+        the depth inside the K reduction loops for DMA/compute.
+    """
     dim_M, dim_N, dim_K = cfg["dim_M"], cfg["dim_N"], cfg["dim_K"]
-    dim_order = cfg.get("dim_order", (dim_M, dim_N))
     num_blocks = {dim_M: cfg["num_blocks_M"], dim_N: cfg["num_blocks_N"]}
-    chunks = {dim_M: cfg["chunks_M"], dim_N: cfg["chunks_N"]}
+    tpb_hbm = {dim_M: cfg["tpb_hbm_M"], dim_N: cfg["tpb_hbm_N"]}
+    tpb_psum = {dim_M: cfg["tpb_psum_M"], dim_N: cfg["tpb_psum_N"]}
+    ig_trips = {dim_M: cfg["ig_trips_M"], dim_N: cfg["ig_trips_N"]}
 
-    lines = emit_outer_loops(dim_order, num_blocks)
-    n_outer = len(dim_order) * 2
+    lines = emit_outer_loops(dim_order, num_blocks, tpb_hbm, tpb_psum)
+
+    n_outer = len(dim_order) * 3
     for j, did in enumerate(dim_order):
-        indent = " " * (4 * (n_outer + j))
-        lines.append(f"{indent}for i_interleave_group_{did} in nl.affine_range({chunks[did]}):")
-    lines.append(f"{_I6}nisa.memset(dst={psum_name}[{psum_sl}], value=0.0)")
-    lines.append(f"{_I6}for i_block_{dim_K} in nl.affine_range({cfg['num_blocks_K']}):")
-    lines.append(f"{_I6}{_I1}for i_tile_{dim_K} in nl.affine_range(1):")
-    lines.append(f"{_I6}{_I2}for i_interleave_group_{dim_K} in nl.affine_range({cfg['chunks_K']}):")
-    return lines
+        lines.append(f"{ind(n_outer + j)}for i_ig_{did} in nl.affine_range({ig_trips[did]}):")
+
+    memset_depth = n_outer + len(dim_order)
+    d = ind(memset_depth)
+    lines.append(f"{d}nisa.memset(dst={psum_name}[{psum_sl}], value=0.0)")
+    lines.append(f"{d}for i_block_{dim_K} in nl.affine_range({cfg['num_blocks_K']}):")
+    lines.append(f"{ind(memset_depth + 1)}for i_psum_batch_{dim_K} in nl.affine_range({cfg['psum_batches_K']}):")
+    lines.append(f"{ind(memset_depth + 2)}for i_tile_{dim_K} in nl.affine_range({cfg['tpb_psum_K']}):")
+    lines.append(f"{ind(memset_depth + 3)}for i_ig_{dim_K} in nl.affine_range({cfg['ig_trips_K']}):")
+
+    inner_depth = memset_depth + 4
+    return lines, memset_depth, inner_depth
 
 
-def _emit_dma_loads(cfg: dict, sbuf_stat: str, sbuf_mov: str) -> list[str]:
+def _emit_dma_loads(cfg: dict, sbuf_stat: str, sbuf_mov: str, depth: int) -> list[str]:
     """Emit DMA load lines for HBM operands.
 
     Args:
         cfg: Configuration dict with tile sizes and HBM flags.
         sbuf_stat: Stationary staging buffer name.
         sbuf_mov: Moving staging buffer name.
+        depth: Indentation depth.
 
     Returns:
         List of DMA copy source lines.
     """
     lines: list[str] = []
-    inner = _I6 + _I3
+    d = ind(depth)
     if cfg["stat_from_hbm"]:
         stat_sl = intra_slice(cfg["op_K"], cfg["op_M"])
-        k_rng = hbm_chunk_range(
-            f"i_block_{cfg['dim_K']}", cfg["unified_K"], f"i_interleave_group_{cfg['dim_K']}", cfg["op_K"]
-        )
-        m_rng = hbm_chunk_range(
-            f"i_block_{cfg['dim_M']}", cfg["unified_M"], f"i_interleave_group_{cfg['dim_M']}", cfg["op_M"]
-        )
-        lines.append(f"{inner}nisa.dma_copy(dst={sbuf_stat}[{stat_sl}], src={cfg['stat_name']}[{k_rng}, {m_rng}])")
+        k_rng = hbm_range(cfg, "K")
+        m_rng = hbm_range(cfg, "M")
+        lines.append(f"{d}nisa.dma_copy(dst={sbuf_stat}[{stat_sl}], src={cfg['stat_name']}[{k_rng}, {m_rng}])")
     if cfg["mov_from_hbm"]:
         mov_sl = intra_slice(cfg["op_K"], cfg["op_N"])
-        k_rng = hbm_chunk_range(
-            f"i_block_{cfg['dim_K']}", cfg["unified_K"], f"i_interleave_group_{cfg['dim_K']}", cfg["op_K"]
-        )
-        n_rng = hbm_chunk_range(
-            f"i_block_{cfg['dim_N']}", cfg["unified_N"], f"i_interleave_group_{cfg['dim_N']}", cfg["op_N"]
-        )
-        lines.append(f"{inner}nisa.dma_copy(dst={sbuf_mov}[{mov_sl}], src={cfg['mov_name']}[{k_rng}, {n_rng}])")
+        k_rng = hbm_range(cfg, "K")
+        n_rng = hbm_range(cfg, "N")
+        lines.append(f"{d}nisa.dma_copy(dst={sbuf_mov}[{mov_sl}], src={cfg['mov_name']}[{k_rng}, {n_rng}])")
     return lines
 
 
-def _emit_compute(cfg: dict, psum_name: str, sbuf_stat: str, sbuf_mov: str) -> list[str]:
-    """Emit nc_matmul call with flat tile indexing for operand reads.
+def _emit_compute(cfg: dict, psum_name: str, sbuf_stat: str, sbuf_mov: str, depth: int) -> list[str]:
+    """Emit nc_matmul call with operand read expressions.
 
     Args:
         cfg: Configuration dict with tile sizes and operand info.
         psum_name: PSUM buffer variable name.
         sbuf_stat: Stationary staging buffer name.
         sbuf_mov: Moving staging buffer name.
+        depth: Indentation depth.
 
     Returns:
         List of nc_matmul source lines.
     """
-    inner = _I6 + _I3
+    d = ind(depth)
     psum_sl = intra_slice(cfg["op_M"], cfg["op_N"])
 
     stat_expr = _operand_read_expr(cfg, "stat", sbuf_stat, cfg["op_K"], cfg["op_M"], cfg["gpi_M"])
     mov_expr = _operand_read_expr(cfg, "mov", sbuf_mov, cfg["op_K"], cfg["op_N"], cfg["gpi_N"])
 
-    return [f"{inner}nisa.nc_matmul(dst={psum_name}[{psum_sl}], stationary={stat_expr}, moving={mov_expr})"]
+    return [f"{d}nisa.nc_matmul(dst={psum_name}[{psum_sl}], stationary={stat_expr}, moving={mov_expr})"]
 
 
 def _operand_read_expr(cfg: dict, role: str, sbuf_name: str, op_p: int, op_f: int, gpi_f: int) -> str:
@@ -144,12 +137,12 @@ def _operand_read_expr(cfg: dict, role: str, sbuf_name: str, op_p: int, op_f: in
     """
     from_hbm = cfg[f"{role}_from_hbm"]
     if from_hbm:
-        expr = f"{sbuf_name}[{intra_slice(op_p, op_f)}]"
+        result = f"{sbuf_name}[{intra_slice(op_p, op_f)}]"
     elif gpi_f > 1:
-        expr = _interop_reshape_read(cfg, role, op_f, gpi_f)
+        result = _interop_reshape_read(cfg, role, op_f, gpi_f)
     else:
-        expr = _interop_simple_read(cfg, role)
-    return expr
+        result = _interop_simple_read(cfg, role)
+    return result
 
 
 def _interop_simple_read(cfg: dict, role: str) -> str:
@@ -163,17 +156,12 @@ def _interop_simple_read(cfg: dict, role: str) -> str:
         Slice expression for the inter-op buffer.
     """
     tensor_name = cfg[f"{role}_name"]
-    dim_K = cfg["dim_K"]
-    dim_F = cfg["dim_M"] if role == "stat" else cfg["dim_N"]
-    min_K, min_F = cfg["min_K"], cfg["min_M"] if role == "stat" else cfg["min_N"]
-    intlv_K = cfg["intlv_K"]
-    intlv_F = cfg["intlv_M"] if role == "stat" else cfg["intlv_N"]
+    suffix_F = "M" if role == "stat" else "N"
+    min_K = cfg["min_tile_K"]
+    min_F = cfg[f"min_tile_{suffix_F}"]
 
-    bk, ck = f"i_block_{dim_K}", f"i_interleave_group_{dim_K}"
-    bf, cf = f"i_block_{dim_F}", f"i_interleave_group_{dim_F}"
-
-    idx_K = flat_tile_index(bk, intlv_K, ck, cfg["gpi_K"])
-    idx_F = flat_tile_index(bf, intlv_F, cf, 1)
+    idx_K = linear_expr(flat_terms(cfg, "K"))
+    idx_F = linear_expr(flat_terms(cfg, suffix_F, gpi_override=1))
     return f"sbuf_{tensor_name}[0:{min_K}, {idx_K}, {idx_F}, 0:{min_F}]"
 
 
@@ -181,8 +169,7 @@ def _interop_reshape_read(cfg: dict, role: str, op_f: int, gpi_f: int) -> str:
     """Read inter-op 4D buffer with reshape-then-slice (gpi_f > 1).
 
     Reshapes the full buffer to merge gpi_f consecutive groups into
-    the free dim, then slices. This avoids the NKI simulator limitation
-    where reshape on a sliced view uses the full backing array size.
+    the free dim, then slices.
 
     Args:
         cfg: Configuration dict.
@@ -194,67 +181,60 @@ def _interop_reshape_read(cfg: dict, role: str, op_f: int, gpi_f: int) -> str:
         ``buffer.reshape(merged)[slice]`` expression string.
     """
     tensor_name = cfg[f"{role}_name"]
-    dim_K = cfg["dim_K"]
-    dim_F = cfg["dim_M"] if role == "stat" else cfg["dim_N"]
-    min_K = cfg["min_K"]
-    intlv_K = cfg["intlv_K"]
-    intlv_F = cfg["intlv_M"] if role == "stat" else cfg["intlv_N"]
+    suffix_F = "M" if role == "stat" else "N"
+    min_K = cfg["min_tile_K"]
     total_K = cfg["total_K"]
-    total_F = cfg["total_M"] if role == "stat" else cfg["total_N"]
-    chunks_per_block_F = intlv_F // gpi_f
+    total_F = cfg[f"total_{suffix_F}"]
 
-    bk, ck = f"i_block_{dim_K}", f"i_interleave_group_{dim_K}"
-    bf, cf = f"i_block_{dim_F}", f"i_interleave_group_{dim_F}"
+    idx_K = linear_expr(flat_terms(cfg, "K"))
+    idx_F = linear_expr(flat_terms_merged(cfg, suffix_F))
 
     reshape = f"({min_K}, {total_K}, {total_F // gpi_f}, {op_f})"
-    idx_K = flat_tile_index(bk, intlv_K, ck, cfg["gpi_K"])
-    idx_F = flat_tile_index(bf, chunks_per_block_F, cf, 1)
     sl = f"0:{min_K}, {idx_K}, {idx_F}, 0:{op_f}"
     return f"sbuf_{tensor_name}.reshape({reshape})[{sl}]"
 
 
-def _emit_writeback(cfg: dict, psum_name: str, sbuf_out: str) -> list[str]:
+def _emit_writeback(cfg: dict, psum_name: str, sbuf_out: str, depth: int) -> list[str]:
     """Emit tensor_copy from PSUM to SBUF and optional DMA store.
 
     Args:
         cfg: Configuration dict with tile sizes and flags.
         psum_name: PSUM buffer variable name.
         sbuf_out: Output SBUF buffer name.
+        depth: Indentation depth.
 
     Returns:
         List of writeback source lines.
     """
-    dim_M, dim_N = cfg["dim_M"], cfg["dim_N"]
     op_M, op_N = cfg["op_M"], cfg["op_N"]
     psum_sl = intra_slice(op_M, op_N)
     psum_src = f"{psum_name}[{psum_sl}]"
+    d = ind(depth)
 
     lines: list[str] = []
     if cfg["is_final"]:
         out_sl = intra_slice(op_M, op_N)
-        lines.append(f"{_I6}nisa.tensor_copy(dst={sbuf_out}[{out_sl}], src={psum_src})")
-        m_rng = hbm_chunk_range(f"i_block_{dim_M}", cfg["unified_M"], f"i_interleave_group_{dim_M}", op_M)
-        n_rng = hbm_chunk_range(f"i_block_{dim_N}", cfg["unified_N"], f"i_interleave_group_{dim_N}", op_N)
-        lines.append(f"{_I6}nisa.dma_copy(dst=hbm_{cfg['output_name']}[{m_rng}, {n_rng}], src={sbuf_out}[{out_sl}])")
+        lines.append(f"{d}nisa.tensor_copy(dst={sbuf_out}[{out_sl}], src={psum_src})")
+        m_rng = hbm_range(cfg, "M")
+        n_rng = hbm_range(cfg, "N")
+        lines.append(f"{d}nisa.dma_copy(dst=hbm_{cfg['output_name']}[{m_rng}, {n_rng}], src={sbuf_out}[{out_sl}])")
     else:
-        min_M, min_N = cfg["min_M"], cfg["min_N"]
-        intlv_M, intlv_N = cfg["intlv_M"], cfg["intlv_N"]
-        gpi_M, gpi_N = cfg["gpi_M"], cfg["gpi_N"]
+        min_M = cfg["min_tile_M"]
+        min_N = cfg["min_tile_N"]
+        gpi_N = cfg["gpi_N"]
 
-        bm, cm = f"i_block_{dim_M}", f"i_interleave_group_{dim_M}"
-        bn, cn = f"i_block_{dim_N}", f"i_interleave_group_{dim_N}"
-
-        idx_M = flat_tile_index(bm, intlv_M, cm, gpi_M)
+        idx_M = linear_expr(flat_terms(cfg, "M"))
 
         if gpi_N > 1:
-            rng_N = flat_tile_range(bn, intlv_N, cn, gpi_N)
+            start_N = linear_expr(flat_terms(cfg, "N"))
+            rng_N = f"{start_N}:{start_N}+{gpi_N}"
             out_sl = f"0:{min_M}, {idx_M}, {rng_N}, 0:{min_N}"
             psum_src += f".reshape(({min_M}, {gpi_N}, {min_N}))"
         else:
-            idx_N = flat_tile_index(bn, intlv_N, cn, gpi_N)
+            idx_N = linear_expr(flat_terms(cfg, "N"))
             out_sl = f"0:{min_M}, {idx_M}, {idx_N}, 0:{min_N}"
 
-        lines.append(f"{_I6}nisa.tensor_copy(dst={sbuf_out}[{out_sl}], src={psum_src})")
+        lines.append(f"{d}nisa.tensor_copy(dst={sbuf_out}[{out_sl}], src={psum_src})")
     return lines
 
 
@@ -307,10 +287,11 @@ class NKIMatmul(NKIOp):
         is_final: bool,
         *,
         pre_allocated: frozenset[str] = frozenset(),
+        inner_depth: int = 6,
     ) -> list[str]:
         """Emit inner lines for fused rendering (no outer block/tile loops)."""
         cfg = _build_config(ctx, operand_map, output_name, is_final)
-        return _render_matmul_inner(cfg, pre_allocated)
+        return _render_matmul_inner(cfg, pre_allocated, inner_depth)
 
 
 def _build_config(ctx: RenderContext, operand_map: dict[str, str], output_name: str, is_final: bool) -> dict:
@@ -330,54 +311,72 @@ def _build_config(ctx: RenderContext, operand_map: dict[str, str], output_name: 
     dim_K, dim_M = stat.dim_ids
     dim_N = mov.dim_ids[1]
 
-    unified_K, unified_M, unified_N = ctx.dim_tiles[dim_K], ctx.dim_tiles[dim_M], ctx.dim_tiles[dim_N]
-    min_K, min_M, min_N = ctx.dim_min_tiles[dim_K], ctx.dim_min_tiles[dim_M], ctx.dim_min_tiles[dim_N]
-    intlv_K = unified_K // min_K
-    intlv_M = unified_M // min_M
-    intlv_N = unified_N // min_N
+    max_tile_K = ctx.dim_tiles[dim_K]
+    max_tile_M = ctx.dim_tiles[dim_M]
+    max_tile_N = ctx.dim_tiles[dim_N]
+    min_tile_K = ctx.dim_min_tiles[dim_K]
+    min_tile_M = ctx.dim_min_tiles[dim_M]
+    min_tile_N = ctx.dim_min_tiles[dim_N]
+    interleave_K = max_tile_K // min_tile_K
+    interleave_M = max_tile_M // min_tile_M
+    interleave_N = max_tile_N // min_tile_N
 
-    op_K = min(unified_K, 128)
-    op_M = min(unified_M, 128)
-    op_N = min(unified_N, MATMUL_FREE_MAX)
+    tpb_hbm_K = ctx.dim_tpb_hbm[dim_K]
+    tpb_hbm_M = ctx.dim_tpb_hbm[dim_M]
+    tpb_hbm_N = ctx.dim_tpb_hbm[dim_N]
+    tpb_psum_K = ctx.dim_tpb_psum[dim_K]
+    tpb_psum_M = ctx.dim_tpb_psum[dim_M]
+    tpb_psum_N = ctx.dim_tpb_psum[dim_N]
 
-    num_blocks_K = stat.shape[0] // unified_K
-    num_blocks_M = stat.shape[1] // unified_M
-    num_blocks_N = mov.shape[1] // unified_N
+    op_K = min(max_tile_K, 128)
+    op_M = min(max_tile_M, 128)
+    op_N = min(max_tile_N, MATMUL_FREE_MAX)
+
+    num_blocks_K = stat.shape[0] // (tpb_hbm_K * max_tile_K)
+    num_blocks_M = stat.shape[1] // (tpb_hbm_M * max_tile_M)
+    num_blocks_N = mov.shape[1] // (tpb_hbm_N * max_tile_N)
 
     return {
         "dim_K": dim_K,
         "dim_M": dim_M,
         "dim_N": dim_N,
-        "unified_K": unified_K,
-        "unified_M": unified_M,
-        "unified_N": unified_N,
-        "min_K": min_K,
-        "min_M": min_M,
-        "min_N": min_N,
-        "intlv_K": intlv_K,
-        "intlv_M": intlv_M,
-        "intlv_N": intlv_N,
+        "max_tile_K": max_tile_K,
+        "max_tile_M": max_tile_M,
+        "max_tile_N": max_tile_N,
+        "min_tile_K": min_tile_K,
+        "min_tile_M": min_tile_M,
+        "min_tile_N": min_tile_N,
+        "interleave_K": interleave_K,
+        "interleave_M": interleave_M,
+        "interleave_N": interleave_N,
+        "tpb_hbm_K": tpb_hbm_K,
+        "tpb_hbm_M": tpb_hbm_M,
+        "tpb_hbm_N": tpb_hbm_N,
+        "tpb_psum_K": tpb_psum_K,
+        "tpb_psum_M": tpb_psum_M,
+        "tpb_psum_N": tpb_psum_N,
         "op_K": op_K,
         "op_M": op_M,
         "op_N": op_N,
-        "gpi_K": op_K // min_K,
-        "gpi_M": op_M // min_M,
-        "gpi_N": op_N // min_N,
-        "chunks_K": unified_K // op_K,
-        "chunks_M": unified_M // op_M,
-        "chunks_N": unified_N // op_N,
+        "gpi_K": op_K // min_tile_K,
+        "gpi_M": op_M // min_tile_M,
+        "gpi_N": op_N // min_tile_N,
+        "ig_trips_K": max_tile_K // op_K,
+        "ig_trips_M": max_tile_M // op_M,
+        "ig_trips_N": max_tile_N // op_N,
+        "psum_batches_K": tpb_hbm_K // tpb_psum_K,
+        "psum_batches_M": tpb_hbm_M // tpb_psum_M,
+        "psum_batches_N": tpb_hbm_N // tpb_psum_N,
         "num_blocks_K": num_blocks_K,
         "num_blocks_M": num_blocks_M,
         "num_blocks_N": num_blocks_N,
-        "total_K": num_blocks_K * intlv_K,
-        "total_M": num_blocks_M * intlv_M,
-        "total_N": num_blocks_N * intlv_N,
+        "total_K": num_blocks_K * tpb_hbm_K * interleave_K,
+        "total_M": num_blocks_M * tpb_hbm_M * interleave_M,
+        "total_N": num_blocks_N * tpb_hbm_N * interleave_N,
         "stat_from_hbm": stat.location == "hbm",
         "mov_from_hbm": mov.location == "hbm",
         "stat_name": stat.name,
         "mov_name": mov.name,
-        "stat_shape": stat.shape,
-        "mov_shape": mov.shape,
         "stat_dtype": stat.dtype,
         "mov_dtype": mov.dtype,
         "output_name": output_name,
@@ -385,17 +384,16 @@ def _build_config(ctx: RenderContext, operand_map: dict[str, str], output_name: 
     }
 
 
-def _render_matmul_inner(cfg: dict, pre_allocated: frozenset[str] = frozenset()) -> list[str]:
+def _render_matmul_inner(cfg: dict, pre_allocated: frozenset[str] = frozenset(), base_depth: int = 6) -> list[str]:
     """Build matmul inner lines (inside shared outer loops) for fused rendering.
 
-    Emits interleave-group loops, memset, K reduction, DMA loads,
-    compute, and degree-1 writeback.  Indent starts at _I4 to match
-    the position after 4 shared outer block/tile loops.
+    Emits ig loops, memset, K reduction, DMA loads, compute,
+    and degree-1 writeback.
 
     Args:
-        cfg: Configuration dict from ``_build_config`` with
-            ``degree_1 == True`` for the intermediate buffer.
+        cfg: Configuration dict from ``_build_config``.
         pre_allocated: Buffer names already allocated by the caller.
+        base_depth: Nesting depth at which inner lines start.
 
     Returns:
         List of NKI source lines for the matmul inner part.
@@ -406,31 +404,37 @@ def _render_matmul_inner(cfg: dict, pre_allocated: frozenset[str] = frozenset())
     sbuf_mov = f"sbuf_{cfg['mov_name']}"
     op_M, op_N = cfg["op_M"], cfg["op_N"]
     psum_sl = intra_slice(op_M, op_N)
-    min_M, min_N = cfg["min_M"], cfg["min_N"]
-    intlv_N = cfg["intlv_N"]
+    min_M, min_N = cfg["min_tile_M"], cfg["min_tile_N"]
+    interleave_N = cfg["interleave_N"]
     gpi_N = cfg["gpi_N"]
+
+    dim_M, dim_N, dim_K = cfg["dim_M"], cfg["dim_N"], cfg["dim_K"]
+    n = base_depth
 
     lines: list[str] = []
 
-    lines.append(f"{_I4}{psum_name} = nl.ndarray(({op_M}, {op_N}), dtype=nl.float32, buffer=nl.psum)")
+    lines.append(f"{ind(n)}{psum_name} = nl.ndarray(({op_M}, {op_N}), dtype=nl.float32, buffer=nl.psum)")
 
     if sbuf_out not in pre_allocated:
         lines.append(
-            f"{_I4}{sbuf_out} = nl.ndarray("
-            f"({min_M}, 1, {intlv_N}, {min_N}),"
+            f"{ind(n)}{sbuf_out} = nl.ndarray("
+            f"({min_M}, 1, {interleave_N}, {min_N}),"
             f" dtype=nl.{cfg['stat_dtype']}, buffer=nl.sbuf)"
         )
 
-    dim_M, dim_N, dim_K = cfg["dim_M"], cfg["dim_N"], cfg["dim_K"]
-    lines.append(f"{_I4}for i_interleave_group_{dim_M} in nl.affine_range({cfg['chunks_M']}):")
-    lines.append(f"{_I5}for i_interleave_group_{dim_N} in nl.affine_range({cfg['chunks_N']}):")
-    lines.append(f"{_I6}nisa.memset(dst={psum_name}[{psum_sl}], value=0.0)")
-    lines.append(f"{_I6}for i_block_{dim_K} in nl.affine_range({cfg['num_blocks_K']}):")
-    lines.append(f"{_I6}{_I1}for i_tile_{dim_K} in nl.affine_range(1):")
-    lines.append(f"{_I6}{_I2}for i_interleave_group_{dim_K} in nl.affine_range({cfg['chunks_K']}):")
+    lines.append(f"{ind(n)}for i_ig_{dim_M} in nl.affine_range({cfg['ig_trips_M']}):")
+    lines.append(f"{ind(n + 1)}for i_ig_{dim_N} in nl.affine_range({cfg['ig_trips_N']}):")
 
-    lines.extend(_emit_dma_loads(cfg, sbuf_stat, sbuf_mov))
-    lines.extend(_emit_compute(cfg, psum_name, sbuf_stat, sbuf_mov))
+    memset_d = n + 2
+    lines.append(f"{ind(memset_d)}nisa.memset(dst={psum_name}[{psum_sl}], value=0.0)")
+    lines.append(f"{ind(memset_d)}for i_block_{dim_K} in nl.affine_range({cfg['num_blocks_K']}):")
+    lines.append(f"{ind(memset_d + 1)}for i_psum_batch_{dim_K} in nl.affine_range({cfg['psum_batches_K']}):")
+    lines.append(f"{ind(memset_d + 2)}for i_tile_{dim_K} in nl.affine_range({cfg['tpb_psum_K']}):")
+    lines.append(f"{ind(memset_d + 3)}for i_ig_{dim_K} in nl.affine_range({cfg['ig_trips_K']}):")
+
+    inner_d = memset_d + 4
+    lines.extend(_emit_dma_loads(cfg, sbuf_stat, sbuf_mov, inner_d))
+    lines.extend(_emit_compute(cfg, psum_name, sbuf_stat, sbuf_mov, inner_d))
 
     psum_src = f"{psum_name}[{psum_sl}]"
     if gpi_N > 1:
@@ -438,7 +442,7 @@ def _render_matmul_inner(cfg: dict, pre_allocated: frozenset[str] = frozenset())
         psum_src += f".reshape(({min_M}, {gpi_N}, {min_N}))"
     else:
         out_sl = f"0:{min_M}, 0, 0, 0:{min_N}"
-    lines.append(f"{_I6}nisa.tensor_copy(dst={sbuf_out}[{out_sl}], src={psum_src})")
+    lines.append(f"{ind(memset_d)}nisa.tensor_copy(dst={sbuf_out}[{out_sl}], src={psum_src})")
 
     return lines
 
@@ -452,6 +456,7 @@ def _render_matmul(cfg: dict) -> list[str]:
     Returns:
         Complete list of NKI source lines for this matmul.
     """
+    dim_order = cfg.get("dim_order", (cfg["dim_M"], cfg["dim_N"]))
     sbuf_out = f"sbuf_{cfg['output_name']}"
     psum_name = f"psum_{cfg['output_name']}"
     sbuf_stat = f"sbuf_{cfg['stat_name']}"
@@ -465,8 +470,9 @@ def _render_matmul(cfg: dict) -> list[str]:
         f' -> {cfg["output_name"]}({cfg["dim_M"]}, {cfg["dim_N"]})"""'
     ]
     lines.extend(_emit_buffers(psum_name, sbuf_stat, sbuf_mov, sbuf_out, cfg))
-    lines.extend(_emit_loops(cfg, psum_name, psum_sl))
-    lines.extend(_emit_dma_loads(cfg, sbuf_stat, sbuf_mov))
-    lines.extend(_emit_compute(cfg, psum_name, sbuf_stat, sbuf_mov))
-    lines.extend(_emit_writeback(cfg, psum_name, sbuf_out))
+    loop_lines, memset_depth, inner_depth = _emit_loops(cfg, psum_name, psum_sl, dim_order)
+    lines.extend(loop_lines)
+    lines.extend(_emit_dma_loads(cfg, sbuf_stat, sbuf_mov, inner_depth))
+    lines.extend(_emit_compute(cfg, psum_name, sbuf_stat, sbuf_mov, inner_depth))
+    lines.extend(_emit_writeback(cfg, psum_name, sbuf_out, memset_depth))
     return lines

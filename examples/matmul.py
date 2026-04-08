@@ -74,6 +74,7 @@ if __name__ == "__main__":
         hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5", "gym-6"],
         cache_dir=str(cache_dir),
         num_variants=10,
+        transforms=[],
         atol=1e-3,
         rtol=1e-3,
         warmup=10,

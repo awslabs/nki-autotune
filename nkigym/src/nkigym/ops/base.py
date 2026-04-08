@@ -40,15 +40,19 @@ class RenderContext:
     Attributes:
         tensors: All tensors in scope, keyed by name.
         kwargs: Non-tensor keyword arguments from the op call.
-        dim_tiles: Maps axis label to unified tile size (max across ops).
-        dim_min_tiles: Maps axis label to min op tile size.
-            ``interleave_groups = dim_tiles[d] // dim_min_tiles[d]``.
+        dim_tiles: Maps dim ID to max tile size (max across ops).
+        dim_min_tiles: Maps dim ID to min tile size (min across ops).
+            ``interleave = dim_tiles[d] // dim_min_tiles[d]``.
+        dim_tpb_hbm: Maps dim ID to tiles per HBM block (tunable, default 1).
+        dim_tpb_psum: Maps dim ID to tiles per PSUM batch (tunable, default tpb_hbm).
     """
 
     tensors: dict[str, Tensor] = field(default_factory=dict)
     kwargs: dict[str, Any] = field(default_factory=dict)
     dim_tiles: dict[str, int] = field(default_factory=dict)
     dim_min_tiles: dict[str, int] = field(default_factory=dict)
+    dim_tpb_hbm: dict[str, int] = field(default_factory=dict)
+    dim_tpb_psum: dict[str, int] = field(default_factory=dict)
 
 
 class NKIOp:
@@ -94,6 +98,7 @@ class NKIOp:
         is_final: bool,
         *,
         pre_allocated: frozenset[str] = frozenset(),
+        inner_depth: int = 6,
     ) -> list[str]:
         """Emit inner lines for fused rendering (no outer block/tile loops).
 
@@ -105,5 +110,6 @@ class NKIOp:
             output_name: Output tensor name.
             is_final: Whether this is the final output.
             pre_allocated: Buffer names already allocated by the caller.
+            inner_depth: Nesting depth at which inner lines start.
         """
         raise NotImplementedError(f"{self.NAME} does not support fused rendering")

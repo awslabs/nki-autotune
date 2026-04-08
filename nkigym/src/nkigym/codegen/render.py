@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from nkigym.ops.base import NKIOp, RenderContext, Tensor
+from nkigym.ops.common import emit_outer_loops
 from nkigym.ops.matmul import MATMUL_FREE_MAX
 from nkigym.ops.transpose import TRANSPOSE_BLOCK
 
@@ -347,6 +348,8 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple]) -> 
     per_op_maps, dim_tiles, dim_min_tiles = _process_ops(ops, ctx, return_name)
     ctx.dim_tiles = dim_tiles
     ctx.dim_min_tiles = dim_min_tiles
+    ctx.dim_tpb_hbm = {d: 1 for d in dim_tiles}
+    ctx.dim_tpb_psum = {d: 1 for d in dim_tiles}
 
     fusion_groups = [[i] for i in range(len(ops))]
     group_dim_orders = [_default_singleton_dim_order(ops[g[0]][0], per_op_maps[g[0]]) for g in fusion_groups]
@@ -411,7 +414,8 @@ def _render_fused_group(ir: KernelIR, group: list[int], dim_order: tuple[str, ..
         size = _dim_size(ir.ctx, dim_id)
         if size is None:
             raise ValueError(f"Cannot find size for dim {dim_id!r}")
-        num_blocks_by_dim[dim_id] = size // ir.ctx.dim_tiles[dim_id]
+        tpb_hbm = ir.ctx.dim_tpb_hbm[dim_id]
+        num_blocks_by_dim[dim_id] = size // (tpb_hbm * ir.ctx.dim_tiles[dim_id])
 
     pre_allocated: set[str] = set()
     lines: list[str] = []
@@ -427,15 +431,17 @@ def _render_fused_group(ir: KernelIR, group: list[int], dim_order: tuple[str, ..
 
     pre_allocated_frozen = frozenset(pre_allocated)
 
-    for i, dim_id in enumerate(dim_order):
-        indent = _INDENT * (i * 2)
-        lines.append(f"{indent}for i_block_{dim_id} in nl.affine_range({num_blocks_by_dim[dim_id]}):")
-        lines.append(f"{indent}{_INDENT}for i_tile_{dim_id} in nl.affine_range(1):")
+    tpb_hbm_dict = {d: ir.ctx.dim_tpb_hbm[d] for d in dim_order}
+    tpb_psum_dict = {d: ir.ctx.dim_tpb_psum[d] for d in dim_order}
+    lines.extend(emit_outer_loops(dim_order, num_blocks_by_dim, tpb_hbm_dict, tpb_psum_dict))
 
+    inner_depth = len(dim_order) * 3
     for op_idx in group:
         op, operand_map, output_name = ir.ops[op_idx]
         is_final = output_name == ir.return_name
-        for line in op.render_inner(ir.ctx, operand_map, output_name, is_final, pre_allocated=pre_allocated_frozen):
+        for line in op.render_inner(
+            ir.ctx, operand_map, output_name, is_final, pre_allocated=pre_allocated_frozen, inner_depth=inner_depth
+        ):
             lines.append(line)
 
     return lines
