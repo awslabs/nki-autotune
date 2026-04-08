@@ -1,47 +1,93 @@
 # Tiles Per Block
 
-`tiles_per_block` groups consecutive unified tiles into blocks, splitting each dimension's flat iteration into a two-level loop nest (outer block, inner tile). From §2:
+`tiles_per_block` groups consecutive unified tiles into blocks, changing the dimension's iteration granularity and staging buffer sizes.
 
 $$\texttt{unified\_tiles} = \frac{\texttt{dim\_size}}{\texttt{max\_tile\_size}} = \texttt{num\_blocks} \times \texttt{tiles\_per\_block}$$
 
-Must divide `unified_tiles`. Default is 1. Setting to T creates a two-level nest:
+Must divide `unified_tiles`. Default is 1. Setting to T:
+
+1. **Loop trip count.** The dimension's loop iterates `num_blocks` times instead of `unified_tiles`.
+2. **Staging buffers.** Buffers for tensors that depend on the dimension grow from 1 to T tiles on that dimension's axis. `load_tensor_block` has built-in loops over all tile slots — the buffer shape drives how many tiles are loaded per call.
+3. **Compute iteration.** Single-tile ops (e.g. `nc_matmul`) iterate over the T tiles in the buffer within each block.
+
+The transform applies independently to each dimension — any combination of per-dimension values is valid as long as each divides the dimension's `unified_tiles`.
+
+Two other transforms build on the block structure:
+
+- **Load placement** hoists loads across other dimensions' loops for cross-dimension reuse. Orthogonal to tiles_per_block, which determines the same-dimension buffer granularity.
+- **Dimension interleaving** separates the block-level iteration from within-block processing with other dimensions' loops in between, enabling section-based processing. Requires $\texttt{num\_blocks} > 1$.
+
+## Example
+
+Matmul from loop_reordering.md: `lhs_T(K=d0, M=d1) × rhs(K=d0, N=d2) → result(d1, d2)` with d0 (K, tile=128, 16 unified tiles), d1 (M, tile=128, 16 unified tiles), d2 (N, tile=512, 4 unified tiles). Order (d0, d1, d2). lhs_T depends on (d0, d1); rhs depends on (d0, d2).
+
+**Before** — `tiles_per_block_d0 = 1` (default, 16 blocks of 1 tile):
 
 ```python
-""" tiles_per_block = 1 (default) """
-for i_block_d in range(unified_tiles):
-    for i_tile_d in range(1):
-
-""" tiles_per_block = T """
-for i_block_d in range(unified_tiles // T):
-    for i_tile_d in range(T):
+sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), buffer=nl.sbuf)
+sbuf_rhs = nl.ndarray((128, 1, 1, 512), buffer=nl.sbuf)
+psum_output = nl.ndarray((128, 16, 4, 512), dtype=nl.float32, buffer=nl.psum)
+sbuf_output = nl.ndarray((128, 16, 4, 512), dtype=output.dtype, buffer=nl.sbuf)
+nisa.memset(dst=psum_output[0:128, 0:16, 0:4, 0:512], value=0.0)
+for i_d0 in range(16):
+    for i_d1 in range(16):
+        load_tensor_block(dst=sbuf_lhs_T, src=lhs_T, par_ofs=i_d0*128, free_ofs=i_d1*128)
+        for i_d2 in range(4):
+            load_tensor_block(dst=sbuf_rhs, src=rhs, par_ofs=i_d0*128, free_ofs=i_d2*512)
+            nisa.nc_matmul(dst=psum_output[0:128, i_d1, i_d2, 0:512],
+                stationary=sbuf_lhs_T[0:128, 0, 0, 0:128], moving=sbuf_rhs[0:128, 0, 0, 0:512])
+nisa.tensor_copy(psum_output -> sbuf_output)
+save_tensor_block(dst=output, src=sbuf_output, par_ofs=0, free_ofs=0)
 ```
 
-Total iterations are unchanged ($\texttt{num\_blocks} \times T = \texttt{unified\_tiles}$). `tiles_per_block` itself does not change buffer sizes or DMA — it creates a block/tile boundary that two other transforms exploit:
+**After** — `tiles_per_block = {"d0": 4}` (4 blocks of 4 tiles):
 
-- **Load placement** (§5.2) positions DMA loads between block and tile loops, loading data once per block and reusing across tile iterations within the block.
-- **Dimension interleaving** (§5.3) hoists the block loop above output dims while keeping the tile loop inside, enabling the flash attention section pattern.
+```python
+sbuf_lhs_T = nl.ndarray((128, 4, 1, 128), buffer=nl.sbuf)
+sbuf_rhs = nl.ndarray((128, 4, 1, 512), buffer=nl.sbuf)
+psum_output = nl.ndarray((128, 16, 4, 512), dtype=nl.float32, buffer=nl.psum)
+sbuf_output = nl.ndarray((128, 16, 4, 512), dtype=output.dtype, buffer=nl.sbuf)
+nisa.memset(dst=psum_output[0:128, 0:16, 0:4, 0:512], value=0.0)
+for i_d0 in range(4):
+    for i_d1 in range(16):
+        load_tensor_block(dst=sbuf_lhs_T, src=lhs_T, par_ofs=i_d0*4*128, free_ofs=i_d1*128)
+        for i_d2 in range(4):
+            load_tensor_block(dst=sbuf_rhs, src=rhs, par_ofs=i_d0*4*128, free_ofs=i_d2*512)
+            for i_k in range(4):
+                nisa.nc_matmul(dst=psum_output[0:128, i_d1, i_d2, 0:512],
+                    stationary=sbuf_lhs_T[0:128, i_k, 0, 0:128],
+                    moving=sbuf_rhs[0:128, i_k, 0, 0:512])
+nisa.tensor_copy(psum_output -> sbuf_output)
+save_tensor_block(dst=output, src=sbuf_output, par_ofs=0, free_ofs=0)
+```
 
-Per-block load placement collapses to per-tile when `tiles_per_block = 1` — both provide `interleave` sub-tiles. Increasing `tiles_per_block` widens the gap: per-block provides `T × interleave` sub-tiles while per-tile stays at `interleave`. Dimension interleaving works with any `num_blocks > 1`, but 1-tile blocks have high save/reload overhead per tile; increasing `tiles_per_block` amortizes that cost and gives per-block loads multiple tiles to pre-load.
+Changes:
 
-## Interaction with Multi-Buffer (§5.5)
+- **Buffers grow on d0.** `sbuf_lhs_T` from (128, **1**, 1, 128) to (128, **4**, 1, 128). `sbuf_rhs` from (128, **1**, 1, 512) to (128, **4**, 1, 512). Both tensors depend on d0 (par axis), so their par tile count grows to `tiles_per_block`.
+- **Loop trip count.** d0 loop: `range(16)` → `range(4)`. Offset: `i_d0*128` → `i_d0*4*128` (block start).
+- **Load granularity.** `load_tensor_block` reads the buffer shape and loads all 4 par tiles per call (built-in internal loop). One call per block replaces what was one call per tile.
+- **Compute iteration.** `for i_k in range(4)` iterates over the 4 K tiles in the buffer. Each `nc_matmul` indexes `sbuf_lhs_T[0:128, i_k, 0, 0:128]` and `sbuf_rhs[0:128, i_k, 0, 0:512]`.
+- **PSUM unchanged.** PSUM sizing depends on which output dims are inside K (loop reordering), not on tiles_per_block.
 
-Multi-buffering interacts with `tiles_per_block` differently at each loop level:
+### Valid values for d0
 
-- **Tile-level** (SBUF or PSUM): D and `tiles_per_block` share `i_tile`. Only D = 1 (unconstrained) or D = T (constrains `tiles_per_block = D`) are valid — NKI affine loops lack modular arithmetic, so `i_tile % D` is not expressible.
-- **Interleave-level** (PSUM, free dims only): D = interleave, driven by `i_ig`. No `tiles_per_block` constraint.
-- **Block-level** (PSUM, not in current search): D = num_blocks, driven by `i_block`. No `tiles_per_block` constraint (§5.5). Not generated by multi-buffer candidates.
+| T | num_blocks | Divisor of 16? |
+|---|---|---|
+| 1 | 16 | yes (default) |
+| 2 | 8 | yes |
+| 4 | 4 | yes |
+| 8 | 2 | yes |
+| 16 | 1 | yes |
 
-The candidate generation excludes dimensions where any tile-level buffer has D > 1 — changing `tiles_per_block` would break that buffer's `i_tile` indexing. Interleave-level buffers do not constrain `tiles_per_block`. In practice, set `tiles_per_block` before tile-level multi-buffer — once tile-level multi-buffer constrains a dimension, `tiles_per_block` can no longer change it.
+$T = 16$ collapses to a single block — interleaving becomes a no-op (`num_blocks = 1`), and the buffer holds all 16 tiles (equivalent to full placement on d0). The search explores all divisors; each creates a different trade-off between block count and tiles per block.
 
-## Representation
+## Representation and Candidates
 
 ```python
 tiles_per_block: dict[str, int]
 ```
 
 Maps dimension ID to tiles_per_block in `KernelIR`. Absent dimensions default to 1.
-
-## Candidate Generation
 
 ```python
 class TilesPerBlock(Transform):
@@ -70,55 +116,4 @@ class TilesPerBlock(Transform):
         return results
 ```
 
-Candidates only increase `tiles_per_block` — the search graph explores all valid divisors greater than the current value in a single step. Dimensions with tile-level multi-buffer D > 1 are excluded — detected by `D == tiles_per_block[dim_id]`, since tile-level `_apply` always sets both `buffer_degrees` and `tiles_per_block` to D while interleave-level `_apply_interleave` only sets `buffer_degrees`. Values are constrained to divisors of `unified_tiles`, so some section lengths are unreachable for input sizes where `unified_tiles` has few factors (e.g., `tiles_per_block = 16` requires `unified_tiles % 16 == 0`).
-
-## Example: Fused Double Matmul
-
-Fully fused `[[0,1,2,3,4]]`, dim order $(d_0, d_4, d_2, d_1)$, all inputs `(2048, 128)`. On d2: `unified_tiles = 4`, `interleave = 4`. Setting `tiles_per_block_d2 = 2` changes the d2 loops from 4 blocks × 1 tile to 2 blocks × 2 tiles:
-
-```python
-for i_block_d0 in range(16):
-    for i_tile_d0 in range(1):
-        for i_block_d4 in range(1):
-            for i_tile_d4 in range(1):
-                psum_output = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
-                nisa.memset(dst=psum_output[0:128, 0:128], value=0.0)
-                for i_block_d2 in range(2):              """ 2 blocks (was 4) """
-                    for i_tile_d2 in range(2):           """ 2 tiles/block (was 1) """
-                        psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
-                        nisa.memset(dst=psum_S[0:128, 0:512], value=0.0)
-                        for i_block_d1 in range(1):
-                            for i_tile_d1 in range(1):
-                                """ Ops 0-2: transpose Q, K; matmul → psum_S """
-                        sbuf_S = nl.ndarray((128, 1, 4, 128), ...)  """ degree-1 """
-                        nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
-                        for i_ig_d2 in range(4):
-                            """ Ops 3-4: transpose S; matmul → psum_output """
-                sbuf_output = nl.ndarray((128, 1, 1, 128), ...)
-                nisa.tensor_copy(dst=sbuf_output[...], src=psum_output[...])
-                nisa.dma_copy(dst=hbm_output[...], src=sbuf_output[...])
-```
-
-S stays degree-1 — no extra SBUF cost. The boundary between `i_block_d2` and `i_tile_d2` is where subsequent transforms act:
-
-- **Load placement** (§5.2): K/V DMA can move between block and tile, pre-loading `tiles_per_block × interleave = 8` raw sub-tiles per block.
-- **Dimension interleaving** (§5.3): `i_block_d2` can hoist above d0, wrapping Q groups — K/V loaded per block are reused across all 16 d0 iterations (16× DMA reduction).
-
-## Reference Kernel Mapping
-
-Hardware constants: `min_tile_size = 128` (`_V_TILE_SZ`), `max_tile_size = 512` (`_K_TILE_SZ`), `interleave = 4`.
-
-The reference kernel has a four-level d2 hierarchy: section (8192) → large_tile (2048) → K-tile (512) → V-tile (128). K/V are loaded per-section; MM2 PSUM rotates per-large-tile. Our three-level loop (`i_block` → `i_tile` → `i_ig`) maps V-tile/K-tile to interleave, leaving `tiles_per_block` to set the block granularity:
-
-| T | Block covers | Per-block K/V load | Key benefit |
-|---|---|---|---|
-| 4 | large tile (2048) | 16 sub-tiles | MM2 tile-level PSUM D=4 (§5.5) |
-| 16 | section (8192) | 64 sub-tiles | Section-level K/V loads |
-
-MM1 PSUM rotates at interleave-level (D=interleave=4), which is hardware-determined and independent of `tiles_per_block`. MM2 PSUM rotates at tile-level (D=`tiles_per_block`), so T=4 enables MM2's D=4 rotation; T=16 gives D=16 (> MAX_DEGREE), disabling it.
-
-The reference kernel achieves section-level K/V loading and large-tile PSUM rotation simultaneously via its 4-level hierarchy. Our 3-level framework captures one aspect per configuration; the search explores both.
-
-Interleaving (§5.3) requires `num_blocks > 1` on d2. T=4 gives `num_blocks = unified/4` — viable whenever `unified ≥ 8`. T=16 gives `num_blocks = unified/16` — requires `unified > 16` (seq_k > 8192) for interleaving. At `unified = 16` (seq_k = 8192), T=16 collapses to `num_blocks = 1`, disabling interleaving; T=4 with interleaving and full load placement on d2 loads all K/V once, matching the reference kernel's single-section case.
-
-With d2 interleaved above d0 (§5.3): `i_block_d2` wraps `i_block_d0` (128 tokens each) — K/V loaded per-block (§5.2) are reused across all d0 iterations.
+Candidates only increase `tiles_per_block` — all valid divisors greater than the current value are explored in a single step. Dimensions where tile-level multi-buffer has degree $D > 1$ are excluded — changing `tiles_per_block` would break the buffer's tile-loop indexing (detected by $D = \texttt{tiles\_per\_block}[d]$, since tile-level multi-buffer sets both `buffer_degrees` and `tiles_per_block` to $D$). Values are constrained to divisors of `unified_tiles`, so some block sizes are unreachable for input sizes where `unified_tiles` has few factors.
