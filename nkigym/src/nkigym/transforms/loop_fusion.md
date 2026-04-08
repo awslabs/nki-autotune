@@ -1,27 +1,41 @@
 # Loop Fusion
 
-Two adjacent fusion groups can share a single loop nest when: (1) their dimension sets overlap, (2) for every intermediate tensor between them, every dimension of that tensor is **fusable** for the consumer, and (3) for each intermediate tensor T, T's producing op is **non-blocking** on every dimension in both groups' dim sets (the intersection) that is absent from T. An op not involving a dimension is trivially non-blocking on it.
+Two adjacent fusion groups can share a single loop nest when:
 
-A dimension is **fusable** for an op when that op can process one tile at a time on the dimension without introducing new computation:
+1. **Shared dimensions**: their dimension sets overlap.
+2. **Consumer fusability**: for every intermediate tensor T (produced by group A, consumed by group B), every dimension of T is *fusable* for each op in B that consumes T.
+3. **Producer completeness**: for every intermediate tensor T, T's producing op is non-blocking on every dimension in dims_A ∩ dims_B that is absent from T.
 
-- **Non-blocking**: each tile is independently valid (e.g., matmul output axes M and N, transpose axes). The op produces correct partial results from each tile alone.
-- **In-place accumulating**: the op's ISA instruction uses `+=` semantics on this dimension — it adds to its destination each call rather than overwriting. `nc_matmul` has this property: each call adds to PSUM, so repeated calls over K tiles naturally build the correct sum. Currently `nc_matmul` K is the only dimension with this property.
+An intermediate is a tensor produced by an op in group A and consumed by an op in group B. Tensors internal to a group (produced and consumed within it) or from prior groups (shared inputs, already complete) are not checked. Condition (1) is automatic when intermediates exist — every dim of T appears in both the producer's and consumer's groups.
 
-Fusability is per-op: the same dimension can be fusable for `nc_matmul` (accumulates on K) and not fusable for `reduce_max` (blocks without accumulation). Any cross-tile combination — even a running max or sum — is not fusable programmatically; that requires math transforms.
+A dimension is **fusable** for an op when the op can process one tile at a time on that dimension:
 
-Condition (2) asks whether the consumer can handle each intermediate tile-by-tile — accumulating consumers (`nc_matmul`) pass even on blocking dims. Condition (3) asks whether each intermediate is **complete** inside the shared loop. A shared dimension absent from T means T's producing op reduced it away; inside the loop, T is mid-reduction. Even `nc_matmul` fails condition (3): its PSUM output is only valid after the full K loop. Example: `reduce_max(S(d0,d2)) → neg_max(d0)` shares d2 with the next group; d2 is absent from `neg_max` and `reduce_max` reduces d2 → rejected.
+- **Non-blocking**: each tile is independently valid (e.g., matmul M and N, transpose P and F, element-wise ops).
+- **In-place accumulating**: the ISA instruction uses += semantics — each call adds to the destination. Two ISA mechanisms have this property: `nc_matmul` K (PSUM accumulation of partial products) and `nisa.activation` with `reduce_cmd=reduce` (scalar-engine accumulation of partial sums along the free axis). The latter enables tile-by-tile sum accumulation after math transforms (§6) convert blocking reductions to incremental ones.
 
-Condition (1) is automatic when an intermediate exists (its dimensions appear in both groups). It only needs checking for independent ops.
+Fusability is per-op: the same dimension can be fusable for one consumer and not another. An op not involving a dimension is trivially non-blocking on it.
 
-Three named cases arise from this single rule:
+**Why dims_A ∩ dims_B in condition (3).** The intersection dims form the shared loop. If T is missing an intersection dim d, T's producer reduced d away — inside the shared d-loop, T is mid-reduction. Only a non-blocking producer yields a valid T at each d iteration. Dims unique to one group become inner loops; the scheduler places consumers after those inner loops via data dependencies, so condition (3) need not check them. Note that accumulating ops as producers fail condition (3) on their accumulation axis: the accumulated output is valid only after the full loop completes — `nc_matmul` on K (PSUM mid-reduction) and `activation(reduce_cmd=reduce)` on its free axis (scalar registers mid-accumulation).
 
-- **Independent**: no intermediates → conditions (2)-(3) vacuous. Shared dimension as outer loop, unique dimensions as inner loops (placing unique dims outside the shared dim would require separate loops). No buffer changes.
-- **Non-blocking**: all intermediate dims non-blocking for the consumer. Intermediate becomes degree-1. Condition (3) typically vacuous — shared dims usually appear in the intermediate.
-- **Accumulating**: a blocking intermediate dim maps to `nc_matmul` K — the consumer's `+=` semantics make it fusable. The shared loop serves as both fusion loop and K reduction; intermediate becomes degree-1. If a second intermediate T2 is missing the accumulation dim, condition (3) rejects (T2's producer reduced over the shared dim). The accumulation dim must be an inner loop (accumulator valid only after loop completes). In double matmul: d1 (MM1 K) inner to d2 (MM2 K), d2 inner to d0/d4.
+Three named cases arise:
 
-**Scheduling.** Within a fused group, the renderer places each op at its appropriate loop level from data dependencies — an op consuming a blocking reduction's output runs after that dim's loop; an op not touching a dim runs outside it. Different ops in the same group may execute at different loop levels (e.g., Ops 3-4 run after d1 but inside d2).
+- **Independent**: no intermediates → conditions (2)-(3) vacuous. Shared dim as outer loop, unique dims as inner loops. No buffer changes.
+- **Non-blocking**: all intermediate dims non-blocking for the consumer. Intermediate becomes degree-1.
+- **Accumulating**: the consumer's += semantics make a blocking intermediate dim fusable (`nc_matmul` K, or `activation(reduce_cmd=reduce)` free axis). The shared loop serves as both fusion and accumulation; intermediate becomes degree-1. If a second intermediate T2 is missing the accumulation dim because its producer reduced that dim away, condition (3) rejects — the producer is mid-reduction in the shared loop. The accumulation dim must be an inner loop (accumulator valid only after loop completes). In double matmul: d1 (MM1 K) inner to d2 (MM2 K), d2 inner to d0/d4.
 
-The conditions are sufficient but conservative. Skip connections between non-adjacent ops can make the intermediate set path-dependent — fusing in a different adjacent-pair order may bypass checks that block the direct path. The search tries multiple fusion sequences.
+**Buffer degrees.** In both non-blocking and accumulating cases, degree-1 holds only when all consumers of the intermediate are within the fused group. If a later group also consumes the intermediate, it retains full range so the later group can access all tiles. (In attention, every internalized intermediate has exactly one consumer within the fused group, so degree-1 always applies. Cross-group outputs like `scaled_S` — consumed by both [[5]] and [[6,...,10]] — stay full range but are never candidates for degree-1.)
+
+**Scheduling.** Within a fused group, ops execute at different loop levels from data dependencies. Each op is placed at the outermost loop level that satisfies all its data dependencies (respecting topological order):
+
+- An op consuming a blocking reduction's output runs *after* that dim's loop.
+- An op not touching a dim is unconstrained by it (defaults to outside, but may land inside if a constrained dim is nested within it).
+- An op touching a dim non-blockingly (or accumulatingly) runs *inside* it.
+
+In fully fused double matmul: Ops 0-2 (transposes + MM1) run inside d1, while Ops 3-4 (transpose S + MM2) run after d1 but inside d2 — S requires d1 to complete, while d2 is still iterating for MM2's accumulation.
+
+**Path dependence.** The conditions are sufficient but conservative. Fusing A+B first can internalize intermediates that would block a later fusion with C — the internal tensor leaves the intermediate set, and a different tensor (produced by a non-blocking op) may take its place. Different pairwise orders may reach different results; the search tries multiple sequences.
+
+Concrete example from attention: if {7,...,10} are fused first (right-to-left), trying {6}+{7,...,10} then fails because `sum_exp(d0)` is intermediate with d2 ∈ dims_A ∩ dims_B but d2 ∉ `sum_exp`, and `activation_reduce` (the producer) blocks on d2 (condition 3). But left-to-right fusion avoids this: {6}+{7} works because {7} has only d0, so dims_A ∩ dims_B = {d0}, and d2 is not checked. After fusion, `sum_exp` is internal to {6,7}. Now `inv_sum(d0)` replaces it as the outward-facing intermediate; its producer (Op 7, `activation`) doesn't involve d2, passing condition (3).
 
 ## Double Matmul Example
 
@@ -34,7 +48,7 @@ All five ops fuse into a single group `[[0, 1, 2, 3, 4]]`:
 | {0,1,2}+3 | non-blocking | S(d0,d2) | Both dims non-blocking for transpose |
 | {0,1,2,3}+4 | accumulating | S_t(d2,d0) | d2 is matmul K — `nc_matmul` accumulates |
 
-For double matmul, fusion order doesn't matter — any adjacent-pair sequence reaches `[[0,1,2,3,4]]` because every dependency is between consecutive ops (no skip connections), so the intermediates at each step are invariant to fusion order.
+For double matmul, fusion order doesn't matter — every dependency is between consecutive ops (no skip connections), so the intermediates at each step are invariant to fusion order.
 
 **Before** — Ops 0 and 1 each have their own loop nest with separate d1 loops:
 
@@ -152,4 +166,23 @@ for i_block_d0 in nl.affine_range(16):                              """ seq_q gr
 
 ## Attention Fusion Trace
 
-This is the attention kernel skeleton. In the full attention pipeline, programmatic fusion produces `[[0,...,4], [5], [6,...,10]]`. Ops 0-4 (transposes, matmul, masking, scaling) fuse fully. Op 5 (`tensor_reduce` max) is isolated: d2 is blocking for the consumer (Ops 4→5 fails condition 2), and d2 is absent from `neg_max_S` with a blocking producer (Ops 5→6 fails condition 3). Ops 6-10 (`activation_reduce`, `activation`, transpose, matmul, `tensor_scalar`) fuse left-to-right. {6}+{7} passes because Op 7 only involves d0 — the intersection is {d0}, so condition (3) is trivial for `sum_exp(d0)` (d2 not checked). This internalizes `sum_exp`; subsequent steps check `inv_sum(d0)` instead, whose producer (Op 7) trivially passes on d2. Direct {6}+{7,...,10} fails because `sum_exp(d0)` is in the intermediate set with d2 absent and `activation_reduce` blocking on d2 — the path-dependent case from the conservative-conditions note above. The two boundaries are where math transforms (online fusion) are needed. Load placement can then hoist Q above the d2 loop to avoid redundant reloading.
+Full attention pipeline `softmax(mask(scale * Q @ K^T)) @ V` with 11 ops (numbering from §1 of the guide):
+
+| Step | Intermediate(s) | Intersection | Result | Key check |
+|---|---|---|---|---|
+| 0+1 | (none) | {d1} | [[0,1]] | Independent, share d1 |
+| {0,1}+2 | Q_t(d1,d0), K_t(d1,d2) | {d0,d1,d2} | [[0,...,2]] | d1 is matmul K → accumulating |
+| {0,...,2}+3 | S(d0,d2) | {d0,d2} | [[0,...,3]] | Non-blocking for affine_select |
+| {0,...,3}+4 | masked_S(d0,d2) | {d0,d2} | [[0,...,4]] | Non-blocking for tensor_scalar |
+| {0,...,4}+5 | scaled_S(d0,d2) | {d0,d2} | **FAILS** | d2 blocking for tensor_reduce (cond. 2) |
+| 5+6 | neg_max_S(d0) | {d0,d2} | **FAILS** | d2 ∉ neg_max_S; tensor_reduce blocks d2 (cond. 3) |
+| 6+7 | sum_exp(d0) | {d0} | [[6,7]] | Intersection {d0} — d2 not checked |
+| {6,7}+8 | exp_S(d0,d2) | {d0,d2} | [[6,...,8]] | Non-blocking for nc_transpose |
+| {6,...,8}+9 | exp_S_t(d2,d0) | {d0,d2} | [[6,...,9]] | d2 is matmul K → accumulating |
+| {6,...,9}+10 | attn(d0,d4), inv_sum(d0) | {d0,d4} | [[6,...,10]] | Non-blocking for tensor_scalar; inv_sum producer trivially non-blocking on d4 |
+
+Result: **[[0,...,4], [5], [6,...,10]]**
+
+Step 6+7 is the path-dependent case. `inv_sum(d0)` is produced by Op 7 but not consumed until Op 10 — it first appears as an intermediate at step {6,...,9}+10, not earlier. At step {6,7}+8, `inv_sum`'s consumer (Op 10) is outside both groups, so it is not an intermediate.
+
+The two fusion boundaries — at `tensor_reduce` (Op 5) and between Ops 5–6 — are where full-range reduction over d2 blocks tile-by-tile processing. Crossing these barriers requires math transforms (online softmax, §6), not programmatic fusion. Within [[6,...,10]], the d2 loop runs Ops 6, 8, 9 per tile (exp, transpose, matmul accumulation), while Ops 7 and 10 (reciprocal of `sum_exp`, output normalization) run after d2 completes — matching the CTE kernel's per-tile / post-reduction structure.

@@ -16,7 +16,7 @@ Non-blocking output dimensions in `group_dim_orders` (the per-group ordered list
 
 **What varies across orderings:**
 
-- **Data reuse.** Operands not depending on the innermost dim are loop-invariant there, loaded once and reused. Ordering `(d2, d0)` loads each K_t block once and reuses across 16 d0 blocks; `(d0, d2)` gives Q_t reuse instead.
+- **Data reuse.** An operand is loop-invariant in any dim it doesn't depend on. Placing invariant dims innermost maximizes reuse — the operand is loaded once and persists across all inner iterations. Each ordering favors operands whose irrelevant dims land innermost.
 - **HBM access pattern.** The innermost-varying dim determines DMA contiguity. Aligning it with row-major layout improves bandwidth.
 - **Interaction with load placement.** Reordering changes which loops are outer, changing which hoists are profitable and at what SBUF cost.
 
@@ -50,7 +50,7 @@ for i_block_d2 in nl.affine_range(4):                           # d2 outermost
                 nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
 ```
 
-With `d2` outermost, each K_t tile is reused across all 16 d0 iterations — matching the reference attention kernel's standalone matmul phases.
+With `d2` outermost, any operand that depends on d2 but not d0 is loop-invariant across d0's 16 iterations — a reuse opportunity that load placement (§5.2) exploits by hoisting those loads above the d0 loop.
 
 ## Dimension Interleaving
 
@@ -80,7 +80,7 @@ for d2_block:                      # blocking dim block — hoisted above d0
 
 **Why valid for accumulating dims.** `nc_matmul` uses `+=` semantics, adding to whatever PSUM holds. Reloading a partial sum via `tensor_copy` lets accumulation continue across blocks — the result is identical because addition is associative ($K = B \times T$ iterations split into $B$ blocks of $T$).
 
-Pre-zeroing the SBUF partial buffer avoids conditional logic within `nl.affine_range` — the first reload loads zero (equivalent to memset), subsequent reloads load the running partial sum. When the partial buffer exceeds SBUF capacity, it can go through HBM instead (DMA store/reload each iteration). The reference attention kernel uses HBM for output accumulation between sections, while keeping small per-Q-group accumulators (running_max, running_sum) in SBUF.
+Pre-zeroing the SBUF partial buffer avoids conditional logic within `nl.affine_range` — the first reload loads zero (equivalent to memset), subsequent reloads load the running partial sum.
 
 ```python
 sbuf_partial = nl.ndarray((128, 16, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
@@ -102,10 +102,10 @@ for i_block_d0 in nl.affine_range(16):                           # writeback
 
 **Requirements:**
 
-- `tiles_per_block > 1` on the interleaved dim — otherwise there is no block/tile split to separate
-- The dim must be **accumulating**: the op reducing over this dim adds each iteration's contribution to a running total via `+=` semantics (`nc_matmul` accumulates into PSUM). Non-accumulating blocking dims (reduce_max, reduce_sum) need online fusion to convert to accumulating form before interleaving applies
+- **`num_blocks > 1`** on the interleaved dim — with only 1 block the block loop has range(1) and interleaving is a no-op. $\texttt{num\_blocks} = \texttt{unified\_tiles} / \texttt{tiles\_per\_block}$ where $\texttt{unified\_tiles} = \texttt{dim\_size} / \texttt{max\_tile\_size}$ (§5.4). Increasing `tiles_per_block` reduces `num_blocks` (fewer, larger sections) and better amortizes save/reload overhead, but is not a prerequisite — any `num_blocks > 1` enables interleaving
+- The dim must be **accumulating**: every op that reduces over this dim uses additive accumulation (`+=` semantics). `nc_matmul` accumulates into PSUM — valid. `tensor_reduce(op="add")` sums partial results — valid ($\sum A + \sum B = \sum(A \cup B)$). `tensor_reduce(op="max")` is NOT additive: $\max(A \cup B) \neq \max(A) + \max(B)$. Non-accumulating reductions require online fusion (§6) to convert to accumulating form before interleaving applies
 
-**Benefits and costs.** Data loaded between block and tile loops persists across all enclosed output-dim iterations, enabling cross-output-dim reuse via load placement. In the fused double matmul, K/V between d2's block and tile loops are reused across 16 d0 Q-groups per section (16x DMA reduction). The cost is extra `tensor_copy` per (block, output-dim) for save/reload, plus a partial buffer with $\prod_{i \geq k} \text{num\_blocks}(d_i)$ slots for a level-$k$ interleave.
+**Benefits and costs.** Operands loaded between block and tile loops persist across all enclosed output-dim iterations ($d_k$ through $d_{n-1}$), enabling cross-output-dim reuse via load placement (§5.2). The reuse factor equals the product of trips across enclosed output dims. The cost is extra `tensor_copy` per (block-iteration, enclosed-output-tile) for save/reload of the partial accumulator, plus a partial buffer with $\prod_{i \geq k} \texttt{unified\_tiles}(d_i) \cdot \texttt{interleave}(d_i)$ sub-tile slots for a level-$k$ interleave, following the standard 4D buffer layout (§2).
 
 **Example.** Fused double matmul `[[0,1,2,3,4]]` with `tiles_per_block_d2 = 2`. Interleaving d2 above d0 produces the section pattern:
 
@@ -114,9 +114,8 @@ for i_block_d0 in nl.affine_range(16):                           # writeback
 sbuf_partial = nl.ndarray((128, 16, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_partial[...], value=0.0)
 
-for i_block_d2 in nl.affine_range(2):                            """ section """
-    """ K, V loaded here — reused across all 16 d0 iterations """
-    for i_block_d0 in nl.affine_range(16):                       """ Q-group """
+for i_block_d2 in nl.affine_range(2):                            """ d2 block (hoisted above d0) """
+    for i_block_d0 in nl.affine_range(16):                       """ d0 (enclosed by d2 block) """
         for i_tile_d0 in nl.affine_range(1):
             for i_block_d4 in nl.affine_range(1):
                 for i_tile_d4 in nl.affine_range(1):
@@ -165,9 +164,12 @@ class LoopReorder(Transform):
                         new_orders = list(ir.group_dim_orders)
                         new_orders[gidx] = perm
                         results.append(replace(ir, group_dim_orders=new_orders))
-            """ Dimension interleaving (blocking dims with tiles_per_block > 1) """
+            """ Dimension interleaving (accumulating blocking dims with num_blocks > 1) """
             for dim_id in ir.group_blocking_dims[gidx]:
-                if ir.tiles_per_block.get(dim_id, 1) <= 1:
+                if not ir.is_accumulating(dim_id, gidx):
+                    continue
+                unified = ir.ctx.dim_sizes[dim_id] // ir.ctx.dim_tiles[dim_id]
+                if unified // ir.tiles_per_block.get(dim_id, 1) <= 1:
                     continue
                 n = len(dim_order)
                 current = ir.interleave_levels[gidx].get(dim_id, n)
