@@ -90,12 +90,12 @@ We classify each blocking pair:
 
 Online fusion breaks the Op 5→6 and Op 6→9 barriers, pulling Ops 5, 6, 8, 9 into a single d2 loop. Op 7 is topologically independent from Op 9 (§1 DAG). Op 10 depends on Op 9's output but runs after the d2 reduction completes. Neither is part of the online fusion transforms. The result is the flash attention algorithm.
 
-**Fusion granularity.** Online fusion can apply at two granularities:
+**Fusion granularity.** The "tile" $k$ in Algorithm 4 can be:
 
-- **Tile level** (§6.1.2–6.1.3 below): merge all d2 loops into a single pass — every `i_tile_d2` iteration updates the running max and rescales accumulators. Simpler structure, smaller buffers, more rescaling overhead.
-- **Block level** (section level): corrections apply between `i_block_d2` iterations; within each block, Ops 5 and 6–10 keep their own separate `i_tile_d2` loops (naive multi-pass). Fewer corrections, larger within-block buffers, enables software pipelining across Q groups within a section.
+- **Tile level** (§6.1.2–6.1.3): $k$ = one unified tile. Every `i_tile_d2` iteration runs the X step and rescales accumulators. Simpler structure, smaller buffers, more rescaling overhead.
+- **Block level** (§6.1.4): $k$ = one block of `tiles_per_block` tiles. Within each block, Ops 5 and 6 run their own `i_tile_d2` loops (naive multi-pass). Corrections apply once per `i_block_d2` iteration. Fewer corrections, enables section-based processing with dimension interleaving (§5.3).
 
-Both use the same X + Accumulation math (§6.1.1) — the "tile" $k$ in Algorithm 4 is either one tile (tile level) or one block of tiles (block level). The reference attention CTE kernel uses block-level fusion with 8K-token sections: dimension interleaving (§5.3) creates the section structure (`d2_block → d0 → d2_tile`), and online fusion adds the between-section corrections. The tile-level form is described in full below; block-level fusion follows the same pattern with the scale coefficient applied at the `i_block_d2` boundary instead of inside `i_tile_d2`.
+Both produce the same final result using the same math (§6.1.1). The reference attention CTE kernel uses block-level fusion with 8K-token sections.
 
 #### 6.1.2 Online Fusion: Op 5→6
 
@@ -164,9 +164,9 @@ For the first tile ($k = 1$), $m_0 = -\infty$ so $s_1 = e^{-\infty - m_1} = 0$, 
 
 ```python
 """ Ops 5+6 fused: running max + exp + sum in one d2 loop """
-sbuf_running_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_running_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_max[0:128, 0:1], value=-np.inf)
-sbuf_running_sum = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_running_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_sum[0:128, 0:1], value=0.0)
 sbuf_scaled_S_reshd = sbuf_scaled_S.reshape((128, 32, 4096))
 sbuf_exp_S_reshd = sbuf_exp_S.reshape((128, 32, 4096))
@@ -179,16 +179,16 @@ for i_block_d2 in nl.affine_range(8):                                          "
             data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
             op=nl.maximum, axis=1)
 
-        sbuf_new_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        sbuf_new_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=sbuf_new_max[0:128, 0:1],
             data1=sbuf_running_max[0:128, 0:1],
             data2=psum_tile_max[0:128, 0:1], op=nl.maximum)
 
         """ Scale: s_k = exp(m_{k-1} - m_k); negate new max reused as exp bias """
-        sbuf_neg_new_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        sbuf_neg_new_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=sbuf_neg_new_max[0:128, 0:1],
             data=sbuf_new_max[0:128, 0:1], op0=nl.multiply, operand0=-1.0)
-        sbuf_max_scale = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        sbuf_max_scale = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=sbuf_max_scale[0:128, 0:1],
             data=sbuf_running_max[0:128, 0:1], op=nl.exp,
             bias=sbuf_neg_new_max[0:128, 0:1])
@@ -196,7 +196,7 @@ for i_block_d2 in nl.affine_range(8):                                          "
             src=sbuf_new_max[0:128, 0:1])
 
         """ Bias + accumulate: exp(S - m_k), per-tile sum, fused rescale+accumulate """
-        sbuf_tile_sum = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        sbuf_tile_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation_reduce(dst=sbuf_exp_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
             op=nl.exp, data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
             bias=sbuf_neg_new_max[0:128, 0:1],
@@ -219,9 +219,9 @@ First, prepare two d2 loops. Op 8 (transpose) is elementwise — fold it into Op
 
 ```python
 """ Fused Ops 5+6: d2 loop (from §6.1.2) """
-sbuf_running_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_running_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_max[0:128, 0:1], value=-np.inf)
-sbuf_running_sum = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_running_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_sum[0:128, 0:1], value=0.0)
 for i_block_d2 in nl.affine_range(8):                                          """ d2 loop A """
     for i_tile_d2 in nl.affine_range(1):
@@ -270,9 +270,9 @@ Since both online fusions share the same X (running max) and same $g_B(m) = e^{-
 
 ```python
 """ Ops 5+6+8+9 fused: one d2 loop """
-sbuf_running_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_running_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_max[0:128, 0:1], value=-np.inf)
-sbuf_running_sum = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_running_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_running_sum[0:128, 0:1], value=0.0)
 sbuf_scaled_S_reshd = sbuf_scaled_S.reshape((128, 32, 4096))
 for i_block_d5 in nl.affine_range(1):
@@ -287,16 +287,16 @@ for i_block_d2 in nl.affine_range(8):                                          "
         nisa.tensor_reduce(dst=psum_tile_max[0:128, 0:1],
             data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
             op=nl.maximum, axis=1)
-        sbuf_new_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        sbuf_new_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=sbuf_new_max[0:128, 0:1],
             data1=sbuf_running_max[0:128, 0:1],
             data2=psum_tile_max[0:128, 0:1], op=nl.maximum)
 
         """ Scale: s_k = exp(m_{k-1} - m_k); negate new max reused as exp bias """
-        sbuf_neg_new_max = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        sbuf_neg_new_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=sbuf_neg_new_max[0:128, 0:1],
             data=sbuf_new_max[0:128, 0:1], op0=nl.multiply, operand0=-1.0)
-        sbuf_max_scale = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        sbuf_max_scale = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation(dst=sbuf_max_scale[0:128, 0:1],
             data=sbuf_running_max[0:128, 0:1], op=nl.exp,
             bias=sbuf_neg_new_max[0:128, 0:1])
@@ -313,7 +313,7 @@ for i_block_d2 in nl.affine_range(8):                                          "
 
         """ Accumulator 1: exp + sum (Op 6 body), fused rescale+accumulate """
         sbuf_exp_S = nl.ndarray((128, 512), dtype=Q.dtype, buffer=nl.sbuf)
-        sbuf_tile_sum = nl.ndarray((128, 1), dtype=Q.dtype, buffer=nl.sbuf)
+        sbuf_tile_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation_reduce(dst=sbuf_exp_S[0:128, 0:512],
             op=nl.exp, data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, i_block_d2*512:(i_block_d2+1)*512],
             bias=sbuf_neg_new_max[0:128, 0:1],
@@ -340,3 +340,168 @@ for i_block_d2 in nl.affine_range(8):                                          "
 ```
 
 `sbuf_exp_S` shrinks to per-tile since it is produced and consumed within the same d2 iteration. d5 moves from outer (wrapping d2 in "Before") to inner (within the d2 body): the X step and Accumulator 1 are shared across d5, so they run once per d2 tile; only the psum_attn rescale and matmul iterate over d5. For d5 > 1, psum_attn extends along d5. After the fused loop, `running_sum` holds the exact softmax denominator and `psum_attn` holds the exact unnormalized output — Op 7 (reciprocal) and Op 10 (multiply) normalize outside the loop.
+
+#### 6.1.4 Block-Level Fusion
+
+The tile-level examples (§6.1.2–6.1.3) apply Algorithm 4 per unified tile. Block-level applies it per `i_block_d2` iteration — one "tile" $k$ in Algorithm 4 is a block of `tiles_per_block` unified tiles. Within each block, Ops 5 and 6 run their naive multi-pass (separate `i_tile_d2` loops producing a complete section max and section sum). The correction is applied once between blocks.
+
+**Flow per block $k$:**
+
+1. **Within-block compute.** Ops 0–4 compute S tiles. Op 5 reduces per-tile maxes over the block → `section_max`.
+2. **X step.** `new_max = max(running_max, section_max)`. `s_k = exp(prev_max - new_max)`. `running_max = new_max`.
+3. **Rescale accumulators.** `psum_output *= s_k`.
+4. **Within-block exp + sum.** Op 6 computes `exp(S - running_max)` per tile and per-tile sums. Crucially, Op 6 uses the **updated** running_max (including the current block's max), so exp values are already correct — no further per-tile adjustment needed. `running_sum = running_sum * s_k + section_sum`.
+5. **Within-block P@V.** Ops 8–9: transpose + matmul → accumulate `psum_output`.
+6. **Post-loop.** After all blocks: Op 7 (reciprocal of `running_sum`), Op 10 (normalize `psum_output * inv_sum`).
+
+**After.** Block-level fusion applied to Ops 5+6+8+9. Same correction math as tile-level; structural difference is that the X step and rescaling run between blocks, while within-block loops are multi-pass. Block-level uses the **negated convention** (matching the reference kernel): `running_max` stores $-m$, initialized to $+\infty$, updated via `tensor_tensor(minimum)`. The negated max serves directly as the exp bias, saving an explicit negation step. Tile-level uses positive max (init $-\infty$, `tensor_tensor(maximum)`, separate negate for bias).
+
+```python
+""" Block-level: Ops 5+6+8+9, correction at d2 block boundary """
+sbuf_running_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+nisa.memset(dst=sbuf_running_max[0:128, 0:1], value=np.inf)
+sbuf_running_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+nisa.memset(dst=sbuf_running_sum[0:128, 0:1], value=0.0)
+psum_output = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
+nisa.memset(dst=psum_output[0:128, 0:128], value=0.0)
+
+for i_block_d2 in nl.affine_range(num_blocks_d2):                              """ section """
+    """ Op 5 (within block): per-tile max → reduce → section_max """
+    psum_partial_max = nl.ndarray((128, tiles_per_block), dtype=nl.float32, buffer=nl.psum)
+    for i_tile_d2 in nl.affine_range(tiles_per_block):
+        nisa.tensor_reduce(dst=psum_partial_max[0:128, i_tile_d2:i_tile_d2+1],
+            data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, ...],
+            op=nl.maximum, axis=1)
+    sbuf_section_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=sbuf_section_max[0:128, 0:1],
+        data=psum_partial_max[0:128, 0:tiles_per_block],
+        op=nl.maximum, axis=1, negate=True)
+
+    """ X step + scale (same math as tile-level, once per block) """
+    sbuf_prev_max = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=sbuf_prev_max[0:128, 0:1], op=nl.copy,
+        data=sbuf_running_max[0:128, 0:1], scale=-1.0)
+    nisa.tensor_tensor(dst=sbuf_running_max[0:128, 0:1],
+        data1=sbuf_running_max[0:128, 0:1],
+        data2=sbuf_section_max[0:128, 0:1], op=nl.minimum)
+    sbuf_correction = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=sbuf_correction[0:128, 0:1], op=nl.exp,
+        data=sbuf_prev_max[0:128, 0:1], bias=sbuf_running_max[0:128, 0:1])
+
+    """ Rescale Accumulator 2 (psum_output) by s_k """
+    for i_block_d5 in nl.affine_range(1):
+        for i_tile_d5 in nl.affine_range(1):
+            nisa.tensor_scalar(dst=psum_output[0:128, 0:128],
+                data=psum_output[0:128, 0:128],
+                op0=nl.multiply, operand0=sbuf_correction[0:128, 0:1])
+
+    """ Op 6 (within block): exp + sum using updated running_max """
+    sbuf_exp_S = nl.ndarray((128, tiles_per_block * 512), dtype=Q.dtype, buffer=nl.sbuf)
+    psum_partial_sum = nl.ndarray((128, tiles_per_block), dtype=nl.float32, buffer=nl.psum)
+    for i_tile_d2 in nl.affine_range(tiles_per_block):
+        nisa.activation_reduce(dst=sbuf_exp_S[0:128, i_tile_d2*512:(i_tile_d2+1)*512],
+            op=nl.exp, data=sbuf_scaled_S_reshd[0:128, i_block_d0:i_block_d0+1, ...],
+            bias=sbuf_running_max[0:128, 0:1],
+            reduce_op=nl.add, reduce_res=psum_partial_sum[0:128, i_tile_d2:i_tile_d2+1])
+    sbuf_section_sum = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=sbuf_section_sum[0:128, 0:1],
+        data=psum_partial_sum[0:128, 0:tiles_per_block], op=nl.add, axis=1)
+
+    """ Accumulator 1: running sum """
+    nisa.tensor_scalar(dst=sbuf_running_sum[0:128, 0:1],
+        data=sbuf_running_sum[0:128, 0:1],
+        op0=nl.multiply, operand0=sbuf_correction[0:128, 0:1],
+        op1=nl.add, operand1=sbuf_section_sum[0:128, 0:1])
+
+    """ Ops 8+9 (within block): transpose + matmul → accumulate psum_output """
+    for i_tile_d2 in nl.affine_range(tiles_per_block):
+        for i_ig_d2 in nl.affine_range(4):
+            sbuf_exp_S_t = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.sbuf)
+            nisa.nc_transpose(dst=sbuf_exp_S_t[0:128, 0:128],
+                src=sbuf_exp_S[0:128, i_tile_d2*512+i_ig_d2*128:i_tile_d2*512+(i_ig_d2+1)*128])
+            for i_block_d5 in nl.affine_range(1):
+                for i_tile_d5 in nl.affine_range(1):
+                    sbuf_V = nl.ndarray((128, 128), dtype=V.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=sbuf_V[0:128, 0:128], src=V[...])
+                    nisa.nc_matmul(dst=psum_output[0:128, 0:128],
+                        stationary=sbuf_exp_S_t[0:128, 0:128],
+                        moving=sbuf_V[0:128, 0:128])
+```
+
+**Comparison with tile-level.** The correction math (X step, $s_k$, rescaling) is identical — only the scope changes:
+
+| Aspect | Tile level | Block level |
+|---|---|---|
+| "Tile" $k$ in Algorithm 4 | 1 unified tile | `tiles_per_block` unified tiles |
+| Corrections per full pass | `unified_tiles` | `num_blocks` |
+| Op 5 within $k$ | single `tensor_reduce` | multi-pass `tensor_reduce` → final reduce |
+| Op 6 within $k$ | single `activation_reduce` | multi-pass `activation_reduce` → final reduce |
+| Intermediate `exp_S` | per-tile (128, 512) | per-block (`tiles_per_block` × 512 elements) |
+
+**Interaction with dimension interleaving (§5.3).** Block-level fusion composes with interleaving to produce the flash attention section pattern: `i_block_d2` (section) → `i_block_d0` (Q group) → `i_tile_d2` (tile within section). The running state (`running_max`, `running_sum`) must then persist across Q groups, requiring per-group columns: shape `(128, num_grps)` with the Q group index selecting the column. Dimension interleaving handles the save/reload of `psum_output` via a partial buffer (§5.3); within each `(i_block_d2, i_block_d0)` iteration, the ordering matches the non-interleaved code: reload → X step (computes $s_k$) → `psum_output *= s_k` → Op 6 (exp + sum) → Ops 8–9 (P@V accumulates into `psum_output`) → save.
+
+**Reference kernel mapping.**
+
+| Reference kernel | Block-level mapping |
+|---|---|
+| `_qk_and_max_impl` | Ops 0–4 + Op 5 within-block multi-pass |
+| `_update_max_impl` | X step + scale (between blocks) |
+| `_exp_impl` | Op 6 within-block + Op 8 transpose |
+| `_pv_impl` | Op 9 within-block |
+| `_write_back_impl` | Accumulator 1 + 2 corrections, Op 7 + 10 post-loop |
+| `mm1_running_max` (negated, persistent) | `sbuf_running_max` |
+| `exp_running_sum` (persistent) | `sbuf_running_sum` |
+| `flash_attn_correction_factor` | `sbuf_correction` ($s_k$) |
+
+The block-level code rescales `psum_output` in PSUM each block. The reference kernel instead writes each section's P@V into a fresh buffer (`mm2_sb`), then applies correction at HBM writeback: load previous output, compute `output = prev_output * s_k + mm2_sb`, store back. This avoids keeping the output accumulator in PSUM across sections.
+
+#### 6.1.5 Representation and Candidates
+
+Online fusion modifies the KernelIR by replacing the full-range blocking reduction with an incremental running state, adding correction ops, and eliminating the blocking barrier that prevented loop fusion.
+
+**What changes in the IR:**
+
+1. **New ops.** Running state initialization (`memset`), per-tile/per-block partial reduction, running state update (`tensor_tensor`, `activation`), scale computation, accumulator rescaling (`tensor_scalar`). These are standard NKI ISA instructions, not new nkigym ops.
+2. **Modified data flow.** Op 6's bias changes from the full-range `neg_max_S` (output of Op 5) to the incremental `running_max` (updated each tile/block). The `running_sum` update uses fused rescale+accumulate (`tensor_scalar` with multiply+add) instead of a separate full-range `tensor_reduce(add)`.
+3. **Eliminated blocking barrier.** The intermediate `neg_max_S` (full-range reduction output) no longer exists. `running_max` is produced non-blockingly — each tile/block yields a valid running max. This enables loop fusion (§5.1) to merge the previously-separated groups: the consumer (Op 6) can process tiles incrementally using the running state, satisfying fusion condition (2).
+
+**Representation.**
+
+```python
+online_fusion_groups: list[OnlineFusionGroup] | None
+
+@dataclass
+class OnlineFusionGroup:
+    x_op_idx: int                    # The X reduction op (e.g., Op 5: tensor_reduce max)
+    accumulator_indices: list[int]   # Ops sharing this X (e.g., [6, 9])
+    blocking_dim: str                # Dimension being fused (e.g., "d2")
+    granularity: str                 # "tile" or "block"
+```
+
+**Candidate generation.** The transform detects X + Accumulation patterns and generates two candidates per group (tile-level and block-level):
+
+```python
+class OnlineFusion(Transform):
+    NAME = "online_fusion"
+
+    def candidates(self, ir: KernelIR) -> list[KernelIR]:
+        results = []
+        for group in self._find_x_accumulation_groups(ir):
+            results.append(self._apply(ir, group, granularity="tile"))
+            results.append(self._apply(ir, group, granularity="block"))
+        return results
+```
+
+**Pattern detection** (`_find_x_accumulation_groups`):
+
+1. Find reduction ops whose output crosses a blocking barrier (produced in group A, consumed in group B, with the reduction dim in dims_A ∩ dims_B).
+2. For each such reduction (the X candidate), find ops that accumulate (sum) over the same blocking dim, whose per-tile contribution depends on the X output — either directly (e.g., Op 6 uses running max as exp bias) or transitively through intermediate ops (e.g., Op 9 accumulates `exp_S_t @ V`, where `exp_S` carries the $e^{-m}$ factor from Op 6).
+3. Check **separability**: the per-tile contribution decomposes as $B(O_X, V) = g_B(O_X) \cdot h_B(V)$. Separability is checked per op and propagates through linear ops (matmul, transpose, scalar multiply):
+   - `exp(data + bias)` where bias depends on X: separable as $e^{\text{bias}} \cdot e^{\text{data}}$.
+   - `data * scale` where scale depends on X: trivially separable.
+   - Matmul/transpose of an already-separable operand: the per-row factor distributes, e.g., $(c \cdot A) @ B = c \cdot (A @ B)$.
+4. Group all accumulators sharing the same X — they share one $s_k$.
+
+For attention, this yields one group: X = Op 5 (reduce max), accumulators = [Op 6 (exp + sum), Op 9 (matmul output)], blocking dim = d2.
+
+**Interaction with loop fusion.** Before online fusion, loop fusion produces [[0,...,4], [5], [6,...,10]] — the barriers at Op 5 are unfusable (§5.1 attention trace). After online fusion eliminates the blocking intermediate, loop fusion can merge the groups: `running_max` replaces `neg_max_S` as the bias for Op 6, and `running_max` is produced non-blockingly (valid at each iteration). The search applies online fusion to generate a new KernelIR, then re-applies loop fusion (and other programmatic transforms) to the modified IR.

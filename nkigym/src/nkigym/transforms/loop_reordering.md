@@ -103,9 +103,21 @@ for i_block_d0 in nl.affine_range(16):                           # writeback
 **Requirements:**
 
 - **`num_blocks > 1`** on the interleaved dim — with only 1 block the block loop has range(1) and interleaving is a no-op. $\texttt{num\_blocks} = \texttt{unified\_tiles} / \texttt{tiles\_per\_block}$ where $\texttt{unified\_tiles} = \texttt{dim\_size} / \texttt{max\_tile\_size}$ (§5.4). Increasing `tiles_per_block` reduces `num_blocks` (fewer, larger sections) and better amortizes save/reload overhead, but is not a prerequisite — any `num_blocks > 1` enables interleaving
-- The dim must be **accumulating**: every op that reduces over this dim uses additive accumulation (`+=` semantics). `nc_matmul` accumulates into PSUM — valid. `tensor_reduce(op="add")` sums partial results — valid ($\sum A + \sum B = \sum(A \cup B)$). `tensor_reduce(op="max")` is NOT additive: $\max(A \cup B) \neq \max(A) + \max(B)$. Non-accumulating reductions require online fusion (§6) to convert to accumulating form before interleaving applies
+- The dim must be **accumulating**: every op that reduces over this dim uses additive accumulation (`+=` semantics). `nc_matmul` accumulates into PSUM — valid. `tensor_reduce(op="add")` sums partial results — valid ($\sum A + \sum B = \sum(A \cup B)$). `tensor_reduce(op="max")` is NOT additive: $\max(A \cup B) \neq \max(A) + \max(B)$. Non-accumulating reductions require online fusion (§6) to convert to accumulating form before interleaving applies. The `is_accumulating` check in `candidates()` gates this: for attention-like patterns where seq_k involves `tensor_reduce(max)`, interleaving candidates for that dim won't appear until online fusion has transformed it into accumulating form
 
-**Benefits and costs.** Operands loaded between block and tile loops persist across all enclosed output-dim iterations ($d_k$ through $d_{n-1}$), enabling cross-output-dim reuse via load placement (§5.2). The reuse factor equals the product of trips across enclosed output dims. The cost is extra `tensor_copy` per (block-iteration, enclosed-output-tile) for save/reload of the partial accumulator, plus a partial buffer with $\prod_{i \geq k} \texttt{unified\_tiles}(d_i) \cdot \texttt{interleave}(d_i)$ sub-tile slots for a level-$k$ interleave, following the standard 4D buffer layout (§2).
+**Fused groups and partial scope.** In a fused group, a dim may be an output axis for some ops and a reduction axis for others — e.g., d2 is output N for the first matmul but reduction K for the second in double matmul. When d2 is interleaved, only the accumulating output (second matmul) needs a partial buffer. The first matmul produces a complete result for each d2 tile (d2 is non-blocking for it), consumed within the same tile iteration by downstream ops. Intermediate tensors are produced and consumed at tile granularity and do not persist across blocks.
+
+**Benefits and costs.** Operands loaded between block and tile loops persist across all enclosed output-dim iterations ($d_k$ through $d_{n-1}$), enabling cross-output-dim reuse via load placement (§5.2). The reuse factor equals the product of trips across enclosed output dims. The cost is extra `tensor_copy` per (block-iteration, enclosed-output-tile) for save/reload of the partial accumulator, plus a partial buffer with $\prod_{i \geq k} \texttt{unified\_tiles}(d_i) \cdot \texttt{interleave}(d_i)$ sub-tile slots for a level-$k$ interleave ($k < n$; level $n$ requires no partial buffer), following the standard 4D buffer layout (§2). When interleaving is active, the total save/reload count is the same at every level: $2 \times \texttt{num\_blocks} \times \prod_i \texttt{output\_tiles}(d_i)$ (one reload + one save per block-iteration per output tile). What changes across levels is the partial buffer size and which operands can be hoisted between the split loops.
+
+**Interleave levels.** For the fused double matmul with `group_dim_orders = (d0, d4)` and `tiles_per_block_d2 = 2` (`num_blocks_d2 = 2`):
+
+| Level | Loop nest | Partial buffer | Operand reuse per section |
+|---|---|---|---|
+| 0 | `d2_blk → d0 → d4 → d2_tile` | 16 tiles | 16× (across d0 × d4) |
+| 1 | `d0 → d2_blk → d4 → d2_tile` | 1 tile | 1× (across d4 only) |
+| 2 (default) | `d0 → d4 → d2_blk → d2_tile` | — | — |
+
+Lower levels enclose more output dims: more operand reuse per section, larger partial buffer. Level 0 produces the reference attention kernel's section structure; `tiles_per_block_d2` (§5.4) controls section size.
 
 **Example.** Fused double matmul `[[0,1,2,3,4]]` with `tiles_per_block_d2 = 2`. Interleaving d2 above d0 produces the section pattern:
 
@@ -149,6 +161,8 @@ interleave_levels: list[dict[str, int]]
 `group_dim_orders` — per fusion group, the ordered tuple of non-blocking output dim IDs. Dimension permutation modifies this ordering; the initial ordering comes from dimension analysis.
 
 `interleave_levels` — per fusion group, maps blocking dim ID → level $k$ in `group_dim_orders`. Level $k$ places the block loop above $d_k$ (enclosing $d_k$ through $d_{n-1}$). Level 0 = above all output dims. Level $n$ = below all (default, no interleaving). The tile loop stays inside all output dims regardless.
+
+When multiple blocking dims are interleaved in the same group, each is independently assigned a level. If two blocking dims share the same level, their block loops nest in dim ID order. In practice this is rare — typically only one blocking dim per group has `num_blocks > 1`.
 
 ```python
 class LoopReorder(Transform):

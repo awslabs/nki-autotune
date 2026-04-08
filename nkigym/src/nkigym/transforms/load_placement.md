@@ -10,25 +10,34 @@ Each dimension contributes a block loop (`i_block_d`), a tile loop (`i_tile_d`),
 |---|---|---|
 | Above $d$'s block loop | $\texttt{unified\_tiles}(d) \times \texttt{interleave}(d)$ | **full** |
 | Between $d$'s block and tile loops | $\texttt{tiles\_per\_block}(d) \times \texttt{interleave}(d)$ | **per-block** |
+| Between $d$'s tile and ig loops | $\texttt{interleave}(d)$ | **per-tile** |
 | Inside all of $d$'s loops | 1 | **single** (default) |
 
-Dimensions the tensor doesn't depend on (**irrelevant dims**) never affect buffer sizing. The renderer automatically hoists loads past irrelevant dims — this always reduces redundant DMA without growing the buffer, so it is not a search candidate (always applied).
+Dimensions the tensor doesn't depend on (**irrelevant dims**) never affect buffer sizing or pre-load loop bounds. When the renderer emits a pre-load pass (for per-tile, per-block, or full), it iterates only over relevant dims — irrelevant dims between the load position and the compute are implicitly skipped. At single placement (no pre-load pass), the DMA is inside all loops including irrelevant ones; eliminating that redundancy requires load placement (grow buffer), loop reordering, or dimension interleaving.
 
-Per-block is only useful when dim interleaving places irrelevant dims between a relevant dim's block and tile loops — the load escapes those irrelevant iterations while using a smaller buffer than full. In a standard (non-interleaved) nest, no loops sit between block and tile, so per-block offers no benefit over single.
+Each tier above single reduces DMA calls by pre-loading more sub-tiles into a larger buffer. Per-tile pre-loads one tile's interleave groups; per-block pre-loads an entire block; full pre-loads the whole dimension. Per-tile is only distinct from per-block when $\texttt{tiles\_per\_block} > 1$, and from single when $\texttt{interleave} > 1$.
+
+## Interaction with Dimension Interleaving
+
+When dimension interleaving (§5.3) hoists $d$'s block loop above output dims, the gap between block and tile loops spans those enclosed dims. A tensor at per-block on $d$ is loaded once per block and reused across all enclosed-dim iterations — the reuse factor is the product of trip counts over enclosed dims.
+
+Without interleaving (d0 outermost, d2 inner), per-block on d2 loads K/V once per (d0_tile, d2_block) pair. With d2 interleaved above d0, per-block loads K/V once per d2_block, reused across all d0 iterations — a $\texttt{num\_tiles}(d_0)\times$ DMA reduction. This is the core of the flash attention section pattern: interleaving creates the section loop, load placement fills each section's buffers, and tiles_per_block (§5.4) controls section size.
 
 ## Representation
 
 ```python
-load_placements: dict[str, dict[str, int]]
+load_placements: dict[str, dict[str, Literal["per_tile", "per_block", "full"]]]
 ```
 
-Maps each HBM tensor to its per-dimension buffered sub-tile count. For each relevant dimension $d$: 1 (single, default), $\texttt{tiles\_per\_block}(d) \times \texttt{interleave}(d)$ (per-block), or $\texttt{unified\_tiles}(d) \times \texttt{interleave}(d)$ (full). Absent dimensions default to 1. The total buffer is $\prod_{d \in T} \texttt{sub\_tiles}(d)$ raw slots.
+Maps each HBM tensor to its per-dimension placement tier. Absent dimensions default to single. The renderer derives each tier's sub-tile count from current dimension parameters (per-tile → $\texttt{interleave}(d)$, per-block → $\texttt{tiles\_per\_block}(d) \times \texttt{interleave}(d)$, full → $\texttt{unified\_tiles}(d) \times \texttt{interleave}(d)$). Total buffer = $\prod_{d \in T} \texttt{sub\_tiles}(d)$ raw slots.
+
+Storing tiers instead of raw counts keeps the representation valid when $\texttt{tiles\_per\_block}$ changes — "per_block" always means "between block and tile loops", and the derived buffer size adjusts to the current block size automatically. With raw counts, a stored value can become orphaned (matching no tier) after a $\texttt{tiles\_per\_block}$ change, leaving the renderer unable to determine the pre-load loop position.
 
 ## Candidate Generation
 
-Each candidate increases one tensor's sub-tile count on one relevant dimension from its current tier to a higher tier.
+Each candidate promotes one tensor on one relevant dimension from its current tier to a higher tier.
 
-`_apply(ir, name, dim_id, sub_tiles)` returns a new `KernelIR` with `load_placements[name][dim_id] = sub_tiles`.
+`_apply(ir, name, dim_id, tier)` returns a new `KernelIR` with `load_placements[name][dim_id] = tier`.
 
 ```python
 class LoadPlacement(Transform):
@@ -40,28 +49,32 @@ class LoadPlacement(Transform):
             for tensor_name in ir.group_hbm_inputs(gidx):
                 relevant_dims = ir.tensor_relevant_dims(tensor_name)
                 for dim_id in relevant_dims:
-                    current = ir.load_placements.get(tensor_name, {}).get(dim_id, 1)
-                    tpb = ir.tiles_per_block.get(dim_id, 1)
+                    tier = ir.load_placements.get(tensor_name, {}).get(dim_id, "single")
                     interleave = ir.ctx.interleave(dim_id)
+                    tpb = ir.tiles_per_block.get(dim_id, 1)
                     unified = ir.ctx.unified_tiles(dim_id)
-                    per_block = tpb * interleave
-                    full = unified * interleave
-                    if per_block > current and per_block < full:
-                        results.append(self._apply(ir, tensor_name, dim_id, per_block))
-                    if full > current:
-                        results.append(self._apply(ir, tensor_name, dim_id, full))
+                    counts = {"single": 1, "per_tile": interleave,
+                              "per_block": tpb * interleave,
+                              "full": unified * interleave}
+                    current = counts[tier]
+                    if counts["per_tile"] > current and counts["per_tile"] < counts["per_block"]:
+                        results.append(self._apply(ir, tensor_name, dim_id, "per_tile"))
+                    if counts["per_block"] > current and counts["per_block"] < counts["full"]:
+                        results.append(self._apply(ir, tensor_name, dim_id, "per_block"))
+                    if counts["full"] > current:
+                        results.append(self._apply(ir, tensor_name, dim_id, "full"))
         return results
 ```
 
-Per-block is only offered when strictly between current and full (avoids duplicating single or full).
+Tier distinctness is checked via derived sub-tile counts — each tier is only offered when its count is strictly between the current count and the next higher tier's count (avoids duplicates). Per-tile is offered only when distinct from both single ($\texttt{interleave} > 1$) and per-block ($\texttt{tiles\_per\_block} > 1$).
 
 ## Application
 
-When the renderer encounters `load_placements[tensor][dim] > 1`, it transforms the rendered code in three ways:
+When a dimension has a non-single tier in `load_placements[tensor][dim]`, the renderer transforms the code in three ways:
 
-1. **Buffer grows.** The staging buffer's `num_tiles` axis on the relevant dimension increases from 1 to the specified sub-tile count.
+1. **Buffer grows.** The staging buffer's `num_tiles` axis on the relevant dimension increases from 1 to the tier's derived sub-tile count.
 
-2. **DMA moves to a pre-load loop.** Instead of loading one sub-tile per compute iteration, the renderer emits a dedicated loop at the target position (between block and tile for per-block, above block for full) that fills all buffer slots before the compute loop begins.
+2. **DMA moves to a pre-load loop.** Instead of loading one sub-tile per compute iteration, the renderer emits a dedicated loop at the target position (between tile and ig for per-tile, between block and tile for per-block, above block for full) that fills all buffer slots before the compute loop begins.
 
 3. **Compute loop indexes into the pre-loaded buffer.** The per-iteration DMA is removed; the compute loop reads from the correct buffer slot using the existing loop variables.
 
@@ -96,7 +109,7 @@ for i_block_d0 in nl.affine_range(16):
                         nisa.dma_copy(dst=hbm_output[...], src=sbuf_output[0:128, 0:128])
 ```
 
-**After** — `load_placements = {"V": {"d2": 16}}` (full on d2). Buffer grows to `(128, 16, 1, 128)`. Pre-load loop fills all 16 slots; compute loop indexes into them:
+**After** — `load_placements = {"V": {"d2": "full"}}`. Buffer grows to `(128, 16, 1, 128)` (full on d2: unified(d2) × interleave(d2) = 4 × 4 = 16 sub-tiles). Pre-load loop fills all 16 slots; compute loop indexes into them:
 
 ```python
 """ Op 4: nisa.nc_matmul -- S_t(K=d2, M=d0) x V(K=d2, N=d4) -> output(d0, d4) """
@@ -135,4 +148,4 @@ The [reference kernel](/home/ubuntu/shared_workplace/KaenaNeuronKernelLibrary/sr
 | V | per-block on $d_2$ | $\texttt{tiles\_per\_block}(d_2) \times \texttt{interleave}(d_2)$ sub-tiles | `bufs.v_sb` loaded per-section |
 | Q | single on $d_0$ (+ multi-buffer D=2) | 1 sub-tile (double-buffered separately) | `bufs.q_sb` loaded per-group |
 
-K and V at per-block on $d_2$ sit between $d_2$'s block (section) and tile loops. With $d_0$ (irrelevant to K/V) interleaved between them, K/V are loaded once per section and reused across all Q groups. Q stays at single — free hoists past $d_2$'s inner loops are applied automatically by the renderer.
+K and V at per-block on $d_2$ sit between $d_2$'s block (section) and tile loops. With $d_0$ (irrelevant to K/V) interleaved between them, K/V are loaded once per section and reused across all Q groups. Q stays at single — in the fused group, scheduling (§5.1) places Q's ops outside $d_2$'s loops since Q doesn't depend on $d_2$.

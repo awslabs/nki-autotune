@@ -14,11 +14,13 @@ All three use the same mechanism: D buffer slots indexed by a loop variable.
 
 ## Representation
 
-`buffer_degrees` maps each buffer name to per-dimension degrees. Loop fusion and math transforms add entries at degree 1. The multi-buffer transform adds DMA staging and PSUM entries at degree D ≥ 2, or increases existing entries:
+`buffer_degrees` maps each buffer name to per-dimension degrees. Loop fusion and math transforms add entries at degree 1. The multi-buffer transform adds DMA staging and PSUM entries at degree D ≥ 2, or increases existing entries. `psum_levels` stores the loop level for each PSUM entry ("tile" or "block"), since the degree alone does not determine which loop drives the bank rotation:
 
 ```python
 buffer_degrees: dict[str, dict[str, int]]
-buffer_degrees = {"S": {"d0": 1, "d2": 2}, "corr": {"d0": 1}, "Q": {"d0": 2}, "psum_S": {"d2": 4}}
+psum_levels: dict[str, dict[str, str]]
+buffer_degrees = {"S": {"d0": 1, "d2": 2}, "Q": {"d0": 2}, "psum_S": {"d2": 4}, "psum_output": {"d2": 4}}
+psum_levels = {"psum_S": {"d2": "tile"}, "psum_output": {"d2": "block"}}
 ```
 
 ## Buffer Sizing
@@ -37,13 +39,6 @@ $\texttt{num\_tiles} = \texttt{degree} \times \texttt{interleave}$. For S(d0, d2
 
 PSUM has 8 banks of `PSUM_BANK_SIZE` (2048) free elements each. A multi-buffered accumulator occupies D consecutive banks starting at `base_bank`. The renderer assigns `base_bank` sequentially across concurrent accumulators (those whose lifetimes overlap within the same fusion group). Total D across all concurrent accumulators must be $\leq 8$.
 
-Example from reference attention CTE kernel with d2 coexistence (unified_tiles=16, tiles_per_block=4, num_blocks=4):
-
-| Accumulator | Level | D | Banks |
-|---|---|---|---|
-| psum_S (MM1) | tile-level | 4 | 0–3 |
-| psum_output (MM2) | block-level | 4 | 4–7 |
-
 ## Indexing
 
 **SBUF:** `i_tile` directly indexes buffer slots:
@@ -60,51 +55,118 @@ for i_block_d2 in nl.affine_range(num_blocks):
 ```python
 psum_acc = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
                        buffer=nl.psum, address=(0, base_bank * PSUM_BANK_SIZE))
-for i_tile_d2 in nl.affine_range(D):
-    nisa.nc_matmul(dst=psum_acc[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, tile_free)], ...)
+for i in nl.affine_range(D):
+    nisa.nc_matmul(dst=psum_acc[0:128, nl.ds(i * PSUM_BANK_SIZE, tile_free)], ...)
 ```
 
-Tile-level uses `i_tile`; block-level uses `i_block`. Banks are free-axis addressed — only the matmul output's free dimension (N) and contraction dimension (K) support PSUM multi-buffering. The partition dimension (M) cannot rotate banks.
+The driving loop variable is determined by the PSUM's level — see §Loop Levels below.
+
+## PSUM Loop Levels
+
+PSUM multi-buffering operates at two loop levels, depending on which loop variable indexes the D banks:
+
+| Level | D | Driving loop | Free dim | Contraction dim |
+|---|---|---|---|---|
+| Tile | tiles_per_block | `i_tile` | Valid | Valid |
+| Block | num_blocks | `i_block` | Valid | Valid |
+
+NKI `nl.affine_range` loops lack modular arithmetic (`i % D`), so D must equal the driving loop's trip count — `i_tile` ranges 0..D-1 only when D = tiles_per_block, and `i_block` only when D = num_blocks.
+
+Why not interleave level (`i_ig`)? The matmul's op_tile_size on the free dim (N=512) spans all interleave groups (each 128 elements) in one call. The matmul runs at `i_tile` granularity, outside the `i_ig` loop, so it cannot use `i_ig` for bank selection.
+
+### Free-dim PSUM
+
+Each iteration of the driving loop produces an independent result in its own bank. While the Tensor Engine writes bank $k+1$, the Vector Engine reads bank $k$ — overlapping TE and VE.
+
+**Tile level** (primary pattern, matches reference kernel MM1): D = tiles_per_block. The matmul runs once per tile at its op_tile_size (512 free elements), writing a full result to one bank. After each tile, `tensor_copy` saves the result to SBUF while the next tile's matmul starts on a different bank. The consumer transpose then processes the saved SBUF data at `i_ig` granularity (128 elements per group). Sets tiles_per_block = D.
+
+```python
+psum_S = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
+                     buffer=nl.psum, address=(0, 0))
+for i_tile_d2 in nl.affine_range(D):
+    nisa.memset(dst=psum_S[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 512)], value=0.0)
+    nisa.nc_matmul(dst=psum_S[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 512)], ...)
+    nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 512)])
+```
+
+**Block level**: D = num_blocks. Banks rotate per block. Within each block, all tiles share one bank. Less useful for free dims — no TE/VE overlap within a block.
+
+### Contraction-dim PSUM
+
+Multiple tiles accumulate into the same output — each tile's partial products add to the running sum. Multi-buffering rotates the PSUM bank at the driving loop boundary, saving each partial result to an SBUF accumulator via `nisa.tensor_tensor(add)`. This pipelines the next iteration's matmul (TE) with the previous iteration's save (VE).
+
+**Tile level**: D = tiles_per_block. Within each tile, interleave groups accumulate into the same bank. Between tiles, the bank rotates and the partial result is added to SBUF. Sets tiles_per_block = D.
+
+```python
+psum_output = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
+                          buffer=nl.psum, address=(0, 4 * PSUM_BANK_SIZE))
+sbuf_accum = nl.ndarray((128, 1, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
+nisa.memset(dst=sbuf_accum[0:128, 0, 0, 0:128], value=0.0)
+for i_tile_d2 in nl.affine_range(D):
+    nisa.memset(dst=psum_output[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 128)], value=0.0)
+    for i_ig_d2 in nl.affine_range(interleave):
+        nisa.nc_matmul(dst=psum_output[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 128)], ...)
+    nisa.tensor_tensor(dst=sbuf_accum[0:128, 0, 0, 0:128],
+                       data=sbuf_accum[0:128, 0, 0, 0:128],
+                       data2=psum_output[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 128)],
+                       op=nl.add)
+```
+
+The zero-initialized SBUF accumulator avoids branching on `i_tile == 0` (which affine loops can't express) — the first add is `0 + result = result`. The SBUF accumulator is the matmul's output staging buffer — no extra allocation is needed.
+
+**Block level** (matches reference kernel MM2): D = num_blocks. Within each block, ALL tiles and interleave groups accumulate into the same bank. Between blocks, the bank rotates and the partial result is added to SBUF. Does not constrain tiles_per_block.
+
+```python
+psum_output = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
+                          buffer=nl.psum, address=(0, 4 * PSUM_BANK_SIZE))
+sbuf_accum = nl.ndarray((128, 1, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
+nisa.memset(dst=sbuf_accum[0:128, 0, 0, 0:128], value=0.0)
+for i_block_d2 in nl.affine_range(D):
+    nisa.memset(dst=psum_output[0:128, nl.ds(i_block_d2 * PSUM_BANK_SIZE, 128)], value=0.0)
+    for i_tile_d2 in nl.affine_range(tiles_per_block):
+        for i_ig_d2 in nl.affine_range(interleave):
+            nisa.nc_matmul(dst=psum_output[0:128, nl.ds(i_block_d2 * PSUM_BANK_SIZE, 128)], ...)
+    nisa.tensor_tensor(dst=sbuf_accum[0:128, 0, 0, 0:128],
+                       data=sbuf_accum[0:128, 0, 0, 0:128],
+                       data2=psum_output[0:128, nl.ds(i_block_d2 * PSUM_BANK_SIZE, 128)],
+                       op=nl.add)
+```
+
+Block-level accumulates more partial products per bank (all tiles × interleave groups within a block) and makes fewer saves (one per block vs one per tile). Requires tiles_per_block > 1 from a prior transform and D = num_blocks $\leq$ MAX_DEGREE.
+
+### Bank Budget
+
+All concurrent PSUM accumulators within a fusion group share 8 banks. In the reference attention kernel with d2 (seq_k):
+
+- MM1 (free dim, tile level): D = 4 banks (banks 0–3)
+- MM2 (contraction dim, block level): D = 4 banks (banks 4–7)
+- Total: 8 banks (maximum)
+
+Both are allocated with fixed bank addresses within the fusion group scope — the renderer assigns non-overlapping ranges, so both must fit within 8 banks.
 
 ## Loop Constraints
 
-NKI `nl.affine_range` loops produce symbolic values restricted to affine index expressions. Modular arithmetic (`i % D`) is non-affine, so the only way to index D buffer slots from a loop variable is to have a loop that ranges exactly 0..D-1.
-
-**Tile-level** (SBUF buffers on any dim; PSUM on free dim N only): tiles_per_block = D. `i_tile` ranges 0..D-1, indexing D buffer slots.
+### SBUF (tile-level only)
 
 - **D = 1**: tiles_per_block set independently by §5.4. Buffer indexes as `0 × interleave + i_ig`.
 - **D > 1**: tiles_per_block = D. $\texttt{num\_blocks} = \texttt{unified\_tiles} / D$.
 
-Tile-level D > 1 sets tiles_per_block = D. Both this transform and tiles_per_block (§5.4) can set the value — they must agree. The tiles_per_block transform excludes dimensions where any buffer has D > 1; multi-buffer candidates on a dimension where tiles_per_block is already T > 1 are constrained to D = T. Buffers at D=1 don't constrain tiles_per_block — they index as `0 × interleave + i_ig` regardless of the tile loop's trip count. All buffers at D > 1 on the same dimension must share the same D (= tiles_per_block).
+All SBUF buffers at D > 1 on the same dimension must share the same D (= tiles_per_block). Buffers at D = 1 don't constrain tiles_per_block. The tiles_per_block transform (§5.4) excludes dimensions where any buffer has D > 1; multi-buffer candidates on a dimension where tiles_per_block is already T > 1 are constrained to D = T.
 
-**Block-level** (PSUM on contraction dims): tiles accumulate into the same PSUM bank within a block — the bank can only change between blocks. `i_block` ranges 0..D-1, requiring num_blocks = D. Does NOT set tiles_per_block.
+### PSUM
 
-Block-level changes the reduction pattern. Without it (D=1), a single PSUM bank accumulates the full contraction. With D > 1, each block produces a **partial** result in its own bank. The partial results are accumulated in an SBUF buffer via `nisa.tensor_tensor(add)`:
+- **Tile level**: D = tiles_per_block. Same mutual constraint with SBUF tile-level and tiles_per_block transform. Valid for both free and contraction dims.
+- **Block level**: D = unified_tiles / tiles_per_block. Requires tiles_per_block > 1 from a prior transform, so D is determined and won't be invalidated by later changes. D must be $\leq$ MAX_DEGREE.
 
-```python
-nisa.memset(dst=sbuf_accum[0:128, 0:128], value=0.0)
-for i_block_d2 in nl.affine_range(D):
-    nisa.memset(dst=psum_acc[0:128, nl.ds(i_block_d2 * PSUM_BANK_SIZE, tile_free)], value=0.0)
-    for i_tile_d2 in nl.affine_range(tiles_per_block):
-        for i_ig_d2 in nl.affine_range(interleave):
-            nisa.nc_matmul(dst=psum_acc[0:128, nl.ds(i_block_d2 * PSUM_BANK_SIZE, tile_free)], ...)
-    nisa.tensor_tensor(dst=sbuf_accum, data=sbuf_accum,
-                       data2=psum_acc[0:128, nl.ds(i_block_d2 * PSUM_BANK_SIZE, tile_free)], op=nl.add)
-```
-
-The zero-initialized SBUF accumulator avoids branching on `i_block == 0` (which affine loops can't express). The SBUF accumulator is the matmul's output staging buffer — no extra allocation is needed. The reference kernel uses this pattern for MM2 (`mm2_sb += mm2_psum_tile` per large tile).
-
-Which level to use for PSUM is deterministic: if the dimension is the matmul's contraction dimension (K dim), tiles accumulate per block → block-level. Otherwise each tile produces an independent result → tile-level. No annotation needed — the renderer derives the level from the op graph.
-
-**Coexistence.** Tile-level and block-level can both be active on the same dimension. D_block is not independently chosen — it equals num_blocks, which is determined by D_tile: $D_\text{block} = \texttt{unified\_tiles} / D_\text{tile}$. Both must be $\leq$ MAX_DEGREE for the combination to be reachable. In the reference kernel: d2 with unified_tiles=16, D_tile=4 (tiles_per_block=4), D_block=4 (num_blocks=4) — the only valid pair where both $\leq 4$. MM1 PSUM rotates tile-level via `i_tile_d2` (banks 0–3); MM2 PSUM rotates block-level via `i_block_d2` (banks 4–7).
+Tile-level and block-level are mutually exclusive for the same PSUM on the same dimension. The `psum_levels` field stores the level explicitly — the renderer reads it directly rather than inferring from D.
 
 ## Candidate Generation
 
-Three sources. For tile-level, D must divide unified_tiles (since tiles_per_block = D determines num_blocks = unified_tiles / D). For block-level, D equals num_blocks exactly — there is no choice of D; the value is determined by the current tiles_per_block. Tile-level D sets tiles_per_block for the dimension, so all tile-level buffers sharing that dimension's tile loop must use the same D (or stay at D=1). If tiles_per_block is already set to a value T > 1 on a dimension, tile-level candidates for that dimension are constrained to D = T.
+Candidate generation requires `buffer_degrees` from prior transforms (loop fusion sets degree-1 entries for fusion intermediates) and respects existing `tiles_per_block` constraints.
 
-`_apply(ir, name, dim_id, D)` returns a new `KernelIR` with `buffer_degrees[name][dim_id] = D`. For tile-level D > 1, it also sets `tiles_per_block[dim_id] = D`. For block-level (PSUM contraction dim), tiles_per_block is unchanged — `num_blocks = D` is already satisfied by the current tiles_per_block.
+Two SBUF sources and one PSUM source. Source 1 increases existing `buffer_degrees` entries (fusion intermediates, or HBM dims added by a prior multi-buffer application). Source 2 adds new dimensions for HBM inputs/outputs. Source 3 adds PSUM entries at tile or block level. For tile-level, D must divide unified_tiles (since tiles_per_block = D determines num_blocks = unified_tiles / D). Tile-level D sets tiles_per_block for the dimension, so all tile-level buffers sharing that dimension's tile loop must use the same D (or stay at D=1). If tiles_per_block is already set to T > 1, tile-level candidates are constrained to D = T. For block-level, tiles_per_block must already be > 1 (set by a prior transform); D = unified_tiles / tiles_per_block.
 
-Tile-level D changes num_blocks to `unified / D`. If a block-level PSUM degree D_block > 1 already exists on the same dim, num_blocks must stay = D_block, constraining tile-level D to `unified / D_block`. All tile-level sources filter candidates that violate this via `_conflicts_block_psum(ir, dim_id, unified // D)`, which returns True if any matmul's contraction dim = dim_id has a PSUM degree D_block > 1 that differs from the proposed num_blocks.
+`_apply(ir, name, dim_id, D)` returns a new `KernelIR` with `buffer_degrees[name][dim_id] = D` and `tiles_per_block[dim_id] = D`. For PSUM, also sets `psum_levels[name][dim_id] = "tile"`. `_apply_block(ir, name, dim_id, D)` sets `buffer_degrees[name][dim_id] = D` and `psum_levels[name][dim_id] = "block"` without modifying `tiles_per_block`. Only called when tiles_per_block > 1 is already set.
 
 ```python
 class MultiBuffer(Transform):
@@ -126,8 +188,6 @@ class MultiBuffer(Transform):
                         continue
                     if existing_tpb > 1 and D != existing_tpb:
                         continue
-                    if _conflicts_block_psum(ir, dim_id, unified // D):
-                        continue
                     results.append(self._apply(ir, tensor_name, dim_id, D))
         """Source 2: HBM staging (tile-level) — add dims not yet in buffer_degrees"""
         for name in (*ir.hbm_inputs, *ir.hbm_outputs):
@@ -142,10 +202,8 @@ class MultiBuffer(Transform):
                         continue
                     if existing_tpb > 1 and D != existing_tpb:
                         continue
-                    if _conflicts_block_psum(ir, dim_id, unified // D):
-                        continue
                     results.append(self._apply(ir, name, dim_id, D))
-        """Source 3: PSUM — tile-level on free dim, block-level on contraction dim.
+        """Source 3: PSUM — tile-level and block-level on free or contraction dim.
         Skip partition dim (M): PSUM banks are free-axis addressed only."""
         for op in ir.matmul_ops:
             current_degrees = ir.buffer_degrees.get(op.psum_name, {})
@@ -153,25 +211,27 @@ class MultiBuffer(Transform):
                 if dim_id == op.partition_dim:
                     continue
                 current = current_degrees.get(dim_id, 0)
-                if dim_id == op.contraction_dim:
-                    """block-level: D = num_blocks exactly (affine loops can't express i_block % D)"""
-                    num_blocks = (dim_size[dim_id] // max_tile_size[dim_id]) // ir.tiles_per_block.get(dim_id, 1)
-                    if 2 <= num_blocks <= self.MAX_DEGREE and num_blocks > current:
-                        results.append(self._apply(ir, op.psum_name, dim_id, num_blocks))
-                else:
-                    """tile-level on free dim: D divides unified_tiles, sets tiles_per_block = D"""
-                    unified = dim_size[dim_id] // max_tile_size[dim_id]
-                    existing_tpb = ir.tiles_per_block.get(dim_id, 1)
-                    for D in range(max(2, current + 1), self.MAX_DEGREE + 1):
-                        if unified % D != 0:
-                            continue
-                        if existing_tpb > 1 and D != existing_tpb:
-                            continue
-                        if _conflicts_block_psum(ir, dim_id, unified // D):
-                            continue
-                        results.append(self._apply(ir, op.psum_name, dim_id, D))
+                """Tile-level: both free and contraction dims. Sets tiles_per_block = D."""
+                unified = dim_size[dim_id] // max_tile_size[dim_id]
+                existing_tpb = ir.tiles_per_block.get(dim_id, 1)
+                for D in range(max(2, current + 1), self.MAX_DEGREE + 1):
+                    if unified % D != 0:
+                        continue
+                    if existing_tpb > 1 and D != existing_tpb:
+                        continue
+                    results.append(self._apply(ir, op.psum_name, dim_id, D))
+                """Block-level: D = num_blocks. Only when tiles_per_block > 1
+                (set by prior transform), so D won't be invalidated later."""
+                if existing_tpb > 1:
+                    num_blocks = unified // existing_tpb
+                    if num_blocks >= 2 and num_blocks <= self.MAX_DEGREE and num_blocks > current:
+                        results.append(self._apply_block(ir, op.psum_name, dim_id, num_blocks))
         return results
 ```
+
+Persistent state buffers — running accumulators from online fusion (e.g., `mm1_running_max`, `exp_running_sum`) that carry values across loop iterations via read-modify-write — must be excluded from all three sources. Multi-buffering assigns each iteration a separate slot, breaking the serial dependency these buffers require. The IR tracks persistent buffer names; candidate generation skips them.
+
+The bank budget constraint (total PSUM banks $\leq 8$) is not checked during candidate generation — the compiler rejects infeasible allocations.
 
 ## Example
 
@@ -190,7 +250,7 @@ for i_block_d0 in nl.affine_range(16):
 
 ## Reference Kernel Mapping
 
-All mappings reference the attention CTE kernel (`attention_cte.py`). The section dimension (seq_k, our d2) has unified_tiles=16, tiles_per_block=4, num_blocks=4.
+All mappings reference the attention CTE kernel (`attention_cte.py`). The section dimension (seq_k, our d2) has unified_tiles=16, tiles_per_block=4, interleave=4, num_blocks=4.
 
 **DMA staging (tile-level on d0).**
 
@@ -200,12 +260,14 @@ All mappings reference the attention CTE kernel (`attention_cte.py`). The sectio
 | `mm2_sb` | 2 | writeback overlaps next group's compute |
 | `k_sb`, `v_sb` | full-range | pre-loaded per section (§5.2, not multi-buffering) |
 
-**PSUM (d2).** MM1 and MM2 share d2 via coexistence:
+**PSUM (d2).** MM1 and MM2 use different loop levels on the same dimension:
 
 | Accumulator | Level | D | Banks | Why |
 |---|---|---|---|---|
-| `mm1_psum` | tile-level | 4 | 0–3 | d2 is the free dim (N) for MM1; each tile produces an independent S column, so rotating across `i_tile_d2` pipelines TE/VE |
-| `mm2_psum` | block-level | 4 | 4–7 | d2 is contraction for MM2; tiles accumulate within a block, so rotating across `i_block_d2` pipelines consecutive blocks |
+| `mm1_psum` | tile | 4 | 0–3 | d2 is MM1's free dim (N). Each K tile (512 tokens = 1 unified tile) produces an independent 128×512 result → `i_tile_d2` indexes banks |
+| `mm2_psum` | block | 4 | 4–7 | d2 is MM2's contraction dim (K). Each large tile (2048 tokens = 1 block of 4 K tiles) accumulates a partial sum → `i_block_d2` indexes banks; partial result accumulated into `mm2_sb` via `tensor_tensor(add)` per block |
+
+Reference code: `mm1_psum` address = `(k_tile_idx % 4) * PSUM_BANK_SIZE`; `mm2_psum` address = `(4 + large_tile_idx % 4) * PSUM_BANK_SIZE`. Mapping: k_tile_idx → `i_tile_d2` (512 tokens = max_tile_size), large_tile_idx → `i_block_d2` (2048 tokens = 4 tiles = 1 block). Both D=4 with trip_count=4, so `% 4` is identity — expressible in affine loops.
 
 **Fusion intermediates and online fusion state (tile-level on d0).**
 
@@ -220,10 +282,8 @@ All mappings reference the attention CTE kernel (`attention_cte.py`). The sectio
 
 ## Limitations
 
-**D < trip_count (both levels).** The reference kernel's `ModularAllocator` handles `index % D` via Python-level list indexing (e.g., `mm1_copy_sb` D=2 with trip=4). Our framework uses `nl.affine_range` where `i % D` is non-affine. To support D < trip_count, the loop would need splitting: `for i_outer in range(T // D): for i_slot in range(D):` — a future codegen extension.
+**D < trip_count.** The reference kernel's `ModularAllocator` handles `index % D` via Python-level list indexing (e.g., `mm2_sb` D=2 with trip=num_grps, `mm1_copy_sb` D=2 with trip=4 K tiles). Our framework uses `nl.affine_range` where `i % D` is non-affine. To support D < trip_count, the loop would need splitting: `for i_outer in range(T // D): for i_slot in range(D):` — a future codegen extension.
 
-Impact at tile-level: the reference kernel's `mm1_copy_sb` and `mm1_affine_select_output` patterns (D=2 within 4 K-tiles per large tile) cannot currently be expressed.
+Our framework CAN express tile-level D = tiles_per_block (e.g., D=2 with tiles_per_block=2), providing local pipelining within each block. What it CANNOT express is D < trip_count — rotating a small buffer (D=2) across many iterations (trip >> 2) of a single loop. The reference kernel's software pipelining across Q groups uses this D < trip_count pattern for all DMA staging and online fusion state buffers at D=2. Without the loop-split extension, these specific patterns are unreachable; the framework can still pipeline these buffers at tile-level (D = tiles_per_block), which provides per-block overlap rather than cross-loop overlap.
 
-Impact at block-level: for the reference configuration (unified_tiles=16, tiles_per_block=4), D_block = num_blocks = 4 $\leq$ MAX_DEGREE, so block-level PSUM rotation is reachable. For larger inputs (e.g., unified_tiles=32 $\rightarrow$ num_blocks=8), D_block exceeds MAX_DEGREE. The three-level loop split (outer $\times$ D-slot $\times$ inner-tile) would keep D_block within bounds regardless of input size — matching the reference kernel's section $\times$ large_tile $\times$ K-tile structure.
-
-All reference kernel multi-buffering patterns at the tested configuration (unified_tiles=16) with D = trip_count are fully supported.
+All reference kernel multi-buffering patterns where D = trip_count (both PSUM allocations: MM1 tile-level D=4=tiles_per_block, MM2 block-level D=4=num_blocks) are fully supported.

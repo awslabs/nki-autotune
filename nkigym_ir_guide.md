@@ -217,30 +217,40 @@ Every on-chip tensor uses a uniform **4D layout**: `(tile_size_P, num_tiles_P, n
 
 **Hardware constraint.** Trainium DMA cannot operate on tensors with more than 5 meaningful (non-singleton) dimensions, so 4D is the maximum usable rank for a two-axis (P, F) tensor.
 
+**Memory hierarchy.** Trainium has three memory levels: HBM (off-chip) → SBUF (on-chip scratchpad) → PSUM (accumulator registers). Each boundary between adjacent levels introduces a tiling parameter — a "tiles per block" that controls how many tiles are processed at that level before results move on. Two ops produce results in PSUM: `nc_matmul` (accumulates partial products across a reduction dimension) and `nc_transpose` (writes transposed tile to a PSUM bank). All other ops work entirely in SBUF.
+
 Each dimension has four components whose product is the dimension size:
 
-$$\texttt{dim\_size} = \texttt{num\_blocks} \times \texttt{tiles\_per\_block} \times \texttt{interleave} \times \texttt{tile\_size}$$
+$$\texttt{dim\_size} = \texttt{num\_blocks} \times \texttt{tpb\_hbm} \times \texttt{interleave} \times \texttt{tile\_size}$$
 
-The first three components define the loop nest for that dimension, forming a stride hierarchy from largest to smallest:
+The HBM→SBUF boundary gives the first tiling parameter: `tpb_hbm` (tiles per block). On dimensions where PSUM-producing ops accumulate or batch results, `tpb_hbm` further factors into two loops via a second parameter `tpb_psum` (tiles per PSUM batch):
 
-| Component | Stride | Loop var |
-|---|---|---|
-| `num_blocks` | `tiles_per_block * interleave` | `i_block` |
-| `tiles_per_block` | `interleave` | `i_tile` |
-| `interleave` | 1 | `i_ig` |
+$$\texttt{tpb\_hbm} = \underbrace{(\texttt{tpb\_hbm} / \texttt{tpb\_psum})}_{\text{PSUM batches per block}} \times \texttt{tpb\_psum}$$
 
-Two components are hardware-determined, one is tunable, one is derived:
+This gives up to four nested loops per dimension:
+
+| Loop | Trip count | Memory boundary | Controls |
+|---|---|---|---|
+| `i_block` | `num_blocks` | — | DMA block iterations |
+| `i_psum_batch` | `tpb_hbm / tpb_psum` | HBM → SBUF | PSUM spill batches within a block |
+| `i_tile` | `tpb_psum` | SBUF → PSUM | Tiles processed before PSUM spill |
+| `i_ig` | `interleave` | — | Sub-tile iterations for ops with smaller tile sizes |
+
+When a dimension has no PSUM-producing ops, or `tpb_psum = tpb_hbm`, the `i_psum_batch` loop has trip count 1 and the nest collapses to three loops.
+
+Component classification:
 
 - **`tile_size`** (hardware) — max of all hardware tile size limits across ops that touch the dimension.
-- **`interleave`** (hardware) — different ops may require different tile sizes on the same dimension (e.g., matmul N=512 vs transpose F=128). The buffer stores data at the smallest common granularity so each op consumes the right number of slots.
-- **`tiles_per_block`** (tunable) — controls arithmetic intensity. Data is loaded from HBM once per block, then reused across `tiles_per_block` compute iterations.
-- **`num_blocks`** (derived) — `dim_size / (tiles_per_block * interleave * tile_size)`. Falls out once the other three are set.
+- **`interleave`** (hardware) — `tile_size / min_tile_size`. Different ops may have different tile sizes on the same dimension (e.g., matmul N=512 vs transpose F=128). The buffer stores data at the smallest common granularity so each op consumes the right number of slots.
+- **`tpb_hbm`** (tunable) — tiles per HBM→SBUF block. Data is loaded from HBM once per block, then reused across `tpb_hbm` compute iterations. Controls arithmetic intensity and SBUF capacity usage.
+- **`tpb_psum`** (tunable, where applicable) — tiles per PSUM→SBUF spill. Controls how many `nc_matmul` accumulations (or `nc_transpose` results) pile up in PSUM before a `tensor_copy` spills to SBUF. Balances spill overhead against PSUM liveness in software-pipelined schedules. Defaults to `tpb_hbm` (spill once per block) when not tuned.
+- **`num_blocks`** (derived) — `dim_size / (tpb_hbm * interleave * tile_size)`.
 
-The buffer's `num_tiles` axis is `num_blocks * tiles_per_block * interleave`. A tensor's placement in the loop nest determines how many of these loop levels fall *outside* vs *inside* the buffer allocation — shifting tensors up and down the loop nest changes the buffer's `num_tiles` without changing the loop structure itself. A tensor placed at the outermost level is full-range (`num_tiles = dim_size / tile_size`); a tensor placed inside all three loops is degree-1 (`num_tiles = 1`).
+The buffer's `num_tiles` axis is `num_blocks * tpb_hbm * interleave`. A tensor's placement in the loop nest determines how many of these loop levels fall *outside* vs *inside* the buffer allocation — shifting tensors up and down the loop nest changes the buffer's `num_tiles` without changing the loop structure itself. A tensor placed at the outermost level is full-range (`num_tiles = dim_size / tile_size`); a tensor placed inside all loops is degree-1 (`num_tiles = 1`).
 
 ## 3. Dimension Analysis
 
-A forward pass over all ops assigns concrete dimension IDs and computes the four components for each dimension. No tensor starts with dimension IDs — they are discovered automatically from op structure.
+A forward pass over all ops assigns concrete dimension IDs and computes the hardware-determined components (`tile_size` and `interleave`, §2) for each dimension. No tensor starts with dimension IDs — they are discovered automatically from op structure.
 
 For each op, build a local axis map from abstract axes (K, M, N or P, F) to concrete dimension IDs (d0, d1, ...). Operands that already carry dim_ids (from prior ops) provide the mapping; operands without dim_ids get fresh IDs allocated. When two operands of the same op share an abstract axis (e.g., matmul's K axis appears in both stationary and moving), their concrete dims are **unified** — the later operand's dim is renamed to match the earlier one, propagating backward through all tensors that share the old ID. This is how shared dimensions are discovered without any manual labeling.
 
@@ -321,7 +331,7 @@ for i_interleave_group_d{id} in range(max_tile_size/op_tile_size):
 
 `render_ir(ir)` converts a `KernelIR` to a complete NKI kernel source string. For the base IR, each op sits in its own singleton fusion group (`[[0], [1], ...]`), so each gets its own self-contained code block: buffer allocations, loop nest, DMA loads, ISA call, and writeback. The renderer iterates over fusion groups in order and concatenates their output.
 
-When transforms modify the `KernelIR` (changing fusion groups, loop order, etc.), `render_ir` produces the transformed kernel — fused groups emit shared loop nests, reordered dimensions change loop nesting, and adjusted `tiles_per_block` changes block/tile loop bounds. The same `render_ir` handles both base and transformed IRs.
+When transforms modify the `KernelIR` (changing fusion groups, loop order, etc.), `render_ir` produces the transformed kernel — fused groups emit shared loop nests, reordered dimensions change loop nesting, and adjusted `tpb_hbm` changes block/tile loop bounds. The same `render_ir` handles both base and transformed IRs.
 
 ### 4.4 Example: Double Matmul
 
@@ -368,6 +378,8 @@ Matmul reshapes `(4, 128)` → `(1, 512)` and processes in 1 group. Transpose re
 **Transpose codegen.** Fixed 128 × 128 tile. Reads from SBUF, writes to a degree-1 PSUM temp `(128, 1, 1, 128)`, then `nisa.tensor_copy` to the output SBUF. The output buffer swaps P and F axes.
 
 **Matmul codegen.** Accumulates into PSUM in fp32 (memset to 0 before the K loop). After all K iterations, `nisa.tensor_copy` moves the result to SBUF.
+
+**PSUM spill scheduling.** Both `nc_matmul` and `nc_transpose` produce results in PSUM and require `nisa.tensor_copy` to move them to SBUF (§2). For `nc_transpose`, each tile produces an independent PSUM result that is spilled immediately. For `nc_matmul` accumulating across a reduction dimension, multiple partial products pile up in the same PSUM tile — `tpb_psum` (§2) controls how many iterations accumulate before the spill. In the reference attention kernel, `tpb_psum = 4` on d2 gives a "large tile" of 4 × 512 = 2048 positions (16 V-tile matmuls) per PSUM batch, with 4 batches per section.
 
 ## 5. Programmatic Transforms
 
