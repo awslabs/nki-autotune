@@ -18,11 +18,11 @@ When a dimension has a non-single tier, the renderer:
 
 1. **Grows the buffer.** The staging buffer's `num_tiles` axis on that dimension increases from 1 to the tier's derived sub-tile count.
 
-2. **Moves the DMA.** The DMA moves to the target position (above the hoisted dimension's loop). A tile-by-tile load loop fills all buffer slots via a helper gadget (e.g. `load_tensor_block`), keeping the main loop nest unchanged.
+2. **Moves the DMA.** The DMA moves to the target position (above the hoisted dimension's loop). A tile-by-tile load loop fills all buffer slots via a helper gadget (`load_tensor_block` from `nkigym.gadgets`), keeping the main loop nest unchanged.
 
 3. **Removes the inline DMA.** The original per-iteration DMA inside the loop is removed; the compute reads from the correct buffer slot using the existing loop variable.
 
-The loop nest itself never changes — no loops are added or split. Dimensions the tensor doesn't depend on (**irrelevant dims**) never affect buffer sizing. At single placement, the DMA is inside all loops including irrelevant ones; eliminating that redundancy is the primary purpose of load placement.
+The loop nest itself never changes — no loops are added or split. Dimensions the tensor doesn't depend on (**irrelevant dims**) never affect buffer sizing. At single placement, the DMA sits at the innermost relevant dimension's loop; if irrelevant loops lie between relevant ones in the loop order, the DMA re-executes for each irrelevant iteration. Eliminating that redundancy is one purpose of load placement.
 
 ## Why
 
@@ -91,7 +91,7 @@ for i_d0 in range(16):
         load_tensor_block(dst=sbuf_lhs_T, src=lhs_T, par_ofs=i_d0*128, free_ofs=i_d1*128)
         for i_d2 in range(4):
             load_tensor_block(dst=sbuf_rhs, src=rhs, par_ofs=i_d0*128, free_ofs=i_d2*512)
-            nisa.nc_matmul(dst=psum_output[0:128, i_d1, i_d2, 0:512],stationary=sbuf_lhs_T[...],moving=sbuf_rhs[...])
+            nisa.nc_matmul(dst=psum_output[0:128, i_d1, i_d2, 0:512],stationary=sbuf_lhs_T[0:128,0,0,0:128],moving=sbuf_rhs[0:128,0,0,0:512])
 nisa.tensor_copy(psum_output -> sbuf_output)
 nisa.dma_copy(sbuf_output -> hbm_output)
 ```
@@ -101,13 +101,13 @@ nisa.dma_copy(sbuf_output -> hbm_output)
 sbuf_lhs_T = nl.ndarray((128,1,1,128), buffer=nl.sbuf)
 sbuf_rhs = nl.ndarray((128,1,4,512), buffer=nl.sbuf)
 psum_output = nl.ndarray((128, 16, 4, 512),buffer=nl.psum)
-sbuf_output = nl.ndarray((128, 16, 4, 512),buffer=nl.psum)
+sbuf_output = nl.ndarray((128, 16, 4, 512),buffer=nl.sbuf)
 for i_d0 in range(16):
     for i_d1 in range(16):
         load_tensor_block(dst=sbuf_lhs_T, src=lhs_T, par_ofs=i_d0*128, free_ofs=i_d1*128)
         load_tensor_block(dst=sbuf_rhs, src=rhs, par_ofs=i_d0*128, free_ofs=0)
         for i_d2 in range(4):
-            nisa.nc_matmul(dst=psum_output[0:128, i_d1, i_d2, 0:512],stationary=sbuf_lhs_T[...],moving=sbuf_rhs[0:128,0,i_d2,0:512])
+            nisa.nc_matmul(dst=psum_output[0:128, i_d1, i_d2, 0:512],stationary=sbuf_lhs_T[0:128,0,0,0:128],moving=sbuf_rhs[0:128,0,i_d2,0:512])
 nisa.tensor_copy(psum_output -> sbuf_output)
 nisa.dma_copy(sbuf_output -> hbm_output)
 ```
