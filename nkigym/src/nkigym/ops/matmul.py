@@ -54,15 +54,15 @@ def _emit_loops(cfg: dict, psum_name: str, psum_sl: str, dim_order: tuple[str, .
 
     n_outer = len(dim_order) * 3
     for j, did in enumerate(dim_order):
-        lines.append(f"{ind(n_outer + j)}for i_ig_{did} in nl.affine_range({ig_trips[did]}):")
+        lines.append(f"{ind(n_outer + j)}for i_ig_{did} in range({ig_trips[did]}):")
 
     memset_depth = n_outer + len(dim_order)
     d = ind(memset_depth)
     lines.append(f"{d}nisa.memset(dst={psum_name}[{psum_sl}], value=0.0)")
-    lines.append(f"{d}for i_block_{dim_K} in nl.affine_range({cfg['num_blocks_K']}):")
-    lines.append(f"{ind(memset_depth + 1)}for i_psum_batch_{dim_K} in nl.affine_range({cfg['psum_batches_K']}):")
-    lines.append(f"{ind(memset_depth + 2)}for i_tile_{dim_K} in nl.affine_range({cfg['tpb_psum_K']}):")
-    lines.append(f"{ind(memset_depth + 3)}for i_ig_{dim_K} in nl.affine_range({cfg['ig_trips_K']}):")
+    lines.append(f"{d}for i_block_{dim_K} in range({cfg['num_blocks_K']}):")
+    lines.append(f"{ind(memset_depth + 1)}for i_psum_batch_{dim_K} in range({cfg['psum_batches_K']}):")
+    lines.append(f"{ind(memset_depth + 2)}for i_tile_{dim_K} in range({cfg['tpb_psum_K']}):")
+    lines.append(f"{ind(memset_depth + 3)}for i_ig_{dim_K} in range({cfg['ig_trips_K']}):")
 
     inner_depth = memset_depth + 4
     return lines, memset_depth, inner_depth
@@ -422,15 +422,15 @@ def _render_matmul_inner(cfg: dict, pre_allocated: frozenset[str] = frozenset(),
             f" dtype=nl.{cfg['stat_dtype']}, buffer=nl.sbuf)"
         )
 
-    lines.append(f"{ind(n)}for i_ig_{dim_M} in nl.affine_range({cfg['ig_trips_M']}):")
-    lines.append(f"{ind(n + 1)}for i_ig_{dim_N} in nl.affine_range({cfg['ig_trips_N']}):")
+    lines.append(f"{ind(n)}for i_ig_{dim_M} in range({cfg['ig_trips_M']}):")
+    lines.append(f"{ind(n + 1)}for i_ig_{dim_N} in range({cfg['ig_trips_N']}):")
 
     memset_d = n + 2
     lines.append(f"{ind(memset_d)}nisa.memset(dst={psum_name}[{psum_sl}], value=0.0)")
-    lines.append(f"{ind(memset_d)}for i_block_{dim_K} in nl.affine_range({cfg['num_blocks_K']}):")
-    lines.append(f"{ind(memset_d + 1)}for i_psum_batch_{dim_K} in nl.affine_range({cfg['psum_batches_K']}):")
-    lines.append(f"{ind(memset_d + 2)}for i_tile_{dim_K} in nl.affine_range({cfg['tpb_psum_K']}):")
-    lines.append(f"{ind(memset_d + 3)}for i_ig_{dim_K} in nl.affine_range({cfg['ig_trips_K']}):")
+    lines.append(f"{ind(memset_d)}for i_block_{dim_K} in range({cfg['num_blocks_K']}):")
+    lines.append(f"{ind(memset_d + 1)}for i_psum_batch_{dim_K} in range({cfg['psum_batches_K']}):")
+    lines.append(f"{ind(memset_d + 2)}for i_tile_{dim_K} in range({cfg['tpb_psum_K']}):")
+    lines.append(f"{ind(memset_d + 3)}for i_ig_{dim_K} in range({cfg['ig_trips_K']}):")
 
     inner_d = memset_d + 4
     lines.extend(_emit_dma_loads(cfg, sbuf_stat, sbuf_mov, inner_d))

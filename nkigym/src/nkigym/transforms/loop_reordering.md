@@ -24,13 +24,13 @@ Non-blocking output dimensions in `group_dim_orders` (the per-group ordered list
 
 ```python
 """ Op 2: Q_t x K_t -> S(d0, d2), default order: (d0, d2) """
-for i_block_d0 in nl.affine_range(16):                          # d0 outermost
-    for i_tile_d0 in nl.affine_range(1):
-        for i_block_d2 in nl.affine_range(4):                   # d2 inner
-            for i_tile_d2 in nl.affine_range(1):
+for i_block_d0 in range(16):                          # d0 outermost
+    for i_tile_d0 in range(1):
+        for i_block_d2 in range(4):                   # d2 inner
+            for i_tile_d2 in range(1):
                 psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
-                for i_block_d1 in nl.affine_range(1):           # d1 reduction
-                    for i_tile_d1 in nl.affine_range(1):
+                for i_block_d1 in range(1):           # d1 reduction
+                    for i_tile_d1 in range(1):
                         nisa.nc_matmul(dst=psum_S[...], stationary=sbuf_Q_t[...], moving=sbuf_K_t[...])
                 nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
 ```
@@ -39,13 +39,13 @@ for i_block_d0 in nl.affine_range(16):                          # d0 outermost
 
 ```python
 """ Op 2: Q_t x K_t -> S(d0, d2), reordered: (d2, d0) """
-for i_block_d2 in nl.affine_range(4):                           # d2 outermost
-    for i_tile_d2 in nl.affine_range(1):
-        for i_block_d0 in nl.affine_range(16):                  # d0 inner
-            for i_tile_d0 in nl.affine_range(1):
+for i_block_d2 in range(4):                           # d2 outermost
+    for i_tile_d2 in range(1):
+        for i_block_d0 in range(16):                  # d0 inner
+            for i_tile_d0 in range(1):
                 psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
-                for i_block_d1 in nl.affine_range(1):           # d1 reduction
-                    for i_tile_d1 in nl.affine_range(1):
+                for i_block_d1 in range(1):           # d1 reduction
+                    for i_tile_d1 in range(1):
                         nisa.nc_matmul(dst=psum_S[...], stationary=sbuf_Q_t[...], moving=sbuf_K_t[...])
                 nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
 ```
@@ -80,23 +80,23 @@ for d2_block:                      # blocking dim block — hoisted above d0
 
 **Why valid for accumulating dims.** `nc_matmul` uses `+=` semantics, adding to whatever PSUM holds. Reloading a partial sum via `tensor_copy` lets accumulation continue across blocks — the result is identical because addition is associative ($K = B \times T$ iterations split into $B$ blocks of $T$).
 
-Pre-zeroing the SBUF partial buffer avoids conditional logic within `nl.affine_range` — the first reload loads zero (equivalent to memset), subsequent reloads load the running partial sum.
+Pre-zeroing the SBUF partial buffer avoids conditional logic within `range` — the first reload loads zero (equivalent to memset), subsequent reloads load the running partial sum.
 
 ```python
 sbuf_partial = nl.ndarray((128, 16, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_partial[...], value=0.0)
 
-for i_block_d2 in nl.affine_range(num_blocks_d2):               # section
-    for i_block_d0 in nl.affine_range(16):                       # Q-group
+for i_block_d2 in range(num_blocks_d2):               # section
+    for i_block_d0 in range(16):                       # Q-group
         psum_acc = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
         nisa.tensor_copy(dst=psum_acc[0:128, 0:128],             # reload partial
             src=sbuf_partial[0:128, i_block_d0, 0, 0:128])
-        for i_tile_d2 in nl.affine_range(tiles_per_block_d2):    # d2 tile
+        for i_tile_d2 in range(tiles_per_block_d2):    # d2 tile
             nisa.nc_matmul(dst=psum_acc[...], ...)               # accumulates via +=
         nisa.tensor_copy(dst=sbuf_partial[0:128, i_block_d0, 0, 0:128],
             src=psum_acc[0:128, 0:128])                          # save partial
 
-for i_block_d0 in nl.affine_range(16):                           # writeback
+for i_block_d0 in range(16):                           # writeback
     nisa.dma_copy(dst=output[...], src=sbuf_partial[0:128, i_block_d0, 0, 0:128])
 ```
 
@@ -126,26 +126,26 @@ Lower levels enclose more output dims: more operand reuse per section, larger pa
 sbuf_partial = nl.ndarray((128, 16, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_partial[...], value=0.0)
 
-for i_block_d2 in nl.affine_range(2):                            """ d2 block (hoisted above d0) """
-    for i_block_d0 in nl.affine_range(16):                       """ d0 (enclosed by d2 block) """
-        for i_tile_d0 in nl.affine_range(1):
-            for i_block_d4 in nl.affine_range(1):
-                for i_tile_d4 in nl.affine_range(1):
+for i_block_d2 in range(2):                            """ d2 block (hoisted above d0) """
+    for i_block_d0 in range(16):                       """ d0 (enclosed by d2 block) """
+        for i_tile_d0 in range(1):
+            for i_block_d4 in range(1):
+                for i_tile_d4 in range(1):
                     psum_output = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
                     nisa.tensor_copy(dst=psum_output[0:128, 0:128],
                         src=sbuf_partial[0:128, i_block_d0, 0, 0:128])
-                    for i_tile_d2 in nl.affine_range(2):         """ d2 tile (inside d0) """
+                    for i_tile_d2 in range(2):         """ d2 tile (inside d0) """
                         psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
                         nisa.memset(dst=psum_S[0:128, 0:512], value=0.0)
-                        for i_block_d1 in nl.affine_range(1):
-                            for i_tile_d1 in nl.affine_range(1):
+                        for i_block_d1 in range(1):
+                            for i_tile_d1 in range(1):
                                 """ Ops 0-1: transpose Q, K """
                                 """ Op 2: matmul Q_t @ K_t → accumulate psum_S """
                         """ Ops 3-4: transpose S → S_t, matmul S_t @ V → accumulate psum_output """
                     nisa.tensor_copy(dst=sbuf_partial[0:128, i_block_d0, 0, 0:128],
                         src=psum_output[0:128, 0:128])
 
-for i_block_d0 in nl.affine_range(16):
+for i_block_d0 in range(16):
     nisa.dma_copy(dst=output[...], src=sbuf_partial[0:128, i_block_d0, 0, 0:128])
 ```
 

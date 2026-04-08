@@ -44,8 +44,8 @@ PSUM has 8 banks of `PSUM_BANK_SIZE` (2048) free elements each. A multi-buffered
 **SBUF:** `i_tile` directly indexes buffer slots:
 
 ```python
-for i_block_d2 in nl.affine_range(num_blocks):
-    for i_tile_d2 in nl.affine_range(D):
+for i_block_d2 in range(num_blocks):
+    for i_tile_d2 in range(D):
         idx = i_tile_d2 * interleave + i_ig
         sbuf_S[..., idx, ...]
 ```
@@ -55,7 +55,7 @@ for i_block_d2 in nl.affine_range(num_blocks):
 ```python
 psum_acc = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
                        buffer=nl.psum, address=(0, base_bank * PSUM_BANK_SIZE))
-for i in nl.affine_range(D):
+for i in range(D):
     nisa.nc_matmul(dst=psum_acc[0:128, nl.ds(i * PSUM_BANK_SIZE, tile_free)], ...)
 ```
 
@@ -70,7 +70,7 @@ PSUM multi-buffering operates at two loop levels, depending on which loop variab
 | Tile | tiles_per_block | `i_tile` | Valid | Valid |
 | Block | num_blocks | `i_block` | Valid | Valid |
 
-NKI `nl.affine_range` loops lack modular arithmetic (`i % D`), so D must equal the driving loop's trip count — `i_tile` ranges 0..D-1 only when D = tiles_per_block, and `i_block` only when D = num_blocks.
+NKI `range` loops lack modular arithmetic (`i % D`), so D must equal the driving loop's trip count — `i_tile` ranges 0..D-1 only when D = tiles_per_block, and `i_block` only when D = num_blocks.
 
 Why not interleave level (`i_ig`)? The matmul's op_tile_size on the free dim (N=512) spans all interleave groups (each 128 elements) in one call. The matmul runs at `i_tile` granularity, outside the `i_ig` loop, so it cannot use `i_ig` for bank selection.
 
@@ -83,7 +83,7 @@ Each iteration of the driving loop produces an independent result in its own ban
 ```python
 psum_S = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
                      buffer=nl.psum, address=(0, 0))
-for i_tile_d2 in nl.affine_range(D):
+for i_tile_d2 in range(D):
     nisa.memset(dst=psum_S[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 512)], value=0.0)
     nisa.nc_matmul(dst=psum_S[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 512)], ...)
     nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 512)])
@@ -102,9 +102,9 @@ psum_output = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
                           buffer=nl.psum, address=(0, 4 * PSUM_BANK_SIZE))
 sbuf_accum = nl.ndarray((128, 1, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_accum[0:128, 0, 0, 0:128], value=0.0)
-for i_tile_d2 in nl.affine_range(D):
+for i_tile_d2 in range(D):
     nisa.memset(dst=psum_output[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 128)], value=0.0)
-    for i_ig_d2 in nl.affine_range(interleave):
+    for i_ig_d2 in range(interleave):
         nisa.nc_matmul(dst=psum_output[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 128)], ...)
     nisa.tensor_tensor(dst=sbuf_accum[0:128, 0, 0, 0:128],
                        data=sbuf_accum[0:128, 0, 0, 0:128],
@@ -121,10 +121,10 @@ psum_output = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
                           buffer=nl.psum, address=(0, 4 * PSUM_BANK_SIZE))
 sbuf_accum = nl.ndarray((128, 1, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_accum[0:128, 0, 0, 0:128], value=0.0)
-for i_block_d2 in nl.affine_range(D):
+for i_block_d2 in range(D):
     nisa.memset(dst=psum_output[0:128, nl.ds(i_block_d2 * PSUM_BANK_SIZE, 128)], value=0.0)
-    for i_tile_d2 in nl.affine_range(tiles_per_block):
-        for i_ig_d2 in nl.affine_range(interleave):
+    for i_tile_d2 in range(tiles_per_block):
+        for i_ig_d2 in range(interleave):
             nisa.nc_matmul(dst=psum_output[0:128, nl.ds(i_block_d2 * PSUM_BANK_SIZE, 128)], ...)
     nisa.tensor_tensor(dst=sbuf_accum[0:128, 0, 0, 0:128],
                        data=sbuf_accum[0:128, 0, 0, 0:128],
@@ -239,11 +239,11 @@ Fused matmul S → transpose S_t, intermediate S(d0, d2). Degree-2 along d2 — 
 
 ```python
 sbuf_S = nl.ndarray((128, 1, 8, 128), dtype=Q.dtype, buffer=nl.sbuf)
-for i_block_d0 in nl.affine_range(16):
-    for i_tile_d0 in nl.affine_range(1):
-        for i_block_d2 in nl.affine_range(2):                            """ was 4, now 2 """
-            for i_tile_d2 in nl.affine_range(2):                         """ was 1, now 2 (= D) """
-                for i_ig_d2 in nl.affine_range(4):
+for i_block_d0 in range(16):
+    for i_tile_d0 in range(1):
+        for i_block_d2 in range(2):                            """ was 4, now 2 """
+            for i_tile_d2 in range(2):                         """ was 1, now 2 (= D) """
+                for i_ig_d2 in range(4):
                     sbuf_S[0:128, 0, i_tile_d2*4+i_ig_d2, 0:128]
                 ...
 ```
@@ -282,7 +282,7 @@ Reference code: `mm1_psum` address = `(k_tile_idx % 4) * PSUM_BANK_SIZE`; `mm2_p
 
 ## Limitations
 
-**D < trip_count.** The reference kernel's `ModularAllocator` handles `index % D` via Python-level list indexing (e.g., `mm2_sb` D=2 with trip=num_grps, `mm1_copy_sb` D=2 with trip=4 K tiles). Our framework uses `nl.affine_range` where `i % D` is non-affine. To support D < trip_count, the loop would need splitting: `for i_outer in range(T // D): for i_slot in range(D):` — a future codegen extension.
+**D < trip_count.** The reference kernel's `ModularAllocator` handles `index % D` via Python-level list indexing (e.g., `mm2_sb` D=2 with trip=num_grps, `mm1_copy_sb` D=2 with trip=4 K tiles). Our framework uses `range` where `i % D` is non-affine. To support D < trip_count, the loop would need splitting: `for i_outer in range(T // D): for i_slot in range(D):` — a future codegen extension.
 
 Our framework CAN express tile-level D = tiles_per_block (e.g., D=2 with tiles_per_block=2), providing local pipelining within each block. What it CANNOT express is D < trip_count — rotating a small buffer (D=2) across many iterations (trip >> 2) of a single loop. The reference kernel's software pipelining across Q groups uses this D < trip_count pattern for all DMA staging and online fusion state buffers at D=2. Without the loop-split extension, these specific patterns are unreachable; the framework can still pipeline these buffers at tile-level (D = tiles_per_block), which provides per-block overlap rather than cross-loop overlap.
 

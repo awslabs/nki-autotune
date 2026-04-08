@@ -238,8 +238,8 @@ def _render_transpose_inner(cfg: dict, pre_allocated: frozenset[str] = frozenset
                 f" dtype=nl.{cfg['dtype']}, buffer=nl.sbuf)"
             )
 
-    lines.append(f"{ind(n)}for i_ig_{dim_P} in nl.affine_range({cfg['ig_trips_P']}):")
-    lines.append(f"{ind(n + 1)}for i_ig_{dim_F} in nl.affine_range({cfg['ig_trips_F']}):")
+    lines.append(f"{ind(n)}for i_ig_{dim_P} in range({cfg['ig_trips_P']}):")
+    lines.append(f"{ind(n + 1)}for i_ig_{dim_F} in range({cfg['ig_trips_F']}):")
 
     inner_d = n + 2
     src_sl = f"0:{min_P}, 0, i_ig_{dim_F}, 0:{min_F}"
@@ -293,7 +293,7 @@ def _render_transpose(cfg: dict) -> list[str]:
 
     n_outer = len(dim_order) * 3
     for j, did in enumerate(dim_order):
-        lines.append(f"{ind(n_outer + j)}for i_ig_{did} in nl.affine_range({ig_trips[did]}):")
+        lines.append(f"{ind(n_outer + j)}for i_ig_{did} in range({ig_trips[did]}):")
 
     inner_depth = n_outer + len(dim_order)
 

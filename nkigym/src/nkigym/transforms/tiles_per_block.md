@@ -8,12 +8,12 @@ Must divide `unified_tiles`. Default is 1. Setting to T creates a two-level nest
 
 ```python
 """ tiles_per_block = 1 (default) """
-for i_block_d in nl.affine_range(unified_tiles):
-    for i_tile_d in nl.affine_range(1):
+for i_block_d in range(unified_tiles):
+    for i_tile_d in range(1):
 
 """ tiles_per_block = T """
-for i_block_d in nl.affine_range(unified_tiles // T):
-    for i_tile_d in nl.affine_range(T):
+for i_block_d in range(unified_tiles // T):
+    for i_tile_d in range(T):
 ```
 
 Total iterations are unchanged ($\texttt{num\_blocks} \times T = \texttt{unified\_tiles}$). `tiles_per_block` itself does not change buffer sizes or DMA — it creates a block/tile boundary that two other transforms exploit:
@@ -77,22 +77,22 @@ Candidates only increase `tiles_per_block` — the search graph explores all val
 Fully fused `[[0,1,2,3,4]]`, dim order $(d_0, d_4, d_2, d_1)$, all inputs `(2048, 128)`. On d2: `unified_tiles = 4`, `interleave = 4`. Setting `tiles_per_block_d2 = 2` changes the d2 loops from 4 blocks × 1 tile to 2 blocks × 2 tiles:
 
 ```python
-for i_block_d0 in nl.affine_range(16):
-    for i_tile_d0 in nl.affine_range(1):
-        for i_block_d4 in nl.affine_range(1):
-            for i_tile_d4 in nl.affine_range(1):
+for i_block_d0 in range(16):
+    for i_tile_d0 in range(1):
+        for i_block_d4 in range(1):
+            for i_tile_d4 in range(1):
                 psum_output = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
                 nisa.memset(dst=psum_output[0:128, 0:128], value=0.0)
-                for i_block_d2 in nl.affine_range(2):              """ 2 blocks (was 4) """
-                    for i_tile_d2 in nl.affine_range(2):           """ 2 tiles/block (was 1) """
+                for i_block_d2 in range(2):              """ 2 blocks (was 4) """
+                    for i_tile_d2 in range(2):           """ 2 tiles/block (was 1) """
                         psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
                         nisa.memset(dst=psum_S[0:128, 0:512], value=0.0)
-                        for i_block_d1 in nl.affine_range(1):
-                            for i_tile_d1 in nl.affine_range(1):
+                        for i_block_d1 in range(1):
+                            for i_tile_d1 in range(1):
                                 """ Ops 0-2: transpose Q, K; matmul → psum_S """
                         sbuf_S = nl.ndarray((128, 1, 4, 128), ...)  """ degree-1 """
                         nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[...])
-                        for i_ig_d2 in nl.affine_range(4):
+                        for i_ig_d2 in range(4):
                             """ Ops 3-4: transpose S; matmul → psum_output """
                 sbuf_output = nl.ndarray((128, 1, 1, 128), ...)
                 nisa.tensor_copy(dst=sbuf_output[...], src=psum_output[...])

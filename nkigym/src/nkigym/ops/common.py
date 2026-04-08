@@ -31,7 +31,7 @@ def linear_expr(terms: list[tuple[str, int, int]]) -> str:
 
     Each term is ``(variable_name, stride, trip_count)``.  Terms whose
     ``trip_count <= 1`` are omitted because the variable is always 0
-    (from an ``nl.affine_range(1)`` loop).
+    (from a ``range(1)`` loop).
 
     Args:
         terms: List of (variable_name, stride, trip_count) tuples.
@@ -101,9 +101,9 @@ def emit_outer_loops(
     for i, dim_id in enumerate(dim_order):
         base = i * 3
         psum_batches = tpb_hbm_by_dim[dim_id] // tpb_psum_by_dim[dim_id]
-        lines.append(f"{ind(base)}for i_block_{dim_id} in nl.affine_range({num_blocks_by_dim[dim_id]}):")
-        lines.append(f"{ind(base + 1)}for i_psum_batch_{dim_id} in nl.affine_range({psum_batches}):")
-        lines.append(f"{ind(base + 2)}for i_tile_{dim_id} in nl.affine_range({tpb_psum_by_dim[dim_id]}):")
+        lines.append(f"{ind(base)}for i_block_{dim_id} in range({num_blocks_by_dim[dim_id]}):")
+        lines.append(f"{ind(base + 1)}for i_psum_batch_{dim_id} in range({psum_batches}):")
+        lines.append(f"{ind(base + 2)}for i_tile_{dim_id} in range({tpb_psum_by_dim[dim_id]}):")
     return lines
 
 
