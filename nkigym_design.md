@@ -1,12 +1,13 @@
 ---
-title: "NKIGym Guide: From Python to NKI Kernels"
+title: "NKIGym Design: From Python to NKI Kernels"
 author: "NKI Autotune"
 date: "2026-03-25"
 geometry: margin=1in
 ---
 
-# NKIGym Guide
+# NKIGym Design
 
+## 1. Logical Computation
 **Running example**: causal single-head attention `softmax(mask(scale * Q @ K^T)) @ V`. Inputs use standard ML layout `(seq, hidden)`:
 
 - `q: float16[4096, 128]` — `(seq_q, d_k)`
@@ -14,43 +15,40 @@ geometry: margin=1in
 - `v: float16[4096, 128]` — `(seq_k, d_v)`
 - output: `float16[4096, 128]` — `(seq_q, d_v)`
 
----
-
-## 1. Logical Computation
-
 The math function defines what to compute — no loads/stores, no tiling, no memory hierarchy. Each `nkigym.*` call maps 1:1 to a real `nisa.*` ISA instruction, but the math function only specifies the logical data flow.
 
 ```python
 def attention(Q, K, V, scale):
-    Q_t = nkigym.nc_transpose(Q)
-    K_t = nkigym.nc_transpose(K)
-    S = nkigym.nc_matmul(Q_t, K_t)
-    masked_S = nkigym.affine_select(
+    Q_t = GymTranspose()(Q)
+    K_t = GymTranspose()(K)
+    S = GymMatmul()(Q_t, K_t)
+    masked_S = GymAffineSelect()(
         pattern=[[-1, S.shape[1]]], channel_multiplier=1,
         on_true_tile=S, on_false_value=-np.inf,
         cmp_op="greater_equal")
-    scaled_S = nkigym.tensor_scalar(masked_S, op0="multiply",
+    scaled_S = GymTensorScalar()(masked_S, op0="multiply",
                                      operand0=scale)
-    neg_max_S = nkigym.tensor_reduce(op="max", data=scaled_S,
+    neg_max_S = GymTensorReduce()(op="max", data=scaled_S,
                                       axis=1, negate=True)
-    exp_S, sum_exp = nkigym.activation_reduce(
+    exp_S, sum_exp = GymActivationReduce()(
         op="exp", data=scaled_S, reduce_op="add",
         bias=neg_max_S)
-    inv_sum = nkigym.activation(op="reciprocal", data=sum_exp)
-    exp_S_t = nkigym.nc_transpose(exp_S)
-    attn = nkigym.nc_matmul(exp_S_t, V)
-    output = nkigym.tensor_scalar(attn, op0="multiply",
-                                   operand0=inv_sum)
+    inv_sum = GymActivation()(op="reciprocal", data=sum_exp)
+    exp_S_t = nkigym.nc_transpose()(exp_S)
+    attn = GymMatmul()(exp_S_t, V)
+    output = GymTensorScalar()(attn, op0="multiply",operand0=inv_sum)
     return output
 ```
 
-### 1.1 NKI Gym Operators
+---
+
+## 2 NKIGym Operators
 
 Every `nkigym.*` op mirrors a real `nisa.*` or `nl.*` ISA operation — no ops are invented. At the logical level, an op only declares its axis semantics and a CPU simulation. No hardware constraints, tiling, or memory placement.
 
 ```python
-class NKIOp:
-    """Logical NKI operator — axis semantics and CPU simulation only."""
+class GymOp:
+    """Logical NKIGym operator — axis semantics and CPU simulation only."""
     NAME: str
     OPERAND_AXES: dict[str, tuple[str, ...]]
     OUTPUT_AXES: dict[str, tuple[str, str, ...]]
@@ -62,10 +60,10 @@ class NKIOp:
         """
 ```
 
-#### Operator Subclasses
+### 2.1 Operator Subclasses
 
 ```python
-class NKIMatmul(NKIOp):
+class GymMatmul(GymOp):
     """stationary(K, M).T @ moving(K, N) → output(M, N).
     K is the contraction (accumulation) axis.
     """
@@ -78,7 +76,7 @@ class NKIMatmul(NKIOp):
         return stationary.T @ moving
 
 
-class NKITranspose(NKIOp):
+class GymTranspose(GymOp):
     """data(P, F) → output(F, P). Real hardware op, not a free view."""
 
     NAME = "nc_transpose"
@@ -89,7 +87,7 @@ class NKITranspose(NKIOp):
         return data.T
 
 
-class NKITensorScalar(NKIOp):
+class GymTensorScalar(GymOp):
     """(data <op0> operand0) <op1> operand1 → output(P, F).
     operand0/operand1: scalar constant or (P,) column vector,
     broadcast across the free axis.
@@ -111,7 +109,7 @@ class NKITensorScalar(NKIOp):
         return result
 
 
-class NKIAffineSelect(NKIOp):
+class GymAffineSelect(GymOp):
     """Position-predicated element select.
     affine_value = offset + p * channel_multiplier + Σ(idx_i * step_i).
     Compares affine_value to 0; selects on_true_tile or on_false_value.
@@ -136,7 +134,7 @@ class NKIAffineSelect(NKIOp):
         return np.where(mask, on_true_tile.reshape(P, F), on_false_value)
 
 
-class NKITensorReduce(NKIOp):
+class GymTensorReduce(GymOp):
     """Reduce along specified axis with optional negation.
     data(P, F) → output(P,).
     axis must be trailing free dimension(s); partition axis cannot be reduced.
@@ -154,7 +152,7 @@ class NKITensorReduce(NKIOp):
         return result
 
 
-class NKIActivationReduce(NKIOp):
+class GymActivationReduce(GymOp):
     """op(data * scale + bias) → output(P, F), and simultaneously
     reduce_op(output) along free axis → reduce_res(P,).
     reduce_op only supports "add".
@@ -176,7 +174,7 @@ class NKIActivationReduce(NKIOp):
         return elem, red
 
 
-class NKIActivation(NKIOp):
+class GymActivation(GymOp):
     """output = op(data * scale + bias).
     Applies unary activation element-wise.
     """
@@ -196,9 +194,9 @@ class NKIActivation(NKIOp):
         return fns[op](data * s + b)
 ```
 
-### 1.2 CPU Simulation
+### 2.2 CPU Simulation
 
-The math function is plain Python — each `nkigym.*` call dispatches to `NKIOp.__call__()` which executes the op with numpy at float64 precision. No parsing or IR needed; just call the function directly:
+The math function is plain Python — each `nkigym.*` call dispatches to `GymOp.__call__()` which executes the op with numpy at float64 precision. No parsing or IR needed; just call the function directly:
 
 ```python
 q = np.random.randn(4096, 128)
@@ -211,15 +209,39 @@ The result is the **reference output** — a float64 array that any correctly re
 
 ---
 
-## 2. Tensor Layout
+## 3. Dimension Analysis
+
+A forward pass over all ops assigns concrete dimension IDs and computes the hardware-determined components (`op{int}_d{int}_tile_size` and `d{int}_tile_size`) for each dimension. No tensor starts with dimension IDs — they are discovered automatically from op structure.
+
+For each op, build a local axis map from abstract axes (K, M, N or P, F) to concrete dimension IDs (d0, d1, ...). Operands that already carry dim_ids (from prior ops) provide the mapping; operands without dim_ids get fresh IDs allocated. When two operands of the same op share an abstract axis (e.g., matmul's K axis appears in both stationary and moving), their concrete dims are **unified** — the later operand's dim is renamed to match the earlier one, propagating backward through all tensors that share the old ID. This is how shared dimensions are discovered without any manual labeling.
+
+### Example
+
+```python
+Q_t = GymTranspose()(Q)
+K_t = GymTranspose()(K)
+S = GymMatmul()(Q_t, K_t)
+```
+
+Walk through the forward pass. Inputs Q, K, V have no dim_ids — the pass discovers them:
+
+1. **`GymTranspose(Q)`** — Q has no dim_ids. Allocate P=d0, F=d1. Assign **Q → (d0, d1)**. `OUTPUT_AXES = ("F", "P")` → **Q_t gets (d1, d0)**.
+
+2. **`GymTranspose(K)`** — K has no dim_ids. Allocate P=d2, F=d3. Assign **K → (d2, d3)**. Output → **K_t gets (d3, d2)**.
+
+3. **`GymMatmul(Q_t, K_t)`** — Q_t has (d1, d0) → K=d1, M=d0. K_t has (d3, d2) → K=d3, N=d2. Abstract axis K maps to both d1 and d3 — **unify d3→d1**. This renames K's dim_ids from (d2, d3) to (d2, d1), and K_t from (d3, d2) to (d1, d2). Now K=d1 is consistent across both operands. `OUTPUT_AXES = ("M", "N")` → **S gets (d0, d2)**.
+
+---
+
+## 4. Tensor Tiling
 
 Every on-chip tensor uses a uniform **4D layout**: `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`. This is the central design decision — loop structure, buffer sizing, and all transforms operate on this single shape.
 
 **Hardware constraint.** Trainium DMA cannot operate on tensors with more than 5 meaningful (non-singleton) dimensions.
 
-### Memory Hierarchy and Boundaries
+### 4.1 Memory Hierarchy and Boundaries
 
-Trainium has three memory levels: HBM (off-chip) → SBUF (on-chip scratchpad) → PSUM (accumulator registers). Each boundary between adjacent levels introduces a block/tile tiling parameter that controls arithmetic intensity. Two ops produce results in PSUM: `nc_matmul` and `nc_transpose`. All other ops work entirely in SBUF.
+Trainium has three memory levels: HBM (off-chip) → SBUF (on-chip scratchpad) → PSUM (accumulator registers). Each boundary between adjacent levels introduces a block/tile tiling parameter that controls arithmetic intensity. Two ops produce results in PSUM: `nc_matmul` and `nc_transpose`.
 
 Each op decides which boundary it triggers by examining its own inputs — an entirely localized decision. An op triggers at most one boundary:
 
@@ -227,38 +249,195 @@ Each op decides which boundary it triggers by examining its own inputs — an en
 
 - **SBUF↔PSUM boundary.** Triggered when the op's input lives in PSUM but the op needs it in SBUF. The op inserts a `tensor_copy(PSUM → SBUF)` before consuming. Introduces `tpb_sbuf` (tunable) and `num_blocks_sbuf` (derived).
 
-**Interleave.** Different ops may have different tile size limits on the same dimension (e.g., `nc_matmul` N=512 vs `nc_transpose` F=128). `interleave_tile_size` = max of all op tile sizes. Ops with smaller tile sizes iterate `tiles_per_interleave_group = interleave_tile_size / op_tile_size` times per unified tile.
+### 4.2 Interleave
+Different ops may have different tile size limits on the same dimension (e.g., `nc_matmul` N=512 vs `nc_transpose` F=128). `d{int}_tile_size` = max of all op tile sizes and is per-dimension across all ops. Ops with smaller tile sizes iterate `tiles_per_unified_tile = d{int}_tile_size / d{int}_op{int}_tile_size` times per unified tile.
 
-### Per-Op Loop Structure
-
-Each op contributes up to 3 loops per dimension: block, tile, and interleave group.
-
-| Loop | Trip count | Controls |
-|---|---|---|
-| `i_block` | `num_blocks` | Block iterations for the active boundary |
-| `i_tile` | `tpb` | Tiles within a block |
-| `i_ig` | `tiles_per_interleave_group` | Per-op sub-tile iteration |
-
-For an HBM↔SBUF op: `i_block` = `i_block_hbm`, `i_tile` = `i_tpb_hbm`.
-For an SBUF↔PSUM op: `i_block` = `i_block_sbuf`, `i_tile` = `i_tpb_sbuf`.
-
-### Dimension Decomposition
+### 4.2 Dimension Decomposition
 When the HBM-SBUF boundary is active on the tensor for an operator:
-$$\texttt{dim\_size} = \texttt{num\_blocks\_hbm} \times \texttt{tpb\_hbm} \times \texttt{interleave\_tile\_size}$$
+$$\texttt{dim\_size} = \texttt{num\_blocks\_hbm} \times \texttt{tpb\_hbm} \times \texttt{d\{int\}\_tile\_size}$$
 
 When the SBUF-PSUM boundary is active on the tensor for an operator:
-$$\texttt{dim\_size} = \texttt{num\_blocks\_sbuf} \times \texttt{tpb\_sbuf} \times \texttt{interleave\_tile\_size}$$
+$$\texttt{dim\_size} = \texttt{num\_blocks\_sbuf} \times \texttt{tpb\_sbuf} \times \texttt{d\{int\}\_tile\_size}$$
 
-**Components:**
+In both cases, `d{int}_tile_size` is further broken down into `tiles_per_unified_tile` * `d{int}_op{int}_tile_size`.
 
-- **`interleave_tile_size`** (hardware) — max of all hardware tile size limits across ops on the dimension. One iteration of block/tile loops processes `interleave_tile_size` elements.
-- **`tiles_per_interleave_group`** (hardware, per-op) — `interleave_tile_size / op_tile_size`. The buffer stores at the smallest op tile size; ops with larger tiles consume multiple buffer slots per iteration.
-- **`tpb_hbm`** (tunable) — unified tiles per HBM block. Data is loaded from HBM once per block via `load_tensor_block`, then reused across compute iterations.
-- **`tpb_sbuf`** (tunable, where applicable) — unified tiles per PSUM→SBUF staging batch. When an op finds its input in PSUM, it stages `tpb_sbuf` tiles to SBUF via `tensor_copy` before consuming them.
-- **`num_blocks_hbm`** (derived) — `dim_size / (tpb_hbm × interleave_tile_size)`.
-- **`num_blocks_sbuf`** (derived) — `dim_size / (tpb_sbuf × interleave_tile_size)`.
+### 4.4 Per-Op Loop Nest
+For each dimension of an op's tensor operands, either P or F:
+- `d{int}_tile_size` (hardware, per-dimension) — max of all hardware tile size limits across ops on the dimension. One iteration of block/tile loops processes `d{int}_tile_size` elements.
+- `d{int}_op{int}_tile_size` (hardware, per-dimension per-op) - hardware tile size for a particular dimension for an op.
+- `tiles_per_unified_tile` (hardware, per-dimension per-op) — `d{int}_tile_size / d{int}_op{int}_tile_size`. The buffer stores at the smallest op tile size; ops with larger tiles consume multiple buffer slots per iteration.
+- `tpb_hbm` (tunable) — unified tiles per HBM block. Data is loaded from HBM once per block via `load_tensor_block`, then reused across compute iterations.
+- `tpb_sbuf` (tunable, where applicable) — unified tiles per PSUM→SBUF staging batch. When an op finds its input in PSUM, it stages `tpb_sbuf` tiles to SBUF via `tensor_copy` before consuming them.
+- `num_blocks_hbm` (derived) — `dim_size / (tpb_hbm × d{int}_tile_size)`.
+- `num_blocks_sbuf` (derived) — `dim_size / (tpb_sbuf × d{int}_tile_size)`.
 
-### Example: N dimension with transpose + matmul
+Each op contributes up to 3 loops per dimension: block, tile, and interleave tile.
+
+| Loop Variable | Trip count | Controls |
+|---|---|---|
+| `i_block_hbm/sbuf` | `num_blocks_hbm/sbuf` | Block iterations for the active memory boundary |
+| `i_tile_hbm/sbuf` | `tpb_hbm/sbuff` | Tiles within a block |
+| `i_ig` | `tiles_per_unified_tile` | Per-op sub-tile iteration |
+
+### Example
+
+```python
+Q_t = GymTranspose()(Q)
+K_t = GymTranspose()(K)
+S = GymMatmul()(Q_t, K_t)
+```
+
+## 5. Initial KernelIR
+
+`KernelIR` is the intermediate representation that carries all state needed to render and transform a kernel. `build_ir(func, input_specs)` creates the base IR from a math function — it runs the dimension analysis (§3), computes tile sizes and interleave factors, then wraps everything in a `KernelIR` with each op in its own singleton fusion group (no transforms applied).
+
+```python
+@dataclass
+class KernelIR:
+    ops: list[tuple[NKIOp, dict[str, str], str]]
+    per_op_maps: list[dict[str, str]]
+    ctx: RenderContext
+    return_name: str
+    func_name: str
+    param_names: list[str]
+    input_specs: dict[str, tuple[tuple[int, ...], str]]
+    fusion_groups: list[list[int]]
+    buffer_degrees: dict[str, int]
+```
+
+`build_ir` performs three steps: (1) parse the math function to discover ops and their operand maps via AST inspection, (2) run dimension analysis — assign dim IDs, unify shared dimensions, create output tensors (§3), and (3) compute per-dimension tile sizes and interleave factors (§4.1–4.2). The result is a `KernelIR` ready for rendering (§4.3) or transforms (§5).
+
+### 5.1 Determine Dimension Tile Size
+
+Each ISA instruction imposes per-tensor limits on tile dimensions:
+
+| Op | Dimensions | Hardware Tile Size Limit |
+|---|---|---|
+| nc_matmul | K (accumulation), M (partition), N (free) | K ≤ 128, M ≤ 128, N ≤ 512 |
+| nc_transpose | P (partition), F (free) | P ≤ 128, F ≤ 128 |
+
+These are the only ops implemented so far. Other ops (tensor_scalar, affine_select, tensor_reduce, activation_reduce, activation) follow the same partition ≤ 128 pattern with large SBUF-based free limits — they will be added as needed.
+
+We assume `dim_size` is always a multiple of the smallest hardware limit across ops on that dimension. For each concrete dimension, collect all hardware limits from the table above, then compute:
+- `max_tile_size = min(max(hw_limits), dim_size)`.
+- `min_tile_size = min(hw_limits, dim_size)`.
+
+Inter-op buffers store the dimension as `(max_tile_size / min_tile_size, min_tile_size)` — data is laid out at the smallest granularity so that every op can read at its own tile size.
+
+### 5.2 Interleaving Groups
+
+Different ops may have different tile size limits on the same dimension. For example, `nc_matmul` can process N up to 512 elements, while `nc_transpose` is fixed at 128. The buffer stores data at `min_tile_size` granularity — the smallest op limit on that dimension. Ops that work at a larger tile size consume multiple buffer slots per iteration, grouped together as one **interleave group**. This lets all ops share a single buffer layout despite different tile size requirements.
+
+Each op computes a per-op tile size for each dimension it touches: `op_tile_size = min(max_tile_size, hw_limit)`. From this, two quantities determine how the op reads from the interleaved buffer:
+- `num_interleave_groups = max_tile_size / op_tile_size` — sub-loop iterations per unified tile (the `i_interleave_group_d{id}` loop).
+- `tiles_per_interleave_group` = `op_tile_size / min_tile_size` — buffer slots consumed per interleave group iteration.
+
+Per-op reshape:
+```python
+for i_interleave_group_d{id} in range(max_tile_size/op_tile_size):
+    (op_tile_size/min_tile_size, min_tile_size).reshape((1, op_tile_size))
+```
+
+### 5.3 Rendering NKI Source from KernelIR
+
+`render_ir(ir)` converts a `KernelIR` to a complete NKI kernel source string. For the base IR, each op sits in its own singleton fusion group (`[[0], [1], ...]`), so each gets its own self-contained code block: buffer allocations, loop nest, DMA loads, ISA call, and writeback. The renderer iterates over fusion groups in order and concatenates their output.
+
+When transforms modify the `KernelIR` (changing fusion groups, loop order, etc.), `render_ir` produces the transformed kernel — fused groups emit shared loop nests, reordered dimensions change loop nesting, and adjusted `tpb_hbm` changes block/tile loop bounds. The same `render_ir` handles both base and transformed IRs.
+
+### 5.4 Example: Double Matmul
+
+**Naming conventions:** loop variables `i_block_d{id}`, `i_tile_d{id}`, `i_interleave_group_d{id}`; buffers `sbuf_{name}` (SBUF), `psum_{name}` (PSUM).
+
+Double matmul `(Q @ K.T) @ V` with `Q: (2048, 128)`, `K: (2048, 128)`, `V: (2048, 128)`:
+
+```python
+Q_t = GymTranspose()(data=Q)
+K_t = GymTranspose()(data=K)
+S = GymMatmul()(stationary=Q_t, moving=K_t)
+S_t = GymTranspose()(data=S)
+output = GymMatmul()(stationary=S_t, moving=V)
+```
+
+**Dimension analysis** (§3):
+
+1. **`nc_transpose(Q)`** — P=d0, F=d1. **Q → (d0, d1)**. **Q_t → (d1, d0)**.
+2. **`nc_transpose(K)`** — P=d2, F=d3. **K → (d2, d3)**. **K_t → (d3, d2)**.
+3. **`nc_matmul(Q_t, K_t)`** — K=d1, M=d0, K=d3 → **unify d3→d1**. N=d2. **S → (d0, d2)**.
+4. **`nc_transpose(S)`** — P=d0, F=d2. **S_t → (d2, d0)**.
+5. **`nc_matmul(S_t, V)`** — K=d2, M=d0. V has no dim_ids; K=d2 in map, allocate N=d4. **V → (d2, d4)**. **output → (d0, d4)**.
+
+Dimensions: d0=seq_q (2048), d1=d_k (128), d2=seq_k (2048), d4=d_v (128).
+
+**Tile sizes** (§4.1). d2 is touched by matmul as N (limit 512) and by transpose as F (limit 128), producing different hardware limits:
+
+| Dim | dim_size | max_tile_size | min_tile_size |
+|---|---|---|---|
+| d0 (seq_q) | 2048 | 128 | 128 |
+| d1 (d_k) | 128 | 128 | 128 |
+| d2 (seq_k) | 2048 | 512 | 128 |
+| d4 (d_v) | 128 | 128 | 128 |
+
+**Interleave on d2** (§4.2). Buffer stores `(4, 128)`. Per-op breakdown:
+
+| Op on d2 | hw_limit | op_tile_size | num_interleave_groups | tiles_per_interleave_group |
+|---|---|---|---|---|
+| nc_matmul | 512 | 512 | 1 | 4 |
+| nc_transpose | 128 | 128 | 4 | 1 |
+
+Matmul reshapes `(4, 128)` → `(1, 512)` and processes in 1 group. Transpose reads one `(1, 128)` slot per group across 4 groups.
+
+**Transpose codegen.** Fixed 128 × 128 tile. Reads from SBUF, writes to a degree-1 PSUM temp `(128, 1, 1, 128)`, then `nisa.tensor_copy` to the output SBUF. The output buffer swaps P and F axes.
+
+**Matmul codegen.** Accumulates into PSUM in fp32 (memset to 0 before the K loop). After all K iterations, `nisa.tensor_copy` moves the result to SBUF.
+
+**PSUM spill scheduling.** Both `nc_matmul` and `nc_transpose` produce results in PSUM and require `nisa.tensor_copy` to move them to SBUF (§2). For `nc_transpose`, each tile produces an independent PSUM result that is spilled immediately. For `nc_matmul` accumulating across a reduction dimension, multiple partial products pile up in the same PSUM tile — `tpb_psum` (§2) controls how many iterations accumulate before the spill. In the reference attention kernel, `tpb_psum = 4` on d2 gives a "large tile" of 4 × 512 = 2048 positions (16 V-tile matmuls) per PSUM batch, with 4 batches per section.
+
+## 6. Programmatic Transforms
+
+Programmatic transforms are mechanical rearrangements of the loop nest that do not change the math — they only change how and when ops execute. All transforms must respect the topological computation order: every op's inputs must be computed before the op runs. The math function (§1) defines one valid topological order, and the initial KernelIR (§4) follows it exactly. Transforms may reorder loops and fuse ops, but the resulting execution order must remain a valid topological sort of the computation graph — no op can consume a tensor that hasn't been produced yet.
+
+Transforms operate on the `KernelIR` (§4). Each transform produces a new `KernelIR` with modified transform state (e.g., different `fusion_groups`) while sharing immutable state (`ops`, `per_op_maps`, `ctx`).
+
+Each transform subclass implements `candidates(ir) → list[KernelIR]`, returning every possible single-step application of that transform. Each candidate is a clone with the relevant state modified.
+
+```python
+class Transform(ABC):
+    NAME: ClassVar[str] = ""
+
+    @abstractmethod
+    def candidates(self, ir: KernelIR) -> list[KernelIR]:
+        ...
+```
+
+Transforms compose: applying loop fusion to the base IR produces a set of variants; applying loop reordering to any of those produces further variants. The search (§7) explores this space by randomly walking the graph of transform applications.
+
+Four transforms generate the search space.
+
+### 6.1 Loop Fusion
+
+See [loop_fusion.md](nkigym/src/nkigym/transforms/loop_fusion.md).
+
+### 6.2 Load Placement
+
+See [load_placement.md](nkigym/src/nkigym/transforms/load_placement.md).
+
+### 6.3 Loop Reordering
+
+See [loop_reordering.md](nkigym/src/nkigym/transforms/loop_reordering.md).
+
+### 6.4 Tiles Per Block
+
+See [tiles_per_block.md](nkigym/src/nkigym/transforms/tiles_per_block.md).
+
+### 6.5 Multi-Buffer
+
+See [multi_buffer.md](nkigym/src/nkigym/transforms/multi_buffer.md).
+
+## 7. Math Transforms
+
+See [online_fusion.md](nkigym/src/nkigym/transforms/online_fusion.md).
+
+## 8. Example: N dimension with transpose + matmul
 ```python
 def matmul(lhs_T, rhs_T):
     # lhs_T[d0, d1]
@@ -324,189 +503,11 @@ for i_block_sbuf in range(2):                    # 2 staging batches
             nc_matmul(...)                       # consumes rhs from SBUF
 ```
 
-## 3. Dimension Analysis
-
-A forward pass over all ops assigns concrete dimension IDs and computes the hardware-determined components (`tile_size` and `interleave`, §2) for each dimension. No tensor starts with dimension IDs — they are discovered automatically from op structure.
-
-For each op, build a local axis map from abstract axes (K, M, N or P, F) to concrete dimension IDs (d0, d1, ...). Operands that already carry dim_ids (from prior ops) provide the mapping; operands without dim_ids get fresh IDs allocated. When two operands of the same op share an abstract axis (e.g., matmul's K axis appears in both stationary and moving), their concrete dims are **unified** — the later operand's dim is renamed to match the earlier one, propagating backward through all tensors that share the old ID. This is how shared dimensions are discovered without any manual labeling.
-
-Example: double matmul `(Q @ K.T) @ V`:
-
-```python
-Q_t = NKITranspose()(data=Q)
-K_t = NKITranspose()(data=K)
-S = NKIMatmul()(stationary=Q_t, moving=K_t)
-S_t = NKITranspose()(data=S)
-output = NKIMatmul()(stationary=S_t, moving=V)
-```
-
-Walk through the forward pass. Inputs Q, K, V have no dim_ids — the pass discovers them:
-
-1. **`nc_transpose(Q)`** — Q has no dim_ids. Allocate P=d0, F=d1. Assign **Q → (d0, d1)**. `OUTPUT_AXES = ("F", "P")` → **Q_t gets (d1, d0)**.
-
-2. **`nc_transpose(K)`** — K has no dim_ids. Allocate P=d2, F=d3. Assign **K → (d2, d3)**. Output → **K_t gets (d3, d2)**.
-
-3. **`nc_matmul(Q_t, K_t)`** — Q_t has (d1, d0) → K=d1, M=d0. K_t has (d3, d2) → K=d3, N=d2. Abstract axis K maps to both d1 and d3 — **unify d3→d1**. This renames K's dim_ids from (d2, d3) to (d2, d1), and K_t from (d3, d2) to (d1, d2). Now K=d1 is consistent across both operands. `OUTPUT_AXES = ("M", "N")` → **S gets (d0, d2)**.
-
-4. **`nc_transpose(S)`** — S has (d0, d2) → P=d0, F=d2. Output → **S_t gets (d2, d0)**.
-
-5. **`nc_matmul(S_t, V)`** — S_t has (d2, d0) → K=d2, M=d0. V has no dim_ids. K=d2 already in local map, allocate N=d4. Assign **V → (d2, d4)**. Output → **output gets (d0, d4)**.
-
-## 4. Initial KernelIR
-
-`KernelIR` is the intermediate representation that carries all state needed to render and transform a kernel. `build_ir(func, input_specs)` creates the base IR from a math function — it runs the dimension analysis (§3), computes tile sizes and interleave factors, then wraps everything in a `KernelIR` with each op in its own singleton fusion group (no transforms applied).
-
-```python
-@dataclass
-class KernelIR:
-    ops: list[tuple[NKIOp, dict[str, str], str]]
-    per_op_maps: list[dict[str, str]]
-    ctx: RenderContext
-    return_name: str
-    func_name: str
-    param_names: list[str]
-    input_specs: dict[str, tuple[tuple[int, ...], str]]
-    fusion_groups: list[list[int]]
-    buffer_degrees: dict[str, int]
-```
-
-`build_ir` performs three steps: (1) parse the math function to discover ops and their operand maps via AST inspection, (2) run dimension analysis — assign dim IDs, unify shared dimensions, create output tensors (§3), and (3) compute per-dimension tile sizes and interleave factors (§4.1–4.2). The result is a `KernelIR` ready for rendering (§4.3) or transforms (§5).
-
-### 4.1 Determine Dimension Tile Size
-
-Each ISA instruction imposes per-tensor limits on tile dimensions:
-
-| Op | Dimensions | Hardware Tile Size Limit |
-|---|---|---|
-| nc_matmul | K (accumulation), M (partition), N (free) | K ≤ 128, M ≤ 128, N ≤ 512 |
-| nc_transpose | P (partition), F (free) | P ≤ 128, F ≤ 128 |
-
-These are the only ops implemented so far. Other ops (tensor_scalar, affine_select, tensor_reduce, activation_reduce, activation) follow the same partition ≤ 128 pattern with large SBUF-based free limits — they will be added as needed.
-
-We assume `dim_size` is always a multiple of the smallest hardware limit across ops on that dimension. For each concrete dimension, collect all hardware limits from the table above, then compute:
-- `max_tile_size = min(max(hw_limits), dim_size)`.
-- `min_tile_size = min(hw_limits, dim_size)`.
-
-Inter-op buffers store the dimension as `(max_tile_size / min_tile_size, min_tile_size)` — data is laid out at the smallest granularity so that every op can read at its own tile size.
-
-### 4.2 Interleaving Groups
-
-Different ops may have different tile size limits on the same dimension. For example, `nc_matmul` can process N up to 512 elements, while `nc_transpose` is fixed at 128. The buffer stores data at `min_tile_size` granularity — the smallest op limit on that dimension. Ops that work at a larger tile size consume multiple buffer slots per iteration, grouped together as one **interleave group**. This lets all ops share a single buffer layout despite different tile size requirements.
-
-Each op computes a per-op tile size for each dimension it touches: `op_tile_size = min(max_tile_size, hw_limit)`. From this, two quantities determine how the op reads from the interleaved buffer:
-- `num_interleave_groups = max_tile_size / op_tile_size` — sub-loop iterations per unified tile (the `i_interleave_group_d{id}` loop).
-- `tiles_per_interleave_group` = `op_tile_size / min_tile_size` — buffer slots consumed per interleave group iteration.
-
-Per-op reshape:
-```python
-for i_interleave_group_d{id} in range(max_tile_size/op_tile_size):
-    (op_tile_size/min_tile_size, min_tile_size).reshape((1, op_tile_size))
-```
-
-### 4.3 Rendering NKI Source from KernelIR
-
-`render_ir(ir)` converts a `KernelIR` to a complete NKI kernel source string. For the base IR, each op sits in its own singleton fusion group (`[[0], [1], ...]`), so each gets its own self-contained code block: buffer allocations, loop nest, DMA loads, ISA call, and writeback. The renderer iterates over fusion groups in order and concatenates their output.
-
-When transforms modify the `KernelIR` (changing fusion groups, loop order, etc.), `render_ir` produces the transformed kernel — fused groups emit shared loop nests, reordered dimensions change loop nesting, and adjusted `tpb_hbm` changes block/tile loop bounds. The same `render_ir` handles both base and transformed IRs.
-
-### 4.4 Example: Double Matmul
-
-**Naming conventions:** loop variables `i_block_d{id}`, `i_tile_d{id}`, `i_interleave_group_d{id}`; buffers `sbuf_{name}` (SBUF), `psum_{name}` (PSUM).
-
-Double matmul `(Q @ K.T) @ V` with `Q: (2048, 128)`, `K: (2048, 128)`, `V: (2048, 128)`:
-
-```python
-Q_t = NKITranspose()(data=Q)
-K_t = NKITranspose()(data=K)
-S = NKIMatmul()(stationary=Q_t, moving=K_t)
-S_t = NKITranspose()(data=S)
-output = NKIMatmul()(stationary=S_t, moving=V)
-```
-
-**Dimension analysis** (§3):
-
-1. **`nc_transpose(Q)`** — P=d0, F=d1. **Q → (d0, d1)**. **Q_t → (d1, d0)**.
-2. **`nc_transpose(K)`** — P=d2, F=d3. **K → (d2, d3)**. **K_t → (d3, d2)**.
-3. **`nc_matmul(Q_t, K_t)`** — K=d1, M=d0, K=d3 → **unify d3→d1**. N=d2. **S → (d0, d2)**.
-4. **`nc_transpose(S)`** — P=d0, F=d2. **S_t → (d2, d0)**.
-5. **`nc_matmul(S_t, V)`** — K=d2, M=d0. V has no dim_ids; K=d2 in map, allocate N=d4. **V → (d2, d4)**. **output → (d0, d4)**.
-
-Dimensions: d0=seq_q (2048), d1=d_k (128), d2=seq_k (2048), d4=d_v (128).
-
-**Tile sizes** (§4.1). d2 is touched by matmul as N (limit 512) and by transpose as F (limit 128), producing different hardware limits:
-
-| Dim | dim_size | max_tile_size | min_tile_size |
-|---|---|---|---|
-| d0 (seq_q) | 2048 | 128 | 128 |
-| d1 (d_k) | 128 | 128 | 128 |
-| d2 (seq_k) | 2048 | 512 | 128 |
-| d4 (d_v) | 128 | 128 | 128 |
-
-**Interleave on d2** (§4.2). Buffer stores `(4, 128)`. Per-op breakdown:
-
-| Op on d2 | hw_limit | op_tile_size | num_interleave_groups | tiles_per_interleave_group |
-|---|---|---|---|---|
-| nc_matmul | 512 | 512 | 1 | 4 |
-| nc_transpose | 128 | 128 | 4 | 1 |
-
-Matmul reshapes `(4, 128)` → `(1, 512)` and processes in 1 group. Transpose reads one `(1, 128)` slot per group across 4 groups.
-
-**Transpose codegen.** Fixed 128 × 128 tile. Reads from SBUF, writes to a degree-1 PSUM temp `(128, 1, 1, 128)`, then `nisa.tensor_copy` to the output SBUF. The output buffer swaps P and F axes.
-
-**Matmul codegen.** Accumulates into PSUM in fp32 (memset to 0 before the K loop). After all K iterations, `nisa.tensor_copy` moves the result to SBUF.
-
-**PSUM spill scheduling.** Both `nc_matmul` and `nc_transpose` produce results in PSUM and require `nisa.tensor_copy` to move them to SBUF (§2). For `nc_transpose`, each tile produces an independent PSUM result that is spilled immediately. For `nc_matmul` accumulating across a reduction dimension, multiple partial products pile up in the same PSUM tile — `tpb_psum` (§2) controls how many iterations accumulate before the spill. In the reference attention kernel, `tpb_psum = 4` on d2 gives a "large tile" of 4 × 512 = 2048 positions (16 V-tile matmuls) per PSUM batch, with 4 batches per section.
-
-## 5. Programmatic Transforms
-
-Programmatic transforms are mechanical rearrangements of the loop nest that do not change the math — they only change how and when ops execute. All transforms must respect the topological computation order: every op's inputs must be computed before the op runs. The math function (§1) defines one valid topological order, and the initial KernelIR (§4) follows it exactly. Transforms may reorder loops and fuse ops, but the resulting execution order must remain a valid topological sort of the computation graph — no op can consume a tensor that hasn't been produced yet.
-
-Transforms operate on the `KernelIR` (§4). Each transform produces a new `KernelIR` with modified transform state (e.g., different `fusion_groups`) while sharing immutable state (`ops`, `per_op_maps`, `ctx`).
-
-Each transform subclass implements `candidates(ir) → list[KernelIR]`, returning every possible single-step application of that transform. Each candidate is a clone with the relevant state modified.
-
-```python
-class Transform(ABC):
-    NAME: ClassVar[str] = ""
-
-    @abstractmethod
-    def candidates(self, ir: KernelIR) -> list[KernelIR]:
-        ...
-```
-
-Transforms compose: applying loop fusion to the base IR produces a set of variants; applying loop reordering to any of those produces further variants. The search (§7) explores this space by randomly walking the graph of transform applications.
-
-Four transforms generate the search space.
-
-### 5.1 Loop Fusion
-
-See [loop_fusion.md](nkigym/src/nkigym/transforms/loop_fusion.md).
-
-### 5.2 Load Placement
-
-See [load_placement.md](nkigym/src/nkigym/transforms/load_placement.md).
-
-### 5.3 Loop Reordering
-
-See [loop_reordering.md](nkigym/src/nkigym/transforms/loop_reordering.md).
-
-### 5.4 Tiles Per Block
-
-See [tiles_per_block.md](nkigym/src/nkigym/transforms/tiles_per_block.md).
-
-### 5.5 Multi-Buffer
-
-See [multi_buffer.md](nkigym/src/nkigym/transforms/multi_buffer.md).
-
-## 6. Math Transforms
-
-See [online_fusion.md](nkigym/src/nkigym/transforms/online_fusion.md).
-
-## 7. Search Interface
+## 9. Search Interface
 
 The search finds high-performing kernel variants by randomly exploring the transform graph and benchmarking each variant on hardware.
 
-### 7.1 Transform Graph
+### 9.1 Transform Graph
 
 The transform graph is a directed graph where **nodes** are kernel variants (`KernelIR` + rendered source) and **edges** are transform applications. Different transform paths can converge on the same node (same rendered source), so the graph is not necessarily a tree or DAG. It starts with one node — the base kernel from `build_ir()` — and grows by randomly picking a node, picking an applicable transform, and applying it to produce a new child node.
 
@@ -527,7 +528,7 @@ class TransformGraph:
     def expand(self, num_variants, render_fn, rng): ...
 ```
 
-### 7.2 remote_search
+### 9.2 remote_search
 
 `remote_search` wraps `remote_profile` with transform graph expansion:
 
@@ -557,7 +558,7 @@ Internally:
 5. Submit every variant as a `KernelJob` to `remote_profile`.
 6. Return the `ProfileOutput` with timing and correctness results for all variants.
 
-## 8. Future Work
+## 10. Future Work
 
 - **Boundary handling for non-divisible input shapes.** The current guide assumes all input dimensions are exact multiples of their tile sizes. Real workloads often have ragged last tiles (e.g., a sequence length of 1000 with tile size 128 leaves a remainder of 104). Supporting this requires `nl.ds(offset, size)` dynamic slicing to emit variable-length last tiles, with masking or predication where needed. The reference attention kernel ([`attention_cte.py`](/home/ubuntu/KaenaNeuronKernelLibrary/src/nkilib_src/nkilib/core/attention/attention_cte.py)) already uses `nl.ds` for this purpose.
 
