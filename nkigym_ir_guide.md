@@ -217,36 +217,108 @@ Every on-chip tensor uses a uniform **4D layout**: `(tile_size_P, num_tiles_P, n
 
 **Hardware constraint.** Trainium DMA cannot operate on tensors with more than 5 meaningful (non-singleton) dimensions, so 4D is the maximum usable rank for a two-axis (P, F) tensor.
 
-**Memory hierarchy.** Trainium has three memory levels: HBM (off-chip) → SBUF (on-chip scratchpad) → PSUM (accumulator registers). Each boundary between adjacent levels introduces a tiling parameter — a "tiles per block" that controls how many tiles are processed at that level before results move on. Two ops produce results in PSUM: `nc_matmul` (accumulates partial products across a reduction dimension) and `nc_transpose` (writes transposed tile to a PSUM bank). All other ops work entirely in SBUF.
+**Memory hierarchy.** Trainium has three memory levels: HBM (off-chip) → SBUF (on-chip scratchpad) → PSUM (accumulator registers). Each boundary between adjacent levels introduces a block/tile tiling parameter that controls arithmetic intensity — how many tiles are processed before results move to the next level. Two ops produce results in PSUM: `nc_matmul` (accumulates partial products) and `nc_transpose` (writes transposed tile to a PSUM bank). All other ops work entirely in SBUF.
 
-Each dimension has four components whose product is the dimension size:
+**HBM↔SBUF boundary.** Active when an op reads from or writes to HBM. Introduces `tpb_hbm` (tunable) and `num_blocks_hbm` (derived). DMA loads `tpb_hbm` unified tiles per block; the `load_tensor_block` / `save_tensor_block` gadgets from `nkigym.gadgets` handle the tile-by-tile DMA internally.
 
-$$\texttt{dim\_size} = \texttt{num\_blocks} \times \texttt{tpb\_hbm} \times \texttt{interleave} \times \texttt{tile\_size}$$
+**SBUF↔PSUM boundary.** Active when an op produces results in PSUM that a subsequent consumer needs in SBUF. Introduces `tpb_sbuf` (tunable) and `num_blocks_sbuf` (derived). Controls how many tiles pile up in PSUM before `tensor_copy` spills to SBUF.
 
-The HBM→SBUF boundary gives the first tiling parameter: `tpb_hbm` (tiles per block). On dimensions where PSUM-producing ops accumulate or batch results, `tpb_hbm` further factors into two loops via a second parameter `tpb_psum` (tiles per PSUM batch):
+The two boundaries nest — PSUM batching happens within each HBM block:
 
-$$\texttt{tpb\_hbm} = \underbrace{(\texttt{tpb\_hbm} / \texttt{tpb\_psum})}_{\text{PSUM batches per block}} \times \texttt{tpb\_psum}$$
+$$\texttt{dim\_size} = \texttt{num\_blocks\_hbm} \times \texttt{tpb\_hbm} \times \texttt{interleave\_tile\_size}$$
 
-This gives up to four nested loops per dimension:
+$$\texttt{num\_blocks\_sbuf} \times \texttt{tpb\_sbuf} = \texttt{tpb\_hbm} \quad \text{(by construction)}$$
 
-| Loop | Trip count | Memory boundary | Controls |
+**Interleave.** Different ops may have different tile size limits on the same dimension (e.g., `nc_matmul` N=512 vs `nc_transpose` F=128). `interleave_tile_size` = max of all op tile sizes on the dimension. Ops with smaller tile sizes iterate `tiles_per_interleave_group = interleave_tile_size / op_tile_size` times per unified tile.
+
+This gives up to four nested loops per dimension. When only the HBM↔SBUF boundary is active (3 loops):
+
+| Loop | Trip count | Controls |
+|---|---|---|
+| `i_block_hbm` | `num_blocks_hbm` | DMA block iterations |
+| `i_tpb_hbm` | `tpb_hbm` | Unified tiles within an HBM block |
+| `i_ig` | `tiles_per_interleave_group` | Per-op sub-tile iteration |
+
+When both boundaries are active, `i_tpb_hbm` splits into two PSUM loops (`num_blocks_sbuf × tpb_sbuf = tpb_hbm`), giving 4 loops:
+
+| Loop | Trip count | Controls |
+|---|---|---|
+| `i_block_hbm` | `num_blocks_hbm` | DMA block iterations |
+| `i_block_sbuf` | `num_blocks_sbuf` | PSUM spill batches within an HBM block |
+| `i_tpb_sbuf` | `tpb_sbuf` | Unified tiles processed before PSUM spill |
+| `i_ig` | `tiles_per_interleave_group` | Per-op sub-tile iteration |
+
+**Component classification:**
+
+- **`interleave_tile_size`** (hardware) — max of all hardware tile size limits across ops on the dimension. This is the unified tile size — one iteration of the block/tile loops processes `interleave_tile_size` elements.
+- **`tiles_per_interleave_group`** (hardware, per-op) — `interleave_tile_size / op_tile_size`. The buffer stores at the smallest op tile size; ops with larger tiles consume multiple buffer slots per iteration.
+- **`tpb_hbm`** (tunable) — unified tiles per HBM block. Data is loaded from HBM once per block via `load_tensor_block`, then reused across compute iterations. Controls arithmetic intensity and SBUF capacity.
+- **`tpb_sbuf`** (tunable, where applicable) — unified tiles per PSUM spill. Controls how many tiles pile up in PSUM before `tensor_copy` spills to SBUF. Must divide `tpb_hbm`. Defaults to `tpb_hbm` (one spill per block).
+- **`num_blocks_hbm`** (derived) — `dim_size / (tpb_hbm × interleave_tile_size)`.
+- **`num_blocks_sbuf`** (derived) — `tpb_hbm / tpb_sbuf`.
+
+### Example: N dimension with transpose + matmul
+```python
+def matmul(lhs_T, rhs_T):
+    # lhs_T[d0, d1]
+    # rhs_T[d2, d0]
+    rhs = nkigym.nc_transpose(rhs_T) # [d0, d2]
+    result = nkigym.nc_matmul(lhs_T, rhs) # [d1, d2]
+    return result
+```
+Consider how to produce the loops for `d2` dimension for the `nc_transpose` operator.
+**Constraints**
+- `num_blocks_sbuf` * `tpb_sbuf` = `tpb_hbm` by construction.
+- `nc_transpose` on N has `nc_transpose_tile_size` = 128.
+- `nc_matmul` on N has `nc_matmul_tile_size` = 512.
+- Assume `d2` = 8192.
+
+**Derived**
+- `interleave_tile_size` = max(`nc_transpose_tile_size`, `nc_matmul_tile_size`) = 512
+- `tiles_per_interleave_group` = `interleave_tile_size` / `nc_transpose_tile_size` = 4
+
+**Active Memory Boundaries**
+- Because `nc_transpose` reads from HBM tensors, the HBM-SBUF boundary is active --> need to control `tpb_hbm`.
+- Because `nc_transpose` produces `rhs` in PSUM, and the subsequent consumer `nc_matmul` needs `rhs` in SBUF, the SBUF-PSUM boundary is also active --> need to control `tpb_sbuf`.
+
+`num_blocks_hbm` * `tpb_hbm` * `interleave_tile_size` = `d2` = 8192.
+Therefore, `num_blocks_hbm` * `tpb_hbm` = `d2` / `interleave_tile_size` = 16.
+
+**Valid Tuning Options**
+
+`tpb_hbm` must divide 16. `tpb_sbuf` must divide `tpb_hbm`.
+
+| `tpb_hbm` | `tpb_sbuf` | `num_blocks_hbm` | `num_blocks_sbuf` |
 |---|---|---|---|
-| `i_block` | `num_blocks` | — | DMA block iterations |
-| `i_psum_batch` | `tpb_hbm / tpb_psum` | HBM → SBUF | PSUM spill batches within a block |
-| `i_tile` | `tpb_psum` | SBUF → PSUM | Tiles processed before PSUM spill |
-| `i_ig` | `interleave` | — | Sub-tile iterations for ops with smaller tile sizes |
+| 1 | 1 | 16 | 1 |
+| 2 | 1 | 8 | 2 |
+| 2 | 2 | 8 | 1 |
+| 4 | 1 | 4 | 4 |
+| 4 | 2 | 4 | 2 |
+| 4 | 4 | 4 | 1 |
+| 8 | 1 | 2 | 8 |
+| 8 | 2 | 2 | 4 |
+| 8 | 4 | 2 | 2 |
+| 8 | 8 | 2 | 1 |
+| 16 | 1 | 1 | 16 |
+| 16 | 2 | 1 | 8 |
+| 16 | 4 | 1 | 4 |
+| 16 | 8 | 1 | 2 |
+| 16 | 16 | 1 | 1 |
 
-When a dimension has no PSUM-producing ops, or `tpb_psum = tpb_hbm`, the `i_psum_batch` loop has trip count 1 and the nest collapses to three loops.
+Example: `tpb_hbm = 4, tpb_sbuf = 2` → `num_blocks_hbm = 4, num_blocks_sbuf = 2`. The loop nest for `nc_transpose` on `d2`:
 
-Component classification:
+```
+for i_block_hbm in range(4):                    # 4 HBM blocks
+    load_tensor_block(...)                       # DMA: 4 unified tiles (16 buffer slots of 128)
+    for i_block_sbuf in range(2):                # 2 PSUM batches per block
+        for i_tpb_sbuf in range(2):              # 2 unified tiles per batch
+            for i_ig in range(4):                # 4 × 128 = 512 per unified tile
+                nc_transpose(one 128-wide tile)
+        tensor_copy(PSUM → SBUF)                 # spill after each batch
+```
 
-- **`tile_size`** (hardware) — max of all hardware tile size limits across ops that touch the dimension.
-- **`interleave`** (hardware) — `tile_size / min_tile_size`. Different ops may have different tile sizes on the same dimension (e.g., matmul N=512 vs transpose F=128). The buffer stores data at the smallest common granularity so each op consumes the right number of slots.
-- **`tpb_hbm`** (tunable) — tiles per HBM→SBUF block. Data is loaded from HBM once per block, then reused across `tpb_hbm` compute iterations. Controls arithmetic intensity and SBUF capacity usage.
-- **`tpb_psum`** (tunable, where applicable) — tiles per PSUM→SBUF spill. Controls how many `nc_matmul` accumulations (or `nc_transpose` results) pile up in PSUM before a `tensor_copy` spills to SBUF. Balances spill overhead against PSUM liveness in software-pipelined schedules. Defaults to `tpb_hbm` (spill once per block) when not tuned.
-- **`num_blocks`** (derived) — `dim_size / (tpb_hbm * interleave * tile_size)`.
-
-The buffer's `num_tiles` axis is `num_blocks * tpb_hbm * interleave`. A tensor's placement in the loop nest determines how many of these loop levels fall *outside* vs *inside* the buffer allocation — shifting tensors up and down the loop nest changes the buffer's `num_tiles` without changing the loop structure itself. A tensor placed at the outermost level is full-range (`num_tiles = dim_size / tile_size`); a tensor placed inside all loops is degree-1 (`num_tiles = 1`).
+**Buffer sizing.** The buffer's `num_tiles` on a dimension = `tpb_hbm × tiles_per_interleave_group` per block (here 4 × 4 = 16 slots of 128 elements). A tensor's placement in the loop nest determines how many loop levels fall outside vs inside the buffer — shifting up grows the buffer, shifting down shrinks it. Full-range placement: `num_tiles = dim_size / min_op_tile_size`; inside all loops: `num_tiles = 1`.
 
 ## 3. Dimension Analysis
 

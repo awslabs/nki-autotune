@@ -51,7 +51,7 @@ def matmul_nkigym(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 
 if __name__ == "__main__":
 
-    K, M, N = 2048, 2048, 2048
+    K, M, N = 8192, 8192, 8192
 
     lhs_T = np.random.randn(K, M)
     rhs = np.random.randn(K, N)

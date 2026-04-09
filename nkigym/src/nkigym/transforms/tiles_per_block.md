@@ -1,5 +1,7 @@
 # Tiles Per Block
 
+*Single-loop-nest transform — operates on one fusion group's loop nest. Fusing loop nests is handled by online fusion and loop fusion.*
+
 `tiles_per_block` groups consecutive unified tiles into blocks, changing the dimension's iteration granularity and staging buffer sizes.
 
 $$\texttt{unified\_tiles} = \frac{\texttt{dim\_size}}{\texttt{max\_tile\_size}} = \texttt{num\_blocks} \times \texttt{tiles\_per\_block}$$
@@ -27,7 +29,6 @@ Matmul from loop_reordering.md: `lhs_T(K=d0, M=d1) × rhs(K=d0, N=d2) → result
 sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), buffer=nl.sbuf)
 sbuf_rhs = nl.ndarray((128, 1, 1, 512), buffer=nl.sbuf)
 psum_output = nl.ndarray((128, 16, 4, 512), dtype=nl.float32, buffer=nl.psum)
-sbuf_output = nl.ndarray((128, 16, 4, 512), dtype=output.dtype, buffer=nl.sbuf)
 nisa.memset(dst=psum_output[0:128, 0:16, 0:4, 0:512], value=0.0)
 for i_d0 in range(16):
     for i_d1 in range(16):
@@ -36,8 +37,7 @@ for i_d0 in range(16):
             load_tensor_block(dst=sbuf_rhs, src=rhs, par_ofs=i_d0*128, free_ofs=i_d2*512)
             nisa.nc_matmul(dst=psum_output[0:128, i_d1, i_d2, 0:512],
                 stationary=sbuf_lhs_T[0:128, 0, 0, 0:128], moving=sbuf_rhs[0:128, 0, 0, 0:512])
-nisa.tensor_copy(psum_output -> sbuf_output)
-save_tensor_block(dst=output, src=sbuf_output, par_ofs=0, free_ofs=0)
+save_tensor_block(dst=output, src=psum_output, par_ofs=0, free_ofs=0)
 ```
 
 **After** — `tiles_per_block = {"d0": 4}` (4 blocks of 4 tiles):
@@ -46,7 +46,6 @@ save_tensor_block(dst=output, src=sbuf_output, par_ofs=0, free_ofs=0)
 sbuf_lhs_T = nl.ndarray((128, 4, 1, 128), buffer=nl.sbuf)
 sbuf_rhs = nl.ndarray((128, 4, 1, 512), buffer=nl.sbuf)
 psum_output = nl.ndarray((128, 16, 4, 512), dtype=nl.float32, buffer=nl.psum)
-sbuf_output = nl.ndarray((128, 16, 4, 512), dtype=output.dtype, buffer=nl.sbuf)
 nisa.memset(dst=psum_output[0:128, 0:16, 0:4, 0:512], value=0.0)
 for i_d0 in range(4):
     for i_d1 in range(16):
@@ -57,8 +56,7 @@ for i_d0 in range(4):
                 nisa.nc_matmul(dst=psum_output[0:128, i_d1, i_d2, 0:512],
                     stationary=sbuf_lhs_T[0:128, i_k, 0, 0:128],
                     moving=sbuf_rhs[0:128, i_k, 0, 0:512])
-nisa.tensor_copy(psum_output -> sbuf_output)
-save_tensor_block(dst=output, src=sbuf_output, par_ofs=0, free_ofs=0)
+save_tensor_block(dst=output, src=psum_output, par_ofs=0, free_ofs=0)
 ```
 
 Changes:

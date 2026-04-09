@@ -1,5 +1,7 @@
 # Multi-Buffer Transform
 
+*Single-loop-nest transform — operates on one fusion group's loop nest. Fusing loop nests is handled by online fusion and loop fusion.*
+
 Multi-buffering increases a buffer from 1 to D slots so consecutive loop iterations address different memory regions. The hardware overlaps one iteration's consumer with the next iteration's producer — pipelining compute or overlapping DMA with compute.
 
 Three categories of buffers:
@@ -16,7 +18,7 @@ $$\texttt{num\_tiles} = \texttt{tpb\_hbm} \times \texttt{interleave} \times \tex
 
 With degree 1, DMA overwrites the single slot each iteration. With degree D, each iteration loads into a distinct slot — DMA for block $k+1$ overlaps compute on block $k$. Compute indexes with $\texttt{i\_d} \times S + \texttt{i\_tile} \times \texttt{interleave} + \texttt{i\_ig}$ where $S = \texttt{tpb\_hbm} \times \texttt{interleave}$.
 
-Before (buffer_degree=1, tpb_hbm=4, interleave=1, num_blocks=4):
+Before (buffer_degree=1, tpb_hbm=4, interleave=1, num_blocks=4). Only d0 shown; d1 loop encloses this fragment:
 
 ```python
 sbuf_lhs_T = nl.ndarray((128, 4, 1, 128), buffer=nl.sbuf)
@@ -89,7 +91,7 @@ The matmul's contraction dimension (e.g., K in C=A@B) — multiple tiles accumul
 ```python
 psum_output = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
                           buffer=nl.psum, address=(0, 4 * PSUM_BANK_SIZE))
-sbuf_accum = nl.ndarray((128, 1, 1, 128), dtype=Q.dtype, buffer=nl.sbuf)
+sbuf_accum = nl.ndarray((128, 1, 1, 128), dtype=output.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_accum[0:128, 0, 0, 0:128], value=0.0)
 for i_d2 in range(D):
     nisa.memset(dst=psum_output[0:128, nl.ds(i_d2 * PSUM_BANK_SIZE, 128)], value=0.0)
@@ -97,7 +99,7 @@ for i_d2 in range(D):
         for i_ig_d2 in range(interleave):
             nisa.nc_matmul(dst=psum_output[0:128, nl.ds(i_d2 * PSUM_BANK_SIZE, 128)], ...)
     nisa.tensor_tensor(dst=sbuf_accum[0:128, 0, 0, 0:128],
-                       data=sbuf_accum[0:128, 0, 0, 0:128],
+                       data1=sbuf_accum[0:128, 0, 0, 0:128],
                        data2=psum_output[0:128, nl.ds(i_d2 * PSUM_BANK_SIZE, 128)],
                        op=nl.add)
 ```
@@ -106,7 +108,7 @@ for i_d2 in range(D):
 
 **Constraints:**
 - Tile level: constrains tiles_per_block = D. Valid for both free and contraction dims.
-- Block level: D = num_blocks. Requires tiles_per_block > 1 (from a prior transform) and num_blocks ≤ MAX_DEGREE.
+- Block level: D = num_blocks. Requires tiles_per_block > 1 (from a prior transform) and num_blocks ≤ MAX_DEGREE (= 8, the PSUM bank count).
 - Tile and block levels are mutually exclusive for the same PSUM on the same dimension.
 - Total D across all concurrent accumulators in a fusion group must be ≤ 8.
 
