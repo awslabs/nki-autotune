@@ -15,7 +15,7 @@ geometry: margin=1in
 - `v: float16[4096, 128]` — `(seq_k, d_v)`
 - output: `float16[4096, 128]` — `(seq_q, d_v)`
 
-The math function defines what to compute — no loads/stores, no tiling, no memory hierarchy. Each `nkigym.*` call maps 1:1 to a real `nisa.*` ISA instruction, but the math function only specifies the logical data flow.
+The math function defines what to compute — no loads/stores, no tiling, no memory hierarchy. Each `GymXXX` call maps 1:1 to a real `nisa.*` ISA instruction, but the math function only specifies the logical data flow.
 
 ```python
 def attention(Q, K, V, scale):
@@ -44,7 +44,7 @@ def attention(Q, K, V, scale):
 
 ## 2 NKIGym Operators
 
-Every `nkigym.*` op mirrors a real `nisa.*` or `nl.*` ISA operation — no ops are invented. At the logical level, an op only declares its axis semantics and a CPU simulation. No hardware constraints, tiling, or memory placement.
+Every `GymXXX` op mirrors a real `nisa.*` or `nl.*` ISA operation — no ops are invented. At the logical level, an op only declares its axis semantics and a CPU simulation. No hardware constraints, tiling, or memory placement.
 
 ```python
 class GymOp:
@@ -196,7 +196,7 @@ class GymActivation(GymOp):
 
 ### 2.2 CPU Simulation
 
-The math function is plain Python — each `nkigym.*` call dispatches to `GymOp.__call__()` which executes the op with numpy at float64 precision. No parsing or IR needed; just call the function directly:
+The math function is plain Python — each `GymXXX` call dispatches to `GymOp.__call__()` which executes the op with numpy at float64 precision. No parsing or IR needed; just call the function directly:
 
 ```python
 q = np.random.randn(4096, 128)
@@ -211,7 +211,7 @@ The result is the **reference output** — a float64 array that any correctly re
 
 ## 3. Dimension Analysis
 
-A forward pass over all ops assigns concrete dimension IDs and computes the hardware-determined components (`op{int}_d{int}_tile_size` and `d{int}_tile_size`) for each dimension. No tensor starts with dimension IDs — they are discovered automatically from op structure.
+A forward pass over all ops assigns concrete dimension IDs and computes the hardware-determined components (`op{int}_d{int}_unified_tile_size` and `d{int}_unified_tile_size`) for each dimension. No tensor starts with dimension IDs — they are discovered automatically from op structure.
 
 For each op, build a local axis map from abstract axes (K, M, N or P, F) to concrete dimension IDs (d0, d1, ...). Operands that already carry dim_ids (from prior ops) provide the mapping; operands without dim_ids get fresh IDs allocated. When two operands of the same op share an abstract axis (e.g., matmul's K axis appears in both stationary and moving), their concrete dims are **unified** — the later operand's dim is renamed to match the earlier one, propagating backward through all tensors that share the old ID. This is how shared dimensions are discovered without any manual labeling.
 
@@ -250,7 +250,7 @@ Each op decides which boundary it triggers by examining its own inputs — an en
 - **SBUF↔PSUM boundary.** Triggered when the op's input lives in PSUM but the op needs it in SBUF. The op inserts a `tensor_copy(PSUM → SBUF)` before consuming. Introduces `tpb_sbuf` (tunable) and `num_blocks_sbuf` (derived).
 
 ### 4.2 Interleave
-Different ops may have different tile size limits on the same dimension (e.g., `nc_matmul` N=512 vs `nc_transpose` F=128). `d{int}_tile_size` = max of all op tile sizes and is per-dimension across all ops. Ops with smaller tile sizes iterate `tiles_per_unified_tile = d{int}_tile_size / d{int}_op{int}_tile_size` times per unified tile.
+Different ops may have different tile size limits on the same dimension (e.g., `nc_matmul` N=512 vs `nc_transpose` F=128). `d{int}_unified_tile_size` = max of all op tile sizes and is per-dimension across all ops. Ops with smaller tile sizes iterate `tiles_per_unified_tile = d{int}_unified_tile_size / d{int}_op{int}_tile_size` times per unified tile.
 
 ### 4.2 Dimension Decomposition
 When the HBM-SBUF boundary is active on the tensor for an operator:
@@ -259,17 +259,17 @@ $$\texttt{dim\_size} = \texttt{num\_blocks\_hbm} \times \texttt{tpb\_hbm} \times
 When the SBUF-PSUM boundary is active on the tensor for an operator:
 $$\texttt{dim\_size} = \texttt{num\_blocks\_sbuf} \times \texttt{tpb\_sbuf} \times \texttt{d\{int\}\_tile\_size}$$
 
-In both cases, `d{int}_tile_size` is further broken down into `tiles_per_unified_tile` * `d{int}_op{int}_tile_size`.
+In both cases, `d{int}_unified_tile_size` is further broken down into `tiles_per_unified_tile` * `d{int}_op{int}_tile_size`.
 
 ### 4.4 Per-Op Loop Nest
 For each dimension of an op's tensor operands, either P or F:
-- `d{int}_tile_size` (hardware, per-dimension) — max of all hardware tile size limits across ops on the dimension. One iteration of block/tile loops processes `d{int}_tile_size` elements.
+- `d{int}_unified_tile_size` (hardware, per-dimension) — max of all hardware tile size limits across ops on the dimension. One iteration of block/tile loops processes `d{int}_unified_tile_size` elements.
 - `d{int}_op{int}_tile_size` (hardware, per-dimension per-op) - hardware tile size for a particular dimension for an op.
-- `tiles_per_unified_tile` (hardware, per-dimension per-op) — `d{int}_tile_size / d{int}_op{int}_tile_size`. The buffer stores at the smallest op tile size; ops with larger tiles consume multiple buffer slots per iteration.
-- `tpb_hbm` (tunable) — unified tiles per HBM block. Data is loaded from HBM once per block via `load_tensor_block`, then reused across compute iterations.
+- `tiles_per_unified_tile` (hardware, per-dimension per-op) — `d{int}_unified_tile_size / d{int}_op{int}_tile_size`. The buffer stores at the smallest op tile size; ops with larger tiles consume multiple buffer slots per iteration.
+- `tpb_hbm` (tunable, where applicable) — unified tiles per HBM block. Data is loaded from HBM once per block via `load_tensor_block`, then reused across compute iterations.
 - `tpb_sbuf` (tunable, where applicable) — unified tiles per PSUM→SBUF staging batch. When an op finds its input in PSUM, it stages `tpb_sbuf` tiles to SBUF via `tensor_copy` before consuming them.
-- `num_blocks_hbm` (derived) — `dim_size / (tpb_hbm × d{int}_tile_size)`.
-- `num_blocks_sbuf` (derived) — `dim_size / (tpb_sbuf × d{int}_tile_size)`.
+- `num_blocks_hbm` (derived) — `dim_size / (tpb_hbm × d{int}_unified_tile_size)`.
+- `num_blocks_sbuf` (derived) — `dim_size / (tpb_sbuf × d{int}_unified_tile_size)`.
 
 Each op contributes up to 3 loops per dimension: block, tile, and interleave tile.
 
@@ -286,6 +286,52 @@ Q_t = GymTranspose()(Q)
 K_t = GymTranspose()(K)
 S = GymMatmul()(Q_t, K_t)
 ```
+Using the dimension assignments from §3 and ISA tile limits (`nc_transpose`: P=128, F=128; `nc_matmul`: K=128, M=128, N=512). Suppose d0=4096, d1=256, d2=4096.
+
+```python
+dim_size = {"d0": 4096, "d1": 256, "d2": 4096}
+
+"""Unified tile size: max of all op tile sizes on each dimension."""
+unified = {
+    "d0": max(128, 128),  # transpose P, matmul M → 128
+    "d1": max(128, 128),  # transpose F, matmul K → 128
+    "d2": max(128, 512),  # transpose P, matmul N → 512
+}
+
+"""Per-op tile size: hardware limit for this op on this dimension."""
+op_tile = {
+    (0, "d0"): 128,  # transpose P
+    (0, "d1"): 128,  # transpose F
+    (1, "d2"): 128,  # transpose P
+    (1, "d1"): 128,  # transpose F
+    (2, "d1"): 128,  # matmul K
+    (2, "d0"): 128,  # matmul M
+    (2, "d2"): 512,  # matmul N
+}
+
+interleave = {k: unified[k[1]] // v for k, v in op_tile.items()}
+# (1,"d2") → 512//128 = **4**, all others → 1
+
+"""Boundary type per op — determined by where the input lives."""
+boundary = {0: "hbm", 1: "hbm", 2: "sbuf"}
+# Q,K in HBM → HBM↔SBUF; Q_t,K_t in PSUM → SBUF↔PSUM
+
+"""Tunable tiles-per-block (one per boundary type)."""
+tpb = {0: tpb_hbm, 1: tpb_hbm, 2: tpb_sbuf}
+
+num_blocks = {
+    k: dim_size[k[1]] // (tpb[k[0]] * unified[k[1]])
+    for k in op_tile
+}
+```
+
+**Per-op loop nests.** Each dimension contributes 3 loops: `i_block`(`num_blocks[op,d]`) × `i_tile`(`tpb[op]`) × `i_ig`(`interleave[op,d]`).
+
+- **op0** `transpose(Q)` [HBM↔SBUF]: `i_block[0,d0]` × `i_tile[0,d0]` × `i_ig[0,d0]`(1) × `i_block[0,d1]` × `i_tile[0,d1]` × `i_ig[0,d1]`(1)
+- **op1** `transpose(K)` [HBM↔SBUF]: `i_block[1,d2]` × `i_tile[1,d2]` × `i_ig[1,d2]`(**4**) × `i_block[1,d1]` × `i_tile[1,d1]` × `i_ig[1,d1]`(1)
+- **op2** `matmul` [SBUF↔PSUM]: `i_block[2,d1]` × `i_tile[2,d1]` × `i_ig[2,d1]`(1) × `i_block[2,d0]` × `i_tile[2,d0]` × `i_ig[2,d0]`(1) × `i_block[2,d2]` × `i_tile[2,d2]` × `i_ig[2,d2]`(1)
+
+The interleave trip of **4** in op1/d2 is the key asymmetry: the matmul forces `unified["d2"]`=512, but transpose handles only 128 elements on P per iteration.
 
 ## 5. Initial KernelIR
 
