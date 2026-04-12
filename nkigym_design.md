@@ -421,6 +421,7 @@ class KernelIR:
     tiles_per_block: dict[tuple[int, str], int]
     buffer_degrees: dict[tuple[int, str, str], int]
     loop_order: list[list[str]]
+    load_placements: dict[tuple[str, str], str]
 ```
 
 **Immutable state** — produced by `build_ir`, shared across all transform variants:
@@ -432,44 +433,58 @@ class KernelIR:
 - `tiles_per_block`: initially `1` for all `(op_idx, dim_id)` pairs.
 - `buffer_degrees`: initially `1` for all `(group_idx, tensor_name, dim_id)` triples. Each tensor's buffer is independent per fusion group — the same tensor loaded in two groups can have different degrees.
 - `loop_order`: per group — non-blocking dims first, blocking (accumulation) dims last.
+- `load_placements`: initially absent (all loads at default position). `(tensor_name, dim_id) → tier` where tier is `"per_tile"`, `"per_block"`, or `"full"`. See §6.2.
 
-### 5.2 Lowering Rules
+**Renderer-derived positions** — NOT stored in KernelIR, mechanically derived by `render_ir` from the transform state above:
+- **memset**: before the accumulation (K) dimension's outermost loop in the current `loop_order`.
+- **save / tensor_copy(psum→sbuf)**: after the accumulation dimension's last inner loop.
+- **tensor_copy (interleave reload/save)**: around the tile loop when an accumulating dim's block and tile are split by other dims' loops.
+- These are deterministic given the loop structure — exactly one correct position for each, no ambiguity.
 
-`render_ir(ir)` mechanically converts a `KernelIR` to NKI source. In the initial IR, each op is its own group and gets a self-contained code block emitted in topological order.
+### 5.2 Generic Lowering
+
+`render_ir(ir)` mechanically converts any `KernelIR` — initial or transformed — to NKI source. The same renderer handles all variants by reading the transform state and applying dependency-based statement placement.
 
 **Kernel frame.** Emit `@nki.jit` decorator, `def func_name(params):`, and the HBM output `nl.ndarray(..., buffer=nl.shared_hbm)` for the return tensor.
 
-**Per-op codegen.** For each op in topological order:
+**Per-group codegen.** For each fusion group in topological order:
 
-1. **Buffers.**
-   - *HBM load buffer* (SBUF): one per HBM-resident operand. Shape `(min_tile_P, tpb_P × ig_P, tpb_F × ig_F, min_tile_F)` — holds one block of loaded data. `tpb_d = tiles_per_block[(op, d)]`, `ig_d = num_ig` from `OpDimInfo`.
-   - *PSUM temp*: for PSUM-producing ops (`nc_transpose`, `nc_matmul`). Degree-1 shape `(op_tile_P, 1, 1, op_tile_F)`.
-   - *Cross-op SBUF output*: full-range buffer holding the entire intermediate tensor for later ops. Shape `(min_tile_P, total_P_tiles, total_F_tiles, min_tile_F)`. This is the cost of no fusion — the entire intermediate must be materialized.
-   - *Result save*: `save_tensor_block` accepts PSUM or SBUF sources — for PSUM, it stages through a temporary SBUF buffer internally before DMA to HBM.
+1. **Loop nest.** Each dimension contributes 3 loops (block, tile, ig). Nesting follows `loop_order`. All loops always explicit, even when trip count is 1.
 
-2. **Loop nest.** Per-phase grouping matching §4.4: all block loops outermost, then all tile loops, then all ig loops. Within each phase, dimensions follow `loop_order`. DMA loads go after the block phase (once per block combination). All loops are always explicit, even when trip count is 1.
-
-   | Phase | Variable | Trip count |
+   | Loop | Variable | Trip count |
    |---|---|---|
    | Block | `i_block_d{id}` | `dim_size / (tpb × unified_tile_size)` |
    | Tile | `i_tile_d{id}` | `tiles_per_block[(op, d)]` |
    | Interleave | `i_ig_d{id}` | `num_ig` from `OpDimInfo` |
 
-3. **DMA load.** After the block phase (between the last block loop and the first tile loop), emit `load_tensor_block` for each HBM operand. With per-phase grouping, the load runs once per block combination — no redundancy within tile/ig phases. Load placement (§6.2) can further optimize by hoisting past irrelevant block dims. The gadget handles tile-by-tile DMA internally.
+2. **Buffers.** Sizes derived from `tiles_per_block`, `buffer_degrees`, `load_placements`, and dim info:
+   - *HBM load buffer* (SBUF): size per relevant dimension from `load_placements` tier — absent = 1 tile, `"per_tile"` = ig tiles, `"per_block"` = tpb × ig tiles, `"full"` = all tiles.
+   - *PSUM temp*: degree-1 shape `(op_tile_P, 1, 1, op_tile_F)`.
+   - *Cross-group SBUF*: full-range buffer for intermediate tensors consumed by later groups.
+   - *Interleave sbuf_output*: when an accumulating dim's block and tile are split by other dims, persists partial sums across block iterations.
 
-4. **PSUM init / staging.**
-   - `nc_matmul`: `nisa.memset(psum, 0.0)` before the accumulation (K) dimension's loops. After all K iterations: for intermediate tensors, explicit `nisa.tensor_copy(sbuf, psum)`; for the return tensor, `save_tensor_block` handles PSUM→SBUF→HBM internally.
-   - `nc_transpose`: `nisa.tensor_copy(sbuf, psum)` immediately after each ISA call (each tile is independent).
+3. **DMA load.** Position from `load_placements`. `load_tensor_block` gadget handles tile-by-tile DMA internally.
 
-5. **ISA call.** At the innermost loop level. Buffer tile index for a given dimension:
+4. **PSUM init / staging.** Positions derived from `loop_order` + accumulation dimensions (RAW/WAW):
+   - `nc_matmul`: `memset` before K's outermost loop. After K's last iteration: `save_tensor_block` (return tensor) or `tensor_copy` (intermediates).
+   - `nc_transpose`: `tensor_copy(psum→sbuf)` immediately after each ISA call.
+   - Block-tile split on accumulating dim: `tensor_copy` reload before tile loop, save after.
 
-   $$idx = i_{block} \times (tpb \times num\_ig) + i_{tile} \times num\_ig + i_{ig}$$
+5. **ISA call.** Innermost loop level. Buffer tile index: $idx = i_{block} \times (tpb \times num\_ig) + i_{tile} \times num\_ig + i_{ig}$. Interleave reshape `(tiles_per_ig, min_tile)` → `(1, op_tile)` is a free view.
 
-   For interleaved dimensions where `tiles_per_ig > 1`, the op reads `tiles_per_ig` consecutive buffer slots and reshapes `(tiles_per_ig, min_tile_size)` → `(1, op_tile_size)` (free view, no data copy).
+6. **DMA store.** `save_tensor_block` after K's last iteration. Handles PSUM→SBUF staging internally.
 
-6. **DMA store.** For the op producing the return tensor, `save_tensor_block` accepts PSUM or SBUF sources and writes to HBM, staging through a temporary SBUF buffer internally for PSUM sources.
+### 5.3 Initial KernelIR Conventions
 
-### 5.3 Example
+`build_ir` produces the initial KernelIR with these defaults — the starting point before any transforms (§6):
+
+- **`tiles_per_block = 1`** for all (op, dim). Block loops carry the full tile count; tile loops are `range(1)`.
+- **`load_placements = {}`** (absent). All loads after the block phase, before tile phase.
+- **`buffer_degrees = 1`** for all (group, tensor, dim). Single-buffered.
+- **`loop_order`**: per-phase grouping (§4.4) — blocks outermost, tiles middle, igs inner. Non-blocking dims first, blocking dims last.
+- **`fusion_groups = [[0], [1], ...]`** — each op in its own group. Intermediate tensors fully materialized in cross-group SBUF buffers.
+
+### 5.4 Initial KernelIR Example
 
 Transpose + matmul with interleave asymmetry on d2:
 
@@ -532,6 +547,7 @@ ir = KernelIR(
         (1, "result", "d1"): 1, (1, "result", "d2"): 1,
     },
     loop_order=[["d2", "d0"], ["d1", "d2", "d0"]],
+    load_placements={},
 )
 ```
 
@@ -562,9 +578,7 @@ Op 1 (matmul), loop order d1 → d2 → d0(K):
 | `sbuf_lhs_T` | HBM load for lhs_T | `(128, 1, 1, 128)` | K=d0: 1 tile. M=d1: 1 tile. |
 | `psum_result` | PSUM accum for matmul | `(128, 1, 1, 512)` | Degree-1. One 128×512 matmul tile (fp32). `save_tensor_block` handles PSUM→SBUF→HBM internally. |
 
-### 5.4 Lowered NKI Kernel
-
-One self-contained loop nest per op, emitted in topological order:
+**Lowered NKI kernel** — one self-contained loop nest per op:
 
 ```python
 import nki
@@ -625,13 +639,6 @@ def matmul(lhs_T, rhs_T):
 
     return result
 ```
-
-**Key observations:**
-
-- **Full-range buffer cost.** `sbuf_rhs` stores the entire 128×8192 intermediate tensor (2 MB at float16). This is the cost of separate loop nests — fusion (§6.1) eliminates it by sharing loops between producer and consumer.
-- **d2 interleave.** `sbuf_rhs` is stored at min tile size (128) per §4. The transpose writes one 128-wide tile per `i_ig_d2` iteration. The matmul reads 4 consecutive tiles and reshapes `(4, 128)` → `(1, 512)` — a free view, no data copy.
-- **PSUM lifecycle.** Each `nc_transpose` tile writes to PSUM and immediately copies to SBUF (independent tiles). The `nc_matmul` memsets before the K (d0) loop and copies out after — with d0=128 (1 tile), the accumulation is a single matmul followed by `tensor_copy`.
-- **DMA placement.** Per-phase grouping places all block loops outermost. The load runs once per block combination — `lhs_T` loads 16×1×16 = 256 times (d1×d0×d2 blocks), but d2 is irrelevant to lhs_T so 16 of those are redundant. Load placement (§6.2) hoists past irrelevant block dims to eliminate this.
 
 ## 6. Programmatic Transforms
 
