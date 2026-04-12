@@ -1,8 +1,8 @@
-## 6. Math Transforms
+## Online Fusion
 
-Math transforms restructure the algorithm itself — changing the computation to break blocking dependencies. Programmatic transforms (§5) cannot fuse loops across blocking dependencies; math transforms eliminate those dependencies so that programmatic transforms can then optimize the resulting loop nest.
+Online fusion is a greedy math-level preprocessing step — not part of the programmatic search space. It detects all X + Accumulation patterns in the IR, applies tile-level fusion to each, and produces a single KernelIR with blocking barriers eliminated. Programmatic transforms (§6) then operate on this already-fused IR.
 
-### 6.1 Online Fusion
+Block-level granularity is not a separate online fusion mode — it emerges from programmatic transforms: when tiles_per_block groups multiple tiles into a block and dimension interleaving splits the block/tile loops, corrections happen once per block instead of per tile. Same math, different scheduling.
 
 ![Math function DAG — Op 7 and Op 9 are topologically independent, converging only at Op 10](../../../../diagrams/math_function_dag.png)
 
@@ -84,7 +84,7 @@ We classify each blocking pair:
 
 | Producer → Consumer | Blocking dim | Handled by | Why |
 |---|---|---|---|
-| Op 2 (matmul over d1) → Op 5 (reduce max over d2) | d1 | **Not online-fusable** | Different blocking dims (d1 vs d2); no X+Accumulation pattern. Resolved by loop nesting: d1 becomes an inner loop inside the fused d2 loop, so Op 2's d1 reduction completes per d2 tile before Ops 5-9 consume it (programmatic transform §5.1, not a math transform). |
+| Op 2 (matmul over d1) → Op 5 (reduce max over d2) | d1 | **Not online-fusable** | Different blocking dims (d1 vs d2); no X+Accumulation pattern. Resolved by loop nesting: d1 becomes an inner loop inside the fused d2 loop, so Op 2's d1 reduction completes per d2 tile before Ops 5-9 consume it (programmatic loop fusion, not online fusion). |
 | Op 5 (reduce max over d2) → Op 6 (exp + sum over d2) | d2 | **Online fusion** | X+Accumulation pattern (§6.1.2) |
 | Op 6 (exp_S depends on max) → Op 9 (matmul over d2) | d2 | **Online fusion** | Same X (running max), same $s_k$ (§6.1.3) |
 
@@ -93,7 +93,7 @@ Online fusion breaks the Op 5→6 and Op 6→9 barriers, pulling Ops 5, 6, 8, 9 
 **Fusion granularity.** The "tile" $k$ in Algorithm 4 can be:
 
 - **Tile level** (§6.1.2–6.1.3): $k$ = one unified tile. Every `i_tile_d2` iteration runs the X step and rescales accumulators. Simpler structure, smaller buffers, more rescaling overhead.
-- **Block level** (§6.1.4): $k$ = one block of `tiles_per_block` tiles. Within each block, Ops 5 and 6 run their own `i_tile_d2` loops (naive multi-pass). Corrections apply once per `i_block_d2` iteration. Fewer corrections, enables section-based processing with dimension interleaving (§5.3).
+- **Block level** (§6.1.4): $k$ = one block of `tiles_per_block` tiles. Within each block, Ops 5 and 6 run their own `i_tile_d2` loops (naive multi-pass). Corrections apply once per `i_block_d2` iteration. Fewer corrections, enables section-based processing with dimension interleaving.
 
 Both produce the same final result using the same math (§6.1.1). The reference attention CTE kernel uses block-level fusion with 8K-token sections.
 
@@ -463,7 +463,7 @@ Online fusion modifies the KernelIR by replacing the full-range blocking reducti
 
 1. **New ops.** Running state initialization (`memset`), per-tile/per-block partial reduction, running state update (`tensor_tensor`, `activation`), scale computation, accumulator rescaling (`tensor_scalar`). These are standard NKI ISA instructions, not new nkigym ops.
 2. **Modified data flow.** Op 6's bias changes from the full-range `neg_max_S` (output of Op 5) to the incremental `running_max` (updated each tile/block). The `running_sum` update uses fused rescale+accumulate (`tensor_scalar` with multiply+add) instead of a separate full-range `tensor_reduce(add)`.
-3. **Eliminated blocking barrier.** The intermediate `neg_max_S` (full-range reduction output) no longer exists. `running_max` is produced non-blockingly — each tile/block yields a valid running max. This enables loop fusion (§5.1) to merge the previously-separated groups: the consumer (Op 6) can process tiles incrementally using the running state, satisfying fusion condition (2).
+3. **Eliminated blocking barrier.** The intermediate `neg_max_S` (full-range reduction output) no longer exists. `running_max` is produced non-blockingly — each tile/block yields a valid running max. This enables loop fusion to merge the previously-separated groups: the consumer (Op 6) can process tiles incrementally using the running state, satisfying fusion condition (2).
 
 **Representation.**
 
@@ -504,4 +504,4 @@ class OnlineFusion(Transform):
 
 For attention, this yields one group: X = Op 5 (reduce max), accumulators = [Op 6 (exp + sum), Op 9 (matmul output)], blocking dim = d2.
 
-**Interaction with loop fusion.** Before online fusion, loop fusion produces [[0,...,4], [5], [6,...,10]] — the barriers at Op 5 are unfusable (§5.1 attention trace). After online fusion eliminates the blocking intermediate, loop fusion can merge the groups: `running_max` replaces `neg_max_S` as the bias for Op 6, and `running_max` is produced non-blockingly (valid at each iteration). The search applies online fusion to generate a new KernelIR, then re-applies loop fusion (and other programmatic transforms) to the modified IR.
+**Pipeline.** Online fusion runs greedily before the programmatic search: detect all patterns, apply tile-level fusion to each, produce a single KernelIR. Before online fusion, loop fusion would produce [[0,...,4], [5], [6,...,10]] — barriers at Op 5 are unfusable. After online fusion eliminates the blocking intermediate, `running_max` replaces `neg_max_S` as the bias for Op 6, produced non-blockingly (valid at each iteration). The programmatic search then operates on this fused IR — loop fusion can now merge the previously-blocked groups, and other transforms (tiles_per_block, dimension interleaving) can create block-level granularity where corrections happen once per block instead of per tile.

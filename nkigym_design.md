@@ -346,7 +346,7 @@ The interleave trip of **4** in op1/d2 is the key asymmetry: the matmul forces `
 
 ## 5. KernelIR and Lowering
 
-The pipeline: **math function →** `build_ir` **→ KernelIR → transforms → KernelIR →** `render_ir` **→ NKI source → test + profile.** `KernelIR` is the structured representation that all transforms operate on, avoiding repeated AST parsing of NKI source for every variant. `build_ir(func, input_specs)` constructs the initial IR once (dimension analysis §3, tiling §4, default transform state). Transforms (§6) clone and modify the transform state to produce new variants — all within `KernelIR`, no source generation yet. `render_ir(ir)` mechanically lowers any `KernelIR` — initial or transformed — to NKI source. In the initial IR, each op gets its own self-contained loop nest — no fusion, no optimization.
+The pipeline: **math function →** `build_ir` **→ KernelIR → online fusion (§7) → KernelIR → programmatic transforms (§6) → KernelIR →** `render_ir` **→ NKI source → test + profile.** `KernelIR` is the structured representation that all transforms operate on, avoiding repeated AST parsing of NKI source for every variant. `build_ir(func, input_specs)` constructs the initial IR once (dimension analysis §3, tiling §4, default transform state). Online fusion (§7) greedily applies all detected math-level optimizations, producing a single KernelIR with blocking barriers eliminated. Programmatic transforms (§6) then clone and modify the transform state to produce variant candidates — all within `KernelIR`, no source generation yet. `render_ir(ir)` mechanically lowers any `KernelIR` — initial or transformed — to NKI source.
 
 ### 5.1 Data Model
 
@@ -681,9 +681,11 @@ See [tiles_per_block.md](nkigym/src/nkigym/transforms/tiles_per_block.md).
 
 See [multi_buffer.md](nkigym/src/nkigym/transforms/multi_buffer.md).
 
-## 7. Math Transforms
+## 7. Online Fusion
 
-See [online_fusion.md](nkigym/src/nkigym/transforms/online_fusion.md).
+Greedy math-level preprocessing — not part of the programmatic search space. Detects all X + Accumulation patterns, applies tile-level fusion to each, and produces a single KernelIR with blocking barriers eliminated. Programmatic transforms (§6) then operate on this already-fused IR. Block-level granularity emerges from programmatic transforms: tiles_per_block + dimension interleaving naturally create the section structure where corrections happen once per block.
+
+See [online_fusion.md](nkigym/src/nkigym/online_fusion/online_fusion.md).
 
 ## 8. Search Interface
 
