@@ -1,28 +1,50 @@
-"""Causal attention: numpy reference vs nkigym simulation.
+"""Causal attention: numpy reference, nkigym simulation, and remote profiling.
 
 Demonstrates that nkigym tile-level NKI ops produce identical results
-to numpy at float64 precision for causal masked attention.
+to numpy at float64 precision for causal masked attention, renders
+the naive NKI kernel, then compiles and benchmarks it on remote
+Trainium workers.
+
+Usage::
+
+    source ~/venvs/kernel-env/bin/activate
+    python examples/attention.py
 """
+
+import inspect
+import shutil
+from pathlib import Path
 
 import numpy as np
 
-import nkigym
+from autotune.runner.compare import assert_close
+from nkigym.codegen.render import build_ir
+from nkigym.ops.activation import NKIActivation
+from nkigym.ops.activation_reduce import NKIActivationReduce
+from nkigym.ops.affine_select import NKIAffineSelect
+from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.tensor_reduce import NKITensorReduce
+from nkigym.ops.tensor_scalar import NKITensorScalar
+from nkigym.ops.transpose import NKITranspose
+from nkigym.search.api import remote_search
 
 
-def attention_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray, scale: float) -> np.ndarray:
+def attention_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
     """Causal attention with numpy.
 
     softmax(mask(scale * Q @ K^T)) @ V with lower-triangular causal mask.
+    scale = 1/sqrt(d_k) derived from Q.shape[1].
 
     Args:
-        Q: Query tensor of shape (seq_q, d).
-        K: Key tensor of shape (seq_k, d).
+        Q: Query tensor of shape (seq_q, d_k).
+        K: Key tensor of shape (seq_k, d_k).
         V: Value tensor of shape (seq_k, d_v).
-        scale: Scalar multiplier.
 
     Returns:
         Output tensor of shape (seq_q, d_v).
     """
+    d_k = Q.shape[1]
+    scale = 1.0 / np.sqrt(d_k)
     seq_q = Q.shape[0]
     seq_k = K.shape[0]
     scores = scale * (Q @ K.T)
@@ -37,8 +59,8 @@ def attention_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray, scale: float) -
     return weights @ V
 
 
-def attention_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray, scale: float) -> np.ndarray:
-    """Causal attention using nkigym logical ops.
+def attention_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
+    """Causal attention using nkigym NKIOp classes.
 
     Same math as attention_numpy, expressed as NKI tile operations:
         1. Q_t, K_t = transpose Q and K
@@ -53,47 +75,66 @@ def attention_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray, scale: float) 
        10. output = attn * inv_sum
 
     Args:
-        Q: Query tensor of shape (seq_q, d).
-        K: Key tensor of shape (seq_k, d).
+        Q: Query tensor of shape (seq_q, d_k).
+        K: Key tensor of shape (seq_k, d_k).
         V: Value tensor of shape (seq_k, d_v).
-        scale: Scalar multiplier.
 
     Returns:
         Output tensor of shape (seq_q, d_v).
     """
+    d_k = Q.shape[1]
+    scale = 1.0 / np.sqrt(d_k)
     seq_k = K.shape[0]
-    Q_t = nkigym.nc_transpose(Q)
-    K_t = nkigym.nc_transpose(K)
-    S = nkigym.nc_matmul(Q_t, K_t)
-    scaled_S = nkigym.tensor_scalar(S, scale, op0="multiply")
-    masked_S = nkigym.affine_select(
-        scaled_S, pattern=[[-1, seq_k]], channel_multiplier=1, on_false_value=-np.inf, cmp_op="greater_equal"
+    Q_t = NKITranspose()(data=Q)
+    K_t = NKITranspose()(data=K)
+    S = NKIMatmul()(stationary=Q_t, moving=K_t)
+    scaled_S = NKITensorScalar()(data=S, scalar0=scale, op0="multiply")
+    masked_S = NKIAffineSelect()(
+        data=scaled_S, pattern=[[-1, seq_k]], channel_multiplier=1, on_false_value=-np.inf, cmp_op="greater_equal"
     )
-    neg_max = nkigym.tensor_reduce(masked_S, op="max", negate=True)
-    exp_S, sum_exp = nkigym.activation_reduce(masked_S, op="exp", reduce_op="add", bias=neg_max)
-    inv_sum = nkigym.activation(sum_exp, op="reciprocal")
-    exp_S_t = nkigym.nc_transpose(exp_S)
-    attn = nkigym.nc_matmul(exp_S_t, V)
-    return nkigym.tensor_scalar(attn, inv_sum, op0="multiply")
+    neg_max = NKITensorReduce()(data=masked_S, op="max", negate=True)
+    exp_S, sum_exp = NKIActivationReduce()(data=masked_S, op="exp", reduce_op="add", bias=neg_max)
+    inv_sum = NKIActivation()(data=sum_exp, op="reciprocal")
+    exp_S_t = NKITranspose()(data=exp_S)
+    attn = NKIMatmul()(stationary=exp_S_t, moving=V)
+    output = NKITensorScalar()(data=attn, scalar0=inv_sum, op0="multiply")
+    return output
 
 
 if __name__ == "__main__":
-    rng = np.random.default_rng(42)
 
-    seq_len, d_k, d_v = 128, 64, 64
-    Q = rng.standard_normal((seq_len, d_k))
-    K = rng.standard_normal((seq_len, d_k))
-    V = rng.standard_normal((seq_len, d_v))
-    scale = 1.0 / np.sqrt(d_k)
+    seq_len, d_k, d_v = 2048, 128, 128
 
-    out_np = attention_numpy(Q, K, V, scale)
-    out_gym = attention_nkigym(Q, K, V, scale)
+    Q = np.random.randn(seq_len, d_k)
+    K = np.random.randn(seq_len, d_k)
+    V = np.random.randn(seq_len, d_v)
 
-    print(f"Q: {Q.shape}  K: {K.shape}  V: {V.shape}")
-    print(f"scale: {scale:.6f}")
-    print(f"numpy  sample: {out_np[0, :4]}")
-    print(f"nkigym sample: {out_gym[0, :4]}")
-    max_diff = np.max(np.abs(out_np - out_gym))
-    print(f"max |diff|: {max_diff:.2e}")
-    np.testing.assert_allclose(out_gym, out_np, rtol=1e-10, atol=1e-10)
-    print("PASS: causal nkigym matches numpy")
+    out_np = attention_numpy(Q, K, V)
+    out_gym = attention_nkigym(Q, K, V)
+    status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
+    print(status)
+
+    input_specs = {
+        "Q": ((seq_len, d_k), "bfloat16"),
+        "K": ((seq_len, d_k), "bfloat16"),
+        "V": ((seq_len, d_v), "bfloat16"),
+    }
+    ir = build_ir(attention_nkigym, input_specs=input_specs)
+
+    golden_source = inspect.getsource(attention_numpy)
+    cache_dir = Path("/home/ubuntu/cache/attention_test")
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    remote_search(
+        initial_kernel=ir,
+        golden_source=golden_source,
+        golden_func_name="attention_numpy",
+        hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5", "gym-6"],
+        cache_dir=str(cache_dir),
+        num_variants=10,
+        transforms=[],
+        atol=1e-2,
+        rtol=1e-2,
+        warmup=10,
+        iters=100,
+    )
