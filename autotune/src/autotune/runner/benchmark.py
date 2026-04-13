@@ -138,13 +138,14 @@ def benchmark_one(
 
 
 def simulate_one(nki_path: str, func_name: str, kernel_kwargs: dict[str, Any]) -> tuple[np.ndarray, str]:
-    """Run a kernel through the NKI CPU simulator.
+    """Run a kernel through the NKI CPU simulator in float32.
 
-    The simulator converts low-precision inputs (bfloat16, float8) to
-    float32 at the storage level before execution (unless NKI_PRECISE_FP
-    is set). nc_matmul then operates entirely in float32. This means
-    the CPU sim tests float32 accumulation order (tiled vs monolithic),
-    not low-precision arithmetic.
+    All tensor inputs are cast to float32 before simulation, regardless
+    of the kernel's declared dtype. The NKI simulator only accepts
+    hardware dtypes (float32 is the highest precision). This matches
+    compute_golden() which also casts to float32, giving an
+    apples-to-apples comparison that tests accumulation order
+    (tiled vs monolithic) without low-precision noise.
 
     Args:
         nki_path: Path to the kernel source file.
@@ -161,7 +162,7 @@ def simulate_one(nki_path: str, func_name: str, kernel_kwargs: dict[str, Any]) -
         sim_kwargs: dict[str, Any] = {}
         for k, v in kernel_kwargs.items():
             if hasattr(v, "ndim") and v.ndim > 0:
-                sim_kwargs[k] = v.copy()
+                sim_kwargs[k] = v.astype(np.float32)
             else:
                 sim_kwargs[k] = v
         result = nki.simulate(kernel_func)(**sim_kwargs)
@@ -191,7 +192,7 @@ def compute_golden(golden_source: str, func_name: str, kernel_kwargs: dict[str, 
     """Execute a golden reference function to compute expected output.
 
     Casts inputs to float32 to match the NKI CPU simulator precision
-    (nc_matmul simulator casts operands to float32).
+    (float32 is the highest precision the NKI simulator accepts).
 
     Args:
         golden_source: Source code containing the golden function.

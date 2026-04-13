@@ -432,7 +432,7 @@ class KernelIR:
 - `fusion_groups`: initially `[[0], [1], ...]` — each op in its own group.
 - `tiles_per_block`: initially `1` for all `(op_idx, dim_id)` pairs.
 - `buffer_degrees`: initially `1` for all `(group_idx, tensor_name, dim_id)` triples. Each tensor's buffer is independent per fusion group — the same tensor loaded in two groups can have different degrees.
-- `loop_order`: per group — non-blocking dims first, blocking (accumulation) dims last.
+- `loop_order`: per group — dimension ordering within each phase.
 - `load_placements`: initially absent (all loads at default position). `(tensor_name, dim_id) → tier` where tier is `"per_tile"`, `"per_block"`, or `"full"`. See §6.2.
 
 **Renderer-derived positions** — NOT stored in KernelIR, mechanically derived by `render_ir` from the transform state above:
@@ -460,6 +460,7 @@ class KernelIR:
 2. **Buffers.** Sizes derived from `tiles_per_block`, `buffer_degrees`, `load_placements`, and dim info:
    - *HBM load buffer* (SBUF): size per relevant dimension from `load_placements` tier — absent = 1 tile, `"per_tile"` = ig tiles, `"per_block"` = tpb × ig tiles, `"full"` = all tiles.
    - *PSUM temp*: degree-1 shape `(op_tile_P, 1, 1, op_tile_F)`.
+   - *PSUM accum* (matmul): holds all output tiles live between memset and save. Dims inside the K dimension's outermost loop contribute their full tile count; dims outside contribute 1. Shape depends on `loop_order`.
    - *Cross-group SBUF*: full-range buffer for intermediate tensors consumed by later groups.
    - *Interleave sbuf_output*: when an accumulating dim's block and tile are split by other dims, persists partial sums across block iterations.
 
@@ -476,13 +477,15 @@ class KernelIR:
 
 ### 5.3 Initial KernelIR Conventions
 
-`build_ir` produces the initial KernelIR with these defaults — the starting point before any transforms (§6):
+`build_ir` produces the initial KernelIR with these defaults — the most naive, mechanical lowering with no optimization choices. Every field starts at its simplest value; transforms (§6) improve from here.
 
 - **`tiles_per_block = 1`** for all (op, dim). Block loops carry the full tile count; tile loops are `range(1)`.
 - **`load_placements = {}`** (absent). All loads after the block phase, before tile phase.
 - **`buffer_degrees = 1`** for all (group, tensor, dim). Single-buffered.
-- **`loop_order`**: per-phase grouping (§4.4) — blocks outermost, tiles middle, igs inner. Non-blocking dims first, blocking dims last.
+- **`loop_order`**: per-phase grouping (§4.4) — blocks outermost, tiles middle, igs inner. Dimensions in order of first appearance (d0, d1, d2, ...).
 - **`fusion_groups = [[0], [1], ...]`** — each op in its own group. Intermediate tensors fully materialized in cross-group SBUF buffers.
+
+The initial `loop_order` uses dimension ID order because it is a neutral starting point that makes no assumptions about which dimension benefits from being outermost or innermost. Loop reordering transforms (§6.3) explore the space of valid orderings from here. When an accumulation dimension (K) appears early in the numbering, it ends up outermost, and the PSUM accumulator must hold all inner-dimension output tiles between memset and save. This can produce buffers too large for hardware PSUM — that is expected. The initial IR is not required to fit on hardware; transforms shrink buffers by reordering loops (moving K innermost) or adjusting `tiles_per_block`.
 
 ### 5.4 Initial KernelIR Example
 
@@ -495,14 +498,14 @@ def matmul(lhs_T, rhs_T):
     return result
 ```
 
-Input specs: `lhs_T: float16[128, 2048]` (d0, d1), `rhs_T: float16[8192, 128]` (d2, d0).
+Input specs: `lhs_T: float16[8192, 8192]` (d0, d1), `rhs_T: float16[8192, 8192]` (d2, d0).
 
-Dimensions from §3: d0=128, d1=2048, d2=8192. Tiling from §4:
+Dimensions from §3: d0=8192, d1=8192, d2=8192. Tiling from §4:
 
 | Dim | dim_size | unified | min |
 |---|---|---|---|
-| d0 | 128 | 128 | 128 |
-| d1 | 2048 | 128 | 128 |
+| d0 | 8192 | 128 | 128 |
+| d1 | 8192 | 128 | 128 |
 | d2 | 8192 | 512 | 128 |
 
 **KernelIR** (initial, all `tiles_per_block = 1`):
@@ -513,15 +516,15 @@ ir = KernelIR(
     param_names=["lhs_T", "rhs_T"],
     return_name="result",
     dims={
-        "d0": DimInfo(128, 128, 128),
-        "d1": DimInfo(2048, 128, 128),
+        "d0": DimInfo(8192, 128, 128),
+        "d1": DimInfo(8192, 128, 128),
         "d2": DimInfo(8192, 512, 128),
     },
     tensors={
-        "lhs_T":  TensorInfo(("d0", "d1"), (128, 2048), "float16", "hbm"),
-        "rhs_T":  TensorInfo(("d2", "d0"), (8192, 128), "float16", "hbm"),
-        "rhs":    TensorInfo(("d0", "d2"), (128, 8192), "float16", "psum"),
-        "result": TensorInfo(("d1", "d2"), (2048, 8192), "float16", "psum"),
+        "lhs_T":  TensorInfo(("d0", "d1"), (8192, 8192), "float16", "hbm"),
+        "rhs_T":  TensorInfo(("d2", "d0"), (8192, 8192), "float16", "hbm"),
+        "rhs":    TensorInfo(("d0", "d2"), (8192, 8192), "float16", "psum"),
+        "result": TensorInfo(("d1", "d2"), (8192, 8192), "float16", "psum"),
     },
     op_graph=OpGraph(
         nodes=[
@@ -546,27 +549,27 @@ ir = KernelIR(
         (0, "rhs", "d0"): 1, (0, "rhs", "d2"): 1,
         (1, "result", "d1"): 1, (1, "result", "d2"): 1,
     },
-    loop_order=[["d2", "d0"], ["d1", "d2", "d0"]],
+    loop_order=[["d0", "d2"], ["d0", "d1", "d2"]],
     load_placements={},
 )
 ```
 
 **Derived loop trip counts** from §4.4 formulas:
 
-Op 0 (transpose), loop order d2 → d0:
+Op 0 (transpose), loop order d0 → d2:
 
 | Dim | num_blocks | tpb | ig |
 |---|---|---|---|
+| d0 | 64 | 1 | 1 |
 | d2 | 16 | 1 | 4 |
-| d0 | 1 | 1 | 1 |
 
-Op 1 (matmul), loop order d1 → d2 → d0(K):
+Op 1 (matmul), loop order d0(K) → d1 → d2:
 
 | Dim | num_blocks | tpb | ig |
 |---|---|---|---|
-| d1 | 16 | 1 | 1 |
+| d0 (K) | 64 | 1 | 1 |
+| d1 | 64 | 1 | 1 |
 | d2 | 16 | 1 | 1 |
-| d0 (K) | 1 | 1 | 1 |
 
 **Buffer sizing.** Each buffer follows the 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`:
 
@@ -574,9 +577,9 @@ Op 1 (matmul), loop order d1 → d2 → d0(K):
 |---|---|---|---|
 | `sbuf_rhs_T` | HBM load for rhs_T | `(128, 4, 1, 128)` | P=d2: tpb(1)×ig(4)=4 tiles. F=d0: 1 tile. |
 | `psum_rhs_temp` | PSUM temp for transpose | `(128, 1, 1, 128)` | Degree-1. One 128×128 transpose tile. |
-| `sbuf_rhs` | Cross-op output for rhs | `(128, 1, 64, 128)` | Full-range at min tile size per §4. P=d0: 1 tile. F=d2: 8192/128=64 tiles. Matmul reshapes `(4, 128)` → `(1, 512)` (free view, no copy). |
+| `sbuf_rhs` | Cross-group output for rhs | `(128, 64, 64, 128)` | Full-range at min tile size per §4. P=d0: 8192/128=64 tiles. F=d2: 8192/128=64 tiles. Matmul reshapes `(4, 128)` → `(1, 512)` (free view, no copy). |
 | `sbuf_lhs_T` | HBM load for lhs_T | `(128, 1, 1, 128)` | K=d0: 1 tile. M=d1: 1 tile. |
-| `psum_result` | PSUM accum for matmul | `(128, 1, 1, 512)` | Degree-1. One 128×512 matmul tile (fp32). `save_tensor_block` handles PSUM→SBUF→HBM internally. |
+| `psum_result` | PSUM accum for matmul | `(128, 64, 16, 512)` | Full output range — d0(K) outermost, so all d1×d2 tiles live between memset and save. M=d1: 64 tiles. N=d2: 16 unified tiles (fp32). `save_tensor_block` handles PSUM→SBUF→HBM internally. |
 
 **Lowered NKI kernel** — one self-contained loop nest per op:
 
@@ -587,55 +590,57 @@ import nki.language as nl
 
 @nki.jit
 def matmul(lhs_T, rhs_T):
-    result = nl.ndarray((2048, 8192), dtype=nl.float16, buffer=nl.shared_hbm)
+    result = nl.ndarray((8192, 8192), dtype=nl.float16, buffer=nl.shared_hbm)
 
     """ === Op 0: nc_transpose(rhs_T) → rhs === """
     sbuf_rhs_T = nl.ndarray((128, 4, 1, 128), dtype=nl.float16, buffer=nl.sbuf)
     psum_rhs_temp = nl.ndarray((128, 1, 1, 128), dtype=nl.float16, buffer=nl.psum)
-    sbuf_rhs = nl.ndarray((128, 1, 64, 128), dtype=nl.float16, buffer=nl.sbuf)
-    sbuf_rhs_op1 = sbuf_rhs.reshape((128, 1, 16, 512))
+    sbuf_rhs = nl.ndarray((128, 64, 64, 128), dtype=nl.float16, buffer=nl.sbuf)
+    sbuf_rhs_op1 = sbuf_rhs.reshape((128, 64, 16, 512))
 
-    for i_block_d2 in range(16):
-        for i_block_d0 in range(1):
+    for i_block_d0 in range(64):
+        for i_block_d2 in range(16):
             load_tensor_block(sbuf_rhs_T, rhs_T,
                               par_ofs=i_block_d2 * 512, free_ofs=i_block_d0 * 128)
-            for i_tile_d2 in range(1):
-                for i_tile_d0 in range(1):
-                    for i_ig_d2 in range(4):
-                        for i_ig_d0 in range(1):
+            for i_tile_d0 in range(1):
+                for i_tile_d2 in range(1):
+                    for i_ig_d0 in range(1):
+                        for i_ig_d2 in range(4):
                             ld2 = i_tile_d2 * 4 + i_ig_d2
                             td0 = i_tile_d0 * 1 + i_ig_d0
                             gd2 = i_block_d2 * 4 + ld2
-                            nisa.nc_transpose(psum_rhs_temp[0:128, td0, 0, 0:128],
+                            gd0 = i_block_d0 * 1 + td0
+                            nisa.nc_transpose(psum_rhs_temp[0:128, 0, 0, 0:128],
                                               sbuf_rhs_T[0:128, ld2, td0, 0:128])
-                            nisa.tensor_copy(sbuf_rhs[0:128, td0, gd2, 0:128],
-                                             psum_rhs_temp[0:128, td0, 0, 0:128])
+                            nisa.tensor_copy(sbuf_rhs[0:128, gd0, gd2, 0:128],
+                                             psum_rhs_temp[0:128, 0, 0, 0:128])
 
     """ === Op 1: nc_matmul(lhs_T, rhs) → result === """
     sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), dtype=nl.float16, buffer=nl.sbuf)
-    psum_result = nl.ndarray((128, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)
+    psum_result = nl.ndarray((128, 64, 16, 512), dtype=nl.float32, buffer=nl.psum)
 
-    for i_block_d1 in range(16):
-        for i_block_d2 in range(16):
-            for i_block_d0 in range(1):
+    nisa.memset(psum_result[0:128, 0:64, 0:16, 0:512], value=0.0)
+    for i_block_d0 in range(64):
+        for i_block_d1 in range(64):
+            for i_block_d2 in range(16):
                 load_tensor_block(sbuf_lhs_T, lhs_T,
                                   par_ofs=i_block_d0 * 128, free_ofs=i_block_d1 * 128)
-                nisa.memset(psum_result[0:128, 0, 0, 0:512], value=0.0)
-                for i_tile_d1 in range(1):
-                    for i_tile_d2 in range(1):
-                        for i_tile_d0 in range(1):
-                            for i_ig_d1 in range(1):
-                                for i_ig_d2 in range(1):
-                                    for i_ig_d0 in range(1):
+                for i_tile_d0 in range(1):
+                    for i_tile_d1 in range(1):
+                        for i_tile_d2 in range(1):
+                            for i_ig_d0 in range(1):
+                                for i_ig_d1 in range(1):
+                                    for i_ig_d2 in range(1):
                                         td0 = i_tile_d0 * 1 + i_ig_d0
                                         td1 = i_tile_d1 * 1 + i_ig_d1
                                         d2_ut = i_block_d2 + i_tile_d2
+                                        gd0 = i_block_d0 * 1 + td0
+                                        gd1 = i_block_d1 * 1 + td1
                                         nisa.nc_matmul(
-                                            psum_result[0:128, td1, i_ig_d2, 0:512],
+                                            psum_result[0:128, gd1, d2_ut, 0:512],
                                             sbuf_lhs_T[0:128, td0, td1, 0:128],
-                                            sbuf_rhs_op1[0:128, td0, d2_ut, 0:512])
-                save_tensor_block(result, psum_result,
-                                  par_ofs=i_block_d1 * 128, free_ofs=i_block_d2 * 512)
+                                            sbuf_rhs_op1[0:128, gd0, d2_ut, 0:512])
+    save_tensor_block(result, psum_result, par_ofs=0, free_ofs=0)
 
     return result
 ```

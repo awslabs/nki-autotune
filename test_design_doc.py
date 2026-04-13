@@ -10,8 +10,8 @@ Group B (§6 transforms, tpb=2): tiles_per_block before/after + interleave befor
   K=512 (4 tiles, tpb=2, 2 blocks), M=256 (2 tiles), N=1024 (2 tiles)
 
 Group C (§5.4 naive lowering): transpose + matmul, one loop nest per op
-  result = lhs_T.T @ rhs_T.T, float16
-  d0=128 (1 tile), d1=2048 (16 tiles), d2=8192 (16 unified tiles, ig=4)
+  result = lhs_T.T @ rhs_T.T, float32
+  d0=8192 (64 tiles), d1=8192 (64 tiles), d2=8192 (16 unified tiles, ig=4)
 """
 
 import sys
@@ -283,8 +283,8 @@ def interleave_after(lhs_T: Any, rhs: Any, output: Any) -> None:
 
 """
 ======== Group C: §5.4 naive lowering (transpose + matmul) ========
-d0=128 (1 tile), d1=2048 (16 tiles), d2=8192 (16 unified tiles, ig=4)
-result = lhs_T.T @ rhs_T.T, float16
+d0=8192 (64 tiles), d1=8192 (64 tiles), d2=8192 (16 unified tiles, ig=4)
+result = lhs_T.T @ rhs_T.T, float32
 """
 
 
@@ -296,50 +296,53 @@ def section5_naive(lhs_T: Any, rhs_T: Any, result: Any) -> None:
     Op 0: nc_transpose(rhs_T) → rhs
     sbuf_rhs at min tile size (128) per §4. Matmul reshapes (4,128)→(1,512).
     """
-    sbuf_rhs_T = nl.ndarray((128, 4, 1, 128), dtype=nl.float16, buffer=nl.sbuf)
-    psum_rhs_temp = nl.ndarray((128, 1, 1, 128), dtype=nl.float16, buffer=nl.psum)
-    sbuf_rhs = nl.ndarray((128, 1, 64, 128), dtype=nl.float16, buffer=nl.sbuf)
-    sbuf_rhs_op1 = sbuf_rhs.reshape((128, 1, 16, 512))
+    sbuf_rhs_T = nl.ndarray((128, 4, 1, 128), dtype=rhs_T.dtype, buffer=nl.sbuf)
+    psum_rhs_temp = nl.ndarray((128, 1, 1, 128), dtype=rhs_T.dtype, buffer=nl.psum)
+    sbuf_rhs = nl.ndarray((128, 64, 64, 128), dtype=rhs_T.dtype, buffer=nl.sbuf)
+    sbuf_rhs_op1 = sbuf_rhs.reshape((128, 64, 16, 512))
 
-    for i_block_d2 in range(16):
-        for i_block_d0 in range(1):
+    for i_block_d0 in range(64):
+        for i_block_d2 in range(16):
             load_tensor_block(sbuf_rhs_T, rhs_T, par_ofs=i_block_d2 * 512, free_ofs=i_block_d0 * 128)
-            for i_tile_d2 in range(1):
-                for i_tile_d0 in range(1):
-                    for i_ig_d2 in range(4):
-                        for i_ig_d0 in range(1):
+            for i_tile_d0 in range(1):
+                for i_tile_d2 in range(1):
+                    for i_ig_d0 in range(1):
+                        for i_ig_d2 in range(4):
                             ld2 = i_tile_d2 * 4 + i_ig_d2
                             td0 = i_tile_d0 * 1 + i_ig_d0
                             gd2 = i_block_d2 * 4 + ld2
-                            nisa.nc_transpose(psum_rhs_temp[0:128, td0, 0, 0:128], sbuf_rhs_T[0:128, ld2, td0, 0:128])
-                            nisa.tensor_copy(sbuf_rhs[0:128, td0, gd2, 0:128], psum_rhs_temp[0:128, td0, 0, 0:128])
+                            gd0 = i_block_d0 * 1 + td0
+                            nisa.nc_transpose(psum_rhs_temp[0:128, 0, 0, 0:128], sbuf_rhs_T[0:128, ld2, td0, 0:128])
+                            nisa.tensor_copy(sbuf_rhs[0:128, gd0, gd2, 0:128], psum_rhs_temp[0:128, 0, 0, 0:128])
 
     """
     Op 1: nc_matmul(lhs_T, rhs) → result
     """
-    sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), dtype=nl.float16, buffer=nl.sbuf)
-    psum_result = nl.ndarray((128, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
+    psum_result = nl.ndarray((128, 64, 16, 512), dtype=nl.float32, buffer=nl.psum)
 
-    for i_block_d1 in range(16):
-        for i_block_d2 in range(16):
-            for i_block_d0 in range(1):
+    nisa.memset(psum_result[0:128, 0:64, 0:16, 0:512], value=0.0)
+    for i_block_d0 in range(64):
+        for i_block_d1 in range(64):
+            for i_block_d2 in range(16):
                 load_tensor_block(sbuf_lhs_T, lhs_T, par_ofs=i_block_d0 * 128, free_ofs=i_block_d1 * 128)
-                nisa.memset(psum_result[0:128, 0, 0, 0:512], value=0.0)
-                for i_tile_d1 in range(1):
-                    for i_tile_d2 in range(1):
-                        for i_tile_d0 in range(1):
-                            for i_ig_d1 in range(1):
-                                for i_ig_d2 in range(1):
-                                    for i_ig_d0 in range(1):
+                for i_tile_d0 in range(1):
+                    for i_tile_d1 in range(1):
+                        for i_tile_d2 in range(1):
+                            for i_ig_d0 in range(1):
+                                for i_ig_d1 in range(1):
+                                    for i_ig_d2 in range(1):
                                         td0 = i_tile_d0 * 1 + i_ig_d0
                                         td1 = i_tile_d1 * 1 + i_ig_d1
                                         d2_ut = i_block_d2 + i_tile_d2
+                                        gd0 = i_block_d0 * 1 + td0
+                                        gd1 = i_block_d1 * 1 + td1
                                         nisa.nc_matmul(
-                                            psum_result[0:128, td1, i_ig_d2, 0:512],
+                                            psum_result[0:128, gd1, d2_ut, 0:512],
                                             sbuf_lhs_T[0:128, td0, td1, 0:128],
-                                            sbuf_rhs_op1[0:128, td0, d2_ut, 0:512],
+                                            sbuf_rhs_op1[0:128, gd0, d2_ut, 0:512],
                                         )
-                save_tensor_block(result, psum_result, par_ofs=i_block_d1 * 128, free_ofs=i_block_d2 * 512)
+    save_tensor_block(result, psum_result, par_ofs=0, free_ofs=0)
 
 
 """
@@ -376,9 +379,9 @@ def main() -> None:
     ref_b = lhs_b.T @ rhs_b
 
     """Group C data"""
-    lhs_T_c = np.random.randn(128, 2048).astype(np.float16)
-    rhs_T_c = np.random.randn(8192, 128).astype(np.float16)
-    ref_c = (lhs_T_c.astype(np.float64).T @ rhs_T_c.astype(np.float64).T).astype(np.float16)
+    lhs_T_c = np.random.randn(8192, 8192).astype(np.float32)
+    rhs_T_c = np.random.randn(8192, 8192).astype(np.float32)
+    ref_c = lhs_T_c.T @ rhs_T_c.T
 
     group_a: list[tuple[str, Callable[..., None]]] = [
         ("load_placement/before  (d0,d1,d2)", lp_before),
@@ -426,12 +429,12 @@ def main() -> None:
 
     print()
     print("=" * 70)
-    print("Group C: §5.4 naive lowering — transpose+matmul, float16")
+    print("Group C: §5.4 naive lowering — transpose+matmul, float32")
     print("=" * 70)
-    result_c = np.zeros((2048, 8192), dtype=np.float16)
+    result_c = np.zeros((8192, 8192), dtype=np.float32)
     nki.simulate(section5_naive)(lhs_T_c, rhs_T_c, result_c)
-    max_err = float(np.max(np.abs(result_c.astype(np.float64) - ref_c.astype(np.float64))))
-    ok = bool(np.allclose(result_c, ref_c, rtol=1e-2, atol=1e-2))
+    max_err = float(np.max(np.abs(result_c - ref_c)))
+    ok = bool(np.allclose(result_c, ref_c, rtol=1e-3, atol=1e-3))
     status = "PASS" if ok else "FAIL"
     print(f"  [{status}] {'section5/naive (transpose+matmul)':40s}  max_err={max_err:.2e}")
     if not ok:
