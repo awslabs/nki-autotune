@@ -107,7 +107,6 @@ def _emit_header(
         shape, dtype_str = _parse_input_spec(input_specs[name])
         shape_str = ", ".join(str(s) for s in shape)
         lines.append(f"{_INDENT}assert {name}.shape == ({shape_str})")
-        lines.append(f"{_INDENT}assert {name}.dtype == nl.{dtype_str}")
     return lines
 
 

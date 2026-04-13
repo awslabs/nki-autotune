@@ -238,18 +238,20 @@ def _process_host_outputs(
     return all_results, all_compiler_logs
 
 
-def _write_cache_files(cache_dir: str, kernels: dict[str, KernelJob], compiler_logs: dict[str, str]) -> None:
-    """Write kernel sources and compiler logs to cache directory."""
+def write_kernel_sources(cache_dir: str, kernels: dict[str, KernelJob]) -> None:
+    """Write kernel source files to cache before dispatching to workers."""
     nki_dir = os.path.join(cache_dir, "nki")
-    neff_dir = os.path.join(cache_dir, "neff")
     os.makedirs(nki_dir, exist_ok=True)
-    os.makedirs(neff_dir, exist_ok=True)
-
     for kname, job in kernels.items():
         filename = kname if kname.endswith(".py") else f"{kname}.py"
         with open(os.path.join(nki_dir, filename), "w") as f:
             f.write(job.source)
 
+
+def _write_compiler_logs(cache_dir: str, compiler_logs: dict[str, str]) -> None:
+    """Write compiler logs to cache directory."""
+    neff_dir = os.path.join(cache_dir, "neff")
+    os.makedirs(neff_dir, exist_ok=True)
     for kname, log_text in compiler_logs.items():
         stem = Path(kname).stem
         log_dir = os.path.join(neff_dir, stem)
@@ -370,6 +372,7 @@ class RemoteProfiler:
 
     def save_cache(self, cache_dir: str, kernels: dict[str, KernelJob], results: list[ProfileResult]) -> None:
         """Save profile results to disk following the standard cache layout."""
-        _write_cache_files(cache_dir, kernels, self.compiler_logs)
+        write_kernel_sources(cache_dir, kernels)
+        _write_compiler_logs(cache_dir, self.compiler_logs)
         _write_results_json(cache_dir, kernels, results, self)
         logger.info("Cache saved to %s", cache_dir)

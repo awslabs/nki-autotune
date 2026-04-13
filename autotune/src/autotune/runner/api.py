@@ -1,12 +1,14 @@
 """Convenience API for remote NKI kernel profiling."""
 
 from autotune.runner.output import ProfileOutput
-from autotune.runner.remote import RemoteProfiler
+from autotune.runner.remote import RemoteProfiler, write_kernel_sources
 from autotune.runner.types import KernelJob, ProfileConfig, ProfileResult
 
 
 def _run_and_cache(profiler: RemoteProfiler, kernels: dict[str, KernelJob], cache_dir: str) -> list[ProfileResult]:
     """Execute profiling and optionally save cache."""
+    if cache_dir:
+        write_kernel_sources(cache_dir, kernels)
     results = profiler.profile(kernels)
     if cache_dir:
         profiler.save_cache(cache_dir, kernels, results)
