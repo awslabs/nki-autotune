@@ -1,17 +1,9 @@
 """
 NKI CPU simulator correctness tests for design doc code examples.
 
-Group A (§6 transforms, tpb=1): load_placement before/after + 6 loop orderings
-  C = lhs_T.T @ rhs, float32
-  K=256 (2 tiles), M=256 (2 tiles), N=1024 (2 tiles)
-
-Group B (§6 transforms, tpb=2): tiles_per_block before/after + interleave before/after
-  C = lhs_T.T @ rhs, float32
-  K=512 (4 tiles, tpb=2, 2 blocks), M=256 (2 tiles), N=1024 (2 tiles)
-
-Group C (§5.4 naive lowering): transpose + matmul, one loop nest per op
-  result = lhs_T.T @ rhs_T.T, float32
-  d0=8192 (64 tiles), d1=8192 (64 tiles), d2=8192 (16 unified tiles, ig=4)
+Group A (§6, tpb=1): load_placement + 6 loop orderings. K=256, M=256, N=1024.
+Group B (§6, tpb=2): tiles_per_block + interleave. K=512, M=256, N=1024.
+Group C (§5.4): naive lowering — single matmul and transpose+matmul, MNK=8192.
 """
 
 import sys
@@ -282,7 +274,47 @@ def interleave_after(lhs_T: Any, rhs: Any, output: Any) -> None:
 
 
 """
-======== Group C: §5.4 naive lowering (transpose + matmul) ========
+======== Group C: §5.4 naive lowering ========
+"""
+
+
+"""
+C1: single matmul — K=d0 outermost, full PSUM accum
+d0=8192 (K, 64 blocks), d1=8192 (M, 64 blocks), d2=8192 (N, 16 blocks)
+result = lhs_T.T @ rhs, float32
+"""
+
+
+@nki.jit
+def section5_matmul(lhs_T: Any, rhs: Any, result: Any) -> None:
+    """§5.4 lowered kernel: single nc_matmul, K outermost."""
+
+    sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
+    sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
+    psum_result = nl.ndarray((128, 64, 16, 512), dtype=nl.float32, buffer=nl.psum)
+
+    nisa.memset(psum_result[0:128, 0:64, 0:16, 0:512], value=0.0)
+    for i_block_d0 in range(64):
+        for i_block_d1 in range(64):
+            for i_block_d2 in range(16):
+                load_tensor_block(sbuf_lhs_T, lhs_T, par_ofs=i_block_d0 * 128, free_ofs=i_block_d1 * 128)
+                load_tensor_block(sbuf_rhs, rhs, par_ofs=i_block_d0 * 128, free_ofs=i_block_d2 * 512)
+                for i_tile_d0 in range(1):
+                    for i_tile_d1 in range(1):
+                        for i_tile_d2 in range(1):
+                            for i_ig_d0 in range(1):
+                                for i_ig_d1 in range(1):
+                                    for i_ig_d2 in range(1):
+                                        nisa.nc_matmul(
+                                            psum_result[0:128, i_block_d1, i_block_d2, 0:512],
+                                            sbuf_lhs_T[0:128, 0, 0, 0:128],
+                                            sbuf_rhs[0:128, 0, 0, 0:512],
+                                        )
+    save_tensor_block(result, psum_result, par_ofs=0, free_ofs=0)
+
+
+"""
+C2: transpose + matmul — interleave asymmetry on d2
 d0=8192 (64 tiles), d1=8192 (64 tiles), d2=8192 (16 unified tiles, ig=4)
 result = lhs_T.T @ rhs_T.T, float32
 """
@@ -378,10 +410,15 @@ def main() -> None:
     rhs_b = np.random.randn(kb, nb).astype(np.float32)
     ref_b = lhs_b.T @ rhs_b
 
-    """Group C data"""
-    lhs_T_c = np.random.randn(8192, 8192).astype(np.float32)
-    rhs_T_c = np.random.randn(8192, 8192).astype(np.float32)
-    ref_c = lhs_T_c.T @ rhs_T_c.T
+    """Group C data — single matmul"""
+    lhs_T_c1 = np.random.randn(8192, 8192).astype(np.float32)
+    rhs_c1 = np.random.randn(8192, 8192).astype(np.float32)
+    ref_c1 = lhs_T_c1.T @ rhs_c1
+
+    """Group C data — transpose + matmul"""
+    lhs_T_c2 = np.random.randn(8192, 8192).astype(np.float32)
+    rhs_T_c2 = np.random.randn(8192, 8192).astype(np.float32)
+    ref_c2 = lhs_T_c2.T @ rhs_T_c2.T
 
     group_a: list[tuple[str, Callable[..., None]]] = [
         ("load_placement/before  (d0,d1,d2)", lp_before),
@@ -429,12 +466,22 @@ def main() -> None:
 
     print()
     print("=" * 70)
-    print("Group C: §5.4 naive lowering — transpose+matmul, float32")
+    print("Group C: §5.4 naive lowering, float32")
     print("=" * 70)
-    result_c = np.zeros((8192, 8192), dtype=np.float32)
-    nki.simulate(section5_naive)(lhs_T_c, rhs_T_c, result_c)
-    max_err = float(np.max(np.abs(result_c - ref_c)))
-    ok = bool(np.allclose(result_c, ref_c, rtol=1e-3, atol=1e-3))
+
+    result_c1 = np.zeros((8192, 8192), dtype=np.float32)
+    nki.simulate(section5_matmul)(lhs_T_c1, rhs_c1, result_c1)
+    max_err = float(np.max(np.abs(result_c1 - ref_c1)))
+    ok = bool(np.allclose(result_c1, ref_c1, rtol=1e-3, atol=1e-3))
+    status = "PASS" if ok else "FAIL"
+    print(f"  [{status}] {'section5/matmul (single matmul)':40s}  max_err={max_err:.2e}")
+    if not ok:
+        all_passed = False
+
+    result_c2 = np.zeros((8192, 8192), dtype=np.float32)
+    nki.simulate(section5_naive)(lhs_T_c2, rhs_T_c2, result_c2)
+    max_err = float(np.max(np.abs(result_c2 - ref_c2)))
+    ok = bool(np.allclose(result_c2, ref_c2, rtol=1e-3, atol=1e-3))
     status = "PASS" if ok else "FAIL"
     print(f"  [{status}] {'section5/naive (transpose+matmul)':40s}  max_err={max_err:.2e}")
     if not ok:
@@ -442,7 +489,7 @@ def main() -> None:
 
     print()
     if all_passed:
-        print("All 12 kernels PASSED.")
+        print("All 13 kernels PASSED.")
     else:
         print("Some kernels FAILED.")
         sys.exit(1)

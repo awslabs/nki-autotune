@@ -83,10 +83,12 @@ def emit_outer_loops(
     tpb_hbm_by_dim: dict[str, int],
     tpb_psum_by_dim: dict[str, int],
 ) -> list[str]:
-    """Emit outer block/psum_batch/tile loop nest for dimensions in order.
+    """Emit outer block/psum_batch/tile loop nest in per-phase order.
 
-    Each dimension gets three loops — ``i_block``, ``i_psum_batch``,
-    ``i_tile`` — producing ``3 * len(dim_order)`` nesting levels.
+    Per-phase grouping: all block loops outermost, then all
+    psum_batch loops, then all tile loops.  Within each phase,
+    dimensions follow ``dim_order``.  Produces
+    ``3 * len(dim_order)`` nesting levels.
 
     Args:
         dim_order: Ordered dimension IDs for the outer loops.
@@ -97,13 +99,15 @@ def emit_outer_loops(
     Returns:
         List of loop source lines with appropriate indentation.
     """
+    n = len(dim_order)
     lines: list[str] = []
     for i, dim_id in enumerate(dim_order):
-        base = i * 3
+        lines.append(f"{ind(i)}for i_block_{dim_id} in range({num_blocks_by_dim[dim_id]}):")
+    for i, dim_id in enumerate(dim_order):
         psum_batches = tpb_hbm_by_dim[dim_id] // tpb_psum_by_dim[dim_id]
-        lines.append(f"{ind(base)}for i_block_{dim_id} in range({num_blocks_by_dim[dim_id]}):")
-        lines.append(f"{ind(base + 1)}for i_psum_batch_{dim_id} in range({psum_batches}):")
-        lines.append(f"{ind(base + 2)}for i_tile_{dim_id} in range({tpb_psum_by_dim[dim_id]}):")
+        lines.append(f"{ind(n + i)}for i_psum_batch_{dim_id} in range({psum_batches}):")
+    for i, dim_id in enumerate(dim_order):
+        lines.append(f"{ind(2 * n + i)}for i_tile_{dim_id} in range({tpb_psum_by_dim[dim_id]}):")
     return lines
 
 
