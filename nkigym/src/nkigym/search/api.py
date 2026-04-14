@@ -5,12 +5,14 @@ expansion — it renders the base IR, grows the graph to
 ``num_variants`` nodes, and submits every variant for profiling.
 """
 
+import functools
 import random
 
 from autotune.runner.api import remote_profile
 from autotune.runner.output import ProfileOutput
 from autotune.runner.types import KernelJob
-from nkigym.codegen.render import KernelIR, render_ir
+from nkigym.codegen.ir import KernelIR
+from nkigym.codegen.render import render_ir
 from nkigym.search.graph import TransformGraph
 from nkigym.transforms import Transform
 from nkigym.transforms.loop_fusion import LoopFusion
@@ -53,7 +55,8 @@ def remote_search(
     """
     active_transforms = transforms if transforms is not None else list(_DEFAULT_TRANSFORMS)
 
-    graph = TransformGraph(base_ir=initial_kernel, render_fn=render_ir, transforms=active_transforms)
+    render_fn = functools.partial(render_ir, simplify=True)
+    graph = TransformGraph(base_ir=initial_kernel, render_fn=render_fn, transforms=active_transforms)
     rng = random.Random(seed)
     graph.expand(num_variants=num_variants, rng=rng)
 

@@ -1,8 +1,9 @@
-"""NKIOp base class with __call__ simulation and RenderContext.
+"""NKIOp base class with __call__ simulation.
 
 Each NKIOp subclass maps 1:1 to a real nisa.* ISA instruction.
-Subclasses implement __call__() for CPU simulation (numpy at float64)
-and render() for emitting NKI source lines.
+Subclasses implement __call__() for CPU simulation (numpy at float64),
+declare axis semantics and hardware limits via class attributes, and
+provide format_isa_call() for the generic renderer.
 """
 
 from abc import abstractmethod
@@ -12,14 +13,14 @@ from typing import Any, ClassVar
 
 @dataclass
 class Tensor:
-    """A tensor visible in the current rendering scope.
+    """A tensor tracked during dimension analysis.
 
     Attributes:
         name: Tensor name (e.g. ``"lhs_T"``).
         shape: Full shape (e.g. ``(2048, 2048)``).
         dtype: Dtype string (e.g. ``"bfloat16"``).
-        location: Where it lives: ``"hbm"``, ``"sbuf"``, or ``"psum"``.
-        dim_ids: Axis label for each dimension (e.g. ``("K", "M")``).
+        location: Initial location hint (``"hbm"`` for inputs).
+        dim_ids: Concrete dimension IDs assigned by analysis.
     """
 
     name: str
@@ -31,85 +32,45 @@ class Tensor:
 
 @dataclass
 class RenderContext:
-    """Running context passed to each NKIOp.render().
+    """Mutable context used during dimension analysis in build_ir.
 
-    The renderer builds this from input_specs (HBM tensors),
-    then passes it to each op. Ops read their inputs from
-    tensors and can add new tensors (SBUF/PSUM buffers).
-
-    Attributes:
-        tensors: All tensors in scope, keyed by name.
-        kwargs: Non-tensor keyword arguments from the op call.
-        dim_tiles: Maps dim ID to max tile size (max across ops).
-        dim_min_tiles: Maps dim ID to min tile size (min across ops).
-            ``interleave = dim_tiles[d] // dim_min_tiles[d]``.
-        dim_tpb_hbm: Maps dim ID to tiles per HBM block (tunable, default 1).
-        dim_tpb_psum: Maps dim ID to tiles per PSUM batch (tunable, default tpb_hbm).
+    Holds tensors discovered so far so that later ops can
+    reference earlier ops' outputs and unify shared dimensions.
     """
 
     tensors: dict[str, Tensor] = field(default_factory=dict)
-    kwargs: dict[str, Any] = field(default_factory=dict)
-    dim_tiles: dict[str, int] = field(default_factory=dict)
-    dim_min_tiles: dict[str, int] = field(default_factory=dict)
-    dim_tpb_hbm: dict[str, int] = field(default_factory=dict)
-    dim_tpb_psum: dict[str, int] = field(default_factory=dict)
 
 
 class NKIOp:
     """Base for all NKI operator definitions.
 
-    Subclasses define:
-    - NAME: maps to the nisa.* call name
-    - OPERAND_AXES: maps operand name to axis label tuple
-    - OUTPUT_AXES: maps output name to axis label tuple
+    Subclasses define axis semantics, hardware limits, ISA call
+    format, and CPU simulation.  The generic renderer reads these
+    class attributes — no op-specific logic lives in the renderer.
 
     Attributes:
-        NAME: Registry key and ISA call name.
+        NAME: ISA call name (e.g. ``"nc_matmul"``).
         OPERAND_AXES: Maps operand name to axis label tuple.
         OUTPUT_AXES: Maps output name to axis label tuple.
+        BLOCKING_AXES: Accumulation axes (e.g. ``{"K"}`` for matmul).
+        TILE_LIMITS: Hardware tile size per abstract axis.
+        ISA_LOC: Where the ISA writes output (``"psum"`` or ``"sbuf"``).
+        PSUM_DTYPE: Override dtype for PSUM buffer (``None`` = input dtype).
     """
 
     NAME: ClassVar[str] = ""
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
+    TILE_LIMITS: ClassVar[dict[str, int]] = {}
+    ISA_LOC: ClassVar[str] = "sbuf"
+    PSUM_DTYPE: ClassVar[str | None] = None
 
     @abstractmethod
     def __call__(self, **kwargs: Any) -> Any:
         """CPU simulation using numpy at float64 precision."""
 
-    @abstractmethod
-    def render(
-        self,
-        ctx: RenderContext,
-        operand_map: dict[str, str],
-        output_name: str,
-        is_final: bool,
-        *,
-        dim_order: tuple[str, ...] | None = None,
-    ) -> list[str]:
-        """Emit full NKI source lines for standalone rendering."""
-
-    def render_inner(
-        self,
-        ctx: RenderContext,
-        operand_map: dict[str, str],
-        output_name: str,
-        is_final: bool,
-        *,
-        pre_allocated: frozenset[str] = frozenset(),
-        inner_depth: int = 6,
-    ) -> list[str]:
-        """Emit inner lines for fused rendering (no outer block/tile loops).
-
-        Override in subclasses that support fusion. Default raises.
-
-        Args:
-            ctx: Running render context.
-            operand_map: Maps op slot name to tensor name.
-            output_name: Output tensor name.
-            is_final: Whether this is the final output.
-            pre_allocated: Buffer names already allocated by the caller.
-            inner_depth: Nesting depth at which inner lines start.
-        """
-        raise NotImplementedError(f"{self.NAME} does not support fused rendering")
+    @classmethod
+    def format_isa_call(cls, dst_expr: str, operand_exprs: dict[str, str]) -> str:
+        """Format the nisa.* ISA call string from dst and operand expressions."""
+        raise NotImplementedError(f"{cls.NAME} must implement format_isa_call")

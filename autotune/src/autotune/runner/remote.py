@@ -22,12 +22,13 @@ from autotune.runner.types import _DEFAULT_VENV_PYTHON, KernelJob, ProfileResult
 logger = logging.getLogger(__name__)
 
 _AUTOTUNE_ROOT = Path(__file__).parent.parent
+_NKIGYM_ROOT = Path(__file__).resolve().parents[4] / "nkigym" / "src" / "nkigym"
 
 _worker_bundle_cache: bytes = b""
 
 
 def _get_worker_bundle() -> bytes:
-    """Build a base64-encoded bundle of the autotune package.
+    """Build a base64-encoded bundle of the autotune and nkigym packages.
 
     The bundle is a JSON dict mapping relative path to source code.
     Sent as the first line of stdin to the bootstrap script on each
@@ -37,9 +38,10 @@ def _get_worker_bundle() -> bytes:
     if not _worker_bundle_cache:
         bundle: dict[str, str] = {}
         bundle["worker.py"] = (_AUTOTUNE_ROOT / "runner" / "worker.py").read_text()
-        for py_file in sorted(_AUTOTUNE_ROOT.rglob("*.py")):
-            rel = py_file.relative_to(_AUTOTUNE_ROOT.parent)
-            bundle[str(rel)] = py_file.read_text()
+        for pkg_root in [_AUTOTUNE_ROOT, _NKIGYM_ROOT]:
+            for py_file in sorted(pkg_root.rglob("*.py")):
+                rel = py_file.relative_to(pkg_root.parent)
+                bundle[str(rel)] = py_file.read_text()
         _worker_bundle_cache = base64.b64encode(json.dumps(bundle).encode("utf-8"))
     return _worker_bundle_cache
 

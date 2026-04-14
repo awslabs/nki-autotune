@@ -8,7 +8,8 @@ NKI kernel source.
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
-from nkigym.codegen.render import KernelIR, render_ir
+from nkigym.codegen.ir import KernelIR
+from nkigym.codegen.render import render_ir
 
 __all__ = ["Transform", "render_ir"]
 

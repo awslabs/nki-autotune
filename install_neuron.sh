@@ -9,7 +9,7 @@
 #
 set -euo pipefail
 
-HOSTS=(gym-6)
+HOSTS=(gym-1 gym-2 gym-3 gym-4 gym-5)
 WHEEL_DIR="/home/ubuntu/shared_workplace/artifacts"
 REMOTE_WHEEL_DIR="/tmp/nki-wheels"
 VENV_DIR="/home/ubuntu/venvs/kernel-env"

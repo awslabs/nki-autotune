@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from autotune.runner.compare import assert_close
-from nkigym.codegen.render import build_ir
+from nkigym.codegen.render import build_ir, render_ir
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.search.api import remote_search
 
@@ -62,6 +62,9 @@ if __name__ == "__main__":
     print(status)
     input_specs = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
     ir = build_ir(matmul_nkigym, input_specs=input_specs)
+    print(ir)
+    source = render_ir(ir, simplify=False)
+    print(source)
 
     golden_source = inspect.getsource(matmul_numpy)
     cache_dir = Path("/home/ubuntu/cache/matmul_test")
@@ -71,7 +74,7 @@ if __name__ == "__main__":
         initial_kernel=ir,
         golden_source=golden_source,
         golden_func_name="matmul_numpy",
-        hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5", "gym-6"],
+        hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5"],
         cache_dir=str(cache_dir),
         num_variants=10,
         transforms=[],
