@@ -16,15 +16,21 @@ Usage::
     python examples/rmsnorm_matmul.py
 """
 
+import shutil
+from pathlib import Path
+
 import numpy as np
 
 from autotune.runner.compare import assert_close
 from nkigym.dim_analysis.dim_analysis import analyze_dims
+from nkigym.graph_analysis.op_graph import build_op_graph
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.transpose import NKITranspose
+
+CACHE_DIR = Path("/home/ubuntu/cache/rmsnorm_matmul")
 
 EPS = 1e-6
 
@@ -77,6 +83,12 @@ if __name__ == "__main__":
     status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
     print(f"rmsnorm_matmul: {status}")
 
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    CACHE_DIR.mkdir(parents=True)
+
     input_specs = {"a": ((M, K), "bfloat16"), "b": ((K, N), "bfloat16")}
     da = analyze_dims(rmsnorm_matmul_nkigym, input_specs)
-    print(da)
+    (CACHE_DIR / "dim_analysis.txt").write_text(repr(da))
+
+    graph = build_op_graph(rmsnorm_matmul_nkigym)
+    graph.render(CACHE_DIR / "op_graph")

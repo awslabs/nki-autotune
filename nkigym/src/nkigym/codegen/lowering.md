@@ -44,7 +44,7 @@ Each op contributes 3 loops per dimension: block, tile, and interleave. Loops ar
 | Tile | `i_tile_d{id}` | `tpb` | Tiles within a block |
 | Interleave | `i_ig_d{id}` | `d{int}_tiles_per_op` | Per-op sub-tile iteration |
 
-### 1.2 Tiling Example
+### 1.5 Tiling Example
 
 ```python
 Q_t = GymTranspose()(Q)
@@ -113,38 +113,7 @@ The interleave trip of **4** in op1/d2 is the key asymmetry: the matmul forces `
 
 The pipeline: **math function →** `build_ir` **→ KernelIR → online fusion → KernelIR → programmatic transforms → KernelIR →** `render_ir` **→ NKI source → test + profile.** `KernelIR` is the structured representation that all transforms operate on, avoiding repeated AST parsing of NKI source for every variant. `build_ir(func, input_specs)` constructs the initial IR once (dimension analysis, tiling, default transform state). Online fusion greedily applies all detected math-level optimizations, producing a single KernelIR with blocking barriers eliminated. Programmatic transforms then clone and modify the transform state to produce variant candidates — all within `KernelIR`, no source generation yet. `render_ir(ir)` mechanically lowers any `KernelIR` — initial or transformed — to NKI source.
 
-### 2.1 Computation DAG
-
-```python
-@dataclass
-class OpInfo:
-    """Node in the computation DAG."""
-    op_type: str
-    operands: dict[str, str]    # role → tensor_name
-    output: str                 # output tensor name
-    dim_map: dict[str, str]     # abstract_axis → dim_id
-    per_dim: dict[str, OpDimInfo]
-    predecessors: list[int]     # indices of ops that produce this op's inputs
-
-
-@dataclass
-class OpGraph:
-    """Computation DAG — ops in topological order with explicit edges."""
-    nodes: list[OpInfo]         # topological order, indexed by op_idx
-    tensor_producers: dict[str, int]
-    """
-    tensor_name → op_idx that produces it.
-    Absent for kernel inputs (HBM).
-    Inverse of OpInfo.output — together with predecessors,
-    gives both forward and backward traversal of the DAG.
-    """
-```
-
-**Immutable state** — produced by `build_ir`, shared across all transform variants:
-- `dims`, `tensors`, `op_graph`: full results of dimension analysis and tiling. The `OpGraph` stores ops in topological order with explicit predecessor edges and a `tensor_producers` map for reverse lookup.
-- Signature fields: `func_name`, `param_names`, `return_name`.
-
-### 2.2 Generic Lowering
+### 2.1 Generic Lowering
 
 `render_ir(ir)` mechanically converts any `KernelIR` — initial or transformed — to NKI source. The same renderer handles all variants by reading the transform state and applying dependency-based statement placement.
 
@@ -178,19 +147,19 @@ class OpGraph:
 
 6. **DMA store.** `save_tensor_block` after K's last iteration. Handles PSUM→SBUF staging internally.
 
-### 2.3 Initial KernelIR Conventions
+### 2.2 Initial KernelIR Conventions
 
 `build_ir` produces the initial KernelIR with these defaults — the most naive, mechanical lowering with no optimization choices. Every field starts at its simplest value; transforms improve from here.
 
 - **`tiles_per_block = 1`** for all (op, dim). Block loops carry the full tile count; tile loops are `range(1)`.
 - **`load_placements = {}`** (absent). All loads after the block phase, before tile phase.
 - **`buffer_degrees = 1`** for all (group, tensor, dim). Single-buffered.
-- **`loop_order`**: per-phase grouping (§1.1) — blocks outermost, tiles middle, igs inner. Dimensions in order of first appearance (d0, d1, d2, ...).
+- **`loop_order`**: per-phase grouping (§1.4) — blocks outermost, tiles middle, igs inner. Dimensions in order of first appearance (d0, d1, d2, ...).
 - **`fusion_groups = [[0], [1], ...]`** — each op in its own group. Intermediate tensors fully materialized in cross-group SBUF buffers.
 
 The initial `loop_order` uses dimension ID order because it is a neutral starting point that makes no assumptions about which dimension benefits from being outermost or innermost. Loop reordering transforms explore the space of valid orderings from here. When an accumulation dimension (K) appears early in the numbering, it ends up outermost, and the PSUM accumulator must hold all inner-dimension output tiles between memset and save. This can produce buffers too large for hardware PSUM — that is expected. The initial IR is not required to fit on hardware; transforms shrink buffers by reordering loops (moving K innermost) or adjusting `tiles_per_block`.
 
-### 2.4 Initial KernelIR Examples
+### 2.3 Initial KernelIR Examples
 
 #### Single matmul
 
@@ -369,7 +338,7 @@ ir = KernelIR(
 )
 ```
 
-**Derived loop trip counts** from §1.1 formulas:
+**Derived loop trip counts** from §1.4 formulas:
 
 Op 0 (transpose), loop order d0 → d2:
 

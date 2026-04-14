@@ -15,12 +15,18 @@ Usage::
     python examples/double_matmul.py
 """
 
+import shutil
+from pathlib import Path
+
 import numpy as np
 
 from autotune.runner.compare import assert_close
 from nkigym.dim_analysis.dim_analysis import analyze_dims
+from nkigym.graph_analysis.op_graph import build_op_graph
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
+
+CACHE_DIR = Path("/home/ubuntu/cache/double_matmul")
 
 
 def double_matmul_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
@@ -72,6 +78,12 @@ if __name__ == "__main__":
     status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
     print(f"double_matmul: {status}")
 
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    CACHE_DIR.mkdir(parents=True)
+
     input_specs = {"Q": ((seq_q, d_k), "bfloat16"), "K": ((seq_k, d_k), "bfloat16"), "V": ((seq_k, d_v), "bfloat16")}
     da = analyze_dims(double_matmul_nkigym, input_specs)
-    print(da)
+    (CACHE_DIR / "dim_analysis.txt").write_text(repr(da))
+
+    graph = build_op_graph(double_matmul_nkigym)
+    graph.render(CACHE_DIR / "op_graph")

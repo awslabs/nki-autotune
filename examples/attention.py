@@ -21,10 +21,14 @@ Usage::
     python examples/attention.py
 """
 
+import shutil
+from pathlib import Path
+
 import numpy as np
 
 from autotune.runner.compare import assert_close
 from nkigym.dim_analysis.dim_analysis import analyze_dims
+from nkigym.graph_analysis.op_graph import build_op_graph
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.affine_select import NKIAffineSelect
@@ -32,6 +36,8 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.tensor_reduce import NKITensorReduce
 from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.transpose import NKITranspose
+
+CACHE_DIR = Path("/home/ubuntu/cache/attention")
 
 
 def attention_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
@@ -104,10 +110,16 @@ if __name__ == "__main__":
     status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
     print(f"attention: {status}")
 
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    CACHE_DIR.mkdir(parents=True)
+
     input_specs = {
         "Q": ((seq_len, d_k), "bfloat16"),
         "K": ((seq_len, d_k), "bfloat16"),
         "V": ((seq_len, d_v), "bfloat16"),
     }
     da = analyze_dims(attention_nkigym, input_specs)
-    print(da)
+    (CACHE_DIR / "dim_analysis.txt").write_text(repr(da))
+
+    graph = build_op_graph(attention_nkigym)
+    graph.render(CACHE_DIR / "op_graph")
