@@ -2,17 +2,17 @@
 
 *Single-loop-nest transform — operates on one fusion group's loop nest. Fusing loop nests is handled by online fusion and loop fusion.*
 
-`tiles_per_block` groups consecutive unified tiles into blocks, changing the dimension's iteration granularity and staging buffer sizes.
+`tiles_per_block` groups consecutive dimension tiles into blocks, changing the dimension's iteration granularity and staging buffer sizes.
 
-$$\texttt{unified\_tiles} = \frac{\texttt{dim\_size}}{\texttt{max\_tile\_size}} = \texttt{num\_blocks} \times \texttt{tiles\_per\_block}$$
+$$\texttt{dimension\_tiles} = \frac{\texttt{dim\_size}}{\texttt{max\_tile\_size}} = \texttt{num\_blocks} \times \texttt{tiles\_per\_block}$$
 
-Must divide `unified_tiles`. Default is 1. Setting to T:
+Must divide `dimension_tiles`. Default is 1. Setting to T:
 
-1. **Loop trip count.** The dimension's loop iterates `num_blocks` times instead of `unified_tiles`.
+1. **Loop trip count.** The dimension's loop iterates `num_blocks` times instead of `dimension_tiles`.
 2. **Staging buffers.** Buffers for tensors that depend on the dimension grow from 1 to T tiles on that dimension's axis. `load_tensor_block` has built-in loops over all tile slots — the buffer shape drives how many tiles are loaded per call.
 3. **Compute iteration.** Single-tile ops (e.g. `nc_matmul`) iterate over the T tiles in the buffer within each block.
 
-The transform applies independently to each dimension — any combination of per-dimension values is valid as long as each divides the dimension's `unified_tiles`.
+The transform applies independently to each dimension — any combination of per-dimension values is valid as long as each divides the dimension's `dimension_tiles`.
 
 Two other transforms build on the block structure:
 
@@ -21,7 +21,7 @@ Two other transforms build on the block structure:
 
 ## Example
 
-Matmul from loop_reordering.md: `lhs_T(K=d0, M=d1) × rhs(K=d0, N=d2) → result(d1, d2)` with d0 (K, tile=128, 16 unified tiles), d1 (M, tile=128, 16 unified tiles), d2 (N, tile=512, 4 unified tiles). Order (d0, d1, d2). lhs_T depends on (d0, d1); rhs depends on (d0, d2).
+Matmul from loop_reordering.md: `lhs_T(K=d0, M=d1) × rhs(K=d0, N=d2) → result(d1, d2)` with d0 (K, tile=128, 16 dimension tiles), d1 (M, tile=128, 16 dimension tiles), d2 (N, tile=512, 4 dimension tiles). Order (d0, d1, d2). lhs_T depends on (d0, d1); rhs depends on (d0, d2).
 
 **Before** — `tiles_per_block_d0 = 1` (default, 16 blocks of 1 tile):
 
@@ -114,4 +114,4 @@ class TilesPerBlock(Transform):
         return results
 ```
 
-Candidates only increase `tiles_per_block` — all valid divisors greater than the current value are explored in a single step. Dimensions where tile-level multi-buffer has degree $D > 1$ are excluded — changing `tiles_per_block` would break the buffer's tile-loop indexing (detected by $D = \texttt{tiles\_per\_block}[d]$, since tile-level multi-buffer sets both `buffer_degrees` and `tiles_per_block` to $D$). Values are constrained to divisors of `unified_tiles`, so some block sizes are unreachable for input sizes where `unified_tiles` has few factors.
+Candidates only increase `tiles_per_block` — all valid divisors greater than the current value are explored in a single step. Dimensions where tile-level multi-buffer has degree $D > 1$ are excluded — changing `tiles_per_block` would break the buffer's tile-loop indexing (detected by $D = \texttt{tiles\_per\_block}[d]$, since tile-level multi-buffer sets both `buffer_degrees` and `tiles_per_block` to $D$). Values are constrained to divisors of `dimension_tiles`, so some block sizes are unreachable for input sizes where `dimension_tiles` has few factors.

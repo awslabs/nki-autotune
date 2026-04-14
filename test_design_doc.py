@@ -315,7 +315,7 @@ def section5_matmul(lhs_T: Any, rhs: Any, result: Any) -> None:
 
 """
 C2: transpose + matmul — interleave asymmetry on d2
-d0=8192 (64 tiles), d1=8192 (64 tiles), d2=8192 (16 unified tiles, ig=4)
+d0=8192 (64 tiles), d1=8192 (64 tiles), d2=8192 (16 dimension tiles, ig=4)
 result = lhs_T.T @ rhs_T.T, float32
 """
 

@@ -1,9 +1,9 @@
-"""Dimension analysis (design doc section 3).
+"""Dimension analysis: ID assignment, tile sizes, data-parallel classification.
 
-Forward pass over all ops assigns concrete dimension IDs and
-computes per-dimension unified/min tile sizes and per-op tiling
-parameters.  No tensor starts with dimension IDs -- they are
-discovered automatically from op structure.
+Forward pass over all ops produces three results per dimension:
+  1. A concrete dimension ID (d0, d1, ...)
+  2. A tile size (max of hardware tile limits across ops)
+  3. A data-parallel vs reduction classification
 
 Usage::
 
@@ -24,28 +24,27 @@ from nkigym.ops.base import NKIOp
 
 @dataclass
 class DimInfo:
-    """Per-dimension global info, computed once by analyze_dims.
+    """Per-dimension analysis result.
 
     Attributes:
         dim_size: Total number of elements along this dimension.
-        unified_tile_size: max(all op tile limits) on this dimension,
-            clamped to dim_size.
+        tile_size: max(all op tile limits) on this dimension,
+            clamped to dim_size. Referred to as d{i}_tile_size.
         min_tile_size: min(all op tile limits) on this dimension,
-            clamped to dim_size.
+            clamped to dim_size. Referred to as d{i}_min_tile_size.
+        is_data_parallel: True if this dimension appears in the
+            kernel's return tensor.
     """
 
     dim_size: int
-    unified_tile_size: int
+    tile_size: int
     min_tile_size: int
-
-    def __repr__(self) -> str:
-        """Compact single-line summary."""
-        return f"DimInfo(size={self.dim_size}," f" unified={self.unified_tile_size}," f" min={self.min_tile_size})"
+    is_data_parallel: bool
 
 
 @dataclass
 class TensorInfo:
-    """Per-tensor info, computed once by analyze_dims.
+    """Per-tensor analysis result.
 
     Attributes:
         dim_ids: Concrete dimension IDs (e.g. ``("d0", "d1")``).
@@ -62,12 +61,6 @@ class TensorInfo:
     dtype: str
     isa_loc: str
 
-    def __repr__(self) -> str:
-        """Compact single-line summary."""
-        dims = ", ".join(self.dim_ids)
-        shape = ", ".join(str(s) for s in self.shape)
-        return f"TensorInfo(({dims}), ({shape})," f" {self.dtype}, {self.isa_loc})"
-
 
 @dataclass
 class OpDimInfo:
@@ -75,17 +68,13 @@ class OpDimInfo:
 
     Attributes:
         op_tile_size: Hardware tile size for this op on this dim.
-        num_ig: ``unified_tile_size / op_tile_size``.
-        tiles_per_ig: ``op_tile_size / min_tile_size``.
+        num_ig: d{i}_tile_size / op_tile_size.
+        tiles_per_ig: op_tile_size / d{i}_min_tile_size.
     """
 
     op_tile_size: int
     num_ig: int
     tiles_per_ig: int
-
-    def __repr__(self) -> str:
-        """Compact single-line summary."""
-        return f"OpDimInfo(tile={self.op_tile_size}," f" ig={self.num_ig}," f" per_ig={self.tiles_per_ig})"
 
 
 @dataclass
@@ -112,21 +101,6 @@ class OpInfo:
     predecessors: list[int]
     blocking_axes: frozenset[str]
 
-    def __repr__(self) -> str:
-        """Multi-line summary with dim map and tiling."""
-        operands = ", ".join(f"{k}={v}" for k, v in self.operands.items())
-        outs = ", ".join(self.outputs)
-        dm = ", ".join(f"{k}->{v}" for k, v in self.dim_map.items())
-        pd = "\n".join(f"      {k}: {v}" for k, v in self.per_dim.items())
-        blk = ", ".join(sorted(self.blocking_axes)) or "none"
-        return (
-            f"OpInfo({self.op_type}({operands}) -> {outs}\n"
-            f"    dim_map: {dm}\n"
-            f"    per_dim:\n{pd}\n"
-            f"    blocking: {{{blk}}},"
-            f" preds: {self.predecessors})"
-        )
-
 
 @dataclass
 class OpGraph:
@@ -140,15 +114,10 @@ class OpGraph:
     nodes: list[OpInfo]
     tensor_producers: dict[str, int]
 
-    def __repr__(self) -> str:
-        """Summary listing each op node."""
-        lines = "\n".join(f"    [{i}] {n.op_type} -> {', '.join(n.outputs)}" for i, n in enumerate(self.nodes))
-        return f"OpGraph({len(self.nodes)} ops\n{lines})"
-
 
 @dataclass
 class DimAnalysis:
-    """Complete result of section 3 dimension analysis.
+    """Complete dimension analysis result.
 
     Attributes:
         func_name: Name of the math function.
@@ -167,20 +136,44 @@ class DimAnalysis:
     op_graph: OpGraph
 
     def __repr__(self) -> str:
-        """Multi-line summary of dims, tensors, and ops."""
-        lines = [f"DimAnalysis({self.func_name})", f"  params: {self.param_names} -> {self.return_name}", "  dims:"]
-        for d, info in self.dims.items():
-            lines.append(f"    {d}: {info}")
-        lines.append("  tensors:")
+        """Show final dimension analysis result."""
+        lines: list[str] = []
+        lines.append(f"DimAnalysis({self.func_name})")
+        lines.append(f"  params: {self.param_names} -> {self.return_name}")
+
+        lines.append("")
+        lines.append("  Dimensions:")
+        for dim_id, di in self.dims.items():
+            par = "data-parallel" if di.is_data_parallel else "reduction"
+            lines.append(
+                f"    {dim_id}: size={di.dim_size},"
+                f" {dim_id}_tile_size={di.tile_size},"
+                f" {dim_id}_min_tile_size={di.min_tile_size},"
+                f" {par}"
+            )
+
+        lines.append("")
+        lines.append("  Tensors:")
         for name, t in self.tensors.items():
-            lines.append(f"    {name}: {t}")
-        lines.append("  ops:")
+            dims_str = ", ".join(t.dim_ids)
+            shape_str = ", ".join(str(s) for s in t.shape)
+            lines.append(f"    {name}: ({dims_str}) shape=({shape_str}) {t.dtype} {t.isa_loc}")
+
+        lines.append("")
+        lines.append("  Ops:")
         for i, node in enumerate(self.op_graph.nodes):
             ops_str = ", ".join(f"{k}={v}" for k, v in node.operands.items())
             outs = ", ".join(node.outputs)
+            dm_str = ", ".join(f"{k}->{v}" for k, v in node.dim_map.items())
             lines.append(f"    [{i}] {node.op_type}({ops_str}) -> {outs}")
+            lines.append(f"        dim_map: {dm_str}")
             for dim_id, odi in node.per_dim.items():
-                lines.append(f"        {dim_id}: {odi}")
+                lines.append(
+                    f"        {dim_id}: op_tile={odi.op_tile_size},"
+                    f" num_ig={odi.num_ig},"
+                    f" tiles_per_ig={odi.tiles_per_ig}"
+                )
+
         return "\n".join(lines)
 
 
@@ -223,30 +216,32 @@ def _map_existing_dims(
     dim_sizes: dict[str, int],
     dim_counter: list[int],
 ) -> None:
-    """Map dims from a tensor that already carries dim_ids."""
+    """Map dims from a tensor that already carries dim_ids.
+
+    Only maps axes that the tensor actually has. Axes beyond the
+    tensor's rank are absent (e.g. a 1D reduced tensor fed to a
+    2D op) — no spurious size-1 dims are allocated.
+    """
     for abstract, concrete in zip(axes, tensor.dim_ids):
         if abstract in local and local[abstract] != concrete:
             _unify_dim(tensors, per_op_maps, dim_sizes, old_id=concrete, new_id=local[abstract])
         else:
             local[abstract] = concrete
-    for abstract in axes[len(tensor.dim_ids) :]:
-        if abstract not in local:
-            fresh = f"d{dim_counter[0]}"
-            dim_counter[0] += 1
-            dim_sizes[fresh] = 1
-            local[abstract] = fresh
 
 
 def _map_fresh_dims(
     axes: tuple[str, ...], tensor: _Tensor, local: dict[str, str], dim_sizes: dict[str, int], dim_counter: list[int]
 ) -> None:
-    """Allocate dims for a tensor with no dim_ids yet."""
-    for i, abstract in enumerate(axes):
+    """Allocate dims for a tensor with no dim_ids yet.
+
+    Only allocates dims for axes the tensor actually has.
+    Axes beyond the tensor's rank are skipped.
+    """
+    for i, abstract in enumerate(axes[: len(tensor.shape)]):
         if abstract not in local:
             fresh = f"d{dim_counter[0]}"
             dim_counter[0] += 1
-            size = tensor.shape[i] if i < len(tensor.shape) else 1
-            dim_sizes[fresh] = size
+            dim_sizes[fresh] = tensor.shape[i]
             local[abstract] = fresh
     tensor.dim_ids = [local[a] for a in axes[: len(tensor.shape)]]
 
@@ -296,7 +291,7 @@ def _create_outputs(
     )
 
     for oname, (_, output_axes) in zip(output_names, op_cls.OUTPUT_AXES.items()):
-        dim_ids = [local[a] for a in output_axes]
+        dim_ids = [local[a] for a in output_axes if a in local]
         shape = tuple(dim_sizes[d] for d in dim_ids)
         tensors[oname] = _Tensor(oname, shape, dtype, op_cls.ISA_LOC, dim_ids)
 
@@ -305,23 +300,26 @@ def _compute_tile_sizes(
     ops: list[tuple[type[NKIOp], dict[str, str], list[str]]],
     per_op_maps: list[dict[str, str]],
     dim_sizes: dict[str, int],
+    data_parallel_dims: set[str],
 ) -> dict[str, DimInfo]:
-    """Compute per-dimension unified and min tile sizes."""
-    unified: dict[str, int] = {}
-    minimum: dict[str, int] = {}
+    """Compute per-dimension tile sizes and classification."""
+    max_tile: dict[str, int] = {}
+    min_tile: dict[str, int] = {}
 
     for (op_cls, _, _), local in zip(ops, per_op_maps):
         for abstract_axis, limit in op_cls.TILE_LIMITS.items():
+            if abstract_axis not in local:
+                continue
             dim_id = local[abstract_axis]
-            unified[dim_id] = max(unified.get(dim_id, limit), limit)
-            minimum[dim_id] = min(minimum.get(dim_id, limit), limit)
+            max_tile[dim_id] = max(max_tile.get(dim_id, limit), limit)
+            min_tile[dim_id] = min(min_tile.get(dim_id, limit), limit)
 
-    for dim_id in unified:
-        unified[dim_id] = min(unified[dim_id], dim_sizes[dim_id])
-    for dim_id in minimum:
-        minimum[dim_id] = min(minimum[dim_id], dim_sizes[dim_id])
+    for dim_id in max_tile:
+        max_tile[dim_id] = min(max_tile[dim_id], dim_sizes[dim_id])
+    for dim_id in min_tile:
+        min_tile[dim_id] = min(min_tile[dim_id], dim_sizes[dim_id])
 
-    return {d: DimInfo(dim_sizes[d], unified[d], minimum[d]) for d in unified}
+    return {d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], d in data_parallel_dims) for d in max_tile}
 
 
 def _build_op_node(
@@ -339,10 +337,12 @@ def _build_op_node(
     preds = sorted({tensor_producers[v] for v in operand_map.values() if v in tensor_producers})
     per_dim: dict[str, OpDimInfo] = {}
     for abstract_axis, limit in op_cls.TILE_LIMITS.items():
+        if abstract_axis not in per_op_maps[i]:
+            continue
         dim_id = per_op_maps[i][abstract_axis]
         di = dims[dim_id]
-        ot = min(limit, di.unified_tile_size)
-        per_dim[dim_id] = OpDimInfo(ot, di.unified_tile_size // ot, ot // di.min_tile_size)
+        ot = min(limit, di.tile_size)
+        per_dim[dim_id] = OpDimInfo(ot, di.tile_size // ot, ot // di.min_tile_size)
 
     return OpInfo(
         op_type=op_cls.NAME,
@@ -357,7 +357,12 @@ def _build_op_node(
 
 
 def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> DimAnalysis:
-    """Run dimension analysis (design doc section 3).
+    """Run dimension analysis.
+
+    Produces three results per dimension:
+      1. Concrete dimension ID (d0, d1, ...)
+      2. Tile size (max of hardware tile limits across ops)
+      3. Data-parallel vs reduction classification
 
     Args:
         func: Math function using NKIOp classes.
@@ -388,7 +393,12 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
         per_op_maps.append(local)
         _create_outputs(op_cls, operand_map, output_names, local, tensors, dim_sizes)
 
-    dims = _compute_tile_sizes(ops, per_op_maps, dim_sizes)
+    """Step 3: data-parallel classification from return tensor."""
+    if return_name not in tensors:
+        raise ValueError(f"Return tensor {return_name!r} not found")
+    data_parallel_dims = set(tensors[return_name].dim_ids)
+
+    dims = _compute_tile_sizes(ops, per_op_maps, dim_sizes, data_parallel_dims)
 
     tensor_producers: dict[str, int] = {}
     op_nodes: list[OpInfo] = []

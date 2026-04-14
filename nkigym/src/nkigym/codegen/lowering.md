@@ -10,12 +10,12 @@ Trainium has three memory levels: HBM (off-chip) → SBUF (on-chip scratchpad) �
 
 Each op decides which boundary it triggers by examining its own inputs — an entirely localized decision. An op triggers at most one boundary:
 
-- **HBM↔SBUF boundary.** Triggered when the op's input lives in HBM. Introduces `tpb_hbm` (tunable) and `num_blocks_hbm` (derived). DMA loads `tpb_hbm` unified tiles per block; the `load_tensor_block` / `save_tensor_block` gadgets from `nkigym.gadgets` handle the tile-by-tile DMA internally.
+- **HBM↔SBUF boundary.** Triggered when the op's input lives in HBM. Introduces `tpb_hbm` (tunable) and `num_blocks_hbm` (derived). DMA loads `tpb_hbm` dimension tiles per block; the `load_tensor_block` / `save_tensor_block` gadgets from `nkigym.gadgets` handle the tile-by-tile DMA internally.
 
 - **SBUF↔PSUM boundary.** Triggered when the op's input lives in PSUM but the op needs it in SBUF. The op inserts a `tensor_copy(PSUM → SBUF)` before consuming. Introduces `tpb_sbuf` (tunable) and `num_blocks_sbuf` (derived).
 
 ### 1.2 Interleave
-Different ops may have different tile size limits on the same dimension (e.g., `nc_matmul` N=512 vs `nc_transpose` F=128). `d{int}_unified_tile_size` = max of all op tile sizes and is per-dimension across all ops. Ops with smaller tile sizes iterate `tiles_per_unified_tile = d{int}_unified_tile_size / d{int}_op{int}_tile_size` times per unified tile.
+Different ops may have different tile size limits on the same dimension (e.g., `nc_matmul` N=512 vs `nc_transpose` F=128). `d{int}_tile_size` = max of all op tile sizes and is per-dimension across all ops. Ops with smaller tile sizes iterate `d{int}_tiles_per_op = d{int}_tile_size / d{int}_op{int}_tile_size` times per dimension tile.
 
 ### 1.3 Dimension Decomposition
 When the HBM-SBUF boundary is active on the tensor for an operator:
@@ -24,17 +24,17 @@ $$\texttt{dim\_size} = \texttt{num\_blocks\_hbm} \times \texttt{tpb\_hbm} \times
 When the SBUF-PSUM boundary is active on the tensor for an operator:
 $$\texttt{dim\_size} = \texttt{num\_blocks\_sbuf} \times \texttt{tpb\_sbuf} \times \texttt{d\{int\}\_tile\_size}$$
 
-In both cases, `d{int}_unified_tile_size` is further broken down into `tiles_per_unified_tile` * `d{int}_op{int}_tile_size`.
+In both cases, `d{int}_tile_size` is further broken down into `d{int}_tiles_per_op` * `d{int}_op{int}_tile_size`.
 
 ### 1.4 Per-Op Loop Nest
 For each dimension of an op's tensor operands, either P or F:
-- `d{int}_unified_tile_size` (hardware, per-dimension) — max of all hardware tile size limits across ops on the dimension. One iteration of block/tile loops processes `d{int}_unified_tile_size` elements.
+- `d{int}_tile_size` (hardware, per-dimension) — max of all hardware tile size limits across ops on the dimension. One iteration of block/tile loops processes `d{int}_tile_size` elements.
 - `d{int}_op{int}_tile_size` (hardware, per-dimension per-op) - hardware tile size for a particular dimension for an op.
-- `tiles_per_unified_tile` (hardware, per-dimension per-op) — `d{int}_unified_tile_size / d{int}_op{int}_tile_size`. The buffer stores at the smallest op tile size; ops with larger tiles consume multiple buffer slots per iteration.
-- `tpb_hbm` (tunable, where applicable) — unified tiles per HBM block. Data is loaded from HBM once per block via `load_tensor_block`, then reused across compute iterations.
-- `tpb_sbuf` (tunable, where applicable) — unified tiles per PSUM→SBUF staging batch. When an op finds its input in PSUM, it stages `tpb_sbuf` tiles to SBUF via `tensor_copy` before consuming them.
-- `num_blocks_hbm` (derived) — `dim_size / (tpb_hbm × d{int}_unified_tile_size)`.
-- `num_blocks_sbuf` (derived) — `dim_size / (tpb_sbuf × d{int}_unified_tile_size)`.
+- `d{int}_tiles_per_op` (hardware, per-dimension per-op) — `d{int}_tile_size / d{int}_op{int}_tile_size`. The buffer stores at the smallest op tile size; ops with larger tiles consume multiple buffer slots per iteration.
+- `tpb_hbm` (tunable, where applicable) — dimension tiles per HBM block. Data is loaded from HBM once per block via `load_tensor_block`, then reused across compute iterations.
+- `tpb_sbuf` (tunable, where applicable) — dimension tiles per PSUM→SBUF staging batch. When an op finds its input in PSUM, it stages `tpb_sbuf` tiles to SBUF via `tensor_copy` before consuming them.
+- `num_blocks_hbm` (derived) — `dim_size / (tpb_hbm × d{int}_tile_size)`.
+- `num_blocks_sbuf` (derived) — `dim_size / (tpb_sbuf × d{int}_tile_size)`.
 
 Each op contributes 3 loops per dimension: block, tile, and interleave. Loops are grouped by **phase** — all block loops outermost, then all tile loops, then all interleave loops. Within each phase, dimensions follow the loop order. This per-phase grouping means block loops define the data boundary, the load happens once per block combination, and tile/ig loops iterate within the loaded data.
 
@@ -42,7 +42,7 @@ Each op contributes 3 loops per dimension: block, tile, and interleave. Loops ar
 |---|---|---|---|
 | Block | `i_block_d{id}` | `num_blocks` | Data boundary — DMA loads here |
 | Tile | `i_tile_d{id}` | `tpb` | Tiles within a block |
-| Interleave | `i_ig_d{id}` | `tiles_per_unified_tile` | Per-op sub-tile iteration |
+| Interleave | `i_ig_d{id}` | `d{int}_tiles_per_op` | Per-op sub-tile iteration |
 
 ### 1.2 Tiling Example
 
@@ -156,7 +156,7 @@ class OpGraph:
 
    | Loop | Variable | Trip count |
    |---|---|---|
-   | Block | `i_block_d{id}` | `dim_size / (tpb × unified_tile_size)` |
+   | Block | `i_block_d{id}` | `dim_size / (tpb × d{id}_tile_size)` |
    | Tile | `i_tile_d{id}` | `tiles_per_block[(op, d)]` |
    | Interleave | `i_ig_d{id}` | `num_ig` from `OpDimInfo` |
 
@@ -257,7 +257,7 @@ ir = KernelIR(
 
 **Buffer sizing.** All buffers use 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`.
 
-- `sbuf_lhs_T` — HBM load for lhs_T(K=d0, M=d1). `load_placements` absent → buffer holds 1 unified tile per dim. Tile sizes at min granularity: `min_d0=128`, `min_d1=128`. Num tiles: `unified_d0/min_d0 = 128/128 = 1`, `unified_d1/min_d1 = 128/128 = 1`. Shape: **`(128, 1, 1, 128)`**.
+- `sbuf_lhs_T` — HBM load for lhs_T(K=d0, M=d1). `load_placements` absent → buffer holds 1 dimension tile per dim. Tile sizes at min granularity: `min_d0=128`, `min_d1=128`. Num tiles: `d0_tile_size/min_d0 = 128/128 = 1`, `d1_tile_size/min_d1 = 128/128 = 1`. Shape: **`(128, 1, 1, 128)`**.
 - `sbuf_rhs` — HBM load for rhs(K=d0, N=d2). Same rule. `min_d0=128`, `min_d2=512`. Num tiles: `128/128 = 1`, `512/512 = 1`. Shape: **`(128, 1, 1, 512)`**.
 - `psum_result` — PSUM accum for result(M=d1, N=d2). K=d0 is outermost in `loop_order` — all of d1 and d2 are inside K's loop, so both contribute full tile count. Op tile sizes: `op_M=128`, `op_N=512`. Num tiles: `8192/128 = 64`, `8192/512 = 16`. fp32. Shape: **`(128, 64, 16, 512)`**.
 
@@ -390,7 +390,7 @@ Op 1 (matmul), loop order d0(K) → d1 → d2:
 
 Op 0 (transpose):
 
-- `sbuf_rhs_T` — HBM load for rhs_T(P=d2, F=d0). `load_placements` absent → 1 unified tile per dim. `min_d2=128`, `min_d0=128`. Num tiles: `unified_d2/min_d2 = 512/128 = 4`, `unified_d0/min_d0 = 128/128 = 1`. Shape: **`(128, 4, 1, 128)`**. The 4 tiles span one unified tile of d2 (512 elements) at the 128-element min granularity.
+- `sbuf_rhs_T` — HBM load for rhs_T(P=d2, F=d0). `load_placements` absent → 1 dimension tile per dim. `min_d2=128`, `min_d0=128`. Num tiles: `d2_tile_size/min_d2 = 512/128 = 4`, `d0_tile_size/min_d0 = 128/128 = 1`. Shape: **`(128, 4, 1, 128)`**. The 4 tiles span one d2_tile (512 elements) at the 128-element min granularity.
 - `psum_rhs_temp` — PSUM temp for transpose. Degree-1 at op tile: `op_P=128`, `op_F=128`. Shape: **`(128, 1, 1, 128)`**.
 - `sbuf_rhs` — Cross-group SBUF for rhs(d0, d2). Full-range at min tile: `min_d0=128`, `min_d2=128`. Num tiles: `8192/128 = 64`, `8192/128 = 64`. Shape: **`(128, 64, 64, 128)`**. Matmul consumes this via reshape `(128, 64, 16, 512)` — free view, no copy.
 

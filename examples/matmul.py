@@ -12,7 +12,7 @@ Usage::
 import numpy as np
 
 from autotune.runner.compare import assert_close
-from nkigym.codegen.dim_analysis import analyze_dims
+from nkigym.dim_analysis.dim_analysis import analyze_dims
 from nkigym.ops.matmul import NKIMatmul
 
 

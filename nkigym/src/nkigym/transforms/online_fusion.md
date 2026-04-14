@@ -92,7 +92,7 @@ Online fusion breaks the Op 5→6 and Op 6→9 barriers, pulling Ops 5, 6, 8, 9 
 
 **Fusion granularity.** The "tile" $k$ in Algorithm 4 can be:
 
-- **Tile level** (§6.1.2–6.1.3): $k$ = one unified tile. Every `i_tile_d2` iteration runs the X step and rescales accumulators. Simpler structure, smaller buffers, more rescaling overhead.
+- **Tile level** (§6.1.2–6.1.3): $k$ = one dimension tile. Every `i_tile_d2` iteration runs the X step and rescales accumulators. Simpler structure, smaller buffers, more rescaling overhead.
 - **Block level** (§6.1.4): $k$ = one block of `tiles_per_block` tiles. Within each block, Ops 5 and 6 run their own `i_tile_d2` loops (naive multi-pass). Corrections apply once per `i_block_d2` iteration. Fewer corrections, enables section-based processing with dimension interleaving.
 
 Both produce the same final result using the same math (§6.1.1). The reference attention CTE kernel uses block-level fusion with 8K-token sections.
@@ -343,7 +343,7 @@ for i_block_d2 in range(8):                                          """ d2 loop
 
 #### 6.1.4 Block-Level Fusion
 
-The tile-level examples (§6.1.2–6.1.3) apply Algorithm 4 per unified tile. Block-level applies it per `i_block_d2` iteration — one "tile" $k$ in Algorithm 4 is a block of `tiles_per_block` unified tiles. Within each block, Ops 5 and 6 run their naive multi-pass (separate `i_tile_d2` loops producing a complete section max and section sum). The correction is applied once between blocks.
+The tile-level examples (§6.1.2–6.1.3) apply Algorithm 4 per dimension tile. Block-level applies it per `i_block_d2` iteration — one "tile" $k$ in Algorithm 4 is a block of `tiles_per_block` dimension tiles. Within each block, Ops 5 and 6 run their naive multi-pass (separate `i_tile_d2` loops producing a complete section max and section sum). The correction is applied once between blocks.
 
 **Flow per block $k$:**
 
@@ -432,8 +432,8 @@ for i_block_d2 in range(num_blocks_d2):                              """ section
 
 | Aspect | Tile level | Block level |
 |---|---|---|
-| "Tile" $k$ in Algorithm 4 | 1 unified tile | `tiles_per_block` unified tiles |
-| Corrections per full pass | `unified_tiles` | `num_blocks` |
+| "Tile" $k$ in Algorithm 4 | 1 dimension tile | `tiles_per_block` dimension tiles |
+| Corrections per full pass | `dimension_tiles` | `num_blocks` |
 | Op 5 within $k$ | single `tensor_reduce` | multi-pass `tensor_reduce` → final reduce |
 | Op 6 within $k$ | single `activation_reduce` | multi-pass `activation_reduce` → final reduce |
 | Intermediate `exp_S` | per-tile (128, 512) | per-block (`tiles_per_block` × 512 elements) |
