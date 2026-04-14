@@ -7,38 +7,7 @@ provide format_isa_call() for the generic renderer.
 """
 
 from abc import abstractmethod
-from dataclasses import dataclass, field
 from typing import Any, ClassVar
-
-
-@dataclass
-class Tensor:
-    """A tensor tracked during dimension analysis.
-
-    Attributes:
-        name: Tensor name (e.g. ``"lhs_T"``).
-        shape: Full shape (e.g. ``(2048, 2048)``).
-        dtype: Dtype string (e.g. ``"bfloat16"``).
-        location: Initial location hint (``"hbm"`` for inputs).
-        dim_ids: Concrete dimension IDs assigned by analysis.
-    """
-
-    name: str
-    shape: tuple[int, ...]
-    dtype: str
-    location: str
-    dim_ids: tuple[str, ...] = ()
-
-
-@dataclass
-class RenderContext:
-    """Mutable context used during dimension analysis in build_ir.
-
-    Holds tensors discovered so far so that later ops can
-    reference earlier ops' outputs and unify shared dimensions.
-    """
-
-    tensors: dict[str, Tensor] = field(default_factory=dict)
 
 
 class NKIOp:

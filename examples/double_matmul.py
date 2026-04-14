@@ -9,26 +9,17 @@ Expressed as NKI ops:
   S_t  = nc_transpose(S)        -- S(d0, d2) -> S_t(d2, d0)
   out  = nc_matmul(S_t, V)      -- S_t.T @ V = S @ V -> out(d0, d3)
 
-CPU sim should pass. Hardware run will likely fail due to oversized
-inter-op SBUF buffers — that is expected and will be fixed by transforms.
-
 Usage::
 
     source ~/venvs/kernel-env/bin/activate
     python examples/double_matmul.py
 """
 
-import inspect
-import shutil
-from pathlib import Path
-
 import numpy as np
 
 from autotune.runner.compare import assert_close
-from nkigym.codegen.render import build_ir
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
-from nkigym.search.api import remote_search
 
 
 def double_matmul_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
@@ -77,25 +68,5 @@ if __name__ == "__main__":
 
     out_np = double_matmul_numpy(Q, K, V)
     out_gym = double_matmul_nkigym(Q, K, V)
-    status = assert_close(out_gym, out_np, atol=1e-6, rtol=1e-6)
-    print(f"CPU sim: {status}")
-
-    input_specs = {"Q": ((seq_q, d_k), "bfloat16"), "K": ((seq_k, d_k), "bfloat16"), "V": ((seq_k, d_v), "bfloat16")}
-    ir = build_ir(double_matmul_nkigym, input_specs=input_specs)
-
-    golden_source = inspect.getsource(double_matmul_numpy)
-    cache_dir = Path("/home/ubuntu/cache/double_matmul_test")
-    if cache_dir.exists():
-        shutil.rmtree(cache_dir)
-    remote_search(
-        initial_kernel=ir,
-        golden_source=golden_source,
-        golden_func_name="double_matmul_numpy",
-        hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5", "gym-6"],
-        cache_dir=str(cache_dir),
-        num_variants=10,
-        atol=1e-3,
-        rtol=1e-3,
-        warmup=10,
-        iters=100,
-    )
+    status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
+    print(f"double_matmul: {status}")

@@ -1,59 +1,77 @@
-"""NKI Gym search: rmsnorm + matmul two-pass reduction kernel.
+"""RMSNorm + matmul: numpy golden, nkigym simulation, and comparison.
 
-Demonstrates multi-pass schedule search: RMSNorm (activation+reduce
-over K, then normalize) followed by matrix multiply, producing two
-sequential reduction passes over the same dimension.
+Math: RMSNorm(a) @ b = (a / sqrt(mean(a^2) + eps)) @ b
+
+Expressed as NKI ops:
+  sq, sum_sq = activation_reduce(a, square, add)
+  scaled     = tensor_scalar(sum_sq * (1/K) + eps)
+  rsqrt_val  = activation(scaled, rsqrt)
+  a_normed   = tensor_scalar(a * rsqrt_val)
+  a_t        = nc_transpose(a_normed)
+  result     = nc_matmul(a_t, b)
+
+Usage::
+
+    source ~/venvs/kernel-env/bin/activate
+    python examples/rmsnorm_matmul.py
 """
-
-import argparse
-import logging
-from pathlib import Path
 
 import numpy as np
 
-import nkigym
-from nkigym.search import search
+from autotune.runner.compare import assert_close
+from nkigym.ops.activation import NKIActivation
+from nkigym.ops.activation_reduce import NKIActivationReduce
+from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.tensor_scalar import NKITensorScalar
+from nkigym.ops.transpose import NKITranspose
+
+EPS = 1e-6
 
 
-def rmsnorm_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """RMSNorm(a) @ b: normalize rows of a then multiply by b.
+def rmsnorm_matmul_numpy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """RMSNorm(a) @ b with numpy.
 
     Args:
-        a: Input tensor of shape [M, K].
-        b: Weight tensor of shape [K, N].
+        a: Input tensor of shape (M, K).
+        b: Weight tensor of shape (K, N).
 
     Returns:
-        Output tensor of shape [M, N].
+        Output tensor of shape (M, N).
     """
-    sum_sq = nkigym.activation(a, op="square", reduce_op=np.add)
-    scaled = nkigym.tensor_scalar(sum_sq, op0=np.multiply, operand0=1 / 1024, op1=np.add, operand1=1e-6)
-    rsqrt_val = nkigym.activation(scaled, op="rsqrt")
-    a_normed = nkigym.tensor_scalar(a, rsqrt_val, op0=np.multiply)
-    a_t = nkigym.transpose(a_normed)
-    result = nkigym.nc_matmul(a_t, b)
+    k = a.shape[1]
+    rms = np.sqrt(np.mean(a**2, axis=1, keepdims=True) + EPS)
+    a_normed = a / rms
+    return a_normed @ b
+
+
+def rmsnorm_matmul_nkigym(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """RMSNorm(a) @ b using nkigym NKIOp classes.
+
+    Args:
+        a: Input tensor of shape (M, K).
+        b: Weight tensor of shape (K, N).
+
+    Returns:
+        Output tensor of shape (M, N).
+    """
+    k = a.shape[1]
+    sq, sum_sq = NKIActivationReduce()(data=a, op="square", reduce_op="add")
+    scaled = NKITensorScalar()(data=sum_sq, op0="multiply", operand0=1.0 / k, op1="add", operand1=EPS)
+    rsqrt_val = NKIActivation()(data=scaled, op="rsqrt")
+    a_normed = NKITensorScalar()(data=a, op0="multiply", operand0=rsqrt_val)
+    a_t = NKITranspose()(data=a_normed)
+    result = NKIMatmul()(stationary=a_t, moving=b)
     return result
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="NKI Gym rmsnorm+matmul search")
-    parser.add_argument("--cache-dir", type=Path, required=True, help="Directory for storing output artifacts")
-    return parser.parse_args()
-
-
-def main() -> None:
-    """Run schedule search on a 1024x1024 rmsnorm+matmul workload."""
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    args = parse_args()
-    cache_dir = args.cache_dir
+if __name__ == "__main__":
+    M, K, N = 1024, 1024, 1024
 
     rng = np.random.default_rng(42)
-    a = rng.standard_normal((1024, 1024)).astype(np.float16)
-    b = rng.standard_normal((1024, 1024)).astype(np.float16)
+    a = rng.standard_normal((M, K))
+    b = rng.standard_normal((K, N))
 
-    search(func=rmsnorm_matmul, num_targets=99999, seed=42, save_cache=cache_dir, kernel_kwargs={"a": a, "b": b})
-
-
-if __name__ == "__main__":
-    main()
+    out_np = rmsnorm_matmul_numpy(a, b)
+    out_gym = rmsnorm_matmul_nkigym(a, b)
+    status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
+    print(f"rmsnorm_matmul: {status}")
