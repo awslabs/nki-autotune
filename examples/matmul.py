@@ -12,6 +12,7 @@ Usage::
 import numpy as np
 
 from autotune.runner.compare import assert_close
+from nkigym.codegen.dim_analysis import analyze_dims
 from nkigym.ops.matmul import NKIMatmul
 
 
@@ -53,3 +54,7 @@ if __name__ == "__main__":
     out_gym = matmul_nkigym(lhs_T, rhs)
     status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
     print(f"matmul: {status}")
+
+    input_specs = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
+    da = analyze_dims(matmul_nkigym, input_specs)
+    print(da)

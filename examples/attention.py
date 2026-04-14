@@ -24,6 +24,7 @@ Usage::
 import numpy as np
 
 from autotune.runner.compare import assert_close
+from nkigym.codegen.dim_analysis import analyze_dims
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.affine_select import NKIAffineSelect
@@ -102,3 +103,11 @@ if __name__ == "__main__":
     out_gym = attention_nkigym(Q, K, V)
     status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
     print(f"attention: {status}")
+
+    input_specs = {
+        "Q": ((seq_len, d_k), "bfloat16"),
+        "K": ((seq_len, d_k), "bfloat16"),
+        "V": ((seq_len, d_v), "bfloat16"),
+    }
+    da = analyze_dims(attention_nkigym, input_specs)
+    print(da)

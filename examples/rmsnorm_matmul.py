@@ -19,6 +19,7 @@ Usage::
 import numpy as np
 
 from autotune.runner.compare import assert_close
+from nkigym.codegen.dim_analysis import analyze_dims
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.matmul import NKIMatmul
@@ -75,3 +76,7 @@ if __name__ == "__main__":
     out_gym = rmsnorm_matmul_nkigym(a, b)
     status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
     print(f"rmsnorm_matmul: {status}")
+
+    input_specs = {"a": ((M, K), "bfloat16"), "b": ((K, N), "bfloat16")}
+    da = analyze_dims(rmsnorm_matmul_nkigym, input_specs)
+    print(da)
