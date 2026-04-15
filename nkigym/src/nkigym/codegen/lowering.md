@@ -1,10 +1,34 @@
-## 1. Tensor Tiling
+## 1. Kernel Header
+
+`render_ir` emits a fixed preamble before any loop nests or buffers. All fields come directly from KernelIR — no heuristics.
+
+**Imports.** Always the same three lines:
+
+```python
+import nki
+import nki.isa as nisa
+import nki.language as nl
+```
+
+**Decorator and signature.** `@nki.jit` decorator, then `def {func_name}({param_names}):` where `func_name` and `param_names` are read from KernelIR.
+
+**Input shape assertions.** For each parameter in `param_names`, emit `assert {param}.shape == {shape}` using the shape from `tensors[param]`.
+
+**Output HBM allocation.** For the return tensor `return_name`, emit:
+
+```python
+{return_name} = nl.ndarray({shape}, dtype=nl.{dtype}, buffer=nl.shared_hbm)
+```
+
+Shape and dtype come from `tensors[return_name]`. The output is always allocated in `nl.shared_hbm`. At the end of the function body, emit `return {return_name}`.
+
+## 2. Tensor Tiling
 
 Every on-chip tensor uses a uniform **4D layout**: `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`. This is the central design decision — loop structure, buffer sizing, and all transforms operate on this single shape.
 
 **Hardware constraint.** Trainium DMA cannot operate on tensors with more than 5 meaningful (non-singleton) dimensions.
 
-### 1.1 Memory Hierarchy and Boundaries
+### 2.1 Memory Hierarchy and Boundaries
 
 Trainium has three memory levels: HBM (off-chip) → SBUF (on-chip scratchpad) → PSUM (accumulator registers). Each boundary between adjacent levels introduces a block/tile tiling parameter that controls arithmetic intensity. Two ops produce results in PSUM: `nc_matmul` and `nc_transpose`.
 
@@ -14,10 +38,10 @@ Each op decides which boundary it triggers by examining its own inputs — an en
 
 - **SBUF↔PSUM boundary.** Triggered when the op's input lives in PSUM but the op needs it in SBUF. The op inserts a `tensor_copy(PSUM → SBUF)` before consuming. Introduces `tpb_sbuf` (tunable) and `num_blocks_sbuf` (derived).
 
-### 1.2 Interleave
+### 2.2 Interleave
 Different ops may have different tile size limits on the same dimension (e.g., `nc_matmul` N=512 vs `nc_transpose` F=128). `d{int}_tile_size` = max of all op tile sizes and is per-dimension across all ops. Ops with smaller tile sizes iterate `d{int}_tiles_per_op = d{int}_tile_size / d{int}_op{int}_tile_size` times per dimension tile.
 
-### 1.3 Dimension Decomposition
+### 2.3 Dimension Decomposition
 When the HBM-SBUF boundary is active on the tensor for an operator:
 $$\texttt{dim\_size} = \texttt{num\_blocks\_hbm} \times \texttt{tpb\_hbm} \times \texttt{d\{int\}\_tile\_size}$$
 
@@ -26,7 +50,7 @@ $$\texttt{dim\_size} = \texttt{num\_blocks\_sbuf} \times \texttt{tpb\_sbuf} \tim
 
 In both cases, `d{int}_tile_size` is further broken down into `d{int}_tiles_per_op` * `d{int}_op{int}_tile_size`.
 
-### 1.4 Per-Op Loop Nest
+### 2.4 Per-Op Loop Nest
 For each dimension of an op's tensor operands, either P or F:
 - `d{int}_tile_size` (hardware, per-dimension) — max of all hardware tile size limits across ops on the dimension. One iteration of block/tile loops processes `d{int}_tile_size` elements.
 - `d{int}_op{int}_tile_size` (hardware, per-dimension per-op) - hardware tile size for a particular dimension for an op.
@@ -44,7 +68,7 @@ Each op contributes 3 loops per dimension: block, tile, and interleave. Loops ar
 | Tile | `i_tile_d{id}` | `tpb` | Tiles within a block |
 | Interleave | `i_ig_d{id}` | `d{int}_tiles_per_op` | Per-op sub-tile iteration |
 
-### 1.5 Tiling Example
+### 2.5 Tiling Example
 
 ```python
 Q_t = GymTranspose()(Q)
@@ -109,11 +133,11 @@ num_blocks = {
 
 The interleave trip of **4** in op1/d2 is the key asymmetry: the matmul forces `unified["d2"]`=512, but transpose handles only 128 elements on P per iteration.
 
-## 2. KernelIR and Lowering
+## 3. KernelIR and Lowering
 
 The pipeline: **math function →** `build_ir` **→ KernelIR → online fusion → KernelIR → programmatic transforms → KernelIR →** `render_ir` **→ NKI source → test + profile.** `KernelIR` is the structured representation that all transforms operate on, avoiding repeated AST parsing of NKI source for every variant. `build_ir(func, input_specs)` constructs the initial IR once (dimension analysis, tiling, default transform state). Online fusion greedily applies all detected math-level optimizations, producing a single KernelIR with blocking barriers eliminated. Programmatic transforms then clone and modify the transform state to produce variant candidates — all within `KernelIR`, no source generation yet. `render_ir(ir)` mechanically lowers any `KernelIR` — initial or transformed — to NKI source.
 
-### 2.1 Generic Lowering
+### 3.1 Generic Lowering
 
 `render_ir(ir)` mechanically converts any `KernelIR` — initial or transformed — to NKI source. The same renderer handles all variants by reading the transform state and applying dependency-based statement placement.
 
@@ -147,19 +171,19 @@ The pipeline: **math function →** `build_ir` **→ KernelIR → online fusion 
 
 6. **DMA store.** `save_tensor_block` after K's last iteration. Handles PSUM→SBUF staging internally.
 
-### 2.2 Initial KernelIR Conventions
+### 3.2 Initial KernelIR Conventions
 
 `build_ir` produces the initial KernelIR with these defaults — the most naive, mechanical lowering with no optimization choices. Every field starts at its simplest value; transforms improve from here.
 
 - **`tiles_per_block = 1`** for all (op, dim). Block loops carry the full tile count; tile loops are `range(1)`.
 - **`load_placements = {}`** (absent). All loads after the block phase, before tile phase.
 - **`buffer_degrees = 1`** for all (group, tensor, dim). Single-buffered.
-- **`loop_order`**: per-phase grouping (§1.4) — blocks outermost, tiles middle, igs inner. Dimensions in order of first appearance (d0, d1, d2, ...).
+- **`loop_order`**: per-phase grouping (§2.4) — blocks outermost, tiles middle, igs inner. Dimensions in order of first appearance (d0, d1, d2, ...).
 - **`fusion_groups = [[0], [1], ...]`** — each op in its own group. Intermediate tensors fully materialized in cross-group SBUF buffers.
 
 The initial `loop_order` uses dimension ID order because it is a neutral starting point that makes no assumptions about which dimension benefits from being outermost or innermost. Loop reordering transforms explore the space of valid orderings from here. When an accumulation dimension (K) appears early in the numbering, it ends up outermost, and the PSUM accumulator must hold all inner-dimension output tiles between memset and save. This can produce buffers too large for hardware PSUM — that is expected. The initial IR is not required to fit on hardware; transforms shrink buffers by reordering loops (moving K innermost) or adjusting `tiles_per_block`.
 
-### 2.3 Initial KernelIR Examples
+### 3.3 Initial KernelIR Examples
 
 #### Single matmul
 
@@ -338,7 +362,7 @@ ir = KernelIR(
 )
 ```
 
-**Derived loop trip counts** from §1.4 formulas:
+**Derived loop trip counts** from §2.4 formulas:
 
 Op 0 (transpose), loop order d0 → d2:
 

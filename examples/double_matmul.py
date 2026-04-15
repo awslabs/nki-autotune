@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from autotune.runner.compare import assert_close
+from nkigym.codegen.header import render_full
 from nkigym.dim_analysis.dim_analysis import analyze_dims
 from nkigym.graph_analysis.op_graph import build_op_graph
 from nkigym.ops.matmul import NKIMatmul
@@ -87,3 +88,5 @@ if __name__ == "__main__":
 
     graph = build_op_graph(double_matmul_nkigym)
     graph.render(CACHE_DIR / "op_graph")
+
+    (CACHE_DIR / "header.py").write_text(render_full(da))
