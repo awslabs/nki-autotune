@@ -63,59 +63,6 @@ class TensorInfo:
 
 
 @dataclass
-class OpDimInfo:
-    """Per-op per-dimension tiling info, derived from hardware limits.
-
-    Attributes:
-        op_tile_size: Hardware tile size for this op on this dim.
-        num_ig: d{i}_tile_size / op_tile_size.
-        tiles_per_ig: op_tile_size / d{i}_min_tile_size.
-    """
-
-    op_tile_size: int
-    num_ig: int
-    tiles_per_ig: int
-
-
-@dataclass
-class OpInfo:
-    """Node in the computation DAG.
-
-    Attributes:
-        op_type: ISA call name (e.g. ``"nc_matmul"``).
-        op_cls: The NKIOp subclass.
-        operands: Tensor-valued kwargs ``{role: tensor_name}``.
-        outputs: Output tensor names.
-        dim_map: ``{abstract_axis: dim_id}`` for this op.
-        per_dim: ``{dim_id: OpDimInfo}`` tiling info.
-        predecessors: Indices of ops producing this op's inputs.
-        blocking_axes: Abstract axes that are blocking.
-    """
-
-    op_type: str
-    op_cls: type
-    operands: dict[str, str]
-    outputs: list[str]
-    dim_map: dict[str, str]
-    per_dim: dict[str, OpDimInfo]
-    predecessors: list[int]
-    blocking_axes: frozenset[str]
-
-
-@dataclass
-class OpGraph:
-    """Computation DAG -- ops in topological order.
-
-    Attributes:
-        nodes: Op nodes indexed by op_idx.
-        tensor_producers: ``{tensor_name: op_idx}``.
-    """
-
-    nodes: list[OpInfo]
-    tensor_producers: dict[str, int]
-
-
-@dataclass
 class DimAnalysis:
     """Complete dimension analysis result.
 
@@ -125,7 +72,6 @@ class DimAnalysis:
         return_name: Name of the returned tensor.
         dims: ``{dim_id: DimInfo}``.
         tensors: ``{tensor_name: TensorInfo}``.
-        op_graph: The computation DAG.
     """
 
     func_name: str
@@ -133,7 +79,6 @@ class DimAnalysis:
     return_name: str
     dims: dict[str, DimInfo]
     tensors: dict[str, TensorInfo]
-    op_graph: OpGraph
 
     def __repr__(self) -> str:
         """Show final dimension analysis result."""
@@ -158,21 +103,6 @@ class DimAnalysis:
             dims_str = ", ".join(t.dim_ids)
             shape_str = ", ".join(str(s) for s in t.shape)
             lines.append(f"    {name}: ({dims_str}) shape=({shape_str}) {t.dtype} {t.isa_loc}")
-
-        lines.append("")
-        lines.append("  Ops:")
-        for i, node in enumerate(self.op_graph.nodes):
-            ops_str = ", ".join(f"{k}={v}" for k, v in node.operands.items())
-            outs = ", ".join(node.outputs)
-            dm_str = ", ".join(f"{k}->{v}" for k, v in node.dim_map.items())
-            lines.append(f"    [{i}] {node.op_type}({ops_str}) -> {outs}")
-            lines.append(f"        dim_map: {dm_str}")
-            for dim_id, odi in node.per_dim.items():
-                lines.append(
-                    f"        {dim_id}: op_tile={odi.op_tile_size},"
-                    f" num_ig={odi.num_ig},"
-                    f" tiles_per_ig={odi.tiles_per_ig}"
-                )
 
         return "\n".join(lines)
 
@@ -322,40 +252,6 @@ def _compute_tile_sizes(
     return {d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], d in data_parallel_dims) for d in max_tile}
 
 
-def _build_op_node(
-    i: int,
-    op_cls: type[NKIOp],
-    name_kwargs: dict[str, str],
-    output_names: list[str],
-    per_op_maps: list[dict[str, str]],
-    tensors: dict[str, _Tensor],
-    dims: dict[str, DimInfo],
-    tensor_producers: dict[str, int],
-) -> OpInfo:
-    """Build a single OpInfo node."""
-    operand_map = {k: v for k, v in name_kwargs.items() if v in tensors}
-    preds = sorted({tensor_producers[v] for v in operand_map.values() if v in tensor_producers})
-    per_dim: dict[str, OpDimInfo] = {}
-    for abstract_axis, limit in op_cls.TILE_LIMITS.items():
-        if abstract_axis not in per_op_maps[i]:
-            continue
-        dim_id = per_op_maps[i][abstract_axis]
-        di = dims[dim_id]
-        ot = min(limit, di.tile_size)
-        per_dim[dim_id] = OpDimInfo(ot, di.tile_size // ot, ot // di.min_tile_size)
-
-    return OpInfo(
-        op_type=op_cls.NAME,
-        op_cls=op_cls,
-        operands=operand_map,
-        outputs=output_names,
-        dim_map=dict(per_op_maps[i]),
-        per_dim=per_dim,
-        predecessors=preds,
-        blocking_axes=op_cls.BLOCKING_AXES,
-    )
-
-
 def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> DimAnalysis:
     """Run dimension analysis.
 
@@ -369,7 +265,7 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
         input_specs: ``{param_name: (shape, dtype)}``.
 
     Returns:
-        DimAnalysis with dims, tensors, and op_graph.
+        DimAnalysis with dims and tensors.
     """
     param_names = list(inspect.signature(func).parameters.keys())
     for name in param_names:
@@ -400,23 +296,10 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
 
     dims = _compute_tile_sizes(ops, per_op_maps, dim_sizes, data_parallel_dims)
 
-    tensor_producers: dict[str, int] = {}
-    op_nodes: list[OpInfo] = []
-    for i, (op_cls, name_kwargs, output_names) in enumerate(ops):
-        for oname in output_names:
-            tensor_producers[oname] = i
-        node = _build_op_node(i, op_cls, name_kwargs, output_names, per_op_maps, tensors, dims, tensor_producers)
-        op_nodes.append(node)
-
     tensor_infos: dict[str, TensorInfo] = {}
     for name, t in tensors.items():
         tensor_infos[name] = TensorInfo(tuple(t.dim_ids), t.shape, t.dtype, t.isa_loc)
 
     return DimAnalysis(
-        func_name=func.__name__,
-        param_names=param_names,
-        return_name=return_name,
-        dims=dims,
-        tensors=tensor_infos,
-        op_graph=OpGraph(op_nodes, tensor_producers),
+        func_name=func.__name__, param_names=param_names, return_name=return_name, dims=dims, tensors=tensor_infos
     )
