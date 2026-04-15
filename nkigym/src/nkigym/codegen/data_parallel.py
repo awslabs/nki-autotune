@@ -3,7 +3,7 @@
 from nkigym.codegen.kernel_ir import KernelIR
 
 
-def render_data_parallel_loops(ir: KernelIR) -> str:
+def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
     """Emit the data-parallel loop nest from a KernelIR.
 
     Each data-parallel dimension (``is_data_parallel=True``)
@@ -16,8 +16,8 @@ def render_data_parallel_loops(ir: KernelIR) -> str:
         ir: Complete kernel IR.
 
     Returns:
-        Indented NKI source lines for the data-parallel loops,
-        ending with a ``...`` placeholder for the body.
+        Tuple of (source lines, body indent level). The source
+        lines contain the loop headers without a body placeholder.
     """
     da = ir.dim_analysis
 
@@ -49,10 +49,7 @@ def render_data_parallel_loops(ir: KernelIR) -> str:
         lines.append(f"{pad}for i_ig_{dim_id} in range({num_ig}):")
         indent += 1
 
-    pad = "    " * indent
-    lines.append(f"{pad}...")
-
-    return "\n".join(lines)
+    return "\n".join(lines), indent
 
 
 def _get_tpb(ir: KernelIR, dim_id: str) -> int:

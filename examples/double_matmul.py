@@ -89,4 +89,3 @@ if __name__ == "__main__":
 
     source = render_ir(ir)
     (CACHE_DIR / "kernel.py").write_text(source)
-    print(source)

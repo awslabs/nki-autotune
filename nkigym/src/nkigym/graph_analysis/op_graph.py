@@ -25,10 +25,17 @@ class OpGraph:
     Attributes:
         nodes: ``op_idx -> op_type`` (ISA name).
         edges: ``(producer, consumer, tensor, role)`` tuples.
+            Only inter-op tensors — kernel inputs with no
+            producer op are absent.
+        op_tensors: Per-op ``(inputs, outputs)``.
+            ``inputs`` maps ``role -> tensor_name`` (including
+            kernel inputs with no producer). ``outputs`` lists
+            output tensor names.
     """
 
     nodes: list[str]
     edges: list[tuple[int, int, str, str]]
+    op_tensors: list[tuple[dict[str, str], list[str]]]
 
     def __repr__(self) -> str:
         """Render the DAG as a per-node flow.
@@ -93,16 +100,22 @@ def build_op_graph(func: Callable[..., np.ndarray]) -> OpGraph:
 
     nodes: list[str] = []
     edges: list[tuple[int, int, str, str]] = []
+    op_tensors: list[tuple[dict[str, str], list[str]]] = []
     tensor_producers: dict[str, int] = {}
 
     for i, (op_cls, name_kwargs, output_names) in enumerate(ops):
         nodes.append(op_cls.NAME)
 
+        inputs: dict[str, str] = {}
         for role, var_name in name_kwargs.items():
-            if var_name in tensor_producers:
-                edges.append((tensor_producers[var_name], i, var_name, role))
+            if isinstance(var_name, str):
+                inputs[role] = var_name
+                if var_name in tensor_producers:
+                    edges.append((tensor_producers[var_name], i, var_name, role))
+
+        op_tensors.append((inputs, list(output_names)))
 
         for oname in output_names:
             tensor_producers[oname] = i
 
-    return OpGraph(nodes=nodes, edges=edges)
+    return OpGraph(nodes=nodes, edges=edges, op_tensors=op_tensors)
