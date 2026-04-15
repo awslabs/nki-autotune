@@ -21,9 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from autotune.runner.compare import assert_close
-from nkigym.codegen.header import render_full
-from nkigym.dim_analysis.dim_analysis import analyze_dims
-from nkigym.graph_analysis.op_graph import build_op_graph
+from nkigym.codegen import build_ir, render_ir
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
 
@@ -83,10 +81,12 @@ if __name__ == "__main__":
     CACHE_DIR.mkdir(parents=True)
 
     input_specs = {"Q": ((seq_q, d_k), "bfloat16"), "K": ((seq_k, d_k), "bfloat16"), "V": ((seq_k, d_v), "bfloat16")}
-    da = analyze_dims(double_matmul_nkigym, input_specs)
-    (CACHE_DIR / "dim_analysis.txt").write_text(repr(da))
 
-    graph = build_op_graph(double_matmul_nkigym)
-    graph.render(CACHE_DIR / "op_graph")
+    ir = build_ir(double_matmul_nkigym, input_specs)
+    (CACHE_DIR / "dim_analysis.txt").write_text(repr(ir.dim_analysis))
 
-    (CACHE_DIR / "header.py").write_text(render_full(da))
+    ir.op_graph.render(CACHE_DIR / "op_graph")
+
+    source = render_ir(ir)
+    (CACHE_DIR / "kernel.py").write_text(source)
+    print(source)

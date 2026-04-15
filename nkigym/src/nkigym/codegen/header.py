@@ -47,16 +47,3 @@ def render_return(da: DimAnalysis) -> str:
         Indented return statement.
     """
     return f"    return {da.return_name}"
-
-
-def render_full(da: DimAnalysis) -> str:
-    """Emit complete kernel header with return statement.
-
-    Args:
-        da: Complete dimension analysis result.
-
-    Returns:
-        NKI source code for imports, signature, assertions,
-        HBM allocation, and return statement.
-    """
-    return render_header(da) + "\n" + render_return(da) + "\n"
