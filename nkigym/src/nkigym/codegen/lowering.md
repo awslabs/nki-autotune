@@ -22,19 +22,20 @@ class KernelIR:
 
 **`op_graph`** — from `build_op_graph`. Contains:
 - `nodes: list[str]` — `op_idx -> op_type` (e.g. `"nc_matmul"`).
-- `edges: list[tuple[int, int, str, str]]` — `(producer, consumer, tensor, role)`.
+- `edges: list[tuple[int, int, str, str]]` — `(producer, consumer, tensor, role)`. Only inter-op tensors — kernel inputs with no producer op are absent.
+- `op_tensors: list[tuple[dict[str, str], list[str]]]` — per-op `(inputs, outputs)`. `inputs` maps `role -> tensor_name` (including kernel inputs with no producer). `outputs` lists output tensor names.
 
 **Rendering parameters** — `render_ir` reads these to determine loop structure, buffer sizes, and DMA placement:
 - `fusion_groups`: which ops share a loop nest. Initially `[[0], [1], ...]` — each op in its own group.
 - `tiles_per_block`: `(op_idx, dim_id) -> int`. Initially `1` for all pairs.
 - `buffer_degrees`: `(group_idx, tensor_name, dim_id) -> int`. Initially `1`. Each tensor's buffer is independent per fusion group — the same tensor loaded in two groups can have different degrees.
-- `loop_order`: per group — dimension ordering within each phase.
+- `loop_order`: per group — all dimension IDs in priority order. The renderer filters to the relevant subset (reduction dims for section 3). Initially `sorted(da.dims)` for every group.
 - `load_placements`: `(tensor_name, dim_id) -> tier`. Initially absent. Tier is `"per_tile"`, `"per_block"`, or `"full"`.
 
 **Renderer-derived positions** — NOT stored in KernelIR, mechanically derived by `render_ir` from the fields above:
-- **memset**: before the accumulation (K) dimension's outermost loop in the current `loop_order`.
-- **save / tensor_copy(psum→sbuf)**: after the accumulation dimension's last inner loop.
-- **tensor_copy (interleave reload/save)**: around the tile loop when an accumulating dim's block and tile are split by other dims' loops.
+- **memset**: before the blocking dimension's outermost loop in the current `loop_order`.
+- **save / tensor_copy(psum→sbuf)**: after the blocking dimension's last inner loop.
+- **tensor_copy (interleave reload/save)**: around the tile loop when a blocking dim's block and tile are split by other dims' loops.
 - These are deterministic given the loop structure — exactly one correct position for each, no ambiguity.
 
 ## 1. Kernel Header
@@ -73,43 +74,96 @@ Each dimension contributes 3 loops: block, tile, and interleave. All three are a
 | Tile | `i_tile_d{id}` | `tiles_per_block` |
 | Interleave | `i_ig_d{id}` | `tile_size / min_tile_size` |
 
-Loops are grouped by phase — all block loops outermost, then all tile loops, then all interleave loops. Within each phase, data-parallel dimensions are ordered by dimension ID. The block loops define the data boundary (DMA loads happen here), tile loops iterate within a block, and interleave loops handle sub-tile iteration when ops have different tile size limits on the same dimension.
+Loops are grouped by phase — all block loops outermost, then all tile loops, then all interleave loops. Within each phase, data-parallel dimensions are sorted by dimension ID (fixed ordering — DP loops wrap all groups, so `loop_order` does not apply here). Block loops define the data boundary (DMA loads happen here), tile loops iterate within a block, and interleave loops handle sub-tile iteration when ops have different tile size limits on the same dimension.
 
-### 2.1 Example
+### 2.1 Example: Attention
 
-Single matmul: `result = GymMatmul()(stationary=lhs_T, moving=rhs)` where lhs_T is (d0, d1) and rhs is (d0, d2). `result` has dims (d1, d2). With initial `tiles_per_block = 1`:
+`softmax(mask(scale * Q @ K.T)) @ V`. Inputs: `Q(d0, d1), K(d2, d1), V(d2, d4)`. Return `output(d0, d4)`. With `seq_q=seq_k=2048, d_k=d_v=128`, `tiles_per_block = 1`:
 
-| Dim | dim_size | tile_size | min_tile_size | is_data_parallel | block | tile | ig |
+| Dim | dim_size | tile_size | min_tile_size | DP/reduction | block | tile | ig |
 |---|---|---|---|---|---|---|---|
-| d0 | 8192 | 128 | 128 | False | — | — | — |
-| d1 | 8192 | 128 | 128 | True | 64 | 1 | 1 |
-| d2 | 8192 | 512 | 512 | True | 16 | 1 | 1 |
+| d0 | 2048 | 128 | 128 | DP | 16 | 1 | 1 |
+| d1 | 128 | 128 | 128 | reduction | — | — | — |
+| d2 | 2048 | 512 | 128 | reduction | — | — | — |
+| d4 | 128 | 128 | 128 | DP | 1 | 1 | 1 |
 
-d0 is a reduction dimension — it is not emitted here. d1 and d2 are data-parallel:
+d1 and d2 are reduction dimensions — not emitted here. d0 and d4 are data-parallel:
 
 ```python
-for i_block_d1 in range(64):
-    for i_block_d2 in range(16):
-        for i_tile_d1 in range(1):
-            for i_tile_d2 in range(1):
-                for i_ig_d1 in range(1):
-                    for i_ig_d2 in range(1):
+for i_block_d0 in range(16):
+    for i_block_d4 in range(1):
+        for i_tile_d0 in range(1):
+            for i_tile_d4 in range(1):
+                for i_ig_d0 in range(1):
+                    for i_ig_d4 in range(1):
                         ...
 ```
 
-Transpose + matmul: `rhs = GymTranspose()(data=rhs_T)`, `result = GymMatmul()(stationary=lhs_T, moving=rhs)` where lhs_T is (d0, d1) and rhs_T is (d2, d0). Same return tensor dims (d1, d2), but the interleave asymmetry on d2 (tile_size=512 from matmul N, min_tile_size=128 from transpose P) changes the ig trip count:
+## 3. Reference Kernel
 
-| Dim | dim_size | tile_size | min_tile_size | is_data_parallel | block | tile | ig |
-|---|---|---|---|---|---|---|---|
-| d1 | 8192 | 128 | 128 | True | 64 | 1 | 1 |
-| d2 | 8192 | 512 | 128 | True | 16 | 1 | 4 |
+`softmax(mask(scale * Q @ K.T)) @ V`. Inputs: `Q(d0, d1), K(d2, d1), V(d2, d4)`. Return `output(d0, d4)`. With `seq_q=seq_k=2048, d_k=d_v=128`:
+
+| Dim | dim_size | tile_size | min_tile_size | DP/reduction |
+|---|---|---|---|---|
+| d0 | 2048 | 128 | 128 | DP |
+| d1 | 128 | 128 | 128 | reduction |
+| d2 | 2048 | 512 | 128 | reduction |
+| d4 | 128 | 128 | 128 | DP |
+
+Op graph (11 ops, DAG with diamond at ops 4→5/6):
+
+```
+[0] transpose Q ──→ [2] matmul QK ──→ [3] affine_select ──→ [4] tensor_scalar ─┬→ [5] tensor_reduce ─┐
+[1] transpose K ──↗                                                              └→ [6] act_reduce ←───┘
+                                                                                      ├→ [7] activation ──→ [10] tensor_scalar
+                                                                                      └→ [8] transpose ──→ [9] matmul SV ──↗
+```
+
+The reference attention CTE kernel organizes this DAG into sequential phases inside a d2 section loop, with d0 iteration inside. Translated to our dimension names (reference variable names in parentheses):
 
 ```python
-for i_block_d1 in range(64):
-    for i_block_d2 in range(16):
-        for i_tile_d1 in range(1):
-            for i_tile_d2 in range(1):
-                for i_ig_d1 in range(1):
-                    for i_ig_d2 in range(4):
-                        ...
+for i_d2_section in range(1):                     # (section_idx) d2 block groups; >1 when seq_k > 8192
+    nl.load K[i_d2_section]                       #   all d2 tiles in section → SBUF
+    nl.load V[i_d2_section]                       #   all d2 tiles in section → SBUF
+
+    for i_d0 in range(16):                        # (grp_i) DP: d0 tiles, 128 rows each
+        nl.load Q[i_d0]                           #   one d0 tile → SBUF
+        nisa.nc_transpose Q → Q_t                 #   [0] d0×d1 → d1×d0
+
+        # --- Phase: QK + mask + scale + max (ops 2,3,4,5 fused) ---
+        # (reference: _qk_and_max_impl)
+        nisa.memset partial_max
+        for i_d2 in range(4):                     # (k_tile_idx) d2 tiles, 512 each
+            nisa.nc_matmul Q_t, K_t → S           #   [2] d1 reduced, one d2 tile
+            nisa.affine_select S → masked_S        #   [3] causal mask
+            nisa.tensor_scalar masked_S → scaled_S #   [4] scale + partial max
+
+        # (reference: _update_max_impl)
+        nisa.tensor_reduce partial_max → neg_max   # [5] max across all d2 tiles
+
+        # --- Phase: exp + sum + transpose (ops 6,8 fused) ---
+        # (reference: _exp_impl)
+        nisa.memset partial_sum
+        for i_d2 in range(4):                     # (exp_tile_idx) d2 tiles, 512 each
+            nisa.activation_reduce → exp_S, sum_exp #  [6] exp(scaled_S - neg_max) + sum
+            nisa.nc_transpose exp_S → exp_S_t       #  [8] d0×d2 → d2×d0
+
+        # --- Phase: PV matmul (op 9 alone) ---
+        # (reference: _pv_impl)
+        nisa.memset pv_accum
+        for i_d2 in range(4):                     # (mm2_grp×mm2_i) d2 tiles, 512 each
+            nisa.nc_matmul exp_S_t, V → attn       #  [9] d2 accumulated
+        nisa.tensor_copy psum → sbuf
+
+        # --- Phase: write-back (ops 7,10 — no d2 loop) ---
+        # (reference: _write_back_impl)
+        nisa.activation sum_exp → inv_sum          # [7] reciprocal
+        nisa.tensor_scalar attn, inv_sum → output  # [10] scale
+        nl.store output → HBM
 ```
+
+**Structure.** The d2 section loop is outermost — K and V are loaded once per section, then all d0 tiles (Q groups) are processed against that section's K/V. Within each d0 iteration, phases are sequential siblings: each d2-dependent phase has its own `i_d2` tile loop. Ops within a phase share one d2 loop: QK+mask+scale+max (ops 2–5) fused, exp+transpose (ops 6+8) fused, PV matmul (op 9) alone. Write-back (ops 7, 10) has no d2 loop.
+
+**Blocking-axis boundaries frame each phase.** `memset` before the d2 loop zeros the accumulator; `tensor_reduce`/`tensor_copy` after finalizes the reduction. d1 is trivial (1 tile) — consumed entirely within each `nc_matmul` call, no explicit loop.
+
+**The diamond** (op 4 → ops 5,6) is sequenced: max (op 5) completes before exp+sum (op 6) starts, since op 6 consumes neg_max. Both paths reconverge at op 10.
