@@ -219,9 +219,71 @@ for i_block_d2 in range(4):
 ...
 ```
 
-This is the default lowering — each group gets its own independent reduction loops. The reference kernel (section 4) is the result of applying transforms (loop fusion, online softmax) on top of this baseline.
+This is the default lowering — each group gets its own independent reduction loops. The reference kernel (section 5) is the result of applying transforms (loop fusion, online softmax) on top of this baseline.
 
-## 4. Reference Kernel
+## 4. Tensor Buffers
+
+Every on-chip tensor (`isa_loc` is `"sbuf"` or `"psum"`) needs a buffer allocation. HBM tensors (kernel inputs) are excluded — they are parameters, not on-chip buffers. The return tensor gets both an HBM allocation (section 1, for the final store destination) and an on-chip buffer here (for the intermediate compute result, e.g. PSUM accumulator).
+
+**Placement rule: allocate at the top of the loop level where the buffer lives.** A buffer that is reused across iterations of a loop is allocated outside that loop. A buffer that is recycled each iteration is allocated at the top of the loop body. In the default lowering (degree-1, no load placement), every on-chip buffer holds one tile and is consumed within the innermost DP loop body, so all allocations go at the top of the innermost DP loop body, before any reduction loops.
+
+The reference attention CTE kernel follows this same rule: persistent buffers (running_max, running_sum) are allocated before the section loop because they survive across sections. Per-section buffers (K/V SBUF, compute temps) are allocated at the top of the section loop body, with the allocator reset to a checkpoint each iteration so memory is reused.
+
+**Buffer shape.** Every on-chip buffer uses a uniform layout with `(tile_size, num_tiles)` per dimension. A 2D tensor with `dim_ids = (dA, dB)` gets a 4D buffer:
+
+```python
+{loc}_{name} = nl.ndarray(
+    ({dA_tile_size}, {dA_num_tiles}, {dB_num_tiles}, {dB_tile_size}),
+    dtype=nl.{dtype},
+    buffer=nl.{isa_loc},
+)
+```
+
+A 1D tensor with `dim_ids = (dA,)` gets a 2D buffer: `({dA_tile_size}, {dA_num_tiles})`.
+
+**`num_tiles` formula.** For each dimension, `num_tiles` is the product of four factors:
+
+$$\text{num\_tiles} = \text{num\_blocks} \times \text{tiles\_per\_block} \times \text{interleave} \times \text{buffer\_degree}$$
+
+where `num_blocks = dim_size / (tiles_per_block * tile_size)`, `interleave = tile_size / min_tile_size`, and `buffer_degree` comes from `ir.buffer_degrees[(group_idx, tensor_name, dim_id)]`. In the default lowering (`tiles_per_block = 1`, `buffer_degree = 1`, no load hoisting), `num_tiles = 1` for every dimension — the buffer holds exactly one tile.
+
+Transforms grow `num_tiles` by changing these factors: `tiles_per_block` increases the tile-loop range, `buffer_degrees` adds multi-buffering capacity (e.g. double-buffering = 2), and `load_placements` hoists buffers to cover larger tile ranges.
+
+**Tile sizes** come from `dim_analysis.dims[dim_id].tile_size`.
+
+**PSUM staging.** A PSUM tensor gets an additional SBUF staging buffer (`sbuf_{name}`) when a consumer requires it. Each op declares per-operand memory requirements via `INPUT_LOCS` (e.g. `{"stationary": "sbuf", "moving": "sbuf"}` for nc_matmul). The renderer checks each consumer: if any operand reading this tensor has `INPUT_LOCS[role] == "sbuf"`, an SBUF staging buffer is emitted. The return tensor also needs staging (dma_copy to HBM reads from SBUF).
+
+Currently all ops declare `INPUT_LOCS = "sbuf"` for all operands, so every PSUM tensor gets staging. The consumer-driven check is generic — if a future op accepts PSUM input directly, its tensors would skip staging automatically.
+
+**Dtype.** PSUM buffers from ops with `PSUM_DTYPE` set (nc_matmul → float32) use that dtype. All SBUF buffers use the tensor's dtype.
+
+**Buffer naming.** `sbuf_{tensor_name}` for SBUF, `psum_{tensor_name}` for PSUM.
+
+### 4.1 Example: Attention
+
+On-chip tensors (Q, K, V excluded — HBM inputs). All `num_tiles = 1` in the default lowering:
+
+```python
+psum_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.psum)       # (d1, d0)
+sbuf_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)       # staging: nc_matmul reads sbuf
+psum_K_t = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.psum)       # (d1, d2)
+sbuf_K_t = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)       # staging: nc_matmul reads sbuf
+psum_S = nl.ndarray((128, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)          # (d0, d2)
+sbuf_S = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)         # staging: affine_select reads sbuf
+sbuf_masked_S = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2)
+sbuf_scaled_S = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2)
+sbuf_neg_max = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)           # (d0)
+sbuf_exp_S = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)     # (d0, d2)
+sbuf_sum_exp = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)           # (d0)
+sbuf_inv_sum = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)           # (d0)
+psum_exp_S_t = nl.ndarray((512, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.psum)   # (d2, d0)
+sbuf_exp_S_t = nl.ndarray((512, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)   # staging: nc_matmul reads sbuf
+psum_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.float32, buffer=nl.psum)       # (d0, d4)
+sbuf_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)      # staging: tensor_scalar reads sbuf
+sbuf_output = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)    # (d0, d4)
+```
+
+## 5. Reference Kernel
 
 `softmax(mask(scale * Q @ K.T)) @ V`. Inputs: `Q(d0, d1), K(d2, d1), V(d2, d4)`. Return `output(d0, d4)`. With `seq_q=seq_k=2048, d_k=d_v=128`:
 

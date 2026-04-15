@@ -29,6 +29,7 @@ class NKIMatmul(NKIOp):
     TILE_LIMITS: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": MATMUL_FREE_MAX}
     ISA_LOC: ClassVar[str] = "psum"
     PSUM_DTYPE: ClassVar[str | None] = "float32"
+    INPUT_LOCS: ClassVar[dict[str, str]] = {"stationary": "sbuf", "moving": "sbuf"}
 
     def __call__(self, stationary: np.ndarray, moving: np.ndarray, **_: object) -> np.ndarray:
         """CPU simulation: stationary.T @ moving.

@@ -33,6 +33,7 @@ class NKITensorReduce(NKIOp):
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": VE_PARTITION_MAX, "F": VE_FREE_MAX}
     ISA_LOC: ClassVar[str] = "sbuf"
     PSUM_DTYPE: ClassVar[str | None] = None
+    INPUT_LOCS: ClassVar[dict[str, str]] = {"data": "sbuf"}
 
     def __call__(
         self, data: np.ndarray, op: str, axis: int = 1, negate: bool = False, keepdims: bool = False, **_: object

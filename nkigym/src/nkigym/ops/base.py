@@ -25,6 +25,9 @@ class NKIOp:
         TILE_LIMITS: Hardware tile size per abstract axis.
         ISA_LOC: Where the ISA writes output (``"psum"`` or ``"sbuf"``).
         PSUM_DTYPE: Override dtype for PSUM buffer (``None`` = input dtype).
+        INPUT_LOCS: Per-operand memory requirement. Maps
+            ``role -> "sbuf"`` (SBUF only) or ``"sbuf_or_psum"``.
+            Used by the renderer to decide PSUM→SBUF staging.
     """
 
     NAME: ClassVar[str] = ""
@@ -34,6 +37,7 @@ class NKIOp:
     TILE_LIMITS: ClassVar[dict[str, int]] = {}
     ISA_LOC: ClassVar[str] = "sbuf"
     PSUM_DTYPE: ClassVar[str | None] = None
+    INPUT_LOCS: ClassVar[dict[str, str]] = {}
 
     @abstractmethod
     def __call__(self, **kwargs: Any) -> Any:

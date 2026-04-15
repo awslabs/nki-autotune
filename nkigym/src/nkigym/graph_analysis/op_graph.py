@@ -36,6 +36,8 @@ class OpGraph:
     nodes: list[str]
     edges: list[tuple[int, int, str, str]]
     op_tensors: list[tuple[dict[str, str], list[str]]]
+    op_psum_dtypes: list[str | None]
+    op_input_locs: list[dict[str, str]]
 
     def __repr__(self) -> str:
         """Render the DAG as a per-node flow.
@@ -101,10 +103,14 @@ def build_op_graph(func: Callable[..., np.ndarray]) -> OpGraph:
     nodes: list[str] = []
     edges: list[tuple[int, int, str, str]] = []
     op_tensors: list[tuple[dict[str, str], list[str]]] = []
+    op_psum_dtypes: list[str | None] = []
+    op_input_locs: list[dict[str, str]] = []
     tensor_producers: dict[str, int] = {}
 
     for i, (op_cls, name_kwargs, output_names) in enumerate(ops):
         nodes.append(op_cls.NAME)
+        op_psum_dtypes.append(op_cls.PSUM_DTYPE)
+        op_input_locs.append(dict(op_cls.INPUT_LOCS))
 
         inputs: dict[str, str] = {}
         for role, var_name in name_kwargs.items():
@@ -118,4 +124,6 @@ def build_op_graph(func: Callable[..., np.ndarray]) -> OpGraph:
         for oname in output_names:
             tensor_producers[oname] = i
 
-    return OpGraph(nodes=nodes, edges=edges, op_tensors=op_tensors)
+    return OpGraph(
+        nodes=nodes, edges=edges, op_tensors=op_tensors, op_psum_dtypes=op_psum_dtypes, op_input_locs=op_input_locs
+    )

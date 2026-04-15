@@ -32,6 +32,7 @@ class NKITranspose(NKIOp):
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": TRANSPOSE_BLOCK, "F": TRANSPOSE_BLOCK}
     ISA_LOC: ClassVar[str] = "psum"
     PSUM_DTYPE: ClassVar[str | None] = None
+    INPUT_LOCS: ClassVar[dict[str, str]] = {"data": "sbuf"}
 
     def __call__(self, data: np.ndarray, **_: object) -> np.ndarray:
         """CPU simulation: data.T.

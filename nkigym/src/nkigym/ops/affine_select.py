@@ -35,6 +35,7 @@ class NKIAffineSelect(NKIOp):
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": VE_PARTITION_MAX, "F": VE_FREE_MAX}
     ISA_LOC: ClassVar[str] = "sbuf"
     PSUM_DTYPE: ClassVar[str | None] = None
+    INPUT_LOCS: ClassVar[dict[str, str]] = {"on_true_tile": "sbuf"}
 
     def __call__(
         self,
