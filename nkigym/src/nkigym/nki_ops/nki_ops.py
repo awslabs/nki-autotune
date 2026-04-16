@@ -1,12 +1,11 @@
 """NKI op rendering: ISA calls, memset, and PSUM staging."""
 
-from nkigym.codegen.buffers import find_psum_tensors_needing_sbuf
-from nkigym.codegen.kernel_ir import KernelIR
 from nkigym.dim_analysis.dim_analysis import TensorInfo
+from nkigym.kernel_ir import KernelIR
 
 
 def render_ops_for_group(
-    ir: KernelIR, group: list[int], red_dims: list[str], inner_indent: int, base_indent: int
+    ir: KernelIR, group: list[int], red_dims: list[str], inner_indent: int, base_indent: int, needs_staging: set[str]
 ) -> tuple[list[str], list[str], list[str]]:
     """Emit ISA calls, memset, and PSUM staging for a fusion group.
 
@@ -21,6 +20,7 @@ def render_ops_for_group(
         red_dims: Reduction dim IDs for this group.
         inner_indent: Indentation at the innermost loop body.
         base_indent: Indentation at the group's top level (before reduction loops).
+        needs_staging: PSUM tensors needing SBUF staging.
 
     Returns:
         Tuple of (pre_lines, inner_lines, post_lines):
@@ -30,7 +30,6 @@ def render_ops_for_group(
     """
     da = ir.dim_analysis
     graph = ir.op_graph
-    needs_staging = find_psum_tensors_needing_sbuf(ir)
 
     pre_lines: list[str] = []
     inner_lines: list[str] = []

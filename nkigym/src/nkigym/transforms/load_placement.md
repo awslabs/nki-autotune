@@ -6,7 +6,7 @@
 
 Each HBM input's DMA load sits at a position in the fusion group's loop nest. Moving a load **up** (hoisting) pre-loads more sub-tiles into a larger SBUF buffer; moving it **down** (sinking) shrinks the buffer but re-executes the DMA more often. In the base IR, all loads start at the innermost position.
 
-Each dimension contributes a block loop (`i_block_d`), a psum-batch loop (`i_psum_batch_d`), a tile loop (`i_tile_d`), and an interleave group loop (`i_ig_d`) to the nest. For DMA, the sub-block loops (psum-batch, tile, ig) are encapsulated inside the `load_tensor_block` / `save_tensor_block` gadgets from `nkigym.gadgets` — the gadgets iterate over all tile slots in the buffer internally. The main loop nest only provides block-level offsets to the gadget; the compute loops remain explicit.
+Each dimension contributes a block loop (`i_block_d`), a psum-batch loop (`i_psum_batch_d`), a tile loop (`i_tile_d`), and an interleave group loop (`i_ig_d`) to the nest. For DMA, the sub-block loops (psum-batch, tile, ig) are encapsulated inside the `load_tensor_block` / `save_tensor_block` gadgets from `nkigym.dma.gadgets` — the gadgets iterate over all tile slots in the buffer internally. The main loop nest only provides block-level offsets to the gadget; the compute loops remain explicit.
 
 For each dimension $d$ that the tensor depends on (**relevant dim**), the load position determines the buffer's sub-tile count on $d$:
 

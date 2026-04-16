@@ -1,6 +1,6 @@
 """Data-parallel loop generation: outermost loops over output tile coordinates."""
 
-from nkigym.codegen.kernel_ir import KernelIR, get_tpb
+from nkigym.kernel_ir import KernelIR, get_tpb
 
 
 def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:

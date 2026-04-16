@@ -1,8 +1,8 @@
 """DMA codegen: load and store instructions for HBM↔SBUF transfers."""
 
-from nkigym.codegen.kernel_ir import KernelIR, get_tpb
 from nkigym.dim_analysis.dim_analysis import DimAnalysis, TensorInfo
 from nkigym.graph_analysis.op_graph import OpGraph
+from nkigym.kernel_ir import KernelIR, get_tpb
 
 
 def render_loads_for_group(ir: KernelIR, group: list[int], indent: int) -> list[str]:

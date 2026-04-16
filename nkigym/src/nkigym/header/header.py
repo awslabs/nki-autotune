@@ -21,7 +21,7 @@ def render_header(da: DimAnalysis) -> str:
     lines.append("import nki.isa as nisa")
     lines.append("import nki.language as nl")
     lines.append("import numpy as np")
-    lines.append("from nkigym.gadgets.dma import load_tensor_block, stage_tensor_block, store_tensor_block")
+    lines.append("from nkigym.dma.gadgets import load_tensor_block, stage_tensor_block, store_tensor_block")
     lines.append("")
     lines.append("")
     lines.append("@nki.jit")

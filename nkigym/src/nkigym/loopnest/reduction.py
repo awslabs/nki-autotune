@@ -2,14 +2,14 @@
 
 import heapq
 
-from nkigym.codegen.dma import render_loads_for_group
-from nkigym.codegen.kernel_ir import KernelIR, get_tpb
-from nkigym.codegen.nki_ops import render_ops_for_group
 from nkigym.dim_analysis.dim_analysis import DimAnalysis
+from nkigym.dma.codegen import render_loads_for_group
 from nkigym.graph_analysis.op_graph import OpGraph
+from nkigym.kernel_ir import KernelIR, get_tpb
+from nkigym.nki_ops.nki_ops import render_ops_for_group
 
 
-def render_reduction_loops(ir: KernelIR, dp_indent: int) -> str:
+def render_reduction_loops(ir: KernelIR, dp_indent: int, needs_staging: set[str]) -> str:
     """Emit the reduction loop region inside the innermost DP loop.
 
     Each fusion group emits its own reduction loop nest as a
@@ -19,6 +19,7 @@ def render_reduction_loops(ir: KernelIR, dp_indent: int) -> str:
     Args:
         ir: Complete kernel IR.
         dp_indent: Indentation level of the innermost DP loop body.
+        needs_staging: PSUM tensors needing SBUF staging.
 
     Returns:
         Indented NKI source lines for the reduction region,
@@ -34,7 +35,7 @@ def render_reduction_loops(ir: KernelIR, dp_indent: int) -> str:
     for group_idx in group_order:
         group = ir.fusion_groups[group_idx]
         red_dims = _group_reduction_dims(group, graph, da, dp_dims)
-        group_lines = _render_group(ir, group_idx, group, red_dims, dp_indent)
+        group_lines = _render_group(ir, group_idx, group, red_dims, dp_indent, needs_staging)
         lines.extend(group_lines)
 
     return "\n".join(lines)
@@ -101,7 +102,9 @@ def _group_reduction_dims(group: list[int], graph: OpGraph, da: DimAnalysis, dp_
     return sorted(all_dims - dp_dims)
 
 
-def _render_group(ir: KernelIR, group_idx: int, group: list[int], red_dims: list[str], base_indent: int) -> list[str]:
+def _render_group(
+    ir: KernelIR, group_idx: int, group: list[int], red_dims: list[str], base_indent: int, needs_staging: set[str]
+) -> list[str]:
     """Render one fusion group's reduction loop nest.
 
     Args:
@@ -110,6 +113,7 @@ def _render_group(ir: KernelIR, group_idx: int, group: list[int], red_dims: list
         group: List of op indices in this group.
         red_dims: Sorted reduction dim IDs for this group.
         base_indent: Indentation level to start at.
+        needs_staging: PSUM tensors needing SBUF staging.
 
     Returns:
         List of source lines.
@@ -128,7 +132,9 @@ def _render_group(ir: KernelIR, group_idx: int, group: list[int], red_dims: list
     num_loops = len(ordered_red) * 3
     inner_indent = base_indent + num_loops
 
-    pre_lines, inner_lines, post_lines = render_ops_for_group(ir, group, red_dims, inner_indent, base_indent)
+    pre_lines, inner_lines, post_lines = render_ops_for_group(
+        ir, group, red_dims, inner_indent, base_indent, needs_staging
+    )
 
     lines.extend(pre_lines)
 

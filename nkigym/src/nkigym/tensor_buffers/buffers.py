@@ -1,10 +1,10 @@
 """Tensor buffer allocation: on-chip SBUF and PSUM buffers."""
 
-from nkigym.codegen.kernel_ir import KernelIR, get_tpb
 from nkigym.dim_analysis.dim_analysis import TensorInfo
+from nkigym.kernel_ir import KernelIR, get_tpb
 
 
-def render_buffers(ir: KernelIR, indent: int) -> str:
+def render_buffers(ir: KernelIR, indent: int, needs_sbuf_staging: set[str]) -> str:
     """Emit buffer allocations for all tensors needing on-chip buffers.
 
     HBM inputs get an SBUF staging buffer for DMA loads. On-chip
@@ -16,6 +16,7 @@ def render_buffers(ir: KernelIR, indent: int) -> str:
     Args:
         ir: Complete kernel IR.
         indent: Indentation level for the allocations.
+        needs_sbuf_staging: PSUM tensors needing SBUF staging.
 
     Returns:
         Indented NKI source lines for buffer allocations.
@@ -23,7 +24,6 @@ def render_buffers(ir: KernelIR, indent: int) -> str:
     da = ir.dim_analysis
 
     tensor_to_psum_dtype = _build_psum_dtype_map(ir)
-    needs_sbuf_staging = find_psum_tensors_needing_sbuf(ir)
 
     lines: list[str] = []
     pad = "    " * indent
