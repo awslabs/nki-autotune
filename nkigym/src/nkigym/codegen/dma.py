@@ -1,8 +1,8 @@
 """DMA codegen: load and store instructions for HBM↔SBUF transfers."""
 
-from nkigym.dim_analysis.dim_analysis import DimAnalysis, TensorInfo
-from nkigym.graph_analysis.op_graph import OpGraph
 from nkigym.kernel_ir import KernelIR, get_tpb
+from nkigym.kernel_ir.dim_analysis import DimAnalysis, TensorInfo
+from nkigym.kernel_ir.op_graph import OpGraph
 
 
 def render_loads_for_group(ir: KernelIR, group: list[int], indent: int) -> list[str]:
@@ -110,8 +110,8 @@ def _offset_expr(dim_id: str, da: DimAnalysis, tpb: int) -> str:
     consistency.
     """
     di = da.dims[dim_id]
-    tile_size = di.tile_size
-    min_tile_size = di.min_tile_size
+    tile_size = di.logical_tile_size
+    min_tile_size = di.physical_tile_size
     block_stride = tpb * tile_size
     return (
         f"i_block_{dim_id} * {block_stride}" f" + i_tile_{dim_id} * {tile_size}" f" + i_ig_{dim_id} * {min_tile_size}"

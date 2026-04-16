@@ -1,6 +1,6 @@
 """Data-parallel loop generation: outermost loops over output tile coordinates."""
 
-from nkigym.kernel_ir import KernelIR, get_tpb
+from nkigym.kernel_ir.ir import KernelIR, get_tpb
 
 
 def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
@@ -33,7 +33,7 @@ def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
 
     for dim_id in dp_dims:
         di = da.dims[dim_id]
-        num_blocks = di.dim_size // (tpb_map[dim_id] * di.tile_size)
+        num_blocks = di.dim_size // (tpb_map[dim_id] * di.logical_tile_size)
         pad = "    " * indent
         lines.append(f"{pad}for i_block_{dim_id} in range({num_blocks}):")
         indent += 1
@@ -45,7 +45,7 @@ def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
 
     for dim_id in dp_dims:
         di = da.dims[dim_id]
-        num_ig = di.tile_size // di.min_tile_size
+        num_ig = di.logical_tile_size // di.physical_tile_size
         pad = "    " * indent
         lines.append(f"{pad}for i_ig_{dim_id} in range({num_ig}):")
         indent += 1

@@ -86,17 +86,18 @@ if __name__ == "__main__":
 
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     CACHE_DIR.mkdir(parents=True)
-
     input_specs = {"a": ((M, K), "bfloat16"), "b": ((K, N), "bfloat16")}
 
+    """Step 1: build IR."""
     ir = build_ir(rmsnorm_matmul_nkigym, input_specs)
-    (CACHE_DIR / "dim_analysis.txt").write_text(repr(ir.dim_analysis))
-
+    (CACHE_DIR / "ir.txt").write_text(repr(ir))
     ir.op_graph.render(CACHE_DIR / "op_graph")
 
+    """Step 2: render IR to NKI source."""
     source = render_ir(ir)
     (CACHE_DIR / "kernel.py").write_text(source)
 
+    """Step 3: simulate."""
     kernel_func = load_kernel(str(CACHE_DIR / "kernel.py"), "rmsnorm_matmul_nkigym")
     golden = rmsnorm_matmul_numpy(a.astype(np.float32), b.astype(np.float32))
     sim_result = nki.simulate(kernel_func)(a=a.astype(np.float32), b=b.astype(np.float32))

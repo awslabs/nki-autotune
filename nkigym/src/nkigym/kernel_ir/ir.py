@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from nkigym.dim_analysis.dim_analysis import DimAnalysis, analyze_dims
-from nkigym.graph_analysis.op_graph import OpGraph, build_op_graph
+from nkigym.kernel_ir.dim_analysis import DimAnalysis, analyze_dims
+from nkigym.kernel_ir.op_graph import OpGraph, build_op_graph
 
 
 @dataclass

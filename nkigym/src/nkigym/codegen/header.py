@@ -1,6 +1,6 @@
 """Kernel header: imports, signature, assertions, HBM output allocation."""
 
-from nkigym.dim_analysis.dim_analysis import DimAnalysis
+from nkigym.kernel_ir.dim_analysis import DimAnalysis
 
 
 def render_header(da: DimAnalysis) -> str:
@@ -21,7 +21,7 @@ def render_header(da: DimAnalysis) -> str:
     lines.append("import nki.isa as nisa")
     lines.append("import nki.language as nl")
     lines.append("import numpy as np")
-    lines.append("from nkigym.dma.gadgets import load_tensor_block, stage_tensor_block, store_tensor_block")
+    lines.append("from nkigym.codegen.gadgets import load_tensor_block, stage_tensor_block, store_tensor_block")
     lines.append("")
     lines.append("")
     lines.append("@nki.jit")

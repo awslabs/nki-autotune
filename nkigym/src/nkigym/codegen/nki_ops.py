@@ -1,7 +1,7 @@
 """NKI op rendering: ISA calls, memset, and PSUM staging."""
 
-from nkigym.dim_analysis.dim_analysis import TensorInfo
 from nkigym.kernel_ir import KernelIR
+from nkigym.kernel_ir.dim_analysis import TensorInfo
 
 
 def render_ops_for_group(
@@ -148,11 +148,11 @@ def _buf_index_expr(ir: KernelIR, tinfo: TensorInfo) -> str:
     ndims = len(tinfo.dim_ids)
     idx = ""
     if ndims == 2:
-        tp = da.dims[tinfo.dim_ids[0]].tile_size
-        tf = da.dims[tinfo.dim_ids[1]].tile_size
+        tp = da.dims[tinfo.dim_ids[0]].physical_tile_size
+        tf = da.dims[tinfo.dim_ids[1]].physical_tile_size
         idx = f"[0:{tp}, 0, 0, 0:{tf}]"
     elif ndims == 1:
-        tp = da.dims[tinfo.dim_ids[0]].tile_size
+        tp = da.dims[tinfo.dim_ids[0]].physical_tile_size
         idx = f"[0:{tp}, 0]"
     return idx
 
@@ -170,8 +170,8 @@ def _dst_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo) -> str:
     idx = ""
     if ndims == 2:
         d_p, d_f = tinfo.dim_ids[0], tinfo.dim_ids[1]
-        di_tp = da.dims[d_p].tile_size
-        di_tf = da.dims[d_f].tile_size
+        di_tp = da.dims[d_p].physical_tile_size
+        di_tf = da.dims[d_f].physical_tile_size
         op_tp = op_tiles.get(d_p, di_tp)
         op_tf = op_tiles.get(d_f, di_tf)
         ig_p = _dim_ig_slice(di_tp, op_tp)
@@ -179,7 +179,7 @@ def _dst_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo) -> str:
         idx = f"[0:{di_tp}, {ig_p}, {ig_f}, 0:{di_tf}]"
     elif ndims == 1:
         d_p = tinfo.dim_ids[0]
-        di_tp = da.dims[d_p].tile_size
+        di_tp = da.dims[d_p].physical_tile_size
         op_tp = op_tiles.get(d_p, di_tp)
         ig_p = _dim_ig_slice(di_tp, op_tp)
         idx = f"[0:{di_tp}, {ig_p}]"
@@ -205,8 +205,8 @@ def _tile_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo) -> str:
     idx = ""
     if ndims == 2:
         d_p, d_f = tinfo.dim_ids[0], tinfo.dim_ids[1]
-        di_tp = da.dims[d_p].tile_size
-        di_tf = da.dims[d_f].tile_size
+        di_tp = da.dims[d_p].physical_tile_size
+        di_tf = da.dims[d_f].physical_tile_size
         op_tp = op_tiles.get(d_p, di_tp)
         op_tf = op_tiles.get(d_f, di_tf)
         ig_p = _dim_ig_slice(di_tp, op_tp)
@@ -214,7 +214,7 @@ def _tile_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo) -> str:
         idx = f"[0:{di_tp}, {ig_p}, {ig_f}, 0:{di_tf}].reshape(({op_tp}, {op_tf}))"
     elif ndims == 1:
         d_p = tinfo.dim_ids[0]
-        di_tp = da.dims[d_p].tile_size
+        di_tp = da.dims[d_p].physical_tile_size
         op_tp = op_tiles.get(d_p, di_tp)
         ig_p = _dim_ig_slice(di_tp, op_tp)
         idx = f"[0:{di_tp}, {ig_p}].reshape(({op_tp},))"

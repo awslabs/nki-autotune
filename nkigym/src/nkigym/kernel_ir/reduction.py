@@ -2,11 +2,11 @@
 
 import heapq
 
-from nkigym.dim_analysis.dim_analysis import DimAnalysis
-from nkigym.dma.codegen import render_loads_for_group
-from nkigym.graph_analysis.op_graph import OpGraph
-from nkigym.kernel_ir import KernelIR, get_tpb
-from nkigym.nki_ops.nki_ops import render_ops_for_group
+from nkigym.codegen.dma import render_loads_for_group
+from nkigym.codegen.nki_ops import render_ops_for_group
+from nkigym.kernel_ir.dim_analysis import DimAnalysis
+from nkigym.kernel_ir.ir import KernelIR, get_tpb
+from nkigym.kernel_ir.op_graph import OpGraph
 
 
 def render_reduction_loops(ir: KernelIR, dp_indent: int, needs_staging: set[str]) -> str:
@@ -143,7 +143,7 @@ def _render_group(
     for dim_id in ordered_red:
         di = da.dims[dim_id]
         tpb = get_tpb(ir, dim_id, group)
-        num_blocks = di.dim_size // (tpb * di.tile_size)
+        num_blocks = di.dim_size // (tpb * di.logical_tile_size)
         p = "    " * indent
         lines.append(f"{p}for i_block_{dim_id} in range({num_blocks}):")
         indent += 1
@@ -156,7 +156,7 @@ def _render_group(
 
     for dim_id in ordered_red:
         di = da.dims[dim_id]
-        num_ig = di.tile_size // di.min_tile_size
+        num_ig = di.logical_tile_size // di.physical_tile_size
         p = "    " * indent
         lines.append(f"{p}for i_ig_{dim_id} in range({num_ig}):")
         indent += 1

@@ -2,7 +2,7 @@
 
 Usage::
 
-    from nkigym.graph_analysis.op_graph import build_op_graph
+    from nkigym.kernel_ir.op_graph import build_op_graph
 
     graph = build_op_graph(my_math_func)
     print(graph)
@@ -15,7 +15,7 @@ from pathlib import Path
 import graphviz
 import numpy as np
 
-from nkigym.dim_analysis.parse import find_ops
+from nkigym.kernel_ir.parse import find_ops
 from nkigym.ops.base import NKIOp
 
 

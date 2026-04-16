@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from nkigym.dim_analysis.parse import find_ops
+from nkigym.kernel_ir.parse import find_ops
 from nkigym.ops.base import NKIOp
 
 
@@ -28,17 +28,19 @@ class DimInfo:
 
     Attributes:
         dim_size: Total number of elements along this dimension.
-        tile_size: max(all op tile limits) on this dimension,
-            clamped to dim_size. Referred to as d{i}_tile_size.
-        min_tile_size: min(all op tile limits) on this dimension,
-            clamped to dim_size. Referred to as d{i}_min_tile_size.
+        logical_tile_size: Iteration granularity. max(all op tile
+            limits) on this dimension, clamped to dim_size.
+        physical_tile_size: Buffer allocation granularity. min(all
+            op tile limits) on this dimension, with partition cap
+            (128) included when the dimension appears as the first
+            axis of any tensor.
         is_data_parallel: True if this dimension appears in the
             kernel's return tensor.
     """
 
     dim_size: int
-    tile_size: int
-    min_tile_size: int
+    logical_tile_size: int
+    physical_tile_size: int
     is_data_parallel: bool
 
 
@@ -99,10 +101,12 @@ class DimAnalysis:
         lines.append("  Dimensions:")
         for dim_id, di in self.dims.items():
             par = "data-parallel" if di.is_data_parallel else "reduction"
+            ig = di.logical_tile_size // di.physical_tile_size
             lines.append(
                 f"    {dim_id}: size={di.dim_size},"
-                f" {dim_id}_tile_size={di.tile_size},"
-                f" {dim_id}_min_tile_size={di.min_tile_size},"
+                f" logical={di.logical_tile_size},"
+                f" physical={di.physical_tile_size},"
+                f" ig={ig},"
                 f" {par}"
             )
 
@@ -272,9 +276,9 @@ def _compute_tile_sizes(
         op_tile_sizes.append(per_op)
 
     for dim_id in max_tile:
+        max_tile[dim_id] = min(max_tile[dim_id], dim_sizes[dim_id])
         if dim_id in partition_dims:
-            max_tile[dim_id] = min(max_tile[dim_id], PARTITION_MAX)
-        min_tile[dim_id] = min(min_tile[dim_id], max_tile[dim_id])
+            min_tile[dim_id] = min(min_tile[dim_id], PARTITION_MAX)
 
     dims = {d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], d in data_parallel_dims) for d in max_tile}
     return dims, op_tile_sizes

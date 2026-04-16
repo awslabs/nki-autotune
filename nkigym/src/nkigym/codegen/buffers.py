@@ -1,7 +1,7 @@
 """Tensor buffer allocation: on-chip SBUF and PSUM buffers."""
 
-from nkigym.dim_analysis.dim_analysis import TensorInfo
 from nkigym.kernel_ir import KernelIR, get_tpb
+from nkigym.kernel_ir.dim_analysis import TensorInfo
 
 
 def render_buffers(ir: KernelIR, indent: int, needs_sbuf_staging: set[str]) -> str:
@@ -108,14 +108,14 @@ def _buffer_shape(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> tuple[in
     shape: tuple[int, ...] = ()
     if len(dim_ids) == 2:
         d_p, d_f = dim_ids[0], dim_ids[1]
-        tile_p = da.dims[d_p].tile_size
-        tile_f = da.dims[d_f].tile_size
+        tile_p = da.dims[d_p].physical_tile_size
+        tile_f = da.dims[d_f].physical_tile_size
         num_tiles_p = _compute_num_tiles(ir, tensor_name, d_p)
         num_tiles_f = _compute_num_tiles(ir, tensor_name, d_f)
         shape = (tile_p, num_tiles_p, num_tiles_f, tile_f)
     elif len(dim_ids) == 1:
         d_p = dim_ids[0]
-        tile_p = da.dims[d_p].tile_size
+        tile_p = da.dims[d_p].physical_tile_size
         num_tiles_p = _compute_num_tiles(ir, tensor_name, d_p)
         shape = (tile_p, num_tiles_p)
 
@@ -142,7 +142,7 @@ def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     di = da.dims[dim_id]
 
     max_op_tile = _max_op_tile_for_tensor(ir, tensor_name, dim_id)
-    ig = max_op_tile // di.tile_size
+    ig = max_op_tile // di.physical_tile_size
 
     tier = ir.load_placements[(tensor_name, dim_id)]
     ops_touching = _ops_for_tensor(ir, tensor_name)
@@ -157,7 +157,7 @@ def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
         blocks_factor = 1
     elif tier == "full":
         tpb_factor = tpb
-        blocks_factor = di.dim_size // (tpb * di.tile_size)
+        blocks_factor = di.dim_size // (tpb * di.logical_tile_size)
     else:
         raise ValueError(f"Unknown load_placement tier: {tier!r}")
 
@@ -168,7 +168,7 @@ def _max_op_tile_for_tensor(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     """Find the largest op tile size on a dimension across all ops touching a tensor."""
     da = ir.dim_analysis
     ops = _ops_for_tensor(ir, tensor_name)
-    max_tile = da.dims[dim_id].tile_size
+    max_tile = da.dims[dim_id].logical_tile_size
     for op_idx in ops:
         op_tile = da.op_tile_sizes[op_idx].get(dim_id)
         if op_tile is not None:

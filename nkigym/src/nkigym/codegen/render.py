@@ -1,11 +1,11 @@
 """render_ir: mechanical lowering of KernelIR to NKI source code."""
 
-from nkigym.dma.codegen import render_store
-from nkigym.header.header import render_header, render_return
+from nkigym.codegen.buffers import find_psum_tensors_needing_sbuf, render_buffers
+from nkigym.codegen.dma import render_store
+from nkigym.codegen.header import render_header, render_return
 from nkigym.kernel_ir import KernelIR
-from nkigym.loopnest.data_parallel import render_data_parallel_loops
-from nkigym.loopnest.reduction import render_reduction_loops
-from nkigym.tensor_buffers.buffers import find_psum_tensors_needing_sbuf, render_buffers
+from nkigym.kernel_ir.data_parallel import render_data_parallel_loops
+from nkigym.kernel_ir.reduction import render_reduction_loops
 
 
 def render_ir(ir: KernelIR) -> str:

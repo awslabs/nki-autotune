@@ -16,7 +16,7 @@ import nki.language as nl
 import numpy as np
 from numpy.typing import NDArray
 
-from nkigym.dma.gadgets import load_tensor_block, stage_tensor_block, store_tensor_block
+from nkigym.codegen.gadgets import load_tensor_block, stage_tensor_block, store_tensor_block
 
 """
 ======== Group A: load placement + loop reordering ========
