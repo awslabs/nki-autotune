@@ -8,32 +8,25 @@ Each op maps its abstract axes (K, M, N or P, F) to concrete dimension IDs (d0, 
 
 Only axes the tensor actually has get mapped. When an op collapses a dimension (e.g. `tensor_reduce` reduces F, producing a 1D output), the reduced axis is gone — downstream ops consuming that 1D tensor see fewer dims, not a spurious size-1 dim. For example, `sum_exp: (d0,)` fed to `activation(data=sum_exp)` maps only P=d0; the F axis declared in `OPERAND_AXES` is skipped because the tensor has no second dimension.
 
-### 2. Dimension Tile Size
+### 2. Dimension Tile Sizes
 
-Each op's tile size per dimension comes from hardware tile limits of the PE array. The Trainium PE array operates on tiles of (128, 128) or (128, 512) depending on the axis role. ISA ops consume these hardware tiles — e.g., `nc_matmul` uses (K=128, M=128, N=512), `nc_transpose` uses (P=128, F=128).
+Each op declares hardware tile limits per abstract axis via `TILE_LIMITS`. These come from the PE array geometry — e.g., `nc_matmul` uses (K=128, M=128, N=512), `nc_transpose` uses (P=128, F=128), vector-engine ops use (P=128, F=512).
 
-**Partition axis constraint.** On-chip buffers have a physical partition dimension capped at 128. If a dimension ever appears as the first (partition) axis of any tensor, its tile size is capped at 128 regardless of op tile limits. This is a hardware constraint in addition to the per-op tile limits.
+Two tile sizes are derived per dimension:
 
-For each dimension `d{i}`:
+**Logical tile size** — the iteration granularity. Each loop step processes one logical tile's worth of data. Computed as the max of all op tile limits on the dimension, clamped to dim_size:
 
-```python
-max_op_tile = max(op_tile_size[op, d{i}] for all ops touching d{i})
-is_ever_partition = any(tensor.dim_ids[0] == d{i} for tensor in all tensors with d{i})
-d{i}_tile_size = min(max_op_tile, 128) if is_ever_partition else max_op_tile
-d{i}_tile_size = min(d{i}_tile_size, dim_size)
-d{i}_min_tile_size = min(op_tile_size[op, d{i}] for all ops touching d{i})
-d{i}_min_tile_size = min(d{i}_min_tile_size, dim_size)
-```
+$$\text{logical\_tile\_size} = \min(\max(\text{op\_tile\_sizes}),\ \text{dim\_size})$$
 
-Per-op behavior depends on how its hardware tile compares to the unified tile:
+**Physical tile size** — the buffer granularity. Buffers are allocated in physical-tile-sized slots. Computed as the min of all op tile limits on the dimension. If the dimension ever appears as the first (partition) axis of any tensor, the partition hardware limit (128) is included:
 
-| Case | Condition | Behavior |
-|---|---|---|
-| Sub-tile | `op_tile < di_tile` | Op processes a sub-region within one buffer tile. Iterates `di_tile / op_tile` times per tile, indexing via reshape. |
-| Exact | `op_tile == di_tile` | One-to-one. Op processes one buffer tile directly. |
-| Multi-tile | `op_tile > di_tile` | Op consumes `op_tile / di_tile` buffer tiles. Reshapes them into a contiguous operand. |
+$$\text{physical\_tile\_size} = \min(\text{op\_tile\_sizes},\ [128\ \text{if partition}])$$
 
-The buffer's `num_tiles` on a dimension includes the interleave factor from the largest op: `ig = max(op_tile_size[op, d{i}]) / d{i}_tile_size`. This ensures the buffer holds enough slots for the largest op's tile. `ig ≥ 1` always, since `d{i}_tile_size ≤ max(op_tile_size)` (it's capped, not raised).
+The **interleave factor** `ig = logical_tile_size / physical_tile_size` is how many physical slots make up one logical tile in the buffer. When all ops agree on tile size and no partition cap applies, ig = 1.
+
+Within one logical tile, each op:
+- Iterates `logical_tile_size / op_tile_size` times (the ig sub-loop packs multiple op invocations)
+- Consumes `op_tile_size / physical_tile_size` physical buffer slots per invocation
 
 ### 3. Data-Parallel Classification
 
@@ -90,20 +83,24 @@ Hardware tile limits per op (P is always 128):
 | tensor_scalar, activation, activation_reduce, affine_select | 128 | SBUF capacity | Bounded by SBUF partition size, not a fixed tile |
 | tensor_reduce | 128 | SBUF capacity | Reduces free axis; same SBUF bound |
 
-For dimension tile size, elementwise/reduce ops don't impose a binding F constraint — their SBUF limit is far above the matmul/transpose tiles. The binding constraints come from `nc_matmul` N=512 and `nc_transpose` P/F=128.
+For dimension tile sizes, elementwise/reduce ops don't impose a binding F constraint — their SBUF limit is far above the matmul/transpose tiles. The binding constraints come from `nc_matmul` N=512 and `nc_transpose` P/F=128.
 
-The partition axis constraint additionally affects d2 and d4: d2 appears as the partition axis of K `(d2, d1)`, exp_S_t `(d2, d0)`, etc.; d4 appears as partition of V `(d2, d4)` — no, V has d2 first. Actually d4 only appears as the free axis of V and output, never as partition. So only d2 is capped.
+| Dimension | Semantic | Size | Binding ops | Partition? | logical_tile | physical_tile | ig |
+|---|---|---|---|---|---|---|---|
+| d0 | seq_q | 4096 | transpose(P=128), matmul(M=128) | Yes | 128 | 128 | 1 |
+| d1 | d_k | 128 | transpose(F=128), matmul(K=128) | Yes | 128 | 128 | 1 |
+| d2 | seq_k | 4096 | transpose(P=128), matmul(N=512) | Yes | 512 | 128 | 4 |
+| d4 | d_v | 128 | matmul(N=512) | No | 128 | 128 | 1 |
 
-| Dimension | Semantic | Size | Binding ops | Partition? | d{i}_tile_size | d{i}_min_tile_size |
-|---|---|---|---|---|---|---|
-| d0 | seq_q | 4096 | transpose(P=128), matmul(M=128) | Yes (Q, S, ...) | 128 | 128 |
-| d1 | d_k | 128 | transpose(F=128), matmul(K=128) | Yes (Q_t, K_t) | 128 | 128 |
-| d2 | seq_k | 4096 | transpose(P=128), matmul(N=512) | Yes (K, exp_S_t) | 128 | 128 |
-| d4 | d_v | 128 | matmul(N=512) | No | 512 | 512 |
+d0: logical = `min(max(128, 128), 4096) = 128`. physical = `min(128, 128, 128) = 128`. ig = 1.
 
-d2: `max(op_tiles) = 512` from matmul N, but d2 appears as partition of K `(d2, d1)` and exp_S_t `(d2, d0)` → capped to 128. The buffer holds 128-element d2 tiles. nc_matmul needs 512 elements of d2 per call (N=512), so it consumes `ig = 512/128 = 4` buffer tiles and reshapes them into a contiguous 512-wide operand. Transpose and VE ops use 128 per call — no reshape needed.
+d1: logical = `min(max(128, 128), 128) = 128`. physical = `min(128, 128, 128) = 128`. ig = 1.
 
-d4: never partition → `d4_tile_size = 512` from matmul N. But `dim_size = 128 < 512` → clamped to 128. So `d4_tile_size = 128 = d4_min_tile_size`, no interleave.
+d2: logical = `min(max(128, 512), 4096) = 512`. physical = `min(128, 512) = 128`, partition cap applied → `min(128, 128) = 128`. ig = 512/128 = 4. Per op:
+- nc_matmul: `512/512 = 1` call per logical tile, `512/128 = 4` physical slots per call → 1 × 4 = 4.
+- transpose/VE: `512/128 = 4` calls per logical tile, `128/128 = 1` physical slot per call → 4 × 1 = 4.
+
+d4: logical = `min(max(512), 128) = 128` (clamped to dim_size). physical = `min(512, 128) = 128`, not partition → no cap. ig = 1.
 
 ### Step 3 — Data-parallel classification
 
