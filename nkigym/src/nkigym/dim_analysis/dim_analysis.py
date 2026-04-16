@@ -236,17 +236,30 @@ def _create_outputs(
 
 
 def _compute_tile_sizes(
-    ops: list[tuple[type[NKIOp], dict[str, str], list[str]]],
+    ops: list[tuple[type[NKIOp], dict[str, str], list[str], dict[str, str]]],
     per_op_maps: list[dict[str, str]],
     dim_sizes: dict[str, int],
     data_parallel_dims: set[str],
+    tensors: dict[str, "_Tensor"],
 ) -> tuple[dict[str, DimInfo], list[dict[str, int]]]:
-    """Compute per-dimension tile sizes, classification, and per-op tile sizes."""
+    """Compute per-dimension tile sizes, classification, and per-op tile sizes.
+
+    Applies the partition axis constraint: if a dimension appears
+    as the first (partition) axis of any tensor, its tile_size is
+    capped at 128.
+    """
+    PARTITION_MAX = 128
+
+    partition_dims: set[str] = set()
+    for t in tensors.values():
+        if t.dim_ids:
+            partition_dims.add(t.dim_ids[0])
+
     max_tile: dict[str, int] = {}
     min_tile: dict[str, int] = {}
     op_tile_sizes: list[dict[str, int]] = []
 
-    for (op_cls, _, _), local in zip(ops, per_op_maps):
+    for (op_cls, _, _, _), local in zip(ops, per_op_maps):
         per_op: dict[str, int] = {}
         for abstract_axis, limit in op_cls.TILE_LIMITS.items():
             if abstract_axis not in local:
@@ -257,6 +270,11 @@ def _compute_tile_sizes(
             max_tile[dim_id] = max(max_tile.get(dim_id, clamped), clamped)
             min_tile[dim_id] = min(min_tile.get(dim_id, clamped), clamped)
         op_tile_sizes.append(per_op)
+
+    for dim_id in max_tile:
+        if dim_id in partition_dims:
+            max_tile[dim_id] = min(max_tile[dim_id], PARTITION_MAX)
+        min_tile[dim_id] = min(min_tile[dim_id], max_tile[dim_id])
 
     dims = {d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], d in data_parallel_dims) for d in max_tile}
     return dims, op_tile_sizes
@@ -293,7 +311,7 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
     per_op_maps: list[dict[str, str]] = []
     dim_sizes: dict[str, int] = {}
 
-    for op_cls, name_kwargs, output_names in ops:
+    for op_cls, name_kwargs, output_names, _all_kwargs in ops:
         operand_map = {k: v for k, v in name_kwargs.items() if v in tensors}
         local = _build_axis_map(op_cls, operand_map, tensors, dim_counter, per_op_maps, dim_sizes)
         per_op_maps.append(local)
@@ -304,7 +322,7 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
         raise ValueError(f"Return tensor {return_name!r} not found")
     data_parallel_dims = set(tensors[return_name].dim_ids)
 
-    dims, op_tile_sizes = _compute_tile_sizes(ops, per_op_maps, dim_sizes, data_parallel_dims)
+    dims, op_tile_sizes = _compute_tile_sizes(ops, per_op_maps, dim_sizes, data_parallel_dims, tensors)
 
     tensor_infos: dict[str, TensorInfo] = {}
     for name, t in tensors.items():

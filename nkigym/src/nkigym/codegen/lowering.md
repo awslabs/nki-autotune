@@ -229,35 +229,48 @@ Every tensor needs a buffer allocation. HBM inputs get an SBUF staging buffer (`
 
 The reference attention CTE kernel follows this same rule: persistent buffers (running_max, running_sum) are allocated before the section loop because they survive across sections. Per-section buffers (K/V SBUF, compute temps) are allocated at the top of the section loop body, with the allocator reset to a checkpoint each iteration so memory is reused.
 
-**Buffer shape.** Every on-chip buffer uses a uniform layout with `(tile_size, num_tiles)` per dimension. A 2D tensor with `dim_ids = (dA, dB)` gets a 4D buffer:
+**Buffer shape.** SBUF and PSUM buffers use different layouts:
+
+**SBUF** buffers use a 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)` for 2D tensors, or `(tile_size_P, num_tiles_P)` for 1D tensors. `tile_size` is the unified (global) tile size per dimension. `num_tiles` includes the interleave factor (see below). Multi-tile SBUF is a single `nl.ndarray` allocation:
 
 ```python
-{loc}_{name} = nl.ndarray(
+sbuf_{name} = nl.ndarray(
     ({dA_tile_size}, {dA_num_tiles}, {dB_num_tiles}, {dB_tile_size}),
     dtype=nl.{dtype},
-    buffer=nl.{isa_loc},
+    buffer=nl.sbuf,
 )
 ```
 
-A 1D tensor with `dim_ids = (dA,)` gets a 2D buffer: `({dA_tile_size}, {dA_num_tiles})`.
+**PSUM** buffers must be 2D — one tile per allocation, `(partition_tile, free_tile)`. When `num_tiles > 1`, PSUM uses a Python list of 2D tiles:
 
-**`num_tiles` derivation.** `num_tiles` is derived from two independent choices in KernelIR:
+```python
+psum_{name} = [
+    nl.ndarray(({dA_tile_size}, {dB_tile_size}), dtype=nl.{dtype}, buffer=nl.psum)
+    for _ in range({total_tiles})
+]
+```
 
-1. **`load_placements[(tensor_name, dim_id)]`** — allocation location. Determines how many loop iterations the buffer spans:
+where `total_tiles = num_tiles_P * num_tiles_F`. PSUM tiles are indexed by flat index `[i_p * num_tiles_F + i_f]`. When `total_tiles == 1`, it's a single `nl.ndarray` (no list).
 
-| Tier | Tiles covered |
+**`num_tiles` derivation.** `num_tiles` per dimension has three contributing factors:
+
+$$\text{num\_tiles} = \text{ig} \times \text{location\_factor} \times \text{buffer\_degree}$$
+
+1. **Interleave (`ig`)** — `max(op_tile_sizes on this dim across ops touching this tensor) / di_tile_size`. Ensures the buffer holds enough tiles for the largest op's hardware tile. When `max_op_tile == di_tile`, ig = 1 (no interleave). When `max_op_tile > di_tile` (e.g. matmul N=512 on a partition-capped dim with di_tile=128), ig = 4. See `dim_analysis.md` for details on the partition cap and interleave.
+
+2. **Location factor** — from `load_placements[(tensor_name, dim_id)]`:
+
+| Tier | Factor |
 |---|---|
 | `"per_tile"` | 1 |
-| `"per_block"` | `tiles_per_block × interleave` |
-| `"full"` | `num_blocks × tiles_per_block × interleave` |
+| `"per_block"` | `tiles_per_block` |
+| `"full"` | `num_blocks × tiles_per_block` |
 
-where `interleave = tile_size / min_tile_size` and `num_blocks = dim_size / (tiles_per_block × tile_size)`.
+where `num_blocks = dim_size / (tiles_per_block × tile_size)`.
 
-2. **`buffer_degrees[(group_idx, tensor_name, dim_id)]`** — multi-buffering degree (e.g. double-buffering = 2).
+3. **`buffer_degrees[(group_idx, tensor_name, dim_id)]`** — multi-buffering degree (e.g. double-buffering = 2).
 
-$$\text{num\_tiles} = \text{tiles\_covered} \times \text{buffer\_degree}$$
-
-Both fields are initialized in `build_ir`: `load_placements` defaults to `"per_tile"` for all `(tensor, dim)` pairs, `buffer_degrees` defaults to `1`. With these defaults, `num_tiles = 1` for every dimension. The renderer derives `num_tiles` purely from these fields — no hardcoded fallbacks.
+Both `load_placements` and `buffer_degrees` are initialized in `build_ir`: `load_placements` defaults to `"per_tile"`, `buffer_degrees` defaults to `1`. With these defaults and ig=1 (no partition cap triggers), `num_tiles = 1`. The renderer derives `num_tiles` purely from KernelIR fields — no hardcoded fallbacks.
 
 **Tile sizes** come from `dim_analysis.dims[dim_id].tile_size`.
 
@@ -271,30 +284,39 @@ Currently all ops declare `INPUT_LOCS = "sbuf"` for all operands, so every PSUM 
 
 ### 4.1 Example: Attention
 
-All `num_tiles = 1` in the default lowering. HBM inputs (Q, K, V) get SBUF staging buffers:
+With partition cap: d2 is capped to `tile_size=128` (appears as partition of K, exp_S_t). nc_matmul has `op_tile=512` on d2 → `ig = 512/128 = 4`. Buffers on d2 have `num_tiles = 4` on the d2 axis. All other dims have ig=1.
+
+SBUF buffers (4D layout):
 
 ```python
-sbuf_Q = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # HBM input staging: (d0, d1)
-sbuf_K = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # HBM input staging: (d2, d1)
-sbuf_V = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # HBM input staging: (d2, d4)
-psum_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.psum)       # (d1, d0)
-sbuf_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)       # staging: nc_matmul reads sbuf
-psum_K_t = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.psum)       # (d1, d2)
-sbuf_K_t = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)       # staging: nc_matmul reads sbuf
-psum_S = nl.ndarray((128, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)          # (d0, d2)
-sbuf_S = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)         # staging: affine_select reads sbuf
-sbuf_masked_S = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2)
-sbuf_scaled_S = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2)
+sbuf_Q = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d0, d1) ig=1,1
+sbuf_K = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d2, d1) ig=1,1
+sbuf_V = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d2, d4) ig=1,1
+sbuf_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)       # (d1, d0) staging
+sbuf_K_t = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)       # (d1, d2) staging, d2 ig=4
+sbuf_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d0, d2) staging, d2 ig=4
+sbuf_masked_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2) d2 ig=4
+sbuf_scaled_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2) d2 ig=4
 sbuf_neg_max = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)           # (d0)
-sbuf_exp_S = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)     # (d0, d2)
+sbuf_exp_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)     # (d0, d2) d2 ig=4
 sbuf_sum_exp = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)           # (d0)
 sbuf_inv_sum = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)           # (d0)
-psum_exp_S_t = nl.ndarray((512, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.psum)   # (d2, d0)
-sbuf_exp_S_t = nl.ndarray((512, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)   # staging: nc_matmul reads sbuf
-psum_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.float32, buffer=nl.psum)       # (d0, d4)
-sbuf_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)      # staging: tensor_scalar reads sbuf
+sbuf_exp_S_t = nl.ndarray((128, 4, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)   # (d2, d0) staging, d2 ig=4
+sbuf_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)      # (d0, d4) staging
 sbuf_output = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)    # (d0, d4)
 ```
+
+PSUM buffers (2D tiles, lists when ig > 1):
+
+```python
+psum_Q_t = nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.psum)             # (d1, d0) single tile
+psum_K_t = [nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.psum) for _ in range(4)]  # (d1, d2) 4 tiles
+psum_S = [nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum) for _ in range(4)]     # (d0, d2) 4 tiles
+psum_exp_S_t = [nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.psum) for _ in range(4)]  # (d2, d0) 4 tiles
+psum_attn = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)             # (d0, d4) single tile
+```
+
+PSUM is always 2D `(partition, free)` — one hardware tile per allocation. When ig > 1, a Python list holds the tiles. Ops index with `psum_K_t[i_ig]` (list index) then `[0:128, 0:128]` (tile slice). Ops needing the full ig range (e.g. nc_matmul reading 512 = 4×128) concatenate tiles via reshape.
 
 ## 5. DMA
 
@@ -377,11 +399,30 @@ Inside each reduction group's innermost loop (the `...` placeholder), the render
 
 **Memset.** Before a blocking op's reduction loop, emit `nisa.memset(psum_{name}, 0.0)` to zero the PSUM accumulator. Position: before the blocking dimension's outermost loop in the current `loop_order`.
 
-**Tensor indexing.** Each operand is indexed into its buffer using the loop variables in scope. For a degree-1 buffer the tile indices are structurally 0: `buf[0:tile_p, 0, 0, 0:tile_f]`.
+**Tensor indexing.** Each operand is indexed into its buffer using the **op's own tile size** (from `op_tile_sizes[op_idx]`) and the ig loop variable. The buffer shape is `(op_tile_size, num_tiles)` per dimension, where `num_tiles` includes the interleave factor `ig = di_tile_size / op_tile_size`.
 
-### 6.1 Example: Matmul Group
+For a 4D buffer: `buf[0:op_tile_p, i_ig_p, i_ig_f, 0:op_tile_f]`. When `ig=1` on a dimension (op tile equals unified tile), the index is structurally 0. When `ig > 1`, the ig loop variable selects which sub-tile within the buffer.
 
-Single group with `nc_matmul` (blocking on d0):
+For an input buffer being read: `sbuf[0:op_tile_p, i_ig_p, i_ig_f, 0:op_tile_f]` — each ig iteration reads a different sub-tile of the pre-loaded data.
+
+**Memset** addresses the full buffer using unified tile sizes: `psum[0:di_tile_p, 0, 0, 0:di_tile_f]`.
+
+### 6.1 Example: Attention nc_transpose (interleave)
+
+Group 8: nc_transpose on exp_S `(d0, d2)` → exp_S_t `(d2, d0)`. nc_transpose tile is 128×128, but d2 has `tile_size=512, min_tile_size=128`, so `ig=4` on d2. The buffer `psum_exp_S_t` has shape `(128, 4, 1, 128)` — 4 sub-tiles along d2.
+
+```python
+for i_ig_d2 in range(4):
+    nisa.nc_transpose(psum_exp_S_t[0:128, i_ig_d2, 0, 0:128],
+                      sbuf_exp_S[0:128, 0, i_ig_d2, 0:128])
+    stage_tensor_block(sbuf_exp_S_t, psum_exp_S_t)
+```
+
+Each ig iteration transposes a 128×128 sub-tile. The ig variable indexes into the buffer's interleave dimension.
+
+### 6.2 Example: Matmul Group (no interleave)
+
+Single group with `nc_matmul` (blocking on d0, no interleave — all dims have `ig=1`):
 
 ```python
 """inside DP loop body"""
@@ -398,7 +439,7 @@ for i_block_d0 in range(64):
 stage_tensor_block(sbuf_result, psum_result)
 ```
 
-Memset before the d0 loop. nc_matmul accumulates across all d0 iterations into the same PSUM tile. `stage_tensor_block` after the loop — the PSUM result is now valid. Then section 5's `store_tensor_block` copies SBUF→HBM.
+No interleave — all ig indices are structurally 0. Memset before the d0 loop, nc_matmul accumulates across all d0 iterations, `stage_tensor_block` after the loop.
 
 ## 7. Reference Kernel
 

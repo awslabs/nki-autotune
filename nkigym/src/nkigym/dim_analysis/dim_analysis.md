@@ -12,14 +12,28 @@ Only axes the tensor actually has get mapped. When an op collapses a dimension (
 
 Each op's tile size per dimension comes from hardware tile limits of the PE array. The Trainium PE array operates on tiles of (128, 128) or (128, 512) depending on the axis role. ISA ops consume these hardware tiles — e.g., `nc_matmul` uses (K=128, M=128, N=512), `nc_transpose` uses (P=128, F=128).
 
+**Partition axis constraint.** On-chip buffers have a physical partition dimension capped at 128. If a dimension ever appears as the first (partition) axis of any tensor, its tile size is capped at 128 regardless of op tile limits. This is a hardware constraint in addition to the per-op tile limits.
+
 For each dimension `d{i}`:
 
 ```python
-d{i}_tile_size = max(op_tile_size[op, d{i}] for all ops touching d{i})
+max_op_tile = max(op_tile_size[op, d{i}] for all ops touching d{i})
+is_ever_partition = any(tensor.dim_ids[0] == d{i} for tensor in all tensors with d{i})
+d{i}_tile_size = min(max_op_tile, 128) if is_ever_partition else max_op_tile
+d{i}_tile_size = min(d{i}_tile_size, dim_size)
 d{i}_min_tile_size = min(op_tile_size[op, d{i}] for all ops touching d{i})
+d{i}_min_tile_size = min(d{i}_min_tile_size, dim_size)
 ```
 
-Per-op interleave count: `num_ig[op, d{i}] = d{i}_tile_size / op_tile_size[op, d{i}]`. Ops with smaller tile sizes iterate multiple times per dimension tile.
+Per-op behavior depends on how its hardware tile compares to the unified tile:
+
+| Case | Condition | Behavior |
+|---|---|---|
+| Sub-tile | `op_tile < di_tile` | Op processes a sub-region within one buffer tile. Iterates `di_tile / op_tile` times per tile, indexing via reshape. |
+| Exact | `op_tile == di_tile` | One-to-one. Op processes one buffer tile directly. |
+| Multi-tile | `op_tile > di_tile` | Op consumes `op_tile / di_tile` buffer tiles. Reshapes them into a contiguous operand. |
+
+The buffer's `num_tiles` on a dimension includes the interleave factor from the largest op: `ig = max(op_tile_size[op, d{i}]) / d{i}_tile_size`. This ensures the buffer holds enough slots for the largest op's tile. `ig ≥ 1` always, since `d{i}_tile_size ≤ max(op_tile_size)` (it's capped, not raised).
 
 ### 3. Data-Parallel Classification
 
@@ -78,14 +92,18 @@ Hardware tile limits per op (P is always 128):
 
 For dimension tile size, elementwise/reduce ops don't impose a binding F constraint — their SBUF limit is far above the matmul/transpose tiles. The binding constraints come from `nc_matmul` N=512 and `nc_transpose` P/F=128.
 
-| Dimension | Semantic | Size | Binding ops | d{i}_tile_size | d{i}_min_tile_size |
-|---|---|---|---|---|---|
-| d0 | seq_q | 4096 | transpose(P=128), matmul(M=128) | 128 | 128 |
-| d1 | d_k | 128 | transpose(F=128), matmul(K=128) | 128 | 128 |
-| d2 | seq_k | 4096 | transpose(P=128), matmul(N=512) | 512 | 128 |
-| d4 | d_v | 128 | matmul(N=512) | 512 | 512 |
+The partition axis constraint additionally affects d2 and d4: d2 appears as the partition axis of K `(d2, d1)`, exp_S_t `(d2, d0)`, etc.; d4 appears as partition of V `(d2, d4)` — no, V has d2 first. Actually d4 only appears as the free axis of V and output, never as partition. So only d2 is capped.
 
-d2 has the largest spread: `nc_transpose` P=128 vs `nc_matmul` N=512 → `d2_tile_size`=512, giving interleave=4 for transpose ops on d2.
+| Dimension | Semantic | Size | Binding ops | Partition? | d{i}_tile_size | d{i}_min_tile_size |
+|---|---|---|---|---|---|---|
+| d0 | seq_q | 4096 | transpose(P=128), matmul(M=128) | Yes (Q, S, ...) | 128 | 128 |
+| d1 | d_k | 128 | transpose(F=128), matmul(K=128) | Yes (Q_t, K_t) | 128 | 128 |
+| d2 | seq_k | 4096 | transpose(P=128), matmul(N=512) | Yes (K, exp_S_t) | 128 | 128 |
+| d4 | d_v | 128 | matmul(N=512) | No | 512 | 512 |
+
+d2: `max(op_tiles) = 512` from matmul N, but d2 appears as partition of K `(d2, d1)` and exp_S_t `(d2, d0)` → capped to 128. The buffer holds 128-element d2 tiles. nc_matmul needs 512 elements of d2 per call (N=512), so it consumes `ig = 512/128 = 4` buffer tiles and reshapes them into a contiguous 512-wide operand. Transpose and VE ops use 128 per call — no reshape needed.
+
+d4: never partition → `d4_tile_size = 512` from matmul N. But `dim_size = 128 < 512` → clamped to 128. So `d4_tile_size = 128 = d4_min_tile_size`, no interleave.
 
 ### Step 3 — Data-parallel classification
 

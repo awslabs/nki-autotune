@@ -57,6 +57,12 @@ class NKITensorReduce(NKIOp):
         return result
 
     @classmethod
-    def format_isa_call(cls, dst_expr: str, operand_exprs: dict[str, str]) -> str:
-        """Format nisa.tensor_reduce(dst, data, ...)."""
-        return f"nisa.tensor_reduce({dst_expr}," f" {operand_exprs['data']}, ...)"
+    def format_isa_call(
+        cls, dst_expr: str, operand_exprs: dict[str, str], scalar_kwargs: dict[str, str] | None = None
+    ) -> str:
+        """Format nisa.tensor_reduce(dst, op, data, axis, ...)."""
+        sk = scalar_kwargs or {}
+        op_arg = cls._to_nl(sk.get("op", "nl.add"))
+        axis = sk.get("axis", "1")
+        extra = cls._format_scalar_kwargs(sk, set(cls.OPERAND_AXES) | {"op", "axis"})
+        return f"nisa.tensor_reduce({dst_expr}, {op_arg}, {operand_exprs['data']}, {axis}{extra})"

@@ -46,6 +46,8 @@ class NKITranspose(NKIOp):
         return data.T
 
     @classmethod
-    def format_isa_call(cls, dst_expr: str, operand_exprs: dict[str, str]) -> str:
+    def format_isa_call(
+        cls, dst_expr: str, operand_exprs: dict[str, str], scalar_kwargs: dict[str, str] | None = None
+    ) -> str:
         """Format nisa.nc_transpose(dst, data)."""
         return f"nisa.nc_transpose({dst_expr}, {operand_exprs['data']})"

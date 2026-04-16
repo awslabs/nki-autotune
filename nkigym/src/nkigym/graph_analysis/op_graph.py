@@ -34,11 +34,15 @@ class OpGraph:
             ``inputs`` maps ``role -> tensor_name`` (including
             kernel inputs with no producer). ``outputs`` lists
             output tensor names.
+        op_all_kwargs: Per-op ``{kwarg_name: source_string}``
+            for all kwargs (tensors and scalars). Used by
+            ``format_isa_call`` for scalar parameters.
     """
 
     op_classes: list[type[NKIOp]]
     edges: list[tuple[int, int, str, str]]
     op_tensors: list[tuple[dict[str, str], list[str]]]
+    op_all_kwargs: list[dict[str, str]]
 
     def __repr__(self) -> str:
         """Render the DAG as a per-node flow.
@@ -104,10 +108,12 @@ def build_op_graph(func: Callable[..., np.ndarray]) -> OpGraph:
     op_classes_list: list[type[NKIOp]] = []
     edges: list[tuple[int, int, str, str]] = []
     op_tensors: list[tuple[dict[str, str], list[str]]] = []
+    op_all_kwargs: list[dict[str, str]] = []
     tensor_producers: dict[str, int] = {}
 
-    for i, (op_cls, name_kwargs, output_names) in enumerate(ops):
+    for i, (op_cls, name_kwargs, output_names, all_kwargs) in enumerate(ops):
         op_classes_list.append(op_cls)
+        op_all_kwargs.append(all_kwargs)
 
         inputs: dict[str, str] = {}
         for role, var_name in name_kwargs.items():
@@ -121,4 +127,4 @@ def build_op_graph(func: Callable[..., np.ndarray]) -> OpGraph:
         for oname in output_names:
             tensor_producers[oname] = i
 
-    return OpGraph(op_classes=op_classes_list, edges=edges, op_tensors=op_tensors)
+    return OpGraph(op_classes=op_classes_list, edges=edges, op_tensors=op_tensors, op_all_kwargs=op_all_kwargs)

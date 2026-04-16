@@ -23,7 +23,7 @@ def render_buffers(ir: KernelIR, indent: int) -> str:
     da = ir.dim_analysis
 
     tensor_to_psum_dtype = _build_psum_dtype_map(ir)
-    needs_sbuf_staging = _find_psum_tensors_needing_sbuf(ir)
+    needs_sbuf_staging = find_psum_tensors_needing_sbuf(ir)
 
     lines: list[str] = []
     pad = "    " * indent
@@ -45,7 +45,7 @@ def render_buffers(ir: KernelIR, indent: int) -> str:
     return "\n".join(lines)
 
 
-def _find_psum_tensors_needing_sbuf(ir: KernelIR) -> set[str]:
+def find_psum_tensors_needing_sbuf(ir: KernelIR) -> set[str]:
     """Find PSUM tensors that need an SBUF staging buffer.
 
     A PSUM tensor needs staging when:
@@ -92,11 +92,12 @@ def _build_psum_dtype_map(ir: KernelIR) -> dict[str, str]:
 def _buffer_shape(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> tuple[int, ...]:
     """Compute the buffer shape for a tensor.
 
-    2D tensor → 4D: (tile_size_P, num_tiles_P, num_tiles_F, tile_size_F).
-    1D tensor → 2D: (tile_size_P, num_tiles_P).
+    Always uses the global unified tile size per dimension.
+    Interleave is NOT folded into num_tiles — it is handled
+    by reshape at the op level (section 6).
 
-    num_tiles is derived from load_placements, tiles_per_block,
-    and buffer_degrees — no hardcoded defaults.
+    2D tensor → 4D: (di_tile_P, num_tiles_P, num_tiles_F, di_tile_F).
+    1D tensor → 2D: (di_tile_P, num_tiles_P).
     """
     da = ir.dim_analysis
     dim_ids = tinfo.dim_ids
@@ -124,39 +125,83 @@ def _buffer_shape(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> tuple[in
 def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     """Derive num_tiles for one dimension from KernelIR fields.
 
-    Determined by two independent choices in KernelIR:
-    - ``load_placements`` → allocation location → how many
-      loop iterations the buffer spans.
-    - ``buffer_degrees`` → multi-buffering degree.
+    num_tiles = ig * tpb_factor * num_blocks_factor * buffer_degree
 
-    | tier       | tiles covered                            |
-    |------------|------------------------------------------|
-    | per_tile   | 1                                        |
-    | per_block  | tiles_per_block * interleave             |
-    | full       | num_blocks * tiles_per_block * interleave|
+    ig = max(op_tile) / di_tile_size — enough slots for the
+    largest op's tile on this dimension. This is the interleave
+    factor: ops with larger tiles than di_tile consume multiple
+    buffer slots and reshape.
 
-    num_tiles = tiles_covered * buffer_degree
+    | tier       | tpb_factor | num_blocks_factor          |
+    |------------|------------|----------------------------|
+    | per_tile   | 1          | 1                          |
+    | per_block  | tpb        | 1                          |
+    | full       | tpb        | num_blocks                 |
     """
     da = ir.dim_analysis
     di = da.dims[dim_id]
 
+    max_op_tile = _max_op_tile_for_tensor(ir, tensor_name, dim_id)
+    ig = max_op_tile // di.tile_size
+
     tier = ir.load_placements[(tensor_name, dim_id)]
     ops_touching = _ops_for_tensor(ir, tensor_name)
     tpb = get_tpb(ir, dim_id, ops_touching)
-    interleave = di.tile_size // di.min_tile_size
     degree = ir.buffer_degrees[_buffer_degree_key(ir, tensor_name, dim_id)]
 
     if tier == "per_tile":
-        tiles_covered = 1
+        tpb_factor = 1
+        blocks_factor = 1
     elif tier == "per_block":
-        tiles_covered = tpb * interleave
+        tpb_factor = tpb
+        blocks_factor = 1
     elif tier == "full":
-        num_blocks = di.dim_size // (tpb * di.tile_size)
-        tiles_covered = num_blocks * tpb * interleave
+        tpb_factor = tpb
+        blocks_factor = di.dim_size // (tpb * di.tile_size)
     else:
         raise ValueError(f"Unknown load_placement tier: {tier!r}")
 
-    return tiles_covered * degree
+    return ig * tpb_factor * blocks_factor * degree
+
+
+def _max_op_tile_for_tensor(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
+    """Find the largest op tile size on a dimension across all ops touching a tensor."""
+    da = ir.dim_analysis
+    ops = _ops_for_tensor(ir, tensor_name)
+    max_tile = da.dims[dim_id].tile_size
+    for op_idx in ops:
+        op_tile = da.op_tile_sizes[op_idx].get(dim_id)
+        if op_tile is not None:
+            max_tile = max(max_tile, op_tile)
+    return max_tile
+
+
+def producer_op_tiles(ir: KernelIR, tensor_name: str) -> dict[str, int]:
+    """Get the producing op's tile sizes for a tensor.
+
+    For HBM inputs (no producer), returns the first consumer
+    op's tile sizes. For on-chip tensors, returns the producing
+    op's tile sizes.
+    """
+    da = ir.dim_analysis
+    graph = ir.op_graph
+
+    match_idx: int | None = None
+    for op_idx, (_inputs, outputs) in enumerate(graph.op_tensors):
+        if tensor_name in outputs:
+            match_idx = op_idx
+            break
+
+    if match_idx is None:
+        for op_idx, (inputs, _outputs) in enumerate(graph.op_tensors):
+            if tensor_name in inputs.values():
+                match_idx = op_idx
+                break
+
+    if match_idx is None:
+        raise ValueError(f"No op produces or consumes tensor {tensor_name!r}")
+
+    return da.op_tile_sizes[match_idx]
 
 
 def _ops_for_tensor(ir: KernelIR, tensor_name: str) -> list[int]:

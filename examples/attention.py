@@ -24,9 +24,11 @@ Usage::
 import shutil
 from pathlib import Path
 
+import nki
 import numpy as np
 
 from autotune.runner.compare import assert_close
+from autotune.runner.compile import load_kernel
 from nkigym.codegen import build_ir, render_ir
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
@@ -79,12 +81,11 @@ def attention_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
     """
     d_k = Q.shape[1]
     scale = 1.0 / np.sqrt(d_k)
-    seq_k = K.shape[0]
     Q_t = NKITranspose()(data=Q)
     K_t = NKITranspose()(data=K)
     S = NKIMatmul()(stationary=Q_t, moving=K_t)
     masked_S = NKIAffineSelect()(
-        on_true_tile=S, pattern=[[-1, seq_k]], channel_multiplier=1, on_false_value=-np.inf, cmp_op="greater_equal"
+        on_true_tile=S, pattern=[[-1, K.shape[0]]], channel_multiplier=1, on_false_value=-np.inf, cmp_op="greater_equal"
     )
     scaled_S = NKITensorScalar()(data=masked_S, op0="multiply", operand0=scale)
     neg_max = NKITensorReduce()(data=scaled_S, op="max", axis=1, negate=True)
@@ -124,3 +125,9 @@ if __name__ == "__main__":
 
     source = render_ir(ir)
     (CACHE_DIR / "kernel.py").write_text(source)
+
+    kernel_func = load_kernel(str(CACHE_DIR / "kernel.py"), "attention_nkigym")
+    golden = attention_numpy(Q.astype(np.float32), K.astype(np.float32), V.astype(np.float32))
+    sim_result = nki.simulate(kernel_func)(Q=Q.astype(np.float32), K=K.astype(np.float32), V=V.astype(np.float32))
+    sim_status = assert_close(sim_result, golden, atol=1e-1, rtol=1e-1)
+    print(f"attention cpu_sim: {sim_status}")

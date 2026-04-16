@@ -8,9 +8,10 @@ from nkigym.graph_analysis.op_graph import OpGraph
 def render_loads_for_group(ir: KernelIR, group: list[int], indent: int) -> list[str]:
     """Emit load_tensor_block calls for HBM inputs of a fusion group.
 
-    For each HBM tensor consumed by ops in this group, emit a
-    load at the current indentation (innermost loop position
-    where all the tensor's dims are in scope).
+    Uses the load_tensor_block gadget which iterates all
+    num_tiles slots in the buffer (including ig slots).
+    The HBM offset is computed from the loop variables for
+    the tensor's dimensions.
 
     Args:
         ir: Complete kernel IR.
@@ -24,6 +25,7 @@ def render_loads_for_group(ir: KernelIR, group: list[int], indent: int) -> list[
     graph = ir.op_graph
 
     hbm_inputs = _group_hbm_inputs(group, graph, da)
+
     lines: list[str] = []
     pad = "    " * indent
 

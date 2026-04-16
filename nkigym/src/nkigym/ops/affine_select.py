@@ -72,6 +72,17 @@ class NKIAffineSelect(NKIOp):
         return np.where(mask, on_true_tile.reshape(p_count, f_count), on_false_value)
 
     @classmethod
-    def format_isa_call(cls, dst_expr: str, operand_exprs: dict[str, str]) -> str:
-        """Format nisa.affine_select(dst, on_true_tile, ...)."""
-        return f"nisa.affine_select({dst_expr}," f" {operand_exprs['on_true_tile']}, ...)"
+    def format_isa_call(
+        cls, dst_expr: str, operand_exprs: dict[str, str], scalar_kwargs: dict[str, str] | None = None
+    ) -> str:
+        """Format nisa.affine_select(dst, pattern, channel_multiplier, on_true_tile, on_false_value, ...)."""
+        sk = scalar_kwargs or {}
+        pattern = sk.get("pattern", "[]")
+        ch_mul = sk.get("channel_multiplier", "0")
+        on_false = sk.get("on_false_value", "0.0")
+        extra = cls._format_scalar_kwargs(
+            sk, set(cls.OPERAND_AXES) | {"pattern", "channel_multiplier", "on_false_value"}
+        )
+        return (
+            f"nisa.affine_select({dst_expr}, {pattern}, {ch_mul}, {operand_exprs['on_true_tile']}, {on_false}{extra})"
+        )

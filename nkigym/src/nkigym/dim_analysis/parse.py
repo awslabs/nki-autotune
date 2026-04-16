@@ -9,7 +9,7 @@ import numpy as np
 
 from nkigym.ops.base import NKIOp
 
-_OpTuple = tuple[type[NKIOp], dict[str, str], list[str]]
+_OpTuple = tuple[type[NKIOp], dict[str, str], list[str], dict[str, str]]
 
 
 def _resolve_op_class(node: ast.expr, func_globals: dict[str, object]) -> type[NKIOp] | None:
@@ -30,6 +30,16 @@ def _resolve_op_class(node: ast.expr, func_globals: dict[str, object]) -> type[N
 def _extract_name_kwargs(call: ast.Call) -> dict[str, str]:
     """Return ``{arg_name: variable_name}`` for Name-valued kwargs."""
     return {kw.arg: kw.value.id for kw in call.keywords if kw.arg is not None and isinstance(kw.value, ast.Name)}
+
+
+def _extract_all_kwargs(call: ast.Call) -> dict[str, str]:
+    """Return ``{arg_name: source_string}`` for all kwargs."""
+    result: dict[str, str] = {}
+    for kw in call.keywords:
+        if kw.arg is None:
+            continue
+        result[kw.arg] = ast.unparse(kw.value)
+    return result
 
 
 def _extract_output_names(target: ast.expr) -> list[str]:
@@ -64,7 +74,8 @@ def _parse_op_assignment(stmt: ast.Assign, func_globals: dict[str, object]) -> _
                 )
             assert isinstance(stmt.value, ast.Call)
             name_kwargs = _extract_name_kwargs(stmt.value)
-            result = (op_cls, name_kwargs, output_names)
+            all_kwargs = _extract_all_kwargs(stmt.value)
+            result = (op_cls, name_kwargs, output_names, all_kwargs)
     return result
 
 

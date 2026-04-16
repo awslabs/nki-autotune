@@ -71,6 +71,9 @@ class NKITensorScalar(NKIOp):
         return result
 
     @classmethod
-    def format_isa_call(cls, dst_expr: str, operand_exprs: dict[str, str]) -> str:
+    def format_isa_call(
+        cls, dst_expr: str, operand_exprs: dict[str, str], scalar_kwargs: dict[str, str] | None = None
+    ) -> str:
         """Format nisa.tensor_scalar(dst, data, ...)."""
-        return f"nisa.tensor_scalar({dst_expr}," f" {operand_exprs['data']}, ...)"
+        extra = cls._format_scalar_kwargs(scalar_kwargs, set(cls.OPERAND_AXES))
+        return f"nisa.tensor_scalar({dst_expr}, {operand_exprs['data']}{extra})"

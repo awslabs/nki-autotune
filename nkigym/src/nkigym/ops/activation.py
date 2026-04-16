@@ -61,6 +61,11 @@ class NKIActivation(NKIOp):
         return fns[op](data * s + b)
 
     @classmethod
-    def format_isa_call(cls, dst_expr: str, operand_exprs: dict[str, str]) -> str:
-        """Format nisa.activation(dst, data, ...)."""
-        return f"nisa.activation({dst_expr}," f" {operand_exprs['data']}, ...)"
+    def format_isa_call(
+        cls, dst_expr: str, operand_exprs: dict[str, str], scalar_kwargs: dict[str, str] | None = None
+    ) -> str:
+        """Format nisa.activation(dst, op, data, ...)."""
+        sk = scalar_kwargs or {}
+        op_arg = cls._to_nl(sk.get("op", "nl.copy"))
+        extra = cls._format_scalar_kwargs(sk, set(cls.OPERAND_AXES) | {"op"})
+        return f"nisa.activation({dst_expr}, {op_arg}, {operand_exprs['data']}{extra})"

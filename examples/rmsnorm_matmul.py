@@ -19,9 +19,11 @@ Usage::
 import shutil
 from pathlib import Path
 
+import nki
 import numpy as np
 
 from autotune.runner.compare import assert_close
+from autotune.runner.compile import load_kernel
 from nkigym.codegen import build_ir, render_ir
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
@@ -94,3 +96,9 @@ if __name__ == "__main__":
 
     source = render_ir(ir)
     (CACHE_DIR / "kernel.py").write_text(source)
+
+    kernel_func = load_kernel(str(CACHE_DIR / "kernel.py"), "rmsnorm_matmul_nkigym")
+    golden = rmsnorm_matmul_numpy(a.astype(np.float32), b.astype(np.float32))
+    sim_result = nki.simulate(kernel_func)(a=a.astype(np.float32), b=b.astype(np.float32))
+    sim_status = assert_close(sim_result, golden, atol=1e-1, rtol=1e-1)
+    print(f"rmsnorm_matmul cpu_sim: {sim_status}")

@@ -65,6 +65,15 @@ class NKIActivationReduce(NKIOp):
         return elem, red
 
     @classmethod
-    def format_isa_call(cls, dst_expr: str, operand_exprs: dict[str, str]) -> str:
-        """Format nisa.activation_reduce(dst, data, ...)."""
-        return f"nisa.activation_reduce({dst_expr}," f" {operand_exprs['data']}, ...)"
+    def format_isa_call(
+        cls, dst_expr: str, operand_exprs: dict[str, str], scalar_kwargs: dict[str, str] | None = None
+    ) -> str:
+        """Format nisa.activation_reduce(dst, op, data, reduce_op, reduce_res, ...)."""
+        sk = scalar_kwargs or {}
+        op_arg = cls._to_nl(sk.get("op", "nl.copy"))
+        reduce_op = cls._to_nl(sk.get("reduce_op", "nl.add"))
+        reduce_res = sk.get("__dst_reduce_res", "None")
+        extra = cls._format_scalar_kwargs(sk, set(cls.OPERAND_AXES) | {"op", "reduce_op"})
+        return (
+            f"nisa.activation_reduce({dst_expr}, {op_arg}, {operand_exprs['data']}, {reduce_op}, {reduce_res}{extra})"
+        )
