@@ -7,9 +7,9 @@ def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
     """Emit the data-parallel loop nest from a KernelIR.
 
     Each data-parallel dimension (``is_data_parallel=True``)
-    contributes 3 loops: block, tile, interleave. Loops are
+    contributes 3 loops: block, tile, physical. Loops are
     grouped by phase — all block loops outermost, then all tile
-    loops, then all interleave loops. Within each phase,
+    loops, then all physical tile loops. Within each phase,
     dimensions are ordered by dimension ID.
 
     Args:
@@ -45,9 +45,9 @@ def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
 
     for dim_id in dp_dims:
         di = da.dims[dim_id]
-        num_ig = di.logical_tile_size // di.physical_tile_size
+        num_ptiles = di.logical_tile_size // di.physical_tile_size
         pad = "    " * indent
-        lines.append(f"{pad}for i_ig_{dim_id} in range({num_ig}):")
+        lines.append(f"{pad}for i_ptile_{dim_id} in range({num_ptiles}):")
         indent += 1
 
     return "\n".join(lines), indent

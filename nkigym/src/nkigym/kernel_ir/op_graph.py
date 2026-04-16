@@ -45,26 +45,8 @@ class OpGraph:
     op_all_kwargs: list[dict[str, str]]
 
     def __repr__(self) -> str:
-        """Render the DAG as a per-node flow.
-
-        Each node shows its inputs (tensor:role from which producer)
-        and its outputs (tensor -> which consumers).
-        """
-        inputs: dict[int, list[tuple[int, str, str]]] = {i: [] for i in range(len(self.op_classes))}
-        outputs: dict[int, list[tuple[int, str, str]]] = {i: [] for i in range(len(self.op_classes))}
-        for producer, consumer, tensor, role in self.edges:
-            inputs[consumer].append((producer, tensor, role))
-            outputs[producer].append((consumer, tensor, role))
-
-        lines = [f"OpGraph({len(self.op_classes)} nodes, {len(self.edges)} edges)", ""]
-        for i, op_type in enumerate(op_cls.NAME for op_cls in self.op_classes):
-            lines.append(f"  [{i}] {op_type}")
-            for src, tensor, role in inputs[i]:
-                lines.append(f"       <- {tensor} ({role}) from [{src}]")
-            for dst, tensor, _role in outputs[i]:
-                lines.append(f"       -> {tensor} to [{dst}]")
-
-        return "\n".join(lines)
+        """Return summary string with node and edge counts."""
+        return f"OpGraph({len(self.op_classes)} nodes, {len(self.edges)} edges)"
 
     def render(self, path: str | Path) -> Path:
         """Render the DAG to a PNG file via Graphviz.

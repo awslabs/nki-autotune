@@ -9,7 +9,7 @@ def render_loads_for_group(ir: KernelIR, group: list[int], indent: int) -> list[
     """Emit load_tensor_block calls for HBM inputs of a fusion group.
 
     Uses the load_tensor_block gadget which iterates all
-    num_tiles slots in the buffer (including ig slots).
+    num_tiles slots in the buffer (including physical tile slots).
     The HBM offset is computed from the loop variables for
     the tensor's dimensions.
 
@@ -102,17 +102,11 @@ def _group_hbm_inputs(group: list[int], graph: OpGraph, da: DimAnalysis) -> list
 def _offset_expr(dim_id: str, da: DimAnalysis, tpb: int) -> str:
     """Build the HBM offset expression for one dimension.
 
-    Combines block, tile, and interleave loop variables:
-    ``i_block * (tpb * tile_size) + i_tile * tile_size + i_ig * min_tile_size``
-
-    For dimensions with trip count 1 at every level, this
-    simplifies but we always emit the full expression for
-    consistency.
+    Combines block, tile, and physical tile loop variables:
+    ``i_block * (tpb * logical_tile_size) + i_tile * logical_tile_size + i_ptile * physical_tile_size``
     """
     di = da.dims[dim_id]
-    tile_size = di.logical_tile_size
-    min_tile_size = di.physical_tile_size
-    block_stride = tpb * tile_size
-    return (
-        f"i_block_{dim_id} * {block_stride}" f" + i_tile_{dim_id} * {tile_size}" f" + i_ig_{dim_id} * {min_tile_size}"
-    )
+    logical = di.logical_tile_size
+    physical = di.physical_tile_size
+    block_stride = tpb * logical
+    return f"i_block_{dim_id} * {block_stride}" f" + i_tile_{dim_id} * {logical}" f" + i_ptile_{dim_id} * {physical}"

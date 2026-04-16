@@ -6,7 +6,7 @@ Fixed preamble: imports, `@nki.jit` decorator, function signature, input shape a
 
 ## 2. Data-Parallel Loops
 
-DP dimensions (in the return tensor) get outermost loops: block, tile, interleave per dimension, grouped by phase. All DP dims sorted by ID within each phase.
+DP dimensions (in the return tensor) get outermost loops: block, tile, physical tile per dimension, grouped by phase. All DP dims sorted by ID within each phase.
 
 ## 3. Reduction Loops
 
@@ -14,7 +14,7 @@ Inside the innermost DP loop, each fusion group emits its own reduction loop nes
 
 ## 4. Tensor Buffers
 
-Buffer allocation for all on-chip tensors. SBUF uses 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`. PSUM uses 2D single-tile allocations `(partition, free)` in Python lists when `num_tiles > 1`. Buffers are allocated at the top of the innermost DP loop body, before reduction loops. `num_tiles = ig × location_factor × buffer_degree`.
+Buffer allocation for all on-chip tensors. SBUF uses 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`. PSUM uses 2D single-tile allocations `(partition, free)` in Python lists when `num_tiles > 1`. Buffers are allocated at the top of the innermost DP loop body, before reduction loops. `num_tiles = num_physical_tiles_per_logical_tile × location_tiles × buffer_degree`.
 
 ## 5. DMA
 
@@ -22,13 +22,13 @@ DMA transfers between HBM, SBUF, and PSUM. Universal store rule: move data when 
 
 ## 6. NKI Ops
 
-ISA call rendering inside reduction loops. Each op uses `format_isa_call` to emit `nisa.*` calls. Includes memset before blocking loops, PSUM→SBUF staging after, and per-op tile indexing with reshape for interleave.
+ISA call rendering inside reduction loops. Each op uses `format_isa_call` to emit `nisa.*` calls. Includes memset before blocking loops, PSUM→SBUF staging after, and per-op tile indexing with reshape for physical tile packing.
 
 ## 7. Reference Kernel
 
 `softmax(mask(scale * Q @ K.T)) @ V`. Inputs: `Q(d0, d1), K(d2, d1), V(d2, d4)`. Return `output(d0, d4)`. With `seq_q=seq_k=2048, d_k=d_v=128`:
 
-| Dim | dim_size | tile_size | min_tile_size | DP/reduction |
+| Dim | dim_size | logical_tile_size | physical_tile_size | DP/reduction |
 |---|---|---|---|---|
 | d0 | 2048 | 128 | 128 | DP |
 | d1 | 128 | 128 | 128 | reduction |

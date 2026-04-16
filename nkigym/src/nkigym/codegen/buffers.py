@@ -125,12 +125,8 @@ def _buffer_shape(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> tuple[in
 def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     """Derive num_tiles for one dimension from KernelIR fields.
 
-    num_tiles = ig * tpb_factor * num_blocks_factor * buffer_degree
-
-    ig = max(op_tile) / di_tile_size — enough slots for the
-    largest op's tile on this dimension. This is the interleave
-    factor: ops with larger tiles than di_tile consume multiple
-    buffer slots and reshape.
+    num_tiles = num_physical_tiles_per_logical_tile
+               * tpb_factor * num_blocks_factor * buffer_degree
 
     | tier       | tpb_factor | num_blocks_factor          |
     |------------|------------|----------------------------|
@@ -142,7 +138,7 @@ def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     di = da.dims[dim_id]
 
     max_op_tile = _max_op_tile_for_tensor(ir, tensor_name, dim_id)
-    ig = max_op_tile // di.physical_tile_size
+    num_ptiles = max_op_tile // di.physical_tile_size
 
     tier = ir.load_placements[(tensor_name, dim_id)]
     ops_touching = _ops_for_tensor(ir, tensor_name)
@@ -161,7 +157,7 @@ def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     else:
         raise ValueError(f"Unknown load_placement tier: {tier!r}")
 
-    return ig * tpb_factor * blocks_factor * degree
+    return num_ptiles * tpb_factor * blocks_factor * degree
 
 
 def _max_op_tile_for_tensor(ir: KernelIR, tensor_name: str, dim_id: str) -> int:

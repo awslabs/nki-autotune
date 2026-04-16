@@ -15,7 +15,7 @@ class KernelIR:
     load_placements: dict[tuple[str, str], str]
 ```
 
-**`dim_analysis`** — from `analyze_dims`. Provides dimension IDs, logical/physical tile sizes, interleave factors, data-parallel classification, tensor metadata, and per-op axis/tile mappings. The renderer reads these to compute loop trip counts and buffer shapes.
+**`dim_analysis`** — from `analyze_dims`. Provides dimension IDs, logical/physical tile sizes, num_physical_tiles_per_logical_tile, data-parallel classification, tensor metadata, and per-op axis/tile mappings. The renderer reads these to compute loop trip counts and buffer shapes.
 
 **`op_graph`** — from `build_op_graph`. Provides op classes, inter-op edges, per-op tensor roles, and per-op kwargs. The renderer reads these to determine op ordering, memory boundaries, and ISA call rendering.
 
@@ -29,5 +29,5 @@ class KernelIR:
 **Renderer-derived positions** — NOT stored in KernelIR, mechanically derived by `render_ir` from the fields above:
 - **memset**: before the blocking dimension's outermost loop in the current `loop_order`.
 - **tensor_copy(psum→sbuf) and store(sbuf→hbm)**: when the source is valid — after the blocking dimension's last inner loop for PSUM→SBUF, after all reduction groups for SBUF→HBM. Same rule at both memory boundaries.
-- **tensor_copy (interleave reload/save)**: around the tile loop when a blocking dim's block and tile are split by other dims' loops.
+- **tensor_copy (reload/save)**: around the tile loop when a blocking dim's block and tile are split by other dims' loops.
 - These are deterministic given the loop structure — exactly one correct position for each, no ambiguity.

@@ -316,9 +316,9 @@ def section5_matmul(lhs_T: Any, rhs: Any, result: Any) -> None:
                 for i_tile_d0 in range(1):
                     for i_tile_d1 in range(1):
                         for i_tile_d2 in range(1):
-                            for i_ig_d0 in range(1):
-                                for i_ig_d1 in range(1):
-                                    for i_ig_d2 in range(1):
+                            for i_ptile_d0 in range(1):
+                                for i_ptile_d1 in range(1):
+                                    for i_ptile_d2 in range(1):
                                         nisa.nc_matmul(
                                             psum_result[0:128, i_block_d1, i_block_d2, 0:512],
                                             sbuf_lhs_T[0:128, 0, 0, 0:128],
@@ -341,10 +341,10 @@ def section5_naive(lhs_T: Any, rhs_T: Any, result: Any) -> None:
             load_tensor_block(sbuf_rhs_T, rhs_T, par_ofs=i_block_d2 * 512, free_ofs=i_block_d0 * 128)
             for i_tile_d0 in range(1):
                 for i_tile_d2 in range(1):
-                    for i_ig_d0 in range(1):
-                        for i_ig_d2 in range(4):
-                            ld2 = i_tile_d2 * 4 + i_ig_d2
-                            td0 = i_tile_d0 * 1 + i_ig_d0
+                    for i_ptile_d0 in range(1):
+                        for i_ptile_d2 in range(4):
+                            ld2 = i_tile_d2 * 4 + i_ptile_d2
+                            td0 = i_tile_d0 * 1 + i_ptile_d0
                             gd2 = i_block_d2 * 4 + ld2
                             gd0 = i_block_d0 * 1 + td0
                             nisa.nc_transpose(psum_rhs_temp[0:128, 0, 0, 0:128], sbuf_rhs_T[0:128, ld2, td0, 0:128])
@@ -361,11 +361,11 @@ def section5_naive(lhs_T: Any, rhs_T: Any, result: Any) -> None:
                 for i_tile_d0 in range(1):
                     for i_tile_d1 in range(1):
                         for i_tile_d2 in range(1):
-                            for i_ig_d0 in range(1):
-                                for i_ig_d1 in range(1):
-                                    for i_ig_d2 in range(1):
-                                        td0 = i_tile_d0 * 1 + i_ig_d0
-                                        td1 = i_tile_d1 * 1 + i_ig_d1
+                            for i_ptile_d0 in range(1):
+                                for i_ptile_d1 in range(1):
+                                    for i_ptile_d2 in range(1):
+                                        td0 = i_tile_d0 * 1 + i_ptile_d0
+                                        td1 = i_tile_d1 * 1 + i_ptile_d1
                                         d2_ut = i_block_d2 + i_tile_d2
                                         gd0 = i_block_d0 * 1 + td0
                                         gd1 = i_block_d1 * 1 + td1

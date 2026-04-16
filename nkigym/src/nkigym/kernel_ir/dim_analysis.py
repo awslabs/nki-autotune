@@ -99,23 +99,41 @@ class DimAnalysis:
 
         lines.append("")
         lines.append("  Dimensions:")
+        headers = ["dim", "size", "logical", "physical", "phys/logical", "type"]
+        rows: list[list[str]] = []
         for dim_id, di in self.dims.items():
-            par = "data-parallel" if di.is_data_parallel else "reduction"
-            ig = di.logical_tile_size // di.physical_tile_size
-            lines.append(
-                f"    {dim_id}: size={di.dim_size},"
-                f" logical={di.logical_tile_size},"
-                f" physical={di.physical_tile_size},"
-                f" ig={ig},"
-                f" {par}"
+            num_physical = di.logical_tile_size // di.physical_tile_size
+            rows.append(
+                [
+                    dim_id,
+                    str(di.dim_size),
+                    str(di.logical_tile_size),
+                    str(di.physical_tile_size),
+                    str(num_physical),
+                    "data-parallel" if di.is_data_parallel else "reduction",
+                ]
             )
+        col_widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+        header_line = "  | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
+        sep_line = "-+-".join("-" * col_widths[i] for i in range(len(headers)))
+        lines.append(f"    {header_line}")
+        lines.append(f"    {sep_line}")
+        for row in rows:
+            lines.append("    " + "  | ".join(row[i].ljust(col_widths[i]) for i in range(len(headers))))
 
         lines.append("")
         lines.append("  Tensors:")
+        t_headers = ["name", "dims", "shape", "dtype", "loc"]
+        t_rows: list[list[str]] = []
         for name, t in self.tensors.items():
-            dims_str = ", ".join(t.dim_ids)
-            shape_str = ", ".join(str(s) for s in t.shape)
-            lines.append(f"    {name}: ({dims_str}) shape=({shape_str}) {t.dtype} {t.isa_loc}")
+            t_rows.append(
+                [name, f"({', '.join(t.dim_ids)})", f"({', '.join(str(s) for s in t.shape)})", t.dtype, t.isa_loc]
+            )
+        t_widths = [max(len(h), *(len(r[i]) for r in t_rows)) for i, h in enumerate(t_headers)]
+        lines.append("    " + "  | ".join(h.ljust(t_widths[i]) for i, h in enumerate(t_headers)))
+        lines.append("    " + "-+-".join("-" * t_widths[i] for i in range(len(t_headers))))
+        for row in t_rows:
+            lines.append("    " + "  | ".join(row[i].ljust(t_widths[i]) for i in range(len(t_headers))))
 
         return "\n".join(lines)
 

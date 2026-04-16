@@ -160,8 +160,8 @@ def _buf_index_expr(ir: KernelIR, tinfo: TensorInfo) -> str:
 def _dst_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo) -> str:
     """Build destination index expression — no reshape.
 
-    Destinations use the unified tile size and ig slice
-    directly in the 4D layout. NKI simulator does not
+    Destinations use the physical tile size and physical tile
+    slice directly in the 4D layout. NKI simulator does not
     support reshape on write destinations.
     """
     da = ir.dim_analysis
@@ -174,28 +174,29 @@ def _dst_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo) -> str:
         di_tf = da.dims[d_f].physical_tile_size
         op_tp = op_tiles.get(d_p, di_tp)
         op_tf = op_tiles.get(d_f, di_tf)
-        ig_p = _dim_ig_slice(di_tp, op_tp)
-        ig_f = _dim_ig_slice(di_tf, op_tf)
-        idx = f"[0:{di_tp}, {ig_p}, {ig_f}, 0:{di_tf}]"
+        ptile_p = _dim_ptile_slice(di_tp, op_tp)
+        ptile_f = _dim_ptile_slice(di_tf, op_tf)
+        idx = f"[0:{di_tp}, {ptile_p}, {ptile_f}, 0:{di_tf}]"
     elif ndims == 1:
         d_p = tinfo.dim_ids[0]
         di_tp = da.dims[d_p].physical_tile_size
         op_tp = op_tiles.get(d_p, di_tp)
-        ig_p = _dim_ig_slice(di_tp, op_tp)
-        idx = f"[0:{di_tp}, {ig_p}]"
+        ptile_p = _dim_ptile_slice(di_tp, op_tp)
+        idx = f"[0:{di_tp}, {ptile_p}]"
     return idx
 
 
 def _tile_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo) -> str:
     """Build the tile index expression for an op accessing a buffer.
 
-    The buffer uses unified tile sizes with ig folded into
-    num_tiles. Each op slices the buffer according to how many
+    The buffer uses physical tile sizes with
+    num_physical_tiles_per_logical_tile folded into num_tiles.
+    Each op slices the buffer according to how many physical
     tiles it needs, then reshapes to its own tile size.
 
-    - op_tile == di_tile: one slot ``[0:di_t, 0, ...]``
-    - op_tile > di_tile: multi-slot ``[0:di_t, 0:ig, ...]``
-    - op_tile < di_tile: sub-tile (via ig loop variable offset)
+    - op_tile == physical_tile: one slot ``[0:di_t, 0, ...]``
+    - op_tile > physical_tile: multi-slot ``[0:di_t, 0:n, ...]``
+    - op_tile < physical_tile: sub-tile (via ptile loop offset)
 
     Always appends ``.reshape((op_tp, op_tf))`` for consistency.
     """
@@ -209,25 +210,24 @@ def _tile_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo) -> str:
         di_tf = da.dims[d_f].physical_tile_size
         op_tp = op_tiles.get(d_p, di_tp)
         op_tf = op_tiles.get(d_f, di_tf)
-        ig_p = _dim_ig_slice(di_tp, op_tp)
-        ig_f = _dim_ig_slice(di_tf, op_tf)
-        idx = f"[0:{di_tp}, {ig_p}, {ig_f}, 0:{di_tf}].reshape(({op_tp}, {op_tf}))"
+        ptile_p = _dim_ptile_slice(di_tp, op_tp)
+        ptile_f = _dim_ptile_slice(di_tf, op_tf)
+        idx = f"[0:{di_tp}, {ptile_p}, {ptile_f}, 0:{di_tf}].reshape(({op_tp}, {op_tf}))"
     elif ndims == 1:
         d_p = tinfo.dim_ids[0]
         di_tp = da.dims[d_p].physical_tile_size
         op_tp = op_tiles.get(d_p, di_tp)
-        ig_p = _dim_ig_slice(di_tp, op_tp)
-        idx = f"[0:{di_tp}, {ig_p}].reshape(({op_tp},))"
+        ptile_p = _dim_ptile_slice(di_tp, op_tp)
+        idx = f"[0:{di_tp}, {ptile_p}].reshape(({op_tp},))"
     return idx
 
 
-def _dim_ig_slice(di_tile: int, op_tile: int) -> str:
+def _dim_ptile_slice(physical_tile: int, op_tile: int) -> str:
     """Build the num_tiles index for one dimension.
 
-    - op_tile == di_tile: single slot → ``0``
-    - op_tile > di_tile: multi-slot → ``0:{op_tile // di_tile}``
-    - op_tile < di_tile: sub-tile → ``0`` (ig loop handles offset via reshape)
+    - op_tile == physical_tile: single slot → ``0``
+    - op_tile > physical_tile: multi-slot → ``0:{op_tile // physical_tile}``
+    - op_tile < physical_tile: sub-tile → ``0`` (ptile loop handles offset)
     """
-    ig = op_tile // di_tile
-    expr = f"0:{ig}" if ig > 1 else "0"
-    return expr
+    num_ptiles = op_tile // physical_tile
+    return f"0:{num_ptiles}" if num_ptiles > 1 else "0"

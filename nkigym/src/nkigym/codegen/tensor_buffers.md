@@ -8,7 +8,7 @@ The reference attention CTE kernel follows this same rule: persistent buffers (r
 
 **Buffer shape.** SBUF and PSUM buffers use different layouts:
 
-**SBUF** buffers use a 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)` for 2D tensors, or `(tile_size_P, num_tiles_P)` for 1D tensors. `tile_size` is the physical tile size — the buffer allocation granularity. `num_tiles` includes the interleave factor (see below). Multi-tile SBUF is a single `nl.ndarray` allocation:
+**SBUF** buffers use a 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)` for 2D tensors, or `(tile_size_P, num_tiles_P)` for 1D tensors. `tile_size` is the physical tile size — the buffer allocation granularity. `num_tiles` includes `num_physical_tiles_per_logical_tile` (see below). Multi-tile SBUF is a single `nl.ndarray` allocation:
 
 ```python
 sbuf_{name} = nl.ndarray(
@@ -43,7 +43,7 @@ $$\text{num\_tiles} = \frac{\text{logical\_tile\_size}}{\text{physical\_tile\_si
 
 `buffer_degree` comes from `buffer_degrees[(group_idx, tensor_name, dim_id)]` (default 1).
 
-With the defaults (`"per_tile"`, degree 1, ig 1), `num_tiles = 1`.
+With the defaults (`"per_tile"`, degree 1, num_physical_tiles_per_logical_tile 1), `num_tiles = 1`.
 
 **PSUM staging.** A PSUM tensor gets an additional SBUF staging buffer (`sbuf_{name}`) when a consumer requires it. Each op declares per-operand memory requirements via `INPUT_LOCS` (e.g. `{"stationary": "sbuf", "moving": "sbuf"}` for nc_matmul). The renderer checks each consumer: if any operand reading this tensor has `INPUT_LOCS[role] == "sbuf"`, an SBUF staging buffer is emitted. The return tensor also needs staging (dma_copy to HBM reads from SBUF).
 
@@ -55,29 +55,29 @@ Currently all ops declare `INPUT_LOCS = "sbuf"` for all operands, so every PSUM 
 
 ### Example: Attention
 
-d2 has `logical_tile=512` (max of transpose 128, matmul 512) and `physical_tile=128` (min, with partition cap). So `ig = 512/128 = 4`. Buffers on d2 have `num_tiles = 4` on the d2 axis. All other dims have ig=1.
+d2 has `logical_tile_size=512` (max of transpose 128, matmul 512) and `physical_tile_size=128` (min, with partition cap). So `num_physical_tiles_per_logical_tile = 512/128 = 4`. Buffers on d2 have `num_tiles = 4` on the d2 axis. All other dims have num_physical_tiles_per_logical_tile=1.
 
 SBUF buffers (4D layout):
 
 ```python
-sbuf_Q = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d0, d1) ig=1,1
-sbuf_K = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d2, d1) ig=1,1
-sbuf_V = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d2, d4) ig=1,1
+sbuf_Q = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d0, d1) ptiles=1,1
+sbuf_K = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d2, d1) ptiles=1,1
+sbuf_V = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d2, d4) ptiles=1,1
 sbuf_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)       # (d1, d0) staging
-sbuf_K_t = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)       # (d1, d2) staging, d2 ig=4
-sbuf_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d0, d2) staging, d2 ig=4
-sbuf_masked_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2) d2 ig=4
-sbuf_scaled_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2) d2 ig=4
+sbuf_K_t = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)       # (d1, d2) staging, d2 ptiles=4
+sbuf_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # (d0, d2) staging, d2 ptiles=4
+sbuf_masked_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2) d2 ptiles=4
+sbuf_scaled_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)  # (d0, d2) d2 ptiles=4
 sbuf_neg_max = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)           # (d0)
-sbuf_exp_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)     # (d0, d2) d2 ig=4
+sbuf_exp_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)     # (d0, d2) d2 ptiles=4
 sbuf_sum_exp = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)           # (d0)
 sbuf_inv_sum = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)           # (d0)
-sbuf_exp_S_t = nl.ndarray((128, 4, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)   # (d2, d0) staging, d2 ig=4
+sbuf_exp_S_t = nl.ndarray((128, 4, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)   # (d2, d0) staging, d2 ptiles=4
 sbuf_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)      # (d0, d4) staging
 sbuf_output = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)    # (d0, d4)
 ```
 
-PSUM buffers (2D tiles, lists when ig > 1):
+PSUM buffers (2D tiles, lists when num_physical_tiles_per_logical_tile > 1):
 
 ```python
 psum_Q_t = nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.psum)             # (d1, d0) single tile
@@ -87,4 +87,4 @@ psum_exp_S_t = [nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.psum) for _ 
 psum_attn = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)             # (d0, d4) single tile
 ```
 
-PSUM is always 2D `(partition, free)` — one hardware tile per allocation. When ig > 1, a Python list holds the tiles. Ops index with `psum_K_t[i_ig]` (list index) then `[0:128, 0:128]` (tile slice). Ops needing the full ig range (e.g. nc_matmul reading 512 = 4×128) concatenate tiles via reshape.
+PSUM is always 2D `(partition, free)` — one hardware tile per allocation. When `num_physical_tiles_per_logical_tile > 1`, a Python list holds the tiles. Ops index with `psum_K_t[i_ptile]` (list index) then `[0:128, 0:128]` (tile slice). Ops needing the full logical tile (e.g. nc_matmul reading 512 = 4×128) concatenate tiles via reshape.

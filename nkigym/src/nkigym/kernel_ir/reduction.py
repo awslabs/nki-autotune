@@ -156,9 +156,9 @@ def _render_group(
 
     for dim_id in ordered_red:
         di = da.dims[dim_id]
-        num_ig = di.logical_tile_size // di.physical_tile_size
+        num_ptiles = di.logical_tile_size // di.physical_tile_size
         p = "    " * indent
-        lines.append(f"{p}for i_ig_{dim_id} in range({num_ig}):")
+        lines.append(f"{p}for i_ptile_{dim_id} in range({num_ptiles}):")
         indent += 1
 
     load_lines = render_loads_for_group(ir, group, indent)

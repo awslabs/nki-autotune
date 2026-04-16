@@ -120,7 +120,7 @@ if __name__ == "__main__":
 
     """Step 1: build IR."""
     ir = build_ir(attention_nkigym, input_specs)
-    (CACHE_DIR / "ir.txt").write_text(repr(ir))
+    (CACHE_DIR / "ir.md").write_text(repr(ir))
     ir.op_graph.render(CACHE_DIR / "op_graph")
 
     """Step 2: render IR to NKI source."""
