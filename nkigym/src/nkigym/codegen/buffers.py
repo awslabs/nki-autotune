@@ -50,7 +50,7 @@ def _find_psum_tensors_needing_sbuf(ir: KernelIR) -> set[str]:
 
     A PSUM tensor needs staging when:
     1. A consumer op requires SBUF for the operand that reads
-       this tensor (``op_input_locs[role] == "sbuf"``).
+       this tensor (``INPUT_LOCS[role] == "sbuf"``).
     2. The tensor is the return tensor (needs dma_copy to HBM,
        which reads from SBUF).
     """
@@ -59,7 +59,7 @@ def _find_psum_tensors_needing_sbuf(ir: KernelIR) -> set[str]:
     result: set[str] = set()
 
     for consumer_idx, (inputs, _outputs) in enumerate(graph.op_tensors):
-        input_locs = graph.op_input_locs[consumer_idx]
+        input_locs = graph.op_classes[consumer_idx].INPUT_LOCS
         for role, tensor_name in inputs.items():
             tinfo = da.tensors.get(tensor_name)
             if tinfo is None or tinfo.isa_loc != "psum":
@@ -80,12 +80,12 @@ def _build_psum_dtype_map(ir: KernelIR) -> dict[str, str]:
     nc_matmul → float32) get an override.
     """
     result: dict[str, str] = {}
-    for op_idx, psum_dtype in enumerate(ir.op_graph.op_psum_dtypes):
-        if psum_dtype is None:
+    for op_idx, op_cls in enumerate(ir.op_graph.op_classes):
+        if op_cls.PSUM_DTYPE is None:
             continue
         _, outputs = ir.op_graph.op_tensors[op_idx]
         for tensor_name in outputs:
-            result[tensor_name] = psum_dtype
+            result[tensor_name] = op_cls.PSUM_DTYPE
     return result
 
 

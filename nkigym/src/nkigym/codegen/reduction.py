@@ -4,6 +4,7 @@ import heapq
 
 from nkigym.codegen.dma import render_loads_for_group
 from nkigym.codegen.kernel_ir import KernelIR, get_tpb
+from nkigym.codegen.nki_ops import render_ops_for_group
 from nkigym.dim_analysis.dim_analysis import DimAnalysis
 from nkigym.graph_analysis.op_graph import OpGraph
 
@@ -117,12 +118,19 @@ def _render_group(ir: KernelIR, group_idx: int, group: list[int], red_dims: list
     lines: list[str] = []
     pad = "    " * base_indent
 
-    op_names = ", ".join(ir.op_graph.nodes[i] for i in group)
+    op_names = ", ".join(ir.op_graph.op_classes[i].NAME for i in group)
     red_str = ", ".join(red_dims) if red_dims else "(none)"
     lines.append(f"{pad}# Group {group_idx}: {op_names} [reduction: {red_str}]")
 
     loop_order = ir.loop_order[group_idx]
     ordered_red = [d for d in loop_order if d in set(red_dims)]
+
+    num_loops = len(ordered_red) * 3
+    inner_indent = base_indent + num_loops
+
+    pre_lines, inner_lines, post_lines = render_ops_for_group(ir, group, red_dims, inner_indent, base_indent)
+
+    lines.extend(pre_lines)
 
     indent = base_indent
 
@@ -149,9 +157,9 @@ def _render_group(ir: KernelIR, group_idx: int, group: list[int], red_dims: list
 
     load_lines = render_loads_for_group(ir, group, indent)
     lines.extend(load_lines)
+    lines.extend(inner_lines)
 
-    p = "    " * indent
-    lines.append(f"{p}...")
+    lines.extend(post_lines)
     lines.append("")
 
     return lines

@@ -219,7 +219,7 @@ for i_block_d2 in range(4):
 ...
 ```
 
-This is the default lowering — each group gets its own independent reduction loops. The reference kernel (section 6) is the result of applying transforms (loop fusion, online softmax) on top of this baseline.
+This is the default lowering — each group gets its own independent reduction loops. The reference kernel (section 7) is the result of applying transforms (loop fusion, online softmax) on top of this baseline.
 
 ## 4. Tensor Buffers
 
@@ -361,7 +361,46 @@ for i_block_d0 in range(16):
                         store_tensor_block(dst=output, src=sbuf_output, par_ofs=..., free_ofs=...)
 ```
 
-## 6. Reference Kernel
+## 6. NKI Ops
+
+Inside each reduction group's innermost loop (the `...` placeholder), the renderer emits the actual ISA calls for the ops in that group. Each op uses `NKIOp.format_isa_call(dst_expr, operand_exprs)` to produce the `nisa.*` call string.
+
+**Operand resolution.** For each operand, the renderer looks up the tensor name and resolves it to the appropriate buffer variable:
+- HBM input → `sbuf_{name}` (the DMA load buffer from section 5)
+- SBUF on-chip tensor → `sbuf_{name}`
+- PSUM on-chip tensor consumed by an op requiring SBUF → `sbuf_{name}` (the staging buffer)
+- PSUM on-chip tensor consumed by an op accepting PSUM → `psum_{name}`
+
+**Destination resolution.** The op's output goes to `psum_{name}` or `sbuf_{name}` based on `isa_loc`.
+
+**PSUM→SBUF staging.** After an op that writes to PSUM, if the tensor has an SBUF staging buffer (section 4), emit `stage_tensor_block(sbuf_{name}, psum_{name})`. Position follows the store rule (section 5): immediately for non-blocking ops, after the blocking axis loop for blocking ops.
+
+**Memset.** Before a blocking op's reduction loop, emit `nisa.memset(psum_{name}, 0.0)` to zero the PSUM accumulator. Position: before the blocking dimension's outermost loop in the current `loop_order`.
+
+**Tensor indexing.** Each operand is indexed into its buffer using the loop variables in scope. For a degree-1 buffer the tile indices are structurally 0: `buf[0:tile_p, 0, 0, 0:tile_f]`.
+
+### 6.1 Example: Matmul Group
+
+Single group with `nc_matmul` (blocking on d0):
+
+```python
+"""inside DP loop body"""
+# Group 0: nc_matmul [reduction: d0]
+nisa.memset(psum_result[0:128, 0, 0, 0:512], 0.0)
+for i_block_d0 in range(64):
+    for i_tile_d0 in range(1):
+        for i_ig_d0 in range(1):
+            load_tensor_block(sbuf_lhs_T, lhs_T, ...)
+            load_tensor_block(sbuf_rhs, rhs, ...)
+            nisa.nc_matmul(psum_result[0:128, 0, 0, 0:512],
+                           sbuf_lhs_T[0:128, 0, 0, 0:128],
+                           sbuf_rhs[0:128, 0, 0, 0:512])
+stage_tensor_block(sbuf_result, psum_result)
+```
+
+Memset before the d0 loop. nc_matmul accumulates across all d0 iterations into the same PSUM tile. `stage_tensor_block` after the loop — the PSUM result is now valid. Then section 5's `store_tensor_block` copies SBUF→HBM.
+
+## 7. Reference Kernel
 
 `softmax(mask(scale * Q @ K.T)) @ V`. Inputs: `Q(d0, d1), K(d2, d1), V(d2, d4)`. Return `output(d0, d4)`. With `seq_q=seq_k=2048, d_k=d_v=128`:
 

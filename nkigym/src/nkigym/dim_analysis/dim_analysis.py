@@ -72,6 +72,13 @@ class DimAnalysis:
         return_name: Name of the returned tensor.
         dims: ``{dim_id: DimInfo}``.
         tensors: ``{tensor_name: TensorInfo}``.
+        per_op_axis_maps: Per-op mapping from abstract axis
+            names to concrete dim IDs. Used by the renderer
+            to resolve ``BLOCKING_AXES`` to concrete dims.
+        op_tile_sizes: Per-op tile sizes mapped to concrete
+            dim IDs. ``op_tile_sizes[op_idx][dim_id]`` gives
+            the op's own tile limit on that dimension. Used
+            by the renderer for ISA call operand sizing.
     """
 
     func_name: str
@@ -79,6 +86,8 @@ class DimAnalysis:
     return_name: str
     dims: dict[str, DimInfo]
     tensors: dict[str, TensorInfo]
+    per_op_axis_maps: list[dict[str, str]]
+    op_tile_sizes: list[dict[str, int]]
 
     def __repr__(self) -> str:
         """Show final dimension analysis result."""
@@ -231,25 +240,26 @@ def _compute_tile_sizes(
     per_op_maps: list[dict[str, str]],
     dim_sizes: dict[str, int],
     data_parallel_dims: set[str],
-) -> dict[str, DimInfo]:
-    """Compute per-dimension tile sizes and classification."""
+) -> tuple[dict[str, DimInfo], list[dict[str, int]]]:
+    """Compute per-dimension tile sizes, classification, and per-op tile sizes."""
     max_tile: dict[str, int] = {}
     min_tile: dict[str, int] = {}
+    op_tile_sizes: list[dict[str, int]] = []
 
     for (op_cls, _, _), local in zip(ops, per_op_maps):
+        per_op: dict[str, int] = {}
         for abstract_axis, limit in op_cls.TILE_LIMITS.items():
             if abstract_axis not in local:
                 continue
             dim_id = local[abstract_axis]
-            max_tile[dim_id] = max(max_tile.get(dim_id, limit), limit)
-            min_tile[dim_id] = min(min_tile.get(dim_id, limit), limit)
+            clamped = min(limit, dim_sizes[dim_id])
+            per_op[dim_id] = clamped
+            max_tile[dim_id] = max(max_tile.get(dim_id, clamped), clamped)
+            min_tile[dim_id] = min(min_tile.get(dim_id, clamped), clamped)
+        op_tile_sizes.append(per_op)
 
-    for dim_id in max_tile:
-        max_tile[dim_id] = min(max_tile[dim_id], dim_sizes[dim_id])
-    for dim_id in min_tile:
-        min_tile[dim_id] = min(min_tile[dim_id], dim_sizes[dim_id])
-
-    return {d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], d in data_parallel_dims) for d in max_tile}
+    dims = {d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], d in data_parallel_dims) for d in max_tile}
+    return dims, op_tile_sizes
 
 
 def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> DimAnalysis:
@@ -294,12 +304,18 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
         raise ValueError(f"Return tensor {return_name!r} not found")
     data_parallel_dims = set(tensors[return_name].dim_ids)
 
-    dims = _compute_tile_sizes(ops, per_op_maps, dim_sizes, data_parallel_dims)
+    dims, op_tile_sizes = _compute_tile_sizes(ops, per_op_maps, dim_sizes, data_parallel_dims)
 
     tensor_infos: dict[str, TensorInfo] = {}
     for name, t in tensors.items():
         tensor_infos[name] = TensorInfo(tuple(t.dim_ids), t.shape, t.dtype, t.isa_loc)
 
     return DimAnalysis(
-        func_name=func.__name__, param_names=param_names, return_name=return_name, dims=dims, tensors=tensor_infos
+        func_name=func.__name__,
+        param_names=param_names,
+        return_name=return_name,
+        dims=dims,
+        tensors=tensor_infos,
+        per_op_axis_maps=per_op_maps,
+        op_tile_sizes=op_tile_sizes,
     )

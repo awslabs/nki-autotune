@@ -16,6 +16,7 @@ import graphviz
 import numpy as np
 
 from nkigym.dim_analysis.parse import find_ops
+from nkigym.ops.base import NKIOp
 
 
 @dataclass
@@ -23,7 +24,9 @@ class OpGraph:
     """Computation DAG.
 
     Attributes:
-        nodes: ``op_idx -> op_type`` (ISA name).
+        op_classes: ``op_idx -> NKIOp subclass``. Single source
+            of truth for all per-op attributes (NAME, BLOCKING_AXES,
+            PSUM_DTYPE, INPUT_LOCS, ISA_LOC, format_isa_call).
         edges: ``(producer, consumer, tensor, role)`` tuples.
             Only inter-op tensors — kernel inputs with no
             producer op are absent.
@@ -33,11 +36,9 @@ class OpGraph:
             output tensor names.
     """
 
-    nodes: list[str]
+    op_classes: list[type[NKIOp]]
     edges: list[tuple[int, int, str, str]]
     op_tensors: list[tuple[dict[str, str], list[str]]]
-    op_psum_dtypes: list[str | None]
-    op_input_locs: list[dict[str, str]]
 
     def __repr__(self) -> str:
         """Render the DAG as a per-node flow.
@@ -45,14 +46,14 @@ class OpGraph:
         Each node shows its inputs (tensor:role from which producer)
         and its outputs (tensor -> which consumers).
         """
-        inputs: dict[int, list[tuple[int, str, str]]] = {i: [] for i in range(len(self.nodes))}
-        outputs: dict[int, list[tuple[int, str, str]]] = {i: [] for i in range(len(self.nodes))}
+        inputs: dict[int, list[tuple[int, str, str]]] = {i: [] for i in range(len(self.op_classes))}
+        outputs: dict[int, list[tuple[int, str, str]]] = {i: [] for i in range(len(self.op_classes))}
         for producer, consumer, tensor, role in self.edges:
             inputs[consumer].append((producer, tensor, role))
             outputs[producer].append((consumer, tensor, role))
 
-        lines = [f"OpGraph({len(self.nodes)} nodes, {len(self.edges)} edges)", ""]
-        for i, op_type in enumerate(self.nodes):
+        lines = [f"OpGraph({len(self.op_classes)} nodes, {len(self.edges)} edges)", ""]
+        for i, op_type in enumerate(op_cls.NAME for op_cls in self.op_classes):
             lines.append(f"  [{i}] {op_type}")
             for src, tensor, role in inputs[i]:
                 lines.append(f"       <- {tensor} ({role}) from [{src}]")
@@ -74,8 +75,8 @@ class OpGraph:
         dot.attr(rankdir="TB", dpi="150")
         dot.attr("node", shape="box", style="rounded")
 
-        for i, op_type in enumerate(self.nodes):
-            dot.node(str(i), f"[{i}] {op_type}")
+        for i, op_cls in enumerate(self.op_classes):
+            dot.node(str(i), f"[{i}] {op_cls.NAME}")
 
         for producer, consumer, tensor, role in self.edges:
             dot.edge(str(producer), str(consumer), label=f"{tensor} ({role})")
@@ -100,17 +101,13 @@ def build_op_graph(func: Callable[..., np.ndarray]) -> OpGraph:
     """
     ops, _ = find_ops(func)
 
-    nodes: list[str] = []
+    op_classes_list: list[type[NKIOp]] = []
     edges: list[tuple[int, int, str, str]] = []
     op_tensors: list[tuple[dict[str, str], list[str]]] = []
-    op_psum_dtypes: list[str | None] = []
-    op_input_locs: list[dict[str, str]] = []
     tensor_producers: dict[str, int] = {}
 
     for i, (op_cls, name_kwargs, output_names) in enumerate(ops):
-        nodes.append(op_cls.NAME)
-        op_psum_dtypes.append(op_cls.PSUM_DTYPE)
-        op_input_locs.append(dict(op_cls.INPUT_LOCS))
+        op_classes_list.append(op_cls)
 
         inputs: dict[str, str] = {}
         for role, var_name in name_kwargs.items():
@@ -124,6 +121,4 @@ def build_op_graph(func: Callable[..., np.ndarray]) -> OpGraph:
         for oname in output_names:
             tensor_producers[oname] = i
 
-    return OpGraph(
-        nodes=nodes, edges=edges, op_tensors=op_tensors, op_psum_dtypes=op_psum_dtypes, op_input_locs=op_input_locs
-    )
+    return OpGraph(op_classes=op_classes_list, edges=edges, op_tensors=op_tensors)

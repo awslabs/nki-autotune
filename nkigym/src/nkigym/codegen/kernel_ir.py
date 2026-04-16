@@ -103,7 +103,7 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
     da = analyze_dims(func, input_specs)
     graph = build_op_graph(func)
 
-    num_ops = len(graph.nodes)
+    num_ops = len(graph.op_classes)
 
     fusion_groups = [[i] for i in range(num_ops)]
 

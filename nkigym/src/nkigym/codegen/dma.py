@@ -51,7 +51,7 @@ def render_store(ir: KernelIR, indent: int) -> str:
     da = ir.dim_analysis
     ret = da.return_name
     tinfo = da.tensors[ret]
-    all_ops = list(range(len(ir.op_graph.nodes)))
+    all_ops = list(range(len(ir.op_graph.op_classes)))
 
     par_ofs, free_ofs = _tensor_offsets(ir, tinfo, all_ops)
 

@@ -23,7 +23,7 @@ def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
 
     dp_dims = [dim_id for dim_id in sorted(da.dims) if da.dims[dim_id].is_data_parallel]
 
-    all_ops = list(range(len(ir.op_graph.nodes)))
+    all_ops = list(range(len(ir.op_graph.op_classes)))
     tpb_map: dict[str, int] = {}
     for dim_id in dp_dims:
         tpb_map[dim_id] = get_tpb(ir, dim_id, all_ops)
