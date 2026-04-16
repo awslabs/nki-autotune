@@ -1,6 +1,6 @@
 """Data-parallel loop generation: outermost loops over output tile coordinates."""
 
-from nkigym.codegen.kernel_ir import KernelIR
+from nkigym.codegen.kernel_ir import KernelIR, get_tpb
 
 
 def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
@@ -23,9 +23,10 @@ def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
 
     dp_dims = [dim_id for dim_id in sorted(da.dims) if da.dims[dim_id].is_data_parallel]
 
+    all_ops = list(range(len(ir.op_graph.nodes)))
     tpb_map: dict[str, int] = {}
     for dim_id in dp_dims:
-        tpb_map[dim_id] = _get_tpb(ir, dim_id)
+        tpb_map[dim_id] = get_tpb(ir, dim_id, all_ops)
 
     lines: list[str] = []
     indent = 1
@@ -50,18 +51,3 @@ def render_data_parallel_loops(ir: KernelIR) -> tuple[str, int]:
         indent += 1
 
     return "\n".join(lines), indent
-
-
-def _get_tpb(ir: KernelIR, dim_id: str) -> int:
-    """Get tiles_per_block for a data-parallel dimension.
-
-    All ops agree on tiles_per_block for a given dimension,
-    so we take the value from the first op that has the key.
-    """
-    tpb = 1
-    for op_idx in range(len(ir.op_graph.nodes)):
-        key = (op_idx, dim_id)
-        if key in ir.tiles_per_block:
-            tpb = ir.tiles_per_block[key]
-            break
-    return tpb

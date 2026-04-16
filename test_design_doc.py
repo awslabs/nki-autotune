@@ -16,7 +16,7 @@ import nki.language as nl
 import numpy as np
 from numpy.typing import NDArray
 
-from nkigym.gadgets import load_tensor_block, save_tensor_block
+from nkigym.gadgets import load_tensor_block, stage_tensor_block, store_tensor_block
 
 """
 ======== Group A: load placement + loop reordering ========
@@ -34,6 +34,7 @@ def lp_before(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, MT_A, NT_A, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, MT_A, NT_A, 512), dtype=output.dtype, buffer=nl.sbuf)
     nisa.memset(dst=psum_out[0:128, 0:MT_A, 0:NT_A, 0:512], value=0.0)
     for i_d0 in range(KT_A):
         for i_d1 in range(MT_A):
@@ -45,7 +46,8 @@ def lp_before(lhs_T: Any, rhs: Any, output: Any) -> None:
                     stationary=sbuf_lhs[0:128, 0, 0, 0:128],
                     moving=sbuf_rhs[0:128, 0, 0, 0:512],
                 )
-    save_tensor_block(output, psum_out, par_ofs=0, free_ofs=0)
+    stage_tensor_block(sbuf_out, psum_out)
+    store_tensor_block(output, sbuf_out, par_ofs=0, free_ofs=0)
 
 
 @nki.jit
@@ -54,6 +56,7 @@ def lp_after(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, NT_A, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, MT_A, NT_A, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, MT_A, NT_A, 512), dtype=output.dtype, buffer=nl.sbuf)
     nisa.memset(dst=psum_out[0:128, 0:MT_A, 0:NT_A, 0:512], value=0.0)
     for i_d0 in range(KT_A):
         load_tensor_block(sbuf_rhs, rhs, par_ofs=i_d0 * 128, free_ofs=0)
@@ -65,7 +68,8 @@ def lp_after(lhs_T: Any, rhs: Any, output: Any) -> None:
                     stationary=sbuf_lhs[0:128, 0, 0, 0:128],
                     moving=sbuf_rhs[0:128, 0, i_d2, 0:512],
                 )
-    save_tensor_block(output, psum_out, par_ofs=0, free_ofs=0)
+    stage_tensor_block(sbuf_out, psum_out)
+    store_tensor_block(output, sbuf_out, par_ofs=0, free_ofs=0)
 
 
 """
@@ -79,6 +83,7 @@ def lr_d0d2d1(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, MT_A, NT_A, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, MT_A, NT_A, 512), dtype=output.dtype, buffer=nl.sbuf)
     nisa.memset(dst=psum_out[0:128, 0:MT_A, 0:NT_A, 0:512], value=0.0)
     for i_d0 in range(KT_A):
         for i_d2 in range(NT_A):
@@ -90,7 +95,8 @@ def lr_d0d2d1(lhs_T: Any, rhs: Any, output: Any) -> None:
                     stationary=sbuf_lhs[0:128, 0, 0, 0:128],
                     moving=sbuf_rhs[0:128, 0, 0, 0:512],
                 )
-    save_tensor_block(output, psum_out, par_ofs=0, free_ofs=0)
+    stage_tensor_block(sbuf_out, psum_out)
+    store_tensor_block(output, sbuf_out, par_ofs=0, free_ofs=0)
 
 
 @nki.jit
@@ -99,6 +105,7 @@ def lr_d1d0d2(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, 1, NT_A, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, 1, NT_A, 512), dtype=output.dtype, buffer=nl.sbuf)
     for i_d1 in range(MT_A):
         nisa.memset(dst=psum_out[0:128, 0, 0:NT_A, 0:512], value=0.0)
         for i_d0 in range(KT_A):
@@ -110,7 +117,8 @@ def lr_d1d0d2(lhs_T: Any, rhs: Any, output: Any) -> None:
                     stationary=sbuf_lhs[0:128, 0, 0, 0:128],
                     moving=sbuf_rhs[0:128, 0, 0, 0:512],
                 )
-        save_tensor_block(output, psum_out, par_ofs=i_d1 * 128, free_ofs=0)
+        stage_tensor_block(sbuf_out, psum_out)
+        store_tensor_block(output, sbuf_out, par_ofs=i_d1 * 128, free_ofs=0)
 
 
 @nki.jit
@@ -119,6 +127,7 @@ def lr_d1d2d0(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, 1, 1, 512), dtype=output.dtype, buffer=nl.sbuf)
     for i_d1 in range(MT_A):
         for i_d2 in range(NT_A):
             nisa.memset(dst=psum_out[0:128, 0, 0, 0:512], value=0.0)
@@ -130,7 +139,8 @@ def lr_d1d2d0(lhs_T: Any, rhs: Any, output: Any) -> None:
                     stationary=sbuf_lhs[0:128, 0, 0, 0:128],
                     moving=sbuf_rhs[0:128, 0, 0, 0:512],
                 )
-            save_tensor_block(output, psum_out, par_ofs=i_d1 * 128, free_ofs=i_d2 * 512)
+            stage_tensor_block(sbuf_out, psum_out)
+            store_tensor_block(output, sbuf_out, par_ofs=i_d1 * 128, free_ofs=i_d2 * 512)
 
 
 @nki.jit
@@ -139,6 +149,7 @@ def lr_d2d0d1(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, MT_A, 1, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, MT_A, 1, 512), dtype=output.dtype, buffer=nl.sbuf)
     for i_d2 in range(NT_A):
         nisa.memset(dst=psum_out[0:128, 0:MT_A, 0, 0:512], value=0.0)
         for i_d0 in range(KT_A):
@@ -150,7 +161,8 @@ def lr_d2d0d1(lhs_T: Any, rhs: Any, output: Any) -> None:
                     stationary=sbuf_lhs[0:128, 0, 0, 0:128],
                     moving=sbuf_rhs[0:128, 0, 0, 0:512],
                 )
-        save_tensor_block(output, psum_out, par_ofs=0, free_ofs=i_d2 * 512)
+        stage_tensor_block(sbuf_out, psum_out)
+        store_tensor_block(output, sbuf_out, par_ofs=0, free_ofs=i_d2 * 512)
 
 
 @nki.jit
@@ -159,6 +171,7 @@ def lr_d2d1d0(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, 1, 1, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, 1, 1, 512), dtype=output.dtype, buffer=nl.sbuf)
     for i_d2 in range(NT_A):
         for i_d1 in range(MT_A):
             nisa.memset(dst=psum_out[0:128, 0, 0, 0:512], value=0.0)
@@ -170,7 +183,8 @@ def lr_d2d1d0(lhs_T: Any, rhs: Any, output: Any) -> None:
                     stationary=sbuf_lhs[0:128, 0, 0, 0:128],
                     moving=sbuf_rhs[0:128, 0, 0, 0:512],
                 )
-            save_tensor_block(output, psum_out, par_ofs=i_d1 * 128, free_ofs=i_d2 * 512)
+            stage_tensor_block(sbuf_out, psum_out)
+            store_tensor_block(output, sbuf_out, par_ofs=i_d1 * 128, free_ofs=i_d2 * 512)
 
 
 """
@@ -191,6 +205,7 @@ def tpb_before(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, MT_B, NT_B, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, MT_B, NT_B, 512), dtype=output.dtype, buffer=nl.sbuf)
     nisa.memset(dst=psum_out[0:128, 0:MT_B, 0:NT_B, 0:512], value=0.0)
     for i_d0 in range(KT_B):
         for i_d1 in range(MT_B):
@@ -202,7 +217,8 @@ def tpb_before(lhs_T: Any, rhs: Any, output: Any) -> None:
                     stationary=sbuf_lhs[0:128, 0, 0, 0:128],
                     moving=sbuf_rhs[0:128, 0, 0, 0:512],
                 )
-    save_tensor_block(output, psum_out, par_ofs=0, free_ofs=0)
+    stage_tensor_block(sbuf_out, psum_out)
+    store_tensor_block(output, sbuf_out, par_ofs=0, free_ofs=0)
 
 
 @nki.jit
@@ -211,6 +227,7 @@ def tpb_after(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, TPB, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, TPB, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, MT_B, NT_B, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, MT_B, NT_B, 512), dtype=output.dtype, buffer=nl.sbuf)
     nisa.memset(dst=psum_out[0:128, 0:MT_B, 0:NT_B, 0:512], value=0.0)
     for i_d0 in range(NUM_BLK):
         for i_d1 in range(MT_B):
@@ -223,7 +240,8 @@ def tpb_after(lhs_T: Any, rhs: Any, output: Any) -> None:
                         stationary=sbuf_lhs[0:128, i_k, 0, 0:128],
                         moving=sbuf_rhs[0:128, i_k, 0, 0:512],
                     )
-    save_tensor_block(output, psum_out, par_ofs=0, free_ofs=0)
+    stage_tensor_block(sbuf_out, psum_out)
+    store_tensor_block(output, sbuf_out, par_ofs=0, free_ofs=0)
 
 
 @nki.jit
@@ -232,6 +250,7 @@ def interleave_before(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_lhs = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_out = nl.ndarray((128, MT_B, NT_B, 512), dtype=nl.float32, buffer=nl.psum)
+    sbuf_out = nl.ndarray((128, MT_B, NT_B, 512), dtype=output.dtype, buffer=nl.sbuf)
     nisa.memset(dst=psum_out[0:128, 0:MT_B, 0:NT_B, 0:512], value=0.0)
     for i_block_d0 in range(NUM_BLK):
         for i_tile_d0 in range(TPB):
@@ -245,7 +264,8 @@ def interleave_before(lhs_T: Any, rhs: Any, output: Any) -> None:
                         stationary=sbuf_lhs[0:128, 0, 0, 0:128],
                         moving=sbuf_rhs[0:128, 0, 0, 0:512],
                     )
-    save_tensor_block(output, psum_out, par_ofs=0, free_ofs=0)
+    stage_tensor_block(sbuf_out, psum_out)
+    store_tensor_block(output, sbuf_out, par_ofs=0, free_ofs=0)
 
 
 @nki.jit
@@ -270,29 +290,23 @@ def interleave_after(lhs_T: Any, rhs: Any, output: Any) -> None:
                         moving=sbuf_rhs[0:128, 0, 0, 0:512],
                     )
                 nisa.tensor_copy(dst=sbuf_out[0:128, i_d1, i_d2, 0:512], src=psum_out[0:128, 0, 0, 0:512])
-    save_tensor_block(output, sbuf_out, par_ofs=0, free_ofs=0)
+    store_tensor_block(output, sbuf_out, par_ofs=0, free_ofs=0)
 
 
 """
 ======== Group C: §5.4 naive lowering ========
-"""
-
-
-"""
-C1: single matmul — K=d0 outermost, full PSUM accum
-d0=8192 (K, 64 blocks), d1=8192 (M, 64 blocks), d2=8192 (N, 16 blocks)
-result = lhs_T.T @ rhs, float32
+C1: single matmul — K=d0 outermost, full PSUM accum (8192x8192)
+C2: transpose + matmul — interleave asymmetry on d2 (8192x8192)
 """
 
 
 @nki.jit
 def section5_matmul(lhs_T: Any, rhs: Any, result: Any) -> None:
     """§5.4 lowered kernel: single nc_matmul, K outermost."""
-
     sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs = nl.ndarray((128, 1, 1, 512), dtype=rhs.dtype, buffer=nl.sbuf)
     psum_result = nl.ndarray((128, 64, 16, 512), dtype=nl.float32, buffer=nl.psum)
-
+    sbuf_result = nl.ndarray((128, 64, 16, 512), dtype=result.dtype, buffer=nl.sbuf)
     nisa.memset(psum_result[0:128, 0:64, 0:16, 0:512], value=0.0)
     for i_block_d0 in range(64):
         for i_block_d1 in range(64):
@@ -310,29 +324,18 @@ def section5_matmul(lhs_T: Any, rhs: Any, result: Any) -> None:
                                             sbuf_lhs_T[0:128, 0, 0, 0:128],
                                             sbuf_rhs[0:128, 0, 0, 0:512],
                                         )
-    save_tensor_block(result, psum_result, par_ofs=0, free_ofs=0)
-
-
-"""
-C2: transpose + matmul — interleave asymmetry on d2
-d0=8192 (64 tiles), d1=8192 (64 tiles), d2=8192 (16 dimension tiles, ig=4)
-result = lhs_T.T @ rhs_T.T, float32
-"""
+    stage_tensor_block(sbuf_result, psum_result)
+    store_tensor_block(result, sbuf_result, par_ofs=0, free_ofs=0)
 
 
 @nki.jit
 def section5_naive(lhs_T: Any, rhs_T: Any, result: Any) -> None:
     """§5.4 lowered kernel: one loop nest per op, no fusion."""
-
-    """
-    Op 0: nc_transpose(rhs_T) → rhs
-    sbuf_rhs at min tile size (128) per §4. Matmul reshapes (4,128)→(1,512).
-    """
+    """Op 0: nc_transpose(rhs_T) → rhs"""
     sbuf_rhs_T = nl.ndarray((128, 4, 1, 128), dtype=rhs_T.dtype, buffer=nl.sbuf)
     psum_rhs_temp = nl.ndarray((128, 1, 1, 128), dtype=rhs_T.dtype, buffer=nl.psum)
     sbuf_rhs = nl.ndarray((128, 64, 64, 128), dtype=rhs_T.dtype, buffer=nl.sbuf)
     sbuf_rhs_op1 = sbuf_rhs.reshape((128, 64, 16, 512))
-
     for i_block_d0 in range(64):
         for i_block_d2 in range(16):
             load_tensor_block(sbuf_rhs_T, rhs_T, par_ofs=i_block_d2 * 512, free_ofs=i_block_d0 * 128)
@@ -346,13 +349,10 @@ def section5_naive(lhs_T: Any, rhs_T: Any, result: Any) -> None:
                             gd0 = i_block_d0 * 1 + td0
                             nisa.nc_transpose(psum_rhs_temp[0:128, 0, 0, 0:128], sbuf_rhs_T[0:128, ld2, td0, 0:128])
                             nisa.tensor_copy(sbuf_rhs[0:128, gd0, gd2, 0:128], psum_rhs_temp[0:128, 0, 0, 0:128])
-
-    """
-    Op 1: nc_matmul(lhs_T, rhs) → result
-    """
+    """Op 1: nc_matmul(lhs_T, rhs) → result"""
     sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), dtype=lhs_T.dtype, buffer=nl.sbuf)
     psum_result = nl.ndarray((128, 64, 16, 512), dtype=nl.float32, buffer=nl.psum)
-
+    sbuf_result = nl.ndarray((128, 64, 16, 512), dtype=result.dtype, buffer=nl.sbuf)
     nisa.memset(psum_result[0:128, 0:64, 0:16, 0:512], value=0.0)
     for i_block_d0 in range(64):
         for i_block_d1 in range(64):
@@ -374,7 +374,8 @@ def section5_naive(lhs_T: Any, rhs_T: Any, result: Any) -> None:
                                             sbuf_lhs_T[0:128, td0, td1, 0:128],
                                             sbuf_rhs_op1[0:128, gd0, d2_ut, 0:512],
                                         )
-    save_tensor_block(result, psum_result, par_ofs=0, free_ofs=0)
+    stage_tensor_block(sbuf_result, psum_result)
+    store_tensor_block(result, sbuf_result, par_ofs=0, free_ofs=0)
 
 
 """
@@ -398,24 +399,20 @@ def main() -> None:
     """Run all design doc kernels and compare against numpy reference."""
     np.random.seed(42)
 
-    """Group A data"""
     ka, ma, na = KT_A * 128, MT_A * 128, NT_A * 512
     lhs_a = np.random.randn(ka, ma).astype(np.float32)
     rhs_a = np.random.randn(ka, na).astype(np.float32)
     ref_a = lhs_a.T @ rhs_a
 
-    """Group B data"""
     kb, mb, nb = KT_B * 128, MT_B * 128, NT_B * 512
     lhs_b = np.random.randn(kb, mb).astype(np.float32)
     rhs_b = np.random.randn(kb, nb).astype(np.float32)
     ref_b = lhs_b.T @ rhs_b
 
-    """Group C data — single matmul"""
     lhs_T_c1 = np.random.randn(8192, 8192).astype(np.float32)
     rhs_c1 = np.random.randn(8192, 8192).astype(np.float32)
     ref_c1 = lhs_T_c1.T @ rhs_c1
 
-    """Group C data — transpose + matmul"""
     lhs_T_c2 = np.random.randn(8192, 8192).astype(np.float32)
     rhs_T_c2 = np.random.randn(8192, 8192).astype(np.float32)
     ref_c2 = lhs_T_c2.T @ rhs_T_c2.T
@@ -429,7 +426,6 @@ def main() -> None:
         ("loop_reorder/(d2,d0,d1)", lr_d2d0d1),
         ("loop_reorder/(d2,d1,d0)", lr_d2d1d0),
     ]
-
     group_b: list[tuple[str, Callable[..., None]]] = [
         ("tiles_per_block/before (tpb=1)", tpb_before),
         ("tiles_per_block/after  (tpb=2)", tpb_after),

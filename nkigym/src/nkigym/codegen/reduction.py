@@ -2,7 +2,8 @@
 
 import heapq
 
-from nkigym.codegen.kernel_ir import KernelIR
+from nkigym.codegen.dma import render_loads_for_group
+from nkigym.codegen.kernel_ir import KernelIR, get_tpb
 from nkigym.dim_analysis.dim_analysis import DimAnalysis
 from nkigym.graph_analysis.op_graph import OpGraph
 
@@ -99,17 +100,6 @@ def _group_reduction_dims(group: list[int], graph: OpGraph, da: DimAnalysis, dp_
     return sorted(all_dims - dp_dims)
 
 
-def _get_tpb(ir: KernelIR, group: list[int], dim_id: str) -> int:
-    """Get tiles_per_block for a dimension using the first op in group."""
-    tpb = 1
-    for op_idx in group:
-        key = (op_idx, dim_id)
-        if key in ir.tiles_per_block:
-            tpb = ir.tiles_per_block[key]
-            break
-    return tpb
-
-
 def _render_group(ir: KernelIR, group_idx: int, group: list[int], red_dims: list[str], base_indent: int) -> list[str]:
     """Render one fusion group's reduction loop nest.
 
@@ -138,14 +128,14 @@ def _render_group(ir: KernelIR, group_idx: int, group: list[int], red_dims: list
 
     for dim_id in ordered_red:
         di = da.dims[dim_id]
-        tpb = _get_tpb(ir, group, dim_id)
+        tpb = get_tpb(ir, dim_id, group)
         num_blocks = di.dim_size // (tpb * di.tile_size)
         p = "    " * indent
         lines.append(f"{p}for i_block_{dim_id} in range({num_blocks}):")
         indent += 1
 
     for dim_id in ordered_red:
-        tpb = _get_tpb(ir, group, dim_id)
+        tpb = get_tpb(ir, dim_id, group)
         p = "    " * indent
         lines.append(f"{p}for i_tile_{dim_id} in range({tpb}):")
         indent += 1
@@ -156,6 +146,9 @@ def _render_group(ir: KernelIR, group_idx: int, group: list[int], red_dims: list
         p = "    " * indent
         lines.append(f"{p}for i_ig_{dim_id} in range({num_ig}):")
         indent += 1
+
+    load_lines = render_loads_for_group(ir, group, indent)
+    lines.extend(load_lines)
 
     p = "    " * indent
     lines.append(f"{p}...")

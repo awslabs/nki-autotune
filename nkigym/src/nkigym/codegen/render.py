@@ -2,6 +2,7 @@
 
 from nkigym.codegen.buffers import render_buffers
 from nkigym.codegen.data_parallel import render_data_parallel_loops
+from nkigym.codegen.dma import render_store
 from nkigym.codegen.header import render_header, render_return
 from nkigym.codegen.kernel_ir import KernelIR
 from nkigym.codegen.reduction import render_reduction_loops
@@ -11,7 +12,8 @@ def render_ir(ir: KernelIR) -> str:
     """Lower a KernelIR to NKI source code.
 
     Emits the kernel header, data-parallel loop nest, buffer
-    allocations, reduction loop bodies, and return statement.
+    allocations, reduction loop bodies with DMA loads, store,
+    and return statement.
 
     Args:
         ir: Complete kernel IR.
@@ -23,6 +25,7 @@ def render_ir(ir: KernelIR) -> str:
     dp_loops, dp_indent = render_data_parallel_loops(ir)
     buffers = render_buffers(ir, dp_indent)
     reduction = render_reduction_loops(ir, dp_indent)
+    store = render_store(ir, dp_indent)
     ret = render_return(ir.dim_analysis)
 
     parts = [header]
@@ -32,6 +35,8 @@ def render_ir(ir: KernelIR) -> str:
         parts.append(buffers)
     if reduction:
         parts.append(reduction)
+    if store:
+        parts.append(store)
     parts.append(ret)
 
     return "\n".join(parts) + "\n"

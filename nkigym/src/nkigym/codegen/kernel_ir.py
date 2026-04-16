@@ -36,6 +36,30 @@ class KernelIR:
     load_placements: dict[tuple[str, str], str]
 
 
+def get_tpb(ir: KernelIR, dim_id: str, op_indices: list[int]) -> int:
+    """Get tiles_per_block for a dimension from the first matching op.
+
+    Scans ``op_indices`` in order and returns the first
+    ``tiles_per_block[(op_idx, dim_id)]`` found.
+
+    Args:
+        ir: Complete kernel IR.
+        dim_id: Dimension to look up.
+        op_indices: Op indices to scan.
+
+    Returns:
+        tiles_per_block value.
+
+    Raises:
+        ValueError: If no matching key is found.
+    """
+    for op_idx in op_indices:
+        key = (op_idx, dim_id)
+        if key in ir.tiles_per_block:
+            return ir.tiles_per_block[key]
+    raise ValueError(f"No tiles_per_block for dim {dim_id!r} in ops {op_indices}")
+
+
 def _init_buffer_degrees(fusion_groups: list[list[int]], da: DimAnalysis) -> dict[tuple[int, str, str], int]:
     """Set all buffer degrees to 1 (single-buffered)."""
     degrees: dict[tuple[int, str, str], int] = {}
@@ -44,6 +68,15 @@ def _init_buffer_degrees(fusion_groups: list[list[int]], da: DimAnalysis) -> dic
             for dim_id in tinfo.dim_ids:
                 degrees.setdefault((group_idx, tensor_name, dim_id), 1)
     return degrees
+
+
+def _init_load_placements(da: DimAnalysis) -> dict[tuple[str, str], str]:
+    """Set all load placements to per_tile (innermost, one tile)."""
+    placements: dict[tuple[str, str], str] = {}
+    for tensor_name, tinfo in da.tensors.items():
+        for dim_id in tinfo.dim_ids:
+            placements[(tensor_name, dim_id)] = "per_tile"
+    return placements
 
 
 def _init_loop_order(fusion_groups: list[list[int]], da: DimAnalysis) -> list[list[str]]:
@@ -89,5 +122,5 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
         tiles_per_block=tiles_per_block,
         buffer_degrees=buffer_degrees,
         loop_order=loop_order,
-        load_placements={},
+        load_placements=_init_load_placements(da),
     )

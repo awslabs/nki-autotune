@@ -34,7 +34,7 @@ class KernelIR:
 
 **Renderer-derived positions** — NOT stored in KernelIR, mechanically derived by `render_ir` from the fields above:
 - **memset**: before the blocking dimension's outermost loop in the current `loop_order`.
-- **save / tensor_copy(psum→sbuf)**: after the blocking dimension's last inner loop.
+- **tensor_copy(psum→sbuf) and store(sbuf→hbm)**: when the source is valid — after the blocking dimension's last inner loop for PSUM→SBUF, after all reduction groups for SBUF→HBM. Same rule at both memory boundaries (section 5).
 - **tensor_copy (interleave reload/save)**: around the tile loop when a blocking dim's block and tile are split by other dims' loops.
 - These are deterministic given the loop structure — exactly one correct position for each, no ambiguity.
 
@@ -219,11 +219,11 @@ for i_block_d2 in range(4):
 ...
 ```
 
-This is the default lowering — each group gets its own independent reduction loops. The reference kernel (section 5) is the result of applying transforms (loop fusion, online softmax) on top of this baseline.
+This is the default lowering — each group gets its own independent reduction loops. The reference kernel (section 6) is the result of applying transforms (loop fusion, online softmax) on top of this baseline.
 
 ## 4. Tensor Buffers
 
-Every on-chip tensor (`isa_loc` is `"sbuf"` or `"psum"`) needs a buffer allocation. HBM tensors (kernel inputs) are excluded — they are parameters, not on-chip buffers. The return tensor gets both an HBM allocation (section 1, for the final store destination) and an on-chip buffer here (for the intermediate compute result, e.g. PSUM accumulator).
+Every tensor needs a buffer allocation. HBM inputs get an SBUF staging buffer (`sbuf_{name}`) for DMA loads — the load gadget copies tiles from HBM into this buffer, and ops consume from it. On-chip tensors (`isa_loc` is `"sbuf"` or `"psum"`) get their primary buffer as before, plus PSUM tensors get an SBUF staging buffer when a consumer requires it. The return tensor gets both an HBM allocation (section 1, for the final store destination) and an on-chip buffer here (for the intermediate compute result).
 
 **Placement rule: allocate at the top of the loop level where the buffer lives.** A buffer that is reused across iterations of a loop is allocated outside that loop. A buffer that is recycled each iteration is allocated at the top of the loop body. In the default lowering (degree-1, no load placement), every on-chip buffer holds one tile and is consumed within the innermost DP loop body, so all allocations go at the top of the innermost DP loop body, before any reduction loops.
 
@@ -241,13 +241,23 @@ The reference attention CTE kernel follows this same rule: persistent buffers (r
 
 A 1D tensor with `dim_ids = (dA,)` gets a 2D buffer: `({dA_tile_size}, {dA_num_tiles})`.
 
-**`num_tiles` formula.** For each dimension, `num_tiles` is the product of four factors:
+**`num_tiles` derivation.** `num_tiles` is derived from two independent choices in KernelIR:
 
-$$\text{num\_tiles} = \text{num\_blocks} \times \text{tiles\_per\_block} \times \text{interleave} \times \text{buffer\_degree}$$
+1. **`load_placements[(tensor_name, dim_id)]`** — allocation location. Determines how many loop iterations the buffer spans:
 
-where `num_blocks = dim_size / (tiles_per_block * tile_size)`, `interleave = tile_size / min_tile_size`, and `buffer_degree` comes from `ir.buffer_degrees[(group_idx, tensor_name, dim_id)]`. In the default lowering (`tiles_per_block = 1`, `buffer_degree = 1`, no load hoisting), `num_tiles = 1` for every dimension — the buffer holds exactly one tile.
+| Tier | Tiles covered |
+|---|---|
+| `"per_tile"` | 1 |
+| `"per_block"` | `tiles_per_block × interleave` |
+| `"full"` | `num_blocks × tiles_per_block × interleave` |
 
-Transforms grow `num_tiles` by changing these factors: `tiles_per_block` increases the tile-loop range, `buffer_degrees` adds multi-buffering capacity (e.g. double-buffering = 2), and `load_placements` hoists buffers to cover larger tile ranges.
+where `interleave = tile_size / min_tile_size` and `num_blocks = dim_size / (tiles_per_block × tile_size)`.
+
+2. **`buffer_degrees[(group_idx, tensor_name, dim_id)]`** — multi-buffering degree (e.g. double-buffering = 2).
+
+$$\text{num\_tiles} = \text{tiles\_covered} \times \text{buffer\_degree}$$
+
+Both fields are initialized in `build_ir`: `load_placements` defaults to `"per_tile"` for all `(tensor, dim)` pairs, `buffer_degrees` defaults to `1`. With these defaults, `num_tiles = 1` for every dimension. The renderer derives `num_tiles` purely from these fields — no hardcoded fallbacks.
 
 **Tile sizes** come from `dim_analysis.dims[dim_id].tile_size`.
 
@@ -261,9 +271,12 @@ Currently all ops declare `INPUT_LOCS = "sbuf"` for all operands, so every PSUM 
 
 ### 4.1 Example: Attention
 
-On-chip tensors (Q, K, V excluded — HBM inputs). All `num_tiles = 1` in the default lowering:
+All `num_tiles = 1` in the default lowering. HBM inputs (Q, K, V) get SBUF staging buffers:
 
 ```python
+sbuf_Q = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # HBM input staging: (d0, d1)
+sbuf_K = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # HBM input staging: (d2, d1)
+sbuf_V = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)         # HBM input staging: (d2, d4)
 psum_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.psum)       # (d1, d0)
 sbuf_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)       # staging: nc_matmul reads sbuf
 psum_K_t = nl.ndarray((128, 1, 1, 512), dtype=nl.bfloat16, buffer=nl.psum)       # (d1, d2)
@@ -283,7 +296,72 @@ sbuf_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)     
 sbuf_output = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)    # (d0, d4)
 ```
 
-## 5. Reference Kernel
+## 5. DMA
+
+Data moves through three memory levels: HBM → SBUF → PSUM (loads) and PSUM → SBUF → HBM (stores). One universal rule governs all store-direction transfers:
+
+**Store rule: move data when the source is valid.** This applies identically at every memory boundary:
+- **PSUM → SBUF** (`tensor_copy`): after the blocking dimension's accumulation loop completes — the PSUM accumulator is final.
+- **SBUF → HBM** (`nl.store`): after all reduction groups finish for a DP tile — the output tile is final.
+
+A non-blocking op (nc_transpose, single nc_matmul without accumulation) produces a valid PSUM result immediately, so `tensor_copy` follows right after. A blocking op (nc_matmul accumulating over K tiles) produces a valid result only after the full accumulation loop, so `tensor_copy` goes after the loop. Same principle, different granularity.
+
+### 5.1 Gadgets
+
+All multi-tile transfers use helper gadgets from `nkigym.gadgets.dma` to avoid inline loop nests in generated code. Three gadgets:
+
+- **`load_tensor_block(dst, src, par_ofs, free_ofs)`** — HBM → SBUF. Iterates over all tile slots in a 4D (or 2D) on-chip buffer and copies each tile from HBM via `nisa.dma_copy`.
+- **`stage_tensor_block(dst, src)`** — PSUM → SBUF. Iterates over all tile slots and issues `nisa.tensor_copy` for each. Both buffers must have the same shape.
+- **`store_tensor_block(dst, src, par_ofs, free_ofs)`** — SBUF → HBM. Iterates over all tile slots in an SBUF buffer and copies each tile to HBM via `nisa.dma_copy`.
+
+All three support 4D buffers `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)` for 2D tensors and 2D buffers `(tile_size_P, num_tiles_P)` for 1D tensors. The HBM offset is computed from loop variables: `offset = i_block * (tiles_per_block * tile_size) + i_tile * tile_size + i_ig * min_tile_size`.
+
+### 5.2 Loads
+
+Each HBM input tensor needs a `load_tensor_block` into its SBUF buffer before any op can consume it. A tensor's load position depends on which dimensions it carries:
+
+- A tensor with only DP dims (no reduction dims) is loaded once per DP tile — at the top of the innermost DP loop, after buffer allocations, before reduction groups.
+- A tensor with reduction dims is loaded inside the reduction group that consumes it, at the innermost position where all its dims have loop variables in scope.
+
+In the default lowering (degree-1, `num_tiles = 1`), each load brings in one tile.
+
+### 5.3 Stores
+
+PSUM → SBUF and SBUF → HBM both follow the store rule above.
+
+**PSUM → SBUF.** Each PSUM tensor with an SBUF staging buffer (section 4) gets a `stage_tensor_block(sbuf_{name}, psum_{name})` after its value is valid. Position is mechanically determined: after the blocking dimension's last inner loop for blocking ops, immediately after the ISA call for non-blocking ops.
+
+**SBUF → HBM.** The return tensor is stored via `store_tensor_block` at the bottom of the innermost DP loop, after all reduction groups finish.
+
+### 5.4 Example: Attention
+
+```python
+for i_block_d0 in range(16):
+    for i_block_d4 in range(1):
+        for i_tile_d0 in range(1):
+            for i_tile_d4 in range(1):
+                for i_ig_d0 in range(1):
+                    for i_ig_d4 in range(1):
+                        """buffer allocations..."""
+
+                        # --- Reduction groups 0–10 ---
+                        # Each group loads its HBM inputs via load_tensor_block
+                        # at the innermost position where all dims are in scope.
+                        # Group 0 loads Q inside its d1 loop.
+                        # Group 1 loads K inside its d1,d2 loop.
+                        # Group 9 loads V inside its d2 loop.
+                        #
+                        # PSUM→SBUF tensor_copy follows the store rule:
+                        # Group 0 (nc_transpose Q): non-blocking, copy immediately.
+                        # Group 2 (nc_matmul QK): blocking on d1, copy after d1 loop.
+                        # Group 9 (nc_matmul SV): blocking on d2, copy after d2 loop.
+                        """reduction loops with loads and tensor_copies..."""
+
+                        # --- SBUF→HBM store: output tile ready ---
+                        store_tensor_block(dst=output, src=sbuf_output, par_ofs=..., free_ofs=...)
+```
+
+## 6. Reference Kernel
 
 `softmax(mask(scale * Q @ K.T)) @ V`. Inputs: `Q(d0, d1), K(d2, d1), V(d2, d4)`. Return `output(d0, d4)`. With `seq_q=seq_k=2048, d_k=d_v=128`:
 
