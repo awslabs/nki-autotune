@@ -31,7 +31,7 @@ See [loop_reordering.md](loop_reordering.md).
 
 ### 4. Tiles Per Block
 
-See [tiles_per_block.md](tiles_per_block.md).
+See [ltiles_per_block.md](ltiles_per_block.md).
 
 ### 5. Multi-Buffer
 
@@ -39,7 +39,7 @@ See [multi_buffer.md](multi_buffer.md).
 
 ### 6. Online Fusion
 
-Greedy math-level preprocessing — not part of the programmatic search space. Detects all X + Accumulation patterns, applies tile-level fusion to each, and produces a single KernelIR with blocking barriers eliminated. Programmatic transforms then operate on this already-fused IR. Block-level granularity emerges from programmatic transforms: tiles_per_block + dimension interleaving naturally create the section structure where corrections happen once per block.
+Greedy math-level preprocessing — not part of the programmatic search space. Detects all X + Accumulation patterns, applies tile-level fusion to each, and produces a single KernelIR with blocking barriers eliminated. Programmatic transforms then operate on this already-fused IR. Block-level granularity emerges from programmatic transforms: ltiles_per_block + dimension interleaving naturally create the section structure where corrections happen once per block.
 
 See [online_fusion.md](online_fusion.md).
 

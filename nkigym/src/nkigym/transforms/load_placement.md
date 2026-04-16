@@ -6,7 +6,7 @@
 
 Each HBM input's DMA load sits at a position in the fusion group's loop nest. Moving a load **up** (hoisting) pre-loads more sub-tiles into a larger SBUF buffer; moving it **down** (sinking) shrinks the buffer but re-executes the DMA more often. In the base IR, all loads start at the innermost position.
 
-Each dimension contributes a block loop (`i_block_d`), a psum-batch loop (`i_psum_batch_d`), a tile loop (`i_tile_d`), and an interleave group loop (`i_ig_d`) to the nest. For DMA, the sub-block loops (psum-batch, tile, ig) are encapsulated inside the `load_tensor_block` / `save_tensor_block` gadgets from `nkigym.dma.gadgets` — the gadgets iterate over all tile slots in the buffer internally. The main loop nest only provides block-level offsets to the gadget; the compute loops remain explicit.
+Each dimension contributes a block loop (`i_block_d`), a psum-batch loop (`i_psum_batch_d`), a tile loop (`i_ltile_d`), and an interleave group loop (`i_ig_d`) to the nest. For DMA, the sub-block loops (psum-batch, tile, ig) are encapsulated inside the `load_tensor_block` / `save_tensor_block` gadgets from `nkigym.dma.gadgets` — the gadgets iterate over all tile slots in the buffer internally. The main loop nest only provides block-level offsets to the gadget; the compute loops remain explicit.
 
 For each dimension $d$ that the tensor depends on (**relevant dim**), the load position determines the buffer's sub-tile count on $d$:
 
@@ -37,14 +37,14 @@ Dimension interleaving (see loop_reordering.md) changes which loops sit between 
 ## Candidate Generation
 
 ```python
-load_placements: dict[str, dict[str, Literal["per_tile", "per_psum_batch", "per_block", "full"]]]
+tensor_placements: dict[str, dict[str, Literal["per_tile", "per_psum_batch", "per_block", "full"]]]
 ```
 
 Maps each HBM tensor to its per-dimension placement tier. Absent dimensions default to single. The renderer derives each tier's sub-tile count from current dimension parameters (per-tile → $\texttt{interleave}(d)$, per-psum-batch → $\texttt{tpb\_psum}(d) \times \texttt{interleave}(d)$, per-block → $\texttt{tpb\_hbm}(d) \times \texttt{interleave}(d)$, full → $\texttt{unified\_tiles}(d) \times \texttt{interleave}(d)$). Total buffer = $\prod_{d \in T} \texttt{sub\_tiles}(d)$ raw slots.
 
 Storing tiers instead of raw counts keeps the representation valid when $\texttt{tpb\_hbm}$ or $\texttt{tpb\_psum}$ changes — "per_block" always means "between block and psum-batch loops", "per_psum_batch" always means "between psum-batch and tile loops", and derived buffer sizes adjust automatically.
 
-Each candidate promotes one tensor on one relevant dimension from its current tier to a higher tier. `_apply(ir, name, dim_id, tier)` returns a new `KernelIR` with `load_placements[name][dim_id] = tier`.
+Each candidate promotes one tensor on one relevant dimension from its current tier to a higher tier. `_apply(ir, name, dim_id, tier)` returns a new `KernelIR` with `tensor_placements[name][dim_id] = tier`.
 
 ```python
 class LoadPlacement(Transform):
@@ -56,7 +56,7 @@ class LoadPlacement(Transform):
             for tensor_name in ir.group_hbm_inputs(gidx):
                 relevant_dims = ir.tensor_relevant_dims(tensor_name)
                 for dim_id in relevant_dims:
-                    tier = ir.load_placements.get(tensor_name, {}).get(dim_id, "single")
+                    tier = ir.tensor_placements.get(tensor_name, {}).get(dim_id, "single")
                     interleave = ir.ctx.interleave(dim_id)
                     tpb_hbm = ir.tpb_hbm.get(dim_id, 1)
                     tpb_psum = ir.tpb_psum.get(dim_id, tpb_hbm)
@@ -100,7 +100,7 @@ for i_d0 in range(16):
 save_tensor_block(dst=output, src=psum_output, par_ofs=0, free_ofs=0)
 ```
 
-**After** — `load_placements = {"rhs": {"d2": "full"}}`. `sbuf_rhs` grows from `(128, 1, 1, 512)` to `(128, 1, 4, 512)`. The rhs DMA moves above the d2 loop and loads all 4 d2 tiles tile-by-tile via a helper; the d2 loop is unchanged:
+**After** — `tensor_placements = {"rhs": {"d2": "full"}}`. `sbuf_rhs` grows from `(128, 1, 1, 512)` to `(128, 1, 4, 512)`. The rhs DMA moves above the d2 loop and loads all 4 d2 tiles tile-by-tile via a helper; the d2 loop is unchanged:
 ```python
 sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), buffer=nl.sbuf)
 sbuf_rhs = nl.ndarray((128, 1, 4, 512), buffer=nl.sbuf)

@@ -22,7 +22,7 @@ $$\text{logical\_tile\_size} = \min(\max(\text{op\_tile\_sizes}),\ \text{dim\_si
 
 $$\text{physical\_tile\_size} = \min(\text{op\_tile\_sizes},\ [128\ \text{if partition}])$$
 
-The **number of physical tiles per logical tile** `num_physical_tiles_per_logical_tile = logical_tile_size / physical_tile_size` is how many physical slots make up one logical tile in the buffer.
+The **number of physical tiles per logical tile** `num_ptiles_per_ltile = logical_tile_size / physical_tile_size` is how many physical slots make up one logical tile in the buffer.
 
 Within one logical tile, each op:
 - Iterates `logical_tile_size / op_tile_size` times (the physical tile sub-loop packs multiple op invocations)
@@ -85,22 +85,22 @@ Hardware tile limits per op (P is always 128):
 
 For dimension tile sizes, elementwise/reduce ops don't impose a binding F constraint — their SBUF limit is far above the matmul/transpose tiles. The binding constraints come from `nc_matmul` N=512 and `nc_transpose` P/F=128.
 
-| Dimension | Semantic | Size | Binding ops | Partition? | logical_tile_size | physical_tile_size | num_physical_tiles_per_logical_tile |
+| Dimension | Semantic | Size | Binding ops | Partition? | logical_tile_size | physical_tile_size | num_ptiles_per_ltile |
 |---|---|---|---|---|---|---|---|
 | d0 | seq_q | 4096 | transpose(P=128), matmul(M=128) | Yes | 128 | 128 | 1 |
 | d1 | d_k | 128 | transpose(F=128), matmul(K=128) | Yes | 128 | 128 | 1 |
 | d2 | seq_k | 4096 | transpose(P=128), matmul(N=512) | Yes | 512 | 128 | 4 |
 | d4 | d_v | 128 | matmul(N=512) | No | 128 | 128 | 1 |
 
-d0: logical_tile_size = `min(max(128, 128), 4096) = 128`. physical_tile_size = `min(128, 128, 128) = 128`. num_physical_tiles_per_logical_tile = 1.
+d0: logical_tile_size = `min(max(128, 128), 4096) = 128`. physical_tile_size = `min(128, 128, 128) = 128`. num_ptiles_per_ltile = 1.
 
-d1: logical_tile_size = `min(max(128, 128), 128) = 128`. physical_tile_size = `min(128, 128, 128) = 128`. num_physical_tiles_per_logical_tile = 1.
+d1: logical_tile_size = `min(max(128, 128), 128) = 128`. physical_tile_size = `min(128, 128, 128) = 128`. num_ptiles_per_ltile = 1.
 
-d2: logical_tile_size = `min(max(128, 512), 4096) = 512`. physical_tile_size = `min(128, 512) = 128`, partition cap applied → `min(128, 128) = 128`. num_physical_tiles_per_logical_tile = 512/128 = 4. Per op:
+d2: logical_tile_size = `min(max(128, 512), 4096) = 512`. physical_tile_size = `min(128, 512) = 128`, partition cap applied → `min(128, 128) = 128`. num_ptiles_per_ltile = 512/128 = 4. Per op:
 - nc_matmul: `512/512 = 1` call per logical tile, `512/128 = 4` physical slots per call → 1 × 4 = 4.
 - transpose/VE: `512/128 = 4` calls per logical tile, `128/128 = 1` physical slot per call → 4 × 1 = 4.
 
-d4: logical_tile_size = `min(max(512), 128) = 128` (clamped to dim_size). physical_tile_size = `min(512, 128) = 128`, not partition → no cap. num_physical_tiles_per_logical_tile = 1.
+d4: logical_tile_size = `min(max(512), 128) = 128` (clamped to dim_size). physical_tile_size = `min(512, 128) = 128`, not partition → no cap. num_ptiles_per_ltile = 1.
 
 ### Step 3 — Data-parallel classification
 

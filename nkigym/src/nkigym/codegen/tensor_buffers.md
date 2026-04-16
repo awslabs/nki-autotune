@@ -8,7 +8,7 @@ The reference attention CTE kernel follows this same rule: persistent buffers (r
 
 **Buffer shape.** SBUF and PSUM buffers use different layouts:
 
-**SBUF** buffers use a 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)` for 2D tensors, or `(tile_size_P, num_tiles_P)` for 1D tensors. `tile_size` is the physical tile size — the buffer allocation granularity. `num_tiles` includes `num_physical_tiles_per_logical_tile` (see below). Multi-tile SBUF is a single `nl.ndarray` allocation:
+**SBUF** buffers use a 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)` for 2D tensors, or `(tile_size_P, num_tiles_P)` for 1D tensors. `tile_size` is the physical tile size — the buffer allocation granularity. `num_tiles` includes `num_ptiles_per_ltile` (see below). Multi-tile SBUF is a single `nl.ndarray` allocation:
 
 ```python
 sbuf_{name} = nl.ndarray(
@@ -33,17 +33,17 @@ where `total_tiles = num_tiles_P * num_tiles_F`. PSUM tiles are indexed by flat 
 
 $$\text{num\_tiles} = \frac{\text{logical\_tile\_size}}{\text{physical\_tile\_size}} \times \text{location\_tiles} \times \text{buffer\_degree}$$
 
-`location_tiles` comes from `load_placements[(tensor_name, dim_id)]`:
+`location_tiles` comes from `tensor_placements[(tensor_name, dim_id)]`:
 
 | Tier | `location_tiles` |
 |---|---|
 | `"per_tile"` | 1 |
-| `"per_block"` | `tiles_per_block` |
+| `"per_block"` | `ltiles_per_block` |
 | `"full"` | `dim_size / logical_tile_size` |
 
 `buffer_degree` comes from `buffer_degrees[(group_idx, tensor_name, dim_id)]` (default 1).
 
-With the defaults (`"per_tile"`, degree 1, num_physical_tiles_per_logical_tile 1), `num_tiles = 1`.
+With the defaults (`"per_tile"`, degree 1, num_ptiles_per_ltile 1), `num_tiles = 1`.
 
 **PSUM staging.** A PSUM tensor gets an additional SBUF staging buffer (`sbuf_{name}`) when a consumer requires it. Each op declares per-operand memory requirements via `INPUT_LOCS` (e.g. `{"stationary": "sbuf", "moving": "sbuf"}` for nc_matmul). The renderer checks each consumer: if any operand reading this tensor has `INPUT_LOCS[role] == "sbuf"`, an SBUF staging buffer is emitted. The return tensor also needs staging (dma_copy to HBM reads from SBUF).
 
@@ -55,7 +55,7 @@ Currently all ops declare `INPUT_LOCS = "sbuf"` for all operands, so every PSUM 
 
 ### Example: Attention
 
-d2 has `logical_tile_size=512` (max of transpose 128, matmul 512) and `physical_tile_size=128` (min, with partition cap). So `num_physical_tiles_per_logical_tile = 512/128 = 4`. Buffers on d2 have `num_tiles = 4` on the d2 axis. All other dims have num_physical_tiles_per_logical_tile=1.
+d2 has `logical_tile_size=512` (max of transpose 128, matmul 512) and `physical_tile_size=128` (min, with partition cap). So `num_ptiles_per_ltile = 512/128 = 4`. Buffers on d2 have `num_tiles = 4` on the d2 axis. All other dims have num_ptiles_per_ltile=1.
 
 SBUF buffers (4D layout):
 
@@ -77,7 +77,7 @@ sbuf_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)     
 sbuf_output = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)    # (d0, d4)
 ```
 
-PSUM buffers (2D tiles, lists when num_physical_tiles_per_logical_tile > 1):
+PSUM buffers (2D tiles, lists when num_ptiles_per_ltile > 1):
 
 ```python
 psum_Q_t = nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.psum)             # (d1, d0) single tile
@@ -87,4 +87,4 @@ psum_exp_S_t = [nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.psum) for _ 
 psum_attn = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)             # (d0, d4) single tile
 ```
 
-PSUM is always 2D `(partition, free)` — one hardware tile per allocation. When `num_physical_tiles_per_logical_tile > 1`, a Python list holds the tiles. Ops index with `psum_K_t[i_ptile]` (list index) then `[0:128, 0:128]` (tile slice). Ops needing the full logical tile (e.g. nc_matmul reading 512 = 4×128) concatenate tiles via reshape.
+PSUM is always 2D `(partition, free)` — one hardware tile per allocation. When `num_ptiles_per_ltile > 1`, a Python list holds the tiles. Ops index with `psum_K_t[i_ptile]` (list index) then `[0:128, 0:128]` (tile slice). Ops needing the full logical tile (e.g. nc_matmul reading 512 = 4×128) concatenate tiles via reshape.

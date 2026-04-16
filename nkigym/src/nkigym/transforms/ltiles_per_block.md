@@ -2,7 +2,7 @@
 
 *Single-loop-nest transform — operates on one fusion group's loop nest. Fusing loop nests is handled by online fusion and loop fusion.*
 
-`tiles_per_block` groups consecutive dimension tiles into blocks, changing the dimension's iteration granularity and staging buffer sizes.
+`ltiles_per_block` groups consecutive dimension tiles into blocks, changing the dimension's iteration granularity and staging buffer sizes.
 
 $$\texttt{dimension\_tiles} = \frac{\texttt{dim\_size}}{\texttt{max\_tile\_size}} = \texttt{num\_blocks} \times \texttt{tiles\_per\_block}$$
 
@@ -16,14 +16,14 @@ The transform applies independently to each dimension — any combination of per
 
 Two other transforms build on the block structure:
 
-- **Load placement** hoists loads across other dimensions' loops for cross-dimension reuse. Orthogonal to tiles_per_block, which determines the same-dimension buffer granularity.
+- **Load placement** hoists loads across other dimensions' loops for cross-dimension reuse. Orthogonal to ltiles_per_block, which determines the same-dimension buffer granularity.
 - **Dimension interleaving** separates the block-level iteration from within-block processing with other dimensions' loops in between, enabling section-based processing. Requires $\texttt{num\_blocks} > 1$.
 
 ## Example
 
 Matmul from loop_reordering.md: `lhs_T(K=d0, M=d1) × rhs(K=d0, N=d2) → result(d1, d2)` with d0 (K, tile=128, 16 dimension tiles), d1 (M, tile=128, 16 dimension tiles), d2 (N, tile=512, 4 dimension tiles). Order (d0, d1, d2). lhs_T depends on (d0, d1); rhs depends on (d0, d2).
 
-**Before** — `tiles_per_block_d0 = 1` (default, 16 blocks of 1 tile):
+**Before** — `ltiles_per_block_d0 = 1` (default, 16 blocks of 1 tile):
 
 ```python
 sbuf_lhs_T = nl.ndarray((128, 1, 1, 128), buffer=nl.sbuf)
@@ -40,7 +40,7 @@ for i_d0 in range(16):
 save_tensor_block(dst=output, src=psum_output, par_ofs=0, free_ofs=0)
 ```
 
-**After** — `tiles_per_block = {"d0": 4}` (4 blocks of 4 tiles):
+**After** — `ltiles_per_block = {"d0": 4}` (4 blocks of 4 tiles):
 
 ```python
 sbuf_lhs_T = nl.ndarray((128, 4, 1, 128), buffer=nl.sbuf)
@@ -61,11 +61,11 @@ save_tensor_block(dst=output, src=psum_output, par_ofs=0, free_ofs=0)
 
 Changes:
 
-- **Buffers grow on d0.** `sbuf_lhs_T` from (128, **1**, 1, 128) to (128, **4**, 1, 128). `sbuf_rhs` from (128, **1**, 1, 512) to (128, **4**, 1, 512). Both tensors depend on d0 (par axis), so their par tile count grows to `tiles_per_block`.
+- **Buffers grow on d0.** `sbuf_lhs_T` from (128, **1**, 1, 128) to (128, **4**, 1, 128). `sbuf_rhs` from (128, **1**, 1, 512) to (128, **4**, 1, 512). Both tensors depend on d0 (par axis), so their par tile count grows to `ltiles_per_block`.
 - **Loop trip count.** d0 loop: `range(16)` → `range(4)`. Offset: `i_d0*128` → `i_d0*4*128` (block start).
 - **Load granularity.** `load_tensor_block` reads the buffer shape and loads all 4 par tiles per call (built-in internal loop). One call per block replaces what was one call per tile.
 - **Compute iteration.** `for i_k in range(4)` iterates over the 4 K tiles in the buffer. Each `nc_matmul` indexes `sbuf_lhs_T[0:128, i_k, 0, 0:128]` and `sbuf_rhs[0:128, i_k, 0, 0:512]`.
-- **PSUM unchanged.** PSUM sizing depends on which output dims are inside K (loop reordering), not on tiles_per_block.
+- **PSUM unchanged.** PSUM sizing depends on which output dims are inside K (loop reordering), not on ltiles_per_block.
 
 ### Valid values for d0
 
@@ -82,14 +82,14 @@ $T = 16$ collapses to a single block — interleaving becomes a no-op (`num_bloc
 ## Representation and Candidates
 
 ```python
-tiles_per_block: dict[str, int]
+ltiles_per_block: dict[str, int]
 ```
 
-Maps dimension ID to tiles_per_block in `KernelIR`. Absent dimensions default to 1.
+Maps dimension ID to ltiles_per_block in `KernelIR`. Absent dimensions default to 1.
 
 ```python
 class TilesPerBlock(Transform):
-    NAME = "tiles_per_block"
+    NAME = "ltiles_per_block"
 
     def candidates(self, ir: KernelIR) -> list[KernelIR]:
         results: list[KernelIR] = []
@@ -97,21 +97,21 @@ class TilesPerBlock(Transform):
             dim_id
             for dim_degrees in ir.buffer_degrees.values()
             for dim_id, deg in dim_degrees.items()
-            if deg > 1 and deg == ir.tiles_per_block.get(dim_id, 1)
+            if deg > 1 and deg == ir.ltiles_per_block.get(dim_id, 1)
         }
         dim_sizes = _collect_dim_sizes(ir.ctx)
         for dim_id, max_tile in ir.ctx.dim_tiles.items():
             if dim_id in constrained_dims:
                 continue
             unified = dim_sizes[dim_id] // max_tile
-            current = ir.tiles_per_block.get(dim_id, 1)
+            current = ir.ltiles_per_block.get(dim_id, 1)
             for tpb in _divisors(unified):
                 if tpb <= current:
                     continue
-                new_tpb = dict(ir.tiles_per_block)
+                new_tpb = dict(ir.ltiles_per_block)
                 new_tpb[dim_id] = tpb
-                results.append(replace(ir, tiles_per_block=new_tpb))
+                results.append(replace(ir, ltiles_per_block=new_tpb))
         return results
 ```
 
-Candidates only increase `tiles_per_block` — all valid divisors greater than the current value are explored in a single step. Dimensions where tile-level multi-buffer has degree $D > 1$ are excluded — changing `tiles_per_block` would break the buffer's tile-loop indexing (detected by $D = \texttt{tiles\_per\_block}[d]$, since tile-level multi-buffer sets both `buffer_degrees` and `tiles_per_block` to $D$). Values are constrained to divisors of `dimension_tiles`, so some block sizes are unreachable for input sizes where `dimension_tiles` has few factors.
+Candidates only increase `ltiles_per_block` — all valid divisors greater than the current value are explored in a single step. Dimensions where tile-level multi-buffer has degree $D > 1$ are excluded — changing `ltiles_per_block` would break the buffer's tile-loop indexing (detected by $D = \texttt{tiles\_per\_block}[d]$, since tile-level multi-buffer sets both `buffer_degrees` and `ltiles_per_block` to $D$). Values are constrained to divisors of `dimension_tiles`, so some block sizes are unreachable for input sizes where `dimension_tiles` has few factors.

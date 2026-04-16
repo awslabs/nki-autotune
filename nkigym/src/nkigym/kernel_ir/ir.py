@@ -21,19 +21,19 @@ class KernelIR:
         dim_analysis: Dimension IDs, tile sizes, tensor metadata.
         op_graph: Producer-consumer DAG.
         fusion_groups: Which ops share a loop nest.
-        tiles_per_block: Per (op_idx, dim_id) tiling factor.
+        ltiles_per_block: Per (op_idx, dim_id) tiling factor.
         buffer_degrees: Per (group_idx, tensor_name, dim_id) degree.
         loop_order: Per-group dimension ordering within each phase.
-        load_placements: Per (tensor_name, dim_id) DMA tier.
+        tensor_placements: Per (tensor_name, dim_id) DMA tier.
     """
 
     dim_analysis: DimAnalysis
     op_graph: OpGraph
     fusion_groups: list[list[int]]
-    tiles_per_block: dict[tuple[int, str], int]
+    ltiles_per_block: dict[tuple[int, str], int]
     buffer_degrees: dict[tuple[int, str, str], int]
     loop_order: list[list[str]]
-    load_placements: dict[tuple[str, str], str]
+    tensor_placements: dict[tuple[str, str], str]
 
     def __repr__(self) -> str:
         """Show KernelIR with each field on its own line."""
@@ -42,26 +42,26 @@ class KernelIR:
             f"  dim_analysis={self.dim_analysis!r}",
             f"  op_graph={self.op_graph!r}",
             f"  fusion_groups={self.fusion_groups!r}",
-            f"  tiles_per_block=",
-            self._fmt_tiles_per_block(),
+            f"  ltiles_per_block=",
+            self._fmt_ltiles_per_block(),
             "  buffer_degrees=",
             self._fmt_buffer_degrees(),
             f"  loop_order={self.loop_order!r}",
-            "  load_placements=",
-            self._fmt_load_placements(),
+            "  tensor_placements=",
+            self._fmt_tensor_placements(),
             ")",
         ]
         return "\n".join(lines)
 
-    def _fmt_tiles_per_block(self) -> str:
-        """Format tiles_per_block as an op-by-dim table."""
-        dim_ids = sorted({d for _, d in self.tiles_per_block})
-        op_indices = sorted({o for o, _ in self.tiles_per_block})
+    def _fmt_ltiles_per_block(self) -> str:
+        """Format ltiles_per_block as an op-by-dim table."""
+        dim_ids = sorted({d for _, d in self.ltiles_per_block})
+        op_indices = sorted({o for o, _ in self.ltiles_per_block})
         op_names = [self.op_graph.op_classes[i].NAME for i in op_indices]
 
         op_col_w = max(len("op"), *(len(n) for n in op_names))
         dim_col_ws = [
-            max(len(d), *(len(str(self.tiles_per_block.get((o, d), ""))) for o in op_indices)) for d in dim_ids
+            max(len(d), *(len(str(self.ltiles_per_block.get((o, d), ""))) for o in op_indices)) for d in dim_ids
         ]
 
         header = "op".ljust(op_col_w) + "  | " + "  | ".join(d.ljust(dim_col_ws[i]) for i, d in enumerate(dim_ids))
@@ -69,7 +69,7 @@ class KernelIR:
         rows: list[str] = []
         for o, name in zip(op_indices, op_names):
             vals = "  | ".join(
-                str(self.tiles_per_block.get((o, d), "")).ljust(dim_col_ws[i]) for i, d in enumerate(dim_ids)
+                str(self.ltiles_per_block.get((o, d), "")).ljust(dim_col_ws[i]) for i, d in enumerate(dim_ids)
             )
             rows.append(f"{name.ljust(op_col_w)}  | {vals}")
 
@@ -102,10 +102,10 @@ class KernelIR:
         pad = "    "
         return "\n".join([f"{pad}{header_line}", f"{pad}{sep_line}"] + [f"{pad}{line}" for line in data_lines])
 
-    def _fmt_load_placements(self) -> str:
-        """Format load_placements as a tensor-by-dim table."""
+    def _fmt_tensor_placements(self) -> str:
+        """Format tensor_placements as a tensor-by-dim table."""
         rows: list[list[str]] = []
-        for (tensor, dim_id), placement in sorted(self.load_placements.items()):
+        for (tensor, dim_id), placement in sorted(self.tensor_placements.items()):
             rows.append([tensor, dim_id, placement])
 
         headers = ["tensor", "dim", "placement"]
@@ -120,10 +120,10 @@ class KernelIR:
 
 
 def get_tpb(ir: KernelIR, dim_id: str, op_indices: list[int]) -> int:
-    """Get tiles_per_block for a dimension from the first matching op.
+    """Get ltiles_per_block for a dimension from the first matching op.
 
     Scans ``op_indices`` in order and returns the first
-    ``tiles_per_block[(op_idx, dim_id)]`` found.
+    ``ltiles_per_block[(op_idx, dim_id)]`` found.
 
     Args:
         ir: Complete kernel IR.
@@ -131,16 +131,16 @@ def get_tpb(ir: KernelIR, dim_id: str, op_indices: list[int]) -> int:
         op_indices: Op indices to scan.
 
     Returns:
-        tiles_per_block value.
+        ltiles_per_block value.
 
     Raises:
         ValueError: If no matching key is found.
     """
     for op_idx in op_indices:
         key = (op_idx, dim_id)
-        if key in ir.tiles_per_block:
-            return ir.tiles_per_block[key]
-    raise ValueError(f"No tiles_per_block for dim {dim_id!r} in ops {op_indices}")
+        if key in ir.ltiles_per_block:
+            return ir.ltiles_per_block[key]
+    raise ValueError(f"No ltiles_per_block for dim {dim_id!r} in ops {op_indices}")
 
 
 def _init_buffer_degrees(fusion_groups: list[list[int]], da: DimAnalysis) -> dict[tuple[int, str, str], int]:
@@ -153,8 +153,8 @@ def _init_buffer_degrees(fusion_groups: list[list[int]], da: DimAnalysis) -> dic
     return degrees
 
 
-def _init_load_placements(da: DimAnalysis) -> dict[tuple[str, str], str]:
-    """Set all load placements to per_tile (innermost, one tile)."""
+def _init_tensor_placements(da: DimAnalysis) -> dict[tuple[str, str], str]:
+    """Set all tensor placements to per_tile (innermost, one tile)."""
     placements: dict[tuple[str, str], str] = {}
     for tensor_name, tinfo in da.tensors.items():
         for dim_id in tinfo.dim_ids:
@@ -190,10 +190,10 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
 
     fusion_groups = [[i] for i in range(num_ops)]
 
-    tiles_per_block: dict[tuple[int, str], int] = {}
+    ltiles_per_block: dict[tuple[int, str], int] = {}
     for op_idx in range(num_ops):
         for dim_id in da.op_tile_sizes[op_idx]:
-            tiles_per_block[(op_idx, dim_id)] = 1
+            ltiles_per_block[(op_idx, dim_id)] = 1
 
     buffer_degrees = _init_buffer_degrees(fusion_groups, da)
     loop_order = _init_loop_order(fusion_groups, da)
@@ -202,8 +202,8 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
         dim_analysis=da,
         op_graph=graph,
         fusion_groups=fusion_groups,
-        tiles_per_block=tiles_per_block,
+        ltiles_per_block=ltiles_per_block,
         buffer_degrees=buffer_degrees,
         loop_order=loop_order,
-        load_placements=_init_load_placements(da),
+        tensor_placements=_init_tensor_placements(da),
     )

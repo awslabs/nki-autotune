@@ -68,7 +68,7 @@ def _tensor_offsets(ir: KernelIR, tinfo: TensorInfo, ops: list[int]) -> tuple[st
     Args:
         ir: Complete kernel IR.
         tinfo: Tensor metadata with dim_ids.
-        ops: Op indices to scan for tiles_per_block.
+        ops: Op indices to scan for ltiles_per_block.
 
     Returns:
         Tuple of (par_offset_expr, free_offset_expr). Free offset
@@ -103,10 +103,10 @@ def _offset_expr(dim_id: str, da: DimAnalysis, tpb: int) -> str:
     """Build the HBM offset expression for one dimension.
 
     Combines block, tile, and physical tile loop variables:
-    ``i_block * (tpb * logical_tile_size) + i_tile * logical_tile_size + i_ptile * physical_tile_size``
+    ``i_block * (tpb * logical_tile_size) + i_ltile * logical_tile_size + i_ptile * physical_tile_size``
     """
     di = da.dims[dim_id]
     logical = di.logical_tile_size
     physical = di.physical_tile_size
     block_stride = tpb * logical
-    return f"i_block_{dim_id} * {block_stride}" f" + i_tile_{dim_id} * {logical}" f" + i_ptile_{dim_id} * {physical}"
+    return f"i_block_{dim_id} * {block_stride}" f" + i_ltile_{dim_id} * {logical}" f" + i_ptile_{dim_id} * {physical}"

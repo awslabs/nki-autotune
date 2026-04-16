@@ -2,19 +2,19 @@
 
 After the header, `render_ir` emits loops for the data-parallel dimensions. A dimension is data-parallel when `DimInfo.is_data_parallel` is True — it appears in the kernel's return tensor. Every other dimension is a reduction dimension.
 
-Each dimension contributes 3 loops: block, tile, and physical tile. All three are always emitted, even when trip count is 1. Trip counts come from `DimInfo` and `tiles_per_block`:
+Each dimension contributes 3 loops: block, tile, and physical tile. All three are always emitted, even when trip count is 1. Trip counts come from `DimInfo` and `ltiles_per_block`:
 
 | Loop | Variable | Trip count |
 |---|---|---|
-| Block | `i_block_d{id}` | `dim_size / (tiles_per_block * logical_tile_size)` |
-| Tile | `i_tile_d{id}` | `tiles_per_block` |
-| Physical tile | `i_ptile_d{id}` | `num_physical_tiles_per_logical_tile` |
+| Block | `i_block_d{id}` | `dim_size / (ltiles_per_block * logical_tile_size)` |
+| Tile | `i_ltile_d{id}` | `ltiles_per_block` |
+| Physical tile | `i_ptile_d{id}` | `num_ptiles_per_ltile` |
 
 Loops are grouped by phase — all block loops outermost, then all tile loops, then all physical tile loops. Within each phase, data-parallel dimensions are sorted by dimension ID (fixed ordering — DP loops wrap all groups, so `loop_order` does not apply here). Block loops define the data boundary (DMA loads happen here), tile loops iterate within a block, and physical tile loops handle sub-tile iteration when ops have different tile size limits on the same dimension.
 
 ### Example: Attention DP Loops
 
-`softmax(mask(scale * Q @ K.T)) @ V`. Inputs: `Q(d0, d1), K(d2, d1), V(d2, d4)`. Return `output(d0, d4)`. With `seq_q=seq_k=2048, d_k=d_v=128`, `tiles_per_block = 1`:
+`softmax(mask(scale * Q @ K.T)) @ V`. Inputs: `Q(d0, d1), K(d2, d1), V(d2, d4)`. Return `output(d0, d4)`. With `seq_q=seq_k=2048, d_k=d_v=128`, `ltiles_per_block = 1`:
 
 | Dim | dim_size | logical_tile_size | physical_tile_size | DP/reduction | block | tile | ptile |
 |---|---|---|---|---|---|---|---|
@@ -28,8 +28,8 @@ d1 and d2 are reduction dimensions — not emitted here. d0 and d4 are data-para
 ```python
 for i_block_d0 in range(16):
     for i_block_d4 in range(1):
-        for i_tile_d0 in range(1):
-            for i_tile_d4 in range(1):
+        for i_ltile_d0 in range(1):
+            for i_ltile_d4 in range(1):
                 for i_ptile_d0 in range(1):
                     for i_ptile_d4 in range(1):
                         ...
@@ -43,7 +43,7 @@ Inside the innermost DP loop, the `...` placeholder is replaced by reduction con
 
 **Per-group reduction dims.** For each op in a group, collect all input and output tensor names from `op_graph.op_tensors[op_idx]`. Union their `dim_ids` (from `dim_analysis.tensors`) across all ops in the group, subtract the data-parallel dims. The remainder is the group's reduction dims.
 
-**Per-group loop structure.** Same phase-grouped pattern and trip count formulas as the DP loops, applied to the group's reduction dims. Within each phase, reduction dims are ordered by `loop_order[group_idx]` (filtered to reduction dims, preserving relative order). `tiles_per_block` is read from `ir.tiles_per_block[(op_idx, dim_id)]` using the first op in the group.
+**Per-group loop structure.** Same phase-grouped pattern and trip count formulas as the DP loops, applied to the group's reduction dims. Within each phase, reduction dims are ordered by `loop_order[group_idx]` (filtered to reduction dims, preserving relative order). `ltiles_per_block` is read from `ir.ltiles_per_block[(op_idx, dim_id)]` using the first op in the group.
 
 Groups with no reduction dims emit no loops — the body sits directly at the DP indentation level.
 
@@ -90,15 +90,15 @@ Inside the innermost DP loop, the eleven groups emit as sibling blocks. Groups 7
 
 # Group 0: nc_transpose Q [reduction: d1]
 for i_block_d1 in range(1):
-    for i_tile_d1 in range(1):
+    for i_ltile_d1 in range(1):
         for i_ptile_d1 in range(1):
             ...
 
 # Group 1: nc_transpose K [reduction: d1, d2]
 for i_block_d1 in range(1):
     for i_block_d2 in range(4):
-        for i_tile_d1 in range(1):
-            for i_tile_d2 in range(1):
+        for i_ltile_d1 in range(1):
+            for i_ltile_d2 in range(1):
                 for i_ptile_d1 in range(1):
                     for i_ptile_d2 in range(4):
                         ...
@@ -106,33 +106,33 @@ for i_block_d1 in range(1):
 # Group 2: nc_matmul QK [reduction: d1, d2]
 for i_block_d1 in range(1):
     for i_block_d2 in range(4):
-        for i_tile_d1 in range(1):
-            for i_tile_d2 in range(1):
+        for i_ltile_d1 in range(1):
+            for i_ltile_d2 in range(1):
                 for i_ptile_d1 in range(1):
                     for i_ptile_d2 in range(4):
                         ...
 
 # Group 3: affine_select [reduction: d2]
 for i_block_d2 in range(4):
-    for i_tile_d2 in range(1):
+    for i_ltile_d2 in range(1):
         for i_ptile_d2 in range(4):
             ...
 
 # Group 4: tensor_scalar scale [reduction: d2]
 for i_block_d2 in range(4):
-    for i_tile_d2 in range(1):
+    for i_ltile_d2 in range(1):
         for i_ptile_d2 in range(4):
             ...
 
 # Group 5: tensor_reduce max [reduction: d2]
 for i_block_d2 in range(4):
-    for i_tile_d2 in range(1):
+    for i_ltile_d2 in range(1):
         for i_ptile_d2 in range(4):
             ...
 
 # Group 6: activation_reduce exp+sum [reduction: d2]
 for i_block_d2 in range(4):
-    for i_tile_d2 in range(1):
+    for i_ltile_d2 in range(1):
         for i_ptile_d2 in range(4):
             ...
 
@@ -141,13 +141,13 @@ for i_block_d2 in range(4):
 
 # Group 8: nc_transpose exp_S [reduction: d2]
 for i_block_d2 in range(4):
-    for i_tile_d2 in range(1):
+    for i_ltile_d2 in range(1):
         for i_ptile_d2 in range(4):
             ...
 
 # Group 9: nc_matmul SV [reduction: d2]
 for i_block_d2 in range(4):
-    for i_tile_d2 in range(1):
+    for i_ltile_d2 in range(1):
         for i_ptile_d2 in range(4):
             ...
 

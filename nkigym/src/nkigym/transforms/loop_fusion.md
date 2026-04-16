@@ -69,9 +69,9 @@ psum_Q_t_tmp = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.psum)
 sbuf_Q = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.sbuf)
 sbuf_Q_t = nl.ndarray((128, 1, 16, 128), dtype=Q.dtype, buffer=nl.sbuf)
 for i_block_d1 in range(1):
-    for i_tile_d1 in range(1):
+    for i_ltile_d1 in range(1):
         for i_block_d0 in range(16):
-            for i_tile_d0 in range(1):
+            for i_ltile_d0 in range(1):
                 for i_ig_d0 in range(1):
                     for i_ig_d1 in range(1):
                         nisa.dma_copy(dst=sbuf_Q[...], src=Q[...])
@@ -83,9 +83,9 @@ psum_K_t_tmp = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.psum)
 sbuf_K = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.sbuf)
 sbuf_K_t = nl.ndarray((128, 1, 16, 128), dtype=Q.dtype, buffer=nl.sbuf)
 for i_block_d1 in range(1):
-    for i_tile_d1 in range(1):
+    for i_ltile_d1 in range(1):
         for i_block_d2 in range(4):
-            for i_tile_d2 in range(1):
+            for i_ltile_d2 in range(1):
                 for i_ig_d2 in range(4):
                     for i_ig_d1 in range(1):
                         nisa.dma_copy(dst=sbuf_K[...], src=K[...])
@@ -100,10 +100,10 @@ for i_block_d1 in range(1):
 sbuf_Q_t = nl.ndarray((128, 1, 16, 128), dtype=Q.dtype, buffer=nl.sbuf)
 sbuf_K_t = nl.ndarray((128, 1, 16, 128), dtype=Q.dtype, buffer=nl.sbuf)
 for i_block_d1 in range(1):
-    for i_tile_d1 in range(1):
+    for i_ltile_d1 in range(1):
         """ Op 0: transpose Q → Q_t """
         for i_block_d0 in range(16):
-            for i_tile_d0 in range(1):
+            for i_ltile_d0 in range(1):
                 for i_ig_d0 in range(1):
                     for i_ig_d1 in range(1):
                         psum_Q_t_tmp = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.psum)
@@ -113,7 +113,7 @@ for i_block_d1 in range(1):
                         nisa.tensor_copy(dst=sbuf_Q_t[...], src=psum_Q_t_tmp[...])
         """ Op 1: transpose K → K_t """
         for i_block_d2 in range(4):
-            for i_tile_d2 in range(1):
+            for i_ltile_d2 in range(1):
                 for i_ig_d2 in range(4):
                     for i_ig_d1 in range(1):
                         psum_K_t_tmp = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.psum)
@@ -128,18 +128,18 @@ for i_block_d1 in range(1):
 ```python
 """ All ops fused: [[0, 1, 2, 3, 4]] """
 for i_block_d0 in range(16):                              """ seq_q groups """
-    for i_tile_d0 in range(1):
+    for i_ltile_d0 in range(1):
         for i_block_d4 in range(1):                      """ d_v """
-            for i_tile_d4 in range(1):
+            for i_ltile_d4 in range(1):
                 psum_output = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
                 nisa.memset(dst=psum_output[0:128, 0:128], value=0.0)
                 for i_block_d2 in range(4):              """ seq_k — MM2 K reduction """
-                    for i_tile_d2 in range(1):
+                    for i_ltile_d2 in range(1):
                         """ Ops 0+1+2: MM1 — transpose Q, K; matmul Q_t @ K_t → S """
                         psum_S = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
                         nisa.memset(dst=psum_S[0:128, 0:512], value=0.0)
                         for i_block_d1 in range(1):      """ d_k — MM1 K reduction """
-                            for i_tile_d1 in range(1):
+                            for i_ltile_d1 in range(1):
                                 """ Op 0: transpose Q → Q_t (degree-1) """
                                 sbuf_Q = nl.ndarray((128, 128), dtype=Q.dtype, buffer=nl.sbuf)
                                 nisa.dma_copy(dst=sbuf_Q[...], src=Q[...])

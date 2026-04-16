@@ -190,7 +190,7 @@ def _tile_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo) -> str:
     """Build the tile index expression for an op accessing a buffer.
 
     The buffer uses physical tile sizes with
-    num_physical_tiles_per_logical_tile folded into num_tiles.
+    num_ptiles_per_ltile folded into num_tiles.
     Each op slices the buffer according to how many physical
     tiles it needs, then reshapes to its own tile size.
 

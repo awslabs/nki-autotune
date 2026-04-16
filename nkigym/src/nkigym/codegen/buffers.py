@@ -125,7 +125,7 @@ def _buffer_shape(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> tuple[in
 def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     """Derive num_tiles for one dimension from KernelIR fields.
 
-    num_tiles = num_physical_tiles_per_logical_tile
+    num_tiles = num_ptiles_per_ltile
                * tpb_factor * num_blocks_factor * buffer_degree
 
     | tier       | tpb_factor | num_blocks_factor          |
@@ -140,7 +140,7 @@ def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     max_op_tile = _max_op_tile_for_tensor(ir, tensor_name, dim_id)
     num_ptiles = max_op_tile // di.physical_tile_size
 
-    tier = ir.load_placements[(tensor_name, dim_id)]
+    tier = ir.tensor_placements[(tensor_name, dim_id)]
     ops_touching = _ops_for_tensor(ir, tensor_name)
     tpb = get_tpb(ir, dim_id, ops_touching)
     degree = ir.buffer_degrees[_buffer_degree_key(ir, tensor_name, dim_id)]

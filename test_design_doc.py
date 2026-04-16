@@ -2,7 +2,7 @@
 NKI CPU simulator correctness tests for design doc code examples.
 
 Group A (§6, tpb=1): load_placement + 6 loop orderings. K=256, M=256, N=1024.
-Group B (§6, tpb=2): tiles_per_block + interleave. K=512, M=256, N=1024.
+Group B (§6, tpb=2): ltiles_per_block + interleave. K=512, M=256, N=1024.
 Group C (§5.4): naive lowering — single matmul and transpose+matmul, MNK=8192.
 """
 
@@ -188,7 +188,7 @@ def lr_d2d1d0(lhs_T: Any, rhs: Any, output: Any) -> None:
 
 
 """
-======== Group B: tiles_per_block + interleave ========
+======== Group B: ltiles_per_block + interleave ========
 K=512 (KT_B=4 tiles, TPB=2, NUM_BLK=2), M=256 (MT_B=2), N=1024 (NT_B=2)
 """
 
@@ -253,9 +253,9 @@ def interleave_before(lhs_T: Any, rhs: Any, output: Any) -> None:
     sbuf_out = nl.ndarray((128, MT_B, NT_B, 512), dtype=output.dtype, buffer=nl.sbuf)
     nisa.memset(dst=psum_out[0:128, 0:MT_B, 0:NT_B, 0:512], value=0.0)
     for i_block_d0 in range(NUM_BLK):
-        for i_tile_d0 in range(TPB):
+        for i_ltile_d0 in range(TPB):
             for i_d1 in range(MT_B):
-                k_ofs = (i_block_d0 * TPB + i_tile_d0) * 128
+                k_ofs = (i_block_d0 * TPB + i_ltile_d0) * 128
                 load_tensor_block(sbuf_lhs, lhs_T, par_ofs=k_ofs, free_ofs=i_d1 * 128)
                 for i_d2 in range(NT_B):
                     load_tensor_block(sbuf_rhs, rhs, par_ofs=k_ofs, free_ofs=i_d2 * 512)
@@ -280,8 +280,8 @@ def interleave_after(lhs_T: Any, rhs: Any, output: Any) -> None:
         for i_d1 in range(MT_B):
             for i_d2 in range(NT_B):
                 nisa.tensor_copy(dst=psum_out[0:128, 0, 0, 0:512], src=sbuf_out[0:128, i_d1, i_d2, 0:512])
-                for i_tile_d0 in range(TPB):
-                    k_ofs = (i_block_d0 * TPB + i_tile_d0) * 128
+                for i_ltile_d0 in range(TPB):
+                    k_ofs = (i_block_d0 * TPB + i_ltile_d0) * 128
                     load_tensor_block(sbuf_lhs, lhs_T, par_ofs=k_ofs, free_ofs=i_d1 * 128)
                     load_tensor_block(sbuf_rhs, rhs, par_ofs=k_ofs, free_ofs=i_d2 * 512)
                     nisa.nc_matmul(
@@ -313,9 +313,9 @@ def section5_matmul(lhs_T: Any, rhs: Any, result: Any) -> None:
             for i_block_d2 in range(16):
                 load_tensor_block(sbuf_lhs_T, lhs_T, par_ofs=i_block_d0 * 128, free_ofs=i_block_d1 * 128)
                 load_tensor_block(sbuf_rhs, rhs, par_ofs=i_block_d0 * 128, free_ofs=i_block_d2 * 512)
-                for i_tile_d0 in range(1):
-                    for i_tile_d1 in range(1):
-                        for i_tile_d2 in range(1):
+                for i_ltile_d0 in range(1):
+                    for i_ltile_d1 in range(1):
+                        for i_ltile_d2 in range(1):
                             for i_ptile_d0 in range(1):
                                 for i_ptile_d1 in range(1):
                                     for i_ptile_d2 in range(1):
@@ -339,12 +339,12 @@ def section5_naive(lhs_T: Any, rhs_T: Any, result: Any) -> None:
     for i_block_d0 in range(64):
         for i_block_d2 in range(16):
             load_tensor_block(sbuf_rhs_T, rhs_T, par_ofs=i_block_d2 * 512, free_ofs=i_block_d0 * 128)
-            for i_tile_d0 in range(1):
-                for i_tile_d2 in range(1):
+            for i_ltile_d0 in range(1):
+                for i_ltile_d2 in range(1):
                     for i_ptile_d0 in range(1):
                         for i_ptile_d2 in range(4):
-                            ld2 = i_tile_d2 * 4 + i_ptile_d2
-                            td0 = i_tile_d0 * 1 + i_ptile_d0
+                            ld2 = i_ltile_d2 * 4 + i_ptile_d2
+                            td0 = i_ltile_d0 * 1 + i_ptile_d0
                             gd2 = i_block_d2 * 4 + ld2
                             gd0 = i_block_d0 * 1 + td0
                             nisa.nc_transpose(psum_rhs_temp[0:128, 0, 0, 0:128], sbuf_rhs_T[0:128, ld2, td0, 0:128])
@@ -358,15 +358,15 @@ def section5_naive(lhs_T: Any, rhs_T: Any, result: Any) -> None:
         for i_block_d1 in range(64):
             for i_block_d2 in range(16):
                 load_tensor_block(sbuf_lhs_T, lhs_T, par_ofs=i_block_d0 * 128, free_ofs=i_block_d1 * 128)
-                for i_tile_d0 in range(1):
-                    for i_tile_d1 in range(1):
-                        for i_tile_d2 in range(1):
+                for i_ltile_d0 in range(1):
+                    for i_ltile_d1 in range(1):
+                        for i_ltile_d2 in range(1):
                             for i_ptile_d0 in range(1):
                                 for i_ptile_d1 in range(1):
                                     for i_ptile_d2 in range(1):
-                                        td0 = i_tile_d0 * 1 + i_ptile_d0
-                                        td1 = i_tile_d1 * 1 + i_ptile_d1
-                                        d2_ut = i_block_d2 + i_tile_d2
+                                        td0 = i_ltile_d0 * 1 + i_ptile_d0
+                                        td1 = i_ltile_d1 * 1 + i_ptile_d1
+                                        d2_ut = i_block_d2 + i_ltile_d2
                                         gd0 = i_block_d0 * 1 + td0
                                         gd1 = i_block_d1 * 1 + td1
                                         nisa.nc_matmul(
@@ -427,8 +427,8 @@ def main() -> None:
         ("loop_reorder/(d2,d1,d0)", lr_d2d1d0),
     ]
     group_b: list[tuple[str, Callable[..., None]]] = [
-        ("tiles_per_block/before (tpb=1)", tpb_before),
-        ("tiles_per_block/after  (tpb=2)", tpb_after),
+        ("ltiles_per_block/before (tpb=1)", tpb_before),
+        ("ltiles_per_block/after  (tpb=2)", tpb_after),
         ("interleave/before (depth 0)", interleave_before),
         ("interleave/after  (depth 2)", interleave_after),
     ]

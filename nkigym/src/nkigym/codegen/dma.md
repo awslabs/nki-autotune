@@ -16,7 +16,7 @@ All multi-tile transfers use helper gadgets from `nkigym.dma.gadgets` to avoid i
 - **`stage_tensor_block(dst, src)`** — PSUM → SBUF. Iterates over all tile slots and issues `nisa.tensor_copy` for each. Both buffers must have the same shape.
 - **`store_tensor_block(dst, src, par_ofs, free_ofs)`** — SBUF → HBM. Iterates over all tile slots in an SBUF buffer and copies each tile to HBM via `nisa.dma_copy`.
 
-All three support 4D buffers `(physical_tile_size_P, num_tiles_P, num_tiles_F, physical_tile_size_F)` for 2D tensors and 2D buffers `(physical_tile_size_P, num_tiles_P)` for 1D tensors. The HBM offset is computed from loop variables: `offset = i_block * (tiles_per_block * logical_tile_size) + i_tile * logical_tile_size + i_ptile * physical_tile_size`.
+All three support 4D buffers `(physical_tile_size_P, num_tiles_P, num_tiles_F, physical_tile_size_F)` for 2D tensors and 2D buffers `(physical_tile_size_P, num_tiles_P)` for 1D tensors. The HBM offset is computed from loop variables: `offset = i_block * (ltiles_per_block * logical_tile_size) + i_ltile * logical_tile_size + i_ptile * physical_tile_size`.
 
 ### Loads
 
@@ -40,8 +40,8 @@ PSUM → SBUF and SBUF → HBM both follow the store rule above.
 ```python
 for i_block_d0 in range(16):
     for i_block_d4 in range(1):
-        for i_tile_d0 in range(1):
-            for i_tile_d4 in range(1):
+        for i_ltile_d0 in range(1):
+            for i_ltile_d4 in range(1):
                 for i_ptile_d0 in range(1):
                     for i_ptile_d4 in range(1):
                         """buffer allocations..."""

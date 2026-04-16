@@ -138,25 +138,25 @@ Orders pair by reuse pattern: {(d0,d1,d2), (d1,d0,d2)} both get 4× lhs_T reuse;
 
 ## Dimension Interleaving
 
-When tiles_per_block splits a dimension into multiple blocks, its block and tile loops can be separated with other dimensions' loops in between. This creates a **section** structure: each block iteration processes a chunk of the dimension across all enclosed iterations, with partial buffers for save/reload between sections.
+When ltiles_per_block splits a dimension into multiple blocks, its block and tile loops can be separated with other dimensions' loops in between. This creates a **section** structure: each block iteration processes a chunk of the dimension across all enclosed iterations, with partial buffers for save/reload between sections.
 
 ### Mechanism
 
 1. **Shrink `psum_output`.** Output dims that move between block and tile loops reduce to 1 — PSUM holds one tile position at a time.
 2. **Allocate `sbuf_output`.** An SBUF buffer matching the pre-shrink PSUM shape (all output tile positions), zero-initialized via `nisa.memset`. This buffer persists partial sums across block iterations.
-3. **Split the loops.** The dim's `i_block` loop stays at its position. The remaining phase loops (`i_psum_batch`, `i_tile`, `i_ig`) move deeper by `depth` positions past subsequent dims' loops.
+3. **Split the loops.** The dim's `i_block` loop stays at its position. The remaining phase loops (`i_psum_batch`, `i_ltile`, `i_ig`) move deeper by `depth` positions past subsequent dims' loops.
 4. **Move `tensor_copy(psum → sbuf)`.** The writeback moves from inside `save_tensor_block` to after the tile loop, saving each tile's accumulated result into `sbuf_output`.
 5. **Insert `tensor_copy(sbuf → psum)`.** Before the tile loop: reload the partial sum from `sbuf_output` into `psum_output`. First reload gets zeros; subsequent reloads continue accumulation from the previous block.
 6. **Update `save_tensor_block`.** src changes from `psum_output` to `sbuf_output` — data is already in SBUF after the per-iteration saves.
 
 ### Requirements
 
-- **`num_blocks > 1`** on the interleaved dim. With 1 block, the block loop is `range(1)` and splitting is a no-op. The tiles_per_block transform creates multi-block structure.
+- **`num_blocks > 1`** on the interleaved dim. With 1 block, the block loop is `range(1)` and splitting is a no-op. The ltiles_per_block transform creates multi-block structure.
 - **Accumulating semantics.** Every op reducing over this dim must use additive accumulation. `nc_matmul` accumulates via `+=` — valid. `tensor_reduce(op="max")` is NOT additive — requires online fusion to convert to accumulating form first.
 
 ### Interleave depths
 
-For the matmul with order `(d0, d1, d2)` and `tiles_per_block_d0 = 4` (`num_blocks_d0 = 4`):
+For the matmul with order `(d0, d1, d2)` and `ltiles_per_block_d0 = 4` (`num_blocks_d0 = 4`):
 
 | Depth | Loop nest | PSUM size | `sbuf_output` |
 |---|---|---|---|
@@ -168,7 +168,7 @@ Deeper interleaving reduces PSUM usage (the reload/save narrows the accumulation
 
 ### Example
 
-Same matmul, now with `tiles_per_block_d0 = 4` (4 blocks of 4 tiles each). Order `(d0, d1, d2)`. Staging buffers remain single-tile with per-tile loads to show the loop structure explicitly; in rendered code, tiles_per_block also grows buffers and coalesces loads to block level (see tiles_per_block.md).
+Same matmul, now with `ltiles_per_block_d0 = 4` (4 blocks of 4 tiles each). Order `(d0, d1, d2)`. Staging buffers remain single-tile with per-tile loads to show the loop structure explicitly; in rendered code, ltiles_per_block also grows buffers and coalesces loads to block level (see ltiles_per_block.md).
 
 **Before** — d0 not interleaved (depth 0):
 
@@ -178,13 +178,13 @@ sbuf_rhs = nl.ndarray((128, 1, 1, 512), buffer=nl.sbuf)
 psum_output = nl.ndarray((128, 16, 4, 512), dtype=nl.float32, buffer=nl.psum)
 nisa.memset(dst=psum_output[0:128, 0:16, 0:4, 0:512], value=0.0)
 for i_block_d0 in range(4):
-    for i_tile_d0 in range(4):
+    for i_ltile_d0 in range(4):
         for i_d1 in range(16):
             load_tensor_block(dst=sbuf_lhs_T, src=lhs_T,
-                par_ofs=(i_block_d0*4 + i_tile_d0)*128, free_ofs=i_d1*128)
+                par_ofs=(i_block_d0*4 + i_ltile_d0)*128, free_ofs=i_d1*128)
             for i_d2 in range(4):
                 load_tensor_block(dst=sbuf_rhs, src=rhs,
-                    par_ofs=(i_block_d0*4 + i_tile_d0)*128, free_ofs=i_d2*512)
+                    par_ofs=(i_block_d0*4 + i_ltile_d0)*128, free_ofs=i_d2*512)
                 nisa.nc_matmul(dst=psum_output[0:128, i_d1, i_d2, 0:512],
                     stationary=sbuf_lhs_T[0:128, 0, 0, 0:128], moving=sbuf_rhs[0:128, 0, 0, 0:512])
 save_tensor_block(dst=output, src=psum_output, par_ofs=0, free_ofs=0)
@@ -203,11 +203,11 @@ for i_block_d0 in range(4):
         for i_d2 in range(4):
             nisa.tensor_copy(dst=psum_output[0:128, 0, 0, 0:512],
                 src=sbuf_output[0:128, i_d1, i_d2, 0:512])
-            for i_tile_d0 in range(4):
+            for i_ltile_d0 in range(4):
                 load_tensor_block(dst=sbuf_lhs_T, src=lhs_T,
-                    par_ofs=(i_block_d0*4 + i_tile_d0)*128, free_ofs=i_d1*128)
+                    par_ofs=(i_block_d0*4 + i_ltile_d0)*128, free_ofs=i_d1*128)
                 load_tensor_block(dst=sbuf_rhs, src=rhs,
-                    par_ofs=(i_block_d0*4 + i_tile_d0)*128, free_ofs=i_d2*512)
+                    par_ofs=(i_block_d0*4 + i_ltile_d0)*128, free_ofs=i_d2*512)
                 nisa.nc_matmul(dst=psum_output[0:128, 0, 0, 0:512],
                     stationary=sbuf_lhs_T[0:128, 0, 0, 0:128], moving=sbuf_rhs[0:128, 0, 0, 0:512])
             nisa.tensor_copy(dst=sbuf_output[0:128, i_d1, i_d2, 0:512],
@@ -219,12 +219,12 @@ Mechanical steps applied to the before:
 
 1. **Shrink `psum_output`**: dims between block and tile (d1, d2) reduce to 1 → (128, 1, 1, 512)
 2. **Allocate `sbuf_output`**: shape matches pre-shrink PSUM (128, 16, 4, 512), zero-initialized via `memset`
-3. **Split loops**: `i_tile_d0` moves past 2 subsequent dims (d1, d2)
-4. **Move `tensor_copy(psum → sbuf)`**: from inside `save_tensor_block` to after `i_tile_d0` loop
-5. **Insert `tensor_copy(sbuf → psum)`**: reload before `i_tile_d0` loop
+3. **Split loops**: `i_ltile_d0` moves past 2 subsequent dims (d1, d2)
+4. **Move `tensor_copy(psum → sbuf)`**: from inside `save_tensor_block` to after `i_ltile_d0` loop
+5. **Insert `tensor_copy(sbuf → psum)`**: reload before `i_ltile_d0` loop
 6. **Update `save_tensor_block`**: src changes from `psum_output` to `sbuf_output`
 
-Operands loaded between `i_block_d0` and `i_tile_d0` persist across all 64 enclosed (d1 × d2) iterations per section. Load placement exploits this by hoisting loads into that gap.
+Operands loaded between `i_block_d0` and `i_ltile_d0` persist across all 64 enclosed (d1 × d2) iterations per section. Load placement exploits this by hoisting loads into that gap.
 
 **Fused groups.** In a fused group, a dim may be output for some ops and reduction for others. When interleaved, only the accumulating ops need partial buffer save/reload. Non-accumulating ops produce complete results per tile iteration, consumed within the same iteration by downstream ops.
 
@@ -258,7 +258,7 @@ class LoopReorder(Transform):
                 if not ir.is_accumulating(dim_id, gidx):
                     continue
                 unified = ir.ctx.dim_sizes[dim_id] // ir.ctx.dim_tiles[dim_id]
-                if unified // ir.tiles_per_block.get(dim_id, 1) <= 1:
+                if unified // ir.ltiles_per_block.get(dim_id, 1) <= 1:
                     continue
                 pos = dim_order.index(dim_id)
                 max_depth = len(dim_order) - pos - 1

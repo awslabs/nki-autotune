@@ -41,7 +41,7 @@ for i_d0 in range(4):
 
 Buffer grows from (128, **4**, 1, 128) to (128, **16**, 1, 128) — 4 rotating slots of 4 tiles. Previous blocks persist for DMA-compute overlap.
 
-**Constraints:** buffer_degree must divide num_blocks (same modular arithmetic limitation as PSUM — each block maps to a unique slot only when D divides the trip count). Independent of tiles_per_block — they control different concerns (buffer_degree: software pipelining, tiles_per_block: DMA-to-compute ratio). Different buffers on the same dimension can have different buffer_degrees.
+**Constraints:** buffer_degree must divide num_blocks (same modular arithmetic limitation as PSUM — each block maps to a unique slot only when D divides the trip count). Independent of ltiles_per_block — they control different concerns (buffer_degree: software pipelining, ltiles_per_block: DMA-to-compute ratio). Different buffers on the same dimension can have different buffer_degrees.
 
 ## PSUM Multi-Buffering
 
@@ -60,7 +60,7 @@ The driving loop operates at one of two levels:
 
 | Level | D | Driving loop |
 |---|---|---|
-| Tile | tiles_per_block | `i_tile` |
+| Tile | ltiles_per_block | `i_ltile` |
 | Block | num_blocks | `i_d` |
 
 NKI `range` lacks modular arithmetic (`i % D`), so D must equal the driving loop's trip count.
@@ -71,15 +71,15 @@ The dimension being multi-buffered determines the accumulation pattern:
 
 The matmul's free dimension (e.g., N in C=A@B) — each tile produces an independent, complete result. No cross-tile accumulation needed.
 
-**Tile level:** D = tiles_per_block. Matmul writes a full result per tile; `tensor_copy` saves to SBUF while the next tile starts on a different bank:
+**Tile level:** D = ltiles_per_block. Matmul writes a full result per tile; `tensor_copy` saves to SBUF while the next tile starts on a different bank:
 
 ```python
 psum_S = nl.ndarray((128, D * PSUM_BANK_SIZE), dtype=nl.float32,
                      buffer=nl.psum, address=(0, 0))
-for i_tile_d2 in range(D):
-    nisa.memset(dst=psum_S[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 512)], value=0.0)
-    nisa.nc_matmul(dst=psum_S[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 512)], ...)
-    nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[0:128, nl.ds(i_tile_d2 * PSUM_BANK_SIZE, 512)])
+for i_ltile_d2 in range(D):
+    nisa.memset(dst=psum_S[0:128, nl.ds(i_ltile_d2 * PSUM_BANK_SIZE, 512)], value=0.0)
+    nisa.nc_matmul(dst=psum_S[0:128, nl.ds(i_ltile_d2 * PSUM_BANK_SIZE, 512)], ...)
+    nisa.tensor_copy(dst=sbuf_S[...], src=psum_S[0:128, nl.ds(i_ltile_d2 * PSUM_BANK_SIZE, 512)])
 ```
 
 ### Contraction-dim PSUM
@@ -95,7 +95,7 @@ sbuf_accum = nl.ndarray((128, 1, 1, 128), dtype=output.dtype, buffer=nl.sbuf)
 nisa.memset(dst=sbuf_accum[0:128, 0, 0, 0:128], value=0.0)
 for i_d2 in range(D):
     nisa.memset(dst=psum_output[0:128, nl.ds(i_d2 * PSUM_BANK_SIZE, 128)], value=0.0)
-    for i_tile_d2 in range(tiles_per_block):
+    for i_ltile_d2 in range(ltiles_per_block):
         for i_ig_d2 in range(interleave):
             nisa.nc_matmul(dst=psum_output[0:128, nl.ds(i_d2 * PSUM_BANK_SIZE, 128)], ...)
     nisa.tensor_tensor(dst=sbuf_accum[0:128, 0, 0, 0:128],
@@ -104,11 +104,11 @@ for i_d2 in range(D):
                        op=nl.add)
 ```
 
-**Tile level:** Same pattern with `i_tile` driving bank rotation instead of `i_d`.
+**Tile level:** Same pattern with `i_ltile` driving bank rotation instead of `i_d`.
 
 **Constraints:**
-- Tile level: constrains tiles_per_block = D. Valid for both free and contraction dims.
-- Block level: D = num_blocks. Requires tiles_per_block > 1 (from a prior transform) and num_blocks ≤ MAX_DEGREE (= 8, the PSUM bank count).
+- Tile level: constrains ltiles_per_block = D. Valid for both free and contraction dims.
+- Block level: D = num_blocks. Requires ltiles_per_block > 1 (from a prior transform) and num_blocks ≤ MAX_DEGREE (= 8, the PSUM bank count).
 - Tile and block levels are mutually exclusive for the same PSUM on the same dimension.
 - Total D across all concurrent accumulators in a fusion group must be ≤ 8.
 
@@ -118,6 +118,6 @@ Three sources, all skipping persistent state buffers (online fusion accumulators
 
 1. **Increase existing SBUF entries:** For each buffer already in `buffer_degrees`, try D from current+1 to MAX_DEGREE where D divides num_blocks.
 2. **New HBM staging dims:** For each HBM input/output dimension not yet in `buffer_degrees`, try D from 2 to MAX_DEGREE where D divides num_blocks.
-3. **PSUM:** For each matmul's non-partition dims, try tile-level (sets tiles_per_block = D) and block-level (D = num_blocks, requires existing tiles_per_block > 1).
+3. **PSUM:** For each matmul's non-partition dims, try tile-level (sets ltiles_per_block = D) and block-level (D = num_blocks, requires existing ltiles_per_block > 1).
 
-`_apply(ir, name, dim_id, D)` sets `buffer_degrees` only. `_apply_psum_tile` also sets `psum_levels="tile"` and `tiles_per_block=D`. `_apply_psum_block` sets `psum_levels="block"` without constraining tiles_per_block.
+`_apply(ir, name, dim_id, D)` sets `buffer_degrees` only. `_apply_psum_tile` also sets `psum_levels="tile"` and `ltiles_per_block=D`. `_apply_psum_block` sets `psum_levels="block"` without constraining ltiles_per_block.

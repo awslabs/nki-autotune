@@ -49,8 +49,8 @@ for i_block_d0 in range(16):                               # d0 DP
         nisa.memset(psum_S[...], 0.0)
         for i_block_d1 in range(1):                         # d1 reduction
             for i_block_d2 in range(4):                     # d2 reduction
-                for i_tile_d1 in range(1):
-                    for i_tile_d2 in range(1):
+                for i_ltile_d1 in range(1):
+                    for i_ltile_d2 in range(1):
                         for i_ig_d1 in range(1):
                             for i_ig_d2 in range(4):        # F dimension ig loop
                                 p_start = i_block_d0 * 128

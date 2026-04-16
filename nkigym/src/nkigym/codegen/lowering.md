@@ -1,30 +1,26 @@
-**KernelIR** — the structured kernel representation that `render_ir` mechanically lowers to NKI source code. Contains `dim_analysis`, `op_graph`, and rendering parameters (`fusion_groups`, `tiles_per_block`, `buffer_degrees`, `loop_order`, `load_placements`).
+**KernelIR** — the structured kernel representation that `render_ir` mechanically lowers to NKI source code. Contains `dim_analysis`, `op_graph`, and rendering parameters (`fusion_groups`, `ltiles_per_block`, `buffer_degrees`, `loop_order`, `tensor_placements`).
 
 ## 1. Kernel Header
 
 Fixed preamble: imports, `@nki.jit` decorator, function signature, input shape assertions, HBM output allocation, return statement.
 
-## 2. Data-Parallel Loops
+## 2. Loop Nest
 
-DP dimensions (in the return tensor) get outermost loops: block, tile, physical tile per dimension, grouped by phase. All DP dims sorted by ID within each phase.
+DP dimensions (in the return tensor) get outermost loops: block, tile, physical tile per dimension, grouped by phase. All DP dims sorted by ID within each phase. Inside the innermost DP loop, each fusion group emits its own reduction loop nest as a sibling block, ordered by topological sort of the group-level DAG. Same phase-grouped pattern as DP loops, applied to the group's reduction dims.
 
-## 3. Reduction Loops
+## 3. Tensor Buffers
 
-Inside the innermost DP loop, each fusion group emits its own reduction loop nest as a sibling block, ordered by topological sort of the group-level DAG. Same phase-grouped pattern as DP loops, applied to the group's reduction dims.
+Buffer allocation for all on-chip tensors. SBUF uses 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`. PSUM uses 2D single-tile allocations `(partition, free)` in Python lists when `num_tiles > 1`. Buffers are allocated at the top of the innermost DP loop body, before reduction loops. `num_tiles = num_ptiles_per_ltile × location_tiles × buffer_degree`.
 
-## 4. Tensor Buffers
-
-Buffer allocation for all on-chip tensors. SBUF uses 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`. PSUM uses 2D single-tile allocations `(partition, free)` in Python lists when `num_tiles > 1`. Buffers are allocated at the top of the innermost DP loop body, before reduction loops. `num_tiles = num_physical_tiles_per_logical_tile × location_tiles × buffer_degree`.
-
-## 5. DMA
+## 4. DMA
 
 DMA transfers between HBM, SBUF, and PSUM. Universal store rule: move data when the source is valid (PSUM→SBUF after blocking loop, SBUF→HBM after all reduction groups). Three gadgets: `load_tensor_block` (HBM→SBUF), `stage_tensor_block` (PSUM→SBUF), `store_tensor_block` (SBUF→HBM).
 
-## 6. NKI Ops
+## 5. NKI Ops
 
 ISA call rendering inside reduction loops. Each op uses `format_isa_call` to emit `nisa.*` calls. Includes memset before blocking loops, PSUM→SBUF staging after, and per-op tile indexing with reshape for physical tile packing.
 
-## 7. Reference Kernel
+## 6. Reference Kernel
 
 `softmax(mask(scale * Q @ K.T)) @ V`. Inputs: `Q(d0, d1), K(d2, d1), V(d2, d4)`. Return `output(d0, d4)`. With `seq_q=seq_k=2048, d_k=d_v=128`:
 

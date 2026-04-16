@@ -14,7 +14,7 @@ Inside each reduction group's innermost loop, the renderer emits the actual ISA 
 
 **Memset.** Before a blocking op's reduction loop, emit `nisa.memset(psum_{name}, 0.0)` to zero the PSUM accumulator. Position: before the blocking dimension's outermost loop in the current `loop_order`.
 
-**Tensor indexing.** Each operand is indexed into its buffer using the **op's own tile size** (from `op_tile_sizes[op_idx]`). The buffer uses physical tile sizes with `num_physical_tiles_per_logical_tile` folded into `num_tiles`. Ops slice the buffer and reshape to their own tile size:
+**Tensor indexing.** Each operand is indexed into its buffer using the **op's own tile size** (from `op_tile_sizes[op_idx]`). The buffer uses physical tile sizes with `num_ptiles_per_ltile` folded into `num_tiles`. Ops slice the buffer and reshape to their own tile size:
 - `op_tile == physical_tile`: one slot, trivial reshape
 - `op_tile > physical_tile`: multi-slot `[0:physical_tile, 0:n, ...]`, reshape to `(op_tile_p, op_tile_f)`
 - `op_tile < physical_tile`: sub-tile within one slot
@@ -23,7 +23,7 @@ Inside each reduction group's innermost loop, the renderer emits the actual ISA 
 
 ### Example: Attention nc_transpose (multiple physical tiles)
 
-Group 8: nc_transpose on exp_S `(d0, d2)` → exp_S_t `(d2, d0)`. nc_transpose tile is 128×128, but d2 has `physical_tile_size=128` (partition-capped), and matmul wants 512 → `num_physical_tiles_per_logical_tile=4`. The buffer `psum_exp_S_t` has 4 PSUM tiles.
+Group 8: nc_transpose on exp_S `(d0, d2)` → exp_S_t `(d2, d0)`. nc_transpose tile is 128×128, but d2 has `physical_tile_size=128` (partition-capped), and matmul wants 512 → `num_ptiles_per_ltile=4`. The buffer `psum_exp_S_t` has 4 PSUM tiles.
 
 ```python
 for i_ptile_d2 in range(4):
@@ -37,7 +37,7 @@ for i_ptile_d2 in range(4):
 ```python
 nisa.memset(psum_result[0:128, 0, 0, 0:512], 0.0)
 for i_block_d0 in range(64):
-    for i_tile_d0 in range(1):
+    for i_ltile_d0 in range(1):
         for i_ptile_d0 in range(1):
             load_tensor_block(sbuf_lhs_T, lhs_T, ...)
             load_tensor_block(sbuf_rhs, rhs, ...)
