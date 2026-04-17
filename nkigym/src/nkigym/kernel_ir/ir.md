@@ -10,7 +10,7 @@ class KernelIR:
 
     fusion_groups: list[list[int]]
     ltiles_per_block: dict[str, int]
-    buffer_degrees: dict[tuple[int, str, str], int]
+    buffer_degrees: dict[tuple[str, str], int]
     loop_order: list[str | list[str]]
     tensor_placements: dict[tuple[str, str], str]
 ```
@@ -22,7 +22,7 @@ class KernelIR:
 **Rendering parameters** — `render_ir` reads these to determine loop structure, buffer sizes, and DMA placement:
 - `fusion_groups`: which ops share a loop nest. Initially `[[0], [1], ...]` — each op in its own group.
 - `ltiles_per_block`: `dim_id -> int`. Per-dimension tiling factor — every op and tensor on a given dim shares the same block structure. Initially `1` for every dim in `da.dims`.
-- `buffer_degrees`: `(group_idx, tensor_name, dim_id) -> int`. Initially `1`. Each tensor's buffer is independent per fusion group — the same tensor loaded in two groups can have different degrees.
+- `buffer_degrees`: `(tensor_name, dim_id) -> int`. Initially `1` for every `(tensor, dim)` pair where `dim` is in the tensor's `dim_ids`. Multi-buffering degree along that axis — see `multi_buffer.md`.
 - `loop_order`: single flat list for the whole kernel nest. Top-level string entries are DP dim IDs in outer-to-inner order; each nested `list[str]` is one fusion group's reduction dim IDs in outer-to-inner order, positional on `fusion_groups`. An empty sublist marks a group with no reduction dims. Example: for a kernel with two DP dims `d0, d4` and two fusion groups whose reduction nests are `for d1` and `for d1: for d2`, `loop_order = ["d0", "d4", ["d1"], ["d1", "d2"]]` — decoded as `for d0: for d4: { for d1 { ... }; for d1: for d2 { ... } }`. Initially DP dims `sorted` on top, then one sorted reduction sublist per fusion group.
 - `tensor_placements`: `(tensor_name, dim_id) -> tier`. Initially `"per_tile"` for all pairs. Tier is `"per_tile"`, `"per_block"`, or `"full"`.
 

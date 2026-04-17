@@ -95,8 +95,7 @@ class TilesPerBlock(Transform):
         results: list[KernelIR] = []
         constrained_dims = {
             dim_id
-            for dim_degrees in ir.buffer_degrees.values()
-            for dim_id, deg in dim_degrees.items()
+            for (_tensor, dim_id), deg in ir.buffer_degrees.items()
             if deg > 1 and deg == ir.ltiles_per_block.get(dim_id, 1)
         }
         dim_sizes = _collect_dim_sizes(ir.ctx)

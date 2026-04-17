@@ -18,7 +18,7 @@ Merging a contiguous run of groups `A = [a_0, ..., a_k]` (listed in current `fus
 |---|---|
 | `fusion_groups` | Replace the `k+1` entries with a single concatenated entry (ops in input order) |
 | `loop_order` | Replace the `k+1` reduction sublists with one sublist over `⋃ red_dims(a_i)` (order: see below) |
-| `buffer_degrees` | Rewrite keys from each old group index to the merged index; collisions on `(tensor, dim)` resolved by `max` |
+| `buffer_degrees` | Unchanged — keyed by `(tensor, dim)`, not by group |
 | `ltiles_per_block` | Unchanged — keyed by `dim`, not by group |
 | `tensor_placements` | Unchanged — keyed by `(tensor, dim)`, not by group |
 | `dim_analysis`, `op_graph` | Unchanged — the op set and dependencies are identical |
@@ -26,8 +26,6 @@ Merging a contiguous run of groups `A = [a_0, ..., a_k]` (listed in current `fus
 The renderer walks `fusion_groups` positionally and emits one nest per entry, so no renderer change is needed: after fusion it simply sees fewer sibling blocks.
 
 **Order in the merged sublist.** Take the first group's sublist as a base, then interleave each subsequent group's sublist while preserving within-group relative order. If a conflict arises (dim `d` appears before `e` in one group and after `e` in another), fusion is rejected; run loop-reordering first.
-
-**Max on `buffer_degrees`.** A buffer shared by two merged groups must be large enough to satisfy the stricter pipelining requirement.
 
 ### Legality
 
@@ -84,8 +82,8 @@ def fuse_groups(ir: KernelIR, group_indices: list[int]) -> KernelIR:
 
     `group_indices` — indices into `ir.fusion_groups`, in topological
     order (contiguous in the group-level DAG). Returns a new
-    `KernelIR` with merged `fusion_groups`, `loop_order`, and
-    `buffer_degrees`. Other fields are shared by reference.
+    `KernelIR` with merged `fusion_groups` and `loop_order`. Other
+    fields are shared by reference.
 
     Raises `ValueError` if any legality rule fails.
     """

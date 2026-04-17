@@ -41,7 +41,7 @@ $$\text{num\_tiles} = \frac{\text{logical\_tile\_size}}{\text{physical\_tile\_si
 | `"per_block"` | `ltiles_per_block` |
 | `"full"` | `dim_size / logical_tile_size` |
 
-`buffer_degree` comes from `buffer_degrees[(group_idx, tensor_name, dim_id)]` (default 1).
+`buffer_degree` comes from `buffer_degrees[(tensor_name, dim_id)]` (default 1).
 
 With the defaults (`"per_tile"`, degree 1, num_ptiles_per_ltile 1), `num_tiles = 1`.
 

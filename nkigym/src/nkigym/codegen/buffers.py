@@ -135,7 +135,7 @@ def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
 
     tier = ir.tensor_placements[(tensor_name, dim_id)]
     tpb = get_tpb(ir, dim_id)
-    degree = ir.buffer_degrees[_buffer_degree_key(ir, tensor_name, dim_id)]
+    degree = ir.buffer_degrees[(tensor_name, dim_id)]
 
     if tier == "per_tile":
         tpb_factor = 1
@@ -201,12 +201,3 @@ def _ops_for_tensor(ir: KernelIR, tensor_name: str) -> list[int]:
     if not result:
         raise ValueError(f"No ops touch tensor {tensor_name!r}")
     return result
-
-
-def _buffer_degree_key(ir: KernelIR, tensor_name: str, dim_id: str) -> tuple[int, str, str]:
-    """Find the buffer_degrees key for a tensor+dim (first group that has it)."""
-    for group_idx in range(len(ir.fusion_groups)):
-        key = (group_idx, tensor_name, dim_id)
-        if key in ir.buffer_degrees:
-            return key
-    raise ValueError(f"No buffer_degree for tensor {tensor_name!r}, dim {dim_id!r}")

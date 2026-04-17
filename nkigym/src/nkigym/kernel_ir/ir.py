@@ -22,7 +22,9 @@ class KernelIR:
         op_graph: Producer-consumer DAG.
         fusion_groups: Which ops share a loop nest.
         ltiles_per_block: Per-dimension tiling factor.
-        buffer_degrees: Per (group_idx, tensor_name, dim_id) degree.
+        buffer_degrees: Per (tensor_name, dim_id) multi-buffering
+            degree. ``dim_id`` must be one of the tensor's
+            ``dim_ids``.
         loop_order: Single flat list describing the whole kernel
             loop nest. Top-level string entries are DP dimension
             IDs in outer-to-inner order; each nested ``list[str]``
@@ -40,7 +42,7 @@ class KernelIR:
     op_graph: OpGraph
     fusion_groups: list[list[int]]
     ltiles_per_block: dict[str, int]
-    buffer_degrees: dict[tuple[int, str, str], int]
+    buffer_degrees: dict[tuple[str, str], int]
     loop_order: list[str | list[str]]
     tensor_placements: dict[tuple[str, str], str]
 
@@ -64,61 +66,28 @@ class KernelIR:
 
     def _fmt_ltiles_per_block(self) -> str:
         """Format ltiles_per_block as a dim → count table."""
-        rows: list[list[str]] = [
-            [dim_id, str(self.ltiles_per_block[dim_id])] for dim_id in sorted(self.ltiles_per_block)
-        ]
-
-        headers = ["dim", "ltiles_per_block"]
-        col_widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
-
-        header_line = "  | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
-        sep_line = "-+-".join("-" * col_widths[i] for i in range(len(headers)))
-        data_lines = ["  | ".join(r[i].ljust(col_widths[i]) for i in range(len(headers))) for r in rows]
-
-        pad = "    "
-        return "\n".join([f"{pad}{header_line}", f"{pad}{sep_line}"] + [f"{pad}{line}" for line in data_lines])
+        rows = [[dim_id, str(self.ltiles_per_block[dim_id])] for dim_id in sorted(self.ltiles_per_block)]
+        return _fmt_table(["dim", "ltiles_per_block"], rows)
 
     def _fmt_buffer_degrees(self) -> str:
-        """Format buffer_degrees as a group-by-tensor-by-dim table."""
-        group_indices = sorted({g for g, _, _ in self.buffer_degrees})
-        tensor_dim_pairs = sorted({(t, d) for _, t, d in self.buffer_degrees})
-        tensor_names = sorted({t for _, t, _ in self.buffer_degrees})
-
-        rows: list[list[str]] = []
-        for g in group_indices:
-            for t in tensor_names:
-                dims_for_t = [d for tn, d in tensor_dim_pairs if tn == t]
-                if not dims_for_t:
-                    continue
-                for d in dims_for_t:
-                    val = self.buffer_degrees.get((g, t, d), "")
-                    rows.append([str(g), t, d, str(val)])
-
-        headers = ["group", "tensor", "dim", "degree"]
-        col_widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
-
-        header_line = "  | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
-        sep_line = "-+-".join("-" * col_widths[i] for i in range(len(headers)))
-        data_lines = ["  | ".join(r[i].ljust(col_widths[i]) for i in range(len(headers))) for r in rows]
-
-        pad = "    "
-        return "\n".join([f"{pad}{header_line}", f"{pad}{sep_line}"] + [f"{pad}{line}" for line in data_lines])
+        """Format buffer_degrees as a tensor-by-dim table."""
+        rows = [[tensor, dim_id, str(degree)] for (tensor, dim_id), degree in sorted(self.buffer_degrees.items())]
+        return _fmt_table(["tensor", "dim", "degree"], rows)
 
     def _fmt_tensor_placements(self) -> str:
         """Format tensor_placements as a tensor-by-dim table."""
-        rows: list[list[str]] = []
-        for (tensor, dim_id), placement in sorted(self.tensor_placements.items()):
-            rows.append([tensor, dim_id, placement])
+        rows = [[tensor, dim_id, tier] for (tensor, dim_id), tier in sorted(self.tensor_placements.items())]
+        return _fmt_table(["tensor", "dim", "placement"], rows)
 
-        headers = ["tensor", "dim", "placement"]
-        col_widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
 
-        header_line = "  | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
-        sep_line = "-+-".join("-" * col_widths[i] for i in range(len(headers)))
-        data_lines = ["  | ".join(r[i].ljust(col_widths[i]) for i in range(len(headers))) for r in rows]
-
-        pad = "    "
-        return "\n".join([f"{pad}{header_line}", f"{pad}{sep_line}"] + [f"{pad}{line}" for line in data_lines])
+def _fmt_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Render a list of rows as an aligned text table."""
+    col_widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    header_line = "  | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers))
+    sep_line = "-+-".join("-" * col_widths[i] for i in range(len(headers)))
+    data_lines = ["  | ".join(r[i].ljust(col_widths[i]) for i in range(len(headers))) for r in rows]
+    pad = "    "
+    return "\n".join([f"{pad}{header_line}", f"{pad}{sep_line}"] + [f"{pad}{line}" for line in data_lines])
 
 
 def get_tpb(ir: KernelIR, dim_id: str) -> int:
@@ -143,13 +112,16 @@ def get_tpb(ir: KernelIR, dim_id: str) -> int:
     return ir.ltiles_per_block[dim_id]
 
 
-def _init_buffer_degrees(fusion_groups: list[list[int]], da: DimAnalysis) -> dict[tuple[int, str, str], int]:
-    """Set all buffer degrees to 1 (single-buffered)."""
-    degrees: dict[tuple[int, str, str], int] = {}
-    for group_idx, _group in enumerate(fusion_groups):
-        for tensor_name, tinfo in da.tensors.items():
-            for dim_id in tinfo.dim_ids:
-                degrees.setdefault((group_idx, tensor_name, dim_id), 1)
+def _init_buffer_degrees(da: DimAnalysis) -> dict[tuple[str, str], int]:
+    """Set all buffer degrees to 1 (single-buffered).
+
+    One entry per ``(tensor_name, dim_id)`` where ``dim_id`` is in
+    the tensor's own ``dim_ids``.
+    """
+    degrees: dict[tuple[str, str], int] = {}
+    for tensor_name, tinfo in da.tensors.items():
+        for dim_id in tinfo.dim_ids:
+            degrees[(tensor_name, dim_id)] = 1
     return degrees
 
 
@@ -206,7 +178,7 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
 
     ltiles_per_block: dict[str, int] = {dim_id: 1 for dim_id in da.dims}
 
-    buffer_degrees = _init_buffer_degrees(fusion_groups, da)
+    buffer_degrees = _init_buffer_degrees(da)
     loop_order = _init_loop_order(fusion_groups, da, graph)
 
     return KernelIR(
