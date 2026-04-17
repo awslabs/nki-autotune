@@ -20,21 +20,20 @@ class KernelIR:
     Attributes:
         dim_analysis: Dimension IDs, tile sizes, tensor metadata.
         op_graph: Producer-consumer DAG.
-        fusion_groups: Which ops share a loop nest.
+        fusion_groups: Which ops share a loop nest. Initially one
+            singleton group per op; loop fusion merges groups.
         ltiles_per_block: Per-dimension tiling factor.
         buffer_degrees: Per (tensor_name, dim_id) multi-buffering
             degree. ``dim_id`` must be one of the tensor's
             ``dim_ids``.
-        loop_order: Single flat list describing the whole kernel
-            loop nest. Top-level string entries are DP dimension
-            IDs in outer-to-inner order; each nested ``list[str]``
-            is one fusion group's reduction dim IDs in
-            outer-to-inner order, positioned by fusion-group
-            index. Groups with no reduction dims use an empty
-            nested list. Example: ``["d0", "d4", ["d1"], ["d1", "d2"]]``
-            means two DP loops ``d0, d4`` enclosing two sibling
-            reduction groups, the first over ``d1`` alone and the
-            second over ``d1`` then ``d2``.
+        group_dim_orders: Per fusion group, the complete ordered
+            list of dim IDs this group loops over (outer-to-inner).
+            Positional on ``fusion_groups``. A group's dim list
+            covers every dim touched by any op in the group. An
+            empty list marks a group with no loops (every op has
+            trip count 1 on every dim it touches). Stored rather
+            than derived so loop-reordering transforms can permute
+            the order without mutating ``op_graph``.
         tensor_placements: Per (tensor_name, dim_id) DMA tier.
     """
 
@@ -43,7 +42,7 @@ class KernelIR:
     fusion_groups: list[list[int]]
     ltiles_per_block: dict[str, int]
     buffer_degrees: dict[tuple[str, str], int]
-    loop_order: list[str | list[str]]
+    group_dim_orders: list[list[str]]
     tensor_placements: dict[tuple[str, str], str]
 
     def __repr__(self) -> str:
@@ -53,11 +52,11 @@ class KernelIR:
             f"  dim_analysis={self.dim_analysis!r}",
             f"  op_graph={self.op_graph!r}",
             f"  fusion_groups={self.fusion_groups!r}",
-            f"  ltiles_per_block=",
+            "  ltiles_per_block=",
             self._fmt_ltiles_per_block(),
             "  buffer_degrees=",
             self._fmt_buffer_degrees(),
-            f"  loop_order={self.loop_order!r}",
+            f"  group_dim_orders={self.group_dim_orders!r}",
             "  tensor_placements=",
             self._fmt_tensor_placements(),
             ")",
@@ -134,33 +133,40 @@ def _init_tensor_placements(da: DimAnalysis) -> dict[tuple[str, str], str]:
     return placements
 
 
-def _init_loop_order(fusion_groups: list[list[int]], da: DimAnalysis, op_graph: OpGraph) -> list[str | list[str]]:
-    """Build the default nested loop_order.
+def _group_dims(group: list[int], da: DimAnalysis, op_graph: OpGraph) -> list[str]:
+    """Collect every dim any op in the group touches.
 
-    DP dims (sorted) go at the top level; one sorted reduction
-    sublist per fusion group follows, positional on
-    ``fusion_groups``. A group with no reduction dims contributes
-    an empty sublist.
+    Union of ``dim_ids`` across all input and output tensors of
+    every op in ``group``. Returned sorted for a deterministic
+    initial order; loop-reordering exposes permutations later.
     """
-    dp_dims = [d for d in sorted(da.dims) if da.dims[d].is_data_parallel]
-    order: list[str | list[str]] = list(dp_dims)
-    dp_set = set(dp_dims)
-    for group in fusion_groups:
-        group_dims: set[str] = set()
-        for op_idx in group:
-            inputs, outputs = op_graph.op_tensors[op_idx]
-            for tensor_name in list(inputs.values()) + outputs:
-                if tensor_name in da.tensors:
-                    group_dims.update(da.tensors[tensor_name].dim_ids)
-        order.append(sorted(group_dims - dp_set))
-    return order
+    dims: set[str] = set()
+    for op_idx in group:
+        for tensor_name in op_graph.op_tensor_names(op_idx):
+            if tensor_name in da.tensors:
+                dims.update(da.tensors[tensor_name].dim_ids)
+    return sorted(dims)
+
+
+def _init_group_dim_orders(fusion_groups: list[list[int]], da: DimAnalysis, op_graph: OpGraph) -> list[list[str]]:
+    """Build the default per-group dim_order list.
+
+    One entry per fusion group, positional on ``fusion_groups``.
+    Each entry is every dim the group's ops touch, sorted by
+    dim_id. No DP-vs-reduction distinction — every dim the ops
+    touch is a loop.
+    """
+    return [_group_dims(group, da, op_graph) for group in fusion_groups]
 
 
 def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
     """Construct the initial KernelIR from a math function.
 
     Runs dimension analysis and graph analysis, then sets all
-    rendering parameters to their default (naive) values.
+    rendering parameters to their default (naive) values. The
+    default is maximally unfused: one singleton fusion group per
+    op, each owning a complete loop nest over every dim its op
+    touches.
 
     Args:
         func: Math function using NKIOp classes.
@@ -179,7 +185,7 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
     ltiles_per_block: dict[str, int] = {dim_id: 1 for dim_id in da.dims}
 
     buffer_degrees = _init_buffer_degrees(da)
-    loop_order = _init_loop_order(fusion_groups, da, graph)
+    group_dim_orders = _init_group_dim_orders(fusion_groups, da, graph)
 
     return KernelIR(
         dim_analysis=da,
@@ -187,6 +193,6 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
         fusion_groups=fusion_groups,
         ltiles_per_block=ltiles_per_block,
         buffer_degrees=buffer_degrees,
-        loop_order=loop_order,
+        group_dim_orders=group_dim_orders,
         tensor_placements=_init_tensor_placements(da),
     )

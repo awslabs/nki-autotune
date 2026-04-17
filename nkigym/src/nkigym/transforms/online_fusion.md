@@ -1,12 +1,12 @@
 ## Online Fusion
 
-Online fusion is a greedy math-level preprocessing step — not part of the programmatic search space. It detects all X + Accumulation patterns in the IR, applies tile-level fusion to each, and produces a single KernelIR with blocking barriers eliminated. Programmatic transforms (§6) then operate on this already-fused IR.
+Online fusion is a greedy math-level preprocessing step — not part of the programmatic search space. It detects all X + Accumulation patterns in the IR, applies tile-level fusion to each, and produces a single KernelIR in which specific blocking dims are flipped from `DimInfo.is_blocking=True` to `False` by injecting running state + correction factors. Flipping `is_blocking` enlarges the legal fusion space for downstream loop fusion (it is `is_blocking` on a shared dim that triggers rule 2 rejection in `loop_fusion.md`). Programmatic transforms (§6) then operate on this already-fused IR.
 
 Block-level granularity is not a separate online fusion mode — it emerges from programmatic transforms: when ltiles_per_block groups multiple tiles into a block and dimension interleaving splits the block/tile loops, corrections happen once per block instead of per tile. Same math, different scheduling.
 
 ![Math function DAG — Op 7 and Op 9 are topologically independent, converging only at Op 10](../../../../diagrams/math_function_dag.png)
 
-A **blocking dependency** exists when a consumer op requires the producer to complete its full reduction loop before the consumer can start. To identify blocking pairs, first fuse any elementwise ops between two reductions into the second reduction's body — elementwise ops don't introduce new blocking barriers. In the source-level attention pipeline:
+A **blocking dependency** exists when a consumer op requires the producer to complete its full reduction loop before the consumer can start. Formally, an edge `u → v` is blocking when `u` lists a shared dim `d` in its `BLOCKING_AXES` (so `DimInfo.is_blocking[d] == True`) and `v` reads the post-loop output. To identify blocking pairs, first fuse any elementwise ops between two reductions into the second reduction's body — elementwise ops don't introduce new blocking barriers. In the source-level attention pipeline:
 
 ```
 tensor_reduce(max) → tensor_scalar(subtract) → activation(exp) → tensor_reduce(add)
@@ -22,7 +22,7 @@ After fusing elementwise ops into their consuming reductions, three blocking pai
 | Op 5: tensor_reduce(max) over d2 → neg_max_S | Op 6: activation_reduce uses neg_max_S as bias | d2 |
 | Op 6: activation_reduce produces exp_S using neg_max_S | Op 9: matmul accumulates exp_S_t @ V over d2 (with Op 8 fused in) | d2 |
 
-Some of these match the **X + Accumulation** pattern from the [online fusion paper draft](/home/ubuntu/online_fusion/main.pdf), which enables **online fusion** — a math-level transformation that eliminates the blocking barrier.
+Some of these match the **X + Accumulation** pattern from the [online fusion paper draft](/home/ubuntu/online_fusion/main.pdf), which enables **online fusion** — a math-level transformation that flips the blocking dim's `DimInfo.is_blocking` flag from True to False, unblocking subsequent loop fusion.
 
 #### 6.1.1 The X + Accumulation Pattern
 
@@ -84,11 +84,11 @@ We classify each blocking pair:
 
 | Producer → Consumer | Blocking dim | Handled by | Why |
 |---|---|---|---|
-| Op 2 (matmul over d1) → Op 5 (reduce max over d2) | d1 | **Not online-fusable** | Different blocking dims (d1 vs d2); no X+Accumulation pattern. Resolved by loop nesting: d1 becomes an inner loop inside the fused d2 loop, so Op 2's d1 reduction completes per d2 tile before Ops 5-9 consume it (programmatic loop fusion, not online fusion). |
+| Op 2 (matmul over d1) → Op 5 (reduce max over d2) | d1 | **Not online-fusable** | Different blocking dims (d1 vs d2); no X+Accumulation pattern. Resolved by loop nesting: d1 becomes an inner loop inside the fused d2 loop, so Op 2's d1 reduction completes per d2 tile before Ops 5-9 consume it. In the new IR model any fusion group can permute any dim (see `loop_reordering.md`), so d2-outside-d1 is a legal ordering in its own right — but fusing Op 2 with downstream d2 consumers still depends on Op 2's d1 trip count being 1 (rule 2 in `loop_fusion.md` exempts trip-count-1 blocking dims), not on online fusion. |
 | Op 5 (reduce max over d2) → Op 6 (exp + sum over d2) | d2 | **Online fusion** | X+Accumulation pattern (§6.1.2) |
 | Op 6 (exp_S depends on max) → Op 9 (matmul over d2) | d2 | **Online fusion** | Same X (running max), same $s_k$ (§6.1.3) |
 
-Online fusion breaks the Op 5→6 and Op 6→9 barriers, pulling Ops 5, 6, 8, 9 into a single d2 loop. Op 7 is topologically independent from Op 9 (§1 DAG). Op 10 depends on Op 9's output but runs after the d2 reduction completes. Neither is part of the online fusion transforms. The result is the flash attention algorithm.
+Online fusion flips d2 from blocking to non-blocking for the Op 5→6 and Op 6→9 edges, which lets downstream loop fusion pull Ops 5, 6, 8, 9 into a single d2 loop. Putting a (now non-blocking) d2 outside d0 is by itself a legal loop ordering for any single fusion group in the new IR (see `loop_reordering.md`); what online fusion uniquely enables is *fusing across* d2 when d2 was blocking. Op 7 is topologically independent from Op 9 (§1 DAG). Op 10 depends on Op 9's output but runs after the d2 reduction completes. Neither is part of the online fusion transforms. The result is the flash attention algorithm.
 
 **Fusion granularity.** The "tile" $k$ in Algorithm 4 can be:
 

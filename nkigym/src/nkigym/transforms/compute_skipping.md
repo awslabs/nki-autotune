@@ -1,6 +1,6 @@
 ## Compute Skipping
 
-The renderer emits `if` guards inside reduction loops to skip tile computations guaranteed to produce masked-out values. This is a render-time optimization -- the skip condition is deterministic given the `affine_select` pattern, so there is no search space.
+The renderer emits `if` guards inside a fusion group's loop nest to skip tile computations guaranteed to produce masked-out values. This is a render-time optimization -- the skip condition is deterministic given the `affine_select` pattern, so there is no search space.
 
 ### How It Works
 
@@ -41,30 +41,31 @@ The `affine_select`'s axis map (`per_op_axis_maps[op_idx]`) identifies which con
 
 The guard goes inside the innermost loop whose variable appears in the skip condition. For the causal mask, the condition depends on d0 (P) and d2 (F) loop variables, so the guard sits inside whichever of d0's or d2's ig loop is innermost. The guard does not change the loop structure: memset stays outside, loops still iterate the full range, only the body is conditionally executed.
 
-In the attention example, P maps to d0 (DP) and F maps to d2 (reduction):
+In the attention example, the group's `dim_order` is `[d0, d1, d2]` (siblings in one nest); P maps to d0 (blocking) and F maps to d2 (non-blocking):
 
 ```python
-for i_block_d0 in range(16):                               # d0 DP
-    ...
-        nisa.memset(psum_S[...], 0.0)
-        for i_block_d1 in range(1):                         # d1 reduction
-            for i_block_d2 in range(4):                     # d2 reduction
-                for i_ltile_d1 in range(1):
-                    for i_ltile_d2 in range(1):
-                        for i_ig_d1 in range(1):
-                            for i_ig_d2 in range(4):        # F dimension ig loop
-                                p_start = i_block_d0 * 128
-                                f_start = i_block_d2 * 512 + i_ig_d2 * 128
-                                if p_start + 128 > f_start: # guard
-                                    nisa.dma_copy(...)
-                                    nisa.nc_matmul(...)
-                                    nisa.affine_select(...)
-                                    nisa.tensor_scalar(...)
+for i_block_d0 in range(16):                               # d0 (blocking)
+    nisa.memset(psum_S[...], 0.0)
+    for i_block_d1 in range(1):                             # d1 (non-blocking)
+        for i_block_d2 in range(4):                         # d2 (non-blocking)
+            for i_ltile_d1 in range(1):
+                for i_ltile_d2 in range(1):
+                    for i_ig_d1 in range(1):
+                        for i_ig_d2 in range(4):            # F dimension ig loop
+                            p_start = i_block_d0 * 128
+                            f_start = i_block_d2 * 512 + i_ig_d2 * 128
+                            if p_start + 128 > f_start:     # guard
+                                nisa.dma_copy(...)
+                                nisa.nc_matmul(...)
+                                nisa.affine_select(...)
+                                nisa.tensor_scalar(...)
 ```
 
 Offset formulas are the same as DMA indexing:
 
 $$p\_start = i\_block \times tpb \times tile\_size + i\_tile \times tile\_size + i\_ig \times min\_tile\_size$$
+
+The guard placement is independent of the blocking/non-blocking classification of the dims in the group's `dim_order` — only loop variable dependencies in the skip condition matter.
 
 ### Scope
 

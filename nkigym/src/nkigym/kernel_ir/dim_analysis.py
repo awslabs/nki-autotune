@@ -1,9 +1,10 @@
-"""Dimension analysis: ID assignment, tile sizes, data-parallel classification.
+"""Dimension analysis: ID assignment, tile sizes, blocking classification.
 
 Forward pass over all ops produces three results per dimension:
   1. A concrete dimension ID (d0, d1, ...)
   2. A tile size (max of hardware tile limits across ops)
-  3. A data-parallel vs reduction classification
+  3. A blocking vs non-blocking classification (derived from
+     ``BLOCKING_AXES`` of ops touching the dim)
 
 Usage::
 
@@ -34,14 +35,19 @@ class DimInfo:
             op tile limits) on this dimension, with partition cap
             (128) included when the dimension appears as the first
             axis of any tensor.
-        is_data_parallel: True if this dimension appears in the
-            kernel's return tensor.
+        is_blocking: True if any op touching this dimension has
+            it in ``BLOCKING_AXES`` — the op accumulates over the
+            dim and its output is only valid after the dim's full
+            iteration completes. Loop-fusion legality uses this
+            to decide when a shared dim constrains ordering.
+            Online fusion can flip a blocking dim to non-blocking
+            by injecting running state + correction factors.
     """
 
     dim_size: int
     logical_tile_size: int
     physical_tile_size: int
-    is_data_parallel: bool
+    is_blocking: bool
 
 
 @dataclass
@@ -105,7 +111,7 @@ class DimAnalysis:
                     str(di.logical_tile_size),
                     str(di.physical_tile_size),
                     str(num_physical),
-                    "data-parallel" if di.is_data_parallel else "reduction",
+                    "blocking" if di.is_blocking else "non-blocking",
                 ]
             )
         col_widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
@@ -249,11 +255,31 @@ def _create_outputs(
         tensors[oname] = _Tensor(oname, shape, dtype, dim_ids)
 
 
+def op_blocking_dims(op_cls: type[NKIOp], axis_map: dict[str, str]) -> set[str]:
+    """Return the concrete dims this op blocks on.
+
+    An op blocks on every concrete dim its ``BLOCKING_AXES`` map
+    to under ``axis_map``. Axes not in the map (tensor collapsed
+    before the op) are silently skipped.
+    """
+    return {axis_map[axis] for axis in op_cls.BLOCKING_AXES if axis in axis_map}
+
+
+def _compute_blocking_dims(
+    ops: list[tuple[type[NKIOp], dict[str, str], list[str], dict[str, str]]], per_op_maps: list[dict[str, str]]
+) -> set[str]:
+    """Collect concrete dims marked blocking by any op touching them."""
+    blocking: set[str] = set()
+    for (op_cls, _, _, _), local in zip(ops, per_op_maps):
+        blocking |= op_blocking_dims(op_cls, local)
+    return blocking
+
+
 def _compute_tile_sizes(
     ops: list[tuple[type[NKIOp], dict[str, str], list[str], dict[str, str]]],
     per_op_maps: list[dict[str, str]],
     dim_sizes: dict[str, int],
-    data_parallel_dims: set[str],
+    blocking_dims: set[str],
     tensors: dict[str, "_Tensor"],
 ) -> tuple[dict[str, DimInfo], list[dict[str, int]]]:
     """Compute per-dimension tile sizes, classification, and per-op tile sizes.
@@ -290,7 +316,7 @@ def _compute_tile_sizes(
         if dim_id in partition_dims:
             min_tile[dim_id] = min(min_tile[dim_id], PARTITION_MAX)
 
-    dims = {d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], d in data_parallel_dims) for d in max_tile}
+    dims = {d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], d in blocking_dims) for d in max_tile}
     return dims, op_tile_sizes
 
 
@@ -300,7 +326,7 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
     Produces three results per dimension:
       1. Concrete dimension ID (d0, d1, ...)
       2. Tile size (max of hardware tile limits across ops)
-      3. Data-parallel vs reduction classification
+      3. Blocking vs non-blocking classification
 
     Args:
         func: Math function using NKIOp classes.
@@ -331,12 +357,11 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
         per_op_maps.append(local)
         _create_outputs(op_cls, operand_map, output_names, local, tensors, dim_sizes)
 
-    """Step 3: data-parallel classification from return tensor."""
     if return_name not in tensors:
         raise ValueError(f"Return tensor {return_name!r} not found")
-    data_parallel_dims = set(tensors[return_name].dim_ids)
+    blocking_dims = _compute_blocking_dims(ops, per_op_maps)
 
-    dims, op_tile_sizes = _compute_tile_sizes(ops, per_op_maps, dim_sizes, data_parallel_dims, tensors)
+    dims, op_tile_sizes = _compute_tile_sizes(ops, per_op_maps, dim_sizes, blocking_dims, tensors)
 
     tensor_infos: dict[str, TensorInfo] = {}
     for name, t in tensors.items():

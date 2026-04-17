@@ -1,6 +1,6 @@
 ## NKI Ops Rendering *(not yet enabled in `render_ir`)*
 
-Inside each reduction group's innermost loop, the renderer emits the actual ISA calls for the ops in that group. Each op uses `NKIOp.format_isa_call(dst_expr, operand_exprs)` to produce the `nisa.*` call string.
+Inside each fusion group's innermost loop (the group's own complete loop nest over `group_dim_orders[group_idx]`), the renderer emits the actual ISA calls for the ops in that group. Each op uses `NKIOp.format_isa_call(dst_expr, operand_exprs)` to produce the `nisa.*` call string.
 
 **Physical-tile packing is per op, hidden in gadgets.** When an op's own tile size is smaller than the dimension's logical tile, the op internally loops `num_ptiles_per_ltile = logical_tile_size / op_tile_size` times. This iteration happens inside a per-op helper (analogous to the DMA gadgets) and never appears as a kernel-level `i_ptile_*` loop. Ops whose tile size equals the logical tile (e.g. `nc_matmul` on a dim whose logical tile is 512) emit a single ISA call with no inner loop.
 
@@ -14,7 +14,7 @@ Inside each reduction group's innermost loop, the renderer emits the actual ISA 
 
 **PSUM→SBUF staging.** After an op that writes to PSUM, if the tensor has an SBUF staging buffer, emit `stage_tensor_block(sbuf_{name}, psum_{name})`. Position follows the store rule: immediately for non-blocking ops, after the blocking axis loop for blocking ops.
 
-**Memset.** Before a blocking op's reduction loop, emit `nisa.memset(psum_{name}, 0.0)` to zero the PSUM accumulator. Position: before the blocking dimension's outermost loop in the current `loop_order`.
+**Memset.** Before a blocking op's blocking-dim loop, emit `nisa.memset(psum_{name}, 0.0)` to zero the PSUM accumulator. Position: before the blocking dimension's outermost loop in the op's containing group nest (read from `group_dim_orders[group_idx]`).
 
 **Tensor indexing.** Each operand is indexed into its buffer using the **op's own tile size** (from `op_tile_sizes[op_idx]`). The buffer uses physical tile sizes with `num_ptiles_per_ltile` folded into `num_tiles`. Ops slice the buffer and reshape to their own tile size:
 - `op_tile == physical_tile`: one slot, trivial reshape
@@ -28,7 +28,7 @@ Inside each reduction group's innermost loop, the renderer emits the actual ISA 
 Group 8: nc_transpose on exp_S `(d0, d2)` → exp_S_t `(d2, d0)`. nc_transpose tile is 128×128, but d2 has `physical_tile_size=128` (partition-capped), and matmul wants 512 → `num_ptiles_per_ltile=4`. The buffer `psum_exp_S_t` has 4 PSUM tiles. The kernel-level code is a single gadget call; the 4-way ptile loop lives inside the gadget:
 
 ```python
-"""kernel-level — inside the group's innermost logical-tile loop"""
+"""kernel-level — inside the group's innermost logical-tile loop (from group_dim_orders[group_idx])"""
 nc_transpose_block(psum_exp_S_t, sbuf_exp_S)
 stage_tensor_block(sbuf_exp_S_t, psum_exp_S_t)
 ```
@@ -47,4 +47,4 @@ for i_block_d0 in range(64):
 stage_tensor_block(sbuf_result, psum_result)
 ```
 
-`nc_matmul` covers the full 512 free dim in one call, so there is no gadget wrapper — the ISA call is emitted directly. Memset before the d0 loop, nc_matmul accumulates across all d0 iterations, `stage_tensor_block` after the loop.
+`nc_matmul` covers the full 512 free dim in one call, so there is no gadget wrapper — the ISA call is emitted directly. Memset before the blocking-dim (d0) loop in the group nest, nc_matmul accumulates across all d0 iterations, `stage_tensor_block` after the blocking-dim loop.

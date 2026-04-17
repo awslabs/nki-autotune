@@ -68,18 +68,18 @@ Default (`per_tile`, degree 1) collapses to `num_tiles = num_ptiles` — usually
 
 ### Placement in the Emitted Source
 
-*Where* in the loop nest each allocation sits is decided by the allocation-depth derivation described in `kernel_ir/load_placement.md`. In the default lowering (all `per_tile`, all degrees 1), every tensor's $B$ set is empty → every allocation sits at the top of the innermost DP loop body, before reduction groups. This section only specifies *what* to allocate; the render pass decides *where*.
+*Where* in the loop nest each allocation sits is decided by the allocation-depth derivation described in `kernel_ir/load_placement.md`. In the default lowering (all `per_tile`, all degrees 1), every tensor's $B$ set is empty → every allocation sits at the top of the kernel body, before the per-group sibling loop nests. This section only specifies *what* to allocate; the render pass decides *where*.
 
 ### Example: Attention (Default)
 
 With `seq_q = seq_k = 2048, d_k = d_v = 128`, dim geometry:
 
-| dim | size | logical | physical | num_ptiles | DP/reduction |
-|-----|------|---------|----------|------------|--------------|
-| d0  | 2048 | 128     | 128      | 1          | DP           |
-| d1  | 128  | 128     | 128      | 1          | reduction    |
-| d2  | 2048 | 512     | 128      | 4          | reduction    |
-| d4  | 128  | 128     | 128      | 1          | DP           |
+| dim | size | logical | physical | num_ptiles | is_blocking |
+|-----|------|---------|----------|------------|-------------|
+| d0  | 2048 | 128     | 128      | 1          | yes         |
+| d1  | 128  | 128     | 128      | 1          | no          |
+| d2  | 2048 | 512     | 128      | 4          | no          |
+| d4  | 128  | 128     | 128      | 1          | yes         |
 
 All tiers `per_tile`, all degrees 1, so `num_tiles = num_ptiles` everywhere. Walking the 15 tensors in the order they arise from the op graph:
 
@@ -134,7 +134,7 @@ sbuf_output = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
 
 `tensor_placements[("K", "d2")] = "full"`, all degrees still 1. `blocks_factor_d2 = 2048 / (1 × 512) = 4`, so `num_tiles_d2(K) = 1 × 1 × 4 × 1 = 4`. `sbuf_K` grows from `(128, 4, 1, 128)` to `(128, 4, 4, 128)` — num_tiles on d2 grows from 1 to 4. No other buffer changes: `K_t`, `S`, and downstream tensors are unaffected because their own `tensor_placements` entries are still `per_tile` (they cover d2 under their own keys, not K's).
 
-Feasibility against `loop_order` is checked upstream; `render_buffers` just consumes the result. If the transform produced an infeasible assignment, the joint check in `transforms/load_placement.py` would have rejected it before reaching this pass.
+Feasibility against `group_dim_orders` (per-group, not global) is checked upstream; `render_buffers` just consumes the result. If the transform produced an infeasible assignment against any group's dim_order, the joint check in `transforms/load_placement.py` would have rejected it before reaching this pass.
 
 ### Wiring
 
@@ -142,4 +142,4 @@ The concrete entry points live in `codegen/buffers.py`:
 - `find_psum_tensors_needing_sbuf(ir) -> set[str]` — step 3.
 - `render_buffers(ir, indent) -> str` — walks every tensor in `ir.dim_analysis.tensors`, applies steps 1–4, emits one line per buffer.
 
-`render_ir` calls `render_buffers(ir, inner_indent)` at the top of the innermost DP loop body, where every default-tier allocation lives.
+`render_ir` calls `render_buffers(ir, inner_indent)` at the top of the kernel body (before the per-group sibling loop nests), where every default-tier allocation lives.

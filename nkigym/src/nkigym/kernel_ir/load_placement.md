@@ -2,7 +2,7 @@
 
 Load placement controls how many of a tensor-dim's tile iterations a single allocation covers. `per_tile` → one logical tile's worth; `per_block` → one block's worth; `full` → all blocks. Higher tiers grow the buffer, hoist the allocation and its DMA load outward, and reduce DMA frequency.
 
-This doc describes the **IR representation**: the field, per-tier semantics, the feasibility constraint against `loop_order`, and how the renderer reads it. The transform that mutates the field lives in `transforms/load_placement.md`.
+This doc describes the **IR representation**: the field, per-tier semantics, the per-group feasibility constraint against `group_dim_orders`, and how the renderer reads it. The transform that mutates the field lives in `transforms/load_placement.md`.
 
 ### Field
 
@@ -13,9 +13,11 @@ tensor_placements: dict[tuple[str, str], str]
 
 One entry per `(tensor, dim)` where `dim` is in `tensor.dim_ids`. Same key space as `buffer_degrees`. The renderer branches on the literal string in `_compute_num_tiles` (`codegen/buffers.py`).
 
+A tensor is relevant to every fusion group that contains an op producing or consuming it. A tier on `(t, d)` affects the buffer shape and the DMA placement depth in *every* group that touches `t`.
+
 ### Tier Semantics
 
-Each dim `d` contributes two loops in the emitted kernel: `i_block_d` (outer) and `i_ltile_d` (inner, within its phase). A tier on `(t, d)` constrains whether these two loops sit above or below `t`'s allocation:
+Each dim `d` in a group's `dim_order` contributes two loops in the group's nest: `i_block_d` (outer) and `i_ltile_d` (inner, within its phase). A tier on `(t, d)` constrains whether these two loops sit above or below `t`'s allocation in every group where `t` appears:
 
 | tier       | `i_block_d` vs alloc | `i_ltile_d` vs alloc | buffer slots on `d`               |
 |------------|----------------------|----------------------|-----------------------------------|
@@ -28,24 +30,23 @@ Each dim `d` contributes two loops in the emitted kernel: `i_block_d` (outer) an
 
 With `num_ptiles = max_op_tile / physical_tile_size`, `tpb = ltiles_per_block[d]`, `num_blocks = dim_size / (tpb × logical_tile_size)`.
 
-### Feasibility Against `loop_order`
+### Per-Group Feasibility
 
-The kernel emits loops in a **fixed phase order** (see `kernel_ir/data_parallel.py`, `kernel_ir/reduction.py`): within any scope (top level, or a fusion group's reduction region), *all* block loops come first in the order listed in `loop_order`, then *all* tile loops in the same order. So a tensor whose dims sit in the DP phase is enclosed by loops emitted in this pattern:
+Every fusion group emits its own complete loop nest (see `kernel_ir/group_loops.py`). Within a group's nest, loops are emitted in **phase-grouped order**: all block loops first in the order listed in that group's `group_dim_orders` entry, then all tile loops in the same order. A dim's blocking status (`DimInfo.is_blocking`) only gates fusion legality — once a dim is in a group's `dim_order`, its loops emit identically regardless of blocking.
+
+So within group `g`, a tensor `t` whose dims `(d_a, d_b)` both appear in `group_dim_orders[g] = [..., d_a, ..., d_b, ...]` is enclosed by:
 
 ```
-for i_block_{dp[0]}:
-  for i_block_{dp[1]}:
-    ...
-    for i_ltile_{dp[0]}:
-      for i_ltile_{dp[1]}:
+for i_block_{d_a}:
+  for i_block_{d_b}:
+    for i_ltile_{d_a}:
+      for i_ltile_{d_b}:
         ...<body>
 ```
 
-Reduction phases inside a fusion group follow the same block-then-tile pattern over that group's reduction dim sublist.
+**Feasibility rule (per group).** An allocation lives at *one* depth in each group's nest. Let $A_g$ be the loops the tensor's tiers require above alloc and $B_g$ the loops they require below — restricted to the dims in group `g`'s `dim_order`. The assignment is realizable in group `g` iff every loop in $A_g$ is emitted before every loop in $B_g$ under that group's phase-grouped order. The full assignment is feasible iff it is feasible in *every* group that touches `t`.
 
-**Feasibility rule.** An allocation lives at *one* depth. Let $A$ be the loops the tensor's tiers require above alloc and $B$ the loops they require below. The assignment is realizable iff every loop in $A$ is emitted before every loop in $B$ under the phase-grouped order.
-
-Concrete cases for a tensor on `(d_a, d_b)` both DP, with `loop_order` listing DP dims as `[d_a, d_b]`:
+Concrete cases within a single group whose `dim_order` lists `[d_a, d_b]`:
 
 | tiers `(d_a, d_b)`         | A (above)                                  | B (below)                                  | feasible? |
 |----------------------------|--------------------------------------------|--------------------------------------------|-----------|
@@ -59,18 +60,18 @@ Concrete cases for a tensor on `(d_a, d_b)` both DP, with `loop_order` listing D
 | `(per_tile, full)`         | `block_da, tile_da`                        | `block_db, tile_db`                        | no — `block_db` precedes `tile_da` |
 | `(per_block, full)`        | `block_da`                                 | `block_db, tile_da, tile_db`               | no — `block_db` precedes `tile_da` |
 
-The only feasible mixed-tier combinations are *uniform tiers across the dims sharing a phase*. Phase-grouped emission forces all the block loops to cluster and all the tile loops to cluster, so you can't interleave tiers between dims in the same phase.
+The only feasible mixed-tier combinations are *uniform tiers across the dims sharing a phase within a single group*. Phase-grouped emission forces all block loops to cluster and all tile loops to cluster, so you can't interleave tiers between dims in the same phase.
 
-**Reordering as an escape hatch.** If a specific assignment is desired but infeasible, the only structural fix is splitting the phase — that would require loop-reordering to emit `block_da, tile_da, block_db, tile_db` instead of phase-grouped, which is a different transform outside this doc's scope.
+A dim the tensor doesn't carry contributes no loops to that tensor's $A_g$ or $B_g$ — its tier doesn't exist. Other tensors' dim loops in the same group still emit around the alloc based on *their own* tiers; the feasibility rule is per-tensor.
 
-**DP vs reduction dims.** DP loops always enclose reduction loops. A tensor's DP-dim tiers and reduction-dim tiers are therefore independent of each other for feasibility — the constraint only couples dims within the same phase. A tensor on `(dp, red)` with `(per_tile, full)` is always feasible: the DP tile loop is above alloc, the reduction loops are below, the alloc sits at the top of the innermost DP body.
+**Reordering as an escape hatch.** If a specific assignment is desired but infeasible in some group, the structural fix is to reorder that group's `dim_order` to split the phase — a loop-reordering transform outside this doc's scope.
 
-### Joint Constraint with `loop_order`
+### Joint Constraint with `group_dim_orders`
 
-1. A load-placement transform must reject tier changes that break the feasibility rule under the current `loop_order`.
-2. A loop-reorder transform must reject reorderings that break an existing placement assignment.
+1. A load-placement transform must reject tier changes that break the feasibility rule in *any* group where the tensor appears.
+2. A loop-reorder transform on a group must reject reorderings that break an existing placement assignment on any tensor touched by that group.
 
-Storage remains orthogonal — `tensor_placements` and `loop_order` are independent dicts/lists — but *legality* is a cross-field check at transform time.
+Storage remains orthogonal — `tensor_placements` and `group_dim_orders` are independent dict/list fields — but *legality* is a cross-field check at transform time.
 
 ### Default
 
@@ -80,7 +81,7 @@ tensor_placements[(tensor, dim_id)] = "per_tile"
     for dim_id in tensor.dim_ids
 ```
 
-All-`per_tile` puts every loop above every allocation. $B$ is empty for every tensor, feasibility is vacuous, the base IR always works.
+All-`per_tile` puts every loop above every allocation. $B_g$ is empty for every tensor in every group, feasibility is vacuous, the base IR always works.
 
 ### How the Renderer Uses It
 
@@ -94,9 +95,9 @@ $$\text{num\_tiles}(t, d) = \text{num\_ptiles}(t, d) \times \text{tpb\_factor}(t
 | `per_block` | `tpb`        | 1               |
 | `full`      | `tpb`        | `num_blocks`    |
 
-**Allocation depth — derived, not stored.** The renderer walks the emission order and places each tensor's allocation at the boundary between its $A$ and $B$. For all-`per_tile`, this is the innermost body of the enclosing loop (innermost DP body for pure-DP tensors, innermost reduction body of the producing group for reduction-dim tensors).
+**Allocation depth — derived, not stored.** The renderer walks each group's emission order and places the tensor's allocation at the boundary between its $A_g$ and $B_g$ within that group. For all-`per_tile`, this is the innermost body of the group's nest.
 
-**Load position — derived.** An HBM input's `load_tensor_block` sits at the same depth as the buffer's allocation and fills all slots implied by the buffer shape via the gadget's internal par/free loops.
+**Load position — derived.** An HBM input's `load_tensor_block` sits at the same depth as the buffer's allocation in each group that consumes it and fills all slots implied by the buffer shape via the gadget's internal par/free loops.
 
 ### What Load Placement Is Not
 
@@ -106,19 +107,26 @@ $$\text{num\_tiles}(t, d) = \text{num\_ptiles}(t, d) \times \text{tpb\_factor}(t
 
 ### Attention Walkthrough
 
-Default (all `per_tile`). In the attention example's default lowering:
+Default (all `per_tile`). From the attention example (see `loopnest.md` for the op graph):
 
-- DP dims: `d0` (16 blocks × 1 tile), `d4` (1 block × 1 tile).
-- Reduction dims per group: `d1` (1 block × 1 tile), `d2` (4 blocks × 1 tile).
+- `d0` (16 blocks × 1 tile) — non-blocking.
+- `d1` (1 block × 1 tile) — blocking (matmul K).
+- `d2` (4 blocks × 1 tile) — blocking (softmax / matmul K).
+- `d4` (1 block × 1 tile) — non-blocking.
 
-Every on-chip buffer's alloc sits at the innermost body of its enclosing loops. HBM tensors `Q (d0, d1)`, `K (d2, d1)`, `V (d2, d4)` get their `sbuf_*` staging allocated at the innermost body of the consuming group's reduction nest, and `load_tensor_block` fires there. Q alone is loaded 16 × 1 = 16 times across the `(i_block_d0, i_block_d1)` loops of group 0.
+Blocking status doesn't affect feasibility — only each group's `dim_order` does.
 
-Hoisting `K` to `per_tile → full` on `d2`: `tensor_placements[("K", "d2")] = "full"`. Group 1's reduction nest orders `[d1, d2]` (loop_order sublist `["d1", "d2"]`), so under phase grouping the emitted loops are `block_d1, block_d2, tile_d1, tile_d2`. For K, $A = \{block_{d1}, tile_{d1}\}$, $B = \{block_{d2}, tile_{d2}\}$. $A$ loops are at positions 0 and 2; $B$ loops at 1 and 3. `block_d2` at 1 precedes `tile_d1` at 2 — **infeasible under the phase-grouped default**.
+Every on-chip buffer's alloc sits at the innermost body of its group's nest. HBM tensors `Q(d0, d1)`, `K(d2, d1)`, `V(d2, d4)` get their `sbuf_*` staging buffers sized by `num_tiles = num_ptiles` on every axis and allocated at the innermost body of each consuming group.
 
-To make it feasible, loop-reordering must first reorder group 1's sublist to split the phase, or multi-buffering must be used instead. This is exactly the cross-field coupling the feasibility rule catches.
+Hoisting `K` to `per_tile → full` on `d2`: `tensor_placements[("K", "d2")] = "full"`. K appears in group 1 (K transpose) with `dim_order = [d1, d2]` and group 2 (QK matmul) with `dim_order = [d0, d1, d2]`.
 
-Hoisting `Q` to `full` on `d1` (which only needs $B = \{block_{d1}, tile_{d1}\}$, $A = \emptyset$): alloc sits above group 0's whole reduction nest. `sbuf_Q` grows to `(128, 1, 1, 128)` already since `d1` has `num_ptiles = tpb = num_blocks = 1` — shape is unchanged, but the allocation rises up the nest. This is vacuously feasible and illustrates the separation between feasibility and buffer-size impact.
+- Group 1's nest under phase grouping: `block_d1, block_d2, tile_d1, tile_d2`. For K, $A_1 = \{block_{d1}, tile_{d1}\}$, $B_1 = \{block_{d2}, tile_{d2}\}$. $A_1$ loops at positions 0 and 2; $B_1$ at 1 and 3. `block_d2` at 1 precedes `tile_d1` at 2 — **infeasible in group 1** under the phase-grouped default.
+- Group 2 has the same K-relevant dims in the same relative order, so it is independently infeasible for the same reason.
+
+The assignment is rejected by the transform because it fails in at least one group. To make it feasible, loop-reordering must first reorder `group_dim_orders[1]` (and/or `[2]`) to split the phase, or multi-buffering must be used instead. This is exactly the cross-field coupling the feasibility rule catches.
+
+Hoisting `Q` to `full` on `d1` (`tensor_placements[("Q", "d1")] = "full"`): Q appears in group 0 (Q transpose, `dim_order = [d0, d1]`) and group 2 (QK matmul, `dim_order = [d0, d1, d2]`). In both groups, Q has $A = \{$loops on d0$\}$ and $B = \{block_{d1}, tile_{d1}\}$. All non-d1 loops on Q are `per_tile`, so they stay in $A_g$; d1's loops move to $B_g$. Under phase grouping, the d0 loops precede the d1 loops in each relevant group — feasible. `sbuf_Q`'s shape is unchanged since `d1` has `num_ptiles = tpb = num_blocks = 1`, but the allocation rises up each group's nest. This is vacuously feasible and illustrates the separation between feasibility and buffer-size impact.
 
 ### Summary
 
-The IR field is a flat `(tensor, dim) → tier` map with three legal values. The non-trivial part — the joint constraint with `loop_order` — lives in transform-time legality checks, not in the field's shape.
+The IR field is a flat `(tensor, dim) → tier` map with three legal values. The non-trivial part — the per-group feasibility constraint against each group's `dim_order` — lives in transform-time legality checks, not in the field's shape.

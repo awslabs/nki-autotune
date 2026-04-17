@@ -152,7 +152,7 @@ When ltiles_per_block splits a dimension into multiple blocks, its block and til
 ### Requirements
 
 - **`num_blocks > 1`** on the interleaved dim. With 1 block, the block loop is `range(1)` and splitting is a no-op. The ltiles_per_block transform creates multi-block structure.
-- **Accumulating semantics.** Every op reducing over this dim must use additive accumulation. `nc_matmul` accumulates via `+=` — valid. `tensor_reduce(op="max")` is NOT additive — requires online fusion to convert to accumulating form first.
+- **Blocking dim with additive accumulation.** The dim must be blocking (`DimInfo.is_blocking == True`, i.e. some op in the group lists it in `BLOCKING_AXES`) and every op reducing over it must accumulate additively. `nc_matmul` accumulates via `+=` — valid. `tensor_reduce(op="max")` is NOT additive — requires online fusion to convert to accumulating form first.
 
 ### Interleave depths
 
@@ -231,13 +231,12 @@ Operands loaded between `i_block_d0` and `i_ltile_d0` persist across all 64 encl
 ## Representation and Candidates
 
 ```python
-group_dim_orders: list[tuple[str, ...]]
-interleave_depth: list[dict[str, int]]
+group_dim_orders: list[list[str]]
 ```
 
-`group_dim_orders` — per fusion group, ordered tuple of all dim IDs. Permutation modifies this ordering.
+`group_dim_orders` — per fusion group, an ordered list of every dim ID any op in the group touches (outer-to-inner). Positional on `fusion_groups`. Permutation modifies this ordering. Every dim the group's ops touch is a loop in the emitted nest; blocking status (`DimInfo.is_blocking`) affects fusion legality, not the structure of a single group's nest, so all dims in a group are freely permutable here.
 
-`interleave_depth` — per fusion group, maps dim ID → depth (number of subsequent dims between block and tile loops). Depth 0 = block and tile adjacent (default). Max depth for a dim at position $p$ is $n - p - 1$.
+`interleave_depth` *(proposed, not yet in `KernelIR`)* — per fusion group, maps dim ID → depth (number of subsequent dims between block and tile loops). Depth 0 = block and tile adjacent (default). Max depth for a dim at position $p$ is $n - p - 1$. Only dims with blocking semantics (the ops reducing over them accumulate additively) admit non-zero depth — see the Requirements note above.
 
 ```python
 class LoopReorder(Transform):
@@ -246,18 +245,20 @@ class LoopReorder(Transform):
     def candidates(self, ir: KernelIR) -> list[KernelIR]:
         results: list[KernelIR] = []
         for gidx, dim_order in enumerate(ir.group_dim_orders):
-            """Dimension permutations (all dims)"""
+            """Dimension permutations (all dims in the group)"""
             if len(dim_order) > 1:
                 for perm in permutations(dim_order):
-                    if perm != dim_order:
-                        new_orders = list(ir.group_dim_orders)
-                        new_orders[gidx] = perm
+                    perm_list = list(perm)
+                    if perm_list != dim_order:
+                        new_orders = [list(o) for o in ir.group_dim_orders]
+                        new_orders[gidx] = perm_list
                         results.append(replace(ir, group_dim_orders=new_orders))
-            """Dimension interleaving (accumulating dims with num_blocks > 1)"""
+            """Dimension interleaving (blocking dims with num_blocks > 1)"""
             for dim_id in dim_order:
-                if not ir.is_accumulating(dim_id, gidx):
+                if not ir.dim_analysis.dims[dim_id].is_blocking:
                     continue
-                unified = ir.ctx.dim_sizes[dim_id] // ir.ctx.dim_tiles[dim_id]
+                di = ir.dim_analysis.dims[dim_id]
+                unified = di.dim_size // di.logical_tile_size
                 if unified // ir.ltiles_per_block.get(dim_id, 1) <= 1:
                     continue
                 pos = dim_order.index(dim_id)

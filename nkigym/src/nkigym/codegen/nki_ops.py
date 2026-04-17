@@ -1,7 +1,7 @@
 """NKI op rendering: ISA calls, memset, and PSUM staging."""
 
 from nkigym.kernel_ir import KernelIR
-from nkigym.kernel_ir.dim_analysis import TensorInfo
+from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
 
 
 def render_ops_for_group(
@@ -35,12 +35,11 @@ def render_ops_for_group(
     inner_lines: list[str] = []
     post_lines: list[str] = []
 
+    red_set = set(red_dims)
     for op_idx in group:
         op_cls = graph.op_classes[op_idx]
         outputs = graph.op_tensors[op_idx][1]
-        axis_map = da.per_op_axis_maps[op_idx]
-        blocking_dims = {axis_map[a] for a in op_cls.BLOCKING_AXES if a in axis_map}
-        has_blocking = bool(blocking_dims & set(red_dims))
+        has_blocking = bool(op_blocking_dims(op_cls, da.per_op_axis_maps[op_idx]) & red_set)
 
         if op_cls.ISA_LOC == "psum" and has_blocking:
             for oname in outputs:

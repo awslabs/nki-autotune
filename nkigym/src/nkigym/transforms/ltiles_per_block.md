@@ -17,7 +17,7 @@ The transform applies independently to each dimension — any combination of per
 Two other transforms build on the block structure:
 
 - **Load placement** hoists loads across other dimensions' loops for cross-dimension reuse. Orthogonal to ltiles_per_block, which determines the same-dimension buffer granularity.
-- **Dimension interleaving** separates the block-level iteration from within-block processing with other dimensions' loops in between, enabling section-based processing. Requires $\texttt{num\_blocks} > 1$.
+- **Dimension interleaving** separates the block-level iteration from within-block processing with other dims from the group's `dim_order` in between, enabling section-based processing. Requires $\texttt{num\_blocks} > 1$.
 
 ## Example
 
@@ -98,11 +98,10 @@ class TilesPerBlock(Transform):
             for (_tensor, dim_id), deg in ir.buffer_degrees.items()
             if deg > 1 and deg == ir.ltiles_per_block.get(dim_id, 1)
         }
-        dim_sizes = _collect_dim_sizes(ir.ctx)
-        for dim_id, max_tile in ir.ctx.dim_tiles.items():
+        for dim_id, info in ir.dim_analysis.dims.items():
             if dim_id in constrained_dims:
                 continue
-            unified = dim_sizes[dim_id] // max_tile
+            unified = info.dim_size // info.logical_tile_size
             current = ir.ltiles_per_block.get(dim_id, 1)
             for tpb in _divisors(unified):
                 if tpb <= current:

@@ -164,29 +164,19 @@ def producer_op_tiles(ir: KernelIR, tensor_name: str) -> dict[str, int]:
     op's tile sizes. For on-chip tensors, returns the producing
     op's tile sizes.
     """
-    da = ir.dim_analysis
     graph = ir.op_graph
-
-    match_idx: int | None = graph.producer_op(tensor_name)
-
+    match_idx = graph.producer_op(tensor_name)
     if match_idx is None:
-        for op_idx, (inputs, _outputs) in enumerate(graph.op_tensors):
-            if tensor_name in inputs.values():
-                match_idx = op_idx
-                break
-
-    if match_idx is None:
-        raise ValueError(f"No op produces or consumes tensor {tensor_name!r}")
-
-    return da.op_tile_sizes[match_idx]
+        touching = graph.ops_touching(tensor_name)
+        if not touching:
+            raise ValueError(f"No op produces or consumes tensor {tensor_name!r}")
+        match_idx = touching[0]
+    return ir.dim_analysis.op_tile_sizes[match_idx]
 
 
 def _ops_for_tensor(ir: KernelIR, tensor_name: str) -> list[int]:
     """Find all op indices that touch a tensor (as input or output)."""
-    result: list[int] = []
-    for op_idx, (inputs, outputs) in enumerate(ir.op_graph.op_tensors):
-        if tensor_name in inputs.values() or tensor_name in outputs:
-            result.append(op_idx)
+    result = ir.op_graph.ops_touching(tensor_name)
     if not result:
         raise ValueError(f"No ops touch tensor {tensor_name!r}")
     return result

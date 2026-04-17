@@ -8,6 +8,7 @@ Usage::
     print(graph)
 """
 
+import heapq
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,15 @@ class OpGraph:
         """Return summary string with node and edge counts."""
         return f"OpGraph({len(self.op_classes)} nodes, {len(self.edges)} edges)"
 
+    def op_tensor_names(self, op_idx: int) -> list[str]:
+        """Return every tensor name touched by ``op_idx`` (inputs + outputs)."""
+        inputs, outputs = self.op_tensors[op_idx]
+        return [*inputs.values(), *outputs]
+
+    def ops_touching(self, tensor_name: str) -> list[int]:
+        """Return every op index that reads or writes ``tensor_name``."""
+        return [op_idx for op_idx in range(len(self.op_tensors)) if tensor_name in self.op_tensor_names(op_idx)]
+
     def producer_op(self, tensor_name: str) -> int | None:
         """Return the op index that produces *tensor_name*, or None if it is a kernel input."""
         producer: int | None = None
@@ -62,6 +72,48 @@ class OpGraph:
         producer = self.producer_op(tensor_name)
         loc = self.op_classes[producer].ISA_LOC if producer is not None else None
         return loc
+
+    def toposort_groups(self, fusion_groups: list[list[int]]) -> list[int]:
+        """Topologically sort fusion groups by the group-level DAG.
+
+        Each edge in ``self.edges`` is lifted to group level; ties
+        broken by the minimum ``op_idx`` in each group.
+        """
+        num_groups = len(fusion_groups)
+        op_to_group: dict[int, int] = {}
+        for gi, group in enumerate(fusion_groups):
+            for op_idx in group:
+                op_to_group[op_idx] = gi
+
+        adjacency: dict[int, list[int]] = {gi: [] for gi in range(num_groups)}
+        in_degree: dict[int, int] = dict.fromkeys(range(num_groups), 0)
+        seen_edges: set[tuple[int, int]] = set()
+        for producer, consumer, _tensor, _role in self.edges:
+            gp = op_to_group[producer]
+            gc = op_to_group[consumer]
+            if gp != gc and (gp, gc) not in seen_edges:
+                seen_edges.add((gp, gc))
+                adjacency[gp].append(gc)
+                in_degree[gc] += 1
+
+        heap: list[tuple[int, int]] = []
+        for gi in range(num_groups):
+            if in_degree[gi] == 0:
+                heapq.heappush(heap, (min(fusion_groups[gi]), gi))
+        order: list[int] = []
+
+        while heap:
+            _priority, gi = heapq.heappop(heap)
+            order.append(gi)
+            for neighbor in adjacency[gi]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    heapq.heappush(heap, (min(fusion_groups[neighbor]), neighbor))
+
+        if len(order) != num_groups:
+            raise ValueError("Cycle detected in group-level DAG")
+
+        return order
 
     def render(self, path: str | Path) -> Path:
         """Render the DAG to a PNG file via Graphviz.

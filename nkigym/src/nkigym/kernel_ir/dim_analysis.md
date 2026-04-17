@@ -1,6 +1,6 @@
 ## Dimension Analysis
 
-A forward pass over all ops produces three results per dimension: an ID, a tile size, and a data-parallel classification. It also records per-tensor **logical shape information**: `(name, dim_ids, shape, dtype)`. Memory location (`hbm`/`sbuf`/`psum`) is **not** a dim-analysis concern — code-generation consults each op's `ISA_LOC` directly at its own call site.
+A forward pass over all ops produces three results per dimension: an ID, a tile size, and a **blocking vs non-blocking** classification. It also records per-tensor **logical shape information**: `(name, dim_ids, shape, dtype)`. Memory location (`hbm`/`sbuf`/`psum`) is **not** a dim-analysis concern — code-generation consults each op's `ISA_LOC` directly at its own call site.
 
 ### 1. Dimension ID Assignment
 
@@ -28,9 +28,13 @@ Within one logical tile, each op:
 - Iterates `logical_tile_size / op_tile_size` times (the physical tile sub-loop packs multiple op invocations)
 - Consumes `op_tile_size / physical_tile_size` physical buffer slots per invocation
 
-### 3. Data-Parallel Classification
+### 3. Blocking Classification
 
-A dimension is **data-parallel** if it appears in the kernel's return tensor — iterating over it produces independent partial results. All other dimensions are **reduction** — the full iteration must complete before the result is valid.
+A dimension is **blocking** if any op touching it has it listed in `BLOCKING_AXES` — the op accumulates over the dim and its output is only valid after the dim's full iteration completes. All other dimensions are **non-blocking** — each iteration produces a complete per-iteration result.
+
+The classification drives loop-fusion legality. A blocking shared dim between two groups constrains ordering; a non-blocking shared dim is freely permutable. Online fusion can flip a blocking dim to non-blocking by injecting running state + correction factors, which enlarges the legal fusion space downstream.
+
+This replaces the older data-parallel-vs-reduction split, which tied classification to the kernel's return tensor. Classifying by `BLOCKING_AXES` is a per-op property of the actual computation, independent of which dims happen to appear in the return, and it generalizes cleanly once online fusion converts reductions into non-blocking running state.
 
 ## Attention Example
 
@@ -102,7 +106,14 @@ d2: logical_tile_size = `min(max(128, 512), 4096) = 512`. physical_tile_size = `
 
 d4: logical_tile_size = `min(max(512), 128) = 128` (clamped to dim_size). physical_tile_size = `min(512, 128) = 128`, not partition → no cap. num_ptiles_per_ltile = 1.
 
-### Step 3 — Data-parallel classification
+### Step 3 — Blocking classification
 
-Return tensor `output` has dims (d0, d4). These are **data-parallel**. Dimensions d1 and d2 are **reduction** — d1 is the first matmul's accumulation axis, d2 is the second matmul's accumulation axis and the reduce_max/reduce_sum axis.
+Per-op `BLOCKING_AXES`: `nc_matmul` has `{K}`, `tensor_reduce` and `activation_reduce` have `{F}`, all others empty. Mapping abstract → concrete:
+
+- Op 2 (matmul): K → d1 → **d1 blocking**.
+- Op 5 (reduce_max): F → d2 → **d2 blocking**.
+- Op 6 (activation_reduce): F → d2 → **d2 blocking** (already known).
+- Op 9 (matmul): K → d2 → **d2 blocking** (already known).
+
+Final classification: **d1, d2 blocking**; **d0, d4 non-blocking**. Matches the old DP/reduction result for this example — but the new rule derives it from `BLOCKING_AXES`, not from the return tensor, so it remains correct after online fusion flips specific dims.
 
