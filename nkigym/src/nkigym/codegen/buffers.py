@@ -4,25 +4,23 @@ from nkigym.kernel_ir import KernelIR, get_tpb
 from nkigym.kernel_ir.dim_analysis import TensorInfo
 
 
-def render_buffers_for_names(ir: KernelIR, names: list[str], indent: int, needs_sbuf_staging: set[str]) -> str:
-    """Emit buffer allocations for a specific set of tensors.
+def render_buffers(ir: KernelIR, indent: int) -> str:
+    """Emit buffer allocations for every tensor in the IR.
 
     Args:
         ir: Complete kernel IR.
-        names: Tensor names to emit.
         indent: Indentation level.
-        needs_sbuf_staging: PSUM tensors needing SBUF staging.
 
     Returns:
         Indented NKI source lines.
     """
     da = ir.dim_analysis
+    needs_sbuf_staging = find_psum_tensors_needing_sbuf(ir)
     tensor_to_psum_dtype = _build_psum_dtype_map(ir)
     lines: list[str] = []
     pad = "    " * indent
 
-    for name in names:
-        tinfo = da.tensors[name]
+    for name, tinfo in da.tensors.items():
         shape = _buffer_shape(ir, name, tinfo)
         shape_str = ", ".join(str(s) for s in shape)
 
@@ -85,12 +83,8 @@ def _build_psum_dtype_map(ir: KernelIR) -> dict[str, str]:
 def _buffer_shape(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> tuple[int, ...]:
     """Compute the buffer shape for a tensor.
 
-    Always uses the global unified tile size per dimension.
-    Interleave is NOT folded into num_tiles — it is handled
-    by reshape at the op level (section 6).
-
-    2D tensor → 4D: (di_tile_P, num_tiles_P, num_tiles_F, di_tile_F).
-    1D tensor → 2D: (di_tile_P, num_tiles_P).
+    2D tensor → 4D: (phys_P, num_tiles_P, num_tiles_F, phys_F).
+    1D tensor → 2D: (phys_P, num_tiles_P).
     """
     da = ir.dim_analysis
     dim_ids = tinfo.dim_ids
@@ -118,10 +112,9 @@ def _buffer_shape(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> tuple[in
 def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     """Derive num_tiles for one dimension from KernelIR fields.
 
-    num_tiles = num_ptiles_per_ltile
-               * tpb_factor * num_blocks_factor * buffer_degree
+    num_tiles = num_ptiles * tpb_factor * blocks_factor * buffer_degree
 
-    | tier       | tpb_factor | num_blocks_factor          |
+    | tier       | tpb_factor | blocks_factor              |
     |------------|------------|----------------------------|
     | per_tile   | 1          | 1                          |
     | per_block  | tpb        | 1                          |
@@ -147,7 +140,7 @@ def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
         tpb_factor = tpb
         blocks_factor = di.dim_size // (tpb * di.logical_tile_size)
     else:
-        raise ValueError(f"Unknown load_placement tier: {tier!r}")
+        raise ValueError(f"Unknown tensor_placement tier: {tier!r}")
 
     return num_ptiles * tpb_factor * blocks_factor * degree
 
@@ -174,11 +167,7 @@ def producer_op_tiles(ir: KernelIR, tensor_name: str) -> dict[str, int]:
     da = ir.dim_analysis
     graph = ir.op_graph
 
-    match_idx: int | None = None
-    for op_idx, (_inputs, outputs) in enumerate(graph.op_tensors):
-        if tensor_name in outputs:
-            match_idx = op_idx
-            break
+    match_idx: int | None = graph.producer_op(tensor_name)
 
     if match_idx is None:
         for op_idx, (inputs, _outputs) in enumerate(graph.op_tensors):
