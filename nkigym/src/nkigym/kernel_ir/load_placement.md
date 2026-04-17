@@ -32,7 +32,7 @@ With `num_ptiles = max_op_tile / physical_tile_size`, `tpb = ltiles_per_block[d]
 
 ### Per-Group Feasibility
 
-Every fusion group emits its own complete loop nest (see `kernel_ir/group_loops.py`). Within a group's nest, loops are emitted in **phase-grouped order**: all block loops first in the order listed in that group's `group_dim_orders` entry, then all tile loops in the same order. A dim's blocking status (`DimInfo.is_blocking`) only gates fusion legality — once a dim is in a group's `dim_order`, its loops emit identically regardless of blocking.
+Every fusion group emits its own complete loop nest (see `codegen/group_loops.py`). Within a group's nest, loops are emitted in **phase-grouped order**: all block loops first in the order listed in that group's `group_dim_orders` entry, then all tile loops in the same order. A dim's blocking status (`DimInfo.is_blocking`) only gates fusion legality — once a dim is in a group's `dim_order`, its loops emit identically regardless of blocking.
 
 So within group `g`, a tensor `t` whose dims `(d_a, d_b)` both appear in `group_dim_orders[g] = [..., d_a, ..., d_b, ...]` is enclosed by:
 
@@ -107,7 +107,7 @@ $$\text{num\_tiles}(t, d) = \text{num\_ptiles}(t, d) \times \text{tpb\_factor}(t
 
 ### Attention Walkthrough
 
-Default (all `per_tile`). From the attention example (see `loopnest.md` for the op graph):
+Default (all `per_tile`). From the attention example (see `codegen/loopnest.md` for the op graph):
 
 - `d0` (16 blocks × 1 tile) — non-blocking.
 - `d1` (1 block × 1 tile) — blocking (matmul K).
