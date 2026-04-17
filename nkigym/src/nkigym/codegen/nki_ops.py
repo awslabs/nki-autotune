@@ -42,9 +42,8 @@ def render_ops_for_group(
         blocking_dims = {axis_map[a] for a in op_cls.BLOCKING_AXES if a in axis_map}
         has_blocking = bool(blocking_dims & set(red_dims))
 
-        for oname in outputs:
-            tinfo = da.tensors[oname]
-            if tinfo.isa_loc == "psum" and has_blocking:
+        if op_cls.ISA_LOC == "psum" and has_blocking:
+            for oname in outputs:
                 pre_lines.extend(_render_memset(ir, oname, base_indent))
 
         inner_lines.extend(_render_isa_call(ir, op_idx, needs_staging, inner_indent))
@@ -101,9 +100,8 @@ def _dst_exprs(ir: KernelIR, op_idx: int) -> dict[str, str]:
     result: dict[str, str] = {}
     for ax_name, oname in zip(op_cls.OUTPUT_AXES, outputs):
         tinfo = ir.dim_analysis.tensors[oname]
-        loc = tinfo.isa_loc
         idx = _dst_index_expr(ir, op_idx, tinfo)
-        result[ax_name] = f"{loc}_{oname}{idx}"
+        result[ax_name] = f"{op_cls.ISA_LOC}_{oname}{idx}"
     return result
 
 
@@ -121,9 +119,7 @@ def _operand_exprs(ir: KernelIR, op_idx: int, needs_staging: set[str]) -> dict[s
         if tinfo is None:
             continue
 
-        if tinfo.isa_loc == "hbm":
-            buf_name = f"sbuf_{tensor_name}"
-        elif tinfo.isa_loc == "psum":
+        if ir.op_graph.producer_isa_loc(tensor_name) == "psum":
             input_loc = op_cls.INPUT_LOCS.get(role, "sbuf")
             if input_loc == "sbuf" and tensor_name in needs_staging:
                 buf_name = f"sbuf_{tensor_name}"

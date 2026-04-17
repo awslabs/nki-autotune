@@ -48,6 +48,21 @@ class OpGraph:
         """Return summary string with node and edge counts."""
         return f"OpGraph({len(self.op_classes)} nodes, {len(self.edges)} edges)"
 
+    def producer_op(self, tensor_name: str) -> int | None:
+        """Return the op index that produces *tensor_name*, or None if it is a kernel input."""
+        producer: int | None = None
+        for op_idx, (_inputs, outputs) in enumerate(self.op_tensors):
+            if tensor_name in outputs:
+                producer = op_idx
+                break
+        return producer
+
+    def producer_isa_loc(self, tensor_name: str) -> str | None:
+        """Return the ISA_LOC of the op producing *tensor_name*, or None if it is a kernel input."""
+        producer = self.producer_op(tensor_name)
+        loc = self.op_classes[producer].ISA_LOC if producer is not None else None
+        return loc
+
     def render(self, path: str | Path) -> Path:
         """Render the DAG to a PNG file via Graphviz.
 

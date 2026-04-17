@@ -4,37 +4,29 @@ from nkigym.kernel_ir import KernelIR, get_tpb
 from nkigym.kernel_ir.dim_analysis import TensorInfo
 
 
-def render_buffers(ir: KernelIR, indent: int, needs_sbuf_staging: set[str]) -> str:
-    """Emit buffer allocations for all tensors needing on-chip buffers.
-
-    HBM inputs get an SBUF staging buffer for DMA loads. On-chip
-    tensors (``"sbuf"`` or ``"psum"``) get their primary buffer,
-    plus PSUM tensors get an SBUF staging buffer when a consumer
-    requires it. All buffers use the uniform ``(tile_size,
-    num_tiles)`` layout per dimension.
+def render_buffers_for_names(ir: KernelIR, names: list[str], indent: int, needs_sbuf_staging: set[str]) -> str:
+    """Emit buffer allocations for a specific set of tensors.
 
     Args:
         ir: Complete kernel IR.
-        indent: Indentation level for the allocations.
+        names: Tensor names to emit.
+        indent: Indentation level.
         needs_sbuf_staging: PSUM tensors needing SBUF staging.
 
     Returns:
-        Indented NKI source lines for buffer allocations.
+        Indented NKI source lines.
     """
     da = ir.dim_analysis
-
     tensor_to_psum_dtype = _build_psum_dtype_map(ir)
-
     lines: list[str] = []
     pad = "    " * indent
 
-    for name, tinfo in da.tensors.items():
+    for name in names:
+        tinfo = da.tensors[name]
         shape = _buffer_shape(ir, name, tinfo)
         shape_str = ", ".join(str(s) for s in shape)
 
-        if tinfo.isa_loc == "hbm":
-            lines.append(f"{pad}sbuf_{name} = nl.ndarray(({shape_str}), dtype=nl.{tinfo.dtype}, buffer=nl.sbuf)")
-        elif tinfo.isa_loc == "psum":
+        if ir.op_graph.producer_isa_loc(name) == "psum":
             psum_dtype = tensor_to_psum_dtype.get(name, tinfo.dtype)
             lines.append(f"{pad}psum_{name} = nl.ndarray(({shape_str}), dtype=nl.{psum_dtype}, buffer=nl.psum)")
             if name in needs_sbuf_staging:
@@ -61,13 +53,14 @@ def find_psum_tensors_needing_sbuf(ir: KernelIR) -> set[str]:
     for consumer_idx, (inputs, _outputs) in enumerate(graph.op_tensors):
         input_locs = graph.op_classes[consumer_idx].INPUT_LOCS
         for role, tensor_name in inputs.items():
-            tinfo = da.tensors.get(tensor_name)
-            if tinfo is None or tinfo.isa_loc != "psum":
+            if tensor_name not in da.tensors:
+                continue
+            if graph.producer_isa_loc(tensor_name) != "psum":
                 continue
             if input_locs.get(role) == "sbuf":
                 result.add(tensor_name)
 
-    if da.return_name in da.tensors and da.tensors[da.return_name].isa_loc == "psum":
+    if graph.producer_isa_loc(da.return_name) == "psum":
         result.add(da.return_name)
 
     return result
@@ -141,8 +134,7 @@ def _compute_num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     num_ptiles = max_op_tile // di.physical_tile_size
 
     tier = ir.tensor_placements[(tensor_name, dim_id)]
-    ops_touching = _ops_for_tensor(ir, tensor_name)
-    tpb = get_tpb(ir, dim_id, ops_touching)
+    tpb = get_tpb(ir, dim_id)
     degree = ir.buffer_degrees[_buffer_degree_key(ir, tensor_name, dim_id)]
 
     if tier == "per_tile":

@@ -2,12 +2,14 @@
 
 `render_ir` emits a fixed preamble before any loop nests or buffers. All fields come directly from KernelIR — no heuristics.
 
-**Imports.** Always the same three lines:
+**Imports.** Always the same fixed preamble:
 
 ```python
 import nki
 import nki.isa as nisa
 import nki.language as nl
+import numpy as np
+from nkigym.codegen.gadgets import load_tensor_block, stage_tensor_block, store_tensor_block
 ```
 
 **Decorator and signature.** `@nki.jit` decorator, then `def {func_name}({param_names}):` where `func_name` and `param_names` are read from KernelIR.

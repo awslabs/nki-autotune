@@ -52,16 +52,11 @@ class TensorInfo:
         dim_ids: Concrete dimension IDs (e.g. ``("d0", "d1")``).
         shape: Full shape (e.g. ``(2048, 128)``).
         dtype: Dtype string (e.g. ``"bfloat16"``).
-        isa_loc: Where the tensor lives or is produced:
-            ``"hbm"`` for kernel inputs,
-            ``"psum"`` for nc_matmul/nc_transpose outputs,
-            ``"sbuf"`` for vector-engine op outputs.
     """
 
     dim_ids: tuple[str, ...]
     shape: tuple[int, ...]
     dtype: str
-    isa_loc: str
 
 
 @dataclass
@@ -122,13 +117,11 @@ class DimAnalysis:
             lines.append("    " + "  | ".join(row[i].ljust(col_widths[i]) for i in range(len(headers))))
 
         lines.append("")
-        lines.append("  Tensors:")
-        t_headers = ["name", "dims", "shape", "dtype", "loc"]
+        lines.append("  Logical Tensors:")
+        t_headers = ["name", "dims", "shape", "dtype"]
         t_rows: list[list[str]] = []
         for name, t in self.tensors.items():
-            t_rows.append(
-                [name, f"({', '.join(t.dim_ids)})", f"({', '.join(str(s) for s in t.shape)})", t.dtype, t.isa_loc]
-            )
+            t_rows.append([name, f"({', '.join(t.dim_ids)})", f"({', '.join(str(s) for s in t.shape)})", t.dtype])
         t_widths = [max(len(h), *(len(r[i]) for r in t_rows)) for i, h in enumerate(t_headers)]
         lines.append("    " + "  | ".join(h.ljust(t_widths[i]) for i, h in enumerate(t_headers)))
         lines.append("    " + "-+-".join("-" * t_widths[i] for i in range(len(t_headers))))
@@ -145,7 +138,6 @@ class _Tensor:
     name: str
     shape: tuple[int, ...]
     dtype: str
-    isa_loc: str
     dim_ids: list[str]
 
 
@@ -254,7 +246,7 @@ def _create_outputs(
     for oname, (_, output_axes) in zip(output_names, op_cls.OUTPUT_AXES.items()):
         dim_ids = [local[a] for a in output_axes if a in local]
         shape = tuple(dim_sizes[d] for d in dim_ids)
-        tensors[oname] = _Tensor(oname, shape, dtype, op_cls.ISA_LOC, dim_ids)
+        tensors[oname] = _Tensor(oname, shape, dtype, dim_ids)
 
 
 def _compute_tile_sizes(
@@ -327,7 +319,7 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
     tensors: dict[str, _Tensor] = {}
     for name in param_names:
         shape, dtype = input_specs[name]
-        tensors[name] = _Tensor(name, shape, dtype, "hbm", dim_ids=[])
+        tensors[name] = _Tensor(name, shape, dtype, dim_ids=[])
 
     dim_counter = [0]
     per_op_maps: list[dict[str, str]] = []
@@ -348,7 +340,7 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
 
     tensor_infos: dict[str, TensorInfo] = {}
     for name, t in tensors.items():
-        tensor_infos[name] = TensorInfo(tuple(t.dim_ids), t.shape, t.dtype, t.isa_loc)
+        tensor_infos[name] = TensorInfo(tuple(t.dim_ids), t.shape, t.dtype)
 
     return DimAnalysis(
         func_name=func.__name__,

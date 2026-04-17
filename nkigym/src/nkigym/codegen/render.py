@@ -1,43 +1,44 @@
-"""render_ir: mechanical lowering of KernelIR to NKI source code."""
+"""render_ir: mechanical lowering of KernelIR to NKI source code.
 
-from nkigym.codegen.buffers import find_psum_tensors_needing_sbuf, render_buffers
-from nkigym.codegen.dma import render_store
+Current scope: header, data-parallel block/logical-tile loops,
+and per-fusion-group reduction-loop skeletons (``pass`` bodies).
+Buffer allocation, DMA, and ISA calls remain commented out until
+those stages are verified.
+"""
+
 from nkigym.codegen.header import render_header, render_return
 from nkigym.kernel_ir import KernelIR
 from nkigym.kernel_ir.data_parallel import render_data_parallel_loops
 from nkigym.kernel_ir.reduction import render_reduction_loops
 
+"""
+from collections import defaultdict
+
+from nkigym.codegen.buffers import find_psum_tensors_needing_sbuf, render_buffers_for_names
+from nkigym.codegen.dma import render_store
+"""
+
 
 def render_ir(ir: KernelIR) -> str:
     """Lower a KernelIR to NKI source code.
 
-    Emits the kernel header, data-parallel loop nest, buffer
-    allocations, reduction loop bodies with DMA loads, store,
-    and return statement.
+    Current scope: kernel header, the data-parallel block and
+    logical-tile loops, and per-fusion-group reduction-loop
+    skeletons (``pass`` bodies), HBM output allocation, and
+    return statement. Tensor buffers, DMA, and ISA calls are not
+    yet emitted.
 
     Args:
         ir: Complete kernel IR.
 
     Returns:
-        Complete NKI kernel source code.
+        NKI kernel source with DP and reduction loop skeletons.
     """
-    needs_staging = find_psum_tensors_needing_sbuf(ir)
-    header = render_header(ir.dim_analysis)
-    dp_loops, dp_indent = render_data_parallel_loops(ir)
-    buffers = render_buffers(ir, dp_indent, needs_staging)
-    reduction = render_reduction_loops(ir, dp_indent, needs_staging)
-    store = render_store(ir, dp_indent)
-    ret = render_return(ir.dim_analysis)
+    da = ir.dim_analysis
+    header = render_header(da)
+    dp_src, inner_indent = render_data_parallel_loops(ir, body_indent=1)
+    reduction = render_reduction_loops(ir, body_indent=inner_indent)
+    ret = render_return(da)
 
-    parts = [header]
-    if dp_loops:
-        parts.append(dp_loops)
-    if buffers:
-        parts.append(buffers)
-    if reduction:
-        parts.append(reduction)
-    if store:
-        parts.append(store)
-    parts.append(ret)
-
+    parts = [header, dp_src, reduction, ret]
     return "\n".join(parts) + "\n"

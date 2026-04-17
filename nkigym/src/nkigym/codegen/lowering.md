@@ -6,19 +6,23 @@ Fixed preamble: imports, `@nki.jit` decorator, function signature, input shape a
 
 ## 2. Loop Nest
 
-DP dimensions (in the return tensor) get outermost loops: block, tile, physical tile per dimension, grouped by phase. All DP dims sorted by ID within each phase. Inside the innermost DP loop, each fusion group emits its own reduction loop nest as a sibling block, ordered by topological sort of the group-level DAG. Same phase-grouped pattern as DP loops, applied to the group's reduction dims.
+DP dimensions (in the return tensor) get outermost loops: **block and logical tile per dimension** at the kernel level, grouped by phase (all block loops outermost, then all logical-tile loops). Within each phase, dimension order is taken from the top-level string entries of `ir.loop_order`. Physical-tile iteration within a logical tile is a per-op concern and is hidden inside op-specific gadgets — the kernel source has no `i_ptile_*` loops. Inside the innermost DP loop, each fusion group emits its own reduction loop nest as a sibling block (same block + logical-tile pattern, applied to the group's reduction dims), ordered by topological sort of the group-level DAG.
 
-## 3. Tensor Buffers
+## 3. Tensor Buffers *(not yet enabled in `render_ir`)*
 
 Buffer allocation for all on-chip tensors. SBUF uses 4D layout `(tile_size_P, num_tiles_P, num_tiles_F, tile_size_F)`. PSUM uses 2D single-tile allocations `(partition, free)` in Python lists when `num_tiles > 1`. Buffers are allocated at the top of the innermost DP loop body, before reduction loops. `num_tiles = num_ptiles_per_ltile × location_tiles × buffer_degree`.
 
-## 4. DMA
+## 4. DMA *(not yet enabled in `render_ir`)*
 
 DMA transfers between HBM, SBUF, and PSUM. Universal store rule: move data when the source is valid (PSUM→SBUF after blocking loop, SBUF→HBM after all reduction groups). Three gadgets: `load_tensor_block` (HBM→SBUF), `stage_tensor_block` (PSUM→SBUF), `store_tensor_block` (SBUF→HBM).
 
-## 5. NKI Ops
+## 5. NKI Ops *(not yet enabled in `render_ir`)*
 
-ISA call rendering inside reduction loops. Each op uses `format_isa_call` to emit `nisa.*` calls. Includes memset before blocking loops, PSUM→SBUF staging after, and per-op tile indexing with reshape for physical tile packing.
+ISA call rendering inside reduction loops. Each op uses `format_isa_call` to emit `nisa.*` calls. Includes memset before blocking loops, PSUM→SBUF staging after, and per-op gadgets that hide physical-tile iteration (the `num_ptiles_per_ltile` loop) from the kernel source, mirroring the DMA gadget pattern.
+
+## Current `render_ir` scope
+
+Enabled: §1 Kernel Header, §2 Loop Nest — data-parallel block and logical-tile loops only, with a ``pass`` body. Not yet enabled: reduction loops, tensor buffers, DMA, ISA calls.
 
 ## 6. Reference Kernel
 

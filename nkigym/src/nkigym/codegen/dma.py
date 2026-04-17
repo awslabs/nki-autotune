@@ -31,7 +31,7 @@ def render_loads_for_group(ir: KernelIR, group: list[int], indent: int) -> list[
 
     for tensor_name in hbm_inputs:
         tinfo = da.tensors[tensor_name]
-        par_ofs, free_ofs = _tensor_offsets(ir, tinfo, group)
+        par_ofs, free_ofs = _tensor_offsets(ir, tinfo)
         lines.append(f"{pad}load_tensor_block(sbuf_{tensor_name}, {tensor_name}, {par_ofs}, {free_ofs})")
 
     return lines
@@ -53,32 +53,30 @@ def render_store(ir: KernelIR, indent: int) -> str:
     da = ir.dim_analysis
     ret = da.return_name
     tinfo = da.tensors[ret]
-    all_ops = list(range(len(ir.op_graph.op_classes)))
 
-    par_ofs, free_ofs = _tensor_offsets(ir, tinfo, all_ops)
+    par_ofs, free_ofs = _tensor_offsets(ir, tinfo)
 
     pad = "    " * indent
     src_name = f"sbuf_{ret}"
     return f"{pad}store_tensor_block({ret}, {src_name}, {par_ofs}, {free_ofs})"
 
 
-def _tensor_offsets(ir: KernelIR, tinfo: TensorInfo, ops: list[int]) -> tuple[str, str]:
+def _tensor_offsets(ir: KernelIR, tinfo: TensorInfo) -> tuple[str, str]:
     """Build HBM offset expressions for a tensor's partition and free axes.
 
     Args:
         ir: Complete kernel IR.
         tinfo: Tensor metadata with dim_ids.
-        ops: Op indices to scan for ltiles_per_block.
 
     Returns:
         Tuple of (par_offset_expr, free_offset_expr). Free offset
         is ``"0"`` for 1D tensors.
     """
     da = ir.dim_analysis
-    par_tpb = get_tpb(ir, tinfo.dim_ids[0], ops)
+    par_tpb = get_tpb(ir, tinfo.dim_ids[0])
     par_ofs = _offset_expr(tinfo.dim_ids[0], da, par_tpb)
     if len(tinfo.dim_ids) == 2:
-        free_tpb = get_tpb(ir, tinfo.dim_ids[1], ops)
+        free_tpb = get_tpb(ir, tinfo.dim_ids[1])
         free_ofs = _offset_expr(tinfo.dim_ids[1], da, free_tpb)
     else:
         free_ofs = "0"
@@ -86,16 +84,20 @@ def _tensor_offsets(ir: KernelIR, tinfo: TensorInfo, ops: list[int]) -> tuple[st
 
 
 def _group_hbm_inputs(group: list[int], graph: OpGraph, da: DimAnalysis) -> list[str]:
-    """Find HBM tensors consumed by ops in a group (deduplicated, ordered)."""
+    """Find HBM tensors consumed by ops in a group (deduplicated, ordered).
+
+    HBM tensors are the kernel's input parameters — the only
+    tensors not produced by any op.
+    """
+    param_set = set(da.param_names)
     seen: set[str] = set()
     result: list[str] = []
     for op_idx in group:
         inputs, _ = graph.op_tensors[op_idx]
         for tensor_name in inputs.values():
-            if tensor_name in da.tensors and da.tensors[tensor_name].isa_loc == "hbm":
-                if tensor_name not in seen:
-                    seen.add(tensor_name)
-                    result.append(tensor_name)
+            if tensor_name in param_set and tensor_name not in seen:
+                seen.add(tensor_name)
+                result.append(tensor_name)
     return result
 
 

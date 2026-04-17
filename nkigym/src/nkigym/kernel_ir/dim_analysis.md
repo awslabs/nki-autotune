@@ -1,6 +1,6 @@
 ## Dimension Analysis
 
-A forward pass over all ops produces three results per dimension: an ID, a tile size, and a data-parallel classification.
+A forward pass over all ops produces three results per dimension: an ID, a tile size, and a data-parallel classification. It also records per-tensor **logical shape information**: `(name, dim_ids, shape, dtype)`. Memory location (`hbm`/`sbuf`/`psum`) is **not** a dim-analysis concern — code-generation consults each op's `ISA_LOC` directly at its own call site.
 
 ### 1. Dimension ID Assignment
 

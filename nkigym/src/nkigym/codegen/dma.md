@@ -1,4 +1,4 @@
-## DMA
+## DMA *(not yet enabled in `render_ir`)*
 
 Data moves through three memory levels: HBM → SBUF → PSUM (loads) and PSUM → SBUF → HBM (stores). One universal rule governs all store-direction transfers:
 
@@ -16,7 +16,7 @@ All multi-tile transfers use helper gadgets from `nkigym.dma.gadgets` to avoid i
 - **`stage_tensor_block(dst, src)`** — PSUM → SBUF. Iterates over all tile slots and issues `nisa.tensor_copy` for each. Both buffers must have the same shape.
 - **`store_tensor_block(dst, src, par_ofs, free_ofs)`** — SBUF → HBM. Iterates over all tile slots in an SBUF buffer and copies each tile to HBM via `nisa.dma_copy`.
 
-All three support 4D buffers `(physical_tile_size_P, num_tiles_P, num_tiles_F, physical_tile_size_F)` for 2D tensors and 2D buffers `(physical_tile_size_P, num_tiles_P)` for 1D tensors. The HBM offset is computed from loop variables: `offset = i_block * (ltiles_per_block * logical_tile_size) + i_ltile * logical_tile_size + i_ptile * physical_tile_size`.
+All three support 4D buffers `(physical_tile_size_P, num_tiles_P, num_tiles_F, physical_tile_size_F)` for 2D tensors and 2D buffers `(physical_tile_size_P, num_tiles_P)` for 1D tensors. The HBM offset is computed from the kernel-level loop variables: `offset = i_block * (ltiles_per_block * logical_tile_size) + i_ltile * logical_tile_size`. Physical-tile iteration within a logical tile is internal to the gadget — it walks the buffer's physical slots without needing a kernel-level `i_ptile_*` loop.
 
 ### Loads
 
@@ -42,23 +42,21 @@ for i_block_d0 in range(16):
     for i_block_d4 in range(1):
         for i_ltile_d0 in range(1):
             for i_ltile_d4 in range(1):
-                for i_ptile_d0 in range(1):
-                    for i_ptile_d4 in range(1):
-                        """buffer allocations..."""
+                """buffer allocations..."""
 
-                        # --- Reduction groups 0–10 ---
-                        # Each group loads its HBM inputs via load_tensor_block
-                        # at the innermost position where all dims are in scope.
-                        # Group 0 loads Q inside its d1 loop.
-                        # Group 1 loads K inside its d1,d2 loop.
-                        # Group 9 loads V inside its d2 loop.
-                        #
-                        # PSUM→SBUF tensor_copy follows the store rule:
-                        # Group 0 (nc_transpose Q): non-blocking, copy immediately.
-                        # Group 2 (nc_matmul QK): blocking on d1, copy after d1 loop.
-                        # Group 9 (nc_matmul SV): blocking on d2, copy after d2 loop.
-                        """reduction loops with loads and tensor_copies..."""
+                # --- Reduction groups 0–10 ---
+                # Each group loads its HBM inputs via load_tensor_block
+                # at the innermost position where all dims are in scope.
+                # Group 0 loads Q inside its d1 loop.
+                # Group 1 loads K inside its d1,d2 loop.
+                # Group 9 loads V inside its d2 loop.
+                #
+                # PSUM→SBUF tensor_copy follows the store rule:
+                # Group 0 (nc_transpose Q): non-blocking, copy immediately.
+                # Group 2 (nc_matmul QK): blocking on d1, copy after d1 loop.
+                # Group 9 (nc_matmul SV): blocking on d2, copy after d2 loop.
+                """reduction loops with loads and tensor_copies..."""
 
-                        # --- SBUF→HBM store: output tile ready ---
-                        store_tensor_block(dst=output, src=sbuf_output, par_ofs=..., free_ofs=...)
+                # --- SBUF→HBM store: output tile ready ---
+                store_tensor_block(dst=output, src=sbuf_output, par_ofs=..., free_ofs=...)
 ```

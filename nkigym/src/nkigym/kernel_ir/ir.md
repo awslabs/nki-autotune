@@ -9,9 +9,9 @@ class KernelIR:
     op_graph: OpGraph
 
     fusion_groups: list[list[int]]
-    ltiles_per_block: dict[tuple[int, str], int]
+    ltiles_per_block: dict[str, int]
     buffer_degrees: dict[tuple[int, str, str], int]
-    loop_order: list[list[str]]
+    loop_order: list[str | list[str]]
     tensor_placements: dict[tuple[str, str], str]
 ```
 
@@ -21,9 +21,9 @@ class KernelIR:
 
 **Rendering parameters** — `render_ir` reads these to determine loop structure, buffer sizes, and DMA placement:
 - `fusion_groups`: which ops share a loop nest. Initially `[[0], [1], ...]` — each op in its own group.
-- `ltiles_per_block`: `(op_idx, dim_id) -> int`. Initially `1` for all pairs.
+- `ltiles_per_block`: `dim_id -> int`. Per-dimension tiling factor — every op and tensor on a given dim shares the same block structure. Initially `1` for every dim in `da.dims`.
 - `buffer_degrees`: `(group_idx, tensor_name, dim_id) -> int`. Initially `1`. Each tensor's buffer is independent per fusion group — the same tensor loaded in two groups can have different degrees.
-- `loop_order`: per group — all dimension IDs in priority order. The renderer filters to the relevant subset per fusion group (e.g. reduction dims only for single-op groups). Initially `sorted(da.dims)` for every group.
+- `loop_order`: single flat list for the whole kernel nest. Top-level string entries are DP dim IDs in outer-to-inner order; each nested `list[str]` is one fusion group's reduction dim IDs in outer-to-inner order, positional on `fusion_groups`. An empty sublist marks a group with no reduction dims. Example: for a kernel with two DP dims `d0, d4` and two fusion groups whose reduction nests are `for d1` and `for d1: for d2`, `loop_order = ["d0", "d4", ["d1"], ["d1", "d2"]]` — decoded as `for d0: for d4: { for d1 { ... }; for d1: for d2 { ... } }`. Initially DP dims `sorted` on top, then one sorted reduction sublist per fusion group.
 - `tensor_placements`: `(tensor_name, dim_id) -> tier`. Initially `"per_tile"` for all pairs. Tier is `"per_tile"`, `"per_block"`, or `"full"`.
 
 **Renderer-derived positions** — NOT stored in KernelIR, mechanically derived by `render_ir` from the fields above:

@@ -1,6 +1,6 @@
-## Tensor Buffers
+## Tensor Buffers *(not yet enabled in `render_ir`)*
 
-Every tensor needs a buffer allocation. HBM inputs get an SBUF staging buffer (`sbuf_{name}`) for DMA loads — the load gadget copies tiles from HBM into this buffer, and ops consume from it. On-chip tensors (`isa_loc` is `"sbuf"` or `"psum"`) get their primary buffer as before, plus PSUM tensors get an SBUF staging buffer when a consumer requires it. The return tensor gets both an HBM allocation (in the kernel header, for the final store destination) and an on-chip buffer here (for the intermediate compute result).
+Every tensor needs a buffer allocation. HBM inputs — the kernel's parameter tensors — get an SBUF staging buffer (`sbuf_{name}`) for DMA loads. The load gadget copies tiles from HBM into this buffer, and ops consume from it. On-chip tensors are allocated according to their producing op's `ISA_LOC`: `"psum"` producers get `psum_{name}` (plus an SBUF staging buffer if a consumer requires it), `"sbuf"` producers get `sbuf_{name}`. The return tensor gets both an HBM allocation (in the kernel header, for the final store destination) and an on-chip buffer here (for the intermediate compute result).
 
 **Placement rule: allocate at the top of the loop level where the buffer lives.** A buffer that is reused across iterations of a loop is allocated outside that loop. A buffer that is recycled each iteration is allocated at the top of the loop body. In the default lowering (degree-1, no load placement), every on-chip buffer holds one tile and is consumed within the innermost DP loop body, so all allocations go at the top of the innermost DP loop body, before any reduction loops.
 
