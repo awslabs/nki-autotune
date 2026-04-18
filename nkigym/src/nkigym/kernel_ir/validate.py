@@ -17,6 +17,7 @@ def validate(ir: Any, op_to_group: dict[int, int]) -> bool:
         _check_cross_group_placements(ir, op_to_group)
         and _check_blocking_innermost(ir)
         and _check_placement_feasibility(ir)
+        and _check_psum_output_reachable(ir)
     )
 
 
@@ -46,6 +47,54 @@ def _op_blocking_innermost_ok(ir: Any, group_idx: int, op_idx: int) -> bool:
     blocking_positions = [dim_order.index(d) for d in blocking if d in dim_order]
     non_blocking_positions = [idx for idx, d in enumerate(dim_order) if d not in blocking]
     return not (blocking_positions and non_blocking_positions and min(blocking_positions) < max(non_blocking_positions))
+
+
+def _check_psum_output_reachable(ir: Any) -> bool:
+    """Every PSUM-produced tensor must be stageable at the depth where its producer finishes accumulating.
+
+    A PSUM op accumulates over its blocking dims; the output is
+    only defined after the outermost blocking dim's loop closes
+    — i.e. at depth ``producer_finished = min(pos(b) for b in
+    blocking)`` in the producer group's dim_order. The tier
+    intervals on the output's dims must contain that depth, else
+    the stage/store fires inside the accumulation loop and reads
+    a partial sum.
+    """
+    return all(_group_psum_outputs_ok(ir, gi) for gi in range(len(ir.fusion_groups)))
+
+
+def _group_psum_outputs_ok(ir: Any, group_idx: int) -> bool:
+    """Check every PSUM-producing op in one group has reachable outputs at its finished depth."""
+    dim_order = ir.group_dim_orders[group_idx]
+    pos = {d: i for i, d in enumerate(dim_order)}
+    n = len(dim_order)
+    psum_ops = [i for i in ir.fusion_groups[group_idx] if ir.op_graph.op_classes[i].ISA_LOC == "psum"]
+    return all(_op_psum_outputs_ok(ir, op_idx, pos, n) for op_idx in psum_ops)
+
+
+def _op_psum_outputs_ok(ir: Any, op_idx: int, pos: dict[str, int], n: int) -> bool:
+    """Check one PSUM op's outputs are reachable at the producer-finished depth."""
+    op_cls = ir.op_graph.op_classes[op_idx]
+    blocking = op_blocking_dims(op_cls, ir.dim_analysis.per_op_axis_maps[op_idx]) & pos.keys()
+    finished = min(pos[d] for d in blocking) if blocking else 2 * n
+    outputs = ir.op_graph.op_tensors[op_idx][1]
+    return all(_depth_in_tensor_interval(ir, oname, pos, n, finished) for oname in outputs)
+
+
+def _depth_in_tensor_interval(ir: Any, tensor_name: str, pos: dict[str, int], n: int, depth: int) -> bool:
+    """True iff ``depth`` lies in every per-dim tier interval for *tensor_name*."""
+    return all(
+        _dim_interval_contains(ir, tensor_name, d, pos[d], n, depth)
+        for d in ir.dim_analysis.tensors[tensor_name].dim_ids
+        if d in pos
+    )
+
+
+def _dim_interval_contains(ir: Any, tensor_name: str, dim_id: str, position: int, n: int, depth: int) -> bool:
+    """True iff the tier interval for one dim contains ``depth``."""
+    tier = ir.tensor_placements[(tensor_name, dim_id)]
+    d_lo, d_hi = tier_depth_range(tier, position, n)
+    return d_lo <= depth <= d_hi
 
 
 def _check_placement_feasibility(ir: Any) -> bool:

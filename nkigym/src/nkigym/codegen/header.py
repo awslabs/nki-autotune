@@ -21,6 +21,7 @@ def render_header(da: DimAnalysis) -> str:
     lines.append("import nki.isa as nisa")
     lines.append("import nki.language as nl")
     lines.append("import numpy as np")
+    lines.append("from nkigym.codegen.gadgets import load_block, stage_block, store_block")
     lines.append("")
     lines.append("")
     lines.append("@nki.jit")

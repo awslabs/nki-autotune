@@ -6,7 +6,7 @@ stage/store). Slice expressions are built from in-scope loop
 vars and tiers; gadgets are thin ISA wrappers that don't loop.
 """
 
-from nkigym.codegen.buffers import num_tiles, psum_tile_count, psum_tile_slice
+from nkigym.codegen.buffers import num_tiles
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.kernel_ir import KernelIR, get_tpb
 from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
@@ -59,7 +59,7 @@ def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int]) -> DepthPlan:
         depth = _tier_depth(ir, tensor_name, tinfo, dim_order)
         dst = f"sbuf_{tensor_name}{_sbuf_slice(ir, tensor_name, tinfo, dim_order, depth)}"
         src = f"{tensor_name}{_hbm_slice(ir, tinfo, dim_order, depth)}"
-        plan.setdefault(group_idx, {}).setdefault(depth, []).append(f"nisa.dma_copy({dst}, {src})")
+        plan.setdefault(group_idx, {}).setdefault(depth, []).append(f"load_block({dst}, {src})")
 
     return plan
 
@@ -85,8 +85,8 @@ def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[s
         uses_after = bool(blocking) and depth == producer_depth
 
         dst = f"sbuf_{tensor_name}{_sbuf_slice(ir, tensor_name, tinfo, dim_order, depth)}"
-        src = f"psum_{tensor_name}{_psum_slice(ir, tensor_name, tinfo)}"
-        line = f"nisa.tensor_copy({dst}, {src})"
+        src = f"psum_{tensor_name}"
+        line = f"stage_block({dst}, {src})"
         (after if uses_after else before).setdefault(group_idx, {}).setdefault(depth, []).append(line)
 
     return before, after
@@ -117,7 +117,7 @@ def render_hbm_store(ir: KernelIR, op_to_group: dict[int, int]) -> tuple[DepthPl
         depth = max(producer_depth, tier_depth)
         dst = f"{ret}{_hbm_slice(ir, tinfo, dim_order, depth)}"
         src = f"sbuf_{ret}{_sbuf_slice(ir, ret, tinfo, dim_order, depth)}"
-        line = f"nisa.dma_copy({dst}, {src})"
+        line = f"store_block({dst}, {src})"
         (after if uses_after else before).setdefault(group_idx, {}).setdefault(depth, []).append(line)
     return before, after
 
@@ -155,31 +155,45 @@ def _sbuf_slice(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, dim_order: li
 
 
 def _sbuf_axis_index(ir: KernelIR, tensor_name: str, dim_id: str, dim_order: list[str], depth: int) -> str:
-    """Per-dim ``num_tiles`` index into an SBUF buffer — ``0``, ``0:slots``, or a loop-var expression depending on tier and the loops in scope at ``depth``."""
+    """Per-dim slot range for a block-scoped SBUF slice at ``depth``.
+
+    Always yields a ``start:end`` range so the slice keeps every
+    SBUF axis — block-level gadgets iterate over the resulting
+    slot count. ``start`` is a loop-var expression for dims whose
+    tiered loop is already open at ``depth``; ``end`` extends by
+    however many slots are in-flight at that depth.
+    """
     slots = num_tiles(ir, tensor_name, dim_id)
-    if slots == 1:
-        idx = "0"
-    elif dim_id not in dim_order:
-        idx = f"0:{slots}"
-    else:
-        n = len(dim_order)
-        i = dim_order.index(dim_id)
+    num_ptiles = ir.dim_analysis.dims[dim_id].num_ptiles
+    expr = f"0:{slots}"
+    if slots > 1 and dim_id in dim_order:
         tier = ir.tensor_placements[(tensor_name, dim_id)]
         tpb = get_tpb(ir, dim_id)
-        num_ptiles = ir.dim_analysis.dims[dim_id].num_ptiles
-        block_active = depth > i
-        tile_active = depth > n + i
-        if tier == "full":
-            idx = (
-                f"i_block_{dim_id} * {tpb * num_ptiles} + i_ltile_{dim_id} * {num_ptiles}"
-                if block_active
-                else f"0:{slots}"
-            )
-        elif tier == "per_block":
-            idx = f"i_ltile_{dim_id} * {num_ptiles}" if tile_active else f"0:{tpb * num_ptiles}"
-        else:
-            idx = "0"
-    return idx
+        n = len(dim_order)
+        i = dim_order.index(dim_id)
+        expr = _slot_range(tier, dim_id, i, n, depth, tpb, num_ptiles, slots)
+    return expr
+
+
+def _slot_range(tier: str, dim_id: str, pos: int, n: int, depth: int, tpb: int, num_ptiles: int, slots: int) -> str:
+    """Slot-range expression for one dim given its tier and the loops in scope at ``depth``."""
+    block_active = depth > pos
+    tile_active = depth > n + pos
+    block_stride = tpb * num_ptiles
+    if tier == "full" and tile_active:
+        start = f"i_block_{dim_id} * {block_stride} + i_ltile_{dim_id} * {num_ptiles}"
+        expr = f"{start}:{start} + {num_ptiles}"
+    elif tier == "full" and block_active:
+        start = f"i_block_{dim_id} * {block_stride}"
+        expr = f"{start}:{start} + {block_stride}"
+    elif tier == "per_block" and tile_active:
+        start = f"i_ltile_{dim_id} * {num_ptiles}"
+        expr = f"{start}:{start} + {num_ptiles}"
+    elif tier == "per_tile":
+        expr = f"0:{num_ptiles}"
+    else:
+        expr = f"0:{slots}"
+    return expr
 
 
 def _hbm_slice(ir: KernelIR, tinfo: TensorInfo, dim_order: list[str], depth: int) -> str:
@@ -213,9 +227,3 @@ def _hbm_axis_range(ir: KernelIR, dim_id: str, dim_order: list[str], depth: int)
         start = f"i_block_{dim_id} * {block_stride} + i_ltile_{dim_id} * {logical}"
         rng = f"{start}:{start} + {logical}"
     return rng
-
-
-def _psum_slice(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> str:
-    """Slice into a PSUM allocation at list index 0 (stage reads the first tile each iteration)."""
-    tile = psum_tile_slice(ir, tensor_name, tinfo)
-    return tile if psum_tile_count(ir, tensor_name, tinfo) == 1 else f"[0]{tile}"

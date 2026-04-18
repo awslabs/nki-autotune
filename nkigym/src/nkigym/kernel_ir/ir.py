@@ -191,23 +191,20 @@ def _init_group_dim_orders(fusion_groups: list[list[int]], da: DimAnalysis, op_g
     return [_group_dims(group, da, op_graph) for group in fusion_groups]
 
 
-def build_ir(
-    func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], seed: int = 0
-) -> KernelIR:
+def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
     """Construct the initial KernelIR from a math function.
 
     Runs dimension analysis and graph analysis, then sets all
     rendering parameters to their default (naive) values. The
     default is maximally unfused: one singleton fusion group per
     op, each owning a complete loop nest over every dim its op
-    touches. ``tensor_placements`` is drawn via rejection
-    sampling so the initial IR satisfies ``validate`` — no
-    hard-coded promotion rule.
+    touches. ``group_dim_orders`` and ``tensor_placements`` are
+    drawn via rejection sampling using a fresh unseeded RNG, so
+    every call returns a different valid IR.
 
     Args:
         func: Math function using NKIOp classes.
         input_specs: ``{param_name: (shape, dtype)}``.
-        seed: Random seed for the placement sampler.
 
     Returns:
         KernelIR with default rendering parameters.
@@ -233,4 +230,4 @@ def build_ir(
         group_dim_orders=group_dim_orders,
         tensor_placements=_init_tensor_placements(da),
     )
-    return sample_valid_ir(ir, random.Random(seed))
+    return sample_valid_ir(ir, random.Random())
