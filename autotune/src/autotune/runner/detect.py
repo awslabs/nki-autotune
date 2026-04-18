@@ -75,13 +75,37 @@ def _try_parse(source: str) -> ast.Module | None:
 
 
 def _slice_size(node: ast.expr) -> int:
-    """Extract the size of a slice dimension (e.g. 0:128 → 128)."""
-    if isinstance(node, ast.Slice) and isinstance(node.upper, ast.Constant) and isinstance(node.upper.value, int):
-        lower = 0
-        if isinstance(node.lower, ast.Constant) and isinstance(node.lower.value, int):
-            lower = node.lower.value
-        return node.upper.value - lower
-    raise ValueError(f"Cannot extract slice size from {ast.unparse(node)}")
+    """Extract the size of a slice dimension.
+
+    Handles constant bounds (``0:128 → 128``) and the common
+    loop-indexed form ``expr:expr + N`` that codegen emits for
+    in-flight tile views (e.g. ``i_block_d0 * 128:i_block_d0 *
+    128 + 128``). For the loop-indexed form the ``expr`` must
+    match literally (``ast.unparse``) on both sides; ``N`` is
+    then the size.
+    """
+    size: int | None = None
+    if isinstance(node, ast.Slice) and node.upper is not None:
+        lower = node.lower if node.lower is not None else ast.Constant(value=0)
+        upper = node.upper
+        if (
+            isinstance(upper, ast.Constant)
+            and isinstance(upper.value, int)
+            and isinstance(lower, ast.Constant)
+            and isinstance(lower.value, int)
+        ):
+            size = upper.value - lower.value
+        elif (
+            isinstance(upper, ast.BinOp)
+            and isinstance(upper.op, ast.Add)
+            and isinstance(upper.right, ast.Constant)
+            and isinstance(upper.right.value, int)
+            and ast.unparse(upper.left) == ast.unparse(lower)
+        ):
+            size = upper.right.value
+    if size is None:
+        raise ValueError(f"Cannot extract slice size from {ast.unparse(node)}")
+    return size
 
 
 def _range_dims(subscript: ast.Subscript) -> list[int]:
@@ -147,14 +171,10 @@ def detect_mac_count(source: str) -> int:
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Call) and ast.unparse(node.func) == "nisa.nc_matmul"):
                 continue
-            stat_kw = [kw for kw in node.keywords if kw.arg == "stationary"]
-            mov_kw = [kw for kw in node.keywords if kw.arg == "moving"]
-            if not stat_kw or not mov_kw:
+            operands = _nc_matmul_operands(node)
+            if operands is None:
                 continue
-            stat_val = stat_kw[0].value
-            mov_val = mov_kw[0].value
-            if not isinstance(stat_val, ast.Subscript) or not isinstance(mov_val, ast.Subscript):
-                continue
+            stat_val, mov_val = operands
             try:
                 stat_dims = _range_dims(stat_val)
                 mov_dims = _range_dims(mov_val)
@@ -169,6 +189,27 @@ def detect_mac_count(source: str) -> int:
             except (ValueError, IndexError):
                 continue
     return total_mac
+
+
+def _nc_matmul_operands(node: ast.Call) -> tuple[ast.Subscript, ast.Subscript] | None:
+    """Return ``(stationary, moving)`` operand subscripts from an ``nc_matmul`` call.
+
+    Accepts either kwargs (``stationary=..., moving=...``) or
+    the positional ``nc_matmul(dst, stationary, moving)`` form.
+    Returns ``None`` when operands aren't subscripts (e.g. bare
+    names referring to already-sliced buffers).
+    """
+    stat_kw = [kw for kw in node.keywords if kw.arg == "stationary"]
+    mov_kw = [kw for kw in node.keywords if kw.arg == "moving"]
+    pair: tuple[ast.expr, ast.expr] | None = None
+    if stat_kw and mov_kw:
+        pair = (stat_kw[0].value, mov_kw[0].value)
+    elif len(node.args) >= 3:
+        pair = (node.args[1], node.args[2])
+    result: tuple[ast.Subscript, ast.Subscript] | None = None
+    if pair is not None and isinstance(pair[0], ast.Subscript) and isinstance(pair[1], ast.Subscript):
+        result = (pair[0], pair[1])
+    return result
 
 
 def detect_func_name(source: str) -> str:

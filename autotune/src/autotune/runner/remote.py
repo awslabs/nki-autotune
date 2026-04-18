@@ -262,6 +262,20 @@ def _write_compiler_logs(cache_dir: str, compiler_logs: dict[str, str]) -> None:
             f.write(log_text)
 
 
+def _kernel_sort_key(kernel_name: str) -> tuple[int, int, str]:
+    """Natural sort key for kernel names.
+
+    Names shaped like ``<prefix>_<N>.py`` sort numerically by
+    ``N`` (so ``kernel_2.py`` precedes ``kernel_10.py``); names
+    without a numeric suffix sort alphabetically after all
+    numerically-sorted names.
+    """
+    stem = Path(kernel_name).stem
+    tail = stem.rsplit("_", 1)[-1]
+    key = (0, int(tail), stem) if tail.isdigit() else (1, 0, stem)
+    return key
+
+
 def _write_results_json(
     cache_dir: str, kernels: dict[str, KernelJob], results: list[ProfileResult], profiler: "RemoteProfiler"
 ) -> None:
@@ -270,7 +284,7 @@ def _write_results_json(
     times = [r.min_ms for r in successes]
 
     kernel_entries = []
-    for r in results:
+    for r in sorted(results, key=lambda r: _kernel_sort_key(r.kernel_name)):
         rd = r._asdict()
         filename = r.kernel_name if r.kernel_name.endswith(".py") else f"{r.kernel_name}.py"
         rd["nki_path"] = f"nki/{filename}"

@@ -4,7 +4,7 @@ stationary(K, M).T @ moving(K, N) -> output(M, N).
 Accumulates into PSUM in fp32 regardless of input dtype.
 """
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 
@@ -31,21 +31,18 @@ class NKIMatmul(NKIOp):
     PSUM_DTYPE: ClassVar[str | None] = "float32"
     INPUT_LOCS: ClassVar[dict[str, str]] = {"stationary": "sbuf", "moving": "sbuf"}
 
-    def __call__(self, stationary: np.ndarray, moving: np.ndarray, **_: object) -> np.ndarray:
-        """CPU simulation: stationary.T @ moving.
-
-        Args:
-            stationary: Array of shape (K, M).
-            moving: Array of shape (K, N).
-
-        Returns:
-            Result array of shape (M, N).
-        """
+    def __call__(self, **kwargs: Any) -> Any:
+        """CPU simulation: ``stationary.T @ moving`` from kwargs ``stationary`` and ``moving``."""
+        stationary: np.ndarray = kwargs["stationary"]
+        moving: np.ndarray = kwargs["moving"]
         return stationary.T @ moving
 
     @classmethod
     def format_isa_call(
         cls, dst_expr: str, operand_exprs: dict[str, str], scalar_kwargs: dict[str, str] | None = None
     ) -> str:
-        """Format nisa.nc_matmul(dst, stationary, moving)."""
-        return f"nisa.nc_matmul({dst_expr}, {operand_exprs['stationary']}, {operand_exprs['moving']})"
+        """Format nisa.nc_matmul with keyword args for dst, stationary, moving."""
+        return (
+            f"nisa.nc_matmul(dst={dst_expr}, "
+            f"stationary={operand_exprs['stationary']}, moving={operand_exprs['moving']})"
+        )

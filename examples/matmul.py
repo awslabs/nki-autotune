@@ -1,7 +1,4 @@
-"""Matrix multiplication: numpy golden, nkigym simulation, and comparison.
-
-Demonstrates that NKIMatmul produces identical results to numpy
-at float64 precision.
+"""Matrix multiplication: remote search over sampled KernelIR variants.
 
 Usage::
 
@@ -9,75 +6,50 @@ Usage::
     python examples/matmul.py
 """
 
+import inspect
 import shutil
 from pathlib import Path
 
-import nki
 import numpy as np
 
-from autotune.runner.compare import assert_close
-from autotune.runner.compile import load_kernel
-from nkigym.codegen import build_ir, render_ir
+from nkigym.codegen import build_ir
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.search import remote_search
 
 CACHE_DIR = Path("/home/ubuntu/cache/matmul")
+HOSTS = ["gym-1", "gym-2", "gym-3"]
+NUM_VARIANTS = 50
 
 
 def matmul_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Matrix multiply with numpy: lhs_T.T @ rhs.
-
-    Args:
-        lhs_T: Stationary tensor of shape (K, M).
-        rhs: Moving tensor of shape (K, N).
-
-    Returns:
-        Output tensor of shape (M, N).
-    """
+    """Matrix multiply with numpy: lhs_T.T @ rhs."""
     return lhs_T.T @ rhs
 
 
 def matmul_nkigym(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Matrix multiply using nkigym logical ops.
-
-    Args:
-        lhs_T: Stationary tensor of shape (K, M).
-        rhs: Moving tensor of shape (K, N).
-
-    Returns:
-        Output tensor of shape (M, N).
-    """
+    """Matrix multiply using nkigym logical ops."""
     result = NKIMatmul()(stationary=lhs_T, moving=rhs)
     return result
 
 
 if __name__ == "__main__":
     K, M, N = 2048, 2048, 2048
-
-    rng = np.random.default_rng(42)
-    lhs_T = rng.standard_normal((K, M))
-    rhs = rng.standard_normal((K, N))
-
-    out_np = matmul_numpy(lhs_T, rhs)
-    out_gym = matmul_nkigym(lhs_T, rhs)
-    status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
-    print(f"matmul: {status}")
+    input_specs = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     CACHE_DIR.mkdir(parents=True)
-    input_specs = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 
-    """Step 1: build IR."""
     ir = build_ir(matmul_nkigym, input_specs)
-    (CACHE_DIR / "ir.txt").write_text(repr(ir))
-    ir.op_graph.render(CACHE_DIR / "op_graph")
 
-    """Step 2: render IR to NKI source."""
-    source = render_ir(ir)
-    (CACHE_DIR / "kernel.py").write_text(source)
-
-    """Step 3: simulate."""
-    kernel_func = load_kernel(str(CACHE_DIR / "kernel.py"), "matmul_nkigym")
-    golden = lhs_T.astype(np.float32).T @ rhs.astype(np.float32)
-    sim_result = nki.simulate(kernel_func)(lhs_T=lhs_T.astype(np.float32), rhs=rhs.astype(np.float32))
-    sim_status = assert_close(sim_result, golden, atol=1e-2, rtol=1e-2)
-    print(f"matmul cpu_sim: {sim_status}")
+    output = remote_search(
+        initial_kernel=ir,
+        input_specs=input_specs,
+        golden_source=inspect.getsource(matmul_numpy),
+        golden_func_name="matmul_numpy",
+        hosts=HOSTS,
+        cache_dir=str(CACHE_DIR),
+        num_variants=NUM_VARIANTS,
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    print(output)

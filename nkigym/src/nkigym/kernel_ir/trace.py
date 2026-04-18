@@ -20,9 +20,22 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import ml_dtypes
 import numpy as np
 
 from nkigym.ops.base import NKIOp
+
+
+def _resolve_dtype(name: str) -> np.dtype:
+    """Resolve a dtype string, falling back to ml_dtypes for bfloat16 and other extensions."""
+    try:
+        dtype = np.dtype(name)
+    except TypeError:
+        ext = getattr(ml_dtypes, name, None)
+        if ext is None:
+            raise ValueError(f"Unknown dtype {name!r}") from None
+        dtype = np.dtype(ext)
+    return dtype
 
 
 def _all_subclasses(cls: type) -> list[type]:
@@ -109,7 +122,7 @@ def trace_scalar_kwargs(
         NKIOp call in execution order. Tensor kwargs (ndarray
         values) are excluded.
     """
-    dummies = {name: np.zeros(shape, dtype=np.dtype(dtype)) for name, (shape, dtype) in input_specs.items()}
+    dummies = {name: np.zeros(shape, dtype=_resolve_dtype(dtype)) for name, (shape, dtype) in input_specs.items()}
 
     records: list[dict[str, Any]] = []
     with _tracing(records):
