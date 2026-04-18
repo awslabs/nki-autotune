@@ -1,12 +1,16 @@
 """KernelIR: structured representation for lowering to NKI source."""
 
+import random
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from nkigym.kernel_ir.dim_analysis import DimAnalysis, analyze_dims
 from nkigym.kernel_ir.op_graph import OpGraph, build_op_graph
+from nkigym.kernel_ir.validate import validate
+
+TIERS = ("per_tile", "per_block", "full")
 
 
 @dataclass
@@ -133,13 +137,41 @@ def _init_tensor_placements(da: DimAnalysis) -> dict[tuple[str, str], str]:
     return placements
 
 
-def _group_dims(group: list[int], da: DimAnalysis, op_graph: OpGraph) -> list[str]:
-    """Collect every dim any op in the group touches.
+def sample_valid_ir(ir: "KernelIR", rng: random.Random, max_tries: int = 1_000_000) -> "KernelIR":
+    """Rejection-sample ``group_dim_orders`` and ``tensor_placements`` jointly.
 
-    Union of ``dim_ids`` across all input and output tensors of
-    every op in ``group``. Returned sorted for a deterministic
-    initial order; loop-reordering exposes permutations later.
+    Each attempt independently draws:
+
+    * For every fusion group: a uniformly random permutation of
+      that group's dims.
+    * For every ``(tensor, dim)`` pair: a uniform tier from ``TIERS``.
+
+    The candidate is accepted iff ``validate(candidate)`` passes
+    (cross-group full-placement, blocking-dims innermost,
+    per-tensor depth feasibility — see ``validate.py``). Raises
+    ``RuntimeError`` if no valid combination is found within
+    ``max_tries`` tries.
     """
+    placement_keys = list(ir.tensor_placements)
+    op_to_group = {op_idx: gi for gi, grp in enumerate(ir.fusion_groups) for op_idx in grp}
+    for _ in range(max_tries):
+        group_dim_orders = [_rand_perm(order, rng) for order in ir.group_dim_orders]
+        placements = {k: rng.choice(TIERS) for k in placement_keys}
+        candidate = replace(ir, group_dim_orders=group_dim_orders, tensor_placements=placements)
+        if validate(candidate, op_to_group):
+            return candidate
+    raise RuntimeError(f"No valid IR found after {max_tries} samples")
+
+
+def _rand_perm(order: list[str], rng: random.Random) -> list[str]:
+    """Return a uniformly random permutation of ``order``."""
+    perm = list(order)
+    rng.shuffle(perm)
+    return perm
+
+
+def _group_dims(group: list[int], da: DimAnalysis, op_graph: OpGraph) -> list[str]:
+    """Return every dim any op in the group touches, sorted by ``dim_id``."""
     dims: set[str] = set()
     for op_idx in group:
         for tensor_name in op_graph.op_tensor_names(op_idx):
@@ -159,24 +191,29 @@ def _init_group_dim_orders(fusion_groups: list[list[int]], da: DimAnalysis, op_g
     return [_group_dims(group, da, op_graph) for group in fusion_groups]
 
 
-def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
+def build_ir(
+    func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], seed: int = 0
+) -> KernelIR:
     """Construct the initial KernelIR from a math function.
 
     Runs dimension analysis and graph analysis, then sets all
     rendering parameters to their default (naive) values. The
     default is maximally unfused: one singleton fusion group per
     op, each owning a complete loop nest over every dim its op
-    touches.
+    touches. ``tensor_placements`` is drawn via rejection
+    sampling so the initial IR satisfies ``validate`` — no
+    hard-coded promotion rule.
 
     Args:
         func: Math function using NKIOp classes.
         input_specs: ``{param_name: (shape, dtype)}``.
+        seed: Random seed for the placement sampler.
 
     Returns:
         KernelIR with default rendering parameters.
     """
     da = analyze_dims(func, input_specs)
-    graph = build_op_graph(func)
+    graph = build_op_graph(func, input_specs)
 
     num_ops = len(graph.op_classes)
 
@@ -187,7 +224,7 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
     buffer_degrees = _init_buffer_degrees(da)
     group_dim_orders = _init_group_dim_orders(fusion_groups, da, graph)
 
-    return KernelIR(
+    ir = KernelIR(
         dim_analysis=da,
         op_graph=graph,
         fusion_groups=fusion_groups,
@@ -196,3 +233,4 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
         group_dim_orders=group_dim_orders,
         tensor_placements=_init_tensor_placements(da),
     )
+    return sample_valid_ir(ir, random.Random(seed))

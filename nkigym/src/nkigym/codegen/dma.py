@@ -1,23 +1,16 @@
 """DMA codegen: HBM↔SBUF and PSUM↔SBUF transfer rendering.
 
-Positions are derived from KernelIR:
-
-- HBM loads: each kernel input tensor is loaded once in the
-  fusion group that contains its earliest consumer op. Depth
-  within the group's nest is driven by ``tensor_placements``
-  tiers per dim (per_tile / per_block / full).
-- PSUM staging: for each PSUM tensor needing SBUF staging, emit
-  ``stage_tensor_block`` in the producing op's group. Non-blocking
-  ops stage at the innermost body; blocking ops stage after the
-  outermost blocking dim's block loop closes.
-- HBM store: the return tensor is stored inside the producing
-  group's innermost body.
+Load, stage, and store emit at the tensor's feasibility-interval
+lower bound (adjusted for the producer's blocking semantics on
+stage/store). Slice expressions are built from in-scope loop
+vars and tiers; gadgets are thin ISA wrappers that don't loop.
 """
 
-from nkigym.codegen.buffers import find_psum_tensors_needing_sbuf
+from nkigym.codegen.buffers import num_tiles, psum_tile_count, psum_tile_slice
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.kernel_ir import KernelIR, get_tpb
 from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
+from nkigym.kernel_ir.validate import tier_depth_range
 
 
 def build_op_to_group(ir: KernelIR) -> dict[int, int]:
@@ -29,13 +22,28 @@ def build_op_to_group(ir: KernelIR) -> dict[int, int]:
     return result
 
 
+def producer_finished_depth(ir: KernelIR, producer: int, dim_order: list[str]) -> tuple[int, set[str]]:
+    """Return (depth at which the producer op has finished all writes, blocking dims).
+
+    ``depth`` is ``i_min`` — the position of the outermost
+    blocking dim in ``dim_order`` — when the op has blocking
+    dims that overlap ``dim_order``; otherwise ``2 * N`` (the
+    innermost body).
+    """
+    da = ir.dim_analysis
+    op_cls = ir.op_graph.op_classes[producer]
+    blocking = op_blocking_dims(op_cls, da.per_op_axis_maps[producer]) & set(dim_order)
+    depth = min(dim_order.index(d) for d in blocking) if blocking else 2 * len(dim_order)
+    return depth, blocking
+
+
 def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int]) -> DepthPlan:
     """Plan HBM→SBUF loads for every kernel input.
 
-    Returns a per-group injection map ``{group_idx: {depth: [lines]}}``
-    where ``depth`` is an offset within the group's nest (``0`` =
-    before the first block loop, ``N`` = between block/tile phases,
-    ``2N`` = innermost body).
+    Each input tensor is loaded once at the tier-feasibility
+    depth in the group that contains its earliest consumer. The
+    slice written covers every SBUF slot the consumer will read
+    with that tier.
     """
     da = ir.dim_analysis
     graph = ir.op_graph
@@ -48,123 +56,166 @@ def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int]) -> DepthPlan:
             raise ValueError(f"Kernel input {tensor_name!r} has no consumers")
         group_idx = op_to_group[touching[0]]
         dim_order = ir.group_dim_orders[group_idx]
-        depth = _load_depth(ir, tensor_name, tinfo, dim_order)
-        par_ofs, free_ofs = _tensor_offsets(ir, tinfo, dim_order)
-        line = f"load_tensor_block(sbuf_{tensor_name}, {tensor_name}, {par_ofs}, {free_ofs})"
-        plan.setdefault(group_idx, {}).setdefault(depth, []).append(line)
+        depth = _tier_depth(ir, tensor_name, tinfo, dim_order)
+        dst = f"sbuf_{tensor_name}{_sbuf_slice(ir, tensor_name, tinfo, dim_order, depth)}"
+        src = f"{tensor_name}{_hbm_slice(ir, tinfo, dim_order, depth)}"
+        plan.setdefault(group_idx, {}).setdefault(depth, []).append(f"nisa.dma_copy({dst}, {src})")
 
     return plan
 
 
-def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int]) -> tuple[DepthPlan, DepthPlan]:
-    """Plan PSUM→SBUF staging for each PSUM tensor needing SBUF.
-
-    Non-blocking producers stage at depth ``2 * N`` (innermost
-    body). Blocking producers stage at depth ``i_min`` — the
-    smallest position of a blocking dim in the group's
-    ``dim_order``. Under phase-grouped emission, depth ``i_min``
-    sits just outside the outermost blocking dim's block loop,
-    so every blocking dim's loops (block and tile) have iterated.
-    """
+def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> tuple[DepthPlan, DepthPlan]:
+    """Plan PSUM→SBUF staging for each PSUM tensor in *staged*, emitted at ``max(producer_finished_depth, tier_depth)``."""
     da = ir.dim_analysis
     graph = ir.op_graph
     before: DepthPlan = {}
     after: DepthPlan = {}
 
-    for tensor_name in sorted(find_psum_tensors_needing_sbuf(ir)):
+    for tensor_name in sorted(staged):
         producer = graph.producer_op(tensor_name)
         if producer is None:
             continue
         group_idx = op_to_group[producer]
         dim_order = ir.group_dim_orders[group_idx]
-        n = len(dim_order)
-        op_cls = graph.op_classes[producer]
-        axis_map = da.per_op_axis_maps[producer]
-        blocking = op_blocking_dims(op_cls, axis_map) & set(dim_order)
+        tinfo = da.tensors[tensor_name]
 
-        line = f"stage_tensor_block(sbuf_{tensor_name}, psum_{tensor_name})"
-        if blocking:
-            i_min = min(dim_order.index(d) for d in blocking)
-            after.setdefault(group_idx, {}).setdefault(i_min, []).append(line)
-        else:
-            before.setdefault(group_idx, {}).setdefault(2 * n, []).append(line)
+        producer_depth, blocking = producer_finished_depth(ir, producer, dim_order)
+        tier_depth = _tier_depth(ir, tensor_name, tinfo, dim_order)
+        depth = max(producer_depth, tier_depth)
+        uses_after = bool(blocking) and depth == producer_depth
+
+        dst = f"sbuf_{tensor_name}{_sbuf_slice(ir, tensor_name, tinfo, dim_order, depth)}"
+        src = f"psum_{tensor_name}{_psum_slice(ir, tensor_name, tinfo)}"
+        line = f"nisa.tensor_copy({dst}, {src})"
+        (after if uses_after else before).setdefault(group_idx, {}).setdefault(depth, []).append(line)
 
     return before, after
 
 
-def render_hbm_store(ir: KernelIR, op_to_group: dict[int, int]) -> tuple[int, int, str] | None:
-    """Plan the SBUF→HBM store for the return tensor.
-
-    The store is emitted inside the producing group's innermost
-    body (depth ``2 * N``) so the group's loop variables are in
-    scope for the HBM offset expressions. Pass-through kernels
-    (return tensor is a kernel input) need no store.
-    """
+def render_hbm_store(ir: KernelIR, op_to_group: dict[int, int]) -> tuple[DepthPlan, DepthPlan]:
+    """Plan the SBUF→HBM store for the return tensor — into the after-plan when the producer writes PSUM (sequencing after the stage), otherwise before-plan."""
     da = ir.dim_analysis
+    graph = ir.op_graph
     ret = da.return_name
-    producer = ir.op_graph.producer_op(ret)
-    result: tuple[int, int, str] | None = None
+    producer = graph.producer_op(ret)
+    before: DepthPlan = {}
+    after: DepthPlan = {}
     if producer is not None:
         group_idx = op_to_group[producer]
         tinfo = da.tensors[ret]
         dim_order = ir.group_dim_orders[group_idx]
-        par_ofs, free_ofs = _tensor_offsets(ir, tinfo, dim_order)
-        line = f"store_tensor_block({ret}, sbuf_{ret}, {par_ofs}, {free_ofs})"
-        result = (group_idx, 2 * len(dim_order), line)
-    return result
+
+        op_cls = graph.op_classes[producer]
+        if op_cls.ISA_LOC == "psum":
+            producer_depth, _ = producer_finished_depth(ir, producer, dim_order)
+            uses_after = True
+        else:
+            producer_depth = 2 * len(dim_order)
+            uses_after = False
+
+        tier_depth = _tier_depth(ir, ret, tinfo, dim_order)
+        depth = max(producer_depth, tier_depth)
+        dst = f"{ret}{_hbm_slice(ir, tinfo, dim_order, depth)}"
+        src = f"sbuf_{ret}{_sbuf_slice(ir, ret, tinfo, dim_order, depth)}"
+        line = f"nisa.dma_copy({dst}, {src})"
+        (after if uses_after else before).setdefault(group_idx, {}).setdefault(depth, []).append(line)
+    return before, after
 
 
-def _load_depth(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, dim_order: list[str]) -> int:
-    """Compute the depth at which to emit the load for a tensor.
-
-    For each dim ``d`` of ``t`` at position ``i`` in ``dim_order``
-    (group has ``N`` dims): ``per_tile`` requires depth ≥ ``N + i + 1``,
-    ``per_block`` requires depth ≥ ``i + 1``, ``full`` imposes no
-    constraint. Returned depth is the max across relevant dims.
-    Dims not in ``dim_order`` impose no constraint.
-    """
+def _tier_depth(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, dim_order: list[str]) -> int:
+    """Lower bound of the tensor's feasibility interval — ``max`` of each dim's ``tier_depth_range`` low."""
     n = len(dim_order)
     pos = {d: i for i, d in enumerate(dim_order)}
-
-    required = 0
+    lo = 0
     for d in tinfo.dim_ids:
         if d not in pos:
             continue
         tier = ir.tensor_placements[(tensor_name, d)]
-        i = pos[d]
-        if tier == "per_tile":
-            required = max(required, n + i + 1)
-        elif tier == "per_block":
-            required = max(required, i + 1)
-        elif tier == "full":
-            pass
-        else:
-            raise ValueError(f"Unknown placement tier {tier!r} for ({tensor_name}, {d})")
-    return required
+        lo = max(lo, tier_depth_range(tier, pos[d], n)[0])
+    return lo
 
 
-def _tensor_offsets(ir: KernelIR, tinfo: TensorInfo, dim_order: list[str]) -> tuple[str, str]:
-    """Build HBM offset expressions for a tensor's partition and free axes.
-
-    Offsets are built only from loop variables the group owns
-    (``dim_order``). Dims not in the group's nest contribute
-    ``0`` — the tensor is invariant over them at this scope.
-    """
-    par_ofs = _dim_offset(tinfo.dim_ids[0], ir, dim_order)
-    if len(tinfo.dim_ids) == 2:
-        free_ofs = _dim_offset(tinfo.dim_ids[1], ir, dim_order)
+def _sbuf_slice(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, dim_order: list[str], depth: int) -> str:
+    """Slice into an SBUF ``(phys_p, num_tiles_p, num_tiles_f, phys_f)`` (or 2D) buffer covering the portion active at ``depth``."""
+    da = ir.dim_analysis
+    dim_ids = tinfo.dim_ids
+    if len(dim_ids) == 2:
+        d_p, d_f = dim_ids
+        tp = da.dims[d_p].physical_tile_size
+        tf = da.dims[d_f].physical_tile_size
+        p_idx = _sbuf_axis_index(ir, tensor_name, d_p, dim_order, depth)
+        f_idx = _sbuf_axis_index(ir, tensor_name, d_f, dim_order, depth)
+        expr = f"[0:{tp}, {p_idx}, {f_idx}, 0:{tf}]"
     else:
-        free_ofs = "0"
-    return par_ofs, free_ofs
-
-
-def _dim_offset(dim_id: str, ir: KernelIR, dim_order: list[str]) -> str:
-    """Build the HBM offset expression for one dim, if the group loops over it."""
-    expr = "0"
-    if dim_id in dim_order:
-        di = ir.dim_analysis.dims[dim_id]
-        tpb = get_tpb(ir, dim_id)
-        logical = di.logical_tile_size
-        block_stride = tpb * logical
-        expr = f"i_block_{dim_id} * {block_stride} + i_ltile_{dim_id} * {logical}"
+        d_p = dim_ids[0]
+        tp = da.dims[d_p].physical_tile_size
+        p_idx = _sbuf_axis_index(ir, tensor_name, d_p, dim_order, depth)
+        expr = f"[0:{tp}, {p_idx}]"
     return expr
+
+
+def _sbuf_axis_index(ir: KernelIR, tensor_name: str, dim_id: str, dim_order: list[str], depth: int) -> str:
+    """Per-dim ``num_tiles`` index into an SBUF buffer — ``0``, ``0:slots``, or a loop-var expression depending on tier and the loops in scope at ``depth``."""
+    slots = num_tiles(ir, tensor_name, dim_id)
+    if slots == 1:
+        idx = "0"
+    elif dim_id not in dim_order:
+        idx = f"0:{slots}"
+    else:
+        n = len(dim_order)
+        i = dim_order.index(dim_id)
+        tier = ir.tensor_placements[(tensor_name, dim_id)]
+        tpb = get_tpb(ir, dim_id)
+        num_ptiles = ir.dim_analysis.dims[dim_id].num_ptiles
+        block_active = depth > i
+        tile_active = depth > n + i
+        if tier == "full":
+            idx = (
+                f"i_block_{dim_id} * {tpb * num_ptiles} + i_ltile_{dim_id} * {num_ptiles}"
+                if block_active
+                else f"0:{slots}"
+            )
+        elif tier == "per_block":
+            idx = f"i_ltile_{dim_id} * {num_ptiles}" if tile_active else f"0:{tpb * num_ptiles}"
+        else:
+            idx = "0"
+    return idx
+
+
+def _hbm_slice(ir: KernelIR, tinfo: TensorInfo, dim_order: list[str], depth: int) -> str:
+    """HBM slice covering the in-flight portion of the tensor.
+
+    Each axis is ``start:end`` built from loop vars in scope at
+    ``depth`` and the tier on that dim.
+    """
+    dim_ids = tinfo.dim_ids
+    par = _hbm_axis_range(ir, dim_ids[0], dim_order, depth)
+    if len(dim_ids) == 2:
+        free = _hbm_axis_range(ir, dim_ids[1], dim_order, depth)
+        expr = f"[{par}, {free}]"
+    else:
+        expr = f"[{par}]"
+    return expr
+
+
+def _hbm_axis_range(ir: KernelIR, dim_id: str, dim_order: list[str], depth: int) -> str:
+    """HBM ``start:end`` range for one dim, derived from loop vars in scope at ``depth``."""
+    di = ir.dim_analysis.dims[dim_id]
+    logical = di.logical_tile_size
+    block_stride = get_tpb(ir, dim_id) * logical
+
+    if dim_id not in dim_order or depth <= dim_order.index(dim_id):
+        rng = f"0:{di.dim_size}"
+    elif depth <= len(dim_order) + dim_order.index(dim_id):
+        start = f"i_block_{dim_id} * {block_stride}"
+        rng = f"{start}:{start} + {block_stride}"
+    else:
+        start = f"i_block_{dim_id} * {block_stride} + i_ltile_{dim_id} * {logical}"
+        rng = f"{start}:{start} + {logical}"
+    return rng
+
+
+def _psum_slice(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> str:
+    """Slice into a PSUM allocation at list index 0 (stage reads the first tile each iteration)."""
+    tile = psum_tile_slice(ir, tensor_name, tinfo)
+    return tile if psum_tile_count(ir, tensor_name, tinfo) == 1 else f"[0]{tile}"

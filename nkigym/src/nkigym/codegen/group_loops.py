@@ -109,7 +109,8 @@ def _render_group(
         lines.append("    " * (base_indent + n + i) + f"for i_ltile_{dim_id} in range({tpb_by_dim[dim_id]}):")
         inject(before_lines, n + i + 1)
 
-    lines.append("    " * (base_indent + 2 * n) + "pass")
+    if not before_lines.get(2 * n):
+        lines.append("    " * (base_indent + 2 * n) + "pass")
 
     for i in reversed(range(n)):
         inject(after_lines, n + i)

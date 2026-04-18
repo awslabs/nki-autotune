@@ -49,6 +49,11 @@ class DimInfo:
     physical_tile_size: int
     is_blocking: bool
 
+    @property
+    def num_ptiles(self) -> int:
+        """Physical tiles per logical tile: ``logical_tile_size // physical_tile_size``."""
+        return self.logical_tile_size // self.physical_tile_size
+
 
 @dataclass
 class TensorInfo:
@@ -103,7 +108,7 @@ class DimAnalysis:
         headers = ["dim", "size", "logical", "physical", "phys/logical", "type"]
         rows: list[list[str]] = []
         for dim_id, di in self.dims.items():
-            num_physical = di.logical_tile_size // di.physical_tile_size
+            num_physical = di.num_ptiles
             rows.append(
                 [
                     dim_id,

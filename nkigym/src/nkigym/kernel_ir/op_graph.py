@@ -4,7 +4,7 @@ Usage::
 
     from nkigym.kernel_ir.op_graph import build_op_graph
 
-    graph = build_op_graph(my_math_func)
+    graph = build_op_graph(my_math_func, input_specs)
     print(graph)
 """
 
@@ -17,6 +17,7 @@ import graphviz
 import numpy as np
 
 from nkigym.kernel_ir.parse import find_ops
+from nkigym.kernel_ir.trace import trace_scalar_kwargs
 from nkigym.ops.base import NKIOp
 
 
@@ -45,6 +46,12 @@ class OpGraph:
     op_tensors: list[tuple[dict[str, str], list[str]]]
     op_all_kwargs: list[dict[str, str]]
 
+    def __post_init__(self) -> None:
+        """Build the tensor→producer-op-index cache."""
+        self._producer_cache: dict[str, int] = {
+            name: op_idx for op_idx, (_inputs, outputs) in enumerate(self.op_tensors) for name in outputs
+        }
+
     def __repr__(self) -> str:
         """Return summary string with node and edge counts."""
         return f"OpGraph({len(self.op_classes)} nodes, {len(self.edges)} edges)"
@@ -60,12 +67,7 @@ class OpGraph:
 
     def producer_op(self, tensor_name: str) -> int | None:
         """Return the op index that produces *tensor_name*, or None if it is a kernel input."""
-        producer: int | None = None
-        for op_idx, (_inputs, outputs) in enumerate(self.op_tensors):
-            if tensor_name in outputs:
-                producer = op_idx
-                break
-        return producer
+        return self._producer_cache.get(tensor_name)
 
     def producer_isa_loc(self, tensor_name: str) -> str | None:
         """Return the ISA_LOC of the op producing *tensor_name*, or None if it is a kernel input."""
@@ -140,19 +142,30 @@ class OpGraph:
         return out.with_suffix(".png")
 
 
-def build_op_graph(func: Callable[..., np.ndarray]) -> OpGraph:
+def build_op_graph(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> OpGraph:
     """Build an OpGraph from a math function.
 
     Parses the function's NKIOp calls and constructs the DAG
-    from producer-consumer tensor relationships.
+    from producer-consumer tensor relationships. The function is
+    also traced once against dummy numpy inputs so non-tensor
+    scalar kwargs are captured as concrete literals (e.g.
+    ``1.0 / k`` where ``k`` is a local of the math function)
+    rather than as AST source strings.
 
     Args:
         func: Math function using NKIOp classes.
+        input_specs: ``{param_name: (shape, dtype)}`` matching the
+            math function's signature; used for scalar-kwarg
+            tracing.
 
     Returns:
         The computation DAG.
     """
     ops, _ = find_ops(func)
+
+    traced = trace_scalar_kwargs(func, input_specs)
+    if len(traced) != len(ops):
+        raise ValueError(f"Traced {len(traced)} op calls but AST found {len(ops)}")
 
     op_classes_list: list[type[NKIOp]] = []
     edges: list[tuple[int, int, str, str]] = []
@@ -162,7 +175,10 @@ def build_op_graph(func: Callable[..., np.ndarray]) -> OpGraph:
 
     for i, (op_cls, name_kwargs, output_names, all_kwargs) in enumerate(ops):
         op_classes_list.append(op_cls)
-        op_all_kwargs.append(all_kwargs)
+        kwargs = dict(all_kwargs)
+        for kw_name, literal in traced[i].items():
+            kwargs[kw_name] = literal
+        op_all_kwargs.append(kwargs)
 
         inputs: dict[str, str] = {}
         for role, var_name in name_kwargs.items():
