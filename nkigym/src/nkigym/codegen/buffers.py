@@ -43,45 +43,35 @@ _DTYPE_BYTES = {
 }
 
 
-def render_persistent_sbuf_buffers(
-    ir: KernelIR, indent: int, staged: set[str], tensor_to_groups: dict[str, set[int]]
-) -> str:
-    """Emit kernel-top SBUF allocations for tensors shared across fusion groups.
+def render_sbuf_buffers(ir: KernelIR, staged: set[str], tensor_to_groups: dict[str, set[int]]) -> dict[int, list[str]]:
+    """Emit SBUF declarations keyed by the fusion group at whose top they appear.
 
-    A tensor is persistent when two or more fusion groups touch
-    it (via op inputs or outputs). Persistent tensors get low
-    addresses starting at 0 and stay pinned for the whole kernel.
+    Each SBUF tensor is declared at depth 0 of the first fusion
+    group (in toposort order) that touches it. Persistent tensors
+    (touched by 2+ groups) occupy low byte offsets that stay
+    pinned for the rest of the kernel because the NKI compiler
+    honors the explicit address verbatim. Per-FG tensors (touched
+    by exactly one group) stack after the persistent range inside
+    that group — per-FG regions overlap across groups so the
+    compiler reuses the same addresses for tensors local to
+    different groups.
     """
-    lines: list[str] = []
-    pad = "    " * indent
-    offset = 0
-    for name, tinfo in _persistent_sbuf_tensors(ir, staged, tensor_to_groups):
-        lines.append(_sbuf_line(ir, name, tinfo, pad, offset))
-        offset += _sbuf_bytes(ir, name, tinfo)
-    return "\n".join(lines)
-
-
-def render_per_group_sbuf_buffers(
-    ir: KernelIR, staged: set[str], tensor_to_groups: dict[str, set[int]]
-) -> dict[int, list[str]]:
-    """Emit per-FG SBUF declarations keyed by group index.
-
-    Each group's declarations live at depth 0 and start at the
-    byte offset just past the persistent range — per-FG regions
-    overlap across groups so the compiler reuses the same SBUF
-    addresses for tensors local to different groups.
-    """
-    by_group: dict[int, list[str]] = {}
+    by_group: dict[int, list[str]] = {gi: [] for gi in range(len(ir.fusion_groups))}
+    order = ir.op_graph.toposort_groups([g.op_indices for g in ir.fusion_groups])
+    group_rank = {gi: rank for rank, gi in enumerate(order)}
+    persistent_offset = 0
     persistent_end = sum(
         _sbuf_bytes(ir, name, tinfo) for name, tinfo in _persistent_sbuf_tensors(ir, staged, tensor_to_groups)
     )
+    for name, tinfo in _persistent_sbuf_tensors(ir, staged, tensor_to_groups):
+        first_gi = min(tensor_to_groups[name], key=lambda gi: group_rank[gi])
+        by_group[first_gi].append(_sbuf_line(ir, name, tinfo, pad="", offset=persistent_offset))
+        persistent_offset += _sbuf_bytes(ir, name, tinfo)
     for group_idx, names in _per_group_sbuf_tensors(ir, staged, tensor_to_groups).items():
-        lines: list[str] = []
         offset = persistent_end
         for name, tinfo in names:
-            lines.append(_sbuf_line(ir, name, tinfo, pad="", offset=offset))
+            by_group[group_idx].append(_sbuf_line(ir, name, tinfo, pad="", offset=offset))
             offset += _sbuf_bytes(ir, name, tinfo)
-        by_group[group_idx] = lines
     return by_group
 
 

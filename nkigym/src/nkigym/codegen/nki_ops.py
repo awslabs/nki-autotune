@@ -97,7 +97,7 @@ def _ptile_stage_lines(
         tinfo = da.tensors[oname]
         sbuf_idx = sbuf_ptile_slice(ir, group_idx, oname, tinfo, dim_order, ptile_set)
         psum_idx = psum_tile_slice(ir, oname, tinfo)
-        lines.append(f"nisa.tensor_copy(sbuf_{oname}{sbuf_idx}, psum_{oname}{psum_idx})")
+        lines.append(f"stage_block(sbuf_{oname}{sbuf_idx}, psum_{oname}{psum_idx})")
     return lines
 
 

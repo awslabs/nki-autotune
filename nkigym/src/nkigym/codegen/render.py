@@ -3,9 +3,8 @@
 from nkigym.codegen.buffers import (
     build_tensor_to_groups,
     find_psum_tensors_needing_sbuf,
-    render_per_group_sbuf_buffers,
-    render_persistent_sbuf_buffers,
     render_psum_allocations,
+    render_sbuf_buffers,
 )
 from nkigym.codegen.dma import build_op_to_group, render_hbm_loads, render_hbm_store, render_psum_staging
 from nkigym.codegen.group_loops import DepthPlan, render_group_loops
@@ -17,26 +16,28 @@ from nkigym.kernel_ir import KernelIR
 def render_ir(ir: KernelIR) -> str:
     """Lower a KernelIR to NKI source code.
 
-    Emits: header, persistent SBUF allocations (tensors touched by
-    2+ fusion groups, pinned at low addresses), one sibling loop
-    nest per fusion group. Each group's nest starts with per-FG
-    SBUF and PSUM declarations — SBUF starts at the byte offset
-    past the persistent range (so FGs overlap and reuse those
-    bytes); PSUM packs into bank-aligned offsets starting at 0
-    within the group so banks are recycled across groups. PSUM
-    memsets for blocking producers still fire at the outermost
-    blocking loop depth so the accumulator is re-zeroed each
-    output tile. HBM→SBUF loads fire at per-dim derived depths;
-    ISA calls sit at the innermost body; PSUM→SBUF staging lands
-    after the outermost blocking loop closes for blocking
-    producers (innermost body otherwise); and an SBUF→HBM store
-    fires at the producing group's deepest depth.
+    Emits: header, then one sibling loop nest per fusion group.
+    Each group's nest opens with buffer declarations at depth 0 —
+    first any persistent SBUF tensors (touched by 2+ groups, whose
+    first user is this group), then per-FG SBUF tensors (local to
+    this group, stacked after the persistent range), then all
+    PSUM buffers produced in this group (bank-aligned offsets
+    starting at 0 per group). Persistent addresses stay pinned for
+    the kernel lifetime because NKI honors the explicit
+    ``address=`` verbatim; per-FG SBUF regions overlap across
+    groups so the compiler reuses those bytes. PSUM memsets for
+    blocking producers still fire at the outermost blocking loop
+    depth so the accumulator is re-zeroed each output tile.
+    HBM→SBUF loads fire at per-dim derived depths; ISA calls sit
+    at the innermost body; PSUM→SBUF staging lands after the
+    outermost blocking loop closes for blocking producers
+    (innermost body otherwise); and an SBUF→HBM store fires at
+    the producing group's deepest depth.
     """
     op_to_group = build_op_to_group(ir)
     tensor_to_groups = build_tensor_to_groups(ir)
     staged = find_psum_tensors_needing_sbuf(ir)
     header = render_header(ir.dim_analysis)
-    buffers = render_persistent_sbuf_buffers(ir, indent=1, staged=staged, tensor_to_groups=tensor_to_groups)
 
     before_plan: DepthPlan = render_hbm_loads(ir, op_to_group)
     _merge(before_plan, render_nki_ops(ir, op_to_group, staged))
@@ -47,18 +48,17 @@ def render_ir(ir: KernelIR) -> str:
     _merge(before_plan, store_before)
     _merge(staging_after, store_after)
 
-    per_group_sbuf = render_per_group_sbuf_buffers(ir, staged=staged, tensor_to_groups=tensor_to_groups)
+    sbuf_by_group = render_sbuf_buffers(ir, staged=staged, tensor_to_groups=tensor_to_groups)
     psum_allocs = render_psum_allocations(ir, op_to_group)
     for group_idx in range(len(ir.fusion_groups)):
-        group_top = per_group_sbuf.get(group_idx, []) + psum_allocs.get(group_idx, [])
+        group_top = sbuf_by_group.get(group_idx, []) + psum_allocs.get(group_idx, [])
         if group_top:
             before_plan.setdefault(group_idx, {}).setdefault(0, [])[:0] = group_top
 
     group_src = render_group_loops(ir, body_indent=1, before_plan=before_plan, after_plan=staging_after)
     ret = render_return(ir.dim_analysis)
 
-    parts = [header, buffers, group_src, ret]
-    return "\n".join(parts) + "\n"
+    return "\n".join([header, group_src, ret]) + "\n"
 
 
 def _merge(dst: DepthPlan, src: DepthPlan) -> None:

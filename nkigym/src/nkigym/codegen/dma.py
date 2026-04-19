@@ -256,7 +256,7 @@ def _sbuf_axis_index(
         i = dim_order.index(dim_id)
         expr = _slot_range(tier, dim_id, i, n, depth, tpb, num_ptiles, slots, dim_id in ptile_dims)
     elif dim_id in ptile_dims:
-        expr = f"i_ptile_{dim_id}"
+        expr = f"i_ptile_{dim_id}:i_ptile_{dim_id} + 1"
     return expr
 
 
@@ -281,15 +281,15 @@ def _slot_range(
         start = f"i_ltile_{dim_id} * {num_ptiles}"
         expr = _narrow_or_range(start, num_ptiles, ptile, dim_id)
     elif tier == "per_tile":
-        expr = f"i_ptile_{dim_id}" if ptile else f"0:{num_ptiles}"
+        expr = f"i_ptile_{dim_id}:i_ptile_{dim_id} + 1" if ptile else f"0:{num_ptiles}"
     else:
         expr = f"0:{slots}"
     return expr
 
 
 def _narrow_or_range(start: str, width: int, ptile: bool, dim_id: str) -> str:
-    """Return either a single-slot ``start + i_ptile_{d}`` or the full ``start:start + width`` range."""
-    return f"{start} + i_ptile_{dim_id}" if ptile else f"{start}:{start} + {width}"
+    """Return either a single-slot range ``start + i_ptile_{d} : start + i_ptile_{d} + 1`` or the full ``start:start + width`` range."""
+    return f"{start} + i_ptile_{dim_id}:{start} + i_ptile_{dim_id} + 1" if ptile else f"{start}:{start} + {width}"
 
 
 def _hbm_slice(ir: KernelIR, tinfo: TensorInfo, dim_order: list[str], depth: int) -> str:

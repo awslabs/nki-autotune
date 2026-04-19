@@ -6,16 +6,7 @@ from nkigym.codegen import gadgets
 from nkigym.kernel_ir.dim_analysis import DimAnalysis
 
 _INLINED_GADGETS = "\n\n".join(
-    inspect.getsource(fn)
-    for fn in (
-        gadgets.load_block,
-        gadgets.stage_block,
-        gadgets.store_block,
-        gadgets._is_single_tile,
-        gadgets._stage_single,
-        gadgets._stage_along_partition,
-        gadgets._stage_along_free,
-    )
+    inspect.getsource(fn) for fn in (gadgets.load_block, gadgets.stage_block, gadgets.store_block)
 )
 
 
