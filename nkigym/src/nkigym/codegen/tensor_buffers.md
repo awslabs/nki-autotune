@@ -2,144 +2,112 @@
 
 This pass emits on-chip (SBUF / PSUM) buffer allocations for every tensor the kernel touches. Every shape and every dtype is derived from KernelIR — no new decisions happen here.
 
-### Inputs
+### Model: list-of-2D-tiles SBUF
 
-Two KernelIR fields are consumed jointly; each answers half of a shape question:
+Every SBUF buffer is a **nested Python list** `sbuf_X[NP_list][NF_list]` where each leaf is a 2D `nl.ndarray(phys_P, leaf_F)`. This mirrors the PSUM model (a 2D `nl.ndarray` optionally wrapped in a Python list of tiles) and matches the nkilib reference style of multi-buffered SBUF regions modeled as list indirection.
 
-- **`tensor_placements[(tensor, dim)]`** — per-dim tier (`per_tile` / `per_block` / `full`). See `kernel_ir/load_placement.md`. Determines how many logical tiles along `dim` the buffer must hold (`tpb_factor × blocks_factor`).
-- **`buffer_degrees[(tensor, dim)]`** — per-dim pipelining multiplier. See `kernel_ir/multi_buffer.md`. Determines how many rotating copies of the above the buffer must hold.
+The resulting invariant: **every ISA operand and every gadget call operates on a genuine 2D memref** — no 4D reshape tricks, no affine-select 4D-AP rejection, no partition striding hidden inside a slice.
 
-Both share the `(tensor, dim)` key space and are read together in `_compute_num_tiles`. Two other KernelIR pieces feed the pass:
+### Factors
 
-- **`dim_analysis.dims[dim]`** — `logical_tile_size`, `physical_tile_size`, `dim_size`.
-- **`dim_analysis.op_tile_sizes[op_idx]`** — per-op tile size per dim (`max_op_tile` over the ops touching the tensor tells us the largest slice any consumer pulls in one ISA call).
+Each axis of an SBUF buffer carries four factors whose product is the total number of physical tiles along that axis:
 
-Two op-graph pieces decide *kind* of buffer:
+`num_tiles = multi_buffer × num_blocks × ltiles_per_block × ptiles_per_ltile`
 
-- **`op_graph.producer_isa_loc(tensor)`** — `"psum"` or `"sbuf"` (or `None` for HBM inputs). Chooses whether the primary allocation is `psum_{name}` or `sbuf_{name}`.
-- **`op_classes[consumer_idx].INPUT_LOCS[role]`** — whether each consumer needs SBUF for its operand. Drives PSUM→SBUF staging buffers.
+| Factor               | Meaning                                                        | Source                                      |
+|----------------------|----------------------------------------------------------------|---------------------------------------------|
+| `multi_buffer`       | extra slots for pipelining (double-buffer etc.)                | `buffer_degrees[("sbuf", t, d)]`            |
+| `num_blocks`         | outer block iterations kept resident                           | `dim_size / (ltiles_per_block × logical)` when tier = `full`, else 1 |
+| `ltiles_per_block`   | logical tiles kept resident per outer block                    | `ir.ltiles_per_block[d]` when tier ≥ `per_block`, else 1 |
+| `ptiles_per_ltile`   | physical tiles inside one logical tile (the ISA-call unit)     | `max_op_tile(t, d) / physical_tile_size(d)` |
 
-### Algorithm
+**Where each factor materializes** differs by axis:
 
-Walk every tensor in `dim_analysis.tensors` once. For each:
+* **Partition axis:** all four factors become Python-list levels. The leaf's P size is always `phys_P = 128` (the full hardware partition block); there is no ptile slice inside the leaf.
+* **Free axis:** the outer three factors become Python-list levels; `ptiles_per_ltile` is absorbed into the leaf's free size (`leaf_F = phys_F × ptiles_per_ltile`).
 
-1. **Classify.** Look up `producer_isa_loc(name)`:
-   - `None` (HBM input) → emit `sbuf_{name}` only.
-   - `"sbuf"` → emit `sbuf_{name}` only.
-   - `"psum"` → emit `psum_{name}`; if staging is needed (see step 3), also emit `sbuf_{name}`.
-2. **Shape.** Compute `num_tiles(t, d)` per dim using the `_compute_num_tiles` formula. 2D tensors map to a 4D SBUF layout `(phys_P, num_tiles_P, num_tiles_F, phys_F)`; 1D tensors map to 2D `(phys_P, num_tiles_P)`. PSUM buffers use 2D single-tile allocations, wrapped in a Python list when any `num_tiles > 1`.
-3. **Stage.** A PSUM tensor needs an SBUF staging sibling when any consumer's `INPUT_LOCS[role] == "sbuf"` for the operand that reads it, *or* when the tensor is the kernel's return (needs `dma_copy` to HBM, which reads SBUF). Staging buffer shape equals the PSUM shape (both map the same tile geometry).
-4. **Dtype.** PSUM buffer dtype comes from the producing op's `PSUM_DTYPE` if set (nc_matmul → `float32`), else the tensor's own dtype. SBUF buffers always use the tensor's dtype.
+1D logical tensors are lifted to 2D with `f.phys = 1` and every free-axis factor set to 1. Every access still produces a 2D `(phys_P, 1)` memref.
 
-The algorithm is tensor-ordered (not op-ordered). Each tensor's buffer shape only depends on fields keyed by that tensor, so the walk is independent per tensor — no producer-before-consumer ordering is needed at this stage.
+### Classes
 
-### Shape Formula
+Defined in `codegen/sbuf_buffer.py`:
 
-Per dim, `num_tiles` is a plain multiplicative composition of the two fields plus hardware geometry:
+* `SbufAxis(phys, ptiles_per_ltile, ltiles_per_block, num_blocks, multi_buffer, leaf_includes_ptile)` — the four factors plus the bit that says whether ptile lives inside the leaf (F axis) or at list level (P axis). Derived properties: `list_slots`, `logical`, `num_tiles`.
+* `SbufBuffer(name, dtype, p, f)` — two axes + name + dtype. Emits allocation via `alloc_line()`, per-tile access via `get_tile(AxisAccess, AxisAccess)`, gadget sub-block bounds via `range(AxisAccess, AxisAccess)`.
+* `AxisAccess(block, ltile, ptile)` — per-axis binding for indexed access. Each field is either a string expression (bound to a loop var) or `None` (span the full factor's range for `range()`, or require-bound for `get_tile()`).
 
-$$\text{num\_tiles}(t, d) = \text{num\_ptiles}(t, d) \times \text{tpb\_factor}(t, d) \times \text{blocks\_factor}(t, d) \times \text{buffer\_degrees}[(t, d)]$$
+Construction: `build_sbuf_buffer(ir, tensor_name, dtype)` decomposes `num_tiles` on each dim into the four factors based on the tensor's tier and the op graph.
 
-with:
-- `num_ptiles(t, d) = max_op_tile(t, d) / physical_tile_size(d)` — hardware-forced multi-tile when any op reads more than one physical tile per call.
-- `tpb_factor`, `blocks_factor` from `tensor_placements[(t, d)]`:
+### Allocation
 
-| tier        | `tpb_factor` | `blocks_factor`                    |
-|-------------|--------------|------------------------------------|
-| `per_tile`  | 1            | 1                                  |
-| `per_block` | `tpb`        | 1                                  |
-| `full`      | `tpb`        | `dim_size / (tpb × logical_tile)`  |
+2D logical tensors emit
 
-Default (`per_tile`, degree 1) collapses to `num_tiles = num_ptiles` — usually 1 except on dims where physical < logical (see the d2 attention example below).
+```python
+sbuf_X = [[nl.ndarray((p.logical, f.logical), dtype=..., buffer=nl.sbuf)
+           for _ in range(f.list_slots)]
+          for _ in range(p.list_slots)]
+```
 
-### Layouts
+1D logical tensors emit the same shape with `f.phys = 1`, `f.ptiles_per_ltile = 1`, so the leaf is `(phys_P, 1)`.
 
-**SBUF, 2D tensor.** One `nl.ndarray` with shape `(phys_P, num_tiles_P, num_tiles_F, phys_F)`. Ops slice by setting indices on axes 1 and 2.
+### Dtype promotion
 
-**SBUF, 1D tensor.** One `nl.ndarray` with shape `(phys_P, num_tiles_P)`.
+`sbuf_dtype(ir, name, tinfo)` promotes the buffer dtype to `float32` when any consumer reads the tensor via a `FLOAT32_KWARGS` role (`operand0`/`operand1` on `tensor_scalar`; `scale` on `activation` / `activation_reduce`). NKI hardware rejects bf16/fp16 for those roles regardless of the data-tile's dtype.
 
-**PSUM, 2D tensor.** PSUM hardware constrains each allocation to one 2D tile `(phys_P, phys_F)`. When `num_tiles_P × num_tiles_F == 1`, emit a single `nl.ndarray`. Otherwise emit a Python list of `num_tiles_P × num_tiles_F` tiles; ops index with a flat `[i_p * num_tiles_F + i_f]` and then a tile-local `[0:phys_P, 0:phys_F]`.
+### PSUM
 
-**PSUM, 1D tensor.** Not produced by any current op — PSUM outputs come from matmul/transpose which are always 2D. No layout defined.
-
-### Naming
-
-- `sbuf_{tensor_name}` for SBUF (including staging buffers for PSUM producers).
-- `psum_{tensor_name}` for PSUM.
+PSUM allocation keeps the existing flat-2D model: one `nl.ndarray((phys_P, phys_F))` per tile, wrapped in a Python list of length `psum_tile_count` when the producer materializes more than one tile concurrently. Multi-D PSUM ndarrays tripped spurious reshape failures in the NKI simulator; keeping PSUM flat sidesteps that.
 
 ### Placement in the Emitted Source
 
-*Where* in the loop nest each allocation sits is decided by the allocation-depth derivation described in `kernel_ir/load_placement.md`. In the default lowering (all `per_tile`, all degrees 1), every tensor's $B$ set is empty → every allocation sits at the top of the kernel body, before the per-group sibling loop nests. This section only specifies *what* to allocate; the render pass decides *where*.
+*Where* in the loop nest each allocation sits is decided by the allocation-depth logic in `kernel_ir/load_placement.md`. In the default lowering (all `per_tile`, all degrees 1), every tensor's allocation sits at the top of its owning fusion group's loop nest. This section specifies *what* to allocate; the render pass decides *where*.
 
-### Example: Attention (Default)
+### Access
 
-With `seq_q = seq_k = 2048, d_k = d_v = 128`, dim geometry:
+ISA ops access one physical tile via `SbufBuffer.get_tile(AxisAccess, AxisAccess)`, which emits
 
-| dim | size | logical | physical | num_ptiles | is_blocking |
-|-----|------|---------|----------|------------|-------------|
-| d0  | 2048 | 128     | 128      | 1          | yes         |
-| d1  | 128  | 128     | 128      | 1          | no          |
-| d2  | 2048 | 512     | 128      | 4          | no          |
-| d4  | 128  | 128     | 128      | 1          | yes         |
-
-All tiers `per_tile`, all degrees 1, so `num_tiles = num_ptiles` everywhere. Walking the 15 tensors in the order they arise from the op graph:
-
-| tensor     | producer ISA_LOC | dims     | num_tiles | dtype    | staging needed? |
-|------------|------------------|----------|-----------|----------|-----------------|
-| Q          | (HBM input)      | (d0, d1) | (1, 1)    | bfloat16 | —               |
-| K          | (HBM input)      | (d2, d1) | (4, 1)    | bfloat16 | —               |
-| V          | (HBM input)      | (d2, d4) | (4, 1)    | bfloat16 | —               |
-| Q_t        | psum             | (d1, d0) | (1, 1)    | bfloat16 | yes (matmul)    |
-| K_t        | psum             | (d1, d2) | (1, 4)    | bfloat16 | yes (matmul)    |
-| S          | psum             | (d0, d2) | (1, 4)    | float32  | yes (affine)    |
-| masked_S   | sbuf             | (d0, d2) | (1, 4)    | bfloat16 | —               |
-| scaled_S   | sbuf             | (d0, d2) | (1, 4)    | bfloat16 | —               |
-| neg_max    | sbuf             | (d0,)    | (1,)      | bfloat16 | —               |
-| exp_S      | sbuf             | (d0, d2) | (1, 4)    | bfloat16 | —               |
-| sum_exp    | sbuf             | (d0,)    | (1,)      | bfloat16 | —               |
-| inv_sum    | sbuf             | (d0,)    | (1,)      | bfloat16 | —               |
-| exp_S_t    | psum             | (d2, d0) | (4, 1)    | bfloat16 | yes (matmul)    |
-| attn       | psum             | (d0, d4) | (1, 1)    | float32  | yes (scalar)    |
-| output     | sbuf             | (d0, d4) | (1, 1)    | bfloat16 | yes (return)    |
-
-PSUM dtype override: matmul outputs (`S`, `attn`) get `float32` from `PSUM_DTYPE`; transpose outputs (`Q_t`, `K_t`, `exp_S_t`) keep the tensor's own `bfloat16`.
-
-Emitted allocations (walking the table in order; staging buffer emitted immediately after its PSUM parent):
-
-```python
-sbuf_Q = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-sbuf_K = nl.ndarray((128, 4, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-sbuf_V = nl.ndarray((128, 4, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-psum_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.psum)
-sbuf_Q_t = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-psum_K_t = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.psum)
-sbuf_K_t = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-psum_S = nl.ndarray((128, 1, 4, 128), dtype=nl.float32, buffer=nl.psum)
-sbuf_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-sbuf_masked_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-sbuf_scaled_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-sbuf_neg_max = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
-sbuf_exp_S = nl.ndarray((128, 1, 4, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-sbuf_sum_exp = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
-sbuf_inv_sum = nl.ndarray((128, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
-psum_exp_S_t = nl.ndarray((128, 4, 1, 128), dtype=nl.bfloat16, buffer=nl.psum)
-sbuf_exp_S_t = nl.ndarray((128, 4, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-psum_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.float32, buffer=nl.psum)
-sbuf_attn = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-sbuf_output = nl.ndarray((128, 1, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
+```
+sbuf_X[p_list_idx][f_list_idx][0:p.logical, f_start:f_end]
 ```
 
-(PSUM layouts stay 4D here because every `num_tiles` product ≤ 4 fits the `nl.ndarray`-with-broadcast convention; when a transform pushes totals past the single-tile form, PSUM falls back to the Python-list-of-tiles layout per §Layouts.)
+* `p_list_idx` and `f_list_idx` are collapsed list-level expressions. On the P axis, `ptile` participates in this collapse (because it's a list level on P). On the F axis, `ptile` is always unbound here and the inner slice covers one leaf.
+* `f_start:f_end` is either one physical-tile slice (`f.ptile = i_ptile_{d}`, a `phys_F`-wide range) or the whole leaf (`f.ptile = None`, range `0:f.logical`).
 
-### Example: Attention with One Placement Change
+DMA gadgets (`load_block`, `stage_block`, `store_block`) take the whole buffer + `p_start, p_count, f_start, f_count` and Python-iterate per leaf; each inner call is a 2D memref access. See `codegen/dma.md`.
 
-`tensor_placements[("K", "d2")] = "full"`, all degrees still 1. `blocks_factor_d2 = 2048 / (1 × 512) = 4`, so `num_tiles_d2(K) = 1 × 1 × 4 × 1 = 4`. `sbuf_K` grows from `(128, 4, 1, 128)` to `(128, 4, 4, 128)` — num_tiles on d2 grows from 1 to 4. No other buffer changes: `K_t`, `S`, and downstream tensors are unaffected because their own `tensor_placements` entries are still `per_tile` (they cover d2 under their own keys, not K's).
+### Example: Attention CPU (`seq_q = seq_k = 512, d_k = d_v = 128`, default tiers)
 
-Feasibility against `group_dim_orders` (per-group, not global) is checked upstream; `render_buffers` just consumes the result. If the transform produced an infeasible assignment against any group's dim_order, the joint check in `transforms/load_placement.py` would have rejected it before reaching this pass.
+Dim geometry:
+
+| dim | size | logical | physical | ptiles_per_ltile |
+|-----|------|---------|----------|------------------|
+| d0  | 512  | 128     | 128      | 1                |
+| d1  | 128  | 128     | 128      | 1                |
+| d2  | 512  | 512     | 128      | 4                |
+| d4  | 128  | 128     | 128      | 1                |
+
+All tiers `per_tile`, all degrees 1 → `ltiles_per_block = num_blocks = multi_buffer = 1` everywhere. Only `ptiles_per_ltile` differs from 1 (on d2).
+
+Sample allocations:
+
+```python
+sbuf_Q   = [[nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)] for _ in range(1)]
+sbuf_K   = [[nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)] for _ in range(4)]
+sbuf_Q_t = [[nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(4)] for _ in range(1)]
+sbuf_K_t = [[nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)] for _ in range(1)]
+sbuf_S   = [[nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)] for _ in range(4)]
+sbuf_inv_sum = [[nl.ndarray((128, 1), dtype=nl.float32,  buffer=nl.sbuf) for _ in range(1)] for _ in range(4)]
+```
+
+Notes:
+* `sbuf_Q_t` has P dim = d1 (phys=128, ptiles=1) and F dim = d0 (phys=128, ptiles=4 via the upstream matmul's M limit). Leaf F = `128 × 4 = 512`… wait — `Q_t` is (d1, d0), d0 has 4 list slots on partition. P-axis `list_slots = 4`, leaf = `(128, 128)`. See the `[4]` on the outer, `[1]` inner.
+* `sbuf_K_t` has P dim = d1, F dim = d2. d2's 4 ptiles are absorbed into the leaf's free axis → leaf = `(128, 512)`.
+* `sbuf_inv_sum` is 1D; lifted to 2D `(128, 1)`; dtype promoted to float32 because `inv_sum` feeds `tensor_scalar.operand0`.
 
 ### Wiring
 
 The concrete entry points live in `codegen/buffers.py`:
-- `find_psum_tensors_needing_sbuf(ir) -> set[str]` — step 3.
-- `render_buffers(ir, indent) -> str` — walks every tensor in `ir.dim_analysis.tensors`, applies steps 1–4, emits one line per buffer.
-
-`render_ir` calls `render_buffers(ir, inner_indent)` at the top of the kernel body (before the per-group sibling loop nests), where every default-tier allocation lives.
+* `render_sbuf_buffers(ir, staged, tensor_to_groups)` — emits allocations keyed by the group at whose top they appear.
+* `render_psum_allocations(ir, op_to_group)` — emits PSUM allocations per producer group.
+* `sbuf_buffer(ir, name)` — builds an `SbufBuffer` with dtype promotion applied; used by downstream codegen for access-string generation.
+* `find_psum_tensors_needing_sbuf(ir)` — PSUM tensors whose consumers or the kernel return require an SBUF staging sibling.

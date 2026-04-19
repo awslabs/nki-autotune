@@ -3,6 +3,7 @@
 from nkigym.codegen.buffers import (
     build_tensor_to_groups,
     find_psum_tensors_needing_sbuf,
+    prime_sbuf_cache,
     render_psum_allocations,
     render_sbuf_buffers,
 )
@@ -21,19 +22,15 @@ def render_ir(ir: KernelIR) -> str:
     first any persistent SBUF tensors (touched by 2+ groups, whose
     first user is this group), then per-FG SBUF tensors (local to
     this group, stacked after the persistent range), then all
-    PSUM buffers produced in this group (bank-aligned offsets
-    starting at 0 per group). Persistent addresses stay pinned for
-    the kernel lifetime because NKI honors the explicit
-    ``address=`` verbatim; per-FG SBUF regions overlap across
-    groups so the compiler reuses those bytes. PSUM memsets for
-    blocking producers still fire at the outermost blocking loop
-    depth so the accumulator is re-zeroed each output tile.
-    HBM→SBUF loads fire at per-dim derived depths; ISA calls sit
-    at the innermost body; PSUM→SBUF staging lands after the
-    outermost blocking loop closes for blocking producers
-    (innermost body otherwise); and an SBUF→HBM store fires at
-    the producing group's deepest depth.
+    PSUM buffers produced in this group. PSUM memsets for blocking
+    producers fire at the outermost blocking loop depth so the
+    accumulator is re-zeroed each output tile. HBM→SBUF loads fire
+    at per-dim derived depths; ISA calls sit at the innermost body;
+    PSUM→SBUF staging lands after the outermost blocking loop
+    closes for blocking producers (innermost body otherwise); and
+    an SBUF→HBM store fires at the producing group's deepest depth.
     """
+    prime_sbuf_cache(ir)
     op_to_group = build_op_to_group(ir)
     tensor_to_groups = build_tensor_to_groups(ir)
     staged = find_psum_tensors_needing_sbuf(ir)

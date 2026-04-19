@@ -2,15 +2,20 @@
 
 Load, stage, and store emit at the tensor's feasibility-interval
 lower bound (adjusted for the producer's blocking semantics on
-stage/store). Slice expressions are built from in-scope loop
-vars and tiers; gadgets are thin ISA wrappers that don't loop.
+stage/store). SBUF access uses the list-of-2D-tiles model
+(``sbuf_buffer.SbufBuffer``); each gadget call names a contiguous
+``[p_start:p_start+p_count][f_start:f_start+f_count]`` sub-block
+and the gadget Python-iterates per leaf.
 """
 
-from nkigym.codegen.buffers import num_tiles
+from nkigym.codegen.buffers import sbuf_buffer
 from nkigym.codegen.group_loops import DepthPlan
+from nkigym.codegen.sbuf_buffer import AxisAccess
 from nkigym.kernel_ir import KernelIR, get_tpb
 from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
 from nkigym.kernel_ir.validate import tier_depth_range
+
+_TIER_RANK = {"per_tile": 0, "per_block": 1, "full": 2}
 
 
 def build_op_to_group(ir: KernelIR) -> dict[int, int]:
@@ -42,8 +47,8 @@ def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int]) -> DepthPlan:
 
     Each input tensor is loaded once at the tier-feasibility
     depth in the group that contains its earliest consumer. The
-    slice written covers every SBUF slot the consumer will read
-    with that tier.
+    sub-block written covers every SBUF slot the consumer will
+    read at that depth.
     """
     da = ir.dim_analysis
     graph = ir.op_graph
@@ -57,9 +62,9 @@ def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int]) -> DepthPlan:
         group_idx = op_to_group[touching[0]]
         dim_order = ir.fusion_groups[group_idx].dim_order
         depth = _tier_depth(ir, group_idx, tensor_name, tinfo, dim_order)
-        dst = f"sbuf_{tensor_name}{_sbuf_slice(ir, group_idx, tensor_name, tinfo, dim_order, depth)}"
-        src = f"{tensor_name}{_hbm_slice(ir, tinfo, dim_order, depth)}"
-        plan.setdefault(group_idx, {}).setdefault(depth, []).append(f"load_block({dst}, {src})")
+        plan.setdefault(group_idx, {}).setdefault(depth, []).append(
+            _gadget_call("load_block", ir, group_idx, tensor_name, tinfo, dim_order, depth, sbuf_is_dst=True)
+        )
 
     return plan
 
@@ -99,9 +104,9 @@ def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[s
             depth = max(producer_depth, _tier_depth(ir, group_idx, tensor_name, tinfo, dim_order))
             uses_after = False
 
-        dst = f"sbuf_{tensor_name}{_sbuf_slice(ir, group_idx, tensor_name, tinfo, dim_order, depth)}"
-        src = f"psum_{tensor_name}"
-        line = f"stage_block({dst}, {src})"
+        line = _gadget_call(
+            "stage_block", ir, group_idx, tensor_name, tinfo, dim_order, depth, sbuf_is_dst=True, psum_src=True
+        )
         (after if uses_after else before).setdefault(group_idx, {}).setdefault(depth, []).append(line)
 
     return before, after
@@ -148,7 +153,6 @@ def render_hbm_store(ir: KernelIR, op_to_group: dict[int, int]) -> tuple[DepthPl
         group_idx = op_to_group[producer]
         tinfo = da.tensors[ret]
         dim_order = ir.fusion_groups[group_idx].dim_order
-
         op_cls = graph.op_classes[producer]
         if op_cls.ISA_LOC == "psum":
             producer_depth, blocking = producer_finished_depth(ir, producer, dim_order)
@@ -161,10 +165,7 @@ def render_hbm_store(ir: KernelIR, op_to_group: dict[int, int]) -> tuple[DepthPl
         else:
             depth = max(2 * len(dim_order), _tier_depth(ir, group_idx, ret, tinfo, dim_order))
             uses_after = False
-
-        dst = f"{ret}{_hbm_slice(ir, tinfo, dim_order, depth)}"
-        src = f"sbuf_{ret}{_sbuf_slice(ir, group_idx, ret, tinfo, dim_order, depth)}"
-        line = f"store_block({dst}, {src})"
+        line = _gadget_call("store_block", ir, group_idx, ret, tinfo, dim_order, depth, sbuf_is_dst=False)
         (after if uses_after else before).setdefault(group_idx, {}).setdefault(depth, []).append(line)
     return before, after
 
@@ -186,119 +187,111 @@ def _tier_depth(ir: KernelIR, group_idx: int, tensor_name: str, tinfo: TensorInf
     return lo
 
 
-def _sbuf_slice(
-    ir: KernelIR, group_idx: int, tensor_name: str, tinfo: TensorInfo, dim_order: list[str], depth: int
-) -> str:
-    """Slice into an SBUF ``(phys_p, num_tiles_p, num_tiles_f, phys_f)`` (or 2D) buffer covering the portion active at ``depth``."""
-    return _sbuf_slice_ptile(ir, group_idx, tensor_name, tinfo, dim_order, depth, ptile_dims=frozenset())
-
-
-def sbuf_ptile_slice(
-    ir: KernelIR, group_idx: int, tensor_name: str, tinfo: TensorInfo, dim_order: list[str], ptile_dims: frozenset[str]
-) -> str:
-    """Per-ptile SBUF slice at the innermost body depth.
-
-    Like ``_sbuf_slice`` but narrows each dim listed in
-    ``ptile_dims`` to a single slot indexed by ``i_ptile_{d}``,
-    added on top of any in-scope block/ltile loop offset.
-    """
-    return _sbuf_slice_ptile(
-        ir, group_idx, tensor_name, tinfo, dim_order, depth=2 * len(dim_order), ptile_dims=ptile_dims
-    )
-
-
-def _sbuf_slice_ptile(
+def _gadget_call(
+    gadget: str,
     ir: KernelIR,
     group_idx: int,
     tensor_name: str,
     tinfo: TensorInfo,
     dim_order: list[str],
     depth: int,
-    ptile_dims: frozenset[str],
+    sbuf_is_dst: bool,
+    psum_src: bool = False,
 ) -> str:
-    """Internal: build the full SBUF slice string with optional per-ptile narrowing."""
-    da = ir.dim_analysis
-    dim_ids = tinfo.dim_ids
-    if len(dim_ids) == 2:
-        d_p, d_f = dim_ids
-        tp = da.dims[d_p].physical_tile_size
-        tf = da.dims[d_f].physical_tile_size
-        p_idx = sbuf_axis_index(ir, group_idx, tensor_name, d_p, dim_order, depth, ptile_dims)
-        f_idx = sbuf_axis_index(ir, group_idx, tensor_name, d_f, dim_order, depth, ptile_dims)
-        expr = f"[0:{tp}, {p_idx}, {f_idx}, 0:{tf}]"
-    else:
-        d_p = dim_ids[0]
-        tp = da.dims[d_p].physical_tile_size
-        p_idx = sbuf_axis_index(ir, group_idx, tensor_name, d_p, dim_order, depth, ptile_dims)
-        expr = f"[0:{tp}, {p_idx}]"
-    return expr
+    """Emit ``gadget(sbuf=..., mem=..., p_start=..., p_count=..., f_start=..., f_count=...)``.
 
-
-def sbuf_axis_index(
-    ir: KernelIR,
-    group_idx: int,
-    tensor_name: str,
-    dim_id: str,
-    dim_order: list[str],
-    depth: int,
-    ptile_dims: frozenset[str] = frozenset(),
-) -> str:
-    """Per-dim slot range for a block-scoped SBUF slice at ``depth``.
-
-    Always yields a ``start:end`` range so the slice keeps every
-    SBUF axis — block-level gadgets iterate over the resulting
-    slot count. ``start`` is a loop-var expression for dims whose
-    tiered loop is already open at ``depth``; ``end`` extends by
-    however many slots are in-flight at that depth. Dims listed
-    in ``ptile_dims`` add a ``+ i_ptile_{d}`` to the start and
-    narrow the range to a single slot.
+    For load/stage, ``sbuf`` is the dst list-of-lists and ``mem``
+    is the 2D HBM/PSUM region; for store, ``sbuf`` is the src list
+    and ``mem`` is the 2D HBM dst. The sub-block bounds come from
+    ``SbufBuffer.range`` with the in-scope axes bound and the rest
+    spanning their full factor.
     """
-    slots = num_tiles(ir, tensor_name, dim_id)
-    num_ptiles = ir.dim_analysis.dims[dim_id].num_ptiles
-    expr = f"0:{slots}"
+    buf = sbuf_buffer(ir, tensor_name)
+    p_access, f_access = _axis_access(ir, group_idx, tensor_name, tinfo, dim_order, depth)
+    p_start, p_count, f_start, f_count = buf.range(p_access, f_access)
+    sbuf_arg = f"sbuf_{tensor_name}"
+    mem_expr = _mem_expr(ir, tensor_name, tinfo, dim_order, depth, psum_src)
+    bounds = f"{p_start}, {p_count}, {f_start}, {f_count}"
+    first, second = (sbuf_arg, mem_expr) if sbuf_is_dst else (mem_expr, sbuf_arg)
+    return f"{gadget}({first}, {second}, {bounds})"
+
+
+def _axis_access(
+    ir: KernelIR, group_idx: int, tensor_name: str, tinfo: TensorInfo, dim_order: list[str], depth: int
+) -> tuple[AxisAccess, AxisAccess]:
+    """Return ``(p_access, f_access)`` for a gadget emission at ``depth``.
+
+    Each axis's ``AxisAccess.block`` / ``ltile`` is bound to the
+    loop var when that loop is in scope, or left ``None`` when it
+    isn't. ``ptile`` is unused by gadgets (they span every
+    physical tile inside a leaf).
+    """
+    dim_ids = tinfo.dim_ids
+    p_axis = _scope_access(group_idx, tensor_name, dim_ids[0], dim_order, depth, ir)
+    f_axis = (
+        _scope_access(group_idx, tensor_name, dim_ids[1], dim_order, depth, ir)
+        if len(dim_ids) == 2
+        else AxisAccess(block="0", ltile="0")
+    )
+    return p_axis, f_axis
+
+
+def _scope_access(
+    group_idx: int, tensor_name: str, dim_id: str, dim_order: list[str], depth: int, ir: KernelIR
+) -> AxisAccess:
+    """Bind ``block`` / ``ltile`` for one dim based on tier and in-scope loops.
+
+    A dim outside ``dim_order`` has no loops → both bound to
+    ``"0"`` (the single list slot at ``list_slots == 1``). A dim
+    inside ``dim_order`` binds its loop var iff the tier keeps
+    that list factor (``full`` keeps both; ``per_block`` keeps
+    only ltile; ``per_tile`` keeps neither) AND the loop is in
+    scope at ``depth``. A list factor that the tier does not
+    keep collapses to ``"0"`` (the factor is 1 at allocation).
+    """
     placements = ir.fusion_groups[group_idx].tensor_placements
     key = ("sbuf", tensor_name, dim_id)
-    if slots > 1 and dim_id in dim_order and key in placements:
-        tier = placements[key]
-        tpb = get_tpb(ir, dim_id)
+    tier = placements.get(key, "per_tile")
+    block: str | None = "0"
+    ltile: str | None = "0"
+    if dim_id in dim_order:
+        pos = dim_order.index(dim_id)
         n = len(dim_order)
-        i = dim_order.index(dim_id)
-        expr = _slot_range(tier, dim_id, i, n, depth, tpb, num_ptiles, slots, dim_id in ptile_dims)
-    elif dim_id in ptile_dims:
-        expr = f"i_ptile_{dim_id}:i_ptile_{dim_id} + 1"
-    return expr
+        block = _bind(tier, "full", depth > pos, f"i_block_{dim_id}")
+        ltile = _bind(tier, "per_block", depth > n + pos, f"i_ltile_{dim_id}")
+    return AxisAccess(block=block, ltile=ltile)
 
 
-def _slot_range(
-    tier: str, dim_id: str, pos: int, n: int, depth: int, tpb: int, num_ptiles: int, slots: int, ptile: bool
-) -> str:
-    """Slot-range expression for one dim given its tier and the loops in scope at ``depth``.
+def _bind(tier: str, required_tier: str, loop_open: bool, var: str) -> str | None:
+    """Bind a list-factor loop var when the tier keeps it AND the loop is in scope.
 
-    When ``ptile`` is ``True``, the range is narrowed to a
-    single slot at ``start + i_ptile_{dim_id}``.
+    ``required_tier`` is the minimum tier that materializes the
+    factor (``"full"`` for the block factor, ``"per_block"`` for
+    the ltile factor). When the tier doesn't keep the factor, the
+    list length is 1 and we return ``"0"``. When the tier keeps
+    the factor, we return the loop var if it's in scope, else
+    ``None`` so the caller spans the full range.
     """
-    block_active = depth > pos
-    tile_active = depth > n + pos
-    block_stride = tpb * num_ptiles
-    if tier == "full" and tile_active:
-        start = f"i_block_{dim_id} * {block_stride} + i_ltile_{dim_id} * {num_ptiles}"
-        expr = _narrow_or_range(start, num_ptiles, ptile, dim_id)
-    elif tier == "full" and block_active:
-        start = f"i_block_{dim_id} * {block_stride}"
-        expr = _narrow_or_range(start, block_stride, ptile, dim_id)
-    elif tier == "per_block" and tile_active:
-        start = f"i_ltile_{dim_id} * {num_ptiles}"
-        expr = _narrow_or_range(start, num_ptiles, ptile, dim_id)
-    elif tier == "per_tile":
-        expr = f"i_ptile_{dim_id}:i_ptile_{dim_id} + 1" if ptile else f"0:{num_ptiles}"
+    kept = _TIER_RANK[tier] >= _TIER_RANK[required_tier]
+    result: str | None
+    if not kept:
+        result = "0"
+    elif loop_open:
+        result = var
     else:
-        expr = f"0:{slots}"
+        result = None
+    return result
+
+
+def _mem_expr(
+    ir: KernelIR, tensor_name: str, tinfo: TensorInfo, dim_order: list[str], depth: int, psum_src: bool
+) -> str:
+    """Return the 2D HBM or PSUM argument expression passed to the gadget."""
+    if psum_src:
+        expr = f"psum_{tensor_name}"
+    else:
+        expr = f"{tensor_name}{_hbm_slice(ir, tinfo, dim_order, depth)}"
     return expr
-
-
-def _narrow_or_range(start: str, width: int, ptile: bool, dim_id: str) -> str:
-    """Return either a single-slot range ``start + i_ptile_{d} : start + i_ptile_{d} + 1`` or the full ``start:start + width`` range."""
-    return f"{start} + i_ptile_{dim_id}:{start} + i_ptile_{dim_id} + 1" if ptile else f"{start}:{start} + {width}"
 
 
 def _hbm_slice(ir: KernelIR, tinfo: TensorInfo, dim_order: list[str], depth: int) -> str:
@@ -322,7 +315,6 @@ def _hbm_axis_range(ir: KernelIR, dim_id: str, dim_order: list[str], depth: int)
     di = ir.dim_analysis.dims[dim_id]
     logical = di.logical_tile_size
     block_stride = get_tpb(ir, dim_id) * logical
-
     if dim_id not in dim_order or depth <= dim_order.index(dim_id):
         rng = f"0:{di.dim_size}"
     elif depth <= len(dim_order) + dim_order.index(dim_id):

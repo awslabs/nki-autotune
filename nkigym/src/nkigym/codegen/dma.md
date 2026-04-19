@@ -3,91 +3,75 @@
 Data moves through three memory levels: HBM → SBUF → PSUM (loads) and PSUM → SBUF → HBM (stores). One universal rule governs all store-direction transfers:
 
 **Store rule: move data when the source is valid.** This applies identically at every memory boundary:
-- **PSUM → SBUF** (`stage_tensor_block`): after the outermost blocking dim's *block* loop closes — every blocking dim's loops (block and tile, nested inside) have fully iterated, so the PSUM accumulator is final.
-- **SBUF → HBM** (`store_tensor_block`): inside the producing group's innermost body — the output tile is final once the op writes it.
+- **PSUM → SBUF** (`stage_block`): after the outermost blocking dim's block loop closes — every blocking dim's loops (block and tile, nested inside) have fully iterated, so the PSUM accumulator is final.
+- **SBUF → HBM** (`store_block`): inside the producing group's innermost body — the output tile is final once the op writes it.
 
-A non-blocking op (nc_transpose, single nc_matmul without accumulation) produces a valid PSUM result immediately, so `stage_tensor_block` follows right after at the innermost body. A blocking op (nc_matmul accumulating over K tiles) produces a valid result only after the full accumulation of that dim, so `stage_tensor_block` goes outside every loop touching a blocking dim. Same principle, different granularity.
+A non-blocking op (nc_transpose, single nc_matmul without accumulation) produces a valid PSUM result immediately, so the stage follows right after at the innermost body. A blocking op (nc_matmul accumulating over K tiles) produces a valid result only after the full accumulation of that dim, so the stage goes outside every loop touching a blocking dim. Same principle, different granularity.
 
 ### Gadgets
 
-All multi-tile transfers use helper gadgets from `nkigym.dma.gadgets` to avoid inline loop nests in generated code. Three gadgets:
+SBUF buffers are nested Python lists `sbuf_X[NP_list][NF_list]` of 2D `nl.ndarray(phys_P, leaf_F)` leaves (see `tensor_buffers.md`). Three gadgets move data in and out; each Python-iterates per leaf and issues one ISA call per tile:
 
-- **`load_tensor_block(dst, src, par_ofs, free_ofs)`** — HBM → SBUF. Iterates over all tile slots in a 4D (or 2D) on-chip buffer and copies each tile from HBM via `nisa.dma_copy`.
-- **`stage_tensor_block(dst, src)`** — PSUM → SBUF. Iterates over all tile slots and issues `nisa.tensor_copy` for each. Both buffers must have the same shape.
-- **`store_tensor_block(dst, src, par_ofs, free_ofs)`** — SBUF → HBM. Iterates over all tile slots in an SBUF buffer and copies each tile to HBM via `nisa.dma_copy`.
+- **`load_block(sbuf, mem, p_start, p_count, f_start, f_count)`** — HBM → SBUF. Copies a `(p_count × phys_P, f_count × leaf_F)` slab of `mem` into the `[p_start:p_start + p_count][f_start:f_start + f_count]` sub-block of `sbuf` via `nisa.dma_copy`.
+- **`stage_block(sbuf, mem, p_start, p_count, f_start, f_count)`** — PSUM → SBUF. Same sub-block semantics; per-leaf copy via `nisa.tensor_copy`. `mem` is the PSUM ndarray.
+- **`store_block(mem, sbuf, p_start, p_count, f_start, f_count)`** — SBUF → HBM. Reads the same sub-block of `sbuf` and writes it to `mem` via `nisa.dma_copy`.
 
-All three support 4D buffers `(physical_tile_size_P, num_tiles_P, num_tiles_F, physical_tile_size_F)` for 2D tensors and 2D buffers `(physical_tile_size_P, num_tiles_P)` for 1D tensors. The HBM offset is computed from the kernel-level loop variables: `offset = i_block * (ltiles_per_block * logical_tile_size) + i_ltile * logical_tile_size`. Physical-tile iteration within a logical tile is internal to the gadget — it walks the buffer's physical slots without needing a kernel-level `i_ptile_*` loop.
+All three require `mem.shape == (p_count * phys_P, f_count * leaf_F)` and raise `ValueError` otherwise. NKI forbids a single DMA that spans multiple partition slots, so per-leaf iteration is obligatory; because each leaf is one 128-lane partition block, the inner ISA call is a genuine 2D memref access with no partition stride.
+
+Per-ptile staging inside an op's ptile loop (where the PSUM holds just one physical tile) emits a direct `nisa.tensor_copy` into one `SbufBuffer.get_tile(...)` slice rather than a gadget call — the gadget is for multi-leaf bulk transfers.
 
 ### Loads
 
-Each HBM input tensor `t` in `dim_analysis.param_names` is loaded exactly once. The owning group is the one containing the earliest op (smallest `op_idx`) that reads `t`; this is derived from `op_graph.ops_touching(t)`. No new IR field — the position is fully determined by:
-
-- `fusion_groups` — which group owns the load.
-- `group_dim_orders[group_idx]` — the owning group's loop order.
-- `tensor_placements[(t, d)]` — per-dim tier (`per_tile`, `per_block`, `full`), which also drives buffer shape (see `kernel_ir/load_placement.md`).
-
-**Position rule.** Let `relevant = set(t.dim_ids) ∩ set(group_dim_orders[g])` — the dims of `t` that produce loop variables in `g`'s nest. The load is emitted at the innermost indent level where every `d ∈ relevant` has its tier's required loops in scope:
+Each HBM input tensor `t` in `dim_analysis.param_names` is loaded exactly once. The owning group is the one containing the earliest op (smallest `op_idx`) that reads `t`. The load depth comes from `tensor_placements[(t, d)]` on each of `t`'s dims:
 
 - `per_tile` — inside both `d`'s block and ltile loops (deepest).
 - `per_block` — inside `d`'s block loop, outside its ltile loop.
 - `full` — outside `d`'s block loop (hoisted).
 
-Dims in `t.dim_ids` but not in `relevant` impose no constraint — the tensor is invariant over them.
+Dims outside the group's `dim_order` impose no constraint. If no in-group dim constrains the tensor, the load is emitted at the top of the group.
 
-If `relevant` is empty (tensor has no dims in any group's nest), the load is emitted at the top of the kernel body, before the group nests.
-
-In the default lowering (all tiers `per_tile`, degree-1), each load brings in one tile at the innermost nest position.
+The sub-block bounds come from `SbufBuffer.range(AxisAccess, AxisAccess)` with each loop-var bound iff it's in scope at the emission depth. A factor whose loop is not yet in scope (outer to the current depth) spans its full count; a factor whose tier does not materialize it collapses to `"0"` with count 1.
 
 ### PSUM → SBUF Staging
 
-Every PSUM tensor that a consumer (or the return tensor) reads from SBUF gets one `stage_tensor_block(sbuf_{name}, psum_{name})` call in the fusion group that produces it. The set of such tensors is `find_psum_tensors_needing_sbuf(ir)` in `codegen/buffers.py`. Position is fully determined by the producing op's blocking dims intersected with the group's `dim_order`:
+Every PSUM tensor whose consumer (or the kernel return) reads from SBUF gets a staging sibling. Position:
 
-- **Non-blocking producer** (no blocking dim appears in the group's `dim_order`) — stage at the innermost body (depth `2N`, where `N = len(group_dim_orders[group_idx])`). The PSUM result is complete after every ISA call.
-- **Blocking producer** — let `i_min = min(pos(d) for d in blocking_dims ∩ dim_order)`, the outermost blocking dim's position in `dim_order`. Stage at depth `i_min` (after-plan) — the indent level right after that dim's *block* loop closes. Under phase-grouped emission (all block loops outermost, then all tile loops), being outside that block loop is strictly outside its tile loop too, so every blocking dim's loops (block and tile, at positions ≥ `i_min`) have fully iterated.
+- **Non-blocking producer** — stage at the innermost body (depth `2N`).
+- **Blocking producer** — stage at depth `i_min` (after-plan), where `i_min` is the outermost blocking dim's position in the group's `dim_order`. Being outside that block loop is strictly outside its tile loop too, so every blocking dim has fully iterated.
 
-No new IR field — derivation uses `op_graph.producer_op`, per-op `BLOCKING_AXES`, and `dim_analysis.per_op_axis_maps`.
+Ops with non-blocking ptile dims own their own per-ptile staging inside the op's ptile loop (`render_nki_ops._ptile_stage_lines`). Only ops whose ptile dims are all blocking (or which have none) go through the group-scope stage.
 
 ### SBUF → HBM Store
 
-The return tensor is stored via `store_tensor_block` inside the producing group's innermost body. The group is the one containing `op_graph.producer_op(return_name)`. Emitting inside the innermost body keeps the group's loop variables in scope for the HBM offset expressions.
+The return tensor is stored via `store_block` inside the producing group's innermost body. When the producer is a PSUM op, the store lands in the after-plan after the group-scope stage so the sequencing SBUF → HBM reads committed data.
 
-### Example: Attention
-
-Each group emits its own complete loop nest as a sibling block — no outer wrapper. A group's nest covers only the dims its ops touch. Loads land at the depth dictated by `tensor_placements`; PSUM staging sits at the innermost body for non-blocking producers or after the outermost blocking dim's tile loop closes for blocking producers; the return tensor is stored inside the final producing group's innermost body.
+### Example: Attention (`seq_q = seq_k = 512, d_k = d_v = 128`, default tiers)
 
 ```python
 """buffer allocations..."""
+sbuf_K_t = [[nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)] for _ in range(1)]
 
 """Group 1: nc_transpose (K -> K_t) [dims: d1, d2]"""
 for i_block_d1 in range(1):
-    for i_block_d2 in range(4):
+    for i_block_d2 in range(1):
         for i_ltile_d1 in range(1):
             for i_ltile_d2 in range(1):
-                load_tensor_block(sbuf_K, K, i_block_d2 * 512 + ..., i_block_d1 * 128 + ...)
-                """nc_transpose is non-blocking: stage at innermost body"""
-                stage_tensor_block(sbuf_K_t, psum_K_t)
-                pass
+                load_block(sbuf_K, K[...], 0, 4, 0, 1)
+                for i_ptile_d2 in range(4):
+                    nisa.nc_transpose(psum_K_t[0:128, 0:128], sbuf_K[i_ptile_d2][0][0:128, 0:128])
+                    """per-ptile stage: one (128, 128) tile into one phys-tile slice of the leaf"""
+                    nisa.tensor_copy(sbuf_K_t[0][0][0:128, i_ptile_d2 * 128:i_ptile_d2 * 128 + 128],
+                                     psum_K_t[0:128, 0:128])
 
-"""Group 2: nc_matmul (Q_t @ K_t -> S) [dims: d0, d1, d2]; blocking on d1 (position 1)"""
-for i_block_d0 in range(16):
-    for i_block_d1 in range(1):
-        for i_block_d2 in range(4):
+"""Group 2: nc_matmul (Q_t @ K_t -> S) [dims: d0, d2, d1]; blocking on d1 (position 2)"""
+for i_block_d0 in range(4):
+    for i_block_d2 in range(1):
+        nisa.memset(psum_S[0:128, 0:512], 0.0)
+        for i_block_d1 in range(1):
             for i_ltile_d0 in range(1):
-                for i_ltile_d1 in range(1):
-                    for i_ltile_d2 in range(1):
-                        """nc_matmul accumulates across d1 tiles"""
-                        pass
-    """block_d1 closed: stage at depth i_min = 1, fires once per i_block_d0"""
-    stage_tensor_block(sbuf_S, psum_S)
-
-"""... groups 3-9 ..."""
-
-"""Group 10: tensor_scalar (attn * inv_sum -> output) [dims: d0, d4]"""
-for i_block_d0 in range(16):
-    for i_block_d4 in range(1):
-        for i_ltile_d0 in range(1):
-            for i_ltile_d4 in range(1):
-                """return tensor's producer; store inside innermost body"""
-                store_tensor_block(output, sbuf_output, i_block_d0 * 128 + ..., i_block_d4 * 128 + ...)
-                pass
+                for i_ltile_d2 in range(1):
+                    for i_ltile_d1 in range(1):
+                        nisa.nc_matmul(dst=psum_S[0:128, 0:512], ...)
+        """block_d1 closed; depth = i_min; stage into one (128, 512) leaf"""
+        stage_block(sbuf_S, psum_S, i_block_d0, 1, i_block_d2, 1)
 ```

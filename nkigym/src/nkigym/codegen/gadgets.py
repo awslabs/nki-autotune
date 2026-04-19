@@ -1,16 +1,22 @@
-"""Block-level DMA/staging wrappers that hide per-slot iteration.
+"""Block-level DMA/staging wrappers for the list-of-2D-tiles SBUF model.
 
-Purpose: NKI forbids a single DMA / ``tensor_copy`` that spans
-multiple slots on the partition axis, so every load/stage/store
-site has to emit ``for pi in range(NP): for fi in range(NF): ...``
-around the ISA call. The gadgets encapsulate that loop so the
-generated kernel source stays readable.
+SBUF buffers are nested Python lists ``sbuf_X[NP_list][NF_list]``
+where each leaf is a 2D ``nl.ndarray(P, F)``. NKI forbids a
+single DMA that spans multiple partition slots, so the gadgets
+Python-iterate per leaf and emit one ISA call per tile. Each
+inner call is a genuine 2D memref access — no 4D reshape, no
+partition striding in the slice.
 
-Contract: ``dst`` (or ``src`` for ``store_block``) is a 4D SBUF
-region of shape ``(P, NP, NF, F)``; the 2D side is the HBM or PSUM
-region that fills it. Shape compatibility is strict —
-``P * NP == OP`` on partition and ``NF * F == OF`` on free, else
-``ValueError``. No broadcast, no list source, no fallback.
+Contract:
+* ``sbuf`` (dst for load/stage, src for store): nested Python
+  list ``[NP_list][NF_list]`` of 2D ``nl.ndarray`` leaves of
+  shape ``(P, F)``.
+* ``mem`` (src for load/stage, dst for store): 2D ``nl.ndarray``
+  of shape ``(p_count * P, f_count * F)`` — the matching chunk of
+  HBM or PSUM.
+* ``p_start``, ``f_start``: starting slot indices into ``sbuf``.
+* ``p_count``, ``f_count``: number of slots to transfer on each
+  axis. ``mem`` must cover exactly this region, else ``ValueError``.
 """
 
 from typing import Any
@@ -18,52 +24,45 @@ from typing import Any
 import nki.isa as nisa
 
 
-def load_block(dst: Any, src: Any) -> None:
-    """HBM → SBUF: fill every slot of a 4D SBUF region from the matching chunk of a 2D HBM region.
-
-    Slot ``(pi, fi)`` of ``dst`` receives
-    ``src[pi*P : (pi+1)*P, fi*F : (fi+1)*F]``.
-    """
-    p, np_p, nf_f, f = dst.shape
-    op, of = src.shape
-    if op != p * np_p or of != nf_f * f:
+def load_block(sbuf: Any, mem: Any, p_start: int, p_count: int, f_start: int, f_count: int) -> None:
+    """HBM → SBUF: copy ``mem`` into the ``[p_start : p_start + p_count][f_start : f_start + f_count]`` sub-block of ``sbuf``."""
+    p, f = sbuf[0][0].shape
+    op, of = mem.shape
+    if op != p_count * p or of != f_count * f:
         raise ValueError(
-            f"load_block shape mismatch: dst {dst.shape} flattens to ({p * np_p}, {nf_f * f}), src {src.shape}"
+            f"load_block shape mismatch: sbuf sub-block ({p_count}, {f_count})x({p}, {f}) "
+            f"covers ({p_count * p}, {f_count * f}), mem {mem.shape}"
         )
-    for pi in range(np_p):
-        for fi in range(nf_f):
-            nisa.dma_copy(dst[0:p, pi : pi + 1, fi : fi + 1, 0:f], src[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f])
+    for pi in range(p_count):
+        for fi in range(f_count):
+            nisa.dma_copy(sbuf[p_start + pi][f_start + fi][0:p, 0:f], mem[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f])
 
 
-def store_block(dst: Any, src: Any) -> None:
-    """SBUF → HBM: write every slot of a 4D SBUF region to the matching chunk of a 2D HBM region.
-
-    Slot ``(pi, fi)`` of ``src`` writes to
-    ``dst[pi*P : (pi+1)*P, fi*F : (fi+1)*F]``.
-    """
-    p, np_p, nf_f, f = src.shape
-    op, of = dst.shape
-    if op != p * np_p or of != nf_f * f:
+def stage_block(sbuf: Any, mem: Any, p_start: int, p_count: int, f_start: int, f_count: int) -> None:
+    """PSUM → SBUF: copy ``mem`` into the ``[p_start : p_start + p_count][f_start : f_start + f_count]`` sub-block of ``sbuf``."""
+    p, f = sbuf[0][0].shape
+    op, of = mem.shape
+    if op != p_count * p or of != f_count * f:
         raise ValueError(
-            f"store_block shape mismatch: src {src.shape} flattens to ({p * np_p}, {nf_f * f}), dst {dst.shape}"
+            f"stage_block shape mismatch: sbuf sub-block ({p_count}, {f_count})x({p}, {f}) "
+            f"covers ({p_count * p}, {f_count * f}), mem {mem.shape}"
         )
-    for pi in range(np_p):
-        for fi in range(nf_f):
-            nisa.dma_copy(dst[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f], src[0:p, pi : pi + 1, fi : fi + 1, 0:f])
+    for pi in range(p_count):
+        for fi in range(f_count):
+            nisa.tensor_copy(
+                sbuf[p_start + pi][f_start + fi][0:p, 0:f], mem[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f]
+            )
 
 
-def stage_block(dst: Any, src: Any) -> None:
-    """PSUM → SBUF: fill every slot of a 4D SBUF region from the matching chunk of a 2D PSUM region.
-
-    Slot ``(pi, fi)`` of ``dst`` receives
-    ``src[pi*P : (pi+1)*P, fi*F : (fi+1)*F]``.
-    """
-    p, np_p, nf_f, f = dst.shape
-    op, of = src.shape
-    if op != p * np_p or of != nf_f * f:
+def store_block(mem: Any, sbuf: Any, p_start: int, p_count: int, f_start: int, f_count: int) -> None:
+    """SBUF → HBM: write the ``[p_start : p_start + p_count][f_start : f_start + f_count]`` sub-block of ``sbuf`` into ``mem``."""
+    p, f = sbuf[0][0].shape
+    op, of = mem.shape
+    if op != p_count * p or of != f_count * f:
         raise ValueError(
-            f"stage_block shape mismatch: dst {dst.shape} flattens to ({p * np_p}, {nf_f * f}), src {src.shape}"
+            f"store_block shape mismatch: sbuf sub-block ({p_count}, {f_count})x({p}, {f}) "
+            f"covers ({p_count * p}, {f_count * f}), mem {mem.shape}"
         )
-    for pi in range(np_p):
-        for fi in range(nf_f):
-            nisa.tensor_copy(dst[0:p, pi : pi + 1, fi : fi + 1, 0:f], src[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f])
+    for pi in range(p_count):
+        for fi in range(f_count):
+            nisa.dma_copy(mem[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f], sbuf[p_start + pi][f_start + fi][0:p, 0:f])
