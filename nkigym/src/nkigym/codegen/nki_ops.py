@@ -8,7 +8,7 @@ per-dim ``i_ptile_{d}`` loops.
 """
 
 from nkigym.codegen.buffers import num_tiles, producer_op_tiles, psum_tile_count, psum_tile_slice
-from nkigym.codegen.dma import producer_finished_depth
+from nkigym.codegen.dma import producer_finished_depth, ptile_loop_dims, sbuf_ptile_slice
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.kernel_ir import KernelIR
 from nkigym.kernel_ir.dim_analysis import TensorInfo
@@ -21,7 +21,7 @@ def render_nki_ops(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) 
 
     for op_idx, op_cls in enumerate(graph.op_classes):
         group_idx = op_to_group[op_idx]
-        dim_order = ir.group_dim_orders[group_idx]
+        dim_order = ir.fusion_groups[group_idx].dim_order
         n = len(dim_order)
 
         if op_cls.ISA_LOC == "psum":
@@ -30,7 +30,7 @@ def render_nki_ops(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) 
                 for oname in graph.op_tensors[op_idx][1]:
                     plan.setdefault(group_idx, {}).setdefault(i_min, []).extend(_memset_lines(ir, oname))
 
-        plan.setdefault(group_idx, {}).setdefault(2 * n, []).extend(_render_op_block(ir, op_idx, staged))
+        plan.setdefault(group_idx, {}).setdefault(2 * n, []).extend(_render_op_block(ir, op_idx, op_to_group, staged))
 
     return plan
 
@@ -45,56 +45,81 @@ def _memset_lines(ir: KernelIR, tensor_name: str) -> list[str]:
     return [body] if count == 1 else [f"for i_pt_{tensor_name} in range({count}):", f"    {body}"]
 
 
-def _render_op_block(ir: KernelIR, op_idx: int, staged: set[str]) -> list[str]:
-    """Render one op's call, wrapped in ``i_ptile_{d}`` loops when the op tile doesn't cover a dim's full logical span."""
+def _render_op_block(ir: KernelIR, op_idx: int, op_to_group: dict[int, int], staged: set[str]) -> list[str]:
+    """Render one op's ISA call wrapped in ``i_ptile_{d}`` loops, with a fused per-ptile stage.
+
+    When the op writes PSUM and has ptile dims, a per-iteration
+    ``nisa.tensor_copy(sbuf_dst_slot, psum_tile)`` is appended
+    inside the innermost ptile loop so each iteration's PSUM
+    output lands in the matching SBUF slot before the next
+    iteration overwrites PSUM. This makes list-of-N PSUM
+    buffering unnecessary for the baseline — single-buffered
+    PSUM + per-iteration stage gives correct results when
+    ``psum_tile_count == 1``.
+    """
     lines: list[str] = []
-    ptile_dims = _ptile_loop_dims(ir, op_idx)
-    call_line = _isa_call_line(ir, op_idx, staged, ptile_dims)
+    ptile_dims = ptile_loop_dims(ir, op_idx)
+    group_idx = op_to_group[op_idx]
+    call_line = _isa_call_line(ir, group_idx, op_idx, staged, ptile_dims)
     for depth, (dim_id, count) in enumerate(ptile_dims):
         lines.append("    " * depth + f"for i_ptile_{dim_id} in range({count}):")
-    lines.append("    " * len(ptile_dims) + call_line)
+    body_indent = "    " * len(ptile_dims)
+    lines.append(body_indent + call_line)
+    if ptile_dims:
+        stage_lines = _ptile_stage_lines(ir, op_idx, op_to_group, staged, ptile_dims)
+        lines.extend(body_indent + line for line in stage_lines)
     return lines
 
 
-def _ptile_loop_dims(ir: KernelIR, op_idx: int) -> list[tuple[str, int]]:
-    """Dims that need an ``i_ptile_{d}`` loop for this op, outer-to-inner."""
+def _ptile_stage_lines(
+    ir: KernelIR, op_idx: int, op_to_group: dict[int, int], staged: set[str], ptile_dims: list[tuple[str, int]]
+) -> list[str]:
+    """Per-ptile PSUM→SBUF stage lines for PSUM outputs that need staging.
+
+    Emits one ``nisa.tensor_copy`` per output tensor, indexed by
+    the current ptile iteration using ``sbuf_ptile_slice`` so
+    the SBUF destination slice accounts for in-scope block/ltile
+    loops as well as the narrowing ``i_ptile_{d}`` index. Runs
+    inside the innermost ptile loop so only one PSUM tile is
+    live at a time.
+    """
+    graph = ir.op_graph
+    op_cls = graph.op_classes[op_idx]
+    ptile_set: frozenset[str] = frozenset(dim_id for dim_id, _ in ptile_dims)
+    outputs = graph.op_tensors[op_idx][1] if op_cls.ISA_LOC == "psum" else ()
     da = ir.dim_analysis
-    op_tiles = da.op_tile_sizes[op_idx]
-    result: list[tuple[str, int]] = []
-    seen: set[str] = set()
-    for tensor_name in ir.op_graph.op_tensor_names(op_idx):
-        tinfo = da.tensors.get(tensor_name)
-        if tinfo is None:
+    group_idx = op_to_group[op_idx]
+    dim_order = ir.fusion_groups[group_idx].dim_order
+    lines: list[str] = []
+    for oname in outputs:
+        if oname not in staged:
             continue
-        for dim_id in tinfo.dim_ids:
-            if dim_id in seen:
-                continue
-            seen.add(dim_id)
-            di = da.dims[dim_id]
-            op_slots = op_tiles.get(dim_id, di.physical_tile_size) // di.physical_tile_size
-            total_slots = di.num_ptiles
-            if total_slots > op_slots:
-                result.append((dim_id, total_slots // op_slots))
-    return result
+        tinfo = da.tensors[oname]
+        sbuf_idx = sbuf_ptile_slice(ir, group_idx, oname, tinfo, dim_order, ptile_set)
+        psum_idx = psum_tile_slice(ir, oname, tinfo)
+        lines.append(f"nisa.tensor_copy(sbuf_{oname}{sbuf_idx}, psum_{oname}{psum_idx})")
+    return lines
 
 
-def _isa_call_line(ir: KernelIR, op_idx: int, staged: set[str], ptile_dims: list[tuple[str, int]]) -> str:
+def _isa_call_line(
+    ir: KernelIR, group_idx: int, op_idx: int, staged: set[str], ptile_dims: list[tuple[str, int]]
+) -> str:
     """Format the nisa.* ISA call string for one op."""
     op_cls = ir.op_graph.op_classes[op_idx]
     ptile_lookup = {dim_id for dim_id, _ in ptile_dims}
-    dst_map = _dst_exprs(ir, op_idx, ptile_lookup)
+    dst_map = _dst_exprs(ir, group_idx, op_idx, ptile_lookup)
     dst = next(iter(dst_map.values()))
-    operands = _operand_exprs(ir, op_idx, staged, ptile_lookup)
+    operands = _operand_exprs(ir, group_idx, op_idx, staged, ptile_lookup)
 
     scalar_kwargs = dict(ir.op_graph.op_all_kwargs[op_idx])
-    _rewrite_tensor_valued_scalars(ir, op_idx, scalar_kwargs, staged, ptile_lookup)
+    _rewrite_tensor_valued_scalars(ir, group_idx, op_idx, scalar_kwargs, staged, ptile_lookup)
     for ax_name, expr in dst_map.items():
         scalar_kwargs[f"__dst_{ax_name}"] = expr
     return op_cls.format_isa_call(dst, operands, scalar_kwargs)
 
 
 def _rewrite_tensor_valued_scalars(
-    ir: KernelIR, op_idx: int, scalar_kwargs: dict[str, str], staged: set[str], ptile_dims: set[str]
+    ir: KernelIR, group_idx: int, op_idx: int, scalar_kwargs: dict[str, str], staged: set[str], ptile_dims: set[str]
 ) -> None:
     """Rewrite scalar kwargs whose value is a tensor name to a buffer slice."""
     da = ir.dim_analysis
@@ -109,10 +134,10 @@ def _rewrite_tensor_valued_scalars(
         tinfo = da.tensors[expr]
         is_psum = graph.producer_isa_loc(expr) == "psum" and expr not in staged
         buf_name = f"psum_{expr}" if is_psum else f"sbuf_{expr}"
-        scalar_kwargs[name] = f"{buf_name}{_tile_index_expr(ir, op_idx, expr, tinfo, ptile_dims, is_psum)}"
+        scalar_kwargs[name] = f"{buf_name}{_tile_index_expr(ir, group_idx, op_idx, expr, tinfo, ptile_dims, is_psum)}"
 
 
-def _dst_exprs(ir: KernelIR, op_idx: int, ptile_dims: set[str]) -> dict[str, str]:
+def _dst_exprs(ir: KernelIR, group_idx: int, op_idx: int, ptile_dims: set[str]) -> dict[str, str]:
     """Destination expressions keyed by the op's ``OUTPUT_AXES`` names."""
     graph = ir.op_graph
     op_cls = graph.op_classes[op_idx]
@@ -121,12 +146,12 @@ def _dst_exprs(ir: KernelIR, op_idx: int, ptile_dims: set[str]) -> dict[str, str
     is_psum = op_cls.ISA_LOC == "psum"
     for ax_name, oname in zip(op_cls.OUTPUT_AXES, outputs):
         tinfo = ir.dim_analysis.tensors[oname]
-        idx = _dst_index_expr(ir, op_idx, oname, tinfo, ptile_dims, is_psum)
+        idx = _dst_index_expr(ir, group_idx, op_idx, oname, tinfo, ptile_dims, is_psum)
         result[ax_name] = f"{op_cls.ISA_LOC}_{oname}{idx}"
     return result
 
 
-def _operand_exprs(ir: KernelIR, op_idx: int, staged: set[str], ptile_dims: set[str]) -> dict[str, str]:
+def _operand_exprs(ir: KernelIR, group_idx: int, op_idx: int, staged: set[str], ptile_dims: set[str]) -> dict[str, str]:
     """Operand expressions keyed by the op's input role names."""
     graph = ir.op_graph
     da = ir.dim_analysis
@@ -149,7 +174,7 @@ def _operand_exprs(ir: KernelIR, op_idx: int, staged: set[str], ptile_dims: set[
                 buf_name = f"psum_{tensor_name}"
                 is_psum = True
 
-        result[role] = f"{buf_name}{_tile_index_expr(ir, op_idx, tensor_name, tinfo, ptile_dims, is_psum)}"
+        result[role] = f"{buf_name}{_tile_index_expr(ir, group_idx, op_idx, tensor_name, tinfo, ptile_dims, is_psum)}"
 
     return result
 
@@ -182,25 +207,25 @@ def _psum_list_index(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, ptile_di
 
 
 def _dst_index_expr(
-    ir: KernelIR, op_idx: int, tensor_name: str, tinfo: TensorInfo, ptile_dims: set[str], is_psum: bool
+    ir: KernelIR, group_idx: int, op_idx: int, tensor_name: str, tinfo: TensorInfo, ptile_dims: set[str], is_psum: bool
 ) -> str:
     """Destination index — PSUM list-slice or SBUF 4D slice."""
     expr = (
         _psum_index_expr(ir, tensor_name, tinfo, ptile_dims)
         if is_psum
-        else _sbuf_dst_index_expr(ir, op_idx, tinfo, ptile_dims)
+        else _sbuf_dst_index_expr(ir, group_idx, op_idx, tinfo, ptile_dims)
     )
     return expr
 
 
 def _tile_index_expr(
-    ir: KernelIR, op_idx: int, tensor_name: str, tinfo: TensorInfo, ptile_dims: set[str], is_psum: bool
+    ir: KernelIR, group_idx: int, op_idx: int, tensor_name: str, tinfo: TensorInfo, ptile_dims: set[str], is_psum: bool
 ) -> str:
     """Operand index — PSUM list-slice or SBUF 4D slice (optionally reshaped)."""
     expr = (
         _psum_index_expr(ir, tensor_name, tinfo, ptile_dims)
         if is_psum
-        else _sbuf_tile_index_expr(ir, op_idx, tensor_name, tinfo, ptile_dims)
+        else _sbuf_tile_index_expr(ir, group_idx, op_idx, tensor_name, tinfo, ptile_dims)
     )
     return expr
 
@@ -216,7 +241,7 @@ def _psum_index_expr(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, ptile_di
     return slice_expr if list_idx is None else f"[{list_idx}]{slice_expr}"
 
 
-def _sbuf_dst_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo, ptile_dims: set[str]) -> str:
+def _sbuf_dst_index_expr(ir: KernelIR, group_idx: int, op_idx: int, tinfo: TensorInfo, ptile_dims: set[str]) -> str:
     """Destination index into a 4D (or 2D) SBUF buffer — no reshape."""
     da = ir.dim_analysis
     op_tiles = da.op_tile_sizes[op_idx]
@@ -236,7 +261,9 @@ def _sbuf_dst_index_expr(ir: KernelIR, op_idx: int, tinfo: TensorInfo, ptile_dim
     return idx
 
 
-def _sbuf_tile_index_expr(ir: KernelIR, op_idx: int, tensor_name: str, tinfo: TensorInfo, ptile_dims: set[str]) -> str:
+def _sbuf_tile_index_expr(
+    ir: KernelIR, group_idx: int, op_idx: int, tensor_name: str, tinfo: TensorInfo, ptile_dims: set[str]
+) -> str:
     """Operand access into an SBUF buffer.
 
     Reshape goes before the slice because the NKI simulator
@@ -256,7 +283,7 @@ def _sbuf_tile_index_expr(ir: KernelIR, op_idx: int, tensor_name: str, tinfo: Te
         if n_slots_p == 1:
             expr = f"[0:{di_tp}, 0]"
         else:
-            flat = _flat_axis_range(ir, tensor_name, d_p, di_tp, op_tp, ptile_dims)
+            flat = _flat_axis_range(ir, group_idx, tensor_name, d_p, di_tp, op_tp, ptile_dims)
             expr = f".reshape(({di_tp} * {n_slots_p},))[{flat}]"
     else:
         d_p, d_f = dim_ids
@@ -272,29 +299,33 @@ def _sbuf_tile_index_expr(ir: KernelIR, op_idx: int, tensor_name: str, tinfo: Te
             expr = f"[{par_range}, 0, 0, 0:{di_tf}]"
         elif n_slots_p == 1:
             total_f = n_slots_f * di_tf
-            flat = _flat_axis_range(ir, tensor_name, d_f, di_tf, op_tf, ptile_dims)
+            flat = _flat_axis_range(ir, group_idx, tensor_name, d_f, di_tf, op_tf, ptile_dims)
             expr = f".reshape(({di_tp}, {total_f}))[{par_range}, {flat}]"
         elif n_slots_f == 1:
-            mid = _axis_slot_index(ir, tensor_name, d_p, op_tp // di_tp, ptile_dims)
+            mid = _axis_slot_index(ir, group_idx, tensor_name, d_p, op_tp // di_tp, ptile_dims)
             expr = f".reshape(({di_tp}, {n_slots_p}, {di_tf}))[{par_range}, {mid}, 0:{di_tf}]"
         else:
             total_f = n_slots_f * di_tf
-            mid = _axis_slot_index(ir, tensor_name, d_p, op_tp // di_tp, ptile_dims)
-            flat = _flat_axis_range(ir, tensor_name, d_f, di_tf, op_tf, ptile_dims)
+            mid = _axis_slot_index(ir, group_idx, tensor_name, d_p, op_tp // di_tp, ptile_dims)
+            flat = _flat_axis_range(ir, group_idx, tensor_name, d_f, di_tf, op_tf, ptile_dims)
             expr = f".reshape(({di_tp}, {n_slots_p}, {total_f}))[{par_range}, {mid}, {flat}]"
     return expr
 
 
-def _flat_axis_range(ir: KernelIR, tensor_name: str, dim_id: str, phys: int, op_size: int, ptile_dims: set[str]) -> str:
+def _flat_axis_range(
+    ir: KernelIR, group_idx: int, tensor_name: str, dim_id: str, phys: int, op_size: int, ptile_dims: set[str]
+) -> str:
     """Flat ``start:end`` range over a single flattened axis (``num_tiles * phys``)."""
-    start = _slot_expr(ir, tensor_name, dim_id, phys, ptile_dims)
+    start = _slot_expr(ir, group_idx, tensor_name, dim_id, phys, ptile_dims)
     end = f"{start} + {op_size}" if start != "0" else str(op_size)
     return f"{start}:{end}"
 
 
-def _axis_slot_index(ir: KernelIR, tensor_name: str, dim_id: str, op_slots: int, ptile_dims: set[str]) -> str:
+def _axis_slot_index(
+    ir: KernelIR, group_idx: int, tensor_name: str, dim_id: str, op_slots: int, ptile_dims: set[str]
+) -> str:
     """Integer (or slice) index for a num_tiles axis kept as a separate dimension."""
-    slot_start = _slot_expr(ir, tensor_name, dim_id, 1, ptile_dims)
+    slot_start = _slot_expr(ir, group_idx, tensor_name, dim_id, 1, ptile_dims)
     if op_slots <= 1:
         expr = slot_start
     elif slot_start == "0":
@@ -304,7 +335,7 @@ def _axis_slot_index(ir: KernelIR, tensor_name: str, dim_id: str, op_slots: int,
     return expr
 
 
-def _slot_expr(ir: KernelIR, tensor_name: str, dim_id: str, unit: int, ptile_dims: set[str]) -> str:
+def _slot_expr(ir: KernelIR, group_idx: int, tensor_name: str, dim_id: str, unit: int, ptile_dims: set[str]) -> str:
     """Flat slot offset on ``dim_id``, combining tier iteration with ptile iteration.
 
     ``unit`` is the per-slot stride — ``phys_tile`` for slot-
@@ -312,7 +343,7 @@ def _slot_expr(ir: KernelIR, tensor_name: str, dim_id: str, unit: int, ptile_dim
     count.
     """
     num_ptiles = ir.dim_analysis.dims[dim_id].num_ptiles
-    tier = ir.tensor_placements[(tensor_name, dim_id)]
+    tier = ir.fusion_groups[group_idx].tensor_placements.get((tensor_name, dim_id), "per_tile")
     tpb = ir.ltiles_per_block.get(dim_id, 1)
 
     terms: list[str] = []

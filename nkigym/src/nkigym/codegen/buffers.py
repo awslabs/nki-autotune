@@ -1,5 +1,21 @@
 """Tensor buffer allocation: on-chip SBUF and PSUM buffers.
 
+SBUF and PSUM buffers are declared with explicit
+``address=(base_partition, byte_offset)`` arguments and placed at
+the tightest Python scope that still covers their live range:
+
+* Persistent SBUF tensors (touched by 2+ fusion groups) declare at
+  kernel top and occupy low addresses that stay pinned for the
+  whole kernel.
+* Per-FG SBUF tensors (touched by exactly one fusion group) declare
+  at the top of that group's loop nest; each group's per-FG region
+  starts right after the persistent range, and the range is reused
+  by other groups' per-FG tensors.
+* PSUM tensors are always per-FG (PSUM never crosses groups) and
+  declare at the depth where their producer's outermost blocking
+  loop opens. PSUM addresses are packed into ``PSUM_BANK_SIZE``
+  banks within each group.
+
 SBUF is a multi-D ``nl.ndarray``. PSUM is a flat 2D ``nl.ndarray``
 (or a Python list of them when the producer writes >1 tile) —
 multi-D PSUM ndarrays tripped spurious reshape failures in the
@@ -9,41 +25,197 @@ NKI simulator.
 from nkigym.kernel_ir import KernelIR, get_tpb
 from nkigym.kernel_ir.dim_analysis import TensorInfo
 
+PSUM_BANK_SIZE = 2048
+"""Bytes per PSUM bank; each allocation is aligned up to this boundary."""
 
-def render_buffers(ir: KernelIR, indent: int, staged: set[str]) -> str:
-    """Emit buffer allocations for every tensor in the IR."""
-    da = ir.dim_analysis
-    tensor_to_psum_dtype = _build_psum_dtype_map(ir)
+_DTYPE_BYTES = {
+    "float32": 4,
+    "float16": 2,
+    "bfloat16": 2,
+    "int32": 4,
+    "uint32": 4,
+    "int16": 2,
+    "uint16": 2,
+    "int8": 1,
+    "uint8": 1,
+    "float8_e4m3": 1,
+    "float8_e5m2": 1,
+}
+
+
+def render_persistent_sbuf_buffers(
+    ir: KernelIR, indent: int, staged: set[str], tensor_to_groups: dict[str, set[int]]
+) -> str:
+    """Emit kernel-top SBUF allocations for tensors shared across fusion groups.
+
+    A tensor is persistent when two or more fusion groups touch
+    it (via op inputs or outputs). Persistent tensors get low
+    addresses starting at 0 and stay pinned for the whole kernel.
+    """
     lines: list[str] = []
     pad = "    " * indent
-
-    for name, tinfo in da.tensors.items():
-        is_psum = ir.op_graph.producer_isa_loc(name) == "psum"
-        if is_psum:
-            psum_dtype = tensor_to_psum_dtype.get(name, tinfo.dtype)
-            lines.append(_psum_line(ir, name, tinfo, psum_dtype, pad))
-            if name in staged:
-                lines.append(_sbuf_line(ir, name, tinfo, pad))
-        else:
-            lines.append(_sbuf_line(ir, name, tinfo, pad))
-
+    offset = 0
+    for name, tinfo in _persistent_sbuf_tensors(ir, staged, tensor_to_groups):
+        lines.append(_sbuf_line(ir, name, tinfo, pad, offset))
+        offset += _sbuf_bytes(ir, name, tinfo)
     return "\n".join(lines)
 
 
-def _sbuf_line(ir: KernelIR, name: str, tinfo: TensorInfo, pad: str) -> str:
-    """Emit a single SBUF ``nl.ndarray`` allocation line."""
+def render_per_group_sbuf_buffers(
+    ir: KernelIR, staged: set[str], tensor_to_groups: dict[str, set[int]]
+) -> dict[int, list[str]]:
+    """Emit per-FG SBUF declarations keyed by group index.
+
+    Each group's declarations live at depth 0 and start at the
+    byte offset just past the persistent range — per-FG regions
+    overlap across groups so the compiler reuses the same SBUF
+    addresses for tensors local to different groups.
+    """
+    by_group: dict[int, list[str]] = {}
+    persistent_end = sum(
+        _sbuf_bytes(ir, name, tinfo) for name, tinfo in _persistent_sbuf_tensors(ir, staged, tensor_to_groups)
+    )
+    for group_idx, names in _per_group_sbuf_tensors(ir, staged, tensor_to_groups).items():
+        lines: list[str] = []
+        offset = persistent_end
+        for name, tinfo in names:
+            lines.append(_sbuf_line(ir, name, tinfo, pad="", offset=offset))
+            offset += _sbuf_bytes(ir, name, tinfo)
+        by_group[group_idx] = lines
+    return by_group
+
+
+def render_psum_allocations(ir: KernelIR, op_to_group: dict[int, int]) -> dict[int, list[str]]:
+    """Return ``{group_idx: [alloc_lines]}`` for every PSUM tensor.
+
+    Every PSUM buffer is declared at the top of its fusion group
+    (depth 0), alongside the per-FG SBUF declarations. Per-iteration
+    zeroing still fires at the blocking depth via the memset that
+    ``render_nki_ops`` emits. PSUM tensors within a group pack into
+    ``PSUM_BANK_SIZE``-aligned byte offsets starting at 0; banks
+    between groups are reclaimed by the compiler because PSUM never
+    crosses group boundaries.
+    """
+    da = ir.dim_analysis
+    graph = ir.op_graph
+    tensor_to_psum_dtype = _build_psum_dtype_map(ir)
+    by_group: dict[int, list[str]] = {}
+    psum_offsets: dict[int, int] = {}
+    for name, tinfo in da.tensors.items():
+        if graph.producer_isa_loc(name) != "psum":
+            continue
+        producer = graph.producer_op(name)
+        if producer is None:
+            continue
+        group_idx = op_to_group[producer]
+        psum_dtype = tensor_to_psum_dtype.get(name, tinfo.dtype)
+        offset = psum_offsets.get(group_idx, 0)
+        by_group.setdefault(group_idx, []).append(_psum_line(ir, name, tinfo, psum_dtype, pad="", offset=offset))
+        psum_offsets[group_idx] = offset + _psum_bytes(ir, name, tinfo, psum_dtype)
+    return by_group
+
+
+def _persistent_sbuf_tensors(
+    ir: KernelIR, staged: set[str], tensor_to_groups: dict[str, set[int]]
+) -> list[tuple[str, TensorInfo]]:
+    """SBUF-needing tensors touched by 2+ fusion groups, in IR order."""
+    return [
+        (name, tinfo)
+        for name, tinfo in ir.dim_analysis.tensors.items()
+        if _needs_sbuf(ir, name, staged) and len(tensor_to_groups.get(name, ())) >= 2
+    ]
+
+
+def _per_group_sbuf_tensors(
+    ir: KernelIR, staged: set[str], tensor_to_groups: dict[str, set[int]]
+) -> dict[int, list[tuple[str, TensorInfo]]]:
+    """SBUF-needing tensors touched by exactly one fusion group, keyed by that group."""
+    result: dict[int, list[tuple[str, TensorInfo]]] = {gi: [] for gi in range(len(ir.fusion_groups))}
+    for name, tinfo in ir.dim_analysis.tensors.items():
+        if not _needs_sbuf(ir, name, staged):
+            continue
+        groups = tensor_to_groups.get(name, set())
+        if len(groups) == 1:
+            result[next(iter(groups))].append((name, tinfo))
+    return result
+
+
+def build_tensor_to_groups(ir: KernelIR) -> dict[str, set[int]]:
+    """Map every tensor to the set of fusion-group indices whose ops touch it."""
+    result: dict[str, set[int]] = {}
+    for gi, group in enumerate(ir.fusion_groups):
+        for op_idx in group.op_indices:
+            for name in ir.op_graph.op_tensor_names(op_idx):
+                result.setdefault(name, set()).add(gi)
+    return result
+
+
+def _needs_sbuf(ir: KernelIR, name: str, staged: set[str]) -> bool:
+    """True iff ``name`` needs an SBUF buffer (non-PSUM, or a staged PSUM tensor)."""
+    is_psum = ir.op_graph.producer_isa_loc(name) == "psum"
+    return (not is_psum) or (name in staged)
+
+
+def _sbuf_bytes(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> int:
+    """Byte footprint of an SBUF tensor on one partition (product of free dims × dtype)."""
+    shape = sbuf_shape(ir, tensor_name, tinfo)
+    free_elems = 1
+    for dim in shape[1:]:
+        free_elems *= dim
+    return free_elems * _dtype_bytes(tinfo.dtype)
+
+
+def _psum_bank_step(shape: tuple[int, ...], dtype: str) -> int:
+    """Per-tile byte footprint rounded up to a full PSUM bank."""
+    free_elems = 1
+    for dim in shape[1:]:
+        free_elems *= dim
+    tile_bytes = free_elems * _dtype_bytes(dtype)
+    return ((tile_bytes + PSUM_BANK_SIZE - 1) // PSUM_BANK_SIZE) * PSUM_BANK_SIZE
+
+
+def _psum_bytes(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, dtype: str) -> int:
+    """Byte footprint of one PSUM allocation, rounded up to a full bank per tile."""
+    shape = psum_tile_shape(ir, tensor_name, tinfo)
+    count = psum_tile_count(ir, tensor_name, tinfo)
+    return _psum_bank_step(shape, dtype) * count
+
+
+def _dtype_bytes(dtype: str) -> int:
+    """Byte size of one element in ``dtype``."""
+    if dtype not in _DTYPE_BYTES:
+        raise ValueError(f"Unknown dtype {dtype!r}")
+    return _DTYPE_BYTES[dtype]
+
+
+def _sbuf_line(ir: KernelIR, name: str, tinfo: TensorInfo, pad: str, offset: int) -> str:
+    """Emit a single SBUF ``nl.ndarray`` allocation line with an explicit address."""
     shape = sbuf_shape(ir, name, tinfo)
     shape_str = ", ".join(str(s) for s in shape)
-    return f"{pad}sbuf_{name} = nl.ndarray(({shape_str}), dtype=nl.{tinfo.dtype}, buffer=nl.sbuf)"
+    return (
+        f"{pad}sbuf_{name} = nl.ndarray(({shape_str}), dtype=nl.{tinfo.dtype}, "
+        f"buffer=nl.sbuf, address=(0, {offset}))"
+    )
 
 
-def _psum_line(ir: KernelIR, name: str, tinfo: TensorInfo, dtype: str, pad: str) -> str:
-    """Emit a PSUM allocation — a single 2D ndarray or a Python list of them."""
+def _psum_line(ir: KernelIR, name: str, tinfo: TensorInfo, dtype: str, pad: str, offset: int) -> str:
+    """Emit a PSUM allocation with explicit per-bank addresses.
+
+    Single-tile allocation emits one ``nl.ndarray`` at ``offset``;
+    multi-tile allocations emit a Python list of ``nl.ndarray`` at
+    consecutive bank-aligned offsets.
+    """
     shape = psum_tile_shape(ir, name, tinfo)
     shape_str = ", ".join(str(s) for s in shape)
-    tile_expr = f"nl.ndarray(({shape_str}), dtype=nl.{dtype}, buffer=nl.psum)"
     count = psum_tile_count(ir, name, tinfo)
-    rhs = tile_expr if count == 1 else f"[{tile_expr} for _ in range({count})]"
+    bank_step = _psum_bank_step(shape, dtype)
+    if count == 1:
+        rhs = f"nl.ndarray(({shape_str}), dtype=nl.{dtype}, buffer=nl.psum, address=(0, {offset}))"
+    else:
+        rhs = (
+            f"[nl.ndarray(({shape_str}), dtype=nl.{dtype}, buffer=nl.psum, "
+            f"address=(0, {offset} + _i * {bank_step})) for _i in range({count})]"
+        )
     return f"{pad}psum_{name} = {rhs}"
 
 
@@ -148,17 +320,23 @@ def psum_tile_slice(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> str:
 
 
 def psum_tile_count(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> int:
-    """Number of distinct PSUM tiles the producer op writes — product of ptile-loop trip counts."""
-    da = ir.dim_analysis
+    """Number of distinct PSUM tiles held simultaneously — product of per-dim PSUM buffer degrees.
+
+    Baseline (``buffer_degrees[("psum", t, d)] == 1`` everywhere)
+    gives count ``1``: a single PSUM ``nl.ndarray``. The ptile
+    loop (emitted by codegen when the producer's op tile is
+    narrower than the dim's logical tile) reuses that one PSUM
+    across iterations and stages to SBUF inside the loop.
+    Multi-buffering (degree > 1 on a dim) emits a Python list of
+    size equal to the product of degrees so that concurrent
+    iterations can alias different tiles.
+    """
     dim_ids = tinfo.dim_ids
     if len(dim_ids) not in (1, 2):
         raise ValueError(f"Tensor {tensor_name} has {len(dim_ids)} dims, expected 1 or 2")
-    op_tiles = producer_op_tiles(ir, tensor_name)
     count = 1
     for d in dim_ids:
-        di = da.dims[d]
-        op_tile = op_tiles.get(d, di.physical_tile_size)
-        count *= max(1, di.logical_tile_size // op_tile)
+        count *= _effective_buffer_degree(ir, "psum", tensor_name, d)
     return count
 
 
@@ -179,9 +357,9 @@ def num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     max_op_tile = _max_op_tile_for_tensor(ir, tensor_name, dim_id)
     num_ptiles = max_op_tile // di.physical_tile_size
 
-    tier = ir.tensor_placements[(tensor_name, dim_id)]
+    tier = _effective_sbuf_tier(ir, tensor_name, dim_id)
     tpb = get_tpb(ir, dim_id)
-    degree = ir.buffer_degrees[(tensor_name, dim_id)]
+    degree = _effective_buffer_degree(ir, "sbuf", tensor_name, dim_id)
 
     if tier == "per_tile":
         tpb_factor = 1
@@ -196,6 +374,27 @@ def num_tiles(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
         raise ValueError(f"Unknown tensor_placement tier: {tier!r}")
 
     return num_ptiles * tpb_factor * blocks_factor * degree
+
+
+def _effective_sbuf_tier(ir: KernelIR, tensor_name: str, dim_id: str) -> str:
+    """Return the widest SBUF tier this tensor sees across the groups that touch it.
+
+    A single physical SBUF buffer backs all uses of a tensor. Its
+    shape must fit the widest tier requested by any group that
+    touches the tensor. Groups that don't have an entry for the
+    tensor are ignored (they don't use this buffer).
+    """
+    return ir._effective_tier.get((tensor_name, dim_id), "per_tile")
+
+
+def _effective_buffer_degree(ir: KernelIR, kind: str, tensor_name: str, dim_id: str) -> int:
+    """Return the max multi-buffer degree this ``(kind, tensor, dim)`` sees across the groups that touch it.
+
+    A single physical buffer backs all uses of the tensor within
+    a group (PSUM) or across groups (SBUF). The buffer's slot
+    count must fit the largest degree requested.
+    """
+    return ir._effective_degree.get((kind, tensor_name, dim_id), 1)
 
 
 def _max_op_tile_for_tensor(ir: KernelIR, tensor_name: str, dim_id: str) -> int:

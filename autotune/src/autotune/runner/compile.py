@@ -125,6 +125,10 @@ def _run_compiler(kernel: Kernel, tensor_inputs: dict[str, np.ndarray], output_n
 
     Captures C-level stderr so compiler diagnostics (e.g. ``Out of
     memory in sbuf``) appear in the Python exception on failure.
+    ``compile_bir_to_neff`` swallows neuronx-cc failures and returns
+    a ``CompiledKernel`` with ``neuronx_cc_error`` set; surface that
+    as an exception so the caller sees the real diagnostic instead
+    of a generic "NEFF file not found".
     """
     frontend = TracerFrontend()
     with _capture_fd_stderr() as stderr_path:
@@ -133,7 +137,7 @@ def _run_compiler(kernel: Kernel, tensor_inputs: dict[str, np.ndarray], output_n
                 kernel, frontend=frontend, inputs=tensor_inputs, compile_opts=opts, output_names=[output_name]
             )
             input_arrays = [np.zeros(s.shape, dtype=np.dtype(s.dtype)) for s in cr.input_specs]
-            compile_bir_to_neff(
+            compiled = compile_bir_to_neff(
                 opts,
                 bir,
                 input_arrays,
@@ -141,9 +145,15 @@ def _run_compiler(kernel: Kernel, tensor_inputs: dict[str, np.ndarray], output_n
                 cr.output_names,
                 input_output_aliases=cr.input_output_aliases,
             )
+            if compiled.neuronx_cc_error:
+                stderr_content = Path(stderr_path).read_text().strip()
+                detail = (
+                    f"{compiled.neuronx_cc_error}\n{stderr_content}" if stderr_content else compiled.neuronx_cc_error
+                )
+                raise RuntimeError(detail)
         except Exception as exc:
             stderr_content = Path(stderr_path).read_text().strip()
-            if stderr_content:
+            if stderr_content and not isinstance(exc, RuntimeError):
                 raise RuntimeError(stderr_content) from exc
             raise
 

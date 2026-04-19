@@ -295,6 +295,7 @@ def _write_results_json(
             "worst_min_ms": max(times) if times else None,
             "mean_min_ms": sum(times) / len(times) if times else None,
             "best_kernel": min(successes, key=lambda r: r.min_ms).kernel_name if successes else None,
+            "best_mfu": max(r.mfu for r in successes) if successes else None,
         },
         "kernels": kernel_entries,
     }

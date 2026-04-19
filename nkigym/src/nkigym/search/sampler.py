@@ -21,10 +21,11 @@ def sample_variants(
     on ``group_dim_orders`` and ``tensor_placements``) and renders
     to source. Duplicates (same rendered source) are skipped. When
     ``cache_dir`` is set, each variant gets its own directory
-    ``<cache_dir>/kernels/<name>/`` containing ``<name>.py`` (the
-    kernel) and ``ir_<N>.md`` (a dump of the sampled ``KernelIR``
-    for variant N). Raises ``RuntimeError`` if uniqueness can't be
-    reached within ``max_tries_per_variant * num_variants`` draws.
+    ``<cache_dir>/kernels/<name>/`` containing ``ir_<N>.md`` (a
+    dump of the sampled ``KernelIR`` for variant N); the kernel
+    source itself is written by ``remote_profile``. Raises
+    ``RuntimeError`` if uniqueness can't be reached within
+    ``max_tries_per_variant * num_variants`` draws.
     """
     kernels_dir = cache_dir / "kernels" if cache_dir is not None else None
     if kernels_dir is not None:
@@ -45,7 +46,6 @@ def sample_variants(
         if kernels_dir is not None:
             variant_dir = kernels_dir / name
             variant_dir.mkdir(parents=True, exist_ok=True)
-            (variant_dir / f"{name}.py").write_text(source)
             (variant_dir / f"ir_{idx}.md").write_text(repr(candidate))
         variants.append((name, candidate, source))
     if len(variants) < num_variants:

@@ -1,14 +1,15 @@
 """remote_search: sample unique kernel variants and profile them on remote Trainium hosts."""
 
-import json
 import random
-import shutil
+from collections.abc import Callable
 from pathlib import Path
+
+import numpy as np
 
 from autotune.runner.api import remote_profile
 from autotune.runner.output import ProfileOutput
 from autotune.runner.types import KernelJob, ProfileConfig
-from nkigym.kernel_ir import KernelIR
+from nkigym.kernel_ir import build_ir
 from nkigym.search.sampler import sample_variants
 
 _WARMUP = 10
@@ -16,7 +17,7 @@ _ITERS = 100
 
 
 def remote_search(
-    initial_kernel: KernelIR,
+    func: Callable[..., np.ndarray],
     input_specs: dict[str, tuple[tuple[int, ...], str]],
     golden_source: str,
     golden_func_name: str,
@@ -28,22 +29,20 @@ def remote_search(
     seed: int | None = None,
     config: ProfileConfig = ProfileConfig(),
 ) -> ProfileOutput:
-    """Sample ``num_variants`` unique variants from ``initial_kernel`` and profile them.
+    """Sample ``num_variants`` unique variants from ``func`` and profile them.
 
-    Rejection-samples ``(group_dim_orders, tensor_placements)`` via
-    ``sample_variants``, dumping each sampled IR and rendered source
-    to ``<cache_dir>/kernels/<name>/`` as it is drawn, then wraps
-    every variant in a ``KernelJob`` and delegates to
-    ``remote_profile``. After profiling, the per-variant neuron
-    compiler log and auxiliary ``nki/`` / ``neff/`` directories
-    written by ``remote_profile`` are consolidated under the
-    matching ``<cache_dir>/kernels/<name>/`` subdirectory.
-    Benchmark warmup and iters are fixed at ``10`` and ``100``.
+    Builds a seed ``KernelIR`` for ``func`` internally, then
+    rejection-samples ``(group_dim_orders, tensor_placements)`` via
+    ``sample_variants``, dumping each sampled IR to
+    ``<cache_dir>/kernels/<name>/`` as it is drawn, then wraps every
+    variant in a ``KernelJob`` and delegates to ``remote_profile``,
+    which writes the kernel source and compiler log to the same
+    per-variant directory. Benchmark warmup and iters are fixed at
+    ``10`` and ``100``.
 
     Args:
-        initial_kernel: Seed IR. Its fusion_groups, ltiles_per_block,
-            and buffer_degrees carry through to every sampled variant
-            unchanged; only dim_order and tensor_placements are drawn.
+        func: Math function using NKIOp classes. Dimension analysis
+            and the seed op graph are derived from this.
         input_specs: ``{param_name: (shape, dtype)}`` used by every
             variant.
         golden_source: Source code of the reference numpy function.
@@ -60,8 +59,8 @@ def remote_search(
         ProfileOutput with per-variant timing and correctness.
     """
     rng = random.Random(seed)
-    cache_path = Path(cache_dir)
-    variants = sample_variants(initial_kernel, num_variants, rng, cache_dir=cache_path)
+    initial_kernel = build_ir(func, input_specs, seed=seed)
+    variants = sample_variants(initial_kernel, num_variants, rng, cache_dir=Path(cache_dir))
     kernels: dict[str, KernelJob] = {
         f"{name}.py": KernelJob(
             source=source,
@@ -73,46 +72,6 @@ def remote_search(
         )
         for name, _ir, source in variants
     }
-    output = remote_profile(
+    return remote_profile(
         kernels=kernels, hosts=hosts, cache_dir=cache_dir, warmup=_WARMUP, iters=_ITERS, config=config
     )
-    _consolidate_cache(cache_path, [name for name, _, _ in variants])
-    return output
-
-
-def _consolidate_cache(cache_dir: Path, variant_names: list[str]) -> None:
-    """Fold ``<cache>/nki/`` and ``<cache>/neff/`` into ``<cache>/kernels/<name>/``.
-
-    ``remote_profile`` writes kernel sources under ``<cache>/nki/``
-    and the neuron compiler log under
-    ``<cache>/neff/<name>/log-neuron-cc.txt``. This helper moves
-    everything into the per-variant ``<cache>/kernels/<name>/``
-    directory the sampler already populated, removes the now-empty
-    ``nki/`` and ``neff/`` directories, and rewrites
-    ``results.json`` entries to point at the new paths.
-    """
-    nki_dir = cache_dir / "nki"
-    neff_dir = cache_dir / "neff"
-    kernels_dir = cache_dir / "kernels"
-    for name in variant_names:
-        variant_dir = kernels_dir / name
-        variant_dir.mkdir(parents=True, exist_ok=True)
-        neff_src = neff_dir / name
-        if neff_src.exists():
-            for entry in neff_src.iterdir():
-                shutil.move(str(entry), str(variant_dir / entry.name))
-            neff_src.rmdir()
-    if nki_dir.exists():
-        shutil.rmtree(nki_dir)
-    if neff_dir.exists():
-        shutil.rmtree(neff_dir)
-
-    results_path = cache_dir / "results.json"
-    if results_path.exists():
-        data = json.loads(results_path.read_text())
-        for entry in data.get("kernels", []):
-            kname = entry.get("kernel_name", "")
-            stem = Path(kname).stem
-            entry["kernel_path"] = f"kernels/{stem}/{stem}.py"
-            entry.pop("nki_path", None)
-        results_path.write_text(json.dumps(data, indent=2))

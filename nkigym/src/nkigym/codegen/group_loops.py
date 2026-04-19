@@ -48,7 +48,7 @@ def render_group_loops(
     before = before_plan or {}
     after = after_plan or {}
     lines: list[str] = []
-    for group_idx in ir.op_graph.toposort_groups(ir.fusion_groups):
+    for group_idx in ir.op_graph.toposort_groups([g.op_indices for g in ir.fusion_groups]):
         lines.extend(_render_group(ir, group_idx, body_indent, before.get(group_idx, {}), after.get(group_idx, {})))
 
     return "\n".join(lines)
@@ -84,12 +84,12 @@ def _render_group(
     """
     da = ir.dim_analysis
     group = ir.fusion_groups[group_idx]
-    dim_order = ir.group_dim_orders[group_idx]
+    dim_order = group.dim_order
     n = len(dim_order)
     tpb_by_dim = {dim_id: get_tpb(ir, dim_id) for dim_id in dim_order}
 
     lines: list[str] = []
-    op_names = ", ".join(ir.op_graph.op_classes[i].NAME for i in group)
+    op_names = ", ".join(ir.op_graph.op_classes[i].NAME for i in group.op_indices)
     dim_str = ", ".join(dim_order) if dim_order else "(none)"
     lines.append("    " * base_indent + f"# Group {group_idx}: {op_names} [dims: {dim_str}]")
 
