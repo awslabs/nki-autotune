@@ -5,11 +5,13 @@ operand0/operand1: scalar constant or (P,) column vector,
 broadcast across the free axis.
 """
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 
 from nkigym.ops.base import NKIOp
+
+_OPS: dict[str, Any] = {"multiply": np.multiply, "subtract": np.subtract, "add": np.add}
 
 VE_PARTITION_MAX = 128
 VE_FREE_MAX = 512
@@ -36,21 +38,12 @@ class NKITensorScalar(NKIOp):
     ISA_LOC: ClassVar[str] = "sbuf"
     PSUM_DTYPE: ClassVar[str | None] = None
     INPUT_LOCS: ClassVar[dict[str, str]] = {"data": "sbuf"}
+    FLOAT32_KWARGS: ClassVar[frozenset[str]] = frozenset({"operand0", "operand1"})
 
-    def __call__(
-        self,
-        data: np.ndarray,
-        op0: str,
-        operand0: np.ndarray | float,
-        reverse0: bool = False,
-        op1: str | None = None,
-        operand1: np.ndarray | float | None = None,
-        reverse1: bool = False,
-        **_: object,
-    ) -> np.ndarray:
+    def __call__(self, **kwargs: Any) -> np.ndarray:
         """CPU simulation: (data <op0> operand0) <op1> operand1.
 
-        Args:
+        Kwargs:
             data: Array of shape (P, F) or (P,).
             op0: First operation name.
             operand0: Scalar or (P,) vector.
@@ -62,12 +55,18 @@ class NKITensorScalar(NKIOp):
         Returns:
             Result array, same shape as data.
         """
-        ops = {"multiply": np.multiply, "subtract": np.subtract, "add": np.add}
+        data: np.ndarray = kwargs["data"]
+        op0: str = kwargs["op0"]
+        operand0 = kwargs["operand0"]
+        reverse0: bool = kwargs.get("reverse0", False)
+        op1: str | None = kwargs.get("op1")
+        operand1 = kwargs.get("operand1")
+        reverse1: bool = kwargs.get("reverse1", False)
         b = operand0[..., np.newaxis] if isinstance(operand0, np.ndarray) else operand0
-        result = ops[op0](b, data) if reverse0 else ops[op0](data, b)
+        result = _OPS[op0](b, data) if reverse0 else _OPS[op0](data, b)
         if op1 is not None:
             c = operand1[..., np.newaxis] if isinstance(operand1, np.ndarray) else operand1
-            result = ops[op1](c, result) if reverse1 else ops[op1](result, c)
+            result = _OPS[op1](c, result) if reverse1 else _OPS[op1](result, c)
         return result
 
     @classmethod

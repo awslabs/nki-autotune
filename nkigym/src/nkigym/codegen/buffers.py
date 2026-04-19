@@ -152,7 +152,7 @@ def _sbuf_bytes(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> int:
     free_elems = 1
     for dim in shape[1:]:
         free_elems *= dim
-    return free_elems * _dtype_bytes(tinfo.dtype)
+    return free_elems * _dtype_bytes(sbuf_dtype(ir, tensor_name, tinfo))
 
 
 def _psum_bank_step(shape: tuple[int, ...], dtype: str) -> int:
@@ -188,7 +188,36 @@ def _sbuf_line(ir: KernelIR, name: str, tinfo: TensorInfo, pad: str, offset: int
     del offset
     shape = sbuf_shape(ir, name, tinfo)
     shape_str = ", ".join(str(s) for s in shape)
-    return f"{pad}sbuf_{name} = nl.ndarray(({shape_str}), dtype=nl.{tinfo.dtype}, buffer=nl.sbuf)"
+    dtype = sbuf_dtype(ir, name, tinfo)
+    return f"{pad}sbuf_{name} = nl.ndarray(({shape_str}), dtype=nl.{dtype}, buffer=nl.sbuf)"
+
+
+def sbuf_dtype(ir: KernelIR, name: str, tinfo: TensorInfo) -> str:
+    """Promote the SBUF dtype to float32 if any consumer reads it through a FLOAT32_KWARGS role.
+
+    NKI hardware requires ``operand0``/``operand1`` of
+    ``nisa.tensor_scalar`` and ``scale`` of ``nisa.activation`` /
+    ``nisa.activation_reduce`` to be float32 regardless of the
+    data tile's dtype. If this tensor feeds any such role in any
+    op, the backing SBUF buffer must be float32 or the compiler
+    rejects the MLIR. Otherwise the logical dtype from
+    ``dim_analysis`` stands.
+    """
+    graph = ir.op_graph
+    promote = False
+    for op_idx, op_cls in enumerate(graph.op_classes):
+        f32_roles = op_cls.FLOAT32_KWARGS
+        if not f32_roles:
+            continue
+        all_kwargs = graph.op_all_kwargs[op_idx]
+        for role in f32_roles:
+            raw = all_kwargs.get(role)
+            if raw is None:
+                continue
+            value = raw[1:-1] if raw.startswith("'") and raw.endswith("'") else raw
+            if value == name:
+                promote = True
+    return "float32" if promote else tinfo.dtype
 
 
 def _psum_line(ir: KernelIR, name: str, tinfo: TensorInfo, dtype: str, pad: str, offset: int) -> str:

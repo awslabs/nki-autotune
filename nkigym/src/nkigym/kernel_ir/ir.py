@@ -382,34 +382,34 @@ def _rand_blocking_inner_perm(order: list[str], blocking: set[str], rng: random.
 
 
 def _forced_full_pairs(ir: "KernelIR", op_to_group: dict[int, int]) -> set[tuple[int, str, str]]:
-    """Return ``(group, tensor, dim)`` triples forced to ``full`` by the cross-group rule.
+    """Return ``(group, tensor, dim)`` triples forced to ``full`` by cross-group rules.
 
-    A cross-group tensor's SBUF buffer must be ``full`` in BOTH
-    the producer's and the consumer's group on every dim that
-    appears in both groups' ``dim_order`` (the rule in
-    ``_check_cross_group_placements``). Both groups get entries
-    because tiers are now per-group and must independently
-    agree. Membership of ``dim_order`` is invariant under the
-    sampler's permutations, so these triples can be computed
-    once.
+    A tensor shared across multiple fusion groups (either
+    producer→consumer edges or a kernel input feeding several
+    consumer groups) must have ``tier=full`` in every group that
+    touches it, on every dim the tensor carries that also appears
+    in that group's ``dim_order``. Otherwise one group's iteration
+    can overwrite slots another group hasn't read yet, or an
+    under-loaded SBUF feeds downstream groups stale data.
     """
     da = ir.dim_analysis
     graph = ir.op_graph
     group_dim_sets = [set(group.dim_order) for group in ir.fusion_groups]
+    tensor_to_groups: dict[str, set[int]] = {}
+    for gi, group in enumerate(ir.fusion_groups):
+        for op_idx in group.op_indices:
+            for name in graph.op_tensor_names(op_idx):
+                if name in da.tensors:
+                    tensor_to_groups.setdefault(name, set()).add(gi)
+
     forced: set[tuple[int, str, str]] = set()
-    for consumer_idx, (inputs, _outputs) in enumerate(graph.op_tensors):
-        g_c = op_to_group[consumer_idx]
-        for tensor_name in inputs.values():
-            if tensor_name not in da.tensors:
-                continue
-            producer = graph.producer_op(tensor_name)
-            if producer is None or op_to_group[producer] == g_c:
-                continue
-            g_p = op_to_group[producer]
-            shared = group_dim_sets[g_p] & group_dim_sets[g_c] & set(da.tensors[tensor_name].dim_ids)
-            for d in shared:
-                forced.add((g_p, tensor_name, d))
-                forced.add((g_c, tensor_name, d))
+    for tensor_name, groups in tensor_to_groups.items():
+        if len(groups) < 2:
+            continue
+        tensor_dims = set(da.tensors[tensor_name].dim_ids)
+        for gi in groups:
+            for d in group_dim_sets[gi] & tensor_dims:
+                forced.add((gi, tensor_name, d))
     return forced
 
 

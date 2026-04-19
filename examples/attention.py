@@ -84,7 +84,7 @@ def attention_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
         on_true_tile=S, pattern=[[-1, K.shape[0]]], channel_multiplier=1, on_false_value=-np.inf, cmp_op="greater_equal"
     )
     scaled_S = NKITensorScalar()(data=masked_S, op0="multiply", operand0=scale)
-    neg_max = NKITensorReduce()(data=scaled_S, op="max", axis=1, negate=True)
+    neg_max = NKITensorReduce()(data=scaled_S, op="maximum", axis=1, negate=True)
     exp_S, sum_exp = NKIActivationReduce()(data=scaled_S, op="exp", reduce_op="add", bias=neg_max)
     inv_sum = NKIActivation()(data=sum_exp, op="reciprocal")
     exp_S_t = NKITranspose()(data=exp_S)
@@ -94,7 +94,7 @@ def attention_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    seq_len, d_k, d_v = 2048, 128, 128
+    seq_len, d_k, d_v = 512, 128, 128
     input_specs = {
         "Q": ((seq_len, d_k), "bfloat16"),
         "K": ((seq_len, d_k), "bfloat16"),

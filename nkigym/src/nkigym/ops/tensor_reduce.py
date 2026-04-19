@@ -4,11 +4,13 @@ Reduce along the free axis with optional negation.
 data(P, F) -> output(P,).
 """
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 
 from nkigym.ops.base import NKIOp
+
+_REDUCE_FNS = {"maximum": np.max, "add": np.sum}
 
 VE_PARTITION_MAX = 128
 VE_FREE_MAX = 512
@@ -35,14 +37,12 @@ class NKITensorReduce(NKIOp):
     PSUM_DTYPE: ClassVar[str | None] = None
     INPUT_LOCS: ClassVar[dict[str, str]] = {"data": "sbuf"}
 
-    def __call__(
-        self, data: np.ndarray, op: str, axis: int = 1, negate: bool = False, keepdims: bool = False, **_: object
-    ) -> np.ndarray:
+    def __call__(self, **kwargs: Any) -> np.ndarray:
         """CPU simulation: reduce along axis with optional negation.
 
-        Args:
+        Kwargs:
             data: Array of shape (P, F).
-            op: Reduction operation (``"max"`` or ``"add"``).
+            op: Reduction operation (``"maximum"`` or ``"add"``).
             axis: Axis to reduce (default 1 = free axis).
             negate: Negate the result.
             keepdims: Keep reduced dimensions.
@@ -50,8 +50,12 @@ class NKITensorReduce(NKIOp):
         Returns:
             Reduced array of shape (P,) or (P, 1) if keepdims.
         """
-        reduce_fns = {"max": np.max, "add": np.sum}
-        result = reduce_fns[op](data, axis=axis, keepdims=keepdims)
+        data: np.ndarray = kwargs["data"]
+        op: str = kwargs["op"]
+        axis: int = kwargs.get("axis", 1)
+        negate: bool = kwargs.get("negate", False)
+        keepdims: bool = kwargs.get("keepdims", False)
+        result = _REDUCE_FNS[op](data, axis=axis, keepdims=keepdims)
         if negate:
             result = -result
         return result

@@ -8,7 +8,7 @@ per-dim ``i_ptile_{d}`` loops.
 """
 
 from nkigym.codegen.buffers import num_tiles, producer_op_tiles, psum_tile_count, psum_tile_slice
-from nkigym.codegen.dma import producer_finished_depth, ptile_loop_dims, sbuf_ptile_slice
+from nkigym.codegen.dma import producer_finished_depth, ptile_loop_dims, sbuf_axis_index, sbuf_ptile_slice
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.kernel_ir import KernelIR
 from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
@@ -132,7 +132,55 @@ def _isa_call_line(
     _rewrite_tensor_valued_scalars(ir, group_idx, op_idx, scalar_kwargs, staged, ptile_lookup)
     for ax_name, expr in dst_map.items():
         scalar_kwargs[f"__dst_{ax_name}"] = expr
+    _inject_tile_geometry(ir, op_idx, scalar_kwargs, ptile_lookup)
     return op_cls.format_isa_call(dst, operands, scalar_kwargs)
+
+
+def _inject_tile_geometry(ir: KernelIR, op_idx: int, scalar_kwargs: dict[str, str], ptile_dims: set[str]) -> None:
+    """Inject per-operand-axis tile-start and tile-size into ``scalar_kwargs``.
+
+    For each input role with abstract axes, expose the concrete
+    dim ID, the element-offset start expression (combining
+    ``i_block_``/``i_ltile_``/``i_ptile_`` according to the
+    per-op ptile set), and the element-size of one op tile on
+    that axis. Ops that need global position awareness (e.g.
+    ``affine_select`` per-tile pattern / offset rewrite) read
+    these from ``scalar_kwargs``; ops that don't, ignore them.
+    """
+    da = ir.dim_analysis
+    op_cls = ir.op_graph.op_classes[op_idx]
+    inputs, _outputs = ir.op_graph.op_tensors[op_idx]
+    op_tiles = da.op_tile_sizes[op_idx]
+    for role, axes in op_cls.OPERAND_AXES.items():
+        tensor_name = inputs.get(role)
+        if tensor_name is None or tensor_name not in da.tensors:
+            continue
+        tinfo = da.tensors[tensor_name]
+        for ax_name, dim_id in zip(axes, tinfo.dim_ids):
+            scalar_kwargs[f"__axis_dim_{ax_name}"] = dim_id
+            scalar_kwargs[f"__tile_start_{ax_name}"] = _tile_start_expr(ir, dim_id, ptile_dims)
+            scalar_kwargs[f"__tile_size_{ax_name}"] = str(op_tiles.get(dim_id, da.dims[dim_id].physical_tile_size))
+
+
+def _tile_start_expr(ir: KernelIR, dim_id: str, ptile_dims: set[str]) -> str:
+    """Global element-offset start expression for one dim of the current iteration."""
+    di = ir.dim_analysis.dims[dim_id]
+    tpb = ir.ltiles_per_block.get(dim_id, 1)
+    logical = di.logical_tile_size
+    phys = di.physical_tile_size
+    block_stride = logical * tpb
+    terms: list[str] = []
+    if block_stride > 1:
+        terms.append(f"i_block_{dim_id} * {block_stride}")
+    else:
+        terms.append(f"i_block_{dim_id}")
+    if logical > 1:
+        terms.append(f"i_ltile_{dim_id} * {logical}")
+    else:
+        terms.append(f"i_ltile_{dim_id}")
+    if dim_id in ptile_dims:
+        terms.append(f"i_ptile_{dim_id} * {phys}" if phys > 1 else f"i_ptile_{dim_id}")
+    return " + ".join(terms)
 
 
 def _rewrite_tensor_valued_scalars(
@@ -230,7 +278,7 @@ def _dst_index_expr(
     expr = (
         _psum_index_expr(ir, tensor_name, tinfo, ptile_dims)
         if is_psum
-        else _sbuf_dst_index_expr(ir, group_idx, op_idx, tinfo, ptile_dims)
+        else _sbuf_dst_index_expr(ir, group_idx, op_idx, tensor_name, tinfo, ptile_dims)
     )
     return expr
 
@@ -258,23 +306,33 @@ def _psum_index_expr(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, ptile_di
     return slice_expr if list_idx is None else f"[{list_idx}]{slice_expr}"
 
 
-def _sbuf_dst_index_expr(ir: KernelIR, group_idx: int, op_idx: int, tinfo: TensorInfo, ptile_dims: set[str]) -> str:
-    """Destination index into a 4D (or 2D) SBUF buffer — no reshape."""
+def _sbuf_dst_index_expr(
+    ir: KernelIR, group_idx: int, op_idx: int, tensor_name: str, tinfo: TensorInfo, ptile_dims: set[str]
+) -> str:
+    """Destination index into a 4D (or 2D) SBUF buffer — no reshape.
+
+    Walks ``sbuf_axis_index`` so each axis's range reflects the
+    tensor's tier and the in-scope block/ltile loops at the
+    innermost body depth. Full-tier buffers advance with
+    iteration; per_tile buffers stay at slot 0.
+    """
     da = ir.dim_analysis
-    op_tiles = da.op_tile_sizes[op_idx]
+    dim_order = ir.fusion_groups[group_idx].dim_order
+    depth = 2 * len(dim_order)
+    ptile_frozen = frozenset(ptile_dims)
     dim_ids = tinfo.dim_ids
     if len(dim_ids) == 2:
         d_p, d_f = dim_ids
         di_tp = da.dims[d_p].physical_tile_size
         di_tf = da.dims[d_f].physical_tile_size
-        ptile_p = _slot_index(d_p, di_tp, op_tiles.get(d_p, di_tp), ptile_dims)
-        ptile_f = _slot_index(d_f, di_tf, op_tiles.get(d_f, di_tf), ptile_dims)
-        idx = f"[0:{di_tp}, {ptile_p}, {ptile_f}, 0:{di_tf}]"
+        p_idx = sbuf_axis_index(ir, group_idx, tensor_name, d_p, dim_order, depth, ptile_frozen)
+        f_idx = sbuf_axis_index(ir, group_idx, tensor_name, d_f, dim_order, depth, ptile_frozen)
+        idx = f"[0:{di_tp}, {p_idx}, {f_idx}, 0:{di_tf}]"
     else:
         d_p = dim_ids[0]
         di_tp = da.dims[d_p].physical_tile_size
-        ptile_p = _slot_index(d_p, di_tp, op_tiles.get(d_p, di_tp), ptile_dims)
-        idx = f"[0:{di_tp}, {ptile_p}]"
+        p_idx = sbuf_axis_index(ir, group_idx, tensor_name, d_p, dim_order, depth, ptile_frozen)
+        idx = f"[0:{di_tp}, {p_idx}]"
     return idx
 
 
@@ -300,8 +358,8 @@ def _sbuf_tile_index_expr(
         if n_slots_p == 1:
             expr = f"[0:{di_tp}, 0]"
         else:
-            flat = _flat_axis_range(ir, group_idx, tensor_name, d_p, di_tp, op_tp, ptile_dims)
-            expr = f".reshape(({di_tp} * {n_slots_p},))[{flat}]"
+            slot = _axis_slot_index(ir, group_idx, tensor_name, d_p, op_tp // di_tp, ptile_dims)
+            expr = f"[0:{di_tp}, {slot}]"
     else:
         d_p, d_f = dim_ids
         di_tp = da.dims[d_p].physical_tile_size
@@ -373,19 +431,3 @@ def _slot_expr(ir: KernelIR, group_idx: int, tensor_name: str, dim_id: str, unit
     if dim_id in ptile_dims:
         terms.append(f"i_ptile_{dim_id} * {unit}" if unit > 1 else f"i_ptile_{dim_id}")
     return " + ".join(terms) if terms else "0"
-
-
-def _slot_index(dim_id: str, physical_tile: int, op_tile: int, ptile_dims: set[str]) -> str:
-    """Physical-tile slice index for one dim of the op's tile — ``i_ptile_{d}``-scaled, ``0:n`` static span, or ``0``."""
-    num_ptiles = op_tile // physical_tile
-    if dim_id in ptile_dims:
-        expr = (
-            f"i_ptile_{dim_id}"
-            if num_ptiles <= 1
-            else f"i_ptile_{dim_id} * {num_ptiles}:(i_ptile_{dim_id} + 1) * {num_ptiles}"
-        )
-    elif num_ptiles > 1:
-        expr = f"0:{num_ptiles}"
-    else:
-        expr = "0"
-    return expr

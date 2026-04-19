@@ -121,45 +121,30 @@ def tier_depth_range(tier: str, pos: int, n: int) -> tuple[int, int]:
 
 
 def _check_cross_group_placements(ir: Any, op_to_group: dict[int, int]) -> bool:
-    """Cross-group tensors must be ``full`` in both groups on shared-scope dims.
+    """Cross-group tensors must be ``full`` in every touching group on shared-scope dims.
 
-    A tensor ``t`` produced by op ``p`` and consumed by op ``c``
-    in a different fusion group survives between two group loop
-    nests that run sequentially. For every dim ``d`` that (a)
-    ``t`` carries, (b) appears in the producer group's
-    ``dim_order``, and (c) appears in the consumer group's
-    ``dim_order``, both ``tensor_placements[(g_p, t, d)]`` and
-    ``tensor_placements[(g_c, t, d)]`` must be ``"full"``. Any
-    lesser tier on either side lets the producer's outer
-    iterations overwrite slots the consumer hasn't read yet, or
-    forces the consumer to read a slot the producer never
-    materialized.
+    A tensor ``t`` that is touched by two or more fusion groups
+    survives between their sequential loop nests. For every dim
+    ``d`` the tensor carries, each touching group that has ``d``
+    in its ``dim_order`` must pin ``tensor_placements[(g, t, d)]``
+    to ``"full"``. Any lesser tier lets one group's outer
+    iterations overwrite slots another group hasn't read yet, or
+    leaves a kernel input under-loaded when a later consumer
+    group reads it.
     """
-    graph = ir.op_graph
-    return all(_consumer_placements_ok(ir, op_to_group, consumer_idx) for consumer_idx in range(len(graph.op_tensors)))
-
-
-def _consumer_placements_ok(ir: Any, op_to_group: dict[int, int], consumer_idx: int) -> bool:
-    """Check every cross-group edge feeding one consumer op."""
-    inputs, _ = ir.op_graph.op_tensors[consumer_idx]
-    g_c = op_to_group[consumer_idx]
-    consumer_dims = set(ir.fusion_groups[g_c].dim_order)
-    return all(_edge_ok(ir, op_to_group, name, g_c, consumer_dims) for name in inputs.values())
-
-
-def _edge_ok(ir: Any, op_to_group: dict[int, int], tensor_name: str, g_c: int, consumer_dims: set[str]) -> bool:
-    """Check a single producer→consumer edge for a cross-group placement rule."""
+    del op_to_group
     da = ir.dim_analysis
-    producer = ir.op_graph.producer_op(tensor_name) if tensor_name in da.tensors else None
-    shared: set[str] = set()
-    g_p = -1
-    if producer is not None and op_to_group[producer] != g_c:
-        g_p = op_to_group[producer]
-        producer_dims = set(ir.fusion_groups[g_p].dim_order)
-        shared = producer_dims & consumer_dims & set(da.tensors[tensor_name].dim_ids)
-    p_placements = ir.fusion_groups[g_p].tensor_placements if g_p >= 0 else {}
-    c_placements = ir.fusion_groups[g_c].tensor_placements
+    graph = ir.op_graph
+    tensor_to_groups: dict[str, set[int]] = {}
+    for gi, group in enumerate(ir.fusion_groups):
+        for op_idx in group.op_indices:
+            for name in graph.op_tensor_names(op_idx):
+                if name in da.tensors:
+                    tensor_to_groups.setdefault(name, set()).add(gi)
     return all(
-        p_placements.get(("sbuf", tensor_name, d)) == "full" and c_placements.get(("sbuf", tensor_name, d)) == "full"
-        for d in shared
+        ir.fusion_groups[gi].tensor_placements.get(("sbuf", tensor_name, d)) == "full"
+        for tensor_name, groups in tensor_to_groups.items()
+        if len(groups) >= 2
+        for gi in groups
+        for d in set(ir.fusion_groups[gi].dim_order) & set(da.tensors[tensor_name].dim_ids)
     )

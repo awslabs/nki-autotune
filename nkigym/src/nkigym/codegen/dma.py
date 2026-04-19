@@ -223,18 +223,18 @@ def _sbuf_slice_ptile(
         d_p, d_f = dim_ids
         tp = da.dims[d_p].physical_tile_size
         tf = da.dims[d_f].physical_tile_size
-        p_idx = _sbuf_axis_index(ir, group_idx, tensor_name, d_p, dim_order, depth, ptile_dims)
-        f_idx = _sbuf_axis_index(ir, group_idx, tensor_name, d_f, dim_order, depth, ptile_dims)
+        p_idx = sbuf_axis_index(ir, group_idx, tensor_name, d_p, dim_order, depth, ptile_dims)
+        f_idx = sbuf_axis_index(ir, group_idx, tensor_name, d_f, dim_order, depth, ptile_dims)
         expr = f"[0:{tp}, {p_idx}, {f_idx}, 0:{tf}]"
     else:
         d_p = dim_ids[0]
         tp = da.dims[d_p].physical_tile_size
-        p_idx = _sbuf_axis_index(ir, group_idx, tensor_name, d_p, dim_order, depth, ptile_dims)
+        p_idx = sbuf_axis_index(ir, group_idx, tensor_name, d_p, dim_order, depth, ptile_dims)
         expr = f"[0:{tp}, {p_idx}]"
     return expr
 
 
-def _sbuf_axis_index(
+def sbuf_axis_index(
     ir: KernelIR,
     group_idx: int,
     tensor_name: str,

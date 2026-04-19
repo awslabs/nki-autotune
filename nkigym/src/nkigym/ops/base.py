@@ -40,6 +40,7 @@ class NKIOp:
     ISA_LOC: ClassVar[str] = "sbuf"
     PSUM_DTYPE: ClassVar[str | None] = None
     INPUT_LOCS: ClassVar[dict[str, str]] = {}
+    FLOAT32_KWARGS: ClassVar[frozenset[str]] = frozenset()
     _NKI_OP_KWARGS: ClassVar[frozenset[str]] = frozenset({"op", "reduce_op", "cmp_op", "op0", "op1"})
 
     @abstractmethod
@@ -67,7 +68,7 @@ class NKIOp:
         parts: list[str] = []
         if scalar_kwargs:
             for k, v in scalar_kwargs.items():
-                if k in exclude or k.startswith("__dst_"):
+                if k in exclude or k.startswith("__"):
                     continue
                 if k in cls._NKI_OP_KWARGS and v.startswith("'") and v.endswith("'"):
                     v = f"nl.{v[1:-1]}"

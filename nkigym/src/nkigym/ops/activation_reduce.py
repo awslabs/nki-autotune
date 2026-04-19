@@ -4,11 +4,14 @@ op(data * scale + bias) -> output(P, F), and simultaneously
 reduce_op(output) along free axis -> reduce_res(P,).
 """
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 
 from nkigym.ops.base import NKIOp
+
+_ACT_FNS: dict[str, Any] = {"exp": np.exp, "tanh": np.tanh, "square": np.square, "reciprocal": lambda x: 1.0 / x}
+_RED_FNS: dict[str, Any] = {"add": np.sum}
 
 VE_PARTITION_MAX = 128
 VE_FREE_MAX = 512
@@ -35,19 +38,12 @@ class NKIActivationReduce(NKIOp):
     ISA_LOC: ClassVar[str] = "sbuf"
     PSUM_DTYPE: ClassVar[str | None] = None
     INPUT_LOCS: ClassVar[dict[str, str]] = {"data": "sbuf", "bias": "sbuf"}
+    FLOAT32_KWARGS: ClassVar[frozenset[str]] = frozenset({"scale"})
 
-    def __call__(
-        self,
-        data: np.ndarray,
-        op: str,
-        reduce_op: str,
-        bias: np.ndarray | None = None,
-        scale: np.ndarray | float = 1.0,
-        **_: object,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    def __call__(self, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
         """CPU simulation: activation then reduction.
 
-        Args:
+        Kwargs:
             data: Array of shape (P, F).
             op: Activation function name.
             reduce_op: Reduction operation (``"add"``).
@@ -57,11 +53,15 @@ class NKIActivationReduce(NKIOp):
         Returns:
             Tuple of (activated output (P, F), reduction result (P,)).
         """
-        fns = {"exp": np.exp, "tanh": np.tanh, "square": np.square, "reciprocal": lambda x: 1.0 / x}
+        data: np.ndarray = kwargs["data"]
+        op: str = kwargs["op"]
+        reduce_op: str = kwargs["reduce_op"]
+        bias: np.ndarray | None = kwargs.get("bias")
+        scale = kwargs.get("scale", 1.0)
         b = 0.0 if bias is None else bias[..., np.newaxis]
         s = scale[..., np.newaxis] if isinstance(scale, np.ndarray) else scale
-        elem = fns[op](data * s + b)
-        red = {"add": np.sum}[reduce_op](elem, axis=1)
+        elem = _ACT_FNS[op](data * s + b)
+        red = _RED_FNS[reduce_op](elem, axis=1)
         return elem, red
 
     @classmethod
@@ -73,7 +73,9 @@ class NKIActivationReduce(NKIOp):
         op_arg = cls._to_nl(sk.get("op", "nl.copy"))
         reduce_op = cls._to_nl(sk.get("reduce_op", "nl.add"))
         reduce_res = sk.get("__dst_reduce_res", "None")
+        bias_part = f", bias={operand_exprs['bias']}" if "bias" in operand_exprs else ""
         extra = cls._format_scalar_kwargs(sk, set(cls.OPERAND_AXES) | {"op", "reduce_op"})
         return (
-            f"nisa.activation_reduce({dst_expr}, {op_arg}, {operand_exprs['data']}, {reduce_op}, {reduce_res}{extra})"
+            f"nisa.activation_reduce({dst_expr}, {op_arg}, {operand_exprs['data']}, "
+            f"{reduce_op}, {reduce_res}{bias_part}{extra})"
         )
