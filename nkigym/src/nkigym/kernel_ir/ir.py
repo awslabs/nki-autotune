@@ -36,18 +36,21 @@ class FusionGroup:
             this group. ``buffer_kind`` is ``"sbuf"`` or
             ``"psum"``. A tensor appears iff the group's ops
             produce or consume its buffer.
-        tensor_placements: Per (tensor_name, dim_id) SBUF tier
-            (``per_tile`` / ``per_block`` / ``full``) — this
-            group's own loop-scope decision for each SBUF tensor
-            it touches. PSUM buffers carry no tier (allocated
+        tensor_placements: Per (buffer_kind, tensor_name, dim_id)
+            tier (``per_tile`` / ``per_block`` / ``full``) — this
+            group's own loop-scope decision for each physical
+            buffer it touches. Today ``buffer_kind`` is always
+            ``"sbuf"``; PSUM buffers carry no tier (allocated
             greedily at the narrowest scope, see
-            ``render_psum_allocations``).
+            ``render_psum_allocations``). The key mirrors
+            ``buffer_degrees`` so logical tensors with multiple
+            physical buffers remain unambiguous.
     """
 
     op_indices: list[int]
     dim_order: list[str]
     buffer_degrees: dict[tuple[str, str, str], int]
-    tensor_placements: dict[tuple[str, str], str]
+    tensor_placements: dict[tuple[str, str, str], str]
 
 
 @dataclass
@@ -78,12 +81,12 @@ class KernelIR:
 
     def __post_init__(self) -> None:
         """Precompute cross-group effective-tier/degree maps used by codegen."""
-        self._effective_tier: dict[tuple[str, str], str] = {}
+        self._effective_tier: dict[tuple[str, str, str], str] = {}
         for group in self.fusion_groups:
-            for (t, d), tier in group.tensor_placements.items():
-                prev = self._effective_tier.get((t, d))
+            for (k, t, d), tier in group.tensor_placements.items():
+                prev = self._effective_tier.get((k, t, d))
                 if prev is None or _TIER_RANK[tier] > _TIER_RANK[prev]:
-                    self._effective_tier[(t, d)] = tier
+                    self._effective_tier[(k, t, d)] = tier
         self._effective_degree: dict[tuple[str, str, str], int] = {}
         for group in self.fusion_groups:
             for (k, t, d), deg in group.buffer_degrees.items():
@@ -119,14 +122,16 @@ class KernelIR:
                 [kind, tensor, dim_id, str(degree)]
                 for (kind, tensor, dim_id), degree in sorted(group.buffer_degrees.items())
             ]
-            plc_rows = [[tensor, dim_id, tier] for (tensor, dim_id), tier in sorted(group.tensor_placements.items())]
+            plc_rows = [
+                [kind, tensor, dim_id, tier] for (kind, tensor, dim_id), tier in sorted(group.tensor_placements.items())
+            ]
             blocks.append(header)
             if deg_rows:
                 blocks.append("      buffer_degrees=")
                 blocks.append(_fmt_table(["kind", "tensor", "dim", "degree"], deg_rows))
             if plc_rows:
                 blocks.append("      tensor_placements=")
-                blocks.append(_fmt_table(["tensor", "dim", "placement"], plc_rows))
+                blocks.append(_fmt_table(["kind", "tensor", "dim", "placement"], plc_rows))
         return "\n".join(blocks)
 
 
@@ -223,20 +228,22 @@ def tensor_buffers(da: DimAnalysis, graph: OpGraph) -> dict[str, set[str]]:
 
 def _init_group_tensor_placements(
     da: DimAnalysis, graph: OpGraph, group_tensors: set[str]
-) -> dict[tuple[str, str], str]:
-    """Set every ``(SBUF tensor, dim)`` placement to per_tile for one group.
+) -> dict[tuple[str, str, str], str]:
+    """Set every ``("sbuf", tensor, dim)`` placement to per_tile for one group.
 
-    Placements are an SBUF-only concept — PSUM has no meaningful
-    tier choice (allocated greedily at a group-local scope, see
+    Placements key on ``(buffer_kind, tensor_name, dim_id)`` to
+    mirror ``buffer_degrees``. Only ``sbuf`` entries are
+    populated today — PSUM has no meaningful tier choice
+    (allocated greedily at a group-local scope, see
     ``render_psum_allocations``). Each group gets independent
     tier entries for the SBUF-backed tensors its ops actually
     touch.
     """
-    placements: dict[tuple[str, str], str] = {}
+    placements: dict[tuple[str, str, str], str] = {}
     sbuf_tensors = {name for name, kinds in tensor_buffers(da, graph).items() if "sbuf" in kinds}
     for tensor_name in group_tensors & sbuf_tensors:
         for dim_id in da.tensors[tensor_name].dim_ids:
-            placements[(tensor_name, dim_id)] = "per_tile"
+            placements[("sbuf", tensor_name, dim_id)] = "per_tile"
     return placements
 
 
@@ -296,7 +303,7 @@ def sample_valid_ir(ir: "KernelIR", rng: random.Random, max_tries: int = 1_000_0
 
 def _sample_group_placements(
     ir: "KernelIR", group_idx: int, dim_order: list[str], forced_full: set[tuple[int, str, str]], rng: random.Random
-) -> dict[tuple[str, str], str]:
+) -> dict[tuple[str, str, str], str]:
     """Draw one group's ``tensor_placements`` map.
 
     For each SBUF-backed tensor this group touches, pick a
@@ -308,15 +315,15 @@ def _sample_group_placements(
     """
     da = ir.dim_analysis
     seed_group = ir.fusion_groups[group_idx]
-    touched = {name for (name, _d) in seed_group.tensor_placements}
+    touched = {name for (_kind, name, _d) in seed_group.tensor_placements}
     pos = {d: i for i, d in enumerate(dim_order)}
     n = len(dim_order)
-    placements: dict[tuple[str, str], str] = {}
+    placements: dict[tuple[str, str, str], str] = {}
     for name in touched:
         tinfo = da.tensors[name]
         depth = rng.randint(0, 2 * n) if n > 0 else 0
         for d in tinfo.dim_ids:
-            key = (name, d)
+            key = ("sbuf", name, d)
             if (group_idx, name, d) in forced_full:
                 placements[key] = "full"
                 continue

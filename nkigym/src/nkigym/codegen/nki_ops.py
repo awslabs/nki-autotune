@@ -360,7 +360,7 @@ def _slot_expr(ir: KernelIR, group_idx: int, tensor_name: str, dim_id: str, unit
     count.
     """
     num_ptiles = ir.dim_analysis.dims[dim_id].num_ptiles
-    tier = ir.fusion_groups[group_idx].tensor_placements.get((tensor_name, dim_id), "per_tile")
+    tier = ir.fusion_groups[group_idx].tensor_placements.get(("sbuf", tensor_name, dim_id), "per_tile")
     tpb = ir.ltiles_per_block.get(dim_id, 1)
 
     terms: list[str] = []

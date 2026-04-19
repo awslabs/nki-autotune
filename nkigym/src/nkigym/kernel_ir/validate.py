@@ -97,7 +97,7 @@ def _tensor_feasibility_ok(ir: Any, group_idx: int, tensor_name: str, pos: dict[
     for d in ir.dim_analysis.tensors[tensor_name].dim_ids:
         if d not in pos:
             continue
-        key = (tensor_name, d)
+        key = ("sbuf", tensor_name, d)
         if key not in placements:
             continue
         tier = placements[key]
@@ -160,5 +160,6 @@ def _edge_ok(ir: Any, op_to_group: dict[int, int], tensor_name: str, g_c: int, c
     p_placements = ir.fusion_groups[g_p].tensor_placements if g_p >= 0 else {}
     c_placements = ir.fusion_groups[g_c].tensor_placements
     return all(
-        p_placements.get((tensor_name, d)) == "full" and c_placements.get((tensor_name, d)) == "full" for d in shared
+        p_placements.get(("sbuf", tensor_name, d)) == "full" and c_placements.get(("sbuf", tensor_name, d)) == "full"
+        for d in shared
     )

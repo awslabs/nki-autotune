@@ -178,7 +178,7 @@ def _tier_depth(ir: KernelIR, group_idx: int, tensor_name: str, tinfo: TensorInf
     for d in tinfo.dim_ids:
         if d not in pos:
             continue
-        key = (tensor_name, d)
+        key = ("sbuf", tensor_name, d)
         if key not in placements:
             continue
         tier = placements[key]
@@ -257,7 +257,7 @@ def _sbuf_axis_index(
     num_ptiles = ir.dim_analysis.dims[dim_id].num_ptiles
     expr = f"0:{slots}"
     placements = ir.fusion_groups[group_idx].tensor_placements
-    key = (tensor_name, dim_id)
+    key = ("sbuf", tensor_name, dim_id)
     if slots > 1 and dim_id in dim_order and key in placements:
         tier = placements[key]
         tpb = get_tpb(ir, dim_id)

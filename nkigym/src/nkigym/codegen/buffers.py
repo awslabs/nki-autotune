@@ -372,7 +372,7 @@ def _effective_sbuf_tier(ir: KernelIR, tensor_name: str, dim_id: str) -> str:
     touches the tensor. Groups that don't have an entry for the
     tensor are ignored (they don't use this buffer).
     """
-    return ir._effective_tier.get((tensor_name, dim_id), "per_tile")
+    return ir._effective_tier.get(("sbuf", tensor_name, dim_id), "per_tile")
 
 
 def _effective_buffer_degree(ir: KernelIR, kind: str, tensor_name: str, dim_id: str) -> int:
