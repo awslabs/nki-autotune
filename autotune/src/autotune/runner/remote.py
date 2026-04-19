@@ -241,24 +241,22 @@ def _process_host_outputs(
 
 
 def write_kernel_sources(cache_dir: str, kernels: dict[str, KernelJob]) -> None:
-    """Write kernel source files to cache before dispatching to workers."""
-    nki_dir = os.path.join(cache_dir, "nki")
-    os.makedirs(nki_dir, exist_ok=True)
+    """Write kernel source files to ``<cache>/kernels/<stem>/<stem>.py``."""
     for kname, job in kernels.items():
-        filename = kname if kname.endswith(".py") else f"{kname}.py"
-        with open(os.path.join(nki_dir, filename), "w") as f:
+        stem = Path(kname).stem
+        variant_dir = os.path.join(cache_dir, "kernels", stem)
+        os.makedirs(variant_dir, exist_ok=True)
+        with open(os.path.join(variant_dir, f"{stem}.py"), "w") as f:
             f.write(job.source)
 
 
 def _write_compiler_logs(cache_dir: str, compiler_logs: dict[str, str]) -> None:
-    """Write compiler logs to cache directory."""
-    neff_dir = os.path.join(cache_dir, "neff")
-    os.makedirs(neff_dir, exist_ok=True)
+    """Write compiler logs to ``<cache>/kernels/<stem>/log-neuron-cc.txt``."""
     for kname, log_text in compiler_logs.items():
         stem = Path(kname).stem
-        log_dir = os.path.join(neff_dir, stem)
-        os.makedirs(log_dir, exist_ok=True)
-        with open(os.path.join(log_dir, "log-neuron-cc.txt"), "w") as f:
+        variant_dir = os.path.join(cache_dir, "kernels", stem)
+        os.makedirs(variant_dir, exist_ok=True)
+        with open(os.path.join(variant_dir, "log-neuron-cc.txt"), "w") as f:
             f.write(log_text)
 
 
@@ -286,8 +284,8 @@ def _write_results_json(
     kernel_entries = []
     for r in sorted(results, key=lambda r: _kernel_sort_key(r.kernel_name)):
         rd = r._asdict()
-        filename = r.kernel_name if r.kernel_name.endswith(".py") else f"{r.kernel_name}.py"
-        rd["nki_path"] = f"nki/{filename}"
+        stem = Path(r.kernel_name).stem
+        rd["kernel_path"] = f"kernels/{stem}/{stem}.py"
         kernel_entries.append(rd)
 
     results_data = {

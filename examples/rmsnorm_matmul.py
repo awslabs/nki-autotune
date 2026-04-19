@@ -1,4 +1,4 @@
-"""RMSNorm + matmul: numpy golden, nkigym simulation, and comparison.
+"""RMSNorm + matmul: remote search over sampled KernelIR variants.
 
 Math: RMSNorm(a) @ b = (a / sqrt(mean(a^2) + eps)) @ b
 
@@ -16,22 +16,18 @@ Usage::
     python examples/rmsnorm_matmul.py
 """
 
+import inspect
 import shutil
 from pathlib import Path
 
-import nki
 import numpy as np
 
-from autotune.runner.compare import assert_close
-from autotune.runner.compile import load_kernel
-from nkigym.codegen import build_ir, render_ir
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.transpose import NKITranspose
-
-CACHE_DIR = Path("/home/ubuntu/cache/rmsnorm_matmul")
+from nkigym.search import remote_search
 
 EPS = 1e-6
 
@@ -74,32 +70,21 @@ def rmsnorm_matmul_nkigym(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 if __name__ == "__main__":
     M, K, N = 1024, 1024, 1024
-
-    rng = np.random.default_rng(42)
-    a = rng.standard_normal((M, K))
-    b = rng.standard_normal((K, N))
-
-    out_np = rmsnorm_matmul_numpy(a, b)
-    out_gym = rmsnorm_matmul_nkigym(a, b)
-    status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
-    print(f"rmsnorm_matmul: {status}")
-
-    shutil.rmtree(CACHE_DIR, ignore_errors=True)
-    CACHE_DIR.mkdir(parents=True)
     input_specs = {"a": ((M, K), "bfloat16"), "b": ((K, N), "bfloat16")}
 
-    """Step 1: build IR."""
-    ir = build_ir(rmsnorm_matmul_nkigym, input_specs)
-    (CACHE_DIR / "ir.txt").write_text(repr(ir))
-    ir.op_graph.render(CACHE_DIR / "op_graph")
+    CACHE_DIR = Path("/home/ubuntu/cache/rmsnorm_matmul")
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    CACHE_DIR.mkdir(parents=True)
 
-    """Step 2: render IR to NKI source."""
-    source = render_ir(ir)
-    (CACHE_DIR / "kernel.py").write_text(source)
-
-    """Step 3: simulate."""
-    kernel_func = load_kernel(str(CACHE_DIR / "kernel.py"), "rmsnorm_matmul_nkigym")
-    golden = rmsnorm_matmul_numpy(a.astype(np.float32), b.astype(np.float32))
-    sim_result = nki.simulate(kernel_func)(a=a.astype(np.float32), b=b.astype(np.float32))
-    sim_status = assert_close(sim_result, golden, atol=1e-1, rtol=1e-1)
-    print(f"rmsnorm_matmul cpu_sim: {sim_status}")
+    output = remote_search(
+        func=rmsnorm_matmul_nkigym,
+        input_specs=input_specs,
+        golden_source=inspect.getsource(rmsnorm_matmul_numpy),
+        golden_func_name="rmsnorm_matmul_numpy",
+        hosts=["gym-1", "gym-2", "gym-3"],
+        cache_dir=str(CACHE_DIR),
+        num_variants=50,
+        atol=1e-2,
+        rtol=1e-2,
+        seed=0,
+    )

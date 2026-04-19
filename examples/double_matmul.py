@@ -1,4 +1,4 @@
-"""Double matmul: simplified attention backbone (transpose + matmul only).
+"""Double matmul: remote search over sampled KernelIR variants.
 
 Math: output = (Q @ K.T) @ V
 
@@ -15,19 +15,15 @@ Usage::
     python examples/double_matmul.py
 """
 
+import inspect
 import shutil
 from pathlib import Path
 
-import nki
 import numpy as np
 
-from autotune.runner.compare import assert_close
-from autotune.runner.compile import load_kernel
-from nkigym.codegen import build_ir, render_ir
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
-
-CACHE_DIR = Path("/home/ubuntu/cache/double_matmul")
+from nkigym.search import remote_search
 
 
 def double_matmul_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
@@ -64,37 +60,22 @@ def double_matmul_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndar
 
 
 if __name__ == "__main__":
-    seq_q = 2048
-    d_k = 128
-    seq_k = 2048
-    d_v = 128
-
-    rng = np.random.default_rng(42)
-    Q = rng.standard_normal((seq_q, d_k))
-    K = rng.standard_normal((seq_k, d_k))
-    V = rng.standard_normal((seq_k, d_v))
-
-    out_np = double_matmul_numpy(Q, K, V)
-    out_gym = double_matmul_nkigym(Q, K, V)
-    status = assert_close(out_gym, out_np, atol=1e-10, rtol=1e-10)
-    print(f"double_matmul: {status}")
-
-    shutil.rmtree(CACHE_DIR, ignore_errors=True)
-    CACHE_DIR.mkdir(parents=True)
+    seq_q, d_k, seq_k, d_v = 2048, 128, 2048, 128
     input_specs = {"Q": ((seq_q, d_k), "bfloat16"), "K": ((seq_k, d_k), "bfloat16"), "V": ((seq_k, d_v), "bfloat16")}
 
-    """Step 1: build IR."""
-    ir = build_ir(double_matmul_nkigym, input_specs)
-    (CACHE_DIR / "ir.txt").write_text(repr(ir))
-    ir.op_graph.render(CACHE_DIR / "op_graph")
+    CACHE_DIR = Path("/home/ubuntu/cache/double_matmul")
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    CACHE_DIR.mkdir(parents=True)
 
-    """Step 2: render IR to NKI source."""
-    source = render_ir(ir)
-    (CACHE_DIR / "kernel.py").write_text(source)
-
-    """Step 3: simulate."""
-    kernel_func = load_kernel(str(CACHE_DIR / "kernel.py"), "double_matmul_nkigym")
-    golden = (Q.astype(np.float32) @ K.astype(np.float32).T) @ V.astype(np.float32)
-    sim_result = nki.simulate(kernel_func)(Q=Q.astype(np.float32), K=K.astype(np.float32), V=V.astype(np.float32))
-    sim_status = assert_close(sim_result, golden, atol=1e-1, rtol=1e-1)
-    print(f"double_matmul cpu_sim: {sim_status}")
+    output = remote_search(
+        func=double_matmul_nkigym,
+        input_specs=input_specs,
+        golden_source=inspect.getsource(double_matmul_numpy),
+        golden_func_name="double_matmul_numpy",
+        hosts=["gym-1", "gym-2", "gym-3"],
+        cache_dir=str(CACHE_DIR),
+        num_variants=50,
+        atol=1e-2,
+        rtol=1e-2,
+        seed=0,
+    )
