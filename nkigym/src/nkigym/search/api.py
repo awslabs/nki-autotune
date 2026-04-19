@@ -60,7 +60,9 @@ def remote_search(
     """
     rng = random.Random(seed)
     initial_kernel = build_ir(func, input_specs, seed=seed)
-    variants = sample_variants(initial_kernel, num_variants, rng, cache_dir=Path(cache_dir))
+    cache_path = Path(cache_dir)
+    initial_kernel.op_graph.render(cache_path / "op_graph")
+    variants = sample_variants(initial_kernel, num_variants, rng, cache_dir=cache_path)
     kernels: dict[str, KernelJob] = {
         f"{name}.py": KernelJob(
             source=source,
