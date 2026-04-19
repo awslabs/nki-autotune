@@ -198,6 +198,19 @@ def _init_group_buffer_degrees(
     return degrees
 
 
+def build_tensor_to_groups(ir: "KernelIR") -> dict[str, set[int]]:
+    """Map every tensor to the set of fusion-group indices whose ops touch it."""
+    result: dict[str, set[int]] = {}
+    da = ir.dim_analysis
+    graph = ir.op_graph
+    for gi, group in enumerate(ir.fusion_groups):
+        for op_idx in group.op_indices:
+            for name in graph.op_tensor_names(op_idx):
+                if name in da.tensors:
+                    result.setdefault(name, set()).add(gi)
+    return result
+
+
 def tensor_buffers(da: DimAnalysis, graph: OpGraph) -> dict[str, set[str]]:
     """Return ``{tensor_name: set_of_buffer_kinds}`` by walking the op graph.
 
@@ -283,7 +296,8 @@ def sample_valid_ir(ir: "KernelIR", rng: random.Random, max_tries: int = 1_000_0
     within ``max_tries`` tries.
     """
     op_to_group = {op_idx: gi for gi, group in enumerate(ir.fusion_groups) for op_idx in group.op_indices}
-    forced_full = _forced_full_pairs(ir, op_to_group)
+    tensor_to_groups = build_tensor_to_groups(ir)
+    forced_full = _forced_full_pairs(ir, tensor_to_groups)
     group_axis_splits = _group_axis_splits(ir, op_to_group)
     for _ in range(max_tries):
         new_dim_orders = [_rand_blocking_inner_perm(order, blocking, rng) for order, blocking in group_axis_splits]
@@ -296,7 +310,7 @@ def sample_valid_ir(ir: "KernelIR", rng: random.Random, max_tries: int = 1_000_0
             for gi, old in enumerate(ir.fusion_groups)
         ]
         candidate = replace(ir, fusion_groups=new_groups)
-        if validate(candidate, op_to_group):
+        if validate(candidate, tensor_to_groups):
             return candidate
     raise RuntimeError(f"No valid IR found after {max_tries} samples")
 
@@ -381,7 +395,7 @@ def _rand_blocking_inner_perm(order: list[str], blocking: set[str], rng: random.
     return non_blocking + blocking_list
 
 
-def _forced_full_pairs(ir: "KernelIR", op_to_group: dict[int, int]) -> set[tuple[int, str, str]]:
+def _forced_full_pairs(ir: "KernelIR", tensor_to_groups: dict[str, set[int]]) -> set[tuple[int, str, str]]:
     """Return ``(group, tensor, dim)`` triples forced to ``full`` by cross-group rules.
 
     A tensor shared across multiple fusion groups (either
@@ -393,15 +407,7 @@ def _forced_full_pairs(ir: "KernelIR", op_to_group: dict[int, int]) -> set[tuple
     under-loaded SBUF feeds downstream groups stale data.
     """
     da = ir.dim_analysis
-    graph = ir.op_graph
     group_dim_sets = [set(group.dim_order) for group in ir.fusion_groups]
-    tensor_to_groups: dict[str, set[int]] = {}
-    for gi, group in enumerate(ir.fusion_groups):
-        for op_idx in group.op_indices:
-            for name in graph.op_tensor_names(op_idx):
-                if name in da.tensors:
-                    tensor_to_groups.setdefault(name, set()).add(gi)
-
     forced: set[tuple[int, str, str]] = set()
     for tensor_name, groups in tensor_to_groups.items():
         if len(groups) < 2:

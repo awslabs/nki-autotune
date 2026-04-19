@@ -11,7 +11,7 @@ from typing import Any
 from nkigym.kernel_ir.dim_analysis import op_blocking_dims
 
 
-def validate(ir: Any, op_to_group: dict[int, int]) -> bool:
+def validate(ir: Any, tensor_to_groups: dict[str, set[int]]) -> bool:
     """Return True iff every legality rule passes for *ir*.
 
     ``tensor_placements`` is an SBUF-only concept (PSUM has no
@@ -20,7 +20,7 @@ def validate(ir: Any, op_to_group: dict[int, int]) -> bool:
     implicitly subjects the SBUF buffer.
     """
     return (
-        _check_cross_group_placements(ir, op_to_group)
+        _check_cross_group_placements(ir, tensor_to_groups)
         and _check_blocking_innermost(ir)
         and _check_placement_feasibility(ir)
     )
@@ -120,7 +120,7 @@ def tier_depth_range(tier: str, pos: int, n: int) -> tuple[int, int]:
     return rng
 
 
-def _check_cross_group_placements(ir: Any, op_to_group: dict[int, int]) -> bool:
+def _check_cross_group_placements(ir: Any, tensor_to_groups: dict[str, set[int]]) -> bool:
     """Cross-group tensors must be ``full`` in every touching group on shared-scope dims.
 
     A tensor ``t`` that is touched by two or more fusion groups
@@ -132,15 +132,7 @@ def _check_cross_group_placements(ir: Any, op_to_group: dict[int, int]) -> bool:
     leaves a kernel input under-loaded when a later consumer
     group reads it.
     """
-    del op_to_group
     da = ir.dim_analysis
-    graph = ir.op_graph
-    tensor_to_groups: dict[str, set[int]] = {}
-    for gi, group in enumerate(ir.fusion_groups):
-        for op_idx in group.op_indices:
-            for name in graph.op_tensor_names(op_idx):
-                if name in da.tensors:
-                    tensor_to_groups.setdefault(name, set()).add(gi)
     return all(
         ir.fusion_groups[gi].tensor_placements.get(("sbuf", tensor_name, d)) == "full"
         for tensor_name, groups in tensor_to_groups.items()

@@ -4,7 +4,7 @@ The search finds high-performing kernel variants by repeatedly mutating a seed `
 
 ### 1. Variant Generation
 
-Each variant is produced by a single call to `sample_valid_ir(ir, rng)`. The sampler draws — independently and uniformly — a permutation of every fusion group's `dim_order` and a tier in `("per_tile", "per_block", "full")` for every `(tensor, dim)` pair, then accepts the candidate iff every rule in `validate(ir, op_to_group)` passes (cross-group full-placement, blocking-dims innermost, per-tensor depth feasibility, PSUM-output reachability). Rejected candidates are silently redrawn.
+Each variant is produced by a single call to `sample_valid_ir(ir, rng)`. The sampler draws — independently and uniformly — a permutation of every fusion group's `dim_order` and a tier in `("per_tile", "per_block", "full")` for every `(tensor, dim)` pair, then accepts the candidate iff every rule in `validate(ir, tensor_to_groups)` passes (cross-group full-placement, blocking-dims innermost, per-tensor depth feasibility, PSUM-output reachability). Rejected candidates are silently redrawn.
 
 ```python
 ir = build_ir(matmul_nkigym, input_specs)      # seed: singleton groups, tpb=1, random valid order + placements

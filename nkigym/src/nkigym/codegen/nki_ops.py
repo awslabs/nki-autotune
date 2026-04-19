@@ -157,7 +157,6 @@ def _inject_tile_geometry(ir: KernelIR, op_idx: int, scalar_kwargs: dict[str, st
             continue
         tinfo = da.tensors[tensor_name]
         for ax_name, dim_id in zip(axes, tinfo.dim_ids):
-            scalar_kwargs[f"__axis_dim_{ax_name}"] = dim_id
             scalar_kwargs[f"__tile_start_{ax_name}"] = _tile_start_expr(ir, dim_id, ptile_dims)
             scalar_kwargs[f"__tile_size_{ax_name}"] = str(op_tiles.get(dim_id, da.dims[dim_id].physical_tile_size))
 
@@ -309,13 +308,7 @@ def _psum_index_expr(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, ptile_di
 def _sbuf_dst_index_expr(
     ir: KernelIR, group_idx: int, op_idx: int, tensor_name: str, tinfo: TensorInfo, ptile_dims: set[str]
 ) -> str:
-    """Destination index into a 4D (or 2D) SBUF buffer — no reshape.
-
-    Walks ``sbuf_axis_index`` so each axis's range reflects the
-    tensor's tier and the in-scope block/ltile loops at the
-    innermost body depth. Full-tier buffers advance with
-    iteration; per_tile buffers stay at slot 0.
-    """
+    """Destination index into a 4D (or 2D) SBUF buffer — no reshape."""
     da = ir.dim_analysis
     dim_order = ir.fusion_groups[group_idx].dim_order
     depth = 2 * len(dim_order)

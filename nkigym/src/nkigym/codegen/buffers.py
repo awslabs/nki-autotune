@@ -24,6 +24,9 @@ NKI simulator.
 
 from nkigym.kernel_ir import KernelIR, get_tpb
 from nkigym.kernel_ir.dim_analysis import TensorInfo
+from nkigym.kernel_ir.ir import build_tensor_to_groups
+
+__all__ = ["build_tensor_to_groups", "render_sbuf_buffers"]
 
 PSUM_BANK_SIZE = 2048
 """Bytes per PSUM bank; each allocation is aligned up to this boundary."""
@@ -127,16 +130,6 @@ def _per_group_sbuf_tensors(
         groups = tensor_to_groups.get(name, set())
         if len(groups) == 1:
             result[next(iter(groups))].append((name, tinfo))
-    return result
-
-
-def build_tensor_to_groups(ir: KernelIR) -> dict[str, set[int]]:
-    """Map every tensor to the set of fusion-group indices whose ops touch it."""
-    result: dict[str, set[int]] = {}
-    for gi, group in enumerate(ir.fusion_groups):
-        for op_idx in group.op_indices:
-            for name in ir.op_graph.op_tensor_names(op_idx):
-                result.setdefault(name, set()).add(gi)
     return result
 
 
