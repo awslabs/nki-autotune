@@ -179,33 +179,31 @@ def _dtype_bytes(dtype: str) -> int:
 
 
 def _sbuf_line(ir: KernelIR, name: str, tinfo: TensorInfo, pad: str, offset: int) -> str:
-    """Emit a single SBUF ``nl.ndarray`` allocation line with an explicit address."""
+    """Emit a single SBUF ``nl.ndarray`` allocation line.
+
+    ``offset`` is currently unused — the compiler's automatic
+    allocator handles SBUF placement. Kept in the signature so
+    callers can pass through their cursor without branching.
+    """
+    del offset
     shape = sbuf_shape(ir, name, tinfo)
     shape_str = ", ".join(str(s) for s in shape)
-    return (
-        f"{pad}sbuf_{name} = nl.ndarray(({shape_str}), dtype=nl.{tinfo.dtype}, "
-        f"buffer=nl.sbuf, address=(0, {offset}))"
-    )
+    return f"{pad}sbuf_{name} = nl.ndarray(({shape_str}), dtype=nl.{tinfo.dtype}, buffer=nl.sbuf)"
 
 
 def _psum_line(ir: KernelIR, name: str, tinfo: TensorInfo, dtype: str, pad: str, offset: int) -> str:
-    """Emit a PSUM allocation with explicit per-bank addresses.
+    """Emit a PSUM allocation.
 
-    Single-tile allocation emits one ``nl.ndarray`` at ``offset``;
-    multi-tile allocations emit a Python list of ``nl.ndarray`` at
-    consecutive bank-aligned offsets.
+    Single-tile → one ``nl.ndarray``. Multi-tile → Python list of
+    ``nl.ndarray``. ``offset`` is unused; the compiler's allocator
+    handles PSUM bank placement.
     """
+    del offset
     shape = psum_tile_shape(ir, name, tinfo)
     shape_str = ", ".join(str(s) for s in shape)
     count = psum_tile_count(ir, name, tinfo)
-    bank_step = _psum_bank_step(shape, dtype)
-    if count == 1:
-        rhs = f"nl.ndarray(({shape_str}), dtype=nl.{dtype}, buffer=nl.psum, address=(0, {offset}))"
-    else:
-        rhs = (
-            f"[nl.ndarray(({shape_str}), dtype=nl.{dtype}, buffer=nl.psum, "
-            f"address=(0, {offset} + _i * {bank_step})) for _i in range({count})]"
-        )
+    tile_expr = f"nl.ndarray(({shape_str}), dtype=nl.{dtype}, buffer=nl.psum)"
+    rhs = tile_expr if count == 1 else f"[{tile_expr} for _ in range({count})]"
     return f"{pad}psum_{name} = {rhs}"
 
 

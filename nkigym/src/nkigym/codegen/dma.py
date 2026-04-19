@@ -67,12 +67,14 @@ def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int]) -> DepthPlan:
 def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> tuple[DepthPlan, DepthPlan]:
     """Plan PSUM→SBUF staging for each PSUM tensor in *staged*, emitted at ``max(producer_finished_depth, tier_depth)``.
 
-    Staging for tensors whose producer has per-ptile loops is
-    handled inside ``render_nki_ops._render_op_block`` instead —
-    those stages fire inside the ``i_ptile_{d}`` loop so each
-    iteration's PSUM output lands in its own SBUF slot before
-    the next iteration overwrites PSUM. This function skips
-    them.
+    Ops with OUTPUT (non-blocking) ptile dims own their own staging
+    in ``render_nki_ops._render_op_block`` — each output ptile
+    iteration produces a distinct output tile and needs a
+    per-iteration stage to its own SBUF slot. This function skips
+    those producers. Ops whose ptile dims are ALL blocking fall
+    through and get staged at group scope (outside every block /
+    ltile / ptile loop), which is the only math-valid place to
+    read a PSUM accumulator.
     """
     da = ir.dim_analysis
     graph = ir.op_graph
@@ -83,7 +85,7 @@ def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[s
         producer = graph.producer_op(tensor_name)
         if producer is None:
             continue
-        if ptile_loop_dims(ir, producer):
+        if _has_output_ptile_dims(ir, producer):
             continue
         group_idx = op_to_group[producer]
         dim_order = ir.fusion_groups[group_idx].dim_order
@@ -125,6 +127,13 @@ def ptile_loop_dims(ir: KernelIR, op_idx: int) -> list[tuple[str, int]]:
             if total_slots > op_slots:
                 result.append((dim_id, total_slots // op_slots))
     return result
+
+
+def _has_output_ptile_dims(ir: KernelIR, op_idx: int) -> bool:
+    """True iff this op has at least one non-blocking ptile dim (output-tile axis)."""
+    op_cls = ir.op_graph.op_classes[op_idx]
+    blocking = op_blocking_dims(op_cls, ir.dim_analysis.per_op_axis_maps[op_idx])
+    return any(dim_id not in blocking for dim_id, _ in ptile_loop_dims(ir, op_idx))
 
 
 def render_hbm_store(ir: KernelIR, op_to_group: dict[int, int]) -> tuple[DepthPlan, DepthPlan]:

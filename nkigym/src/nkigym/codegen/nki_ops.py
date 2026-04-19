@@ -11,7 +11,7 @@ from nkigym.codegen.buffers import num_tiles, producer_op_tiles, psum_tile_count
 from nkigym.codegen.dma import producer_finished_depth, ptile_loop_dims, sbuf_ptile_slice
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.kernel_ir import KernelIR
-from nkigym.kernel_ir.dim_analysis import TensorInfo
+from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
 
 
 def render_nki_ops(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> DepthPlan:
@@ -48,27 +48,44 @@ def _memset_lines(ir: KernelIR, tensor_name: str) -> list[str]:
 def _render_op_block(ir: KernelIR, op_idx: int, op_to_group: dict[int, int], staged: set[str]) -> list[str]:
     """Render one op's ISA call wrapped in ``i_ptile_{d}`` loops, with a fused per-ptile stage.
 
-    When the op writes PSUM and has ptile dims, a per-iteration
-    ``nisa.tensor_copy(sbuf_dst_slot, psum_tile)`` is appended
-    inside the innermost ptile loop so each iteration's PSUM
-    output lands in the matching SBUF slot before the next
-    iteration overwrites PSUM. This makes list-of-N PSUM
-    buffering unnecessary for the baseline — single-buffered
-    PSUM + per-iteration stage gives correct results when
-    ``psum_tile_count == 1``.
+    Ptile dims split into output (non-blocking) and blocking by the
+    op's ``BLOCKING_AXES``. Output ptile loops are emitted outer,
+    blocking ptile loops inner. Per-op PSUM→SBUF stage fires
+    INSIDE output ptile loops but OUTSIDE blocking ptile loops —
+    the generic math-validity rule: read PSUM only after every
+    blocking loop that accumulates into it has closed. Ops whose
+    ptile dims are all blocking emit no per-op stage; the stage
+    comes from ``render_psum_staging`` at group scope, which is
+    already outside every loop.
     """
     lines: list[str] = []
-    ptile_dims = ptile_loop_dims(ir, op_idx)
     group_idx = op_to_group[op_idx]
+    output_ptile, blocking_ptile = _partition_ptile_dims(ir, op_idx)
+    ptile_dims = output_ptile + blocking_ptile
     call_line = _isa_call_line(ir, group_idx, op_idx, staged, ptile_dims)
-    for depth, (dim_id, count) in enumerate(ptile_dims):
+
+    for depth, (dim_id, count) in enumerate(output_ptile):
         lines.append("    " * depth + f"for i_ptile_{dim_id} in range({count}):")
-    body_indent = "    " * len(ptile_dims)
+    output_indent = "    " * len(output_ptile)
+    for depth, (dim_id, count) in enumerate(blocking_ptile):
+        lines.append(output_indent + "    " * depth + f"for i_ptile_{dim_id} in range({count}):")
+    body_indent = output_indent + "    " * len(blocking_ptile)
     lines.append(body_indent + call_line)
-    if ptile_dims:
-        stage_lines = _ptile_stage_lines(ir, op_idx, op_to_group, staged, ptile_dims)
-        lines.extend(body_indent + line for line in stage_lines)
+    if output_ptile:
+        stage_lines = _ptile_stage_lines(ir, op_idx, op_to_group, staged, output_ptile)
+        lines.extend(output_indent + line for line in stage_lines)
     return lines
+
+
+def _partition_ptile_dims(ir: KernelIR, op_idx: int) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Split this op's ptile dims into (output, blocking) by its ``BLOCKING_AXES``."""
+    op_cls = ir.op_graph.op_classes[op_idx]
+    blocking = op_blocking_dims(op_cls, ir.dim_analysis.per_op_axis_maps[op_idx])
+    output: list[tuple[str, int]] = []
+    accum: list[tuple[str, int]] = []
+    for dim_id, count in ptile_loop_dims(ir, op_idx):
+        (accum if dim_id in blocking else output).append((dim_id, count))
+    return output, accum
 
 
 def _ptile_stage_lines(
