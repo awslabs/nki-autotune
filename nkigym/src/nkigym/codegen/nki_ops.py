@@ -14,7 +14,7 @@ when the producer writes multiple tiles concurrently).
 """
 
 from nkigym.codegen.buffers import producer_op_tiles, psum_tile_count, psum_tile_slice, sbuf_buffer
-from nkigym.codegen.dma import producer_finished_depth, ptile_loop_dims
+from nkigym.codegen.dma import has_output_ptile_dims, inline_stage_line, producer_finished_depth, ptile_loop_dims
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.codegen.sbuf_buffer import AxisAccess
 from nkigym.kernel_ir import KernelIR
@@ -22,20 +22,42 @@ from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
 
 
 def render_nki_ops(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> DepthPlan:
-    """Plan ISA calls and memsets for every op, keyed by group."""
+    """Plan ISA calls and memsets for every op, keyed by group.
+
+    For a non-blocking PSUM producer with no output ptile dims,
+    group-scope staging is emitted inline right after the ISA
+    block so an intra-group consumer reads staged SBUF instead of
+    racing with an end-of-plan stage.
+    """
     graph = ir.op_graph
     plan: DepthPlan = {}
     for op_idx, op_cls in enumerate(graph.op_classes):
         group_idx = op_to_group[op_idx]
         dim_order = ir.fusion_groups[group_idx].dim_order
         n = len(dim_order)
+        block_lines = list(_render_op_block(ir, op_idx, op_to_group, staged))
         if op_cls.ISA_LOC == "psum":
             i_min, blocking = producer_finished_depth(ir, op_idx, dim_order)
             if blocking:
                 for oname in graph.op_tensors[op_idx][1]:
                     plan.setdefault(group_idx, {}).setdefault(i_min, []).extend(_memset_lines(ir, oname))
-        plan.setdefault(group_idx, {}).setdefault(2 * n, []).extend(_render_op_block(ir, op_idx, op_to_group, staged))
+            else:
+                block_lines.extend(_inline_stage_lines(ir, op_idx, group_idx, dim_order, staged))
+        plan.setdefault(group_idx, {}).setdefault(2 * n, []).extend(block_lines)
     return plan
+
+
+def _inline_stage_lines(ir: KernelIR, op_idx: int, group_idx: int, dim_order: list[str], staged: set[str]) -> list[str]:
+    """Group-scope stage lines for a non-blocking PSUM producer, empty when per-ptile stage handles it."""
+    return (
+        []
+        if has_output_ptile_dims(ir, op_idx)
+        else [
+            inline_stage_line(ir, group_idx, op_idx, oname, dim_order)
+            for oname in ir.op_graph.op_tensors[op_idx][1]
+            if oname in staged
+        ]
+    )
 
 
 def _memset_lines(ir: KernelIR, tensor_name: str) -> list[str]:
@@ -56,10 +78,7 @@ def _render_op_block(ir: KernelIR, op_idx: int, op_to_group: dict[int, int], sta
     blocking ptile loops inner. Per-op PSUM→SBUF stage fires
     INSIDE output ptile loops but OUTSIDE blocking ptile loops —
     the generic math-validity rule: read PSUM only after every
-    blocking loop that accumulates into it has closed. Ops whose
-    ptile dims are all blocking emit no per-op stage; the stage
-    comes from ``render_psum_staging`` at group scope, which is
-    already outside every loop.
+    blocking loop that accumulates into it has closed.
     """
     lines: list[str] = []
     group_idx = op_to_group[op_idx]

@@ -8,6 +8,7 @@ import numpy as np
 
 from nkigym.kernel_ir.dim_analysis import DimAnalysis, analyze_dims, op_blocking_dims
 from nkigym.kernel_ir.op_graph import OpGraph, build_op_graph
+from nkigym.kernel_ir.partition import compute_reachability, op_dims_of, sample_partition
 from nkigym.kernel_ir.validate import tier_depth_range, validate
 
 TIERS = ("per_tile", "per_block", "full")
@@ -168,7 +169,11 @@ def get_tpb(ir: KernelIR, dim_id: str) -> int:
 
 
 def _init_group_buffer_degrees(
-    da: DimAnalysis, graph: OpGraph, group_op_indices: list[int], group_tensors: set[str]
+    da: DimAnalysis,
+    graph: OpGraph,
+    group_op_indices: list[int],
+    group_tensors: set[str],
+    tensor_kinds: dict[str, set[str]],
 ) -> dict[tuple[str, str, str], int]:
     """Set every physical-buffer degree to 1 for one group.
 
@@ -179,7 +184,6 @@ def _init_group_buffer_degrees(
     iff the group contains its producer; it has an SBUF entry
     iff any op in the group uses SBUF for it.
     """
-    kinds = tensor_buffers(da, graph)
     degrees: dict[tuple[str, str, str], int] = {}
     group_psum_producers = {
         oname
@@ -188,11 +192,11 @@ def _init_group_buffer_degrees(
         for oname in graph.op_tensors[op_idx][1]
     }
     for tensor_name in group_tensors:
-        tensor_kinds = kinds.get(tensor_name, set())
-        if "sbuf" in tensor_kinds:
+        kinds = tensor_kinds.get(tensor_name, set())
+        if "sbuf" in kinds:
             for dim_id in da.tensors[tensor_name].dim_ids:
                 degrees[("sbuf", tensor_name, dim_id)] = 1
-        if "psum" in tensor_kinds and tensor_name in group_psum_producers:
+        if "psum" in kinds and tensor_name in group_psum_producers:
             for dim_id in da.tensors[tensor_name].dim_ids:
                 degrees[("psum", tensor_name, dim_id)] = 1
     return degrees
@@ -240,7 +244,7 @@ def tensor_buffers(da: DimAnalysis, graph: OpGraph) -> dict[str, set[str]]:
 
 
 def _init_group_tensor_placements(
-    da: DimAnalysis, graph: OpGraph, group_tensors: set[str]
+    da: DimAnalysis, group_tensors: set[str], sbuf_tensors: set[str]
 ) -> dict[tuple[str, str, str], str]:
     """Set every ``("sbuf", tensor, dim)`` placement to per_tile for one group.
 
@@ -253,7 +257,6 @@ def _init_group_tensor_placements(
     touch.
     """
     placements: dict[tuple[str, str, str], str] = {}
-    sbuf_tensors = {name for name, kinds in tensor_buffers(da, graph).items() if "sbuf" in kinds}
     for tensor_name in group_tensors & sbuf_tensors:
         for dim_id in da.tensors[tensor_name].dim_ids:
             placements[("sbuf", tensor_name, dim_id)] = "per_tile"
@@ -271,43 +274,48 @@ def _group_touched_tensors(graph: OpGraph, da: DimAnalysis, op_indices: list[int
 
 
 def sample_valid_ir(ir: "KernelIR", rng: random.Random, max_tries: int = 1_000_000) -> "KernelIR":
-    """Rejection-sample each fusion group's ``dim_order`` and ``tensor_placements`` jointly.
+    """Rejection-sample a full IR: fusion partition, ``dim_order``, and ``tensor_placements``.
 
-    Up-front constraints narrow the draw so the sampler doesn't
-    burn its budget on mechanically-forced mismatches:
-
-    * Each fusion group's ``dim_order`` is drawn from the subset
-      of permutations that keep blocking dims innermost (rule:
-      ``_check_blocking_innermost``).
-    * Each ``(tensor, dim)`` pair that is forced to ``full`` by
-      the cross-group rule (``_check_cross_group_placements``) is
-      pinned up front.
-    * For every other SBUF-backed tensor, a single emission depth
-      is picked uniformly in ``[0, 2n]`` for the group it lives
-      in, then each dim's tier is drawn uniformly among the tiers
-      whose interval contains that depth. This guarantees
-      per-tensor depth feasibility
-      (``_check_placement_feasibility``) by construction. PSUM
-      buffers are allocated greedily just before use (see
-      ``render_psum_allocations``) — they carry no tier and are
-      not part of the sampling space.
-
-    Raises ``RuntimeError`` if no valid combination is found
-    within ``max_tries`` tries.
+    Per try: draw ``fusion_groups`` via stochastic pairwise merging
+    (see ``partition.sample_partition``), then per-group draw
+    ``dim_order`` (blocking dims innermost) and ``tensor_placements``
+    (per-tensor emission depth feasible by construction; cross-group
+    shared dims forced to ``full``). Accept jointly against
+    ``validate``. PSUM buffers carry no tier — allocated greedily
+    just before use. Raises ``RuntimeError`` if no valid combination
+    is found within ``max_tries`` tries.
     """
-    op_to_group = {op_idx: gi for gi, group in enumerate(ir.fusion_groups) for op_idx in group.op_indices}
-    tensor_to_groups = build_tensor_to_groups(ir)
-    forced_full = _forced_full_pairs(ir, tensor_to_groups)
-    group_axis_splits = _group_axis_splits(ir, op_to_group)
+    da = ir.dim_analysis
+    graph = ir.op_graph
+    reach = compute_reachability(graph)
+    op_dims = [op_dims_of(graph, da, i) for i in range(len(graph.op_classes))]
+    tensor_kinds = tensor_buffers(da, graph)
+    sbuf_tensors = {name for name, kinds in tensor_kinds.items() if "sbuf" in kinds}
     for _ in range(max_tries):
-        new_dim_orders = [_rand_blocking_inner_perm(order, blocking, rng) for order, blocking in group_axis_splits]
+        op_groups = sample_partition(graph, da, rng, reach=reach, op_dims=op_dims)
+        seed_groups: list[FusionGroup] = []
+        for op_indices in op_groups:
+            touched = _group_touched_tensors(graph, da, op_indices)
+            seed_groups.append(
+                FusionGroup(
+                    op_indices=op_indices,
+                    dim_order=_group_dims(op_indices, da, graph),
+                    buffer_degrees=_init_group_buffer_degrees(da, graph, op_indices, touched, tensor_kinds),
+                    tensor_placements=_init_group_tensor_placements(da, touched, sbuf_tensors),
+                )
+            )
+        seed = replace(ir, fusion_groups=seed_groups)
+        tensor_to_groups = build_tensor_to_groups(seed)
+        forced_full = _forced_full_pairs(seed, tensor_to_groups)
+        op_to_group = {op_idx: gi for gi, group in enumerate(seed_groups) for op_idx in group.op_indices}
+        dim_orders = [_rand_blocking_inner_perm(o, b, rng) for o, b in _group_axis_splits(seed, op_to_group)]
         new_groups = [
             replace(
                 old,
-                dim_order=new_dim_orders[gi],
-                tensor_placements=_sample_group_placements(ir, gi, new_dim_orders[gi], forced_full, rng),
+                dim_order=dim_orders[gi],
+                tensor_placements=_sample_group_placements(seed, gi, dim_orders[gi], forced_full, rng),
             )
-            for gi, old in enumerate(ir.fusion_groups)
+            for gi, old in enumerate(seed_groups)
         ]
         candidate = replace(ir, fusion_groups=new_groups)
         if validate(candidate, tensor_to_groups):
@@ -457,6 +465,8 @@ def build_ir(
 
     num_ops = len(graph.op_classes)
     ltiles_per_block: dict[str, int] = {dim_id: 1 for dim_id in da.dims}
+    tensor_kinds = tensor_buffers(da, graph)
+    sbuf_tensors = {name for name, kinds in tensor_kinds.items() if "sbuf" in kinds}
 
     groups: list[FusionGroup] = []
     for op_idx in range(num_ops):
@@ -466,8 +476,8 @@ def build_ir(
             FusionGroup(
                 op_indices=op_indices,
                 dim_order=_group_dims(op_indices, da, graph),
-                buffer_degrees=_init_group_buffer_degrees(da, graph, op_indices, touched),
-                tensor_placements=_init_group_tensor_placements(da, graph, touched),
+                buffer_degrees=_init_group_buffer_degrees(da, graph, op_indices, touched, tensor_kinds),
+                tensor_placements=_init_group_tensor_placements(da, touched, sbuf_tensors),
             )
         )
 

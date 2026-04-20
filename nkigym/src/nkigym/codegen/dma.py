@@ -70,16 +70,17 @@ def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int]) -> DepthPlan:
 
 
 def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> tuple[DepthPlan, DepthPlan]:
-    """Plan PSUM→SBUF staging for each PSUM tensor in *staged*, emitted at ``max(producer_finished_depth, tier_depth)``.
+    """Plan PSUM→SBUF staging for blocking PSUM producers at the outermost-blocking-loop close.
 
-    Ops with OUTPUT (non-blocking) ptile dims own their own staging
-    in ``render_nki_ops._render_op_block`` — each output ptile
-    iteration produces a distinct output tile and needs a
-    per-iteration stage to its own SBUF slot. This function skips
-    those producers. Ops whose ptile dims are ALL blocking fall
-    through and get staged at group scope (outside every block /
-    ltile / ptile loop), which is the only math-valid place to
-    read a PSUM accumulator.
+    Ops with output (non-blocking) ptile dims own their own staging
+    in ``render_nki_ops._render_op_block`` (per-iteration stage
+    inside the output ptile loop). Non-blocking producers without
+    output ptile dims get their stage emitted inline right after
+    the ISA call by ``render_nki_ops`` (see ``inline_stage_line``)
+    so intra-group consumers see the staged SBUF. Remaining cases
+    — blocking producers — are staged here in the after-plan,
+    outside the outermost blocking loop so the PSUM read happens
+    only once per output tile.
     """
     da = ir.dim_analysis
     graph = ir.op_graph
@@ -90,26 +91,34 @@ def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[s
         producer = graph.producer_op(tensor_name)
         if producer is None:
             continue
-        if _has_output_ptile_dims(ir, producer):
+        if has_output_ptile_dims(ir, producer):
             continue
         group_idx = op_to_group[producer]
         dim_order = ir.fusion_groups[group_idx].dim_order
-        tinfo = da.tensors[tensor_name]
-
         producer_depth, blocking = producer_finished_depth(ir, producer, dim_order)
-        if blocking:
-            depth = producer_depth
-            uses_after = True
-        else:
-            depth = max(producer_depth, _tier_depth(ir, group_idx, tensor_name, tinfo, dim_order))
-            uses_after = False
-
+        if not blocking:
+            continue
+        tinfo = da.tensors[tensor_name]
         line = _gadget_call(
-            "stage_block", ir, group_idx, tensor_name, tinfo, dim_order, depth, sbuf_is_dst=True, psum_src=True
+            "stage_block", ir, group_idx, tensor_name, tinfo, dim_order, producer_depth, sbuf_is_dst=True, psum_src=True
         )
-        (after if uses_after else before).setdefault(group_idx, {}).setdefault(depth, []).append(line)
+        after.setdefault(group_idx, {}).setdefault(producer_depth, []).append(line)
 
     return before, after
+
+
+def inline_stage_line(
+    ir: KernelIR, group_idx: int, producer_op_idx: int, tensor_name: str, dim_order: list[str]
+) -> str:
+    """PSUM→SBUF stage line for a non-blocking producer, emitted inline by ``render_nki_ops``."""
+    tinfo = ir.dim_analysis.tensors[tensor_name]
+    depth = max(
+        producer_finished_depth(ir, producer_op_idx, dim_order)[0],
+        _tier_depth(ir, group_idx, tensor_name, tinfo, dim_order),
+    )
+    return _gadget_call(
+        "stage_block", ir, group_idx, tensor_name, tinfo, dim_order, depth, sbuf_is_dst=True, psum_src=True
+    )
 
 
 def ptile_loop_dims(ir: KernelIR, op_idx: int) -> list[tuple[str, int]]:
@@ -134,7 +143,7 @@ def ptile_loop_dims(ir: KernelIR, op_idx: int) -> list[tuple[str, int]]:
     return result
 
 
-def _has_output_ptile_dims(ir: KernelIR, op_idx: int) -> bool:
+def has_output_ptile_dims(ir: KernelIR, op_idx: int) -> bool:
     """True iff this op has at least one non-blocking ptile dim (output-tile axis)."""
     op_cls = ir.op_graph.op_classes[op_idx]
     blocking = op_blocking_dims(op_cls, ir.dim_analysis.per_op_axis_maps[op_idx])

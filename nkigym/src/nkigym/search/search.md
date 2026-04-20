@@ -13,7 +13,7 @@ for _ in range(num_variants):
     source  = render_ir(variant)                # same header/gadgets pipeline
 ```
 
-`fusion_groups`, `ltiles_per_block`, and `buffer_degrees` are **not** touched by the sampler. Programmatic transforms (`loop_fusion`, `ltiles_per_block`, `multi_buffer`, ...) still apply to the seed `KernelIR` and produce new seeds; each seed then spawns its own population of sampled variants.
+`fusion_groups`, `ltiles_per_block`, and `buffer_degrees` are **not** touched by the sampler today — they stay fixed at the seed's values. Extending the rejection sampler to draw `fusion_groups` as well (with R1 convexity + R2 blocking-barrier rules pruning during construction) is the next step; `ltiles_per_block` and `buffer_degrees` can be folded in the same way.
 
 ### 2. Deduplication
 

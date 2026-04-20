@@ -22,7 +22,7 @@ class KernelIR:
 **Rendering parameters** — `render_ir` reads these to determine loop structure, buffer sizes, and DMA placement:
 - `fusion_groups`: which ops share a loop nest. Initially `[[0], [1], ...]` — one singleton group per op. Loop fusion merges groups later.
 - `ltiles_per_block`: `dim_id -> int`. Per-dimension tiling factor — every op and tensor on a given dim shares the same block structure. Initially `1` for every dim in `da.dims`.
-- `buffer_degrees`: `(tensor_name, dim_id) -> int`. Initially `1` for every `(tensor, dim)` pair where `dim` is in the tensor's `dim_ids`. Multi-buffering degree along that axis — see `multi_buffer.md`.
+- `buffer_degrees`: `(tensor_name, dim_id) -> int`. Initially `1` for every `(tensor, dim)` pair where `dim` is in the tensor's `dim_ids`. Multi-buffering degree along that axis — see `kernel_ir/multi_buffer.md`.
 - `group_dim_orders`: one complete dim_order per fusion group, positional on `fusion_groups`. Each entry is the outer-to-inner dim list for that group's nest, covering every dim any op in the group touches. Every dim is a loop — no DP/reduction split. Example: for attention's default (11 singleton groups), `group_dim_orders[1] = ["d1", "d2"]` — K transpose's group loops only over its own dims, so no spurious outer loops on dims its ops don't touch.
 - `tensor_placements`: `(tensor_name, dim_id) -> tier`. Initially `"per_tile"` for all pairs. Tier is `"per_tile"`, `"per_block"`, or `"full"`.
 

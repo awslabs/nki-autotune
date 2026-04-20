@@ -19,7 +19,7 @@ Loops within one group are grouped by phase — all block loops outermost, then 
 
 `build_ir` produces `fusion_groups = [[0], [1], ..., [n-1]]`. Each group's `dim_order` is every dim that op touches. No dim sits outside a group that doesn't depend on it — an op only loops over its own dims.
 
-This is maximally unfused. Loop fusion later merges groups; loop reordering permutes within a group. Both operate on `fusion_groups` + `group_dim_orders`, not on the renderer.
+This is maximally unfused. Loop fusion merges groups; the rejection sampler redraws each group's `dim_order` on every call. Both operate on `fusion_groups`, not on the renderer.
 
 ### Example: Attention default
 
@@ -77,4 +77,4 @@ Compare to the old DP-outermost layout, which wrapped group 1's body in `for i_b
 
 Inside each innermost `i_ltile_*` body, the op's own gadget handles physical-tile packing on its dim(s). `nc_matmul` (groups 2, 9) covers the full d2 logical tile of 512 in a single ISA call — no ptile iteration. `nc_transpose` on d2 (groups 1, 8) only covers 128 per call, so the transpose gadget internally loops `num_ptiles_per_ltile = 4` times. Vector-engine ops on d2 (groups 3–6) behave the same way as transpose.
 
-This is the default lowering — each op singleton, each group's nest tight to its own dims. The reference attention_cte kernel is the result of applying transforms (loop fusion, loop reordering, online fusion) on top of this baseline.
+This is the default lowering — each op singleton, each group's nest tight to its own dims. The reference attention_cte kernel is the result of online fusion (math preprocessing) followed by loop fusion and a sampler draw over `dim_order` + `tensor_placements` on top of this baseline.

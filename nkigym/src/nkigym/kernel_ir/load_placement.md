@@ -2,7 +2,7 @@
 
 Load placement controls how many of a tensor-dim's tile iterations a single allocation covers. `per_tile` → one logical tile's worth; `per_block` → one block's worth; `full` → all blocks. Higher tiers grow the buffer, hoist the allocation and its DMA load outward, and reduce DMA frequency.
 
-This doc describes the **IR representation**: the field, per-tier semantics, the per-group feasibility constraint against `group_dim_orders`, and how the renderer reads it. The transform that mutates the field lives in `transforms/load_placement.md`.
+This doc describes the **IR representation**: the field, per-tier semantics, the per-group feasibility constraint against each group's `dim_order`, and how the renderer reads it. The rejection sampler in `kernel_ir/ir.py::sample_valid_ir` draws tiers jointly with `dim_order` and accepts only feasible combinations — there is no separate mutate-then-validate transform.
 
 ### Field
 
