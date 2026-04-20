@@ -21,7 +21,6 @@ Usage::
     python examples/attention.py
 """
 
-import inspect
 import shutil
 from pathlib import Path
 
@@ -35,33 +34,6 @@ from nkigym.ops.tensor_reduce import NKITensorReduce
 from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.transpose import NKITranspose
 from nkigym.search import remote_search
-
-
-def attention_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
-    """Causal attention with numpy.
-
-    Args:
-        Q: Query tensor of shape (seq_q, d_k).
-        K: Key tensor of shape (seq_k, d_k).
-        V: Value tensor of shape (seq_k, d_v).
-
-    Returns:
-        Output tensor of shape (seq_q, d_v).
-    """
-    d_k = Q.shape[1]
-    scale = 1.0 / np.sqrt(d_k)
-    seq_q = Q.shape[0]
-    seq_k = K.shape[0]
-    scores = scale * (Q @ K.T)
-    row_idx = np.arange(seq_q)[:, np.newaxis]
-    col_idx = np.arange(seq_k)[np.newaxis, :]
-    causal_mask = row_idx >= col_idx
-    scores = np.where(causal_mask, scores, -np.inf)
-    row_max = scores.max(axis=-1, keepdims=True)
-    exp_scores = np.exp(scores - row_max)
-    row_sum = exp_scores.sum(axis=-1, keepdims=True)
-    weights = exp_scores / row_sum
-    return weights @ V
 
 
 def attention_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
@@ -108,8 +80,6 @@ if __name__ == "__main__":
     output = remote_search(
         func=attention_nkigym,
         input_specs=input_specs,
-        golden_source=inspect.getsource(attention_numpy),
-        golden_func_name="attention_numpy",
         hosts=["gym-1", "gym-2", "gym-3"],
         cache_dir=str(CACHE_DIR),
         num_variants=50,

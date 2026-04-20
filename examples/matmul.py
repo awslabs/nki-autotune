@@ -11,7 +11,6 @@ Usage::
     python examples/matmul.py
 """
 
-import inspect
 import shutil
 from pathlib import Path
 
@@ -22,20 +21,10 @@ from nkigym.ops.transpose import NKITranspose
 from nkigym.search import remote_search
 
 
-def matmul_lhsT_rhs_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Matrix multiply with numpy: lhs_T.T @ rhs."""
-    return lhs_T.T @ rhs
-
-
 def matmul_lhsT_rhs_nkigym(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     """Matrix multiply using nkigym logical ops: lhs_T.T @ rhs."""
     output = NKIMatmul()(stationary=lhs_T, moving=rhs)
     return output
-
-
-def matmul_lhs_rhs_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Matrix multiply with numpy: lhs @ rhs."""
-    return lhs @ rhs
 
 
 def matmul_lhs_rhs_nkigym(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -43,11 +32,6 @@ def matmul_lhs_rhs_nkigym(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     lhs_T = NKITranspose()(data=lhs)
     output = NKIMatmul()(stationary=lhs_T, moving=rhs)
     return output
-
-
-def matmul_lhs_rhsT_numpy(lhs: np.ndarray, rhs_T: np.ndarray) -> np.ndarray:
-    """Matrix multiply with numpy: lhs @ rhs_T.T."""
-    return lhs @ rhs_T.T
 
 
 def matmul_lhs_rhsT_nkigym(lhs: np.ndarray, rhs_T: np.ndarray) -> np.ndarray:
@@ -71,8 +55,6 @@ if __name__ == "__main__":
     remote_search(
         func=matmul_lhsT_rhs_nkigym,
         input_specs={"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")},
-        golden_source=inspect.getsource(matmul_lhsT_rhs_numpy),
-        golden_func_name="matmul_lhsT_rhs_numpy",
         hosts=HOSTS,
         cache_dir=str(CACHE_ROOT / "lhsT_rhs"),
         num_variants=NUM_VARIANTS,
@@ -84,8 +66,6 @@ if __name__ == "__main__":
     remote_search(
         func=matmul_lhs_rhs_nkigym,
         input_specs={"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")},
-        golden_source=inspect.getsource(matmul_lhs_rhs_numpy),
-        golden_func_name="matmul_lhs_rhs_numpy",
         hosts=HOSTS,
         cache_dir=str(CACHE_ROOT / "lhs_rhs"),
         num_variants=NUM_VARIANTS,
@@ -97,8 +77,6 @@ if __name__ == "__main__":
     remote_search(
         func=matmul_lhs_rhsT_nkigym,
         input_specs={"lhs": ((M, K), "bfloat16"), "rhs_T": ((N, K), "bfloat16")},
-        golden_source=inspect.getsource(matmul_lhs_rhsT_numpy),
-        golden_func_name="matmul_lhs_rhsT_numpy",
         hosts=HOSTS,
         cache_dir=str(CACHE_ROOT / "lhs_rhsT"),
         num_variants=NUM_VARIANTS,

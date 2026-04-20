@@ -49,16 +49,24 @@ class KernelJob(NamedTuple):
     Attributes:
         source: NKI kernel source code string.
         input_specs: Map of param name to (shape, dtype_str).
-        golden_source: Source code of the golden numpy reference function.
-        golden_func_name: Name of the golden function.
+        nkigym_source: Source code of the nkigym math function; the
+            worker executes it as the golden reference, running every
+            ``NKIOp`` through its numpy ``__call__``.
+        nkigym_func_name: Name of the nkigym math function within
+            ``nkigym_source``.
+        mac_count: Theoretical MAC count, derived from the KernelIR
+            on the coordinator. Avoids AST scans of the rendered
+            kernel (which misattribute trip counts when loops from
+            different fusion groups interleave).
         atol: Absolute tolerance for CPU sim vs golden comparison.
         rtol: Relative tolerance for CPU sim vs golden comparison.
     """
 
     source: str
     input_specs: dict[str, tuple[tuple[int, ...], str]]
-    golden_source: str
-    golden_func_name: str
+    nkigym_source: str
+    nkigym_func_name: str
+    mac_count: int
     atol: float
     rtol: float
 

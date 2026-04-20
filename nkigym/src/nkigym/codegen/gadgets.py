@@ -17,6 +17,13 @@ Contract:
 * ``p_start``, ``f_start``: starting slot indices into ``sbuf``.
 * ``p_count``, ``f_count``: number of slots to transfer on each
   axis. ``mem`` must cover exactly this region, else ``ValueError``.
+
+``load_block`` accepts ``transpose=True`` to fold a 2D transpose
+into the HBM→SBUF DMA via ``nisa.dma_transpose``. The ``mem``
+region is then the pre-transpose HBM tile with shape
+``(f_count * F, p_count * P)``; each leaf is filled with
+``mem[fi*F:(fi+1)*F, pi*P:(pi+1)*P]`` so the destination's
+partition axis takes values from the source's free axis.
 """
 
 from typing import Any
@@ -24,18 +31,31 @@ from typing import Any
 import nki.isa as nisa
 
 
-def load_block(sbuf: Any, mem: Any, p_start: int, p_count: int, f_start: int, f_count: int) -> None:
-    """HBM → SBUF: copy ``mem`` into the ``[p_start : p_start + p_count][f_start : f_start + f_count]`` sub-block of ``sbuf``."""
+def load_block(
+    sbuf: Any, mem: Any, p_start: int, p_count: int, f_start: int, f_count: int, transpose: bool = False
+) -> None:
+    """HBM → SBUF: copy ``mem`` into the ``[p_start : p_start + p_count][f_start : f_start + f_count]`` sub-block of ``sbuf``.
+
+    When ``transpose=True``, ``mem`` is the pre-transpose HBM tile
+    of shape ``(f_count * F, p_count * P)`` and each leaf is filled
+    via ``nisa.dma_transpose`` so the destination's partition axis
+    takes values from the source's free axis.
+    """
     p, f = sbuf[0][0].shape
     op, of = mem.shape
-    if op != p_count * p or of != f_count * f:
+    expected = (f_count * f, p_count * p) if transpose else (p_count * p, f_count * f)
+    if (op, of) != expected:
         raise ValueError(
             f"load_block shape mismatch: sbuf sub-block ({p_count}, {f_count})x({p}, {f}) "
-            f"covers ({p_count * p}, {f_count * f}), mem {mem.shape}"
+            f"expects mem {expected}, got {mem.shape} (transpose={transpose})"
         )
     for pi in range(p_count):
         for fi in range(f_count):
-            nisa.dma_copy(sbuf[p_start + pi][f_start + fi][0:p, 0:f], mem[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f])
+            dst = sbuf[p_start + pi][f_start + fi][0:p, 0:f]
+            if transpose:
+                nisa.dma_transpose(dst, mem[fi * f : (fi + 1) * f, pi * p : (pi + 1) * p])
+            else:
+                nisa.dma_copy(dst, mem[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f])
 
 
 def stage_block(sbuf: Any, mem: Any, p_start: int, p_count: int, f_start: int, f_count: int) -> None:

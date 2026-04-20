@@ -53,7 +53,7 @@ def render_sbuf_buffers(ir: KernelIR, staged: set[str], tensor_to_groups: dict[s
     return by_group
 
 
-def render_psum_allocations(ir: KernelIR, op_to_group: dict[int, int]) -> dict[int, list[str]]:
+def render_psum_allocations(ir: KernelIR, op_to_group: dict[int, int], elided: dict[int, str]) -> dict[int, list[str]]:
     """Return ``{group_idx: [alloc_lines]}`` for every PSUM tensor.
 
     Every PSUM buffer is declared at the top of its fusion group
@@ -62,7 +62,9 @@ def render_psum_allocations(ir: KernelIR, op_to_group: dict[int, int]) -> dict[i
     ``render_nki_ops`` emits. PSUM tensors within a group pack into
     ``PSUM_BANK_SIZE``-aligned byte offsets starting at 0; banks
     between groups are reclaimed by the compiler because PSUM never
-    crosses group boundaries.
+    crosses group boundaries. Tensors produced by ops in ``elided``
+    get no PSUM allocation — their fused HBM ``dma_transpose`` load
+    writes straight into SBUF.
     """
     da = ir.dim_analysis
     graph = ir.op_graph
@@ -72,7 +74,7 @@ def render_psum_allocations(ir: KernelIR, op_to_group: dict[int, int]) -> dict[i
         if graph.producer_isa_loc(name) != "psum":
             continue
         producer = graph.producer_op(name)
-        if producer is None:
+        if producer is None or producer in elided:
             continue
         group_idx = op_to_group[producer]
         psum_dtype = tensor_to_psum_dtype.get(name, tinfo.dtype)

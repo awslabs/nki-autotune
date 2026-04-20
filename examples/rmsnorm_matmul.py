@@ -16,7 +16,6 @@ Usage::
     python examples/rmsnorm_matmul.py
 """
 
-import inspect
 import shutil
 from pathlib import Path
 
@@ -30,21 +29,6 @@ from nkigym.ops.transpose import NKITranspose
 from nkigym.search import remote_search
 
 EPS = 1e-6
-
-
-def rmsnorm_matmul_numpy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """RMSNorm(a) @ b with numpy.
-
-    Args:
-        a: Input tensor of shape (M, K).
-        b: Weight tensor of shape (K, N).
-
-    Returns:
-        Output tensor of shape (M, N).
-    """
-    rms = np.sqrt(np.mean(a**2, axis=1, keepdims=True) + 1e-6)
-    a_normed = a / rms
-    return a_normed @ b
 
 
 def rmsnorm_matmul_nkigym(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -78,8 +62,6 @@ if __name__ == "__main__":
     output = remote_search(
         func=rmsnorm_matmul_nkigym,
         input_specs=input_specs,
-        golden_source=inspect.getsource(rmsnorm_matmul_numpy),
-        golden_func_name="rmsnorm_matmul_numpy",
         hosts=["gym-1", "gym-2", "gym-3"],
         cache_dir=str(CACHE_DIR),
         num_variants=50,

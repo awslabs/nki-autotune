@@ -7,7 +7,13 @@ from nkigym.codegen.buffers import (
     render_psum_allocations,
     render_sbuf_buffers,
 )
-from nkigym.codegen.dma import build_op_to_group, render_hbm_loads, render_hbm_store, render_psum_staging
+from nkigym.codegen.dma import (
+    build_op_to_group,
+    find_fused_transposes,
+    render_hbm_loads,
+    render_hbm_store,
+    render_psum_staging,
+)
 from nkigym.codegen.group_loops import DepthPlan, render_group_loops
 from nkigym.codegen.header import render_header, render_return
 from nkigym.codegen.nki_ops import render_nki_ops
@@ -34,12 +40,18 @@ def render_ir(ir: KernelIR) -> str:
     op_to_group = build_op_to_group(ir)
     tensor_to_groups = build_tensor_to_groups(ir)
     staged = find_psum_tensors_needing_sbuf(ir)
+    elided = find_fused_transposes(ir)
+    for input_name in elided.values():
+        """Drop the dead ``sbuf_<input>`` allocation — the fused
+        load writes directly to the transpose output's SBUF
+        buffer, so the pre-transpose input has no reader."""
+        tensor_to_groups.pop(input_name, None)
     header = render_header(ir.dim_analysis)
 
-    before_plan: DepthPlan = render_hbm_loads(ir, op_to_group)
+    before_plan: DepthPlan = render_hbm_loads(ir, op_to_group, elided)
     staging_before, staging_after = render_psum_staging(ir, op_to_group, staged)
     _merge(before_plan, staging_before)
-    nki_before, nki_after = render_nki_ops(ir, op_to_group, staged)
+    nki_before, nki_after = render_nki_ops(ir, op_to_group, staged, elided)
     _merge(before_plan, nki_before)
     _merge(staging_after, nki_after)
 
@@ -48,7 +60,7 @@ def render_ir(ir: KernelIR) -> str:
     _merge(staging_after, store_after)
 
     sbuf_by_group = render_sbuf_buffers(ir, staged=staged, tensor_to_groups=tensor_to_groups)
-    psum_allocs = render_psum_allocations(ir, op_to_group)
+    psum_allocs = render_psum_allocations(ir, op_to_group, elided)
     for group_idx in range(len(ir.fusion_groups)):
         group_top = sbuf_by_group.get(group_idx, []) + psum_allocs.get(group_idx, [])
         if group_top:

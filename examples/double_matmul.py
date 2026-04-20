@@ -15,7 +15,6 @@ Usage::
     python examples/double_matmul.py
 """
 
-import inspect
 import shutil
 from pathlib import Path
 
@@ -24,20 +23,6 @@ import numpy as np
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
 from nkigym.search import remote_search
-
-
-def double_matmul_numpy(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
-    """Reference: (Q @ K.T) @ V.
-
-    Args:
-        Q: Shape (seq_q, d_k).
-        K: Shape (seq_k, d_k).
-        V: Shape (seq_k, d_v).
-
-    Returns:
-        Output of shape (seq_q, d_v).
-    """
-    return (Q @ K.T) @ V
 
 
 def double_matmul_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
@@ -70,8 +55,6 @@ if __name__ == "__main__":
     output = remote_search(
         func=double_matmul_nkigym,
         input_specs=input_specs,
-        golden_source=inspect.getsource(double_matmul_numpy),
-        golden_func_name="double_matmul_numpy",
         hosts=["gym-1", "gym-2", "gym-3"],
         cache_dir=str(CACHE_DIR),
         num_variants=50,

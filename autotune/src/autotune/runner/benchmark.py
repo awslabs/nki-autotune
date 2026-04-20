@@ -4,6 +4,8 @@ Worker-only module — imports nki and nkipy at top level. Not safe to
 import on the coordinator machine.
 """
 
+import re
+from pathlib import Path
 from typing import Any, cast
 
 import nki
@@ -138,14 +140,14 @@ def benchmark_one(
 
 
 def simulate_one(nki_path: str, func_name: str, kernel_kwargs: dict[str, Any]) -> tuple[np.ndarray, str]:
-    """Run a kernel through the NKI CPU simulator in float32.
+    """Run a kernel through the NKI CPU simulator in float32 end-to-end.
 
-    All tensor inputs are cast to float32 before simulation, regardless
-    of the kernel's declared dtype. The NKI simulator only accepts
-    hardware dtypes (float32 is the highest precision). This matches
-    compute_golden() which also casts to float32, giving an
-    apples-to-apples comparison that tests accumulation order
-    (tiled vs monolithic) without low-precision noise.
+    Everything runs at float32: inputs are cast, and the kernel source
+    is rewritten to a sibling ``.sim.py`` so every ``dtype=nl.<name>``
+    token declares ``nl.float32``. This keeps the numerical check
+    apples-to-apples with ``compute_golden()`` and bypasses
+    ``nisa.dma_transpose``'s strict dtype assert — the hardware path
+    still reads ``nki_path`` with the user's declared dtypes.
 
     Args:
         nki_path: Path to the kernel source file.
@@ -158,7 +160,8 @@ def simulate_one(nki_path: str, func_name: str, kernel_kwargs: dict[str, Any]) -
     output = np.empty(0)
     error = ""
     try:
-        kernel_func = load_kernel(nki_path, func_name)
+        sim_path = _rewrite_to_fp32(nki_path)
+        kernel_func = load_kernel(sim_path, func_name)
         sim_kwargs: dict[str, Any] = {}
         for k, v in kernel_kwargs.items():
             if hasattr(v, "ndim") and v.ndim > 0:
@@ -170,6 +173,20 @@ def simulate_one(nki_path: str, func_name: str, kernel_kwargs: dict[str, Any]) -
     except Exception as e:
         error = capture_error(e)
     return output, error
+
+
+def _rewrite_to_fp32(nki_path: str) -> str:
+    """Return a sibling ``.sim.py`` with every ``dtype=nl.<name>`` forced to ``nl.float32``.
+
+    Targets the codegen's dtype-bearing tokens without touching
+    unrelated ``nl.*`` names (``nl.ndarray``, ``nl.sbuf``,
+    ``nl.psum``, ``nl.shared_hbm``, etc.).
+    """
+    source = Path(nki_path).read_text()
+    rewritten = re.sub(r"dtype=nl\.\w+", "dtype=nl.float32", source)
+    sim_path = Path(nki_path).with_suffix(".sim.py")
+    sim_path.write_text(rewritten)
+    return str(sim_path)
 
 
 def generate_tensors(tensor_specs: dict[str, dict], seed: int) -> dict[str, np.ndarray]:
@@ -188,22 +205,25 @@ def generate_tensors(tensor_specs: dict[str, dict], seed: int) -> dict[str, np.n
     return tensors
 
 
-def compute_golden(golden_source: str, func_name: str, kernel_kwargs: dict[str, np.ndarray]) -> np.ndarray:
-    """Execute a golden reference function to compute expected output.
+def compute_golden(nkigym_source: str, func_name: str, kernel_kwargs: dict[str, np.ndarray]) -> np.ndarray:
+    """Execute the nkigym math function as the golden reference, in float32.
 
-    Casts inputs to float32 to match the NKI CPU simulator precision
-    (float32 is the highest precision the NKI simulator accepts).
+    The source carries its own imports (``from nkigym.ops.matmul
+    import NKIMatmul`` etc.). Each ``NKIOp`` has a pure-numpy
+    ``__call__`` — invoking the math function therefore runs a
+    numpy simulation of the kernel at float32. Inputs are cast to
+    float32 to match ``simulate_one``'s fp32-end-to-end path.
 
     Args:
-        golden_source: Source code containing the golden function.
-        func_name: Name of the golden function.
+        nkigym_source: Source code of the nkigym math function.
+        func_name: Name of the nkigym function within the source.
         kernel_kwargs: Input arrays (will be cast to float32).
 
     Returns:
         Expected output at float32 precision.
     """
-    g: dict[str, Any] = {"np": np, "__builtins__": __builtins__}
-    exec(golden_source, g)  # noqa: S102
+    g: dict[str, Any] = {"__builtins__": __builtins__, "__name__": "__nkigym_golden__"}
+    exec(nkigym_source, g)  # noqa: S102
     func = g[func_name]
     f32_kwargs = {k: v.astype(np.float32) for k, v in kernel_kwargs.items() if hasattr(v, "ndim") and v.ndim > 0}
     return func(**f32_kwargs)

@@ -15,6 +15,7 @@ from nkigym.kernel_ir import KernelIR, get_tpb
 from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
 from nkigym.kernel_ir.emission import material_blocking_dims, op_emission_placement
 from nkigym.kernel_ir.validate import tier_depth_range
+from nkigym.ops.transpose import NKITranspose
 
 _TIER_RANK = {"per_tile": 0, "per_block": 1, "full": 2}
 
@@ -25,6 +26,42 @@ def build_op_to_group(ir: KernelIR) -> dict[int, int]:
     for gi, group in enumerate(ir.fusion_groups):
         for op_idx in group.op_indices:
             result[op_idx] = gi
+    return result
+
+
+_FUSED_TRANSPOSES_CACHE: dict[int, dict[int, str]] = {}
+
+
+def find_fused_transposes(ir: KernelIR) -> dict[int, str]:
+    """Return ``{op_idx: hbm_input_name}`` for every ``NKITranspose`` that fuses into an HBM ``dma_transpose`` load.
+
+    Fusion fires iff the transpose's ``data`` input is an HBM
+    kernel input with this transpose as its sole consumer AND the
+    output is not the kernel return tensor. The transpose op is
+    elided from ``render_nki_ops``; ``render_hbm_loads`` emits a
+    single ``load_block(..., transpose=True)`` that writes the
+    transposed layout directly into the consumer's SBUF buffer.
+    Cached on ``id(ir)`` — ``render_ir`` is on the hot sampling
+    path (thousands of calls per ``sample_variants`` run).
+    """
+    result = _FUSED_TRANSPOSES_CACHE.get(id(ir))
+    if result is None:
+        graph = ir.op_graph
+        return_name = ir.dim_analysis.return_name
+        result = {}
+        for op_idx, op_cls in enumerate(graph.op_classes):
+            if op_cls is not NKITranspose:
+                continue
+            inputs, outputs = graph.op_tensors[op_idx]
+            data = inputs.get("data")
+            if data is None or graph.producer_op(data) is not None:
+                continue
+            if graph.ops_touching(data) != [op_idx]:
+                continue
+            if outputs[0] == return_name:
+                continue
+            result[op_idx] = data
+        _FUSED_TRANSPOSES_CACHE[id(ir)] = result
     return result
 
 
@@ -43,19 +80,29 @@ def producer_finished_depth(ir: KernelIR, producer: int, dim_order: list[str]) -
     return depth, blocking
 
 
-def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int]) -> DepthPlan:
+def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int], elided: dict[int, str]) -> DepthPlan:
     """Plan HBM→SBUF loads for every kernel input.
 
     Each input tensor is loaded once at the tier-feasibility
     depth in the group that contains its earliest consumer. The
     sub-block written covers every SBUF slot the consumer will
-    read at that depth.
+    read at that depth. When an elided transpose consumes the
+    input, a single ``load_block(..., transpose=True)`` fills the
+    transpose output's SBUF buffer directly instead.
     """
     da = ir.dim_analysis
     graph = ir.op_graph
     plan: DepthPlan = {}
+    fused_inputs = set(elided.values())
+
+    for op_idx in sorted(elided):
+        group_idx = op_to_group[op_idx]
+        depth, line = _fused_load_line(ir, op_idx, group_idx)
+        plan.setdefault(group_idx, {}).setdefault(depth, []).append(line)
 
     for tensor_name in da.param_names:
+        if tensor_name in fused_inputs:
+            continue
         tinfo = da.tensors[tensor_name]
         touching = graph.ops_touching(tensor_name)
         if not touching:
@@ -68,6 +115,33 @@ def render_hbm_loads(ir: KernelIR, op_to_group: dict[int, int]) -> DepthPlan:
         )
 
     return plan
+
+
+def _fused_load_line(ir: KernelIR, op_idx: int, group_idx: int) -> tuple[int, str]:
+    """Return ``(depth, line)`` for a fused ``dma_transpose`` HBM load.
+
+    ``sbuf`` arg and sub-block bounds key on the transpose output
+    (the tensor the downstream consumer reads); the HBM slice
+    keys on the input's own dim_ids, which yields a pre-transpose
+    shape ``(f_count * F, p_count * P)`` — exactly what
+    ``load_block(..., transpose=True)`` expects.
+    """
+    graph = ir.op_graph
+    da = ir.dim_analysis
+    inputs, outputs = graph.op_tensors[op_idx]
+    input_name = inputs["data"]
+    output_name = outputs[0]
+    dim_order = ir.fusion_groups[group_idx].dim_order
+    output_tinfo = da.tensors[output_name]
+    depth = _tier_depth(ir, group_idx, output_name, output_tinfo, dim_order)
+    buf = sbuf_buffer(ir, output_name)
+    p_access, f_access = _axis_access(ir, group_idx, output_name, output_tinfo, dim_order, depth)
+    p_start, p_count, f_start, f_count = buf.range(p_access, f_access)
+    input_tinfo = da.tensors[input_name]
+    mem_expr = f"{input_name}{_hbm_slice(ir, input_tinfo, dim_order, depth)}"
+    sbuf_arg = f"sbuf_{output_name}"
+    line = f"load_block({sbuf_arg}, {mem_expr}, {p_start}, {p_count}, {f_start}, {f_count}, transpose=True)"
+    return depth, line
 
 
 def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> tuple[DepthPlan, DepthPlan]:

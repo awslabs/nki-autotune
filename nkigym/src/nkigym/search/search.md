@@ -24,21 +24,18 @@ Different `(dim_order, tensor_placements)` combinations can render to the same s
 `remote_search` wraps `remote_profile` with sample-based variant generation:
 
 ```python
-ir = build_ir(matmul_nkigym, input_specs)
-
 results = remote_search(
-    initial_kernel=ir,
-    golden_source=golden_source,
-    golden_func_name="matmul_numpy",
+    func=matmul_nkigym,
+    input_specs=input_specs,
     hosts=["gym-1", "gym-2", "gym-3", "gym-4", "gym-5", "gym-6"],
     cache_dir="/home/ubuntu/cache/matmul_search",
     num_variants=100,
     atol=0.5,
     rtol=0.1,
-    warmup=10,
-    iters=100,
 )
 ```
+
+The nkigym math function doubles as the fp32 golden reference — every `NKIOp` has a pure-numpy `__call__`, so the worker runs `func(**inputs)` at fp32 and compares against the NKI CPU simulator output (also fp32 end-to-end after the kernel source rewrite). If users want to sanity-check the nkigym function against a hand-written numpy reference, they do that outside `remote_search`.
 
 Internally:
 

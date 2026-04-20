@@ -24,7 +24,7 @@ from nkipy.runtime import BaremetalExecutor
 from autotune.runner.benchmark import benchmark_one, compute_golden, generate_tensors, simulate_one
 from autotune.runner.compare import assert_close
 from autotune.runner.compile import compile_one, init_compile_worker
-from autotune.runner.detect import detect_func_name, detect_kernel_info, detect_mac_count, detect_neuron_cores
+from autotune.runner.detect import detect_func_name, detect_kernel_info, detect_neuron_cores
 from autotune.runner.types import (
     BenchmarkConfig,
     CompileResult,
@@ -84,12 +84,12 @@ def _process_kernel_job(kname: str, job: dict[str, Any], seed: int, nki_dir: Pat
     nki_path.write_text(source)
 
     func_name, output_shape = detect_kernel_info(source)
-    mac_count = detect_mac_count(source)
+    mac_count = job["mac_count"]
 
     tensor_specs = {name: {"shape": list(shape), "dtype": dt} for name, (shape, dt) in job["tensor_specs"].items()}
     kwargs = generate_tensors(tensor_specs, seed)
 
-    golden = compute_golden(job["golden_source"], job["golden_func_name"], kwargs)
+    golden = compute_golden(job["nkigym_source"], job["nkigym_func_name"], kwargs)
 
     sim_output, sim_error = simulate_one(str(nki_path), func_name, kwargs)
     cpu_sim = _cpu_sim_status(sim_output, sim_error, golden, job["atol"], job["rtol"])

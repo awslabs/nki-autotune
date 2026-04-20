@@ -136,8 +136,9 @@ def _launch_ssh_workers(
             payload["kernel_jobs"][n] = {
                 "source": job.source,
                 "tensor_specs": {name: (list(shape), dt) for name, (shape, dt) in job.input_specs.items()},
-                "golden_source": job.golden_source,
-                "golden_func_name": job.golden_func_name,
+                "nkigym_source": job.nkigym_source,
+                "nkigym_func_name": job.nkigym_func_name,
+                "mac_count": job.mac_count,
                 "atol": job.atol,
                 "rtol": job.rtol,
             }

@@ -28,7 +28,9 @@ from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
 from nkigym.kernel_ir.emission import Placement, material_blocking_dims, op_emission_placement
 
 
-def render_nki_ops(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> tuple[DepthPlan, DepthPlan]:
+def render_nki_ops(
+    ir: KernelIR, op_to_group: dict[int, int], staged: set[str], elided: dict[int, str]
+) -> tuple[DepthPlan, DepthPlan]:
     """Plan ISA calls, per-op stages, and PSUM memsets; return (before, after) plans.
 
     Each op's ISA block is placed at its own ``Placement``. Non-
@@ -36,13 +38,17 @@ def render_nki_ops(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) 
     ISA block at the same slot; material-blocking producers get
     their memset at the outermost blocking loop's depth (before)
     and are staged via ``render_psum_staging`` at the same depth
-    in the after-plan.
+    in the after-plan. Ops in ``elided`` (transposes fused into an
+    HBM ``dma_transpose`` load) are skipped entirely — their
+    memset, stage, and ISA call are absorbed by the fused load.
     """
     graph = ir.op_graph
     before_plan: DepthPlan = {}
     after_plan: DepthPlan = {}
     memo: dict[int, Placement] = {}
     for op_idx, op_cls in enumerate(graph.op_classes):
+        if op_idx in elided:
+            continue
         group_idx = op_to_group[op_idx]
         dim_order = ir.fusion_groups[group_idx].dim_order
         placement = op_emission_placement(ir, op_idx, group_idx, op_to_group, staged, memo)
