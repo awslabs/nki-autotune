@@ -37,11 +37,13 @@ def render_ir(ir: KernelIR) -> str:
     header = render_header(ir.dim_analysis)
 
     before_plan: DepthPlan = render_hbm_loads(ir, op_to_group)
-    _merge(before_plan, render_nki_ops(ir, op_to_group, staged))
     staging_before, staging_after = render_psum_staging(ir, op_to_group, staged)
     _merge(before_plan, staging_before)
+    nki_before, nki_after = render_nki_ops(ir, op_to_group, staged)
+    _merge(before_plan, nki_before)
+    _merge(staging_after, nki_after)
 
-    store_before, store_after = render_hbm_store(ir, op_to_group)
+    store_before, store_after = render_hbm_store(ir, op_to_group, staged)
     _merge(before_plan, store_before)
     _merge(staging_after, store_after)
 

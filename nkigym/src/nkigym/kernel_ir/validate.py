@@ -9,21 +9,50 @@ independently-sampled IR candidates.
 from typing import Any
 
 from nkigym.kernel_ir.dim_analysis import op_blocking_dims
+from nkigym.kernel_ir.emission import Placement, op_emission_placement
 
 
-def validate(ir: Any, tensor_to_groups: dict[str, set[int]]) -> bool:
+def validate(ir: Any, tensor_to_groups: dict[str, set[int]], op_to_group: dict[int, int], staged: set[str]) -> bool:
     """Return True iff every legality rule passes for *ir*.
 
     ``tensor_placements`` is an SBUF-only concept (PSUM has no
     meaningful tier — it's always a single narrow-scoped tile
     allocated just before use), so every placement rule here
-    implicitly subjects the SBUF buffer.
+    implicitly subjects the SBUF buffer. Emission-slot feasibility
+    is trip-count-aware and catches partition draws where some op
+    has no legal slot under phase-grouped emission given the drawn
+    ``dim_order`` + ``tensor_placements``. ``staged`` is the PSUM-
+    needing-SBUF set; caller caches it since it depends only on the
+    op graph (not on the drawn IR state).
     """
     return (
         _check_cross_group_placements(ir, tensor_to_groups)
         and _check_blocking_innermost(ir)
         and _check_placement_feasibility(ir)
+        and _check_emission_feasibility(ir, op_to_group, staged)
     )
+
+
+def _check_emission_feasibility(ir: Any, op_to_group: dict[int, int], staged: set[str]) -> bool:
+    """Every op must have a legal emission slot under phase-grouped emission."""
+    memo: dict[int, Placement] = {}
+    return all(
+        _placement_ok(ir, op_idx, gi, op_to_group, staged, memo)
+        for gi, group in enumerate(ir.fusion_groups)
+        for op_idx in group.op_indices
+    )
+
+
+def _placement_ok(
+    ir: Any, op_idx: int, gi: int, op_to_group: dict[int, int], staged: set[str], memo: dict[int, Placement]
+) -> bool:
+    """True iff ``op_emission_placement`` returns a legal slot for this op."""
+    ok = True
+    try:
+        op_emission_placement(ir, op_idx, gi, op_to_group, staged, memo)
+    except ValueError:
+        ok = False
+    return ok
 
 
 def _check_blocking_innermost(ir: Any) -> bool:
@@ -46,13 +75,25 @@ def _check_blocking_innermost(ir: Any) -> bool:
 
 
 def _op_blocking_innermost_ok(ir: Any, group_idx: int, op_idx: int) -> bool:
-    """Check that every blocking dim is inner to every non-blocking dim for one op."""
+    """Check that every blocking dim of *op_idx* is inner to every non-blocking dim *this op touches*.
+
+    Dims the op doesn't touch are irrelevant to its accumulation
+    contract — they're outer or inner to the op's scope, not part
+    of the PSUM iteration the op drives. Restricting the rule to
+    ``dims(op)`` lets fused groups where different ops block on
+    different dims still admit a legal dim_order.
+    """
     da = ir.dim_analysis
     op_cls = ir.op_graph.op_classes[op_idx]
     blocking = op_blocking_dims(op_cls, da.per_op_axis_maps[op_idx])
     dim_order = ir.fusion_groups[group_idx].dim_order
-    blocking_positions = [dim_order.index(d) for d in blocking if d in dim_order]
-    non_blocking_positions = [idx for idx, d in enumerate(dim_order) if d not in blocking]
+    op_dims = set()
+    for name in ir.op_graph.op_tensor_names(op_idx):
+        if name in da.tensors:
+            op_dims.update(da.tensors[name].dim_ids)
+    op_dims &= set(dim_order)
+    blocking_positions = [dim_order.index(d) for d in blocking if d in op_dims]
+    non_blocking_positions = [dim_order.index(d) for d in op_dims if d not in blocking]
     return not (blocking_positions and non_blocking_positions and min(blocking_positions) < max(non_blocking_positions))
 
 

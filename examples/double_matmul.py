@@ -60,7 +60,7 @@ def double_matmul_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndar
 
 
 if __name__ == "__main__":
-    seq_q, d_k, seq_k, d_v = 2048, 128, 2048, 128
+    seq_q, d_k, seq_k, d_v = 2048, 2048, 2048, 2048
     input_specs = {"Q": ((seq_q, d_k), "bfloat16"), "K": ((seq_k, d_k), "bfloat16"), "V": ((seq_k, d_v), "bfloat16")}
 
     CACHE_DIR = Path("/home/ubuntu/cache/double_matmul")

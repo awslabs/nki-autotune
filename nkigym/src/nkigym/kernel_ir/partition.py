@@ -1,25 +1,22 @@
-"""Fusion-partition sampling under R1 (convexity) + R2 (blocking barrier) + renderer-capability gate.
+"""Fusion-partition sampling under R1 (convexity) only.
 
 Draws a partition of ``op_graph.op_classes`` into fusion groups by
-stochastic pairwise merging from the singleton partition, gated by:
+stochastic pairwise merging from the singleton partition. The one
+partition-time rule is R1 (convexity): ``ops(M)`` must be a convex
+subset of the op DAG — for every op ``w`` outside ``M``, ``w``
+must not lie on a DAG path between two members of ``M``.
 
-* R1 (convexity): ``ops(M)`` must be a convex subset of the op
-  DAG. For every op ``w`` outside ``M``, ``w`` must not lie on a
-  DAG path between two members of ``M``.
-* R2 (blocking barrier): for every producer→consumer edge
-  ``u → v`` with both in ``M``,
-  ``blocking_dims(u) ∩ dims(v) = ∅``. ``v``'s emission scope must
-  sit outside ``u``'s blocking loops so ``u``'s store has fired
-  before ``v`` reads it.
-* Renderer-capability gate: reject intra-group edges where the
-  producer is a blocking PSUM op.
+R2 (blocking barrier) and renderer-capability are trip-count-
+dependent and draw-specific (they depend on the sampled
+``dim_order``, ``ltiles_per_block``, and ``tensor_placements``).
+They are enforced at IR-validation time via
+``validate._check_emission_feasibility`` rather than here.
 
 Output is a list of op-index groups in topological order.
 """
 
 import random
 
-from nkigym.kernel_ir.dim_analysis import DimAnalysis, op_blocking_dims
 from nkigym.kernel_ir.op_graph import OpGraph
 
 
@@ -46,15 +43,6 @@ def compute_reachability(graph: OpGraph) -> list[set[int]]:
     return reach
 
 
-def op_dims_of(graph: OpGraph, da: DimAnalysis, op_idx: int) -> set[str]:
-    """Return every dim the op touches via its input + output tensors."""
-    dims: set[str] = set()
-    for name in graph.op_tensor_names(op_idx):
-        if name in da.tensors:
-            dims.update(da.tensors[name].dim_ids)
-    return dims
-
-
 def _is_convex(ops: set[int], n: int, reach: list[set[int]]) -> bool:
     """Check R1: no external op lies on a DAG path between two members of ``ops``.
 
@@ -67,58 +55,29 @@ def _is_convex(ops: set[int], n: int, reach: list[set[int]]) -> bool:
     return not any(external_on_path)
 
 
-def _violates_blocking(ops: set[int], graph: OpGraph, da: DimAnalysis, op_dims: list[set[str]]) -> bool:
-    """Check R2 + renderer-capability: any intra-group edge ``u → v`` where either
-    ``blocking_dims(u) ∩ dims(v) ≠ ∅`` (math-invalid), or ``u`` is a PSUM producer
-    with non-empty ``BLOCKING_AXES`` (renderer can't hoist ``v`` out of ``u``'s blocking scope).
+def _legal_merge(a: set[int], b: set[int], reach: list[set[int]], n: int) -> bool:
+    """Test whether merging ``a`` and ``b`` preserves R1 (convexity).
+
+    Trip-count-dependent rules (R2, emission-slot feasibility) are
+    enforced at IR-validation time against the full drawn state.
     """
-    return any(
-        _edge_blocks(graph, da, producer, consumer, op_dims)
-        for producer, consumer, _tensor, _role in graph.edges
-        if producer in ops and consumer in ops
-    )
-
-
-def _edge_blocks(graph: OpGraph, da: DimAnalysis, producer: int, consumer: int, op_dims: list[set[str]]) -> bool:
-    """True iff edge ``producer → consumer`` violates R2 or the renderer-capability gate."""
-    producer_cls = graph.op_classes[producer]
-    blocking = op_blocking_dims(producer_cls, da.per_op_axis_maps[producer])
-    r2_violation = bool(blocking & op_dims[consumer])
-    capability_violation = producer_cls.ISA_LOC == "psum" and bool(blocking)
-    return r2_violation or capability_violation
-
-
-def _legal_merge(
-    a: set[int], b: set[int], graph: OpGraph, da: DimAnalysis, reach: list[set[int]], op_dims: list[set[str]], n: int
-) -> bool:
-    """Test whether merging ``a`` and ``b`` preserves R1 + R2 + renderer capability."""
-    merged = a | b
-    return _is_convex(merged, n, reach) and not _violates_blocking(merged, graph, da, op_dims)
+    return _is_convex(a | b, n, reach)
 
 
 def sample_partition(
-    graph: OpGraph,
-    da: DimAnalysis,
-    rng: random.Random,
-    p_merge: float = 0.7,
-    reach: list[set[int]] | None = None,
-    op_dims: list[set[str]] | None = None,
+    graph: OpGraph, rng: random.Random, p_merge: float = 0.7, reach: list[set[int]] | None = None
 ) -> list[list[int]]:
     """Draw a partition of the op set via stochastic pairwise merging.
 
     Starts from the singleton partition and repeatedly selects a
-    random legal merge (under R1 + R2) with probability ``p_merge``
-    per step. Stops when no legal merges remain or the Bernoulli
-    draw breaks. Groups are returned in topological order with ops
-    inside each group sorted by index. ``reach`` and ``op_dims``
-    depend only on ``(graph, da)`` — callers in hot paths should
-    compute them once and pass them in.
+    random legal merge (under R1) with probability ``p_merge`` per
+    step. Stops when no legal merges remain or the Bernoulli draw
+    breaks. Groups are returned in topological order with ops inside
+    each group sorted by index. ``reach`` depends only on ``graph``
+    — callers in hot paths should compute it once and pass it in.
     """
     n = len(graph.op_classes)
     reach_final: list[set[int]] = compute_reachability(graph) if reach is None else reach
-    op_dims_final: list[set[str]] = (
-        [op_dims_of(graph, da, op_idx) for op_idx in range(n)] if op_dims is None else op_dims
-    )
     groups: list[set[int]] = [{i} for i in range(n)]
 
     while True:
@@ -126,7 +85,7 @@ def sample_partition(
             (i, j)
             for i in range(len(groups))
             for j in range(i + 1, len(groups))
-            if _legal_merge(groups[i], groups[j], graph, da, reach_final, op_dims_final, n)
+            if _legal_merge(groups[i], groups[j], reach_final, n)
         ]
         if not legal_pairs:
             break

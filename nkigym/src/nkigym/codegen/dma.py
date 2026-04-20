@@ -13,6 +13,7 @@ from nkigym.codegen.group_loops import DepthPlan
 from nkigym.codegen.sbuf_buffer import AxisAccess
 from nkigym.kernel_ir import KernelIR, get_tpb
 from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
+from nkigym.kernel_ir.emission import material_blocking_dims, op_emission_placement
 from nkigym.kernel_ir.validate import tier_depth_range
 
 _TIER_RANK = {"per_tile": 0, "per_block": 1, "full": 2}
@@ -95,9 +96,10 @@ def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[s
             continue
         group_idx = op_to_group[producer]
         dim_order = ir.fusion_groups[group_idx].dim_order
-        producer_depth, blocking = producer_finished_depth(ir, producer, dim_order)
-        if not blocking:
+        material = material_blocking_dims(ir, producer, dim_order)
+        if not material:
             continue
+        producer_depth = min(dim_order.index(d) for d in material)
         tinfo = da.tensors[tensor_name]
         line = _gadget_call(
             "stage_block", ir, group_idx, tensor_name, tinfo, dim_order, producer_depth, sbuf_is_dst=True, psum_src=True
@@ -108,14 +110,11 @@ def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[s
 
 
 def inline_stage_line(
-    ir: KernelIR, group_idx: int, producer_op_idx: int, tensor_name: str, dim_order: list[str]
+    ir: KernelIR, group_idx: int, producer_op_idx: int, tensor_name: str, dim_order: list[str], depth: int
 ) -> str:
-    """PSUM→SBUF stage line for a non-blocking producer, emitted inline by ``render_nki_ops``."""
+    """PSUM→SBUF stage line for a non-material-blocking producer, emitted at the producer's depth."""
+    _ = producer_op_idx
     tinfo = ir.dim_analysis.tensors[tensor_name]
-    depth = max(
-        producer_finished_depth(ir, producer_op_idx, dim_order)[0],
-        _tier_depth(ir, group_idx, tensor_name, tinfo, dim_order),
-    )
     return _gadget_call(
         "stage_block", ir, group_idx, tensor_name, tinfo, dim_order, depth, sbuf_is_dst=True, psum_src=True
     )
@@ -150,8 +149,8 @@ def has_output_ptile_dims(ir: KernelIR, op_idx: int) -> bool:
     return any(dim_id not in blocking for dim_id, _ in ptile_loop_dims(ir, op_idx))
 
 
-def render_hbm_store(ir: KernelIR, op_to_group: dict[int, int]) -> tuple[DepthPlan, DepthPlan]:
-    """Plan the SBUF→HBM store for the return tensor — into the after-plan when the producer writes PSUM (sequencing after the stage), otherwise before-plan."""
+def render_hbm_store(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> tuple[DepthPlan, DepthPlan]:
+    """Plan the SBUF→HBM store for the return tensor at the producer's emission slot."""
     da = ir.dim_analysis
     graph = ir.op_graph
     ret = da.return_name
@@ -162,18 +161,16 @@ def render_hbm_store(ir: KernelIR, op_to_group: dict[int, int]) -> tuple[DepthPl
         group_idx = op_to_group[producer]
         tinfo = da.tensors[ret]
         dim_order = ir.fusion_groups[group_idx].dim_order
+        placement = op_emission_placement(ir, producer, group_idx, op_to_group, staged)
         op_cls = graph.op_classes[producer]
-        if op_cls.ISA_LOC == "psum":
-            producer_depth, blocking = producer_finished_depth(ir, producer, dim_order)
-            if blocking:
-                depth = producer_depth
-                uses_after = True
-            else:
-                depth = max(producer_depth, _tier_depth(ir, group_idx, ret, tinfo, dim_order))
-                uses_after = False
+        is_psum = op_cls.ISA_LOC == "psum"
+        material = material_blocking_dims(ir, producer, dim_order) if is_psum else set()
+        if is_psum and material:
+            depth = min(dim_order.index(d) for d in material)
+            uses_after = True
         else:
-            depth = max(2 * len(dim_order), _tier_depth(ir, group_idx, ret, tinfo, dim_order))
-            uses_after = False
+            depth = max(placement.depth, _tier_depth(ir, group_idx, ret, tinfo, dim_order))
+            uses_after = placement.phase == "after"
         line = _gadget_call("store_block", ir, group_idx, ret, tinfo, dim_order, depth, sbuf_is_dst=False)
         (after if uses_after else before).setdefault(group_idx, {}).setdefault(depth, []).append(line)
     return before, after

@@ -23,7 +23,7 @@ memref — no 4D reshape tricks, no affine-select 4D AP rejection.
 
 from dataclasses import dataclass
 
-from nkigym.kernel_ir import KernelIR, get_tpb
+from nkigym.kernel_ir.ir import KernelIR, get_tpb
 
 
 @dataclass(frozen=True)

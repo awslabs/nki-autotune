@@ -7,8 +7,9 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from nkigym.kernel_ir.dim_analysis import DimAnalysis, analyze_dims, op_blocking_dims
+from nkigym.kernel_ir.emission import compute_staged_set
 from nkigym.kernel_ir.op_graph import OpGraph, build_op_graph
-from nkigym.kernel_ir.partition import compute_reachability, op_dims_of, sample_partition
+from nkigym.kernel_ir.partition import compute_reachability, sample_partition
 from nkigym.kernel_ir.validate import tier_depth_range, validate
 
 TIERS = ("per_tile", "per_block", "full")
@@ -288,11 +289,11 @@ def sample_valid_ir(ir: "KernelIR", rng: random.Random, max_tries: int = 1_000_0
     da = ir.dim_analysis
     graph = ir.op_graph
     reach = compute_reachability(graph)
-    op_dims = [op_dims_of(graph, da, i) for i in range(len(graph.op_classes))]
     tensor_kinds = tensor_buffers(da, graph)
     sbuf_tensors = {name for name, kinds in tensor_kinds.items() if "sbuf" in kinds}
+    staged = compute_staged_set(ir)
     for _ in range(max_tries):
-        op_groups = sample_partition(graph, da, rng, reach=reach, op_dims=op_dims)
+        op_groups = sample_partition(graph, rng, reach=reach)
         seed_groups: list[FusionGroup] = []
         for op_indices in op_groups:
             touched = _group_touched_tensors(graph, da, op_indices)
@@ -318,7 +319,7 @@ def sample_valid_ir(ir: "KernelIR", rng: random.Random, max_tries: int = 1_000_0
             for gi, old in enumerate(seed_groups)
         ]
         candidate = replace(ir, fusion_groups=new_groups)
-        if validate(candidate, tensor_to_groups):
+        if validate(candidate, tensor_to_groups, op_to_group, staged):
             return candidate
     raise RuntimeError(f"No valid IR found after {max_tries} samples")
 
