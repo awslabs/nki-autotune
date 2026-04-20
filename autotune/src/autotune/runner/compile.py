@@ -153,8 +153,8 @@ def _run_compiler(kernel: Kernel, tensor_inputs: dict[str, np.ndarray], output_n
                 raise RuntimeError(detail)
         except Exception as exc:
             stderr_content = Path(stderr_path).read_text().strip()
-            if stderr_content and not isinstance(exc, RuntimeError):
-                raise RuntimeError(stderr_content) from exc
+            if stderr_content:
+                raise RuntimeError(f"{exc}\n{stderr_content}") from exc
             raise
 
 
