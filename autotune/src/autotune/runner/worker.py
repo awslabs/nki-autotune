@@ -13,7 +13,6 @@ import logging
 import os
 import shutil
 import sys
-import tempfile
 import time
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -25,7 +24,7 @@ from nkipy.runtime import BaremetalExecutor
 from autotune.runner.benchmark import benchmark_one, compute_golden, generate_tensors, simulate_one
 from autotune.runner.compare import assert_close
 from autotune.runner.compile import compile_one, init_compile_worker
-from autotune.runner.detect import detect_kernel_info, detect_mac_count, detect_neuron_cores
+from autotune.runner.detect import detect_func_name, detect_kernel_info, detect_mac_count, detect_neuron_cores
 from autotune.runner.types import (
     BenchmarkConfig,
     CompileResult,
@@ -216,33 +215,34 @@ def _run_pipeline(payload: dict[str, Any]) -> tuple[list[ProfileResult], dict[st
     Returns:
         Tuple of (all_results, compiler_logs).
     """
-    host = payload["host"]
     kernel_jobs = payload["kernel_jobs"]
     seed = payload["seed"]
     config = payload["config"]
     t_start = time.monotonic()
 
-    work_dir = Path(tempfile.mkdtemp(prefix=f"autotune-{host}-"))
-    try:
-        nki_dir = work_dir / "nki"
-        nki_dir.mkdir()
-        neff_dir = work_dir / "neff"
-        neff_dir.mkdir()
+    first_job = next(iter(kernel_jobs.values()))
+    func_name = detect_func_name(first_job["source"])
+    work_dir = Path(f"/tmp/autotune-{func_name}")
+    shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True)
 
-        neuron_cores = detect_neuron_cores()
-        logger.info("Worker ready: %d kernels, %d CPU, %d NC", len(kernel_jobs), os.cpu_count() or 1, neuron_cores)
+    nki_dir = work_dir / "nki"
+    nki_dir.mkdir()
+    neff_dir = work_dir / "neff"
+    neff_dir.mkdir()
 
-        kernel_data: dict[str, dict[str, Any]] = {}
-        for kname, job in kernel_jobs.items():
-            kernel_data[kname] = _process_kernel_job(kname, job, seed, nki_dir)
-        logger.info("CPU sim done: %d kernels", len(kernel_data))
+    neuron_cores = detect_neuron_cores()
+    logger.info("Worker ready: %d kernels, %d CPU, %d NC", len(kernel_jobs), os.cpu_count() or 1, neuron_cores)
 
-        executor, futures = _submit_compilations(kernel_data, neff_dir)
-        all_results, compiler_logs = _run_hw_benchmarks(executor, futures, kernel_data, config, neff_dir)
+    kernel_data: dict[str, dict[str, Any]] = {}
+    for kname, job in kernel_jobs.items():
+        kernel_data[kname] = _process_kernel_job(kname, job, seed, nki_dir)
+    logger.info("CPU sim done: %d kernels", len(kernel_data))
 
-        logger.info("Done: %d results (%.1fs)", len(all_results), time.monotonic() - t_start)
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+    executor, futures = _submit_compilations(kernel_data, neff_dir)
+    all_results, compiler_logs = _run_hw_benchmarks(executor, futures, kernel_data, config, neff_dir)
+
+    logger.info("Done: %d results (%.1fs)", len(all_results), time.monotonic() - t_start)
 
     return all_results, compiler_logs
 

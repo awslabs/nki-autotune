@@ -178,6 +178,5 @@ class ProfileConfig(NamedTuple):
     """
 
     seed: int = 42
-    ssh_timeout_sec: int = 600
     neuron_platform_target: str = "trn2"
     venv_python: str = _DEFAULT_VENV_PYTHON

@@ -28,7 +28,7 @@ def matmul_nkigym(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    K, M, N = 2048, 2048, 2048
+    K, M, N = 8192, 8192, 8192
     input_specs = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 
     CACHE_DIR = Path("/home/ubuntu/cache/matmul")

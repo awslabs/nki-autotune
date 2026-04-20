@@ -153,39 +153,29 @@ def _launch_ssh_workers(
     return procs, writers
 
 
-def _read_host_output(
-    host: str, proc: subprocess.Popen[bytes], timeout: int, out: dict[str, tuple[bytes, bytes, int]]
-) -> None:
+def _read_host_output(host: str, proc: subprocess.Popen[bytes], out: dict[str, tuple[bytes, bytes, int]]) -> None:
     """Read stdout/stderr from a single host process into out dict."""
-    try:
-        stdout_data, stderr_data = proc.communicate(timeout=timeout)
-        out[host] = (stdout_data, stderr_data, proc.returncode)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        out[host] = (b"", b"", -1)
+    stdout_data, stderr_data = proc.communicate()
+    out[host] = (stdout_data, stderr_data, proc.returncode)
 
 
-def _collect_host_outputs(
-    procs: dict[str, subprocess.Popen[bytes]], timeout: int
-) -> dict[str, tuple[bytes, bytes, int]]:
+def _collect_host_outputs(procs: dict[str, subprocess.Popen[bytes]]) -> dict[str, tuple[bytes, bytes, int]]:
     """Read all host outputs concurrently via threads."""
     host_outputs: dict[str, tuple[bytes, bytes, int]] = {}
     readers: list[threading.Thread] = []
     for host, proc in procs.items():
-        rt = threading.Thread(target=_read_host_output, args=(host, proc, timeout, host_outputs), daemon=True)
+        rt = threading.Thread(target=_read_host_output, args=(host, proc, host_outputs), daemon=True)
         rt.start()
         readers.append(rt)
     for rt in readers:
-        rt.join(timeout=timeout)
+        rt.join()
     return host_outputs
 
 
 def _host_error_message(host: str, returncode: int, stderr_data: bytes, stdout_data: bytes) -> str:
     """Determine error message for a host, or empty string if success."""
-    _ERROR_TEMPLATES = {-1: "SSH worker on {host} timed out"}
-    msg = _ERROR_TEMPLATES.get(returncode, "")
-    if not msg and returncode != 0:
+    msg = ""
+    if returncode != 0:
         stderr = stderr_data.decode(errors="replace")
         msg = f"SSH worker on {host} exited {returncode}: {stderr}"
     if not msg and not stdout_data:
@@ -310,7 +300,6 @@ class RemoteProfiler:
     Attributes:
         hosts: SSH hostnames (e.g. ["gym-1", "gym-2"]).
         venv_python: Path to the Python executable on remote hosts.
-        ssh_timeout_sec: Timeout in seconds for SSH communication.
         neuron_platform_target: Neuron platform target (default "trn2").
         warmup: Number of warmup iterations before timing.
         iters: Number of benchmark iterations.
@@ -318,7 +307,6 @@ class RemoteProfiler:
 
     hosts: list[str]
     venv_python: str = _DEFAULT_VENV_PYTHON
-    ssh_timeout_sec: int = 600
     neuron_platform_target: str = "trn2"
     warmup: int = 5
     iters: int = 20
@@ -371,7 +359,7 @@ class RemoteProfiler:
                 proc.stdin = None
 
             t0 = time.monotonic()
-            host_outputs = _collect_host_outputs(procs, self.ssh_timeout_sec)
+            host_outputs = _collect_host_outputs(procs)
             all_results, all_compiler_logs = _process_host_outputs(procs, host_outputs, host_assignments)
         except BaseException:
             for proc in procs.values():

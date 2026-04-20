@@ -42,7 +42,6 @@ def remote_profile(
     profiler = RemoteProfiler(
         hosts=hosts,
         venv_python=config.venv_python,
-        ssh_timeout_sec=config.ssh_timeout_sec,
         neuron_platform_target=config.neuron_platform_target,
         warmup=warmup,
         iters=iters,
