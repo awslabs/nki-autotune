@@ -1,240 +1,466 @@
 """Render path for ``NKIOnlineFusionChain`` composite ops.
 
-The composite is one op graph node that subsumes an X + Accumulation
-chain. Its render path emits the full fused loop body: running-
-buffer declarations and memsets outside the accumulation dim's
-loops, and the per-iteration body (snapshot, X update, σ chain,
-rescale-accumulate, matmul chunk) inside. Both populate the same
-``before_plan`` the standard emitter uses, so the composite
-integrates with the rest of the renderer without special hooks.
-
-Entry point: ``render_online_fusion_op(ir, op_idx, group_idx,
-before_plan)``. Called from ``render_nki_ops`` when the op class is
-a subclass of ``NKIOnlineFusionChain``.
+Emits the fused loop body parametrically via
+``render_online_fusion_op(ir, op_idx, group_idx, before_plan)`` —
+declarations at depth 0, memsets outside the accumulation loops,
+per-iteration body at innermost. Dispatch reads ``SCALE_SPEC`` and
+``ACCUMULATOR_SPECS`` from the composite subclass; no role-string
+branching. Called from ``render_nki_ops`` when the op class is a
+subclass of ``NKIOnlineFusionChain``.
 """
+
+from dataclasses import dataclass
+from typing import cast
 
 from nkigym.codegen.buffers import sbuf_buffer
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.codegen.sbuf_buffer import AxisAccess
 from nkigym.kernel_ir import KernelIR
+from nkigym.kernel_ir.online_fusion_spec import AccumulatorSpec, ScaleSpec
 from nkigym.ops.online_fusion_chain import NKIOnlineFusionChain
 
 
 def render_online_fusion_op(ir: KernelIR, op_idx: int, group_idx: int, before_plan: DepthPlan) -> None:
-    """Emit the composite's declarations + per-iteration body into ``before_plan``.
+    """Emit the composite's full fused loop body into ``before_plan``.
 
-    Declarations (SBUF running buffers, PSUM chunk) go at the top
-    of the group (depth 0). The per-iteration body goes at the
-    innermost body (depth ``2 * N``). Running buffers live in the
-    emitted source only — they are not registered in
-    ``DimAnalysis.tensors`` so the rest of the IR's buffer
-    machinery never sees them.
-
-    Dispatches on ``op_cls.SCALE_ROLE`` for the specific σ chain
-    shape. Today supports ``rsqrt_then_mul`` only.
+    Running buffers live in the emitted source only — they are not
+    registered in ``DimAnalysis.tensors``.
     """
-    op_cls = ir.op_graph.op_classes[op_idx]
-    assert issubclass(op_cls, NKIOnlineFusionChain), "caller must gate on NKIOnlineFusionChain"
-    dim_order = ir.fusion_groups[group_idx].dim_order
-    n = len(dim_order)
-    ctx = _RenderContext(ir=ir, op_idx=op_idx, group_idx=group_idx, dim_order=dim_order, n=n)
-    role = op_cls.SCALE_ROLE
-    if role == "rsqrt_then_mul":
-        _render_rsqrt_then_mul(ctx, before_plan)
-    else:
-        raise NotImplementedError(f"online-fusion render for scale_role={role!r} not yet implemented")
-
-
-class _RenderContext:
-    """Bundle of everything the per-role render helpers need.
-
-    Avoids threading seven parameters through every helper. Populated
-    once at the top of ``render_online_fusion_op``.
-    """
-
-    def __init__(self, ir: KernelIR, op_idx: int, group_idx: int, dim_order: list[str], n: int) -> None:
-        """Cache references the per-role emitters read."""
-        self.ir = ir
-        self.op_idx = op_idx
-        self.group_idx = group_idx
-        self.dim_order = dim_order
-        self.n = n
-        raw_cls = ir.op_graph.op_classes[op_idx]
-        assert issubclass(raw_cls, NKIOnlineFusionChain), "RenderContext built for non-composite op"
-        self.op_cls: type[NKIOnlineFusionChain] = raw_cls
-        self.inputs_map, self.outputs_list = ir.op_graph.op_tensors[op_idx]
-
-
-def _render_rsqrt_then_mul(ctx: _RenderContext, before_plan: DepthPlan) -> None:
-    """RMSNorm + matmul shape.
-
-    Expected inputs (by convention in the composite's OPERAND_AXES
-    keys): ``a_in`` (pre-norm data, blocked along the
-    accumulation dim), ``b_in`` (matmul RHS). Expected output:
-    ``out`` (running matmul accumulator).
-    """
-    ir = ctx.ir
-    op_cls = ctx.op_cls
-    acc_dim = op_cls.ACCUMULATION_DIM
-    a_name = ctx.inputs_map["a_in"]
-    b_name = ctx.inputs_map["b_in"]
-    out_name = ctx.outputs_list[0]
-    (affine_kwargs,) = op_cls.INNER_OP_KWARGS
-    a_dims = ir.dim_analysis.tensors[a_name].dim_ids
-    out_dims = ir.dim_analysis.tensors[out_name].dim_ids
-    partition_dim = a_dims[0]
-    partition_size = ir.dim_analysis.dims[partition_dim].physical_tile_size
-    out_free_size = ir.dim_analysis.dims[out_dims[1]].logical_tile_size
-    acc_tile = ir.dim_analysis.dims[acc_dim].logical_tile_size
-    out_dtype = ir.dim_analysis.tensors[out_name].dtype
-    outer_depth = _outermost_depth(ctx, acc_dim)
+    ctx = _RenderContext.build(ir, op_idx, group_idx)
+    ctx.assert_supported()
+    declarations: list[str] = []
+    memsets: list[str] = []
+    _emit_scale_declarations(ctx, declarations, memsets)
+    _emit_accumulator_declarations(ctx, declarations, memsets)
+    before_plan.setdefault(group_idx, {}).setdefault(0, []).extend(declarations)
+    outer_depth = _outermost_depth(ctx, ctx.acc_dim)
+    before_plan.setdefault(group_idx, {}).setdefault(outer_depth, []).extend(memsets)
     inner_depth = 2 * ctx.n
-    decl_lines, memset_lines = _rsqrt_outer_declarations(ctx.op_idx, partition_size, out_free_size, acc_tile, out_dtype)
-    before_plan.setdefault(ctx.group_idx, {}).setdefault(0, []).extend(decl_lines)
-    before_plan.setdefault(ctx.group_idx, {}).setdefault(outer_depth, []).extend(memset_lines)
-    inner_lines = _rsqrt_inner_body(ctx, a_name, b_name, out_name, affine_kwargs)
-    before_plan.setdefault(ctx.group_idx, {}).setdefault(inner_depth, []).extend(inner_lines)
+    inner_lines: list[str] = []
+    _emit_scale_body(ctx, inner_lines)
+    _emit_accumulator_bodies(ctx, inner_lines)
+    before_plan.setdefault(group_idx, {}).setdefault(inner_depth, []).extend(inner_lines)
+
+
+@dataclass
+class _RenderContext:
+    """Bundle of everything the parametric emitters need for one composite.
+
+    Built once via ``_RenderContext.build``; its helpers cache
+    frequently-used derived values (tile sizes, partition dim,
+    etc.) so the emitters stay short.
+    """
+
+    ir: KernelIR
+    op_idx: int
+    group_idx: int
+    dim_order: list[str]
+    n: int
+    op_cls: type[NKIOnlineFusionChain]
+    inputs_map: dict[str, str]
+    outputs_list: list[str]
+    scale: ScaleSpec
+    accumulators: tuple[AccumulatorSpec, ...]
+    acc_dim: str
+    partition_size: int
+
+    @classmethod
+    def build(cls, ir: KernelIR, op_idx: int, group_idx: int) -> "_RenderContext":
+        """Populate a ``_RenderContext`` from a live IR + op index."""
+        op_cls = ir.op_graph.op_classes[op_idx]
+        assert issubclass(op_cls, NKIOnlineFusionChain), "_RenderContext built for non-composite op"
+        dim_order = ir.fusion_groups[group_idx].dim_order
+        inputs_map, outputs_list = ir.op_graph.op_tensors[op_idx]
+        scale = op_cls.SCALE_SPEC
+        assert scale is not None, "composite missing SCALE_SPEC"
+        first_input = next(iter(inputs_map.values()))
+        partition_dim = ir.dim_analysis.tensors[first_input].dim_ids[0]
+        return cls(
+            ir=ir,
+            op_idx=op_idx,
+            group_idx=group_idx,
+            dim_order=dim_order,
+            n=len(dim_order),
+            op_cls=op_cls,
+            inputs_map=dict(inputs_map),
+            outputs_list=list(outputs_list),
+            scale=cast(ScaleSpec, scale),
+            accumulators=cast(tuple[AccumulatorSpec, ...], op_cls.ACCUMULATOR_SPECS),
+            acc_dim=op_cls.ACCUMULATION_DIM,
+            partition_size=ir.dim_analysis.dims[partition_dim].physical_tile_size,
+        )
+
+    def assert_supported(self) -> None:
+        """Fail loudly if the composite uses a combination the render path doesn't implement yet."""
+        if self.scale.sigma_kind not in {"ratio_via_reciprocal", "exp_diff_via_activation"}:
+            raise NotImplementedError(f"sigma_kind={self.scale.sigma_kind!r} not yet supported")
+        for spec in self.accumulators:
+            if spec.kind not in {"matmul", "activation_reduce"}:
+                raise NotImplementedError(f"accumulator kind={spec.kind!r} not yet supported")
+
+    def uid(self) -> int:
+        """Unique id used to namespace running-buffer symbols in the emitted source."""
+        return self.op_idx
+
+
+def _emit_scale_declarations(ctx: _RenderContext, declarations: list[str], memsets: list[str]) -> None:
+    """Running-X / prev-X / σ + scratch-buffer decls (hoisted to group top for SBUF) + init memset."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    running_init = ctx.scale.init_value
+    declarations.append(f"sbuf_running_{uid} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
+    declarations.append(f"sbuf_prev_{uid} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
+    declarations.append(f"sbuf_sigma_{uid} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
+    declarations.append(f"sbuf_delta_{uid} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
+    if ctx.scale.delta_op == "activation_reduce":
+        acc_tile = ctx.ir.dim_analysis.dims[ctx.acc_dim].logical_tile_size
+        declarations.append(f"sbuf_sq_{uid} = nl.ndarray(({p}, {acc_tile}), dtype=nl.float32, buffer=nl.sbuf)")
+    if ctx.scale.sigma_kind == "ratio_via_reciprocal":
+        declarations.append(f"sbuf_inv_running_{uid} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
+        declarations.append(f"sbuf_inv_prev_{uid} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
+        declarations.append(f"sbuf_recip_prev_{uid} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
+        for idx in range(len(ctx.scale.inverse_chain) - 1):
+            declarations.append(
+                f"sbuf_invtmp_running_{uid}_{idx} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)"
+            )
+            declarations.append(
+                f"sbuf_invtmp_prev_{uid}_{idx} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)"
+            )
+    memsets.append(f"nisa.memset(sbuf_running_{uid}[0:{p}, 0:1], {running_init})")
+
+
+def _emit_accumulator_declarations(ctx: _RenderContext, declarations: list[str], memsets: list[str]) -> None:
+    """Emit per-accumulator running-out + scratch buffers."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    for acc_idx, spec in enumerate(ctx.accumulators):
+        out_name = _accumulator_output_tensor(ctx, spec)
+        out_dims = ctx.ir.dim_analysis.tensors[out_name].dim_ids
+        out_dtype = ctx.ir.dim_analysis.tensors[out_name].dtype
+        free_size = ctx.ir.dim_analysis.dims[out_dims[1]].logical_tile_size if len(out_dims) == 2 else 1
+        free_slice = f"0:{free_size}" if free_size > 1 else "0:1"
+        declarations.append(
+            f"sbuf_running_out_{uid}_{acc_idx} = nl.ndarray(({p}, {free_size}),"
+            f" dtype=nl.{out_dtype}, buffer=nl.sbuf)"
+        )
+        memsets.append(f"nisa.memset(sbuf_running_out_{uid}_{acc_idx}[0:{p}, {free_slice}], 0.0)")
+        if spec.kind == "matmul":
+            _emit_matmul_accumulator_decls(ctx, spec, acc_idx, free_size, declarations)
+        elif spec.kind == "activation_reduce":
+            _emit_activation_reduce_accumulator_decls(ctx, spec, acc_idx, declarations)
+
+
+def _emit_matmul_accumulator_decls(
+    ctx: _RenderContext, spec: AccumulatorSpec, acc_idx: int, free_size: int, declarations: list[str]
+) -> None:
+    """Matmul-specific scratch buffers: PSUM chunk + stationary-side SBUF/PSUM transposes."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    acc_tile = ctx.ir.dim_analysis.dims[spec.ptile_free_dim].logical_tile_size
+    ptiles = acc_tile // p
+    declarations.append(
+        f"psum_chunk_{uid}_{acc_idx} = nl.ndarray(({p}, {free_size}), dtype=nl.float32, buffer=nl.psum)"
+    )
+    declarations.append(
+        f"sbuf_a_normed_{uid}_{acc_idx} = nl.ndarray(({p}, {acc_tile}), dtype=nl.bfloat16, buffer=nl.sbuf)"
+    )
+    declarations.append(
+        f"sbuf_a_t_{uid}_{acc_idx} = [nl.ndarray(({p}, {p}), dtype=nl.bfloat16, buffer=nl.sbuf)"
+        f" for _ in range({ptiles})]"
+    )
+    declarations.append(f"psum_a_t_{uid}_{acc_idx} = nl.ndarray(({p}, {p}), dtype=nl.bfloat16, buffer=nl.psum)")
+
+
+def _emit_activation_reduce_accumulator_decls(
+    ctx: _RenderContext, spec: AccumulatorSpec, acc_idx: int, declarations: list[str]
+) -> None:
+    """Activation_reduce-specific scratch buffer for the per-chunk sum + exp tile."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    _ = spec
+    acc_tile = ctx.ir.dim_analysis.dims[ctx.acc_dim].logical_tile_size
+    declarations.append(f"sbuf_chunk_sum_{uid}_{acc_idx} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
+    declarations.append(f"sbuf_exp_{uid}_{acc_idx} = nl.ndarray(({p}, {acc_tile}), dtype=nl.bfloat16, buffer=nl.sbuf)")
+
+
+def _emit_scale_body(ctx: _RenderContext, lines: list[str]) -> None:
+    """Snapshot prev, compute delta, update running, compute σ — once per iteration."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    data_access = _scale_data_access(ctx)
+    delta_expr = f"sbuf_delta_{uid}[0:{p}, 0:1]"
+    _emit_delta_compute(ctx, data_access, delta_expr, lines)
+    lines.append(f"nisa.tensor_copy(sbuf_prev_{uid}[0:{p}, 0:1], sbuf_running_{uid}[0:{p}, 0:1])")
+    _emit_running_update(ctx, delta_expr, lines)
+    _emit_sigma_compute(ctx, lines)
+
+
+def _scale_data_access(ctx: _RenderContext) -> str:
+    """SBUF access string for the input tensor X's delta-op reads from.
+
+    The X op's input is the first ``OPERAND_AXES`` role — by
+    convention ``a_in`` for sum-family roles and whatever the
+    detector placed first for exp-family roles. For this phase
+    we hold to the single-input-for-X convention.
+    """
+    first_input = next(iter(ctx.inputs_map.values()))
+    return _sbuf_body_access(ctx, first_input)
+
+
+def _emit_delta_compute(ctx: _RenderContext, data_access: str, delta_expr: str, lines: list[str]) -> None:
+    """Emit the ISA call producing this iteration's delta from the input chunk."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    op = ctx.scale.delta_op
+    kwargs = ctx.scale.delta_kwargs
+    if op == "activation_reduce":
+        acc_tile = ctx.ir.dim_analysis.dims[ctx.acc_dim].logical_tile_size
+        act = _nl(kwargs.get("op", "'square'"))
+        red = _nl(kwargs.get("reduce_op", "'add'"))
+        lines.append(
+            f"nisa.activation_reduce(sbuf_sq_{uid}[0:{p}, 0:{acc_tile}], {act}," f" {data_access}, {red}, {delta_expr})"
+        )
+    elif op == "tensor_reduce":
+        red = _nl(kwargs.get("op", "'maximum'"))
+        negate_tail = ", negate=True" if kwargs.get("negate") == "True" else ""
+        lines.append(f"nisa.tensor_reduce({delta_expr}, {red}, {data_access}, 1{negate_tail})")
+    else:
+        raise NotImplementedError(f"delta_op={op!r} not yet supported")
+
+
+def _emit_running_update(ctx: _RenderContext, delta_expr: str, lines: list[str]) -> None:
+    """Combine delta into running via the scale's combinator."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    running = f"sbuf_running_{uid}[0:{p}, 0:1]"
+    combinator = ctx.scale.combinator
+    tensor_tensor_ops = {"maximum": "nl.maximum", "minimum": "nl.minimum"}
+    if combinator == "add":
+        lines.append(f"nisa.tensor_scalar({running}, {running}, op0=nl.add, operand0={delta_expr})")
+    elif combinator in tensor_tensor_ops:
+        lines.append(f"nisa.tensor_tensor({running}, {running}, {delta_expr}, {tensor_tensor_ops[combinator]})")
+    else:
+        raise NotImplementedError(f"combinator={combinator!r} not yet supported")
+
+
+def _emit_sigma_compute(ctx: _RenderContext, lines: list[str]) -> None:
+    """Compute σ from (running, prev). Dispatches on ``sigma_kind``."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    running = f"sbuf_running_{uid}[0:{p}, 0:1]"
+    prev = f"sbuf_prev_{uid}[0:{p}, 0:1]"
+    sigma = f"sbuf_sigma_{uid}[0:{p}, 0:1]"
+    if ctx.scale.sigma_kind == "ratio_via_reciprocal":
+        inv_running = f"sbuf_inv_running_{uid}[0:{p}, 0:1]"
+        inv_prev = f"sbuf_inv_prev_{uid}[0:{p}, 0:1]"
+        recip_prev = f"sbuf_recip_prev_{uid}[0:{p}, 0:1]"
+        _emit_inverse_chain(ctx, source=running, dest=inv_running, scratch_label="running", lines=lines)
+        _emit_inverse_chain(ctx, source=prev, dest=inv_prev, scratch_label="prev", lines=lines)
+        lines.append(f"nisa.reciprocal({recip_prev}, {inv_prev})")
+        lines.append(f"nisa.tensor_scalar({sigma}, {inv_running}, op0=nl.multiply, operand0={recip_prev})")
+    elif ctx.scale.sigma_kind == "exp_diff_via_activation":
+        lines.append(f"nisa.activation({sigma}, nl.exp, {prev}, bias={running}, scale=-1.0)")
+
+
+def _emit_inverse_chain(ctx: _RenderContext, source: str, dest: str, scratch_label: str, lines: list[str]) -> None:
+    """Chain the ScaleSpec's inverse steps from ``source`` to ``dest``.
+
+    Each step writes into a pre-declared scratch buffer (hoisted
+    to the group's declaration block); the final step writes to
+    ``dest``. ``scratch_label`` disambiguates the two inverse
+    chains (running vs prev) so they don't share scratch.
+    """
+    uid = ctx.uid()
+    p = ctx.partition_size
+    current = source
+    steps = ctx.scale.inverse_chain
+    for idx, step in enumerate(steps):
+        is_last = idx == len(steps) - 1
+        target = dest if is_last else f"sbuf_invtmp_{scratch_label}_{uid}_{idx}[0:{p}, 0:1]"
+        if step.op_name == "tensor_scalar":
+            lines.append(_tensor_scalar_call(target, current, step.kwargs))
+        elif step.op_name == "activation":
+            act = _nl(step.kwargs.get("op", "'copy'"))
+            lines.append(f"nisa.activation({target}, {act}, {current})")
+        else:
+            raise NotImplementedError(f"inverse-chain op_name={step.op_name!r} not yet supported")
+        current = target
+        current = target
+
+
+def _tensor_scalar_call(dst: str, data: str, kwargs: dict[str, str]) -> str:
+    """Format a ``nisa.tensor_scalar`` call from a kwargs dict."""
+    op0 = _nl(kwargs.get("op0", "'copy'"))
+    operand0 = kwargs.get("operand0", "0.0")
+    op1 = kwargs.get("op1")
+    operand1 = kwargs.get("operand1")
+    tail = f", op1={_nl(op1)}, operand1={operand1}" if op1 and operand1 else ""
+    return f"nisa.tensor_scalar({dst}, {data}, op0={op0}, operand0={operand0}{tail})"
+
+
+def _emit_accumulator_bodies(ctx: _RenderContext, lines: list[str]) -> None:
+    """Per-accumulator per-chunk compute + σ-correct-and-accumulate."""
+    for acc_idx, spec in enumerate(ctx.accumulators):
+        if spec.kind == "matmul":
+            _emit_matmul_accumulator_body(ctx, spec, acc_idx, lines)
+        elif spec.kind == "activation_reduce":
+            _emit_activation_reduce_accumulator_body(ctx, spec, acc_idx, lines)
+
+
+def _emit_matmul_accumulator_body(ctx: _RenderContext, spec: AccumulatorSpec, acc_idx: int, lines: list[str]) -> None:
+    """Normalize a_chunk → a_t → psum_chunk → running_out rescale-accumulate."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    acc_tile = ctx.ir.dim_analysis.dims[spec.ptile_free_dim].logical_tile_size
+    ptiles = acc_tile // p
+    a_name = next(iter(ctx.inputs_map.values()))
+    b_name = _matmul_moving_input(ctx, spec)
+    out_name = _accumulator_output_tensor(ctx, spec)
+    out_dims = ctx.ir.dim_analysis.tensors[out_name].dim_ids
+    free_size = ctx.ir.dim_analysis.dims[out_dims[1]].logical_tile_size if len(out_dims) == 2 else 1
+    matmul_ptile_var = f"i_ptile_{ctx.acc_dim}_{uid}_{acc_idx}"
+    b_access = _sbuf_body_access(ctx, b_name, ptile_binding={ctx.acc_dim: matmul_ptile_var})
+    out_access = _sbuf_body_access(ctx, out_name)
+    sigma = f"sbuf_sigma_{uid}[0:{p}, 0:1]"
+    stationary_src = _matmul_stationary_source(ctx, acc_idx, a_name, acc_tile)
+    lines.extend(stationary_src.prelude_lines)
+    tpose_var = f"i_ptile_{ctx.acc_dim}_{uid}_{acc_idx}_t"
+    lines.append(f"for {tpose_var} in range({ptiles}):")
+    lines.append(
+        f"    nisa.nc_transpose(psum_a_t_{uid}_{acc_idx}[0:{p}, 0:{p}],"
+        f" {stationary_src.buffer_name}[0:{p}, {tpose_var} * {p}:{tpose_var} * {p} + {p}])"
+    )
+    lines.append(
+        f"    nisa.tensor_copy(sbuf_a_t_{uid}_{acc_idx}[{tpose_var}][0:{p}, 0:{p}],"
+        f" psum_a_t_{uid}_{acc_idx}[0:{p}, 0:{p}])"
+    )
+    lines.append(f"nisa.memset(psum_chunk_{uid}_{acc_idx}[0:{p}, 0:{free_size}], 0.0)")
+    lines.append(f"for {matmul_ptile_var} in range({ptiles}):")
+    lines.append(
+        f"    nisa.nc_matmul(dst=psum_chunk_{uid}_{acc_idx}[0:{p}, 0:{free_size}],"
+        f" stationary=sbuf_a_t_{uid}_{acc_idx}[{matmul_ptile_var}][0:{p}, 0:{p}],"
+        f" moving={b_access})"
+    )
+    running_out = f"sbuf_running_out_{uid}_{acc_idx}[0:{p}, 0:{free_size}]"
+    lines.append(
+        f"nisa.scalar_tensor_tensor({running_out}, {running_out}, nl.multiply, {sigma},"
+        f" nl.add, psum_chunk_{uid}_{acc_idx}[0:{p}, 0:{free_size}])"
+    )
+    lines.append(f"nisa.tensor_copy({out_access}, {running_out})")
+
+
+def _emit_activation_reduce_accumulator_body(
+    ctx: _RenderContext, spec: AccumulatorSpec, acc_idx: int, lines: list[str]
+) -> None:
+    """Per-chunk activation_reduce producing chunk_sum, then σ-correct-and-accumulate."""
+    uid = ctx.uid()
+    p = ctx.partition_size
+    data_name = next(iter(ctx.inputs_map.values()))
+    data_access = _sbuf_body_access(ctx, data_name)
+    out_name = _accumulator_output_tensor(ctx, spec)
+    out_access = _sbuf_body_access(ctx, out_name)
+    source_kwargs = dict(spec.source_kwargs)
+    act = _nl(source_kwargs.get("op", "'exp'"))
+    red = _nl(source_kwargs.get("reduce_op", "'add'"))
+    running = f"sbuf_running_{uid}[0:{p}, 0:1]"
+    chunk_sum = f"sbuf_chunk_sum_{uid}_{acc_idx}[0:{p}, 0:1]"
+    sigma = f"sbuf_sigma_{uid}[0:{p}, 0:1]"
+    running_out = f"sbuf_running_out_{uid}_{acc_idx}[0:{p}, 0:1]"
+    acc_tile = ctx.ir.dim_analysis.dims[ctx.acc_dim].logical_tile_size
+    lines.append(
+        f"nisa.activation_reduce(sbuf_exp_{uid}_{acc_idx}[0:{p}, 0:{acc_tile}], {act},"
+        f" {data_access}, {red}, {chunk_sum}, bias={running})"
+    )
+    lines.append(
+        f"nisa.scalar_tensor_tensor({running_out}, {running_out}, nl.multiply, {sigma}," f" nl.add, {chunk_sum})"
+    )
+    lines.append(f"nisa.tensor_copy({out_access}, {running_out})")
+
+
+def _matmul_moving_input(ctx: _RenderContext, spec: AccumulatorSpec) -> str:
+    """Return the external input feeding the matmul's ``moving`` operand.
+
+    For the detector's ``rsqrt_then_mul`` role this is ``b_in``;
+    for other roles (including ``exp_bias`` with a matmul
+    accumulator) it's whichever external input isn't the X input.
+    """
+    _ = spec
+    assert len(ctx.inputs_map) >= 2, "matmul accumulator needs two external inputs"
+    x_input = next(iter(ctx.inputs_map))
+    moving_candidates = [role for role in ctx.inputs_map if role != x_input]
+    return ctx.inputs_map[moving_candidates[0]]
+
+
+def _accumulator_output_tensor(ctx: _RenderContext, spec: AccumulatorSpec) -> str:
+    """Return the external-output tensor name this accumulator writes to."""
+    output_axes = ctx.op_cls.OUTPUT_AXES
+    role_idx = list(output_axes).index(spec.output_role)
+    return ctx.outputs_list[role_idx]
+
+
+@dataclass
+class _StationarySource:
+    """Matmul stationary source: the pre-declared SBUF buffer + any prelude lines to populate it."""
+
+    buffer_name: str
+    prelude_lines: list[str]
+
+
+def _matmul_stationary_source(
+    ctx: _RenderContext, matmul_acc_idx: int, a_name: str, acc_tile: int
+) -> _StationarySource:
+    """Return the SBUF buffer the matmul's transpose should read from.
+
+    If a prior activation_reduce accumulator wrote an exp tile
+    (attention exp_bias), reuse its ``sbuf_exp_*`` buffer directly.
+    Else (rmsnorm rsqrt_then_mul), normalize ``a_in`` by
+    ``inv_running`` into ``sbuf_a_normed_*`` first.
+    """
+    uid = ctx.uid()
+    p = ctx.partition_size
+    prior_exp = next(
+        (i for i, pr in enumerate(ctx.accumulators) if i < matmul_acc_idx and pr.kind == "activation_reduce"), None
+    )
+    if prior_exp is not None:
+        result = _StationarySource(buffer_name=f"sbuf_exp_{uid}_{prior_exp}", prelude_lines=[])
+    else:
+        a_access = _sbuf_body_access(ctx, a_name)
+        result = _StationarySource(
+            buffer_name=f"sbuf_a_normed_{uid}_{matmul_acc_idx}",
+            prelude_lines=[
+                f"nisa.tensor_scalar(sbuf_a_normed_{uid}_{matmul_acc_idx}[0:{p}, 0:{acc_tile}],"
+                f" {a_access}, op0=nl.multiply, operand0=sbuf_inv_running_{uid}[0:{p}, 0:1])"
+            ],
+        )
+    return result
 
 
 def _outermost_depth(ctx: _RenderContext, acc_dim: str) -> int:
-    """Depth at which to emit declarations + memsets — just outside the accumulation dim's loops.
+    """Depth at which to emit running-state memsets — just before acc_dim's BLOCK loop opens.
 
-    The accumulation dim's block loop opens at position
-    ``dim_order.index(acc_dim) + 1``; the ltile loop opens at
-    ``N + dim_order.index(acc_dim) + 1``. We emit at the latter
-    minus one — i.e. inside every outer loop but strictly outside
-    the accumulation dim's own ltile. That places the memset at
-    the boundary between phases, fired once per outer-dim
-    iteration.
+    Running state must persist across every iteration of the
+    accumulation dim (both block and ltile phases). It must reset
+    per iteration of every OUTER dim so each output tile starts
+    with a fresh running value.
+
+    With ``dim_order = [d_a, d_b, acc, ...]``, the loops nest
+    ``block_d_a, block_d_b, block_acc, ..., ltile_d_a, ltile_d_b,
+    ltile_acc, ...``; ``block_acc`` opens at depth ``acc_pos``.
+    Emitting the memset at depth ``acc_pos`` fires it right after
+    every outer block loop opens and right before the accumulation
+    block loop — exactly one memset per outer-dim iteration,
+    before any accumulation work starts.
     """
-    acc_pos = ctx.dim_order.index(acc_dim)
-    return ctx.n + acc_pos
-
-
-def _rsqrt_outer_declarations(
-    op_idx: int, partition_size: int, out_free_size: int, acc_tile: int, out_dtype: str
-) -> tuple[list[str], list[str]]:
-    """Running-buffer declarations (once at group top) + per-accumulation memsets.
-
-    Declarations emit at depth 0 so the compiler's allocator sees
-    every PSUM / SBUF buffer alongside the rest of the group's
-    buffers, avoiding the "new buffer every loop iteration"
-    pattern that causes PSUM OOM. Memsets emit at
-    ``_outermost_depth`` so running state resets once per output-
-    tile iteration.
-    """
-    uid = op_idx
-    ptiles = acc_tile // partition_size
-    declarations = [
-        f"sbuf_running_s_{uid} = nl.ndarray(({partition_size}, 1), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_prev_s_{uid} = nl.ndarray(({partition_size}, 1), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_inv_rms_{uid} = nl.ndarray(({partition_size}, 1), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_prev_inv_{uid} = nl.ndarray(({partition_size}, 1), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_recip_prev_{uid} = nl.ndarray(({partition_size}, 1), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_sigma_{uid} = nl.ndarray(({partition_size}, 1), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_delta_{uid} = nl.ndarray(({partition_size}, 1), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_scaled_{uid} = nl.ndarray(({partition_size}, 1), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_prev_scaled_{uid} = nl.ndarray(({partition_size}, 1), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_sq_{uid} = nl.ndarray(({partition_size}, {acc_tile}), dtype=nl.float32, buffer=nl.sbuf)",
-        f"sbuf_a_normed_{uid} = nl.ndarray(({partition_size}, {acc_tile}), dtype=nl.bfloat16, buffer=nl.sbuf)",
-        f"sbuf_a_t_{uid} = [nl.ndarray(({partition_size}, {partition_size}),"
-        f" dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range({ptiles})]",
-        f"psum_a_t_{uid} = nl.ndarray(({partition_size}, {partition_size}), dtype=nl.bfloat16, buffer=nl.psum)",
-        f"psum_chunk_{uid} = nl.ndarray(({partition_size}, {out_free_size}), dtype=nl.float32, buffer=nl.psum)",
-        f"sbuf_running_out_{uid} = nl.ndarray(({partition_size}, {out_free_size}),"
-        f" dtype=nl.{out_dtype}, buffer=nl.sbuf)",
-    ]
-    memsets = [
-        f"nisa.memset(sbuf_running_s_{uid}[0:{partition_size}, 0:1], 0.0)",
-        f"nisa.memset(sbuf_running_out_{uid}[0:{partition_size}, 0:{out_free_size}], 0.0)",
-    ]
-    return declarations, memsets
-
-
-def _rsqrt_inner_body(
-    ctx: _RenderContext, a_name: str, b_name: str, out_name: str, affine_kwargs: dict[str, str]
-) -> list[str]:
-    """Per-iteration body: snapshot, update, σ chain, a_normed, transpose, matmul, rescale-accumulate.
-
-    Access expressions for external buffers (``a``, ``b``,
-    ``result`` staging) go through the standard ``SbufBuffer``
-    machinery so multi-buffering and tier placements stay
-    consistent with the rest of the renderer.
-    """
-    ir = ctx.ir
-    op_cls = ctx.op_cls
-    acc_dim = op_cls.ACCUMULATION_DIM
-    uid = ctx.op_idx
-    a_dims = ir.dim_analysis.tensors[a_name].dim_ids
-    out_dims = ir.dim_analysis.tensors[out_name].dim_ids
-    partition_size = ir.dim_analysis.dims[a_dims[0]].physical_tile_size
-    out_free_size = ir.dim_analysis.dims[out_dims[1]].logical_tile_size
-    acc_tile = ir.dim_analysis.dims[acc_dim].logical_tile_size
-    ptiles = acc_tile // partition_size
-    matmul_ptile_var = f"i_ptile_{acc_dim}_{uid}_m"
-    a_access = _sbuf_body_access(ctx, a_name)
-    b_access = _sbuf_body_access(ctx, b_name, ptile_binding={acc_dim: matmul_ptile_var})
-    out_access = _sbuf_body_access(ctx, out_name)
-    op0_nl = _nl(affine_kwargs.get("op0", "'multiply'"))
-    operand0 = affine_kwargs.get("operand0", "1.0")
-    op1 = affine_kwargs.get("op1")
-    operand1 = affine_kwargs.get("operand1")
-    affine_tail = f", op1={_nl(op1)}, operand1={operand1}" if op1 and operand1 else ""
-    return [
-        f"nisa.activation_reduce(sbuf_sq_{uid}[0:{partition_size}, 0:{acc_tile}], nl.square,"
-        f" {a_access}, nl.add, sbuf_delta_{uid}[0:{partition_size}, 0:1])",
-        f"nisa.tensor_copy(sbuf_prev_s_{uid}[0:{partition_size}, 0:1],"
-        f" sbuf_running_s_{uid}[0:{partition_size}, 0:1])",
-        f"nisa.tensor_scalar(sbuf_running_s_{uid}[0:{partition_size}, 0:1],"
-        f" sbuf_running_s_{uid}[0:{partition_size}, 0:1], op0=nl.add,"
-        f" operand0=sbuf_delta_{uid}[0:{partition_size}, 0:1])",
-        f"nisa.tensor_scalar(sbuf_scaled_{uid}[0:{partition_size}, 0:1],"
-        f" sbuf_running_s_{uid}[0:{partition_size}, 0:1], op0={op0_nl},"
-        f" operand0={operand0}{affine_tail})",
-        f"nisa.activation(sbuf_inv_rms_{uid}[0:{partition_size}, 0:1], nl.rsqrt,"
-        f" sbuf_scaled_{uid}[0:{partition_size}, 0:1])",
-        f"nisa.tensor_scalar(sbuf_prev_scaled_{uid}[0:{partition_size}, 0:1],"
-        f" sbuf_prev_s_{uid}[0:{partition_size}, 0:1], op0={op0_nl},"
-        f" operand0={operand0}{affine_tail})",
-        f"nisa.activation(sbuf_prev_inv_{uid}[0:{partition_size}, 0:1], nl.rsqrt,"
-        f" sbuf_prev_scaled_{uid}[0:{partition_size}, 0:1])",
-        f"nisa.reciprocal(sbuf_recip_prev_{uid}[0:{partition_size}, 0:1],"
-        f" sbuf_prev_inv_{uid}[0:{partition_size}, 0:1])",
-        f"nisa.tensor_scalar(sbuf_sigma_{uid}[0:{partition_size}, 0:1],"
-        f" sbuf_inv_rms_{uid}[0:{partition_size}, 0:1], op0=nl.multiply,"
-        f" operand0=sbuf_recip_prev_{uid}[0:{partition_size}, 0:1])",
-        f"nisa.tensor_scalar(sbuf_a_normed_{uid}[0:{partition_size}, 0:{acc_tile}],"
-        f" {a_access}, op0=nl.multiply,"
-        f" operand0=sbuf_inv_rms_{uid}[0:{partition_size}, 0:1])",
-        f"for i_ptile_{acc_dim}_{uid} in range({ptiles}):",
-        f"    nisa.nc_transpose(psum_a_t_{uid}[0:{partition_size}, 0:{partition_size}],"
-        f" sbuf_a_normed_{uid}[0:{partition_size},"
-        f" i_ptile_{acc_dim}_{uid} * {partition_size}:i_ptile_{acc_dim}_{uid} * {partition_size} + {partition_size}])",
-        f"    nisa.tensor_copy(sbuf_a_t_{uid}[i_ptile_{acc_dim}_{uid}][0:{partition_size}, 0:{partition_size}],"
-        f" psum_a_t_{uid}[0:{partition_size}, 0:{partition_size}])",
-        f"nisa.memset(psum_chunk_{uid}[0:{partition_size}, 0:{out_free_size}], 0.0)",
-        f"for i_ptile_{acc_dim}_{uid}_m in range({ptiles}):",
-        f"    nisa.nc_matmul(dst=psum_chunk_{uid}[0:{partition_size}, 0:{out_free_size}],"
-        f" stationary=sbuf_a_t_{uid}[i_ptile_{acc_dim}_{uid}_m][0:{partition_size}, 0:{partition_size}],"
-        f" moving={b_access})",
-        f"nisa.scalar_tensor_tensor(sbuf_running_out_{uid}[0:{partition_size}, 0:{out_free_size}],"
-        f" sbuf_running_out_{uid}[0:{partition_size}, 0:{out_free_size}],"
-        f" nl.multiply, sbuf_sigma_{uid}[0:{partition_size}, 0:1],"
-        f" nl.add, psum_chunk_{uid}[0:{partition_size}, 0:{out_free_size}])",
-        f"nisa.tensor_copy({out_access}," f" sbuf_running_out_{uid}[0:{partition_size}, 0:{out_free_size}])",
-    ]
+    return ctx.dim_order.index(acc_dim)
 
 
 def _sbuf_body_access(ctx: _RenderContext, tensor_name: str, ptile_binding: dict[str, str] | None = None) -> str:
     """SBUF access string for an external tensor at the composite's innermost slot.
 
-    Uses ``SbufBuffer.get_tile`` with every loop-var bound. The
-    per-dim tier (``per_tile`` / ``per_block`` / ``full``) controls
-    which loop vars participate in the list-index; the standard
-    buffer model handles the rest. ``ptile_binding`` maps a
-    concrete dim id to a loop-var expression that should be bound
-    as that dim's ptile slot — needed when the access sits inside
-    a ptile loop (e.g. the matmul's K-ptile loop).
+    Uses ``SbufBuffer.get_tile`` with every loop-var bound via
+    tier placement. ``ptile_binding`` maps a concrete dim to a
+    loop-var expression that binds that dim's ptile slot — needed
+    when the access sits inside a ptile loop (e.g. matmul K-ptile).
     """
     buf = sbuf_buffer(ctx.ir, tensor_name)
     placements = ctx.ir.fusion_groups[ctx.group_idx].tensor_placements
@@ -256,13 +482,7 @@ def _axis_access(
     placements: dict[tuple[str, str, str], str],
     ptile_var: str | None = None,
 ) -> AxisAccess:
-    """Axis-access for one dim of an external tensor, respecting tier placement.
-
-    ``ptile_var`` binds the ptile slot for this dim when the access
-    sits inside a ptile loop — partition-axis buffers with
-    ``ptiles_per_ltile > 1`` store those slots at the Python-list
-    level and require the binding to be non-None.
-    """
+    """Axis-access for one dim of an external tensor, respecting tier placement."""
     tier = placements.get(("sbuf", tensor_name, dim_id), "per_tile")
     block = "0"
     ltile = "0"
@@ -274,6 +494,7 @@ def _axis_access(
     return AxisAccess(block=block, ltile=ltile, ptile=ptile_var)
 
 
-def _nl(value: str) -> str:
-    """Convert a quoted string op name to an ``nl.*`` reference."""
-    return f"nl.{value[1:-1]}" if value.startswith("'") and value.endswith("'") else value
+def _nl(value: str | None) -> str:
+    """Convert a quoted string op name to an ``nl.*`` reference, passing through bare names."""
+    raw = "'copy'" if value is None else value
+    return f"nl.{raw[1:-1]}" if raw.startswith("'") and raw.endswith("'") else raw

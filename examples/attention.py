@@ -66,7 +66,7 @@ def attention_nkigym(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    seq_len, d_k, d_v = 512, 128, 128
+    seq_len, d_k, d_v = 2048, 128, 128
     input_specs = {
         "Q": ((seq_len, d_k), "bfloat16"),
         "K": ((seq_len, d_k), "bfloat16"),

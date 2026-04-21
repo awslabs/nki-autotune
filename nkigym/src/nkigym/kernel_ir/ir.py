@@ -8,10 +8,10 @@ import numpy as np
 
 from nkigym.kernel_ir.dim_analysis import DimAnalysis, analyze_dims
 from nkigym.kernel_ir.emission import compute_staged_set
-from nkigym.kernel_ir.online_fusion_detect import detect_online_fusion
-from nkigym.kernel_ir.online_fusion_rewrite import apply_online_fusion
+from nkigym.kernel_ir.online_fusion_pattern import OnlineFusionPattern
 from nkigym.kernel_ir.op_graph import OpGraph, build_op_graph
 from nkigym.kernel_ir.partition import compute_reachability, sample_partition
+from nkigym.kernel_ir.pattern_rewrite import apply_rewrites_until_fixpoint
 from nkigym.kernel_ir.validate import tier_depth_range, validate
 
 TIERS = ("per_tile", "per_block", "full")
@@ -468,8 +468,8 @@ def build_ir(
     """
     da = analyze_dims(func, input_specs)
     graph = build_op_graph(func, input_specs)
-    candidates = detect_online_fusion(da, graph)
-    da, graph, required_merges = apply_online_fusion(da, graph, candidates)
+    da, graph = apply_rewrites_until_fixpoint(da, graph, [OnlineFusionPattern()])
+    required_merges: list[frozenset[int]] = []
 
     num_ops = len(graph.op_classes)
     ltiles_per_block: dict[str, int] = {dim_id: 1 for dim_id in da.dims}

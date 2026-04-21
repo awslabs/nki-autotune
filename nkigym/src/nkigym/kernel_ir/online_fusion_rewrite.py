@@ -1,63 +1,32 @@
 """Online-fusion IR rewrite.
 
 Replaces the X op and its accumulator chain with a single composite
-op node in the op graph. The composite (``NKIOnlineFusionChain``
-subclass, built per candidate) subsumes the entire producer→
-accumulator chain and renders as one fused loop body through
-``codegen.online_fusion``.
-
-Algorithm per candidate:
-
-1. Walk the op graph to find every op on a path from ``x_op_idx``
-   to an accumulator. These "absorbed" ops, plus X itself, are
-   removed from the rewritten graph.
-2. Determine external inputs (tensors read by absorbed ops but
-   produced outside the absorbed set) and external outputs
-   (tensors consumed outside the absorbed set, plus the kernel
-   return tensor if it was produced inside).
-3. Build an ``NKIOnlineFusionChain`` subclass with concrete
-   ``OPERAND_AXES`` / ``OUTPUT_AXES`` / etc. wired to the external
-   tensors' concrete dims.
-4. Append the composite op to the graph; delete the absorbed ops;
-   renumber indices.
-5. Promote the accumulation dim to ``ACCUMULATION`` in ``da.dims``.
-6. Retarget the kernel return to the composite's output (if it
-   was among the absorbed ops' outputs).
-
-Forced-merge clusters are empty — the composite is already one
-node, so the partition sampler keeps it in a singleton group
-naturally.
+``NKIOnlineFusionChain`` subclass node. The composite subsumes the
+entire producer→accumulator chain; rendered via
+``codegen.online_fusion`` as one fused loop body. See
+``online_fusion_plan.md`` for the algorithm and contract.
 """
 
 from dataclasses import replace
 
 from nkigym.kernel_ir.dim_analysis import DimAnalysis, DimRole, TensorInfo
 from nkigym.kernel_ir.online_fusion_detect import OnlineFusionCandidate
+from nkigym.kernel_ir.online_fusion_spec import AccumulatorSpec, InverseStep, ScaleSpec
 from nkigym.kernel_ir.op_graph import OpGraph
 from nkigym.ops.base import NKIOp
 from nkigym.ops.online_fusion_chain import make_online_fusion_class
 
 
-def apply_online_fusion(
-    da: DimAnalysis, graph: OpGraph, candidates: list[OnlineFusionCandidate]
-) -> tuple[DimAnalysis, OpGraph, list[frozenset[int]]]:
-    """Rewrite ``da`` / ``graph`` for every supported candidate.
-
-    Returns the rewritten dim analysis, op graph, and forced-merge
-    clusters (empty for composite-node rewrites).
-    """
-    supported = [c for c in candidates if c.scale_role == "rsqrt_then_mul"]
-    current_da = da
-    current_graph = graph
-    for candidate in supported:
-        current_da, current_graph = _rewrite_candidate(current_da, current_graph, candidate)
-    return current_da, current_graph, []
-
-
-def _rewrite_candidate(
+def rewrite_one_candidate(
     da: DimAnalysis, graph: OpGraph, candidate: OnlineFusionCandidate
 ) -> tuple[DimAnalysis, OpGraph]:
-    """Apply one candidate's rewrite; return the mutated (da, graph)."""
+    """Apply one candidate's rewrite; return the mutated (da, graph).
+
+    Public entry point for the ``OnlineFusionPattern.apply`` driver
+    step. Unchanged behavior vs the prior ``_rewrite_candidate``
+    helper — renamed so the pattern can import it without touching
+    a private API.
+    """
     absorbed = _absorbed_ops(graph, candidate.x_op_idx, candidate.accumulator_op_indices)
     inputs, outputs = _external_boundary(da, graph, absorbed, candidate)
     return_name = _rewrite_return_name(da, outputs, absorbed)
@@ -104,19 +73,9 @@ def _external_boundary(
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Return ``(external_inputs, external_outputs)`` for the composite.
 
-    Role names are semantic for the scale-role family so the
-    render path can address each input by its semantic role rather
-    than positional index:
-
-    * ``a_in``: the external input feeding BOTH X's reduction and
-      the accumulator's stationary-side chain (the "data" being
-      normalized). For ``rsqrt_then_mul``, this is the pre-norm
-      tensor.
-    * ``b_in``: the external input feeding ONLY the accumulator's
-      moving-side (the matmul RHS).
-    * ``out``: the composite's output tensor — adopts the
-      accumulator's original output name so downstream consumers
-      don't need rewiring.
+    Inputs use semantic role names (``a_in`` = X + stationary data,
+    ``b_in`` = matmul moving RHS). Outputs use positional
+    ``out_i`` roles so multi-accumulator composites disambiguate.
     """
     produced_internal: set[str] = set()
     for op_idx in absorbed:
@@ -144,7 +103,7 @@ def _external_boundary(
             if _is_externally_used(graph, tname, absorbed, da.return_name):
                 external_out_names.append(tname)
                 seen_out.add(tname)
-    outputs = [("out", name) for name in external_out_names]
+    outputs = [(f"out_{i}", name) for i, name in enumerate(external_out_names)]
     return inputs, outputs
 
 
@@ -193,34 +152,19 @@ def _build_composite_class(
 ) -> type[NKIOp]:
     """Build the ``NKIOnlineFusionChain`` subclass for this candidate.
 
-    Abstract-axis labels are generated per role with a unique
-    prefix so the axis-map inversion is unambiguous. Only the
-    affine-op kwargs from the user's inverse chain are carried
-    through — the composite's render path needs them to reproduce
-    ``running_s/K + eps`` on both the current and previous
-    running-sum values.
+    Parametric: derives a ``ScaleSpec`` from the candidate's
+    ``scale_role`` and the X op's kwargs, and one
+    ``AccumulatorSpec`` per accumulator op. The render path reads
+    these specs to emit the fused loop body without any role-
+    string branching.
     """
-    input_axes: dict[str, tuple[str, ...]] = {}
-    input_locs: dict[str, str] = {}
-    tile_limits: dict[str, int] = {}
-    for role, tname in inputs:
-        dims = da.tensors[tname].dim_ids
-        labels = tuple(f"{role}_{i}" for i in range(len(dims)))
-        input_axes[role] = labels
-        input_locs[role] = "sbuf"
-        for label, dim_id in zip(labels, dims):
-            tile_limits[label] = da.dims[dim_id].physical_tile_size
-    output_axes: dict[str, tuple[str, ...]] = {}
-    for role, tname in outputs:
-        dims = da.tensors[tname].dim_ids
-        labels = tuple(f"{role}_{i}" for i in range(len(dims)))
-        output_axes[role] = labels
-        for label, dim_id in zip(labels, dims):
-            tile_limits[label] = da.dims[dim_id].physical_tile_size
-    affine_op_idx = _find_affine_op(graph, candidate.x_op_idx, candidate.accumulator_op_indices)
-    affine_kwargs = dict(graph.op_all_kwargs[affine_op_idx]) if affine_op_idx is not None else {}
+    input_axes, input_locs, tile_limits = _build_axis_maps(da, inputs)
+    output_axes, output_tile_limits = _build_output_axis_maps(da, outputs)
+    tile_limits.update(output_tile_limits)
+    scale_spec = _build_scale_spec(candidate, graph)
+    accumulator_specs = _build_accumulator_specs(candidate, graph, outputs)
     return make_online_fusion_class(
-        scale_role=candidate.scale_role,
+        label=candidate.scale_role,
         accumulation_dim=candidate.blocking_dim,
         input_tensor_names=tuple(name for _, name in inputs),
         input_axes=input_axes,
@@ -229,8 +173,135 @@ def _build_composite_class(
         output_axes=output_axes,
         tile_limits=tile_limits,
         blocking_axes=frozenset(),
-        inner_op_kwargs=(affine_kwargs,),
+        scale_spec=scale_spec,
+        accumulator_specs=accumulator_specs,
     )
+
+
+def _build_axis_maps(
+    da: DimAnalysis, role_pairs: list[tuple[str, str]]
+) -> tuple[dict[str, tuple[str, ...]], dict[str, str], dict[str, int]]:
+    """Per-input-role axis labels (unique-per-role prefix), locs, tile limits."""
+    axes: dict[str, tuple[str, ...]] = {}
+    locs: dict[str, str] = {}
+    tile_limits: dict[str, int] = {}
+    for role, tname in role_pairs:
+        dims = da.tensors[tname].dim_ids
+        labels = tuple(f"{role}_{i}" for i in range(len(dims)))
+        axes[role] = labels
+        locs[role] = "sbuf"
+        for label, dim_id in zip(labels, dims):
+            tile_limits[label] = da.dims[dim_id].physical_tile_size
+    return axes, locs, tile_limits
+
+
+def _build_output_axis_maps(
+    da: DimAnalysis, role_pairs: list[tuple[str, str]]
+) -> tuple[dict[str, tuple[str, ...]], dict[str, int]]:
+    """Build per-output-role axis labels and tile limits (no locs on outputs)."""
+    axes: dict[str, tuple[str, ...]] = {}
+    tile_limits: dict[str, int] = {}
+    for role, tname in role_pairs:
+        dims = da.tensors[tname].dim_ids
+        labels = tuple(f"{role}_{i}" for i in range(len(dims)))
+        axes[role] = labels
+        for label, dim_id in zip(labels, dims):
+            tile_limits[label] = da.dims[dim_id].physical_tile_size
+    return axes, tile_limits
+
+
+def _build_scale_spec(candidate: OnlineFusionCandidate, graph: OpGraph) -> ScaleSpec:
+    """Construct the ``ScaleSpec`` for this candidate's scale role.
+
+    * ``rsqrt_then_mul``: sum-like running X, inverse chain of
+      ``tensor_scalar(×1/K +eps)`` then ``activation(rsqrt)`` read
+      off the user's graph, σ = inv(running) · reciprocal(inv(prev)).
+    * ``exp_bias``: max-like running X, no inverse chain (σ is
+      produced by a single ``activation(exp, data=prev,
+      bias=running, scale=-1.0)``).
+    """
+    builders = {
+        "rsqrt_then_mul": lambda: _scale_spec_rsqrt_then_mul(candidate, graph),
+        "exp_bias": _scale_spec_exp_bias,
+    }
+    builder = builders.get(candidate.scale_role)
+    if builder is None:
+        raise NotImplementedError(f"online-fusion scale_role={candidate.scale_role!r} not yet supported")
+    return builder()
+
+
+def _scale_spec_rsqrt_then_mul(candidate: OnlineFusionCandidate, graph: OpGraph) -> ScaleSpec:
+    """Extract the sum-family ``ScaleSpec`` from the user's inverse chain."""
+    affine_idx = _find_affine_op(graph, candidate.x_op_idx, candidate.accumulator_op_indices)
+    affine_kwargs = dict(graph.op_all_kwargs[affine_idx]) if affine_idx is not None else {}
+    inverse_chain = (
+        InverseStep(op_name="tensor_scalar", kwargs=affine_kwargs),
+        InverseStep(op_name="activation", kwargs={"op": "'rsqrt'"}),
+    )
+    return ScaleSpec(
+        combinator="add",
+        init_value="0.0",
+        delta_op="activation_reduce",
+        delta_kwargs={"op": "'square'", "reduce_op": "'add'"},
+        inverse_chain=inverse_chain,
+        sigma_kind="ratio_via_reciprocal",
+    )
+
+
+def _scale_spec_exp_bias() -> ScaleSpec:
+    """Max-family spec — running stores NEGATED max (reference convention)."""
+    return ScaleSpec(
+        combinator="minimum",
+        init_value="float('inf')",
+        delta_op="tensor_reduce",
+        delta_kwargs={"op": "'maximum'", "negate": "True"},
+        inverse_chain=(),
+        sigma_kind="exp_diff_via_activation",
+    )
+
+
+def _build_accumulator_specs(
+    candidate: OnlineFusionCandidate, graph: OpGraph, outputs: list[tuple[str, str]]
+) -> tuple[AccumulatorSpec, ...]:
+    """One ``AccumulatorSpec`` per accumulator op.
+
+    The output role assigned to each accumulator mirrors the
+    output role in the composite's ``OUTPUT_AXES`` — the detector
+    guarantees an external output exists for each accumulator that
+    surviving downstream ops read.
+    """
+    specs: list[AccumulatorSpec] = []
+    for acc_idx in candidate.accumulator_op_indices:
+        op_cls = graph.op_classes[acc_idx]
+        role = _accumulator_output_role(graph, acc_idx, outputs)
+        kind = {"nc_matmul": "matmul", "activation_reduce": "activation_reduce"}.get(op_cls.NAME)
+        if kind is None:
+            raise NotImplementedError(f"accumulator op {op_cls.NAME!r} not yet supported")
+        specs.append(
+            AccumulatorSpec(
+                kind=kind,
+                output_role=role,
+                source_op_idx=acc_idx,
+                ptile_free_dim=candidate.blocking_dim if kind == "matmul" else "",
+                source_kwargs=tuple(graph.op_all_kwargs[acc_idx].items()),
+            )
+        )
+    return tuple(specs)
+
+
+def _accumulator_output_role(graph: OpGraph, acc_idx: int, outputs: list[tuple[str, str]]) -> str:
+    """Return the composite output role for an accumulator op's externally-consumed output.
+
+    Accumulators produce one or more output tensors; at least one
+    of them is in the composite's external output list (otherwise
+    the accumulator wouldn't be user-visible). Pick the first
+    match.
+    """
+    acc_outputs = set(graph.op_tensors[acc_idx][1])
+    for role, tname in outputs:
+        if tname in acc_outputs:
+            return role
+    raise ValueError(f"accumulator {acc_idx} has no external output in {outputs}")
 
 
 def _find_affine_op(graph: OpGraph, x_op_idx: int, accumulator_op_indices: tuple[int, ...]) -> int | None:
@@ -258,18 +329,62 @@ def _reassemble_graph(
     inputs: list[tuple[str, str]],
     outputs: list[tuple[str, str]],
 ) -> OpGraph:
-    """Build the new op graph: keep non-absorbed ops, append composite, renumber."""
+    """Keep non-absorbed ops; insert composite topologically via ``_composite_insert_position``.
+
+    Consumer edges require producer-before-consumer in op-index
+    order (``_rebuild_edges`` walks index-sorted), so the composite
+    must slot between its surviving producers and consumers.
+    """
     survivors = [op_idx for op_idx in range(len(graph.op_classes)) if op_idx not in absorbed]
-    new_op_classes = [graph.op_classes[op_idx] for op_idx in survivors]
-    new_op_tensors = [(dict(graph.op_tensors[op_idx][0]), list(graph.op_tensors[op_idx][1])) for op_idx in survivors]
-    new_op_all_kwargs = [dict(graph.op_all_kwargs[op_idx]) for op_idx in survivors]
-    new_op_classes.append(composite_cls)
+    insert_at = _composite_insert_position(graph, absorbed, inputs, outputs)
+    new_op_classes: list[type[NKIOp]] = []
+    new_op_tensors: list[tuple[dict[str, str], list[str]]] = []
+    new_op_all_kwargs: list[dict[str, str]] = []
     composite_inputs = {role: name for role, name in inputs}
     composite_outputs = [name for _, name in outputs]
-    new_op_tensors.append((composite_inputs, composite_outputs))
-    new_op_all_kwargs.append({})
+    inserted = False
+    for orig_idx in survivors:
+        if not inserted and orig_idx >= insert_at:
+            new_op_classes.append(composite_cls)
+            new_op_tensors.append((composite_inputs, composite_outputs))
+            new_op_all_kwargs.append({})
+            inserted = True
+        new_op_classes.append(graph.op_classes[orig_idx])
+        new_op_tensors.append((dict(graph.op_tensors[orig_idx][0]), list(graph.op_tensors[orig_idx][1])))
+        new_op_all_kwargs.append(dict(graph.op_all_kwargs[orig_idx]))
+    if not inserted:
+        new_op_classes.append(composite_cls)
+        new_op_tensors.append((composite_inputs, composite_outputs))
+        new_op_all_kwargs.append({})
     edges = _rebuild_edges(new_op_tensors)
     return OpGraph(op_classes=new_op_classes, edges=edges, op_tensors=new_op_tensors, op_all_kwargs=new_op_all_kwargs)
+
+
+def _composite_insert_position(
+    graph: OpGraph, absorbed: set[int], inputs: list[tuple[str, str]], outputs: list[tuple[str, str]]
+) -> int:
+    """Earliest survivor-index the composite can legally occupy.
+
+    Must sit after every external-input producer and before every
+    external-output consumer. Defaults to ``min(absorbed)`` when
+    no consumer survives.
+    """
+    input_names = {name for _, name in inputs}
+    output_names = {name for _, name in outputs}
+    producers_max = -1
+    for op_idx in range(len(graph.op_classes)):
+        if op_idx in absorbed:
+            continue
+        if any(out in input_names for out in graph.op_tensors[op_idx][1]):
+            producers_max = max(producers_max, op_idx)
+    consumers_min = len(graph.op_classes)
+    for op_idx in range(len(graph.op_classes)):
+        if op_idx in absorbed:
+            continue
+        if any(inp in output_names for inp in graph.op_tensors[op_idx][0].values()):
+            consumers_min = min(consumers_min, op_idx)
+    absorbed_min = min(absorbed) if absorbed else producers_max + 1
+    return max(producers_max + 1, min(absorbed_min, consumers_min))
 
 
 def _rebuild_edges(op_tensors: list[tuple[dict[str, str], list[str]]]) -> list[tuple[int, int, str, str]]:
@@ -296,24 +411,27 @@ def _reassemble_dim_analysis(
     return_name: str,
     candidate: OnlineFusionCandidate,
 ) -> DimAnalysis:
-    """Build a DimAnalysis consistent with the rewritten graph.
-
-    Drops per-op entries for absorbed ops; appends one entry for
-    the composite. Promotes the candidate's blocking dim to
-    ``ACCUMULATION``. Keeps every tensor in ``da.tensors`` —
-    internal intermediates absorbed by the composite are still
-    referenced by the original (now-dropped) ops in upstream
-    callers; leaving them behind is harmless because the renderer
-    only allocates for tensors produced by surviving ops.
-    """
+    """Per-op arrays match the new graph's op order (composite inserted at same slot as in ``_reassemble_graph``)."""
+    insert_at = _composite_insert_position(graph, absorbed, inputs, outputs)
     survivors = [op_idx for op_idx in range(len(graph.op_classes)) if op_idx not in absorbed]
-    new_per_op_axis_maps = [dict(da.per_op_axis_maps[op_idx]) for op_idx in survivors]
-    new_op_tile_sizes = [dict(da.op_tile_sizes[op_idx]) for op_idx in survivors]
-    new_per_op_blocking_dims = [set(da.per_op_blocking_dims[op_idx]) for op_idx in survivors]
     composite_axis_map, composite_tile_sizes = _composite_axis_map(da, composite_cls, inputs, outputs)
-    new_per_op_axis_maps.append(composite_axis_map)
-    new_op_tile_sizes.append(composite_tile_sizes)
-    new_per_op_blocking_dims.append(set())
+    new_per_op_axis_maps: list[dict[str, str]] = []
+    new_op_tile_sizes: list[dict[str, int]] = []
+    new_per_op_blocking_dims: list[set[str]] = []
+    inserted = False
+    for orig_idx in survivors:
+        if not inserted and orig_idx >= insert_at:
+            new_per_op_axis_maps.append(composite_axis_map)
+            new_op_tile_sizes.append(composite_tile_sizes)
+            new_per_op_blocking_dims.append({candidate.blocking_dim})
+            inserted = True
+        new_per_op_axis_maps.append(dict(da.per_op_axis_maps[orig_idx]))
+        new_op_tile_sizes.append(dict(da.op_tile_sizes[orig_idx]))
+        new_per_op_blocking_dims.append(set(da.per_op_blocking_dims[orig_idx]))
+    if not inserted:
+        new_per_op_axis_maps.append(composite_axis_map)
+        new_op_tile_sizes.append(composite_tile_sizes)
+        new_per_op_blocking_dims.append({candidate.blocking_dim})
     new_dims = dict(da.dims)
     new_dims[candidate.blocking_dim] = replace(new_dims[candidate.blocking_dim], role=DimRole.ACCUMULATION)
     new_tensors = _retain_external_tensors(da.tensors, graph, absorbed, outputs)

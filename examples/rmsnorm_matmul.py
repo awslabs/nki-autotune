@@ -52,7 +52,7 @@ def rmsnorm_matmul_nkigym(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    M, K, N = 1024, 512, 1024
+    M, K, N = 2048, 2048, 2048
     input_specs = {"a": ((M, K), "bfloat16"), "b": ((K, N), "bfloat16")}
 
     CACHE_DIR = Path("/home/ubuntu/cache/rmsnorm_matmul")
