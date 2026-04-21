@@ -109,3 +109,54 @@ def apply_rewrites_until_fixpoint(
         f"pattern-rewrite driver did not reach fixpoint after {max_iterations} passes — "
         "check for oscillating patterns"
     )
+
+
+def _graph_signature(graph: OpGraph) -> tuple:
+    """Canonical structural signature for dedup.
+
+    Two graphs with different apply orders but the same resulting
+    structure hash to the same signature. Uses class name, input
+    role -> tensor map, and output tensor tuple per op.
+    """
+    return tuple(
+        (op_cls.__name__, tuple(sorted(inputs.items())), tuple(outputs))
+        for op_cls, (inputs, outputs) in zip(graph.op_classes, graph.op_tensors)
+    )
+
+
+def enumerate_graph_variants(
+    da: DimAnalysis, graph: OpGraph, patterns: list[PatternRewrite]
+) -> list[tuple[DimAnalysis, OpGraph]]:
+    """Exhaustively enumerate every graph reachable by any subset of rewrites.
+
+    For each state, collect every current match across all
+    patterns; for each match, apply it and recurse on the result.
+    Structural dedup via ``_graph_signature`` collapses
+    commuting-rewrite paths so the output list contains every
+    distinct reachable graph exactly once.
+
+    The starting ``(da, graph)`` is always in the output (empty
+    subset of rewrites). Terminal states (no matches remaining)
+    are the "all rewrites applied along this path" graphs.
+
+    Args:
+        da: Starting dim analysis.
+        graph: Starting op graph.
+        patterns: Patterns to explore.
+
+    Returns:
+        List of ``(da, graph)`` pairs, one per reachable state.
+    """
+    seen: dict[tuple, tuple[DimAnalysis, OpGraph]] = {}
+    stack: list[tuple[DimAnalysis, OpGraph]] = [(da, graph)]
+    while stack:
+        current_da, current_graph = stack.pop()
+        sig = _graph_signature(current_graph)
+        if sig in seen:
+            continue
+        seen[sig] = (current_da, current_graph)
+        for pattern in patterns:
+            for instance in pattern.match(current_da, current_graph):
+                new_da, new_graph = pattern.apply(current_da, current_graph, instance)
+                stack.append((new_da, new_graph))
+    return list(seen.values())

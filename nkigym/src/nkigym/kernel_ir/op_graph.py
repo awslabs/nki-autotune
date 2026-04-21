@@ -10,15 +10,17 @@ Usage::
 
 import heapq
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import graphviz
 import numpy as np
 
+from nkigym.kernel_ir.dim_analysis import DimAnalysis, TensorInfo
 from nkigym.kernel_ir.parse import find_ops
 from nkigym.kernel_ir.trace import trace_scalar_kwargs
 from nkigym.ops.base import NKIOp
+from nkigym.ops.dma import NKILoad, NKIStore
 
 
 @dataclass
@@ -193,3 +195,121 @@ def build_op_graph(func: Callable[..., np.ndarray], input_specs: dict[str, tuple
             tensor_producers[oname] = i
 
     return OpGraph(op_classes=op_classes_list, edges=edges, op_tensors=op_tensors, op_all_kwargs=op_all_kwargs)
+
+
+@dataclass
+class _OpAccum:
+    """Per-op side data accumulated by ``insert_dma_nodes``."""
+
+    classes: list[type[NKIOp]]
+    tensors: list[tuple[dict[str, str], list[str]]]
+    all_kwargs: list[dict[str, str]]
+    axis_maps: list[dict[str, str]]
+    tile_sizes: list[dict[str, int]]
+    blocking_dims: list[set[str]]
+
+
+def _append_dma_op(
+    accum: _OpAccum, op_cls: type[NKIOp], inputs: dict[str, str], outputs: list[str], all_kwargs: dict[str, str]
+) -> None:
+    """Append an ``NKILoad`` or ``NKIStore`` with empty dim-analysis metadata."""
+    accum.classes.append(op_cls)
+    accum.tensors.append((inputs, outputs))
+    accum.all_kwargs.append(all_kwargs)
+    accum.axis_maps.append({})
+    accum.tile_sizes.append({})
+    accum.blocking_dims.append(set())
+
+
+def _insert_load_and_rewire(da: DimAnalysis, graph: OpGraph, accum: _OpAccum) -> None:
+    """Walk compute ops; insert ``NKILoad`` before each kernel input's first use."""
+    params = set(da.param_names)
+    load_output_of: dict[str, str] = {p: f"{p}_sbuf" for p in da.param_names}
+    loaded: set[str] = set()
+    for op_idx, op_cls in enumerate(graph.op_classes):
+        inputs, outputs = graph.op_tensors[op_idx]
+        for name in inputs.values():
+            if name in params and name not in loaded:
+                _append_dma_op(accum, NKILoad, {"data": name}, [load_output_of[name]], {"data": name})
+                loaded.add(name)
+        rewired_inputs = {role: load_output_of.get(name, name) for role, name in inputs.items()}
+        accum.classes.append(op_cls)
+        accum.tensors.append((rewired_inputs, list(outputs)))
+        accum.all_kwargs.append(dict(graph.op_all_kwargs[op_idx]))
+        accum.axis_maps.append(dict(da.per_op_axis_maps[op_idx]))
+        accum.tile_sizes.append(dict(da.op_tile_sizes[op_idx]))
+        accum.blocking_dims.append(set(da.per_op_blocking_dims[op_idx]))
+
+
+def _extend_tensors(
+    da: DimAnalysis, load_output_names: dict[str, str], store_output_name: str
+) -> dict[str, TensorInfo]:
+    """Extend ``da.tensors`` with Load / Store output aliases."""
+    result: dict[str, TensorInfo] = dict(da.tensors)
+    for p in da.param_names:
+        source = da.tensors[p]
+        result[load_output_names[p]] = TensorInfo(source.dim_ids, source.shape, source.dtype)
+    source = da.tensors[da.return_name]
+    result[store_output_name] = TensorInfo(source.dim_ids, source.shape, source.dtype)
+    return result
+
+
+def _rebuild_edges(
+    op_tensors: list[tuple[dict[str, str], list[str]]],
+) -> tuple[list[tuple[int, int, str, str]], dict[str, int]]:
+    """Return ``(edges, tensor_producers)`` from current per-op tensor metadata."""
+    tensor_producers: dict[str, int] = {}
+    for new_idx, (_inputs, outputs) in enumerate(op_tensors):
+        for oname in outputs:
+            tensor_producers[oname] = new_idx
+    edges: list[tuple[int, int, str, str]] = []
+    for new_idx, (inputs, _outputs) in enumerate(op_tensors):
+        for role, name in inputs.items():
+            producer = tensor_producers.get(name)
+            if producer is not None and producer != new_idx:
+                edges.append((producer, new_idx, name, role))
+    return edges, tensor_producers
+
+
+def insert_dma_nodes(da: DimAnalysis, graph: OpGraph) -> tuple[DimAnalysis, OpGraph]:
+    """Return ``(da, graph)`` with explicit NKILoad / NKIStore nodes.
+
+    Phase 2 of the online-fusion plan. Each kernel input gets one
+    ``NKILoad`` inserted immediately before its first consumer
+    (lazy DFS ordering); the return tensor gets one ``NKIStore``
+    appended at the end. ``DimAnalysis`` is extended so downstream
+    passes (online-fusion detector, validator, codegen) can index
+    Load/Store ops by the same ``op_idx`` space as compute ops —
+    the new ops carry empty ``per_op_blocking_dims`` / axis map /
+    tile sizes (pure copies, no new abstract axes), and the new
+    ``*_sbuf`` / ``*_hbm`` tensor names alias their source's
+    dims/shape/dtype.
+
+    Args:
+        da: Starting dim analysis (pre-DMA).
+        graph: Starting op graph (pre-DMA).
+
+    Returns:
+        New ``(da, graph)`` pair with Load/Store nodes inserted.
+        Inputs are unchanged.
+    """
+    accum = _OpAccum(classes=[], tensors=[], all_kwargs=[], axis_maps=[], tile_sizes=[], blocking_dims=[])
+    _insert_load_and_rewire(da, graph, accum)
+    return_name = da.return_name
+    store_output_name = f"{return_name}_hbm"
+    _append_dma_op(accum, NKIStore, {"data": return_name}, [store_output_name], {"data": return_name})
+
+    edges, tensor_producers = _rebuild_edges(accum.tensors)
+    if tensor_producers.get(return_name) is None:
+        raise ValueError(f"Return tensor {return_name!r} has no producer op in the graph")
+
+    new_graph = OpGraph(op_classes=accum.classes, edges=edges, op_tensors=accum.tensors, op_all_kwargs=accum.all_kwargs)
+    load_output_of = {p: f"{p}_sbuf" for p in da.param_names}
+    new_da = replace(
+        da,
+        tensors=_extend_tensors(da, load_output_of, store_output_name),
+        per_op_axis_maps=accum.axis_maps,
+        op_tile_sizes=accum.tile_sizes,
+        per_op_blocking_dims=accum.blocking_dims,
+    )
+    return new_da, new_graph

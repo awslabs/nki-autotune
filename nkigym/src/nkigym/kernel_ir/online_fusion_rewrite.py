@@ -3,8 +3,7 @@
 Replaces the X op and its accumulator chain with a single composite
 ``NKIOnlineFusionChain`` subclass node. The composite subsumes the
 entire producer→accumulator chain; rendered via
-``codegen.online_fusion`` as one fused loop body. See
-``online_fusion_plan.md`` for the algorithm and contract.
+``codegen.online_fusion`` as one fused loop body.
 """
 
 from dataclasses import replace

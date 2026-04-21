@@ -2,7 +2,7 @@
 
 from nkigym.kernel_ir.dim_analysis import DimAnalysis, DimInfo, TensorInfo, analyze_dims
 from nkigym.kernel_ir.ir import KernelIR, build_ir, get_tpb
-from nkigym.kernel_ir.op_graph import OpGraph, build_op_graph
+from nkigym.kernel_ir.op_graph import OpGraph, build_op_graph, insert_dma_nodes
 
 __all__ = [
     "DimAnalysis",
@@ -14,4 +14,5 @@ __all__ = [
     "build_ir",
     "build_op_graph",
     "get_tpb",
+    "insert_dma_nodes",
 ]
