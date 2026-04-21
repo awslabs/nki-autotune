@@ -8,7 +8,6 @@ independently-sampled IR candidates.
 
 from typing import Any
 
-from nkigym.kernel_ir.dim_analysis import op_blocking_dims
 from nkigym.kernel_ir.emission import Placement, op_emission_placement
 
 
@@ -84,8 +83,7 @@ def _op_blocking_innermost_ok(ir: Any, group_idx: int, op_idx: int) -> bool:
     different dims still admit a legal dim_order.
     """
     da = ir.dim_analysis
-    op_cls = ir.op_graph.op_classes[op_idx]
-    blocking = op_blocking_dims(op_cls, da.per_op_axis_maps[op_idx])
+    blocking = da.op_blocking_dims(op_idx)
     dim_order = ir.fusion_groups[group_idx].dim_order
     op_dims = set()
     for name in ir.op_graph.op_tensor_names(op_idx):

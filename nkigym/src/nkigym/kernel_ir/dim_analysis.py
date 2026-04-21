@@ -1,10 +1,12 @@
-"""Dimension analysis: ID assignment, tile sizes, blocking classification.
+"""Dimension analysis: ID assignment, tile sizes, role classification.
 
 Forward pass over all ops produces three results per dimension:
   1. A concrete dimension ID (d0, d1, ...)
   2. A tile size (max of hardware tile limits across ops)
-  3. A blocking vs non-blocking classification (derived from
-     ``BLOCKING_AXES`` of ops touching the dim)
+  3. A ``DimRole`` classifying the loop-iteration dependency
+     structure, seeded from ``BLOCKING_AXES`` of ops touching the
+     dim. The online-fusion rewrite may later promote a ``SERIAL``
+     dim to ``ACCUMULATION``.
 
 Usage::
 
@@ -16,11 +18,43 @@ Usage::
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
 
 from nkigym.kernel_ir.parse import find_ops
 from nkigym.ops.base import NKIOp
+
+
+class DimRole(Enum):
+    """Loop-iteration dependency structure of a dimension.
+
+    ``PARALLEL``: iterations are independent — they read/write
+    disjoint buffer slices and can run in any order or
+    concurrently. Multi-buffering and sharding are legal.
+
+    ``SERIAL``: iterations contribute to the same buffer via a
+    non-additive combinator (max, min, argmax, etc.). Associative
+    but not linear, so consumers of the buffer must wait for the
+    full loop to finish (blocking barrier). Multi-buffering and
+    sharding are illegal.
+
+    ``ACCUMULATION``: iterations contribute to the same buffer via
+    addition (associative AND linear). Linearity lets online fusion
+    inject a per-iteration scale coefficient so consumers can read
+    the partial accumulator before the loop finishes — the blocking
+    barrier is lifted. Still serial in dependency; multi-buffering
+    and sharding remain illegal.
+
+    State transitions: only ``SERIAL → ACCUMULATION`` is legal,
+    triggered by the online-fusion rewrite after verifying the
+    downstream consumer is add-accumulation-shaped. ``PARALLEL``
+    never participates.
+    """
+
+    PARALLEL = "parallel"
+    SERIAL = "serial"
+    ACCUMULATION = "accumulation"
 
 
 @dataclass
@@ -35,19 +69,36 @@ class DimInfo:
             op tile limits) on this dimension, with partition cap
             (128) included when the dimension appears as the first
             axis of any tensor.
-        is_blocking: True if any op touching this dimension has
-            it in ``BLOCKING_AXES`` — the op accumulates over the
-            dim and its output is only valid after the dim's full
-            iteration completes. Loop-fusion legality uses this
-            to decide when a shared dim constrains ordering.
-            Online fusion can flip a blocking dim to non-blocking
-            by injecting running state + correction factors.
+        role: ``DimRole`` for this dimension's loop-iteration
+            dependency structure. Seeded from ``BLOCKING_AXES``
+            (``SERIAL`` when any op blocks on the dim, else
+            ``PARALLEL``) and possibly promoted to ``ACCUMULATION``
+            by the online-fusion rewrite.
     """
 
     dim_size: int
     logical_tile_size: int
     physical_tile_size: int
-    is_blocking: bool
+    role: DimRole
+
+    @property
+    def blocks_consumers(self) -> bool:
+        """True iff downstream consumers must wait for this dim's loop to finish.
+
+        Equivalent to ``role is SERIAL``. ``ACCUMULATION`` doesn't
+        block consumers because σ-correction lets them read the
+        running buffer mid-loop.
+        """
+        return self.role is DimRole.SERIAL
+
+    @property
+    def is_sequential(self) -> bool:
+        """True iff iterations share buffer state (``SERIAL`` or ``ACCUMULATION``).
+
+        Gates multi-buffering and sharding: both are legal only on
+        ``PARALLEL`` dims.
+        """
+        return self.role is not DimRole.PARALLEL
 
     @property
     def num_ptiles(self) -> int:
@@ -74,6 +125,15 @@ class TensorInfo:
 class DimAnalysis:
     """Complete dimension analysis result.
 
+    Authority on per-op blocking semantics. ``NKIOp.BLOCKING_AXES``
+    is the per-class declaration (abstract axes); this class carries
+    the concrete, per-op, per-kernel set after any IR-level
+    transforms (e.g. online fusion) have had a chance to clear
+    blocking dims the rewrite has broken. Downstream callers
+    (partition sampler, emission placement, loop-fusion legality,
+    renderer) must read from ``op_blocking_dims(op_idx)`` rather
+    than the class attribute so there is a single source of truth.
+
     Attributes:
         func_name: Name of the math function.
         param_names: Input parameter names.
@@ -87,6 +147,11 @@ class DimAnalysis:
             dim IDs. ``op_tile_sizes[op_idx][dim_id]`` gives
             the op's own tile limit on that dimension. Used
             by the renderer for ISA call operand sizing.
+        per_op_blocking_dims: Per-op concrete blocking-dim sets
+            (by op index). Seeded from ``NKIOp.BLOCKING_AXES``
+            resolved through ``per_op_axis_maps``; mutated by
+            online-fusion rewrites that remove dims from the
+            producer's blocking set.
     """
 
     func_name: str
@@ -96,6 +161,16 @@ class DimAnalysis:
     tensors: dict[str, TensorInfo]
     per_op_axis_maps: list[dict[str, str]]
     op_tile_sizes: list[dict[str, int]]
+    per_op_blocking_dims: list[set[str]]
+
+    def op_blocking_dims(self, op_idx: int) -> set[str]:
+        """Return the concrete dims ``op_idx`` blocks on in this kernel.
+
+        This is the sole source of truth for per-op blocking in
+        downstream code. Returns a fresh set copy so callers can
+        freely intersect/mutate without affecting the record.
+        """
+        return set(self.per_op_blocking_dims[op_idx])
 
     def __repr__(self) -> str:
         """Show final dimension analysis result."""
@@ -116,7 +191,7 @@ class DimAnalysis:
                     str(di.logical_tile_size),
                     str(di.physical_tile_size),
                     str(num_physical),
-                    "blocking" if di.is_blocking else "non-blocking",
+                    di.role.value,
                 ]
             )
         col_widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
@@ -261,23 +336,18 @@ def _create_outputs(
 
 
 def op_blocking_dims(op_cls: type[NKIOp], axis_map: dict[str, str]) -> set[str]:
-    """Return the concrete dims this op blocks on.
+    """Seed the concrete blocking-dim set for an op from its class declaration.
 
-    An op blocks on every concrete dim its ``BLOCKING_AXES`` map
-    to under ``axis_map``. Axes not in the map (tensor collapsed
-    before the op) are silently skipped.
+    Reads ``op_cls.BLOCKING_AXES`` and resolves each abstract axis
+    through ``axis_map``; axes not in the map (tensor collapsed
+    before the op) are silently skipped. This is the default
+    per-class seed — the authoritative per-op set lives on
+    ``DimAnalysis.per_op_blocking_dims`` and may diverge once
+    online-fusion rewrites have cleared dims from specific ops.
+    Downstream call sites must use ``DimAnalysis.op_blocking_dims``
+    rather than this helper.
     """
     return {axis_map[axis] for axis in op_cls.BLOCKING_AXES if axis in axis_map}
-
-
-def _compute_blocking_dims(
-    ops: list[tuple[type[NKIOp], dict[str, str], list[str], dict[str, str]]], per_op_maps: list[dict[str, str]]
-) -> set[str]:
-    """Collect concrete dims marked blocking by any op touching them."""
-    blocking: set[str] = set()
-    for (op_cls, _, _, _), local in zip(ops, per_op_maps):
-        blocking |= op_blocking_dims(op_cls, local)
-    return blocking
 
 
 def _compute_tile_sizes(
@@ -321,7 +391,10 @@ def _compute_tile_sizes(
         if dim_id in partition_dims:
             min_tile[dim_id] = min(min_tile[dim_id], PARTITION_MAX)
 
-    dims = {d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], d in blocking_dims) for d in max_tile}
+    dims = {
+        d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], DimRole.SERIAL if d in blocking_dims else DimRole.PARALLEL)
+        for d in max_tile
+    }
     return dims, op_tile_sizes
 
 
@@ -364,7 +437,10 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
 
     if return_name not in tensors:
         raise ValueError(f"Return tensor {return_name!r} not found")
-    blocking_dims = _compute_blocking_dims(ops, per_op_maps)
+    per_op_blocking: list[set[str]] = [
+        op_blocking_dims(op_cls, local) for (op_cls, _, _, _), local in zip(ops, per_op_maps)
+    ]
+    blocking_dims: set[str] = set().union(*per_op_blocking) if per_op_blocking else set()
 
     dims, op_tile_sizes = _compute_tile_sizes(ops, per_op_maps, dim_sizes, blocking_dims, tensors)
 
@@ -380,4 +456,5 @@ def analyze_dims(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
         tensors=tensor_infos,
         per_op_axis_maps=per_op_maps,
         op_tile_sizes=op_tile_sizes,
+        per_op_blocking_dims=per_op_blocking,
     )

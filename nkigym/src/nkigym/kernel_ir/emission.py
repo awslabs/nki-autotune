@@ -19,8 +19,6 @@ every intra-group producer's stage slot.
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from nkigym.kernel_ir.dim_analysis import op_blocking_dims
-
 KernelIR = Any
 
 
@@ -82,25 +80,41 @@ def material_blocking_dims(ir: KernelIR, op_idx: int, dim_order: list[str]) -> s
     are the same position. Only dims with at least one material loop (block
     or ltile trip > 1) constitute a barrier that requires consumer hoisting.
     """
-    blocking = op_blocking_dims(ir.op_graph.op_classes[op_idx], ir.dim_analysis.per_op_axis_maps[op_idx]) & set(
-        dim_order
-    )
+    blocking = ir.dim_analysis.op_blocking_dims(op_idx) & set(dim_order)
     return {d for d in blocking if block_trip(ir, d) > 1 or ltile_trip(ir, d) > 1}
 
 
 def op_depth_floor(ir: KernelIR, op_idx: int, group_idx: int) -> int:
     """Smallest ``slot.depth`` at which this op can legally emit.
 
-    Baseline: every op emits at the innermost body (``2 * N``),
-    matching the pre-refactor renderer contract so existing
-    ``tensor_placements`` tier → buffer-size math stays valid. Per-
-    op Placement only differs from ``2 * N`` when a producer
-    barrier pushes the emission slot to an ``after[k]`` window —
-    see ``op_emission_placement``.
+    Derived from the op's tensor dims: an op emits at the narrowest
+    scope in which every dim it touches has its block- AND ltile-
+    loop open. For each dim the op touches, the ltile loop is the
+    later-opening one (depth ``N + pos + 1``); the floor is the
+    max over all such ``N + pos + 1`` values. Ops whose tensors
+    touch every dim in the group thus land at ``2 * N`` (innermost
+    body) — preserving existing behavior for pre-rewrite ops.
+    Rewrite-inserted ops whose tensors skip some dims (e.g. a
+    running buffer that carries only the partition axis) get a
+    shallower floor, emitting outside the skipped dims' loops.
     """
-    _ = op_idx
     dim_order = ir.fusion_groups[group_idx].dim_order
-    return 2 * len(dim_order)
+    n = len(dim_order)
+    relevant_positions = _op_tensor_dim_positions(ir, op_idx, dim_order)
+    floor = n + max(relevant_positions) + 1 if relevant_positions else 0
+    return floor
+
+
+def _op_tensor_dim_positions(ir: KernelIR, op_idx: int, dim_order: list[str]) -> list[int]:
+    """Return the positions in ``dim_order`` of every dim any of the op's tensors carries."""
+    da = ir.dim_analysis
+    graph = ir.op_graph
+    touched_dims: set[str] = set()
+    for tensor_name in graph.op_tensor_names(op_idx):
+        tinfo = da.tensors.get(tensor_name)
+        if tinfo is not None:
+            touched_dims.update(tinfo.dim_ids)
+    return [dim_order.index(d) for d in touched_dims if d in dim_order]
 
 
 def _op_input_tensor_names(ir: KernelIR, op_idx: int) -> list[str]:
@@ -182,7 +196,7 @@ def _compute_placement(
     barriers: list[Placement] = []
     for t in _op_input_tensor_names(ir, op_idx):
         producer = graph.producer_op(t)
-        if producer is None or op_to_group.get(producer) != group_idx:
+        if producer is None or producer == op_idx or op_to_group.get(producer) != group_idx:
             continue
         barriers.append(producer_stage_placement(ir, producer, group_idx, op_to_group, staged, memo))
     candidates = [Placement("before", d) for d in range(floor, 2 * n + 1)] + [

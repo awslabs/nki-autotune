@@ -107,7 +107,7 @@ def remote_search(
     """
     rng = random.Random(seed)
     initial_kernel = build_ir(func, input_specs, seed=seed)
-    mac_count = compute_mac_count(initial_kernel)
+    mac_count = compute_mac_count(func, input_specs)
     nkigym_source = _func_source_with_imports(func)
     cache_path = Path(cache_dir)
     initial_kernel.op_graph.render(cache_path / "op_graph")

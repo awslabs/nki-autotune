@@ -65,20 +65,40 @@ def _legal_merge(a: set[int], b: set[int], reach: list[set[int]], n: int) -> boo
 
 
 def sample_partition(
-    graph: OpGraph, rng: random.Random, p_merge: float = 0.7, reach: list[set[int]] | None = None
+    graph: OpGraph,
+    rng: random.Random,
+    p_merge: float = 0.7,
+    reach: list[set[int]] | None = None,
+    required_merges: list[frozenset[int]] | None = None,
 ) -> list[list[int]]:
     """Draw a partition of the op set via stochastic pairwise merging.
 
-    Starts from the singleton partition and repeatedly selects a
+    Starts from the singleton partition (or, when ``required_merges``
+    is given, from the partition where each listed cluster is
+    already fused into a single group), then repeatedly selects a
     random legal merge (under R1) with probability ``p_merge`` per
     step. Stops when no legal merges remain or the Bernoulli draw
     breaks. Groups are returned in topological order with ops inside
     each group sorted by index. ``reach`` depends only on ``graph``
     — callers in hot paths should compute it once and pass it in.
+
+    Args:
+        graph: Op graph to partition.
+        rng: Random source for the Bernoulli merge draws.
+        p_merge: Per-step probability of continuing to merge.
+        reach: Optional precomputed forward reachability.
+        required_merges: Clusters that must appear fused in the
+            returned partition. Each cluster must be a convex set
+            of op indices (per R1). Disjoint clusters are merged
+            pairwise into the seed partition; intersecting clusters
+            are first unioned.
+
+    Raises:
+        ValueError: If a required cluster is not convex.
     """
     n = len(graph.op_classes)
     reach_final: list[set[int]] = compute_reachability(graph) if reach is None else reach
-    groups: list[set[int]] = [{i} for i in range(n)]
+    groups: list[set[int]] = _seed_groups(n, required_merges or [], reach_final)
 
     while True:
         legal_pairs = [
@@ -99,3 +119,33 @@ def sample_partition(
     ordered_op_lists = [sorted(g) for g in groups]
     topo_order = graph.toposort_groups(ordered_op_lists)
     return [ordered_op_lists[gi] for gi in topo_order]
+
+
+def _seed_groups(n: int, required_merges: list[frozenset[int]], reach: list[set[int]]) -> list[set[int]]:
+    """Build the starting partition honoring ``required_merges``.
+
+    Unions required clusters that share any op, validates each
+    resulting cluster is convex, then emits one group per cluster
+    plus singletons for every op not covered. Raises ``ValueError``
+    if a cluster violates R1.
+    """
+    op_to_cluster: dict[int, set[int]] = {}
+    for cluster in required_merges:
+        combined = set(cluster)
+        for op_idx in cluster:
+            existing = op_to_cluster.get(op_idx)
+            if existing is not None:
+                combined |= existing
+        for op_idx in combined:
+            op_to_cluster[op_idx] = combined
+    unique_clusters: list[set[int]] = []
+    seen_ids: set[int] = set()
+    for cluster in op_to_cluster.values():
+        if id(cluster) not in seen_ids:
+            seen_ids.add(id(cluster))
+            unique_clusters.append(cluster)
+    for cluster in unique_clusters:
+        if not _is_convex(cluster, n, reach):
+            raise ValueError(f"required_merges cluster {sorted(cluster)} violates R1 convexity")
+    covered = {op_idx for cluster in unique_clusters for op_idx in cluster}
+    return unique_clusters + [{i} for i in range(n) if i not in covered]

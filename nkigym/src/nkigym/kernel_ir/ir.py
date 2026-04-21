@@ -2,12 +2,14 @@
 
 import random
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from nkigym.kernel_ir.dim_analysis import DimAnalysis, analyze_dims, op_blocking_dims
+from nkigym.kernel_ir.dim_analysis import DimAnalysis, analyze_dims
 from nkigym.kernel_ir.emission import compute_staged_set
+from nkigym.kernel_ir.online_fusion_detect import detect_online_fusion
+from nkigym.kernel_ir.online_fusion_rewrite import apply_online_fusion
 from nkigym.kernel_ir.op_graph import OpGraph, build_op_graph
 from nkigym.kernel_ir.partition import compute_reachability, sample_partition
 from nkigym.kernel_ir.validate import tier_depth_range, validate
@@ -74,12 +76,16 @@ class KernelIR:
             group loop order, buffer degrees, and tier
             placements. Initially one singleton group per op;
             loop fusion merges groups.
+        required_merges: Op-index clusters that must appear in a
+            single fusion group. Populated by IR-level rewrites
+            (e.g. online fusion). Empty by default.
     """
 
     dim_analysis: DimAnalysis
     op_graph: OpGraph
     ltiles_per_block: dict[str, int]
     fusion_groups: list[FusionGroup]
+    required_merges: list[frozenset[int]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Precompute cross-group effective-tier/degree maps used by codegen."""
@@ -293,7 +299,7 @@ def sample_valid_ir(ir: "KernelIR", rng: random.Random, max_tries: int = 1_000_0
     sbuf_tensors = {name for name, kinds in tensor_kinds.items() if "sbuf" in kinds}
     staged = compute_staged_set(ir)
     for _ in range(max_tries):
-        op_groups = sample_partition(graph, rng, reach=reach)
+        op_groups = sample_partition(graph, rng, reach=reach, required_merges=ir.required_merges)
         seed_groups: list[FusionGroup] = []
         for op_indices in op_groups:
             touched = _group_touched_tensors(graph, da, op_indices)
@@ -385,8 +391,7 @@ def _group_axis_splits(ir: "KernelIR", op_to_group: dict[int, int]) -> list[tupl
         order = list(group.dim_order)
         blocking: set[str] = set()
         for op_idx in group.op_indices:
-            op_cls = ir.op_graph.op_classes[op_idx]
-            blocking |= op_blocking_dims(op_cls, da.per_op_axis_maps[op_idx]) & set(order)
+            blocking |= da.op_blocking_dims(op_idx) & set(order)
         splits.append((order, blocking))
     return splits
 
@@ -463,6 +468,8 @@ def build_ir(
     """
     da = analyze_dims(func, input_specs)
     graph = build_op_graph(func, input_specs)
+    candidates = detect_online_fusion(da, graph)
+    da, graph, required_merges = apply_online_fusion(da, graph, candidates)
 
     num_ops = len(graph.op_classes)
     ltiles_per_block: dict[str, int] = {dim_id: 1 for dim_id in da.dims}
@@ -482,5 +489,11 @@ def build_ir(
             )
         )
 
-    ir = KernelIR(dim_analysis=da, op_graph=graph, ltiles_per_block=ltiles_per_block, fusion_groups=groups)
+    ir = KernelIR(
+        dim_analysis=da,
+        op_graph=graph,
+        ltiles_per_block=ltiles_per_block,
+        fusion_groups=groups,
+        required_merges=required_merges,
+    )
     return sample_valid_ir(ir, random.Random(seed))

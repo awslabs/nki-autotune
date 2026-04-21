@@ -12,7 +12,7 @@ from nkigym.codegen.buffers import sbuf_buffer
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.codegen.sbuf_buffer import AxisAccess
 from nkigym.kernel_ir import KernelIR, get_tpb
-from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
+from nkigym.kernel_ir.dim_analysis import TensorInfo
 from nkigym.kernel_ir.emission import material_blocking_dims, op_emission_placement
 from nkigym.kernel_ir.validate import tier_depth_range
 from nkigym.ops.transpose import NKITranspose
@@ -74,8 +74,7 @@ def producer_finished_depth(ir: KernelIR, producer: int, dim_order: list[str]) -
     innermost body).
     """
     da = ir.dim_analysis
-    op_cls = ir.op_graph.op_classes[producer]
-    blocking = op_blocking_dims(op_cls, da.per_op_axis_maps[producer]) & set(dim_order)
+    blocking = da.op_blocking_dims(producer) & set(dim_order)
     depth = min(dim_order.index(d) for d in blocking) if blocking else 2 * len(dim_order)
     return depth, blocking
 
@@ -218,8 +217,7 @@ def ptile_loop_dims(ir: KernelIR, op_idx: int) -> list[tuple[str, int]]:
 
 def has_output_ptile_dims(ir: KernelIR, op_idx: int) -> bool:
     """True iff this op has at least one non-blocking ptile dim (output-tile axis)."""
-    op_cls = ir.op_graph.op_classes[op_idx]
-    blocking = op_blocking_dims(op_cls, ir.dim_analysis.per_op_axis_maps[op_idx])
+    blocking = ir.dim_analysis.op_blocking_dims(op_idx)
     return any(dim_id not in blocking for dim_id, _ in ptile_loop_dims(ir, op_idx))
 
 

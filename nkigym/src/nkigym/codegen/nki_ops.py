@@ -22,10 +22,12 @@ loop.
 from nkigym.codegen.buffers import producer_op_tiles, psum_tile_count, psum_tile_slice, sbuf_buffer
 from nkigym.codegen.dma import has_output_ptile_dims, inline_stage_line, ptile_loop_dims
 from nkigym.codegen.group_loops import DepthPlan
+from nkigym.codegen.online_fusion import render_online_fusion_op
 from nkigym.codegen.sbuf_buffer import AxisAccess
 from nkigym.kernel_ir import KernelIR
-from nkigym.kernel_ir.dim_analysis import TensorInfo, op_blocking_dims
+from nkigym.kernel_ir.dim_analysis import TensorInfo
 from nkigym.kernel_ir.emission import Placement, material_blocking_dims, op_emission_placement
+from nkigym.ops.online_fusion_chain import NKIOnlineFusionChain
 
 
 def render_nki_ops(
@@ -50,6 +52,9 @@ def render_nki_ops(
         if op_idx in elided:
             continue
         group_idx = op_to_group[op_idx]
+        if issubclass(op_cls, NKIOnlineFusionChain):
+            render_online_fusion_op(ir, op_idx, group_idx, before_plan)
+            continue
         dim_order = ir.fusion_groups[group_idx].dim_order
         placement = op_emission_placement(ir, op_idx, group_idx, op_to_group, staged, memo)
         block_lines = list(_render_op_block(ir, op_idx, op_to_group, staged, placement))
@@ -131,9 +136,8 @@ def _render_op_block(
 
 
 def _partition_ptile_dims(ir: KernelIR, op_idx: int) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
-    """Split this op's ptile dims into (output, blocking) by its ``BLOCKING_AXES``."""
-    op_cls = ir.op_graph.op_classes[op_idx]
-    blocking = op_blocking_dims(op_cls, ir.dim_analysis.per_op_axis_maps[op_idx])
+    """Split this op's ptile dims into (output, blocking) by its blocking-dim set."""
+    blocking = ir.dim_analysis.op_blocking_dims(op_idx)
     output: list[tuple[str, int]] = []
     accum: list[tuple[str, int]] = []
     for dim_id, count in ptile_loop_dims(ir, op_idx):
