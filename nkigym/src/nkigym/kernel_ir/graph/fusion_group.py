@@ -25,3 +25,18 @@ class FusionGroup:
     dim_order: list[str] = field(default_factory=list)
     buffer_degrees: dict[tuple[str, str, str], int] = field(default_factory=dict)
     tensor_placements: dict[tuple[str, str, str], str] = field(default_factory=dict)
+
+    def summary_lines(self, indent: str = "      ") -> list[str]:
+        """Return indented lines describing this group's codegen state."""
+        op_names = ", ".join(type(op).NAME for op in self.ops)
+        dims = ", ".join(self.dim_order) if self.dim_order else "(none)"
+        lines = [f"{indent}ops: {op_names}", f"{indent}dim_order: [{dims}]"]
+        if self.tensor_placements:
+            lines.append(f"{indent}tensor_placements:")
+            for (kind, tname, dim_id), tier in sorted(self.tensor_placements.items()):
+                lines.append(f"{indent}  ({kind}, {tname}, {dim_id}) = {tier}")
+        if self.buffer_degrees:
+            lines.append(f"{indent}buffer_degrees:")
+            for (kind, tname, dim_id), deg in sorted(self.buffer_degrees.items()):
+                lines.append(f"{indent}  ({kind}, {tname}, {dim_id}) = {deg}")
+        return lines

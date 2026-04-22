@@ -24,7 +24,7 @@ from nkipy.runtime import BaremetalExecutor
 from autotune.runner.benchmark import benchmark_one, compute_golden, generate_tensors, simulate_one
 from autotune.runner.compare import assert_close
 from autotune.runner.compile import compile_one, init_compile_worker
-from autotune.runner.detect import detect_func_name, detect_kernel_info, detect_neuron_cores
+from autotune.runner.detect import detect_neuron_cores
 from autotune.runner.types import (
     BenchmarkConfig,
     CompileResult,
@@ -75,7 +75,7 @@ def _cpu_sim_status(sim_output: np.ndarray, sim_error: str, golden: np.ndarray, 
 
 
 def _process_kernel_job(kname: str, job: dict[str, Any], seed: int, nki_dir: Path) -> dict[str, Any]:
-    """Process a single kernel job: generate tensors, golden, detect info, run CPU sim.
+    """Process a single kernel job: generate tensors, golden, run CPU sim.
 
     Returns a dict with all per-kernel data needed for compile and benchmark.
     """
@@ -84,8 +84,10 @@ def _process_kernel_job(kname: str, job: dict[str, Any], seed: int, nki_dir: Pat
     nki_path = nki_dir / filename
     nki_path.write_text(source)
 
-    func_name, output_shape = detect_kernel_info(source)
+    func_name = job["func_name"]
+    output_shape = tuple(job["output_shape"])
     mac_count = job["mac_count"]
+    neuronx_cc_args = tuple(job.get("neuronx_cc_args", ()))
 
     tensor_specs = {name: {"shape": list(shape), "dtype": dt} for name, (shape, dt) in job["tensor_specs"].items()}
     kwargs = generate_tensors(tensor_specs, seed)
@@ -104,6 +106,7 @@ def _process_kernel_job(kname: str, job: dict[str, Any], seed: int, nki_dir: Pat
         "kwargs": kwargs,
         "cpu_sim": cpu_sim,
         "input_dtype_name": input_dtype_name,
+        "neuronx_cc_args": neuronx_cc_args,
     }
 
 
@@ -136,6 +139,7 @@ def _submit_compilations(
                 kd["input_dtype_name"],
                 str(compile_dir),
                 {},
+                kd["neuronx_cc_args"],
             )
         )
     return executor, futures
@@ -222,8 +226,7 @@ def _run_pipeline(payload: dict[str, Any]) -> tuple[list[ProfileResult], dict[st
     t_start = time.monotonic()
 
     first_job = next(iter(kernel_jobs.values()))
-    func_name = detect_func_name(first_job["source"])
-    work_dir = Path(f"/tmp/autotune-{func_name}")
+    work_dir = Path(f"/tmp/autotune-{first_job['func_name']}")
     shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True)
 
@@ -266,12 +269,22 @@ def worker_main() -> None:
 
     Reads a JSON payload from stdin containing per-kernel job configs
     and benchmark settings. Writes results JSON to stdout.
+
+    Real stdout is hijacked for the duration of the pipeline so any
+    stray ``print(...)`` from imported libraries (e.g. ``nkilib``'s
+    ``[WARN]`` logger, which writes to stdout) cannot corrupt the
+    JSON payload the coordinator parses.
     """
     payload = _parse_payload()
     _setup_env(payload)
     logging.basicConfig(level=logging.INFO, format=f"[{payload['host']}] %(message)s")
 
-    all_results, compiler_logs = _run_pipeline(payload)
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
+    try:
+        all_results, compiler_logs = _run_pipeline(payload)
+    finally:
+        sys.stdout = real_stdout
 
     output = {"host": payload["host"], "results": [r._asdict() for r in all_results], "compiler_logs": compiler_logs}
     sys.stdout.buffer.write(json.dumps(output).encode("utf-8"))

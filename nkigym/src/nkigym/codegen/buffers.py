@@ -1,6 +1,6 @@
 """Tensor buffer allocation: on-chip SBUF and PSUM buffers."""
 
-from nkigym.codegen.sbuf_buffer import SbufBuffer, build_sbuf_buffer
+from nkigym.codegen.sbuf_buffer import SbufBuffer, buffer_ident, build_sbuf_buffer
 from nkigym.kernel_ir import KernelIR
 from nkigym.kernel_ir.context.context import KernelContext, TensorInfo
 from nkigym.kernel_ir.graph.graph import KernelGraph
@@ -238,7 +238,7 @@ def _psum_line(ir: KernelIR, name: str, tinfo: TensorInfo, dtype: str) -> str:
     count = psum_tile_count(ir, name, tinfo)
     tile_expr = f"nl.ndarray(({shape_str}), dtype=nl.{dtype}, buffer=nl.psum)"
     rhs = tile_expr if count == 1 else f"[{tile_expr} for _ in range({count})]"
-    return f"psum_{name} = {rhs}"
+    return f"psum_{buffer_ident(name)} = {rhs}"
 
 
 def _build_psum_dtype_map(ir: KernelIR) -> dict[str, str]:

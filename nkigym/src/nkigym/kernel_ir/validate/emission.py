@@ -1,12 +1,17 @@
 """Per-op emission Placement in a group's render slot sequence.
 
-A group's ``_render_group`` linearizes into a sequence of slots::
+A group's ``_render_group`` linearizes into a pair-interleaved
+sequence of slots::
 
-    before[0], for block_0: before[1], ..., for block_{N-1}: before[N],
-    for ltile_0: ..., for ltile_{N-1}: before[2N], after[2N-1], ...,
-    after[N], after[N-1], ..., after[0]
+    before[0], for block_0: before[1], for ltile_0: before[2],
+    for block_1: before[3], for ltile_1: before[4], ...,
+    for block_{N-1}: before[2N-1], for ltile_{N-1}: before[2N],
+    after[2N-1], after[2N-2], ..., after[0]
 
-Every ``(phase, depth)`` is a slot. Source order:
+Every ``(phase, depth)`` is a slot. The slot coordinate for dim
+at ``pos`` is ``block_depth(pos) = 2*pos`` (before the block loop
+opens) and ``ltile_depth(pos) = 2*pos + 1`` (before the ltile
+loop opens). Body emits at depth ``2*N``. Source order:
 ``before[k1] < before[k2] < after[k2-1] < after[k1-1]`` for
 ``k1 <= k2``; linearize via ``source_position(p) = p.depth if
 p.phase == "before" else 4*N - p.depth``.
@@ -18,6 +23,22 @@ from typing import Literal
 from nkigym.kernel_ir.context.context import KernelContext
 from nkigym.kernel_ir.graph.graph import KernelGraph
 from nkigym.ops.base import NKIOp
+from nkigym.ops.dma import NKIDMATranspose, NKILoad, NKIStore
+
+
+def block_depth(pos: int) -> int:
+    """Slot depth at which the block loop for dim ``pos`` opens."""
+    return 2 * pos
+
+
+def ltile_depth(pos: int) -> int:
+    """Slot depth at which the ltile loop for dim ``pos`` opens."""
+    return 2 * pos + 1
+
+
+def body_depth(n: int) -> int:
+    """Innermost body slot depth for a group of ``n`` ordered dims."""
+    return 2 * n
 
 
 def compute_staged_set(context: KernelContext, graph: KernelGraph) -> set[str]:
@@ -84,12 +105,61 @@ def material_blocking_dims(context: KernelContext, op: NKIOp, dim_order: list[st
 
 
 def op_depth_floor(context: KernelContext, graph: KernelGraph, op: NKIOp, group_idx: int) -> int:
-    """Smallest ``slot.depth`` at which this op can legally emit."""
+    """Smallest ``slot.depth`` at which this op can legally emit.
+
+    For DMA ops (Load/Store/DMATranspose) the floor is derived
+    from the SBUF tensor's per-dim tier placement: ``full`` dims
+    add no constraint (loop need not be open), ``per_block`` dims
+    force emission inside the block loop (depth > ``2*pos``),
+    ``per_tile`` dims force emission inside the ltile loop (depth
+    > ``2*pos+1``). For all other ops the floor is the body slot.
+    """
     dim_order = graph.groups[group_idx].dim_order
-    n = len(dim_order)
     positions = _op_tensor_dim_positions(context, op, dim_order)
-    floor = n + max(positions) + 1 if positions else 0
+    if isinstance(op, (NKILoad, NKIStore, NKIDMATranspose)):
+        floor = _dma_depth_floor(context, graph, op, group_idx)
+    else:
+        floor = body_depth(len(dim_order)) if positions else 0
     return floor
+
+
+def _dma_depth_floor(context: KernelContext, graph: KernelGraph, op: NKIOp, group_idx: int) -> int:
+    """DMA-specific floor: max per-dim tier lower bound on the op's SBUF tensor."""
+    dim_order = graph.groups[group_idx].dim_order
+    placements = graph.groups[group_idx].tensor_placements
+    sbuf_tensor = _dma_sbuf_tensor(context, op)
+    tinfo = context.logical_tensors.get(sbuf_tensor, None) if sbuf_tensor else None
+    floor = 0
+    if tinfo is not None and sbuf_tensor is not None:
+        for dim_id in tinfo.dim_ids:
+            if dim_id not in dim_order:
+                continue
+            pos = dim_order.index(dim_id)
+            tier = placements.get(("sbuf", sbuf_tensor, dim_id), "per_tile")
+            contribution = _tier_floor_contribution(tier, pos)
+            floor = max(floor, contribution)
+    return floor
+
+
+def _tier_floor_contribution(tier: str, pos: int) -> int:
+    """Return the per-dim floor contribution for a tier at ``pos``."""
+    if tier == "full":
+        contribution = 0
+    elif tier == "per_block":
+        contribution = block_depth(pos) + 1
+    else:
+        contribution = ltile_depth(pos) + 1
+    return contribution
+
+
+def _dma_sbuf_tensor(context: KernelContext, op: NKIOp) -> str:
+    """Return the SBUF-side tensor name for a DMA op (Load/DMATranspose: output; Store: input)."""
+    if isinstance(op, NKIStore):
+        name = context.op_inputs.get(op, {}).get("data", "")
+    else:
+        outputs = context.op_outputs.get(op, [])
+        name = outputs[0] if outputs else ""
+    return name
 
 
 def _op_tensor_dim_positions(context: KernelContext, op: NKIOp, dim_order: list[str]) -> list[int]:
@@ -142,7 +212,7 @@ def producer_stage_placement(
         material = material_blocking_dims(context, producer_op, dim_order)
         produced = context.op_outputs.get(producer_op, [])
         if material and any(t in staged for t in produced):
-            blocking_barrier = Placement("after", min(dim_order.index(d) for d in material))
+            blocking_barrier = Placement("after", block_depth(min(dim_order.index(d) for d in material)))
     if blocking_barrier is not None:
         result = blocking_barrier
     else:
@@ -186,8 +256,8 @@ def _compute_placement(
         if producer is None or producer is op or op_to_group.get(id(producer)) != group_idx:
             continue
         barriers.append(producer_stage_placement(context, graph, producer, group_idx, op_to_group, staged, memo))
-    candidates = [Placement("before", d) for d in range(floor, 2 * n + 1)] + [
-        Placement("after", d) for d in range(2 * n - 1, -1, -1)
+    candidates = [Placement("before", d) for d in range(floor, body_depth(n) + 1)] + [
+        Placement("after", d) for d in range(body_depth(n) - 1, -1, -1)
     ]
     chosen: Placement | None = None
     for cand in candidates:

@@ -16,12 +16,7 @@ def _run_and_cache(profiler: RemoteProfiler, kernels: dict[str, KernelJob], cach
 
 
 def remote_profile(
-    kernels: dict[str, KernelJob],
-    hosts: list[str],
-    cache_dir: str,
-    warmup: int = 5,
-    iters: int = 20,
-    config: ProfileConfig = ProfileConfig(),
+    kernels: dict[str, KernelJob], hosts: list[str], cache_dir: str, config: ProfileConfig = ProfileConfig()
 ) -> ProfileOutput:
     """Profile NKI kernels across remote Trainium hosts.
 
@@ -43,8 +38,8 @@ def remote_profile(
         hosts=hosts,
         venv_python=config.venv_python,
         neuron_platform_target=config.neuron_platform_target,
-        warmup=warmup,
-        iters=iters,
+        warmup=10,
+        iters=100,
         seed=config.seed,
         _collect_compiler_logs=bool(cache_dir),
     )

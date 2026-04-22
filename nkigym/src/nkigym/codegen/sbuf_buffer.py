@@ -4,6 +4,26 @@ from dataclasses import dataclass
 
 from nkigym.kernel_ir import KernelIR
 
+_DMA_ALIAS_SUFFIXES = ("_sbuf", "_hbm")
+
+
+def buffer_ident(tensor_name: str) -> str:
+    """Strip DMA-alias suffixes when forming Python buffer identifiers.
+
+    The DMA rewrite tags Load outputs with ``_sbuf`` and Store
+    outputs with ``_hbm`` to keep the logical-tensor catalog
+    unambiguous. The generated Python code is more readable if we
+    render those as ``sbuf_<name>`` / ``psum_<name>`` without the
+    redundant alias suffix — the buffer kind is already in the
+    prefix.
+    """
+    result = tensor_name
+    for suffix in _DMA_ALIAS_SUFFIXES:
+        if tensor_name.endswith(suffix):
+            result = tensor_name[: -len(suffix)]
+            break
+    return result
+
 
 @dataclass(frozen=True)
 class SbufAxis:
@@ -56,14 +76,14 @@ class SbufBuffer:
         leaf = f"nl.ndarray(({self.p.logical}, {self.f.logical}), dtype=nl.{self.dtype}, buffer=nl.sbuf)"
         inner = f"[{leaf} for _ in range({self.f.list_slots})]"
         outer = f"[{inner} for _ in range({self.p.list_slots})]"
-        return f"sbuf_{self.name} = {outer}"
+        return f"sbuf_{buffer_ident(self.name)} = {outer}"
 
     def get_tile(self, p: AxisAccess, f: AxisAccess) -> str:
         """Return an access string for one physical 2D tile."""
         p_idx = _list_index(self.p, p.block, p.ltile, p.ptile)
         f_idx = _list_index(self.f, f.block, f.ltile, None)
         f_slice = _f_ptile_slice(self.f, f.ptile) if f.ptile is not None else f"0:{self.f.logical}"
-        return f"sbuf_{self.name}[{p_idx}][{f_idx}][0:{self.p.logical}, {f_slice}]"
+        return f"sbuf_{buffer_ident(self.name)}[{p_idx}][{f_idx}][0:{self.p.logical}, {f_slice}]"
 
     def range(self, p: AxisAccess, f: AxisAccess) -> tuple[str, int, str, int]:
         """Return ``(p_start, p_count, f_start, f_count)`` for a gadget sub-block."""

@@ -166,8 +166,16 @@ def compile_nki_kernel(
     output_shape: tuple[int, ...],
     output_dtype: np.dtype,
     output_dir: str,
+    neuronx_cc_args: tuple[str, ...],
 ) -> str:
     """Compile an NKI kernel file to NEFF via nki.compiler.
+
+    ``neuronx_cc_args`` is forwarded to the MLIR pass pipeline via
+    ``CompileOptions.set_pipeline_options(*args)``. Hand-allocated
+    kernels (e.g. nkilib's ``attention_cte``) need
+    ``("enable-linear-scan-allocation=false",
+    "enable-instruction-scheduling=false")`` so neuronx-cc's scheduler
+    doesn't reshuffle their explicit SBUF/PSUM address lifetimes.
 
     Returns:
         Path to the compiled NEFF file.
@@ -183,6 +191,8 @@ def compile_nki_kernel(
     kernel = Kernel(kernel_func)
     neff_file = os.path.join(output_dir, "file.neff")
     opts = CompileOptions(target="trn2", lnc=1, output_path=neff_file, artifacts_dir=output_dir)
+    if neuronx_cc_args:
+        opts = opts.set_pipeline_options(*neuronx_cc_args)
     _run_compiler(kernel, tensor_inputs, output_name, opts)
 
     if not os.path.isfile(neff_file):
@@ -201,6 +211,7 @@ def compile_one(
     output_dtype_name: str,
     compile_dir: str,
     scalar_params: dict[str, float],
+    neuronx_cc_args: tuple[str, ...],
 ) -> CompileResult:
     """Top-level picklable worker for parallel NKI compilation.
 
@@ -215,6 +226,8 @@ def compile_one(
         output_dtype_name: Dtype name for the output tensor.
         compile_dir: Directory for compilation artifacts.
         scalar_params: Map of scalar param names to values.
+        neuronx_cc_args: Extra MLIR pass-pipeline flags for
+            ``CompileOptions.set_pipeline_options``.
     """
     neff_path = ""
     error = ""
@@ -227,7 +240,7 @@ def compile_one(
         for name, value in scalar_params.items():
             input_tensors[name] = value
         neff_path = compile_nki_kernel(
-            nki_path, func_name, input_tensors, output_name, output_shape, out_dtype, compile_dir
+            nki_path, func_name, input_tensors, output_name, output_shape, out_dtype, compile_dir, neuronx_cc_args
         )
     except Exception as e:
         error = capture_error(e)

@@ -20,10 +20,10 @@ from dataclasses import dataclass
 
 from nkigym.codegen.buffers import sbuf_buffer
 from nkigym.codegen.group_loops import DepthPlan
-from nkigym.codegen.sbuf_buffer import AxisAccess
+from nkigym.codegen.sbuf_buffer import AxisAccess, buffer_ident
 from nkigym.kernel_ir import KernelContext, KernelIR
 from nkigym.kernel_ir.context.context import TensorInfo
-from nkigym.kernel_ir.validate.emission import Placement
+from nkigym.kernel_ir.validate.emission import Placement, block_depth, ltile_depth
 from nkigym.ops.base import NKIOp
 
 _INIT: dict[str, str] = {"add": "0.0", "maximum": "float('-inf')", "minimum": "float('inf')"}
@@ -65,13 +65,14 @@ def reduced_outputs_with_multichunk(ir: KernelIR, op: NKIOp) -> list[ReducedOutp
 
 
 def _any_multichunk(ir: KernelIR, dim_ids: set[str]) -> bool:
-    """True iff any dim's block-loop trip is > 1."""
+    """True iff any dim's block-loop or ltile-loop trip is > 1."""
     context = ir.context
     result = False
     for d in dim_ids:
         di = context.dimensions[d]
-        num_blocks = di.dim_size // (context.ltiles_per_block.get(d, 1) * di.logical_tile_size)
-        if num_blocks > 1:
+        tpb = context.ltiles_per_block.get(d, 1)
+        num_blocks = di.dim_size // (tpb * di.logical_tile_size)
+        if num_blocks > 1 or tpb > 1:
             result = True
             break
     return result
@@ -124,7 +125,7 @@ def init_depth(ir: KernelIR, op: NKIOp, gi: int) -> int:
         reduction_dims |= blocking - out_dims
     dim_order = ir.graph.groups[gi].dim_order
     positions = [dim_order.index(d) for d in reduction_dims if d in dim_order]
-    return min(positions) if positions else 0
+    return block_depth(min(positions)) if positions else 0
 
 
 def scratch_shape(context: KernelContext, tinfo: TensorInfo) -> tuple[int, int]:
@@ -165,10 +166,11 @@ def apply_reduction_plan(
         tinfo = context.logical_tensors[r.tensor_name]
         p, f = scratch_shape(context, tinfo)
         chunk_dtype = _chunk_scratch_dtype(r.combinator, tinfo.dtype)
-        top_lines.append(f"sbuf_{r.tensor_name}_chunk = nl.ndarray(({p}, {f}), dtype=nl.{chunk_dtype}, buffer=nl.sbuf)")
+        chunk_name = f"{buffer_ident(r.tensor_name)}_chunk"
+        top_lines.append(f"sbuf_{chunk_name} = nl.ndarray(({p}, {f}), dtype=nl.{chunk_dtype}, buffer=nl.sbuf)")
         init_lines.extend(init_memset_lines(ir, gi, r, depth))
         running = _running_access(ir, gi, r, placement)
-        chunk = f"sbuf_{r.tensor_name}_chunk[0:{p}, 0:{f}]"
+        chunk = f"sbuf_{chunk_name}[0:{p}, 0:{f}]"
         block_lines.append(combine_line(ir, r, chunk, running))
     return block_lines
 
@@ -212,10 +214,9 @@ def _running_axis_access(
     ltile = "0"
     if dim_id in dim_order:
         pos = dim_order.index(dim_id)
-        n = len(dim_order)
-        if tier == "full" and placement.loop_open(pos):
+        if tier == "full" and placement.loop_open(block_depth(pos)):
             block = f"i_block_{dim_id}"
-        if tier in ("per_block", "full") and placement.loop_open(n + pos):
+        if tier in ("per_block", "full") and placement.loop_open(ltile_depth(pos)):
             ltile = f"i_ltile_{dim_id}"
     return AxisAccess(block=block, ltile=ltile)
 

@@ -19,9 +19,6 @@ from nkigym.ops.base import NKIOp
 from nkigym.search.mac import compute_mac_count
 from nkigym.search.sampler import sample_variants
 
-_WARMUP = 10
-_ITERS = 100
-
 
 def _func_source_with_imports(func: Callable[..., np.ndarray]) -> str:
     """Return the function's source prefixed with a minimal nkigym-safe preamble.
@@ -111,9 +108,12 @@ def remote_search(
     nkigym_source = _func_source_with_imports(func)
     cache_path = Path(cache_dir)
     variants = sample_variants(naive_ctx, naive_graph, ctx, graph_variants, num_variants, rng, cache_dir=cache_path)
+    output_shape = tuple(naive_ctx.logical_tensors[naive_ctx.return_name].shape)
     kernels: dict[str, KernelJob] = {
         f"{name}.py": KernelJob(
             source=source,
+            func_name=naive_ctx.func_name,
+            output_shape=output_shape,
             input_specs=input_specs,
             nkigym_source=nkigym_source,
             nkigym_func_name=func.__name__,
@@ -123,6 +123,4 @@ def remote_search(
         )
         for name, _ir, source in variants
     }
-    return remote_profile(
-        kernels=kernels, hosts=hosts, cache_dir=cache_dir, warmup=_WARMUP, iters=_ITERS, config=config
-    )
+    return remote_profile(kernels=kernels, hosts=hosts, cache_dir=cache_dir, config=config)

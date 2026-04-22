@@ -1,6 +1,7 @@
 """Per-group loop generation: one sibling block per fusion group."""
 
 from nkigym.kernel_ir import KernelIR
+from nkigym.kernel_ir.validate.emission import block_depth, body_depth, ltile_depth
 
 DepthPlan = dict[int, dict[int, list[str]]]
 
@@ -24,7 +25,7 @@ def _render_group(
     before_lines: dict[int, list[str]],
     after_lines: dict[int, list[str]],
 ) -> list[str]:
-    """Render one fusion group's full loop nest."""
+    """Render one fusion group's full loop nest as pair-interleaved ``(block, ltile)`` per dim."""
     context = ir.context
     group = ir.graph.groups[group_idx]
     dim_order = group.dim_order
@@ -42,24 +43,24 @@ def _render_group(
             lines.append("    " * (base_indent + depth) + line)
 
     inject(before_lines, 0)
-    for i, dim_id in enumerate(dim_order):
+    for pos, dim_id in enumerate(dim_order):
         di = context.dimensions[dim_id]
         num_blocks = di.dim_size // (tpb_by_dim[dim_id] * di.logical_tile_size)
-        lines.append("    " * (base_indent + i) + f"for i_block_{dim_id} in range({num_blocks}):")
-        inject(before_lines, i + 1)
+        b_depth = block_depth(pos)
+        lines.append("    " * (base_indent + b_depth) + f"for i_block_{dim_id} in range({num_blocks}):")
+        inject(before_lines, b_depth + 1)
+        l_depth = ltile_depth(pos)
+        lines.append("    " * (base_indent + l_depth) + f"for i_ltile_{dim_id} in range({tpb_by_dim[dim_id]}):")
+        inject(before_lines, l_depth + 1)
 
-    for i, dim_id in enumerate(dim_order):
-        lines.append("    " * (base_indent + n + i) + f"for i_ltile_{dim_id} in range({tpb_by_dim[dim_id]}):")
-        inject(before_lines, n + i + 1)
-
-    if n > 0 and not before_lines.get(2 * n):
-        lines.append("    " * (base_indent + 2 * n) + "pass")
+    body = body_depth(n)
+    if n > 0 and not before_lines.get(body):
+        lines.append("    " * (base_indent + body) + "pass")
     if n == 0 and not before_lines.get(0) and not after_lines.get(0):
         lines.append("    " * base_indent + "pass")
 
-    for i in reversed(range(n)):
-        inject(after_lines, n + i)
-    for i in reversed(range(n)):
-        inject(after_lines, i)
+    for pos in reversed(range(n)):
+        inject(after_lines, ltile_depth(pos))
+        inject(after_lines, block_depth(pos))
     lines.append("")
     return lines

@@ -1,7 +1,7 @@
 """KernelIR legality checks on the ``(context, graph)`` shape."""
 
 from nkigym.kernel_ir.ir import KernelIR
-from nkigym.kernel_ir.validate.emission import Placement, op_emission_placement
+from nkigym.kernel_ir.validate.emission import Placement, block_depth, body_depth, ltile_depth, op_emission_placement
 from nkigym.ops.base import NKIOp
 
 
@@ -95,7 +95,7 @@ def _group_feasibility_ok(ir: KernelIR, group_idx: int) -> bool:
 def _tensor_feasibility_ok(ir: KernelIR, group_idx: int, tensor_name: str, pos: dict[str, int], n: int) -> bool:
     """Intersection of per-dim depth ranges must be non-empty."""
     lo = 0
-    hi = 2 * n
+    hi = body_depth(n)
     placements = ir.graph.groups[group_idx].tensor_placements
     for d in ir.context.logical_tensors[tensor_name].dim_ids:
         if d not in pos:
@@ -113,11 +113,11 @@ def _tensor_feasibility_ok(ir: KernelIR, group_idx: int, tensor_name: str, pos: 
 def tier_depth_range(tier: str, pos: int, n: int) -> tuple[int, int]:
     """Allowed emission-depth range for a dim at ``pos`` under a given tier."""
     if tier == "per_tile":
-        rng = (n + pos + 1, 2 * n)
+        rng = (ltile_depth(pos) + 1, body_depth(n))
     elif tier == "per_block":
-        rng = (pos + 1, n + pos)
+        rng = (block_depth(pos) + 1, ltile_depth(pos))
     elif tier == "full":
-        rng = (0, pos)
+        rng = (0, block_depth(pos))
     else:
         raise ValueError(f"Unknown tier {tier!r}")
     return rng

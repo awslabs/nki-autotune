@@ -60,5 +60,5 @@ if __name__ == "__main__":
         num_variants=50,
         atol=1e-2,
         rtol=1e-2,
-        seed=0,
+        seed=3279,
     )

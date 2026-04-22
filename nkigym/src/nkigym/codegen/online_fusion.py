@@ -8,6 +8,7 @@ from nkigym.codegen.group_loops import DepthPlan
 from nkigym.codegen.sbuf_buffer import AxisAccess
 from nkigym.kernel_ir import KernelIR
 from nkigym.kernel_ir.rewrites.online_fusion_spec import AccumulatorSpec, ScaleSpec
+from nkigym.kernel_ir.validate.emission import block_depth
 from nkigym.ops.base import NKIOp
 from nkigym.ops.online_fusion_chain import NKIOnlineFusionChain
 
@@ -406,7 +407,7 @@ def _matmul_stationary_source(
 
 def _outermost_depth(ctx: _RenderContext, acc_dim: str) -> int:
     """Depth to emit running-state memsets — just before acc_dim's BLOCK loop opens."""
-    return ctx.dim_order.index(acc_dim)
+    return block_depth(ctx.dim_order.index(acc_dim))
 
 
 def _sbuf_body_access(ctx: _RenderContext, tensor_name: str, ptile_binding: dict[str, str] | None = None) -> str:

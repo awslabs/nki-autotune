@@ -135,12 +135,15 @@ def _launch_ssh_workers(
             job = kernels[n]
             payload["kernel_jobs"][n] = {
                 "source": job.source,
+                "func_name": job.func_name,
+                "output_shape": list(job.output_shape),
                 "tensor_specs": {name: (list(shape), dt) for name, (shape, dt) in job.input_specs.items()},
                 "nkigym_source": job.nkigym_source,
                 "nkigym_func_name": job.nkigym_func_name,
                 "mac_count": job.mac_count,
                 "atol": job.atol,
                 "rtol": job.rtol,
+                "neuronx_cc_args": list(job.neuronx_cc_args),
             }
         payload_bytes = json.dumps(payload).encode("utf-8")
 

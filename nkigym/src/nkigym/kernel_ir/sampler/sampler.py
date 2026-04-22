@@ -43,8 +43,10 @@ def sample_valid_ir(
     rebuild_edges(seed_graph, context)
     forced_full = _forced_full_pairs(context, seed_graph)
     op_to_group = {id(op): gi for gi, group in enumerate(seed_graph.groups) for op in group.ops}
+    divisor_choices = _enumerate_lpb_choices(context)
     for _ in range(max_tries):
-        dim_orders = [_rand_blocking_inner_perm(o, b, rng) for o, b in _group_axis_splits(context, seed_graph)]
+        iter_context = replace(context, ltiles_per_block={d: rng.choice(divisor_choices[d]) for d in divisor_choices})
+        dim_orders = [_rand_blocking_inner_perm(o, b, rng) for o, b in _group_axis_splits(iter_context, seed_graph)]
         new_groups: list[FusionGroup] = []
         for gi, old in enumerate(seed_graph.groups):
             new_groups.append(
@@ -52,15 +54,36 @@ def sample_valid_ir(
                     old,
                     dim_order=dim_orders[gi],
                     tensor_placements=_sample_group_placements(
-                        context, seed_graph, gi, dim_orders[gi], forced_full, rng
+                        iter_context, seed_graph, gi, dim_orders[gi], forced_full, rng
                     ),
                 )
             )
         candidate_graph = KernelGraph(groups=new_groups, edges=list(seed_graph.edges))
-        candidate_ir = KernelIR(context=context, graph=candidate_graph)
+        candidate_ir = KernelIR(context=iter_context, graph=candidate_graph)
         if validate(candidate_ir, op_to_group, staged):
             return candidate_ir
     raise RuntimeError(f"No valid IR found after {max_tries} samples")
+
+
+def _enumerate_lpb_choices(context: KernelContext) -> dict[str, list[int]]:
+    """Per-dim sorted divisors of ``dim_size // logical_tile_size`` — the legal ``ltiles_per_block`` set."""
+    return {d: _divisors(di.dim_size // di.logical_tile_size) for d, di in context.dimensions.items()}
+
+
+def _divisors(n: int) -> list[int]:
+    """Sorted positive divisors of ``n`` (O(sqrt(n)))."""
+    if n <= 0:
+        raise ValueError(f"divisors requires n >= 1, got {n}")
+    small: list[int] = []
+    large: list[int] = []
+    i = 1
+    while i * i <= n:
+        if n % i == 0:
+            small.append(i)
+            if i * i != n:
+                large.append(n // i)
+        i += 1
+    return small + large[::-1]
 
 
 def _apply_stochastic_merges(

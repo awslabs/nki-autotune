@@ -15,11 +15,11 @@ emits ``stage_block`` after its accumulation loops close.
 
 from nkigym.codegen.buffers import sbuf_buffer
 from nkigym.codegen.group_loops import DepthPlan
-from nkigym.codegen.sbuf_buffer import AxisAccess
+from nkigym.codegen.sbuf_buffer import AxisAccess, buffer_ident
 from nkigym.kernel_ir import KernelIR
 from nkigym.kernel_ir.context.context import TensorInfo
 from nkigym.kernel_ir.validate import tier_depth_range
-from nkigym.kernel_ir.validate.emission import material_blocking_dims
+from nkigym.kernel_ir.validate.emission import block_depth, body_depth, ltile_depth, material_blocking_dims
 from nkigym.ops.base import NKIOp
 
 _TIER_RANK = {"per_tile": 0, "per_block": 1, "full": 2}
@@ -37,7 +37,7 @@ def build_op_to_group(ir: KernelIR) -> dict[int, int]:
 def producer_finished_depth(ir: KernelIR, producer: NKIOp, dim_order: list[str]) -> tuple[int, set[str]]:
     """Return depth at which the producer op has finished all writes + its blocking dims."""
     blocking = ir.context.op_blocking_dims.get(producer, set()) & set(dim_order)
-    depth = min(dim_order.index(d) for d in blocking) if blocking else 2 * len(dim_order)
+    depth = block_depth(min(dim_order.index(d) for d in blocking)) if blocking else body_depth(len(dim_order))
     return depth, blocking
 
 
@@ -82,7 +82,7 @@ def dma_transpose_line(ir: KernelIR, op: NKIOp, group_idx: int, depth: int) -> s
     p_start, p_count, f_start, f_count = buf.range(p_access, f_access)
     input_tinfo = context.logical_tensors[hbm_name]
     mem_expr = f"{hbm_name}{_hbm_slice(ir, input_tinfo, dim_order, depth)}"
-    sbuf_arg = f"sbuf_{sbuf_name}"
+    sbuf_arg = f"sbuf_{buffer_ident(sbuf_name)}"
     return f"load_block({sbuf_arg}, {mem_expr}, {p_start}, {p_count}, {f_start}, {f_count}, transpose=True)"
 
 
@@ -117,7 +117,7 @@ def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[s
         material = material_blocking_dims(context, producer, dim_order)
         if not material:
             continue
-        producer_depth = min(dim_order.index(d) for d in material)
+        producer_depth = block_depth(min(dim_order.index(d) for d in material))
         tinfo = context.logical_tensors[tensor_name]
         line = _gadget_call(
             "stage_block", ir, gi, tensor_name, tinfo, dim_order, producer_depth, sbuf_is_dst=True, psum_src=True
@@ -201,7 +201,7 @@ def _gadget_call(
     buf = sbuf_buffer(ir, tensor_name)
     p_access, f_access = _axis_access(ir, group_idx, tensor_name, tinfo, dim_order, depth)
     p_start, p_count, f_start, f_count = buf.range(p_access, f_access)
-    sbuf_arg = f"sbuf_{tensor_name}"
+    sbuf_arg = f"sbuf_{buffer_ident(tensor_name)}"
     effective_hbm = hbm_name if hbm_name is not None else tensor_name
     mem_expr = _mem_expr(ir, effective_hbm, tinfo, dim_order, depth, psum_src)
     bounds = f"{p_start}, {p_count}, {f_start}, {f_count}"
@@ -233,9 +233,8 @@ def _scope_access(
     ltile: str | None = "0"
     if dim_id in dim_order:
         pos = dim_order.index(dim_id)
-        n = len(dim_order)
-        block = _bind(tier, "full", depth > pos, f"i_block_{dim_id}")
-        ltile = _bind(tier, "per_block", depth > n + pos, f"i_ltile_{dim_id}")
+        block = _bind(tier, "full", depth > block_depth(pos), f"i_block_{dim_id}")
+        ltile = _bind(tier, "per_block", depth > ltile_depth(pos), f"i_ltile_{dim_id}")
     return AxisAccess(block=block, ltile=ltile)
 
 
@@ -256,7 +255,7 @@ def _mem_expr(
 ) -> str:
     """Return the 2D HBM or PSUM argument expression passed to the gadget."""
     if psum_src:
-        expr = f"psum_{tensor_name}"
+        expr = f"psum_{buffer_ident(tensor_name)}"
     else:
         expr = f"{tensor_name}{_hbm_slice(ir, tinfo, dim_order, depth)}"
     return expr
@@ -280,9 +279,9 @@ def _hbm_axis_range(ir: KernelIR, dim_id: str, dim_order: list[str], depth: int)
     di = context.dimensions[dim_id]
     logical = di.logical_tile_size
     block_stride = context.ltiles_per_block.get(dim_id, 1) * logical
-    if dim_id not in dim_order or depth <= dim_order.index(dim_id):
+    if dim_id not in dim_order or depth <= block_depth(dim_order.index(dim_id)):
         rng = f"0:{di.dim_size}"
-    elif depth <= len(dim_order) + dim_order.index(dim_id):
+    elif depth <= ltile_depth(dim_order.index(dim_id)):
         start = f"i_block_{dim_id} * {block_stride}"
         rng = f"{start}:{start} + {block_stride}"
     else:

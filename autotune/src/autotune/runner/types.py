@@ -48,6 +48,11 @@ class KernelJob(NamedTuple):
 
     Attributes:
         source: NKI kernel source code string.
+        func_name: Name of the ``@nki.jit`` function inside ``source``.
+        output_shape: Shape of the kernel's HBM output tensor. Supplied
+            by the caller (traced once on the coordinator for
+            nkigym-generated kernels, hardcoded for reference kernels)
+            to avoid unreliable AST parsing on the worker.
         input_specs: Map of param name to (shape, dtype_str).
         nkigym_source: Source code of the nkigym math function; the
             worker executes it as the golden reference, running every
@@ -60,15 +65,25 @@ class KernelJob(NamedTuple):
             different fusion groups interleave).
         atol: Absolute tolerance for CPU sim vs golden comparison.
         rtol: Relative tolerance for CPU sim vs golden comparison.
+        neuronx_cc_args: Extra flags forwarded to neuronx-cc via
+            ``CompileOptions.set_pipeline_options(*args)``. Empty for
+            nkigym-generated kernels; hand-allocated reference kernels
+            (e.g. nkilib's ``attention_cte``) typically need
+            ``("enable-linear-scan-allocation=false",
+            "enable-instruction-scheduling=false")`` — equivalent to
+            nkilib's ``disable_backend_optimizations()``.
     """
 
     source: str
+    func_name: str
+    output_shape: tuple[int, ...]
     input_specs: dict[str, tuple[tuple[int, ...], str]]
     nkigym_source: str
     nkigym_func_name: str
     mac_count: int
     atol: float
     rtol: float
+    neuronx_cc_args: tuple[str, ...] = ()
 
 
 class CompileResult(NamedTuple):

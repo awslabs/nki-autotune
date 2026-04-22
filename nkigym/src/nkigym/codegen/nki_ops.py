@@ -13,10 +13,16 @@ from nkigym.codegen.dma import (
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.codegen.online_fusion import render_online_fusion_op
 from nkigym.codegen.reduction import apply_reduction_plan, reduced_outputs_with_multichunk, scratch_shape
-from nkigym.codegen.sbuf_buffer import AxisAccess
+from nkigym.codegen.sbuf_buffer import AxisAccess, buffer_ident
 from nkigym.kernel_ir import KernelIR
 from nkigym.kernel_ir.context.context import TensorInfo
-from nkigym.kernel_ir.validate.emission import Placement, material_blocking_dims, op_emission_placement
+from nkigym.kernel_ir.validate.emission import (
+    Placement,
+    block_depth,
+    ltile_depth,
+    material_blocking_dims,
+    op_emission_placement,
+)
 from nkigym.ops.base import NKIOp
 from nkigym.ops.dma import NKIDMATranspose, NKILoad, NKIStore
 from nkigym.ops.online_fusion_chain import NKIOnlineFusionChain
@@ -63,7 +69,7 @@ def _render_one_op(
         dim_order = ir.graph.groups[gi].dim_order
         placement = op_emission_placement(context, ir.graph, op, gi, op_to_group, staged, memo)
         reduced = reduced_outputs_with_multichunk(ir, op) if op_cls.ISA_LOC != "psum" else []
-        scratch_override = {r.role: f"{r.tensor_name}_chunk" for r in reduced}
+        scratch_override = {r.role: f"{buffer_ident(r.tensor_name)}_chunk" for r in reduced}
         block_lines = list(_render_op_block(ir, op, gi, staged, placement, scratch_override))
         if reduced:
             block_lines = apply_reduction_plan(ir, op, gi, reduced, placement, block_lines, before_plan)
@@ -116,7 +122,7 @@ def _apply_psum_plan(
             memset_lines.extend(_memset_lines(ir, oname))
     if material:
         i_min = min(dim_order.index(d) for d in material)
-        before_plan.setdefault(gi, {}).setdefault(i_min, []).extend(memset_lines)
+        before_plan.setdefault(gi, {}).setdefault(block_depth(i_min), []).extend(memset_lines)
     else:
         block_lines = memset_lines + block_lines
         block_lines.extend(_inline_stage_lines(ir, op, gi, dim_order, staged, placement))
@@ -140,9 +146,10 @@ def _memset_lines(ir: KernelIR, tensor_name: str) -> list[str]:
     tinfo = ir.context.logical_tensors[tensor_name]
     count = psum_tile_count(ir, tensor_name, tinfo)
     slice_expr = psum_tile_slice(ir, tensor_name, tinfo)
-    list_prefix = "" if count == 1 else f"[i_pt_{tensor_name}]"
-    body = f"nisa.memset(psum_{tensor_name}{list_prefix}{slice_expr}, 0.0)"
-    return [body] if count == 1 else [f"for i_pt_{tensor_name} in range({count}):", f"    {body}"]
+    ident = buffer_ident(tensor_name)
+    list_prefix = "" if count == 1 else f"[i_pt_{ident}]"
+    body = f"nisa.memset(psum_{ident}{list_prefix}{slice_expr}, 0.0)"
+    return [body] if count == 1 else [f"for i_pt_{ident} in range({count}):", f"    {body}"]
 
 
 def _render_op_block(
@@ -288,12 +295,12 @@ def _tile_start_expr(
     phys = di.physical_tile_size
     block_stride = logical * tpb
     terms: list[str] = []
-    n = len(dim_order)
+    _ = dim_order
     if dim_id in dim_order:
         pos = dim_order.index(dim_id)
-        if placement.loop_open(pos):
+        if placement.loop_open(block_depth(pos)):
             terms.append(f"i_block_{dim_id} * {block_stride}" if block_stride > 1 else f"i_block_{dim_id}")
-        if placement.loop_open(n + pos):
+        if placement.loop_open(ltile_depth(pos)):
             terms.append(f"i_ltile_{dim_id} * {logical}" if logical > 1 else f"i_ltile_{dim_id}")
     if dim_id in ptile_dims:
         terms.append(f"i_ptile_{dim_id} * {phys}" if phys > 1 else f"i_ptile_{dim_id}")
@@ -343,7 +350,7 @@ def _dst_exprs(
         if ax_name in overrides:
             tinfo = context.logical_tensors[oname]
             p, f = scratch_shape(context, tinfo)
-            result[ax_name] = f"sbuf_{overrides[ax_name]}[0:{p}, 0:{f}]"
+            result[ax_name] = f"sbuf_{buffer_ident(overrides[ax_name])}[0:{p}, 0:{f}]"
         else:
             tinfo = context.logical_tensors[oname]
             result[ax_name] = _access_expr(ir, group_idx, op, oname, tinfo, ptile_dims, is_psum, placement)
@@ -451,10 +458,9 @@ def _inner_body_access(
     ltile = "0"
     if dim_id in dim_order:
         pos = dim_order.index(dim_id)
-        n = len(dim_order)
-        if tier == "full" and placement.loop_open(pos):
+        if tier == "full" and placement.loop_open(block_depth(pos)):
             block = f"i_block_{dim_id}"
-        if tier in ("per_block", "full") and placement.loop_open(n + pos):
+        if tier in ("per_block", "full") and placement.loop_open(ltile_depth(pos)):
             ltile = f"i_ltile_{dim_id}"
     return AxisAccess(block=block, ltile=ltile, ptile=ptile)
 
@@ -463,7 +469,8 @@ def _psum_access(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, ptile_dims: 
     """Index expression into a PSUM allocation."""
     slice_expr = psum_tile_slice(ir, tensor_name, tinfo)
     list_idx = _psum_list_index(ir, tensor_name, tinfo, ptile_dims)
-    return f"psum_{tensor_name}{slice_expr}" if list_idx is None else f"psum_{tensor_name}[{list_idx}]{slice_expr}"
+    ident = buffer_ident(tensor_name)
+    return f"psum_{ident}{slice_expr}" if list_idx is None else f"psum_{ident}[{list_idx}]{slice_expr}"
 
 
 def _psum_list_index(ir: KernelIR, tensor_name: str, tinfo: TensorInfo, ptile_dims: set[str]) -> str | None:

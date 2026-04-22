@@ -40,8 +40,16 @@ class KernelGraph:
     edges: list[tuple[int, int, str, str]] = field(default_factory=list)
 
     def __repr__(self) -> str:
-        """Return summary string with group and edge counts."""
-        return f"KernelGraph({len(self.groups)} groups, {len(self.edges)} edges)"
+        """Return full group + edge detail for debugging."""
+        lines = [f"KernelGraph({len(self.groups)} groups, {len(self.edges)} edges)"]
+        for gi, group in enumerate(self.groups):
+            lines.append(f"  group {gi}:")
+            lines.extend(group.summary_lines(indent="    "))
+        if self.edges:
+            lines.append("  edges:")
+            for gp, gc, tensor, role in self.edges:
+                lines.append(f"    g{gp} -> g{gc}: {tensor} ({role})")
+        return "\n".join(lines)
 
     def op_index_of(self, op: NKIOp) -> tuple[int, int]:
         """Return ``(group_idx, local_idx)`` for ``op``. Raises if absent."""
