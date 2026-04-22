@@ -164,12 +164,24 @@ def apply_reduction_plan(
     for r in reduced:
         tinfo = context.logical_tensors[r.tensor_name]
         p, f = scratch_shape(context, tinfo)
-        top_lines.append(f"sbuf_{r.tensor_name}_chunk = nl.ndarray(({p}, {f}), dtype=nl.{tinfo.dtype}, buffer=nl.sbuf)")
+        chunk_dtype = _chunk_scratch_dtype(r.combinator, tinfo.dtype)
+        top_lines.append(f"sbuf_{r.tensor_name}_chunk = nl.ndarray(({p}, {f}), dtype=nl.{chunk_dtype}, buffer=nl.sbuf)")
         init_lines.extend(init_memset_lines(ir, gi, r, depth))
         running = _running_access(ir, gi, r, placement)
         chunk = f"sbuf_{r.tensor_name}_chunk[0:{p}, 0:{f}]"
         block_lines.append(combine_line(ir, r, chunk, running))
     return block_lines
+
+
+def _chunk_scratch_dtype(combinator: str, tensor_dtype: str) -> str:
+    """Return the scratch-buffer dtype for a per-chunk reduction output.
+
+    Hardware mandates ``float32`` for ``nisa.tensor_scalar.operand0``,
+    which is where the chunk gets plugged in when the combinator
+    is ``add``. Max / min use ``nisa.tensor_tensor`` which accepts
+    any dtype — those can inherit the running buffer's dtype.
+    """
+    return "float32" if combinator == "add" else tensor_dtype
 
 
 def _running_access(ir: KernelIR, group_idx: int, reduced: ReducedOutput, placement: Placement) -> str:

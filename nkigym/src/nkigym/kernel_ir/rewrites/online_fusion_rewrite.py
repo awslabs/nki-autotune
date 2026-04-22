@@ -386,6 +386,7 @@ def _reassemble(
                     dim_order=list(group.dim_order),
                     buffer_degrees=dict(group.buffer_degrees),
                     tensor_placements=dict(group.tensor_placements),
+                    skip_spec=group.skip_spec,
                 )
             )
     if not inserted:

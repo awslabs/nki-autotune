@@ -112,6 +112,7 @@ class LoadTransposePattern:
                         dim_order=list(group.dim_order),
                         buffer_degrees=dict(group.buffer_degrees),
                         tensor_placements=dict(group.tensor_placements),
+                        skip_spec=group.skip_spec,
                     )
                 )
         new_graph = KernelGraph(groups=keep)

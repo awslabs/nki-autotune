@@ -27,6 +27,7 @@ from nkigym.kernel_ir.context.trace import trace_scalar_kwargs
 from nkigym.kernel_ir.graph.fusion_group import FusionGroup
 from nkigym.kernel_ir.graph.graph import KernelGraph, insert_dma_nodes, rebuild_edges
 from nkigym.kernel_ir.ir import KernelIR
+from nkigym.kernel_ir.rewrites.compute_skip_pattern import ComputeSkipPattern
 from nkigym.kernel_ir.rewrites.load_transpose_pattern import LoadTransposePattern
 from nkigym.kernel_ir.rewrites.merge_composites import MergeComposites
 from nkigym.kernel_ir.rewrites.online_fusion_pattern import OnlineFusionPattern
@@ -41,7 +42,9 @@ graphs (each rewrite has O(1) or O(N) matches and terminates in
 a handful of applies). The outer layer of hierarchical sampling
 picks uniformly among them.
 """
-GRAPH_REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [OnlineFusionPattern(), LoadTransposePattern()])
+GRAPH_REWRITES: list[PatternRewrite] = cast(
+    list[PatternRewrite], [OnlineFusionPattern(), LoadTransposePattern(), ComputeSkipPattern()]
+)
 
 """Merge rewrite — applied stochastically per-draw in the inner sampler.
 
