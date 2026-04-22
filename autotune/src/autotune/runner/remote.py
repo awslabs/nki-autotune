@@ -270,9 +270,16 @@ def _write_results_json(
 ) -> None:
     """Write results.json with metrics and per-kernel data."""
     successes: list[tuple[ProfileResult, float, float]] = []
+    passed_cpu_sim = success = 0
     for r in results:
-        if r.hardware_output.startswith("[") and r.min_ms is not None and r.mfu is not None:
+        sim_ok = bool(r.cpu_sim.get("passed"))
+        hw_ok = r.min_ms is not None and r.mfu is not None
+        if r.min_ms is not None and r.mfu is not None:
             successes.append((r, r.min_ms, r.mfu))
+        if sim_ok:
+            passed_cpu_sim += 1
+        if sim_ok and hw_ok:
+            success += 1
     times = [t for _, t, _ in successes]
     mfus = [m for _, _, m in successes]
 
@@ -295,6 +302,8 @@ def _write_results_json(
             "worst_kernel": worst_kernel,
             "best_mfu": max(mfus) if mfus else None,
             "worst_mfu": min(mfus) if mfus else None,
+            "passed_cpu_sim": passed_cpu_sim,
+            "success": success,
         },
         "kernels": kernel_entries,
     }
