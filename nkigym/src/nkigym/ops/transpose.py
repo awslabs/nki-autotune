@@ -34,15 +34,17 @@ class NKITranspose(NKIOp):
     PSUM_DTYPE: ClassVar[str | None] = None
     INPUT_LOCS: ClassVar[dict[str, str]] = {"data": "sbuf"}
 
-    def __call__(self, data: np.ndarray, **_: object) -> np.ndarray:
+    def __call__(self, **kwargs: object) -> np.ndarray:
         """CPU simulation: data.T.
 
-        Args:
+        Kwargs:
             data: Array of shape (P, F).
 
         Returns:
             Transposed array of shape (F, P).
         """
+        data = kwargs["data"]
+        assert isinstance(data, np.ndarray), "NKITranspose expects ndarray data"
         return data.T
 
     @classmethod
@@ -51,3 +53,9 @@ class NKITranspose(NKIOp):
     ) -> str:
         """Format nisa.nc_transpose(dst, data)."""
         return f"nisa.nc_transpose({dst_expr}, {operand_exprs['data']})"
+
+    @classmethod
+    def propagate_mask_value(cls, op_kwargs: dict[str, str], input_value: float) -> float | None:
+        """Transpose is value-preserving; pass the scalar through."""
+        _ = op_kwargs
+        return input_value

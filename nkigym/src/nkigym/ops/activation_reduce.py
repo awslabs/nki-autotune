@@ -8,6 +8,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from nkigym.ops.activation import apply_unary_mask, parse_scale_literal
 from nkigym.ops.base import NKIOp
 
 _ACT_FNS: dict[str, Any] = {"exp": np.exp, "tanh": np.tanh, "square": np.square, "reciprocal": lambda x: 1.0 / x}
@@ -80,3 +81,25 @@ class NKIActivationReduce(NKIOp):
             f"nisa.activation_reduce({dst_expr}, {op_arg}, {operand_exprs['data']}, "
             f"{reduce_op}, {reduce_res}{bias_part}{extra})"
         )
+
+    @classmethod
+    def propagate_mask_value(cls, op_kwargs: dict[str, str], input_value: float) -> float | None:
+        """Apply ``op(input * scale + bias)`` element-wise (reducer semantics checked separately).
+
+        ``bias`` is typically a per-partition tensor of finite
+        values. For saturating inputs like ``±inf``, adding a
+        finite bias can't change the result — we can safely
+        propagate. For finite inputs with unknown bias we return
+        ``None`` (not analyzable).
+        """
+        result: float | None = None
+        scale = parse_scale_literal(op_kwargs.get("scale", "1.0"))
+        if scale is not None:
+            scaled = input_value * scale
+            if "bias" in op_kwargs and not (scaled == float("inf") or scaled == float("-inf")):
+                result = None
+            else:
+                raw_op = op_kwargs.get("op", "'copy'")
+                op_name = raw_op[1:-1] if raw_op.startswith("'") and raw_op.endswith("'") else raw_op
+                result = apply_unary_mask(op_name, scaled)
+        return result

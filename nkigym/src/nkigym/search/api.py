@@ -106,11 +106,11 @@ def remote_search(
         ProfileOutput with per-variant timing and correctness.
     """
     rng = random.Random(seed)
-    ctx, graph_variants = build_context_and_variants(func, input_specs)
+    naive_ctx, naive_graph, ctx, graph_variants = build_context_and_variants(func, input_specs)
     mac_count = compute_mac_count(func, input_specs)
     nkigym_source = _func_source_with_imports(func)
     cache_path = Path(cache_dir)
-    variants = sample_variants(ctx, graph_variants, num_variants, rng, cache_dir=cache_path)
+    variants = sample_variants(naive_ctx, naive_graph, ctx, graph_variants, num_variants, rng, cache_dir=cache_path)
     kernels: dict[str, KernelJob] = {
         f"{name}.py": KernelJob(
             source=source,

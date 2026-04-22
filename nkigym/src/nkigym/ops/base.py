@@ -125,3 +125,19 @@ class NKIOp:
         """
         result = f"nl.{value[1:-1]}" if value.startswith("'") and value.endswith("'") else value
         return result
+
+    @classmethod
+    def propagate_mask_value(cls, op_kwargs: dict[str, str], input_value: float) -> float | None:
+        """Return the scalar output for a uniform-constant scalar input, or ``None`` if not analyzable.
+
+        Used by ``propagate_compute_skip`` to carry the mask
+        sentinel through elementwise ops so the final value at a
+        reducer boundary can be checked against the reducer's
+        identity. Default: ``None`` — the compute-skip
+        propagation stops at this op (memset fallback fires on
+        the upstream boundary tensor). Elementwise ops whose
+        output is a pure scalar function of the input override
+        this.
+        """
+        _ = op_kwargs, input_value
+        return None

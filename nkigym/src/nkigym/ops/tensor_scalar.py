@@ -76,3 +76,55 @@ class NKITensorScalar(NKIOp):
         """Format nisa.tensor_scalar(dst, data, ...)."""
         extra = cls._format_scalar_kwargs(scalar_kwargs, set(cls.OPERAND_AXES))
         return f"nisa.tensor_scalar({dst_expr}, {operand_exprs['data']}{extra})"
+
+    @classmethod
+    def propagate_mask_value(cls, op_kwargs: dict[str, str], input_value: float) -> float | None:
+        """Apply ``(input <op0> operand0) <op1> operand1`` at the scalar level.
+
+        Returns ``None`` if any operand is tensor-valued (we can't
+        resolve per-partition scales at propagation time) or if
+        the op name isn't in the supported-literal set.
+        """
+        chain_ops = [("op0", "operand0"), ("op1", "operand1")]
+        current: float | None = input_value
+        for op_name_key, operand_key in chain_ops:
+            if op_name_key not in op_kwargs or op_kwargs[op_name_key] is None:
+                continue
+            raw_op = op_kwargs[op_name_key]
+            op_name = raw_op[1:-1] if raw_op.startswith("'") and raw_op.endswith("'") else raw_op
+            operand_raw = op_kwargs.get(operand_key)
+            operand = _parse_scalar_literal(operand_raw)
+            if operand is None or current is None:
+                current = None
+                break
+            reverse = op_kwargs.get(op_name_key.replace("op", "reverse")) == "True"
+            current = _apply_binary(op_name, current, operand, reverse)
+            if current is None:
+                break
+        return current
+
+
+def _parse_scalar_literal(raw: str | None) -> float | None:
+    """Parse a Python-literal scalar source string to ``float``; ``None`` if not a literal."""
+    result: float | None = None
+    if raw is None:
+        result = None
+    elif raw.startswith("np.float"):
+        inner = raw[raw.find("(") + 1 : raw.rfind(")")]
+        try:
+            result = float(inner)
+        except ValueError:
+            result = None
+    else:
+        try:
+            result = float(raw)
+        except ValueError:
+            result = None
+    return result
+
+
+def _apply_binary(op_name: str, lhs: float, rhs: float, reverse: bool) -> float | None:
+    """Evaluate ``op_name`` on two scalars; ``None`` if ``op_name`` is unsupported."""
+    a, b = (rhs, lhs) if reverse else (lhs, rhs)
+    mapping: dict[str, Any] = {"add": a + b, "subtract": a - b, "multiply": a * b}
+    return mapping.get(op_name)

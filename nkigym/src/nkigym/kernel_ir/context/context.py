@@ -21,6 +21,7 @@ on ``KernelGraph`` / ``FusionGroup``.
 from dataclasses import dataclass, field
 from enum import Enum
 
+from nkigym.kernel_ir.compute_skip_spec import SkipPredicate
 from nkigym.ops.base import NKIOp
 
 
@@ -118,6 +119,7 @@ class KernelContext:
     op_axis_map: dict[NKIOp, dict[str, str]] = field(default_factory=dict)
     op_tile_sizes: dict[NKIOp, dict[str, int]] = field(default_factory=dict)
     op_blocking_dims: dict[NKIOp, set[str]] = field(default_factory=dict)
+    op_skip_spec: dict[NKIOp, SkipPredicate] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         """Render full KernelContext detail for debugging."""

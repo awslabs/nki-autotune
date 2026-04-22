@@ -1,6 +1,5 @@
 """Pattern-rewrite driver + every registered pattern."""
 
-from nkigym.kernel_ir.rewrites.compute_skip_pattern import ComputeSkipPattern
 from nkigym.kernel_ir.rewrites.load_transpose_pattern import LoadTransposePattern
 from nkigym.kernel_ir.rewrites.online_fusion_pattern import OnlineFusionPattern
 from nkigym.kernel_ir.rewrites.pattern_rewrite import (
@@ -11,7 +10,6 @@ from nkigym.kernel_ir.rewrites.pattern_rewrite import (
 )
 
 __all__ = [
-    "ComputeSkipPattern",
     "LoadTransposePattern",
     "MatchInstance",
     "OnlineFusionPattern",

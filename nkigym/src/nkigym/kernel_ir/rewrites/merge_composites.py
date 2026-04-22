@@ -51,15 +51,14 @@ class MergeComposites:
         """Merge groups ``lo`` and ``hi`` into one; keep all others unchanged."""
         raw_ops = list(graph.groups[instance.lo].ops) + list(graph.groups[instance.hi].ops)
         merged_ops = _toposort_ops(context, raw_ops)
-        merged_skip_spec = graph.groups[instance.lo].skip_spec or graph.groups[instance.hi].skip_spec
         new_groups: list[FusionGroup] = []
         for gi, grp in enumerate(graph.groups):
             if gi == instance.lo:
-                new_groups.append(FusionGroup(ops=merged_ops, skip_spec=merged_skip_spec))
+                new_groups.append(FusionGroup(ops=merged_ops))
             elif gi == instance.hi:
                 continue
             else:
-                new_groups.append(FusionGroup(ops=list(grp.ops), skip_spec=grp.skip_spec))
+                new_groups.append(FusionGroup(ops=list(grp.ops)))
         new_graph = KernelGraph(groups=new_groups)
         rebuild_edges(new_graph, context)
         return context, new_graph

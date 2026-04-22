@@ -348,6 +348,7 @@ def _reassemble(
     new_op_axis_map = {op: v for op, v in context.op_axis_map.items() if op not in absorbed}
     new_op_tile_sizes = {op: v for op, v in context.op_tile_sizes.items() if op not in absorbed}
     new_op_blocking_dims = {op: v for op, v in context.op_blocking_dims.items() if op not in absorbed}
+    new_op_skip_spec = {op: v for op, v in context.op_skip_spec.items() if op not in absorbed}
 
     new_op_inputs[composite_op] = composite_inputs
     new_op_outputs[composite_op] = composite_outputs
@@ -355,6 +356,9 @@ def _reassemble(
     new_op_axis_map[composite_op] = composite_axis_map
     new_op_tile_sizes[composite_op] = composite_tile_sizes
     new_op_blocking_dims[composite_op] = {candidate.blocking_dim}
+    inherited_predicate = next((context.op_skip_spec[op] for op in absorbed if op in context.op_skip_spec), None)
+    if inherited_predicate is not None:
+        new_op_skip_spec[composite_op] = inherited_predicate
 
     new_dims = dict(context.dimensions)
     new_dims[candidate.blocking_dim] = replace(new_dims[candidate.blocking_dim], role=DimRole.ACCUMULATION)
@@ -370,6 +374,7 @@ def _reassemble(
         op_axis_map=new_op_axis_map,
         op_tile_sizes=new_op_tile_sizes,
         op_blocking_dims=new_op_blocking_dims,
+        op_skip_spec=new_op_skip_spec,
     )
 
     survivors: list[FusionGroup] = []
@@ -386,7 +391,6 @@ def _reassemble(
                     dim_order=list(group.dim_order),
                     buffer_degrees=dict(group.buffer_degrees),
                     tensor_placements=dict(group.tensor_placements),
-                    skip_spec=group.skip_spec,
                 )
             )
     if not inserted:

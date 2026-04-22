@@ -1,7 +1,7 @@
 """NKI op rendering: ISA calls + PSUM memsets."""
 
 from nkigym.codegen.buffers import producer_op, producer_op_tiles, psum_tile_count, psum_tile_slice, sbuf_buffer
-from nkigym.codegen.compute_skip import record_op_delta, snapshot_before_lengths, wrap_skip_groups
+from nkigym.codegen.compute_skip import record_op_delta, snapshot_before_lengths, wrap_annotated_ops
 from nkigym.codegen.dma import (
     dma_load_line,
     dma_store_line,
@@ -26,9 +26,8 @@ def render_nki_ops(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) 
     """Plan ISA calls, per-op stages, and PSUM memsets.
 
     Tracks which lines each op contributes to ``before_plan`` via
-    a per-op delta record so ``wrap_skip_groups`` can split the
-    innermost-body lines of ``skip_spec``-annotated groups into
-    the three-state classifier branches.
+    a per-op delta record so ``wrap_annotated_ops`` can replace
+    each annotated op's lines with a three-state classifier.
     """
     before_plan: DepthPlan = {}
     after_plan: DepthPlan = {}
@@ -39,7 +38,7 @@ def render_nki_ops(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) 
             baseline = snapshot_before_lengths(before_plan, gi)
             _render_one_op(ir, op, gi, op_to_group, staged, memo, before_plan, after_plan)
             record_op_delta(before_plan, gi, baseline, op, per_op_lines)
-    wrap_skip_groups(ir, before_plan, after_plan, per_op_lines)
+    wrap_annotated_ops(ir, before_plan, per_op_lines)
     return before_plan, after_plan
 
 

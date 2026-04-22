@@ -21,13 +21,14 @@ from typing import cast
 
 import numpy as np
 
+from nkigym.kernel_ir.compute_skip_prop import propagate_compute_skip
+from nkigym.kernel_ir.compute_skip_spec import SkipPredicate
 from nkigym.kernel_ir.context.context import DimInfo, DimRole, KernelContext, TensorInfo
 from nkigym.kernel_ir.context.parse import find_ops
 from nkigym.kernel_ir.context.trace import trace_scalar_kwargs
 from nkigym.kernel_ir.graph.fusion_group import FusionGroup
 from nkigym.kernel_ir.graph.graph import KernelGraph, insert_dma_nodes, rebuild_edges
 from nkigym.kernel_ir.ir import KernelIR
-from nkigym.kernel_ir.rewrites.compute_skip_pattern import ComputeSkipPattern
 from nkigym.kernel_ir.rewrites.load_transpose_pattern import LoadTransposePattern
 from nkigym.kernel_ir.rewrites.merge_composites import MergeComposites
 from nkigym.kernel_ir.rewrites.online_fusion_pattern import OnlineFusionPattern
@@ -42,9 +43,7 @@ graphs (each rewrite has O(1) or O(N) matches and terminates in
 a handful of applies). The outer layer of hierarchical sampling
 picks uniformly among them.
 """
-GRAPH_REWRITES: list[PatternRewrite] = cast(
-    list[PatternRewrite], [OnlineFusionPattern(), LoadTransposePattern(), ComputeSkipPattern()]
-)
+GRAPH_REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [OnlineFusionPattern(), LoadTransposePattern()])
 
 """Merge rewrite — applied stochastically per-draw in the inner sampler.
 
@@ -291,19 +290,32 @@ def build_initial(
 
 def build_context_and_variants(
     func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]
-) -> tuple[KernelContext, list[KernelGraph]]:
-    """Return ``(context, variants)`` after enumerating every reachable graph.
+) -> tuple[KernelContext, KernelGraph, KernelContext, list[KernelGraph]]:
+    """Return the naive baseline + the full variant set for stochastic sampling.
 
-    Each rewrite creates new composite op instances and drops the
-    absorbed ones; per-op dicts on each variant's ``KernelContext``
-    hold only the ops that variant's graph contains. Downstream
-    codegen takes one ``(context, graph)`` pair at a time, so we
-    merge every variant's per-op data into a single
-    ``shared_ctx`` — op-instance keys never collide across
-    variants, and this keeps the caller's signature simple.
+    The pipeline is:
+
+    1. ``build_initial`` + ``insert_dma_nodes`` → **naive context + graph**.
+       Returned directly as the first two results. Used to emit
+       ``kernel_0`` — the raw operator graph with ``NKIAffineSelect``
+       still present, no compute-skip annotations, no rewrites, no
+       merges. Serves as a baseline for before/after comparison.
+    2. ``propagate_compute_skip`` → mandatory pre-pass that lifts
+       every ``NKIAffineSelect`` into per-op ``SkipPredicate``
+       annotations and removes the standalone op. Runs BEFORE any
+       graph rewrite; masking is treated as mandatory, not a
+       sampled choice.
+    3. ``enumerate_graph_variants`` with ``GRAPH_REWRITES`` (online
+       fusion + load-transpose) on the propagated graph. The
+       sampled-from set returned as ``(shared_ctx, variants)``.
+
+    Returns:
+        ``(naive_ctx, naive_graph, sampled_ctx, sampled_variants)``.
     """
     context, graph = build_initial(func, input_specs)
     context, graph = insert_dma_nodes(context, graph)
+    naive_ctx, naive_graph = context, graph
+    context, graph = propagate_compute_skip(context, graph)
     pairs = enumerate_graph_variants(context, graph, GRAPH_REWRITES)
     if pairs:
         shared_ctx = _merge_contexts([c for c, _g in pairs])
@@ -311,7 +323,7 @@ def build_context_and_variants(
     else:
         shared_ctx = context
         variants = [graph]
-    return shared_ctx, variants
+    return naive_ctx, naive_graph, shared_ctx, variants
 
 
 def _merge_contexts(contexts: list[KernelContext]) -> KernelContext:
@@ -325,6 +337,7 @@ def _merge_contexts(contexts: list[KernelContext]) -> KernelContext:
     op_axis_map: dict[NKIOp, dict[str, str]] = {}
     op_tile_sizes: dict[NKIOp, dict[str, int]] = {}
     op_blocking_dims: dict[NKIOp, set[str]] = {}
+    op_skip_spec: dict[NKIOp, SkipPredicate] = {}
     logical_tensors: dict[str, TensorInfo] = {}
     for ctx in contexts:
         op_inputs.update(ctx.op_inputs)
@@ -333,6 +346,7 @@ def _merge_contexts(contexts: list[KernelContext]) -> KernelContext:
         op_axis_map.update(ctx.op_axis_map)
         op_tile_sizes.update(ctx.op_tile_sizes)
         op_blocking_dims.update(ctx.op_blocking_dims)
+        op_skip_spec.update(ctx.op_skip_spec)
         logical_tensors.update(ctx.logical_tensors)
     return KernelContext(
         func_name=base.func_name,
@@ -348,6 +362,7 @@ def _merge_contexts(contexts: list[KernelContext]) -> KernelContext:
         op_axis_map=op_axis_map,
         op_tile_sizes=op_tile_sizes,
         op_blocking_dims=op_blocking_dims,
+        op_skip_spec=op_skip_spec,
     )
 
 
@@ -355,7 +370,7 @@ def build_ir(
     func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], seed: int | None = None
 ) -> KernelIR:
     """Convenience: build context + pick last variant + sample one valid state."""
-    context, variants = build_context_and_variants(func, input_specs)
+    _naive_ctx, _naive_graph, context, variants = build_context_and_variants(func, input_specs)
     rng = random.Random(seed)
     seed_ir = KernelIR(context=context, graph=variants[-1])
     return sample_valid_ir(seed_ir, rng, merge_rewrites=MERGE_REWRITES)

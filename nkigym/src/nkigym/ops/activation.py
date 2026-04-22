@@ -4,6 +4,7 @@ output = op(data * scale + bias).
 Applies unary activation element-wise.
 """
 
+import math
 from typing import Any, ClassVar
 
 import numpy as np
@@ -74,3 +75,53 @@ class NKIActivation(NKIOp):
         bias_part = f", bias={operand_exprs['bias']}" if "bias" in operand_exprs else ""
         extra = cls._format_scalar_kwargs(sk, set(cls.OPERAND_AXES) | {"op"})
         return f"nisa.activation({dst_expr}, {op_arg}, {operand_exprs['data']}{bias_part}{extra})"
+
+    @classmethod
+    def propagate_mask_value(cls, op_kwargs: dict[str, str], input_value: float) -> float | None:
+        """Apply ``op(data * scale + bias)`` at the scalar level.
+
+        ``bias`` is a tensor whose runtime values are unknown; for
+        saturating inputs (``±inf``) the bias can't change the
+        result so we propagate through, otherwise we give up.
+        """
+        result: float | None = None
+        scale = parse_scale_literal(op_kwargs.get("scale", "1.0"))
+        if scale is not None:
+            scaled = input_value * scale
+            if "bias" in op_kwargs and not (scaled == float("inf") or scaled == float("-inf")):
+                result = None
+            else:
+                raw_op = op_kwargs.get("op", "'copy'")
+                op_name = raw_op[1:-1] if raw_op.startswith("'") and raw_op.endswith("'") else raw_op
+                result = apply_unary_mask(op_name, scaled)
+        return result
+
+
+def parse_scale_literal(raw: str) -> float | None:
+    """Parse the ``scale`` kwarg source to a float; ``None`` if it's a tensor reference."""
+    result: float | None = None
+    if raw.startswith("np."):
+        inner = raw[raw.find("(") + 1 : raw.rfind(")")]
+        try:
+            result = float(inner)
+        except ValueError:
+            result = None
+    else:
+        try:
+            result = float(raw)
+        except ValueError:
+            result = None
+    return result
+
+
+def apply_unary_mask(op_name: str, x: float) -> float | None:
+    """Evaluate a supported unary op on a scalar; ``None`` for unsupported names."""
+    mapping: dict[str, float | None] = {
+        "exp": math.exp(x) if x > -700 else 0.0,
+        "tanh": math.tanh(x),
+        "square": x * x,
+        "reciprocal": None if x == 0.0 else 1.0 / x,
+        "rsqrt": None if x <= 0.0 else 1.0 / math.sqrt(x),
+        "copy": x,
+    }
+    return mapping.get(op_name)
