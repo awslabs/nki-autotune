@@ -6,12 +6,10 @@
 |---|---|---|
 | 1. Header | `codegen/header.py` | `header.md` |
 | 2. Buffers | `codegen/buffers.py` | `tensor_buffers.md` |
-| 3. Loop nests | `codegen/group_loops.py` | `kernel_ir/loopnest.md` |
+| 3. Loop nests | `codegen/group_loops.py` | `loopnest.md` |
 | 4. DMA (HBM↔SBUF, PSUM→SBUF) | `codegen/dma.py` | `dma.md` |
 | 5. NKI ops (ISA + memset) | `codegen/nki_ops.py` | `nki_ops.md` |
+| 6. Online fusion composites | `codegen/online_fusion.py` | `../kernel_ir/rewrites/online_fusion.md` |
+| 7. Multi-chunk reductions | `codegen/reduction.py` | — |
 
-Each fusion group emits its own complete loop nest as a sibling block over `group_dim_orders[group_idx]` — no DP-outermost wrapper. DMA and staging positions are injected at derived depths within each group's nest via `render_group_loops`' `before_plan` / `after_plan` hooks.
-
-## Current `render_ir` scope
-
-Enabled: §1 Header, §2 Buffers, §3 Loop nests, §4 DMA (loads, PSUM→SBUF staging, SBUF→HBM store). Not yet enabled: §5 ISA calls and memset — loop bodies currently hold a `pass` placeholder.
+Each fusion group emits its own complete loop nest as a sibling block over ``ir.graph.groups[gi].dim_order`` — no DP-outermost wrapper. DMA and staging positions are injected at derived depths within each group's nest via ``render_group_loops``' ``before_plan`` / ``after_plan`` hooks.

@@ -60,7 +60,7 @@ PSUM allocation keeps the existing flat-2D model: one `nl.ndarray((phys_P, phys_
 
 ### Placement in the Emitted Source
 
-*Where* in the loop nest each allocation sits is decided by the allocation-depth logic in `kernel_ir/load_placement.md`. In the default lowering (all `per_tile`, all degrees 1), every tensor's allocation sits at the top of its owning fusion group's loop nest. This section specifies *what* to allocate; the render pass decides *where*.
+*Where* in the loop nest each allocation sits is decided by the allocation-depth logic in ``kernel_ir/sampler/load_placement.md``. In the default lowering (all ``per_tile``, all degrees 1), every tensor's allocation sits at the top of its owning fusion group's loop nest. This section specifies *what* to allocate; the render pass decides *where*.
 
 ### Access
 

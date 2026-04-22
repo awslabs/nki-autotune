@@ -34,7 +34,7 @@ The op's output goes to `psum_{name}` or `sbuf_{name}` based on its own `ISA_LOC
 
 ### Tensor Indexing
 
-Each operand is indexed into its buffer using the op's own tile size (from `dim_analysis.op_tile_sizes[op_idx]`). Buffers use physical tile sizes with `num_ptiles_per_ltile` folded into `num_tiles`. Ops slice the buffer and reshape to their own tile size:
+Each operand is indexed into its buffer using the op's own tile size (from ``context.op_tile_sizes[op]``). Buffers use physical tile sizes with ``num_ptiles_per_ltile`` folded into ``num_tiles``. Ops slice the buffer and reshape to their own tile size:
 
 - `op_tile == physical_tile` → one slot, trivial reshape
 - `op_tile > physical_tile` → multi-slot `[0:physical_tile, 0:n, ...]`, reshape to `(op_tile_p, op_tile_f)`
@@ -60,7 +60,7 @@ for i_block_d0 in range(16):
                 for i_ltile_d1 in range(1):
                     for i_ltile_d2 in range(1):
                         nisa.nc_matmul(psum_S[...], sbuf_Q_t[...], sbuf_K_t[...])
-    stage_tensor_block(sbuf_S, psum_S)
+    stage_block(sbuf_S, psum_S, ...)
 ```
 
 ### Example: Attention Group 0 (nc_transpose, non-blocking)
@@ -77,5 +77,5 @@ for i_block_d0 in range(16):
         for i_ltile_d0 in range(1):
             for i_ltile_d1 in range(1):
                 nisa.nc_transpose(psum_Q_t[...], sbuf_Q[...])
-                stage_tensor_block(sbuf_Q_t, psum_Q_t)
+                stage_block(sbuf_Q_t, psum_Q_t, ...)
 ```

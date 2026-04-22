@@ -22,7 +22,7 @@ Per-ptile staging inside an op's ptile loop (where the PSUM holds just one physi
 
 ### Loads
 
-Each HBM input tensor `t` in `dim_analysis.param_names` is loaded exactly once. The owning group is the one containing the earliest op (smallest `op_idx`) that reads `t`. The load depth comes from `tensor_placements[(t, d)]` on each of `t`'s dims:
+Each HBM input tensor ``t`` in ``context.param_names`` is loaded exactly once via an ``NKILoad`` node inserted at build time by ``insert_dma_nodes`` (``kernel_ir/graph/graph.py``). The renderer dispatches ``NKILoad`` to ``dma_load_line`` at the op's own emission slot inside its group. The load depth comes from ``tensor_placements[("sbuf", <sbuf_alias>, d)]`` on each of the Load output's dims:
 
 - `per_tile` — inside both `d`'s block and ltile loops (deepest).
 - `per_block` — inside `d`'s block loop, outside its ltile loop.

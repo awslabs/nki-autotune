@@ -9,8 +9,10 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
-from nkigym.codegen.gadgets import load_tensor_block, stage_tensor_block, store_tensor_block
+from typing import Any
 ```
+
+DMA gadgets (`load_block`, `stage_block`, `store_block`) are inlined into the emitted source from a module-level constant (``codegen/nki_ops.py::_INLINED_GADGETS``) — the worker compiles each variant as a standalone file with no nkigym runtime dependency.
 
 **Decorator and signature.** `@nki.jit` decorator, then `def {func_name}({param_names}):` where `func_name` and `param_names` are read from KernelIR.
 
