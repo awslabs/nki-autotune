@@ -1,4 +1,4 @@
-"""RMSNorm + matmul: remote search over sampled KernelIR variants.
+"""RMSNorm + matmul: remote search over sampled KernelContext variants.
 
 Math: RMSNorm(a) @ b = (a / sqrt(mean(a^2) + eps)) @ b
 

@@ -54,7 +54,7 @@ class KernelJob(NamedTuple):
             ``NKIOp`` through its numpy ``__call__``.
         nkigym_func_name: Name of the nkigym math function within
             ``nkigym_source``.
-        mac_count: Theoretical MAC count, derived from the KernelIR
+        mac_count: Theoretical MAC count, derived from the KernelContext
             on the coordinator. Avoids AST scans of the rendered
             kernel (which misattribute trip counts when loops from
             different fusion groups interleave).
@@ -81,15 +81,20 @@ class CompileResult(NamedTuple):
 
 
 class ProfileResult(NamedTuple):
-    """Benchmark result for a single kernel."""
+    """Benchmark result for a single kernel.
+
+    Timing fields are ``None`` for kernels that failed CPU sim, compile, or
+    hardware execution — a failed kernel produced no valid measurement and
+    reporting zeros would be misleading.
+    """
 
     kernel_name: str
-    min_ms: float
-    mean_ms: float
-    p50_ms: float
-    p99_ms: float
+    min_ms: float | None
+    mean_ms: float | None
+    p50_ms: float | None
+    p99_ms: float | None
     mac_count: int
-    mfu: float
+    mfu: float | None
     cpu_sim: dict
     hardware_output: str
 
@@ -122,15 +127,15 @@ def _sim_not_run() -> dict:
 
 
 def make_failure(kernel_name: str, hardware_output: str, mac_count: int, cpu_sim: dict | None = None) -> ProfileResult:
-    """Create a failed ProfileResult."""
+    """Create a failed ProfileResult with null timing fields."""
     return ProfileResult(
         kernel_name=kernel_name,
-        min_ms=0.0,
-        mean_ms=0.0,
-        p50_ms=0.0,
-        p99_ms=0.0,
+        min_ms=None,
+        mean_ms=None,
+        p50_ms=None,
+        p99_ms=None,
         mac_count=mac_count,
-        mfu=0.0,
+        mfu=None,
         cpu_sim=cpu_sim if cpu_sim is not None else _sim_not_run(),
         hardware_output=hardware_output,
     )

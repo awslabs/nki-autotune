@@ -39,6 +39,7 @@ class NKIActivationReduce(NKIOp):
     PSUM_DTYPE: ClassVar[str | None] = None
     INPUT_LOCS: ClassVar[dict[str, str]] = {"data": "sbuf", "bias": "sbuf"}
     FLOAT32_KWARGS: ClassVar[frozenset[str]] = frozenset({"scale"})
+    REDUCE_COMBINATOR: ClassVar[dict[str, str]] = {"reduce_res": "reduce_op"}
 
     def __call__(self, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
         """CPU simulation: activation then reduction.

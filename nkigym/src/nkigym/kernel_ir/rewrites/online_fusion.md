@@ -4,7 +4,7 @@ Online fusion is a greedy math-level preprocessing step — it runs once before 
 
 Block-level granularity is not a separate online fusion mode — it emerges from `ltiles_per_block` and the loop-nest renderer: when multiple tiles pack into a block, corrections happen once per block instead of per tile. Same math, different scheduling.
 
-![Math function DAG — Op 7 and Op 9 are topologically independent, converging only at Op 10](../../../../diagrams/math_function_dag.png)
+![Math function DAG — Op 7 and Op 9 are topologically independent, converging only at Op 10](../../../../../diagrams/math_function_dag.png)
 
 A **blocking dependency** exists when a consumer op requires the producer to complete its full reduction loop before the consumer can start. Formally, an edge `u → v` is blocking when some dim `d ∈ blocking_dims(u)` also appears in `dims(v)` (loop fusion's R2). To identify blocking pairs, first fuse any elementwise ops between two reductions into the second reduction's body — elementwise ops don't introduce new blocking barriers. In the source-level attention pipeline:
 

@@ -32,6 +32,7 @@ from autotune.runner.types import (
     ProfileResult,
     compile_failure_result,
     ensure_venv_on_path,
+    make_failure,
     resolve_dtype,
 )
 
@@ -235,13 +236,26 @@ def _run_pipeline(payload: dict[str, Any]) -> tuple[list[ProfileResult], dict[st
     logger.info("Worker ready: %d kernels, %d CPU, %d NC", len(kernel_jobs), os.cpu_count() or 1, neuron_cores)
 
     kernel_data: dict[str, dict[str, Any]] = {}
+    sim_failures: list[ProfileResult] = []
     for kname, job in kernel_jobs.items():
-        kernel_data[kname] = _process_kernel_job(kname, job, seed, nki_dir)
-    logger.info("CPU sim done: %d kernels", len(kernel_data))
+        kd = _process_kernel_job(kname, job, seed, nki_dir)
+        if kd["cpu_sim"].get("passed"):
+            kernel_data[kname] = kd
+        else:
+            sim_failures.append(
+                make_failure(kname, "skipped: CPU sim did not pass", kd["mac_count"], cpu_sim=kd["cpu_sim"])
+            )
+    logger.info("CPU sim done: %d passed, %d failed", len(kernel_data), len(sim_failures))
 
-    executor, futures = _submit_compilations(kernel_data, neff_dir)
-    all_results, compiler_logs = _run_hw_benchmarks(executor, futures, kernel_data, config, neff_dir)
+    hw_results: list[ProfileResult] = []
+    compiler_logs: dict[str, str] = {}
+    if kernel_data:
+        executor, futures = _submit_compilations(kernel_data, neff_dir)
+        hw_results, compiler_logs = _run_hw_benchmarks(executor, futures, kernel_data, config, neff_dir)
+    else:
+        logger.info("No kernels passed CPU sim; skipping compile and hardware benchmark")
 
+    all_results = sim_failures + hw_results
     logger.info("Done: %d results (%.1fs)", len(all_results), time.monotonic() - t_start)
 
     return all_results, compiler_logs

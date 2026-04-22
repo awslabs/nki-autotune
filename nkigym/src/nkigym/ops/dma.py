@@ -21,7 +21,6 @@ from typing import Any, ClassVar
 import numpy as np
 
 from nkigym.ops.base import NKIOp
-from nkigym.ops.group import NKIGroup
 
 
 class NKILoad(NKIOp):
@@ -60,12 +59,14 @@ class NKILoad(NKIOp):
         raise NotImplementedError("NKILoad codegen emission is not wired yet (Phase 2+).")
 
 
-class NKIDMATranspose(NKIGroup):
+class NKIDMATranspose(NKIOp):
     """Fused HBM -> SBUF load with on-the-fly transpose.
 
-    Composite produced by the ``LoadTransposePattern`` rewrite,
-    replacing an adjacent ``NKILoad`` + ``NKITranspose`` pair when
-    the Load's output has exactly one consumer (the transpose).
+    Produced by the ``LoadTransposePattern`` rewrite, replacing an
+    adjacent ``NKILoad`` + ``NKITranspose`` pair when the Load's
+    output has exactly one consumer (the transpose). A standalone
+    ``NKIOp`` — wrapped like any other op by a ``FusionGroup``
+    at graph level.
 
     Attributes:
         NAME: ``"dma_transpose"``.

@@ -1,4 +1,4 @@
-"""Double matmul: remote search over sampled KernelIR variants.
+"""Double matmul: remote search over sampled KernelContext variants.
 
 Math: output = (Q @ K.T) @ V
 

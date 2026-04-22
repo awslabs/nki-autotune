@@ -232,20 +232,20 @@ def _process_host_outputs(
 
 
 def write_kernel_sources(cache_dir: str, kernels: dict[str, KernelJob]) -> None:
-    """Write kernel source files to ``<cache>/kernels/<stem>/<stem>.py``."""
+    """Write kernel source files to ``<cache>/<stem>/<stem>.py``."""
     for kname, job in kernels.items():
         stem = Path(kname).stem
-        variant_dir = os.path.join(cache_dir, "kernels", stem)
+        variant_dir = os.path.join(cache_dir, stem)
         os.makedirs(variant_dir, exist_ok=True)
         with open(os.path.join(variant_dir, f"{stem}.py"), "w") as f:
             f.write(job.source)
 
 
 def _write_compiler_logs(cache_dir: str, compiler_logs: dict[str, str]) -> None:
-    """Write compiler logs to ``<cache>/kernels/<stem>/log-neuron-cc.txt``."""
+    """Write compiler logs to ``<cache>/<stem>/log-neuron-cc.txt``."""
     for kname, log_text in compiler_logs.items():
         stem = Path(kname).stem
-        variant_dir = os.path.join(cache_dir, "kernels", stem)
+        variant_dir = os.path.join(cache_dir, stem)
         os.makedirs(variant_dir, exist_ok=True)
         with open(os.path.join(variant_dir, "log-neuron-cc.txt"), "w") as f:
             f.write(log_text)
@@ -269,24 +269,32 @@ def _write_results_json(
     cache_dir: str, kernels: dict[str, KernelJob], results: list[ProfileResult], profiler: "RemoteProfiler"
 ) -> None:
     """Write results.json with metrics and per-kernel data."""
-    successes = [r for r in results if r.hardware_output.startswith("[")]
-    times = [r.min_ms for r in successes]
+    successes: list[tuple[ProfileResult, float, float]] = []
+    for r in results:
+        if r.hardware_output.startswith("[") and r.min_ms is not None and r.mfu is not None:
+            successes.append((r, r.min_ms, r.mfu))
+    times = [t for _, t, _ in successes]
+    mfus = [m for _, _, m in successes]
 
     kernel_entries = []
     for r in sorted(results, key=lambda r: _kernel_sort_key(r.kernel_name)):
         rd = r._asdict()
         stem = Path(r.kernel_name).stem
-        rd["kernel_path"] = f"kernels/{stem}/{stem}.py"
+        rd["kernel_path"] = f"{stem}/{stem}.py"
         kernel_entries.append(rd)
 
+    best_kernel = min(successes, key=lambda s: s[1])[0].kernel_name if successes else None
+    worst_kernel = max(successes, key=lambda s: s[1])[0].kernel_name if successes else None
     results_data = {
         "metadata": {"num_kernels": len(kernels), "wallclock_s": profiler._last_elapsed, "hosts": profiler.hosts},
         "metrics": {
             "best_min_ms": min(times) if times else None,
             "worst_min_ms": max(times) if times else None,
             "mean_min_ms": sum(times) / len(times) if times else None,
-            "best_kernel": min(successes, key=lambda r: r.min_ms).kernel_name if successes else None,
-            "best_mfu": max(r.mfu for r in successes) if successes else None,
+            "best_kernel": best_kernel,
+            "worst_kernel": worst_kernel,
+            "best_mfu": max(mfus) if mfus else None,
+            "worst_mfu": min(mfus) if mfus else None,
         },
         "kernels": kernel_entries,
     }

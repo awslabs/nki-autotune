@@ -12,6 +12,7 @@ any codegen — constructs them as part of matching.
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -105,7 +106,7 @@ class AccumulatorSpec:
 
     kind: str
     output_role: str
-    source_op_idx: int
+    source_op: Any = None
     chunk_output_name: str = ""
     ptile_free_dim: str = ""
     source_kwargs: tuple[tuple[str, str], ...] = ()

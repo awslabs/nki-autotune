@@ -1,4 +1,4 @@
-"""Causal attention: remote search over sampled KernelIR variants.
+"""Causal attention: remote search over sampled KernelContext variants.
 
 softmax(mask(scale * Q @ K^T)) @ V with lower-triangular causal mask.
 

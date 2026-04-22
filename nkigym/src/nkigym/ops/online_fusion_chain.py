@@ -24,10 +24,10 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.group import NKIGroup
+from nkigym.ops.base import NKIOp
 
 
-class NKIOnlineFusionChain(NKIGroup):
+class NKIOnlineFusionChain(NKIOp):
     """Composite op for a fused X + Accumulation pattern.
 
     Attributes below are all placeholders — the rewrite produces a

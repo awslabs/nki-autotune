@@ -1,8 +1,41 @@
 """Profile output formatting and display."""
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from autotune.runner.types import ProfileResult
+
+
+class SuccessRow(NamedTuple):
+    """Kernel result with guaranteed non-None timing/MFU fields."""
+
+    kernel_name: str
+    min_ms: float
+    mean_ms: float
+    p50_ms: float
+    p99_ms: float
+    mfu: float
+
+
+def _collect_successes(results: list[ProfileResult]) -> list[SuccessRow]:
+    """Narrow to kernels that compiled, ran on HW, and produced timings."""
+    rows: list[SuccessRow] = []
+    for r in results:
+        if not r.hardware_output.startswith("["):
+            continue
+        if r.min_ms is None or r.mean_ms is None or r.p50_ms is None or r.p99_ms is None or r.mfu is None:
+            continue
+        rows.append(
+            SuccessRow(
+                kernel_name=r.kernel_name,
+                min_ms=r.min_ms,
+                mean_ms=r.mean_ms,
+                p50_ms=r.p50_ms,
+                p99_ms=r.p99_ms,
+                mfu=r.mfu,
+            )
+        )
+    return rows
 
 
 @dataclass
@@ -24,14 +57,14 @@ class ProfileOutput:
     cache_dir: str = ""
 
     @property
-    def successes(self) -> list[ProfileResult]:
-        """Results that completed without hardware errors."""
-        return [r for r in self.results if r.hardware_output.startswith("[")]
+    def successes(self) -> list[SuccessRow]:
+        """Kernels that passed CPU sim, compiled, and produced HW timings."""
+        return _collect_successes(self.results)
 
     @property
     def failures(self) -> list[ProfileResult]:
-        """Results that had hardware errors."""
-        return [r for r in self.results if not r.hardware_output.startswith("[")]
+        """Kernels that failed CPU sim, compile, or hardware execution."""
+        return [r for r in self.results if r.min_ms is None or not r.hardware_output.startswith("[")]
 
     def __str__(self) -> str:
         """Human-readable summary with per-kernel timing table."""
@@ -43,20 +76,20 @@ class ProfileOutput:
         return "\n".join(lines)
 
 
-def _format_results_table(successes: list[ProfileResult]) -> list[str]:
+def _format_results_table(successes: list[SuccessRow]) -> list[str]:
     """Format the timing results table for successful kernels."""
     lines: list[str] = []
-    show_mfu = any(r.mfu > 0 for r in successes)
+    show_mfu = any(s.mfu > 0 for s in successes)
     header = f"{'Kernel':<30} {'min_ms':>10} {'mean_ms':>10} {'p50_ms':>10} {'p99_ms':>10}"
     if show_mfu:
         header += f" {'mfu':>8}"
-    for r in sorted(successes, key=lambda r: r.min_ms):
+    for s in sorted(successes, key=lambda s: s.min_ms):
         if not lines:
             lines.append(header)
             lines.append("-" * len(header))
-        row = f"{r.kernel_name:<30} {r.min_ms:>10.4f} {r.mean_ms:>10.4f} {r.p50_ms:>10.4f} {r.p99_ms:>10.4f}"
+        row = f"{s.kernel_name:<30} {s.min_ms:>10.4f} {s.mean_ms:>10.4f} {s.p50_ms:>10.4f} {s.p99_ms:>10.4f}"
         if show_mfu:
-            row += f" {r.mfu:>7.2f}%"
+            row += f" {s.mfu:>7.2f}%"
         lines.append(row)
     return lines
 
@@ -73,10 +106,10 @@ def _format_failures(failures: list[ProfileResult]) -> list[str]:
     return lines
 
 
-def _format_summary(successes: list[ProfileResult], output: ProfileOutput) -> list[str]:
+def _format_summary(successes: list[SuccessRow], output: ProfileOutput) -> list[str]:
     """Format the summary footer."""
     lines: list[str] = []
-    times = [r.min_ms for r in successes]
+    times = [s.min_ms for s in successes]
     lines.append(f"\nSummary:")
     lines.append(f"  Succeeded:  {len(successes)}/{len(output.results)}")
     lines.append(f"  Hosts:      {len(output.hosts)} ({', '.join(output.hosts)})")

@@ -36,6 +36,21 @@ class NKITensorReduce(NKIOp):
     ISA_LOC: ClassVar[str] = "sbuf"
     PSUM_DTYPE: ClassVar[str | None] = None
     INPUT_LOCS: ClassVar[dict[str, str]] = {"data": "sbuf"}
+    REDUCE_COMBINATOR: ClassVar[dict[str, str]] = {"output": "op"}
+
+    @classmethod
+    def resolve_reduce_combinator(cls, output_role: str, op_kwargs: dict[str, str]) -> str | None:
+        """Flip ``maximum``↔``minimum`` when ``negate=True`` (per-chunk negation inverts combine order)."""
+        base = super().resolve_reduce_combinator(output_role, op_kwargs)
+        if base is None or op_kwargs.get("negate") != "True":
+            result = base
+        elif base == "maximum":
+            result = "minimum"
+        elif base == "minimum":
+            result = "maximum"
+        else:
+            result = base
+        return result
 
     def __call__(self, **kwargs: Any) -> np.ndarray:
         """CPU simulation: reduce along axis with optional negation.

@@ -14,7 +14,7 @@ import nkigym.ops as ops_pkg
 from autotune.runner.api import remote_profile
 from autotune.runner.output import ProfileOutput
 from autotune.runner.types import KernelJob, ProfileConfig
-from nkigym.kernel_ir import build_ir
+from nkigym.kernel_ir import build_context_and_variants
 from nkigym.ops.base import NKIOp
 from nkigym.search.mac import compute_mac_count
 from nkigym.search.sampler import sample_variants
@@ -78,7 +78,7 @@ def remote_search(
 ) -> ProfileOutput:
     """Sample ``num_variants`` unique variants from ``func`` and profile them.
 
-    Builds a seed ``KernelIR`` for ``func`` internally, rejection-
+    Builds a seed ``KernelContext`` for ``func`` internally, rejection-
     samples variants, wraps each in a ``KernelJob`` and delegates to
     ``remote_profile``. The nkigym math function itself is shipped
     to every remote worker and executed there as the fp32 golden
@@ -106,12 +106,11 @@ def remote_search(
         ProfileOutput with per-variant timing and correctness.
     """
     rng = random.Random(seed)
-    initial_kernel = build_ir(func, input_specs, seed=seed)
+    ctx, graph_variants = build_context_and_variants(func, input_specs)
     mac_count = compute_mac_count(func, input_specs)
     nkigym_source = _func_source_with_imports(func)
     cache_path = Path(cache_dir)
-    initial_kernel.op_graph.render(cache_path / "op_graph")
-    variants = sample_variants(initial_kernel, num_variants, rng, cache_dir=cache_path)
+    variants = sample_variants(ctx, graph_variants, num_variants, rng, cache_dir=cache_path)
     kernels: dict[str, KernelJob] = {
         f"{name}.py": KernelJob(
             source=source,

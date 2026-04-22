@@ -119,13 +119,18 @@ def benchmark_one(
         config: Benchmark configuration.
         cpu_sim: CPU simulation status dict.
     """
-    min_ms = mean_ms = p50_ms = p99_ms = mfu = 0.0
+    min_ms: float | None = None
+    mean_ms: float | None = None
+    p50_ms: float | None = None
+    p99_ms: float | None = None
+    mfu: float | None = None
     hardware_output = f"{list(out.shape)} {out.dtype}"
     try:
         compiled = create_compiled_kernel(cr.neff_path, cr.nki_path, func_name, kernel_kwargs, out)
         min_ms, mean_ms, p50_ms, p99_ms, mfu = _run_timing(spike, compiled, kernel_kwargs, config)
     except Exception as e:
         hardware_output = capture_error(e)
+        min_ms = mean_ms = p50_ms = p99_ms = mfu = None
     return ProfileResult(
         kernel_name=cr.kernel_name,
         min_ms=min_ms,

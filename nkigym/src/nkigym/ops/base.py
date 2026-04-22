@@ -41,6 +41,21 @@ class NKIOp:
     PSUM_DTYPE: ClassVar[str | None] = None
     INPUT_LOCS: ClassVar[dict[str, str]] = {}
     FLOAT32_KWARGS: ClassVar[frozenset[str]] = frozenset()
+    """Per-output combinator declaring what happens when one of the
+    op's blocking axes becomes a multi-chunk loop.
+
+    Maps ``output_role -> combinator_kwarg_name`` pointing at the
+    instance-level kwarg whose value names the combinator
+    (``"add"``, ``"maximum"``, ``"minimum"``, ...). The renderer
+    reads the kwarg to pick an init value and an ISA combine call.
+
+    Empty dict = no blocking-axis reduction semantics (PARALLEL
+    output). Operators like ``nc_matmul`` whose hardware
+    accumulation is implicit still declare this so ``DimRole``
+    classification is uniform. ``None`` in place of a kwarg name
+    means the combinator is fixed (e.g. matmul is always ``add``).
+    """
+    REDUCE_COMBINATOR: ClassVar[dict[str, str]] = {}
     _NKI_OP_KWARGS: ClassVar[frozenset[str]] = frozenset({"op", "reduce_op", "cmp_op", "op0", "op1"})
 
     @abstractmethod
@@ -76,6 +91,29 @@ class NKIOp:
         result = ""
         if parts:
             result = ", " + ", ".join(parts)
+        return result
+
+    @classmethod
+    def resolve_reduce_combinator(cls, output_role: str, op_kwargs: dict[str, str]) -> str | None:
+        """Return the combinator (``'add'``/``'maximum'``/``'minimum'``) for an output, or None.
+
+        Reads ``REDUCE_COMBINATOR[output_role]`` and resolves it:
+        if the value is ``"__<literal>"`` (e.g. ``"__add"``), the
+        combinator is fixed at ``<literal>``; otherwise the value
+        names a kwarg (e.g. ``"op"``, ``"reduce_op"``) whose
+        value at call-time holds the combinator string. Missing
+        or mismatching kwargs return ``None`` — treated as
+        PARALLEL output.
+        """
+        spec = cls.REDUCE_COMBINATOR.get(output_role)
+        result: str | None = None
+        if spec is not None:
+            if spec.startswith("__"):
+                result = spec[2:]
+            else:
+                raw = op_kwargs.get(spec)
+                if raw is not None:
+                    result = raw[1:-1] if raw.startswith("'") and raw.endswith("'") else raw
         return result
 
     @staticmethod

@@ -3,31 +3,16 @@
 import inspect
 
 from nkigym.codegen import gadgets
-from nkigym.kernel_ir.dim_analysis import DimAnalysis
+from nkigym.kernel_ir import KernelContext
 
 _INLINED_GADGETS = "\n\n".join(
     inspect.getsource(fn) for fn in (gadgets.load_block, gadgets.stage_block, gadgets.store_block)
 )
 
 
-def render_header(da: DimAnalysis) -> str:
-    """Emit NKI kernel header from dimension analysis.
-
-    Produces imports, inlined top-level gadget functions
-    (``load_block``, ``stage_block``, ``store_block``) so the
-    kernel file is self-contained and does not depend on the
-    ``nkigym`` package on the executor, the ``@nki.jit``
-    decorator, function signature, input shape assertions, and
-    the output HBM allocation.
-
-    Args:
-        da: Complete dimension analysis result.
-
-    Returns:
-        NKI source code for the kernel header.
-    """
+def render_header(context: KernelContext) -> str:
+    """Emit NKI kernel header from the kernel context."""
     lines: list[str] = []
-
     lines.append("import nki")
     lines.append("import nki.isa as nisa")
     lines.append("import nki.language as nl")
@@ -37,27 +22,17 @@ def render_header(da: DimAnalysis) -> str:
     lines.append(_INLINED_GADGETS)
     lines.append("")
     lines.append("@nki.jit")
-    params = ", ".join(da.param_names)
-    lines.append(f"def {da.func_name}({params}):")
-
-    for name in da.param_names:
-        shape = da.tensors[name].shape
+    params = ", ".join(context.param_names)
+    lines.append(f"def {context.func_name}({params}):")
+    for name in context.param_names:
+        shape = context.logical_tensors[name].shape
         lines.append(f"    assert {name}.shape == {shape}")
-
-    ret = da.return_name
-    ret_tensor = da.tensors[ret]
-    lines.append(f"    {ret} = nl.ndarray({ret_tensor.shape}," f" dtype=nl.{ret_tensor.dtype}, buffer=nl.shared_hbm)")
-
+    ret = context.return_name
+    ret_tinfo = context.logical_tensors[ret]
+    lines.append(f"    {ret} = nl.ndarray({ret_tinfo.shape}, dtype=nl.{ret_tinfo.dtype}, buffer=nl.shared_hbm)")
     return "\n".join(lines)
 
 
-def render_return(da: DimAnalysis) -> str:
-    """Emit the return statement for the kernel.
-
-    Args:
-        da: Complete dimension analysis result.
-
-    Returns:
-        Indented return statement.
-    """
-    return f"    return {da.return_name}"
+def render_return(context: KernelContext) -> str:
+    """Emit the return statement for the kernel."""
+    return f"    return {context.return_name}"

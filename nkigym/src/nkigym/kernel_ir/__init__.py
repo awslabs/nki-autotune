@@ -1,18 +1,23 @@
 """KernelIR: structured kernel representation for lowering to NKI source."""
 
-from nkigym.kernel_ir.dim_analysis import DimAnalysis, DimInfo, TensorInfo, analyze_dims
-from nkigym.kernel_ir.ir import KernelIR, build_ir, get_tpb
-from nkigym.kernel_ir.op_graph import OpGraph, build_op_graph, insert_dma_nodes
+from nkigym.kernel_ir.context.build import build_context_and_variants, build_initial, build_ir
+from nkigym.kernel_ir.context.context import DimInfo, DimRole, KernelContext, TensorInfo
+from nkigym.kernel_ir.graph.fusion_group import FusionGroup
+from nkigym.kernel_ir.graph.graph import KernelGraph, rebuild_edges
+from nkigym.kernel_ir.ir import KernelIR
+from nkigym.kernel_ir.sampler.sampler import sample_valid_ir
 
 __all__ = [
-    "DimAnalysis",
     "DimInfo",
+    "DimRole",
+    "FusionGroup",
+    "KernelContext",
+    "KernelGraph",
     "KernelIR",
-    "OpGraph",
     "TensorInfo",
-    "analyze_dims",
+    "build_context_and_variants",
+    "build_initial",
     "build_ir",
-    "build_op_graph",
-    "get_tpb",
-    "insert_dma_nodes",
+    "rebuild_edges",
+    "sample_valid_ir",
 ]

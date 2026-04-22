@@ -30,6 +30,7 @@ class NKIMatmul(NKIOp):
     ISA_LOC: ClassVar[str] = "psum"
     PSUM_DTYPE: ClassVar[str | None] = "float32"
     INPUT_LOCS: ClassVar[dict[str, str]] = {"stationary": "sbuf", "moving": "sbuf"}
+    REDUCE_COMBINATOR: ClassVar[dict[str, str]] = {"output": "__add"}
 
     def __call__(self, **kwargs: Any) -> Any:
         """CPU simulation: ``stationary.T @ moving`` from kwargs ``stationary`` and ``moving``."""
