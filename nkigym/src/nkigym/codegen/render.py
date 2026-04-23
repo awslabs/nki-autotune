@@ -41,9 +41,12 @@ def render_ir(ir: KernelIR) -> str:
     sbuf_by_group = render_sbuf_buffers(ir, staged=staged, tensor_to_groups=tensor_to_groups)
     psum_allocs = render_psum_allocations(ir, op_to_group)
     for group_idx in range(len(ir.graph.groups)):
-        group_top = sbuf_by_group.get(group_idx, []) + psum_allocs.get(group_idx, [])
-        if group_top:
-            before_plan.setdefault(group_idx, {}).setdefault(0, [])[:0] = group_top
+        for depth, lines in sbuf_by_group.get(group_idx, {}).items():
+            if lines:
+                before_plan.setdefault(group_idx, {}).setdefault(depth, [])[:0] = lines
+        group_psum = psum_allocs.get(group_idx, [])
+        if group_psum:
+            before_plan.setdefault(group_idx, {}).setdefault(0, [])[:0] = group_psum
 
     group_src = render_group_loops(ir, body_indent=1, before_plan=before_plan, after_plan=staging_after)
     ret = render_return(ir.context)

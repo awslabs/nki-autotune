@@ -1,33 +1,6 @@
-"""Block-level DMA/staging wrappers for the list-of-2D-tiles SBUF model.
-
-SBUF buffers are nested Python lists ``sbuf_X[NP_list][NF_list]``
-where each leaf is a 2D ``nl.ndarray(P, F)``. NKI forbids a
-single DMA that spans multiple partition slots, so the gadgets
-Python-iterate per leaf and emit one ISA call per tile. Each
-inner call is a genuine 2D memref access — no 4D reshape, no
-partition striding in the slice.
-
-Contract:
-* ``sbuf`` (dst for load/stage, src for store): nested Python
-  list ``[NP_list][NF_list]`` of 2D ``nl.ndarray`` leaves of
-  shape ``(P, F)``.
-* ``mem`` (src for load/stage, dst for store): 2D ``nl.ndarray``
-  of shape ``(p_count * P, f_count * F)`` — the matching chunk of
-  HBM or PSUM.
-* ``p_start``, ``f_start``: starting slot indices into ``sbuf``.
-* ``p_count``, ``f_count``: number of slots to transfer on each
-  axis. ``mem`` must cover exactly this region, else ``ValueError``.
-
-``load_block`` accepts ``transpose=True`` to fold a 2D transpose
-into the HBM→SBUF DMA via ``nisa.dma_transpose``. The ``mem``
-region is then the pre-transpose HBM tile with shape
-``(f_count * F, p_count * P)``; each leaf is filled with
-``mem[fi*F:(fi+1)*F, pi*P:(pi+1)*P]`` so the destination's
-partition axis takes values from the source's free axis.
-"""
-
 from typing import Any
 
+import nki
 import nki.isa as nisa
 import nki.language as nl
 
@@ -140,3 +113,42 @@ def matmul_block(
                 acc_tile[0:tile_m, 0:tile_n],
                 op=nl.add,
             )
+
+
+@nki.jit
+def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    # Group 0: dma_load, dma_load, nc_matmul, dma_store [dims: d2, d0, d1]
+    for i_block_d2 in range(4):
+        sbuf_output = [[nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)] for _ in range(16)]
+        for i_pmr in range(16):
+            for i_fmr in range(1):
+                nisa.memset(sbuf_output[i_pmr][i_fmr][0:128, 0:512], 0.0)
+        for i_block_d0 in range(2):
+            sbuf_rhs = [[nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)] for _ in range(8)]
+            load_block(
+                sbuf_rhs,
+                rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512],
+                0,
+                8,
+                0,
+                1,
+            )
+            for i_block_d1 in range(4):
+                sbuf_lhs_T = [
+                    [nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)] for _ in range(8)
+                ]
+                load_block(
+                    sbuf_lhs_T,
+                    lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512],
+                    0,
+                    8,
+                    0,
+                    1,
+                )
+                matmul_block(sbuf_output, i_block_d1 * 4, 4, 0, 1, sbuf_lhs_T, sbuf_rhs, 0, 8, 128, 512)
+        store_block(output[0:2048, i_block_d2 * 512 : i_block_d2 * 512 + 512], sbuf_output, 0, 16, 0, 1)
+
+    return output

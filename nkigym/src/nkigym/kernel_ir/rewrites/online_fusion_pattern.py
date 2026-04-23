@@ -25,14 +25,25 @@ class OnlineFusionPattern:
         """Return every supported candidate visible in the current graph."""
         candidates = detect_online_fusion(context, graph)
         supported = {"rsqrt_then_mul", "exp_bias"}
-        return [_Match(candidate=c) for c in candidates if c.scale_role in supported and not self._touches_composite(c)]
+        extend_supported = supported | {"passthrough_mul"}
+        return [
+            _Match(candidate=c)
+            for c in candidates
+            if self._role_ok(c, supported, extend_supported) and self._is_valid_shape(c)
+        ]
+
+    @staticmethod
+    def _role_ok(candidate: OnlineFusionCandidate, create_set: frozenset | set, extend_set: frozenset | set) -> bool:
+        """Supported-role gate differs for create vs extend: extend inherits SCALE_SPEC, accepting passthrough_mul."""
+        return candidate.scale_role in (extend_set if candidate.mode == "extend" else create_set)
 
     def apply(self, context: KernelContext, graph: KernelGraph, instance: _Match) -> tuple[KernelContext, KernelGraph]:
         """Apply one candidate's rewrite."""
         return rewrite_one_candidate(context, graph, instance.candidate)
 
     @staticmethod
-    def _touches_composite(candidate: OnlineFusionCandidate) -> bool:
-        """True iff X or any accumulator is already a composite node."""
-        all_ops = (candidate.x_op, *candidate.accumulator_ops)
-        return any(isinstance(op, NKIOnlineFusionChain) for op in all_ops)
+    def _is_valid_shape(candidate: OnlineFusionCandidate) -> bool:
+        """Create mode: neither X nor accs are composites. Extend mode: X is a composite, accs aren't."""
+        acc_touches_composite = any(isinstance(op, NKIOnlineFusionChain) for op in candidate.accumulator_ops)
+        x_is_composite = isinstance(candidate.x_op, NKIOnlineFusionChain)
+        return not acc_touches_composite and (candidate.mode == "extend") == x_is_composite

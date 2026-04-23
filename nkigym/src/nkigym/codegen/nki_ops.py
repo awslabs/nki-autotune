@@ -2,15 +2,9 @@
 
 from nkigym.codegen.buffers import producer_op, producer_op_tiles, psum_tile_count, psum_tile_slice, sbuf_buffer
 from nkigym.codegen.compute_skip import record_op_delta, snapshot_before_lengths, wrap_annotated_ops
-from nkigym.codegen.dma import (
-    dma_load_line,
-    dma_store_line,
-    dma_transpose_line,
-    has_output_ptile_dims,
-    inline_stage_line,
-    ptile_loop_dims,
-)
+from nkigym.codegen.dma import has_output_ptile_dims, inline_stage_line, ptile_loop_dims, render_dma_op
 from nkigym.codegen.group_loops import DepthPlan
+from nkigym.codegen.matmul_block_render import is_matmul_block_candidate, render_matmul_block_op
 from nkigym.codegen.online_fusion import render_online_fusion_op
 from nkigym.codegen.reduction import apply_reduction_plan, reduced_outputs_with_multichunk, scratch_shape
 from nkigym.codegen.sbuf_buffer import AxisAccess, buffer_ident
@@ -60,46 +54,46 @@ def _render_one_op(
 ) -> None:
     """Render one op into ``before_plan`` / ``after_plan``."""
     op_cls = type(op)
-    if issubclass(op_cls, (NKILoad, NKIStore, NKIDMATranspose)):
-        _render_dma_op(ir, op, gi, op_to_group, staged, memo, before_plan, after_plan)
-    elif issubclass(op_cls, NKIOnlineFusionChain):
+    is_dma = issubclass(op_cls, (NKILoad, NKIStore, NKIDMATranspose))
+    is_ofn = issubclass(op_cls, NKIOnlineFusionChain)
+    is_mb = (not is_dma) and (not is_ofn) and is_matmul_block_candidate(ir, op, gi)
+    if is_dma:
+        render_dma_op(ir, op, gi, op_to_group, staged, memo, before_plan, after_plan)
+    elif is_ofn:
         render_online_fusion_op(ir, op, gi, before_plan)
+    elif is_mb:
+        render_matmul_block_op(ir, op, gi, before_plan)
     else:
-        context = ir.context
         dim_order = ir.graph.groups[gi].dim_order
-        placement = op_emission_placement(context, ir.graph, op, gi, op_to_group, staged, memo)
+        placement = op_emission_placement(ir.context, ir.graph, op, gi, op_to_group, staged, memo)
         reduced = reduced_outputs_with_multichunk(ir, op) if op_cls.ISA_LOC != "psum" else []
         scratch_override = {r.role: f"{buffer_ident(r.tensor_name)}_chunk" for r in reduced}
-        block_lines = list(_render_op_block(ir, op, gi, staged, placement, scratch_override))
-        if reduced:
-            block_lines = apply_reduction_plan(ir, op, gi, reduced, placement, block_lines, before_plan)
-        elif op_cls.ISA_LOC == "psum":
-            block_lines = _apply_psum_plan(ir, op, gi, dim_order, staged, placement, block_lines, before_plan)
+        lines = list(_render_op_block(ir, op, gi, staged, placement, scratch_override))
+        lines = _apply_output_plan(ir, op, gi, dim_order, staged, placement, reduced, lines, before_plan)
         target = before_plan if placement.phase == "before" else after_plan
-        target.setdefault(gi, {}).setdefault(placement.depth, []).extend(block_lines)
+        target.setdefault(gi, {}).setdefault(placement.depth, []).extend(lines)
 
 
-def _render_dma_op(
+def _apply_output_plan(
     ir: KernelIR,
     op: NKIOp,
     gi: int,
-    op_to_group: dict[int, int],
+    dim_order: list[str],
     staged: set[str],
-    memo: dict[int, Placement],
+    placement: Placement,
+    reduced: list,
+    lines: list[str],
     before_plan: DepthPlan,
-    after_plan: DepthPlan,
-) -> None:
-    """Render a ``NKILoad`` / ``NKIStore`` / ``NKIDMATranspose`` op at its own emission slot."""
-    context = ir.context
-    placement = op_emission_placement(context, ir.graph, op, gi, op_to_group, staged, memo)
-    if isinstance(op, NKIStore):
-        line = dma_store_line(ir, op, gi, placement.depth)
-    elif isinstance(op, NKIDMATranspose):
-        line = dma_transpose_line(ir, op, gi, placement.depth)
+) -> list[str]:
+    """Apply reduction-plan OR psum-plan transformation to the op's rendered lines."""
+    op_cls = type(op)
+    if reduced:
+        result = apply_reduction_plan(ir, op, gi, reduced, placement, lines, before_plan)
+    elif op_cls.ISA_LOC == "psum":
+        result = _apply_psum_plan(ir, op, gi, dim_order, staged, placement, lines, before_plan)
     else:
-        line = dma_load_line(ir, op, gi, placement.depth)
-    target = before_plan if placement.phase == "before" else after_plan
-    target.setdefault(gi, {}).setdefault(placement.depth, []).append(line)
+        result = lines
+    return result
 
 
 def _apply_psum_plan(
@@ -162,12 +156,10 @@ def _render_op_block(
 ) -> list[str]:
     """Render one op's ISA call wrapped in ``i_ptile_{d}`` loops, with per-ptile stage.
 
-    ``scratch_override`` maps output-role → scratch tensor name.
-    For roles in the map, the emitted destination writes to a
-    direct-alloc SBUF scratch (``sbuf_<scratch_name>[0:P, 0:F]``)
-    instead of the role's normal SBUF buffer — used by the
-    multi-chunk reduction codegen to capture per-chunk output
-    before the combine step.
+    ``scratch_override`` maps output-role → scratch tensor name; roles
+    in the map emit into ``sbuf_<scratch_name>[0:P, 0:F]`` instead of
+    the role's normal SBUF buffer — used by the multi-chunk reduction
+    codegen to capture per-chunk output before the combine step.
     """
     lines: list[str] = []
     output_ptile, blocking_ptile = _partition_ptile_dims(ir, op)
@@ -288,14 +280,12 @@ def _tile_start_expr(
     ir: KernelIR, dim_id: str, ptile_dims: set[str], placement: Placement, dim_order: list[str]
 ) -> str:
     """Global element-offset start expression for one dim."""
-    context = ir.context
-    di = context.dimensions[dim_id]
-    tpb = context.ltiles_per_block.get(dim_id, 1)
+    di = ir.context.dimensions[dim_id]
+    tpb = ir.context.ltiles_per_block.get(dim_id, 1)
     logical = di.logical_tile_size
     phys = di.physical_tile_size
     block_stride = logical * tpb
     terms: list[str] = []
-    _ = dim_order
     if dim_id in dim_order:
         pos = dim_order.index(dim_id)
         if placement.loop_open(block_depth(pos)):

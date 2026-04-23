@@ -1,5 +1,6 @@
 """Tensor buffer allocation: on-chip SBUF and PSUM buffers."""
 
+from nkigym.codegen.matmul_block_detect import is_matmul_block_candidate
 from nkigym.codegen.sbuf_buffer import SbufBuffer, buffer_ident, build_sbuf_buffer
 from nkigym.kernel_ir import KernelIR
 from nkigym.kernel_ir.context.context import KernelContext, TensorInfo
@@ -25,24 +26,65 @@ __all__ = [
 _SBUF_BUFFER_CACHE: dict[int, dict[str, SbufBuffer]] = {}
 
 
-def render_sbuf_buffers(ir: KernelIR, staged: set[str], tensor_to_groups: dict[str, set[int]]) -> dict[int, list[str]]:
-    """Emit SBUF declarations keyed by the fusion group at whose top they appear."""
+def render_sbuf_buffers(
+    ir: KernelIR, staged: set[str], tensor_to_groups: dict[str, set[int]]
+) -> dict[int, dict[int, list[str]]]:
+    """Emit SBUF declarations keyed by ``{group_idx: {depth: [lines]}}``.
+
+    Alloc depth follows the tensor's tightest-tier dim:
+    a tensor that is ``per_block`` on some dim in the owning
+    group gets its allocation pushed inside that dim's block
+    loop so the compiler sees fresh-per-iteration buffers —
+    matching the ``nki_matmul_fully_optimized_`` pattern when
+    a matmul-block gadget dispatches on the same group.
+    """
     groups = ir.graph.groups
-    by_group: dict[int, list[str]] = {gi: [] for gi in range(len(groups))}
+    by_group: dict[int, dict[int, list[str]]] = {gi: {} for gi in range(len(groups))}
     order = ir.graph.toposort_groups()
     group_rank = {gi: rank for rank, gi in enumerate(order)}
     persistent = _persistent_sbuf_tensors(ir, staged, tensor_to_groups)
     for name, _tinfo in persistent:
         first_gi = min(tensor_to_groups[name], key=lambda gi: group_rank[gi])
-        by_group[first_gi].append(sbuf_buffer(ir, name).alloc_line())
+        depth = _alloc_depth(ir, name, first_gi)
+        by_group[first_gi].setdefault(depth, []).append(sbuf_buffer(ir, name).alloc_line())
     for group_idx, names in _per_group_sbuf_tensors(ir, staged, tensor_to_groups).items():
         for name, _tinfo in names:
-            by_group[group_idx].append(sbuf_buffer(ir, name).alloc_line())
+            depth = _alloc_depth(ir, name, group_idx)
+            by_group[group_idx].setdefault(depth, []).append(sbuf_buffer(ir, name).alloc_line())
     return by_group
 
 
+def _alloc_depth(ir: KernelIR, tensor_name: str, group_idx: int) -> int:
+    """Return the slot depth at which ``tensor_name`` should be allocated in ``group_idx``.
+
+    Kernel-top (``0``) if every placement dim in this group is
+    ``full``; otherwise innermost ``block_depth(pos) + 1`` across
+    all ``per_block``/``per_tile`` dims — i.e. the buffer is
+    declared fresh each iteration of the tightest block loop it
+    depends on.
+    """
+    placements = ir.graph.groups[group_idx].tensor_placements
+    dim_order = ir.graph.groups[group_idx].dim_order
+    tinfo = ir.context.logical_tensors[tensor_name]
+    depth = 0
+    for dim_id in tinfo.dim_ids:
+        if dim_id not in dim_order:
+            continue
+        tier = placements.get(("sbuf", tensor_name, dim_id), "per_tile")
+        if tier == "full":
+            continue
+        pos = dim_order.index(dim_id)
+        depth = max(depth, 2 * pos + 1)
+    return depth
+
+
 def render_psum_allocations(ir: KernelIR, op_to_group: dict[int, int]) -> dict[int, list[str]]:
-    """Return ``{group_idx: [alloc_lines]}`` for every PSUM tensor."""
+    """Return ``{group_idx: [alloc_lines]}`` for every PSUM tensor.
+
+    Skips ops dispatched to the matmul_block gadget: matmul_block
+    allocates its own PSUM scratch internally, so emitting a
+    module-level PSUM declaration would be dead code.
+    """
     context = ir.context
     psum_dtype_map = _build_psum_dtype_map(ir)
     by_group: dict[int, list[str]] = {}
@@ -51,6 +93,8 @@ def render_psum_allocations(ir: KernelIR, op_to_group: dict[int, int]) -> dict[i
         if producer is None or type(producer).ISA_LOC != "psum":
             continue
         gi = op_to_group[id(producer)]
+        if is_matmul_block_candidate(ir, producer, gi):
+            continue
         psum_dtype = psum_dtype_map.get(name, tinfo.dtype)
         by_group.setdefault(gi, []).append(_psum_line(ir, name, tinfo, psum_dtype))
     return by_group

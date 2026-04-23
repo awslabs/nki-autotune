@@ -6,7 +6,7 @@ from nkigym.codegen import gadgets
 from nkigym.kernel_ir import KernelContext
 
 _INLINED_GADGETS = "\n\n".join(
-    inspect.getsource(fn) for fn in (gadgets.load_block, gadgets.stage_block, gadgets.store_block)
+    inspect.getsource(fn) for fn in (gadgets.load_block, gadgets.stage_block, gadgets.store_block, gadgets.matmul_block)
 )
 
 

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from nkigym.codegen.matmul_block_detect import gadget_absorbed_dims
 from nkigym.kernel_ir import KernelIR
 
 _DMA_ALIAS_SUFFIXES = ("_sbuf", "_hbm")
@@ -200,7 +201,17 @@ def _build_axis(
     effective_tier: dict[tuple[str, str, str], str],
     effective_degree: dict[tuple[str, str, str], int],
 ) -> SbufAxis:
-    """Factor this dim's ``num_tiles`` into the four SbufAxis fields."""
+    """Factor this dim's ``num_tiles`` into the four SbufAxis fields.
+
+    When ``dim_id`` is absorbed by a gadget (``matmul_block``
+    iterates M/N internally) AND this is a free axis, fold
+    ``ltiles_per_block`` into the leaf width so the generated
+    buffer has one wide leaf per block (matching
+    ``nki_matmul_fully_optimized_``'s ``(TILE_K, BLOCK_M)`` and
+    ``(TILE_K, BLOCK_N)`` leaves) — fewer, larger DMAs at load
+    time and the gadget slices inside the leaf via ptile
+    indexing.
+    """
     context = ir.context
     di = context.dimensions[dim_id]
     phys = di.physical_tile_size
@@ -210,6 +221,9 @@ def _build_axis(
     multi_buffer = effective_degree.get(("sbuf", tensor_name, dim_id), 1)
     ltiles_per_block = tpb if tier in ("per_block", "full") else 1
     num_blocks = di.dim_size // (tpb * di.logical_tile_size) if tier == "full" else 1
+    if leaf_includes_ptile and _is_gadget_absorbed_free_axis(ir, tensor_name, dim_id):
+        ptiles_per_ltile = ptiles_per_ltile * ltiles_per_block
+        ltiles_per_block = 1
     return SbufAxis(
         phys=phys,
         ptiles_per_ltile=ptiles_per_ltile,
@@ -218,6 +232,28 @@ def _build_axis(
         multi_buffer=multi_buffer,
         leaf_includes_ptile=leaf_includes_ptile,
     )
+
+
+def _is_gadget_absorbed_free_axis(ir: KernelIR, tensor_name: str, dim_id: str) -> bool:
+    """True iff ``dim_id`` is absorbed by a gadget in any group that touches ``tensor_name``.
+
+    Currently: ``matmul_block``-dispatched groups absorb the
+    matmul's M and N dims along K-input and output buffers'
+    free axes.
+    """
+    found = False
+    for gi, group in enumerate(ir.graph.groups):
+        if found:
+            break
+        absorbed = gadget_absorbed_dims(ir, gi)
+        if dim_id not in absorbed:
+            continue
+        for op in group.ops:
+            touched = [*ir.context.op_inputs.get(op, {}).values(), *ir.context.op_outputs.get(op, [])]
+            if tensor_name in touched:
+                found = True
+                break
+    return found
 
 
 def _max_op_tile(ir: KernelIR, tensor_name: str, dim_id: str) -> int:

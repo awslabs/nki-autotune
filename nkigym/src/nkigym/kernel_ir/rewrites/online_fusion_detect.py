@@ -18,16 +18,26 @@ from dataclasses import dataclass
 from nkigym.kernel_ir.context.context import KernelContext
 from nkigym.kernel_ir.graph.graph import KernelGraph
 from nkigym.ops.base import NKIOp
+from nkigym.ops.online_fusion_chain import NKIOnlineFusionChain
 
 
 @dataclass(frozen=True)
 class OnlineFusionCandidate:
-    """One X + Accumulation pattern match."""
+    """One X + Accumulation pattern match.
+
+    ``mode="create"`` builds a new composite from ``x_op`` +
+    accumulators living in an adjacent group.
+
+    ``mode="extend"`` augments an existing ``NKIOnlineFusionChain``
+    composite (``x_op``) with new accumulator(s) living in the
+    same group as the composite (after an earlier TF merge).
+    """
 
     x_op: NKIOp
     accumulator_ops: tuple[NKIOp, ...]
     blocking_dim: str
     scale_role: str
+    mode: str = "create"
 
 
 def _all_ops(graph: KernelGraph) -> list[NKIOp]:
@@ -51,16 +61,99 @@ def _producer_op(context: KernelContext, graph: KernelGraph, tensor_name: str) -
 
 
 def detect_online_fusion(context: KernelContext, graph: KernelGraph) -> list[OnlineFusionCandidate]:
-    """Return every atomic X + Accumulation candidate."""
+    """Return every atomic X + Accumulation candidate (both create and extend modes)."""
     candidates: list[OnlineFusionCandidate] = []
     group_of = _group_of_map(graph)
     for x_op in _all_ops(graph):
+        if isinstance(x_op, NKIOnlineFusionChain):
+            extended = _detect_extend(context, graph, x_op, group_of)
+            if extended is not None:
+                candidates.append(extended)
+            continue
         blocking_dims = context.op_blocking_dims.get(x_op, set())
         for dim_id in sorted(blocking_dims):
             fused = _match_on_dim(context, graph, x_op, dim_id, group_of)
             if fused is not None:
                 candidates.append(fused)
     return candidates
+
+
+def _detect_extend(
+    context: KernelContext, graph: KernelGraph, composite_op: NKIOnlineFusionChain, group_of: dict[int, int]
+) -> OnlineFusionCandidate | None:
+    """Find same-group accumulators whose data lineage traces back to ``composite_op``'s outputs."""
+    op_cls = type(composite_op)
+    acc_dim = op_cls.ACCUMULATION_DIM
+    comp_gi = group_of[id(composite_op)]
+    comp_outputs = set(context.op_outputs.get(composite_op, []))
+    existing_sources = _existing_accumulator_sources(op_cls)
+    new_accs = _collect_new_accumulators(
+        context, graph, composite_op, acc_dim, comp_gi, comp_outputs, existing_sources, group_of
+    )
+    return _build_extend_candidate(composite_op, acc_dim, new_accs) if (acc_dim and new_accs) else None
+
+
+def _collect_new_accumulators(
+    context: KernelContext,
+    graph: KernelGraph,
+    composite_op: NKIOp,
+    acc_dim: str,
+    comp_gi: int,
+    comp_outputs: set[str],
+    existing_sources: set[NKIOp],
+    group_of: dict[int, int],
+) -> list[tuple[NKIOp, str]]:
+    """Walk every op in the composite's group; return accumulator candidates not already absorbed."""
+    result: list[tuple[NKIOp, str]] = []
+    for consumer in sorted(_all_ops(graph), key=lambda op: id(op)):
+        if not _is_extend_consumer(consumer, composite_op, comp_gi, acc_dim, existing_sources, group_of, context):
+            continue
+        role = _classify_accumulator(context, graph, composite_op, comp_outputs, consumer, acc_dim, group_of, comp_gi)
+        if role is not None:
+            result.append((consumer, role))
+    return result
+
+
+def _is_extend_consumer(
+    consumer: NKIOp,
+    composite_op: NKIOp,
+    comp_gi: int,
+    acc_dim: str,
+    existing_sources: set[NKIOp],
+    group_of: dict[int, int],
+    context: KernelContext,
+) -> bool:
+    """True iff consumer is a same-group, acc-dim-blocking, not-already-absorbed extension candidate."""
+    return (
+        consumer is not composite_op
+        and consumer not in existing_sources
+        and group_of[id(consumer)] == comp_gi
+        and acc_dim in context.op_blocking_dims.get(consumer, set())
+    )
+
+
+def _build_extend_candidate(
+    composite_op: NKIOp, acc_dim: str, new_accs: list[tuple[NKIOp, str]]
+) -> OnlineFusionCandidate:
+    """Fold per-accumulator roles into one OnlineFusionCandidate in extend mode."""
+    acc_ops = tuple(op for op, _ in new_accs)
+    role = new_accs[0][1]
+    for _op, r in new_accs[1:]:
+        role = _merge_roles(role, r)
+    return OnlineFusionCandidate(
+        x_op=composite_op, accumulator_ops=acc_ops, blocking_dim=acc_dim, scale_role=role, mode="extend"
+    )
+
+
+def _existing_accumulator_sources(op_cls: type[NKIOp]) -> set[NKIOp]:
+    """Set of original ``source_op`` instances already absorbed as accumulators."""
+    sources: set[NKIOp] = set()
+    specs = getattr(op_cls, "ACCUMULATOR_SPECS", ())
+    for spec in specs:
+        source = getattr(spec, "source_op", None)
+        if source is not None:
+            sources.add(source)
+    return sources
 
 
 def _match_on_dim(
@@ -153,18 +246,22 @@ def _walk_back_for_separable(
     visited: set[str] = set()
     stack: list[str] = [tensor_name]
     role: str | None = None
-    while stack and role is None:
+    reached_x = False
+    while stack and role is None and not reached_x:
         cur = stack.pop()
         if cur in visited:
             continue
         visited.add(cur)
-        producer = _producer_op(context, graph, cur)
-        if producer is None:
+        if cur in x_outputs:
+            reached_x = True
             continue
-        if group_of.get(id(producer)) != acc_gi:
+        producer = _producer_op(context, graph, cur)
+        if producer is None or group_of.get(id(producer)) != acc_gi:
             continue
         role = _separable_role_via(context, producer, x_outputs, group_of, acc_gi)
         stack.extend(_separable_parents(context, producer))
+    if role is None and reached_x:
+        role = "passthrough_mul"
     return role
 
 

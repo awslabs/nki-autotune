@@ -21,7 +21,7 @@ other rewrites in a single stochastic loop.
 from collections import deque
 from dataclasses import dataclass
 
-from nkigym.kernel_ir.context.context import KernelContext
+from nkigym.kernel_ir.context.context import DimRole, KernelContext
 from nkigym.kernel_ir.graph.fusion_group import FusionGroup
 from nkigym.kernel_ir.graph.graph import KernelGraph, rebuild_edges
 from nkigym.kernel_ir.sampler.partition import compute_reachability
@@ -104,10 +104,20 @@ def _group_touched_dims(context: KernelContext, group: FusionGroup) -> set[str]:
 
 
 def _group_blocking_dims(context: KernelContext, group: FusionGroup) -> set[str]:
-    """Union of every op's blocking dims in the group."""
+    """Union of every op's SERIAL blocking dims in the group.
+
+    ACCUMULATION dims do **not** block: by construction they
+    produce valid incremental state per iteration, so a consumer
+    in a downstream group can read the running buffer inside the
+    same loop. Only SERIAL dims require the producer's reduction
+    to complete before consumers may read.
+    """
     result: set[str] = set()
     for op in group.ops:
-        result |= context.op_blocking_dims.get(op, set())
+        for dim_id in context.op_blocking_dims.get(op, set()):
+            dim_info = context.dimensions.get(dim_id)
+            if dim_info is None or dim_info.role is DimRole.SERIAL:
+                result.add(dim_id)
     return result
 
 

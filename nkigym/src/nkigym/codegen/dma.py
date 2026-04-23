@@ -15,14 +15,44 @@ emits ``stage_block`` after its accumulation loops close.
 
 from nkigym.codegen.buffers import sbuf_buffer
 from nkigym.codegen.group_loops import DepthPlan
+from nkigym.codegen.matmul_block_detect import gadget_absorbed_dims, is_matmul_block_candidate
 from nkigym.codegen.sbuf_buffer import AxisAccess, buffer_ident
 from nkigym.kernel_ir import KernelIR
 from nkigym.kernel_ir.context.context import TensorInfo
 from nkigym.kernel_ir.validate import tier_depth_range
-from nkigym.kernel_ir.validate.emission import block_depth, body_depth, ltile_depth, material_blocking_dims
+from nkigym.kernel_ir.validate.emission import (
+    Placement,
+    block_depth,
+    body_depth,
+    ltile_depth,
+    material_blocking_dims,
+    op_emission_placement,
+)
 from nkigym.ops.base import NKIOp
+from nkigym.ops.dma import NKIDMATranspose, NKIStore
 
 _TIER_RANK = {"per_tile": 0, "per_block": 1, "full": 2}
+
+
+def render_dma_op(
+    ir: KernelIR,
+    op: NKIOp,
+    gi: int,
+    op_to_group: dict[int, int],
+    staged: set[str],
+    memo: dict[int, Placement],
+    before_plan: DepthPlan,
+    after_plan: DepthPlan,
+) -> None:
+    """Render ``NKILoad`` / ``NKIStore`` / ``NKIDMATranspose`` at its own emission slot."""
+    placement = op_emission_placement(ir.context, ir.graph, op, gi, op_to_group, staged, memo)
+    renderer = (
+        dma_store_line
+        if isinstance(op, NKIStore)
+        else (dma_transpose_line if isinstance(op, NKIDMATranspose) else dma_load_line)
+    )
+    target = before_plan if placement.phase == "before" else after_plan
+    target.setdefault(gi, {}).setdefault(placement.depth, []).append(renderer(ir, op, gi, placement.depth))
 
 
 def build_op_to_group(ir: KernelIR) -> dict[int, int]:
@@ -81,7 +111,7 @@ def dma_transpose_line(ir: KernelIR, op: NKIOp, group_idx: int, depth: int) -> s
     p_access, f_access = _axis_access(ir, group_idx, sbuf_name, tinfo, dim_order, depth)
     p_start, p_count, f_start, f_count = buf.range(p_access, f_access)
     input_tinfo = context.logical_tensors[hbm_name]
-    mem_expr = f"{hbm_name}{_hbm_slice(ir, input_tinfo, dim_order, depth)}"
+    mem_expr = f"{hbm_name}{_hbm_slice(ir, input_tinfo, dim_order, depth, gadget_absorbed_dims(ir, group_idx))}"
     sbuf_arg = f"sbuf_{buffer_ident(sbuf_name)}"
     return f"load_block({sbuf_arg}, {mem_expr}, {p_start}, {p_count}, {f_start}, {f_count}, transpose=True)"
 
@@ -104,7 +134,12 @@ def tier_depth(ir: KernelIR, group_idx: int, tensor_name: str, tinfo: TensorInfo
 
 
 def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> tuple[DepthPlan, DepthPlan]:
-    """Plan PSUM→SBUF staging for blocking PSUM producers."""
+    """Plan PSUM→SBUF staging for blocking PSUM producers.
+
+    Skips producers whose op is dispatched to the matmul_block
+    gadget — that path writes directly into the running-sum SBUF
+    buffer and has no PSUM→SBUF staging to emit.
+    """
     before: DepthPlan = {}
     after: DepthPlan = {}
     context = ir.context
@@ -113,6 +148,8 @@ def render_psum_staging(ir: KernelIR, op_to_group: dict[int, int], staged: set[s
         if producer is None or has_output_ptile_dims(ir, producer):
             continue
         gi = op_to_group[id(producer)]
+        if is_matmul_block_candidate(ir, producer, gi):
+            continue
         dim_order = ir.graph.groups[gi].dim_order
         material = material_blocking_dims(context, producer, dim_order)
         if not material:
@@ -203,7 +240,7 @@ def _gadget_call(
     p_start, p_count, f_start, f_count = buf.range(p_access, f_access)
     sbuf_arg = f"sbuf_{buffer_ident(tensor_name)}"
     effective_hbm = hbm_name if hbm_name is not None else tensor_name
-    mem_expr = _mem_expr(ir, effective_hbm, tinfo, dim_order, depth, psum_src)
+    mem_expr = _mem_expr(ir, effective_hbm, tinfo, dim_order, depth, psum_src, gadget_absorbed_dims(ir, group_idx))
     bounds = f"{p_start}, {p_count}, {f_start}, {f_count}"
     first, second = (sbuf_arg, mem_expr) if sbuf_is_dst else (mem_expr, sbuf_arg)
     return f"{gadget}({first}, {second}, {bounds})"
@@ -213,17 +250,23 @@ def _axis_access(
     ir: KernelIR, group_idx: int, tensor_name: str, tinfo: TensorInfo, dim_order: list[str], depth: int
 ) -> tuple[AxisAccess, AxisAccess]:
     """Return ``(p_access, f_access)`` for a gadget emission at ``depth``."""
+    absorbed = _absorbed_dims(ir, group_idx)
     dim_ids = tinfo.dim_ids
-    p_axis = _scope_access(group_idx, tensor_name, dim_ids[0], dim_order, depth, ir)
+    p_axis = _scope_access(group_idx, tensor_name, dim_ids[0], dim_order, depth, ir, absorbed)
     if len(dim_ids) == 2:
-        f_axis = _scope_access(group_idx, tensor_name, dim_ids[1], dim_order, depth, ir)
+        f_axis = _scope_access(group_idx, tensor_name, dim_ids[1], dim_order, depth, ir, absorbed)
     else:
         f_axis = AxisAccess(block="0", ltile="0")
     return p_axis, f_axis
 
 
+def _absorbed_dims(ir: KernelIR, group_idx: int) -> set[str]:
+    """Return the ltile-absorbed dim set for ``group_idx``."""
+    return gadget_absorbed_dims(ir, group_idx)
+
+
 def _scope_access(
-    group_idx: int, tensor_name: str, dim_id: str, dim_order: list[str], depth: int, ir: KernelIR
+    group_idx: int, tensor_name: str, dim_id: str, dim_order: list[str], depth: int, ir: KernelIR, absorbed: set[str]
 ) -> AxisAccess:
     """Bind ``block`` / ``ltile`` for one dim based on tier and in-scope loops."""
     placements = ir.graph.groups[group_idx].tensor_placements
@@ -234,7 +277,8 @@ def _scope_access(
     if dim_id in dim_order:
         pos = dim_order.index(dim_id)
         block = _bind(tier, "full", depth > block_depth(pos), f"i_block_{dim_id}")
-        ltile = _bind(tier, "per_block", depth > ltile_depth(pos), f"i_ltile_{dim_id}")
+        ltile_is_open = depth > ltile_depth(pos) and dim_id not in absorbed
+        ltile = _bind(tier, "per_block", ltile_is_open, f"i_ltile_{dim_id}")
     return AxisAccess(block=block, ltile=ltile)
 
 
@@ -251,37 +295,50 @@ def _bind(tier: str, required_tier: str, loop_open: bool, var: str) -> str | Non
 
 
 def _mem_expr(
-    ir: KernelIR, tensor_name: str, tinfo: TensorInfo, dim_order: list[str], depth: int, psum_src: bool
+    ir: KernelIR,
+    tensor_name: str,
+    tinfo: TensorInfo,
+    dim_order: list[str],
+    depth: int,
+    psum_src: bool,
+    absorbed: set[str],
 ) -> str:
     """Return the 2D HBM or PSUM argument expression passed to the gadget."""
     if psum_src:
         expr = f"psum_{buffer_ident(tensor_name)}"
     else:
-        expr = f"{tensor_name}{_hbm_slice(ir, tinfo, dim_order, depth)}"
+        expr = f"{tensor_name}{_hbm_slice(ir, tinfo, dim_order, depth, absorbed)}"
     return expr
 
 
-def _hbm_slice(ir: KernelIR, tinfo: TensorInfo, dim_order: list[str], depth: int) -> str:
+def _hbm_slice(ir: KernelIR, tinfo: TensorInfo, dim_order: list[str], depth: int, absorbed: set[str]) -> str:
     """HBM slice covering the in-flight portion of the tensor."""
     dim_ids = tinfo.dim_ids
-    par = _hbm_axis_range(ir, dim_ids[0], dim_order, depth)
+    par = _hbm_axis_range(ir, dim_ids[0], dim_order, depth, absorbed)
     if len(dim_ids) == 2:
-        free = _hbm_axis_range(ir, dim_ids[1], dim_order, depth)
+        free = _hbm_axis_range(ir, dim_ids[1], dim_order, depth, absorbed)
         expr = f"[{par}, {free}]"
     else:
         expr = f"[{par}]"
     return expr
 
 
-def _hbm_axis_range(ir: KernelIR, dim_id: str, dim_order: list[str], depth: int) -> str:
-    """HBM ``start:end`` range for one dim."""
+def _hbm_axis_range(ir: KernelIR, dim_id: str, dim_order: list[str], depth: int, absorbed: set[str]) -> str:
+    """HBM ``start:end`` range for one dim.
+
+    ``absorbed`` carries dims whose ltile loops are absorbed by a
+    gadget — for those dims the slice always spans one whole
+    block (block_stride wide) even when the emission depth is
+    inside the (would-be-open) ltile slot.
+    """
     context = ir.context
     di = context.dimensions[dim_id]
     logical = di.logical_tile_size
     block_stride = context.ltiles_per_block.get(dim_id, 1) * logical
+    ltile_slot_open = dim_id in dim_order and depth > ltile_depth(dim_order.index(dim_id)) and dim_id not in absorbed
     if dim_id not in dim_order or depth <= block_depth(dim_order.index(dim_id)):
         rng = f"0:{di.dim_size}"
-    elif depth <= ltile_depth(dim_order.index(dim_id)):
+    elif not ltile_slot_open:
         start = f"i_block_{dim_id} * {block_stride}"
         rng = f"{start}:{start} + {block_stride}"
     else:
