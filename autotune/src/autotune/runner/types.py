@@ -101,6 +101,22 @@ class ProfileResult(NamedTuple):
     Timing fields are ``None`` for kernels that failed CPU sim, compile, or
     hardware execution — a failed kernel produced no valid measurement and
     reporting zeros would be misleading.
+
+    Roofline fields are sourced from the ``neuron-profile`` summary-json
+    emitted by an NTFF trace, so they reflect the post-compiler-optimized
+    kernel behavior rather than a static analysis of the NKI source:
+
+        mbu_estimated_percent
+            Memory bandwidth utilization — measured HBM traffic rate as a
+            fraction of the HBM bandwidth ceiling.
+        mfu_max_achievable_estimated_percent
+            The kernel's roofline-limited compute ceiling: what fraction of
+            peak FLOPS this kernel *could* hit given its measured
+            arithmetic intensity. Ties mfu_estimated_percent to a meaningful
+            upper bound for that specific kernel.
+        roofline_efficiency
+            ``mfu / mfu_max_achievable_estimated_percent`` — how close the
+            kernel gets to its own ceiling (memory- or compute-bound).
     """
 
     kernel_name: str
@@ -112,6 +128,9 @@ class ProfileResult(NamedTuple):
     mfu: float | None
     cpu_sim: dict
     hardware_output: str
+    mbu_estimated_percent: float | None = None
+    mfu_max_achievable_estimated_percent: float | None = None
+    roofline_efficiency: float | None = None
 
 
 class BenchmarkConfig(NamedTuple):
@@ -121,6 +140,30 @@ class BenchmarkConfig(NamedTuple):
     iters: int
     mac_count: int
     input_dtype_name: str
+
+
+class RooflineMetrics(NamedTuple):
+    """Post-compiler roofline metrics sourced from ``neuron-profile``.
+
+    Extracted from the NTFF trace's summary-json so the numbers reflect
+    what the compiler actually produced (DMA scheduling, buffer reuse,
+    prefetching), not a static analysis of the NKI source.
+
+    Attributes:
+        mbu_estimated_percent: HBM bandwidth utilization percent.
+        mfu_max_achievable_estimated_percent: The kernel's roofline-limited
+            compute ceiling — the MFU this kernel *could* hit given its
+            measured arithmetic intensity. Caps out at the hardware peak
+            when the kernel is compute-bound.
+        roofline_efficiency: ``mfu / mfu_max_achievable_estimated_percent``,
+            expressed as a percent — how close the kernel gets to its own
+            ceiling regardless of whether that ceiling is memory- or
+            compute-bound.
+    """
+
+    mbu_estimated_percent: float | None
+    mfu_max_achievable_estimated_percent: float | None
+    roofline_efficiency: float | None
 
 
 class OutputSpec(NamedTuple):

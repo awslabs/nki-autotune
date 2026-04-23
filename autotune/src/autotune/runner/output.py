@@ -15,6 +15,9 @@ class SuccessRow(NamedTuple):
     p50_ms: float
     p99_ms: float
     mfu: float
+    mbu: float | None
+    roofline_ceiling: float | None
+    roofline_efficiency: float | None
 
 
 def _collect_successes(results: list[ProfileResult]) -> list[SuccessRow]:
@@ -33,6 +36,9 @@ def _collect_successes(results: list[ProfileResult]) -> list[SuccessRow]:
                 p50_ms=r.p50_ms,
                 p99_ms=r.p99_ms,
                 mfu=r.mfu,
+                mbu=r.mbu_estimated_percent,
+                roofline_ceiling=r.mfu_max_achievable_estimated_percent,
+                roofline_efficiency=r.roofline_efficiency,
             )
         )
     return rows
@@ -80,9 +86,12 @@ def _format_results_table(successes: list[SuccessRow]) -> list[str]:
     """Format the timing results table for successful kernels."""
     lines: list[str] = []
     show_mfu = any(s.mfu > 0 for s in successes)
+    show_roofline = any(s.roofline_efficiency is not None for s in successes)
     header = f"{'Kernel':<30} {'min_ms':>10} {'mean_ms':>10} {'p50_ms':>10} {'p99_ms':>10}"
     if show_mfu:
         header += f" {'mfu':>8}"
+    if show_roofline:
+        header += f" {'mbu':>8} {'ceiling':>8} {'roofline':>9}"
     for s in sorted(successes, key=lambda s: s.min_ms):
         if not lines:
             lines.append(header)
@@ -90,8 +99,15 @@ def _format_results_table(successes: list[SuccessRow]) -> list[str]:
         row = f"{s.kernel_name:<30} {s.min_ms:>10.4f} {s.mean_ms:>10.4f} {s.p50_ms:>10.4f} {s.p99_ms:>10.4f}"
         if show_mfu:
             row += f" {s.mfu:>7.2f}%"
+        if show_roofline:
+            row += f" {_fmt_pct(s.mbu):>8} {_fmt_pct(s.roofline_ceiling):>8} {_fmt_pct(s.roofline_efficiency):>9}"
         lines.append(row)
     return lines
+
+
+def _fmt_pct(value: float | None) -> str:
+    """Format a percentage with '-' for None."""
+    return "-" if value is None else f"{value:.2f}%"
 
 
 def _format_failures(failures: list[ProfileResult]) -> list[str]:

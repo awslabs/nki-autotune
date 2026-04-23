@@ -4,12 +4,15 @@ Worker-only module — imports nki and nkipy at top level. Not safe to
 import on the coordinator machine.
 """
 
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, cast
 
 import nki
 import numpy as np
+from nki.compiler.ncc_driver import extract_perf_metrics
 from nkipy.core.backend.hlo import HLOModule, HLOTensor
 from nkipy.runtime import BaremetalExecutor, CompiledKernel
 from spike.spike_model import BenchmarkResult
@@ -20,6 +23,7 @@ from autotune.runner.types import (
     CompileResult,
     OutputSpec,
     ProfileResult,
+    RooflineMetrics,
     _sim_not_run,
     calculate_mfu,
     capture_error,
@@ -96,6 +100,71 @@ def _run_timing(
     return min_ms, mean_ms, p50_ms, p99_ms, mfu
 
 
+_EMPTY_ROOFLINE = RooflineMetrics(
+    mbu_estimated_percent=None, mfu_max_achievable_estimated_percent=None, roofline_efficiency=None
+)
+
+
+def _collect_roofline(
+    spike: BaremetalExecutor, compiled: CompiledKernel, kernel_kwargs: dict[str, Any], mfu: float | None
+) -> RooflineMetrics:
+    """Run the kernel once with ``save_trace=True`` and extract profiler metrics.
+
+    Returns MBU, the kernel's roofline-limited MFU ceiling, and the
+    fraction of that ceiling actually reached. Sourced from
+    ``neuron-profile``'s summary-json so the arithmetic intensity
+    reflects the post-compiler DMA schedule, not a static analysis of
+    the NKI source.
+    """
+    metrics: dict[str, Any] | None = None
+    with tempfile.TemporaryDirectory(prefix="autotune-profile-") as artifacts_dir:
+        try:
+            spike.run(compiled, *tensor_inputs(kernel_kwargs), save_trace=True, artifacts_dir=artifacts_dir)
+            ntff_path = os.path.join(artifacts_dir, "profile.ntff")
+            if os.path.isfile(ntff_path):
+                metrics = extract_perf_metrics(compiled.compiled_artifact, ntff_path, verbose=False)
+        except Exception as e:
+            raise RuntimeError(f"Roofline profile run failed: {e}") from e
+    return _roofline_from_metrics(metrics, mfu)
+
+
+def _roofline_from_metrics(metrics: dict[str, Any] | None, mfu: float | None) -> RooflineMetrics:
+    """Assemble a RooflineMetrics from a ``neuron-profile`` summary-json dict.
+
+    ``neuron-profile`` reports ``mbu_estimated_percent``,
+    ``mfu_estimated_percent``, and ``mfu_max_achievable_estimated_percent``
+    as fractions in [0, 1] (matching the compiler's internal convention);
+    we scale to percent so values align with the existing ``mfu`` field.
+    ``roofline_efficiency`` = measured MFU / ceiling MFU, expressed as a
+    percent so a kernel that lands at its ceiling reads 100%.
+    """
+    mbu_pct: float | None = None
+    ceiling_pct: float | None = None
+    efficiency: float | None = None
+    if metrics is not None:
+        mbu_pct = _to_percent(metrics.get("mbu_estimated_percent"))
+        ceiling_pct = _to_percent(metrics.get("mfu_max_achievable_estimated_percent"))
+        if mfu is not None and ceiling_pct and ceiling_pct > 0:
+            efficiency = 100.0 * mfu / ceiling_pct
+    return RooflineMetrics(
+        mbu_estimated_percent=mbu_pct, mfu_max_achievable_estimated_percent=ceiling_pct, roofline_efficiency=efficiency
+    )
+
+
+def _to_percent(value: Any) -> float | None:
+    """Convert a ``neuron-profile`` fractional metric to percent.
+
+    Profiler fields are fractions in [0, 1]; None or negative sentinels
+    signal "not available".
+    """
+    result: float | None = None
+    if value is not None:
+        scaled = float(value) * 100.0
+        if scaled >= 0:
+            result = scaled
+    return result
+
+
 def benchmark_one(
     spike: BaremetalExecutor,
     cr: CompileResult,
@@ -109,6 +178,9 @@ def benchmark_one(
 
     Timing only — no numerical correctness checks. The cpu_sim field
     carries the CPU simulation result from earlier in the pipeline.
+    Also runs one extra ``save_trace=True`` pass so ``neuron-profile``
+    can emit MBU and the roofline-limited MFU ceiling for the
+    post-compiler kernel.
 
     Args:
         spike: Active BaremetalExecutor session.
@@ -124,10 +196,12 @@ def benchmark_one(
     p50_ms: float | None = None
     p99_ms: float | None = None
     mfu: float | None = None
+    roofline = _EMPTY_ROOFLINE
     hardware_output = f"{list(out.shape)} {out.dtype}"
     try:
         compiled = create_compiled_kernel(cr.neff_path, cr.nki_path, func_name, kernel_kwargs, out)
         min_ms, mean_ms, p50_ms, p99_ms, mfu = _run_timing(spike, compiled, kernel_kwargs, config)
+        roofline = _collect_roofline(spike, compiled, kernel_kwargs, mfu)
     except Exception as e:
         hardware_output = capture_error(e)
         min_ms = mean_ms = p50_ms = p99_ms = mfu = None
@@ -141,6 +215,9 @@ def benchmark_one(
         mfu=mfu,
         cpu_sim=cpu_sim if cpu_sim is not None else _sim_not_run(),
         hardware_output=hardware_output,
+        mbu_estimated_percent=roofline.mbu_estimated_percent,
+        mfu_max_achievable_estimated_percent=roofline.mfu_max_achievable_estimated_percent,
+        roofline_efficiency=roofline.roofline_efficiency,
     )
 
 

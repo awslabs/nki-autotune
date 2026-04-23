@@ -8,7 +8,6 @@ its resolved inputs, outputs, axis map, tile sizes, and blocking
 dim.
 """
 
-from collections.abc import Iterator
 from dataclasses import replace
 
 from nkigym.kernel_ir.context.context import DimRole, KernelContext, TensorInfo
@@ -37,43 +36,21 @@ def rewrite_one_candidate(
 
 
 def _absorbed_ops(context: KernelContext, graph: KernelGraph, candidate: OnlineFusionCandidate) -> set[NKIOp]:
-    """Every op on a data-flow path from X to any accumulator."""
-    ops = _all_ops(graph)
-    forward = _bfs(context, ops, [candidate.x_op], forward=True)
-    backward = _bfs(context, ops, list(candidate.accumulator_ops), forward=False)
-    return forward & backward
+    """Every op in X's group plus every op in each accumulator's group.
 
-
-def _build_adjacency(context: KernelContext, ops: list[NKIOp], forward: bool) -> dict[NKIOp, list[NKIOp]]:
-    """Build producer→consumer (forward) or consumer→producer (backward) adjacency."""
-    adjacency: dict[NKIOp, list[NKIOp]] = {op: [] for op in ops}
-    for producer, consumer, _name in _iter_data_edges(context, ops):
-        src, dst = (producer, consumer) if forward else (consumer, producer)
-        adjacency[src].append(dst)
-    return adjacency
-
-
-def _iter_data_edges(context: KernelContext, ops: list[NKIOp]) -> Iterator[tuple[NKIOp, NKIOp, str]]:
-    """Yield ``(producer, consumer, tensor_name)`` triples via tensor-name matching."""
-    for producer in ops:
-        for name in context.op_outputs.get(producer, []):
-            for consumer in ops:
-                if name in context.op_inputs.get(consumer, {}).values():
-                    yield producer, consumer, name
-
-
-def _bfs(context: KernelContext, ops: list[NKIOp], starts: list[NKIOp], forward: bool) -> set[NKIOp]:
-    """BFS following data-flow edges (forward/backward) using op-instance identity."""
-    adjacency = _build_adjacency(context, ops, forward)
-    seen = set(starts)
-    stack = list(starts)
-    while stack:
-        node = stack.pop()
-        for neighbor in adjacency.get(node, []):
-            if neighbor not in seen:
-                seen.add(neighbor)
-                stack.append(neighbor)
-    return seen
+    The detector only matches when trivial fusion has already
+    pulled the intermediates into those groups, so the absorbed
+    set is exactly the union of their ``ops`` lists — no forward ∩
+    backward BFS through the data-flow graph.
+    """
+    group_of = {id(op): gi for gi, group in enumerate(graph.groups) for op in group.ops}
+    group_indices: set[int] = {group_of[id(candidate.x_op)]}
+    for acc_op in candidate.accumulator_ops:
+        group_indices.add(group_of[id(acc_op)])
+    absorbed: set[NKIOp] = set()
+    for gi in group_indices:
+        absorbed.update(graph.groups[gi].ops)
+    return absorbed
 
 
 def _external_boundary(

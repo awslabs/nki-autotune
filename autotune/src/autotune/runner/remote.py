@@ -287,6 +287,8 @@ def _write_results_json(
             sbuf_oom += 1
     times = [t for _, t, _ in successes]
     mfus = [m for _, _, m in successes]
+    roofline_effs = [r.roofline_efficiency for r, _, _ in successes if r.roofline_efficiency is not None]
+    mbus = [r.mbu_estimated_percent for r, _, _ in successes if r.mbu_estimated_percent is not None]
 
     kernel_entries = []
     for r in sorted(results, key=lambda r: _kernel_sort_key(r.kernel_name)):
@@ -307,6 +309,10 @@ def _write_results_json(
             "worst_kernel": worst_kernel,
             "best_mfu": max(mfus) if mfus else None,
             "worst_mfu": min(mfus) if mfus else None,
+            "best_roofline_efficiency": max(roofline_effs) if roofline_effs else None,
+            "worst_roofline_efficiency": min(roofline_effs) if roofline_effs else None,
+            "best_mbu": max(mbus) if mbus else None,
+            "worst_mbu": min(mbus) if mbus else None,
             "passed_cpu_sim": passed_cpu_sim,
             "success": success,
             "sbuf_oom": sbuf_oom,
