@@ -2,7 +2,7 @@
 
 from nkigym.codegen.matmul_block_detect import gadget_absorbed_dims
 from nkigym.kernel_ir import KernelIR
-from nkigym.kernel_ir.context.context import DimInfo
+from nkigym.kernel_ir.types import DimInfo
 from nkigym.kernel_ir.validate.emission import block_depth, body_depth, ltile_depth
 
 DepthPlan = dict[int, dict[int, list[str]]]
@@ -26,7 +26,7 @@ def render_group_loops(
     before = before_plan or {}
     after = after_plan or {}
     lines: list[str] = []
-    for group_idx in ir.graph.toposort_groups():
+    for group_idx in ir.toposort_groups():
         lines.extend(_render_group(ir, group_idx, body_indent, before.get(group_idx, {}), after.get(group_idx, {})))
     return "\n".join(lines)
 
@@ -46,11 +46,11 @@ def _render_group(
     the Python indent level independently of logical slot depth so
     suppressed loops don't leave stair-step indentation gaps.
     """
-    context = ir.context
-    group = ir.graph.groups[group_idx]
+    ir = ir
+    group = ir.groups[group_idx]
     dim_order = group.dim_order
     n = len(dim_order)
-    tpb_by_dim = {dim_id: context.ltiles_per_block.get(dim_id, 1) for dim_id in dim_order}
+    tpb_by_dim = {dim_id: ir.ltiles_per_block.get(dim_id, 1) for dim_id in dim_order}
     absorbed = gadget_absorbed_dims(ir, group_idx)
     depth_indent = _compute_depth_indent(dim_order, absorbed, base_indent)
 
@@ -66,7 +66,7 @@ def _render_group(
 
     inject(before_lines, 0)
     for pos, dim_id in enumerate(dim_order):
-        di = context.dimensions[dim_id]
+        di = ir.dimensions[dim_id]
         num_blocks = di.dim_size // (tpb_by_dim[dim_id] * di.logical_tile_size)
         b_depth = block_depth(pos)
         range_fn = _dim_range_fn(di)

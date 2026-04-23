@@ -59,7 +59,7 @@ class KernelJob(NamedTuple):
             ``NKIOp`` through its numpy ``__call__``.
         nkigym_func_name: Name of the nkigym math function within
             ``nkigym_source``.
-        mac_count: Theoretical MAC count, derived from the KernelContext
+        mac_count: Theoretical MAC count, derived from the KernelIR
             on the coordinator. Avoids AST scans of the rendered
             kernel (which misattribute trip counts when loops from
             different fusion groups interleave).

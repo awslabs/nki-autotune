@@ -19,7 +19,6 @@ When the pattern does NOT match, ``_render_one_op`` falls back to
 the classic PSUM-only path (unchanged).
 """
 
-from nkigym.codegen.buffers import sbuf_buffer
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.codegen.matmul_block_detect import is_matmul_block_candidate
 from nkigym.codegen.sbuf_buffer import AxisAccess, buffer_ident
@@ -41,18 +40,18 @@ def render_matmul_block_op(ir: KernelIR, op: NKIOp, group_idx: int, before_plan:
 
     Pre-memset of ``sbuf_<output>`` goes at depth 0 (group top).
     """
-    context = ir.context
-    group = ir.graph.groups[group_idx]
+    ir = ir
+    group = ir.groups[group_idx]
     dim_order = group.dim_order
     n = len(dim_order)
-    axis_map = context.op_axis_map.get(op, {})
+    axis_map = ir.op_axis_map.get(op, {})
     k_dim = axis_map["K"]
     m_dim = axis_map["M"]
     n_dim = axis_map["N"]
 
-    out_name = context.op_outputs.get(op, [])[0]
-    out_tinfo = context.logical_tensors[out_name]
-    inputs = context.op_inputs.get(op, {})
+    out_name = ir.op_outputs.get(op, [])[0]
+    out_tinfo = ir.logical_tensors[out_name]
+    inputs = ir.op_inputs.get(op, {})
     stat_name = inputs["stationary"]
     mov_name = inputs["moving"]
 
@@ -61,8 +60,10 @@ def render_matmul_block_op(ir: KernelIR, op: NKIOp, group_idx: int, before_plan:
     p_start, p_count = _block_slab_range(ir, group_idx, out_name, m_dim)
     f_start, f_count = _block_slab_range(ir, group_idx, out_name, n_dim)
     k_start, k_count = _k_slab_range(ir, group_idx, stat_name, k_dim)
-    tile_m = context.op_tile_sizes.get(op, {}).get(m_dim, context.dimensions[m_dim].physical_tile_size)
-    tile_n = context.op_tile_sizes.get(op, {}).get(n_dim, context.dimensions[n_dim].physical_tile_size)
+    s_p_slot, _ = _free_block_slot(ir, group_idx, stat_name, m_dim)
+    m_f_slot, _ = _free_block_slot(ir, group_idx, mov_name, n_dim)
+    tile_m = ir.op_tile_sizes.get(op, {}).get(m_dim, ir.dimensions[m_dim].physical_tile_size)
+    tile_n = ir.op_tile_sizes.get(op, {}).get(n_dim, ir.dimensions[n_dim].physical_tile_size)
 
     sbuf_out_arg = f"sbuf_{buffer_ident(out_name)}"
     stat_arg = f"sbuf_{buffer_ident(stat_name)}"
@@ -70,7 +71,7 @@ def render_matmul_block_op(ir: KernelIR, op: NKIOp, group_idx: int, before_plan:
 
     call = (
         f"matmul_block({sbuf_out_arg}, {p_start}, {p_count}, {f_start}, {f_count}, "
-        f"{stat_arg}, {mov_arg}, {k_start}, {k_count}, {tile_m}, {tile_n})"
+        f"{stat_arg}, {s_p_slot}, {mov_arg}, {m_f_slot}, {k_start}, {k_count}, {tile_m}, {tile_n})"
     )
     before_plan.setdefault(group_idx, {}).setdefault(emit_depth, []).append(call)
 
@@ -87,8 +88,8 @@ def _output_memset_depth(ir: KernelIR, group_idx: int, tensor_name: str, dim_ord
     declared fresh, never earlier (buffer undefined) or later
     (memset overrun by accumulation writes).
     """
-    placements = ir.graph.groups[group_idx].tensor_placements
-    tinfo = ir.context.logical_tensors[tensor_name]
+    placements = ir.groups[group_idx].tensor_placements
+    tinfo = ir.logical_tensors[tensor_name]
     depth = 0
     for dim_id in tinfo.dim_ids:
         if dim_id not in dim_order:
@@ -114,9 +115,9 @@ def _block_slab_range(ir: KernelIR, group_idx: int, tensor_name: str, dim_id: st
     at the list level. ``start`` names the first slot; ``count``
     is the number of contiguous slots.
     """
-    placements = ir.graph.groups[group_idx].tensor_placements
+    placements = ir.groups[group_idx].tensor_placements
     tier = placements.get(("sbuf", tensor_name, dim_id), "per_tile")
-    tpb = ir.context.ltiles_per_block.get(dim_id, 1)
+    tpb = ir.ltiles_per_block.get(dim_id, 1)
     if tier == "full":
         start = f"i_block_{dim_id} * {tpb}" if tpb > 1 else f"i_block_{dim_id}"
     elif tier == "per_block":
@@ -128,24 +129,42 @@ def _block_slab_range(ir: KernelIR, group_idx: int, tensor_name: str, dim_id: st
 
 def _k_slab_range(ir: KernelIR, group_idx: int, tensor_name: str, k_dim: str) -> tuple[str, int]:
     """Return ``(k_start_slot, k_count)`` along the K axis for one inner-K slab."""
-    placements = ir.graph.groups[group_idx].tensor_placements
+    placements = ir.groups[group_idx].tensor_placements
     tier = placements.get(("sbuf", tensor_name, k_dim), "per_tile")
     if tier != "per_block":
         raise ValueError(f"matmul_block requires K-input tier=per_block on {tensor_name!r}; got {tier!r}")
-    tpb = ir.context.ltiles_per_block.get(k_dim, 1)
+    tpb = ir.ltiles_per_block.get(k_dim, 1)
     return "0", tpb
 
 
+def _free_block_slot(ir: KernelIR, group_idx: int, tensor_name: str, free_dim: str) -> tuple[str, int]:
+    """Return ``(slot_index_expr, num_blocks_on_dim)`` into the K-input's free-axis slot list.
+
+    Free-axis leaf layout is controlled by tier × leaf-fold rules:
+    ``per_block`` collapses to 1 slot (``i_block`` not stored in
+    the list dim), ``full`` keeps ``num_blocks`` slots addressed
+    by ``i_block``. With gadget-absorbed free dims the gadget
+    slices inside a wide leaf via ``pi * tile_m`` — this helper
+    just tells it WHICH slot holds the current M-or-N block.
+    """
+    placements = ir.groups[group_idx].tensor_placements
+    tier = placements.get(("sbuf", tensor_name, free_dim), "per_tile")
+    di = ir.dimensions[free_dim]
+    tpb = ir.ltiles_per_block.get(free_dim, 1)
+    num_blocks = di.dim_size // (tpb * di.logical_tile_size)
+    if tier == "full":
+        slot = f"i_block_{free_dim}"
+    elif tier == "per_block":
+        slot = "0"
+    else:
+        raise ValueError(f"matmul_block requires block-slab placement on {tensor_name!r}[{free_dim}]; got {tier!r}")
+    return slot, num_blocks
+
+
 def _render_output_memsets(ir: KernelIR, tensor_name: str, tinfo: object) -> list[str]:
-    """Emit memset loops zeroing every slot of the SBUF output buffer at kernel start."""
-    _ = tinfo
-    buf = sbuf_buffer(ir, tensor_name)
-    leaf_expr = f"sbuf_{buffer_ident(tensor_name)}[i_pmr][i_fmr]"
-    return [
-        f"for i_pmr in range({buf.p.list_slots}):",
-        f"    for i_fmr in range({buf.f.list_slots}):",
-        f"        nisa.memset({leaf_expr}[0:{buf.p.logical}, 0:{buf.f.logical}], 0.0)",
-    ]
+    """Emit a ``memset_block(...)`` call zeroing the SBUF output buffer."""
+    _ = tinfo, ir
+    return [f"memset_block(sbuf_{buffer_ident(tensor_name)}, 0.0)"]
 
 
 _ = (_tensor_dim_ids, AxisAccess, block_depth, ltile_depth)

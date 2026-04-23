@@ -1,4 +1,4 @@
-"""Matrix multiplication: remote search over sampled KernelContext variants.
+"""Matrix multiplication: remote search over sampled KernelIR variants.
 
 Four input-layout variants:
   * ``lhs_T @ rhs``   -- lhs_T(K, M), rhs(K, N)   -> direct nc_matmul

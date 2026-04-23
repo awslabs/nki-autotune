@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from nkigym.codegen.buffers import sbuf_buffer
 from nkigym.codegen.group_loops import DepthPlan
 from nkigym.codegen.sbuf_buffer import AxisAccess, buffer_ident
-from nkigym.kernel_ir import KernelContext, KernelIR
-from nkigym.kernel_ir.context.context import TensorInfo
+from nkigym.kernel_ir import KernelIR
+from nkigym.kernel_ir.types import TensorInfo
 from nkigym.kernel_ir.validate.emission import Placement, block_depth, ltile_depth
 from nkigym.ops.base import NKIOp
 
@@ -40,12 +40,12 @@ class ReducedOutput:
 
 def reduced_outputs_with_multichunk(ir: KernelIR, op: NKIOp) -> list[ReducedOutput]:
     """Return every output of ``op`` whose reduction dim(s) are multi-chunk."""
-    context = ir.context
+    ir = ir
     op_cls = type(op)
-    axis_map = context.op_axis_map.get(op, {})
-    blocking = context.op_blocking_dims.get(op, set())
-    kwargs = context.op_kwargs.get(op, {})
-    outputs = context.op_outputs.get(op, [])
+    axis_map = ir.op_axis_map.get(op, {})
+    blocking = ir.op_blocking_dims.get(op, set())
+    kwargs = ir.op_kwargs.get(op, {})
+    outputs = ir.op_outputs.get(op, [])
     result: list[ReducedOutput] = []
     for role_idx, role in enumerate(op_cls.OUTPUT_AXES):
         if role_idx >= len(outputs):
@@ -66,11 +66,11 @@ def reduced_outputs_with_multichunk(ir: KernelIR, op: NKIOp) -> list[ReducedOutp
 
 def _any_multichunk(ir: KernelIR, dim_ids: set[str]) -> bool:
     """True iff any dim's block-loop or ltile-loop trip is > 1."""
-    context = ir.context
+    ir = ir
     result = False
     for d in dim_ids:
-        di = context.dimensions[d]
-        tpb = context.ltiles_per_block.get(d, 1)
+        di = ir.dimensions[d]
+        tpb = ir.ltiles_per_block.get(d, 1)
         num_blocks = di.dim_size // (tpb * di.logical_tile_size)
         if num_blocks > 1 or tpb > 1:
             result = True
@@ -107,13 +107,13 @@ def init_depth(ir: KernelIR, op: NKIOp, gi: int) -> int:
     position of the outermost material reduction dim in the
     group's dim_order — i.e. OUTSIDE that dim's block loop.
     """
-    context = ir.context
+    ir = ir
     op_cls = type(op)
-    axis_map = context.op_axis_map.get(op, {})
-    blocking = context.op_blocking_dims.get(op, set())
-    kwargs = context.op_kwargs.get(op, {})
+    axis_map = ir.op_axis_map.get(op, {})
+    blocking = ir.op_blocking_dims.get(op, set())
+    kwargs = ir.op_kwargs.get(op, {})
     reduction_dims: set[str] = set()
-    outputs = context.op_outputs.get(op, [])
+    outputs = ir.op_outputs.get(op, [])
     for role_idx, role in enumerate(op_cls.OUTPUT_AXES):
         if role_idx >= len(outputs):
             continue
@@ -123,16 +123,16 @@ def init_depth(ir: KernelIR, op: NKIOp, gi: int) -> int:
         out_axes = op_cls.OUTPUT_AXES[role]
         out_dims = {axis_map.get(ax) for ax in out_axes if axis_map.get(ax) is not None}
         reduction_dims |= blocking - out_dims
-    dim_order = ir.graph.groups[gi].dim_order
+    dim_order = ir.groups[gi].dim_order
     positions = [dim_order.index(d) for d in reduction_dims if d in dim_order]
     return block_depth(min(positions)) if positions else 0
 
 
-def scratch_shape(context: KernelContext, tinfo: TensorInfo) -> tuple[int, int]:
+def scratch_shape(ir: KernelIR, tinfo: TensorInfo) -> tuple[int, int]:
     """Return ``(P, F)`` physical tile shape for a reduced output's scratch buffer."""
     dim_ids = tinfo.dim_ids
-    p = context.dimensions[dim_ids[0]].physical_tile_size
-    f = context.dimensions[dim_ids[1]].physical_tile_size if len(dim_ids) == 2 else 1
+    p = ir.dimensions[dim_ids[0]].physical_tile_size
+    f = ir.dimensions[dim_ids[1]].physical_tile_size if len(dim_ids) == 2 else 1
     return p, f
 
 
@@ -158,13 +158,13 @@ def apply_reduction_plan(
     3. Combine ISA calls after the op call to accumulate
        chunk → running via the declared combinator.
     """
-    context = ir.context
+    ir = ir
     depth = init_depth(ir, op, gi)
     top_lines = before_plan.setdefault(gi, {}).setdefault(0, [])
     init_lines = before_plan.setdefault(gi, {}).setdefault(depth, [])
     for r in reduced:
-        tinfo = context.logical_tensors[r.tensor_name]
-        p, f = scratch_shape(context, tinfo)
+        tinfo = ir.logical_tensors[r.tensor_name]
+        p, f = scratch_shape(ir, tinfo)
         chunk_dtype = _chunk_scratch_dtype(r.combinator, tinfo.dtype)
         chunk_name = f"{buffer_ident(r.tensor_name)}_chunk"
         top_lines.append(f"sbuf_{chunk_name} = nl.ndarray(({p}, {f}), dtype=nl.{chunk_dtype}, buffer=nl.sbuf)")
@@ -188,11 +188,11 @@ def _chunk_scratch_dtype(combinator: str, tensor_dtype: str) -> str:
 
 def _running_access(ir: KernelIR, group_idx: int, reduced: ReducedOutput, placement: Placement) -> str:
     """SBUF access string for the running (accumulated) output at the op's emission slot."""
-    tinfo = ir.context.logical_tensors[reduced.tensor_name]
+    tinfo = ir.logical_tensors[reduced.tensor_name]
     buf = sbuf_buffer(ir, reduced.tensor_name)
     dim_ids = tinfo.dim_ids
-    placements = ir.graph.groups[group_idx].tensor_placements
-    dim_order = ir.graph.groups[group_idx].dim_order
+    placements = ir.groups[group_idx].tensor_placements
+    dim_order = ir.groups[group_idx].dim_order
     p_access = _running_axis_access(reduced.tensor_name, dim_ids[0], placements, dim_order, placement)
     if len(dim_ids) == 2:
         f_access = _running_axis_access(reduced.tensor_name, dim_ids[1], placements, dim_order, placement)

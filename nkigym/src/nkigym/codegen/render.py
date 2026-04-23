@@ -19,9 +19,9 @@ def render_ir(ir: KernelIR) -> str:
 
     Emits: header, then one sibling loop nest per fusion group.
     DMA (HBM↔SBUF) is driven by ``NKILoad`` / ``NKIStore`` /
-    ``NKIDMATranspose`` nodes in the op graph — each emits at
+    ``NKIDMATranspose`` nodes in the op ir — each emits at
     its own op placement. PSUM→SBUF staging is implicit
-    renderer logic (no graph node). ISA calls, stages, and
+    renderer logic (no ir node). ISA calls, stages, and
     DMA lines all land in the same depth-indexed plan that
     ``render_group_loops`` walks to produce source.
     """
@@ -29,7 +29,7 @@ def render_ir(ir: KernelIR) -> str:
     op_to_group = build_op_to_group(ir)
     tensor_to_groups = build_tensor_to_groups(ir)
     staged = find_psum_tensors_needing_sbuf(ir)
-    header = render_header(ir.context)
+    header = render_header(ir)
 
     before_plan: DepthPlan = {}
     staging_before, staging_after = render_psum_staging(ir, op_to_group, staged)
@@ -40,7 +40,7 @@ def render_ir(ir: KernelIR) -> str:
 
     sbuf_by_group = render_sbuf_buffers(ir, staged=staged, tensor_to_groups=tensor_to_groups)
     psum_allocs = render_psum_allocations(ir, op_to_group)
-    for group_idx in range(len(ir.graph.groups)):
+    for group_idx in range(len(ir.groups)):
         for depth, lines in sbuf_by_group.get(group_idx, {}).items():
             if lines:
                 before_plan.setdefault(group_idx, {}).setdefault(depth, [])[:0] = lines
@@ -49,7 +49,7 @@ def render_ir(ir: KernelIR) -> str:
             before_plan.setdefault(group_idx, {}).setdefault(0, [])[:0] = group_psum
 
     group_src = render_group_loops(ir, body_indent=1, before_plan=before_plan, after_plan=staging_after)
-    ret = render_return(ir.context)
+    ret = render_return(ir)
 
     return "\n".join([header, group_src, ret]) + "\n"
 

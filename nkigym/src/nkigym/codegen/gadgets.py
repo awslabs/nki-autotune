@@ -59,6 +59,24 @@ def load_block(
                 nisa.dma_copy(dst, mem[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f])
 
 
+def memset_block(buffer: Any, value: float) -> None:
+    """Fill every leaf of a nested SBUF / PSUM list buffer with ``value``.
+
+    ``buffer`` is the ``[NP_list][NF_list]`` nested list used
+    throughout codegen; each leaf is a 2D ``nl.ndarray(P, F)``.
+    Iterates every list slot and emits one ``nisa.memset`` per
+    leaf covering the full ``(0:P, 0:F)`` region.
+    """
+    np_slots = len(buffer)
+    nf_slots = len(buffer[0]) if np_slots > 0 else 0
+    if np_slots == 0 or nf_slots == 0:
+        raise ValueError(f"memset_block got empty buffer with shape ({np_slots}, {nf_slots})")
+    p, f = buffer[0][0].shape
+    for pi in range(np_slots):
+        for fi in range(nf_slots):
+            nisa.memset(buffer[pi][fi][0:p, 0:f], value)
+
+
 def stage_block(sbuf: Any, mem: Any, p_start: int, p_count: int, f_start: int, f_count: int) -> None:
     """PSUM → SBUF: copy ``mem`` into the ``[p_start : p_start + p_count][f_start : f_start + f_count]`` sub-block of ``sbuf``."""
     p, f = sbuf[0][0].shape
@@ -96,7 +114,9 @@ def matmul_block(
     f_start: int,
     f_count: int,
     sbuf_stationary: Any,
+    s_p_slot: int,
     sbuf_moving: Any,
+    m_f_slot: int,
     k_start: int,
     k_count: int,
     tile_m: int,
@@ -104,12 +124,13 @@ def matmul_block(
 ) -> None:
     """Two-level matmul block: absorbs M-ltile / N-ltile / K-ltile iteration.
 
-    ``sbuf_stationary`` and ``sbuf_moving`` use wide leaves of
-    ``(TILE_K, p_count * tile_m)`` and ``(TILE_K, f_count * tile_n)``
-    respectively (one leaf per inner-K slot); the gadget slices
-    inside each leaf to reach the ``(pi, fi)`` output tile.
+    ``sbuf_stationary[k][s_p_slot]`` is one SBUF leaf of shape
+    ``(TILE_K, p_count * tile_m)``; ``sbuf_moving[k][m_f_slot]``
+    is one leaf of shape ``(TILE_K, f_count * tile_n)``. The
+    gadget slices inside each leaf to reach the ``(pi, fi)``
+    output tile.
 
-    For each output tile ``(pi, fi)`` in
+    For each ``(pi, fi)`` in
     ``[p_start, p_start+p_count) x [f_start, f_start+f_count)``:
 
       1. Zero a reused PSUM scratch tile.
@@ -121,7 +142,7 @@ def matmul_block(
     Caller must pre-memset every ``sbuf_out`` leaf before the
     first outer-K invocation.
     """
-    tile_k = sbuf_stationary[k_start][0].shape[0]
+    tile_k = sbuf_stationary[k_start][s_p_slot].shape[0]
     psum_tile = nl.ndarray((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum)
     acc_tile = nl.ndarray((tile_m, tile_n), dtype=sbuf_out[0][0].dtype, buffer=nl.sbuf)
     for pi in range(p_count):
@@ -130,8 +151,8 @@ def matmul_block(
             for ki in range(k_count):
                 nisa.nc_matmul(
                     dst=psum_tile[0:tile_m, 0:tile_n],
-                    stationary=sbuf_stationary[k_start + ki][0][0:tile_k, pi * tile_m : pi * tile_m + tile_m],
-                    moving=sbuf_moving[k_start + ki][0][0:tile_k, fi * tile_n : fi * tile_n + tile_n],
+                    stationary=sbuf_stationary[k_start + ki][s_p_slot][0:tile_k, pi * tile_m : pi * tile_m + tile_m],
+                    moving=sbuf_moving[k_start + ki][m_f_slot][0:tile_k, fi * tile_n : fi * tile_n + tile_n],
                 )
             nisa.tensor_copy(acc_tile[0:tile_m, 0:tile_n], psum_tile[0:tile_m, 0:tile_n])
             nisa.tensor_tensor(

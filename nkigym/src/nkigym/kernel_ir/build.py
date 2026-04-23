@@ -1,4 +1,4 @@
-"""Build the initial ``(KernelContext, KernelGraph)`` from a math function.
+"""Build the initial ``(KernelIR, KernelIR)`` from a math function.
 
 Pipeline:
 
@@ -6,11 +6,11 @@ Pipeline:
    ``(op_cls, name_kwargs, output_names, all_kwargs)`` call-site
    tuples.
 2. Instantiate one ``NKIOp`` per call site — each gets a
-   distinct instance used as a dict key in ``KernelContext``.
+   distinct instance used as a dict key in ``KernelIR``.
 3. Forward pass resolves per-op axis maps, tile sizes, blocking
    dims, and the logical-tensor catalog.
 4. Wrap each op in a singleton ``FusionGroup``; assemble the
-   graph with group-level edges.
+   ir with group-level edges.
 """
 
 import inspect
@@ -22,17 +22,16 @@ from typing import cast
 import numpy as np
 
 from nkigym.kernel_ir.compute_skip_prop import propagate_compute_skip
-from nkigym.kernel_ir.context.context import DimInfo, DimRole, KernelContext, TensorInfo
-from nkigym.kernel_ir.context.parse import find_ops
-from nkigym.kernel_ir.context.trace import trace_scalar_kwargs
-from nkigym.kernel_ir.graph.fusion_group import FusionGroup
-from nkigym.kernel_ir.graph.graph import KernelGraph, insert_dma_nodes, rebuild_edges
-from nkigym.kernel_ir.ir import KernelIR
+from nkigym.kernel_ir.fusion_group import FusionGroup
+from nkigym.kernel_ir.ir import KernelIR, insert_dma_nodes, rebuild_edges
+from nkigym.kernel_ir.parse import find_ops
 from nkigym.kernel_ir.rewrites.load_transpose_pattern import LoadTransposePattern
 from nkigym.kernel_ir.rewrites.online_fusion_pattern import OnlineFusionPattern
 from nkigym.kernel_ir.rewrites.pattern_rewrite import PatternRewrite, apply_rewrites_until_fixpoint
 from nkigym.kernel_ir.rewrites.trivial_fusion import TrivialFusion
 from nkigym.kernel_ir.sampler.sampler import sample_valid_ir
+from nkigym.kernel_ir.trace import trace_scalar_kwargs
+from nkigym.kernel_ir.types import DimInfo, DimRole, TensorInfo
 from nkigym.ops.base import NKIOp
 
 """Graph rewrites — split into mandatory pre-passes and sampled rewrites.
@@ -206,10 +205,8 @@ def _compute_tile_sizes(
     return dims, per_op_tile_sizes
 
 
-def build_initial(
-    func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]
-) -> tuple[KernelContext, KernelGraph]:
-    """Build the initial ``(context, graph)`` pair for a math function."""
+def build_initial(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
+    """Build the initial ``KernelIR`` for a math function — one singleton group per op."""
     param_names = list(inspect.signature(func).parameters.keys())
     for name in param_names:
         if name not in input_specs:
@@ -266,8 +263,9 @@ def build_initial(
         op_blocking_dims[op] = per_op_blocking[i]
 
     ltiles_per_block: dict[str, int] = {dim_id: 1 for dim_id in dimensions}
+    groups = [FusionGroup(ops=[op]) for op in op_instances]
 
-    context = KernelContext(
+    ir = KernelIR(
         func_name=func.__name__,
         param_names=param_names,
         return_name=return_name,
@@ -280,25 +278,23 @@ def build_initial(
         op_axis_map=op_axis_map,
         op_tile_sizes=op_tile_sizes,
         op_blocking_dims=op_blocking_dims,
+        groups=groups,
     )
-
-    groups = [FusionGroup(ops=[op]) for op in op_instances]
-    graph = KernelGraph(groups=groups)
-    rebuild_edges(graph, context)
-    return context, graph
+    rebuild_edges(ir)
+    return ir
 
 
 def build_naive_ir(
     func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]
-) -> tuple[KernelContext, KernelGraph, KernelContext, KernelGraph]:
-    """Return the naive baseline and the rewrite-ready ``(ctx, graph)`` seed.
+) -> tuple[KernelIR, KernelIR]:
+    """Return ``(naive_ir, seed_ir)`` — pre-rewrite and rewrite-ready KernelIR.
 
-    The pipeline is:
+    Pipeline:
 
-    1. ``build_initial`` + ``insert_dma_nodes`` → naive ``(ctx,
-       graph)``. Used to emit ``kernel_0`` — the raw operator
-       graph with ``NKIAffineSelect`` still present, no
-       compute-skip annotations, no rewrites, no merges.
+    1. ``build_initial`` + ``insert_dma_nodes`` → naive ``KernelIR``.
+       Used to emit ``kernel_0`` — the raw operator ir with
+       ``NKIAffineSelect`` still present, no compute-skip
+       annotations, no rewrites, no merges.
     2. ``propagate_compute_skip`` → mandatory pre-pass that lifts
        every ``NKIAffineSelect`` into per-op ``SkipPredicate``
        annotations and removes the standalone op.
@@ -306,26 +302,23 @@ def build_naive_ir(
        just ``TrivialFusion``, which is a strict no-op-or-better
        transform and is therefore lifted out of the sampled
        ``REWRITES`` set.
-    4. The resulting ``(ctx, graph)`` is the seed every
+    4. The resulting ``KernelIR`` is the seed every
        ``sample_valid_ir`` call starts from; remaining
        ``REWRITES`` are sampled per-draw inside
        ``sample_valid_ir``.
-
-    Returns:
-        ``(naive_ctx, naive_graph, seed_ctx, seed_graph)``.
     """
-    context, graph = build_initial(func, input_specs)
-    context, graph = insert_dma_nodes(context, graph)
-    naive_ctx, naive_graph = context, graph
-    context, graph = propagate_compute_skip(context, graph)
-    context, graph = apply_rewrites_until_fixpoint(context, graph, _MANDATORY_REWRITES)
-    return naive_ctx, naive_graph, context, graph
+    ir = build_initial(func, input_specs)
+    ir = insert_dma_nodes(ir)
+    naive = ir
+    ir = propagate_compute_skip(ir)
+    ir = apply_rewrites_until_fixpoint(ir, _MANDATORY_REWRITES)
+    return naive, ir
 
 
 def build_ir(
     func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], seed: int | None = None
 ) -> KernelIR:
-    """Convenience: build seed context + graph and sample one valid state."""
-    _naive_ctx, _naive_graph, context, graph = build_naive_ir(func, input_specs)
+    """Convenience: build seed IR and sample one valid state."""
+    _naive, seed_ir = build_naive_ir(func, input_specs)
     rng = random.Random(seed)
-    return sample_valid_ir(context, graph, rng, rewrites=REWRITES)
+    return sample_valid_ir(seed_ir, rng, rewrites=REWRITES)

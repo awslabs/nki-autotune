@@ -5,15 +5,13 @@ from pathlib import Path
 
 from nkigym.codegen import render_ir
 from nkigym.codegen.buffers import _SBUF_BUFFER_CACHE
-from nkigym.kernel_ir import KernelContext, KernelGraph, KernelIR, sample_valid_ir
-from nkigym.kernel_ir.context.build import REWRITES
+from nkigym.kernel_ir import KernelIR, sample_valid_ir
+from nkigym.kernel_ir.build import REWRITES
 
 
 def sample_variants(
-    naive_ctx: KernelContext,
-    naive_graph: KernelGraph,
-    ctx: KernelContext,
-    graph: KernelGraph,
+    ir: KernelIR,
+    ir: KernelIR,
     num_variants: int,
     rng: random.Random,
     cache_dir: Path | None = None,
@@ -25,7 +23,7 @@ def sample_variants(
     built from ``(naive_ctx, naive_graph)`` with NO rewrites
     applied. It samples only per-group codegen state. The
     remaining ``num_variants - 1`` kernels are drawn from
-    ``(ctx, graph)`` with the full ``REWRITES`` registry
+    ``(ctx, ir)`` with the full ``REWRITES`` registry
     sampled per draw.
     """
     _SBUF_BUFFER_CACHE.clear()
@@ -34,29 +32,23 @@ def sample_variants(
     variants: list[tuple[str, KernelIR, str]] = []
     seen: set[str] = set()
     _emit_naive_kernel_0(naive_ctx, naive_graph, rng, cache_dir, variants, seen)
-    _sample_remaining(ctx, graph, num_variants, rng, cache_dir, variants, seen, max_tries_per_variant)
+    _sample_remaining(ctx, ir, num_variants, rng, cache_dir, variants, seen, max_tries_per_variant)
     if len(variants) < num_variants:
         raise RuntimeError(f"Only {len(variants)}/{num_variants} unique variants produced")
     return variants
 
 
 def _emit_naive_kernel_0(
-    naive_ctx: KernelContext,
-    naive_graph: KernelGraph,
-    rng: random.Random,
-    cache_dir: Path | None,
-    variants: list[tuple[str, KernelIR, str]],
-    seen: set[str],
+    ir: KernelIR, rng: random.Random, cache_dir: Path | None, variants: list[tuple[str, KernelIR, str]], seen: set[str]
 ) -> None:
-    """Sample per-group codegen state for the raw baseline graph and record as kernel_0."""
+    """Sample per-group codegen state for the raw baseline ir and record as kernel_0."""
     candidate = sample_valid_ir(naive_ctx, naive_graph, rng, rewrites=[])
     source = render_ir(candidate)
     _record_kernel(0, candidate, source, cache_dir, variants, seen)
 
 
 def _sample_remaining(
-    ctx: KernelContext,
-    graph: KernelGraph,
+    ir: KernelIR,
     num_variants: int,
     rng: random.Random,
     cache_dir: Path | None,
@@ -64,11 +56,11 @@ def _sample_remaining(
     seen: set[str],
     max_tries_per_variant: int,
 ) -> None:
-    """Fill kernels 1..N-1 by sampling rewrites + codegen state from ``(ctx, graph)``."""
+    """Fill kernels 1..N-1 by sampling rewrites + codegen state from ``(ctx, ir)``."""
     tries = 0
     budget = max_tries_per_variant * num_variants
     while len(variants) < num_variants and tries < budget:
-        candidate = sample_valid_ir(ctx, graph, rng, rewrites=REWRITES)
+        candidate = sample_valid_ir(ctx, ir, rng, rewrites=REWRITES)
         source = render_ir(candidate)
         tries += 1
         if source in seen:
@@ -78,7 +70,7 @@ def _sample_remaining(
 
 def _record_kernel(
     idx: int,
-    candidate: KernelIR,
+    ir: KernelIR,
     source: str,
     cache_dir: Path | None,
     variants: list[tuple[str, KernelIR, str]],

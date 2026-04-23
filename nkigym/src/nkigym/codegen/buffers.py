@@ -2,9 +2,8 @@
 
 from nkigym.codegen.matmul_block_detect import is_matmul_block_candidate
 from nkigym.codegen.sbuf_buffer import SbufBuffer, buffer_ident, build_sbuf_buffer
-from nkigym.kernel_ir import KernelIR
-from nkigym.kernel_ir.context.context import KernelContext, TensorInfo
-from nkigym.kernel_ir.graph.graph import KernelGraph
+from nkigym.kernel_ir.ir import KernelIR
+from nkigym.kernel_ir.types import TensorInfo
 from nkigym.ops.base import NKIOp
 
 __all__ = [
@@ -38,9 +37,9 @@ def render_sbuf_buffers(
     matching the ``nki_matmul_fully_optimized_`` pattern when
     a matmul-block gadget dispatches on the same group.
     """
-    groups = ir.graph.groups
+    groups = ir.groups
     by_group: dict[int, dict[int, list[str]]] = {gi: {} for gi in range(len(groups))}
-    order = ir.graph.toposort_groups()
+    order = ir.toposort_groups()
     group_rank = {gi: rank for rank, gi in enumerate(order)}
     persistent = _persistent_sbuf_tensors(ir, staged, tensor_to_groups)
     for name, _tinfo in persistent:
@@ -63,9 +62,9 @@ def _alloc_depth(ir: KernelIR, tensor_name: str, group_idx: int) -> int:
     declared fresh each iteration of the tightest block loop it
     depends on.
     """
-    placements = ir.graph.groups[group_idx].tensor_placements
-    dim_order = ir.graph.groups[group_idx].dim_order
-    tinfo = ir.context.logical_tensors[tensor_name]
+    placements = ir.groups[group_idx].tensor_placements
+    dim_order = ir.groups[group_idx].dim_order
+    tinfo = ir.logical_tensors[tensor_name]
     depth = 0
     for dim_id in tinfo.dim_ids:
         if dim_id not in dim_order:
@@ -85,10 +84,10 @@ def render_psum_allocations(ir: KernelIR, op_to_group: dict[int, int]) -> dict[i
     allocates its own PSUM scratch internally, so emitting a
     module-level PSUM declaration would be dead code.
     """
-    context = ir.context
+    ir = ir
     psum_dtype_map = _build_psum_dtype_map(ir)
     by_group: dict[int, list[str]] = {}
-    for name, tinfo in context.logical_tensors.items():
+    for name, tinfo in ir.logical_tensors.items():
         producer = producer_op(ir, name)
         if producer is None or type(producer).ISA_LOC != "psum":
             continue
@@ -113,7 +112,7 @@ def prime_sbuf_cache(ir: KernelIR) -> dict[str, SbufBuffer]:
     f32_tensors = _float32_promoted_tensors(ir)
     cache = {
         name: build_sbuf_buffer(ir, name, "float32" if name in f32_tensors else tinfo.dtype)
-        for name, tinfo in ir.context.logical_tensors.items()
+        for name, tinfo in ir.logical_tensors.items()
     }
     _SBUF_BUFFER_CACHE[id(ir)] = cache
     return cache
@@ -125,52 +124,52 @@ def sbuf_dtype(ir: KernelIR, name: str, tinfo: TensorInfo) -> str:
 
 
 def _float32_promoted_tensors(ir: KernelIR) -> set[str]:
-    """Tensors consumed via a ``FLOAT32_KWARGS`` role anywhere in the graph."""
-    context = ir.context
+    """Tensors consumed via a ``FLOAT32_KWARGS`` role anywhere in the ir."""
+    ir = ir
     promoted: set[str] = set()
-    for op in context.op_inputs:
+    for op in ir.op_inputs:
         f32_roles = type(op).FLOAT32_KWARGS
         if not f32_roles:
             continue
-        kwargs = context.op_kwargs.get(op, {})
+        kwargs = ir.op_kwargs.get(op, {})
         for role in f32_roles:
             raw = kwargs.get(role)
             if raw is None:
                 continue
             value = raw[1:-1] if raw.startswith("'") and raw.endswith("'") else raw
-            if value in context.logical_tensors:
+            if value in ir.logical_tensors:
                 promoted.add(value)
     return promoted
 
 
 def find_psum_tensors_needing_sbuf(ir: KernelIR) -> set[str]:
     """PSUM-produced tensors that need an SBUF staging buffer."""
-    context = ir.context
-    graph = ir.graph
+    ir = ir
+    ir = ir
     result: set[str] = set()
-    for group in graph.groups:
+    for group in ir.groups:
         for op in group.ops:
             input_locs = type(op).INPUT_LOCS
-            for role, tname in context.op_inputs.get(op, {}).items():
-                if tname not in context.logical_tensors:
+            for role, tname in ir.op_inputs.get(op, {}).items():
+                if tname not in ir.logical_tensors:
                     continue
                 prod = producer_op(ir, tname)
                 if prod is None or type(prod).ISA_LOC != "psum":
                     continue
                 if input_locs.get(role) == "sbuf":
                     result.add(tname)
-    ret_producer = producer_op(ir, context.return_name)
+    ret_producer = producer_op(ir, ir.return_name)
     if ret_producer is not None and type(ret_producer).ISA_LOC == "psum":
-        result.add(context.return_name)
+        result.add(ir.return_name)
     return result
 
 
 def producer_op(ir: KernelIR, tensor_name: str) -> NKIOp | None:
     """Return the op producing ``tensor_name`` or None."""
     result: NKIOp | None = None
-    for group in ir.graph.groups:
+    for group in ir.groups:
         for op in group.ops:
-            if tensor_name in ir.context.op_outputs.get(op, []):
+            if tensor_name in ir.op_outputs.get(op, []):
                 result = op
                 break
         if result is not None:
@@ -181,17 +180,17 @@ def producer_op(ir: KernelIR, tensor_name: str) -> NKIOp | None:
 def producer_op_tiles(ir: KernelIR, tensor_name: str) -> dict[str, int]:
     """Producing op's tile sizes for a tensor, or ``{}`` for kernel inputs."""
     prod = producer_op(ir, tensor_name)
-    return dict(ir.context.op_tile_sizes.get(prod, {})) if prod is not None else {}
+    return dict(ir.op_tile_sizes.get(prod, {})) if prod is not None else {}
 
 
 def psum_tile_shape(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> tuple[int, ...]:
     """PSUM tile shape — the producer op's own output tile size."""
-    context = ir.context
+    ir = ir
     dim_ids = tinfo.dim_ids
     if len(dim_ids) not in (1, 2):
         raise ValueError(f"Tensor {tensor_name} has {len(dim_ids)} dims")
     op_tiles = producer_op_tiles(ir, tensor_name)
-    return tuple(op_tiles.get(d, context.dimensions[d].physical_tile_size) for d in dim_ids)
+    return tuple(op_tiles.get(d, ir.dimensions[d].physical_tile_size) for d in dim_ids)
 
 
 def psum_tile_slice(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> str:
@@ -221,7 +220,7 @@ def psum_tile_count(ir: KernelIR, tensor_name: str, tinfo: TensorInfo) -> int:
 def _max_degree_map(ir: KernelIR) -> dict[tuple[str, str, str], int]:
     """Cross-group widest degree per ``(kind, tensor, dim)``."""
     result: dict[tuple[str, str, str], int] = {}
-    for group in ir.graph.groups:
+    for group in ir.groups:
         for key, deg in group.buffer_degrees.items():
             prev = result.get(key, 0)
             if deg > prev:
@@ -235,7 +234,7 @@ def _persistent_sbuf_tensors(
     """SBUF-needing tensors touched by 2+ groups, in IR order."""
     return [
         (name, tinfo)
-        for name, tinfo in ir.context.logical_tensors.items()
+        for name, tinfo in ir.logical_tensors.items()
         if _needs_sbuf(ir, name, staged) and len(tensor_to_groups.get(name, ())) >= 2
     ]
 
@@ -244,8 +243,8 @@ def _per_group_sbuf_tensors(
     ir: KernelIR, staged: set[str], tensor_to_groups: dict[str, set[int]]
 ) -> dict[int, list[tuple[str, TensorInfo]]]:
     """SBUF-needing tensors touched by exactly one fusion group, keyed by that group."""
-    result: dict[int, list[tuple[str, TensorInfo]]] = {gi: [] for gi in range(len(ir.graph.groups))}
-    for name, tinfo in ir.context.logical_tensors.items():
+    result: dict[int, list[tuple[str, TensorInfo]]] = {gi: [] for gi in range(len(ir.groups))}
+    for name, tinfo in ir.logical_tensors.items():
         if not _needs_sbuf(ir, name, staged):
             continue
         groups = tensor_to_groups.get(name, set())
@@ -267,7 +266,7 @@ def _needs_sbuf(ir: KernelIR, name: str, staged: set[str]) -> bool:
       not SBUF.
     * PSUM-produced tensors that no consumer stages through SBUF.
     """
-    is_param = name in ir.context.param_names
+    is_param = name in ir.param_names
     prod = producer_op(ir, name)
     isa_loc = type(prod).ISA_LOC if prod is not None else None
     is_hbm_producer = isa_loc == "hbm"
@@ -288,26 +287,26 @@ def _psum_line(ir: KernelIR, name: str, tinfo: TensorInfo, dtype: str) -> str:
 def _build_psum_dtype_map(ir: KernelIR) -> dict[str, str]:
     """Map tensor names to PSUM dtype overrides."""
     result: dict[str, str] = {}
-    for op in ir.context.op_outputs:
+    for op in ir.op_outputs:
         dtype = type(op).PSUM_DTYPE
         if dtype is None:
             continue
-        for tname in ir.context.op_outputs.get(op, []):
+        for tname in ir.op_outputs.get(op, []):
             result[tname] = dtype
     return result
 
 
 def build_tensor_to_groups(ir: KernelIR) -> dict[str, set[int]]:
     """Map tensor names → set of group indices whose ops touch them."""
-    context = ir.context
+    ir = ir
     result: dict[str, set[int]] = {}
-    for gi, group in enumerate(ir.graph.groups):
+    for gi, group in enumerate(ir.groups):
         for op in group.ops:
-            names = [*context.op_inputs.get(op, {}).values(), *context.op_outputs.get(op, [])]
+            names = [*ir.op_inputs.get(op, {}).values(), *ir.op_outputs.get(op, [])]
             for name in names:
-                if name in context.logical_tensors:
+                if name in ir.logical_tensors:
                     result.setdefault(name, set()).add(gi)
     return result
 
 
-_ = (KernelContext, KernelGraph)
+_ = (KernelIR, KernelIR)

@@ -153,8 +153,8 @@ def _list_strides(
 
 def build_sbuf_buffer(ir: KernelIR, tensor_name: str, dtype: str) -> SbufBuffer:
     """Construct the ``SbufBuffer`` for a logical tensor."""
-    context = ir.context
-    tinfo = context.logical_tensors[tensor_name]
+    ir = ir
+    tinfo = ir.logical_tensors[tensor_name]
     dim_ids = tinfo.dim_ids
     if len(dim_ids) not in (1, 2):
         raise ValueError(f"Tensor {tensor_name} has {len(dim_ids)} dims, expected 1 or 2")
@@ -174,7 +174,7 @@ def _effective_tier_map(ir: KernelIR) -> dict[tuple[str, str, str], str]:
     """Cross-group widest tier per ``(kind, tensor, dim)``."""
     ranks = {"per_tile": 0, "per_block": 1, "full": 2}
     result: dict[tuple[str, str, str], str] = {}
-    for group in ir.graph.groups:
+    for group in ir.groups:
         for key, tier in group.tensor_placements.items():
             prev = result.get(key)
             if prev is None or ranks[tier] > ranks[prev]:
@@ -185,7 +185,7 @@ def _effective_tier_map(ir: KernelIR) -> dict[tuple[str, str, str], str]:
 def _effective_degree_map(ir: KernelIR) -> dict[tuple[str, str, str], int]:
     """Cross-group max degree per ``(kind, tensor, dim)``."""
     result: dict[tuple[str, str, str], int] = {}
-    for group in ir.graph.groups:
+    for group in ir.groups:
         for key, deg in group.buffer_degrees.items():
             prev = result.get(key, 0)
             if deg > prev:
@@ -212,12 +212,12 @@ def _build_axis(
     time and the gadget slices inside the leaf via ptile
     indexing.
     """
-    context = ir.context
-    di = context.dimensions[dim_id]
+    ir = ir
+    di = ir.dimensions[dim_id]
     phys = di.physical_tile_size
     ptiles_per_ltile = _max_op_tile(ir, tensor_name, dim_id) // phys
     tier = effective_tier.get(("sbuf", tensor_name, dim_id), "per_tile")
-    tpb = context.ltiles_per_block.get(dim_id, 1)
+    tpb = ir.ltiles_per_block.get(dim_id, 1)
     multi_buffer = effective_degree.get(("sbuf", tensor_name, dim_id), 1)
     ltiles_per_block = tpb if tier in ("per_block", "full") else 1
     num_blocks = di.dim_size // (tpb * di.logical_tile_size) if tier == "full" else 1
@@ -242,14 +242,14 @@ def _is_gadget_absorbed_free_axis(ir: KernelIR, tensor_name: str, dim_id: str) -
     free axes.
     """
     found = False
-    for gi, group in enumerate(ir.graph.groups):
+    for gi, group in enumerate(ir.groups):
         if found:
             break
         absorbed = gadget_absorbed_dims(ir, gi)
         if dim_id not in absorbed:
             continue
         for op in group.ops:
-            touched = [*ir.context.op_inputs.get(op, {}).values(), *ir.context.op_outputs.get(op, [])]
+            touched = [*ir.op_inputs.get(op, {}).values(), *ir.op_outputs.get(op, [])]
             if tensor_name in touched:
                 found = True
                 break
@@ -258,14 +258,14 @@ def _is_gadget_absorbed_free_axis(ir: KernelIR, tensor_name: str, dim_id: str) -
 
 def _max_op_tile(ir: KernelIR, tensor_name: str, dim_id: str) -> int:
     """Widest op tile size seen on ``dim_id`` across all ops touching ``tensor_name``."""
-    context = ir.context
-    max_tile = context.dimensions[dim_id].logical_tile_size
-    for group in ir.graph.groups:
+    ir = ir
+    max_tile = ir.dimensions[dim_id].logical_tile_size
+    for group in ir.groups:
         for op in group.ops:
-            touched = [*context.op_inputs.get(op, {}).values(), *context.op_outputs.get(op, [])]
+            touched = [*ir.op_inputs.get(op, {}).values(), *ir.op_outputs.get(op, [])]
             if tensor_name not in touched:
                 continue
-            op_tile = context.op_tile_sizes.get(op, {}).get(dim_id)
+            op_tile = ir.op_tile_sizes.get(op, {}).get(dim_id)
             if op_tile is not None:
                 max_tile = max(max_tile, op_tile)
     return max_tile

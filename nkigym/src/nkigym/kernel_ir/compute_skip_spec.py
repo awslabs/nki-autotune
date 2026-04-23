@@ -1,6 +1,6 @@
 """Per-op compute-skip annotation produced by ``propagate_compute_skip``.
 
-``SkipPredicate`` tags one ``NKIOp`` in ``KernelContext.op_skip_spec``.
+``SkipPredicate`` tags one ``NKIOp`` in ``KernelIR.op_skip_spec``.
 It carries the affine classifier coefficients from the removed
 ``NKIAffineSelect`` plus a single side-effect flag:
 

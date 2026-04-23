@@ -92,7 +92,7 @@ class AccumulatorSpec:
             Determines which sbuf_running_out_* buffer receives
             the σ-corrected accumulation.
         source_op_idx: The accumulator op's index in the ORIGINAL
-            graph — the rewrite reads its inputs/kwargs to
+            ir — the rewrite reads its inputs/kwargs to
             reproduce the per-chunk compute.
         chunk_output_name: Name of the per-chunk tensor the
             accumulator would have produced (for graphs where the
@@ -121,7 +121,7 @@ class OnlineFusionMatch:
     boundary, and the parametric specs.
 
     Attributes:
-        x_op_idx: The producer-reducer op in the current graph.
+        x_op_idx: The producer-reducer op in the current ir.
         absorbed_op_indices: Every op on a data-flow path from X
             to any accumulator, inclusive. The rewrite replaces
             these with one composite node.

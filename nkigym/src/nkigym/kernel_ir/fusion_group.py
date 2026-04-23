@@ -7,13 +7,13 @@ from nkigym.ops.base import NKIOp
 
 @dataclass
 class FusionGroup:
-    """One fusion-group node in the kernel graph.
+    """One fusion-group node in the kernel ir.
 
     Attributes:
         ops: Ordered ``NKIOp`` instances sharing this group's
             loop nest. Per-op resolved data (inputs, outputs,
             kwargs, axis map, tile sizes, blocking dims) lives
-            on ``KernelContext``, keyed by the op instance.
+            on ``KernelIR``, keyed by the op instance.
         dim_order: Sampler-chosen outer-to-inner loop order.
         buffer_degrees: Per-``(buffer_kind, tensor, dim)``
             multi-buffering degree.

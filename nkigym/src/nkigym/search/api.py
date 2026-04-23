@@ -75,7 +75,7 @@ def remote_search(
 ) -> ProfileOutput:
     """Sample ``num_variants`` unique variants from ``func`` and profile them.
 
-    Builds a seed ``KernelContext`` for ``func`` internally, rejection-
+    Builds a seed ``KernelIR`` for ``func`` internally, rejection-
     samples variants, wraps each in a ``KernelJob`` and delegates to
     ``remote_profile``. The nkigym math function itself is shipped
     to every remote worker and executed there as the fp32 golden
@@ -87,7 +87,7 @@ def remote_search(
 
     Args:
         func: Math function using NKIOp classes. Dimension analysis,
-            seed op graph, and the fp32 golden reference are all
+            seed op ir, and the fp32 golden reference are all
             derived from this.
         input_specs: ``{param_name: (shape, dtype)}`` used by every
             variant.
@@ -103,11 +103,11 @@ def remote_search(
         ProfileOutput with per-variant timing and correctness.
     """
     rng = random.Random(seed)
-    naive_ctx, naive_graph, ctx, graph = build_naive_ir(func, input_specs)
+    naive_ctx, naive_graph, ctx, ir = build_naive_ir(func, input_specs)
     mac_count = compute_mac_count(func, input_specs)
     nkigym_source = _func_source_with_imports(func)
     cache_path = Path(cache_dir)
-    variants = sample_variants(naive_ctx, naive_graph, ctx, graph, num_variants, rng, cache_dir=cache_path)
+    variants = sample_variants(naive_ctx, naive_graph, ctx, ir, num_variants, rng, cache_dir=cache_path)
     output_shape = tuple(naive_ctx.logical_tensors[naive_ctx.return_name].shape)
     kernels: dict[str, KernelJob] = {
         f"{name}.py": KernelJob(

@@ -4,20 +4,20 @@ Small primitive used by fusion rewrites (``TrivialFusion``) to
 check R1 convexity when merging two groups.
 """
 
-from nkigym.kernel_ir.graph.graph import KernelGraph
+from nkigym.kernel_ir.ir import KernelIR
 
 
-def compute_reachability(graph: KernelGraph) -> list[set[int]]:
+def compute_reachability(ir: KernelIR) -> list[set[int]]:
     """Return transitive-closure forward reachability over groups.
 
     ``reach[u]`` is the set of group indices reachable from ``u``
-    via ``graph.edges`` (inclusive of ``u``). Used by
+    via ``ir.edges`` (inclusive of ``u``). Used by
     ``TrivialFusion`` to test whether merging two groups preserves
     R1 — no external group is trapped on a DAG path between them.
     """
-    n = len(graph.groups)
+    n = len(ir.groups)
     adjacency: list[list[int]] = [[] for _ in range(n)]
-    for producer, consumer, _tensor, _role in graph.edges:
+    for producer, consumer, _tensor, _role in ir.edges:
         adjacency[producer].append(consumer)
     reach: list[set[int]] = [set() for _ in range(n)]
     for start in range(n):

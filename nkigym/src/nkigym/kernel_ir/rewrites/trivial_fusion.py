@@ -19,12 +19,12 @@ other rewrites in a single stochastic loop.
 """
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from nkigym.kernel_ir.context.context import DimRole, KernelContext
-from nkigym.kernel_ir.graph.fusion_group import FusionGroup
-from nkigym.kernel_ir.graph.graph import KernelGraph, rebuild_edges
+from nkigym.kernel_ir.fusion_group import FusionGroup
+from nkigym.kernel_ir.ir import KernelIR, rebuild_edges
 from nkigym.kernel_ir.sampler.partition import compute_reachability
+from nkigym.kernel_ir.types import DimRole
 from nkigym.ops.base import NKIOp
 
 
@@ -41,36 +41,36 @@ class TrivialFusion:
 
     name = "trivial_fusion"
 
-    def match(self, context: KernelContext, graph: KernelGraph) -> list[_Match]:
+    def match(self, ir: KernelIR) -> list[_Match]:
         """Return every legal producer→consumer pair."""
-        n = len(graph.groups)
-        reach = compute_reachability(graph)
+        n = len(ir.groups)
+        reach = compute_reachability(ir)
         matches: list[_Match] = []
-        for producer_gi, consumer_gi in _producer_consumer_edges(context, graph):
-            if not _shared_dims_all_parallel(context, graph, producer_gi, consumer_gi):
+        for producer_gi, consumer_gi in _producer_consumer_edges(ir):
+            if not _shared_dims_all_parallel(ir, producer_gi, consumer_gi):
                 continue
             if not _merge_preserves_convexity({producer_gi}, {consumer_gi}, n, reach):
                 continue
             matches.append(_Match(producer=producer_gi, consumer=consumer_gi))
         return matches
 
-    def apply(self, context: KernelContext, graph: KernelGraph, instance: _Match) -> tuple[KernelContext, KernelGraph]:
+    def apply(self, ir: KernelIR, instance: _Match) -> KernelIR:
         """Merge the two groups, producer-before-consumer."""
-        return context, _merge_two_groups(context, graph, instance.producer, instance.consumer)
+        return _merge_two_groups(ir, instance.producer, instance.consumer)
 
 
-def _producer_consumer_edges(context: KernelContext, graph: KernelGraph) -> list[tuple[int, int]]:
+def _producer_consumer_edges(ir: KernelIR) -> list[tuple[int, int]]:
     """Return every ``(producer_gi, consumer_gi)`` pair connected by at least one tensor."""
     producer_of_tensor: dict[str, int] = {}
-    for gi, group in enumerate(graph.groups):
+    for gi, group in enumerate(ir.groups):
         for op in group.ops:
-            for name in context.op_outputs.get(op, []):
+            for name in ir.op_outputs.get(op, []):
                 producer_of_tensor[name] = gi
     seen: set[tuple[int, int]] = set()
     edges: list[tuple[int, int]] = []
-    for gi, group in enumerate(graph.groups):
+    for gi, group in enumerate(ir.groups):
         for op in group.ops:
-            for name in context.op_inputs.get(op, {}).values():
+            for name in ir.op_inputs.get(op, {}).values():
                 src = producer_of_tensor.get(name)
                 if src is None or src == gi:
                     continue
@@ -82,28 +82,28 @@ def _producer_consumer_edges(context: KernelContext, graph: KernelGraph) -> list
     return edges
 
 
-def _shared_dims_all_parallel(context: KernelContext, graph: KernelGraph, producer_gi: int, consumer_gi: int) -> bool:
+def _shared_dims_all_parallel(ir: KernelIR, producer_gi: int, consumer_gi: int) -> bool:
     """True iff every dim shared between producer group and consumer group is parallel in the producer."""
-    producer_group = graph.groups[producer_gi]
-    consumer_group = graph.groups[consumer_gi]
-    shared = _group_touched_dims(context, producer_group) & _group_touched_dims(context, consumer_group)
-    producer_blocking = _group_blocking_dims(context, producer_group)
+    producer_group = ir.groups[producer_gi]
+    consumer_group = ir.groups[consumer_gi]
+    shared = _group_touched_dims(ir, producer_group) & _group_touched_dims(ir, consumer_group)
+    producer_blocking = _group_blocking_dims(ir, producer_group)
     return not (shared & producer_blocking)
 
 
-def _group_touched_dims(context: KernelContext, group: FusionGroup) -> set[str]:
+def _group_touched_dims(ir: KernelIR, group: FusionGroup) -> set[str]:
     """Union of dim IDs across every tensor any op in the group touches."""
     result: set[str] = set()
     for op in group.ops:
-        tensor_names = list(context.op_inputs.get(op, {}).values()) + list(context.op_outputs.get(op, []))
+        tensor_names = list(ir.op_inputs.get(op, {}).values()) + list(ir.op_outputs.get(op, []))
         for name in tensor_names:
-            tinfo = context.logical_tensors.get(name)
+            tinfo = ir.logical_tensors.get(name)
             if tinfo is not None:
                 result.update(tinfo.dim_ids)
     return result
 
 
-def _group_blocking_dims(context: KernelContext, group: FusionGroup) -> set[str]:
+def _group_blocking_dims(ir: KernelIR, group: FusionGroup) -> set[str]:
     """Union of every op's SERIAL blocking dims in the group.
 
     ACCUMULATION dims do **not** block: by construction they
@@ -114,29 +114,29 @@ def _group_blocking_dims(context: KernelContext, group: FusionGroup) -> set[str]
     """
     result: set[str] = set()
     for op in group.ops:
-        for dim_id in context.op_blocking_dims.get(op, set()):
-            dim_info = context.dimensions.get(dim_id)
+        for dim_id in ir.op_blocking_dims.get(op, set()):
+            dim_info = ir.dimensions.get(dim_id)
             if dim_info is None or dim_info.role is DimRole.SERIAL:
                 result.add(dim_id)
     return result
 
 
-def _merge_two_groups(context: KernelContext, graph: KernelGraph, gi: int, gj: int) -> KernelGraph:
-    """Return a new ``KernelGraph`` with groups ``gi`` and ``gj`` merged, producer-before-consumer."""
+def _merge_two_groups(ir: KernelIR, gi: int, gj: int) -> KernelIR:
+    """Return a new ``KernelIR`` with groups ``gi`` and ``gj`` merged, producer-before-consumer."""
     lo, hi = (gi, gj) if gi < gj else (gj, gi)
-    raw_ops = list(graph.groups[lo].ops) + list(graph.groups[hi].ops)
-    merged_ops = _toposort_ops(context, raw_ops)
+    raw_ops = list(ir.groups[lo].ops) + list(ir.groups[hi].ops)
+    merged_ops = _toposort_ops(ir, raw_ops)
     new_groups: list[FusionGroup] = []
-    for idx, grp in enumerate(graph.groups):
+    for idx, grp in enumerate(ir.groups):
         if idx == lo:
             new_groups.append(FusionGroup(ops=merged_ops))
         elif idx == hi:
             continue
         else:
             new_groups.append(FusionGroup(ops=list(grp.ops)))
-    new_graph = KernelGraph(groups=new_groups)
-    rebuild_edges(new_graph, context)
-    return new_graph
+    new_ir = replace(ir, groups=new_groups, edges=[])
+    rebuild_edges(new_ir)
+    return new_ir
 
 
 def _merge_preserves_convexity(a: set[int], b: set[int], n: int, reach: list[set[int]]) -> bool:
@@ -152,7 +152,7 @@ def _merge_preserves_convexity(a: set[int], b: set[int], n: int, reach: list[set
     return ok
 
 
-def _toposort_ops(context: KernelContext, ops: list[NKIOp]) -> list[NKIOp]:
+def _toposort_ops(ir: KernelIR, ops: list[NKIOp]) -> list[NKIOp]:
     """Return ``ops`` reordered so each producer precedes its consumers (Kahn's algorithm).
 
     Ties break on original input order — preserves the sequence
@@ -161,12 +161,12 @@ def _toposort_ops(context: KernelContext, ops: list[NKIOp]) -> list[NKIOp]:
     idx_of = {id(op): i for i, op in enumerate(ops)}
     producer_of: dict[str, NKIOp] = {}
     for op in ops:
-        for name in context.op_outputs.get(op, []):
+        for name in ir.op_outputs.get(op, []):
             producer_of[name] = op
     in_degree: dict[int, int] = {id(op): 0 for op in ops}
     adjacency: dict[int, list[NKIOp]] = {id(op): [] for op in ops}
     for consumer in ops:
-        for name in context.op_inputs.get(consumer, {}).values():
+        for name in ir.op_inputs.get(consumer, {}).values():
             producer = producer_of.get(name)
             if producer is None or producer is consumer:
                 continue

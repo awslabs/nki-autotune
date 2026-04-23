@@ -1,4 +1,4 @@
-"""Inner-layer sampler + graph-reachability helper used by TrivialFusion."""
+"""Inner-layer sampler + ir-reachability helper used by TrivialFusion."""
 
 from nkigym.kernel_ir.sampler.partition import compute_reachability
 from nkigym.kernel_ir.sampler.sampler import sample_valid_ir

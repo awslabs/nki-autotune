@@ -2,8 +2,7 @@
 
 from dataclasses import dataclass
 
-from nkigym.kernel_ir.context.context import KernelContext
-from nkigym.kernel_ir.graph.graph import KernelGraph
+from nkigym.kernel_ir.ir import KernelIR
 from nkigym.kernel_ir.rewrites.online_fusion_detect import OnlineFusionCandidate, detect_online_fusion
 from nkigym.kernel_ir.rewrites.online_fusion_rewrite import rewrite_one_candidate
 from nkigym.ops.online_fusion_chain import NKIOnlineFusionChain
@@ -21,9 +20,9 @@ class OnlineFusionPattern:
 
     name = "online_fusion"
 
-    def match(self, context: KernelContext, graph: KernelGraph) -> list[_Match]:
-        """Return every supported candidate visible in the current graph."""
-        candidates = detect_online_fusion(context, graph)
+    def match(self, ir: KernelIR) -> list[_Match]:
+        """Return every supported candidate visible in the current ir."""
+        candidates = detect_online_fusion(ir)
         supported = {"rsqrt_then_mul", "exp_bias"}
         extend_supported = supported | {"passthrough_mul"}
         return [
@@ -37,9 +36,9 @@ class OnlineFusionPattern:
         """Supported-role gate differs for create vs extend: extend inherits SCALE_SPEC, accepting passthrough_mul."""
         return candidate.scale_role in (extend_set if candidate.mode == "extend" else create_set)
 
-    def apply(self, context: KernelContext, graph: KernelGraph, instance: _Match) -> tuple[KernelContext, KernelGraph]:
+    def apply(self, ir: KernelIR, instance: _Match) -> tuple[KernelIR, KernelIR]:
         """Apply one candidate's rewrite."""
-        return rewrite_one_candidate(context, graph, instance.candidate)
+        return rewrite_one_candidate(ir, instance.candidate)
 
     @staticmethod
     def _is_valid_shape(candidate: OnlineFusionCandidate) -> bool:

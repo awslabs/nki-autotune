@@ -54,14 +54,14 @@ def wrap_annotated_ops(ir: KernelIR, before_plan: DepthPlan, per_op_lines: dict[
     are never gated — they are already outside the classifier's
     per-tile scope.
     """
-    context = ir.context
-    for gi, group in enumerate(ir.graph.groups):
+    ir = ir
+    for gi, group in enumerate(ir.groups):
         n = len(group.dim_order)
         inner_depth = 2 * n
         original = before_plan.get(gi, {}).get(inner_depth, [])
         if not original:
             continue
-        rebuilt = _rebuild_inner_body(ir, gi, original, group.ops, context.op_skip_spec, per_op_lines, inner_depth)
+        rebuilt = _rebuild_inner_body(ir, gi, original, group.ops, ir.op_skip_spec, per_op_lines, inner_depth)
         before_plan.setdefault(gi, {})[inner_depth] = rebuilt
 
 
@@ -112,11 +112,11 @@ def _rebuild_inner_body(
 
 def _op_touches_both_dims(ir: KernelIR, op: NKIOp, predicate: SkipPredicate) -> bool:
     """True iff the op touches both ``partition_dim_id`` and ``free_dim_id`` in any of its tensors."""
-    context = ir.context
-    names = list(context.op_inputs.get(op, {}).values()) + list(context.op_outputs.get(op, []))
+    ir = ir
+    names = list(ir.op_inputs.get(op, {}).values()) + list(ir.op_outputs.get(op, []))
     touches: set[str] = set()
     for name in names:
-        tinfo = context.logical_tensors.get(name)
+        tinfo = ir.logical_tensors.get(name)
         if tinfo is not None:
             touches.update(tinfo.dim_ids)
     return predicate.partition_dim_id in touches and predicate.free_dim_id in touches
@@ -150,17 +150,17 @@ def _mask_injection_lines(ir: KernelIR, op: NKIOp, predicate: SkipPredicate) -> 
     tile (in-place), matching what the standalone ``NKIAffineSelect``
     would have produced on the same data.
     """
-    context = ir.context
-    outputs = context.op_outputs.get(op, [])
+    ir = ir
+    outputs = ir.op_outputs.get(op, [])
     lines: list[str] = []
     for oname in outputs:
-        tinfo = context.logical_tensors.get(oname)
+        tinfo = ir.logical_tensors.get(oname)
         if tinfo is None:
             continue
         buf = sbuf_buffer(ir, oname)
         group_idx = _group_of(ir, op)
-        placements = ir.graph.groups[group_idx].tensor_placements
-        dim_order = ir.graph.groups[group_idx].dim_order
+        placements = ir.groups[group_idx].tensor_placements
+        dim_order = ir.groups[group_idx].dim_order
         p_access = _body_axis_access(oname, tinfo.dim_ids[0], placements, dim_order)
         if len(tinfo.dim_ids) == 2:
             f_access = _body_axis_access(oname, tinfo.dim_ids[1], placements, dim_order)
@@ -197,7 +197,7 @@ def _tile_offset_expr(ir: KernelIR, predicate: SkipPredicate) -> str:
 
 def _group_of(ir: KernelIR, op: NKIOp) -> int:
     """Return the group index containing ``op``."""
-    for gi, group in enumerate(ir.graph.groups):
+    for gi, group in enumerate(ir.groups):
         if op in group.ops:
             return gi
     raise ValueError(f"op {op!r} not found in any fusion group")
@@ -235,8 +235,8 @@ def _build_predicates(ir: KernelIR, spec: SkipPredicate) -> dict[str, str]:
 
 def _tile_start_with_strides(ir: KernelIR, dim_id: str) -> str:
     """Element start of one block/ltile slice for ``dim_id`` at the innermost body."""
-    di = ir.context.dimensions[dim_id]
-    tpb = ir.context.ltiles_per_block.get(dim_id, 1)
+    di = ir.dimensions[dim_id]
+    tpb = ir.ltiles_per_block.get(dim_id, 1)
     logical = di.logical_tile_size
     block_stride = logical * tpb
     terms: list[str] = []

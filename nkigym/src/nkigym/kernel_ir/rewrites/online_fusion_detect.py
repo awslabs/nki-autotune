@@ -1,4 +1,4 @@
-"""Online-fusion pattern detector on ``(KernelContext, KernelGraph)``.
+"""Online-fusion pattern detector on ``(KernelIR, KernelIR)``.
 
 Atomic matching: a candidate fires **only** when X and every
 accumulator sharing that X live in adjacent groups after trivial
@@ -15,8 +15,7 @@ constrained to ops trivial fusion already co-grouped.
 from collections import defaultdict
 from dataclasses import dataclass
 
-from nkigym.kernel_ir.context.context import KernelContext
-from nkigym.kernel_ir.graph.graph import KernelGraph
+from nkigym.kernel_ir.ir import KernelIR
 from nkigym.ops.base import NKIOp
 from nkigym.ops.online_fusion_chain import NKIOnlineFusionChain
 
@@ -40,62 +39,59 @@ class OnlineFusionCandidate:
     mode: str = "create"
 
 
-def _all_ops(graph: KernelGraph) -> list[NKIOp]:
+def _all_ops(ir: KernelIR) -> list[NKIOp]:
     """Flat walk over all ops across groups."""
-    return [op for group in graph.groups for op in group.ops]
+    return [op for group in ir.groups for op in group.ops]
 
 
-def _group_of_map(graph: KernelGraph) -> dict[int, int]:
+def _group_of_map(ir: KernelIR) -> dict[int, int]:
     """``id(op) -> group_idx`` lookup."""
-    return {id(op): gi for gi, group in enumerate(graph.groups) for op in group.ops}
+    return {id(op): gi for gi, group in enumerate(ir.groups) for op in group.ops}
 
 
-def _producer_op(context: KernelContext, graph: KernelGraph, tensor_name: str) -> NKIOp | None:
+def _producer_op(ir: KernelIR, tensor_name: str) -> NKIOp | None:
     """Return the op that produces ``tensor_name`` (or None)."""
     result: NKIOp | None = None
-    for op in _all_ops(graph):
-        if tensor_name in context.op_outputs.get(op, []):
+    for op in _all_ops(ir):
+        if tensor_name in ir.op_outputs.get(op, []):
             result = op
             break
     return result
 
 
-def detect_online_fusion(context: KernelContext, graph: KernelGraph) -> list[OnlineFusionCandidate]:
+def detect_online_fusion(ir: KernelIR) -> list[OnlineFusionCandidate]:
     """Return every atomic X + Accumulation candidate (both create and extend modes)."""
     candidates: list[OnlineFusionCandidate] = []
-    group_of = _group_of_map(graph)
-    for x_op in _all_ops(graph):
+    group_of = _group_of_map(ir)
+    for x_op in _all_ops(ir):
         if isinstance(x_op, NKIOnlineFusionChain):
-            extended = _detect_extend(context, graph, x_op, group_of)
+            extended = _detect_extend(ir, x_op, group_of)
             if extended is not None:
                 candidates.append(extended)
             continue
-        blocking_dims = context.op_blocking_dims.get(x_op, set())
+        blocking_dims = ir.op_blocking_dims.get(x_op, set())
         for dim_id in sorted(blocking_dims):
-            fused = _match_on_dim(context, graph, x_op, dim_id, group_of)
+            fused = _match_on_dim(ir, x_op, dim_id, group_of)
             if fused is not None:
                 candidates.append(fused)
     return candidates
 
 
 def _detect_extend(
-    context: KernelContext, graph: KernelGraph, composite_op: NKIOnlineFusionChain, group_of: dict[int, int]
+    ir: KernelIR, composite_op: NKIOnlineFusionChain, group_of: dict[int, int]
 ) -> OnlineFusionCandidate | None:
     """Find same-group accumulators whose data lineage traces back to ``composite_op``'s outputs."""
     op_cls = type(composite_op)
     acc_dim = op_cls.ACCUMULATION_DIM
     comp_gi = group_of[id(composite_op)]
-    comp_outputs = set(context.op_outputs.get(composite_op, []))
+    comp_outputs = set(ir.op_outputs.get(composite_op, []))
     existing_sources = _existing_accumulator_sources(op_cls)
-    new_accs = _collect_new_accumulators(
-        context, graph, composite_op, acc_dim, comp_gi, comp_outputs, existing_sources, group_of
-    )
+    new_accs = _collect_new_accumulators(ir, composite_op, acc_dim, comp_gi, comp_outputs, existing_sources, group_of)
     return _build_extend_candidate(composite_op, acc_dim, new_accs) if (acc_dim and new_accs) else None
 
 
 def _collect_new_accumulators(
-    context: KernelContext,
-    graph: KernelGraph,
+    ir: KernelIR,
     composite_op: NKIOp,
     acc_dim: str,
     comp_gi: int,
@@ -105,10 +101,10 @@ def _collect_new_accumulators(
 ) -> list[tuple[NKIOp, str]]:
     """Walk every op in the composite's group; return accumulator candidates not already absorbed."""
     result: list[tuple[NKIOp, str]] = []
-    for consumer in sorted(_all_ops(graph), key=lambda op: id(op)):
-        if not _is_extend_consumer(consumer, composite_op, comp_gi, acc_dim, existing_sources, group_of, context):
+    for consumer in sorted(_all_ops(ir), key=lambda op: id(op)):
+        if not _is_extend_consumer(consumer, composite_op, comp_gi, acc_dim, existing_sources, group_of, ir):
             continue
-        role = _classify_accumulator(context, graph, composite_op, comp_outputs, consumer, acc_dim, group_of, comp_gi)
+        role = _classify_accumulator(ir, composite_op, comp_outputs, consumer, acc_dim, group_of, comp_gi)
         if role is not None:
             result.append((consumer, role))
     return result
@@ -121,14 +117,14 @@ def _is_extend_consumer(
     acc_dim: str,
     existing_sources: set[NKIOp],
     group_of: dict[int, int],
-    context: KernelContext,
+    ir: KernelIR,
 ) -> bool:
     """True iff consumer is a same-group, acc-dim-blocking, not-already-absorbed extension candidate."""
     return (
         consumer is not composite_op
         and consumer not in existing_sources
         and group_of[id(consumer)] == comp_gi
-        and acc_dim in context.op_blocking_dims.get(consumer, set())
+        and acc_dim in ir.op_blocking_dims.get(consumer, set())
     )
 
 
@@ -156,20 +152,18 @@ def _existing_accumulator_sources(op_cls: type[NKIOp]) -> set[NKIOp]:
     return sources
 
 
-def _match_on_dim(
-    context: KernelContext, graph: KernelGraph, x_op: NKIOp, dim_id: str, group_of: dict[int, int]
-) -> OnlineFusionCandidate | None:
+def _match_on_dim(ir: KernelIR, x_op: NKIOp, dim_id: str, group_of: dict[int, int]) -> OnlineFusionCandidate | None:
     """Emit one candidate iff all accumulators for ``(x_op, dim_id)`` share one adjacent group."""
     x_gi = group_of[id(x_op)]
-    x_outputs = set(context.op_outputs.get(x_op, []))
+    x_outputs = set(ir.op_outputs.get(x_op, []))
     by_group: dict[int, list[tuple[NKIOp, str]]] = defaultdict(list)
-    for consumer in sorted(_all_ops(graph), key=lambda op: id(op)):
+    for consumer in sorted(_all_ops(ir), key=lambda op: id(op)):
         consumer_gi = group_of[id(consumer)]
         if consumer_gi == x_gi:
             continue
-        if dim_id not in context.op_blocking_dims.get(consumer, set()):
+        if dim_id not in ir.op_blocking_dims.get(consumer, set()):
             continue
-        match_role = _classify_accumulator(context, graph, x_op, x_outputs, consumer, dim_id, group_of, consumer_gi)
+        match_role = _classify_accumulator(ir, x_op, x_outputs, consumer, dim_id, group_of, consumer_gi)
         if match_role is None:
             continue
         by_group[consumer_gi].append((consumer, match_role))
@@ -185,64 +179,51 @@ def _match_on_dim(
 
 
 def _classify_accumulator(
-    context: KernelContext,
-    graph: KernelGraph,
-    x_op: NKIOp,
-    x_outputs: set[str],
-    consumer: NKIOp,
-    dim_id: str,
-    group_of: dict[int, int],
-    acc_gi: int,
+    ir: KernelIR, x_op: NKIOp, x_outputs: set[str], consumer: NKIOp, dim_id: str, group_of: dict[int, int], acc_gi: int
 ) -> str | None:
     """Return the online-fusion role label for this ``(X, consumer)`` pair, or None."""
     cls_name = type(consumer).NAME
     role: str | None = None
     if cls_name == "activation_reduce":
-        role = _match_exp_bias(context, x_outputs, consumer, dim_id)
+        role = _match_exp_bias(ir, x_outputs, consumer, dim_id)
     elif cls_name == "nc_matmul":
-        role = _match_matmul_through_scale(context, graph, x_op, consumer, dim_id, group_of, acc_gi)
+        role = _match_matmul_through_scale(ir, x_op, consumer, dim_id, group_of, acc_gi)
     return role
 
 
-def _match_exp_bias(context: KernelContext, x_outputs: set[str], consumer: NKIOp, dim_id: str) -> str | None:
+def _match_exp_bias(ir: KernelIR, x_outputs: set[str], consumer: NKIOp, dim_id: str) -> str | None:
     """True iff the consumer is ``activation_reduce(op='exp', bias=X, reduce_op='add')`` (atomic, no walk)."""
-    kwargs = context.op_kwargs.get(consumer, {})
-    inputs = context.op_inputs.get(consumer, {})
+    kwargs = ir.op_kwargs.get(consumer, {})
+    inputs = ir.op_inputs.get(consumer, {})
     bias_tensor = inputs.get("bias")
     role: str | None = None
     if (
         bias_tensor in x_outputs
         and _literal_op(kwargs.get("op")) == "exp"
         and _literal_op(kwargs.get("reduce_op")) == "add"
-        and dim_id in context.op_blocking_dims.get(consumer, set())
+        and dim_id in ir.op_blocking_dims.get(consumer, set())
     ):
         role = "exp_bias"
     return role
 
 
 def _match_matmul_through_scale(
-    context: KernelContext,
-    graph: KernelGraph,
-    x_op: NKIOp,
-    matmul: NKIOp,
-    dim_id: str,
-    group_of: dict[int, int],
-    acc_gi: int,
+    ir: KernelIR, x_op: NKIOp, matmul: NKIOp, dim_id: str, group_of: dict[int, int], acc_gi: int
 ) -> str | None:
     """True iff the matmul's stationary lineage (inside ``acc_gi``) carries X as a per-partition scale."""
-    inputs = context.op_inputs.get(matmul, {})
+    inputs = ir.op_inputs.get(matmul, {})
     stationary = inputs.get("stationary")
     role: str | None = None
-    if stationary is not None and dim_id in context.op_blocking_dims.get(matmul, set()):
-        role = _walk_back_for_separable(context, graph, stationary, x_op, group_of, acc_gi)
+    if stationary is not None and dim_id in ir.op_blocking_dims.get(matmul, set()):
+        role = _walk_back_for_separable(ir, stationary, x_op, group_of, acc_gi)
     return role
 
 
 def _walk_back_for_separable(
-    context: KernelContext, graph: KernelGraph, tensor_name: str, x_op: NKIOp, group_of: dict[int, int], acc_gi: int
+    ir: KernelIR, tensor_name: str, x_op: NKIOp, group_of: dict[int, int], acc_gi: int
 ) -> str | None:
     """BFS backward through separable-preserving ops **inside acc_gi**; label by the first X-consuming op."""
-    x_outputs = set(context.op_outputs.get(x_op, []))
+    x_outputs = set(ir.op_outputs.get(x_op, []))
     visited: set[str] = set()
     stack: list[str] = [tensor_name]
     role: str | None = None
@@ -255,28 +236,28 @@ def _walk_back_for_separable(
         if cur in x_outputs:
             reached_x = True
             continue
-        producer = _producer_op(context, graph, cur)
+        producer = _producer_op(ir, cur)
         if producer is None or group_of.get(id(producer)) != acc_gi:
             continue
-        role = _separable_role_via(context, producer, x_outputs, group_of, acc_gi)
-        stack.extend(_separable_parents(context, producer))
+        role = _separable_role_via(ir, producer, x_outputs, group_of, acc_gi)
+        stack.extend(_separable_parents(ir, producer))
     if role is None and reached_x:
         role = "passthrough_mul"
     return role
 
 
 def _separable_role_via(
-    context: KernelContext, op: NKIOp, x_outputs: set[str], group_of: dict[int, int], acc_gi: int
+    ir: KernelIR, op: NKIOp, x_outputs: set[str], group_of: dict[int, int], acc_gi: int
 ) -> str | None:
     """Return a role label iff this op consumes an X output in a separable slot."""
     cls_name = type(op).NAME
-    kwargs = context.op_kwargs.get(op, {})
-    inputs = context.op_inputs.get(op, {})
+    kwargs = ir.op_kwargs.get(op, {})
+    inputs = ir.op_inputs.get(op, {})
     role: str | None = None
     if cls_name == "tensor_scalar" and _literal_op(kwargs.get("op0")) == "multiply":
         operand = kwargs.get("operand0")
-        if operand in context.logical_tensors:
-            role = _scale_to_x_label(context, operand, x_outputs, group_of, acc_gi)
+        if operand in ir.logical_tensors:
+            role = _scale_to_x_label(ir, operand, x_outputs, group_of, acc_gi)
     elif cls_name in {"activation", "activation_reduce"} and _literal_op(kwargs.get("op")) == "exp":
         bias = inputs.get("bias")
         if bias in x_outputs:
@@ -288,12 +269,12 @@ _SCALE_WALK_OPS: frozenset[str] = frozenset({"activation", "tensor_scalar"})
 
 
 def _scale_to_x_label(
-    context: KernelContext, scale_tensor: str, x_outputs: set[str], group_of: dict[int, int], acc_gi: int
+    ir: KernelIR, scale_tensor: str, x_outputs: set[str], group_of: dict[int, int], acc_gi: int
 ) -> str | None:
     """Classify how ``scale_tensor`` reaches an X output — walk stays inside acc_gi."""
     act_ops: list[str] = []
     cur: str | None = scale_tensor
-    ops_by_output: dict[str, NKIOp] = {name: op for op, names in context.op_outputs.items() for name in names}
+    ops_by_output: dict[str, NKIOp] = {name: op for op, names in ir.op_outputs.items() for name in names}
     reached_x = False
     while cur is not None and not reached_x:
         if cur in x_outputs:
@@ -302,27 +283,27 @@ def _scale_to_x_label(
         producer = ops_by_output.get(cur)
         in_group = producer is not None and group_of.get(id(producer)) == acc_gi
         cls_name = type(producer).NAME if producer is not None else ""
-        cur = _next_scale_cur(context, producer, cls_name, act_ops) if in_group else None
+        cur = _next_scale_cur(ir, producer, cls_name, act_ops) if in_group else None
     label: str | None = None
     if reached_x:
         label = f"{act_ops[0]}_then_mul" if act_ops else "passthrough_mul"
     return label
 
 
-def _next_scale_cur(context: KernelContext, producer: NKIOp | None, cls_name: str, act_ops: list[str]) -> str | None:
+def _next_scale_cur(ir: KernelIR, producer: NKIOp | None, cls_name: str, act_ops: list[str]) -> str | None:
     """Advance the walk through one separable-preserving producer; append activation label if any."""
     data: str | None = None
     if producer is not None and cls_name in _SCALE_WALK_OPS:
         if cls_name == "activation":
-            act_ops.append(_literal_op(context.op_kwargs.get(producer, {}).get("op")) or "")
-        data = context.op_inputs.get(producer, {}).get("data")
+            act_ops.append(_literal_op(ir.op_kwargs.get(producer, {}).get("op")) or "")
+        data = ir.op_inputs.get(producer, {}).get("data")
     return data
 
 
-def _separable_parents(context: KernelContext, op: NKIOp) -> list[str]:
+def _separable_parents(ir: KernelIR, op: NKIOp) -> list[str]:
     """Return parent tensors to keep walking through for separable-preserving ops."""
     cls_name = type(op).NAME
-    inputs = context.op_inputs.get(op, {})
+    inputs = ir.op_inputs.get(op, {})
     result: list[str] = []
     if cls_name == "nc_transpose" and "data" in inputs:
         result.append(inputs["data"])

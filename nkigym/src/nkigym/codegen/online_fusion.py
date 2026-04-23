@@ -62,13 +62,13 @@ class _RenderContext:
         """Populate a ``_RenderContext`` from a live IR + composite op instance."""
         op_cls = type(op)
         assert issubclass(op_cls, NKIOnlineFusionChain), "_RenderContext built for non-composite op"
-        dim_order = ir.graph.groups[group_idx].dim_order
-        inputs_map = dict(ir.context.op_inputs.get(op, {}))
-        outputs_list = list(ir.context.op_outputs.get(op, []))
+        dim_order = ir.groups[group_idx].dim_order
+        inputs_map = dict(ir.op_inputs.get(op, {}))
+        outputs_list = list(ir.op_outputs.get(op, []))
         scale = op_cls.SCALE_SPEC
         assert scale is not None, "composite missing SCALE_SPEC"
         x_name = next(iter(inputs_map.values()))
-        partition_dim = ir.context.logical_tensors[x_name].dim_ids[0]
+        partition_dim = ir.logical_tensors[x_name].dim_ids[0]
         return cls(
             ir=ir,
             op=op,
@@ -81,7 +81,7 @@ class _RenderContext:
             scale=cast(ScaleSpec, scale),
             accumulators=cast(tuple[AccumulatorSpec, ...], op_cls.ACCUMULATOR_SPECS),
             acc_dim=op_cls.ACCUMULATION_DIM,
-            partition_size=ir.context.dimensions[partition_dim].physical_tile_size,
+            partition_size=ir.dimensions[partition_dim].physical_tile_size,
             x_name=x_name,
         )
 
@@ -104,7 +104,7 @@ def _emit_scale_declarations(ctx: _RenderContext, declarations: list[str], memse
     declarations.append(f"sbuf_sigma_{x} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
     declarations.append(f"sbuf_delta_{x} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
     if ctx.scale.delta_op == "activation_reduce":
-        acc_tile = ctx.ir.context.dimensions[ctx.acc_dim].logical_tile_size
+        acc_tile = ctx.ir.dimensions[ctx.acc_dim].logical_tile_size
         declarations.append(f"sbuf_sq_{x} = nl.ndarray(({p}, {acc_tile}), dtype=nl.float32, buffer=nl.sbuf)")
     if ctx.scale.sigma_kind == "ratio_via_reciprocal":
         declarations.append(f"sbuf_inv_running_{x} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
@@ -123,9 +123,9 @@ def _emit_accumulator_declarations(ctx: _RenderContext, declarations: list[str],
     p = ctx.partition_size
     for acc_idx, spec in enumerate(ctx.accumulators):
         out_name = _accumulator_output_tensor(ctx, spec)
-        out_dims = ctx.ir.context.logical_tensors[out_name].dim_ids
-        out_dtype = ctx.ir.context.logical_tensors[out_name].dtype
-        free_size = ctx.ir.context.dimensions[out_dims[1]].logical_tile_size if len(out_dims) == 2 else 1
+        out_dims = ctx.ir.logical_tensors[out_name].dim_ids
+        out_dtype = ctx.ir.logical_tensors[out_name].dtype
+        free_size = ctx.ir.dimensions[out_dims[1]].logical_tile_size if len(out_dims) == 2 else 1
         free_slice = f"0:{free_size}" if free_size > 1 else "0:1"
         declarations.append(
             f"sbuf_running_out_{out_name} = nl.ndarray(({p}, {free_size})," f" dtype=nl.{out_dtype}, buffer=nl.sbuf)"
@@ -148,7 +148,7 @@ def _emit_matmul_accumulator_decls(
     declarations in sync with ``_matmul_stationary_source``.
     """
     p = ctx.partition_size
-    acc_tile = ctx.ir.context.dimensions[spec.ptile_free_dim].logical_tile_size
+    acc_tile = ctx.ir.dimensions[spec.ptile_free_dim].logical_tile_size
     ptiles = acc_tile // p
     declarations.append(f"psum_chunk_{out_name} = nl.ndarray(({p}, {free_size}), dtype=nl.float32, buffer=nl.psum)")
     if not _has_prior_activation_reduce(ctx, acc_idx):
@@ -173,7 +173,7 @@ def _emit_activation_reduce_accumulator_decls(
     p = ctx.partition_size
     _ = spec
     _ = acc_idx
-    acc_tile = ctx.ir.context.dimensions[ctx.acc_dim].logical_tile_size
+    acc_tile = ctx.ir.dimensions[ctx.acc_dim].logical_tile_size
     declarations.append(f"sbuf_chunk_sum_{out_name} = nl.ndarray(({p}, 1), dtype=nl.float32, buffer=nl.sbuf)")
     declarations.append(f"sbuf_exp_{out_name} = nl.ndarray(({p}, {acc_tile}), dtype=nl.bfloat16, buffer=nl.sbuf)")
 
@@ -202,7 +202,7 @@ def _emit_delta_compute(ctx: _RenderContext, data_access: str, delta_expr: str, 
     op = ctx.scale.delta_op
     kwargs = ctx.scale.delta_kwargs
     if op == "activation_reduce":
-        acc_tile = ctx.ir.context.dimensions[ctx.acc_dim].logical_tile_size
+        acc_tile = ctx.ir.dimensions[ctx.acc_dim].logical_tile_size
         act = _nl(kwargs.get("op", "'square'"))
         red = _nl(kwargs.get("reduce_op", "'add'"))
         lines.append(
@@ -292,13 +292,13 @@ def _emit_matmul_accumulator_body(ctx: _RenderContext, spec: AccumulatorSpec, ac
     """Normalize a_chunk → a_t → psum_chunk → running_out rescale-accumulate."""
     x = ctx.x_name
     p = ctx.partition_size
-    acc_tile = ctx.ir.context.dimensions[spec.ptile_free_dim].logical_tile_size
+    acc_tile = ctx.ir.dimensions[spec.ptile_free_dim].logical_tile_size
     ptiles = acc_tile // p
     a_name = ctx.x_name
     b_name = _matmul_moving_input(ctx, spec)
     out_name = _accumulator_output_tensor(ctx, spec)
-    out_dims = ctx.ir.context.logical_tensors[out_name].dim_ids
-    free_size = ctx.ir.context.dimensions[out_dims[1]].logical_tile_size if len(out_dims) == 2 else 1
+    out_dims = ctx.ir.logical_tensors[out_name].dim_ids
+    free_size = ctx.ir.dimensions[out_dims[1]].logical_tile_size if len(out_dims) == 2 else 1
     matmul_ptile_var = f"i_ptile_{ctx.acc_dim}_{out_name}"
     b_access = _sbuf_body_access(ctx, b_name, ptile_binding={ctx.acc_dim: matmul_ptile_var})
     out_access = _sbuf_body_access(ctx, out_name)
@@ -343,7 +343,7 @@ def _emit_activation_reduce_accumulator_body(ctx: _RenderContext, spec: Accumula
     chunk_sum = f"sbuf_chunk_sum_{out_name}[0:{p}, 0:1]"
     sigma = f"sbuf_sigma_{x}[0:{p}, 0:1]"
     running_out = f"sbuf_running_out_{out_name}[0:{p}, 0:1]"
-    acc_tile = ctx.ir.context.dimensions[ctx.acc_dim].logical_tile_size
+    acc_tile = ctx.ir.dimensions[ctx.acc_dim].logical_tile_size
     lines.append(
         f"nisa.activation_reduce(sbuf_exp_{out_name}[0:{p}, 0:{acc_tile}], {act},"
         f" {data_access}, {red}, {chunk_sum}, bias={running})"
@@ -413,8 +413,8 @@ def _outermost_depth(ctx: _RenderContext, acc_dim: str) -> int:
 def _sbuf_body_access(ctx: _RenderContext, tensor_name: str, ptile_binding: dict[str, str] | None = None) -> str:
     """SBUF access string for an external tensor at the composite's innermost slot."""
     buf = sbuf_buffer(ctx.ir, tensor_name)
-    placements = ctx.ir.graph.groups[ctx.group_idx].tensor_placements
-    tinfo = ctx.ir.context.logical_tensors[tensor_name]
+    placements = ctx.ir.groups[ctx.group_idx].tensor_placements
+    tinfo = ctx.ir.logical_tensors[tensor_name]
     dim_ids = tinfo.dim_ids
     bindings = ptile_binding or {}
     p_access = _axis_access(ctx, tensor_name, dim_ids[0], placements, bindings.get(dim_ids[0]))

@@ -1,24 +1,14 @@
 """``propagate_compute_skip`` — mandatory pre-pass that lifts ``NKIAffineSelect`` to per-op annotations.
 
 Runs exactly once after ``insert_dma_nodes`` and before any
-``REWRITES`` sampling. For every ``NKIAffineSelect`` in
-the graph:
+``REWRITES`` sampling. For every ``NKIAffineSelect`` in the IR:
 
 1. Extract the causal predicate coefficients + the ``on_false_value``.
 2. BFS upstream — every producer whose output flows exclusively
-   into the affine_select's data chain gets the predicate. No
-   numerical check needed (their output only feeds annotated
-   ops, so on ``skip_all`` no one reads what wasn't written).
+   into the affine_select's data chain gets the predicate.
 3. BFS downstream — carry the mask sentinel through the chain.
-   At each elementwise op apply its ``propagate_mask_value``. At
-   each reducer along the mask's free axis, require the current
-   sentinel to equal the reducer's identity; if not, raise —
-   the given ``on_false_value`` is not numerically compatible
-   with the chain.
-4. The op whose output the ``NKIAffineSelect`` used to read
-   gets its predicate marked ``inject_mask=True``. Codegen emits
-   an in-place ``nisa.affine_select`` on ``mask_and_compute``.
-5. Delete the ``NKIAffineSelect`` from the graph; rewire
+4. Annotate ops in ``op_skip_spec`` with the predicate.
+5. Delete the ``NKIAffineSelect`` from the ir; rewire
    consumers of the masked tensor to read the upstream source.
 """
 
@@ -26,36 +16,28 @@ import ast
 from dataclasses import replace
 
 from nkigym.kernel_ir.compute_skip_spec import SkipPredicate
-from nkigym.kernel_ir.context.context import KernelContext
-from nkigym.kernel_ir.graph.fusion_group import FusionGroup
-from nkigym.kernel_ir.graph.graph import KernelGraph, rebuild_edges
+from nkigym.kernel_ir.fusion_group import FusionGroup
+from nkigym.kernel_ir.ir import KernelIR, rebuild_edges
 from nkigym.ops.base import NKIOp
 
 _REDUCER_IDENTITY: dict[str, float] = {"add": 0.0, "maximum": float("-inf"), "minimum": float("inf"), "multiply": 1.0}
 
 
-def propagate_compute_skip(context: KernelContext, graph: KernelGraph) -> tuple[KernelContext, KernelGraph]:
-    """Lift every ``NKIAffineSelect`` to per-op skip predicates; remove the standalone op.
-
-    Raises:
-        ValueError: If the mask sentinel can't propagate cleanly
-            through every downstream consumer — either because an
-            elementwise op doesn't analytically resolve or a
-            reducer's identity doesn't match the current sentinel.
-    """
-    current_ctx, current_graph = context, graph
+def propagate_compute_skip(ir: KernelIR) -> KernelIR:
+    """Lift every ``NKIAffineSelect`` to per-op skip predicates; remove the standalone op."""
+    current = ir
     while True:
-        affine_op = _find_first_affine_select(current_graph)
+        affine_op = _find_first_affine_select(current)
         if affine_op is None:
             break
-        current_ctx, current_graph = _propagate_one(current_ctx, current_graph, affine_op)
-    return current_ctx, current_graph
+        current = _propagate_one(current, affine_op)
+    return current
 
 
-def _find_first_affine_select(graph: KernelGraph) -> NKIOp | None:
-    """Return the first ``NKIAffineSelect`` still in the graph, or ``None``."""
+def _find_first_affine_select(ir: KernelIR) -> NKIOp | None:
+    """Return the first ``NKIAffineSelect`` still in the ir, or ``None``."""
     result: NKIOp | None = None
-    for group in graph.groups:
+    for group in ir.groups:
         for op in group.ops:
             if type(op).NAME == "affine_select":
                 result = op
@@ -65,20 +47,20 @@ def _find_first_affine_select(graph: KernelGraph) -> NKIOp | None:
     return result
 
 
-def _propagate_one(context: KernelContext, graph: KernelGraph, affine_op: NKIOp) -> tuple[KernelContext, KernelGraph]:
+def _propagate_one(ir: KernelIR, affine_op: NKIOp) -> KernelIR:
     """Propagate one affine-select: annotate upstream + downstream; remove the op; rewire."""
-    predicate_base = _build_predicate_base(context, affine_op)
-    upstream = _trace_upstream(context, graph, affine_op)
-    downstream = _trace_downstream_with_numerics(context, graph, affine_op, predicate_base)
-    new_ctx = _annotate_ops(context, predicate_base, upstream, downstream, affine_op)
-    new_ctx, new_graph = _remove_affine_select(new_ctx, graph, affine_op)
-    return new_ctx, new_graph
+    predicate_base = _build_predicate_base(ir, affine_op)
+    upstream = _trace_upstream(ir, affine_op)
+    downstream = _trace_downstream_with_numerics(ir, affine_op, predicate_base)
+    ir = _annotate_ops(ir, predicate_base, upstream, downstream, affine_op)
+    ir = _remove_affine_select(ir, affine_op)
+    return ir
 
 
-def _build_predicate_base(context: KernelContext, affine_op: NKIOp) -> SkipPredicate:
+def _build_predicate_base(ir: KernelIR, affine_op: NKIOp) -> SkipPredicate:
     """Extract the predicate coefficients from an ``NKIAffineSelect`` op's kwargs."""
-    kwargs = context.op_kwargs.get(affine_op, {})
-    axis_map = context.op_axis_map.get(affine_op, {})
+    kwargs = ir.op_kwargs.get(affine_op, {})
+    axis_map = ir.op_axis_map.get(affine_op, {})
     pattern = ast.literal_eval(kwargs["pattern"])
     step, _count = pattern[0]
     channel_mul = int(kwargs.get("channel_multiplier", "0").strip("'\""))
@@ -87,9 +69,9 @@ def _build_predicate_base(context: KernelContext, affine_op: NKIOp) -> SkipPredi
     cmp_op = cmp_raw[1:-1] if cmp_raw.startswith("'") and cmp_raw.endswith("'") else cmp_raw
     partition_dim = axis_map["P"]
     free_dim = axis_map["F"]
-    tile_sizes = context.op_tile_sizes.get(affine_op, {})
-    p_size = tile_sizes.get(partition_dim, context.dimensions[partition_dim].logical_tile_size)
-    f_size = tile_sizes.get(free_dim, context.dimensions[free_dim].logical_tile_size)
+    tile_sizes = ir.op_tile_sizes.get(affine_op, {})
+    p_size = tile_sizes.get(partition_dim, ir.dimensions[partition_dim].logical_tile_size)
+    f_size = tile_sizes.get(free_dim, ir.dimensions[free_dim].logical_tile_size)
     on_false_value = kwargs.get("on_false_value", "float('-inf')")
     return SkipPredicate(
         partition_dim_id=partition_dim,
@@ -104,12 +86,12 @@ def _build_predicate_base(context: KernelContext, affine_op: NKIOp) -> SkipPredi
     )
 
 
-def _trace_upstream(context: KernelContext, graph: KernelGraph, affine_op: NKIOp) -> list[NKIOp]:
+def _trace_upstream(ir: KernelIR, affine_op: NKIOp) -> list[NKIOp]:
     """BFS back from ``affine_op.inputs`` absorbing producers whose outputs feed only the mask chain."""
-    all_ops = [op for group in graph.groups for op in group.ops]
-    producers_of = _producers_of_map(context, all_ops)
-    consumers_of = _consumers_of_map(context, all_ops)
-    affine_inputs = list(context.op_inputs.get(affine_op, {}).values())
+    all_ops = [op for group in ir.groups for op in group.ops]
+    producers_of = _producers_of_map(ir, all_ops)
+    consumers_of = _consumers_of_map(ir, all_ops)
+    affine_inputs = list(ir.op_inputs.get(affine_op, {}).values())
     absorbed: list[NKIOp] = []
     stack = list(affine_inputs)
     visited: set[int] = {id(affine_op)}
@@ -126,28 +108,28 @@ def _trace_upstream(context: KernelContext, graph: KernelGraph, affine_op: NKIOp
             continue
         visited.add(id(producer))
         absorbed.append(producer)
-        stack.extend(context.op_inputs.get(producer, {}).values())
+        stack.extend(ir.op_inputs.get(producer, {}).values())
     return absorbed
 
 
-def _producers_of_map(context: KernelContext, ops: list[NKIOp]) -> dict[str, NKIOp]:
+def _producers_of_map(ir: KernelIR, ops: list[NKIOp]) -> dict[str, NKIOp]:
     """Map tensor_name → producer op."""
     result: dict[str, NKIOp] = {}
     for op in ops:
-        for name in context.op_outputs.get(op, []):
+        for name in ir.op_outputs.get(op, []):
             result[name] = op
     return result
 
 
-def _consumers_of_map(context: KernelContext, ops: list[NKIOp]) -> dict[str, list[NKIOp]]:
+def _consumers_of_map(ir: KernelIR, ops: list[NKIOp]) -> dict[str, list[NKIOp]]:
     """Map tensor_name → consumer op list (kwargs-as-tensor included)."""
     result: dict[str, list[NKIOp]] = {}
-    tensors_set = set(context.logical_tensors)
+    tensors_set = set(ir.logical_tensors)
     for op in ops:
         names: set[str] = set()
-        for tname in context.op_inputs.get(op, {}).values():
+        for tname in ir.op_inputs.get(op, {}).values():
             names.add(tname)
-        for _k, expr in context.op_kwargs.get(op, {}).items():
+        for _k, expr in ir.op_kwargs.get(op, {}).items():
             if expr in tensors_set:
                 names.add(expr)
         for name in names:
@@ -155,27 +137,15 @@ def _consumers_of_map(context: KernelContext, ops: list[NKIOp]) -> dict[str, lis
     return result
 
 
-def _trace_downstream_with_numerics(
-    context: KernelContext, graph: KernelGraph, affine_op: NKIOp, base_pred: SkipPredicate
-) -> list[NKIOp]:
-    """BFS forward annotating every consumer that's reachable from ``affine_op``.
-
-    Only traverses edges where the flowing tensor still carries
-    the mask's free dim — once a reducer eats the free axis, its
-    output is a reduced scalar along that dim and downstream ops
-    reading it aren't per-tile gated.
-
-    Raises ``ValueError`` on any numerical-incompatibility — either
-    an elementwise op that can't be analyzed or a reducer whose
-    identity doesn't match the current sentinel value.
-    """
-    all_ops = [op for group in graph.groups for op in group.ops]
-    consumers_of = _consumers_of_map(context, all_ops)
+def _trace_downstream_with_numerics(ir: KernelIR, affine_op: NKIOp, base_pred: SkipPredicate) -> list[NKIOp]:
+    """BFS forward annotating every consumer reachable from ``affine_op``."""
+    all_ops = [op for group in ir.groups for op in group.ops]
+    consumers_of = _consumers_of_map(ir, all_ops)
     starting_value = _parse_on_false(base_pred.on_false_value)
     if starting_value is None:
         raise ValueError(f"Compute-skip: cannot parse on_false_value={base_pred.on_false_value!r} as a scalar literal.")
     free_dim = base_pred.free_dim_id
-    stack: list[tuple[str, float]] = [(name, starting_value) for name in context.op_outputs.get(affine_op, [])]
+    stack: list[tuple[str, float]] = [(name, starting_value) for name in ir.op_outputs.get(affine_op, [])]
     visited: set[int] = {id(affine_op)}
     annotated: list[NKIOp] = []
     while stack:
@@ -183,34 +153,27 @@ def _trace_downstream_with_numerics(
         for consumer in consumers_of.get(tname, []):
             if id(consumer) in visited:
                 continue
-            next_value = _propagate_through_or_raise(context, consumer, current_value, free_dim)
+            next_value = _propagate_through_or_raise(ir, consumer, current_value, free_dim)
             visited.add(id(consumer))
             annotated.append(consumer)
-            for out in context.op_outputs.get(consumer, []):
-                if _tensor_has_dim(context, out, free_dim):
+            for out in ir.op_outputs.get(consumer, []):
+                if _tensor_has_dim(ir, out, free_dim):
                     stack.append((out, next_value))
     return annotated
 
 
-def _tensor_has_dim(context: KernelContext, tensor_name: str, dim_id: str) -> bool:
+def _tensor_has_dim(ir: KernelIR, tensor_name: str, dim_id: str) -> bool:
     """True iff the tensor carries ``dim_id`` in its logical ``dim_ids``."""
-    tinfo = context.logical_tensors.get(tensor_name)
+    tinfo = ir.logical_tensors.get(tensor_name)
     return tinfo is not None and dim_id in tinfo.dim_ids
 
 
-def _propagate_through_or_raise(context: KernelContext, op: NKIOp, input_value: float, free_dim: str) -> float:
-    """Compute the op's output sentinel, raising if the op is not numerically compatible with skip.
-
-    An op may combine an elementwise transform AND a reduction
-    (e.g. ``activation_reduce(exp, reduce_op=add)`` — exp first,
-    then add over the free axis). The reducer-identity check
-    must compare the POST-elementwise value to the reducer's
-    identity, not the raw input.
-    """
+def _propagate_through_or_raise(ir: KernelIR, op: NKIOp, input_value: float, free_dim: str) -> float:
+    """Compute the op's output sentinel, raising if the op is not numerically compatible with skip."""
     op_cls = type(op)
-    kwargs = context.op_kwargs.get(op, {})
-    axis_map = context.op_axis_map.get(op, {})
-    blocking = context.op_blocking_dims.get(op, set())
+    kwargs = ir.op_kwargs.get(op, {})
+    axis_map = ir.op_axis_map.get(op, {})
+    blocking = ir.op_blocking_dims.get(op, set())
     elementwise = op_cls.propagate_mask_value(kwargs, input_value)
     reducer_role = _find_reducer_role_on_free_dim(op_cls, axis_map, blocking, free_dim)
     effective = elementwise if elementwise is not None else input_value
@@ -221,32 +184,20 @@ def _propagate_through_or_raise(context: KernelContext, op: NKIOp, input_value: 
             raise ValueError(
                 f"Compute-skip: op {op_cls.NAME!r} reduces along free dim {free_dim!r} with combinator "
                 f"{combinator!r} (identity={identity!r}), but the post-elementwise mask sentinel is "
-                f"{effective!r} — skipping is not numerically valid. Adjust on_false_value or "
-                "stop using compute skipping for this op."
+                f"{effective!r} — skipping is not numerically valid."
             )
         result = effective
     else:
         if elementwise is None:
             raise ValueError(
-                f"Compute-skip: op {op_cls.NAME!r} isn't analyzable for mask propagation "
-                f"(propagate_mask_value returned None on input {input_value!r}). "
-                "Implement propagate_mask_value for this op or stop using compute skipping here."
+                f"Compute-skip: op {op_cls.NAME!r} isn't analyzable for mask propagation on input {input_value!r}."
             )
         result = elementwise
     return result
 
 
 def _element_level_combinator(op_cls: type[NKIOp], role: str, kwargs: dict[str, str]) -> str | None:
-    """Return the element-level reducer name, bypassing chunk-combine adjustments like ``negate``.
-
-    ``NKIOp.resolve_reduce_combinator`` adjusts the reported
-    combinator for chunk-combining (``tensor_reduce(maximum,
-    negate=True)`` reports ``minimum`` because the per-chunk
-    negated-max's cross-chunk combine is ``min``). For
-    identity checking against element-level inputs we need the
-    RAW combinator (``maximum`` in that example) because the
-    elements fed into the reducer are un-negated.
-    """
+    """Return the element-level reducer name, bypassing chunk-combine adjustments like ``negate``."""
     spec = op_cls.REDUCE_COMBINATOR.get(role)
     result: str | None = None
     if spec is not None:
@@ -262,12 +213,7 @@ def _element_level_combinator(op_cls: type[NKIOp], role: str, kwargs: dict[str, 
 def _find_reducer_role_on_free_dim(
     op_cls: type[NKIOp], axis_map: dict[str, str], blocking: set[str], free_dim: str
 ) -> str | None:
-    """Return the output role whose reduction dim is the mask's free dim, or ``None``.
-
-    A reducer "eats" its blocking axis — the output's abstract
-    axes drop it. If the mask's free dim is in ``blocking`` but
-    NOT in the output's axes, this op reduces along it.
-    """
+    """Return the output role whose reduction dim is the mask's free dim, or ``None``."""
     result: str | None = None
     class_blocking_concrete = {axis_map.get(ax) for ax in op_cls.BLOCKING_AXES}
     if free_dim in class_blocking_concrete and free_dim in blocking:
@@ -300,66 +246,47 @@ def _parse_on_false(raw: str) -> float | None:
 
 
 def _annotate_ops(
-    context: KernelContext, base_pred: SkipPredicate, upstream: list[NKIOp], downstream: list[NKIOp], affine_op: NKIOp
-) -> KernelContext:
-    """Write per-op ``SkipPredicate`` entries into ``context.op_skip_spec``."""
-    new_skip = dict(context.op_skip_spec)
-    source_op = _find_affine_source_op(context, affine_op)
+    ir: KernelIR, base_pred: SkipPredicate, upstream: list[NKIOp], downstream: list[NKIOp], affine_op: NKIOp
+) -> KernelIR:
+    """Write per-op ``SkipPredicate`` entries into ``ir.op_skip_spec``."""
+    new_skip = dict(ir.op_skip_spec)
+    source_op = _find_affine_source_op(ir, affine_op)
     for op in upstream:
         inject = op is source_op
         new_skip[op] = replace(base_pred, inject_mask=inject)
     for op in downstream:
         new_skip[op] = replace(base_pred, inject_mask=False)
-    return replace(context, op_skip_spec=new_skip)
+    return replace(ir, op_skip_spec=new_skip)
 
 
-def _find_affine_source_op(context: KernelContext, affine_op: NKIOp) -> NKIOp | None:
+def _find_affine_source_op(ir: KernelIR, affine_op: NKIOp) -> NKIOp | None:
     """Return the op producing the tensor that ``affine_op`` reads via ``on_true_tile``."""
-    source_tensor = context.op_inputs.get(affine_op, {}).get("on_true_tile")
+    source_tensor = ir.op_inputs.get(affine_op, {}).get("on_true_tile")
     result: NKIOp | None = None
     if source_tensor is not None:
-        for op, outs in context.op_outputs.items():
+        for op, outs in ir.op_outputs.items():
             if source_tensor in outs:
                 result = op
                 break
     return result
 
 
-def _remove_affine_select(
-    context: KernelContext, graph: KernelGraph, affine_op: NKIOp
-) -> tuple[KernelContext, KernelGraph]:
-    """Drop the affine-select op from every context dict and from its group; rewire consumers.
-
-    Consumers of the masked tensor now read the affine-select's
-    ``on_true_tile`` source directly. The masked tensor itself is
-    removed from ``logical_tensors``. The affine-select's entry in
-    every per-op dict is dropped.
-    """
-    source_tensor = context.op_inputs.get(affine_op, {}).get("on_true_tile")
-    masked_tensors = list(context.op_outputs.get(affine_op, []))
-    new_op_inputs = {op: _rewire(inputs, masked_tensors, source_tensor) for op, inputs in context.op_inputs.items()}
-    new_op_kwargs = {op: _rewire(kw, masked_tensors, source_tensor) for op, kw in context.op_kwargs.items()}
+def _remove_affine_select(ir: KernelIR, affine_op: NKIOp) -> KernelIR:
+    """Drop the affine-select op from every IR dict and from its group; rewire consumers."""
+    source_tensor = ir.op_inputs.get(affine_op, {}).get("on_true_tile")
+    masked_tensors = list(ir.op_outputs.get(affine_op, []))
+    new_op_inputs = {op: _rewire(inputs, masked_tensors, source_tensor) for op, inputs in ir.op_inputs.items()}
+    new_op_kwargs = {op: _rewire(kw, masked_tensors, source_tensor) for op, kw in ir.op_kwargs.items()}
     new_op_inputs.pop(affine_op, None)
     new_op_kwargs.pop(affine_op, None)
-    new_op_outputs = {op: v for op, v in context.op_outputs.items() if op is not affine_op}
-    new_op_axis_map = {op: v for op, v in context.op_axis_map.items() if op is not affine_op}
-    new_op_tile_sizes = {op: v for op, v in context.op_tile_sizes.items() if op is not affine_op}
-    new_op_blocking_dims = {op: v for op, v in context.op_blocking_dims.items() if op is not affine_op}
-    new_op_skip_spec = {op: v for op, v in context.op_skip_spec.items() if op is not affine_op}
-    new_tensors = {name: info for name, info in context.logical_tensors.items() if name not in masked_tensors}
-    new_context = replace(
-        context,
-        logical_tensors=new_tensors,
-        op_inputs=new_op_inputs,
-        op_outputs=new_op_outputs,
-        op_kwargs=new_op_kwargs,
-        op_axis_map=new_op_axis_map,
-        op_tile_sizes=new_op_tile_sizes,
-        op_blocking_dims=new_op_blocking_dims,
-        op_skip_spec=new_op_skip_spec,
-    )
+    new_op_outputs = {op: v for op, v in ir.op_outputs.items() if op is not affine_op}
+    new_op_axis_map = {op: v for op, v in ir.op_axis_map.items() if op is not affine_op}
+    new_op_tile_sizes = {op: v for op, v in ir.op_tile_sizes.items() if op is not affine_op}
+    new_op_blocking_dims = {op: v for op, v in ir.op_blocking_dims.items() if op is not affine_op}
+    new_op_skip_spec = {op: v for op, v in ir.op_skip_spec.items() if op is not affine_op}
+    new_tensors = {name: info for name, info in ir.logical_tensors.items() if name not in masked_tensors}
     new_groups: list[FusionGroup] = []
-    for group in graph.groups:
+    for group in ir.groups:
         surviving = [op for op in group.ops if op is not affine_op]
         if surviving:
             new_groups.append(
@@ -371,9 +298,21 @@ def _remove_affine_select(
                     tensor_placements=dict(group.tensor_placements),
                 )
             )
-    new_graph = KernelGraph(groups=new_groups)
-    rebuild_edges(new_graph, new_context)
-    return new_context, new_graph
+    new_ir = replace(
+        ir,
+        logical_tensors=new_tensors,
+        op_inputs=new_op_inputs,
+        op_outputs=new_op_outputs,
+        op_kwargs=new_op_kwargs,
+        op_axis_map=new_op_axis_map,
+        op_tile_sizes=new_op_tile_sizes,
+        op_blocking_dims=new_op_blocking_dims,
+        op_skip_spec=new_op_skip_spec,
+        groups=new_groups,
+        edges=[],
+    )
+    rebuild_edges(new_ir)
+    return new_ir
 
 
 def _rewire(mapping: dict[str, str], masked_tensors: list[str], source_tensor: str | None) -> dict[str, str]:

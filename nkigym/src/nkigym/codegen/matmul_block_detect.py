@@ -20,35 +20,66 @@ def is_matmul_block_candidate(ir: KernelIR, op: NKIOp, group_idx: int) -> bool:
     * Its reduction axis ``K`` resolves to a blocked dim with
       ``num_blocks > 1``.
     * Both the ``stationary`` and ``moving`` SBUF inputs have
-      tier on ``K`` strictly below ``full`` (i.e. ``per_block``
-      or ``per_tile``) in this group — so the inputs reload per
+      ``per_block`` tier on ``K`` — so the inputs reload per
       outer-K-block iteration, the shape the gadget needs.
+    * Both inputs' free-axis tiers (M for stationary, N for
+      moving) are ``per_block`` or ``full`` — ``per_tile`` would
+      require element-level loads that matmul_block can't
+      express.
     * The matmul's output has a block-slab tier on its M and N
-      dims (``per_block`` or ``full``, not ``per_tile``) so the
-      running accumulator persists across the outer-K loop.
+      dims (``per_block`` or ``full``) so the running
+      accumulator persists across the outer-K loop.
     """
     k_dim = _resolve_k_dim(ir, op)
     ok = k_dim is not None and _k_has_multiple_blocks(ir, k_dim)
     if ok:
         assert k_dim is not None
-        ok = _k_inputs_not_full(ir, op, group_idx, k_dim) and _output_has_block_slab(ir, op, group_idx)
+        ok = (
+            _k_inputs_not_full(ir, op, group_idx, k_dim)
+            and _inputs_have_block_slab(ir, op, group_idx)
+            and _output_has_block_slab(ir, op, group_idx)
+        )
     return ok
+
+
+def _inputs_have_block_slab(ir: KernelIR, op: NKIOp, group_idx: int) -> bool:
+    """True iff the matmul inputs' free-axis tiers are ``per_block`` or ``full``.
+
+    Free-axis for ``stationary`` is M (the second OPERAND_AXES
+    entry) and for ``moving`` is N. ``per_tile`` would demand
+    element-level accesses, which matmul_block doesn't emit.
+    """
+    inputs = ir.op_inputs.get(op, {})
+    placements = ir.groups[group_idx].tensor_placements
+    axis_map = ir.op_axis_map.get(op, {})
+    result = True
+    for role, abstract in (("stationary", "M"), ("moving", "N")):
+        tensor = inputs.get(role)
+        dim_id = axis_map.get(abstract)
+        if tensor is None or dim_id is None:
+            result = False
+            break
+        tier = placements.get(("sbuf", tensor, dim_id), "per_tile")
+        if _TIER_RANK[tier] < _TIER_RANK["per_block"]:
+            result = False
+            break
+    return result
 
 
 def _resolve_k_dim(ir: KernelIR, op: NKIOp) -> str | None:
     """Return the concrete K dim for ``op``, or None if not a matmul-block candidate shape."""
     result: str | None = None
     if type(op) is NKIMatmul:
-        axis_map = ir.context.op_axis_map.get(op, {})
+        axis_map = ir.op_axis_map.get(op, {})
         result = axis_map.get("K")
     return result
 
 
 def _k_has_multiple_blocks(ir: KernelIR, k_dim: str) -> bool:
     """True iff ``k_dim`` is split into at least two outer blocks."""
-    context = ir.context
-    di = context.dimensions[k_dim]
-    tpb = context.ltiles_per_block.get(k_dim, 1)
+    ir = ir
+    di = ir.dimensions[k_dim]
+    tpb = ir.ltiles_per_block.get(k_dim, 1)
     num_blocks = di.dim_size // (tpb * di.logical_tile_size)
     return num_blocks > 1
 
@@ -61,8 +92,8 @@ def _k_inputs_not_full(ir: KernelIR, op: NKIOp, group_idx: int, k_dim: str) -> b
     reload entirely and ``per_tile`` would force element-level
     loads the gadget can't express.
     """
-    inputs = ir.context.op_inputs.get(op, {})
-    placements = ir.graph.groups[group_idx].tensor_placements
+    inputs = ir.op_inputs.get(op, {})
+    placements = ir.groups[group_idx].tensor_placements
     result = True
     for role in ("stationary", "moving"):
         tensor = inputs.get(role)
@@ -81,9 +112,9 @@ def _output_has_block_slab(ir: KernelIR, op: NKIOp, group_idx: int) -> bool:
     whole M/N block at a time — ``per_tile`` would force an
     element-level drain that the gadget can't express.
     """
-    outputs = ir.context.op_outputs.get(op, [])
-    placements = ir.graph.groups[group_idx].tensor_placements
-    axis_map = ir.context.op_axis_map.get(op, {})
+    outputs = ir.op_outputs.get(op, [])
+    placements = ir.groups[group_idx].tensor_placements
+    axis_map = ir.op_axis_map.get(op, {})
     result = bool(outputs)
     if result:
         out_name = outputs[0]
@@ -107,10 +138,10 @@ def gadget_absorbed_dims(ir: KernelIR, group_idx: int) -> set[str]:
     unbound (load the full slab per block iteration).
     """
     result: set[str] = set()
-    for op in ir.graph.groups[group_idx].ops:
+    for op in ir.groups[group_idx].ops:
         if is_matmul_block_candidate(ir, op, group_idx):
             for abstract in ("K", "M", "N"):
-                dim_id = ir.context.op_axis_map.get(op, {}).get(abstract)
+                dim_id = ir.op_axis_map.get(op, {}).get(abstract)
                 if dim_id is not None:
                     result.add(dim_id)
     return result

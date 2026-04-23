@@ -20,8 +20,7 @@ p.phase == "before" else 4*N - p.depth``.
 from dataclasses import dataclass
 from typing import Literal
 
-from nkigym.kernel_ir.context.context import KernelContext
-from nkigym.kernel_ir.graph.graph import KernelGraph
+from nkigym.kernel_ir.ir import KernelIR
 from nkigym.ops.base import NKIOp
 from nkigym.ops.dma import NKIDMATranspose, NKILoad, NKIStore
 
@@ -41,32 +40,32 @@ def body_depth(n: int) -> int:
     return 2 * n
 
 
-def compute_staged_set(context: KernelContext, graph: KernelGraph) -> set[str]:
+def compute_staged_set(ir: KernelIR) -> set[str]:
     """PSUM-produced tensors that require an SBUF staging buffer."""
     result: set[str] = set()
-    producer_loc = _producer_isa_loc_map(context, graph)
-    for group in graph.groups:
+    producer_loc = _producer_isa_loc_map(ir)
+    for group in ir.groups:
         for op in group.ops:
             input_locs = type(op).INPUT_LOCS
-            for role, tname in context.op_inputs.get(op, {}).items():
-                if tname not in context.logical_tensors:
+            for role, tname in ir.op_inputs.get(op, {}).items():
+                if tname not in ir.logical_tensors:
                     continue
                 if producer_loc.get(tname) != "psum":
                     continue
                 if input_locs.get(role) == "sbuf":
                     result.add(tname)
-    if producer_loc.get(context.return_name) == "psum":
-        result.add(context.return_name)
+    if producer_loc.get(ir.return_name) == "psum":
+        result.add(ir.return_name)
     return result
 
 
-def _producer_isa_loc_map(context: KernelContext, graph: KernelGraph) -> dict[str, str]:
+def _producer_isa_loc_map(ir: KernelIR) -> dict[str, str]:
     """Return ``{tensor_name: ISA_LOC of its producer}``."""
     result: dict[str, str] = {}
-    for group in graph.groups:
+    for group in ir.groups:
         for op in group.ops:
             loc = type(op).ISA_LOC
-            for name in context.op_outputs.get(op, []):
+            for name in ir.op_outputs.get(op, []):
                 result[name] = loc
     return result
 
@@ -87,24 +86,24 @@ class Placement:
         return loop_depth < self.depth
 
 
-def block_trip(context: KernelContext, dim_id: str) -> int:
+def block_trip(ir: KernelIR, dim_id: str) -> int:
     """Block-loop trip count for ``dim_id``."""
-    di = context.dimensions[dim_id]
-    return di.dim_size // (context.ltiles_per_block.get(dim_id, 1) * di.logical_tile_size)
+    di = ir.dimensions[dim_id]
+    return di.dim_size // (ir.ltiles_per_block.get(dim_id, 1) * di.logical_tile_size)
 
 
-def ltile_trip(context: KernelContext, dim_id: str) -> int:
+def ltile_trip(ir: KernelIR, dim_id: str) -> int:
     """Ltile-loop trip count for ``dim_id``."""
-    return context.ltiles_per_block.get(dim_id, 1)
+    return ir.ltiles_per_block.get(dim_id, 1)
 
 
-def material_blocking_dims(context: KernelContext, op: NKIOp, dim_order: list[str]) -> set[str]:
+def material_blocking_dims(ir: KernelIR, op: NKIOp, dim_order: list[str]) -> set[str]:
     """Blocking dims whose loops have trip > 1."""
-    blocking = context.op_blocking_dims.get(op, set()) & set(dim_order)
-    return {d for d in blocking if block_trip(context, d) > 1 or ltile_trip(context, d) > 1}
+    blocking = ir.op_blocking_dims.get(op, set()) & set(dim_order)
+    return {d for d in blocking if block_trip(ir, d) > 1 or ltile_trip(ir, d) > 1}
 
 
-def op_depth_floor(context: KernelContext, graph: KernelGraph, op: NKIOp, group_idx: int) -> int:
+def op_depth_floor(ir: KernelIR, op: NKIOp, group_idx: int) -> int:
     """Smallest ``slot.depth`` at which this op can legally emit.
 
     For DMA ops (Load/Store/DMATranspose) the floor is derived
@@ -114,21 +113,21 @@ def op_depth_floor(context: KernelContext, graph: KernelGraph, op: NKIOp, group_
     ``per_tile`` dims force emission inside the ltile loop (depth
     > ``2*pos+1``). For all other ops the floor is the body slot.
     """
-    dim_order = graph.groups[group_idx].dim_order
-    positions = _op_tensor_dim_positions(context, op, dim_order)
+    dim_order = ir.groups[group_idx].dim_order
+    positions = _op_tensor_dim_positions(ir, op, dim_order)
     if isinstance(op, (NKILoad, NKIStore, NKIDMATranspose)):
-        floor = _dma_depth_floor(context, graph, op, group_idx)
+        floor = _dma_depth_floor(ir, op, group_idx)
     else:
         floor = body_depth(len(dim_order)) if positions else 0
     return floor
 
 
-def _dma_depth_floor(context: KernelContext, graph: KernelGraph, op: NKIOp, group_idx: int) -> int:
+def _dma_depth_floor(ir: KernelIR, op: NKIOp, group_idx: int) -> int:
     """DMA-specific floor: max per-dim tier lower bound on the op's SBUF tensor."""
-    dim_order = graph.groups[group_idx].dim_order
-    placements = graph.groups[group_idx].tensor_placements
-    sbuf_tensor = _dma_sbuf_tensor(context, op)
-    tinfo = context.logical_tensors.get(sbuf_tensor, None) if sbuf_tensor else None
+    dim_order = ir.groups[group_idx].dim_order
+    placements = ir.groups[group_idx].tensor_placements
+    sbuf_tensor = _dma_sbuf_tensor(ir, op)
+    tinfo = ir.logical_tensors.get(sbuf_tensor, None) if sbuf_tensor else None
     floor = 0
     if tinfo is not None and sbuf_tensor is not None:
         for dim_id in tinfo.dim_ids:
@@ -152,42 +151,42 @@ def _tier_floor_contribution(tier: str, pos: int) -> int:
     return contribution
 
 
-def _dma_sbuf_tensor(context: KernelContext, op: NKIOp) -> str:
+def _dma_sbuf_tensor(ir: KernelIR, op: NKIOp) -> str:
     """Return the SBUF-side tensor name for a DMA op (Load/DMATranspose: output; Store: input)."""
     if isinstance(op, NKIStore):
-        name = context.op_inputs.get(op, {}).get("data", "")
+        name = ir.op_inputs.get(op, {}).get("data", "")
     else:
-        outputs = context.op_outputs.get(op, [])
+        outputs = ir.op_outputs.get(op, [])
         name = outputs[0] if outputs else ""
     return name
 
 
-def _op_tensor_dim_positions(context: KernelContext, op: NKIOp, dim_order: list[str]) -> list[int]:
+def _op_tensor_dim_positions(ir: KernelIR, op: NKIOp, dim_order: list[str]) -> list[int]:
     """Return positions in ``dim_order`` of every dim any of the op's tensors carries."""
     touched: set[str] = set()
-    for name in list(context.op_inputs.get(op, {}).values()) + list(context.op_outputs.get(op, [])):
-        tinfo = context.logical_tensors.get(name)
+    for name in list(ir.op_inputs.get(op, {}).values()) + list(ir.op_outputs.get(op, [])):
+        tinfo = ir.logical_tensors.get(name)
         if tinfo is not None:
             touched.update(tinfo.dim_ids)
     return [dim_order.index(d) for d in touched if d in dim_order]
 
 
-def _op_input_tensor_names(context: KernelContext, op: NKIOp) -> list[str]:
+def _op_input_tensor_names(ir: KernelIR, op: NKIOp) -> list[str]:
     """Every tensor-valued input — positional inputs plus tensor-valued kwargs."""
-    result = list(context.op_inputs.get(op, {}).values())
-    tensors_set = set(context.logical_tensors)
-    for _name, expr in context.op_kwargs.get(op, {}).items():
+    result = list(ir.op_inputs.get(op, {}).values())
+    tensors_set = set(ir.logical_tensors)
+    for _name, expr in ir.op_kwargs.get(op, {}).items():
         if expr in tensors_set and expr not in result:
             result.append(expr)
     return result
 
 
-def _producer_op_of(context: KernelContext, graph: KernelGraph, tensor_name: str) -> NKIOp | None:
+def _producer_op_of(ir: KernelIR, tensor_name: str) -> NKIOp | None:
     """Return the op producing ``tensor_name`` or None."""
     result: NKIOp | None = None
-    for group in graph.groups:
+    for group in ir.groups:
         for op in group.ops:
-            if tensor_name in context.op_outputs.get(op, []):
+            if tensor_name in ir.op_outputs.get(op, []):
                 result = op
                 break
         if result is not None:
@@ -196,8 +195,7 @@ def _producer_op_of(context: KernelContext, graph: KernelGraph, tensor_name: str
 
 
 def producer_stage_placement(
-    context: KernelContext,
-    graph: KernelGraph,
+    ir: KernelIR,
     producer_op: NKIOp,
     group_idx: int,
     op_to_group: dict[int, int],
@@ -206,24 +204,23 @@ def producer_stage_placement(
 ) -> Placement:
     """Slot at which the producer's output becomes valid for a consumer to read."""
     op_cls = type(producer_op)
-    dim_order = graph.groups[group_idx].dim_order
+    dim_order = ir.groups[group_idx].dim_order
     blocking_barrier: Placement | None = None
     if op_cls.ISA_LOC == "psum":
-        material = material_blocking_dims(context, producer_op, dim_order)
-        produced = context.op_outputs.get(producer_op, [])
+        material = material_blocking_dims(ir, producer_op, dim_order)
+        produced = ir.op_outputs.get(producer_op, [])
         if material and any(t in staged for t in produced):
             blocking_barrier = Placement("after", block_depth(min(dim_order.index(d) for d in material)))
     if blocking_barrier is not None:
         result = blocking_barrier
     else:
-        result = op_emission_placement(context, graph, producer_op, group_idx, op_to_group, staged, memo)
+        result = op_emission_placement(ir, producer_op, group_idx, op_to_group, staged, memo)
     memo[id(producer_op)] = result
     return result
 
 
 def op_emission_placement(
-    context: KernelContext,
-    graph: KernelGraph,
+    ir: KernelIR,
     op: NKIOp,
     group_idx: int,
     op_to_group: dict[int, int],
@@ -233,29 +230,23 @@ def op_emission_placement(
     """Narrowest legal Placement for ``op`` in ``group_idx``."""
     memo = memo if memo is not None else {}
     if id(op) not in memo:
-        memo[id(op)] = _compute_placement(context, graph, op, group_idx, op_to_group, staged, memo)
+        memo[id(op)] = _compute_placement(ir, op, group_idx, op_to_group, staged, memo)
     return memo[id(op)]
 
 
 def _compute_placement(
-    context: KernelContext,
-    graph: KernelGraph,
-    op: NKIOp,
-    group_idx: int,
-    op_to_group: dict[int, int],
-    staged: set[str],
-    memo: dict[int, Placement],
+    ir: KernelIR, op: NKIOp, group_idx: int, op_to_group: dict[int, int], staged: set[str], memo: dict[int, Placement]
 ) -> Placement:
     """Body of ``op_emission_placement``."""
-    dim_order = graph.groups[group_idx].dim_order
+    dim_order = ir.groups[group_idx].dim_order
     n = len(dim_order)
-    floor = op_depth_floor(context, graph, op, group_idx)
+    floor = op_depth_floor(ir, op, group_idx)
     barriers: list[Placement] = []
-    for tname in _op_input_tensor_names(context, op):
-        producer = _producer_op_of(context, graph, tname)
+    for tname in _op_input_tensor_names(ir, op):
+        producer = _producer_op_of(ir, tname)
         if producer is None or producer is op or op_to_group.get(id(producer)) != group_idx:
             continue
-        barriers.append(producer_stage_placement(context, graph, producer, group_idx, op_to_group, staged, memo))
+        barriers.append(producer_stage_placement(ir, producer, group_idx, op_to_group, staged, memo))
     candidates = [Placement("before", d) for d in range(floor, body_depth(n) + 1)] + [
         Placement("after", d) for d in range(body_depth(n) - 1, -1, -1)
     ]
