@@ -1,4 +1,4 @@
-"""Hierarchical two-layer draw: kernel_0 is the naive baseline; 1..N sampled from variants."""
+"""Draw kernel variants: kernel_0 is the naive baseline; 1..N are stochastically rewritten."""
 
 import random
 from pathlib import Path
@@ -6,14 +6,14 @@ from pathlib import Path
 from nkigym.codegen import render_ir
 from nkigym.codegen.buffers import _SBUF_BUFFER_CACHE
 from nkigym.kernel_ir import KernelContext, KernelGraph, KernelIR, sample_valid_ir
-from nkigym.kernel_ir.context.build import MERGE_REWRITES
+from nkigym.kernel_ir.context.build import REWRITES
 
 
 def sample_variants(
     naive_ctx: KernelContext,
     naive_graph: KernelGraph,
     ctx: KernelContext,
-    graph_variants: list[KernelGraph],
+    graph: KernelGraph,
     num_variants: int,
     rng: random.Random,
     cache_dir: Path | None = None,
@@ -21,23 +21,20 @@ def sample_variants(
 ) -> list[tuple[str, KernelIR, str]]:
     """Return ``num_variants`` unique ``(name, KernelIR, source)`` triples.
 
-    The first output is always ``kernel_0`` — the raw baseline built
-    from ``(naive_ctx, naive_graph)``. It bypasses
-    ``GRAPH_REWRITES`` entirely, skips stochastic merges, and
-    samples per-group codegen state with a separate RNG draw
-    seeded from ``rng``. The remaining ``num_variants - 1``
-    kernels are drawn from ``graph_variants`` with the full
-    stochastic-merge + placement sampling.
+    The first output is always ``kernel_0`` — the raw baseline
+    built from ``(naive_ctx, naive_graph)`` with NO rewrites
+    applied. It samples only per-group codegen state. The
+    remaining ``num_variants - 1`` kernels are drawn from
+    ``(ctx, graph)`` with the full ``REWRITES`` registry
+    sampled per draw.
     """
-    if not graph_variants:
-        raise ValueError("graph_variants must be non-empty")
     _SBUF_BUFFER_CACHE.clear()
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     variants: list[tuple[str, KernelIR, str]] = []
     seen: set[str] = set()
     _emit_naive_kernel_0(naive_ctx, naive_graph, rng, cache_dir, variants, seen)
-    _sample_remaining(ctx, graph_variants, num_variants, rng, cache_dir, variants, seen, max_tries_per_variant)
+    _sample_remaining(ctx, graph, num_variants, rng, cache_dir, variants, seen, max_tries_per_variant)
     if len(variants) < num_variants:
         raise RuntimeError(f"Only {len(variants)}/{num_variants} unique variants produced")
     return variants
@@ -52,15 +49,14 @@ def _emit_naive_kernel_0(
     seen: set[str],
 ) -> None:
     """Sample per-group codegen state for the raw baseline graph and record as kernel_0."""
-    seed_ir = KernelIR(context=naive_ctx, graph=naive_graph)
-    candidate = sample_valid_ir(seed_ir, rng, merge_rewrites=[])
+    candidate = sample_valid_ir(naive_ctx, naive_graph, rng, rewrites=[])
     source = render_ir(candidate)
     _record_kernel(0, candidate, source, cache_dir, variants, seen)
 
 
 def _sample_remaining(
     ctx: KernelContext,
-    graph_variants: list[KernelGraph],
+    graph: KernelGraph,
     num_variants: int,
     rng: random.Random,
     cache_dir: Path | None,
@@ -68,13 +64,11 @@ def _sample_remaining(
     seen: set[str],
     max_tries_per_variant: int,
 ) -> None:
-    """Fill kernels 1..N-1 from the enumerated variant set via stochastic sampling."""
+    """Fill kernels 1..N-1 by sampling rewrites + codegen state from ``(ctx, graph)``."""
     tries = 0
     budget = max_tries_per_variant * num_variants
     while len(variants) < num_variants and tries < budget:
-        chosen_graph = rng.choice(graph_variants)
-        seed_ir = KernelIR(context=ctx, graph=chosen_graph)
-        candidate = sample_valid_ir(seed_ir, rng, merge_rewrites=MERGE_REWRITES)
+        candidate = sample_valid_ir(ctx, graph, rng, rewrites=REWRITES)
         source = render_ir(candidate)
         tries += 1
         if source in seen:

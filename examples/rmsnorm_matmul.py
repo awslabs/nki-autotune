@@ -64,7 +64,7 @@ if __name__ == "__main__":
         input_specs=input_specs,
         hosts=["gym-1", "gym-2", "gym-3"],
         cache_dir=str(CACHE_DIR),
-        num_variants=50,
+        num_variants=100,
         atol=1e-2,
         rtol=1e-2,
         seed=0,

@@ -53,7 +53,7 @@ def matmul_lhsT_rhsT_nkigym(lhs_T: np.ndarray, rhs_T: np.ndarray) -> np.ndarray:
 if __name__ == "__main__":
     K, M, N = 2048, 2048, 2048
     HOSTS = ["gym-1", "gym-2", "gym-3"]
-    NUM_VARIANTS = 50
+    NUM_VARIANTS = 100
     ATOL, RTOL = 1e-2, 1e-2
 
     CACHE_ROOT = Path("/home/ubuntu/cache/matmul")

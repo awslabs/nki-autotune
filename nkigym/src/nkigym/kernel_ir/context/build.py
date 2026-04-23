@@ -22,7 +22,6 @@ from typing import cast
 import numpy as np
 
 from nkigym.kernel_ir.compute_skip_prop import propagate_compute_skip
-from nkigym.kernel_ir.compute_skip_spec import SkipPredicate
 from nkigym.kernel_ir.context.context import DimInfo, DimRole, KernelContext, TensorInfo
 from nkigym.kernel_ir.context.parse import find_ops
 from nkigym.kernel_ir.context.trace import trace_scalar_kwargs
@@ -30,31 +29,23 @@ from nkigym.kernel_ir.graph.fusion_group import FusionGroup
 from nkigym.kernel_ir.graph.graph import KernelGraph, insert_dma_nodes, rebuild_edges
 from nkigym.kernel_ir.ir import KernelIR
 from nkigym.kernel_ir.rewrites.load_transpose_pattern import LoadTransposePattern
-from nkigym.kernel_ir.rewrites.merge_composites import MergeComposites
 from nkigym.kernel_ir.rewrites.online_fusion_pattern import OnlineFusionPattern
-from nkigym.kernel_ir.rewrites.pattern_rewrite import PatternRewrite, enumerate_graph_variants
+from nkigym.kernel_ir.rewrites.pattern_rewrite import PatternRewrite
+from nkigym.kernel_ir.rewrites.trivial_fusion import TrivialFusion
 from nkigym.kernel_ir.sampler.sampler import sample_valid_ir
 from nkigym.ops.base import NKIOp
 
-"""Structural graph rewrites exhaustively enumerated at variant-build time.
+"""Graph rewrites — all sampled stochastically per-draw in one loop.
 
-These produce a finite, small set of structurally distinct
-graphs (each rewrite has O(1) or O(N) matches and terminates in
-a handful of applies). The outer layer of hierarchical sampling
-picks uniformly among them.
+Every rewrite lives in one registry and is drawn uniformly at
+each sampling step; no outer vs inner layer. The sampler picks
+a rewrite count ``k ∈ [0, num_ops - 1]`` uniformly, then applies
+``k`` rewrites (one match per step, chosen uniformly across all
+currently-matching ``(pattern, instance)`` pairs).
 """
-GRAPH_REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [OnlineFusionPattern(), LoadTransposePattern()])
-
-"""Merge rewrite — applied stochastically per-draw in the inner sampler.
-
-Unlike ``GRAPH_REWRITES`` whose match sets are small, merges
-have O(N²) matches per graph and chained merges produce a
-Bell-number-sized lattice of partitions. Exhaustive enumeration
-is infeasible; the sampler randomly applies a subset per draw
-under R1 convexity. Semantically still a ``PatternRewrite``;
-just plugged into a different layer of the sampler.
-"""
-MERGE_REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [MergeComposites()])
+REWRITES: list[PatternRewrite] = cast(
+    list[PatternRewrite], [TrivialFusion(), OnlineFusionPattern(), LoadTransposePattern()]
+)
 
 
 @dataclass
@@ -288,89 +279,40 @@ def build_initial(
     return context, graph
 
 
-def build_context_and_variants(
+def build_naive_ir(
     func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]
-) -> tuple[KernelContext, KernelGraph, KernelContext, list[KernelGraph]]:
-    """Return the naive baseline + the full variant set for stochastic sampling.
+) -> tuple[KernelContext, KernelGraph, KernelContext, KernelGraph]:
+    """Return the naive baseline and the rewrite-ready ``(ctx, graph)`` seed.
 
     The pipeline is:
 
-    1. ``build_initial`` + ``insert_dma_nodes`` → **naive context + graph**.
-       Returned directly as the first two results. Used to emit
-       ``kernel_0`` — the raw operator graph with ``NKIAffineSelect``
-       still present, no compute-skip annotations, no rewrites, no
-       merges. Serves as a baseline for before/after comparison.
+    1. ``build_initial`` + ``insert_dma_nodes`` → naive ``(ctx,
+       graph)``. Used to emit ``kernel_0`` — the raw operator
+       graph with ``NKIAffineSelect`` still present, no
+       compute-skip annotations, no rewrites, no merges.
     2. ``propagate_compute_skip`` → mandatory pre-pass that lifts
        every ``NKIAffineSelect`` into per-op ``SkipPredicate``
        annotations and removes the standalone op. Runs BEFORE any
        graph rewrite; masking is treated as mandatory, not a
        sampled choice.
-    3. ``enumerate_graph_variants`` with ``GRAPH_REWRITES`` (online
-       fusion + load-transpose) on the propagated graph. The
-       sampled-from set returned as ``(shared_ctx, variants)``.
+    3. The resulting ``(ctx, graph)`` is the seed every
+       ``sample_valid_ir`` call starts from. Rewrites from
+       ``REWRITES`` are sampled per-draw inside ``sample_valid_ir``.
 
     Returns:
-        ``(naive_ctx, naive_graph, sampled_ctx, sampled_variants)``.
+        ``(naive_ctx, naive_graph, seed_ctx, seed_graph)``.
     """
     context, graph = build_initial(func, input_specs)
     context, graph = insert_dma_nodes(context, graph)
     naive_ctx, naive_graph = context, graph
     context, graph = propagate_compute_skip(context, graph)
-    pairs = enumerate_graph_variants(context, graph, GRAPH_REWRITES)
-    if pairs:
-        shared_ctx = _merge_contexts([c for c, _g in pairs])
-        variants = [g for _c, g in pairs]
-    else:
-        shared_ctx = context
-        variants = [graph]
-    return naive_ctx, naive_graph, shared_ctx, variants
-
-
-def _merge_contexts(contexts: list[KernelContext]) -> KernelContext:
-    """Union every per-op dict across variants so downstream lookups always find the op."""
-    if not contexts:
-        raise ValueError("cannot merge empty context list")
-    base = contexts[-1]
-    op_inputs: dict[NKIOp, dict[str, str]] = {}
-    op_outputs: dict[NKIOp, list[str]] = {}
-    op_kwargs: dict[NKIOp, dict[str, str]] = {}
-    op_axis_map: dict[NKIOp, dict[str, str]] = {}
-    op_tile_sizes: dict[NKIOp, dict[str, int]] = {}
-    op_blocking_dims: dict[NKIOp, set[str]] = {}
-    op_skip_spec: dict[NKIOp, SkipPredicate] = {}
-    logical_tensors: dict[str, TensorInfo] = {}
-    for ctx in contexts:
-        op_inputs.update(ctx.op_inputs)
-        op_outputs.update(ctx.op_outputs)
-        op_kwargs.update(ctx.op_kwargs)
-        op_axis_map.update(ctx.op_axis_map)
-        op_tile_sizes.update(ctx.op_tile_sizes)
-        op_blocking_dims.update(ctx.op_blocking_dims)
-        op_skip_spec.update(ctx.op_skip_spec)
-        logical_tensors.update(ctx.logical_tensors)
-    return KernelContext(
-        func_name=base.func_name,
-        param_names=base.param_names,
-        return_name=base.return_name,
-        dimensions=base.dimensions,
-        logical_tensors=logical_tensors,
-        ltiles_per_block=base.ltiles_per_block,
-        required_merges=base.required_merges,
-        op_inputs=op_inputs,
-        op_outputs=op_outputs,
-        op_kwargs=op_kwargs,
-        op_axis_map=op_axis_map,
-        op_tile_sizes=op_tile_sizes,
-        op_blocking_dims=op_blocking_dims,
-        op_skip_spec=op_skip_spec,
-    )
+    return naive_ctx, naive_graph, context, graph
 
 
 def build_ir(
     func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], seed: int | None = None
 ) -> KernelIR:
-    """Convenience: build context + pick last variant + sample one valid state."""
-    _naive_ctx, _naive_graph, context, variants = build_context_and_variants(func, input_specs)
+    """Convenience: build seed context + graph and sample one valid state."""
+    _naive_ctx, _naive_graph, context, graph = build_naive_ir(func, input_specs)
     rng = random.Random(seed)
-    seed_ir = KernelIR(context=context, graph=variants[-1])
-    return sample_valid_ir(seed_ir, rng, merge_rewrites=MERGE_REWRITES)
+    return sample_valid_ir(context, graph, rng, rewrites=REWRITES)

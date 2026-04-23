@@ -1,10 +1,7 @@
 """Graph reachability helper for fusion-group merge legality.
 
-The old stochastic merge sampler has been retired; merges are
-now enumerated at graph-variant time by the ``MergeComposites``
-``PatternRewrite`` in ``rewrites/merge_composites.py``. This
-module keeps only the small reachability primitive the rewrite
-uses to check R1 convexity.
+Small primitive used by fusion rewrites (``TrivialFusion``) to
+check R1 convexity when merging two groups.
 """
 
 from nkigym.kernel_ir.graph.graph import KernelGraph
@@ -15,9 +12,8 @@ def compute_reachability(graph: KernelGraph) -> list[set[int]]:
 
     ``reach[u]`` is the set of group indices reachable from ``u``
     via ``graph.edges`` (inclusive of ``u``). Used by
-    ``MergeComposites`` to test whether merging two groups
-    preserves R1 — no external group is trapped on a DAG path
-    between them.
+    ``TrivialFusion`` to test whether merging two groups preserves
+    R1 — no external group is trapped on a DAG path between them.
     """
     n = len(graph.groups)
     adjacency: list[list[int]] = [[] for _ in range(n)]

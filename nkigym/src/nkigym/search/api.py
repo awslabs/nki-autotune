@@ -14,7 +14,7 @@ import nkigym.ops as ops_pkg
 from autotune.runner.api import remote_profile
 from autotune.runner.output import ProfileOutput
 from autotune.runner.types import KernelJob, ProfileConfig
-from nkigym.kernel_ir import build_context_and_variants
+from nkigym.kernel_ir import build_naive_ir
 from nkigym.ops.base import NKIOp
 from nkigym.search.mac import compute_mac_count
 from nkigym.search.sampler import sample_variants
@@ -103,11 +103,11 @@ def remote_search(
         ProfileOutput with per-variant timing and correctness.
     """
     rng = random.Random(seed)
-    naive_ctx, naive_graph, ctx, graph_variants = build_context_and_variants(func, input_specs)
+    naive_ctx, naive_graph, ctx, graph = build_naive_ir(func, input_specs)
     mac_count = compute_mac_count(func, input_specs)
     nkigym_source = _func_source_with_imports(func)
     cache_path = Path(cache_dir)
-    variants = sample_variants(naive_ctx, naive_graph, ctx, graph_variants, num_variants, rng, cache_dir=cache_path)
+    variants = sample_variants(naive_ctx, naive_graph, ctx, graph, num_variants, rng, cache_dir=cache_path)
     output_shape = tuple(naive_ctx.logical_tensors[naive_ctx.return_name].shape)
     kernels: dict[str, KernelJob] = {
         f"{name}.py": KernelJob(

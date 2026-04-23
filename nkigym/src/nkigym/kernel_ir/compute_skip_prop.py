@@ -1,7 +1,7 @@
 """``propagate_compute_skip`` — mandatory pre-pass that lifts ``NKIAffineSelect`` to per-op annotations.
 
 Runs exactly once after ``insert_dma_nodes`` and before any
-``GRAPH_REWRITES`` enumeration. For every ``NKIAffineSelect`` in
+``REWRITES`` sampling. For every ``NKIAffineSelect`` in
 the graph:
 
 1. Extract the causal predicate coefficients + the ``on_false_value``.

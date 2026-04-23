@@ -54,32 +54,3 @@ def apply_rewrites_until_fixpoint(
         f"pattern-rewrite driver did not reach fixpoint after {max_iterations} passes — "
         "check for oscillating patterns"
     )
-
-
-def _graph_signature(graph: KernelGraph) -> tuple:
-    """Canonical structural signature for dedup.
-
-    Two graphs with different apply orders but the same resulting
-    structure hash to the same signature. Uses group-op class
-    names in order.
-    """
-    return tuple(tuple(type(op).__name__ for op in group.ops) for group in graph.groups)
-
-
-def enumerate_graph_variants(
-    context: KernelContext, graph: KernelGraph, patterns: list[PatternRewrite]
-) -> list[tuple[KernelContext, KernelGraph]]:
-    """Exhaustively enumerate every graph reachable by any subset of rewrites."""
-    seen: dict[tuple, tuple[KernelContext, KernelGraph]] = {}
-    stack: list[tuple[KernelContext, KernelGraph]] = [(context, graph)]
-    while stack:
-        current_ctx, current_graph = stack.pop()
-        sig = _graph_signature(current_graph)
-        if sig in seen:
-            continue
-        seen[sig] = (current_ctx, current_graph)
-        for pattern in patterns:
-            for instance in pattern.match(current_ctx, current_graph):
-                new_ctx, new_graph = pattern.apply(current_ctx, current_graph, instance)
-                stack.append((new_ctx, new_graph))
-    return list(seen.values())

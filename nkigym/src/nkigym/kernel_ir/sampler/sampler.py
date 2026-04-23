@@ -1,17 +1,18 @@
-"""Inner-layer sampler: stochastic merges + per-group codegen state.
+"""Sampler: draw one valid ``KernelIR`` from ``(ctx, graph)`` + a rewrite registry.
 
-The outer layer (``enumerate_graph_variants``) fixes structural
-graph variants from ``GRAPH_REWRITES`` (online fusion, DMA
-transpose). This layer then applies ``MERGE_REWRITES``
-stochastically — each ``sample_valid_ir`` call samples a random
-subset of legal merges via ``MergeComposites``, then draws
-``dim_order`` / ``buffer_degrees`` / ``tensor_placements`` under
-rejection sampling.
+Each ``sample_valid_ir`` call:
 
-Two-phase split: merges are O(N²) per graph and chained merges
-produce a Bell-number-sized partition lattice — infeasible to
-enumerate. Semantically still a ``PatternRewrite``; applied here
-rather than at enumeration time.
+1. Samples a rewrite count ``k`` uniformly in ``[0, num_ops - 1]``.
+2. Applies ``k`` rewrites from the unified ``REWRITES`` registry;
+   at each step, draws one ``(pattern, instance)`` uniformly from
+   the current match set across all patterns.
+3. Rejection-samples ``dim_order`` / ``ltiles_per_block`` /
+   ``tensor_placements`` for the resulting graph until ``validate``
+   passes.
+
+There is no outer/inner split. Every rewrite (trivial fusion,
+online fusion, DMA-transpose fusion) is a ``PatternRewrite`` in
+one registry, sampled in one loop.
 """
 
 import random
@@ -27,15 +28,18 @@ from nkigym.kernel_ir.validate.rules import tier_depth_range, validate
 from nkigym.ops.base import NKIOp
 
 TIERS = ("per_tile", "per_block", "full")
-_P_MERGE = 0.7
 
 
 def sample_valid_ir(
-    ir: KernelIR, rng: random.Random, merge_rewrites: list[PatternRewrite] | None = None, max_tries: int = 1_000_000
+    context: KernelContext,
+    graph: KernelGraph,
+    rng: random.Random,
+    rewrites: list[PatternRewrite],
+    max_tries: int = 1_000_000,
 ) -> KernelIR:
-    """Stochastically merge + rejection-sample per-group state. Returns a new ``KernelIR``."""
-    context = ir.context
-    graph = _apply_stochastic_merges(context, ir.graph, merge_rewrites or [], rng)
+    """Sample rewrites + per-group codegen state; return a valid ``KernelIR``."""
+    k_max = max(0, len(context.op_inputs) - 1)
+    context, graph = _apply_stochastic_rewrites(context, graph, rewrites, rng, k_max)
     tensor_kinds = _tensor_buffers(context, graph)
     sbuf_tensors = {name for name, kinds in tensor_kinds.items() if "sbuf" in kinds}
     staged = compute_staged_set(context, graph)
@@ -65,6 +69,24 @@ def sample_valid_ir(
     raise RuntimeError(f"No valid IR found after {max_tries} samples")
 
 
+def _apply_stochastic_rewrites(
+    context: KernelContext, graph: KernelGraph, rewrites: list[PatternRewrite], rng: random.Random, k_max: int
+) -> tuple[KernelContext, KernelGraph]:
+    """Apply ``k`` rewrites where ``k`` is drawn uniformly in ``[0, k_max]``."""
+    k = rng.randint(0, k_max)
+    current_ctx, current_graph = context, graph
+    for _ in range(k):
+        matches: list[tuple[PatternRewrite, object]] = []
+        for pattern in rewrites:
+            for instance in pattern.match(current_ctx, current_graph):
+                matches.append((pattern, instance))
+        if not matches:
+            break
+        pattern, instance = rng.choice(matches)
+        current_ctx, current_graph = pattern.apply(current_ctx, current_graph, instance)
+    return current_ctx, current_graph
+
+
 def _enumerate_lpb_choices(context: KernelContext) -> dict[str, list[int]]:
     """Per-dim sorted divisors of ``dim_size // logical_tile_size`` — the legal ``ltiles_per_block`` set."""
     return {d: _divisors(di.dim_size // di.logical_tile_size) for d, di in context.dimensions.items()}
@@ -84,23 +106,6 @@ def _divisors(n: int) -> list[int]:
                 large.append(n // i)
         i += 1
     return small + large[::-1]
-
-
-def _apply_stochastic_merges(
-    context: KernelContext, graph: KernelGraph, rewrites: list[PatternRewrite], rng: random.Random
-) -> KernelGraph:
-    """Apply merge rewrites stochastically until Bernoulli bail or no legal matches."""
-    current = graph
-    while True:
-        matches: list[tuple[PatternRewrite, object]] = []
-        for pattern in rewrites:
-            for instance in pattern.match(context, current):
-                matches.append((pattern, instance))
-        if not matches or rng.random() >= _P_MERGE:
-            break
-        pattern, instance = rng.choice(matches)
-        _, current = pattern.apply(context, current, instance)
-    return current
 
 
 def _tensor_buffers(context: KernelContext, graph: KernelGraph) -> dict[str, set[str]]:
