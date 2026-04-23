@@ -21,13 +21,17 @@ def is_matmul_block_candidate(ir: KernelIR, op: NKIOp, group_idx: int) -> bool:
       ``num_blocks > 1``.
     * Both the ``stationary`` and ``moving`` SBUF inputs have
       tier on ``K`` strictly below ``full`` (i.e. ``per_block``
-      or ``per_tile``) in this group.
+      or ``per_tile``) in this group — so the inputs reload per
+      outer-K-block iteration, the shape the gadget needs.
+    * The matmul's output has a block-slab tier on its M and N
+      dims (``per_block`` or ``full``, not ``per_tile``) so the
+      running accumulator persists across the outer-K loop.
     """
     k_dim = _resolve_k_dim(ir, op)
     ok = k_dim is not None and _k_has_multiple_blocks(ir, k_dim)
     if ok:
         assert k_dim is not None
-        ok = _k_inputs_not_full(ir, op, group_idx, k_dim)
+        ok = _k_inputs_not_full(ir, op, group_idx, k_dim) and _output_has_block_slab(ir, op, group_idx)
     return ok
 
 
@@ -50,16 +54,47 @@ def _k_has_multiple_blocks(ir: KernelIR, k_dim: str) -> bool:
 
 
 def _k_inputs_not_full(ir: KernelIR, op: NKIOp, group_idx: int, k_dim: str) -> bool:
-    """True iff both matmul SBUF inputs have non-full tier on ``k_dim``."""
+    """True iff both matmul SBUF inputs have ``per_block`` tier on ``k_dim``.
+
+    matmul_block iterates the inner-K slab of a ``per_block``-tier
+    input per outer-K-block step. ``full`` tier would skip the
+    reload entirely and ``per_tile`` would force element-level
+    loads the gadget can't express.
+    """
     inputs = ir.context.op_inputs.get(op, {})
     placements = ir.graph.groups[group_idx].tensor_placements
     result = True
     for role in ("stationary", "moving"):
         tensor = inputs.get(role)
         tier = placements.get(("sbuf", tensor, k_dim), "per_tile") if tensor else "full"
-        if tensor is None or _TIER_RANK[tier] >= _TIER_RANK["full"]:
+        if tensor is None or tier != "per_block":
             result = False
             break
+    return result
+
+
+def _output_has_block_slab(ir: KernelIR, op: NKIOp, group_idx: int) -> bool:
+    """True iff the matmul's output SBUF has ``per_block``-or-``full`` tier on its M and N dims.
+
+    matmul_block writes the running accumulator across the
+    outer-K loop, so the output buffer must hold at least a
+    whole M/N block at a time — ``per_tile`` would force an
+    element-level drain that the gadget can't express.
+    """
+    outputs = ir.context.op_outputs.get(op, [])
+    placements = ir.graph.groups[group_idx].tensor_placements
+    axis_map = ir.context.op_axis_map.get(op, {})
+    result = bool(outputs)
+    if result:
+        out_name = outputs[0]
+        for abstract in ("M", "N"):
+            dim_id = axis_map.get(abstract)
+            if dim_id is None:
+                continue
+            tier = placements.get(("sbuf", out_name, dim_id), "per_tile")
+            if _TIER_RANK[tier] < _TIER_RANK["per_block"]:
+                result = False
+                break
     return result
 
 

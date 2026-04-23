@@ -30,22 +30,31 @@ from nkigym.kernel_ir.graph.graph import KernelGraph, insert_dma_nodes, rebuild_
 from nkigym.kernel_ir.ir import KernelIR
 from nkigym.kernel_ir.rewrites.load_transpose_pattern import LoadTransposePattern
 from nkigym.kernel_ir.rewrites.online_fusion_pattern import OnlineFusionPattern
-from nkigym.kernel_ir.rewrites.pattern_rewrite import PatternRewrite
+from nkigym.kernel_ir.rewrites.pattern_rewrite import PatternRewrite, apply_rewrites_until_fixpoint
 from nkigym.kernel_ir.rewrites.trivial_fusion import TrivialFusion
 from nkigym.kernel_ir.sampler.sampler import sample_valid_ir
 from nkigym.ops.base import NKIOp
 
-"""Graph rewrites — all sampled stochastically per-draw in one loop.
+"""Graph rewrites — split into mandatory pre-passes and sampled rewrites.
 
-Every rewrite lives in one registry and is drawn uniformly at
-each sampling step; no outer vs inner layer. The sampler picks
-a rewrite count ``k ∈ [0, num_ops - 1]`` uniformly, then applies
-``k`` rewrites (one match per step, chosen uniformly across all
-currently-matching ``(pattern, instance)`` pairs).
+``TrivialFusion`` is applied to fixpoint as a mandatory pre-pass
+inside ``build_naive_ir`` because it is a strict no-op-or-better
+transform: merging a producer→consumer pair whose shared dims are
+all PARALLEL in the producer preserves semantics, and any kernel
+the sampler could produce with an unfused partition is strictly
+reachable via placement draws on the merged partition (choosing
+``full`` tier on the shared tensor's dims reproduces the
+pre-loaded outer-group pattern). Leaving it as a sampled choice
+wasted rewrite-count budget on a redundant search axis.
+
+The remaining ``REWRITES`` cover transforms with genuine
+performance trade-offs: the sampler picks ``k ∈ [0, num_ops -
+1]`` uniformly, then applies ``k`` rewrites (one match per step,
+chosen uniformly across all currently-matching
+``(pattern, instance)`` pairs).
 """
-REWRITES: list[PatternRewrite] = cast(
-    list[PatternRewrite], [TrivialFusion(), OnlineFusionPattern(), LoadTransposePattern()]
-)
+_MANDATORY_REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [TrivialFusion()])
+REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [OnlineFusionPattern(), LoadTransposePattern()])
 
 
 @dataclass
@@ -292,12 +301,15 @@ def build_naive_ir(
        compute-skip annotations, no rewrites, no merges.
     2. ``propagate_compute_skip`` → mandatory pre-pass that lifts
        every ``NKIAffineSelect`` into per-op ``SkipPredicate``
-       annotations and removes the standalone op. Runs BEFORE any
-       graph rewrite; masking is treated as mandatory, not a
-       sampled choice.
-    3. The resulting ``(ctx, graph)`` is the seed every
-       ``sample_valid_ir`` call starts from. Rewrites from
-       ``REWRITES`` are sampled per-draw inside ``sample_valid_ir``.
+       annotations and removes the standalone op.
+    3. ``_MANDATORY_REWRITES`` applied to fixpoint — currently
+       just ``TrivialFusion``, which is a strict no-op-or-better
+       transform and is therefore lifted out of the sampled
+       ``REWRITES`` set.
+    4. The resulting ``(ctx, graph)`` is the seed every
+       ``sample_valid_ir`` call starts from; remaining
+       ``REWRITES`` are sampled per-draw inside
+       ``sample_valid_ir``.
 
     Returns:
         ``(naive_ctx, naive_graph, seed_ctx, seed_graph)``.
@@ -306,6 +318,7 @@ def build_naive_ir(
     context, graph = insert_dma_nodes(context, graph)
     naive_ctx, naive_graph = context, graph
     context, graph = propagate_compute_skip(context, graph)
+    context, graph = apply_rewrites_until_fixpoint(context, graph, _MANDATORY_REWRITES)
     return naive_ctx, naive_graph, context, graph
 
 

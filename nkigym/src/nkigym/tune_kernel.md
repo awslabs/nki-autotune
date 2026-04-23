@@ -18,11 +18,15 @@ python -m nkigym.pipeline.build_ir <func_path> <input_specs> --out <cache>/seed.
 Abort on failure — compute-skip incompatibility is a user bug, not a search failure.
 
 ### 2. Propose rewrites (you)
-For each candidate graph:
-- `python -m nkigym.pipeline.list_matches <state>.pkl` → legal `(pattern, instance)` pairs.
-- Pick a sequence guided by `learnings.md` priors (e.g. TF→OF→TF for attention).
-- `python -m nkigym.pipeline.apply_rewrite <state>.pkl <pattern> <instance> --out <next>.pkl` per step.
-- Save as `<cache>/graph_<i>.pkl`. Favor breadth over depth.
+Rewrites are iterative — applying one can expose matches that were previously hidden. Do not plan full sequences up front. For each candidate:
+- Start from `seed.pkl` (or a branched intermediate).
+- Loop:
+  1. `python -m nkigym.pipeline.list_matches <state>.pkl` → current legal `(pattern, instance)` pairs.
+  2. Pick ONE match, guided by `learnings.md` priors (e.g. TF before OF for attention).
+  3. `python -m nkigym.pipeline.apply_rewrite <state>.pkl <pattern> <instance> --out <next>.pkl`.
+  4. Re-list on `<next>.pkl`; new matches may now appear.
+  5. Stop when no match fits the prior or no matches remain.
+- Save the terminal state as `<cache>/graph_<i>.pkl`. Branch at any intermediate step to explore alternatives.
 
 ### 3. Propose context knobs (you)
 For each `graph_<i>.pkl`:
