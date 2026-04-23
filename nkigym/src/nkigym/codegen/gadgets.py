@@ -32,31 +32,41 @@ import nki.isa as nisa
 import nki.language as nl
 
 
-def load_block(
-    sbuf: Any, mem: Any, p_start: int, p_count: int, f_start: int, f_count: int, transpose: bool = False
-) -> None:
-    """HBM → SBUF: copy ``mem`` into the ``[p_start : p_start + p_count][f_start : f_start + f_count]`` sub-block of ``sbuf``.
+def load_block(sbuf: Any, mem: Any, p_start: int, p_size: int, f_start: int, f_size: int, transpose: bool) -> None:
+    """HBM → SBUF: copy the ``mem[p_start:p_start+p_size, f_start:f_start+f_size]`` region into every leaf of ``sbuf``.
 
-    When ``transpose=True``, ``mem`` is the pre-transpose HBM tile
-    of shape ``(f_count * F, p_count * P)`` and each leaf is filled
-    via ``nisa.dma_transpose`` so the destination's partition axis
-    takes values from the source's free axis.
+    Slot count and per-leaf tile size are recovered from ``sbuf``:
+    ``num_p_tiles = len(sbuf)``, ``num_f_tiles = len(sbuf[0])``,
+    and leaf shape ``(p_tile, f_tile) = sbuf[0][0].shape``. The
+    requested HBM extent must match exactly:
+    ``p_size == num_p_tiles * p_tile`` and
+    ``f_size == num_f_tiles * f_tile``.
+
+    When ``transpose=True``, the HBM region is taken as
+    ``mem[f_start:f_start+f_size, p_start:p_start+p_size]`` and
+    each leaf is filled via ``nisa.dma_transpose`` so the
+    destination's partition axis takes values from the source's
+    free axis.
     """
-    p, f = sbuf[0][0].shape
-    op, of = mem.shape
-    expected = (f_count * f, p_count * p) if transpose else (p_count * p, f_count * f)
-    if (op, of) != expected:
+    num_p_tiles = len(sbuf)
+    num_f_tiles = len(sbuf[0]) if num_p_tiles else 0
+    if num_p_tiles == 0 or num_f_tiles == 0:
+        raise ValueError(f"load_block got empty sbuf with outer shape ({num_p_tiles}, {num_f_tiles})")
+    p_tile, f_tile = sbuf[0][0].shape
+    if p_size != num_p_tiles * p_tile or f_size != num_f_tiles * f_tile:
         raise ValueError(
-            f"load_block shape mismatch: sbuf sub-block ({p_count}, {f_count})x({p}, {f}) "
-            f"expects mem {expected}, got {mem.shape} (transpose={transpose})"
+            f"load_block extent mismatch: sbuf covers ({num_p_tiles * p_tile}, {num_f_tiles * f_tile}) "
+            f"via ({num_p_tiles}, {num_f_tiles}) slots of ({p_tile}, {f_tile}), got (p_size, f_size)=({p_size}, {f_size})"
         )
-    for pi in range(p_count):
-        for fi in range(f_count):
-            dst = sbuf[p_start + pi][f_start + fi][0:p, 0:f]
+    for pi in range(num_p_tiles):
+        for fi in range(num_f_tiles):
+            dst = sbuf[pi][fi][0:p_tile, 0:f_tile]
+            p0 = p_start + pi * p_tile
+            f0 = f_start + fi * f_tile
             if transpose:
-                nisa.dma_transpose(dst, mem[fi * f : (fi + 1) * f, pi * p : (pi + 1) * p])
+                nisa.dma_transpose(dst, mem[f0 : f0 + f_tile, p0 : p0 + p_tile])
             else:
-                nisa.dma_copy(dst, mem[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f])
+                nisa.dma_copy(dst, mem[p0 : p0 + p_tile, f0 : f0 + f_tile])
 
 
 def memset_block(buffer: Any, value: float) -> None:
@@ -161,3 +171,26 @@ def matmul_block(
                 acc_tile[0:tile_m, 0:tile_n],
                 op=nl.add,
             )
+
+
+def allocate_buffers(
+    p_tile_size: int,
+    num_p_tiles: int,
+    num_p_buffers: int,
+    f_tile_size: int,
+    num_f_tiles: int,
+    num_f_buffers: int,
+    loc,
+    dtype,
+):
+    leaf_shape = (p_tile_size, f_tile_size * num_f_tiles)
+    buffers = []
+    for _ in range(num_p_buffers):
+        p_slots = []
+        for _ in range(num_p_tiles):
+            f_slots = []
+            for _ in range(num_f_buffers):
+                f_slots.append(nl.ndarray(leaf_shape, dtype=dtype, buffer=loc))
+            p_slots.append(f_slots)
+        buffers.append(p_slots)
+    return buffers
