@@ -77,22 +77,28 @@ Information from IR:
 ```
 physical_buffers:
     sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
+    sbuf_rhs: tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
 dim_order: [d2, d0, d1]
 ltiles/block:
     d0: 8
     d1: 4
+    d2: 1
 buffer_placements:
     sbuf_lhs_T = INNER
+    sbuf_rhs = INNER
 buffer_degrees:
     (sbuf_lhs_T, d0) = 1
     (sbuf_lhs_T, d1) = 1
+    (sbuf_rhs, d0) = 1
+    (sbuf_rhs, d2) = 1
 ```
 ```python
 sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
 ```
 
 ## Loopnest
-Emit op0:
+### Emit op0:
 ```
 [0] NKILoad:
       inputs={'data': 'lhs_T'}, outputs=['sbuf_lhs_T']
@@ -119,4 +125,32 @@ for i_block_d2 in range(d2_num_blocks):
     for i_block_d0 in range(d0_num_blocks):
         for i_block_d1 in range(d1_num_blocks):
             load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512)
+```
+
+### Emit op1:
+```
+[1] NKILoad:
+      inputs={'data': 'rhs'}, outputs=['sbuf_rhs']
+      kwargs={'data': 'rhs'}
+      axis_map={}, tile_sizes={}, blocking=[]
+```
+Information from IR:
+```
+physical_buffers:
+    sbuf_rhs: tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
+dim_order: [d2, d0, d1]
+ltiles/block:
+    d0: 8
+    d2: 1
+buffer_placements:
+    sbuf_rhs = INNER
+buffer_degrees:
+    (sbuf_rhs, d0) = 1
+    (sbuf_rhs, d2) = 1
+```
+Code generation:
+```python
+for i_block_d2 in range(d2_num_blocks):
+    for i_block_d0 in range(d0_num_blocks):
+        load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512)
 ```
