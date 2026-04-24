@@ -19,11 +19,9 @@ Usage::
 """
 
 import shutil
-from dataclasses import replace
 from pathlib import Path
 
 from nkigym.kernel_ir import BufferScope, KernelIR, NumBuffers, build_ir
-from nkigym.kernel_ir.build import _derive_edges
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.matmul import NKIMatmul
@@ -47,25 +45,14 @@ def rmsnorm_matmul_nkigym(a, b):
 
 
 def build_tuned_rmsnorm_matmul_ir(input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
-    """Baseline IR from ``build_ir`` + champion knobs (≈67% MFU at 2048³).
+    """Baseline IR from ``build_ir`` + champion knobs (≈73% MFU at 2048³).
 
     ``build_ir`` picks dim ids in discovery order:
     ``d0`` = a's partition (M), ``d1`` = a's free / K (ACCUMULATION),
     ``d2`` = b's free (N). Champion loop order is ``[M, N, K]`` →
     ``[d0, d2, d1]``.
-
-    This hits ≈67% MFU, ~6pp short of the 73% hand-built champion. The
-    remaining gap is from rewrites build_ir does NOT do: the champion
-    fuses ops 3+4 (tensor_scalar → activation) into a shared fp32 scratch
-    buffer (``sbuf_rsqrt_val`` used as both input and output of the
-    activation), and promotes ``sbuf_sum_sq`` / the intermediate scaled
-    value to fp32. ``build_ir`` emits the strict naive chain with
-    ``sbuf_scaled`` (bf16) as a separate buffer. Closing the gap is an
-    agent-level graph-rewrite proposal on top of this baseline.
     """
     ir = build_ir(rmsnorm_matmul_nkigym, input_specs)
-    _alias_buffers(ir, kill="sbuf_scaled", keep="sbuf_rsqrt_val")
-    _widen_dtype(ir, "sbuf_sum_sq", "float32")
     ir.dim_order = ["d0", "d2", "d1"]
     ir.ltiles_per_block = {"d0": 4, "d1": 8, "d2": 1}
     ir.buffer_scopes = {
@@ -83,35 +70,6 @@ def build_tuned_rmsnorm_matmul_ir(input_specs: dict[str, tuple[tuple[int, ...], 
         if op.kind == "NKITranspose":
             op.attrs["mode"] = "dma_transpose"
     return ir
-
-
-def _alias_buffers(ir: KernelIR, *, kill: str, keep: str) -> None:
-    """Rewrite: merge ``kill`` into ``keep`` (breaks SSA for physical buffers).
-
-    Renames every use of ``kill`` in ``ops.inputs`` / ``ops.outputs`` to
-    ``keep``, drops ``kill`` from ``physical_buffers`` (widening dtype if
-    needed), and regenerates ``ir.edges`` from the mutated ops.
-    """
-    if kill not in ir.physical_buffers or keep not in ir.physical_buffers:
-        raise KeyError(f"cannot alias {kill!r} → {keep!r}: missing from physical_buffers")
-    kill_buf = ir.physical_buffers[kill]
-    keep_buf = ir.physical_buffers[keep]
-    widened = kill_buf.dtype if kill_buf.dtype == "float32" else keep_buf.dtype
-    ir.physical_buffers[keep] = replace(keep_buf, dtype=widened)
-    del ir.physical_buffers[kill]
-
-    for op in ir.ops:
-        op.inputs = {role: (keep if t == kill else t) for role, t in op.inputs.items()}
-        op.outputs = [keep if t == kill else t for t in op.outputs]
-        op.kwargs = {k: (keep if isinstance(v, str) and v == kill else v) for k, v in op.kwargs.items()}
-
-    ir.edges = _derive_edges(ir.ops)
-
-
-def _widen_dtype(ir: KernelIR, buf_name: str, dtype: str) -> None:
-    """Rewrite: widen a single physical buffer's dtype."""
-    buf = ir.physical_buffers[buf_name]
-    ir.physical_buffers[buf_name] = replace(buf, dtype=dtype)
 
 
 if __name__ == "__main__":

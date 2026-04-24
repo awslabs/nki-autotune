@@ -515,21 +515,27 @@ def _topological_ranks(ir: KernelIR) -> dict[int, int]:
 def _op_dim_set(ir: KernelIR, op: Op) -> set[str]:
     """Dims the op's loops must iterate over.
 
-    * Matmul / compute ops: union of input + output tensor dim_ids +
-      any ``blocking_dims``.
-    * Load: dims whose HBM slice varies (i.e. dim extent of the
-      destination buffer < full dim size), plus enclosing loops of
-      the destination buffer's ``emission_depth``.
-    * Other compute ops on a wider-than-one-block buffer: same rule
-      as Load — only include dims where the buffer doesn't span full
-      extent.
+    * Matmul: union of input + output varying dims + ``blocking_dims``
+      (the K reduction must be an explicit outer loop).
+    * Load: dims whose HBM slice varies, plus enclosing loops of the
+      destination buffer's ``emission_depth``.
+    * Other compute ops (activation_reduce, tensor_scalar, etc.):
+      only dims that *actually vary* across the op's tensor operands.
+      ``blocking_dims`` is NOT added: the block-level gadget already
+      iterates over full-extent buffer axes internally, so wrapping an
+      outer loop around a gadget whose input spans the full extent
+      produces redundant iterations. Only matmul needs the explicit
+      outer K loop because PSUM-accumulation is op-level, not
+      gadget-internal.
     * Store: handled separately; never scheduled here.
     """
     if op.kind == "NKIStore":
         return set()
     if op.kind == "NKILoad":
         return _load_dim_set(ir, op)
-    dims: set[str] = set(op.blocking_dims)
+    dims: set[str] = set()
+    if op.kind == "NKIMatmul":
+        dims.update(op.blocking_dims)
     for tname in list(op.inputs.values()) + list(op.outputs):
         if ir.has_tensor(tname):
             dims.update(_varying_dims_for_tensor(ir, tname))
