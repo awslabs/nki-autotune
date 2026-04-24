@@ -167,8 +167,7 @@ def _emit_body(writer: _SourceWriter, ir: KernelIR) -> None:
     writer.line()
 
     stack: list[str] = []
-    _ = _ScheduleContext(buf_info, schedules, store_op)
-    ctx = _ScheduleContext(buf_info=buf_info, schedules=schedules, store_op=store_op, prologue_fired=set())
+    ctx = _ScheduleContext(buf_info=buf_info, schedules=schedules, store_op=store_op)
 
     for sched in schedules:
         if sched.op is store_op:
@@ -1081,7 +1080,11 @@ def _emit_store_if_owned(
 
     info = buf_info[sbuf_src]
     mem_expr = _store_mem_slice(ir, info, out_dims)
-    if info.num_buffers.is_compiler_offload:
+    producer = ir.producer_of(sbuf_src)
+    is_matmul_output = producer is not None and ir.ops[producer].kind == "NKIMatmul"
+    if is_matmul_output:
+        src_expr = f"cur_{sbuf_src}"
+    elif info.num_buffers.is_compiler_offload:
         src_expr = sbuf_src
     else:
         src_expr = f"cur_{sbuf_src}"

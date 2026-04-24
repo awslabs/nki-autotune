@@ -1,6 +1,5 @@
-"""Search: generate unique sampled KernelIR variants and profile them remotely."""
+"""Search: build + render + remote-profile a KernelIR on Trainium hosts."""
 
-from nkigym.search.api import remote_search
-from nkigym.search.sampler import sample_variants
+from nkigym.search.api import remote_run
 
-__all__ = ["remote_search", "sample_variants"]
+__all__ = ["remote_run"]

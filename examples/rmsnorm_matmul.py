@@ -1,7 +1,14 @@
-"""RMSNorm + matmul: build KernelIR by hand, render, profile on remote hosts.
+"""RMSNorm + matmul: build KernelIR from nkigym function, tune knobs, render, profile.
 
-Hardcodes the strict-IR-driven champion from ``nkigym/design_rmsnorm_matmul.md``
-(~73 % MFU, no in-place reuse, no online fusion).
+Demos the agentic backend flow on a multi-op workload:
+
+1. Define the nkigym math function (RMSNorm + matmul).
+2. ``build_ir`` produces a baseline ``KernelIR`` — one ``NKILoad`` per
+   input, one ``Op`` per nkigym call, one ``NKIStore`` at the tail.
+3. Overlay champion knobs (73% MFU at 2048³ bf16, strict IR-driven —
+   no in-place reuse, no online fusion). These are the tunable knobs
+   the agent would propose after exploring against the profiler.
+4. ``remote_run`` renders + profiles on a Trainium host.
 
 Math: ``output = RMSNorm(a) @ b = (a / sqrt(mean(a^2) + eps)) @ b``.
 
@@ -12,27 +19,23 @@ Usage::
 """
 
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
-from autotune.runner.api import remote_profile
-from autotune.runner.types import KernelJob
-from nkigym.codegen import gadgets as _gadgets
-from nkigym.codegen import render_ir
-from nkigym.kernel_ir.ir import BufferScope, KernelIR, NumBuffers, Op, PhysicalBuffer
-from nkigym.kernel_ir.types import DimInfo, DimRole, TensorInfo
-
-NKIGYM_SOURCE = """
-import numpy as np
+from nkigym.kernel_ir import BufferScope, KernelIR, NumBuffers, build_ir
+from nkigym.kernel_ir.build import _derive_edges
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.transpose import NKITranspose
+from nkigym.search import remote_run
 
 EPS = 1e-6
 
 
 def rmsnorm_matmul_nkigym(a, b):
+    """nkigym math function — the source of truth for the IR."""
     k = a.shape[1]
     sq, sum_sq = NKIActivationReduce()(data=a, op="square", reduce_op="add")
     scaled = NKITensorScalar()(data=sum_sq, op0="multiply", operand0=1.0 / k, op1="add", operand1=EPS)
@@ -41,157 +44,96 @@ def rmsnorm_matmul_nkigym(a, b):
     a_t = NKITranspose()(data=a_normed)
     result = NKIMatmul()(stationary=a_t, moving=b)
     return result
-"""
 
 
-def build_rmsnorm_matmul_ir() -> KernelIR:
-    """Hand-built ``RMSNorm(a) @ b`` IR matching ``design_rmsnorm_matmul.md``."""
-    K = 2048
-    EPS = 1e-6
-    dimensions = {
-        "d0": DimInfo(dim_size=2048, logical_tile_size=128, physical_tile_size=128, role=DimRole.ACCUMULATION),
-        "d1": DimInfo(dim_size=2048, logical_tile_size=128, physical_tile_size=128, role=DimRole.PARALLEL),
-        "d2": DimInfo(dim_size=2048, logical_tile_size=512, physical_tile_size=512, role=DimRole.PARALLEL),
+def build_tuned_rmsnorm_matmul_ir(input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
+    """Baseline IR from ``build_ir`` + champion knobs (≈67% MFU at 2048³).
+
+    ``build_ir`` picks dim ids in discovery order:
+    ``d0`` = a's partition (M), ``d1`` = a's free / K (ACCUMULATION),
+    ``d2`` = b's free (N). Champion loop order is ``[M, N, K]`` →
+    ``[d0, d2, d1]``.
+
+    This hits ≈67% MFU, ~6pp short of the 73% hand-built champion. The
+    remaining gap is from rewrites build_ir does NOT do: the champion
+    fuses ops 3+4 (tensor_scalar → activation) into a shared fp32 scratch
+    buffer (``sbuf_rsqrt_val`` used as both input and output of the
+    activation), and promotes ``sbuf_sum_sq`` / the intermediate scaled
+    value to fp32. ``build_ir`` emits the strict naive chain with
+    ``sbuf_scaled`` (bf16) as a separate buffer. Closing the gap is an
+    agent-level graph-rewrite proposal on top of this baseline.
+    """
+    ir = build_ir(rmsnorm_matmul_nkigym, input_specs)
+    _alias_buffers(ir, kill="sbuf_scaled", keep="sbuf_rsqrt_val")
+    _widen_dtype(ir, "sbuf_sum_sq", "float32")
+    ir.dim_order = ["d0", "d2", "d1"]
+    ir.ltiles_per_block = {"d0": 4, "d1": 8, "d2": 1}
+    ir.buffer_scopes = {
+        "sbuf_a": BufferScope.MIDDLE,
+        "sbuf_b": BufferScope.INNER,
+        "sbuf_a_normed": BufferScope.MIDDLE,
+        "sbuf_a_t": BufferScope.MIDDLE,
     }
-    logical_tensors = {
-        "a": TensorInfo(dim_ids=("d1", "d0"), shape=(2048, 2048), dtype="bfloat16"),
-        "b": TensorInfo(dim_ids=("d0", "d2"), shape=(2048, 2048), dtype="bfloat16"),
-        "output": TensorInfo(dim_ids=("d1", "d2"), shape=(2048, 2048), dtype="bfloat16"),
+    ir.num_buffers = {
+        "sbuf_b": NumBuffers(num_p_buffers=4, num_f_buffers=2),
+        "sbuf_result": NumBuffers(num_p_buffers=None, num_f_buffers=4),
     }
-    physical_buffers = {
-        "sbuf_a": PhysicalBuffer(tile=(128, 128), dim_ids=("d1", "d0"), p_axis="d1", f_axis="d0", dtype="bfloat16"),
-        "sbuf_b": PhysicalBuffer(tile=(128, 512), dim_ids=("d0", "d2"), p_axis="d0", f_axis="d2", dtype="bfloat16"),
-        "sbuf_sum_sq": PhysicalBuffer(tile=(128, 1), dim_ids=("d1",), p_axis="d1", f_axis=None, dtype="float32"),
-        "sbuf_rsqrt_val": PhysicalBuffer(tile=(128, 1), dim_ids=("d1",), p_axis="d1", f_axis=None, dtype="float32"),
-        "sbuf_a_normed": PhysicalBuffer(
-            tile=(128, 128), dim_ids=("d1", "d0"), p_axis="d1", f_axis="d0", dtype="bfloat16"
-        ),
-        "sbuf_a_t": PhysicalBuffer(tile=(128, 128), dim_ids=("d0", "d1"), p_axis="d0", f_axis="d1", dtype="bfloat16"),
-        "sbuf_output": PhysicalBuffer(
-            tile=(128, 512), dim_ids=("d1", "d2"), p_axis="d1", f_axis="d2", dtype="bfloat16"
-        ),
-        "output_hbm": PhysicalBuffer(
-            tile=(2048, 2048), dim_ids=("d1", "d2"), p_axis="d1", f_axis="d2", dtype="bfloat16"
-        ),
-    }
-    ops = [
-        Op(kind="NKILoad", inputs={"data": "a"}, outputs=["sbuf_a"]),
-        Op(kind="NKILoad", inputs={"data": "b"}, outputs=["sbuf_b"]),
-        Op(
-            kind="NKIActivationReduce",
-            inputs={"data": "sbuf_a"},
-            outputs=["sbuf_sum_sq"],
-            kwargs={"op": "square", "reduce_op": "add"},
-        ),
-        Op(
-            kind="NKITensorScalar",
-            inputs={"data": "sbuf_sum_sq"},
-            outputs=["sbuf_rsqrt_val"],
-            kwargs={"op0": "multiply", "operand0": 1.0 / K, "op1": "add", "operand1": EPS},
-        ),
-        Op(kind="NKIActivation", inputs={"data": "sbuf_rsqrt_val"}, outputs=["sbuf_rsqrt_val"], kwargs={"op": "rsqrt"}),
-        Op(
-            kind="NKITensorScalar",
-            inputs={"data": "sbuf_a", "operand0": "sbuf_rsqrt_val"},
-            outputs=["sbuf_a_normed"],
-            kwargs={"op0": "multiply", "operand0": "sbuf_rsqrt_val"},
-        ),
-        Op(
-            kind="NKITranspose", inputs={"data": "sbuf_a_normed"}, outputs=["sbuf_a_t"], attrs={"mode": "dma_transpose"}
-        ),
-        Op(
-            kind="NKIMatmul",
-            inputs={"stationary": "sbuf_a_t", "moving": "sbuf_b"},
-            outputs=["sbuf_output"],
-            axis_map={"K": "d0", "M": "d1", "N": "d2"},
-            blocking_dims={"d0"},
-        ),
-        Op(kind="NKIStore", inputs={"data": "sbuf_output"}, outputs=["output_hbm"]),
-    ]
-    edges = [
-        (0, 2, "sbuf_a", "data"),
-        (2, 3, "sbuf_sum_sq", "data"),
-        (3, 4, "sbuf_rsqrt_val", "data"),
-        (0, 5, "sbuf_a", "data"),
-        (4, 5, "sbuf_rsqrt_val", "operand0"),
-        (5, 6, "sbuf_a_normed", "data"),
-        (6, 7, "sbuf_a_t", "stationary"),
-        (1, 7, "sbuf_b", "moving"),
-        (7, 8, "sbuf_output", "data"),
-    ]
-    return KernelIR(
-        func_name="rmsnorm_matmul_nkigym",
-        param_names=["a", "b"],
-        return_name="output",
-        dimensions=dimensions,
-        logical_tensors=logical_tensors,
-        physical_buffers=physical_buffers,
-        ops=ops,
-        edges=edges,
-        dim_order=["d1", "d2", "d0"],
-        ltiles_per_block={"d0": 8, "d1": 4, "d2": 1},
-        buffer_scopes={
-            "sbuf_a": BufferScope.MIDDLE,
-            "sbuf_b": BufferScope.INNER,
-            "sbuf_a_normed": BufferScope.MIDDLE,
-            "sbuf_a_t": BufferScope.MIDDLE,
-        },
-        num_buffers={
-            "sbuf_b": NumBuffers(num_p_buffers=4, num_f_buffers=2),
-            "sbuf_output": NumBuffers(num_p_buffers=None, num_f_buffers=4),
-        },
-        emission_depth={"sbuf_b": 1, "sbuf_output": 0},
-    )
+    ir.emission_depth = {"sbuf_b": 1, "sbuf_result": 0}
+    for op in ir.ops:
+        if op.kind == "NKITranspose":
+            op.attrs["mode"] = "dma_transpose"
+    return ir
 
 
-def inline_gadgets(kernel_src: str) -> str:
-    """Prepend the gadgets module so the emitted source ships as one file."""
-    gadgets_src = Path(_gadgets.__file__).read_text()
-    kernel_src = kernel_src.replace(
-        "from nkigym.codegen.gadgets import (\n"
-        "    activation_block,\n"
-        "    activation_reduce_block,\n"
-        "    allocate_buffers,\n"
-        "    load_block,\n"
-        "    matmul_block,\n"
-        "    memset_buffers,\n"
-        "    store_block,\n"
-        "    tensor_scalar_block,\n"
-        "    transpose_block,\n"
-        ")",
-        "",
-    )
-    return gadgets_src + "\n\n" + kernel_src
+def _alias_buffers(ir: KernelIR, *, kill: str, keep: str) -> None:
+    """Rewrite: merge ``kill`` into ``keep`` (breaks SSA for physical buffers).
+
+    Renames every use of ``kill`` in ``ops.inputs`` / ``ops.outputs`` to
+    ``keep``, drops ``kill`` from ``physical_buffers`` (widening dtype if
+    needed), and regenerates ``ir.edges`` from the mutated ops.
+    """
+    if kill not in ir.physical_buffers or keep not in ir.physical_buffers:
+        raise KeyError(f"cannot alias {kill!r} → {keep!r}: missing from physical_buffers")
+    kill_buf = ir.physical_buffers[kill]
+    keep_buf = ir.physical_buffers[keep]
+    widened = kill_buf.dtype if kill_buf.dtype == "float32" else keep_buf.dtype
+    ir.physical_buffers[keep] = replace(keep_buf, dtype=widened)
+    del ir.physical_buffers[kill]
+
+    for op in ir.ops:
+        op.inputs = {role: (keep if t == kill else t) for role, t in op.inputs.items()}
+        op.outputs = [keep if t == kill else t for t in op.outputs]
+        op.kwargs = {k: (keep if isinstance(v, str) and v == kill else v) for k, v in op.kwargs.items()}
+
+    ir.edges = _derive_edges(ir.ops)
+
+
+def _widen_dtype(ir: KernelIR, buf_name: str, dtype: str) -> None:
+    """Rewrite: widen a single physical buffer's dtype."""
+    buf = ir.physical_buffers[buf_name]
+    ir.physical_buffers[buf_name] = replace(buf, dtype=dtype)
 
 
 if __name__ == "__main__":
     M, K, N = 2048, 2048, 2048
-    HOSTS = ["gym-2"]
+    INPUT_SPECS = {"a": ((M, K), "bfloat16"), "b": ((K, N), "bfloat16")}
+    HOSTS = ["gym-1"]
     ATOL, RTOL = 1e-2, 1e-2
 
     CACHE_ROOT = Path("/home/ubuntu/cache/rmsnorm_matmul")
     shutil.rmtree(CACHE_ROOT, ignore_errors=True)
     CACHE_ROOT.mkdir(parents=True)
 
-    ir = build_rmsnorm_matmul_ir()
-    source = render_ir(ir)
-    (CACHE_ROOT / "rendered.py").write_text(source)
-    payload = inline_gadgets(source)
-    (CACHE_ROOT / "rendered_inlined.py").write_text(payload)
-
-    job = KernelJob(
-        source=payload,
-        func_name=ir.func_name,
-        output_shape=(M, N),
-        input_specs={"a": ((M, K), "bfloat16"), "b": ((K, N), "bfloat16")},
-        nkigym_source=NKIGYM_SOURCE,
-        nkigym_func_name=ir.func_name,
-        mac_count=M * K * N,
+    ir = build_tuned_rmsnorm_matmul_ir(INPUT_SPECS)
+    output = remote_run(
+        ir=ir,
+        func=rmsnorm_matmul_nkigym,
+        input_specs=INPUT_SPECS,
+        hosts=HOSTS,
+        cache_dir=str(CACHE_ROOT),
         atol=ATOL,
         rtol=RTOL,
-        neuronx_cc_args=("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false"),
+        kernel_name="rmsnorm_matmul.py",
     )
-
-    output = remote_profile(kernels={"rmsnorm_matmul.py": job}, hosts=HOSTS, cache_dir=str(CACHE_ROOT))
     for r in output.results:
         print(f"{r.kernel_name}: sim={r.cpu_sim.get('passed')}  min_ms={r.min_ms}  MFU={r.mfu}")

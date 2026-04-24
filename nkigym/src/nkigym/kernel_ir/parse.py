@@ -9,7 +9,7 @@ import numpy as np
 
 from nkigym.ops.base import NKIOp
 
-_OpTuple = tuple[type[NKIOp], dict[str, str], list[str], dict[str, str]]
+_ParsedOp = tuple[type[NKIOp], dict[str, str], list[str]]
 
 
 def _resolve_op_class(node: ast.expr, func_globals: dict[str, object]) -> type[NKIOp] | None:
@@ -28,25 +28,16 @@ def _resolve_op_class(node: ast.expr, func_globals: dict[str, object]) -> type[N
 
 
 def _extract_name_kwargs(call: ast.Call) -> dict[str, str]:
-    """Return ``{arg_name: variable_name}`` for Name-valued kwargs."""
+    """Return ``{arg_name: variable_name}`` for Name-valued kwargs.
+
+    Only kwargs that reference local variables get captured — these
+    are the tensor operands.
+    """
     return {kw.arg: kw.value.id for kw in call.keywords if kw.arg is not None and isinstance(kw.value, ast.Name)}
 
 
-def _extract_all_kwargs(call: ast.Call) -> dict[str, str]:
-    """Return ``{arg_name: source_string}`` for all kwargs."""
-    result: dict[str, str] = {}
-    for kw in call.keywords:
-        if kw.arg is None:
-            continue
-        result[kw.arg] = ast.unparse(kw.value)
-    return result
-
-
 def _extract_output_names(target: ast.expr) -> list[str]:
-    """Extract output variable names from an assignment target.
-
-    Returns an empty list if the target is not a Name or Tuple.
-    """
+    """Extract output variable names from an assignment target."""
     if isinstance(target, ast.Name):
         names = [target.id]
     elif isinstance(target, ast.Tuple):
@@ -56,30 +47,28 @@ def _extract_output_names(target: ast.expr) -> list[str]:
     return names
 
 
-def _parse_op_assignment(stmt: ast.Assign, func_globals: dict[str, object]) -> _OpTuple | None:
+def _parse_op_assignment(stmt: ast.Assign, func_globals: dict[str, object]) -> _ParsedOp | None:
     """Try to parse an assignment as an NKIOp call.
 
     Returns ``(op_cls, name_kwargs, output_names)`` or None.
     """
-    result: _OpTuple | None = None
+    result: _ParsedOp | None = None
     op_cls = _resolve_op_class(stmt.value, func_globals) if len(stmt.targets) == 1 else None
     if op_cls is not None:
         output_names = _extract_output_names(stmt.targets[0])
         if output_names:
             if len(output_names) != len(op_cls.OUTPUT_AXES):
                 raise ValueError(
-                    f"Op {op_cls.NAME}: {len(output_names)}"
-                    f" outputs assigned but OUTPUT_AXES has"
-                    f" {len(op_cls.OUTPUT_AXES)} entries"
+                    f"Op {op_cls.NAME}: {len(output_names)} outputs assigned"
+                    f" but OUTPUT_AXES has {len(op_cls.OUTPUT_AXES)} entries"
                 )
             assert isinstance(stmt.value, ast.Call)
             name_kwargs = _extract_name_kwargs(stmt.value)
-            all_kwargs = _extract_all_kwargs(stmt.value)
-            result = (op_cls, name_kwargs, output_names, all_kwargs)
+            result = (op_cls, name_kwargs, output_names)
     return result
 
 
-def find_ops(func: Callable[..., np.ndarray]) -> tuple[list[_OpTuple], str]:
+def find_ops(func: Callable[..., np.ndarray]) -> tuple[list[_ParsedOp], str]:
     """Parse *func* to extract NKIOp calls and the return name.
 
     Returns:
@@ -95,7 +84,7 @@ def find_ops(func: Callable[..., np.ndarray]) -> tuple[list[_OpTuple], str]:
     if not isinstance(func_def, ast.FunctionDef):
         raise ValueError("Expected a function definition")
 
-    ops: list[_OpTuple] = []
+    ops: list[_ParsedOp] = []
     return_name: str | None = None
 
     for stmt in func_def.body:
@@ -108,5 +97,5 @@ def find_ops(func: Callable[..., np.ndarray]) -> tuple[list[_OpTuple], str]:
                 ops.append(parsed)
 
     if return_name is None:
-        raise ValueError("Math function must have a" " 'return <variable>' statement")
+        raise ValueError("Math function must have a 'return <variable>' statement")
     return ops, return_name

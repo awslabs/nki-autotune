@@ -1,212 +1,66 @@
-"""Build the initial ``(KernelIR, KernelIR)`` from a math function.
+"""Build a baseline :class:`KernelIR` from an nkigym math function.
 
 Pipeline:
 
 1. AST-parse the math function → ordered list of
-   ``(op_cls, name_kwargs, output_names, all_kwargs)`` call-site
-   tuples.
-2. Instantiate one ``NKIOp`` per call site — each gets a
-   distinct instance used as a dict key in ``KernelIR``.
-3. Forward pass resolves per-op axis maps, tile sizes, blocking
-   dims, and the logical-tensor catalog.
-4. Wrap each op in a singleton ``FusionGroup``; assemble the
-   ir with group-level edges.
+   ``(op_cls, name_kwargs, output_names)`` call-site tuples.
+2. Trace the function once against dummy arrays to capture scalar
+   kwarg values (``op='multiply'``, ``operand0=1e-6``, ...).
+3. Forward pass over parsed ops unifies abstract axes (``P``, ``F``,
+   ``K``, ``M``, ``N``) into concrete dim ids (``d0``, ``d1``, ...),
+   producing ``dimensions`` and ``logical_tensors``.
+4. Compute tile sizes (min of per-op ``TILE_LIMITS``) and dim roles
+   (``ACCUMULATION`` if any reducing op blocks on it, ``SERIAL`` for
+   non-reducing blocking, else ``PARALLEL``).
+5. Synthesize ``physical_buffers``: one ``sbuf_<name>`` per tensor
+   that's read downstream, plus ``<return>_hbm`` for the store dest.
+6. Synthesize ``ops``: one ``NKILoad`` per kernel param, one ``Op``
+   per parsed op (with SBUF-aliased inputs/outputs), one ``NKIStore``
+   at the tail.
+7. Derive ``edges`` from input/output producer-consumer links.
+8. Leave all tunable knobs at canonical defaults — the agent mutates
+   them to explore performance variants.
 """
 
 import inspect
-import random
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import cast
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
-from nkigym.kernel_ir.compute_skip_prop import propagate_compute_skip
-from nkigym.kernel_ir.fusion_group import FusionGroup
-from nkigym.kernel_ir.ir import KernelIR, insert_dma_nodes, rebuild_edges
+from nkigym.kernel_ir.ir import KernelIR, Op, PhysicalBuffer
 from nkigym.kernel_ir.parse import find_ops
-from nkigym.kernel_ir.rewrites.load_transpose_pattern import LoadTransposePattern
-from nkigym.kernel_ir.rewrites.loop_fusion import LoopFusion
-from nkigym.kernel_ir.rewrites.online_fusion_pattern import OnlineFusionPattern
-from nkigym.kernel_ir.rewrites.pattern_rewrite import PatternRewrite, apply_rewrites_until_fixpoint
-from nkigym.kernel_ir.sampler.sampler import sample_valid_ir
 from nkigym.kernel_ir.trace import trace_scalar_kwargs
 from nkigym.kernel_ir.types import DimInfo, DimRole, TensorInfo
 from nkigym.ops.base import NKIOp
 
-"""Graph rewrites — split into mandatory pre-passes and sampled rewrites.
-
-``LoopFusion`` is applied to fixpoint as a mandatory pre-pass
-inside ``build_naive_ir`` because it is a strict no-op-or-better
-transform: merging a producer→consumer pair whose shared dims are
-all PARALLEL in the producer preserves semantics, and any kernel
-the sampler could produce with an unfused partition is strictly
-reachable via placement draws on the merged partition (choosing
-``full`` tier on the shared tensor's dims reproduces the
-pre-loaded outer-group pattern). Leaving it as a sampled choice
-wasted rewrite-count budget on a redundant search axis.
-
-The remaining ``REWRITES`` cover transforms with genuine
-performance trade-offs: the sampler picks ``k ∈ [0, num_ops -
-1]`` uniformly, then applies ``k`` rewrites (one match per step,
-chosen uniformly across all currently-matching
-``(pattern, instance)`` pairs).
-"""
-_MANDATORY_REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [LoopFusion()])
-REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [OnlineFusionPattern(), LoadTransposePattern()])
-
 
 @dataclass
 class _Tensor:
-    """Internal mutable tensor used during analysis."""
+    """Internal mutable tensor record used during dim inference."""
 
     name: str
     shape: tuple[int, ...]
     dtype: str
-    dim_ids: list[str]
+    dim_ids: list[str] = field(default_factory=list)
 
 
-def _unify_dim(
-    tensors: dict[str, _Tensor], per_op_maps: list[dict[str, str]], dim_sizes: dict[str, int], old_id: str, new_id: str
-) -> None:
-    """Rename *old_id* to *new_id* in all tensors and axis maps."""
-    old_size = dim_sizes.get(old_id)
-    new_size = dim_sizes.get(new_id)
-    if old_size is not None and new_size is not None and old_size != new_size:
-        raise ValueError(f"Cannot unify {old_id} (size {old_size}) with {new_id} (size {new_size})")
-    if old_id in dim_sizes:
-        dim_sizes.setdefault(new_id, dim_sizes.pop(old_id))
-    for tensor in tensors.values():
-        tensor.dim_ids = [new_id if d == old_id else d for d in tensor.dim_ids]
-    for axis_map in per_op_maps:
-        for ax in axis_map:
-            if axis_map[ax] == old_id:
-                axis_map[ax] = new_id
+def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
+    """Build a baseline ``KernelIR`` from a math function and input specs.
 
+    Args:
+        func: nkigym math function — a chain of ``NKIOp()(...)`` calls
+            ending in ``return <variable>``.
+        input_specs: ``{param_name: (shape, dtype)}`` for every
+            parameter in ``func``'s signature.
 
-def _map_existing_dims(
-    axes: tuple[str, ...],
-    tensor: _Tensor,
-    local: dict[str, str],
-    tensors: dict[str, _Tensor],
-    per_op_maps: list[dict[str, str]],
-    dim_sizes: dict[str, int],
-) -> None:
-    """Map dims from a tensor that already carries dim_ids."""
-    for abstract, concrete in zip(axes, tensor.dim_ids):
-        if abstract in local and local[abstract] != concrete:
-            _unify_dim(tensors, per_op_maps, dim_sizes, old_id=concrete, new_id=local[abstract])
-        else:
-            local[abstract] = concrete
-
-
-def _map_fresh_dims(
-    axes: tuple[str, ...], tensor: _Tensor, local: dict[str, str], dim_sizes: dict[str, int], dim_counter: list[int]
-) -> None:
-    """Allocate dims for a tensor with no dim_ids yet."""
-    for i, abstract in enumerate(axes[: len(tensor.shape)]):
-        if abstract not in local:
-            fresh = f"d{dim_counter[0]}"
-            dim_counter[0] += 1
-            dim_sizes[fresh] = tensor.shape[i]
-            local[abstract] = fresh
-    tensor.dim_ids = [local[a] for a in axes[: len(tensor.shape)]]
-
-
-def _build_axis_map(
-    op_cls: type[NKIOp],
-    operand_map: dict[str, str],
-    tensors: dict[str, _Tensor],
-    dim_counter: list[int],
-    per_op_maps: list[dict[str, str]],
-    dim_sizes: dict[str, int],
-) -> dict[str, str]:
-    """Build abstract->concrete axis map for one op."""
-    local: dict[str, str] = {}
-    for slot, axes in op_cls.OPERAND_AXES.items():
-        if slot not in operand_map:
-            continue
-        tname = operand_map[slot]
-        if tname not in tensors:
-            continue
-        tensor = tensors[tname]
-        if tensor.dim_ids:
-            _map_existing_dims(axes, tensor, local, tensors, per_op_maps, dim_sizes)
-        else:
-            _map_fresh_dims(axes, tensor, local, dim_sizes, dim_counter)
-    return local
-
-
-def _create_outputs(
-    op_cls: type[NKIOp],
-    operand_map: dict[str, str],
-    output_names: list[str],
-    local: dict[str, str],
-    tensors: dict[str, _Tensor],
-    dim_sizes: dict[str, int],
-) -> None:
-    """Create output tensors for one op."""
-    first_slot = next(iter(op_cls.OPERAND_AXES))
-    has_first = first_slot in operand_map and operand_map[first_slot] in tensors
-    dtype = (
-        tensors[operand_map[first_slot]].dtype
-        if has_first
-        else next(t.dtype for t in tensors.values() if t.dtype != "")
-    )
-    for oname, (_, output_axes) in zip(output_names, op_cls.OUTPUT_AXES.items()):
-        dim_ids = [local[a] for a in output_axes if a in local]
-        shape = tuple(dim_sizes[d] for d in dim_ids)
-        tensors[oname] = _Tensor(oname, shape, dtype, dim_ids)
-
-
-def _resolve_blocking_dims(op_cls: type[NKIOp], axis_map: dict[str, str]) -> set[str]:
-    """Resolve class-level ``BLOCKING_AXES`` through an op's axis map."""
-    return {axis_map[axis] for axis in op_cls.BLOCKING_AXES if axis in axis_map}
-
-
-_ParsedOp = tuple[type[NKIOp], dict[str, str], list[str], dict[str, str]]
-
-
-def _compute_tile_sizes(
-    parsed_ops: list[_ParsedOp],
-    per_op_maps: list[dict[str, str]],
-    dim_sizes: dict[str, int],
-    blocking_dims: set[str],
-    tensors: dict[str, _Tensor],
-) -> tuple[dict[str, DimInfo], list[dict[str, int]]]:
-    """Compute per-dim tile sizes + DimInfo map + per-op tile-size maps."""
-    PARTITION_MAX = 128
-    partition_dims: set[str] = set()
-    for t in tensors.values():
-        if t.dim_ids:
-            partition_dims.add(t.dim_ids[0])
-    max_tile: dict[str, int] = {}
-    min_tile: dict[str, int] = {}
-    per_op_tile_sizes: list[dict[str, int]] = []
-    for (op_cls, _, _, _), local in zip(parsed_ops, per_op_maps):
-        per_op: dict[str, int] = {}
-        for abstract_axis, limit in op_cls.TILE_LIMITS.items():
-            if abstract_axis not in local:
-                continue
-            dim_id = local[abstract_axis]
-            clamped = min(limit, dim_sizes[dim_id])
-            per_op[dim_id] = clamped
-            max_tile[dim_id] = max(max_tile.get(dim_id, clamped), clamped)
-            min_tile[dim_id] = min(min_tile.get(dim_id, clamped), clamped)
-        per_op_tile_sizes.append(per_op)
-    for dim_id in max_tile:
-        max_tile[dim_id] = min(max_tile[dim_id], dim_sizes[dim_id])
-        if dim_id in partition_dims:
-            min_tile[dim_id] = min(min_tile[dim_id], PARTITION_MAX)
-    dims = {
-        d: DimInfo(dim_sizes[d], max_tile[d], min_tile[d], DimRole.SERIAL if d in blocking_dims else DimRole.PARALLEL)
-        for d in max_tile
-    }
-    return dims, per_op_tile_sizes
-
-
-def build_initial(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
-    """Build the initial ``KernelIR`` for a math function — one singleton group per op."""
+    Returns:
+        A ``KernelIR`` with DMA nodes inserted, ops filled out, edges
+        derived, and all tunable knobs at naive defaults
+        (``dim_order`` in insertion order, ``ltiles_per_block={d: 1}``,
+        empty ``buffer_scopes``, ``num_buffers``, ``emission_depth``).
+    """
     param_names = list(inspect.signature(func).parameters.keys())
     for name in param_names:
         if name not in input_specs:
@@ -220,105 +74,325 @@ def build_initial(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[
     tensors: dict[str, _Tensor] = {}
     for name in param_names:
         shape, dtype = input_specs[name]
-        tensors[name] = _Tensor(name, shape, dtype, dim_ids=[])
+        tensors[name] = _Tensor(name, shape, dtype)
 
-    dim_counter = [0]
-    per_op_maps: list[dict[str, str]] = []
     dim_sizes: dict[str, int] = {}
-    for op_cls, name_kwargs, output_names, _all_kwargs in parsed:
+    dim_counter = [0]
+    per_op_axis_maps: list[dict[str, str]] = []
+    for op_cls, name_kwargs, output_names in parsed:
         operand_map = {k: v for k, v in name_kwargs.items() if v in tensors}
-        local = _build_axis_map(op_cls, operand_map, tensors, dim_counter, per_op_maps, dim_sizes)
-        per_op_maps.append(local)
-        _create_outputs(op_cls, operand_map, output_names, local, tensors, dim_sizes)
+        axis_map = _build_axis_map(op_cls, operand_map, tensors, dim_counter, per_op_axis_maps, dim_sizes)
+        per_op_axis_maps.append(axis_map)
+        _create_outputs(op_cls, operand_map, output_names, axis_map, tensors, dim_sizes)
 
     if return_name not in tensors:
-        raise ValueError(f"Return tensor {return_name!r} not found")
+        raise ValueError(f"Return tensor {return_name!r} not found among produced tensors")
 
     per_op_blocking: list[set[str]] = [
-        _resolve_blocking_dims(op_cls, axis_map) for (op_cls, _, _, _), axis_map in zip(parsed, per_op_maps)
+        {axis_map[a] for a in op_cls.BLOCKING_AXES if a in axis_map}
+        for (op_cls, _, _), axis_map in zip(parsed, per_op_axis_maps)
     ]
-    blocking_union: set[str] = set().union(*per_op_blocking) if per_op_blocking else set()
-    dimensions, per_op_tile_sizes = _compute_tile_sizes(parsed, per_op_maps, dim_sizes, blocking_union, tensors)
+    dimensions = _resolve_dimensions(parsed, per_op_axis_maps, per_op_blocking, dim_sizes)
+    _promote_float32_consumers(parsed, tensors)
 
     logical_tensors: dict[str, TensorInfo] = {
-        name: TensorInfo(tuple(t.dim_ids), t.shape, t.dtype) for name, t in tensors.items()
+        name: TensorInfo(dim_ids=tuple(t.dim_ids), shape=t.shape, dtype=t.dtype) for name, t in tensors.items()
     }
 
-    op_instances: list[NKIOp] = [op_cls() for op_cls, _, _, _ in parsed]
-    op_inputs: dict[NKIOp, dict[str, str]] = {}
-    op_outputs: dict[NKIOp, list[str]] = {}
-    op_kwargs: dict[NKIOp, dict[str, str]] = {}
-    op_axis_map: dict[NKIOp, dict[str, str]] = {}
-    op_tile_sizes: dict[NKIOp, dict[str, int]] = {}
-    op_blocking_dims: dict[NKIOp, set[str]] = {}
-    for i, (op, (_cls, name_kwargs, output_names, all_kwargs)) in enumerate(zip(op_instances, parsed)):
-        inputs = {role: tname for role, tname in name_kwargs.items() if tname in logical_tensors}
-        op_inputs[op] = inputs
-        op_outputs[op] = list(output_names)
-        merged_kwargs = dict(all_kwargs)
-        merged_kwargs.update(traced[i])
-        op_kwargs[op] = merged_kwargs
-        op_axis_map[op] = per_op_maps[i]
-        op_tile_sizes[op] = per_op_tile_sizes[i]
-        op_blocking_dims[op] = per_op_blocking[i]
+    used = _collect_used_tensors(parsed, param_names, return_name, tensors)
+    physical_buffers = _build_physical_buffers(tensors, used, dimensions, return_name)
+    ops = _build_ops(parsed, per_op_axis_maps, per_op_blocking, traced, tensors, used, param_names, return_name)
+    edges = _derive_edges(ops)
+    dim_order = _default_dim_order(dimensions)
+    ltiles_per_block = {d: 1 for d in dimensions}
 
-    ltiles_per_block: dict[str, int] = {dim_id: 1 for dim_id in dimensions}
-    groups = [FusionGroup(ops=[op]) for op in op_instances]
-
-    ir = KernelIR(
+    return KernelIR(
         func_name=func.__name__,
         param_names=param_names,
         return_name=return_name,
         dimensions=dimensions,
         logical_tensors=logical_tensors,
+        physical_buffers=physical_buffers,
+        ops=ops,
+        edges=edges,
+        dim_order=dim_order,
         ltiles_per_block=ltiles_per_block,
-        op_inputs=op_inputs,
-        op_outputs=op_outputs,
-        op_kwargs=op_kwargs,
-        op_axis_map=op_axis_map,
-        op_tile_sizes=op_tile_sizes,
-        op_blocking_dims=op_blocking_dims,
-        groups=groups,
     )
-    rebuild_edges(ir)
-    return ir
 
 
-def build_naive_ir(
-    func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]
-) -> tuple[KernelIR, KernelIR]:
-    """Return ``(naive_ir, seed_ir)`` — pre-rewrite and rewrite-ready KernelIR.
+def _default_dim_order(dimensions: dict[str, DimInfo]) -> list[str]:
+    """Naive default: non-ACCUMULATION dims first, ACCUMULATION dims innermost.
 
-    Pipeline:
-
-    1. ``build_initial`` + ``insert_dma_nodes`` → naive ``KernelIR``.
-       Used to emit ``kernel_0`` — the raw operator ir with
-       ``NKIAffineSelect`` still present, no compute-skip
-       annotations, no rewrites, no merges.
-    2. ``propagate_compute_skip`` → mandatory pre-pass that lifts
-       every ``NKIAffineSelect`` into per-op ``SkipPredicate``
-       annotations and removes the standalone op.
-    3. ``_MANDATORY_REWRITES`` applied to fixpoint — currently
-       just ``LoopFusion``, which is a strict no-op-or-better
-       transform and is therefore lifted out of the sampled
-       ``REWRITES`` set.
-    4. The resulting ``KernelIR`` is the seed every
-       ``sample_valid_ir`` call starts from; remaining
-       ``REWRITES`` are sampled per-draw inside
-       ``sample_valid_ir``.
+    Accumulator buffers need the ACC loop to live *inside* every non-ACC
+    loop so the accumulator state is local to each output block. Putting
+    ACC dims at the tail of ``dim_order`` gives the renderer a valid
+    starting point the agent can tune.
     """
-    ir = build_initial(func, input_specs)
-    ir = insert_dma_nodes(ir)
-    naive = ir
-    ir = propagate_compute_skip(ir)
-    ir = apply_rewrites_until_fixpoint(ir, _MANDATORY_REWRITES)
-    return naive, ir
+    non_acc = [d for d, info in dimensions.items() if info.role is not DimRole.ACCUMULATION]
+    acc = [d for d, info in dimensions.items() if info.role is DimRole.ACCUMULATION]
+    return non_acc + acc
 
 
-def build_ir(
-    func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], seed: int | None = None
-) -> KernelIR:
-    """Convenience: build seed IR and sample one valid state."""
-    _naive, seed_ir = build_naive_ir(func, input_specs)
-    rng = random.Random(seed)
-    return sample_valid_ir(seed_ir, rng, rewrites=REWRITES)
+def _resolve_dimensions(
+    parsed: list[tuple[type[NKIOp], dict[str, str], list[str]]],
+    per_op_axis_maps: list[dict[str, str]],
+    per_op_blocking: list[set[str]],
+    dim_sizes: dict[str, int],
+) -> dict[str, DimInfo]:
+    """Compute ``DimInfo`` per dim: tile size = min of per-op limits; role from blocking + reducer."""
+    per_dim_tile: dict[str, int] = {}
+    for (op_cls, _, _), axis_map in zip(parsed, per_op_axis_maps):
+        for abstract_axis, limit in op_cls.TILE_LIMITS.items():
+            if abstract_axis not in axis_map:
+                continue
+            dim_id = axis_map[abstract_axis]
+            tile = min(limit, dim_sizes[dim_id])
+            per_dim_tile[dim_id] = min(per_dim_tile.get(dim_id, tile), tile)
+    for d in dim_sizes:
+        if d not in per_dim_tile:
+            raise ValueError(f"Dim {d!r} has no op-declared tile size")
+
+    dim_role: dict[str, DimRole] = {d: DimRole.PARALLEL for d in dim_sizes}
+    for (op_cls, _, _), blocking in zip(parsed, per_op_blocking):
+        for d in blocking:
+            if op_cls.REDUCE_COMBINATOR:
+                dim_role[d] = DimRole.ACCUMULATION
+            elif dim_role[d] is DimRole.PARALLEL:
+                dim_role[d] = DimRole.SERIAL
+
+    return {
+        d: DimInfo(
+            dim_size=dim_sizes[d],
+            logical_tile_size=per_dim_tile[d],
+            physical_tile_size=per_dim_tile[d],
+            role=dim_role[d],
+        )
+        for d in dim_sizes
+    }
+
+
+def _collect_used_tensors(
+    parsed: list[tuple[type[NKIOp], dict[str, str], list[str]]],
+    param_names: list[str],
+    return_name: str,
+    tensors: dict[str, _Tensor],
+) -> set[str]:
+    """Set of tensor names that are referenced as an input somewhere + params + return."""
+    used: set[str] = {return_name, *param_names}
+    for _op_cls, name_kwargs, _output_names in parsed:
+        for v in name_kwargs.values():
+            if v in tensors:
+                used.add(v)
+    return used
+
+
+def _promote_float32_consumers(
+    parsed: list[tuple[type[NKIOp], dict[str, str], list[str]]], tensors: dict[str, _Tensor]
+) -> None:
+    """Promote tensors to ``float32`` if they feed a FLOAT32_KWARGS operand.
+
+    NKI HW mandates fp32 for ``tensor_scalar.operand0/operand1``,
+    ``activation.scale``, ``activation_reduce.scale`` etc. If a tensor
+    produced by op A is consumed as such a slot in op B, A's sbuf must
+    be fp32. Promote A's output record and iterate to fixpoint so the
+    promotion walks upstream through intermediate pass-through ops.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for op_cls, name_kwargs, _outputs in parsed:
+            for slot, value in name_kwargs.items():
+                if slot not in op_cls.FLOAT32_KWARGS:
+                    continue
+                if value in tensors and tensors[value].dtype != "float32":
+                    tensors[value].dtype = "float32"
+                    changed = True
+
+
+def _build_physical_buffers(
+    tensors: dict[str, _Tensor], used: set[str], dimensions: dict[str, DimInfo], return_name: str
+) -> dict[str, PhysicalBuffer]:
+    """Build ``sbuf_<name>`` entries for every used tensor plus ``<return>_hbm``."""
+    result: dict[str, PhysicalBuffer] = {}
+    for name, t in tensors.items():
+        if name not in used or not t.dim_ids:
+            continue
+        p_axis = t.dim_ids[0]
+        f_axis = t.dim_ids[1] if len(t.dim_ids) >= 2 else None
+        p_tile = dimensions[p_axis].physical_tile_size
+        f_tile = dimensions[f_axis].physical_tile_size if f_axis is not None else 1
+        result[f"sbuf_{name}"] = PhysicalBuffer(
+            tile=(p_tile, f_tile), dim_ids=tuple(t.dim_ids), dtype=t.dtype, p_axis=p_axis, f_axis=f_axis
+        )
+    ret_t = tensors[return_name]
+    ret_p = ret_t.dim_ids[0]
+    ret_f = ret_t.dim_ids[1] if len(ret_t.dim_ids) >= 2 else None
+    hbm_p = dimensions[ret_p].dim_size
+    hbm_f = dimensions[ret_f].dim_size if ret_f is not None else 1
+    result[f"{return_name}_hbm"] = PhysicalBuffer(
+        tile=(hbm_p, hbm_f), dim_ids=tuple(ret_t.dim_ids), dtype=ret_t.dtype, p_axis=ret_p, f_axis=ret_f
+    )
+    return result
+
+
+def _build_ops(
+    parsed: list[tuple[type[NKIOp], dict[str, str], list[str]]],
+    per_op_axis_maps: list[dict[str, str]],
+    per_op_blocking: list[set[str]],
+    traced: list[dict[str, Any]],
+    tensors: dict[str, _Tensor],
+    used: set[str],
+    param_names: list[str],
+    return_name: str,
+) -> list[Op]:
+    """Assemble the final ops list: NKILoad header + math ops + NKIStore tail."""
+    ops: list[Op] = []
+    for p in param_names:
+        ops.append(Op(kind="NKILoad", inputs={"data": p}, outputs=[f"sbuf_{p}"]))
+
+    for (op_cls, name_kwargs, output_names), axis_map, blocking, scalars in zip(
+        parsed, per_op_axis_maps, per_op_blocking, traced
+    ):
+        inputs, extra_tensor_kwargs = _split_tensor_inputs(op_cls, name_kwargs, tensors)
+        kept_outputs = [o for o in output_names if o in used]
+        sbuf_outputs = [f"sbuf_{o}" for o in kept_outputs]
+        op_kwargs: dict[str, Any] = dict(scalars)
+        op_kwargs.update(extra_tensor_kwargs)
+        ops.append(
+            Op(
+                kind=op_cls.__name__,
+                inputs=inputs,
+                outputs=sbuf_outputs,
+                kwargs=op_kwargs,
+                axis_map=dict(axis_map),
+                blocking_dims=set(blocking),
+            )
+        )
+
+    ops.append(Op(kind="NKIStore", inputs={"data": f"sbuf_{return_name}"}, outputs=[f"{return_name}_hbm"]))
+    return ops
+
+
+def _split_tensor_inputs(
+    op_cls: type[NKIOp], name_kwargs: dict[str, str], tensors: dict[str, _Tensor]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Split Name-valued kwargs into ``inputs`` vs extra tensor-kwargs for ``kwargs``.
+
+    Inputs: every role in ``OPERAND_AXES`` whose value is a known tensor,
+    plus any extra Name-valued kwarg whose value is a known tensor.
+    The extras are also returned separately so the caller can stash them
+    into ``Op.kwargs`` alongside scalar kwargs (codegen reads tensor-
+    valued kwargs from ``kwargs``, not from ``inputs``).
+    """
+    inputs: dict[str, str] = {}
+    extras: dict[str, str] = {}
+    for role in op_cls.OPERAND_AXES:
+        if role in name_kwargs and name_kwargs[role] in tensors:
+            inputs[role] = f"sbuf_{name_kwargs[role]}"
+    for role, tname in name_kwargs.items():
+        if role in op_cls.OPERAND_AXES:
+            continue
+        if tname in tensors:
+            alias = f"sbuf_{tname}"
+            inputs[role] = alias
+            extras[role] = alias
+    return inputs, extras
+
+
+def _derive_edges(ops: list[Op]) -> list[tuple[int, int, str, str]]:
+    """Return ``[(producer_idx, consumer_idx, tensor_name, role), ...]``.
+
+    Tracks the *last writer before the consumer*, so a non-SSA chain
+    (``scaled = A(); scaled = B(scaled)``) edges to the previous writer
+    instead of self-looping. Self-loops (an op reading a buffer it also
+    writes, e.g. in-place ``activation(sbuf, sbuf)``) are dropped — they
+    add no scheduling information.
+    """
+    producer_of: dict[str, int] = {}
+    edges: list[tuple[int, int, str, str]] = []
+    for i, op in enumerate(ops):
+        for role, tname in op.inputs.items():
+            src = producer_of.get(tname)
+            if src is not None and src != i:
+                edges.append((src, i, tname, role))
+        for out in op.outputs:
+            producer_of[out] = i
+    return edges
+
+
+def _unify_dim(
+    tensors: dict[str, _Tensor],
+    per_op_axis_maps: list[dict[str, str]],
+    dim_sizes: dict[str, int],
+    old_id: str,
+    new_id: str,
+) -> None:
+    """Rename *old_id* to *new_id* in all tensors and axis maps."""
+    old_size = dim_sizes.get(old_id)
+    new_size = dim_sizes.get(new_id)
+    if old_size is not None and new_size is not None and old_size != new_size:
+        raise ValueError(f"Cannot unify {old_id} (size {old_size}) with {new_id} (size {new_size})")
+    if old_id in dim_sizes:
+        dim_sizes.setdefault(new_id, dim_sizes.pop(old_id))
+    for tensor in tensors.values():
+        tensor.dim_ids = [new_id if d == old_id else d for d in tensor.dim_ids]
+    for axis_map in per_op_axis_maps:
+        for ax in axis_map:
+            if axis_map[ax] == old_id:
+                axis_map[ax] = new_id
+
+
+def _build_axis_map(
+    op_cls: type[NKIOp],
+    operand_map: dict[str, str],
+    tensors: dict[str, _Tensor],
+    dim_counter: list[int],
+    per_op_axis_maps: list[dict[str, str]],
+    dim_sizes: dict[str, int],
+) -> dict[str, str]:
+    """Build abstract->concrete axis map for one op by walking its tensor operands."""
+    local: dict[str, str] = {}
+    for slot, axes in op_cls.OPERAND_AXES.items():
+        if slot not in operand_map:
+            continue
+        tname = operand_map[slot]
+        if tname not in tensors:
+            continue
+        tensor = tensors[tname]
+        if tensor.dim_ids:
+            for abstract, concrete in zip(axes, tensor.dim_ids):
+                if abstract in local and local[abstract] != concrete:
+                    _unify_dim(tensors, per_op_axis_maps, dim_sizes, old_id=concrete, new_id=local[abstract])
+                else:
+                    local[abstract] = concrete
+        else:
+            for i, abstract in enumerate(axes[: len(tensor.shape)]):
+                if abstract not in local:
+                    fresh = f"d{dim_counter[0]}"
+                    dim_counter[0] += 1
+                    dim_sizes[fresh] = tensor.shape[i]
+                    local[abstract] = fresh
+            tensor.dim_ids = [local[a] for a in axes[: len(tensor.shape)]]
+    return local
+
+
+def _create_outputs(
+    op_cls: type[NKIOp],
+    operand_map: dict[str, str],
+    output_names: list[str],
+    local: dict[str, str],
+    tensors: dict[str, _Tensor],
+    dim_sizes: dict[str, int],
+) -> None:
+    """Create output tensor records from the op's abstract ``OUTPUT_AXES``."""
+    first_slot = next(iter(op_cls.OPERAND_AXES))
+    has_first = first_slot in operand_map and operand_map[first_slot] in tensors
+    dtype = (
+        tensors[operand_map[first_slot]].dtype
+        if has_first
+        else next(t.dtype for t in tensors.values() if t.dtype != "")
+    )
+    for oname, (_, output_axes) in zip(output_names, op_cls.OUTPUT_AXES.items()):
+        dim_ids = [local[a] for a in output_axes if a in local]
+        shape = tuple(dim_sizes[d] for d in dim_ids)
+        tensors[oname] = _Tensor(oname, shape, dtype, dim_ids)

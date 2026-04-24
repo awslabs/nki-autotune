@@ -1,122 +1,136 @@
-"""Baseline causal attention via nkipy: plain numpy -> HLO -> neuronx-cc -> Trn2.
+"""Causal attention: ``build_ir`` + atomic OnlineFusion to flash attention.
 
-Mirrors ``examples/baseline_matmul.py`` but for causal self-attention. The
-tensors match the convention used by ``attention_cte_golden``:
+Defines the naive attention math as an nkigym function, uses
+``build_ir`` to synthesize the baseline ``KernelIR`` from that
+function + input shapes, then applies :class:`OnlineFusion` to
+fixpoint. The atomic rewrite reaches flash attention in two
+applications that share the same running-max state:
 
-    Q: (seq_len, d_k)
-    K: (seq_len, d_k)
-    V: (seq_len, d_v)
+1. ``(R = tensor_reduce(max), A = activation_reduce(exp+sum))`` on the
+   seq_k dim — direct bias link. Allocates ``sbuf_running_*`` and
+   ``sbuf_scale_*``, inserts ``update_running`` + ``compute_scale``
+   ops, rescales the exp+sum accumulator.
+2. ``(R = tensor_reduce(max), A = matmul(exp_S_t, V))`` — transitive
+   link through ``transpose → activation_reduce(bias=running)``.
+   Reuses the existing running/scale buffers; only inserts a second
+   ``rescale`` on the P@V accumulator.
 
-    output = softmax(causal(scale * Q @ K^T)) @ V
-
-No NKI kernel authoring: ``nkipy`` traces the numpy function to HLO,
-``neuronx-cc`` lowers it, and ``BaremetalExecutor`` runs it on a Neuron
-core. The reported MFU is the compiler's out-of-the-box result.
-
-This script must run on a Trn2 host (e.g. ``gym-2``)::
-
-    rsync examples/attention.py gym-2:/tmp/
-    ssh gym-2 '/home/ubuntu/venvs/kernel-env/bin/python /tmp/attention.py'
+Math: ``output = softmax(scale * Q_T @ K) @ V`` with Q given
+already-transposed (the matmul op contract is ``stationary.T @ moving``
+so ``stationary = Q_T`` yields ``Q @ K^T`` when ``moving = K``). The
+causal mask is ignored — it is the job of :class:`ComputeSkipping`.
 """
 
-import json
-import os
-import shutil
-import sys
-from pathlib import Path
-from typing import Any
-
-_VENV_BIN = os.path.dirname(sys.executable)
-if _VENV_BIN not in os.environ.get("PATH", "").split(os.pathsep):
-    os.environ["PATH"] = _VENV_BIN + os.pathsep + os.environ.get("PATH", "")
-
-import ml_dtypes
 import numpy as np
-from nkipy.core.trace import NKIPyKernel
-from nkipy.runtime import BaremetalExecutor, CompiledKernel
-from nkipy.runtime.execute import _compile_kernel
 
-_PE_FREQ_HZ = 2.4e9
-_BF16_FLOPS_PER_CYCLE = 2 * 128 * 128
+from nkigym.kernel_ir import KernelIR, build_ir
+from nkigym.kernel_ir.rewrites import OnlineFusion
+from nkigym.ops.activation_reduce import NKIActivationReduce
+from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.reciprocal import NKIReciprocal
+from nkigym.ops.tensor_reduce import NKITensorReduce
+from nkigym.ops.tensor_scalar import NKITensorScalar
+from nkigym.ops.transpose import NKITranspose
+
+SEQ_LEN = 2048
+D_K = 128
+D_V = 128
+SCALE = 1.0 / (D_K**0.5)
 
 
-def attention_causal(Q: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
-    """Causal self-attention on 2D tensors.
+def attention_nkigym(Q_T: np.ndarray, K: np.ndarray, V: np.ndarray) -> np.ndarray:
+    """Naive attention math — one nkigym op per pass.
 
-    Args:
-        Q: Query tensor of shape (seq_len, d_k).
-        K: Key tensor of shape (seq_len, d_k).
-        V: Value tensor of shape (seq_len, d_v).
-
-    Returns:
-        Output tensor of shape (seq_len, d_v).
+    ``stationary.T @ moving`` contract: we pass ``Q_T (d_k, seq_q)``
+    and ``K (d_k, seq_k)``, yielding ``S (seq_q, seq_k)``.
     """
-    scale = 1.0 / np.sqrt(Q.shape[-1])
-    s = (Q @ K.T) * scale
-    causal = np.triu(np.full_like(s, -np.inf), k=1)
-    s = s + causal
-    s = s - s.max(axis=-1, keepdims=True)
-    exp_s = np.exp(s)
-    p = exp_s / exp_s.sum(axis=-1, keepdims=True)
-    output = p @ V
+    S = NKIMatmul()(stationary=Q_T, moving=K)
+    scaled_S = NKITensorScalar()(data=S, op0="multiply", operand0=SCALE)
+    neg_max = NKITensorReduce()(data=scaled_S, op="maximum", axis=1, negate=True)
+    exp_S, sum_exp = NKIActivationReduce()(data=scaled_S, op="exp", bias=neg_max, reduce_op="add")
+    inv_sum = NKIReciprocal()(data=sum_exp)
+    exp_S_t = NKITranspose()(data=exp_S)
+    O_unnorm = NKIMatmul()(stationary=exp_S_t, moving=V)
+    output = NKITensorScalar()(data=O_unnorm, op0="multiply", operand0=inv_sum)
     return output
 
 
-def calculate_mfu_bf16(mac_count: int, time_ms: float) -> float:
-    """Return MFU percentage on Trn2 NeuronCore-v3 TensorEngine for bf16."""
-    flops = 2 * mac_count
-    actual_pe_cycles = (time_ms / 1000) * _PE_FREQ_HZ
-    theoretical_pe_cycles = flops / _BF16_FLOPS_PER_CYCLE
-    return 100.0 * theoretical_pe_cycles / actual_pe_cycles
+def build_naive_attention_ir() -> KernelIR:
+    """``build_ir`` from the math function — naive baseline with canonical defaults."""
+    input_specs = {
+        "Q_T": ((D_K, SEQ_LEN), "bfloat16"),
+        "K": ((D_K, SEQ_LEN), "bfloat16"),
+        "V": ((SEQ_LEN, D_V), "bfloat16"),
+    }
+    return build_ir(attention_nkigym, input_specs)
 
 
-def run_attention(
-    inputs: dict[str, np.ndarray], mac_count: int, cache_dir: Path, warmup: int = 10, iters: int = 100
-) -> dict[str, Any]:
-    """Trace + compile + benchmark the causal attention kernel on the local Neuron core.
+def print_ops(ir: KernelIR, title: str) -> None:
+    """Pretty-print the op list for quick diffing."""
+    print(f"\n{title} — {len(ir.ops)} ops, {len(ir.physical_buffers)} physical buffers")
+    print("─" * 88)
+    for i, op in enumerate(ir.ops):
+        inputs = ", ".join(f"{r}={n}" for r, n in op.inputs.items())
+        outputs = ", ".join(op.outputs)
+        block = f"  blocking={sorted(op.blocking_dims)}" if op.blocking_dims else ""
+        role = op.attrs.get("online_fusion_role")
+        role_str = f"  role={role}" if role else ""
+        fused = "  [X-fused]" if op.attrs.get("online_fused") else ""
+        cfused = "  [A-fused]" if op.attrs.get("online_fused_consumer") else ""
+        print(f"  #{i:2d} {op.kind:24s} ({inputs}) -> [{outputs}]{block}{role_str}{fused}{cfused}")
 
-    Args:
-        inputs: Kwargs passed to ``attention_causal``. Values are numpy arrays.
-        mac_count: Theoretical MAC count for MFU computation.
-        cache_dir: Directory for compilation artifacts.
-        warmup: Warmup iterations.
-        iters: Benchmark iterations.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    traced = NKIPyKernel.trace(attention_causal)
-    args = list(inputs.values())
-    neff_path, kname, _ir, _boundargs, _orig = _compile_kernel(traced, *args, artifacts_dir=str(cache_dir))
-    compiled = CompiledKernel(traced, neff_path)
+def describe_changes(naive: KernelIR, fused: KernelIR) -> None:
+    """Print the key IR-field diffs that OnlineFusion produced."""
+    print("\n" + "=" * 88)
+    print("OnlineFusion changes")
+    print("=" * 88)
 
-    with BaremetalExecutor() as spike:
-        stats = spike.benchmark(compiled, *args, warmup_iterations=warmup, benchmark_iterations=iters, mode="device")
-    min_ms = stats.min_ms
-    mean_ms = stats.mean_ms
-    mfu = calculate_mfu_bf16(mac_count, min_ms)
-    record = {"min_ms": min_ms, "mean_ms": mean_ms, "mac_count": mac_count, "mfu": mfu, "neff_path": neff_path}
-    print(f"attention    min={min_ms:.3f}ms  mean={mean_ms:.3f}ms  MFU={mfu:.2f}%")
-    return record
+    added_buffers = sorted(set(fused.physical_buffers) - set(naive.physical_buffers))
+    print(f"\nNew physical buffers: {added_buffers}")
+    for name in added_buffers:
+        pb = fused.physical_buffers[name]
+        print(f"  {name}: tile={pb.tile} dims={pb.dim_ids} dtype={pb.dtype}")
+
+    inserted_roles = [op.attrs.get("online_fusion_role") for op in fused.ops if op.attrs.get("online_fusion_role")]
+    print(f"\nInserted correction ops: {inserted_roles}")
+
+    print("\nBlocking_dims before → after:")
+    for i, op in enumerate(naive.ops):
+        if not op.blocking_dims:
+            continue
+        matched = [j for j, fop in enumerate(fused.ops) if fop.kind == op.kind and fop.outputs == op.outputs]
+        if not matched:
+            continue
+        j = matched[0]
+        after = fused.ops[j].blocking_dims
+        marker = " ★" if after != op.blocking_dims else ""
+        print(f"  {op.kind:24s} #{i}→#{j}: {sorted(op.blocking_dims)} -> {sorted(after)}{marker}")
 
 
 if __name__ == "__main__":
-    seq_len, d_k, d_v = 2048, 128, 128
-    mac_count = seq_len * seq_len * d_k + seq_len * seq_len * d_v
+    naive = build_naive_attention_ir()
+    print_ops(naive, "Naive attention IR (from build_ir)")
 
-    cache_root = Path("/home/ubuntu/cache/baseline_attention")
-    shutil.rmtree(cache_root, ignore_errors=True)
-    cache_root.mkdir(parents=True)
-
-    bf16 = ml_dtypes.bfloat16
-    rng = np.random.default_rng(0)
-    Q = rng.standard_normal((seq_len, d_k)).astype(bf16)
-    K = rng.standard_normal((seq_len, d_k)).astype(bf16)
-    V = rng.standard_normal((seq_len, d_v)).astype(bf16)
-
-    record = run_attention({"Q": Q, "K": K, "V": V}, mac_count, cache_root)
-
-    with open(cache_root / "results.json", "w") as fh:
-        json.dump(
-            {"shape": {"seq_len": seq_len, "d_k": d_k, "d_v": d_v}, "dtype": "bfloat16", "result": record}, fh, indent=2
+    of = OnlineFusion()
+    current = naive
+    step = 0
+    while True:
+        matches = of.match(current)
+        if not matches:
+            break
+        step += 1
+        m = matches[0]
+        r = current.ops[m.reducer_index]
+        c = current.ops[m.consumer_index]
+        shared = "(shared X — reuse running/scale)" if m.shared_x else "(first X — allocate running/scale)"
+        print(
+            f"\nStep {step}: R#{m.reducer_index} {r.kind}({list(r.outputs)})  →  "
+            f"C#{m.consumer_index} {c.kind}({list(c.outputs)})  on {m.blocking_dim} via role={m.bias_role} {shared}"
         )
-    print(f"\nResults -> {cache_root / 'results.json'}")
+        current = of.apply(current, m)
+
+    flash = current
+    print(f"\nTotal OnlineFusion applications: {step}")
+    print_ops(flash, "Flash attention IR (after OnlineFusion)")
+    describe_changes(naive, flash)

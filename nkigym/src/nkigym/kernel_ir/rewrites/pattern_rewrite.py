@@ -15,8 +15,8 @@ class PatternRewrite(Protocol):
     """Protocol for one kind of ir rewrite.
 
     Patterns operate on a ``KernelIR`` and return a fresh
-    ``KernelIR`` on ``apply``. The driver is pure: it threads
-    the IR through ``match`` / ``apply`` without mutation.
+    ``KernelIR`` on ``apply``. The driver threads the IR through
+    ``match`` / ``apply`` without mutation between calls.
     """
 
     name: str
@@ -31,7 +31,12 @@ class PatternRewrite(Protocol):
 
 
 def apply_rewrites_until_fixpoint(ir: KernelIR, patterns: list[PatternRewrite], max_iterations: int = 64) -> KernelIR:
-    """Run every pattern until a full pass yields zero matches."""
+    """Run every pattern until a full pass yields zero matches.
+
+    Raises:
+        RuntimeError: if the driver does not converge within
+            ``max_iterations`` passes.
+    """
     current = ir
     for _ in range(max_iterations):
         any_applied = False
