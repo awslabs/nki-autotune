@@ -7,10 +7,10 @@ Each ``sample_valid_ir`` call:
    at each step, draws one ``(pattern, instance)`` uniformly from
    the current match set across all patterns.
 3. Rejection-samples ``dim_order`` / ``ltiles_per_block`` /
-   ``tensor_placements`` for the resulting ir until ``validate``
+   ``buffer_placements`` for the resulting ir until ``validate``
    passes.
 
-There is no outer/inner split. Every rewrite (trivial fusion,
+There is no outer/inner split. Every rewrite (loop fusion,
 online fusion, DMA-transpose fusion) is a ``PatternRewrite`` in
 one registry, sampled in one loop.
 """
@@ -18,14 +18,15 @@ one registry, sampled in one loop.
 import random
 from dataclasses import replace
 
-from nkigym.kernel_ir.fusion_group import FusionGroup
+from nkigym.kernel_ir.fusion_group import BufferPlacement, FusionGroup
 from nkigym.kernel_ir.ir import KernelIR, rebuild_edges
 from nkigym.kernel_ir.rewrites.pattern_rewrite import PatternRewrite
 from nkigym.kernel_ir.validate.emission import compute_staged_set
-from nkigym.kernel_ir.validate.rules import tier_depth_range, validate
+from nkigym.kernel_ir.validate.rules import validate
 from nkigym.ops.base import NKIOp
+from nkigym.ops.dma import NKILoad
 
-TIERS = ("per_tile", "per_block", "full")
+_PLACEMENTS: tuple[BufferPlacement, ...] = (BufferPlacement.OUTER, BufferPlacement.MIDDLE, BufferPlacement.INNER)
 
 
 def sample_valid_ir(
@@ -39,7 +40,7 @@ def sample_valid_ir(
     staged = compute_staged_set(ir)
     seed_ir = _assign_initial_state(ir, tensor_kinds, sbuf_tensors)
     rebuild_edges(seed_ir)
-    forced_full = _forced_full_pairs(seed_ir)
+    forced_outer = _forced_outer_pairs(seed_ir)
     op_to_group = {id(op): gi for gi, group in enumerate(seed_ir.groups) for op in group.ops}
     divisor_choices = _enumerate_lpb_choices(seed_ir)
     for _ in range(max_tries):
@@ -51,7 +52,7 @@ def sample_valid_ir(
                 replace(
                     old,
                     dim_order=dim_orders[gi],
-                    tensor_placements=_sample_group_placements(candidate, gi, dim_orders[gi], forced_full, rng),
+                    buffer_placements=_sample_group_placements(candidate, gi, forced_outer, rng),
                 )
             )
         candidate = replace(candidate, groups=new_groups, edges=list(seed_ir.edges))
@@ -101,7 +102,7 @@ def _divisors(n: int) -> list[int]:
 
 def _tensor_buffers(ir: KernelIR) -> dict[str, set[str]]:
     """Return ``{tensor_name: set_of_buffer_kinds}`` by walking the IR."""
-    kinds: dict[str, set[str]] = {name: set() for name in ir.logical_tensors}
+    kinds: dict[str, set[str]] = {name: set() for name in ir.all_tensors()}
     for group in ir.groups:
         for op in group.ops:
             isa_loc = type(op).ISA_LOC
@@ -117,7 +118,15 @@ def _tensor_buffers(ir: KernelIR) -> dict[str, set[str]]:
 
 
 def _assign_initial_state(ir: KernelIR, tensor_kinds: dict[str, set[str]], sbuf_tensors: set[str]) -> KernelIR:
-    """Populate ``dim_order`` / ``buffer_degrees`` / ``tensor_placements`` on each group."""
+    """Populate ``dim_order`` / ``buffer_degrees`` / ``buffer_placements`` on each group.
+
+    ``buffer_placements`` only holds entries for **FG input
+    buffers** — physical_buffers produced by an ``NKILoad`` in
+    this group (i.e. buffers the FG reads data INTO from HBM).
+    Output buffers and intermediates derive their placement via
+    ``placement_semantics.effective_placement``.
+    """
+    _ = sbuf_tensors
     new_groups: list[FusionGroup] = []
     for group in ir.groups:
         touched = _group_touched_tensors(ir, group)
@@ -126,7 +135,7 @@ def _assign_initial_state(ir: KernelIR, tensor_kinds: dict[str, set[str]], sbuf_
                 group,
                 dim_order=_group_dims(ir, group),
                 buffer_degrees=_init_group_buffer_degrees(ir, group, touched, tensor_kinds),
-                tensor_placements=_init_group_tensor_placements(ir, touched, sbuf_tensors),
+                buffer_placements=_init_group_buffer_placements(ir, group),
             )
         )
     return replace(ir, groups=new_groups, edges=list(ir.edges))
@@ -137,10 +146,10 @@ def _group_touched_tensors(ir: KernelIR, group: FusionGroup) -> set[str]:
     touched: set[str] = set()
     for op in group.ops:
         for name in ir.op_inputs.get(op, {}).values():
-            if name in ir.logical_tensors:
+            if ir.has_tensor(name):
                 touched.add(name)
         for name in ir.op_outputs.get(op, []):
-            if name in ir.logical_tensors:
+            if ir.has_tensor(name):
                 touched.add(name)
     return touched
 
@@ -150,9 +159,8 @@ def _group_dims(ir: KernelIR, group: FusionGroup) -> list[str]:
     dims: set[str] = set()
     for op in group.ops:
         for name in _op_touched_tensors(ir, op):
-            tinfo = ir.logical_tensors.get(name)
-            if tinfo is not None:
-                dims.update(tinfo.dim_ids)
+            if ir.has_tensor(name):
+                dims.update(ir.tensor_info(name).dim_ids)
     return sorted(dims)
 
 
@@ -173,23 +181,29 @@ def _init_group_buffer_degrees(
     for tname in touched:
         kinds = tensor_kinds.get(tname, set())
         if "sbuf" in kinds:
-            for dim_id in ir.logical_tensors[tname].dim_ids:
+            for dim_id in ir.tensor_info(tname).dim_ids:
                 degrees[("sbuf", tname, dim_id)] = 1
         if "psum" in kinds and tname in psum_producers:
-            for dim_id in ir.logical_tensors[tname].dim_ids:
+            for dim_id in ir.tensor_info(tname).dim_ids:
                 degrees[("psum", tname, dim_id)] = 1
     return degrees
 
 
-def _init_group_tensor_placements(
-    ir: KernelIR, touched: set[str], sbuf_tensors: set[str]
-) -> dict[tuple[str, str, str], str]:
-    """Seed every ``("sbuf", tensor, dim)`` placement to ``per_tile``."""
-    placements: dict[tuple[str, str, str], str] = {}
-    for tname in touched & sbuf_tensors:
-        for dim_id in ir.logical_tensors[tname].dim_ids:
-            placements[("sbuf", tname, dim_id)] = "per_tile"
-    return placements
+def _init_group_buffer_placements(ir: KernelIR, group: FusionGroup) -> dict[tuple[str, str], BufferPlacement]:
+    """Seed placements for each Load-destination physical_buffer this group produces.
+
+    An FG input buffer is a physical_buffer produced by an
+    ``NKILoad`` op in this group — the buffer holds data the FG
+    reads from HBM.
+    """
+    result: dict[tuple[str, str], BufferPlacement] = {}
+    for op in group.ops:
+        if not isinstance(op, NKILoad):
+            continue
+        for oname in ir.op_outputs.get(op, []):
+            if oname in ir.physical_buffers:
+                result[("sbuf", oname)] = BufferPlacement.INNER
+    return result
 
 
 def _group_axis_splits(ir: KernelIR) -> list[tuple[list[str], set[str]]]:
@@ -205,33 +219,22 @@ def _group_axis_splits(ir: KernelIR) -> list[tuple[list[str], set[str]]]:
 
 
 def _rand_blocking_inner_perm(order: list[str], blocking: set[str], rng: random.Random) -> list[str]:
-    """Uniform random permutation over all dim orderings.
-
-    Previously restricted blocking dims to the suffix, but the
-    validator's ``_check_blocking_innermost`` now ignores
-    gadget-absorbed blocking dims, so the order-choice pipeline
-    draws unrestricted and invalid combinations are filtered at
-    validate time.
-    """
+    """Uniform random permutation over all dim orderings."""
     _ = blocking
     permuted = list(order)
     rng.shuffle(permuted)
     return permuted
 
 
-def _forced_full_pairs(ir: KernelIR) -> set[tuple[int, str, str]]:
-    """Return ``(group_idx, tensor, dim)`` triples forced to ``full`` by cross-group rules."""
+def _forced_outer_pairs(ir: KernelIR) -> set[tuple[int, str]]:
+    """Return ``(group_idx, tensor)`` pairs forced to ``OUTER`` by cross-group rules.
+
+    A tensor touched by 2+ groups must be allocated at the kernel
+    top so its data persists across the group boundary; every
+    touching group must therefore have ``OUTER`` placement.
+    """
     tensor_to_groups = _build_tensor_to_groups(ir)
-    group_dim_sets = [set(group.dim_order) for group in ir.groups]
-    forced: set[tuple[int, str, str]] = set()
-    for tname, gis in tensor_to_groups.items():
-        if len(gis) < 2:
-            continue
-        tensor_dims = set(ir.logical_tensors[tname].dim_ids)
-        for gi in gis:
-            for d in group_dim_sets[gi] & tensor_dims:
-                forced.add((gi, tname, d))
-    return forced
+    return {(gi, tname) for tname, gis in tensor_to_groups.items() if len(gis) >= 2 for gi in gis}
 
 
 def _build_tensor_to_groups(ir: KernelIR) -> dict[str, set[int]]:
@@ -240,37 +243,26 @@ def _build_tensor_to_groups(ir: KernelIR) -> dict[str, set[int]]:
     for gi, group in enumerate(ir.groups):
         for op in group.ops:
             for name in _op_touched_tensors(ir, op):
-                if name in ir.logical_tensors:
+                if ir.has_tensor(name):
                     result.setdefault(name, set()).add(gi)
     return result
 
 
 def _sample_group_placements(
-    ir: KernelIR, group_idx: int, dim_order: list[str], forced_full: set[tuple[int, str, str]], rng: random.Random
-) -> dict[tuple[str, str, str], str]:
-    """Draw one group's ``tensor_placements`` map."""
+    ir: KernelIR, group_idx: int, forced_outer: set[tuple[int, str]], rng: random.Random
+) -> dict[tuple[str, str], BufferPlacement]:
+    """Draw one group's ``buffer_placements`` — one ``BufferPlacement`` per FG input buffer.
+
+    Only Load-destination physical_buffers get a sampled placement.
+    Cross-FG input buffers are forced to ``OUTER`` so data survives
+    the group boundary.
+    """
     group = ir.groups[group_idx]
-    touched = {name for (_kind, name, _d) in group.tensor_placements}
-    pos = {d: i for i, d in enumerate(dim_order)}
-    n = len(dim_order)
-    placements: dict[tuple[str, str, str], str] = {}
-    for name in touched:
-        tinfo = ir.logical_tensors[name]
-        depth = rng.randint(0, 2 * n) if n > 0 else 0
-        for d in tinfo.dim_ids:
-            key = ("sbuf", name, d)
-            if (group_idx, name, d) in forced_full:
-                placements[key] = "full"
-            elif d in pos:
-                placements[key] = _pick_tier_containing(pos[d], n, depth, rng)
-            else:
-                placements[key] = rng.choice(TIERS)
+    placements: dict[tuple[str, str], BufferPlacement] = {}
+    for key in group.buffer_placements:
+        _kind, tname = key
+        if (group_idx, tname) in forced_outer:
+            placements[key] = BufferPlacement.OUTER
+        else:
+            placements[key] = rng.choice(_PLACEMENTS)
     return placements
-
-
-def _pick_tier_containing(position: int, n: int, depth: int, rng: random.Random) -> str:
-    """Pick a tier whose interval at ``position`` contains ``depth``."""
-    candidates = [
-        t for t in TIERS if tier_depth_range(t, position, n)[0] <= depth <= tier_depth_range(t, position, n)[1]
-    ]
-    return rng.choice(candidates) if candidates else rng.choice(TIERS)

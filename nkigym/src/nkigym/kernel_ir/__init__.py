@@ -1,21 +1,12 @@
-"""KernelIR: structured kernel representation for lowering to NKI source."""
+"""KernelIR: structured kernel representation for lowering to NKI source.
 
-from nkigym.kernel_ir.build import build_initial, build_ir, build_naive_ir
-from nkigym.kernel_ir.fusion_group import FusionGroup
-from nkigym.kernel_ir.ir import KernelIR, insert_dma_nodes, rebuild_edges
-from nkigym.kernel_ir.sampler.sampler import sample_valid_ir
+This module exports only the core IR types. The sampler, rewrites,
+builder, and validator subpackages were written against an earlier
+IR schema (groups, buffer_degrees, BufferPlacement) and need to be
+rewritten to match the current ``ir.py`` schema before re-exporting.
+"""
+
+from nkigym.kernel_ir.ir import BufferScope, KernelIR, NumBuffers, Op, PhysicalBuffer
 from nkigym.kernel_ir.types import DimInfo, DimRole, TensorInfo
 
-__all__ = [
-    "DimInfo",
-    "DimRole",
-    "FusionGroup",
-    "KernelIR",
-    "TensorInfo",
-    "build_initial",
-    "build_ir",
-    "build_naive_ir",
-    "insert_dma_nodes",
-    "rebuild_edges",
-    "sample_valid_ir",
-]
+__all__ = ["BufferScope", "DimInfo", "DimRole", "KernelIR", "NumBuffers", "Op", "PhysicalBuffer", "TensorInfo"]

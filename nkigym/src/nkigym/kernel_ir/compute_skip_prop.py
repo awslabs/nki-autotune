@@ -124,7 +124,7 @@ def _producers_of_map(ir: KernelIR, ops: list[NKIOp]) -> dict[str, NKIOp]:
 def _consumers_of_map(ir: KernelIR, ops: list[NKIOp]) -> dict[str, list[NKIOp]]:
     """Map tensor_name → consumer op list (kwargs-as-tensor included)."""
     result: dict[str, list[NKIOp]] = {}
-    tensors_set = set(ir.logical_tensors)
+    tensors_set = set(ir.logical_tensors) | set(ir.physical_buffers)
     for op in ops:
         names: set[str] = set()
         for tname in ir.op_inputs.get(op, {}).values():
@@ -164,8 +164,9 @@ def _trace_downstream_with_numerics(ir: KernelIR, affine_op: NKIOp, base_pred: S
 
 def _tensor_has_dim(ir: KernelIR, tensor_name: str, dim_id: str) -> bool:
     """True iff the tensor carries ``dim_id`` in its logical ``dim_ids``."""
-    tinfo = ir.logical_tensors.get(tensor_name)
-    return tinfo is not None and dim_id in tinfo.dim_ids
+    if not ir.has_tensor(tensor_name):
+        return False
+    return dim_id in ir.tensor_info(tensor_name).dim_ids
 
 
 def _propagate_through_or_raise(ir: KernelIR, op: NKIOp, input_value: float, free_dim: str) -> float:
@@ -295,7 +296,7 @@ def _remove_affine_select(ir: KernelIR, affine_op: NKIOp) -> KernelIR:
                     ops=surviving,
                     dim_order=list(group.dim_order),
                     buffer_degrees=dict(group.buffer_degrees),
-                    tensor_placements=dict(group.tensor_placements),
+                    buffer_placements=dict(group.buffer_placements),
                 )
             )
     new_ir = replace(

@@ -26,9 +26,9 @@ from nkigym.kernel_ir.fusion_group import FusionGroup
 from nkigym.kernel_ir.ir import KernelIR, insert_dma_nodes, rebuild_edges
 from nkigym.kernel_ir.parse import find_ops
 from nkigym.kernel_ir.rewrites.load_transpose_pattern import LoadTransposePattern
+from nkigym.kernel_ir.rewrites.loop_fusion import LoopFusion
 from nkigym.kernel_ir.rewrites.online_fusion_pattern import OnlineFusionPattern
 from nkigym.kernel_ir.rewrites.pattern_rewrite import PatternRewrite, apply_rewrites_until_fixpoint
-from nkigym.kernel_ir.rewrites.trivial_fusion import TrivialFusion
 from nkigym.kernel_ir.sampler.sampler import sample_valid_ir
 from nkigym.kernel_ir.trace import trace_scalar_kwargs
 from nkigym.kernel_ir.types import DimInfo, DimRole, TensorInfo
@@ -36,7 +36,7 @@ from nkigym.ops.base import NKIOp
 
 """Graph rewrites — split into mandatory pre-passes and sampled rewrites.
 
-``TrivialFusion`` is applied to fixpoint as a mandatory pre-pass
+``LoopFusion`` is applied to fixpoint as a mandatory pre-pass
 inside ``build_naive_ir`` because it is a strict no-op-or-better
 transform: merging a producer→consumer pair whose shared dims are
 all PARALLEL in the producer preserves semantics, and any kernel
@@ -52,7 +52,7 @@ performance trade-offs: the sampler picks ``k ∈ [0, num_ops -
 chosen uniformly across all currently-matching
 ``(pattern, instance)`` pairs).
 """
-_MANDATORY_REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [TrivialFusion()])
+_MANDATORY_REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [LoopFusion()])
 REWRITES: list[PatternRewrite] = cast(list[PatternRewrite], [OnlineFusionPattern(), LoadTransposePattern()])
 
 
@@ -299,7 +299,7 @@ def build_naive_ir(
        every ``NKIAffineSelect`` into per-op ``SkipPredicate``
        annotations and removes the standalone op.
     3. ``_MANDATORY_REWRITES`` applied to fixpoint — currently
-       just ``TrivialFusion``, which is a strict no-op-or-better
+       just ``LoopFusion``, which is a strict no-op-or-better
        transform and is therefore lifted out of the sampled
        ``REWRITES`` set.
     4. The resulting ``KernelIR`` is the seed every

@@ -123,7 +123,7 @@ def _collect_external_inputs(ir: KernelIR, ops: list[NKIOp], absorbed: set[NKIOp
         if op not in absorbed:
             continue
         for tname in ir.op_inputs.get(op, {}).values():
-            if tname in produced_internal or tname in seen or tname not in ir.logical_tensors:
+            if tname in produced_internal or tname in seen or not ir.has_tensor(tname):
                 continue
             names.append(tname)
             seen.add(tname)

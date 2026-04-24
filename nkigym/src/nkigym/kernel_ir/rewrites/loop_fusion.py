@@ -1,4 +1,4 @@
-"""Trivial-fusion pattern: merge two groups whose shared dims are all parallel in the producer.
+"""Loop-fusion pattern: merge two groups whose shared dims are all parallel in the producer.
 
 ``A`` → ``B`` can be merged iff for every dim ``d`` shared
 between the two groups, role(``d``, ``A``) is ``PARALLEL`` —
@@ -30,16 +30,16 @@ from nkigym.ops.base import NKIOp
 
 @dataclass(frozen=True)
 class _Match:
-    """One trivial-merge candidate: producer group index and consumer group index."""
+    """One loop-merge candidate: producer group index and consumer group index."""
 
     producer: int
     consumer: int
 
 
-class TrivialFusion:
+class LoopFusion:
     """Merge a producer→consumer pair whose shared dims are all parallel in the producer."""
 
-    name = "trivial_fusion"
+    name = "loop_fusion"
 
     def match(self, ir: KernelIR) -> list[_Match]:
         """Return every legal producer→consumer pair."""
@@ -97,9 +97,8 @@ def _group_touched_dims(ir: KernelIR, group: FusionGroup) -> set[str]:
     for op in group.ops:
         tensor_names = list(ir.op_inputs.get(op, {}).values()) + list(ir.op_outputs.get(op, []))
         for name in tensor_names:
-            tinfo = ir.logical_tensors.get(name)
-            if tinfo is not None:
-                result.update(tinfo.dim_ids)
+            if ir.has_tensor(name):
+                result.update(ir.tensor_info(name).dim_ids)
     return result
 
 

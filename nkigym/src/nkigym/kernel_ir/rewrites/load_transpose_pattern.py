@@ -110,7 +110,7 @@ class LoadTransposePattern:
                         ops=list(group.ops),
                         dim_order=list(group.dim_order),
                         buffer_degrees=dict(group.buffer_degrees),
-                        tensor_placements=dict(group.tensor_placements),
+                        buffer_placements=dict(group.buffer_placements),
                     )
                 )
         new_graph = KernelIR(groups=keep)

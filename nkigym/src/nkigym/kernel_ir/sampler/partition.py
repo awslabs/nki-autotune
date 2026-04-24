@@ -1,6 +1,6 @@
 """Graph reachability helper for fusion-group merge legality.
 
-Small primitive used by fusion rewrites (``TrivialFusion``) to
+Small primitive used by fusion rewrites (``LoopFusion``) to
 check R1 convexity when merging two groups.
 """
 
@@ -12,7 +12,7 @@ def compute_reachability(ir: KernelIR) -> list[set[int]]:
 
     ``reach[u]`` is the set of group indices reachable from ``u``
     via ``ir.edges`` (inclusive of ``u``). Used by
-    ``TrivialFusion`` to test whether merging two groups preserves
+    ``LoopFusion`` to test whether merging two groups preserves
     R1 — no external group is trapped on a DAG path between them.
     """
     n = len(ir.groups)

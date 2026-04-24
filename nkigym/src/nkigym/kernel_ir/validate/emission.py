@@ -48,7 +48,7 @@ def compute_staged_set(ir: KernelIR) -> set[str]:
         for op in group.ops:
             input_locs = type(op).INPUT_LOCS
             for role, tname in ir.op_inputs.get(op, {}).items():
-                if tname not in ir.logical_tensors:
+                if not ir.has_tensor(tname):
                     continue
                 if producer_loc.get(tname) != "psum":
                     continue
@@ -123,32 +123,22 @@ def op_depth_floor(ir: KernelIR, op: NKIOp, group_idx: int) -> int:
 
 
 def _dma_depth_floor(ir: KernelIR, op: NKIOp, group_idx: int) -> int:
-    """DMA-specific floor: max per-dim tier lower bound on the op's SBUF tensor."""
-    dim_order = ir.groups[group_idx].dim_order
-    placements = ir.groups[group_idx].tensor_placements
+    """DMA-specific floor: alloc-depth of the op's SBUF tensor.
+
+    The DMA must emit at or below the buffer's alloc depth — any
+    earlier would reference an undeclared buffer. Alloc depth is
+    driven by the buffer's effective ``BufferPlacement``.
+    """
+    from nkigym.kernel_ir.placement_semantics import alloc_depth, buffer_dim_positions, effective_placement
+
+    group = ir.groups[group_idx]
     sbuf_tensor = _dma_sbuf_tensor(ir, op)
-    tinfo = ir.logical_tensors.get(sbuf_tensor, None) if sbuf_tensor else None
-    floor = 0
-    if tinfo is not None and sbuf_tensor is not None:
-        for dim_id in tinfo.dim_ids:
-            if dim_id not in dim_order:
-                continue
-            pos = dim_order.index(dim_id)
-            tier = placements.get(("sbuf", sbuf_tensor, dim_id), "per_tile")
-            contribution = _tier_floor_contribution(tier, pos)
-            floor = max(floor, contribution)
-    return floor
-
-
-def _tier_floor_contribution(tier: str, pos: int) -> int:
-    """Return the per-dim floor contribution for a tier at ``pos``."""
-    if tier == "full":
-        contribution = 0
-    elif tier == "per_block":
-        contribution = block_depth(pos) + 1
-    else:
-        contribution = ltile_depth(pos) + 1
-    return contribution
+    if not sbuf_tensor or not ir.has_tensor(sbuf_tensor):
+        return 0
+    tinfo = ir.tensor_info(sbuf_tensor)
+    placement = effective_placement(ir, group_idx, sbuf_tensor)
+    positions = buffer_dim_positions(tinfo.dim_ids, group.dim_order)
+    return alloc_depth(placement, positions)
 
 
 def _dma_sbuf_tensor(ir: KernelIR, op: NKIOp) -> str:
@@ -165,16 +155,15 @@ def _op_tensor_dim_positions(ir: KernelIR, op: NKIOp, dim_order: list[str]) -> l
     """Return positions in ``dim_order`` of every dim any of the op's tensors carries."""
     touched: set[str] = set()
     for name in list(ir.op_inputs.get(op, {}).values()) + list(ir.op_outputs.get(op, [])):
-        tinfo = ir.logical_tensors.get(name)
-        if tinfo is not None:
-            touched.update(tinfo.dim_ids)
+        if ir.has_tensor(name):
+            touched.update(ir.tensor_info(name).dim_ids)
     return [dim_order.index(d) for d in touched if d in dim_order]
 
 
 def _op_input_tensor_names(ir: KernelIR, op: NKIOp) -> list[str]:
     """Every tensor-valued input — positional inputs plus tensor-valued kwargs."""
     result = list(ir.op_inputs.get(op, {}).values())
-    tensors_set = set(ir.logical_tensors)
+    tensors_set = set(ir.logical_tensors) | set(ir.physical_buffers)
     for _name, expr in ir.op_kwargs.get(op, {}).items():
         if expr in tensors_set and expr not in result:
             result.append(expr)

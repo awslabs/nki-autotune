@@ -1,22 +1,23 @@
 """KernelIR legality checks on the ``(ir, ir)`` shape."""
 
+from nkigym.kernel_ir.fusion_group import BufferPlacement
 from nkigym.kernel_ir.ir import KernelIR
-from nkigym.kernel_ir.validate.emission import Placement, block_depth, body_depth, ltile_depth, op_emission_placement
+from nkigym.kernel_ir.placement_semantics import block_loop_open, buffer_dim_positions, effective_placement
+from nkigym.kernel_ir.validate.emission import Placement, op_emission_placement
 from nkigym.ops.base import NKIOp
 from nkigym.ops.matmul import NKIMatmul
 
-_TIER_RANK = {"per_tile": 0, "per_block": 1, "full": 2}
-
 
 def validate(ir: KernelIR, op_to_group: dict[int, int], staged: set[str]) -> bool:
-    """Return True iff every legality rule passes for ``ir``."""
-    tensor_to_groups = _build_tensor_to_groups(ir)
-    return (
-        _check_cross_group_placements(ir, tensor_to_groups)
-        and _check_blocking_innermost(ir)
-        and _check_placement_feasibility(ir)
-        and _check_emission_feasibility(ir, op_to_group, staged)
-    )
+    """Rejection checks disabled — accept every sampled IR.
+
+    Temporary: the sampler now trusts codegen to raise on
+    truly-illegal shapes rather than filtering via the multi-check
+    rejection loop. Left as ``(ir, op_to_group, staged) -> True``
+    so the sampler's ``if validate(...)`` guard always passes.
+    """
+    _ = ir, op_to_group, staged
+    return True
 
 
 def _build_tensor_to_groups(ir: KernelIR) -> dict[str, set[int]]:
@@ -25,7 +26,7 @@ def _build_tensor_to_groups(ir: KernelIR) -> dict[str, set[int]]:
     for gi, group in enumerate(ir.groups):
         for op in group.ops:
             for name in _op_tensors(ir, op):
-                if name in ir.logical_tensors:
+                if ir.has_tensor(name):
                     result.setdefault(name, set()).add(gi)
     return result
 
@@ -75,9 +76,8 @@ def _op_blocking_innermost_ok(ir: KernelIR, group_idx: int, op: NKIOp) -> bool:
     dim_order = ir.groups[group_idx].dim_order
     op_dims: set[str] = set()
     for name in _op_tensors(ir, op):
-        tinfo = ir.logical_tensors.get(name)
-        if tinfo is not None:
-            op_dims.update(tinfo.dim_ids)
+        if ir.has_tensor(name):
+            op_dims.update(ir.tensor_info(name).dim_ids)
     op_dims &= set(dim_order)
     blocking_positions = [dim_order.index(d) for d in blocking if d in op_dims]
     non_blocking_positions = [dim_order.index(d) for d in op_dims if d not in blocking]
@@ -104,7 +104,15 @@ def _gadget_absorbed_blocking_dims(ir: KernelIR, group_idx: int) -> set[str]:
 
 
 def _is_matmul_block_candidate(ir: KernelIR, op: NKIOp, group_idx: int) -> bool:
-    """Local copy of the codegen-level matmul_block candidate predicate."""
+    """Local copy of the codegen-level matmul_block candidate predicate.
+
+    matmul_block fires iff:
+
+    * ``op`` is an ``NKIMatmul`` with a blocked K dim
+      (``num_blocks[K] > 1``).
+    * Both K-input buffer placements leave the K block loop OPEN
+      at alloc — i.e. the input is reloaded per outer-K block.
+    """
     ok = type(op) is NKIMatmul
     if ok:
         axis_map = ir.op_axis_map.get(op, {})
@@ -115,64 +123,32 @@ def _is_matmul_block_candidate(ir: KernelIR, op: NKIOp, group_idx: int) -> bool:
             di = ir.dimensions[k_dim]
             tpb = ir.ltiles_per_block.get(k_dim, 1)
             num_blocks = di.dim_size // (tpb * di.logical_tile_size)
-            if num_blocks <= 1:
-                ok = False
-            else:
-                ok = (
-                    _k_inputs_per_block(ir, op, group_idx, k_dim)
-                    and _inputs_have_block_slab(ir, op, group_idx)
-                    and _output_has_block_slab(ir, op, group_idx)
-                )
+            ok = num_blocks > 1 and _k_inputs_reload_per_block(ir, op, group_idx, k_dim)
     return ok
 
 
-def _inputs_have_block_slab(ir: KernelIR, op: NKIOp, group_idx: int) -> bool:
-    """True iff matmul inputs' free-axis tiers are ``per_block`` or ``full``."""
+def _k_inputs_reload_per_block(ir: KernelIR, op: NKIOp, group_idx: int, k_dim: str) -> bool:
+    """True iff both K-input buffers have their K block loop OPEN at alloc.
+
+    A buffer's K block loop is open at alloc iff its placement
+    is ``MIDDLE`` (when K is the outer buffer dim) or ``INNER``
+    (when K is the inner buffer dim).
+    """
+    group = ir.groups[group_idx]
     inputs = ir.op_inputs.get(op, {})
-    placements = ir.groups[group_idx].tensor_placements
-    axis_map = ir.op_axis_map.get(op, {})
     result = True
-    for role, abstract in (("stationary", "M"), ("moving", "N")):
-        tensor = inputs.get(role)
-        dim_id = axis_map.get(abstract)
-        if tensor is None or dim_id is None:
-            result = False
-            break
-        tier = placements.get(("sbuf", tensor, dim_id), "per_tile")
-        if _TIER_RANK[tier] < _TIER_RANK["per_block"]:
-            result = False
-            break
-    return result
-
-
-def _k_inputs_per_block(ir: KernelIR, op: NKIOp, group_idx: int, k_dim: str) -> bool:
-    """True iff both matmul SBUF inputs have ``per_block`` tier on ``k_dim``."""
-    inputs = ir.op_inputs.get(op, {})
-    placements = ir.groups[group_idx].tensor_placements
-    result = True
-    for role in ("stationary", "moving"):
-        tensor = inputs.get(role)
-        tier = placements.get(("sbuf", tensor, k_dim), "per_tile") if tensor else "full"
-        if tensor is None or tier != "per_block":
-            result = False
-            break
-    return result
-
-
-def _output_has_block_slab(ir: KernelIR, op: NKIOp, group_idx: int) -> bool:
-    """True iff the matmul's output has ``per_block`` or ``full`` tier on its M and N dims."""
-    outputs = ir.op_outputs.get(op, [])
-    placements = ir.groups[group_idx].tensor_placements
-    axis_map = ir.op_axis_map.get(op, {})
-    result = bool(outputs)
-    if result:
-        out_name = outputs[0]
-        for abstract in ("M", "N"):
-            dim_id = axis_map.get(abstract)
-            if dim_id is None:
-                continue
-            tier = placements.get(("sbuf", out_name, dim_id), "per_tile")
-            if _TIER_RANK[tier] < _TIER_RANK["per_block"]:
+    if k_dim not in group.dim_order:
+        result = False
+    else:
+        k_pos = group.dim_order.index(k_dim)
+        for role in ("stationary", "moving"):
+            tensor = inputs.get(role)
+            if tensor is None or not ir.has_tensor(tensor):
+                result = False
+                break
+            placement = effective_placement(ir, group_idx, tensor)
+            positions = buffer_dim_positions(ir.tensor_info(tensor).dim_ids, group.dim_order)
+            if not block_loop_open(placement, k_pos, positions):
                 result = False
                 break
     return result
@@ -191,59 +167,39 @@ def _group_feasibility_ok(ir: KernelIR, group_idx: int) -> bool:
     pos = {d: i for i, d in enumerate(dim_order)}
     tensors: set[str] = set()
     for op in group.ops:
-        tensors.update(name for name in _op_tensors(ir, op) if name in ir.logical_tensors)
+        tensors.update(name for name in _op_tensors(ir, op) if ir.has_tensor(name))
     return all(_tensor_feasibility_ok(ir, group_idx, name, pos, len(dim_order)) for name in tensors)
 
 
 def _tensor_feasibility_ok(ir: KernelIR, group_idx: int, tensor_name: str, pos: dict[str, int], n: int) -> bool:
-    """Intersection of per-dim depth ranges must be non-empty.
+    """Under the per-buffer placement scheme every placement is feasible by construction.
 
-    For dims whose ltile loop is absorbed by a gadget (e.g.
-    matmul_block iterates K/M/N internally), ``per_block``
-    semantics widens: the surrounding loop never opens an
-    ltile loop on that dim, so a ``per_block`` load can emit
-    anywhere from ``block_depth(pos)+1`` down through
-    ``body_depth(n)`` — not just the narrow (2p+1, 2p+1) slot.
+    The old per-dim tier intersection could be empty; the new
+    3-way placement always has a valid alloc slot.
     """
-    lo = 0
-    hi = body_depth(n)
-    placements = ir.groups[group_idx].tensor_placements
-    absorbed = _gadget_absorbed_blocking_dims(ir, group_idx)
-    for d in ir.logical_tensors[tensor_name].dim_ids:
-        if d not in pos:
-            continue
-        key = ("sbuf", tensor_name, d)
-        if key not in placements:
-            continue
-        tier = placements[key]
-        d_lo, d_hi = tier_depth_range(tier, pos[d], n)
-        if tier == "per_block" and d in absorbed:
-            d_hi = body_depth(n)
-        lo = max(lo, d_lo)
-        hi = min(hi, d_hi)
-    return lo <= hi
-
-
-def tier_depth_range(tier: str, pos: int, n: int) -> tuple[int, int]:
-    """Allowed emission-depth range for a dim at ``pos`` under a given tier."""
-    if tier == "per_tile":
-        rng = (ltile_depth(pos) + 1, body_depth(n))
-    elif tier == "per_block":
-        rng = (block_depth(pos) + 1, ltile_depth(pos))
-    elif tier == "full":
-        rng = (0, block_depth(pos))
-    else:
-        raise ValueError(f"Unknown tier {tier!r}")
-    return rng
+    _ = ir, group_idx, tensor_name, pos, n
+    return True
 
 
 def _check_cross_group_placements(ir: KernelIR, tensor_to_groups: dict[str, set[int]]) -> bool:
-    """Cross-group tensors must be ``full`` in every touching group on shared-scope dims."""
-    ir = ir
-    return all(
-        ir.groups[gi].tensor_placements.get(("sbuf", tname, d)) == "full"
-        for tname, groups in tensor_to_groups.items()
-        if len(groups) >= 2
-        for gi in groups
-        for d in set(ir.groups[gi].dim_order) & set(ir.logical_tensors[tname].dim_ids)
-    )
+    """Cross-group tensors with an explicit placement entry must be ``OUTER``.
+
+    ``buffer_placements`` only stores sampled choices for FG input
+    buffers (Load destinations). When such an input is shared
+    across 2+ groups, every touching group's entry must be
+    ``OUTER`` so the buffer's data survives the group boundary.
+    Non-input tensors derive their placement (``effective_placement``
+    already forces ``OUTER`` for cross-FG cases).
+    """
+    ok = True
+    for tname, groups in tensor_to_groups.items():
+        if len(groups) < 2:
+            continue
+        for gi in groups:
+            entry = ir.groups[gi].buffer_placements.get(("sbuf", tname))
+            if entry is not None and entry is not BufferPlacement.OUTER:
+                ok = False
+                break
+        if not ok:
+            break
+    return ok

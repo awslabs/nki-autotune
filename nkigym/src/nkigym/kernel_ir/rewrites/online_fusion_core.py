@@ -40,7 +40,7 @@ def build_axis_maps(
     locs: dict[str, str] = {}
     tile_limits: dict[str, int] = {}
     for role, tname in role_pairs:
-        dims = ir.logical_tensors[tname].dim_ids
+        dims = ir.tensor_info(tname).dim_ids
         labels = tuple(f"{role}_{i}" for i in range(len(dims)))
         axes[role] = labels
         locs[role] = "sbuf"
@@ -56,7 +56,7 @@ def build_output_axis_maps(
     axes: dict[str, tuple[str, ...]] = {}
     tile_limits: dict[str, int] = {}
     for role, tname in role_pairs:
-        dims = ir.logical_tensors[tname].dim_ids
+        dims = ir.tensor_info(tname).dim_ids
         labels = tuple(f"{role}_{i}" for i in range(len(dims)))
         axes[role] = labels
         for label, dim_id in zip(labels, dims):
@@ -102,11 +102,11 @@ def composite_axis_map(
     axis_map: dict[str, str] = {}
     tile_sizes: dict[str, int] = {}
     for role, tname in inputs:
-        for label, dim_id in zip(composite_cls.OPERAND_AXES[role], ir.logical_tensors[tname].dim_ids):
+        for label, dim_id in zip(composite_cls.OPERAND_AXES[role], ir.tensor_info(tname).dim_ids):
             axis_map[label] = dim_id
             tile_sizes[dim_id] = ir.dimensions[dim_id].physical_tile_size
     for role, tname in outputs:
-        for label, dim_id in zip(composite_cls.OUTPUT_AXES[role], ir.logical_tensors[tname].dim_ids):
+        for label, dim_id in zip(composite_cls.OUTPUT_AXES[role], ir.tensor_info(tname).dim_ids):
             axis_map[label] = dim_id
             tile_sizes[dim_id] = ir.dimensions[dim_id].physical_tile_size
     return axis_map, tile_sizes
@@ -220,7 +220,7 @@ def _build_new_graph(ir: KernelIR, absorbed: set[NKIOp], composite_op: NKIOp, ne
                     ops=surviving_ops,
                     dim_order=list(group.dim_order),
                     buffer_degrees=dict(group.buffer_degrees),
-                    tensor_placements=dict(group.tensor_placements),
+                    buffer_placements=dict(group.buffer_placements),
                 )
             )
     if not inserted:

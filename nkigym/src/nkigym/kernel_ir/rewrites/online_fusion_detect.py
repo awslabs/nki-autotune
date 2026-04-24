@@ -1,15 +1,15 @@
 """Online-fusion pattern detector on ``(KernelIR, KernelIR)``.
 
 Atomic matching: a candidate fires **only** when X and every
-accumulator sharing that X live in adjacent groups after trivial
+accumulator sharing that X live in adjacent groups after loop
 fusion has absorbed the intermediates between them. Walks through
 separable chains are scoped to the accumulator's own group — if
-trivial fusion hasn't pulled an intermediate op into ``acc_gi``,
+loop fusion hasn't pulled an intermediate op into ``acc_gi``,
 the walk exits the group and the match quietly doesn't fire.
 
 The separable-chain walk is NOT a general-purpose "discover what
-trivial fusion would do" engine; it's a scale-role classifier
-constrained to ops trivial fusion already co-grouped.
+loop fusion would do" engine; it's a scale-role classifier
+constrained to ops loop fusion already co-grouped.
 """
 
 from collections import defaultdict
@@ -256,7 +256,7 @@ def _separable_role_via(
     role: str | None = None
     if cls_name == "tensor_scalar" and _literal_op(kwargs.get("op0")) == "multiply":
         operand = kwargs.get("operand0")
-        if operand in ir.logical_tensors:
+        if operand is not None and ir.has_tensor(operand):
             role = _scale_to_x_label(ir, operand, x_outputs, group_of, acc_gi)
     elif cls_name in {"activation", "activation_reduce"} and _literal_op(kwargs.get("op")) == "exp":
         bias = inputs.get("bias")

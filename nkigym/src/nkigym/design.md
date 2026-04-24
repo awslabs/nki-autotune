@@ -14,6 +14,7 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
     sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), p_axis=d0, f_axis=d1, dtype=bfloat16
     sbuf_rhs:   tile=(128, 512), dims=('d0', 'd2'), p_axis=d0, f_axis=d2, dtype=bfloat16
     sbuf_output: tile=(128, 512), dims=('d1', 'd2'), p_axis=d1, f_axis=d2, dtype=bfloat16
+  # Tunable IR knobs
   ops (4):
     [0] NKILoad:
       inputs={'data': 'lhs_T'}, outputs=['sbuf_lhs_T']
@@ -32,7 +33,6 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
       kwargs={'data': 'output'}
       axis_map={}, tile_sizes={}, blocking=[]
   edges: (0, 2), (1, 2), (2, 3)
-  # Tunable IR knobs
   dim_order: [d2, d0, d1]
   ltiles/block:
     d0: 8

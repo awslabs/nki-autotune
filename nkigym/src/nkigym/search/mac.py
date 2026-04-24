@@ -10,7 +10,7 @@ from nkigym.ops.matmul import NKIMatmul
 
 def compute_mac_count(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> int:
     """Total MAC count across every ``NKIMatmul`` op in the pre-rewrite IR."""
-    ir, _graph = build_initial(func, input_specs)
+    ir = build_initial(func, input_specs)
     total = 0
     for op in ir.op_inputs:
         if not isinstance(op, NKIMatmul):

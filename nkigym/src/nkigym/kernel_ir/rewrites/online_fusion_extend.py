@@ -1,7 +1,7 @@
 """Online-fusion extension rewrite.
 
 Takes an existing ``NKIOnlineFusionChain`` composite plus new
-accumulator(s) that trivial fusion has pulled into the same
+accumulator(s) that loop fusion has pulled into the same
 group, and produces a new composite with appended
 ``ACCUMULATOR_SPECS``. The composite's ``SCALE_SPEC`` is inherited
 unchanged — all accumulators in one composite share σ by
@@ -179,7 +179,7 @@ def _extend_inputs(
             if (
                 tname not in produced_internal
                 and tname not in old_input_names
-                and tname in ir.logical_tensors
+                and ir.has_tensor(tname)
                 and tname not in seen
             ):
                 new_external.append(tname)
