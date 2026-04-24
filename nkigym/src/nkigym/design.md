@@ -46,7 +46,7 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
     sbuf_rhs:    {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d0 only
     sbuf_output: {num_p_buffers: None, num_f_buffers: 4}     # rotate on d2 only
   emission_depth:
-    sbuf_lhs_T:  0    # kernel top
+    sbuf_lhs_T:  1    # inside dim_order[0] = i_block_d2
     sbuf_rhs:    1    # inside dim_order[0] = i_block_d2
     sbuf_output: 0    # forced — d2 is outermost rotating
 ```
@@ -169,7 +169,7 @@ num_buffers:
     sbuf_rhs:    {num_p_buffers: 2,    num_f_buffers: None}
     sbuf_output: {num_p_buffers: None, num_f_buffers: 4}
 emission_depth:
-    sbuf_lhs_T:  0        # kernel top
+    sbuf_lhs_T:  1        # inside i_block_d2
     sbuf_rhs:    1        # inside i_block_d2
     sbuf_output: 0        # kernel top
 ```
@@ -179,12 +179,12 @@ Skeleton:
 def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     """depth 0 — kernel top."""
-    sbuf_lhs_T  = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
     sbuf_output = allocate_buffers(128, 16, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=None, num_f_buffers=4)
 
     for i_block_d2 in range(4):
         """depth 1 — inside dim_order[0]."""
-        sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
+        sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
+        sbuf_rhs   = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
 
         for i_block_d0 in range(2):
             """depth 2 — inside dim_order[1]. No allocations here."""
@@ -211,12 +211,15 @@ buffer_scopes:
     sbuf_lhs_T = INNER
 num_buffers:
     sbuf_lhs_T: {num_p_buffers: 2, num_f_buffers: 4}
+emission_depth:
+    sbuf_lhs_T: 1
 ```
 `sbuf_lhs_T` rotates on both axes: 2 slots on its partition axis (d0), 4 on
 its free axis (d1). The return is a 2-level nest indexed as
-`sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]`. `load_block` fires at the
-tightest enclosing loop of the use (`i_block_d1`), right after the slot is
-selected.
+`sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]`. `emission_depth=1` places the
+allocation inside `dim_order[0] = i_block_d2`, above both rotating loops
+(`i_block_d0` and `i_block_d1`). `load_block` fires at the tightest
+enclosing loop of the use (`i_block_d1`), right after the slot is selected.
 ```python
 @nki.jit
 def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
@@ -224,9 +227,8 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
-
     for i_block_d2 in range(d2_num_blocks):
+        sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
         for i_block_d0 in range(d0_num_blocks):
             for i_block_d1 in range(d1_num_blocks):
                 cur_sbuf_lhs_T = sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]
@@ -264,10 +266,9 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
-
     for i_block_d2 in range(4):
-        sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
+        sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
+        sbuf_rhs   = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
         for i_block_d0 in range(2):
             cur_sbuf_rhs = sbuf_rhs[i_block_d0 % 2]
             load_block(cur_sbuf_rhs, rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
@@ -309,11 +310,11 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T  = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
     sbuf_output = allocate_buffers(128, 16, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=None, num_f_buffers=4)
 
     for i_block_d2 in range(4):
-        sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
+        sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
+        sbuf_rhs   = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
         cur_sbuf_output = sbuf_output[i_block_d2 % 4]
         memset_buffers(cur_sbuf_output, 0.0)
         for i_block_d0 in range(2):
@@ -351,11 +352,11 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T  = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
     sbuf_output = allocate_buffers(128, 16, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=None, num_f_buffers=4)
 
     for i_block_d2 in range(4):
-        sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
+        sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
+        sbuf_rhs   = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
         cur_sbuf_output = sbuf_output[i_block_d2 % 4]
         memset_buffers(cur_sbuf_output, 0.0)
         for i_block_d0 in range(2):
