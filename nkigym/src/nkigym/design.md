@@ -40,14 +40,16 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
   buffer_placements:
     sbuf_lhs_T = INNER
     sbuf_rhs = INNER
-  buffer_degrees:
-    (sbuf_lhs_T, d0) = 1
-    (sbuf_lhs_T, d1) = 1
-    (sbuf_rhs, d0) = 1
-    (sbuf_rhs, d2) = 1
 ```
 
 # Code Generation
+
+`buffer_placements` (`OUTER` / `MIDDLE` / `INNER`) controls sizing — how
+many tiles the buffer must span. Where each `allocate_buffers(...)` statement
+is emitted follows a separate **tightest-emission** rule: the allocation is
+placed at the innermost loop that encloses every use of the buffer. The compiler's
+SBUF allocator exploits the tight live ranges.
+
 ## Constants
 ```python
 d0_num_blocks = 16/8 = 2
@@ -72,31 +74,6 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 ```
 
-## Physical Buffers
-Information from IR:
-```
-physical_buffers:
-    sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
-    sbuf_rhs: tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
-dim_order: [d2, d0, d1]
-ltiles/block:
-    d0: 8
-    d1: 4
-    d2: 1
-buffer_placements:
-    sbuf_lhs_T = INNER
-    sbuf_rhs = INNER
-buffer_degrees:
-    (sbuf_lhs_T, d0) = 1
-    (sbuf_lhs_T, d1) = 1
-    (sbuf_rhs, d0) = 1
-    (sbuf_rhs, d2) = 1
-```
-```python
-sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-```
-
 ## Loopnest
 ### Emit op0:
 ```
@@ -115,11 +92,14 @@ ltiles/block:
     d1: 4
 buffer_placements:
     sbuf_lhs_T = INNER
-buffer_degrees:
-    (sbuf_lhs_T, d0) = 1
-    (sbuf_lhs_T, d1) = 1
 ```
-Code generation:
+`sbuf_lhs_T` has dims `(d0, d1)` — its tightest enclosing loop is the
+innermost of `d0`/`d1` in `dim_order`, i.e. `i_block_d1`. Allocate there.
+
+`load_block` fires at the same depth: `NKILoad`'s only operand is the HBM
+tensor `lhs_T` (always available), so the emission site is driven purely by
+the destination buffer. Placing `load_block` right after the allocation keeps
+the load as close to its first use as possible.
 ```python
 @nki.jit
 def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
@@ -127,12 +107,11 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
     for i_block_d2 in range(d2_num_blocks):
         for i_block_d0 in range(d0_num_blocks):
             for i_block_d1 in range(d1_num_blocks):
-                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512)
+                sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, f_tile_size=128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16)
+                load_block(sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
 ```
 
 ### Emit op1:
@@ -152,11 +131,14 @@ ltiles/block:
     d2: 1
 buffer_placements:
     sbuf_rhs = INNER
-buffer_degrees:
-    (sbuf_rhs, d0) = 1
-    (sbuf_rhs, d2) = 1
 ```
-Accumulated code generation:
+`sbuf_rhs` has dims `(d0, d2)` — its tightest enclosing loop is `i_block_d0`
+(innermost of the two in `dim_order`). Allocate there.
+
+`load_block` fires at the same depth: `NKILoad`'s only operand is the HBM
+tensor `rhs` (always available), so the emission site is driven purely by
+the destination buffer. Placing `load_block` right after the allocation keeps
+the load as close to its first use as possible.
 ```python
 @nki.jit
 def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
@@ -164,14 +146,15 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
     for i_block_d2 in range(4):
         for i_block_d0 in range(2):
-            load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512)
+            sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, f_tile_size=512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16)
+            load_block(sbuf_rhs, rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
             for i_block_d1 in range(4):
-                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512)
+                sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, f_tile_size=128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16)
+                load_block(sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
 ```
+
 ### Emit op2:
 ```
 [2] NKIMatmul:
@@ -189,9 +172,16 @@ ltiles/block:
     d2: 1
 ```
 
-Allocate on-demand, always directly outside of accumulation dimension loop, which is `d0` in this case -->
-1. Outside `d1` block: `num_p_tiles=16`
-2. Inside `d2` block: `num_f_tiles=1`
+`sbuf_output` is `NKIMatmul`'s accumulator — it must live directly outside
+the accumulation dim loop so its contents persist across every d0 iteration.
+`d0` sits between `d2` and `d1` in `dim_order`, so `sbuf_output` is allocated
+inside `i_block_d2`, right before `i_block_d0` opens. It must span every d1
+ltile that the d0 reduction feeds, so `num_p_tiles=16` (the full d1 extent).
+
+`matmul_block` fires at the point where all three operands are ready: `sbuf_output`
+exists at `i_block_d2`, `sbuf_rhs` at `i_block_d0`, `sbuf_lhs_T` at `i_block_d1` —
+the innermost of those is `i_block_d1`, right after its `load_block` populates
+`sbuf_lhs_T`. That's the earliest legal depth.
 ```python
 @nki.jit
 def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
@@ -199,44 +189,15 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
     for i_block_d2 in range(4):
-        sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
+        sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, f_tile_size=512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
         for i_block_d0 in range(2):
-            load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512, transpose=False)
+            sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, f_tile_size=512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16)
+            load_block(sbuf_rhs, rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
             for i_block_d1 in range(4):
-                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512, transpose=False)
-```
-
-Information from IR:
-```
-buffer_placements:
-    sbuf_lhs_T = INNER
-    sbuf_rhs = INNER
-ltiles/block:
-    d0: 8
-    d1: 4
-    d2: 1
-```
-
-`matmul_block` call has to happen when all of its operands are available, which is inside `d1` loop, after `load_block(sbuf_lhs_T)`.
-```python
-@nki.jit
-def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
-    assert lhs_T.shape == (2048, 2048)
-    assert rhs.shape == (2048, 2048)
-    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
-
-    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-    for i_block_d2 in range(4):
-        sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
-        for i_block_d0 in range(2):
-            load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512, transpose=False)
-            for i_block_d1 in range(4):
-                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512, transpose=False)
-                matmul_block(sbuf_output[0][i_block_d1*4:i_block_d1*4+4][0], sbuf_lhs_T[0][0:8][0], sbuf_rhs[0][0:8][0])
+                sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, f_tile_size=128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16)
+                load_block(sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
+                matmul_block(sbuf_output[i_block_d1 * 4 : i_block_d1 * 4 + 4], sbuf_lhs_T[0:8], sbuf_rhs[0:8])
 ```
 
 ### Emit op3:
@@ -257,7 +218,9 @@ dimensions:
     d2: role=PARALLEL
 ```
 
-Final store happens after all `sequential`/`accumulation` loops close. `output` carries dims `(d1, d2)`; d0 is the accumulation dim (not in `output`), so the store fires right after the `i_block_d0` loop ends, inside `i_block_d2`. `sbuf_output` carries d1-full across d2-block — write the full `(2048, 512)` strip per `i_block_d2`.
+Final store fires after the accumulation loop (`i_block_d0`) closes. `output`
+carries `(d1, d2)` — d0 is not in output, so store sits inside `i_block_d2`.
+Write the full `(2048, 512)` strip per `i_block_d2`.
 
 ```python
 @nki.jit
@@ -266,14 +229,14 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
     for i_block_d2 in range(4):
-        sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
+        sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, f_tile_size=512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
         for i_block_d0 in range(2):
-            load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512, transpose=False)
+            sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, f_tile_size=512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16)
+            load_block(sbuf_rhs, rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
             for i_block_d1 in range(4):
-                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512, transpose=False)
-                matmul_block(sbuf_output[0][i_block_d1*4:i_block_d1*4+4][0], sbuf_lhs_T[0][0:8][0], sbuf_rhs[0][0:8][0])
-        store_block(output, sbuf_output, 0, 2048, i_block_d2 * 512, 512)
+                sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, f_tile_size=128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16)
+                load_block(sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
+                matmul_block(sbuf_output[i_block_d1 * 4 : i_block_d1 * 4 + 4], sbuf_lhs_T[0:8], sbuf_rhs[0:8])
+        store_block(output[0:2048, i_block_d2 * 512 : i_block_d2 * 512 + 512], sbuf_output)
 ```
