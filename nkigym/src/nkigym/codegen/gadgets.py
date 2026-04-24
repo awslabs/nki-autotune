@@ -121,28 +121,40 @@ def matmul_block(sbuf_out: Any, sbuf_lhs_T: Any, sbuf_rhs: Any) -> None:
             )
 
 
+def memset_buffers(sbuf: Any, value: float) -> None:
+    """Zero every leaf of a buffer list with ``value`` via ``nisa.memset``.
+
+    ``sbuf`` is the flat list of leaves returned by ``allocate_buffers``.
+    """
+    if len(sbuf) == 0:
+        raise ValueError("memset_buffers got empty sbuf")
+    p_tile, f_tile = sbuf[0].shape
+    for leaf in sbuf:
+        nisa.memset(leaf[0:p_tile, 0:f_tile], value)
+
+
 def allocate_buffers(
-    p_tile_size: int,
-    num_p_tiles: int,
-    f_tile_size: int,
-    num_f_tiles: int,
-    loc,
-    dtype,
-    initial_value: float | None = None,
+    p_tile_size: int, num_p_tiles: int, f_tile_size: int, num_f_tiles: int, loc, dtype, num_buffers: int = 1
 ) -> list:
-    """Allocate a list of ``num_p_tiles`` 2D leaves for SBUF / PSUM.
+    """Allocate tile buffers for SBUF / PSUM.
 
     Each leaf is an ``nl.ndarray`` of shape
     ``(p_tile_size, f_tile_size * num_f_tiles)``. ``num_f_tiles`` is
     packed *into* the leaf's free-axis width.
 
-    If ``initial_value`` is given, every leaf is ``nisa.memset`` to it.
+    With ``num_buffers=1`` (default), returns a flat list of
+    ``num_p_tiles`` leaves — a drop-in for ``load_block`` /
+    ``store_block`` / ``matmul_block``.
+
+    With ``num_buffers > 1``, returns a list of ``num_buffers``
+    independent flat-leaf lists. Caller selects one at each use
+    site via ``bufs[iter_var % num_buffers]``. The compiler treats
+    each list as an independent set of live ranges, which enables
+    automatic address rotation and DMA↔compute overlap.
+
+    Call ``memset_buffers`` separately to zero leaves.
     """
     leaf_shape = (p_tile_size, f_tile_size * num_f_tiles)
-    leaves = []
-    for _ in range(num_p_tiles):
-        leaf = nl.ndarray(leaf_shape, dtype=dtype, buffer=loc)
-        if initial_value is not None:
-            nisa.memset(leaf[0 : leaf_shape[0], 0 : leaf_shape[1]], initial_value)
-        leaves.append(leaf)
-    return leaves
+    if num_buffers == 1:
+        return [nl.ndarray(leaf_shape, dtype=dtype, buffer=loc) for _ in range(num_p_tiles)]
+    return [[nl.ndarray(leaf_shape, dtype=dtype, buffer=loc) for _ in range(num_p_tiles)] for _ in range(num_buffers)]
