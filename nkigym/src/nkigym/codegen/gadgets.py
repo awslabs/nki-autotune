@@ -51,18 +51,32 @@ def load_block(sbuf: Any, mem: Any, p_start: int, p_size: int, f_start: int, f_s
                     nisa.dma_copy(dst, mem[p0 : p0 + p_tile, f_start : f_start + f_tile])
 
 
-def store_block(mem: Any, sbuf: Any, p_start: int, p_count: int, f_start: int, f_count: int) -> None:
-    """SBUF → HBM: write the ``[p_start : p_start + p_count][f_start : f_start + f_count]`` sub-block of ``sbuf`` into ``mem``."""
-    p, f = sbuf[0][0].shape
-    op, of = mem.shape
-    if op != p_count * p or of != f_count * f:
+def store_block(mem: Any, sbuf: Any, p_start: int, p_size: int, f_start: int, f_size: int) -> None:
+    """SBUF → HBM: write every leaf of ``sbuf`` into ``mem[p_start:p_start+p_size, f_start:f_start+f_size]``.
+
+    ``sbuf`` is a ``Buffers`` grid indexable as
+    ``sbuf[p_buffer][p_tile][f_buffer]``. The P-axis splits across
+    ``num_p_tiles`` list slots of ``p_tile`` rows each; the F-axis is
+    packed into the leaf's free-axis width ``f_tile``. When multi-buffer
+    dims ``num_p_buffers`` / ``num_f_buffers`` are > 1, only ``pb=0`` /
+    ``fb=0`` is written out (the other slots are redundant copies).
+
+    Required: ``p_size == num_p_tiles * p_tile`` and ``f_size == f_tile``.
+    """
+    num_p_buffers = len(sbuf)
+    num_p_tiles = len(sbuf[0]) if num_p_buffers else 0
+    num_f_buffers = len(sbuf[0][0]) if num_p_tiles else 0
+    if num_p_buffers == 0 or num_p_tiles == 0 or num_f_buffers == 0:
+        raise ValueError(f"store_block got empty sbuf with shape ({num_p_buffers}, {num_p_tiles}, {num_f_buffers})")
+    p_tile, f_tile = sbuf[0][0][0].shape
+    if p_size != num_p_tiles * p_tile or f_size != f_tile:
         raise ValueError(
-            f"store_block shape mismatch: sbuf sub-block ({p_count}, {f_count})x({p}, {f}) "
-            f"covers ({p_count * p}, {f_count * f}), mem {mem.shape}"
+            f"store_block extent mismatch: sbuf covers ({num_p_tiles * p_tile}, {f_tile}) "
+            f"via {num_p_tiles} P-slots of ({p_tile}, {f_tile}), got (p_size, f_size)=({p_size}, {f_size})"
         )
-    for pi in range(p_count):
-        for fi in range(f_count):
-            nisa.dma_copy(mem[pi * p : (pi + 1) * p, fi * f : (fi + 1) * f], sbuf[p_start + pi][f_start + fi][0:p, 0:f])
+    for pt in range(num_p_tiles):
+        p0 = p_start + pt * p_tile
+        nisa.dma_copy(mem[p0 : p0 + p_tile, f_start : f_start + f_tile], sbuf[0][pt][0][0:p_tile, 0:f_tile])
 
 
 def matmul_block(sbuf_out: Any, sbuf_lhs_T: Any, sbuf_rhs: Any) -> None:

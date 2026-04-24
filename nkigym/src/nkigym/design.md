@@ -121,10 +121,18 @@ buffer_degrees:
 ```
 Code generation:
 ```python
-for i_block_d2 in range(d2_num_blocks):
-    for i_block_d0 in range(d0_num_blocks):
-        for i_block_d1 in range(d1_num_blocks):
-            load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512)
+@nki.jit
+def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    for i_block_d2 in range(d2_num_blocks):
+        for i_block_d0 in range(d0_num_blocks):
+            for i_block_d1 in range(d1_num_blocks):
+                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512)
 ```
 
 ### Emit op1:
@@ -150,11 +158,19 @@ buffer_degrees:
 ```
 Accumulated code generation:
 ```python
-for i_block_d2 in range(4):
-    for i_block_d0 in range(2):
-        load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512)
-        for i_block_d1 in range(4):
-            load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512)
+@nki.jit
+def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    for i_block_d2 in range(4):
+        for i_block_d0 in range(2):
+            load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512)
+            for i_block_d1 in range(4):
+                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512)
 ```
 ### Emit op2:
 ```
@@ -177,12 +193,20 @@ Allocate on-demand, always directly outside of accumulation dimension loop, whic
 1. Outside `d1` block: `num_p_tiles=16`
 2. Inside `d2` block: `num_f_tiles=1`
 ```python
-for i_block_d2 in range(4):
-    sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
-    for i_block_d0 in range(2):
-        load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512, transpose=False)
-        for i_block_d1 in range(4):
-            load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512, transpose=False)
+@nki.jit
+def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    for i_block_d2 in range(4):
+        sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
+        for i_block_d0 in range(2):
+            load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512, transpose=False)
+            for i_block_d1 in range(4):
+                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512, transpose=False)
 ```
 
 Information from IR:
@@ -198,13 +222,58 @@ ltiles/block:
 
 `matmul_block` call has to happen when all of its operands are available, which is inside `d1` loop, after `load_block(sbuf_lhs_T)`.
 ```python
-sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
-for i_block_d2 in range(4):
-    sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
-    for i_block_d0 in range(2):
-        load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512, transpose=False)
-        for i_block_d1 in range(4):
-            load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512, transpose=False)
-            matmul_block(sbuf_output[0][i_block_d1*4:i_block_d1*4+4][0], sbuf_lhs_T[0][0:8][0], sbuf_rhs[0][0:8][0])
+@nki.jit
+def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    for i_block_d2 in range(4):
+        sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
+        for i_block_d0 in range(2):
+            load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512, transpose=False)
+            for i_block_d1 in range(4):
+                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512, transpose=False)
+                matmul_block(sbuf_output[0][i_block_d1*4:i_block_d1*4+4][0], sbuf_lhs_T[0][0:8][0], sbuf_rhs[0][0:8][0])
+```
+
+### Emit op3:
+```
+[3] NKIStore:
+      inputs={'data': 'output'}, outputs=['output_hbm']
+      kwargs={'data': 'output'}
+      axis_map={}, tile_sizes={}, blocking=[]
+```
+Information from IR:
+```
+logical_tensors:
+    output: shape=(2048, 2048), dims=('d1', 'd2'), dtype=bfloat16
+dim_order: [d2, d0, d1]
+dimensions:
+    d0: role=ACCUMULATION
+    d1: role=PARALLEL
+    d2: role=PARALLEL
+```
+
+Final store happens after all `sequential`/`accumulation` loops close. `output` carries dims `(d1, d2)`; d0 is the accumulation dim (not in `output`), so the store fires right after the `i_block_d0` loop ends, inside `i_block_d2`. `sbuf_output` carries d1-full across d2-block — write the full `(2048, 512)` strip per `i_block_d2`.
+
+```python
+@nki.jit
+def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=128, num_f_tiles=4, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16)
+    for i_block_d2 in range(4):
+        sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, num_p_buffers=1, f_tile_size=512, num_f_tiles=1, num_f_buffers=1, loc=nl.sbuf, dtype=nl.bfloat16, initial_value=0.0)
+        for i_block_d0 in range(2):
+            load_block(sbuf_rhs, rhs, i_block_d0 * 1024, 1024, i_block_d2 * 512, 512, transpose=False)
+            for i_block_d1 in range(4):
+                load_block(sbuf_lhs_T, lhs_T, i_block_d0 * 1024, 1024, i_block_d1 * 512, 512, transpose=False)
+                matmul_block(sbuf_output[0][i_block_d1*4:i_block_d1*4+4][0], sbuf_lhs_T[0][0:8][0], sbuf_rhs[0][0:8][0])
+        store_block(output, sbuf_output, 0, 2048, i_block_d2 * 512, 512)
 ```
