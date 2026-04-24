@@ -11,9 +11,9 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
     rhs: shape=(2048, 2048), dims=('d0', 'd2'), dtype=bfloat16
     output: shape=(2048, 2048), dims=('d1', 'd2'), dtype=bfloat16
   physical_buffers:
-    sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
-    sbuf_rhs: tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
-    sbuf_output: tile=(128, 512), dims=('d1', 'd2'), dtype=bfloat16
+    sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), p_axis=d0, f_axis=d1, dtype=bfloat16
+    sbuf_rhs:   tile=(128, 512), dims=('d0', 'd2'), p_axis=d0, f_axis=d2, dtype=bfloat16
+    sbuf_output: tile=(128, 512), dims=('d1', 'd2'), p_axis=d1, f_axis=d2, dtype=bfloat16
   ops (4):
     [0] NKILoad:
       inputs={'data': 'lhs_T'}, outputs=['sbuf_lhs_T']
@@ -42,10 +42,35 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
     sbuf_lhs_T = INNER
     sbuf_rhs = INNER
   num_buffers:
-    sbuf_lhs_T: 8
-    sbuf_rhs: 2
-    sbuf_output: 4
+    sbuf_lhs_T:  {num_p_buffers: 2,    num_f_buffers: 4}     # rotate on d0, d1
+    sbuf_rhs:    {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d0 only
+    sbuf_output: {num_p_buffers: None, num_f_buffers: 4}     # rotate on d2 only
+  emission_depth:
+    sbuf_lhs_T:  0    # kernel top
+    sbuf_rhs:    1    # inside dim_order[0] = i_block_d2
+    sbuf_output: 0    # forced — d2 is outermost rotating
 ```
+
+**Sampling ranges** — each tunable knob's valid range in a random-sampling
+autotune loop (constraints on top of these are correctness invariants):
+
+* `dim_order`: permutation of all dims. **`num_dims!` combinations** (6 for
+  3 dims). Some orderings may be rejected by op-specific legality checks (e.g.
+  ACCUMULATION dim placement relative to matmul's output).
+* `ltiles/block[d]`: divisors of `num_ltile[d]`. For `num_ltile=16` → {1, 2,
+  4, 8, 16} (5 choices per dim).
+* `buffer_scopes[B]`: `{OUTER, MIDDLE, INNER}` per buffer (3 choices each,
+  only for Load-destination buffers; accumulator outputs are derived).
+* `num_buffers[B].num_p_buffers`: `None` or `int ≥ 1`. In practice `{None,
+  1, 2, 4, 8, ...}` up to the buffer's partition-axis tile count.
+* `num_buffers[B].num_f_buffers`: same as partition axis but bounded by the
+  free-axis tile count.
+* `emission_depth[B]`: `int` in `[0, outermost_rotating_depth(B, dim_order)]`,
+  where depth 0 = kernel top and depth k = inside the loop for
+  `dim_order[k-1]`. Upper bound is the depth of the outermost rotating loop
+  (i.e. the one whose index feeds multi-buffer rotation). For buffers with
+  `num_buffers = None` this field is unused — allocation sits at the tightest
+  enclosing loop of every use.
 
 # Code Generation
 
@@ -56,16 +81,53 @@ must span one block-tile's worth of data, `MIDDLE` spans the outer dim's block,
 allocation statement is emitted — emission position is controlled by
 `num_buffers` below.
 
-`num_buffers` is the **multi-buffering knob**:
+`num_buffers` is the **multi-buffering knob**, specified per-(buffer, axis)
+using the buffer's partition / free axes:
 
-* `num_buffers = None` → compiler-offload mode. Emit the allocation at the
-  tightest enclosing loop of every use and do not multi-buffer explicitly. The
-  compiler's SBUF allocator sees tight live ranges, packs addresses, and runs
-  its own address-rotation pass for DMA↔compute overlap.
-* `num_buffers = N` (any `int ≥ 1`) → explicit mode. Always emit at **kernel
-  top** and rotate via `bufs[iter_var % N]` at each use. The compiler sees N
-  independent tensor names and pipelines across them. `N=1` is the degenerate
-  case: kernel-top emission, no rotation. Autotune sweeps this knob.
+* `num_buffers = None` (shorthand for the whole buffer being `None`) →
+  compiler-offload mode. Emit the allocation at the tightest enclosing loop
+  of every use and do not multi-buffer explicitly. The compiler's SBUF
+  allocator sees tight live ranges, packs addresses, and runs its own
+  address-rotation pass for DMA↔compute overlap.
+* `num_buffers = {num_p_buffers: P, num_f_buffers: F}` where each of `P`, `F`
+  is `None` (no rotation along that axis) or an `int ≥ 1` (rotate along that
+  axis with `N` physical copies). Caller indexes with one bracket per
+  rotating axis. Autotune sweeps `P` and `F` independently.
+
+### Emission rule
+
+For any buffer with at least one integer axis count, the allocation must be
+emitted **outside every loop whose index feeds the rotation**. The rotation
+uses `i_block_<p_axis>` when `P` is int and/or `i_block_<f_axis>` when `F`
+is int. The allocation is hoisted above all those rotating loops.
+
+The buffer *list* has to persist across iterations so rotation into distinct
+slots is meaningful. If emitted inside a rotating loop, each iteration would
+re-create the list and the compiler would see a single kernel-long live
+range per slot instead of `P × F` rotating slots, defeating the point.
+
+Within the allowed range, `emission_depth` picks the exact placement:
+`0` = kernel top, `k` = inside `dim_order[k-1]`'s body. The upper bound is
+`outermost_rotating_depth(B, dim_order)` — the depth of the outermost loop
+whose index rotates this buffer.
+
+Empirically, this knob matters (sweep on matmul produced 80.45% - 83.36% MFU
+across the 4 combinations of lhs/rhs at kernel-top vs inside `i_block_d2`),
+and should be swept by autotune alongside `num_buffers`.
+
+`allocate_buffers` return shape follows `(num_p_buffers, num_f_buffers)`:
+
+| `num_p_buffers` | `num_f_buffers` | return | indexing |
+|---|---|---|---|
+| `None` | `None` | flat leaf list | `bufs` (drop-in for gadgets) |
+| `P`    | `None` | 1-level nest   | `bufs[p_idx % P]` |
+| `None` | `F`    | 1-level nest   | `bufs[f_idx % F]` |
+| `P`    | `F`    | 2-level nest   | `bufs[p_idx % P][f_idx % F]` |
+
+The P/F axis mapping to kernel dims comes from the buffer's
+`physical_buffers` entry: `p_axis` is the dim laid across partitions,
+`f_axis` is the dim packed into the leaf free-axis. Rotation indices are
+always derived from the corresponding `i_block_<p_axis>` / `i_block_<f_axis>`.
 
 ## Constants
 ```python
@@ -92,24 +154,43 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
 ```
 
 ## Physical Buffers
-`num_buffers` is per-buffer and independent — each buffer can be `None`
-(compiler-managed, inline emission) or a positive integer (kernel-top
-emission with explicit rotation). This section emits only the buffers with
-an integer `num_buffers`. Information from IR:
+Emit the loopnest skeleton from `dim_order`, then at each depth insert
+the allocation for every buffer whose `emission_depth` matches. Buffers
+with `num_buffers = None` are skipped here — they're emitted at each
+op's tightest-enclosing-loop site below. Information from IR:
 ```
 physical_buffers:
-    sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
-    sbuf_rhs: tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
-    sbuf_output: tile=(128, 512), dims=('d1', 'd2'), dtype=bfloat16
+    sbuf_lhs_T:  tile=(128, 128), dims=('d0', 'd1'), p_axis=d0, f_axis=d1
+    sbuf_rhs:    tile=(128, 512), dims=('d0', 'd2'), p_axis=d0, f_axis=d2
+    sbuf_output: tile=(128, 512), dims=('d1', 'd2'), p_axis=d1, f_axis=d2
+dim_order: [d2, d0, d1]
 num_buffers:
-    sbuf_lhs_T: 8
-    sbuf_rhs: 2
-    sbuf_output: 4
+    sbuf_lhs_T:  {num_p_buffers: 2,    num_f_buffers: 4}
+    sbuf_rhs:    {num_p_buffers: 2,    num_f_buffers: None}
+    sbuf_output: {num_p_buffers: None, num_f_buffers: 4}
+emission_depth:
+    sbuf_lhs_T:  0        # kernel top
+    sbuf_rhs:    1        # inside i_block_d2
+    sbuf_output: 0        # kernel top
 ```
+Skeleton:
 ```python
-sbuf_lhs_T = allocate_buffers(p_tile_size=128, num_p_tiles=8, f_tile_size=128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16, num_buffers=8)
-sbuf_rhs = allocate_buffers(p_tile_size=128, num_p_tiles=8, f_tile_size=512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_buffers=2)
-sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, f_tile_size=512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_buffers=4)
+@nki.jit
+def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    """depth 0 — kernel top."""
+    sbuf_lhs_T  = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
+    sbuf_output = allocate_buffers(128, 16, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=None, num_f_buffers=4)
+
+    for i_block_d2 in range(4):
+        """depth 1 — inside dim_order[0]."""
+        sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
+
+        for i_block_d0 in range(2):
+            """depth 2 — inside dim_order[1]. No allocations here."""
+            for i_block_d1 in range(4):
+                """depth 3 — innermost. No allocations here."""
+                pass
 ```
 
 ## Loopnest
@@ -121,7 +202,7 @@ sbuf_output = allocate_buffers(p_tile_size=128, num_p_tiles=16, f_tile_size=512,
 Information from IR:
 ```
 physical_buffers:
-    sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
+    sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), p_axis=d0, f_axis=d1
 dim_order: [d2, d0, d1]
 ltiles/block:
     d0: 8
@@ -129,14 +210,13 @@ ltiles/block:
 buffer_scopes:
     sbuf_lhs_T = INNER
 num_buffers:
-    sbuf_lhs_T: 8
+    sbuf_lhs_T: {num_p_buffers: 2, num_f_buffers: 4}
 ```
-`sbuf_lhs_T`'s tightest enclosing loop is `i_block_d1` (innermost of d0/d1 in
-`dim_order`). With `num_buffers=8`, we rotate at that depth by picking
-`sbuf_lhs_T[(i_block_d0 * 4 + i_block_d1) % 8]`. The modulus combines both
-enclosing loop indices so every `(d0, d1)` pair maps to a distinct physical slot.
-
-`load_block` fires at the same depth as the use, right after the slot is selected.
+`sbuf_lhs_T` rotates on both axes: 2 slots on its partition axis (d0), 4 on
+its free axis (d1). The return is a 2-level nest indexed as
+`sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]`. `load_block` fires at the
+tightest enclosing loop of the use (`i_block_d1`), right after the slot is
+selected.
 ```python
 @nki.jit
 def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
@@ -144,12 +224,12 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_buffers=8)
+    sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
 
     for i_block_d2 in range(d2_num_blocks):
         for i_block_d0 in range(d0_num_blocks):
             for i_block_d1 in range(d1_num_blocks):
-                cur_sbuf_lhs_T = sbuf_lhs_T[(i_block_d0 * 4 + i_block_d1) % 8]
+                cur_sbuf_lhs_T = sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]
                 load_block(cur_sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
 ```
 
@@ -161,7 +241,7 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
 Information from IR:
 ```
 physical_buffers:
-    sbuf_rhs: tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
+    sbuf_rhs: tile=(128, 512), dims=('d0', 'd2'), p_axis=d0, f_axis=d2
 dim_order: [d2, d0, d1]
 ltiles/block:
     d0: 8
@@ -169,11 +249,14 @@ ltiles/block:
 buffer_scopes:
     sbuf_rhs = INNER
 num_buffers:
-    sbuf_rhs: 2
+    sbuf_rhs: {num_p_buffers: 2, num_f_buffers: None}
+emission_depth:
+    sbuf_rhs: 1
 ```
-`sbuf_rhs`'s tightest enclosing loop is `i_block_d0`. Rotation index is
-`i_block_d0 % 2` (the d2 loop already varies the data region loaded, so d2
-doesn't need to factor into the modulus).
+`sbuf_rhs` rotates only on its partition axis (d0); `num_f_buffers=None` so
+the free-axis level collapses. Return is a 1-level nest indexed as
+`sbuf_rhs[i_block_d0 % 2]`. `emission_depth=1` places the allocation inside
+`dim_order[0]` = `i_block_d2`, above the rotating `i_block_d0`.
 ```python
 @nki.jit
 def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
@@ -181,15 +264,15 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_buffers=8)
-    sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_buffers=2)
+    sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
 
     for i_block_d2 in range(4):
+        sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
         for i_block_d0 in range(2):
             cur_sbuf_rhs = sbuf_rhs[i_block_d0 % 2]
             load_block(cur_sbuf_rhs, rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
             for i_block_d1 in range(4):
-                cur_sbuf_lhs_T = sbuf_lhs_T[(i_block_d0 * 4 + i_block_d1) % 8]
+                cur_sbuf_lhs_T = sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]
                 load_block(cur_sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
 ```
 
@@ -202,18 +285,20 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
 Information from IR:
 ```
 physical_buffers:
-    sbuf_output: tile=(128, 512), dims=('d1', 'd2'), dtype=bfloat16
+    sbuf_output: tile=(128, 512), dims=('d1', 'd2'), p_axis=d1, f_axis=d2
 ltiles/block:
     d2: 1
 num_buffers:
-    sbuf_output: 4
+    sbuf_output: {num_p_buffers: None, num_f_buffers: 4}
 ```
 `sbuf_output` is `NKIMatmul`'s accumulator — its scope is derived, not
 chosen: the buffer must be used outside the accumulation loop (`i_block_d0`)
 so contents persist across every d0 iteration, and inside the smallest enclosing
 non-accumulation loop (`i_block_d2`) so it's freshly zeroed per d2-block.
-With `num_buffers=4`, rotate by `i_block_d2 % 4`. `memset_buffers` zeroes the selected slot at the top of each
-d2-iteration.
+`num_p_buffers=None` (no rotation along d1 — matmul writes the full M-block
+into one slot), `num_f_buffers=4` (one slot per d2-iter). Return is a
+1-level nest indexed as `sbuf_output[i_block_d2 % 4]`. `memset_buffers` zeroes
+the selected slot at the top of each d2-iteration.
 
 `matmul_block` fires at the point where all three operands are ready — the
 innermost is `sbuf_lhs_T` inside `i_block_d1`.
@@ -224,18 +309,18 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_buffers=8)
-    sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_buffers=2)
-    sbuf_output = allocate_buffers(128, 16, 512, 1, nl.sbuf, nl.bfloat16, num_buffers=4)
+    sbuf_lhs_T  = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
+    sbuf_output = allocate_buffers(128, 16, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=None, num_f_buffers=4)
 
     for i_block_d2 in range(4):
+        sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
         cur_sbuf_output = sbuf_output[i_block_d2 % 4]
         memset_buffers(cur_sbuf_output, 0.0)
         for i_block_d0 in range(2):
             cur_sbuf_rhs = sbuf_rhs[i_block_d0 % 2]
             load_block(cur_sbuf_rhs, rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
             for i_block_d1 in range(4):
-                cur_sbuf_lhs_T = sbuf_lhs_T[(i_block_d0 * 4 + i_block_d1) % 8]
+                cur_sbuf_lhs_T = sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]
                 load_block(cur_sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
                 matmul_block(cur_sbuf_output[i_block_d1 * 4 : i_block_d1 * 4 + 4], cur_sbuf_lhs_T, cur_sbuf_rhs)
 ```
@@ -266,18 +351,18 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_buffers=8)
-    sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_buffers=2)
-    sbuf_output = allocate_buffers(128, 16, 512, 1, nl.sbuf, nl.bfloat16, num_buffers=4)
+    sbuf_lhs_T  = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
+    sbuf_output = allocate_buffers(128, 16, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=None, num_f_buffers=4)
 
     for i_block_d2 in range(4):
+        sbuf_rhs = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
         cur_sbuf_output = sbuf_output[i_block_d2 % 4]
         memset_buffers(cur_sbuf_output, 0.0)
         for i_block_d0 in range(2):
             cur_sbuf_rhs = sbuf_rhs[i_block_d0 % 2]
             load_block(cur_sbuf_rhs, rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
             for i_block_d1 in range(4):
-                cur_sbuf_lhs_T = sbuf_lhs_T[(i_block_d0 * 4 + i_block_d1) % 8]
+                cur_sbuf_lhs_T = sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]
                 load_block(cur_sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
                 matmul_block(cur_sbuf_output[i_block_d1 * 4 : i_block_d1 * 4 + 4], cur_sbuf_lhs_T, cur_sbuf_rhs)
         store_block(output[0:2048, i_block_d2 * 512 : i_block_d2 * 512 + 512], cur_sbuf_output)

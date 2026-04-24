@@ -134,27 +134,50 @@ def memset_buffers(sbuf: Any, value: float) -> None:
 
 
 def allocate_buffers(
-    p_tile_size: int, num_p_tiles: int, f_tile_size: int, num_f_tiles: int, loc, dtype, num_buffers: int = 1
+    p_tile_size: int,
+    num_p_tiles: int,
+    f_tile_size: int,
+    num_f_tiles: int,
+    loc,
+    dtype,
+    num_p_buffers: int | None,
+    num_f_buffers: int | None,
 ) -> list:
-    """Allocate tile buffers for SBUF / PSUM.
+    """Allocate tile buffers for SBUF / PSUM with per-dim multi-buffering.
 
     Each leaf is an ``nl.ndarray`` of shape
-    ``(p_tile_size, f_tile_size * num_f_tiles)``. ``num_f_tiles`` is
-    packed *into* the leaf's free-axis width.
+    ``(p_tile_size, f_tile_size * num_f_tiles)``. ``num_f_tiles`` is packed
+    *into* the leaf's free-axis width.
 
-    With ``num_buffers=1`` (default), returns a flat list of
-    ``num_p_tiles`` leaves — a drop-in for ``load_block`` /
-    ``store_block`` / ``matmul_block``.
+    ``num_p_buffers`` and ``num_f_buffers`` are both required and describe
+    multi-buffering along the partition and free dims respectively:
 
-    With ``num_buffers > 1``, returns a list of ``num_buffers``
-    independent flat-leaf lists. Caller selects one at each use
-    site via ``bufs[iter_var % num_buffers]``. The compiler treats
-    each list as an independent set of live ranges, which enables
-    automatic address rotation and DMA↔compute overlap.
+      * ``None`` → no rotation along that dim; the dim collapses in the
+        return shape.
+      * ``N`` (int ≥ 1) → ``N`` independent copies at that dim; caller
+        indexes ``bufs[idx % N]`` at the use site.
+
+    Return shape:
+
+      * ``(None, None)`` → flat leaf list ``[leaf, ...]`` of length
+        ``num_p_tiles``. Drop-in for ``load_block`` / ``store_block`` /
+        ``matmul_block``.
+      * ``(P, None)`` → ``bufs[p_buf_idx]`` → leaf list.
+      * ``(None, F)`` → ``bufs[f_buf_idx]`` → leaf list.
+      * ``(P, F)`` → ``bufs[p_buf_idx][f_buf_idx]`` → leaf list.
 
     Call ``memset_buffers`` separately to zero leaves.
     """
     leaf_shape = (p_tile_size, f_tile_size * num_f_tiles)
-    if num_buffers == 1:
-        return [nl.ndarray(leaf_shape, dtype=dtype, buffer=loc) for _ in range(num_p_tiles)]
-    return [[nl.ndarray(leaf_shape, dtype=dtype, buffer=loc) for _ in range(num_p_tiles)] for _ in range(num_buffers)]
+    p_count = 1 if num_p_buffers is None else num_p_buffers
+    f_count = 1 if num_f_buffers is None else num_f_buffers
+    nested = [
+        [[nl.ndarray(leaf_shape, dtype=dtype, buffer=loc) for _ in range(num_p_tiles)] for _ in range(f_count)]
+        for _ in range(p_count)
+    ]
+    result: Any = nested
+    if num_f_buffers is None:
+        result = [row[0] for row in result]
+    if num_p_buffers is None:
+        result = result[0]
+    return result
