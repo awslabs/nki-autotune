@@ -1,19 +1,21 @@
-"""``LoadTranspose`` rewrite — fuse ``NKITranspose`` into its feeding ``NKILoad``.
+"""``LoadTranspose`` rewrite — collapse ``NKILoad → transpose`` into one DMA transpose.
 
-Pattern::
+Pattern (either ``NKITranspose`` or ``NKIDMATranspose`` qualifies —
+both describe the same math; the fused form subsumes either gadget)::
 
-    [i] NKILoad(data=param)  → sbuf_param         (p=dP, f=dF)
-    [j] NKITranspose(data=sbuf_param) → sbuf_param_T  (p=dF, f=dP)
-    ... (any consumer uses sbuf_param_T, not sbuf_param)
+    [i] NKILoad(data=param)               → sbuf_param    (p=dP, f=dF)
+    [j] NKI[DMA]Transpose(data=sbuf_param) → sbuf_param_T (p=dF, f=dP)
 
 Rewrite::
 
-    [i] NKILoad(data=param, attrs={"transpose": True})  → sbuf_param_T
+    [i] NKIDMATranspose(data=param) → sbuf_param_T
 
-The ``transpose=True`` flag tells the renderer to emit
-``load_block(..., transpose=True)``, which dispatches to
-``nisa.dma_transpose`` and performs the HBM→SBUF transposition in one
-DMA instead of a round-trip through a separate Tensor-Engine transpose.
+The fused op reads directly from the HBM parameter and writes the
+transposed result into ``sbuf_param_T``. The renderer lowers it to
+``dma_transpose_block(cur_sbuf_param_T, param[...])`` — exactly one
+HBM→SBUF DMA transpose, same perf as the previous
+``load_block(transpose=True)`` path but with no attribute side-channel
+or dedicated load-transpose codepath.
 
 Guardrails:
 
@@ -29,17 +31,14 @@ from dataclasses import replace
 
 from nkigym.kernel_ir.ir import KernelIR, Op
 
+_TRANSPOSE_KINDS = frozenset({"NKITranspose", "NKIDMATranspose"})
+
 
 class LoadTranspose:
-    """Rewrite: fuse each ``NKITranspose`` into its sole-producer ``NKILoad``."""
+    """Rewrite: replace each ``(NKILoad, transpose)`` pair with one ``NKIDMATranspose``."""
 
     def __call__(self, ir: KernelIR) -> KernelIR:
-        """Apply the fuse-transpose-into-load rewrite to ``ir``.
-
-        Returns a new ``KernelIR`` with the fusion applied to every
-        matching ``(NKILoad, NKITranspose)`` pair. Non-matching ops
-        pass through unchanged.
-        """
+        """Apply the fusion to every matching pair in ``ir``."""
         ops = list(ir.ops)
         physical_buffers = dict(ir.physical_buffers)
         buffer_scopes = dict(ir.buffer_scopes)
@@ -53,15 +52,22 @@ class LoadTranspose:
             load_idx, transpose_idx = match
             load_op = ops[load_idx]
             transpose_op = ops[transpose_idx]
+            hbm_param = load_op.inputs["data"]
             old_sbuf = load_op.outputs[0]
             new_sbuf = transpose_op.outputs[0]
 
-            """Update the load: dst becomes the transpose's output buffer,
-            and set the transpose flag so the renderer fires dma_transpose."""
-            new_attrs = dict(load_op.attrs)
-            new_attrs["transpose"] = True
-            ops[load_idx] = replace(load_op, outputs=[new_sbuf], attrs=new_attrs)
-            """Drop the NKITranspose op entirely."""
+            """Replace the load op with a fused NKIDMATranspose reading
+            directly from the HBM parameter."""
+            ops[load_idx] = replace(
+                load_op,
+                kind="NKIDMATranspose",
+                inputs={"data": hbm_param},
+                outputs=[new_sbuf],
+                axis_map=dict(transpose_op.axis_map),
+                blocking_dims=set(transpose_op.blocking_dims),
+                attrs=dict(transpose_op.attrs),
+            )
+            """Drop the separate transpose op."""
             ops.pop(transpose_idx)
 
             """Retire the now-unused intermediate buffer and re-key any
@@ -93,12 +99,11 @@ class LoadTranspose:
 def _find_load_transpose_pair(ops: list[Op]) -> tuple[int, int] | None:
     """Return ``(load_idx, transpose_idx)`` for the first fusable pair, or ``None``.
 
-    Fusable means: a ``NKITranspose`` whose input sbuf is the sole
-    output of a ``NKILoad`` op, and that sbuf has no other consumers
-    anywhere in ``ops``.
+    Fusable means: a transpose op whose input sbuf is the sole output
+    of an ``NKILoad``, and that sbuf has no other consumers.
     """
     for j, op in enumerate(ops):
-        if op.kind != "NKITranspose":
+        if op.kind not in _TRANSPOSE_KINDS:
             continue
         src_buffer = op.inputs.get("data")
         if src_buffer is None:

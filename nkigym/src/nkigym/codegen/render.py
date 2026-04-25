@@ -23,6 +23,7 @@ from nkigym.kernel_ir.types import DimRole
 _GADGETS_IMPORT = (
     "from nkigym.codegen.gadgets import (\n"
     "    allocate_buffers,\n"
+    "    dma_transpose_block,\n"
     "    load_block,\n"
     "    matmul_block,\n"
     "    memset_buffers,\n"
@@ -192,32 +193,40 @@ def _find_matmul_op(ir: KernelIR) -> Op:
     raise ValueError("KernelIR has no NKIMatmul op")
 
 
+_TRANSPOSE_GADGETS: dict[str, str] = {"NKITranspose": "transpose_block", "NKIDMATranspose": "dma_transpose_block"}
+
+
 def _emit_compute_ops(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc]) -> None:
     """Emit every non-Load/non-Store op at the innermost loop body.
 
     Walks ``ir.ops`` in list order (producer before consumer thanks to
     topological construction in ``build_ir``). Dispatches by kind.
+    Fused HBM-sourced ``NKIDMATranspose`` ops are emitted by
+    ``_emit_loads_at_depth`` instead — skipped here.
     """
     for op in ir.ops:
-        if op.kind == "NKITranspose":
-            _emit_transpose(w, ir, allocs, op)
+        if op.kind in _TRANSPOSE_GADGETS:
+            if op.kind == "NKIDMATranspose" and op.inputs["data"] in ir.param_names:
+                continue
+            _emit_transpose(w, ir, allocs, op, _TRANSPOSE_GADGETS[op.kind])
         elif op.kind == "NKIMatmul":
             _emit_matmul(w, ir, allocs, op)
 
 
-def _emit_transpose(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
-    """Emit ``cur_<dst> = <dst>[rotation]; transpose_block(cur_dst, cur_src)``.
+def _emit_transpose(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op, gadget: str) -> None:
+    """Emit ``cur_<dst> = <dst>[rotation]; <gadget>(cur_dst, cur_src)``.
 
     Both operands live at the tightest enclosing loop (same rotation
     discipline as loads). The source's ``cur_<name>`` was bound earlier
-    when its load fired.
+    when its load fired. ``gadget`` is the gadget name to call —
+    ``transpose_block`` for TE-engine, ``dma_transpose_block`` for DMA.
     """
     src = op.inputs["data"]
     dst = op.outputs[0]
     dst_info = allocs[dst]
     cur_dst = _cur_name(dst)
     w.line(f"{cur_dst} = {dst}{_rotation_index(dst_info)}")
-    w.line(f"transpose_block({cur_dst}, {_cur_name(src)})")
+    w.line(f"{gadget}({cur_dst}, {_cur_name(src)})")
 
 
 """────────────────────────────────────────────────────────────────
@@ -435,21 +444,27 @@ Load emission
 
 
 def _emit_loads_at_depth(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], depth: int) -> None:
-    """Emit every ``NKILoad`` whose destination buffer wants to appear here.
+    """Emit every HBM-sourced op whose destination buffer wants to appear here.
 
-    A load fires at the depth equal to the number of its destination
-    buffer's *rotating* block axes that appear first in ``dim_order``,
-    counting outermost-first. For ``INNER`` (the default in the design
-    doc) that's the same as the full set of dims the buffer varies on.
+    That's ``NKILoad`` always, plus ``NKIDMATranspose`` ops whose
+    ``data`` input is a kernel parameter (HBM tensor) — i.e. fused
+    load-transposes. Each fires at the depth equal to ``1 +`` the
+    deepest ``dim_order`` position of any of its destination buffer's
+    rotating block axes.
     """
     for op in ir.ops:
-        if op.kind != "NKILoad":
+        is_plain_load = op.kind == "NKILoad"
+        is_fused_dma_transpose = op.kind == "NKIDMATranspose" and op.inputs.get("data") in ir.param_names
+        if not (is_plain_load or is_fused_dma_transpose):
             continue
         dst_name = op.outputs[0]
         info = allocs[dst_name]
         if _load_emission_depth(ir, info) != depth:
             continue
-        _emit_load(w, ir, op, info)
+        if is_plain_load:
+            _emit_load(w, ir, op, info)
+        else:
+            _emit_hbm_dma_transpose(w, ir, op, info)
 
 
 def _load_emission_depth(ir: KernelIR, info: _BufAlloc) -> int:
@@ -488,29 +503,38 @@ def _block_indexed_axes(ir: KernelIR, info: _BufAlloc) -> list[str]:
 
 
 def _emit_load(w: _Writer, ir: KernelIR, op: Op, info: _BufAlloc) -> None:
-    """Emit ``cur_<dst> = <dst>[...]`` + ``load_block(cur_<dst>, src[...], transpose=...)``.
+    """Emit ``cur_<dst> = <dst>[...]`` + ``load_block(cur_<dst>, src[...])``."""
+    dst = op.outputs[0]
+    src = op.inputs["data"]
+    cur = _cur_name(dst)
+    w.line(f"{cur} = {dst}{_rotation_index(info)}")
+    w.line(f"load_block({cur}, {_hbm_slice_expr(ir, src, info)})")
 
-    ``op.attrs["transpose"]`` (installed by ``LoadTranspose``) flips the
-    HBM slice's axis order so ``load_block`` sees
-    ``(f_tile*num_f_tiles, num_p_tiles*p_tile)`` — matching the
-    ``dma_transpose`` contract.
+
+def _emit_hbm_dma_transpose(w: _Writer, ir: KernelIR, op: Op, info: _BufAlloc) -> None:
+    """Emit ``cur_<dst> = <dst>[...]; dma_transpose_block(cur_<dst>, src[...])``.
+
+    Fires for ``NKIDMATranspose`` ops whose ``data`` input is an HBM
+    parameter (installed by the ``LoadTranspose`` rewrite). The HBM
+    slice is ordered ``(f_axis_of_dst, p_axis_of_dst)`` — i.e. swapped
+    vs the src tensor's declared dims — to match the DMA-transpose
+    shape contract.
     """
     dst = op.outputs[0]
     src = op.inputs["data"]
     cur = _cur_name(dst)
-    transpose = bool(op.attrs.get("transpose", False))
     w.line(f"{cur} = {dst}{_rotation_index(info)}")
-    w.line(f"load_block({cur}, {_hbm_slice_expr(ir, src, info, transpose)}, transpose={transpose})")
+    w.line(f"dma_transpose_block({cur}, {_hbm_slice_expr(ir, src, info, transpose=True)})")
 
 
-def _hbm_slice_expr(ir: KernelIR, src: str, info: _BufAlloc, transpose: bool) -> str:
-    """Build ``src[<slices>]`` with axis order matching ``load_block``'s expectations.
+def _hbm_slice_expr(ir: KernelIR, src: str, info: _BufAlloc, transpose: bool = False) -> str:
+    """Build ``src[<slices>]`` matching the receiving gadget's shape contract.
 
-    For non-transpose loads, slices follow the src tensor's own dim
-    order. For transpose loads, the sbuf's ``(p_axis, f_axis)`` are
-    swapped relative to ``src`` — the HBM slice must be ordered as
-    ``(f_axis, p_axis)`` of the *destination* sbuf to match the
-    ``(f_tile, num_p_tiles*p_tile)`` shape contract.
+    For plain loads, slices follow the src tensor's own dim order.
+    For ``transpose=True`` (DMA transpose from HBM), the destination
+    sbuf's ``(p_axis, f_axis)`` are swapped relative to ``src`` — the
+    slice must be ordered ``(f_axis_of_dst, p_axis_of_dst)`` to yield
+    a ``(f_tile*num_f_tiles, num_p_tiles*p_tile)`` region.
     """
     src_dims = ir.logical_tensors[src].dim_ids
     if transpose:

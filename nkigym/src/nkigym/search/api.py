@@ -125,20 +125,35 @@ def _format_ir(ir: KernelIR) -> str:
     return "\n".join(lines) + "\n"
 
 
+_GADGETS_PREAMBLE = "from typing import Any\n\nimport nki.isa as nisa\nimport nki.language as nl\n"
+
+
 def _inline_gadgets(kernel_src: str) -> str:
-    """Prepend gadgets.py so the emitted source is self-contained for workers."""
-    gadgets_src = Path(_gadgets.__file__).read_text()
-    gadgets_import_block = (
-        "from nkigym.codegen.gadgets import (\n"
-        "    allocate_buffers,\n"
-        "    load_block,\n"
-        "    matmul_block,\n"
-        "    memset_buffers,\n"
-        "    store_block,\n"
-        "    transpose_block,\n"
-        ")"
-    )
-    return gadgets_src + "\n\n" + kernel_src.replace(gadgets_import_block, "")
+    """Prepend every gadget's source so the emitted kernel is self-contained.
+
+    Walks ``nkigym.codegen.gadgets.__all__`` and inlines each function's
+    source via ``inspect.getsource``. Gadgets re-exported from
+    ``nkigym.ops.*`` contribute their source from their home module.
+    The kernel's own ``from nkigym.codegen.gadgets import (...)`` block
+    is stripped since the definitions are now inline.
+    """
+    fn_sources: list[str] = []
+    for name in _gadgets.__all__:
+        fn_sources.append(inspect.getsource(getattr(_gadgets, name)))
+    bundle = _GADGETS_PREAMBLE + "\n\n" + "\n\n".join(fn_sources) + "\n\n"
+    """Strip the kernel-side gadgets import block (any form)."""
+    stripped: list[str] = []
+    in_import = False
+    for line in kernel_src.splitlines():
+        if line.startswith("from nkigym.codegen.gadgets import ("):
+            in_import = True
+            continue
+        if in_import:
+            if line.strip().startswith(")"):
+                in_import = False
+            continue
+        stripped.append(line)
+    return bundle + "\n".join(stripped) + "\n"
 
 
 def _func_source_with_imports(func: Callable[..., np.ndarray]) -> str:

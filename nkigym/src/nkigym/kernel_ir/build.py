@@ -27,6 +27,8 @@ from nkigym.kernel_ir.ir import KernelIR, Op, PhysicalBuffer
 from nkigym.kernel_ir.parse import find_ops
 from nkigym.kernel_ir.types import DimInfo, DimRole, TensorInfo
 from nkigym.ops.base import NKIOp
+from nkigym.ops.load import NKILoad
+from nkigym.ops.store import NKIStore
 
 
 @dataclass
@@ -202,7 +204,7 @@ def _build_ops(
     """Assemble the final ops list: NKILoad header + math ops + NKIStore tail."""
     ops: list[Op] = []
     for p in param_names:
-        ops.append(Op(kind="NKILoad", inputs={"data": p}, outputs=[f"sbuf_{p}"]))
+        ops.append(Op(kind=NKILoad.__name__, inputs={"data": p}, outputs=[f"sbuf_{p}"]))
 
     for (op_cls, name_kwargs, output_names), axis_map, blocking in zip(parsed, per_op_axis_maps, per_op_blocking):
         inputs: dict[str, str] = {
@@ -222,7 +224,7 @@ def _build_ops(
             )
         )
 
-    ops.append(Op(kind="NKIStore", inputs={"data": f"sbuf_{return_name}"}, outputs=[f"hbm_{return_name}"]))
+    ops.append(Op(kind=NKIStore.__name__, inputs={"data": f"sbuf_{return_name}"}, outputs=[f"hbm_{return_name}"]))
     return ops
 
 

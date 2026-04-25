@@ -8,6 +8,10 @@ Two variants share the same math function and tuned knobs:
    ``lhs`` load, producing one ``nisa.dma_transpose`` per leaf and
    dropping the intermediate ``sbuf_lhs`` buffer.
 
+A third entry ships the plain-numpy equivalent through nkipy +
+neuronx-cc (``baremetal_jit``'s path) as the zero-NKI reference
+baseline.
+
 Usage::
 
     source ~/venvs/kernel-env/bin/activate
@@ -17,11 +21,15 @@ Usage::
 import shutil
 from pathlib import Path
 
+import numpy as np
+
+from autotune.runner.remote import remote_numpy_baseline
 from nkigym.kernel_ir import BufferScope, KernelIR, NumBuffers, build_ir
 from nkigym.kernel_ir.rewrites import LoadTranspose
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
 from nkigym.search import remote_run
+from nkigym.search.mac import compute_mac_count
 
 
 def matmul_lhs_rhs_nkigym(lhs, rhs):
@@ -29,6 +37,11 @@ def matmul_lhs_rhs_nkigym(lhs, rhs):
     lhs_T = NKITranspose()(data=lhs)
     output = NKIMatmul()(stationary=lhs_T, moving=rhs)
     return output
+
+
+def matmul_lhs_rhs_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Plain-numpy equivalent for the nkipy baremetal_jit baseline."""
+    return lhs @ rhs
 
 
 def build_tuned_ir(input_specs: dict[str, tuple[tuple[int, ...], str]], fuse_load_transpose: bool) -> KernelIR:
@@ -79,3 +92,13 @@ if __name__ == "__main__":
         )
         for r in output.results:
             print(f"{r.kernel_name}: sim={r.cpu_sim.get('passed')}  min_ms={r.min_ms}  MFU={r.mfu}")
+
+    mac_count = compute_mac_count(matmul_lhs_rhs_nkigym, INPUT_SPECS)
+    baseline = remote_numpy_baseline(
+        func=matmul_lhs_rhs_numpy,
+        input_specs=INPUT_SPECS,
+        mac_count=mac_count,
+        host=HOSTS[0],
+        kernel_name="nkipy_baseline",
+    )
+    print(f"{baseline.kernel_name}: min_ms={baseline.min_ms}  MFU={baseline.mfu}  ({baseline.hardware_output})")
