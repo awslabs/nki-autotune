@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from autotune.runner.api import remote_profile
+from autotune.runner.remote import remote_numpy_baseline
 from autotune.runner.types import KernelJob
 from nkigym.codegen import render_ir
 from nkigym.kernel_ir import build_ir
@@ -65,7 +66,7 @@ if __name__ == "__main__":
     nkigym_source = func_source_with_imports(matmul_lhs_rhs_nkigym)
     output_shape = tuple(base_ir.logical_tensors[base_ir.return_name].shape)
 
-    num_samples = 10
+    num_samples = 100
     seen: set[tuple] = set()
     kernels: dict[str, KernelJob] = {}
     for variant, ir in [("base", base_ir), ("fused", fused_ir)]:
@@ -93,12 +94,11 @@ if __name__ == "__main__":
 
     output = remote_profile(kernels=kernels, hosts=HOSTS, cache_dir=str(CACHE_ROOT))
 
-    # mac_count = compute_mac_count(matmul_lhs_rhs_nkigym, INPUT_SPECS)
-    # baseline = remote_numpy_baseline(
-    #     func=matmul_lhs_rhs_numpy,
-    #     input_specs=INPUT_SPECS,
-    #     mac_count=mac_count,
-    #     host=HOSTS[0],
-    #     kernel_name="nkipy_baseline",
-    # )
-    # print(f"{baseline.kernel_name}: min_ms={baseline.min_ms}  MFU={baseline.mfu}  ({baseline.hardware_output})")
+    baseline = remote_numpy_baseline(
+        func=matmul_lhs_rhs_numpy,
+        input_specs=INPUT_SPECS,
+        mac_count=mac_count,
+        host=HOSTS[0],
+        kernel_name="nkipy_baseline",
+    )
+    print(f"{baseline.kernel_name}: min_ms={baseline.min_ms}  MFU={baseline.mfu}")
