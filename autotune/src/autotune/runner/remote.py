@@ -278,7 +278,7 @@ def _write_results_json(
 ) -> None:
     """Write results.json with metrics and per-kernel data."""
     successes: list[tuple[ProfileResult, float, float]] = []
-    passed_cpu_sim = success = sbuf_oom = 0
+    passed_cpu_sim = success = sbuf_oom = psum_oom = 0
     for r in results:
         sim_ok = bool(r.cpu_sim.get("passed"))
         hw_ok = r.min_ms is not None and r.mfu is not None
@@ -290,6 +290,8 @@ def _write_results_json(
             success += 1
         if not hw_ok and "Out of memory in sbuf" in r.hardware_output:
             sbuf_oom += 1
+        if not hw_ok and "Out of memory in psum" in r.hardware_output:
+            psum_oom += 1
     times = [t for _, t, _ in successes]
     mfus = [m for _, _, m in successes]
     roofline_effs = [r.roofline_efficiency for r, _, _ in successes if r.roofline_efficiency is not None]
@@ -321,6 +323,7 @@ def _write_results_json(
             "passed_cpu_sim": passed_cpu_sim,
             "success": success,
             "sbuf_oom": sbuf_oom,
+            "psum_oom": psum_oom,
         },
         "kernels": kernel_entries,
     }
