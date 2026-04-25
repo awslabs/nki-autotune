@@ -135,6 +135,7 @@ def _inline_gadgets(kernel_src: str) -> str:
         "    matmul_block,\n"
         "    memset_buffers,\n"
         "    store_block,\n"
+        "    transpose_block,\n"
         ")"
     )
     return gadgets_src + "\n\n" + kernel_src.replace(gadgets_import_block, "")

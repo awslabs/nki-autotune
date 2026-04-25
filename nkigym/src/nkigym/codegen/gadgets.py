@@ -112,6 +112,30 @@ def matmul_block(sbuf_out: Any, sbuf_lhs_T: Any, sbuf_rhs: Any) -> None:
             )
 
 
+def transpose_block(sbuf_dst: Any, sbuf_src: Any) -> None:
+    """SBUF→SBUF transpose via ``nisa.nc_transpose`` (Tensor Engine).
+
+    ``sbuf_src`` is ``num_m_tiles`` leaves of shape
+    ``(p_tile, num_k_tiles * p_tile)`` with the packed free axis
+    holding K-tiles. ``sbuf_dst`` is ``num_k_tiles`` leaves of shape
+    ``(p_tile, num_m_tiles * p_tile)`` with the packed free axis
+    holding M-tiles.
+
+    Tensor Engine ``nc_transpose`` writes to PSUM, so each ``(ki, mi)``
+    pair stages through a ``(p_tile, p_tile)`` PSUM tile, then copies
+    to its slot in ``sbuf_dst``.
+    """
+    p_tile = sbuf_src[0].shape[0]
+    num_m_tiles = len(sbuf_src)
+    num_k_tiles = len(sbuf_dst)
+    dtype = sbuf_dst[0].dtype
+    for ki in range(num_k_tiles):
+        for mi in range(num_m_tiles):
+            psum_tile = nl.ndarray((p_tile, p_tile), dtype=dtype, buffer=nl.psum)
+            nisa.nc_transpose(psum_tile[0:p_tile, 0:p_tile], sbuf_src[mi][0:p_tile, ki * p_tile : (ki + 1) * p_tile])
+            nisa.tensor_copy(sbuf_dst[ki][0:p_tile, mi * p_tile : (mi + 1) * p_tile], psum_tile[0:p_tile, 0:p_tile])
+
+
 def memset_buffers(sbuf: Any, value: float) -> None:
     """Zero every leaf of a buffer list with ``value`` via ``nisa.memset``."""
     if len(sbuf) == 0:

@@ -27,6 +27,7 @@ _GADGETS_IMPORT = (
     "    matmul_block,\n"
     "    memset_buffers,\n"
     "    store_block,\n"
+    "    transpose_block,\n"
     ")"
 )
 
@@ -149,7 +150,7 @@ def _emit_loop_nest(
     * On the way out of every ACCUMULATION loop, fire the store.
     """
     if dim_idx == len(ir.dim_order):
-        _emit_matmul(w, ir, allocs, matmul_op)
+        _emit_compute_ops(w, ir, allocs)
         return
 
     dim = ir.dim_order[dim_idx]
@@ -166,7 +167,8 @@ def _emit_loop_nest(
     """Store placement: fire after the innermost ACCUMULATION loop closes."""
     dim_role = ir.dimensions[dim].role
     if dim_role is DimRole.ACCUMULATION and _is_innermost_acc_dim(ir, dim):
-        _emit_store(w, ir, allocs, store_op, matmul_op)
+        open_loops = ir.dim_order[:dim_idx]
+        _emit_store(w, ir, allocs, store_op, matmul_op, open_loops)
 
 
 def _is_innermost_acc_dim(ir: KernelIR, dim: str) -> bool:
@@ -188,6 +190,34 @@ def _find_matmul_op(ir: KernelIR) -> Op:
         if op.kind == "NKIMatmul":
             return op
     raise ValueError("KernelIR has no NKIMatmul op")
+
+
+def _emit_compute_ops(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc]) -> None:
+    """Emit every non-Load/non-Store op at the innermost loop body.
+
+    Walks ``ir.ops`` in list order (producer before consumer thanks to
+    topological construction in ``build_ir``). Dispatches by kind.
+    """
+    for op in ir.ops:
+        if op.kind == "NKITranspose":
+            _emit_transpose(w, ir, allocs, op)
+        elif op.kind == "NKIMatmul":
+            _emit_matmul(w, ir, allocs, op)
+
+
+def _emit_transpose(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
+    """Emit ``cur_<dst> = <dst>[rotation]; transpose_block(cur_dst, cur_src)``.
+
+    Both operands live at the tightest enclosing loop (same rotation
+    discipline as loads). The source's ``cur_<name>`` was bound earlier
+    when its load fired.
+    """
+    src = op.inputs["data"]
+    dst = op.outputs[0]
+    dst_info = allocs[dst]
+    cur_dst = _cur_name(dst)
+    w.line(f"{cur_dst} = {dst}{_rotation_index(dst_info)}")
+    w.line(f"transpose_block({cur_dst}, {_cur_name(src)})")
 
 
 """────────────────────────────────────────────────────────────────
@@ -213,11 +243,12 @@ def _resolve_allocations(ir: KernelIR) -> dict[str, _BufAlloc]:
     for name, buf in ir.physical_buffers.items():
         if name.startswith("hbm_"):
             continue
-        if name in acc_out_names:
+        if name in ir.buffer_scopes:
+            p_tile, num_p, f_tile, num_f = _scope_extents(ir, buf, ir.buffer_scopes[name])
+        elif name in acc_out_names:
             p_tile, num_p, f_tile, num_f = _accumulator_extents(ir, buf, matmul_op)
         else:
-            scope = ir.buffer_scopes.get(name, BufferScope.INNER)
-            p_tile, num_p, f_tile, num_f = _scope_extents(ir, buf, scope)
+            p_tile, num_p, f_tile, num_f = _scope_extents(ir, buf, BufferScope.INNER)
         result[name] = _BufAlloc(
             name=name,
             buf=buf,
@@ -343,29 +374,43 @@ def _maybe_emit_accumulator_prologue(
     w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], matmul_op: Op, depth: int
 ) -> None:
     """Emit ``cur_<acc> = <acc>[...]; memset_buffers(cur_<acc>, 0.0)``
-    at the depth immediately enclosing the first ACCUMULATION loop.
+    at the depth where the accumulator's rotation slot first resolves.
 
-    The matmul output buffer rotates on any dim that lies *above* the
-    ACC dim; the ``cur_<name>`` expression selects that rotation slot.
+    Fires just inside the deepest non-ACC loop whose index appears in
+    the accumulator's rotation (i.e. the slot is stable from here down
+    through every ACC iteration). If the accumulator has no non-ACC
+    rotation and no ACC-rotation either, it fires at depth 0.
     """
-    if depth != _accumulator_prologue_depth(ir, matmul_op):
-        return
     out_name = matmul_op.outputs[0]
     info = allocs[out_name]
+    if depth != _accumulator_prologue_depth(ir, matmul_op, info):
+        return
     cur = _cur_name(out_name)
     w.line(f"{cur} = {out_name}{_rotation_index(info)}")
     w.line(f"memset_buffers({cur}, 0.0)")
 
 
-def _accumulator_prologue_depth(ir: KernelIR, matmul_op: Op) -> int:
-    """Depth immediately above the first ACCUMULATION loop.
+def _accumulator_prologue_depth(ir: KernelIR, matmul_op: Op, info: "_BufAlloc") -> int:
+    """Depth where the accumulator's ``cur_<name>`` slot binding fires.
 
-    Depth 0 = kernel top; depth k = inside ``dim_order[k-1]``.
+    Equal to ``1 + max(dim_order.index(d))`` over non-ACC rotation axes
+    of the accumulator. If the accumulator doesn't rotate on any
+    non-ACC dim, falls back to the depth just above the first ACC loop.
     """
+    rot_dims: list[str] = []
+    nb = info.num_buffers
+    if nb.num_p_buffers is not None:
+        rot_dims.append(info.buf.p_axis)
+    if nb.num_f_buffers is not None and info.buf.f_axis is not None:
+        rot_dims.append(info.buf.f_axis)
+    non_acc_rot = [d for d in rot_dims if ir.dimensions[d].role is not DimRole.ACCUMULATION]
+    if non_acc_rot:
+        return 1 + max(ir.dim_order.index(d) for d in non_acc_rot if d in ir.dim_order)
     for i, d in enumerate(ir.dim_order):
         if ir.dimensions[d].role is DimRole.ACCUMULATION:
             return i
-    return len(ir.dim_order)
+    _ = matmul_op
+    return 0
 
 
 def _rotation_index(info: _BufAlloc) -> str:
@@ -532,33 +577,46 @@ Store emission
 ────────────────────────────────────────────────────────────────"""
 
 
-def _emit_store(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], store_op: Op, matmul_op: Op) -> None:
-    """Emit ``store_block(hbm[<slice>], cur_<sbuf_output>)``.
+def _emit_store(
+    w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], store_op: Op, matmul_op: Op, open_loops: list[str]
+) -> None:
+    """Emit ``store_block(hbm[<slice>], <sbuf_expr>)``.
 
     Store placement rule: fire after all SEQUENTIAL/ACCUMULATION loops
     of the producer's sbuf data are done. For matmul-output sbuf that
     means emitting the store when the innermost ACC loop closes.
 
-    The HBM slice covers the accumulator's current output block — full
-    extent on axes the accumulator spans, per-block on axes it doesn't.
+    Only ``open_loops`` (the loops still in scope at the store point)
+    contribute block-indexed slices. For HBM dims that are block-indexed
+    we use ``block_extent(d)``; for everything else we emit the full span.
+
+    Same indexing applies to the sbuf source: if the accumulator buffer
+    is wider than one block along an open-loop dim, slice it per block.
     """
     sbuf_name = store_op.inputs["data"]
     hbm_name = store_op.outputs[0]
     info = allocs[sbuf_name]
     hbm = ir.physical_buffers[hbm_name]
-
-    slices: list[str] = []
-    for d in hbm.dim_ids:
-        if d == info.buf.p_axis:
-            extent = info.p_tile * info.num_p_tiles
-        elif d == info.buf.f_axis:
-            extent = info.f_tile * info.num_f_tiles
-        else:
-            extent = ir.dimensions[d].dim_size
-        full = ir.dimensions[d].dim_size
-        if extent >= full or d not in ir.dim_order:
-            slices.append(f"0:{full}")
-        else:
-            slices.append(f"i_block_{d} * {extent} : i_block_{d} * {extent} + {extent}")
     _ = matmul_op
-    w.line(f"store_block({hbm_name}[{', '.join(slices)}], {_cur_name(sbuf_name)})")
+
+    hbm_slices: list[str] = []
+    for d in hbm.dim_ids:
+        full = ir.dimensions[d].dim_size
+        if d in open_loops:
+            extent = ir.block_extent(d)
+            hbm_slices.append(f"i_block_{d} * {extent} : i_block_{d} * {extent} + {extent}")
+        else:
+            hbm_slices.append(f"0:{full}")
+
+    sbuf_expr = _cur_name(sbuf_name)
+    p_axis = info.buf.p_axis
+    f_axis = info.buf.f_axis
+    if p_axis in open_loops and info.num_p_tiles > ir.ltiles_per_block[p_axis]:
+        lt = ir.ltiles_per_block[p_axis]
+        sbuf_expr = f"{sbuf_expr}[i_block_{p_axis} * {lt} : i_block_{p_axis} * {lt} + {lt}]"
+    elif f_axis is not None and f_axis in open_loops and info.num_f_tiles > ir.ltiles_per_block[f_axis]:
+        """Free-axis per-block slicing — rare; included for completeness."""
+        lt = ir.ltiles_per_block[f_axis]
+        sbuf_expr = f"{sbuf_expr}[:, i_block_{f_axis} * {lt} : i_block_{f_axis} * {lt} + {lt}]"
+
+    w.line(f"store_block({hbm_name}[{', '.join(hbm_slices)}], {sbuf_expr})")

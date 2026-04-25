@@ -120,8 +120,8 @@ num_p_buffers = 2
 num_f_buffers = 4
 
 """Derived from IR"""
-num_p_tiles = d0_ltiles_per_block # Because INNER d0
-num_f_tiles = d1_ltiles_per_block # Because INNER d1
+num_p_tiles = d0_ltiles_per_block # Because inside of d0
+num_f_tiles = d1_ltiles_per_block # Because inside of d1
 ```
 Accumulated code generation:
 ```python
@@ -164,8 +164,8 @@ num_p_buffers = 2
 num_f_buffers = None
 
 """Derived from IR"""
-num_p_tiles = d0_ltiles_per_block # Because INNER d0
-num_f_tiles = d2_ltiles_per_block # Because INNER d2
+num_p_tiles = d0_ltiles_per_block # Because inside of d0
+num_f_tiles = d2_ltiles_per_block # Because inside of d2
 ```
 Accumulated code generation:
 ```python
@@ -213,8 +213,8 @@ num_p_buffers = None
 num_f_buffers = 4
 
 """Derived from IR"""
-num_p_tiles = d1_num_ltile = 16 # Because OUTER d1
-num_f_tiles = d2_ltiles_per_block = 1 # Because INNER d2
+num_p_tiles = d1_num_ltile = 16 # Because outside of d1
+num_f_tiles = d2_ltiles_per_block = 1 # Because inside of d2
 ```
 Accumulated code generation:
 ```python

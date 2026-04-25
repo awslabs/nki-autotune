@@ -54,8 +54,8 @@ KernelIR(func=matmul_lhs_rhs_nkigym, params=['lhs', 'rhs'], return=output)
         sbuf_output = MIDDLE
     num_buffers:
         sbuf_lhs:    {num_p_buffers: 2,    num_f_buffers: 4}     # rotate on d0, d1
-        sbuf_lhs_T:  {num_p_buffers: 2,    num_f_buffers: 4}     # rotate on d0, d1
-        sbuf_rhs:    {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d0 only
+        sbuf_lhs_T:  {num_p_buffers: 2,    num_f_buffers: 4}     # rotate on d1, d0
+        sbuf_rhs:    {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d1 only
         sbuf_output: {num_p_buffers: None, num_f_buffers: 4}     # rotate on d2 only
     emission_depth:
         sbuf_lhs:    1    # inside loop_order[0] = i_block_d2
@@ -131,8 +131,8 @@ num_p_buffers = 2
 num_f_buffers = 4
 
 """Derived from IR"""
-num_p_tiles = d0_ltiles_per_block # Because INNER d0
-num_f_tiles = d1_ltiles_per_block # Because INNER d1
+num_p_tiles = d0_ltiles_per_block # Because inside of d0
+num_f_tiles = d1_ltiles_per_block # Because inside of d1
 ```
 Accumulated code generation:
 ```python
@@ -175,8 +175,8 @@ num_p_buffers = 2
 num_f_buffers = None
 
 """Derived from IR"""
-num_p_tiles = d1_ltiles_per_block # Because INNER d1
-num_f_tiles = d2_ltiles_per_block # Because INNER d2
+num_p_tiles = d1_ltiles_per_block # Because inside of d1
+num_f_tiles = d2_ltiles_per_block # Because inside of d2
 ```
 Accumulated code generation:
 ```python
@@ -224,8 +224,8 @@ num_p_buffers = 2
 num_f_buffers = 4
 
 """Derived from IR"""
-num_p_tiles = d1_ltiles_per_block # Because INNER d1
-num_f_tiles = d0_ltiles_per_block # Because INNER d0
+num_p_tiles = d1_ltiles_per_block # Because inside of d1
+num_f_tiles = d0_ltiles_per_block # Because inside of d0
 ```
 Accumulated code generation:
 ```python
@@ -279,8 +279,8 @@ num_p_buffers = None
 num_f_buffers = 4
 
 """Derived from IR"""
-num_p_tiles = d0_num_ltile = 16 # Because OUTER d0
-num_f_tiles = d2_ltiles_per_block = 1 # Because INNER d2
+num_p_tiles = d0_num_ltile = 16 # Because outside of d0
+num_f_tiles = d2_ltiles_per_block = 1 # Because inside of d2
 ```
 Accumulated code generation:
 ```python
@@ -373,4 +373,52 @@ def matmul_lhs_rhs_nkigym(lhs, rhs):
                 matmul_block(cur_sbuf_output[i_block_d0 * 8 : i_block_d0 * 8 + 8], cur_sbuf_lhs_T, cur_sbuf_rhs)
             # store_block placed here after i_block_d1 (K-axis) closes; d0 per-block, d2 per-block
             store_block(output[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], cur_sbuf_output[i_block_d0 * 8 : i_block_d0 * 8 + 8])
+```
+
+# KernelIR Rewrite: LoadTranspose
+Consecutive `NKILoad` and `NKITranspose` can be fused into a `NKIDMATranspose` operator.
+```bash
+KernelIR(func=matmul_lhs_rhs_nkigym, params=['lhs', 'rhs'], return=output)
+    # Derived objective information
+    dimensions:
+        d0: size=2048, ltile=128, ptile=128, num_ltile=16, role=PARALLEL
+        d1: size=2048, ltile=128, ptile=128, num_ltile=16, role=ACCUMULATION
+        d2: size=2048, ltile=512, ptile=512, num_ltile=4, role=PARALLEL
+    input_hbm_tensors:
+        hbm_lhs: shape=(2048, 2048), dims=('d0', 'd1'), dtype=bfloat16
+        hbm_rhs: shape=(2048, 2048), dims=('d1', 'd2'), dtype=bfloat16
+    output_hbm_tensors:
+        hbm_output: shape=(2048, 2048), dims=('d0', 'd2'), dtype=bfloat16
+    physical_buffers:
+        sbuf_lhs_T:  tile=(128, 128), dims=('d1', 'd0'), dtype=bfloat16
+        sbuf_rhs:    tile=(128, 512), dims=('d1', 'd2'), dtype=bfloat16
+        sbuf_output: tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
+    # Tunable IR knobs
+    operators:
+        [0] NKIDMATranspose:
+            data=lhs, outputs=[sbuf_lhs_T], dim_map={'P': 'd1', 'F':'d0'}
+        [1] NKILoad:
+            data=rhs, outputs=[sbuf_rhs], dim_map={'P': 'd1', 'F':'d2'}
+        [2] NKIMatmul:
+            stationary=sbuf_lhs_T, moving=sbuf_rhs, outputs=[sbuf_output], dim_map={'K': 'd1', 'M': 'd0', 'N': 'd2'}
+        [3] NKIStore:
+            data=sbuf_output, outputs=[hbm_output], dim_map={'P':'d0', 'F':'d2'}
+    edges: (0, 2), (1, 2), (2, 3)
+    loop_order: ['d2', 'd0', 'd1']
+    ltiles/block:
+        d0: 8
+        d1: 4
+        d2: 1
+    buffer_scopes:
+        sbuf_lhs_T = INNER
+        sbuf_rhs = INNER
+        sbuf_output = MIDDLE
+    num_buffers:
+        sbuf_lhs_T:  {num_p_buffers: 2,    num_f_buffers: 4}     # rotate on d1, d0
+        sbuf_rhs:    {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d1 only
+        sbuf_output: {num_p_buffers: None, num_f_buffers: 4}     # rotate on d2 only
+    emission_depth:
+        sbuf_lhs_T:  1    # inside loop_order[0] = i_block_d2
+        sbuf_rhs:    1    # inside loop_order[0] = i_block_d2
+        sbuf_output: 0    # outermost
 ```
