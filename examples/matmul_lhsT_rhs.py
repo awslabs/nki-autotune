@@ -84,11 +84,15 @@ if __name__ == "__main__":
         print(f"{r.kernel_name}: sim={r.cpu_sim.get('passed')}  min_ms={r.min_ms}  MFU={r.mfu}")
 
     mac_count = compute_mac_count(matmul_lhsT_rhs_nkigym, INPUT_SPECS)
+    baseline_cache = Path("/home/ubuntu/cache/matmul_lhsT_rhs_baseline")
+    shutil.rmtree(baseline_cache, ignore_errors=True)
+    baseline_cache.mkdir(parents=True)
     baseline = remote_numpy_baseline(
         func=matmul_lhsT_rhs_numpy,
         input_specs=INPUT_SPECS,
         mac_count=mac_count,
         host=HOSTS[0],
         kernel_name="nkipy_baseline",
+        cache_dir=str(baseline_cache),
     )
     print(f"{baseline.kernel_name}: min_ms={baseline.min_ms}  MFU={baseline.mfu}  ({baseline.hardware_output})")

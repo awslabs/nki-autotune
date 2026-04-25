@@ -274,7 +274,7 @@ def _kernel_sort_key(kernel_name: str) -> tuple[int, int, str]:
 
 
 def _write_results_json(
-    cache_dir: str, kernels: dict[str, KernelJob], results: list[ProfileResult], profiler: "RemoteProfiler"
+    cache_dir: str, num_kernels: int, results: list[ProfileResult], hosts: list[str], wallclock_s: float
 ) -> None:
     """Write results.json with metrics and per-kernel data."""
     successes: list[tuple[ProfileResult, float, float]] = []
@@ -307,7 +307,7 @@ def _write_results_json(
     best_kernel = min(successes, key=lambda s: s[1])[0].kernel_name if successes else None
     worst_kernel = max(successes, key=lambda s: s[1])[0].kernel_name if successes else None
     results_data = {
-        "metadata": {"num_kernels": len(kernels), "wallclock_s": profiler._last_elapsed, "hosts": profiler.hosts},
+        "metadata": {"num_kernels": num_kernels, "wallclock_s": wallclock_s, "hosts": hosts},
         "metrics": {
             "best_min_ms": min(times) if times else None,
             "worst_min_ms": max(times) if times else None,
@@ -415,7 +415,7 @@ class RemoteProfiler:
         """Save profile results to disk following the standard cache layout."""
         write_kernel_sources(cache_dir, kernels)
         _write_compiler_logs(cache_dir, self.compiler_logs)
-        _write_results_json(cache_dir, kernels, results, self)
+        _write_results_json(cache_dir, len(kernels), results, self.hosts, self._last_elapsed)
         logger.info("Cache saved to %s", cache_dir)
 
 
@@ -449,6 +449,25 @@ def _func_source(func: Callable[..., np.ndarray]) -> str:
     return "import numpy as np\n\n" + textwrap.dedent(inspect.getsource(func))
 
 
+def _write_baseline_cache(
+    cache_dir: str, kernel_name: str, result: ProfileResult, nki_source: str, host: str, wallclock_s: float
+) -> None:
+    """Persist a baseline run to the standard cache layout.
+
+    Mirrors :meth:`RemoteProfiler.save_cache`: writes the compiler-emitted
+    NKI source to ``<cache>/<stem>/<stem>.py`` and a ``results.json``
+    summary so the baseline slots next to tuned kernels in any
+    comparison table.
+    """
+    stem = Path(kernel_name).stem
+    variant_dir = os.path.join(cache_dir, stem)
+    os.makedirs(variant_dir, exist_ok=True)
+    source_to_write = nki_source if nki_source else "# lower_to_nki did not emit source for this baseline run.\n"
+    with open(os.path.join(variant_dir, f"{stem}.py"), "w") as f:
+        f.write(source_to_write)
+    _write_results_json(cache_dir, 1, [result], [host], wallclock_s)
+
+
 def remote_numpy_baseline(
     func: Callable[..., np.ndarray],
     input_specs: dict[str, tuple[tuple[int, ...], str]],
@@ -458,6 +477,7 @@ def remote_numpy_baseline(
     venv_python: str = _DEFAULT_VENV_PYTHON,
     neuron_platform_target: str = "trn2",
     additional_compiler_args: str = "--lnc 1 --internal-tensorizer-opt-level=2",
+    cache_dir: str = "",
 ) -> ProfileResult:
     """Run a nkipy numpy-baseline profile on a single remote Trainium host.
 
@@ -475,12 +495,17 @@ def remote_numpy_baseline(
             positional order of ``func``'s parameters.
         mac_count: Theoretical MACs for MFU computation.
         host: SSH hostname of the Trainium node (e.g. ``"gym-1"``).
-        kernel_name: Identifier stored on the returned ProfileResult.
+        kernel_name: Identifier stored on the returned ProfileResult. Also
+            used as the cache subdirectory stem when ``cache_dir`` is set.
         venv_python: Path to the Python interpreter on the remote host.
         neuron_platform_target: Neuron platform target (default ``trn2``).
         additional_compiler_args: Forwarded to neuronx-cc. Default
             ``--internal-tensorizer-opt-level=2`` matches ``baremetal_jit``'s
             baseline pipeline.
+        cache_dir: If non-empty, writes ``<cache>/<stem>/<stem>.py`` with
+            the compiler-emitted NKI source (from ``lower_to_nki``) and
+            ``<cache>/results.json`` — same layout :func:`remote_profile`
+            produces for tuned NKI kernels.
     """
     payload = {
         "host": host,
@@ -517,6 +542,7 @@ def remote_numpy_baseline(
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     writer = threading.Thread(target=_feed_stdin, args=(proc, bundle_line, payload_bytes), daemon=True)
     writer.start()
+    t0 = time.monotonic()
     try:
         stdout_data, stderr_data = proc.communicate()
     except BaseException:
@@ -524,17 +550,28 @@ def remote_numpy_baseline(
         proc.communicate()
         raise
     writer.join()
+    elapsed = time.monotonic() - t0
 
     stderr_text = stderr_data.decode(errors="replace").strip()
     for line in stderr_text.splitlines():
         logger.info("  [%s] %s", host, line)
 
     if proc.returncode != 0:
-        return make_failure(kernel_name, f"SSH baseline on {host} exited {proc.returncode}: {stderr_text}", mac_count)
-    if not stdout_data:
-        return make_failure(kernel_name, f"No baseline result from {host} (empty stdout)", mac_count)
-    try:
-        data = json.loads(stdout_data)
-    except (json.JSONDecodeError, ValueError) as e:
-        return make_failure(kernel_name, f"Malformed baseline JSON from {host}: {e}", mac_count)
-    return ProfileResult(**data["result"])
+        result = make_failure(kernel_name, f"SSH baseline on {host} exited {proc.returncode}: {stderr_text}", mac_count)
+        nki_source = ""
+    elif not stdout_data:
+        result = make_failure(kernel_name, f"No baseline result from {host} (empty stdout)", mac_count)
+        nki_source = ""
+    else:
+        try:
+            data = json.loads(stdout_data)
+            result = ProfileResult(**data["result"])
+            nki_source = data.get("nki_source", "")
+        except (json.JSONDecodeError, ValueError) as e:
+            result = make_failure(kernel_name, f"Malformed baseline JSON from {host}: {e}", mac_count)
+            nki_source = ""
+
+    if cache_dir:
+        _write_baseline_cache(cache_dir, kernel_name, result, nki_source, host, elapsed)
+        logger.info("Baseline cache saved to %s", cache_dir)
+    return result

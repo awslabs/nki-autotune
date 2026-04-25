@@ -15,14 +15,17 @@ over the existing worker-bundle transport.
 """
 
 import json
+import logging
 import os
 import shutil
 import sys
 from typing import Any, Callable
 
 import numpy as np
-from nkipy.core.compile import CompilationTarget, compile_to_neff, trace
+from nkipy.core.compile import CompilationTarget, compile_to_neff, lower_to_nki, trace
 from nkipy.runtime import BaremetalExecutor, CompiledKernel
+
+logger = logging.getLogger(__name__)
 
 from autotune.runner.benchmark import _collect_roofline, _run_timing, generate_tensors
 from autotune.runner.types import (
@@ -40,7 +43,7 @@ def _compile_numpy_fn(
     kernel_kwargs: dict[str, np.ndarray],
     output_dir: str,
     additional_compiler_args: str,
-) -> CompiledKernel:
+) -> tuple[CompiledKernel, str]:
     """Trace ``func`` against ``kernel_kwargs`` and compile the HLO to NEFF.
 
     Mirrors the first half of
@@ -48,6 +51,12 @@ def _compile_numpy_fn(
     (``specialize`` + ``compile_to_neff``) but stops short of hardware
     execution so the caller can reuse the NEFF across the timing and
     roofline passes.
+
+    Also invokes ``lower_to_nki`` on the same traced kernel, which runs
+    the compiler's ``tensorize`` pipeline with ``--print-nki`` to emit
+    the post-tensorizer NKI source — returned alongside the NEFF so the
+    caller can record the compiler-generated kernel next to the tuned
+    NKI variants in the same cache layout.
     """
     traced = trace(func)
     traced.specialize(**kernel_kwargs)
@@ -59,7 +68,18 @@ def _compile_numpy_fn(
         additional_compiler_args=additional_compiler_args,
         target=CompilationTarget.TRN2,
     )
-    return CompiledKernel(traced, neff_path)
+    try:
+        nki_source = lower_to_nki(
+            trace_kernel=traced,
+            output_dir=os.path.join(output_dir, "nki_lowering"),
+            target=CompilationTarget.TRN2,
+            additional_compiler_args=additional_compiler_args,
+            save_artifacts=True,
+        )
+    except RuntimeError as e:
+        logger.warning("lower_to_nki failed: %s", e)
+        nki_source = ""
+    return CompiledKernel(traced, neff_path), nki_source
 
 
 def profile_numpy_baseline(
@@ -69,7 +89,7 @@ def profile_numpy_baseline(
     output_dir: str,
     kernel_name: str = "baseline",
     additional_compiler_args: str = "--lnc 1 --internal-tensorizer-opt-level=2",
-) -> ProfileResult:
+) -> tuple[ProfileResult, str]:
     """Compile a numpy function via nkipy + neuronx-cc and benchmark on Trainium.
 
     Produces the same timing / MFU / roofline fields as ``benchmark_one``
@@ -96,9 +116,11 @@ def profile_numpy_baseline(
             of the pipeline uses.
 
     Returns:
-        A ``ProfileResult`` whose ``cpu_sim`` field is marked "not run" --
-        the numpy function *is* the golden reference, so there is nothing
-        to compare against.
+        A ``(ProfileResult, nki_source)`` pair. The ``ProfileResult``'s
+        ``cpu_sim`` field is marked "not run" -- the numpy function *is*
+        the golden reference, so there is nothing to compare against.
+        ``nki_source`` is the NKI text emitted by the compiler's
+        tensorizer (``lower_to_nki``); empty on failure.
     """
     shutil.rmtree(output_dir, ignore_errors=True)
     os.makedirs(output_dir, exist_ok=True)
@@ -118,14 +140,15 @@ def profile_numpy_baseline(
         mbu_estimated_percent=None, mfu_max_achievable_estimated_percent=None, roofline_efficiency=None
     )
     hardware_output = "baseline"
+    nki_source = ""
     try:
-        compiled = _compile_numpy_fn(func, kernel_kwargs, output_dir, additional_compiler_args)
+        compiled, nki_source = _compile_numpy_fn(func, kernel_kwargs, output_dir, additional_compiler_args)
         with BaremetalExecutor(verbose=0) as spike:
             min_ms, mean_ms, p50_ms, p99_ms, mfu = _run_timing(spike, compiled, kernel_kwargs, config)
             roofline = _collect_roofline(spike, compiled, kernel_kwargs, mfu)
     except Exception as e:
         hardware_output = capture_error(e)
-    return ProfileResult(
+    result = ProfileResult(
         kernel_name=kernel_name,
         min_ms=min_ms,
         mean_ms=mean_ms,
@@ -139,6 +162,7 @@ def profile_numpy_baseline(
         mfu_max_achievable_estimated_percent=roofline.mfu_max_achievable_estimated_percent,
         roofline_efficiency=roofline.roofline_efficiency,
     )
+    return result, nki_source
 
 
 def baseline_worker_main() -> None:
@@ -177,7 +201,7 @@ def baseline_worker_main() -> None:
     real_stdout = sys.stdout
     sys.stdout = sys.stderr
     try:
-        result = profile_numpy_baseline(
+        result, nki_source = profile_numpy_baseline(
             func=func,
             input_specs=input_specs,
             mac_count=payload["mac_count"],
@@ -188,7 +212,9 @@ def baseline_worker_main() -> None:
     finally:
         sys.stdout = real_stdout
 
-    sys.stdout.buffer.write(json.dumps({"host": payload["host"], "result": result._asdict()}).encode("utf-8"))
+    sys.stdout.buffer.write(
+        json.dumps({"host": payload["host"], "result": result._asdict(), "nki_source": nki_source}).encode("utf-8")
+    )
     sys.stdout.buffer.flush()
 
 
