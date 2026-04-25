@@ -1,9 +1,9 @@
-"""remote_run: render a KernelIR to NKI source and profile it on Trainium hosts.
+"""``remote_run``: render a :class:`KernelIR` to NKI source and profile it.
 
-The sampling loop is gone — instead, callers build a ``KernelIR`` (via
-``build_ir`` for the baseline, or hand-constructed variants from an
-agent proposer), optionally tweak its knobs, and hand the IR to this
-module to get ``render_ir → KernelJob → remote_profile``.
+Callers build a ``KernelIR`` (via ``build_ir`` for the baseline, or
+hand-constructed for tuned variants), optionally tweak its knobs, and
+pass it here. The IR is rendered, shipped to a Trainium host, and
+benchmarked; results mirror the on-disk cache layout.
 """
 
 import ast
@@ -38,21 +38,20 @@ def remote_run(
     neuronx_cc_args: tuple[str, ...] = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false"),
     config: ProfileConfig = ProfileConfig(),
 ) -> ProfileOutput:
-    """Render *ir* and profile it against the math function *func*.
+    """Render ``ir`` and profile against the math function ``func``.
 
     Args:
-        ir: The KernelIR to render. Typically produced by ``build_ir``
-            then mutated by an agent proposer.
-        func: The nkigym math function — shipped to remote workers to
-            compute the fp32 golden.
+        ir: The KernelIR to render.
+        func: The nkigym math function — shipped to remote workers for
+            the fp32 golden.
         input_specs: ``{param: (shape, dtype)}`` for every parameter.
         hosts: SSH hostnames for remote profiling.
         cache_dir: Directory for kernel sources + results.
         atol: Absolute tolerance for CPU-sim correctness.
         rtol: Relative tolerance for CPU-sim correctness.
-        kernel_name: Filename under ``cache_dir`` for the rendered kernel.
+        kernel_name: Filename for the rendered kernel.
         neuronx_cc_args: Extra compiler flags.
-        config: Infra settings (SSH timeout, venv path, etc.).
+        config: Infra settings.
 
     Returns:
         ProfileOutput with timing and correctness.
@@ -81,12 +80,7 @@ def remote_run(
 
 
 def _dump_ir(cache_path: Path, kernel_name: str, ir: KernelIR) -> None:
-    """Write the KernelIR alongside the rendered kernel in the cache.
-
-    The remote worker drops the rendered ``.py`` into ``<cache>/<kernel>/``;
-    we mirror that layout and add ``ir.md`` so the on-disk record is
-    self-describing (math-level IR + lowered kernel + profile results).
-    """
+    """Write the KernelIR fields alongside the rendered kernel."""
     stem = Path(kernel_name).stem
     ir_dir = cache_path / stem
     ir_dir.mkdir(parents=True, exist_ok=True)
@@ -126,32 +120,24 @@ def _format_ir(ir: KernelIR) -> str:
     for i, op in enumerate(ir.ops):
         lines.append(f"{i}. {op}")
     lines.extend(["", "## edges"])
-    for producer, consumer, tensor, role in ir.edges:
-        lines.append(f"- ({producer} → {consumer}) {tensor} as {role}")
+    for producer, consumer in ir.edges:
+        lines.append(f"- {producer} → {consumer}")
     return "\n".join(lines) + "\n"
 
 
 def _inline_gadgets(kernel_src: str) -> str:
     """Prepend gadgets.py so the emitted source is self-contained for workers."""
     gadgets_src = Path(_gadgets.__file__).read_text()
-    return (
-        gadgets_src
-        + "\n\n"
-        + kernel_src.replace(
-            "from nkigym.codegen.gadgets import (\n"
-            "    activation_block,\n"
-            "    activation_reduce_block,\n"
-            "    allocate_buffers,\n"
-            "    load_block,\n"
-            "    matmul_block,\n"
-            "    memset_buffers,\n"
-            "    store_block,\n"
-            "    tensor_scalar_block,\n"
-            "    transpose_block,\n"
-            ")",
-            "",
-        )
+    gadgets_import_block = (
+        "from nkigym.codegen.gadgets import (\n"
+        "    allocate_buffers,\n"
+        "    load_block,\n"
+        "    matmul_block,\n"
+        "    memset_buffers,\n"
+        "    store_block,\n"
+        ")"
     )
+    return gadgets_src + "\n\n" + kernel_src.replace(gadgets_import_block, "")
 
 
 def _func_source_with_imports(func: Callable[..., np.ndarray]) -> str:

@@ -18,14 +18,11 @@ def load_block(sbuf: Any, mem_slice: Any, transpose: bool) -> None:
 
     ``sbuf`` is a list of ``num_p_tiles`` leaves of shape
     ``(p_tile, f_tile)``. The caller passes the HBM region as a
-    Python slice, e.g. ``lhs_T[r0:r0+R, c0:c0+C]``. The gadget
-    reads the required extent from the slice's shape and splits
-    it across ``num_p_tiles`` list slots.
+    Python slice; the gadget splits it across the P-slots.
 
     Required: ``mem_slice.shape == (num_p_tiles * p_tile, f_tile)``.
     When ``transpose=True``, required shape is
-    ``(f_tile, num_p_tiles * p_tile)`` and each leaf is filled
-    via ``nisa.dma_transpose``.
+    ``(f_tile, num_p_tiles * p_tile)``.
     """
     num_p_tiles = len(sbuf)
     if num_p_tiles == 0:
@@ -35,7 +32,8 @@ def load_block(sbuf: Any, mem_slice: Any, transpose: bool) -> None:
     if tuple(mem_slice.shape) != expected:
         raise ValueError(
             f"load_block extent mismatch: sbuf covers ({num_p_tiles * p_tile}, {f_tile}) "
-            f"via {num_p_tiles} P-slots of ({p_tile}, {f_tile}), expected mem_slice {expected}, got {tuple(mem_slice.shape)}"
+            f"via {num_p_tiles} P-slots of ({p_tile}, {f_tile}), expected mem_slice {expected}, "
+            f"got {tuple(mem_slice.shape)}"
         )
     for pt in range(num_p_tiles):
         dst = sbuf[pt][0:p_tile, 0:f_tile]
@@ -48,11 +46,6 @@ def load_block(sbuf: Any, mem_slice: Any, transpose: bool) -> None:
 def store_block(mem_slice: Any, sbuf: Any) -> None:
     """SBUF → HBM: write every leaf of ``sbuf`` into ``mem_slice``.
 
-    ``sbuf`` is a list of ``num_p_tiles`` leaves of shape
-    ``(p_tile, f_tile)``. The caller passes the HBM destination
-    as a Python slice; the gadget reads the required extent from
-    its shape.
-
     Required: ``mem_slice.shape == (num_p_tiles * p_tile, f_tile)``.
     """
     num_p_tiles = len(sbuf)
@@ -63,7 +56,8 @@ def store_block(mem_slice: Any, sbuf: Any) -> None:
     if tuple(mem_slice.shape) != expected:
         raise ValueError(
             f"store_block extent mismatch: sbuf covers ({num_p_tiles * p_tile}, {f_tile}) "
-            f"via {num_p_tiles} P-slots of ({p_tile}, {f_tile}), expected mem_slice {expected}, got {tuple(mem_slice.shape)}"
+            f"via {num_p_tiles} P-slots of ({p_tile}, {f_tile}), expected mem_slice {expected}, "
+            f"got {tuple(mem_slice.shape)}"
         )
     for pt in range(num_p_tiles):
         nisa.dma_copy(mem_slice[pt * p_tile : (pt + 1) * p_tile, 0:f_tile], sbuf[pt][0:p_tile, 0:f_tile])
@@ -84,9 +78,6 @@ def matmul_block(sbuf_out: Any, sbuf_lhs_T: Any, sbuf_rhs: Any) -> None:
     one N-tile of that width; otherwise it splits into ``width // 512``
     tiles of ``tile_n = 512`` (the HW PSUM-free-axis cap).
 
-    For each ``(m_idx, n_idx)`` the gadget zeroes a PSUM tile, reduces
-    all K with ``nc_matmul``, then adds the PSUM result into
-    ``sbuf_out[m_idx]``'s ``[:, n_idx*tile_n : (n_idx+1)*tile_n]`` strip.
     Caller must pre-memset every ``sbuf_out[m]`` leaf before the first
     outer-K invocation.
     """
@@ -121,82 +112,8 @@ def matmul_block(sbuf_out: Any, sbuf_lhs_T: Any, sbuf_rhs: Any) -> None:
             )
 
 
-def activation_block(sbuf_dst: Any, sbuf_src: Any, op: Any) -> None:
-    """Apply activation ``op`` per leaf: ``dst[i] = op(src[i])``."""
-    p_tile, f_tile = sbuf_dst[0].shape
-    for i in range(len(sbuf_dst)):
-        nisa.activation(dst=sbuf_dst[i][0:p_tile, 0:f_tile], op=op, data=sbuf_src[i][0:p_tile, 0:f_tile])
-
-
-def activation_reduce_block(sbuf_red: Any, sbuf_data: Any, op: Any, reduce_op: Any) -> None:
-    """Activation + reduce along free axis, accumulating into ``sbuf_red``.
-
-    ``sbuf_data`` leaves shape ``(p_tile, f_tile)``. ``sbuf_red`` leaves
-    shape ``(p_tile, 1)``. Each reduce is added into the accumulator;
-    caller must memset ``sbuf_red`` before the first call.
-    """
-    p_tile, f_tile = sbuf_data[0].shape
-    tmp = nl.ndarray((p_tile, f_tile), dtype=nl.float32, buffer=nl.sbuf)
-    tmp_red = nl.ndarray((p_tile, 1), dtype=nl.float32, buffer=nl.sbuf)
-    for pi in range(len(sbuf_data)):
-        nisa.activation_reduce(
-            dst=tmp, op=op, data=sbuf_data[pi][0:p_tile, 0:f_tile], reduce_op=reduce_op, reduce_res=tmp_red
-        )
-        nisa.tensor_tensor(sbuf_red[pi][0:p_tile, 0:1], sbuf_red[pi][0:p_tile, 0:1], tmp_red, op=nl.add)
-
-
-def tensor_scalar_block(
-    sbuf_dst: Any, sbuf_src: Any, op0: Any, operand0: Any, op1: Any = None, operand1: Any = None
-) -> None:
-    """Elementwise per leaf: ``dst[i] = op1(op0(src[i], operand0), operand1)``.
-
-    If ``operand0`` is a buffer list (same length as ``sbuf_src``), each
-    leaf uses its corresponding ``operand0[i]`` as a per-partition vector.
-    Otherwise ``operand0`` is a scalar / per-partition vector broadcast
-    across free.
-    """
-    p_tile, f_tile = sbuf_dst[0].shape
-    for i in range(len(sbuf_dst)):
-        op0_i = operand0[i][0:p_tile, 0:1] if isinstance(operand0, list) else operand0
-        if op1 is None:
-            nisa.tensor_scalar(
-                dst=sbuf_dst[i][0:p_tile, 0:f_tile], data=sbuf_src[i][0:p_tile, 0:f_tile], op0=op0, operand0=op0_i
-            )
-        else:
-            nisa.tensor_scalar(
-                dst=sbuf_dst[i][0:p_tile, 0:f_tile],
-                data=sbuf_src[i][0:p_tile, 0:f_tile],
-                op0=op0,
-                operand0=op0_i,
-                op1=op1,
-                operand1=operand1,
-            )
-
-
-def transpose_block(sbuf_dst: Any, sbuf_src: Any) -> None:
-    """Transpose a (p-list × packed-free) SBUF region into a swapped layout.
-
-    ``sbuf_src`` is ``num_m_tiles`` leaves of ``(p_tile, num_k_tiles * p_tile)``
-    with the packed free axis holding K-tiles. ``sbuf_dst`` is ``num_k_tiles``
-    leaves of ``(p_tile, num_m_tiles * p_tile)`` with the packed free axis
-    holding M-tiles. Emits one ``nisa.dma_transpose`` per ``(ki, mi)`` pair.
-    """
-    p_tile = sbuf_src[0].shape[0]
-    num_m_tiles = len(sbuf_src)
-    num_k_tiles = len(sbuf_dst)
-    for ki in range(num_k_tiles):
-        for mi in range(num_m_tiles):
-            nisa.dma_transpose(
-                sbuf_dst[ki][0:p_tile, mi * p_tile : (mi + 1) * p_tile],
-                sbuf_src[mi][0:p_tile, ki * p_tile : (ki + 1) * p_tile],
-            )
-
-
 def memset_buffers(sbuf: Any, value: float) -> None:
-    """Zero every leaf of a buffer list with ``value`` via ``nisa.memset``.
-
-    ``sbuf`` is the flat list of leaves returned by ``allocate_buffers``.
-    """
+    """Zero every leaf of a buffer list with ``value`` via ``nisa.memset``."""
     if len(sbuf) == 0:
         raise ValueError("memset_buffers got empty sbuf")
     p_tile, f_tile = sbuf[0].shape
@@ -214,14 +131,14 @@ def allocate_buffers(
     num_p_buffers: int | None,
     num_f_buffers: int | None,
 ) -> list:
-    """Allocate tile buffers for SBUF / PSUM with per-dim multi-buffering.
+    """Allocate tile buffers for SBUF with per-dim multi-buffering.
 
     Each leaf is an ``nl.ndarray`` of shape
     ``(p_tile_size, f_tile_size * num_f_tiles)``. ``num_f_tiles`` is packed
     *into* the leaf's free-axis width.
 
-    ``num_p_buffers`` and ``num_f_buffers`` are both required and describe
-    multi-buffering along the partition and free dims respectively:
+    ``num_p_buffers`` / ``num_f_buffers`` describe multi-buffering along
+    the partition and free dims:
 
       * ``None`` → no rotation along that dim; the dim collapses in the
         return shape.
@@ -231,13 +148,10 @@ def allocate_buffers(
     Return shape:
 
       * ``(None, None)`` → flat leaf list ``[leaf, ...]`` of length
-        ``num_p_tiles``. Drop-in for ``load_block`` / ``store_block`` /
-        ``matmul_block``.
+        ``num_p_tiles``.
       * ``(P, None)`` → ``bufs[p_buf_idx]`` → leaf list.
       * ``(None, F)`` → ``bufs[f_buf_idx]`` → leaf list.
       * ``(P, F)`` → ``bufs[p_buf_idx][f_buf_idx]`` → leaf list.
-
-    Call ``memset_buffers`` separately to zero leaves.
     """
     leaf_shape = (p_tile_size, f_tile_size * num_f_tiles)
     p_count = 1 if num_p_buffers is None else num_p_buffers
