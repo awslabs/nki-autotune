@@ -42,6 +42,7 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
     buffer_scopes:
         sbuf_lhs_T = INNER
         sbuf_rhs = INNER
+        sbuf_output = MIDDLE
     num_buffers:
         sbuf_lhs_T:  {num_p_buffers: 2,    num_f_buffers: 4}     # rotate on d0, d1
         sbuf_rhs:    {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d0 only
@@ -49,7 +50,7 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
     emission_depth:
         sbuf_lhs_T:  1    # inside loop_order[0] = i_block_d2
         sbuf_rhs:    1    # inside loop_order[0] = i_block_d2
-        sbuf_output: 0    # forced — d2 is outermost rotating
+        sbuf_output: 0    # outermost
 ```
 
 **Sampling ranges** — each tunable knob's valid range in a random-sampling
@@ -131,11 +132,11 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
     for i_block_d2 in range(4):
-        # sbuf_lhs_T placed here because sbuf_lhs_T emission depth = 1
+        # sbuf_lhs_T declared here because sbuf_lhs_T emission depth = 1
         sbuf_lhs_T = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = 4)
         for i_block_d0 in range(2):
             for i_block_d1 in range(4):
-                # load_block sbuf_lhs_T placed here because sbuf_lhs_T = INNER (depends on d0, d1)
+                # sbuf_lhs_T consumed here because sbuf_lhs_T = INNER (depends on d0, d1)
                 cur_sbuf_lhs_T = sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]
                 load_block(cur_sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
 ```
@@ -175,39 +176,47 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
     for i_block_d2 in range(4):
-        # sbuf_lhs_T placed here because sbuf_lhs_T emission depth = 1
+        # sbuf_lhs_T declared here because sbuf_lhs_T emission depth = 1
         sbuf_lhs_T = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = 4)
-        # sbuf_rhs placed here because sbuf_rhs emission depth = 1
+        # sbuf_rhs declared here because sbuf_rhs emission depth = 1
         sbuf_rhs = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = None)
         for i_block_d0 in range(2):
-            # load_block sbuf_rhs placed here because sbuf_rhs = INNER (depends on d0, d2)
+            # sbuf_rhs consumed here because sbuf_rhs = INNER (depends on d0, d2)
             cur_sbuf_rhs = sbuf_rhs[i_block_d0 % 2]
             load_block(cur_sbuf_rhs, rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
             for i_block_d1 in range(4):
-                # load_block sbuf_lhs_T placed here because sbuf_lhs_T = INNER (depends on d0, d1)
+                # sbuf_lhs_T consumed here because sbuf_lhs_T = INNER (depends on d0, d1)
                 cur_sbuf_lhs_T = sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]
                 load_block(cur_sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
 ```
 
 ### OP_2:
-
-
-<!-- ### OP_2:
 ```
 [2] NKIMatmul:
-      inputs={'stationary': 'sbuf_lhs_T', 'moving': 'sbuf_rhs'}, outputs=['output']
-      dim_map={'K': 'd0', 'M': 'd1', 'N': 'd2'}, tile_sizes={'d0': 128, 'd1': 128, 'd2': 512}, blocking=['d0']
+    stationary=sbuf_lhs_T, moving=sbuf_rhs, outputs=[sbuf_output], dim_map={'K': 'd0', 'M': 'd1', 'N': 'd2'}
 ```
 Information from IR:
 ```
-physical_buffers:
-    sbuf_output: tile=(128, 512), dims=('d1', 'd2'), p_axis=d1, f_axis=d2
-ltiles/block:
-    d2: 1
-num_buffers:
-    sbuf_output: {num_p_buffers: None, num_f_buffers: 4}
+sbuf_output: tile=(128, 512), dims=('d1', 'd2'), dtype=bfloat16
+sbuf_output = MIDDLE
+sbuf_output: {num_p_buffers: None, num_f_buffers: 4}
+sbuf_output: 0  # emission depth — outermost
 ```
+Derive `sbuf_output` buffer allocation:
+```python
+"""Directly read from IR"""
+p_tile_size = 128
+f_tile_size = 512
+loc=nl.sbuf
+dtype=nl.bfloat16
+num_p_buffers = None
+num_f_buffers = 4
 
+"""Derived from IR"""
+num_p_tiles = d1_num_ltile = 16 # Because OUTER d1
+num_f_tiles = d2_ltiles_per_block = 1 # Because INNER d2
+```
+Accumulated code generation:
 ```python
 @nki.jit
 def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
@@ -215,21 +224,32 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_output = allocate_buffers(128, 16, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=None, num_f_buffers=4)
+    # sbuf_output declared here because sbuf_output emission depth = 0
+    sbuf_output = allocate_buffers(p_tile_size = 128, num_p_tiles=16, f_tile_size = 512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = None, num_f_buffers = 4)
 
     for i_block_d2 in range(4):
-        sbuf_lhs_T = allocate_buffers(128, 8, 128, 4, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=4)
-        sbuf_rhs   = allocate_buffers(128, 8, 512, 1, nl.sbuf, nl.bfloat16, num_p_buffers=2, num_f_buffers=None)
+        # sbuf_lhs_T declared here because sbuf_lhs_T emission depth = 1
+        sbuf_lhs_T = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = 4)
+        # sbuf_rhs declared here because sbuf_rhs emission depth = 1
+        sbuf_rhs = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = None)
+        # sbuf_output consumed here because sbuf_output = MIDDLE (depends on d1, d2)
+        # sbuf_output is matmul accumulation output, consume location indicates where it should be zeroed
         cur_sbuf_output = sbuf_output[i_block_d2 % 4]
         memset_buffers(cur_sbuf_output, 0.0)
         for i_block_d0 in range(2):
+            # sbuf_rhs consumed here because sbuf_rhs = INNER (depends on d0, d2)
             cur_sbuf_rhs = sbuf_rhs[i_block_d0 % 2]
             load_block(cur_sbuf_rhs, rhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
             for i_block_d1 in range(4):
+                # sbuf_lhs_T consumed here because sbuf_lhs_T = INNER (depends on d0, d1)
                 cur_sbuf_lhs_T = sbuf_lhs_T[i_block_d0 % 2][i_block_d1 % 4]
                 load_block(cur_sbuf_lhs_T, lhs_T[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
+                # computation operator matmul_block placed here when all of its operands are available
                 matmul_block(cur_sbuf_output[i_block_d1 * 4 : i_block_d1 * 4 + 4], cur_sbuf_lhs_T, cur_sbuf_rhs)
 ```
+
+<!-- ###
+
 
 ### OP_3:
 ```
