@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from nkigym.kernel_ir.ir import KernelIR, Op, PhysicalBuffer
+from nkigym.kernel_ir.ir import BufferScope, KernelIR, NumBuffers, Op, PhysicalBuffer
 from nkigym.kernel_ir.parse import find_ops
 from nkigym.kernel_ir.types import DimInfo, DimRole, TensorInfo
 from nkigym.ops.base import NKIOp
@@ -51,9 +51,10 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
 
     Returns:
         A ``KernelIR`` with ops filled out, edges derived, and tunable
-        knobs at naive defaults (``dim_order`` non-ACC then ACC,
-        ``ltiles_per_block={d: 1}``, empty ``buffer_scopes`` /
-        ``num_buffers`` / ``emission_depth``).
+        knobs at naive defaults: canonical ``dim_order`` (``d0`` → ``dN``),
+        ``ltiles_per_block={d: 1}``, ``buffer_scopes={buf: INNER}``,
+        ``num_buffers={buf: NumBuffers()}``, ``emission_depth={buf: 0}``
+        for every non-HBM physical buffer.
     """
     param_names = list(inspect.signature(func).parameters.keys())
     for name in param_names:
@@ -94,6 +95,9 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
     edges = _derive_edges(ops)
     dim_order = _default_dim_order(dimensions)
     ltiles_per_block = {d: 1 for d in dimensions}
+    buffer_scopes = {name: BufferScope.INNER for name in physical_buffers if not name.startswith("hbm_")}
+    num_buffers = {name: NumBuffers() for name in physical_buffers if not name.startswith("hbm_")}
+    emission_depth = {name: 0 for name in physical_buffers if not name.startswith("hbm_")}
 
     return KernelIR(
         func_name=func.__name__,
@@ -106,14 +110,15 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
         edges=edges,
         dim_order=dim_order,
         ltiles_per_block=ltiles_per_block,
+        buffer_scopes=buffer_scopes,
+        num_buffers=num_buffers,
+        emission_depth=emission_depth,
     )
 
 
 def _default_dim_order(dimensions: dict[str, DimInfo]) -> list[str]:
-    """Non-ACCUMULATION dims first, ACCUMULATION dims innermost."""
-    non_acc = [d for d, info in dimensions.items() if info.role is not DimRole.ACCUMULATION]
-    acc = [d for d, info in dimensions.items() if info.role is DimRole.ACCUMULATION]
-    return non_acc + acc
+    """Canonical dim order: ``d0`` → ``dN`` by numeric suffix."""
+    return sorted(dimensions, key=lambda d: int(d[1:]))
 
 
 def _resolve_dimensions(

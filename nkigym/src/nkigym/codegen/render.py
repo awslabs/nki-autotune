@@ -133,6 +133,7 @@ def _emit_body(w: _Writer, ir: KernelIR) -> None:
     _emit_allocs_at_depth(w, allocs, depth=0)
     if allocs and any(info.emission_depth == 0 for info in allocs.values()):
         w.line()
+    _emit_loads_at_depth(w, ir, allocs, depth=0)
 
     _emit_loop_nest(w, ir, allocs, matmul_op, store_op, dim_idx=0)
 
@@ -144,11 +145,13 @@ def _emit_loop_nest(
 
     At each depth:
     * Emit allocations whose ``emission_depth == dim_idx``.
-    * If this is the outermost non-ACC depth *inside* the matmul's loop
-      set and the matmul output lives here, bind + memset the accumulator
-      slot.
-    * Emit loads and the matmul at their required depth.
-    * On the way out of every ACCUMULATION loop, fire the store.
+    * Bind + memset the accumulator slot at the accumulator's prologue depth.
+    * Emit loads at their required depth.
+    * Recurse.
+    * Fire the store at the depth immediately outside all ACCUMULATION
+      loops (``= _store_emission_depth``). Output dims that live outside
+      the ACC loops contribute per-block slices; those nested inside
+      (and thus already closed) contribute full-extent slices.
     """
     if dim_idx == len(ir.dim_order):
         _emit_compute_ops(w, ir, allocs)
@@ -165,24 +168,31 @@ def _emit_loop_nest(
 
     w.dedent()
 
-    """Store placement: fire after the innermost ACCUMULATION loop closes."""
-    dim_role = ir.dimensions[dim].role
-    if dim_role is DimRole.ACCUMULATION and _is_innermost_acc_dim(ir, dim):
-        open_loops = ir.dim_order[:dim_idx]
+    """Store placement: fire when we close the loop immediately outside
+    the first ACC dim (i.e. right after the outermost ACC loop finishes
+    and we're still inside any enclosing non-ACC loops whose indices the
+    store slice needs).
+    """
+    store_depth = _store_emission_depth(ir)
+    if dim_idx == store_depth:
+        open_loops = ir.dim_order[:store_depth]
         _emit_store(w, ir, allocs, store_op, matmul_op, open_loops)
 
 
-def _is_innermost_acc_dim(ir: KernelIR, dim: str) -> bool:
-    """True iff ``dim`` is the innermost ACCUMULATION dim in ``dim_order``.
+def _store_emission_depth(ir: KernelIR) -> int:
+    """Depth at which the store fires.
 
-    The store fires after the innermost accumulation loop closes — i.e.
-    the deepest position in ``dim_order`` whose dim is ACCUMULATION.
+    The store must run outside every ACCUMULATION loop (so the
+    accumulator is complete) and inside every non-ACC loop that's
+    outside any ACC loop (so the store slice can reference those
+    block indices). That's exactly the position of the first ACC dim
+    in ``dim_order`` — the store fires just as we dedent back out of
+    that loop.
     """
-    last_acc = None
-    for d in ir.dim_order:
+    for i, d in enumerate(ir.dim_order):
         if ir.dimensions[d].role is DimRole.ACCUMULATION:
-            last_acc = d
-    return dim == last_acc
+            return i
+    return len(ir.dim_order)
 
 
 def _find_matmul_op(ir: KernelIR) -> Op:
@@ -258,11 +268,13 @@ def _resolve_allocations(ir: KernelIR) -> dict[str, _BufAlloc]:
             p_tile, num_p, f_tile, num_f = _accumulator_extents(ir, buf, matmul_op)
         else:
             p_tile, num_p, f_tile, num_f = _scope_extents(ir, buf, BufferScope.INNER)
+        num_buffers = ir.num_buffers.get(name, NumBuffers())
+        emission_depth = ir.emission_depth.get(name, 0)
         result[name] = _BufAlloc(
             name=name,
             buf=buf,
-            num_buffers=ir.num_buffers.get(name, NumBuffers()),
-            emission_depth=ir.emission_depth.get(name, 0),
+            num_buffers=num_buffers,
+            emission_depth=emission_depth,
             p_tile=p_tile,
             num_p_tiles=num_p,
             f_tile=f_tile,
@@ -573,11 +585,12 @@ def _emit_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op)
     """
     k_dim = op.axis_map["K"]
     m_dim = op.axis_map["M"]
+    n_dim = op.axis_map["N"]
     lhs = op.inputs["stationary"]
     rhs = op.inputs["moving"]
     out = op.outputs[0]
-
     out_info = allocs[out]
+
     lt_m = ir.ltiles_per_block[m_dim]
     out_base = _cur_name(out)
     if out_info.buf.p_axis == m_dim and out_info.num_p_tiles > lt_m:
@@ -585,16 +598,25 @@ def _emit_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op)
     else:
         out_expr = out_base
 
-    lhs_expr = _matmul_input_expr(ir, allocs, lhs, k_dim)
-    rhs_expr = _matmul_input_expr(ir, allocs, rhs, k_dim)
+    lhs_expr = _matmul_input_expr(ir, allocs, lhs, k_dim, m_dim)
+    rhs_expr = _matmul_input_expr(ir, allocs, rhs, k_dim, n_dim)
     w.line(f"matmul_block({out_expr}, {lhs_expr}, {rhs_expr})")
 
 
-def _matmul_input_expr(ir: KernelIR, allocs: dict[str, _BufAlloc], name: str, k_dim: str) -> str:
+def _matmul_input_expr(ir: KernelIR, allocs: dict[str, _BufAlloc], name: str, k_dim: str, other_dim: str) -> str:
     """Matmul operand expression.
 
-    If the operand buffer spans the full K axis (``MIDDLE``/``OUTER``),
-    we slice by the active K-block. Otherwise use ``cur_<name>`` directly.
+    Input buffers may hold more than one block along some axis — if so,
+    slice to the active block so the gadget sees exactly the tiles it
+    needs:
+
+    * ``k_dim`` on the P-axis → slice the P-slot list by K-block.
+    * ``k_dim`` on the packed free axis → slice each leaf's free axis
+      by K-block.
+    * ``other_dim`` (M for stationary, N for moving) on the free axis →
+      slice each leaf's free axis by that block.
+    * ``other_dim`` on the P-axis (when K is on free) → slice P-slots
+      by that block.
     """
     info = allocs[name]
     base = (
@@ -603,15 +625,30 @@ def _matmul_input_expr(ir: KernelIR, allocs: dict[str, _BufAlloc], name: str, k_
         else name
     )
     buf = info.buf
-    k_axis_is_p = buf.p_axis == k_dim
-    k_axis_is_f = buf.f_axis == k_dim
-    if not (k_axis_is_p or k_axis_is_f):
-        return base
-    axis_extent = info.p_tile * info.num_p_tiles if k_axis_is_p else info.f_tile * info.num_f_tiles
-    if axis_extent < ir.dimensions[k_dim].dim_size:
-        return base
     lt_k = ir.ltiles_per_block[k_dim]
-    return f"{base}[i_block_{k_dim} * {lt_k} : i_block_{k_dim} * {lt_k} + {lt_k}]"
+    lt_other = ir.ltiles_per_block[other_dim]
+
+    """K-axis slicing."""
+    expr = base
+    if buf.p_axis == k_dim and info.num_p_tiles > lt_k:
+        expr = f"{expr}[i_block_{k_dim} * {lt_k} : i_block_{k_dim} * {lt_k} + {lt_k}]"
+    elif buf.f_axis == k_dim and info.num_f_tiles > lt_k:
+        f_tile = info.f_tile
+        expr = (
+            f"[leaf[:, i_block_{k_dim} * {lt_k * f_tile} : "
+            f"i_block_{k_dim} * {lt_k * f_tile} + {lt_k * f_tile}] for leaf in {expr}]"
+        )
+
+    """Output-dim (M for stationary, N for moving) slicing."""
+    if buf.f_axis == other_dim and info.num_f_tiles > lt_other:
+        f_tile = info.f_tile
+        expr = (
+            f"[leaf[:, i_block_{other_dim} * {lt_other * f_tile} : "
+            f"i_block_{other_dim} * {lt_other * f_tile} + {lt_other * f_tile}] for leaf in {expr}]"
+        )
+    elif buf.p_axis == other_dim and info.num_p_tiles > lt_other and buf.p_axis != k_dim:
+        expr = f"{expr}[i_block_{other_dim} * {lt_other} : i_block_{other_dim} * {lt_other} + {lt_other}]"
+    return expr
 
 
 """────────────────────────────────────────────────────────────────

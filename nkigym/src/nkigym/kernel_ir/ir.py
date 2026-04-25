@@ -117,3 +117,112 @@ class KernelIR:
         """Elements per block along ``dim_id`` — ``ltiles_per_block × ptile``."""
         info = self.dimensions[dim_id]
         return self.ltiles_per_block[dim_id] * info.physical_tile_size
+
+    def __repr__(self) -> str:
+        """Human-readable multi-line view of every field."""
+        return _format_kernel_ir(self)
+
+
+def _format_kernel_ir(ir: "KernelIR") -> str:
+    """Render ``ir`` as a section-structured multi-line string."""
+    lines: list[str] = [f"KernelIR(func_name={ir.func_name!r})"]
+
+    params = ", ".join(ir.param_names)
+    lines.append(f"  signature: ({params}) -> {ir.return_name}")
+    lines.append(f"  dim_order: {ir.dim_order}")
+    lines.append(f"  ltiles_per_block: {_format_dict(ir.ltiles_per_block)}")
+
+    lines.append("  dimensions:")
+    dim_rows = [
+        (
+            name,
+            str(info.dim_size),
+            f"ltile={info.logical_tile_size}",
+            f"ptile={info.physical_tile_size}",
+            info.role.value,
+        )
+        for name, info in ir.dimensions.items()
+    ]
+    lines.extend(_format_table(dim_rows, indent="    "))
+
+    lines.append("  logical_tensors:")
+    tensor_rows = [
+        (f"{name}:", f"dims=({','.join(t.dim_ids)})", f"shape={t.shape}", t.dtype)
+        for name, t in ir.logical_tensors.items()
+    ]
+    lines.extend(_format_table(tensor_rows, indent="    "))
+
+    lines.append("  physical_buffers:")
+    buf_rows = []
+    for name, buf in ir.physical_buffers.items():
+        f_axis = buf.f_axis if buf.f_axis is not None else "-"
+        buf_rows.append(
+            (
+                f"{name}:",
+                f"tile={buf.tile}",
+                f"dims=({','.join(buf.dim_ids)})",
+                buf.dtype,
+                f"p={buf.p_axis}",
+                f"f={f_axis}",
+            )
+        )
+    lines.extend(_format_table(buf_rows, indent="    "))
+
+    lines.append("  buffer_scopes:")
+    scope_rows = [(f"{name}:", scope.value) for name, scope in ir.buffer_scopes.items()]
+    lines.extend(_format_table(scope_rows, indent="    "))
+
+    lines.append("  num_buffers:")
+    nb_rows = [
+        (
+            f"{name}:",
+            f"p={nb.num_p_buffers if nb.num_p_buffers is not None else '-'}",
+            f"f={nb.num_f_buffers if nb.num_f_buffers is not None else '-'}",
+        )
+        for name, nb in ir.num_buffers.items()
+    ]
+    lines.extend(_format_table(nb_rows, indent="    "))
+
+    lines.append("  emission_depth:")
+    depth_rows = [(f"{name}:", str(depth)) for name, depth in ir.emission_depth.items()]
+    lines.extend(_format_table(depth_rows, indent="    "))
+
+    lines.append("  ops:")
+    for i, op in enumerate(ir.ops):
+        inputs = ", ".join(f"{k}={v}" for k, v in op.inputs.items())
+        outputs = ", ".join(op.outputs)
+        extras: list[str] = []
+        if op.blocking_dims:
+            extras.append(f"blocking={{{','.join(sorted(op.blocking_dims))}}}")
+        if op.axis_map:
+            axis_str = ",".join(f"{k}={v}" for k, v in op.axis_map.items())
+            extras.append(f"axes={{{axis_str}}}")
+        if op.attrs:
+            extras.append(f"attrs={op.attrs}")
+        extras_str = f"  [{'  '.join(extras)}]" if extras else ""
+        lines.append(f"    {i}. {op.kind}({inputs}) -> {outputs}{extras_str}")
+
+    lines.append("  edges:")
+    if ir.edges:
+        edge_str = ", ".join(f"{p}->{c}" for p, c in ir.edges)
+        lines.append(f"    {edge_str}")
+
+    return "\n".join(lines)
+
+
+def _format_dict(d: dict[str, int]) -> str:
+    """Compact ``{k:v, k:v}`` rendering preserving insertion order."""
+    return "{" + ", ".join(f"{k}:{v}" for k, v in d.items()) + "}"
+
+
+def _format_table(rows: list[tuple[str, ...]], indent: str) -> list[str]:
+    """Left-align each column across ``rows``; join with two-space gaps."""
+    if not rows:
+        return []
+    width = max(len(r) for r in rows)
+    col_widths = [max(len(r[c]) for r in rows if c < len(r)) for c in range(width)]
+    out = []
+    for row in rows:
+        cells = [cell.ljust(col_widths[i]) for i, cell in enumerate(row)]
+        out.append(indent + "  ".join(cells).rstrip())
+    return out

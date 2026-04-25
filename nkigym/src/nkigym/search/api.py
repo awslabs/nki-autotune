@@ -57,9 +57,9 @@ def remote_run(
         ProfileOutput with timing and correctness.
     """
     source = render_ir(ir)
-    payload = _inline_gadgets(source)
+    payload = inline_gadgets(source)
     mac_count = compute_mac_count(func, input_specs)
-    nkigym_source = _func_source_with_imports(func)
+    nkigym_source = func_source_with_imports(func)
     output_shape = tuple(ir.logical_tensors[ir.return_name].shape)
     job = KernelJob(
         source=payload,
@@ -75,60 +75,22 @@ def remote_run(
     )
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
-    _dump_ir(cache_path, kernel_name, ir)
+    dump_ir(cache_path, kernel_name, ir)
     return remote_profile(kernels={kernel_name: job}, hosts=hosts, cache_dir=cache_dir, config=config)
 
 
-def _dump_ir(cache_path: Path, kernel_name: str, ir: KernelIR) -> None:
+def dump_ir(cache_path: Path, kernel_name: str, ir: KernelIR) -> None:
     """Write the KernelIR fields alongside the rendered kernel."""
     stem = Path(kernel_name).stem
     ir_dir = cache_path / stem
     ir_dir.mkdir(parents=True, exist_ok=True)
-    (ir_dir / "ir.md").write_text(_format_ir(ir))
-
-
-def _format_ir(ir: KernelIR) -> str:
-    """Human-readable dump of every KernelIR field."""
-    lines: list[str] = [
-        f"# KernelIR: {ir.func_name}",
-        "",
-        f"- param_names: {ir.param_names}",
-        f"- return_name: {ir.return_name}",
-        f"- dim_order: {ir.dim_order}",
-        f"- ltiles_per_block: {ir.ltiles_per_block}",
-        "",
-        "## dimensions",
-    ]
-    for name, info in ir.dimensions.items():
-        lines.append(f"- {name}: {info}")
-    lines.extend(["", "## logical_tensors"])
-    for name, t in ir.logical_tensors.items():
-        lines.append(f"- {name}: {t}")
-    lines.extend(["", "## physical_buffers"])
-    for name, buf in ir.physical_buffers.items():
-        lines.append(f"- {name}: {buf}")
-    lines.extend(["", "## buffer_scopes"])
-    for name, scope in ir.buffer_scopes.items():
-        lines.append(f"- {name}: {scope.value}")
-    lines.extend(["", "## num_buffers"])
-    for name, nb in ir.num_buffers.items():
-        lines.append(f"- {name}: {nb}")
-    lines.extend(["", "## emission_depth"])
-    for name, depth in ir.emission_depth.items():
-        lines.append(f"- {name}: {depth}")
-    lines.extend(["", "## ops"])
-    for i, op in enumerate(ir.ops):
-        lines.append(f"{i}. {op}")
-    lines.extend(["", "## edges"])
-    for producer, consumer in ir.edges:
-        lines.append(f"- {producer} → {consumer}")
-    return "\n".join(lines) + "\n"
+    (ir_dir / "ir.md").write_text(repr(ir) + "\n")
 
 
 _GADGETS_PREAMBLE = "from typing import Any\n\nimport nki.isa as nisa\nimport nki.language as nl\n"
 
 
-def _inline_gadgets(kernel_src: str) -> str:
+def inline_gadgets(kernel_src: str) -> str:
     """Prepend every gadget's source so the emitted kernel is self-contained.
 
     Walks ``nkigym.codegen.gadgets.__all__`` and inlines each function's
@@ -156,7 +118,7 @@ def _inline_gadgets(kernel_src: str) -> str:
     return bundle + "\n".join(stripped) + "\n"
 
 
-def _func_source_with_imports(func: Callable[..., np.ndarray]) -> str:
+def func_source_with_imports(func: Callable[..., np.ndarray]) -> str:
     """Return *func*'s source prefixed with a minimal nkigym-safe preamble."""
     module = inspect.getmodule(func)
     if module is None:
