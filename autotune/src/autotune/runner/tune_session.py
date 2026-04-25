@@ -20,7 +20,7 @@ themselves):
 * ``batch_<bid>/``
    * ``kernel_<kid>/``
       * ``batch_<bid>_kernel_<kid>.py``                  — rendered NKI source
-      * ``batch_<bid>_ir_<kid>.py``                      — KernelIR ``repr``
+      * ``batch_<bid>_ir_<kid>.md``                      — KernelIR ``repr``
       * ``batch_<bid>_kernel_<kid>_log-neuron-cc.txt``   — compiler log
    * ``batch_<bid>_results.json``                        — backend-shape results for the batch
 * ``summary.json``  — ``{"function": str, "baseline": {...}, "tuning": {"batch_<bid>": {...}}}``
@@ -121,6 +121,13 @@ def submit_batch(
     ``batch_<bid>_results.json``). Rewrites ``summary.json`` with the
     new batch's running-best entry.
 
+    Deduplicates against prior batches: an IR whose ``repr`` matches a
+    kernel recorded in any prior ``batch_<bid>_results.json`` is not
+    re-rendered or re-profiled — the cached :class:`ProfileResult` is
+    returned in that slot (its ``kernel_name`` still points at the
+    original batch). If every IR is a cache hit, no new batch is
+    created and ``summary.json`` is left untouched.
+
     Returns :class:`ProfileResult` for each IR in input order.
     """
     if not irs:
@@ -136,6 +143,21 @@ def submit_batch(
     )
     summary.setdefault("tuning", {})
 
+    """Partition inputs into cache hits (prior ProfileResult reused) and
+    fresh IRs that need rendering + shipping."""
+    prior_cache = _load_prior_ir_results(cache_root)
+    cached: dict[int, ProfileResult] = {}
+    fresh: list[tuple[int, KernelIR]] = []
+    for idx, ir in enumerate(irs):
+        hit = prior_cache.get(repr(ir))
+        if hit is not None:
+            cached[idx] = hit
+        else:
+            fresh.append((idx, ir))
+
+    if not fresh:
+        return [cached[i] for i in range(len(irs))]
+
     bid = _next_batch_id(summary)
     next_kid = _next_kernel_id(cache_root, summary)
 
@@ -145,10 +167,10 @@ def submit_batch(
     nkigym_source = func_source_with_imports(f_nkigym)
     mac_count = compute_mac_count(f_nkigym, input_specs)
 
-    """Render every IR, stage .py + ir.py + KernelJob dict."""
+    """Render every fresh IR, stage .py + ir.md + KernelJob dict."""
     jobs: dict[str, KernelJob] = {}
-    assignments: list[tuple[int, str, KernelIR]] = []
-    for ir in irs:
+    assignments: list[tuple[int, int, str, KernelIR]] = []
+    for input_idx, ir in fresh:
         kid = next_kid
         next_kid += 1
         stem = f"batch_{bid}_kernel_{kid}"
@@ -156,7 +178,7 @@ def submit_batch(
         kdir = batch_dir / f"kernel_{kid}"
         kdir.mkdir(parents=True, exist_ok=True)
         source = inline_gadgets(render_ir(ir))
-        (kdir / f"batch_{bid}_ir_{kid}.py").write_text(repr(ir) + "\n")
+        (kdir / f"batch_{bid}_ir_{kid}.md").write_text(repr(ir) + "\n")
         jobs[kernel_name] = KernelJob(
             source=source,
             func_name=ir.func_name,
@@ -169,7 +191,7 @@ def submit_batch(
             rtol=rtol,
             neuronx_cc_args=_NEURONX_CC_ARGS,
         )
-        assignments.append((kid, kernel_name, ir))
+        assignments.append((input_idx, kid, kernel_name, ir))
 
     """Ship — let the backend do source/log/results writes under batch_dir/<stem>/."""
     output = remote_profile(jobs, hosts=hosts, cache_dir=str(batch_dir))
@@ -177,7 +199,7 @@ def submit_batch(
 
     """Fold the backend's <stem>/ layout into the requested one:
        kernel_<kid>/batch_<bid>_kernel_<kid>.py + _log-neuron-cc.txt."""
-    for kid, kernel_name, _ir in assignments:
+    for _input_idx, kid, kernel_name, _ir in assignments:
         stem = Path(kernel_name).stem
         stem_dir = batch_dir / stem
         dst_dir = batch_dir / f"kernel_{kid}"
@@ -192,20 +214,86 @@ def submit_batch(
     if backend_results.exists():
         backend_results.rename(batch_dir / f"batch_{bid}_results.json")
 
-    """Running-best bookkeeping: this batch vs. prior last-batch best."""
+    """Splice fresh results back into input order alongside cache hits."""
+    fresh_by_idx: dict[int, ProfileResult] = {
+        input_idx: by_name[kernel_name] for input_idx, _kid, kernel_name, _ir in assignments
+    }
+    merged = {**cached, **fresh_by_idx}
+    ordered: list[ProfileResult] = [merged[i] for i in range(len(irs))]
+
+    """Running-best bookkeeping: this batch vs. prior last-batch best.
+    Consider all slots (cache + fresh) so a cache hit higher than the
+    prior running-best still promotes, guarding against manually edited
+    summary.json."""
     prior_best_name, prior_best_mfu = _latest_running_best(summary)
     best_name, best_mfu = prior_best_name, prior_best_mfu
-    ordered: list[ProfileResult] = []
-    for kid, kernel_name, _ir in assignments:
-        pr = by_name[kernel_name]
-        ordered.append(pr)
-        if pr.mfu is not None and (best_mfu is None or pr.mfu > best_mfu):
-            best_name = kernel_name
-            best_mfu = pr.mfu
+    for r in ordered:
+        if r.mfu is not None and (best_mfu is None or r.mfu > best_mfu):
+            best_name = r.kernel_name
+            best_mfu = r.mfu
 
     summary["tuning"][f"batch_{bid}"] = {"running_best_kernel": best_name, "mfu": best_mfu}
     summary_path.write_text(json.dumps(summary, indent=2))
     return ordered
+
+
+def _load_prior_ir_results(cache_root: Path) -> dict[str, ProfileResult]:
+    """Scan prior batches and build ``{repr(ir) -> ProfileResult}``.
+
+    Walks every ``batch_<bid>/batch_<bid>_results.json`` under
+    ``cache_root``. For each kernel entry, reads the sibling
+    ``kernel_<kid>/batch_<bid>_ir_<kid>.md`` (dropping its trailing
+    newline) and maps that IR repr to a :class:`ProfileResult`
+    reconstructed from the JSON row. Entries whose ``ir.md`` is missing
+    are skipped — their IR repr can't be known, so they can't dedup.
+
+    If the same IR repr was run more than once, the latest occurrence
+    wins (dicts preserve insertion order; batches iterate in ascending
+    id).
+    """
+    cache: dict[str, ProfileResult] = {}
+    batch_dirs = sorted(
+        (p for p in cache_root.glob("batch_*") if p.is_dir()),
+        key=lambda p: int(p.name.rsplit("_", 1)[-1]) if p.name.rsplit("_", 1)[-1].isdigit() else -1,
+    )
+    for batch_dir in batch_dirs:
+        try:
+            bid = int(batch_dir.name.rsplit("_", 1)[-1])
+        except ValueError:
+            continue
+        results_path = batch_dir / f"batch_{bid}_results.json"
+        if not results_path.exists():
+            continue
+        try:
+            data = json.loads(results_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        for entry in data.get("kernels", []):
+            kernel_name = entry.get("kernel_name", "")
+            stem = Path(kernel_name).stem
+            tail = stem.rsplit("_", 1)[-1]
+            if not tail.isdigit():
+                continue
+            kid = int(tail)
+            ir_md = batch_dir / f"kernel_{kid}" / f"batch_{bid}_ir_{kid}.md"
+            if not ir_md.exists():
+                continue
+            ir_repr = ir_md.read_text().rstrip("\n")
+            cache[ir_repr] = ProfileResult(
+                kernel_name=kernel_name,
+                min_ms=entry.get("min_ms"),
+                mean_ms=entry.get("mean_ms"),
+                p50_ms=entry.get("p50_ms"),
+                p99_ms=entry.get("p99_ms"),
+                mac_count=entry.get("mac_count", 0),
+                mfu=entry.get("mfu"),
+                cpu_sim=entry.get("cpu_sim", {}),
+                hardware_output=entry.get("hardware_output", ""),
+                mbu_estimated_percent=entry.get("mbu_estimated_percent"),
+                mfu_max_achievable_estimated_percent=entry.get("mfu_max_achievable_estimated_percent"),
+                roofline_efficiency=entry.get("roofline_efficiency"),
+            )
+    return cache
 
 
 def _next_batch_id(summary: dict) -> int:

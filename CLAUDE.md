@@ -8,9 +8,5 @@ pytest <tests>
 ```
 
 Next to-do:
-1. Computation skipping as a graph rewrite
-2. ltiles_per_block tuning
-3. Roofline efficiency
-4. Software pipelining
-5. Buffer allocation
-6. Data layout via dummy transposes
+1. Online Fusion as a graph rewrite
+2. Computation skipping as a graph rewrite

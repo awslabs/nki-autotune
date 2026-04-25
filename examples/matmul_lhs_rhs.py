@@ -50,11 +50,11 @@ def matmul_lhs_rhs_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 
 if __name__ == "__main__":
     M, K, N = 2048, 2048, 2048
-    HOSTS = ["gym-1", "gym-2"]
+    HOSTS = ["gym-2", "gym-3"]
     ATOL, RTOL = 1e-2, 1e-2
 
     INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-    CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhs_rhs")
+    CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhs_rhs_sampling")
 
     shutil.rmtree(CACHE_ROOT, ignore_errors=True)
     CACHE_ROOT.mkdir(parents=True)

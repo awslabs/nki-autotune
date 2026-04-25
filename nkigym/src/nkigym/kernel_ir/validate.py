@@ -1,22 +1,61 @@
 """Lightweight validity checks over a ``KernelIR``'s knob assignment.
 
 These are cheap, mechanical guards meant to filter random samples
-before rendering — each function returns ``True`` iff the IR satisfies
-the structural invariant. No rendering, no exceptions.
+before rendering — no rendering, no exceptions. Two entry points:
+
+* :func:`is_valid` — boolean fast-path for sampler reject loops.
+* :func:`validity_report` — structured list of every failed check
+  with a fix hint. Use this in tuning loops to decide which knob to
+  flip instead of discarding a near-miss IR.
 """
+
+from dataclasses import dataclass
 
 from nkigym.kernel_ir.ir import BufferScope, KernelIR, Op
 from nkigym.kernel_ir.types import DimRole
 
 
+@dataclass(frozen=True)
+class ValidityFailure:
+    """One failed validity check, plus a concrete fix hint.
+
+    Attributes:
+        check: Identifier of the failed check — one of
+            ``emission_depth_ceiling``, ``rotation_axis_closed``,
+            ``transpose_scope_mismatch``, ``accumulator_coverage``.
+        buffer: Buffer name the failure pertains to, or ``None`` when
+            the failure is whole-IR.
+        detail: Human-readable description of what went wrong
+            (actual vs. expected numbers).
+        fix_hint: One-line actionable suggestion naming the knob to
+            adjust and the direction of adjustment.
+    """
+
+    check: str
+    buffer: str | None
+    detail: str
+    fix_hint: str
+
+
 def is_valid(ir: KernelIR) -> bool:
     """Return ``True`` iff every validity check passes."""
-    return (
-        _emission_depth_is_valid(ir)
-        and _rotation_axes_in_scope(ir)
-        and _transpose_scopes_match(ir)
-        and _accumulator_covers_closed_dims(ir)
-    )
+    return not validity_report(ir)
+
+
+def validity_report(ir: KernelIR) -> list[ValidityFailure]:
+    """Return every failed validity check on ``ir``.
+
+    Empty list = valid. Each :class:`ValidityFailure` names the
+    check, the buffer, the numerical detail, and a one-line fix
+    hint. Useful when a tuning loop wants to nudge a single knob
+    rather than discard the whole IR.
+    """
+    failures: list[ValidityFailure] = []
+    failures.extend(_check_emission_depth(ir))
+    failures.extend(_check_rotation_axes(ir))
+    failures.extend(_check_transpose_scopes(ir))
+    failures.extend(_check_accumulator_coverage(ir))
+    return failures
 
 
 def _accumulator_covers_closed_dims(ir: KernelIR) -> bool:
@@ -28,16 +67,22 @@ def _accumulator_covers_closed_dims(ir: KernelIR) -> bool:
     store emits the full HBM span on those axes and expects the SBUF
     source to match that span.
     """
+    return not _check_accumulator_coverage(ir)
+
+
+def _check_accumulator_coverage(ir: KernelIR) -> list[ValidityFailure]:
+    """List every output axis the matmul accumulator fails to cover."""
     acc_op = _find_matmul_op(ir)
     if acc_op is None or not acc_op.outputs:
-        return True
+        return []
     acc_buf_name = acc_op.outputs[0]
     if acc_buf_name not in ir.buffer_scopes:
-        return True
+        return []
     first_acc_pos = _store_depth(ir)
     buf = ir.physical_buffers[acc_buf_name]
     scope = ir.buffer_scopes[acc_buf_name]
     outer_axis = _outer_axis_in_order(ir, buf.p_axis, buf.f_axis)
+    failures: list[ValidityFailure] = []
     for axis in (buf.p_axis, buf.f_axis):
         if axis is None or axis not in ir.dim_order:
             continue
@@ -46,8 +91,23 @@ def _accumulator_covers_closed_dims(ir: KernelIR) -> bool:
         num_tiles = _num_tiles_for_scope(ir, axis, scope, is_outer=(axis == outer_axis))
         full = ir.dimensions[axis].dim_size // ir.dimensions[axis].physical_tile_size
         if num_tiles < full:
-            return False
-    return True
+            failures.append(
+                ValidityFailure(
+                    check="accumulator_coverage",
+                    buffer=acc_buf_name,
+                    detail=(
+                        f"axis {axis!r} covered by {num_tiles} tiles but needs {full} "
+                        f"(position {ir.dim_order.index(axis)} ≥ first_acc_position "
+                        f"{first_acc_pos} → its loop is already closed at store)"
+                    ),
+                    fix_hint=(
+                        f"widen {acc_buf_name} scope to OUTER (or MIDDLE if "
+                        f"{axis!r} is outermost), or move {axis!r} before any "
+                        f"ACCUMULATION dim in dim_order so its loop stays open at store"
+                    ),
+                )
+            )
+    return failures
 
 
 def _find_matmul_op(ir: KernelIR) -> Op | None:
@@ -67,6 +127,12 @@ def _transpose_scopes_match(ir: KernelIR) -> bool:
     use the same scope-sizing rule on each dim — equivalent to
     matching scope labels.
     """
+    return not _check_transpose_scopes(ir)
+
+
+def _check_transpose_scopes(ir: KernelIR) -> list[ValidityFailure]:
+    """List every transpose whose src/dst scopes disagree."""
+    failures: list[ValidityFailure] = []
     for op in ir.ops:
         if op.kind not in ("NKITranspose", "NKIDMATranspose"):
             continue
@@ -76,9 +142,25 @@ def _transpose_scopes_match(ir: KernelIR) -> bool:
             continue
         if src not in ir.buffer_scopes or dst not in ir.buffer_scopes:
             continue
-        if ir.buffer_scopes[src] is not ir.buffer_scopes[dst]:
-            return False
-    return True
+        src_scope = ir.buffer_scopes[src]
+        dst_scope = ir.buffer_scopes[dst]
+        if src_scope is not dst_scope:
+            failures.append(
+                ValidityFailure(
+                    check="transpose_scope_mismatch",
+                    buffer=dst,
+                    detail=(
+                        f"transpose {src!r}→{dst!r} has src scope {src_scope.name} "
+                        f"but dst scope {dst_scope.name}; gadget requires matching "
+                        f"num_p_tiles/num_f_tiles across the swapped axes"
+                    ),
+                    fix_hint=(
+                        f"set buffer_scopes[{dst!r}] = buffer_scopes[{src!r}] "
+                        f"(or vice-versa) — transpose pairs share one scope"
+                    ),
+                )
+            )
+    return failures
 
 
 def _emission_depth_is_valid(ir: KernelIR) -> bool:
@@ -88,10 +170,30 @@ def _emission_depth_is_valid(ir: KernelIR) -> bool:
     emits before the allocation, triggering ``UnboundLocalError`` at
     sim time.
     """
+    return not _check_emission_depth(ir)
+
+
+def _check_emission_depth(ir: KernelIR) -> list[ValidityFailure]:
+    """List every buffer whose ``emission_depth`` exceeds its first use."""
+    failures: list[ValidityFailure] = []
     for name, depth in ir.emission_depth.items():
-        if depth > first_use_depth(ir, name):
-            return False
-    return True
+        fu = first_use_depth(ir, name)
+        if depth > fu:
+            failures.append(
+                ValidityFailure(
+                    check="emission_depth_ceiling",
+                    buffer=name,
+                    detail=(
+                        f"emission_depth={depth} exceeds first_use_depth={fu} "
+                        f"(allocation would land below the first reference)"
+                    ),
+                    fix_hint=(
+                        f"lower emission_depth[{name!r}] to ≤ {fu}, or widen the "
+                        f"buffer's scope / change dim_order to push first_use_depth deeper"
+                    ),
+                )
+            )
+    return failures
 
 
 def first_use_depth(ir: KernelIR, buf_name: str) -> int:
@@ -139,14 +241,57 @@ def _rotation_axes_in_scope(ir: KernelIR) -> bool:
     axis's loop hasn't been entered yet, that reference triggers
     ``UnboundLocalError``.
     """
+    return not _check_rotation_axes(ir)
+
+
+def _check_rotation_axes(ir: KernelIR) -> list[ValidityFailure]:
+    """List every rotation whose index axis is closed at first use."""
+    failures: list[ValidityFailure] = []
     for name, nb in ir.num_buffers.items():
         depth = first_use_depth(ir, name)
         buf = ir.physical_buffers[name]
         if nb.num_p_buffers is not None and not axis_open(ir, buf.p_axis, depth):
-            return False
+            failures.append(
+                ValidityFailure(
+                    check="rotation_axis_closed",
+                    buffer=name,
+                    detail=(
+                        f"num_p_buffers={nb.num_p_buffers} on p_axis={buf.p_axis!r} "
+                        f"but that axis is not open at first_use_depth={depth} "
+                        f"(position {_axis_position(ir, buf.p_axis)} in dim_order)"
+                    ),
+                    fix_hint=(
+                        f"set num_buffers[{name!r}].num_p_buffers=None, or move "
+                        f"{buf.p_axis!r} above position {depth} in dim_order so its "
+                        f"loop is open when {name!r} is first referenced"
+                    ),
+                )
+            )
         if nb.num_f_buffers is not None and buf.f_axis is not None and not axis_open(ir, buf.f_axis, depth):
-            return False
-    return True
+            failures.append(
+                ValidityFailure(
+                    check="rotation_axis_closed",
+                    buffer=name,
+                    detail=(
+                        f"num_f_buffers={nb.num_f_buffers} on f_axis={buf.f_axis!r} "
+                        f"but that axis is not open at first_use_depth={depth} "
+                        f"(position {_axis_position(ir, buf.f_axis)} in dim_order)"
+                    ),
+                    fix_hint=(
+                        f"set num_buffers[{name!r}].num_f_buffers=None, or move "
+                        f"{buf.f_axis!r} above position {depth} in dim_order so its "
+                        f"loop is open when {name!r} is first referenced"
+                    ),
+                )
+            )
+    return failures
+
+
+def _axis_position(ir: KernelIR, axis: str | None) -> int | str:
+    """Position of ``axis`` in ``dim_order``, or ``'absent'`` when missing."""
+    if axis is None or axis not in ir.dim_order:
+        return "absent"
+    return ir.dim_order.index(axis)
 
 
 def axis_open(ir: KernelIR, axis: str, depth: int) -> bool:

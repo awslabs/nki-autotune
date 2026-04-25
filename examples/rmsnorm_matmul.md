@@ -519,3 +519,151 @@ def rmsnorm_matmul_nkigym(lhs, rhs):
             # store_block placed here after i_block_d1 (ACCUMULATION) closes; d0 per-block, d2 per-block
             store_block(output[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], cur_sbuf_output[i_block_d0 * 8 : i_block_d0 * 8 + 8])
 ```
+
+# KernelIR Rewrite: OnlineFusion
+Operators `(2, 3, 4, 5)` forms a chain. `d1` has roles of `SEQUENTIAL, PARALLEL, PARALLEL, ACCUMULATION`. This means that operators 2 and 5 have to create dependent sibling loops due to math validity.
+```bash
+[2] NKIActivationReduce:
+    data=sbuf_lhs, outputs=[sbuf_rms_inv], op='square', reduce_op='add', post_op='rsqrt', scale=1/2048, bias=eps, dim_map={'P': 'd0', 'F':'d1'}, dim_role={'P':PARALLEL, 'F':SEQUENTIAL}
+[3] NKITensorScalar:
+    data=sbuf_lhs, operand0=sbuf_rms_inv, outputs=[sbuf_lhs_rms], op='multiply', dim_map={'P': 'd0', 'F':'d1'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
+[4] NKITranspose:
+    data=sbuf_lhs_rms, outputs=[sbuf_lhs_T], dim_map={'P': 'd0', 'F':'d1'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
+[5] NKIMatmul:
+    stationary=sbuf_lhs_T, moving=sbuf_rhs, outputs=[sbuf_output], dim_map={'K': 'd1', 'M': 'd0', 'N': 'd2'}, dim_role={'K':ACCUMULATION, 'M':PARALLEL, 'N':PARALLEL}
+```
+
+However, we can apply online fusion mathematical transforms.
+
+## Pattern match against Algorithm 2
+
+Each `OnlineFusion.apply` fuses **exactly one pair** $(\text{op}_X, \text{op}_A)$. Algorithm 2 has three sections:
+
+1. X-loop: $\mathbf{O_0}_k = f_X(\mathbf{O_0}_{k-1}, \mathbf{V_0}_k)$ — blocking reduction along $D$.
+2. Hoisted closure: $g_B(\mathbf{O_0}_K)$ — a $D$-invariant tensor computed once after the X-loop closes.
+3. Accumulation loop: $\mathbf{B}_k = g_B(\mathbf{O_0}_K)\,h_B(\mathbf{V_1}_k)$, $\mathbf{O_1}_k = \mathbf{O_1}_{k-1} + \mathbf{B}_k$.
+
+**Match criteria** for a candidate pair along a shared dim $D$:
+
+1. $\text{op}_X$ has `dim_role[D] ∈ {SEQUENTIAL, ACCUMULATION}` and reduces $D$ out of its output (so $\mathbf{O_0}_K$ has no $D$ axis — a single value per non-$D$ position). SEQUENTIAL is the superset — arbitrary recurrence $f_X(\mathbf{O_0}_{k-1},\mathbf{V_0}_k)$. ACCUMULATION is the add-linear special case. The `post_op` of $\text{op}_X$ (if any) **is** $g_B$ — the closure applied once when the $D$-loop closes. $g_B$ is a function of $\mathbf{O_0}_K$ only.
+2. $\text{op}_A$ has `dim_role[D] = ACCUMULATION` (strictly — the fusion derivation relies on the linearity and associativity of $+$, which SEQUENTIAL does not guarantee) and transitively consumes $g_B(\mathbf{O_0}_K)$.
+3. All intermediate ops on the dependency path from $\text{op}_X$ to $\text{op}_A$ have `dim_role[D] = PARALLEL`. Together with $\text{op}_A$, they realize $h_B$ and the $g_B\cdot h_B$ product: intermediate ops fold $g_B$ into one of $h_B$'s $D$-varying operands, and $\text{op}_A$ completes $h_B$ plus the $+\mathbf{B}_k$ drain.
+
+**Rmsnorm+matmul instance** — pair = (op 2, op 5); $D$ = `d1`; intermediate PARALLEL ops = {3, 4}:
+
+| Algorithm 2 section | IR realization |
+| --- | --- |
+| $\mathbf{O_0}_k = f_X(\mathbf{O_0}_{k-1},\mathbf{V_0}_k)$ | op 2 `NKIActivationReduce(op=square, reduce_op=add)` — `d1` SEQUENTIAL, yields $\mathbf{O_0}_K=\sum_k\mathbf{V_0}_k^2$ |
+| $g_B(\mathbf{O_0}_K) = 1/\sqrt{\mathbf{O_0}_K/K+\epsilon}$ | op 2 `post_op=rsqrt, scale=1/K, bias=eps` — fires once when the `d1`-loop closes |
+| $h_B(\mathbf{V_0}_k,\mathbf{V_1}_k) = \mathbf{V_0}_k\mathbf{V_1}_k$ and $\mathbf{B}_k = g_B\,h_B$ and $\mathbf{O_1}_k = \mathbf{O_1}_{k-1}+\mathbf{B}_k$ | op 3 `NKITensorScalar(multiply)` folds $g_B$ into $\mathbf{V_0}_k$ → op 4 `NKITranspose` lays out for matmul (both `d1` PARALLEL) → op 5 `NKIMatmul` completes the bilinear product with $\mathbf{V_1}_k$ and accumulates (`d1` ACCUMULATION) |
+
+**Notes on the mapping:**
+
+- **$\mathbf{V_1}_k$ is a bundle.** Textbook $\mathbf{V_1}_k$ labels the set of $k$-varying inputs to the accumulation loop; it need not be a single buffer. Here that bundle is $(\mathbf{V_0}_k, \mathbf{V_1}_k)$ — the rmsnorm input is reused across both loops (loop 0's X-input and loop 1's $h_B$ input), and the matmul RHS adds a fresh tensor. $h_B$ over this bundle is the product $\mathbf{V_0}_k\mathbf{V_1}_k$.
+- **$g_B\cdot h_B$ is factored across the PARALLEL chain.** Op 3 applies $g_B$ to one factor of $h_B$ ($\mathbf{V_0}_k$), op 5 completes the product with the other ($\mathbf{V_1}_k$) and accumulates. Result: $\mathbf{B}_k = g_B(\mathbf{O_0}_K)\cdot\mathbf{V_0}_k\mathbf{V_1}_k$.
+- **Layout-identity ops ride the PARALLEL chain.** Op 4 does no math, but it sits on the path with `dim_role[d1]=PARALLEL`, so the matcher accepts it transparently.
+
+## Apply Algorithm 4
+
+Substitute into $\mathbf{\tilde O_1}_k = s_k\mathbf{\tilde O_1}_{k-1} + \mathbf{B}_k$ with $s_k = g_B(\mathbf{O_0}_k)/g_B(\mathbf{O_0}_{k-1})$:
+
+$$s_k=\frac{\sqrt{\mathbf{O_0}_{k-1}/K+\epsilon}}{\sqrt{\mathbf{O_0}_k/K+\epsilon}}, \qquad
+\mathbf{B}_k=\frac{\mathbf{V_0}_k\mathbf{V_1}_k}{\sqrt{\mathbf{O_0}_k/K+\epsilon}}, \qquad
+\mathbf{\tilde O_1}_k=s_k\mathbf{\tilde O_1}_{k-1}+\mathbf{B}_k$$
+
+One `apply` collapses the two sibling `i_block_d1` loops in the rendered kernel into a single fused pass. Further fusions on the same IR (if another $(\text{op}_X, \text{op}_A)$ pair remained) require a separate `apply` invocation.
+
+## Rewrite: fuse ops 2–5 into a single `NKIOnlineFusion`
+
+The rewrite replaces the subgraph $\{op_2, op_3, op_4, op_5\}$ with one composite op that carries the Algorithm 4 recurrence. Ops 0, 1, 6 (loads and store) are untouched.
+
+### KernelIR after rewrite
+
+```bash
+KernelIR(func=rmsnorm_matmul_nkigym, params=['lhs', 'rhs'], return=output)
+    # Derived objective information
+    dimensions:
+        d0: size=2048, ltile=128, ptile=128, num_ltile=16
+        d1: size=2048, ltile=128, ptile=128, num_ltile=16
+        d2: size=2048, ltile=512, ptile=512, num_ltile=4
+    input_hbm_tensors:
+        hbm_lhs: shape=(2048, 2048), dims=('d0', 'd1'), dtype=bfloat16
+        hbm_rhs: shape=(2048, 2048), dims=('d1', 'd2'), dtype=bfloat16
+    output_hbm_tensors:
+        hbm_output: shape=(2048, 2048), dims=('d0', 'd2'), dtype=bfloat16
+    physical_buffers:
+        sbuf_lhs:     tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
+        sbuf_rhs:     tile=(128, 512), dims=('d1', 'd2'), dtype=bfloat16
+        sbuf_output:  tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
+        sbuf_O0_new:  tile=(128,),     dims=('d0',),     dtype=float32
+        sbuf_O0_old:  tile=(128,),     dims=('d0',),     dtype=float32
+        sbuf_scale:   tile=(128,),     dims=('d0',),     dtype=float32
+    # Compute graph (can be changed by graph rewrites)
+    operators:
+        [0] NKILoad:
+            data=lhs, outputs=[sbuf_lhs], dim_map={'P': 'd0', 'F':'d1'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
+        [1] NKILoad:
+            data=rhs, outputs=[sbuf_rhs], dim_map={'P': 'd1', 'F':'d2'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
+        [2] NKIOnlineFusion:
+            op_X    = NKIActivationReduce(op='square', reduce_op='add', post_op='rsqrt', scale=1/2048, bias=eps)
+            g_chain = [NKITensorScalar(op='multiply'), NKITranspose()]
+            op_A    = NKIMatmul()
+            V0=sbuf_lhs, V1=sbuf_rhs, outputs=[sbuf_output]
+            scratch_buffers=[sbuf_O0_new, sbuf_O0_old, sbuf_scale]
+            dim_map={'K':'d1', 'M':'d0', 'N':'d2'}
+            dim_role={'K':ACCUMULATION, 'M':PARALLEL, 'N':PARALLEL}
+        [3] NKIStore:
+            data=sbuf_output, outputs=[hbm_output], dim_map={'P':'d0', 'F':'d2'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
+    edges: (0, 2), (1, 2), (2, 3)
+    # Tunable IR knobs
+    loop_order: ['d2', 'd0', 'd1']
+    ltiles/block:
+        d0: 8
+        d1: 4
+        d2: 1
+    buffer_scopes:
+        sbuf_lhs     = INNER
+        sbuf_rhs     = INNER
+        sbuf_output  = MIDDLE
+        sbuf_O0_new  = INNER
+        sbuf_O0_old  = INNER
+        sbuf_scale   = INNER
+    num_buffers:
+        sbuf_lhs:     {num_p_buffers: 2,    num_f_buffers: 4}     # rotate on d0, d1
+        sbuf_rhs:     {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d1 only
+        sbuf_output:  {num_p_buffers: None, num_f_buffers: 4}     # rotate on d2 only
+        sbuf_O0_new:  {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d0 only
+        sbuf_O0_old:  {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d0 only
+        sbuf_scale:   {num_p_buffers: 2,    num_f_buffers: None}  # rotate on d0 only
+    emission_depth:
+        sbuf_lhs:     1    # inside loop_order[0] = i_block_d2
+        sbuf_rhs:     1    # inside loop_order[0] = i_block_d2
+        sbuf_output:  0    # outermost
+        sbuf_O0_new:  1    # inside loop_order[0] = i_block_d2
+        sbuf_O0_old:  1    # inside loop_order[0] = i_block_d2
+        sbuf_scale:   1    # inside loop_order[0] = i_block_d2
+```
+
+### Semantics of `NKIOnlineFusion`
+
+Static fields (frozen by the rewrite, not tunable):
+
+- `op_X` — the X-loop operator. `dim_role[K] ∈ {SEQUENTIAL, ACCUMULATION}`; carries the optional `post_op` that supplies $g_B$.
+- `g_chain` — ordered list of PARALLEL intermediate ops from op_X to op_A. May include math ops (fold $g_B$ into operands of $h_B$) and layout-identity ops.
+- `op_A` — the accumulation operator. `dim_role[K] = ACCUMULATION`; realizes $h_B$ over its $K$-varying input bundle and the $+\mathbf{B}_k$ drain.
+- `scratch_buffers` — running $\mathbf{O_0}_{new}$, $\mathbf{O_0}_{old}$, and the scale vector $s_k$. All fp32, partition-only (d0 only for this instance), introduced by the rewrite.
+
+Per-$k$ body (conceptual — Algorithm 4 applied to the instance):
+
+$$\mathbf{O_0}_{new} = f_X(\mathbf{O_0}_{old},\mathbf{V_0}_k), \qquad
+s_k = \frac{g_B(\mathbf{O_0}_{old})}{g_B(\mathbf{O_0}_{new})}, \qquad
+\mathbf{\tilde O_1} = s_k \mathbf{\tilde O_1} + g_B(\mathbf{O_0}_{new})\,h_B(\mathbf{V_0}_k,\mathbf{V_1}_k), \qquad
+\mathbf{O_0}_{old} \leftarrow \mathbf{O_0}_{new}$$
+
+$k=1$ is folded into the same expression by initializing $\mathbf{\tilde O_1} = 0$ — then $s_1\cdot 0 = 0$ regardless of $s_1$.
+
+### Rewrite invariants
+
+1. Ops $\{2, 3, 4, 5\}$ and the intermediate buffers `sbuf_rms_inv`, `sbuf_lhs_rms`, `sbuf_lhs_T` are removed. Only the $\mathbf{O_0}$ running pair plus the scale vector survive as fp32 scratch.
+2. The two sibling `i_block_d1` loops in the pre-rewrite kernel collapse into one — $f_X$, $g_B$, $h_B$, and the accumulation recurrence all fire per $k$ in that single loop.
+3. The rewrite is atomic: one $(op_X, op_A)$ pair per `apply`.
