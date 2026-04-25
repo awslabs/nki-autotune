@@ -580,9 +580,9 @@ Matmul emission
 def _emit_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
     """Emit ``matmul_block(out_slice, lhs_T, rhs)`` at the innermost loop body.
 
-    The output accumulator is sliced by the current M-block
-    (``ltiles_per_block[M]`` tiles wide) when the accumulator holds more
-    than one block along M. Inputs pass through their ``cur_<name>`` slot.
+    The accumulator is sliced down to one M-block on the P-axis and/or
+    one N-block on the free-axis whenever it holds more. Inputs pass
+    through their ``cur_<name>`` slot.
     """
     k_dim = op.axis_map["K"]
     m_dim = op.axis_map["M"]
@@ -592,16 +592,29 @@ def _emit_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op)
     out = op.outputs[0]
     out_info = allocs[out]
 
-    lt_m = ir.ltiles_per_block[m_dim]
-    out_base = _cur_name(out)
-    if out_info.buf.p_axis == m_dim and out_info.num_p_tiles > lt_m:
-        out_expr = f"{out_base}[i_block_{m_dim} * {lt_m} : i_block_{m_dim} * {lt_m} + {lt_m}]"
-    else:
-        out_expr = out_base
-
+    out_expr = _matmul_output_expr(ir, out_info, m_dim, n_dim)
     lhs_expr = _matmul_input_expr(ir, allocs, lhs, k_dim, m_dim)
     rhs_expr = _matmul_input_expr(ir, allocs, rhs, k_dim, n_dim)
     w.line(f"matmul_block({out_expr}, {lhs_expr}, {rhs_expr})")
+
+
+def _matmul_output_expr(ir: KernelIR, info: _BufAlloc, m_dim: str, n_dim: str) -> str:
+    """Accumulator slice for ``matmul_block``.
+
+    * M on P-axis, accumulator wider than one M-block → slice P-slot list.
+    * N on free-axis, accumulator wider than one N-block → per-leaf slice
+      the free axis via a list comprehension.
+    """
+    expr = _cur_name(info.name)
+    buf = info.buf
+    lt_m = ir.ltiles_per_block[m_dim]
+    lt_n = ir.ltiles_per_block[n_dim]
+    if buf.p_axis == m_dim and info.num_p_tiles > lt_m:
+        expr = f"{expr}[i_block_{m_dim} * {lt_m} : i_block_{m_dim} * {lt_m} + {lt_m}]"
+    if buf.f_axis == n_dim and info.num_f_tiles > lt_n:
+        f_width = info.f_tile * lt_n
+        expr = f"[leaf[:, i_block_{n_dim} * {f_width} : i_block_{n_dim} * {f_width} + {f_width}] for leaf in {expr}]"
+    return expr
 
 
 def _matmul_input_expr(ir: KernelIR, allocs: dict[str, _BufAlloc], name: str, k_dim: str, other_dim: str) -> str:
