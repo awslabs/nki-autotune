@@ -488,18 +488,36 @@ def _block_indexed_axes(ir: KernelIR, info: _BufAlloc) -> list[str]:
 
 
 def _emit_load(w: _Writer, ir: KernelIR, op: Op, info: _BufAlloc) -> None:
-    """Emit ``cur_<dst> = <dst>[...]`` + ``load_block(cur_<dst>, src[...], transpose=False)``."""
+    """Emit ``cur_<dst> = <dst>[...]`` + ``load_block(cur_<dst>, src[...], transpose=...)``.
+
+    ``op.attrs["transpose"]`` (installed by ``LoadTranspose``) flips the
+    HBM slice's axis order so ``load_block`` sees
+    ``(f_tile*num_f_tiles, num_p_tiles*p_tile)`` — matching the
+    ``dma_transpose`` contract.
+    """
     dst = op.outputs[0]
     src = op.inputs["data"]
     cur = _cur_name(dst)
+    transpose = bool(op.attrs.get("transpose", False))
     w.line(f"{cur} = {dst}{_rotation_index(info)}")
-    w.line(f"load_block({cur}, {_hbm_slice_expr(ir, src, info)}, transpose=False)")
+    w.line(f"load_block({cur}, {_hbm_slice_expr(ir, src, info, transpose)}, transpose={transpose})")
 
 
-def _hbm_slice_expr(ir: KernelIR, src: str, info: _BufAlloc) -> str:
-    """Build ``src[<p_slice>, <f_slice>]`` in the src tensor's dim order."""
+def _hbm_slice_expr(ir: KernelIR, src: str, info: _BufAlloc, transpose: bool) -> str:
+    """Build ``src[<slices>]`` with axis order matching ``load_block``'s expectations.
+
+    For non-transpose loads, slices follow the src tensor's own dim
+    order. For transpose loads, the sbuf's ``(p_axis, f_axis)`` are
+    swapped relative to ``src`` — the HBM slice must be ordered as
+    ``(f_axis, p_axis)`` of the *destination* sbuf to match the
+    ``(f_tile, num_p_tiles*p_tile)`` shape contract.
+    """
     src_dims = ir.logical_tensors[src].dim_ids
-    slices = [_axis_slice(ir, d, info) for d in src_dims]
+    if transpose:
+        axis_order = [info.buf.f_axis, info.buf.p_axis]
+    else:
+        axis_order = list(src_dims)
+    slices = [_axis_slice(ir, d, info) for d in axis_order if d is not None]
     return f"{src}[{', '.join(slices)}]"
 
 

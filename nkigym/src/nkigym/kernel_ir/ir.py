@@ -13,6 +13,7 @@ program to NKI source:
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from nkigym.kernel_ir.types import DimInfo, TensorInfo
 
@@ -66,14 +67,18 @@ class Op:
     """One NKI op record in the ops list.
 
     Attributes:
-        kind: Op class name — ``"NKILoad"``, ``"NKIMatmul"``, ``"NKIStore"``.
-        inputs: Named inputs — role → tensor name. Tensor names resolve
-            against ``logical_tensors`` (kernel params and producer outputs)
-            or ``physical_buffers`` (SBUF-side aliases).
+        kind: Op class name — e.g. ``"NKILoad"``, ``"NKIMatmul"``,
+            ``"NKITranspose"``, ``"NKIStore"``.
+        inputs: Named inputs — role → tensor name.
         outputs: Output names in declaration order.
         axis_map: Abstract axis label → dim id, e.g. ``{"K": "d0"}``.
         blocking_dims: Dim ids this op iterates over as inner loops
-            (the K reduction axis for matmul).
+            (e.g. the K reduction axis for matmul).
+        attrs: Per-op free-form attributes — rewrite-owned. Notable key:
+            * ``transpose`` (on ``NKILoad``) — when ``True`` the load
+              emits ``load_block(..., transpose=True)`` and the
+              destination sbuf's (p_axis, f_axis) are swapped relative
+              to the source HBM tensor.
     """
 
     kind: str
@@ -81,6 +86,7 @@ class Op:
     outputs: list[str] = field(default_factory=list)
     axis_map: dict[str, str] = field(default_factory=dict)
     blocking_dims: set[str] = field(default_factory=set)
+    attrs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

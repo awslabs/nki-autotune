@@ -6,16 +6,21 @@ benchmark, and return results as JSON on stdout.
 """
 
 import base64
+import inspect
 import json
 import logging
 import os
 import random
 import subprocess
+import textwrap
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from autotune.runner.types import _DEFAULT_VENV_PYTHON, KernelJob, ProfileResult, make_failure
 
@@ -409,3 +414,124 @@ class RemoteProfiler:
         _write_compiler_logs(cache_dir, self.compiler_logs)
         _write_results_json(cache_dir, kernels, results, self)
         logger.info("Cache saved to %s", cache_dir)
+
+
+_BASELINE_BOOTSTRAP_SCRIPT = (
+    "import base64,json,sys,os,tempfile,importlib.util;"
+    "b=json.loads(base64.b64decode(sys.stdin.buffer.readline()));"
+    "d=tempfile.mkdtemp();"
+    "[os.makedirs(os.path.join(d,os.path.dirname(n)),exist_ok=True) or "
+    'open(os.path.join(d,n),"w").write(s) for n,s in b.items()];'
+    "sys.path.insert(0,d);"
+    'spec=importlib.util.spec_from_file_location("baseline",'
+    'os.path.join(d,"autotune","runner","baseline.py"));'
+    "mod=importlib.util.module_from_spec(spec);"
+    'sys.modules["baseline"]=mod;'
+    "spec.loader.exec_module(mod);"
+    "mod.baseline_worker_main()"
+)
+
+
+def _func_source(func: Callable[..., np.ndarray]) -> str:
+    """Extract ``func``'s source with a minimal numpy-only preamble.
+
+    The remote worker exec()s this blob in a fresh namespace, so only
+    bare-minimum imports should travel with it — pulling every
+    top-level import from the host module would drag unrelated
+    project-local imports (``autotune``, ``nkigym``) that the worker's
+    fresh namespace has no business resolving. A plain-numpy baseline
+    function needs nothing beyond ``numpy``; any user helper it
+    references should be inlined into the function body.
+    """
+    return "import numpy as np\n\n" + textwrap.dedent(inspect.getsource(func))
+
+
+def remote_numpy_baseline(
+    func: Callable[..., np.ndarray],
+    input_specs: dict[str, tuple[tuple[int, ...], str]],
+    mac_count: int,
+    host: str,
+    kernel_name: str = "baseline",
+    venv_python: str = _DEFAULT_VENV_PYTHON,
+    neuron_platform_target: str = "trn2",
+    additional_compiler_args: str = "--lnc 1 --internal-tensorizer-opt-level=2",
+) -> ProfileResult:
+    """Run a nkipy numpy-baseline profile on a single remote Trainium host.
+
+    Companion to :func:`remote_profile`. Ships ``func``'s source to
+    ``host`` via the standard worker-bundle transport, where it is
+    compiled through nkipy + neuronx-cc (the same path ``baremetal_jit``
+    takes) and benchmarked with ``BaremetalExecutor``. Returns a single
+    :class:`ProfileResult` so the baseline sits next to tuned NKI
+    kernels in the same comparison table.
+
+    Args:
+        func: Numpy function to profile (e.g. ``lambda a, b: a @ b``).
+            Must be importable by source — top-level ``def`` preferred.
+        input_specs: ``{param_name: (shape, dtype_str)}`` matching the
+            positional order of ``func``'s parameters.
+        mac_count: Theoretical MACs for MFU computation.
+        host: SSH hostname of the Trainium node (e.g. ``"gym-1"``).
+        kernel_name: Identifier stored on the returned ProfileResult.
+        venv_python: Path to the Python interpreter on the remote host.
+        neuron_platform_target: Neuron platform target (default ``trn2``).
+        additional_compiler_args: Forwarded to neuronx-cc. Default
+            ``--internal-tensorizer-opt-level=2`` matches ``baremetal_jit``'s
+            baseline pipeline.
+    """
+    payload = {
+        "host": host,
+        "neuron_platform_target": neuron_platform_target,
+        "func_source": _func_source(func),
+        "func_name": func.__name__,
+        "input_specs": {name: [list(shape), dt] for name, (shape, dt) in input_specs.items()},
+        "mac_count": mac_count,
+        "kernel_name": kernel_name,
+        "additional_compiler_args": additional_compiler_args,
+    }
+    payload_bytes = json.dumps(payload).encode("utf-8")
+
+    cmd = [
+        "ssh",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPath=/tmp/autotune-ssh-%r@%h:%p",
+        "-o",
+        "ControlPersist=300",
+        host,
+        f"{venv_python} -c '{_BASELINE_BOOTSTRAP_SCRIPT}'",
+    ]
+    bundle_line = _get_worker_bundle()
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    writer = threading.Thread(target=_feed_stdin, args=(proc, bundle_line, payload_bytes), daemon=True)
+    writer.start()
+    try:
+        stdout_data, stderr_data = proc.communicate()
+    except BaseException:
+        proc.kill()
+        proc.communicate()
+        raise
+    writer.join()
+
+    stderr_text = stderr_data.decode(errors="replace").strip()
+    for line in stderr_text.splitlines():
+        logger.info("  [%s] %s", host, line)
+
+    if proc.returncode != 0:
+        return make_failure(kernel_name, f"SSH baseline on {host} exited {proc.returncode}: {stderr_text}", mac_count)
+    if not stdout_data:
+        return make_failure(kernel_name, f"No baseline result from {host} (empty stdout)", mac_count)
+    try:
+        data = json.loads(stdout_data)
+    except (json.JSONDecodeError, ValueError) as e:
+        return make_failure(kernel_name, f"Malformed baseline JSON from {host}: {e}", mac_count)
+    return ProfileResult(**data["result"])
