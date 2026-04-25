@@ -48,11 +48,12 @@ def build_tuned_matmul_ir(input_specs: dict[str, tuple[tuple[int, ...], str]]) -
 
 if __name__ == "__main__":
     K, M, N = 2048, 2048, 2048
-    INPUT_SPECS = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-    HOSTS = ["gym-2"]
+    HOSTS = ["gym-1"]
     ATOL, RTOL = 1e-2, 1e-2
 
+    INPUT_SPECS = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
     CACHE_ROOT = Path("/home/ubuntu/cache/matmul")
+
     shutil.rmtree(CACHE_ROOT, ignore_errors=True)
     CACHE_ROOT.mkdir(parents=True)
 
