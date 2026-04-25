@@ -17,7 +17,7 @@ HBM→SBUF DMA transpose, same perf as the previous
 ``load_block(transpose=True)`` path but with no attribute side-channel
 or dedicated load-transpose codepath.
 
-Two-stage interface (see :class:`GraphRewrite`):
+Two-stage interface (see :class:`IRRewrite`):
 
 * ``analyze(ir)`` returns a list of :class:`LoadTransposeMatch` — one
   per fusable ``(load, transpose)`` pair, in IR order. Pure inspection.
@@ -37,7 +37,7 @@ Guardrails (enforced during ``analyze``):
 from dataclasses import dataclass, replace
 
 from nkigym.kernel_ir.ir import KernelIR, Op
-from nkigym.kernel_ir.rewrites.base import GraphRewrite
+from nkigym.kernel_ir.rewrites.base import IRRewrite
 
 _TRANSPOSE_KINDS = frozenset({"NKITranspose", "NKIDMATranspose"})
 
@@ -61,7 +61,7 @@ class LoadTransposeMatch:
     new_sbuf: str
 
 
-class LoadTranspose(GraphRewrite[LoadTransposeMatch]):
+class LoadTranspose(IRRewrite[LoadTransposeMatch]):
     """Rewrite: replace ``(NKILoad, transpose)`` pairs with a single ``NKIDMATranspose``."""
 
     def analyze(self, ir: KernelIR) -> list[LoadTransposeMatch]:

@@ -1,8 +1,8 @@
 """Matmul ``lhs_T @ rhs`` — sampling many IR knob configurations.
 
-Samples ``num_samples`` random knob configurations from ``build_ir``'s
-default IR, renders each one, and profiles them in parallel across
-hosts.
+For every IR-rewrite variant (see ``enumerate_rewrite_combinations``)
+samples ``num_samples`` random knob configurations from the variant
+IR, renders each one, and profiles them in parallel across hosts.
 
 A plain-numpy equivalent ships through nkipy + neuronx-cc
 (``baremetal_jit``'s path) as the zero-NKI reference baseline.
@@ -23,6 +23,7 @@ from autotune.runner.remote import remote_numpy_baseline
 from autotune.runner.types import KernelJob
 from nkigym.codegen import render_ir
 from nkigym.kernel_ir import build_ir
+from nkigym.kernel_ir.rewrites import LoadTranspose, enumerate_rewrite_combinations
 from nkigym.kernel_ir.sample import knob_signature, sample
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.search import dump_ir, func_source_with_imports, inline_gadgets
@@ -52,6 +53,7 @@ if __name__ == "__main__":
     CACHE_ROOT.mkdir(parents=True)
 
     base_ir = build_ir(matmul_lhsT_rhs_nkigym, INPUT_SPECS)
+    variants = dict(enumerate_rewrite_combinations(base_ir, [LoadTranspose()]))
 
     mac_count = compute_mac_count(matmul_lhsT_rhs_nkigym, INPUT_SPECS)
     nkigym_source = func_source_with_imports(matmul_lhsT_rhs_nkigym)
@@ -60,27 +62,28 @@ if __name__ == "__main__":
     num_samples = 100
     seen: set[tuple] = set()
     kernels: dict[str, KernelJob] = {}
-    for i in range(num_samples):
-        candidate = sample(base_ir)
-        sig = knob_signature(candidate)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        source = inline_gadgets(render_ir(candidate))
-        kernel_name = f"kernel_{i}.py"
-        kernels[kernel_name] = KernelJob(
-            source=source,
-            func_name=candidate.func_name,
-            output_shape=output_shape,
-            input_specs=INPUT_SPECS,
-            nkigym_source=nkigym_source,
-            nkigym_func_name=matmul_lhsT_rhs_nkigym.__name__,
-            mac_count=mac_count,
-            atol=ATOL,
-            rtol=RTOL,
-            neuronx_cc_args=("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false"),
-        )
-        dump_ir(CACHE_ROOT, kernel_name, candidate)
+    for variant, ir in variants.items():
+        for i in range(num_samples):
+            candidate = sample(ir)
+            sig = knob_signature(candidate)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            source = inline_gadgets(render_ir(candidate))
+            kernel_name = f"{variant}_{i}.py"
+            kernels[kernel_name] = KernelJob(
+                source=source,
+                func_name=candidate.func_name,
+                output_shape=output_shape,
+                input_specs=INPUT_SPECS,
+                nkigym_source=nkigym_source,
+                nkigym_func_name=matmul_lhsT_rhs_nkigym.__name__,
+                mac_count=mac_count,
+                atol=ATOL,
+                rtol=RTOL,
+                neuronx_cc_args=("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false"),
+            )
+            dump_ir(CACHE_ROOT, kernel_name, candidate)
 
     output = remote_profile(kernels=kernels, hosts=HOSTS, cache_dir=str(CACHE_ROOT))
 

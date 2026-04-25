@@ -1,4 +1,4 @@
-"""Base class for ``KernelIR`` graph rewrites.
+"""Base class for ``KernelIR`` IR rewrites.
 
 Every rewrite is a two-stage transformation:
 
@@ -7,11 +7,13 @@ Every rewrite is a two-stage transformation:
    *match* records. No IR mutation. Safe to call, inspect, or drop.
 2. ``apply(ir, matches)`` — consumes the match list and produces a new
    ``KernelIR`` with those specific rewrites applied. The caller picks
-   which matches to forward — all of them, a subset, or none — so the
-   rewrite is no longer all-or-nothing.
+   which matches to forward — all of them, a subset, or none.
 
-The default ``__call__`` runs ``apply(ir, analyze(ir))`` for backwards
-compatible "rewrite everything" behaviour.
+Callers always go through the two steps explicitly::
+
+    rewrite = LoadTranspose()
+    matches = rewrite.analyze(ir)
+    new_ir = rewrite.apply(ir, matches)
 """
 
 from abc import ABC, abstractmethod
@@ -22,8 +24,8 @@ from nkigym.kernel_ir.ir import KernelIR
 Match = TypeVar("Match")
 
 
-class GraphRewrite(ABC, Generic[Match]):
-    """Two-stage ``KernelIR`` graph rewrite.
+class IRRewrite(ABC, Generic[Match]):
+    """Two-stage ``KernelIR`` rewrite.
 
     Subclasses parameterise ``Match`` — the opaque record describing
     one pattern occurrence — and implement ``analyze`` + ``apply``.
@@ -36,7 +38,3 @@ class GraphRewrite(ABC, Generic[Match]):
     @abstractmethod
     def apply(self, ir: KernelIR, matches: list[Match]) -> KernelIR:
         """Produce a new IR with ``matches`` rewritten. Caller curates the list."""
-
-    def __call__(self, ir: KernelIR) -> KernelIR:
-        """Rewrite every match — convenience wrapper around ``analyze`` + ``apply``."""
-        return self.apply(ir, self.analyze(ir))

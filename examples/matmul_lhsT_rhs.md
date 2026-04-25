@@ -23,7 +23,7 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
         sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
         sbuf_rhs:   tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
         sbuf_output: tile=(128, 512), dims=('d1', 'd2'), dtype=bfloat16
-    # Compute graph (can be changed by graph rewrites)
+    # Compute graph (can be changed by IR rewrites)
     operators:
         [0] NKILoad:
             data=lhs_T, outputs=[sbuf_lhs_T], dim_map={'P': 'd0', 'F':'d1'}, dim_role={'P':PARALLEL, 'F':PARALLEL}

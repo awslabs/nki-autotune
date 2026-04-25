@@ -13,7 +13,7 @@ Tunes one nkigym kernel by editing `KernelIR` knobs and measuring on Trainium. G
 - `nkigym/src/nkigym/kernel_ir/build.py` — `build_ir` parser
 - `nkigym/src/nkigym/kernel_ir/validate.py` — `is_valid(ir)` boolean + `validity_report(ir)` structured fix hints
 - `nkigym/src/nkigym/kernel_ir/sample.py` — `sample(ir, rng)` joint random draw over all 5 knobs; `knob_signature(ir)` for dedup
-- `nkigym/src/nkigym/kernel_ir/rewrites/` — available graph rewrites
+- `nkigym/src/nkigym/kernel_ir/rewrites/` — available IR rewrites + `enumerate_rewrite_combinations(ir, rewrites)`
 - `nkigym/src/nkigym/ops/<op>.py` — gadget + op class for each NKIOp
 - `nkigym/src/nkigym/codegen/render.py` — how knobs map to emitted code
 - `autotune/src/autotune/runner/tune_session.py` — `dump_baseline`, `submit_batch` for this skill
@@ -118,24 +118,23 @@ print(repr(ir))
 
 Read `repr(ir)` for: `dimensions` (dim ids + roles), `physical_buffers` (SBUF buffer names + tile shape), `ops` (op graph). Your knob dicts key off the buffer names printed here.
 
-## Step 3 — Enumerate graph-rewrite variants
+## Step 3 — Enumerate IR-rewrite variants
 
 ```bash
 ls nkigym/src/nkigym/kernel_ir/rewrites/
 ```
 
-Rewrites restructure the op graph and change which buffers exist. Every subset of applicable rewrites gives a distinct starting point for knob tuning — tune over all of them.
+Rewrites restructure the op graph and change which buffers exist. Every subset of applicable rewrites gives a distinct starting point for knob tuning — tune over all of them. `enumerate_rewrite_combinations(ir, rewrites)` yields one `(name, variant_ir)` per subset, deduping no-op rewrites (whose patterns aren't present) against `"base"`.
 
 ```python
 from nkigym.kernel_ir import build_ir
-from nkigym.kernel_ir.rewrites import LoadTranspose
+from nkigym.kernel_ir.rewrites import LoadTranspose, enumerate_rewrite_combinations
 
 base_ir = build_ir(f_nkigym, INPUT_SPECS)
-variants = {
-    "base":  base_ir,
-    "fused": LoadTranspose()(base_ir),
-    # add one entry per additional rewrite / combination as the library grows
-}
+variants = dict(enumerate_rewrite_combinations(base_ir, [LoadTranspose()]))
+"""For K rewrites, up to 2**K variants: {"base", "LoadTranspose",
+"LoadTranspose+OnlineFusion", ...}. Subsets whose IR repr matches
+an earlier variant are dropped."""
 for name, ir in variants.items():
     print(name)
     print(repr(ir))   # physical_buffers + ops differ per variant → knob dicts key off them
@@ -278,7 +277,7 @@ Search strategy for `propose_next_batch` — **two phases**, phase transition tr
 
 **Phase 1 — guided coordinate sweeps (early exploration).** Useful for establishing a per-variant floor and identifying which knobs individually move the needle.
 
-1. First batch: one plain `build_ir(...)` IR per rewrite variant from Step 3.
+1. First batch: `submit_batch(list(variants.values()), ...)` — one IR per rewrite combination from Step 3's `enumerate_rewrite_combinations` dict. Establishes a per-variant floor.
 2. Next few batches: vary one knob (5-10 settings) per rewrite variant, starting with coarse-grained choices — `ltiles` / `dim_order` / `buffer_scopes` before `num_buffers` / `emission_depth`.
 3. Read the rendered `.py` every time (`<CACHE_ROOT>/batch_<bid>/kernel_<kid>/batch_<bid>_kernel_<kid>.py`) to catch render bugs early.
 
@@ -287,10 +286,12 @@ Search strategy for `propose_next_batch` — **two phases**, phase transition tr
 ```python
 import random
 from nkigym.kernel_ir import build_ir
+from nkigym.kernel_ir.rewrites import LoadTranspose, enumerate_rewrite_combinations
 from nkigym.kernel_ir.sample import sample, knob_signature
 
 rng = random.Random(42)
-variants = {"base": build_ir(f_nkigym, INPUT_SPECS), "fused": LoadTranspose()(build_ir(...))}
+base_ir = build_ir(f_nkigym, INPUT_SPECS)
+variants = dict(enumerate_rewrite_combinations(base_ir, [LoadTranspose()]))
 seen: set = set()
 batch: list[KernelIR] = []
 while len(batch) < 20:

@@ -28,7 +28,7 @@ from autotune.runner.remote import remote_numpy_baseline
 from autotune.runner.types import KernelJob
 from nkigym.codegen import render_ir
 from nkigym.kernel_ir import build_ir
-from nkigym.kernel_ir.rewrites import LoadTranspose
+from nkigym.kernel_ir.rewrites import LoadTranspose, enumerate_rewrite_combinations
 from nkigym.kernel_ir.sample import knob_signature, sample
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
@@ -60,7 +60,7 @@ if __name__ == "__main__":
     CACHE_ROOT.mkdir(parents=True)
 
     base_ir = build_ir(matmul_lhs_rhs_nkigym, INPUT_SPECS)
-    fused_ir = LoadTranspose()(base_ir)
+    variants = dict(enumerate_rewrite_combinations(base_ir, [LoadTranspose()]))
 
     mac_count = compute_mac_count(matmul_lhs_rhs_nkigym, INPUT_SPECS)
     nkigym_source = func_source_with_imports(matmul_lhs_rhs_nkigym)
@@ -69,7 +69,7 @@ if __name__ == "__main__":
     num_samples = 100
     seen: set[tuple] = set()
     kernels: dict[str, KernelJob] = {}
-    for variant, ir in [("base", base_ir), ("fused", fused_ir)]:
+    for variant, ir in variants.items():
         for i in range(num_samples):
             candidate = sample(ir)
             sig = knob_signature(candidate)

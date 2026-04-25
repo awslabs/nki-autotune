@@ -36,7 +36,7 @@ KernelIR(func=rmsnorm_matmul_nkigym, params=['lhs', 'rhs'], return=output)
         sbuf_lhs_rms: tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
         sbuf_lhs_T:   tile=(128, 128), dims=('d1', 'd0'), dtype=bfloat16
         sbuf_output:  tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
-    # Compute graph (can be changed by graph rewrites)
+    # Compute graph (can be changed by IR rewrites)
     operators:
         [0] NKILoad:
             data=lhs, outputs=[sbuf_lhs], dim_map={'P': 'd0', 'F':'d1'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
@@ -598,7 +598,7 @@ KernelIR(func=rmsnorm_matmul_nkigym, params=['lhs', 'rhs'], return=output)
         sbuf_O0_new:  tile=(128,),     dims=('d0',),     dtype=float32
         sbuf_O0_old:  tile=(128,),     dims=('d0',),     dtype=float32
         sbuf_scale:   tile=(128,),     dims=('d0',),     dtype=float32
-    # Compute graph (can be changed by graph rewrites)
+    # Compute graph (can be changed by IR rewrites)
     operators:
         [0] NKILoad:
             data=lhs, outputs=[sbuf_lhs], dim_map={'P': 'd0', 'F':'d1'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
@@ -667,3 +667,298 @@ $k=1$ is folded into the same expression by initializing $\mathbf{\tilde O_1} = 
 1. Ops $\{2, 3, 4, 5\}$ and the intermediate buffers `sbuf_rms_inv`, `sbuf_lhs_rms`, `sbuf_lhs_T` are removed. Only the $\mathbf{O_0}$ running pair plus the scale vector survive as fp32 scratch.
 2. The two sibling `i_block_d1` loops in the pre-rewrite kernel collapse into one — $f_X$, $g_B$, $h_B$, and the accumulation recurrence all fire per $k$ in that single loop.
 3. The rewrite is atomic: one $(op_X, op_A)$ pair per `apply`.
+
+# Code Generation (post-rewrite)
+
+## Kernel Constants
+```python
+d0_num_blocks = 16/8 = 2
+d1_num_blocks = 16/4 = 4
+d2_num_blocks = 4/1 = 4
+loop_order: ['d2', 'd0', 'd1']
+d0_ltiles_per_block=8
+d1_ltiles_per_block=4
+d2_ltiles_per_block=1
+```
+
+## Header
+Information from IR:
+```
+KernelIR(func=rmsnorm_matmul_nkigym, params=['lhs', 'rhs'], return=output)
+input_hbm_tensors:
+    hbm_lhs: shape=(2048, 2048), dims=('d0', 'd1'), dtype=bfloat16
+    hbm_rhs: shape=(2048, 2048), dims=('d1', 'd2'), dtype=bfloat16
+output_hbm_tensors:
+    hbm_output: shape=(2048, 2048), dims=('d0', 'd2'), dtype=bfloat16
+```
+Generate the NKI kernel header:
+```python
+@nki.jit
+def rmsnorm_matmul_nkigym(lhs, rhs):
+    assert lhs.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+```
+
+## Per-Operator Code Generation
+
+### OP_0:
+```
+[0] NKILoad:
+    data=lhs, outputs=[sbuf_lhs], dim_map={'P': 'd0', 'F':'d1'}
+```
+Information from IR:
+```
+sbuf_lhs: tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
+sbuf_lhs = INNER
+sbuf_lhs:  {num_p_buffers: 2,    num_f_buffers: 4}
+sbuf_lhs:  1
+```
+Derive `sbuf_lhs` buffer allocation:
+```python
+"""Directly read from IR"""
+p_tile_size = 128
+f_tile_size = 128
+loc=nl.sbuf
+dtype=nl.bfloat16
+num_p_buffers = 2
+num_f_buffers = 4
+
+"""Derived from IR"""
+num_p_tiles = d0_ltiles_per_block # Because inside of d0
+num_f_tiles = d1_ltiles_per_block # Because inside of d1
+```
+Accumulated code generation:
+```python
+@nki.jit
+def rmsnorm_matmul_nkigym(lhs, rhs):
+    assert lhs.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    for i_block_d2 in range(4):
+        # sbuf_lhs declared here because sbuf_lhs emission depth = 1
+        sbuf_lhs = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = 4)
+        for i_block_d0 in range(2):
+            for i_block_d1 in range(4):
+                # sbuf_lhs consumed here because sbuf_lhs = INNER (depends on d0, d1)
+                cur_sbuf_lhs = sbuf_lhs[i_block_d0 % 2][i_block_d1 % 4]
+                load_block(cur_sbuf_lhs, lhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
+```
+
+### OP_1:
+```
+[1] NKILoad:
+    data=rhs, outputs=[sbuf_rhs], dim_map={'P': 'd1', 'F':'d2'}
+```
+Information from IR:
+```
+sbuf_rhs: tile=(128, 512), dims=('d1', 'd2'), dtype=bfloat16
+sbuf_rhs = INNER
+sbuf_rhs:  {num_p_buffers: 2, num_f_buffers: None}
+sbuf_rhs:  1
+```
+Derive `sbuf_rhs` buffer allocation:
+```python
+"""Directly read from IR"""
+p_tile_size = 128
+f_tile_size = 512
+loc=nl.sbuf
+dtype=nl.bfloat16
+num_p_buffers = 2
+num_f_buffers = None
+
+"""Derived from IR"""
+num_p_tiles = d1_ltiles_per_block # Because inside of d1
+num_f_tiles = d2_ltiles_per_block # Because inside of d2
+```
+Accumulated code generation:
+```python
+@nki.jit
+def rmsnorm_matmul_nkigym(lhs, rhs):
+    assert lhs.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    for i_block_d2 in range(4):
+        sbuf_lhs = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = 4)
+        # sbuf_rhs declared here because sbuf_rhs emission depth = 1
+        sbuf_rhs = allocate_buffers(p_tile_size = 128, num_p_tiles=4, f_tile_size = 512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = None)
+        for i_block_d0 in range(2):
+            for i_block_d1 in range(4):
+                # sbuf_rhs consumed here because sbuf_rhs = INNER (depends on d1, d2)
+                cur_sbuf_rhs = sbuf_rhs[i_block_d1 % 2]
+                load_block(cur_sbuf_rhs, rhs[i_block_d1 * 512 : i_block_d1 * 512 + 512, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
+                cur_sbuf_lhs = sbuf_lhs[i_block_d0 % 2][i_block_d1 % 4]
+                load_block(cur_sbuf_lhs, lhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
+```
+
+### OP_2:
+```
+[2] NKIOnlineFusion:
+    op_X    = NKIActivationReduce(op='square', reduce_op='add', post_op='rsqrt', scale=1/2048, bias=eps)
+    g_chain = [NKITensorScalar(op='multiply'), NKITranspose()]
+    op_A    = NKIMatmul()
+    V0=sbuf_lhs, V1=sbuf_rhs, outputs=[sbuf_output]
+    scratch_buffers=[sbuf_O0_new, sbuf_O0_old, sbuf_scale]
+    dim_map={'K':'d1', 'M':'d0', 'N':'d2'}, dim_role={'K':ACCUMULATION, 'M':PARALLEL, 'N':PARALLEL}
+```
+Information from IR:
+```
+sbuf_output: tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
+sbuf_output = MIDDLE
+sbuf_output: {num_p_buffers: None, num_f_buffers: 4}
+sbuf_output: 0
+
+sbuf_O0_new: tile=(128,), dims=('d0',), dtype=float32
+sbuf_O0_new = INNER
+sbuf_O0_new: {num_p_buffers: 2, num_f_buffers: None}
+sbuf_O0_new: 1
+
+sbuf_O0_old: tile=(128,), dims=('d0',), dtype=float32
+sbuf_O0_old = INNER
+sbuf_O0_old: {num_p_buffers: 2, num_f_buffers: None}
+sbuf_O0_old: 1
+
+sbuf_scale: tile=(128,), dims=('d0',), dtype=float32
+sbuf_scale = INNER
+sbuf_scale: {num_p_buffers: 2, num_f_buffers: None}
+sbuf_scale: 1
+
+fused op dim_role: {'K'=d1: ACCUMULATION, 'M'=d0: PARALLEL, 'N'=d2: PARALLEL}
+```
+Derive `sbuf_output` buffer allocation:
+```python
+"""Directly read from IR"""
+p_tile_size = 128
+f_tile_size = 512
+loc=nl.sbuf
+dtype=nl.bfloat16
+num_p_buffers = None
+num_f_buffers = 4
+
+"""Derived from IR"""
+num_p_tiles = d0_num_ltile = 16 # Because outside of d0
+num_f_tiles = d2_ltiles_per_block = 1 # Because inside of d2
+```
+Derive `sbuf_O0_new` / `sbuf_O0_old` buffer allocation (both identical):
+```python
+"""Directly read from IR"""
+p_tile_size = 128
+f_tile_size = 1   # O_0 is per-row scalar (reduced along d1)
+loc=nl.sbuf
+dtype=nl.float32  # FP32 required for rsqrt / reduction accumulator
+num_p_buffers = 2
+num_f_buffers = None
+
+"""Derived from IR"""
+num_p_tiles = d0_ltiles_per_block # Because inside of d0
+num_f_tiles = 1                   # O_0 has no free axis
+```
+Derive `sbuf_scale` buffer allocation:
+```python
+"""Directly read from IR"""
+p_tile_size = 128
+f_tile_size = 1
+loc=nl.sbuf
+dtype=nl.float32
+num_p_buffers = 2
+num_f_buffers = None
+
+"""Derived from IR"""
+num_p_tiles = d0_ltiles_per_block # Because inside of d0
+num_f_tiles = 1                   # s_k has no free axis
+```
+Accumulated code generation:
+```python
+@nki.jit
+def rmsnorm_matmul_nkigym(lhs, rhs):
+    assert lhs.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    # sbuf_output declared here because sbuf_output emission depth = 0
+    sbuf_output = allocate_buffers(p_tile_size = 128, num_p_tiles=16, f_tile_size = 512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = None, num_f_buffers = 4)
+
+    for i_block_d2 in range(4):
+        sbuf_lhs    = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = 4)
+        sbuf_rhs    = allocate_buffers(p_tile_size = 128, num_p_tiles=4, f_tile_size = 512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = None)
+        # sbuf_O0_new / sbuf_O0_old / sbuf_scale declared here because emission depth = 1
+        sbuf_O0_new = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 1, num_f_tiles=1, loc=nl.sbuf, dtype=nl.float32, num_p_buffers = 2, num_f_buffers = None)
+        sbuf_O0_old = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 1, num_f_tiles=1, loc=nl.sbuf, dtype=nl.float32, num_p_buffers = 2, num_f_buffers = None)
+        sbuf_scale  = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 1, num_f_tiles=1, loc=nl.sbuf, dtype=nl.float32, num_p_buffers = 2, num_f_buffers = None)
+        # sbuf_output consumed here because sbuf_output = MIDDLE (depends on d0, d2)
+        # sbuf_output is matmul accumulation output, consume location indicates where it should be zeroed
+        cur_sbuf_output = sbuf_output[i_block_d2 % 4]
+        memset_buffers(cur_sbuf_output, 0.0)
+        for i_block_d0 in range(2):
+            # O_0 running pair init — O0_old=0, O0_new starts fresh per d1 pass
+            cur_O0_new = sbuf_O0_new[i_block_d0 % 2]
+            cur_O0_old = sbuf_O0_old[i_block_d0 % 2]
+            cur_scale  = sbuf_scale[i_block_d0 % 2]
+            memset_buffers(cur_O0_new, 0.0)
+            memset_buffers(cur_O0_old, 0.0)
+            for i_block_d1 in range(4):
+                cur_sbuf_rhs = sbuf_rhs[i_block_d1 % 2]
+                load_block(cur_sbuf_rhs, rhs[i_block_d1 * 512 : i_block_d1 * 512 + 512, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
+                cur_sbuf_lhs = sbuf_lhs[i_block_d0 % 2][i_block_d1 % 4]
+                load_block(cur_sbuf_lhs, lhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
+                # online_fusion_block placed here when all of its operands are available
+                # body realizes Algorithm 4: f_X on O0, s_k = g_B(O0_old)/g_B(O0_new), O_1 += s_k*O_1 + g_B(O0_new)*V0*V1
+                online_fusion_block(cur_sbuf_output[i_block_d0 * 8 : i_block_d0 * 8 + 8],
+                                    V0=cur_sbuf_lhs, V1=cur_sbuf_rhs,
+                                    O0_new=cur_O0_new, O0_old=cur_O0_old, scale=cur_scale,
+                                    op_X={'op':'square', 'reduce_op':'add', 'post_op':'rsqrt', 'scale':1/2048, 'bias':eps})
+```
+
+### OP_3:
+```
+[3] NKIStore:
+    data=sbuf_output, outputs=[hbm_output], dim_map={'P':'d0', 'F':'d2'}
+```
+Information from IR:
+```
+producer of sbuf_output = [2] NKIOnlineFusion, dim_role: {'K'=d1: ACCUMULATION, 'M'=d0: PARALLEL, 'N'=d2: PARALLEL}
+```
+Derive `store_block` placement:
+```python
+"""Derived from IR"""
+# Store placement rule: fire after all SEQUENTIAL/ACCUMULATION loops of the producer's sbuf data are done.
+# cur_sbuf_output producer (NKIOnlineFusion) has accumulation axis d1 → place store after i_block_d1 loop closes.
+```
+Accumulated code generation:
+```python
+@nki.jit
+def rmsnorm_matmul_nkigym(lhs, rhs):
+    assert lhs.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    sbuf_output = allocate_buffers(p_tile_size = 128, num_p_tiles=16, f_tile_size = 512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = None, num_f_buffers = 4)
+
+    for i_block_d2 in range(4):
+        sbuf_lhs    = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 128, num_f_tiles=4, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = 4)
+        sbuf_rhs    = allocate_buffers(p_tile_size = 128, num_p_tiles=4, f_tile_size = 512, num_f_tiles=1, loc=nl.sbuf, dtype=nl.bfloat16, num_p_buffers = 2, num_f_buffers = None)
+        sbuf_O0_new = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 1,   num_f_tiles=1, loc=nl.sbuf, dtype=nl.float32,  num_p_buffers = 2, num_f_buffers = None)
+        sbuf_O0_old = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 1,   num_f_tiles=1, loc=nl.sbuf, dtype=nl.float32,  num_p_buffers = 2, num_f_buffers = None)
+        sbuf_scale  = allocate_buffers(p_tile_size = 128, num_p_tiles=8, f_tile_size = 1,   num_f_tiles=1, loc=nl.sbuf, dtype=nl.float32,  num_p_buffers = 2, num_f_buffers = None)
+        cur_sbuf_output = sbuf_output[i_block_d2 % 4]
+        memset_buffers(cur_sbuf_output, 0.0)
+        for i_block_d0 in range(2):
+            cur_O0_new = sbuf_O0_new[i_block_d0 % 2]
+            cur_O0_old = sbuf_O0_old[i_block_d0 % 2]
+            cur_scale  = sbuf_scale[i_block_d0 % 2]
+            memset_buffers(cur_O0_new, 0.0)
+            memset_buffers(cur_O0_old, 0.0)
+            for i_block_d1 in range(4):
+                cur_sbuf_rhs = sbuf_rhs[i_block_d1 % 2]
+                load_block(cur_sbuf_rhs, rhs[i_block_d1 * 512 : i_block_d1 * 512 + 512, i_block_d2 * 512 : i_block_d2 * 512 + 512], transpose=False)
+                cur_sbuf_lhs = sbuf_lhs[i_block_d0 % 2][i_block_d1 % 4]
+                load_block(cur_sbuf_lhs, lhs[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d1 * 512 : i_block_d1 * 512 + 512], transpose=False)
+                online_fusion_block(cur_sbuf_output[i_block_d0 * 8 : i_block_d0 * 8 + 8],
+                                    V0=cur_sbuf_lhs, V1=cur_sbuf_rhs,
+                                    O0_new=cur_O0_new, O0_old=cur_O0_old, scale=cur_scale,
+                                    op_X={'op':'square', 'reduce_op':'add', 'post_op':'rsqrt', 'scale':1/2048, 'bias':eps})
+            # store_block placed here after i_block_d1 (ACCUMULATION) closes; d0 per-block, d2 per-block
+            store_block(output[i_block_d0 * 1024 : i_block_d0 * 1024 + 1024, i_block_d2 * 512 : i_block_d2 * 512 + 512], cur_sbuf_output[i_block_d0 * 8 : i_block_d0 * 8 + 8])
+```
