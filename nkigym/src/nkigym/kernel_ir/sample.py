@@ -9,20 +9,56 @@ Order:
 1. ``dim_order`` — free permutation.
 2. ``ltiles_per_block`` — free divisor per dim.
 3. ``buffer_scopes`` — free per buffer.
-4. ``num_buffers`` — per buffer per axis; rotation on an axis is only
-   offered when that axis's loop is open at the buffer's first-use depth.
-5. ``emission_depth`` — per buffer integer in ``[0, first_use_depth]``.
+4. ``emission_depth`` + ``num_buffers`` — joint pass, largest-base
+   buffer first. Each draw picks a valid depth with room for the
+   base, then a rotation pair that fits the remaining SBUF budget.
 """
 
 import random
 from dataclasses import replace
 
 from nkigym.kernel_ir.ir import BufferScope, KernelIR, NumBuffers
-from nkigym.kernel_ir.validate import _accumulator_covers_closed_dims, _find_matmul_op, axis_open, first_use_depth
+from nkigym.kernel_ir.validate import (
+    _accumulator_covers_closed_dims,
+    _find_matmul_op,
+    _num_tiles_for_scope,
+    _outer_axis_in_order,
+    axis_open,
+    first_use_depth,
+)
+
+_SBUF_CAP_BYTES = 24 * 1024 * 1024
+"""Trn2 SBUF size. Per-allocation AND per-emission-depth cap.
+
+Each ``allocate_buffers`` call must fit within this. The SUM of all
+buffers emitted at the same ``emission_depth`` must also fit — the
+depth-0 group is live across the whole kernel and every deeper group
+co-exists with its ancestors within one iteration of the enclosing
+loops."""
+
+_NUM_BUFFERS_CAP = 4
+"""Per-axis ceiling on ``NumBuffers.num_p_buffers`` / ``num_f_buffers``.
+
+Deeper multi-buffering mostly chews SBUF without hiding additional
+DMA latency; 4 slots is enough to overlap compute+load for most
+kernels we care about."""
+
+_SAMPLE_RETRIES = 100
+"""Max attempts for a single :func:`sample` call.
+
+Budget-aware knobs can raise when upstream choices produce infeasible
+buffers (e.g. three OUTER-scoped 8 MiB buffers with no depth headroom).
+A fresh redraw usually succeeds; ``_SAMPLE_RETRIES`` bounds the retry
+loop before giving up."""
+
+_DTYPE_BYTES = {"bfloat16": 2, "bf16": 2, "float16": 2, "fp16": 2, "float32": 4, "fp32": 4}
 
 
 def sample(ir: KernelIR, rng: random.Random | None = None) -> KernelIR:
     """Return a new ``KernelIR`` with every tunable knob randomized.
+
+    Retries the full draw up to ``_SAMPLE_RETRIES`` times when budget-
+    aware stages raise ``RuntimeError`` (infeasible co-residence).
 
     Args:
         ir: Source IR — typically the canonical-default output of
@@ -37,10 +73,18 @@ def sample(ir: KernelIR, rng: random.Random | None = None) -> KernelIR:
         ``emission_depth``.
     """
     rng = rng or random.Random()
-    partial = replace(ir, dim_order=sample_dim_order(ir, rng), ltiles_per_block=sample_ltiles_per_block(ir, rng))
-    partial = replace(partial, buffer_scopes=sample_buffer_scopes(partial, rng))
-    partial = replace(partial, num_buffers=sample_num_buffers(partial, rng))
-    return replace(partial, emission_depth=sample_emission_depth(partial, rng))
+    last_err: RuntimeError | None = None
+    for _ in range(_SAMPLE_RETRIES):
+        try:
+            partial = replace(
+                ir, dim_order=sample_dim_order(ir, rng), ltiles_per_block=sample_ltiles_per_block(ir, rng)
+            )
+            partial = replace(partial, buffer_scopes=sample_buffer_scopes(partial, rng))
+            emission_depth, num_buffers = sample_emission_depth_and_num_buffers(partial, rng)
+            return replace(partial, emission_depth=emission_depth, num_buffers=num_buffers)
+        except RuntimeError as e:
+            last_err = e
+    raise RuntimeError(f"sample: no feasible IR within {_SAMPLE_RETRIES} retries; last error: {last_err}")
 
 
 def sample_dim_order(ir: KernelIR, rng: random.Random) -> list[str]:
@@ -58,7 +102,7 @@ def sample_ltiles_per_block(ir: KernelIR, rng: random.Random) -> dict[str, int]:
 def sample_buffer_scopes(ir: KernelIR, rng: random.Random) -> dict[str, BufferScope]:
     """Per-buffer random choice from ``{INNER, MIDDLE, OUTER}``.
 
-    Two structural constraints bias the draw:
+    Three constraints bias the draw:
 
     * Transpose src/dst pairs share one scope — the transpose gadget
       requires matching tile counts on the swapped axes.
@@ -67,12 +111,21 @@ def sample_buffer_scopes(ir: KernelIR, rng: random.Random) -> dict[str, BufferSc
       :func:`validate._accumulator_covers_closed_dims`). Scopes that
       would under-cover a closed output dim are dropped from its
       choice list.
+    * Scopes whose base allocation exceeds ``_SBUF_CAP_BYTES`` are
+      dropped — a single ``allocate_buffers`` call cannot be larger
+      than SBUF even with ``num_buffers=None``.
     """
-    scopes = list(BufferScope)
     acc_buf = _matmul_output_name(ir)
     result: dict[str, BufferScope] = {}
     for name in _tunable_buffers(ir):
-        choices = scopes if name != acc_buf else _accumulator_scope_choices(ir, name)
+        acc_filtered = _accumulator_scope_choices(ir, name) if name == acc_buf else list(BufferScope)
+        choices = [s for s in acc_filtered if _base_size_for_scope(ir, name, s) <= _SBUF_CAP_BYTES]
+        if not choices:
+            raise RuntimeError(
+                f"sample_buffer_scopes: buffer {name} has no scope whose base fits "
+                f"_SBUF_CAP_BYTES={_SBUF_CAP_BYTES}; upstream dim_order/ltiles_per_block "
+                f"produced an infeasible buffer"
+            )
         result[name] = rng.choice(choices)
     for op in ir.ops:
         if op.kind not in ("NKITranspose", "NKIDMATranspose"):
@@ -82,6 +135,12 @@ def sample_buffer_scopes(ir: KernelIR, rng: random.Random) -> dict[str, BufferSc
         if src in result and dst in result:
             result[dst] = result[src]
     return result
+
+
+def _base_size_for_scope(ir: KernelIR, name: str, scope: BufferScope) -> int:
+    """Bytes of one ``allocate_buffers`` call if ``name`` were sized by ``scope``."""
+    trial = replace(ir, buffer_scopes={**ir.buffer_scopes, name: scope})
+    return _buffer_base_size(trial, name)
 
 
 def _matmul_output_name(ir: KernelIR) -> str | None:
@@ -100,41 +159,72 @@ def _accumulator_scope_choices(ir: KernelIR, name: str) -> list[BufferScope]:
     return valid
 
 
-def sample_num_buffers(ir: KernelIR, rng: random.Random) -> dict[str, NumBuffers]:
-    """Per-buffer per-axis rotation factor.
+def sample_emission_depth_and_num_buffers(
+    ir: KernelIR, rng: random.Random
+) -> tuple[dict[str, int], dict[str, NumBuffers]]:
+    """Joint draw — every buffer gets a depth + rotation in one pass.
 
-    ``None`` is always allowed. Integer rotation is offered only when
-    the axis's block loop is open at the buffer's first-use depth —
-    the rotation index ``[i_block_<axis> % N]`` emits there, so the
-    loop variable must already be bound.
+    Largest-base buffers claim budget first. For each buffer:
+
+    * ``emission_depth`` is drawn from ``[0, first_use_depth]``
+      restricted to depths where the buffer's base size still fits in
+      remaining SBUF budget.
+    * ``num_buffers`` is drawn from the ``(None | divisors(num_ltile))``
+      product for each axis (rotation only when the axis's loop is
+      open at first-use depth), restricted to pairs whose multiplied
+      size fits the remaining budget at the chosen depth.
+
+    Raises ``RuntimeError`` when no depth has room for a base — that
+    means upstream knobs produced buffers that cannot co-exist in
+    SBUF regardless of ``num_buffers``.
     """
-    result: dict[str, NumBuffers] = {}
-    for name in _tunable_buffers(ir):
+    bases = {name: _buffer_base_size(ir, name) for name in _tunable_buffers(ir)}
+    used: dict[int, int] = {}
+    emission: dict[str, int] = {}
+    num_bufs: dict[str, NumBuffers] = {}
+    for name, base in sorted(bases.items(), key=lambda kv: -kv[1]):
         buf = ir.physical_buffers[name]
-        depth = first_use_depth(ir, name)
-        p_choices: list[int | None] = [None]
-        if axis_open(ir, buf.p_axis, depth):
-            p_choices.extend(_divisors(_num_ltile(ir, buf.p_axis)))
-        f_choices: list[int | None] = [None]
-        if buf.f_axis is not None and axis_open(ir, buf.f_axis, depth):
-            f_choices.extend(_divisors(_num_ltile(ir, buf.f_axis)))
-        result[name] = NumBuffers(num_p_buffers=rng.choice(p_choices), num_f_buffers=rng.choice(f_choices))
-    return result
+        fu_depth = first_use_depth(ir, name)
+        depth_choices = [d for d in range(fu_depth + 1) if used.get(d, 0) + base <= _SBUF_CAP_BYTES]
+        if not depth_choices:
+            raise RuntimeError(
+                f"sample: buffer {name} (base {base} B) cannot fit at any depth ≤ "
+                f"{fu_depth} under cap {_SBUF_CAP_BYTES} — co-resident bases exceed SBUF"
+            )
+        depth = rng.choice(depth_choices)
+        remaining = _SBUF_CAP_BYTES - used.get(depth, 0)
+        p_raw: list[int | None] = [None]
+        if axis_open(ir, buf.p_axis, fu_depth):
+            p_raw.extend(d for d in _divisors(_num_ltile(ir, buf.p_axis)) if d <= _NUM_BUFFERS_CAP)
+        f_raw: list[int | None] = [None]
+        if buf.f_axis is not None and axis_open(ir, buf.f_axis, fu_depth):
+            f_raw.extend(d for d in _divisors(_num_ltile(ir, buf.f_axis)) if d <= _NUM_BUFFERS_CAP)
+        pairs = [(p, f) for p in p_raw for f in f_raw if base * (p or 1) * (f or 1) <= remaining]
+        p_choice, f_choice = rng.choice(pairs)
+        used[depth] = used.get(depth, 0) + base * (p_choice or 1) * (f_choice or 1)
+        emission[name] = depth
+        num_bufs[name] = NumBuffers(num_p_buffers=p_choice, num_f_buffers=f_choice)
+    return emission, num_bufs
 
 
-def sample_emission_depth(ir: KernelIR, rng: random.Random) -> dict[str, int]:
-    """Per-buffer random depth in ``[0, first_use_depth]``.
+def _buffer_base_size(ir: KernelIR, name: str) -> int:
+    """Bytes occupied by one ``allocate_buffers`` call with ``num_*_buffers=None``."""
+    buf = ir.physical_buffers[name]
+    p_tile, f_tile = buf.tile
+    n_p, n_f = _scope_tile_counts(ir, name)
+    return p_tile * f_tile * n_p * n_f * _DTYPE_BYTES[buf.dtype]
 
-    Allocating deeper than the first use would place the allocation
-    after the ``cur_<buf> = <buf>[...]`` binding. For the matmul
-    accumulator the first use is the memset prologue at
-    ``store_depth``, not the matmul op at the innermost body.
-    """
-    result: dict[str, int] = {}
-    for name in _tunable_buffers(ir):
-        max_depth = first_use_depth(ir, name)
-        result[name] = rng.choice(list(range(max_depth + 1)))
-    return result
+
+def _scope_tile_counts(ir: KernelIR, name: str) -> tuple[int, int]:
+    """``(num_p_tiles, num_f_tiles)`` under the buffer's current scope."""
+    buf = ir.physical_buffers[name]
+    scope = ir.buffer_scopes[name]
+    outer_axis = _outer_axis_in_order(ir, buf.p_axis, buf.f_axis)
+    n_p = _num_tiles_for_scope(ir, buf.p_axis, scope, is_outer=(buf.p_axis == outer_axis))
+    n_f = 1
+    if buf.f_axis is not None:
+        n_f = _num_tiles_for_scope(ir, buf.f_axis, scope, is_outer=(buf.f_axis == outer_axis))
+    return n_p, n_f
 
 
 def knob_signature(ir: KernelIR) -> tuple:

@@ -95,20 +95,39 @@ def _emission_depth_is_valid(ir: KernelIR) -> bool:
 
 
 def first_use_depth(ir: KernelIR, buf_name: str) -> int:
-    """Depth at which ``buf_name`` is first referenced by ``render_ir``.
+    """Shallowest depth at which ``buf_name`` may be referenced by render.
 
-    For the matmul accumulator buffer the first use is the memset
-    prologue at ``_store_depth(ir)`` (book-ending the ACC loops),
-    NOT the matmul op at the innermost body. For every other buffer
-    the producer op's own depth is correct.
+    * Matmul accumulator: the memset prologue fires at
+      ``1 + min(dim_order.index(d))`` over the accumulator's non-ACC
+      axes when any rotation is chosen on a non-ACC axis, otherwise
+      at ``_store_depth(ir)``. We return the shallower bound —
+      ``emission_depth`` and ``num_buffers`` must be valid under
+      every rotation choice the sampler may still make.
+    * Every other buffer: its producer op's depth.
     """
     acc_op = _find_matmul_op(ir)
     if acc_op is not None and buf_name in acc_op.outputs:
-        return _store_depth(ir)
+        return _accumulator_first_use_depth(ir, buf_name)
     producer = producer_op(ir, buf_name)
     if producer is None:
         return len(ir.dim_order)
     return op_depth(ir, producer)
+
+
+def _accumulator_first_use_depth(ir: KernelIR, buf_name: str) -> int:
+    """Pessimistic prologue depth: shallowest a non-ACC rotation could place it."""
+    buf = ir.physical_buffers[buf_name]
+    non_acc_positions: list[int] = []
+    for axis in (buf.p_axis, buf.f_axis):
+        if axis is None or axis not in ir.dim_order:
+            continue
+        if ir.dimensions[axis].role is DimRole.ACCUMULATION:
+            continue
+        non_acc_positions.append(ir.dim_order.index(axis))
+    store = _store_depth(ir)
+    if not non_acc_positions:
+        return store
+    return min(store, 1 + min(non_acc_positions))
 
 
 def _rotation_axes_in_scope(ir: KernelIR) -> bool:
