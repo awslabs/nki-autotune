@@ -134,6 +134,7 @@ def _emit_body(w: _Writer, ir: KernelIR) -> None:
     if allocs and any(info.emission_depth == 0 for info in allocs.values()):
         w.line()
     _emit_loads_at_depth(w, ir, allocs, depth=0)
+    _maybe_emit_accumulator_prologue(w, ir, allocs, matmul_op, depth=0)
 
     _emit_loop_nest(w, ir, allocs, matmul_op, store_op, dim_idx=0)
 
