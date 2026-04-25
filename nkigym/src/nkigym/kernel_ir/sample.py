@@ -10,15 +10,15 @@ Order:
 2. ``ltiles_per_block`` — free divisor per dim.
 3. ``buffer_scopes`` — free per buffer.
 4. ``num_buffers`` — per buffer per axis; rotation on an axis is only
-   offered when that axis's loop is open at the producer op's depth.
-5. ``emission_depth`` — per buffer integer in ``[0, producer_op_depth]``.
+   offered when that axis's loop is open at the buffer's first-use depth.
+5. ``emission_depth`` — per buffer integer in ``[0, first_use_depth]``.
 """
 
 import random
 from dataclasses import replace
 
 from nkigym.kernel_ir.ir import BufferScope, KernelIR, NumBuffers
-from nkigym.kernel_ir.validate import _accumulator_covers_closed_dims, _find_matmul_op, axis_open, op_depth, producer_op
+from nkigym.kernel_ir.validate import _accumulator_covers_closed_dims, _find_matmul_op, axis_open, first_use_depth
 
 
 def sample(ir: KernelIR, rng: random.Random | None = None) -> KernelIR:
@@ -104,15 +104,14 @@ def sample_num_buffers(ir: KernelIR, rng: random.Random) -> dict[str, NumBuffers
     """Per-buffer per-axis rotation factor.
 
     ``None`` is always allowed. Integer rotation is offered only when
-    the buffer's producer op runs inside the axis's block loop — the
-    rotation index is emitted at producer depth, so the axis's
-    ``i_block_<axis>`` must already be bound.
+    the axis's block loop is open at the buffer's first-use depth —
+    the rotation index ``[i_block_<axis> % N]`` emits there, so the
+    loop variable must already be bound.
     """
     result: dict[str, NumBuffers] = {}
     for name in _tunable_buffers(ir):
         buf = ir.physical_buffers[name]
-        producer = producer_op(ir, name)
-        depth = op_depth(ir, producer) if producer is not None else len(ir.dim_order)
+        depth = first_use_depth(ir, name)
         p_choices: list[int | None] = [None]
         if axis_open(ir, buf.p_axis, depth):
             p_choices.extend(_divisors(_num_ltile(ir, buf.p_axis)))
@@ -124,15 +123,16 @@ def sample_num_buffers(ir: KernelIR, rng: random.Random) -> dict[str, NumBuffers
 
 
 def sample_emission_depth(ir: KernelIR, rng: random.Random) -> dict[str, int]:
-    """Per-buffer random depth in ``[0, producer_op_depth]``.
+    """Per-buffer random depth in ``[0, first_use_depth]``.
 
-    Allocating deeper than the producer would place the allocation
-    after its first use (``cur_<buf> = <buf>[...]``).
+    Allocating deeper than the first use would place the allocation
+    after the ``cur_<buf> = <buf>[...]`` binding. For the matmul
+    accumulator the first use is the memset prologue at
+    ``store_depth``, not the matmul op at the innermost body.
     """
     result: dict[str, int] = {}
     for name in _tunable_buffers(ir):
-        producer = producer_op(ir, name)
-        max_depth = op_depth(ir, producer) if producer is not None else len(ir.dim_order)
+        max_depth = first_use_depth(ir, name)
         result[name] = rng.choice(list(range(max_depth + 1)))
     return result
 

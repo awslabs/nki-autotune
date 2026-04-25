@@ -82,34 +82,45 @@ def _transpose_scopes_match(ir: KernelIR) -> bool:
 
 
 def _emission_depth_is_valid(ir: KernelIR) -> bool:
-    """Each buffer's ``emission_depth`` must be ≤ its producer op's depth.
+    """Each buffer's ``emission_depth`` must be ≤ its first use depth.
 
     Otherwise the consumer-side reference (``cur_<buf> = <buf>[...]``)
     emits before the allocation, triggering ``UnboundLocalError`` at
     sim time.
     """
     for name, depth in ir.emission_depth.items():
-        producer = producer_op(ir, name)
-        if producer is None:
-            continue
-        if depth > op_depth(ir, producer):
+        if depth > first_use_depth(ir, name):
             return False
     return True
 
 
+def first_use_depth(ir: KernelIR, buf_name: str) -> int:
+    """Depth at which ``buf_name`` is first referenced by ``render_ir``.
+
+    For the matmul accumulator buffer the first use is the memset
+    prologue at ``_store_depth(ir)`` (book-ending the ACC loops),
+    NOT the matmul op at the innermost body. For every other buffer
+    the producer op's own depth is correct.
+    """
+    acc_op = _find_matmul_op(ir)
+    if acc_op is not None and buf_name in acc_op.outputs:
+        return _store_depth(ir)
+    producer = producer_op(ir, buf_name)
+    if producer is None:
+        return len(ir.dim_order)
+    return op_depth(ir, producer)
+
+
 def _rotation_axes_in_scope(ir: KernelIR) -> bool:
-    """Rotation on an axis requires ``i_block_<axis>`` to be open at the producer op.
+    """Rotation on an axis requires ``i_block_<axis>`` to be open at the buffer's first use.
 
     ``num_buffers.num_p_buffers`` / ``num_f_buffers`` emit
-    ``[i_block_<axis> % N]`` at the producer's depth. If the axis's
-    loop hasn't been entered yet (its ``dim_order`` position ≥ op
-    depth), that reference triggers ``UnboundLocalError``.
+    ``[i_block_<axis> % N]`` at the ``cur_<buf>`` binding. If the
+    axis's loop hasn't been entered yet, that reference triggers
+    ``UnboundLocalError``.
     """
     for name, nb in ir.num_buffers.items():
-        producer = producer_op(ir, name)
-        if producer is None:
-            continue
-        depth = op_depth(ir, producer)
+        depth = first_use_depth(ir, name)
         buf = ir.physical_buffers[name]
         if nb.num_p_buffers is not None and not axis_open(ir, buf.p_axis, depth):
             return False
