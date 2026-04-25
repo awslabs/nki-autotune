@@ -1,48 +1,35 @@
 """Random sampler over the full KernelIR knob space.
 
-For an IR with ``N`` dimensions and ``B`` tunable (non-HBM) physical
-buffers, the combinatorial space is:
+Samples are built one knob at a time in dependency order, each knob
+conditioned on the partial IR so far. No rejection loop — every draw
+satisfies :func:`validate.is_valid` by construction.
 
-* ``dim_order`` — ``N!`` permutations of ``ir.dimensions``.
-* ``ltiles_per_block`` — per-dim divisor of ``num_ltile`` along that
-  dim; ``prod_d divisors(num_ltile_d)`` total.
-* ``buffer_scopes`` — per-buffer one of ``{INNER, MIDDLE, OUTER}``;
-  ``3^B`` total.
-* ``num_buffers`` — per-buffer per-axis choice from
-  ``{None} ∪ divisors(num_ltile_axis)``; product across buffers/axes.
-* ``emission_depth`` — per-buffer integer in ``[0, N]``;
-  ``(N+1)^B`` total.
+Order:
 
-``sample`` draws ONE random assignment for every knob and rejects
-assignments that fail ``validate.is_valid``, retrying up to
-``_MAX_RETRIES`` times. Samples that pass may still fail render /
-compile / sim for other reasons.
+1. ``dim_order`` — free permutation.
+2. ``ltiles_per_block`` — free divisor per dim.
+3. ``buffer_scopes`` — free per buffer.
+4. ``num_buffers`` — per buffer per axis; rotation on an axis is only
+   offered when that axis's loop is open at the producer op's depth.
+5. ``emission_depth`` — per buffer integer in ``[0, producer_op_depth]``.
 """
 
 import random
 from dataclasses import replace
 
 from nkigym.kernel_ir.ir import BufferScope, KernelIR, NumBuffers
-from nkigym.kernel_ir.validate import is_valid
-
-_MAX_RETRIES = 100
+from nkigym.kernel_ir.validate import axis_open, op_depth, producer_op
 
 
 def sample(ir: KernelIR, rng: random.Random | None = None) -> KernelIR:
     """Return a new ``KernelIR`` with every tunable knob randomized.
 
-    The returned IR is guaranteed to pass :func:`validate.is_valid`.
-    If a draw fails validity, only ``emission_depth`` is redrawn (the
-    only knob whose random choice can violate a structural invariant);
-    retries up to ``_MAX_RETRIES`` before raising.
-
     Args:
         ir: Source IR — typically the canonical-default output of
             ``build_ir``. Non-tunable fields (``dimensions``,
             ``logical_tensors``, ``physical_buffers``, ``ops``,
-            ``edges``, etc.) are passed through unchanged.
-        rng: Optional ``random.Random`` for deterministic runs. A
-            fresh default-seeded generator is used when omitted.
+            ``edges``) pass through unchanged.
+        rng: Optional ``random.Random`` for deterministic runs.
 
     Returns:
         A valid ``KernelIR`` with randomized ``dim_order``,
@@ -50,24 +37,10 @@ def sample(ir: KernelIR, rng: random.Random | None = None) -> KernelIR:
         ``emission_depth``.
     """
     rng = rng or random.Random()
-    candidate = replace(
-        ir,
-        dim_order=sample_dim_order(ir, rng),
-        ltiles_per_block=sample_ltiles_per_block(ir, rng),
-        buffer_scopes=sample_buffer_scopes(ir, rng),
-        num_buffers=sample_num_buffers(ir, rng),
-        emission_depth=sample_emission_depth(ir, rng),
-    )
-    for _ in range(_MAX_RETRIES):
-        if is_valid(candidate):
-            return candidate
-        candidate = replace(
-            candidate,
-            buffer_scopes=sample_buffer_scopes(candidate, rng),
-            num_buffers=sample_num_buffers(candidate, rng),
-            emission_depth=sample_emission_depth(candidate, rng),
-        )
-    raise RuntimeError(f"sample: could not satisfy is_valid within {_MAX_RETRIES} retries")
+    partial = replace(ir, dim_order=sample_dim_order(ir, rng), ltiles_per_block=sample_ltiles_per_block(ir, rng))
+    partial = replace(partial, buffer_scopes=sample_buffer_scopes(partial, rng))
+    partial = replace(partial, num_buffers=sample_num_buffers(partial, rng))
+    return replace(partial, emission_depth=sample_emission_depth(partial, rng))
 
 
 def sample_dim_order(ir: KernelIR, rng: random.Random) -> list[str]:
@@ -83,28 +56,59 @@ def sample_ltiles_per_block(ir: KernelIR, rng: random.Random) -> dict[str, int]:
 
 
 def sample_buffer_scopes(ir: KernelIR, rng: random.Random) -> dict[str, BufferScope]:
-    """Per-buffer random choice from ``{INNER, MIDDLE, OUTER}``."""
+    """Per-buffer random choice from ``{INNER, MIDDLE, OUTER}``.
+
+    Transpose src/dst pairs share one scope — the transpose gadget
+    requires matching tile counts on the swapped axes, which is only
+    true when both sides use the same scope-sizing rule.
+    """
     scopes = list(BufferScope)
-    return {name: rng.choice(scopes) for name in _tunable_buffers(ir)}
+    result = {name: rng.choice(scopes) for name in _tunable_buffers(ir)}
+    for op in ir.ops:
+        if op.kind not in ("NKITranspose", "NKIDMATranspose"):
+            continue
+        src = op.inputs.get("data")
+        dst = op.outputs[0] if op.outputs else None
+        if src in result and dst in result:
+            result[dst] = result[src]
+    return result
 
 
 def sample_num_buffers(ir: KernelIR, rng: random.Random) -> dict[str, NumBuffers]:
-    """Per-buffer per-axis choice from ``{None} ∪ divisors(num_ltile)``."""
+    """Per-buffer per-axis rotation factor.
+
+    ``None`` is always allowed. Integer rotation is offered only when
+    the buffer's producer op runs inside the axis's block loop — the
+    rotation index is emitted at producer depth, so the axis's
+    ``i_block_<axis>`` must already be bound.
+    """
     result: dict[str, NumBuffers] = {}
     for name in _tunable_buffers(ir):
         buf = ir.physical_buffers[name]
-        p_choices: list[int | None] = [None, *_divisors(_num_ltile(ir, buf.p_axis))]
-        f_choices: list[int | None] = (
-            [None, *_divisors(_num_ltile(ir, buf.f_axis))] if buf.f_axis is not None else [None]
-        )
+        producer = producer_op(ir, name)
+        depth = op_depth(ir, producer) if producer is not None else len(ir.dim_order)
+        p_choices: list[int | None] = [None]
+        if axis_open(ir, buf.p_axis, depth):
+            p_choices.extend(_divisors(_num_ltile(ir, buf.p_axis)))
+        f_choices: list[int | None] = [None]
+        if buf.f_axis is not None and axis_open(ir, buf.f_axis, depth):
+            f_choices.extend(_divisors(_num_ltile(ir, buf.f_axis)))
         result[name] = NumBuffers(num_p_buffers=rng.choice(p_choices), num_f_buffers=rng.choice(f_choices))
     return result
 
 
 def sample_emission_depth(ir: KernelIR, rng: random.Random) -> dict[str, int]:
-    """Per-buffer random depth in ``[0, N]`` — ``(N+1)^B`` combos."""
-    depths = list(range(len(ir.dimensions) + 1))
-    return {name: rng.choice(depths) for name in _tunable_buffers(ir)}
+    """Per-buffer random depth in ``[0, producer_op_depth]``.
+
+    Allocating deeper than the producer would place the allocation
+    after its first use (``cur_<buf> = <buf>[...]``).
+    """
+    result: dict[str, int] = {}
+    for name in _tunable_buffers(ir):
+        producer = producer_op(ir, name)
+        max_depth = op_depth(ir, producer) if producer is not None else len(ir.dim_order)
+        result[name] = rng.choice(list(range(max_depth + 1)))
+    return result
 
 
 def knob_signature(ir: KernelIR) -> tuple:

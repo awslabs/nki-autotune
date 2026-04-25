@@ -11,7 +11,30 @@ from nkigym.kernel_ir.types import DimRole
 
 def is_valid(ir: KernelIR) -> bool:
     """Return ``True`` iff every validity check passes."""
-    return _emission_depth_is_valid(ir) and _rotation_axes_in_scope(ir)
+    return _emission_depth_is_valid(ir) and _rotation_axes_in_scope(ir) and _transpose_scopes_match(ir)
+
+
+def _transpose_scopes_match(ir: KernelIR) -> bool:
+    """Transpose src and dst must share the same ``buffer_scope``.
+
+    ``transpose_block`` / ``dma_transpose_block`` require
+    ``src.num_p_tiles == dst.num_f_tiles`` and vice-versa. Since the
+    two buffers' axes are swapped, that equality holds iff both sides
+    use the same scope-sizing rule on each dim — equivalent to
+    matching scope labels.
+    """
+    for op in ir.ops:
+        if op.kind not in ("NKITranspose", "NKIDMATranspose"):
+            continue
+        src = op.inputs.get("data")
+        dst = op.outputs[0] if op.outputs else None
+        if src is None or dst is None:
+            continue
+        if src not in ir.buffer_scopes or dst not in ir.buffer_scopes:
+            continue
+        if ir.buffer_scopes[src] is not ir.buffer_scopes[dst]:
+            return False
+    return True
 
 
 def _emission_depth_is_valid(ir: KernelIR) -> bool:
@@ -22,10 +45,10 @@ def _emission_depth_is_valid(ir: KernelIR) -> bool:
     sim time.
     """
     for name, depth in ir.emission_depth.items():
-        producer = _producer_op(ir, name)
+        producer = producer_op(ir, name)
         if producer is None:
             continue
-        if depth > _op_depth(ir, producer):
+        if depth > op_depth(ir, producer):
             return False
     return True
 
@@ -39,26 +62,26 @@ def _rotation_axes_in_scope(ir: KernelIR) -> bool:
     depth), that reference triggers ``UnboundLocalError``.
     """
     for name, nb in ir.num_buffers.items():
-        producer = _producer_op(ir, name)
+        producer = producer_op(ir, name)
         if producer is None:
             continue
-        op_depth = _op_depth(ir, producer)
+        depth = op_depth(ir, producer)
         buf = ir.physical_buffers[name]
-        if nb.num_p_buffers is not None and not _axis_open(ir, buf.p_axis, op_depth):
+        if nb.num_p_buffers is not None and not axis_open(ir, buf.p_axis, depth):
             return False
-        if nb.num_f_buffers is not None and buf.f_axis is not None and not _axis_open(ir, buf.f_axis, op_depth):
+        if nb.num_f_buffers is not None and buf.f_axis is not None and not axis_open(ir, buf.f_axis, depth):
             return False
     return True
 
 
-def _axis_open(ir: KernelIR, axis: str, depth: int) -> bool:
+def axis_open(ir: KernelIR, axis: str, depth: int) -> bool:
     """``i_block_<axis>`` is open iff the axis sits above ``depth`` in ``dim_order``."""
     if axis not in ir.dim_order:
         return False
     return ir.dim_order.index(axis) < depth
 
 
-def _producer_op(ir: KernelIR, buf_name: str) -> Op | None:
+def producer_op(ir: KernelIR, buf_name: str) -> Op | None:
     """The single op that writes ``buf_name`` as an output, or ``None``."""
     for op in ir.ops:
         if buf_name in op.outputs:
@@ -66,7 +89,7 @@ def _producer_op(ir: KernelIR, buf_name: str) -> Op | None:
     return None
 
 
-def _op_depth(ir: KernelIR, op: Op) -> int:
+def op_depth(ir: KernelIR, op: Op) -> int:
     """Loop-nest depth at which ``op`` is emitted in ``render_ir``."""
     if op.kind in _LOAD_KINDS or (op.kind == "NKIDMATranspose" and _is_hbm_sourced(ir, op)):
         return _load_depth(ir, op)
