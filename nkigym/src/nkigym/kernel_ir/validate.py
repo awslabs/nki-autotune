@@ -115,19 +115,20 @@ def first_use_depth(ir: KernelIR, buf_name: str) -> int:
 
 
 def _accumulator_first_use_depth(ir: KernelIR, buf_name: str) -> int:
-    """Pessimistic prologue depth: shallowest a non-ACC rotation could place it."""
-    buf = ir.physical_buffers[buf_name]
-    non_acc_positions: list[int] = []
-    for axis in (buf.p_axis, buf.f_axis):
-        if axis is None or axis not in ir.dim_order:
-            continue
-        if ir.dimensions[axis].role is DimRole.ACCUMULATION:
-            continue
-        non_acc_positions.append(ir.dim_order.index(axis))
-    store = _store_depth(ir)
-    if not non_acc_positions:
-        return store
-    return min(store, 1 + min(non_acc_positions))
+    """Accumulator prologue depth — matches ``_accumulator_prologue_depth`` in render.
+
+    Rule (same as loads): ``1 + max(dim_order.index(d))`` over the
+    accumulator's block-indexed axes — the axes whose ``i_block_<d>``
+    appears in the slot expression. OUTER-scoped accumulators have no
+    block-indexed axes → depth 0.
+    """
+    block_axes = _block_indexed_axes(ir, buf_name)
+    if not block_axes:
+        return 0
+    positions = [ir.dim_order.index(d) for d in block_axes if d in ir.dim_order]
+    if not positions:
+        return 0
+    return 1 + max(positions)
 
 
 def _rotation_axes_in_scope(ir: KernelIR) -> bool:

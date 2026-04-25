@@ -43,6 +43,22 @@ Deeper multi-buffering mostly chews SBUF without hiding additional
 DMA latency; 4 slots is enough to overlap compute+load for most
 kernels we care about."""
 
+_PSUM_TILE_CAP = 8
+"""Ceiling on gadget PSUM tile count. PSUM has 8 banks per partition.
+
+Gadgets (``matmul_block``, ``transpose_block``) allocate fresh PSUM
+tiles inside their inner loops. With
+``--enable-instruction-scheduling=false`` (always on for profiling
+runs), banks can't rotate across iterations, so the inner-loop
+product must fit in 8 banks.
+
+Enforced in ``sample_ltiles_per_block``:
+
+* Matmul: ``ltiles_per_block[m_dim] × ltiles_per_block[n_dim] ≤ 8``.
+* Transpose: ``ltiles_per_block[p_dim] × ltiles_per_block[f_dim] ≤ 8``
+  (both gadgets share the innermost body, so they add up).
+"""
+
 _SAMPLE_RETRIES = 100
 """Max attempts for a single :func:`sample` call.
 
@@ -95,8 +111,40 @@ def sample_dim_order(ir: KernelIR, rng: random.Random) -> list[str]:
 
 
 def sample_ltiles_per_block(ir: KernelIR, rng: random.Random) -> dict[str, int]:
-    """Per-dim random divisor of ``num_ltile`` along that dim."""
-    return {d: rng.choice(_divisors(_num_ltile(ir, d))) for d in ir.dimensions}
+    """Per-dim random divisor of ``num_ltile`` along that dim.
+
+    PSUM cap: for every PSUM-using gadget call, the product of
+    ``ltiles_per_block`` on its inner-loop dims must be ≤
+    ``_PSUM_TILE_CAP``. Matmul uses (M, N); transpose uses (P, F).
+    All caps are enforced jointly — pairs may share a dim, so the
+    constraint space is solved iteratively until every pair fits.
+    """
+    result = {d: rng.choice(_divisors(_num_ltile(ir, d))) for d in ir.dimensions}
+    pairs = _psum_gadget_dim_pairs(ir)
+    for _ in range(len(pairs) + 1):
+        if all(result[a] * result[b] <= _PSUM_TILE_CAP for a, b in pairs):
+            return result
+        for a, b in pairs:
+            if result[a] * result[b] <= _PSUM_TILE_CAP:
+                continue
+            a_choices = _divisors(_num_ltile(ir, a))
+            b_choices = _divisors(_num_ltile(ir, b))
+            fits = [(x, y) for x in a_choices for y in b_choices if x * y <= _PSUM_TILE_CAP]
+            result[a], result[b] = rng.choice(fits)
+    raise RuntimeError(
+        f"sample_ltiles_per_block: could not satisfy PSUM caps jointly for pairs {pairs}; " f"last: {result}"
+    )
+
+
+def _psum_gadget_dim_pairs(ir: KernelIR) -> list[tuple[str, str]]:
+    """Inner-loop dim pairs for every PSUM-using gadget in ``ir``."""
+    pairs: list[tuple[str, str]] = []
+    for op in ir.ops:
+        if op.kind == "NKIMatmul":
+            pairs.append((op.axis_map["M"], op.axis_map["N"]))
+        elif op.kind == "NKITranspose":
+            pairs.append((op.axis_map["P"], op.axis_map["F"]))
+    return pairs
 
 
 def sample_buffer_scopes(ir: KernelIR, rng: random.Random) -> dict[str, BufferScope]:

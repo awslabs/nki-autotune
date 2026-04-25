@@ -49,7 +49,7 @@ def matmul_lhs_rhs_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 
 if __name__ == "__main__":
     M, K, N = 2048, 2048, 2048
-    HOSTS = ["gym-1", "gym-2", "gym-3"]
+    HOSTS = ["gym-1", "gym-2"]
     ATOL, RTOL = 1e-2, 1e-2
 
     INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
@@ -87,6 +87,7 @@ if __name__ == "__main__":
                 mac_count=mac_count,
                 atol=ATOL,
                 rtol=RTOL,
+                neuronx_cc_args=("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false"),
             )
             dump_ir(CACHE_ROOT, kernel_name, candidate)
 

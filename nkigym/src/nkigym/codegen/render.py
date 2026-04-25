@@ -225,19 +225,46 @@ def _emit_compute_ops(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc]) ->
 
 
 def _emit_transpose(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op, gadget: str) -> None:
-    """Emit ``cur_<dst> = <dst>[rotation]; <gadget>(cur_dst, cur_src)``.
+    """Emit ``cur_<dst> = <dst>[rotation]; <gadget>(dst_expr, src_expr)``.
 
     Both operands live at the tightest enclosing loop (same rotation
-    discipline as loads). The source's ``cur_<name>`` was bound earlier
-    when its load fired. ``gadget`` is the gadget name to call —
-    ``transpose_block`` for TE-engine, ``dma_transpose_block`` for DMA.
+    discipline as loads). When src/dst buffers hold more tiles than
+    one block along their axes (OUTER/MIDDLE scope), the gadget input
+    is sliced down so the gadget's inner ``num_k × num_m`` product
+    equals ``lt[P] × lt[F]`` regardless of scope.
     """
     src = op.inputs["data"]
     dst = op.outputs[0]
     dst_info = allocs[dst]
+    src_info = allocs[src]
     cur_dst = _cur_name(dst)
     w.line(f"{cur_dst} = {dst}{_rotation_index(dst_info)}")
-    w.line(f"{gadget}({cur_dst}, {_cur_name(src)})")
+    dst_expr = _transpose_operand_slice(ir, dst_info, base=cur_dst)
+    src_expr = _transpose_operand_slice(ir, src_info, base=_cur_name(src))
+    w.line(f"{gadget}({dst_expr}, {src_expr})")
+
+
+def _transpose_operand_slice(ir: KernelIR, info: _BufAlloc, base: str) -> str:
+    """Slice an operand down to one block on each of its axes.
+
+    P-axis slice → picks ``ltiles_per_block[p_axis]`` contiguous
+    P-slots. F-axis slice → per-leaf list-comprehension narrows each
+    leaf's free-axis width to one block.
+    """
+    buf = info.buf
+    expr = base
+    p_lt = ir.ltiles_per_block.get(buf.p_axis, 1)
+    if info.num_p_tiles > p_lt:
+        expr = f"{expr}[i_block_{buf.p_axis} * {p_lt} : i_block_{buf.p_axis} * {p_lt} + {p_lt}]"
+    if buf.f_axis is not None:
+        f_lt = ir.ltiles_per_block.get(buf.f_axis, 1)
+        if info.num_f_tiles > f_lt:
+            f_width = info.f_tile * f_lt
+            expr = (
+                f"[leaf[:, i_block_{buf.f_axis} * {f_width} : i_block_{buf.f_axis} * {f_width} + {f_width}] "
+                f"for leaf in {expr}]"
+            )
+    return expr
 
 
 """────────────────────────────────────────────────────────────────
@@ -415,24 +442,23 @@ def _maybe_emit_accumulator_prologue(
 def _accumulator_prologue_depth(ir: KernelIR, matmul_op: Op, info: "_BufAlloc") -> int:
     """Depth where the accumulator's ``cur_<name>`` slot binding fires.
 
-    Equal to ``1 + max(dim_order.index(d))`` over non-ACC rotation axes
-    of the accumulator. If the accumulator doesn't rotate on any
-    non-ACC dim, falls back to the depth just above the first ACC loop.
+    Same rule as ``_load_emission_depth``: ``1 + max(dim_order.index(d))``
+    over the accumulator's block-indexed axes (those the buffer's scope
+    leaves per-block rather than full-extent). Block-indexed axes are
+    the ones whose ``i_block_<d>`` index appears in the slot
+    expression, so the prologue must sit inside every such loop.
+
+    When no axes are block-indexed (OUTER scope), the prologue fires at
+    depth 0 (unconditionally, before any loop opens).
     """
-    rot_dims: list[str] = []
-    nb = info.num_buffers
-    if nb.num_p_buffers is not None:
-        rot_dims.append(info.buf.p_axis)
-    if nb.num_f_buffers is not None and info.buf.f_axis is not None:
-        rot_dims.append(info.buf.f_axis)
-    non_acc_rot = [d for d in rot_dims if ir.dimensions[d].role is not DimRole.ACCUMULATION]
-    if non_acc_rot:
-        return 1 + max(ir.dim_order.index(d) for d in non_acc_rot if d in ir.dim_order)
-    for i, d in enumerate(ir.dim_order):
-        if ir.dimensions[d].role is DimRole.ACCUMULATION:
-            return i
     _ = matmul_op
-    return 0
+    block_axes = _block_indexed_axes(ir, info)
+    if not block_axes:
+        return 0
+    positions = [ir.dim_order.index(d) for d in block_axes if d in ir.dim_order]
+    if not positions:
+        return 0
+    return 1 + max(positions)
 
 
 def _rotation_index(info: _BufAlloc) -> str:
