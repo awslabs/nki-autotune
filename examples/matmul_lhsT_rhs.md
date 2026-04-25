@@ -11,9 +11,9 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
 KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
     # Derived objective information
     dimensions:
-        d0: size=2048, ltile=128, ptile=128, num_ltile=16, role=ACCUMULATION
-        d1: size=2048, ltile=128, ptile=128, num_ltile=16, role=PARALLEL
-        d2: size=2048, ltile=512, ptile=512, num_ltile=4, role=PARALLEL
+        d0: size=2048, ltile=128, ptile=128, num_ltile=16
+        d1: size=2048, ltile=128, ptile=128, num_ltile=16
+        d2: size=2048, ltile=512, ptile=512, num_ltile=4
     input_hbm_tensors:
         hbm_lhs_T: shape=(2048, 2048), dims=('d0', 'd1'), dtype=bfloat16
         hbm_rhs: shape=(2048, 2048), dims=('d0', 'd2'), dtype=bfloat16
@@ -23,17 +23,18 @@ KernelIR(func=matmul_lhsT_rhs_nkigym, params=['lhs_T', 'rhs'], return=output)
         sbuf_lhs_T: tile=(128, 128), dims=('d0', 'd1'), dtype=bfloat16
         sbuf_rhs:   tile=(128, 512), dims=('d0', 'd2'), dtype=bfloat16
         sbuf_output: tile=(128, 512), dims=('d1', 'd2'), dtype=bfloat16
-    # Tunable IR knobs
+    # Compute graph (can be changed by graph rewrites)
     operators:
         [0] NKILoad:
-            data=lhs_T, outputs=[sbuf_lhs_T], dim_map={'P': 'd0', 'F':'d1'}
+            data=lhs_T, outputs=[sbuf_lhs_T], dim_map={'P': 'd0', 'F':'d1'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
         [1] NKILoad:
-            data=rhs, outputs=[sbuf_rhs], dim_map={'P': 'd0', 'F':'d2'}
+            data=rhs, outputs=[sbuf_rhs], dim_map={'P': 'd0', 'F':'d2'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
         [2] NKIMatmul:
-            stationary=sbuf_lhs_T, moving=sbuf_rhs, outputs=[sbuf_output], dim_map={'K': 'd0', 'M': 'd1', 'N': 'd2'}
+            stationary=sbuf_lhs_T, moving=sbuf_rhs, outputs=[sbuf_output], dim_map={'K': 'd0', 'M': 'd1', 'N': 'd2'}, dim_role={'K':ACCUMULATION, 'M':PARALLEL, 'N':PARALLEL}
         [3] NKIStore:
-            data=sbuf_output, outputs=[hbm_output], dim_map={'P':'d1', 'F':'d2'}
+            data=sbuf_output, outputs=[hbm_output], dim_map={'P':'d1', 'F':'d2'}, dim_role={'P':PARALLEL, 'F':PARALLEL}
     edges: (0, 2), (1, 2), (2, 3)
+    # Tunable IR knobs
     loop_order: ['d2', 'd0', 'd1']
     ltiles/block:
         d0: 8
@@ -255,8 +256,7 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
 ```
 Information from IR:
 ```
-producer of sbuf_output = [2] NKIMatmul, blocking_dims = {d0}
-d0: role=ACCUMULATION
+producer of sbuf_output = [2] NKIMatmul, dim_role: {'K'=d0: ACCUMULATION, 'M'=d1: PARALLEL, 'N'=d2: PARALLEL}
 ```
 Derive `store_block` placement:
 ```python
