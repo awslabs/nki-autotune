@@ -707,7 +707,7 @@ def _emit_store(
     if p_axis in open_loops and info.num_p_tiles > ir.ltiles_per_block[p_axis]:
         lt = ir.ltiles_per_block[p_axis]
         sbuf_expr = f"{sbuf_expr}[i_block_{p_axis} * {lt} : i_block_{p_axis} * {lt} + {lt}]"
-    elif f_axis is not None and f_axis in open_loops and info.num_f_tiles > ir.ltiles_per_block[f_axis]:
+    if f_axis is not None and f_axis in open_loops and info.num_f_tiles > ir.ltiles_per_block[f_axis]:
         """Free-axis per-block slicing: the sbuf is a list of P-slot
         leaves, so slice each leaf's free axis via a list comprehension."""
         lt = ir.ltiles_per_block[f_axis]
