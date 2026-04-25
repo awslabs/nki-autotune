@@ -18,7 +18,7 @@ import random
 from dataclasses import replace
 
 from nkigym.kernel_ir.ir import BufferScope, KernelIR, NumBuffers
-from nkigym.kernel_ir.validate import axis_open, op_depth, producer_op
+from nkigym.kernel_ir.validate import _accumulator_covers_closed_dims, _find_matmul_op, axis_open, op_depth, producer_op
 
 
 def sample(ir: KernelIR, rng: random.Random | None = None) -> KernelIR:
@@ -58,12 +58,22 @@ def sample_ltiles_per_block(ir: KernelIR, rng: random.Random) -> dict[str, int]:
 def sample_buffer_scopes(ir: KernelIR, rng: random.Random) -> dict[str, BufferScope]:
     """Per-buffer random choice from ``{INNER, MIDDLE, OUTER}``.
 
-    Transpose src/dst pairs share one scope — the transpose gadget
-    requires matching tile counts on the swapped axes, which is only
-    true when both sides use the same scope-sizing rule.
+    Two structural constraints bias the draw:
+
+    * Transpose src/dst pairs share one scope — the transpose gadget
+      requires matching tile counts on the swapped axes.
+    * The matmul accumulator must span FULL extent on every output dim
+      at position ≥ ``first_acc_position`` in ``dim_order`` (see
+      :func:`validate._accumulator_covers_closed_dims`). Scopes that
+      would under-cover a closed output dim are dropped from its
+      choice list.
     """
     scopes = list(BufferScope)
-    result = {name: rng.choice(scopes) for name in _tunable_buffers(ir)}
+    acc_buf = _matmul_output_name(ir)
+    result: dict[str, BufferScope] = {}
+    for name in _tunable_buffers(ir):
+        choices = scopes if name != acc_buf else _accumulator_scope_choices(ir, name)
+        result[name] = rng.choice(choices)
     for op in ir.ops:
         if op.kind not in ("NKITranspose", "NKIDMATranspose"):
             continue
@@ -72,6 +82,22 @@ def sample_buffer_scopes(ir: KernelIR, rng: random.Random) -> dict[str, BufferSc
         if src in result and dst in result:
             result[dst] = result[src]
     return result
+
+
+def _matmul_output_name(ir: KernelIR) -> str | None:
+    """SBUF name that holds the matmul accumulator, or ``None``."""
+    op = _find_matmul_op(ir)
+    return op.outputs[0] if op and op.outputs else None
+
+
+def _accumulator_scope_choices(ir: KernelIR, name: str) -> list[BufferScope]:
+    """Scopes under which the accumulator covers every closed output dim."""
+    valid: list[BufferScope] = []
+    for scope in BufferScope:
+        trial = replace(ir, buffer_scopes={**ir.buffer_scopes, name: scope})
+        if _accumulator_covers_closed_dims(trial):
+            valid.append(scope)
+    return valid
 
 
 def sample_num_buffers(ir: KernelIR, rng: random.Random) -> dict[str, NumBuffers]:

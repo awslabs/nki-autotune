@@ -11,7 +11,51 @@ from nkigym.kernel_ir.types import DimRole
 
 def is_valid(ir: KernelIR) -> bool:
     """Return ``True`` iff every validity check passes."""
-    return _emission_depth_is_valid(ir) and _rotation_axes_in_scope(ir) and _transpose_scopes_match(ir)
+    return (
+        _emission_depth_is_valid(ir)
+        and _rotation_axes_in_scope(ir)
+        and _transpose_scopes_match(ir)
+        and _accumulator_covers_closed_dims(ir)
+    )
+
+
+def _accumulator_covers_closed_dims(ir: KernelIR) -> bool:
+    """Matmul accumulator must span FULL extent on every output dim at
+    position ≥ ``first_acc_position`` in ``dim_order``.
+
+    Store fires once all ACC loops close — at that depth, any dim
+    positioned at or below the first ACC dim is out of scope, so the
+    store emits the full HBM span on those axes and expects the SBUF
+    source to match that span.
+    """
+    acc_op = _find_matmul_op(ir)
+    if acc_op is None or not acc_op.outputs:
+        return True
+    acc_buf_name = acc_op.outputs[0]
+    if acc_buf_name not in ir.buffer_scopes:
+        return True
+    first_acc_pos = _store_depth(ir)
+    buf = ir.physical_buffers[acc_buf_name]
+    scope = ir.buffer_scopes[acc_buf_name]
+    outer_axis = _outer_axis_in_order(ir, buf.p_axis, buf.f_axis)
+    for axis in (buf.p_axis, buf.f_axis):
+        if axis is None or axis not in ir.dim_order:
+            continue
+        if ir.dim_order.index(axis) < first_acc_pos:
+            continue
+        num_tiles = _num_tiles_for_scope(ir, axis, scope, is_outer=(axis == outer_axis))
+        full = ir.dimensions[axis].dim_size // ir.dimensions[axis].physical_tile_size
+        if num_tiles < full:
+            return False
+    return True
+
+
+def _find_matmul_op(ir: KernelIR) -> Op | None:
+    """First ``NKIMatmul`` op, or ``None``."""
+    for op in ir.ops:
+        if op.kind == "NKIMatmul":
+            return op
+    return None
 
 
 def _transpose_scopes_match(ir: KernelIR) -> bool:
