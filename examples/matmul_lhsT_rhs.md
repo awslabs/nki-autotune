@@ -67,7 +67,7 @@ Code generation is **mechanical lowering only** — the IR is the source of trut
 3. Every op's fire depth is the mechanical max of `(operand availability)` and `(op-intrinsic tile requirement)`.
 4. **Illegal IR fails loudly.** If the IR demands something impossible (e.g. an op needs all three `.tile` loops open but the IR places a reader of its output between two of them), raise an error — do not silently rewrite loops, dissolve entries, or promote tile ranges to block ranges to force correctness.
 
-This keeps the sampler's feedback honest: invalid IRs get a loud failure, not a silent correctness hazard.
+**Invalid-IR detection falls out of the derivations.** Every derivation step — emission depth, fire depth, buffer shape, operand liveness, dtype compatibility, tile-role assignment — is a constraint resolution: gather lower bounds, gather upper bounds, pick a consistent value. Any contradiction (`lower > upper`, dtype mismatch between producer and consumer, reducing dim not listed in a downstream accumulator's scope, operand not in scope at an op's computed fire depth, etc.) rejects the IR at derivation time. No ad-hoc fixes, no silent rewrites. The sampler sees a clean failure and moves on.
 
 ## 3.2 Kernel Constants
 ```python
@@ -471,9 +471,22 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
 
 Derive OP_2 PSUM → sbuf_output drain placement:
 ```python
-"""Drain depth = psum_output.emission_depth, on loop close.
-   psum_output.emission_depth = 4 → drain fires at depth 4 after the
-   inner reducing-dim loop (d0.tile) closes."""
+"""Unified drain rule:
+   Drain depth = PSUM emission depth. Drain fires on loop close of the
+   innermost reducing loop that was bracketed by PSUM's lifetime. Drained
+   region = PSUM slice fully populated at that close.
+
+   Drain op depends on whether a downstream SBUF accumulator needs K:
+     - PSUM K = PER_BLOCK (Option B) → downstream SBUF carries K implicit-FULL.
+       Drain op = nisa.tensor_tensor(dst=sbuf, data1=sbuf, data2=psum, op=nl.add)
+       to fold the per-block partial into the longer-lived accumulator.
+     - PSUM K = FULL (Option A) → PSUM already holds the entire K reduction,
+       no SBUF-level accumulation left.
+       Drain op = nisa.dma_copy(dst=sbuf, src=psum) — dtype-narrowing copy only.
+
+   psum_output.emission_depth = 4 (Option B); K = d0 → drain fires at
+   depth 4 on d0.tile close. Full (M.tile, d2.block) PSUM slice is
+   populated (d2.tile iterates inside d0.tile) → drain the whole 0:512."""
 op2_drain_depth = 4
 ```
 Derive OP_2 fire depth:
@@ -532,8 +545,8 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
                                 stationary=sbuf_lhs_T[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
                                 moving=sbuf_rhs[0:128, i_tile_d0, i_tile_d2 * 512 : i_tile_d2 * 512 + 512],
                             )
-                    """PSUM → sbuf_output drain — fires after d0.tile closes (K complete for this M.tile).
-                       nisa.tensor_tensor with op=nl.add accepts one PSUM + one SBUF operand directly."""
+                    """Drain fires at depth 4 right after d0.tile (accumulation-dim tile loop) closes.
+                       Full (M.tile, d2.block) PSUM slice is populated — drain the whole 0:512 F-range."""
                     nisa.tensor_tensor(
                         dst=sbuf_output[0:128, i_block_d1 * 4 + i_tile_d1, 0:512],
                         data1=sbuf_output[0:128, i_block_d1 * 4 + i_tile_d1, 0:512],

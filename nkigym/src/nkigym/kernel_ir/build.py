@@ -3,18 +3,20 @@
 Pipeline:
 
 1. AST-parse the math function → ordered list of
-   ``(op_cls, name_kwargs, output_names)`` call-site tuples.
+   ``(op_cls, name_kwargs, op_kwargs, output_names)`` call-site tuples.
 2. Forward pass over parsed ops unifies abstract axes (``P``, ``F``,
    ``K``, ``M``, ``N``, ...) into concrete dim ids (``d0``, ``d1``, ...),
    producing ``dimensions`` and ``logical_tensors``.
-3. Compute tile sizes (min of per-op ``TILE_LIMITS``) and dim roles
-   (``ACCUMULATION`` if any op blocks on it; else ``PARALLEL``).
+3. Compute tile sizes (min of per-op ``TILE_LIMITS``) and dim roles.
 4. Synthesize ``physical_buffers``: one ``sbuf_<name>`` per referenced
-   tensor plus ``hbm_<return>`` for the store destination.
+   tensor plus ``hbm_<return>`` for the store destination, plus a PSUM
+   sibling for every matmul-style op.
 5. Synthesize ``ops``: one ``NKILoad`` per kernel param, one ``Op`` per
-   parsed op (SBUF-aliased inputs/outputs), one ``NKIStore`` at the tail.
+   parsed op, one ``NKIStore`` at the tail.
 6. Derive ``edges`` from input/output producer-consumer links.
-7. Leave tunable knobs at canonical defaults.
+7. Set canonical knobs: 2N-entry ``loop_order`` (all ``.block`` first,
+   then all ``.tile``); ``ltiles_per_block[d] = 1``; per-dim
+   ``buffer_scopes[buf][d] = PER_BLOCK``.
 """
 
 import inspect
@@ -23,12 +25,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from nkigym.kernel_ir.ir import BufferScope, KernelIR, NumBuffers, Op, PhysicalBuffer
+from nkigym.kernel_ir.ir import DimScope, KernelIR, Op, PhysicalBuffer
 from nkigym.kernel_ir.parse import find_ops
 from nkigym.kernel_ir.types import DimInfo, DimRole, TensorInfo
 from nkigym.ops.base import NKIOp
 from nkigym.ops.load import NKILoad
 from nkigym.ops.store import NKIStore
+
+_MATMUL_KINDS = frozenset({"NKIMatmul"})
 
 
 @dataclass
@@ -51,10 +55,7 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
 
     Returns:
         A ``KernelIR`` with ops filled out, edges derived, and tunable
-        knobs at naive defaults: canonical ``dim_order`` (``d0`` → ``dN``),
-        ``ltiles_per_block={d: 1}``, ``buffer_scopes={buf: INNER}``,
-        ``num_buffers={buf: NumBuffers()}``, ``emission_depth={buf: 0}``
-        for every non-HBM physical buffer.
+        knobs at canonical defaults.
     """
     param_names = list(inspect.signature(func).parameters.keys())
     for name in param_names:
@@ -94,12 +95,9 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
     ops = _build_ops(parsed, per_op_axis_maps, per_op_blocking, tensors, used, param_names, return_name)
     _mint_psum_buffers(ops, physical_buffers, dimensions)
     edges = _derive_edges(ops)
-    dim_order = _default_dim_order(dimensions)
+    loop_order = _default_loop_order(dimensions)
     ltiles_per_block = {d: 1 for d in dimensions}
-    tunable_names = [name for name, buf in physical_buffers.items() if buf.loc != "hbm"]
-    buffer_scopes = {name: BufferScope.INNER for name in tunable_names}
-    num_buffers = {name: NumBuffers() for name in tunable_names}
-    emission_depth = {name: 0 for name in tunable_names}
+    buffer_scopes = _default_buffer_scopes(physical_buffers, ops)
 
     return KernelIR(
         func_name=func.__name__,
@@ -110,17 +108,57 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
         physical_buffers=physical_buffers,
         ops=ops,
         edges=edges,
-        dim_order=dim_order,
+        loop_order=loop_order,
         ltiles_per_block=ltiles_per_block,
         buffer_scopes=buffer_scopes,
-        num_buffers=num_buffers,
-        emission_depth=emission_depth,
     )
 
 
-def _default_dim_order(dimensions: dict[str, DimInfo]) -> list[str]:
-    """Canonical dim order: ``d0`` → ``dN`` by numeric suffix."""
-    return sorted(dimensions, key=lambda d: int(d[1:]))
+def _default_loop_order(dimensions: dict[str, DimInfo]) -> list[str]:
+    """Canonical 2N-entry loop order: all ``.block`` first (by dim id),
+    then all ``.tile`` (by dim id). Respects the invariant that
+    ``{d}.block`` precedes ``{d}.tile`` for every dim."""
+    ordered = sorted(dimensions, key=lambda d: int(d[1:]))
+    return [f"{d}.block" for d in ordered] + [f"{d}.tile" for d in ordered]
+
+
+def _default_buffer_scopes(
+    physical_buffers: dict[str, PhysicalBuffer], ops: list[Op]
+) -> dict[str, dict[str, DimScope]]:
+    """Per-dim default scopes for every non-HBM buffer.
+
+    * Plain buffers: ``PER_BLOCK`` on every dim.
+    * Matmul SBUF outputs: reducing dim omitted (codegen rule pins it
+      to FULL). Non-reducing output dims default to ``FULL`` too —
+      the simplest always-valid setting; a tuner can shrink to
+      PER_BLOCK whenever the non-reducing dim sits before the reducing
+      dim in loop_order.
+    * Matmul PSUM siblings: every matmul op axis (K, M, N) listed.
+      Reducing dim affects emission depth; non-reducing dims shape
+      the storage.
+    """
+    reducing_by_sbuf: dict[str, set[str]] = {}
+    reducing_by_psum: dict[str, set[str]] = {}
+    for op in ops:
+        if op.kind in _MATMUL_KINDS and op.outputs:
+            sbuf_out = op.outputs[0]
+            reducing_by_sbuf[sbuf_out] = set(op.blocking_dims)
+            psum_name = "psum_" + sbuf_out[len("sbuf_") :]
+            reducing_by_psum[psum_name] = set(op.blocking_dims)
+    result: dict[str, dict[str, DimScope]] = {}
+    for name, buf in physical_buffers.items():
+        if buf.loc == "hbm":
+            continue
+        if name in reducing_by_sbuf:
+            dims = [d for d in buf.dim_ids if d not in reducing_by_sbuf[name]]
+            result[name] = {d: DimScope.FULL for d in dims}
+        elif name in reducing_by_psum:
+            dims = list(reducing_by_psum[name]) + list(buf.dim_ids)
+            result[name] = {d: DimScope.PER_BLOCK for d in dims}
+        else:
+            dims = list(buf.dim_ids)
+            result[name] = {d: DimScope.PER_BLOCK for d in dims}
+    return result
 
 
 def _resolve_dimensions(
@@ -186,7 +224,7 @@ def _build_physical_buffers(
         p_tile = dimensions[p_axis].physical_tile_size
         f_tile = dimensions[f_axis].physical_tile_size if f_axis is not None else 1
         result[f"sbuf_{name}"] = PhysicalBuffer(
-            tile=(p_tile, f_tile), dim_ids=tuple(t.dim_ids), dtype=t.dtype, p_axis=p_axis, f_axis=f_axis, loc="sbuf"
+            tile=(p_tile, f_tile), dim_ids=tuple(t.dim_ids), dtype=t.dtype, loc="sbuf"
         )
     ret_t = tensors[return_name]
     ret_p = ret_t.dim_ids[0]
@@ -194,35 +232,21 @@ def _build_physical_buffers(
     hbm_p = dimensions[ret_p].dim_size
     hbm_f = dimensions[ret_f].dim_size if ret_f is not None else 1
     result[f"hbm_{return_name}"] = PhysicalBuffer(
-        tile=(hbm_p, hbm_f), dim_ids=tuple(ret_t.dim_ids), dtype=ret_t.dtype, p_axis=ret_p, f_axis=ret_f, loc="hbm"
+        tile=(hbm_p, hbm_f), dim_ids=tuple(ret_t.dim_ids), dtype=ret_t.dtype, loc="hbm"
     )
     return result
-
-
-_MATMUL_KINDS = frozenset({"NKIMatmul"})
-"""Ops whose SBUF output is an SBUF drain target of a hoisted PSUM
-accumulator.
-
-For each such op, :func:`_mint_psum_buffers` adds a sibling
-``psum_<out>`` physical buffer. The K-accumulator is hoisted out of
-the per-call gadget scratch: the renderer emits PSUM alloc+memset
-just outside ``K``, the gadget accumulates ``+=`` across K, and a
-separate drain runs once the reducing loop closes.
-
-``NKIOnlineMatmul`` is deliberately excluded — its per-K rescale
-``O_k = s_k · O_{k-1} + A_k`` requires the drain to fire inside each
-K iteration (the online-fusion recurrence is not add-associative with
-hoisting). It keeps the fresh-PSUM-per-(m,n) pattern internally."""
 
 
 def _mint_psum_buffers(
     ops: list[Op], physical_buffers: dict[str, PhysicalBuffer], dimensions: dict[str, DimInfo]
 ) -> None:
-    """For every matmul-style op, add ``psum_<sbuf_out>`` to ``physical_buffers``.
+    """For every matmul-style op, add ``psum_<stem>`` to ``physical_buffers``.
 
-    Axes come from the op's ``axis_map`` — ``M`` on partition, ``N`` on
-    free. PSUM dtype is always fp32 regardless of input dtype (matches
-    the HW contract of ``nc_matmul`` draining through fp32 PSUM).
+    The PSUM entry's storage ``dim_ids`` is ``(M, N)`` — the reducing
+    K-axis is consumed in-place by ``nc_matmul``'s HW accumulator and
+    does not contribute to the storage shape. The reducing axis is
+    still tracked in ``buffer_scopes`` for placement purposes (emission
+    depth is capped by K.tile).
     """
     for op in ops:
         if op.kind not in _MATMUL_KINDS or not op.outputs:
@@ -235,10 +259,10 @@ def _mint_psum_buffers(
             continue
         m_dim = op.axis_map["M"]
         n_dim = op.axis_map["N"]
-        p_tile = dimensions[m_dim].physical_tile_size
-        f_tile = dimensions[n_dim].physical_tile_size
+        m_tile = dimensions[m_dim].physical_tile_size
+        n_tile = dimensions[n_dim].physical_tile_size
         physical_buffers[psum_name] = PhysicalBuffer(
-            tile=(p_tile, f_tile), dim_ids=(m_dim, n_dim), dtype="float32", p_axis=m_dim, f_axis=n_dim, loc="psum"
+            tile=(m_tile, n_tile), dim_ids=(m_dim, n_dim), dtype="float32", loc="psum"
         )
 
 
@@ -359,13 +383,7 @@ def _create_outputs(
     tensors: dict[str, _Tensor],
     dim_sizes: dict[str, int],
 ) -> None:
-    """Create output tensor records from the op's abstract ``OUTPUT_AXES``.
-
-    Output dtype follows the first tensor operand (elementwise / matmul
-    default), unless the op class overrides it per-output via
-    ``OUTPUT_DTYPES`` — ``NKIActivationReduce`` pins its reduce result
-    to ``float32``.
-    """
+    """Create output tensor records from the op's abstract ``OUTPUT_AXES``."""
     first_slot = next(iter(op_cls.OPERAND_AXES))
     has_first = first_slot in operand_map and operand_map[first_slot] in tensors
     default_dtype = (

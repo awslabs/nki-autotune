@@ -43,7 +43,7 @@ def matmul_lhsT_rhs_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 
 if __name__ == "__main__":
     K, M, N = 2048, 2048, 2048
-    HOSTS = ["gym-2", "gym-3"]
+    HOSTS = ["gym-1", "gym-2", "gym-3"]
     ATOL, RTOL = 1e-2, 1e-2
 
     INPUT_SPECS = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}

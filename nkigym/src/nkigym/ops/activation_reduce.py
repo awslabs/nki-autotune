@@ -30,7 +30,10 @@ _ACT_FNS: dict[str, Any] = {
     "rsqrt": lambda x: 1.0 / np.sqrt(x),
     "sqrt": np.sqrt,
 }
-_RED_FNS: dict[str, Any] = {"add": np.sum}
+_RED_FNS: dict[str, Any] = {"add": np.sum, "max": np.max}
+"""Reduce-op-name → numpy reduction. Extend by adding a new
+``{name: np.fn}`` entry; the gadget picks up new names via
+``_MERGE_FNS`` and ``_IDENTITY`` below."""
 
 _NL_OPS: dict[str, Any] = {
     "square": nl.square,
@@ -41,7 +44,21 @@ _NL_OPS: dict[str, Any] = {
     "rsqrt": nl.rsqrt,
     "sqrt": nl.sqrt,
 }
-_NL_REDUCE_OPS: dict[str, Any] = {"add": nl.add}
+_NL_REDUCE_OPS: dict[str, Any] = {"add": nl.add, "max": nl.maximum}
+"""Reduce-op-name → ``nl.*`` ISA op. Lower-case ``max`` maps to
+``nl.maximum`` — the binary pairwise elementwise-max used both as the
+reduction axis op and the cross-iteration accumulator merge."""
+
+_MERGE_FNS: dict[str, Any] = {"add": nl.add, "max": nl.maximum}
+"""Per-reduce-op binary merge for the cross-iteration accumulator.
+``activation_reduce_block`` is called once per F-block; each call
+produces a ``(p_tile, 1)`` block reduction that must be folded into
+the caller-owned ``sbuf_red`` accumulator via this merge."""
+
+_IDENTITY: dict[str, float] = {"add": 0.0, "max": float("-inf")}
+"""Identity element for each reduce op. The renderer emits the
+prologue memset using this value so the first block's merge produces
+the correct first-block reduction."""
 
 
 class NKIActivationReduce(NKIOp):
@@ -99,11 +116,14 @@ class NKIActivationReduce(NKIOp):
 
 
 def activation_reduce_block(sbuf_red: Any, sbuf_data: Any, op: Any, reduce_op: Any) -> None:
-    """Apply ``op`` + free-axis ``reduce_op`` per leaf, accumulating into ``sbuf_red``.
+    """Apply ``op`` + free-axis ``reduce_op`` per leaf, merging into ``sbuf_red``.
 
     ``sbuf_data`` leaves shape ``(p_tile, f_tile)``. ``sbuf_red`` leaves
-    shape ``(p_tile, 1)``. Each reduce is added into the accumulator;
-    caller must memset ``sbuf_red`` before the first call in an F-block.
+    shape ``(p_tile, 1)``. The F-block reduction is merged into the
+    caller-provided accumulator using ``reduce_op`` (``nl.add`` →
+    sum-accumulate, ``nl.maximum`` → running max). The caller must
+    memset ``sbuf_red`` to the reduction identity before the first
+    call in an F-block (0.0 for add, -inf for max).
 
     The scale+bias+post_op kwargs of :class:`NKIActivationReduce` are
     emitted by the renderer — this gadget handles only the raw
@@ -122,7 +142,9 @@ def activation_reduce_block(sbuf_red: Any, sbuf_data: Any, op: Any, reduce_op: A
             reduce_op=reduce_op,
             reduce_res=tmp_red[0:p_tile, 0:1],
         )
-        nisa.tensor_tensor(sbuf_red[pi][0:p_tile, 0:1], sbuf_red[pi][0:p_tile, 0:1], tmp_red[0:p_tile, 0:1], op=nl.add)
+        nisa.tensor_tensor(
+            sbuf_red[pi][0:p_tile, 0:1], sbuf_red[pi][0:p_tile, 0:1], tmp_red[0:p_tile, 0:1], op=reduce_op
+        )
 
 
 def activation_block(sbuf_dst: Any, sbuf_src: Any, op: Any, scale: float = 1.0, bias: float = 0.0) -> None:

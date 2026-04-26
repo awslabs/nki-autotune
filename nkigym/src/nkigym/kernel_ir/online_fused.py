@@ -10,7 +10,7 @@ using the per-workload recipe registered in
 
 The output is still a plain ``KernelIR`` that plugs into
 :func:`nkigym.codegen.render_ir`, :func:`nkigym.kernel_ir.sample.sample`,
-:func:`nkigym.kernel_ir.validate.validity_report`, and the tuning
+and the tuning
 infrastructure.
 """
 

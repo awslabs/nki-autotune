@@ -11,27 +11,20 @@ Rewrite::
     [i] NKIDMATranspose(data=param) → sbuf_param_T
 
 The fused op reads directly from the HBM parameter and writes the
-transposed result into ``sbuf_param_T``. The renderer lowers it to
-``dma_transpose_block(cur_sbuf_param_T, param[...])`` — exactly one
-HBM→SBUF DMA transpose, same perf as the previous
-``load_block(transpose=True)`` path but with no attribute side-channel
-or dedicated load-transpose codepath.
+transposed result into ``sbuf_param_T``.
 
 Two-stage interface (see :class:`IRRewrite`):
 
 * ``analyze(ir)`` returns a list of :class:`LoadTransposeMatch` — one
-  per fusable ``(load, transpose)`` pair, in IR order. Pure inspection.
-* ``apply(ir, matches)`` rewrites exactly the pairs in ``matches``
-  (the caller can prune the list). Returns a new :class:`KernelIR`.
+  per fusable ``(load, transpose)`` pair, in IR order.
+* ``apply(ir, matches)`` rewrites exactly the pairs in ``matches``.
 
 Guardrails (enforced during ``analyze``):
 
 * Only fires when the transpose's input sbuf is produced by a single
-  load **and** has no other consumers — otherwise removing the
-  intermediate ``sbuf_param`` would break some other op.
-* Preserves every other IR knob: scope / num_buffers / emission_depth
-  entries keyed under the original ``sbuf_param`` are re-keyed under
-  the fused destination ``sbuf_param_T``.
+  load **and** has no other consumers.
+* Preserves every other IR knob: scope entries keyed under the
+  original ``sbuf_param`` are re-keyed under the fused destination.
 """
 
 from dataclasses import dataclass, replace
@@ -44,15 +37,7 @@ _TRANSPOSE_KINDS = frozenset({"NKITranspose", "NKIDMATranspose"})
 
 @dataclass(frozen=True)
 class LoadTransposeMatch:
-    """One fusable ``(NKILoad, transpose)`` site.
-
-    Attributes:
-        load_idx: Index of the ``NKILoad`` op in ``ir.ops``.
-        transpose_idx: Index of the transpose op in ``ir.ops``.
-        hbm_param: HBM tensor the load reads from.
-        old_sbuf: Intermediate SBUF buffer name to be retired.
-        new_sbuf: Transpose output SBUF buffer name — fused destination.
-    """
+    """One fusable ``(NKILoad, transpose)`` site."""
 
     load_idx: int
     transpose_idx: int
@@ -100,8 +85,6 @@ class LoadTranspose(IRRewrite[LoadTransposeMatch]):
         ops = list(ir.ops)
         physical_buffers = dict(ir.physical_buffers)
         buffer_scopes = dict(ir.buffer_scopes)
-        num_buffers = dict(ir.num_buffers)
-        emission_depth = dict(ir.emission_depth)
 
         transpose_indices_to_drop: list[int] = []
         for match in matches:
@@ -120,11 +103,7 @@ class LoadTranspose(IRRewrite[LoadTransposeMatch]):
 
             physical_buffers.pop(match.old_sbuf, None)
             _migrate_knob(buffer_scopes, match.old_sbuf, match.new_sbuf)
-            _migrate_knob(num_buffers, match.old_sbuf, match.new_sbuf)
-            _migrate_knob(emission_depth, match.old_sbuf, match.new_sbuf)
 
-        """Drop the retired transpose ops in descending order so earlier
-        indices remain valid during removal."""
         for idx in sorted(transpose_indices_to_drop, reverse=True):
             ops.pop(idx)
 
@@ -139,11 +118,9 @@ class LoadTranspose(IRRewrite[LoadTransposeMatch]):
             physical_buffers=physical_buffers,
             ops=ops,
             edges=edges,
-            dim_order=ir.dim_order,
+            loop_order=ir.loop_order,
             ltiles_per_block=ir.ltiles_per_block,
             buffer_scopes=buffer_scopes,
-            num_buffers=num_buffers,
-            emission_depth=emission_depth,
         )
 
 
@@ -169,8 +146,6 @@ def _migrate_knob(knob: dict, old_key: str, new_key: str) -> None:
     """Move ``knob[old_key]`` to ``knob[new_key]``; skip when old is absent."""
     if old_key in knob:
         value = knob.pop(old_key)
-        """Only install the migrated value when there isn't already an
-        explicit entry for the fused destination buffer."""
         knob.setdefault(new_key, value)
 
 

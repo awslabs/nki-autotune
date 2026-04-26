@@ -88,3 +88,57 @@ def matmul_drain_block(sbuf_out: Any, psum_out: Any) -> None:
                 sbuf_out[m_idx][0:tile_m, n_idx * tile_n : (n_idx + 1) * tile_n],
                 psum_out[m_idx][0:tile_m, n_idx * tile_n : (n_idx + 1) * tile_n],
             )
+
+
+def matmul_prefetched_drain_block(sbuf_out: Any, sbuf_lhs_T: Any, sbuf_rhs: Any) -> None:
+    """Matmul + drain with per-(m, n) independent PSUM tiles.
+
+    Unlike :func:`matmul_block` + :func:`matmul_drain_block` — which share
+    one caller-provided PSUM list across all (m, n) pairs and drain AFTER
+    K closes — this gadget allocates a fresh PSUM per (m, n) up front, then
+    issues all ``nc_matmul`` instructions in one burst, then all
+    ``tensor_copy`` drains in a second burst.
+
+    Tensor Engine and Vector Engine have independent instruction queues;
+    with all ``nc_matmul`` issued first, TE runs the full burst while VE's
+    ``tensor_copy`` queue starts draining as soon as each PSUM slot retires.
+    Per-(m, n) distinct PSUM slots remove WAW/RAW hazards that would otherwise
+    serialize compute and drain on a single shared PSUM.
+
+    Applies when the matmul's K axis is fully absorbed (one nc_matmul per
+    (m, n) — i.e. ``num_k_tiles == 1``). For multi-K accumulation, use
+    :func:`matmul_block` + :func:`matmul_drain_block`.
+    """
+    import nki.language as nl
+
+    _TILE_M_MAX = 128
+    _TILE_N_MAX = 512
+    num_m_tiles = len(sbuf_out)
+    num_k_tiles = len(sbuf_lhs_T)
+    tile_k = sbuf_lhs_T[0].shape[0]
+    tile_m = sbuf_out[0].shape[0]
+    if tile_m > _TILE_M_MAX:
+        raise ValueError(f"matmul_prefetched_drain_block: tile_m={tile_m} exceeds HW cap {_TILE_M_MAX}")
+    free_width = sbuf_rhs[0].shape[1]
+    tile_n = free_width if free_width <= _TILE_N_MAX else _TILE_N_MAX
+    num_n_tiles = free_width // tile_n
+
+    psum_tiles = [
+        [nl.ndarray((tile_m, tile_n), dtype=nl.float32, buffer=nl.psum) for _ in range(num_n_tiles)]
+        for _ in range(num_m_tiles)
+    ]
+
+    for m_idx in range(num_m_tiles):
+        for n_idx in range(num_n_tiles):
+            for k_idx in range(num_k_tiles):
+                nisa.nc_matmul(
+                    dst=psum_tiles[m_idx][n_idx][0:tile_m, 0:tile_n],
+                    stationary=sbuf_lhs_T[k_idx][0:tile_k, m_idx * tile_m : (m_idx + 1) * tile_m],
+                    moving=sbuf_rhs[k_idx][0:tile_k, n_idx * tile_n : (n_idx + 1) * tile_n],
+                )
+    for m_idx in range(num_m_tiles):
+        for n_idx in range(num_n_tiles):
+            nisa.tensor_copy(
+                sbuf_out[m_idx][0:tile_m, n_idx * tile_n : (n_idx + 1) * tile_n],
+                psum_tiles[m_idx][n_idx][0:tile_m, 0:tile_n],
+            )

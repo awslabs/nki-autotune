@@ -31,9 +31,10 @@ _ACT_FNS: dict[str, Any] = {
 class NKIActivation(NKIOp):
     """Standalone activation: ``output = op(data * scale + bias)``.
 
-    Declares only the P axis so the op accepts both 1D ``(P,)`` and
-    2D ``(P, F)`` inputs — the build pipeline unifies axes positionally
-    and the gadget iterates over the full leaf shape regardless.
+    Declares both P and F axes so the op accepts 1D ``(P,)`` and 2D
+    ``(P, F)`` inputs. The build pipeline's axis-unification layer
+    zips ``OPERAND_AXES`` with the operand's concrete ``dim_ids``
+    positionally — 1D operands simply skip the F axis slot.
 
     Output matches the input dtype by default; pin to fp32 via
     ``OUTPUT_DTYPES`` at the use site if precision matters (the online
@@ -41,11 +42,11 @@ class NKIActivation(NKIOp):
     """
 
     NAME: ClassVar[str] = "activation"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P",)}
-    OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P",)}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F")}
+    OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F")}
     OUTPUT_DTYPES: ClassVar[dict[str, str]] = {"output": "float32"}
     BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128, "F": 512}
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: ``op(data * scale + bias)``."""
