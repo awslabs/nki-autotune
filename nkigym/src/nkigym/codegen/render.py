@@ -27,6 +27,7 @@ _GADGETS_IMPORT = (
     "    dma_transpose_block,\n"
     "    load_block,\n"
     "    matmul_block,\n"
+    "    matmul_drain_block,\n"
     "    memset_buffers,\n"
     "    online_matmul_block,\n"
     "    store_block,\n"
@@ -46,6 +47,29 @@ _GADGETS_IMPORT = (
 _LOAD_KINDS = frozenset({"NKILoad"})
 _TRANSPOSE_GADGETS: dict[str, str] = {"NKITranspose": "transpose_block", "NKIDMATranspose": "dma_transpose_block"}
 _REDUCING_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce", "NKIOnlineMatmul"})
+_MATMUL_KINDS = frozenset({"NKIMatmul"})
+"""Matmul-style reducers whose PSUM accumulator is hoisted out of the
+gadget — ``psum_<output-stem>`` is a physical buffer in the IR, and
+the renderer emits a separate ``matmul_drain_block`` once the K loop
+closes. ``NKIOnlineMatmul`` is excluded because its per-K rescale
+(``O_k = s_k · O_{k-1} + A_k``) is not associative across K: the
+drain must fire inside each K iteration, so the gadget keeps its
+PSUM scratch private."""
+
+
+def _accumulator_buf_name(op: Op) -> str:
+    """Buffer the reducer ``op`` accumulates into.
+
+    ``NKIMatmul`` accumulates into ``psum_<stem>``; everything else
+    (``NKIActivationReduce``, ``NKIOnlineMatmul`` — which manages its
+    own PSUM scratch) writes its SBUF output in place.
+    """
+    out = op.outputs[0]
+    if op.kind in _MATMUL_KINDS:
+        if not out.startswith("sbuf_"):
+            raise ValueError(f"matmul op {op.kind} expected sbuf_-prefixed output, got {out!r}")
+        return "psum_" + out[len("sbuf_") :]
+    return out
 
 
 def render_ir(ir: KernelIR) -> str:
@@ -177,13 +201,16 @@ def _emit_loop_nest(
       loops (``= _store_emission_depth``).
     """
     here_ops = [op for op in _ops_in_phase(ir, phases, phase=0) if _op_natural_depth(ir, allocs, op) == dim_idx]
-    _emit_compute_ops(w, ir, allocs, here_ops)
+    pre_ops, post_ops = _split_here_ops_by_matmul_drain(ir, here_ops, dim_idx)
+    _emit_compute_ops(w, ir, allocs, pre_ops)
     if dim_idx == len(ir.dim_order):
         return
 
     dim = ir.dim_order[dim_idx]
     if not _loop_has_body(ir, allocs, phases, dim_idx):
         _emit_loop_nest(w, ir, allocs, store_op, phases, dim_idx + 1)
+        _emit_matmul_drains_at_depth(w, ir, allocs, depth=dim_idx, open_loops=ir.dim_order[:dim_idx])
+        _emit_compute_ops(w, ir, allocs, post_ops)
         store_depth = _store_emission_depth(ir)
         if dim_idx == store_depth:
             open_loops = ir.dim_order[:store_depth]
@@ -204,10 +231,42 @@ def _emit_loop_nest(
         _emit_loop_nest(w, ir, allocs, store_op, phases, dim_idx + 1)
         w.dedent()
 
+    _emit_matmul_drains_at_depth(w, ir, allocs, depth=dim_idx, open_loops=ir.dim_order[:dim_idx])
+    _emit_compute_ops(w, ir, allocs, post_ops)
     store_depth = _store_emission_depth(ir)
     if dim_idx == store_depth:
         open_loops = ir.dim_order[:store_depth]
         _emit_store(w, ir, allocs, store_op, open_loops)
+
+
+def _split_here_ops_by_matmul_drain(ir: KernelIR, here_ops: list[Op], dim_idx: int) -> tuple[list[Op], list[Op]]:
+    """Split ``here_ops`` into pre- and post-drain halves.
+
+    An op lands in the post-drain half if any of its inputs is the
+    SBUF output of a matmul-style op whose own drain fires at
+    ``dim_idx``. Those inputs only become readable once the drain
+    has run, so the consumer must be emitted after drains (still at
+    the same dim_idx, inside the enclosing ``dim_order[:dim_idx]`` body).
+
+    Ops that don't depend on a drain at this depth stay in the pre-drain
+    half and retain their original emission point (before the loop for
+    ``dim_order[dim_idx]`` opens), preserving producer-before-consumer
+    semantics for all non-drain relationships.
+    """
+    drain_outputs: set[str] = set()
+    for op in ir.ops:
+        if op.kind not in _MATMUL_KINDS or not op.outputs:
+            continue
+        if _matmul_drain_depth(ir, op) == dim_idx:
+            drain_outputs.add(op.outputs[0])
+    pre: list[Op] = []
+    post: list[Op] = []
+    for op in here_ops:
+        if any(inp in drain_outputs for inp in op.inputs.values()):
+            post.append(op)
+        else:
+            pre.append(op)
+    return pre, post
 
 
 def _emit_phases_at_inner_depth(
@@ -281,6 +340,7 @@ def _emit_phase_tail(
         _emit_loads_at_depth(w, ir, allocs, phase=phase, depth=dim_idx + 1)
         _emit_phase_tail(w, ir, allocs, store_op, phases, phase, phase_ops, dim_idx + 1)
         w.dedent()
+    _emit_matmul_drains_at_depth(w, ir, allocs, depth=dim_idx, open_loops=ir.dim_order[:dim_idx])
     store_depth = _store_emission_depth(ir)
     if dim_idx == store_depth and _is_store_producer_phase(ir, phases, phase):
         open_loops = ir.dim_order[:store_depth]
@@ -343,8 +403,8 @@ def _phase_tail_has_body(
                 if dst in allocs and _load_emission_depth(ir, allocs[dst]) == depth:
                     return True
             if op.kind in _REDUCING_KINDS and op.outputs:
-                out_name = op.outputs[0]
-                if out_name in allocs and _accumulator_prologue_depth(ir, op, allocs[out_name]) == depth:
+                acc_name = _accumulator_buf_name(op)
+                if acc_name in allocs and _accumulator_prologue_depth(ir, op, allocs[acc_name]) == depth:
                     return True
         for op in phase_ops:
             if _op_natural_depth(ir, allocs, op) == depth:
@@ -375,8 +435,8 @@ def _loop_has_body(ir: KernelIR, allocs: dict[str, _BufAlloc], phases: "_PhaseMa
                 if dst in allocs and _load_emission_depth(ir, allocs[dst]) == depth:
                     return True
             if op.kind in _REDUCING_KINDS and op.outputs:
-                out_name = op.outputs[0]
-                if out_name in allocs and _accumulator_prologue_depth(ir, op, allocs[out_name]) == depth:
+                acc_name = _accumulator_buf_name(op)
+                if acc_name in allocs and _accumulator_prologue_depth(ir, op, allocs[acc_name]) == depth:
                     return True
         for op in _ops_in_phase(ir, phases, phase=0):
             if _op_natural_depth(ir, allocs, op) == depth:
@@ -507,7 +567,14 @@ def _assign_op_phases(ir: KernelIR) -> _PhaseMap:
                 continue
             prod_phase = op_phase.get(id(prod), 0)
             bump = 0
-            if prod.kind in _REDUCING_KINDS and not (prod.blocking_dims & op.blocking_dims):
+            """Only ``NKIActivationReduce`` fires a phase split — its
+            ``post_op`` closure (e.g. ``rsqrt``) runs once the F-reduce
+            loop closes, separating pre-reduce and post-reduce ops into
+            sibling loops. Matmul-style reducers drain through a PSUM
+            gadget at ``_matmul_drain_depth``; their SBUF output is a
+            plain forward edge to downstream ops and does not split
+            phases."""
+            if prod.kind == "NKIActivationReduce" and not (prod.blocking_dims & op.blocking_dims):
                 bump = 1
                 phase_closers.setdefault(prod_phase, [])
                 if prod not in phase_closers[prod_phase]:
@@ -695,7 +762,7 @@ def _resolve_allocations(ir: KernelIR) -> dict[str, _BufAlloc]:
     """
     result: dict[str, _BufAlloc] = {}
     for name, buf in ir.physical_buffers.items():
-        if name.startswith("hbm_"):
+        if buf.loc == "hbm":
             continue
         if name not in ir.buffer_scopes:
             raise ValueError(
@@ -784,7 +851,7 @@ def _alloc_call(info: _BufAlloc) -> str:
     return (
         f"{info.name} = allocate_buffers(p_tile_size={info.p_tile}, num_p_tiles={info.num_p_tiles}, "
         f"f_tile_size={info.f_tile}, num_f_tiles={info.num_f_tiles}, "
-        f"loc=nl.sbuf, dtype=nl.{info.buf.dtype}, "
+        f"loc=nl.{info.buf.loc}, dtype=nl.{info.buf.dtype}, "
         f"num_p_buffers={p}, num_f_buffers={f})"
     )
 
@@ -801,18 +868,20 @@ def _maybe_emit_reducer_prologue(
     for every reducing op whose accumulator's slot first resolves at
     ``depth``.
 
-    Covers matmul *and* activation_reduce. 1D reduce outputs (f_axis=None)
-    memset at ``(p_tile, 1)`` — handled the same way via the flat
-    leaf-list contract.
+    Matmul-style ops accumulate into ``psum_<stem>`` (the K-accumulator
+    hoisted out of the gadget); ``NKIActivationReduce`` accumulates into
+    its own SBUF output. Both fire the same binding+memset pattern at
+    the same rule — the accumulator buffer's block-indexed first-use
+    depth.
     """
     _ = phases
     for op in _find_reducing_ops(ir):
-        out_name = op.outputs[0]
-        info = allocs[out_name]
+        acc_name = _accumulator_buf_name(op)
+        info = allocs[acc_name]
         if depth != _accumulator_prologue_depth(ir, op, info):
             continue
-        cur = _cur_name(out_name)
-        w.line(f"{cur} = {out_name}{_rotation_index(info)}")
+        cur = _cur_name(acc_name)
+        w.line(f"{cur} = {acc_name}{_rotation_index(info)}")
         w.line(f"memset_buffers({cur}, 0.0)")
 
 
@@ -1102,24 +1171,40 @@ Matmul emission
 
 
 def _emit_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
-    """Emit ``matmul_block(out_slice, lhs_T, rhs)`` at the innermost loop body.
+    """Emit ``matmul_block(psum_slice, lhs_T, rhs)`` at the innermost loop body.
 
-    The accumulator is sliced down to one M-block on the P-axis and/or
-    one N-block on the free-axis whenever it holds more. Inputs pass
-    through their ``cur_<name>`` slot.
+    The accumulator lives in PSUM under name ``psum_<stem>`` — fed by
+    the prologue at the matmul's K-enclosing depth. The gadget does one
+    ``nc_matmul`` per K block, accumulating additively into the PSUM
+    slot.
+
+    Drain placement depends on K's iteration count:
+
+    * All blocking dims with ``num_blocks == 1`` — drain inline right
+      after the call (PSUM is complete after a single ``nc_matmul``).
+      Needed when a downstream consumer of the SBUF output is nested
+      inside a sibling non-K loop deeper than the producer's natural
+      depth; post-recursion drain would land after the consumer reads
+      a stale slot.
+    * Multi-iter K — drain at :func:`_matmul_drain_depth` post-recursion
+      via :func:`_emit_matmul_drains_at_depth`.
     """
     k_dim = op.axis_map["K"]
     m_dim = op.axis_map["M"]
     n_dim = op.axis_map["N"]
     lhs = op.inputs["stationary"]
     rhs = op.inputs["moving"]
-    out = op.outputs[0]
-    out_info = allocs[out]
+    psum_name = _accumulator_buf_name(op)
+    psum_info = allocs[psum_name]
 
-    out_expr = _matmul_output_expr(ir, out_info, m_dim, n_dim)
+    psum_expr = _matmul_output_expr(ir, psum_info, m_dim, n_dim)
     lhs_expr = _matmul_input_expr(ir, allocs, lhs, k_dim, m_dim)
     rhs_expr = _matmul_input_expr(ir, allocs, rhs, k_dim, n_dim)
-    w.line(f"matmul_block({out_expr}, {lhs_expr}, {rhs_expr})")
+    w.line(f"matmul_block({psum_expr}, {lhs_expr}, {rhs_expr})")
+
+    if not _has_multi_iter_blocking(ir, op):
+        open_loops = ir.dim_order[: _op_natural_depth(ir, allocs, op)]
+        _emit_matmul_drain(w, ir, allocs, op, open_loops)
 
 
 def _emit_online_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
@@ -1127,8 +1212,9 @@ def _emit_online_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], 
 
     Same (K, M, N) operand shaping as :func:`_emit_matmul`, plus a
     ``(P=M,)`` scale operand narrowed to one M-block when its buffer
-    holds more. The gadget's fused ``scalar_tensor_tensor`` drain
-    applies ``output = output * scale + lhs_T @ rhs`` per K block.
+    holds more. Unlike :func:`_emit_matmul`, the online gadget keeps
+    its PSUM scratch internal — the ``s_k`` rescale fires inside each
+    K iteration, so no external drain is emitted.
     """
     k_dim = op.axis_map["K"]
     m_dim = op.axis_map["M"]
@@ -1145,6 +1231,104 @@ def _emit_online_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], 
     rhs_expr = _matmul_input_expr(ir, allocs, rhs, k_dim, n_dim)
     scale_expr = _broadcast_operand_slice(ir, scale_info, base=_cur_name(scale))
     w.line(f"online_matmul_block({out_expr}, {lhs_expr}, {rhs_expr}, {scale_expr})")
+
+
+def _emit_matmul_drains_at_depth(
+    w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], depth: int, open_loops: list[str]
+) -> None:
+    """Emit PSUM→SBUF drain gadgets for matmul-style ops whose drain
+    fires at ``depth``.
+
+    Each ``NKIMatmul`` accumulates into PSUM across its own
+    ``blocking_dims``. Drain placement depends on whether the K loop
+    iterates:
+
+    * Multi-iter K (any blocking dim with ``num_blocks > 1``) — drain
+      at ``min(dim_order.index(d))`` over those multi-iter dims, i.e.
+      right after the outermost multi-iter K loop closes.
+    * All-1-iter K — drain inline at the producer's natural depth
+      right after the single ``matmul_block`` call. Post-recursion
+      placement would land below any consumer nested inside a sibling
+      non-K loop at the same depth, causing the consumer to read a
+      stale SBUF slot.
+
+    The inline case is emitted by :func:`_emit_inline_matmul_drain`
+    (called immediately after each matmul call in
+    :func:`_emit_compute_ops`); this function handles only the
+    post-recursion case.
+    """
+    for op in ir.ops:
+        if op.kind not in _MATMUL_KINDS or not op.outputs:
+            continue
+        if not _has_multi_iter_blocking(ir, op):
+            continue
+        if _matmul_drain_depth(ir, op) != depth:
+            continue
+        _emit_matmul_drain(w, ir, allocs, op, open_loops)
+
+
+def _has_multi_iter_blocking(ir: KernelIR, op: Op) -> bool:
+    """True iff any of ``op``'s blocking dims has ``num_blocks > 1``."""
+    return any(ir.num_blocks(d) > 1 for d in op.blocking_dims if d in ir.dim_order)
+
+
+def _matmul_drain_depth(ir: KernelIR, op: Op) -> int:
+    """Post-recursion depth where ``op``'s PSUM is drained to SBUF.
+
+    Defined only for multi-iter K: returns the ``dim_order`` position
+    of the outermost multi-iter blocking dim — the drain fires right
+    after that loop closes. All-1-iter K matmuls drain inline at their
+    natural depth (see :func:`_emit_inline_matmul_drain`); this helper
+    does not apply to them.
+    """
+    positions = [ir.dim_order.index(d) for d in op.blocking_dims if d in ir.dim_order and ir.num_blocks(d) > 1]
+    if not positions:
+        return len(ir.dim_order)
+    return min(positions)
+
+
+def _emit_matmul_drain(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op, open_loops: list[str]) -> None:
+    """Emit the PSUM → SBUF drain once the matmul's K loop closes.
+
+    Runs at the same depth as the store (right after all blocking loops
+    of the matmul producer close). Binds ``cur_<sbuf_out>`` so the
+    store can reference it, then calls the drain gadget. Slicing mirrors
+    :func:`_emit_store` — the SBUF accumulator may be OUTER/MIDDLE and
+    thus wider than one (m, n) block; the drain sees only the current
+    block's slice.
+    """
+    m_dim = op.axis_map["M"]
+    n_dim = op.axis_map["N"]
+    sbuf_name = op.outputs[0]
+    psum_name = _accumulator_buf_name(op)
+    sbuf_info = allocs[sbuf_name]
+    psum_info = allocs[psum_name]
+
+    cur_sbuf = _cur_name(sbuf_name)
+    w.line(f"{cur_sbuf} = {sbuf_name}{_rotation_index(sbuf_info)}")
+    sbuf_expr = _drain_sbuf_slice(ir, sbuf_info, m_dim, n_dim, open_loops, base=cur_sbuf)
+    psum_expr = _matmul_output_expr(ir, psum_info, m_dim, n_dim)
+    w.line(f"matmul_drain_block({sbuf_expr}, {psum_expr})")
+
+
+def _drain_sbuf_slice(ir: KernelIR, info: _BufAlloc, m_dim: str, n_dim: str, open_loops: list[str], base: str) -> str:
+    """Slice an SBUF accumulator buffer to the current (m, n) block.
+
+    The buffer may be OUTER/MIDDLE and hold more than one block on
+    either axis. Only slices axes whose ``i_block_<d>`` is still open
+    at drain time; axes already closed are fully covered by the
+    accumulator (enforced by ``_check_accumulator_coverage``).
+    """
+    buf = info.buf
+    expr = base
+    lt_m = ir.ltiles_per_block[m_dim]
+    lt_n = ir.ltiles_per_block[n_dim]
+    if buf.p_axis == m_dim and m_dim in open_loops and info.num_p_tiles > lt_m:
+        expr = f"{expr}[i_block_{m_dim} * {lt_m} : i_block_{m_dim} * {lt_m} + {lt_m}]"
+    if buf.f_axis == n_dim and n_dim in open_loops and info.num_f_tiles > lt_n:
+        f_width = info.f_tile * lt_n
+        expr = f"[leaf[:, i_block_{n_dim} * {f_width} : i_block_{n_dim} * {f_width} + {f_width}] for leaf in {expr}]"
+    return expr
 
 
 def _matmul_output_expr(ir: KernelIR, info: _BufAlloc, m_dim: str, n_dim: str) -> str:

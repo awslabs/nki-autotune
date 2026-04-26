@@ -13,7 +13,7 @@ program to NKI source:
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from nkigym.kernel_ir.types import DimInfo, TensorInfo
 
@@ -35,12 +35,26 @@ class BufferScope(Enum):
     OUTER = "outer"
 
 
+BufferLoc = Literal["sbuf", "psum", "hbm"]
+"""Physical memory pool a buffer lives in.
+
+* ``"sbuf"`` — state buffer (24 MiB on Trn2); the default for every
+  on-chip tile.
+* ``"psum"`` — partial-sum buffer (8 banks × 128 partitions × 512 cols
+  × fp32 = 2 MiB). Written by ``nc_matmul`` / ``nc_transpose``; read
+  by drain ops (``tensor_copy``, ``scalar_tensor_tensor``).
+* ``"hbm"`` — device HBM; only the kernel output lives here."""
+
+
 @dataclass
 class PhysicalBuffer:
-    """SBUF buffer carrying a logical tensor.
+    """Physical buffer carrying a logical tensor.
 
     ``p_axis`` / ``f_axis`` name the dims laid across the partition
-    and free axes. For 1D tensors ``f_axis`` is ``None``.
+    and free axes. For 1D tensors ``f_axis`` is ``None``. ``loc``
+    names the memory pool — SBUF for tile-resident tensors, PSUM for
+    matmul accumulators hoisted out of the per-call gadget scratch,
+    HBM for the kernel output.
     """
 
     tile: tuple[int, int]
@@ -48,6 +62,7 @@ class PhysicalBuffer:
     dtype: str
     p_axis: str
     f_axis: str | None
+    loc: BufferLoc = "sbuf"
 
 
 @dataclass
@@ -165,6 +180,7 @@ def _format_kernel_ir(ir: "KernelIR") -> str:
         buf_rows.append(
             (
                 f"{name}:",
+                f"loc={buf.loc}",
                 f"tile={buf.tile}",
                 f"dims=({','.join(buf.dim_ids)})",
                 buf.dtype,

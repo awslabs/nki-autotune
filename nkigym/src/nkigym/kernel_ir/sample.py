@@ -20,7 +20,6 @@ from dataclasses import replace
 from nkigym.kernel_ir.ir import BufferScope, KernelIR, NumBuffers
 from nkigym.kernel_ir.validate import (
     _accumulator_covers_closed_dims,
-    _find_matmul_op,
     _num_tiles_for_scope,
     _outer_axis_in_order,
     axis_open,
@@ -35,6 +34,12 @@ buffers emitted at the same ``emission_depth`` must also fit — the
 depth-0 group is live across the whole kernel and every deeper group
 co-exists with its ancestors within one iteration of the enclosing
 loops."""
+
+_PSUM_CAP_BYTES = 2 * 1024 * 1024
+"""Trn2 PSUM size — 8 banks × 128 partitions × 512 fp32 cols. Any
+single PSUM buffer alloc must fit here. Co-residence across multiple
+PSUM buffers at the same ``emission_depth`` is additionally capped at
+``_PSUM_TILE_CAP`` banks via :func:`sample_ltiles_per_block`."""
 
 _NUM_BUFFERS_CAP = 4
 """Per-axis ceiling on ``NumBuffers.num_p_buffers`` / ``num_f_buffers``.
@@ -126,11 +131,14 @@ def sample_dim_order(ir: KernelIR, rng: random.Random) -> list[str]:
 
 
 def _dim_order_respects_reducer_inner_dims(ir: KernelIR, dim_order: list[str]) -> bool:
-    """True iff every reducer's inner dims are all used by the reducer.
+    """True iff every reducer's inner dims are all used by the reducer
+    AND matmul-style reducers have K after their output dims.
 
-    Mirrors :func:`validate._check_reducer_inner_dims` but takes the
+    Mirrors :func:`validate._check_reducer_inner_dims` +
+    :func:`validate._check_matmul_psum_outside_k` but takes the
     candidate ``dim_order`` directly so we can filter permutations
-    before committing to one.
+    before committing to one. A dim with ``num_blocks == 1`` never
+    multiplies the reducer (the loop runs once), so it is ignored.
     """
     for op in ir.ops:
         if op.kind not in _REDUCER_KINDS or not op.outputs:
@@ -145,12 +153,27 @@ def _dim_order_respects_reducer_inner_dims(ir: KernelIR, dim_order: list[str]) -
         for i, d in enumerate(dim_order):
             if i < first_blocking:
                 continue
-            if d not in used:
+            if d in used:
+                continue
+            if ir.num_blocks(d) <= 1:
+                continue
+            return False
+        if op.kind in _MATMUL_KINDS:
+            block_output_positions = [dim_order.index(d) for d in out_dims if d in dim_order and ir.num_blocks(d) > 1]
+            if block_output_positions and min(positions) <= max(block_output_positions):
                 return False
     return True
 
 
-_REDUCER_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce"})
+_MATMUL_KINDS = frozenset({"NKIMatmul"})
+"""Matmul-style reducers with hoisted PSUM. Must match
+:data:`nkigym.codegen.render._MATMUL_KINDS`. Their PSUM accumulator
+must sit outside the K loop — every blocking dim of the op must
+follow every output dim in ``dim_order``. ``NKIOnlineMatmul`` is
+excluded; its internal PSUM drains per-K and is unaffected by the
+rule."""
+
+_REDUCER_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce", "NKIOnlineMatmul"})
 """Must match :data:`nkigym.codegen.render._REDUCING_KINDS` — keeping
 this local so the sampler has no import dependency on render."""
 
@@ -185,7 +208,7 @@ def _psum_gadget_dim_pairs(ir: KernelIR) -> list[tuple[str, str]]:
     """Inner-loop dim pairs for every PSUM-using gadget in ``ir``."""
     pairs: list[tuple[str, str]] = []
     for op in ir.ops:
-        if op.kind == "NKIMatmul":
+        if op.kind in _MATMUL_KINDS:
             pairs.append((op.axis_map["M"], op.axis_map["N"]))
         elif op.kind == "NKITranspose":
             pairs.append((op.axis_map["P"], op.axis_map["F"]))
@@ -195,29 +218,32 @@ def _psum_gadget_dim_pairs(ir: KernelIR) -> list[tuple[str, str]]:
 def sample_buffer_scopes(ir: KernelIR, rng: random.Random) -> dict[str, BufferScope]:
     """Per-buffer random choice from ``{INNER, MIDDLE, OUTER}``.
 
-    Three constraints bias the draw:
+    Constraints biasing the draw:
 
     * Transpose src/dst pairs share one scope — the transpose gadget
       requires matching tile counts on the swapped axes.
-    * The matmul accumulator must span FULL extent on every output dim
-      at position ≥ ``first_acc_position`` in ``dim_order`` (see
-      :func:`validate._accumulator_covers_closed_dims`). Scopes that
-      would under-cover a closed output dim are dropped from its
-      choice list.
-    * Scopes whose base allocation exceeds ``_SBUF_CAP_BYTES`` are
-      dropped — a single ``allocate_buffers`` call cannot be larger
-      than SBUF even with ``num_buffers=None``.
+    * Every matmul's PSUM accumulator AND its SBUF drain target must
+      span FULL extent on every output dim at position ≥
+      ``first_acc_position`` in ``dim_order`` (see
+      :func:`validate._check_accumulator_coverage`). Scopes that
+      would under-cover a closed output dim are dropped from each
+      candidate list.
+    * Scopes whose base allocation exceeds the buffer's memory cap
+      (``_PSUM_CAP_BYTES`` for PSUM, ``_SBUF_CAP_BYTES`` for SBUF)
+      are dropped — a single ``allocate_buffers`` call cannot be
+      larger than its pool.
     """
-    acc_buf = _matmul_output_name(ir)
+    matmul_acc_bufs = _matmul_accumulator_buffers(ir)
     result: dict[str, BufferScope] = {}
     for name in _tunable_buffers(ir):
-        acc_filtered = _accumulator_scope_choices(ir, name) if name == acc_buf else list(BufferScope)
-        choices = [s for s in acc_filtered if _base_size_for_scope(ir, name, s) <= _SBUF_CAP_BYTES]
+        buf = ir.physical_buffers[name]
+        cap = _PSUM_CAP_BYTES if buf.loc == "psum" else _SBUF_CAP_BYTES
+        acc_filtered = _accumulator_scope_choices(ir, name) if name in matmul_acc_bufs else list(BufferScope)
+        choices = [s for s in acc_filtered if _base_size_for_scope(ir, name, s) <= cap]
         if not choices:
             raise RuntimeError(
-                f"sample_buffer_scopes: buffer {name} has no scope whose base fits "
-                f"_SBUF_CAP_BYTES={_SBUF_CAP_BYTES}; upstream dim_order/ltiles_per_block "
-                f"produced an infeasible buffer"
+                f"sample_buffer_scopes: buffer {name} has no scope whose base fits cap "
+                f"{cap}; upstream dim_order/ltiles_per_block produced an infeasible buffer"
             )
         result[name] = rng.choice(choices)
     for op in ir.ops:
@@ -230,16 +256,32 @@ def sample_buffer_scopes(ir: KernelIR, rng: random.Random) -> dict[str, BufferSc
     return result
 
 
+def _matmul_accumulator_buffers(ir: KernelIR) -> set[str]:
+    """Every reducer-accumulator buffer that needs closed-dim coverage.
+
+    PSUM K-accumulators (for ``NKIMatmul``), SBUF drain targets (for
+    ``NKIMatmul``), and SBUF F-reduction accumulators (for
+    ``NKIActivationReduce`` and ``NKIOnlineMatmul``) all first-use
+    outside at least one blocking loop. Closed output dims must be
+    fully covered by the buffer's scope.
+    """
+    names: set[str] = set()
+    for op in ir.ops:
+        if op.kind not in _REDUCER_KINDS or not op.outputs:
+            continue
+        sbuf_name = op.outputs[0]
+        names.add(sbuf_name)
+        if op.kind in _MATMUL_KINDS and sbuf_name.startswith("sbuf_"):
+            psum_name = "psum_" + sbuf_name[len("sbuf_") :]
+            if psum_name in ir.physical_buffers:
+                names.add(psum_name)
+    return names
+
+
 def _base_size_for_scope(ir: KernelIR, name: str, scope: BufferScope) -> int:
     """Bytes of one ``allocate_buffers`` call if ``name`` were sized by ``scope``."""
     trial = replace(ir, buffer_scopes={**ir.buffer_scopes, name: scope})
     return _buffer_base_size(trial, name)
-
-
-def _matmul_output_name(ir: KernelIR) -> str | None:
-    """SBUF name that holds the matmul accumulator, or ``None``."""
-    op = _find_matmul_op(ir)
-    return op.outputs[0] if op and op.outputs else None
 
 
 def _accumulator_scope_choices(ir: KernelIR, name: str) -> list[BufferScope]:
@@ -272,20 +314,23 @@ def sample_emission_depth_and_num_buffers(
     SBUF regardless of ``num_buffers``.
     """
     bases = {name: _buffer_base_size(ir, name) for name in _tunable_buffers(ir)}
-    used: dict[int, int] = {}
+    used_sbuf: dict[int, int] = {}
+    used_psum: dict[int, int] = {}
     emission: dict[str, int] = {}
     num_bufs: dict[str, NumBuffers] = {}
     for name, base in sorted(bases.items(), key=lambda kv: -kv[1]):
         buf = ir.physical_buffers[name]
+        cap = _PSUM_CAP_BYTES if buf.loc == "psum" else _SBUF_CAP_BYTES
+        used = used_psum if buf.loc == "psum" else used_sbuf
         fu_depth = first_use_depth(ir, name)
-        depth_choices = [d for d in range(fu_depth + 1) if used.get(d, 0) + base <= _SBUF_CAP_BYTES]
+        depth_choices = [d for d in range(fu_depth + 1) if used.get(d, 0) + base <= cap]
         if not depth_choices:
             raise RuntimeError(
-                f"sample: buffer {name} (base {base} B) cannot fit at any depth ≤ "
-                f"{fu_depth} under cap {_SBUF_CAP_BYTES} — co-resident bases exceed SBUF"
+                f"sample: buffer {name} (base {base} B, loc={buf.loc}) cannot fit at any depth ≤ "
+                f"{fu_depth} under cap {cap} — co-resident bases exceed pool"
             )
         depth = rng.choice(depth_choices)
-        remaining = _SBUF_CAP_BYTES - used.get(depth, 0)
+        remaining = cap - used.get(depth, 0)
         p_raw: list[int | None] = [None]
         if axis_open(ir, buf.p_axis, fu_depth):
             p_raw.extend(d for d in _divisors(_num_ltile(ir, buf.p_axis)) if d <= _NUM_BUFFERS_CAP)
@@ -333,7 +378,7 @@ def knob_signature(ir: KernelIR) -> tuple:
 
 def _tunable_buffers(ir: KernelIR) -> list[str]:
     """Non-HBM physical buffer names — the ones carrying tunable knobs."""
-    return [n for n in ir.physical_buffers if not n.startswith("hbm_")]
+    return [n for n, buf in ir.physical_buffers.items() if buf.loc != "hbm"]
 
 
 def _num_ltile(ir: KernelIR, dim_id: str) -> int:

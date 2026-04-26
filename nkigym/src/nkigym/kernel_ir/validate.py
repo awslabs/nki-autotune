@@ -20,6 +20,23 @@ _REDUCING_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce", "NKIOnlineMatmu
 :func:`_accumulator_first_use_depth` rather than at the op's emission
 depth. Must match :data:`nkigym.codegen.render._REDUCING_KINDS`."""
 
+_MATMUL_KINDS = frozenset({"NKIMatmul"})
+"""Matmul-style reducers whose PSUM accumulator is hoisted out of the
+gadget — ``psum_<stem>`` is a physical buffer in the IR. Mirrors
+:data:`nkigym.codegen.render._MATMUL_KINDS`. ``NKIOnlineMatmul`` is
+excluded (per-K rescale keeps its PSUM scratch internal)."""
+
+
+def _accumulator_buf_name(op: Op) -> str:
+    """Buffer the reducer ``op`` accumulates into — PSUM sibling for
+    :data:`_MATMUL_KINDS`, its own SBUF output otherwise."""
+    out = op.outputs[0]
+    if op.kind in _MATMUL_KINDS:
+        if not out.startswith("sbuf_"):
+            raise ValueError(f"matmul op {op.kind} expected sbuf_-prefixed output, got {out!r}")
+        return "psum_" + out[len("sbuf_") :]
+    return out
+
 
 @dataclass(frozen=True)
 class ValidityFailure:
@@ -61,6 +78,54 @@ def validity_report(ir: KernelIR) -> list[ValidityFailure]:
     failures.extend(_check_rotation_axes(ir))
     failures.extend(_check_transpose_scopes(ir))
     failures.extend(_check_accumulator_coverage(ir))
+    failures.extend(_check_matmul_psum_outside_k(ir))
+    return failures
+
+
+def _check_matmul_psum_outside_k(ir: KernelIR) -> list[ValidityFailure]:
+    """For every matmul-style op, PSUM prologue must fire OUTSIDE the K loop.
+
+    The PSUM accumulator's memset fires at ``1 + max(pos of PSUM's
+    block-indexed axes)`` in ``dim_order``. For the memset to run once
+    per (M, N) block (not once per K iter), every **blocking dim with
+    ``num_blocks > 1``** must sit at or deeper than that prologue
+    depth. Blocking dims whose extent fits in a single tile have
+    ``num_blocks == 1``: the loop runs once and cannot re-zero the
+    accumulator, so their position is unconstrained.
+    """
+    failures: list[ValidityFailure] = []
+    for op in ir.ops:
+        if op.kind not in _MATMUL_KINDS or not op.outputs:
+            continue
+        psum_name = _accumulator_buf_name(op)
+        if psum_name not in ir.physical_buffers:
+            continue
+        psum_block_axes = _block_indexed_axes(ir, psum_name)
+        out_positions = [ir.dim_order.index(d) for d in psum_block_axes if d in ir.dim_order]
+        block_positions = [
+            ir.dim_order.index(d) for d in op.blocking_dims if d in ir.dim_order and ir.num_blocks(d) > 1
+        ]
+        if not out_positions or not block_positions:
+            continue
+        prologue_depth = 1 + max(out_positions)
+        first_block_pos = min(block_positions)
+        if first_block_pos < prologue_depth:
+            failures.append(
+                ValidityFailure(
+                    check="matmul_psum_outside_k",
+                    buffer=psum_name,
+                    detail=(
+                        f"PSUM prologue fires at depth {prologue_depth} (inside {op.blocking_dims}) "
+                        f"but the outermost matmul blocking dim sits at position {first_block_pos} — "
+                        f"the memset would re-zero the accumulator every K iteration"
+                    ),
+                    fix_hint=(
+                        f"move every dim in {op.blocking_dims} to a position ≥ {prologue_depth} "
+                        f"in dim_order, or widen {psum_name} scope so fewer output axes are "
+                        f"block-indexed (OUTER — but PSUM is 2 MiB)"
+                    ),
+                )
+            )
     return failures
 
 
@@ -94,45 +159,54 @@ def _check_accumulator_coverage(ir: KernelIR) -> list[ValidityFailure]:
     for op in ir.ops:
         if op.kind not in _REDUCING_KINDS or not op.outputs:
             continue
-        acc_buf_name = op.outputs[0]
-        if acc_buf_name not in ir.buffer_scopes:
-            continue
+        """Check the reducer's accumulator buffer. For matmul-style ops
+        this is the PSUM sibling buffer; for ``NKIActivationReduce``
+        it's the op's SBUF output. Matmul-style ops additionally need
+        their SBUF drain target to cover the same closed dims — when
+        the drain fires, the SBUF is indexed only on the still-open
+        loops, so closed dims must be fully covered by the buffer."""
+        acc_buf_names = [_accumulator_buf_name(op)]
+        if op.kind in _MATMUL_KINDS:
+            acc_buf_names.append(op.outputs[0])
         first_acc_pos = _reducer_first_acc_position(ir, op)
-        buf = ir.physical_buffers[acc_buf_name]
-        scope = ir.buffer_scopes[acc_buf_name]
-        outer_axis = _outer_axis_in_order(ir, buf.p_axis, buf.f_axis)
-        for axis in (buf.p_axis, buf.f_axis):
-            if axis is None or axis not in ir.dim_order:
+        for acc_buf_name in acc_buf_names:
+            if acc_buf_name not in ir.buffer_scopes:
                 continue
-            if ir.dim_order.index(axis) < first_acc_pos:
-                continue
-            num_tiles = _num_tiles_for_scope(ir, axis, scope, is_outer=(axis == outer_axis))
-            full = ir.dimensions[axis].dim_size // ir.dimensions[axis].physical_tile_size
-            if num_tiles < full:
-                failures.append(
-                    ValidityFailure(
-                        check="accumulator_coverage",
-                        buffer=acc_buf_name,
-                        detail=(
-                            f"axis {axis!r} covered by {num_tiles} tiles but needs {full} "
-                            f"(position {ir.dim_order.index(axis)} ≥ first_acc_position "
-                            f"{first_acc_pos} for {op.kind} → its loop is already closed "
-                            f"when the accumulator is first referenced)"
-                        ),
-                        fix_hint=(
-                            f"widen {acc_buf_name} scope to OUTER (or MIDDLE if "
-                            f"{axis!r} is outermost), or move {axis!r} before any "
-                            f"blocking dim of {op.kind} in dim_order so its loop "
-                            f"stays open when the accumulator is referenced"
-                        ),
+            buf = ir.physical_buffers[acc_buf_name]
+            scope = ir.buffer_scopes[acc_buf_name]
+            outer_axis = _outer_axis_in_order(ir, buf.p_axis, buf.f_axis)
+            for axis in (buf.p_axis, buf.f_axis):
+                if axis is None or axis not in ir.dim_order:
+                    continue
+                if ir.dim_order.index(axis) < first_acc_pos:
+                    continue
+                num_tiles = _num_tiles_for_scope(ir, axis, scope, is_outer=(axis == outer_axis))
+                full = ir.dimensions[axis].dim_size // ir.dimensions[axis].physical_tile_size
+                if num_tiles < full:
+                    failures.append(
+                        ValidityFailure(
+                            check="accumulator_coverage",
+                            buffer=acc_buf_name,
+                            detail=(
+                                f"axis {axis!r} covered by {num_tiles} tiles but needs {full} "
+                                f"(position {ir.dim_order.index(axis)} ≥ first_acc_position "
+                                f"{first_acc_pos} for {op.kind} → its loop is already closed "
+                                f"when the accumulator is first referenced)"
+                            ),
+                            fix_hint=(
+                                f"widen {acc_buf_name} scope to OUTER (or MIDDLE if "
+                                f"{axis!r} is outermost), or move {axis!r} before any "
+                                f"blocking dim of {op.kind} in dim_order so its loop "
+                                f"stays open when the accumulator is referenced"
+                            ),
+                        )
                     )
-                )
     return failures
 
 
 def _check_reducer_inner_dims(ir: KernelIR) -> list[ValidityFailure]:
     """Every dim inside a reducer's outermost blocking dim must be used
-    by the reducer.
+    by the reducer OR have ``num_blocks == 1``.
 
     The renderer lowers every ``dim_order`` dim to its own ``for
     i_block_<d>`` unconditionally. If a dim ``d`` sits at position
@@ -140,7 +214,9 @@ def _check_reducer_inner_dims(ir: KernelIR) -> list[ValidityFailure]:
     ``blocking_dims`` nor in any dim of the reducer's output buffer,
     the reducer executes ``num_blocks[d]`` extra times per (outer)
     iteration — each call over-writing or over-accumulating the same
-    destination slot, producing a multiplied accumulator.
+    destination slot, producing a multiplied accumulator. When
+    ``num_blocks[d] == 1`` the loop runs once and the extra iteration
+    doesn't exist.
 
     A dim is "used" by the reducer if (a) it is in ``blocking_dims``,
     or (b) it is a dim of the reducer's output physical buffer (the
@@ -161,6 +237,8 @@ def _check_reducer_inner_dims(ir: KernelIR) -> list[ValidityFailure]:
             if i < first_blocking:
                 continue
             if d in used_dims:
+                continue
+            if ir.num_blocks(d) <= 1:
                 continue
             failures.append(
                 ValidityFailure(
@@ -193,14 +271,6 @@ def _reducer_first_acc_position(ir: KernelIR, op: Op) -> int:
     if not positions:
         return len(ir.dim_order)
     return min(positions)
-
-
-def _find_matmul_op(ir: KernelIR) -> Op | None:
-    """First ``NKIMatmul`` op, or ``None``."""
-    for op in ir.ops:
-        if op.kind == "NKIMatmul":
-            return op
-    return None
 
 
 def _transpose_scopes_match(ir: KernelIR) -> bool:
@@ -284,18 +354,46 @@ def _check_emission_depth(ir: KernelIR) -> list[ValidityFailure]:
 def first_use_depth(ir: KernelIR, buf_name: str) -> int:
     """Shallowest depth at which ``buf_name`` may be referenced by render.
 
-    * Reducer accumulator (matmul, activation_reduce): the memset
-      prologue fires at ``1 + max(dim_order.index(d))`` over the
-      accumulator's block-indexed axes — matching
-      :func:`nkigym.codegen.render._accumulator_prologue_depth`.
+    * PSUM accumulator for a matmul: its prologue binding fires at
+      ``1 + max(dim_order.index(d))`` over the PSUM buffer's
+      block-indexed axes (matches ``_accumulator_prologue_depth`` in
+      render).
+    * SBUF output of ``NKIMatmul``: first use is the drain depth
+      (``min(pos(blocking_dim))``) — the drain binds ``cur_<sbuf_out>``
+      before the store can read it.
+    * SBUF accumulator for ``NKIActivationReduce`` or
+      ``NKIOnlineMatmul``: the memset prologue fires at the
+      block-indexed-axes depth (both memset their SBUF output and
+      accumulate across a blocking loop).
     * Every other buffer: its producer op's depth.
     """
+    if buf_name in ir.physical_buffers and ir.physical_buffers[buf_name].loc == "psum":
+        return _accumulator_first_use_depth(ir, buf_name)
     producer = producer_op(ir, buf_name)
-    if producer is not None and producer.kind in _REDUCING_KINDS and buf_name in producer.outputs:
+    if producer is not None and producer.kind in _MATMUL_KINDS and buf_name in producer.outputs:
+        return _matmul_drain_depth(ir, producer)
+    if (
+        producer is not None
+        and producer.kind in ("NKIActivationReduce", "NKIOnlineMatmul")
+        and buf_name in producer.outputs
+    ):
         return _accumulator_first_use_depth(ir, buf_name)
     if producer is None:
         return len(ir.dim_order)
     return op_depth(ir, producer)
+
+
+def _matmul_drain_depth(ir: KernelIR, op: Op) -> int:
+    """Drain depth for a matmul-style op — ``min(pos(blocking_dim))``.
+
+    Mirrors :func:`nkigym.codegen.render._matmul_drain_depth`. The
+    drain fires right after the outermost blocking dim's loop closes,
+    turning the PSUM K-accumulator into the SBUF output.
+    """
+    positions = [ir.dim_order.index(d) for d in op.blocking_dims if d in ir.dim_order]
+    if not positions:
+        return len(ir.dim_order)
+    return min(positions)
 
 
 def _accumulator_first_use_depth(ir: KernelIR, buf_name: str) -> int:

@@ -92,12 +92,14 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
     used = _collect_used_tensors(parsed, param_names, return_name, tensors)
     physical_buffers = _build_physical_buffers(tensors, used, dimensions, return_name)
     ops = _build_ops(parsed, per_op_axis_maps, per_op_blocking, tensors, used, param_names, return_name)
+    _mint_psum_buffers(ops, physical_buffers, dimensions)
     edges = _derive_edges(ops)
     dim_order = _default_dim_order(dimensions)
     ltiles_per_block = {d: 1 for d in dimensions}
-    buffer_scopes = {name: BufferScope.INNER for name in physical_buffers if not name.startswith("hbm_")}
-    num_buffers = {name: NumBuffers() for name in physical_buffers if not name.startswith("hbm_")}
-    emission_depth = {name: 0 for name in physical_buffers if not name.startswith("hbm_")}
+    tunable_names = [name for name, buf in physical_buffers.items() if buf.loc != "hbm"]
+    buffer_scopes = {name: BufferScope.INNER for name in tunable_names}
+    num_buffers = {name: NumBuffers() for name in tunable_names}
+    emission_depth = {name: 0 for name in tunable_names}
 
     return KernelIR(
         func_name=func.__name__,
@@ -184,7 +186,7 @@ def _build_physical_buffers(
         p_tile = dimensions[p_axis].physical_tile_size
         f_tile = dimensions[f_axis].physical_tile_size if f_axis is not None else 1
         result[f"sbuf_{name}"] = PhysicalBuffer(
-            tile=(p_tile, f_tile), dim_ids=tuple(t.dim_ids), dtype=t.dtype, p_axis=p_axis, f_axis=f_axis
+            tile=(p_tile, f_tile), dim_ids=tuple(t.dim_ids), dtype=t.dtype, p_axis=p_axis, f_axis=f_axis, loc="sbuf"
         )
     ret_t = tensors[return_name]
     ret_p = ret_t.dim_ids[0]
@@ -192,9 +194,52 @@ def _build_physical_buffers(
     hbm_p = dimensions[ret_p].dim_size
     hbm_f = dimensions[ret_f].dim_size if ret_f is not None else 1
     result[f"hbm_{return_name}"] = PhysicalBuffer(
-        tile=(hbm_p, hbm_f), dim_ids=tuple(ret_t.dim_ids), dtype=ret_t.dtype, p_axis=ret_p, f_axis=ret_f
+        tile=(hbm_p, hbm_f), dim_ids=tuple(ret_t.dim_ids), dtype=ret_t.dtype, p_axis=ret_p, f_axis=ret_f, loc="hbm"
     )
     return result
+
+
+_MATMUL_KINDS = frozenset({"NKIMatmul"})
+"""Ops whose SBUF output is an SBUF drain target of a hoisted PSUM
+accumulator.
+
+For each such op, :func:`_mint_psum_buffers` adds a sibling
+``psum_<out>`` physical buffer. The K-accumulator is hoisted out of
+the per-call gadget scratch: the renderer emits PSUM alloc+memset
+just outside ``K``, the gadget accumulates ``+=`` across K, and a
+separate drain runs once the reducing loop closes.
+
+``NKIOnlineMatmul`` is deliberately excluded — its per-K rescale
+``O_k = s_k · O_{k-1} + A_k`` requires the drain to fire inside each
+K iteration (the online-fusion recurrence is not add-associative with
+hoisting). It keeps the fresh-PSUM-per-(m,n) pattern internally."""
+
+
+def _mint_psum_buffers(
+    ops: list[Op], physical_buffers: dict[str, PhysicalBuffer], dimensions: dict[str, DimInfo]
+) -> None:
+    """For every matmul-style op, add ``psum_<sbuf_out>`` to ``physical_buffers``.
+
+    Axes come from the op's ``axis_map`` — ``M`` on partition, ``N`` on
+    free. PSUM dtype is always fp32 regardless of input dtype (matches
+    the HW contract of ``nc_matmul`` draining through fp32 PSUM).
+    """
+    for op in ops:
+        if op.kind not in _MATMUL_KINDS or not op.outputs:
+            continue
+        sbuf_out = op.outputs[0]
+        if not sbuf_out.startswith("sbuf_"):
+            raise ValueError(f"matmul op {op.kind} expected sbuf_-prefixed output, got {sbuf_out!r}")
+        psum_name = "psum_" + sbuf_out[len("sbuf_") :]
+        if psum_name in physical_buffers:
+            continue
+        m_dim = op.axis_map["M"]
+        n_dim = op.axis_map["N"]
+        p_tile = dimensions[m_dim].physical_tile_size
+        f_tile = dimensions[n_dim].physical_tile_size
+        physical_buffers[psum_name] = PhysicalBuffer(
+            tile=(p_tile, f_tile), dim_ids=(m_dim, n_dim), dtype="float32", p_axis=m_dim, f_axis=n_dim, loc="psum"
+        )
 
 
 def _build_ops(

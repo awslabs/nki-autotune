@@ -37,26 +37,32 @@ def _extract_name_kwargs(call: ast.Call) -> dict[str, str]:
     return {kw.arg: kw.value.id for kw in call.keywords if kw.arg is not None and isinstance(kw.value, ast.Name)}
 
 
-def _literal_value(node: ast.expr) -> tuple[bool, Any]:
+def _literal_value(node: ast.expr, func_globals: dict[str, object]) -> tuple[bool, Any]:
     """Try to evaluate ``node`` as a Python literal (incl. arithmetic BinOps).
 
     Returns ``(ok, value)``. Captures plain ``Constant`` plus arithmetic
-    BinOps over constants (``1/2048``, ``-eps``, ``2*pi`` etc.) — common
-    nkigym kwargs like ``scale=1/K`` would otherwise be silently dropped.
+    BinOps over constants (``1/2048``, ``-eps``, ``2*pi`` etc.). Name
+    references are resolved against ``func_globals`` when they point to
+    numeric constants — covers kwargs like ``bias=EPS`` that reference
+    a module-level constant.
     """
     try:
         return True, ast.literal_eval(node)
     except (ValueError, SyntaxError):
         pass
+    if isinstance(node, ast.Name):
+        value = func_globals.get(node.id)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return True, value
     if isinstance(node, ast.UnaryOp):
-        ok, inner = _literal_value(node.operand)
+        ok, inner = _literal_value(node.operand, func_globals)
         if ok and isinstance(node.op, ast.USub):
             return True, -inner
         if ok and isinstance(node.op, ast.UAdd):
             return True, +inner
     if isinstance(node, ast.BinOp):
-        ok_l, lhs = _literal_value(node.left)
-        ok_r, rhs = _literal_value(node.right)
+        ok_l, lhs = _literal_value(node.left, func_globals)
+        ok_r, rhs = _literal_value(node.right, func_globals)
         if ok_l and ok_r:
             if isinstance(node.op, ast.Add):
                 return True, lhs + rhs
@@ -69,18 +75,21 @@ def _literal_value(node: ast.expr) -> tuple[bool, Any]:
     return False, None
 
 
-def _extract_literal_kwargs(call: ast.Call) -> dict[str, Any]:
+def _extract_literal_kwargs(call: ast.Call, func_globals: dict[str, object]) -> dict[str, Any]:
     """Return ``{arg_name: literal}`` for constant-valued kwargs on ``call``.
 
-    Handles both plain ``ast.Constant`` and arithmetic BinOp trees whose
-    leaves are all constants (e.g. ``scale=1/2048``). Tensor-valued
-    (Name) kwargs are captured separately by :func:`_extract_name_kwargs`.
+    Handles plain ``ast.Constant``, arithmetic BinOp trees whose leaves
+    are all constants (e.g. ``scale=1/2048``), and Name references that
+    resolve to numeric constants in ``func_globals`` (e.g.
+    ``bias=EPS`` where ``EPS = 1e-6`` lives at module scope).
+    Tensor-valued (Name → ndarray) kwargs are captured separately by
+    :func:`_extract_name_kwargs`.
     """
     out: dict[str, Any] = {}
     for kw in call.keywords:
         if kw.arg is None:
             continue
-        ok, value = _literal_value(kw.value)
+        ok, value = _literal_value(kw.value, func_globals)
         if ok:
             out[kw.arg] = value
     return out
@@ -124,10 +133,10 @@ def _parse_op_assignment(stmt: ast.Assign, func_globals: dict[str, object]) -> _
                 )
             assert isinstance(stmt.value, ast.Call)
             name_kwargs = _extract_name_kwargs(stmt.value)
-            outer_kwargs = _extract_literal_kwargs(stmt.value)
+            outer_kwargs = _extract_literal_kwargs(stmt.value, func_globals)
             inner_call = stmt.value.func
             assert isinstance(inner_call, ast.Call)
-            op_kwargs = {**_extract_literal_kwargs(inner_call), **outer_kwargs}
+            op_kwargs = {**_extract_literal_kwargs(inner_call, func_globals), **outer_kwargs}
             result = (op_cls, name_kwargs, op_kwargs, output_names)
     return result
 

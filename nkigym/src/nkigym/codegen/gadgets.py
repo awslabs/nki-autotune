@@ -20,7 +20,7 @@ import nki.language as nl
 from nkigym.ops.activation_reduce import activation_block, activation_reduce_block
 from nkigym.ops.dma_transpose import dma_transpose_block
 from nkigym.ops.load import load_block
-from nkigym.ops.matmul import matmul_block
+from nkigym.ops.matmul import matmul_block, matmul_drain_block
 from nkigym.ops.online_matmul import online_matmul_block
 from nkigym.ops.store import store_block
 from nkigym.ops.tensor_scalar import tensor_scalar_block
@@ -33,6 +33,7 @@ __all__ = [
     "dma_transpose_block",
     "load_block",
     "matmul_block",
+    "matmul_drain_block",
     "memset_buffers",
     "online_matmul_block",
     "store_block",

@@ -72,6 +72,12 @@ def online_matmul_block(sbuf_out: Any, sbuf_lhs_T: Any, sbuf_rhs: Any, sbuf_scal
     3. ``scalar_tensor_tensor(dst=sbuf_out, data=sbuf_out,
        op0=multiply, operand0=sbuf_scale, op1=add, operand1=psum_tile)``
        — single fused instruction; no ``tensor_copy`` round-trip.
+
+    Unlike :func:`nkigym.ops.matmul.matmul_block`, this gadget keeps
+    its PSUM scratch internal: the online-fusion recurrence
+    ``O_k = s_k · O_{k-1} + A_k`` is not add-associative across K
+    iterations, so the drain must fire per K block, not once at the
+    end of the K loop.
     """
     _TILE_M_MAX = 128
     _TILE_N_MAX = 512
