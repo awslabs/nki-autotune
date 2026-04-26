@@ -28,6 +28,7 @@ _GADGETS_IMPORT = (
     "    load_block,\n"
     "    matmul_block,\n"
     "    memset_buffers,\n"
+    "    online_matmul_block,\n"
     "    store_block,\n"
     "    tensor_scalar_block,\n"
     "    transpose_block,\n"
@@ -44,7 +45,7 @@ _GADGETS_IMPORT = (
 """
 _LOAD_KINDS = frozenset({"NKILoad"})
 _TRANSPOSE_GADGETS: dict[str, str] = {"NKITranspose": "transpose_block", "NKIDMATranspose": "dma_transpose_block"}
-_REDUCING_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce"})
+_REDUCING_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce", "NKIOnlineMatmul"})
 
 
 def render_ir(ir: KernelIR) -> str:
@@ -141,7 +142,6 @@ def _emit_body(w: _Writer, ir: KernelIR) -> None:
     required dims.
     """
     allocs = _resolve_allocations(ir)
-    matmul_op = _find_matmul_op(ir)
     store_op = _store_op(ir)
     phases = _assign_op_phases(ir)
 
@@ -151,17 +151,11 @@ def _emit_body(w: _Writer, ir: KernelIR) -> None:
     _emit_loads_at_depth(w, ir, allocs, phase=0, depth=0)
     _maybe_emit_reducer_prologue(w, ir, allocs, phases, depth=0)
 
-    _emit_loop_nest(w, ir, allocs, matmul_op, store_op, phases, dim_idx=0)
+    _emit_loop_nest(w, ir, allocs, store_op, phases, dim_idx=0)
 
 
 def _emit_loop_nest(
-    w: _Writer,
-    ir: KernelIR,
-    allocs: dict[str, _BufAlloc],
-    matmul_op: Op,
-    store_op: Op,
-    phases: "_PhaseMap",
-    dim_idx: int,
+    w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], store_op: Op, phases: "_PhaseMap", dim_idx: int
 ) -> None:
     """Recursively emit ``for i_block_<d> in range(...)`` in ``dim_order``.
 
@@ -174,45 +168,50 @@ def _emit_loop_nest(
     * Emit allocations whose ``emission_depth == dim_idx``.
     * Bind + memset reducer-output slots at the prologue depth.
     * Emit loads at their required depth.
+    * Emit compute ops whose natural depth matches this depth
+      (i.e. ops whose input/output buffers don't reference any deeper
+      dim in ``dim_order``). Keeps reducers whose output doesn't depend
+      on inner loop dims from re-firing once per inner-dim iteration.
     * Recurse.
     * Fire the store at the depth immediately outside all ACCUMULATION
       loops (``= _store_emission_depth``).
     """
+    here_ops = [op for op in _ops_in_phase(ir, phases, phase=0) if _op_natural_depth(ir, allocs, op) == dim_idx]
+    _emit_compute_ops(w, ir, allocs, here_ops)
     if dim_idx == len(ir.dim_order):
-        """Innermost level — emit all phase-0 compute ops. Multi-phase
-        emission happens one level up (see ``_emit_phases_at_inner_depth``)."""
-        _emit_compute_ops(w, ir, allocs, _ops_in_phase(ir, phases, phase=0))
         return
 
     dim = ir.dim_order[dim_idx]
+    if not _loop_has_body(ir, allocs, phases, dim_idx):
+        _emit_loop_nest(w, ir, allocs, store_op, phases, dim_idx + 1)
+        store_depth = _store_emission_depth(ir)
+        if dim_idx == store_depth:
+            open_loops = ir.dim_order[:store_depth]
+            _emit_store(w, ir, allocs, store_op, open_loops)
+        return
+
     max_phase = max(phases.op_phase.values(), default=0)
     is_phase_split_depth = max_phase > 0 and dim == _phase_split_dim(ir, phases)
 
     if is_phase_split_depth:
-        _emit_phases_at_inner_depth(w, ir, allocs, matmul_op, store_op, phases, dim_idx)
+        _emit_phases_at_inner_depth(w, ir, allocs, store_op, phases, dim_idx)
     else:
         w.line(f"for i_block_{dim} in range({ir.num_blocks(dim)}):")
         w.indent()
         _emit_allocs_at_depth(w, allocs, depth=dim_idx + 1)
         _maybe_emit_reducer_prologue(w, ir, allocs, phases, dim_idx + 1)
         _emit_loads_at_depth(w, ir, allocs, phase=0, depth=dim_idx + 1)
-        _emit_loop_nest(w, ir, allocs, matmul_op, store_op, phases, dim_idx + 1)
+        _emit_loop_nest(w, ir, allocs, store_op, phases, dim_idx + 1)
         w.dedent()
 
     store_depth = _store_emission_depth(ir)
     if dim_idx == store_depth:
         open_loops = ir.dim_order[:store_depth]
-        _emit_store(w, ir, allocs, store_op, matmul_op, open_loops)
+        _emit_store(w, ir, allocs, store_op, open_loops)
 
 
 def _emit_phases_at_inner_depth(
-    w: _Writer,
-    ir: KernelIR,
-    allocs: dict[str, _BufAlloc],
-    matmul_op: Op,
-    store_op: Op,
-    phases: "_PhaseMap",
-    dim_idx: int,
+    w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], store_op: Op, phases: "_PhaseMap", dim_idx: int
 ) -> None:
     """Emit one sibling ``for i_block_<dim>`` loop per phase at the phase-split depth.
 
@@ -241,7 +240,7 @@ def _emit_phases_at_inner_depth(
         w.line(f"for i_block_{dim} in range({ir.num_blocks(dim)}):")
         w.indent()
         _emit_loads_at_depth(w, ir, allocs, phase=phase, depth=dim_idx + 1)
-        _emit_phase_tail(w, ir, allocs, matmul_op, store_op, phases, phase, phase_ops, dim_idx + 1)
+        _emit_phase_tail(w, ir, allocs, store_op, phases, phase, phase_ops, dim_idx + 1)
         w.dedent()
         _emit_phase_closures(w, ir, allocs, phases, phase)
 
@@ -250,7 +249,6 @@ def _emit_phase_tail(
     w: _Writer,
     ir: KernelIR,
     allocs: dict[str, _BufAlloc],
-    matmul_op: Op,
     store_op: Op,
     phases: "_PhaseMap",
     phase: int,
@@ -268,21 +266,25 @@ def _emit_phase_tail(
     producer's outermost blocking dim — same rule as the non-phase-
     split path in ``_emit_loop_nest``.
     """
+    here_ops = [op for op in phase_ops if _op_natural_depth(ir, allocs, op) == dim_idx]
+    _emit_compute_ops(w, ir, allocs, here_ops)
     if dim_idx == len(ir.dim_order):
-        _emit_compute_ops(w, ir, allocs, phase_ops)
         return
     dim = ir.dim_order[dim_idx]
-    w.line(f"for i_block_{dim} in range({ir.num_blocks(dim)}):")
-    w.indent()
-    _emit_allocs_at_depth(w, allocs, depth=dim_idx + 1)
-    _maybe_emit_reducer_prologue(w, ir, allocs, phases, dim_idx + 1)
-    _emit_loads_at_depth(w, ir, allocs, phase=phase, depth=dim_idx + 1)
-    _emit_phase_tail(w, ir, allocs, matmul_op, store_op, phases, phase, phase_ops, dim_idx + 1)
-    w.dedent()
+    if not _phase_tail_has_body(ir, allocs, phases, phase, phase_ops, dim_idx):
+        _emit_phase_tail(w, ir, allocs, store_op, phases, phase, phase_ops, dim_idx + 1)
+    else:
+        w.line(f"for i_block_{dim} in range({ir.num_blocks(dim)}):")
+        w.indent()
+        _emit_allocs_at_depth(w, allocs, depth=dim_idx + 1)
+        _maybe_emit_reducer_prologue(w, ir, allocs, phases, dim_idx + 1)
+        _emit_loads_at_depth(w, ir, allocs, phase=phase, depth=dim_idx + 1)
+        _emit_phase_tail(w, ir, allocs, store_op, phases, phase, phase_ops, dim_idx + 1)
+        w.dedent()
     store_depth = _store_emission_depth(ir)
     if dim_idx == store_depth and _is_store_producer_phase(ir, phases, phase):
         open_loops = ir.dim_order[:store_depth]
-        _emit_store(w, ir, allocs, store_op, matmul_op, open_loops)
+        _emit_store(w, ir, allocs, store_op, open_loops)
 
 
 def _is_store_producer_phase(ir: KernelIR, phases: "_PhaseMap", phase: int) -> bool:
@@ -321,12 +323,96 @@ def _store_emission_depth(ir: KernelIR) -> int:
     return min(positions)
 
 
-def _find_matmul_op(ir: KernelIR) -> Op:
-    """The single ``NKIMatmul`` op."""
-    for op in ir.ops:
-        if op.kind == "NKIMatmul":
-            return op
-    raise ValueError("KernelIR has no NKIMatmul op")
+def _phase_tail_has_body(
+    ir: KernelIR, allocs: dict[str, _BufAlloc], phases: "_PhaseMap", phase: int, phase_ops: list[Op], dim_idx: int
+) -> bool:
+    """Whether a phase-tail ``for i_block_<d>`` body contains any emitted lines.
+
+    Mirrors :func:`_loop_has_body` for the phase-tail path — limits
+    compute-op scanning to the phase's op subset and loads to that phase.
+    """
+    for depth in range(dim_idx + 1, len(ir.dim_order) + 1):
+        if any(info.emission_depth == depth for info in allocs.values()):
+            return True
+        for op in ir.ops:
+            is_load = op.kind in _LOAD_KINDS or (
+                op.kind == "NKIDMATranspose" and op.inputs.get("data") in ir.param_names
+            )
+            if is_load:
+                dst = op.outputs[0]
+                if dst in allocs and _load_emission_depth(ir, allocs[dst]) == depth:
+                    return True
+            if op.kind in _REDUCING_KINDS and op.outputs:
+                out_name = op.outputs[0]
+                if out_name in allocs and _accumulator_prologue_depth(ir, op, allocs[out_name]) == depth:
+                    return True
+        for op in phase_ops:
+            if _op_natural_depth(ir, allocs, op) == depth:
+                return True
+    _ = phase, phases
+    return False
+
+
+def _loop_has_body(ir: KernelIR, allocs: dict[str, _BufAlloc], phases: "_PhaseMap", dim_idx: int) -> bool:
+    """Return True iff opening ``for i_block_<dim_order[dim_idx]>`` would
+    enclose at least one emitted statement.
+
+    When every deeper loop body is empty (no allocs, no loads, no
+    compute ops, no reducer prologues, no store), opening the loop
+    produces an ``IndentationError``. This happens when a dim has
+    ``num_blocks == 1`` AND every downstream op's natural depth is at
+    or outside the current depth.
+    """
+    for depth in range(dim_idx + 1, len(ir.dim_order) + 1):
+        if any(info.emission_depth == depth for info in allocs.values()):
+            return True
+        for op in ir.ops:
+            is_load = op.kind in _LOAD_KINDS or (
+                op.kind == "NKIDMATranspose" and op.inputs.get("data") in ir.param_names
+            )
+            if is_load:
+                dst = op.outputs[0]
+                if dst in allocs and _load_emission_depth(ir, allocs[dst]) == depth:
+                    return True
+            if op.kind in _REDUCING_KINDS and op.outputs:
+                out_name = op.outputs[0]
+                if out_name in allocs and _accumulator_prologue_depth(ir, op, allocs[out_name]) == depth:
+                    return True
+        for op in _ops_in_phase(ir, phases, phase=0):
+            if _op_natural_depth(ir, allocs, op) == depth:
+                return True
+    return False
+
+
+def _op_natural_depth(ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> int:
+    """Depth at which ``op`` belongs in the mechanical loop nest.
+
+    ``= 1 + max(position(d))`` over every dim ``d`` the op references:
+
+    * Dims in ``op.blocking_dims`` (the op iterates on those).
+    * Dims appearing on any input/output buffer whose block loop has
+      ``num_blocks(d) > 1`` — those dims' ``i_block_<d>`` indices appear
+      in the slice expressions the op emits, so the op must be nested
+      inside them.
+
+    A dim with ``num_blocks == 1`` is never live at render time — the
+    mechanical emitter still opens a ``for ... in range(1)`` for it, but
+    the op does not depend on its index and can sit outside.
+    """
+    used: set[str] = set(op.blocking_dims)
+    for name in list(op.inputs.values()) + list(op.outputs):
+        if name not in allocs:
+            continue
+        info = allocs[name]
+        for axis in (info.buf.p_axis, info.buf.f_axis):
+            if axis is None:
+                continue
+            if ir.num_blocks(axis) > 1:
+                used.add(axis)
+    positions = [ir.dim_order.index(d) for d in used if d in ir.dim_order]
+    if not positions:
+        return 0
+    return 1 + max(positions)
 
 
 def _find_reducing_ops(ir: KernelIR) -> list[Op]:
@@ -537,8 +623,12 @@ def _emit_compute_ops(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op
             _emit_transpose(w, ir, allocs, op, _TRANSPOSE_GADGETS[op.kind])
         elif op.kind == "NKIMatmul":
             _emit_matmul(w, ir, allocs, op)
+        elif op.kind == "NKIOnlineMatmul":
+            _emit_online_matmul(w, ir, allocs, op)
         elif op.kind == "NKIActivationReduce":
             _emit_activation_reduce(w, ir, allocs, op)
+        elif op.kind == "NKIActivation":
+            _emit_activation(w, ir, allocs, op)
         elif op.kind == "NKITensorScalar":
             _emit_tensor_scalar(w, ir, allocs, op)
 
@@ -925,6 +1015,32 @@ def _emit_activation_reduce(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAllo
     w.line(f"activation_reduce_block({dst_expr}, {src_expr}, op=nl.{act}, reduce_op=nl.{red})")
 
 
+def _emit_activation(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
+    """Emit ``cur_<dst> = <dst>[...]; activation_block(cur_dst, cur_src, op=..., scale=..., bias=...)``.
+
+    ``NKIActivation`` is a standalone Scalar-Engine pass — no F-reduce,
+    no post_op phase. Both operands are sliced per-block on their P
+    axis via :func:`_broadcast_operand_slice` (the F axis is always 1
+    for ``(P,)`` tensors, so no per-leaf free-slice is needed).
+    """
+    src = op.inputs["data"]
+    dst = op.outputs[0]
+    dst_info = allocs[dst]
+    src_info = allocs[src]
+    cur_dst = _cur_name(dst)
+    cur_src = _cur_name(src)
+    w.line(f"{cur_dst} = {dst}{_rotation_index(dst_info)}")
+    dst_expr = _broadcast_operand_slice(ir, dst_info, base=cur_dst)
+    src_expr = _broadcast_operand_slice(ir, src_info, base=cur_src)
+    act = op.kwargs.get("op", "copy")
+    scale = op.kwargs.get("scale", 1.0)
+    bias = op.kwargs.get("bias", 0.0)
+    w.line(
+        f"activation_block({dst_expr}, {src_expr}, op=nl.{act}, "
+        f"scale={_scale_bias_repr(scale)}, bias={_scale_bias_repr(bias)})"
+    )
+
+
 def _emit_tensor_scalar(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
     """Emit ``tensor_scalar_block(cur_dst, cur_data, cur_operand0, op=...)``.
 
@@ -1006,6 +1122,31 @@ def _emit_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op)
     w.line(f"matmul_block({out_expr}, {lhs_expr}, {rhs_expr})")
 
 
+def _emit_online_matmul(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
+    """Emit ``online_matmul_block(out_slice, lhs_T, rhs, scale)``.
+
+    Same (K, M, N) operand shaping as :func:`_emit_matmul`, plus a
+    ``(P=M,)`` scale operand narrowed to one M-block when its buffer
+    holds more. The gadget's fused ``scalar_tensor_tensor`` drain
+    applies ``output = output * scale + lhs_T @ rhs`` per K block.
+    """
+    k_dim = op.axis_map["K"]
+    m_dim = op.axis_map["M"]
+    n_dim = op.axis_map["N"]
+    lhs = op.inputs["stationary"]
+    rhs = op.inputs["moving"]
+    scale = op.inputs["scale"]
+    out = op.outputs[0]
+    out_info = allocs[out]
+    scale_info = allocs[scale]
+
+    out_expr = _matmul_output_expr(ir, out_info, m_dim, n_dim)
+    lhs_expr = _matmul_input_expr(ir, allocs, lhs, k_dim, m_dim)
+    rhs_expr = _matmul_input_expr(ir, allocs, rhs, k_dim, n_dim)
+    scale_expr = _broadcast_operand_slice(ir, scale_info, base=_cur_name(scale))
+    w.line(f"online_matmul_block({out_expr}, {lhs_expr}, {rhs_expr}, {scale_expr})")
+
+
 def _matmul_output_expr(ir: KernelIR, info: _BufAlloc, m_dim: str, n_dim: str) -> str:
     """Accumulator slice for ``matmul_block``.
 
@@ -1078,9 +1219,7 @@ Store emission
 ────────────────────────────────────────────────────────────────"""
 
 
-def _emit_store(
-    w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], store_op: Op, matmul_op: Op, open_loops: list[str]
-) -> None:
+def _emit_store(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], store_op: Op, open_loops: list[str]) -> None:
     """Emit ``store_block(hbm[<slice>], <sbuf_expr>)``.
 
     Store placement rule: fire after all SEQUENTIAL/ACCUMULATION loops
@@ -1098,7 +1237,6 @@ def _emit_store(
     hbm_name = store_op.outputs[0]
     info = allocs[sbuf_name]
     hbm = ir.physical_buffers[hbm_name]
-    _ = matmul_op
 
     hbm_slices: list[str] = []
     for d in hbm.dim_ids:

@@ -106,7 +106,7 @@ print(f"nkipy: {baseline.mfu:.3f}%  {baseline.min_ms:.4f} ms  target: {TARGET_MF
 - `<CACHE_ROOT>/nkipy_baseline/baseline.json` — `{source, mfu, min_ms}`
 - `<CACHE_ROOT>/summary.json` — seeded with `function`, `baseline`, `target_mfu`
 
-Read `nkipy_baseline.py` to see the compiler's tiling / buffer layout / instruction choice.
+Read `nkipy_baseline.py` to see the compiler's tiling / buffer layout / instruction choice. **Start by mirroring it.** Translate what the compiler picked into your first IR configuration — tile shapes → `ltiles_per_block`, loop nest order → `dim_order`, which buffers live across the outer loop → `buffer_scopes` / `emission_depth`, any ping-pong / rotation → `num_buffers`. The compiler's output is already a strong local optimum; starting there gives an informed floor to tune *from*, rather than climbing from a random default. Submit this mirror as the first kernel in batch 0 alongside the rewrite-variant defaults.
 
 ## Step 2 — Build the canonical KernelIR
 
@@ -148,24 +148,15 @@ When sweeping knobs (step 4), produce one set of candidate IRs per variant — t
 
 `KernelIR` has exactly five tunable fields. Before writing values, reason about what each knob physically does to the emitted kernel — knobs interact with each other:
 
-- **`dim_order: list[str]`** — permutation of dim ids. Controls the loop nest order, which controls **what loops are open at each buffer's first use**. Store fires once all `ACCUMULATION`/`SEQUENTIAL` loops close (at position = `first_acc_position`); any dim to the right of that is already closed when the output lands in HBM. Reducing dim innermost = reuse of loaded operands; reducing dim outermost = drain-per-operand, shorter accumulator lifetime. Changing `dim_order` re-derives every buffer's `first_use_depth`, which gates both `emission_depth` and `num_buffers`.
-- **`ltiles_per_block: dict[str, int]`** — how many logical tiles one block iteration processes per dim. Raises `allocate_buffers` sizes (base = `Π tile × ltiles_per_block`) and shrinks the outer `num_blocks` loop trip count. Matmul inner body emits `ltiles[m] × ltiles[n]` PSUM tiles simultaneously; transpose emits `ltiles[P] × ltiles[F]`. Those sums share the 8-bank PSUM budget. Larger `ltiles` = better operand reuse per K-drain, but quadratic SBUF/PSUM growth.
-- **`buffer_scopes: dict[str, BufferScope]`** — sizing (NOT emission placement): `INNER` = 0 full-span dims (one tile), `MIDDLE` = outermost-in-`dim_order` axis per-block + others full, `OUTER` = all full. Matmul accumulators MUST cover every output dim whose `dim_order` position ≥ `first_acc_position` (that dim's loop is closed at store) — undercovered axes = validator failure. Transpose src/dst pairs MUST share a scope (gadget requires matching tile counts on swapped axes). Widening scope raises SBUF footprint but extends a buffer's reuse across loop iterations.
-- **`num_buffers: dict[str, NumBuffers]`** — rotation for DMA/compute overlap. `NumBuffers(num_p_buffers=N, ...)` emits `[i_block_<p_axis> % N]` ping-pong slots, hiding load latency behind compute on a previous tile. Rotation axis MUST be open at the buffer's `first_use_depth` (else the index is unbound). Rotation multiplies the buffer's live bytes by `N` — pair carefully with scope and emission_depth budget.
-- **`emission_depth: dict[str, int]`** — at which loop depth the `allocate_buffers` call emits. `0` = kernel top (lifetime = whole kernel), `N` = inside `N` outer loops (lifetime = that loop iteration). Deeper emission frees SBUF between iterations and lets co-resident buffers share bytes; shallower emission keeps data alive for outer reuse. Must be ≤ `first_use_depth(buf)` — allocation can't land below its first reference.
+- **`dim_order: list[str]`** — permutation of dim ids. Controls the loop nest order, which controls **what loops are open at each buffer's first use**. Store fires once all `ACCUMULATION`/`SEQUENTIAL` loops close (at position = `first_acc_position`); any dim to the right of that is already closed when the output lands in HBM. Reducing dim innermost = reuse of loaded operands; reducing dim outermost = drain-per-operand, shorter accumulator lifetime.
+- **`ltiles_per_block: dict[str, int]`** — how many logical tiles one block iteration processes per dim. Raises `allocate_buffers` sizes (base = `Π tile × ltiles_per_block`) and shrinks the outer `num_blocks` loop trip count. Matmul inner body emits `ltiles[m] × ltiles[n]` PSUM tiles simultaneously; transpose emits `ltiles[P] × ltiles[F]`; those sums share the 8-bank PSUM budget.
+- **`buffer_scopes: dict[str, BufferScope]`** — sizing (NOT emission placement): `INNER` = 0 full-span dims (one tile), `MIDDLE` = outermost-in-`dim_order` axis per-block + others full, `OUTER` = all full. Matmul accumulators MUST cover every output dim whose `dim_order` position ≥ `first_acc_position`; transpose src/dst pairs MUST share a scope.
+- **`num_buffers: dict[str, NumBuffers]`** — rotation for DMA/compute overlap. `NumBuffers(num_p_buffers=N, ...)` emits `[i_block_<p_axis> % N]` ping-pong slots. Rotation axis MUST be open at the buffer's `first_use_depth`; rotation multiplies live bytes by `N`.
+- **`emission_depth: dict[str, int]`** — loop depth at which `allocate_buffers` emits. `0` = kernel top (lifetime = whole kernel), `N` = inside `N` outer loops (lifetime = that loop iteration). Must be ≤ `first_use_depth(buf)`.
 
-**The knobs are not independent.** A single change (e.g. `dim_order` rotating K from innermost to outermost) shifts `first_use_depth` for every buffer, which can invalidate prior `emission_depth` and `num_buffers` choices. Treat each (dim_order, ltiles, scopes, num_buffers, emission_depth) assignment as one joint configuration, not five separate decisions.
+**The knobs are not independent.** Changing `dim_order` shifts `first_use_depth` for every buffer, which invalidates prior `emission_depth` and `num_buffers` choices; widening `buffer_scopes` can violate the accumulator-coverage rule after a `dim_order` swap. Treat each (dim_order, ltiles, scopes, num_buffers, emission_depth) as one joint configuration.
 
-```python
-from nkigym.kernel_ir import BufferScope, NumBuffers
-ir.dim_order = ["d0", "d2", "d1"]
-ir.ltiles_per_block = {"d0": 8, "d1": 8, "d2": 1}
-ir.buffer_scopes = {"sbuf_output": BufferScope.MIDDLE}
-ir.num_buffers = {"sbuf_lhs_T": NumBuffers(4, 4), "sbuf_rhs": NumBuffers(8, None)}
-ir.emission_depth = {"sbuf_lhs_T": 0, "sbuf_rhs": 2, "sbuf_output": 1}
-```
-
-Only set entries you want to override. Anything missing uses `build_ir` defaults.
+Assign directly to `ir.dim_order`, `ir.ltiles_per_block`, `ir.buffer_scopes`, `ir.num_buffers`, `ir.emission_depth`. Only set entries you want to override; anything missing uses `build_ir` defaults. Buffer-keyed dicts key off the names printed in `repr(ir)`.
 
 ## Step 5 — Validate
 
@@ -224,12 +215,16 @@ Resumable: rerunning the skill on an existing `CACHE_ROOT` reads `summary.json` 
 `ProfileResult` fields of interest:
 
 - `cpu_sim.passed` — numerical match vs `f_nkigym` golden. `False` → HW skipped.
-- `min_ms` — best of 100 iters. `None` → compile or runtime failure.
+- `min_ms` — best of 100 iters (built-in `warmup=10, iters=100` from `ProfileConfig`/`BenchmarkConfig`; one submit = one valid comparison point, replicate only for deltas under ~0.1pp). `None` → compile or runtime failure.
 - `mfu` — compute utilization.
 - `mfu_max_achievable_estimated_percent` — roofline ceiling.
 - `roofline_efficiency` — `mfu / mfu_max_achievable`.
 - `mbu_estimated_percent` — HBM bandwidth utilization.
 - `hardware_output` — neuronx-cc stderr.
+
+**Reading `roofline_efficiency`** — the ceiling already bakes in memory-vs-compute bound for this arithmetic intensity, so it isolates scheduling headroom from algorithmic limits:
+- Low MFU + low roofline eff → tuning headroom remains. Check `tensor_engine_active_time_percent`; gaps point at PSUM bank contention, missing DMA/TE overlap, scheduler-induced instruction gaps, unrotated buffers, or transpose scheduled as a separate gadget. Keep sweeping the 5 knobs.
+- Low MFU + high roofline eff → near the memory-bound ceiling for this AI. Step up to rewrite-level changes: grow tile footprint, extend operand reuse, or apply a fusion rewrite.
 
 Open `<CACHE_ROOT>/batch_<bid>/kernel_<kid>/batch_<bid>_kernel_<kid>.py` after each submit to spot render bugs.
 
@@ -247,11 +242,7 @@ Open `<CACHE_ROOT>/batch_<bid>/kernel_<kid>/batch_<bid>_kernel_<kid>.py` after e
 }
 ```
 
-## Step 7 — Measurement
-
-Built-in `warmup=10, iters=100` (`ProfileConfig`, `BenchmarkConfig`). One submit = one valid comparison point. Replicate only for deltas under ~0.1pp.
-
-## Step 8 — Iterate until `TARGET_MFU`
+## Step 7 — Iterate until `TARGET_MFU`
 
 Loop until target hit:
 
@@ -273,25 +264,30 @@ while running_best_mfu() < TARGET_MFU:
     print(f"running best: {running_best_mfu():.3f}%  target: {TARGET_MFU}%")
 ```
 
-Search strategy for `propose_next_batch` — **two phases**, phase transition triggered by the running-best curve flattening:
+`propose_next_batch` does three things per iteration: read feedback → form a hypothesis → pick a mutation mode.
 
-**Phase 1 — guided coordinate sweeps (early exploration).** Useful for establishing a per-variant floor and identifying which knobs individually move the needle.
+**1. Read feedback.** Load `<CACHE_ROOT>/batch_<latest>/batch_<latest>_results.json`, rank entries by `mfu` (descending, `None` last), and classify the bottleneck. If *every* entry has `min_ms is None`, the batch compiled/ran nothing — address failures before any MFU tuning: read `hardware_output` of the most common failure mode and fix the offending knob. Otherwise look at the top-3 successful kernels:
 
-1. First batch: `submit_batch(list(variants.values()), ...)` — one IR per rewrite combination from Step 3's `enumerate_rewrite_combinations` dict. Establishes a per-variant floor.
-2. Next few batches: vary one knob (5-10 settings) per rewrite variant, starting with coarse-grained choices — `ltiles` / `dim_order` / `buffer_scopes` before `num_buffers` / `emission_depth`.
-3. Read the rendered `.py` every time (`<CACHE_ROOT>/batch_<bid>/kernel_<kid>/batch_<bid>_kernel_<kid>.py`) to catch render bugs early.
+- Low MFU + low `roofline_efficiency` → TE scheduling gaps (PSUM bank contention, missing rotation, transpose scheduled as a separate gadget, `neuronx_cc_args` scheduler-off not set). Implicates `num_buffers`, `emission_depth`, or `dim_order`.
+- Low MFU + high `roofline_efficiency` or high `mbu_estimated_percent` → memory-bound at this AI. Implicates `ltiles_per_block`, `buffer_scopes`, or a fusion rewrite.
+- Mixed success/failure in one batch → read `hardware_output` of failures; the offending knob is usually named in the stderr (OOM, `NCC_*` code, unbound rotation index). Narrow the next sweep to avoid that failure region.
 
-**Phase 2 — joint random sampling (once coordinate descent plateaus).** The 5 knobs are not independent: if `ltiles`, `dim_order`, `buffer_scopes`, `num_buffers`, `emission_depth` each hurt MFU when changed *individually* from a local maximum, coordinate descent will never try the combination that unlocks the next basin. **When the running-best curve flattens for 2-3 consecutive batches, switch to `nkigym.kernel_ir.sample`**:
+A batch proposed without first reading the prior batch's profiler fields is wasted compute. Whenever running-best MFU is more than ~5pp below the nkipy baseline, also diff `<CACHE_ROOT>/nkipy_baseline/nkipy_baseline.py` against your best rendered `.py` — the compiler's tile shapes, buffer placement, rotation depth, and instruction choices (e.g. inline transpose via `nc_matmul(is_transpose=True)` rather than a separate `transpose_block`) are a strong prior; translate what you see into knob settings before mutating further.
+
+**2. Pick a mutation mode** based on whether the hypothesis names a single knob:
+
+- **Targeted mode** — one knob clearly implicated. Sweep 5-10 settings of that knob per rewrite variant, holding others fixed near the running best. Use when the bottleneck diagnosis is specific (e.g. "unrotated `sbuf_rhs` is causing TE gap" → sweep `num_buffers["sbuf_rhs"]`).
+- **Joint sample mode** — no single knob obviously implicated, or individual sweeps have all regressed from a local maximum (knobs interact; coordinate descent can't escape). Draw joint samples via `nkigym.kernel_ir.sample`.
+
+The first batch is a special case: `submit_batch(list(variants.values()), ...)` (reusing the `variants` dict from Step 3) establishes a per-variant floor before any feedback exists. Read the rendered `.py` after every submit (`<CACHE_ROOT>/batch_<bid>/kernel_<kid>/batch_<bid>_kernel_<kid>.py`) to catch render bugs early.
+
+**Joint sample mode reference** (reusing `variants` from Step 3):
 
 ```python
 import random
-from nkigym.kernel_ir import build_ir
-from nkigym.kernel_ir.rewrites import LoadTranspose, enumerate_rewrite_combinations
 from nkigym.kernel_ir.sample import sample, knob_signature
 
-rng = random.Random(42)
-base_ir = build_ir(f_nkigym, INPUT_SPECS)
-variants = dict(enumerate_rewrite_combinations(base_ir, [LoadTranspose()]))
+rng = random.Random()  # nondeterministic — resumed sessions advance new ground
 seen: set = set()
 batch: list[KernelIR] = []
 while len(batch) < 20:
@@ -306,6 +302,6 @@ while len(batch) < 20:
 
 `sample.py` draws every knob conditioned on prior draws (PSUM cap on `ltiles`, transpose-pair matching on `scopes`, SBUF budget + open-axis on joint `emission_depth` × `num_buffers`) — every sample is valid by construction, no reject loop needed. `submit_batch` dedups against prior batches automatically, so re-proposed configurations are free.
 
-**Reason about why a joint sample is promising before submitting.** For each sampled IR, glance at `repr(ir)` and ask: does the `dim_order` leave the right loops open for the chosen `num_buffers` rotations? Does the accumulator scope cover every closed output dim? Does the `ltiles` product stay within the 8-bank PSUM budget for matmul + transpose gadgets combined? The sampler enforces these mechanically but the agent should still be able to justify *why* a config is worth a HW run.
+**3. Justify each candidate before submitting.** The sampler and validator already cover validity; the question here is *performance* relevance — does this candidate target the bottleneck from step 1? If running-best is far behind the nkipy baseline, does it borrow tile shapes or rotation depth from `nkipy_baseline.py`? Bias selection toward candidates that address a named bottleneck; drop the rest.
 
-**Stopping condition**: `running_best_mfu() >= TARGET_MFU`. Keep sampling — plateau in one batch means try more joint samples with a different seed, not give up.
+**Stopping condition**: `running_best_mfu() >= TARGET_MFU`. A plateau in one batch means draw more joint samples or flip modes — not give up.

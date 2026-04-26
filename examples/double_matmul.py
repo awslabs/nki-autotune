@@ -32,11 +32,9 @@ from nkigym.search.mac import compute_mac_count
 
 
 def double_matmul_nkigym(q, k, v):
-    """nkigym math function for attention-style double matmul ``(Q @ K^T) @ V``."""
     q_T = NKITranspose()(data=q)
     k_T = NKITranspose()(data=k)
-    scores = NKIMatmul()(stationary=q_T, moving=k_T)
-    scores_T = NKITranspose()(data=scores)
+    scores_T = NKIMatmul()(stationary=k_T, moving=q_T)
     output = NKIMatmul()(stationary=scores_T, moving=v)
     return output
 
@@ -48,7 +46,7 @@ def double_matmul_numpy(q: np.ndarray, k: np.ndarray, v: np.ndarray) -> np.ndarr
 
 if __name__ == "__main__":
     SEQLEN_Q, SEQLEN_KV, D = 2048, 2048, 128
-    HOSTS = ["gym-1"]
+    HOSTS = ["gym-2"]
     ATOL, RTOL = 1e-2, 1e-2
 
     INPUT_SPECS = {
@@ -68,7 +66,7 @@ if __name__ == "__main__":
     nkigym_source = func_source_with_imports(double_matmul_nkigym)
     output_shape = tuple(base_ir.logical_tensors[base_ir.return_name].shape)
 
-    num_samples = 10
+    num_samples = 50
     seen: set[tuple] = set()
     kernels: dict[str, KernelJob] = {}
     for variant, ir in variants.items():

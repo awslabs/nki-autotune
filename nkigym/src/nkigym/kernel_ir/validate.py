@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from nkigym.kernel_ir.ir import BufferScope, KernelIR, Op
 from nkigym.kernel_ir.types import DimRole
 
-_REDUCING_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce"})
+_REDUCING_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce", "NKIOnlineMatmul"})
 """Ops whose output SBUF is a loop-lived accumulator — its prologue
 (``cur_<name> = <name>[...]; memset``) fires at
 :func:`_accumulator_first_use_depth` rather than at the op's emission
@@ -61,7 +61,6 @@ def validity_report(ir: KernelIR) -> list[ValidityFailure]:
     failures.extend(_check_rotation_axes(ir))
     failures.extend(_check_transpose_scopes(ir))
     failures.extend(_check_accumulator_coverage(ir))
-    failures.extend(_check_reducer_inner_dims(ir))
     return failures
 
 
