@@ -9,19 +9,9 @@ Tunes one nkigym kernel. Two mutation surfaces are both first-class: the 3 `Kern
 
 ## Reference material
 
-- `nkigym/src/nkigym/kernel_ir/ir.py` — dataclasses (`KernelIR`, `Op`, `PhysicalBuffer`)
-- `nkigym/src/nkigym/kernel_ir/build.py` — `build_ir` parser
-- `nkigym/src/nkigym/kernel_ir/validate.py` — `validity_report(ir)` returns contradictions from derivation-step constraint checks
-- `nkigym/src/nkigym/kernel_ir/sample.py` — `sample(ir, rng)` joint random draw over the 3 knobs; `knob_signature(ir)` for dedup
-- `nkigym/src/nkigym/kernel_ir/rewrites/` — available IR rewrites + `enumerate_rewrite_combinations(ir, rewrites)`
-- `nkigym/src/nkigym/ops/<op>.py` — op class + codegen for each NKIOp
-- `nkigym/src/nkigym/codegen/render.py` — mechanical lowering: how knobs + derived depths map to emitted code
-- `examples/matmul_lhsT_rhs.md` — canonical walkthrough of the new IR semantics and code-gen contract (start here when unsure)
-- `autotune/src/autotune/runner/tune_session.py` — `dump_baseline`, `submit_batch` for IR-keyed entries in this skill
-- `autotune/src/autotune/runner/api.py` — `remote_profile` one-shot entry used for hand-edited source
-- `autotune/src/autotune/runner/types.py` — `KernelJob` NamedTuple (source + metadata sent to workers)
-- `autotune/src/autotune/runner/remote.py` — `RemoteProfiler`, `remote_numpy_baseline`
-- `nkigym/src/nkigym/search/api.py` — `inline_gadgets`, `func_source_with_imports`, `compute_mac_count` used to build `KernelJob`
+- `/home/ubuntu/nki-autotune/nkigym/src/nkigym/` — IR, codegen, ops, rewrites, search (`KernelIR`, `build_ir`, `validity_report`, `sample`/`knob_signature`, `enumerate_rewrite_combinations`, `render_ir`, `inline_gadgets`, `func_source_with_imports`, `compute_mac_count`)
+- `/home/ubuntu/nki-autotune/autotune/src/autotune/runner/` — `dump_baseline`, `submit_batch`, `remote_profile`, `KernelJob`
+- `/home/ubuntu/nki-autotune/examples/matmul_lhsT_rhs.md` — canonical walkthrough of the new IR semantics and code-gen contract (start here when unsure)
 - `/home/ubuntu/venvs/kernel-env/lib/python3.12/site-packages/nki/` — NKI Python API (`isa/`, `language/`, `simulator.py`)
 - `/home/ubuntu/shared_workplace/KaenaCompiler/neuronxcc` — compiler source
 - `/home/ubuntu/shared_workplace/KaenaNeuronKernelLibrary` — hand-written reference kernels

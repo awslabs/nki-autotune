@@ -436,7 +436,7 @@ def matmul_lhs_rhs_nkigym(lhs, rhs):
                         """OP_2 fires at depth 5 — one 128x128 tile per call."""
                         nisa.nc_transpose(
                             dst=sbuf_lhs_T[0:128, i_tile_d1, i_tile_d0 * 128 : i_tile_d0 * 128 + 128],
-                            src=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
+                            data=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
                         )
 ```
 
@@ -519,7 +519,7 @@ def matmul_lhs_rhs_nkigym(lhs, rhs):
                         )
                         nisa.nc_transpose(
                             dst=sbuf_lhs_T[0:128, i_tile_d1, i_tile_d0 * 128 : i_tile_d0 * 128 + 128],
-                            src=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
+                            data=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
                         )
 ```
 Information from IR:
@@ -591,7 +591,7 @@ def matmul_lhs_rhs_nkigym(lhs, rhs):
                         )
                         nisa.nc_transpose(
                             dst=sbuf_lhs_T[0:128, i_tile_d1, i_tile_d0 * 128 : i_tile_d0 * 128 + 128],
-                            src=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
+                            data=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
                         )
 ```
 
@@ -668,7 +668,7 @@ def matmul_lhs_rhs_nkigym(lhs, rhs):
                         )
                         nisa.nc_transpose(
                             dst=sbuf_lhs_T[0:128, i_tile_d1, i_tile_d0 * 128 : i_tile_d0 * 128 + 128],
-                            src=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
+                            data=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
                         )
                         """nc_matmul fires at depth 6 — one tile pair per call; K accumulates in HW."""
                         for i_tile_d2 in range(1):
@@ -756,7 +756,7 @@ def matmul_lhs_rhs_nkigym(lhs, rhs):
                         )
                         nisa.nc_transpose(
                             dst=sbuf_lhs_T[0:128, i_tile_d1, i_tile_d0 * 128 : i_tile_d0 * 128 + 128],
-                            src=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
+                            data=sbuf_lhs[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
                         )
                         for i_tile_d2 in range(1):
                             nisa.nc_matmul(

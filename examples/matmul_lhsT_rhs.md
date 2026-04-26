@@ -64,8 +64,8 @@ Code generation is **mechanical lowering only** — the IR is the source of trut
 
 1. Every loop in `loop_order` is emitted. No elision, no reordering.
 2. Every buffer's shape and placement follows `buffer_scopes` exactly.
-3. Every op's fire depth is the mechanical max of `(operand availability)` and `(op-intrinsic tile requirement)`.
-4. **Illegal IR fails loudly.** If the IR demands something impossible (e.g. an op needs all three `.tile` loops open but the IR places a reader of its output between two of them), raise an error — do not silently rewrite loops, dissolve entries, or promote tile ranges to block ranges to force correctness.
+3. Every op's fire depth is the mechanical max of `(operand availability)` and `(op-intrinsic tile requirement)`. **DMA ops (`nisa.dma_copy`, `nisa.dma_transpose`) have NO outer-loop tile requirement** — they accept multi-tile `par_dim` destinations and walk the partition axis via an internal for-loop. Compute ops (`nisa.nc_matmul`, `nisa.nc_transpose`, `nisa.activation_reduce`, `nisa.tensor_scalar`) DO require each touched dim's `.tile` loop open at fire depth.
+4. **Illegal IR fails loudly.** If the IR demands something impossible (e.g. a compute op needs all three `.tile` loops open but the IR places a reader of its output between two of them), raise an error — do not silently rewrite loops, dissolve entries, or promote tile ranges to block ranges to force correctness.
 
 **Invalid-IR detection falls out of the derivations.** Every derivation step — emission depth, fire depth, buffer shape, operand liveness, dtype compatibility, tile-role assignment — is a constraint resolution: gather lower bounds, gather upper bounds, pick a consistent value. Any contradiction (`lower > upper`, dtype mismatch between producer and consumer, reducing dim not listed in a downstream accumulator's scope, operand not in scope at an op's computed fire depth, etc.) rejects the IR at derivation time. No ad-hoc fixes, no silent rewrites. The sampler sees a clean failure and moves on.
 
@@ -164,18 +164,17 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
 
 Derive OP_0 fire depth:
 ```python
-"""fire_depth has two sources:
-   (a) operand-availability: max(operand.emission_depth for operand in operands)
+"""fire_depth = operand-availability: max(operand.emission_depth for operand in operands)
         lhs_T       → kernel param, available at depth 0
         sbuf_lhs_T  → emission_depth = 3
         max = 3.
-   (b) op-intrinsic tile-level requirement: nisa.dma_copy's partition axis
-       (P-role) must be a single tile per call — the free axis can span
-       multiple tiles. dim_map P=d0 → must fire inside d0.tile (depth 5).
-       Free axis d1 has no constraint.
-   Tiebreaker when multiple depths are valid: pick the tightest (smallest).
-   Final fire_depth = max(3, 5) = depth 5."""
-op0_fire_depth = 5
+   nisa.dma_copy has NO outer-loop tile-level requirement — it accepts any
+   par_dim-extended SBUF destination and walks its own P-tile axis via a
+   local for-loop inside the op body. The op fires as soon as operands are
+   live; the partition-tile walk is an emission detail, not a loop_order
+   constraint.
+   Final fire_depth = 3."""
+op0_fire_depth = 3
 ```
 Accumulated code generation — OP_0 body:
 ```python
@@ -189,17 +188,17 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
         for i_block_d0 in range(2):
             for i_block_d1 in range(4):
                 sbuf_lhs_T = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
-                for i_tile_d1 in range(4):        # depth 4 — d1.tile (mechanical loop_order)
-                    for i_tile_d0 in range(8):    # depth 5 — d0.tile (P-axis; one tile per dma_copy)
-                        """OP_0 fires at depth 5 — partition axis d0 one tile per call;
-                           d1 is the free axis, sliced by i_tile_d1."""
-                        nisa.dma_copy(
-                            dst=sbuf_lhs_T[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
-                            src=lhs_T[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d1 *  512 + i_tile_d1 * 128 : i_block_d1 *  512 + i_tile_d1 * 128 + 128,
-                            ],
-                        )
+                """OP_0 fires at depth 3 — right after sbuf_lhs_T is live.
+                   Internal i_tile_d0 walk fills the 8 partition tiles of the allocated block;
+                   d1 free axis spans the full block in one DMA per partition tile."""
+                for i_tile_d0 in range(8):
+                    nisa.dma_copy(
+                        dst=sbuf_lhs_T[0:128, i_tile_d0, 0:512],
+                        src=lhs_T[
+                            i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                            i_block_d1 *  512 : i_block_d1 *  512 + 512,
+                        ],
+                    )
 ```
 
 ### 3.4.2 OP_1
@@ -271,18 +270,13 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
 
 Derive OP_1 fire depth:
 ```python
-"""fire_depth has two sources:
-   (a) operand-availability: max(operand.emission_depth for operand in operands)
+"""fire_depth = operand-availability: max(operand.emission_depth for operand in operands)
         rhs       → kernel param, available at depth 0
         sbuf_rhs  → emission_depth = 2
         max = 2.
-   (b) op-intrinsic tile-level requirement: nisa.dma_copy's partition axis
-       (P-role) must be a single tile per call. dim_map P=d0 → must fire
-       inside d0.tile (depth 5). Free axis d2 has no constraint → op is
-       valid at depth 5 (d2 free axis spans the full block) or depth 6.
-   Tiebreaker when multiple depths are valid: pick the tightest (smallest).
-   Final fire_depth = max(2, 5) = depth 5."""
-op1_fire_depth = 5
+   nisa.dma_copy has no outer-loop tile-level requirement (see OP_0).
+   Final fire_depth = 2."""
+op1_fire_depth = 2
 ```
 Accumulated code generation — OP_1 body:
 ```python
@@ -295,26 +289,27 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     for i_block_d2 in range(4):
         for i_block_d0 in range(2):
             sbuf_rhs = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+            """OP_1 fires at depth 2 — right after sbuf_rhs is live.
+               Internal i_tile_d0 walk fills the 8 partition tiles of the allocated block;
+               d2 free axis spans the full block in one DMA per partition tile."""
+            for i_tile_d0 in range(8):
+                nisa.dma_copy(
+                    dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
+                    src=rhs[
+                        i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                        i_block_d2 *  512 : i_block_d2 *  512 + 512,
+                    ],
+                )
             for i_block_d1 in range(4):
                 sbuf_lhs_T = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
-                for i_tile_d1 in range(4):
-                    for i_tile_d0 in range(8):
-                        nisa.dma_copy(
-                            dst=sbuf_lhs_T[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
-                            src=lhs_T[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d1 *  512 + i_tile_d1 * 128 : i_block_d1 *  512 + i_tile_d1 * 128 + 128,
-                            ],
-                        )
-                        """OP_1 fires at depth 5 — partition axis d0 one tile per call;
-                           d2 is the free axis, spans the full block in one DMA."""
-                        nisa.dma_copy(
-                            dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
-                            src=rhs[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d2 *  512 : i_block_d2 *  512 + 512,
-                            ],
-                        )
+                for i_tile_d0 in range(8):
+                    nisa.dma_copy(
+                        dst=sbuf_lhs_T[0:128, i_tile_d0, 0:512],
+                        src=lhs_T[
+                            i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                            i_block_d1 *  512 : i_block_d1 *  512 + 512,
+                        ],
+                    )
 ```
 
 ### 3.4.3 OP_2
@@ -379,24 +374,24 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
         nisa.memset(sbuf_output[0:128, 0:16, 0:512], value=0.0)
         for i_block_d0 in range(2):
             sbuf_rhs = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+            for i_tile_d0 in range(8):
+                nisa.dma_copy(
+                    dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
+                    src=rhs[
+                        i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                        i_block_d2 *  512 : i_block_d2 *  512 + 512,
+                    ],
+                )
             for i_block_d1 in range(4):
                 sbuf_lhs_T = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
-                for i_tile_d1 in range(4):
-                    for i_tile_d0 in range(8):
-                        nisa.dma_copy(
-                            dst=sbuf_lhs_T[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
-                            src=lhs_T[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d1 *  512 + i_tile_d1 * 128 : i_block_d1 *  512 + i_tile_d1 * 128 + 128,
-                            ],
-                        )
-                        nisa.dma_copy(
-                            dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
-                            src=rhs[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d2 *  512 : i_block_d2 *  512 + 512,
-                            ],
-                        )
+                for i_tile_d0 in range(8):
+                    nisa.dma_copy(
+                        dst=sbuf_lhs_T[0:128, i_tile_d0, 0:512],
+                        src=lhs_T[
+                            i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                            i_block_d1 *  512 : i_block_d1 *  512 + 512,
+                        ],
+                    )
 ```
 Derive `psum_output` buffer allocation:
 ```python
@@ -444,28 +439,29 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
         nisa.memset(sbuf_output[0:128, 0:16, 0:512], value=0.0)
         for i_block_d0 in range(2):
             sbuf_rhs = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+            for i_tile_d0 in range(8):
+                nisa.dma_copy(
+                    dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
+                    src=rhs[
+                        i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                        i_block_d2 *  512 : i_block_d2 *  512 + 512,
+                    ],
+                )
             for i_block_d1 in range(4):
                 sbuf_lhs_T = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+                for i_tile_d0 in range(8):
+                    nisa.dma_copy(
+                        dst=sbuf_lhs_T[0:128, i_tile_d0, 0:512],
+                        src=lhs_T[
+                            i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                            i_block_d1 *  512 : i_block_d1 *  512 + 512,
+                        ],
+                    )
                 for i_tile_d1 in range(4):        # depth 4 — d1.tile (M)
                     """psum_output allocated at depth 4 — per-(K.block, M.tile) partial sum."""
                     psum_output = nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum)
                     """Accumulator prologue — zero before d0.tile opens."""
                     nisa.memset(psum_output[0:128, 0:1, 0:512], value=0.0)
-                    for i_tile_d0 in range(8):
-                        nisa.dma_copy(
-                            dst=sbuf_lhs_T[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
-                            src=lhs_T[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d1 *  512 + i_tile_d1 * 128 : i_block_d1 *  512 + i_tile_d1 * 128 + 128,
-                            ],
-                        )
-                        nisa.dma_copy(
-                            dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
-                            src=rhs[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d2 *  512 : i_block_d2 *  512 + 512,
-                            ],
-                        )
 ```
 #### 3.4.3.2 Instruction
 
@@ -505,7 +501,7 @@ Derive OP_2 fire depth:
    Final fire_depth = max(4, 6) = depth 6."""
 op2_fire_depth = 6
 ```
-Accumulated code generation — OP_2 body (nc_matmul fires at depth 6 inside d0.tile/d2.tile; PSUM → sbuf_output drain fires at the d2.tile close, still inside d0.tile via free-axis span):
+Accumulated code generation — OP_2 body (nc_matmul fires at depth 6 inside d0.tile/d2.tile; PSUM → sbuf_output drain fires at the d0.tile close):
 ```python
 @nki.jit
 def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
@@ -518,27 +514,29 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
         nisa.memset(sbuf_output[0:128, 0:16, 0:512], value=0.0)
         for i_block_d0 in range(2):
             sbuf_rhs = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+            for i_tile_d0 in range(8):
+                nisa.dma_copy(
+                    dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
+                    src=rhs[
+                        i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                        i_block_d2 *  512 : i_block_d2 *  512 + 512,
+                    ],
+                )
             for i_block_d1 in range(4):
                 sbuf_lhs_T = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+                for i_tile_d0 in range(8):
+                    nisa.dma_copy(
+                        dst=sbuf_lhs_T[0:128, i_tile_d0, 0:512],
+                        src=lhs_T[
+                            i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                            i_block_d1 *  512 : i_block_d1 *  512 + 512,
+                        ],
+                    )
                 for i_tile_d1 in range(4):
                     psum_output = nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum)
                     nisa.memset(psum_output[0:128, 0:1, 0:512], value=0.0)
+                    """nc_matmul fires at depth 6 — one tile pair per call; K accumulates in HW."""
                     for i_tile_d0 in range(8):
-                        nisa.dma_copy(
-                            dst=sbuf_lhs_T[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
-                            src=lhs_T[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d1 *  512 + i_tile_d1 * 128 : i_block_d1 *  512 + i_tile_d1 * 128 + 128,
-                            ],
-                        )
-                        nisa.dma_copy(
-                            dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
-                            src=rhs[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d2 *  512 : i_block_d2 *  512 + 512,
-                            ],
-                        )
-                        """nc_matmul fires at depth 6 — one tile pair per call; K accumulates in HW."""
                         for i_tile_d2 in range(1):
                             nisa.nc_matmul(
                                 psum_output[0:128, 0, i_tile_d2 * 512 : i_tile_d2 * 512 + 512],
@@ -574,7 +572,7 @@ _(No new buffers — both operands already exist.)_
 
 Derive OP_3 fire depth:
 ```python
-"""fire_depth has three sources:
+"""fire_depth has two sources:
    (a) operand-availability: max(operand.emission_depth for operand in operands)
         sbuf_output  → emission_depth = 1
         hbm_output   → kernel return, available at depth 0
@@ -583,13 +581,9 @@ Derive OP_3 fire depth:
        reducing op (OP_2, K=d0 ACCUMULATION). Store must fire AFTER every
        reducing block loop of the producer closes. d0.block at depth 2 →
        store sits at depth ≤ 1 in the main loop_order nest.
-   (c) op-intrinsic tile-level requirement: nisa.dma_copy's P-axis must be
-       a single tile per call. dim_map P=d1 → needs d1.tile open.
-   Resolution: OP_3 fires at depth 1 in the main nest (inside d2.block,
-   after d0.block closes). Inside its own emission it opens d1.block /
-   d1.tile as mechanical post-reducing loops so (c) is satisfied — the
-   dma_copy lives at depth 3 of OP_3's local nest."""
-op3_fire_depth = 1  # in the main loop_order nest; local nest adds d1.block + d1.tile
+   dma_copy has no outer-loop tile requirement — the P-tile walk is internal.
+   Final fire_depth = 1."""
+op3_fire_depth = 1
 ```
 Accumulated code generation — OP_3 body:
 ```python
@@ -604,26 +598,28 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
         nisa.memset(sbuf_output[0:128, 0:16, 0:512], value=0.0)
         for i_block_d0 in range(2):
             sbuf_rhs = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+            for i_tile_d0 in range(8):
+                nisa.dma_copy(
+                    dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
+                    src=rhs[
+                        i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                        i_block_d2 *  512 : i_block_d2 *  512 + 512,
+                    ],
+                )
             for i_block_d1 in range(4):
                 sbuf_lhs_T = nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+                for i_tile_d0 in range(8):
+                    nisa.dma_copy(
+                        dst=sbuf_lhs_T[0:128, i_tile_d0, 0:512],
+                        src=lhs_T[
+                            i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
+                            i_block_d1 *  512 : i_block_d1 *  512 + 512,
+                        ],
+                    )
                 for i_tile_d1 in range(4):
                     psum_output = nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum)
                     nisa.memset(psum_output[0:128, 0:1, 0:512], value=0.0)
                     for i_tile_d0 in range(8):
-                        nisa.dma_copy(
-                            dst=sbuf_lhs_T[0:128, i_tile_d0, i_tile_d1 * 128 : i_tile_d1 * 128 + 128],
-                            src=lhs_T[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d1 *  512 + i_tile_d1 * 128 : i_block_d1 *  512 + i_tile_d1 * 128 + 128,
-                            ],
-                        )
-                        nisa.dma_copy(
-                            dst=sbuf_rhs[0:128, i_tile_d0, 0:512],
-                            src=rhs[
-                                i_block_d0 * 1024 + i_tile_d0 * 128 : i_block_d0 * 1024 + i_tile_d0 * 128 + 128,
-                                i_block_d2 *  512 : i_block_d2 *  512 + 512,
-                            ],
-                        )
                         for i_tile_d2 in range(1):
                             nisa.nc_matmul(
                                 psum_output[0:128, 0, i_tile_d2 * 512 : i_tile_d2 * 512 + 512],
@@ -636,8 +632,8 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
                         data2=psum_output[0:128, 0, 0:512],
                         op=nl.add,
                     )
-        """OP_3 fires at depth 4 — partition axis d1 one tile per call; d2 free axis spans the full block.
-           Placed after d0.block closes so every K contribution has been folded into sbuf_output."""
+        """OP_3 fires at main-nest depth 1 — d0.block closed, sbuf_output complete.
+           Walks own d1.block + internal d1.tile loop; dma_copy uses i_tile_d1 for the P-tile walk."""
         for i_block_d1 in range(4):
             for i_tile_d1 in range(4):
                 nisa.dma_copy(
