@@ -17,19 +17,24 @@ from typing import Any
 import nki.isa as nisa
 import nki.language as nl
 
+from nkigym.ops.activation_reduce import activation_block, activation_reduce_block
 from nkigym.ops.dma_transpose import dma_transpose_block
 from nkigym.ops.load import load_block
 from nkigym.ops.matmul import matmul_block
 from nkigym.ops.store import store_block
+from nkigym.ops.tensor_scalar import tensor_scalar_block
 from nkigym.ops.transpose import transpose_block
 
 __all__ = [
+    "activation_block",
+    "activation_reduce_block",
     "allocate_buffers",
     "dma_transpose_block",
     "load_block",
     "matmul_block",
     "memset_buffers",
     "store_block",
+    "tensor_scalar_block",
     "transpose_block",
 ]
 

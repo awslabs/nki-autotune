@@ -70,7 +70,7 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
     dim_sizes: dict[str, int] = {}
     dim_counter = [0]
     per_op_axis_maps: list[dict[str, str]] = []
-    for op_cls, name_kwargs, output_names in parsed:
+    for op_cls, name_kwargs, _op_kwargs, output_names in parsed:
         operand_map = {k: v for k, v in name_kwargs.items() if v in tensors}
         axis_map = _build_axis_map(op_cls, operand_map, tensors, dim_counter, per_op_axis_maps, dim_sizes)
         per_op_axis_maps.append(axis_map)
@@ -81,7 +81,7 @@ def build_ir(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple
 
     per_op_blocking: list[set[str]] = [
         {axis_map[a] for a in op_cls.BLOCKING_AXES if a in axis_map}
-        for (op_cls, _, _), axis_map in zip(parsed, per_op_axis_maps)
+        for (op_cls, _, _, _), axis_map in zip(parsed, per_op_axis_maps)
     ]
     dimensions = _resolve_dimensions(parsed, per_op_axis_maps, per_op_blocking, dim_sizes)
 
@@ -122,14 +122,14 @@ def _default_dim_order(dimensions: dict[str, DimInfo]) -> list[str]:
 
 
 def _resolve_dimensions(
-    parsed: list[tuple[type[NKIOp], dict[str, str], list[str]]],
+    parsed: list[tuple[type[NKIOp], dict[str, str], dict, list[str]]],
     per_op_axis_maps: list[dict[str, str]],
     per_op_blocking: list[set[str]],
     dim_sizes: dict[str, int],
 ) -> dict[str, DimInfo]:
     """Compute ``DimInfo`` per dim: tile size = min of per-op limits; role from blocking."""
     per_dim_tile: dict[str, int] = {}
-    for (op_cls, _, _), axis_map in zip(parsed, per_op_axis_maps):
+    for (op_cls, _, _, _), axis_map in zip(parsed, per_op_axis_maps):
         for abstract_axis, limit in op_cls.TILE_LIMITS.items():
             if abstract_axis not in axis_map:
                 continue
@@ -157,14 +157,14 @@ def _resolve_dimensions(
 
 
 def _collect_used_tensors(
-    parsed: list[tuple[type[NKIOp], dict[str, str], list[str]]],
+    parsed: list[tuple[type[NKIOp], dict[str, str], dict, list[str]]],
     param_names: list[str],
     return_name: str,
     tensors: dict[str, _Tensor],
 ) -> set[str]:
     """Names referenced as inputs anywhere + params + return."""
     used: set[str] = {return_name, *param_names}
-    for _op_cls, name_kwargs, _output_names in parsed:
+    for _op_cls, name_kwargs, _op_kwargs, _output_names in parsed:
         for v in name_kwargs.values():
             if v in tensors:
                 used.add(v)
@@ -198,7 +198,7 @@ def _build_physical_buffers(
 
 
 def _build_ops(
-    parsed: list[tuple[type[NKIOp], dict[str, str], list[str]]],
+    parsed: list[tuple[type[NKIOp], dict[str, str], dict, list[str]]],
     per_op_axis_maps: list[dict[str, str]],
     per_op_blocking: list[set[str]],
     tensors: dict[str, _Tensor],
@@ -211,7 +211,9 @@ def _build_ops(
     for p in param_names:
         ops.append(Op(kind=NKILoad.__name__, inputs={"data": p}, outputs=[f"sbuf_{p}"]))
 
-    for (op_cls, name_kwargs, output_names), axis_map, blocking in zip(parsed, per_op_axis_maps, per_op_blocking):
+    for (op_cls, name_kwargs, op_kwargs, output_names), axis_map, blocking in zip(
+        parsed, per_op_axis_maps, per_op_blocking
+    ):
         inputs: dict[str, str] = {
             role: f"sbuf_{name_kwargs[role]}"
             for role in op_cls.OPERAND_AXES
@@ -226,6 +228,7 @@ def _build_ops(
                 outputs=sbuf_outputs,
                 axis_map=dict(axis_map),
                 blocking_dims=set(blocking),
+                kwargs=dict(op_kwargs),
             )
         )
 
@@ -311,15 +314,22 @@ def _create_outputs(
     tensors: dict[str, _Tensor],
     dim_sizes: dict[str, int],
 ) -> None:
-    """Create output tensor records from the op's abstract ``OUTPUT_AXES``."""
+    """Create output tensor records from the op's abstract ``OUTPUT_AXES``.
+
+    Output dtype follows the first tensor operand (elementwise / matmul
+    default), unless the op class overrides it per-output via
+    ``OUTPUT_DTYPES`` — ``NKIActivationReduce`` pins its reduce result
+    to ``float32``.
+    """
     first_slot = next(iter(op_cls.OPERAND_AXES))
     has_first = first_slot in operand_map and operand_map[first_slot] in tensors
-    dtype = (
+    default_dtype = (
         tensors[operand_map[first_slot]].dtype
         if has_first
         else next(t.dtype for t in tensors.values() if t.dtype != "")
     )
-    for oname, (_, output_axes) in zip(output_names, op_cls.OUTPUT_AXES.items()):
+    for oname, (out_slot, output_axes) in zip(output_names, op_cls.OUTPUT_AXES.items()):
         dim_ids = [local[a] for a in output_axes if a in local]
         shape = tuple(dim_sizes[d] for d in dim_ids)
+        dtype = op_cls.OUTPUT_DTYPES.get(out_slot, default_dtype)
         tensors[oname] = _Tensor(oname, shape, dtype, dim_ids)

@@ -30,7 +30,7 @@ class NKIDMATranspose(NKIOp):
     the op's tile limits."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
 
-    def __call__(self, **kwargs: Any) -> Any:
+    def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: ``data.T``."""
         data: np.ndarray = kwargs["data"]
         return data.T

@@ -22,15 +22,30 @@ from nkigym.kernel_ir.types import DimRole
 
 _GADGETS_IMPORT = (
     "from nkigym.codegen.gadgets import (\n"
+    "    activation_block,\n"
+    "    activation_reduce_block,\n"
     "    allocate_buffers,\n"
     "    dma_transpose_block,\n"
     "    load_block,\n"
     "    matmul_block,\n"
     "    memset_buffers,\n"
     "    store_block,\n"
+    "    tensor_scalar_block,\n"
     "    transpose_block,\n"
     ")"
 )
+
+"""Per-op taxonomy for render dispatch:
+
+* ``_LOAD_KINDS``: HBM→SBUF loads, emitted by ``_emit_loads_at_depth``.
+* ``_TRANSPOSE_GADGETS``: map NKIOp kind → gadget name for SBUF→SBUF transposes.
+* ``_REDUCING_KINDS``: ops whose output accumulates across one of their
+  blocking dims — need a memset prologue and a fresh accumulator binding
+  at the prologue depth. Matmul and activation_reduce are both reducers.
+"""
+_LOAD_KINDS = frozenset({"NKILoad"})
+_TRANSPOSE_GADGETS: dict[str, str] = {"NKITranspose": "transpose_block", "NKIDMATranspose": "dma_transpose_block"}
+_REDUCING_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce"})
 
 
 def render_ir(ir: KernelIR) -> str:
@@ -129,55 +144,104 @@ def _emit_body(w: _Writer, ir: KernelIR) -> None:
     allocs = _resolve_allocations(ir)
     matmul_op = _find_matmul_op(ir)
     store_op = _store_op(ir)
+    phases = _assign_op_phases(ir)
 
     _emit_allocs_at_depth(w, allocs, depth=0)
     if allocs and any(info.emission_depth == 0 for info in allocs.values()):
         w.line()
-    _emit_loads_at_depth(w, ir, allocs, depth=0)
-    _maybe_emit_accumulator_prologue(w, ir, allocs, matmul_op, depth=0)
+    _emit_loads_at_depth(w, ir, allocs, phase=0, depth=0)
+    _maybe_emit_reducer_prologue(w, ir, allocs, phases, depth=0)
 
-    _emit_loop_nest(w, ir, allocs, matmul_op, store_op, dim_idx=0)
+    _emit_loop_nest(w, ir, allocs, matmul_op, store_op, phases, dim_idx=0)
 
 
 def _emit_loop_nest(
-    w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], matmul_op: Op, store_op: Op, dim_idx: int
+    w: _Writer,
+    ir: KernelIR,
+    allocs: dict[str, _BufAlloc],
+    matmul_op: Op,
+    store_op: Op,
+    phases: "_PhaseMap",
+    dim_idx: int,
 ) -> None:
     """Recursively emit ``for i_block_<d> in range(...)`` in ``dim_order``.
 
+    Innermost-ACC-dim sibling loops: when the current dim hosts ACC
+    reducers AND the compute graph spans multiple phases, emit one loop
+    per phase with inter-phase closures (post_op) between them.
+    Non-innermost depths keep the single-loop structure.
+
     At each depth:
     * Emit allocations whose ``emission_depth == dim_idx``.
-    * Bind + memset the accumulator slot at the accumulator's prologue depth.
+    * Bind + memset reducer-output slots at the prologue depth.
     * Emit loads at their required depth.
     * Recurse.
     * Fire the store at the depth immediately outside all ACCUMULATION
-      loops (``= _store_emission_depth``). Output dims that live outside
-      the ACC loops contribute per-block slices; those nested inside
-      (and thus already closed) contribute full-extent slices.
+      loops (``= _store_emission_depth``).
     """
     if dim_idx == len(ir.dim_order):
-        _emit_compute_ops(w, ir, allocs)
+        """Innermost level — emit all phase-0 compute ops. Multi-phase
+        emission happens one level up (see ``_emit_phases_at_inner_depth``)."""
+        _emit_compute_ops(w, ir, allocs, _ops_in_phase(ir, phases, phase=0))
         return
 
     dim = ir.dim_order[dim_idx]
-    w.line(f"for i_block_{dim} in range({ir.num_blocks(dim)}):")
-    w.indent()
+    max_phase = max(phases.op_phase.values(), default=0)
+    is_phase_split_depth = max_phase > 0 and dim == _phase_split_dim(ir, phases)
 
-    _emit_allocs_at_depth(w, allocs, depth=dim_idx + 1)
-    _maybe_emit_accumulator_prologue(w, ir, allocs, matmul_op, dim_idx + 1)
-    _emit_loads_at_depth(w, ir, allocs, dim_idx + 1)
-    _emit_loop_nest(w, ir, allocs, matmul_op, store_op, dim_idx + 1)
+    if is_phase_split_depth:
+        _emit_phases_at_inner_depth(w, ir, allocs, matmul_op, store_op, phases, dim_idx)
+    else:
+        w.line(f"for i_block_{dim} in range({ir.num_blocks(dim)}):")
+        w.indent()
+        _emit_allocs_at_depth(w, allocs, depth=dim_idx + 1)
+        _maybe_emit_reducer_prologue(w, ir, allocs, phases, dim_idx + 1)
+        _emit_loads_at_depth(w, ir, allocs, phase=0, depth=dim_idx + 1)
+        _emit_loop_nest(w, ir, allocs, matmul_op, store_op, phases, dim_idx + 1)
+        w.dedent()
 
-    w.dedent()
-
-    """Store placement: fire when we close the loop immediately outside
-    the first ACC dim (i.e. right after the outermost ACC loop finishes
-    and we're still inside any enclosing non-ACC loops whose indices the
-    store slice needs).
-    """
     store_depth = _store_emission_depth(ir)
     if dim_idx == store_depth:
         open_loops = ir.dim_order[:store_depth]
         _emit_store(w, ir, allocs, store_op, matmul_op, open_loops)
+
+
+def _emit_phases_at_inner_depth(
+    w: _Writer,
+    ir: KernelIR,
+    allocs: dict[str, _BufAlloc],
+    matmul_op: Op,
+    store_op: Op,
+    phases: "_PhaseMap",
+    dim_idx: int,
+) -> None:
+    """Emit one sibling ``for i_block_<dim>`` loop per phase at the innermost depth.
+
+    Between phase N and phase N+1, emit any reducer-closure ops (post_op
+    activation) whose reducer lives in phase N — those run after the
+    phase-N loop closes and before the phase-N+1 loop opens.
+
+    Allocations whose ``emission_depth == dim_idx+1`` are emitted once
+    before the first sibling loop — they're shared across all phases.
+    Reducer prologues (bind + memset) also emit once, before the first
+    sibling loop.
+    """
+    dim = ir.dim_order[dim_idx]
+    _emit_allocs_at_depth(w, allocs, depth=dim_idx + 1)
+    _maybe_emit_reducer_prologue(w, ir, allocs, phases, dim_idx + 1)
+
+    max_phase = max(phases.op_phase.values(), default=0)
+    _ = matmul_op, store_op
+    for phase in range(max_phase + 1):
+        phase_ops = _ops_in_phase(ir, phases, phase)
+        if not phase_ops and not _has_phase_loads(ir, phases, phase):
+            continue
+        w.line(f"for i_block_{dim} in range({ir.num_blocks(dim)}):")
+        w.indent()
+        _emit_loads_at_depth(w, ir, allocs, phase=phase, depth=dim_idx + 1)
+        _emit_compute_ops(w, ir, allocs, phase_ops)
+        w.dedent()
+        _emit_phase_closures(w, ir, allocs, phases, phase)
 
 
 def _store_emission_depth(ir: KernelIR) -> int:
@@ -204,24 +268,213 @@ def _find_matmul_op(ir: KernelIR) -> Op:
     raise ValueError("KernelIR has no NKIMatmul op")
 
 
-_TRANSPOSE_GADGETS: dict[str, str] = {"NKITranspose": "transpose_block", "NKIDMATranspose": "dma_transpose_block"}
+def _find_reducing_ops(ir: KernelIR) -> list[Op]:
+    """Ops whose output accumulates across a blocking dim — need memset + prologue.
 
-
-def _emit_compute_ops(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc]) -> None:
-    """Emit every non-Load/non-Store op at the innermost loop body.
-
-    Walks ``ir.ops`` in list order (producer before consumer thanks to
-    topological construction in ``build_ir``). Dispatches by kind.
-    Fused HBM-sourced ``NKIDMATranspose`` ops are emitted by
-    ``_emit_loads_at_depth`` instead — skipped here.
+    Matmul reduces along K; ``NKIActivationReduce`` reduces along F. Both
+    produce an accumulator SBUF that must be zeroed before the first
+    innermost iteration and is live across every iteration of the
+    reducing dim's loop.
     """
+    return [op for op in ir.ops if op.kind in _REDUCING_KINDS]
+
+
+"""────────────────────────────────────────────────────────────────
+Phase analysis — split compute ops into reduce-closure phases.
+────────────────────────────────────────────────────────────────"""
+
+
+@dataclass
+class _PhaseMap:
+    """Per-op phase labels for rendering.
+
+    A phase is a maximal set of ops that can share a single sibling
+    ``for i_block_<inner_dim>`` loop at the innermost depth. Transitions
+    between phases are caused by reducers whose closed output is
+    consumed by a downstream op that does *not* block on the same
+    dim — classic ``NKIActivationReduce(F→SEQUENTIAL) → NKITensorScalar``
+    pattern.
+
+    Attributes:
+        op_phase: Map from Op id → integer phase label.
+        phase_closers: Map from phase → list of reducer ops whose
+            ``post_op`` closure must fire between that phase's loop
+            and the next phase's loop.
+    """
+
+    op_phase: dict[int, int]
+    phase_closers: dict[int, list[Op]]
+
+
+def _phase_split_dim(ir: KernelIR, phases: _PhaseMap) -> str:
+    """The dim whose innermost loop hosts the phase split.
+
+    For sibling-loop rendering we open one loop per phase at this dim's
+    depth. The dim is the one blocked by the phase-closing reducer —
+    e.g. ``NKIActivationReduce`` with ``F=d1`` blocks on d1, so we split
+    at d1's depth.
+
+    Assumption (enforced): every phase-closing reducer in the graph
+    shares the same single blocking dim. Multi-dim reducers aren't
+    supported yet; ``NotImplementedError`` surfaces the constraint.
+    """
+    split_dims: set[str] = set()
+    for ops in phases.phase_closers.values():
+        for op in ops:
+            split_dims.update(op.blocking_dims)
+    if len(split_dims) != 1:
+        raise NotImplementedError(
+            f"phase-split requires exactly one shared blocking dim across closers; got {split_dims}"
+        )
+    return next(iter(split_dims))
+
+
+def _assign_op_phases(ir: KernelIR) -> _PhaseMap:
+    """Topologically assign each op a phase number for sibling-loop emission.
+
+    Rule: an op's phase = max(phase of its producer ops) + bump, where
+    ``bump = 1`` iff any producer is a reducer (in ``_REDUCING_KINDS``)
+    whose blocking dim is not also blocked by this consumer. That is:
+    "consumer needs reducer's closed result" ⇒ consumer must run after
+    the reducer's loop closes ⇒ new phase.
+
+    Matmul is a reducer, but store (its direct consumer) is an HBM op
+    that already fires outside the innermost ACC loop via
+    ``_store_emission_depth`` — it never triggers a phase bump.
+    """
+    op_phase: dict[int, int] = {}
+    producer: dict[str, Op] = {}
     for op in ir.ops:
+        for out in op.outputs:
+            producer[out] = op
+
+    phase_closers: dict[int, list[Op]] = {}
+    for op in ir.ops:
+        if op.kind == "NKIStore":
+            op_phase[id(op)] = 0
+            continue
+        own_phase = 0
+        for tname in op.inputs.values():
+            prod = producer.get(tname)
+            if prod is None:
+                continue
+            prod_phase = op_phase.get(id(prod), 0)
+            bump = 0
+            if prod.kind in _REDUCING_KINDS and not (prod.blocking_dims & op.blocking_dims):
+                bump = 1
+                phase_closers.setdefault(prod_phase, [])
+                if prod not in phase_closers[prod_phase]:
+                    phase_closers[prod_phase].append(prod)
+            own_phase = max(own_phase, prod_phase + bump)
+        op_phase[id(op)] = own_phase
+    return _PhaseMap(op_phase=op_phase, phase_closers=phase_closers)
+
+
+def _ops_in_phase(ir: KernelIR, phases: _PhaseMap, phase: int) -> list[Op]:
+    """Non-load, non-store ops labelled with ``phase``."""
+    result: list[Op] = []
+    for op in ir.ops:
+        if op.kind in _LOAD_KINDS or op.kind == "NKIStore":
+            continue
+        if op.kind == "NKIDMATranspose" and op.inputs.get("data") in ir.param_names:
+            continue
+        if phases.op_phase.get(id(op), 0) == phase:
+            result.append(op)
+    return result
+
+
+def _has_phase_loads(ir: KernelIR, phases: _PhaseMap, phase: int) -> bool:
+    """True iff any HBM-load op should fire inside the ``phase`` sibling loop.
+
+    Loads without a direct reducer-fed consumer belong in phase 0; loads
+    feeding only phase-N ops (N > 0) would belong in phase N. In
+    practice for rmsnorm+matmul, every load is consumed in phase 0
+    (NKIActivationReduce consumes lhs, matmul consumes lhs_T which is
+    phase-1 but the raw load still sits in phase 0 per how we bind
+    cur_sbuf_lhs within both sibling loops). This predicate is used to
+    decide whether to open an otherwise-empty phase loop.
+    """
+    _ = phases, phase
+    return False
+
+
+def _emit_phase_operand_rebindings(
+    w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], phases: _PhaseMap, phase_ops: list[Op], loads_emitted: bool
+) -> None:
+    """Re-bind ``cur_<name>`` for every input buffer the phase's ops read.
+
+    Buffers whose rotation-slot or block-index depends on the phase-
+    split dim would otherwise keep a stale binding from the prior
+    phase's final iteration. When ``loads_emitted`` is True, the loads
+    themselves already bound ``cur_<name>`` for their destinations —
+    skip those to avoid duplicates.
+    """
+    _ = phases
+    already: set[str] = set()
+    if loads_emitted:
+        for op in ir.ops:
+            if op.kind == "NKILoad":
+                already.add(op.outputs[0])
+            if op.kind == "NKIDMATranspose" and op.inputs.get("data") in ir.param_names:
+                already.add(op.outputs[0])
+    seen: set[str] = set()
+    for op in phase_ops:
+        for tname in op.inputs.values():
+            if tname in already or tname in seen or tname not in allocs:
+                continue
+            seen.add(tname)
+            info = allocs[tname]
+            w.line(f"{_cur_name(tname)} = {tname}{_rotation_index(info)}")
+
+
+def _emit_phase_closures(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], phases: _PhaseMap, phase: int) -> None:
+    """Emit ``activation_block(post_op)`` for every reducer closing phase ``phase``.
+
+    Fires between the phase-N sibling loop's dedent and the phase-(N+1)
+    loop's open. Only ``NKIActivationReduce`` with a ``post_op`` kwarg
+    emits code here; other reducers leave their accumulator unchanged.
+    """
+    _ = ir
+    for op in phases.phase_closers.get(phase, []):
+        if op.kind != "NKIActivationReduce":
+            continue
+        post_op = op.kwargs.get("post_op")
+        if post_op is None:
+            continue
+        out_name = op.outputs[0]
+        info = allocs[out_name]
+        cur = _cur_name(out_name)
+        scale = op.kwargs.get("scale", 1.0)
+        bias = op.kwargs.get("bias", 0.0)
+        scale_repr = _scale_bias_repr(scale)
+        bias_repr = _scale_bias_repr(bias)
+        w.line(f"activation_block({cur}, {cur}, op=nl.{post_op}, scale={scale_repr}, bias={bias_repr})")
+        _ = info
+
+
+def _scale_bias_repr(v: float) -> str:
+    """Render a float literal for the emitted source."""
+    return repr(v)
+
+
+def _emit_compute_ops(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], ops: list[Op]) -> None:
+    """Emit the compute ops in ``ops`` at the current loop depth.
+
+    Loads are handled by ``_emit_loads_at_depth`` (depth-aware, emit once
+    per enclosing-dim binding). ``NKIStore`` is emitted by ``_emit_store``
+    after the reducing loops close. Every other op dispatches by kind.
+    """
+    for op in ops:
         if op.kind in _TRANSPOSE_GADGETS:
             if op.kind == "NKIDMATranspose" and op.inputs["data"] in ir.param_names:
                 continue
             _emit_transpose(w, ir, allocs, op, _TRANSPOSE_GADGETS[op.kind])
         elif op.kind == "NKIMatmul":
             _emit_matmul(w, ir, allocs, op)
+        elif op.kind == "NKIActivationReduce":
+            _emit_activation_reduce(w, ir, allocs, op)
+        elif op.kind == "NKITensorScalar":
+            _emit_tensor_scalar(w, ir, allocs, op)
 
 
 def _emit_transpose(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op, gadget: str) -> None:
@@ -419,27 +672,29 @@ Accumulator prologue
 ────────────────────────────────────────────────────────────────"""
 
 
-def _maybe_emit_accumulator_prologue(
-    w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], matmul_op: Op, depth: int
+def _maybe_emit_reducer_prologue(
+    w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], phases: _PhaseMap, depth: int
 ) -> None:
     """Emit ``cur_<acc> = <acc>[...]; memset_buffers(cur_<acc>, 0.0)``
-    at the depth where the accumulator's rotation slot first resolves.
+    for every reducing op whose accumulator's slot first resolves at
+    ``depth``.
 
-    Fires just inside the deepest non-ACC loop whose index appears in
-    the accumulator's rotation (i.e. the slot is stable from here down
-    through every ACC iteration). If the accumulator has no non-ACC
-    rotation and no ACC-rotation either, it fires at depth 0.
+    Covers matmul *and* activation_reduce. 1D reduce outputs (f_axis=None)
+    memset at ``(p_tile, 1)`` — handled the same way via the flat
+    leaf-list contract.
     """
-    out_name = matmul_op.outputs[0]
-    info = allocs[out_name]
-    if depth != _accumulator_prologue_depth(ir, matmul_op, info):
-        return
-    cur = _cur_name(out_name)
-    w.line(f"{cur} = {out_name}{_rotation_index(info)}")
-    w.line(f"memset_buffers({cur}, 0.0)")
+    _ = phases
+    for op in _find_reducing_ops(ir):
+        out_name = op.outputs[0]
+        info = allocs[out_name]
+        if depth != _accumulator_prologue_depth(ir, op, info):
+            continue
+        cur = _cur_name(out_name)
+        w.line(f"{cur} = {out_name}{_rotation_index(info)}")
+        w.line(f"memset_buffers({cur}, 0.0)")
 
 
-def _accumulator_prologue_depth(ir: KernelIR, matmul_op: Op, info: "_BufAlloc") -> int:
+def _accumulator_prologue_depth(ir: KernelIR, reducing_op: Op, info: "_BufAlloc") -> int:
     """Depth where the accumulator's ``cur_<name>`` slot binding fires.
 
     Same rule as ``_load_emission_depth``: ``1 + max(dim_order.index(d))``
@@ -451,7 +706,7 @@ def _accumulator_prologue_depth(ir: KernelIR, matmul_op: Op, info: "_BufAlloc") 
     When no axes are block-indexed (OUTER scope), the prologue fires at
     depth 0 (unconditionally, before any loop opens).
     """
-    _ = matmul_op
+    _ = reducing_op
     block_axes = _block_indexed_axes(ir, info)
     if not block_axes:
         return 0
@@ -482,7 +737,7 @@ Load emission
 ────────────────────────────────────────────────────────────────"""
 
 
-def _emit_loads_at_depth(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], depth: int) -> None:
+def _emit_loads_at_depth(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], phase: int, depth: int) -> None:
     """Emit every HBM-sourced op whose destination buffer wants to appear here.
 
     That's ``NKILoad`` always, plus ``NKIDMATranspose`` ops whose
@@ -490,7 +745,14 @@ def _emit_loads_at_depth(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc],
     load-transposes. Each fires at the depth equal to ``1 +`` the
     deepest ``dim_order`` position of any of its destination buffer's
     rotating block axes.
+
+    Each phase reloads the buffers it consumes. When the default IR
+    has no rotation, phase-1 would otherwise see stale data from
+    phase-0's final iteration; reloading is always correct and cheap
+    (loads are DMA-backed). Phase-level dead-load elimination can come
+    later once rotation analysis is plumbed through.
     """
+    _ = phase
     for op in ir.ops:
         is_plain_load = op.kind == "NKILoad"
         is_fused_dma_transpose = op.kind == "NKIDMATranspose" and op.inputs.get("data") in ir.param_names
@@ -596,6 +858,88 @@ def _axis_slice(ir: KernelIR, axis: str, info: _BufAlloc) -> str:
     if extent >= full or axis not in ir.dim_order:
         return f"0:{full}"
     return f"i_block_{axis} * {extent} : i_block_{axis} * {extent} + {extent}"
+
+
+"""────────────────────────────────────────────────────────────────
+Activation-reduce / tensor-scalar emission.
+────────────────────────────────────────────────────────────────"""
+
+
+def _emit_activation_reduce(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
+    """Emit ``activation_reduce_block(cur_red, cur_data, op=..., reduce_op=...)``.
+
+    ``post_op`` / ``scale`` / ``bias`` kwargs apply once the reducing
+    loop closes — emitted by :func:`_emit_phase_closures`. Here we just
+    do one accumulation step per iteration.
+    """
+    src = op.inputs["data"]
+    dst = op.outputs[0]
+    dst_info = allocs[dst]
+    src_info = allocs[src]
+    _ = dst_info, src_info
+    """``cur_<dst>`` was already bound by the reducer prologue outside
+    the innermost loop — re-binding here would shadow the memset."""
+    cur_dst = _cur_name(dst)
+    cur_src = _cur_name(src)
+    act = op.kwargs.get("op", "copy")
+    red = op.kwargs.get("reduce_op", "add")
+    src_expr = _tensor_scalar_operand_slice(ir, src_info, base=cur_src)
+    w.line(f"activation_reduce_block({cur_dst}, {src_expr}, op=nl.{act}, reduce_op=nl.{red})")
+
+
+def _emit_tensor_scalar(w: _Writer, ir: KernelIR, allocs: dict[str, _BufAlloc], op: Op) -> None:
+    """Emit ``tensor_scalar_block(cur_dst, cur_data, cur_operand0, op=...)``.
+
+    ``operand0`` is a ``(P,)`` per-row vector. Data + output are
+    ``(P, F)`` tiles sliced down to one block on each of their axes
+    (matches the transpose-operand slicing rule).
+    """
+    src = op.inputs["data"]
+    operand = op.inputs["operand0"]
+    dst = op.outputs[0]
+    dst_info = allocs[dst]
+    src_info = allocs[src]
+    op_info = allocs[operand]
+    cur_dst = _cur_name(dst)
+    cur_src = _cur_name(src)
+    cur_op = _cur_name(operand)
+    w.line(f"{cur_dst} = {dst}{_rotation_index(dst_info)}")
+    dst_expr = _tensor_scalar_operand_slice(ir, dst_info, base=cur_dst)
+    src_expr = _tensor_scalar_operand_slice(ir, src_info, base=cur_src)
+    operand_expr = _broadcast_operand_slice(ir, op_info, base=cur_op)
+    math_op = op.kwargs.get("op", "multiply")
+    w.line(f"tensor_scalar_block({dst_expr}, {src_expr}, {operand_expr}, op=nl.{math_op})")
+
+
+def _tensor_scalar_operand_slice(ir: KernelIR, info: _BufAlloc, base: str) -> str:
+    """Narrow a (P, F) operand down to one block on each axis, by-leaf on F."""
+    buf = info.buf
+    expr = base
+    p_lt = ir.ltiles_per_block.get(buf.p_axis, 1)
+    if info.num_p_tiles > p_lt:
+        expr = f"{expr}[i_block_{buf.p_axis} * {p_lt} : i_block_{buf.p_axis} * {p_lt} + {p_lt}]"
+    if buf.f_axis is not None:
+        f_lt = ir.ltiles_per_block.get(buf.f_axis, 1)
+        if info.num_f_tiles > f_lt:
+            f_width = info.f_tile * f_lt
+            expr = (
+                f"[leaf[:, i_block_{buf.f_axis} * {f_width} : i_block_{buf.f_axis} * {f_width} + {f_width}] "
+                f"for leaf in {expr}]"
+            )
+    return expr
+
+
+def _broadcast_operand_slice(ir: KernelIR, info: _BufAlloc, base: str) -> str:
+    """``operand0`` for ``tensor_scalar_block`` — a (P,) per-row vector.
+
+    Only the P-axis may need per-block slicing; there's no F axis.
+    """
+    buf = info.buf
+    expr = base
+    p_lt = ir.ltiles_per_block.get(buf.p_axis, 1)
+    if info.num_p_tiles > p_lt:
+        expr = f"{expr}[i_block_{buf.p_axis} * {p_lt} : i_block_{buf.p_axis} * {p_lt} + {p_lt}]"
+    return expr
 
 
 """────────────────────────────────────────────────────────────────

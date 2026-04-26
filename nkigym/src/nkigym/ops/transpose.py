@@ -27,7 +27,7 @@ class NKITranspose(NKIOp):
     We target Tensor Engine, so both axes are capped at 128."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
 
-    def __call__(self, **kwargs: Any) -> Any:
+    def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: ``data.T``."""
         data: np.ndarray = kwargs["data"]
         return data.T

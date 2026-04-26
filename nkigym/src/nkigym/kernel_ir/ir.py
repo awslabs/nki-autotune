@@ -74,6 +74,11 @@ class Op:
         axis_map: Abstract axis label → dim id, e.g. ``{"K": "d0"}``.
         blocking_dims: Dim ids this op iterates over as inner loops
             (e.g. the K reduction axis for matmul).
+        kwargs: Scalar-literal keyword arguments captured from the
+            nkigym call site — ``op='square'``, ``reduce_op='add'``,
+            ``post_op='rsqrt'``, ``scale=1/2048``, ``bias=1e-6``, etc.
+            Tensor-valued kwargs live in ``inputs``; scalar literals
+            live here.
         attrs: Per-op free-form attributes — rewrite-owned. Notable key:
             * ``transpose`` (on ``NKILoad``) — when ``True`` the load
               emits ``load_block(..., transpose=True)`` and the
@@ -86,6 +91,7 @@ class Op:
     outputs: list[str] = field(default_factory=list)
     axis_map: dict[str, str] = field(default_factory=dict)
     blocking_dims: set[str] = field(default_factory=set)
+    kwargs: dict[str, Any] = field(default_factory=dict)
     attrs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -192,6 +198,9 @@ def _format_kernel_ir(ir: "KernelIR") -> str:
         inputs = ", ".join(f"{k}={v}" for k, v in op.inputs.items())
         outputs = ", ".join(op.outputs)
         extras: list[str] = []
+        if op.kwargs:
+            kw_str = ",".join(f"{k}={v!r}" for k, v in op.kwargs.items())
+            extras.append(f"kwargs={{{kw_str}}}")
         if op.blocking_dims:
             extras.append(f"blocking={{{','.join(sorted(op.blocking_dims))}}}")
         if op.axis_map:

@@ -24,7 +24,7 @@ class NKIMatmul(NKIOp):
     BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset({"K"})
     TILE_LIMITS: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": MATMUL_FREE_MAX}
 
-    def __call__(self, **kwargs: Any) -> Any:
+    def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: ``stationary.T @ moving``."""
         stationary: np.ndarray = kwargs["stationary"]
         moving: np.ndarray = kwargs["moving"]

@@ -19,7 +19,7 @@ class NKIStore(NKIOp):
     partition axis (128) — the free axis is unbounded."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
 
-    def __call__(self, **kwargs: Any) -> Any:
+    def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: identity pass-through."""
         data: np.ndarray = kwargs["data"]
         return data
