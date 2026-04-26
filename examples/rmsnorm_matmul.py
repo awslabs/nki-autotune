@@ -1,10 +1,9 @@
-"""Vanilla rmsnorm(lhs) @ rhs — KernelIR + renderer end-to-end.
+"""Vanilla rmsnorm(lhs) @ rhs — KernelIR + renderer end-to-end with sampling.
 
 Defines the nkigym math function for rmsnorm+matmul, builds the
-baseline IR, overlays a known-good knob set (canonical ``dim_order`` of
-``[d2, d0, d1]`` that puts the reducing dim innermost), renders to NKI
-source, and profiles on gym. A numpy baseline runs through the nkipy
-baremetal path for an MFU reference point.
+baseline IR, samples N random knob configurations, renders each one,
+and profiles them in parallel across hosts. A plain-numpy equivalent
+ships through nkipy + neuronx-cc as the zero-NKI reference baseline.
 
 Usage::
 
@@ -22,6 +21,7 @@ from autotune.runner.remote import remote_numpy_baseline
 from autotune.runner.types import KernelJob
 from nkigym.codegen import render_ir
 from nkigym.kernel_ir import build_ir
+from nkigym.kernel_ir.sample import knob_signature, sample
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.tensor_scalar import NKITensorScalar
@@ -62,24 +62,39 @@ if __name__ == "__main__":
     ATOL, RTOL = 1e-2, 1e-2
 
     INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-    CACHE_ROOT = Path("/home/ubuntu/cache/rmsnorm_matmul")
+    CACHE_ROOT = Path("/home/ubuntu/cache/rmsnorm_matmul_sampling")
     shutil.rmtree(CACHE_ROOT, ignore_errors=True)
     CACHE_ROOT.mkdir(parents=True)
 
-    ir = build_ir(rmsnorm_matmul_nkigym, INPUT_SPECS)
-    """Canonical working knob set — ACC dim d1 innermost in dim_order so
-    the phase-split sibling loops fire at the rightmost depth."""
-    ir.dim_order = ["d2", "d0", "d1"]
-    source = inline_gadgets(render_ir(ir))
+    base_ir = build_ir(rmsnorm_matmul_nkigym, INPUT_SPECS)
 
     mac_count = compute_mac_count(rmsnorm_matmul_nkigym, INPUT_SPECS)
     nkigym_source = func_source_with_imports(rmsnorm_matmul_nkigym)
-    output_shape = tuple(ir.logical_tensors[ir.return_name].shape)
+    output_shape = tuple(base_ir.logical_tensors[base_ir.return_name].shape)
 
-    kernels = {
-        "rmsnorm_matmul.py": KernelJob(
+    num_samples = 20
+    seen: set[tuple] = set()
+    kernels: dict[str, KernelJob] = {}
+    render_failures: list[tuple[int, str]] = []
+    for i in range(num_samples):
+        try:
+            candidate = sample(base_ir)
+        except Exception as e:
+            render_failures.append((i, f"sample: {type(e).__name__}: {e}"))
+            continue
+        sig = knob_signature(candidate)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        try:
+            source = inline_gadgets(render_ir(candidate))
+        except Exception as e:
+            render_failures.append((i, f"render: {type(e).__name__}: {e}"))
+            continue
+        kernel_name = f"sample_{i}.py"
+        kernels[kernel_name] = KernelJob(
             source=source,
-            func_name=ir.func_name,
+            func_name=candidate.func_name,
             output_shape=output_shape,
             input_specs=INPUT_SPECS,
             nkigym_source=nkigym_source,
@@ -89,15 +104,13 @@ if __name__ == "__main__":
             rtol=RTOL,
             neuronx_cc_args=("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false"),
         )
-    }
-    dump_ir(CACHE_ROOT, "rmsnorm_matmul.py", ir)
+        dump_ir(CACHE_ROOT, kernel_name, candidate)
+
+    print(f"sampled {len(kernels)} unique IRs, {len(render_failures)} render failures")
+    for i, err in render_failures[:10]:
+        print(f"  sample {i}: {err}")
 
     output = remote_profile(kernels=kernels, hosts=HOSTS, cache_dir=str(CACHE_ROOT))
-    for r in output.results:
-        print(
-            f"{r.kernel_name}: sim={r.cpu_sim.get('passed')}  min_ms={r.min_ms}  MFU={r.mfu}  "
-            f"mbu={r.mbu_estimated_percent}  roof={r.roofline_efficiency}"
-        )
 
     baseline = remote_numpy_baseline(
         func=rmsnorm_matmul_numpy,

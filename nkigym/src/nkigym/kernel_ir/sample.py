@@ -104,10 +104,55 @@ def sample(ir: KernelIR, rng: random.Random | None = None) -> KernelIR:
 
 
 def sample_dim_order(ir: KernelIR, rng: random.Random) -> list[str]:
-    """One random permutation of ``ir.dimensions`` — ``N!`` options."""
+    """One random permutation of ``ir.dimensions`` that passes
+    :func:`validate._check_reducer_inner_dims`.
+
+    A reducer's blocking dim must have every inner dim of ``dim_order``
+    (positions ≥ its own) be either a blocking_dim or an output dim of
+    that reducer. Otherwise the mechanical renderer opens a loop for
+    an unused inner dim and the reducer re-accumulates on every step.
+
+    We filter by enumerating all ``N!`` permutations and keeping the
+    valid ones — cheap for ``N ≤ 5``, and rmsnorm/matmul sit at ``N=3``.
+    """
     dims = list(ir.dimensions)
-    rng.shuffle(dims)
-    return dims
+    import itertools
+
+    candidates = [list(p) for p in itertools.permutations(dims)]
+    valid = [p for p in candidates if _dim_order_respects_reducer_inner_dims(ir, p)]
+    if not valid:
+        raise RuntimeError("sample_dim_order: no permutation satisfies reducer_inner_dims invariant")
+    return rng.choice(valid)
+
+
+def _dim_order_respects_reducer_inner_dims(ir: KernelIR, dim_order: list[str]) -> bool:
+    """True iff every reducer's inner dims are all used by the reducer.
+
+    Mirrors :func:`validate._check_reducer_inner_dims` but takes the
+    candidate ``dim_order`` directly so we can filter permutations
+    before committing to one.
+    """
+    for op in ir.ops:
+        if op.kind not in _REDUCER_KINDS or not op.outputs:
+            continue
+        positions = [dim_order.index(d) for d in op.blocking_dims if d in dim_order]
+        if not positions:
+            continue
+        first_blocking = min(positions)
+        out_name = op.outputs[0]
+        out_dims = set(ir.physical_buffers[out_name].dim_ids) if out_name in ir.physical_buffers else set()
+        used = set(op.blocking_dims) | out_dims
+        for i, d in enumerate(dim_order):
+            if i < first_blocking:
+                continue
+            if d not in used:
+                return False
+    return True
+
+
+_REDUCER_KINDS = frozenset({"NKIMatmul", "NKIActivationReduce"})
+"""Must match :data:`nkigym.codegen.render._REDUCING_KINDS` — keeping
+this local so the sampler has no import dependency on render."""
 
 
 def sample_ltiles_per_block(ir: KernelIR, rng: random.Random) -> dict[str, int]:
