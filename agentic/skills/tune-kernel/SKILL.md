@@ -7,20 +7,23 @@ Tunes one nkigym kernel by editing `KernelIR` knobs and measuring on Trainium. G
 
 **Goal: reach `TARGET_MFU` (set by the user in `workload.py`).** The skill keeps iterating — new rewrite variants, new knob sweeps, new batches — until the running-best MFU (see `summary.json → tuning.batch_<latest>.mfu`) is ≥ `TARGET_MFU`. That MFU threshold is the one and only stop criterion.
 
+**No peeking.** The only allowed kernel source the agent may read is the rendered `.py` files produced by its own `submit_batch` calls under `<CACHE_ROOT>/batch_*/`. Do NOT read, search, grep, or otherwise inspect any other kernel source — including but not limited to the nkipy baseline kernel file, hand-tuned kernels, worked-out tuning examples, champion archives, prior tuning caches, or any file under a `kernel_library/`, `examples/`, or similar directory. Tuning must be derived from IR semantics and measurement feedback only.
+
+**No stray files outside `<CACHE_ROOT>/`.** Any driver / helper file the skill writes (e.g. `tune_driver.py`, `run.py`, `tune_loop.py`) MUST live under `<CACHE_ROOT>/` — never in the repo, the user's home directory, `/tmp`, or anywhere else. Short snippets can also be run via `python -c '...'`, a heredoc, or an interactive REPL; if a driver file is useful (e.g. for the Step 8 iterate-until-target loop), put it at `<CACHE_ROOT>/tune_driver.py` or similar. The only files written outside the driver itself are those produced by `dump_baseline` and `submit_batch` under `<CACHE_ROOT>/`.
+
 ## Reference material
 
 - `nkigym/src/nkigym/kernel_ir/ir.py` — dataclasses (`KernelIR`, `Op`, `PhysicalBuffer`, `BufferScope`, `NumBuffers`)
 - `nkigym/src/nkigym/kernel_ir/build.py` — `build_ir` parser
 - `nkigym/src/nkigym/kernel_ir/validate.py` — `is_valid(ir)` gate
-- `nkigym/src/nkigym/kernel_ir/rewrites/` — available graph rewrites
-- `nkigym/src/nkigym/ops/<op>.py` — gadget + op class for each NKIOp
+- `nkigym/src/nkigym/kernel_ir/rewrites/` — available graph rewrites (read rewrite *mechanics* only; do not read any example IRs or test kernels bundled alongside)
+- `nkigym/src/nkigym/ops/<op>.py` — op class for each NKIOp
 - `nkigym/src/nkigym/codegen/render.py` — how knobs map to emitted code
 - `autotune/src/autotune/runner/tune_session.py` — `dump_baseline`, `submit_batch` for this skill
 - `autotune/src/autotune/runner/api.py` — `remote_profile` one-shot entry
 - `autotune/src/autotune/runner/remote.py` — `RemoteProfiler`, `remote_numpy_baseline`
 - `/home/ubuntu/venvs/kernel-env/lib/python3.12/site-packages/nki/` — NKI Python API (`isa/`, `language/`, `simulator.py`)
 - `/home/ubuntu/shared_workplace/KaenaCompiler/neuronxcc` — compiler source
-- `/home/ubuntu/shared_workplace/KaenaNeuronKernelLibrary` — hand-written reference kernels
 
 ## Invocation
 
@@ -101,11 +104,10 @@ print(f"nkipy: {baseline.mfu:.3f}%  {baseline.min_ms:.4f} ms  target: {TARGET_MF
 
 `dump_baseline` runs the numpy function through `nkipy` + `neuronx-cc` on one host and writes:
 
-- `<CACHE_ROOT>/nkipy_baseline/nkipy_baseline.py` — compiler-emitted NKI source
 - `<CACHE_ROOT>/nkipy_baseline/baseline.json` — `{source, mfu, min_ms}`
 - `<CACHE_ROOT>/summary.json` — seeded with `function`, `baseline`, `target_mfu`
 
-Read `nkipy_baseline.py` to see the compiler's tiling / buffer layout / instruction choice.
+`dump_baseline` also writes a compiler-emitted NKI source file into `<CACHE_ROOT>/nkipy_baseline/`. Do NOT open or read it — you only consume the baseline MFU / min_ms numbers (from `baseline.json` or `summary.json`) as the comparison target. The baseline kernel source itself is off-limits under the "No peeking" rule.
 
 ## Step 2 — Build the canonical KernelIR
 
@@ -140,7 +142,7 @@ for name, ir in variants.items():
     print(repr(ir))   # physical_buffers + ops differ per variant → knob dicts key off them
 ```
 
-A rewrite leaves the IR unchanged if its pattern isn't present, so always including the rewrite is safe; keeping both `base` and `<rewrite>-applied` versions is what matters. See `examples/matmul_lhs_rhs.py` for the pattern.
+A rewrite leaves the IR unchanged if its pattern isn't present, so always including the rewrite is safe; keeping both `base` and `<rewrite>-applied` versions is what matters.
 
 When sweeping knobs (step 4), produce one set of candidate IRs per variant — the best knob setting under one rewrite configuration is not necessarily the best under another.
 
