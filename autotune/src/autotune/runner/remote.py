@@ -22,12 +22,17 @@ from typing import Any
 
 import numpy as np
 
-from autotune.runner.types import _DEFAULT_VENV_PYTHON, KernelJob, ProfileResult, make_failure
+from autotune.runner.types import _DEFAULT_VENV_PYTHON, KernelJob, ProfileResult, make_failure, profiler_percent
 
 logger = logging.getLogger(__name__)
 
 _AUTOTUNE_ROOT = Path(__file__).parent.parent
 _NKIGYM_ROOT = Path(__file__).resolve().parents[4] / "nkigym" / "src" / "nkigym"
+
+_PROFILE_SUMMARY_FILE = "profile_summary.json"
+_PROFILE_DETAILED_FILE = "profile.json"
+_NEFF_FILE = "file.neff"
+_NTFF_FILE = "profile.ntff"
 
 _worker_bundle_cache: bytes = b""
 
@@ -68,7 +73,7 @@ def _feed_stdin(proc: subprocess.Popen[bytes], bundle_line: bytes, payload: byte
 def _fail_host(results: list[ProfileResult], kernel_names: list[str], error_msg: str) -> None:
     """Append a failure ProfileResult for every kernel assigned to a host."""
     for kname in kernel_names:
-        results.append(make_failure(kname, error_msg, 0))
+        results.append(make_failure(kname, error_msg))
 
 
 _BOOTSTRAP_SCRIPT = (
@@ -145,10 +150,11 @@ def _launch_ssh_workers(
                 "tensor_specs": {name: (list(shape), dt) for name, (shape, dt) in job.input_specs.items()},
                 "nkigym_source": job.nkigym_source,
                 "nkigym_func_name": job.nkigym_func_name,
-                "mac_count": job.mac_count,
                 "atol": job.atol,
                 "rtol": job.rtol,
                 "neuronx_cc_args": list(job.neuronx_cc_args),
+                "skip_cpu_sim": job.skip_cpu_sim,
+                "lnc": job.lnc,
             }
         payload_bytes = json.dumps(payload).encode("utf-8")
 
@@ -273,17 +279,76 @@ def _kernel_sort_key(kernel_name: str) -> tuple[int, int, str]:
     return key
 
 
+def _write_per_kernel_profiles(cache_dir: str, results: list[ProfileResult]) -> None:
+    """Move per-kernel profiler dicts into their subfolders.
+
+    Always writes ``<cache>/<stem>/profile_summary.json``. When the
+    caller enabled ``collect_detailed_profile`` the subfolder also
+    receives ``profile.json`` (full trace dict), ``file.neff`` (compiled
+    binary), and ``profile.ntff`` (raw NTFF trace) so offline
+    ``neuron-profile view`` runs work without a gym host.
+    """
+    for r in results:
+        stem = Path(r.kernel_name).stem
+        variant_dir = os.path.join(cache_dir, stem)
+        os.makedirs(variant_dir, exist_ok=True)
+        if r.profiler_summary is not None:
+            with open(os.path.join(variant_dir, _PROFILE_SUMMARY_FILE), "w") as f:
+                json.dump(r.profiler_summary, f, indent=2)
+        if r.profile_detailed is not None:
+            with open(os.path.join(variant_dir, _PROFILE_DETAILED_FILE), "w") as f:
+                json.dump(r.profile_detailed, f)
+        if r.neff_b64 is not None:
+            with open(os.path.join(variant_dir, _NEFF_FILE), "wb") as f:
+                f.write(base64.b64decode(r.neff_b64))
+        if r.ntff_b64 is not None:
+            with open(os.path.join(variant_dir, _NTFF_FILE), "wb") as f:
+                f.write(base64.b64decode(r.ntff_b64))
+
+
+def _kernel_index_row(
+    r: ProfileResult, total_time_s: float | None, mfu: float | None, mbu: float | None, ceiling: float | None
+) -> dict:
+    """Slim per-kernel index row for results.json — no embedded dicts.
+
+    Sibling paths (``<stem>/profile_summary.json``, ``<stem>/profile.json``)
+    are derivable from ``kernel_name``; not stored.
+    """
+    stem = Path(r.kernel_name).stem
+    return {
+        "kernel_name": r.kernel_name,
+        "kernel_path": f"{stem}/{stem}.py",
+        "cpu_sim_passed": bool(r.cpu_sim.get("passed")),
+        "hardware_output": r.hardware_output,
+        "total_time_s": total_time_s,
+        "mfu_estimated_percent": mfu,
+        "mbu_estimated_percent": mbu,
+        "mfu_max_achievable_estimated_percent": ceiling,
+    }
+
+
 def _write_results_json(
     cache_dir: str, num_kernels: int, results: list[ProfileResult], hosts: list[str], wallclock_s: float
 ) -> None:
-    """Write results.json with metrics and per-kernel data."""
-    successes: list[tuple[ProfileResult, float, float]] = []
+    """Write results.json (index) and split detailed per-kernel JSONs into
+    ``<cache>/<stem>/profile_summary.json`` + ``<cache>/<stem>/profile.json``.
+
+    ``results.json`` keeps only aggregate run-level metrics and a slim
+    one-row-per-kernel index with pointers to the per-kernel files.
+    """
+    _write_per_kernel_profiles(cache_dir, results)
+
+    extracted: dict[str, tuple[float | None, float | None, float | None, float | None]] = {}
     passed_cpu_sim = success = sbuf_oom = psum_oom = 0
     for r in results:
+        total = (r.profiler_summary or {}).get("total_time")
+        total_s = float(total) if isinstance(total, (int, float)) else None
+        mfu = profiler_percent(r.profiler_summary, "mfu_estimated_percent")
+        mbu = profiler_percent(r.profiler_summary, "mbu_estimated_percent")
+        ceiling = profiler_percent(r.profiler_summary, "mfu_max_achievable_estimated_percent")
+        extracted[r.kernel_name] = (total_s, mfu, mbu, ceiling)
         sim_ok = bool(r.cpu_sim.get("passed"))
-        hw_ok = r.min_ms is not None and r.mfu is not None
-        if r.min_ms is not None and r.mfu is not None:
-            successes.append((r, r.min_ms, r.mfu))
+        hw_ok = total_s is not None
         if sim_ok:
             passed_cpu_sim += 1
         if sim_ok and hw_ok:
@@ -292,32 +357,28 @@ def _write_results_json(
             sbuf_oom += 1
         if not hw_ok and "Out of memory in psum" in r.hardware_output:
             psum_oom += 1
-    times = [t for _, t, _ in successes]
-    mfus = [m for _, _, m in successes]
-    roofline_effs = [r.roofline_efficiency for r, _, _ in successes if r.roofline_efficiency is not None]
-    mbus = [r.mbu_estimated_percent for r, _, _ in successes if r.mbu_estimated_percent is not None]
 
-    kernel_entries = []
-    for r in sorted(results, key=lambda r: _kernel_sort_key(r.kernel_name)):
-        rd = r._asdict()
-        stem = Path(r.kernel_name).stem
-        rd["kernel_path"] = f"{stem}/{stem}.py"
-        kernel_entries.append(rd)
+    successes = [(r, extracted[r.kernel_name]) for r in results if extracted[r.kernel_name][0] is not None]
+    times = [e[0] for _, e in successes]
+    mfus = [e[1] for _, e in successes if e[1] is not None]
+    mbus = [e[2] for _, e in successes if e[2] is not None]
 
-    best_kernel = min(successes, key=lambda s: s[1])[0].kernel_name if successes else None
-    worst_kernel = max(successes, key=lambda s: s[1])[0].kernel_name if successes else None
+    kernel_entries = [
+        _kernel_index_row(r, *extracted[r.kernel_name])
+        for r in sorted(results, key=lambda r: _kernel_sort_key(r.kernel_name))
+    ]
+
+    best_kernel = min(successes, key=lambda s: s[1][0])[0].kernel_name if successes else None
+    worst_kernel = max(successes, key=lambda s: s[1][0])[0].kernel_name if successes else None
     results_data = {
         "metadata": {"num_kernels": num_kernels, "wallclock_s": wallclock_s, "hosts": hosts},
         "metrics": {
-            "best_min_ms": min(times) if times else None,
-            "worst_min_ms": max(times) if times else None,
-            "mean_min_ms": sum(times) / len(times) if times else None,
+            "best_total_time_s": min(times) if times else None,
+            "worst_total_time_s": max(times) if times else None,
             "best_kernel": best_kernel,
             "worst_kernel": worst_kernel,
             "best_mfu": max(mfus) if mfus else None,
             "worst_mfu": min(mfus) if mfus else None,
-            "best_roofline_efficiency": max(roofline_effs) if roofline_effs else None,
-            "worst_roofline_efficiency": min(roofline_effs) if roofline_effs else None,
             "best_mbu": max(mbus) if mbus else None,
             "worst_mbu": min(mbus) if mbus else None,
             "passed_cpu_sim": passed_cpu_sim,
@@ -333,22 +394,13 @@ def _write_results_json(
 
 @dataclass
 class RemoteProfiler:
-    """Distributes NKI kernel profiling across remote Trainium hosts.
-
-    Attributes:
-        hosts: SSH hostnames (e.g. ["gym-1", "gym-2"]).
-        venv_python: Path to the Python executable on remote hosts.
-        neuron_platform_target: Neuron platform target (default "trn2").
-        warmup: Number of warmup iterations before timing.
-        iters: Number of benchmark iterations.
-    """
+    """Distributes NKI kernel profiling across remote Trainium hosts."""
 
     hosts: list[str]
     venv_python: str = _DEFAULT_VENV_PYTHON
     neuron_platform_target: str = "trn2"
-    warmup: int = 5
-    iters: int = 20
     seed: int = 42
+    collect_detailed_profile: bool = False
     compiler_logs: dict[str, str] = field(default_factory=dict, repr=False)
     _last_elapsed: float = field(default=0.0, repr=False)
     _collect_compiler_logs: bool = field(default=False, repr=False)
@@ -359,9 +411,8 @@ class RemoteProfiler:
             "neuron_platform_target": self.neuron_platform_target,
             "seed": self.seed,
             "config": {
-                "warmup": self.warmup,
-                "iters": self.iters,
                 "collect_compiler_logs": self._collect_compiler_logs,
+                "collect_detailed_profile": self.collect_detailed_profile,
             },
         }
 
@@ -471,13 +522,13 @@ def _write_baseline_cache(
 def remote_numpy_baseline(
     func: Callable[..., np.ndarray],
     input_specs: dict[str, tuple[tuple[int, ...], str]],
-    mac_count: int,
     host: str,
     kernel_name: str = "baseline",
     venv_python: str = _DEFAULT_VENV_PYTHON,
     neuron_platform_target: str = "trn2",
     additional_compiler_args: str = "--lnc 1 --internal-tensorizer-opt-level=2",
     cache_dir: str = "",
+    collect_detailed_profile: bool = False,
 ) -> ProfileResult:
     """Run a nkipy numpy-baseline profile on a single remote Trainium host.
 
@@ -493,7 +544,6 @@ def remote_numpy_baseline(
             Must be importable by source — top-level ``def`` preferred.
         input_specs: ``{param_name: (shape, dtype_str)}`` matching the
             positional order of ``func``'s parameters.
-        mac_count: Theoretical MACs for MFU computation.
         host: SSH hostname of the Trainium node (e.g. ``"gym-1"``).
         kernel_name: Identifier stored on the returned ProfileResult. Also
             used as the cache subdirectory stem when ``cache_dir`` is set.
@@ -513,9 +563,9 @@ def remote_numpy_baseline(
         "func_source": _func_source(func),
         "func_name": func.__name__,
         "input_specs": {name: [list(shape), dt] for name, (shape, dt) in input_specs.items()},
-        "mac_count": mac_count,
         "kernel_name": kernel_name,
         "additional_compiler_args": additional_compiler_args,
+        "collect_detailed_profile": collect_detailed_profile,
     }
     payload_bytes = json.dumps(payload).encode("utf-8")
 
@@ -557,10 +607,10 @@ def remote_numpy_baseline(
         logger.info("  [%s] %s", host, line)
 
     if proc.returncode != 0:
-        result = make_failure(kernel_name, f"SSH baseline on {host} exited {proc.returncode}: {stderr_text}", mac_count)
+        result = make_failure(kernel_name, f"SSH baseline on {host} exited {proc.returncode}: {stderr_text}")
         nki_source = ""
     elif not stdout_data:
-        result = make_failure(kernel_name, f"No baseline result from {host} (empty stdout)", mac_count)
+        result = make_failure(kernel_name, f"No baseline result from {host} (empty stdout)")
         nki_source = ""
     else:
         try:
@@ -568,7 +618,7 @@ def remote_numpy_baseline(
             result = ProfileResult(**data["result"])
             nki_source = data.get("nki_source", "")
         except (json.JSONDecodeError, ValueError) as e:
-            result = make_failure(kernel_name, f"Malformed baseline JSON from {host}: {e}", mac_count)
+            result = make_failure(kernel_name, f"Malformed baseline JSON from {host}: {e}")
             nki_source = ""
 
     if cache_dir:

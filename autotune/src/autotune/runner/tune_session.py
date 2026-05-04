@@ -36,11 +36,10 @@ import numpy as np
 
 from autotune.runner.api import remote_profile
 from autotune.runner.remote import remote_numpy_baseline
-from autotune.runner.types import KernelJob, ProfileResult
+from autotune.runner.types import KernelJob, ProfileResult, profiler_percent
 from nkigym.codegen import render_ir
 from nkigym.kernel_ir import KernelIR
 from nkigym.search.api import func_source_with_imports, inline_gadgets
-from nkigym.search.mac import compute_mac_count
 
 _NEURONX_CC_ARGS = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")
 
@@ -50,7 +49,7 @@ class BaselineResult:
     """Baseline dump return — what the skill prints + records."""
 
     mfu: float | None
-    min_ms: float | None
+    total_time_s: float | None
     source: str
 
 
@@ -66,29 +65,28 @@ def dump_baseline(
     """Ship the nkipy baseline on ``host`` and seed the tuning cache.
 
     Writes ``<cache_root>/nkipy_baseline/nkipy_baseline.py`` (compiler
-    output) and ``<cache_root>/nkipy_baseline/baseline.json`` (mfu /
-    min_ms). Initializes ``<cache_root>/summary.json`` with
-    ``function``, ``baseline``, ``target_mfu`` (when provided), and
-    an empty ``tuning`` table.
+    output) and ``<cache_root>/nkipy_baseline/baseline.json`` (mfu +
+    profiler wall-clock). Initializes ``<cache_root>/summary.json``
+    with ``function``, ``baseline``, ``target_mfu`` (when provided),
+    and an empty ``tuning`` table.
     """
     cache_root = Path(cache_root)
     cache_root.mkdir(parents=True, exist_ok=True)
     baseline_dir = cache_root / "nkipy_baseline"
 
     result = remote_numpy_baseline(
-        func=f_numpy,
-        input_specs=input_specs,
-        mac_count=compute_mac_count(f_nkigym, input_specs),
-        host=host,
-        kernel_name="nkipy_baseline",
-        cache_dir=str(cache_root),
+        func=f_numpy, input_specs=input_specs, host=host, kernel_name="nkipy_baseline", cache_dir=str(cache_root)
     )
+
+    baseline_mfu = profiler_percent(result.profiler_summary, "mfu_estimated_percent")
+    total_time_s = (result.profiler_summary or {}).get("total_time")
+    total_time_s = float(total_time_s) if isinstance(total_time_s, (int, float)) else None
 
     """``remote_numpy_baseline`` writes <cache>/<stem>/<stem>.py +
     <cache>/results.json; drop the stray results.json (the baseline is
     tracked in summary.json instead) and add baseline.json alongside."""
     (cache_root / "results.json").unlink(missing_ok=True)
-    baseline_info = {"source": source, "mfu": result.mfu, "min_ms": result.min_ms}
+    baseline_info = {"source": source, "mfu": baseline_mfu, "total_time_s": total_time_s}
     (baseline_dir / "baseline.json").write_text(json.dumps(baseline_info, indent=2))
 
     summary_path = cache_root / "summary.json"
@@ -102,7 +100,7 @@ def dump_baseline(
         summary["target_mfu"] = float(target_mfu)
     summary_path.write_text(json.dumps(summary, indent=2))
 
-    return BaselineResult(mfu=result.mfu, min_ms=result.min_ms, source=source)
+    return BaselineResult(mfu=baseline_mfu, total_time_s=total_time_s, source=source)
 
 
 def submit_batch(
@@ -113,6 +111,7 @@ def submit_batch(
     hosts: list[str],
     atol: float = 1e-2,
     rtol: float = 1e-2,
+    collect_detailed_profile: bool = False,
 ) -> list[ProfileResult]:
     """Render + ship ``irs`` in one SSH batch; persist the batch cache.
 
@@ -165,7 +164,6 @@ def submit_batch(
     batch_dir.mkdir(parents=True, exist_ok=True)
 
     nkigym_source = func_source_with_imports(f_nkigym)
-    mac_count = compute_mac_count(f_nkigym, input_specs)
 
     """Render every fresh IR, stage .py + ir.md + KernelJob dict."""
     jobs: dict[str, KernelJob] = {}
@@ -186,7 +184,6 @@ def submit_batch(
             input_specs=input_specs,
             nkigym_source=nkigym_source,
             nkigym_func_name=f_nkigym.__name__,
-            mac_count=mac_count,
             atol=atol,
             rtol=rtol,
             neuronx_cc_args=_NEURONX_CC_ARGS,
@@ -194,7 +191,15 @@ def submit_batch(
         assignments.append((input_idx, kid, kernel_name, ir))
 
     """Ship — let the backend do source/log/results writes under batch_dir/<stem>/."""
-    output = remote_profile(jobs, hosts=hosts, cache_dir=str(batch_dir))
+    output = remote_profile(
+        jobs,
+        hosts=hosts,
+        cache_dir=str(batch_dir),
+        seed=42,
+        neuron_platform_target="trn2",
+        venv_python="/home/ubuntu/venvs/kernel-env/bin/python",
+        collect_detailed_profile=collect_detailed_profile,
+    )
     by_name = {r.kernel_name: r for r in output.results}
 
     """Fold the backend's <stem>/ layout into the requested one:
@@ -228,9 +233,10 @@ def submit_batch(
     prior_best_name, prior_best_mfu = _latest_running_best(summary)
     best_name, best_mfu = prior_best_name, prior_best_mfu
     for r in ordered:
-        if r.mfu is not None and (best_mfu is None or r.mfu > best_mfu):
+        mfu = profiler_percent(r.profiler_summary, "mfu_estimated_percent")
+        if mfu is not None and (best_mfu is None or mfu > best_mfu):
             best_name = r.kernel_name
-            best_mfu = r.mfu
+            best_mfu = mfu
 
     summary["tuning"][f"batch_{bid}"] = {"running_best_kernel": best_name, "mfu": best_mfu}
     summary_path.write_text(json.dumps(summary, indent=2))
@@ -279,19 +285,17 @@ def _load_prior_ir_results(cache_root: Path) -> dict[str, ProfileResult]:
             if not ir_md.exists():
                 continue
             ir_repr = ir_md.read_text().rstrip("\n")
+            summary: dict | None = None
+            summary_path = batch_dir / stem / "profile_summary.json"
+            try:
+                summary = json.loads(summary_path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                summary = None
             cache[ir_repr] = ProfileResult(
                 kernel_name=kernel_name,
-                min_ms=entry.get("min_ms"),
-                mean_ms=entry.get("mean_ms"),
-                p50_ms=entry.get("p50_ms"),
-                p99_ms=entry.get("p99_ms"),
-                mac_count=entry.get("mac_count", 0),
-                mfu=entry.get("mfu"),
-                cpu_sim=entry.get("cpu_sim", {}),
+                cpu_sim={"passed": bool(entry.get("cpu_sim_passed"))},
                 hardware_output=entry.get("hardware_output", ""),
-                mbu_estimated_percent=entry.get("mbu_estimated_percent"),
-                mfu_max_achievable_estimated_percent=entry.get("mfu_max_achievable_estimated_percent"),
-                roofline_efficiency=entry.get("roofline_efficiency"),
+                profiler_summary=summary,
             )
     return cache
 

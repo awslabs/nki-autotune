@@ -4,30 +4,28 @@ Worker-only module — imports nki and nkipy at top level. Not safe to
 import on the coordinator machine.
 """
 
+import base64
+import json
 import os
 import re
+import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import nki
 import numpy as np
 from nki.compiler.ncc_driver import extract_perf_metrics
 from nkipy.core.backend.hlo import HLOModule, HLOTensor
 from nkipy.runtime import BaremetalExecutor, CompiledKernel
-from spike.spike_model import BenchmarkResult
 
 from autotune.runner.compile import load_kernel
 from autotune.runner.types import (
-    BenchmarkConfig,
     CompileResult,
     OutputSpec,
     ProfileResult,
-    RooflineMetrics,
     _sim_not_run,
-    calculate_mfu,
     capture_error,
-    percentile,
     resolve_dtype,
     tensor_inputs,
 )
@@ -68,101 +66,62 @@ def create_compiled_kernel(
     return CompiledKernel(TracedKernel(kernel, hlo), neff_path)
 
 
-def _run_timing(
-    spike: BaremetalExecutor, compiled: CompiledKernel, kernel_kwargs: dict[str, Any], config: BenchmarkConfig
-) -> tuple[float, float, float, float, float]:
-    """Run benchmark timing and return (min_ms, mean_ms, p50, p99, mfu).
+def _collect_profiler_outputs(
+    spike: BaremetalExecutor, compiled: CompiledKernel, kernel_kwargs: dict[str, Any], collect_detailed: bool
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    """Run the kernel once with ``save_trace=True`` and parse the NTFF.
 
-    Args:
-        spike: Active BaremetalExecutor session.
-        compiled: Compiled kernel to benchmark.
-        kernel_kwargs: Input tensors.
-        config: Benchmark configuration.
+    Returns ``(summary, detailed, ntff_b64)`` where:
+
+    * ``summary`` = the ``neuron-profile view --output-format summary-json``
+      dict (~100-key aggregate, always collected).
+    * ``detailed`` = the ``--output-format json`` dict (per-instruction
+      trace, per-engine active intervals, per-layer summaries) when
+      ``collect_detailed`` is ``True``; else ``None``. Tens of MB.
+    * ``ntff_b64`` = base64-encoded NTFF bytes when ``collect_detailed``
+      is ``True``; else ``None``. Callers can decode and re-feed into
+      ``neuron-profile view`` offline.
     """
-    stats = cast(
-        BenchmarkResult,
-        spike.benchmark(
-            compiled,
-            *tensor_inputs(kernel_kwargs),
-            warmup_iterations=config.warmup,
-            benchmark_iterations=config.iters,
-            mode="device",
-        ),
-    )
-    min_ms = stats.min_ms
-    mean_ms = stats.mean_ms
-    sorted_durations = sorted(stats.durations_ms)
-    p50_ms = percentile(sorted_durations, 50)
-    p99_ms = percentile(sorted_durations, 99)
-    mfu = 0.0
-    if config.mac_count > 0 and min_ms > 0:
-        mfu = calculate_mfu(config.mac_count, min_ms, config.input_dtype_name)
-    return min_ms, mean_ms, p50_ms, p99_ms, mfu
-
-
-_EMPTY_ROOFLINE = RooflineMetrics(
-    mbu_estimated_percent=None, mfu_max_achievable_estimated_percent=None, roofline_efficiency=None
-)
-
-
-def _collect_roofline(
-    spike: BaremetalExecutor, compiled: CompiledKernel, kernel_kwargs: dict[str, Any], mfu: float | None
-) -> RooflineMetrics:
-    """Run the kernel once with ``save_trace=True`` and extract profiler metrics.
-
-    Returns MBU, the kernel's roofline-limited MFU ceiling, and the
-    fraction of that ceiling actually reached. Sourced from
-    ``neuron-profile``'s summary-json so the arithmetic intensity
-    reflects the post-compiler DMA schedule, not a static analysis of
-    the NKI source.
-    """
-    metrics: dict[str, Any] | None = None
+    detailed: dict[str, Any] | None = None
+    ntff_b64: str | None = None
     with tempfile.TemporaryDirectory(prefix="autotune-profile-") as artifacts_dir:
         try:
             spike.run(compiled, *tensor_inputs(kernel_kwargs), save_trace=True, artifacts_dir=artifacts_dir)
             ntff_path = os.path.join(artifacts_dir, "profile.ntff")
-            if os.path.isfile(ntff_path):
-                metrics = extract_perf_metrics(compiled.compiled_artifact, ntff_path, verbose=False)
+            summary = extract_perf_metrics(compiled.compiled_artifact, ntff_path, verbose=False)
+            if collect_detailed:
+                detailed = _extract_detailed_profile(compiled.compiled_artifact, ntff_path, artifacts_dir)
+                with open(ntff_path, "rb") as f:
+                    ntff_b64 = base64.b64encode(f.read()).decode("ascii")
         except Exception as e:
-            raise RuntimeError(f"Roofline profile run failed: {e}") from e
-    return _roofline_from_metrics(metrics, mfu)
+            raise RuntimeError(f"Profiler summary collection failed: {e}") from e
+    return summary, detailed, ntff_b64
 
 
-def _roofline_from_metrics(metrics: dict[str, Any] | None, mfu: float | None) -> RooflineMetrics:
-    """Assemble a RooflineMetrics from a ``neuron-profile`` summary-json dict.
-
-    ``neuron-profile`` reports ``mbu_estimated_percent``,
-    ``mfu_estimated_percent``, and ``mfu_max_achievable_estimated_percent``
-    as fractions in [0, 1] (matching the compiler's internal convention);
-    we scale to percent so values align with the existing ``mfu`` field.
-    ``roofline_efficiency`` = measured MFU / ceiling MFU, expressed as a
-    percent so a kernel that lands at its ceiling reads 100%.
-    """
-    mbu_pct: float | None = None
-    ceiling_pct: float | None = None
-    efficiency: float | None = None
-    if metrics is not None:
-        mbu_pct = _to_percent(metrics.get("mbu_estimated_percent"))
-        ceiling_pct = _to_percent(metrics.get("mfu_max_achievable_estimated_percent"))
-        if mfu is not None and ceiling_pct and ceiling_pct > 0:
-            efficiency = 100.0 * mfu / ceiling_pct
-    return RooflineMetrics(
-        mbu_estimated_percent=mbu_pct, mfu_max_achievable_estimated_percent=ceiling_pct, roofline_efficiency=efficiency
+def _extract_detailed_profile(neff_path: str, ntff_path: str, work_dir: str) -> dict[str, Any] | None:
+    """Invoke ``neuron-profile view --output-format json`` and load result."""
+    out_json = os.path.join(work_dir, "profile_detailed.json")
+    result = subprocess.run(
+        [
+            "neuron-profile",
+            "view",
+            "-n",
+            neff_path,
+            "-s",
+            ntff_path,
+            "--output-format",
+            "json",
+            "--output-file",
+            out_json,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-
-
-def _to_percent(value: Any) -> float | None:
-    """Convert a ``neuron-profile`` fractional metric to percent.
-
-    Profiler fields are fractions in [0, 1]; None or negative sentinels
-    signal "not available".
-    """
-    result: float | None = None
-    if value is not None:
-        scaled = float(value) * 100.0
-        if scaled >= 0:
-            result = scaled
-    return result
+    if result.returncode != 0:
+        return None
+    with open(out_json) as f:
+        return json.load(f)
 
 
 def benchmark_one(
@@ -171,53 +130,40 @@ def benchmark_one(
     func_name: str,
     kernel_kwargs: dict[str, Any],
     out: OutputSpec,
-    config: BenchmarkConfig,
     cpu_sim: dict | None = None,
+    collect_detailed_profile: bool = False,
 ) -> ProfileResult:
-    """Benchmark a single compiled variant on a Neuron core.
+    """Run the compiled kernel once with ``save_trace=True`` and attach the
+    profiler's JSON output(s) to a :class:`ProfileResult`.
 
-    Timing only — no numerical correctness checks. The cpu_sim field
-    carries the CPU simulation result from earlier in the pipeline.
-    Also runs one extra ``save_trace=True`` pass so ``neuron-profile``
-    can emit MBU and the roofline-limited MFU ceiling for the
-    post-compiler kernel.
-
-    Args:
-        spike: Active BaremetalExecutor session.
-        cr: Compilation result with NEFF path.
-        func_name: Kernel function name.
-        kernel_kwargs: Input tensors.
-        out: Output tensor specification.
-        config: Benchmark configuration.
-        cpu_sim: CPU simulation status dict.
+    Correctness is already gated by CPU sim upstream; wall-clock timing
+    and utilization come entirely from the profiler summary. When
+    ``collect_detailed_profile`` is ``True`` the full per-instruction
+    trace is also attached as ``profile_detailed``.
     """
-    min_ms: float | None = None
-    mean_ms: float | None = None
-    p50_ms: float | None = None
-    p99_ms: float | None = None
-    mfu: float | None = None
-    roofline = _EMPTY_ROOFLINE
+    profiler_summary: dict[str, Any] | None = None
+    profile_detailed: dict[str, Any] | None = None
+    neff_b64: str | None = None
+    ntff_b64: str | None = None
     hardware_output = f"{list(out.shape)} {out.dtype}"
     try:
         compiled = create_compiled_kernel(cr.neff_path, cr.nki_path, func_name, kernel_kwargs, out)
-        min_ms, mean_ms, p50_ms, p99_ms, mfu = _run_timing(spike, compiled, kernel_kwargs, config)
-        roofline = _collect_roofline(spike, compiled, kernel_kwargs, mfu)
+        profiler_summary, profile_detailed, ntff_b64 = _collect_profiler_outputs(
+            spike, compiled, kernel_kwargs, collect_detailed_profile
+        )
+        if collect_detailed_profile:
+            with open(cr.neff_path, "rb") as f:
+                neff_b64 = base64.b64encode(f.read()).decode("ascii")
     except Exception as e:
         hardware_output = capture_error(e)
-        min_ms = mean_ms = p50_ms = p99_ms = mfu = None
     return ProfileResult(
         kernel_name=cr.kernel_name,
-        min_ms=min_ms,
-        mean_ms=mean_ms,
-        p50_ms=p50_ms,
-        p99_ms=p99_ms,
-        mac_count=config.mac_count,
-        mfu=mfu,
         cpu_sim=cpu_sim if cpu_sim is not None else _sim_not_run(),
         hardware_output=hardware_output,
-        mbu_estimated_percent=roofline.mbu_estimated_percent,
-        mfu_max_achievable_estimated_percent=roofline.mfu_max_achievable_estimated_percent,
-        roofline_efficiency=roofline.roofline_efficiency,
+        profiler_summary=profiler_summary,
+        profile_detailed=profile_detailed,
+        neff_b64=neff_b64,
+        ntff_b64=ntff_b64,
     )
 
 

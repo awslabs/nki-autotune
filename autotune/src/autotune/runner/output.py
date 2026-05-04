@@ -3,42 +3,38 @@
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from autotune.runner.types import ProfileResult
+from autotune.runner.types import ProfileResult, profiler_percent
 
 
 class SuccessRow(NamedTuple):
-    """Kernel result with guaranteed non-None timing/MFU fields."""
+    """Kernel result narrowed to non-None profiler fields used by the table."""
 
     kernel_name: str
-    min_ms: float
-    mean_ms: float
-    p50_ms: float
-    p99_ms: float
+    total_time_s: float
     mfu: float
     mbu: float | None
     roofline_ceiling: float | None
-    roofline_efficiency: float | None
 
 
 def _collect_successes(results: list[ProfileResult]) -> list[SuccessRow]:
-    """Narrow to kernels that compiled, ran on HW, and produced timings."""
+    """Narrow to kernels that compiled, ran on HW, and produced profiler data."""
     rows: list[SuccessRow] = []
     for r in results:
         if not r.hardware_output.startswith("["):
             continue
-        if r.min_ms is None or r.mean_ms is None or r.p50_ms is None or r.p99_ms is None or r.mfu is None:
+        total = (r.profiler_summary or {}).get("total_time")
+        if not isinstance(total, (int, float)):
+            continue
+        mfu = profiler_percent(r.profiler_summary, "mfu_estimated_percent")
+        if mfu is None:
             continue
         rows.append(
             SuccessRow(
                 kernel_name=r.kernel_name,
-                min_ms=r.min_ms,
-                mean_ms=r.mean_ms,
-                p50_ms=r.p50_ms,
-                p99_ms=r.p99_ms,
-                mfu=r.mfu,
-                mbu=r.mbu_estimated_percent,
-                roofline_ceiling=r.mfu_max_achievable_estimated_percent,
-                roofline_efficiency=r.roofline_efficiency,
+                total_time_s=float(total),
+                mfu=mfu,
+                mbu=profiler_percent(r.profiler_summary, "mbu_estimated_percent"),
+                roofline_ceiling=profiler_percent(r.profiler_summary, "mfu_max_achievable_estimated_percent"),
             )
         )
     return rows
@@ -70,7 +66,7 @@ class ProfileOutput:
     @property
     def failures(self) -> list[ProfileResult]:
         """Kernels that failed CPU sim, compile, or hardware execution."""
-        return [r for r in self.results if r.min_ms is None or not r.hardware_output.startswith("[")]
+        return [r for r in self.results if r.profiler_summary is None or not r.hardware_output.startswith("[")]
 
     def __str__(self) -> str:
         """Human-readable summary with per-kernel timing table."""
@@ -83,24 +79,24 @@ class ProfileOutput:
 
 
 def _format_results_table(successes: list[SuccessRow]) -> list[str]:
-    """Format the timing results table for successful kernels."""
+    """Format the results table for successful kernels."""
     lines: list[str] = []
     show_mfu = any(s.mfu > 0 for s in successes)
-    show_roofline = any(s.roofline_efficiency is not None for s in successes)
-    header = f"{'Kernel':<30} {'min_ms':>10} {'mean_ms':>10} {'p50_ms':>10} {'p99_ms':>10}"
+    show_roofline = any(s.mbu is not None or s.roofline_ceiling is not None for s in successes)
+    header = f"{'Kernel':<30} {'total_s':>10}"
     if show_mfu:
         header += f" {'mfu':>8}"
     if show_roofline:
-        header += f" {'mbu':>8} {'ceiling':>8} {'roofline':>9}"
-    for s in sorted(successes, key=lambda s: s.min_ms):
+        header += f" {'mbu':>8} {'ceiling':>8}"
+    for s in sorted(successes, key=lambda s: s.total_time_s):
         if not lines:
             lines.append(header)
             lines.append("-" * len(header))
-        row = f"{s.kernel_name:<30} {s.min_ms:>10.4f} {s.mean_ms:>10.4f} {s.p50_ms:>10.4f} {s.p99_ms:>10.4f}"
+        row = f"{s.kernel_name:<30} {s.total_time_s:>10.6f}"
         if show_mfu:
             row += f" {s.mfu:>7.2f}%"
         if show_roofline:
-            row += f" {_fmt_pct(s.mbu):>8} {_fmt_pct(s.roofline_ceiling):>8} {_fmt_pct(s.roofline_efficiency):>9}"
+            row += f" {_fmt_pct(s.mbu):>8} {_fmt_pct(s.roofline_ceiling):>8}"
         lines.append(row)
     return lines
 
@@ -125,15 +121,14 @@ def _format_failures(failures: list[ProfileResult]) -> list[str]:
 def _format_summary(successes: list[SuccessRow], output: ProfileOutput) -> list[str]:
     """Format the summary footer."""
     lines: list[str] = []
-    times = [s.min_ms for s in successes]
-    lines.append(f"\nSummary:")
+    times = [s.total_time_s for s in successes]
+    lines.append("\nSummary:")
     lines.append(f"  Succeeded:  {len(successes)}/{len(output.results)}")
     lines.append(f"  Hosts:      {len(output.hosts)} ({', '.join(output.hosts)})")
     lines.append(f"  Wallclock:  {output.elapsed_s:.1f}s")
     if times:
-        lines.append(f"  Best:       {min(times):.4f} ms ({successes[0].kernel_name})")
-        lines.append(f"  Worst:      {max(times):.4f} ms")
-        lines.append(f"  Mean:       {sum(times) / len(times):.4f} ms")
+        lines.append(f"  Best:       {min(times):.6f} s ({successes[0].kernel_name})")
+        lines.append(f"  Worst:      {max(times):.6f} s")
     if output.cache_dir:
         lines.append(f"  Cache:      {output.cache_dir}")
     return lines

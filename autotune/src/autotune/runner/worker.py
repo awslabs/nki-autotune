@@ -26,7 +26,6 @@ from autotune.runner.compare import assert_close
 from autotune.runner.compile import compile_one, init_compile_worker
 from autotune.runner.detect import detect_neuron_cores
 from autotune.runner.types import (
-    BenchmarkConfig,
     CompileResult,
     OutputSpec,
     ProfileResult,
@@ -86,27 +85,28 @@ def _process_kernel_job(kname: str, job: dict[str, Any], seed: int, nki_dir: Pat
 
     func_name = job["func_name"]
     output_shape = tuple(job["output_shape"])
-    mac_count = job["mac_count"]
     neuronx_cc_args = tuple(job.get("neuronx_cc_args", ()))
 
     tensor_specs = {name: {"shape": list(shape), "dtype": dt} for name, (shape, dt) in job["tensor_specs"].items()}
     kwargs = generate_tensors(tensor_specs, seed)
 
-    golden = compute_golden(job["nkigym_source"], job["nkigym_func_name"], kwargs)
-
-    sim_output, sim_error = simulate_one(str(nki_path), func_name, kwargs)
-    cpu_sim = _cpu_sim_status(sim_output, sim_error, golden, job["atol"], job["rtol"])
+    if job.get("skip_cpu_sim"):
+        cpu_sim = {"passed": True, "skipped": True}
+    else:
+        golden = compute_golden(job["nkigym_source"], job["nkigym_func_name"], kwargs)
+        sim_output, sim_error = simulate_one(str(nki_path), func_name, kwargs)
+        cpu_sim = _cpu_sim_status(sim_output, sim_error, golden, job["atol"], job["rtol"])
 
     input_dtype_name = next(iter(job["tensor_specs"].values()))[1]
     return {
         "nki_path": str(nki_path),
         "func_name": func_name,
         "output_shape": output_shape,
-        "mac_count": mac_count,
         "kwargs": kwargs,
         "cpu_sim": cpu_sim,
         "input_dtype_name": input_dtype_name,
         "neuronx_cc_args": neuronx_cc_args,
+        "lnc": int(job.get("lnc", 1)),
     }
 
 
@@ -140,6 +140,7 @@ def _submit_compilations(
                 str(compile_dir),
                 {},
                 kd["neuronx_cc_args"],
+                kd.get("lnc", 1),
             )
         )
     return executor, futures
@@ -149,8 +150,7 @@ def _benchmark_compiled(
     compile_futures: list[Future],
     spike: BaremetalExecutor,
     kernel_data: dict[str, dict[str, Any]],
-    warmup: int,
-    iters: int,
+    collect_detailed_profile: bool,
 ) -> tuple[list[CompileResult], list[ProfileResult], list[ProfileResult]]:
     """Benchmark each kernel as it finishes compiling.
 
@@ -165,15 +165,22 @@ def _benchmark_compiled(
         compile_results.append(cr)
         kd = kernel_data[cr.kernel_name]
         if cr.error:
-            compile_errors.append(compile_failure_result(cr, kd["mac_count"], cpu_sim=kd["cpu_sim"]))
+            compile_errors.append(compile_failure_result(cr, cpu_sim=kd["cpu_sim"]))
             continue
         out = OutputSpec(
             name=_OUTPUT_TENSOR_NAME, shape=kd["output_shape"], dtype=resolve_dtype(kd["input_dtype_name"])
         )
-        bench_config = BenchmarkConfig(
-            warmup=warmup, iters=iters, mac_count=kd["mac_count"], input_dtype_name=kd["input_dtype_name"]
+        hw_results.append(
+            benchmark_one(
+                spike,
+                cr,
+                kd["func_name"],
+                kd["kwargs"],
+                out,
+                kd["cpu_sim"],
+                collect_detailed_profile=collect_detailed_profile,
+            )
         )
-        hw_results.append(benchmark_one(spike, cr, kd["func_name"], kd["kwargs"], out, bench_config, kd["cpu_sim"]))
     return compile_results, compile_errors, hw_results
 
 
@@ -200,13 +207,17 @@ def _run_hw_benchmarks(
     Returns:
         Tuple of (all_results, compiler_logs).
     """
-    os.environ["NEURON_RT_VISIBLE_CORES"] = "0"
-    os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
+    lncs = {kd.get("lnc", 1) for kd in kernel_data.values()}
+    if len(lncs) > 1:
+        raise RuntimeError(f"Batch mixes lnc values {lncs}; submit one lnc per remote_profile call")
+    lnc = next(iter(lncs))
+    os.environ["NEURON_RT_VISIBLE_CORES"] = "0" if lnc == 1 else "0,1"
+    os.environ["NEURON_LOGICAL_NC_CONFIG"] = str(lnc)
     os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
 
     with BaremetalExecutor(verbose=0) as spike:
         compile_results, compile_errors, hw_results = _benchmark_compiled(
-            futures, spike, kernel_data, config["warmup"], config["iters"]
+            futures, spike, kernel_data, bool(config.get("collect_detailed_profile", False))
         )
     executor.shutdown(wait=True)
 
@@ -245,9 +256,7 @@ def _run_pipeline(payload: dict[str, Any]) -> tuple[list[ProfileResult], dict[st
         if kd["cpu_sim"].get("passed"):
             kernel_data[kname] = kd
         else:
-            sim_failures.append(
-                make_failure(kname, "skipped: CPU sim did not pass", kd["mac_count"], cpu_sim=kd["cpu_sim"])
-            )
+            sim_failures.append(make_failure(kname, "skipped: CPU sim did not pass", cpu_sim=kd["cpu_sim"]))
     logger.info("CPU sim done: %d passed, %d failed", len(kernel_data), len(sim_failures))
 
     hw_results: list[ProfileResult] = []

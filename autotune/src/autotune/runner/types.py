@@ -4,7 +4,6 @@ Safe to import on both coordinator and worker machines — no nki or
 nkipy dependencies.
 """
 
-import logging
 import os
 import sys
 import traceback
@@ -12,18 +11,6 @@ from typing import NamedTuple
 
 import ml_dtypes
 import numpy as np
-
-logger = logging.getLogger(__name__)
-
-_PE_FREQ_HZ = 2.4e9
-_TRN2_FLOPS_PER_CYCLE: dict[str, int] = {
-    "float8_e4m3fn": 4 * 128 * 128,
-    "float8_e5m2": 4 * 128 * 128,
-    "float16": 2 * 128 * 128,
-    "bfloat16": 2 * 128 * 128,
-    "float32": 2 * 128 * 128,
-}
-_BF16_FLOPS_PER_CYCLE = 2 * 128 * 128
 
 _DTYPE_CACHE: dict[str, np.dtype] = {}
 
@@ -59,10 +46,6 @@ class KernelJob(NamedTuple):
             ``NKIOp`` through its numpy ``__call__``.
         nkigym_func_name: Name of the nkigym math function within
             ``nkigym_source``.
-        mac_count: Theoretical MAC count, derived from the KernelIR
-            on the coordinator. Avoids AST scans of the rendered
-            kernel (which misattribute trip counts when loops from
-            different fusion groups interleave).
         atol: Absolute tolerance for CPU sim vs golden comparison.
         rtol: Relative tolerance for CPU sim vs golden comparison.
         neuronx_cc_args: Extra flags forwarded to neuronx-cc via
@@ -80,10 +63,11 @@ class KernelJob(NamedTuple):
     input_specs: dict[str, tuple[tuple[int, ...], str]]
     nkigym_source: str
     nkigym_func_name: str
-    mac_count: int
     atol: float
     rtol: float
     neuronx_cc_args: tuple[str, ...] = ()
+    skip_cpu_sim: bool = False
+    lnc: int = 1
 
 
 class CompileResult(NamedTuple):
@@ -98,72 +82,33 @@ class CompileResult(NamedTuple):
 class ProfileResult(NamedTuple):
     """Benchmark result for a single kernel.
 
-    Timing fields are ``None`` for kernels that failed CPU sim, compile, or
-    hardware execution — a failed kernel produced no valid measurement and
-    reporting zeros would be misleading.
+    ``profiler_summary`` is the raw ``neuron-profile view
+    --output-format summary-json`` dict for the post-compiler NTFF
+    trace. Every number we report — wall-clock time, MFU/MBU/ceiling,
+    engine-active times, cycle counts, DMA bytes — lives there.
 
-    Roofline fields are sourced from the ``neuron-profile`` summary-json
-    emitted by an NTFF trace, so they reflect the post-compiler-optimized
-    kernel behavior rather than a static analysis of the NKI source:
+    ``profile_detailed``, ``neff_b64``, and ``ntff_b64`` are collected
+    only when the caller passes ``collect_detailed_profile=True`` to
+    :func:`remote_profile`:
 
-        mbu_estimated_percent
-            Memory bandwidth utilization — measured HBM traffic rate as a
-            fraction of the HBM bandwidth ceiling.
-        mfu_max_achievable_estimated_percent
-            The kernel's roofline-limited compute ceiling: what fraction of
-            peak FLOPS this kernel *could* hit given its measured
-            arithmetic intensity. Ties mfu_estimated_percent to a meaningful
-            upper bound for that specific kernel.
-        roofline_efficiency
-            ``mfu / mfu_max_achievable_estimated_percent`` — how close the
-            kernel gets to its own ceiling (memory- or compute-bound).
+    * ``profile_detailed`` is the full ``--output-format json`` dict
+      (per-instruction trace, per-engine active intervals, per-layer
+      summaries, DMA throughput history).
+    * ``neff_b64`` is the base64-encoded compiled NEFF binary.
+    * ``ntff_b64`` is the base64-encoded NTFF trace. Callers can decode
+      and feed these back into ``neuron-profile view`` offline.
+
+    All optional fields are ``None`` when CPU sim, compile, or hardware
+    execution failed, or when detailed collection is off.
     """
 
     kernel_name: str
-    min_ms: float | None
-    mean_ms: float | None
-    p50_ms: float | None
-    p99_ms: float | None
-    mac_count: int
-    mfu: float | None
     cpu_sim: dict
     hardware_output: str
-    mbu_estimated_percent: float | None = None
-    mfu_max_achievable_estimated_percent: float | None = None
-    roofline_efficiency: float | None = None
-
-
-class BenchmarkConfig(NamedTuple):
-    """Grouping of benchmark parameters passed through the pipeline."""
-
-    warmup: int
-    iters: int
-    mac_count: int
-    input_dtype_name: str
-
-
-class RooflineMetrics(NamedTuple):
-    """Post-compiler roofline metrics sourced from ``neuron-profile``.
-
-    Extracted from the NTFF trace's summary-json so the numbers reflect
-    what the compiler actually produced (DMA scheduling, buffer reuse,
-    prefetching), not a static analysis of the NKI source.
-
-    Attributes:
-        mbu_estimated_percent: HBM bandwidth utilization percent.
-        mfu_max_achievable_estimated_percent: The kernel's roofline-limited
-            compute ceiling — the MFU this kernel *could* hit given its
-            measured arithmetic intensity. Caps out at the hardware peak
-            when the kernel is compute-bound.
-        roofline_efficiency: ``mfu / mfu_max_achievable_estimated_percent``,
-            expressed as a percent — how close the kernel gets to its own
-            ceiling regardless of whether that ceiling is memory- or
-            compute-bound.
-    """
-
-    mbu_estimated_percent: float | None
-    mfu_max_achievable_estimated_percent: float | None
-    roofline_efficiency: float | None
+    profiler_summary: dict | None = None
+    profile_detailed: dict | None = None
+    neff_b64: str | None = None
+    ntff_b64: str | None = None
 
 
 class OutputSpec(NamedTuple):
@@ -184,24 +129,18 @@ def _sim_not_run() -> dict:
     return {"passed": False, "error": "not run"}
 
 
-def make_failure(kernel_name: str, hardware_output: str, mac_count: int, cpu_sim: dict | None = None) -> ProfileResult:
-    """Create a failed ProfileResult with null timing fields."""
+def make_failure(kernel_name: str, hardware_output: str, cpu_sim: dict | None = None) -> ProfileResult:
+    """Create a failed ProfileResult with a null ``profiler_summary``."""
     return ProfileResult(
         kernel_name=kernel_name,
-        min_ms=None,
-        mean_ms=None,
-        p50_ms=None,
-        p99_ms=None,
-        mac_count=mac_count,
-        mfu=None,
         cpu_sim=cpu_sim if cpu_sim is not None else _sim_not_run(),
         hardware_output=hardware_output,
     )
 
 
-def compile_failure_result(cr: CompileResult, mac_count: int, cpu_sim: dict | None = None) -> ProfileResult:
+def compile_failure_result(cr: CompileResult, cpu_sim: dict | None = None) -> ProfileResult:
     """Convert a failed CompileResult into a ProfileResult."""
-    return make_failure(cr.kernel_name, cr.error, mac_count, cpu_sim=cpu_sim)
+    return make_failure(cr.kernel_name, cr.error, cpu_sim=cpu_sim)
 
 
 def tensor_inputs(kwargs: dict) -> list[np.ndarray]:
@@ -209,25 +148,21 @@ def tensor_inputs(kwargs: dict) -> list[np.ndarray]:
     return [v for v in kwargs.values() if hasattr(v, "ndim") and v.ndim > 0]
 
 
-def calculate_mfu(mac_count: int, time_ms: float, dtype_name: str) -> float:
-    """Calculate MFU percentage for trn2 NeuronCore-v3 TensorEngine.
+def profiler_percent(summary: dict | None, field: str) -> float | None:
+    """Read a profiler summary-json fractional field and scale to percent.
 
-    Returns:
-        MFU as a percentage (e.g. 24.0 means 24% utilization).
+    ``neuron-profile`` reports utilization fields as fractions in [0, 1]
+    (or a negative sentinel when unavailable). Returns ``None`` when the
+    summary is missing the field or the value is a sentinel.
     """
-    if dtype_name not in _TRN2_FLOPS_PER_CYCLE:
-        logger.warning("Unknown dtype %r for MFU; using BF16 peak", dtype_name)
-    flops_per_cycle = _TRN2_FLOPS_PER_CYCLE.get(dtype_name, _BF16_FLOPS_PER_CYCLE)
-    flops = 2 * mac_count
-    actual_pe_cycles = (time_ms / 1000) * _PE_FREQ_HZ
-    theoretical_pe_cycles = flops / flops_per_cycle
-    return 100.0 * theoretical_pe_cycles / actual_pe_cycles
-
-
-def percentile(sorted_vals: list[float], pct: float) -> float:
-    """Return the pct-th percentile from a pre-sorted list via nearest-rank."""
-    idx = max(0, min(int(pct / 100 * len(sorted_vals)), len(sorted_vals) - 1))
-    return sorted_vals[idx]
+    result: float | None = None
+    if summary is not None:
+        value = summary.get(field)
+        if value is not None:
+            scaled = float(value) * 100.0
+            if scaled >= 0:
+                result = scaled
+    return result
 
 
 _DEFAULT_VENV_PYTHON = "/home/ubuntu/venvs/kernel-env/bin/python"
@@ -239,15 +174,3 @@ def ensure_venv_on_path() -> None:
     path = os.environ.get("PATH", "")
     if venv_bin not in path.split(os.pathsep):
         os.environ["PATH"] = venv_bin + os.pathsep + path
-
-
-class ProfileConfig(NamedTuple):
-    """Infrastructure configuration for remote profiling.
-
-    Per-kernel settings (golden, tolerances, input_specs) are in KernelJob.
-    This bundles infra params that rarely change.
-    """
-
-    seed: int = 42
-    neuron_platform_target: str = "trn2"
-    venv_python: str = _DEFAULT_VENV_PYTHON

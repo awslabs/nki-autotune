@@ -14,6 +14,7 @@ coordinator-side payload into this module's ``baseline_worker_main``
 over the existing worker-bundle transport.
 """
 
+import base64
 import json
 import logging
 import os
@@ -27,15 +28,8 @@ from nkipy.runtime import BaremetalExecutor, CompiledKernel
 
 logger = logging.getLogger(__name__)
 
-from autotune.runner.benchmark import _collect_roofline, _run_timing, generate_tensors
-from autotune.runner.types import (
-    BenchmarkConfig,
-    ProfileResult,
-    RooflineMetrics,
-    _sim_not_run,
-    capture_error,
-    ensure_venv_on_path,
-)
+from autotune.runner.benchmark import _collect_profiler_outputs, generate_tensors
+from autotune.runner.types import ProfileResult, _sim_not_run, capture_error, ensure_venv_on_path
 
 
 def _compile_numpy_fn(
@@ -85,17 +79,17 @@ def _compile_numpy_fn(
 def profile_numpy_baseline(
     func: Callable[..., np.ndarray],
     input_specs: dict[str, tuple[tuple[int, ...], str]],
-    mac_count: int,
     output_dir: str,
     kernel_name: str = "baseline",
     additional_compiler_args: str = "--lnc 1 --internal-tensorizer-opt-level=2",
+    collect_detailed_profile: bool = False,
 ) -> tuple[ProfileResult, str]:
     """Compile a numpy function via nkipy + neuronx-cc and benchmark on Trainium.
 
-    Produces the same timing / MFU / roofline fields as ``benchmark_one``
-    so the baseline slots into any comparison table of tuned NKI kernels.
-    Must be run on a Trainium host -- ``BaremetalExecutor`` requires the
-    Neuron runtime.
+    Returns a :class:`ProfileResult` with the post-compiler
+    ``profiler_summary`` so the baseline slots into any comparison
+    table of tuned NKI kernels. Must be run on a Trainium host --
+    ``BaremetalExecutor`` requires the Neuron runtime.
 
     ``input_specs`` iteration order MUST match the positional parameter
     order of ``func``; Python dicts preserve insertion order, so callers
@@ -105,15 +99,14 @@ def profile_numpy_baseline(
         func: Numpy function to profile, e.g.
             ``def mm(a, b): return a @ b``.
         input_specs: Map of parameter name to ``(shape, dtype_str)``.
-        mac_count: Theoretical MAC count for MFU computation.
         output_dir: Directory for compilation artifacts (NEFF, HLO, logs).
         kernel_name: Identifier stored on the resulting ``ProfileResult``.
         additional_compiler_args: Forwarded to neuronx-cc. The default
             matches nkipy's ``baremetal_jit`` baseline for an NKIPy
             kernel (``--lnc 1 --internal-tensorizer-opt-level=2``), so
-            the returned MFU is an apples-to-apples reference and the
-            produced NEFF loads against the same 1-core config the rest
-            of the pipeline uses.
+            the returned profiler summary is an apples-to-apples
+            reference and the produced NEFF loads against the same
+            1-core config the rest of the pipeline uses.
 
     Returns:
         A ``(ProfileResult, nki_source)`` pair. The ``ProfileResult``'s
@@ -128,39 +121,32 @@ def profile_numpy_baseline(
     os.environ["NEURON_LOGICAL_NC_CONFIG"] = "1"
     tensor_specs = {name: {"shape": list(shape), "dtype": dt} for name, (shape, dt) in input_specs.items()}
     kernel_kwargs = generate_tensors(tensor_specs, seed=42)
-    first_dtype = next(iter(input_specs.values()))[1]
-    config = BenchmarkConfig(warmup=10, iters=100, mac_count=mac_count, input_dtype_name=first_dtype)
 
-    min_ms: float | None = None
-    mean_ms: float | None = None
-    p50_ms: float | None = None
-    p99_ms: float | None = None
-    mfu: float | None = None
-    roofline = RooflineMetrics(
-        mbu_estimated_percent=None, mfu_max_achievable_estimated_percent=None, roofline_efficiency=None
-    )
+    profiler_summary: dict[str, Any] | None = None
+    profile_detailed: dict[str, Any] | None = None
+    neff_b64: str | None = None
+    ntff_b64: str | None = None
     hardware_output = "baseline"
     nki_source = ""
     try:
         compiled, nki_source = _compile_numpy_fn(func, kernel_kwargs, output_dir, additional_compiler_args)
         with BaremetalExecutor(verbose=0) as spike:
-            min_ms, mean_ms, p50_ms, p99_ms, mfu = _run_timing(spike, compiled, kernel_kwargs, config)
-            roofline = _collect_roofline(spike, compiled, kernel_kwargs, mfu)
+            profiler_summary, profile_detailed, ntff_b64 = _collect_profiler_outputs(
+                spike, compiled, kernel_kwargs, collect_detailed_profile
+            )
+        if collect_detailed_profile:
+            with open(compiled.compiled_artifact, "rb") as f:
+                neff_b64 = base64.b64encode(f.read()).decode("ascii")
     except Exception as e:
         hardware_output = capture_error(e)
     result = ProfileResult(
         kernel_name=kernel_name,
-        min_ms=min_ms,
-        mean_ms=mean_ms,
-        p50_ms=p50_ms,
-        p99_ms=p99_ms,
-        mac_count=mac_count,
-        mfu=mfu,
         cpu_sim=_sim_not_run(),
         hardware_output=hardware_output,
-        mbu_estimated_percent=roofline.mbu_estimated_percent,
-        mfu_max_achievable_estimated_percent=roofline.mfu_max_achievable_estimated_percent,
-        roofline_efficiency=roofline.roofline_efficiency,
+        profiler_summary=profiler_summary,
+        profile_detailed=profile_detailed,
+        neff_b64=neff_b64,
+        ntff_b64=ntff_b64,
     )
     return result, nki_source
 
@@ -181,9 +167,9 @@ def baseline_worker_main() -> None:
           "func_source": str,     # exec'd in a fresh namespace
           "func_name": str,       # callable to lookup in that namespace
           "input_specs": {name: [[shape...], dtype_str]},
-          "mac_count": int,
           "kernel_name": str,
           "additional_compiler_args": str,
+          "collect_detailed_profile": bool,
         }
     """
     payload: dict[str, Any] = json.loads(sys.stdin.buffer.read())
@@ -204,10 +190,10 @@ def baseline_worker_main() -> None:
         result, nki_source = profile_numpy_baseline(
             func=func,
             input_specs=input_specs,
-            mac_count=payload["mac_count"],
             output_dir=f"/tmp/autotune-baseline-{payload['kernel_name']}",
             kernel_name=payload["kernel_name"],
             additional_compiler_args=payload["additional_compiler_args"],
+            collect_detailed_profile=bool(payload.get("collect_detailed_profile", False)),
         )
     finally:
         sys.stdout = real_stdout

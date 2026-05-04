@@ -167,6 +167,7 @@ def compile_nki_kernel(
     output_dtype: np.dtype,
     output_dir: str,
     neuronx_cc_args: tuple[str, ...],
+    lnc: int = 1,
 ) -> str:
     """Compile an NKI kernel file to NEFF via nki.compiler.
 
@@ -190,7 +191,7 @@ def compile_nki_kernel(
 
     kernel = Kernel(kernel_func)
     neff_file = os.path.join(output_dir, "file.neff")
-    opts = CompileOptions(target="trn2", lnc=1, output_path=neff_file, artifacts_dir=output_dir)
+    opts = CompileOptions(target="trn2", lnc=lnc, output_path=neff_file, artifacts_dir=output_dir)
     if neuronx_cc_args:
         opts = opts.set_pipeline_options(*neuronx_cc_args)
     _run_compiler(kernel, tensor_inputs, output_name, opts)
@@ -212,6 +213,7 @@ def compile_one(
     compile_dir: str,
     scalar_params: dict[str, float],
     neuronx_cc_args: tuple[str, ...],
+    lnc: int = 1,
 ) -> CompileResult:
     """Top-level picklable worker for parallel NKI compilation.
 
@@ -240,7 +242,7 @@ def compile_one(
         for name, value in scalar_params.items():
             input_tensors[name] = value
         neff_path = compile_nki_kernel(
-            nki_path, func_name, input_tensors, output_name, output_shape, out_dtype, compile_dir, neuronx_cc_args
+            nki_path, func_name, input_tensors, output_name, output_shape, out_dtype, compile_dir, neuronx_cc_args, lnc
         )
     except Exception as e:
         error = capture_error(e)
