@@ -1,24 +1,27 @@
-"""``nkigym_compile``: synthesis → eager codegen driver.
+"""``nkigym_compile``: synthesis → eager codegen → tune driver.
 
-Single public entry point for the nkigym compilation pipeline. Runs the
-selected ``stages`` in order, caching each stage's artifact under
-``cache_dir``:
+Single public entry point for the nkigym compilation pipeline. Runs
+all three stages in order on every call and caches their artifacts
+under ``cache_dir``:
 
 ``<cache_dir>/``
 
-* ``f_nkigym.py``  — synthesised ``f_nkigym`` math function
-  (produced by ``"synthesis"``).
-* ``kernel.py``    — rendered eager NKI kernel (produced by
-  ``"initial_codegen"``).
+* ``f_nkigym.py``              — synthesised ``f_nkigym`` math function.
+* ``kernel.py``                — rendered canonical eager NKI kernel.
+* ``kernel_tuned_{idx:04d}.py``  — batch-path rendered samples
+  (``rewrites=None``; default).
+* ``kernel_tuned.py``          — explicit-path single rendered kernel
+  (``rewrites=[...]``).
+* ``results.json``             — per-kernel + aggregate profile data,
+  written by ``autotune.remote_profile`` on the batch path.
 
-``"initial_codegen"`` also runs an automatic CPU-simulation accuracy
-test: it executes the rendered kernel through ``nki.simulate`` at fp32
-against random inputs drawn from ``input_specs`` and raises
-``AssertionError`` if the result diverges from ``f_numpy`` beyond the
-default tolerance.
+``initial_codegen`` runs an automatic fp32 CPU-sim accuracy check.
+The batch tune path runs the same check per kernel on remote workers
+and raises if any kernel diverges.
 """
 
 import importlib.util
+import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -35,66 +38,73 @@ _ATOL = 5e-3
 _RTOL = 5e-3
 _SIM_SEED = 0
 
-_KNOWN_STAGES = ("synthesis", "initial_codegen", "tune")
-
 
 def nkigym_compile(
     f_numpy: Callable[..., np.ndarray],
     input_specs: dict[str, tuple[tuple[int, ...], str]],
     cache_dir: str | Path,
-    stages: list[str],
+    num_kernels: int,
+    hosts: list[str],
+    venv_python: str,
+    neuron_platform_target: str,
+    collect_detailed_profile: bool = False,
     rewrites: list[KernelRewrite] | None = None,
     seed: int = 0,
 ) -> None:
-    """Run the nkigym compilation pipeline through the given ``stages``.
+    """Run the full nkigym compile pipeline: synthesis → initial_codegen → tune.
 
     Args:
-        f_numpy: Plain-numpy reference — drives both synthesis (input)
-            and the CPU-sim accuracy check (golden).
-        input_specs: ``{param_name: (shape, dtype)}`` for every parameter.
-            Must match ``f_numpy``'s positional parameters by name + order.
-        cache_dir: Directory to write stage artifacts. Created if missing;
-            pre-existing files from prior runs are preserved so stages
-            can be replayed independently.
-        stages: Ordered list of stage names to run. Supported:
-            ``"synthesis"``, ``"initial_codegen"``, ``"tune"``. Later
-            stages consume prior-stage artifacts from ``cache_dir``.
-        rewrites: Consumed only by the ``"tune"`` stage. When ``None``,
-            the stage randomises from :func:`enumerate_fusion_atoms`
-            using ``seed``. When a list is given, rewrites are applied
-            in order; each rewrite's legality is checked against the
-            current ``(op_graph, forest)`` state.
-        seed: Seeds the random rewrite draw when ``rewrites`` is ``None``.
+        f_numpy: Plain-numpy reference. Drives synthesis (input),
+            ``initial_codegen``'s inline CPU-sim check (golden), and
+            the batch path's output-shape trace + kernel-level
+            correctness golden.
+        input_specs: ``{param_name: (shape, dtype_str)}``; order
+            matches ``f_numpy``'s positional parameters by name.
+        cache_dir: Artifact directory. Created if missing;
+            pre-existing files for each stage are overwritten.
+        num_kernels: Batch path — number of kernels to sample + profile.
+            Ignored when ``rewrites`` is not ``None``.
+        hosts: SSH hosts for ``remote_profile``. Ignored when
+            ``rewrites`` is not ``None``.
+        venv_python: Python executable on remote hosts.
+        neuron_platform_target: Neuron target (e.g. ``"trn2"``).
+        collect_detailed_profile: Collect the full per-instruction
+            profile + NEFF/NTFF per kernel. Off by default.
+        rewrites: ``None`` → batch path (default). List →
+            deterministic explicit path, writes
+            ``kernel_tuned.py`` only, no HW profile.
+        seed: Drives sampling (batch path) and ``remote_profile``
+            input-tensor generation.
 
     Raises:
-        ValueError: An unknown stage name is in ``stages``, a stage's
-            required input artifact is missing from ``cache_dir``, or an
-            explicit rewrite is illegal on the current state.
-        AssertionError: The CPU-sim result of the rendered kernel
-            diverges from ``f_numpy`` beyond the fp32 tolerance.
+        AssertionError: Any sampled kernel fails CPU sim (batch) or
+            the canonical ``initial_codegen`` CPU sim fails.
+        ValueError: ``rewrites`` list has an illegal atom on the
+            current state.
     """
-    for stage in stages:
-        if stage not in _KNOWN_STAGES:
-            raise ValueError(f"Unknown stage {stage!r}; expected one of {_KNOWN_STAGES}")
-
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
 
-    for stage in stages:
-        if stage == "synthesis":
-            _run_synthesis(f_numpy, input_specs, cache_path)
-        elif stage == "initial_codegen":
-            _run_initial_codegen(f_numpy, input_specs, cache_path)
-        elif stage == "tune":
-            run_tune(
-                f_numpy,
-                input_specs,
-                cache_path,
-                rewrites=rewrites,
-                seed=seed,
-                load_f_nkigym=_load_f_nkigym,
-                cpu_sim_check=_cpu_sim_check,
-            )
+    _run_synthesis(f_numpy, input_specs, cache_path)
+    _run_initial_codegen(f_numpy, input_specs, cache_path)
+    run_tune(
+        f_numpy=f_numpy,
+        input_specs=input_specs,
+        cache_path=cache_path,
+        rewrites=rewrites,
+        seed=seed,
+        load_f_nkigym=_load_f_nkigym,
+        cpu_sim_check=_cpu_sim_check,
+        num_kernels=num_kernels,
+        hosts=hosts,
+        venv_python=venv_python,
+        neuron_platform_target=neuron_platform_target,
+        collect_detailed_profile=collect_detailed_profile,
+        trace_output_shape=_trace_output_shape,
+        assert_no_cpu_sim_failures=_assert_no_cpu_sim_failures,
+        atol=_ATOL,
+        rtol=_RTOL,
+    )
 
 
 def _run_synthesis(
@@ -172,3 +182,38 @@ def _draw_fp32_inputs(input_specs: dict[str, tuple[tuple[int, ...], str]]) -> di
     """Draw reproducible fp32 inputs for the CPU-sim accuracy check."""
     rng = np.random.default_rng(_SIM_SEED)
     return {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _) in input_specs.items()}
+
+
+def _trace_output_shape(
+    f_numpy: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]
+) -> tuple[int, ...]:
+    """Trace the numpy reference once to recover the output shape.
+
+    ``KernelJob`` requires the output HBM shape on the coordinator so
+    workers skip unreliable AST parsing. The same random fp32 inputs
+    used by :func:`_cpu_sim_check` drive the trace — if the numpy
+    reference is deterministic on shape this is stable regardless of
+    seed.
+    """
+    inputs = _draw_fp32_inputs(input_specs)
+    result = f_numpy(**inputs)
+    if isinstance(result, tuple):
+        result = result[0]
+    return tuple(result.shape)
+
+
+def _assert_no_cpu_sim_failures(results_json_path: Path) -> None:
+    """Raise ``AssertionError`` when any kernel in ``results.json`` failed CPU sim.
+
+    ``remote_profile`` writes a ``results.json`` whose ``"kernels"``
+    array has one entry per kernel with a boolean ``"cpu_sim_passed"``.
+    Per the design spec, CPU-sim divergence on any batched kernel is
+    a bug; HW compile/runtime failures are tolerated (emitted into
+    ``results.json`` but not raised here).
+    """
+    data = json.loads(results_json_path.read_text())
+    failed = [k["kernel_name"] for k in data["kernels"] if not k["cpu_sim_passed"]]
+    if failed:
+        raise AssertionError(
+            f"CPU-sim failures in batch tune stage: {failed}. " f"See {results_json_path} for details."
+        )
