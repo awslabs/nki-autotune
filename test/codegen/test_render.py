@@ -97,7 +97,8 @@ def test_render_emits_header_and_allocations() -> None:
     assert "sbuf_lhs_T = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)" in src
     assert "sbuf_rhs = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)" in src
     assert "sbuf_prod = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)" in src
-    assert "sbuf_out = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)" in src
+    """Return tensor (``out``) lives only in HBM — no sbuf_out allocation."""
+    assert "sbuf_out =" not in src
 
 
 def _header_only(g) -> str:

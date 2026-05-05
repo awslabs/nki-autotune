@@ -97,9 +97,15 @@ def _emit_hbm_output(w: _Writer, op_graph: OpGraph) -> None:
 
 
 def _emit_sbuf_allocations(w: _Writer, op_graph: OpGraph) -> None:
-    """Allocate every SBUF intermediate + the SBUF mirror of the return."""
+    """Allocate one SBUF buffer per intermediate.
+
+    Kernel inputs live in HBM (consumed by ``NKILoad``) and the return
+    tensor lives in HBM (written by ``NKIStore``). The store emitter
+    reads from its data-operand's SBUF buffer directly, so the return
+    has no SBUF mirror and is skipped here.
+    """
     for name, tensor in op_graph.tensors.items():
-        if tensor.origin == "param":
+        if tensor.origin in ("param", "return"):
             continue
         shape = _sbuf_shape(tensor, op_graph)
         w.line(f"{_sbuf_name(name)} = nl.ndarray({shape}, dtype=nl.{tensor.dtype}, buffer=nl.sbuf)")
