@@ -126,11 +126,9 @@ def test_sbuf_tile_slice_2d() -> None:
     """Per-tile slice for a 2D SBUF tensor uses ``(i_<d>_0 + i_<d>_1)``."""
     from nkigym.codegen.render import _sbuf_tile_slice
 
-    ordinals = {"d0": 2, "d1": 2}
+    names = {"d0": ["i_d0_0", "i_d0_1"], "d1": ["i_d1_0", "i_d1_1"]}
     trips = {"d0": [16, 1], "d1": [8, 1]}
-    slice_expr = _sbuf_tile_slice(
-        "sbuf_lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_ordinals=ordinals, path_trips=trips
-    )
+    slice_expr = _sbuf_tile_slice("sbuf_lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_names=names, path_trips=trips)
     assert slice_expr == (
         "sbuf_lhs[0:128, i_d0_0 + i_d0_1, " "(i_d1_0 + i_d1_1) * 128 : (i_d1_0 + i_d1_1) * 128 + 128]"
     )
@@ -140,9 +138,9 @@ def test_sbuf_tile_slice_1d() -> None:
     """Per-tile slice for a 1D SBUF tensor uses ``(i_<p>_0 + i_<p>_1)`` on P."""
     from nkigym.codegen.render import _sbuf_tile_slice
 
-    ordinals = {"d0": 2}
+    names = {"d0": ["i_d0_0", "i_d0_1"]}
     trips = {"d0": [4, 1]}
-    slice_expr = _sbuf_tile_slice("sbuf_rms", ("d0",), p_tile=128, f_tile=1, path_ordinals=ordinals, path_trips=trips)
+    slice_expr = _sbuf_tile_slice("sbuf_rms", ("d0",), p_tile=128, f_tile=1, path_names=names, path_trips=trips)
     assert slice_expr == "sbuf_rms[0:128, i_d0_0 + i_d0_1, 0:1]"
 
 
@@ -150,9 +148,9 @@ def test_hbm_tile_slice() -> None:
     """HBM tile slice uses ``(i_<d>_0 + i_<d>_1) * tile`` offsets."""
     from nkigym.codegen.render import _hbm_tile_slice
 
-    ordinals = {"d0": 2, "d1": 2}
+    names = {"d0": ["i_d0_0", "i_d0_1"], "d1": ["i_d1_0", "i_d1_1"]}
     trips = {"d0": [16, 1], "d1": [16, 1]}
-    slice_expr = _hbm_tile_slice("lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_ordinals=ordinals, path_trips=trips)
+    slice_expr = _hbm_tile_slice("lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_names=names, path_trips=trips)
     assert slice_expr == (
         "lhs[(i_d0_0 + i_d0_1) * 128 : (i_d0_0 + i_d0_1) * 128 + 128, "
         "(i_d1_0 + i_d1_1) * 128 : (i_d1_0 + i_d1_1) * 128 + 128]"
@@ -346,11 +344,9 @@ def test_sbuf_tile_slice_2d_canonical_form() -> None:
     """Canonical 2N-form: i_<d>_0 + i_<d>_1 with parenthesised compound on free axis."""
     from nkigym.codegen.render import _sbuf_tile_slice
 
-    ordinals = {"d0": 2, "d1": 2}
+    names = {"d0": ["i_d0_0", "i_d0_1"], "d1": ["i_d1_0", "i_d1_1"]}
     trips = {"d0": [16, 1], "d1": [8, 1]}
-    slice_expr = _sbuf_tile_slice(
-        "sbuf_lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_ordinals=ordinals, path_trips=trips
-    )
+    slice_expr = _sbuf_tile_slice("sbuf_lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_names=names, path_trips=trips)
     assert slice_expr == (
         "sbuf_lhs[0:128, i_d0_0 + i_d0_1, " "(i_d1_0 + i_d1_1) * 128 : (i_d1_0 + i_d1_1) * 128 + 128]"
     )
@@ -360,9 +356,9 @@ def test_sbuf_tile_slice_1d_canonical_form() -> None:
     """1D tensor uses only partition-axis path ordinals, free-axis literal 0:1."""
     from nkigym.codegen.render import _sbuf_tile_slice
 
-    ordinals = {"d0": 2}
+    names = {"d0": ["i_d0_0", "i_d0_1"]}
     trips = {"d0": [4, 1]}
-    slice_expr = _sbuf_tile_slice("sbuf_rms", ("d0",), p_tile=128, f_tile=1, path_ordinals=ordinals, path_trips=trips)
+    slice_expr = _sbuf_tile_slice("sbuf_rms", ("d0",), p_tile=128, f_tile=1, path_names=names, path_trips=trips)
     assert slice_expr == "sbuf_rms[0:128, i_d0_0 + i_d0_1, 0:1]"
 
 
@@ -370,9 +366,9 @@ def test_hbm_tile_slice_parenthesises_compound_before_multiplication() -> None:
     """HBM slice wraps (i_<d>_0 + i_<d>_1) in parens before the * tile multiplication."""
     from nkigym.codegen.render import _hbm_tile_slice
 
-    ordinals = {"d0": 2, "d1": 2}
+    names = {"d0": ["i_d0_0", "i_d0_1"], "d1": ["i_d1_0", "i_d1_1"]}
     trips = {"d0": [16, 1], "d1": [16, 1]}
-    slice_expr = _hbm_tile_slice("lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_ordinals=ordinals, path_trips=trips)
+    slice_expr = _hbm_tile_slice("lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_names=names, path_trips=trips)
     assert slice_expr == (
         "lhs[(i_d0_0 + i_d0_1) * 128 : (i_d0_0 + i_d0_1) * 128 + 128, "
         "(i_d1_0 + i_d1_1) * 128 : (i_d1_0 + i_d1_1) * 128 + 128]"
@@ -383,10 +379,10 @@ def test_swapped_dst_tile_slice_swaps_p_and_f_for_transpose() -> None:
     """Transpose dst: partition slot = src_f's ordinals; free slot = src_p's ordinals."""
     from nkigym.codegen.render import _swapped_dst_tile_slice
 
-    ordinals = {"d0": 2, "d1": 2}
+    names = {"d0": ["i_d0_0", "i_d0_1"], "d1": ["i_d1_0", "i_d1_1"]}
     trips = {"d0": [16, 1], "d1": [16, 1]}
     slice_expr = _swapped_dst_tile_slice(
-        dst_name="lhs_T", src_p_axis="d0", src_f_axis="d1", tile=128, path_ordinals=ordinals, path_trips=trips
+        dst_name="lhs_T", src_p_axis="d0", src_f_axis="d1", tile=128, path_names=names, path_trips=trips
     )
     assert slice_expr == (
         "sbuf_lhs_T[0:128, i_d1_0 + i_d1_1, " "(i_d0_0 + i_d0_1) * 128 : (i_d0_0 + i_d0_1) * 128 + 128]"
@@ -397,9 +393,9 @@ def test_slot_expr_collapses_when_tail_product_is_one() -> None:
     """Canonical form trips [t_0, 1]: term i_<d>_0 has tail=1, so no ' * N' multiplier."""
     from nkigym.codegen.render import _slot_expr
 
-    ordinals = {"d0": 2}
+    names = {"d0": ["i_d0_0", "i_d0_1"]}
     trips = {"d0": [16, 1]}
-    expr = _slot_expr(ordinals, trips, "d0")
+    expr = _slot_expr(names, trips, "d0")
     assert expr == "i_d0_0 + i_d0_1"
 
 
@@ -407,18 +403,18 @@ def test_slot_expr_multi_split_uses_tail_products() -> None:
     """If trips [t_0, t_1, 1], outermost term carries '* t_1' (tail product)."""
     from nkigym.codegen.render import _slot_expr
 
-    ordinals = {"d0": 3}
+    names = {"d0": ["i_d0_0", "i_d0_1", "i_d0_2"]}
     trips = {"d0": [4, 2, 1]}
-    expr = _slot_expr(ordinals, trips, "d0")
+    expr = _slot_expr(names, trips, "d0")
     assert expr == "i_d0_0 * 2 + i_d0_1 + i_d0_2"
 
 
 def test_slot_expr_raises_when_dim_has_no_ancestors() -> None:
-    """If path_ordinals[dim] is 0 or missing, caller has no open loop for that dim — raise."""
+    """If path_names[dim] is empty or missing, caller has no open loop for that dim — raise."""
     from nkigym.codegen.render import _slot_expr
 
     try:
-        _slot_expr({"d0": 0}, {"d0": []}, "d0")
+        _slot_expr({"d0": []}, {"d0": []}, "d0")
     except ValueError as exc:
         assert "d0" in str(exc)
     else:
@@ -440,16 +436,18 @@ def test_walker_emits_for_headers_with_path_ordinal_names() -> None:
 
     specs = {"x": ((128, 256), "bfloat16")}
     g = parse_and_resolve(_walker_test_kernel, specs)
-    """Synthesise a minimal forest with a single LoopNode pair + a marker BodyLeaf."""
+    """Synthesise a minimal forest with a single LoopNode pair + a marker BodyLeaf.
+    Omit node.name so the walker falls back to position-derived names — this
+    test verifies the fallback path works for hand-built test forests."""
     marker_tree = LoopNode(
         "d0", 4, AxisRole.PARALLEL, [LoopNode("d0", 1, AxisRole.PARALLEL, [BodyLeaf(op_idx=0, phase="_marker_")])]
     )
 
-    def _marker_emitter(w, op_graph, op, path_ordinals, path_trips):
-        """Test emitter — prints the ordinals and trips it sees at body time."""
-        d0_ord = path_ordinals.get("d0", 0)
+    def _marker_emitter(w, op_graph, op, path_names, path_trips):
+        """Test emitter — prints the names and trips it sees at body time."""
+        d0_names = path_names.get("d0", [])
         d0_trips = path_trips.get("d0", [])
-        w.line(f"MARK(d0_ord={d0_ord}, trips={d0_trips!r})")
+        w.line(f"MARK(d0_names={d0_names!r}, trips={d0_trips!r})")
 
     _BODY_EMITTERS[("NKILoad", "_marker_")] = _marker_emitter
 
@@ -459,7 +457,7 @@ def test_walker_emits_for_headers_with_path_ordinal_names() -> None:
         src = w.getvalue()
         assert "for i_d0_0 in range(4):" in src
         assert "for i_d0_1 in range(1):" in src
-        assert "MARK(d0_ord=2, trips=[4, 1])" in src
+        assert "MARK(d0_names=['i_d0_0', 'i_d0_1'], trips=[4, 1])" in src
     finally:
         """Clean up the test registration so it doesn't pollute other tests."""
         del _BODY_EMITTERS[("NKILoad", "_marker_")]
@@ -470,7 +468,7 @@ def test_register_body_decorator_stores_emitter_keyed_on_op_kind_and_phase() -> 
     from nkigym.codegen.render import _BODY_EMITTERS, _register_body
 
     @_register_body("TestOp", "test_phase")
-    def _emit_test(w, op_graph, op, path_ordinals, path_trips):
+    def _emit_test(w, op_graph, op, path_names, path_trips):
         w.line("TEST")
 
     try:

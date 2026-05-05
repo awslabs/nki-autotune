@@ -141,19 +141,32 @@ def _rewrite_forest(forest: LoopForest, path: tuple[int, ...], boundary: tuple[i
     parent = forest[idx]
     assert isinstance(parent, LoopNode)
     new_children = _rewrite_forest(parent.children, rest, boundary, dim_id)
-    new_parent = LoopNode(dim_id=parent.dim_id, trip_count=parent.trip_count, role=parent.role, children=new_children)
+    new_parent = LoopNode(
+        dim_id=parent.dim_id,
+        trip_count=parent.trip_count,
+        role=parent.role,
+        children=new_children,
+        reduce_op=parent.reduce_op,
+        name=parent.name,
+    )
     return [*forest[:idx], new_parent, *forest[idx + 1 :]]
 
 
 def _merge_pair(
     siblings: list[LoopNode | BodyLeaf], boundary: tuple[int, int], dim_id: str
 ) -> list[LoopNode | BodyLeaf]:
-    """Merge one adjacent pair inside ``siblings``."""
+    """Merge one adjacent pair inside ``siblings``.
+
+    The merged loop inherits ``a``'s ``name`` — either side's name is
+    valid (fusion requires identical dim_id + trip_count, so a caller
+    that named them the same at build time would see the same name
+    either way), and taking the left one is arbitrary but deterministic.
+    """
     i, j = boundary
     a = siblings[i]
     b = siblings[j]
     assert isinstance(a, LoopNode) and isinstance(b, LoopNode)
     merged = LoopNode(
-        dim_id=dim_id, trip_count=a.trip_count, role=AxisRole.PARALLEL, children=[*a.children, *b.children]
+        dim_id=dim_id, trip_count=a.trip_count, role=AxisRole.PARALLEL, children=[*a.children, *b.children], name=a.name
     )
     return [*siblings[:i], merged, *siblings[j + 1 :]]

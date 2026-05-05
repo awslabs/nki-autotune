@@ -7,6 +7,14 @@ python <script>
 pytest <tests>
 ```
 
-Next to-do:
-1. Online Fusion as an IR rewrite
-2. Computation skipping as an IR rewrite
+Performance tuning:
+- [x] Loop fusion
+- [x] Loop order
+- [ ] Unified tune stage
+- [ ] Tiles per block
+- [ ] Hoist
+- [ ] Multi buffer
+- [ ] Software pipelining
+- [ ] Online fusion at synthesis stage
+- [ ] Computation skipping at synthesis stage
+- [ ] Two level synthesis+tune

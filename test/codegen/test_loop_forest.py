@@ -259,3 +259,184 @@ def test_canonical_forest_rmsnorm_matmul_invariant_holds() -> None:
     op_touched = {o.idx: o.touched_dims for o in g.ops}
     phase_touched = compute_phase_touched(g)
     check_invariant(forest, num_tiles, op_touched, phase_touched)
+
+
+def test_loop_node_reduce_op_defaults_to_none() -> None:
+    """LoopNode without an explicit reduce_op defaults to None."""
+    from nkigym.codegen.loop_forest import LoopNode
+    from nkigym.ops.base import AxisRole
+
+    node = LoopNode(dim_id="d0", trip_count=4, role=AxisRole.PARALLEL)
+    assert node.reduce_op is None
+
+
+def test_loop_node_reduce_op_accepts_explicit_value() -> None:
+    """LoopNode can be constructed with reduce_op='add' for ACC loops."""
+    from nkigym.codegen.loop_forest import LoopNode
+    from nkigym.ops.base import AxisRole
+
+    node = LoopNode(dim_id="d0", trip_count=4, role=AxisRole.ACCUMULATION, reduce_op="add")
+    assert node.reduce_op == "add"
+
+
+def test_canonical_forest_matmul_k_loops_carry_reduce_op_add() -> None:
+    """Matmul's K-chain LoopNodes (block + tile) carry reduce_op='add'."""
+    from nkigym.codegen.loop_forest import LoopNode, build_canonical_forest
+
+    g = _parse(_matmul_lhsT_rhs_for_forest_tests, _MATMUL_SPECS)
+    forest = build_canonical_forest(g)
+    matmul_idx = next(i for i, op in enumerate(g.ops) if op.op_cls.__name__ == "NKIMatmul")
+    tree = forest[matmul_idx]
+    n_tile = tree.children[0].children[0].children[0]
+    k_block = n_tile.children[1]
+    assert isinstance(k_block, LoopNode)
+    assert k_block.reduce_op == "add"
+    k_tile = k_block.children[0]
+    assert isinstance(k_tile, LoopNode)
+    assert k_tile.reduce_op == "add"
+
+
+def test_canonical_forest_matmul_m_n_loops_have_no_reduce_op() -> None:
+    """Matmul's M and N loops are PARALLEL and carry reduce_op=None."""
+    from nkigym.codegen.loop_forest import LoopNode, build_canonical_forest
+
+    g = _parse(_matmul_lhsT_rhs_for_forest_tests, _MATMUL_SPECS)
+    forest = build_canonical_forest(g)
+    matmul_idx = next(i for i, op in enumerate(g.ops) if op.op_cls.__name__ == "NKIMatmul")
+    tree = forest[matmul_idx]
+    m_block = tree
+    m_tile = m_block.children[0]
+    n_block = m_tile.children[0]
+    n_tile = n_block.children[0]
+    for node in (m_block, m_tile, n_block, n_tile):
+        assert isinstance(node, LoopNode)
+        assert node.reduce_op is None
+
+
+def test_canonical_forest_activation_reduce_f_loops_carry_kwargs_reduce_op() -> None:
+    """ActivationReduce F-chain LoopNodes carry reduce_op from op_kwargs."""
+    from nkigym.codegen.loop_forest import LoopNode, build_canonical_forest
+
+    g = _parse(_rms_kernel_with_post_op, _RMS_SPECS)
+    forest = build_canonical_forest(g)
+    ar_idx = next(i for i, op in enumerate(g.ops) if op.op_cls.__name__ == "NKIActivationReduce")
+    tree = forest[ar_idx]
+    p_tile = tree.children[0]
+    f_block = p_tile.children[1]
+    assert isinstance(f_block, LoopNode)
+    assert f_block.reduce_op == "add"
+    f_tile = f_block.children[0]
+    assert isinstance(f_tile, LoopNode)
+    assert f_tile.reduce_op == "add"
+
+
+def test_hash_forest_is_deterministic_across_invocations() -> None:
+    """Two calls on the same forest produce the same hash."""
+    from nkigym.codegen.loop_forest import build_canonical_forest, hash_forest
+
+    g = _parse(_rmsnorm_matmul, _RMSNORM_MATMUL_SPECS)
+    forest = build_canonical_forest(g)
+    assert hash_forest(forest) == hash_forest(forest)
+
+
+def test_hash_forest_equals_for_independently_built_canonical_forests() -> None:
+    """Two independent canonical forests of the same op_graph hash equal."""
+    from nkigym.codegen.loop_forest import build_canonical_forest, hash_forest
+
+    g = _parse(_rmsnorm_matmul, _RMSNORM_MATMUL_SPECS)
+    f1 = build_canonical_forest(g)
+    f2 = build_canonical_forest(g)
+    assert hash_forest(f1) == hash_forest(f2)
+
+
+def test_hash_forest_distinguishes_trip_count_change() -> None:
+    """Forests differing only in a trip count hash differently."""
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_forest
+    from nkigym.ops.base import AxisRole
+
+    f1 = [LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])]
+    f2 = [LoopNode("d0", 8, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])]
+    assert hash_forest(f1) != hash_forest(f2)
+
+
+def test_hash_forest_distinguishes_dim_id_change() -> None:
+    """Forests differing only in dim_id at a node hash differently."""
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_forest
+    from nkigym.ops.base import AxisRole
+
+    f1 = [LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])]
+    f2 = [LoopNode("d1", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])]
+    assert hash_forest(f1) != hash_forest(f2)
+
+
+def test_hash_forest_distinguishes_reduce_op_change() -> None:
+    """Forests differing only in reduce_op hash differently."""
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_forest
+    from nkigym.ops.base import AxisRole
+
+    f1 = [LoopNode("d0", 4, AxisRole.ACCUMULATION, [BodyLeaf(op_idx=0)], reduce_op="add")]
+    f2 = [LoopNode("d0", 4, AxisRole.ACCUMULATION, [BodyLeaf(op_idx=0)], reduce_op="max")]
+    assert hash_forest(f1) != hash_forest(f2)
+
+
+def test_hash_forest_distinguishes_leaf_phase_change() -> None:
+    """Leaves differing only in phase hash differently."""
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_forest
+    from nkigym.ops.base import AxisRole
+
+    f1 = [LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0, phase="a")])]
+    f2 = [LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0, phase="b")])]
+    assert hash_forest(f1) != hash_forest(f2)
+
+
+def test_resolve_node_returns_forest_root_entry_for_single_index_path() -> None:
+    """path=(0,) returns forest[0]."""
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, _resolve_node
+    from nkigym.ops.base import AxisRole
+
+    node_a = LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])
+    node_b = LoopNode("d1", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=1)])
+    forest = [node_a, node_b]
+    assert _resolve_node(forest, (0,)) is node_a
+    assert _resolve_node(forest, (1,)) is node_b
+
+
+def test_resolve_node_walks_nested_children() -> None:
+    """path=(0, 0) returns forest[0].children[0]."""
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, _resolve_node
+    from nkigym.ops.base import AxisRole
+
+    leaf = BodyLeaf(op_idx=0)
+    inner = LoopNode("d1", 1, AxisRole.PARALLEL, [leaf])
+    outer = LoopNode("d0", 4, AxisRole.PARALLEL, [inner])
+    forest = [outer]
+    assert _resolve_node(forest, (0, 0)) is inner
+    assert _resolve_node(forest, (0, 0, 0)) is leaf
+
+
+def test_resolve_node_returns_none_for_empty_path() -> None:
+    """Empty path is invalid (no target node)."""
+    from nkigym.codegen.loop_forest import _resolve_node
+
+    assert _resolve_node([], ()) is None
+
+
+def test_resolve_node_returns_none_for_out_of_range_index() -> None:
+    """Path index beyond children length returns None."""
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, _resolve_node
+    from nkigym.ops.base import AxisRole
+
+    forest = [LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])]
+    assert _resolve_node(forest, (99,)) is None
+    assert _resolve_node(forest, (0, 99)) is None
+
+
+def test_resolve_node_returns_none_when_traversing_through_body_leaf() -> None:
+    """Can't descend into a BodyLeaf's 'children'; returns None."""
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, _resolve_node
+    from nkigym.ops.base import AxisRole
+
+    leaf = BodyLeaf(op_idx=0)
+    forest = [LoopNode("d0", 4, AxisRole.PARALLEL, [leaf])]
+    """path=(0, 0, 0) would try to descend into leaf.children."""
+    assert _resolve_node(forest, (0, 0, 0)) is None

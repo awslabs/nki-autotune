@@ -13,10 +13,11 @@ from pathlib import Path
 import numpy as np
 
 from nkigym.codegen.graph import parse_and_resolve
-from nkigym.codegen.loop_forest import build_canonical_forest
+from nkigym.codegen.loop_forest import build_canonical_forest, hash_forest
 from nkigym.codegen.render import render
 from nkigym.tune import KernelRewrite
 from nkigym.tune.fuse_loops import enumerate_fusion_atoms
+from nkigym.tune.reorder_loops import enumerate_reorder_atoms
 
 
 def run_tune(
@@ -34,11 +35,14 @@ def run_tune(
 
     * **Explicit** (``rewrites`` is a list): apply each rewrite in order,
       checking legality before each ``apply`` because the caller's
-      boundary indices may become stale after prior applies.
-    * **Random** (``rewrites`` is ``None``): re-enumerate legal atoms
-      between applies and pick the first one whose coin-flip survives,
-      using a seeded RNG. Terminates when no legal atom survives the
-      draw.
+      boundary / path indices may become stale after prior applies.
+    * **Random** (``rewrites`` is ``None``): draw atoms from
+      ``enumerate_fusion_atoms`` + ``enumerate_reorder_atoms`` between
+      applies, pick the first one whose coin-flip survives, and apply
+      it. Terminates when no atom survives the draw or when the
+      resulting forest state repeats (hash-detected cycle — reorder
+      atoms are self-inverse, so a self-canceling pair must stop the
+      loop).
 
     Args:
         f_numpy: Plain-numpy reference used as the CPU-sim golden.
@@ -65,13 +69,18 @@ def run_tune(
 
     if rewrites is None:
         rng = random.Random(seed)
+        seen: set[int] = {hash_forest(forest)}
         while True:
-            atoms = enumerate_fusion_atoms(forest)
+            atoms = enumerate_fusion_atoms(forest) + enumerate_reorder_atoms(forest)
             candidates = [a for a in atoms if rng.random() < 0.5]
             if not candidates:
                 break
             chosen = candidates[0]
             op_graph, forest = chosen.apply(op_graph, forest)
+            h = hash_forest(forest)
+            if h in seen:
+                break
+            seen.add(h)
     else:
         for r in rewrites:
             if not r.is_legal(op_graph, forest):

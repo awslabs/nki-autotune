@@ -44,12 +44,25 @@ class LoopNode:
             construction (fusion requires both sides PARALLEL).
         children: Nested ``LoopNode``s and/or terminal ``BodyLeaf``s, in
             emission order.
+        reduce_op: Reducer name for ACCUMULATION loops (``"add"``,
+            ``"max"``, ...). ``None`` for PARALLEL / SEQUENTIAL loops.
+            Used by :class:`ReorderLoops` to detect associative-
+            compatible ACC×ACC swaps.
+        name: Loop variable name emitted in the rendered ``for`` header.
+            Populated by :func:`build_canonical_forest` as ``f"i_{dim_id}_{k}"``
+            where ``k`` counts same-dim ancestors outermost→innermost at
+            build time. Preserved verbatim across :class:`FuseLoops` and
+            :class:`ReorderLoops` so loop identity survives swaps. ``None``
+            on raw test forests; the renderer falls back to a
+            position-based name when unset.
     """
 
     dim_id: str
     trip_count: int
     role: AxisRole
     children: "list[LoopNode | BodyLeaf]" = field(default_factory=list)
+    reduce_op: str | None = None
+    name: str | None = None
 
 
 LoopForest = list[LoopNode | BodyLeaf]
@@ -131,8 +144,36 @@ def build_canonical_forest(op_graph: OpGraph) -> LoopForest:
     nested ``LoopNode(d_k, 1)`` ("block" tier then "tile" tier). At the
     deepest point, multi-phase ops place phase leaves per op-class
     rules; single-phase ops place one ``BodyLeaf(op_idx, "main")``.
+
+    After construction, every ``LoopNode`` is named ``f"i_{dim_id}_{k}"``
+    where ``k`` indexes same-dim ancestors root-outward at build time.
+    Names are preserved verbatim across structural rewrites, so loop
+    identity survives reorder and fusion.
     """
-    return [_build_tree(op, op_graph) for op in op_graph.ops]
+    forest = [_build_tree(op, op_graph) for op in op_graph.ops]
+    for tree in forest:
+        _assign_canonical_names(tree, same_dim_counts={})
+    return forest
+
+
+def _assign_canonical_names(node: "LoopNode | BodyLeaf", same_dim_counts: dict[str, int]) -> None:
+    """Walk the tree in a root-outward DFS, naming each LoopNode.
+
+    ``same_dim_counts[d]`` tracks how many same-dim ancestors of ``d``
+    are already open on the current path; the newly visited node takes
+    that as its ordinal, emits a name, then recurses with the counter
+    incremented. Restoring the counter after recursion means siblings
+    see the same counts the parent did (they are not each other's
+    ancestors).
+    """
+    if isinstance(node, BodyLeaf):
+        return
+    k = same_dim_counts.get(node.dim_id, 0)
+    node.name = f"i_{node.dim_id}_{k}"
+    same_dim_counts[node.dim_id] = k + 1
+    for child in node.children:
+        _assign_canonical_names(child, same_dim_counts)
+    same_dim_counts[node.dim_id] = k
 
 
 def compute_phase_touched(op_graph: OpGraph) -> dict[tuple[int, str], tuple[str, ...]]:
@@ -213,14 +254,15 @@ def _build_leaves_matmul(op: ParsedOp, op_graph: OpGraph) -> list[LoopNode | Bod
     The outer M and N dims are consumed by ``_wrap_dims``. The K dim is
     handled here so the body placement mirrors the physical kernel:
     PSUM init lives outside K, ``nc_matmul`` fires inside K, drain
-    runs after K closes.
+    runs after K closes. The K-chain LoopNodes carry ``reduce_op="add"``
+    because nc_matmul's PSUM accumulator is summation.
     """
     k_dim = op.axis_map["K"]
     k_role = op.dim_role[k_dim]
     num_k = op_graph.dims[k_dim].num_tiles
     compute_leaf = BodyLeaf(op_idx=op.idx, phase="compute")
-    k_tile = LoopNode(dim_id=k_dim, trip_count=1, role=k_role, children=[compute_leaf])
-    k_block = LoopNode(dim_id=k_dim, trip_count=num_k, role=k_role, children=[k_tile])
+    k_tile = LoopNode(dim_id=k_dim, trip_count=1, role=k_role, children=[compute_leaf], reduce_op="add")
+    k_block = LoopNode(dim_id=k_dim, trip_count=num_k, role=k_role, children=[k_tile], reduce_op="add")
     return [BodyLeaf(op_idx=op.idx, phase="psum_init"), k_block, BodyLeaf(op_idx=op.idx, phase="drain")]
 
 
@@ -250,15 +292,18 @@ def _build_leaves_activation_reduce(op: ParsedOp, op_graph: OpGraph) -> list[Loo
     The outer P dim is consumed by ``_wrap_dims``. The F dim is handled
     here: an ``F-block / F-tile / BodyLeaf(reduce_step)`` chain sits
     between ``reducer_init`` and the optional ``post_op`` leaf. The
-    ``post_op`` leaf is included only when ``op.op_kwargs["post_op"]``
-    is not ``None``.
+    F-chain LoopNodes carry the reducer name from
+    ``op.op_kwargs["reduce_op"]`` so :class:`ReorderLoops` can detect
+    associative-compatible ACC×ACC pairs. The ``post_op`` leaf is
+    included only when ``op.op_kwargs["post_op"]`` is not ``None``.
     """
     f_dim = op.axis_map["F"]
     f_role = op.dim_role[f_dim]
     num_f = op_graph.dims[f_dim].num_tiles
+    reduce_op = op.op_kwargs["reduce_op"]
     reduce_leaf = BodyLeaf(op_idx=op.idx, phase="reduce_step")
-    f_tile = LoopNode(dim_id=f_dim, trip_count=1, role=f_role, children=[reduce_leaf])
-    f_block = LoopNode(dim_id=f_dim, trip_count=num_f, role=f_role, children=[f_tile])
+    f_tile = LoopNode(dim_id=f_dim, trip_count=1, role=f_role, children=[reduce_leaf], reduce_op=reduce_op)
+    f_block = LoopNode(dim_id=f_dim, trip_count=num_f, role=f_role, children=[f_tile], reduce_op=reduce_op)
     leaves: list[LoopNode | BodyLeaf] = [BodyLeaf(op_idx=op.idx, phase="reducer_init"), f_block]
     if op.op_kwargs.get("post_op") is not None:
         leaves.append(BodyLeaf(op_idx=op.idx, phase="post_op"))
@@ -285,3 +330,59 @@ that returns the dims each phase of that op touches. Used by
 :func:`check_invariant` to validate multi-phase ops correctly."""
 _PHASE_DIMS["NKIMatmul"] = _phase_dims_matmul
 _PHASE_DIMS["NKIActivationReduce"] = _phase_dims_activation_reduce
+
+
+def _canonical_key(node: "LoopNode | BodyLeaf") -> tuple:
+    """Recursive structural key for a node.
+
+    Two nodes (and their subtrees) produce equal keys iff they have the
+    same tree shape, dim_ids, trip counts, roles, reduce_ops, and leaf
+    op_idx / phase tags.
+    """
+    if isinstance(node, BodyLeaf):
+        return ("leaf", node.op_idx, node.phase)
+    return (
+        "node",
+        node.dim_id,
+        node.trip_count,
+        node.role.value,
+        node.reduce_op,
+        tuple(_canonical_key(c) for c in node.children),
+    )
+
+
+def hash_forest(forest: LoopForest) -> int:
+    """Return a deterministic structural hash of ``forest``.
+
+    Used by the ``tune`` stage's random-draw loop to break cycles
+    caused by self-inverse rewrites (e.g. ``ReorderLoops`` applied
+    twice restores the prior state).
+
+    Covers only the forest — current structural rewrites leave
+    ``op_graph`` untouched. Once graph rewrites land, extend the hash
+    to include ``op_graph``.
+    """
+    return hash(tuple(_canonical_key(e) for e in forest))
+
+
+def _resolve_node(forest: LoopForest, path: tuple[int, ...]) -> "LoopNode | BodyLeaf | None":
+    """Walk ``path`` from the forest root; return the node at that position.
+
+    Returns ``None`` when the path is invalid — empty, out of range, or
+    traversing through a ``BodyLeaf``.
+    """
+    if not path:
+        return None
+    siblings: list[LoopNode | BodyLeaf] = list(forest)
+    node: LoopNode | BodyLeaf | None = None
+    for idx in path:
+        if idx < 0 or idx >= len(siblings):
+            return None
+        node = siblings[idx]
+        if isinstance(node, BodyLeaf):
+            """Consumed the terminal leaf; further path indices are
+            invalid."""
+            siblings = []
+        else:
+            siblings = node.children
+    return node

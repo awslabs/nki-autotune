@@ -118,3 +118,77 @@ def test_tune_stage_random_draw_is_reproducible(tmp_path: Path) -> None:
     nkigym_compile(_rmsnorm_matmul_numpy, specs, tmp_path, stages=["tune"], seed=42)
     second = (tmp_path / "kernel_tuned.py").read_text()
     assert first == second
+
+
+def test_tune_stage_applies_reorder_loops_inside_tensor_scalar(tmp_path: Path) -> None:
+    """An explicit ReorderLoops on tensor_scalar's inner chain still matches numpy."""
+    from nkigym.tune.reorder_loops import ReorderLoops
+
+    (tmp_path / "f_nkigym.py").write_text(_F_NKIGYM_SOURCE)
+    specs = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
+    """tensor_scalar is op index 3; its tree is a 2N chain over (d0, d1).
+    Swap the d0-tile (depth 1, path (3, 0)) with its d1-block child."""
+    rewrites = [ReorderLoops(path=(3, 0), outer_dim="d0", inner_dim="d1")]
+    nkigym_compile(_rmsnorm_matmul_numpy, specs, tmp_path, stages=["tune"], rewrites=rewrites)
+    assert (tmp_path / "kernel_tuned.py").exists()
+
+
+def test_tune_stage_compose_reorder_then_fuse(tmp_path: Path) -> None:
+    """Reorder exposes a new fusion boundary; composed pipeline still CPU-sim-passes."""
+    from nkigym.tune.fuse_loops import FuseLoops
+    from nkigym.tune.reorder_loops import ReorderLoops
+
+    (tmp_path / "f_nkigym.py").write_text(_F_NKIGYM_SOURCE)
+    specs = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
+    """Apply an unrelated reorder first, then the canonical forest-root
+    FuseLoops on (2, 3) — both should still be legal and the CPU-sim
+    gate passes on the combined result."""
+    rewrites = [
+        ReorderLoops(path=(3, 0), outer_dim="d0", inner_dim="d1"),
+        FuseLoops(path=(), boundary=(2, 3), dim_id="d0"),
+    ]
+    nkigym_compile(_rmsnorm_matmul_numpy, specs, tmp_path, stages=["tune"], rewrites=rewrites)
+    assert (tmp_path / "kernel_tuned.py").exists()
+
+
+def test_tune_stage_random_draw_terminates_when_only_self_inverse_atom_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With enumerators stubbed to emit a single self-inverse atom, tune terminates on hash cycle."""
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode
+    from nkigym.ops.base import AxisRole
+    from nkigym.tune import stage as stage_mod
+    from nkigym.tune.reorder_loops import ReorderLoops
+
+    inner = LoopNode("d1", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])
+    outer = LoopNode("d0", 4, AxisRole.PARALLEL, [inner])
+    _ = outer  # kept to show the stub forest shape matches the reference atom
+
+    def _only_root_atom(forest):
+        """Return the unique reorder at the outermost two-level pair (if present)."""
+        if not forest:
+            return []
+        top = forest[0]
+        if not isinstance(top, LoopNode) or len(top.children) != 1:
+            return []
+        child = top.children[0]
+        if not isinstance(child, LoopNode):
+            return []
+        return [ReorderLoops(path=(0,), outer_dim=top.dim_id, inner_dim=child.dim_id)]
+
+    monkeypatch.setattr(stage_mod, "enumerate_reorder_atoms", _only_root_atom)
+    monkeypatch.setattr(stage_mod, "enumerate_fusion_atoms", lambda forest: [])
+
+    class _AlwaysHeads:
+        def random(self):
+            return 0.0
+
+    monkeypatch.setattr(stage_mod.random, "Random", lambda _seed: _AlwaysHeads())
+
+    (tmp_path / "f_nkigym.py").write_text(_F_NKIGYM_SOURCE)
+    specs = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
+    nkigym_compile(_rmsnorm_matmul_numpy, specs, tmp_path, stages=["tune"], seed=0)
+    """If the cycle break didn't fire, this would loop forever (or until
+    Python recursion/OOM). Reaching this line means the hash_forest
+    cycle detector stopped the loop after the first revisit."""
+    assert (tmp_path / "kernel_tuned.py").exists()
