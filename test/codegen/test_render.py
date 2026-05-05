@@ -123,27 +123,33 @@ def _header_only(g) -> str:
 
 
 def test_sbuf_tile_slice_2d() -> None:
-    """Per-tile slice for a 2D SBUF tensor uses i_block_<p> and i_block_<f>."""
+    """Per-tile slice for a 2D SBUF tensor uses ``(i_block_<d> + i_tile_<d>)``."""
     from nkigym.codegen.render import _sbuf_tile_slice
 
     slice_expr = _sbuf_tile_slice("sbuf_lhs", ("d0", "d1"), p_tile=128, f_tile=128)
-    assert slice_expr == "sbuf_lhs[0:128, i_block_d0, i_block_d1 * 128 : i_block_d1 * 128 + 128]"
+    assert slice_expr == (
+        "sbuf_lhs[0:128, i_block_d0 + i_tile_d0, "
+        "(i_block_d1 + i_tile_d1) * 128 : (i_block_d1 + i_tile_d1) * 128 + 128]"
+    )
 
 
 def test_sbuf_tile_slice_1d() -> None:
-    """Per-tile slice for a 1D SBUF tensor (e.g. activation_reduce output) uses 0:1 on free."""
+    """Per-tile slice for a 1D SBUF tensor uses ``(i_block_<p> + i_tile_<p>)`` on P."""
     from nkigym.codegen.render import _sbuf_tile_slice
 
     slice_expr = _sbuf_tile_slice("sbuf_rms", ("d0",), p_tile=128, f_tile=1)
-    assert slice_expr == "sbuf_rms[0:128, i_block_d0, 0:1]"
+    assert slice_expr == "sbuf_rms[0:128, i_block_d0 + i_tile_d0, 0:1]"
 
 
 def test_hbm_tile_slice() -> None:
-    """HBM tile slice uses p_tile and f_tile offsets."""
+    """HBM tile slice uses ``(i_block_<d> + i_tile_<d>) * tile`` offsets."""
     from nkigym.codegen.render import _hbm_tile_slice
 
     slice_expr = _hbm_tile_slice("lhs", ("d0", "d1"), p_tile=128, f_tile=128)
-    assert slice_expr == "lhs[i_block_d0 * 128 : i_block_d0 * 128 + 128, i_block_d1 * 128 : i_block_d1 * 128 + 128]"
+    assert slice_expr == (
+        "lhs[(i_block_d0 + i_tile_d0) * 128 : (i_block_d0 + i_tile_d0) * 128 + 128, "
+        "(i_block_d1 + i_tile_d1) * 128 : (i_block_d1 + i_tile_d1) * 128 + 128]"
+    )
 
 
 def test_render_load_store_kernel() -> None:
@@ -301,6 +307,21 @@ def test_render_activation_reduce_rmsnorm() -> None:
         actual = actual[0]
     expected = 1.0 / np.sqrt(np.mean(x * x, axis=1) + 1e-6)
     assert np.allclose(actual.reshape(-1), expected, atol=5e-4, rtol=5e-4)
+
+
+def test_open_block_tile_loops_opens_2n_entries() -> None:
+    """_open_block_tile_loops opens 2 loops per dim: block then tile, pair-interleaved."""
+    from nkigym.codegen.render import _open_block_tile_loops, _Writer
+
+    g = parse_and_resolve(_matmul_lhsT_rhs, _SPECS)
+    w = _Writer()
+    depth = _open_block_tile_loops(w, g, ("d0", "d1"))
+    assert depth == 4
+    lines = w.getvalue().splitlines()
+    assert lines[0] == "for i_block_d0 in range(16):"
+    assert lines[1] == "    for i_tile_d0 in range(1):"
+    assert lines[2] == "        for i_block_d1 in range(16):"
+    assert lines[3] == "            for i_tile_d1 in range(1):"
 
 
 def test_render_rmsnorm_matmul_end_to_end() -> None:
