@@ -28,12 +28,14 @@ import numpy as np
 
 from nkigym.codegen import render_eager
 from nkigym.synthesis import compile_numpy_to_nkigym
+from nkigym.tune import KernelRewrite
+from nkigym.tune.stage import run_tune
 
 _ATOL = 5e-3
 _RTOL = 5e-3
 _SIM_SEED = 0
 
-_KNOWN_STAGES = ("synthesis", "initial_codegen")
+_KNOWN_STAGES = ("synthesis", "initial_codegen", "tune")
 
 
 def nkigym_compile(
@@ -41,6 +43,8 @@ def nkigym_compile(
     input_specs: dict[str, tuple[tuple[int, ...], str]],
     cache_dir: str | Path,
     stages: list[str],
+    rewrites: list[KernelRewrite] | None = None,
+    seed: int = 0,
 ) -> None:
     """Run the nkigym compilation pipeline through the given ``stages``.
 
@@ -52,16 +56,22 @@ def nkigym_compile(
         cache_dir: Directory to write stage artifacts. Created if missing;
             pre-existing files from prior runs are preserved so stages
             can be replayed independently.
-        stages: Ordered list of stage names to run. Supported: ``"synthesis"``,
-            ``"initial_codegen"``. A later stage consumes the prior stage's
-            artifact from ``cache_dir`` — running ``"initial_codegen"``
-            alone requires ``f_nkigym.py`` to already exist.
+        stages: Ordered list of stage names to run. Supported:
+            ``"synthesis"``, ``"initial_codegen"``, ``"tune"``. Later
+            stages consume prior-stage artifacts from ``cache_dir``.
+        rewrites: Consumed only by the ``"tune"`` stage. When ``None``,
+            the stage randomises from :func:`enumerate_fusion_atoms`
+            using ``seed``. When a list is given, rewrites are applied
+            in order; each rewrite's legality is checked against the
+            current ``(op_graph, forest)`` state.
+        seed: Seeds the random rewrite draw when ``rewrites`` is ``None``.
 
     Raises:
-        ValueError: An unknown stage name is in ``stages``, or a stage's
-            required input artifact is missing from ``cache_dir``.
-        AssertionError: The CPU-sim result of the rendered kernel diverges
-            from ``f_numpy`` beyond the fp32 tolerance.
+        ValueError: An unknown stage name is in ``stages``, a stage's
+            required input artifact is missing from ``cache_dir``, or an
+            explicit rewrite is illegal on the current state.
+        AssertionError: The CPU-sim result of the rendered kernel
+            diverges from ``f_numpy`` beyond the fp32 tolerance.
     """
     for stage in stages:
         if stage not in _KNOWN_STAGES:
@@ -75,6 +85,16 @@ def nkigym_compile(
             _run_synthesis(f_numpy, input_specs, cache_path)
         elif stage == "initial_codegen":
             _run_initial_codegen(f_numpy, input_specs, cache_path)
+        elif stage == "tune":
+            run_tune(
+                f_numpy,
+                input_specs,
+                cache_path,
+                rewrites=rewrites,
+                seed=seed,
+                load_f_nkigym=_load_f_nkigym,
+                cpu_sim_check=_cpu_sim_check,
+            )
 
 
 def _run_synthesis(

@@ -14,7 +14,6 @@ class NKIStore(NKIOp):
     NAME: ClassVar[str] = "dma_copy"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("P", "F")}
-    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
     """Same story as ``NKILoad``: ``nisa.dma_copy`` only caps the
     partition axis (128) — the free axis is unbounded."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}

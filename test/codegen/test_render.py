@@ -123,32 +123,39 @@ def _header_only(g) -> str:
 
 
 def test_sbuf_tile_slice_2d() -> None:
-    """Per-tile slice for a 2D SBUF tensor uses ``(i_block_<d> + i_tile_<d>)``."""
+    """Per-tile slice for a 2D SBUF tensor uses ``(i_<d>_0 + i_<d>_1)``."""
     from nkigym.codegen.render import _sbuf_tile_slice
 
-    slice_expr = _sbuf_tile_slice("sbuf_lhs", ("d0", "d1"), p_tile=128, f_tile=128)
+    ordinals = {"d0": 2, "d1": 2}
+    trips = {"d0": [16, 1], "d1": [8, 1]}
+    slice_expr = _sbuf_tile_slice(
+        "sbuf_lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_ordinals=ordinals, path_trips=trips
+    )
     assert slice_expr == (
-        "sbuf_lhs[0:128, i_block_d0 + i_tile_d0, "
-        "(i_block_d1 + i_tile_d1) * 128 : (i_block_d1 + i_tile_d1) * 128 + 128]"
+        "sbuf_lhs[0:128, i_d0_0 + i_d0_1, " "(i_d1_0 + i_d1_1) * 128 : (i_d1_0 + i_d1_1) * 128 + 128]"
     )
 
 
 def test_sbuf_tile_slice_1d() -> None:
-    """Per-tile slice for a 1D SBUF tensor uses ``(i_block_<p> + i_tile_<p>)`` on P."""
+    """Per-tile slice for a 1D SBUF tensor uses ``(i_<p>_0 + i_<p>_1)`` on P."""
     from nkigym.codegen.render import _sbuf_tile_slice
 
-    slice_expr = _sbuf_tile_slice("sbuf_rms", ("d0",), p_tile=128, f_tile=1)
-    assert slice_expr == "sbuf_rms[0:128, i_block_d0 + i_tile_d0, 0:1]"
+    ordinals = {"d0": 2}
+    trips = {"d0": [4, 1]}
+    slice_expr = _sbuf_tile_slice("sbuf_rms", ("d0",), p_tile=128, f_tile=1, path_ordinals=ordinals, path_trips=trips)
+    assert slice_expr == "sbuf_rms[0:128, i_d0_0 + i_d0_1, 0:1]"
 
 
 def test_hbm_tile_slice() -> None:
-    """HBM tile slice uses ``(i_block_<d> + i_tile_<d>) * tile`` offsets."""
+    """HBM tile slice uses ``(i_<d>_0 + i_<d>_1) * tile`` offsets."""
     from nkigym.codegen.render import _hbm_tile_slice
 
-    slice_expr = _hbm_tile_slice("lhs", ("d0", "d1"), p_tile=128, f_tile=128)
+    ordinals = {"d0": 2, "d1": 2}
+    trips = {"d0": [16, 1], "d1": [16, 1]}
+    slice_expr = _hbm_tile_slice("lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_ordinals=ordinals, path_trips=trips)
     assert slice_expr == (
-        "lhs[(i_block_d0 + i_tile_d0) * 128 : (i_block_d0 + i_tile_d0) * 128 + 128, "
-        "(i_block_d1 + i_tile_d1) * 128 : (i_block_d1 + i_tile_d1) * 128 + 128]"
+        "lhs[(i_d0_0 + i_d0_1) * 128 : (i_d0_0 + i_d0_1) * 128 + 128, "
+        "(i_d1_0 + i_d1_1) * 128 : (i_d1_0 + i_d1_1) * 128 + 128]"
     )
 
 
@@ -167,7 +174,7 @@ def test_render_load_store_kernel() -> None:
     g = parse_and_resolve(passthrough, specs)
     src = render(g)
     assert "nisa.dma_copy(" in src
-    assert "for i_block_" in src
+    assert "for i_d0_0 in range" in src
 
     """CPU-sim the rendered kernel at fp32 and compare to the numpy identity."""
     src_fp32 = src.replace("nl.bfloat16", "nl.float32")
@@ -309,21 +316,6 @@ def test_render_activation_reduce_rmsnorm() -> None:
     assert np.allclose(actual.reshape(-1), expected, atol=5e-4, rtol=5e-4)
 
 
-def test_open_block_tile_loops_opens_2n_entries() -> None:
-    """_open_block_tile_loops opens 2 loops per dim: block then tile, pair-interleaved."""
-    from nkigym.codegen.render import _open_block_tile_loops, _Writer
-
-    g = parse_and_resolve(_matmul_lhsT_rhs, _SPECS)
-    w = _Writer()
-    depth = _open_block_tile_loops(w, g, ("d0", "d1"))
-    assert depth == 4
-    lines = w.getvalue().splitlines()
-    assert lines[0] == "for i_block_d0 in range(16):"
-    assert lines[1] == "    for i_tile_d0 in range(1):"
-    assert lines[2] == "        for i_block_d1 in range(16):"
-    assert lines[3] == "            for i_tile_d1 in range(1):"
-
-
 def test_render_rmsnorm_matmul_end_to_end() -> None:
     """The full rmsnorm+matmul DAG renders and matches the numpy reference."""
     import nki
@@ -338,6 +330,342 @@ def test_render_rmsnorm_matmul_end_to_end() -> None:
     exec(src_fp32, ns)
     kernel = ns["_rmsnorm_matmul"]
 
+    rng = np.random.default_rng(42)
+    lhs = rng.standard_normal((128, 256)).astype(np.float32)
+    rhs = rng.standard_normal((256, 512)).astype(np.float32)
+    actual = nki.simulate(kernel)(lhs=lhs, rhs=rhs)
+    if isinstance(actual, tuple):
+        actual = actual[0]
+    m = np.mean(lhs * lhs, axis=1, keepdims=True)
+    rms_inv = 1.0 / np.sqrt(m + EPS)
+    expected = (lhs * rms_inv) @ rhs
+    assert np.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_sbuf_tile_slice_2d_canonical_form() -> None:
+    """Canonical 2N-form: i_<d>_0 + i_<d>_1 with parenthesised compound on free axis."""
+    from nkigym.codegen.render import _sbuf_tile_slice
+
+    ordinals = {"d0": 2, "d1": 2}
+    trips = {"d0": [16, 1], "d1": [8, 1]}
+    slice_expr = _sbuf_tile_slice(
+        "sbuf_lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_ordinals=ordinals, path_trips=trips
+    )
+    assert slice_expr == (
+        "sbuf_lhs[0:128, i_d0_0 + i_d0_1, " "(i_d1_0 + i_d1_1) * 128 : (i_d1_0 + i_d1_1) * 128 + 128]"
+    )
+
+
+def test_sbuf_tile_slice_1d_canonical_form() -> None:
+    """1D tensor uses only partition-axis path ordinals, free-axis literal 0:1."""
+    from nkigym.codegen.render import _sbuf_tile_slice
+
+    ordinals = {"d0": 2}
+    trips = {"d0": [4, 1]}
+    slice_expr = _sbuf_tile_slice("sbuf_rms", ("d0",), p_tile=128, f_tile=1, path_ordinals=ordinals, path_trips=trips)
+    assert slice_expr == "sbuf_rms[0:128, i_d0_0 + i_d0_1, 0:1]"
+
+
+def test_hbm_tile_slice_parenthesises_compound_before_multiplication() -> None:
+    """HBM slice wraps (i_<d>_0 + i_<d>_1) in parens before the * tile multiplication."""
+    from nkigym.codegen.render import _hbm_tile_slice
+
+    ordinals = {"d0": 2, "d1": 2}
+    trips = {"d0": [16, 1], "d1": [16, 1]}
+    slice_expr = _hbm_tile_slice("lhs", ("d0", "d1"), p_tile=128, f_tile=128, path_ordinals=ordinals, path_trips=trips)
+    assert slice_expr == (
+        "lhs[(i_d0_0 + i_d0_1) * 128 : (i_d0_0 + i_d0_1) * 128 + 128, "
+        "(i_d1_0 + i_d1_1) * 128 : (i_d1_0 + i_d1_1) * 128 + 128]"
+    )
+
+
+def test_swapped_dst_tile_slice_swaps_p_and_f_for_transpose() -> None:
+    """Transpose dst: partition slot = src_f's ordinals; free slot = src_p's ordinals."""
+    from nkigym.codegen.render import _swapped_dst_tile_slice
+
+    ordinals = {"d0": 2, "d1": 2}
+    trips = {"d0": [16, 1], "d1": [16, 1]}
+    slice_expr = _swapped_dst_tile_slice(
+        dst_name="lhs_T", src_p_axis="d0", src_f_axis="d1", tile=128, path_ordinals=ordinals, path_trips=trips
+    )
+    assert slice_expr == (
+        "sbuf_lhs_T[0:128, i_d1_0 + i_d1_1, " "(i_d0_0 + i_d0_1) * 128 : (i_d0_0 + i_d0_1) * 128 + 128]"
+    )
+
+
+def test_slot_expr_collapses_when_tail_product_is_one() -> None:
+    """Canonical form trips [t_0, 1]: term i_<d>_0 has tail=1, so no ' * N' multiplier."""
+    from nkigym.codegen.render import _slot_expr
+
+    ordinals = {"d0": 2}
+    trips = {"d0": [16, 1]}
+    expr = _slot_expr(ordinals, trips, "d0")
+    assert expr == "i_d0_0 + i_d0_1"
+
+
+def test_slot_expr_multi_split_uses_tail_products() -> None:
+    """If trips [t_0, t_1, 1], outermost term carries '* t_1' (tail product)."""
+    from nkigym.codegen.render import _slot_expr
+
+    ordinals = {"d0": 3}
+    trips = {"d0": [4, 2, 1]}
+    expr = _slot_expr(ordinals, trips, "d0")
+    assert expr == "i_d0_0 * 2 + i_d0_1 + i_d0_2"
+
+
+def test_slot_expr_raises_when_dim_has_no_ancestors() -> None:
+    """If path_ordinals[dim] is 0 or missing, caller has no open loop for that dim — raise."""
+    from nkigym.codegen.render import _slot_expr
+
+    try:
+        _slot_expr({"d0": 0}, {"d0": []}, "d0")
+    except ValueError as exc:
+        assert "d0" in str(exc)
+    else:
+        raise AssertionError("_slot_expr did not raise on missing ancestors")
+
+
+def test_walker_emits_for_headers_with_path_ordinal_names() -> None:
+    """The walker emits 'for i_<d>_<ordinal>' headers with the correct trip count."""
+    from nkigym.codegen.graph import parse_and_resolve
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode
+    from nkigym.codegen.render import _BODY_EMITTERS, _Writer, render_forest
+    from nkigym.ops.base import AxisRole
+
+    @nkigym_kernel
+    def _walker_test_kernel(x):
+        y = NKILoad()(data=x)
+        out = NKIStore()(data=y)
+        return out
+
+    specs = {"x": ((128, 256), "bfloat16")}
+    g = parse_and_resolve(_walker_test_kernel, specs)
+    """Synthesise a minimal forest with a single LoopNode pair + a marker BodyLeaf."""
+    marker_tree = LoopNode(
+        "d0", 4, AxisRole.PARALLEL, [LoopNode("d0", 1, AxisRole.PARALLEL, [BodyLeaf(op_idx=0, phase="_marker_")])]
+    )
+
+    def _marker_emitter(w, op_graph, op, path_ordinals, path_trips):
+        """Test emitter — prints the ordinals and trips it sees at body time."""
+        d0_ord = path_ordinals.get("d0", 0)
+        d0_trips = path_trips.get("d0", [])
+        w.line(f"MARK(d0_ord={d0_ord}, trips={d0_trips!r})")
+
+    _BODY_EMITTERS[("NKILoad", "_marker_")] = _marker_emitter
+
+    try:
+        w = _Writer()
+        render_forest(w, g, [marker_tree])
+        src = w.getvalue()
+        assert "for i_d0_0 in range(4):" in src
+        assert "for i_d0_1 in range(1):" in src
+        assert "MARK(d0_ord=2, trips=[4, 1])" in src
+    finally:
+        """Clean up the test registration so it doesn't pollute other tests."""
+        del _BODY_EMITTERS[("NKILoad", "_marker_")]
+
+
+def test_register_body_decorator_stores_emitter_keyed_on_op_kind_and_phase() -> None:
+    """_register_body returns the function and stores it in _BODY_EMITTERS."""
+    from nkigym.codegen.render import _BODY_EMITTERS, _register_body
+
+    @_register_body("TestOp", "test_phase")
+    def _emit_test(w, op_graph, op, path_ordinals, path_trips):
+        w.line("TEST")
+
+    try:
+        assert _BODY_EMITTERS[("TestOp", "test_phase")] is _emit_test
+    finally:
+        del _BODY_EMITTERS[("TestOp", "test_phase")]
+
+
+def test_walker_raises_on_missing_emitter() -> None:
+    """If no emitter is registered for (op_kind, phase), walker raises with a clear message."""
+    from nkigym.codegen.graph import parse_and_resolve
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode
+    from nkigym.codegen.render import _Writer, render_forest
+    from nkigym.ops.base import AxisRole
+
+    @nkigym_kernel
+    def _no_emitter_kernel(x):
+        y = NKILoad()(data=x)
+        out = NKIStore()(data=y)
+        return out
+
+    specs = {"x": ((128, 256), "bfloat16")}
+    g = parse_and_resolve(_no_emitter_kernel, specs)
+    tree = LoopNode("d0", 1, AxisRole.PARALLEL, [BodyLeaf(op_idx=0, phase="_nonexistent_phase_")])
+    w = _Writer()
+    try:
+        render_forest(w, g, [tree])
+    except ValueError as exc:
+        assert "NKILoad" in str(exc)
+        assert "_nonexistent_phase_" in str(exc)
+    else:
+        raise AssertionError("render_forest did not raise on missing emitter")
+
+
+@nkigym_kernel
+def _passthrough_kernel(x):
+    """Passthrough for walker test."""
+    xs = NKILoad()(data=x)
+    out = NKIStore()(data=xs)
+    return out
+
+
+def test_render_forest_load_store_cpu_sim_matches() -> None:
+    """Rendering a passthrough kernel via the walker and simulating it matches numpy."""
+    import nki
+    import numpy as np
+
+    from nkigym.codegen.loop_forest import build_canonical_forest
+    from nkigym.codegen.render import (
+        _emit_hbm_output,
+        _emit_imports,
+        _emit_param_asserts,
+        _emit_sbuf_allocations,
+        _emit_signature,
+        _hbm_name,
+        _Writer,
+        render_forest,
+    )
+
+    specs = {"x": ((2048, 2048), "bfloat16")}
+    g = parse_and_resolve(_passthrough_kernel, specs)
+    forest = build_canonical_forest(g)
+
+    w = _Writer()
+    _emit_imports(w)
+    _emit_signature(w, g)
+    w.indent()
+    _emit_param_asserts(w, g)
+    _emit_hbm_output(w, g)
+    _emit_sbuf_allocations(w, g)
+    render_forest(w, g, forest)
+    w.line(f"return {_hbm_name(g.return_name)}")
+    w.dedent()
+    src = w.getvalue()
+
+    assert "for i_d0_0 in range" in src
+    assert "for i_d0_1 in range(1):" in src
+    assert "nisa.dma_copy(" in src
+
+    src_fp32 = src.replace("nl.bfloat16", "nl.float32")
+    ns: dict = {}
+    exec(src_fp32, ns)
+    kernel = ns["_passthrough_kernel"]
+    rng = np.random.default_rng(0)
+    x_in = rng.standard_normal((2048, 2048)).astype(np.float32)
+    actual = nki.simulate(kernel)(x=x_in)
+    if isinstance(actual, tuple):
+        actual = actual[0]
+    assert np.allclose(actual, x_in, atol=1e-5, rtol=1e-5)
+
+
+def _render_via_walker(op_graph) -> str:
+    """Helper: render a full kernel through the forest walker.
+
+    Exactly equivalent to today's ``render(op_graph)`` default path, but
+    uses ``render_forest`` + a canonical forest instead of the legacy
+    per-op emitters. When Task C5 swaps the default ``render`` to this
+    code path, this helper can be replaced with a direct call.
+    """
+    from nkigym.codegen.loop_forest import build_canonical_forest
+    from nkigym.codegen.render import (
+        _emit_hbm_output,
+        _emit_imports,
+        _emit_param_asserts,
+        _emit_sbuf_allocations,
+        _emit_signature,
+        _hbm_name,
+        _Writer,
+        render_forest,
+    )
+
+    forest = build_canonical_forest(op_graph)
+    w = _Writer()
+    _emit_imports(w)
+    _emit_signature(w, op_graph)
+    w.indent()
+    _emit_param_asserts(w, op_graph)
+    _emit_hbm_output(w, op_graph)
+    _emit_sbuf_allocations(w, op_graph)
+    render_forest(w, op_graph, forest)
+    w.line(f"return {_hbm_name(op_graph.return_name)}")
+    w.dedent()
+    return w.getvalue()
+
+
+def test_render_forest_matmul_cpu_sim_matches() -> None:
+    """Full lhs_T @ rhs kernel rendered through the walker simulates correctly."""
+    import nki
+    import numpy as np
+
+    from nkigym.codegen.graph import parse_and_resolve
+
+    g = parse_and_resolve(_matmul_lhsT_rhs, _SPECS)
+    src = _render_via_walker(g)
+    assert "nisa.nc_matmul(" in src
+    assert "nisa.memset(psum_tile" in src
+    assert "nisa.tensor_copy(" in src
+    assert "for i_d0_0 in range" in src
+    assert "for i_d0_1 in range(1):" in src
+
+    src_fp32 = src.replace("nl.bfloat16", "nl.float32")
+    ns: dict = {}
+    exec(src_fp32, ns)
+    kernel = ns["_matmul_lhsT_rhs"]
+    rng = np.random.default_rng(0)
+    lhs_T = rng.standard_normal((2048, 2048)).astype(np.float32)
+    rhs = rng.standard_normal((2048, 2048)).astype(np.float32)
+    actual = nki.simulate(kernel)(lhs_T=lhs_T, rhs=rhs)
+    if isinstance(actual, tuple):
+        actual = actual[0]
+    expected = lhs_T.T @ rhs
+    assert np.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_render_forest_activation_reduce_cpu_sim_matches() -> None:
+    """RMS kernel rendered through the walker simulates correctly."""
+    import nki
+    import numpy as np
+
+    from nkigym.codegen.graph import parse_and_resolve
+
+    specs = {"x": ((128, 128), "bfloat16")}
+    g = parse_and_resolve(_rms_kernel, specs)
+    src = _render_via_walker(g)
+    assert "nisa.memset(" in src
+    assert "nisa.activation_reduce(" in src
+    assert "nisa.activation(" in src
+    assert "op=nl.rsqrt" in src
+
+    src_fp32 = src.replace("nl.bfloat16", "nl.float32")
+    ns: dict = {}
+    exec(src_fp32, ns)
+    kernel = ns["_rms_kernel"]
+    x = np.random.default_rng(0).standard_normal((128, 128)).astype(np.float32)
+    actual = nki.simulate(kernel)(x=x)
+    if isinstance(actual, tuple):
+        actual = actual[0]
+    expected = 1.0 / np.sqrt(np.mean(x * x, axis=1) + 1e-6)
+    assert np.allclose(actual.reshape(-1), expected, atol=5e-4, rtol=5e-4)
+
+
+def test_render_forest_rmsnorm_matmul_cpu_sim_matches() -> None:
+    """Full rmsnorm+matmul DAG rendered via walker matches numpy end-to-end."""
+    import nki
+    import numpy as np
+
+    from nkigym.codegen.graph import parse_and_resolve
+
+    specs = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
+    g = parse_and_resolve(_rmsnorm_matmul, specs)
+    src = _render_via_walker(g)
+    src_fp32 = src.replace("nl.bfloat16", "nl.float32")
+    ns: dict = {}
+    exec(src_fp32, ns)
+    kernel = ns["_rmsnorm_matmul"]
     rng = np.random.default_rng(42)
     lhs = rng.standard_normal((128, 256)).astype(np.float32)
     rhs = rng.standard_normal((256, 512)).astype(np.float32)

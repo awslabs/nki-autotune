@@ -14,7 +14,6 @@ class NKILoad(NKIOp):
     NAME: ClassVar[str] = "dma_copy"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("P", "F")}
-    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
     """``nisa.dma_copy`` has no tile-size constraint beyond
     ``src.size == dst.size`` and partition-dim validation. Only the
     partition axis is capped by the NeuronCore's 128-partition SBUF

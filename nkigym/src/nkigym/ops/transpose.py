@@ -22,7 +22,6 @@ class NKITranspose(NKIOp):
     NAME: ClassVar[str] = "nc_transpose"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("F", "P")}
-    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
     """Tensor Engine caps the input at 128×128; Vector Engine at 32×32.
     We target Tensor Engine, so both axes are capped at 128."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128, "F": 128}

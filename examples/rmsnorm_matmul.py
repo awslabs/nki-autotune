@@ -1,12 +1,16 @@
-"""Compile ``rmsnorm(lhs) @ rhs`` from numpy to an eager NKI kernel.
+"""Compile ``rmsnorm(lhs) @ rhs`` from numpy through the full nkigym pipeline.
 
 Drives the staged ``nkigym_compile`` pipeline:
 
     1. ``"synthesis"`` — synthesise ``f_nkigym`` from the numpy reference
        via the Claude Agent SDK; write ``<cache>/f_nkigym.py``.
-    2. ``"initial_codegen"`` — render the eager NKI kernel into
+    2. ``"initial_codegen"`` — render the canonical eager NKI kernel into
        ``<cache>/kernel.py`` and auto-validate it against the numpy
        reference through ``nki.simulate``.
+    3. ``"tune"`` — randomly draw legal fusion atoms from the current
+       forest (seeded for reproducibility) and apply them in sequence,
+       render the transformed kernel into ``<cache>/kernel_tuned.py``,
+       and auto-validate the tuned kernel against numpy.
 
 Usage::
 
@@ -39,5 +43,13 @@ if __name__ == "__main__":
     M, K, N = 2048, 2048, 2048
     INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 
-    nkigym_compile(rmsnorm_matmul_numpy, INPUT_SPECS, cache_dir, stages=["synthesis", "initial_codegen"])
-    print(f"[rmsnorm_matmul] kernel written to {cache_dir / 'kernel.py'}")
+    """The tune stage defaults to a seeded random draw: after each
+    apply, it re-enumerates legal fusion atoms from the current forest,
+    flips an independent coin on each, and applies the first survivor.
+    The loop terminates when no atom survives the coin flip. Change the
+    ``seed`` kwarg to sample a different tuning outcome."""
+    nkigym_compile(
+        rmsnorm_matmul_numpy, INPUT_SPECS, cache_dir, stages=["synthesis", "initial_codegen", "tune"], seed=0
+    )
+    print(f"[rmsnorm_matmul] canonical kernel: {cache_dir / 'kernel.py'}")
+    print(f"[rmsnorm_matmul] tuned kernel:     {cache_dir / 'kernel_tuned.py'}")

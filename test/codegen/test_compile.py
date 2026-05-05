@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from nkigym import nkigym_compile
+from nkigym.tune.fuse_loops import FuseLoops
 
 
 def _rmsnorm_matmul_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -77,3 +78,43 @@ def test_cpu_sim_mismatch_raises(tmp_path: Path) -> None:
 
     with pytest.raises(AssertionError, match="CPU-sim mismatch"):
         nkigym_compile(bogus_golden, specs, tmp_path, stages=["initial_codegen"])
+
+
+def test_tune_stage_with_empty_rewrites_writes_kernel_tuned_file(tmp_path: Path) -> None:
+    """`tune` with `rewrites=[]` writes kernel_tuned.py and CPU-sim succeeds."""
+    (tmp_path / "f_nkigym.py").write_text(_F_NKIGYM_SOURCE)
+    specs = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
+    nkigym_compile(_rmsnorm_matmul_numpy, specs, tmp_path, stages=["tune"], rewrites=[])
+    assert (tmp_path / "kernel_tuned.py").exists()
+
+
+def test_tune_stage_applies_fuse_loops_d0(tmp_path: Path) -> None:
+    """Applying FuseLoops on activation_reduce↔tensor_scalar d0 still matches numpy."""
+    (tmp_path / "f_nkigym.py").write_text(_F_NKIGYM_SOURCE)
+    specs = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
+    rewrites = [FuseLoops(path=(), boundary=(2, 3), dim_id="d0")]
+    nkigym_compile(_rmsnorm_matmul_numpy, specs, tmp_path, stages=["tune"], rewrites=rewrites)
+    kernel_source = (tmp_path / "kernel_tuned.py").read_text()
+    assert "nisa.activation_reduce(" in kernel_source
+    assert "nisa.tensor_scalar(" in kernel_source
+
+
+def test_tune_stage_rejects_illegal_rewrite(tmp_path: Path) -> None:
+    """A rewrite that fails is_legal raises ValueError before producing any artifact."""
+    (tmp_path / "f_nkigym.py").write_text(_F_NKIGYM_SOURCE)
+    specs = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
+    bogus = FuseLoops(path=(), boundary=(99, 100), dim_id="d0")
+    with pytest.raises(ValueError, match="illegal"):
+        nkigym_compile(_rmsnorm_matmul_numpy, specs, tmp_path, stages=["tune"], rewrites=[bogus])
+    assert not (tmp_path / "kernel_tuned.py").exists()
+
+
+def test_tune_stage_random_draw_is_reproducible(tmp_path: Path) -> None:
+    """Running tune twice with rewrites=None + same seed produces identical output."""
+    (tmp_path / "f_nkigym.py").write_text(_F_NKIGYM_SOURCE)
+    specs = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
+    nkigym_compile(_rmsnorm_matmul_numpy, specs, tmp_path, stages=["tune"], seed=42)
+    first = (tmp_path / "kernel_tuned.py").read_text()
+    nkigym_compile(_rmsnorm_matmul_numpy, specs, tmp_path, stages=["tune"], seed=42)
+    second = (tmp_path / "kernel_tuned.py").read_text()
+    assert first == second

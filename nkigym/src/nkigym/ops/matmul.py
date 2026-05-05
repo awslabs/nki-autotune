@@ -10,7 +10,7 @@ from typing import Any, ClassVar
 import nki.isa as nisa
 import numpy as np
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import AxisRole, NKIOp
 
 MATMUL_FREE_MAX = 512
 
@@ -21,7 +21,7 @@ class NKIMatmul(NKIOp):
     NAME: ClassVar[str] = "nc_matmul"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"stationary": ("K", "M"), "moving": ("K", "N")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("M", "N")}
-    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset({"K"})
+    AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"K": AxisRole.ACCUMULATION}
     TILE_LIMITS: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": MATMUL_FREE_MAX}
 
     def _run(self, **kwargs: Any) -> Any:

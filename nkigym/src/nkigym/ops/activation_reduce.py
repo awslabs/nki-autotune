@@ -16,7 +16,7 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import AxisRole, NKIOp
 
 VE_PARTITION_MAX = 128
 VE_FREE_MAX = 512
@@ -83,11 +83,11 @@ class NKIActivationReduce(NKIOp):
     2048-element sum loses the low-bit accumulation precision and
     propagates into the matmul accumulator. Matches the nisa.activation_reduce
     HW contract."""
-    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset({"F"})
     """The F axis is a reduction axis — the op iterates over all F tiles
     before its output is complete. Render emits an F-loop memset prologue
     (on the reduce accumulator) and places downstream consumers outside
     this F-loop, symmetric to how matmul's K dim is handled."""
+    AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": VE_PARTITION_MAX, "F": VE_FREE_MAX}
 
     def _run(self, **kwargs: Any) -> Any:

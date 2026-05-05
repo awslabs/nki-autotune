@@ -32,7 +32,6 @@ class NKITensorScalar(NKIOp):
     NAME: ClassVar[str] = "tensor_scalar"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "operand0": ("P",)}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F")}
-    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": VE_PARTITION_MAX, "F": VE_FREE_MAX}
 
     def _run(self, **kwargs: Any) -> Any:

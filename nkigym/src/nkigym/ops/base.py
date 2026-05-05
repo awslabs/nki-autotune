@@ -8,6 +8,7 @@ axis semantics and hardware limits via class attributes.
 import functools
 from abc import abstractmethod
 from collections.abc import Callable
+from enum import Enum
 from typing import Any, ClassVar
 
 import numpy as np
@@ -28,6 +29,23 @@ _ALLOWED_INPUT_ROLES: dict[str, frozenset[str]] = {"NKILoad": frozenset({"param"
 _DEFAULT_ALLOWED_ROLES = frozenset({"sbuf"})
 _OUTPUT_ROLES: dict[str, str] = {"NKILoad": "sbuf", "NKIStore": "stored"}
 _DEFAULT_OUTPUT_ROLE = "sbuf"
+
+
+class AxisRole(str, Enum):
+    """Per-op classification of how a loop axis carries state across iterations.
+
+    PARALLEL iterations are independent and safe to fuse with another
+    op's PARALLEL loop on the same dim. SEQUENTIAL iterations carry
+    non-associative state (prefix scan, running state) and must not
+    fuse with a PARALLEL loop on the same dim. ACCUMULATION iterations
+    contribute to an associative reducer (sum, max); the accumulator
+    is live across iterations, so fusion with another nest's PARALLEL
+    loop on the same dim is illegal.
+    """
+
+    PARALLEL = "parallel"
+    SEQUENTIAL = "sequential"
+    ACCUMULATION = "accumulation"
 
 
 class _RoleArray(np.ndarray):
@@ -93,7 +111,8 @@ class NKIOp:
             elementwise/math ops). ``NKIActivationReduce`` overrides its
             reduce output to ``float32`` so the Scalar Engine can
             accumulate without narrowing.
-        BLOCKING_AXES: Accumulation axes (e.g. ``{"K"}`` for matmul).
+        AXIS_ROLES: Per-op axis → role classification. Omitted axes default
+            to ``AxisRole.PARALLEL``.
         TILE_LIMITS: Hardware tile size per abstract axis.
     """
 
@@ -101,7 +120,7 @@ class NKIOp:
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     OUTPUT_DTYPES: ClassVar[dict[str, str]] = {}
-    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
+    AXIS_ROLES: ClassVar[dict[str, "AxisRole"]] = {}
     TILE_LIMITS: ClassVar[dict[str, int]] = {}
 
     def __init__(self, **kwargs: Any) -> None:

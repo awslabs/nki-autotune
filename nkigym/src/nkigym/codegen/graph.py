@@ -22,7 +22,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import AxisRole, NKIOp
 
 TensorOrigin = Literal["param", "intermediate", "return"]
 
@@ -75,6 +75,10 @@ class ParsedOp:
         touched_dims: Every dim id this op's operands or outputs mention,
             in canonical loop-nest order: partition-axis dim first, then
             free-axis dims, then any reducing dim.
+        dim_role: Concrete ``dim_id`` → :class:`AxisRole` for every dim
+            in ``touched_dims``. Resolved from ``op_cls.AXIS_ROLES`` via
+            ``axis_map``; PARALLEL is the default for any dim not named
+            in ``AXIS_ROLES``.
     """
 
     idx: int
@@ -84,6 +88,7 @@ class ParsedOp:
     output_names: list[str]
     axis_map: dict[str, str]
     touched_dims: tuple[str, ...]
+    dim_role: dict[str, AxisRole]
 
 
 @dataclass
@@ -470,6 +475,7 @@ def _build_parsed_ops(
     ops: list[ParsedOp] = []
     for idx, (raw, axis_map) in enumerate(zip(raws, per_op_axis_maps)):
         touched = _touched_dims(raw, axis_map, tensors)
+        dim_role = _resolve_dim_role(raw.op_cls, axis_map, touched)
         ops.append(
             ParsedOp(
                 idx=idx,
@@ -479,9 +485,22 @@ def _build_parsed_ops(
                 output_names=list(raw.output_names),
                 axis_map=dict(axis_map),
                 touched_dims=touched,
+                dim_role=dim_role,
             )
         )
     return ops
+
+
+def _resolve_dim_role(op_cls: type[NKIOp], axis_map: dict[str, str], touched: tuple[str, ...]) -> dict[str, AxisRole]:
+    """Map every ``dim_id`` in ``touched`` to the op's role for that dim."""
+    abstract_role = getattr(op_cls, "AXIS_ROLES", {})
+    concrete: dict[str, AxisRole] = {}
+    for abstract, dim_id in axis_map.items():
+        if dim_id in touched and abstract in abstract_role:
+            concrete[dim_id] = abstract_role[abstract]
+    for dim_id in touched:
+        concrete.setdefault(dim_id, AxisRole.PARALLEL)
+    return concrete
 
 
 def _touched_dims(raw: _ParsedOpRaw, axis_map: dict[str, str], tensors: dict[str, Tensor]) -> tuple[str, ...]:
@@ -493,10 +512,10 @@ def _touched_dims(raw: _ParsedOpRaw, axis_map: dict[str, str], tensors: dict[str
     for abstract in out_axes:
         if abstract in axis_map and axis_map[abstract] not in ordered:
             ordered.append(axis_map[abstract])
-    blocking = [axis_map[a] for a in op_cls.BLOCKING_AXES if a in axis_map]
-    for d in blocking:
-        if d not in ordered:
-            ordered.append(d)
+    non_parallel_axes = getattr(op_cls, "AXIS_ROLES", {}).keys()
+    for abstract in non_parallel_axes:
+        if abstract in axis_map and axis_map[abstract] not in ordered:
+            ordered.append(axis_map[abstract])
     for slot, axes in op_cls.OPERAND_AXES.items():
         tname = raw.operand_names.get(slot)
         if tname is None or tname not in tensors:

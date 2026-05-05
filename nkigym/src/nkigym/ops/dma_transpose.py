@@ -22,7 +22,6 @@ class NKIDMATranspose(NKIOp):
     NAME: ClassVar[str] = "dma_transpose"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("F", "P")}
-    BLOCKING_AXES: ClassVar[frozenset[str]] = frozenset()
     """``nisa.dma_transpose`` has no per-axis tile cap beyond the
     partition axis (128). The mode-specific shape rules (HWDGE's
     ``src.shape[0]==16`` and ``src.shape[-1] % 128 == 0``, SWDGE's
