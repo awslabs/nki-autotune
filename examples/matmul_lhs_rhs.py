@@ -1,16 +1,4 @@
-"""Matmul ``lhs @ rhs`` — with and without the ``LoadTranspose`` rewrite.
-
-Two variants share the same math function and tuned knobs:
-
-1. **Base** — explicit ``NKITranspose`` op + ``transpose_block`` gadget
-   (``nisa.nc_transpose`` via Tensor Engine).
-2. **Fused** — ``LoadTranspose`` rewrite merges the transpose into the
-   ``lhs`` load, producing one ``nisa.dma_transpose`` per leaf and
-   dropping the intermediate ``sbuf_lhs`` buffer.
-
-A third entry ships the plain-numpy equivalent through nkipy +
-neuronx-cc (``baremetal_jit``'s path) as the zero-NKI reference
-baseline.
+"""Render the eager ``lhs @ rhs`` kernel (with inline Transpose) and CPU-sim.
 
 Usage::
 
@@ -21,84 +9,49 @@ Usage::
 import shutil
 from pathlib import Path
 
+import nki
 import numpy as np
 
-from autotune.runner.api import remote_profile
-from autotune.runner.remote import remote_numpy_baseline
-from autotune.runner.types import KernelJob
-from nkigym.codegen import render_ir
-from nkigym.kernel_ir import build_ir
-from nkigym.kernel_ir.rewrites import LoadTranspose, enumerate_rewrite_combinations
-from nkigym.kernel_ir.sample import knob_signature, sample
+from nkigym.codegen import render_eager
+from nkigym.ops import nkigym_kernel
+from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.store import NKIStore
 from nkigym.ops.transpose import NKITranspose
-from nkigym.search import dump_ir, func_source_with_imports, inline_gadgets
-from nkigym.search.mac import compute_mac_count
 
 
+@nkigym_kernel
 def matmul_lhs_rhs_nkigym(lhs, rhs):
-    """nkigym math function for ``lhs @ rhs`` (lhs not pre-transposed)."""
-    lhs_T = NKITranspose()(data=lhs)
-    output = NKIMatmul()(stationary=lhs_T, moving=rhs)
-    return output
-
-
-def matmul_lhs_rhs_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Plain-numpy equivalent for the nkipy baremetal_jit baseline."""
-    return lhs @ rhs
+    """``lhs @ rhs`` via a Transpose staging pass."""
+    lhs_sbuf = NKILoad()(data=lhs)
+    rhs_sbuf = NKILoad()(data=rhs)
+    lhs_T = NKITranspose()(data=lhs_sbuf)
+    prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)
+    out = NKIStore()(data=prod)
+    return out
 
 
 if __name__ == "__main__":
     M, K, N = 2048, 2048, 2048
-    HOSTS = ["gym-2", "gym-3"]
-    ATOL, RTOL = 1e-2, 1e-2
-
     INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-    CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhs_rhs_sampling")
-
+    CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhs_rhs_eager")
     shutil.rmtree(CACHE_ROOT, ignore_errors=True)
     CACHE_ROOT.mkdir(parents=True)
 
-    base_ir = build_ir(matmul_lhs_rhs_nkigym, INPUT_SPECS)
-    variants = dict(enumerate_rewrite_combinations(base_ir, [LoadTranspose()]))
+    source = render_eager(matmul_lhs_rhs_nkigym, INPUT_SPECS)
+    (CACHE_ROOT / "kernel.py").write_text(source)
 
-    mac_count = compute_mac_count(matmul_lhs_rhs_nkigym, INPUT_SPECS)
-    nkigym_source = func_source_with_imports(matmul_lhs_rhs_nkigym)
-    output_shape = tuple(base_ir.logical_tensors[base_ir.return_name].shape)
-
-    num_samples = 100
-    seen: set[tuple] = set()
-    kernels: dict[str, KernelJob] = {}
-    for variant, ir in variants.items():
-        for i in range(num_samples):
-            candidate = sample(ir)
-            sig = knob_signature(candidate)
-            if sig in seen:
-                continue
-            seen.add(sig)
-            source = inline_gadgets(render_ir(candidate))
-            kernel_name = f"{variant}_{i}.py"
-            kernels[kernel_name] = KernelJob(
-                source=source,
-                func_name=candidate.func_name,
-                output_shape=output_shape,
-                input_specs=INPUT_SPECS,
-                nkigym_source=nkigym_source,
-                nkigym_func_name=matmul_lhs_rhs_nkigym.__name__,
-                mac_count=mac_count,
-                atol=ATOL,
-                rtol=RTOL,
-                neuronx_cc_args=("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false"),
-            )
-            dump_ir(CACHE_ROOT, kernel_name, candidate)
-
-    output = remote_profile(kernels=kernels, hosts=HOSTS, cache_dir=str(CACHE_ROOT))
-
-    baseline = remote_numpy_baseline(
-        func=matmul_lhs_rhs_numpy,
-        input_specs=INPUT_SPECS,
-        mac_count=mac_count,
-        host=HOSTS[0],
-        kernel_name="nkipy_baseline",
-    )
-    print(f"{baseline.kernel_name}: min_ms={baseline.min_ms}  MFU={baseline.mfu}")
+    sim_source = source.replace("nl.bfloat16", "nl.float32")
+    sim_ns: dict = {}
+    exec(sim_source, sim_ns)
+    kernel_fn = sim_ns["matmul_lhs_rhs_nkigym"]
+    rng = np.random.default_rng(1)
+    lhs = rng.standard_normal((M, K)).astype(np.float32)
+    rhs = rng.standard_normal((K, N)).astype(np.float32)
+    actual = nki.simulate(kernel_fn)(lhs=lhs, rhs=rhs)
+    if isinstance(actual, tuple):
+        actual = actual[0]
+    expected = lhs @ rhs
+    print(f"[matmul_lhs_rhs] max_abs={float(np.abs(actual - expected).max()):.3e}")
+    assert np.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+    print(f"[matmul_lhs_rhs] kernel written to {CACHE_ROOT / 'kernel.py'}")

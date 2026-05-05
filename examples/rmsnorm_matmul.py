@@ -1,8 +1,12 @@
-"""Compile ``rmsnorm(lhs) @ rhs`` from numpy to nkigym.
+"""Compile ``rmsnorm(lhs) @ rhs`` from numpy to an eager NKI kernel.
 
-The user writes the plain-numpy reference and ``INPUT_SPECS``; one
-``compile_numpy_to_nkigym`` call drives the translation and returns
-validated ``f_nkigym`` source.
+Drives the staged ``nkigym_compile`` pipeline:
+
+    1. ``"synthesis"`` — synthesise ``f_nkigym`` from the numpy reference
+       via the Claude Agent SDK; write ``<cache>/f_nkigym.py``.
+    2. ``"initial_codegen"`` — render the eager NKI kernel into
+       ``<cache>/kernel.py`` and auto-validate it against the numpy
+       reference through ``nki.simulate``.
 
 Usage::
 
@@ -15,16 +19,15 @@ from pathlib import Path
 
 import numpy as np
 
-from nkigym.synthesis import compile_numpy_to_nkigym
+from nkigym import nkigym_compile
 
 
 def rmsnorm_matmul_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Plain-numpy golden for the nkipy baremetal_jit baseline."""
+    """Plain-numpy ``rmsnorm(lhs) @ rhs`` golden."""
     m = np.mean(np.square(lhs), axis=1, keepdims=True)
     rms_inv = 1.0 / np.sqrt(m + 1e-6)
     normed = lhs * rms_inv
-    output = normed @ rhs
-    return output
+    return normed @ rhs
 
 
 if __name__ == "__main__":
@@ -36,5 +39,5 @@ if __name__ == "__main__":
     M, K, N = 2048, 2048, 2048
     INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 
-    source = compile_numpy_to_nkigym(rmsnorm_matmul_numpy, INPUT_SPECS)
-    (cache_dir / "f_nkigym.py").write_text(source)
+    nkigym_compile(rmsnorm_matmul_numpy, INPUT_SPECS, cache_dir, stages=["synthesis", "initial_codegen"])
+    print(f"[rmsnorm_matmul] kernel written to {cache_dir / 'kernel.py'}")

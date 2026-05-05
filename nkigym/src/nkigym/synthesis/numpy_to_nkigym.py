@@ -41,7 +41,7 @@ Given a numpy function `f_numpy` and an `INPUT_SPECS` dict, produce an `f_nkigym
 
 # Output contract
 
-- Decorate the function with `@nkigym_kernel` (imported from `nkigym.ops`). The decorator enforces that every HBM input flows through `NKILoad` before any compute op touches it, and that the kernel returns the output of an `NKIStore`.
+- Decorate the function with `@nkigym_kernel`. The decorator enforces that every HBM input flows through `NKILoad` before any compute op touches it, and that the kernel returns the output of an `NKIStore`.
 - Positional parameters match `INPUT_SPECS` keys and order (same names, same order).
 - Body consists ONLY of `NKIOp()(...)` calls — no `np.*`, no Python arithmetic, no `if` / `for`, no helper functions.
 - Every intermediate is bound to a named local.
@@ -50,18 +50,36 @@ Given a numpy function `f_numpy` and an `INPUT_SPECS` dict, produce an `f_nkigym
 - Matmul uses `stationary.T @ moving`. For raw `A @ B`, insert `A_T = NKITranspose()(data=A)` before `NKIMatmul()(stationary=A_T, moving=B)`.
 - Plain stateless DAG — the vanilla decomposition of the numpy math. NEVER emit an online/single-pass reformulation (flash attention, running-softmax, fused running-mean, etc.). NEVER use `NKIOnlineFlashAttention` or `NKIOnlineMatmul`. Online fusion is a separate downstream rewrite that operates on your output.
 
+# Imports
+
+Each NKIOp class lives in its own submodule under `nkigym.ops.<module>`. `nkigym_kernel` is the only name exported from `nkigym.ops` directly. Emit only the import lines for the ops you actually use, drawn from this table:
+
+```python
+from nkigym.ops import nkigym_kernel
+from nkigym.ops.load import NKILoad
+from nkigym.ops.store import NKIStore
+from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.transpose import NKITranspose
+from nkigym.ops.dma_transpose import NKIDMATranspose
+from nkigym.ops.activation import NKIActivation
+from nkigym.ops.activation_reduce import NKIActivationReduce
+from nkigym.ops.tensor_scalar import NKITensorScalar
+```
+
+Do NOT import NKIOp classes from `nkigym.ops` (flat namespace) — that package only exports `nkigym_kernel` and the abstract `NKIOp` base.
+
 # Op cheat sheet
 
-| Op | OPERAND_AXES | OUTPUT_AXES | Call |
-|---|---|---|---|
-| `NKILoad` | `data:(P,F)` | `output:(P,F)` | `NKILoad()(data=param)` — HBM → SBUF, identity layout; wrap every INPUT_SPECS parameter before compute |
-| `NKIStore` | `data:(P,F)` | `output:(P,F)` | `NKIStore()(data=sbuf)` — SBUF → HBM, identity layout; final op before `return` |
-| `NKIMatmul` | `stationary:(K,M)`, `moving:(K,N)` | `output:(M,N)` | `NKIMatmul()(stationary=A_T, moving=B)` computes `A_T.T @ B` |
-| `NKITranspose` | `data:(P,F)` | `output:(F,P)` | TE transpose, ≤128×128 input |
-| `NKIDMATranspose` | `data:(P,F)` | `output:(F,P)` | DMA transpose, frees TE for matmul |
-| `NKIActivationReduce` | `data:(P,F)` | `output:(P,)` | `NKIActivationReduce(op=..., reduce_op=..., post_op=?, scale=?, bias=?)(data=X)` — reduces along F |
-| `NKIActivation` | `data:(P,F)` or `(P,)` | same | `NKIActivation(op=..., scale=?, bias=?)(data=X)` — elementwise, no reduce |
-| `NKITensorScalar` | `data:(P,F)`, `operand0:(P,)` | `output:(P,F)` | `NKITensorScalar(op=...)(data=X, operand0=v)` — per-row vector broadcast along F |
+| Op | Import | OPERAND_AXES | OUTPUT_AXES | Call |
+|---|---|---|---|---|
+| `NKILoad` | `nkigym.ops.load` | `data:(P,F)` | `output:(P,F)` | `NKILoad()(data=param)` — HBM → SBUF, identity layout; wrap every INPUT_SPECS parameter before compute |
+| `NKIStore` | `nkigym.ops.store` | `data:(P,F)` | `output:(P,F)` | `NKIStore()(data=sbuf)` — SBUF → HBM, identity layout; final op before `return` |
+| `NKIMatmul` | `nkigym.ops.matmul` | `stationary:(K,M)`, `moving:(K,N)` | `output:(M,N)` | `NKIMatmul()(stationary=A_T, moving=B)` computes `A_T.T @ B` |
+| `NKITranspose` | `nkigym.ops.transpose` | `data:(P,F)` | `output:(F,P)` | TE transpose, ≤128×128 input |
+| `NKIDMATranspose` | `nkigym.ops.dma_transpose` | `data:(P,F)` | `output:(F,P)` | DMA transpose, frees TE for matmul |
+| `NKIActivationReduce` | `nkigym.ops.activation_reduce` | `data:(P,F)` | `output:(P,)` | `NKIActivationReduce(op=..., reduce_op=..., post_op=?, scale=?, bias=?)(data=X)` — reduces along F |
+| `NKIActivation` | `nkigym.ops.activation` | `data:(P,F)` or `(P,)` | same | `NKIActivation(op=..., scale=?, bias=?)(data=X)` — elementwise, no reduce |
+| `NKITensorScalar` | `nkigym.ops.tensor_scalar` | `data:(P,F)`, `operand0:(P,)` | `output:(P,F)` | `NKITensorScalar(op=...)(data=X, operand0=v)` — per-row vector broadcast along F |
 
 Op-arg vocabulary: `op` / `post_op` ∈ `{square, exp, copy, reciprocal, tanh, rsqrt, sqrt}`; `reduce_op` ∈ `{add, max}`; `NKITensorScalar.op` ∈ `{multiply, add, subtract}`.
 
