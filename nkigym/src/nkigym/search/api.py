@@ -18,12 +18,11 @@ import numpy as np
 import nkigym.ops as ops_pkg
 from autotune.runner.api import remote_profile
 from autotune.runner.output import ProfileOutput
-from autotune.runner.types import KernelJob, ProfileConfig
+from autotune.runner.types import KernelJob
 from nkigym.codegen import gadgets as _gadgets
 from nkigym.codegen import render_ir
 from nkigym.kernel_ir.ir import KernelIR
 from nkigym.ops.base import NKIOp
-from nkigym.search.mac import compute_mac_count
 
 
 def remote_run(
@@ -36,7 +35,7 @@ def remote_run(
     rtol: float,
     kernel_name: str = "kernel.py",
     neuronx_cc_args: tuple[str, ...] = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false"),
-    config: ProfileConfig = ProfileConfig(),
+    collect_detailed_profile: bool = False,
 ) -> ProfileOutput:
     """Render ``ir`` and profile against the math function ``func``.
 
@@ -51,14 +50,14 @@ def remote_run(
         rtol: Relative tolerance for CPU-sim correctness.
         kernel_name: Filename for the rendered kernel.
         neuronx_cc_args: Extra compiler flags.
-        config: Infra settings.
+        collect_detailed_profile: Capture full per-instruction
+            ``neuron-profile`` JSON. Tens of MB per kernel.
 
     Returns:
         ProfileOutput with timing and correctness.
     """
     source = render_ir(ir)
     payload = inline_gadgets(source)
-    mac_count = compute_mac_count(func, input_specs)
     nkigym_source = func_source_with_imports(func)
     output_shape = tuple(ir.logical_tensors[ir.return_name].shape)
     job = KernelJob(
@@ -68,7 +67,6 @@ def remote_run(
         input_specs=input_specs,
         nkigym_source=nkigym_source,
         nkigym_func_name=func.__name__,
-        mac_count=mac_count,
         atol=atol,
         rtol=rtol,
         neuronx_cc_args=neuronx_cc_args,
@@ -76,7 +74,15 @@ def remote_run(
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
     dump_ir(cache_path, kernel_name, ir)
-    return remote_profile(kernels={kernel_name: job}, hosts=hosts, cache_dir=cache_dir, config=config)
+    return remote_profile(
+        kernels={kernel_name: job},
+        hosts=hosts,
+        cache_dir=cache_dir,
+        seed=42,
+        neuron_platform_target="trn2",
+        venv_python="/home/ubuntu/venvs/kernel-env/bin/python",
+        collect_detailed_profile=collect_detailed_profile,
+    )
 
 
 def dump_ir(cache_path: Path, kernel_name: str, ir: KernelIR) -> None:
