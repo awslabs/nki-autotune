@@ -1,19 +1,14 @@
-"""Fused activation + free-axis reduce op: ``nisa.activation_reduce`` + ``activation_reduce_block`` gadget.
+"""Fused activation + free-axis reduce op: mirrors ``nisa.activation_reduce``.
 
-Mirrors ``nisa.activation_reduce`` one-to-one: applies ``op(data * scale + bias)``
-element-wise and simultaneously reduces the activated result along the free
-dimension into a per-row scalar. ``post_op`` (optional) applies a final
-activation to the closed reduction result once all F tiles have been summed —
-covers the ``post_op='rsqrt'`` case used by rmsnorm.
+Math: ``reduce_op(op(data), axis=F)``. Output is the per-row reduction vector.
+The fully activated tile is an internal byproduct the ISA call discards.
 
 OPERAND_AXES / OUTPUT_AXES reflect that only the reduce result is the
-op's *output* — the activated tile is internally consumed and discarded.
+op's output — the activated tile is internally consumed and discarded.
 """
 
 from typing import Any, ClassVar
 
-import nki.isa as nisa
-import nki.language as nl
 import numpy as np
 
 from nkigym.ops.base import AxisRole, NKIOp
@@ -31,48 +26,34 @@ _ACT_FNS: dict[str, Any] = {
     "sqrt": np.sqrt,
 }
 _RED_FNS: dict[str, Any] = {"add": np.sum, "max": np.max}
-"""Reduce-op-name → numpy reduction. Extend by adding a new
-``{name: np.fn}`` entry; the gadget picks up new names via
-``_MERGE_FNS`` and ``_IDENTITY`` below."""
-
-_NL_OPS: dict[str, Any] = {
-    "square": nl.square,
-    "exp": nl.exp,
-    "copy": nl.copy,
-    "reciprocal": nl.reciprocal,
-    "tanh": nl.tanh,
-    "rsqrt": nl.rsqrt,
-    "sqrt": nl.sqrt,
-}
-_NL_REDUCE_OPS: dict[str, Any] = {"add": nl.add, "max": nl.maximum}
-"""Reduce-op-name → ``nl.*`` ISA op. Lower-case ``max`` maps to
-``nl.maximum`` — the binary pairwise elementwise-max used both as the
-reduction axis op and the cross-iteration accumulator merge."""
-
-_MERGE_FNS: dict[str, Any] = {"add": nl.add, "max": nl.maximum}
-"""Per-reduce-op binary merge for the cross-iteration accumulator.
-``activation_reduce_block`` is called once per F-block; each call
-produces a ``(p_tile, 1)`` block reduction that must be folded into
-the caller-owned ``sbuf_red`` accumulator via this merge."""
-
-_IDENTITY: dict[str, float] = {"add": 0.0, "max": float("-inf")}
-"""Identity element for each reduce op. The renderer emits the
-prologue memset using this value so the first block's merge produces
-the correct first-block reduction."""
 
 
 class NKIActivationReduce(NKIOp):
-    """Fused activation + free-axis reduce, with optional post-op on the closed reduction.
+    """Fused activation + free-axis reduce — mirrors ``nisa.activation_reduce``.
 
-    Math: ``reduce_op(op(data * scale + bias), axis=F)`` with an optional
-    ``post_op`` applied once after the F reduction closes — the typical
-    rmsnorm shape is ``post_op(reduce_op(op(data)*scale+bias, axis=F))``.
+    Math: ``reduce_op(op(data), axis=F)``. Output is the ``(P,)`` per-row
+    reduction vector. The fully activated ``(P, F)`` tile is an internal
+    byproduct the gadget discards.
 
-    The op's output is the ``(P,)`` per-row reduction vector. The fully
-    activated ``(P, F)`` tile is an internal byproduct the gadget
-    discards — downstream consumers either use the reduction vector
-    directly (rmsnorm → ``tensor_scalar(multiply, operand0=rms_inv)``)
-    or fuse it into a subsequent elementwise op.
+    Kwargs mirror the valid subset of ``nisa.activation_reduce``:
+
+    * ``op``: activation applied per-element before the reduce.
+    * ``reduce_op``: reduction operator along the free axis.
+
+    Fused closures (e.g. rmsnorm's ``rsqrt(sum(x²)·scale + bias)``) must
+    be spelled out in the DSL as a separate ``NKIActivation(op="rsqrt",
+    scale=..., bias=...)`` call on the reduction output — not as
+    ``post_op``/``scale``/``bias`` kwargs on this op.
+
+    Lowering (Pattern 2): one ``nisa.activation_reduce`` per F-tile
+    writes to a distinct slot of the op-local ``slot_vec`` buffer;
+    after the F loop exits, one ``nisa.tensor_reduce(axis=2)`` folds
+    ``slot_vec`` into the op's ``(P, 1)`` output.
+
+    Future work: a hoist transform that pulls ``activation_reduce`` out
+    of the F loop, combined with DCE on the closing ``tensor_reduce``
+    (trivial when ``num_f_tiles == 1``), will reach Pattern 1 (one
+    full-F ``activation_reduce`` call, no slot vector) monotonically.
     """
 
     NAME: ClassVar[str] = "activation_reduce"
@@ -89,87 +70,36 @@ class NKIActivationReduce(NKIOp):
     this F-loop, symmetric to how matmul's K dim is handled."""
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": VE_PARTITION_MAX, "F": VE_FREE_MAX}
+    OP_LOCAL_BUFFERS: ClassVar[dict[str, tuple[str, str, tuple[str, ...]]]] = {
+        "scratch": ("sbuf", "float32", ("P", "F")),
+        "slot_vec": ("sbuf", "float32", ("P", "F_slot")),
+    }
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: ``post_op(reduce_op(op(data), axis=F) * scale + bias)``.
+        """CPU simulation: ``reduce_op(op(data), axis=F)``.
 
-        ``scale`` and ``bias`` apply to the **closed reduction result**
-        before the optional ``post_op`` — matches the rmsnorm formula
-        ``rsqrt(sum(lhs^2) * (1/K) + eps)``. The codegen emits the
-        activation+reduce as one fused call (no scale/bias on the
-        reducer), then a separate ``activation_block(post_op, scale, bias)``
-        on the closed reduction, which is semantically equivalent.
+        Mirrors the valid kwarg subset of ``nisa.activation_reduce``: only
+        ``op`` and ``reduce_op`` are accepted. For fused closures like
+        rmsnorm (``rsqrt(sum(x²)/K + eps)``), the DSL must spell out the
+        post-reduction activation as a separate ``NKIActivation`` call on
+        the reduction output.
+
+        Raises:
+            TypeError: any kwarg besides ``data`` / ``op`` / ``reduce_op``
+                is supplied.
         """
+        allowed = {"data", "op", "reduce_op"}
+        extra = set(kwargs) - allowed
+        if extra:
+            raise TypeError(
+                f"NKIActivationReduce received unexpected kwargs: {sorted(extra)}. "
+                f"Only {sorted(allowed)} are supported; use a separate NKIActivation "
+                f"for post-reduction scale/bias/op."
+            )
         data: np.ndarray = kwargs["data"]
-        op_name: str = kwargs.get("op", "copy")
-        reduce_op: str = kwargs.get("reduce_op", "add")
-        post_op_name: str | None = kwargs.get("post_op")
-        scale = kwargs.get("scale", 1.0)
-        bias = kwargs.get("bias", 0.0)
+        op_name: str = kwargs["op"]
+        reduce_op: str = kwargs["reduce_op"]
         data_f32 = data.astype(np.float32)
         activated = _ACT_FNS[op_name](data_f32)
         reduced = _RED_FNS[reduce_op](activated, axis=1).astype(np.float32)
-        scaled = reduced * scale + bias
-        if post_op_name is not None:
-            scaled = _ACT_FNS[post_op_name](scaled)
-        return scaled
-
-
-def activation_reduce_block(sbuf_red: Any, sbuf_data: Any, op: Any, reduce_op: Any) -> None:
-    """Apply ``op`` + free-axis ``reduce_op`` per leaf, merging into ``sbuf_red``.
-
-    ``sbuf_data`` leaves shape ``(p_tile, f_tile)``. ``sbuf_red`` leaves
-    shape ``(p_tile, 1)``. The F-block reduction is merged into the
-    caller-provided accumulator using ``reduce_op`` (``nl.add`` →
-    sum-accumulate, ``nl.maximum`` → running max). The caller must
-    memset ``sbuf_red`` to the reduction identity before the first
-    call in an F-block (0.0 for add, -inf for max).
-
-    The scale+bias+post_op kwargs of :class:`NKIActivationReduce` are
-    emitted by the renderer — this gadget handles only the raw
-    activation-reduce step. For rmsnorm's ``post_op='rsqrt'``, the
-    renderer emits a separate ``activation_block`` call on the closed
-    reduction once the F loop exits.
-    """
-    p_tile, f_tile = sbuf_data[0].shape
-    for pi in range(len(sbuf_data)):
-        tmp = nl.ndarray((p_tile, f_tile), dtype=nl.float32, buffer=nl.sbuf)
-        tmp_red = nl.ndarray((p_tile, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation_reduce(
-            dst=tmp[0:p_tile, 0:f_tile],
-            op=op,
-            data=sbuf_data[pi][0:p_tile, 0:f_tile],
-            reduce_op=reduce_op,
-            reduce_res=tmp_red[0:p_tile, 0:1],
-        )
-        nisa.tensor_tensor(
-            sbuf_red[pi][0:p_tile, 0:1], sbuf_red[pi][0:p_tile, 0:1], tmp_red[0:p_tile, 0:1], op=reduce_op
-        )
-
-
-def activation_block(sbuf_dst: Any, sbuf_src: Any, op: Any, scale: float = 1.0, bias: float = 0.0) -> None:
-    """Apply a standalone activation ``op(data * scale + bias)`` per leaf.
-
-    Used by the renderer to emit the ``post_op`` of :class:`NKIActivationReduce`
-    after the F reduction has closed — e.g. ``activation_block(rms_inv,
-    m_sum, op=nl.rsqrt, scale=1/K, bias=eps)`` to turn ``sum(lhs^2)``
-    into ``1/sqrt(mean + eps)``.
-
-    ``sbuf_dst`` and ``sbuf_src`` must have matching shapes. For the
-    rmsnorm closure they are both ``(p_tile, 1)`` 1D-style leaves.
-    """
-    p_tile, f_tile = sbuf_dst[0].shape
-    for i in range(len(sbuf_dst)):
-        nisa.activation(
-            dst=sbuf_dst[i][0:p_tile, 0:f_tile], op=op, data=sbuf_src[i][0:p_tile, 0:f_tile], scale=scale, bias=bias
-        )
-
-
-def nl_op(name: str) -> Any:
-    """Resolve an op-name string to its ``nl.*`` callable."""
-    return _NL_OPS[name]
-
-
-def nl_reduce_op(name: str) -> Any:
-    """Resolve a reduce-op-name string to its ``nl.*`` callable."""
-    return _NL_REDUCE_OPS[name]
+        return reduced

@@ -7,6 +7,7 @@ import pytest
 from nkigym.codegen.graph import parse_and_resolve
 from nkigym.codegen.loop_forest import build_canonical_forest, hash_forest
 from nkigym.ops import nkigym_kernel
+from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
@@ -21,9 +22,8 @@ def _rmsnorm_matmul_f_nkigym(lhs, rhs):
     """rmsnorm + matmul fixture reused across tests — same shape as test_compile."""
     lhs_sbuf = NKILoad()(data=lhs)
     rhs_sbuf = NKILoad()(data=rhs)
-    rms_inv = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt", scale=1 / 256, bias=1e-6)(
-        data=lhs_sbuf
-    )
+    sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
+    rms_inv = NKIActivation(op="rsqrt", scale=1 / 256, bias=1e-6)(data=sum_sq)
     lhs_rms = NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv)
     lhs_T = NKITranspose()(data=lhs_rms)
     prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)

@@ -66,10 +66,8 @@ EPS = 1e-6
 def _rms_func(lhs):
     """Function for testing literal kwargs parsing."""
     lhs_sbuf = NKILoad()(data=lhs)
-    rms_inv = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt", scale=1 / 2048, bias=EPS)(
-        data=lhs_sbuf
-    )
-    out = NKIStore()(data=rms_inv)
+    sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
+    out = NKIStore()(data=sum_sq)
     return out
 
 
@@ -79,9 +77,9 @@ def test_parse_ast_captures_literal_kwargs() -> None:
     kwargs = raws[1].op_kwargs
     assert kwargs["op"] == "square"
     assert kwargs["reduce_op"] == "add"
-    assert kwargs["post_op"] == "rsqrt"
-    assert kwargs["scale"] == 1 / 2048
-    assert kwargs["bias"] == EPS
+    assert "post_op" not in kwargs
+    assert "scale" not in kwargs
+    assert "bias" not in kwargs
 
 
 def test_parse_and_resolve_simple_matmul() -> None:
@@ -172,3 +170,109 @@ def test_parse_and_resolve_touched_dims_ordering() -> None:
     m_dim = g.tensors["lhs_T_sbuf"].dim_ids[1]
     n_dim = g.tensors["rhs_sbuf"].dim_ids[1]
     assert matmul_op.touched_dims == (m_dim, n_dim, k_dim)
+
+
+def test_op_local_buffers_defaults_to_empty() -> None:
+    """NKIOp.OP_LOCAL_BUFFERS defaults to an empty dict so existing ops are unaffected."""
+    from nkigym.ops.base import NKIOp
+    from nkigym.ops.load import NKILoad
+    from nkigym.ops.matmul import NKIMatmul
+
+    assert NKIOp.OP_LOCAL_BUFFERS == {}
+    assert NKIMatmul.OP_LOCAL_BUFFERS == {}
+    assert NKILoad.OP_LOCAL_BUFFERS == {}
+
+
+def test_parse_and_resolve_registers_op_local_derived_dims_for_activation_reduce() -> None:
+    """After parse_and_resolve, an F_slot derived dim exists for each activation_reduce op.
+
+    The derived dim's tile_size is 1 and num_tiles matches the source F dim's num_tiles.
+    """
+    from nkigym.codegen.graph import parse_and_resolve
+
+    @nkigym_kernel
+    def _rms(x):
+        xs = NKILoad()(data=x)
+        m = NKIActivationReduce(op="square", reduce_op="add")(data=xs)
+        out = NKIStore()(data=m)
+        return out
+
+    g = parse_and_resolve(_rms, {"x": ((128, 2048), "bfloat16")})
+    ar_op = next(o for o in g.ops if o.op_cls.__name__ == "NKIActivationReduce")
+    f_dim_id = ar_op.axis_map["F"]
+    f_info = g.dims[f_dim_id]
+    assert f_info.tile_size == 512
+    assert f_info.num_tiles == 4
+
+    """A derived F_slot dim must be registered for this op instance."""
+    f_slot_dim_ids = [d for d in g.dims if d.startswith(f_dim_id) and d.endswith("_f_slot")]
+    assert len(f_slot_dim_ids) == 1
+    slot_info = g.dims[f_slot_dim_ids[0]]
+    assert slot_info.tile_size == 1
+    assert slot_info.num_tiles == f_info.num_tiles
+    assert slot_info.total_size == f_info.num_tiles
+
+
+def test_parsed_op_resolves_op_local_buffer_names_for_activation_reduce() -> None:
+    """ParsedOp.op_local_buffers maps logical → (emitted_name, location, dtype, shape).
+
+    Naming convention: sbuf_local_<id> / psum_local_<id>, id assigned per
+    op instance in encounter order across OP_LOCAL_BUFFERS iteration order.
+    """
+    from nkigym.codegen.graph import parse_and_resolve
+    from nkigym.ops import nkigym_kernel
+    from nkigym.ops.activation_reduce import NKIActivationReduce
+    from nkigym.ops.load import NKILoad
+    from nkigym.ops.store import NKIStore
+
+    @nkigym_kernel
+    def _rms(x):
+        xs = NKILoad()(data=x)
+        m = NKIActivationReduce(op="square", reduce_op="add")(data=xs)
+        out = NKIStore()(data=m)
+        return out
+
+    g = parse_and_resolve(_rms, {"x": ((128, 2048), "bfloat16")})
+    ar_op = next(o for o in g.ops if o.op_cls.__name__ == "NKIActivationReduce")
+
+    """Buffers dict is keyed by logical name declared on the op."""
+    assert set(ar_op.op_local_buffers.keys()) == {"scratch", "slot_vec"}
+
+    scratch = ar_op.op_local_buffers["scratch"]
+    assert scratch.emitted_name == "sbuf_local_0"
+    assert scratch.location == "sbuf"
+    assert scratch.dtype == "float32"
+    """Shape: (p_tile, 1, num_f_tiles * f_tile) — P dim contributes p_tile
+    plus singleton block dim; F contributes num_f_tiles*f_tile."""
+    assert scratch.shape == (128, 1, 2048)
+
+    slot = ar_op.op_local_buffers["slot_vec"]
+    assert slot.emitted_name == "sbuf_local_1"
+    assert slot.location == "sbuf"
+    assert slot.dtype == "float32"
+    """Shape: (p_tile, 1, num_f_tiles) — F_slot.num_tiles=4, tile_size=1."""
+    assert slot.shape == (128, 1, 4)
+
+
+def test_activation_reduce_rejects_removed_kwargs() -> None:
+    """NKIActivationReduce mirrors nisa.activation_reduce kwargs; post_op/scale/bias removed."""
+    import numpy as np
+    import pytest
+
+    from nkigym.ops.activation_reduce import NKIActivationReduce
+    from nkigym.ops.base import _RoleArray
+
+    xs_np = np.ones((128, 2048), dtype=np.float32)
+    xs = xs_np.view(_RoleArray)
+    xs.role = "sbuf"
+
+    """Valid call: only op + reduce_op."""
+    NKIActivationReduce(op="square", reduce_op="add")(data=xs)
+
+    """Removed kwargs must raise TypeError with a clear message."""
+    with pytest.raises(TypeError):
+        NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt")(data=xs)
+    with pytest.raises(TypeError):
+        NKIActivationReduce(op="square", reduce_op="add", scale=0.5)(data=xs)
+    with pytest.raises(TypeError):
+        NKIActivationReduce(op="square", reduce_op="add", bias=1e-6)(data=xs)

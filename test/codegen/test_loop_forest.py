@@ -2,6 +2,7 @@
 
 from nkigym.codegen.loop_forest import BodyLeaf, LoopForest, LoopNode, check_invariant
 from nkigym.ops import nkigym_kernel
+from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad
@@ -94,17 +95,8 @@ def _matmul_lhsT_rhs_for_forest_tests(lhs_T, rhs):
 
 
 @nkigym_kernel
-def _rms_kernel_with_post_op(x):
-    """Test kernel: activation_reduce with post_op=rsqrt."""
-    xs = NKILoad()(data=x)
-    m = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt")(data=xs)
-    out = NKIStore()(data=m)
-    return out
-
-
-@nkigym_kernel
-def _rms_kernel_without_post_op(x):
-    """Test kernel: activation_reduce with no post_op."""
+def _rms_kernel(x):
+    """Test kernel: activation_reduce with no extra kwargs."""
     xs = NKILoad()(data=x)
     m = NKIActivationReduce(op="square", reduce_op="add")(data=xs)
     out = NKIStore()(data=m)
@@ -116,10 +108,11 @@ EPS = 1e-6
 
 @nkigym_kernel
 def _rmsnorm_matmul(lhs, rhs):
-    """Full rmsnorm+matmul DAG for invariant coverage."""
+    """Test kernel: RMSNorm followed by matmul (two-call form)."""
     lhs_sbuf = NKILoad()(data=lhs)
     rhs_sbuf = NKILoad()(data=rhs)
-    rms_inv = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt")(data=lhs_sbuf)
+    sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
+    rms_inv = NKIActivation(op="rsqrt", scale=1 / 256, bias=1e-6)(data=sum_sq)
     lhs_rms = NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv)
     lhs_T = NKITranspose()(data=lhs_rms)
     prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)
@@ -210,43 +203,34 @@ def test_canonical_forest_matmul_invariant_holds() -> None:
     check_invariant(forest, num_tiles, op_touched, phase_touched)
 
 
-def test_canonical_forest_activation_reduce_with_post_op_has_three_leaves() -> None:
-    """ActivationReduce with post_op emits reducer_init + F chain ending in reduce_step + post_op."""
+def test_canonical_forest_activation_reduce_has_expected_leaves() -> None:
+    """NKIActivationReduce emits F chain + reduce_close. No reducer_init, no post_op.
+
+    Pattern 2: each activation_reduce call writes a distinct slot of
+    slot_vec; reduce_close folds the slots via nisa.tensor_reduce. The
+    post_op phase was removed — fused closures are now two separate DSL
+    calls in f_nkigym.
+    """
     from nkigym.codegen.loop_forest import build_canonical_forest
 
-    g = _parse(_rms_kernel_with_post_op, _RMS_SPECS)
+    g = _parse(_rms_kernel, _RMS_SPECS)
     forest = build_canonical_forest(g)
     ar_idx = next(i for i, op in enumerate(g.ops) if op.op_cls.__name__ == "NKIActivationReduce")
     tree = forest[ar_idx]
     p_tile = tree.children[0]
     children = p_tile.children
-    """Three children: reducer_init, F chain, post_op."""
-    assert isinstance(children[0], BodyLeaf) and children[0].phase == "reducer_init"
-    f_block = children[1]
+    """Two children: F chain, reduce_close."""
+    assert len(children) == 2
+    f_block = children[0]
     assert isinstance(f_block, LoopNode)
     f_tile = f_block.children[0]
     reduce_leaf = f_tile.children[0]
     assert isinstance(reduce_leaf, BodyLeaf) and reduce_leaf.phase == "reduce_step"
-    assert isinstance(children[2], BodyLeaf) and children[2].phase == "post_op"
-
-
-def test_canonical_forest_activation_reduce_no_post_op_omits_post_op_leaf() -> None:
-    """When the op has no post_op, the post_op leaf is omitted."""
-    from nkigym.codegen.loop_forest import build_canonical_forest
-
-    g = _parse(_rms_kernel_without_post_op, _RMS_SPECS)
-    forest = build_canonical_forest(g)
-    ar_idx = next(i for i, op in enumerate(g.ops) if op.op_cls.__name__ == "NKIActivationReduce")
-    tree = forest[ar_idx]
-    p_tile = tree.children[0]
-    children = p_tile.children
-    """Two children: reducer_init, F chain. No post_op."""
-    assert len(children) == 2
-    assert isinstance(children[0], BodyLeaf) and children[0].phase == "reducer_init"
-    assert isinstance(children[1], LoopNode)
+    assert isinstance(children[1], BodyLeaf) and children[1].phase == "reduce_close"
     for c in children:
         if isinstance(c, BodyLeaf):
             assert c.phase != "post_op"
+            assert c.phase != "reducer_init"
 
 
 def test_canonical_forest_rmsnorm_matmul_invariant_holds() -> None:
@@ -317,12 +301,12 @@ def test_canonical_forest_activation_reduce_f_loops_carry_kwargs_reduce_op() -> 
     """ActivationReduce F-chain LoopNodes carry reduce_op from op_kwargs."""
     from nkigym.codegen.loop_forest import LoopNode, build_canonical_forest
 
-    g = _parse(_rms_kernel_with_post_op, _RMS_SPECS)
+    g = _parse(_rms_kernel, _RMS_SPECS)
     forest = build_canonical_forest(g)
     ar_idx = next(i for i, op in enumerate(g.ops) if op.op_cls.__name__ == "NKIActivationReduce")
     tree = forest[ar_idx]
     p_tile = tree.children[0]
-    f_block = p_tile.children[1]
+    f_block = p_tile.children[0]
     assert isinstance(f_block, LoopNode)
     assert f_block.reduce_op == "add"
     f_tile = f_block.children[0]

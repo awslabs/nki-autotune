@@ -61,7 +61,8 @@ def _tensor_scalar_kernel(x, v):
 @nkigym_kernel
 def _rms_kernel(x):
     xs = NKILoad()(data=x)
-    m = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt", scale=1 / 128, bias=1e-6)(data=xs)
+    sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=xs)
+    m = NKIActivation(op="rsqrt", scale=1 / 128, bias=1e-6)(data=sum_sq)
     out = NKIStore()(data=m)
     return out
 
@@ -73,7 +74,8 @@ EPS = 1e-6
 def _rmsnorm_matmul(lhs, rhs):
     lhs_sbuf = NKILoad()(data=lhs)
     rhs_sbuf = NKILoad()(data=rhs)
-    rms_inv = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt", scale=1 / 256, bias=EPS)(data=lhs_sbuf)
+    sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
+    rms_inv = NKIActivation(op="rsqrt", scale=1 / 256, bias=EPS)(data=sum_sq)
     lhs_rms = NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv)
     lhs_T = NKITranspose()(data=lhs_rms)
     prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)
@@ -290,14 +292,14 @@ def test_render_tensor_scalar() -> None:
 
 
 def test_render_activation_reduce_rmsnorm() -> None:
-    """activation_reduce with post_op=rsqrt emits memset + accumulate loop + post_op."""
+    """activation_reduce with post_op=rsqrt emits activation_reduce + tensor_reduce + post_op."""
     import nki
     import numpy as np
 
     specs = {"x": ((128, 128), "bfloat16")}
     g = parse_and_resolve(_rms_kernel, specs)
     src = render(g)
-    assert "nisa.memset(" in src
+    assert "nisa.tensor_reduce(" in src
     assert "nisa.activation_reduce(" in src
     assert "nisa.activation(" in src
     assert "op=nl.rsqrt" in src
@@ -633,7 +635,7 @@ def test_render_forest_activation_reduce_cpu_sim_matches() -> None:
     specs = {"x": ((128, 128), "bfloat16")}
     g = parse_and_resolve(_rms_kernel, specs)
     src = _render_via_walker(g)
-    assert "nisa.memset(" in src
+    assert "nisa.tensor_reduce(" in src
     assert "nisa.activation_reduce(" in src
     assert "nisa.activation(" in src
     assert "op=nl.rsqrt" in src
@@ -674,3 +676,50 @@ def test_render_forest_rmsnorm_matmul_cpu_sim_matches() -> None:
     rms_inv = 1.0 / np.sqrt(m + EPS)
     expected = (lhs * rms_inv) @ rhs
     assert np.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_render_emits_op_local_buffer_allocations_at_top() -> None:
+    """Renderer emits one nl.ndarray per op-local buffer, after tensor allocations."""
+    specs = {"x": ((128, 2048), "bfloat16")}
+    g = parse_and_resolve(_rms_kernel, specs)
+    src = render(g)
+
+    """scratch: (p_tile=128, 1, num_f_tiles*f_tile=4*512=2048) — f_tile-wide per call."""
+    assert "sbuf_local_0 = nl.ndarray((128, 1, 2048), dtype=nl.float32, buffer=nl.sbuf)" in src
+    """slot_vec: (p_tile=128, 1, num_f_tiles=4)."""
+    assert "sbuf_local_1 = nl.ndarray((128, 1, 4), dtype=nl.float32, buffer=nl.sbuf)" in src
+
+
+def test_render_reduce_step_writes_slot_and_omits_tensor_tensor_merge() -> None:
+    """reduce_step emits activation_reduce(reduce_res=slot_vec[:, :, f_idx:f_idx+1]) with no merge.
+
+    Pattern 2 doesn't need tensor_tensor or tmp_red — each call writes
+    a distinct slot directly.
+    """
+    specs = {"x": ((128, 2048), "bfloat16")}
+    g = parse_and_resolve(_rms_kernel, specs)
+    src = render(g)
+
+    """activation_reduce writes to sbuf_local_1 (slot_vec); dst is sbuf_local_0 (scratch)."""
+    assert "nisa.activation_reduce(" in src
+    assert "reduce_res=sbuf_local_1" in src
+    """No tmp_red allocation, no tensor_tensor merge."""
+    assert "tmp_red" not in src
+    assert "nisa.tensor_tensor(" not in src
+    """The legacy reducer_init memset on sbuf_<reduce_output> must also be gone."""
+    assert "nisa.memset(sbuf_m" not in src
+
+
+def test_render_reduce_close_emits_tensor_reduce_on_slot_vec() -> None:
+    """reduce_close folds slot_vec into the op's (P, 1) output via nisa.tensor_reduce."""
+    specs = {"x": ((128, 2048), "bfloat16")}
+    g = parse_and_resolve(_rms_kernel, specs)
+    src = render(g)
+
+    """tensor_reduce closes the slot vector along its free axis."""
+    assert "nisa.tensor_reduce(" in src
+    """Must reduce axis=2 of (p_tile, 1, num_f_tiles) shape."""
+    assert "axis=2" in src
+    """Output is sbuf_m (the op's reduce output), slot is sbuf_local_1."""
+    assert "sbuf_m" in src
+    assert "sbuf_local_1" in src

@@ -114,6 +114,10 @@ class NKIOp:
         AXIS_ROLES: Per-op axis → role classification. Omitted axes default
             to ``AxisRole.PARALLEL``.
         TILE_LIMITS: Hardware tile size per abstract axis.
+        OP_LOCAL_BUFFERS: Buffers allocated at function top but sized at
+            single-iteration scope (see ClassVar docstring). Empty for
+            most ops; used by reducers that need cross-phase scratch
+            within one tile's iteration.
     """
 
     NAME: ClassVar[str] = ""
@@ -122,6 +126,15 @@ class NKIOp:
     OUTPUT_DTYPES: ClassVar[dict[str, str]] = {}
     AXIS_ROLES: ClassVar[dict[str, "AxisRole"]] = {}
     TILE_LIMITS: ClassVar[dict[str, int]] = {}
+    OP_LOCAL_BUFFERS: ClassVar[dict[str, tuple[str, str, tuple[str, ...]]]] = {}
+    """Op-local buffers allocated at function top but sized at single-iteration
+    scope (no outer-dim blow-up). Each entry maps a logical name to
+    ``(location, dtype, axis_ids)`` — ``location`` ∈ ``{"sbuf", "psum"}``,
+    ``dtype`` is an ``nl.*`` dtype name (e.g. ``"float32"``), ``axis_ids``
+    are abstract axis labels from ``OPERAND_AXES`` keys plus any op-local
+    derived axes declared on the op. The emitted buffer identifiers are
+    ``{location}_local_<id>`` where ``<id>`` is assigned per op instance
+    monotonically across the kernel."""
 
     def __init__(self, **kwargs: Any) -> None:
         """Stash constructor kwargs for merging into ``__call__`` kwargs."""

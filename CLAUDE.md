@@ -8,9 +8,9 @@ pytest <tests>
 ```
 
 Performance tuning:
+- [x] Unified tune stage
 - [x] Loop fusion
 - [x] Loop order
-- [ ] Unified tune stage
 - [ ] Tiles per block
 - [ ] Hoist
 - [ ] Multi buffer

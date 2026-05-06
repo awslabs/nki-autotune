@@ -77,18 +77,18 @@ Do NOT import NKIOp classes from `nkigym.ops` (flat namespace) — that package 
 | `NKIMatmul` | `nkigym.ops.matmul` | `stationary:(K,M)`, `moving:(K,N)` | `output:(M,N)` | `NKIMatmul()(stationary=A_T, moving=B)` computes `A_T.T @ B` |
 | `NKITranspose` | `nkigym.ops.transpose` | `data:(P,F)` | `output:(F,P)` | TE transpose, ≤128×128 input |
 | `NKIDMATranspose` | `nkigym.ops.dma_transpose` | `data:(P,F)` | `output:(F,P)` | DMA transpose, frees TE for matmul |
-| `NKIActivationReduce` | `nkigym.ops.activation_reduce` | `data:(P,F)` | `output:(P,)` | `NKIActivationReduce(op=..., reduce_op=..., post_op=?, scale=?, bias=?)(data=X)` — reduces along F |
+| `NKIActivationReduce` | `nkigym.ops.activation_reduce` | `data:(P,F)` | `output:(P,)` | `NKIActivationReduce(op=..., reduce_op=...)(data=X)` — reduces along F; output is the per-row reduction vector |
 | `NKIActivation` | `nkigym.ops.activation` | `data:(P,F)` or `(P,)` | same | `NKIActivation(op=..., scale=?, bias=?)(data=X)` — elementwise, no reduce |
 | `NKITensorScalar` | `nkigym.ops.tensor_scalar` | `data:(P,F)`, `operand0:(P,)` | `output:(P,F)` | `NKITensorScalar(op=...)(data=X, operand0=v)` — per-row vector broadcast along F |
 
-Op-arg vocabulary: `op` / `post_op` ∈ `{square, exp, copy, reciprocal, tanh, rsqrt, sqrt}`; `reduce_op` ∈ `{add, max}`; `NKITensorScalar.op` ∈ `{multiply, add, subtract}`.
+Op-arg vocabulary: `op` ∈ `{square, exp, copy, reciprocal, tanh, rsqrt, sqrt}`; `reduce_op` ∈ `{add, max}`; `NKITensorScalar.op` ∈ `{multiply, add, subtract}`; `NKIActivation.scale` / `NKIActivation.bias` apply per-element pre-activation.
 
 # Translation procedure
 
 1. `NKILoad` every parameter from `INPUT_SPECS` at the top of the function — one named local per input (`x_sbuf = NKILoad()(data=x)`). All subsequent compute ops consume the `_sbuf` locals, never the raw parameters.
 2. List every tensor-level step in `f_numpy`, stripping `.astype(...)` and `keepdims=True` (numpy bookkeeping, not primitives).
 3. Map each step to one `NKIOp`. Key patterns:
-   - Fused reduce-and-activation: `reduce(act(X), axis=F)` + optional affine (`+bias`) + optional post-activation (e.g. `rsqrt`) → one `NKIActivationReduce(op=<act>, reduce_op=<red>, post_op=<post>, scale=<scalar>, bias=<scalar>)`. `scale` / `bias` apply to the CLOSED reduction result, not per-element; an `/F` on the closed reduction becomes `scale=1/F`.
+   - Fused reduce-then-activation (e.g. rmsnorm's `rsqrt(sum(x²)/F + eps)`): split into two DSL calls. Emit `NKIActivationReduce(op=<act>, reduce_op=<red>)(data=X)` to get the raw reduction; then feed that into `NKIActivation(op=<post>, scale=<scalar>, bias=<scalar>)(data=reduced)` to apply the post-reduction activation with its affine scale/bias. `NKIActivation` applies `op(data * scale + bias)` per-element on its input; for `rsqrt(reduced/F + eps)`, use `scale=1/F` and `bias=eps`.
    - `X * v[:, None]` with `v` shape `(P,)` → `NKITensorScalar(op="multiply", data=X, operand0=v)`. Broadcasts along F.
 4. Fix matmul operand shapes. `NKIMatmul` computes `stationary.T @ moving`. For `A @ B`, transpose `A` first.
 5. Bind every intermediate to a named local — no chained calls.
@@ -98,7 +98,7 @@ Op-arg vocabulary: `op` / `post_op` ∈ `{square, exp, copy, reciprocal, tanh, r
 
 - Every assistant turn emits exactly ONE ```python fenced code block: imports + any constants + `def f_nkigym(...):`. Nothing else — no prose before or after.
 - The orchestrator replies with a validator result. If `passed` is true the conversation ends. If false, read `error` / `max_abs_diff` / `max_rel_diff` and emit a revised candidate in the same format.
-- Common failure modes: wrong matmul transpose orientation, `scale` / `bias` applied pre-reduce instead of post-reduce, wrong axis in a reduction, missing step in the DAG, output-shape mismatch (usually a missing or extra transpose).
+- Common failure modes: wrong matmul transpose orientation, post-reduction activation squeezed into `NKIActivationReduce` (it has no `post_op` / `scale` / `bias` — emit a separate `NKIActivation` instead), wrong axis in a reduction, missing step in the DAG, output-shape mismatch (usually a missing or extra transpose).
 """
 
 

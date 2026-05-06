@@ -2,6 +2,7 @@
 
 from nkigym.codegen.loop_forest import BodyLeaf, LoopNode
 from nkigym.ops import nkigym_kernel
+from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad
@@ -309,9 +310,8 @@ def test_apply_rmsnorm_matmul_preserves_check_invariant() -> None:
     def rmm(lhs, rhs):
         lhs_sbuf = NKILoad()(data=lhs)
         rhs_sbuf = NKILoad()(data=rhs)
-        rms_inv = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt", scale=1 / 256, bias=1e-6)(
-            data=lhs_sbuf
-        )
+        sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
+        rms_inv = NKIActivation(op="rsqrt", scale=1 / 256, bias=1e-6)(data=sum_sq)
         lhs_rms = NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv)
         lhs_T = NKITranspose()(data=lhs_rms)
         prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)
@@ -321,9 +321,9 @@ def test_apply_rmsnorm_matmul_preserves_check_invariant() -> None:
     specs = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
     g = parse_and_resolve(rmm, specs)
     forest = build_canonical_forest(g)
-    """tensor_scalar is op index 3. Its tree shape is d0-block/d0-tile/d1-block/d1-tile/leaf.
-    Swap d0-tile (at path (3, 0)) with d1-block (its child)."""
-    atom = ReorderLoops(path=(3, 0), outer_dim="d0", inner_dim="d1")
+    """tensor_scalar is op index 4 (0=Load, 1=Load, 2=ActivationReduce, 3=Activation, 4=TensorScalar).
+    Its tree shape is d0-block/d0-tile/d1-block/d1-tile/leaf. Swap d0-tile (at path (4, 0)) with d1-block."""
+    atom = ReorderLoops(path=(4, 0), outer_dim="d0", inner_dim="d1")
     assert atom.is_legal(g, forest) is True
     _, new_forest = atom.apply(g, forest)
     num_tiles = {d: info.num_tiles for d, info in g.dims.items()}
@@ -413,9 +413,8 @@ def test_enumerate_rmsnorm_matmul_canonical_finds_expected_atoms() -> None:
     def rmm(lhs, rhs):
         lhs_sbuf = NKILoad()(data=lhs)
         rhs_sbuf = NKILoad()(data=rhs)
-        rms_inv = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt", scale=1 / 256, bias=1e-6)(
-            data=lhs_sbuf
-        )
+        sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
+        rms_inv = NKIActivation(op="rsqrt", scale=1 / 256, bias=1e-6)(data=sum_sq)
         lhs_rms = NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv)
         lhs_T = NKITranspose()(data=lhs_rms)
         prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)
@@ -427,12 +426,12 @@ def test_enumerate_rmsnorm_matmul_canonical_finds_expected_atoms() -> None:
     forest = build_canonical_forest(g)
     atoms = enumerate_reorder_atoms(forest)
     """Sanity: at least one atom exists in every 2D-or-deeper op's chain
-    (load, rhs_load, tensor_scalar, transpose, store are 2D ops; each
-    has block→tile same-dim pair legal as PAR×PAR)."""
+    (load=0, rhs_load=1, tensor_scalar=4, transpose=5, store=7 are 2D
+    ops; each has block→tile same-dim pair legal as PAR×PAR)."""
     paths = {a.path for a in atoms}
     assert (0,) in paths
     assert (1,) in paths
-    assert (3,) in paths
+    assert (4,) in paths
 
 
 def test_canonical_forest_populates_loop_node_names() -> None:

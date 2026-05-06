@@ -5,6 +5,7 @@ from typing import get_type_hints
 from nkigym.codegen.graph import parse_and_resolve
 from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, build_canonical_forest
 from nkigym.ops import nkigym_kernel
+from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad
@@ -23,7 +24,8 @@ def _rmsnorm_matmul_for_rewrites(lhs, rhs):
     """Rmsnorm+matmul kernel used to exercise FuseLoops."""
     lhs_sbuf = NKILoad()(data=lhs)
     rhs_sbuf = NKILoad()(data=rhs)
-    rms_inv = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt", scale=1 / 256, bias=EPS)(data=lhs_sbuf)
+    sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
+    rms_inv = NKIActivation(op="rsqrt", scale=1 / 256, bias=EPS)(data=sum_sq)
     lhs_rms = NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv)
     lhs_T = NKITranspose()(data=lhs_rms)
     prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)
@@ -211,14 +213,15 @@ def test_enumerate_fusion_atoms_rmsnorm_matmul_canonical_has_sensible_atoms() ->
     g, forest = _canonical_rmsnorm_matmul()
     atoms = enumerate_fusion_atoms(forest)
     """Op indices in _rmsnorm_matmul_for_rewrites:
-      0=Load(lhs), 1=Load(rhs), 2=ActivationReduce, 3=TensorScalar,
-      4=Transpose, 5=Matmul, 6=Store.
-    Forest-root atoms must include (2, 3) and (5, 6) on d0."""
+      0=Load(lhs), 1=Load(rhs), 2=ActivationReduce, 3=Activation,
+      4=TensorScalar, 5=Transpose, 6=Matmul, 7=Store.
+    Forest-root atoms must include (2, 3), (3, 4), and (6, 7) on d0."""
     root_atoms = [(a.boundary, a.dim_id) for a in atoms if a.path == ()]
     assert ((2, 3), "d0") in root_atoms
-    assert ((5, 6), "d0") in root_atoms
-    """Exactly two root-level atoms."""
-    assert len(root_atoms) == 2
+    assert ((3, 4), "d0") in root_atoms
+    assert ((6, 7), "d0") in root_atoms
+    """Exactly three root-level atoms."""
+    assert len(root_atoms) == 3
 
 
 def test_enumerate_returns_empty_on_empty_forest() -> None:
@@ -293,10 +296,10 @@ def test_re_enumeration_after_apply_finds_next_atom_at_shifted_boundary() -> Non
     """After fusing at the forest root, re-enumeration must not include stale root indices."""
     g, forest = _canonical_rmsnorm_matmul()
     atoms0 = enumerate_fusion_atoms(forest)
-    assert any(a.path == () and a.boundary == (5, 6) and a.dim_id == "d0" for a in atoms0)
+    assert any(a.path == () and a.boundary == (6, 7) and a.dim_id == "d0" for a in atoms0)
     forest1 = forest
     for a in atoms0:
-        if a.path == () and a.boundary == (5, 6) and a.dim_id == "d0":
+        if a.path == () and a.boundary == (6, 7) and a.dim_id == "d0":
             _, forest1 = a.apply(g, forest1)
             break
     atoms1 = enumerate_fusion_atoms(forest1)

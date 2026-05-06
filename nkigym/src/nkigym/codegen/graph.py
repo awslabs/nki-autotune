@@ -59,6 +59,29 @@ class DimInfo:
 
 
 @dataclass
+class OpLocalBuffer:
+    """Resolved op-local buffer ready for renderer emission.
+
+    Attributes:
+        logical_name: Name the op declared (e.g. ``"scratch"``, ``"slot_vec"``).
+        emitted_name: Identifier the renderer uses in emitted source
+            (e.g. ``"sbuf_local_0"``).
+        location: ``"sbuf"`` or ``"psum"``.
+        dtype: ``nl.*`` dtype name (e.g. ``"float32"``).
+        shape: Emitted 3D shape ``(p_tile, 1, free_extent)``. Partition
+            dim contributes ``p_tile``; outer block tier collapses to 1
+            (op-local = no cross-iteration persistence); free axis
+            contributes ``num_tiles * tile_size``.
+    """
+
+    logical_name: str
+    emitted_name: str
+    location: str
+    dtype: str
+    shape: tuple[int, int, int]
+
+
+@dataclass
 class ParsedOp:
     """One ``NKIOp()(...)`` call captured from the ``f_nkigym`` body.
 
@@ -79,6 +102,11 @@ class ParsedOp:
             in ``touched_dims``. Resolved from ``op_cls.AXIS_ROLES`` via
             ``axis_map``; PARALLEL is the default for any dim not named
             in ``AXIS_ROLES``.
+        op_local_buffers: Resolved op-local buffers keyed by logical
+            name. Renderer emits one allocation per entry at function
+            top using ``emitted_name`` / ``location`` / ``shape``. Body
+            emitters reference ``emitted_name`` directly. Empty when
+            the op class declares no ``OP_LOCAL_BUFFERS``.
     """
 
     idx: int
@@ -89,6 +117,7 @@ class ParsedOp:
     axis_map: dict[str, str]
     touched_dims: tuple[str, ...]
     dim_role: dict[str, AxisRole]
+    op_local_buffers: dict[str, OpLocalBuffer] = field(default_factory=dict)
 
 
 @dataclass
@@ -327,8 +356,9 @@ def parse_and_resolve(func: Callable[..., np.ndarray], input_specs: dict[str, tu
         raise ValueError(f"Return tensor {return_name!r} not produced by any op")
 
     dims = _resolve_dimensions(raws, per_op_axis_maps, dim_sizes)
+    _register_op_local_derived_dims(raws, per_op_axis_maps, dims)
     tensors = _finalize_tensors(tensors_scratch, param_names, return_name, raws)
-    ops = _build_parsed_ops(raws, per_op_axis_maps, tensors)
+    ops = _build_parsed_ops(raws, per_op_axis_maps, tensors, dims)
 
     return OpGraph(
         func_name=unwrapped.__name__,
@@ -451,6 +481,41 @@ def _resolve_dimensions(
     }
 
 
+def _register_op_local_derived_dims(
+    raws: list[_ParsedOpRaw], per_op_axis_maps: list[dict[str, str]], dims: dict[str, DimInfo]
+) -> None:
+    """Register derived dims referenced by op-local buffer axis_ids.
+
+    For now, the only derived axis label recognized is ``F_slot``: one
+    element per F-tile, inherited from the op's F dim's ``num_tiles``.
+    For each op that declares an ``OP_LOCAL_BUFFERS`` entry mentioning
+    ``F_slot``, we register a derived ``DimInfo`` keyed ``<f_dim>_f_slot``
+    with ``tile_size=1``, ``num_tiles=dims[f_dim].num_tiles``.
+
+    Args:
+        raws: Parsed ops in source order.
+        per_op_axis_maps: Concrete axis_maps aligned with ``raws``.
+        dims: The resolved dim table (mutated in place to add derived dims).
+    """
+    for raw, axis_map in zip(raws, per_op_axis_maps):
+        local_buffers = getattr(raw.op_cls, "OP_LOCAL_BUFFERS", {})
+        for _, (_, _, axis_ids) in local_buffers.items():
+            for axis_id in axis_ids:
+                if axis_id == "F_slot":
+                    if "F" not in axis_map:
+                        raise ValueError(
+                            f"Op {raw.op_cls.NAME}: OP_LOCAL_BUFFERS references F_slot "
+                            f"but op has no F axis in axis_map"
+                        )
+                    f_dim_id = axis_map["F"]
+                    derived_id = f"{f_dim_id}_f_slot"
+                    if derived_id not in dims:
+                        f_info = dims[f_dim_id]
+                        dims[derived_id] = DimInfo(
+                            dim_id=derived_id, total_size=f_info.num_tiles, tile_size=1, num_tiles=f_info.num_tiles
+                        )
+
+
 def _finalize_tensors(
     scratch: dict[str, _ScratchTensor], param_names: list[str], return_name: str, raws: list[_ParsedOpRaw]
 ) -> dict[str, Tensor]:
@@ -468,14 +533,66 @@ def _finalize_tensors(
     return out
 
 
+def _resolve_op_local_buffers(
+    raw: _ParsedOpRaw, axis_map: dict[str, str], dims: dict[str, DimInfo], counter: list[int]
+) -> dict[str, OpLocalBuffer]:
+    """Materialize op-local buffer records from ``OP_LOCAL_BUFFERS``.
+
+    Each entry gets a unique ``emitted_name`` via the shared ``counter``.
+    Buffer shape is computed from the declared ``axis_ids`` using
+    op-local sizing rules: partition dim → ``(tile_size, 1, ...)``; the
+    free dim contributes ``num_tiles * tile_size`` (one element per F
+    element for ``F``, one element per F-tile for ``F_slot``).
+
+    Args:
+        raw: Parsed op record.
+        axis_map: Concrete axis_map for this op.
+        dims: Resolved dim table (must already include any derived
+            ``F_slot`` entries; see :func:`_register_op_local_derived_dims`).
+        counter: Mutable single-element list used to assign monotonic
+            buffer ids across the whole kernel.
+
+    Returns:
+        Dict keyed by logical name.
+    """
+    out: dict[str, OpLocalBuffer] = {}
+    local_buffers = getattr(raw.op_cls, "OP_LOCAL_BUFFERS", {})
+    for logical_name, (location, dtype, axis_ids) in local_buffers.items():
+        if len(axis_ids) != 2:
+            raise ValueError(
+                f"Op {raw.op_cls.NAME}: OP_LOCAL_BUFFERS['{logical_name}'] must have 2 axis_ids "
+                f"(P, F-like), got {axis_ids}"
+            )
+        p_axis, f_axis = axis_ids
+        p_dim_id = axis_map[p_axis]
+        p_info = dims[p_dim_id]
+        if f_axis == "F_slot":
+            f_dim_id = f"{axis_map['F']}_f_slot"
+        else:
+            f_dim_id = axis_map[f_axis]
+        f_info = dims[f_dim_id]
+        shape = (p_info.tile_size, 1, f_info.num_tiles * f_info.tile_size)
+        emitted = f"{location}_local_{counter[0]}"
+        counter[0] += 1
+        out[logical_name] = OpLocalBuffer(
+            logical_name=logical_name, emitted_name=emitted, location=location, dtype=dtype, shape=shape
+        )
+    return out
+
+
 def _build_parsed_ops(
-    raws: list[_ParsedOpRaw], per_op_axis_maps: list[dict[str, str]], tensors: dict[str, Tensor]
+    raws: list[_ParsedOpRaw],
+    per_op_axis_maps: list[dict[str, str]],
+    tensors: dict[str, Tensor],
+    dims: dict[str, DimInfo],
 ) -> list[ParsedOp]:
     """Assemble per-op records with canonicalised ``touched_dims``."""
     ops: list[ParsedOp] = []
+    counter = [0]
     for idx, (raw, axis_map) in enumerate(zip(raws, per_op_axis_maps)):
         touched = _touched_dims(raw, axis_map, tensors)
         dim_role = _resolve_dim_role(raw.op_cls, axis_map, touched)
+        op_local_buffers = _resolve_op_local_buffers(raw, axis_map, dims, counter)
         ops.append(
             ParsedOp(
                 idx=idx,
@@ -486,6 +603,7 @@ def _build_parsed_ops(
                 axis_map=dict(axis_map),
                 touched_dims=touched,
                 dim_role=dim_role,
+                op_local_buffers=op_local_buffers,
             )
         )
     return ops

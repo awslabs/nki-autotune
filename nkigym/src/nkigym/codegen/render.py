@@ -107,18 +107,24 @@ def _emit_hbm_output(w: _Writer, op_graph: OpGraph) -> None:
 
 
 def _emit_sbuf_allocations(w: _Writer, op_graph: OpGraph) -> None:
-    """Allocate one SBUF buffer per intermediate.
+    """Allocate one SBUF buffer per intermediate, then per op-local buffer.
 
     Kernel inputs live in HBM (consumed by ``NKILoad``) and the return
     tensor lives in HBM (written by ``NKIStore``). The store emitter
     reads from its data-operand's SBUF buffer directly, so the return
-    has no SBUF mirror and is skipped here.
+    has no SBUF mirror and is skipped here. Op-local buffers come after
+    cross-nest tensors, in op-index order, sized at single-iteration
+    scope (``(tile_size, 1, free_extent)``).
     """
     for name, tensor in op_graph.tensors.items():
         if tensor.origin in ("param", "return"):
             continue
         shape = _sbuf_shape(tensor, op_graph)
         w.line(f"{_sbuf_name(name)} = nl.ndarray({shape}, dtype=nl.{tensor.dtype}, buffer=nl.sbuf)")
+    for op in op_graph.ops:
+        for buf in op.op_local_buffers.values():
+            nl_buffer = "nl.sbuf" if buf.location == "sbuf" else "nl.psum"
+            w.line(f"{buf.emitted_name} = nl.ndarray({buf.shape}, dtype=nl.{buf.dtype}, buffer={nl_buffer})")
     w.line()
 
 
@@ -472,24 +478,38 @@ def _body_matmul_drain(w, op_graph, op, path_names, path_trips) -> None:
     w.line(f"nisa.tensor_copy({out_expr}, psum_tile[0:{p_tile_M}, 0:{f_tile_N}])")
 
 
-@_register_body("NKIActivationReduce", "reducer_init")
-def _body_ar_reducer_init(w, op_graph, op, path_names, path_trips) -> None:
-    """Memset the output reducer slot to the reduction identity."""
+@_register_body("NKIActivationReduce", "reduce_close")
+def _body_ar_reduce_close(w, op_graph, op, path_names, path_trips) -> None:
+    """Fold ``slot_vec`` into the op's ``(P, 1)`` output via ``nisa.tensor_reduce``.
+
+    Runs after the F loop exits; the slot vector holds ``num_f_tiles``
+    partial sums, one per F-tile. ``axis=2`` reduces the free axis of
+    the 3D ``(p_tile, 1, num_f_tiles)`` slot_vec.
+    """
     dst_name = op.output_names[0]
     p_axis = op.axis_map["P"]
     p_tile = op_graph.dims[p_axis].tile_size
+    f_axis = op.axis_map["F"]
+    num_f = op_graph.dims[f_axis].num_tiles
     reduce_op = op.op_kwargs.get("reduce_op", "add")
-    identity = _REDUCE_IDENTITY[reduce_op]
+    merge = _REDUCE_MERGE_OP[reduce_op]
     p_slot = _slot_expr(path_names, path_trips, p_axis)
     dst_slot = f"{_sbuf_name(dst_name)}[0:{p_tile}, {p_slot}, 0:1]"
-    w.line(f"nisa.memset({dst_slot}, value={identity})")
+    slot_name = op.op_local_buffers["slot_vec"].emitted_name
+    src_slot = f"{slot_name}[0:{p_tile}, 0:1, 0:{num_f}]"
+    w.line(f"nisa.tensor_reduce({dst_slot}, {merge}, {src_slot}, axis=2)")
 
 
 @_register_body("NKIActivationReduce", "reduce_step")
 def _body_ar_reduce_step(w, op_graph, op, path_names, path_trips) -> None:
-    """Per-F-tile activation_reduce + merge into the running accumulator."""
+    """Per-F-tile activation_reduce writing into a distinct slot of ``slot_vec``.
+
+    The dst operand goes to the op-local scratch buffer (discarded);
+    the reduce_res lands in ``slot_vec[0:p_tile, 0, f_slot:f_slot+1]``
+    where ``f_slot`` is the current F-tile ordinal on the path. No
+    prologue memset, no cross-tile merge — each call owns its slot.
+    """
     src_name = op.operand_names["data"]
-    dst_name = op.output_names[0]
     src = op_graph.tensors[src_name]
     p_axis = op.axis_map["P"]
     f_axis = op.axis_map["F"]
@@ -498,32 +518,18 @@ def _body_ar_reduce_step(w, op_graph, op, path_names, path_trips) -> None:
     act_op = op.op_kwargs.get("op", "copy")
     reduce_op = op.op_kwargs.get("reduce_op", "add")
     merge = _REDUCE_MERGE_OP[reduce_op]
-    p_slot = _slot_expr(path_names, path_trips, p_axis)
-    dst_slot = f"{_sbuf_name(dst_name)}[0:{p_tile}, {p_slot}, 0:1]"
-    w.line(f"tmp_red = nl.ndarray(({p_tile}, 1), dtype=nl.float32, buffer=nl.sbuf)")
-    w.line(f"scratch = nl.ndarray(({p_tile}, {f_tile}), dtype=nl.float32, buffer=nl.sbuf)")
+    f_slot = _slot_expr(path_names, path_trips, f_axis)
+    scratch_name = op.op_local_buffers["scratch"].emitted_name
+    slot_name = op.op_local_buffers["slot_vec"].emitted_name
+    scratch_slot = f"{scratch_name}[0:{p_tile}, 0, 0:{f_tile}]"
+    reduce_res_slot = f"{slot_name}[0:{p_tile}, 0, {f_slot} : {f_slot} + 1]"
     src_expr = _sbuf_tile_slice(_sbuf_name(src_name), src.dim_ids, p_tile, f_tile, path_names, path_trips)
     w.line("nisa.activation_reduce(")
     w.indent()
-    w.line(f"dst=scratch[0:{p_tile}, 0:{f_tile}],")
+    w.line(f"dst={scratch_slot},")
     w.line(f"op=nl.{act_op},")
     w.line(f"data={src_expr},")
     w.line(f"reduce_op={merge},")
-    w.line(f"reduce_res=tmp_red[0:{p_tile}, 0:1],")
+    w.line(f"reduce_res={reduce_res_slot},")
     w.dedent()
     w.line(")")
-    w.line(f"nisa.tensor_tensor({dst_slot}, {dst_slot}, tmp_red[0:{p_tile}, 0:1], op={merge})")
-
-
-@_register_body("NKIActivationReduce", "post_op")
-def _body_ar_post_op(w, op_graph, op, path_names, path_trips) -> None:
-    """Emit the closing post-reduction activation (e.g. rsqrt)."""
-    dst_name = op.output_names[0]
-    p_axis = op.axis_map["P"]
-    p_tile = op_graph.dims[p_axis].tile_size
-    post_op = op.op_kwargs["post_op"]
-    scale = op.op_kwargs.get("scale", 1.0)
-    bias = op.op_kwargs.get("bias", 0.0)
-    p_slot = _slot_expr(path_names, path_trips, p_axis)
-    dst_slot = f"{_sbuf_name(dst_name)}[0:{p_tile}, {p_slot}, 0:1]"
-    w.line(f"nisa.activation(dst={dst_slot}, op=nl.{post_op}, data={dst_slot}, scale={scale}, bias={bias})")

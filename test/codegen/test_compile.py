@@ -30,6 +30,7 @@ from nkigym.ops.store import NKIStore
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
 from nkigym.ops.tensor_scalar import NKITensorScalar
+from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 
 
@@ -37,9 +38,8 @@ from nkigym.ops.activation_reduce import NKIActivationReduce
 def f_nkigym(lhs, rhs):
     lhs_sbuf = NKILoad()(data=lhs)
     rhs_sbuf = NKILoad()(data=rhs)
-    rms_inv = NKIActivationReduce(op="square", reduce_op="add", post_op="rsqrt", scale=1 / 256, bias=1e-6)(
-        data=lhs_sbuf
-    )
+    sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
+    rms_inv = NKIActivation(op="rsqrt", scale=1 / 256, bias=1e-6)(data=sum_sq)
     lhs_rms = NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv)
     lhs_T = NKITranspose()(data=lhs_rms)
     prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)
@@ -107,13 +107,13 @@ def test_run_tune_explicit_empty_rewrites_writes_kernel_tuned(tmp_path: Path) ->
 
 
 def test_run_tune_explicit_applies_fuse_loops_d0(tmp_path: Path) -> None:
-    """Applying FuseLoops on activation_reduce↔tensor_scalar d0 still matches numpy."""
+    """Applying FuseLoops on activation_reduce↔activation d0 still matches numpy."""
     _seed_f_nkigym(tmp_path)
     rewrites = [FuseLoops(path=(), boundary=(2, 3), dim_id="d0")]
     _explicit_run_tune(tmp_path, rewrites=rewrites)
     kernel_source = (tmp_path / "kernel_tuned.py").read_text()
     assert "nisa.activation_reduce(" in kernel_source
-    assert "nisa.tensor_scalar(" in kernel_source
+    assert "nisa.activation(" in kernel_source
 
 
 def test_run_tune_explicit_rejects_illegal_rewrite(tmp_path: Path) -> None:
@@ -130,7 +130,7 @@ def test_run_tune_explicit_applies_reorder_loops_inside_tensor_scalar(tmp_path: 
     from nkigym.tune.reorder_loops import ReorderLoops
 
     _seed_f_nkigym(tmp_path)
-    rewrites = [ReorderLoops(path=(3, 0), outer_dim="d0", inner_dim="d1")]
+    rewrites = [ReorderLoops(path=(4, 0), outer_dim="d0", inner_dim="d1")]
     _explicit_run_tune(tmp_path, rewrites=rewrites)
     assert (tmp_path / "kernel_tuned.py").exists()
 
@@ -141,8 +141,8 @@ def test_run_tune_explicit_compose_reorder_then_fuse(tmp_path: Path) -> None:
 
     _seed_f_nkigym(tmp_path)
     rewrites = [
-        ReorderLoops(path=(3, 0), outer_dim="d0", inner_dim="d1"),
-        FuseLoops(path=(), boundary=(2, 3), dim_id="d0"),
+        ReorderLoops(path=(4, 0), outer_dim="d0", inner_dim="d1"),
+        FuseLoops(path=(), boundary=(3, 4), dim_id="d0"),
     ]
     _explicit_run_tune(tmp_path, rewrites=rewrites)
     assert (tmp_path / "kernel_tuned.py").exists()

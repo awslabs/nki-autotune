@@ -287,15 +287,17 @@ def _phase_dims_matmul(op: ParsedOp) -> dict[str, tuple[str, ...]]:
 
 
 def _build_leaves_activation_reduce(op: ParsedOp, op_graph: OpGraph) -> list[LoopNode | BodyLeaf]:
-    """ActivationReduce: ``[reducer_init leaf, <F chain ending in reduce_step leaf>, post_op leaf?]``.
+    """ActivationReduce Pattern 2: ``[<F-chain with reduce_step>, reduce_close]``.
 
     The outer P dim is consumed by ``_wrap_dims``. The F dim is handled
-    here: an ``F-block / F-tile / BodyLeaf(reduce_step)`` chain sits
-    between ``reducer_init`` and the optional ``post_op`` leaf. The
-    F-chain LoopNodes carry the reducer name from
-    ``op.op_kwargs["reduce_op"]`` so :class:`ReorderLoops` can detect
-    associative-compatible ACC×ACC pairs. The ``post_op`` leaf is
-    included only when ``op.op_kwargs["post_op"]`` is not ``None``.
+    here: F-block → F-tile → BodyLeaf(reduce_step) writes each tile's
+    partial sum into a distinct slot of the op-local ``slot_vec``. After
+    the F loop exits, ``reduce_close`` folds the slot vector via a
+    single ``nisa.tensor_reduce`` into the op's ``(P, 1)`` output.
+
+    No ``reducer_init`` phase — each ``activation_reduce`` call writes a
+    distinct slot. No ``post_op`` phase — fused closures are spelled out
+    as a separate ``NKIActivation`` op in the DSL.
     """
     f_dim = op.axis_map["F"]
     f_role = op.dim_role[f_dim]
@@ -304,20 +306,17 @@ def _build_leaves_activation_reduce(op: ParsedOp, op_graph: OpGraph) -> list[Loo
     reduce_leaf = BodyLeaf(op_idx=op.idx, phase="reduce_step")
     f_tile = LoopNode(dim_id=f_dim, trip_count=1, role=f_role, children=[reduce_leaf], reduce_op=reduce_op)
     f_block = LoopNode(dim_id=f_dim, trip_count=num_f, role=f_role, children=[f_tile], reduce_op=reduce_op)
-    leaves: list[LoopNode | BodyLeaf] = [BodyLeaf(op_idx=op.idx, phase="reducer_init"), f_block]
-    if op.op_kwargs.get("post_op") is not None:
-        leaves.append(BodyLeaf(op_idx=op.idx, phase="post_op"))
-    return leaves
+    return [f_block, BodyLeaf(op_idx=op.idx, phase="reduce_close")]
 
 
 def _phase_dims_activation_reduce(op: ParsedOp) -> dict[str, tuple[str, ...]]:
     """Return the dims each activation_reduce phase touches.
 
-    reducer_init and post_op run outside F; reduce_step runs inside F.
+    reduce_step runs inside F; reduce_close runs outside F.
     """
     p_dim = op.axis_map["P"]
     f_dim = op.axis_map["F"]
-    return {"reducer_init": (p_dim,), "reduce_step": (p_dim, f_dim), "post_op": (p_dim,)}
+    return {"reduce_step": (p_dim, f_dim), "reduce_close": (p_dim,)}
 
 
 _LEAF_BUILDERS["NKIMatmul"] = _build_leaves_matmul
