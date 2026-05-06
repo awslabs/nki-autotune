@@ -23,6 +23,7 @@ current forest after each apply.
 
 from dataclasses import dataclass
 
+from nkigym.codegen.dep_graph import commutes
 from nkigym.codegen.graph import OpGraph
 from nkigym.codegen.loop_forest import BodyLeaf, LoopForest, LoopNode
 from nkigym.ops.base import AxisRole
@@ -46,46 +47,91 @@ class FuseLoops:
     dim_id: str
 
     def is_legal(self, op_graph: OpGraph, forest: LoopForest) -> bool:
-        """Return ``True`` when the atom can be applied at ``(path, boundary)``."""
-        _ = op_graph
+        """Return ``True`` when the atom can be applied at ``(path, boundary)``.
+
+        Three layers:
+
+        1. Resolve ``path``; bail if stale.
+        2. Three-field match on the endpoints: same ``dim_id``, same
+           ``trip_count``, both ``PARALLEL``.
+        3. Topological adjacency: every sibling strictly between ``i``
+           and ``j`` must commute with BOTH endpoints — so it can be
+           pushed to the left of the producer without breaking any
+           RAW / WAR / WAW edge. Skipped when ``j == i + 1``.
+
+        Layer 3 consults ``op_graph.dep``; when ``j == i + 1`` the
+        topological check is vacuous and ``op_graph`` may be ``None``
+        (supported for hand-built test forests).
+        """
         siblings = _resolve_siblings(forest, self.path)
         if siblings is None:
             return False
-        return _pair_is_fusable(siblings, self.boundary, self.dim_id)
+        if not _pair_is_fusable(siblings, self.boundary, self.dim_id):
+            return False
+        i, j = self.boundary
+        if j == i + 1:
+            return True
+        return _intervening_siblings_commute(op_graph, siblings, i, j)
 
     def apply(self, op_graph: OpGraph, forest: LoopForest) -> tuple[OpGraph, LoopForest]:
-        """Merge the two adjacent siblings at ``(path, boundary)`` into one ``LoopNode``.
+        """Fuse the pair at ``(path, boundary)``; consumer absorbs producer.
 
-        The merged node's children = ``A.children ++ B.children`` in
-        program order. ``op_graph`` is returned unchanged (structural
-        rewrite).
+        Siblings strictly between ``i`` and ``j`` slide to the left of
+        ``i``'s original position, keeping their relative order. The
+        fused ``LoopNode`` lands at ``j``'s original slot. Its children
+        are ``producer.children ++ consumer.children`` — producer body
+        first, preserving the RAW edge. The fused loop inherits the
+        consumer's ``name``. ``op_graph`` passes through unchanged.
         """
         new_forest = _rewrite_forest(forest, self.path, self.boundary, self.dim_id)
         return op_graph, new_forest
 
 
-def enumerate_fusion_atoms(forest: LoopForest) -> list[FuseLoops]:
+def enumerate_fusion_atoms(op_graph: OpGraph | None, forest: LoopForest) -> list[FuseLoops]:
     """Return every legal :class:`FuseLoops` atom in ``forest``.
 
     Walks the forest recursively: at every children list (the forest
-    itself plus every ``LoopNode.children``), enumerates adjacent pairs
-    and emits one atom per fusable pair.
+    itself plus every ``LoopNode.children``), enumerates every pair
+    ``(i, j)`` with ``0 ≤ i < j < len(siblings)`` and emits one atom
+    per pair that passes both the three-field match and the
+    topological-adjacency check.
+
+    Args:
+        op_graph: Used for the topological-adjacency check when a pair
+            has intervening siblings. May be ``None`` on hand-built
+            test forests that only exercise literal-adjacent pairs;
+            in that case a pair with ``j > i + 1`` is conservatively
+            rejected.
+        forest: The forest to enumerate over.
+
+    Returns:
+        List of atoms in depth-first order.
     """
     atoms: list[FuseLoops] = []
-    _collect(forest, path=(), atoms=atoms)
+    _collect(op_graph, forest, path=(), atoms=atoms)
     return atoms
 
 
-def _collect(siblings: list[LoopNode | BodyLeaf], path: tuple[int, ...], atoms: list[FuseLoops]) -> None:
+def _collect(
+    op_graph: OpGraph | None, siblings: list[LoopNode | BodyLeaf], path: tuple[int, ...], atoms: list[FuseLoops]
+) -> None:
     """Recursive helper for :func:`enumerate_fusion_atoms`."""
-    for i in range(len(siblings) - 1):
-        if _pair_is_fusable(siblings, (i, i + 1), dim_id=None):
+    n = len(siblings)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not _pair_is_fusable(siblings, (i, j), dim_id=None):
+                continue
+            if j > i + 1:
+                if op_graph is None:
+                    continue
+                if not _intervening_siblings_commute(op_graph, siblings, i, j):
+                    continue
             a = siblings[i]
             assert isinstance(a, LoopNode)
-            atoms.append(FuseLoops(path=path, boundary=(i, i + 1), dim_id=a.dim_id))
+            atoms.append(FuseLoops(path=path, boundary=(i, j), dim_id=a.dim_id))
     for idx, child in enumerate(siblings):
         if isinstance(child, LoopNode):
-            _collect(child.children, path=path + (idx,), atoms=atoms)
+            _collect(op_graph, child.children, path=path + (idx,), atoms=atoms)
 
 
 def _resolve_siblings(forest: LoopForest, path: tuple[int, ...]) -> list[LoopNode | BodyLeaf] | None:
@@ -106,14 +152,17 @@ def _resolve_siblings(forest: LoopForest, path: tuple[int, ...]) -> list[LoopNod
 
 
 def _pair_is_fusable(siblings: list[LoopNode | BodyLeaf], boundary: tuple[int, int], dim_id: str | None) -> bool:
-    """Check the three-field fusion rule on a specific adjacent pair.
+    """Check the three-field fusion rule on a specific pair.
 
-    When ``dim_id`` is ``None`` the check is used by the enumerator and
-    accepts any shared dim. When ``dim_id`` is specified (the
-    ``is_legal`` path), the pair must also match it.
+    When ``dim_id`` is ``None`` the check accepts any shared dim
+    (enumerator path). When ``dim_id`` is specified (``is_legal``
+    path) the pair must also match it. The pair is identified by
+    ``boundary = (i, j)`` with ``i < j``; non-adjacent pairs are
+    accepted here — the topological-adjacency check lives in
+    :func:`_intervening_siblings_commute`.
     """
     i, j = boundary
-    if j != i + 1 or i < 0 or j >= len(siblings):
+    if not (0 <= i < j < len(siblings)):
         return False
     a = siblings[i]
     b = siblings[j]
@@ -129,6 +178,27 @@ def _pair_is_fusable(siblings: list[LoopNode | BodyLeaf], boundary: tuple[int, i
     )
 
 
+def _intervening_siblings_commute(op_graph: OpGraph, siblings: list[LoopNode | BodyLeaf], i: int, j: int) -> bool:
+    """Return ``True`` when every sibling strictly between ``i`` and ``j``
+    commutes with both endpoints.
+
+    Consults ``op_graph.dep`` to form RAW/WAR/WAW judgments at
+    subtree granularity. Callers must have already verified the
+    three-field match on the endpoints; this helper is only concerned
+    with the movement legality of the intervening siblings.
+    """
+    dep = op_graph.dep
+    producer = siblings[i]
+    consumer = siblings[j]
+    for k in range(i + 1, j):
+        survivor = siblings[k]
+        if not commutes(survivor, producer, dep):
+            return False
+        if not commutes(survivor, consumer, dep):
+            return False
+    return True
+
+
 def _rewrite_forest(forest: LoopForest, path: tuple[int, ...], boundary: tuple[int, int], dim_id: str) -> LoopForest:
     """Return a new forest with the pair at ``(path, boundary)`` merged.
 
@@ -136,7 +206,7 @@ def _rewrite_forest(forest: LoopForest, path: tuple[int, ...], boundary: tuple[i
     through by reference, not deep-copied.
     """
     if not path:
-        return _merge_pair(forest, boundary, dim_id)
+        return _apply_fuse_in_siblings(forest, boundary, dim_id)
     idx, rest = path[0], path[1:]
     parent = forest[idx]
     assert isinstance(parent, LoopNode)
@@ -152,21 +222,32 @@ def _rewrite_forest(forest: LoopForest, path: tuple[int, ...], boundary: tuple[i
     return [*forest[:idx], new_parent, *forest[idx + 1 :]]
 
 
-def _merge_pair(
+def _apply_fuse_in_siblings(
     siblings: list[LoopNode | BodyLeaf], boundary: tuple[int, int], dim_id: str
 ) -> list[LoopNode | BodyLeaf]:
-    """Merge one adjacent pair inside ``siblings``.
+    """Merge one pair inside ``siblings`` — producer absorbed by consumer.
 
-    The merged loop inherits ``a``'s ``name`` — either side's name is
-    valid (fusion requires identical dim_id + trip_count, so a caller
-    that named them the same at build time would see the same name
-    either way), and taking the left one is arbitrary but deterministic.
+    Layout after apply:
+        siblings[:i] ++ survivors ++ [fused] ++ siblings[j+1:]
+
+    where ``survivors = siblings[i+1 : j]`` keeps the original
+    relative order. The fused ``LoopNode`` lands at ``j``'s original
+    slot; its children are
+    ``producer.children ++ consumer.children``.
+
+    For ``j == i + 1`` ``survivors`` is empty and the output matches
+    the literal-adjacent case byte-for-byte.
     """
     i, j = boundary
-    a = siblings[i]
-    b = siblings[j]
-    assert isinstance(a, LoopNode) and isinstance(b, LoopNode)
+    producer = siblings[i]
+    consumer = siblings[j]
+    assert isinstance(producer, LoopNode) and isinstance(consumer, LoopNode)
+    survivors = list(siblings[i + 1 : j])
     merged = LoopNode(
-        dim_id=dim_id, trip_count=a.trip_count, role=AxisRole.PARALLEL, children=[*a.children, *b.children], name=a.name
+        dim_id=dim_id,
+        trip_count=consumer.trip_count,
+        role=AxisRole.PARALLEL,
+        children=[*producer.children, *consumer.children],
+        name=consumer.name,
     )
-    return [*siblings[:i], merged, *siblings[j + 1 :]]
+    return [*siblings[:i], *survivors, merged, *siblings[j + 1 :]]

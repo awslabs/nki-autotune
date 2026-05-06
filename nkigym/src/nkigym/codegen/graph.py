@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 import numpy as np
 
+from nkigym.codegen.dep_graph import DepGraph, build_dep_graph
 from nkigym.ops.base import AxisRole, NKIOp
 
 TensorOrigin = Literal["param", "intermediate", "return"]
@@ -135,6 +136,8 @@ class OpGraph:
         per_op_attrs: Per-op annotation side-table keyed by
             ``ParsedOp.idx``. Empty by default — reserved for future
             passes like ``propagate_compute_skip``.
+        dep: Data-flow dependency graph recording producer/consumer
+            edges and read/write sets for every tensor.
     """
 
     func_name: str
@@ -144,6 +147,7 @@ class OpGraph:
     dims: dict[str, DimInfo]
     ops: list[ParsedOp]
     per_op_attrs: dict[int, dict[str, Any]] = field(default_factory=dict)
+    dep: DepGraph = field(default_factory=lambda: DepGraph(producer={}, consumers={}, reads={}, writes={}))
 
 
 @dataclass
@@ -368,6 +372,7 @@ def parse_and_resolve(func: Callable[..., np.ndarray], input_specs: dict[str, tu
         dims=dims,
         ops=ops,
         per_op_attrs={},
+        dep=build_dep_graph(ops, tensors),
     )
 
 

@@ -51,7 +51,7 @@ def test_enumerate_pool_no_legal_atoms(monkeypatch: pytest.MonkeyPatch):
     """Starting state with no legal atoms → pool of size 1, no error."""
     from nkigym.tune import batch as batch_mod
 
-    monkeypatch.setattr(batch_mod, "enumerate_fusion_atoms", lambda f: [])
+    monkeypatch.setattr(batch_mod, "enumerate_fusion_atoms", lambda og, f: [])
     monkeypatch.setattr(batch_mod, "enumerate_reorder_atoms", lambda f: [])
 
     op_graph, forest = _canonical_state()
@@ -117,7 +117,7 @@ def test_enumerate_pool_exhausts_small_graph(monkeypatch: pytest.MonkeyPatch):
     h1 = hash_forest(forest_s1)
     h2 = hash_forest(forest_s2)
 
-    def _fusion(f):
+    def _fusion(og, f):
         return {h0: [atom_a], h1: [atom_c], h2: []}[hash_forest(f)]
 
     def _reorder(f):

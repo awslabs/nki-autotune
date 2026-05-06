@@ -52,7 +52,9 @@ def enumerate_pool(
     """
     h0 = hash_forest(forest)
     pool: dict[int, tuple[OpGraph, LoopForest]] = {h0: (op_graph, forest)}
-    frontier: dict[int, list[KernelRewrite]] = {h0: enumerate_fusion_atoms(forest) + enumerate_reorder_atoms(forest)}
+    frontier: dict[int, list[KernelRewrite]] = {
+        h0: enumerate_fusion_atoms(op_graph, forest) + enumerate_reorder_atoms(forest)
+    }
     if not frontier[h0]:
         del frontier[h0]
 
@@ -72,7 +74,7 @@ def enumerate_pool(
         if h_new in pool:
             continue
         pool[h_new] = (new_og, new_f)
-        new_atoms = enumerate_fusion_atoms(new_f) + enumerate_reorder_atoms(new_f)
+        new_atoms = enumerate_fusion_atoms(new_og, new_f) + enumerate_reorder_atoms(new_f)
         if new_atoms:
             frontier[h_new] = new_atoms
 

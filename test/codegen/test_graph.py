@@ -276,3 +276,29 @@ def test_activation_reduce_rejects_removed_kwargs() -> None:
         NKIActivationReduce(op="square", reduce_op="add", scale=0.5)(data=xs)
     with pytest.raises(TypeError):
         NKIActivationReduce(op="square", reduce_op="add", bias=1e-6)(data=xs)
+
+
+def test_parse_and_resolve_attaches_dep_graph() -> None:
+    """parse_and_resolve populates OpGraph.dep with producer/consumer edges."""
+    from nkigym.codegen.graph import parse_and_resolve
+
+    specs = {"lhs": ((2048, 2048), "bfloat16"), "rhs": ((2048, 2048), "bfloat16")}
+    g = parse_and_resolve(_matmul_func, specs)
+
+    """dep field is populated."""
+    assert hasattr(g, "dep")
+    assert g.dep.producer
+    assert g.dep.consumers
+
+    """lhs_sbuf has one producer: the first Load op."""
+    load_lhs = g.ops[0]
+    assert "lhs_sbuf" in g.dep.producer
+    assert g.dep.producer["lhs_sbuf"] == load_lhs.idx
+
+    """lhs_T consumes lhs_sbuf."""
+    assert "lhs_sbuf" in g.dep.consumers
+    consumers = g.dep.consumers["lhs_sbuf"]
+    assert len(consumers) == 1
+    """lhs_T is produced by the Transpose op."""
+    transpose_op = g.ops[2]
+    assert transpose_op.idx in consumers
