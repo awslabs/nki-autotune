@@ -5,7 +5,7 @@ Two pure functions — no I/O, no rendering, no dependency on
 
 * :func:`enumerate_pool` explores the reachable rewrite graph via
   randomized frontier expansion, deduping states by
-  :func:`hash_forest`.
+  :func:`hash_state`.
 * :func:`sample_pool` draws ``num_kernels`` states uniformly
   without replacement from the enumerated pool.
 
@@ -17,10 +17,28 @@ import random
 import warnings
 
 from nkigym.codegen.graph import OpGraph
-from nkigym.codegen.loop_forest import LoopForest, hash_forest
+from nkigym.codegen.loop_forest import LoopForest, hash_state
 from nkigym.tune import KernelRewrite
 from nkigym.tune.fuse_loops import enumerate_fusion_atoms
+from nkigym.tune.multi_buffer import enumerate_multi_buffer_atoms
 from nkigym.tune.reorder_loops import enumerate_reorder_atoms
+from nkigym.tune.software_pipeline import enumerate_software_pipeline_atoms
+
+
+def _enumerate_atoms(op_graph: OpGraph, forest: LoopForest) -> list[KernelRewrite]:
+    """Return every atom currently applicable to ``(op_graph, forest)``.
+
+    Unions the four atom kinds - fusion, reorder, multi-buffer,
+    software-pipeline - in a fixed order. Callers treat the result as an
+    unordered set; the sampler shuffles via ``rng.randrange`` on the
+    frontier.
+    """
+    return (
+        enumerate_fusion_atoms(op_graph, forest)
+        + enumerate_reorder_atoms(forest)
+        + enumerate_multi_buffer_atoms(op_graph, forest)
+        + enumerate_software_pipeline_atoms(op_graph, forest)
+    )
 
 
 def enumerate_pool(
@@ -47,14 +65,12 @@ def enumerate_pool(
             atom pick.
 
     Returns:
-        Dict keyed by ``hash_forest``; values are ``(op_graph, forest)``
+        Dict keyed by ``hash_state``; values are ``(op_graph, forest)``
         tuples. Always contains the starting state.
     """
-    h0 = hash_forest(forest)
+    h0 = hash_state(op_graph, forest)
     pool: dict[int, tuple[OpGraph, LoopForest]] = {h0: (op_graph, forest)}
-    frontier: dict[int, list[KernelRewrite]] = {
-        h0: enumerate_fusion_atoms(op_graph, forest) + enumerate_reorder_atoms(forest)
-    }
+    frontier: dict[int, list[KernelRewrite]] = {h0: _enumerate_atoms(op_graph, forest)}
     if not frontier[h0]:
         del frontier[h0]
 
@@ -70,11 +86,11 @@ def enumerate_pool(
 
         src_og, src_f = pool[h]
         new_og, new_f = atom.apply(src_og, src_f)
-        h_new = hash_forest(new_f)
+        h_new = hash_state(new_og, new_f)
         if h_new in pool:
             continue
         pool[h_new] = (new_og, new_f)
-        new_atoms = enumerate_fusion_atoms(new_og, new_f) + enumerate_reorder_atoms(new_f)
+        new_atoms = _enumerate_atoms(new_og, new_f)
         if new_atoms:
             frontier[h_new] = new_atoms
 

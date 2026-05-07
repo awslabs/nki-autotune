@@ -302,3 +302,34 @@ def test_parse_and_resolve_attaches_dep_graph() -> None:
     """lhs_T is produced by the Transpose op."""
     transpose_op = g.ops[2]
     assert transpose_op.idx in consumers
+
+
+def test_tensor_default_buffer_degree_is_one_per_dim() -> None:
+    """Every tensor in a parsed OpGraph defaults buffer_degree[d]=1 for every d in dim_ids."""
+    from test.codegen._rmsnorm_matmul_fixture import INPUT_SPECS, f_nkigym
+
+    from nkigym.codegen.graph import parse_and_resolve
+
+    graph = parse_and_resolve(f_nkigym, INPUT_SPECS)
+    for tensor in graph.tensors.values():
+        assert set(tensor.buffer_degree.keys()) == set(tensor.dim_ids), (
+            f"Tensor {tensor.name!r}: buffer_degree keys {set(tensor.buffer_degree)} "
+            f"!= dim_ids {set(tensor.dim_ids)}"
+        )
+        assert all(
+            deg == 1 for deg in tensor.buffer_degree.values()
+        ), f"Tensor {tensor.name!r}: non-default buffer_degree {tensor.buffer_degree}"
+
+
+def test_tensor_direct_construction_populates_buffer_degree() -> None:
+    """Directly-constructed Tensor gets {d: 1} populated via __post_init__."""
+    t = Tensor(name="x", dim_ids=("d0", "d1"), shape=(128, 512), dtype="bfloat16", origin="param")
+    assert t.buffer_degree == {"d0": 1, "d1": 1}
+
+
+def test_tensor_direct_construction_preserves_explicit_buffer_degree() -> None:
+    """Caller-supplied buffer_degree values are preserved; missing dims get filled in."""
+    t = Tensor(
+        name="x", dim_ids=("d0", "d1"), shape=(128, 512), dtype="bfloat16", origin="param", buffer_degree={"d0": 4}
+    )
+    assert t.buffer_degree == {"d0": 4, "d1": 1}

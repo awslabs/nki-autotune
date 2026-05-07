@@ -14,8 +14,8 @@ The atom's identity is ``(path, outer_dim, inner_dim)``:
   rewrite list across intervening rewrites.
 
 Self-inverse: applying the same atom twice restores the original
-forest (structurally). The ``tune`` stage uses forest-state hashing
-(:func:`nkigym.codegen.loop_forest.hash_forest`) to break cycles in
+forest (structurally). The ``tune`` stage uses state hashing
+(:func:`nkigym.codegen.loop_forest.hash_state`) to break cycles in
 the random-draw loop.
 """
 

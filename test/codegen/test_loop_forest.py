@@ -314,63 +314,74 @@ def test_canonical_forest_activation_reduce_f_loops_carry_kwargs_reduce_op() -> 
     assert f_tile.reduce_op == "add"
 
 
-def test_hash_forest_is_deterministic_across_invocations() -> None:
-    """Two calls on the same forest produce the same hash."""
-    from nkigym.codegen.loop_forest import build_canonical_forest, hash_forest
+def _empty_op_graph():
+    """Return an ``OpGraph`` with no tensors/dims/ops for hand-built forest tests."""
+    from nkigym.codegen.graph import OpGraph
+
+    return OpGraph(func_name="t", param_names=[], return_name="", tensors={}, dims={}, ops=[])
+
+
+def test_hash_state_is_deterministic_across_invocations() -> None:
+    """Two calls on the same (op_graph, forest) produce the same hash."""
+    from nkigym.codegen.loop_forest import build_canonical_forest, hash_state
 
     g = _parse(_rmsnorm_matmul, _RMSNORM_MATMUL_SPECS)
     forest = build_canonical_forest(g)
-    assert hash_forest(forest) == hash_forest(forest)
+    assert hash_state(g, forest) == hash_state(g, forest)
 
 
-def test_hash_forest_equals_for_independently_built_canonical_forests() -> None:
+def test_hash_state_equals_for_independently_built_canonical_forests() -> None:
     """Two independent canonical forests of the same op_graph hash equal."""
-    from nkigym.codegen.loop_forest import build_canonical_forest, hash_forest
+    from nkigym.codegen.loop_forest import build_canonical_forest, hash_state
 
     g = _parse(_rmsnorm_matmul, _RMSNORM_MATMUL_SPECS)
     f1 = build_canonical_forest(g)
     f2 = build_canonical_forest(g)
-    assert hash_forest(f1) == hash_forest(f2)
+    assert hash_state(g, f1) == hash_state(g, f2)
 
 
-def test_hash_forest_distinguishes_trip_count_change() -> None:
+def test_hash_state_distinguishes_trip_count_change() -> None:
     """Forests differing only in a trip count hash differently."""
-    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_forest
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_state
     from nkigym.ops.base import AxisRole
 
+    op_graph = _empty_op_graph()
     f1 = [LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])]
     f2 = [LoopNode("d0", 8, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])]
-    assert hash_forest(f1) != hash_forest(f2)
+    assert hash_state(op_graph, f1) != hash_state(op_graph, f2)
 
 
-def test_hash_forest_distinguishes_dim_id_change() -> None:
+def test_hash_state_distinguishes_dim_id_change() -> None:
     """Forests differing only in dim_id at a node hash differently."""
-    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_forest
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_state
     from nkigym.ops.base import AxisRole
 
+    op_graph = _empty_op_graph()
     f1 = [LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])]
     f2 = [LoopNode("d1", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])]
-    assert hash_forest(f1) != hash_forest(f2)
+    assert hash_state(op_graph, f1) != hash_state(op_graph, f2)
 
 
-def test_hash_forest_distinguishes_reduce_op_change() -> None:
+def test_hash_state_distinguishes_reduce_op_change() -> None:
     """Forests differing only in reduce_op hash differently."""
-    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_forest
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_state
     from nkigym.ops.base import AxisRole
 
+    op_graph = _empty_op_graph()
     f1 = [LoopNode("d0", 4, AxisRole.ACCUMULATION, [BodyLeaf(op_idx=0)], reduce_op="add")]
     f2 = [LoopNode("d0", 4, AxisRole.ACCUMULATION, [BodyLeaf(op_idx=0)], reduce_op="max")]
-    assert hash_forest(f1) != hash_forest(f2)
+    assert hash_state(op_graph, f1) != hash_state(op_graph, f2)
 
 
-def test_hash_forest_distinguishes_leaf_phase_change() -> None:
+def test_hash_state_distinguishes_leaf_phase_change() -> None:
     """Leaves differing only in phase hash differently."""
-    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_forest
+    from nkigym.codegen.loop_forest import BodyLeaf, LoopNode, hash_state
     from nkigym.ops.base import AxisRole
 
+    op_graph = _empty_op_graph()
     f1 = [LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0, phase="a")])]
     f2 = [LoopNode("d0", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0, phase="b")])]
-    assert hash_forest(f1) != hash_forest(f2)
+    assert hash_state(op_graph, f1) != hash_state(op_graph, f2)
 
 
 def test_resolve_node_returns_forest_root_entry_for_single_index_path() -> None:
@@ -424,3 +435,71 @@ def test_resolve_node_returns_none_when_traversing_through_body_leaf() -> None:
     forest = [LoopNode("d0", 4, AxisRole.PARALLEL, [leaf])]
     """path=(0, 0, 0) would try to descend into leaf.children."""
     assert _resolve_node(forest, (0, 0, 0)) is None
+
+
+def test_loop_node_pipeline_depth_defaults_to_one() -> None:
+    """Every LoopNode built by build_canonical_forest has pipeline_depth=1."""
+    from test.codegen._rmsnorm_matmul_fixture import INPUT_SPECS, f_nkigym
+
+    from nkigym.codegen.graph import parse_and_resolve
+    from nkigym.codegen.loop_forest import BodyLeaf, build_canonical_forest
+
+    graph = parse_and_resolve(f_nkigym, INPUT_SPECS)
+    forest = build_canonical_forest(graph)
+
+    def walk(node):
+        if isinstance(node, BodyLeaf):
+            return
+        assert node.pipeline_depth == 1, f"LoopNode(dim_id={node.dim_id!r}) has pipeline_depth={node.pipeline_depth}"
+        for child in node.children:
+            walk(child)
+
+    for tree in forest:
+        walk(tree)
+
+
+def test_canonical_key_includes_pipeline_depth() -> None:
+    """Two LoopNodes differing only in pipeline_depth produce distinct canonical keys."""
+    from nkigym.codegen.loop_forest import LoopNode, _canonical_key
+    from nkigym.ops.base import AxisRole
+
+    a = LoopNode(dim_id="d0", trip_count=16, role=AxisRole.PARALLEL, children=[], pipeline_depth=1)
+    b = LoopNode(dim_id="d0", trip_count=16, role=AxisRole.PARALLEL, children=[], pipeline_depth=2)
+    assert _canonical_key(a) != _canonical_key(b)
+
+
+def test_hash_state_distinguishes_buffer_degree() -> None:
+    """hash_state differs when a tensor's buffer_degree changes, forest fixed."""
+    from copy import deepcopy
+    from test.codegen._rmsnorm_matmul_fixture import INPUT_SPECS, f_nkigym
+
+    from nkigym.codegen.graph import parse_and_resolve
+    from nkigym.codegen.loop_forest import build_canonical_forest, hash_state
+
+    graph_a = parse_and_resolve(f_nkigym, INPUT_SPECS)
+    forest = build_canonical_forest(graph_a)
+    graph_b = deepcopy(graph_a)
+    """Pick any intermediate tensor with a dim."""
+    tname = next(t.name for t in graph_b.tensors.values() if t.origin == "intermediate" and t.dim_ids)
+    some_dim = graph_b.tensors[tname].dim_ids[0]
+    graph_b.tensors[tname].buffer_degree[some_dim] = 2
+
+    assert hash_state(graph_a, forest) != hash_state(graph_b, forest)
+
+
+def test_hash_state_stable_under_self_move() -> None:
+    """Setting buffer_degree to its current value leaves hash_state unchanged."""
+    from copy import deepcopy
+    from test.codegen._rmsnorm_matmul_fixture import INPUT_SPECS, f_nkigym
+
+    from nkigym.codegen.graph import parse_and_resolve
+    from nkigym.codegen.loop_forest import build_canonical_forest, hash_state
+
+    graph_a = parse_and_resolve(f_nkigym, INPUT_SPECS)
+    forest = build_canonical_forest(graph_a)
+    graph_b = deepcopy(graph_a)
+    for t in graph_b.tensors.values():
+        for d in t.dim_ids:
+            t.buffer_degree[d] = t.buffer_degree[d]
+
+    assert hash_state(graph_a, forest) == hash_state(graph_b, forest)

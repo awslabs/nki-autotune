@@ -239,3 +239,59 @@ def test_nkigym_compile_batch_raises_on_cpu_sim_failure(tmp_path: Path, monkeypa
             neuron_platform_target="trn2",
             seed=0,
         )
+
+
+def test_nkigym_compile_pool_rerenders_without_sbuf_bloat() -> None:
+    """After Tasks 1-10, sampled kernels with fused loops allocate shrunken intermediates."""
+    import random
+    from test.codegen._rmsnorm_matmul_fixture import INPUT_SPECS, f_nkigym
+
+    from nkigym.codegen.graph import parse_and_resolve
+    from nkigym.codegen.loop_forest import build_canonical_forest
+    from nkigym.codegen.render import render
+    from nkigym.tune.batch import enumerate_pool
+
+    graph = parse_and_resolve(f_nkigym, INPUT_SPECS)
+    forest = build_canonical_forest(graph)
+    rng = random.Random(123)
+    pool = enumerate_pool(graph, forest, max_pool_size=50, rng=rng)
+
+    """At least one pool member renders with a shrunken intermediate (an SBUF allocation
+    whose P slots drop below num_tiles for d0 — e.g. (128, 1, 1) for sbuf_squared_sum after fusion)."""
+
+    def has_shrunken_alloc(og, f) -> bool:
+        """True iff some intra-loopnest intermediate (sbuf_sum_sq or sbuf_rms_inv)
+        is allocated at (128, 1, 1) — proving fusion + required_tiles derivation
+        brought producer and consumer under a shared d0 ancestor. Op-local buffers
+        (sbuf_local_*) are always (128, 1, F) by construction and don't count.
+        """
+        src = render(og, f)
+        targets = ("sbuf_sum_sq", "sbuf_rms_inv")
+        for line in src.splitlines():
+            stripped = line.strip()
+            for name in targets:
+                if stripped.startswith(f"{name} = nl.ndarray((128, 1, 1),"):
+                    return True
+        return False
+
+    assert any(
+        has_shrunken_alloc(og, f) for og, f in pool.values()
+    ), "No pool member shows a shrunken intermediate allocation"
+
+
+def test_initial_codegen_writes_forest_initial_mmd(tmp_path) -> None:
+    """After _run_initial_codegen, cache_dir contains forest_initial.mmd."""
+    import shutil
+    from test.codegen._rmsnorm_matmul_fixture import INPUT_SPECS, f_numpy
+
+    cache_src = "/home/ubuntu/cache/rmsnorm_matmul_compile"
+    shutil.copy(f"{cache_src}/f_nkigym.py", tmp_path / "f_nkigym.py")
+
+    _run_initial_codegen(f_numpy, INPUT_SPECS, tmp_path)
+
+    mmd_path = tmp_path / "forest_initial.mmd"
+    assert mmd_path.exists()
+    src = mmd_path.read_text()
+    assert src.startswith("graph TD\n")
+    assert "NKIMatmul" in src
+    assert "phase=psum_init" in src

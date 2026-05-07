@@ -55,6 +55,11 @@ class LoopNode:
             :class:`ReorderLoops` so loop identity survives swaps. ``None``
             on raw test forests; the renderer falls back to a
             position-based name when unset.
+        pipeline_depth: Software-pipeline depth for this loop. ``1``
+            means un-pipelined (current behaviour). ``> 1`` means the
+            renderer emits ``depth-1`` prologue iters + skewed body +
+            ``depth-1`` epilogue iters, with per-leaf iteration offsets
+            derived from the subtree's op dep graph. Default ``1``.
     """
 
     dim_id: str
@@ -63,6 +68,7 @@ class LoopNode:
     children: "list[LoopNode | BodyLeaf]" = field(default_factory=list)
     reduce_op: str | None = None
     name: str | None = None
+    pipeline_depth: int = 1
 
 
 LoopForest = list[LoopNode | BodyLeaf]
@@ -335,8 +341,8 @@ def _canonical_key(node: "LoopNode | BodyLeaf") -> tuple:
     """Recursive structural key for a node.
 
     Two nodes (and their subtrees) produce equal keys iff they have the
-    same tree shape, dim_ids, trip counts, roles, reduce_ops, and leaf
-    op_idx / phase tags.
+    same tree shape, dim_ids, trip counts, roles, reduce_ops,
+    pipeline_depths, and leaf op_idx / phase tags.
     """
     if isinstance(node, BodyLeaf):
         return ("leaf", node.op_idx, node.phase)
@@ -346,22 +352,30 @@ def _canonical_key(node: "LoopNode | BodyLeaf") -> tuple:
         node.trip_count,
         node.role.value,
         node.reduce_op,
+        node.pipeline_depth,
         tuple(_canonical_key(c) for c in node.children),
     )
 
 
-def hash_forest(forest: LoopForest) -> int:
-    """Return a deterministic structural hash of ``forest``.
+def hash_state(op_graph: OpGraph, forest: LoopForest) -> int:
+    """Return a deterministic structural hash of the tune-stage state.
 
-    Used by the ``tune`` stage's random-draw loop to break cycles
-    caused by self-inverse rewrites (e.g. ``ReorderLoops`` applied
-    twice restores the prior state).
+    The tune stage's state consists of the current ``op_graph`` (for
+    tensor ``buffer_degree`` maps mutated by ``MultiBuffer`` atoms) and
+    the current ``forest`` (mutated by ``FuseLoops``, ``ReorderLoops``,
+    and ``SoftwarePipeline`` atoms). The hash folds both so identical
+    states collide and distinct states (including self-moves) don't.
 
-    Covers only the forest — current structural rewrites leave
-    ``op_graph`` untouched. Once graph rewrites land, extend the hash
-    to include ``op_graph``.
+    Args:
+        op_graph: Current ``OpGraph`` (contains the mutated tensors).
+        forest: Current ``LoopForest``.
+
+    Returns:
+        Integer hash. Suitable as dict key for pool dedup.
     """
-    return hash(tuple(_canonical_key(e) for e in forest))
+    forest_key = tuple(_canonical_key(e) for e in forest)
+    tensor_key = tuple((t.name, tuple(sorted(t.buffer_degree.items()))) for t in op_graph.tensors.values())
+    return hash((forest_key, tensor_key))
 
 
 def _resolve_node(forest: LoopForest, path: tuple[int, ...]) -> "LoopNode | BodyLeaf | None":

@@ -85,6 +85,7 @@ Desktop.ini
 *.out
 *.err
 !/design/figures/*.png
+!/2026-05-07-forest-ir-visual-walkthrough-design/**/*.png
 
 # Artifacts
 artifacts/
@@ -103,3 +104,6 @@ remote/config.sh
 # Downloaded cache from remote autotune runs
 cache/
 generated_kernels/
+
+# Worktrees
+.worktrees/

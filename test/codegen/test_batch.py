@@ -5,7 +5,7 @@ import random
 import pytest
 
 from nkigym.codegen.graph import parse_and_resolve
-from nkigym.codegen.loop_forest import build_canonical_forest, hash_forest
+from nkigym.codegen.loop_forest import build_canonical_forest, hash_state
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
@@ -44,7 +44,7 @@ def _canonical_state() -> tuple:
 def test_enumerate_pool_includes_initial():
     op_graph, forest = _canonical_state()
     pool = enumerate_pool(op_graph, forest, max_pool_size=100, rng=random.Random(0))
-    assert hash_forest(forest) in pool
+    assert hash_state(op_graph, forest) in pool
 
 
 def test_enumerate_pool_no_legal_atoms(monkeypatch: pytest.MonkeyPatch):
@@ -56,7 +56,7 @@ def test_enumerate_pool_no_legal_atoms(monkeypatch: pytest.MonkeyPatch):
 
     op_graph, forest = _canonical_state()
     pool = enumerate_pool(op_graph, forest, max_pool_size=100, rng=random.Random(0))
-    assert list(pool) == [hash_forest(forest)]
+    assert list(pool) == [hash_state(op_graph, forest)]
 
 
 def test_enumerate_pool_cap_respected():
@@ -87,6 +87,7 @@ def test_enumerate_pool_exhausts_small_graph(monkeypatch: pytest.MonkeyPatch):
       s1 → s2 (atom C — reaches s2 from a different parent)
       s1/s2: no outgoing atoms
     """
+    from nkigym.codegen.graph import OpGraph
     from nkigym.codegen.loop_forest import BodyLeaf, LoopForest, LoopNode
     from nkigym.ops.base import AxisRole
     from nkigym.tune import batch as batch_mod
@@ -94,7 +95,7 @@ def test_enumerate_pool_exhausts_small_graph(monkeypatch: pytest.MonkeyPatch):
     def _forest(tag: int) -> LoopForest:
         return [LoopNode(dim_id=f"d{tag}", trip_count=1, role=AxisRole.PARALLEL, children=[BodyLeaf(op_idx=0)])]
 
-    op_graph = object()
+    op_graph = OpGraph(func_name="t", param_names=[], return_name="", tensors={}, dims={}, ops=[])
     forest_s0 = _forest(0)
     forest_s1 = _forest(1)
     forest_s2 = _forest(2)
@@ -113,15 +114,15 @@ def test_enumerate_pool_exhausts_small_graph(monkeypatch: pytest.MonkeyPatch):
     atom_b = _Atom(forest_s2)
     atom_c = _Atom(forest_s2)
 
-    h0 = hash_forest(forest_s0)
-    h1 = hash_forest(forest_s1)
-    h2 = hash_forest(forest_s2)
+    h0 = hash_state(op_graph, forest_s0)
+    h1 = hash_state(op_graph, forest_s1)
+    h2 = hash_state(op_graph, forest_s2)
 
     def _fusion(og, f):
-        return {h0: [atom_a], h1: [atom_c], h2: []}[hash_forest(f)]
+        return {h0: [atom_a], h1: [atom_c], h2: []}[hash_state(og, f)]
 
     def _reorder(f):
-        return {h0: [atom_b], h1: [], h2: []}[hash_forest(f)]
+        return {h0: [atom_b], h1: [], h2: []}[hash_state(op_graph, f)]
 
     monkeypatch.setattr(batch_mod, "enumerate_fusion_atoms", _fusion)
     monkeypatch.setattr(batch_mod, "enumerate_reorder_atoms", _reorder)
@@ -154,3 +155,35 @@ def test_sample_pool_deterministic():
     out_a = sample_pool(pool, num_kernels=5, rng=random.Random(99))
     out_b = sample_pool(pool, num_kernels=5, rng=random.Random(99))
     assert out_a == out_b
+
+
+def test_batch_pool_contains_multi_buffer_variants() -> None:
+    """Sampled pool includes states reachable via MultiBuffer after fusion."""
+    import random
+    from test.codegen._rmsnorm_matmul_fixture import INPUT_SPECS, f_nkigym
+
+    from nkigym.codegen.graph import parse_and_resolve
+    from nkigym.codegen.loop_forest import build_canonical_forest
+    from nkigym.tune.batch import enumerate_pool
+
+    graph = parse_and_resolve(f_nkigym, INPUT_SPECS)
+    forest = build_canonical_forest(graph)
+    rng = random.Random(0)
+    pool = enumerate_pool(graph, forest, max_pool_size=200, rng=rng)
+
+    """Some member has non-default buffer_degree somewhere."""
+    any_mb = any(deg != 1 for og, _ in pool.values() for t in og.tensors.values() for deg in t.buffer_degree.values())
+    assert any_mb, "no MultiBuffer variants in pool"
+
+
+def _has_pipelined_node(forest) -> bool:
+    from nkigym.codegen.loop_forest import BodyLeaf
+
+    def walk(n):
+        if isinstance(n, BodyLeaf):
+            return False
+        if n.pipeline_depth > 1:
+            return True
+        return any(walk(c) for c in n.children)
+
+    return any(walk(r) for r in forest)

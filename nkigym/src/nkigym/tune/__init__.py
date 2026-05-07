@@ -5,6 +5,9 @@ or graph rewrite applied inside the ``"tune"`` stage of
 ``nkigym_compile``. Concrete rewrites live in sibling modules:
 
 * :mod:`nkigym.tune.fuse_loops` — :class:`FuseLoops` loop fusion atom.
+* :mod:`nkigym.tune.reorder_loops` — :class:`ReorderLoops` interchange atom.
+* :mod:`nkigym.tune.multi_buffer` — :class:`MultiBuffer` buffer-degree atom.
+* :mod:`nkigym.tune.software_pipeline` — :class:`SoftwarePipeline` pipeline-depth atom.
 * :mod:`nkigym.tune.stage` — the ``_run_tune`` stage driver.
 """
 

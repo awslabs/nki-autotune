@@ -285,19 +285,21 @@ def test_apply_at_nested_path() -> None:
 
 def test_apply_is_self_inverse_by_structural_hash() -> None:
     """Applying the same atom twice produces a forest with the starting hash."""
-    from nkigym.codegen.loop_forest import hash_forest
+    from nkigym.codegen.graph import OpGraph
+    from nkigym.codegen.loop_forest import hash_state
     from nkigym.tune.reorder_loops import ReorderLoops
 
+    op_graph = OpGraph(func_name="t", param_names=[], return_name="", tensors={}, dims={}, ops=[])
     inner = LoopNode("d1", 4, AxisRole.PARALLEL, [BodyLeaf(op_idx=0)])
     outer = LoopNode("d0", 8, AxisRole.PARALLEL, [inner])
     forest = [outer]
     first = ReorderLoops(path=(0,), outer_dim="d0", inner_dim="d1")
-    _, f1 = first.apply(None, forest)
+    _, f1 = first.apply(op_graph, forest)
     """After the first swap the outer dim is d1, inner dim is d0.
     To swap back we need a fresh atom that matches the new state."""
     reverse = ReorderLoops(path=(0,), outer_dim="d1", inner_dim="d0")
-    _, f2 = reverse.apply(None, f1)
-    assert hash_forest(forest) == hash_forest(f2)
+    _, f2 = reverse.apply(op_graph, f1)
+    assert hash_state(op_graph, forest) == hash_state(op_graph, f2)
 
 
 def test_apply_rmsnorm_matmul_preserves_check_invariant() -> None:

@@ -40,6 +40,11 @@ class Tensor:
         origin: Lineage role — ``"param"`` (HBM kernel input),
             ``"intermediate"`` (SBUF handoff), or ``"return"`` (final
             op output).
+        buffer_degree: Multi-buffer degree per dim. Defaults to
+            ``{d: 1 for d in dim_ids}`` when not supplied. ``MultiBuffer``
+            atom mutates this field; the renderer consults it when
+            sizing SBUF/HBM allocations and when building slot
+            expressions.
     """
 
     name: str
@@ -47,6 +52,12 @@ class Tensor:
     shape: tuple[int, ...]
     dtype: str
     origin: TensorOrigin
+    buffer_degree: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Populate ``buffer_degree`` with ``1`` for every dim the caller omitted."""
+        for d in self.dim_ids:
+            self.buffer_degree.setdefault(d, 1)
 
 
 @dataclass
