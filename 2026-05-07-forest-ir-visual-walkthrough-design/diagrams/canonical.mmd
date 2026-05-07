@@ -1,0 +1,96 @@
+graph TD
+  classDef d0 fill:#fde68a,stroke:#ca8a04,stroke-width:1px
+  classDef d1 fill:#bae6fd,stroke:#0369a1,stroke-width:1px
+  classDef d3 fill:#ddd6fe,stroke:#6d28d9,stroke-width:1px
+  classDef acc stroke-width:3px
+
+  R(((forest)))
+
+  subgraph op0[lhs_load]
+    L0_d0b["d0 trip=16 PAR i_d0_0"]:::d0
+    L0_d0t["d0 trip=1 PAR i_d0_1"]:::d0
+    L0_d1b["d1 trip=16 PAR i_d1_0"]:::d1
+    L0_d1t["d1 trip=1 PAR i_d1_1"]:::d1
+    L0_body(["NKILoad main"])
+    L0_d0b --> L0_d0t --> L0_d1b --> L0_d1t --> L0_body
+  end
+
+  subgraph op1[rhs_load]
+    L1_d1b["d1 trip=16 PAR i_d1_0"]:::d1
+    L1_d1t["d1 trip=1 PAR i_d1_1"]:::d1
+    L1_d3b["d3 trip=4 PAR i_d3_0"]:::d3
+    L1_d3t["d3 trip=1 PAR i_d3_1"]:::d3
+    L1_body(["NKILoad main"])
+    L1_d1b --> L1_d1t --> L1_d3b --> L1_d3t --> L1_body
+  end
+
+  subgraph op2[rmsnorm - activation_reduce]
+    L2_d0b["d0 trip=16 PAR i_d0_0"]:::d0
+    L2_d0t["d0 trip=1 PAR i_d0_1"]:::d0
+    L2_d1b["d1 trip=16 ACC add i_d1_0"]:::d1
+    L2_d1t["d1 trip=1 ACC add i_d1_1"]:::d1
+    L2_step(["reduce_step"])
+    L2_close(["reduce_close"])
+    L2_d0b --> L2_d0t --> L2_d1b --> L2_d1t --> L2_step
+    L2_d0t --> L2_close
+    class L2_d1b,L2_d1t acc
+  end
+
+  subgraph op3[rms_inv - activation]
+    L3_d0b["d0 trip=16 PAR i_d0_0"]:::d0
+    L3_d0t["d0 trip=1 PAR i_d0_1"]:::d0
+    L3_body(["NKIActivation main"])
+    L3_d0b --> L3_d0t --> L3_body
+  end
+
+  subgraph op4[normed - tensor_scalar]
+    L4_d0b["d0 trip=16 PAR i_d0_0"]:::d0
+    L4_d0t["d0 trip=1 PAR i_d0_1"]:::d0
+    L4_d1b["d1 trip=16 PAR i_d1_0"]:::d1
+    L4_d1t["d1 trip=1 PAR i_d1_1"]:::d1
+    L4_body(["NKITensorScalar main"])
+    L4_d0b --> L4_d0t --> L4_d1b --> L4_d1t --> L4_body
+  end
+
+  subgraph op5[normed_T - transpose]
+    L5_d1b["d1 trip=16 PAR i_d1_0"]:::d1
+    L5_d1t["d1 trip=1 PAR i_d1_1"]:::d1
+    L5_d0b["d0 trip=16 PAR i_d0_0"]:::d0
+    L5_d0t["d0 trip=1 PAR i_d0_1"]:::d0
+    L5_body(["NKITranspose main"])
+    L5_d1b --> L5_d1t --> L5_d0b --> L5_d0t --> L5_body
+  end
+
+  subgraph op6[matmul]
+    L6_d0b["d0 trip=16 PAR i_d0_0"]:::d0
+    L6_d0t["d0 trip=1 PAR i_d0_1"]:::d0
+    L6_d3b["d3 trip=4 PAR i_d3_0"]:::d3
+    L6_d3t["d3 trip=1 PAR i_d3_1"]:::d3
+    L6_psum(["psum_init"])
+    L6_d1b["d1 trip=16 ACC add i_d1_0"]:::d1
+    L6_d1t["d1 trip=1 ACC add i_d1_1"]:::d1
+    L6_compute(["compute"])
+    L6_drain(["drain"])
+    L6_d0b --> L6_d0t --> L6_d3b --> L6_d3t --> L6_psum
+    L6_d3t --> L6_d1b --> L6_d1t --> L6_compute
+    L6_d3t --> L6_drain
+    class L6_d1b,L6_d1t acc
+  end
+
+  subgraph op7[store]
+    L7_d0b["d0 trip=16 PAR i_d0_0"]:::d0
+    L7_d0t["d0 trip=1 PAR i_d0_1"]:::d0
+    L7_d3b["d3 trip=4 PAR i_d3_0"]:::d3
+    L7_d3t["d3 trip=1 PAR i_d3_1"]:::d3
+    L7_body(["NKIStore main"])
+    L7_d0b --> L7_d0t --> L7_d3b --> L7_d3t --> L7_body
+  end
+
+  R --> L0_d0b
+  R --> L1_d1b
+  R --> L2_d0b
+  R --> L3_d0b
+  R --> L4_d0b
+  R --> L5_d1b
+  R --> L6_d0b
+  R --> L7_d0b

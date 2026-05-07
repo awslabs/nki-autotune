@@ -1,0 +1,79 @@
+graph TD
+L_0["L(0,)<br/>dim=d0 trip=16<br/>role=PARALLEL name=i_d0_0"]
+L_0_0["L(0, 0)<br/>dim=d0 trip=1<br/>role=PARALLEL name=i_d0_1"]
+L_0 -- 0 --> L_0_0
+L_0_0_0["L(0, 0, 0)<br/>dim=d1 trip=16<br/>role=PARALLEL name=i_d1_0"]
+L_0_0 -- 0 --> L_0_0_0
+L_0_0_0_0["L(0, 0, 0, 0)<br/>dim=d1 trip=1<br/>role=PARALLEL name=i_d1_1"]
+L_0_0_0 -- 0 --> L_0_0_0_0
+B_0_0_0_0_0(["B(0, 0, 0, 0, 0)<br/>op=NKILoad phase=main"])
+L_0_0_0_0 -- 0 --> B_0_0_0_0_0
+L_1["L(1,)<br/>dim=d1 trip=16<br/>role=PARALLEL name=i_d1_0"]
+L_1_0["L(1, 0)<br/>dim=d1 trip=1<br/>role=PARALLEL name=i_d1_1"]
+L_1 -- 0 --> L_1_0
+L_1_0_0["L(1, 0, 0)<br/>dim=d3 trip=4<br/>role=PARALLEL name=i_d3_0"]
+L_1_0 -- 0 --> L_1_0_0
+L_1_0_0_0["L(1, 0, 0, 0)<br/>dim=d3 trip=1<br/>role=PARALLEL name=i_d3_1"]
+L_1_0_0 -- 0 --> L_1_0_0_0
+B_1_0_0_0_0(["B(1, 0, 0, 0, 0)<br/>op=NKILoad phase=main"])
+L_1_0_0_0 -- 0 --> B_1_0_0_0_0
+L_2["L(2,)<br/>dim=d0 trip=16<br/>role=PARALLEL name=i_d0_0"]
+L_2_0["L(2, 0)<br/>dim=d0 trip=1<br/>role=PARALLEL name=i_d0_1"]
+L_2 -- 0 --> L_2_0
+L_2_0_0["L(2, 0, 0)<br/>dim=d1 trip=16<br/>role=ACCUMULATION name=i_d1_0<br/>reduce_op=add"]
+L_2_0 -- 0 --> L_2_0_0
+L_2_0_0_0["L(2, 0, 0, 0)<br/>dim=d1 trip=1<br/>role=ACCUMULATION name=i_d1_1<br/>reduce_op=add"]
+L_2_0_0 -- 0 --> L_2_0_0_0
+B_2_0_0_0_0(["B(2, 0, 0, 0, 0)<br/>op=NKIActivationReduce phase=reduce_step"])
+L_2_0_0_0 -- 0 --> B_2_0_0_0_0
+B_2_0_1(["B(2, 0, 1)<br/>op=NKIActivationReduce phase=reduce_close"])
+L_2_0 -- 1 --> B_2_0_1
+L_3["L(3,)<br/>dim=d0 trip=16<br/>role=PARALLEL name=i_d0_0"]
+L_3_0["L(3, 0)<br/>dim=d0 trip=1<br/>role=PARALLEL name=i_d0_1"]
+L_3 -- 0 --> L_3_0
+B_3_0_0(["B(3, 0, 0)<br/>op=NKIActivation phase=main"])
+L_3_0 -- 0 --> B_3_0_0
+L_4["L(4,)<br/>dim=d0 trip=16<br/>role=PARALLEL name=i_d0_0"]
+L_4_0["L(4, 0)<br/>dim=d0 trip=1<br/>role=PARALLEL name=i_d0_1"]
+L_4 -- 0 --> L_4_0
+L_4_0_0["L(4, 0, 0)<br/>dim=d1 trip=16<br/>role=PARALLEL name=i_d1_0"]
+L_4_0 -- 0 --> L_4_0_0
+L_4_0_0_0["L(4, 0, 0, 0)<br/>dim=d1 trip=1<br/>role=PARALLEL name=i_d1_1"]
+L_4_0_0 -- 0 --> L_4_0_0_0
+B_4_0_0_0_0(["B(4, 0, 0, 0, 0)<br/>op=NKITensorScalar phase=main"])
+L_4_0_0_0 -- 0 --> B_4_0_0_0_0
+L_5["L(5,)<br/>dim=d1 trip=16<br/>role=PARALLEL name=i_d1_0"]
+L_5_0["L(5, 0)<br/>dim=d1 trip=1<br/>role=PARALLEL name=i_d1_1"]
+L_5 -- 0 --> L_5_0
+L_5_0_0["L(5, 0, 0)<br/>dim=d0 trip=16<br/>role=PARALLEL name=i_d0_0"]
+L_5_0 -- 0 --> L_5_0_0
+L_5_0_0_0["L(5, 0, 0, 0)<br/>dim=d0 trip=1<br/>role=PARALLEL name=i_d0_1"]
+L_5_0_0 -- 0 --> L_5_0_0_0
+B_5_0_0_0_0(["B(5, 0, 0, 0, 0)<br/>op=NKITranspose phase=main"])
+L_5_0_0_0 -- 0 --> B_5_0_0_0_0
+L_6["L(6,)<br/>dim=d0 trip=16<br/>role=PARALLEL name=i_d0_0"]
+L_6_0["L(6, 0)<br/>dim=d0 trip=1<br/>role=PARALLEL name=i_d0_1"]
+L_6 -- 0 --> L_6_0
+L_6_0_0["L(6, 0, 0)<br/>dim=d3 trip=4<br/>role=PARALLEL name=i_d3_0"]
+L_6_0 -- 0 --> L_6_0_0
+L_6_0_0_0["L(6, 0, 0, 0)<br/>dim=d3 trip=1<br/>role=PARALLEL name=i_d3_1"]
+L_6_0_0 -- 0 --> L_6_0_0_0
+B_6_0_0_0_0(["B(6, 0, 0, 0, 0)<br/>op=NKIMatmul phase=psum_init"])
+L_6_0_0_0 -- 0 --> B_6_0_0_0_0
+L_6_0_0_0_1["L(6, 0, 0, 0, 1)<br/>dim=d1 trip=16<br/>role=ACCUMULATION name=i_d1_0<br/>reduce_op=add"]
+L_6_0_0_0 -- 1 --> L_6_0_0_0_1
+L_6_0_0_0_1_0["L(6, 0, 0, 0, 1, 0)<br/>dim=d1 trip=1<br/>role=ACCUMULATION name=i_d1_1<br/>reduce_op=add"]
+L_6_0_0_0_1 -- 0 --> L_6_0_0_0_1_0
+B_6_0_0_0_1_0_0(["B(6, 0, 0, 0, 1, 0, 0)<br/>op=NKIMatmul phase=compute"])
+L_6_0_0_0_1_0 -- 0 --> B_6_0_0_0_1_0_0
+B_6_0_0_0_2(["B(6, 0, 0, 0, 2)<br/>op=NKIMatmul phase=drain"])
+L_6_0_0_0 -- 2 --> B_6_0_0_0_2
+L_7["L(7,)<br/>dim=d0 trip=16<br/>role=PARALLEL name=i_d0_0"]
+L_7_0["L(7, 0)<br/>dim=d0 trip=1<br/>role=PARALLEL name=i_d0_1"]
+L_7 -- 0 --> L_7_0
+L_7_0_0["L(7, 0, 0)<br/>dim=d3 trip=4<br/>role=PARALLEL name=i_d3_0"]
+L_7_0 -- 0 --> L_7_0_0
+L_7_0_0_0["L(7, 0, 0, 0)<br/>dim=d3 trip=1<br/>role=PARALLEL name=i_d3_1"]
+L_7_0_0 -- 0 --> L_7_0_0_0
+B_7_0_0_0_0(["B(7, 0, 0, 0, 0)<br/>op=NKIStore phase=main"])
+L_7_0_0_0 -- 0 --> B_7_0_0_0_0

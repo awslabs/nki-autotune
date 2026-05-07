@@ -1,0 +1,17 @@
+graph TD
+  classDef d0 fill:#fde68a,stroke:#ca8a04,stroke-width:1px
+  classDef d1 fill:#bae6fd,stroke:#0369a1,stroke-width:1px
+
+  R(((forest)))
+  R -->|0| dots_left(("..."))
+  R -->|3| fused["d0 trip=16 PAR i_d0_0 fused"]:::d0
+  R -->|4| dots_right(("..."))
+
+  fused --> act_tile["d0 trip=1 PAR i_d0_1 rms_inv"]:::d0
+  act_tile --> act_body(["NKIActivation main"])
+  fused --> ts_tile["d0 trip=1 PAR i_d0_1 normed"]:::d0
+  ts_tile --> ts_d1b["d1 trip=16 PAR i_d1_0"]:::d1
+  ts_d1b --> ts_d1t["d1 trip=1 PAR i_d1_1"]:::d1
+  ts_d1t --> ts_body(["NKITensorScalar main"])
+
+  style fused stroke:#16a34a,stroke-width:3px
