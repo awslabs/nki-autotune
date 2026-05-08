@@ -212,3 +212,18 @@ def test_apply_raises_on_indivisible_residual() -> None:
     except AtomLegalityError:
         return
     raise AssertionError("expected AtomLegalityError for indivisible residual")
+
+
+def test_ancestor_trip_products_accumulates_same_dim() -> None:
+    """Same-dim ancestors contribute their trips multiplicatively."""
+    from nkigym.tune.compute_at import _ancestor_trip_products
+
+    leaf = BodyLeaf(op_cls=object, phase="main")
+    l3 = LoopNode("d0", 4, AxisRole.PARALLEL, children=[leaf])
+    l2 = LoopNode("d0", 2, AxisRole.PARALLEL, children=[l3])
+    l1 = LoopNode("d1", 3, AxisRole.PARALLEL, children=[l2])
+    body = [l1]
+    assert _ancestor_trip_products(body, (0, 0, 0)) == {"d0": 8, "d1": 3}
+    assert _ancestor_trip_products(body, (0, 0)) == {"d0": 2, "d1": 3}
+    assert _ancestor_trip_products(body, (0,)) == {"d1": 3}
+    assert _ancestor_trip_products(body, ()) == {}

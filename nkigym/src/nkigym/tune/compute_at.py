@@ -166,6 +166,28 @@ def _ancestor_dims(body: TreeIR, path: tuple[int, ...]) -> set[str]:
     return dims
 
 
+def _ancestor_trip_products(body: TreeIR, path: tuple[int, ...]) -> dict[str, int]:
+    """Product of trip_counts per dim_id along ``path`` from body root.
+
+    Walks the same path as :func:`_ancestor_dims` but multiplies each
+    ancestor LoopNode's trip_count into a per-dim accumulator. Dims
+    not on the path are absent from the result (callers treat absence
+    as coverage of 1).
+    """
+    products: dict[str, int] = {}
+    siblings: list[LoopNode | BodyLeaf] = list(body)
+    for idx in path:
+        if idx >= len(siblings):
+            break
+        node = siblings[idx]
+        if isinstance(node, LoopNode):
+            products[node.dim_id] = products.get(node.dim_id, 1) * node.trip_count
+            siblings = node.children
+        else:
+            break
+    return products
+
+
 def _wrap_leaf_with_dims(leaf: BodyLeaf, dims: list[str], module: KernelModule) -> LoopNode | BodyLeaf:
     """Wrap ``leaf`` in the canonical 2N-per-dim chain over ``dims``.
 
