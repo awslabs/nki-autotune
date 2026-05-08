@@ -7,53 +7,9 @@ slot-indexing expressions.
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode
+from nkigym.codegen.ir import KernelModule
+from nkigym.codegen.lowering.place_buffers import required_tiles
 from nkigym.tune import AtomLegalityError
-
-
-def _required_tiles(module: KernelModule, tensor_name: str, dim_id: str) -> int:
-    """Return the minimum tile count a tensor must hold along a dim.
-
-    Mirrors ``emit_source._required_tiles`` but inlined here to keep
-    ``MultiBuffer`` free of renderer dependencies. Walks the tree for
-    every leaf that reads or writes ``tensor_name``; finds the LCA of
-    those paths; divides ``num_tiles[dim_id]`` by the product of ancestor
-    trip counts for that dim above the LCA.
-    """
-    num_t = module.dims[dim_id].num_tiles
-    tensor = module.tensors.get(tensor_name)
-    if tensor is None or tensor.origin in ("param", "return"):
-        return num_t
-    paths: list[list[LoopNode | BodyLeaf]] = []
-
-    def walk(node: LoopNode | BodyLeaf, stack: list[LoopNode | BodyLeaf]) -> None:
-        stack.append(node)
-        if isinstance(node, BodyLeaf):
-            if tensor_name in node.writes or tensor_name in node.reads.values():
-                paths.append(list(stack))
-        else:
-            for child in node.children:
-                walk(child, stack)
-        stack.pop()
-
-    for root in module.body:
-        walk(root, [])
-    if not paths:
-        return num_t
-    lca_depth = 0
-    min_len = min(len(p) for p in paths)
-    for depth in range(min_len):
-        nodes_at_depth = {id(p[depth]) for p in paths}
-        if len(nodes_at_depth) != 1:
-            break
-        lca_depth = depth + 1
-    prod = 1
-    for node in paths[0][:lca_depth]:
-        if isinstance(node, LoopNode) and node.dim_id == dim_id:
-            prod *= node.trip_count
-    if num_t % prod != 0:
-        return num_t
-    return num_t // prod
 
 
 @dataclass(frozen=True)
@@ -76,6 +32,12 @@ class MultiBuffer:
         Upper bound is ``num_tiles / required_tiles``: more buffer slots than
         there are distinct tiles under the LCA just waste SBUF without
         changing behavior.
+
+        A :class:`ValueError` from :func:`required_tiles` — raised when the
+        product of ancestor trip counts does not divide ``num_tiles`` —
+        indicates an unsupported forest shape and is treated as "not legal"
+        rather than propagated. Well-formed canonical IR never reaches this
+        branch; the catch is defensive against malformed input.
         """
         result: bool
         if self.tensor_name not in module.tensors:
@@ -87,7 +49,10 @@ class MultiBuffer:
             elif self.dim_id not in module.dims:
                 result = False
             else:
-                req = _required_tiles(module, self.tensor_name, self.dim_id)
+                try:
+                    req = required_tiles(t, self.dim_id, module)
+                except ValueError:
+                    req = 0
                 if req <= 0:
                     result = False
                 else:
@@ -128,7 +93,9 @@ class MultiBuffer:
 def enumerate_multi_buffer_atoms(module: KernelModule) -> list[MultiBuffer]:
     """Return every legal ``(tensor, dim, degree)`` atom on non-HBM tensors.
 
-    Params and returns live in HBM and are not multi-buffered.
+    Params and returns live in HBM and are not multi-buffered. An
+    unsupported forest shape (``required_tiles`` raising
+    :class:`ValueError`) yields no atoms for the offending dim.
     """
     atoms: list[MultiBuffer] = []
     for tensor_name, t in module.tensors.items():
@@ -137,7 +104,10 @@ def enumerate_multi_buffer_atoms(module: KernelModule) -> list[MultiBuffer]:
         for d in t.dim_ids:
             if d not in module.dims:
                 continue
-            req = _required_tiles(module, tensor_name, d)
+            try:
+                req = required_tiles(t, d, module)
+            except ValueError:
+                continue
             if req <= 0:
                 continue
             num_t = module.dims[d].num_tiles

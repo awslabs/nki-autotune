@@ -18,85 +18,10 @@ is byte-identical.
 
 from collections.abc import Callable
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, Tensor, leaves_under
+from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, leaves_under
+from nkigym.codegen.lowering.place_buffers import sbuf_shape, tensor_total_slots
 
-
-def required_tiles(tensor: Tensor, dim_id: str, module: KernelModule) -> int:
-    """Return the minimum tile count along ``dim_id`` that ``tensor`` must hold.
-
-    Derived by walking the module body: find the LCA of ``tensor``'s
-    producer and all consumers, then take
-    ``num_tiles(dim_id) / product_of_dim_id_trips_above_lca``. For
-    cross-loopnest tensors (LCA is the forest root) the product is 1
-    and ``required_tiles`` equals ``num_tiles(dim_id)``. For fully
-    intra-loopnest tensors (LCA below all ``dim_id``-iterating
-    ancestors) the product equals ``num_tiles(dim_id)`` and
-    ``required_tiles`` is ``1``.
-
-    Parameter and return tensors — which live in HBM and are not
-    tile-decomposed — return ``module.dims[dim_id].num_tiles`` unchanged.
-
-    Raises:
-        ValueError: Product of ancestor trip counts does not divide
-            ``num_tiles(dim_id)`` (unsupported forest shape).
-    """
-    num_t = module.dims[dim_id].num_tiles
-    if tensor.origin in ("param", "return"):
-        return num_t
-    paths = _find_access_paths(tensor.name, module)
-    if not paths:
-        return num_t
-    lca = _lowest_common_ancestor(paths)
-    prod = 1
-    for node in lca:
-        if isinstance(node, LoopNode) and node.dim_id == dim_id:
-            prod *= node.trip_count
-    if num_t % prod != 0:
-        raise ValueError(
-            f"Tensor {tensor.name!r} dim {dim_id!r}: ancestor trip product {prod} does not divide num_tiles {num_t}"
-        )
-    return num_t // prod
-
-
-def _find_access_paths(tensor_name: str, module: KernelModule) -> list[list[LoopNode | BodyLeaf]]:
-    """Return root-to-leaf node paths for every BodyLeaf that reads or writes ``tensor_name``.
-
-    Each path is a list of ancestor nodes ending in the ``BodyLeaf``.
-    Walks the module body directly — leaves are self-describing so we
-    filter by each leaf's ``reads``/``writes`` sets.
-    """
-    paths: list[list[LoopNode | BodyLeaf]] = []
-
-    def walk(node: LoopNode | BodyLeaf, stack: list[LoopNode | BodyLeaf]) -> None:
-        """Pre-order walk; record paths whose leaves touch ``tensor_name``."""
-        stack.append(node)
-        if isinstance(node, BodyLeaf):
-            if tensor_name in node.writes or tensor_name in node.reads.values():
-                paths.append(list(stack))
-        else:
-            for child in node.children:
-                walk(child, stack)
-        stack.pop()
-
-    for root in module.body:
-        walk(root, [])
-    return paths
-
-
-def _lowest_common_ancestor(paths: list[list[LoopNode | BodyLeaf]]) -> list[LoopNode | BodyLeaf]:
-    """Return the longest common prefix of root-to-leaf paths."""
-    if not paths:
-        return []
-    common = paths[0]
-    for p in paths[1:]:
-        new_len = 0
-        for a, b in zip(common, p):
-            if a is b:
-                new_len += 1
-            else:
-                break
-        common = common[:new_len]
-    return common
+__all__ = ["emit_source", "render_annotated"]
 
 
 def _sbuf_name(tensor_name: str) -> str:
@@ -282,7 +207,7 @@ def _emit_sbuf_allocations(w: _Writer, module: KernelModule) -> None:
     for name, tensor in module.tensors.items():
         if tensor.origin in ("param", "return"):
             continue
-        shape = _sbuf_shape(tensor, module)
+        shape = sbuf_shape(tensor, module)
         w.line(f"{_sbuf_name(name)} = nl.ndarray({shape}, dtype=nl.{tensor.dtype}, buffer=nl.sbuf)")
     seen: set[str] = set()
     for root in module.body:
@@ -294,28 +219,6 @@ def _emit_sbuf_allocations(w: _Writer, module: KernelModule) -> None:
                 nl_buffer = "nl.sbuf" if buf.location == "sbuf" else "nl.psum"
                 w.line(f"{buf.emitted_name} = nl.ndarray({buf.shape}, dtype=nl.{buf.dtype}, buffer={nl_buffer})")
     w.line()
-
-
-def _sbuf_shape(tensor: Tensor, module: KernelModule) -> tuple[int, int, int]:
-    """Compute 3D SBUF shape ``(p_tile, total_slots_P, num_f_tiles * f_tile)``.
-
-    ``total_slots_P = required_tiles(P) * buffer_degree[P]``. Free axis
-    still spans the full tile count for now — free-axis multi-buffer is
-    out of scope.
-
-    1D tensors collapse the free axis to a single element.
-    """
-    if not tensor.dim_ids:
-        raise ValueError(f"Tensor {tensor.name!r} has no dims")
-    p_axis = tensor.dim_ids[0]
-    p_info = module.dims[p_axis]
-    p_required = required_tiles(tensor, p_axis, module)
-    p_total = p_required * tensor.buffer_degree[p_axis]
-    if len(tensor.dim_ids) == 1:
-        return (p_info.tile_size, p_total, 1)
-    f_axis = tensor.dim_ids[1]
-    f_info = module.dims[f_axis]
-    return (p_info.tile_size, p_total, f_info.num_tiles * f_info.tile_size)
 
 
 def _slot_expr(
@@ -376,11 +279,6 @@ def _slot_expr(
     if total_slots == raw_trip_product and stage_offset == 0:
         return raw
     return f"({raw}) % {total_slots}"
-
-
-def _tensor_total_slots(tensor: Tensor, dim_id: str, module: KernelModule) -> int:
-    """Per-dim total slot count for a tensor: required_tiles * buffer_degree."""
-    return required_tiles(tensor, dim_id, module) * tensor.buffer_degree[dim_id]
 
 
 def _sbuf_tile_slice(
@@ -859,8 +757,8 @@ def _body_load(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage
     f_axis = src_tensor.dim_ids[1] if len(src_tensor.dim_ids) > 1 else None
     p_tile = module.dims[p_axis].tile_size
     f_tile = module.dims[f_axis].tile_size if f_axis is not None else 1
-    dst_p_slots = _tensor_total_slots(dst_tensor, dst_tensor.dim_ids[0], module)
-    dst_f_slots = _tensor_total_slots(dst_tensor, dst_tensor.dim_ids[1], module) if len(dst_tensor.dim_ids) > 1 else 1
+    dst_p_slots = tensor_total_slots(dst_tensor, dst_tensor.dim_ids[0], module)
+    dst_f_slots = tensor_total_slots(dst_tensor, dst_tensor.dim_ids[1], module) if len(dst_tensor.dim_ids) > 1 else 1
     src_p_slots = module.dims[src_tensor.dim_ids[0]].num_tiles
     src_f_slots = module.dims[src_tensor.dim_ids[1]].num_tiles if len(src_tensor.dim_ids) > 1 else 1
     off_p = stage_offset if p_axis == pipeline_dim else 0
@@ -896,8 +794,8 @@ def _body_store(w, module, leaf, path_names, path_trips, pipeline_dim=None, stag
     f_tile = module.dims[f_axis].tile_size if f_axis is not None else 1
     dst_p_slots = module.dims[dst_tensor.dim_ids[0]].num_tiles
     dst_f_slots = module.dims[dst_tensor.dim_ids[1]].num_tiles if len(dst_tensor.dim_ids) > 1 else 1
-    src_p_slots = _tensor_total_slots(src_tensor, src_tensor.dim_ids[0], module)
-    src_f_slots = _tensor_total_slots(src_tensor, src_tensor.dim_ids[1], module) if len(src_tensor.dim_ids) > 1 else 1
+    src_p_slots = tensor_total_slots(src_tensor, src_tensor.dim_ids[0], module)
+    src_f_slots = tensor_total_slots(src_tensor, src_tensor.dim_ids[1], module) if len(src_tensor.dim_ids) > 1 else 1
     off_p = stage_offset if p_axis == pipeline_dim else 0
     off_f = stage_offset if f_axis is not None and f_axis == pipeline_dim else 0
     dst_expr = _hbm_tile_slice(
@@ -941,10 +839,10 @@ def _body_activation(w, module, leaf, path_names, path_trips, pipeline_dim=None,
     act = leaf.kwargs["op"]
     scale = leaf.kwargs.get("scale", 1.0)
     bias = leaf.kwargs.get("bias", 0.0)
-    dst_p_slots = _tensor_total_slots(dst, dst.dim_ids[0], module)
-    dst_f_slots = _tensor_total_slots(dst, dst.dim_ids[1], module) if len(dst.dim_ids) > 1 else 1
-    src_p_slots = _tensor_total_slots(src, src.dim_ids[0], module)
-    src_f_slots = _tensor_total_slots(src, src.dim_ids[1], module) if len(src.dim_ids) > 1 else 1
+    dst_p_slots = tensor_total_slots(dst, dst.dim_ids[0], module)
+    dst_f_slots = tensor_total_slots(dst, dst.dim_ids[1], module) if len(dst.dim_ids) > 1 else 1
+    src_p_slots = tensor_total_slots(src, src.dim_ids[0], module)
+    src_f_slots = tensor_total_slots(src, src.dim_ids[1], module) if len(src.dim_ids) > 1 else 1
     off_p = stage_offset if p_axis == pipeline_dim else 0
     off_f = stage_offset if f_axis is not None and f_axis == pipeline_dim else 0
     dst_expr = _sbuf_tile_slice(
@@ -988,12 +886,12 @@ def _body_tensor_scalar(w, module, leaf, path_names, path_trips, pipeline_dim=No
     p_tile = module.dims[p_axis].tile_size
     f_tile = module.dims[f_axis].tile_size
     op_name = leaf.kwargs["op"]
-    dst_p_slots = _tensor_total_slots(dst, dst.dim_ids[0], module)
-    dst_f_slots = _tensor_total_slots(dst, dst.dim_ids[1], module) if len(dst.dim_ids) > 1 else 1
-    data_p_slots = _tensor_total_slots(data, data.dim_ids[0], module)
-    data_f_slots = _tensor_total_slots(data, data.dim_ids[1], module) if len(data.dim_ids) > 1 else 1
-    op0_p_slots = _tensor_total_slots(op0, op0.dim_ids[0], module)
-    op0_f_slots = _tensor_total_slots(op0, op0.dim_ids[1], module) if len(op0.dim_ids) > 1 else 1
+    dst_p_slots = tensor_total_slots(dst, dst.dim_ids[0], module)
+    dst_f_slots = tensor_total_slots(dst, dst.dim_ids[1], module) if len(dst.dim_ids) > 1 else 1
+    data_p_slots = tensor_total_slots(data, data.dim_ids[0], module)
+    data_f_slots = tensor_total_slots(data, data.dim_ids[1], module) if len(data.dim_ids) > 1 else 1
+    op0_p_slots = tensor_total_slots(op0, op0.dim_ids[0], module)
+    op0_f_slots = tensor_total_slots(op0, op0.dim_ids[1], module) if len(op0.dim_ids) > 1 else 1
     """Offset per-operand: stage_offset applies to the ancestors of the
     pipelined dim. Each operand's axes compare independently (op0 may
     be 1D and thus lack an f-axis)."""
@@ -1053,8 +951,8 @@ def _body_transpose(w, module, leaf, path_names, path_trips, pipeline_dim=None, 
     p_tile = module.dims[src_p_axis].tile_size
     f_tile = module.dims[src_f_axis].tile_size
     w.line(f"psum_tile = nl.ndarray(({p_tile}, {f_tile}), dtype=nl.{dst.dtype}, buffer=nl.psum)")
-    src_p_slots = _tensor_total_slots(src, src.dim_ids[0], module)
-    src_f_slots = _tensor_total_slots(src, src.dim_ids[1], module)
+    src_p_slots = tensor_total_slots(src, src.dim_ids[0], module)
+    src_f_slots = tensor_total_slots(src, src.dim_ids[1], module)
     src_off_p = stage_offset if src_p_axis == pipeline_dim else 0
     src_off_f = stage_offset if src_f_axis == pipeline_dim else 0
     src_expr = _sbuf_tile_slice(
@@ -1070,8 +968,8 @@ def _body_transpose(w, module, leaf, path_names, path_trips, pipeline_dim=None, 
         src_off_f,
     )
     w.line(f"nisa.nc_transpose(psum_tile[0:{p_tile}, 0:{f_tile}], {src_expr})")
-    dst_p_slots = _tensor_total_slots(dst, dst.dim_ids[0], module)
-    dst_f_slots = _tensor_total_slots(dst, dst.dim_ids[1], module)
+    dst_p_slots = tensor_total_slots(dst, dst.dim_ids[0], module)
+    dst_f_slots = tensor_total_slots(dst, dst.dim_ids[1], module)
     """dst's P slot uses src_f_axis ancestors; dst's F slot uses src_p_axis ancestors."""
     dst_off_p = stage_offset if src_f_axis == pipeline_dim else 0
     dst_off_f = stage_offset if src_p_axis == pipeline_dim else 0
@@ -1091,8 +989,8 @@ def _body_dma_transpose(w, module, leaf, path_names, path_trips, pipeline_dim=No
     src_p_axis, src_f_axis = src.dim_ids[0], src.dim_ids[1]
     p_tile = module.dims[src_p_axis].tile_size
     f_tile = module.dims[src_f_axis].tile_size
-    src_p_slots = _tensor_total_slots(src, src.dim_ids[0], module)
-    src_f_slots = _tensor_total_slots(src, src.dim_ids[1], module)
+    src_p_slots = tensor_total_slots(src, src.dim_ids[0], module)
+    src_f_slots = tensor_total_slots(src, src.dim_ids[1], module)
     src_off_p = stage_offset if src_p_axis == pipeline_dim else 0
     src_off_f = stage_offset if src_f_axis == pipeline_dim else 0
     src_expr = _sbuf_tile_slice(
@@ -1107,8 +1005,8 @@ def _body_dma_transpose(w, module, leaf, path_names, path_trips, pipeline_dim=No
         src_off_p,
         src_off_f,
     )
-    dst_p_slots = _tensor_total_slots(dst, dst.dim_ids[0], module)
-    dst_f_slots = _tensor_total_slots(dst, dst.dim_ids[1], module)
+    dst_p_slots = tensor_total_slots(dst, dst.dim_ids[0], module)
+    dst_f_slots = tensor_total_slots(dst, dst.dim_ids[1], module)
     dst_off_p = stage_offset if src_f_axis == pipeline_dim else 0
     dst_off_f = stage_offset if src_p_axis == pipeline_dim else 0
     dst_expr = _swapped_dst_tile_slice(
@@ -1148,10 +1046,10 @@ def _body_matmul_compute(w, module, leaf, path_names, path_trips, pipeline_dim=N
     p_tile_M = module.dims[m_dim].tile_size
     f_tile_N = module.dims[n_dim].tile_size
     p_tile_K = module.dims[k_dim].tile_size
-    stat_p_slots = _tensor_total_slots(stat, stat.dim_ids[0], module)
-    stat_f_slots = _tensor_total_slots(stat, stat.dim_ids[1], module) if len(stat.dim_ids) > 1 else 1
-    mov_p_slots = _tensor_total_slots(mov, mov.dim_ids[0], module)
-    mov_f_slots = _tensor_total_slots(mov, mov.dim_ids[1], module) if len(mov.dim_ids) > 1 else 1
+    stat_p_slots = tensor_total_slots(stat, stat.dim_ids[0], module)
+    stat_f_slots = tensor_total_slots(stat, stat.dim_ids[1], module) if len(stat.dim_ids) > 1 else 1
+    mov_p_slots = tensor_total_slots(mov, mov.dim_ids[0], module)
+    mov_f_slots = tensor_total_slots(mov, mov.dim_ids[1], module) if len(mov.dim_ids) > 1 else 1
     stat_off_p = stage_offset if stat.dim_ids[0] == pipeline_dim else 0
     stat_off_f = stage_offset if len(stat.dim_ids) > 1 and stat.dim_ids[1] == pipeline_dim else 0
     mov_off_p = stage_offset if mov.dim_ids[0] == pipeline_dim else 0
@@ -1198,8 +1096,8 @@ def _body_matmul_drain(w, module, leaf, path_names, path_trips, pipeline_dim=Non
     n_dim = leaf.axis_map["N"]
     p_tile_M = module.dims[m_dim].tile_size
     f_tile_N = module.dims[n_dim].tile_size
-    out_p_slots = _tensor_total_slots(out, out.dim_ids[0], module)
-    out_f_slots = _tensor_total_slots(out, out.dim_ids[1], module) if len(out.dim_ids) > 1 else 1
+    out_p_slots = tensor_total_slots(out, out.dim_ids[0], module)
+    out_f_slots = tensor_total_slots(out, out.dim_ids[1], module) if len(out.dim_ids) > 1 else 1
     out_off_p = stage_offset if out.dim_ids[0] == pipeline_dim else 0
     out_off_f = stage_offset if len(out.dim_ids) > 1 and out.dim_ids[1] == pipeline_dim else 0
     out_expr = _sbuf_tile_slice(
@@ -1233,7 +1131,7 @@ def _body_ar_reduce_close(w, module, leaf, path_names, path_trips, pipeline_dim=
     num_f = module.dims[f_axis].num_tiles
     reduce_op = leaf.kwargs.get("reduce_op", "add")
     merge = _REDUCE_MERGE_OP[reduce_op]
-    dst_p_slots = _tensor_total_slots(dst, dst.dim_ids[0], module)
+    dst_p_slots = tensor_total_slots(dst, dst.dim_ids[0], module)
     off_p = stage_offset if p_axis == pipeline_dim else 0
     p_slot = _slot_expr(path_names, path_trips, p_axis, dst_p_slots, off_p)
     dst_slot = f"{_sbuf_name(dst_name)}[0:{p_tile}, {p_slot}, 0:1]"
@@ -1268,8 +1166,8 @@ def _body_ar_reduce_step(w, module, leaf, path_names, path_trips, pipeline_dim=N
     slot_name = leaf.op_local_buffers["slot_vec"].emitted_name
     scratch_slot = f"{scratch_name}[0:{p_tile}, 0, 0:{f_tile}]"
     reduce_res_slot = f"{slot_name}[0:{p_tile}, 0, {f_slot} : {f_slot} + 1]"
-    src_p_slots = _tensor_total_slots(src, src.dim_ids[0], module)
-    src_f_slots = _tensor_total_slots(src, src.dim_ids[1], module) if len(src.dim_ids) > 1 else 1
+    src_p_slots = tensor_total_slots(src, src.dim_ids[0], module)
+    src_f_slots = tensor_total_slots(src, src.dim_ids[1], module) if len(src.dim_ids) > 1 else 1
     src_off_p = stage_offset if src.dim_ids[0] == pipeline_dim else 0
     src_off_f = stage_offset if len(src.dim_ids) > 1 and src.dim_ids[1] == pipeline_dim else 0
     src_expr = _sbuf_tile_slice(
