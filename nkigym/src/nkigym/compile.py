@@ -29,9 +29,7 @@ from pathlib import Path
 import nki
 import numpy as np
 
-from nkigym.codegen.graph import parse_and_resolve
-from nkigym.codegen.loop_forest import build_canonical_forest
-from nkigym.codegen.mermaid import dump_forest_mermaid
+from nkigym.codegen.canonical import build_canonical_module
 from nkigym.codegen.render import render
 from nkigym.synthesis import compile_numpy_to_nkigym
 from nkigym.tune import KernelRewrite
@@ -121,7 +119,12 @@ def _run_synthesis(
 def _run_initial_codegen(
     f_numpy: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], cache_path: Path
 ) -> None:
-    """Render the eager NKI kernel, write ``kernel.py`` and ``forest_initial.mmd``, and CPU-sim-check."""
+    """Render the eager NKI kernel, write ``kernel.py``, and CPU-sim-check.
+
+    Builds the canonical :class:`KernelModule` via
+    :func:`build_canonical_module`, then lowers it with the new single-argument
+    :func:`render`.
+    """
     f_nkigym_path = cache_path / "f_nkigym.py"
     if not f_nkigym_path.exists():
         raise ValueError(
@@ -129,12 +132,21 @@ def _run_initial_codegen(
             f"or place the file manually before invoking this stage."
         )
     f_nkigym = _load_f_nkigym(f_nkigym_path)
-    op_graph = parse_and_resolve(f_nkigym, input_specs)
-    forest = build_canonical_forest(op_graph)
-    kernel_source = render(op_graph, forest=forest)
+    module = build_canonical_module(f_nkigym, _to_canonical_specs(input_specs))
+    kernel_source = render(module)
     (cache_path / "kernel.py").write_text(kernel_source)
-    (cache_path / "forest_initial.mmd").write_text(dump_forest_mermaid(forest=forest, op_graph=op_graph))
     _cpu_sim_check(kernel_source, f_nkigym.__name__, f_numpy, input_specs)
+
+
+def _to_canonical_specs(input_specs: dict[str, tuple[tuple[int, ...], str]]) -> dict[str, dict]:
+    """Convert public ``(shape, dtype)`` tuple specs to ``build_canonical_module``'s dict form.
+
+    The public :func:`nkigym_compile` API uses ``{name: (shape, dtype_str)}``,
+    matching :class:`autotune.runner.types.KernelJob`. The canonical builder
+    expects ``{name: {"shape": ..., "dtype": ...}}``. This helper is the
+    single conversion point.
+    """
+    return {name: {"shape": shape, "dtype": dtype} for name, (shape, dtype) in input_specs.items()}
 
 
 def _load_f_nkigym(path: Path) -> Callable[..., np.ndarray]:

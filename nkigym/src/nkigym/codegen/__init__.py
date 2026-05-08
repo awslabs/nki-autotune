@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from nkigym.codegen.graph import parse_and_resolve
+from nkigym.codegen.canonical import build_canonical_module
 from nkigym.codegen.render import render
 
 
@@ -18,7 +18,8 @@ def render_eager(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[t
     Returns:
         NKI source string containing the ``@nki.jit`` kernel.
     """
-    return render(parse_and_resolve(func, input_specs))
+    canonical_specs = {name: {"shape": shape, "dtype": dtype} for name, (shape, dtype) in input_specs.items()}
+    return render(build_canonical_module(func, canonical_specs))
 
 
 __all__ = ["render_eager"]

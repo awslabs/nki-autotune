@@ -60,33 +60,53 @@ def test_activation_reduce_axis_roles_marks_f_as_accumulation() -> None:
     assert NKIActivationReduce.AXIS_ROLES == {"F": AxisRole.ACCUMULATION}
 
 
-def test_parsed_op_has_dim_role_for_every_touched_dim() -> None:
-    """ParsedOp.dim_role has an entry per touched_dim with the op's role."""
-    from nkigym.codegen.graph import parse_and_resolve
+def test_body_leaf_has_dim_role_for_every_touched_dim() -> None:
+    """BodyLeaf.dim_role has an entry per touched dim_id with the op's role."""
+    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.codegen.ir import BodyLeaf, leaves_under
 
-    specs = {"lhs_T": ((2048, 2048), "bfloat16"), "rhs": ((2048, 2048), "bfloat16")}
-    g = parse_and_resolve(_matmul_kernel, specs)
-    matmul_op = next(op for op in g.ops if op.op_cls.__name__ == "NKIMatmul")
-    k_dim = matmul_op.axis_map["K"]
-    m_dim = matmul_op.axis_map["M"]
-    n_dim = matmul_op.axis_map["N"]
-    assert matmul_op.dim_role[k_dim] == AxisRole.ACCUMULATION
-    assert matmul_op.dim_role[m_dim] == AxisRole.PARALLEL
-    assert matmul_op.dim_role[n_dim] == AxisRole.PARALLEL
-    assert set(matmul_op.dim_role.keys()) == set(matmul_op.touched_dims)
+    specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
+    module = build_canonical_module(_matmul_kernel, specs)
+    matmul_leaves = [
+        leaf
+        for tree in module.body
+        for leaf in leaves_under(tree)
+        if isinstance(leaf, BodyLeaf) and leaf.op_cls.__name__ == "NKIMatmul"
+    ]
+    assert matmul_leaves
+    compute = next(leaf for leaf in matmul_leaves if leaf.phase == "compute")
+    k_dim = compute.axis_map["K"]
+    m_dim = compute.axis_map["M"]
+    n_dim = compute.axis_map["N"]
+    assert compute.dim_role[k_dim] == AxisRole.ACCUMULATION
+    assert compute.dim_role[m_dim] == AxisRole.PARALLEL
+    assert compute.dim_role[n_dim] == AxisRole.PARALLEL
 
 
 def test_same_concrete_dim_can_carry_different_roles_across_ops() -> None:
-    """In rmsnorm+matmul, d1 is ACCUMULATION in activation_reduce and PARALLEL in tensor_scalar."""
-    from nkigym.codegen.graph import parse_and_resolve
+    """In rmsnorm+matmul, the shared F dim is ACCUMULATION in activation_reduce and PARALLEL in tensor_scalar."""
+    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.codegen.ir import BodyLeaf, leaves_under
 
-    specs = {"lhs": ((128, 256), "bfloat16")}
-    g = parse_and_resolve(_rmsnorm_kernel, specs)
-    ar = next(op for op in g.ops if op.op_cls.__name__ == "NKIActivationReduce")
-    ts = next(op for op in g.ops if op.op_cls.__name__ == "NKITensorScalar")
-    f_dim = ar.axis_map["F"]
-    assert ar.dim_role[f_dim] == AxisRole.ACCUMULATION
-    assert ts.dim_role[f_dim] == AxisRole.PARALLEL
+    specs = {"lhs": {"shape": (128, 256), "dtype": "bfloat16"}}
+    module = build_canonical_module(_rmsnorm_kernel, specs)
+    ar_leaves = [
+        leaf
+        for tree in module.body
+        for leaf in leaves_under(tree)
+        if isinstance(leaf, BodyLeaf) and leaf.op_cls.__name__ == "NKIActivationReduce"
+    ]
+    ts_leaves = [
+        leaf
+        for tree in module.body
+        for leaf in leaves_under(tree)
+        if isinstance(leaf, BodyLeaf) and leaf.op_cls.__name__ == "NKITensorScalar"
+    ]
+    ar_step = next(leaf for leaf in ar_leaves if leaf.phase == "reduce_step")
+    ts_main = ts_leaves[0]
+    f_dim = ar_step.axis_map["F"]
+    assert ar_step.dim_role[f_dim] == AxisRole.ACCUMULATION
+    assert ts_main.dim_role[f_dim] == AxisRole.PARALLEL
 
 
 def test_blocking_axes_removed_from_base_nkiop() -> None:

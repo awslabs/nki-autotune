@@ -1,127 +1,130 @@
-"""``MultiBuffer`` rewrite — set a tensor's per-dim buffer_degree.
+"""``MultiBuffer`` rewrite — set the multi-buffer degree of a tensor on a dim.
 
-Adjusts ``op_graph.tensors[tensor_name].buffer_degree[dim_id]`` to any
-divisor of the tensor's current ``lca_trip_product(dim_id)`` in the
-active forest. Forest is not modified.
-
-Cross-loopnest tensors (``lca_trip_product == 1``) accept only
-``degree == 1``; the enumerator filters them out so the sampler doesn't
-waste atoms on no-op self-moves.
+``MultiBuffer`` mutates only ``KernelModule.tensors[tensor_name].buffer_degree``.
+The renderer later consumes this field to size allocations and to build
+slot-indexing expressions.
 """
 
-from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from nkigym.codegen.graph import OpGraph
-from nkigym.codegen.loop_forest import LoopForest, LoopNode
-from nkigym.codegen.render import _find_access_paths, _lowest_common_ancestor
+from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode
+
+
+def _required_tiles(module: KernelModule, tensor_name: str, dim_id: str) -> int:
+    """Return the minimum tile count a tensor must hold along a dim.
+
+    Mirrors ``emit_source._required_tiles`` but inlined here to keep
+    ``MultiBuffer`` free of renderer dependencies. Walks the tree for
+    every leaf that reads or writes ``tensor_name``; finds the LCA of
+    those paths; divides ``num_tiles[dim_id]`` by the product of ancestor
+    trip counts for that dim above the LCA.
+    """
+    num_t = module.dims[dim_id].num_tiles
+    tensor = module.tensors.get(tensor_name)
+    if tensor is None or tensor.origin in ("param", "return"):
+        return num_t
+    paths: list[list[LoopNode | BodyLeaf]] = []
+
+    def walk(node: LoopNode | BodyLeaf, stack: list[LoopNode | BodyLeaf]) -> None:
+        stack.append(node)
+        if isinstance(node, BodyLeaf):
+            if tensor_name in node.writes or tensor_name in node.reads.values():
+                paths.append(list(stack))
+        else:
+            for child in node.children:
+                walk(child, stack)
+        stack.pop()
+
+    for root in module.body:
+        walk(root, [])
+    if not paths:
+        return num_t
+    lca_depth = 0
+    min_len = min(len(p) for p in paths)
+    for depth in range(min_len):
+        nodes_at_depth = {id(p[depth]) for p in paths}
+        if len(nodes_at_depth) != 1:
+            break
+        lca_depth = depth + 1
+    prod = 1
+    for node in paths[0][:lca_depth]:
+        if isinstance(node, LoopNode) and node.dim_id == dim_id:
+            prod *= node.trip_count
+    if num_t % prod != 0:
+        return num_t
+    return num_t // prod
 
 
 @dataclass(frozen=True)
 class MultiBuffer:
-    """Set a tensor's ``buffer_degree[dim_id]`` to ``degree``.
+    """Set ``module.tensors[tensor_name].buffer_degree[dim_id] = degree``.
 
     Attributes:
-        tensor_name: Name of the tensor to adjust.
-        dim_id: Concrete dim the degree applies to.
-        degree: New degree. Must be a positive divisor of
-            ``lca_trip_product(tensor, dim_id, forest)`` AND differ from
-            the current stored value (enforced by :meth:`is_legal` via
-            dedup in the sampler).
+        tensor_name: Target tensor.
+        dim_id: Dim on which to set buffer degree.
+        degree: New degree (must be >= 1 and <= num_tiles(dim_id)).
     """
 
     tensor_name: str
     dim_id: str
     degree: int
 
-    def is_legal(self, op_graph: OpGraph, forest: LoopForest) -> bool:
-        """Return True when the atom's parameters identify a valid rewrite."""
-        if self.tensor_name not in op_graph.tensors:
-            return False
-        tensor = op_graph.tensors[self.tensor_name]
-        if self.dim_id not in tensor.dim_ids:
-            return False
-        if self.degree < 1:
-            return False
-        prod = _lca_trip_product(self.tensor_name, self.dim_id, op_graph, forest)
-        if self.degree > prod:
-            return False
-        if prod % self.degree != 0:
-            return False
-        return True
+    def is_legal(self, module: KernelModule) -> bool:
+        """Return True iff target tensor exists, dim is bound, and degree is in range.
 
-    def apply(self, op_graph: OpGraph, forest: LoopForest) -> tuple[OpGraph, LoopForest]:
-        """Return a new ``(op_graph, forest)`` with only the targeted tensor updated.
-
-        Deep-copies only the targeted tensor; other tensors share by
-        reference. The forest is returned unchanged (shared reference).
+        Upper bound is ``num_tiles / required_tiles``: more buffer slots than
+        there are distinct tiles under the LCA just waste SBUF without
+        changing behavior.
         """
-        new_tensors = dict(op_graph.tensors)
-        new_tensor = deepcopy(op_graph.tensors[self.tensor_name])
-        new_tensor.buffer_degree[self.dim_id] = self.degree
-        new_tensors[self.tensor_name] = new_tensor
-        new_graph = OpGraph(
-            func_name=op_graph.func_name,
-            param_names=op_graph.param_names,
-            return_name=op_graph.return_name,
-            tensors=new_tensors,
-            dims=op_graph.dims,
-            ops=op_graph.ops,
-            per_op_attrs=op_graph.per_op_attrs,
-            dep=op_graph.dep,
-        )
-        return new_graph, forest
+        result: bool
+        if self.tensor_name not in module.tensors:
+            result = False
+        else:
+            t = module.tensors[self.tensor_name]
+            if self.dim_id not in t.dim_ids:
+                result = False
+            elif self.dim_id not in module.dims:
+                result = False
+            else:
+                req = _required_tiles(module, self.tensor_name, self.dim_id)
+                if req <= 0:
+                    result = False
+                else:
+                    num_t = module.dims[self.dim_id].num_tiles
+                    max_degree = num_t // req
+                    result = 1 <= self.degree <= max_degree
+        return result
+
+    def apply(self, module: KernelModule) -> KernelModule:
+        """Return a new module with ``tensor_name``'s buffer_degree on ``dim_id`` set to ``degree``."""
+        old_t = module.tensors[self.tensor_name]
+        new_degree = dict(old_t.buffer_degree)
+        new_degree[self.dim_id] = self.degree
+        new_t = replace(old_t, buffer_degree=new_degree)
+        new_tensors = {**module.tensors, self.tensor_name: new_t}
+        return replace(module, tensors=new_tensors)
 
 
-def enumerate_multi_buffer_atoms(op_graph: OpGraph, forest: LoopForest) -> list[MultiBuffer]:
-    """Return every non-self-move :class:`MultiBuffer` atom legal for the current state.
+def enumerate_multi_buffer_atoms(module: KernelModule) -> list[MultiBuffer]:
+    """Return every legal ``(tensor, dim, degree)`` atom on non-HBM tensors.
 
-    For each intermediate tensor and each of its dims, emit atoms for
-    every divisor of ``lca_trip_product`` except the current degree.
-    Cross-loopnest tensors yield nothing (``lca_trip_product = 1``,
-    degree pinned at 1).
+    Params and returns live in HBM and are not multi-buffered.
     """
     atoms: list[MultiBuffer] = []
-    for tensor in op_graph.tensors.values():
-        if tensor.origin != "intermediate":
+    for tensor_name, t in module.tensors.items():
+        if t.origin in ("param", "return"):
             continue
-        for d in tensor.dim_ids:
-            prod = _lca_trip_product(tensor.name, d, op_graph, forest)
-            if prod == 1:
+        for d in t.dim_ids:
+            if d not in module.dims:
                 continue
-            current = tensor.buffer_degree[d]
-            for degree in _divisors(prod):
+            req = _required_tiles(module, tensor_name, d)
+            if req <= 0:
+                continue
+            num_t = module.dims[d].num_tiles
+            max_degree = num_t // req
+            current = t.buffer_degree.get(d, 1)
+            for degree in range(1, max_degree + 1):
                 if degree == current:
                     continue
-                atoms.append(MultiBuffer(tensor_name=tensor.name, dim_id=d, degree=degree))
+                atoms.append(MultiBuffer(tensor_name=tensor_name, dim_id=d, degree=degree))
     return atoms
-
-
-def _divisors(n: int) -> list[int]:
-    """Return every positive divisor of ``n`` in ascending order."""
-    out: list[int] = []
-    d = 1
-    while d * d <= n:
-        if n % d == 0:
-            out.append(d)
-            if d != n // d:
-                out.append(n // d)
-        d += 1
-    out.sort()
-    return out
-
-
-def _lca_trip_product(tensor_name: str, dim_id: str, op_graph: OpGraph, forest: LoopForest) -> int:
-    """Product of ``LoopNode.trip_count`` over all ``dim_id``-iterating ancestors
-    above the LCA of ``tensor_name``'s producer + all consumers. 1 when no such
-    ancestors exist (tensor is cross-loopnest on ``dim_id``).
-    """
-    paths = _find_access_paths(tensor_name, op_graph, forest)
-    if not paths:
-        return 1
-    lca = _lowest_common_ancestor(paths)
-    prod = 1
-    for node in lca:
-        if isinstance(node, LoopNode) and node.dim_id == dim_id:
-            prod *= node.trip_count
-    return prod

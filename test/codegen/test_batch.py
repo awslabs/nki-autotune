@@ -4,17 +4,18 @@ import random
 
 import pytest
 
-from nkigym.codegen.graph import parse_and_resolve
-from nkigym.codegen.loop_forest import build_canonical_forest, hash_state
+from nkigym.codegen.canonical import build_canonical_module
+from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
+from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.transpose import NKITranspose
-from nkigym.tune.batch import enumerate_pool, sample_pool
+from nkigym.tune.batch import enumerate_pool, hash_state, sample_pool
 
 
 @nkigym_kernel
@@ -31,32 +32,32 @@ def _rmsnorm_matmul_f_nkigym(lhs, rhs):
     return out
 
 
-_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs": ((128, 256), "bfloat16"), "rhs": ((256, 512), "bfloat16")}
+_SPECS: dict[str, dict] = {
+    "lhs": {"shape": (128, 256), "dtype": "bfloat16"},
+    "rhs": {"shape": (256, 512), "dtype": "bfloat16"},
+}
 
 
-def _canonical_state() -> tuple:
-    """Build the canonical (op_graph, forest) used as the starting state."""
-    op_graph = parse_and_resolve(_rmsnorm_matmul_f_nkigym, _SPECS)
-    forest = build_canonical_forest(op_graph)
-    return op_graph, forest
+def _canonical_module() -> KernelModule:
+    """Build the canonical :class:`KernelModule` used as the starting state."""
+    return build_canonical_module(_rmsnorm_matmul_f_nkigym, _SPECS)
 
 
 def test_enumerate_pool_includes_initial():
-    op_graph, forest = _canonical_state()
-    pool = enumerate_pool(op_graph, forest, max_pool_size=100, rng=random.Random(0))
-    assert hash_state(op_graph, forest) in pool
+    module = _canonical_module()
+    pool = enumerate_pool(module, max_pool_size=100, rng=random.Random(0))
+    assert hash_state(module) in pool
 
 
 def test_enumerate_pool_no_legal_atoms(monkeypatch: pytest.MonkeyPatch):
     """Starting state with no legal atoms → pool of size 1, no error."""
     from nkigym.tune import batch as batch_mod
 
-    monkeypatch.setattr(batch_mod, "enumerate_fusion_atoms", lambda og, f: [])
-    monkeypatch.setattr(batch_mod, "enumerate_reorder_atoms", lambda f: [])
+    monkeypatch.setattr(batch_mod, "_enumerate_atoms", lambda module: [])
 
-    op_graph, forest = _canonical_state()
-    pool = enumerate_pool(op_graph, forest, max_pool_size=100, rng=random.Random(0))
-    assert list(pool) == [hash_state(op_graph, forest)]
+    module = _canonical_module()
+    pool = enumerate_pool(module, max_pool_size=100, rng=random.Random(0))
+    assert list(pool) == [hash_state(module)]
 
 
 def test_enumerate_pool_cap_respected():
@@ -65,77 +66,75 @@ def test_enumerate_pool_cap_respected():
     rmsnorm+matmul has many legal atoms from the canonical state;
     capping at 3 must halt enumeration at exactly 3 pooled states.
     """
-    op_graph, forest = _canonical_state()
-    pool = enumerate_pool(op_graph, forest, max_pool_size=3, rng=random.Random(0))
+    module = _canonical_module()
+    pool = enumerate_pool(module, max_pool_size=3, rng=random.Random(0))
     assert len(pool) == 3
 
 
 def test_enumerate_pool_deterministic():
     """Two runs with the same seed on the same starting state produce identical pool keys."""
-    op_graph, forest = _canonical_state()
-    pool_a = enumerate_pool(op_graph, forest, max_pool_size=50, rng=random.Random(42))
-    pool_b = enumerate_pool(op_graph, forest, max_pool_size=50, rng=random.Random(42))
+    module = _canonical_module()
+    pool_a = enumerate_pool(module, max_pool_size=50, rng=random.Random(42))
+    pool_b = enumerate_pool(module, max_pool_size=50, rng=random.Random(42))
     assert sorted(pool_a) == sorted(pool_b)
 
 
 def test_enumerate_pool_exhausts_small_graph(monkeypatch: pytest.MonkeyPatch):
     """With reachable set |S|=3, cap >> |S|, two independent seeds → identical pool.
 
-    Stubs atom enumerators to simulate a tiny rewrite graph:
+    Stubs ``_enumerate_atoms`` to simulate a tiny rewrite graph:
       s0 → s1 (atom A)
       s0 → s2 (atom B)
       s1 → s2 (atom C — reaches s2 from a different parent)
       s1/s2: no outgoing atoms
     """
-    from nkigym.codegen.graph import OpGraph
-    from nkigym.codegen.loop_forest import BodyLeaf, LoopForest, LoopNode
-    from nkigym.ops.base import AxisRole
     from nkigym.tune import batch as batch_mod
 
-    def _forest(tag: int) -> LoopForest:
-        return [LoopNode(dim_id=f"d{tag}", trip_count=1, role=AxisRole.PARALLEL, children=[BodyLeaf(op_idx=0)])]
+    def _module_with_body(tag: int) -> KernelModule:
+        body = [LoopNode(dim_id=f"d{tag}", trip_count=1, role=AxisRole.PARALLEL, children=[BodyLeaf(op_cls=object)])]
+        return KernelModule(func_name="t", param_names=[], return_name="", tensors={}, dims={}, body=body)
 
-    op_graph = OpGraph(func_name="t", param_names=[], return_name="", tensors={}, dims={}, ops=[])
-    forest_s0 = _forest(0)
-    forest_s1 = _forest(1)
-    forest_s2 = _forest(2)
+    module_s0 = _module_with_body(0)
+    module_s1 = _module_with_body(1)
+    module_s2 = _module_with_body(2)
 
     class _Atom:
-        def __init__(self, dest: LoopForest) -> None:
+        def __init__(self, dest: KernelModule) -> None:
             self.dest = dest
 
-        def is_legal(self, og, f):
+        def is_legal(self, module: KernelModule) -> bool:
             return True
 
-        def apply(self, og, f):
-            return og, self.dest
+        def apply(self, module: KernelModule) -> KernelModule:
+            return self.dest
 
-    atom_a = _Atom(forest_s1)
-    atom_b = _Atom(forest_s2)
-    atom_c = _Atom(forest_s2)
+    atom_a = _Atom(module_s1)
+    atom_b = _Atom(module_s2)
+    atom_c = _Atom(module_s2)
 
-    h0 = hash_state(op_graph, forest_s0)
-    h1 = hash_state(op_graph, forest_s1)
-    h2 = hash_state(op_graph, forest_s2)
+    h0 = hash_state(module_s0)
+    h1 = hash_state(module_s1)
+    h2 = hash_state(module_s2)
 
-    def _fusion(og, f):
-        return {h0: [atom_a], h1: [atom_c], h2: []}[hash_state(og, f)]
+    def _atoms(m: KernelModule) -> list:
+        return {h0: [atom_a, atom_b], h1: [atom_c], h2: []}[hash_state(m)]
 
-    def _reorder(f):
-        return {h0: [atom_b], h1: [], h2: []}[hash_state(op_graph, f)]
+    monkeypatch.setattr(batch_mod, "_enumerate_atoms", _atoms)
 
-    monkeypatch.setattr(batch_mod, "enumerate_fusion_atoms", _fusion)
-    monkeypatch.setattr(batch_mod, "enumerate_reorder_atoms", _reorder)
-
-    pool_a = enumerate_pool(op_graph, forest_s0, max_pool_size=100, rng=random.Random(0))
-    pool_b = enumerate_pool(op_graph, forest_s0, max_pool_size=100, rng=random.Random(7))
+    pool_a = enumerate_pool(module_s0, max_pool_size=100, rng=random.Random(0))
+    pool_b = enumerate_pool(module_s0, max_pool_size=100, rng=random.Random(7))
     assert sorted(pool_a) == sorted([h0, h1, h2])
     assert sorted(pool_b) == sorted([h0, h1, h2])
 
 
+def _fake_module(tag: int) -> KernelModule:
+    """Build a minimal module stand-in for sample_pool tests."""
+    return KernelModule(func_name=f"k{tag}", param_names=[], return_name="", tensors={}, dims={})
+
+
 def test_sample_pool_exact_fill():
     """Pool of 10, N=5 → 5 distinct states."""
-    pool: dict[int, tuple] = {i: (f"og{i}", f"f{i}") for i in range(10)}
+    pool: dict[int, KernelModule] = {i: _fake_module(i) for i in range(10)}
     out = sample_pool(pool, num_kernels=5, rng=random.Random(0))
     assert len(out) == 5
     assert len(set(id(x) for x in out)) == 5
@@ -143,47 +142,28 @@ def test_sample_pool_exact_fill():
 
 def test_sample_pool_under_fill_warns():
     """Pool of 3, N=5 → emits UserWarning, returns all 3."""
-    pool: dict[int, tuple] = {i: (f"og{i}", f"f{i}") for i in range(3)}
+    pool: dict[int, KernelModule] = {i: _fake_module(i) for i in range(3)}
     with pytest.warns(UserWarning, match="pool size 3 < num_kernels 5"):
         out = sample_pool(pool, num_kernels=5, rng=random.Random(0))
     assert len(out) == 3
 
 
 def test_sample_pool_deterministic():
-    """Fixed pool + seed → same sample (by value equality)."""
-    pool: dict[int, tuple] = {i: (f"og{i}", f"f{i}") for i in range(20)}
-    out_a = sample_pool(pool, num_kernels=5, rng=random.Random(99))
-    out_b = sample_pool(pool, num_kernels=5, rng=random.Random(99))
-    assert out_a == out_b
+    """Fixed pool + seed → same sample (by identity)."""
+    pool: dict[int, KernelModule] = {i: _fake_module(i) for i in range(20)}
+    ids_a = [id(x) for x in sample_pool(pool, num_kernels=5, rng=random.Random(99))]
+    ids_b = [id(x) for x in sample_pool(pool, num_kernels=5, rng=random.Random(99))]
+    assert ids_a == ids_b
 
 
 def test_batch_pool_contains_multi_buffer_variants() -> None:
-    """Sampled pool includes states reachable via MultiBuffer after fusion."""
-    import random
+    """Sampled pool includes states reachable via MultiBuffer."""
     from test.codegen._rmsnorm_matmul_fixture import INPUT_SPECS, f_nkigym
 
-    from nkigym.codegen.graph import parse_and_resolve
-    from nkigym.codegen.loop_forest import build_canonical_forest
-    from nkigym.tune.batch import enumerate_pool
-
-    graph = parse_and_resolve(f_nkigym, INPUT_SPECS)
-    forest = build_canonical_forest(graph)
+    specs_dict = {name: {"shape": shape, "dtype": dtype} for name, (shape, dtype) in INPUT_SPECS.items()}
+    module = build_canonical_module(f_nkigym, specs_dict)
     rng = random.Random(0)
-    pool = enumerate_pool(graph, forest, max_pool_size=200, rng=rng)
+    pool = enumerate_pool(module, max_pool_size=200, rng=rng)
 
-    """Some member has non-default buffer_degree somewhere."""
-    any_mb = any(deg != 1 for og, _ in pool.values() for t in og.tensors.values() for deg in t.buffer_degree.values())
+    any_mb = any(deg != 1 for m in pool.values() for t in m.tensors.values() for deg in t.buffer_degree.values())
     assert any_mb, "no MultiBuffer variants in pool"
-
-
-def _has_pipelined_node(forest) -> bool:
-    from nkigym.codegen.loop_forest import BodyLeaf
-
-    def walk(n):
-        if isinstance(n, BodyLeaf):
-            return False
-        if n.pipeline_depth > 1:
-            return True
-        return any(walk(c) for c in n.children)
-
-    return any(walk(r) for r in forest)

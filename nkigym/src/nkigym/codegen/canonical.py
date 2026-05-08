@@ -1,16 +1,20 @@
-"""``parse_and_resolve``: turn an ``f_nkigym`` callable into an :class:`OpGraph`.
+"""Canonical module builder: ``f_nkigym`` callable → :class:`KernelModule`.
 
 Pipeline:
-    1. AST-parse the math function to an ordered list of parsed ops.
+    1. AST-parse the math function to an ordered list of raw parsed ops.
     2. Unify abstract axes (``P``, ``F``, ``K``, ``M``, ``N`` ...) across
        ops into concrete dim ids (``d0``, ``d1`` ...).
     3. Derive per-dim total size + tile size from ``input_specs`` and
        per-op ``TILE_LIMITS``.
     4. Tag each tensor's ``origin`` (``param`` / ``intermediate`` / ``return``).
+    5. Build the canonical 2N-per-op forest with phase leaves at the
+       deepest point; populate every :class:`BodyLeaf` with FULL metadata
+       so leaves are self-describing (no back-reference to a sidecar).
+    6. Assign canonical loop names ``i_<dim>_<ordinal>`` across each tree.
 
-The resulting :class:`OpGraph` is read-only: for any
-``(func, input_specs)`` exactly one graph exists. There are no tunable
-knobs; the renderer lowers this graph mechanically.
+The resulting :class:`KernelModule` is the IR the renderer and transform
+atoms consume. :class:`KernelModule.dep` is populated lazily by the
+default :class:`DepCache` factory.
 """
 
 import ast
@@ -18,147 +22,56 @@ import inspect
 import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 
-from nkigym.codegen.dep_graph import DepGraph, build_dep_graph
+from nkigym.codegen.ir import BodyLeaf, DimInfo, KernelModule, LoopNode, OpLocalBuffer, Tensor, TensorOrigin, TreeIR
 from nkigym.ops.base import AxisRole, NKIOp
 
-TensorOrigin = Literal["param", "intermediate", "return"]
 
+def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict[str, dict]) -> KernelModule:
+    """Build a :class:`KernelModule` from an ``f_nkigym`` callable.
 
-@dataclass
-class Tensor:
-    """Named tensor appearing in the ``f_nkigym`` body.
+    Args:
+        func: A math function decorated with ``@nkigym_kernel`` whose
+            body is straight-line ``NKIOp()(...)`` assignments followed
+            by ``return <tensor>``.
+        input_specs: ``{param_name: {"shape": (...), "dtype": str}}`` for
+            every function parameter.
 
-    Attributes:
-        name: Source-level variable name (e.g. ``"lhs"`` or ``"rms_inv"``).
-        dim_ids: Concrete dim ids in operand order (e.g. ``("d0", "d1")``).
-        shape: Element sizes aligned with ``dim_ids``.
-        dtype: Element dtype (e.g. ``"bfloat16"``, ``"float32"``).
-        origin: Lineage role — ``"param"`` (HBM kernel input),
-            ``"intermediate"`` (SBUF handoff), or ``"return"`` (final
-            op output).
-        buffer_degree: Multi-buffer degree per dim. Defaults to
-            ``{d: 1 for d in dim_ids}`` when not supplied. ``MultiBuffer``
-            atom mutates this field; the renderer consults it when
-            sizing SBUF/HBM allocations and when building slot
-            expressions.
+    Returns:
+        A fully resolved :class:`KernelModule` with canonical 2N-per-op
+        schedule tree and self-describing leaves.
     """
+    raws, return_name = _parse_ast(func)
+    unwrapped = getattr(func, "__wrapped__", func)
+    param_names = list(inspect.signature(unwrapped).parameters.keys())
+    for name in param_names:
+        if name not in input_specs:
+            raise ValueError(f"Missing input_spec for parameter: {name!r}")
 
-    name: str
-    dim_ids: tuple[str, ...]
-    shape: tuple[int, ...]
-    dtype: str
-    origin: TensorOrigin
-    buffer_degree: dict[str, int] = field(default_factory=dict)
+    tensors_scratch, dim_sizes, per_op_axis_maps = _unify_axes(raws, param_names, input_specs)
+    if return_name not in tensors_scratch:
+        raise ValueError(f"Return tensor {return_name!r} not produced by any op")
 
-    def __post_init__(self) -> None:
-        """Populate ``buffer_degree`` with ``1`` for every dim the caller omitted."""
-        for d in self.dim_ids:
-            self.buffer_degree.setdefault(d, 1)
+    dims = _derive_dims(raws, per_op_axis_maps, dim_sizes)
+    _register_op_local_derived_dims(raws, per_op_axis_maps, dims)
+    tensors = _build_tensor_map(tensors_scratch, param_names, return_name)
+    parsed_ops = _build_parsed_ops(raws, per_op_axis_maps, tensors, dims)
 
+    body: TreeIR = [_build_tree(op, dims) for op in parsed_ops]
+    for tree in body:
+        _assign_canonical_names(tree, same_dim_counts={})
 
-@dataclass
-class DimInfo:
-    """Concrete dimension metadata derived from ops + input specs."""
-
-    dim_id: str
-    total_size: int
-    tile_size: int
-    num_tiles: int
-
-
-@dataclass
-class OpLocalBuffer:
-    """Resolved op-local buffer ready for renderer emission.
-
-    Attributes:
-        logical_name: Name the op declared (e.g. ``"scratch"``, ``"slot_vec"``).
-        emitted_name: Identifier the renderer uses in emitted source
-            (e.g. ``"sbuf_local_0"``).
-        location: ``"sbuf"`` or ``"psum"``.
-        dtype: ``nl.*`` dtype name (e.g. ``"float32"``).
-        shape: Emitted 3D shape ``(p_tile, 1, free_extent)``. Partition
-            dim contributes ``p_tile``; outer block tier collapses to 1
-            (op-local = no cross-iteration persistence); free axis
-            contributes ``num_tiles * tile_size``.
-    """
-
-    logical_name: str
-    emitted_name: str
-    location: str
-    dtype: str
-    shape: tuple[int, int, int]
-
-
-@dataclass
-class ParsedOp:
-    """One ``NKIOp()(...)`` call captured from the ``f_nkigym`` body.
-
-    Attributes:
-        idx: 0-indexed position in the math function.
-        op_cls: The NKIOp subclass (e.g. ``NKIMatmul``).
-        operand_names: Maps operand slot name (``"data"``, ``"stationary"``
-            etc.) to the local variable name the call references.
-        op_kwargs: Literal keyword arguments merged from constructor
-            and call site (e.g. ``{"op": "square", "scale": 1/2048}``).
-        output_names: Names the assignment target binds.
-        axis_map: Abstract axis label (``"K"``, ``"M"`` ...) to concrete
-            dim id.
-        touched_dims: Every dim id this op's operands or outputs mention,
-            in canonical loop-nest order: partition-axis dim first, then
-            free-axis dims, then any reducing dim.
-        dim_role: Concrete ``dim_id`` → :class:`AxisRole` for every dim
-            in ``touched_dims``. Resolved from ``op_cls.AXIS_ROLES`` via
-            ``axis_map``; PARALLEL is the default for any dim not named
-            in ``AXIS_ROLES``.
-        op_local_buffers: Resolved op-local buffers keyed by logical
-            name. Renderer emits one allocation per entry at function
-            top using ``emitted_name`` / ``location`` / ``shape``. Body
-            emitters reference ``emitted_name`` directly. Empty when
-            the op class declares no ``OP_LOCAL_BUFFERS``.
-    """
-
-    idx: int
-    op_cls: type
-    operand_names: dict[str, str]
-    op_kwargs: dict[str, Any]
-    output_names: list[str]
-    axis_map: dict[str, str]
-    touched_dims: tuple[str, ...]
-    dim_role: dict[str, AxisRole]
-    op_local_buffers: dict[str, OpLocalBuffer] = field(default_factory=dict)
-
-
-@dataclass
-class OpGraph:
-    """Read-only resolved view of an ``f_nkigym`` function.
-
-    Attributes:
-        func_name: Function name (lands on the emitted kernel).
-        param_names: Kernel parameters in signature order.
-        return_name: Tensor name of the return value (the ``NKIStore``
-            output).
-        tensors: All named tensors, keyed by name.
-        dims: All dims, keyed by dim id.
-        ops: Parsed ops in source order.
-        per_op_attrs: Per-op annotation side-table keyed by
-            ``ParsedOp.idx``. Empty by default — reserved for future
-            passes like ``propagate_compute_skip``.
-        dep: Data-flow dependency graph recording producer/consumer
-            edges and read/write sets for every tensor.
-    """
-
-    func_name: str
-    param_names: list[str]
-    return_name: str
-    tensors: dict[str, Tensor]
-    dims: dict[str, DimInfo]
-    ops: list[ParsedOp]
-    per_op_attrs: dict[int, dict[str, Any]] = field(default_factory=dict)
-    dep: DepGraph = field(default_factory=lambda: DepGraph(producer={}, consumers={}, reads={}, writes={}))
+    return KernelModule(
+        func_name=unwrapped.__name__,
+        param_names=param_names,
+        return_name=return_name,
+        tensors=tensors,
+        dims=dims,
+        body=body,
+    )
 
 
 @dataclass
@@ -178,6 +91,43 @@ class _ParsedOpRaw:
     operand_names: dict[str, str]
     op_kwargs: dict[str, Any]
     output_names: list[str]
+
+
+@dataclass
+class _ScratchTensor:
+    """Mutable dim-inference record used during resolution."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: str
+    dim_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _ParsedOp:
+    """One ``NKIOp()(...)`` call with fully resolved metadata.
+
+    Attributes:
+        idx: 0-indexed position in the math function.
+        op_cls: The NKIOp subclass.
+        operand_names: Operand slot → local variable name.
+        op_kwargs: Merged literal kwargs from constructor + call.
+        output_names: Names bound by the assignment target.
+        axis_map: Abstract axis label → concrete dim id.
+        touched_dims: Dim ids this op touches, canonical loop-nest order.
+        dim_role: Concrete dim id → :class:`AxisRole` (op-local).
+        op_local_buffers: Resolved op-local buffers keyed by logical name.
+    """
+
+    idx: int
+    op_cls: type[NKIOp]
+    operand_names: dict[str, str]
+    op_kwargs: dict[str, Any]
+    output_names: list[str]
+    axis_map: dict[str, str]
+    touched_dims: tuple[str, ...]
+    dim_role: dict[str, AxisRole]
+    op_local_buffers: dict[str, OpLocalBuffer] = field(default_factory=dict)
 
 
 def _parse_ast(func: Callable[..., np.ndarray]) -> tuple[list[_ParsedOpRaw], str]:
@@ -332,29 +282,29 @@ def _literal_value(node: ast.expr, func_globals: dict[str, object]) -> tuple[boo
     return result
 
 
-def parse_and_resolve(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> OpGraph:
-    """AST-parse ``func`` and resolve dims, tensors, tile sizes.
+def _unify_axes(
+    raws: list[_ParsedOpRaw], param_names: list[str], input_specs: dict[str, dict]
+) -> tuple[dict[str, _ScratchTensor], dict[str, int], list[dict[str, str]]]:
+    """Unify abstract axes across ops into concrete dim ids.
+
+    Seeds scratch tensors from ``input_specs``, then walks every raw op
+    in source order, building its ``axis_map`` against the operands it
+    references. Output tensors are materialised as we go so later ops
+    see resolved dim ids.
 
     Args:
-        func: A math function decorated with ``@nkigym_kernel`` whose
-            body is straight-line ``NKIOp()(...)`` assignments followed
-            by ``return <tensor>``.
-        input_specs: ``{param_name: (shape, dtype)}`` for every function
-            parameter.
+        raws: Raw AST-parsed ops in source order.
+        param_names: Kernel parameter names (signature order).
+        input_specs: ``{param_name: {"shape": ..., "dtype": ...}}``.
 
     Returns:
-        A fully resolved :class:`OpGraph`.
+        ``(tensors_scratch, dim_sizes, per_op_axis_maps)``.
     """
-    raws, return_name = _parse_ast(func)
-    unwrapped = getattr(func, "__wrapped__", func)
-    param_names = list(inspect.signature(unwrapped).parameters.keys())
-    for name in param_names:
-        if name not in input_specs:
-            raise ValueError(f"Missing input_spec for parameter: {name!r}")
-
     tensors_scratch: dict[str, _ScratchTensor] = {}
     for name in param_names:
-        shape, dtype = input_specs[name]
+        spec = input_specs[name]
+        shape = tuple(spec["shape"])
+        dtype = spec["dtype"]
         tensors_scratch[name] = _ScratchTensor(name=name, shape=shape, dtype=dtype)
 
     dim_sizes: dict[str, int] = {}
@@ -366,35 +316,7 @@ def parse_and_resolve(func: Callable[..., np.ndarray], input_specs: dict[str, tu
         axis_map = _build_axis_map(op_cls, operand_map, tensors_scratch, dim_counter, per_op_axis_maps, dim_sizes)
         per_op_axis_maps.append(axis_map)
         _create_outputs(op_cls, operand_map, raw.output_names, axis_map, tensors_scratch, dim_sizes)
-
-    if return_name not in tensors_scratch:
-        raise ValueError(f"Return tensor {return_name!r} not produced by any op")
-
-    dims = _resolve_dimensions(raws, per_op_axis_maps, dim_sizes)
-    _register_op_local_derived_dims(raws, per_op_axis_maps, dims)
-    tensors = _finalize_tensors(tensors_scratch, param_names, return_name, raws)
-    ops = _build_parsed_ops(raws, per_op_axis_maps, tensors, dims)
-
-    return OpGraph(
-        func_name=unwrapped.__name__,
-        param_names=param_names,
-        return_name=return_name,
-        tensors=tensors,
-        dims=dims,
-        ops=ops,
-        per_op_attrs={},
-        dep=build_dep_graph(ops, tensors),
-    )
-
-
-@dataclass
-class _ScratchTensor:
-    """Mutable dim-inference record used during resolution."""
-
-    name: str
-    shape: tuple[int, ...]
-    dtype: str
-    dim_ids: list[str] = field(default_factory=list)
+    return tensors_scratch, dim_sizes, per_op_axis_maps
 
 
 def _build_axis_map(
@@ -471,7 +393,7 @@ def _create_outputs(
         tensors[oname] = _ScratchTensor(name=oname, shape=shape, dtype=dtype, dim_ids=dim_ids)
 
 
-def _resolve_dimensions(
+def _derive_dims(
     raws: list[_ParsedOpRaw], per_op_axis_maps: list[dict[str, str]], dim_sizes: dict[str, int]
 ) -> dict[str, DimInfo]:
     """Derive per-dim tile size = min of op TILE_LIMITS touching the dim."""
@@ -532,8 +454,8 @@ def _register_op_local_derived_dims(
                         )
 
 
-def _finalize_tensors(
-    scratch: dict[str, _ScratchTensor], param_names: list[str], return_name: str, raws: list[_ParsedOpRaw]
+def _build_tensor_map(
+    scratch: dict[str, _ScratchTensor], param_names: list[str], return_name: str
 ) -> dict[str, Tensor]:
     """Convert scratch tensors to read-only ``Tensor``s, tagging origin."""
     out: dict[str, Tensor] = {}
@@ -545,7 +467,6 @@ def _finalize_tensors(
         else:
             origin = "intermediate"
         out[name] = Tensor(name=name, dim_ids=tuple(st.dim_ids), shape=tuple(st.shape), dtype=st.dtype, origin=origin)
-    _ = raws
     return out
 
 
@@ -591,7 +512,12 @@ def _resolve_op_local_buffers(
         emitted = f"{location}_local_{counter[0]}"
         counter[0] += 1
         out[logical_name] = OpLocalBuffer(
-            logical_name=logical_name, emitted_name=emitted, location=location, dtype=dtype, shape=shape
+            logical_name=logical_name,
+            emitted_name=emitted,
+            location=location,
+            dtype=dtype,
+            axis_ids=tuple(axis_ids),
+            shape=shape,
         )
     return out
 
@@ -601,16 +527,16 @@ def _build_parsed_ops(
     per_op_axis_maps: list[dict[str, str]],
     tensors: dict[str, Tensor],
     dims: dict[str, DimInfo],
-) -> list[ParsedOp]:
+) -> list[_ParsedOp]:
     """Assemble per-op records with canonicalised ``touched_dims``."""
-    ops: list[ParsedOp] = []
+    ops: list[_ParsedOp] = []
     counter = [0]
     for idx, (raw, axis_map) in enumerate(zip(raws, per_op_axis_maps)):
         touched = _touched_dims(raw, axis_map, tensors)
         dim_role = _resolve_dim_role(raw.op_cls, axis_map, touched)
         op_local_buffers = _resolve_op_local_buffers(raw, axis_map, dims, counter)
         ops.append(
-            ParsedOp(
+            _ParsedOp(
                 idx=idx,
                 op_cls=raw.op_cls,
                 operand_names=dict(raw.operand_names),
@@ -658,3 +584,147 @@ def _touched_dims(raw: _ParsedOpRaw, axis_map: dict[str, str], tensors: dict[str
             if abstract in axis_map and axis_map[abstract] not in ordered:
                 ordered.append(axis_map[abstract])
     return tuple(ordered)
+
+
+def _make_leaf(op: _ParsedOp, phase: str) -> BodyLeaf:
+    """Build a self-describing :class:`BodyLeaf` for ``op``'s ``phase``.
+
+    Copies operand/output/kwargs/axis_map/dim_role/op_local_buffers so
+    the leaf does not share mutable state with the parsed op.
+    """
+    return BodyLeaf(
+        op_cls=op.op_cls,
+        phase=phase,
+        reads=dict(op.operand_names),
+        writes=tuple(op.output_names),
+        kwargs=dict(op.op_kwargs),
+        axis_map=dict(op.axis_map),
+        dim_role=dict(op.dim_role),
+        op_local_buffers=dict(op.op_local_buffers),
+    )
+
+
+def _build_tree(op: _ParsedOp, dims: dict[str, DimInfo]) -> LoopNode:
+    """Build the 2N-per-dim chain for ``op`` with phase leaves at the tip."""
+    deepest_children = _build_leaves(op, dims)
+    wrap_dims = _dims_to_wrap(op)
+    return _wrap_dims(wrap_dims, op, dims, deepest_children)
+
+
+def _dims_to_wrap(op: _ParsedOp) -> tuple[str, ...]:
+    """Return the dims the outer wrapper should build around the leaves.
+
+    Multi-phase builders may handle some interior dims themselves (e.g.
+    matmul builds K internally). For those builders, the dims they
+    consume are dropped from the outer wrap.
+    """
+    interior_fn = _BUILDER_INTERIOR_DIMS.get(op.op_cls.__name__)
+    skip = interior_fn(op) if interior_fn is not None else set()
+    return tuple(d for d in op.touched_dims if d not in skip)
+
+
+def _wrap_dims(
+    wrap: tuple[str, ...], op: _ParsedOp, dims: dict[str, DimInfo], inner_children: list[LoopNode | BodyLeaf]
+) -> LoopNode:
+    """Wrap ``inner_children`` in a 2N-per-dim chain over ``wrap``."""
+    if not wrap:
+        raise ValueError(f"Op {op.idx}: cannot build tree — no touched_dims to wrap")
+    node_children: list[LoopNode | BodyLeaf] = inner_children
+    for d in reversed(wrap):
+        role = op.dim_role[d]
+        num_t = dims[d].num_tiles
+        tile_node = LoopNode(dim_id=d, trip_count=1, role=role, children=node_children)
+        block_node = LoopNode(dim_id=d, trip_count=num_t, role=role, children=[tile_node])
+        node_children = [block_node]
+    head = node_children[0]
+    assert isinstance(head, LoopNode)
+    return head
+
+
+def _build_leaves(op: _ParsedOp, dims: dict[str, DimInfo]) -> list[LoopNode | BodyLeaf]:
+    """Return the deepest-point children list for ``op``'s tree.
+
+    Dispatch on op-class name — single-phase ops return a single
+    ``[BodyLeaf(... phase="main")]``; multi-phase ops (matmul,
+    activation_reduce) use custom builders registered in
+    :data:`_LEAF_BUILDERS`.
+    """
+    builder = _LEAF_BUILDERS.get(op.op_cls.__name__, _build_leaves_default)
+    return builder(op, dims)
+
+
+def _build_leaves_default(op: _ParsedOp, dims: dict[str, DimInfo]) -> list[LoopNode | BodyLeaf]:
+    """Single-phase default: one ``BodyLeaf(... phase='main')``."""
+    _ = dims
+    return [_make_leaf(op, "main")]
+
+
+def _build_leaves_matmul(op: _ParsedOp, dims: dict[str, DimInfo]) -> list[LoopNode | BodyLeaf]:
+    """Matmul: ``[psum_init leaf, <K chain ending in compute leaf>, drain leaf]``.
+
+    The outer M and N dims are consumed by ``_wrap_dims``. The K dim is
+    handled here so the body placement mirrors the physical kernel:
+    PSUM init lives outside K, ``nc_matmul`` fires inside K, drain
+    runs after K closes. The K-chain LoopNodes carry ``reduce_op="add"``
+    because nc_matmul's PSUM accumulator is summation.
+    """
+    k_dim = op.axis_map["K"]
+    k_role = op.dim_role[k_dim]
+    num_k = dims[k_dim].num_tiles
+    compute_leaf = _make_leaf(op, "compute")
+    k_tile = LoopNode(dim_id=k_dim, trip_count=1, role=k_role, children=[compute_leaf], reduce_op="add")
+    k_block = LoopNode(dim_id=k_dim, trip_count=num_k, role=k_role, children=[k_tile], reduce_op="add")
+    return [_make_leaf(op, "psum_init"), k_block, _make_leaf(op, "drain")]
+
+
+def _build_leaves_activation_reduce(op: _ParsedOp, dims: dict[str, DimInfo]) -> list[LoopNode | BodyLeaf]:
+    """ActivationReduce Pattern 2: ``[<F-chain with reduce_step>, reduce_close]``.
+
+    The outer P dim is consumed by ``_wrap_dims``. The F dim is handled
+    here: F-block → F-tile → BodyLeaf(reduce_step) writes each tile's
+    partial sum into a distinct slot of the op-local ``slot_vec``. After
+    the F loop exits, ``reduce_close`` folds the slot vector via a
+    single ``nisa.tensor_reduce`` into the op's ``(P, 1)`` output.
+    """
+    f_dim = op.axis_map["F"]
+    f_role = op.dim_role[f_dim]
+    num_f = dims[f_dim].num_tiles
+    reduce_op = op.op_kwargs["reduce_op"]
+    reduce_leaf = _make_leaf(op, "reduce_step")
+    f_tile = LoopNode(dim_id=f_dim, trip_count=1, role=f_role, children=[reduce_leaf], reduce_op=reduce_op)
+    f_block = LoopNode(dim_id=f_dim, trip_count=num_f, role=f_role, children=[f_tile], reduce_op=reduce_op)
+    return [f_block, _make_leaf(op, "reduce_close")]
+
+
+def _assign_canonical_names(node: "LoopNode | BodyLeaf", same_dim_counts: dict[str, int]) -> None:
+    """Walk the tree in a root-outward DFS, naming each LoopNode.
+
+    ``same_dim_counts[d]`` tracks how many same-dim ancestors of ``d``
+    are already open on the current path; the newly visited node takes
+    that as its ordinal, emits a name, then recurses with the counter
+    incremented. Restoring the counter after recursion means siblings
+    see the same counts the parent did (they are not each other's
+    ancestors).
+    """
+    if isinstance(node, BodyLeaf):
+        return
+    k = same_dim_counts.get(node.dim_id, 0)
+    node.name = f"i_{node.dim_id}_{k}"
+    same_dim_counts[node.dim_id] = k + 1
+    for child in node.children:
+        _assign_canonical_names(child, same_dim_counts)
+    same_dim_counts[node.dim_id] = k
+
+
+_LEAF_BUILDERS: dict[str, Callable[[_ParsedOp, dict[str, DimInfo]], list[LoopNode | BodyLeaf]]] = {
+    "NKIMatmul": _build_leaves_matmul,
+    "NKIActivationReduce": _build_leaves_activation_reduce,
+}
+"""Dispatch table: op-class name → deepest-children builder."""
+
+_BUILDER_INTERIOR_DIMS: dict[str, Callable[[_ParsedOp], set[str]]] = {
+    "NKIMatmul": lambda op: {op.axis_map["K"]},
+    "NKIActivationReduce": lambda op: {op.axis_map["F"]},
+}
+"""Maps op-class name to a callable ``(op) -> set[dim_id]`` of dims that
+the custom leaf builder handles internally (so the outer wrap skips them)."""

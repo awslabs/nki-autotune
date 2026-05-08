@@ -1,7 +1,7 @@
 """Driver for the ``"tune"`` stage of ``nkigym_compile``.
 
 Loads the synthesised ``f_nkigym``, builds the canonical
-:class:`LoopForest`, then dispatches on ``rewrites``:
+:class:`KernelModule`, then dispatches on ``rewrites``:
 
 * ``rewrites`` is a list → **explicit path** — apply each rewrite in
   order, render to ``kernel_tuned.py``, CPU-sim-check inline. No HW
@@ -23,13 +23,25 @@ import numpy as np
 
 from autotune.runner.api import remote_profile
 from autotune.runner.types import KernelJob
-from nkigym.codegen.graph import OpGraph, parse_and_resolve
-from nkigym.codegen.loop_forest import LoopForest, build_canonical_forest
+from nkigym.codegen.canonical import build_canonical_module
+from nkigym.codegen.ir import KernelModule
 from nkigym.codegen.render import render
 from nkigym.tune import KernelRewrite
 from nkigym.tune.batch import enumerate_pool, sample_pool
 
 _MAX_POOL_MULTIPLIER = 100
+
+
+def _adapt_specs(input_specs: dict[str, tuple[tuple[int, ...], str]]) -> dict[str, dict]:
+    """Convert tuple-form input specs to dict-form expected by canonical builder.
+
+    Args:
+        input_specs: ``{name: (shape_tuple, dtype_str)}``.
+
+    Returns:
+        ``{name: {"shape": shape_tuple, "dtype": dtype_str}}``.
+    """
+    return {name: {"shape": shape, "dtype": dtype} for name, (shape, dtype) in input_specs.items()}
 
 
 def run_tune(
@@ -90,8 +102,7 @@ def run_tune(
             f"or place the file manually before invoking this stage."
         )
     f_nkigym = load_f_nkigym(f_nkigym_path)
-    op_graph = parse_and_resolve(f_nkigym, input_specs)
-    forest = build_canonical_forest(op_graph)
+    module = build_canonical_module(f_nkigym, _adapt_specs(input_specs))
 
     if rewrites is None:
         _run_batch(
@@ -99,8 +110,7 @@ def run_tune(
             f_nkigym=f_nkigym,
             input_specs=input_specs,
             cache_path=cache_path,
-            op_graph=op_graph,
-            forest=forest,
+            module=module,
             seed=seed,
             num_kernels=num_kernels,
             hosts=hosts,
@@ -118,8 +128,7 @@ def run_tune(
             f_nkigym=f_nkigym,
             input_specs=input_specs,
             cache_path=cache_path,
-            op_graph=op_graph,
-            forest=forest,
+            module=module,
             rewrites=rewrites,
             cpu_sim_check=cpu_sim_check,
         )
@@ -131,17 +140,16 @@ def _run_explicit(
     f_nkigym: Callable[..., np.ndarray],
     input_specs: dict[str, tuple[tuple[int, ...], str]],
     cache_path: Path,
-    op_graph: OpGraph,
-    forest: LoopForest,
+    module: KernelModule,
     rewrites: list[KernelRewrite],
     cpu_sim_check: Callable[[str, str, Callable[..., np.ndarray], dict[str, tuple[tuple[int, ...], str]]], None],
 ) -> None:
     """Apply ``rewrites`` deterministically and CPU-sim-check the result."""
     for r in rewrites:
-        if not r.is_legal(op_graph, forest):
+        if not r.is_legal(module):
             raise ValueError(f"{r!r} illegal on current state")
-        op_graph, forest = r.apply(op_graph, forest)
-    kernel_source = render(op_graph, forest=forest)
+        module = r.apply(module)
+    kernel_source = render(module)
     (cache_path / "kernel_tuned.py").write_text(kernel_source)
     cpu_sim_check(kernel_source, f_nkigym.__name__, f_numpy, input_specs)
 
@@ -152,8 +160,7 @@ def _run_batch(
     f_nkigym: Callable[..., np.ndarray],
     input_specs: dict[str, tuple[tuple[int, ...], str]],
     cache_path: Path,
-    op_graph: OpGraph,
-    forest: LoopForest,
+    module: KernelModule,
     seed: int,
     num_kernels: int,
     hosts: list[str],
@@ -167,15 +174,15 @@ def _run_batch(
 ) -> None:
     """Enumerate the rewrite pool, render ``num_kernels`` samples, profile on HW."""
     rng = random.Random(seed)
-    pool = enumerate_pool(op_graph=op_graph, forest=forest, max_pool_size=_MAX_POOL_MULTIPLIER * num_kernels, rng=rng)
+    pool = enumerate_pool(module=module, max_pool_size=_MAX_POOL_MULTIPLIER * num_kernels, rng=rng)
     sampled = sample_pool(pool, num_kernels=num_kernels, rng=rng)
 
     output_shape = trace_output_shape(f_numpy, input_specs)
     nkigym_source = (cache_path / "f_nkigym.py").read_text()
 
     kernels: dict[str, KernelJob] = {}
-    for idx, (og, f) in enumerate(sampled):
-        source = render(og, forest=f)
+    for idx, sampled_module in enumerate(sampled):
+        source = render(sampled_module)
         name = f"kernel_tuned_{idx:04d}.py"
         (cache_path / name).write_text(source)
         kernels[name] = KernelJob(
