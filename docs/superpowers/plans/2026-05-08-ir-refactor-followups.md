@@ -3,14 +3,30 @@
 **Parent spec:** `docs/superpowers/specs/2026-05-08-ir-and-transforms-refactor-design.md`
 **Parent plan:** `docs/superpowers/plans/2026-05-08-ir-and-transforms-refactor.md`
 **Created:** 2026-05-08
+**Updated:** 2026-05-08 — Bug #3, Bug #2, Task 23, Tasks 22+24 landed on `dev_1`. Bug #1 + Task 25 deferred pending design.
 
 Followups from the IR + transforms refactor. Unit-test suite shipped green (86/86); MFU gate on `matmul_lhsT_rhs` exposed a cluster of atom-composition bugs. Five were fixed in-session; three remain open. Two renderer-split tasks from the parent plan were also deferred.
+
+## Progress
+
+| Item | Status | Commit |
+|------|--------|--------|
+| Bug #3 — Split canonical-rename | Landed | `7651246` |
+| Bug #2 — MultiBuffer apply-time re-validation | Landed | `c88caad` |
+| Task 23 — PlaceBuffers pass extraction | Landed | `315a8ee` |
+| Tasks 22 + 24 — LowerPhases / InjectMultiBuffer / InjectSoftwarePipeline | Landed | `4e7522f` |
+| Bug #1 — DecomposeReduction divergence | Deferred | — |
+| Task 25 — LowerDecomposedReduction pass | Deferred | — |
 
 ---
 
 ## Open composition bugs (MFU gate blockers)
 
 Shared root cause across all three: **per-atom legality checks local structure, not cross-atom semantic invariants**. Each bug needs either a tighter `is_legal`, a post-apply validator, or a repair-pass in the lowering pipeline. 3/100 sampled kernels pass CPU sim today; each fix should lift that materially.
+
+### Design note — Bug #1 blocker (2026-05-08)
+
+`_body_matmul_psum_init` emits `psum_tile = nl.ndarray(...)` as a Python-local binding inside the init leaf's body. After `DecomposeReduction` splits into init/update/drain siblings, the init tree rebinds `psum_tile` per `(m, n)` iteration — ending pointed at the last iter's allocation — so the update tree's `nc_matmul(dst=psum_tile, ...)` calls all land in the final slot. The bug exists independently of any later `Reorder`; decomposition alone is sufficient to break PSUM scope. Option 1 (coupled-rewrite atoms) and Option 2 (widened accumulator) both require re-plumbing how PSUM is named/sized — Option 2 hits the Trn2 2 MiB PSUM ceiling for 2048³ matmul when naively sized per full-tile-count, so the fix requires either per-tree LCA-scoped PSUM shapes or a rewrite-space constraint on DecomposeReduction inputs. Design session needed before implementation.
 
 ### 1. DecomposeReduction + Reorder phase-tree divergence
 
@@ -62,13 +78,23 @@ Canonicalize dim_roles on post-fission trees. This is the natural home for follo
 
 ---
 
+## New followups surfaced during 2026-05-08 implementation pass
+
+- **Align `ComputeAt` / `ReverseComputeAt` on `AtomLegalityError`.** Both raise bare `ValueError` on their similar stale-target re-resolve failures (`compute_at.py:69`, `reverse_compute_at.py:74`). `batch.py` now catches `AtomLegalityError` but crashes on `ValueError`. Port the two sites for a unified staleness channel.
+- **Cycle-break cleanup in `lowering/`.** `emit_source.py` imports `_emit_pipelined_loop` and `_BODY_EMITTERS` at module bottom with `# noqa: E402`; `inject_software_pipeline.py` aliases `emit_source as _es` for late-bound `_es._emit_vanilla_loop`. Cleaner path: expose `effective_pipeline_depth(node, module)` from `inject_software_pipeline.py` so `_emit_node`'s dispatch decides vanilla vs pipelined without the pipelined emitter needing to call back.
+- **Standardize private-vs-public naming in `lowering/`.** `_BODY_EMITTERS`, `_emit_pipelined_loop`, `_Writer`, `_sbuf_name`, `_hbm_name` are underscore-private but imported across module boundaries. Either drop the underscore (matching `slot_expr`/`sbuf_tile_slice` in `inject_multi_buffer.py`) or declare them via `__all__`.
+- **Body emitter type annotations.** The 11 body emitters in `lower_phases.py` lack parameter type hints — only return type is annotated. `_BODY_EMITTERS: dict[tuple[str, str], Callable]` uses bare `Callable`; a `Protocol` matching the emitter signature would tighten the registry.
+
 ## Suggested order
 
-1. **Bug #3 (Split canonical-rename)** — smallest, no dependency on other work.
-2. **Bug #2 (MultiBuffer apply-time re-validation)** — follow the `_find_node_path` pattern from Task 19b.
-3. **Task 23 (PlaceBuffers extraction)** — sets up shared LCA/required-tiles infrastructure.
-4. **Task 25 (LowerDecomposedReduction)** — home for bug #1's fix.
-5. **Bug #1 (DecomposeReduction divergence)** — uses the Task 25 pass.
-6. **Tasks 22, 24** — cosmetic cleanup, no bug-fix coupling.
+~~1. Bug #3 (Split canonical-rename) — smallest, no dependency on other work.~~ **Landed `7651246`.**
+~~2. Bug #2 (MultiBuffer apply-time re-validation) — follow the `_find_node_path` pattern from Task 19b.~~ **Landed `c88caad`.**
+~~3. Task 23 (PlaceBuffers extraction) — sets up shared LCA/required-tiles infrastructure.~~ **Landed `315a8ee`.**
+~~6. Tasks 22, 24 — cosmetic cleanup, no bug-fix coupling.~~ **Landed `4e7522f`.**
 
-Expected MFU-gate progression: fixing #3 alone should bring ~10–30/100 kernels to CPU-sim pass; #2 another meaningful chunk; #1 closes the gap to SOTA.
+Remaining:
+1. **Bug #1 design session** — resolve the PSUM scope problem (naming/sizing) before attempting Task 25 or coupled-rewrite atoms.
+2. **Task 25 (LowerDecomposedReduction)** — home for Bug #1's fix, once design lands.
+3. **Bug #1 (DecomposeReduction divergence)** — uses the Task 25 pass.
+
+Expected MFU-gate progression: fixing #3 alone should bring ~10–30/100 kernels to CPU-sim pass; #2 another meaningful chunk; #1 closes the gap to SOTA. Measurement pending on `dev_1` after landed work.
