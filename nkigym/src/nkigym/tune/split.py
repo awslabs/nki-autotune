@@ -36,7 +36,20 @@ class Split:
         return result
 
     def apply(self, module: KernelModule) -> KernelModule:
-        """Replace target with one or two sibling (outer, inner) nests."""
+        """Replace target with one or two sibling (outer, inner) nests.
+
+        The new outer/inner LoopNodes carry ``name=None`` at construction,
+        and Split's ``deepcopy`` of the target's children preserves their
+        existing canonical names. Without a canonical-rename pass, the
+        renderer's ``len(existing)``-based name fallback would collide
+        with those preserved child names (see followup doc, Bug #3).
+        Canonical-rename is therefore applied across the whole body
+        before returning, matching the post-apply contract of
+        ``ComputeAt``, ``ReverseComputeAt``, ``HoistInvariant``, and
+        ``DecomposeReduction``.
+        """
+        from nkigym.tune.compute_at import _rename_canonical
+
         target = resolve_node(module.body, self.loop_path)
         assert isinstance(target, LoopNode)
         n = target.trip_count
@@ -49,6 +62,7 @@ class Split:
         if tail_iters > 0:
             replacement.append(_make_split_pair(target, outer_trip=1, inner_trip=tail_iters))
         new_body = _replace_with_siblings(module.body, self.loop_path, replacement)
+        new_body = _rename_canonical(new_body)
         return replace(module, body=new_body)
 
 
