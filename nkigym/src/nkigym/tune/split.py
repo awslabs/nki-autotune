@@ -1,16 +1,17 @@
-"""``Split`` rewrite — split a loop into outer x inner; emit tail pair if needed.
+"""``Split`` rewrite — split a loop into outer x inner by a divisor factor.
 
-When ``factor`` does not divide ``trip_count``, two sibling nests are emitted
-at the split site: the "full" pair (``floor(N/factor)`` outer iters of
-``factor`` inner trip each) and the "tail" pair (1 outer iter of
-``N % factor`` inner trip). Matches TVM's ``LoopPartition`` semantics —
-no predication, separate loops.
+``factor`` must divide ``trip_count``; non-divisor factors are rejected at
+``is_legal`` and raise :class:`AtomLegalityError` at ``apply``. The older
+tail-sibling emission (two sibling nests for non-divisor factors) is gone —
+it violated the 1N canonical form invariant; see spec
+``docs/superpowers/specs/2026-05-08-canonical-1N-and-computeat-partial-coverage-design.md``.
 """
 
 from copy import deepcopy
 from dataclasses import dataclass, replace
 
 from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, TreeIR, resolve_node
+from nkigym.tune import AtomLegalityError
 
 
 @dataclass(frozen=True)
@@ -26,27 +27,28 @@ class Split:
     factor: int
 
     def is_legal(self, module: KernelModule) -> bool:
-        """Target must be a LoopNode; ``factor`` must be positive."""
+        """Target must be a LoopNode; ``factor`` must be a positive divisor of ``trip_count``."""
         result: bool
         if self.factor < 1:
             result = False
         else:
             target = resolve_node(module.body, self.loop_path)
-            result = isinstance(target, LoopNode)
+            if not isinstance(target, LoopNode):
+                result = False
+            else:
+                result = target.trip_count % self.factor == 0
         return result
 
     def apply(self, module: KernelModule) -> KernelModule:
-        """Replace target with one or two sibling (outer, inner) nests.
+        """Replace target with a single outer × inner pair.
 
-        The new outer/inner LoopNodes carry ``name=None`` at construction,
-        and Split's ``deepcopy`` of the target's children preserves their
-        existing canonical names. Without a canonical-rename pass, the
-        renderer's ``len(existing)``-based name fallback would collide
-        with those preserved child names (see followup doc, Bug #3).
-        Canonical-rename is therefore applied across the whole body
-        before returning, matching the post-apply contract of
-        ``ComputeAt``, ``ReverseComputeAt``, ``HoistInvariant``, and
-        ``DecomposeReduction``.
+        Rejects non-divisor factors via :class:`AtomLegalityError` — the
+        old tail-sibling emission path is gone. Tail-siblings violated
+        the 1N invariant (sibling subtrees with the same dim and
+        mismatched trips make downstream atoms brittle; see spec
+        `docs/superpowers/specs/2026-05-08-canonical-1N-and-computeat-partial-coverage-design.md`).
+        Canonical-rename runs across the whole body after replacement,
+        matching the post-apply contract of ``ComputeAt`` et al.
         """
         from nkigym.tune.compute_at import _rename_canonical
 
@@ -54,13 +56,10 @@ class Split:
         assert isinstance(target, LoopNode)
         n = target.trip_count
         f = self.factor
-        full_iters = n // f
-        tail_iters = n % f
-        replacement: list[LoopNode | BodyLeaf] = []
-        if full_iters > 0:
-            replacement.append(_make_split_pair(target, outer_trip=full_iters, inner_trip=f))
-        if tail_iters > 0:
-            replacement.append(_make_split_pair(target, outer_trip=1, inner_trip=tail_iters))
+        if n % f != 0:
+            raise AtomLegalityError(f"Split.apply: factor {f} does not divide trip_count {n} at {self.loop_path}")
+        outer_trip = n // f
+        replacement = [_make_split_pair(target, outer_trip=outer_trip, inner_trip=f)]
         new_body = _replace_with_siblings(module.body, self.loop_path, replacement)
         new_body = _rename_canonical(new_body)
         return replace(module, body=new_body)
@@ -113,8 +112,9 @@ def _replace_with_siblings(body: TreeIR, path: tuple[int, ...], replacement: lis
 def enumerate_split_atoms(module: KernelModule) -> list[Split]:
     """Emit one atom per (LoopNode, divisor factor > 1 and < trip_count).
 
-    Only emits divisors to keep the search space tractable; non-divisor
-    splits are still legal at apply-time but are not proposed by default.
+    Only divisor factors are legal under the current contract; non-divisor
+    factors are rejected at both ``is_legal`` and ``apply`` time (see
+    :class:`Split`).
     """
     atoms: list[Split] = []
 
