@@ -626,15 +626,20 @@ def _dims_to_wrap(op: _ParsedOp) -> tuple[str, ...]:
 def _wrap_dims(
     wrap: tuple[str, ...], op: _ParsedOp, dims: dict[str, DimInfo], inner_children: list[LoopNode | BodyLeaf]
 ) -> LoopNode:
-    """Wrap ``inner_children`` in a 2N-per-dim chain over ``wrap``."""
+    """Wrap ``inner_children`` in a 1N-per-dim chain over ``wrap``.
+
+    Each dim contributes one ``LoopNode`` with ``trip_count = num_tiles``.
+    The outer wrapper matches the dim ordering in ``touched_dims``
+    (outermost first). Arithmetic-intensity dials (tiles-per-block)
+    live in ``Split``, not here.
+    """
     if not wrap:
         raise ValueError(f"Op {op.idx}: cannot build tree — no touched_dims to wrap")
     node_children: list[LoopNode | BodyLeaf] = inner_children
     for d in reversed(wrap):
         role = op.dim_role[d]
         num_t = dims[d].num_tiles
-        tile_node = LoopNode(dim_id=d, trip_count=1, role=role, children=node_children)
-        block_node = LoopNode(dim_id=d, trip_count=num_t, role=role, children=[tile_node])
+        block_node = LoopNode(dim_id=d, trip_count=num_t, role=role, children=node_children)
         node_children = [block_node]
     head = node_children[0]
     assert isinstance(head, LoopNode)
@@ -660,39 +665,38 @@ def _build_leaves_default(op: _ParsedOp, dims: dict[str, DimInfo]) -> list[LoopN
 
 
 def _build_leaves_matmul(op: _ParsedOp, dims: dict[str, DimInfo]) -> list[LoopNode | BodyLeaf]:
-    """Matmul: ``[psum_init leaf, <K chain ending in compute leaf>, drain leaf]``.
+    """Matmul: ``[psum_init leaf, <K loop with compute leaf>, drain leaf]``.
 
     The outer M and N dims are consumed by ``_wrap_dims``. The K dim is
     handled here so the body placement mirrors the physical kernel:
-    PSUM init lives outside K, ``nc_matmul`` fires inside K, drain
-    runs after K closes. The K-chain LoopNodes carry ``reduce_op="add"``
-    because nc_matmul's PSUM accumulator is summation.
+    PSUM init lives outside K, ``nc_matmul`` fires inside K, drain runs
+    after K closes. The K loop carries ``reduce_op="add"`` because
+    nc_matmul's PSUM accumulator is summation.
     """
     k_dim = op.axis_map["K"]
     k_role = op.dim_role[k_dim]
     num_k = dims[k_dim].num_tiles
     compute_leaf = _make_leaf(op, "compute")
-    k_tile = LoopNode(dim_id=k_dim, trip_count=1, role=k_role, children=[compute_leaf], reduce_op="add")
-    k_block = LoopNode(dim_id=k_dim, trip_count=num_k, role=k_role, children=[k_tile], reduce_op="add")
+    k_block = LoopNode(dim_id=k_dim, trip_count=num_k, role=k_role, children=[compute_leaf], reduce_op="add")
     return [_make_leaf(op, "psum_init"), k_block, _make_leaf(op, "drain")]
 
 
 def _build_leaves_activation_reduce(op: _ParsedOp, dims: dict[str, DimInfo]) -> list[LoopNode | BodyLeaf]:
-    """ActivationReduce Pattern 2: ``[<F-chain with reduce_step>, reduce_close]``.
+    """ActivationReduce Pattern 2: ``[<F loop with reduce_step>, reduce_close]``.
 
     The outer P dim is consumed by ``_wrap_dims``. The F dim is handled
-    here: F-block → F-tile → BodyLeaf(reduce_step) writes each tile's
-    partial sum into a distinct slot of the op-local ``slot_vec``. After
-    the F loop exits, ``reduce_close`` folds the slot vector via a
-    single ``nisa.tensor_reduce`` into the op's ``(P, 1)`` output.
+    here: one F loop holds the per-tile ``reduce_step`` BodyLeaf that
+    writes each tile's partial sum into a distinct slot of the op-local
+    ``slot_vec``. After the F loop exits, ``reduce_close`` folds the
+    slot vector via one ``nisa.tensor_reduce`` into the op's ``(P, 1)``
+    output.
     """
     f_dim = op.axis_map["F"]
     f_role = op.dim_role[f_dim]
     num_f = dims[f_dim].num_tiles
     reduce_op = op.op_kwargs["reduce_op"]
     reduce_leaf = _make_leaf(op, "reduce_step")
-    f_tile = LoopNode(dim_id=f_dim, trip_count=1, role=f_role, children=[reduce_leaf], reduce_op=reduce_op)
-    f_block = LoopNode(dim_id=f_dim, trip_count=num_f, role=f_role, children=[f_tile], reduce_op=reduce_op)
+    f_block = LoopNode(dim_id=f_dim, trip_count=num_f, role=f_role, children=[reduce_leaf], reduce_op=reduce_op)
     return [f_block, _make_leaf(op, "reduce_close")]
 
 
