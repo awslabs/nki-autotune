@@ -207,20 +207,13 @@ def _emit_pipelined_leaf(
 ) -> None:
     """Emit one node under a pipelined loop.
 
-    LoopNode children (any ``trip_count``) descend transparently. The
-    pipelined skew lives at BodyLeaf granularity: each leaf's stage —
-    assigned across the whole subtree by :func:`assign_stages` — drives
-    the stage-gate and iteration offset, regardless of how many inner
-    loops wrap it. Trivial ``trip_count == 1`` LoopNodes skip the
-    ``for`` header and bind their loop variable to the literal ``"0"``;
-    non-trivial LoopNodes emit a normal ``for`` header with their
-    loop variable name pushed onto ``path_names``. Either way, children
-    are emitted under the same stage-gate + constant-bind state.
-    Non-trivial descent is required because ``FuseLoops`` produces
-    canonical 2N forms (``Loop(d,N) -> Loop(d,1) -> body``) where the
-    pipelined dim's trivial wrapper hides deeper non-pipelined loops
-    (e.g. load's inner free-axis loop) that still need to run once per
-    pipelined iter. Before descending we call
+    LoopNode children descend transparently: emit a vanilla ``for``
+    header and recurse. The pipelined skew lives at BodyLeaf
+    granularity: each leaf's stage — assigned across the whole subtree
+    by :func:`assign_stages` — drives the stage-gate and iteration
+    offset, regardless of how many inner loops wrap it. Canonical 1N
+    IR guarantees every LoopNode has ``trip_count >= 2``, so no
+    trivial-wrapper branch is needed. Before descending we call
     :func:`_subtree_has_firing_leaf` to skip subtrees whose leaves are
     all gated out — emitting an empty ``for`` block would produce
     invalid Python.
@@ -248,32 +241,6 @@ def _emit_pipelined_leaf(
         if not _subtree_has_firing_leaf(child, stages, fire_if_stage_le, fire_if_stage_gt):
             return
         existing = path_names.setdefault(child.dim_id, [])
-        if child.trip_count == 1:
-            """Trivial trip=1 loop: skip for-header emission, bind var to
-            literal ``"0"`` so inner slot expressions see the single
-            valid iteration index."""
-            existing.append("0")
-            path_trips.setdefault(child.dim_id, []).append(1)
-            try:
-                for grandchild in child.children:
-                    _emit_pipelined_leaf(
-                        w,
-                        module,
-                        grandchild,
-                        path_names,
-                        path_trips,
-                        stages,
-                        dim_id,
-                        constant_loop_var,
-                        fire_if_stage_le,
-                        fire_if_stage_gt,
-                    )
-            finally:
-                path_trips[child.dim_id].pop()
-                existing.pop()
-            return
-        """Non-trivial inner loop: emit the ``for`` header as vanilla;
-        inner body leaves still honor the outer pipelined stage-gate."""
         loop_var = child.name if child.name is not None else f"i_{child.dim_id}_{len(existing)}"
         w.line(f"for {loop_var} in range({child.trip_count}):")
         w.indent()
