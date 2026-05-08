@@ -1,14 +1,21 @@
 """Render orchestrator — runs lowering passes in order.
 
-Stages (Tasks 22-25 extract each as a separate pass; until then the
-work is fully consolidated inside :mod:`nkigym.codegen.lowering.emit_source`):
+The lowering pipeline is split across
+:mod:`nkigym.codegen.lowering`:
 
-1. LowerDecomposedReduction — canonicalize post-fission reducer trees.
-2. InjectMultiBuffer — Tensor.buffer_degree -> allocation shapes + slot exprs.
-3. InjectSoftwarePipeline — LoopNode.pipeline_depth -> prologue/body/epilogue.
-4. LowerPhases — (op_cls, phase) -> ISA call-site snippet.
-5. PlaceBuffers — LCA walk -> buffer shape + position + allocator addresses.
-6. EmitSource — textual NKI Python emission.
+1. :mod:`place_buffers` — buffer shapes + slot counts from the LCA walk.
+2. :mod:`inject_multi_buffer` — slot-index expressions for the buffer
+   degrees set by the ``MultiBuffer`` rewrite.
+3. :mod:`inject_software_pipeline` — prologue/body/epilogue emission
+   for LoopNodes with ``pipeline_depth > 1``.
+4. :mod:`lower_phases` — per-``(op_cls, phase)`` ISA call-site emission.
+5. :mod:`emit_source` — top-level forest walker; produces the NKI
+   source string.
+
+The :func:`render` entry point composes these passes through
+:func:`nkigym.codegen.lowering.emit_source.emit_source`; the body
+emitters and pipelined walker are wired up via cross-module imports
+inside ``emit_source``.
 """
 
 from nkigym.codegen.ir import KernelModule
@@ -18,9 +25,5 @@ __all__ = ["render", "render_annotated"]
 
 
 def render(module: KernelModule) -> str:
-    """Render the :class:`KernelModule` to NKI source.
-
-    Runs all six passes; current implementation collapses them into
-    :func:`emit_source` until Tasks 22-25 extract each.
-    """
+    """Render the :class:`KernelModule` to NKI source."""
     return emit_source(module)
