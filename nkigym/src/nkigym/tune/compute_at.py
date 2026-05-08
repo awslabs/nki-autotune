@@ -19,6 +19,7 @@ After apply, all :class:`LoopNode` names are re-assigned canonically as
 from dataclasses import dataclass, replace
 
 from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, TreeIR, leaves_under, resolve_node
+from nkigym.tune import AtomLegalityError
 
 
 @dataclass(frozen=True)
@@ -70,9 +71,21 @@ class ComputeAt:
                 f"ComputeAt.apply: target LoopNode was consumed by removal — "
                 f"leaf_path={self.leaf_path}, target_loop_path={self.target_loop_path}"
             )
-        ancestor_dims = _ancestor_dims(body_without, new_target_path)
+        ancestor_products = _ancestor_trip_products(body_without, new_target_path)
         leaf_dims = list(leaf.dim_role.keys())
-        needed = [d for d in leaf_dims if d not in ancestor_dims]
+        needed: list[tuple[str, int]] = []
+        for d in leaf_dims:
+            covered = ancestor_products.get(d, 1)
+            num_t = module.dims[d].num_tiles
+            if num_t == covered:
+                continue
+            if num_t % covered != 0:
+                raise AtomLegalityError(
+                    f"ComputeAt.apply: ancestor coverage {covered} does not divide num_tiles[{d!r}]={num_t}"
+                )
+            residual = num_t // covered
+            if residual > 1:
+                needed.append((d, residual))
         regenerated = _wrap_leaf_with_dims(leaf, needed, module)
         new_body = _append_under(body_without, new_target_path, regenerated)
         new_body = _rename_canonical(new_body)
@@ -150,29 +163,12 @@ def _remove_at_path(body: TreeIR, path: tuple[int, ...]) -> TreeIR:
     return [*body[:idx], new_parent, *body[idx + 1 :]]
 
 
-def _ancestor_dims(body: TreeIR, path: tuple[int, ...]) -> set[str]:
-    """Return ``dim_id``s of every LoopNode along ``path`` from body root."""
-    dims: set[str] = set()
-    siblings: list[LoopNode | BodyLeaf] = list(body)
-    for idx in path:
-        if idx >= len(siblings):
-            break
-        node = siblings[idx]
-        if isinstance(node, LoopNode):
-            dims.add(node.dim_id)
-            siblings = node.children
-        else:
-            break
-    return dims
-
-
 def _ancestor_trip_products(body: TreeIR, path: tuple[int, ...]) -> dict[str, int]:
     """Product of trip_counts per dim_id along ``path`` from body root.
 
-    Walks the same path as :func:`_ancestor_dims` but multiplies each
-    ancestor LoopNode's trip_count into a per-dim accumulator. Dims
-    not on the path are absent from the result (callers treat absence
-    as coverage of 1).
+    Walks each ancestor LoopNode along ``path`` and multiplies
+    trip_counts into a per-dim accumulator. Dims not on the path are
+    absent from the result (callers treat absence as coverage of 1).
     """
     products: dict[str, int] = {}
     siblings: list[LoopNode | BodyLeaf] = list(body)
@@ -188,20 +184,22 @@ def _ancestor_trip_products(body: TreeIR, path: tuple[int, ...]) -> dict[str, in
     return products
 
 
-def _wrap_leaf_with_dims(leaf: BodyLeaf, dims: list[str], module: KernelModule) -> LoopNode | BodyLeaf:
-    """Wrap ``leaf`` in the canonical 2N-per-dim chain over ``dims``.
+def _wrap_leaf_with_dims(leaf: BodyLeaf, dim_trips: list[tuple[str, int]], module: KernelModule) -> LoopNode | BodyLeaf:
+    """Wrap ``leaf`` in one LoopNode per ``(dim, trip)`` entry (1N form).
 
-    Returns ``leaf`` directly when ``dims`` is empty.
+    Outermost-first. ``module`` is unused by the helper itself (trip
+    comes from the caller); retained in the signature for call-site
+    symmetry — callers passing the enclosing module don't need to be
+    revised on every helper tweak. Returns ``leaf`` directly when
+    ``dim_trips`` is empty.
     """
-    if not dims:
+    _ = module
+    if not dim_trips:
         return leaf
     node: LoopNode | BodyLeaf = leaf
-    for d in reversed(dims):
+    for d, trip in reversed(dim_trips):
         role = leaf.dim_role[d]
-        num_t = module.dims[d].num_tiles
-        tile_node = LoopNode(dim_id=d, trip_count=1, role=role, children=[node])
-        block_node = LoopNode(dim_id=d, trip_count=num_t, role=role, children=[tile_node])
-        node = block_node
+        node = LoopNode(dim_id=d, trip_count=trip, role=role, children=[node])
     return node
 
 

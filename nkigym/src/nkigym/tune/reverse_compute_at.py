@@ -12,6 +12,7 @@ implementation.
 from dataclasses import dataclass, replace
 
 from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, leaves_under, resolve_node
+from nkigym.tune import AtomLegalityError
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ class ReverseComputeAt:
     def apply(self, module: KernelModule) -> KernelModule:
         """Remove leaf; regenerate uncovered dims under target; insert; canonical-rename."""
         from nkigym.tune.compute_at import (
-            _ancestor_dims,
+            _ancestor_trip_products,
             _append_under,
             _find_node_path,
             _remove_at_path,
@@ -75,9 +76,21 @@ class ReverseComputeAt:
                 f"ReverseComputeAt.apply: target LoopNode was consumed by removal — "
                 f"leaf_path={self.leaf_path}, target_loop_path={self.target_loop_path}"
             )
-        ancestor_dims = _ancestor_dims(body_without, new_target_path)
+        ancestor_products = _ancestor_trip_products(body_without, new_target_path)
         leaf_dims = list(leaf.dim_role.keys())
-        needed = [d for d in leaf_dims if d not in ancestor_dims]
+        needed: list[tuple[str, int]] = []
+        for d in leaf_dims:
+            covered = ancestor_products.get(d, 1)
+            num_t = module.dims[d].num_tiles
+            if num_t == covered:
+                continue
+            if num_t % covered != 0:
+                raise AtomLegalityError(
+                    f"ReverseComputeAt.apply: ancestor coverage {covered} does not divide num_tiles[{d!r}]={num_t}"
+                )
+            residual = num_t // covered
+            if residual > 1:
+                needed.append((d, residual))
         regenerated = _wrap_leaf_with_dims(leaf, needed, module)
         new_body = _append_under(body_without, new_target_path, regenerated)
         new_body = _rename_canonical(new_body)
