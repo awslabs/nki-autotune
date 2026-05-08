@@ -3,9 +3,9 @@
 **Parent spec:** `docs/superpowers/specs/2026-05-08-ir-and-transforms-refactor-design.md`
 **Parent plan:** `docs/superpowers/plans/2026-05-08-ir-and-transforms-refactor.md`
 **Created:** 2026-05-08
-**Updated:** 2026-05-08 — Bug #3, Bug #2, Task 23, Tasks 22+24 landed on `dev_1`. Bug #1 + Task 25 deferred pending design.
+**Updated:** 2026-05-08 — Bug A (ComputeAt/ReverseComputeAt partial-coverage regen) + canonical 1N migration + tail-sibling ban landed on `dev_1`. Bug #3, Bug #2, Task 23, Tasks 22+24 already landed earlier. Bug #1 + Task 25 deferred pending design. Bug B (SoftwarePipeline + required_tiles pipeline-skew widening) is the remaining open MFU-gate blocker.
 
-Followups from the IR + transforms refactor. Unit-test suite shipped green (86/86); MFU gate on `matmul_lhsT_rhs` exposed a cluster of atom-composition bugs. Five were fixed in-session; three remain open. Two renderer-split tasks from the parent plan were also deferred.
+Followups from the IR + transforms refactor. Unit-test suite shipped green (86/86 → 106/106 after Bug A trio); MFU gate on `matmul_lhsT_rhs` exposed a cluster of atom-composition bugs. Bug A fix lifted CPU-sim pass rate from 3/100 → 20/100 sampled kernels.
 
 ## Progress
 
@@ -15,8 +15,11 @@ Followups from the IR + transforms refactor. Unit-test suite shipped green (86/8
 | Bug #2 — MultiBuffer apply-time re-validation | Landed | `c88caad` |
 | Task 23 — PlaceBuffers pass extraction | Landed | `315a8ee` |
 | Tasks 22 + 24 — LowerPhases / InjectMultiBuffer / InjectSoftwarePipeline | Landed | `4e7522f` |
+| Bug A — ComputeAt/ReverseComputeAt partial-coverage regen | Landed | `13946ca` |
+| Canonical 1N migration + tail-sibling ban | Landed | `ba20be5`, `ccbffa5` |
 | Bug #1 — DecomposeReduction divergence | Deferred | — |
 | Task 25 — LowerDecomposedReduction pass | Deferred | — |
+| Bug B — SoftwarePipeline required_tiles pipeline-skew widening | Open | — |
 
 ---
 
@@ -80,6 +83,7 @@ Canonicalize dim_roles on post-fission trees. This is the natural home for follo
 
 ## New followups surfaced during 2026-05-08 implementation pass
 
+- **Bug A fixed + 1N canonical landed.** `_ancestor_dims` (presence-only set) replaced with `_ancestor_trip_products` (per-dim multiplicative accumulation). `ComputeAt.apply` / `ReverseComputeAt.apply` now regenerate a `L(d, num_tiles/covered)` residual inner loop when an ancestor partially covers a leaf dim, and raise `AtomLegalityError` on indivisible residuals. Canonical builder emits 1N trees (no trip-1 tile partner). `Split.is_legal` + `Split.apply` reject non-divisor factors via `AtomLegalityError` (tail-sibling emission path removed — violated the 1N invariant). Pipelined emitter's unreachable trip-1 descent branch deleted. See spec `docs/superpowers/specs/2026-05-08-canonical-1N-and-computeat-partial-coverage-design.md`. MFU-gate progression: 3/100 → 20/100 CPU-sim pass on `matmul_lhsT_rhs` at 2048³.
 - **Align `ComputeAt` / `ReverseComputeAt` on `AtomLegalityError`.** Both raise bare `ValueError` on their similar stale-target re-resolve failures (`compute_at.py:69`, `reverse_compute_at.py:74`). `batch.py` now catches `AtomLegalityError` but crashes on `ValueError`. Port the two sites for a unified staleness channel.
 - **Cycle-break cleanup in `lowering/`.** `emit_source.py` imports `_emit_pipelined_loop` and `_BODY_EMITTERS` at module bottom with `# noqa: E402`; `inject_software_pipeline.py` aliases `emit_source as _es` for late-bound `_es._emit_vanilla_loop`. Cleaner path: expose `effective_pipeline_depth(node, module)` from `inject_software_pipeline.py` so `_emit_node`'s dispatch decides vanilla vs pipelined without the pipelined emitter needing to call back.
 - **Standardize private-vs-public naming in `lowering/`.** `_BODY_EMITTERS`, `_emit_pipelined_loop`, `_Writer`, `_sbuf_name`, `_hbm_name` are underscore-private but imported across module boundaries. Either drop the underscore (matching `slot_expr`/`sbuf_tile_slice` in `inject_multi_buffer.py`) or declare them via `__all__`.
@@ -91,10 +95,12 @@ Canonicalize dim_roles on post-fission trees. This is the natural home for follo
 ~~2. Bug #2 (MultiBuffer apply-time re-validation) — follow the `_find_node_path` pattern from Task 19b.~~ **Landed `c88caad`.**
 ~~3. Task 23 (PlaceBuffers extraction) — sets up shared LCA/required-tiles infrastructure.~~ **Landed `315a8ee`.**
 ~~6. Tasks 22, 24 — cosmetic cleanup, no bug-fix coupling.~~ **Landed `4e7522f`.**
+~~7. Bug A (ComputeAt/ReverseComputeAt partial-coverage regen) + canonical 1N + tail-sibling ban.~~ **Landed `13946ca`, `ba20be5`, `ccbffa5`.** 3/100 → 20/100 CPU-sim pass.
 
 Remaining:
-1. **Bug #1 design session** — resolve the PSUM scope problem (naming/sizing) before attempting Task 25 or coupled-rewrite atoms.
-2. **Task 25 (LowerDecomposedReduction)** — home for Bug #1's fix, once design lands.
-3. **Bug #1 (DecomposeReduction divergence)** — uses the Task 25 pass.
+1. **Bug B (SoftwarePipeline + required_tiles pipeline-skew widening)** — required_tiles(prod, d3)=1 derived pre-pipelining is incorrect after SoftwarePipeline skews drain (stage 0) and store (stage 1). Fix direction: when LCA contains a pipelined ancestor on dim P, any inner non-P dim d iterated between writer and reader must have required_tiles(d) = trip(d).
+2. **Bug #1 design session** — resolve the PSUM scope problem (naming/sizing) before attempting Task 25 or coupled-rewrite atoms.
+3. **Task 25 (LowerDecomposedReduction)** — home for Bug #1's fix, once design lands.
+4. **Bug #1 (DecomposeReduction divergence)** — uses the Task 25 pass.
 
-Expected MFU-gate progression: fixing #3 alone should bring ~10–30/100 kernels to CPU-sim pass; #2 another meaningful chunk; #1 closes the gap to SOTA. Measurement pending on `dev_1` after landed work.
+Expected MFU-gate progression: Bug A + 1N lifted 3/100 → 20/100. Bug B should close the bulk of the remaining 79 CPU-sim failures; Bug #1 closes the gap to SOTA.
