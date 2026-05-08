@@ -8,6 +8,7 @@ slot-indexing expressions.
 from dataclasses import dataclass, replace
 
 from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode
+from nkigym.tune import AtomLegalityError
 
 
 def _required_tiles(module: KernelModule, tensor_name: str, dim_id: str) -> int:
@@ -96,7 +97,26 @@ class MultiBuffer:
         return result
 
     def apply(self, module: KernelModule) -> KernelModule:
-        """Return a new module with ``tensor_name``'s buffer_degree on ``dim_id`` set to ``degree``."""
+        """Return a new module with ``tensor_name``'s buffer_degree on ``dim_id`` set to ``degree``.
+
+        Re-validates legality against ``module`` at apply time. An atom
+        enumerated against a previous state may be stale if a preceding
+        rewrite narrowed the tensor's LCA (raising ``required_tiles``) so
+        the captured degree no longer fits under
+        ``num_tiles // required_tiles``. Applying such an atom would
+        produce slot-modulo aliasing in the rendered kernel; instead,
+        raise :class:`AtomLegalityError` so the caller can skip.
+
+        Raises:
+            AtomLegalityError: If :meth:`is_legal` returns False against
+                ``module`` — the atom's captured ``(tensor, dim, degree)``
+                no longer satisfies the legality invariants.
+        """
+        if not self.is_legal(module):
+            raise AtomLegalityError(
+                f"MultiBuffer.apply: atom stale against current module — "
+                f"tensor={self.tensor_name!r}, dim={self.dim_id!r}, degree={self.degree}"
+            )
         old_t = module.tensors[self.tensor_name]
         new_degree = dict(old_t.buffer_degree)
         new_degree[self.dim_id] = self.degree

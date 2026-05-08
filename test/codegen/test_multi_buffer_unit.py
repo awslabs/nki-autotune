@@ -8,6 +8,7 @@ from nkigym.ops import nkigym_kernel
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
+from nkigym.tune import AtomLegalityError
 from nkigym.tune.compute_at import enumerate_compute_at_atoms
 from nkigym.tune.multi_buffer import MultiBuffer, enumerate_multi_buffer_atoms
 
@@ -80,3 +81,23 @@ def test_enumerator_yields_only_legal_atoms(module):
     assert atoms
     for atom in atoms:
         assert atom.is_legal(module), f"illegal atom: {atom}"
+
+
+def test_multi_buffer_apply_rejects_stale_atom(module):
+    """Apply must reject an atom that is no longer legal against the current module.
+
+    An atom enumerated against a fused module (``required_tiles == 1`` on
+    some intermediate dim, so degree=2 is legal) must not silently mutate
+    a canonical module (``required_tiles == num_tiles`` on the same dim,
+    where the max legal degree is 1). The canonical module is the exact
+    cross-nest case from the IR-refactor followup bug: degree<num_tiles
+    would produce slot-modulo aliasing.
+    """
+    atoms = [a for a in enumerate_multi_buffer_atoms(module) if a.degree >= 2]
+    assert atoms, "fused fixture should yield at least one MultiBuffer atom with degree>=2"
+    atom = atoms[0]
+    canonical = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    assert atom.is_legal(module)
+    assert not atom.is_legal(canonical), "construction precondition: atom must be stale against canonical"
+    with pytest.raises(AtomLegalityError):
+        atom.apply(canonical)

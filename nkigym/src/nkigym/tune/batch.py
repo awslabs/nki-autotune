@@ -15,7 +15,7 @@ import warnings
 
 from nkigym.codegen.dep_cache import subtree_signature
 from nkigym.codegen.ir import KernelModule, validate_dataflow_ordering
-from nkigym.tune import KernelRewrite
+from nkigym.tune import AtomLegalityError, KernelRewrite
 from nkigym.tune.compute_at import enumerate_compute_at_atoms
 from nkigym.tune.decompose_reduction import enumerate_decompose_reduction_atoms
 from nkigym.tune.multi_buffer import enumerate_multi_buffer_atoms
@@ -115,7 +115,10 @@ def enumerate_pool(module: KernelModule, max_pool_size: int, rng: random.Random)
             del frontier[h]
 
         src_module = pool[h]
-        new_module = atom.apply(src_module)
+        try:
+            new_module = atom.apply(src_module)
+        except AtomLegalityError:
+            continue
         if not validate_dataflow_ordering(new_module):
             continue
         h_new = hash_state(new_module)
