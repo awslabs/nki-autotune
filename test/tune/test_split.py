@@ -71,7 +71,7 @@ def _collect_names_by_dim(body, stack=None, out=None):
 def test_split_does_not_alias_existing_same_dim_name():
     """Split on a loop whose children carry canonical names must not collide.
 
-    Repro: start from canonical 2N form ``[d:i_d_0, trip=N] ->
+    Repro: hand-build a same-dim pair ``[d:i_d_0, trip=N] ->
     [d:i_d_1, trip=1] -> leaf``. Applying Split to the OUTER loop
     deepcopies the inner (named ``i_d_1``) under the Split's new outer
     and inner (both ``name=None``). The renderer's name fallback

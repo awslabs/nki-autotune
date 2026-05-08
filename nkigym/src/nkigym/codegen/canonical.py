@@ -7,9 +7,11 @@ Pipeline:
     3. Derive per-dim total size + tile size from ``input_specs`` and
        per-op ``TILE_LIMITS``.
     4. Tag each tensor's ``origin`` (``param`` / ``intermediate`` / ``return``).
-    5. Build the canonical 2N-per-op forest with phase leaves at the
+    5. Build the canonical 1N-per-dim forest with phase leaves at the
        deepest point; populate every :class:`BodyLeaf` with FULL metadata
        so leaves are self-describing (no back-reference to a sidecar).
+       Tiles-per-block arithmetic-intensity dials live in ``Split``, not
+       canonical form.
     6. Assign canonical loop names ``i_<dim>_<ordinal>`` across each tree.
 
 The resulting :class:`KernelModule` is the IR the renderer and transform
@@ -41,7 +43,7 @@ def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict[st
             every function parameter.
 
     Returns:
-        A fully resolved :class:`KernelModule` with canonical 2N-per-op
+        A fully resolved :class:`KernelModule` with canonical 1N-per-dim
         schedule tree and self-describing leaves.
     """
     raws, return_name = _parse_ast(func)
@@ -605,7 +607,7 @@ def _make_leaf(op: _ParsedOp, phase: str) -> BodyLeaf:
 
 
 def _build_tree(op: _ParsedOp, dims: dict[str, DimInfo]) -> LoopNode:
-    """Build the 2N-per-dim chain for ``op`` with phase leaves at the tip."""
+    """Build the 1N-per-dim chain for ``op`` with phase leaves at the tip."""
     deepest_children = _build_leaves(op, dims)
     wrap_dims = _dims_to_wrap(op)
     return _wrap_dims(wrap_dims, op, dims, deepest_children)
