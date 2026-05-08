@@ -183,3 +183,32 @@ def test_apply_regenerates_residual_trip_on_partial_ancestor() -> None:
     residual_child = residual_loop.children[0]
     assert isinstance(residual_child, BodyLeaf)
     assert residual_child.writes == ("p",)
+
+
+def test_apply_raises_on_indivisible_residual() -> None:
+    """Ancestor trip does not divide num_tiles → AtomLegalityError."""
+    from nkigym.tune import AtomLegalityError
+
+    producer = BodyLeaf(op_cls=object, phase="main", writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
+    consumer = BodyLeaf(op_cls=object, phase="main", reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
+    """num_tiles=17 with ancestor trip=3 → residual 17/3 does not divide."""
+    consumer_outer = LoopNode("d0", 3, AxisRole.PARALLEL, children=[consumer])
+    dims = {"d0": DimInfo(dim_id="d0", total_size=17 * 128, tile_size=128, num_tiles=17)}
+    tensors = {
+        "p": Tensor(
+            name="p",
+            dim_ids=("d0",),
+            shape=(17 * 128,),
+            dtype="float32",
+            origin="intermediate",
+            buffer_degree={"d0": 1},
+        )
+    }
+    module = _mod_hand(body=[producer, consumer_outer], dims=dims, tensors=tensors)
+    atom = ComputeAt(leaf_path=(0,), target_loop_path=(1,))
+    assert atom.is_legal(module)
+    try:
+        atom.apply(module)
+    except AtomLegalityError:
+        return
+    raise AssertionError("expected AtomLegalityError for indivisible residual")
