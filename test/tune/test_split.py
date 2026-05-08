@@ -163,3 +163,27 @@ def test_split_assigns_canonical_names():
 
     for root in new_mod.body:
         check(root, {})
+
+
+def test_split_is_legal_rejects_non_divisor() -> None:
+    """is_legal returns False when factor does not divide trip_count."""
+    leaf = BodyLeaf(op_cls=object, phase="main")
+    loop = LoopNode("d0", 17, AxisRole.PARALLEL, children=[leaf])
+    mod = _mod([loop])
+    atom = Split(loop_path=(0,), factor=4)
+    assert not atom.is_legal(mod)
+
+
+def test_split_apply_raises_on_non_divisor() -> None:
+    """apply raises AtomLegalityError when factor does not divide trip_count."""
+    from nkigym.tune import AtomLegalityError
+
+    leaf = BodyLeaf(op_cls=object, phase="main")
+    loop = LoopNode("d0", 17, AxisRole.PARALLEL, children=[leaf])
+    mod = _mod([loop])
+    atom = Split(loop_path=(0,), factor=4)
+    try:
+        atom.apply(mod)
+    except AtomLegalityError:
+        return
+    raise AssertionError("expected AtomLegalityError for non-divisor factor")
