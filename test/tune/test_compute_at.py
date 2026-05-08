@@ -4,12 +4,27 @@ import numpy as np
 import pytest
 
 from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import BodyLeaf, LoopNode, leaves_under
+from nkigym.codegen.dep_cache import DepCache
+from nkigym.codegen.ir import BodyLeaf, DimInfo, KernelModule, LoopNode, Tensor, leaves_under
 from nkigym.ops import nkigym_kernel
+from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 from nkigym.tune.compute_at import ComputeAt, enumerate_compute_at_atoms
+
+
+def _mod_hand(body: list, dims: dict[str, DimInfo], tensors: dict[str, Tensor]) -> KernelModule:
+    """Build a minimal KernelModule from hand-rolled body / dims / tensors."""
+    return KernelModule(
+        func_name="f",
+        param_names=[],
+        return_name=next(iter(tensors)) if tensors else "x",
+        tensors=tensors,
+        dims=dims,
+        body=body,
+        dep=DepCache(scopes={}),
+    )
 
 
 @nkigym_kernel
@@ -109,3 +124,62 @@ def test_compute_at_preserves_target_after_pruning(module):
         """Apply to the original module (not composed) to exercise every atom."""
         new_mod = atom.apply(module)
         assert new_mod is not None
+
+
+def test_apply_regenerates_residual_trip_on_partial_ancestor() -> None:
+    """Partial-coverage ancestor → residual inner loop regenerated.
+
+    Setup: forest body has two root subtrees.
+    * Subtree 0: producer ``write={"p"}`` with no ancestor — sibling at the root.
+    * Subtree 1: ``L(d0, trip=2)`` wrapping consumer ``reads={"p"}``.
+    ``dims["d0"].num_tiles = 16``. Move producer under subtree 1's
+    root loop (target_path=(1,)); producer's dim_role has ``d0``.
+    Expected: producer appended under ``L(d0, 2)`` with a regenerated
+    ``L(d0, 8)`` between target and producer leaf, covering the residual
+    ``16 / 2 = 8`` trips.
+    """
+    producer = BodyLeaf(
+        op_cls=object,
+        phase="main",
+        reads={},
+        writes=("p",),
+        kwargs={},
+        axis_map={},
+        dim_role={"d0": AxisRole.PARALLEL},
+        op_local_buffers={},
+    )
+    consumer = BodyLeaf(
+        op_cls=object,
+        phase="main",
+        reads={"data": "p"},
+        writes=(),
+        kwargs={},
+        axis_map={},
+        dim_role={"d0": AxisRole.PARALLEL},
+        op_local_buffers={},
+    )
+    consumer_outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[consumer])
+    dims = {"d0": DimInfo(dim_id="d0", total_size=2048, tile_size=128, num_tiles=16)}
+    tensors = {
+        "p": Tensor(
+            name="p", dim_ids=("d0",), shape=(2048,), dtype="float32", origin="intermediate", buffer_degree={"d0": 1}
+        )
+    }
+    module = _mod_hand(body=[producer, consumer_outer], dims=dims, tensors=tensors)
+    atom = ComputeAt(leaf_path=(0,), target_loop_path=(1,))
+    assert atom.is_legal(module)
+    new_module = atom.apply(module)
+    """After apply: body collapses from length 2 to 1 — producer removed
+    from body[0], consumer_outer shifts to body[0]. Under the new
+    consumer_outer, expect the original consumer + a regenerated
+    L(d0, 8) wrapping a clone of producer."""
+    assert len(new_module.body) == 1
+    new_target = new_module.body[0]
+    assert isinstance(new_target, LoopNode) and new_target.trip_count == 2
+    regen_wrappers = [c for c in new_target.children if isinstance(c, LoopNode) and c.dim_id == "d0"]
+    assert len(regen_wrappers) == 1, f"expected one regenerated d0 loop, got {len(regen_wrappers)}"
+    residual_loop = regen_wrappers[0]
+    assert residual_loop.trip_count == 8
+    residual_child = residual_loop.children[0]
+    assert isinstance(residual_child, BodyLeaf)
+    assert residual_child.writes == ("p",)

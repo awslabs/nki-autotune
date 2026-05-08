@@ -112,9 +112,12 @@ def test_apply_regenerates_residual_trip_on_partial_ancestor() -> None:
     atom = ComputeAt(leaf_path=(0,), target_loop_path=(1,))
     assert atom.is_legal(module)
     new_module = atom.apply(module)
-    """After apply: body[1] is L(d0, 2) whose children are the original
-    consumer plus a regenerated L(d0, 8) wrapping a clone of producer."""
-    new_target = new_module.body[1]
+    """After apply: body collapses from length 2 to 1 — producer removed
+    from body[0], consumer_outer shifts to body[0]. Under the new
+    consumer_outer, expect the original consumer + a regenerated
+    L(d0, 8) wrapping a clone of producer."""
+    assert len(new_module.body) == 1
+    new_target = new_module.body[0]
     assert isinstance(new_target, LoopNode) and new_target.trip_count == 2
     regen_wrappers = [c for c in new_target.children if isinstance(c, LoopNode) and c.dim_id == "d0"]
     assert len(regen_wrappers) == 1, f"expected one regenerated d0 loop, got {len(regen_wrappers)}"
@@ -128,7 +131,7 @@ def test_apply_regenerates_residual_trip_on_partial_ancestor() -> None:
 - [ ] **Step 3: Run the test, verify RED**
 
 Run: `source ~/venvs/kernel-env/bin/activate && pytest test/tune/test_compute_at.py::test_apply_regenerates_residual_trip_on_partial_ancestor -v`
-Expected: FAIL — current `_wrap_leaf_with_dims` uses `num_t = module.dims[d].num_tiles` unconditionally, producing `L(d0, 16) → L(d0, 1)` inside the target, not `L(d0, 8)`. Assertion `residual_loop.trip_count == 8` fails with `== 16`.
+Expected: FAIL at `assert len(regen_wrappers) == 1, ...` with actual `0` — current `_ancestor_dims` (set-membership) returns `{"d0"}` when target is `L(d0, 2)`, so `needed=[]` and no inner wrapper is generated at all. After Task 4's fix, one wrapper with `trip_count=8` will be produced.
 
 - [ ] **Step 4: Commit the failing test**
 
