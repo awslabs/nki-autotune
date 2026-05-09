@@ -394,11 +394,11 @@ Output after `RFactor(reducer_leaf_path=<activation_reduce>, outer_factor=4)`:
 
 ```
 NKIAlloc(partials, location="sbuf", shape=(P, 1, 4), dtype="float32")
-NKIAlloc(scratch_local, location="sbuf", shape=(P, F/4), dtype="float32")
+NKIAlloc(scratch, location="sbuf", shape=(P, F), dtype="float32")    # unchanged
 LoopNode(F_outer=4, PARALLEL) {
     NKIActivationReduce(
         data=data[..., F_outer*(F/4):(F_outer+1)*(F/4)],
-        dst=scratch_local,
+        dst=scratch[..., F_outer*(F/4):(F_outer+1)*(F/4)],
         reduce_res=partials[..., F_outer:F_outer+1],
     )
 }
@@ -406,11 +406,11 @@ NKITensorReduce(src=partials, dst=sum_acc, axis=F_outer, op="add")
 ```
 
 Mechanical steps:
-1. Register two new `Tensor` entries: `partials` (SBUF, shape=(P, 1, outer_factor)) and `scratch_local` (SBUF, shape=(P, F/outer_factor)).
+1. Register one new `Tensor` entry: `partials` (SBUF, shape=(P, 1, outer_factor)). The existing `scratch` allocation is reused — it already has shape `(P, F)`, and each F_outer iteration writes into the appropriate F slice. Scratch is write-only (nobody reads it after an `activation_reduce` call completes), so slice aliasing across outer iterations is safe.
 2. Wrap the activation_reduce leaf in a new `F_outer` LoopNode (PARALLEL, trip=outer_factor).
 3. Rewrite the leaf's `data` operand axis map to slice along F.
 4. Rewrite the leaf's `reduce_res` operand to point at `partials` (slot expression keyed on F_outer).
-5. Rewrite the leaf's `dst` operand to point at `scratch_local`.
+5. Rewrite the leaf's `dst` operand to slice along F on the existing `scratch` (inherits from F_outer).
 6. Append `NKITensorReduce(src=partials, dst=<original reduce_res>, axis=F_outer, op=<original reduce_op>)` after the F_outer loop.
 7. Mark the original `sum_acc` allocation still live (it's still the target of the closing `tensor_reduce`'s `dst`).
 8. Rename canonical loop vars.
