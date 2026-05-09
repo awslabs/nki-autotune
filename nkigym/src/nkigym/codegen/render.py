@@ -8,7 +8,7 @@ The lowering pipeline is split across
    degrees set by the ``MultiBuffer`` rewrite.
 3. :mod:`inject_software_pipeline` — prologue/body/epilogue emission
    for LoopNodes with ``pipeline_depth > 1``.
-4. :mod:`lower_phases` — per-``(op_cls, phase)`` ISA call-site emission.
+4. :mod:`emit_ops` — per-op_cls ISA call-site emission.
 5. :mod:`emit_source` — top-level forest walker; produces the NKI
    source string.
 

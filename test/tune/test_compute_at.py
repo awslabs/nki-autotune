@@ -27,14 +27,26 @@ def _mod_hand(body: list, dims: dict[str, DimInfo], tensors: dict[str, Tensor]) 
     )
 
 
+from nkigym.ops.alloc import NKIAlloc
+from nkigym.ops.memset import NKIMemset
+from nkigym.ops.tensor_copy import NKITensorCopy
+
+
 @nkigym_kernel
 def _matmul_k(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Simple matmul kernel fixture for ComputeAt atom tests."""
-    lhs_s = NKILoad()(data=lhs)
-    rhs_s = NKILoad()(data=rhs)
-    out_s = NKIMatmul()(stationary=lhs_s, moving=rhs_s)
-    out = NKIStore()(data=out_s)
-    return out
+    """Simple matmul kernel fixture for ComputeAt atom tests (first-class buffers form)."""
+    lhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    rhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    psum_acc = NKIAlloc(location="psum", shape=(2048, 2048), dtype="float32")()
+    sbuf_prod = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    hbm_out = NKIAlloc(location="hbm", shape=(2048, 2048), dtype="bfloat16")()
+    NKILoad()(src=lhs, dst=lhs_sbuf)
+    NKILoad()(src=rhs, dst=rhs_sbuf)
+    NKIMemset(value=0.0)(dst=psum_acc)
+    NKIMatmul()(stationary=lhs_sbuf, moving=rhs_sbuf, dst=psum_acc)
+    NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
+    NKIStore()(src=sbuf_prod, dst=hbm_out)
+    return hbm_out
 
 
 _INPUT_SPECS: dict[str, dict] = {
@@ -139,30 +151,22 @@ def test_apply_regenerates_residual_trip_on_partial_ancestor() -> None:
     ``16 / 2 = 8`` trips.
     """
     producer = BodyLeaf(
-        op_cls=object,
-        phase="main",
-        reads={},
-        writes=("p",),
-        kwargs={},
-        axis_map={},
-        dim_role={"d0": AxisRole.PARALLEL},
-        op_local_buffers={},
+        op_cls=object, reads={}, writes=("p",), kwargs={}, axis_map={}, dim_role={"d0": AxisRole.PARALLEL}
     )
     consumer = BodyLeaf(
-        op_cls=object,
-        phase="main",
-        reads={"data": "p"},
-        writes=(),
-        kwargs={},
-        axis_map={},
-        dim_role={"d0": AxisRole.PARALLEL},
-        op_local_buffers={},
+        op_cls=object, reads={"data": "p"}, writes=(), kwargs={}, axis_map={}, dim_role={"d0": AxisRole.PARALLEL}
     )
     consumer_outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[consumer])
     dims = {"d0": DimInfo(dim_id="d0", total_size=2048, tile_size=128, num_tiles=16)}
     tensors = {
         "p": Tensor(
-            name="p", dim_ids=("d0",), shape=(2048,), dtype="float32", origin="intermediate", buffer_degree={"d0": 1}
+            name="p",
+            dim_ids=("d0",),
+            shape=(2048,),
+            dtype="float32",
+            origin="intermediate",
+            location="sbuf",
+            buffer_degree={"d0": 1},
         )
     }
     module = _mod_hand(body=[producer, consumer_outer], dims=dims, tensors=tensors)
@@ -189,8 +193,8 @@ def test_apply_raises_on_indivisible_residual() -> None:
     """Ancestor trip does not divide num_tiles → AtomLegalityError."""
     from nkigym.tune import AtomLegalityError
 
-    producer = BodyLeaf(op_cls=object, phase="main", writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
-    consumer = BodyLeaf(op_cls=object, phase="main", reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
+    producer = BodyLeaf(op_cls=object, writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
+    consumer = BodyLeaf(op_cls=object, reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
     """num_tiles=17 with ancestor trip=3 → residual 17/3 does not divide."""
     consumer_outer = LoopNode("d0", 3, AxisRole.PARALLEL, children=[consumer])
     dims = {"d0": DimInfo(dim_id="d0", total_size=17 * 128, tile_size=128, num_tiles=17)}
@@ -201,6 +205,7 @@ def test_apply_raises_on_indivisible_residual() -> None:
             shape=(17 * 128,),
             dtype="float32",
             origin="intermediate",
+            location="sbuf",
             buffer_degree={"d0": 1},
         )
     }
@@ -218,7 +223,7 @@ def test_ancestor_trip_products_accumulates_same_dim() -> None:
     """Same-dim ancestors contribute their trips multiplicatively."""
     from nkigym.tune.compute_at import _ancestor_trip_products
 
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     l3 = LoopNode("d0", 4, AxisRole.PARALLEL, children=[leaf])
     l2 = LoopNode("d0", 2, AxisRole.PARALLEL, children=[l3])
     l1 = LoopNode("d1", 3, AxisRole.PARALLEL, children=[l2])

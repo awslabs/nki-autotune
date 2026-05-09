@@ -1,0 +1,38 @@
+"""Free-axis reduction op: maps to ``nisa.tensor_reduce``."""
+
+from typing import Any, ClassVar
+
+import numpy as np
+
+from nkigym.ops.base import AxisRole, NKIOp
+
+_REDUCE_FNS: dict[str, Any] = {"add": np.sum, "max": np.max}
+
+
+class NKITensorReduce(NKIOp):
+    """Reduce ``data`` along an axis into ``dst``.
+
+    kwargs:
+        axis: ``int`` — the axis of ``data`` to reduce over.
+        op: ``"add"`` or ``"max"``.
+    operands:
+        data: source tensor.
+        dst: destination tensor — shape equals ``data.shape`` with ``axis`` removed.
+    """
+
+    NAME: ClassVar[str] = "tensor_reduce"
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "dst": ("P",)}
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data"})
+    AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
+    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+
+    def _run(self, **kwargs: Any) -> Any:
+        """CPU simulation: numpy reduction along axis."""
+        data = kwargs["data"]
+        dst = kwargs["dst"]
+        axis = kwargs["axis"]
+        op = kwargs["op"]
+        reduce_fn = _REDUCE_FNS[op]
+        result = reduce_fn(data, axis=axis)
+        dst[...] = result
+        return dst

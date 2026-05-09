@@ -42,9 +42,8 @@ class NKIActivation(NKIOp):
     """
 
     NAME: ClassVar[str] = "activation"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F")}
-    OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P", "F")}
-    OUTPUT_DTYPES: ClassVar[dict[str, str]] = {"output": "float32"}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "dst": ("P", "F")}
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data"})
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128, "F": 512}
 
     def _run(self, **kwargs: Any) -> Any:

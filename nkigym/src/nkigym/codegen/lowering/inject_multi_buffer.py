@@ -1,7 +1,7 @@
 """``InjectMultiBuffer`` pass: slot-index expressions for multi-buffered tiles.
 
 Runs as part of source emission. Body emitters in
-:mod:`nkigym.codegen.lowering.lower_phases` consume this module's
+:mod:`nkigym.codegen.lowering.emit_ops` consume this module's
 functions to build the ``[p_tile, p_slot, f_range]`` style slice
 expressions that read and write the 3D SBUF allocations produced by
 :mod:`nkigym.codegen.lowering.place_buffers`.
@@ -14,8 +14,6 @@ and the raw slot is emitted. Otherwise the expression includes
 through the body emitter so slot expressions for a pipelined dim
 substitute the innermost ancestor with ``(loop_var + stage_offset)``.
 """
-
-from nkigym.codegen.lowering._emit_utils import _sbuf_name
 
 
 def slot_expr(
@@ -157,4 +155,4 @@ def swapped_dst_tile_slice(
     p_slot = slot_expr(path_names, path_trips, src_f_axis, total_slots_p, stage_offset_dst_p)
     f_slot_inner = slot_expr(path_names, path_trips, src_p_axis, total_slots_f, stage_offset_dst_f)
     f_slot = f"({f_slot_inner})"
-    return f"{_sbuf_name(dst_name)}[0:{tile}, {p_slot}, {f_slot} * {tile} : {f_slot} * {tile} + {tile}]"
+    return f"{dst_name}[0:{tile}, {p_slot}, {f_slot} * {tile} : {f_slot} * {tile} + {tile}]"

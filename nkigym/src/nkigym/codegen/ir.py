@@ -34,6 +34,8 @@ class Tensor:
         dtype: Element dtype (e.g. ``"bfloat16"``).
         origin: ``"param"`` (HBM input), ``"intermediate"`` (SBUF handoff),
             ``"return"`` (final output).
+        location: ``"hbm"`` / ``"sbuf"`` / ``"psum"`` — which memory
+            the allocation targets. For params, always ``"hbm"``.
         buffer_degree: Multi-buffer degree per dim; defaults to 1.
     """
 
@@ -42,6 +44,7 @@ class Tensor:
     shape: tuple[int, ...]
     dtype: str
     origin: TensorOrigin
+    location: Literal["hbm", "sbuf", "psum"] = "sbuf"
     buffer_degree: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -60,18 +63,6 @@ class DimInfo:
 
 
 @dataclass
-class OpLocalBuffer:
-    """Resolved op-local buffer ready for renderer emission."""
-
-    logical_name: str
-    emitted_name: str
-    location: Literal["sbuf", "psum"]
-    dtype: str
-    axis_ids: tuple[str, ...]
-    shape: tuple[int, ...]
-
-
-@dataclass
 class LoopNode:
     """One loop in the schedule tree."""
 
@@ -86,33 +77,20 @@ class LoopNode:
 
 @dataclass
 class BodyLeaf:
-    """Self-describing leaf: an op (or op phase) + the metadata needed to render it.
+    """Self-describing leaf: one op + the metadata needed to render it.
 
-    Every metadata field that used to live on ``ParsedOp`` now lives here, so
-    legality checks and rendering can work from the leaf alone without
-    consulting a sidecar op graph.
-
-    Attributes:
-        op_cls: The NKIOp subclass.
-        phase: ``"main"`` for single-phase ops; one of the op class's phases
-            otherwise (e.g. ``"psum_init"``, ``"compute"``, ``"drain"`` for
-            matmul; ``"reduce_step"``, ``"reduce_close"`` for activation_reduce).
-        reads: Maps operand slot name to referenced tensor name.
-        writes: Tuple of tensor names this leaf writes.
-        kwargs: Merged literal kwargs from the NKIOp call.
-        axis_map: Abstract axis label (``"K"`` etc.) to concrete dim id.
-        dim_role: Concrete dim id to :class:`AxisRole` (op-local).
-        op_local_buffers: Op-local buffers keyed by logical name.
+    Every non-parameter tensor referenced in ``reads`` / ``writes`` /
+    ``reads_writes`` is declared by an ``NKIAlloc`` leaf earlier in
+    pre-order DFS.
     """
 
     op_cls: type
-    phase: str = "main"
     reads: dict[str, str] = field(default_factory=dict)
     writes: tuple[str, ...] = ()
+    reads_writes: tuple[str, ...] = ()
     kwargs: dict[str, Any] = field(default_factory=dict)
     axis_map: dict[str, str] = field(default_factory=dict)
     dim_role: dict[str, AxisRole] = field(default_factory=dict)
-    op_local_buffers: dict[str, OpLocalBuffer] = field(default_factory=dict)
 
 
 TreeIR = list[LoopNode | BodyLeaf]
@@ -217,65 +195,81 @@ def emission_order_leaves(body: TreeIR) -> Iterator[BodyLeaf]:
 def validate_dataflow_ordering(module: KernelModule) -> bool:
     """Return True iff the forest's emission order preserves dataflow.
 
-    Three conditions must hold:
+    Rules:
+    - **Reads-after-writes:** every name in ``leaf.reads ∪ leaf.reads_writes``
+      must be a parameter or already-written by a prior leaf in pre-order
+      DFS.
+    - **Writes update the written set:** names in ``leaf.writes ∪ leaf.reads_writes``
+      are added after the leaf fires.
+    - **Return tensor produced:** every tensor with ``origin == "return"``
+      (legacy — being phased out) must be written by some leaf.
+    - **RMW finalization:** for a tensor T with any RMW writer, every
+      non-RMW read of T (a ``reads``-slot consumer) must appear after the
+      LAST RMW write. Otherwise the consumer reads a partial-accumulation
+      value. Enforced by a pre-pass that records the last RMW-writer
+      position per tensor and rejects consumers that appear earlier.
 
-    * **Reads-after-writes** — every ``leaf.reads`` refers to a tensor that
-      is either a parameter (``origin == "param"``) or has already been
-      written by an earlier leaf in pre-order DFS over the forest.
-    * **Return tensor must be produced** — every tensor whose
-      ``origin == "return"`` must be written by at least one leaf in the
-      body. Rewrites that structurally clone a subtree while keeping only
-      one leaf (e.g. ``DecomposeReduction``) can drop the store leaf
-      downstream of the reducer, leaving ``hbm_out`` unwritten — caught
-      here before the sampler pool accepts the state.
-    * **Matmul phase order** — for each matmul op (identified by shared
-      ``axis_map`` among ``NKIMatmul`` leaves), ``psum_init`` must precede
-      ``compute``, and ``compute`` must precede ``drain`` in emission
-      order. The inline ``psum_tile = nl.ndarray(...)`` binding emitted by
-      ``psum_init`` is a Python-level local; if ``compute`` or ``drain``
-      appears first, the reference is a use-before-def at runtime.
-
-    Tensor-level only for the first two checks — op-local buffers in
-    ``leaf.op_local_buffers`` are emitted at the kernel top and are not
-    subject to emission-order constraints at leaf granularity.
-
-    Returns:
-        ``True`` when the forest linearization is consistent; ``False``
-        otherwise.
+    RMW operands encode "init must precede update" structurally —
+    `NKIMatmul.reads_writes = ('psum_acc',)` means the matmul leaf
+    requires a prior writer of ``psum_acc`` (the memset). The RMW
+    finalization rule additionally ensures drain/consumer ops (e.g.
+    NKITensorCopy) don't read psum_acc before all accumulating
+    nc_matmul iterations complete.
     """
     written: set[str] = set()
     params = {t.name for t in module.tensors.values() if t.origin == "param"}
     returns = {t.name for t in module.tensors.values() if t.origin == "return"}
-    out: bool = True
-    matmul_phase_order = {"psum_init": 0, "compute": 1, "drain": 2}
-    matmul_seen: dict[tuple, int] = {}
-    for leaf in emission_order_leaves(module.body):
-        for tensor_name in leaf.reads.values():
-            if tensor_name in params:
+
+    """Allocated tensor names — NKIAlloc reserves storage but does NOT
+    initialize content. Downstream readers (including RMW operands like
+    matmul's psum dst) need a content-writer (NKIMemset, NKILoad, another
+    compute op) to appear after the alloc but before the read."""
+    allocated: set[str] = set()
+
+    """Pre-pass: find the emission index of the last RMW write per tensor."""
+    leaves_list = list(emission_order_leaves(module.body))
+    last_rmw_write: dict[str, int] = {}
+    for idx, leaf in enumerate(leaves_list):
+        for tname in leaf.reads_writes:
+            last_rmw_write[tname] = idx
+
+    for idx, leaf in enumerate(leaves_list):
+        op_name = leaf.op_cls.__name__
+        if op_name == "NKIAlloc":
+            """Alloc leaf: the tensor must appear for the FIRST time (no prior
+            non-alloc read or write). If another leaf already touched this
+            name, we'd be using the tensor before its storage exists —
+            reject the state."""
+            for tname in leaf.writes:
+                if tname in written or tname in allocated:
+                    return False
+                allocated.add(tname)
+            continue
+        """Non-alloc leaves: all reads/writes/reads_writes names must have
+        been allocated first (storage reserved) — params are exempt."""
+        touched = set(leaf.reads.values()) | set(leaf.writes) | set(leaf.reads_writes)
+        for name in touched:
+            if name in params:
                 continue
-            if tensor_name in written:
+            if name not in allocated:
+                return False
+        read_set = set(leaf.reads.values()) | set(leaf.reads_writes)
+        for name in read_set:
+            if name in params:
                 continue
-            out = False
-            break
-        if not out:
-            break
-        if leaf.op_cls.__name__ == "NKIMatmul" and leaf.phase in matmul_phase_order:
-            """Same-op phase leaves share ``reads`` + ``writes`` identically
-            (set by ``_make_leaf`` from the parent ``_ParsedOp``), so the
-            (op_cls, sorted-reads, writes) triple uniquely identifies this
-            matmul instance even across rewrite-induced rebuilds."""
-            key = (leaf.op_cls.__name__, tuple(sorted(leaf.reads.items())), leaf.writes)
-            required = matmul_phase_order[leaf.phase]
-            prior = matmul_seen.get(key, -1)
-            if required < prior:
-                out = False
-                break
-            matmul_seen[key] = max(prior, required)
-        for t in leaf.writes:
-            written.add(t)
-    if out:
-        for ret_name in returns:
-            if ret_name not in written:
-                out = False
-                break
-    return out
+            if name not in written:
+                return False
+        """RMW finalization: a non-RMW read (leaf.reads, not reads_writes) of
+        a tensor with any RMW writer must come after the last RMW writer.
+        A leaf that itself RMW's the tensor is exempt (same-tensor RMW chains
+        are the accumulation iterations themselves)."""
+        for name in leaf.reads.values():
+            if name in last_rmw_write and idx < last_rmw_write[name]:
+                return False
+        write_set = set(leaf.writes) | set(leaf.reads_writes)
+        written |= write_set
+
+    for ret_name in returns:
+        if ret_name not in written:
+            return False
+    return True

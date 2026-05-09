@@ -2,31 +2,46 @@
 
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.activation_reduce import NKIActivationReduce
+from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import AxisRole, NKIOp
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
+from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.tensor_scalar import NKITensorScalar
 
 
 @nkigym_kernel
 def _matmul_kernel(lhs_T, rhs):
-    """Test kernel: lhsT @ rhs matmul."""
-    lhs_T_sbuf = NKILoad()(data=lhs_T)
-    rhs_sbuf = NKILoad()(data=rhs)
-    prod = NKIMatmul()(stationary=lhs_T_sbuf, moving=rhs_sbuf)
-    out = NKIStore()(data=prod)
-    return out
+    """Test kernel: lhsT @ rhs matmul (first-class buffers form)."""
+    lhs_T_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    rhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    psum_acc = NKIAlloc(location="psum", shape=(2048, 2048), dtype="float32")()
+    sbuf_prod = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    hbm_out = NKIAlloc(location="hbm", shape=(2048, 2048), dtype="bfloat16")()
+    NKILoad()(src=lhs_T, dst=lhs_T_sbuf)
+    NKILoad()(src=rhs, dst=rhs_sbuf)
+    NKIMemset(value=0.0)(dst=psum_acc)
+    NKIMatmul()(stationary=lhs_T_sbuf, moving=rhs_sbuf, dst=psum_acc)
+    NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
+    NKIStore()(src=sbuf_prod, dst=hbm_out)
+    return hbm_out
 
 
 @nkigym_kernel
 def _rmsnorm_kernel(lhs):
-    """Test kernel: rmsnorm computation chain."""
-    lhs_sbuf = NKILoad()(data=lhs)
-    rms_inv = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
-    lhs_rms = NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv)
-    out = NKIStore()(data=lhs_rms)
-    return out
+    """Test kernel: rmsnorm computation chain (first-class buffers form)."""
+    lhs_sbuf = NKIAlloc(location="sbuf", shape=(128, 256), dtype="bfloat16")()
+    ar_scratch = NKIAlloc(location="sbuf", shape=(128, 256), dtype="float32")()
+    rms_inv = NKIAlloc(location="sbuf", shape=(128,), dtype="float32")()
+    lhs_rms = NKIAlloc(location="sbuf", shape=(128, 256), dtype="bfloat16")()
+    hbm_out = NKIAlloc(location="hbm", shape=(128, 256), dtype="bfloat16")()
+    NKILoad()(src=lhs, dst=lhs_sbuf)
+    NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf, dst=ar_scratch, reduce_res=rms_inv)
+    NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv, dst=lhs_rms)
+    NKIStore()(src=lhs_rms, dst=hbm_out)
+    return hbm_out
 
 
 def test_axis_role_has_three_values() -> None:
@@ -74,7 +89,8 @@ def test_body_leaf_has_dim_role_for_every_touched_dim() -> None:
         if isinstance(leaf, BodyLeaf) and leaf.op_cls.__name__ == "NKIMatmul"
     ]
     assert matmul_leaves
-    compute = next(leaf for leaf in matmul_leaves if leaf.phase == "compute")
+    """First-class buffers: single matmul leaf (no separate phases)."""
+    compute = matmul_leaves[0]
     k_dim = compute.axis_map["K"]
     m_dim = compute.axis_map["M"]
     n_dim = compute.axis_map["N"]
@@ -102,7 +118,8 @@ def test_same_concrete_dim_can_carry_different_roles_across_ops() -> None:
         for leaf in leaves_under(tree)
         if isinstance(leaf, BodyLeaf) and leaf.op_cls.__name__ == "NKITensorScalar"
     ]
-    ar_step = next(leaf for leaf in ar_leaves if leaf.phase == "reduce_step")
+    """First-class buffers: single activation_reduce leaf."""
+    ar_step = ar_leaves[0]
     ts_main = ts_leaves[0]
     f_dim = ar_step.axis_map["F"]
     assert ar_step.dim_role[f_dim] == AxisRole.ACCUMULATION

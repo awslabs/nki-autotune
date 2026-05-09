@@ -12,16 +12,16 @@ class NKIStore(NKIOp):
     """Copy an SBUF buffer back to HBM with identical logical layout."""
 
     NAME: ClassVar[str] = "dma_copy"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
-    OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("P", "F")}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"src": ("P", "F"), "dst": ("P", "F")}
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     """Same story as ``NKILoad``: ``nisa.dma_copy`` only caps the
     partition axis (128) — the free axis is unbounded."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: identity pass-through."""
-        data: np.ndarray = kwargs["data"]
-        return data
+        src: np.ndarray = kwargs["src"]
+        return src
 
 
 def store_block(mem_slice: Any, sbuf: Any) -> None:

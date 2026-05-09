@@ -17,19 +17,19 @@ from nkigym.ops.base import NKIOp
 
 
 class NKITranspose(NKIOp):
-    """Transpose ``data(P, F) -> output(F, P)`` on Tensor Engine."""
+    """Transpose ``src(P, F) -> dst(F, P)`` on Tensor Engine."""
 
     NAME: ClassVar[str] = "nc_transpose"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
-    OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("F", "P")}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"src": ("P", "F"), "dst": ("F", "P")}
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     """Tensor Engine caps the input at 128×128; Vector Engine at 32×32.
     We target Tensor Engine, so both axes are capped at 128."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: ``data.T``."""
-        data: np.ndarray = kwargs["data"]
-        return data.T
+        """CPU simulation: ``src.T``."""
+        src: np.ndarray = kwargs["src"]
+        return src.T
 
 
 def transpose_block(sbuf_dst: Any, sbuf_src: Any) -> None:

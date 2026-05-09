@@ -13,7 +13,7 @@ def _mod_with_body(body):
 
 
 def test_reorder_par_par_legal():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 2, AxisRole.PARALLEL, children=[leaf])
     outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[inner])
     mod = _mod_with_body([outer])
@@ -22,7 +22,7 @@ def test_reorder_par_par_legal():
 
 
 def test_reorder_par_par_swaps():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 2, AxisRole.PARALLEL, children=[leaf])
     outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[inner])
     mod = _mod_with_body([outer])
@@ -34,7 +34,7 @@ def test_reorder_par_par_swaps():
 
 
 def test_reorder_acc_acc_same_op_legal():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 2, AxisRole.ACCUMULATION, reduce_op="add", children=[leaf])
     outer = LoopNode("d0", 2, AxisRole.ACCUMULATION, reduce_op="add", children=[inner])
     mod = _mod_with_body([outer])
@@ -43,7 +43,7 @@ def test_reorder_acc_acc_same_op_legal():
 
 
 def test_reorder_acc_acc_different_op_illegal():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 2, AxisRole.ACCUMULATION, reduce_op="max", children=[leaf])
     outer = LoopNode("d0", 2, AxisRole.ACCUMULATION, reduce_op="add", children=[inner])
     mod = _mod_with_body([outer])
@@ -52,7 +52,7 @@ def test_reorder_acc_acc_different_op_illegal():
 
 
 def test_reorder_rejects_sequential():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 2, AxisRole.SEQUENTIAL, children=[leaf])
     outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[inner])
     mod = _mod_with_body([outer])
@@ -61,8 +61,8 @@ def test_reorder_rejects_sequential():
 
 
 def test_reorder_rejects_non_perfect_nest():
-    leaf_a = BodyLeaf(op_cls=object, phase="a")
-    leaf_b = BodyLeaf(op_cls=object, phase="b")
+    leaf_a = BodyLeaf(op_cls=object)
+    leaf_b = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 2, AxisRole.PARALLEL, children=[leaf_a])
     outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[inner, leaf_b])
     mod = _mod_with_body([outer])
@@ -73,12 +73,7 @@ def test_reorder_rejects_non_perfect_nest():
 def test_reorder_par_acc_legal_when_acc_subtree_pure():
     """ACC's subtree has no leaf writing a buffer indexed by PAR's dim."""
     leaf = BodyLeaf(
-        op_cls=object,
-        phase="main",
-        reads={},
-        writes=("out",),
-        axis_map={"K": "d1"},
-        dim_role={"d1": AxisRole.ACCUMULATION},
+        op_cls=object, reads={}, writes=("out",), axis_map={"K": "d1"}, dim_role={"d1": AxisRole.ACCUMULATION}
     )
     inner = LoopNode("d1", 2, AxisRole.ACCUMULATION, reduce_op="add", children=[leaf])
     outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[inner])
@@ -91,7 +86,6 @@ def test_reorder_par_acc_illegal_when_acc_subtree_writes_par_dim():
     """ACC's subtree has a leaf writing a buffer whose index depends on PAR's dim."""
     leaf = BodyLeaf(
         op_cls=object,
-        phase="main",
         reads={},
         writes=("psum",),
         axis_map={"M": "d0", "K": "d1"},

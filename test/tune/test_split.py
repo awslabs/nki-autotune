@@ -14,7 +14,7 @@ def _mod(body):
 
 
 def test_split_divisible_yields_single_pair():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     loop = LoopNode("d0", 16, AxisRole.PARALLEL, children=[leaf])
     mod = _mod([loop])
     atom = Split(loop_path=(0,), factor=4)
@@ -30,7 +30,7 @@ def test_split_divisible_yields_single_pair():
 
 
 def test_split_rejects_factor_zero():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     loop = LoopNode("d0", 16, AxisRole.PARALLEL, children=[leaf])
     mod = _mod([loop])
     atom = Split(loop_path=(0,), factor=0)
@@ -38,7 +38,7 @@ def test_split_rejects_factor_zero():
 
 
 def test_split_rejects_leaf_target():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     mod = _mod([leaf])
     atom = Split(loop_path=(0,), factor=4)
     assert not atom.is_legal(mod)
@@ -84,7 +84,7 @@ def test_split_does_not_alias_existing_same_dim_name():
     every LoopNode in the new tree receives a fresh, collision-free
     ``i_<dim>_<ordinal>`` name.
     """
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d0", 1, AxisRole.PARALLEL, children=[leaf], name="i_d0_1")
     outer = LoopNode("d0", 8, AxisRole.PARALLEL, children=[inner], name="i_d0_0")
     mod = _mod([outer])
@@ -108,7 +108,7 @@ def test_split_assigns_canonical_names():
     Ordinals follow a per-root DFS in which siblings share ancestor
     counts (same contract as ``_rename_canonical``).
     """
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d0", 1, AxisRole.PARALLEL, children=[leaf], name="i_d0_1")
     outer = LoopNode("d0", 8, AxisRole.PARALLEL, children=[inner], name="i_d0_0")
     mod = _mod([outer])
@@ -133,7 +133,7 @@ def test_split_assigns_canonical_names():
 
 def test_split_is_legal_rejects_non_divisor() -> None:
     """is_legal returns False when factor does not divide trip_count."""
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     loop = LoopNode("d0", 17, AxisRole.PARALLEL, children=[leaf])
     mod = _mod([loop])
     atom = Split(loop_path=(0,), factor=4)
@@ -142,7 +142,7 @@ def test_split_is_legal_rejects_non_divisor() -> None:
 
 def test_split_apply_raises_on_non_divisor() -> None:
     """apply raises AtomLegalityError when factor does not divide trip_count."""
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     loop = LoopNode("d0", 17, AxisRole.PARALLEL, children=[leaf])
     mod = _mod([loop])
     atom = Split(loop_path=(0,), factor=4)

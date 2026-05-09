@@ -17,10 +17,10 @@ from nkigym.codegen.dep_cache import subtree_signature
 from nkigym.codegen.ir import KernelModule, validate_dataflow_ordering
 from nkigym.tune import AtomLegalityError, KernelRewrite
 from nkigym.tune.compute_at import enumerate_compute_at_atoms
-from nkigym.tune.decompose_reduction import enumerate_decompose_reduction_atoms
 from nkigym.tune.multi_buffer import enumerate_multi_buffer_atoms
 from nkigym.tune.reorder import enumerate_reorder_atoms
 from nkigym.tune.reverse_compute_at import enumerate_reverse_compute_at_atoms
+from nkigym.tune.rfactor import enumerate_rfactor_atoms
 from nkigym.tune.software_pipeline import enumerate_software_pipeline_atoms
 from nkigym.tune.split import enumerate_split_atoms
 
@@ -46,7 +46,7 @@ def hash_state(module: KernelModule) -> int:
 def _enumerate_atoms(module: KernelModule) -> list[KernelRewrite]:
     """Return every atom currently applicable to ``module``.
 
-    Two atoms are intentionally excluded from the default sampler:
+    Three atoms are intentionally excluded from the default sampler:
 
     - :class:`HoistInvariant` — legality overlap with :class:`ComputeAt`
       makes random sampling fiddly; agents can opt in explicitly.
@@ -66,7 +66,7 @@ def _enumerate_atoms(module: KernelModule) -> list[KernelRewrite]:
     atoms.extend(enumerate_reorder_atoms(module))
     atoms.extend(enumerate_compute_at_atoms(module))
     atoms.extend(enumerate_reverse_compute_at_atoms(module))
-    atoms.extend(enumerate_decompose_reduction_atoms(module))
+    atoms.extend(enumerate_rfactor_atoms(module))
     atoms.extend(enumerate_multi_buffer_atoms(module))
     atoms.extend(enumerate_software_pipeline_atoms(module))
     return atoms

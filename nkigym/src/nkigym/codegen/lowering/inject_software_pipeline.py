@@ -22,18 +22,17 @@ producing NaNs from unscheduled stages. When the clamp collapses to
 from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, leaves_under
 from nkigym.codegen.lowering import emit_source as _es
 from nkigym.codegen.lowering._emit_utils import _Writer
-from nkigym.codegen.lowering.lower_phases import _BODY_EMITTERS
+from nkigym.codegen.lowering.emit_ops import _BODY_EMITTERS
 
 
-def assign_stages(loop_node: LoopNode, module: KernelModule) -> dict[tuple[int, str], int]:
+def assign_stages(loop_node: LoopNode, module: KernelModule) -> dict[int, int]:
     """Return a stage index per leaf in ``loop_node``'s subtree.
 
     Walks the subtree in source (DFS, children-order) order; each leaf's
     stage is one more than the max stage of any upstream leaf (earlier
     in the walk) whose writes it reads. Leaves that read nothing
     produced in the subtree get stage 0. Leaves are identified by
-    ``(id(leaf), phase)`` so each leaf participates independently even
-    though the subtree may contain multiple leaves for the same op.
+    ``id(leaf)`` so each leaf participates independently.
 
     Args:
         loop_node: The ``LoopNode`` whose subtree's stages are assigned.
@@ -42,16 +41,16 @@ def assign_stages(loop_node: LoopNode, module: KernelModule) -> dict[tuple[int, 
             scope-level dep cache access).
 
     Returns:
-        Dict keyed by ``(id(leaf), phase)`` mapping to the leaf's stage.
+        Dict keyed by ``id(leaf)`` mapping to the leaf's stage.
     """
     _ = module
     leaves = _collect_body_leaves(loop_node)
-    stage: dict[tuple[int, str], int] = {}
-    writes_in_subtree: dict[str, tuple[int, str]] = {}
+    stage: dict[int, int] = {}
+    writes_in_subtree: dict[str, int] = {}
     for leaf in leaves:
         reads_set = set(leaf.reads.values())
         upstream = [stage[writes_in_subtree[t]] for t in reads_set if t in writes_in_subtree]
-        key = (id(leaf), leaf.phase)
+        key = id(leaf)
         stage[key] = (max(upstream) + 1) if upstream else 0
         for t in leaf.writes:
             writes_in_subtree[t] = key
@@ -182,7 +181,7 @@ def _subtree_has_firing_leaf(
     Python ``for`` block.
     """
     if isinstance(node, BodyLeaf):
-        stage = stages.get((id(node), node.phase))
+        stage = stages.get(id(node))
         if stage is None:
             return False
         if fire_if_stage_le is not None and stage > fire_if_stage_le:
@@ -266,12 +265,12 @@ def _emit_pipelined_leaf(
             w.dedent()
         return
 
-    stage = stages[(id(child), child.phase)]
+    stage = stages[id(child)]
     if fire_if_stage_le is not None and stage > fire_if_stage_le:
         return
     if fire_if_stage_gt is not None and stage <= fire_if_stage_gt:
         return
-    emitter = _BODY_EMITTERS[(child.op_cls.__name__, child.phase)]
+    emitter = _BODY_EMITTERS[child.op_cls.__name__]
 
     if constant_loop_var is not None:
         literal_value = constant_loop_var - stage

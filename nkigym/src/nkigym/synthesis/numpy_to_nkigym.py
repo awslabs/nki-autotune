@@ -32,7 +32,7 @@ def _log(message: str) -> None:
     print(f"[synthesis] {message}", file=sys.stderr, flush=True)
 
 
-_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT = r"""\
 You translate numpy reference functions into nkigym math functions for a NKI-kernel compiler.
 
 # Task
@@ -43,12 +43,13 @@ Given a numpy function `f_numpy` and an `INPUT_SPECS` dict, produce an `f_nkigym
 
 - Decorate the function with `@nkigym_kernel`. The decorator enforces that every HBM input flows through `NKILoad` before any compute op touches it, and that the kernel returns the output of an `NKIStore`.
 - Positional parameters match `INPUT_SPECS` keys and order (same names, same order).
-- Body consists ONLY of `NKIOp()(...)` calls — no `np.*`, no Python arithmetic, no `if` / `for`, no helper functions.
+- Body consists ONLY of `NKIAlloc` declarations and `NKIOp()(...)` calls — no `np.*`, no Python arithmetic, no `if` / `for`, no helper functions.
 - Every intermediate is bound to a named local.
-- Returns exactly one tensor: the `NKIStore` output.
-- Compute ops operate on SBUF (loaded) tensors only. Reusing the same `NKILoad` result across multiple downstream ops is fine; loading the same parameter twice is not.
-- Matmul uses `stationary.T @ moving`. For raw `A @ B`, insert `A_T = NKITranspose()(data=A)` before `NKIMatmul()(stationary=A_T, moving=B)`.
-- Plain stateless DAG — the vanilla decomposition of the numpy math. NEVER emit an online/single-pass reformulation (flash attention, running-softmax, fused running-mean, etc.). NEVER use `NKIOnlineFlashAttention` or `NKIOnlineMatmul`. Online fusion is a separate downstream rewrite that operates on your output.
+- Every buffer (except kernel parameters) must be declared explicitly via `NKIAlloc(location=..., shape=..., dtype=...)()` BEFORE any op reads from or writes to it.
+- Every compute op takes an explicit `dst=` operand specifying where the result is written.
+- Returns exactly one tensor: an HBM-location buffer that `NKIStore` writes into.
+- Matmul uses `stationary.T @ moving`. For raw `A @ B`, insert `A_T = NKITranspose()(src=A, dst=psum_A_T)` before `NKIMatmul()(stationary=A_T, moving=B, dst=psum_acc)`.
+- Plain stateless DAG — the vanilla decomposition of the numpy math. NEVER emit an online/single-pass reformulation (flash attention, running-softmax, fused running-mean, etc.). Online fusion is a separate downstream rewrite that operates on your output.
 
 # Imports
 
@@ -56,8 +57,12 @@ Each NKIOp class lives in its own submodule under `nkigym.ops.<module>`. `nkigym
 
 ```python
 from nkigym.ops import nkigym_kernel
+from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
 from nkigym.ops.store import NKIStore
+from nkigym.ops.memset import NKIMemset
+from nkigym.ops.tensor_copy import NKITensorCopy
+from nkigym.ops.tensor_reduce import NKITensorReduce
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.transpose import NKITranspose
 from nkigym.ops.dma_transpose import NKIDMATranspose
@@ -70,35 +75,76 @@ Do NOT import NKIOp classes from `nkigym.ops` (flat namespace) — that package 
 
 # Op cheat sheet
 
-| Op | Import | OPERAND_AXES | OUTPUT_AXES | Call |
-|---|---|---|---|---|
-| `NKILoad` | `nkigym.ops.load` | `data:(P,F)` | `output:(P,F)` | `NKILoad()(data=param)` — HBM → SBUF, identity layout; wrap every INPUT_SPECS parameter before compute |
-| `NKIStore` | `nkigym.ops.store` | `data:(P,F)` | `output:(P,F)` | `NKIStore()(data=sbuf)` — SBUF → HBM, identity layout; final op before `return` |
-| `NKIMatmul` | `nkigym.ops.matmul` | `stationary:(K,M)`, `moving:(K,N)` | `output:(M,N)` | `NKIMatmul()(stationary=A_T, moving=B)` computes `A_T.T @ B` |
-| `NKITranspose` | `nkigym.ops.transpose` | `data:(P,F)` | `output:(F,P)` | TE transpose, ≤128×128 input |
-| `NKIDMATranspose` | `nkigym.ops.dma_transpose` | `data:(P,F)` | `output:(F,P)` | DMA transpose, frees TE for matmul |
-| `NKIActivationReduce` | `nkigym.ops.activation_reduce` | `data:(P,F)` | `output:(P,)` | `NKIActivationReduce(op=..., reduce_op=...)(data=X)` — reduces along F; output is the per-row reduction vector |
-| `NKIActivation` | `nkigym.ops.activation` | `data:(P,F)` or `(P,)` | same | `NKIActivation(op=..., scale=?, bias=?)(data=X)` — elementwise, no reduce |
-| `NKITensorScalar` | `nkigym.ops.tensor_scalar` | `data:(P,F)`, `operand0:(P,)` | `output:(P,F)` | `NKITensorScalar(op=...)(data=X, operand0=v)` — per-row vector broadcast along F |
+| Op | Import | Operands (reads → writes) | Call |
+|---|---|---|---|
+| `NKIAlloc` | `nkigym.ops.alloc` | — → declared buffer | `NKIAlloc(location="sbuf\|psum\|hbm", shape=(...), dtype="bfloat16\|float32\|float16")()` — declares a tensor |
+| `NKIMemset` | `nkigym.ops.memset` | — → dst:(P,F) | `NKIMemset(value=0.0)(dst=buffer)` — fills dst with scalar |
+| `NKILoad` | `nkigym.ops.load` | src:(P,F) → dst:(P,F) | `NKILoad()(src=param, dst=param_sbuf)` — HBM → SBUF |
+| `NKIStore` | `nkigym.ops.store` | src:(P,F) → dst:(P,F) | `NKIStore()(src=sbuf, dst=hbm_out)` — SBUF → HBM |
+| `NKITensorCopy` | `nkigym.ops.tensor_copy` | src:(P,F) → dst:(P,F) | `NKITensorCopy()(src=psum_acc, dst=sbuf_prod)` — typically PSUM → SBUF drain |
+| `NKITensorReduce` | `nkigym.ops.tensor_reduce` | data:(P,F) → dst:(P,) | `NKITensorReduce(axis=1, op="add\|max")(data=X, dst=reduced)` — reduce along axis |
+| `NKIMatmul` | `nkigym.ops.matmul` | stationary:(K,M), moving:(K,N), **dst:(M,N) RMW** | `NKIMatmul()(stationary=A_T, moving=B, dst=psum_acc)` — PSUM-accumulating; dst MUST be memset first |
+| `NKITranspose` | `nkigym.ops.transpose` | src:(P,F) → dst:(F,P) | `NKITranspose()(src=sbuf, dst=psum_T)` — TE transpose, ≤128×128; dst MUST be PSUM location |
+| `NKIDMATranspose` | `nkigym.ops.dma_transpose` | src:(P,F) → dst:(F,P) | `NKIDMATranspose()(src=sbuf_a, dst=sbuf_b)` — DMA transpose, frees TE |
+| `NKIActivationReduce` | `nkigym.ops.activation_reduce` | data:(P,F) → dst:(P,F) (scratch), reduce_res:(P,) | `NKIActivationReduce(op=..., reduce_op=...)(data=X, dst=scratch, reduce_res=reduced)` — dst is scratch; reduce_res is the per-row reduction vector |
+| `NKIActivation` | `nkigym.ops.activation` | data:(P,F) or (P,) → dst:same shape | `NKIActivation(op=..., scale=?, bias=?)(data=X, dst=Y)` — elementwise |
+| `NKITensorScalar` | `nkigym.ops.tensor_scalar` | data:(P,F), operand0:(P,) → dst:(P,F) | `NKITensorScalar(op=...)(data=X, operand0=v, dst=Y)` — per-row vector broadcast along F |
 
 Op-arg vocabulary: `op` ∈ `{square, exp, copy, reciprocal, tanh, rsqrt, sqrt}`; `reduce_op` ∈ `{add, max}`; `NKITensorScalar.op` ∈ `{multiply, add, subtract}`; `NKIActivation.scale` / `NKIActivation.bias` apply per-element pre-activation.
 
 # Translation procedure
 
-1. `NKILoad` every parameter from `INPUT_SPECS` at the top of the function — one named local per input (`x_sbuf = NKILoad()(data=x)`). All subsequent compute ops consume the `_sbuf` locals, never the raw parameters.
-2. List every tensor-level step in `f_numpy`, stripping `.astype(...)` and `keepdims=True` (numpy bookkeeping, not primitives).
-3. Map each step to one `NKIOp`. Key patterns:
-   - Fused reduce-then-activation (e.g. rmsnorm's `rsqrt(sum(x²)/F + eps)`): split into two DSL calls. Emit `NKIActivationReduce(op=<act>, reduce_op=<red>)(data=X)` to get the raw reduction; then feed that into `NKIActivation(op=<post>, scale=<scalar>, bias=<scalar>)(data=reduced)` to apply the post-reduction activation with its affine scale/bias. `NKIActivation` applies `op(data * scale + bias)` per-element on its input; for `rsqrt(reduced/F + eps)`, use `scale=1/F` and `bias=eps`.
-   - `X * v[:, None]` with `v` shape `(P,)` → `NKITensorScalar(op="multiply", data=X, operand0=v)`. Broadcasts along F.
-4. Fix matmul operand shapes. `NKIMatmul` computes `stationary.T @ moving`. For `A @ B`, transpose `A` first.
-5. Bind every intermediate to a named local — no chained calls.
-6. `NKIStore` the final compute result and `return` the `NKIStore` output.
+1. Declare explicit buffers for every non-parameter tensor. Use `NKIAlloc(location=..., shape=..., dtype=...)()` BEFORE any op uses it:
+   - Load targets: `location="sbuf"` — holds loaded parameters
+   - PSUM accumulators: `location="psum", dtype="float32"` — used by matmul and transpose
+   - Intermediate compute results: `location="sbuf"` — holds activation, reduce, tensor_scalar outputs
+   - Kernel output: `location="hbm"` — the tensor `NKIStore` writes into and the function returns
+2. Load every parameter from `INPUT_SPECS` at the top. Each parameter needs an SBUF buffer declared first, then `NKILoad()(src=param, dst=param_sbuf)`.
+3. List every tensor-level step in `f_numpy`, stripping `.astype(...)` and `keepdims=True` (numpy bookkeeping, not primitives).
+4. Map each step to one or more `NKIOp` calls. Key patterns:
+   - Matmul requires an explicit PSUM accumulator: declare `psum_acc = NKIAlloc(location="psum", shape=(M,N), dtype="float32")()`, then `NKIMemset(value=0.0)(dst=psum_acc)`, then `NKIMatmul()(stationary=A_T, moving=B, dst=psum_acc)`, then drain: `sbuf_prod = NKIAlloc(location="sbuf", shape=(M,N), dtype=...)()` and `NKITensorCopy()(src=psum_acc, dst=sbuf_prod)`.
+   - Transpose requires a PSUM destination: declare `psum_T = NKIAlloc(location="psum", shape=(F,P), dtype=...)()`, then `NKITranspose()(src=sbuf_input, dst=psum_T)`, then drain: `sbuf_T = NKIAlloc(location="sbuf", shape=(F,P), dtype=...)()` and `NKITensorCopy()(src=psum_T, dst=sbuf_T)`.
+   - `NKIActivationReduce` needs both a scratch buffer (dst) AND a per-row reduction output (reduce_res): declare both as separate SBUF `NKIAlloc` calls (scratch typically shape `(P,F)`, reduce_res shape `(P,)`), then `NKIActivationReduce(op=..., reduce_op=...)(data=X, dst=scratch, reduce_res=reduced)`.
+   - Fused reduce-then-activation (e.g. rmsnorm's `rsqrt(sum(x²)/F + eps)`): split into two DSL calls. Emit `NKIActivationReduce(op=<act>, reduce_op=<red>)(data=X, dst=scratch, reduce_res=raw_reduced)` to get the raw reduction; then feed that into `NKIActivation(op=<post>, scale=<scalar>, bias=<scalar>)(data=raw_reduced, dst=post_reduced)` to apply the post-reduction activation with its affine scale/bias. `NKIActivation` applies `op(data * scale + bias)` per-element on its input; for `rsqrt(reduced/F + eps)`, use `scale=1/F` and `bias=eps`.
+   - `X * v[:, None]` with `v` shape `(P,)`: declare an SBUF output buffer, then `NKITensorScalar(op="multiply")(data=X, operand0=v, dst=output)`. Broadcasts along F.
+5. Fix matmul operand shapes. `NKIMatmul` computes `stationary.T @ moving`. For `A @ B`, transpose `A` first using the PSUM-based transpose pattern above.
+6. Bind every intermediate to a named local — no chained calls.
+7. Final step: declare the HBM output buffer, then `NKIStore()(src=sbuf_final, dst=hbm_out)` and `return hbm_out`.
+
+# Example: matmul
+
+```python
+from nkigym.ops import nkigym_kernel
+from nkigym.ops.alloc import NKIAlloc
+from nkigym.ops.load import NKILoad
+from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.memset import NKIMemset
+from nkigym.ops.store import NKIStore
+from nkigym.ops.tensor_copy import NKITensorCopy
+
+
+@nkigym_kernel
+def f_nkigym(lhs_T, rhs):
+    lhs_T_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    rhs_sbuf   = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    psum_acc   = NKIAlloc(location="psum", shape=(2048, 2048), dtype="float32")()
+    sbuf_prod  = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    hbm_out    = NKIAlloc(location="hbm",  shape=(2048, 2048), dtype="bfloat16")()
+
+    NKILoad()(src=lhs_T, dst=lhs_T_sbuf)
+    NKILoad()(src=rhs,   dst=rhs_sbuf)
+    NKIMemset(value=0.0)(dst=psum_acc)
+    NKIMatmul()(stationary=lhs_T_sbuf, moving=rhs_sbuf, dst=psum_acc)
+    NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
+    NKIStore()(src=sbuf_prod, dst=hbm_out)
+    return hbm_out
+```
 
 # Conversation protocol
 
 - Every assistant turn emits exactly ONE ```python fenced code block: imports + any constants + `def f_nkigym(...):`. Nothing else — no prose before or after.
 - The orchestrator replies with a validator result. If `passed` is true the conversation ends. If false, read `error` / `max_abs_diff` / `max_rel_diff` and emit a revised candidate in the same format.
-- Common failure modes: wrong matmul transpose orientation, post-reduction activation squeezed into `NKIActivationReduce` (it has no `post_op` / `scale` / `bias` — emit a separate `NKIActivation` instead), wrong axis in a reduction, missing step in the DAG, output-shape mismatch (usually a missing or extra transpose).
+- Common failure modes: missing `NKIAlloc` declaration, wrong matmul transpose orientation, post-reduction activation squeezed into `NKIActivationReduce` (it has no `post_op` / `scale` / `bias` — emit a separate `NKIActivation` instead), wrong axis in a reduction, missing step in the DAG, output-shape mismatch (usually a missing or extra transpose), forgetting to memset PSUM before matmul, forgetting PSUM-to-SBUF drain after matmul or transpose.
 """
 
 

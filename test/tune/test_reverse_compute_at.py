@@ -28,14 +28,26 @@ def _mod_hand(body: list, dims: dict[str, DimInfo], tensors: dict[str, Tensor]) 
     )
 
 
+from nkigym.ops.alloc import NKIAlloc
+from nkigym.ops.memset import NKIMemset
+from nkigym.ops.tensor_copy import NKITensorCopy
+
+
 @nkigym_kernel
 def _matmul_k(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Simple matmul kernel fixture for ReverseComputeAt atom tests."""
-    lhs_s = NKILoad()(data=lhs)
-    rhs_s = NKILoad()(data=rhs)
-    out_s = NKIMatmul()(stationary=lhs_s, moving=rhs_s)
-    out = NKIStore()(data=out_s)
-    return out
+    """First-class buffers matmul fixture for ReverseComputeAt atom tests."""
+    lhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    rhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    psum_acc = NKIAlloc(location="psum", shape=(2048, 2048), dtype="float32")()
+    sbuf_prod = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+    hbm_out = NKIAlloc(location="hbm", shape=(2048, 2048), dtype="bfloat16")()
+    NKILoad()(src=lhs, dst=lhs_sbuf)
+    NKILoad()(src=rhs, dst=rhs_sbuf)
+    NKIMemset(value=0.0)(dst=psum_acc)
+    NKIMatmul()(stationary=lhs_sbuf, moving=rhs_sbuf, dst=psum_acc)
+    NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
+    NKIStore()(src=sbuf_prod, dst=hbm_out)
+    return hbm_out
 
 
 _INPUT_SPECS: dict[str, dict] = {
@@ -80,13 +92,19 @@ def test_reverse_apply_regenerates_residual_trip_on_partial_ancestor() -> None:
     Move the consumer under subtree 0's root loop. ``num_tiles[d0]=16``,
     ancestor ``covered=2`` → regenerated ``L(d0, 8)``.
     """
-    producer = BodyLeaf(op_cls=object, phase="main", writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
+    producer = BodyLeaf(op_cls=object, writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
     producer_outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[producer])
-    consumer = BodyLeaf(op_cls=object, phase="main", reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
+    consumer = BodyLeaf(op_cls=object, reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
     dims = {"d0": DimInfo(dim_id="d0", total_size=2048, tile_size=128, num_tiles=16)}
     tensors = {
         "p": Tensor(
-            name="p", dim_ids=("d0",), shape=(2048,), dtype="float32", origin="intermediate", buffer_degree={"d0": 1}
+            name="p",
+            dim_ids=("d0",),
+            shape=(2048,),
+            dtype="float32",
+            origin="intermediate",
+            location="sbuf",
+            buffer_degree={"d0": 1},
         )
     }
     module = _mod_hand(body=[producer_outer, consumer], dims=dims, tensors=tensors)
@@ -112,13 +130,19 @@ def test_reverse_apply_skips_fully_covered_dim() -> None:
     * Subtree 1: consumer at the root.
     ``num_tiles[d0]=16`` → ``covered==num_tiles`` → no inner d0 loop.
     """
-    producer = BodyLeaf(op_cls=object, phase="main", writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
+    producer = BodyLeaf(op_cls=object, writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
     producer_outer = LoopNode("d0", 16, AxisRole.PARALLEL, children=[producer])
-    consumer = BodyLeaf(op_cls=object, phase="main", reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
+    consumer = BodyLeaf(op_cls=object, reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
     dims = {"d0": DimInfo(dim_id="d0", total_size=2048, tile_size=128, num_tiles=16)}
     tensors = {
         "p": Tensor(
-            name="p", dim_ids=("d0",), shape=(2048,), dtype="float32", origin="intermediate", buffer_degree={"d0": 1}
+            name="p",
+            dim_ids=("d0",),
+            shape=(2048,),
+            dtype="float32",
+            origin="intermediate",
+            location="sbuf",
+            buffer_degree={"d0": 1},
         )
     }
     module = _mod_hand(body=[producer_outer, consumer], dims=dims, tensors=tensors)
@@ -137,9 +161,9 @@ def test_reverse_apply_skips_fully_covered_dim() -> None:
 
 def test_reverse_apply_raises_on_indivisible_residual() -> None:
     """Ancestor trip does not divide num_tiles → AtomLegalityError."""
-    producer = BodyLeaf(op_cls=object, phase="main", writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
+    producer = BodyLeaf(op_cls=object, writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
     producer_outer = LoopNode("d0", 3, AxisRole.PARALLEL, children=[producer])
-    consumer = BodyLeaf(op_cls=object, phase="main", reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
+    consumer = BodyLeaf(op_cls=object, reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
     dims = {"d0": DimInfo(dim_id="d0", total_size=17 * 128, tile_size=128, num_tiles=17)}
     tensors = {
         "p": Tensor(
@@ -148,6 +172,7 @@ def test_reverse_apply_raises_on_indivisible_residual() -> None:
             shape=(17 * 128,),
             dtype="float32",
             origin="intermediate",
+            location="sbuf",
             buffer_degree={"d0": 1},
         )
     }

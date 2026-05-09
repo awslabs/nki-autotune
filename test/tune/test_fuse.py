@@ -13,7 +13,7 @@ def _mod(body):
 
 
 def test_fuse_par_par_collapses():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 8, AxisRole.PARALLEL, children=[leaf])
     outer = LoopNode("d0", 4, AxisRole.PARALLEL, children=[inner])
     mod = _mod([outer])
@@ -26,8 +26,8 @@ def test_fuse_par_par_collapses():
 
 
 def test_fuse_rejects_non_perfect_outer():
-    leaf_a = BodyLeaf(op_cls=object, phase="a")
-    leaf_b = BodyLeaf(op_cls=object, phase="b")
+    leaf_a = BodyLeaf(op_cls=object)
+    leaf_b = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 8, AxisRole.PARALLEL, children=[leaf_a])
     outer = LoopNode("d0", 4, AxisRole.PARALLEL, children=[inner, leaf_b])
     mod = _mod([outer])
@@ -36,7 +36,7 @@ def test_fuse_rejects_non_perfect_outer():
 
 
 def test_fuse_rejects_sequential():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 2, AxisRole.SEQUENTIAL, children=[leaf])
     outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[inner])
     mod = _mod([outer])
@@ -45,7 +45,7 @@ def test_fuse_rejects_sequential():
 
 
 def test_fuse_acc_acc_different_reduce_op_illegal():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 2, AxisRole.ACCUMULATION, reduce_op="max", children=[leaf])
     outer = LoopNode("d0", 2, AxisRole.ACCUMULATION, reduce_op="add", children=[inner])
     mod = _mod([outer])
@@ -54,7 +54,7 @@ def test_fuse_acc_acc_different_reduce_op_illegal():
 
 
 def test_fuse_acc_acc_same_op_legal():
-    leaf = BodyLeaf(op_cls=object, phase="main")
+    leaf = BodyLeaf(op_cls=object)
     inner = LoopNode("d1", 2, AxisRole.ACCUMULATION, reduce_op="add", children=[leaf])
     outer = LoopNode("d0", 2, AxisRole.ACCUMULATION, reduce_op="add", children=[inner])
     mod = _mod([outer])

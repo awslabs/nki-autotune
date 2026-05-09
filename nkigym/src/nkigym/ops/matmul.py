@@ -5,7 +5,7 @@ caller-provided PSUM at fp32 regardless of input dtype; a separate
 drain gadget copies PSUM→SBUF once the K loop closes.
 """
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import nki.isa as nisa
 import numpy as np
@@ -19,8 +19,14 @@ class NKIMatmul(NKIOp):
     """Matrix multiply: ``stationary.T @ moving -> output``."""
 
     NAME: ClassVar[str] = "nc_matmul"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"stationary": ("K", "M"), "moving": ("K", "N")}
-    OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("M", "N")}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {
+        "stationary": ("K", "M"),
+        "moving": ("K", "N"),
+        "dst": ("M", "N"),
+    }
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"stationary", "moving"})
+    RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset({"dst"})
+    RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "rmw"
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"K": AxisRole.ACCUMULATION}
     TILE_LIMITS: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": MATMUL_FREE_MAX}
 

@@ -10,8 +10,8 @@ Modules:
   tiles, 3D SBUF allocation shapes, and total-slot counts.
 * :mod:`nkigym.codegen.lowering.inject_multi_buffer` — slot-index
   expressions consuming ``buffer_degree`` and ``required_tiles``.
-* :mod:`nkigym.codegen.lowering.lower_phases` — per-``(op_cls, phase)``
-  body emitter registry; 11 emitters in total.
+* :mod:`nkigym.codegen.lowering.emit_ops` — per-op_cls body emitter
+  registry; 12 emitters in total.
 * :mod:`nkigym.codegen.lowering.inject_software_pipeline` — prologue
   body and epilogue emission for loops with ``pipeline_depth > 1``.
 * :mod:`nkigym.codegen.lowering.emit_source` — top-level walker;

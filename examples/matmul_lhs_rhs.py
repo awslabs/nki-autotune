@@ -14,25 +14,40 @@ import numpy as np
 
 from nkigym.codegen import render_eager
 from nkigym.ops import nkigym_kernel
+from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
+from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
+
+M, K, N = 2048, 2048, 2048
 
 
 @nkigym_kernel
 def matmul_lhs_rhs_nkigym(lhs, rhs):
-    """``lhs @ rhs`` via a Transpose staging pass."""
-    lhs_sbuf = NKILoad()(data=lhs)
-    rhs_sbuf = NKILoad()(data=rhs)
-    lhs_T = NKITranspose()(data=lhs_sbuf)
-    prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)
-    out = NKIStore()(data=prod)
-    return out
+    """``lhs @ rhs`` — transposes lhs to the stationary operand layout."""
+    lhs_sbuf = NKIAlloc(location="sbuf", shape=(M, K), dtype="bfloat16")()
+    rhs_sbuf = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
+    lhs_T_psum = NKIAlloc(location="psum", shape=(K, M), dtype="float32")()
+    lhs_T_sbuf = NKIAlloc(location="sbuf", shape=(K, M), dtype="bfloat16")()
+    psum_acc = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
+    sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
+    hbm_out = NKIAlloc(location="hbm", shape=(M, N), dtype="bfloat16")()
+
+    NKILoad()(src=lhs, dst=lhs_sbuf)
+    NKILoad()(src=rhs, dst=rhs_sbuf)
+    NKITranspose()(src=lhs_sbuf, dst=lhs_T_psum)
+    NKITensorCopy()(src=lhs_T_psum, dst=lhs_T_sbuf)
+    NKIMemset(value=0.0)(dst=psum_acc)
+    NKIMatmul()(stationary=lhs_T_sbuf, moving=rhs_sbuf, dst=psum_acc)
+    NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
+    NKIStore()(src=sbuf_prod, dst=hbm_out)
+    return hbm_out
 
 
 if __name__ == "__main__":
-    M, K, N = 2048, 2048, 2048
     INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
     CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhs_rhs_eager")
     shutil.rmtree(CACHE_ROOT, ignore_errors=True)

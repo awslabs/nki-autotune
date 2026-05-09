@@ -33,7 +33,7 @@ def test_sblock_scope_empty():
 
 
 def _make_leaf(op_cls=object, reads=None, writes=()):
-    return BodyLeaf(op_cls=op_cls, phase="main", reads=reads or {}, writes=writes)
+    return BodyLeaf(op_cls=op_cls, reads=reads or {}, writes=writes)
 
 
 def test_subtree_signature_stable():

@@ -117,7 +117,7 @@ def subtree_signature(node: "LoopNode | BodyLeaf") -> int:
     from nkigym.codegen.ir import BodyLeaf
 
     if isinstance(node, BodyLeaf):
-        return hash(("leaf", id(node.op_cls), node.phase, tuple(sorted(node.reads.items())), node.writes))
+        return hash(("leaf", id(node.op_cls), tuple(sorted(node.reads.items())), node.writes, node.reads_writes))
     return hash(
         (
             "node",

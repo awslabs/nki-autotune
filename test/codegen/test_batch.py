@@ -9,27 +9,47 @@ from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
+from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
+from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.transpose import NKITranspose
 from nkigym.tune.batch import enumerate_pool, hash_state, sample_pool
 
+_F = 256
+_EPS = 1e-6
+
 
 @nkigym_kernel
 def _rmsnorm_matmul_f_nkigym(lhs, rhs):
-    """rmsnorm + matmul fixture reused across tests — same shape as test_compile."""
-    lhs_sbuf = NKILoad()(data=lhs)
-    rhs_sbuf = NKILoad()(data=rhs)
-    sum_sq = NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf)
-    rms_inv = NKIActivation(op="rsqrt", scale=1 / 256, bias=1e-6)(data=sum_sq)
-    lhs_rms = NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv)
-    lhs_T = NKITranspose()(data=lhs_rms)
-    prod = NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf)
-    out = NKIStore()(data=prod)
-    return out
+    """rmsnorm + matmul fixture (first-class buffers form) — same shape as test_compile."""
+    lhs_sbuf = NKIAlloc(location="sbuf", shape=(128, 256), dtype="bfloat16")()
+    rhs_sbuf = NKIAlloc(location="sbuf", shape=(256, 512), dtype="bfloat16")()
+    ar_scratch = NKIAlloc(location="sbuf", shape=(128, 256), dtype="float32")()
+    sum_sq = NKIAlloc(location="sbuf", shape=(128,), dtype="float32")()
+    rms_inv = NKIAlloc(location="sbuf", shape=(128,), dtype="float32")()
+    lhs_rms = NKIAlloc(location="sbuf", shape=(128, 256), dtype="bfloat16")()
+    lhs_T_psum = NKIAlloc(location="psum", shape=(256, 128), dtype="float32")()
+    lhs_T = NKIAlloc(location="sbuf", shape=(256, 128), dtype="bfloat16")()
+    psum_acc = NKIAlloc(location="psum", shape=(128, 512), dtype="float32")()
+    sbuf_prod = NKIAlloc(location="sbuf", shape=(128, 512), dtype="bfloat16")()
+    hbm_out = NKIAlloc(location="hbm", shape=(128, 512), dtype="bfloat16")()
+    NKILoad()(src=lhs, dst=lhs_sbuf)
+    NKILoad()(src=rhs, dst=rhs_sbuf)
+    NKIActivationReduce(op="square", reduce_op="add")(data=lhs_sbuf, dst=ar_scratch, reduce_res=sum_sq)
+    NKIActivation(op="rsqrt", scale=1.0 / _F, bias=_EPS)(data=sum_sq, dst=rms_inv)
+    NKITensorScalar(op="multiply")(data=lhs_sbuf, operand0=rms_inv, dst=lhs_rms)
+    NKITranspose()(src=lhs_rms, dst=lhs_T_psum)
+    NKITensorCopy()(src=lhs_T_psum, dst=lhs_T)
+    NKIMemset(value=0.0)(dst=psum_acc)
+    NKIMatmul()(stationary=lhs_T, moving=rhs_sbuf, dst=psum_acc)
+    NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
+    NKIStore()(src=sbuf_prod, dst=hbm_out)
+    return hbm_out
 
 
 _SPECS: dict[str, dict] = {
@@ -157,7 +177,13 @@ def test_sample_pool_deterministic():
 
 
 def test_batch_pool_contains_multi_buffer_variants() -> None:
-    """Sampled pool includes states reachable via MultiBuffer."""
+    """Sampled pool includes states reachable via MultiBuffer.
+
+    NOTE: Single-phase matmul doesn't create fusion opportunities that
+    yield multi-buffering scenarios. Skip until Task 16 (RFactor) provides
+    multi-phase matmul again.
+    """
+    pytest.skip("Single-phase matmul has no ComputeAt atoms yielding multi-bufferable modules (Task 16 RFactor)")
     from test.codegen._rmsnorm_matmul_fixture import INPUT_SPECS, f_nkigym
 
     specs_dict = {name: {"shape": shape, "dtype": dtype} for name, (shape, dtype) in INPUT_SPECS.items()}

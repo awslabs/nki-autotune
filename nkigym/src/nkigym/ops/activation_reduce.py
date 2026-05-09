@@ -3,11 +3,12 @@
 Math: ``reduce_op(op(data), axis=F)``. Output is the per-row reduction vector.
 The fully activated tile is an internal byproduct the ISA call discards.
 
-OPERAND_AXES / OUTPUT_AXES reflect that only the reduce result is the
-op's output — the activated tile is internally consumed and discarded.
+OPERAND_AXES reflects the valid ISA signature: ``data`` is the input
+tile, ``dst`` receives the activated scratch (discarded by downstream
+consumers), and ``reduce_res`` receives the per-row reduction result.
 """
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 
@@ -57,23 +58,15 @@ class NKIActivationReduce(NKIOp):
     """
 
     NAME: ClassVar[str] = "activation_reduce"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F")}
-    OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"output": ("P",)}
-    OUTPUT_DTYPES: ClassVar[dict[str, str]] = {"output": "float32"}
-    """Reduction accumulator must stay fp32 — narrowing to bf16 across a
-    2048-element sum loses the low-bit accumulation precision and
-    propagates into the matmul accumulator. Matches the nisa.activation_reduce
-    HW contract."""
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "dst": ("P", "F"), "reduce_res": ("P",)}
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data"})
+    RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "slot"
     """The F axis is a reduction axis — the op iterates over all F tiles
     before its output is complete. Render emits an F-loop memset prologue
     (on the reduce accumulator) and places downstream consumers outside
     this F-loop, symmetric to how matmul's K dim is handled."""
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": VE_PARTITION_MAX, "F": VE_FREE_MAX}
-    OP_LOCAL_BUFFERS: ClassVar[dict[str, tuple[str, str, tuple[str, ...]]]] = {
-        "scratch": ("sbuf", "float32", ("P", "F")),
-        "slot_vec": ("sbuf", "float32", ("P", "F_slot")),
-    }
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: ``reduce_op(op(data), axis=F)``.

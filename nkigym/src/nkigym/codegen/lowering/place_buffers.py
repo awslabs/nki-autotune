@@ -129,7 +129,7 @@ def _find_access_paths(tensor_name: str, module: KernelModule) -> list[list[Loop
         """Pre-order walk; record paths whose leaves touch ``tensor_name``."""
         stack.append(node)
         if isinstance(node, BodyLeaf):
-            if tensor_name in node.writes or tensor_name in node.reads.values():
+            if tensor_name in node.writes or tensor_name in node.reads.values() or tensor_name in node.reads_writes:
                 paths.append(list(stack))
         else:
             for child in node.children:

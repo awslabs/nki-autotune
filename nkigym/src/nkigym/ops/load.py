@@ -12,8 +12,8 @@ class NKILoad(NKIOp):
     """Copy an HBM tensor into an SBUF buffer with identical logical layout."""
 
     NAME: ClassVar[str] = "dma_copy"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
-    OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("P", "F")}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"src": ("P", "F"), "dst": ("P", "F")}
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     """``nisa.dma_copy`` has no tile-size constraint beyond
     ``src.size == dst.size`` and partition-dim validation. Only the
     partition axis is capped by the NeuronCore's 128-partition SBUF
@@ -22,8 +22,8 @@ class NKILoad(NKIOp):
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: identity pass-through."""
-        data: np.ndarray = kwargs["data"]
-        return data
+        src: np.ndarray = kwargs["src"]
+        return src
 
 
 def load_block(sbuf: Any, mem_slice: Any) -> None:

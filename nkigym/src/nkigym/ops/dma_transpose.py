@@ -5,7 +5,7 @@ Same math as :class:`NKITranspose` (which uses Tensor Engine
 contend with matmul for TE cycles. Useful when the matmul is TE-bound
 and an explicit DMA transpose is cheaper than a round-trip through
 PSUM. Also the target of the ``LoadTranspose`` rewrite, where the
-``data`` input is an HBM parameter instead of an SBUF buffer.
+``src`` input is an HBM parameter instead of an SBUF buffer.
 """
 
 from typing import Any, ClassVar
@@ -17,11 +17,11 @@ from nkigym.ops.base import NKIOp
 
 
 class NKIDMATranspose(NKIOp):
-    """DMA-engine transpose ``data(P, F) -> output(F, P)``."""
+    """DMA-engine transpose ``src(P, F) -> dst(F, P)``."""
 
     NAME: ClassVar[str] = "dma_transpose"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F")}
-    OUTPUT_AXES: ClassVar[dict[str, tuple[str, str]]] = {"output": ("F", "P")}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"src": ("P", "F"), "dst": ("F", "P")}
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     """``nisa.dma_transpose`` has no per-axis tile cap beyond the
     partition axis (128). The mode-specific shape rules (HWDGE's
     ``src.shape[0]==16`` and ``src.shape[-1] % 128 == 0``, SWDGE's
@@ -30,9 +30,9 @@ class NKIDMATranspose(NKIOp):
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: ``data.T``."""
-        data: np.ndarray = kwargs["data"]
-        return data.T
+        """CPU simulation: ``src.T``."""
+        src: np.ndarray = kwargs["src"]
+        return src.T
 
 
 def dma_transpose_block(sbuf_dst: Any, src: Any) -> None:
