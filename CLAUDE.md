@@ -11,8 +11,8 @@ Performance tuning:
 - [x] Unified tune stage
 - [x] Loop fusion
 - [x] Loop order
-- [ ] Multi buffer
-- [ ] Software pipelining
+- [x] Multi buffer
+- [x] Software pipelining
 - [ ] Revisit forest IR design
 - [ ] Tiles per block
 - [ ] Hoist
