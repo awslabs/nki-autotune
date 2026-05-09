@@ -64,6 +64,7 @@ The fix needs to be architectural. Per-atom legality patches (e.g., rejecting `C
 - RFactor is supported as a first-class rewrite atom that takes a reducer leaf + outer factor and mechanically emits the staging-buffer decomposition.
 - The root cause of the `psum_tile` scope-death bug closes: once PSUM is a real `Tensor` with producer/consumer tracked through `reads`/`writes`/`reads_writes`, placement atoms cannot separate init/update/drain across disjoint sibling subtrees because the dataflow edge on the PSUM tensor is load-bearing.
 - Synthesis skill updated in-place so agents author `f_nkigym` in the new form.
+- After code lands, a new reference doc `docs/ir-design.md` describes the current IR end-to-end (NKIOp surface, `KernelModule` fields, canonical-build pipeline, atom table, renderer structure, file map). The stale pre-first-class-buffers walkthrough at `2026-05-07-forest-ir-visual-walkthrough-design/` is deleted.
 
 **Non-goals:**
 

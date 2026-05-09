@@ -17,6 +17,8 @@
 - `python examples/matmul_lhs_rhs.py` end-to-end.
 - `python examples/rmsnorm_matmul.py` end-to-end.
 - The broken rewrite chain from the bug report is unreachable: `python scripts/tune_matmul_lhsT_rhs.py` never renders a kernel with PSUM allocation inside an accumulation loop.
+- `docs/ir-design.md` exists, describes the new IR from canonical build through render, and references current file paths / line numbers.
+- `/home/ubuntu/nki-autotune/2026-05-07-forest-ir-visual-walkthrough-design/` is deleted from the repo (stale docs from the pre-first-class-buffers IR).
 
 ---
 
@@ -38,6 +40,9 @@ test/codegen/
   test_rfactor_rmw.py                     # matmul rfactor recipe tests
   test_rfactor_slot.py                    # activation_reduce rfactor recipe tests
   test_first_class_buffers.py             # canonical parse + render of NKIAlloc
+
+docs/
+  ir-design.md                            # current IR design reference (Task 20)
 ```
 
 ### Files to modify
@@ -96,6 +101,7 @@ test/tune/
 
 ```
 nkigym/src/nkigym/tune/decompose_reduction.py
+2026-05-07-forest-ir-visual-walkthrough-design/          # stale pre-first-class-buffers IR docs
 ```
 
 ---
@@ -109,6 +115,7 @@ The refactor has interdependent concerns (IR shape, canonical builder, renderer,
 3. **Phase 3 (Tasks 10–14):** Rewrite example `f_nkigym` files + fixtures + synthesis skill. End-to-end green.
 4. **Phase 4 (Tasks 15–18):** Add `RFactor` atom + both recipes + tests. Swap `DecomposeReduction` out of the sampler.
 5. **Phase 5 (Task 19):** Full validation — CPU-sim examples, batch-tune smoke, MFU gate.
+6. **Phase 6 (Task 20):** Write `docs/ir-design.md` documenting the new IR end-to-end; delete the stale `2026-05-07-forest-ir-visual-walkthrough-design/` directory.
 
 ---
 
@@ -3312,17 +3319,289 @@ git commit -m "docs: record first-class buffers + RFactor landing in learnings"
 
 ---
 
+## Phase 6: Documentation
+
+### Task 20: Write `docs/ir-design.md` and delete the stale walkthrough directory
+
+**Files:**
+- Create: `docs/ir-design.md`
+- Delete: `2026-05-07-forest-ir-visual-walkthrough-design/` (entire directory)
+
+- [ ] **Step 1: Verify the stale directory contents before deletion**
+
+```bash
+ls -la 2026-05-07-forest-ir-visual-walkthrough-design/
+find 2026-05-07-forest-ir-visual-walkthrough-design/ -type f
+```
+
+Expected: design.md, plan.md, auto-dumps/, diagrams/*.mmd + .png, kernels/*.py. Nothing inside references current `nkigym/` APIs — those were snapshots of a pre-first-class-buffers IR and are now misleading.
+
+- [ ] **Step 2: Verify nothing else in the repo references the stale directory**
+
+```bash
+grep -rn "2026-05-07-forest-ir-visual-walkthrough" --include="*.md" --include="*.py" . 2>/dev/null | grep -v "^./2026-05-07-forest-ir"
+```
+
+Expected: no output (no cross-references to update).
+
+If any references exist, update them to point at `docs/ir-design.md` (created in Step 3) instead.
+
+- [ ] **Step 3: Write `docs/ir-design.md`**
+
+Create `docs/ir-design.md` with the following structure (fill each section from the current codebase — read the files listed, don't restate old designs):
+
+```markdown
+# nkigym IR Design
+
+*Reference: current state of the IR, canonical builder, schedule tree, rewrite atoms, and renderer after the 2026-05-09 first-class-buffers refactor.*
+
+## 1. Overview
+
+Three layers:
+
+1. **`f_nkigym`** — the user- or agent-authored Python function. Straight-line sequence of `NKIOp()(...)` calls, each mapping to one NKI ISA instruction or one `nl.ndarray` allocation. No loops, no conditionals, no tile-size awareness.
+2. **`KernelModule`** — the IR envelope built by `nkigym.codegen.canonical.build_canonical_module`. Holds signature + `module.tensors` (identity) + `module.dims` (iteration-space registry) + `module.body` (the schedule tree).
+3. **Rendered NKI source** — the `@nki.jit def f_nkigym(...)` function produced by `nkigym.codegen.render.render`. Runnable on NKI CPU-sim or on Trn2 HW.
+
+Schedule-tree rewrites (`Split`, `Reorder`, `ComputeAt`, `ReverseComputeAt`, `MultiBuffer`, `SoftwarePipeline`, `HoistInvariant`, `RFactor`) transform `KernelModule` → `KernelModule`. The same renderer lowers any valid `KernelModule` to source.
+
+## 2. The `NKIOp` surface
+
+Every `NKIOp` subclass mirrors one NKI ISA primitive or `nl.ndarray` call 1:1. No loops, no auto-expansion, no phase multiplexing. One `BodyLeaf` per op invocation in the schedule tree.
+
+| Op class | ISA primitive | reads | writes | reads_writes |
+|---|---|---|---|---|
+| `NKIAlloc` | `nl.ndarray(buffer=...)` | — | declared name | — |
+| `NKIMemset` | `nisa.memset` | — | `dst` | — |
+| `NKILoad` | `nisa.dma_copy` HBM→SBUF | `src` | `dst` | — |
+| `NKIStore` | `nisa.dma_copy` SBUF→HBM | `src` | `dst` | — |
+| `NKITensorCopy` | `nisa.tensor_copy` | `src` | `dst` | — |
+| `NKIDmaTranspose` | `nisa.dma_transpose` | `src` | `dst` | — |
+| `NKITranspose` | `nisa.nc_transpose` (PSUM dst) | `src` | `dst` | — |
+| `NKIActivation` | `nisa.activation` | `data`, `bias?` | `dst` | — |
+| `NKIActivationReduce` | `nisa.activation_reduce` | `data`, `bias?` | `dst`, `reduce_res` | — |
+| `NKITensorScalar` | `nisa.tensor_scalar` | `data`, `operand0` | `dst` | — |
+| `NKITensorReduce` | `nisa.tensor_reduce` | `data` | `dst` | — |
+| `NKIMatmul` | `nisa.nc_matmul` (PSUM accumulate-into) | `stationary`, `moving` | — | `dst` |
+
+Op class attributes (declared on every subclass):
+
+- `NAME`: the ISA call name.
+- `OPERAND_AXES: dict[str, tuple[str, ...]]` — per-operand abstract axis labels (`P`, `F`, `K`, `M`, `N`).
+- `INPUT_OPERANDS: frozenset[str]` — read-only operand slots; everything else is either a write or RMW.
+- `RMW_OPERANDS: frozenset[str]` — operands that are both read and written (matmul's `dst` only).
+- `AXIS_ROLES: dict[str, AxisRole]` — axes that are not `PARALLEL` (`K` for matmul → `ACCUMULATION`, `F` for activation_reduce / tensor_reduce → `ACCUMULATION`).
+- `TILE_LIMITS: dict[str, int]` — HW tile-size caps per axis.
+- `RFACTOR_RECIPE: Literal["rmw", "slot"] | None` — which rfactor recipe applies, or `None` for non-rfactorable ops.
+
+`nkigym/src/nkigym/ops/base.py` has the abstract base class; each concrete subclass lives next to it (`nkigym/src/nkigym/ops/<op>.py`).
+
+## 3. `f_nkigym` shape
+
+Every non-parameter tensor is declared by an explicit `NKIAlloc` call before any compute op reads or writes it. Every compute op takes a user-provided `dst=` kwarg pointing at an alloc'd tensor. Matmul's `dst` is an RMW operand — must be memset'd (or written by a prior op) before the matmul fires.
+
+Example (2048³ `lhs_T.T @ rhs`):
+
+```python
+@nkigym_kernel
+def f_nkigym(lhs_T, rhs):
+    lhs_T_sbuf = NKIAlloc(location="sbuf", shape=(K, M), dtype="bfloat16")()
+    rhs_sbuf   = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
+    psum_acc   = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
+    sbuf_prod  = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
+    hbm_out    = NKIAlloc(location="hbm",  shape=(M, N), dtype="bfloat16")()
+
+    NKILoad()(src=lhs_T, dst=lhs_T_sbuf)
+    NKILoad()(src=rhs,   dst=rhs_sbuf)
+    NKIMemset(value=0.0)(dst=psum_acc)
+    NKIMatmul()(stationary=lhs_T_sbuf, moving=rhs_sbuf, dst=psum_acc)
+    NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
+    NKIStore()(src=sbuf_prod, dst=hbm_out)
+    return hbm_out
+```
+
+The `@nkigym_kernel` decorator tags param `np.ndarray` inputs with `role="param"` at CPU-sim time and enforces that the final `return` is the output of an `NKIStore`.
+
+## 4. `KernelModule` — the IR envelope
+
+`nkigym.codegen.ir.KernelModule` carries:
+
+- `func_name: str` — emitted kernel name.
+- `param_names: list[str]` — kernel parameter signature.
+- `return_name: str` — tensor returned by the kernel (must be origin=`"intermediate"`, location=`"hbm"`).
+- `tensors: dict[str, Tensor]` — the **source of truth for tensor identity**.
+- `dims: dict[str, DimInfo]` — iteration-space registry: per-dim `total_size`, `tile_size`, `num_tiles`.
+- `body: list[LoopNode | BodyLeaf]` — the schedule tree.
+- `dep: DepCache` — lazy per-scope dependency cache.
+
+`Tensor` fields: `name`, `dim_ids`, `shape`, `dtype`, `origin ∈ {"param", "intermediate"}`, `location ∈ {"hbm", "sbuf", "psum"}`, `buffer_degree: dict[str, int]`. This is the **identity** record — what the tensor *is*.
+
+`BodyLeaf` fields: `op_cls`, `reads`, `writes`, `reads_writes`, `kwargs`, `axis_map` (abstract axis → concrete dim id), `dim_role` (per-dim role for this op). One `BodyLeaf` per NKIOp invocation, including `NKIAlloc` (which has `reads={}`, `writes=(name,)`, and `kwargs={"tensor_name": name}`).
+
+`LoopNode` fields: `dim_id`, `trip_count`, `role: AxisRole`, `children`, `reduce_op`, `name` (canonical form `i_<dim>_<ordinal>`), `pipeline_depth`.
+
+## 5. TVM-style Buffer vs Allocate separation
+
+`module.tensors[name]` is the record of tensor identity — like TVM's `Buffer`. Persists across rewrites. Holds shape, dtype, location, buffer_degree.
+
+`NKIAlloc` `BodyLeaf` is the *allocation point* in the schedule tree — like TVM's `AllocateNode`. Its only kwarg is `tensor_name`. The renderer looks up `module.tensors[tensor_name]` at emission time for shape/dtype/location.
+
+Consequences:
+- `ComputeAt` on an `NKIAlloc` leaf moves the allocation in emission order; `module.tensors` is untouched.
+- `MultiBuffer` mutates `module.tensors[name].buffer_degree`; the `NKIAlloc` leaf's position is untouched.
+- Allocation *shape* is computed from `module.tensors[name].shape`, shrunk by ancestor-loop coverage above the `NKIAlloc` leaf, scaled by `buffer_degree`.
+
+## 6. Canonical build pipeline
+
+`nkigym/src/nkigym/codegen/canonical.py::build_canonical_module`:
+
+1. **AST parse** f_nkigym. Each statement is either an `NKIAlloc` call (→ `_AllocRecord` with name/location/shape/dtype) or another `NKIOp` call (→ `_ParsedOpRaw`).
+2. **Build `module.tensors`** from params (`input_specs`) + alloc records.
+3. **Unify axes** by walking ops in source order, matching abstract axes (from `OPERAND_AXES`) against each tensor's dim_ids. First op to touch a tensor seeds its dim_ids from `OPERAND_AXES`; subsequent ops unify.
+4. **Derive `module.dims`** from per-axis `TILE_LIMITS` and the unified dim sizes.
+5. **Build the schedule tree**: alloc leaves at forest root in source order; compute/copy leaves each wrapped in a 1N-per-dim `LoopNode` chain over the op's `touched_dims`.
+6. **Assign canonical loop-var names** (`i_<dim>_<ordinal>`).
+
+Result: a `KernelModule` where every `BodyLeaf` is self-describing, every non-parameter tensor is declared in both `module.tensors` and as an `NKIAlloc` leaf, and `validate_dataflow_ordering` passes.
+
+## 7. `validate_dataflow_ordering`
+
+`nkigym/src/nkigym/codegen/ir.py::validate_dataflow_ordering` walks `body` in pre-order DFS. For each leaf:
+- Every name in `leaf.reads ∪ leaf.reads_writes` must be a kernel parameter or already-written by a prior leaf.
+- After the leaf fires, names in `leaf.writes ∪ leaf.reads_writes` are added to the written set.
+
+RMW operands encode ordering structurally. The matmul phase-order carve-out that the pre-refactor validator had is gone — "init before update" is enforced by `NKIMatmul.reads_writes = ('psum_acc',)` requiring a prior writer, which is the `NKIMemset`.
+
+## 8. Rewrite atoms
+
+Each atom is a frozen dataclass with `is_legal(module) → bool` and `apply(module) → KernelModule`. Tune-stage enumerators in `nkigym/src/nkigym/tune/batch.py` produce every legal `(leaf/loop, parameters)` atom from a module state; the sampler picks atoms uniformly at random, applies them, and dedupes destination states via `hash_state`.
+
+| Atom | Purpose | Acts on | Invariant |
+|---|---|---|---|
+| `Split(loop_path, factor)` | Split a LoopNode into outer+inner (divisor-only; non-divisor → `AtomLegalityError`) | LoopNode | 1N form: one sibling per dim |
+| `Reorder(loop_path, new_order)` | Rearrange the same-dim LoopNodes in a subtree | LoopNode | Subtree purity: no cross-dim dependencies |
+| `ComputeAt(leaf_path, target_loop_path)` | Move a leaf under a target loop; regenerate inner loops for uncovered dims | BodyLeaf | Dataflow: target subtree contains a consumer |
+| `ReverseComputeAt(leaf_path, target_loop_path)` | Move a leaf under a producer's subtree | BodyLeaf | Dataflow: target subtree contains a producer |
+| `MultiBuffer(tensor_name, dim_id, degree)` | Set `tensor.buffer_degree[dim]` | Tensor | `degree ≤ num_tiles / required_tiles` |
+| `SoftwarePipeline(loop_path, depth)` | Skew a LoopNode into prologue/body/epilogue | LoopNode | `depth == chain_length` |
+| `HoistInvariant(leaf_path, target_loop_path)` | Intra-own-tree LICM | BodyLeaf | Pure within own subtree |
+| `RFactor(reducer_leaf_path, outer_factor)` | Decompose a reducer into staging buffer + split + combine | BodyLeaf | Parent loop is `ACCUMULATION`; `1 < outer_factor < num_tiles` and divides |
+
+`Fuse` and `HoistInvariant` are enumerated but excluded from the default random sampler (opt-in via agent synthesis).
+
+`RFactor` dispatches on `op_cls.RFACTOR_RECIPE`:
+- `"rmw"` (matmul): emits `[NKIAlloc(partials), F_outer{ NKIAlloc(acc_local), NKIMemset(acc_local), F_inner{ NKIMatmul(dst=acc_local) }, NKITensorCopy(acc_local → partials[outer]) }, NKITensorReduce(partials → original_drain_dst, axis=outer)]`.
+- `"slot"` (activation_reduce): emits `[NKIAlloc(partials), NKIAlloc(scratch_local), F_outer{ NKIActivationReduce(dst=scratch_local, reduce_res=partials[outer]) }, NKITensorReduce(partials → original_reduce_res, axis=outer)]`.
+
+## 9. Rendering
+
+`nkigym.codegen.render.render(module)` → NKI source string.
+
+`emit_source.py` walks `module.body` in pre-order. For each `BodyLeaf`, dispatches through `_BODY_EMITTERS[op_cls.__name__]` (one emitter per op class, defined in `emit_ops.py`). For each `LoopNode` with `pipeline_depth == 1`, opens a `for <name> in range(<trip>):` block and recurses. For `pipeline_depth > 1`, delegates to `inject_software_pipeline._emit_pipelined_loop`.
+
+Body emitters are purely mechanical: look up each operand's `Tensor` by name, build slice expressions from the leaf's path (via `inject_multi_buffer.tile_slice`), emit one ISA call. `NKIAlloc`'s emitter builds the allocation shape from `tensor.shape` modulo ancestor-loop coverage, scaled by `buffer_degree`, and emits `<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=nl.<location>)`.
+
+No separate allocation pass. No phase multiplexing. No auto-hoisted intermediates. Where an `NKIAlloc` sits in the tree is where its allocation lands in the emitted source.
+
+## 10. File map
+
+```
+nkigym/src/nkigym/
+  ops/
+    base.py                  # NKIOp ABC, AxisRole, _RoleArray, nkigym_kernel decorator
+    alloc.py, memset.py, tensor_copy.py, tensor_reduce.py
+    matmul.py, activation.py, activation_reduce.py, tensor_scalar.py
+    load.py, store.py, transpose.py, dma_transpose.py
+  codegen/
+    ir.py                    # KernelModule, TreeIR, LoopNode, BodyLeaf, Tensor, DimInfo, AxisRole
+    canonical.py             # build_canonical_module(f_nkigym, input_specs) → KernelModule
+    dep_cache.py             # DepCache + subtree_signature
+    render.py                # render(module) → NKI source
+    lowering/
+      emit_source.py         # forest walker
+      emit_ops.py            # per-op-class body emitters (_BODY_EMITTERS dict)
+      _emit_utils.py         # _Writer (indent tracking)
+      place_buffers.py       # required_tiles, tensor_total_slots helpers
+      inject_multi_buffer.py # slot-index expressions
+      inject_software_pipeline.py  # prologue/body/epilogue emission
+  tune/
+    __init__.py              # KernelRewrite protocol, AtomLegalityError
+    split.py, reorder.py, compute_at.py, reverse_compute_at.py
+    multi_buffer.py, software_pipeline.py, hoist_invariant.py, fuse.py
+    rfactor.py               # RFactor + two recipes + enumerator
+    batch.py                 # frontier-expansion sampler
+    stage.py                 # run_tune driver
+  synthesis/
+    SKILL.md                 # agent prompt with worked examples
+    ...
+```
+
+## 11. References
+
+- Spec: `docs/superpowers/specs/2026-05-09-first-class-buffers-and-rfactor-design.md`
+- Plan: `docs/superpowers/plans/2026-05-09-first-class-buffers-and-rfactor.md`
+- Prior IR refactor: `docs/superpowers/specs/2026-05-08-ir-and-transforms-refactor-design.md`
+- Multi-buffer + software-pipeline design: `docs/superpowers/specs/2026-05-07-multi-buffer-software-pipeline-design.md`
+- Canonical 1N form: `docs/superpowers/specs/2026-05-08-canonical-1N-and-computeat-partial-coverage-design.md`
+```
+
+When filling in the doc, read each module listed in §10 to ensure the described behavior matches the code on disk at commit time. Update section numbers in the body if the codebase evolves before landing.
+
+- [ ] **Step 4: Verify the doc is self-consistent**
+
+```bash
+grep -n "TBD\|TODO\|<placeholder\|<fill" docs/ir-design.md
+```
+
+Expected: no output.
+
+Read the whole doc once (3-4 min) and check:
+- Every file path in §10 exists (`ls nkigym/src/nkigym/<path>`).
+- Every op table row in §2 matches the op class's attributes.
+- Every atom in §8 exists as a `nkigym/tune/<name>.py` file.
+
+- [ ] **Step 5: Delete the stale walkthrough directory**
+
+```bash
+git rm -r 2026-05-07-forest-ir-visual-walkthrough-design/
+```
+
+Expected: directory contents removed from the index.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add docs/ir-design.md
+git commit -m "docs: add docs/ir-design.md; delete stale 2026-05-07 forest IR walkthrough"
+```
+
+- [ ] **Step 7: Cross-reference from learnings**
+
+Append one line to `.claude/rules/learnings.md` under the Architecture section:
+
+```markdown
+- **`docs/ir-design.md`**: source-of-truth reference for the current IR (NKIOp surface, `KernelModule` fields, canonical-build pipeline, atom table, renderer structure, file map). Keep in sync when IR fields or atoms change. *(2026-05-09 ET)*
+```
+
+```bash
+git add .claude/rules/learnings.md
+git commit -m "docs: point learnings at docs/ir-design.md"
+```
+
+---
+
 ## Self-Review
 
 **Spec coverage check:**
 
-- §2 Goals: every one of the 6 goals is implemented by a task (1–4 scaffold, 5–9 surgery, 10–14 migration, 15–18 RFactor, 19 gates). ✓
+- §2 Goals: every one of the 6 goals is implemented by a task (1–4 scaffold, 5–9 surgery, 10–14 migration, 15–18 RFactor, 19 gates, 20 docs). ✓
 - §3 Op surface: Tasks 1–5 cover every op class change (RMW_OPERANDS, INPUT_OPERANDS, RFACTOR_RECIPE, dst in OPERAND_AXES, new op classes). ✓
 - §4 IR changes: Task 2 adds `Tensor.location` and `BodyLeaf.reads_writes`; Task 6 rewrites `validate_dataflow_ordering`; Task 8 deletes `phase` / `op_local_buffers` / `OpLocalBuffer`. ✓
 - §5 Canonical builder: Task 7 parses NKIAlloc + single-phase leaves + RMW handling; Task 8 deletes multi-phase machinery. ✓
 - §6 Renderer: Task 9 covers all sub-bullets (tree-position allocs, delete _emit_sbuf_allocations, _emit_hbm_output, _emit_param_asserts; rename lower_phases → emit_ops; op_cls-keyed dispatch). ✓
 - §7 RFactor: Tasks 15–18 cover signature/legality/enumerator (15), rmw recipe (16), rendered CPU-sim verification (17), slot recipe (18). ✓
 - §8 Migration: Tasks 10–14 cover examples + fixtures + synthesis skill. Task 19 runs the end-to-end gates. ✓
+- Documentation scope: Task 20 writes `docs/ir-design.md` and deletes the stale `2026-05-07-forest-ir-visual-walkthrough-design/` directory. ✓
 
 **Placeholder scan:** None of "TBD", "TODO", "implement later", "similar to Task N" appear. Every step with code has the code.
 
