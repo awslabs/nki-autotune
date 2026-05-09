@@ -15,8 +15,12 @@
 
 - A name appears in at most one of `{reads, writes, reads_writes}` per `BodyLeaf`.
 - `validate_dataflow_ordering` is the single source of truth for dataflow legality. No op-specific carve-outs.
-- Every non-parameter tensor is declared by exactly one `NKIAlloc` leaf, which dominates all reads/writes of that tensor in emission order.
-- Tree position determines allocation scope. Allocation shapes are mechanically derived from the LCA of the alloc leaf and the tensor's uses.
+- **Tensor identity and allocation scope are separate concerns** (mirrors TVM's `Buffer` vs `Allocate`):
+  - `module.tensors[name]` is the source of truth for what a named tensor *is* — shape, dtype, location, dim_ids, buffer_degree, origin. Persists across rewrites unless an atom explicitly mutates it. Not derived.
+  - `NKIAlloc` `BodyLeaf` is the source of truth for *where* storage is created in emission order. Its only kwarg is `tensor_name`; the emitter looks up shape/dtype/location via `module.tensors[tensor_name]`.
+  - Atoms that change tensor identity (e.g. `MultiBuffer` on `buffer_degree`) mutate `module.tensors`. Atoms that change allocation scope (e.g. `ComputeAt` on an alloc leaf) move the `NKIAlloc` leaf. The two never mix.
+- Every non-parameter tensor has exactly one `NKIAlloc` leaf, which dominates all reads/writes of that tensor in emission order.
+- Allocation shape is computed at emission time from `module.tensors[name]` and the alloc leaf's tree position. `required_tiles` (LCA walk including the alloc leaf) shrinks the shape to cover only the iterations above the alloc leaf.
 - Canonical `f_nkigym` is straight-line — no `for` loops, no conditionals. The schedule tree is derived from each op's `touched_dims`.
 
 ## Rejected alternatives
@@ -75,21 +79,26 @@ The fix needs to be architectural. Per-atom legality patches (e.g., rejecting `C
 
 ```python
 class NKIAlloc(NKIOp):
-    """Declare a tensor with explicit location/shape/dtype.
+    """Anchor an allocation for a declared tensor at this tree position.
 
-    Emitted as `<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=nl.<location>)`
-    at this leaf's position in the tree.
+    In f_nkigym source, the user-facing call shape is
+    `psum_acc = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()` —
+    those kwargs declare the `Tensor` identity. The canonical builder reads
+    them to populate `module.tensors["psum_acc"]`, then emits a BodyLeaf
+    whose only kwarg is `tensor_name="psum_acc"`.
 
-    kwargs:
-        location: "hbm" | "sbuf" | "psum"
-        shape:    tuple[int, ...]
-        dtype:    str (e.g. "float32", "bfloat16")
+    At render time, the emitter looks up `module.tensors[tensor_name]`
+    for shape/dtype/location and emits
+    `<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=nl.<location>)`
+    at this leaf's tree position.
+
+    BodyLeaf kwargs: {"tensor_name": str}
     reads: {}
-    writes: (<output_name>,)
+    writes: (tensor_name,)
     """
 ```
 
-Maps to `nl.ndarray(buffer=nl.shared_hbm | nl.sbuf | nl.psum)`. Registered as a real leaf in the schedule tree — emission happens at the leaf's tree position, not at function top. Placement rewrites move it like any other leaf.
+`NKIAlloc` is a `BodyLeaf` like any other op. It carries only a back-reference into `module.tensors` — not the declaration itself. The declaration lives in `module.tensors`, the allocation-point declaration lives in the tree. Placement rewrites (`ComputeAt`, etc.) move the alloc leaf without touching `module.tensors`.
 
 ### 3.2 Complete op table
 
@@ -155,6 +164,8 @@ def f_nkigym(lhs_T, rhs):
 ```
 
 Every non-parameter tensor is declared explicitly. Every ISA call appears as its own NKIOp invocation with a user-provided `dst=` kwarg. `return hbm_out` is the only f_nkigym-level control-flow construct.
+
+The user-facing `NKIAlloc(location=..., shape=..., dtype=...)` call form populates `module.tensors[name]` with those fields at canonical build time; the resulting `NKIAlloc` `BodyLeaf` in the tree carries only `tensor_name=name` (see §4.1).
 
 ## 4. IR changes
 
@@ -278,15 +289,19 @@ From `canonical.py`:
 
 ### 6.1 Tree-position-driven allocation
 
-`NKIAlloc` is a `BodyLeaf`. The forest walker hits it like any other leaf; its body emitter emits:
+`NKIAlloc` is a `BodyLeaf` with one kwarg: `tensor_name`. The forest walker hits it like any other leaf. Its body emitter looks up `module.tensors[tensor_name]` and emits:
 
 ```python
-<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=nl.<buffer_expr>)
+<name> = nl.ndarray(<emitted_shape>, dtype=nl.<tensor.dtype>, buffer=nl.<buffer_expr>)
 ```
 
-where `<buffer_expr>` is `shared_hbm` / `sbuf` / `psum` based on `tensor.location`.
+where `<buffer_expr>` is `shared_hbm` / `sbuf` / `psum` based on `tensor.location`, and `<emitted_shape>` is derived as follows:
 
-Shape is computed from tree position: if the alloc leaf sits at forest root, `shape` is the full declared shape from the `NKIAlloc` call. If the alloc sits inside loops that cover some of the tensor's dims, `shape` shrinks to the single-iteration scope for the covered dims. `required_tiles` (already a helper in `place_buffers.py`) gives the per-dim factor — LCA walk still drives sizing, but LCA now includes the `NKIAlloc` leaf's path.
+- **Start** from `tensor.shape` (the declared shape in `module.tensors`).
+- **Shrink along each dim** covered by ancestor loops of the alloc leaf: if N iterations of dim `d` sit above the alloc leaf, the emitted shape's `d` dimension divides by N.
+- **Scale back up by `buffer_degree[d]`** for multi-buffering.
+
+`required_tiles` (already a helper in `place_buffers.py`) handles the LCA walk; it now includes the `NKIAlloc` leaf's path in the LCA computation so that sibling loops above the alloc don't factor into the shrink.
 
 ### 6.2 Deleted pieces
 
@@ -355,12 +370,12 @@ LoopNode(K, ACCUMULATION) {
 NKITensorCopy(src=psum_acc, dst=sbuf_prod)
 ```
 
-Output after `RFactor(reducer_leaf_path=<K/matmul>, outer_factor=4)`:
+Output after `RFactor(reducer_leaf_path=<K/matmul>, outer_factor=4)` (alloc leaves shown with their referenced tensor's shape/location inline for readability; the actual leaf carries only `tensor_name`):
 
 ```
-NKIAlloc(psum_partials, location="sbuf", shape=(M, N, 4), dtype="float32")
+NKIAlloc(tensor_name="psum_partials")    # module.tensors["psum_partials"]: sbuf, (M, N, 4), float32
 LoopNode(K_outer=4, PARALLEL) {
-    NKIAlloc(psum_acc_local, location="psum", shape=(M, N), dtype="float32")
+    NKIAlloc(tensor_name="psum_acc_local")    # module.tensors["psum_acc_local"]: psum, (M, N), float32
     NKIMemset(dst=psum_acc_local, value=0.0)
     LoopNode(K_inner=K_original/4, ACCUMULATION) {
         NKIMatmul(stationary, moving, dst=psum_acc_local)
@@ -373,11 +388,11 @@ NKITensorReduce(src=psum_partials, dst=sbuf_prod, axis=K_outer, op="add")
 Mechanical steps:
 1. Locate and remove the original `NKIMemset` + `NKITensorCopy` siblings of the K-LoopNode.
 2. Split K-LoopNode into `K_outer` (PARALLEL, trip=outer_factor) wrapping `K_inner` (ACCUMULATION, trip=K_original/outer_factor).
-3. Register two new `Tensor` entries: `psum_partials` (SBUF, shape=(M, N, outer_factor)) and `psum_acc_local` (PSUM, same shape as original `psum_acc`).
-4. Under `K_outer`, build the sibling sequence: `NKIAlloc(psum_acc_local)`, `NKIMemset(dst=psum_acc_local)`, `K_inner` with matmul, `NKITensorCopy(src=psum_acc_local, dst=psum_partials[K_outer])`.
-5. Insert `NKIAlloc(psum_partials)` before `K_outer`.
+3. Add two new entries to `module.tensors`: `psum_partials` (SBUF, shape=(M, N, outer_factor)) and `psum_acc_local` (PSUM, same shape as original `psum_acc`).
+4. Under `K_outer`, build the sibling sequence: `NKIAlloc(tensor_name="psum_acc_local")`, `NKIMemset(dst=psum_acc_local)`, `K_inner` with matmul, `NKITensorCopy(src=psum_acc_local, dst=psum_partials[K_outer])`.
+5. Insert `NKIAlloc(tensor_name="psum_partials")` before `K_outer`.
 6. Append `NKITensorReduce(src=psum_partials, dst=<original drain target>, axis=K_outer)` after `K_outer`.
-7. Mark the original `psum_acc` unreferenced (frontier dedup removes it).
+7. Remove the original `psum_acc` entry from `module.tensors` (no longer referenced by any leaf).
 8. Rename canonical loop vars across the tree.
 
 ### 7.4 Recipe "slot" — slot-indexed reducers (activation_reduce)
@@ -385,20 +400,20 @@ Mechanical steps:
 Input tree:
 
 ```
-NKIAlloc(sum_acc, location="sbuf", shape=(P, 1), dtype="float32")
-NKIAlloc(scratch, location="sbuf", shape=(P, F), dtype="float32")
+NKIAlloc(tensor_name="sum_acc")    # module.tensors["sum_acc"]: sbuf, (P, 1), float32
+NKIAlloc(tensor_name="scratch")    # module.tensors["scratch"]: sbuf, (P, F), float32
 NKIActivationReduce(data, dst=scratch, reduce_res=sum_acc)
 ```
 
 Output after `RFactor(reducer_leaf_path=<activation_reduce>, outer_factor=4)`:
 
 ```
-NKIAlloc(partials, location="sbuf", shape=(P, 1, 4), dtype="float32")
-NKIAlloc(scratch, location="sbuf", shape=(P, F), dtype="float32")    # unchanged
+NKIAlloc(tensor_name="partials")       # module.tensors["partials"]: sbuf, (P, 1, 4), float32
+NKIAlloc(tensor_name="scratch_local")  # module.tensors["scratch_local"]: sbuf, (P, F/4), float32
 LoopNode(F_outer=4, PARALLEL) {
     NKIActivationReduce(
         data=data[..., F_outer*(F/4):(F_outer+1)*(F/4)],
-        dst=scratch[..., F_outer*(F/4):(F_outer+1)*(F/4)],
+        dst=scratch_local,
         reduce_res=partials[..., F_outer:F_outer+1],
     )
 }
@@ -406,14 +421,15 @@ NKITensorReduce(src=partials, dst=sum_acc, axis=F_outer, op="add")
 ```
 
 Mechanical steps:
-1. Register one new `Tensor` entry: `partials` (SBUF, shape=(P, 1, outer_factor)). The existing `scratch` allocation is reused — it already has shape `(P, F)`, and each F_outer iteration writes into the appropriate F slice. Scratch is write-only (nobody reads it after an `activation_reduce` call completes), so slice aliasing across outer iterations is safe.
-2. Wrap the activation_reduce leaf in a new `F_outer` LoopNode (PARALLEL, trip=outer_factor).
-3. Rewrite the leaf's `data` operand axis map to slice along F.
-4. Rewrite the leaf's `reduce_res` operand to point at `partials` (slot expression keyed on F_outer).
-5. Rewrite the leaf's `dst` operand to slice along F on the existing `scratch` (inherits from F_outer).
-6. Append `NKITensorReduce(src=partials, dst=<original reduce_res>, axis=F_outer, op=<original reduce_op>)` after the F_outer loop.
-7. Mark the original `sum_acc` allocation still live (it's still the target of the closing `tensor_reduce`'s `dst`).
-8. Rename canonical loop vars.
+1. Add two new entries to `module.tensors`: `partials` (SBUF, shape=(P, 1, outer_factor)) and `scratch_local` (SBUF, shape=(P, F/outer_factor)).
+2. Insert `NKIAlloc(tensor_name="partials")` and `NKIAlloc(tensor_name="scratch_local")` leaves at appropriate positions (outer for `partials`, inside the F_outer loop for `scratch_local` if it fits the tree scope).
+3. Wrap the activation_reduce leaf in a new `F_outer` LoopNode (PARALLEL, trip=outer_factor).
+4. Rewrite the leaf's `data` operand axis map to slice along F.
+5. Rewrite the leaf's `reduce_res` operand to point at `partials` (slot expression keyed on F_outer).
+6. Rewrite the leaf's `dst` operand to point at `scratch_local`.
+7. Append `NKITensorReduce(src=partials, dst=<original reduce_res>, axis=F_outer, op=<original reduce_op>)` after the F_outer loop.
+8. The original `sum_acc` entry in `module.tensors` stays — it's still the target of the closing `tensor_reduce`'s `dst`.
+9. Rename canonical loop vars.
 
 ### 7.5 Legality
 
