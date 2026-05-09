@@ -15,6 +15,7 @@
 - **Online fusion Alg 2**: `(op_X, op_A)` — op_X∈{SEQ,ACC}; op_A strictly ACC. Role lattice `PAR⊂SEQ⊂SUM`; detector `{SEQ}→PAR*→SUM`. *(2026-05-01 23:00 ET)*
 - **HLO algsimp folds flash-identity constants** → flash w/ `m=-inf,l=0,O=0` Python consts collapses to vanilla. Workaround: promote state to kernel inputs (Parameter HLO ops). *(2026-04-29 01:00 ET)*
 - **`dim_role` OP-LOCAL**: each op carries `dim_role={...}`; same dim can have different roles across ops. *(2026-04-25 00:00 ET)*
+- **`docs/ir-design.md`**: source-of-truth reference for the current IR (NKIOp surface, `KernelModule` fields, canonical-build pipeline, atom table, renderer structure, file map). Keep in sync when IR fields or atoms change. *(2026-05-09 ET)*
 - **Path B (own IR stack) > Path A (fork neuronx-cc)**. Path A ceiling = compiler's internal IR (can't express online fusion, rotation, SW pipeline, PSUM-bank addrs); Path B = hand-tuned by construction. Source-level emit avoids fork maintenance. *(2026-05-04 05:00 ET)*
 - **Bottom-IR target**: hand-stripped `attention_cte.py` flash slice (bs=1, seq=16384, d=64, fp16, causal). Single `@nki.jit def`. 1.947ms / 44.88% MFU. Verbatim repro: `canonicalize(render(IR)) == canonicalize(manual)`. *(2026-05-04 05:00 ET)*
 - **`trace` (semantic) + `canonicalize` (spelling) = two passes**. Trace to FIXPOINT (inline + dataclass flatten + constant fold + DCE). Canonicalize: role-based rename, import sort, kwarg order. Dataclass-stripping only touches classes in the module under transform. *(2026-05-05 00:00 ET)*

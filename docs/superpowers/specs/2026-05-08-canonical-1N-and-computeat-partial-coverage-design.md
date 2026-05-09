@@ -139,7 +139,7 @@ tail-product encoding is trip-agnostic. Post-migration:
 
 - Re-render expected output strings in `test/codegen/test_place_buffers.py`
   and friends; mechanical diff removes trip-1 `for` lines.
-- `2026-05-07-forest-ir-visual-walkthrough-design/kernels/*.py`: re-render.
+- See `docs/ir-design.md` for the current IR reference.
 - Add `test/tune/test_split.py::test_apply_rejects_non_divisor_factor`.
 - Add `test/tune/test_split.py::test_is_legal_rejects_non_divisor`.
 
