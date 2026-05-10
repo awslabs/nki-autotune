@@ -1,4 +1,9 @@
-"""Render the eager ``lhs_T @ rhs`` kernel and CPU-sim it against numpy.
+"""Tune the ``lhs_T @ rhs`` matmul end-to-end via ``nkigym_compile``.
+
+Defines the canonical ``@nkigym_kernel`` math function and hands it to
+``nkigym_compile``. Writes the canonical kernel + ``num_kernels`` random
+variants into the cache dir, local fp32 CPU-verifies each, then profiles
+on the gym fleet.
 
 Usage::
 
@@ -9,10 +14,7 @@ Usage::
 import shutil
 from pathlib import Path
 
-import nki
-import numpy as np
-
-from nkigym.codegen import render_eager
+from nkigym import nkigym_compile
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -44,24 +46,19 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
 
 if __name__ == "__main__":
     INPUT_SPECS = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-    CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhsT_rhs_eager")
+    CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhsT_rhs_tune")
     shutil.rmtree(CACHE_ROOT, ignore_errors=True)
     CACHE_ROOT.mkdir(parents=True)
 
-    source = render_eager(matmul_lhsT_rhs_nkigym, INPUT_SPECS)
-    (CACHE_ROOT / "kernel.py").write_text(source)
-
-    sim_source = source.replace("nl.bfloat16", "nl.float32")
-    sim_ns: dict = {}
-    exec(sim_source, sim_ns)
-    kernel_fn = sim_ns["matmul_lhsT_rhs_nkigym"]
-    rng = np.random.default_rng(0)
-    lhs_T = rng.standard_normal((K, M)).astype(np.float32)
-    rhs = rng.standard_normal((K, N)).astype(np.float32)
-    actual = nki.simulate(kernel_fn)(lhs_T=lhs_T, rhs=rhs)
-    if isinstance(actual, tuple):
-        actual = actual[0]
-    expected = lhs_T.T @ rhs
-    print(f"[matmul_lhsT_rhs] max_abs={float(np.abs(actual - expected).max()):.3e}")
-    assert np.allclose(actual, expected, atol=5e-3, rtol=5e-3)
-    print(f"[matmul_lhsT_rhs] kernel written to {CACHE_ROOT / 'kernel.py'}")
+    nkigym_compile(
+        f=matmul_lhsT_rhs_nkigym,
+        input_specs=INPUT_SPECS,
+        cache_dir=CACHE_ROOT,
+        num_kernels=100,
+        hosts=["gym-1", "gym-2", "gym-3"],
+        venv_python="/home/ubuntu/venvs/kernel-env/bin/python",
+        neuron_platform_target="trn2",
+        seed=0,
+    )
+    print(f"[matmul_lhsT_rhs] canonical kernel: {CACHE_ROOT / 'kernel.py'}")
+    print(f"[matmul_lhsT_rhs] results.json:     {CACHE_ROOT / 'results.json'}")

@@ -10,7 +10,7 @@ from typing import Any, ClassVar, Literal
 import nki.isa as nisa
 import numpy as np
 
-from nkigym.ops.base import AxisRole, NKIOp
+from nkigym.ops.base import AxisRole, NKIOp, _operand_role
 
 MATMUL_FREE_MAX = 512
 
@@ -29,12 +29,22 @@ class NKIMatmul(NKIOp):
     RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "rmw"
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"K": AxisRole.ACCUMULATION}
     TILE_LIMITS: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": MATMUL_FREE_MAX}
+    OUTPUT_ROLE: ClassVar[str] = "psum"
+
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``stationary`` and ``moving`` must be SBUF-resident."""
+        for slot in ("stationary", "moving"):
+            role = _operand_role(kwargs[slot])
+            if role is not None and role != "sbuf":
+                raise TypeError(f"NKIMatmul({slot}=<role={role}>) expects sbuf; did you forget to load?")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: ``stationary.T @ moving``."""
+        """CPU simulation: accumulate ``stationary.T @ moving`` into ``dst`` (RMW) and return ``dst``."""
         stationary: np.ndarray = kwargs["stationary"]
         moving: np.ndarray = kwargs["moving"]
-        return stationary.T @ moving
+        dst: np.ndarray = kwargs["dst"]
+        dst[...] = dst + (stationary.astype(np.float32).T @ moving.astype(np.float32)).astype(dst.dtype)
+        return dst
 
 
 def matmul_block(psum_out: Any, sbuf_lhs_T: Any, sbuf_rhs: Any) -> None:

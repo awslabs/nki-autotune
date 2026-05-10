@@ -18,11 +18,9 @@ from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 from nkipy.runtime import BaremetalExecutor
 
-from autotune.runner.benchmark import benchmark_one, compute_golden, generate_tensors, simulate_one
-from autotune.runner.compare import assert_close
+from autotune.runner.benchmark import benchmark_one, generate_tensors
 from autotune.runner.compile import compile_one, init_compile_worker
 from autotune.runner.detect import detect_neuron_cores
 from autotune.runner.types import (
@@ -31,7 +29,6 @@ from autotune.runner.types import (
     ProfileResult,
     compile_failure_result,
     ensure_venv_on_path,
-    make_failure,
     resolve_dtype,
 )
 
@@ -52,29 +49,8 @@ def _setup_env(payload: dict[str, Any]) -> None:
     ensure_venv_on_path()
 
 
-def _cpu_sim_status(sim_output: np.ndarray, sim_error: str, golden: np.ndarray, atol: float, rtol: float) -> dict:
-    """Build a structured CPU simulation status dict.
-
-    Compares NKI CPU sim output against golden numpy output.
-
-    Returns:
-        Dict with 'passed' (bool) and either margin details or 'error' string.
-    """
-    result: dict = {"passed": False, "atol": atol, "rtol": rtol, "error": ""}
-    if sim_error:
-        result["error"] = sim_error
-    else:
-        try:
-            result = assert_close(sim_output, golden, atol=atol, rtol=rtol)
-        except AssertionError as e:
-            result["error"] = str(e)
-            result["atol"] = atol
-            result["rtol"] = rtol
-    return result
-
-
 def _process_kernel_job(kname: str, job: dict[str, Any], seed: int, nki_dir: Path) -> dict[str, Any]:
-    """Process a single kernel job: generate tensors, golden, run CPU sim.
+    """Process a single kernel job: write source, generate tensors.
 
     Returns a dict with all per-kernel data needed for compile and benchmark.
     """
@@ -90,20 +66,12 @@ def _process_kernel_job(kname: str, job: dict[str, Any], seed: int, nki_dir: Pat
     tensor_specs = {name: {"shape": list(shape), "dtype": dt} for name, (shape, dt) in job["tensor_specs"].items()}
     kwargs = generate_tensors(tensor_specs, seed)
 
-    if job.get("skip_cpu_sim"):
-        cpu_sim = {"passed": True, "skipped": True}
-    else:
-        golden = compute_golden(job["nkigym_source"], job["nkigym_func_name"], kwargs)
-        sim_output, sim_error = simulate_one(str(nki_path), func_name, kwargs)
-        cpu_sim = _cpu_sim_status(sim_output, sim_error, golden, job["atol"], job["rtol"])
-
     input_dtype_name = next(iter(job["tensor_specs"].values()))[1]
     return {
         "nki_path": str(nki_path),
         "func_name": func_name,
         "output_shape": output_shape,
         "kwargs": kwargs,
-        "cpu_sim": cpu_sim,
         "input_dtype_name": input_dtype_name,
         "neuronx_cc_args": neuronx_cc_args,
         "lnc": int(job.get("lnc", 1)),
@@ -165,20 +133,14 @@ def _benchmark_compiled(
         compile_results.append(cr)
         kd = kernel_data[cr.kernel_name]
         if cr.error:
-            compile_errors.append(compile_failure_result(cr, cpu_sim=kd["cpu_sim"]))
+            compile_errors.append(compile_failure_result(cr))
             continue
         out = OutputSpec(
             name=_OUTPUT_TENSOR_NAME, shape=kd["output_shape"], dtype=resolve_dtype(kd["input_dtype_name"])
         )
         hw_results.append(
             benchmark_one(
-                spike,
-                cr,
-                kd["func_name"],
-                kd["kwargs"],
-                out,
-                kd["cpu_sim"],
-                collect_detailed_profile=collect_detailed_profile,
+                spike, cr, kd["func_name"], kd["kwargs"], out, collect_detailed_profile=collect_detailed_profile
             )
         )
     return compile_results, compile_errors, hw_results
@@ -226,7 +188,7 @@ def _run_hw_benchmarks(
 
 
 def _run_pipeline(payload: dict[str, Any]) -> tuple[list[ProfileResult], dict[str, str]]:
-    """Execute the per-kernel compile-simulate-benchmark pipeline.
+    """Execute the per-kernel compile + benchmark pipeline.
 
     Returns:
         Tuple of (all_results, compiler_logs).
@@ -249,25 +211,12 @@ def _run_pipeline(payload: dict[str, Any]) -> tuple[list[ProfileResult], dict[st
     neuron_cores = detect_neuron_cores()
     logger.info("Worker ready: %d kernels, %d CPU, %d NC", len(kernel_jobs), os.cpu_count() or 1, neuron_cores)
 
-    kernel_data: dict[str, dict[str, Any]] = {}
-    sim_failures: list[ProfileResult] = []
-    for kname, job in kernel_jobs.items():
-        kd = _process_kernel_job(kname, job, seed, nki_dir)
-        if kd["cpu_sim"].get("passed"):
-            kernel_data[kname] = kd
-        else:
-            sim_failures.append(make_failure(kname, "skipped: CPU sim did not pass", cpu_sim=kd["cpu_sim"]))
-    logger.info("CPU sim done: %d passed, %d failed", len(kernel_data), len(sim_failures))
+    kernel_data: dict[str, dict[str, Any]] = {
+        kname: _process_kernel_job(kname, job, seed, nki_dir) for kname, job in kernel_jobs.items()
+    }
 
-    hw_results: list[ProfileResult] = []
-    compiler_logs: dict[str, str] = {}
-    if kernel_data:
-        executor, futures = _submit_compilations(kernel_data, neff_dir)
-        hw_results, compiler_logs = _run_hw_benchmarks(executor, futures, kernel_data, config, neff_dir)
-    else:
-        logger.info("No kernels passed CPU sim; skipping compile and hardware benchmark")
-
-    all_results = sim_failures + hw_results
+    executor, futures = _submit_compilations(kernel_data, neff_dir)
+    all_results, compiler_logs = _run_hw_benchmarks(executor, futures, kernel_data, config, neff_dir)
     logger.info("Done: %d results (%.1fs)", len(all_results), time.monotonic() - t_start)
 
     return all_results, compiler_logs

@@ -2,7 +2,7 @@
 
 from typing import Any, ClassVar
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _operand_role
 
 
 class NKITensorCopy(NKIOp):
@@ -17,6 +17,12 @@ class NKITensorCopy(NKIOp):
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("P", "F"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``src`` must be SBUF- or PSUM-resident (drain pattern allows PSUM src)."""
+        role = _operand_role(kwargs["src"])
+        if role is not None and role not in {"sbuf", "psum"}:
+            raise TypeError(f"NKITensorCopy(src=<role={role}>) expects sbuf or psum")
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: element-wise copy."""

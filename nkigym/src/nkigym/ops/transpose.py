@@ -13,7 +13,7 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _operand_role
 
 
 class NKITranspose(NKIOp):
@@ -25,11 +25,20 @@ class NKITranspose(NKIOp):
     """Tensor Engine caps the input at 128×128; Vector Engine at 32×32.
     We target Tensor Engine, so both axes are capped at 128."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    OUTPUT_ROLE: ClassVar[str] = "psum"
+
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``src`` must be SBUF-resident."""
+        role = _operand_role(kwargs["src"])
+        if role is not None and role != "sbuf":
+            raise TypeError(f"NKITranspose(src=<role={role}>) expects sbuf")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: ``src.T``."""
+        """CPU simulation: write ``src.T`` into ``dst`` and return ``dst``."""
         src: np.ndarray = kwargs["src"]
-        return src.T
+        dst: np.ndarray = kwargs["dst"]
+        dst[...] = src.T
+        return dst
 
 
 def transpose_block(sbuf_dst: Any, sbuf_src: Any) -> None:

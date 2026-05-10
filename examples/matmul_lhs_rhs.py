@@ -1,4 +1,4 @@
-"""Render the eager ``lhs @ rhs`` kernel (with inline Transpose) and CPU-sim.
+"""Tune ``lhs @ rhs`` (with inline transpose) end-to-end via ``nkigym_compile``.
 
 Usage::
 
@@ -9,10 +9,7 @@ Usage::
 import shutil
 from pathlib import Path
 
-import nki
-import numpy as np
-
-from nkigym.codegen import render_eager
+from nkigym import nkigym_compile
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -49,24 +46,19 @@ def matmul_lhs_rhs_nkigym(lhs, rhs):
 
 if __name__ == "__main__":
     INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-    CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhs_rhs_eager")
+    CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhs_rhs_tune")
     shutil.rmtree(CACHE_ROOT, ignore_errors=True)
     CACHE_ROOT.mkdir(parents=True)
 
-    source = render_eager(matmul_lhs_rhs_nkigym, INPUT_SPECS)
-    (CACHE_ROOT / "kernel.py").write_text(source)
-
-    sim_source = source.replace("nl.bfloat16", "nl.float32")
-    sim_ns: dict = {}
-    exec(sim_source, sim_ns)
-    kernel_fn = sim_ns["matmul_lhs_rhs_nkigym"]
-    rng = np.random.default_rng(1)
-    lhs = rng.standard_normal((M, K)).astype(np.float32)
-    rhs = rng.standard_normal((K, N)).astype(np.float32)
-    actual = nki.simulate(kernel_fn)(lhs=lhs, rhs=rhs)
-    if isinstance(actual, tuple):
-        actual = actual[0]
-    expected = lhs @ rhs
-    print(f"[matmul_lhs_rhs] max_abs={float(np.abs(actual - expected).max()):.3e}")
-    assert np.allclose(actual, expected, atol=5e-3, rtol=5e-3)
-    print(f"[matmul_lhs_rhs] kernel written to {CACHE_ROOT / 'kernel.py'}")
+    nkigym_compile(
+        f=matmul_lhs_rhs_nkigym,
+        input_specs=INPUT_SPECS,
+        cache_dir=CACHE_ROOT,
+        num_kernels=100,
+        hosts=["gym-1", "gym-2", "gym-3"],
+        venv_python="/home/ubuntu/venvs/kernel-env/bin/python",
+        neuron_platform_target="trn2",
+        seed=0,
+    )
+    print(f"[matmul_lhs_rhs] canonical kernel: {CACHE_ROOT / 'kernel.py'}")
+    print(f"[matmul_lhs_rhs] results.json:     {CACHE_ROOT / 'results.json'}")

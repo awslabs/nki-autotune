@@ -41,13 +41,6 @@ class KernelJob(NamedTuple):
             nkigym-generated kernels, hardcoded for reference kernels)
             to avoid unreliable AST parsing on the worker.
         input_specs: Map of param name to (shape, dtype_str).
-        nkigym_source: Source code of the nkigym math function; the
-            worker executes it as the golden reference, running every
-            ``NKIOp`` through its numpy ``__call__``.
-        nkigym_func_name: Name of the nkigym math function within
-            ``nkigym_source``.
-        atol: Absolute tolerance for CPU sim vs golden comparison.
-        rtol: Relative tolerance for CPU sim vs golden comparison.
         neuronx_cc_args: Extra flags forwarded to neuronx-cc via
             ``CompileOptions.set_pipeline_options(*args)``. Empty for
             nkigym-generated kernels; hand-allocated reference kernels
@@ -55,18 +48,14 @@ class KernelJob(NamedTuple):
             ``("enable-linear-scan-allocation=false",
             "enable-instruction-scheduling=false")`` — equivalent to
             nkilib's ``disable_backend_optimizations()``.
+        lnc: Logical NeuronCore count (1 or 2).
     """
 
     source: str
     func_name: str
     output_shape: tuple[int, ...]
     input_specs: dict[str, tuple[tuple[int, ...], str]]
-    nkigym_source: str
-    nkigym_func_name: str
-    atol: float
-    rtol: float
     neuronx_cc_args: tuple[str, ...] = ()
-    skip_cpu_sim: bool = False
     lnc: int = 1
 
 
@@ -98,12 +87,11 @@ class ProfileResult(NamedTuple):
     * ``ntff_b64`` is the base64-encoded NTFF trace. Callers can decode
       and feed these back into ``neuron-profile view`` offline.
 
-    All optional fields are ``None`` when CPU sim, compile, or hardware
-    execution failed, or when detailed collection is off.
+    All optional fields are ``None`` when compile or hardware execution
+    failed, or when detailed collection is off.
     """
 
     kernel_name: str
-    cpu_sim: dict
     hardware_output: str
     profiler_summary: dict | None = None
     profile_detailed: dict | None = None
@@ -124,23 +112,14 @@ def capture_error(exc: Exception) -> str:
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
-def _sim_not_run() -> dict:
-    """Create a fresh 'not run' CPU simulation status."""
-    return {"passed": False, "error": "not run"}
-
-
-def make_failure(kernel_name: str, hardware_output: str, cpu_sim: dict | None = None) -> ProfileResult:
+def make_failure(kernel_name: str, hardware_output: str) -> ProfileResult:
     """Create a failed ProfileResult with a null ``profiler_summary``."""
-    return ProfileResult(
-        kernel_name=kernel_name,
-        cpu_sim=cpu_sim if cpu_sim is not None else _sim_not_run(),
-        hardware_output=hardware_output,
-    )
+    return ProfileResult(kernel_name=kernel_name, hardware_output=hardware_output)
 
 
-def compile_failure_result(cr: CompileResult, cpu_sim: dict | None = None) -> ProfileResult:
+def compile_failure_result(cr: CompileResult) -> ProfileResult:
     """Convert a failed CompileResult into a ProfileResult."""
-    return make_failure(cr.kernel_name, cr.error, cpu_sim=cpu_sim)
+    return make_failure(cr.kernel_name, cr.error)
 
 
 def tensor_inputs(kwargs: dict) -> list[np.ndarray]:

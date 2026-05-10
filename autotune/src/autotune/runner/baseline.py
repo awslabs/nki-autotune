@@ -29,7 +29,7 @@ from nkipy.runtime import BaremetalExecutor, CompiledKernel
 logger = logging.getLogger(__name__)
 
 from autotune.runner.benchmark import _collect_profiler_outputs, generate_tensors
-from autotune.runner.types import ProfileResult, _sim_not_run, capture_error, ensure_venv_on_path
+from autotune.runner.types import ProfileResult, capture_error, ensure_venv_on_path
 
 
 def _compile_numpy_fn(
@@ -109,11 +109,9 @@ def profile_numpy_baseline(
             1-core config the rest of the pipeline uses.
 
     Returns:
-        A ``(ProfileResult, nki_source)`` pair. The ``ProfileResult``'s
-        ``cpu_sim`` field is marked "not run" -- the numpy function *is*
-        the golden reference, so there is nothing to compare against.
-        ``nki_source`` is the NKI text emitted by the compiler's
-        tensorizer (``lower_to_nki``); empty on failure.
+        A ``(ProfileResult, nki_source)`` pair. ``nki_source`` is the
+        NKI text emitted by the compiler's tensorizer (``lower_to_nki``);
+        empty on failure.
     """
     shutil.rmtree(output_dir, ignore_errors=True)
     os.makedirs(output_dir, exist_ok=True)
@@ -141,7 +139,6 @@ def profile_numpy_baseline(
         hardware_output = capture_error(e)
     result = ProfileResult(
         kernel_name=kernel_name,
-        cpu_sim=_sim_not_run(),
         hardware_output=hardware_output,
         profiler_summary=profiler_summary,
         profile_detailed=profile_detailed,

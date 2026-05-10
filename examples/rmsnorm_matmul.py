@@ -51,7 +51,7 @@ if __name__ == "__main__":
     gym via autotune.remote_profile. Adjust ``num_kernels`` / ``hosts``
     as needed; the ``seed`` kwarg controls sampling reproducibility."""
     nkigym_compile(
-        f_numpy=rmsnorm_matmul_numpy,
+        f=rmsnorm_matmul_numpy,
         input_specs=INPUT_SPECS,
         cache_dir=cache_dir,
         num_kernels=100,

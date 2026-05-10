@@ -12,7 +12,7 @@ from typing import Any, ClassVar, Literal
 
 import numpy as np
 
-from nkigym.ops.base import AxisRole, NKIOp
+from nkigym.ops.base import AxisRole, NKIOp, _operand_role
 
 VE_PARTITION_MAX = 128
 VE_FREE_MAX = 512
@@ -68,20 +68,20 @@ class NKIActivationReduce(NKIOp):
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": VE_PARTITION_MAX, "F": VE_FREE_MAX}
 
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``data`` must be SBUF-resident."""
+        role = _operand_role(kwargs["data"])
+        if role is not None and role != "sbuf":
+            raise TypeError(f"NKIActivationReduce(data=<role={role}>) expects sbuf")
+
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: ``reduce_op(op(data), axis=F)``.
+        """CPU simulation: write ``op(data)`` into ``dst`` and ``reduce_op(op(data), axis=F)`` into ``reduce_res``.
 
-        Mirrors the valid kwarg subset of ``nisa.activation_reduce``: only
-        ``op`` and ``reduce_op`` are accepted. For fused closures like
-        rmsnorm (``rsqrt(sum(x²)/K + eps)``), the DSL must spell out the
-        post-reduction activation as a separate ``NKIActivation`` call on
-        the reduction output.
-
-        Raises:
-            TypeError: any kwarg besides ``data`` / ``op`` / ``reduce_op``
-                is supplied.
+        Mirrors the valid ISA signature: configuration kwargs are
+        ``{op, reduce_op}``; operand kwargs are ``{data, dst, reduce_res}``.
+        Extra kwargs raise ``TypeError`` to keep the DSL honest.
         """
-        allowed = {"data", "op", "reduce_op"}
+        allowed = {"data", "op", "reduce_op", "dst", "reduce_res"}
         extra = set(kwargs) - allowed
         if extra:
             raise TypeError(
@@ -92,7 +92,11 @@ class NKIActivationReduce(NKIOp):
         data: np.ndarray = kwargs["data"]
         op_name: str = kwargs["op"]
         reduce_op: str = kwargs["reduce_op"]
+        dst: np.ndarray = kwargs["dst"]
+        reduce_res: np.ndarray = kwargs["reduce_res"]
         data_f32 = data.astype(np.float32)
         activated = _ACT_FNS[op_name](data_f32)
         reduced = _RED_FNS[reduce_op](activated, axis=1).astype(np.float32)
-        return reduced
+        dst[...] = activated.astype(dst.dtype)
+        reduce_res[...] = reduced.astype(reduce_res.dtype)
+        return reduce_res

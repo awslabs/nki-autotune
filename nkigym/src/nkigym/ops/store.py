@@ -5,7 +5,7 @@ from typing import Any, ClassVar
 import nki.isa as nisa
 import numpy as np
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _operand_role
 
 
 class NKIStore(NKIOp):
@@ -17,11 +17,20 @@ class NKIStore(NKIOp):
     """Same story as ``NKILoad``: ``nisa.dma_copy`` only caps the
     partition axis (128) — the free axis is unbounded."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    OUTPUT_ROLE: ClassVar[str] = "stored"
+
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``src`` must be SBUF-resident."""
+        role = _operand_role(kwargs["src"])
+        if role is not None and role != "sbuf":
+            raise TypeError(f"NKIStore(src=<role={role}>) expects sbuf; did you forget to stage through SBUF?")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: identity pass-through."""
+        """CPU simulation: copy ``src`` into ``dst`` and return ``dst``."""
         src: np.ndarray = kwargs["src"]
-        return src
+        dst: np.ndarray = kwargs["dst"]
+        dst[...] = src
+        return dst
 
 
 def store_block(mem_slice: Any, sbuf: Any) -> None:

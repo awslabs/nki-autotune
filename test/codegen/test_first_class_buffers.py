@@ -38,13 +38,23 @@ def test_nkialloc_has_empty_operand_axes_and_no_rmw():
     assert NKIAlloc.RFACTOR_RECIPE is None
 
 
-def test_nkialloc_cpu_sim_returns_numpy_zeros():
-    """CPU simulation allocates a numpy array of declared shape/dtype, zero-filled."""
+def test_nkialloc_cpu_sim_returns_uninitialised_array_with_location_role():
+    """CPU simulation allocates an uninitialised ``np.empty`` of declared shape/dtype.
+
+    The role on the returned _RoleArray matches ``location`` so downstream
+    ops' ``_check_roles`` sees the correct residency tag when the kernel
+    is called directly on numpy inputs.
+    """
     alloc = NKIAlloc(location="sbuf", shape=(4, 8), dtype="float32")
     result = alloc()
     assert result.shape == (4, 8)
     assert str(result.dtype) == "float32"
-    assert np.allclose(result, 0.0)
+    assert getattr(result, "role", None) == "sbuf"
+
+    alloc_hbm = NKIAlloc(location="hbm", shape=(2, 3), dtype="float32")
+    assert getattr(alloc_hbm(), "role", None) == "hbm"
+    alloc_psum = NKIAlloc(location="psum", shape=(2, 3), dtype="float32")
+    assert getattr(alloc_psum(), "role", None) == "psum"
 
 
 def test_nkimemset_writes_dst_with_value():

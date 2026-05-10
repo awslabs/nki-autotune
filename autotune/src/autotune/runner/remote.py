@@ -27,7 +27,6 @@ from autotune.runner.types import _DEFAULT_VENV_PYTHON, KernelJob, ProfileResult
 logger = logging.getLogger(__name__)
 
 _AUTOTUNE_ROOT = Path(__file__).parent.parent
-_NKIGYM_ROOT = Path(__file__).resolve().parents[4] / "nkigym" / "src" / "nkigym"
 
 _PROFILE_SUMMARY_FILE = "profile_summary.json"
 _PROFILE_DETAILED_FILE = "profile.json"
@@ -38,20 +37,20 @@ _worker_bundle_cache: bytes = b""
 
 
 def _get_worker_bundle() -> bytes:
-    """Build a base64-encoded bundle of the autotune and nkigym packages.
+    """Build a base64-encoded bundle of the autotune package.
 
     The bundle is a JSON dict mapping relative path to source code.
     Sent as the first line of stdin to the bootstrap script on each
-    remote host.
+    remote host. Only ``autotune`` travels — the worker compiles NKI
+    sources and reads the profiler, never touching nkigym.
     """
     global _worker_bundle_cache  # noqa: PLW0603
     if not _worker_bundle_cache:
         bundle: dict[str, str] = {}
         bundle["worker.py"] = (_AUTOTUNE_ROOT / "runner" / "worker.py").read_text()
-        for pkg_root in [_AUTOTUNE_ROOT, _NKIGYM_ROOT]:
-            for py_file in sorted(pkg_root.rglob("*.py")):
-                rel = py_file.relative_to(pkg_root.parent)
-                bundle[str(rel)] = py_file.read_text()
+        for py_file in sorted(_AUTOTUNE_ROOT.rglob("*.py")):
+            rel = py_file.relative_to(_AUTOTUNE_ROOT.parent)
+            bundle[str(rel)] = py_file.read_text()
         _worker_bundle_cache = base64.b64encode(json.dumps(bundle).encode("utf-8"))
     return _worker_bundle_cache
 
@@ -148,12 +147,7 @@ def _launch_ssh_workers(
                 "func_name": job.func_name,
                 "output_shape": list(job.output_shape),
                 "tensor_specs": {name: (list(shape), dt) for name, (shape, dt) in job.input_specs.items()},
-                "nkigym_source": job.nkigym_source,
-                "nkigym_func_name": job.nkigym_func_name,
-                "atol": job.atol,
-                "rtol": job.rtol,
                 "neuronx_cc_args": list(job.neuronx_cc_args),
-                "skip_cpu_sim": job.skip_cpu_sim,
                 "lnc": job.lnc,
             }
         payload_bytes = json.dumps(payload).encode("utf-8")
@@ -318,7 +312,6 @@ def _kernel_index_row(
     return {
         "kernel_name": r.kernel_name,
         "kernel_path": f"{stem}/{stem}.py",
-        "cpu_sim_passed": bool(r.cpu_sim.get("passed")),
         "hardware_output": r.hardware_output,
         "total_time_s": total_time_s,
         "mfu_estimated_percent": mfu,
@@ -339,7 +332,7 @@ def _write_results_json(
     _write_per_kernel_profiles(cache_dir, results)
 
     extracted: dict[str, tuple[float | None, float | None, float | None, float | None]] = {}
-    passed_cpu_sim = success = sbuf_oom = psum_oom = 0
+    success = sbuf_oom = psum_oom = 0
     for r in results:
         total = (r.profiler_summary or {}).get("total_time")
         total_s = float(total) if isinstance(total, (int, float)) else None
@@ -347,11 +340,8 @@ def _write_results_json(
         mbu = profiler_percent(r.profiler_summary, "mbu_estimated_percent")
         ceiling = profiler_percent(r.profiler_summary, "mfu_max_achievable_estimated_percent")
         extracted[r.kernel_name] = (total_s, mfu, mbu, ceiling)
-        sim_ok = bool(r.cpu_sim.get("passed"))
         hw_ok = total_s is not None
-        if sim_ok:
-            passed_cpu_sim += 1
-        if sim_ok and hw_ok:
+        if hw_ok:
             success += 1
         if not hw_ok and "Out of memory in sbuf" in r.hardware_output:
             sbuf_oom += 1
@@ -381,7 +371,6 @@ def _write_results_json(
             "worst_mfu": min(mfus) if mfus else None,
             "best_mbu": max(mbus) if mbus else None,
             "worst_mbu": min(mbus) if mbus else None,
-            "passed_cpu_sim": passed_cpu_sim,
             "success": success,
             "sbuf_oom": sbuf_oom,
             "psum_oom": psum_oom,

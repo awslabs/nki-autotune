@@ -15,7 +15,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _operand_role
 
 _ACT_FNS: dict[str, Any] = {
     "square": np.square,
@@ -46,10 +46,18 @@ class NKIActivation(NKIOp):
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data"})
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128, "F": 512}
 
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``data`` must be SBUF-resident."""
+        role = _operand_role(kwargs["data"])
+        if role is not None and role != "sbuf":
+            raise TypeError(f"NKIActivation(data=<role={role}>) expects sbuf")
+
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: ``op(data * scale + bias)``."""
+        """CPU simulation: write ``op(data * scale + bias)`` into ``dst`` and return ``dst``."""
         data: np.ndarray = kwargs["data"]
         op_name: str = kwargs["op"]
         scale = kwargs.get("scale", 1.0)
         bias = kwargs.get("bias", 0.0)
-        return _ACT_FNS[op_name](data.astype(np.float32) * scale + bias).astype(np.float32)
+        dst: np.ndarray = kwargs["dst"]
+        dst[...] = _ACT_FNS[op_name](data.astype(np.float32) * scale + bias).astype(dst.dtype)
+        return dst

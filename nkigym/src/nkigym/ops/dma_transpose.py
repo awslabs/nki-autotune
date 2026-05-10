@@ -13,7 +13,7 @@ from typing import Any, ClassVar
 import nki.isa as nisa
 import numpy as np
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _operand_role
 
 
 class NKIDMATranspose(NKIOp):
@@ -29,10 +29,18 @@ class NKIDMATranspose(NKIOp):
     the op's tile limits."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
 
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``src`` may be HBM param (``LoadTranspose`` rewrite) or SBUF."""
+        role = _operand_role(kwargs["src"])
+        if role is not None and role not in {"param", "sbuf"}:
+            raise TypeError(f"NKIDMATranspose(src=<role={role}>) expects param or sbuf")
+
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: ``src.T``."""
+        """CPU simulation: write ``src.T`` into ``dst`` and return ``dst``."""
         src: np.ndarray = kwargs["src"]
-        return src.T
+        dst: np.ndarray = kwargs["dst"]
+        dst[...] = src.T
+        return dst
 
 
 def dma_transpose_block(sbuf_dst: Any, src: Any) -> None:

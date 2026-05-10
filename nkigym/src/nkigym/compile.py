@@ -1,47 +1,51 @@
-"""``nkigym_compile``: synthesis → eager codegen → tune driver.
+"""Unified nkigym pipeline: dispatch → canonical → sample → verify → profile.
 
-Single public entry point for the nkigym compilation pipeline. Runs
-all three stages in order on every call and caches their artifacts
-under ``cache_dir``:
+``nkigym_compile`` is the single public entry point. It dispatches by
+reading ``__nkigym_kernel__`` off the passed callable:
 
-``<cache_dir>/``
+* ``@nkigym_kernel``-decorated → skip synthesis, use ``f`` directly.
+* plain numpy callable         → run :func:`compile_numpy_to_nkigym`,
+                                 write ``<cache>/f_nkigym.py``,
+                                 load, :func:`_verify_fns` against
+                                 the numpy reference, then continue.
 
-* ``f_nkigym.py``              — synthesised ``f_nkigym`` math function.
-* ``kernel.py``                — rendered canonical eager NKI kernel.
-* ``kernel_tuned_{idx:04d}.py``  — batch-path rendered samples
-  (``rewrites=None``; default).
-* ``kernel_tuned.py``          — explicit-path single rendered kernel
-  (``rewrites=[...]``).
-* ``results.json``             — per-kernel + aggregate profile data,
-  written by ``autotune.remote_profile`` on the batch path.
+Shared tail:
 
-``initial_codegen`` runs an automatic fp32 CPU-sim accuracy check.
-The batch tune path runs the same check per kernel on remote workers
-and raises if any kernel diverges.
+1. :func:`build_canonical_module` from ``f_nkigym``.
+2. Render the canonical module into ``<cache>/kernel.py``; run
+   :func:`_verify` — fp32 CPU sim vs ``f_nkigym``. Raise on mismatch.
+3. ``enumerate_pool`` + ``sample_pool`` → ``num_kernels`` random
+   variants.
+4. For each variant ``i``: render → ``<cache>/kernel_tuned_{i:04d}.py``;
+   run :func:`_verify`. Raise on mismatch.
+5. If ``hosts == []``: write a minimal ``results.json`` index and
+   return; no hardware profiling.
+6. Else: build a ``KernelJob`` dict and call
+   ``autotune.remote_profile``; ``results.json`` comes from there.
 """
 
 import importlib.util
 import json
+import random
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
-import nki
 import numpy as np
 
+from autotune.runner.api import remote_profile
+from autotune.runner.types import KernelJob
 from nkigym.codegen.canonical import build_canonical_module
 from nkigym.codegen.render import render
 from nkigym.synthesis import compile_numpy_to_nkigym
-from nkigym.tune import KernelRewrite
-from nkigym.tune.stage import run_tune
+from nkigym.tune.batch import enumerate_pool, sample_pool
+from nkigym.tune.verify import _draw_fp32_inputs, _verify, _verify_fns
 
-_ATOL = 5e-3
-_RTOL = 5e-3
-_SIM_SEED = 0
+_MAX_POOL_MULTIPLIER = 100
 
 
 def nkigym_compile(
-    f_numpy: Callable[..., np.ndarray],
+    f: Callable[..., np.ndarray],
     input_specs: dict[str, tuple[tuple[int, ...], str]],
     cache_dir: str | Path,
     num_kernels: int,
@@ -49,104 +53,90 @@ def nkigym_compile(
     venv_python: str,
     neuron_platform_target: str,
     collect_detailed_profile: bool = False,
-    rewrites: list[KernelRewrite] | None = None,
     seed: int = 0,
 ) -> None:
-    """Run the full nkigym compile pipeline: synthesis → initial_codegen → tune.
+    """Compile ``f`` to random NKI kernel variants, local-verify, profile.
+
+    Dispatches on ``f``:
+      * ``@nkigym_kernel``-decorated  → use directly.
+      * plain numpy                   → synthesise f_nkigym first.
 
     Args:
-        f_numpy: Plain-numpy reference. Drives synthesis (input),
-            ``initial_codegen``'s inline CPU-sim check (golden), and
-            the batch path's output-shape trace + kernel-level
-            correctness golden.
-        input_specs: ``{param_name: (shape, dtype_str)}``; order
-            matches ``f_numpy``'s positional parameters by name.
-        cache_dir: Artifact directory. Created if missing;
-            pre-existing files for each stage are overwritten.
-        num_kernels: Batch path — number of kernels to sample + profile.
-            Ignored when ``rewrites`` is not ``None``.
-        hosts: SSH hosts for ``remote_profile``. Ignored when
-            ``rewrites`` is not ``None``.
+        f: Either a ``@nkigym_kernel``-decorated callable (used
+            directly) or a plain-numpy reference (triggers synthesis).
+        input_specs: ``{param_name: (shape, dtype_str)}`` matching
+            ``f``'s positional parameters.
+        cache_dir: Directory for all artifacts — created if missing.
+        num_kernels: Number of random variants to draw and (if
+            ``hosts`` is non-empty) profile.
+        hosts: SSH hostnames for ``remote_profile``. Empty list skips
+            profiling entirely; verification still runs.
         venv_python: Python executable on remote hosts.
-        neuron_platform_target: Neuron target (e.g. ``"trn2"``).
-        collect_detailed_profile: Collect the full per-instruction
-            profile + NEFF/NTFF per kernel. Off by default.
-        rewrites: ``None`` → batch path (default). List →
-            deterministic explicit path, writes
-            ``kernel_tuned.py`` only, no HW profile.
-        seed: Drives sampling (batch path) and ``remote_profile``
-            input-tensor generation.
+        neuron_platform_target: Neuron target, e.g. ``"trn2"``.
+        collect_detailed_profile: Forwarded to ``remote_profile``.
+        seed: Drives random sampling and (via ``remote_profile``)
+            remote input-tensor generation.
 
     Raises:
-        AssertionError: Any sampled kernel fails CPU sim (batch) or
-            the canonical ``initial_codegen`` CPU sim fails.
-        ValueError: ``rewrites`` list has an illegal atom on the
-            current state.
+        AssertionError: The canonical render, any sampled render, or
+            (numpy-input branch only) the synthesised ``f_nkigym``
+            vs ``f_numpy`` check fails fp32 CPU sim.
     """
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
 
-    _run_synthesis(f_numpy, input_specs, cache_path)
-    _run_initial_codegen(f_numpy, input_specs, cache_path)
-    run_tune(
-        f_numpy=f_numpy,
-        input_specs=input_specs,
-        cache_path=cache_path,
-        rewrites=rewrites,
-        seed=seed,
-        load_f_nkigym=_load_f_nkigym,
-        cpu_sim_check=_cpu_sim_check,
-        num_kernels=num_kernels,
+    f_nkigym = _resolve_f_nkigym(f, input_specs, cache_path)
+
+    module = build_canonical_module(f_nkigym, _to_canonical_specs(input_specs))
+    canonical_source = render(module)
+    (cache_path / "kernel.py").write_text(canonical_source)
+    _verify(canonical_source, f_nkigym, input_specs)
+
+    rng = random.Random(seed)
+    pool = enumerate_pool(module=module, max_pool_size=_MAX_POOL_MULTIPLIER * num_kernels, rng=rng)
+    sampled = sample_pool(pool, num_kernels=num_kernels, rng=rng)
+
+    kernels: dict[str, KernelJob] = {}
+    output_shape = _trace_output_shape(f_nkigym, input_specs)
+    for idx, sampled_module in enumerate(sampled):
+        name = f"kernel_tuned_{idx:04d}.py"
+        try:
+            source = render(sampled_module)
+        except Exception as e:
+            (cache_path / f"{Path(name).stem}.render_error.txt").write_text(f"{type(e).__name__}: {e}\n")
+            continue
+        (cache_path / name).write_text(source)
+        _verify(source, f_nkigym, input_specs)
+        kernels[name] = KernelJob(
+            source=source, func_name=f_nkigym.__name__, output_shape=output_shape, input_specs=input_specs
+        )
+
+    if not hosts:
+        _write_stub_results_json(cache_path, kernels)
+        return
+
+    remote_profile(
+        kernels=kernels,
         hosts=hosts,
-        venv_python=venv_python,
+        cache_dir=str(cache_path),
+        seed=seed,
         neuron_platform_target=neuron_platform_target,
+        venv_python=venv_python,
         collect_detailed_profile=collect_detailed_profile,
-        trace_output_shape=_trace_output_shape,
-        assert_no_cpu_sim_failures=_assert_no_cpu_sim_failures,
-        atol=_ATOL,
-        rtol=_RTOL,
     )
 
 
-def _run_synthesis(
-    f_numpy: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], cache_path: Path
-) -> None:
-    """Synthesise ``f_nkigym`` via the Claude Agent SDK and write ``f_nkigym.py``."""
-    source = compile_numpy_to_nkigym(f_numpy, input_specs)
+def _resolve_f_nkigym(
+    f: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], cache_path: Path
+) -> Callable[..., np.ndarray]:
+    """Dispatch: return ``f`` directly if tagged, else synthesise + verify."""
+    if getattr(f, "__nkigym_kernel__", False):
+        return f
+    source = compile_numpy_to_nkigym(f, input_specs)
     (cache_path / "f_nkigym.py").write_text(source)
-
-
-def _run_initial_codegen(
-    f_numpy: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]], cache_path: Path
-) -> None:
-    """Render the eager NKI kernel, write ``kernel.py``, and CPU-sim-check.
-
-    Builds the canonical :class:`KernelModule` via
-    :func:`build_canonical_module`, then lowers it with the new single-argument
-    :func:`render`.
-    """
-    f_nkigym_path = cache_path / "f_nkigym.py"
-    if not f_nkigym_path.exists():
-        raise ValueError(
-            f"initial_codegen requires {f_nkigym_path!s} — run the 'synthesis' stage first "
-            f"or place the file manually before invoking this stage."
-        )
-    f_nkigym = _load_f_nkigym(f_nkigym_path)
-    module = build_canonical_module(f_nkigym, _to_canonical_specs(input_specs))
-    kernel_source = render(module)
-    (cache_path / "kernel.py").write_text(kernel_source)
-    _cpu_sim_check(kernel_source, f_nkigym.__name__, f_numpy, input_specs)
-
-
-def _to_canonical_specs(input_specs: dict[str, tuple[tuple[int, ...], str]]) -> dict[str, dict]:
-    """Convert public ``(shape, dtype)`` tuple specs to ``build_canonical_module``'s dict form.
-
-    The public :func:`nkigym_compile` API uses ``{name: (shape, dtype_str)}``,
-    matching :class:`autotune.runner.types.KernelJob`. The canonical builder
-    expects ``{name: {"shape": ..., "dtype": ...}}``. This helper is the
-    single conversion point.
-    """
-    return {name: {"shape": shape, "dtype": dtype} for name, (shape, dtype) in input_specs.items()}
+    f_nkigym = _load_f_nkigym(cache_path / "f_nkigym.py")
+    _verify_fns(f_nkigym, f, input_specs)
+    return f_nkigym
 
 
 def _load_f_nkigym(path: Path) -> Callable[..., np.ndarray]:
@@ -163,75 +153,30 @@ def _load_f_nkigym(path: Path) -> Callable[..., np.ndarray]:
     return func
 
 
-def _cpu_sim_check(
-    kernel_source: str,
-    func_name: str,
-    f_numpy: Callable[..., np.ndarray],
-    input_specs: dict[str, tuple[tuple[int, ...], str]],
-) -> None:
-    """Execute the rendered kernel through ``nki.simulate`` at fp32 and compare to numpy.
-
-    Drops the user-declared bf16/fp16 dtypes in favour of fp32 so the
-    accuracy check isn't dominated by low-precision rounding — matches
-    the ``simulate_one`` convention in ``autotune.runner.benchmark``.
-    """
-    sim_source = kernel_source.replace("nl.bfloat16", "nl.float32").replace("nl.float16", "nl.float32")
-    ns: dict = {}
-    exec(sim_source, ns)  # noqa: S102
-    kernel_fn = ns[func_name]
-    inputs = _draw_fp32_inputs(input_specs)
-    actual = nki.simulate(kernel_fn)(**inputs)
-    if isinstance(actual, tuple):
-        actual = actual[0]
-    expected = f_numpy(**inputs)
-    max_abs = float(np.abs(actual - expected).max())
-    max_rel = float((np.abs(actual - expected) / (np.abs(expected) + _ATOL)).max())
-    tolerance_ok = np.allclose(actual, expected, atol=_ATOL, rtol=_RTOL)
-    print(f"[nkigym_compile] cpu_sim max_abs_diff={max_abs:.3e} max_rel_diff={max_rel:.3e}")
-    if not tolerance_ok:
-        raise AssertionError(
-            f"initial_codegen CPU-sim mismatch vs numpy reference: "
-            f"max_abs_diff={max_abs:.3e} max_rel_diff={max_rel:.3e} "
-            f"(atol={_ATOL}, rtol={_RTOL})"
-        )
-
-
-def _draw_fp32_inputs(input_specs: dict[str, tuple[tuple[int, ...], str]]) -> dict[str, np.ndarray]:
-    """Draw reproducible fp32 inputs for the CPU-sim accuracy check."""
-    rng = np.random.default_rng(_SIM_SEED)
-    return {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _) in input_specs.items()}
+def _to_canonical_specs(input_specs: dict[str, tuple[tuple[int, ...], str]]) -> dict[str, dict]:
+    """Convert ``(shape, dtype)`` tuples to the dict form canonical expects."""
+    return {name: {"shape": shape, "dtype": dtype} for name, (shape, dtype) in input_specs.items()}
 
 
 def _trace_output_shape(
-    f_numpy: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]
+    f_nkigym: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]
 ) -> tuple[int, ...]:
-    """Trace the numpy reference once to recover the output shape.
-
-    ``KernelJob`` requires the output HBM shape on the coordinator so
-    workers skip unreliable AST parsing. The same random fp32 inputs
-    used by :func:`_cpu_sim_check` drive the trace — if the numpy
-    reference is deterministic on shape this is stable regardless of
-    seed.
-    """
+    """Call ``f_nkigym`` once on fp32 inputs to recover the output HBM shape."""
     inputs = _draw_fp32_inputs(input_specs)
-    result = f_numpy(**inputs)
+    result = f_nkigym(**inputs)
     if isinstance(result, tuple):
         result = result[0]
-    return tuple(result.shape)
+    return tuple(np.asarray(result).shape)
 
 
-def _assert_no_cpu_sim_failures(results_json_path: Path) -> None:
-    """Raise ``AssertionError`` when any kernel in ``results.json`` failed CPU sim.
-
-    ``remote_profile`` writes a ``results.json`` whose ``"kernels"``
-    array has one entry per kernel with a boolean ``"cpu_sim_passed"``.
-    Per the design spec, CPU-sim divergence on any batched kernel is
-    a bug; HW compile/runtime failures are tolerated (emitted into
-    ``results.json`` but not raised here).
-    """
-    data = json.loads(results_json_path.read_text())
-    failed = [k["kernel_name"] for k in data["kernels"] if not k["cpu_sim_passed"]]
-    if failed:
-        raise AssertionError(
-            f"CPU-sim failures in batch tune stage: {failed}. " f"See {results_json_path} for details."
-        )
+def _write_stub_results_json(cache_path: Path, kernels: dict[str, KernelJob]) -> None:
+    """Write an index-only ``results.json`` when ``hosts == []`` (no profiling)."""
+    kernel_entries = [
+        {"kernel_name": name, "kernel_path": f"{Path(name).stem}/{Path(name).stem}.py"} for name in sorted(kernels)
+    ]
+    data = {
+        "metadata": {"num_kernels": len(kernels), "wallclock_s": 0.0, "hosts": []},
+        "metrics": {},
+        "kernels": kernel_entries,
+    }
+    (cache_path / "results.json").write_text(json.dumps(data, indent=2))

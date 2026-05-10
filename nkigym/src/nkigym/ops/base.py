@@ -13,21 +13,19 @@ from typing import Any, ClassVar, Literal
 
 import numpy as np
 
-"""Role lattice enforced by ``NKIOp.__call__`` on every CPU-sim call:
+"""Role lattice for CPU-sim role tracking:
 
-- ``"param"``  — HBM kernel input. Only ``NKILoad`` may consume it.
-- ``"sbuf"``   — SBUF-resident tensor. Compute ops and ``NKIStore`` may
-  consume it.
-- ``"stored"`` — HBM output of ``NKIStore``. Only the kernel ``return``
-  may consume it.
+- ``"param"``   — HBM kernel input. Only ``NKILoad`` may consume it.
+- ``"sbuf"``    — SBUF-resident tensor.
+- ``"psum"``    — PSUM-resident tensor.
+- ``"hbm"``     — non-output HBM tensor (intra-kernel scratch / final output).
+- ``"stored"`` — HBM output of ``NKIStore``. Also acceptable as the kernel
+  ``return`` value (alongside ``"hbm"``).
 
 Bare ``np.ndarray`` operands (the typical entry path: a kernel called
-with fresh numpy inputs) are treated as ``"param"``. Every call
-produces a ``_RoleArray`` carrying the output role so downstream ops
-see the correct lineage."""
-_ALLOWED_INPUT_ROLES: dict[str, frozenset[str]] = {"NKILoad": frozenset({"param"}), "NKIStore": frozenset({"sbuf"})}
-_DEFAULT_ALLOWED_ROLES = frozenset({"sbuf"})
-_OUTPUT_ROLES: dict[str, str] = {"NKILoad": "sbuf", "NKIStore": "stored"}
+with fresh numpy inputs) are treated as ``"param"``. Per-op ``_check_roles``
+methods enforce op-specific input-role constraints; the base class does
+not police kwargs centrally."""
 _DEFAULT_OUTPUT_ROLE = "sbuf"
 
 
@@ -167,37 +165,58 @@ class NKIOp:
     def _run(self, **kwargs: Any) -> Any:
         """Subclass-specific numpy simulation. Gets the merged kwargs."""
 
+    OUTPUT_ROLE: ClassVar[str] = _DEFAULT_OUTPUT_ROLE
+    """Role tag attached to ``__call__``'s return value.
+
+    Subclasses override to declare an op-specific output role
+    (e.g. ``NKIStore.OUTPUT_ROLE = "stored"``). ``NKIAlloc`` overrides
+    :meth:`_output_role` directly to select based on ``location``.
+    """
+
+    def _check_roles(self, **kwargs: Any) -> None:
+        """Per-op role validation. Default: no-op.
+
+        Subclasses override to enforce input-role constraints specific
+        to their semantics (e.g. ``NKILoad`` requires ``src`` to be
+        ``param``; ``NKIStore`` requires ``src`` to be ``sbuf``).
+        Output slots (``dst``, ``reduce_res``) are never policed here.
+        """
+
+    def _output_role(self, **kwargs: Any) -> str:
+        """Return the role to tag on ``__call__``'s output array.
+
+        Default consults the ``OUTPUT_ROLE`` class attribute. Overridden
+        by ``NKIAlloc`` to pick per-call based on ``location``.
+        """
+        return type(self).OUTPUT_ROLE
+
     def __call__(self, **kwargs: Any) -> Any:
-        """CPU simulation — check operand roles, dispatch to ``_run``, tag output."""
+        """CPU simulation — run per-op role check, dispatch to ``_run``, tag output."""
         merged = {**getattr(self, "_init_kwargs", {}), **kwargs}
-        op_name = type(self).__name__
-        allowed = _ALLOWED_INPUT_ROLES.get(op_name, _DEFAULT_ALLOWED_ROLES)
-        for arg_name, value in merged.items():
-            role = _operand_role(value)
-            if role is None:
-                continue
-            if role not in allowed:
-                roles_str = "|".join(sorted(allowed))
-                raise TypeError(
-                    f"{op_name}({arg_name}=<role={role}>) expected role in {{{roles_str}}}; "
-                    f"did you forget to load or store?"
-                )
+        self._check_roles(**merged)
         result = self._run(**merged)
-        output_role = _OUTPUT_ROLES.get(op_name, _DEFAULT_OUTPUT_ROLE)
         if isinstance(result, np.ndarray):
-            return _RoleArray(result, output_role)
+            return _RoleArray(result, self._output_role(**merged))
         return result
+
+
+_VALID_RETURN_ROLES = frozenset({"stored", "hbm"})
 
 
 def nkigym_kernel(func: Callable[..., Any]) -> Callable[..., Any]:
     """Mark ``func`` as an nkigym kernel and enforce load / store discipline.
 
-    Tags every ``np.ndarray`` argument with ``role="param"`` on entry,
-    so any non-``NKILoad`` op that touches it raises ``TypeError`` from
-    the offending op's call site. After ``func`` returns, asserts the
-    return value is a ``_RoleArray`` with ``role="stored"`` — i.e. the
-    last op was ``NKIStore`` — otherwise raises ``TypeError`` at the
-    return site.
+    Tags every ``np.ndarray`` argument with ``role="param"`` on entry
+    so any non-``NKILoad`` op that touches them fails its per-op role
+    check. After ``func`` returns, asserts the return value is a
+    ``_RoleArray`` with ``role in {"stored", "hbm"}`` — either the
+    direct return of an ``NKIStore`` call (``"stored"``) or the HBM
+    buffer the caller allocated and stored into (``"hbm"``). Other
+    roles raise ``TypeError`` at the return site.
+
+    The returned wrapper carries ``__nkigym_kernel__ = True`` so public
+    dispatchers (``nkigym_compile``) can distinguish it from plain numpy
+    callables.
 
     Preserves the wrapped function's signature and source; downstream
     consumers that rely on ``inspect.signature`` / ``inspect.getsource``
@@ -210,8 +229,12 @@ def nkigym_kernel(func: Callable[..., Any]) -> Callable[..., Any]:
         tagged_kwargs = {k: _tag_as_param(v) for k, v in kwargs.items()}
         result = func(*tagged_args, **tagged_kwargs)
         role = _operand_role(result)
-        if role != "stored":
-            raise TypeError(f"{func.__name__} returned role={role!r}; kernel must end with NKIStore before `return`")
+        if role not in _VALID_RETURN_ROLES:
+            raise TypeError(
+                f"{func.__name__} returned role={role!r}; expected one of {sorted(_VALID_RETURN_ROLES)} "
+                f"(the HBM buffer an NKIStore wrote into, or the stored-role return of NKIStore itself)"
+            )
         return result
 
+    wrapper.__nkigym_kernel__ = True
     return wrapper

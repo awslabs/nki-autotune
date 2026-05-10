@@ -33,8 +33,12 @@ class NKIAlloc(NKIOp):
         shape: ``tuple[int, ...]``
         dtype: ``str`` — one of ``"float32"`` / ``"float16"`` / ``"bfloat16"``.
 
-    Returns a zero-filled ``numpy.ndarray`` at CPU-sim time for the
-    downstream ops to read/write. At render time the emitter produces
+    Returns an uninitialised ``numpy.ndarray`` at CPU-sim time (so
+    downstream ops' write semantics are observable — a zero-fill would
+    mask cases where a buffer is read before any op writes into it).
+    The returned array is tagged with the ``location`` role so the
+    next op's ``_check_roles`` sees the correct operand residency. At
+    render time the emitter produces
     ``<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=nl.<location>)``.
     """
 
@@ -43,8 +47,12 @@ class NKIAlloc(NKIOp):
     TILE_LIMITS: ClassVar[dict[str, int]] = {}
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: return a zero-filled array of declared shape/dtype."""
+        """CPU simulation: return an uninitialised array of declared shape/dtype."""
         shape = kwargs["shape"]
         dtype_name = kwargs["dtype"]
         dtype = _DTYPE_MAP[dtype_name]
-        return np.zeros(shape, dtype=dtype)
+        return np.empty(shape, dtype=dtype)
+
+    def _output_role(self, **kwargs: Any) -> str:
+        """Output role = the declared ``location`` (``"hbm"`` / ``"sbuf"`` / ``"psum"``)."""
+        return kwargs["location"]

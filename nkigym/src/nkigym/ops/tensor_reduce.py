@@ -4,7 +4,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import AxisRole, NKIOp
+from nkigym.ops.base import AxisRole, NKIOp, _operand_role
 
 _REDUCE_FNS: dict[str, Any] = {"add": np.sum, "max": np.max}
 
@@ -26,8 +26,14 @@ class NKITensorReduce(NKIOp):
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
 
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``data`` must be SBUF-resident."""
+        role = _operand_role(kwargs["data"])
+        if role is not None and role != "sbuf":
+            raise TypeError(f"NKITensorReduce(data=<role={role}>) expects sbuf")
+
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: numpy reduction along axis."""
+        """CPU simulation: numpy reduction along axis, write into ``dst``."""
         data = kwargs["data"]
         dst = kwargs["dst"]
         axis = kwargs["axis"]

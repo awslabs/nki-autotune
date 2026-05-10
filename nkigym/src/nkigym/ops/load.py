@@ -5,7 +5,7 @@ from typing import Any, ClassVar
 import nki.isa as nisa
 import numpy as np
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _operand_role
 
 
 class NKILoad(NKIOp):
@@ -19,11 +19,20 @@ class NKILoad(NKIOp):
     partition axis is capped by the NeuronCore's 128-partition SBUF
     layout; the free axis is unbounded."""
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    OUTPUT_ROLE: ClassVar[str] = "sbuf"
+
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``src`` must be HBM-resident (``param``)."""
+        role = _operand_role(kwargs["src"])
+        if role is not None and role != "param":
+            raise TypeError(f"NKILoad(src=<role={role}>) expects HBM param; did you forget to load?")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: identity pass-through."""
+        """CPU simulation: copy ``src`` into ``dst`` and return ``dst``."""
         src: np.ndarray = kwargs["src"]
-        return src
+        dst: np.ndarray = kwargs["dst"]
+        dst[...] = src
+        return dst
 
 
 def load_block(sbuf: Any, mem_slice: Any) -> None:

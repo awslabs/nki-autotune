@@ -12,7 +12,7 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, _operand_role
 
 VE_PARTITION_MAX = 128
 VE_FREE_MAX = 512
@@ -34,13 +34,24 @@ class NKITensorScalar(NKIOp):
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "operand0"})
     TILE_LIMITS: ClassVar[dict[str, int]] = {"P": VE_PARTITION_MAX, "F": VE_FREE_MAX}
 
+    def _check_roles(self, **kwargs: Any) -> None:
+        """``data`` must be SBUF-resident; ``operand0`` may be SBUF or a literal scalar."""
+        data_role = _operand_role(kwargs["data"])
+        if data_role is not None and data_role != "sbuf":
+            raise TypeError(f"NKITensorScalar(data=<role={data_role}>) expects sbuf")
+        operand0_role = _operand_role(kwargs.get("operand0"))
+        if operand0_role is not None and operand0_role != "sbuf":
+            raise TypeError(f"NKITensorScalar(operand0=<role={operand0_role}>) expects sbuf")
+
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: broadcast ``operand0`` across F and apply ``op``."""
+        """CPU simulation: broadcast ``operand0`` across F, apply ``op``, write into ``dst``."""
         data: np.ndarray = kwargs["data"]
         op_name: str = kwargs["op"]
         operand0 = kwargs["operand0"]
+        dst: np.ndarray = kwargs["dst"]
         broadcast = operand0[..., np.newaxis] if isinstance(operand0, np.ndarray) else operand0
-        return _OPS[op_name](data, broadcast)
+        dst[...] = _OPS[op_name](data, broadcast)
+        return dst
 
 
 def tensor_scalar_block(sbuf_dst: Any, sbuf_data: Any, sbuf_operand0: Any, op: Any) -> None:
