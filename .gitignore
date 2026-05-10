@@ -86,6 +86,7 @@ Desktop.ini
 *.err
 !/design/figures/*.png
 !/2026-05-07-forest-ir-visual-walkthrough-design/**/*.png
+!/docs/diagrams/*.png
 
 # Artifacts
 artifacts/

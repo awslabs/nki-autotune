@@ -1,0 +1,59 @@
+flowchart TB
+    root(("forest root"))
+
+    A1["alloc<br/>lhs_T_sbuf"]
+    A2["alloc<br/>rhs_sbuf"]
+    A3["alloc<br/>psum_acc"]
+    A4["alloc<br/>sbuf_prod"]
+    A5["alloc<br/>hbm_out"]
+
+    L0["Loop d0 trip=4<br/>PARALLEL"]
+    L0c["Loop d1 trip=2<br/>PARALLEL"]
+    L0l["NKILoad<br/>reads=lhs_T<br/>writes=lhs_T_sbuf"]
+
+    L1["Loop d0 trip=4<br/>PARALLEL"]
+    L1c["Loop d3 trip=2<br/>PARALLEL"]
+    L1l["NKILoad<br/>reads=rhs<br/>writes=rhs_sbuf"]
+
+    M1["Loop d1 trip=2<br/>PARALLEL"]
+    M1c["Loop d3 trip=2<br/>PARALLEL"]
+    M1l["NKIMemset<br/>writes=psum_acc"]
+
+    K1["Loop d0 trip=4<br/>ACCUMULATION"]
+    K1c["Loop d1 trip=2<br/>PARALLEL"]
+    K1cc["Loop d3 trip=2<br/>PARALLEL"]
+    K1l["NKIMatmul<br/>reads=lhs_T_sbuf,rhs_sbuf<br/>rmw=psum_acc"]
+
+    T1["Loop d1 trip=2<br/>PARALLEL"]
+    T1c["Loop d3 trip=2<br/>PARALLEL"]
+    T1l["NKITensorCopy<br/>reads=psum_acc<br/>writes=sbuf_prod"]
+
+    S1["Loop d1 trip=2<br/>PARALLEL"]
+    S1c["Loop d3 trip=2<br/>PARALLEL"]
+    S1l["NKIStore<br/>reads=sbuf_prod<br/>writes=hbm_out"]
+
+    root --> A1
+    root --> A2
+    root --> A3
+    root --> A4
+    root --> A5
+    root --> L0
+    root --> L1
+    root --> M1
+    root --> K1
+    root --> T1
+    root --> S1
+
+    L0 --> L0c --> L0l
+    L1 --> L1c --> L1l
+    M1 --> M1c --> M1l
+    K1 --> K1c --> K1cc --> K1l
+    T1 --> T1c --> T1l
+    S1 --> S1c --> S1l
+
+    classDef alloc fill:#fef,stroke:#963;
+    classDef loop fill:#eef,stroke:#336;
+    classDef leaf fill:#efe,stroke:#363;
+    class A1,A2,A3,A4,A5 alloc;
+    class L0,L0c,L1,L1c,M1,M1c,K1,K1c,K1cc,T1,T1c,S1,S1c loop;
+    class L0l,L1l,M1l,K1l,T1l,S1l leaf;

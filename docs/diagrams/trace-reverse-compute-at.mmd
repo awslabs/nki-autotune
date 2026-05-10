@@ -1,0 +1,37 @@
+flowchart LR
+    subgraph before["Before: two sibling K_outer nests"]
+        direction TB
+        R1["Loop d0 trip=2 PAR<br/>(rhs K_outer)"]
+        R1a["Loop d0 trip=2 PAR<br/>(K_inner)"]
+        R1b["Loop d3 trip=2 PAR"]
+        R1l["NKILoad rhs"]
+        R1 --> R1a --> R1b --> R1l
+
+        MK1["Loop d0 trip=2 ACC<br/>(matmul K_outer)"]
+        MK2["Loop d0 trip=2 ACC<br/>(K_inner)"]
+        MK3["Loop d1 trip=2 PAR"]
+        MK4["Loop d3 trip=2 PAR"]
+        ML["NKIMatmul<br/>rmw=psum_acc"]
+        MK1 --> MK2 --> MK3 --> MK4 --> ML
+    end
+
+    subgraph after["After: ReverseComputeAt(matmul, rhs K_outer)"]
+        direction TB
+        A1["Loop d0 trip=2 PAR<br/>(fused K_outer)"]
+        A2a["Loop d0 trip=2 PAR"]
+        A2b["Loop d3 trip=2 PAR"]
+        A2l["NKILoad rhs"]
+        A3a["Loop d0 trip=2 ACC"]
+        A3b["Loop d1 trip=2 PAR"]
+        A3c["Loop d3 trip=2 PAR"]
+        A3l["NKIMatmul<br/>rmw=psum_acc"]
+        A1 --> A2a --> A2b --> A2l
+        A1 --> A3a --> A3b --> A3c --> A3l
+    end
+
+    before -. "pull matmul subtree into<br/>rhs_load's K_outer scope" .-> after
+
+    classDef loop fill:#eef,stroke:#336;
+    classDef leaf fill:#efe,stroke:#363;
+    class R1,R1a,R1b,MK1,MK2,MK3,MK4,A1,A2a,A2b,A3a,A3b,A3c loop;
+    class R1l,ML,A2l,A3l leaf;

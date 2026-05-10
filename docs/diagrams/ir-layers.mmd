@@ -1,0 +1,11 @@
+flowchart LR
+    A["<b>f_nkigym</b><br/>Python function<br/>straight-line NKIOp calls"]
+    B["<b>KernelModule</b><br/>envelope IR<br/>tensors + dims + TreeIR + dep"]
+    C["<b>NKI source</b><br/>@nki.jit function<br/>nisa.* ISA calls"]
+
+    A -- "build_canonical_module" --> B
+    B -- "rewrite atoms<br/>(Split, Reorder,<br/>ComputeAt, ...)" --> B
+    B -- "render" --> C
+
+    classDef layer fill:#eef,stroke:#336,stroke-width:2px;
+    class A,B,C layer;

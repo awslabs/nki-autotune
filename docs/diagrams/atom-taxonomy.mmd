@@ -1,0 +1,37 @@
+flowchart TB
+    root["<b>9 rewrite atoms</b>"]
+
+    dom["<b>Domain</b><br/>(loop structure)"]
+    plc["<b>Placement</b><br/>(computation scope)"]
+    exe["<b>Execution</b><br/>(memory + pipeline)"]
+
+    root --> dom
+    root --> plc
+    root --> exe
+
+    s["Split<br/><i>loop → outer × inner</i>"]
+    r["Reorder<br/><i>swap adjacent loops</i>"]
+    f["Fuse<br/><i>flatten nested iters</i>"]
+
+    ca["ComputeAt<br/><i>move leaf → under consumer loop</i>"]
+    rca["ReverseComputeAt<br/><i>move leaf → into producer scope</i>"]
+    hi["HoistInvariant<br/><i>LICM in own tree</i>"]
+    rf["RFactor<br/><i>fission reducer<br/>(rmw | slot)</i>"]
+
+    mb["MultiBuffer<br/><i>Tensor.buffer_degree += 1</i>"]
+    sp["SoftwarePipeline<br/><i>LoopNode.pipeline_depth > 1</i>"]
+
+    dom --> s
+    dom --> r
+    dom --> f
+    plc --> ca
+    plc --> rca
+    plc --> hi
+    plc --> rf
+    exe --> mb
+    exe --> sp
+
+    classDef cat fill:#ffd,stroke:#a80,stroke-width:2px;
+    classDef atom fill:#eef,stroke:#336;
+    class dom,plc,exe cat;
+    class s,r,f,ca,rca,hi,rf,mb,sp atom;
