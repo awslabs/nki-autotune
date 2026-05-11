@@ -1,309 +1,674 @@
-"""Tests for core IR types in nkigym.codegen.ir."""
+"""Unit tests for IterVar (TVM-style iter-var identity)."""
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.dep_cache import DepCache
+import pytest
+
 from nkigym.codegen.ir import (
-    BodyLeaf,
-    DimInfo,
+    AccessRange,
+    BufferAccess,
+    ForNode,
+    IterVar,
     KernelModule,
-    LoopNode,
-    Tensor,
-    leaves_under,
+    NKIOpCall,
+    SBlock,
+    blocks_under,
     replace_at_path,
     resolve_node,
-    validate_dataflow_ordering,
 )
-from nkigym.ops import nkigym_kernel
 from nkigym.ops.base import AxisRole
-from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
-from nkigym.ops.store import NKIStore
 
 
-def test_tensor_auto_populates_buffer_degree():
-    t = Tensor(
-        name="x", dim_ids=("d0", "d1"), shape=(128, 256), dtype="bfloat16", origin="intermediate", location="sbuf"
+def test_iter_var_is_frozen() -> None:
+    """IterVar must be immutable — atoms retire and replace, never mutate."""
+    iv = IterVar(var_id=0, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
+    with pytest.raises(AttributeError):
+        iv.extent = 8  # type: ignore[misc]
+
+
+def test_iter_var_equality_by_fields() -> None:
+    """Two IterVars with the same fields compare equal."""
+    a = IterVar(var_id=0, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
+    b = IterVar(var_id=0, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
+    assert a == b
+    assert hash(a) == hash(b)
+
+
+def test_iter_var_distinct_ids() -> None:
+    """Same dim, different var_ids → unequal (distinct iter vars)."""
+    a = IterVar(var_id=0, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
+    b = IterVar(var_id=1, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
+    assert a != b
+
+
+def test_access_range_immutable() -> None:
+    """AccessRange must be frozen."""
+    ar = AccessRange.make(coeffs={0: 1}, const_offset=0, extent=128)
+    with pytest.raises(AttributeError):
+        ar.const_offset = 4  # type: ignore[misc]
+
+
+def test_access_range_simple_1to1() -> None:
+    """coeffs={iv: 1}, offset=0, extent=tile_size encodes direct indexing."""
+    ar = AccessRange.make(coeffs={7: 1}, const_offset=0, extent=128)
+    assert ar.coeffs == {7: 1}
+    assert ar.extent == 128
+
+
+def test_access_range_split_rewrite() -> None:
+    """After Split(factor=2), an iter var coefficient becomes inner_extent."""
+    ar = AccessRange.make(coeffs={0: 2, 1: 1}, const_offset=0, extent=128)
+    assert ar.coeffs[0] == 2
+    assert ar.coeffs[1] == 1
+
+
+def test_access_range_make_normalizes_ordering() -> None:
+    """AccessRange.make sorts coeff pairs for hashability + determinism."""
+    a = AccessRange.make(coeffs={1: 5, 0: 3}, const_offset=0, extent=128)
+    b = AccessRange.make(coeffs={0: 3, 1: 5}, const_offset=0, extent=128)
+    assert a == b
+    assert hash(a) == hash(b)
+
+
+def test_buffer_access_immutable() -> None:
+    """BufferAccess is frozen."""
+    ba = BufferAccess(
+        tensor_name="x", iter_var_ids=(0,), pattern=(AccessRange.make(coeffs={0: 1}, const_offset=0, extent=128),)
     )
-    assert t.buffer_degree == {"d0": 1, "d1": 1}
+    with pytest.raises(AttributeError):
+        ba.tensor_name = "y"  # type: ignore[misc]
 
 
-def test_loop_node_defaults():
-    n = LoopNode(dim_id="d0", trip_count=16, role=AxisRole.PARALLEL)
-    assert n.children == []
-    assert n.reduce_op is None
-    assert n.name is None
-    assert n.pipeline_depth == 1
-
-
-def test_body_leaf_self_describing_fields():
-    leaf = BodyLeaf(
-        op_cls=object,
-        reads={"data": "x"},
-        writes=("y",),
-        kwargs={"op": "square"},
-        axis_map={"P": "d0", "F": "d1"},
-        dim_role={"d0": AxisRole.PARALLEL, "d1": AxisRole.PARALLEL},
+def test_buffer_access_uses_tuple_for_patterns() -> None:
+    """pattern field must be a tuple (frozen dataclass requires hashable fields)."""
+    p = (
+        AccessRange.make(coeffs={0: 1}, const_offset=0, extent=128),
+        AccessRange.make(coeffs={1: 1}, const_offset=0, extent=2048),
     )
-    assert leaf.reads == {"data": "x"}
-    assert leaf.writes == ("y",)
-    assert leaf.kwargs == {"op": "square"}
+    ba = BufferAccess(tensor_name="t", iter_var_ids=(0, 1), pattern=p)
+    assert len(ba.pattern) == 2
 
 
-def test_kernel_module_construction():
-    km = KernelModule(
-        func_name="f",
-        param_names=["x"],
-        return_name="y",
-        tensors={"x": Tensor("x", ("d0",), (128,), "bfloat16", "param", location="hbm")},
-        dims={"d0": DimInfo(dim_id="d0", total_size=128, tile_size=128, num_tiles=1)},
-        body=[],
+def test_nki_op_call_immutable() -> None:
+    """NKIOpCall is frozen."""
+    call = NKIOpCall(op_cls=NKIMatmul, kwargs={}, axis_map={}, dim_role={})
+    with pytest.raises(AttributeError):
+        call.op_cls = object  # type: ignore[misc]
+
+
+def test_sblock_single_leaf_canonical() -> None:
+    """Canonical build emits single-NKIOpCall SBlocks."""
+    call = NKIOpCall(
+        op_cls=NKIMatmul,
+        kwargs={},
+        axis_map={"K": "d0", "M": "d1", "N": "d3"},
+        dim_role={"d0": AxisRole.ACCUMULATION, "d1": AxisRole.PARALLEL, "d3": AxisRole.PARALLEL},
     )
-    assert km.func_name == "f"
-    assert km.body == []
+    lhs_access = BufferAccess(
+        tensor_name="lhs_T_sbuf",
+        iter_var_ids=(0, 1),
+        pattern=(AccessRange.make({0: 1}, 0, 128), AccessRange.make({1: 1}, 0, 128)),
+    )
+    block = SBlock(
+        iter_vars=[IterVar(0, "d0", 4, AxisRole.ACCUMULATION)],
+        reads={"stationary": lhs_access},
+        writes={},
+        reads_writes={},
+        body=[call],
+    )
+    assert len(block.body) == 1
+    assert block.iter_vars[0].var_id == 0
 
 
-def test_resolve_node_returns_leaf():
-    leaf = BodyLeaf(op_cls=object)
-    forest = [leaf]
-    assert resolve_node(forest, (0,)) is leaf
+def test_sblock_supports_multi_leaf_body() -> None:
+    """SBlock.body is a list; future fused-block atoms will emit len > 1."""
+    calls = [
+        NKIOpCall(op_cls=NKIMatmul, kwargs={}, axis_map={}, dim_role={}),
+        NKIOpCall(op_cls=NKIMatmul, kwargs={}, axis_map={}, dim_role={}),
+    ]
+    block = SBlock(iter_vars=[], reads={}, writes={}, reads_writes={}, body=calls)
+    assert len(block.body) == 2
 
 
-def test_resolve_node_returns_nested_loop():
-    inner = LoopNode("d0", 4, AxisRole.PARALLEL)
-    outer = LoopNode("d0", 1, AxisRole.PARALLEL, children=[inner])
-    forest = [outer]
-    assert resolve_node(forest, (0, 0)) is inner
+def test_sblock_annotations_default_empty() -> None:
+    """SBlock.annotations defaults to empty dict."""
+    block = SBlock(iter_vars=[], reads={}, writes={}, reads_writes={}, body=[])
+    assert block.annotations == {}
 
 
-def test_resolve_node_returns_none_on_bad_path():
-    assert resolve_node([], (0,)) is None
-    leaf = BodyLeaf(op_cls=object)
-    assert resolve_node([leaf], (0, 0)) is None
+def test_for_node_binds_iter_var_by_reference() -> None:
+    """ForNode stores an IterVar; multiple ForNodes can bind distinct iter
+    vars on the same dim."""
+    iv_outer = IterVar(0, "d0", 2, AxisRole.PARALLEL)
+    iv_inner = IterVar(1, "d0", 2, AxisRole.PARALLEL)
+    outer = ForNode(iter_var=iv_outer, children=[])
+    inner = ForNode(iter_var=iv_inner, children=[])
+    outer.children.append(inner)
+    assert outer.iter_var.var_id == 0
+    assert outer.children[0].iter_var.var_id == 1
 
 
-def test_replace_at_path_replaces_target():
-    a = BodyLeaf(op_cls=object)
-    b = BodyLeaf(op_cls=object)
-    forest = [a, a]
-    new_forest = replace_at_path(forest, (1,), b)
-    assert new_forest[0] is a
-    assert new_forest[1] is b
-    assert forest[1] is a
+def test_for_node_annotations_default_empty() -> None:
+    """annotations default to empty dict."""
+    iv = IterVar(0, "d0", 4, AxisRole.PARALLEL)
+    fn = ForNode(iter_var=iv, children=[])
+    assert fn.annotations == {}
 
 
-def test_leaves_under_returns_all_leaves():
-    a = BodyLeaf(op_cls=object)
-    b = BodyLeaf(op_cls=object)
-    loop = LoopNode("d0", 4, AxisRole.PARALLEL, children=[a, b])
-    assert list(leaves_under(loop)) == [a, b]
+def test_for_node_supports_sblock_child() -> None:
+    """ForNode.children can hold SBlocks and nested ForNodes."""
+    iv = IterVar(0, "d0", 4, AxisRole.PARALLEL)
+    block = SBlock(iter_vars=[], reads={}, writes={}, reads_writes={}, body=[])
+    fn = ForNode(iter_var=iv, children=[block])
+    assert isinstance(fn.children[0], SBlock)
 
 
+def test_for_node_name_defaults_none() -> None:
+    """ForNode.name defaults to None; set by canonicalize pass."""
+    iv = IterVar(0, "d0", 4, AxisRole.PARALLEL)
+    fn = ForNode(iter_var=iv, children=[])
+    assert fn.name is None
+
+
+def test_kernel_module_minimal() -> None:
+    """KernelModule carries signature + tensors + dims + body + iter_var_counter."""
+    from nkigym.codegen.ir import DimInfo, KernelModule, Tensor
+
+    tensors = {
+        "x": Tensor(
+            name="x", dim_ids=("d0",), shape=(128,), dtype="float32", origin="param", location="hbm", buffer_degree={}
+        )
+    }
+    dims = {"d0": DimInfo(dim_id="d0", total_size=128, tile_size=128, num_tiles=1)}
+    m = KernelModule(
+        func_name="f", param_names=["x"], return_name="x", tensors=tensors, dims=dims, iter_var_counter=0, body=[]
+    )
+    assert m.iter_var_counter == 0
+    assert m.body == []
+
+
+def test_kernel_module_allocates_monotonic_iter_var_ids() -> None:
+    """allocate_iter_var bumps the counter and returns a fresh IterVar."""
+    from nkigym.codegen.ir import KernelModule
+
+    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, dims={}, iter_var_counter=0, body=[])
+    iv1 = m.allocate_iter_var("d0", extent=4, role=AxisRole.PARALLEL)
+    iv2 = m.allocate_iter_var("d0", extent=4, role=AxisRole.PARALLEL)
+    assert iv1.var_id == 0
+    assert iv2.var_id == 1
+    assert m.iter_var_counter == 2
+
+
+def test_kernel_module_default_body_and_dep() -> None:
+    """Empty body and fresh DepCache by default."""
+    from nkigym.codegen.ir import KernelModule
+
+    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, dims={})
+    assert m.body == []
+    assert m.iter_var_counter == 0
+    assert m.dep is not None
+
+
+def _mk_mod_with_single_block() -> KernelModule:
+    """Build a minimal module: one ForNode → SBlock tree."""
+    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, dims={}, iter_var_counter=0, body=[])
+    iv = m.allocate_iter_var("d0", 4, AxisRole.PARALLEL)
+    block = SBlock(iter_vars=[iv], reads={}, writes={}, reads_writes={}, body=[])
+    root = ForNode(iter_var=iv, children=[block])
+    m.body.append(root)
+    return m
+
+
+def test_resolve_node_root() -> None:
+    """Path (0,) returns the first root."""
+    m = _mk_mod_with_single_block()
+    node = resolve_node(m.body, (0,))
+    assert isinstance(node, ForNode)
+
+
+def test_resolve_node_nested_block() -> None:
+    """Path (0, 0) returns the SBlock under the root ForNode."""
+    m = _mk_mod_with_single_block()
+    node = resolve_node(m.body, (0, 0))
+    assert isinstance(node, SBlock)
+
+
+def test_resolve_node_invalid_path_out_of_range() -> None:
+    """Out-of-range path returns None."""
+    m = _mk_mod_with_single_block()
+    assert resolve_node(m.body, (5,)) is None
+
+
+def test_resolve_node_empty_path_returns_none() -> None:
+    """Empty path returns None — there is no 'forest node'."""
+    m = _mk_mod_with_single_block()
+    assert resolve_node(m.body, ()) is None
+
+
+def test_resolve_node_descends_through_sblock_returns_none() -> None:
+    """Cannot path-descend through an SBlock (SBlocks are leaves)."""
+    m = _mk_mod_with_single_block()
+    assert resolve_node(m.body, (0, 0, 0)) is None
+
+
+def test_blocks_under_yields_descendant_sblocks() -> None:
+    """blocks_under walks the subtree yielding every SBlock."""
+    m = _mk_mod_with_single_block()
+    root = m.body[0]
+    assert isinstance(root, ForNode)
+    blocks = list(blocks_under(root))
+    assert len(blocks) == 1
+    assert isinstance(blocks[0], SBlock)
+
+
+def test_blocks_under_yields_self_when_sblock() -> None:
+    """blocks_under(sblock) yields [sblock]."""
+    block = SBlock(iter_vars=[], reads={}, writes={}, reads_writes={}, body=[])
+    assert list(blocks_under(block)) == [block]
+
+
+def test_replace_at_path_swaps_subtree() -> None:
+    """replace_at_path returns a new body with the node at path replaced."""
+    m = _mk_mod_with_single_block()
+    new_block = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={},
+        reads_writes={},
+        body=[NKIOpCall(op_cls=NKIMatmul, kwargs={}, axis_map={}, dim_role={})],
+    )
+    new_body = replace_at_path(m.body, (0, 0), new_block)
+    new_root = new_body[0]
+    assert isinstance(new_root, ForNode)
+    assert new_root.children[0] is new_block
+    # Original untouched (non-destructive)
+    assert m.body[0] is not new_root  # type: ignore[comparison-overlap]
+
+
+def test_replace_at_path_empty_raises() -> None:
+    """Empty path is illegal."""
+    m = _mk_mod_with_single_block()
+    with pytest.raises(ValueError):
+        replace_at_path(m.body, (), SBlock(iter_vars=[], reads={}, writes={}, reads_writes={}, body=[]))
+
+
+def test_replace_at_path_replaces_root() -> None:
+    """Path (0,) replaces the first root element."""
+    m = _mk_mod_with_single_block()
+    new_root = SBlock(iter_vars=[], reads={}, writes={}, reads_writes={}, body=[])
+    new_body = replace_at_path(m.body, (0,), new_root)
+    assert new_body[0] is new_root
+
+
+from nkigym.codegen.ir import DimInfo, Tensor, validate_dataflow_ordering
 from nkigym.ops.alloc import NKIAlloc
+from nkigym.ops.load import NKILoad
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 
 
-@nkigym_kernel
-def _matmul_lhsT_rhs_fixture(lhs_T, rhs):
-    """Canonical lhs_T.T @ rhs kernel used by the dataflow validator test."""
-    lhs_T_sbuf = NKIAlloc(location="sbuf", shape=(256, 128), dtype="bfloat16")()
-    rhs_sbuf = NKIAlloc(location="sbuf", shape=(256, 512), dtype="bfloat16")()
-    psum_prod = NKIAlloc(location="psum", shape=(128, 512), dtype="float32")()
-    sbuf_prod = NKIAlloc(location="sbuf", shape=(128, 512), dtype="bfloat16")()
-    out = NKIAlloc(location="hbm", shape=(128, 512), dtype="bfloat16")()
-    NKILoad()(src=lhs_T, dst=lhs_T_sbuf)
-    NKILoad()(src=rhs, dst=rhs_sbuf)
-    NKIMemset(value=0.0)(dst=psum_prod)
-    NKIMatmul()(stationary=lhs_T_sbuf, moving=rhs_sbuf, dst=psum_prod)
-    NKITensorCopy()(src=psum_prod, dst=sbuf_prod)
-    NKIStore()(src=sbuf_prod, dst=out)
-    return out
+def _mk_access(name: str, iv_id: int) -> BufferAccess:
+    """Simple 1:1 access helper."""
+    return BufferAccess(tensor_name=name, iter_var_ids=(iv_id,), pattern=(AccessRange.make({iv_id: 1}, 0, 128),))
 
 
-def test_validate_dataflow_ordering_accepts_canonical():
-    """Canonical matmul module has every read written by an earlier leaf (or a param)."""
-    specs = {"lhs_T": {"shape": (256, 128), "dtype": "bfloat16"}, "rhs": {"shape": (256, 512), "dtype": "bfloat16"}}
-    module = build_canonical_module(_matmul_lhsT_rhs_fixture, specs)
-    assert validate_dataflow_ordering(module)
-
-
-def test_validate_dataflow_ordering_rejects_out_of_order():
-    """A forest where the consumer appears before its producer is rejected."""
-
-    _FakeAlloc = type("NKIAlloc", (), {})
-
-    alloc_intermediate = BodyLeaf(op_cls=_FakeAlloc, reads={}, writes=("intermediate",))
-    alloc_out = BodyLeaf(op_cls=_FakeAlloc, reads={}, writes=("out",))
-    producer = BodyLeaf(op_cls=object, reads={}, writes=("intermediate",))
-    consumer = BodyLeaf(op_cls=object, reads={"x": "intermediate"}, writes=("out",))
-    module = KernelModule(
-        func_name="f",
-        param_names=[],
-        return_name="out",
-        tensors={
-            "intermediate": Tensor("intermediate", (), (), "bfloat16", "intermediate", "sbuf"),
-            "out": Tensor("out", (), (), "bfloat16", "return", "hbm"),
-        },
-        dims={},
-        body=[alloc_intermediate, alloc_out, consumer, producer],
-        dep=DepCache(scopes={}),
-    )
-    assert not validate_dataflow_ordering(module)
-
-
-def test_validate_dataflow_ordering_accepts_param_reads():
-    """Reading a param tensor never requires a writer."""
-
-    _FakeAlloc = type("NKIAlloc", (), {})
-
-    alloc_out = BodyLeaf(op_cls=_FakeAlloc, reads={}, writes=("out",))
-    module = KernelModule(
-        func_name="f",
-        param_names=["x"],
-        return_name="out",
-        tensors={
-            "x": Tensor("x", (), (), "bfloat16", "param", "hbm"),
-            "out": Tensor("out", (), (), "bfloat16", "return", "hbm"),
-        },
-        dims={},
-        body=[alloc_out, BodyLeaf(op_cls=object, reads={"data": "x"}, writes=("out",))],
-        dep=DepCache(scopes={}),
-    )
-    assert validate_dataflow_ordering(module)
-
-
-def test_validate_dataflow_ordering_rejects_missing_return_writer():
-    """A return tensor with no writer (e.g. Store leaf dropped) is rejected."""
-
-    _FakeAlloc = type("NKIAlloc", (), {})
-
-    alloc_intermediate = BodyLeaf(op_cls=_FakeAlloc, reads={}, writes=("intermediate",))
-    alloc_out = BodyLeaf(op_cls=_FakeAlloc, reads={}, writes=("out",))
-    producer = BodyLeaf(op_cls=object, reads={}, writes=("intermediate",))
-    module = KernelModule(
-        func_name="f",
-        param_names=[],
-        return_name="out",
-        tensors={
-            "intermediate": Tensor("intermediate", (), (), "bfloat16", "intermediate", "sbuf"),
-            "out": Tensor("out", (), (), "bfloat16", "return", "hbm"),
-        },
-        dims={},
-        body=[alloc_intermediate, alloc_out, producer],
-        dep=DepCache(scopes={}),
-    )
-    assert not validate_dataflow_ordering(module)
-
-
-def test_validate_dataflow_ordering_traverses_loops():
-    """Pre-order DFS descends into ``LoopNode`` children; deeply nested leaves are reached."""
-
-    _FakeAlloc = type("NKIAlloc", (), {})
-
-    alloc_t = BodyLeaf(op_cls=_FakeAlloc, reads={}, writes=("t",))
-    alloc_out = BodyLeaf(op_cls=_FakeAlloc, reads={}, writes=("out",))
-    producer = BodyLeaf(op_cls=object, reads={}, writes=("t",))
-    consumer = BodyLeaf(op_cls=object, reads={"x": "t"}, writes=("out",))
-    outer = LoopNode("d0", 1, AxisRole.PARALLEL, children=[producer])
-    inner = LoopNode("d0", 1, AxisRole.PARALLEL, children=[consumer])
-    module = KernelModule(
-        func_name="f",
-        param_names=[],
-        return_name="out",
-        tensors={
-            "t": Tensor("t", (), (), "bfloat16", "intermediate", "sbuf"),
-            "out": Tensor("out", (), (), "bfloat16", "return", "hbm"),
-        },
-        dims={},
-        body=[alloc_t, alloc_out, outer, inner],
-        dep=DepCache(scopes={}),
-    )
-    assert validate_dataflow_ordering(module)
-    swapped = KernelModule(
-        func_name="f",
-        param_names=[],
-        return_name="out",
-        tensors=module.tensors,
-        dims={},
-        body=[alloc_t, alloc_out, inner, outer],
-        dep=DepCache(scopes={}),
-    )
-    assert not validate_dataflow_ordering(swapped)
-
-
-def test_validate_dataflow_ordering_rmw_requires_prior_writer():
-    """An RMW operand in reads_writes must have a prior writer.
-    Models the bug scenario: NKIMatmul reads_writes=psum_acc must come
-    after NKIMemset writes=psum_acc."""
-    from nkigym.codegen.ir import BodyLeaf, DimInfo, KernelModule, Tensor, validate_dataflow_ordering
-
-    class _FakeMemset:
-        __name__ = "NKIMemset"
-
-    class _FakeMatmul:
-        __name__ = "NKIMatmul"
-
-    _FakeAlloc = type("NKIAlloc", (), {})
-
+def test_validate_rejects_read_before_alloc() -> None:
+    """Non-alloc block reading an un-alloc'd tensor must fail validation (rule 2)."""
     tensors = {
-        "psum_acc": Tensor(
-            name="psum_acc", dim_ids=("d0",), shape=(128,), dtype="float32", origin="intermediate", location="psum"
+        "x": Tensor(
+            name="x",
+            dim_ids=("d0",),
+            shape=(128,),
+            dtype="float32",
+            origin="intermediate",
+            location="sbuf",
+            buffer_degree={},
         )
     }
-    dims = {"d0": DimInfo(dim_id="d0", total_size=128, tile_size=128, num_tiles=1)}
-
-    alloc_leaf = BodyLeaf(op_cls=_FakeAlloc, reads={}, writes=("psum_acc",), reads_writes=())
-    memset_leaf = BodyLeaf(op_cls=_FakeMemset, reads={}, writes=("psum_acc",), reads_writes=())
-    matmul_leaf = BodyLeaf(op_cls=_FakeMatmul, reads={}, writes=(), reads_writes=("psum_acc",))
-
-    good_module = KernelModule(
+    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    m = KernelModule(
         func_name="f",
         param_names=[],
-        return_name="psum_acc",
+        return_name="x",
         tensors=tensors,
         dims=dims,
-        body=[alloc_leaf, memset_leaf, matmul_leaf],
+        iter_var_counter=0,
+        body=[SBlock(iter_vars=[], reads={"src": _mk_access("x", 0)}, writes={}, reads_writes={}, body=[])],
     )
-    bad_module = KernelModule(
-        func_name="f",
-        param_names=[],
-        return_name="psum_acc",
-        tensors=tensors,
-        dims=dims,
-        body=[alloc_leaf, matmul_leaf, memset_leaf],
-    )
-
-    assert validate_dataflow_ordering(good_module) is True
-    assert validate_dataflow_ordering(bad_module) is False
+    assert not validate_dataflow_ordering(m)
 
 
-def test_validate_dataflow_ordering_rmw_leaf_counts_as_writer_for_next_leaf():
-    """After an RMW leaf fires, the tensor counts as written for subsequent reads."""
-    from nkigym.codegen.ir import BodyLeaf, DimInfo, KernelModule, Tensor, validate_dataflow_ordering
-
-    _FakeAlloc = type("NKIAlloc", (), {})
-
-    class _FakeMemset:
-        __name__ = "NKIMemset"
-
-    class _FakeMatmul:
-        __name__ = "NKIMatmul"
-
-    class _FakeCopy:
-        __name__ = "NKITensorCopy"
-
+def test_validate_accepts_alloc_then_write_then_read() -> None:
+    """Canonical alloc → write → read is legal."""
     tensors = {
-        "psum_acc": Tensor("psum_acc", ("d0",), (128,), "float32", "intermediate", "psum"),
-        "sbuf_prod": Tensor("sbuf_prod", ("d0",), (128,), "bfloat16", "intermediate", "sbuf"),
+        "x": Tensor(
+            name="x",
+            dim_ids=("d0",),
+            shape=(128,),
+            dtype="float32",
+            origin="intermediate",
+            location="sbuf",
+            buffer_degree={},
+        )
     }
-    dims = {"d0": DimInfo(dim_id="d0", total_size=128, tile_size=128, num_tiles=1)}
+    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    alloc_call = NKIOpCall(
+        op_cls=NKIAlloc,
+        kwargs={"tensor_name": "x", "location": "sbuf", "shape": (128,), "dtype": "float32"},
+        axis_map={},
+        dim_role={},
+    )
+    alloc_block = SBlock(
+        iter_vars=[], reads={}, writes={"output": _mk_access("x", 0)}, reads_writes={}, body=[alloc_call]
+    )
+    writer_call = NKIOpCall(op_cls=NKILoad, kwargs={}, axis_map={}, dim_role={})
+    writer = SBlock(iter_vars=[], reads={}, writes={"dst": _mk_access("x", 0)}, reads_writes={}, body=[writer_call])
+    m = KernelModule(
+        func_name="f",
+        param_names=[],
+        return_name="x",
+        tensors=tensors,
+        dims=dims,
+        iter_var_counter=0,
+        body=[alloc_block, writer],
+    )
+    assert validate_dataflow_ordering(m)
 
-    body = [
-        BodyLeaf(op_cls=_FakeAlloc, writes=("psum_acc",)),
-        BodyLeaf(op_cls=_FakeAlloc, writes=("sbuf_prod",)),
-        BodyLeaf(op_cls=_FakeMemset, writes=("psum_acc",)),
-        BodyLeaf(op_cls=_FakeMatmul, reads_writes=("psum_acc",)),
-        BodyLeaf(op_cls=_FakeCopy, reads={"src": "psum_acc"}, writes=("sbuf_prod",)),
-    ]
-    mod = KernelModule(func_name="f", param_names=[], return_name="sbuf_prod", tensors=tensors, dims=dims, body=body)
-    assert validate_dataflow_ordering(mod) is True
+
+def test_validate_param_tensors_are_pre_allocated() -> None:
+    """Params are considered allocated from the start (rule 2 exemption)."""
+    tensors = {
+        "p": Tensor(
+            name="p", dim_ids=("d0",), shape=(128,), dtype="float32", origin="param", location="hbm", buffer_degree={}
+        ),
+        "out": Tensor(
+            name="out",
+            dim_ids=("d0",),
+            shape=(128,),
+            dtype="float32",
+            origin="return",
+            location="hbm",
+            buffer_degree={},
+        ),
+    }
+    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    alloc_call = NKIOpCall(
+        op_cls=NKIAlloc,
+        kwargs={"tensor_name": "out", "location": "hbm", "shape": (128,), "dtype": "float32"},
+        axis_map={},
+        dim_role={},
+    )
+    alloc_block = SBlock(
+        iter_vars=[], reads={}, writes={"output": _mk_access("out", 0)}, reads_writes={}, body=[alloc_call]
+    )
+    copy = SBlock(
+        iter_vars=[],
+        reads={"src": _mk_access("p", 0)},
+        writes={"dst": _mk_access("out", 0)},
+        reads_writes={},
+        body=[NKIOpCall(op_cls=NKILoad, kwargs={}, axis_map={}, dim_role={})],
+    )
+    m = KernelModule(
+        func_name="f",
+        param_names=["p"],
+        return_name="out",
+        tensors=tensors,
+        dims=dims,
+        iter_var_counter=0,
+        body=[alloc_block, copy],
+    )
+    assert validate_dataflow_ordering(m)
+
+
+def test_validate_rejects_alloc_only_return() -> None:
+    """Rule 5: an alloc alone does NOT satisfy the return-produced rule.
+
+    The return tensor needs a real value-producing write — an ``NKIAlloc``
+    declares storage but writes nothing meaningful.
+    """
+    tensors = {
+        "out": Tensor(
+            name="out",
+            dim_ids=("d0",),
+            shape=(128,),
+            dtype="float32",
+            origin="return",
+            location="hbm",
+            buffer_degree={},
+        )
+    }
+    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    alloc_call = NKIOpCall(
+        op_cls=NKIAlloc,
+        kwargs={"tensor_name": "out", "location": "hbm", "shape": (128,), "dtype": "float32"},
+        axis_map={},
+        dim_role={},
+    )
+    alloc_block = SBlock(
+        iter_vars=[], reads={}, writes={"output": _mk_access("out", 0)}, reads_writes={}, body=[alloc_call]
+    )
+    m = KernelModule(
+        func_name="f",
+        param_names=[],
+        return_name="out",
+        tensors=tensors,
+        dims=dims,
+        iter_var_counter=0,
+        body=[alloc_block],
+    )
+    assert not validate_dataflow_ordering(m)
+
+
+def test_validate_rejects_read_between_rmw_writes() -> None:
+    """Rule 4: non-RMW read of T between two RMW writes of T must fail.
+
+    Construction: alloc T; memset T; RMW write #1; non-RMW read of T;
+    RMW write #2. Rule 4 requires the non-RMW read to come after the
+    LAST RMW write. The memset exists so that the failing rule here is
+    specifically rule 4 (not rule 3 — the RMW has a prior real write).
+    """
+    tensors = {
+        "psum": Tensor(
+            name="psum",
+            dim_ids=("d0",),
+            shape=(128,),
+            dtype="float32",
+            origin="intermediate",
+            location="psum",
+            buffer_degree={},
+        ),
+        "out": Tensor(
+            name="out",
+            dim_ids=("d0",),
+            shape=(128,),
+            dtype="bfloat16",
+            origin="return",
+            location="hbm",
+            buffer_degree={},
+        ),
+    }
+    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+
+    alloc_psum = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={"output": _mk_access("psum", 0)},
+        reads_writes={},
+        body=[
+            NKIOpCall(
+                op_cls=NKIAlloc,
+                kwargs={"tensor_name": "psum", "location": "psum", "shape": (128,), "dtype": "float32"},
+                axis_map={},
+                dim_role={},
+            )
+        ],
+    )
+    alloc_out = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={"output": _mk_access("out", 0)},
+        reads_writes={},
+        body=[
+            NKIOpCall(
+                op_cls=NKIAlloc,
+                kwargs={"tensor_name": "out", "location": "hbm", "shape": (128,), "dtype": "bfloat16"},
+                axis_map={},
+                dim_role={},
+            )
+        ],
+    )
+    memset_psum = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={"dst": _mk_access("psum", 0)},
+        reads_writes={},
+        body=[NKIOpCall(op_cls=NKIMemset, kwargs={"value": 0.0}, axis_map={}, dim_role={})],
+    )
+    rmw_1 = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={},
+        reads_writes={"dst": _mk_access("psum", 0)},
+        body=[NKIOpCall(op_cls=NKIMatmul, kwargs={}, axis_map={}, dim_role={})],
+    )
+    reader = SBlock(
+        iter_vars=[],
+        reads={"src": _mk_access("psum", 0)},
+        writes={"dst": _mk_access("out", 0)},
+        reads_writes={},
+        body=[NKIOpCall(op_cls=NKITensorCopy, kwargs={}, axis_map={}, dim_role={})],
+    )
+    rmw_2 = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={},
+        reads_writes={"dst": _mk_access("psum", 0)},
+        body=[NKIOpCall(op_cls=NKIMatmul, kwargs={}, axis_map={}, dim_role={})],
+    )
+    m = KernelModule(
+        func_name="f",
+        param_names=[],
+        return_name="out",
+        tensors=tensors,
+        dims=dims,
+        iter_var_counter=0,
+        body=[alloc_psum, alloc_out, memset_psum, rmw_1, reader, rmw_2],
+    )
+    assert not validate_dataflow_ordering(m)
+
+
+def test_validate_accepts_read_after_all_rmw_writes() -> None:
+    """Rule 4 positive case: non-RMW read of T after ALL RMW writes is legal.
+
+    Includes a memset initializer before the RMW sequence — under the
+    tightened rule 3, the first RMW requires a prior real write.
+    """
+    tensors = {
+        "psum": Tensor(
+            name="psum",
+            dim_ids=("d0",),
+            shape=(128,),
+            dtype="float32",
+            origin="intermediate",
+            location="psum",
+            buffer_degree={},
+        ),
+        "out": Tensor(
+            name="out",
+            dim_ids=("d0",),
+            shape=(128,),
+            dtype="bfloat16",
+            origin="return",
+            location="hbm",
+            buffer_degree={},
+        ),
+    }
+    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+
+    alloc_psum = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={"output": _mk_access("psum", 0)},
+        reads_writes={},
+        body=[
+            NKIOpCall(
+                op_cls=NKIAlloc,
+                kwargs={"tensor_name": "psum", "location": "psum", "shape": (128,), "dtype": "float32"},
+                axis_map={},
+                dim_role={},
+            )
+        ],
+    )
+    alloc_out = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={"output": _mk_access("out", 0)},
+        reads_writes={},
+        body=[
+            NKIOpCall(
+                op_cls=NKIAlloc,
+                kwargs={"tensor_name": "out", "location": "hbm", "shape": (128,), "dtype": "bfloat16"},
+                axis_map={},
+                dim_role={},
+            )
+        ],
+    )
+    memset_psum = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={"dst": _mk_access("psum", 0)},
+        reads_writes={},
+        body=[NKIOpCall(op_cls=NKIMemset, kwargs={"value": 0.0}, axis_map={}, dim_role={})],
+    )
+    rmw_1 = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={},
+        reads_writes={"dst": _mk_access("psum", 0)},
+        body=[NKIOpCall(op_cls=NKIMatmul, kwargs={}, axis_map={}, dim_role={})],
+    )
+    rmw_2 = SBlock(
+        iter_vars=[],
+        reads={},
+        writes={},
+        reads_writes={"dst": _mk_access("psum", 0)},
+        body=[NKIOpCall(op_cls=NKIMatmul, kwargs={}, axis_map={}, dim_role={})],
+    )
+    reader = SBlock(
+        iter_vars=[],
+        reads={"src": _mk_access("psum", 0)},
+        writes={"dst": _mk_access("out", 0)},
+        reads_writes={},
+        body=[NKIOpCall(op_cls=NKITensorCopy, kwargs={}, axis_map={}, dim_role={})],
+    )
+    m = KernelModule(
+        func_name="f",
+        param_names=[],
+        return_name="out",
+        tensors=tensors,
+        dims=dims,
+        iter_var_counter=0,
+        body=[alloc_psum, alloc_out, memset_psum, rmw_1, rmw_2, reader],
+    )
+    assert validate_dataflow_ordering(m)
+
+
+def test_validate_rejects_unwritten_return() -> None:
+    """Rule 5 negative case: return tensor with NO writer (no alloc, no op)
+    must fail validation."""
+    tensors = {
+        "out": Tensor(
+            name="out",
+            dim_ids=("d0",),
+            shape=(128,),
+            dtype="bfloat16",
+            origin="return",
+            location="hbm",
+            buffer_degree={},
+        )
+    }
+    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    """Empty body — no alloc, no writers → "out" never enters `written`."""
+    m = KernelModule(
+        func_name="f", param_names=[], return_name="out", tensors=tensors, dims=dims, iter_var_counter=0, body=[]
+    )
+    assert not validate_dataflow_ordering(m)

@@ -1,4 +1,4 @@
-"""Frontier-expansion sampler for the tune stage batch path.
+"""Frontier-expansion sampler for the tune stage — 7-atom enumeration.
 
 Two pure functions — no I/O, no rendering:
 
@@ -7,7 +7,31 @@ Two pure functions — no I/O, no rendering:
 * :func:`sample_pool` draws ``num_kernels`` states uniformly without
   replacement from the enumerated pool.
 
-See ``docs/superpowers/specs/2026-05-05-unified-tune-stage-design.md``.
+Atoms enumerated by default:
+
+- Domain: :class:`Split`, :class:`Reorder`.
+- Placement: :class:`ComputeAt`, :class:`ReverseComputeAt`.
+- Annotation: :class:`Annotate` (``buffer_degree`` +
+  ``software_pipeline_depth`` keys).
+
+Off the default sampler (atom available for explicit use, but not
+enumerated during random frontier expansion):
+
+- :class:`RFactor` — ``_apply_rmw``'s drain-tree rebuild has a
+  KeyError when block-local iter vars fall outside the forest-visible
+  chain. Re-enable once the fix lands.
+- :class:`Fuse` — renderer's ``_resolve_iv_name`` recursively
+  decomposes fused components, producing divergent
+  ``((i // a) // b) // c`` expressions when the fuse target is
+  itself a component of a prior fuse. Re-enable once the recursion is
+  bounded to a single level of ``//``/``%`` decomposition.
+
+``HoistInvariant`` was removed — its legality is a strict subset of
+:class:`ComputeAt` under the iter-var IR. ``MultiBuffer`` and
+``SoftwarePipeline`` were consolidated into :class:`Annotate` with keyed
+dispatch.
+
+See ``docs/superpowers/specs/2026-05-10-iter-var-refactor-design.md``.
 """
 
 import random
@@ -16,21 +40,20 @@ import warnings
 from nkigym.codegen.dep_cache import subtree_signature
 from nkigym.codegen.ir import KernelModule, validate_dataflow_ordering
 from nkigym.tune import AtomLegalityError, KernelRewrite
+from nkigym.tune.annotate import enumerate_annotate_atoms
 from nkigym.tune.compute_at import enumerate_compute_at_atoms
-from nkigym.tune.multi_buffer import enumerate_multi_buffer_atoms
 from nkigym.tune.reorder import enumerate_reorder_atoms
 from nkigym.tune.reverse_compute_at import enumerate_reverse_compute_at_atoms
-from nkigym.tune.rfactor import enumerate_rfactor_atoms
-from nkigym.tune.software_pipeline import enumerate_software_pipeline_atoms
 from nkigym.tune.split import enumerate_split_atoms
 
 
 def hash_state(module: KernelModule) -> int:
-    """Deterministic hash of the tune-stage state.
+    """Structural hash of the tune-stage state.
 
-    Folds the body's structural signature with every tensor's buffer_degree
-    so that MultiBuffer and body-editing atoms both register as distinct
-    states.
+    Folds the body's structural signature with every tensor's
+    ``buffer_degree`` and ``module.fused_iter_var_map`` so that body-editing
+    atoms, :class:`Annotate` buffer-degree mutations, and :class:`Fuse`
+    iter-var registrations all register as distinct states.
 
     Args:
         module: The :class:`KernelModule` to hash.
@@ -40,20 +63,16 @@ def hash_state(module: KernelModule) -> int:
     """
     body_key = tuple(subtree_signature(c) for c in module.body)
     tensor_key = tuple(sorted((t.name, tuple(sorted(t.buffer_degree.items()))) for t in module.tensors.values()))
-    return hash((body_key, tensor_key))
+    fuse_key = tuple(sorted(module.fused_iter_var_map.items()))
+    return hash((body_key, tensor_key, fuse_key))
 
 
 def _enumerate_atoms(module: KernelModule) -> list[KernelRewrite]:
-    """Return every atom currently applicable to ``module``.
+    """Return every default-sampler atom currently applicable to ``module``.
 
-    Three atoms are intentionally excluded from the default sampler:
-
-    - :class:`HoistInvariant` — legality overlap with :class:`ComputeAt`
-      makes random sampling fiddly; agents can opt in explicitly.
-    - :class:`Fuse` — the synthetic ``<outer>_x_<inner>`` dim_id it
-      produces has no renderer support yet (the renderer's slot
-      emitters can't decompose it back into outer/inner via div/mod).
-      Re-enable once the renderer learns to lower synthetic dims.
+    Five atoms: Split, Reorder, ComputeAt, ReverseComputeAt, Annotate.
+    RFactor and Fuse are excluded pending fixes documented in the
+    module docstring.
 
     Args:
         module: The :class:`KernelModule` to enumerate atoms on.
@@ -66,9 +85,7 @@ def _enumerate_atoms(module: KernelModule) -> list[KernelRewrite]:
     atoms.extend(enumerate_reorder_atoms(module))
     atoms.extend(enumerate_compute_at_atoms(module))
     atoms.extend(enumerate_reverse_compute_at_atoms(module))
-    atoms.extend(enumerate_rfactor_atoms(module))
-    atoms.extend(enumerate_multi_buffer_atoms(module))
-    atoms.extend(enumerate_software_pipeline_atoms(module))
+    atoms.extend(enumerate_annotate_atoms(module))
     return atoms
 
 

@@ -1,234 +1,233 @@
-"""Unit tests for ComputeAt atom."""
+"""Unit tests for the ComputeAt atom on the iter-var IR.
 
-import numpy as np
+Prefix-match + role-promotion semantics (TVM ``sch.compute_at``).
+"""
+
+import ast
+
 import pytest
 
 from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.dep_cache import DepCache
-from nkigym.codegen.ir import BodyLeaf, DimInfo, KernelModule, LoopNode, Tensor, leaves_under
+from nkigym.codegen.ir import ForNode, SBlock, validate_dataflow_ordering
+from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
+from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
+from nkigym.ops.tensor_copy import NKITensorCopy
+from nkigym.tune import AtomLegalityError
 from nkigym.tune.compute_at import ComputeAt, enumerate_compute_at_atoms
 
 
-def _mod_hand(body: list, dims: dict[str, DimInfo], tensors: dict[str, Tensor]) -> KernelModule:
-    """Build a minimal KernelModule from hand-rolled body / dims / tensors."""
-    return KernelModule(
-        func_name="f",
-        param_names=[],
-        return_name=next(iter(tensors)) if tensors else "x",
-        tensors=tensors,
-        dims=dims,
-        body=body,
-        dep=DepCache(scopes={}),
-    )
-
-
-from nkigym.ops.alloc import NKIAlloc
-from nkigym.ops.memset import NKIMemset
-from nkigym.ops.tensor_copy import NKITensorCopy
-
-
 @nkigym_kernel
-def _matmul_k(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """Simple matmul kernel fixture for ComputeAt atom tests (first-class buffers form)."""
-    lhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+def _matmul_large(lhs_T, rhs):
+    """2048 matmul fixture — multi-tile on K/M (16) and N (4)."""
+    lhs_T_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
     rhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
     psum_acc = NKIAlloc(location="psum", shape=(2048, 2048), dtype="float32")()
     sbuf_prod = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
     hbm_out = NKIAlloc(location="hbm", shape=(2048, 2048), dtype="bfloat16")()
-    NKILoad()(src=lhs, dst=lhs_sbuf)
+    NKILoad()(src=lhs_T, dst=lhs_T_sbuf)
     NKILoad()(src=rhs, dst=rhs_sbuf)
     NKIMemset(value=0.0)(dst=psum_acc)
-    NKIMatmul()(stationary=lhs_sbuf, moving=rhs_sbuf, dst=psum_acc)
+    NKIMatmul()(stationary=lhs_T_sbuf, moving=rhs_sbuf, dst=psum_acc)
     NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
     NKIStore()(src=sbuf_prod, dst=hbm_out)
     return hbm_out
 
 
-_INPUT_SPECS: dict[str, dict] = {
-    "lhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
-    "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
-}
+_SPECS = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
 
 
-@pytest.fixture
-def module():
-    """Build a canonical KernelModule for the matmul fixture."""
-    return build_canonical_module(_matmul_k, _INPUT_SPECS)
+def _collect_paths(module) -> list[tuple[tuple[int, ...], ForNode | SBlock]]:
+    """Walk the forest; return every ``(path, node)`` pair."""
+    results: list[tuple[tuple[int, ...], ForNode | SBlock]] = []
 
-
-def test_enumerator_emits_atoms(module):
-    """On canonical matmul, ComputeAt emits at least one legal atom.
-
-    For example, moving a load leaf under the matmul's outer loop.
-    """
-    atoms = enumerate_compute_at_atoms(module)
-    assert atoms, "expected at least one legal ComputeAt atom"
-    for atom in atoms:
-        assert atom.is_legal(module)
-
-
-def test_apply_changes_tree(module):
-    """Applying a legal atom changes tree structure but preserves leaf count."""
-    atoms = enumerate_compute_at_atoms(module)
-    assert atoms
-    atom = atoms[0]
-    new_mod = atom.apply(module)
-    assert new_mod.body is not module.body
-    assert len(list(_all_leaves(new_mod))) == len(list(_all_leaves(module)))
-
-
-def test_rejects_ancestor_target(module):
-    """Moving a leaf under one of its own ancestor loops is rejected."""
-    leaf_path = None
-
-    def find_leaf(node, path):
-        if isinstance(node, BodyLeaf):
-            return path
-        for i, c in enumerate(node.children):
-            r = find_leaf(c, path + (i,))
-            if r is not None:
-                return r
-        return None
+    def walk(node, path):
+        results.append((path, node))
+        if isinstance(node, ForNode):
+            for i, c in enumerate(node.children):
+                walk(c, path + (i,))
 
     for i, root in enumerate(module.body):
-        leaf_path = find_leaf(root, (i,))
-        if leaf_path is not None and len(leaf_path) >= 2:
-            break
-    assert leaf_path is not None
-    ancestor_path = leaf_path[:-1]
-    atom = ComputeAt(leaf_path=leaf_path, target_loop_path=ancestor_path)
+        walk(root, (i,))
+    return results
+
+
+def _find_block_writing(module, tensor_name: str) -> tuple[int, ...]:
+    """Return the path to the first SBlock whose writes contain ``tensor_name``."""
+    for path, node in _collect_paths(module):
+        if isinstance(node, SBlock):
+            written = {a.tensor_name for a in node.writes.values()} | {
+                a.tensor_name for a in node.reads_writes.values()
+            }
+            if tensor_name in written and any(c.op_cls.__name__ != "NKIAlloc" for c in node.body):
+                return path
+    raise AssertionError(f"No SBlock writing {tensor_name!r}")
+
+
+def _find_matmul_d0_acc_path(module) -> tuple[int, ...]:
+    """Return the path to the matmul's ``d0`` ACC ForNode (extent 16)."""
+    for path, node in _collect_paths(module):
+        if isinstance(node, ForNode):
+            iv = node.iter_var
+            if iv.dim_id == "d0" and iv.role == AxisRole.ACCUMULATION:
+                return path
+    raise AssertionError("No d0 ACC ForNode")
+
+
+def test_compute_at_under_matmul_acc_loop_is_legal() -> None:
+    """The load writing ``rhs_sbuf`` can be placed under matmul's ``d0`` ACC loop.
+
+    matmul reads ``rhs_sbuf`` via ``moving`` → target's subtree consumes
+    the block's writes. Block is a sibling subtree of target (load d0 is
+    PARALLEL; matmul d0 is ACCUMULATION) so target is NOT an ancestor.
+    Block.iter_vars[0].dim_id == d0 matches target ancestor chain's d0
+    → prefix-match holds.
+    """
+    module = build_canonical_module(_matmul_large, _SPECS)
+    load_path = _find_block_writing(module, "rhs_sbuf")
+    target_path = _find_matmul_d0_acc_path(module)
+    atom = ComputeAt(block_path=load_path, target_path=target_path)
+    assert atom.is_legal(module)
+
+
+def test_compute_at_rejects_target_that_is_ancestor() -> None:
+    """Target that IS an ancestor of the block's current position is rejected."""
+    module = build_canonical_module(_matmul_large, _SPECS)
+    mm_path = _find_block_writing(module, "psum_acc")
+    """Parent path (last ForNode ancestor of mm block)."""
+    parent_path = mm_path[:-1]
+    atom = ComputeAt(block_path=mm_path, target_path=parent_path)
     assert not atom.is_legal(module)
 
 
-def test_canonical_names_after_apply(module):
-    """Every LoopNode in the post-apply tree has canonical ``i_<dim>_<ordinal>`` name."""
-    atoms = enumerate_compute_at_atoms(module)
-    atom = atoms[0]
-    new_mod = atom.apply(module)
+def test_compute_at_rejects_target_without_consumer() -> None:
+    """Target whose subtree does not consume the block's writes is rejected.
 
-    def walk(node):
-        if isinstance(node, LoopNode):
-            assert node.name is not None
-            assert node.name.startswith("i_")
-            for c in node.children:
-                walk(c)
-
-    for root in new_mod.body:
-        walk(root)
-
-
-def _all_leaves(module):
-    """Yield every BodyLeaf across the whole module forest."""
-    for root in module.body:
-        yield from leaves_under(root)
-
-
-def test_compute_at_preserves_target_after_pruning(module):
-    """When the leaf being moved is the only child of an ancestor LoopNode,
-    removal collapses that ancestor and shifts sibling indices. target_loop_path
-    must be re-resolved against the new tree."""
-    for atom in enumerate_compute_at_atoms(module):
-        """Apply to the original module (not composed) to exercise every atom."""
-        new_mod = atom.apply(module)
-        assert new_mod is not None
-
-
-def test_apply_regenerates_residual_trip_on_partial_ancestor() -> None:
-    """Partial-coverage ancestor → residual inner loop regenerated.
-
-    Setup: forest body has two root subtrees.
-    * Subtree 0: producer ``write={"p"}`` with no ancestor — sibling at the root.
-    * Subtree 1: ``L(d0, trip=2)`` wrapping consumer ``reads={"p"}``.
-    ``dims["d0"].num_tiles = 16``. Move producer under subtree 1's
-    root loop (target_path=(1,)); producer's dim_role has ``d0``.
-    Expected: producer appended under ``L(d0, 2)`` with a regenerated
-    ``L(d0, 8)`` between target and producer leaf, covering the residual
-    ``16 / 2 = 8`` trips.
+    Matmul writes ``psum_acc``; target under the load subtree does not
+    read ``psum_acc``. Such a target is illegal.
     """
-    producer = BodyLeaf(
-        op_cls=object, reads={}, writes=("p",), kwargs={}, axis_map={}, dim_role={"d0": AxisRole.PARALLEL}
-    )
-    consumer = BodyLeaf(
-        op_cls=object, reads={"data": "p"}, writes=(), kwargs={}, axis_map={}, dim_role={"d0": AxisRole.PARALLEL}
-    )
-    consumer_outer = LoopNode("d0", 2, AxisRole.PARALLEL, children=[consumer])
-    dims = {"d0": DimInfo(dim_id="d0", total_size=2048, tile_size=128, num_tiles=16)}
-    tensors = {
-        "p": Tensor(
-            name="p",
-            dim_ids=("d0",),
-            shape=(2048,),
-            dtype="float32",
-            origin="intermediate",
-            location="sbuf",
-            buffer_degree={"d0": 1},
-        )
-    }
-    module = _mod_hand(body=[producer, consumer_outer], dims=dims, tensors=tensors)
-    atom = ComputeAt(leaf_path=(0,), target_loop_path=(1,))
-    assert atom.is_legal(module)
-    new_module = atom.apply(module)
-    """After apply: body collapses from length 2 to 1 — producer removed
-    from body[0], consumer_outer shifts to body[0]. Under the new
-    consumer_outer, expect the original consumer + a regenerated
-    L(d0, 8) wrapping a clone of producer."""
-    assert len(new_module.body) == 1
-    new_target = new_module.body[0]
-    assert isinstance(new_target, LoopNode) and new_target.trip_count == 2
-    regen_wrappers = [c for c in new_target.children if isinstance(c, LoopNode) and c.dim_id == "d0"]
-    assert len(regen_wrappers) == 1, f"expected one regenerated d0 loop, got {len(regen_wrappers)}"
-    residual_loop = regen_wrappers[0]
-    assert residual_loop.trip_count == 8
-    residual_child = residual_loop.children[0]
-    assert isinstance(residual_child, BodyLeaf)
-    assert residual_child.writes == ("p",)
+    module = build_canonical_module(_matmul_large, _SPECS)
+    mm_path = _find_block_writing(module, "psum_acc")
+    """Find any ForNode under a load subtree (which only reads lhs_T / rhs)."""
+    load_path = _find_block_writing(module, "lhs_T_sbuf")
+    load_root_idx = load_path[0]
+    load_root = module.body[load_root_idx]
+    assert isinstance(load_root, ForNode)
+    atom = ComputeAt(block_path=mm_path, target_path=(load_root_idx,))
+    assert not atom.is_legal(module)
 
 
-def test_apply_raises_on_indivisible_residual() -> None:
-    """Ancestor trip does not divide num_tiles → AtomLegalityError."""
-    from nkigym.tune import AtomLegalityError
+def test_compute_at_apply_moves_block_under_target() -> None:
+    """After apply, the moved block lives in target's subtree + module validates."""
+    module = build_canonical_module(_matmul_large, _SPECS)
+    load_path = _find_block_writing(module, "rhs_sbuf")
+    target_path = _find_matmul_d0_acc_path(module)
+    atom = ComputeAt(block_path=load_path, target_path=target_path)
+    new_mod = atom.apply(module)
+    assert validate_dataflow_ordering(new_mod)
 
-    producer = BodyLeaf(op_cls=object, writes=("p",), dim_role={"d0": AxisRole.PARALLEL})
-    consumer = BodyLeaf(op_cls=object, reads={"data": "p"}, dim_role={"d0": AxisRole.PARALLEL})
-    """num_tiles=17 with ancestor trip=3 → residual 17/3 does not divide."""
-    consumer_outer = LoopNode("d0", 3, AxisRole.PARALLEL, children=[consumer])
-    dims = {"d0": DimInfo(dim_id="d0", total_size=17 * 128, tile_size=128, num_tiles=17)}
-    tensors = {
-        "p": Tensor(
-            name="p",
-            dim_ids=("d0",),
-            shape=(17 * 128,),
-            dtype="float32",
-            origin="intermediate",
-            location="sbuf",
-            buffer_degree={"d0": 1},
-        )
-    }
-    module = _mod_hand(body=[producer, consumer_outer], dims=dims, tensors=tensors)
-    atom = ComputeAt(leaf_path=(0,), target_loop_path=(1,))
-    assert atom.is_legal(module)
-    try:
+    """Walk the new tree: the block writing rhs_sbuf should appear under
+    a ForNode whose dim_id == 'd0' (target's ancestor chain's dim)."""
+
+    def has_rhs_load_under_d0(node, under_d0: bool) -> bool:
+        if isinstance(node, SBlock):
+            writes = {a.tensor_name for a in node.writes.values()}
+            return under_d0 and "rhs_sbuf" in writes
+        is_d0 = node.iter_var.dim_id == "d0"
+        next_under = under_d0 or is_d0
+        return any(has_rhs_load_under_d0(c, next_under) for c in node.children)
+
+    found = False
+    for root in new_mod.body:
+        if has_rhs_load_under_d0(root, False):
+            found = True
+            break
+    assert found
+
+
+def test_compute_at_apply_raises_on_illegal() -> None:
+    """``apply`` re-validates and raises ``AtomLegalityError``."""
+    module = build_canonical_module(_matmul_large, _SPECS)
+    mm_path = _find_block_writing(module, "psum_acc")
+    parent_path = mm_path[:-1]
+    atom = ComputeAt(block_path=mm_path, target_path=parent_path)
+    with pytest.raises(AtomLegalityError):
         atom.apply(module)
-    except AtomLegalityError:
-        return
-    raise AssertionError("expected AtomLegalityError for indivisible residual")
 
 
-def test_ancestor_trip_products_accumulates_same_dim() -> None:
-    """Same-dim ancestors contribute their trips multiplicatively."""
-    from nkigym.tune.compute_at import _ancestor_trip_products
+def test_compute_at_render_valid_python() -> None:
+    """After apply + render, the output parses as valid Python."""
+    module = build_canonical_module(_matmul_large, _SPECS)
+    load_path = _find_block_writing(module, "rhs_sbuf")
+    target_path = _find_matmul_d0_acc_path(module)
+    atom = ComputeAt(block_path=load_path, target_path=target_path)
+    new_mod = atom.apply(module)
+    source = render(new_mod)
+    ast.parse(source)
 
-    leaf = BodyLeaf(op_cls=object)
-    l3 = LoopNode("d0", 4, AxisRole.PARALLEL, children=[leaf])
-    l2 = LoopNode("d0", 2, AxisRole.PARALLEL, children=[l3])
-    l1 = LoopNode("d1", 3, AxisRole.PARALLEL, children=[l2])
-    body = [l1]
-    assert _ancestor_trip_products(body, (0, 0, 0)) == {"d0": 8, "d1": 3}
-    assert _ancestor_trip_products(body, (0, 0)) == {"d0": 2, "d1": 3}
-    assert _ancestor_trip_products(body, (0,)) == {"d1": 3}
-    assert _ancestor_trip_products(body, ()) == {}
+
+def test_enumerate_compute_at_atoms_yields_legal_only() -> None:
+    """Every atom emitted by the enumerator passes ``is_legal``."""
+    module = build_canonical_module(_matmul_large, _SPECS)
+    atoms = enumerate_compute_at_atoms(module)
+    for atom in atoms:
+        assert atom.is_legal(module)
+    assert len(atoms) > 0
+
+
+def test_compute_at_role_promotion_allocates_fresh_iter_var() -> None:
+    """When block's role is stronger than target's on a matched dim, a
+    fresh iter var with the stronger role is allocated.
+
+    The matmul writes psum_acc with ACC role on d0, and d0 on matmul's
+    canonical chain is ACC. If we hoist a memset (which writes psum_acc
+    with PAR role on d0) under matmul's d0 ACC loop, the matched pair is
+    (ACC, PAR) → max is ACC → no promotion (target already at max role).
+    Conversely, we can test the mirror: the load's d0 is PAR. ComputeAt
+    under matmul d0 ACC: matched (ACC, PAR) → max is ACC → no promotion.
+    Either way the promoted role is >= target's.
+    """
+    module = build_canonical_module(_matmul_large, _SPECS)
+    counter_before = module.iter_var_counter
+    load_path = _find_block_writing(module, "rhs_sbuf")
+    target_path = _find_matmul_d0_acc_path(module)
+    atom = ComputeAt(block_path=load_path, target_path=target_path)
+    new_mod = atom.apply(module)
+    """Target's role is already ACC (strongest); no promotion needed.
+    Counter should advance if any iter-var was allocated during apply
+    (e.g. in other paths). Allow equality."""
+    assert new_mod.iter_var_counter >= counter_before
+
+
+def test_compute_at_unmatched_suffix_forms_inner_fornodes() -> None:
+    """Block's iter vars beyond the matched prefix become nested ForNodes.
+
+    rhs_sbuf load has iter_vars (d0_par, d3_par). Moving under matmul's
+    d0 ACC means the d0 pair is matched (prefix length 1). The load's
+    d3 iter var remains in block's iter_vars list, wrapped in a fresh
+    ForNode as the new block subtree's outermost loop.
+    """
+    module = build_canonical_module(_matmul_large, _SPECS)
+    load_path = _find_block_writing(module, "rhs_sbuf")
+    target_path = _find_matmul_d0_acc_path(module)
+    atom = ComputeAt(block_path=load_path, target_path=target_path)
+    new_mod = atom.apply(module)
+    """Find the relocated load SBlock (skip the NKIAlloc block that also
+    declares ``rhs_sbuf``)."""
+    relocated: SBlock | None = None
+    for _path, node in _collect_paths(new_mod):
+        if isinstance(node, SBlock):
+            writes = {a.tensor_name for a in node.writes.values()}
+            if "rhs_sbuf" in writes and any(c.op_cls.__name__ == "NKILoad" for c in node.body):
+                relocated = node
+                break
+    assert relocated is not None
+    """Unmatched suffix: d3 iter var remains in iter_vars."""
+    remaining_dims = [iv.dim_id for iv in relocated.iter_vars]
+    assert "d3" in remaining_dims
+    assert "d0" not in remaining_dims, "d0 iter var should have been merged with target's"

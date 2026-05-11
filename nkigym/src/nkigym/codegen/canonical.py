@@ -7,11 +7,10 @@ Pipeline:
     3. Derive per-dim total size + tile size from ``input_specs`` and
        per-op ``TILE_LIMITS``.
     4. Tag each tensor's ``origin`` (``param`` / ``intermediate`` / ``return``).
-    5. Build the canonical 1N-per-dim forest with phase leaves at the
-       deepest point; populate every :class:`BodyLeaf` with FULL metadata
-       so leaves are self-describing (no back-reference to a sidecar).
-       Tiles-per-block arithmetic-intensity dials live in ``Split``, not
-       canonical form.
+    5. Build the iter-var schedule tree: one :class:`SBlock` per op carrying
+       block-local iter vars, wrapped in a 1N-per-dim :class:`ForNode`
+       chain. Allocs produce root-level empty-iter-var SBlocks in source
+       order; compute blocks follow in source order.
     6. Assign canonical loop names ``i_<dim>_<ordinal>`` across each tree.
 
 The resulting :class:`KernelModule` is the IR the renderer and transform
@@ -28,7 +27,19 @@ from typing import Any
 
 import numpy as np
 
-from nkigym.codegen.ir import BodyLeaf, DimInfo, KernelModule, LoopNode, Tensor, TreeIR
+from nkigym.codegen.ir import (
+    AccessRange,
+    BufferAccess,
+    DimInfo,
+    ForNode,
+    IterVar,
+    KernelModule,
+    NKIOpCall,
+    SBlock,
+    Tensor,
+    TreeIR,
+)
+from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import AxisRole, NKIOp
 
 
@@ -49,26 +60,28 @@ def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict[st
     dims = _derive_dims(raws, per_op_axis_maps, dim_sizes)
     parsed_ops = _build_parsed_ops(raws, per_op_axis_maps, tensors, dims)
 
-    body: TreeIR = []
-    """Alloc leaves are emitted at the forest root in source order (the
-    user's declaration order). Compute/copy leaves follow, each with their
-    own schedule tree built from touched_dims."""
-    for alloc in allocs:
-        alloc_leaf = _make_alloc_leaf(alloc)
-        body.append(alloc_leaf)
-    for op in parsed_ops:
-        body.append(_build_tree(op, dims))
-    for tree in body:
-        _assign_canonical_names(tree, same_dim_counts={})
-
-    return KernelModule(
+    module = KernelModule(
         func_name=unwrapped.__name__,
         param_names=param_names,
         return_name=return_name,
         tensors=tensors,
         dims=dims,
-        body=body,
+        iter_var_counter=0,
+        body=[],
     )
+
+    """Alloc blocks first (source order), then compute trees (source order).
+    Each compute block allocates fresh iter vars via ``module.allocate_iter_var``;
+    allocs get empty-iter-var root SBlocks."""
+    for alloc in allocs:
+        module.body.append(_make_alloc_sblock(alloc))
+    for op in parsed_ops:
+        module.body.append(_build_tree(op, module))
+
+    for tree in module.body:
+        _assign_canonical_names(tree, same_dim_counts={})
+
+    return module
 
 
 @dataclass
@@ -95,7 +108,7 @@ class _AllocRecord:
     """Canonical-build-time record for an NKIAlloc call in f_nkigym.
 
     Captures the tensor identity (name, location, shape, dtype) that
-    populates ``module.tensors``. The resulting ``BodyLeaf`` carries
+    populates ``module.tensors``. The resulting alloc SBlock carries
     only ``tensor_name`` — the declaration lives in ``module.tensors``.
     """
 
@@ -216,8 +229,6 @@ def _try_parse_alloc(stmt: ast.Assign, func_globals: dict[str, object]) -> _Allo
     if not isinstance(inner.func, ast.Name) or inner.func.id != "NKIAlloc":
         return None
     """Verify that the NKIAlloc name resolves to our op class."""
-    from nkigym.ops.alloc import NKIAlloc
-
     candidate = func_globals.get(inner.func.id)
     if candidate is not NKIAlloc:
         return None
@@ -429,6 +440,7 @@ def _build_parsed_ops(
     dims: dict[str, DimInfo],
 ) -> list[_ParsedOp]:
     """Assemble per-op records with canonicalised ``touched_dims``."""
+    _ = dims
     ops: list[_ParsedOp] = []
     for idx, (raw, axis_map) in enumerate(zip(raws, per_op_axis_maps)):
         touched = _touched_dims(raw, axis_map, tensors)
@@ -484,90 +496,128 @@ def _touched_dims(raw: _ParsedOpRaw, axis_map: dict[str, str], tensors: dict[str
     return tuple(ordered)
 
 
-def _make_leaf(op: _ParsedOp) -> BodyLeaf:
-    """Build a self-describing :class:`BodyLeaf` for ``op``.
+def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
+    """Build an iter-var :class:`SBlock` for ``op``.
 
-    ``RMW_OPERANDS`` and ``INPUT_OPERANDS`` on the op class split operand
-    slots into three buckets:
-    - ``INPUT_OPERANDS`` (and not RMW) → ``reads``.
-    - ``RMW_OPERANDS`` → ``reads_writes``.
-    - Otherwise (e.g. ``dst``, ``reduce_res``) → ``writes``.
+    Allocates one fresh :class:`IterVar` per ``dim_id`` in ``op.touched_dims``
+    via ``module.allocate_iter_var`` (role = op-local role, extent = dim's
+    num_tiles). Operand slots split into three buckets based on the op's
+    ``INPUT_OPERANDS`` / ``RMW_OPERANDS``:
+
+    - ``RMW_OPERANDS``          → ``reads_writes``
+    - ``INPUT_OPERANDS``        → ``reads``
+    - Otherwise (``dst`` etc.)  → ``writes``
+
+    Each bucket maps slot_name → :class:`BufferAccess` whose pattern carries
+    one :class:`AccessRange` per tensor dim (coefficient 1, offset 0,
+    extent = the dim's tile_size).
     """
+    dim_to_iv: dict[str, IterVar] = {}
+    iter_vars: list[IterVar] = []
+    for dim_id in op.touched_dims:
+        extent = module.dims[dim_id].num_tiles
+        iv = module.allocate_iter_var(dim_id=dim_id, extent=extent, role=op.dim_role[dim_id])
+        dim_to_iv[dim_id] = iv
+        iter_vars.append(iv)
+
     rmw = op.op_cls.RMW_OPERANDS
     input_slots = op.op_cls.INPUT_OPERANDS
-    reads: dict[str, str] = {}
-    writes_list: list[str] = []
-    reads_writes_list: list[str] = []
-    for slot, tname in op.operand_names.items():
+    reads: dict[str, BufferAccess] = {}
+    writes: dict[str, BufferAccess] = {}
+    reads_writes: dict[str, BufferAccess] = {}
+    for slot, axes in op.op_cls.OPERAND_AXES.items():
+        tname = op.operand_names.get(slot)
+        if tname is None or tname not in module.tensors:
+            continue
+        access = _build_buffer_access(tname, axes, op, dim_to_iv, module)
         if slot in rmw:
-            reads_writes_list.append(tname)
+            reads_writes[slot] = access
         elif slot in input_slots:
-            reads[slot] = tname
+            reads[slot] = access
         else:
-            writes_list.append(tname)
-    return BodyLeaf(
-        op_cls=op.op_cls,
-        reads=reads,
-        writes=tuple(writes_list),
-        reads_writes=tuple(reads_writes_list),
-        kwargs=dict(op.op_kwargs),
-        axis_map=dict(op.axis_map),
-        dim_role=dict(op.dim_role),
+            writes[slot] = access
+
+    call = NKIOpCall(
+        op_cls=op.op_cls, kwargs=dict(op.op_kwargs), axis_map=dict(op.axis_map), dim_role=dict(op.dim_role)
     )
+    return SBlock(iter_vars=iter_vars, reads=reads, writes=writes, reads_writes=reads_writes, body=[call])
 
 
-def _make_alloc_leaf(alloc: _AllocRecord) -> BodyLeaf:
-    """Build the single BodyLeaf for an NKIAlloc declaration.
+def _build_buffer_access(
+    tname: str, axes: tuple[str, ...], op: _ParsedOp, dim_to_iv: dict[str, IterVar], module: KernelModule
+) -> BufferAccess:
+    """Produce a :class:`BufferAccess` for ``tname`` referenced by ``op`` via ``axes``.
 
-    The leaf's only kwarg is ``tensor_name`` — shape/dtype/location
-    live in ``module.tensors[name]``.
+    Each abstract axis maps to a concrete dim id via ``op.axis_map``;
+    every such dim carries an iter var in ``dim_to_iv``. The per-dim
+    :class:`AccessRange` has coefficient 1 on its iter var and extent
+    equal to the dim's tile_size.
     """
-    from nkigym.ops.alloc import NKIAlloc
+    tensor = module.tensors[tname]
+    iv_ids_seen: list[int] = []
+    pattern_entries: list[AccessRange] = []
+    for i, abstract in enumerate(axes):
+        if i >= len(tensor.dim_ids):
+            break
+        dim_id = op.axis_map.get(abstract, tensor.dim_ids[i])
+        iv = dim_to_iv.get(dim_id)
+        if iv is None:
+            """Dim untouched by this op — constant-offset access along this dim.
+            Canonical build never hits this branch (every referenced dim is in
+            ``touched_dims``), but the safety net keeps the function total."""
+            extent = module.dims[dim_id].tile_size if dim_id in module.dims else tensor.shape[i]
+            pattern_entries.append(AccessRange.make({}, 0, extent))
+            continue
+        if iv.var_id not in iv_ids_seen:
+            iv_ids_seen.append(iv.var_id)
+        pattern_entries.append(AccessRange.make({iv.var_id: 1}, 0, module.dims[dim_id].tile_size))
+    return BufferAccess(tensor_name=tname, iter_var_ids=tuple(iv_ids_seen), pattern=tuple(pattern_entries))
 
-    return BodyLeaf(op_cls=NKIAlloc, reads={}, writes=(alloc.name,), kwargs={"tensor_name": alloc.name})
 
+def _make_alloc_sblock(alloc: _AllocRecord) -> SBlock:
+    """Build the single :class:`SBlock` for an NKIAlloc declaration.
 
-def _build_tree(op: _ParsedOp, dims: dict[str, DimInfo]) -> LoopNode | BodyLeaf:
-    """Build the 1N-per-dim chain for ``op`` with a leaf at the tip.
-
-    If op has no touched_dims (empty abstract axes), returns the leaf directly."""
-    deepest_children = _build_leaves(op, dims)
-    if not op.touched_dims:
-        """Ops with no operand axes (or scalar-only ops) have no loop nest."""
-        assert len(deepest_children) == 1
-        return deepest_children[0]
-    return _wrap_dims(op.touched_dims, op, dims, deepest_children)
-
-
-def _wrap_dims(
-    wrap: tuple[str, ...], op: _ParsedOp, dims: dict[str, DimInfo], inner_children: list[LoopNode | BodyLeaf]
-) -> LoopNode:
-    """Wrap ``inner_children`` in a 1N-per-dim chain over ``wrap``.
-
-    Each dim contributes one ``LoopNode`` with ``trip_count = num_tiles``.
-    The outer wrapper matches the dim ordering in ``touched_dims``
-    (outermost first). Arithmetic-intensity dials (tiles-per-block)
-    live in ``Split``, not here.
+    Alloc blocks have no iter vars and no reads. The single
+    :class:`NKIOpCall` carries the alloc metadata (``tensor_name``,
+    ``location``, ``shape``, ``dtype``); the renderer looks up
+    ``module.tensors[tensor_name]`` at emission time.
     """
-    node_children: list[LoopNode | BodyLeaf] = inner_children
-    for d in reversed(wrap):
-        role = op.dim_role[d]
-        num_t = dims[d].num_tiles
-        block_node = LoopNode(dim_id=d, trip_count=num_t, role=role, children=node_children)
-        node_children = [block_node]
-    head = node_children[0]
-    assert isinstance(head, LoopNode)
-    return head
+    call = NKIOpCall(
+        op_cls=NKIAlloc,
+        kwargs={"tensor_name": alloc.name, "location": alloc.location, "shape": alloc.shape, "dtype": alloc.dtype},
+        axis_map={},
+        dim_role={},
+    )
+    output_access = BufferAccess(tensor_name=alloc.name, iter_var_ids=(), pattern=())
+    return SBlock(iter_vars=[], reads={}, writes={"output": output_access}, reads_writes={}, body=[call])
 
 
-def _build_leaves(op: _ParsedOp, dims: dict[str, DimInfo]) -> list[LoopNode | BodyLeaf]:
-    """Single-phase default: every op emits one ``BodyLeaf``."""
-    _ = dims
-    return [_make_leaf(op)]
+def _build_tree(op: _ParsedOp, module: KernelModule) -> ForNode | SBlock:
+    """Build the iter-var schedule tree for ``op``: 1N ForNode per touched dim.
+
+    If ``op.touched_dims`` is empty, returns the :class:`SBlock` directly
+    (no loop nest needed). Otherwise wraps outermost-first: ``iter_vars[0]``
+    is the outermost :class:`ForNode`.
+    """
+    block = _make_sblock(op, module)
+    return _wrap_block_in_fornodes(block)
 
 
-def _assign_canonical_names(node: "LoopNode | BodyLeaf", same_dim_counts: dict[str, int]) -> None:
-    """Walk the tree in a root-outward DFS, naming each LoopNode.
+def _wrap_block_in_fornodes(block: SBlock) -> ForNode | SBlock:
+    """Wrap ``block`` in one :class:`ForNode` per iter var, outermost first.
+
+    Returns ``block`` unwrapped if it has no iter vars (alloc blocks).
+    """
+    if not block.iter_vars:
+        return block
+    node: ForNode | SBlock = block
+    for iv in reversed(block.iter_vars):
+        node = ForNode(iter_var=iv, children=[node])
+    return node
+
+
+def _assign_canonical_names(node: ForNode | SBlock, same_dim_counts: dict[str, int]) -> None:
+    """Walk the tree in a root-outward DFS, naming each :class:`ForNode`.
 
     ``same_dim_counts[d]`` tracks how many same-dim ancestors of ``d``
     are already open on the current path; the newly visited node takes
@@ -576,11 +626,17 @@ def _assign_canonical_names(node: "LoopNode | BodyLeaf", same_dim_counts: dict[s
     see the same counts the parent did (they are not each other's
     ancestors).
     """
-    if isinstance(node, BodyLeaf):
+    if isinstance(node, SBlock):
         return
-    k = same_dim_counts.get(node.dim_id, 0)
-    node.name = f"i_{node.dim_id}_{k}"
-    same_dim_counts[node.dim_id] = k + 1
+    dim_id = node.iter_var.dim_id
+    k = same_dim_counts.get(dim_id, 0)
+    node.name = f"i_{dim_id}_{k}"
+    same_dim_counts[dim_id] = k + 1
     for child in node.children:
         _assign_canonical_names(child, same_dim_counts)
-    same_dim_counts[node.dim_id] = k
+    same_dim_counts[dim_id] = k
+
+
+"""TreeIR re-exported only for callers that currently expect
+``canonical.TreeIR`` — the type lives in :mod:`nkigym.codegen.ir`."""
+_ = TreeIR

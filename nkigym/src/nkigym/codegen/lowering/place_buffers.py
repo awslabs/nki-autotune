@@ -1,155 +1,135 @@
-"""``PlaceBuffers`` pass: derive buffer shapes and placement metadata from IR.
+"""Buffer placement: compute tensor SBUF/PSUM shapes from iter-var LCA walk.
 
-Runs before source emission. The pass walks the schedule tree to compute,
-for every intermediate tensor:
+Per-tensor shape derivation:
 
-* :func:`required_tiles` — the minimum number of tiles a tensor must hold
-  along a given dim, derived from the LCA of its producer/consumer paths.
-  For cross-nest tensors (LCA at the forest root) this is
-  ``num_tiles(dim_id)``; for fully intra-nest tensors (LCA below all
-  dim-iterating ancestors) this is ``1``.
-* :func:`sbuf_shape` — the 3D SBUF allocation shape
-  ``(p_tile, total_slots_P, num_f_tiles * f_tile)``, where
-  ``total_slots_P`` multiplies :func:`required_tiles` by the multi-buffer
-  degree.
-* :func:`tensor_total_slots` — per-dim slot count
-  (``required_tiles * buffer_degree``); consumed by body emitters to
-  build slot-indexing expressions.
+- For each ``SBlock`` that touches this tensor, collect enclosing
+  ``ForNode`` iter vars (from forest root down to the block).
+- Find the common iter-var prefix across all accesses -- these iter
+  vars are ancestors above the LCA. Per-dim coverage = product of
+  extents of common-prefix iter vars on that dim.
+- ``required_tiles[dim] = num_tiles[dim] / coverage[dim]``.
+- ``num_slots[dim] = required_tiles[dim] * tensor.buffer_degree.get(dim, 1)``.
+- Shape: ``(P_tile, num_P_slots, *middle_slots, F_tile * num_F_tiles)``.
 
-Shared with :mod:`nkigym.tune.multi_buffer`, which uses
-:func:`required_tiles` for legality checks: a tensor's multi-buffer
-degree may never exceed ``num_tiles(dim_id) / required_tiles(dim_id)``
-without producing slot-modulo aliasing in the rendered kernel.
+N-D unified path: trivial dims (``num_slots == 1``) stay explicit per
+Q5 decision. A single-tile 2D tensor emits ``(P_tile, 1, F_tile)``.
+
+Param tensors and return-HBM tensors are untouched -- their shape comes
+from input_specs / alloc declaration.
 """
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, Tensor
+from nkigym.codegen.ir import ForNode, IterVar, KernelModule, SBlock, Tensor
 
 
-def required_tiles(tensor: Tensor, dim_id: str, module: KernelModule) -> int:
-    """Return the minimum tile count along ``dim_id`` that ``tensor`` must hold.
-
-    Derived by walking the module body: find the LCA of ``tensor``'s
-    producer and all consumers, then take
-    ``num_tiles(dim_id) / product_of_dim_id_trips_above_lca``. For
-    cross-loopnest tensors (LCA is the forest root) the product is 1
-    and ``required_tiles`` equals ``num_tiles(dim_id)``. For fully
-    intra-loopnest tensors (LCA below all ``dim_id``-iterating
-    ancestors) the product equals ``num_tiles(dim_id)`` and
-    ``required_tiles`` is ``1``.
-
-    Parameter and return tensors — which live in HBM and are not
-    tile-decomposed — return ``module.dims[dim_id].num_tiles`` unchanged.
+def place_buffers(module: KernelModule) -> None:
+    """Mutate intermediate SBUF/PSUM tensor shapes in place.
 
     Args:
-        tensor: Target tensor.
-        dim_id: Dim along which to size the tile count.
-        module: Enclosing :class:`KernelModule`.
-
-    Returns:
-        The minimum tile count along ``dim_id`` this tensor must hold.
-
-    Raises:
-        ValueError: Product of ancestor trip counts does not divide
-            ``num_tiles(dim_id)`` (unsupported forest shape).
+        module: KernelModule with iter-var-based body.
     """
-    num_t = module.dims[dim_id].num_tiles
-    if tensor.origin in ("param", "return"):
-        return num_t
-    paths = _find_access_paths(tensor.name, module)
-    if not paths:
-        return num_t
-    lca = _lowest_common_ancestor(paths)
-    prod = 1
-    for node in lca:
-        if isinstance(node, LoopNode) and node.dim_id == dim_id:
-            prod *= node.trip_count
-    if num_t % prod != 0:
-        raise ValueError(
-            f"Tensor {tensor.name!r} dim {dim_id!r}: ancestor trip product {prod} does not divide num_tiles {num_t}"
-        )
-    return num_t // prod
+    for tensor in module.tensors.values():
+        if tensor.origin == "param":
+            continue
+        if tensor.location == "hbm":
+            continue
+        _place_one(module, tensor)
 
 
-def sbuf_shape(tensor: Tensor, module: KernelModule) -> tuple[int, int, int]:
-    """Compute 3D SBUF shape ``(p_tile, total_slots_P, num_f_tiles * f_tile)``.
+def _place_one(module: KernelModule, tensor: Tensor) -> None:
+    """Derive N-D SBUF/PSUM shape for one intermediate tensor.
 
-    ``total_slots_P = required_tiles(P) * buffer_degree[P]``. Free axis
-    still spans the full tile count for now — free-axis multi-buffer is
-    out of scope.
-
-    1D tensors collapse the free axis to a single element.
-
-    Args:
-        tensor: Target tensor.
-        module: Enclosing :class:`KernelModule`.
-
-    Returns:
-        3D SBUF shape tuple.
-
-    Raises:
-        ValueError: Tensor has no declared dims.
+    Emits trivial dims explicitly -- a (P, F) tensor with num_P=1 still
+    renders as ``(P_tile, 1, F_tile * num_F_tiles)``. 1D logical tensors
+    (e.g. ``reduce_res``, ``operand0``) promote to 3D ``(P_tile,
+    num_P_slots, 1)`` so NKI's ≥2D SBUF/PSUM requirement is met while the
+    trailing ``1`` preserves the ``(P, 1)`` slice contract required by
+    ``nisa.activation_reduce.reduce_res`` and ``nisa.tensor_scalar.operand0``.
     """
-    if not tensor.dim_ids:
-        raise ValueError(f"Tensor {tensor.name!r} has no dims")
-    p_axis = tensor.dim_ids[0]
-    p_info = module.dims[p_axis]
-    p_required = required_tiles(tensor, p_axis, module)
-    p_total = p_required * tensor.buffer_degree[p_axis]
+    accesses = _find_accesses(module, tensor.name)
+    if not accesses:
+        return
+    required = _required_tiles(module, accesses)
+    p_dim = tensor.dim_ids[0]
+
+    p_tile = module.dims[p_dim].tile_size
+    num_p_slots = required.get(p_dim, 1) * tensor.buffer_degree.get(p_dim, 1)
+
     if len(tensor.dim_ids) == 1:
-        return (p_info.tile_size, p_total, 1)
-    f_axis = tensor.dim_ids[1]
-    f_info = module.dims[f_axis]
-    return (p_info.tile_size, p_total, f_info.num_tiles * f_info.tile_size)
+        tensor.shape = (p_tile, num_p_slots, 1)
+        return
+
+    f_dim = tensor.dim_ids[-1]
+    middle_dims = tensor.dim_ids[1:-1]
+    f_tile = module.dims[f_dim].tile_size
+
+    middle_slots = [required.get(d, 1) * tensor.buffer_degree.get(d, 1) for d in middle_dims]
+    num_f_tiles = required.get(f_dim, 1) * tensor.buffer_degree.get(f_dim, 1)
+
+    shape_parts: list[int] = [p_tile, num_p_slots, *middle_slots, f_tile * num_f_tiles]
+    tensor.shape = tuple(shape_parts)
 
 
-def tensor_total_slots(tensor: Tensor, dim_id: str, module: KernelModule) -> int:
-    """Per-dim total slot count for a tensor: ``required_tiles * buffer_degree``.
+def _find_accesses(module: KernelModule, tensor_name: str) -> list[tuple[SBlock, tuple[IterVar, ...]]]:
+    """Return ``(block, ancestor_iter_vars)`` for every SBlock touching ``tensor_name``.
 
-    Args:
-        tensor: Target tensor.
-        dim_id: Dim along which to compute the slot count.
-        module: Enclosing :class:`KernelModule`.
-
-    Returns:
-        The total number of tile-slots allocated for ``tensor`` on ``dim_id``.
+    The ancestor tuple is ordered root-first so the common prefix across
+    accesses is the LCA's ancestor chain.
     """
-    return required_tiles(tensor, dim_id, module) * tensor.buffer_degree[dim_id]
+    results: list[tuple[SBlock, tuple[IterVar, ...]]] = []
 
-
-def _find_access_paths(tensor_name: str, module: KernelModule) -> list[list[LoopNode | BodyLeaf]]:
-    """Return root-to-leaf node paths for every BodyLeaf that reads or writes ``tensor_name``.
-
-    Each path is a list of ancestor nodes ending in the ``BodyLeaf``.
-    Walks the module body directly — leaves are self-describing so we
-    filter by each leaf's ``reads``/``writes`` sets.
-    """
-    paths: list[list[LoopNode | BodyLeaf]] = []
-
-    def walk(node: LoopNode | BodyLeaf, stack: list[LoopNode | BodyLeaf]) -> None:
-        """Pre-order walk; record paths whose leaves touch ``tensor_name``."""
-        stack.append(node)
-        if isinstance(node, BodyLeaf):
-            if tensor_name in node.writes or tensor_name in node.reads.values() or tensor_name in node.reads_writes:
-                paths.append(list(stack))
-        else:
-            for child in node.children:
-                walk(child, stack)
-        stack.pop()
+    def walk(node: ForNode | SBlock, ancestors: tuple[IterVar, ...]) -> None:
+        """Pre-order DFS collecting ancestor iter vars for every touching block."""
+        if isinstance(node, SBlock):
+            touched = (
+                {a.tensor_name for a in node.reads.values()}
+                | {a.tensor_name for a in node.writes.values()}
+                | {a.tensor_name for a in node.reads_writes.values()}
+            )
+            if tensor_name in touched:
+                results.append((node, ancestors))
+            return
+        new_ancestors = ancestors + (node.iter_var,)
+        for child in node.children:
+            walk(child, new_ancestors)
 
     for root in module.body:
-        walk(root, [])
-    return paths
+        walk(root, ())
+    return results
 
 
-def _lowest_common_ancestor(paths: list[list[LoopNode | BodyLeaf]]) -> list[LoopNode | BodyLeaf]:
-    """Return the longest common prefix of root-to-leaf paths."""
-    if not paths:
-        return []
-    common = paths[0]
-    for p in paths[1:]:
+def _required_tiles(module: KernelModule, accesses: list[tuple[SBlock, tuple[IterVar, ...]]]) -> dict[str, int]:
+    """Per-dim required tile count based on common-prefix iter vars.
+
+    Find the common prefix (by iter-var identity) across all access
+    chains -- those are the iter vars above the LCA. Product of their
+    extents on each dim = covered portion; divide ``num_tiles`` by it.
+
+    Dims absent from the common prefix get full ``num_tiles`` (cross-nest).
+    """
+    common = _common_prefix(accesses)
+    coverage: dict[str, int] = {}
+    for iv in common:
+        coverage[iv.dim_id] = coverage.get(iv.dim_id, 1) * iv.extent
+
+    result: dict[str, int] = {}
+    for dim_id, dim in module.dims.items():
+        cov = coverage.get(dim_id, 1)
+        if cov > 0:
+            result[dim_id] = max(1, dim.num_tiles // cov)
+        else:
+            result[dim_id] = dim.num_tiles
+    return result
+
+
+def _common_prefix(accesses: list[tuple[SBlock, tuple[IterVar, ...]]]) -> tuple[IterVar, ...]:
+    """Return the longest common prefix of ancestor chains by iter-var identity."""
+    if not accesses:
+        return ()
+    common = accesses[0][1]
+    for _block, ancestors in accesses[1:]:
         new_len = 0
-        for a, b in zip(common, p):
-            if a is b:
+        for a, b in zip(common, ancestors):
+            if a.var_id == b.var_id:
                 new_len += 1
             else:
                 break

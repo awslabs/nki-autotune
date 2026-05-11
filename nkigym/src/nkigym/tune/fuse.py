@@ -1,93 +1,220 @@
-"""``Fuse`` rewrite - collapse a perfectly nested loop pair into one.
+"""``Fuse`` atom — TVM-style ``sch.fuse(outer, inner)``.
 
-The fused loop has ``trip = outer.trip_count * inner.trip_count`` and a
-synthetic ``dim_id = "<outer_dim>_x_<inner_dim>"``. The renderer is
-responsible for recovering the two original loop variables via div/mod
-at emit time via the ``FusedDim`` metadata stashed in the fused loop's
-``dim_id`` naming scheme.
+Collapses a perfectly-nested ForNode pair ``ForNode(v_outer) >
+ForNode(v_inner) > ...`` into a single ``ForNode(v_fused)`` whose
+iter-var binds a synthetic dim ``<outer_dim>_x_<inner_dim>`` with
+extent ``outer.extent * inner.extent``.
 
 Legality:
 
-* ``inner_path == outer_path + (0,)``, outer has exactly one child loop.
-* SEQUENTIAL never fuses.
-* PAR x PAR: fused role is PARALLEL.
-* ACC x ACC: legal iff same non-None ``reduce_op``; fused role retains that op.
-* Mixed PAR x ACC: illegal (iter-space collapse requires identical semantics).
+- The outer ForNode has exactly one child, which is a ForNode binding
+  the inner iter var. No other ForNodes / SBlocks interleave.
+- SEQUENTIAL never fuses — sequential state would be reordered.
+- All other role pairs are legal; the fused role takes the lattice
+  max ``PAR ⊂ SEQ ⊂ ACC``. Only PAR/PAR and ACC/ACC actually compose,
+  because SEQUENTIAL is rejected above.
+
+Apply:
+
+1. Retire ``v_outer`` and ``v_inner``.
+2. Allocate ``v_fused`` with dim_id ``<outer_dim>_x_<inner_dim>`` and
+   extent ``outer.extent * inner.extent``.
+3. Register a synthetic ``DimInfo`` for the new dim so downstream
+   passes (e.g. :func:`place_buffers`) can look it up.
+4. Record the outer/inner decomposition in
+   ``module.fused_iter_var_map`` so the renderer emits outer references
+   as ``(fused_name // inner_extent)`` and inner as ``(fused_name %
+   inner_extent)``.
+5. Replace the two-ForNode chain with a single ``ForNode(v_fused)``
+   that keeps the inner's children.
+6. Rewrite every SBlock.iter_vars: consecutive ``(v_outer, v_inner)``
+   collapses to ``(v_fused,)`` in the same list position.
+
+``BufferAccess.pattern`` is untouched — the retired iter-var ids still
+appear in ``iter_var_coeffs``, and the renderer's ``_resolve_iv_name``
+helper decomposes them via ``module.fused_iter_var_map``.
+
+See ``docs/superpowers/specs/2026-05-10-iter-var-refactor-design.md`` 4.3.
 """
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, replace_at_path, resolve_node
+from nkigym.codegen.ir import DimInfo, ForNode, IterVar, KernelModule, SBlock, TreeIR, replace_at_path
 from nkigym.ops.base import AxisRole
+from nkigym.tune import AtomLegalityError
+
+_ROLE_RANK: dict[AxisRole, int] = {AxisRole.PARALLEL: 0, AxisRole.SEQUENTIAL: 1, AxisRole.ACCUMULATION: 2}
+"""Role lattice ``PAR ⊂ SEQ ⊂ ACC``. Fusion takes the max rank."""
 
 
 @dataclass(frozen=True)
 class Fuse:
-    """Collapse a perfect-nest outer+inner LoopNode pair.
+    """Collapse a parent-child ForNode pair into a single ForNode.
 
     Attributes:
-        outer_path: Forest path to the outer LoopNode.
-        inner_path: Must equal ``outer_path + (0,)`` (guards against stale atoms).
+        outer_iter_var_id: Target outer ForNode's iter-var id.
+        inner_iter_var_id: Target inner ForNode's iter-var id. The
+            inner ForNode must be the outer's sole child.
     """
 
-    outer_path: tuple[int, ...]
-    inner_path: tuple[int, ...]
+    outer_iter_var_id: int
+    inner_iter_var_id: int
 
     def is_legal(self, module: KernelModule) -> bool:
-        """Perfect nest + role compatibility."""
-        result: bool
-        if self.inner_path != self.outer_path + (0,):
-            result = False
-        else:
-            outer = resolve_node(module.body, self.outer_path)
-            if not isinstance(outer, LoopNode) or len(outer.children) != 1:
-                result = False
-            else:
-                inner = outer.children[0]
-                if not isinstance(inner, LoopNode):
-                    result = False
-                elif outer.role == AxisRole.SEQUENTIAL or inner.role == AxisRole.SEQUENTIAL:
-                    result = False
-                elif outer.role != inner.role:
-                    result = False
-                elif outer.role == AxisRole.ACCUMULATION:
-                    result = outer.reduce_op is not None and outer.reduce_op == inner.reduce_op
-                else:
-                    result = True
+        """Structural + role preconditions."""
+        pair = _find_pair(module, self.outer_iter_var_id, self.inner_iter_var_id)
+        result = False
+        if pair is not None:
+            outer, inner, _path = pair
+            role_a = outer.iter_var.role
+            role_b = inner.iter_var.role
+            if role_a != AxisRole.SEQUENTIAL and role_b != AxisRole.SEQUENTIAL:
+                result = True
         return result
 
     def apply(self, module: KernelModule) -> KernelModule:
-        """Replace the outer+inner pair with a single fused LoopNode."""
-        outer = resolve_node(module.body, self.outer_path)
-        assert isinstance(outer, LoopNode)
-        inner = outer.children[0]
-        assert isinstance(inner, LoopNode)
-        fused = LoopNode(
-            dim_id=f"{outer.dim_id}_x_{inner.dim_id}",
-            trip_count=outer.trip_count * inner.trip_count,
-            role=outer.role,
-            children=list(inner.children),
-            reduce_op=outer.reduce_op,
-            name=None,
-            pipeline_depth=outer.pipeline_depth,
+        """Execute the fuse.
+
+        Raises:
+            AtomLegalityError: ``is_legal`` returns False against ``module``.
+        """
+        if not self.is_legal(module):
+            raise AtomLegalityError(f"Fuse.apply: illegal {self!r}")
+        pair = _find_pair(module, self.outer_iter_var_id, self.inner_iter_var_id)
+        assert pair is not None
+        outer_node, inner_node, outer_path = pair
+        v_outer = outer_node.iter_var
+        v_inner = inner_node.iter_var
+
+        fused_dim = f"{v_outer.dim_id}_x_{v_inner.dim_id}"
+        fused_extent = v_outer.extent * v_inner.extent
+        fused_role = max(v_outer.role, v_inner.role, key=_ROLE_RANK.__getitem__)
+        v_fused = module.allocate_iter_var(dim_id=fused_dim, extent=fused_extent, role=fused_role)
+
+        """Register synthetic DimInfo. Tile size = min of outer/inner so
+        downstream buffer shape derivation stays conservative; num_tiles
+        equals the fused extent so slot counts match the fused loop trip
+        count."""
+        outer_tile = module.dims[v_outer.dim_id].tile_size
+        inner_tile = module.dims[v_inner.dim_id].tile_size
+        min_tile = min(outer_tile, inner_tile)
+        module.dims[fused_dim] = DimInfo(
+            dim_id=fused_dim, total_size=fused_extent * min_tile, tile_size=min_tile, num_tiles=fused_extent
         )
-        new_body = replace_at_path(module.body, self.outer_path, fused)
+
+        """Record the decomposition so the renderer can emit
+        ``(fused // inner_extent)`` and ``(fused % inner_extent)``."""
+        module.fused_iter_var_map[v_outer.var_id] = (v_fused.var_id, v_inner.extent, True)
+        module.fused_iter_var_map[v_inner.var_id] = (v_fused.var_id, v_inner.extent, False)
+
+        new_body = _collapse_iter_var_lists(module.body, v_outer.var_id, v_inner.var_id, v_fused)
+        new_fornode = ForNode(
+            iter_var=v_fused, children=list(inner_node.children), name=None, annotations=dict(outer_node.annotations)
+        )
+        new_body = replace_at_path(new_body, outer_path, new_fornode)
         return replace(module, body=new_body)
 
 
+def _find_pair(module: KernelModule, outer_id: int, inner_id: int) -> tuple[ForNode, ForNode, tuple[int, ...]] | None:
+    """Return ``(outer_node, inner_node, outer_path)`` for the legal pair.
+
+    Requires the outer ForNode to have exactly one child ForNode whose
+    iter_var id matches ``inner_id``. Returns ``None`` if no such pair
+    exists.
+    """
+
+    def walk(node: ForNode | SBlock, path: tuple[int, ...]) -> tuple[ForNode, ForNode, tuple[int, ...]] | None:
+        result: tuple[ForNode, ForNode, tuple[int, ...]] | None = None
+        if isinstance(node, ForNode):
+            if (
+                node.iter_var.var_id == outer_id
+                and len(node.children) == 1
+                and isinstance(node.children[0], ForNode)
+                and node.children[0].iter_var.var_id == inner_id
+            ):
+                result = (node, node.children[0], path)
+            else:
+                for i, child in enumerate(node.children):
+                    found = walk(child, path + (i,))
+                    if found is not None:
+                        result = found
+                        break
+        return result
+
+    discovered: tuple[ForNode, ForNode, tuple[int, ...]] | None = None
+    for i, root in enumerate(module.body):
+        found = walk(root, (i,))
+        if found is not None:
+            discovered = found
+            break
+    return discovered
+
+
+def _collapse_iter_var_lists(body: TreeIR, outer_id: int, inner_id: int, v_fused: IterVar) -> TreeIR:
+    """Rewrite every SBlock.iter_vars: replace consecutive ``(outer_id,
+    inner_id)`` with ``(v_fused,)`` in the same list position.
+
+    The canonical builder places the two ids adjacent in reducer order
+    (outer first), and Split preserves that adjacency. If the pair is
+    not adjacent in a block's list, that block is left unchanged —
+    ``is_legal`` already guarantees the enclosing ForNodes are adjacent
+    in the tree so such a case implies the block belongs to a sibling
+    subtree that never saw both ids.
+    """
+
+    def rewrite_block(block: SBlock) -> SBlock:
+        new_ivs: list[IterVar] = []
+        i = 0
+        changed = False
+        while i < len(block.iter_vars):
+            iv = block.iter_vars[i]
+            if iv.var_id == outer_id and i + 1 < len(block.iter_vars) and block.iter_vars[i + 1].var_id == inner_id:
+                new_ivs.append(v_fused)
+                i += 2
+                changed = True
+            else:
+                new_ivs.append(iv)
+                i += 1
+        result = block
+        if changed:
+            result = SBlock(
+                iter_vars=new_ivs,
+                reads=block.reads,
+                writes=block.writes,
+                reads_writes=block.reads_writes,
+                body=block.body,
+                annotations=dict(block.annotations),
+            )
+        return result
+
+    def rewrite_node(node: ForNode | SBlock) -> ForNode | SBlock:
+        if isinstance(node, SBlock):
+            return rewrite_block(node)
+        return ForNode(
+            iter_var=node.iter_var,
+            children=[rewrite_node(c) for c in node.children],
+            name=node.name,
+            annotations=dict(node.annotations),
+        )
+
+    return [rewrite_node(n) for n in body]
+
+
 def enumerate_fuse_atoms(module: KernelModule) -> list[Fuse]:
-    """Emit one Fuse atom per perfect-nest pair whose roles commute."""
+    """Emit one :class:`Fuse` atom per legal perfect-nest pair in the forest."""
     atoms: list[Fuse] = []
 
-    def walk(node: LoopNode | BodyLeaf, path: tuple[int, ...]) -> None:
-        if isinstance(node, LoopNode):
-            if len(node.children) == 1 and isinstance(node.children[0], LoopNode):
-                atom = Fuse(outer_path=path, inner_path=path + (0,))
+    def walk(node: ForNode | SBlock) -> None:
+        if isinstance(node, ForNode):
+            if len(node.children) == 1 and isinstance(node.children[0], ForNode):
+                outer_id = node.iter_var.var_id
+                inner_id = node.children[0].iter_var.var_id
+                atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
                 if atom.is_legal(module):
                     atoms.append(atom)
-            for i, c in enumerate(node.children):
-                walk(c, path + (i,))
+            for child in node.children:
+                walk(child)
 
-    for i, root in enumerate(module.body):
-        walk(root, (i,))
+    for root in module.body:
+        walk(root)
     return atoms

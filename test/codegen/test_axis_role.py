@@ -76,21 +76,21 @@ def test_activation_reduce_axis_roles_marks_f_as_accumulation() -> None:
 
 
 def test_body_leaf_has_dim_role_for_every_touched_dim() -> None:
-    """BodyLeaf.dim_role has an entry per touched dim_id with the op's role."""
+    """Every compute SBlock's NKIOpCall carries a dim_role entry per touched dim."""
     from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import BodyLeaf, leaves_under
+    from nkigym.codegen.ir import blocks_under
 
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
     module = build_canonical_module(_matmul_kernel, specs)
-    matmul_leaves = [
-        leaf
+    matmul_blocks = [
+        block
         for tree in module.body
-        for leaf in leaves_under(tree)
-        if isinstance(leaf, BodyLeaf) and leaf.op_cls.__name__ == "NKIMatmul"
+        for block in blocks_under(tree)
+        if block.body and block.body[0].op_cls.__name__ == "NKIMatmul"
     ]
-    assert matmul_leaves
-    """First-class buffers: single matmul leaf (no separate phases)."""
-    compute = matmul_leaves[0]
+    assert matmul_blocks
+    """First-class buffers: single matmul SBlock (no separate phases)."""
+    compute = matmul_blocks[0].body[0]
     k_dim = compute.axis_map["K"]
     m_dim = compute.axis_map["M"]
     n_dim = compute.axis_map["N"]
@@ -102,25 +102,25 @@ def test_body_leaf_has_dim_role_for_every_touched_dim() -> None:
 def test_same_concrete_dim_can_carry_different_roles_across_ops() -> None:
     """In rmsnorm+matmul, the shared F dim is ACCUMULATION in activation_reduce and PARALLEL in tensor_scalar."""
     from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import BodyLeaf, leaves_under
+    from nkigym.codegen.ir import blocks_under
 
     specs = {"lhs": {"shape": (128, 256), "dtype": "bfloat16"}}
     module = build_canonical_module(_rmsnorm_kernel, specs)
-    ar_leaves = [
-        leaf
+    ar_blocks = [
+        block
         for tree in module.body
-        for leaf in leaves_under(tree)
-        if isinstance(leaf, BodyLeaf) and leaf.op_cls.__name__ == "NKIActivationReduce"
+        for block in blocks_under(tree)
+        if block.body and block.body[0].op_cls.__name__ == "NKIActivationReduce"
     ]
-    ts_leaves = [
-        leaf
+    ts_blocks = [
+        block
         for tree in module.body
-        for leaf in leaves_under(tree)
-        if isinstance(leaf, BodyLeaf) and leaf.op_cls.__name__ == "NKITensorScalar"
+        for block in blocks_under(tree)
+        if block.body and block.body[0].op_cls.__name__ == "NKITensorScalar"
     ]
-    """First-class buffers: single activation_reduce leaf."""
-    ar_step = ar_leaves[0]
-    ts_main = ts_leaves[0]
+    """First-class buffers: single activation_reduce SBlock."""
+    ar_step = ar_blocks[0].body[0]
+    ts_main = ts_blocks[0].body[0]
     f_dim = ar_step.axis_map["F"]
     assert ar_step.dim_role[f_dim] == AxisRole.ACCUMULATION
     assert ts_main.dim_role[f_dim] == AxisRole.PARALLEL

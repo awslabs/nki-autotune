@@ -1,9 +1,9 @@
 """Tests for first-class buffer infrastructure: NKIOp ClassVars, Tensor.location,
-BodyLeaf.reads_writes, and their interactions through the canonical builder."""
+SBlock.reads_writes, and their interactions through the canonical builder."""
 
 import numpy as np
 
-from nkigym.codegen.ir import BodyLeaf, Tensor
+from nkigym.codegen.ir import SBlock, Tensor
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import NKIOp
 
@@ -25,9 +25,14 @@ def test_tensor_location_field_defaults_and_accepts_literal():
 
 
 def test_body_leaf_reads_writes_defaults_empty():
-    """BodyLeaf gains reads_writes for RMW operands. Default is empty tuple."""
-    leaf = BodyLeaf(op_cls=type("Fake", (), {"__name__": "Fake"}))
-    assert leaf.reads_writes == ()
+    """SBlock.reads_writes defaults to an empty dict.
+
+    v2 analog of the v1 BodyLeaf test: reads_writes is now a
+    ``dict[str, BufferAccess]`` keyed by slot name; an empty block has
+    no RMW operands.
+    """
+    block = SBlock(iter_vars=[], reads={}, writes={}, reads_writes={}, body=[])
+    assert block.reads_writes == {}
 
 
 def test_nkialloc_has_empty_operand_axes_and_no_rmw():
@@ -165,10 +170,10 @@ def test_canonical_parses_nkialloc_into_module_tensors():
 
 
 def test_canonical_matmul_leaf_has_dst_in_reads_writes():
-    """After canonical build, NKIMatmul's leaf carries dst in reads_writes
+    """After canonical build, NKIMatmul's SBlock carries dst in reads_writes
     (not in reads or writes)."""
     from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import leaves_under
+    from nkigym.codegen.ir import blocks_under
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.load import NKILoad
@@ -196,13 +201,21 @@ def test_canonical_matmul_leaf_has_dst_in_reads_writes():
     }
     module = build_canonical_module(f, input_specs)
 
-    matmul_leaves = [leaf for root in module.body for leaf in leaves_under(root) if leaf.op_cls.__name__ == "NKIMatmul"]
-    assert len(matmul_leaves) == 1
-    leaf = matmul_leaves[0]
-    assert "psum_acc" in leaf.reads_writes
-    assert "psum_acc" not in leaf.reads.values()
-    assert "psum_acc" not in leaf.writes
-    assert leaf.reads == {"stationary": "lhs_T_sbuf", "moving": "rhs_sbuf"}
+    matmul_blocks = [
+        block
+        for root in module.body
+        for block in blocks_under(root)
+        if block.body and block.body[0].op_cls.__name__ == "NKIMatmul"
+    ]
+    assert len(matmul_blocks) == 1
+    block = matmul_blocks[0]
+    rmw_names = {a.tensor_name for a in block.reads_writes.values()}
+    read_names = {a.tensor_name for a in block.reads.values()}
+    write_names = {a.tensor_name for a in block.writes.values()}
+    assert "psum_acc" in rmw_names
+    assert "psum_acc" not in read_names
+    assert "psum_acc" not in write_names
+    assert {k: v.tensor_name for k, v in block.reads.items()} == {"stationary": "lhs_T_sbuf", "moving": "rhs_sbuf"}
 
 
 def test_render_emits_alloc_inline_at_tree_position():

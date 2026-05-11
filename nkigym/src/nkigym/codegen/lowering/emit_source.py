@@ -1,16 +1,21 @@
-"""Top-level forest walker that emits NKI source from a KernelModule.
+"""Top-level forest walker that emits NKI source from a :class:`KernelModule`.
 
 The renderer is intentionally dumb: it walks the schedule tree and
-delegates each leaf to a per-op-class emitter registered in
-:mod:`emit_ops`. Buffer allocations are themselves tree leaves
-(``NKIAlloc``), so allocation placement is fully determined by tree
-position. No separate allocation pass.
+delegates each :class:`SBlock` to a per-op-class emitter registered in
+:mod:`emit_ops`. Buffer allocations are themselves tree nodes
+(``NKIAlloc`` SBlocks), so allocation placement is fully determined by
+tree position — no separate allocation pass.
+
+The walker opens and closes ``for`` headers for every :class:`ForNode`
+it enters. Loop variable names come from :attr:`ForNode.name` (set by
+:func:`canonicalize_iter_var_names`); the walker updates a live
+``iter_var_id → name`` map in :class:`EmitCtx` so emitters can spell
+the right identifier in their operand slice expressions.
 """
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode
-from nkigym.codegen.lowering._emit_utils import _Writer
-
-__all__ = ["emit_source", "render_annotated"]
+from nkigym.codegen.ir import ForNode, KernelModule, SBlock
+from nkigym.codegen.lowering._emit_utils import EmitCtx, _Writer
+from nkigym.codegen.lowering.emit_ops import emit_op_call
 
 
 def emit_source(module: KernelModule) -> str:
@@ -19,22 +24,9 @@ def emit_source(module: KernelModule) -> str:
     _emit_imports(w)
     _emit_signature(w, module)
     w.indent()
-    render_forest(w, module)
-    w.line(f"return {module.return_name}")
-    w.dedent()
-    return w.getvalue()
-
-
-def render_annotated(module: KernelModule) -> str:
-    """Render with ``# BodyLeaf(...)`` / ``# LoopNode(...)`` comments above each emission."""
-    w = _Writer()
-    _emit_imports(w)
-    _emit_signature(w, module)
-    w.indent()
-    path_names: dict[str, list[str]] = {}
-    path_trips: dict[str, list[int]] = {}
-    for idx, entry in enumerate(module.body):
-        _emit_node_annotated(w, module, entry, path_names, path_trips, path=(idx,))
+    ctx = EmitCtx(iter_var_to_name={}, tensors=module.tensors, module=module)
+    for root in module.body:
+        _emit_node(w, root, ctx)
     w.line(f"return {module.return_name}")
     w.dedent()
     return w.getvalue()
@@ -56,84 +48,24 @@ def _emit_signature(w: _Writer, module: KernelModule) -> None:
     w.line(f"def {module.func_name}({params}):")
 
 
-def render_forest(w: _Writer, module: KernelModule) -> None:
-    """Walk ``module.body`` and emit NKI source for every node."""
-    path_names: dict[str, list[str]] = {}
-    path_trips: dict[str, list[int]] = {}
-    for entry in module.body:
-        _emit_node(w, module, entry, path_names, path_trips)
-
-
-def _emit_node(
-    w: _Writer,
-    module: KernelModule,
-    node: LoopNode | BodyLeaf,
-    path_names: dict[str, list[str]],
-    path_trips: dict[str, list[int]],
-) -> None:
-    """Emit one forest node (recursive for LoopNode, delegating for BodyLeaf)."""
-    if isinstance(node, BodyLeaf):
-        emitter = _BODY_EMITTERS.get(node.op_cls.__name__)
-        if emitter is None:
-            raise ValueError(f"No body emitter registered for {node.op_cls.__name__!r}")
-        emitter(w, module, node, path_names, path_trips)
+def _emit_node(w: _Writer, node: ForNode | SBlock, ctx: EmitCtx) -> None:
+    """Recursively emit ``node``. Mutates ``ctx.iter_var_to_name`` in place."""
+    if isinstance(node, SBlock):
+        _emit_sblock(w, node, ctx)
         return
-    if node.pipeline_depth <= 1:
-        _emit_vanilla_loop(w, module, node, path_names, path_trips)
-    else:
-        _emit_pipelined_loop(w, module, node, path_names, path_trips)
-
-
-def _emit_vanilla_loop(
-    w: _Writer, module: KernelModule, node: LoopNode, path_names: dict[str, list[str]], path_trips: dict[str, list[int]]
-) -> None:
-    """Emit the un-pipelined ``for`` loop for ``pipeline_depth == 1``."""
-    existing = path_names.setdefault(node.dim_id, [])
-    loop_var = node.name if node.name is not None else f"i_{node.dim_id}_{len(existing)}"
-    w.line(f"for {loop_var} in range({node.trip_count}):")
+    iv = node.iter_var
+    name = node.name if node.name is not None else f"i_{iv.dim_id}_{iv.var_id}"
+    ctx.iter_var_to_name[iv.var_id] = name
+    w.line(f"for {name} in range({iv.extent}):")
     w.indent()
-    existing.append(loop_var)
-    path_trips.setdefault(node.dim_id, []).append(node.trip_count)
     for child in node.children:
-        _emit_node(w, module, child, path_names, path_trips)
-    path_trips[node.dim_id].pop()
-    existing.pop()
+        _emit_node(w, child, ctx)
     w.dedent()
+    ctx.iter_var_to_name.pop(iv.var_id, None)
 
 
-def _emit_node_annotated(
-    w: _Writer,
-    module: KernelModule,
-    node: LoopNode | BodyLeaf,
-    path_names: dict[str, list[str]],
-    path_trips: dict[str, list[int]],
-    path: tuple[int, ...],
-) -> None:
-    """Annotating variant used by :func:`render_annotated`."""
-    if isinstance(node, BodyLeaf):
-        emitter = _BODY_EMITTERS.get(node.op_cls.__name__)
-        if emitter is None:
-            raise ValueError(f"No body emitter registered for {node.op_cls.__name__!r}")
-        w.line(f"# BodyLeaf(op_cls={node.op_cls.__name__})  path={path}")
-        emitter(w, module, node, path_names, path_trips)
-        return
-    if node.pipeline_depth > 1:
-        _emit_pipelined_loop(w, module, node, path_names, path_trips)
-        return
-    existing = path_names.setdefault(node.dim_id, [])
-    loop_var = node.name if node.name is not None else f"i_{node.dim_id}_{len(existing)}"
-    w.line(f"# LoopNode(dim_id={node.dim_id!r}, trip={node.trip_count}, role={node.role.name})  path={path}")
-    w.line(f"for {loop_var} in range({node.trip_count}):")
-    w.indent()
-    existing.append(loop_var)
-    path_trips.setdefault(node.dim_id, []).append(node.trip_count)
-    for i, child in enumerate(node.children):
-        _emit_node_annotated(w, module, child, path_names, path_trips, path=path + (i,))
-    path_trips[node.dim_id].pop()
-    existing.pop()
-    w.dedent()
-
-
-"""Wired up at import time (bottom-of-file imports avoid module-load cycles)."""
-from nkigym.codegen.lowering.emit_ops import _BODY_EMITTERS  # noqa: E402
-from nkigym.codegen.lowering.inject_software_pipeline import _emit_pipelined_loop  # noqa: E402
+def _emit_sblock(w: _Writer, block: SBlock, ctx: EmitCtx) -> None:
+    """Emit the body of one :class:`SBlock` by delegating to per-op emitters."""
+    for call in block.body:
+        for line in emit_op_call(call, block, ctx):
+            w.line(line)

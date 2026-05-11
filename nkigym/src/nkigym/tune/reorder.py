@@ -1,136 +1,249 @@
-"""``Reorder`` rewrite — adjacent loop interchange with subtree-purity legality.
+"""``Reorder`` atom — n-ary iter-var-keyed loop reordering.
 
-Legality rules:
+TVM-style ``sch.reorder([iv_1, iv_2, ...])``:
 
-* ``inner_path == outer_path + (0,)`` and outer has exactly one child loop
-  (perfect-nest shape).
-* Role pair rules:
-    - PAR x PAR: legal.
-    - ACC x ACC same ``reduce_op``: legal.
-    - PAR x ACC: legal iff ACC's subtree contains no leaf whose write region
-      is indexed by PAR's ``dim_id`` (subtree-purity check via
-      ``BodyLeaf.axis_map`` / ``dim_role``). After ``DecomposeReduction``
-      strips init/drain leaves, update trees pass.
-    - SEQ involvement: illegal.
+- The named iter vars form a contiguous ForNode chain in the tree
+  (one ForNode per iter var, no other ForNodes interleaved).
+- Legality: for every adjacent pair in the requested order, roles
+  commute (PAR x PAR, ACC x ACC, PAR x ACC iff subtree-pure w.r.t.
+  PAR dim; SEQ never).
+- Apply: reshape the chain so ForNodes appear in the given order
+  top-to-bottom; grandchildren subtree passes by reference; iter var
+  IDs unchanged (no BufferAccess rewriting needed).
 
-This is the replacement for the old ``ReorderLoops`` atom; the old module
-stays until Task 20 cleanup.
+See ``docs/superpowers/specs/2026-05-10-iter-var-refactor-design.md`` 4.2.
 """
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, leaves_under, replace_at_path, resolve_node
+from nkigym.codegen.ir import ForNode, KernelModule, SBlock, blocks_under, replace_at_path
 from nkigym.ops.base import AxisRole
+from nkigym.tune import AtomLegalityError
 
 
 @dataclass(frozen=True)
 class Reorder:
-    """Swap an outer LoopNode with its unique LoopNode child.
+    """Reorder a contiguous ForNode chain by iter var ids.
 
     Attributes:
-        outer_path: Path to the outer LoopNode in ``module.body``.
-        inner_path: Must equal ``outer_path + (0,)``; guards against stale
-            atoms across rewrites.
+        iter_var_ids: Requested order of iter vars, outermost first.
+            Must form a contiguous chain in the current tree.
     """
 
-    outer_path: tuple[int, ...]
-    inner_path: tuple[int, ...]
+    iter_var_ids: tuple[int, ...]
 
     def is_legal(self, module: KernelModule) -> bool:
-        """Return True when the pair is a perfect nest and roles commute."""
-        result: bool
-        if self.inner_path != self.outer_path + (0,):
-            result = False
-        else:
-            outer = resolve_node(module.body, self.outer_path)
-            if not isinstance(outer, LoopNode) or len(outer.children) != 1:
-                result = False
-            else:
-                inner = outer.children[0]
-                if not isinstance(inner, LoopNode):
-                    result = False
-                else:
-                    result = _roles_commute(outer, inner)
+        """Structural + role-commute preconditions."""
+        chain = _find_chain(module, set(self.iter_var_ids))
+        result = False
+        if chain is not None and len(chain) == len(self.iter_var_ids):
+            chain_ids = {n.iter_var.var_id for n in chain}
+            if set(self.iter_var_ids) == chain_ids:
+                requested_nodes = _select_by_ids(chain, self.iter_var_ids)
+                if requested_nodes is not None:
+                    result = _permutation_legal(chain, requested_nodes)
         return result
 
     def apply(self, module: KernelModule) -> KernelModule:
-        """Swap outer and inner; grandchildren subtree passes by reference."""
-        outer = resolve_node(module.body, self.outer_path)
-        assert isinstance(outer, LoopNode)
-        inner = outer.children[0]
-        assert isinstance(inner, LoopNode)
-        new_outer = LoopNode(
-            dim_id=outer.dim_id,
-            trip_count=outer.trip_count,
-            role=outer.role,
-            children=list(inner.children),
-            reduce_op=outer.reduce_op,
-            name=outer.name,
-            pipeline_depth=outer.pipeline_depth,
-        )
-        new_inner = LoopNode(
-            dim_id=inner.dim_id,
-            trip_count=inner.trip_count,
-            role=inner.role,
-            children=[new_outer],
-            reduce_op=inner.reduce_op,
-            name=inner.name,
-            pipeline_depth=inner.pipeline_depth,
-        )
-        new_body = replace_at_path(module.body, self.outer_path, new_inner)
+        """Reshape the tree: replace chain top with requested-order ForNode sequence.
+
+        The chain's deepest ForNode's children become the deepest new ForNode's
+        children. Grandchildren subtree passes by reference.
+        """
+        if not self.is_legal(module):
+            raise AtomLegalityError(f"Reorder.apply: illegal {self!r}")
+        chain = _find_chain(module, set(self.iter_var_ids))
+        assert chain is not None
+        grandchildren: list[ForNode | SBlock] = list(chain[-1].children)
+        requested_nodes = _select_by_ids(chain, self.iter_var_ids)
+        assert requested_nodes is not None
+
+        """Build the new chain: deepest first."""
+        new_children: list[ForNode | SBlock] = grandchildren
+        new_node: ForNode | None = None
+        for node in reversed(requested_nodes):
+            new_node = ForNode(
+                iter_var=node.iter_var, children=new_children, name=None, annotations=dict(node.annotations)
+            )
+            new_children = [new_node]
+        assert new_node is not None
+
+        top_path = _find_top_path(module, chain[0])
+        new_body = replace_at_path(module.body, top_path, new_node)
         return replace(module, body=new_body)
 
 
-def _roles_commute(a: LoopNode, b: LoopNode) -> bool:
-    """Return True iff swapping ``a`` and ``b`` preserves semantics.
+def _find_chain(module: KernelModule, iter_var_ids: set[int]) -> list[ForNode] | None:
+    """Return the contiguous ForNode chain binding exactly ``iter_var_ids``.
 
-    SEQUENTIAL never commutes. PAR x PAR always commutes. ACC x ACC commutes
-    iff both share a non-None ``reduce_op``. PAR x ACC commutes iff the ACC
-    subtree is leaf-pure w.r.t. the PAR dim.
+    The chain is a path of parent->child ForNodes (each has exactly one
+    ForNode child, except possibly the last one). Returns ``None`` if no
+    such chain exists.
+
+    The chain must bind exactly the given set of iter vars (no more, no
+    less) otherwise the requested reorder is ambiguous.
     """
-    result: bool
-    if a.role == AxisRole.SEQUENTIAL or b.role == AxisRole.SEQUENTIAL:
-        result = False
-    elif a.role == AxisRole.PARALLEL and b.role == AxisRole.PARALLEL:
-        result = True
-    elif a.role == AxisRole.ACCUMULATION and b.role == AxisRole.ACCUMULATION:
-        result = a.reduce_op is not None and a.reduce_op == b.reduce_op
-    else:
-        par_dim = a.dim_id if a.role == AxisRole.PARALLEL else b.dim_id
-        acc = a if a.role == AxisRole.ACCUMULATION else b
-        result = _subtree_pure_wrt_dim(acc, par_dim)
+
+    def walk(node: ForNode | SBlock) -> list[ForNode] | None:
+        result: list[ForNode] | None = None
+        if isinstance(node, ForNode):
+            if node.iter_var.var_id in iter_var_ids:
+                chain: list[ForNode] = [node]
+                current: ForNode = node
+                while (
+                    len(current.children) == 1
+                    and isinstance(current.children[0], ForNode)
+                    and current.children[0].iter_var.var_id in iter_var_ids
+                ):
+                    current = current.children[0]
+                    chain.append(current)
+                if len(chain) == len(iter_var_ids):
+                    result = chain
+            else:
+                for child in node.children:
+                    found = walk(child)
+                    if found is not None:
+                        result = found
+                        break
+        return result
+
+    discovered: list[ForNode] | None = None
+    for root in module.body:
+        found = walk(root)
+        if found is not None:
+            discovered = found
+            break
+    return discovered
+
+
+def _select_by_ids(chain: list[ForNode], ids: tuple[int, ...]) -> list[ForNode] | None:
+    """Return the chain's ForNodes reordered to match ``ids``; ``None`` if mismatch."""
+    id_to_node = {n.iter_var.var_id: n for n in chain}
+    result: list[ForNode] | None = None
+    if set(id_to_node) == set(ids):
+        result = [id_to_node[i] for i in ids]
     return result
 
 
-def _subtree_pure_wrt_dim(node: LoopNode | BodyLeaf, par_dim: str) -> bool:
-    """Return True iff no leaf under ``node`` writes a tensor indexed by ``par_dim`` as PARALLEL.
+def _permutation_legal(original: list[ForNode], new_order: list[ForNode]) -> bool:
+    """Check role-commute for every pair of iter vars whose relative order changed.
 
-    Uses each leaf's ``axis_map`` and op-local ``dim_role`` to determine
-    whether a write position's index depends on the outer PAR loop.
+    A pair ``(a, b)`` where ``a`` was originally above ``b`` AND is now below
+    ``b`` (in ``new_order``) constitutes a swap. Every such swap must pass the
+    pair role-commute rule. Pairs whose relative order is unchanged don't
+    need checking — their pairwise legality is already satisfied by the
+    existing tree.
     """
-    for leaf in leaves_under(node):
-        if not leaf.writes:
+    id_to_orig_pos = {n.iter_var.var_id: i for i, n in enumerate(original)}
+    id_to_new_pos = {n.iter_var.var_id: i for i, n in enumerate(new_order)}
+    id_to_node = {n.iter_var.var_id: n for n in original}
+    result = True
+    ids = list(id_to_orig_pos.keys())
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            a_id, b_id = ids[i], ids[j]
+            if id_to_orig_pos[a_id] < id_to_orig_pos[b_id]:
+                orig_outer, orig_inner = a_id, b_id
+            else:
+                orig_outer, orig_inner = b_id, a_id
+            if id_to_new_pos[orig_outer] > id_to_new_pos[orig_inner]:
+                """Relative order flipped — must check the swap is legal."""
+                if not _roles_commute_pair(id_to_node[orig_outer], id_to_node[orig_inner]):
+                    result = False
+                    break
+        if not result:
+            break
+    return result
+
+
+def _roles_commute_pair(a: ForNode, b: ForNode) -> bool:
+    """TVM-style role commute.
+
+    PAR x PAR: always.
+    ACC x ACC: legal (reduce_op distinctions not encoded in v2 iter vars).
+    PAR x ACC: legal iff subtree is leaf-pure w.r.t. the PAR dim.
+    SEQ: never.
+    """
+    result: bool
+    role_a = a.iter_var.role
+    role_b = b.iter_var.role
+    if role_a == AxisRole.SEQUENTIAL or role_b == AxisRole.SEQUENTIAL:
+        result = False
+    elif role_a == AxisRole.PARALLEL and role_b == AxisRole.PARALLEL:
+        result = True
+    elif role_a == AxisRole.ACCUMULATION and role_b == AxisRole.ACCUMULATION:
+        result = True
+    else:
+        par_dim = a.iter_var.dim_id if role_a == AxisRole.PARALLEL else b.iter_var.dim_id
+        acc_node = a if role_a == AxisRole.ACCUMULATION else b
+        result = _subtree_pure_wrt_dim(acc_node, par_dim)
+    return result
+
+
+def _subtree_pure_wrt_dim(node: ForNode | SBlock, par_dim: str) -> bool:
+    """Return True iff no block under ``node`` writes a tensor indexed by
+    ``par_dim`` as PARALLEL role.
+
+    Consults each block's ``NKIOpCall.axis_map`` + ``dim_role``. A block
+    with empty writes AND empty reads_writes contributes no write — skip.
+    """
+    result = True
+    for block in blocks_under(node):
+        if not block.writes and not block.reads_writes:
             continue
-        for concrete_dim in leaf.axis_map.values():
-            if concrete_dim == par_dim and leaf.dim_role.get(concrete_dim) == AxisRole.PARALLEL:
-                return False
-    return True
+        for call in block.body:
+            for concrete_dim in call.axis_map.values():
+                if concrete_dim == par_dim and call.dim_role.get(concrete_dim) == AxisRole.PARALLEL:
+                    result = False
+                    break
+            if not result:
+                break
+        if not result:
+            break
+    return result
+
+
+def _find_top_path(module: KernelModule, top: ForNode) -> tuple[int, ...]:
+    """Walk the tree to find the path to the node that IS ``top`` (by identity)."""
+
+    def walk(node: ForNode | SBlock, path: tuple[int, ...]) -> tuple[int, ...] | None:
+        result: tuple[int, ...] | None = None
+        if node is top:
+            result = path
+        elif isinstance(node, ForNode):
+            for i, c in enumerate(node.children):
+                found = walk(c, path + (i,))
+                if found is not None:
+                    result = found
+                    break
+        return result
+
+    for i, root in enumerate(module.body):
+        found = walk(root, (i,))
+        if found is not None:
+            return found
+    raise ValueError("Reorder: top of chain not found in tree")
 
 
 def enumerate_reorder_atoms(module: KernelModule) -> list[Reorder]:
-    """Every legal adjacent-swap atom in the forest."""
+    """Emit every legal adjacent pair swap in the forest (n=2 only).
+
+    Larger n-ary reorderings are future work — the current sampler /
+    agent space composes pair-swaps to reach them.
+    """
     atoms: list[Reorder] = []
 
-    def walk(node: BodyLeaf | LoopNode, path: tuple[int, ...]) -> None:
-        if not isinstance(node, LoopNode):
-            return
-        if len(node.children) == 1 and isinstance(node.children[0], LoopNode):
-            atom = Reorder(outer_path=path, inner_path=path + (0,))
-            if atom.is_legal(module):
-                atoms.append(atom)
-        for i, child in enumerate(node.children):
-            walk(child, path + (i,))
+    def walk(node: ForNode | SBlock) -> None:
+        if isinstance(node, ForNode):
+            if len(node.children) == 1 and isinstance(node.children[0], ForNode):
+                outer_id = node.iter_var.var_id
+                inner_id = node.children[0].iter_var.var_id
+                atom = Reorder(iter_var_ids=(inner_id, outer_id))
+                if atom.is_legal(module):
+                    atoms.append(atom)
+            for c in node.children:
+                walk(c)
 
-    for i, root in enumerate(module.body):
-        walk(root, (i,))
+    for root in module.body:
+        walk(root)
     return atoms

@@ -15,10 +15,10 @@ class AtomLegalityError(Exception):
     Atoms are typically enumerated against one module and later applied
     against a module reached via a composition of other rewrites. When a
     preceding rewrite invalidates a captured precondition (e.g. a
-    :class:`ComputeAt` narrows the LCA so a :class:`MultiBuffer` degree
-    exceeds the new ``num_tiles / required_tiles`` cap), the atom's
-    ``apply`` must re-validate and raise this error instead of silently
-    producing an incorrect module.
+    :class:`ComputeAt` narrows the LCA so an :class:`Annotate`
+    ``buffer_degree`` exceeds the new ``num_tiles / required_tiles`` cap),
+    the atom's ``apply`` must re-validate and raise this error instead of
+    silently producing an incorrect module.
 
     Callers that orchestrate atom composition (the batch sampler) catch
     :class:`AtomLegalityError` and skip to the next atom; this keeps

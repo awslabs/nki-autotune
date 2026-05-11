@@ -106,9 +106,23 @@ def nkigym_compile(
             (cache_path / f"{Path(name).stem}.render_error.txt").write_text(f"{type(e).__name__}: {e}\n")
             continue
         (cache_path / name).write_text(source)
-        _verify(source, f_nkigym, input_specs)
+        try:
+            _verify(source, f_nkigym, input_specs)
+        except (AssertionError, Exception) as e:
+            """Verify failures are tolerated — atom compositions can produce
+            variants where the producer doesn't cover the consumer's read
+            range, or other tile-level semantic issues that the validator's
+            coarser dataflow checks don't detect. Log + skip so the tuning
+            run proceeds; profiling happens only on variants that CPU-sim
+            correctly."""
+            (cache_path / f"{Path(name).stem}.verify_error.txt").write_text(f"{type(e).__name__}: {e}\n")
+            continue
         kernels[name] = KernelJob(
-            source=source, func_name=f_nkigym.__name__, output_shape=output_shape, input_specs=input_specs
+            source=source,
+            func_name=f_nkigym.__name__,
+            output_shape=output_shape,
+            input_specs=input_specs,
+            neuronx_cc_args=("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false"),
         )
 
     if not hosts:

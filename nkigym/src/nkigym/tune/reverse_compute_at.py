@@ -1,130 +1,180 @@
-"""``ReverseComputeAt`` rewrite - mirror of :class:`ComputeAt`.
+"""``ReverseComputeAt`` atom — dual of :class:`~nkigym.tune.compute_at.ComputeAt`.
 
-Moves a consumer leaf under a loop whose subtree contains one of its
-producers. Legality is the dataflow dual: the target loop must contain at
-least one leaf that writes a tensor the moving leaf reads.
+Dataflow direction flipped: target's subtree must contain a **producer**
+of one of the block's reads (instead of a **consumer** of the block's
+writes).
 
-Reuses helpers from :mod:`nkigym.tune.compute_at` via function-level
-imports to keep the atoms independently importable while sharing
-implementation.
+All other semantics (prefix-match legality, role-lattice promotion,
+iter-var merging + subtree rebuild + pattern rewriting) are identical to
+:class:`ComputeAt`; implementation is shared via module-level helpers in
+``compute_at`` — see spec ``docs/superpowers/specs/2026-05-10-iter-var-refactor-design.md`` §4.5.
+
+Use case: move a consumer block into a producer's scope (e.g. move an
+:class:`NKIStore` into the subtree where its source SBUF buffer gets
+written by the previous op).
 """
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, leaves_under, resolve_node
+from nkigym.codegen.ir import ForNode, IterVar, KernelModule, SBlock, resolve_node
 from nkigym.tune import AtomLegalityError
+from nkigym.tune.compute_at import (
+    _ROLE_RANK,
+    _append_under,
+    _find_node_path,
+    _is_ancestor,
+    _match_prefix,
+    _remove_at_path,
+    _rewrite_block_refs,
+    _rewrite_iter_var_ids,
+    _role_promotion_allowed,
+    _target_ancestor_iter_vars,
+    _target_subtree_produces_block_reads,
+)
 
 
 @dataclass(frozen=True)
 class ReverseComputeAt:
-    """Move a consumer leaf under a loop in a producer's scope.
+    """Move a consumer ``SBlock`` under a target ``ForNode`` in a producer's scope.
 
     Attributes:
-        leaf_path: Path to the consumer leaf to move.
-        target_loop_path: Path to the LoopNode under which the leaf will be
-            placed; target's subtree must contain at least one producer of
-            the leaf being moved.
+        block_path: Path to the consumer SBlock to move.
+        target_path: Path to the target ForNode. Target's subtree must
+            contain at least one producer of one of the block's reads.
     """
 
-    leaf_path: tuple[int, ...]
-    target_loop_path: tuple[int, ...]
+    block_path: tuple[int, ...]
+    target_path: tuple[int, ...]
 
     def is_legal(self, module: KernelModule) -> bool:
-        """Check dataflow and structural preconditions."""
+        """Check structural + dataflow + prefix-match + role preconditions.
+
+        Identical to :meth:`ComputeAt.is_legal` except the dataflow
+        direction is flipped (producer instead of consumer check).
+        """
         result: bool
-        leaf = resolve_node(module.body, self.leaf_path)
-        target = resolve_node(module.body, self.target_loop_path)
-        if not isinstance(leaf, BodyLeaf):
+        block = resolve_node(module.body, self.block_path)
+        target = resolve_node(module.body, self.target_path)
+        if not isinstance(block, SBlock):
             result = False
-        elif not isinstance(target, LoopNode):
+        elif not isinstance(target, ForNode):
+            result = False
+        elif _is_ancestor(self.target_path, self.block_path):
+            result = False
+        elif not _target_subtree_produces_block_reads(module, target, block):
             result = False
         else:
-            from nkigym.tune.compute_at import _is_ancestor
-
-            if _is_ancestor(self.target_loop_path, self.leaf_path):
+            target_ancestor_ivs = _target_ancestor_iter_vars(module.body, self.target_path)
+            matched = _match_prefix(target_ancestor_ivs, block.iter_vars)
+            if matched is None:
                 result = False
             else:
-                producer_found = any(
-                    bool(set(leaf.reads.values()) & set(descendant.writes)) for descendant in leaves_under(target)
-                )
-                result = producer_found
+                result = _role_promotion_allowed(matched)
         return result
 
     def apply(self, module: KernelModule) -> KernelModule:
-        """Remove leaf; regenerate uncovered dims under target; insert; canonical-rename."""
-        from nkigym.tune.compute_at import (
-            _ancestor_trip_products,
-            _append_under,
-            _find_node_path,
-            _remove_at_path,
-            _rename_canonical,
-            _wrap_leaf_with_dims,
-        )
+        """Execute the ReverseComputeAt.
 
-        leaf = resolve_node(module.body, self.leaf_path)
-        assert isinstance(leaf, BodyLeaf)
-        target_node = resolve_node(module.body, self.target_loop_path)
-        assert isinstance(target_node, LoopNode)
-        body_without = _remove_at_path(module.body, self.leaf_path)
-        """Pruning below the target never shifts the target's id(), because
-        ``_remove_at_path`` only rebuilds ancestors of the removed node. Sibling
-        subtrees pass by reference. Find the target's new path in body_without
-        by walking for the same id() — this is O(tree) but safe across pruning."""
-        new_target_path = _find_node_path(body_without, id(target_node))
+        Apply logic (iter-var merging + subtree rebuild + pattern
+        rewriting) is identical to :meth:`ComputeAt.apply`; only the
+        ``is_legal`` direction differs.
+
+        Raises:
+            AtomLegalityError: ``is_legal`` returns False against ``module``.
+        """
+        if not self.is_legal(module):
+            raise AtomLegalityError(f"ReverseComputeAt.apply: illegal {self!r}")
+        block = resolve_node(module.body, self.block_path)
+        assert isinstance(block, SBlock)
+        target_node = resolve_node(module.body, self.target_path)
+        assert isinstance(target_node, ForNode)
+
+        target_ancestor_ivs = _target_ancestor_iter_vars(module.body, self.target_path)
+        matched = _match_prefix(target_ancestor_ivs, block.iter_vars)
+        assert matched is not None
+
+        """Step 1: role promotion. For each matched pair where block's role
+        is stronger, allocate a fresh iter var with the stronger role and
+        rewrite the target ForNode + every BufferAccess + every SBlock.iter_vars
+        reference across the whole forest."""
+        new_body = module.body
+        id_replacements: dict[int, IterVar] = {}
+        for target_iv, block_iv in matched:
+            if _ROLE_RANK[block_iv.role] > _ROLE_RANK[target_iv.role]:
+                promoted = module.allocate_iter_var(
+                    dim_id=target_iv.dim_id, extent=target_iv.extent, role=block_iv.role
+                )
+                id_replacements[target_iv.var_id] = promoted
+        if id_replacements:
+            new_body = _rewrite_iter_var_ids(new_body, id_replacements)
+
+        """Step 2: merge matched block iter vars into target iter vars. For
+        each matched pair, rewrite block_iv.var_id → target_iv.var_id (using
+        the promoted id when applicable) in the block subtree's BufferAccess
+        entries + SBlock.iter_vars lists."""
+        merge_map: dict[int, IterVar] = {}
+        for target_iv, block_iv in matched:
+            merged_target = id_replacements.get(target_iv.var_id, target_iv)
+            merge_map[block_iv.var_id] = merged_target
+
+        """Re-resolve the block in new_body after potential iter-var
+        rewriting above. Paths are unchanged because rewriting only rebuilt
+        nodes in place."""
+        block_in_new = resolve_node(new_body, self.block_path)
+        assert isinstance(block_in_new, SBlock)
+
+        remaining_block_ivs = [iv for iv in block_in_new.iter_vars if iv.var_id not in merge_map]
+        new_block = _rewrite_block_refs(block_in_new, merge_map, remaining_block_ivs)
+
+        """Step 3: build the new subtree. Wrap the rewritten block in one
+        ForNode per remaining block iter var (outermost first)."""
+        subtree: ForNode | SBlock = new_block
+        for iv in reversed(remaining_block_ivs):
+            subtree = ForNode(iter_var=iv, children=[subtree])
+
+        """Step 4: remove block from its old location; append subtree
+        under the target. Use id() to re-resolve the target since removal
+        may shift the target_path."""
+        target_id = id(resolve_node(new_body, self.target_path))
+        body_without = _remove_at_path(new_body, self.block_path)
+        new_target_path = _find_node_path(body_without, target_id)
         if new_target_path is None:
             raise ValueError(
-                f"ReverseComputeAt.apply: target LoopNode was consumed by removal — "
-                f"leaf_path={self.leaf_path}, target_loop_path={self.target_loop_path}"
+                f"ReverseComputeAt.apply: target ForNode was consumed by removal — "
+                f"block_path={self.block_path}, target_path={self.target_path}"
             )
-        ancestor_products = _ancestor_trip_products(body_without, new_target_path)
-        leaf_dims = list(leaf.dim_role.keys())
-        needed: list[tuple[str, int]] = []
-        for d in leaf_dims:
-            covered = ancestor_products.get(d, 1)
-            num_t = module.dims[d].num_tiles
-            if num_t == covered:
-                continue
-            if num_t % covered != 0:
-                raise AtomLegalityError(
-                    f"ReverseComputeAt.apply: ancestor coverage {covered} does not divide num_tiles[{d!r}]={num_t}"
-                )
-            residual = num_t // covered
-            if residual > 1:
-                needed.append((d, residual))
-        regenerated = _wrap_leaf_with_dims(leaf, needed, module)
-        new_body = _append_under(body_without, new_target_path, regenerated)
-        new_body = _rename_canonical(new_body)
-        return replace(module, body=new_body)
+        final_body = _append_under(body_without, new_target_path, subtree)
+        return replace(module, body=final_body)
 
 
 def enumerate_reverse_compute_at_atoms(module: KernelModule) -> list[ReverseComputeAt]:
-    """Emit every legal ``(consumer_leaf, target_loop)`` pair."""
-    leaves: list[tuple[tuple[int, ...], BodyLeaf]] = []
-    loops: list[tuple[tuple[int, ...], LoopNode]] = []
+    """Emit every legal ``(block, target)`` pair across the forest.
 
-    def collect_leaves(node: LoopNode | BodyLeaf, path: tuple[int, ...]) -> None:
-        """Walk ``node`` collecting paths to every BodyLeaf."""
-        if isinstance(node, BodyLeaf):
-            leaves.append((path, node))
+    Alloc blocks are skipped — they carry no iter vars and placing them
+    under a loop has no semantic meaning.
+    """
+    blocks: list[tuple[tuple[int, ...], SBlock]] = []
+    fornodes: list[tuple[tuple[int, ...], ForNode]] = []
+
+    def collect(node: ForNode | SBlock, path: tuple[int, ...]) -> None:
+        """Walk ``node`` collecting paths to every SBlock + ForNode."""
+        if isinstance(node, SBlock):
+            blocks.append((path, node))
         else:
+            fornodes.append((path, node))
             for i, c in enumerate(node.children):
-                collect_leaves(c, path + (i,))
-
-    def collect_loops(node: LoopNode | BodyLeaf, path: tuple[int, ...]) -> None:
-        """Walk ``node`` collecting paths to every LoopNode."""
-        if isinstance(node, LoopNode):
-            loops.append((path, node))
-            for i, c in enumerate(node.children):
-                collect_loops(c, path + (i,))
+                collect(c, path + (i,))
 
     for i, root in enumerate(module.body):
-        collect_leaves(root, (i,))
-        collect_loops(root, (i,))
+        collect(root, (i,))
 
     atoms: list[ReverseComputeAt] = []
-    for leaf_path, _leaf in leaves:
-        for loop_path, _loop in loops:
-            atom = ReverseComputeAt(leaf_path=leaf_path, target_loop_path=loop_path)
+    for block_path, block in blocks:
+        """Skip alloc blocks — empty iter_vars + zero-trip compute."""
+        if not block.iter_vars:
+            continue
+        for target_path, _target in fornodes:
+            atom = ReverseComputeAt(block_path=block_path, target_path=target_path)
             if atom.is_legal(module):
                 atoms.append(atom)
     return atoms

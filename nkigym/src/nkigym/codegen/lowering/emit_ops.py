@@ -1,279 +1,199 @@
-"""Per-op-class body emitters: ``NKIAlloc``, ``NKILoad``, ``NKIMatmul``, etc.
+"""Per-op ISA call emitters for the iter-var IR.
 
-Each emitter receives a fully-resolved :class:`BodyLeaf`, the enclosing
-:class:`KernelModule`, and the current forest path's same-dim ancestor
-state (``path_names`` / ``path_trips``). It emits the ISA call-site
-snippet (e.g. ``nisa.dma_copy(...)``, ``nisa.nc_matmul(...)``) for that
-leaf; the walker opens and closes the wrapping ``for`` loops.
+Each emitter receives an :class:`NKIOpCall` (op-level kwargs), the
+enclosing :class:`SBlock` (operand :class:`BufferAccess` maps), and an
+:class:`EmitCtx` (iter-var id → rendered name + module tensors). It
+returns the exact ``nisa.*`` / ``nl.ndarray`` source fragment for that
+block. Loop headers are opened by the walker in :mod:`emit_source`;
+emitters only produce the body fragment.
 
-Allocation is itself an op (``NKIAlloc``) whose emitter synthesizes the
-``nl.ndarray(...)`` declaration. SBUF/PSUM tensors get 3D shapes
-``(P_tile, num_p_slots, num_f_tiles*f_tile)`` per the NKI convention;
-shape computation delegates to :func:`place_buffers.sbuf_shape`. HBM
-tensors keep their declared 2D shape.
-
-Slot-index expressions for multi-buffered tiles come from
-:mod:`nkigym.codegen.lowering.inject_multi_buffer`; the ``pipeline_dim``
-and ``stage_offset`` kwargs thread software-pipelining's stage skew
-through to those expressions.
+The registry is keyed by the NKIOp subclass's ``__name__`` so the
+dispatch is robust against re-exports.
 """
 
 from collections.abc import Callable
 
-from nkigym.codegen.lowering.inject_multi_buffer import hbm_tile_slice, sbuf_tile_slice
-from nkigym.codegen.lowering.place_buffers import sbuf_shape
+from nkigym.codegen.ir import NKIOpCall, SBlock
+from nkigym.codegen.lowering._emit_utils import EmitCtx, emit_slice
 
-_BODY_EMITTERS: dict[str, Callable] = {}
-"""Per-op-class body emitter registry.
+_DTYPE_MAP: dict[str, str] = {"float32": "nl.float32", "float16": "nl.float16", "bfloat16": "nl.bfloat16"}
 
-A body emitter receives ``(writer, module, leaf, path_names, path_trips,
-pipeline_dim=None, stage_offset=0)`` and emits that op's source lines
-without any loop headers — the walker is responsible for opening and
-closing the loops that frame the body. Emitters read every op detail
-from the self-describing :class:`BodyLeaf` and consult ``module`` for
-dim/tensor declarations.
+_LOCATION_BUFFER_EXPR: dict[str, str] = {"hbm": "nl.shared_hbm", "sbuf": "nl.sbuf", "psum": "nl.psum"}
+
+
+_EMITTERS: dict[str, Callable[[NKIOpCall, SBlock, EmitCtx], list[str]]] = {}
+"""Registry: NKIOp subclass name → emitter function.
+
+Each emitter returns a list of source lines (most return a single line;
+multi-line emitters — matmul, activation_reduce — return several).
 """
 
-_LOCATION_BUFFER_EXPR = {"hbm": "nl.shared_hbm", "sbuf": "nl.sbuf", "psum": "nl.psum"}
+
+def emit_op_call(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
+    """Dispatch to the per-op emitter by class name. Returns source lines."""
+    emitter = _EMITTERS.get(call.op_cls.__name__)
+    if emitter is None:
+        raise NotImplementedError(f"No emitter for op class {call.op_cls.__name__!r}")
+    return emitter(call, block, ctx)
 
 
-def _register_body(op_kind: str):
-    """Decorator: register a body emitter for ``op_kind``."""
+def _register(op_name: str) -> Callable[[Callable], Callable]:
+    """Decorator: register ``fn`` as the emitter for ``op_name``."""
 
     def wrap(fn: Callable) -> Callable:
-        """Attach ``fn`` to the ``op_kind`` slot in the registry."""
-        _BODY_EMITTERS[op_kind] = fn
+        """Attach ``fn`` to the ``op_name`` slot in the registry."""
+        _EMITTERS[op_name] = fn
         return fn
 
     return wrap
 
 
-def _build_slice(
-    tensor_name: str,
-    tensor,
-    module,
-    path_names: dict[str, list[str]],
-    path_trips: dict[str, list[int]],
-    pipeline_dim: str | None,
-    stage_offset: int,
-) -> str:
-    """Dispatch on tensor.location to build HBM or SBUF tile slice expression."""
-    from nkigym.codegen.lowering.place_buffers import tensor_total_slots
+def _slice(slot: str, access_map: dict, ctx: EmitCtx) -> str:
+    """Emit the affine slice expression for one operand slot.
 
-    if tensor.location == "hbm":
-        """HBM tensor: tile size from module.dims, slots from num_tiles."""
-        p_axis = tensor.dim_ids[0]
-        f_axis = tensor.dim_ids[1] if len(tensor.dim_ids) > 1 else None
-        p_tile = module.dims[p_axis].tile_size
-        f_tile = module.dims[f_axis].tile_size if f_axis is not None else 1
-        p_slots = module.dims[p_axis].num_tiles
-        f_slots = module.dims[f_axis].num_tiles if f_axis is not None else 1
-        off_p = stage_offset if p_axis == pipeline_dim else 0
-        off_f = stage_offset if f_axis is not None and f_axis == pipeline_dim else 0
-        return hbm_tile_slice(
-            tensor_name, tensor.dim_ids, p_tile, f_tile, path_names, path_trips, p_slots, f_slots, off_p, off_f
-        )
-    else:
-        """SBUF/PSUM tensor: tile size from module.dims, slots from tensor_total_slots."""
-        p_axis = tensor.dim_ids[0]
-        f_axis = tensor.dim_ids[1] if len(tensor.dim_ids) > 1 else None
-        p_tile = module.dims[p_axis].tile_size
-        f_tile = module.dims[f_axis].tile_size if f_axis is not None else 1
-        p_slots = tensor_total_slots(tensor, p_axis, module)
-        f_slots = tensor_total_slots(tensor, f_axis, module) if f_axis is not None else 1
-        off_p = stage_offset if p_axis == pipeline_dim else 0
-        off_f = stage_offset if f_axis is not None and f_axis == pipeline_dim else 0
-        return sbuf_tile_slice(
-            tensor_name, tensor.dim_ids, p_tile, f_tile, path_names, path_trips, p_slots, f_slots, off_p, off_f
-        )
-
-
-@_register_body("NKIAlloc")
-def _body_alloc(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
-    """Emit ``<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=<buffer_expr>)``.
-
-    SBUF/PSUM tensors get the 3D ``(P_tile, num_p_slots, num_f_tiles*f_tile)``
-    layout per the NKI ``nl.ndarray`` convention — shape comes from
-    :func:`place_buffers.sbuf_shape`, which folds ``buffer_degree`` and
-    LCA-coverage into the P-slot count. HBM tensors keep their declared
-    2D shape (no tile folding — HBM is a flat global buffer).
-
-    ``pipeline_dim`` and ``stage_offset`` are unused; allocation is
-    index-free.
+    Looks up the operand's fully-lowered :class:`Tensor` in
+    ``ctx.tensors`` so :func:`emit_slice` can dispatch on the physical
+    shape (HBM 2D vs SBUF/PSUM 3+D).
     """
-    _ = path_names, path_trips, pipeline_dim, stage_offset
-    name = leaf.writes[0]
-    tensor = module.tensors[name]
-    buffer_expr = _LOCATION_BUFFER_EXPR[tensor.location]
-    if tensor.location == "hbm":
-        shape_str = ", ".join(str(x) for x in tensor.shape)
-        shape_tuple = f"({shape_str},)" if len(tensor.shape) == 1 else f"({shape_str})"
+    access = access_map[slot]
+    tensor = ctx.tensors[access.tensor_name]
+    return emit_slice(tensor, access, ctx)
+
+
+@_register("NKIAlloc")
+def _emit_alloc(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
+    """Emit ``<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=<loc>)``.
+
+    Shape comes from the post-``place_buffers`` tensor record; dtype
+    and location come from the alloc kwargs. ``place_buffers`` leaves
+    HBM tensors with their declared shape and promotes SBUF/PSUM
+    tensors to N-D; we just render what we find.
+    """
+    _ = block
+    tname = call.kwargs["tensor_name"]
+    tensor = ctx.tensors[tname]
+    dtype = call.kwargs["dtype"]
+    location = call.kwargs["location"]
+    dt_expr = _DTYPE_MAP.get(dtype, f"nl.{dtype}")
+    loc_expr = _LOCATION_BUFFER_EXPR[location]
+    shape = tensor.shape
+    if len(shape) == 1:
+        shape_tuple = f"({shape[0]},)"
     else:
-        shape = sbuf_shape(tensor, module)
-        shape_tuple = f"({shape[0]}, {shape[1]}, {shape[2]})"
-    w.line(f"{name} = nl.ndarray({shape_tuple}, dtype=nl.{tensor.dtype}, buffer={buffer_expr})")
+        shape_tuple = "(" + ", ".join(str(x) for x in shape) + ")"
+    return [f"{tname} = nl.ndarray({shape_tuple}, dtype={dt_expr}, buffer={loc_expr})"]
 
 
-@_register_body("NKIMemset")
-def _body_memset(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
-    """Emit ``nisa.memset(<dst_slice>, value=<value>)``."""
-    dst_name = leaf.writes[0]
-    tensor = module.tensors[dst_name]
-    value = leaf.kwargs["value"]
-    dst_slice = _build_slice(dst_name, tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line(f"nisa.memset({dst_slice}, value={value})")
+@_register("NKIMemset")
+def _emit_memset(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
+    """Emit ``nisa.memset(<dst>, value=<value>)``."""
+    dst = _slice("dst", block.writes, ctx)
+    value = call.kwargs["value"]
+    return [f"nisa.memset({dst}, value={value})"]
 
 
-@_register_body("NKILoad")
-def _body_load(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
-    """Emit ``nisa.dma_copy(dst=<dst>, src=<src>)``."""
-    src_name = leaf.reads["src"]
-    dst_name = leaf.writes[0]
-    src_tensor = module.tensors[src_name]
-    dst_tensor = module.tensors[dst_name]
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    src_slice = _build_slice(src_name, src_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line(f"nisa.dma_copy(dst={dst_slice}, src={src_slice})")
+@_register("NKILoad")
+def _emit_load(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
+    """Emit ``nisa.dma_copy(dst=<dst>, src=<src>)`` HBM -> SBUF."""
+    _ = call
+    src = _slice("src", block.reads, ctx)
+    dst = _slice("dst", block.writes, ctx)
+    return [f"nisa.dma_copy(dst={dst}, src={src})"]
 
 
-@_register_body("NKIStore")
-def _body_store(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
-    """Emit ``nisa.dma_copy(dst=<dst>, src=<src>)`` SBUF->HBM."""
-    src_name = leaf.reads["src"]
-    dst_name = leaf.writes[0]
-    src_tensor = module.tensors[src_name]
-    dst_tensor = module.tensors[dst_name]
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    src_slice = _build_slice(src_name, src_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line(f"nisa.dma_copy(dst={dst_slice}, src={src_slice})")
+@_register("NKIStore")
+def _emit_store(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
+    """Emit ``nisa.dma_copy(dst=<dst>, src=<src>)`` SBUF -> HBM."""
+    _ = call
+    src = _slice("src", block.reads, ctx)
+    dst = _slice("dst", block.writes, ctx)
+    return [f"nisa.dma_copy(dst={dst}, src={src})"]
 
 
-@_register_body("NKITensorCopy")
-def _body_tensor_copy(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
+@_register("NKITensorCopy")
+def _emit_tensor_copy(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
     """Emit ``nisa.tensor_copy(<dst>, <src>)``."""
-    src_name = leaf.reads["src"]
-    dst_name = leaf.writes[0]
-    src_tensor = module.tensors[src_name]
-    dst_tensor = module.tensors[dst_name]
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    src_slice = _build_slice(src_name, src_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line(f"nisa.tensor_copy({dst_slice}, {src_slice})")
+    _ = call
+    src = _slice("src", block.reads, ctx)
+    dst = _slice("dst", block.writes, ctx)
+    return [f"nisa.tensor_copy({dst}, {src})"]
 
 
-@_register_body("NKITensorReduce")
-def _body_tensor_reduce(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
+@_register("NKITensorReduce")
+def _emit_tensor_reduce(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
     """Emit ``nisa.tensor_reduce(<dst>, <op_expr>, <data>, axis=<axis>)``."""
-    data_name = leaf.reads["data"]
-    dst_name = leaf.writes[0]
-    data_tensor = module.tensors[data_name]
-    dst_tensor = module.tensors[dst_name]
-    op = leaf.kwargs["op"]
-    axis = leaf.kwargs["axis"]
+    data = _slice("data", block.reads, ctx)
+    dst = _slice("dst", block.writes, ctx)
+    op = call.kwargs["op"]
+    axis = call.kwargs["axis"]
     op_expr = "nl.add" if op == "add" else "nl.maximum"
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    data_slice = _build_slice(data_name, data_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line(f"nisa.tensor_reduce({dst_slice}, {op_expr}, {data_slice}, axis={axis})")
+    return [f"nisa.tensor_reduce({dst}, {op_expr}, {data}, axis={axis})"]
 
 
-@_register_body("NKIMatmul")
-def _body_matmul(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
-    """Emit ``nisa.nc_matmul(dst=<dst>, stationary=..., moving=...)``."""
-    stat_name = leaf.reads["stationary"]
-    mov_name = leaf.reads["moving"]
-    dst_name = leaf.reads_writes[0]
-    stat_tensor = module.tensors[stat_name]
-    mov_tensor = module.tensors[mov_name]
-    dst_tensor = module.tensors[dst_name]
-    stat_slice = _build_slice(stat_name, stat_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    mov_slice = _build_slice(mov_name, mov_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line("nisa.nc_matmul(")
-    w.indent()
-    w.line(f"dst={dst_slice},")
-    w.line(f"stationary={stat_slice},")
-    w.line(f"moving={mov_slice},")
-    w.dedent()
-    w.line(")")
+@_register("NKIMatmul")
+def _emit_matmul(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
+    """Emit the multi-line ``nisa.nc_matmul(dst=..., stationary=..., moving=...)``."""
+    _ = call
+    stat = _slice("stationary", block.reads, ctx)
+    mov = _slice("moving", block.reads, ctx)
+    dst = _slice("dst", block.reads_writes, ctx)
+    return ["nisa.nc_matmul(", f"    dst={dst},", f"    stationary={stat},", f"    moving={mov},", ")"]
 
 
-@_register_body("NKIActivation")
-def _body_activation(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
+@_register("NKIActivation")
+def _emit_activation(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
     """Emit ``nisa.activation(dst=..., op=nl.<act>, data=..., scale=..., bias=...)``."""
-    data_name = leaf.reads["data"]
-    dst_name = leaf.writes[0]
-    data_tensor = module.tensors[data_name]
-    dst_tensor = module.tensors[dst_name]
-    act = leaf.kwargs["op"]
-    scale = leaf.kwargs.get("scale", 1.0)
-    bias = leaf.kwargs.get("bias", 0.0)
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    data_slice = _build_slice(data_name, data_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line(f"nisa.activation(dst={dst_slice}, op=nl.{act}, data={data_slice}, scale={scale}, bias={bias})")
+    data = _slice("data", block.reads, ctx)
+    dst = _slice("dst", block.writes, ctx)
+    act = call.kwargs["op"]
+    scale = call.kwargs.get("scale", 1.0)
+    bias = call.kwargs.get("bias", 0.0)
+    return [f"nisa.activation(dst={dst}, op=nl.{act}, data={data}, scale={scale}, bias={bias})"]
 
 
-@_register_body("NKIActivationReduce")
-def _body_activation_reduce(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
-    """Emit multi-line ``nisa.activation_reduce(dst=..., op=nl.<act>, data=..., reduce_op=..., reduce_res=...)``."""
-    data_name = leaf.reads["data"]
-    dst_name = leaf.writes[0]
-    reduce_res_name = leaf.writes[1]
-    data_tensor = module.tensors[data_name]
-    dst_tensor = module.tensors[dst_name]
-    reduce_res_tensor = module.tensors[reduce_res_name]
-    act = leaf.kwargs.get("op", "copy")
-    reduce_op = leaf.kwargs.get("reduce_op", "add")
+@_register("NKIActivationReduce")
+def _emit_activation_reduce(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
+    """Emit the multi-line ``nisa.activation_reduce(...)`` call."""
+    data = _slice("data", block.reads, ctx)
+    dst = _slice("dst", block.writes, ctx)
+    reduce_res = _slice("reduce_res", block.writes, ctx)
+    act = call.kwargs.get("op", "copy")
+    reduce_op = call.kwargs.get("reduce_op", "add")
     reduce_op_expr = "nl.add" if reduce_op == "add" else "nl.maximum"
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    data_slice = _build_slice(data_name, data_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    reduce_res_slice = _build_slice(
-        reduce_res_name, reduce_res_tensor, module, path_names, path_trips, pipeline_dim, stage_offset
-    )
-    w.line("nisa.activation_reduce(")
-    w.indent()
-    w.line(f"dst={dst_slice},")
-    w.line(f"op=nl.{act},")
-    w.line(f"data={data_slice},")
-    w.line(f"reduce_op={reduce_op_expr},")
-    w.line(f"reduce_res={reduce_res_slice},")
-    w.dedent()
-    w.line(")")
+    return [
+        "nisa.activation_reduce(",
+        f"    dst={dst},",
+        f"    op=nl.{act},",
+        f"    data={data},",
+        f"    reduce_op={reduce_op_expr},",
+        f"    reduce_res={reduce_res},",
+        ")",
+    ]
 
 
-@_register_body("NKITensorScalar")
-def _body_tensor_scalar(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
+@_register("NKITensorScalar")
+def _emit_tensor_scalar(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
     """Emit ``nisa.tensor_scalar(dst=..., data=..., op0=nl.<op>, operand0=...)``."""
-    data_name = leaf.reads["data"]
-    op0_name = leaf.reads["operand0"]
-    dst_name = leaf.writes[0]
-    data_tensor = module.tensors[data_name]
-    op0_tensor = module.tensors[op0_name]
-    dst_tensor = module.tensors[dst_name]
-    op_name = leaf.kwargs["op"]
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    data_slice = _build_slice(data_name, data_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    op0_slice = _build_slice(op0_name, op0_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line(f"nisa.tensor_scalar(dst={dst_slice}, data={data_slice}, op0=nl.{op_name}, operand0={op0_slice})")
+    data = _slice("data", block.reads, ctx)
+    op0 = _slice("operand0", block.reads, ctx)
+    dst = _slice("dst", block.writes, ctx)
+    op_name = call.kwargs["op"]
+    return [f"nisa.tensor_scalar(dst={dst}, data={data}, op0=nl.{op_name}, operand0={op0})"]
 
 
-@_register_body("NKITranspose")
-def _body_transpose(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
+@_register("NKITranspose")
+def _emit_transpose(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
     """Emit ``nisa.nc_transpose(<dst>, <src>)``."""
-    src_name = leaf.reads["src"]
-    dst_name = leaf.writes[0]
-    src_tensor = module.tensors[src_name]
-    dst_tensor = module.tensors[dst_name]
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    src_slice = _build_slice(src_name, src_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line(f"nisa.nc_transpose({dst_slice}, {src_slice})")
+    _ = call
+    src = _slice("src", block.reads, ctx)
+    dst = _slice("dst", block.writes, ctx)
+    return [f"nisa.nc_transpose({dst}, {src})"]
 
 
-@_register_body("NKIDMATranspose")
-def _body_dma_transpose(w, module, leaf, path_names, path_trips, pipeline_dim=None, stage_offset=0) -> None:
+@_register("NKIDMATranspose")
+def _emit_dma_transpose(call: NKIOpCall, block: SBlock, ctx: EmitCtx) -> list[str]:
     """Emit ``nisa.dma_transpose(<dst>, <src>)``."""
-    src_name = leaf.reads["src"]
-    dst_name = leaf.writes[0]
-    src_tensor = module.tensors[src_name]
-    dst_tensor = module.tensors[dst_name]
-    dst_slice = _build_slice(dst_name, dst_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    src_slice = _build_slice(src_name, src_tensor, module, path_names, path_trips, pipeline_dim, stage_offset)
-    w.line(f"nisa.dma_transpose({dst_slice}, {src_slice})")
+    _ = call
+    src = _slice("src", block.reads, ctx)
+    dst = _slice("dst", block.writes, ctx)
+    return [f"nisa.dma_transpose({dst}, {src})"]

@@ -27,14 +27,14 @@ _ATOL = 5e-3
 _RTOL = 5e-3
 _SIM_SEED = 0
 
-_NL_NON_DTYPE_NAMES = frozenset(
-    {"ndarray", "sbuf", "psum", "hbm", "shared_hbm", "par_dim", "load", "store", "multiply", "add", "subtract"}
-)
-"""``nl.<name>`` identifiers that are NOT dtypes — excluded from the
-``nl.* → nl.float32`` rewrite below so we don't silently mangle
-``nl.ndarray``, buffer tags, or language ops. All other ``nl.<name>``
-tokens (``nl.bfloat16``, ``nl.float16``, ``nl.float8_*``, ``nl.int*``,
-``nl.uint*``) are treated as dtypes."""
+_NL_DTYPE_NAME_RE = re.compile(r"^(?:b?float\d+(?:_e\d+m\d+(?:fn)?(?:_x\d+)?)?|tfloat\d+|int\d+|uint\d+|bool_?)$")
+"""Regex matching NKI dtype identifiers: ``float32``, ``float16``,
+``bfloat16``, ``float8_e4m3``, ``float8_e4m3fn_x4``, ``tfloat32``,
+``int8``/``int16``/``int32``, ``uint8``/``uint16``/``uint32``, ``bool_``.
+A whitelist of dtype names keeps the rewrite from corrupting
+``nl.<op>`` activation / language-op tokens (``square``, ``rsqrt``,
+``add``, ``multiply`` ...) or buffer tags (``sbuf``, ``psum``,
+``hbm``, ``ndarray`` ...)."""
 
 _NL_TOKEN_RE = re.compile(r"\bnl\.([A-Za-z_][A-Za-z0-9_]*)\b")
 
@@ -56,15 +56,17 @@ def _rewrite_to_fp32(kernel_source: str) -> str:
     runs fp32 end-to-end so accuracy is not dominated by low-precision
     rounding.
 
-    Rewrites every ``nl.<name>`` token except the fixed set in
-    :data:`_NL_NON_DTYPE_NAMES` (``nl.ndarray`` / buffer tags / ops),
-    which catches all present and future NKI dtypes (bf16, fp16, fp8_*,
-    int*, uint*, ...) regardless of positional vs keyword use.
+    Rewrites every ``nl.<name>`` token whose suffix matches
+    :data:`_NL_DTYPE_NAME_RE`. The whitelist catches all present and
+    future NKI dtypes (bf16, fp16, fp8_*, int*, uint*, ...) while
+    leaving activation/language ops (``nl.square``, ``nl.rsqrt``,
+    ``nl.add``, ...) and buffer tags (``nl.sbuf``, ``nl.psum``,
+    ``nl.ndarray``, ...) untouched.
     """
 
     def replace(match: "re.Match[str]") -> str:
         name = match.group(1)
-        return match.group(0) if name in _NL_NON_DTYPE_NAMES else "nl.float32"
+        return "nl.float32" if _NL_DTYPE_NAME_RE.match(name) else match.group(0)
 
     return _NL_TOKEN_RE.sub(replace, kernel_source)
 
