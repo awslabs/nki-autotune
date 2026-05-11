@@ -111,3 +111,36 @@ def test_place_buffers_sbuf_product_shape() -> None:
     place_buffers(module)
     sbuf_prod = module.tensors["sbuf_prod"]
     assert sbuf_prod.shape == (128, 16, 2048)
+
+
+def test_writer_driven_buffer_shape() -> None:
+    """With NKILoad writing full-F and NKIMatmul reading per-M-tile, the
+    SBUF buffer shape is (P_tile, num_P_slots, F_full_extent) — driven by
+    the producer's write pattern, not the consumer's tile."""
+
+    @nkigym_kernel
+    def _k(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+        lhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+        rhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+        psum_acc = NKIAlloc(location="psum", shape=(2048, 2048), dtype="float32")()
+        sbuf_prod = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+        hbm_out = NKIAlloc(location="hbm", shape=(2048, 2048), dtype="bfloat16")()
+        NKILoad()(src=lhs, dst=lhs_sbuf)
+        NKILoad()(src=rhs, dst=rhs_sbuf)
+        NKIMemset(value=0.0)(dst=psum_acc)
+        NKIMatmul()(stationary=lhs_sbuf, moving=rhs_sbuf, dst=psum_acc)
+        NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
+        NKIStore()(src=sbuf_prod, dst=hbm_out)
+        return hbm_out
+
+    specs = {"lhs": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
+    km = build_canonical_module(_k, specs)
+    place_buffers(km)
+    """lhs_sbuf: writer is NKILoad with tile (P=128, F=2048-full).
+    num_P_slots = 16 (covers 2048/128); F_tile * num_F_tiles = 2048 * 1."""
+    assert km.tensors["lhs_sbuf"].shape == (128, 16, 2048)
+    """rhs_sbuf: same story."""
+    assert km.tensors["rhs_sbuf"].shape == (128, 16, 2048)
+    """psum_acc: RMW writer is NKIMatmul with tile (M=128, N=512).
+    num_P_slots = 16 (2048/128); F_tile * num_F_tiles = 512 * 4 = 2048."""
+    assert km.tensors["psum_acc"].shape == (128, 16, 2048)

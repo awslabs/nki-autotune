@@ -45,6 +45,39 @@ from nkigym.ops.tensor_reduce import NKITensorReduce
 from nkigym.tune import AtomLegalityError
 
 
+def _block_dim_trip(block: SBlock, dim_id: str) -> int | None:
+    """Return the trip count (iter-var extent) for ``dim_id`` in ``block``.
+
+    Returns None if ``block`` has no iter var on ``dim_id``.
+    """
+    for iv in block.iter_vars:
+        if iv.dim_id == dim_id:
+            return iv.extent
+    return None
+
+
+def _block_dim_tile(module: KernelModule, block: SBlock, dim_id: str) -> int | None:
+    """Return the per-op tile width (access-pattern extent) for ``dim_id`` in ``block``.
+
+    Scans the block's reads / writes / reads_writes in order and returns
+    the first extent found on a tensor dim matching ``dim_id``.
+    Returns None when no access in the block touches ``dim_id``.
+
+    Precedence: reads, then writes, then reads_writes. In canonical IR,
+    all accesses touching a given dim in the same block should have
+    identical extents for that dim.
+    """
+    all_accesses = list(block.reads.values()) + list(block.writes.values()) + list(block.reads_writes.values())
+    for access in all_accesses:
+        tensor = module.tensors.get(access.tensor_name)
+        if tensor is None:
+            continue
+        for i, d in enumerate(tensor.dim_ids):
+            if d == dim_id and i < len(access.pattern):
+                return access.pattern[i].extent
+    return None
+
+
 @dataclass(frozen=True)
 class RFactor:
     """Fission a reducer into outer-split + staging + close.
@@ -54,8 +87,8 @@ class RFactor:
             :class:`NKIMatmul` for recipe ``"rmw"``,
             :class:`NKIActivationReduce` for recipe ``"slot"``.
         outer_factor: The outer loop's trip count post-split. Must
-            strictly divide the accumulation dim's ``num_tiles``, and
-            be strictly between 1 and ``num_tiles``.
+            strictly divide the reducer block's iter-var extent on the
+            accumulation dim, and be strictly between 1 and that extent.
     """
 
     reducer_block_path: tuple[int, ...]
@@ -78,7 +111,9 @@ class RFactor:
         dim_info = module.dims.get(acc_dim)
         if dim_info is None:
             return False
-        num_t = dim_info.num_tiles
+        num_t = _block_dim_trip(block, acc_dim)
+        if num_t is None:
+            return False
         if num_t <= 1:
             return False
         if self.outer_factor <= 1 or self.outer_factor >= num_t:
@@ -118,10 +153,12 @@ def enumerate_rfactor_atoms(module: KernelModule) -> list[RFactor]:
                 if acc_dim is not None:
                     dim_info = module.dims.get(acc_dim)
                     if dim_info is not None:
-                        for factor in _strict_divisors(dim_info.num_tiles):
-                            atom = RFactor(reducer_block_path=path, outer_factor=factor)
-                            if atom.is_legal(module):
-                                atoms.append(atom)
+                        num_t = _block_dim_trip(node, acc_dim)
+                        if num_t is not None:
+                            for factor in _strict_divisors(num_t):
+                                atom = RFactor(reducer_block_path=path, outer_factor=factor)
+                                if atom.is_legal(module):
+                                    atoms.append(atom)
         else:
             for i, c in enumerate(node.children):
                 walk(c, path + (i,))
@@ -190,16 +227,18 @@ def _apply_rmw(module: KernelModule, block_path: tuple[int, ...], outer_factor: 
     """Identify the PSUM accumulator — the single RMW write."""
     psum_acc_name = _single_rmw_name(matmul_block)
     psum_acc = module.tensors[psum_acc_name]
-    k_info = module.dims[k_dim]
-    inner_trip = k_info.num_tiles // outer_factor
+    k_trip = _block_dim_trip(matmul_block, k_dim)
+    if k_trip is None:
+        raise AtomLegalityError("RFactor.apply (rmw): matmul block has no iter var on accumulation dim")
+    inner_trip = k_trip // outer_factor
 
     """Declare the synthetic outer dim. The accumulation dim ``k_dim`` is
-    split at the MATMUL iter-var level (Split-style) — its ``num_tiles``
-    stays unchanged so other users of the dim (loads, stores) keep iterating
-    over the full K."""
+    split at the MATMUL iter-var level (Split-style) — its trip count
+    stays unchanged on other users of the dim (loads, stores) so they
+    keep iterating over the full K."""
     outer_dim_id = _fresh_dim_id(module.dims)
     new_dims = dict(module.dims)
-    new_dims[outer_dim_id] = DimInfo(dim_id=outer_dim_id, total_size=outer_factor, tile_size=1, num_tiles=outer_factor)
+    new_dims[outer_dim_id] = DimInfo(dim_id=outer_dim_id, total_size=outer_factor)
 
     """Materialise staging + local PSUM tensors. Ordering of
     ``psum_partials.dim_ids``: P first, outer next, then the remaining
@@ -710,7 +749,7 @@ def _build_close_reduce_tree(
     write, but with an extra no-iter-var AccessRange for the outer dim
     spanning its full extent."""
     outer_info = new_dims[outer_dim_id]
-    outer_ar = AccessRange.make({}, 0, outer_info.num_tiles)
+    outer_ar = AccessRange.make({}, 0, outer_info.total_size)
     orig_dst_pattern = dst_access.pattern
     new_pattern = (orig_dst_pattern[0], outer_ar, *orig_dst_pattern[1:])
     new_iv_ids = tuple(_remap_iv_ids(drain_write_access.iter_var_ids, iv_map))
@@ -819,8 +858,10 @@ def _apply_slot(module: KernelModule, block_path: tuple[int, ...], outer_factor:
     call = ar_block.body[0]
     f_dim = _accumulation_dim(call)
     assert f_dim is not None
-    f_info = module.dims[f_dim]
-    inner_f_trip = f_info.num_tiles // outer_factor
+    f_trip = _block_dim_trip(ar_block, f_dim)
+    if f_trip is None:
+        raise AtomLegalityError("RFactor.apply (slot): activation_reduce block has no iter var on accumulation dim")
+    inner_f_trip = f_trip // outer_factor
 
     """Identify operand tensor names. ``NKIActivationReduce`` declares
     OPERAND_AXES in the order (data, dst, reduce_res); the block puts
@@ -833,12 +874,12 @@ def _apply_slot(module: KernelModule, block_path: tuple[int, ...], outer_factor:
     scratch = module.tensors[scratch_name]
 
     """Declare the synthetic outer dim. Like the rmw recipe, we split the
-    F iter var at the block level (Split-style) instead of mutating
-    ``f_info.num_tiles`` — other users of ``f_dim`` (the outer load)
+    F iter var at the block level (Split-style) instead of mutating the
+    F dim's trip count — other users of ``f_dim`` (the outer load)
     continue to iterate the full F extent."""
     outer_dim_id = _fresh_dim_id(module.dims)
     new_dims = dict(module.dims)
-    new_dims[outer_dim_id] = DimInfo(dim_id=outer_dim_id, total_size=outer_factor, tile_size=1, num_tiles=outer_factor)
+    new_dims[outer_dim_id] = DimInfo(dim_id=outer_dim_id, total_size=outer_factor)
 
     """Staging tensors: ``partials`` holds a per-outer-step scalar per P
     row (1D → 2D w/ outer); ``scratch_local`` per-outer activation tile
@@ -1017,20 +1058,23 @@ def _build_close_reduce_slot_tree(
     new_dims: dict[str, DimInfo],
 ) -> ForNode | SBlock:
     """Build the close-reduce tree for slot: iterate only the P dim (shared w/ sum_acc), reduce outer axis of partials."""
-    _ = orig_ar_block
     sum_acc = module.tensors[sum_acc_name]
     p_dim = sum_acc.dim_ids[0]
-    p_info = new_dims[p_dim]
 
-    iv_p = module.allocate_iter_var(dim_id=p_dim, extent=p_info.num_tiles, role=AxisRole.PARALLEL)
+    p_trip = _block_dim_trip(orig_ar_block, p_dim)
+    p_tile = _block_dim_tile(module, orig_ar_block, p_dim)
+    if p_trip is None or p_tile is None:
+        raise AtomLegalityError("RFactor.apply (slot): activation_reduce block has no iter var/access on P dim")
+
+    iv_p = module.allocate_iter_var(dim_id=p_dim, extent=p_trip, role=AxisRole.PARALLEL)
     outer_info = new_dims[outer_dim_id]
-    outer_ar = AccessRange.make({}, 0, outer_info.num_tiles)
+    outer_ar = AccessRange.make({}, 0, outer_info.total_size)
 
     """sum_acc's logical shape is 1D (P,) — pattern has one entry."""
-    dst_pattern = (AccessRange.make({iv_p.var_id: 1}, 0, p_info.tile_size),)
+    dst_pattern = (AccessRange.make({iv_p.var_id: 1}, 0, p_tile),)
     dst_access = BufferAccess(tensor_name=sum_acc_name, iter_var_ids=(iv_p.var_id,), pattern=dst_pattern)
 
-    partials_pattern = (AccessRange.make({iv_p.var_id: 1}, 0, p_info.tile_size), outer_ar)
+    partials_pattern = (AccessRange.make({iv_p.var_id: 1}, 0, p_tile), outer_ar)
     data_access = BufferAccess(tensor_name=partials_name, iter_var_ids=(iv_p.var_id,), pattern=partials_pattern)
 
     """partials has logical shape ``(P, outer)`` — 2D; place_buffers promotes

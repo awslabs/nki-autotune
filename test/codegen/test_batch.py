@@ -143,7 +143,7 @@ def test_enumerate_pool_exhausts_small_graph(monkeypatch: pytest.MonkeyPatch) ->
             param_names=[],
             return_name="",
             tensors={},
-            dims={f"d{tag}": DimInfo(dim_id=f"d{tag}", total_size=tag + 1, tile_size=1, num_tiles=tag + 1)},
+            dims={f"d{tag}": DimInfo(dim_id=f"d{tag}", total_size=tag + 1)},
             body=body,
         )
 

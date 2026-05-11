@@ -218,30 +218,108 @@ def test_canonical_render_iter_var_names_canonical() -> None:
 def test_canonical_render_matmul_sbuf_slices_are_3d() -> None:
     """SBUF/PSUM tensor slices must have 3 dims matching the 3D declaration.
 
-    Regression: post-Task 13 ``place_buffers`` emits 3D SBUF/PSUM shapes
-    ``(P_tile, num_P_slots, F_tile * num_F_tiles)``; the renderer must
-    emit matching 3D slices (``[0:P_tile, slot_index, F_slice]``), not
-    the 2D slice built naively from ``BufferAccess.pattern``. HBM
-    tensors stay 2D with tile-size-scaled starts on every dim.
+    Per-op tiling: each op slices buffers according to its own TILE_LIMITS.
+    NKILoad writes full-F (2048); NKIMatmul reads with M=128/N=512 tiles.
+    Writer tile widths determine SBUF/PSUM buffer shape; each reader slices
+    into those buffers using its own per-op tile widths.
     """
     from nkigym.codegen.render import render
 
     km = build_canonical_module(_matmul_k, _INPUT_SPECS)
     source = render(km)
 
-    """SBUF intermediate: 3D with partition/slot/F convention."""
+    """SBUF intermediates lhs_sbuf/rhs_sbuf: writer is NKILoad with full-F
+    extent (2048). The load emits F-slice = 2048-wide ranges; matmul readers
+    slice with their own M/N tile widths (128 / 512) into the widened
+    F-axis."""
+    assert "lhs_sbuf[0:128, i_d0_0, (i_d1_0) * 2048 : (i_d1_0) * 2048 + 2048]" in source
+    assert "rhs_sbuf[0:128, i_d0_0, (i_d3_0) * 2048 : (i_d3_0) * 2048 + 2048]" in source
+
+    """NKIMatmul reads (M=128, N=512) — slices into the same SBUF tensors
+    with its own tile widths."""
     assert "lhs_sbuf[0:128, i_d0_0, (i_d1_0) * 128 : (i_d1_0) * 128 + 128]" in source
     assert "rhs_sbuf[0:128, i_d0_0, (i_d3_0) * 512 : (i_d3_0) * 512 + 512]" in source
-    assert "sbuf_prod[0:128, i_d1_0, (i_d3_0) * 512 : (i_d3_0) * 512 + 512]" in source
 
-    """PSUM intermediate: same 3D convention (different shape)."""
+    """NKIMatmul writes psum_acc (M=128, N=512)."""
     assert "psum_acc[0:128, i_d1_0, (i_d3_0) * 512 : (i_d3_0) * 512 + 512]" in source
 
-    """HBM params + return: 2D with tile-size-scaled starts on every dim."""
-    assert "lhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, (i_d1_0) * 128 : (i_d1_0) * 128 + 128]" in source
-    assert "rhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, (i_d3_0) * 512 : (i_d3_0) * 512 + 512]" in source
-    assert "hbm_out[(i_d1_0) * 128 : (i_d1_0) * 128 + 128, (i_d3_0) * 512 : (i_d3_0) * 512 + 512]" in source
+    """NKIMemset writes psum_acc with its own (P=128, F=full) tiles — no
+    F limit on NKIMemset."""
+    assert "psum_acc[0:128, i_d1_0, (i_d3_0) * 2048 : (i_d3_0) * 2048 + 2048]" in source
 
-    """Regression guard: the pre-fix 2D SBUF slice pattern must not appear."""
+    """NKITensorCopy (PSUM drain → SBUF) has no F limit — writes sbuf_prod
+    full-F and reads psum_acc full-F."""
+    assert "sbuf_prod[0:128, i_d1_0, (i_d3_0) * 2048 : (i_d3_0) * 2048 + 2048]" in source
+
+    """HBM param / return slices follow the touching op's per-op tile.
+    Loads scale HBM lhs/rhs by (P=128, F=2048)."""
+    assert "lhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, (i_d1_0) * 2048 : (i_d1_0) * 2048 + 2048]" in source
+    assert "rhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, (i_d3_0) * 2048 : (i_d3_0) * 2048 + 2048]" in source
+
+    """NKIStore has no F limit — stores hbm_out full-F."""
+    assert "hbm_out[(i_d1_0) * 128 : (i_d1_0) * 128 + 128, (i_d3_0) * 2048 : (i_d3_0) * 2048 + 2048]" in source
+
+    """Regression guard."""
     assert "lhs_sbuf[i_d0_0 : i_d0_0 + 128" not in source
     assert "psum_acc[i_d1_0 : i_d1_0 + 128" not in source
+
+
+def test_canonical_load_has_full_F_extent() -> None:
+    """NKILoad has no F-axis TILE_LIMIT — canonical must tile F into a
+    single whole-extent iteration, not carry NKIMatmul's M=128 through
+    shared dim_ids. Regression: the old _derive_dims took a global min
+    over ops touching the shared dim."""
+    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    load_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKILoad]
+    assert len(load_blocks) == 2
+    for block in load_blocks:
+        p_iv, f_iv = block.iter_vars
+        assert p_iv.extent == 16, f"expected P trip=16 (2048/128), got {p_iv.extent}"
+        assert f_iv.extent == 1, f"expected F trip=1 (full-extent load), got {f_iv.extent}"
+        f_ar = list(block.writes.values())[0].pattern[-1]
+        assert f_ar.extent == 2048, f"expected F-tile=2048, got {f_ar.extent}"
+
+
+def test_canonical_memset_has_full_F_extent() -> None:
+    """NKIMemset has only P=128 in TILE_LIMITS — its F iter-var must be
+    full-extent under per-op tiling, independent of NKIMatmul's N=512.
+    Guards against any cross-op coupling re-introduced via the
+    memset-on-matmul-PSUM path."""
+    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    memset_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKIMemset]
+    assert len(memset_blocks) == 1
+    block = memset_blocks[0]
+    p_iv, f_iv = block.iter_vars
+    assert p_iv.extent == 16, f"expected P trip=16, got {p_iv.extent}"
+    assert f_iv.extent == 1, f"expected F trip=1 (full-extent memset), got {f_iv.extent}"
+    f_ar = list(block.writes.values())[0].pattern[-1]
+    assert f_ar.extent == 2048, f"expected F-tile=2048, got {f_ar.extent}"
+
+
+def test_canonical_tensor_copy_has_full_F_extent() -> None:
+    """NKITensorCopy (PSUM drain → SBUF) has only P=128 in TILE_LIMITS —
+    its F iter-var must stay full-extent. Guards against coupling via the
+    matmul producer of psum_acc."""
+    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    copy_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKITensorCopy]
+    assert len(copy_blocks) == 1
+    block = copy_blocks[0]
+    p_iv, f_iv = block.iter_vars
+    assert p_iv.extent == 16, f"expected P trip=16, got {p_iv.extent}"
+    assert f_iv.extent == 1, f"expected F trip=1 (full-extent tensor_copy), got {f_iv.extent}"
+    f_ar = list(block.writes.values())[0].pattern[-1]
+    assert f_ar.extent == 2048, f"expected F-tile=2048, got {f_ar.extent}"
+
+
+def test_canonical_store_has_full_F_extent() -> None:
+    """NKIStore has only P=128 in TILE_LIMITS — its F iter-var must be
+    full-extent. Guards against coupling via the matmul producer chain."""
+    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    store_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKIStore]
+    assert len(store_blocks) == 1
+    block = store_blocks[0]
+    p_iv, f_iv = block.iter_vars
+    assert p_iv.extent == 16, f"expected P trip=16, got {p_iv.extent}"
+    assert f_iv.extent == 1, f"expected F trip=1 (full-extent store), got {f_iv.extent}"
+    f_ar = list(block.writes.values())[0].pattern[-1]
+    assert f_ar.extent == 2048, f"expected F-tile=2048, got {f_ar.extent}"

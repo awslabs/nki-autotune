@@ -91,16 +91,12 @@ class Fuse:
         fused_role = max(v_outer.role, v_inner.role, key=_ROLE_RANK.__getitem__)
         v_fused = module.allocate_iter_var(dim_id=fused_dim, extent=fused_extent, role=fused_role)
 
-        """Register synthetic DimInfo. Tile size = min of outer/inner so
-        downstream buffer shape derivation stays conservative; num_tiles
-        equals the fused extent so slot counts match the fused loop trip
-        count."""
-        outer_tile = module.dims[v_outer.dim_id].tile_size
-        inner_tile = module.dims[v_inner.dim_id].tile_size
-        min_tile = min(outer_tile, inner_tile)
-        module.dims[fused_dim] = DimInfo(
-            dim_id=fused_dim, total_size=fused_extent * min_tile, tile_size=min_tile, num_tiles=fused_extent
-        )
+        """Register synthetic DimInfo. Under per-op tiling, trip count
+        lives on v_fused.extent; the synthetic DimInfo only needs its
+        dim_id and total_size. total_size = fused_extent because the
+        fused loop iterates fused_extent times (outer.extent * inner.extent).
+        Buffer sizing consults writer access extents, not this field."""
+        module.dims[fused_dim] = DimInfo(dim_id=fused_dim, total_size=fused_extent)
 
         """Record the decomposition so the renderer can emit
         ``(fused // inner_extent)`` and ``(fused % inner_extent)``."""

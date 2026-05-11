@@ -1,32 +1,29 @@
-"""Buffer placement: compute tensor SBUF/PSUM shapes from iter-var LCA walk.
+"""Buffer placement: compute tensor SBUF/PSUM shapes from writer footprint.
 
-Per-tensor shape derivation:
+Per-tensor shape derivation (per-op tiling model):
 
-- For each ``SBlock`` that touches this tensor, collect enclosing
-  ``ForNode`` iter vars (from forest root down to the block).
-- Find the common iter-var prefix across all accesses -- these iter
-  vars are ancestors above the LCA. Per-dim coverage = product of
-  extents of common-prefix iter vars on that dim.
-- ``required_tiles[dim] = num_tiles[dim] / coverage[dim]``.
-- ``num_slots[dim] = required_tiles[dim] * tensor.buffer_degree.get(dim, 1)``.
+- The writer's BufferAccess is the authority for tile size along each
+  logical dim: ``tile[i] = writer_access.pattern[i].extent``. Non-RMW
+  tensors have exactly one writer; RMW tensors (matmul dst) have one
+  RMW writer whose extent matches all readers by construction. When a
+  tensor has both an RMW and a non-RMW writer (e.g. memset + matmul RMW
+  into the same PSUM), the RMW writer wins — it is the finalising op
+  and its tile fully partitions the tensor.
+- Slot count per dim = ``total_size[dim] // tile[dim]``.
+- Cross-nest coverage: find the common prefix of ancestor iter-vars
+  across every touching block. Prefix iter-vars reduce the required
+  slot count by their extent product.
 - Shape: ``(P_tile, num_P_slots, *middle_slots, F_tile * num_F_tiles)``.
 
-N-D unified path: trivial dims (``num_slots == 1``) stay explicit per
-Q5 decision. A single-tile 2D tensor emits ``(P_tile, 1, F_tile)``.
-
-Param tensors and return-HBM tensors are untouched -- their shape comes
+Param tensors and return-HBM tensors are untouched — their shape comes
 from input_specs / alloc declaration.
 """
 
-from nkigym.codegen.ir import ForNode, IterVar, KernelModule, SBlock, Tensor
+from nkigym.codegen.ir import BufferAccess, ForNode, IterVar, KernelModule, SBlock, Tensor
 
 
 def place_buffers(module: KernelModule) -> None:
-    """Mutate intermediate SBUF/PSUM tensor shapes in place.
-
-    Args:
-        module: KernelModule with iter-var-based body.
-    """
+    """Mutate intermediate SBUF/PSUM tensor shapes in place."""
     for tensor in module.tensors.values():
         if tensor.origin == "param":
             continue
@@ -38,20 +35,26 @@ def place_buffers(module: KernelModule) -> None:
 def _place_one(module: KernelModule, tensor: Tensor) -> None:
     """Derive N-D SBUF/PSUM shape for one intermediate tensor.
 
-    Emits trivial dims explicitly -- a (P, F) tensor with num_P=1 still
-    renders as ``(P_tile, 1, F_tile * num_F_tiles)``. 1D logical tensors
-    (e.g. ``reduce_res``, ``operand0``) promote to 3D ``(P_tile,
-    num_P_slots, 1)`` so NKI's ≥2D SBUF/PSUM requirement is met while the
-    trailing ``1`` preserves the ``(P, 1)`` slice contract required by
-    ``nisa.activation_reduce.reduce_res`` and ``nisa.tensor_scalar.operand0``.
+    1D logical tensors (e.g. ``reduce_res``, ``operand0``) promote to 3D
+    ``(P_tile, num_P_slots, 1)`` so NKI's ≥2D SBUF/PSUM requirement is
+    met while the trailing ``1`` preserves the ``(P, 1)`` slice contract
+    required by ``nisa.activation_reduce.reduce_res`` and
+    ``nisa.tensor_scalar.operand0``.
     """
     accesses = _find_accesses(module, tensor.name)
     if not accesses:
         return
-    required = _required_tiles(module, accesses)
-    p_dim = tensor.dim_ids[0]
+    writer_access = _find_writer_access(module, tensor.name)
+    if writer_access is None or not writer_access.pattern:
+        return
 
-    p_tile = module.dims[p_dim].tile_size
+    per_dim_tile: dict[str, int] = {}
+    for dim_id, ar in zip(tensor.dim_ids, writer_access.pattern):
+        per_dim_tile[dim_id] = ar.extent
+
+    required = _required_tiles(module, accesses, per_dim_tile)
+    p_dim = tensor.dim_ids[0]
+    p_tile = per_dim_tile[p_dim]
     num_p_slots = required.get(p_dim, 1) * tensor.buffer_degree.get(p_dim, 1)
 
     if len(tensor.dim_ids) == 1:
@@ -60,13 +63,51 @@ def _place_one(module: KernelModule, tensor: Tensor) -> None:
 
     f_dim = tensor.dim_ids[-1]
     middle_dims = tensor.dim_ids[1:-1]
-    f_tile = module.dims[f_dim].tile_size
+    f_tile = per_dim_tile[f_dim]
 
     middle_slots = [required.get(d, 1) * tensor.buffer_degree.get(d, 1) for d in middle_dims]
     num_f_tiles = required.get(f_dim, 1) * tensor.buffer_degree.get(f_dim, 1)
 
     shape_parts: list[int] = [p_tile, num_p_slots, *middle_slots, f_tile * num_f_tiles]
     tensor.shape = tuple(shape_parts)
+
+
+def _find_writer_access(module: KernelModule, tensor_name: str) -> BufferAccess | None:
+    """Return the RMW writer's access if any exists; else the first non-RMW writer.
+
+    Under per-op TILE_LIMITS, different writers to the same tensor can
+    carry different tile widths (e.g. NKIMemset writes ``psum_acc`` full-F
+    while NKIMatmul RMW writes it per-N-tile). The RMW writer is the
+    finalising op — its tile fully partitions the tensor and every reader
+    sub-slices compatibly. Pick the RMW writer when present; fall back to
+    the first non-RMW writer (the tensor has exactly one in that case).
+
+    NKIAlloc blocks produce a writes[output] BufferAccess with empty
+    pattern — skip these, as they don't carry tile info. The real writer
+    is the first op that populates the buffer (e.g. NKILoad, NKIMemset).
+    """
+    rmw_writer: BufferAccess | None = None
+    first_non_rmw: BufferAccess | None = None
+
+    def walk(node: ForNode | SBlock) -> None:
+        nonlocal rmw_writer, first_non_rmw
+        if rmw_writer is not None:
+            return
+        if isinstance(node, SBlock):
+            for access in node.reads_writes.values():
+                if access.tensor_name == tensor_name and access.pattern:
+                    rmw_writer = access
+                    return
+            for access in node.writes.values():
+                if access.tensor_name == tensor_name and access.pattern and first_non_rmw is None:
+                    first_non_rmw = access
+            return
+        for child in node.children:
+            walk(child)
+
+    for root in module.body:
+        walk(root)
+    return rmw_writer if rmw_writer is not None else first_non_rmw
 
 
 def _find_accesses(module: KernelModule, tensor_name: str) -> list[tuple[SBlock, tuple[IterVar, ...]]]:
@@ -78,7 +119,6 @@ def _find_accesses(module: KernelModule, tensor_name: str) -> list[tuple[SBlock,
     results: list[tuple[SBlock, tuple[IterVar, ...]]] = []
 
     def walk(node: ForNode | SBlock, ancestors: tuple[IterVar, ...]) -> None:
-        """Pre-order DFS collecting ancestor iter vars for every touching block."""
         if isinstance(node, SBlock):
             touched = (
                 {a.tensor_name for a in node.reads.values()}
@@ -97,14 +137,13 @@ def _find_accesses(module: KernelModule, tensor_name: str) -> list[tuple[SBlock,
     return results
 
 
-def _required_tiles(module: KernelModule, accesses: list[tuple[SBlock, tuple[IterVar, ...]]]) -> dict[str, int]:
-    """Per-dim required tile count based on common-prefix iter vars.
+def _required_tiles(
+    module: KernelModule, accesses: list[tuple[SBlock, tuple[IterVar, ...]]], per_dim_tile: dict[str, int]
+) -> dict[str, int]:
+    """Per-dim required slot count based on common-prefix iter vars.
 
-    Find the common prefix (by iter-var identity) across all access
-    chains -- those are the iter vars above the LCA. Product of their
-    extents on each dim = covered portion; divide ``num_tiles`` by it.
-
-    Dims absent from the common prefix get full ``num_tiles`` (cross-nest).
+    ``slots_per_dim = (total_size // tile) // coverage_prefix_product``
+    with a floor of 1.
     """
     common = _common_prefix(accesses)
     coverage: dict[str, int] = {}
@@ -113,11 +152,12 @@ def _required_tiles(module: KernelModule, accesses: list[tuple[SBlock, tuple[Ite
 
     result: dict[str, int] = {}
     for dim_id, dim in module.dims.items():
+        tile = per_dim_tile.get(dim_id)
+        if tile is None:
+            continue
+        total_slots = dim.total_size // tile
         cov = coverage.get(dim_id, 1)
-        if cov > 0:
-            result[dim_id] = max(1, dim.num_tiles // cov)
-        else:
-            result[dim_id] = dim.num_tiles
+        result[dim_id] = max(1, total_slots // cov) if cov > 0 else total_slots
     return result
 
 

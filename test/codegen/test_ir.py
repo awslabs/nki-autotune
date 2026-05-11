@@ -178,7 +178,7 @@ def test_kernel_module_minimal() -> None:
             name="x", dim_ids=("d0",), shape=(128,), dtype="float32", origin="param", location="hbm", buffer_degree={}
         )
     }
-    dims = {"d0": DimInfo(dim_id="d0", total_size=128, tile_size=128, num_tiles=1)}
+    dims = {"d0": DimInfo(dim_id="d0", total_size=128)}
     m = KernelModule(
         func_name="f", param_names=["x"], return_name="x", tensors=tensors, dims=dims, iter_var_counter=0, body=[]
     )
@@ -324,7 +324,7 @@ def test_validate_rejects_read_before_alloc() -> None:
             buffer_degree={},
         )
     }
-    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    dims = {"d0": DimInfo("d0", 128)}
     m = KernelModule(
         func_name="f",
         param_names=[],
@@ -350,7 +350,7 @@ def test_validate_accepts_alloc_then_write_then_read() -> None:
             buffer_degree={},
         )
     }
-    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    dims = {"d0": DimInfo("d0", 128)}
     alloc_call = NKIOpCall(
         op_cls=NKIAlloc,
         kwargs={"tensor_name": "x", "location": "sbuf", "shape": (128,), "dtype": "float32"},
@@ -390,7 +390,7 @@ def test_validate_param_tensors_are_pre_allocated() -> None:
             buffer_degree={},
         ),
     }
-    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    dims = {"d0": DimInfo("d0", 128)}
     alloc_call = NKIOpCall(
         op_cls=NKIAlloc,
         kwargs={"tensor_name": "out", "location": "hbm", "shape": (128,), "dtype": "float32"},
@@ -436,7 +436,7 @@ def test_validate_rejects_alloc_only_return() -> None:
             buffer_degree={},
         )
     }
-    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    dims = {"d0": DimInfo("d0", 128)}
     alloc_call = NKIOpCall(
         op_cls=NKIAlloc,
         kwargs={"tensor_name": "out", "location": "hbm", "shape": (128,), "dtype": "float32"},
@@ -486,7 +486,7 @@ def test_validate_rejects_read_between_rmw_writes() -> None:
             buffer_degree={},
         ),
     }
-    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    dims = {"d0": DimInfo("d0", 128)}
 
     alloc_psum = SBlock(
         iter_vars=[],
@@ -582,7 +582,7 @@ def test_validate_accepts_read_after_all_rmw_writes() -> None:
             buffer_degree={},
         ),
     }
-    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    dims = {"d0": DimInfo("d0", 128)}
 
     alloc_psum = SBlock(
         iter_vars=[],
@@ -666,9 +666,19 @@ def test_validate_rejects_unwritten_return() -> None:
             buffer_degree={},
         )
     }
-    dims = {"d0": DimInfo("d0", 128, 128, 1)}
+    dims = {"d0": DimInfo("d0", 128)}
     """Empty body — no alloc, no writers → "out" never enters `written`."""
     m = KernelModule(
         func_name="f", param_names=[], return_name="out", tensors=tensors, dims=dims, iter_var_counter=0, body=[]
     )
     assert not validate_dataflow_ordering(m)
+
+
+def test_dim_info_only_carries_dim_id_and_total_size() -> None:
+    """Per-op tiling model: DimInfo holds identity + total extent only."""
+    from dataclasses import fields
+
+    from nkigym.codegen.ir import DimInfo
+
+    field_names = {f.name for f in fields(DimInfo)}
+    assert field_names == {"dim_id", "total_size"}

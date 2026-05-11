@@ -59,12 +59,12 @@ class Tensor:
 
 @dataclass
 class DimInfo:
-    """Concrete dimension metadata."""
+    """Concrete dimension metadata. Tile sizes are per-op and live on
+    ``IterVar.extent`` / ``AccessRange.extent``; this struct only carries
+    dim identity plus its total logical extent."""
 
     dim_id: str
     total_size: int
-    tile_size: int
-    num_tiles: int
 
 
 @dataclass(frozen=True)

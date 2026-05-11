@@ -61,8 +61,9 @@ def _tensor_copy_pair(module) -> tuple[int, int]:
 
 
 def test_fuse_adjacent_par_par_creates_synthetic_dim() -> None:
-    """Fusing the tensor_copy d1(16) > d3(4) pair yields a single ForNode on
-    the synthetic ``d1_x_d3`` dim with extent 64."""
+    """Fusing the tensor_copy d1(16) > d3(1) pair yields a single ForNode on
+    the synthetic ``d1_x_d3`` dim with extent 16. Under per-op tiling,
+    tensor_copy's d3 loop has extent=1, unlike matmul's d3 extent=4."""
     module = build_canonical_module(_matmul_large, _SPECS)
     outer_id, inner_id = _tensor_copy_pair(module)
     atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
@@ -72,30 +73,32 @@ def test_fuse_adjacent_par_par_creates_synthetic_dim() -> None:
     new_subtree = _find_subtree_with_op(new_mod, "NKITensorCopy")
     assert isinstance(new_subtree, ForNode)
     assert new_subtree.iter_var.dim_id == "d1_x_d3"
-    assert new_subtree.iter_var.extent == 16 * 4
+    assert new_subtree.iter_var.extent == 16
 
 
 def test_fuse_registers_synthetic_dim_info() -> None:
-    """The new dim appears in ``module.dims`` with num_tiles equal to the
-    fused extent."""
+    """The new dim appears in ``module.dims`` with total_size equal to the
+    fused extent. Under per-op tiling, tensor_copy's d1×d3 = 16×1 = 16."""
     module = build_canonical_module(_matmul_large, _SPECS)
     outer_id, inner_id = _tensor_copy_pair(module)
     atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
     new_mod = atom.apply(module)
     assert "d1_x_d3" in new_mod.dims
-    assert new_mod.dims["d1_x_d3"].num_tiles == 64
+    """Synthetic dim lives in module.dims with total_size = fused extent."""
+    assert new_mod.dims["d1_x_d3"].total_size == 16
 
 
 def test_fuse_renderer_emits_div_and_mod() -> None:
-    """The rendered source opens ``for i_d1_x_d3_0 in range(64):`` and the
-    body's slot expressions spell the div/mod decomposition."""
+    """The rendered source opens ``for i_d1_x_d3_0 in range(16):`` and the
+    body's slot expressions spell the div/mod decomposition. Under per-op
+    tiling, tensor_copy's d3 has extent=1, so the modulus is 1."""
     module = build_canonical_module(_matmul_large, _SPECS)
     outer_id, inner_id = _tensor_copy_pair(module)
     atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
     new_mod = atom.apply(module)
     source = render(new_mod)
-    assert "for i_d1_x_d3_0 in range(64):" in source
-    assert "// 4" in source or "% 4" in source
+    assert "for i_d1_x_d3_0 in range(16):" in source
+    assert "// 1" in source or "% 1" in source
 
 
 def test_fuse_non_adjacent_rejects() -> None:
