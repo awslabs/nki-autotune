@@ -42,6 +42,7 @@ from dataclasses import dataclass, replace
 from nkigym.codegen.ir import DimInfo, ForNode, IterVar, KernelModule, SBlock, TreeIR, replace_at_path
 from nkigym.ops.base import AxisRole
 from nkigym.tune import AtomLegalityError
+from nkigym.tune.split import _abstract_axis_for, _op_cls_for_block
 
 _ROLE_RANK: dict[AxisRole, int] = {AxisRole.PARALLEL: 0, AxisRole.SEQUENTIAL: 1, AxisRole.ACCUMULATION: 2}
 """Role lattice ``PAR ⊂ SEQ ⊂ ACC``. Fusion takes the max rank."""
@@ -61,7 +62,16 @@ class Fuse:
     inner_iter_var_id: int
 
     def is_legal(self, module: KernelModule) -> bool:
-        """Structural + role preconditions."""
+        """Structural + role preconditions + MIN/MAX tile check when fuse touches innermost.
+
+        If the inner loop is the innermost tile loop for any descendant
+        leaf (i.e. its iter-var is the last one for its dim in the leaf's
+        ``iter_vars``), the fused extent must satisfy ``MIN <=
+        fused_extent <= MAX`` for that leaf's op on the corresponding
+        abstract axis. When the fuse crosses different dim ids the
+        resulting synthetic dim has no op-axis mapping; in that case the
+        MIN/MAX check is skipped.
+        """
         pair = _find_pair(module, self.outer_iter_var_id, self.inner_iter_var_id)
         result = False
         if pair is not None:
@@ -69,8 +79,33 @@ class Fuse:
             role_a = outer.iter_var.role
             role_b = inner.iter_var.role
             if role_a != AxisRole.SEQUENTIAL and role_b != AxisRole.SEQUENTIAL:
-                result = True
+                result = self._check_min_max(outer, inner)
         return result
+
+    def _check_min_max(self, outer: ForNode, inner: ForNode) -> bool:
+        """Validate fused extent against MIN/MAX bounds when fuse touches an innermost.
+
+        Cases:
+            - ``d_o == d_i`` and ``inner`` is the last iter-var for this
+              dim in a descendant leaf's ``iter_vars``: post-fuse the new
+              innermost for this leaf becomes the fused iter-var, so its
+              extent must be in ``[MIN, MAX]`` for the leaf's op on that
+              abstract axis.
+            - ``d_o != d_i`` (cross-dim fuse): the resulting iter-var
+              carries a synthetic dim id not present in any op's
+              ``axis_map``. The leaf no longer has individual iter-vars
+              for the retired dims; MIN/MAX checks against the synthetic
+              dim are not meaningful, so skip.
+        """
+        d_o = outer.iter_var.dim_id
+        d_i = inner.iter_var.dim_id
+        legal = True
+        if d_o == d_i:
+            fused_dim = d_o
+            fused_extent = outer.iter_var.extent * inner.iter_var.extent
+            inner_id = inner.iter_var.var_id
+            legal = _walk_leaves_for_min_max(inner.children, fused_dim, inner_id, fused_extent)
+        return legal
 
     def apply(self, module: KernelModule) -> KernelModule:
         """Execute the fuse.
@@ -144,6 +179,42 @@ def _find_pair(module: KernelModule, outer_id: int, inner_id: int) -> tuple[ForN
             discovered = found
             break
     return discovered
+
+
+def _walk_leaves_for_min_max(
+    children: list[ForNode | SBlock], fused_dim: str, inner_id: int, fused_extent: int
+) -> bool:
+    """Walk a ForNode's descendants; for each SBlock whose innermost
+    iter-var for ``fused_dim`` is the fuse's inner iter-var, check the
+    fused extent against ``MIN``/``MAX`` on the op's abstract axis.
+    """
+    legal = True
+
+    def visit(node: ForNode | SBlock) -> None:
+        nonlocal legal
+        if not legal:
+            return
+        if isinstance(node, SBlock):
+            ivs_for_dim = [iv for iv in node.iter_vars if iv.dim_id == fused_dim]
+            if not ivs_for_dim or ivs_for_dim[-1].var_id != inner_id:
+                return
+            abstract_axis = _abstract_axis_for(node, fused_dim)
+            op_cls = _op_cls_for_block(node)
+            if abstract_axis is None or op_cls is None:
+                return
+            min_tile = op_cls.MIN_TILE_SIZE.get(abstract_axis)
+            max_tile = op_cls.MAX_TILE_SIZE.get(abstract_axis)
+            if min_tile is not None and fused_extent < min_tile:
+                legal = False
+            if max_tile is not None and fused_extent > max_tile:
+                legal = False
+        else:
+            for c in node.children:
+                visit(c)
+
+    for c in children:
+        visit(c)
+    return legal
 
 
 def _collapse_iter_var_lists(body: TreeIR, outer_id: int, inner_id: int, v_fused: IterVar) -> TreeIR:

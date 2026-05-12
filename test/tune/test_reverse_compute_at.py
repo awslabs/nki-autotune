@@ -199,10 +199,12 @@ def test_enumerate_reverse_compute_at_atoms_yields_legal_only() -> None:
 def test_reverse_compute_at_unmatched_suffix_forms_inner_fornodes() -> None:
     """Block's iter vars beyond the matched prefix become nested ForNodes.
 
-    Store has iter_vars (d1-PAR, d3-PAR). Moving under tensor_copy's
-    root d1 ForNode matches the d1 pair (prefix length 1). The store's
-    d3 iter var remains in block's iter_vars list, wrapped in a fresh
-    ForNode as the new block subtree's outermost loop.
+    Store has iter_vars ``[d1_outer, d1_inner, d3_outer, d3_inner]``
+    (Task 4: each dim yields outer+inner). Target (tensor_copy's root
+    d1 ForNode) has a single d1 ForNode ancestor — prefix match is
+    length 1, matching only the block's d1 outer. The remaining suffix
+    ``[d1_inner, d3_outer, d3_inner]`` stays in the relocated block's
+    ``iter_vars`` and becomes nested ForNodes.
     """
     module = build_canonical_module(_matmul_large, _SPECS)
     store_path = _find_block_with_op(module, "NKIStore")
@@ -216,10 +218,13 @@ def test_reverse_compute_at_unmatched_suffix_forms_inner_fornodes() -> None:
             relocated = node
             break
     assert relocated is not None
-    """Unmatched suffix: d3 iter var remains in iter_vars; d1 merged."""
+    """Unmatched suffix: d3 outer+inner remain, plus d1 inner (target's
+    ancestor chain only covers d1 outer)."""
     remaining_dims = [iv.dim_id for iv in relocated.iter_vars]
     assert "d3" in remaining_dims
-    assert "d1" not in remaining_dims, "d1 iter var should have been merged with target's"
+    assert (
+        remaining_dims.count("d1") == 1
+    ), f"expected d1 outer merged, inner remaining (1 d1 left); got {remaining_dims}"
 
 
 def test_reverse_compute_at_role_promotion_on_matmul_under_load() -> None:

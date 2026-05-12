@@ -62,7 +62,8 @@ Every op class in `nkigym/src/nkigym/ops/` declares its ISA signature at the cla
 | `INPUT_OPERANDS` | Read-only slots → `BodyLeaf.reads`. |
 | `RMW_OPERANDS` | Read-modify-write slots → `BodyLeaf.reads_writes`. |
 | `AXIS_ROLES` | Abstract axis → `AxisRole` (omitted ⇒ `PARALLEL`). |
-| `TILE_LIMITS` | Per-axis HW tile size cap. |
+| `MIN_TILE_SIZE` | Per-axis minimum tile size for the innermost loop. |
+| `MAX_TILE_SIZE` | Per-axis maximum tile size for the innermost loop (`None` = unbounded). |
 | `RFACTOR_RECIPE` | `"rmw"` (matmul), `"slot"` (activation_reduce), or `None`. |
 
 | Class | ISA call | Purpose |
@@ -82,7 +83,7 @@ Every op class in `nkigym/src/nkigym/ops/` declares its ISA signature at the cla
 
 ## 4. Unified example
 
-Everything below uses one kernel: `lhs_T.T @ rhs` with `K=512, M=256, N=1024`. Tile sizes are the HW caps: `K=128, M=128, N=512`. That yields `d0(K): num_tiles=4`, `d1(M): num_tiles=2`, `d3(N): num_tiles=2`.
+Everything below uses one kernel: `lhs_T.T @ rhs` with `K=512, M=256, N=1024`. The matmul's maximum tile sizes are `K=128, M=128, N=512`. That yields `d0(K): num_tiles=4`, `d1(M): num_tiles=2`, `d3(N): num_tiles=2`.
 
 ```python
 @nkigym_kernel
@@ -102,18 +103,18 @@ def matmul_lhsT_rhs_demo(lhs_T, rhs):
     return hbm_out
 ```
 
-`build_canonical_module` parses the AST, unifies abstract axes (`K`, `M`, `N`) into concrete dim ids (`d0`, `d1`, `d3`), derives per-dim tile sizes from `NKIOp.TILE_LIMITS`, tags tensor origins, and builds the canonical forest.
+`build_canonical_module` parses the AST, unifies abstract axes (`K`, `M`, `N`) into concrete dim ids (`d0`, `d1`, `d3`), derives per-dim tile sizes from `NKIOp.MIN_TILE_SIZE` and `NKIOp.MAX_TILE_SIZE`, tags tensor origins, and builds the canonical forest.
 
 ### 4.1 Canonical form
 
-Alloc leaves sit at the forest root in source order. Each compute/copy op gets its own 1N-per-dim loop nest: one `LoopNode` per `(dim, nest-position)` with `trip_count = num_tiles`. No trip-1 tile partners — arithmetic-intensity dials live in `Split`, never in canonical form.
+Alloc leaves sit at the forest root in source order. Each compute/copy op gets its own per-dim loop nest built from the op's `MIN_TILE_SIZE` and `MAX_TILE_SIZE`: for each axis, an outer loop with `trip_count = num_tiles = axis_extent / MAX_TILE_SIZE` (or `trip_count = 1` if `MAX_TILE_SIZE` is `None`) and an inner tile loop with `trip_count = MAX_TILE_SIZE` (or `trip_count = axis_extent` if unbounded). The canonical builder emits both loops explicitly. The renderer later elides the innermost tile loop, absorbing its extent as the slice width on the ISA call.
 
 ![Canonical tree](diagrams/tree-canonical.png)
 
 ```text
 body:
   Alloc lhs_T_sbuf, rhs_sbuf, psum_acc, sbuf_prod, hbm_out          (5 root leaves)
-  Loop d0/PAR trip=4 → Loop d1/PAR trip=2 → NKILoad(lhs_T)
+  Loop d0/PAR trip=4 → Loop d1/PAR trip=2 → NKILoad(lhs_T)         (simplified: each shows outer loop only)
   Loop d0/PAR trip=4 → Loop d3/PAR trip=2 → NKILoad(rhs)
   Loop d1/PAR trip=2 → Loop d3/PAR trip=2 → NKIMemset(psum_acc)
   Loop d0/ACC trip=4 → Loop d1/PAR trip=2 → Loop d3/PAR trip=2 → NKIMatmul
@@ -173,9 +174,9 @@ Nine rewrite atoms, grouped TVM-style into three categories.
 
 | Atom | What it does | Legality |
 |---|---|---|
-| `Split` | Partitions a loop into `outer × inner` when `factor` divides `trip_count`. | Target is a `LoopNode`, `factor ∈ [1, trip_count]`, `trip_count % factor == 0`. Non-divisors raise `AtomLegalityError` — no tail siblings, no predication. |
-| `Reorder` | Swaps an outer `LoopNode` with its unique `LoopNode` child. | Perfect-nest shape + role commutes: `PAR × PAR` always; `ACC × ACC` iff same `reduce_op`; `PAR × ACC` iff subtree is pure w.r.t. the PAR dim; `SEQ` never. |
-| `Fuse` | Flattens nested iters into one synthetic dim. | Excluded from the default sampler (synthetic-dim leaks). |
+| `Split` | Partitions a loop into `outer × inner` when `factor` divides `trip_count`. | Target is a `ForNode`, `1 < factor < trip_count`, `trip_count % factor == 0`. For every op leaf whose tile-axis innermost loop is the target, the new innermost extent must satisfy `MIN_TILE_SIZE ≤ extent ≤ MAX_TILE_SIZE`. Non-divisors raise `AtomLegalityError` — no tail siblings, no predication. |
+| `Reorder` | Swaps an outer `ForNode` with its unique `ForNode` child. | Perfect-nest shape + role commutes: `PAR × PAR` always; `ACC × ACC` iff same `reduce_op`; `PAR × ACC` iff subtree is pure w.r.t. the PAR dim; `SEQ` never. |
+| `Fuse` | Flattens adjacent nested loops on the same axis into one loop whose extent is the product of the inputs. | All input loops are adjacent ancestors on the same axis. For every op leaf affected by the fuse, the new innermost tile extent on that axis must satisfy `MIN_TILE_SIZE ≤ extent ≤ MAX_TILE_SIZE`. |
 
 ### Placement — computation scope
 
@@ -325,6 +326,34 @@ Total firings match the un-pipelined case (`N=2` iters for each stage). The `% 4
 5. **`emit_source`** — top-level walker. Opens / closes `for` headers; delegates each `BodyLeaf` to its emitter.
 
 The renderer is mechanical: every `LoopNode` emits, every leaf emits exactly one ISA call, `NKIAlloc` emits `<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=<location>)` at the leaf's tree position. No implicit rewrites.
+
+### 7.1 Innermost Tile Loop Elision
+
+The canonical builder emits **two** nested `ForNode`s per op axis: an outer trip loop with extent `axis_extent / MAX_TILE_SIZE[axis]` and an inner tile loop with extent `MAX_TILE_SIZE[axis]`. For unbounded axes (`MAX_TILE_SIZE[axis] is None`), the outer has trip 1 and the inner has the full extent.
+
+The renderer (`emit_source.py`) walks the tree and collects the set of innermost-tile iter-var IDs per op leaf. For any `ForNode` whose iter-var is the innermost tile of at least one descendant leaf, the renderer emits no `for` header — the iter-var's extent is consumed as the slice width on the ISA call's buffer-access pattern.
+
+This pattern mirrors TVM's `Tensorize` primitive: in TVM every loop is scalar, and `Tensorize(loop, intrin_name)` replaces the inner loop with the intrinsic call. nkigym's renderer performs the equivalent "tensorize" step implicitly based on `MAX_TILE_SIZE` metadata on the op class.
+
+**Example:** For a matmul with `M=256, MAX_TILE_SIZE["M"]=128`, the canonical builder emits:
+
+```python
+Loop d_M outer trip=2
+  Loop d_M inner trip=128
+    NKIMatmul(...)
+```
+
+The renderer identifies the inner `d_M` loop as the innermost tile loop for the matmul's M axis. It emits:
+
+```python
+for i_d_M_0 in range(2):   # outer trip loop
+    nisa.nc_matmul(
+        dst=psum_acc[0:128, i_d_M_0, ...],   # slice width = 128 from the elided inner loop
+        ...
+    )
+```
+
+The inner loop does not appear as a `for` statement; its extent `128` becomes the slice width `0:128` on the ISA call.
 
 ## 8. `validate_dataflow_ordering`
 

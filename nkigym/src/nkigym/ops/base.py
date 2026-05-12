@@ -111,7 +111,6 @@ class NKIOp:
             accumulate without narrowing.
         AXIS_ROLES: Per-op axis → role classification. Omitted axes default
             to ``AxisRole.PARALLEL``.
-        TILE_LIMITS: Hardware tile size per abstract axis.
     """
 
     NAME: ClassVar[str] = ""
@@ -119,7 +118,23 @@ class NKIOp:
     OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     OUTPUT_DTYPES: ClassVar[dict[str, str]] = {}
     AXIS_ROLES: ClassVar[dict[str, "AxisRole"]] = {}
-    TILE_LIMITS: ClassVar[dict[str, int]] = {}
+
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {}
+    """Minimum legal innermost-tile extent per abstract axis.
+
+    Going below this extent is a hardware- or performance-floor violation.
+    Split/Fuse reject atoms that would produce a smaller innermost tile.
+    Empty = no floor for any axis (legal by default).
+    """
+
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {}
+    """Maximum legal innermost-tile extent per abstract axis.
+
+    ``None`` means unbounded. Canonical build picks the largest legal tile
+    (``MAX`` when set, full extent when unset). Split/Fuse reject atoms
+    that would produce a larger innermost tile.
+    Empty = no cap for any axis.
+    """
 
     RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset()
     """Operand slot names that this op reads AND writes (RMW semantics).

@@ -207,10 +207,12 @@ def test_compute_at_role_promotion_allocates_fresh_iter_var() -> None:
 def test_compute_at_unmatched_suffix_forms_inner_fornodes() -> None:
     """Block's iter vars beyond the matched prefix become nested ForNodes.
 
-    rhs_sbuf load has iter_vars (d0_par, d3_par). Moving under matmul's
-    d0 ACC means the d0 pair is matched (prefix length 1). The load's
-    d3 iter var remains in block's iter_vars list, wrapped in a fresh
-    ForNode as the new block subtree's outermost loop.
+    rhs_sbuf load has iter_vars ``[d0_outer, d0_inner, d3_outer, d3_inner]``
+    (Task 4: each dim yields outer+inner). Target (matmul's d0 ACC) has
+    a single d0 ForNode ancestor — prefix match is length 1, matching
+    only the block's d0 outer. The remaining suffix ``[d0_inner, d3_outer,
+    d3_inner]`` stays in the relocated block's ``iter_vars`` and becomes
+    nested ForNodes as the new subtree.
     """
     module = build_canonical_module(_matmul_large, _SPECS)
     load_path = _find_block_writing(module, "rhs_sbuf")
@@ -227,7 +229,10 @@ def test_compute_at_unmatched_suffix_forms_inner_fornodes() -> None:
                 relocated = node
                 break
     assert relocated is not None
-    """Unmatched suffix: d3 iter var remains in iter_vars."""
+    """Unmatched suffix: d3 outer+inner remain, plus d0 inner (target's
+    ancestor chain only covers d0 outer)."""
     remaining_dims = [iv.dim_id for iv in relocated.iter_vars]
     assert "d3" in remaining_dims
-    assert "d0" not in remaining_dims, "d0 iter var should have been merged with target's"
+    assert (
+        remaining_dims.count("d0") == 1
+    ), f"expected d0 outer merged, inner remaining (1 d0 left); got {remaining_dims}"

@@ -14,7 +14,7 @@ from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.tune.verify import _verify, _verify_fns
 
-K, M, N = 128, 128, 128
+K, M, N = 512, 512, 512
 
 
 @nkigym_kernel

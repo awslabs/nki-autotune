@@ -18,7 +18,8 @@ class NKILoad(NKIOp):
     ``src.size == dst.size`` and partition-dim validation. Only the
     partition axis is capped by the NeuronCore's 128-partition SBUF
     layout; the free axis is unbounded."""
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_ROLE: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:

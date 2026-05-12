@@ -46,14 +46,57 @@ class Split:
     factor: int
 
     def is_legal(self, module: KernelModule) -> bool:
-        """Structural + divisibility preconditions."""
+        """Structural + divisibility preconditions + MIN/MAX tile check.
+
+        The split targets a ForNode. If the target is an innermost tile
+        loop for any leaf beneath it (in that leaf's ``iter_vars``, the
+        target's iter-var is the last one for its dim), the new inner
+        extent (``factor``) must satisfy ``MIN ≤ factor ≤ MAX`` for
+        every such leaf's op class on that axis.
+        """
         target = resolve_node(module.body, self.loop_path)
         result = False
         if isinstance(target, ForNode):
             iv = target.iter_var
             if 1 < self.factor < iv.extent and iv.extent % self.factor == 0:
-                result = True
+                result = self._check_min_max(target)
         return result
+
+    def _check_min_max(self, target: ForNode) -> bool:
+        """Walk descendants; for each SBlock whose ``iter_vars`` has
+        ``target.iter_var`` as its innermost for its dim, check
+        ``factor ∈ [MIN, MAX]`` for the op's abstract axis."""
+        target_id = target.iter_var.var_id
+        target_dim = target.iter_var.dim_id
+        legal = True
+
+        def visit(node: ForNode | SBlock) -> None:
+            nonlocal legal
+            if not legal:
+                return
+            if isinstance(node, SBlock):
+                abstract_axis = _abstract_axis_for(node, target_dim)
+                if abstract_axis is None:
+                    return
+                ivs_for_dim = [iv for iv in node.iter_vars if iv.dim_id == target_dim]
+                if not ivs_for_dim or ivs_for_dim[-1].var_id != target_id:
+                    return
+                op_cls = _op_cls_for_block(node)
+                if op_cls is None:
+                    return
+                min_tile = op_cls.MIN_TILE_SIZE.get(abstract_axis)
+                max_tile = op_cls.MAX_TILE_SIZE.get(abstract_axis)
+                if min_tile is not None and self.factor < min_tile:
+                    legal = False
+                if max_tile is not None and self.factor > max_tile:
+                    legal = False
+            else:
+                for c in node.children:
+                    visit(c)
+
+        for c in target.children:
+            visit(c)
+        return legal
 
     def apply(self, module: KernelModule) -> KernelModule:
         """Execute the split; return a new module with rewired body + new iter vars.
@@ -196,3 +239,26 @@ def enumerate_split_atoms(module: KernelModule) -> list[Split]:
     for i, root in enumerate(module.body):
         walk(root, (i,))
     return atoms
+
+
+def _abstract_axis_for(block: SBlock, dim_id: str) -> str | None:
+    """Look up the op's abstract axis name corresponding to ``dim_id``.
+
+    Stored in ``block.annotations['axis_map']`` as ``{abstract -> dim_id}``
+    by the canonical builder.
+    """
+    axis_map = block.annotations.get("axis_map", {})
+    result: str | None = None
+    for abstract, d in axis_map.items():
+        if d == dim_id:
+            result = abstract
+            break
+    return result
+
+
+def _op_cls_for_block(block: SBlock) -> type | None:
+    """Return the NKIOp subclass for this block, from the first NKIOpCall."""
+    result = None
+    if block.body:
+        result = block.body[0].op_cls
+    return result

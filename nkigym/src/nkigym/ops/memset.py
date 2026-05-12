@@ -17,7 +17,8 @@ class NKIMemset(NKIOp):
     NAME: ClassVar[str] = "memset"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset()
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
 
     def _output_role(self, **kwargs: Any) -> str:
         """Return the role of ``dst`` unchanged (memset does not change residency)."""

@@ -24,7 +24,8 @@ class NKITranspose(NKIOp):
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     """Tensor Engine caps the input at 128×128; Vector Engine at 32×32.
     We target Tensor Engine, so both axes are capped at 128."""
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": 128}
     OUTPUT_ROLE: ClassVar[str] = "psum"
 
     def _check_roles(self, **kwargs: Any) -> None:

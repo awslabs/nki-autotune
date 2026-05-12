@@ -27,7 +27,8 @@ class NKIDMATranspose(NKIOp):
     ``src.shape[0]==16`` and ``src.shape[-1] % 128 == 0``, SWDGE's
     ``src.shape[-1] <= 128``) are selected by the lowering mode, not
     the op's tile limits."""
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` may be HBM param (``LoadTranspose`` rewrite) or SBUF."""

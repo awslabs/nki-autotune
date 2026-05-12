@@ -75,7 +75,7 @@ def _place_one(module: KernelModule, tensor: Tensor) -> None:
 def _find_writer_access(module: KernelModule, tensor_name: str) -> BufferAccess | None:
     """Return the RMW writer's access if any exists; else the first non-RMW writer.
 
-    Under per-op TILE_LIMITS, different writers to the same tensor can
+    Under per-op tile sizes, different writers to the same tensor can
     carry different tile widths (e.g. NKIMemset writes ``psum_acc`` full-F
     while NKIMatmul RMW writes it per-N-tile). The RMW writer is the
     finalising op — its tile fully partitions the tensor and every reader

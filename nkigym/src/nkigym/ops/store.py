@@ -16,7 +16,8 @@ class NKIStore(NKIOp):
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     """Same story as ``NKILoad``: ``nisa.dma_copy`` only caps the
     partition axis (128) — the free axis is unbounded."""
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"P": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_ROLE: ClassVar[str] = "stored"
 
     def _check_roles(self, **kwargs: Any) -> None:

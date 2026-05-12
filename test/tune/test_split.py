@@ -124,9 +124,14 @@ def test_split_rewrites_buffer_access_patterns() -> None:
 
 
 def test_split_updates_sblock_iter_vars() -> None:
-    """The SBlock whose iter_vars list contained v now contains (v_outer, v_inner)."""
+    """After splitting the d0 outer trip ForNode, the SBlock's iter_vars
+    list replaces the original d0 outer (extent=16) with the pair
+    (v_outer_outer=4, v_outer_inner=4), plus the canonical d0 inner tile
+    iter-var (extent=128) stays intact. Total: 3 d0 iter-vars."""
     module = build_canonical_module(_matmul_large, _SPECS_LARGE)
-    """Find the matmul SBlock's d0 iter var (extent=16 ACCUMULATION)."""
+    """Find the matmul SBlock's d0 outer-trip iter var (extent=16
+    ACCUMULATION). The matmul spine post-Task 4 has d0_outer (extent=16)
+    > d0_inner (extent=128); we split the outer."""
     from nkigym.ops.base import AxisRole
 
     mm_path = _find_first_for_path(
@@ -149,11 +154,12 @@ def test_split_updates_sblock_iter_vars() -> None:
     for root in new_mod.body:
         collect_blocks(root, blocks)
     mm_block = next(b for b in blocks if any(c.op_cls.__name__ == "NKIMatmul" for c in b.body))
-    """d0 iter var now shows up TWICE in the SBlock's iter_vars list (outer + inner)."""
+    """d0 appears 3 times: (v_outer_outer=4, v_outer_inner=4) from the
+    split + the canonical d0 inner tile (extent=128)."""
     d0_ivs = [iv for iv in mm_block.iter_vars if iv.dim_id == "d0"]
-    assert len(d0_ivs) == 2
-    extents = {iv.extent for iv in d0_ivs}
-    assert extents == {4}
+    assert len(d0_ivs) == 3
+    extents = sorted(iv.extent for iv in d0_ivs)
+    assert extents == [4, 4, 128]
 
 
 def test_enumerate_split_atoms_yields_divisor_factors_per_loop() -> None:
@@ -197,3 +203,76 @@ def test_split_apply_preserves_sblock_annotations() -> None:
         if isinstance(inner_child, ForNode):
             inner_has = inner_child.annotations.get("test_key") == "preserved"
     assert outer_has or inner_has
+
+
+def test_split_rejects_when_innermost_goes_below_min_tile() -> None:
+    """Splitting a fixed-tile innermost loop (matmul M inner, extent=128) further is illegal.
+
+    Matmul M: MIN=MAX=128. Inner tile loop has extent 128 already; any split factor would
+    produce factor<128 (since factor must be a proper divisor), violating MIN=128.
+    """
+    module = build_canonical_module(_matmul_large, _SPECS_LARGE)
+
+    def find_inner_matmul_m(module):
+        """Return path to the deepest ForNode with dim_id=d1 extent=128 whose
+        descendants include a matmul SBlock."""
+        candidates: list[tuple[int, ...]] = []
+
+        def has_matmul(n):
+            result = False
+            if isinstance(n, SBlock):
+                result = bool(n.body) and n.body[0].op_cls.__name__ == "NKIMatmul"
+            elif isinstance(n, ForNode):
+                result = any(has_matmul(c) for c in n.children)
+            return result
+
+        def scan(node, path):
+            if isinstance(node, ForNode):
+                iv = node.iter_var
+                if iv.extent == 128 and iv.dim_id == "d1" and has_matmul(node):
+                    candidates.append(path)
+                for i, c in enumerate(node.children):
+                    scan(c, path + (i,))
+
+        for i, r in enumerate(module.body):
+            scan(r, (i,))
+        assert candidates, "no matmul d1 extent=128 ForNode"
+        return max(candidates, key=len)
+
+    path = find_inner_matmul_m(module)
+    """factor=2 would make the new inner extent 2 < MIN=128; must be rejected."""
+    atom = Split(loop_path=path, factor=2)
+    assert atom.is_legal(module) is False
+
+
+def test_split_accepts_outer_loop_split() -> None:
+    """Splitting an OUTER trip loop doesn't affect any leaf's innermost; should be legal."""
+    module = build_canonical_module(_matmul_large, _SPECS_LARGE)
+
+    def find_outer_M(module):
+        """Find an outer matmul M loop (extent = 2048/128 = 16, dim=d1, NOT the innermost)."""
+        result = None
+
+        def walk(node, path):
+            nonlocal result
+            if result is not None:
+                return
+            if isinstance(node, ForNode):
+                iv = node.iter_var
+                if iv.extent == 16 and iv.dim_id == "d1":
+                    result = path
+                    return
+                for i, c in enumerate(node.children):
+                    walk(c, path + (i,))
+
+        for i, root in enumerate(module.body):
+            walk(root, (i,))
+            if result is not None:
+                break
+        return result
+
+    path = find_outer_M(module)
+    assert path is not None
+    """16 = 4 * 4, outer split, innermost unchanged."""
+    atom = Split(loop_path=path, factor=4)
+    assert atom.is_legal(module) is True

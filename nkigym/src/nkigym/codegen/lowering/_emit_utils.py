@@ -27,7 +27,7 @@ decomposes retired references into ``(fused // inner_extent)`` for the
 outer component and ``(fused % inner_extent)`` for the inner component.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from nkigym.codegen.ir import AccessRange, BufferAccess, KernelModule, Tensor
 
@@ -71,11 +71,24 @@ class EmitCtx:
             slice-emission helpers consult ``module.fused_iter_var_map``
             to decompose retired outer/inner iter-var references into
             ``(fused // inner_extent)`` / ``(fused % inner_extent)``.
+        innermost_tile_ids: Set of :class:`IterVar` ``var_id``\\ s that
+            are the innermost tile loop for their respective axis at a
+            descendant :class:`SBlock`. When the walker enters a ForNode
+            whose iter-var is in this set, it elides the ``for`` header
+            and binds the iter-var's name to ``"0"`` (the semantically
+            correct symbolic value). The iter-var's ``extent`` is
+            consumed as the slice width on the ISA call's buffer-access
+            pattern. :func:`_emit_affine_start` and
+            :func:`_emit_index_expr` detect elision by membership in
+            this set (not by string-matching the bound name) so the
+            ``"0"`` binding remains a robust symbolic value rather than
+            a sentinel.
     """
 
     iter_var_to_name: dict[int, str]
     tensors: dict[str, Tensor]
     module: KernelModule
+    innermost_tile_ids: set[int] = field(default_factory=set)
 
 
 def _resolve_iv_name(iv_id: int, ctx: EmitCtx) -> str:
@@ -130,15 +143,20 @@ def emit_slice(tensor: Tensor, access: BufferAccess, ctx: EmitCtx) -> str:
 
 
 def _emit_slice_hbm(tensor: Tensor, access: BufferAccess, ctx: EmitCtx) -> str:
-    """Flat HBM slice: every dim emits a tile-size-scaled affine range.
+    """Flat HBM slice: every dim emits the physical affine range.
 
     HBM tensors keep their declared logical shape, so the number of
-    slice dims matches ``len(access.pattern)``. Each dim's iter var is
-    a tile index; the byte/element start = ``iv * tile_size``.
+    slice dims matches ``len(access.pattern)``. Each :class:`AccessRange`
+    carries per-iter-var coefficients already in physical-address units
+    (Task 4: outer coeff = tile, inner coeff = 1), so the affine start is
+    just ``sum(coeff_i * iv_i) + const_offset``. The slice width is
+    ``ar.extent`` (the innermost tile width; the inner iter-var is
+    elided to ``0`` by :func:`_emit_node`, so it contributes nothing to
+    the start).
     """
     slice_parts: list[str] = []
     for ar in access.pattern:
-        start = _emit_scaled_affine_start(ar, ctx, ar.extent)
+        start = _emit_affine_start(ar, ctx)
         slice_parts.append(f"{start} : {start} + {ar.extent}")
     return f"{tensor.name}[{', '.join(slice_parts)}]"
 
@@ -177,7 +195,7 @@ def _emit_slice_sbuf_psum(tensor: Tensor, access: BufferAccess, ctx: EmitCtx) ->
         middle_slots.append(_emit_index_expr(ar, ctx))
 
     f_ar = access.pattern[-1]
-    f_start = _emit_scaled_affine_start(f_ar, ctx, f_ar.extent)
+    f_start = _emit_affine_start(f_ar, ctx)
     f_slice = f"{f_start} : {f_start} + {f_ar.extent}"
 
     parts = [partition_slice, p_slot, *middle_slots, f_slice]
@@ -185,10 +203,18 @@ def _emit_slice_sbuf_psum(tensor: Tensor, access: BufferAccess, ctx: EmitCtx) ->
 
 
 def _emit_index_expr(ar: AccessRange, ctx: EmitCtx) -> str:
-    """Emit a bare integer index expression (no extent scaling, no slice).
+    """Emit a bare integer slot-index expression (no extent scaling, no slice).
 
-    Used for SBUF/PSUM slot axes. For a simple 1:1 access (one iter var,
-    coeff 1, offset 0) the result is just the iter var name.
+    Used for SBUF/PSUM slot axes (dim 1 and middle dims), where the
+    physical index into the buffer is the *slot number*, not the
+    physical byte offset. Under Task 4's IR the :class:`AccessRange`
+    along a slot axis carries coefficients in physical-address units
+    (``outer_coeff = tile``, ``inner_coeff = 1``), so to recover the
+    slot index we divide each iter-var coefficient by ``ar.extent``
+    (the tile width). The outer iter-var's coefficient divides cleanly
+    to ``1``, yielding just the iter-var name; the inner iter-var is
+    elided (its ``var_id`` is recorded in :attr:`EmitCtx.innermost_tile_ids`)
+    and contributes nothing to the slot index.
 
     When the access has no iter-var coefficients and ``extent > 1``, the
     block-level access spans the full slot dimension — emit an explicit
@@ -197,12 +223,18 @@ def _emit_index_expr(ar: AccessRange, ctx: EmitCtx) -> str:
     middle slot dim whose iter var is not bound at the consumer scope.
     """
     terms: list[str] = []
+    tile = ar.extent
     for iv_id, coeff in ar.iter_var_coeffs:
+        if iv_id in ctx.innermost_tile_ids:
+            continue
         name = _resolve_iv_name(iv_id, ctx)
-        if coeff == 1:
+        slot_coeff = coeff // tile if tile > 0 else coeff
+        if slot_coeff == 0:
+            continue
+        if slot_coeff == 1:
             terms.append(name)
         else:
-            terms.append(f"{name} * {coeff}")
+            terms.append(f"{name} * {slot_coeff}")
     if ar.const_offset != 0:
         terms.append(str(ar.const_offset))
     if not terms:
@@ -210,23 +242,28 @@ def _emit_index_expr(ar: AccessRange, ctx: EmitCtx) -> str:
     return " + ".join(terms)
 
 
-def _emit_scaled_affine_start(ar: AccessRange, ctx: EmitCtx, scale: int) -> str:
-    """Emit a tile-size-scaled affine start expression.
+def _emit_affine_start(ar: AccessRange, ctx: EmitCtx) -> str:
+    """Emit the physical affine start expression for a slice.
 
-    Each iter var's coefficient is multiplied by ``scale`` (the tile
-    size along the dim). Parenthesisation matches v1 output:
-    coeff-1 single-iter-var emits as ``(name) * scale``; coeff != 1
-    emits as ``(name * coeff) * scale`` (via grouped product expressed
-    as the flat ``name * total_coeff`` form).
+    Each iter-var coefficient is already in physical-address units
+    (Task 4: outer coeff = tile, inner coeff = 1), so the expression
+    is simply ``sum(coeff_i * iv_i) + const_offset``. Coeff-1 terms
+    emit bare (``name``); other coeff values emit as ``(name) * coeff``
+    to match the renderer's v1 parenthesisation. When the renderer has
+    elided the inner tile loop (the iter-var's ``var_id`` is recorded
+    in :attr:`EmitCtx.innermost_tile_ids`) the term is dropped as a
+    statically-zero contribution, so the emitted start is just the
+    outer component.
     """
     terms: list[str] = []
     for iv_id, coeff in ar.iter_var_coeffs:
+        if iv_id in ctx.innermost_tile_ids:
+            continue
         name = _resolve_iv_name(iv_id, ctx)
-        total_coeff = coeff * scale
         if coeff == 1:
-            terms.append(f"({name}) * {total_coeff}")
+            terms.append(name)
         else:
-            terms.append(f"({name} * {coeff}) * {scale}")
+            terms.append(f"({name}) * {coeff}")
     if ar.const_offset != 0:
         terms.append(str(ar.const_offset))
     if not terms:

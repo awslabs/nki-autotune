@@ -5,7 +5,7 @@ Pipeline:
     2. Unify abstract axes (``P``, ``F``, ``K``, ``M``, ``N`` ...) across
        ops into concrete dim ids (``d0``, ``d1`` ...).
     3. Derive per-dim total size from ``input_specs``; each op derives
-       its own tile sizes from its ``TILE_LIMITS`` (no cross-op coupling).
+       its own tile sizes from its ``MAX_TILE_SIZE`` (no cross-op coupling).
     4. Tag each tensor's ``origin`` (``param`` / ``intermediate`` / ``return``).
     5. Build the iter-var schedule tree: one :class:`SBlock` per op carrying
        block-local iter vars, wrapped in a 1N-per-dim :class:`ForNode`
@@ -421,18 +421,25 @@ def _derive_op_tiles(
 ) -> list[dict[str, int]]:
     """Per-op tile size map: ``op_tiles[i][dim_id] = tile_for_that_op_on_that_dim``.
 
-    For each op, every concrete dim id it touches gets a tile size
-    derived **solely** from that op's ``TILE_LIMITS``. An abstract axis
-    not declared in ``TILE_LIMITS`` defaults to the full extent (trip
-    count = 1). No cross-op coupling.
+    For each op, every concrete dim id it touches gets a tile size derived
+    from that op's ``MAX_TILE_SIZE`` (the largest legal innermost-tile
+    extent). An abstract axis with ``MAX_TILE_SIZE[axis] = None`` (or
+    absent entry) defaults to the full extent.
     """
     out: list[dict[str, int]] = []
     for raw, axis_map in zip(raws, per_op_axis_maps):
         tiles: dict[str, int] = {}
         for abstract, dim_id in axis_map.items():
-            limit = raw.op_cls.TILE_LIMITS.get(abstract)
+            max_tile = raw.op_cls.MAX_TILE_SIZE.get(abstract)
             total = dim_sizes[dim_id]
-            tiles[dim_id] = min(limit, total) if limit is not None else total
+            if max_tile is None:
+                tiles[dim_id] = total
+            else:
+                if total % max_tile != 0:
+                    raise ValueError(
+                        f"{raw.op_cls.__name__}.{abstract}: extent {total} not divisible by MAX_TILE_SIZE {max_tile}"
+                    )
+                tiles[dim_id] = min(max_tile, total)
         out.append(tiles)
     return out
 
@@ -505,21 +512,31 @@ def _touched_dims(raw: _ParsedOpRaw, axis_map: dict[str, str], tensors: dict[str
 def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
     """Build an iter-var :class:`SBlock` for ``op`` with per-op tiling.
 
-    Allocates one fresh :class:`IterVar` per ``dim_id`` in ``op.touched_dims``.
-    The iter-var's ``extent`` is derived from the op's own tile for that
-    dim: ``extent = total_size // op.dim_tile[dim_id]`` (trip count).
+    Allocates TWO fresh :class:`IterVar`\\ s per ``dim_id`` in
+    ``op.touched_dims``: an outer trip iter-var (``extent = total //
+    tile``) and an inner tile iter-var (``extent = tile``). The outer
+    precedes the inner in ``iter_vars`` for each dim. The innermost
+    inner iter-var is present in the IR so per-dim addressing is fully
+    symbolic ``outer * tile + inner``; the renderer (Task 5) elides the
+    inner for-loop by spelling the inner iter-var as ``0`` in slice
+    expressions.
+
     Operand slots split into three buckets based on the op's
     ``INPUT_OPERANDS`` / ``RMW_OPERANDS``.
     """
-    dim_to_iv: dict[str, IterVar] = {}
+    dim_to_outer: dict[str, IterVar] = {}
+    dim_to_inner: dict[str, IterVar] = {}
     iter_vars: list[IterVar] = []
     for dim_id in op.touched_dims:
         total = module.dims[dim_id].total_size
         tile = op.dim_tile[dim_id]
-        extent = total // tile
-        iv = module.allocate_iter_var(dim_id=dim_id, extent=extent, role=op.dim_role[dim_id])
-        dim_to_iv[dim_id] = iv
-        iter_vars.append(iv)
+        trip = total // tile
+        outer = module.allocate_iter_var(dim_id=dim_id, extent=trip, role=op.dim_role[dim_id])
+        inner = module.allocate_iter_var(dim_id=dim_id, extent=tile, role=op.dim_role[dim_id])
+        dim_to_outer[dim_id] = outer
+        dim_to_inner[dim_id] = inner
+        iter_vars.append(outer)
+        iter_vars.append(inner)
 
     rmw = op.op_cls.RMW_OPERANDS
     input_slots = op.op_cls.INPUT_OPERANDS
@@ -530,7 +547,7 @@ def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
         tname = op.operand_names.get(slot)
         if tname is None or tname not in module.tensors:
             continue
-        access = _build_buffer_access(tname, axes, op, dim_to_iv, module)
+        access = _build_buffer_access(tname, axes, op, dim_to_outer, dim_to_inner, module)
         if slot in rmw:
             reads_writes[slot] = access
         elif slot in input_slots:
@@ -541,17 +558,32 @@ def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
     call = NKIOpCall(
         op_cls=op.op_cls, kwargs=dict(op.op_kwargs), axis_map=dict(op.axis_map), dim_role=dict(op.dim_role)
     )
-    return SBlock(iter_vars=iter_vars, reads=reads, writes=writes, reads_writes=reads_writes, body=[call])
+    return SBlock(
+        iter_vars=iter_vars,
+        reads=reads,
+        writes=writes,
+        reads_writes=reads_writes,
+        body=[call],
+        annotations={"axis_map": dict(op.axis_map)},
+    )
 
 
 def _build_buffer_access(
-    tname: str, axes: tuple[str, ...], op: _ParsedOp, dim_to_iv: dict[str, IterVar], module: KernelModule
+    tname: str,
+    axes: tuple[str, ...],
+    op: _ParsedOp,
+    dim_to_outer: dict[str, IterVar],
+    dim_to_inner: dict[str, IterVar],
+    module: KernelModule,
 ) -> BufferAccess:
     """Produce a :class:`BufferAccess` for ``tname`` referenced by ``op`` via ``axes``.
 
-    The per-dim :class:`AccessRange` has coefficient 1 on its iter var
-    and extent equal to **this op's** tile size for that dim
-    (``op.dim_tile[dim_id]``).
+    Each per-dim :class:`AccessRange` carries coefficients for BOTH the
+    outer trip iter-var (coeff = ``tile``) and the inner tile iter-var
+    (coeff = 1), so the full affine address along that dim is
+    ``outer * tile + inner``. The range's ``extent`` stays equal to
+    ``tile`` — it is a per-iteration width for the innermost loop, which
+    the renderer will ultimately elide.
     """
     tensor = module.tensors[tname]
     iv_ids_seen: list[int] = []
@@ -560,18 +592,21 @@ def _build_buffer_access(
         if i >= len(tensor.dim_ids):
             break
         dim_id = op.axis_map.get(abstract, tensor.dim_ids[i])
-        iv = dim_to_iv.get(dim_id)
-        if iv is None:
+        outer = dim_to_outer.get(dim_id)
+        inner = dim_to_inner.get(dim_id)
+        if outer is None or inner is None:
             """Untouched dim — constant-offset access along this dim.
             Canonical build never hits this branch but keeps the
             function total."""
             extent = op.dim_tile.get(dim_id, tensor.shape[i]) if dim_id in module.dims else tensor.shape[i]
             pattern_entries.append(AccessRange.make({}, 0, extent))
             continue
-        if iv.var_id not in iv_ids_seen:
-            iv_ids_seen.append(iv.var_id)
-        extent = op.dim_tile[dim_id]
-        pattern_entries.append(AccessRange.make({iv.var_id: 1}, 0, extent))
+        tile = op.dim_tile[dim_id]
+        if outer.var_id not in iv_ids_seen:
+            iv_ids_seen.append(outer.var_id)
+        if inner.var_id not in iv_ids_seen:
+            iv_ids_seen.append(inner.var_id)
+        pattern_entries.append(AccessRange.make({outer.var_id: tile, inner.var_id: 1}, 0, tile))
     return BufferAccess(tensor_name=tname, iter_var_ids=tuple(iv_ids_seen), pattern=tuple(pattern_entries))
 
 
@@ -594,11 +629,13 @@ def _make_alloc_sblock(alloc: _AllocRecord) -> SBlock:
 
 
 def _build_tree(op: _ParsedOp, module: KernelModule) -> ForNode | SBlock:
-    """Build the iter-var schedule tree for ``op``: 1N ForNode per touched dim.
+    """Build the iter-var schedule tree for ``op``: TWO ForNodes per touched dim.
 
     If ``op.touched_dims`` is empty, returns the :class:`SBlock` directly
-    (no loop nest needed). Otherwise wraps outermost-first: ``iter_vars[0]``
-    is the outermost :class:`ForNode`.
+    (no loop nest needed). Otherwise wraps outer-then-inner per dim, so
+    ``block.iter_vars[0]`` (the outer of the first touched dim) becomes
+    the outermost :class:`ForNode` and the innermost :class:`ForNode`
+    binds the inner iter-var of the last touched dim.
     """
     block = _make_sblock(op, module)
     return _wrap_block_in_fornodes(block)
@@ -606,6 +643,10 @@ def _build_tree(op: _ParsedOp, module: KernelModule) -> ForNode | SBlock:
 
 def _wrap_block_in_fornodes(block: SBlock) -> ForNode | SBlock:
     """Wrap ``block`` in one :class:`ForNode` per iter var, outermost first.
+
+    After Task 4 the block's ``iter_vars`` alternates outer/inner per
+    touched dim; iterating in reverse nests them as
+    ``outer_d0 > inner_d0 > outer_d1 > inner_d1 > ... > block``.
 
     Returns ``block`` unwrapped if it has no iter vars (alloc blocks).
     """

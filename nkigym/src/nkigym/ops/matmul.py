@@ -28,7 +28,8 @@ class NKIMatmul(NKIOp):
     RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset({"dst"})
     RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "rmw"
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"K": AxisRole.ACCUMULATION}
-    TILE_LIMITS: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": MATMUL_FREE_MAX}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": 128}
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"K": 128, "M": 128, "N": 512}
     OUTPUT_ROLE: ClassVar[str] = "psum"
 
     def _check_roles(self, **kwargs: Any) -> None:

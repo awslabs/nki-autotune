@@ -44,7 +44,6 @@ class NKIAlloc(NKIOp):
 
     NAME: ClassVar[str] = "alloc"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
-    TILE_LIMITS: ClassVar[dict[str, int]] = {}
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: return an uninitialised array of declared shape/dtype."""

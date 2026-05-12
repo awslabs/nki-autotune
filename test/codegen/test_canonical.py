@@ -218,7 +218,7 @@ def test_canonical_render_iter_var_names_canonical() -> None:
 def test_canonical_render_matmul_sbuf_slices_are_3d() -> None:
     """SBUF/PSUM tensor slices must have 3 dims matching the 3D declaration.
 
-    Per-op tiling: each op slices buffers according to its own TILE_LIMITS.
+    Per-op tiling: each op slices buffers according to its own tile sizes.
     NKILoad writes full-F (2048); NKIMatmul reads with M=128/N=512 tiles.
     Writer tile widths determine SBUF/PSUM buffer shape; each reader slices
     into those buffers using its own per-op tile widths.
@@ -268,58 +268,178 @@ def test_canonical_load_has_full_F_extent() -> None:
     """NKILoad has no F-axis TILE_LIMIT — canonical must tile F into a
     single whole-extent iteration, not carry NKIMatmul's M=128 through
     shared dim_ids. Regression: the old _derive_dims took a global min
-    over ops touching the shared dim."""
+    over ops touching the shared dim.
+
+    Post-Task 4: each dim yields an outer+inner iter-var pair, so a 2D
+    load block carries 4 iter-vars ordered ``[P_outer, P_inner, F_outer,
+    F_inner]``.
+    """
     km = build_canonical_module(_matmul_k, _INPUT_SPECS)
     load_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKILoad]
     assert len(load_blocks) == 2
     for block in load_blocks:
-        p_iv, f_iv = block.iter_vars
-        assert p_iv.extent == 16, f"expected P trip=16 (2048/128), got {p_iv.extent}"
-        assert f_iv.extent == 1, f"expected F trip=1 (full-extent load), got {f_iv.extent}"
+        p_outer, p_inner, f_outer, f_inner = block.iter_vars
+        assert p_outer.extent == 16, f"expected P trip=16 (2048/128), got {p_outer.extent}"
+        assert p_inner.extent == 128, f"expected P tile=128, got {p_inner.extent}"
+        assert f_outer.extent == 1, f"expected F trip=1 (full-extent load), got {f_outer.extent}"
+        assert f_inner.extent == 2048, f"expected F tile=2048, got {f_inner.extent}"
         f_ar = list(block.writes.values())[0].pattern[-1]
         assert f_ar.extent == 2048, f"expected F-tile=2048, got {f_ar.extent}"
 
 
 def test_canonical_memset_has_full_F_extent() -> None:
-    """NKIMemset has only P=128 in TILE_LIMITS — its F iter-var must be
+    """NKIMemset has only P=128 in MAX_TILE_SIZE — its F iter-var must be
     full-extent under per-op tiling, independent of NKIMatmul's N=512.
     Guards against any cross-op coupling re-introduced via the
-    memset-on-matmul-PSUM path."""
+    memset-on-matmul-PSUM path.
+
+    Post-Task 4: each dim yields an outer+inner iter-var pair.
+    """
     km = build_canonical_module(_matmul_k, _INPUT_SPECS)
     memset_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKIMemset]
     assert len(memset_blocks) == 1
     block = memset_blocks[0]
-    p_iv, f_iv = block.iter_vars
-    assert p_iv.extent == 16, f"expected P trip=16, got {p_iv.extent}"
-    assert f_iv.extent == 1, f"expected F trip=1 (full-extent memset), got {f_iv.extent}"
+    p_outer, p_inner, f_outer, f_inner = block.iter_vars
+    assert p_outer.extent == 16, f"expected P trip=16, got {p_outer.extent}"
+    assert p_inner.extent == 128, f"expected P tile=128, got {p_inner.extent}"
+    assert f_outer.extent == 1, f"expected F trip=1 (full-extent memset), got {f_outer.extent}"
+    assert f_inner.extent == 2048, f"expected F tile=2048, got {f_inner.extent}"
     f_ar = list(block.writes.values())[0].pattern[-1]
     assert f_ar.extent == 2048, f"expected F-tile=2048, got {f_ar.extent}"
 
 
 def test_canonical_tensor_copy_has_full_F_extent() -> None:
-    """NKITensorCopy (PSUM drain → SBUF) has only P=128 in TILE_LIMITS —
+    """NKITensorCopy (PSUM drain → SBUF) has only P=128 in MAX_TILE_SIZE —
     its F iter-var must stay full-extent. Guards against coupling via the
-    matmul producer of psum_acc."""
+    matmul producer of psum_acc.
+
+    Post-Task 4: each dim yields an outer+inner iter-var pair.
+    """
     km = build_canonical_module(_matmul_k, _INPUT_SPECS)
     copy_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKITensorCopy]
     assert len(copy_blocks) == 1
     block = copy_blocks[0]
-    p_iv, f_iv = block.iter_vars
-    assert p_iv.extent == 16, f"expected P trip=16, got {p_iv.extent}"
-    assert f_iv.extent == 1, f"expected F trip=1 (full-extent tensor_copy), got {f_iv.extent}"
+    p_outer, p_inner, f_outer, f_inner = block.iter_vars
+    assert p_outer.extent == 16, f"expected P trip=16, got {p_outer.extent}"
+    assert p_inner.extent == 128, f"expected P tile=128, got {p_inner.extent}"
+    assert f_outer.extent == 1, f"expected F trip=1 (full-extent tensor_copy), got {f_outer.extent}"
+    assert f_inner.extent == 2048, f"expected F tile=2048, got {f_inner.extent}"
     f_ar = list(block.writes.values())[0].pattern[-1]
     assert f_ar.extent == 2048, f"expected F-tile=2048, got {f_ar.extent}"
 
 
 def test_canonical_store_has_full_F_extent() -> None:
-    """NKIStore has only P=128 in TILE_LIMITS — its F iter-var must be
-    full-extent. Guards against coupling via the matmul producer chain."""
+    """NKIStore has only P=128 in MAX_TILE_SIZE — its F iter-var must be
+    full-extent. Guards against coupling via the matmul producer chain.
+
+    Post-Task 4: each dim yields an outer+inner iter-var pair.
+    """
     km = build_canonical_module(_matmul_k, _INPUT_SPECS)
     store_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKIStore]
     assert len(store_blocks) == 1
     block = store_blocks[0]
-    p_iv, f_iv = block.iter_vars
-    assert p_iv.extent == 16, f"expected P trip=16, got {p_iv.extent}"
-    assert f_iv.extent == 1, f"expected F trip=1 (full-extent store), got {f_iv.extent}"
+    p_outer, p_inner, f_outer, f_inner = block.iter_vars
+    assert p_outer.extent == 16, f"expected P trip=16, got {p_outer.extent}"
+    assert p_inner.extent == 128, f"expected P tile=128, got {p_inner.extent}"
+    assert f_outer.extent == 1, f"expected F trip=1 (full-extent store), got {f_outer.extent}"
+    assert f_inner.extent == 2048, f"expected F tile=2048, got {f_inner.extent}"
     f_ar = list(block.writes.values())[0].pattern[-1]
     assert f_ar.extent == 2048, f"expected F-tile=2048, got {f_ar.extent}"
+
+
+def test_canonical_uses_max_tile_size() -> None:
+    """Canonical tile sizes equal MAX_TILE_SIZE when declared, full extent otherwise.
+
+    Post-Task 4: each dim yields an outer+inner iter-var pair, so a matmul
+    (3 dims) has 6 iter-vars ordered ``[K_outer, K_inner, M_outer, M_inner,
+    N_outer, N_inner]``.
+    """
+    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    matmul_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKIMatmul]
+    assert len(matmul_blocks) == 1
+    block = matmul_blocks[0]
+    assert len(block.iter_vars) == 6
+    k_outer, k_inner, m_outer, m_inner, n_outer, n_inner = block.iter_vars
+    """K=128, M=128, N=512 from MAX_TILE_SIZE.
+    Total dims are 2048 each, so outer trips are 16, 16, 4 and inner
+    tiles are 128, 128, 512."""
+    assert k_outer.extent == 16, f"K trip: expected 2048//128=16, got {k_outer.extent}"
+    assert k_inner.extent == 128, f"K tile: expected 128, got {k_inner.extent}"
+    assert m_outer.extent == 16, f"M trip: expected 2048//128=16, got {m_outer.extent}"
+    assert m_inner.extent == 128, f"M tile: expected 128, got {m_inner.extent}"
+    assert n_outer.extent == 4, f"N trip: expected 2048//512=4, got {n_outer.extent}"
+    assert n_inner.extent == 512, f"N tile: expected 512, got {n_inner.extent}"
+    """Access patterns should reflect the tile sizes."""
+    call = block.body[0]
+    assert isinstance(call, NKIOpCall)
+    """Stationary operand (lhs_sbuf) has axes K, M."""
+    stat = block.reads["stationary"]
+    assert len(stat.pattern) == 2
+    assert stat.pattern[0].extent == 128, f"K tile: expected 128, got {stat.pattern[0].extent}"
+    assert stat.pattern[1].extent == 128, f"M tile: expected 128, got {stat.pattern[1].extent}"
+    """Moving operand (rhs_sbuf) has axes K, N."""
+    mov = block.reads["moving"]
+    assert len(mov.pattern) == 2
+    assert mov.pattern[0].extent == 128, f"K tile: expected 128, got {mov.pattern[0].extent}"
+    assert mov.pattern[1].extent == 512, f"N tile: expected 512, got {mov.pattern[1].extent}"
+    """Dst operand (psum_acc) has axes M, N."""
+    dst = block.reads_writes["dst"]
+    assert len(dst.pattern) == 2
+    assert dst.pattern[0].extent == 128, f"M tile: expected 128, got {dst.pattern[0].extent}"
+    assert dst.pattern[1].extent == 512, f"N tile: expected 512, got {dst.pattern[1].extent}"
+
+
+def test_derive_op_tiles_raises_on_indivisible_extent() -> None:
+    """Canonical build raises ValueError when axis extent is not divisible by MAX_TILE_SIZE.
+
+    Matmul M has MAX_TILE_SIZE=128; an M-axis extent of 200 is indivisible.
+    """
+    import pytest
+
+    @nkigym_kernel
+    def _k(lhs_T, rhs):
+        lhs_T_sbuf = NKIAlloc(location="sbuf", shape=(2048, 200), dtype="bfloat16")()
+        rhs_sbuf = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
+        psum = NKIAlloc(location="psum", shape=(200, 2048), dtype="float32")()
+        hbm_out = NKIAlloc(location="hbm", shape=(200, 2048), dtype="bfloat16")()
+        NKILoad()(src=lhs_T, dst=lhs_T_sbuf)
+        NKILoad()(src=rhs, dst=rhs_sbuf)
+        NKIMatmul()(stationary=lhs_T_sbuf, moving=rhs_sbuf, dst=psum)
+        NKIStore()(src=psum, dst=hbm_out)
+        return hbm_out
+
+    with pytest.raises(ValueError, match="not divisible by MAX_TILE_SIZE"):
+        build_canonical_module(
+            _k,
+            input_specs={
+                "lhs_T": {"shape": (2048, 200), "dtype": "bfloat16"},
+                "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
+            },
+        )
+
+
+def test_canonical_emits_outer_and_inner_tile_loops():
+    """Each op axis produces TWO nested ForNodes in the IR: outer trip + inner tile.
+
+    The ``_matmul_k`` fixture has ops whose tiles produce both a 16-trip
+    outer (K/M at 128 over 2048) and multiple 128-wide inner loops (the
+    K and M tiles of matmul, and all P tiles across the rest of the ops),
+    so the asserted shape is reachable.
+    """
+    module = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    """Walk the body. After Task 4 each op axis yields a nested (outer,
+    inner) ForNode pair. For NKIMatmul: K: trip=16 tile=128,
+    M: trip=16 tile=128, N: trip=4 tile=512."""
+
+    def collect_loops(nodes, found):
+        for n in nodes:
+            if isinstance(n, ForNode):
+                found.append((n.iter_var.dim_id, n.iter_var.extent))
+                collect_loops(n.children, found)
+
+    found = []
+    collect_loops(module.body, found)
+    assert any(extent == 128 for _, extent in found), f"expected an inner tile loop with extent 128; got {found}"
+    assert any(extent == 16 for _, extent in found), f"expected an outer trip loop with extent 16; got {found}"
+    inner_128_parents = [(dim, ext) for dim, ext in found if ext == 128]
+    assert len(inner_128_parents) >= 2, f"expected >=2 inner-128 loops; got {inner_128_parents}"

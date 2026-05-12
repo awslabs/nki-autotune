@@ -71,7 +71,12 @@ def _is_under_matmul(module, iv_id):
 
 
 def _find_matmul_subtree_iter_vars(module):
-    """Return (d0 ACC, d1 PAR, d3 PAR) iter vars on matmul's subtree."""
+    """Return (d0 ACC outer, d1 PAR outer, d3 PAR outer) iter vars on matmul's subtree.
+
+    Post-Task 4 each axis yields outer+inner ForNodes. This helper picks
+    the outer (trip) iter-var of each axis — the first ForNode per dim
+    in the matmul spine.
+    """
     fns = _collect_fornodes(module)
     d0_acc = next(
         iv.var_id for _, node in fns if (iv := node.iter_var).dim_id == "d0" and iv.role == AxisRole.ACCUMULATION
@@ -89,75 +94,108 @@ def _find_matmul_subtree_iter_vars(module):
     return d0_acc, d1, d3
 
 
+def _find_matmul_d1_inner_d3_outer(module):
+    """Return the contiguous (d1_inner, d3_outer) pair in matmul's spine.
+
+    Post-Task 4 the matmul spine is ``d0_outer > d0_inner > d1_outer >
+    d1_inner > d3_outer > d3_inner > SBlock``. The first adjacent pair
+    of ForNodes whose role-commute is PAR/PAR (both parallel) is the
+    ``(d1_inner, d3_outer)`` pair — both bind PARALLEL iter-vars.
+    """
+    fns = _collect_fornodes(module)
+    d1_ids = [
+        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d1" and _is_under_matmul(module, n.iter_var.var_id)
+    ]
+    d3_ids = [
+        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d3" and _is_under_matmul(module, n.iter_var.var_id)
+    ]
+    assert len(d1_ids) == 2 and len(d3_ids) == 2, "expected outer+inner per dim under matmul"
+    d1_inner = d1_ids[1]
+    d3_outer = d3_ids[0]
+    return d1_inner, d3_outer
+
+
 def test_reorder_par_par_adjacent_is_legal() -> None:
-    """Swapping d1 PAR and d3 PAR adjacent loops in matmul subtree is legal."""
+    """Swapping the adjacent (d1_inner, d3_outer) PAR/PAR pair in matmul's
+    spine is legal — both iter-vars are PARALLEL, role-commute is PAR×PAR.
+    """
     module = build_canonical_module(_matmul_large, _SPECS)
-    d0_acc, d1, d3 = _find_matmul_subtree_iter_vars(module)
-    """Canonical order: d0_acc > d1_par > d3_par > matmul. Reorder to d0, d3, d1."""
-    atom = Reorder(iter_var_ids=(d0_acc, d3, d1))
+    d1_inner, d3_outer = _find_matmul_d1_inner_d3_outer(module)
+    atom = Reorder(iter_var_ids=(d3_outer, d1_inner))
     assert atom.is_legal(module)
 
 
 def test_reorder_apply_reshapes_tree() -> None:
-    """After Reorder, the tree's ForNode chain matches the requested order."""
+    """After Reorder, the ForNode chain matches the requested order."""
     module = build_canonical_module(_matmul_large, _SPECS)
-    d0_acc, d1, d3 = _find_matmul_subtree_iter_vars(module)
-    atom = Reorder(iter_var_ids=(d0_acc, d3, d1))
+    d1_inner, d3_outer = _find_matmul_d1_inner_d3_outer(module)
+    atom = Reorder(iter_var_ids=(d3_outer, d1_inner))
     new_mod = atom.apply(module)
 
-    """Find the matmul subtree root."""
+    """Find the d3_outer ForNode in the new tree. Its only child must now
+    be d1_inner (swap succeeded)."""
     fns = _collect_fornodes(new_mod)
-    root_for_d0 = next(n for _, n in fns if n.iter_var.var_id == d0_acc)
-    """Top to bottom: d0 → d3 → d1 → SBlock."""
-    child = root_for_d0.children[0]
+    new_d3_outer = next(n for _, n in fns if n.iter_var.var_id == d3_outer)
+    child = new_d3_outer.children[0]
     assert isinstance(child, ForNode)
-    assert child.iter_var.var_id == d3
-    grand = child.children[0]
-    assert isinstance(grand, ForNode)
-    assert grand.iter_var.var_id == d1
+    assert child.iter_var.var_id == d1_inner
 
 
 def test_reorder_rejects_par_acc_with_write_on_par_dim() -> None:
     """Reordering d1 PAR outside d0 ACC where d1 indexes a write position is illegal.
 
-    Here: matmul canonical has d0 ACC > d1 PAR > d3 PAR > matmul. d1 indexes
-    psum_acc's M axis (matmul.reads_writes). Reordering d1, d0 would require
-    d1-purity on the ACC subtree — but matmul's RMW write depends on d1 →
-    impure. Illegal.
+    Matmul canonical spine has d0_outer ACC at the top with d1/d3 PAR
+    deeper. d1 outer indexes psum_acc's M axis (matmul.reads_writes).
+    Reordering (d1_outer, d0_inner) — hoisting d1 above d0_inner's
+    ACC-subtree — would require d1-purity on the ACC subtree, but
+    matmul's RMW write depends on d1 → impure. Illegal.
     """
     module = build_canonical_module(_matmul_large, _SPECS)
-    d0_acc, d1, _d3 = _find_matmul_subtree_iter_vars(module)
-    atom = Reorder(iter_var_ids=(d1, d0_acc))
+    """Find d0_inner (second d0 iter-var under matmul) and d1_outer."""
+    fns = _collect_fornodes(module)
+    d0_ids = [
+        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d0" and _is_under_matmul(module, n.iter_var.var_id)
+    ]
+    d1_ids = [
+        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d1" and _is_under_matmul(module, n.iter_var.var_id)
+    ]
+    assert len(d0_ids) >= 2 and len(d1_ids) >= 1
+    d0_inner = d0_ids[1]
+    d1_outer = d1_ids[0]
+    atom = Reorder(iter_var_ids=(d1_outer, d0_inner))
     assert not atom.is_legal(module)
 
 
 def test_reorder_apply_raises_on_illegal() -> None:
     """Calling apply on an illegal reorder raises AtomLegalityError."""
     module = build_canonical_module(_matmul_large, _SPECS)
-    d0_acc, d1, _d3 = _find_matmul_subtree_iter_vars(module)
-    atom = Reorder(iter_var_ids=(d1, d0_acc))
+    fns = _collect_fornodes(module)
+    d0_ids = [
+        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d0" and _is_under_matmul(module, n.iter_var.var_id)
+    ]
+    d1_ids = [
+        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d1" and _is_under_matmul(module, n.iter_var.var_id)
+    ]
+    assert len(d0_ids) >= 2 and len(d1_ids) >= 1
+    atom = Reorder(iter_var_ids=(d1_ids[0], d0_ids[1]))
     with pytest.raises(AtomLegalityError):
         atom.apply(module)
 
 
 def test_reorder_round_trip_restores_canonical() -> None:
-    """Reorder(a, b) + Reorder(b, a) restores the original tree's loop order."""
+    """Reorder(a, b) + Reorder(b, a) restores the original loop order."""
     module = build_canonical_module(_matmul_large, _SPECS)
-    d0_acc, d1, d3 = _find_matmul_subtree_iter_vars(module)
+    d1_inner, d3_outer = _find_matmul_d1_inner_d3_outer(module)
 
-    first = Reorder(iter_var_ids=(d0_acc, d3, d1)).apply(module)
-    second = Reorder(iter_var_ids=(d0_acc, d1, d3)).apply(first)
+    first = Reorder(iter_var_ids=(d3_outer, d1_inner)).apply(module)
+    second = Reorder(iter_var_ids=(d1_inner, d3_outer)).apply(first)
 
-    """Original matmul subtree order: d0_acc → d1 → d3. After 2 reorders,
-    same order restored."""
+    """Original order: d1_inner > d3_outer. After round-trip, same chain."""
     fns = _collect_fornodes(second)
-    root_for_d0 = next(n for _, n in fns if n.iter_var.var_id == d0_acc)
-    child = root_for_d0.children[0]
+    restored_d1_inner = next(n for _, n in fns if n.iter_var.var_id == d1_inner)
+    child = restored_d1_inner.children[0]
     assert isinstance(child, ForNode)
-    assert child.iter_var.var_id == d1
-    grand = child.children[0]
-    assert isinstance(grand, ForNode)
-    assert grand.iter_var.var_id == d3
+    assert child.iter_var.var_id == d3_outer
 
 
 def test_reorder_requires_contiguous_chain() -> None:
@@ -190,9 +228,9 @@ def test_reorder_preserves_other_subtrees() -> None:
     import ast
 
     module = build_canonical_module(_matmul_large, _SPECS)
-    d0_acc, d1, d3 = _find_matmul_subtree_iter_vars(module)
+    d1_inner, d3_outer = _find_matmul_d1_inner_d3_outer(module)
     orig_source = render(module)
-    new_mod = Reorder(iter_var_ids=(d0_acc, d3, d1)).apply(module)
+    new_mod = Reorder(iter_var_ids=(d3_outer, d1_inner)).apply(module)
     new_source = render(new_mod)
 
     """Both renders should be parseable Python."""

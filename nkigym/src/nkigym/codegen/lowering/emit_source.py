@@ -24,12 +24,42 @@ def emit_source(module: KernelModule) -> str:
     _emit_imports(w)
     _emit_signature(w, module)
     w.indent()
-    ctx = EmitCtx(iter_var_to_name={}, tensors=module.tensors, module=module)
+    ctx = EmitCtx(
+        iter_var_to_name={},
+        tensors=module.tensors,
+        module=module,
+        innermost_tile_ids=_innermost_tile_iter_var_ids(module),
+    )
     for root in module.body:
         _emit_node(w, root, ctx)
     w.line(f"return {module.return_name}")
     w.dedent()
     return w.getvalue()
+
+
+def _innermost_tile_iter_var_ids(module: KernelModule) -> set[int]:
+    """Collect var_ids of iter-vars that are each op's innermost tile loop per axis.
+
+    For each :class:`SBlock` in the tree, for each dim in the block's
+    ``iter_vars``, the innermost iter-var (rightmost entry for that dim
+    in the block's list) is the tile loop. All such var_ids are returned.
+    """
+    ids: set[int] = set()
+
+    def visit(node: ForNode | SBlock) -> None:
+        if isinstance(node, SBlock):
+            by_dim: dict[str, list[int]] = {}
+            for iv in node.iter_vars:
+                by_dim.setdefault(iv.dim_id, []).append(iv.var_id)
+            for id_list in by_dim.values():
+                ids.add(id_list[-1])
+        elif isinstance(node, ForNode):
+            for c in node.children:
+                visit(c)
+
+    for root in module.body:
+        visit(root)
+    return ids
 
 
 def _emit_imports(w: _Writer) -> None:
@@ -49,11 +79,24 @@ def _emit_signature(w: _Writer, module: KernelModule) -> None:
 
 
 def _emit_node(w: _Writer, node: ForNode | SBlock, ctx: EmitCtx) -> None:
-    """Recursively emit ``node``. Mutates ``ctx.iter_var_to_name`` in place."""
+    """Recursively emit ``node``. Mutates ``ctx.iter_var_to_name`` in place.
+
+    When ``node`` is a :class:`ForNode` whose iter-var is the innermost
+    tile loop for some descendant leaf, emit no ``for`` header — bind
+    the iter-var's name to ``"0"`` so slice-start expressions collapse
+    to their base offset. The iter-var's ``extent`` is consumed as the
+    slice width on the ISA call's buffer-access pattern.
+    """
     if isinstance(node, SBlock):
         _emit_sblock(w, node, ctx)
         return
     iv = node.iter_var
+    if iv.var_id in ctx.innermost_tile_ids:
+        ctx.iter_var_to_name[iv.var_id] = "0"
+        for child in node.children:
+            _emit_node(w, child, ctx)
+        ctx.iter_var_to_name.pop(iv.var_id, None)
+        return
     name = node.name if node.name is not None else f"i_{iv.dim_id}_{iv.var_id}"
     ctx.iter_var_to_name[iv.var_id] = name
     w.line(f"for {name} in range({iv.extent}):")

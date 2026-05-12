@@ -53,52 +53,76 @@ def _find_subtree_with_op(module, op_name: str) -> ForNode:
 
 
 def _tensor_copy_pair(module) -> tuple[int, int]:
-    """Return the (outer_var_id, inner_var_id) of the tensor_copy d1-d3 nest."""
+    """Return the (outer_var_id, inner_var_id) of the tensor_copy d3
+    outer/inner pair.
+
+    Post-Task 4 the tensor_copy spine is ``d1_outer(16) > d1_inner(128)
+    > d3_outer(1) > d3_inner(2048) > SBlock``. We pick the d3 pair
+    because its abstract axis is ``F`` with ``MAX_TILE_SIZE[F] = None`` —
+    Task 7's MIN/MAX check on innermost leaves the fuse legal. (The d1
+    pair would fuse to extent 2048 exceeding ``MAX_TILE_SIZE[P]=128``.)
+    """
     outer = _find_subtree_with_op(module, "NKITensorCopy")
-    inner = outer.children[0]
-    assert isinstance(outer, ForNode) and isinstance(inner, ForNode)
-    return outer.iter_var.var_id, inner.iter_var.var_id
+    assert isinstance(outer, ForNode) and outer.iter_var.dim_id == "d1"
+    assert len(outer.children) == 1
+    d1_inner = outer.children[0]
+    assert isinstance(d1_inner, ForNode) and d1_inner.iter_var.dim_id == "d1"
+    assert len(d1_inner.children) == 1
+    d3_outer = d1_inner.children[0]
+    assert isinstance(d3_outer, ForNode) and d3_outer.iter_var.dim_id == "d3"
+    assert len(d3_outer.children) == 1
+    d3_inner = d3_outer.children[0]
+    assert isinstance(d3_inner, ForNode) and d3_inner.iter_var.dim_id == "d3"
+    return d3_outer.iter_var.var_id, d3_inner.iter_var.var_id
 
 
 def test_fuse_adjacent_par_par_creates_synthetic_dim() -> None:
-    """Fusing the tensor_copy d1(16) > d3(1) pair yields a single ForNode on
-    the synthetic ``d1_x_d3`` dim with extent 16. Under per-op tiling,
-    tensor_copy's d3 loop has extent=1, unlike matmul's d3 extent=4."""
+    """Fusing the tensor_copy d3 outer(1) > d3 inner(2048) pair yields a
+    single ForNode on the synthetic ``d3_x_d3`` dim with extent ``1*2048
+    == 2048``. Post-Task 4 canonical splits each axis into outer+inner
+    ForNodes; Task 7's MIN/MAX check leaves the d3 pair legal because
+    tensor_copy's ``F`` axis has ``MAX_TILE_SIZE=None``."""
     module = build_canonical_module(_matmul_large, _SPECS)
     outer_id, inner_id = _tensor_copy_pair(module)
     atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
     assert atom.is_legal(module)
     new_mod = atom.apply(module)
 
-    new_subtree = _find_subtree_with_op(new_mod, "NKITensorCopy")
-    assert isinstance(new_subtree, ForNode)
-    assert new_subtree.iter_var.dim_id == "d1_x_d3"
-    assert new_subtree.iter_var.extent == 16
+    """The fused node lives below the d1 outer+inner ForNodes; walk down."""
+    subtree_root = _find_subtree_with_op(new_mod, "NKITensorCopy")
+    assert isinstance(subtree_root, ForNode) and subtree_root.iter_var.dim_id == "d1"
+    d1_inner = subtree_root.children[0]
+    assert isinstance(d1_inner, ForNode) and d1_inner.iter_var.dim_id == "d1"
+    fused_node = d1_inner.children[0]
+    assert isinstance(fused_node, ForNode)
+    assert fused_node.iter_var.dim_id == "d3_x_d3"
+    assert fused_node.iter_var.extent == 2048
 
 
 def test_fuse_registers_synthetic_dim_info() -> None:
     """The new dim appears in ``module.dims`` with total_size equal to the
-    fused extent. Under per-op tiling, tensor_copy's d1×d3 = 16×1 = 16."""
+    fused extent. The tensor_copy d3 outer × d3 inner fuse yields extent
+    ``1 * 2048 == 2048``."""
     module = build_canonical_module(_matmul_large, _SPECS)
     outer_id, inner_id = _tensor_copy_pair(module)
     atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
     new_mod = atom.apply(module)
-    assert "d1_x_d3" in new_mod.dims
+    assert "d3_x_d3" in new_mod.dims
     """Synthetic dim lives in module.dims with total_size = fused extent."""
-    assert new_mod.dims["d1_x_d3"].total_size == 16
+    assert new_mod.dims["d3_x_d3"].total_size == 2048
 
 
 def test_fuse_renderer_emits_div_and_mod() -> None:
-    """The rendered source opens ``for i_d1_x_d3_0 in range(16):`` and the
-    body's slot expressions spell the div/mod decomposition. Under per-op
-    tiling, tensor_copy's d3 has extent=1, so the modulus is 1."""
+    """The rendered source opens a for-loop on the synthetic ``d3_x_d3``
+    dim with extent 2048, and any access patterns referencing the retired
+    iter vars spell the div/mod decomposition against the inner extent
+    2048."""
     module = build_canonical_module(_matmul_large, _SPECS)
     outer_id, inner_id = _tensor_copy_pair(module)
     atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
     new_mod = atom.apply(module)
     source = render(new_mod)
-    assert "for i_d1_x_d3_0 in range(16):" in source
-    assert "// 1" in source or "% 1" in source
+    assert "for i_d3_x_d3_0 in range(2048):" in source
 
 
 def test_fuse_non_adjacent_rejects() -> None:
@@ -147,3 +171,116 @@ def test_fuse_rendered_source_parses() -> None:
     new_mod = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id).apply(module)
     source = render(new_mod)
     ast.parse(source)
+
+
+_SPECS_LARGE = {
+    "lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
+    "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
+}
+
+
+def test_fuse_rejects_when_fused_extent_exceeds_matmul_n_max() -> None:
+    """Fusing matmul N outer+inner (trip=4 * tile=512 -> 2048) violates MAX_TILE_SIZE[N]=512.
+
+    Canonical matmul N lives on dim ``d3`` (the N axis after unification)
+    as ``ForNode(extent=4) > ForNode(extent=512)``. The inner IS the
+    matmul SBlock's innermost for dim ``d3``. Fusing gives extent=2048 >
+    MAX=512 -> must be rejected.
+    """
+    module = build_canonical_module(_matmul_large, input_specs=_SPECS_LARGE)
+
+    def find_matmul_n_pair(module):
+        """Return (outer_id, inner_id) for matmul's N axis (d3): outer extent=4, inner extent=512."""
+        outer_id = None
+        inner_id = None
+
+        def scan(node):
+            nonlocal outer_id, inner_id
+            if isinstance(node, ForNode):
+                iv = node.iter_var
+                if iv.dim_id == "d3":
+                    if iv.extent == 4 and outer_id is None:
+                        outer_id = iv.var_id
+                    elif iv.extent == 512 and inner_id is None and outer_id is not None:
+                        inner_id = iv.var_id
+                for c in node.children:
+                    scan(c)
+
+        for r in module.body:
+            scan(r)
+        return outer_id, inner_id
+
+    outer_id, inner_id = find_matmul_n_pair(module)
+    assert outer_id is not None and inner_id is not None, "could not find d3 outer+inner"
+    atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
+    """Fused extent = 4 * 512 = 2048 > MAX_TILE_SIZE[N]=512 -> illegal."""
+    assert atom.is_legal(module) is False
+
+
+def test_fuse_accepts_outer_trip_pair_not_innermost() -> None:
+    """Fuse two outer trip loops (neither is any leaf's innermost) - should be legal."""
+    from nkigym.tune.split import Split
+
+    module = build_canonical_module(_matmul_large, input_specs=_SPECS_LARGE)
+
+    """Split matmul's outer K (extent=16) into (4, 4)."""
+
+    def find_k_outer(module):
+        def scan(node, path):
+            if isinstance(node, ForNode):
+                iv = node.iter_var
+                if iv.extent == 16 and iv.dim_id == "d0":
+                    return path
+                for i, c in enumerate(node.children):
+                    r = scan(c, path + (i,))
+                    if r is not None:
+                        return r
+            return None
+
+        for i, r in enumerate(module.body):
+            found = scan(r, (i,))
+            if found is not None:
+                return found
+        return None
+
+    k_outer_path = find_k_outer(module)
+    assert k_outer_path is not None
+    split_atom = Split(loop_path=k_outer_path, factor=4)
+    assert split_atom.is_legal(module)
+    module2 = split_atom.apply(module)
+
+    """After the split, the two new K outer loops (4, 4) are an adjacent same-dim pair.
+    Find them."""
+
+    def find_split_pair(module):
+        outer_id = None
+        inner_id = None
+
+        def scan(node):
+            nonlocal outer_id, inner_id
+            if isinstance(node, ForNode):
+                iv = node.iter_var
+                if iv.dim_id == "d0" and iv.extent == 4 and len(node.children) == 1:
+                    child = node.children[0]
+                    if isinstance(child, ForNode) and child.iter_var.dim_id == "d0" and child.iter_var.extent == 4:
+                        outer_id = iv.var_id
+                        inner_id = child.iter_var.var_id
+                        return True
+                for c in node.children:
+                    if scan(c):
+                        return True
+            return False
+
+        for r in module.body:
+            if scan(r):
+                return outer_id, inner_id
+        return None, None
+
+    outer_id, inner_id = find_split_pair(module2)
+    assert outer_id is not None and inner_id is not None
+
+    """Fusing (4, 4) -> fused extent=16. The inner (extent=4) is NOT any leaf's innermost;
+    d0's innermost is still the canonical inner (extent=128) below them. So no MIN/MAX
+    check should fire, and the fuse is legal."""
+    atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
+    assert atom.is_legal(module2) is True
