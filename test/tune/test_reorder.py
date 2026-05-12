@@ -77,21 +77,24 @@ def _find_matmul_subtree_iter_vars(module):
     the outer (trip) iter-var of each axis — the first ForNode per dim
     in the matmul spine.
     """
+    d0 = module.axis_id_by_name("d0")
+    d1 = module.axis_id_by_name("d1")
+    d3 = module.axis_id_by_name("d3")
     fns = _collect_fornodes(module)
     d0_acc = next(
-        iv.var_id for _, node in fns if (iv := node.iter_var).dim_id == "d0" and iv.role == AxisRole.ACCUMULATION
+        iv.var_id for _, node in fns if (iv := node.iter_var).axis_id == d0 and iv.role == AxisRole.ACCUMULATION
     )
-    d1 = next(
+    d1_iv = next(
         iv.var_id
         for _, node in fns
-        if (iv := node.iter_var).dim_id == "d1" and iv.role == AxisRole.PARALLEL and _is_under_matmul(module, iv.var_id)
+        if (iv := node.iter_var).axis_id == d1 and iv.role == AxisRole.PARALLEL and _is_under_matmul(module, iv.var_id)
     )
-    d3 = next(
+    d3_iv = next(
         iv.var_id
         for _, node in fns
-        if (iv := node.iter_var).dim_id == "d3" and iv.role == AxisRole.PARALLEL and _is_under_matmul(module, iv.var_id)
+        if (iv := node.iter_var).axis_id == d3 and iv.role == AxisRole.PARALLEL and _is_under_matmul(module, iv.var_id)
     )
-    return d0_acc, d1, d3
+    return d0_acc, d1_iv, d3_iv
 
 
 def _find_matmul_d1_inner_d3_outer(module):
@@ -102,14 +105,16 @@ def _find_matmul_d1_inner_d3_outer(module):
     of ForNodes whose role-commute is PAR/PAR (both parallel) is the
     ``(d1_inner, d3_outer)`` pair — both bind PARALLEL iter-vars.
     """
+    d1 = module.axis_id_by_name("d1")
+    d3 = module.axis_id_by_name("d3")
     fns = _collect_fornodes(module)
     d1_ids = [
-        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d1" and _is_under_matmul(module, n.iter_var.var_id)
+        n.iter_var.var_id for _, n in fns if n.iter_var.axis_id == d1 and _is_under_matmul(module, n.iter_var.var_id)
     ]
     d3_ids = [
-        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d3" and _is_under_matmul(module, n.iter_var.var_id)
+        n.iter_var.var_id for _, n in fns if n.iter_var.axis_id == d3 and _is_under_matmul(module, n.iter_var.var_id)
     ]
-    assert len(d1_ids) == 2 and len(d3_ids) == 2, "expected outer+inner per dim under matmul"
+    assert len(d1_ids) == 2 and len(d3_ids) == 2, "expected outer+inner per axis under matmul"
     d1_inner = d1_ids[1]
     d3_outer = d3_ids[0]
     return d1_inner, d3_outer
@@ -151,13 +156,15 @@ def test_reorder_rejects_par_acc_with_write_on_par_dim() -> None:
     matmul's RMW write depends on d1 → impure. Illegal.
     """
     module = build_canonical_module(_matmul_large, _SPECS)
+    d0 = module.axis_id_by_name("d0")
+    d1 = module.axis_id_by_name("d1")
     """Find d0_inner (second d0 iter-var under matmul) and d1_outer."""
     fns = _collect_fornodes(module)
     d0_ids = [
-        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d0" and _is_under_matmul(module, n.iter_var.var_id)
+        n.iter_var.var_id for _, n in fns if n.iter_var.axis_id == d0 and _is_under_matmul(module, n.iter_var.var_id)
     ]
     d1_ids = [
-        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d1" and _is_under_matmul(module, n.iter_var.var_id)
+        n.iter_var.var_id for _, n in fns if n.iter_var.axis_id == d1 and _is_under_matmul(module, n.iter_var.var_id)
     ]
     assert len(d0_ids) >= 2 and len(d1_ids) >= 1
     d0_inner = d0_ids[1]
@@ -169,12 +176,14 @@ def test_reorder_rejects_par_acc_with_write_on_par_dim() -> None:
 def test_reorder_apply_raises_on_illegal() -> None:
     """Calling apply on an illegal reorder raises AtomLegalityError."""
     module = build_canonical_module(_matmul_large, _SPECS)
+    d0 = module.axis_id_by_name("d0")
+    d1 = module.axis_id_by_name("d1")
     fns = _collect_fornodes(module)
     d0_ids = [
-        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d0" and _is_under_matmul(module, n.iter_var.var_id)
+        n.iter_var.var_id for _, n in fns if n.iter_var.axis_id == d0 and _is_under_matmul(module, n.iter_var.var_id)
     ]
     d1_ids = [
-        n.iter_var.var_id for _, n in fns if n.iter_var.dim_id == "d1" and _is_under_matmul(module, n.iter_var.var_id)
+        n.iter_var.var_id for _, n in fns if n.iter_var.axis_id == d1 and _is_under_matmul(module, n.iter_var.var_id)
     ]
     assert len(d0_ids) >= 2 and len(d1_ids) >= 1
     atom = Reorder(iter_var_ids=(d1_ids[0], d0_ids[1]))
@@ -201,13 +210,14 @@ def test_reorder_round_trip_restores_canonical() -> None:
 def test_reorder_requires_contiguous_chain() -> None:
     """Iter vars from disjoint subtrees cannot be reordered together."""
     module = build_canonical_module(_matmul_large, _SPECS)
+    d0 = module.axis_id_by_name("d0")
     d0_acc, _d1, _d3 = _find_matmul_subtree_iter_vars(module)
     """Find a d0 from the LOAD subtree (non-matmul)."""
     fns = _collect_fornodes(module)
     d0_load = next(
         iv.var_id
         for _, node in fns
-        if (iv := node.iter_var).dim_id == "d0" and iv.role == AxisRole.PARALLEL and iv.var_id != d0_acc
+        if (iv := node.iter_var).axis_id == d0 and iv.role == AxisRole.PARALLEL and iv.var_id != d0_acc
     )
     """Attempt to reorder a load's d0 with matmul's d0 — disjoint subtrees, illegal."""
     atom = Reorder(iter_var_ids=(d0_load, d0_acc))

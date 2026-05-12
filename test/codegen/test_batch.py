@@ -10,7 +10,7 @@ import random
 import pytest
 
 from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import DimInfo, ForNode, IterVar, KernelModule, NKIOpCall, SBlock
+from nkigym.codegen.ir import Axis, ForNode, IterVar, KernelModule, NKIOpCall, SBlock
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import AxisRole
@@ -129,7 +129,7 @@ def test_enumerate_pool_exhausts_small_graph(monkeypatch: pytest.MonkeyPatch) ->
 
     def _module_with_body(tag: int) -> KernelModule:
         """Build a minimal KernelModule whose subtree_signature varies by ``tag``."""
-        iv = IterVar(var_id=tag, dim_id=f"d{tag}", extent=tag + 1, role=AxisRole.PARALLEL)
+        iv = IterVar(var_id=tag, axis_id=tag, extent=tag + 1, role=AxisRole.PARALLEL)
         stub_block = SBlock(
             iter_vars=[iv],
             reads={},
@@ -143,7 +143,7 @@ def test_enumerate_pool_exhausts_small_graph(monkeypatch: pytest.MonkeyPatch) ->
             param_names=[],
             return_name="",
             tensors={},
-            dims={f"d{tag}": DimInfo(dim_id=f"d{tag}", total_size=tag + 1)},
+            axes={tag: Axis(axis_id=tag, name=f"d{tag}", total_size=tag + 1)},
             body=body,
         )
 
@@ -187,7 +187,7 @@ def test_enumerate_pool_exhausts_small_graph(monkeypatch: pytest.MonkeyPatch) ->
 
 def _fake_module(tag: int) -> KernelModule:
     """Build a minimal module stand-in for sample_pool tests."""
-    return KernelModule(func_name=f"k{tag}", param_names=[], return_name="", tensors={}, dims={})
+    return KernelModule(func_name=f"k{tag}", param_names=[], return_name="", tensors={}, axes={})
 
 
 def test_sample_pool_exact_fill() -> None:

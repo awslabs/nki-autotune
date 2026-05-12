@@ -71,10 +71,11 @@ def _find_block_writing(module, tensor_name: str) -> tuple[int, ...]:
 
 def _find_matmul_d0_acc_path(module) -> tuple[int, ...]:
     """Return the path to the matmul's ``d0`` ACC ForNode (extent 16)."""
+    d0 = module.axis_id_by_name("d0")
     for path, node in _collect_paths(module):
         if isinstance(node, ForNode):
             iv = node.iter_var
-            if iv.dim_id == "d0" and iv.role == AxisRole.ACCUMULATION:
+            if iv.axis_id == d0 and iv.role == AxisRole.ACCUMULATION:
                 return path
     raise AssertionError("No d0 ACC ForNode")
 
@@ -132,13 +133,14 @@ def test_compute_at_apply_moves_block_under_target() -> None:
     assert validate_dataflow_ordering(new_mod)
 
     """Walk the new tree: the block writing rhs_sbuf should appear under
-    a ForNode whose dim_id == 'd0' (target's ancestor chain's dim)."""
+    a ForNode whose axis_id is d0 (target's ancestor chain's axis)."""
+    d0_new = new_mod.axis_id_by_name("d0")
 
     def has_rhs_load_under_d0(node, under_d0: bool) -> bool:
         if isinstance(node, SBlock):
             writes = {a.tensor_name for a in node.writes.values()}
             return under_d0 and "rhs_sbuf" in writes
-        is_d0 = node.iter_var.dim_id == "d0"
+        is_d0 = node.iter_var.axis_id == d0_new
         next_under = under_d0 or is_d0
         return any(has_rhs_load_under_d0(c, next_under) for c in node.children)
 
@@ -231,8 +233,8 @@ def test_compute_at_unmatched_suffix_forms_inner_fornodes() -> None:
     assert relocated is not None
     """Unmatched suffix: d3 outer+inner remain, plus d0 inner (target's
     ancestor chain only covers d0 outer)."""
-    remaining_dims = [iv.dim_id for iv in relocated.iter_vars]
-    assert "d3" in remaining_dims
+    remaining_names = [new_mod.axes[iv.axis_id].name for iv in relocated.iter_vars]
+    assert "d3" in remaining_names
     assert (
-        remaining_dims.count("d0") == 1
-    ), f"expected d0 outer merged, inner remaining (1 d0 left); got {remaining_dims}"
+        remaining_names.count("d0") == 1
+    ), f"expected d0 outer merged, inner remaining (1 d0 left); got {remaining_names}"

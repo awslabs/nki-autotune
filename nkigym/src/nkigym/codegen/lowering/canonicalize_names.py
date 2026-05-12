@@ -1,13 +1,13 @@
 """Canonical iter-var naming pass.
 
-Assigns ``ForNode.name = "i_<dim>_<ordinal>"`` deterministically across
-the schedule tree. Ordinals are per-tree and per-dim: sibling subtrees
+Assigns ``ForNode.name = "i_<axis_name>_<ordinal>"`` deterministically across
+the schedule tree. Ordinals are per-tree and per-axis: sibling subtrees
 see identical ordinal counts (counters are restored on ascent), but
-nested same-dim ForNodes get increasing ordinals top-down (e.g. a Split
+nested same-axis ForNodes get increasing ordinals top-down (e.g. a Split
 pair on ``d0`` renders as ``i_d0_0`` outside, ``i_d0_1`` inside).
 
-Matches v1's canonical naming behavior. Runs after Task 13's
-``place_buffers`` and before ``emit_source`` in the render pipeline.
+The axis's display name is consulted via ``module.axes[iv.axis_id].name``;
+identity remains ``axis_id`` so renames cannot change the tree's logic.
 """
 
 from nkigym.codegen.ir import ForNode, KernelModule, SBlock
@@ -20,23 +20,24 @@ def canonicalize_iter_var_names(module: KernelModule) -> None:
         module: KernelModule whose body tree will be named in place.
     """
     for root in module.body:
-        _walk(root, counts={})
+        _walk(root, module, counts={})
 
 
-def _walk(node: ForNode | SBlock, counts: dict[str, int]) -> None:
-    """Depth-first walker; assigns each ForNode a per-dim ordinal name.
+def _walk(node: ForNode | SBlock, module: KernelModule, counts: dict[int, int]) -> None:
+    """Depth-first walker; assigns each ForNode a per-axis ordinal name.
 
-    ``counts[dim]`` tracks how many same-dim ancestors the current node
-    has. The node takes that as its ordinal, recurses with the counter
-    incremented, then restores it so sibling subtrees start at the same
-    count their parent saw.
+    ``counts[axis_id]`` tracks how many same-axis ancestors the current
+    node has. The node takes that as its ordinal, recurses with the
+    counter incremented, then restores it so sibling subtrees start at
+    the same count their parent saw.
     """
     if isinstance(node, SBlock):
         return
-    dim = node.iter_var.dim_id
-    k = counts.get(dim, 0)
-    node.name = f"i_{dim}_{k}"
-    counts[dim] = k + 1
+    axis_id = node.iter_var.axis_id
+    axis_name = module.axes[axis_id].name
+    k = counts.get(axis_id, 0)
+    node.name = f"i_{axis_name}_{k}"
+    counts[axis_id] = k + 1
     for child in node.children:
-        _walk(child, counts)
-    counts[dim] = k
+        _walk(child, module, counts)
+    counts[axis_id] = k

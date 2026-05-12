@@ -161,7 +161,7 @@ def _roles_commute_pair(a: ForNode, b: ForNode) -> bool:
 
     PAR x PAR: always.
     ACC x ACC: legal (reduce_op distinctions not encoded in v2 iter vars).
-    PAR x ACC: legal iff subtree is leaf-pure w.r.t. the PAR dim.
+    PAR x ACC: legal iff subtree is leaf-pure w.r.t. the PAR axis.
     SEQ: never.
     """
     result: bool
@@ -174,15 +174,15 @@ def _roles_commute_pair(a: ForNode, b: ForNode) -> bool:
     elif role_a == AxisRole.ACCUMULATION and role_b == AxisRole.ACCUMULATION:
         result = True
     else:
-        par_dim = a.iter_var.dim_id if role_a == AxisRole.PARALLEL else b.iter_var.dim_id
+        par_axis_id = a.iter_var.axis_id if role_a == AxisRole.PARALLEL else b.iter_var.axis_id
         acc_node = a if role_a == AxisRole.ACCUMULATION else b
-        result = _subtree_pure_wrt_dim(acc_node, par_dim)
+        result = _subtree_pure_wrt_axis(acc_node, par_axis_id)
     return result
 
 
-def _subtree_pure_wrt_dim(node: ForNode | SBlock, par_dim: str) -> bool:
+def _subtree_pure_wrt_axis(node: ForNode | SBlock, par_axis_id: int) -> bool:
     """Return True iff no block under ``node`` writes a tensor indexed by
-    ``par_dim`` as PARALLEL role.
+    ``par_axis_id`` as PARALLEL role.
 
     Consults each block's ``NKIOpCall.axis_map`` + ``dim_role``. A block
     with empty writes AND empty reads_writes contributes no write — skip.
@@ -192,8 +192,8 @@ def _subtree_pure_wrt_dim(node: ForNode | SBlock, par_dim: str) -> bool:
         if not block.writes and not block.reads_writes:
             continue
         for call in block.body:
-            for concrete_dim in call.axis_map.values():
-                if concrete_dim == par_dim and call.dim_role.get(concrete_dim) == AxisRole.PARALLEL:
+            for axis_id in call.axis_map.values():
+                if axis_id == par_axis_id and call.dim_role.get(axis_id) == AxisRole.PARALLEL:
                     result = False
                     break
             if not result:

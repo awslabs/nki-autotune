@@ -150,14 +150,15 @@ def test_reverse_compute_at_apply_moves_block_under_target() -> None:
     assert validate_dataflow_ordering(new_mod)
 
     """Walk the new tree: the store should appear under a ForNode whose
-    dim_id == 'd1' (target's ancestor chain's dim)."""
+    axis_id is d1 (target's ancestor chain's axis)."""
+    d1_new = new_mod.axis_id_by_name("d1")
 
     def has_store_under_d1(node, under_d1: bool) -> bool:
         result: bool
         if isinstance(node, SBlock):
             result = under_d1 and any(c.op_cls.__name__ == "NKIStore" for c in node.body)
         else:
-            is_d1 = node.iter_var.dim_id == "d1"
+            is_d1 = node.iter_var.axis_id == d1_new
             next_under = under_d1 or is_d1
             result = any(has_store_under_d1(c, next_under) for c in node.children)
         return result
@@ -220,11 +221,11 @@ def test_reverse_compute_at_unmatched_suffix_forms_inner_fornodes() -> None:
     assert relocated is not None
     """Unmatched suffix: d3 outer+inner remain, plus d1 inner (target's
     ancestor chain only covers d1 outer)."""
-    remaining_dims = [iv.dim_id for iv in relocated.iter_vars]
-    assert "d3" in remaining_dims
+    remaining_names = [new_mod.axes[iv.axis_id].name for iv in relocated.iter_vars]
+    assert "d3" in remaining_names
     assert (
-        remaining_dims.count("d1") == 1
-    ), f"expected d1 outer merged, inner remaining (1 d1 left); got {remaining_dims}"
+        remaining_names.count("d1") == 1
+    ), f"expected d1 outer merged, inner remaining (1 d1 left); got {remaining_names}"
 
 
 def test_reverse_compute_at_role_promotion_on_matmul_under_load() -> None:
@@ -236,12 +237,13 @@ def test_reverse_compute_at_role_promotion_on_matmul_under_load() -> None:
     ACC. A fresh iter var is allocated.
     """
     module = build_canonical_module(_matmul_large, _SPECS)
+    d0 = module.axis_id_by_name("d0")
     counter_before = module.iter_var_counter
     mm_path = _find_block_with_op(module, "NKIMatmul")
     """Find lhs_T load's outer d0-PAR ForNode (root[5], depth-1)."""
     load_root_path: tuple[int, ...] | None = None
     for path, node in _collect_paths(module):
-        if len(path) == 1 and isinstance(node, ForNode) and node.iter_var.dim_id == "d0":
+        if len(path) == 1 and isinstance(node, ForNode) and node.iter_var.axis_id == d0:
             if _has_op_in_subtree(node, "NKILoad"):
                 """Pick the one writing lhs_T_sbuf."""
                 for _sp, sn in _collect_paths(module):

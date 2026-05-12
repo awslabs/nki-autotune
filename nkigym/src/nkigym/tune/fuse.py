@@ -1,9 +1,14 @@
 """``Fuse`` atom — TVM-style ``sch.fuse(outer, inner)``.
 
 Collapses a perfectly-nested ForNode pair ``ForNode(v_outer) >
-ForNode(v_inner) > ...`` into a single ``ForNode(v_fused)`` whose
-iter-var binds a synthetic dim ``<outer_dim>_x_<inner_dim>`` with
-extent ``outer.extent * inner.extent``.
+ForNode(v_inner) > ...`` into a single ``ForNode(v_fused)``.
+
+Same-axis fuse preserves axis identity: the fused iter-var reuses the
+existing ``axis_id``, so subsequent atoms that look for "loops on axis X"
+still find it. Cross-axis fuse allocates a fresh :class:`Axis` with
+``source_axes=(outer.axis_id, inner.axis_id)`` and a derived display
+name (``f"{outer.name}_x_{inner.name}"``); identity is still carried by
+the new integer axis_id.
 
 Legality:
 
@@ -17,17 +22,15 @@ Legality:
 Apply:
 
 1. Retire ``v_outer`` and ``v_inner``.
-2. Allocate ``v_fused`` with dim_id ``<outer_dim>_x_<inner_dim>`` and
-   extent ``outer.extent * inner.extent``.
-3. Register a synthetic ``DimInfo`` for the new dim so downstream
-   passes (e.g. :func:`place_buffers`) can look it up.
-4. Record the outer/inner decomposition in
+2. Allocate ``v_fused``: same-axis preserves ``axis_id``; cross-axis
+   allocates a fresh :class:`Axis` via ``module.allocate_axis``.
+3. Record the outer/inner decomposition in
    ``module.fused_iter_var_map`` so the renderer emits outer references
    as ``(fused_name // inner_extent)`` and inner as ``(fused_name %
    inner_extent)``.
-5. Replace the two-ForNode chain with a single ``ForNode(v_fused)``
+4. Replace the two-ForNode chain with a single ``ForNode(v_fused)``
    that keeps the inner's children.
-6. Rewrite every SBlock.iter_vars: consecutive ``(v_outer, v_inner)``
+5. Rewrite every SBlock.iter_vars: consecutive ``(v_outer, v_inner)``
    collapses to ``(v_fused,)`` in the same list position.
 
 ``BufferAccess.pattern`` is untouched — the retired iter-var ids still
@@ -39,7 +42,7 @@ See ``docs/superpowers/specs/2026-05-10-iter-var-refactor-design.md`` 4.3.
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import DimInfo, ForNode, IterVar, KernelModule, SBlock, TreeIR, replace_at_path
+from nkigym.codegen.ir import ForNode, IterVar, KernelModule, SBlock, TreeIR, replace_at_path
 from nkigym.ops.base import AxisRole
 from nkigym.tune import AtomLegalityError
 from nkigym.tune.split import _abstract_axis_for, _op_cls_for_block
@@ -86,29 +89,32 @@ class Fuse:
         """Validate fused extent against MIN/MAX bounds when fuse touches an innermost.
 
         Cases:
-            - ``d_o == d_i`` and ``inner`` is the last iter-var for this
-              dim in a descendant leaf's ``iter_vars``: post-fuse the new
-              innermost for this leaf becomes the fused iter-var, so its
-              extent must be in ``[MIN, MAX]`` for the leaf's op on that
-              abstract axis.
-            - ``d_o != d_i`` (cross-dim fuse): the resulting iter-var
-              carries a synthetic dim id not present in any op's
+            - ``a_o == a_i`` (same axis) and ``inner`` is the last iter-var
+              for this axis in a descendant leaf's ``iter_vars``: post-fuse
+              the new innermost for this leaf becomes the fused iter-var,
+              so its extent must be in ``[MIN, MAX]`` for the leaf's op on
+              the corresponding abstract axis.
+            - ``a_o != a_i`` (cross-axis fuse): the resulting iter-var
+              carries a fresh ``axis_id`` not present in any op's
               ``axis_map``. The leaf no longer has individual iter-vars
-              for the retired dims; MIN/MAX checks against the synthetic
-              dim are not meaningful, so skip.
+              for the retired axes; MIN/MAX checks against the synthetic
+              axis are not meaningful, so skip.
         """
-        d_o = outer.iter_var.dim_id
-        d_i = inner.iter_var.dim_id
+        a_o = outer.iter_var.axis_id
+        a_i = inner.iter_var.axis_id
         legal = True
-        if d_o == d_i:
-            fused_dim = d_o
+        if a_o == a_i:
+            fused_axis_id = a_o
             fused_extent = outer.iter_var.extent * inner.iter_var.extent
             inner_id = inner.iter_var.var_id
-            legal = _walk_leaves_for_min_max(inner.children, fused_dim, inner_id, fused_extent)
+            legal = _walk_leaves_for_min_max(inner.children, fused_axis_id, inner_id, fused_extent)
         return legal
 
     def apply(self, module: KernelModule) -> KernelModule:
         """Execute the fuse.
+
+        Same-axis fuse preserves ``axis_id``; cross-axis fuse allocates a
+        fresh :class:`Axis` with ``source_axes=(outer.axis_id, inner.axis_id)``.
 
         Raises:
             AtomLegalityError: ``is_legal`` returns False against ``module``.
@@ -121,17 +127,24 @@ class Fuse:
         v_outer = outer_node.iter_var
         v_inner = inner_node.iter_var
 
-        fused_dim = f"{v_outer.dim_id}_x_{v_inner.dim_id}"
         fused_extent = v_outer.extent * v_inner.extent
         fused_role = max(v_outer.role, v_inner.role, key=_ROLE_RANK.__getitem__)
-        v_fused = module.allocate_iter_var(dim_id=fused_dim, extent=fused_extent, role=fused_role)
 
-        """Register synthetic DimInfo. Under per-op tiling, trip count
-        lives on v_fused.extent; the synthetic DimInfo only needs its
-        dim_id and total_size. total_size = fused_extent because the
-        fused loop iterates fused_extent times (outer.extent * inner.extent).
-        Buffer sizing consults writer access extents, not this field."""
-        module.dims[fused_dim] = DimInfo(dim_id=fused_dim, total_size=fused_extent)
+        if v_outer.axis_id == v_inner.axis_id:
+            """Same-axis fuse: reuse the existing axis_id; no new Axis needed."""
+            fused_axis_id = v_outer.axis_id
+        else:
+            """Cross-axis fuse: allocate a fresh Axis with source_axes trace."""
+            outer_axis = module.axes[v_outer.axis_id]
+            inner_axis = module.axes[v_inner.axis_id]
+            fused_axis = module.allocate_axis(
+                name=f"{outer_axis.name}_x_{inner_axis.name}",
+                total_size=fused_extent,
+                source_axes=(v_outer.axis_id, v_inner.axis_id),
+            )
+            fused_axis_id = fused_axis.axis_id
+
+        v_fused = module.allocate_iter_var(axis_id=fused_axis_id, extent=fused_extent, role=fused_role)
 
         """Record the decomposition so the renderer can emit
         ``(fused // inner_extent)`` and ``(fused % inner_extent)``."""
@@ -182,10 +195,10 @@ def _find_pair(module: KernelModule, outer_id: int, inner_id: int) -> tuple[ForN
 
 
 def _walk_leaves_for_min_max(
-    children: list[ForNode | SBlock], fused_dim: str, inner_id: int, fused_extent: int
+    children: list[ForNode | SBlock], fused_axis_id: int, inner_id: int, fused_extent: int
 ) -> bool:
     """Walk a ForNode's descendants; for each SBlock whose innermost
-    iter-var for ``fused_dim`` is the fuse's inner iter-var, check the
+    iter-var for ``fused_axis_id`` is the fuse's inner iter-var, check the
     fused extent against ``MIN``/``MAX`` on the op's abstract axis.
     """
     legal = True
@@ -195,10 +208,10 @@ def _walk_leaves_for_min_max(
         if not legal:
             return
         if isinstance(node, SBlock):
-            ivs_for_dim = [iv for iv in node.iter_vars if iv.dim_id == fused_dim]
-            if not ivs_for_dim or ivs_for_dim[-1].var_id != inner_id:
+            ivs_for_axis = [iv for iv in node.iter_vars if iv.axis_id == fused_axis_id]
+            if not ivs_for_axis or ivs_for_axis[-1].var_id != inner_id:
                 return
-            abstract_axis = _abstract_axis_for(node, fused_dim)
+            abstract_axis = _abstract_axis_for(node, fused_axis_id)
             op_cls = _op_cls_for_block(node)
             if abstract_axis is None or op_cls is None:
                 return

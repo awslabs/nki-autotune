@@ -58,13 +58,31 @@ class Tensor:
 
 
 @dataclass
-class DimInfo:
-    """Concrete dimension metadata. Tile sizes are per-op and live on
-    ``IterVar.extent`` / ``AccessRange.extent``; this struct only carries
-    dim identity plus its total logical extent."""
+class Axis:
+    """Logical axis — opaque integer identity plus display name.
 
-    dim_id: str
+    Identity is the ``axis_id`` int; two IterVars are on the same logical
+    axis iff their ``axis_id``s are equal. The ``name`` is a cosmetic
+    property consumed by the renderer to spell ``i_<name>_<ordinal>``;
+    changing it never affects logic.
+
+    For axes created by ``Fuse`` across distinct axes, ``source_axes``
+    records the component axis_ids in fuse order (outer-first). Original
+    axes have ``source_axes = None``.
+
+    Attributes:
+        axis_id: Monotonic unique id per module (allocated via
+            :meth:`KernelModule.allocate_axis`).
+        name: Display name, e.g. ``"d0"``, ``"row"``. Purely cosmetic.
+        total_size: Axis extent in elements.
+        source_axes: Tuple of component axis_ids if this axis was created
+            by cross-axis Fuse; ``None`` for original axes.
+    """
+
+    axis_id: int
+    name: str
     total_size: int
+    source_axes: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -76,13 +94,13 @@ class IterVar:
 
     Attributes:
         var_id: Monotonic unique id per module.
-        dim_id: Concrete dim this iter var traverses.
+        axis_id: Logical axis this iter var traverses (integer, stable).
         extent: Trip count (# tiles).
         role: PARALLEL / SEQUENTIAL / ACCUMULATION.
     """
 
     var_id: int
-    dim_id: str
+    axis_id: int
     extent: int
     role: AxisRole
 
@@ -143,15 +161,15 @@ class NKIOpCall:
         op_cls: The NKIOp subclass (e.g. ``NKIMatmul``).
         kwargs: Op-level kwargs (e.g. ``value=0.0`` for memset, ``op="square"``
             for activation_reduce).
-        axis_map: Abstract axis → concrete dim id.
-        dim_role: Concrete dim → AxisRole. Op-local; same dim can have
+        axis_map: Abstract axis → axis_id.
+        dim_role: axis_id → AxisRole. Op-local; same axis can have
             different roles across ops in the module.
     """
 
     op_cls: type
     kwargs: dict[str, Any]
-    axis_map: dict[str, str]
-    dim_role: dict[str, AxisRole]
+    axis_map: dict[str, int]
+    dim_role: dict[int, AxisRole]
 
 
 @dataclass
@@ -215,7 +233,7 @@ from nkigym.codegen.dep_cache import DepCache  # noqa: E402
 
 @dataclass
 class KernelModule:
-    """Envelope IR — signature + tensor/dim declarations + schedule tree.
+    """Envelope IR — signature + tensor/axis declarations + schedule tree.
 
     Analog of TVM's PrimFunc + buffer_map.
 
@@ -224,8 +242,9 @@ class KernelModule:
         param_names: Signature order.
         return_name: Tensor name of the return.
         tensors: All named tensors, keyed by name.
-        dims: All dims, keyed by dim_id.
+        axes: All logical axes, keyed by axis_id.
         iter_var_counter: Monotonic counter for allocating IterVar.var_id.
+        axis_counter: Monotonic counter for allocating Axis.axis_id.
         body: Schedule tree — list of ForNode / SBlock roots.
         dep: Per-scope dependency cache (lazy).
         fused_iter_var_map: Retired iter-var id -> (fused iter-var id,
@@ -239,28 +258,59 @@ class KernelModule:
     param_names: list[str]
     return_name: str
     tensors: dict[str, Tensor]
-    dims: dict[str, DimInfo]
+    axes: dict[int, Axis]
     iter_var_counter: int = 0
+    axis_counter: int = 0
     body: TreeIR = field(default_factory=list)
     dep: DepCache = field(default_factory=lambda: DepCache(scopes={}))
     fused_iter_var_map: dict[int, tuple[int, int, bool]] = field(default_factory=dict)
 
-    def allocate_iter_var(self, dim_id: str, extent: int, role: AxisRole) -> IterVar:
-        """Allocate a fresh IterVar with a monotonic unique id.
+    def allocate_axis(self, name: str, total_size: int, source_axes: tuple[int, ...] | None = None) -> Axis:
+        """Allocate a fresh :class:`Axis` with a monotonic unique ``axis_id``.
+
+        Args:
+            name: Display name for the axis (cosmetic only).
+            total_size: Axis extent in elements.
+            source_axes: Tuple of component axis_ids if this axis is
+                the result of a cross-axis fuse; ``None`` for original axes.
+
+        Returns:
+            The freshly-allocated :class:`Axis`.
+        """
+        axis = Axis(axis_id=self.axis_counter, name=name, total_size=total_size, source_axes=source_axes)
+        self.axes[axis.axis_id] = axis
+        self.axis_counter += 1
+        return axis
+
+    def allocate_iter_var(self, axis_id: int, extent: int, role: AxisRole) -> IterVar:
+        """Allocate a fresh IterVar with a monotonic unique var_id.
 
         Never reuses retired var_ids.
 
         Args:
-            dim_id: The concrete dim this iter var traverses.
+            axis_id: The logical axis this iter var traverses.
             extent: The trip count (# tiles).
             role: PARALLEL / SEQUENTIAL / ACCUMULATION.
 
         Returns:
             A freshly-allocated IterVar.
         """
-        iv = IterVar(var_id=self.iter_var_counter, dim_id=dim_id, extent=extent, role=role)
+        iv = IterVar(var_id=self.iter_var_counter, axis_id=axis_id, extent=extent, role=role)
         self.iter_var_counter += 1
         return iv
+
+    def axis_id_by_name(self, name: str) -> int:
+        """Return the axis_id for the axis with the given display name.
+
+        Raises:
+            KeyError: No axis has this name, or multiple axes share it.
+        """
+        matches = [a.axis_id for a in self.axes.values() if a.name == name]
+        if not matches:
+            raise KeyError(f"no axis with name {name!r}")
+        if len(matches) > 1:
+            raise KeyError(f"multiple axes with name {name!r}: {matches}")
+        return matches[0]
 
 
 def resolve_node(forest: TreeIR, path: tuple[int, ...]) -> "ForNode | SBlock | None":

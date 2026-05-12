@@ -110,12 +110,12 @@ def subtree_signature(node: "ForNode | SBlock") -> int:
         writes_key = tuple(sorted((k, v.tensor_name, v.iter_var_ids, v.pattern) for k, v in node.writes.items()))
         rmw_key = tuple(sorted((k, v.tensor_name, v.iter_var_ids, v.pattern) for k, v in node.reads_writes.items()))
         body_key = tuple(c.op_cls.__name__ for c in node.body)
-        iv_key = tuple((iv.var_id, iv.dim_id, iv.extent, iv.role.value) for iv in node.iter_vars)
+        iv_key = tuple((iv.var_id, iv.axis_id, iv.extent, iv.role.value) for iv in node.iter_vars)
         result = hash(("block", iv_key, reads_key, writes_key, rmw_key, body_key))
     else:
         iv = node.iter_var
         result = hash(
-            ("for", iv.var_id, iv.dim_id, iv.extent, iv.role.value, tuple(subtree_signature(c) for c in node.children))
+            ("for", iv.var_id, iv.axis_id, iv.extent, iv.role.value, tuple(subtree_signature(c) for c in node.children))
         )
     return result
 

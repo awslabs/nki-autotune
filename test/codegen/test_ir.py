@@ -4,39 +4,46 @@ import pytest
 
 from nkigym.codegen.ir import (
     AccessRange,
+    Axis,
     BufferAccess,
     ForNode,
     IterVar,
     KernelModule,
     NKIOpCall,
     SBlock,
+    Tensor,
     blocks_under,
     replace_at_path,
     resolve_node,
+    validate_dataflow_ordering,
 )
+from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import AxisRole
+from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.memset import NKIMemset
+from nkigym.ops.tensor_copy import NKITensorCopy
 
 
 def test_iter_var_is_frozen() -> None:
     """IterVar must be immutable — atoms retire and replace, never mutate."""
-    iv = IterVar(var_id=0, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
+    iv = IterVar(var_id=0, axis_id=0, extent=4, role=AxisRole.PARALLEL)
     with pytest.raises(AttributeError):
         iv.extent = 8  # type: ignore[misc]
 
 
 def test_iter_var_equality_by_fields() -> None:
     """Two IterVars with the same fields compare equal."""
-    a = IterVar(var_id=0, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
-    b = IterVar(var_id=0, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
+    a = IterVar(var_id=0, axis_id=0, extent=4, role=AxisRole.PARALLEL)
+    b = IterVar(var_id=0, axis_id=0, extent=4, role=AxisRole.PARALLEL)
     assert a == b
     assert hash(a) == hash(b)
 
 
 def test_iter_var_distinct_ids() -> None:
-    """Same dim, different var_ids → unequal (distinct iter vars)."""
-    a = IterVar(var_id=0, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
-    b = IterVar(var_id=1, dim_id="d0", extent=4, role=AxisRole.PARALLEL)
+    """Same axis, different var_ids → unequal (distinct iter vars)."""
+    a = IterVar(var_id=0, axis_id=0, extent=4, role=AxisRole.PARALLEL)
+    b = IterVar(var_id=1, axis_id=0, extent=4, role=AxisRole.PARALLEL)
     assert a != b
 
 
@@ -100,8 +107,8 @@ def test_sblock_single_leaf_canonical() -> None:
     call = NKIOpCall(
         op_cls=NKIMatmul,
         kwargs={},
-        axis_map={"K": "d0", "M": "d1", "N": "d3"},
-        dim_role={"d0": AxisRole.ACCUMULATION, "d1": AxisRole.PARALLEL, "d3": AxisRole.PARALLEL},
+        axis_map={"K": 0, "M": 1, "N": 3},
+        dim_role={0: AxisRole.ACCUMULATION, 1: AxisRole.PARALLEL, 3: AxisRole.PARALLEL},
     )
     lhs_access = BufferAccess(
         tensor_name="lhs_T_sbuf",
@@ -109,7 +116,7 @@ def test_sblock_single_leaf_canonical() -> None:
         pattern=(AccessRange.make({0: 1}, 0, 128), AccessRange.make({1: 1}, 0, 128)),
     )
     block = SBlock(
-        iter_vars=[IterVar(0, "d0", 4, AxisRole.ACCUMULATION)],
+        iter_vars=[IterVar(0, 0, 4, AxisRole.ACCUMULATION)],
         reads={"stationary": lhs_access},
         writes={},
         reads_writes={},
@@ -137,9 +144,9 @@ def test_sblock_annotations_default_empty() -> None:
 
 def test_for_node_binds_iter_var_by_reference() -> None:
     """ForNode stores an IterVar; multiple ForNodes can bind distinct iter
-    vars on the same dim."""
-    iv_outer = IterVar(0, "d0", 2, AxisRole.PARALLEL)
-    iv_inner = IterVar(1, "d0", 2, AxisRole.PARALLEL)
+    vars on the same axis."""
+    iv_outer = IterVar(0, 0, 2, AxisRole.PARALLEL)
+    iv_inner = IterVar(1, 0, 2, AxisRole.PARALLEL)
     outer = ForNode(iter_var=iv_outer, children=[])
     inner = ForNode(iter_var=iv_inner, children=[])
     outer.children.append(inner)
@@ -149,14 +156,14 @@ def test_for_node_binds_iter_var_by_reference() -> None:
 
 def test_for_node_annotations_default_empty() -> None:
     """annotations default to empty dict."""
-    iv = IterVar(0, "d0", 4, AxisRole.PARALLEL)
+    iv = IterVar(0, 0, 4, AxisRole.PARALLEL)
     fn = ForNode(iter_var=iv, children=[])
     assert fn.annotations == {}
 
 
 def test_for_node_supports_sblock_child() -> None:
     """ForNode.children can hold SBlocks and nested ForNodes."""
-    iv = IterVar(0, "d0", 4, AxisRole.PARALLEL)
+    iv = IterVar(0, 0, 4, AxisRole.PARALLEL)
     block = SBlock(iter_vars=[], reads={}, writes={}, reads_writes={}, body=[])
     fn = ForNode(iter_var=iv, children=[block])
     assert isinstance(fn.children[0], SBlock)
@@ -164,35 +171,32 @@ def test_for_node_supports_sblock_child() -> None:
 
 def test_for_node_name_defaults_none() -> None:
     """ForNode.name defaults to None; set by canonicalize pass."""
-    iv = IterVar(0, "d0", 4, AxisRole.PARALLEL)
+    iv = IterVar(0, 0, 4, AxisRole.PARALLEL)
     fn = ForNode(iter_var=iv, children=[])
     assert fn.name is None
 
 
 def test_kernel_module_minimal() -> None:
-    """KernelModule carries signature + tensors + dims + body + iter_var_counter."""
-    from nkigym.codegen.ir import DimInfo, KernelModule, Tensor
-
+    """KernelModule carries signature + tensors + axes + body + iter_var_counter."""
     tensors = {
         "x": Tensor(
             name="x", dim_ids=("d0",), shape=(128,), dtype="float32", origin="param", location="hbm", buffer_degree={}
         )
     }
-    dims = {"d0": DimInfo(dim_id="d0", total_size=128)}
     m = KernelModule(
-        func_name="f", param_names=["x"], return_name="x", tensors=tensors, dims=dims, iter_var_counter=0, body=[]
+        func_name="f", param_names=["x"], return_name="x", tensors=tensors, axes={}, iter_var_counter=0, body=[]
     )
+    m.allocate_axis(name="d0", total_size=128)
     assert m.iter_var_counter == 0
     assert m.body == []
 
 
 def test_kernel_module_allocates_monotonic_iter_var_ids() -> None:
     """allocate_iter_var bumps the counter and returns a fresh IterVar."""
-    from nkigym.codegen.ir import KernelModule
-
-    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, dims={}, iter_var_counter=0, body=[])
-    iv1 = m.allocate_iter_var("d0", extent=4, role=AxisRole.PARALLEL)
-    iv2 = m.allocate_iter_var("d0", extent=4, role=AxisRole.PARALLEL)
+    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, axes={}, iter_var_counter=0, body=[])
+    axis = m.allocate_axis(name="d0", total_size=128)
+    iv1 = m.allocate_iter_var(axis.axis_id, extent=4, role=AxisRole.PARALLEL)
+    iv2 = m.allocate_iter_var(axis.axis_id, extent=4, role=AxisRole.PARALLEL)
     assert iv1.var_id == 0
     assert iv2.var_id == 1
     assert m.iter_var_counter == 2
@@ -200,9 +204,7 @@ def test_kernel_module_allocates_monotonic_iter_var_ids() -> None:
 
 def test_kernel_module_default_body_and_dep() -> None:
     """Empty body and fresh DepCache by default."""
-    from nkigym.codegen.ir import KernelModule
-
-    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, dims={})
+    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, axes={})
     assert m.body == []
     assert m.iter_var_counter == 0
     assert m.dep is not None
@@ -210,8 +212,9 @@ def test_kernel_module_default_body_and_dep() -> None:
 
 def _mk_mod_with_single_block() -> KernelModule:
     """Build a minimal module: one ForNode → SBlock tree."""
-    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, dims={}, iter_var_counter=0, body=[])
-    iv = m.allocate_iter_var("d0", 4, AxisRole.PARALLEL)
+    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, axes={}, iter_var_counter=0, body=[])
+    axis = m.allocate_axis(name="d0", total_size=128)
+    iv = m.allocate_iter_var(axis.axis_id, 4, AxisRole.PARALLEL)
     block = SBlock(iter_vars=[iv], reads={}, writes={}, reads_writes={}, body=[])
     root = ForNode(iter_var=iv, children=[block])
     m.body.append(root)
@@ -280,7 +283,6 @@ def test_replace_at_path_swaps_subtree() -> None:
     new_root = new_body[0]
     assert isinstance(new_root, ForNode)
     assert new_root.children[0] is new_block
-    # Original untouched (non-destructive)
     assert m.body[0] is not new_root  # type: ignore[comparison-overlap]
 
 
@@ -297,13 +299,6 @@ def test_replace_at_path_replaces_root() -> None:
     new_root = SBlock(iter_vars=[], reads={}, writes={}, reads_writes={}, body=[])
     new_body = replace_at_path(m.body, (0,), new_root)
     assert new_body[0] is new_root
-
-
-from nkigym.codegen.ir import DimInfo, Tensor, validate_dataflow_ordering
-from nkigym.ops.alloc import NKIAlloc
-from nkigym.ops.load import NKILoad
-from nkigym.ops.memset import NKIMemset
-from nkigym.ops.tensor_copy import NKITensorCopy
 
 
 def _mk_access(name: str, iv_id: int) -> BufferAccess:
@@ -324,16 +319,16 @@ def test_validate_rejects_read_before_alloc() -> None:
             buffer_degree={},
         )
     }
-    dims = {"d0": DimInfo("d0", 128)}
     m = KernelModule(
         func_name="f",
         param_names=[],
         return_name="x",
         tensors=tensors,
-        dims=dims,
+        axes={},
         iter_var_counter=0,
         body=[SBlock(iter_vars=[], reads={"src": _mk_access("x", 0)}, writes={}, reads_writes={}, body=[])],
     )
+    m.allocate_axis(name="d0", total_size=128)
     assert not validate_dataflow_ordering(m)
 
 
@@ -350,7 +345,6 @@ def test_validate_accepts_alloc_then_write_then_read() -> None:
             buffer_degree={},
         )
     }
-    dims = {"d0": DimInfo("d0", 128)}
     alloc_call = NKIOpCall(
         op_cls=NKIAlloc,
         kwargs={"tensor_name": "x", "location": "sbuf", "shape": (128,), "dtype": "float32"},
@@ -367,10 +361,11 @@ def test_validate_accepts_alloc_then_write_then_read() -> None:
         param_names=[],
         return_name="x",
         tensors=tensors,
-        dims=dims,
+        axes={},
         iter_var_counter=0,
         body=[alloc_block, writer],
     )
+    m.allocate_axis(name="d0", total_size=128)
     assert validate_dataflow_ordering(m)
 
 
@@ -390,7 +385,6 @@ def test_validate_param_tensors_are_pre_allocated() -> None:
             buffer_degree={},
         ),
     }
-    dims = {"d0": DimInfo("d0", 128)}
     alloc_call = NKIOpCall(
         op_cls=NKIAlloc,
         kwargs={"tensor_name": "out", "location": "hbm", "shape": (128,), "dtype": "float32"},
@@ -412,10 +406,11 @@ def test_validate_param_tensors_are_pre_allocated() -> None:
         param_names=["p"],
         return_name="out",
         tensors=tensors,
-        dims=dims,
+        axes={},
         iter_var_counter=0,
         body=[alloc_block, copy],
     )
+    m.allocate_axis(name="d0", total_size=128)
     assert validate_dataflow_ordering(m)
 
 
@@ -436,7 +431,6 @@ def test_validate_rejects_alloc_only_return() -> None:
             buffer_degree={},
         )
     }
-    dims = {"d0": DimInfo("d0", 128)}
     alloc_call = NKIOpCall(
         op_cls=NKIAlloc,
         kwargs={"tensor_name": "out", "location": "hbm", "shape": (128,), "dtype": "float32"},
@@ -451,10 +445,11 @@ def test_validate_rejects_alloc_only_return() -> None:
         param_names=[],
         return_name="out",
         tensors=tensors,
-        dims=dims,
+        axes={},
         iter_var_counter=0,
         body=[alloc_block],
     )
+    m.allocate_axis(name="d0", total_size=128)
     assert not validate_dataflow_ordering(m)
 
 
@@ -486,7 +481,6 @@ def test_validate_rejects_read_between_rmw_writes() -> None:
             buffer_degree={},
         ),
     }
-    dims = {"d0": DimInfo("d0", 128)}
 
     alloc_psum = SBlock(
         iter_vars=[],
@@ -549,10 +543,11 @@ def test_validate_rejects_read_between_rmw_writes() -> None:
         param_names=[],
         return_name="out",
         tensors=tensors,
-        dims=dims,
+        axes={},
         iter_var_counter=0,
         body=[alloc_psum, alloc_out, memset_psum, rmw_1, reader, rmw_2],
     )
+    m.allocate_axis(name="d0", total_size=128)
     assert not validate_dataflow_ordering(m)
 
 
@@ -582,7 +577,6 @@ def test_validate_accepts_read_after_all_rmw_writes() -> None:
             buffer_degree={},
         ),
     }
-    dims = {"d0": DimInfo("d0", 128)}
 
     alloc_psum = SBlock(
         iter_vars=[],
@@ -645,10 +639,11 @@ def test_validate_accepts_read_after_all_rmw_writes() -> None:
         param_names=[],
         return_name="out",
         tensors=tensors,
-        dims=dims,
+        axes={},
         iter_var_counter=0,
         body=[alloc_psum, alloc_out, memset_psum, rmw_1, rmw_2, reader],
     )
+    m.allocate_axis(name="d0", total_size=128)
     assert validate_dataflow_ordering(m)
 
 
@@ -666,19 +661,17 @@ def test_validate_rejects_unwritten_return() -> None:
             buffer_degree={},
         )
     }
-    dims = {"d0": DimInfo("d0", 128)}
     """Empty body — no alloc, no writers → "out" never enters `written`."""
     m = KernelModule(
-        func_name="f", param_names=[], return_name="out", tensors=tensors, dims=dims, iter_var_counter=0, body=[]
+        func_name="f", param_names=[], return_name="out", tensors=tensors, axes={}, iter_var_counter=0, body=[]
     )
+    m.allocate_axis(name="d0", total_size=128)
     assert not validate_dataflow_ordering(m)
 
 
-def test_dim_info_only_carries_dim_id_and_total_size() -> None:
-    """Per-op tiling model: DimInfo holds identity + total extent only."""
+def test_axis_only_carries_identity_name_and_total_size() -> None:
+    """Per-op tiling model: Axis holds identity + display name + total extent + source_axes."""
     from dataclasses import fields
 
-    from nkigym.codegen.ir import DimInfo
-
-    field_names = {f.name for f in fields(DimInfo)}
-    assert field_names == {"dim_id", "total_size"}
+    field_names = {f.name for f in fields(Axis)}
+    assert field_names == {"axis_id", "name", "total_size", "source_axes"}

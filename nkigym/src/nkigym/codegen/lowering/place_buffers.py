@@ -48,25 +48,37 @@ def _place_one(module: KernelModule, tensor: Tensor) -> None:
     if writer_access is None or not writer_access.pattern:
         return
 
-    per_dim_tile: dict[str, int] = {}
-    for dim_id, ar in zip(tensor.dim_ids, writer_access.pattern):
-        per_dim_tile[dim_id] = ar.extent
+    tensor_axis_ids: list[int] = []
+    for dim_name in tensor.dim_ids:
+        try:
+            tensor_axis_ids.append(module.axis_id_by_name(dim_name))
+        except KeyError:
+            tensor_axis_ids.append(-1)
 
-    required = _required_tiles(module, accesses, per_dim_tile)
-    p_dim = tensor.dim_ids[0]
-    p_tile = per_dim_tile[p_dim]
-    num_p_slots = required.get(p_dim, 1) * tensor.buffer_degree.get(p_dim, 1)
+    per_axis_tile: dict[int, int] = {}
+    for axis_id, ar in zip(tensor_axis_ids, writer_access.pattern):
+        per_axis_tile[axis_id] = ar.extent
+
+    required = _required_tiles(module, accesses, per_axis_tile)
+    p_axis = tensor_axis_ids[0]
+    p_tile = per_axis_tile[p_axis]
+    p_dim_name = tensor.dim_ids[0]
+    num_p_slots = required.get(p_axis, 1) * tensor.buffer_degree.get(p_dim_name, 1)
 
     if len(tensor.dim_ids) == 1:
         tensor.shape = (p_tile, num_p_slots, 1)
         return
 
-    f_dim = tensor.dim_ids[-1]
-    middle_dims = tensor.dim_ids[1:-1]
-    f_tile = per_dim_tile[f_dim]
+    f_axis = tensor_axis_ids[-1]
+    f_dim_name = tensor.dim_ids[-1]
+    middle_axes = tensor_axis_ids[1:-1]
+    middle_dim_names = tensor.dim_ids[1:-1]
+    f_tile = per_axis_tile[f_axis]
 
-    middle_slots = [required.get(d, 1) * tensor.buffer_degree.get(d, 1) for d in middle_dims]
-    num_f_tiles = required.get(f_dim, 1) * tensor.buffer_degree.get(f_dim, 1)
+    middle_slots = [
+        required.get(aid, 1) * tensor.buffer_degree.get(dn, 1) for aid, dn in zip(middle_axes, middle_dim_names)
+    ]
+    num_f_tiles = required.get(f_axis, 1) * tensor.buffer_degree.get(f_dim_name, 1)
 
     shape_parts: list[int] = [p_tile, num_p_slots, *middle_slots, f_tile * num_f_tiles]
     tensor.shape = tuple(shape_parts)
@@ -138,26 +150,26 @@ def _find_accesses(module: KernelModule, tensor_name: str) -> list[tuple[SBlock,
 
 
 def _required_tiles(
-    module: KernelModule, accesses: list[tuple[SBlock, tuple[IterVar, ...]]], per_dim_tile: dict[str, int]
-) -> dict[str, int]:
-    """Per-dim required slot count based on common-prefix iter vars.
+    module: KernelModule, accesses: list[tuple[SBlock, tuple[IterVar, ...]]], per_axis_tile: dict[int, int]
+) -> dict[int, int]:
+    """Per-axis required slot count based on common-prefix iter vars.
 
-    ``slots_per_dim = (total_size // tile) // coverage_prefix_product``
+    ``slots_per_axis = (total_size // tile) // coverage_prefix_product``
     with a floor of 1.
     """
     common = _common_prefix(accesses)
-    coverage: dict[str, int] = {}
+    coverage: dict[int, int] = {}
     for iv in common:
-        coverage[iv.dim_id] = coverage.get(iv.dim_id, 1) * iv.extent
+        coverage[iv.axis_id] = coverage.get(iv.axis_id, 1) * iv.extent
 
-    result: dict[str, int] = {}
-    for dim_id, dim in module.dims.items():
-        tile = per_dim_tile.get(dim_id)
+    result: dict[int, int] = {}
+    for axis_id, axis in module.axes.items():
+        tile = per_axis_tile.get(axis_id)
         if tile is None:
             continue
-        total_slots = dim.total_size // tile
-        cov = coverage.get(dim_id, 1)
-        result[dim_id] = max(1, total_slots // cov) if cov > 0 else total_slots
+        total_slots = axis.total_size // tile
+        cov = coverage.get(axis_id, 1)
+        result[axis_id] = max(1, total_slots // cov) if cov > 0 else total_slots
     return result
 
 

@@ -102,7 +102,7 @@ class ReverseComputeAt:
         for target_iv, block_iv in matched:
             if _ROLE_RANK[block_iv.role] > _ROLE_RANK[target_iv.role]:
                 promoted = module.allocate_iter_var(
-                    dim_id=target_iv.dim_id, extent=target_iv.extent, role=block_iv.role
+                    axis_id=target_iv.axis_id, extent=target_iv.extent, role=block_iv.role
                 )
                 id_replacements[target_iv.var_id] = promoted
         if id_replacements:

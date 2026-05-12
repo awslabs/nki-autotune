@@ -4,7 +4,7 @@ TVM-style ``sch.split(loop, factor)``:
 
 - Retire the target ForNode's ``iter_var`` ``v``.
 - Allocate ``v_outer`` (extent = v.extent / factor) + ``v_inner``
-  (extent = factor); inherit ``dim_id`` + ``role``.
+  (extent = factor); inherit ``axis_id`` + ``role``.
 - Replace the target ForNode with nested ForNode(v_outer)
   ForNode(v_inner) <original children>.
 - Rewrite every BufferAccess.pattern that references ``v.var_id``:
@@ -64,10 +64,10 @@ class Split:
 
     def _check_min_max(self, target: ForNode) -> bool:
         """Walk descendants; for each SBlock whose ``iter_vars`` has
-        ``target.iter_var`` as its innermost for its dim, check
+        ``target.iter_var`` as its innermost for its axis, check
         ``factor ∈ [MIN, MAX]`` for the op's abstract axis."""
         target_id = target.iter_var.var_id
-        target_dim = target.iter_var.dim_id
+        target_axis_id = target.iter_var.axis_id
         legal = True
 
         def visit(node: ForNode | SBlock) -> None:
@@ -75,11 +75,11 @@ class Split:
             if not legal:
                 return
             if isinstance(node, SBlock):
-                abstract_axis = _abstract_axis_for(node, target_dim)
+                abstract_axis = _abstract_axis_for(node, target_axis_id)
                 if abstract_axis is None:
                     return
-                ivs_for_dim = [iv for iv in node.iter_vars if iv.dim_id == target_dim]
-                if not ivs_for_dim or ivs_for_dim[-1].var_id != target_id:
+                ivs_for_axis = [iv for iv in node.iter_vars if iv.axis_id == target_axis_id]
+                if not ivs_for_axis or ivs_for_axis[-1].var_id != target_id:
                     return
                 op_cls = _op_cls_for_block(node)
                 if op_cls is None:
@@ -111,8 +111,8 @@ class Split:
         old_iv = target.iter_var
         outer_extent = old_iv.extent // self.factor
         inner_extent = self.factor
-        v_outer = module.allocate_iter_var(old_iv.dim_id, outer_extent, old_iv.role)
-        v_inner = module.allocate_iter_var(old_iv.dim_id, inner_extent, old_iv.role)
+        v_outer = module.allocate_iter_var(old_iv.axis_id, outer_extent, old_iv.role)
+        v_inner = module.allocate_iter_var(old_iv.axis_id, inner_extent, old_iv.role)
 
         """Rewrite all BufferAccess.pattern entries referencing old_iv.var_id."""
         new_body = _rewrite_patterns(module.body, old_iv.var_id, v_outer.var_id, v_inner.var_id, inner_extent)
@@ -241,16 +241,16 @@ def enumerate_split_atoms(module: KernelModule) -> list[Split]:
     return atoms
 
 
-def _abstract_axis_for(block: SBlock, dim_id: str) -> str | None:
-    """Look up the op's abstract axis name corresponding to ``dim_id``.
+def _abstract_axis_for(block: SBlock, axis_id: int) -> str | None:
+    """Look up the op's abstract axis name corresponding to ``axis_id``.
 
-    Stored in ``block.annotations['axis_map']`` as ``{abstract -> dim_id}``
+    Stored in ``block.annotations['axis_map']`` as ``{abstract -> axis_id}``
     by the canonical builder.
     """
     axis_map = block.annotations.get("axis_map", {})
     result: str | None = None
-    for abstract, d in axis_map.items():
-        if d == dim_id:
+    for abstract, aid in axis_map.items():
+        if aid == axis_id:
             result = abstract
             break
     return result

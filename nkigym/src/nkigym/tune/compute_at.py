@@ -12,7 +12,7 @@ Legality (spec §4.4):
 - Target's subtree contains at least one consumer of the block's writes.
 - **Prefix-match**: target's ancestor iter-var chain (root → target,
   inclusive) is a prefix of the block's ``iter_vars`` list — matched by
-  ``dim_id`` in order. Otherwise illegal; user must ``Reorder`` first.
+  ``axis_id`` in order. Otherwise illegal; user must ``Reorder`` first.
 - **Role-lattice**: for each matched iter-var pair, ``max(target_role,
   block_role)`` must not demote the target's existing role.
 
@@ -112,7 +112,7 @@ class ComputeAt:
         for target_iv, block_iv in matched:
             if _ROLE_RANK[block_iv.role] > _ROLE_RANK[target_iv.role]:
                 promoted = module.allocate_iter_var(
-                    dim_id=target_iv.dim_id, extent=target_iv.extent, role=block_iv.role
+                    axis_id=target_iv.axis_id, extent=target_iv.extent, role=block_iv.role
                 )
                 id_replacements[target_iv.var_id] = promoted
         if id_replacements:
@@ -221,8 +221,8 @@ def _match_prefix(
     """Return matched ``(target_iv, block_iv)`` pairs for the prefix.
 
     The target's ancestor chain (outermost → innermost) must match a
-    prefix of the block's ``iter_vars`` list by ``dim_id`` position-wise.
-    Returns ``None`` if any dim mismatches or the target chain is longer
+    prefix of the block's ``iter_vars`` list by ``axis_id`` position-wise.
+    Returns ``None`` if any axis mismatches or the target chain is longer
     than the block's iter-var list.
     """
     result: list[tuple[IterVar, IterVar]] | None = None
@@ -230,7 +230,7 @@ def _match_prefix(
         ok = True
         pairs: list[tuple[IterVar, IterVar]] = []
         for t_iv, b_iv in zip(target_ancestor_ivs, block_iter_vars):
-            if t_iv.dim_id != b_iv.dim_id:
+            if t_iv.axis_id != b_iv.axis_id:
                 ok = False
                 break
             pairs.append((t_iv, b_iv))

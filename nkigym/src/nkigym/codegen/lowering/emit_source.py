@@ -40,18 +40,18 @@ def emit_source(module: KernelModule) -> str:
 def _innermost_tile_iter_var_ids(module: KernelModule) -> set[int]:
     """Collect var_ids of iter-vars that are each op's innermost tile loop per axis.
 
-    For each :class:`SBlock` in the tree, for each dim in the block's
-    ``iter_vars``, the innermost iter-var (rightmost entry for that dim
+    For each :class:`SBlock` in the tree, for each axis in the block's
+    ``iter_vars``, the innermost iter-var (rightmost entry for that axis
     in the block's list) is the tile loop. All such var_ids are returned.
     """
     ids: set[int] = set()
 
     def visit(node: ForNode | SBlock) -> None:
         if isinstance(node, SBlock):
-            by_dim: dict[str, list[int]] = {}
+            by_axis: dict[int, list[int]] = {}
             for iv in node.iter_vars:
-                by_dim.setdefault(iv.dim_id, []).append(iv.var_id)
-            for id_list in by_dim.values():
+                by_axis.setdefault(iv.axis_id, []).append(iv.var_id)
+            for id_list in by_axis.values():
                 ids.add(id_list[-1])
         elif isinstance(node, ForNode):
             for c in node.children:
@@ -97,7 +97,8 @@ def _emit_node(w: _Writer, node: ForNode | SBlock, ctx: EmitCtx) -> None:
             _emit_node(w, child, ctx)
         ctx.iter_var_to_name.pop(iv.var_id, None)
         return
-    name = node.name if node.name is not None else f"i_{iv.dim_id}_{iv.var_id}"
+    axis_name = ctx.module.axes[iv.axis_id].name
+    name = node.name if node.name is not None else f"i_{axis_name}_{iv.var_id}"
     ctx.iter_var_to_name[iv.var_id] = name
     w.line(f"for {name} in range({iv.extent}):")
     w.indent()

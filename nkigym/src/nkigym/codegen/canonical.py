@@ -30,7 +30,6 @@ import numpy as np
 from nkigym.codegen.ir import (
     AccessRange,
     BufferAccess,
-    DimInfo,
     ForNode,
     IterVar,
     KernelModule,
@@ -57,19 +56,20 @@ def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict[st
 
     tensors = _build_tensor_map(param_names, input_specs, allocs, return_name)
     per_op_axis_maps, dim_sizes = _unify_axes(raws, tensors)
-    dims = _derive_dims(dim_sizes)
-    op_tiles = _derive_op_tiles(raws, per_op_axis_maps, dim_sizes)
-    parsed_ops = _build_parsed_ops(raws, per_op_axis_maps, tensors, dims, op_tiles)
 
     module = KernelModule(
         func_name=unwrapped.__name__,
         param_names=param_names,
         return_name=return_name,
         tensors=tensors,
-        dims=dims,
+        axes={},
         iter_var_counter=0,
         body=[],
     )
+
+    name_to_axis_id = _derive_axes(module, dim_sizes)
+    op_tiles = _derive_op_tiles(raws, per_op_axis_maps, dim_sizes, name_to_axis_id)
+    parsed_ops = _build_parsed_ops(raws, per_op_axis_maps, tensors, op_tiles, name_to_axis_id)
 
     """Alloc blocks first (source order), then compute trees (source order).
     Each compute block allocates fresh iter vars via ``module.allocate_iter_var``;
@@ -80,7 +80,7 @@ def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict[st
         module.body.append(_build_tree(op, module))
 
     for tree in module.body:
-        _assign_canonical_names(tree, same_dim_counts={})
+        _assign_canonical_names(tree, module, same_axis_counts={})
 
     return module
 
@@ -129,10 +129,10 @@ class _ParsedOp:
         operand_names: Operand slot → local variable name.
         op_kwargs: Merged literal kwargs from constructor + call.
         output_names: Names bound by the assignment target.
-        axis_map: Abstract axis label → concrete dim id.
-        touched_dims: Dim ids this op touches, canonical loop-nest order.
-        dim_role: Concrete dim id → :class:`AxisRole` (op-local).
-        dim_tile: Concrete dim id → tile size for this op.
+        axis_map: Abstract axis label → axis_id.
+        touched_axes: Axis ids this op touches, canonical loop-nest order.
+        axis_role: axis_id → :class:`AxisRole` (op-local).
+        axis_tile: axis_id → tile size for this op.
     """
 
     idx: int
@@ -140,10 +140,10 @@ class _ParsedOp:
     operand_names: dict[str, str]
     op_kwargs: dict[str, Any]
     output_names: list[str]
-    axis_map: dict[str, str]
-    touched_dims: tuple[str, ...]
-    dim_role: dict[str, AxisRole]
-    dim_tile: dict[str, int]
+    axis_map: dict[str, int]
+    touched_axes: tuple[int, ...]
+    axis_role: dict[int, AxisRole]
+    axis_tile: dict[int, int]
 
 
 def _parse_ast(func: Callable[..., np.ndarray]) -> tuple[list[_ParsedOpRaw], list[_AllocRecord], str]:
@@ -410,36 +410,47 @@ def _unify_dim(
                 axis_map[ax] = new_id
 
 
-def _derive_dims(dim_sizes: dict[str, int]) -> dict[str, DimInfo]:
-    """Return ``DimInfo`` carrying only (dim_id, total_size). Tile sizes
-    are per-op and live on each op's iter-var extents / access extents."""
-    return {d: DimInfo(dim_id=d, total_size=dim_sizes[d]) for d in dim_sizes}
+def _derive_axes(module: KernelModule, dim_sizes: dict[str, int]) -> dict[str, int]:
+    """Allocate one :class:`Axis` per concrete dim.
+
+    Returns a ``name → axis_id`` map so subsequent helpers can translate
+    abstract-axis strings / dim names → integer axis_ids.
+    """
+    name_to_axis_id: dict[str, int] = {}
+    for name, size in dim_sizes.items():
+        axis = module.allocate_axis(name=name, total_size=size)
+        name_to_axis_id[name] = axis.axis_id
+    return name_to_axis_id
 
 
 def _derive_op_tiles(
-    raws: list[_ParsedOpRaw], per_op_axis_maps: list[dict[str, str]], dim_sizes: dict[str, int]
-) -> list[dict[str, int]]:
-    """Per-op tile size map: ``op_tiles[i][dim_id] = tile_for_that_op_on_that_dim``.
+    raws: list[_ParsedOpRaw],
+    per_op_axis_maps: list[dict[str, str]],
+    dim_sizes: dict[str, int],
+    name_to_axis_id: dict[str, int],
+) -> list[dict[int, int]]:
+    """Per-op tile size map: ``op_tiles[i][axis_id] = tile_for_that_op_on_that_axis``.
 
-    For each op, every concrete dim id it touches gets a tile size derived
-    from that op's ``MAX_TILE_SIZE`` (the largest legal innermost-tile
-    extent). An abstract axis with ``MAX_TILE_SIZE[axis] = None`` (or
-    absent entry) defaults to the full extent.
+    For each op, every axis it touches gets a tile size derived from that
+    op's ``MAX_TILE_SIZE`` (the largest legal innermost-tile extent). An
+    abstract axis with ``MAX_TILE_SIZE[axis] = None`` (or absent entry)
+    defaults to the full extent.
     """
-    out: list[dict[str, int]] = []
+    out: list[dict[int, int]] = []
     for raw, axis_map in zip(raws, per_op_axis_maps):
-        tiles: dict[str, int] = {}
-        for abstract, dim_id in axis_map.items():
+        tiles: dict[int, int] = {}
+        for abstract, dim_name in axis_map.items():
+            axis_id = name_to_axis_id[dim_name]
             max_tile = raw.op_cls.MAX_TILE_SIZE.get(abstract)
-            total = dim_sizes[dim_id]
+            total = dim_sizes[dim_name]
             if max_tile is None:
-                tiles[dim_id] = total
+                tiles[axis_id] = total
             else:
                 if total % max_tile != 0:
                     raise ValueError(
                         f"{raw.op_cls.__name__}.{abstract}: extent {total} not divisible by MAX_TILE_SIZE {max_tile}"
                     )
-                tiles[dim_id] = min(max_tile, total)
+                tiles[axis_id] = min(max_tile, total)
         out.append(tiles)
     return out
 
@@ -448,15 +459,15 @@ def _build_parsed_ops(
     raws: list[_ParsedOpRaw],
     per_op_axis_maps: list[dict[str, str]],
     tensors: dict[str, Tensor],
-    dims: dict[str, DimInfo],
-    op_tiles: list[dict[str, int]],
+    op_tiles: list[dict[int, int]],
+    name_to_axis_id: dict[str, int],
 ) -> list[_ParsedOp]:
-    """Assemble per-op records with canonicalised ``touched_dims`` and per-op tile map."""
-    _ = dims
+    """Assemble per-op records with canonicalised ``touched_axes`` and per-op tile map."""
     ops: list[_ParsedOp] = []
     for idx, (raw, axis_map, tiles) in enumerate(zip(raws, per_op_axis_maps, op_tiles)):
-        touched = _touched_dims(raw, axis_map, tensors)
-        dim_role = _resolve_dim_role(raw.op_cls, axis_map, touched)
+        axis_map_ids: dict[str, int] = {abstract: name_to_axis_id[dim_name] for abstract, dim_name in axis_map.items()}
+        touched = _touched_axes(raw, axis_map_ids, tensors, name_to_axis_id)
+        axis_role = _resolve_axis_role(raw.op_cls, axis_map_ids, touched)
         ops.append(
             _ParsedOp(
                 idx=idx,
@@ -464,31 +475,34 @@ def _build_parsed_ops(
                 operand_names=dict(raw.operand_names),
                 op_kwargs=dict(raw.op_kwargs),
                 output_names=list(raw.output_names),
-                axis_map=dict(axis_map),
-                touched_dims=touched,
-                dim_role=dim_role,
-                dim_tile=dict(tiles),
+                axis_map=axis_map_ids,
+                touched_axes=touched,
+                axis_role=axis_role,
+                axis_tile=dict(tiles),
             )
         )
     return ops
 
 
-def _resolve_dim_role(op_cls: type[NKIOp], axis_map: dict[str, str], touched: tuple[str, ...]) -> dict[str, AxisRole]:
-    """Map every ``dim_id`` in ``touched`` to the op's role for that dim."""
+def _resolve_axis_role(op_cls: type[NKIOp], axis_map: dict[str, int], touched: tuple[int, ...]) -> dict[int, AxisRole]:
+    """Map every ``axis_id`` in ``touched`` to the op's role for that axis."""
     abstract_role = getattr(op_cls, "AXIS_ROLES", {})
-    concrete: dict[str, AxisRole] = {}
-    for abstract, dim_id in axis_map.items():
-        if dim_id in touched and abstract in abstract_role:
-            concrete[dim_id] = abstract_role[abstract]
-    for dim_id in touched:
-        concrete.setdefault(dim_id, AxisRole.PARALLEL)
+    concrete: dict[int, AxisRole] = {}
+    for abstract, axis_id in axis_map.items():
+        if axis_id in touched and abstract in abstract_role:
+            concrete[axis_id] = abstract_role[abstract]
+    for axis_id in touched:
+        concrete.setdefault(axis_id, AxisRole.PARALLEL)
     return concrete
 
 
-def _touched_dims(raw: _ParsedOpRaw, axis_map: dict[str, str], tensors: dict[str, Tensor]) -> tuple[str, ...]:
-    """Canonical order: partition-axis dim first, then free dims, then reducing dims."""
+def _touched_axes(
+    raw: _ParsedOpRaw, axis_map: dict[str, int], tensors: dict[str, Tensor], name_to_axis_id: dict[str, int]
+) -> tuple[int, ...]:
+    """Canonical order: partition-axis id first, then free axes, then reducing axes."""
+    _ = name_to_axis_id
     op_cls = raw.op_cls
-    ordered: list[str] = []
+    ordered: list[int] = []
     if op_cls.OUTPUT_AXES:
         first_out_slot = next(iter(op_cls.OUTPUT_AXES))
         out_axes = op_cls.OUTPUT_AXES[first_out_slot]
@@ -512,29 +526,28 @@ def _touched_dims(raw: _ParsedOpRaw, axis_map: dict[str, str], tensors: dict[str
 def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
     """Build an iter-var :class:`SBlock` for ``op`` with per-op tiling.
 
-    Allocates TWO fresh :class:`IterVar`\\ s per ``dim_id`` in
-    ``op.touched_dims``: an outer trip iter-var (``extent = total //
+    Allocates TWO fresh :class:`IterVar`\\ s per ``axis_id`` in
+    ``op.touched_axes``: an outer trip iter-var (``extent = total //
     tile``) and an inner tile iter-var (``extent = tile``). The outer
-    precedes the inner in ``iter_vars`` for each dim. The innermost
-    inner iter-var is present in the IR so per-dim addressing is fully
-    symbolic ``outer * tile + inner``; the renderer (Task 5) elides the
-    inner for-loop by spelling the inner iter-var as ``0`` in slice
-    expressions.
+    precedes the inner in ``iter_vars`` for each axis. The innermost
+    inner iter-var is present in the IR so per-axis addressing is fully
+    symbolic ``outer * tile + inner``; the renderer elides the inner
+    for-loop by spelling the inner iter-var as ``0`` in slice expressions.
 
     Operand slots split into three buckets based on the op's
     ``INPUT_OPERANDS`` / ``RMW_OPERANDS``.
     """
-    dim_to_outer: dict[str, IterVar] = {}
-    dim_to_inner: dict[str, IterVar] = {}
+    axis_to_outer: dict[int, IterVar] = {}
+    axis_to_inner: dict[int, IterVar] = {}
     iter_vars: list[IterVar] = []
-    for dim_id in op.touched_dims:
-        total = module.dims[dim_id].total_size
-        tile = op.dim_tile[dim_id]
+    for axis_id in op.touched_axes:
+        total = module.axes[axis_id].total_size
+        tile = op.axis_tile[axis_id]
         trip = total // tile
-        outer = module.allocate_iter_var(dim_id=dim_id, extent=trip, role=op.dim_role[dim_id])
-        inner = module.allocate_iter_var(dim_id=dim_id, extent=tile, role=op.dim_role[dim_id])
-        dim_to_outer[dim_id] = outer
-        dim_to_inner[dim_id] = inner
+        outer = module.allocate_iter_var(axis_id=axis_id, extent=trip, role=op.axis_role[axis_id])
+        inner = module.allocate_iter_var(axis_id=axis_id, extent=tile, role=op.axis_role[axis_id])
+        axis_to_outer[axis_id] = outer
+        axis_to_inner[axis_id] = inner
         iter_vars.append(outer)
         iter_vars.append(inner)
 
@@ -547,7 +560,7 @@ def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
         tname = op.operand_names.get(slot)
         if tname is None or tname not in module.tensors:
             continue
-        access = _build_buffer_access(tname, axes, op, dim_to_outer, dim_to_inner, module)
+        access = _build_buffer_access(tname, axes, op, axis_to_outer, axis_to_inner, module)
         if slot in rmw:
             reads_writes[slot] = access
         elif slot in input_slots:
@@ -556,7 +569,7 @@ def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
             writes[slot] = access
 
     call = NKIOpCall(
-        op_cls=op.op_cls, kwargs=dict(op.op_kwargs), axis_map=dict(op.axis_map), dim_role=dict(op.dim_role)
+        op_cls=op.op_cls, kwargs=dict(op.op_kwargs), axis_map=dict(op.axis_map), dim_role=dict(op.axis_role)
     )
     return SBlock(
         iter_vars=iter_vars,
@@ -572,8 +585,8 @@ def _build_buffer_access(
     tname: str,
     axes: tuple[str, ...],
     op: _ParsedOp,
-    dim_to_outer: dict[str, IterVar],
-    dim_to_inner: dict[str, IterVar],
+    axis_to_outer: dict[int, IterVar],
+    axis_to_inner: dict[int, IterVar],
     module: KernelModule,
 ) -> BufferAccess:
     """Produce a :class:`BufferAccess` for ``tname`` referenced by ``op`` via ``axes``.
@@ -591,17 +604,26 @@ def _build_buffer_access(
     for i, abstract in enumerate(axes):
         if i >= len(tensor.dim_ids):
             break
-        dim_id = op.axis_map.get(abstract, tensor.dim_ids[i])
-        outer = dim_to_outer.get(dim_id)
-        inner = dim_to_inner.get(dim_id)
+        axis_id = op.axis_map.get(abstract)
+        if axis_id is None:
+            """Fall back to tensor's declared dim_id for this slot via the
+            module-level name→axis_id lookup. Canonical build should always
+            have filled ``op.axis_map``, but this keeps the function total."""
+            tensor_dim_name = tensor.dim_ids[i]
+            try:
+                axis_id = module.axis_id_by_name(tensor_dim_name)
+            except KeyError:
+                axis_id = -1
+        outer = axis_to_outer.get(axis_id)
+        inner = axis_to_inner.get(axis_id)
         if outer is None or inner is None:
-            """Untouched dim — constant-offset access along this dim.
+            """Untouched axis — constant-offset access along this dim.
             Canonical build never hits this branch but keeps the
             function total."""
-            extent = op.dim_tile.get(dim_id, tensor.shape[i]) if dim_id in module.dims else tensor.shape[i]
+            extent = op.axis_tile.get(axis_id, tensor.shape[i]) if axis_id in module.axes else tensor.shape[i]
             pattern_entries.append(AccessRange.make({}, 0, extent))
             continue
-        tile = op.dim_tile[dim_id]
+        tile = op.axis_tile[axis_id]
         if outer.var_id not in iv_ids_seen:
             iv_ids_seen.append(outer.var_id)
         if inner.var_id not in iv_ids_seen:
@@ -658,25 +680,26 @@ def _wrap_block_in_fornodes(block: SBlock) -> ForNode | SBlock:
     return node
 
 
-def _assign_canonical_names(node: ForNode | SBlock, same_dim_counts: dict[str, int]) -> None:
+def _assign_canonical_names(node: ForNode | SBlock, module: KernelModule, same_axis_counts: dict[int, int]) -> None:
     """Walk the tree in a root-outward DFS, naming each :class:`ForNode`.
 
-    ``same_dim_counts[d]`` tracks how many same-dim ancestors of ``d``
-    are already open on the current path; the newly visited node takes
-    that as its ordinal, emits a name, then recurses with the counter
+    ``same_axis_counts[axis_id]`` tracks how many same-axis ancestors are
+    already open on the current path; the newly visited node takes that
+    as its ordinal, emits a name, then recurses with the counter
     incremented. Restoring the counter after recursion means siblings
     see the same counts the parent did (they are not each other's
     ancestors).
     """
     if isinstance(node, SBlock):
         return
-    dim_id = node.iter_var.dim_id
-    k = same_dim_counts.get(dim_id, 0)
-    node.name = f"i_{dim_id}_{k}"
-    same_dim_counts[dim_id] = k + 1
+    axis_id = node.iter_var.axis_id
+    axis_name = module.axes[axis_id].name
+    k = same_axis_counts.get(axis_id, 0)
+    node.name = f"i_{axis_name}_{k}"
+    same_axis_counts[axis_id] = k + 1
     for child in node.children:
-        _assign_canonical_names(child, same_dim_counts)
-    same_dim_counts[dim_id] = k
+        _assign_canonical_names(child, module, same_axis_counts)
+    same_axis_counts[axis_id] = k
 
 
 """TreeIR re-exported only for callers that currently expect

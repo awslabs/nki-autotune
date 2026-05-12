@@ -26,8 +26,8 @@ from dataclasses import replace as dc_replace
 
 from nkigym.codegen.ir import (
     AccessRange,
+    Axis,
     BufferAccess,
-    DimInfo,
     ForNode,
     IterVar,
     KernelModule,
@@ -45,35 +45,39 @@ from nkigym.ops.tensor_reduce import NKITensorReduce
 from nkigym.tune import AtomLegalityError
 
 
-def _block_dim_trip(block: SBlock, dim_id: str) -> int | None:
-    """Return the trip count (iter-var extent) for ``dim_id`` in ``block``.
+def _block_axis_trip(block: SBlock, axis_id: int) -> int | None:
+    """Return the trip count (iter-var extent) for ``axis_id`` in ``block``.
 
-    Returns None if ``block`` has no iter var on ``dim_id``.
+    Returns None if ``block`` has no iter var on ``axis_id``.
     """
     for iv in block.iter_vars:
-        if iv.dim_id == dim_id:
+        if iv.axis_id == axis_id:
             return iv.extent
     return None
 
 
-def _block_dim_tile(module: KernelModule, block: SBlock, dim_id: str) -> int | None:
-    """Return the per-op tile width (access-pattern extent) for ``dim_id`` in ``block``.
+def _block_axis_tile(module: KernelModule, block: SBlock, axis_id: int) -> int | None:
+    """Return the per-op tile width (access-pattern extent) for ``axis_id`` in ``block``.
 
     Scans the block's reads / writes / reads_writes in order and returns
-    the first extent found on a tensor dim matching ``dim_id``.
-    Returns None when no access in the block touches ``dim_id``.
+    the first extent found on a tensor dim whose name resolves to
+    ``axis_id``. Returns None when no access in the block touches the axis.
 
     Precedence: reads, then writes, then reads_writes. In canonical IR,
-    all accesses touching a given dim in the same block should have
-    identical extents for that dim.
+    all accesses touching a given axis in the same block should have
+    identical extents.
     """
     all_accesses = list(block.reads.values()) + list(block.writes.values()) + list(block.reads_writes.values())
     for access in all_accesses:
         tensor = module.tensors.get(access.tensor_name)
         if tensor is None:
             continue
-        for i, d in enumerate(tensor.dim_ids):
-            if d == dim_id and i < len(access.pattern):
+        for i, dim_name in enumerate(tensor.dim_ids):
+            try:
+                dim_axis_id = module.axis_id_by_name(dim_name)
+            except KeyError:
+                continue
+            if dim_axis_id == axis_id and i < len(access.pattern):
                 return access.pattern[i].extent
     return None
 
@@ -105,13 +109,12 @@ class RFactor:
         recipe = call.op_cls.RFACTOR_RECIPE
         if recipe is None:
             return False
-        acc_dim = _accumulation_dim(call)
-        if acc_dim is None:
+        acc_axis_id = _accumulation_axis_id(call)
+        if acc_axis_id is None:
             return False
-        dim_info = module.dims.get(acc_dim)
-        if dim_info is None:
+        if acc_axis_id not in module.axes:
             return False
-        num_t = _block_dim_trip(block, acc_dim)
+        num_t = _block_axis_trip(block, acc_axis_id)
         if num_t is None:
             return False
         if num_t <= 1:
@@ -121,9 +124,9 @@ class RFactor:
         if num_t % self.outer_factor != 0:
             return False
         if recipe == "rmw":
-            return _is_legal_rmw(block, acc_dim)
+            return _is_legal_rmw(block, acc_axis_id)
         if recipe == "slot":
-            return _is_legal_slot(block, acc_dim)
+            return _is_legal_slot(block, acc_axis_id)
         return False
 
     def apply(self, module: KernelModule) -> KernelModule:
@@ -149,16 +152,14 @@ def enumerate_rfactor_atoms(module: KernelModule) -> list[RFactor]:
         if isinstance(node, SBlock):
             if len(node.body) == 1 and node.body[0].op_cls.RFACTOR_RECIPE is not None:
                 call = node.body[0]
-                acc_dim = _accumulation_dim(call)
-                if acc_dim is not None:
-                    dim_info = module.dims.get(acc_dim)
-                    if dim_info is not None:
-                        num_t = _block_dim_trip(node, acc_dim)
-                        if num_t is not None:
-                            for factor in _strict_divisors(num_t):
-                                atom = RFactor(reducer_block_path=path, outer_factor=factor)
-                                if atom.is_legal(module):
-                                    atoms.append(atom)
+                acc_axis_id = _accumulation_axis_id(call)
+                if acc_axis_id is not None and acc_axis_id in module.axes:
+                    num_t = _block_axis_trip(node, acc_axis_id)
+                    if num_t is not None:
+                        for factor in _strict_divisors(num_t):
+                            atom = RFactor(reducer_block_path=path, outer_factor=factor)
+                            if atom.is_legal(module):
+                                atoms.append(atom)
         else:
             for i, c in enumerate(node.children):
                 walk(c, path + (i,))
@@ -173,8 +174,8 @@ def _strict_divisors(n: int) -> list[int]:
     return [d for d in range(2, n) if n % d == 0]
 
 
-def _accumulation_dim(call: NKIOpCall) -> str | None:
-    """Return the concrete dim id the op uses as its accumulation axis, or ``None``."""
+def _accumulation_axis_id(call: NKIOpCall) -> int | None:
+    """Return the axis_id the op uses as its accumulation axis, or ``None``."""
     roles = getattr(call.op_cls, "AXIS_ROLES", {})
     for abstract, role in roles.items():
         if role == AxisRole.ACCUMULATION and abstract in call.axis_map:
@@ -182,27 +183,31 @@ def _accumulation_dim(call: NKIOpCall) -> str | None:
     return None
 
 
-def _is_legal_rmw(block: SBlock, acc_dim: str) -> bool:
-    """rmw legality: block has RMW output + ACC dim iter var with ACCUMULATION role."""
+def _is_legal_rmw(block: SBlock, acc_axis_id: int) -> bool:
+    """rmw legality: block has RMW output + ACC iter var with ACCUMULATION role."""
     if not block.reads_writes:
         return False
     for iv in block.iter_vars:
-        if iv.dim_id == acc_dim:
+        if iv.axis_id == acc_axis_id:
             return iv.role == AxisRole.ACCUMULATION
     return False
 
 
-def _is_legal_slot(block: SBlock, acc_dim: str) -> bool:
-    """slot legality: block has the ACC dim iter var (role already ACCUMULATION at canonical)."""
+def _is_legal_slot(block: SBlock, acc_axis_id: int) -> bool:
+    """slot legality: block has the ACC iter var (role already ACCUMULATION at canonical)."""
     for iv in block.iter_vars:
-        if iv.dim_id == acc_dim:
+        if iv.axis_id == acc_axis_id:
             return iv.role == AxisRole.ACCUMULATION
     return False
 
 
-def _fresh_dim_id(dims: dict[str, DimInfo]) -> str:
-    """Pick a dim_id not yet in use: ``d<N>`` for the smallest free ``N``."""
-    taken = set(dims.keys())
+def _fresh_axis_name(axes: dict[int, Axis]) -> str:
+    """Pick a display name not yet in use: ``d<N>`` for the smallest free ``N``.
+
+    The returned string is purely cosmetic; identity still lives in the
+    axis_id allocated by :meth:`KernelModule.allocate_axis`.
+    """
+    taken = {axis.name for axis in axes.values()}
     i = 0
     while f"d{i}" in taken:
         i += 1
@@ -212,8 +217,8 @@ def _fresh_dim_id(dims: dict[str, DimInfo]) -> str:
 def _apply_rmw(module: KernelModule, block_path: tuple[int, ...], outer_factor: int) -> KernelModule:
     """Apply rmw recipe to a matmul reducer.
 
-    Layout: dim_ids for ``psum_partials`` are ordered ``(P-dim, outer-dim,
-    ...remaining-dims)`` — the outer dim sits as a middle slot (a
+    Layout: dim_ids for ``psum_partials`` are ordered ``(P-name, outer-name,
+    ...remaining-names)`` — the outer axis sits as a middle slot (a
     per-iteration index), and the tensor's original F-axis stays last so
     :func:`place_buffers` gives the tensor full capacity.
     """
@@ -221,24 +226,24 @@ def _apply_rmw(module: KernelModule, block_path: tuple[int, ...], outer_factor: 
     assert isinstance(matmul_block, SBlock)
     assert len(matmul_block.body) == 1
     call = matmul_block.body[0]
-    k_dim = _accumulation_dim(call)
-    assert k_dim is not None
+    k_axis_id = _accumulation_axis_id(call)
+    assert k_axis_id is not None
 
     """Identify the PSUM accumulator — the single RMW write."""
     psum_acc_name = _single_rmw_name(matmul_block)
     psum_acc = module.tensors[psum_acc_name]
-    k_trip = _block_dim_trip(matmul_block, k_dim)
+    k_trip = _block_axis_trip(matmul_block, k_axis_id)
     if k_trip is None:
-        raise AtomLegalityError("RFactor.apply (rmw): matmul block has no iter var on accumulation dim")
+        raise AtomLegalityError("RFactor.apply (rmw): matmul block has no iter var on accumulation axis")
     inner_trip = k_trip // outer_factor
 
-    """Declare the synthetic outer dim. The accumulation dim ``k_dim`` is
-    split at the MATMUL iter-var level (Split-style) — its trip count
-    stays unchanged on other users of the dim (loads, stores) so they
-    keep iterating over the full K."""
-    outer_dim_id = _fresh_dim_id(module.dims)
-    new_dims = dict(module.dims)
-    new_dims[outer_dim_id] = DimInfo(dim_id=outer_dim_id, total_size=outer_factor)
+    """Allocate the synthetic outer Axis. The accumulation axis is split
+    at the MATMUL iter-var level (Split-style) — its trip count stays
+    unchanged on other users of the axis (loads, stores) so they keep
+    iterating over the full K."""
+    outer_axis_name = _fresh_axis_name(module.axes)
+    outer_axis = module.allocate_axis(name=outer_axis_name, total_size=outer_factor)
+    outer_axis_id = outer_axis.axis_id
 
     """Materialise staging + local PSUM tensors. Ordering of
     ``psum_partials.dim_ids``: P first, outer next, then the remaining
@@ -249,7 +254,7 @@ def _apply_rmw(module: KernelModule, block_path: tuple[int, ...], outer_factor: 
     local_name = "psum_acc_local"
     p_dim = psum_acc.dim_ids[0]
     rest_dims = tuple(d for d in psum_acc.dim_ids[1:])
-    partials_dim_ids = (p_dim, outer_dim_id, *rest_dims)
+    partials_dim_ids = (p_dim, outer_axis_name, *rest_dims)
     partials_shape = tuple([psum_acc.shape[0], outer_factor] + list(psum_acc.shape[1:]))
 
     partials = Tensor(
@@ -287,7 +292,7 @@ def _apply_rmw(module: KernelModule, block_path: tuple[int, ...], outer_factor: 
         raise AtomLegalityError("RFactor.apply (rmw): could not resolve drain target name")
 
     """Build new forest components — all require iter-var allocation via ``module``,
-    so we do so AFTER ``new_dims`` is fixed but BEFORE returning. ``module``'s
+    so we do so AFTER the outer axis is allocated but BEFORE returning. ``module``'s
     ``iter_var_counter`` is shared across the module; allocating on the
     original module is fine — the returned module will carry the incremented
     counter."""
@@ -297,18 +302,18 @@ def _apply_rmw(module: KernelModule, block_path: tuple[int, ...], outer_factor: 
     """Outer iter var — wraps the K_outer block. Role=PARALLEL because each
     outer step produces an independent partial result that the close-reduce
     sums associatively."""
-    iv_k_outer = module.allocate_iter_var(dim_id=outer_dim_id, extent=outer_factor, role=AxisRole.PARALLEL)
+    iv_k_outer = module.allocate_iter_var(axis_id=outer_axis_id, extent=outer_factor, role=AxisRole.PARALLEL)
 
     """Rebuild the memset tree: substitute ``psum_acc_name`` writes with
     ``local_name`` (PSUM local). The iter vars come from fresh allocations
-    matched to the original memset block's iter var dim ids."""
+    matched to the original memset block's iter var axis ids."""
     memset_local_tree = _rebuild_memset_tree_for_local(module, module.body[memset_idx], psum_acc_name, local_name)
 
     """Rebuild the matmul K-loop tree: split K into (K_outer, K_inner).
     The K-outer ForNode is placed outside; K_inner replaces the original
     K ForNode with reduced extent. The matmul writes to ``local_name``."""
     k_inner_tree = _rebuild_matmul_tree_with_inner_k(
-        module, module.body[block_path[0]], block_path[1:], k_dim, inner_trip, local_name, iv_k_outer
+        module, module.body[block_path[0]], block_path[1:], k_axis_id, inner_trip, local_name, iv_k_outer
     )
 
     """Rebuild the drain tree: NKITensorCopy(src=local_name → partials[outer])
@@ -325,9 +330,7 @@ def _apply_rmw(module: KernelModule, block_path: tuple[int, ...], outer_factor: 
 
     """Build close-reduce tree: iterate (P-dim, F-dims) excluding outer;
     tensor_reduce reduces the outer axis of partials into ``drain_dst_name``."""
-    close_tree = _build_close_reduce_tree(
-        module, module.body[drain_idx], partials_name, drain_dst_name, outer_dim_id, new_dims
-    )
+    close_tree = _build_close_reduce_tree(module, module.body[drain_idx], partials_name, drain_dst_name, outer_axis_id)
 
     """Reassemble the forest: original roots minus the four removed trees,
     with alloc_partials + k_outer_forest + close_tree spliced in where the
@@ -346,7 +349,7 @@ def _apply_rmw(module: KernelModule, block_path: tuple[int, ...], outer_factor: 
             continue
         new_body.append(root)
 
-    return dc_replace(module, tensors=new_tensors, dims=new_dims, body=new_body)
+    return dc_replace(module, tensors=new_tensors, body=new_body)
 
 
 def _single_rmw_name(block: SBlock) -> str:
@@ -496,7 +499,7 @@ def _rebuild_memset_tree_for_local(
     """
     orig_block = _find_inner_block(root)
     old_ivs = _forest_iter_vars(root)
-    iv_map = {iv.var_id: module.allocate_iter_var(dim_id=iv.dim_id, extent=iv.extent, role=iv.role) for iv in old_ivs}
+    iv_map = {iv.var_id: module.allocate_iter_var(axis_id=iv.axis_id, extent=iv.extent, role=iv.role) for iv in old_ivs}
     new_ivs = [iv_map[iv.var_id] for iv in old_ivs]
 
     """Rewrite the writes BufferAccess: swap tensor name + iter var ids."""
@@ -527,7 +530,7 @@ def _rebuild_matmul_tree_with_inner_k(
     module: KernelModule,
     root: ForNode | SBlock,
     body_path: tuple[int, ...],
-    k_dim: str,
+    k_axis_id: int,
     inner_trip: int,
     local_name: str,
     iv_k_outer: IterVar,
@@ -536,7 +539,7 @@ def _rebuild_matmul_tree_with_inner_k(
 
     K_outer is shared with the enclosing RFactor forest (the
     ``iv_k_outer`` passed in); this function wraps the matmul block in
-    per-dim ForNodes for NON-K dims + a K_inner ForNode with role=ACC.
+    per-axis ForNodes for NON-K axes + a K_inner ForNode with role=ACC.
     K accesses in ``lhs_T_sbuf`` / ``rhs_sbuf`` become
     ``k_outer * inner_trip + k_inner``.
 
@@ -554,17 +557,17 @@ def _rebuild_matmul_tree_with_inner_k(
     k_inner: IterVar | None = None
     old_k_iv_id: int | None = None
     for iv in old_ivs:
-        if iv.dim_id == k_dim:
+        if iv.axis_id == k_axis_id:
             old_k_iv_id = iv.var_id
-            k_inner = module.allocate_iter_var(dim_id=iv.dim_id, extent=inner_trip, role=AxisRole.ACCUMULATION)
+            k_inner = module.allocate_iter_var(axis_id=iv.axis_id, extent=inner_trip, role=AxisRole.ACCUMULATION)
             iv_map[iv.var_id] = k_inner
         else:
-            fresh = module.allocate_iter_var(dim_id=iv.dim_id, extent=iv.extent, role=iv.role)
+            fresh = module.allocate_iter_var(axis_id=iv.axis_id, extent=iv.extent, role=iv.role)
             iv_map[iv.var_id] = fresh
             new_outer_ivs.append(fresh)
 
     if k_inner is None or old_k_iv_id is None:
-        raise AtomLegalityError("RFactor (rmw): matmul tree does not bind the accumulation dim")
+        raise AtomLegalityError("RFactor (rmw): matmul tree does not bind the accumulation axis")
 
     """Rewrite block iter_vars + accesses. For LHS/RHS reads (which include
     the K dim), rewrite their affine pattern to
@@ -669,7 +672,7 @@ def _rebuild_drain_tree_for_partials(
     """Clone the drain tree: tensor_copy retargeted from (old_src, old_dst) → (new_src, new_dst[outer])."""
     orig_block = _find_inner_block(root)
     old_ivs = _forest_iter_vars(root)
-    iv_map = {iv.var_id: module.allocate_iter_var(dim_id=iv.dim_id, extent=iv.extent, role=iv.role) for iv in old_ivs}
+    iv_map = {iv.var_id: module.allocate_iter_var(axis_id=iv.axis_id, extent=iv.extent, role=iv.role) for iv in old_ivs}
     new_ivs = [iv_map[iv.var_id] for iv in old_ivs]
 
     new_reads = {
@@ -718,24 +721,19 @@ def _rewrite_drain_write_with_outer(
 
 
 def _build_close_reduce_tree(
-    module: KernelModule,
-    drain_root: ForNode | SBlock,
-    partials_name: str,
-    original_dst_name: str,
-    outer_dim_id: str,
-    new_dims: dict[str, DimInfo],
+    module: KernelModule, drain_root: ForNode | SBlock, partials_name: str, original_dst_name: str, outer_axis_id: int
 ) -> ForNode | SBlock:
     """Build the close-reduce tree: NKITensorReduce reads ``partials`` (full outer slice) and writes ``original_dst_name``.
 
     Iter vars mirror the original drain's iter vars (per-(p, f) tile).
-    The outer dim is NOT bound to an iter var in this block — its
+    The outer axis is NOT bound to an iter var in this block — its
     :class:`AccessRange` carries empty coefficients and ``extent =
     outer_factor`` so the renderer emits ``0:outer_factor`` along that
     physical dim.
     """
     orig_block = _find_inner_block(drain_root)
     old_ivs = _forest_iter_vars(drain_root)
-    iv_map = {iv.var_id: module.allocate_iter_var(dim_id=iv.dim_id, extent=iv.extent, role=iv.role) for iv in old_ivs}
+    iv_map = {iv.var_id: module.allocate_iter_var(axis_id=iv.axis_id, extent=iv.extent, role=iv.role) for iv in old_ivs}
     new_ivs = [iv_map[iv.var_id] for iv in old_ivs]
 
     """Derive the original per-dim write access for the drain target;
@@ -746,10 +744,10 @@ def _build_close_reduce_tree(
     dst_access = _remap_access_ivs(drain_write_access, iv_map)
 
     """Partial read access — same (P, ...rest) footprint as the drain's
-    write, but with an extra no-iter-var AccessRange for the outer dim
+    write, but with an extra no-iter-var AccessRange for the outer axis
     spanning its full extent."""
-    outer_info = new_dims[outer_dim_id]
-    outer_ar = AccessRange.make({}, 0, outer_info.total_size)
+    outer_axis = module.axes[outer_axis_id]
+    outer_ar = AccessRange.make({}, 0, outer_axis.total_size)
     orig_dst_pattern = dst_access.pattern
     new_pattern = (orig_dst_pattern[0], outer_ar, *orig_dst_pattern[1:])
     new_iv_ids = tuple(_remap_iv_ids(drain_write_access.iter_var_ids, iv_map))
@@ -856,11 +854,11 @@ def _apply_slot(module: KernelModule, block_path: tuple[int, ...], outer_factor:
     assert isinstance(ar_block, SBlock)
     assert len(ar_block.body) == 1
     call = ar_block.body[0]
-    f_dim = _accumulation_dim(call)
-    assert f_dim is not None
-    f_trip = _block_dim_trip(ar_block, f_dim)
+    f_axis_id = _accumulation_axis_id(call)
+    assert f_axis_id is not None
+    f_trip = _block_axis_trip(ar_block, f_axis_id)
     if f_trip is None:
-        raise AtomLegalityError("RFactor.apply (slot): activation_reduce block has no iter var on accumulation dim")
+        raise AtomLegalityError("RFactor.apply (slot): activation_reduce block has no iter var on accumulation axis")
     inner_f_trip = f_trip // outer_factor
 
     """Identify operand tensor names. ``NKIActivationReduce`` declares
@@ -873,13 +871,13 @@ def _apply_slot(module: KernelModule, block_path: tuple[int, ...], outer_factor:
     sum_acc = module.tensors[sum_acc_name]
     scratch = module.tensors[scratch_name]
 
-    """Declare the synthetic outer dim. Like the rmw recipe, we split the
-    F iter var at the block level (Split-style) instead of mutating the
-    F dim's trip count — other users of ``f_dim`` (the outer load)
-    continue to iterate the full F extent."""
-    outer_dim_id = _fresh_dim_id(module.dims)
-    new_dims = dict(module.dims)
-    new_dims[outer_dim_id] = DimInfo(dim_id=outer_dim_id, total_size=outer_factor)
+    """Allocate the synthetic outer Axis. Like the rmw recipe, we split
+    the F iter var at the block level (Split-style) instead of mutating
+    the F axis's trip count — other users of ``f_axis_id`` (the outer
+    load) continue to iterate the full F extent."""
+    outer_axis_name = _fresh_axis_name(module.axes)
+    outer_axis = module.allocate_axis(name=outer_axis_name, total_size=outer_factor)
+    outer_axis_id = outer_axis.axis_id
 
     """Staging tensors: ``partials`` holds a per-outer-step scalar per P
     row (1D → 2D w/ outer); ``scratch_local`` per-outer activation tile
@@ -888,7 +886,7 @@ def _apply_slot(module: KernelModule, block_path: tuple[int, ...], outer_factor:
     local_name = "scratch_local"
     partials = Tensor(
         name=partials_name,
-        dim_ids=(*sum_acc.dim_ids, outer_dim_id),
+        dim_ids=(*sum_acc.dim_ids, outer_axis_name),
         shape=(*sum_acc.shape, outer_factor),
         dtype=sum_acc.dtype,
         origin="intermediate",
@@ -911,9 +909,9 @@ def _apply_slot(module: KernelModule, block_path: tuple[int, ...], outer_factor:
 
     """F-outer iter var wraps the F-inner tree. Role=PARALLEL because each
     outer step writes a distinct slot of partials."""
-    iv_f_outer = module.allocate_iter_var(dim_id=outer_dim_id, extent=outer_factor, role=AxisRole.PARALLEL)
+    iv_f_outer = module.allocate_iter_var(axis_id=outer_axis_id, extent=outer_factor, role=AxisRole.PARALLEL)
 
-    """Rebuild the ar-tree: iterate over original dims (mapping the F dim's
+    """Rebuild the ar-tree: iterate over original dims (mapping the F axis's
     iter var to an inner-F iter var with reduced extent). The block's
     ``reduce_res`` slot redirects to ``partials`` with an extra
     ``iv_f_outer`` slot index; the ``dst`` slot redirects to
@@ -921,7 +919,7 @@ def _apply_slot(module: KernelModule, block_path: tuple[int, ...], outer_factor:
     ar_tree = _rebuild_ar_tree_with_inner_f(
         module,
         module.body[block_path[0]],
-        f_dim,
+        f_axis_id,
         inner_f_trip,
         scratch_name,
         sum_acc_name,
@@ -934,7 +932,7 @@ def _apply_slot(module: KernelModule, block_path: tuple[int, ...], outer_factor:
 
     """Build close-reduce tree: tensor_reduce over outer axis of partials
     into sum_acc."""
-    close_tree = _build_close_reduce_slot_tree(module, ar_block, partials_name, sum_acc_name, outer_dim_id, new_dims)
+    close_tree = _build_close_reduce_slot_tree(module, ar_block, partials_name, sum_acc_name, outer_axis_id)
 
     """Drop: the scratch NKIAlloc root + the AR-root (replaced above).
     Insert alloc_partials + alloc_local + f_outer + close_tree at AR-root's position."""
@@ -957,7 +955,7 @@ def _apply_slot(module: KernelModule, block_path: tuple[int, ...], outer_factor:
             continue
         new_body.append(root)
 
-    return dc_replace(module, tensors=new_tensors, dims=new_dims, body=new_body)
+    return dc_replace(module, tensors=new_tensors, body=new_body)
 
 
 def _writes_name(block: SBlock, slot: str) -> str | None:
@@ -971,7 +969,7 @@ def _writes_name(block: SBlock, slot: str) -> str | None:
 def _rebuild_ar_tree_with_inner_f(
     module: KernelModule,
     root: ForNode | SBlock,
-    f_dim: str,
+    f_axis_id: int,
     inner_f_trip: int,
     scratch_name: str,
     sum_acc_name: str,
@@ -993,17 +991,17 @@ def _rebuild_ar_tree_with_inner_f(
     f_inner: IterVar | None = None
     new_outer_ivs: list[IterVar] = []
     for iv in old_ivs:
-        if iv.dim_id == f_dim:
+        if iv.axis_id == f_axis_id:
             old_f_iv_id = iv.var_id
-            f_inner = module.allocate_iter_var(dim_id=iv.dim_id, extent=inner_f_trip, role=AxisRole.ACCUMULATION)
+            f_inner = module.allocate_iter_var(axis_id=iv.axis_id, extent=inner_f_trip, role=AxisRole.ACCUMULATION)
             iv_map[iv.var_id] = f_inner
         else:
-            fresh = module.allocate_iter_var(dim_id=iv.dim_id, extent=iv.extent, role=iv.role)
+            fresh = module.allocate_iter_var(axis_id=iv.axis_id, extent=iv.extent, role=iv.role)
             iv_map[iv.var_id] = fresh
             new_outer_ivs.append(fresh)
 
     if old_f_iv_id is None or f_inner is None:
-        raise AtomLegalityError("RFactor (slot): activation_reduce tree does not bind the accumulation dim")
+        raise AtomLegalityError("RFactor (slot): activation_reduce tree does not bind the accumulation axis")
 
     new_block_ivs = [iv_map[iv.var_id] for iv in orig_block.iter_vars]
     new_reads = {
@@ -1050,25 +1048,21 @@ def _rebuild_ar_tree_with_inner_f(
 
 
 def _build_close_reduce_slot_tree(
-    module: KernelModule,
-    orig_ar_block: SBlock,
-    partials_name: str,
-    sum_acc_name: str,
-    outer_dim_id: str,
-    new_dims: dict[str, DimInfo],
+    module: KernelModule, orig_ar_block: SBlock, partials_name: str, sum_acc_name: str, outer_axis_id: int
 ) -> ForNode | SBlock:
-    """Build the close-reduce tree for slot: iterate only the P dim (shared w/ sum_acc), reduce outer axis of partials."""
+    """Build the close-reduce tree for slot: iterate only the P axis (shared w/ sum_acc), reduce outer axis of partials."""
     sum_acc = module.tensors[sum_acc_name]
-    p_dim = sum_acc.dim_ids[0]
+    p_dim_name = sum_acc.dim_ids[0]
+    p_axis_id = module.axis_id_by_name(p_dim_name)
 
-    p_trip = _block_dim_trip(orig_ar_block, p_dim)
-    p_tile = _block_dim_tile(module, orig_ar_block, p_dim)
+    p_trip = _block_axis_trip(orig_ar_block, p_axis_id)
+    p_tile = _block_axis_tile(module, orig_ar_block, p_axis_id)
     if p_trip is None or p_tile is None:
-        raise AtomLegalityError("RFactor.apply (slot): activation_reduce block has no iter var/access on P dim")
+        raise AtomLegalityError("RFactor.apply (slot): activation_reduce block has no iter var/access on P axis")
 
-    iv_p = module.allocate_iter_var(dim_id=p_dim, extent=p_trip, role=AxisRole.PARALLEL)
-    outer_info = new_dims[outer_dim_id]
-    outer_ar = AccessRange.make({}, 0, outer_info.total_size)
+    iv_p = module.allocate_iter_var(axis_id=p_axis_id, extent=p_trip, role=AxisRole.PARALLEL)
+    outer_axis = module.axes[outer_axis_id]
+    outer_ar = AccessRange.make({}, 0, outer_axis.total_size)
 
     """sum_acc's logical shape is 1D (P,) — pattern has one entry."""
     dst_pattern = (AccessRange.make({iv_p.var_id: 1}, 0, p_tile),)

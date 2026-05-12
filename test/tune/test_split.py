@@ -64,7 +64,8 @@ def _find_first_for_path(module, predicate):
 def test_split_divisor_factor_creates_outer_inner_pair() -> None:
     """Split(factor=4) on a trip=16 loop produces trip-4 trip-4 nested pair."""
     module = build_canonical_module(_matmul_large, _SPECS_LARGE)
-    path = _find_first_for_path(module, lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16)
+    d0 = module.axis_id_by_name("d0")
+    path = _find_first_for_path(module, lambda n: n.iter_var.axis_id == d0 and n.iter_var.extent == 16)
     atom = Split(loop_path=path, factor=4)
     assert atom.is_legal(module)
     new_mod = atom.apply(module)
@@ -79,13 +80,14 @@ def test_split_divisor_factor_creates_outer_inner_pair() -> None:
     inner = node.children[0]
     assert isinstance(inner, ForNode)
     assert inner.iter_var.extent == 4
-    assert inner.iter_var.dim_id == "d0"
+    assert inner.iter_var.axis_id == d0
 
 
 def test_split_non_divisor_factor_rejects() -> None:
     """Split(factor=3) on trip=16 is illegal."""
     module = build_canonical_module(_matmul_large, _SPECS_LARGE)
-    path = _find_first_for_path(module, lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16)
+    d0 = module.axis_id_by_name("d0")
+    path = _find_first_for_path(module, lambda n: n.iter_var.axis_id == d0 and n.iter_var.extent == 16)
     atom = Split(loop_path=path, factor=3)
     assert not atom.is_legal(module)
     with pytest.raises(AtomLegalityError):
@@ -95,14 +97,16 @@ def test_split_non_divisor_factor_rejects() -> None:
 def test_split_factor_1_is_illegal() -> None:
     """factor must be > 1."""
     module = build_canonical_module(_matmul_large, _SPECS_LARGE)
-    path = _find_first_for_path(module, lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16)
+    d0 = module.axis_id_by_name("d0")
+    path = _find_first_for_path(module, lambda n: n.iter_var.axis_id == d0 and n.iter_var.extent == 16)
     assert not Split(loop_path=path, factor=1).is_legal(module)
 
 
 def test_split_factor_equal_trip_is_illegal() -> None:
     """factor must be < extent."""
     module = build_canonical_module(_matmul_large, _SPECS_LARGE)
-    path = _find_first_for_path(module, lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16)
+    d0 = module.axis_id_by_name("d0")
+    path = _find_first_for_path(module, lambda n: n.iter_var.axis_id == d0 and n.iter_var.extent == 16)
     assert not Split(loop_path=path, factor=16).is_legal(module)
 
 
@@ -110,7 +114,8 @@ def test_split_rewrites_buffer_access_patterns() -> None:
     """After Split, BufferAccess.pattern references v_outer + v_inner with
     proper coefficients, and the renderer emits the composite expression."""
     module = build_canonical_module(_matmul_large, _SPECS_LARGE)
-    path = _find_first_for_path(module, lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16)
+    d0 = module.axis_id_by_name("d0")
+    path = _find_first_for_path(module, lambda n: n.iter_var.axis_id == d0 and n.iter_var.extent == 16)
     atom = Split(loop_path=path, factor=4)
     new_mod = atom.apply(module)
     source = render(new_mod)
@@ -134,9 +139,10 @@ def test_split_updates_sblock_iter_vars() -> None:
     > d0_inner (extent=128); we split the outer."""
     from nkigym.ops.base import AxisRole
 
+    d0 = module.axis_id_by_name("d0")
     mm_path = _find_first_for_path(
         module,
-        lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16 and n.iter_var.role == AxisRole.ACCUMULATION,
+        lambda n: n.iter_var.axis_id == d0 and n.iter_var.extent == 16 and n.iter_var.role == AxisRole.ACCUMULATION,
     )
     atom = Split(loop_path=mm_path, factor=4)
     new_mod = atom.apply(module)
@@ -156,7 +162,7 @@ def test_split_updates_sblock_iter_vars() -> None:
     mm_block = next(b for b in blocks if any(c.op_cls.__name__ == "NKIMatmul" for c in b.body))
     """d0 appears 3 times: (v_outer_outer=4, v_outer_inner=4) from the
     split + the canonical d0 inner tile (extent=128)."""
-    d0_ivs = [iv for iv in mm_block.iter_vars if iv.dim_id == "d0"]
+    d0_ivs = [iv for iv in mm_block.iter_vars if iv.axis_id == d0]
     assert len(d0_ivs) == 3
     extents = sorted(iv.extent for iv in d0_ivs)
     assert extents == [4, 4, 128]
@@ -177,7 +183,8 @@ def test_enumerate_split_atoms_yields_divisor_factors_per_loop() -> None:
 def test_split_apply_preserves_sblock_annotations() -> None:
     """Annotations on SBlocks and other ForNodes survive Split."""
     module = build_canonical_module(_matmul_large, _SPECS_LARGE)
-    path = _find_first_for_path(module, lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16)
+    d0 = module.axis_id_by_name("d0")
+    path = _find_first_for_path(module, lambda n: n.iter_var.axis_id == d0 and n.iter_var.extent == 16)
     """Attach annotation to target before split."""
     node = module.body[path[0]]
     for idx in path[1:]:
@@ -212,9 +219,10 @@ def test_split_rejects_when_innermost_goes_below_min_tile() -> None:
     produce factor<128 (since factor must be a proper divisor), violating MIN=128.
     """
     module = build_canonical_module(_matmul_large, _SPECS_LARGE)
+    d1 = module.axis_id_by_name("d1")
 
     def find_inner_matmul_m(module):
-        """Return path to the deepest ForNode with dim_id=d1 extent=128 whose
+        """Return path to the deepest ForNode with axis_id=d1 extent=128 whose
         descendants include a matmul SBlock."""
         candidates: list[tuple[int, ...]] = []
 
@@ -229,7 +237,7 @@ def test_split_rejects_when_innermost_goes_below_min_tile() -> None:
         def scan(node, path):
             if isinstance(node, ForNode):
                 iv = node.iter_var
-                if iv.extent == 128 and iv.dim_id == "d1" and has_matmul(node):
+                if iv.extent == 128 and iv.axis_id == d1 and has_matmul(node):
                     candidates.append(path)
                 for i, c in enumerate(node.children):
                     scan(c, path + (i,))
@@ -248,9 +256,10 @@ def test_split_rejects_when_innermost_goes_below_min_tile() -> None:
 def test_split_accepts_outer_loop_split() -> None:
     """Splitting an OUTER trip loop doesn't affect any leaf's innermost; should be legal."""
     module = build_canonical_module(_matmul_large, _SPECS_LARGE)
+    d1 = module.axis_id_by_name("d1")
 
     def find_outer_M(module):
-        """Find an outer matmul M loop (extent = 2048/128 = 16, dim=d1, NOT the innermost)."""
+        """Find an outer matmul M loop (extent = 2048/128 = 16, axis=d1, NOT the innermost)."""
         result = None
 
         def walk(node, path):
@@ -259,7 +268,7 @@ def test_split_accepts_outer_loop_split() -> None:
                 return
             if isinstance(node, ForNode):
                 iv = node.iter_var
-                if iv.extent == 16 and iv.dim_id == "d1":
+                if iv.extent == 16 and iv.axis_id == d1:
                     result = path
                     return
                 for i, c in enumerate(node.children):

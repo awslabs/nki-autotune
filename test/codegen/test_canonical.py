@@ -83,10 +83,11 @@ def test_canonical_iter_vars_per_block_distinct() -> None:
     would cross-couple unrelated blocks.
     """
     km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    d0_axis_id = km.axis_id_by_name("d0")
     blocks = _collect_sblocks(km)
     d0_ids_across_blocks: list[set[int]] = []
     for block in blocks:
-        d0_ids = {iv.var_id for iv in block.iter_vars if iv.dim_id == "d0"}
+        d0_ids = {iv.var_id for iv in block.iter_vars if iv.axis_id == d0_axis_id}
         if d0_ids:
             d0_ids_across_blocks.append(d0_ids)
     flat = [i for s in d0_ids_across_blocks for i in s]
@@ -434,7 +435,7 @@ def test_canonical_emits_outer_and_inner_tile_loops():
     def collect_loops(nodes, found):
         for n in nodes:
             if isinstance(n, ForNode):
-                found.append((n.iter_var.dim_id, n.iter_var.extent))
+                found.append((module.axes[n.iter_var.axis_id].name, n.iter_var.extent))
                 collect_loops(n.children, found)
 
     found = []
