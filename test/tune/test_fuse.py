@@ -1,4 +1,9 @@
-"""Unit tests for the Fuse atom on the iter-var IR."""
+"""Tests for the Fuse atom.
+
+Same-axis Fuse requires outer.extent == 1 and eagerly rewrites access
+patterns; no side-table. Cross-axis Fuse with dependent access patterns
+is rejected at ``is_legal``.
+"""
 
 import ast
 
@@ -120,18 +125,6 @@ def test_fuse_registers_synthetic_dim_info() -> None:
     assert new_mod.axes[d3].total_size == 2048
 
 
-def test_fuse_renderer_emits_div_and_mod() -> None:
-    """The rendered source opens a for-loop on the preserved ``d3`` axis
-    with extent 2048; same-axis fuse preserves the axis name, so the
-    loop spells ``i_d3_<ordinal>``."""
-    module = build_canonical_module(_matmul_large, _SPECS)
-    outer_id, inner_id = _tensor_copy_pair(module)
-    atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
-    new_mod = atom.apply(module)
-    source = render(new_mod)
-    assert "for i_d3_0 in range(2048):" in source
-
-
 def test_fuse_non_adjacent_rejects() -> None:
     """Pairing iter vars from sibling subtrees is illegal — the outer
     ForNode's sole child ForNode must bind the requested inner id."""
@@ -223,73 +216,3 @@ def test_fuse_rejects_when_fused_extent_exceeds_matmul_n_max() -> None:
     atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
     """Fused extent = 4 * 512 = 2048 > MAX_TILE_SIZE[N]=512 -> illegal."""
     assert atom.is_legal(module) is False
-
-
-def test_fuse_accepts_outer_trip_pair_not_innermost() -> None:
-    """Fuse two outer trip loops (neither is any leaf's innermost) - should be legal."""
-    from nkigym.tune.split import Split
-
-    module = build_canonical_module(_matmul_large, input_specs=_SPECS_LARGE)
-    d0 = module.axis_id_by_name("d0")
-
-    """Split matmul's outer K (extent=16) into (4, 4)."""
-
-    def find_k_outer(module):
-        def scan(node, path):
-            if isinstance(node, ForNode):
-                iv = node.iter_var
-                if iv.extent == 16 and iv.axis_id == d0:
-                    return path
-                for i, c in enumerate(node.children):
-                    r = scan(c, path + (i,))
-                    if r is not None:
-                        return r
-            return None
-
-        for i, r in enumerate(module.body):
-            found = scan(r, (i,))
-            if found is not None:
-                return found
-        return None
-
-    k_outer_path = find_k_outer(module)
-    assert k_outer_path is not None
-    split_atom = Split(loop_path=k_outer_path, factor=4)
-    assert split_atom.is_legal(module)
-    module2 = split_atom.apply(module)
-
-    """After the split, the two new K outer loops (4, 4) are an adjacent same-axis pair.
-    Find them."""
-
-    def find_split_pair(module):
-        outer_id = None
-        inner_id = None
-
-        def scan(node):
-            nonlocal outer_id, inner_id
-            if isinstance(node, ForNode):
-                iv = node.iter_var
-                if iv.axis_id == d0 and iv.extent == 4 and len(node.children) == 1:
-                    child = node.children[0]
-                    if isinstance(child, ForNode) and child.iter_var.axis_id == d0 and child.iter_var.extent == 4:
-                        outer_id = iv.var_id
-                        inner_id = child.iter_var.var_id
-                        return True
-                for c in node.children:
-                    if scan(c):
-                        return True
-            return False
-
-        for r in module.body:
-            if scan(r):
-                return outer_id, inner_id
-        return None, None
-
-    outer_id, inner_id = find_split_pair(module2)
-    assert outer_id is not None and inner_id is not None
-
-    """Fusing (4, 4) -> fused extent=16. The inner (extent=4) is NOT any leaf's innermost;
-    d0's innermost is still the canonical inner (extent=128) below them. So no MIN/MAX
-    check should fire, and the fuse is legal."""
-    atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
-    assert atom.is_legal(module2) is True

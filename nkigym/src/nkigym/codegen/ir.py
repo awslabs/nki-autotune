@@ -247,11 +247,6 @@ class KernelModule:
         axis_counter: Monotonic counter for allocating Axis.axis_id.
         body: Schedule tree — list of ForNode / SBlock roots.
         dep: Per-scope dependency cache (lazy).
-        fused_iter_var_map: Retired iter-var id -> (fused iter-var id,
-            inner extent, is_outer). Populated by the ``Fuse`` atom. The
-            renderer consults this map when emitting accesses that still
-            reference the retired outer/inner ids: outer decomposes as
-            ``(fused // inner_extent)`` and inner as ``(fused % inner_extent)``.
     """
 
     func_name: str
@@ -263,7 +258,6 @@ class KernelModule:
     axis_counter: int = 0
     body: TreeIR = field(default_factory=list)
     dep: DepCache = field(default_factory=lambda: DepCache(scopes={}))
-    fused_iter_var_map: dict[int, tuple[int, int, bool]] = field(default_factory=dict)
 
     def allocate_axis(self, name: str, total_size: int, source_axes: tuple[int, ...] | None = None) -> Axis:
         """Allocate a fresh :class:`Axis` with a monotonic unique ``axis_id``.
@@ -311,6 +305,79 @@ class KernelModule:
         if len(matches) > 1:
             raise KeyError(f"multiple axes with name {name!r}: {matches}")
         return matches[0]
+
+    def pprint(self) -> str:
+        """Human-readable multi-line repr of the whole module.
+
+        Sections: signature, axes, tensors, schedule tree. The tree is
+        indented; each ForNode prints as ``for i_<axis.name>_<var_id> in
+        range(extent) [role]``; each SBlock prints as ``SBlock[op_cls]``
+        followed by indented operand access lines.
+        """
+        lines: list[str] = []
+
+        """Signature."""
+        lines.append(f"KernelModule {self.func_name}({', '.join(self.param_names)}) -> {self.return_name}")
+
+        """Axes."""
+        lines.append("axes:")
+        for axis in sorted(self.axes.values(), key=lambda a: a.axis_id):
+            src = f" <- {axis.source_axes}" if axis.source_axes is not None else ""
+            lines.append(f"  axis_id={axis.axis_id} name={axis.name!r} total_size={axis.total_size}{src}")
+
+        """Tensors."""
+        lines.append("tensors:")
+        for t in self.tensors.values():
+            degree = dict(t.buffer_degree) if any(v != 1 for v in t.buffer_degree.values()) else None
+            degree_suffix = f" buffer_degree={degree}" if degree else ""
+            lines.append(
+                f"  {t.name}: {t.location} {t.dtype} shape={t.shape} dim_ids={t.dim_ids} origin={t.origin}{degree_suffix}"
+            )
+
+        """Body."""
+        lines.append("body:")
+        for root in self.body:
+            _pprint_node(root, self, indent=1, lines=lines)
+
+        return "\n".join(lines)
+
+
+def _pprint_node(node: "ForNode | SBlock", module: "KernelModule", indent: int, lines: list[str]) -> None:
+    """Recursively render one tree node into ``lines`` with ``indent`` level."""
+    prefix = "  " * indent
+    if isinstance(node, ForNode):
+        iv = node.iter_var
+        axis_name = module.axes[iv.axis_id].name if iv.axis_id in module.axes else f"axis{iv.axis_id}"
+        lines.append(f"{prefix}for i_{axis_name}_{iv.var_id} in range({iv.extent}) [{iv.role.name}]")
+        for c in node.children:
+            _pprint_node(c, module, indent + 1, lines)
+    else:
+        op_names = ",".join(call.op_cls.__name__ for call in node.body) if node.body else "empty"
+        iv_summary = ",".join(
+            f"{module.axes[iv.axis_id].name if iv.axis_id in module.axes else '?'}:{iv.var_id}(ext={iv.extent})"
+            for iv in node.iter_vars
+        )
+        lines.append(f"{prefix}SBlock[{op_names}] iter_vars=[{iv_summary}]")
+        for slot, access in node.reads.items():
+            lines.append(f"{prefix}  read {slot}: {_fmt_access(access)}")
+        for slot, access in node.writes.items():
+            lines.append(f"{prefix}  write {slot}: {_fmt_access(access)}")
+        for slot, access in node.reads_writes.items():
+            lines.append(f"{prefix}  rmw {slot}: {_fmt_access(access)}")
+
+
+def _fmt_access(access: "BufferAccess") -> str:
+    """One-line repr of a :class:`BufferAccess`."""
+    pattern_parts = []
+    for ar in access.pattern:
+        terms = []
+        for iv_id, coeff in ar.iter_var_coeffs:
+            terms.append(f"{coeff}*iv{iv_id}")
+        if ar.const_offset:
+            terms.append(str(ar.const_offset))
+        start_expr = " + ".join(terms) if terms else "0"
+        pattern_parts.append(f"{start_expr}:+{ar.extent}")
+    return f"{access.tensor_name}[{', '.join(pattern_parts)}]"
 
 
 def resolve_node(forest: TreeIR, path: tuple[int, ...]) -> "ForNode | SBlock | None":

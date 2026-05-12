@@ -51,9 +51,10 @@ def hash_state(module: KernelModule) -> int:
     """Structural hash of the tune-stage state.
 
     Folds the body's structural signature with every tensor's
-    ``buffer_degree`` and ``module.fused_iter_var_map`` so that body-editing
-    atoms, :class:`Annotate` buffer-degree mutations, and :class:`Fuse`
-    iter-var registrations all register as distinct states.
+    ``buffer_degree`` so that body-editing atoms and :class:`Annotate`
+    buffer-degree mutations register as distinct states. :class:`Fuse`
+    now rewrites the tree and access patterns directly, so its effect
+    flows through ``body_key`` naturally.
 
     Args:
         module: The :class:`KernelModule` to hash.
@@ -63,8 +64,7 @@ def hash_state(module: KernelModule) -> int:
     """
     body_key = tuple(subtree_signature(c) for c in module.body)
     tensor_key = tuple(sorted((t.name, tuple(sorted(t.buffer_degree.items()))) for t in module.tensors.values()))
-    fuse_key = tuple(sorted(module.fused_iter_var_map.items()))
-    return hash((body_key, tensor_key, fuse_key))
+    return hash((body_key, tensor_key))
 
 
 def _enumerate_atoms(module: KernelModule) -> list[KernelRewrite]:

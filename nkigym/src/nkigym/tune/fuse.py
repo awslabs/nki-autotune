@@ -15,34 +15,45 @@ Legality:
 - The outer ForNode has exactly one child, which is a ForNode binding
   the inner iter var. No other ForNodes / SBlocks interleave.
 - SEQUENTIAL never fuses — sequential state would be reordered.
+- Same-axis fuse requires ``outer.extent == 1`` (canonical form). The
+  retired outer contributes 0 to every affine expression, so access
+  patterns collapse cleanly without needing non-affine ``//`` / ``%``
+  decomposition.
+- Cross-axis fuse (different ``axis_id``) is rejected when any SBlock
+  in the fused subtree has a :class:`BufferAccess` referencing either
+  outer or inner ``var_id``. The decomposition ``outer = fused //
+  inner_ext`` is non-affine and cannot be encoded in today's
+  :attr:`AccessRange.iter_var_coeffs`.
 - All other role pairs are legal; the fused role takes the lattice
   max ``PAR ⊂ SEQ ⊂ ACC``. Only PAR/PAR and ACC/ACC actually compose,
   because SEQUENTIAL is rejected above.
 
 Apply:
 
-1. Retire ``v_outer`` and ``v_inner``.
-2. Allocate ``v_fused``: same-axis preserves ``axis_id``; cross-axis
-   allocates a fresh :class:`Axis` via ``module.allocate_axis``.
-3. Record the outer/inner decomposition in
-   ``module.fused_iter_var_map`` so the renderer emits outer references
-   as ``(fused_name // inner_extent)`` and inner as ``(fused_name %
-   inner_extent)``.
-4. Replace the two-ForNode chain with a single ``ForNode(v_fused)``
-   that keeps the inner's children.
-5. Rewrite every SBlock.iter_vars: consecutive ``(v_outer, v_inner)``
-   collapses to ``(v_fused,)`` in the same list position.
+Same-axis Fuse eagerly rewrites affected :class:`BufferAccess` patterns
+(outer dropped from coeffs, inner renamed to fused var_id); cross-axis
+Fuse with dependent accesses is rejected at ``is_legal``. No side-table
+is maintained. Every iter-var id appearing in any live
+``BufferAccess.iter_var_coeffs`` must be bound by an enclosing
+``ForNode`` at render time.
 
-``BufferAccess.pattern`` is untouched — the retired iter-var ids still
-appear in ``iter_var_coeffs``, and the renderer's ``_resolve_iv_name``
-helper decomposes them via ``module.fused_iter_var_map``.
-
-See ``docs/superpowers/specs/2026-05-10-iter-var-refactor-design.md`` 4.3.
+See ``docs/superpowers/specs/2026-05-10-iter-var-refactor-design.md`` 4.3
+and ``docs/superpowers/specs/2026-05-12-eager-fuse-pattern-rewrite-design.md``.
 """
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import ForNode, IterVar, KernelModule, SBlock, TreeIR, replace_at_path
+from nkigym.codegen.ir import (
+    AccessRange,
+    BufferAccess,
+    ForNode,
+    IterVar,
+    KernelModule,
+    SBlock,
+    TreeIR,
+    replace_at_path,
+    resolve_node,
+)
 from nkigym.ops.base import AxisRole
 from nkigym.tune import AtomLegalityError
 from nkigym.tune.split import _abstract_axis_for, _op_cls_for_block
@@ -65,7 +76,19 @@ class Fuse:
     inner_iter_var_id: int
 
     def is_legal(self, module: KernelModule) -> bool:
-        """Structural + role preconditions + MIN/MAX tile check when fuse touches innermost.
+        """Structural + role preconditions + eager-rewrite preconditions + MIN/MAX tile check.
+
+        Preconditions for eager access-pattern rewriting:
+
+        - Same-axis fuse (``outer.axis_id == inner.axis_id``):
+          ``outer.extent == 1`` (outer is a trip-1 loop). This matches
+          canonical usage; the retired outer contributes 0 to every
+          affine expression, so it can be dropped from access patterns.
+        - Cross-axis fuse (different axis_ids): no SBlock in the fused
+          subtree may have a BufferAccess referencing either outer or
+          inner var_id. The decomposition ``outer = fused // inner_ext``
+          is non-affine and cannot be encoded in
+          :attr:`AccessRange.iter_var_coeffs`.
 
         If the inner loop is the innermost tile loop for any descendant
         leaf (i.e. its iter-var is the last one for its dim in the leaf's
@@ -79,10 +102,22 @@ class Fuse:
         result = False
         if pair is not None:
             outer, inner, _path = pair
-            role_a = outer.iter_var.role
-            role_b = inner.iter_var.role
+            v_outer = outer.iter_var
+            v_inner = inner.iter_var
+            role_a = v_outer.role
+            role_b = v_inner.role
             if role_a != AxisRole.SEQUENTIAL and role_b != AxisRole.SEQUENTIAL:
-                result = self._check_min_max(outer, inner)
+                eager_ok = True
+                if v_outer.axis_id == v_inner.axis_id:
+                    """Same-axis fuse: require outer.extent == 1 so we can drop its contribution."""
+                    if v_outer.extent != 1:
+                        eager_ok = False
+                else:
+                    """Cross-axis fuse: reject if any dependent access pattern exists."""
+                    if _subtree_has_access_referencing(inner, {v_outer.var_id, v_inner.var_id}):
+                        eager_ok = False
+                if eager_ok:
+                    result = self._check_min_max(outer, inner)
         return result
 
     def _check_min_max(self, outer: ForNode, inner: ForNode) -> bool:
@@ -113,11 +148,26 @@ class Fuse:
     def apply(self, module: KernelModule) -> KernelModule:
         """Execute the fuse.
 
-        Same-axis fuse preserves ``axis_id``; cross-axis fuse allocates a
-        fresh :class:`Axis` with ``source_axes=(outer.axis_id, inner.axis_id)``.
+        Same-axis fuse (the common case, ``outer.extent == 1``):
+
+        - Drops retired outer's var_id from affected access patterns
+          (contribution is 0 since extent is 1).
+        - Renames retired inner's var_id to the fused var_id in affected
+          access patterns (same coefficient).
+        - Collapses ``SBlock.iter_vars`` lists: adjacent ``(outer,
+          inner)`` pairs become ``(fused,)``.
+        - Replaces the two-ForNode chain with a single
+          ``ForNode(v_fused)``.
+
+        Cross-axis fuse (different axis_ids, no dependent accesses):
+
+        - Allocates a fresh :class:`Axis` with ``source_axes`` trace.
+        - Collapses ``SBlock.iter_vars`` lists and the tree as above.
+        - No access-pattern rewrite (legality already rejected cases
+          that would require one).
 
         Raises:
-            AtomLegalityError: ``is_legal`` returns False against ``module``.
+            AtomLegalityError: ``is_legal`` returns False.
         """
         if not self.is_legal(module):
             raise AtomLegalityError(f"Fuse.apply: illegal {self!r}")
@@ -146,14 +196,29 @@ class Fuse:
 
         v_fused = module.allocate_iter_var(axis_id=fused_axis_id, extent=fused_extent, role=fused_role)
 
-        """Record the decomposition so the renderer can emit
-        ``(fused // inner_extent)`` and ``(fused % inner_extent)``."""
-        module.fused_iter_var_map[v_outer.var_id] = (v_fused.var_id, v_inner.extent, True)
-        module.fused_iter_var_map[v_inner.var_id] = (v_fused.var_id, v_inner.extent, False)
+        """Rewrite access patterns in the whole body. For same-axis fuse
+        this drops outer coeffs (outer.extent == 1, contributes 0) and
+        renames inner coeffs to v_fused. For cross-axis fuse legality has
+        already ruled out dependent accesses, so the rewrite is a no-op."""
+        new_body = _rewrite_access_patterns_on_fuse(
+            module.body, outer_id=v_outer.var_id, inner_id=v_inner.var_id, fused_id=v_fused.var_id
+        )
 
-        new_body = _collapse_iter_var_lists(module.body, v_outer.var_id, v_inner.var_id, v_fused)
+        """Collapse SBlock.iter_vars lists: adjacent (outer, inner) -> (fused,)."""
+        new_body = _collapse_iter_var_lists(new_body, v_outer.var_id, v_inner.var_id, v_fused)
+
+        """Now build the replacement ForNode from the *rewritten* subtree
+        at outer_path, not the pre-rewrite inner_node. This ensures the
+        rewritten SBlock children survive into the new module."""
+        rewritten_outer = resolve_node(new_body, outer_path)
+        assert isinstance(rewritten_outer, ForNode)
+        rewritten_inner = rewritten_outer.children[0]
+        assert isinstance(rewritten_inner, ForNode)
         new_fornode = ForNode(
-            iter_var=v_fused, children=list(inner_node.children), name=None, annotations=dict(outer_node.annotations)
+            iter_var=v_fused,
+            children=list(rewritten_inner.children),
+            name=None,
+            annotations=dict(rewritten_outer.annotations),
         )
         new_body = replace_at_path(new_body, outer_path, new_fornode)
         return replace(module, body=new_body)
@@ -266,6 +331,97 @@ def _collapse_iter_var_lists(body: TreeIR, outer_id: int, inner_id: int, v_fused
                 annotations=dict(block.annotations),
             )
         return result
+
+    def rewrite_node(node: ForNode | SBlock) -> ForNode | SBlock:
+        if isinstance(node, SBlock):
+            return rewrite_block(node)
+        return ForNode(
+            iter_var=node.iter_var,
+            children=[rewrite_node(c) for c in node.children],
+            name=node.name,
+            annotations=dict(node.annotations),
+        )
+
+    return [rewrite_node(n) for n in body]
+
+
+def _subtree_has_access_referencing(root: ForNode | SBlock, iv_ids: set[int]) -> bool:
+    """Return True if any SBlock beneath ``root`` has a BufferAccess
+    referencing any id in ``iv_ids``.
+    """
+
+    def visit(node: ForNode | SBlock) -> bool:
+        found = False
+        if isinstance(node, SBlock):
+            for access_map in (node.reads, node.writes, node.reads_writes):
+                for _slot, ba in access_map.items():
+                    if any(iv_id in iv_ids for iv_id in ba.iter_var_ids):
+                        found = True
+                        break
+                if found:
+                    break
+        else:
+            for c in node.children:
+                if visit(c):
+                    found = True
+                    break
+        return found
+
+    return visit(root)
+
+
+def _rewrite_access_patterns_on_fuse(body: TreeIR, outer_id: int, inner_id: int, fused_id: int) -> TreeIR:
+    """Rewrite every ``BufferAccess`` in ``body`` to replace references to
+    the retired ``outer_id`` / ``inner_id`` with ``fused_id``.
+
+    Semantics (same-axis fuse with ``outer.extent == 1``):
+
+    - ``outer.var_id`` contributes 0 to every affine expression -> drop
+      entries.
+    - ``inner.var_id`` equals ``fused.var_id`` numerically -> rename
+      entries.
+
+    For cross-axis fuse legality already guarantees no access references
+    the retired ids; this function is a no-op in that case.
+    """
+
+    def rewrite_access(acc: BufferAccess) -> BufferAccess:
+        result = acc
+        if outer_id in acc.iter_var_ids or inner_id in acc.iter_var_ids:
+            new_id_list: list[int] = []
+            for iv_id in acc.iter_var_ids:
+                if iv_id == outer_id:
+                    continue
+                elif iv_id == inner_id:
+                    if fused_id not in new_id_list:
+                        new_id_list.append(fused_id)
+                else:
+                    if iv_id not in new_id_list:
+                        new_id_list.append(iv_id)
+            new_pattern: list[AccessRange] = []
+            for ar in acc.pattern:
+                coeffs = dict(ar.iter_var_coeffs)
+                """Drop outer: contributes 0."""
+                coeffs.pop(outer_id, None)
+                """Rename inner to fused."""
+                if inner_id in coeffs:
+                    inner_coeff = coeffs.pop(inner_id)
+                    coeffs[fused_id] = coeffs.get(fused_id, 0) + inner_coeff
+                new_pattern.append(AccessRange.make(coeffs, ar.const_offset, ar.extent))
+            result = BufferAccess(
+                tensor_name=acc.tensor_name, iter_var_ids=tuple(new_id_list), pattern=tuple(new_pattern)
+            )
+        return result
+
+    def rewrite_block(block: SBlock) -> SBlock:
+        return SBlock(
+            iter_vars=block.iter_vars,
+            reads={k: rewrite_access(v) for k, v in block.reads.items()},
+            writes={k: rewrite_access(v) for k, v in block.writes.items()},
+            reads_writes={k: rewrite_access(v) for k, v in block.reads_writes.items()},
+            body=block.body,
+            annotations=dict(block.annotations),
+        )
 
     def rewrite_node(node: ForNode | SBlock) -> ForNode | SBlock:
         if isinstance(node, SBlock):

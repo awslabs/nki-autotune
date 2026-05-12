@@ -115,7 +115,9 @@ class Split:
         v_inner = module.allocate_iter_var(old_iv.axis_id, inner_extent, old_iv.role)
 
         """Rewrite all BufferAccess.pattern entries referencing old_iv.var_id."""
-        new_body = _rewrite_patterns(module.body, old_iv.var_id, v_outer.var_id, v_inner.var_id, inner_extent)
+        new_body = _rewrite_patterns(
+            module.body, old_iv.var_id, v_outer.var_id, v_inner.var_id, outer_extent, inner_extent
+        )
 
         """Update every SBlock.iter_vars list: replace old_iv with (v_outer, v_inner)."""
         new_body = _update_iter_var_lists(new_body, old_iv.var_id, v_outer, v_inner)
@@ -130,9 +132,19 @@ class Split:
         return replace(module, body=new_body)
 
 
-def _rewrite_patterns(body: TreeIR, old_id: int, outer_id: int, inner_id: int, inner_extent: int) -> TreeIR:
+def _rewrite_patterns(
+    body: TreeIR, old_id: int, outer_id: int, inner_id: int, outer_extent: int, inner_extent: int
+) -> TreeIR:
     """Rewrite every BufferAccess.pattern entry referencing ``old_id`` to
-    ``outer_id * inner_extent + inner_id``."""
+    ``outer_id * inner_extent + inner_id``.
+
+    When the retired iv's full extent appears as an access's per-iteration
+    extent (the access tracks the iv's full range), shrink the new extent
+    to ``inner_extent`` — after split the new full range is the elided
+    innermost tile (``inner_extent``). Smaller accesses (tiles over part
+    of the iv's range) are left untouched.
+    """
+    old_extent = outer_extent * inner_extent
 
     def rewrite_access(acc: BufferAccess) -> BufferAccess:
         if old_id not in acc.iter_var_ids:
@@ -143,7 +155,11 @@ def _rewrite_patterns(body: TreeIR, old_id: int, outer_id: int, inner_id: int, i
         new_pattern: list[AccessRange] = []
         for ar in acc.pattern:
             coeffs = _coeffs_rewrite(ar, old_id, outer_id, inner_id, inner_extent)
-            new_pattern.append(AccessRange.make(coeffs, ar.const_offset, ar.extent))
+            if old_id in dict(ar.iter_var_coeffs) and ar.extent == old_extent:
+                new_extent = inner_extent
+            else:
+                new_extent = ar.extent
+            new_pattern.append(AccessRange.make(coeffs, ar.const_offset, new_extent))
         return BufferAccess(tensor_name=acc.tensor_name, iter_var_ids=tuple(new_ids_list), pattern=tuple(new_pattern))
 
     def rewrite_block(block: SBlock) -> SBlock:

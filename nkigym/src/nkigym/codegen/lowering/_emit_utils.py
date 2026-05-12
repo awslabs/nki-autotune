@@ -20,11 +20,10 @@ shape:
   any middle slot axes emit the iter-var slot index (no scaling); F-axis
   emits a tile-size-scaled slice.
 
-Fused iter vars: after :class:`Fuse` retires an outer/inner pair and
-allocates ``v_fused``, ``module.fused_iter_var_map`` records each retired
-id → ``(fused_id, inner_extent, is_outer)``. :func:`_resolve_iv_name`
-decomposes retired references into ``(fused // inner_extent)`` for the
-outer component and ``(fused % inner_extent)`` for the inner component.
+Fused iter vars: :class:`Fuse` eagerly rewrites affected
+:class:`BufferAccess` patterns when it retires an outer/inner pair
+(outer dropped from coeffs — extent-1 contributes 0; inner renamed to
+the fused var_id). No side-table is consulted at emission.
 """
 
 from dataclasses import dataclass, field
@@ -67,10 +66,8 @@ class EmitCtx:
             ForNode entry, restored on exit.
         tensors: Reference to ``module.tensors`` for shape/dtype/location
             lookups.
-        module: Reference to the enclosing :class:`KernelModule`. The
-            slice-emission helpers consult ``module.fused_iter_var_map``
-            to decompose retired outer/inner iter-var references into
-            ``(fused // inner_extent)`` / ``(fused % inner_extent)``.
+        module: Reference to the enclosing :class:`KernelModule`. Used
+            for tensor/axis lookups during slice emission.
         innermost_tile_ids: Set of :class:`IterVar` ``var_id``\\ s that
             are the innermost tile loop for their respective axis at a
             descendant :class:`SBlock`. When the walker enters a ForNode
@@ -94,29 +91,16 @@ class EmitCtx:
 def _resolve_iv_name(iv_id: int, ctx: EmitCtx) -> str:
     """Return the source name to use for ``iv_id``.
 
-    Resolution order:
-
-    1. Live binding — the iter var is currently bound by an enclosing
-       ``ForNode`` (normal case).
-    2. Retired via ``Fuse`` — ``module.fused_iter_var_map`` records the
-       decomposition. Emits ``(fused_name // inner_extent)`` for the
-       outer component and ``(fused_name % inner_extent)`` for the inner
-       component. Recursively resolves the fused id so chains of fuses
-       resolve correctly.
+    The iter-var must be bound by an enclosing ForNode at render time;
+    otherwise the access pattern references a ghost id and the module is
+    ill-formed.
 
     Raises:
-        KeyError: ``iv_id`` is neither live nor retired.
+        KeyError: ``iv_id`` is not bound by any enclosing ForNode.
     """
-    if iv_id in ctx.iter_var_to_name:
-        return ctx.iter_var_to_name[iv_id]
-    entry = ctx.module.fused_iter_var_map.get(iv_id)
-    if entry is None:
-        raise KeyError(f"iter var {iv_id} is neither live nor recorded in fused_iter_var_map")
-    fused_id, inner_extent, is_outer = entry
-    fused_name = _resolve_iv_name(fused_id, ctx)
-    if is_outer:
-        return f"({fused_name} // {inner_extent})"
-    return f"({fused_name} % {inner_extent})"
+    if iv_id not in ctx.iter_var_to_name:
+        raise KeyError(f"iter var {iv_id} has no live binding")
+    return ctx.iter_var_to_name[iv_id]
 
 
 def emit_slice(tensor: Tensor, access: BufferAccess, ctx: EmitCtx) -> str:
@@ -131,8 +115,7 @@ def emit_slice(tensor: Tensor, access: BufferAccess, ctx: EmitCtx) -> str:
         access: BufferAccess with one :class:`AccessRange` per logical
             tensor dim.
         ctx: :class:`EmitCtx` carrying the live iter-var naming and the
-            enclosing :class:`KernelModule` (used to decompose retired
-            iter-var references via :attr:`KernelModule.fused_iter_var_map`).
+            enclosing :class:`KernelModule` for tensor/axis lookups.
 
     Returns:
         Source fragment ``"name[slice_0, slice_1, ...]"``.
