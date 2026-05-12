@@ -28,26 +28,27 @@ The nkigym IR is a three-layer pipeline. A math-level Python function is lifted 
 | | `param_names` | Signature order. |
 | | `return_name` | Name of the return tensor. |
 | | `tensors: dict[str, Tensor]` | Every named tensor, keyed by name. |
-| | `dims: dict[str, DimInfo]` | Every concrete dim, keyed by dim id. |
-| | `body: TreeIR` | Schedule tree: list of `LoopNode \| BodyLeaf` roots. |
+| | `axes: dict[int, Axis]` | Every logical axis, keyed by axis_id. |
+| | `body: TreeIR` | Schedule tree: list of `ForNode \| SBlock` roots. |
 | | `dep: DepCache` | Per-scope dependency cache (lazy rebuild). |
 | `Tensor` | `name`, `dim_ids`, `shape`, `dtype` | Identity. |
 | | `origin` | `"param"`, `"intermediate"`, or `"return"`. |
 | | `location` | `"hbm"`, `"sbuf"`, or `"psum"`. |
 | | `buffer_degree` | Multi-buffer degree per dim. Defaults to 1. |
-| `DimInfo` | `dim_id`, `total_size`, `tile_size`, `num_tiles` | Full extent and per-tile extent. |
-| `LoopNode` | `dim_id`, `trip_count`, `role` | One loop over a dim, with role `PARALLEL` / `SEQUENTIAL` / `ACCUMULATION`. |
+| `Axis` | `axis_id: int`, `name: str`, `total_size`, `source_axes` | Logical axis. Identity is `axis_id` (opaque int); `name` is purely cosmetic (display in emitted source). `source_axes` traces cross-axis Fuse provenance. |
+| `ForNode` | `iter_var: IterVar` | One loop over an axis, with role `PARALLEL` / `SEQUENTIAL` / `ACCUMULATION` on its iter-var. |
 | | `children` | Nested loops and/or body leaves. |
-| | `name` | Canonical identifier `i_<dim>_<ordinal>`. |
+| | `name` | Canonical identifier `i_<axis.name>_<ordinal>`. |
 | | `pipeline_depth` | 1 = no pipeline; >1 = software-pipelined. |
 | | `reduce_op` | Combinator for ACC loops. |
-| `BodyLeaf` | `op_cls` | The `NKIOp` subclass (matmul, load, ...). |
+| `IterVar` | `var_id`, `axis_id: int`, `extent`, `role` | Stable identity for one loop iter-var. |
+| `SBlock` | `op_cls` | The `NKIOp` subclass (matmul, load, ...). |
 | | `reads: dict[slot, name]` | Read-only operands. |
 | | `writes: tuple[name, ...]` | Write-only operands. |
 | | `reads_writes: tuple[name, ...]` | RMW operands (e.g. matmul `dst`). |
 | | `kwargs` | Constructor kwargs (e.g. `op="square"`, `value=0.0`). |
-| | `axis_map` | Abstract axis → concrete dim id. |
-| | `dim_role` | Concrete dim → `AxisRole` (op-local). |
+| | `axis_map` | Abstract axis name → `axis_id` (int). |
+| | `axis_role` | `axis_id` → `AxisRole` (op-local). |
 
 **Buffer / Allocate separation (TVM style).** `module.tensors[name]` is the tensor's identity — shape, dtype, location, dim_ids, buffer_degree. An `NKIAlloc` `BodyLeaf` is the tensor's allocation scope — its tree position dictates where the `nl.ndarray(...)` declaration is emitted. Identity-changing atoms (e.g. `MultiBuffer`) mutate `module.tensors`; scope-changing atoms (e.g. `ComputeAt` on an alloc leaf) move the `NKIAlloc` leaf. The two concerns never mix.
 
@@ -228,7 +229,7 @@ for i_d0_0 in range(2):
                 )
 ```
 
-The slot expression `i_d0_0 * 2 + i_d0_1` falls out automatically: both `LoopNode`s carry `dim_id="d0"`, so `slot_expr` multiplies loop vars by tail-trip products.
+The slot expression `i_d0_0 * 2 + i_d0_1` falls out automatically: both `ForNode`s carry iter-vars with the same `axis_id` (the d0 axis), so `slot_expr` multiplies loop vars by tail-trip products.
 
 ### 6.2 Step 2 — `Split(rhs_load K loop, factor=2)` + `ReverseComputeAt(matmul, rhs_load K_outer)`
 
@@ -386,7 +387,7 @@ nkigym/src/nkigym/
 │   ├── tensor_reduce.py                # NKITensorReduce
 │   └── memset.py                       # NKIMemset
 ├── codegen/
-│   ├── ir.py                           # KernelModule, Tensor, DimInfo, LoopNode, BodyLeaf, validate_dataflow_ordering
+│   ├── ir.py                           # KernelModule, Tensor, Axis, IterVar, ForNode, SBlock, validate_dataflow_ordering
 │   ├── dep_cache.py                    # DepCache (per-scope dependency tracking)
 │   ├── canonical.py                    # build_canonical_module (AST parse → IR)
 │   ├── render.py                       # render entry point
