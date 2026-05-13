@@ -29,16 +29,23 @@ source plus a rendered PNG under a caller-supplied cache directory.
 
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import networkx as nx
 
+from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
 from nkigym.ir.dimension_analysis import DimensionAnalysis, OpAxes
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import AxisRole, NKIOp
+
+_FLOWCHART_STYLES: list[ClassStyle] = [
+    ClassStyle(name="alloc", fill="#fef", stroke="#963"),
+    ClassStyle(name="loop", fill="#eef", stroke="#336"),
+    ClassStyle(name="tensorize", fill="#ffe", stroke="#a60"),
+    ClassStyle(name="leaf", fill="#efe", stroke="#363"),
+]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -187,7 +194,7 @@ class KernelTree:
         mmd_path = cache_path / "tree.mmd"
         png_path = cache_path / "tree.png"
         mmd_path.write_text(_to_mermaid(self), encoding="utf-8")
-        _render_png(mmd_path, png_path)
+        render_png(mmd_path, png_path)
 
 
 def build_initial_tree(analysis: DimensionAnalysis) -> KernelTree:
@@ -241,36 +248,27 @@ def _attach_op_subtree(tree: KernelTree, op: OpAxes) -> None:
 
 def _to_mermaid(tree: KernelTree) -> str:
     """Render ``tree`` to a Mermaid ``flowchart TB`` source string."""
-    decls: list[str] = []
-    edges: list[str] = []
-    classes: dict[str, list[str]] = {"alloc": [], "loop": [], "tensorize": [], "leaf": []}
+    flow = Flowchart(direction="TB", styles=_FLOWCHART_STYLES)
     for nid in tree.preorder():
-        data = tree.data(nid)
         node_id = f"n{nid}"
-        if isinstance(data, RootNode):
-            decls.append(f'    {node_id}(("#{nid} root"))')
-        elif isinstance(data, ForNode):
-            decls.append(f'    {node_id}["#{nid} Loop {data.dim} trip={data.trip}<br/>{data.loop_type.name}"]')
-            classes["loop"].append(node_id)
-        elif isinstance(data, TensorizeLoop):
-            decls.append(f'    {node_id}["#{nid} TensorizeLoop {data.dim} trip={data.trip}<br/>{data.loop_type.name}"]')
-            classes["tensorize"].append(node_id)
-        elif isinstance(data, ISANode):
-            decls.append(f'    {node_id}["#{nid} {_isa_label(data)}"]')
-            classes["alloc" if data.op_cls is NKIAlloc else "leaf"].append(node_id)
-        else:
-            raise TypeError(f"unknown node data type: {type(data).__name__}")
+        decl, class_name = _tree_node_decl(node_id, nid, tree.data(nid))
+        flow.add_node(node_id, decl, class_name)
         for child in tree.children(nid):
-            edges.append(f"    n{nid} --> n{child}")
-    lines: list[str] = ["flowchart TB", *decls, "", *edges, ""]
-    lines.append("    classDef alloc fill:#fef,stroke:#963;")
-    lines.append("    classDef loop fill:#eef,stroke:#336;")
-    lines.append("    classDef tensorize fill:#ffe,stroke:#a60;")
-    lines.append("    classDef leaf fill:#efe,stroke:#363;")
-    for bucket, members in classes.items():
-        if members:
-            lines.append(f"    class {','.join(members)} {bucket};")
-    return "\n".join(lines) + "\n"
+            flow.add_edge(node_id, f"n{child}")
+    return flow.render()
+
+
+def _tree_node_decl(node_id: str, nid: int, data: NodeData) -> tuple[str, str | None]:
+    """Return the Mermaid declaration + class bucket for one tree node."""
+    if isinstance(data, RootNode):
+        return f'{node_id}(("#{nid} root"))', None
+    if isinstance(data, ForNode):
+        return (f'{node_id}["#{nid} Loop {data.dim} trip={data.trip}<br/>{data.loop_type.name}"]', "loop")
+    if isinstance(data, TensorizeLoop):
+        return (f'{node_id}["#{nid} TensorizeLoop {data.dim} trip={data.trip}<br/>{data.loop_type.name}"]', "tensorize")
+    if isinstance(data, ISANode):
+        return (f'{node_id}["#{nid} {_isa_label(data)}"]', "alloc" if data.op_cls is NKIAlloc else "leaf")
+    raise TypeError(f"unknown node data type: {type(data).__name__}")
 
 
 def _isa_label(data: ISANode) -> str:
@@ -285,25 +283,6 @@ def _isa_label(data: ISANode) -> str:
     if data.rmw:
         parts.append(f"rmw={','.join(data.rmw)}")
     return "<br/>".join(parts)
-
-
-def _render_png(mmd: Path, png: Path) -> None:
-    """Invoke ``mmdc`` to convert the Mermaid source to a high-res PNG."""
-    config_path = mmd.with_suffix(".puppeteer.json")
-    config_path.write_text('{"args":["--no-sandbox"]}', encoding="utf-8")
-    try:
-        result = subprocess.run(
-            ["mmdc", "-i", str(mmd), "-o", str(png), "-s", "4", "--puppeteerConfigFile", str(config_path)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"mmdc failed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}"
-            )
-    finally:
-        config_path.unlink(missing_ok=True)
 
 
 __all__ = [

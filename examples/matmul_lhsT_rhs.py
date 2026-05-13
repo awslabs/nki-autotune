@@ -68,4 +68,7 @@ if __name__ == "__main__":
     _check_numerics()
     ir = build_initial_ir(f_nkigym, INPUT_SPECS)
     print(repr(ir.analysis))
+    print("chains:")
+    for name, chain in ir.dependency.chains().items():
+        print(f"  {name}: {'-'.join(str(n) for n in chain)}")
     ir.dump(CACHE_DIR)
