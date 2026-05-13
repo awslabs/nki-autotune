@@ -43,7 +43,16 @@ class NKIAlloc(NKIOp):
     """
 
     NAME: ClassVar[str] = "alloc"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"dst": ("P", "F")}
+    """Labels the axes of the allocated tensor (the ``dst`` slot is the output).
+
+    Consumed by the canonical tree builder to populate
+    ``ISANode.tensorize_sizes`` — dim analysis short-circuits on
+    :class:`NKIAlloc` so these labels are declarative, not driven through
+    unification.
+    """
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": None, "F": None}
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: return an uninitialised array of declared shape/dtype."""

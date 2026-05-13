@@ -78,7 +78,7 @@ def test_tensor_scalar_bounds():
     assert NKITensorScalar.MAX_TILE_SIZE == {"P": 128, "F": None}
 
 
-def test_alloc_bounds_inherits_empty():
-    """NKIAlloc has no tile axes per the spec — empty dicts on all scopes."""
-    assert NKIAlloc.MIN_TILE_SIZE == {}
-    assert NKIAlloc.MAX_TILE_SIZE == {}
+def test_alloc_bounds():
+    """NKIAlloc is just another ISA op: MIN 128 per axis, unbounded max on both."""
+    assert NKIAlloc.MIN_TILE_SIZE == {"P": 128, "F": 128}
+    assert NKIAlloc.MAX_TILE_SIZE == {"P": None, "F": None}
