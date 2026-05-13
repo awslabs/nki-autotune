@@ -11,9 +11,12 @@ Usage::
     PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python examples/matmul_lhsT_rhs.py
 """
 
+import shutil
+from pathlib import Path
+
 import numpy as np
 
-from nkigym.ir import analyze_dimensions
+from nkigym.ir import build_initial_ir
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -60,6 +63,9 @@ def _check_numerics(seed: int = 0, atol: float = 1e-5, rtol: float = 1e-5) -> No
 
 
 if __name__ == "__main__":
+    CACHE_DIR = Path("/home/ubuntu/cache/matmul_lhsT_rhs")
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
     _check_numerics()
-    analysis = analyze_dimensions(f_nkigym, INPUT_SPECS)
-    print(repr(analysis))
+    ir = build_initial_ir(f_nkigym, INPUT_SPECS)
+    print(repr(ir.analysis))
+    ir.dump(CACHE_DIR)
