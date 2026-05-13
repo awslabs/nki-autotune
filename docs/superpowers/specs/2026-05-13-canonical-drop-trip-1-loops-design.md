@@ -1,129 +1,151 @@
-# Canonical: Drop Trip-1 Outer Loops for Unbounded-MAX Axes
+# Canonical: Drop Trip-1 Outer for Unbounded-MAX Axes
 
 ## Problem
 
-Canonical build currently emits two nested `ForNode`s per op axis:
+Canonical build emits two nested `ForNode`s per op axis:
 - Outer trip loop with extent `axis_extent / MAX_TILE_SIZE`.
-- Inner tile loop with extent `MAX_TILE_SIZE` (elided by renderer).
+- Inner tile loop with extent `MAX_TILE_SIZE`.
 
-For unbounded axes (`MAX_TILE_SIZE = None`), `outer_trip = 1` and `inner_extent = axis_extent`. The outer is a no-op wrapper that adds nothing beyond noise:
+For unbounded axes (`MAX_TILE_SIZE = None`), `outer.trip = 1` and `inner.extent = axis_extent`. The trip-1 outer is pure noise:
 
-1. **Atom traces become longer than necessary.** To reach the structure of `kernel_1` in `kernel_transforms.py` (lhs_T load's M axis tiled to 128), the trace is canonical `(1, 2048) → Fuse → (2048) → Split(factor=128) → (16, 128)`. The first state is an artifact of how canonical emits the axis, not a meaningful scheduling decision.
-
-2. **Trip-1 loops aren't splittable.** `Split.is_legal` requires `1 < factor < extent`. A trip-1 outer can't be directly split — Fuse-then-Split is the only path, which exercises more atom composition than the user's intent (just tile this axis).
-
-3. **The hand-written `kernel_0` doesn't have trip-1 outers wrapping the visible slice width.** Canonical's output matches byte-for-byte today only because the renderer elides the inner tile loop, leaving the trip-1 outer as a cosmetic `for ... in range(1):`. This is surface-level parity achieved through two layers of compensating nonsense.
+1. **Atom traces become longer than necessary.** To reach `kernel_1` (lhs_T load's M tiled at 128), canonical `(1, 2048) → Fuse → (2048) → Split(128) → (16, 128)`. The `(1, 2048)` state is canonical pathology, not a meaningful scheduling choice.
+2. **Trip-1 loops aren't splittable** (`Split.is_legal` requires `1 < factor < extent`). Fuse-then-Split becomes the only path; composition bugs stack up.
+3. **Emitted source has `for ... in range(1):` wrappers** around trip-1 outers for unbounded axes. Cosmetic noise in the rendered NKI kernel.
 
 ## Target Model
 
-Each op axis emits **at most one `ForNode`** at canonical-build time. The number of loops depends on the op's declared bound for that axis:
+**Preserve the TVM-faithful "innermost loop = tile" invariant.** Every axis has at least one ForNode; the innermost-per-axis ForNode's extent is the ISA slice width (what the renderer bakes into the call as the tile).
 
-- **Bounded axis** (`MAX_TILE_SIZE[axis] = N`): emit one `ForNode` with `trip = axis_extent / N`. The ISA call's slice width along this axis is `N` (the tile), encoded directly in `BufferAccess.iter_var_coeffs` + `AccessRange.extent = N`.
-- **Unbounded axis** (`MAX_TILE_SIZE[axis] = None` or absent): emit **no `ForNode`** for this axis. The ISA call's slice width is the full axis extent. `BufferAccess.iter_var_coeffs` has no entry for this axis; `AccessRange.extent = axis_extent`.
+- **Bounded axis** (`MAX_TILE_SIZE[axis] = N`, `N < axis_extent`): two ForNodes — outer with trip `axis_extent / N`, inner with trip `N`. **Unchanged from today.**
+- **Unbounded axis** (`MAX_TILE_SIZE[axis] = None` or `MAX >= axis_extent`): **one ForNode** with trip `axis_extent`. Drop the trip-1 outer; keep the tile loop. The whole axis is one tile.
 
-**Consequences:**
+### Examples
 
-- For a bounded axis, canonical is already the "tiled" state (one loop, trip = # tiles). Further tiling is one Split call.
-- For an unbounded axis, canonical has no loop. The natural way to bring an axis under a loop is `ComputeAt` on a consumer's loop of the same axis — the producer follows the consumer's scheduling, matching hand-written idioms.
+Matmul M (MAX=128, extent=2048):
 
-**Example (lhs_T load, matmul M axis at extent 2048):**
-
-Before (today):
 ```
-for i_d1_outer in range(1):       # trip-1 artifact
-  for i_d1_inner in range(2048):  # elided by renderer, encoded as slice width
-    nisa.dma_copy(..., slice[0:2048])
+for outer in range(16) [outer trip]
+  for inner in range(128) [tile — elided by renderer]
+    nc_matmul(..., slice[outer*128 : outer*128 + 128])
 ```
 
-After:
-```
-nisa.dma_copy(..., slice[0:2048])  # no d1 loop at all
-```
+Unchanged — bounded axis already emits (trip, tile).
 
-Matmul's M axis (bounded, MAX=128) before:
+lhs_T load F (MAX=None, extent=2048):
+
+Before:
 ```
-for i_d1_outer in range(16):       # trip = 2048/128 = 16
-  for i_d1_inner in range(128):    # elided
-    nisa.nc_matmul(..., slice[i_d1_outer*128 : i_d1_outer*128 + 128])
+for outer in range(1) [trip-1 noise]
+  for inner in range(2048) [tile — elided]
+    dma_copy(..., slice[0:2048])
 ```
 
 After:
 ```
-for i_d1_outer in range(16):       # unchanged — bounded case already only emits one visible loop
-  nisa.nc_matmul(..., slice[i_d1_outer*128 : i_d1_outer*128 + 128])
+for inner in range(2048) [tile — elided by renderer]
+  dma_copy(..., slice[0:2048])
 ```
 
-The change is invisible for bounded axes (renderer already elided the inner). For unbounded axes, the trip-1 outer disappears from emitted source and from the IR.
+One ForNode. Rendered NKI source has NO `for` loop for that axis (tile loop is elided; no outer wrapper).
 
 ## IR Changes
 
-**`SBlock.iter_vars`:** a block has iter-vars only for axes with one or more enclosing `ForNode`s. An unbounded axis with no loop contributes no iter-var to the block's `iter_vars` list. Today each block has 2 iter-vars per axis (outer + inner); after the refactor, blocks have 1 iter-var per bounded axis and 0 iter-vars per unbounded axis.
+**`KernelModule` structure:** unchanged.
 
-**`BufferAccess.iter_var_coeffs`:** entries for unbounded axes disappear. `AccessRange.extent` for an unbounded axis equals the full axis extent (unchanged in meaning; just no longer decomposed into outer-trip × inner-tile).
+**`SBlock.iter_vars`:** bounded axes contribute 2 iter-vars (outer + inner). Unbounded axes contribute **1** iter-var (the tile). Today both contribute 2. Consumers that walked "2 iter-vars per axis" must handle variable counts — but it's still always "at least 1 per axis".
 
-**`AccessRange.extent`:** for a bounded axis, equals `MAX_TILE_SIZE[axis]` (the tile). For an unbounded axis, equals `axis_extent` (the full range). Semantically this is `axis_extent / product(ancestor_trips)` where the product is 1 for unbounded axes and `axis_extent / MAX_TILE_SIZE` (= trip count) for bounded, giving `MAX_TILE_SIZE` back — consistent with today.
+**`BufferAccess.iter_var_coeffs`:**
+- Bounded axis: two entries `{outer.var_id: tile, inner.var_id: 1}`. Extent = tile. Unchanged.
+- Unbounded axis: one entry `{tile_iv.var_id: 1}`. Extent = full axis extent. Today has `{outer: extent, inner: 1}` → simplify to `{inner: 1}` (drop the trip-1 outer's entry whose coefficient * trip=1 contributes 0 anyway).
 
-## Renderer Changes
+**`AccessRange.extent`:**
+- Bounded axis: `tile = MAX_TILE_SIZE`. Unchanged.
+- Unbounded axis: full axis extent. Unchanged in meaning.
 
-The renderer's "innermost tile loop elision" logic disappears. Every `ForNode` now emits a `for` header unconditionally — there are no elided loops left to skip.
+## Canonical Builder Change
 
-`_innermost_tile_iter_var_ids` and `EmitCtx.innermost_tile_ids` become dead code. Remove them.
+`_make_sblock` in `canonical.py`. Current structure:
 
-## Canonical Builder Changes
+```python
+for axis_id in op.touched_axes:
+    total = module.axes[axis_id].total_size
+    tile = op.axis_tile[axis_id]
+    outer_extent = total // tile
+    inner_extent = tile
+    v_outer = module.allocate_iter_var(axis_id, outer_extent, role)
+    v_inner = module.allocate_iter_var(axis_id, inner_extent, role)
+    # always emit both
+```
 
-`_make_sblock` in `canonical.py`:
-- For each axis in `op.touched_axes`:
-  - If `op.axis_tile[axis_id] < axis_extent` (bounded): allocate one iter-var with `extent = axis_extent / tile`. Build one ForNode above the SBlock for this axis.
-  - Else (`op.axis_tile[axis_id] == axis_extent`, unbounded): allocate zero iter-vars. No ForNode.
+New:
 
-BufferAccess coefficients:
-- For bounded axes: one iter-var per axis, coefficient = `tile`. AccessRange.extent = `tile`.
-- For unbounded axes: no iter-var entry. AccessRange.extent = full axis extent.
+```python
+for axis_id in op.touched_axes:
+    total = module.axes[axis_id].total_size
+    tile = op.axis_tile[axis_id]
+    if tile < total:
+        """Bounded axis: outer trip + inner tile (two ForNodes)."""
+        v_outer = module.allocate_iter_var(axis_id, total // tile, role)
+        v_inner = module.allocate_iter_var(axis_id, tile, role)
+        iter_vars.append(v_outer)
+        iter_vars.append(v_inner)
+    else:
+        """Unbounded axis (tile == total): one ForNode for the whole axis."""
+        v_tile = module.allocate_iter_var(axis_id, total, role)
+        iter_vars.append(v_tile)
+```
+
+`_build_buffer_access` — coefficient logic per axis:
+- Bounded: `{outer.var_id: tile, inner.var_id: 1}`, extent = tile.
+- Unbounded: `{tile_iv.var_id: 1}`, extent = total.
+
+Tree wrap: unchanged, except unbounded axes contribute one ForNode instead of two. Structure is `for each axis: ForNode(outer?) > ForNode(tile) > ... > SBlock`, with the outer only present for bounded axes.
+
+## Renderer Change
+
+**None.** `_innermost_tile_iter_var_ids` stays as-is — it collects the per-axis last iter-var per SBlock; whether the SBlock has 1 or 2 iter-vars per axis, the last one is the tile, and the renderer elides it. For unbounded axes, the only loop (now the sole tile ForNode) is elided; no Python `for` is emitted for that axis. For bounded axes, the outer emits as `for outer in range(trip):`; the inner elides.
 
 ## Atom Changes
 
-**Split, Fuse, Reorder, ComputeAt, ReverseComputeAt:** all operate on live `ForNode`s. Semantics unchanged. Legality checks tighten naturally because illegal operations (e.g., Split on a non-existent loop) can't be constructed.
+**None structural.** Existing legality checks already use "innermost-per-axis in affected SBlock" (fixed after Task 6 of the TVM-style split+fuse work). That check works the same whether the axis has 2 or 1 iter-vars.
 
-**No new atom introduced.** The pattern "tile an unbounded axis" is expressed as `ComputeAt(producer_block, consumer_loop_on_that_axis)`, which already exists. The producer's enclosing loop chain inherits the consumer's loop for that axis, bringing the producer under a loop without allocating one directly.
+**Split legality in practice:**
+- **Bounded axis**, e.g. matmul M canonical `(16, 128)`: splitting the outer (trip=16) is legal when factors preserve total and innermost ≥ MIN. `Split(outer, factor=4)` → `(4, 4, 128)` legal; inner 128 stays ≥ 128. Splitting the inner (trip=128) is constrained: `Split(inner, factor=N)` must have `N ≥ 128`; only `(128)` stays, so no meaningful split.
+- **Unbounded axis**, e.g. lhs_T load F canonical `(2048)`: `Split(tile, factor=128)` → `(16, 128)` legal; new innermost 128 ≥ MIN=128. `Split(tile, factor=4)` → `(512, 4)` illegal; 4 < MIN=128.
 
-## Pre-existing Atom Operations
-
-- `ComputeAt(lhs_T_load, matmul_d1_outer)` — moves load inside matmul's d1 loop (trip 16). Load's d1 axis access pattern gains the d1 iter-var automatically because it sits below matmul's d1 outer now. This is what `kernel_1` represents structurally.
-
-- `Split(loop, factor)` on a bounded-axis loop — same as today, since bounded axes already emit one loop.
+This matches your framing exactly.
 
 ## Test Migration
 
-**`test/tune/test_axis_identity.py`:** today's tests find a `(outer=trip-1, inner=tile)` d1 pair on the lhs_T load (NKILoad d1 is unbounded). After the change that pair doesn't exist. Same-axis Fuse tests need a fixture that constructs the `(outer, inner)` state explicitly via an initial `Split` on a bounded axis. Example: matmul M canonical trip=16 → `Split(factor=4)` → `(4, 4)` → `Fuse` → `(16)` → `Split(factor=8)` → `(2, 8)`. This exercises the same atom interaction without relying on canonical pathology.
+Smaller than the over-aggressive version: only test fixtures and assertions for unbounded axes change.
 
-**`test/tune/test_fuse.py`:** same considerations. Most existing Fuse tests use canonical + immediate fuse on unbounded-axis outer; they'd have nothing to fuse post-change. Update fixtures to introduce the fusable pair via a preceding Split.
+- `test/codegen/test_canonical.py`: tests asserting "4 iter-vars per SBlock" (for 2D ops like load with P+F) become "3 iter-vars" (P outer + P inner + F tile). Update counts.
+- `test/tune/test_axis_identity.py`: `_find_lhs_t_load_d1_pair` today returns the `(outer_trip_1, inner_tile_2048)` pair. After refactor, unbounded F has only the single tile ForNode. The test becomes: find the *single* d1 iter-var on the lhs_T load, confirm it has extent = 2048 = full axis extent. The Fuse/Split tests that operated on this pair need new fixtures — use matmul's bounded M axis: canonical `(16, 128)`, Split outer with factor=4 → `(4, 4, 128)` for a same-axis pair.
+- `test/tune/test_fuse.py`, `test_fuse_eager_rewrite.py`: analogous — fixtures that relied on unbounded-axis trip-1-outer pairs need to construct the pair on a bounded axis instead.
+- `test/codegen/test_render_tile_elision.py`: keep; renderer elision still exists and still matters for the tile loop.
+- Other tests (`test_split.py`, `test_reorder.py`, `test_compute_at.py`, `test_reverse_compute_at.py`, rfactor tests): audit for unbounded-axis trip-1 assumptions; most target bounded-axis loops (matmul K/M/N) and are unaffected.
 
-**`test/tune/test_split.py`:** many tests split canonical outer loops. For bounded axes, no change. For unbounded axes, the loop no longer exists — those tests either switch to bounded-axis fixtures or get deleted.
+## `kernel_transforms.py` Reference
 
-**`test/codegen/test_canonical.py`:** tests that assert "2 iter-vars per axis" must update to "1 iter-var per bounded axis, 0 per unbounded axis." Regression test `test_canonical_emits_outer_and_inner_tile_loops` is about to be false — remove or invert.
+The 16 hand-written kernels have `for i_dN_0 in range(1):` trip-1 wrappers for unbounded axes. These were cosmetic parity with the old renderer. After the refactor, the renderer no longer emits trip-1 wrappers. Mechanical rewrite: drop `for ... in range(1):` lines and substitute their loop var with `0` in child slice expressions.
 
-**`test/codegen/test_render_tile_elision.py`:** the renderer no longer elides anything. Remove this file entirely.
+## Example Driver
 
-**`test/tune/test_fuse_eager_rewrite.py`:** `test_fuse_then_split_renders_and_cpu_sims` depends on finding the canonical d1 pair on lhs_T load. Update to the new fixture pattern (A above).
-
-**`test/ops/test_tile_bounds.py`:** unaffected — tests class attrs, not canonical behavior.
-
-## Out of Scope
-
-- Growing a loop on a no-loop axis via a dedicated atom. `ComputeAt` covers the real use cases; a `Tile(axis, factor)` atom is deferred unless a workload emerges that needs it.
-- Non-tiled execution of bounded axes. Today a bounded axis always emits a loop at canonical; if a workload needs to fire one giant ISA call instead of iterating, that's a separate design question.
+`examples/matmul_lhsT_rhs.py`: step 0 canonical has no trip-1 loops. To reach a k1-like state (lhs_T load tiled at 128), `ComputeAt(lhs_T_load, matmul_d1_outer)` is natural — the load block sits inside matmul's d1 outer (trip=16). Its existing tile loop stays the same. One-atom reach.
 
 ## Success Criteria
 
-- Canonical matmul module has **fewer** ForNodes than today (trip-1 outers gone for unbounded axes).
-- `examples/matmul_lhsT_rhs.py` step 0 canonical renders with no trip-1 `for ... in range(1):` loops for unbounded axes (lhs_T load's M, rhs load's N, memset's N, tensor_copy's N, store's N).
-- `kernel_transforms.py`'s kernel_0 is no longer byte-identical to the rendered canonical — it's cleaner (fewer loops). The structural equivalence to hand-written `kernel_0` holds after mechanical rewrite of `kernel_transforms.py` to drop the trip-1 wrappers in the reference.
-- 15 kernels in `kernel_transforms.py` still CPU-sim pass (after the reference is updated to drop trip-1 outers).
-- Full test suite passes (after test migration).
-- `examples/matmul_lhsT_rhs.py` reaches at least one post-canonical step via a real atom (e.g., `ComputeAt(lhs_T_load, matmul_d1_outer)`), demonstrating the cleaner atom sequence.
+- Canonical render of the matmul kernel has zero `range(1)` in Python source.
+- Unbounded axes have one ForNode per axis in canonical IR; bounded axes have two (outer trip + inner tile).
+- `SBlock.iter_vars` has 1 iter-var per unbounded axis + 2 per bounded axis.
+- Renderer elision remains; every axis's innermost-per-SBlock loop elides into the ISA slice width.
+- `kernel_transforms.py`'s 15 kernels still CPU-sim pass after mechanical rewrite to drop trip-1 wrappers.
+- `test/` suite passes after test migration (modulo pre-existing `test_batch` failure).
+- `examples/matmul_lhsT_rhs.py` 2-step driver (canonical → ComputeAt) passes.
 
-## Migration Risk
+## What Does NOT Change
 
-- **`kernel_transforms.py` reference kernels** have trip-1 `for ... in range(1):` outers today. These must be rewritten to drop those outers (mechanical edit).
-- **Existing atoms' legality checks** that look up loops by extent may need updating. Most should be robust because they check for specific extents (not "the trip-1 outer").
-- **`SBlock.iter_vars` consumers** (atoms, renderer's `_innermost_tile_iter_var_ids`, etc.) need audits to handle variable iter-var counts per axis.
+- Bounded axis canonical structure: still outer trip + inner tile.
+- Renderer: `_innermost_tile_iter_var_ids` still collects per-axis-last iter-vars; still elides them.
+- `EmitCtx.innermost_tile_ids`, `_emit_affine_start`, `_emit_index_expr`: unchanged.
+- Split, Fuse, Reorder, ComputeAt, ReverseComputeAt atom implementations: unchanged.
