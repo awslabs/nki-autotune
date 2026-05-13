@@ -1,7 +1,5 @@
-"""IR layer for the nkigym tune stage.
+"""Dim unification analysis for an ``f_nkigym`` callable."""
 
-Defines the IR dataclasses (:mod:`.ir`), the ``f_nkigym`` → :class:`KernelIR`
-lowering pass (:mod:`.build`), and the per-scope dependency cache
-(:mod:`.dep_cache`). Codegen (``nkigym.codegen``) consumes the IR; the IR
-layer itself does not depend on codegen.
-"""
+from nkigym.ir.dimension_analysis import DimensionAnalysis, OpAxes, TensorDims, analyze_dimensions
+
+__all__ = ["DimensionAnalysis", "OpAxes", "TensorDims", "analyze_dimensions"]

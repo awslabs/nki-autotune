@@ -1,14 +1,9 @@
-"""Lower the ``lhs_T @ rhs`` matmul through canonical build + render.
+"""Numpy matmul → ``f_nkigym`` → dim unification.
 
-Writes the canonical kernel + IR repr to
-``/home/ubuntu/cache/matmul_lhsT_rhs/step_0_canonical/`` and CPU-sims.
-
-Step 0 is canonical (= ``kernel_0`` in ``kernel_transforms.py``).
-
-Post-canonical atom chains (e.g. ``ComputeAt(lhs_T_load, matmul_d1_outer)``
-to tile the producer at the consumer's granularity) require a
-buffer-shrink + access-rewrite extension to ``ComputeAt`` that is not
-yet implemented. Tracked in a follow-up spec.
+The ``f_nkigym`` body below is the output of
+:func:`nkigym.synthesis.numpy_to_nkigym.compile_numpy_to_nkigym`
+pasted verbatim — re-run the synthesiser manually whenever the op
+surface or workload changes.
 
 Usage::
 
@@ -16,12 +11,9 @@ Usage::
     PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python examples/matmul_lhsT_rhs.py
 """
 
-import shutil
-from pathlib import Path
+import numpy as np
 
-from nkigym.codegen.render import render
-from nkigym.ir.build import build_initial_ir
-from nkigym.ir.ir import KernelIR
+from nkigym.ir import analyze_dimensions
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -29,47 +21,45 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
-from nkigym.utils.verify import verify
 
-CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhsT_rhs")
 K, M, N = 2048, 2048, 2048
-INPUT_SPECS = {"lhs_T": {"shape": (K, M), "dtype": "bfloat16"}, "rhs": {"shape": (K, N), "dtype": "bfloat16"}}
+INPUT_SPECS: dict[str, tuple[int, ...]] = {"lhs_T": (K, M), "rhs": (K, N)}
+
+
+def f_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """``lhs_T.T @ rhs`` — plain numpy reference (synthesis source)."""
+    return lhs_T.T @ rhs
 
 
 @nkigym_kernel
-def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
-    """``lhs_T.T @ rhs`` with first-class buffer declarations."""
-    lhs_T_sbuf = NKIAlloc(location="sbuf", shape=(K, M), dtype="bfloat16")()
-    rhs_sbuf = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
+def f_nkigym(lhs_T, rhs):
+    """Cached output of ``compile_numpy_to_nkigym(f_numpy, ...)``."""
+    sbuf_lhs_T = NKIAlloc(location="sbuf", shape=(K, M), dtype="bfloat16")()
+    sbuf_rhs = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
     psum_acc = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
     sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
     hbm_out = NKIAlloc(location="hbm", shape=(M, N), dtype="bfloat16")()
 
-    NKILoad()(src=lhs_T, dst=lhs_T_sbuf)
-    NKILoad()(src=rhs, dst=rhs_sbuf)
+    NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
+    NKILoad()(src=rhs, dst=sbuf_rhs)
     NKIMemset(value=0.0)(dst=psum_acc)
-    NKIMatmul()(stationary=lhs_T_sbuf, moving=rhs_sbuf, dst=psum_acc)
+    NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs, dst=psum_acc)
     NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
     NKIStore()(src=sbuf_prod, dst=hbm_out)
     return hbm_out
 
 
-def save_step(module: KernelIR, step_idx: int) -> None:
-    """Write ir.txt + kernel.py into step_<idx>/ and CPU-sim verify."""
-    out_dir = CACHE_ROOT / f"step_{step_idx}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    ir_repr = module.pprint()
-    (out_dir / "ir.txt").write_text(ir_repr + "\n")
-
-    source = render(module)
-    (out_dir / "kernel.py").write_text(source)
-
-    verify(source, matmul_lhsT_rhs_nkigym, INPUT_SPECS)
+def _check_numerics(seed: int = 0, atol: float = 1e-5, rtol: float = 1e-5) -> None:
+    """Run ``f_numpy`` and ``f_nkigym`` on the same fp32 draws and compare."""
+    rng = np.random.default_rng(seed)
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, shape in INPUT_SPECS.items()}
+    expected = f_numpy(**inputs)
+    actual = np.asarray(f_nkigym(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=atol, rtol=rtol)
+    print(f"[numerics] PASS (atol={atol}, rtol={rtol})")
 
 
 if __name__ == "__main__":
-    if CACHE_ROOT.exists():
-        shutil.rmtree(CACHE_ROOT)
-    module = build_initial_ir(matmul_lhsT_rhs_nkigym, input_specs=INPUT_SPECS)
-    save_step(module, 0)
+    _check_numerics()
+    analysis = analyze_dimensions(f_nkigym, INPUT_SPECS)
+    print(repr(analysis))
