@@ -16,6 +16,7 @@ Usage::
     PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python examples/matmul_lhsT_rhs.py
 """
 
+import shutil
 from pathlib import Path
 
 from nkigym.codegen.canonical import build_canonical_module
@@ -28,13 +29,11 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
-from nkigym.tune.verify import _verify
+from nkigym.utils.verify import verify
 
-K, M, N = 2048, 2048, 2048
-
-BUILD_SPECS = {"lhs_T": {"shape": (K, M), "dtype": "bfloat16"}, "rhs": {"shape": (K, N), "dtype": "bfloat16"}}
-VERIFY_SPECS = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhsT_rhs")
+K, M, N = 2048, 2048, 2048
+INPUT_SPECS = {"lhs_T": {"shape": (K, M), "dtype": "bfloat16"}, "rhs": {"shape": (K, N), "dtype": "bfloat16"}}
 
 
 @nkigym_kernel
@@ -55,9 +54,9 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     return hbm_out
 
 
-def save_step(module: KernelModule, step_idx: int, label: str) -> None:
-    """Write ir.txt + kernel.py into step_<idx>_<label>/ and CPU-sim verify."""
-    out_dir = CACHE_ROOT / f"step_{step_idx}_{label}"
+def save_step(module: KernelModule, step_idx: int) -> None:
+    """Write ir.txt + kernel.py into step_<idx>/ and CPU-sim verify."""
+    out_dir = CACHE_ROOT / f"step_{step_idx}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ir_repr = module.pprint()
@@ -66,19 +65,11 @@ def save_step(module: KernelModule, step_idx: int, label: str) -> None:
     source = render(module)
     (out_dir / "kernel.py").write_text(source)
 
-    try:
-        _verify(source, matmul_lhsT_rhs_nkigym, VERIFY_SPECS)
-        verdict = "PASS (within atol=rtol=5e-3)"
-    except AssertionError as e:
-        verdict = f"FAIL: {e}"
-
-    print(f"\n########## step {step_idx}: {label} ##########")
-    print(f"artifacts: {out_dir}")
-    print(f"\n--- IR repr ---\n{ir_repr}")
-    print(f"\n--- rendered kernel ---\n{source}")
-    print(f"--- cpu-sim: {verdict} ---")
+    verify(source, matmul_lhsT_rhs_nkigym, INPUT_SPECS)
 
 
 if __name__ == "__main__":
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs=BUILD_SPECS)
-    save_step(module, 0, "canonical")
+    if CACHE_ROOT.exists():
+        shutil.rmtree(CACHE_ROOT)
+    module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs=INPUT_SPECS)
+    save_step(module, 0)
