@@ -3,8 +3,8 @@
 Holds the indentation-tracking :class:`_Writer`, the per-emit
 :class:`EmitCtx`, and the affine-slice emission helper
 :func:`emit_slice`. Lifted into a shared module so
-:mod:`nkigym.codegen.lowering.emit_ops` and
-:mod:`nkigym.codegen.lowering.emit_source` can depend on these helpers
+:mod:`nkigym.codegen.emit_ops` and
+:mod:`nkigym.codegen.emit_source` can depend on these helpers
 without forming an import cycle with :mod:`emit_source`.
 
 Slice emission is shape-aware. The :class:`BufferAccess.pattern` carries
@@ -28,7 +28,7 @@ the fused var_id). No side-table is consulted at emission.
 
 from dataclasses import dataclass, field
 
-from nkigym.codegen.ir import AccessRange, BufferAccess, KernelModule, Tensor
+from nkigym.ir.ir import AccessRange, BufferAccess, KernelIR, Tensor
 
 
 class _Writer:
@@ -66,7 +66,7 @@ class EmitCtx:
             ForNode entry, restored on exit.
         tensors: Reference to ``module.tensors`` for shape/dtype/location
             lookups.
-        module: Reference to the enclosing :class:`KernelModule`. Used
+        module: Reference to the enclosing :class:`KernelIR`. Used
             for tensor/axis lookups during slice emission.
         innermost_tile_ids: Set of :class:`IterVar` ``var_id``\\ s that
             are the innermost tile loop for their respective axis at a
@@ -84,7 +84,7 @@ class EmitCtx:
 
     iter_var_to_name: dict[int, str]
     tensors: dict[str, Tensor]
-    module: KernelModule
+    module: KernelIR
     innermost_tile_ids: set[int] = field(default_factory=set)
 
 
@@ -115,7 +115,7 @@ def emit_slice(tensor: Tensor, access: BufferAccess, ctx: EmitCtx) -> str:
         access: BufferAccess with one :class:`AccessRange` per logical
             tensor dim.
         ctx: :class:`EmitCtx` carrying the live iter-var naming and the
-            enclosing :class:`KernelModule` for tensor/axis lookups.
+            enclosing :class:`KernelIR` for tensor/axis lookups.
 
     Returns:
         Source fragment ``"name[slice_0, slice_1, ...]"``.

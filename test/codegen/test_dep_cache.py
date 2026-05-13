@@ -1,7 +1,7 @@
 """Unit tests for v2 DepCache — classifier folds reads_writes correctly."""
 
-from nkigym.codegen.dep_cache import DepCache, DepKind, ScopeId, _classify_edge, rebuild_scope, subtree_signature
-from nkigym.codegen.ir import BufferAccess, NKIOpCall, SBlock
+from nkigym.ir.dep_cache import DepCache, DepKind, ScopeId, _classify_edge, rebuild_scope, subtree_signature
+from nkigym.ir.ir import BufferAccess, NKIOpCall, SBlock
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
@@ -114,7 +114,7 @@ def test_dep_cache_lazy_rebuild_on_signature_mismatch() -> None:
 
 def test_subtree_signature_distinguishes_iter_vars() -> None:
     """subtree_signature changes when iter_vars change."""
-    from nkigym.codegen.ir import IterVar
+    from nkigym.ir.ir import IterVar
     from nkigym.ops.base import AxisRole
 
     block1 = SBlock(iter_vars=[IterVar(0, "d0", 4, AxisRole.PARALLEL)], reads={}, writes={}, reads_writes={}, body=[])

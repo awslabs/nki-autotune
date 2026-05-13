@@ -1,4 +1,4 @@
-"""Canonical module builder: ``f_nkigym`` callable → :class:`KernelModule`.
+"""Canonical module builder: ``f_nkigym`` callable → :class:`KernelIR`.
 
 Pipeline:
     1. AST-parse the math function to an ordered list of raw parsed ops.
@@ -13,8 +13,8 @@ Pipeline:
        order; compute blocks follow in source order.
     6. Assign canonical loop names ``i_<dim>_<ordinal>`` across each tree.
 
-The resulting :class:`KernelModule` is the IR the renderer and transform
-atoms consume. :class:`KernelModule.dep` is populated lazily by the
+The resulting :class:`KernelIR` is the IR the renderer and transform
+atoms consume. :class:`KernelIR.dep` is populated lazily by the
 default :class:`DepCache` factory.
 """
 
@@ -27,23 +27,13 @@ from typing import Any
 
 import numpy as np
 
-from nkigym.codegen.ir import (
-    AccessRange,
-    BufferAccess,
-    ForNode,
-    IterVar,
-    KernelModule,
-    NKIOpCall,
-    SBlock,
-    Tensor,
-    TreeIR,
-)
+from nkigym.ir.ir import AccessRange, BufferAccess, ForNode, IterVar, KernelIR, NKIOpCall, SBlock, Tensor, TreeIR
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import AxisRole, NKIOp
 
 
-def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict[str, dict]) -> KernelModule:
-    """Build a :class:`KernelModule` from an ``f_nkigym`` callable.
+def build_initial_ir(func: Callable[..., np.ndarray], input_specs: dict[str, dict]) -> KernelIR:
+    """Build a :class:`KernelIR` from an ``f_nkigym`` callable.
 
     See module docstring for the pipeline.
     """
@@ -57,7 +47,7 @@ def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict[st
     tensors = _build_tensor_map(param_names, input_specs, allocs, return_name)
     per_op_axis_maps, dim_sizes = _unify_axes(raws, tensors)
 
-    module = KernelModule(
+    module = KernelIR(
         func_name=unwrapped.__name__,
         param_names=param_names,
         return_name=return_name,
@@ -410,7 +400,7 @@ def _unify_dim(
                 axis_map[ax] = new_id
 
 
-def _derive_axes(module: KernelModule, dim_sizes: dict[str, int]) -> dict[str, int]:
+def _derive_axes(module: KernelIR, dim_sizes: dict[str, int]) -> dict[str, int]:
     """Allocate one :class:`Axis` per concrete dim.
 
     Returns a ``name → axis_id`` map so subsequent helpers can translate
@@ -523,7 +513,7 @@ def _touched_axes(
     return tuple(ordered)
 
 
-def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
+def _make_sblock(op: _ParsedOp, module: KernelIR) -> SBlock:
     """Build an iter-var :class:`SBlock` for ``op`` with per-op tiling.
 
     Allocates iter-vars per ``axis_id`` in ``op.touched_axes``:
@@ -602,7 +592,7 @@ def _build_buffer_access(
     op: _ParsedOp,
     axis_to_outer: dict[int, IterVar],
     axis_to_inner: dict[int, IterVar],
-    module: KernelModule,
+    module: KernelIR,
 ) -> BufferAccess:
     """Produce a :class:`BufferAccess` for ``tname`` referenced by ``op`` via ``axes``.
 
@@ -678,7 +668,7 @@ def _make_alloc_sblock(alloc: _AllocRecord) -> SBlock:
     return SBlock(iter_vars=[], reads={}, writes={"output": output_access}, reads_writes={}, body=[call])
 
 
-def _build_tree(op: _ParsedOp, module: KernelModule) -> ForNode | SBlock:
+def _build_tree(op: _ParsedOp, module: KernelIR) -> ForNode | SBlock:
     """Build the iter-var schedule tree for ``op``.
 
     Bounded axes contribute TWO ForNodes per touched dim (outer trip +
@@ -712,7 +702,7 @@ def _wrap_block_in_fornodes(block: SBlock) -> ForNode | SBlock:
     return node
 
 
-def _assign_canonical_names(node: ForNode | SBlock, module: KernelModule, same_axis_counts: dict[int, int]) -> None:
+def _assign_canonical_names(node: ForNode | SBlock, module: KernelIR, same_axis_counts: dict[int, int]) -> None:
     """Walk the tree in a root-outward DFS, naming each :class:`ForNode`.
 
     ``same_axis_counts[axis_id]`` tracks how many same-axis ancestors are
@@ -735,5 +725,5 @@ def _assign_canonical_names(node: ForNode | SBlock, module: KernelModule, same_a
 
 
 """TreeIR re-exported only for callers that currently expect
-``canonical.TreeIR`` — the type lives in :mod:`nkigym.codegen.ir`."""
+``canonical.TreeIR`` — the type lives in :mod:`nkigym.ir.ir`."""
 _ = TreeIR

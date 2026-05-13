@@ -231,7 +231,7 @@ git commit -m "feat: add RMW_OPERANDS, RFACTOR_RECIPE, INPUT_OPERANDS ClassVars 
 Append to `test/codegen/test_first_class_buffers.py`:
 
 ```python
-from nkigym.codegen.ir import BodyLeaf, Tensor
+from nkigym.ir.ir import BodyLeaf, Tensor
 
 
 def test_tensor_location_field_defaults_and_accepts_literal():
@@ -904,7 +904,7 @@ def test_validate_dataflow_ordering_rmw_requires_prior_writer():
     """An RMW operand in reads_writes must have a prior writer.
     Models the bug scenario: NKIMatmul reads_writes=psum_acc must come
     after NKIMemset writes=psum_acc."""
-    from nkigym.codegen.ir import BodyLeaf, DimInfo, KernelModule, Tensor, validate_dataflow_ordering
+    from nkigym.ir.ir import BodyLeaf, DimInfo, KernelIR, Tensor, validate_dataflow_ordering
 
     class _FakeMemset:
         __name__ = "NKIMemset"
@@ -923,11 +923,11 @@ def test_validate_dataflow_ordering_rmw_requires_prior_writer():
     memset_leaf = BodyLeaf(op_cls=_FakeMemset, reads={}, writes=("psum_acc",), reads_writes=())
     matmul_leaf = BodyLeaf(op_cls=_FakeMatmul, reads={}, writes=(), reads_writes=("psum_acc",))
 
-    good_module = KernelModule(
+    good_module = KernelIR(
         func_name="f", param_names=[], return_name="psum_acc",
         tensors=tensors, dims=dims, body=[memset_leaf, matmul_leaf],
     )
-    bad_module = KernelModule(
+    bad_module = KernelIR(
         func_name="f", param_names=[], return_name="psum_acc",
         tensors=tensors, dims=dims, body=[matmul_leaf, memset_leaf],
     )
@@ -938,7 +938,7 @@ def test_validate_dataflow_ordering_rmw_requires_prior_writer():
 
 def test_validate_dataflow_ordering_rmw_leaf_counts_as_writer_for_next_leaf():
     """After an RMW leaf fires, the tensor counts as written for subsequent reads."""
-    from nkigym.codegen.ir import BodyLeaf, DimInfo, KernelModule, Tensor, validate_dataflow_ordering
+    from nkigym.ir.ir import BodyLeaf, DimInfo, KernelIR, Tensor, validate_dataflow_ordering
 
     class _FakeMemset: __name__ = "NKIMemset"
     class _FakeMatmul: __name__ = "NKIMatmul"
@@ -955,7 +955,7 @@ def test_validate_dataflow_ordering_rmw_leaf_counts_as_writer_for_next_leaf():
         BodyLeaf(op_cls=_FakeMatmul, reads_writes=("psum_acc",)),
         BodyLeaf(op_cls=_FakeCopy, reads={"src": "psum_acc"}, writes=("sbuf_prod",)),
     ]
-    mod = KernelModule(
+    mod = KernelIR(
         func_name="f", param_names=[], return_name="sbuf_prod",
         tensors=tensors, dims=dims, body=body,
     )
@@ -975,7 +975,7 @@ Expected: FAIL — current validator doesn't check `reads_writes`.
 In `nkigym/src/nkigym/codegen/ir.py`, replace the function body with:
 
 ```python
-def validate_dataflow_ordering(module: KernelModule) -> bool:
+def validate_dataflow_ordering(module: KernelIR) -> bool:
     """Return True iff the forest's emission order preserves dataflow.
 
     Rules:
@@ -1057,7 +1057,7 @@ Append to `test/codegen/test_first_class_buffers.py`:
 def test_canonical_parses_nkialloc_into_module_tensors():
     """An NKIAlloc call in f_nkigym registers a Tensor in module.tensors with
     declared location/shape/dtype — no inference, no OP_LOCAL_BUFFERS, no phase."""
-    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.ir.build import build_initial_ir
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.load import NKILoad
@@ -1072,7 +1072,7 @@ def test_canonical_parses_nkialloc_into_module_tensors():
         return hbm_out
 
     input_specs = {"lhs": {"shape": (128, 512), "dtype": "bfloat16"}}
-    module = build_canonical_module(f, input_specs)
+    module = build_initial_ir(f, input_specs)
 
     assert "lhs_sbuf" in module.tensors
     assert module.tensors["lhs_sbuf"].location == "sbuf"
@@ -1084,8 +1084,8 @@ def test_canonical_parses_nkialloc_into_module_tensors():
 def test_canonical_matmul_leaf_has_dst_in_reads_writes():
     """After canonical build, NKIMatmul's leaf carries dst in reads_writes
     (not in reads or writes)."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import BodyLeaf, leaves_under
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import BodyLeaf, leaves_under
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.load import NKILoad
@@ -1113,7 +1113,7 @@ def test_canonical_matmul_leaf_has_dst_in_reads_writes():
         "lhs_T": {"shape": (128, 128), "dtype": "bfloat16"},
         "rhs": {"shape": (128, 512), "dtype": "bfloat16"},
     }
-    module = build_canonical_module(f, input_specs)
+    module = build_initial_ir(f, input_specs)
 
     matmul_leaves = [leaf for root in module.body for leaf in leaves_under(root)
                      if leaf.op_cls.__name__ == "NKIMatmul"]
@@ -1214,11 +1214,11 @@ def _try_parse_alloc(stmt: ast.Assign, func_globals: dict[str, object]) -> _Allo
     )
 ```
 
-**3b.** Modify `build_canonical_module` to use the new tuple:
+**3b.** Modify `build_initial_ir` to use the new tuple:
 
 ```python
-def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict[str, dict]) -> KernelModule:
-    """Build a :class:`KernelModule` from an ``f_nkigym`` callable.
+def build_initial_ir(func: Callable[..., np.ndarray], input_specs: dict[str, dict]) -> KernelIR:
+    """Build a :class:`KernelIR` from an ``f_nkigym`` callable.
 
     See module docstring for the pipeline.
     """
@@ -1246,7 +1246,7 @@ def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict[st
     for tree in body:
         _assign_canonical_names(tree, same_dim_counts={})
 
-    return KernelModule(
+    return KernelIR(
         func_name=unwrapped.__name__,
         param_names=param_names,
         return_name=return_name,
@@ -1271,7 +1271,7 @@ def _build_tensor_map_v2(
     their declared location. Dim ids are assigned lazily — each tensor's
     dim_ids get populated by ``_unify_axes_v2`` as ops reference it.
     """
-    from nkigym.codegen.ir import Tensor
+    from nkigym.ir.ir import Tensor
     out: dict[str, Tensor] = {}
     for name in param_names:
         spec = input_specs[name]
@@ -1521,7 +1521,7 @@ Append to `test/codegen/test_first_class_buffers.py`:
 def test_render_emits_alloc_inline_at_tree_position():
     """Rendered kernel declares each tensor at the alloc leaf's tree
     position, not at a global function top."""
-    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.ir.build import build_initial_ir
     from nkigym.codegen.render import render
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
@@ -1550,7 +1550,7 @@ def test_render_emits_alloc_inline_at_tree_position():
         "lhs_T": {"shape": (128, 128), "dtype": "bfloat16"},
         "rhs": {"shape": (128, 512), "dtype": "bfloat16"},
     }
-    module = build_canonical_module(f, input_specs)
+    module = build_initial_ir(f, input_specs)
     src = render(module)
     assert "psum_acc = nl.ndarray" in src
     assert "buffer=nl.psum" in src
@@ -1566,7 +1566,7 @@ def test_render_emits_alloc_inline_at_tree_position():
 Open `nkigym/src/nkigym/codegen/lowering/emit_source.py`. Replace the file contents with:
 
 ```python
-"""Top-level forest walker that emits NKI source from a KernelModule.
+"""Top-level forest walker that emits NKI source from a KernelIR.
 
 The renderer is intentionally dumb: it walks the schedule tree and
 delegates each leaf to a per-op-class emitter registered in
@@ -1575,13 +1575,13 @@ delegates each leaf to a per-op-class emitter registered in
 position. No separate allocation pass.
 """
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, leaves_under
-from nkigym.codegen.lowering._emit_utils import _Writer
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, leaves_under
+from nkigym.codegen._emit_utils import _Writer
 
 __all__ = ["emit_source", "render_annotated"]
 
 
-def emit_source(module: KernelModule) -> str:
+def emit_source(module: KernelIR) -> str:
     """Render ``module`` to NKI source via the forest walker."""
     w = _Writer()
     _emit_imports(w)
@@ -1593,7 +1593,7 @@ def emit_source(module: KernelModule) -> str:
     return w.getvalue()
 
 
-def render_annotated(module: KernelModule) -> str:
+def render_annotated(module: KernelIR) -> str:
     """Render with # BodyLeaf(...) / # LoopNode(...) comments above each emission."""
     w = _Writer()
     _emit_imports(w)
@@ -1616,13 +1616,13 @@ def _emit_imports(w: _Writer) -> None:
     w.line()
 
 
-def _emit_signature(w: _Writer, module: KernelModule) -> None:
+def _emit_signature(w: _Writer, module: KernelIR) -> None:
     w.line("@nki.jit")
     params = ", ".join(module.param_names)
     w.line(f"def {module.func_name}({params}):")
 
 
-def render_forest(w: _Writer, module: KernelModule) -> None:
+def render_forest(w: _Writer, module: KernelIR) -> None:
     """Walk ``module.body`` and emit NKI source for every node."""
     path_names: dict[str, list[str]] = {}
     path_trips: dict[str, list[int]] = {}
@@ -1632,7 +1632,7 @@ def render_forest(w: _Writer, module: KernelModule) -> None:
 
 def _emit_node(
     w: _Writer,
-    module: KernelModule,
+    module: KernelIR,
     node: LoopNode | BodyLeaf,
     path_names: dict[str, list[str]],
     path_trips: dict[str, list[int]],
@@ -1651,7 +1651,7 @@ def _emit_node(
 
 
 def _emit_vanilla_loop(
-    w: _Writer, module: KernelModule, node: LoopNode,
+    w: _Writer, module: KernelIR, node: LoopNode,
     path_names: dict[str, list[str]], path_trips: dict[str, list[int]],
 ) -> None:
     existing = path_names.setdefault(node.dim_id, [])
@@ -1668,7 +1668,7 @@ def _emit_vanilla_loop(
 
 
 def _emit_node_annotated(
-    w: _Writer, module: KernelModule, node: LoopNode | BodyLeaf,
+    w: _Writer, module: KernelIR, node: LoopNode | BodyLeaf,
     path_names: dict[str, list[str]], path_trips: dict[str, list[int]],
     path: tuple[int, ...],
 ) -> None:
@@ -1698,7 +1698,7 @@ def _emit_node_annotated(
 
 
 """Wired up at import time (bottom-of-file imports avoid module-load cycles)."""
-from nkigym.codegen.lowering.emit_ops import _BODY_EMITTERS  # noqa: E402
+from nkigym.codegen.emit_ops import _BODY_EMITTERS  # noqa: E402
 from nkigym.codegen.lowering.inject_software_pipeline import _emit_pipelined_loop  # noqa: E402
 ```
 
@@ -1727,7 +1727,7 @@ from nkigym.codegen.lowering.inject_multi_buffer import (
     slot_expr,
     swapped_dst_tile_slice,
 )
-from nkigym.codegen.lowering.place_buffers import tensor_total_slots
+from nkigym.codegen.place_buffers import tensor_total_slots
 
 _BODY_EMITTERS: dict[str, Callable] = {}
 
@@ -2359,8 +2359,8 @@ Create `test/codegen/test_rfactor_rmw.py`:
 
 import pytest
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import leaves_under
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import leaves_under
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -2397,7 +2397,7 @@ def test_rfactor_rejects_non_divisor_factor():
     """outer_factor must divide the accumulation dim's num_tiles."""
     from nkigym.tune.rfactor import RFactor
 
-    module = build_canonical_module(_matmul_canonical, _INPUT_SPECS)
+    module = build_initial_ir(_matmul_canonical, _INPUT_SPECS)
     """Find the matmul leaf and its K LoopNode path."""
     matmul_path = _find_matmul_compute_path(module)
     atom = RFactor(reducer_leaf_path=matmul_path, outer_factor=5)
@@ -2408,7 +2408,7 @@ def test_rfactor_rejects_endpoint_factors():
     """outer_factor == 1 or == num_tiles is a no-op; reject."""
     from nkigym.tune.rfactor import RFactor
 
-    module = build_canonical_module(_matmul_canonical, _INPUT_SPECS)
+    module = build_initial_ir(_matmul_canonical, _INPUT_SPECS)
     matmul_path = _find_matmul_compute_path(module)
     atom_low = RFactor(reducer_leaf_path=matmul_path, outer_factor=1)
     assert atom_low.is_legal(module) is False
@@ -2417,7 +2417,7 @@ def test_rfactor_rejects_endpoint_factors():
 def _find_matmul_compute_path(module):
     """Walk the tree to find the path to the NKIMatmul leaf."""
     def walk(node, path):
-        from nkigym.codegen.ir import BodyLeaf, LoopNode
+        from nkigym.ir.ir import BodyLeaf, LoopNode
         if isinstance(node, BodyLeaf) and node.op_cls.__name__ == "NKIMatmul":
             return path
         if isinstance(node, LoopNode):
@@ -2458,7 +2458,7 @@ See ``docs/superpowers/specs/2026-05-09-first-class-buffers-and-rfactor-design.m
 
 from dataclasses import dataclass
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, resolve_node
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, resolve_node
 from nkigym.ops.base import AxisRole
 from nkigym.tune import AtomLegalityError
 
@@ -2479,7 +2479,7 @@ class RFactor:
     reducer_leaf_path: tuple[int, ...]
     outer_factor: int
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         """Check structural + dataflow preconditions."""
         leaf = resolve_node(module.body, self.reducer_leaf_path)
         if not isinstance(leaf, BodyLeaf):
@@ -2504,7 +2504,7 @@ class RFactor:
             return _is_legal_slot(module, self.reducer_leaf_path, leaf)
         return False
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         """Apply the recipe-specific rewrite; rename canonical loop vars."""
         if not self.is_legal(module):
             raise AtomLegalityError(f"RFactor.apply: atom illegal on current state — {self}")
@@ -2527,7 +2527,7 @@ def _accumulation_dim(leaf: BodyLeaf, recipe: str) -> str | None:
     return None
 
 
-def _is_legal_rmw(module: KernelModule, leaf_path: tuple[int, ...], leaf: BodyLeaf) -> bool:
+def _is_legal_rmw(module: KernelIR, leaf_path: tuple[int, ...], leaf: BodyLeaf) -> bool:
     """Recipe "rmw": parent must be an ACCUMULATION LoopNode; dst must be RMW."""
     if not leaf.reads_writes:
         return False
@@ -2542,22 +2542,22 @@ def _is_legal_rmw(module: KernelModule, leaf_path: tuple[int, ...], leaf: BodyLe
     return True
 
 
-def _is_legal_slot(module: KernelModule, leaf_path: tuple[int, ...], leaf: BodyLeaf) -> bool:
+def _is_legal_slot(module: KernelIR, leaf_path: tuple[int, ...], leaf: BodyLeaf) -> bool:
     """Recipe "slot": reduction axis must be in leaf.axis_map with ACCUMULATION role."""
     return _accumulation_dim(leaf, "slot") is not None
 
 
-def _apply_rmw(module: KernelModule, leaf_path: tuple[int, ...], outer_factor: int) -> KernelModule:
+def _apply_rmw(module: KernelIR, leaf_path: tuple[int, ...], outer_factor: int) -> KernelIR:
     """Implemented in Task 16."""
     raise NotImplementedError("RFactor recipe 'rmw' — implemented in Task 16")
 
 
-def _apply_slot(module: KernelModule, leaf_path: tuple[int, ...], outer_factor: int) -> KernelModule:
+def _apply_slot(module: KernelIR, leaf_path: tuple[int, ...], outer_factor: int) -> KernelIR:
     """Implemented in Task 18."""
     raise NotImplementedError("RFactor recipe 'slot' — implemented in Task 18")
 
 
-def enumerate_rfactor_atoms(module: KernelModule) -> list[RFactor]:
+def enumerate_rfactor_atoms(module: KernelIR) -> list[RFactor]:
     """Emit one atom per (reducer leaf, valid divisor of accumulation dim)."""
     atoms: list[RFactor] = []
 
@@ -2623,7 +2623,7 @@ def test_rfactor_rmw_produces_staging_buffer_and_close():
     """
     from nkigym.tune.rfactor import RFactor
 
-    module = build_canonical_module(_matmul_canonical, _INPUT_SPECS)
+    module = build_initial_ir(_matmul_canonical, _INPUT_SPECS)
     matmul_path = _find_matmul_compute_path(module)
     atom = RFactor(reducer_leaf_path=matmul_path, outer_factor=4)
     assert atom.is_legal(module)
@@ -2644,10 +2644,10 @@ def test_rfactor_rmw_produces_staging_buffer_and_close():
 
 def test_rfactor_rmw_preserves_dataflow_ordering():
     """After rfactor, the resulting module still validates."""
-    from nkigym.codegen.ir import validate_dataflow_ordering
+    from nkigym.ir.ir import validate_dataflow_ordering
     from nkigym.tune.rfactor import RFactor
 
-    module = build_canonical_module(_matmul_canonical, _INPUT_SPECS)
+    module = build_initial_ir(_matmul_canonical, _INPUT_SPECS)
     matmul_path = _find_matmul_compute_path(module)
     new_module = RFactor(reducer_leaf_path=matmul_path, outer_factor=4).apply(module)
     assert validate_dataflow_ordering(new_module) is True
@@ -2666,7 +2666,7 @@ Expected: FAIL — `NotImplementedError: RFactor recipe 'rmw' — implemented in
 In `nkigym/src/nkigym/tune/rfactor.py`, replace `_apply_rmw` with:
 
 ```python
-def _apply_rmw(module: KernelModule, leaf_path: tuple[int, ...], outer_factor: int) -> KernelModule:
+def _apply_rmw(module: KernelIR, leaf_path: tuple[int, ...], outer_factor: int) -> KernelIR:
     """Recipe "rmw": matmul-style.
 
     Transforms:
@@ -2684,7 +2684,7 @@ def _apply_rmw(module: KernelModule, leaf_path: tuple[int, ...], outer_factor: i
     """
     from dataclasses import replace as dc_replace
 
-    from nkigym.codegen.ir import DimInfo, Tensor
+    from nkigym.ir.ir import DimInfo, Tensor
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.matmul import NKIMatmul
     from nkigym.ops.memset import NKIMemset
@@ -2767,7 +2767,7 @@ def _rebuild_forest_rmw(
     6. Prepend NKIAlloc(partials) before the K_outer loop.
     7. Append NKITensorReduce(partials → original_drain_dst, axis=outer) after K_outer.
     """
-    from nkigym.codegen.ir import BodyLeaf, LoopNode
+    from nkigym.ir.ir import BodyLeaf, LoopNode
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.matmul import NKIMatmul
     from nkigym.ops.memset import NKIMemset
@@ -2923,7 +2923,7 @@ def test_rfactor_rmw_kernel_renders_and_cpu_sims_correctly():
     from nkigym.codegen.render import render
     from nkigym.tune.rfactor import RFactor
 
-    module = build_canonical_module(_matmul_canonical, _INPUT_SPECS)
+    module = build_initial_ir(_matmul_canonical, _INPUT_SPECS)
     matmul_path = _find_matmul_compute_path(module)
     rfactored = RFactor(reducer_leaf_path=matmul_path, outer_factor=4).apply(module)
     source = render(rfactored)
@@ -2978,8 +2978,8 @@ Create `test/codegen/test_rfactor_slot.py`:
 ```python
 """Tests for RFactor atom — slot-indexed recipe (activation_reduce)."""
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import leaves_under
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import leaves_under
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.alloc import NKIAlloc
@@ -3011,7 +3011,7 @@ def test_rfactor_slot_produces_partials_and_close():
     """
     from nkigym.tune.rfactor import RFactor
 
-    module = build_canonical_module(_sum_sq_canonical, _INPUT_SPECS)
+    module = build_initial_ir(_sum_sq_canonical, _INPUT_SPECS)
     ar_path = _find_ar_path(module)
     atom = RFactor(reducer_leaf_path=ar_path, outer_factor=4)
     assert atom.is_legal(module)
@@ -3027,7 +3027,7 @@ def test_rfactor_slot_produces_partials_and_close():
 
 
 def _find_ar_path(module):
-    from nkigym.codegen.ir import BodyLeaf, LoopNode
+    from nkigym.ir.ir import BodyLeaf, LoopNode
     def walk(node, path):
         if isinstance(node, BodyLeaf) and node.op_cls.__name__ == "NKIActivationReduce":
             return path
@@ -3057,7 +3057,7 @@ Expected: FAIL — `NotImplementedError: RFactor recipe 'slot' — implemented i
 In `nkigym/src/nkigym/tune/rfactor.py`, replace `_apply_slot` with:
 
 ```python
-def _apply_slot(module: KernelModule, leaf_path: tuple[int, ...], outer_factor: int) -> KernelModule:
+def _apply_slot(module: KernelIR, leaf_path: tuple[int, ...], outer_factor: int) -> KernelIR:
     """Recipe "slot": activation_reduce-style.
 
     Transforms:
@@ -3071,7 +3071,7 @@ def _apply_slot(module: KernelModule, leaf_path: tuple[int, ...], outer_factor: 
     """
     from dataclasses import replace as dc_replace
 
-    from nkigym.codegen.ir import DimInfo, Tensor
+    from nkigym.ir.ir import DimInfo, Tensor
     from nkigym.ops.activation_reduce import NKIActivationReduce
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.tensor_reduce import NKITensorReduce
@@ -3129,7 +3129,7 @@ def _rebuild_forest_slot(body, leaf_path, ar_leaf, outer_dim_id, outer_factor,
     After slot-rfactor: F_outer-LoopNode(PAR) { modified activation_reduce leaf with
       dst=scratch_local, reduce_res=partials[slot] }, then a NKITensorReduce.
     """
-    from nkigym.codegen.ir import BodyLeaf, LoopNode
+    from nkigym.ir.ir import BodyLeaf, LoopNode
     from nkigym.ops.activation_reduce import NKIActivationReduce
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.tensor_reduce import NKITensorReduce
@@ -3360,10 +3360,10 @@ Create `docs/ir-design.md` with the following structure (fill each section from 
 Three layers:
 
 1. **`f_nkigym`** — the user- or agent-authored Python function. Straight-line sequence of `NKIOp()(...)` calls, each mapping to one NKI ISA instruction or one `nl.ndarray` allocation. No loops, no conditionals, no tile-size awareness.
-2. **`KernelModule`** — the IR envelope built by `nkigym.codegen.canonical.build_canonical_module`. Holds signature + `module.tensors` (identity) + `module.dims` (iteration-space registry) + `module.body` (the schedule tree).
+2. **`KernelIR`** — the IR envelope built by `nkigym.ir.build.build_initial_ir`. Holds signature + `module.tensors` (identity) + `module.dims` (iteration-space registry) + `module.body` (the schedule tree).
 3. **Rendered NKI source** — the `@nki.jit def f_nkigym(...)` function produced by `nkigym.codegen.render.render`. Runnable on NKI CPU-sim or on Trn2 HW.
 
-Schedule-tree rewrites (`Split`, `Reorder`, `ComputeAt`, `ReverseComputeAt`, `MultiBuffer`, `SoftwarePipeline`, `HoistInvariant`, `RFactor`) transform `KernelModule` → `KernelModule`. The same renderer lowers any valid `KernelModule` to source.
+Schedule-tree rewrites (`Split`, `Reorder`, `ComputeAt`, `ReverseComputeAt`, `MultiBuffer`, `SoftwarePipeline`, `HoistInvariant`, `RFactor`) transform `KernelIR` → `KernelIR`. The same renderer lowers any valid `KernelIR` to source.
 
 ## 2. The `NKIOp` surface
 
@@ -3422,9 +3422,9 @@ def f_nkigym(lhs_T, rhs):
 
 The `@nkigym_kernel` decorator tags param `np.ndarray` inputs with `role="param"` at CPU-sim time and enforces that the final `return` is the output of an `NKIStore`.
 
-## 4. `KernelModule` — the IR envelope
+## 4. `KernelIR` — the IR envelope
 
-`nkigym.codegen.ir.KernelModule` carries:
+`nkigym.ir.ir.KernelIR` carries:
 
 - `func_name: str` — emitted kernel name.
 - `param_names: list[str]` — kernel parameter signature.
@@ -3453,7 +3453,7 @@ Consequences:
 
 ## 6. Canonical build pipeline
 
-`nkigym/src/nkigym/codegen/canonical.py::build_canonical_module`:
+`nkigym/src/nkigym/codegen/canonical.py::build_initial_ir`:
 
 1. **AST parse** f_nkigym. Each statement is either an `NKIAlloc` call (→ `_AllocRecord` with name/location/shape/dtype) or another `NKIOp` call (→ `_ParsedOpRaw`).
 2. **Build `module.tensors`** from params (`input_specs`) + alloc records.
@@ -3462,7 +3462,7 @@ Consequences:
 5. **Build the schedule tree**: alloc leaves at forest root in source order; compute/copy leaves each wrapped in a 1N-per-dim `LoopNode` chain over the op's `touched_dims`.
 6. **Assign canonical loop-var names** (`i_<dim>_<ordinal>`).
 
-Result: a `KernelModule` where every `BodyLeaf` is self-describing, every non-parameter tensor is declared in both `module.tensors` and as an `NKIAlloc` leaf, and `validate_dataflow_ordering` passes.
+Result: a `KernelIR` where every `BodyLeaf` is self-describing, every non-parameter tensor is declared in both `module.tensors` and as an `NKIAlloc` leaf, and `validate_dataflow_ordering` passes.
 
 ## 7. `validate_dataflow_ordering`
 
@@ -3474,7 +3474,7 @@ RMW operands encode ordering structurally. The matmul phase-order carve-out that
 
 ## 8. Rewrite atoms
 
-Each atom is a frozen dataclass with `is_legal(module) → bool` and `apply(module) → KernelModule`. Tune-stage enumerators in `nkigym/src/nkigym/tune/batch.py` produce every legal `(leaf/loop, parameters)` atom from a module state; the sampler picks atoms uniformly at random, applies them, and dedupes destination states via `hash_state`.
+Each atom is a frozen dataclass with `is_legal(module) → bool` and `apply(module) → KernelIR`. Tune-stage enumerators in `nkigym/src/nkigym/tune/batch.py` produce every legal `(leaf/loop, parameters)` atom from a module state; the sampler picks atoms uniformly at random, applies them, and dedupes destination states via `hash_state`.
 
 | Atom | Purpose | Acts on | Invariant |
 |---|---|---|---|
@@ -3513,8 +3513,8 @@ nkigym/src/nkigym/
     matmul.py, activation.py, activation_reduce.py, tensor_scalar.py
     load.py, store.py, transpose.py, dma_transpose.py
   codegen/
-    ir.py                    # KernelModule, TreeIR, LoopNode, BodyLeaf, Tensor, DimInfo, AxisRole
-    canonical.py             # build_canonical_module(f_nkigym, input_specs) → KernelModule
+    ir.py                    # KernelIR, TreeIR, LoopNode, BodyLeaf, Tensor, DimInfo, AxisRole
+    canonical.py             # build_initial_ir(f_nkigym, input_specs) → KernelIR
     dep_cache.py             # DepCache + subtree_signature
     render.py                # render(module) → NKI source
     lowering/
@@ -3580,7 +3580,7 @@ git commit -m "docs: add docs/ir-design.md; delete stale 2026-05-07 forest IR wa
 Append one line to `.claude/rules/learnings.md` under the Architecture section:
 
 ```markdown
-- **`docs/ir-design.md`**: source-of-truth reference for the current IR (NKIOp surface, `KernelModule` fields, canonical-build pipeline, atom table, renderer structure, file map). Keep in sync when IR fields or atoms change. *(2026-05-09 ET)*
+- **`docs/ir-design.md`**: source-of-truth reference for the current IR (NKIOp surface, `KernelIR` fields, canonical-build pipeline, atom table, renderer structure, file map). Keep in sync when IR fields or atoms change. *(2026-05-09 ET)*
 ```
 
 ```bash

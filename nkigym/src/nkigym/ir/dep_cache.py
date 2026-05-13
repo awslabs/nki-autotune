@@ -10,7 +10,7 @@ See ``docs/superpowers/specs/2026-05-10-iter-var-refactor-design.md`` §7.
 from dataclasses import dataclass, field
 from enum import Enum
 
-from nkigym.codegen.ir import ForNode, SBlock
+from nkigym.ir.ir import ForNode, SBlock
 
 
 class DepKind(Enum):

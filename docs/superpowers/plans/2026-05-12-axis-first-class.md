@@ -4,7 +4,7 @@
 
 **Goal:** Replace `IterVar.dim_id: str` with `IterVar.axis_id: int`; introduce an `Axis` record owning (opaque integer id, display name, total size, optional source-axes for fused dims). Same-dim Fuse preserves axis identity.
 
-**Architecture:** Atomic axis identity becomes an integer counter on `KernelModule.axis_counter`, analogous to how `var_id` works on IterVar today. `DimInfo` is replaced by `Axis`. All call sites that compared `dim_id: str` now compare `axis_id: int`. The rendered output is byte-identical for canonical kernels because `Axis.name` seeds the same `i_<name>_<ordinal>` loop var spelling.
+**Architecture:** Atomic axis identity becomes an integer counter on `KernelIR.axis_counter`, analogous to how `var_id` works on IterVar today. `DimInfo` is replaced by `Axis`. All call sites that compared `dim_id: str` now compare `axis_id: int`. The rendered output is byte-identical for canonical kernels because `Axis.name` seeds the same `i_<name>_<ordinal>` loop var spelling.
 
 **Tech Stack:** Python 3.12, dataclasses, existing nkigym IR layers (canonical, atoms, renderer), pytest.
 
@@ -17,7 +17,7 @@
 ## File Map
 
 **Production code (8 files):**
-- `nkigym/src/nkigym/codegen/ir.py` — add `Axis` dataclass; `IterVar.dim_id: str → axis_id: int`; `KernelModule.dims: dict[str, DimInfo] → axes: dict[int, Axis]`; add `axis_counter: int`; update `allocate_iter_var` signature; add `allocate_axis` method.
+- `nkigym/src/nkigym/codegen/ir.py` — add `Axis` dataclass; `IterVar.dim_id: str → axis_id: int`; `KernelIR.dims: dict[str, DimInfo] → axes: dict[int, Axis]`; add `axis_counter: int`; update `allocate_iter_var` signature; add `allocate_axis` method.
 - `nkigym/src/nkigym/codegen/canonical.py` — `_derive_dims` → `_derive_axes`; all dim_id lookups → axis_id lookups; SBlock annotation `axis_map: dict[str, int]`.
 - `nkigym/src/nkigym/codegen/lowering/emit_source.py` — innermost-tile identification groups by axis_id; loop-name spelling via `module.axes[iv.axis_id].name`.
 - `nkigym/src/nkigym/codegen/lowering/_emit_utils.py` — name lookup updates.
@@ -34,7 +34,7 @@
 - `test/codegen/test_ir.py`, `test_canonical.py`, `test_first_class_buffers.py`, `test_rfactor_rmw.py`, `test_rfactor_slot.py`, `test_batch.py`
 - `test/tune/test_split.py`, `test_fuse.py`, `test_reorder.py`, `test_compute_at.py`, `test_reverse_compute_at.py`
 
-**Test helper:** add `KernelModule.axis_id_by_name(name)` for test ergonomics.
+**Test helper:** add `KernelIR.axis_id_by_name(name)` for test ergonomics.
 
 ## Execution Order
 
@@ -62,8 +62,8 @@ This unblocks kernel_transforms.py kernel_0 -> kernel_1 (Fuse+Split on
 lhs_T load's d1 axis).
 """
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import ForNode, SBlock
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import ForNode, SBlock
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -123,7 +123,7 @@ def _find_lhs_t_load_d1_pair(module):
 
 def test_same_axis_fuse_preserves_axis_id():
     """Fusing d1 outer + d1 inner preserves the axis_id (no synthetic axis)."""
-    module = build_canonical_module(_matmul, input_specs=_SPECS)
+    module = build_initial_ir(_matmul, input_specs=_SPECS)
     d1_axis_id = module.axis_id_by_name("d1")
     outer_iv, inner_iv = _find_lhs_t_load_d1_pair(module)
     assert outer_iv.axis_id == d1_axis_id
@@ -155,7 +155,7 @@ def test_same_axis_fuse_preserves_axis_id():
 
 def test_split_after_same_axis_fuse_preserves_axis_id():
     """After Fuse to 2048, a subsequent Split(factors [16, 128]) produces iter-vars on the same axis."""
-    module = build_canonical_module(_matmul, input_specs=_SPECS)
+    module = build_initial_ir(_matmul, input_specs=_SPECS)
     d1_axis_id = module.axis_id_by_name("d1")
     outer_iv, inner_iv = _find_lhs_t_load_d1_pair(module)
     module = Fuse(outer_iter_var_id=outer_iv.var_id, inner_iter_var_id=inner_iv.var_id).apply(module)
@@ -219,7 +219,7 @@ def test_split_after_same_axis_fuse_preserves_axis_id():
 
 def test_axis_rename_does_not_break_logic():
     """Renaming an Axis (display-only) must not affect atom legality or tree walks."""
-    module = build_canonical_module(_matmul, input_specs=_SPECS)
+    module = build_initial_ir(_matmul, input_specs=_SPECS)
     d1_axis_id = module.axis_id_by_name("d1")
     module.axes[d1_axis_id].name = "row"
     outer_iv, inner_iv = _find_lhs_t_load_d1_pair(module)
@@ -241,7 +241,7 @@ Do NOT commit yet; proceed to Task 2.
 
 ---
 
-## Task 2: IR — Axis dataclass, IterVar.axis_id, KernelModule.axes
+## Task 2: IR — Axis dataclass, IterVar.axis_id, KernelIR.axes
 
 **Files:**
 - Modify: `/home/ubuntu/nki-autotune/nkigym/src/nkigym/codegen/ir.py`
@@ -266,7 +266,7 @@ class Axis:
 
     Attributes:
         axis_id: Monotonic unique id per module (allocated via
-            :meth:`KernelModule.allocate_axis`).
+            :meth:`KernelIR.allocate_axis`).
         name: Display name, e.g. ``"d0"``, ``"row"``. Purely cosmetic.
         total_size: Axis extent in elements.
         source_axes: Tuple of component axis_ids if this axis was created
@@ -304,13 +304,13 @@ class IterVar:
     role: AxisRole
 ```
 
-- [ ] **Step 3: Update `KernelModule` — replace dims with axes, add axis_counter and allocate_axis**
+- [ ] **Step 3: Update `KernelIR` — replace dims with axes, add axis_counter and allocate_axis**
 
-Find `class KernelModule`. Update the fields and methods:
+Find `class KernelIR`. Update the fields and methods:
 
 ```python
 @dataclass
-class KernelModule:
+class KernelIR:
     """Envelope IR — signature + tensor/axis declarations + schedule tree.
 
     Analog of TVM's PrimFunc + buffer_map.
@@ -384,7 +384,7 @@ class KernelModule:
 
 ```bash
 source ~/venvs/kernel-env/bin/activate
-PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python -c "from nkigym.codegen.ir import Axis, IterVar, KernelModule; print('ir.py: ok')"
+PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python -c "from nkigym.ir.ir import Axis, IterVar, KernelIR; print('ir.py: ok')"
 ```
 
 Expected: `ir.py: ok`.
@@ -403,7 +403,7 @@ Expected: `ir.py: ok`.
 Find `_derive_dims` in canonical.py (around line 413). Replace:
 
 ```python
-def _derive_axes(module: KernelModule, dim_sizes: dict[str, int]) -> dict[str, int]:
+def _derive_axes(module: KernelIR, dim_sizes: dict[str, int]) -> dict[str, int]:
     """Allocate one Axis per concrete dim, returning a ``name → axis_id`` map.
 
     Called early in canonical build so subsequent helpers can translate
@@ -416,14 +416,14 @@ def _derive_axes(module: KernelModule, dim_sizes: dict[str, int]) -> dict[str, i
     return name_to_axis_id
 ```
 
-- [ ] **Step 2: Update `build_canonical_module` to construct KernelModule with axes dict**
+- [ ] **Step 2: Update `build_initial_ir` to construct KernelIR with axes dict**
 
-Find the place canonical constructs the `KernelModule`. It currently calls `_derive_dims` and passes `dims=...`. Change to: construct an empty `KernelModule` first (with `axes={}`), then call `_derive_axes(module, dim_sizes)` to populate axes and return the name→axis_id map.
+Find the place canonical constructs the `KernelIR`. It currently calls `_derive_dims` and passes `dims=...`. Change to: construct an empty `KernelIR` first (with `axes={}`), then call `_derive_axes(module, dim_sizes)` to populate axes and return the name→axis_id map.
 
-Concrete change: locate the `_derive_dims(...)` call (around line 60 of canonical.py based on prior reads) and the `KernelModule(...)` constructor call. Rewrite:
+Concrete change: locate the `_derive_dims(...)` call (around line 60 of canonical.py based on prior reads) and the `KernelIR(...)` constructor call. Rewrite:
 
 ```python
-module = KernelModule(
+module = KernelIR(
     func_name=...,  # existing args
     param_names=...,
     return_name=...,
@@ -507,11 +507,11 @@ These use the iter-var maps (dim_to_outer/dim_to_inner). Just change the key typ
 
 At the top of canonical.py, change:
 ```python
-from nkigym.codegen.ir import DimInfo, ...
+from nkigym.ir.ir import DimInfo, ...
 ```
 to:
 ```python
-from nkigym.codegen.ir import Axis, ...
+from nkigym.ir.ir import Axis, ...
 ```
 (or just remove DimInfo if still present; Axis may not be needed to be named directly in this module.)
 
@@ -542,9 +542,9 @@ If there are production-side import or attribute errors, fix them before moving 
 In `emit_source.py`, the helper currently does `by_dim: dict[str, list[int]] = {}` and groups by `iv.dim_id`. Change to:
 
 ```python
-def _innermost_tile_iter_var_ids(module: "KernelModule") -> set[int]:
+def _innermost_tile_iter_var_ids(module: "KernelIR") -> set[int]:
     """Collect var_ids of iter-vars that are each op's innermost tile loop per axis."""
-    from nkigym.codegen.ir import ForNode, SBlock
+    from nkigym.ir.ir import ForNode, SBlock
 
     ids: set[int] = set()
 
@@ -587,7 +587,7 @@ Any `_resolve_iv_name`-style helper that uses `iv.dim_id` in spelling changes to
 ```bash
 PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python -c "
 from nkigym.codegen.render import render
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 print('renderer imports: ok')
 "
 ```
@@ -668,7 +668,7 @@ In `/home/ubuntu/nki-autotune/nkigym/src/nkigym/tune/fuse.py`:
 Replace the body of `apply` that currently creates a synthetic dim. New logic:
 
 ```python
-def apply(self, module: KernelModule) -> KernelModule:
+def apply(self, module: KernelIR) -> KernelIR:
     """Execute the fuse."""
     if not self.is_legal(module):
         raise AtomLegalityError(f"Fuse.apply: illegal {self!r}")
@@ -712,7 +712,7 @@ def apply(self, module: KernelModule) -> KernelModule:
 
 Also: `_check_min_max` uses `outer.iter_var.dim_id` — change to `outer.iter_var.axis_id`, and the `fused_dim = d_o` naming becomes `fused_axis_id = v_outer.axis_id`. Import `_abstract_axis_for` from split (already imported; no change needed).
 
-Remove the `from nkigym.codegen.ir import DimInfo, ...` import — DimInfo no longer exists.
+Remove the `from nkigym.ir.ir import DimInfo, ...` import — DimInfo no longer exists.
 
 - [ ] **Step 3: Update reorder.py, compute_at.py, reverse_compute_at.py**
 
@@ -744,7 +744,7 @@ This is the biggest file touch in the refactor.
 In fuse.py and rfactor.py, remove `DimInfo` from imports:
 
 ```python
-from nkigym.codegen.ir import Axis, ForNode, IterVar, KernelModule, SBlock, TreeIR, replace_at_path
+from nkigym.ir.ir import Axis, ForNode, IterVar, KernelIR, SBlock, TreeIR, replace_at_path
 ```
 
 - [ ] **Step 6: Do not commit yet**
@@ -759,7 +759,7 @@ from nkigym.codegen.ir import Axis, ForNode, IterVar, KernelModule, SBlock, Tree
 source ~/venvs/kernel-env/bin/activate
 cd /home/ubuntu/nki-autotune
 PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python - <<'PY'
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
@@ -784,7 +784,7 @@ def mm(lhs_T, rhs):
     NKIStore()(src=s, dst=h)
     return h
 
-module = build_canonical_module(mm, input_specs={
+module = build_initial_ir(mm, input_specs={
     "lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
     "rhs":   {"shape": (2048, 2048), "dtype": "bfloat16"},
 })
@@ -813,7 +813,7 @@ cd /home/ubuntu/nki-autotune
 PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python - <<'PY'
 import numpy as np
 import nki
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
@@ -839,7 +839,7 @@ def mm(lhs_T, rhs):
     NKIStore()(src=s, dst=h)
     return h
 
-module = build_canonical_module(mm, input_specs={"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}})
+module = build_initial_ir(mm, input_specs={"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}})
 source = render(module)
 sim_src = _rewrite_to_fp32(source)
 ns = {}
@@ -884,7 +884,7 @@ For each test file, apply these patterns:
 2. `iv.dim_id` (as display string in error messages or tuple keys) → `module.axes[iv.axis_id].name`.
 3. `module.dims` → `module.axes`.
 4. `module.dims["d0"]` → `module.axes[module.axis_id_by_name("d0")]`.
-5. Test fixtures that instantiate `DimInfo` directly → use `KernelModule.allocate_axis` or remove if unnecessary.
+5. Test fixtures that instantiate `DimInfo` directly → use `KernelIR.allocate_axis` or remove if unnecessary.
 
 - [ ] **Step 2: Run each test file individually until each passes**
 
@@ -933,14 +933,14 @@ Expected: 15 `pass=True` lines.
 
 ```bash
 PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python - <<'PY'
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from nkigym.tune.verify import _verify
 from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym, K, M, N
 
 INPUT_SPECS = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 INPUT_SPECS_DICT = {"lhs_T": {"shape": (K, M), "dtype": "bfloat16"}, "rhs": {"shape": (K, N), "dtype": "bfloat16"}}
-module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs=INPUT_SPECS_DICT)
+module = build_initial_ir(matmul_lhsT_rhs_nkigym, input_specs=INPUT_SPECS_DICT)
 source = render(module)
 _verify(source, matmul_lhsT_rhs_nkigym, INPUT_SPECS)
 print("matmul_lhsT_rhs: PASS")
@@ -949,7 +949,7 @@ import sys
 sys.path.insert(0, "/home/ubuntu/nki-autotune/test/codegen")
 from _rmsnorm_matmul_fixture import f_nkigym, INPUT_SPECS as RSN_SPECS
 RSN_SPECS_DICT = {name: {"shape": shape, "dtype": dtype} for name, (shape, dtype) in RSN_SPECS.items()}
-module = build_canonical_module(f_nkigym, input_specs=RSN_SPECS_DICT)
+module = build_initial_ir(f_nkigym, input_specs=RSN_SPECS_DICT)
 source = render(module)
 _verify(source, f_nkigym, RSN_SPECS)
 print("rmsnorm_matmul: PASS")
@@ -1025,7 +1025,7 @@ git commit -m "docs: ir-design — Axis replaces DimInfo; axis_id is integer ide
 1. **Spec coverage** — Each requirement in `docs/superpowers/specs/2026-05-12-axis-first-class-design.md`:
    - `Axis` dataclass (spec §"IR Changes") → Task 2.
    - `IterVar.axis_id` replaces `dim_id` (spec §"IR Changes") → Task 2.
-   - `KernelModule.axes`, `axis_counter`, `allocate_axis` → Task 2.
+   - `KernelIR.axes`, `axis_counter`, `allocate_axis` → Task 2.
    - Same-axis Fuse preserves identity (spec §"Atom Behavior") → Task 6, Step 2.
    - Cross-axis Fuse allocates fresh Axis with source_axes → Task 6, Step 2.
    - Canonical name-to-axis-id routing → Task 3.

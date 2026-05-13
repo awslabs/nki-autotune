@@ -9,22 +9,22 @@ The nkigym IR is a three-layer pipeline. A math-level Python function is lifted 
 | Layer | What it is | Where it lives |
 |---|---|---|
 | **`f_nkigym`** | Python function of straight-line `NKIOp` calls — no loops, no branches, no helpers. Written by hand or by an agent. | `examples/*.py`, `nkigym/synthesis/` |
-| **`KernelModule`** | Envelope IR. Signature, tensor / dim declarations, schedule tree (`TreeIR`), lazy `DepCache`. Built by `build_canonical_module`, mutated in place by rewrite atoms. | `nkigym/codegen/ir.py` |
+| **`KernelIR`** | Envelope IR. Signature, tensor / dim declarations, schedule tree (`TreeIR`), lazy `DepCache`. Built by `build_initial_ir`, mutated in place by rewrite atoms. | `nkigym/ir/ir.py` |
 | **NKI source** | `@nki.jit` Python source string with explicit `for` nests and `nisa.*` ISA calls. Produced by `render(module)`. | `nkigym/codegen/render.py` |
 
 **Core invariant:** every buffer (HBM, SBUF, PSUM) is a first-class `Tensor` in the IR with explicit `location`, `shape`, `dtype`, and one `NKIAlloc` leaf that dominates all reads and writes. Every `NKIOp` maps 1:1 to one ISA call — no phase multiplexing, no hidden buffers, no auto-expansion.
 
-## 2. Envelope: `KernelModule`
+## 2. Envelope: `KernelIR`
 
-`KernelModule` is the envelope IR. It bundles signature, tensor and dim declarations, the schedule tree, and a per-scope dependency cache.
+`KernelIR` is the envelope IR. It bundles signature, tensor and dim declarations, the schedule tree, and a per-scope dependency cache.
 
-![KernelModule composition](diagrams/kernel-module.png)
+![KernelIR composition](diagrams/kernel-ir.png)
 
 ### Field summary
 
 | Type | Field | Description |
 |---|---|---|
-| `KernelModule` | `func_name` | Emitted kernel name. |
+| `KernelIR` | `func_name` | Emitted kernel name. |
 | | `param_names` | Signature order. |
 | | `return_name` | Name of the return tensor. |
 | | `tensors: dict[str, Tensor]` | Every named tensor, keyed by name. |
@@ -104,7 +104,7 @@ def matmul_lhsT_rhs_demo(lhs_T, rhs):
     return hbm_out
 ```
 
-`build_canonical_module` parses the AST, unifies abstract axes (`K`, `M`, `N`) into concrete dim ids (`d0`, `d1`, `d3`), derives per-dim tile sizes from `NKIOp.MIN_TILE_SIZE` and `NKIOp.MAX_TILE_SIZE`, tags tensor origins, and builds the canonical forest.
+`build_initial_ir` parses the AST, unifies abstract axes (`K`, `M`, `N`) into concrete dim ids (`d0`, `d1`, `d3`), derives per-dim tile sizes from `NKIOp.MIN_TILE_SIZE` and `NKIOp.MAX_TILE_SIZE`, tags tensor origins, and builds the canonical forest.
 
 ### 4.1 Canonical form
 
@@ -195,7 +195,7 @@ Nine rewrite atoms, grouped TVM-style into three categories.
 | `MultiBuffer` | Sets `Tensor.buffer_degree[dim] = degree`. Renderer widens the P-slot dim at emit time. | Tensor is intermediate (not param/return); `1 ≤ degree ≤ num_tiles(dim) / required_tiles(dim)`. The upper bound is the tensor's LCA-derived slot count — more slots waste SBUF without changing semantics. |
 | `SoftwarePipeline` | Sets `LoopNode.pipeline_depth = depth`. Renderer emits prologue / body / epilogue. | Target is a `LoopNode`; `depth == chain length of subtree` (number of distinct `BodyLeaf`s). The renderer clamps to `min(pipeline_depth, max_stage+1, trip_count)` if later rewrites shrink the chain. |
 
-Every atom is a frozen dataclass with `is_legal(module) -> bool` and `apply(module) -> KernelModule`. The batch sampler enumerates all legal atoms from the current state, picks one uniformly at random, and applies it; state deduplication is via `hash_forest`.
+Every atom is a frozen dataclass with `is_legal(module) -> bool` and `apply(module) -> KernelIR`. The batch sampler enumerates all legal atoms from the current state, picks one uniformly at random, and applies it; state deduplication is via `hash_forest`.
 
 ## 6. Unified trace: four atoms
 
@@ -386,17 +386,20 @@ nkigym/src/nkigym/
 │   ├── tensor_copy.py                  # NKITensorCopy
 │   ├── tensor_reduce.py                # NKITensorReduce
 │   └── memset.py                       # NKIMemset
-├── codegen/
-│   ├── ir.py                           # KernelModule, Tensor, Axis, IterVar, ForNode, SBlock, validate_dataflow_ordering
+├── ir/
+│   ├── ir.py                           # KernelIR, Tensor, Axis, IterVar, ForNode, SBlock, validate_dataflow_ordering
 │   ├── dep_cache.py                    # DepCache (per-scope dependency tracking)
-│   ├── canonical.py                    # build_canonical_module (AST parse → IR)
-│   ├── render.py                       # render entry point
-│   └── lowering/
-│       ├── place_buffers.py            # LCA-based buffer placement
-│       ├── inject_multi_buffer.py      # Slot-index expressions
-│       ├── inject_software_pipeline.py # Prologue / body / epilogue
-│       ├── emit_ops.py                 # Per-op_cls ISA emitters
-│       └── emit_source.py              # Forest walker, NKI source string
+│   └── build.py                        # build_initial_ir (AST parse → KernelIR)
+├── codegen/                            # KernelIR → NKI source (flat)
+│   ├── render.py                       # render entry point; pipeline orchestrator
+│   ├── inject_annotations.py           # Dispatcher for annotation-keyed sub-passes
+│   ├── buffer_degree.py                # Widens Tensor.buffer_degree
+│   ├── software_pipeline.py            # software_pipeline_depth sub-pass
+│   ├── place_buffers.py                # LCA-based buffer placement
+│   ├── canonicalize_names.py           # i_<dim>_<ordinal> ForNode naming
+│   ├── emit_ops.py                     # Per-op_cls ISA emitters
+│   ├── emit_source.py                  # Forest walker, NKI source string
+│   └── _emit_utils.py                  # Shared slice / name helpers
 ├── tune/
 │   ├── __init__.py                     # KernelRewrite protocol, AtomLegalityError
 │   ├── split.py                        # Split

@@ -1,5 +1,5 @@
 classDiagram
-    class KernelModule {
+    class KernelIR {
         +str func_name
         +list~str~ param_names
         +str return_name
@@ -42,9 +42,9 @@ classDiagram
         +dict dim_role
     }
 
-    KernelModule "1" o-- "*" Tensor : tensors
-    KernelModule "1" o-- "*" DimInfo : dims
-    KernelModule "1" *-- "1" TreeIR : body
+    KernelIR "1" o-- "*" Tensor : tensors
+    KernelIR "1" o-- "*" DimInfo : dims
+    KernelIR "1" *-- "1" TreeIR : body
     TreeIR "1" *-- "*" LoopNode : roots/children
     TreeIR "1" *-- "*" BodyLeaf : leaves
     LoopNode "1" *-- "*" LoopNode : children

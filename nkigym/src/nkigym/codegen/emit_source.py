@@ -1,4 +1,4 @@
-"""Top-level forest walker that emits NKI source from a :class:`KernelModule`.
+"""Top-level forest walker that emits NKI source from a :class:`KernelIR`.
 
 The renderer is intentionally dumb: it walks the schedule tree and
 delegates each :class:`SBlock` to a per-op-class emitter registered in
@@ -13,12 +13,12 @@ it enters. Loop variable names come from :attr:`ForNode.name` (set by
 the right identifier in their operand slice expressions.
 """
 
-from nkigym.codegen.ir import ForNode, KernelModule, SBlock
-from nkigym.codegen.lowering._emit_utils import EmitCtx, _Writer
-from nkigym.codegen.lowering.emit_ops import emit_op_call
+from nkigym.codegen._emit_utils import EmitCtx, _Writer
+from nkigym.codegen.emit_ops import emit_op_call
+from nkigym.ir.ir import ForNode, KernelIR, SBlock
 
 
-def emit_source(module: KernelModule) -> str:
+def emit_source(module: KernelIR) -> str:
     """Render ``module`` to NKI source via the forest walker."""
     w = _Writer()
     _emit_imports(w)
@@ -37,7 +37,7 @@ def emit_source(module: KernelModule) -> str:
     return w.getvalue()
 
 
-def _innermost_tile_iter_var_ids(module: KernelModule) -> set[int]:
+def _innermost_tile_iter_var_ids(module: KernelIR) -> set[int]:
     """Collect var_ids of iter-vars that are each op's innermost tile loop per axis.
 
     For each :class:`SBlock` in the tree, for each axis in the block's
@@ -71,7 +71,7 @@ def _emit_imports(w: _Writer) -> None:
     w.line()
 
 
-def _emit_signature(w: _Writer, module: KernelModule) -> None:
+def _emit_signature(w: _Writer, module: KernelIR) -> None:
     """Emit ``@nki.jit`` decorator and ``def <name>(<params>):`` header."""
     w.line("@nki.jit")
     params = ", ".join(module.param_names)

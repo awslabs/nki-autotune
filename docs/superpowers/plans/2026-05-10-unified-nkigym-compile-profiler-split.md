@@ -159,7 +159,7 @@ Create `test/tune/test_verify.py`:
 import numpy as np
 import pytest
 
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
@@ -195,7 +195,7 @@ _INPUT_SPECS = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 
 
 def test_verify_passes_for_canonical_render():
-    module = build_canonical_module(
+    module = build_initial_ir(
         _lhsT_matmul,
         {name: {"shape": shape, "dtype": dt} for name, (shape, dt) in _INPUT_SPECS.items()},
     )
@@ -207,7 +207,7 @@ def test_verify_raises_on_mismatch():
     def wrong_kernel(lhs_T, rhs):
         return np.zeros((M, N), dtype=np.float32)
 
-    module = build_canonical_module(
+    module = build_initial_ir(
         _lhsT_matmul,
         {name: {"shape": shape, "dtype": dt} for name, (shape, dt) in _INPUT_SPECS.items()},
     )
@@ -397,7 +397,7 @@ reading ``__nkigym_kernel__`` off the passed callable:
 
 Shared tail:
 
-1. :func:`build_canonical_module` from ``f_nkigym``.
+1. :func:`build_initial_ir` from ``f_nkigym``.
 2. Render the canonical module into ``<cache>/kernel.py``; run
    :func:`_verify` — fp32 CPU sim vs ``f_nkigym``. Raise on mismatch.
 3. ``enumerate_pool`` + ``sample_pool`` → ``num_kernels`` random
@@ -421,7 +421,7 @@ import numpy as np
 
 from autotune.runner.api import remote_profile
 from autotune.runner.types import KernelJob
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from nkigym.synthesis import compile_numpy_to_nkigym
 from nkigym.tune.batch import enumerate_pool, sample_pool
@@ -469,7 +469,7 @@ def nkigym_compile(
 
     f_nkigym = _resolve_f_nkigym(f, input_specs, cache_path)
 
-    module = build_canonical_module(f_nkigym, _to_canonical_specs(input_specs))
+    module = build_initial_ir(f_nkigym, _to_canonical_specs(input_specs))
     canonical_source = render(module)
     (cache_path / "kernel.py").write_text(canonical_source)
     _verify(canonical_source, f_nkigym, input_specs)

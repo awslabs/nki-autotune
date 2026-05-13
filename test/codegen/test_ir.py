@@ -2,13 +2,13 @@
 
 import pytest
 
-from nkigym.codegen.ir import (
+from nkigym.ir.ir import (
     AccessRange,
     Axis,
     BufferAccess,
     ForNode,
     IterVar,
-    KernelModule,
+    KernelIR,
     NKIOpCall,
     SBlock,
     Tensor,
@@ -176,14 +176,14 @@ def test_for_node_name_defaults_none() -> None:
     assert fn.name is None
 
 
-def test_kernel_module_minimal() -> None:
-    """KernelModule carries signature + tensors + axes + body + iter_var_counter."""
+def test_kernel_ir_minimal() -> None:
+    """KernelIR carries signature + tensors + axes + body + iter_var_counter."""
     tensors = {
         "x": Tensor(
             name="x", dim_ids=("d0",), shape=(128,), dtype="float32", origin="param", location="hbm", buffer_degree={}
         )
     }
-    m = KernelModule(
+    m = KernelIR(
         func_name="f", param_names=["x"], return_name="x", tensors=tensors, axes={}, iter_var_counter=0, body=[]
     )
     m.allocate_axis(name="d0", total_size=128)
@@ -191,9 +191,9 @@ def test_kernel_module_minimal() -> None:
     assert m.body == []
 
 
-def test_kernel_module_allocates_monotonic_iter_var_ids() -> None:
+def test_kernel_ir_allocates_monotonic_iter_var_ids() -> None:
     """allocate_iter_var bumps the counter and returns a fresh IterVar."""
-    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, axes={}, iter_var_counter=0, body=[])
+    m = KernelIR(func_name="f", param_names=[], return_name="", tensors={}, axes={}, iter_var_counter=0, body=[])
     axis = m.allocate_axis(name="d0", total_size=128)
     iv1 = m.allocate_iter_var(axis.axis_id, extent=4, role=AxisRole.PARALLEL)
     iv2 = m.allocate_iter_var(axis.axis_id, extent=4, role=AxisRole.PARALLEL)
@@ -202,17 +202,17 @@ def test_kernel_module_allocates_monotonic_iter_var_ids() -> None:
     assert m.iter_var_counter == 2
 
 
-def test_kernel_module_default_body_and_dep() -> None:
+def test_kernel_ir_default_body_and_dep() -> None:
     """Empty body and fresh DepCache by default."""
-    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, axes={})
+    m = KernelIR(func_name="f", param_names=[], return_name="", tensors={}, axes={})
     assert m.body == []
     assert m.iter_var_counter == 0
     assert m.dep is not None
 
 
-def _mk_mod_with_single_block() -> KernelModule:
+def _mk_mod_with_single_block() -> KernelIR:
     """Build a minimal module: one ForNode → SBlock tree."""
-    m = KernelModule(func_name="f", param_names=[], return_name="", tensors={}, axes={}, iter_var_counter=0, body=[])
+    m = KernelIR(func_name="f", param_names=[], return_name="", tensors={}, axes={}, iter_var_counter=0, body=[])
     axis = m.allocate_axis(name="d0", total_size=128)
     iv = m.allocate_iter_var(axis.axis_id, 4, AxisRole.PARALLEL)
     block = SBlock(iter_vars=[iv], reads={}, writes={}, reads_writes={}, body=[])
@@ -319,7 +319,7 @@ def test_validate_rejects_read_before_alloc() -> None:
             buffer_degree={},
         )
     }
-    m = KernelModule(
+    m = KernelIR(
         func_name="f",
         param_names=[],
         return_name="x",
@@ -356,7 +356,7 @@ def test_validate_accepts_alloc_then_write_then_read() -> None:
     )
     writer_call = NKIOpCall(op_cls=NKILoad, kwargs={}, axis_map={}, dim_role={})
     writer = SBlock(iter_vars=[], reads={}, writes={"dst": _mk_access("x", 0)}, reads_writes={}, body=[writer_call])
-    m = KernelModule(
+    m = KernelIR(
         func_name="f",
         param_names=[],
         return_name="x",
@@ -401,7 +401,7 @@ def test_validate_param_tensors_are_pre_allocated() -> None:
         reads_writes={},
         body=[NKIOpCall(op_cls=NKILoad, kwargs={}, axis_map={}, dim_role={})],
     )
-    m = KernelModule(
+    m = KernelIR(
         func_name="f",
         param_names=["p"],
         return_name="out",
@@ -440,7 +440,7 @@ def test_validate_rejects_alloc_only_return() -> None:
     alloc_block = SBlock(
         iter_vars=[], reads={}, writes={"output": _mk_access("out", 0)}, reads_writes={}, body=[alloc_call]
     )
-    m = KernelModule(
+    m = KernelIR(
         func_name="f",
         param_names=[],
         return_name="out",
@@ -538,7 +538,7 @@ def test_validate_rejects_read_between_rmw_writes() -> None:
         reads_writes={"dst": _mk_access("psum", 0)},
         body=[NKIOpCall(op_cls=NKIMatmul, kwargs={}, axis_map={}, dim_role={})],
     )
-    m = KernelModule(
+    m = KernelIR(
         func_name="f",
         param_names=[],
         return_name="out",
@@ -634,7 +634,7 @@ def test_validate_accepts_read_after_all_rmw_writes() -> None:
         reads_writes={},
         body=[NKIOpCall(op_cls=NKITensorCopy, kwargs={}, axis_map={}, dim_role={})],
     )
-    m = KernelModule(
+    m = KernelIR(
         func_name="f",
         param_names=[],
         return_name="out",
@@ -662,7 +662,7 @@ def test_validate_rejects_unwritten_return() -> None:
         )
     }
     """Empty body — no alloc, no writers → "out" never enters `written`."""
-    m = KernelModule(
+    m = KernelIR(
         func_name="f", param_names=[], return_name="out", tensors=tensors, axes={}, iter_var_counter=0, body=[]
     )
     m.allocate_axis(name="d0", total_size=128)

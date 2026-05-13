@@ -13,8 +13,8 @@ dispatch is robust against re-exports.
 
 from collections.abc import Callable
 
-from nkigym.codegen.ir import NKIOpCall, SBlock
-from nkigym.codegen.lowering._emit_utils import EmitCtx, emit_slice
+from nkigym.codegen._emit_utils import EmitCtx, emit_slice
+from nkigym.ir.ir import NKIOpCall, SBlock
 
 _DTYPE_MAP: dict[str, str] = {"float32": "nl.float32", "float16": "nl.float16", "bfloat16": "nl.bfloat16"}
 

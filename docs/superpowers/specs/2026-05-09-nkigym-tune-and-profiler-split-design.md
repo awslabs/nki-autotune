@@ -23,7 +23,7 @@ Delete `scripts/`.
 ## Non-goals
 
 - No changes to the tune sampler (`enumerate_pool`, `sample_pool`, atom legality, hash_forest).
-- No changes to the rendering path (`build_canonical_module`, `render`).
+- No changes to the rendering path (`build_initial_ir`, `render`).
 - No changes to remote SSH orchestration, bootstrap, or per-kernel cache layout other than the fields removed.
 - No changes to existing unit tests in `test/codegen/` and `test/tune/` — those use the IR API directly and never touched `run_tune`.
 
@@ -62,7 +62,7 @@ Pipeline:
    - Write `<cache_dir>/f_nkigym.py = source`.
    - `f_nkigym = _load_f_nkigym(<cache_dir>/f_nkigym.py)`.
    - `_verify_fns(f_nkigym, f_numpy=f, input_specs)` — raise on mismatch.
-2. `module = build_canonical_module(f_nkigym, _to_canonical_specs(input_specs))`.
+2. `module = build_initial_ir(f_nkigym, _to_canonical_specs(input_specs))`.
 3. `source₀ = render(module)` → write `<cache_dir>/kernel.py`.
 4. `_verify(source₀, f_nkigym, input_specs)` — raise `AssertionError` on mismatch.
 5. `pool = enumerate_pool(module, max_pool_size=100*num_kernels, rng=rng)`.
@@ -197,7 +197,7 @@ class KernelJob(NamedTuple):
 | Path | Change |
 |---|---|
 | `nkigym/src/nkigym/ops/base.py` | `nkigym_kernel` sets `wrapper.__nkigym_kernel__ = True` on the returned wrapper. |
-| `nkigym/src/nkigym/compile.py` | Rewrite as the unified tag-dispatch driver. Imports `build_canonical_module` / `render` / `enumerate_pool` / `sample_pool` / `remote_profile` / `KernelJob` / `_verify` / `_verify_fns` / `_load_f_nkigym` / `compile_numpy_to_nkigym`. Body runs the 8-step pipeline above. |
+| `nkigym/src/nkigym/compile.py` | Rewrite as the unified tag-dispatch driver. Imports `build_initial_ir` / `render` / `enumerate_pool` / `sample_pool` / `remote_profile` / `KernelJob` / `_verify` / `_verify_fns` / `_load_f_nkigym` / `compile_numpy_to_nkigym`. Body runs the 8-step pipeline above. |
 | `nkigym/src/nkigym/tune/stage.py` | **Delete.** Its body (minus the two dispatch paths we're dropping) folds into `compile.py`. |
 | `nkigym/src/nkigym/tune/__init__.py` | Drop any export of `run_tune`. |
 | `nkigym/src/nkigym/__init__.py` | Lazy `__getattr__` unchanged — only `nkigym_compile` is exposed. |
@@ -243,5 +243,5 @@ Single commit (or a small stack if review prefers) — no migration period neede
 - **Two separate entry points `nkigym_tune` and `nkigym_compile`**: rejected — both run the same pipeline (verify + canonical + sample + profile); the only difference is an optional synthesis pre-step. Splitting them hides that they're the same operation and forces callers to pick the "right" name based on input type.
 - **Explicit `f_nkigym=` / `f_numpy=` kwargs (exactly one required)**: rejected — more verbose at call sites; tag-based dispatch is one attribute read and preserves positional form. `@nkigym_kernel` already marks the wrapper; the tag just exposes that marker.
 - **Keep `compute_golden`/`simulate_one` in autotune for "someone might want it"**: rejected per project code-style (dead code must go); nkigym verify runs in-process with the live callable, so the exec-based form is not reusable without adaptation anyway.
-- **Keep explicit-rewrites path**: rejected — no production caller uses it; tests call `build_canonical_module` + `render` + rewrites directly.
+- **Keep explicit-rewrites path**: rejected — no production caller uses it; tests call `build_initial_ir` + `render` + rewrites directly.
 - **`nkigym_compile` takes a path, not a callable**: rejected — callers already have the decorated function in scope; forcing a disk round-trip adds no value. The numpy-input branch still writes `f_nkigym.py` for persistence, then loads it before the tune step.

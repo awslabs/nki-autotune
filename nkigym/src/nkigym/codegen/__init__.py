@@ -1,10 +1,13 @@
-"""Eager renderer — ``f_nkigym`` → NKI source.
+"""Codegen: :class:`KernelIR` → NKI source.
 
-``render_eager`` is exposed via lazy ``__getattr__`` so that importing
-submodules (e.g. ``nkigym.codegen.ir``) does not eagerly pull in the
-canonical builder + render chain. During the iter-var IR migration
-``canonical`` is transiently broken; the lazy path keeps the IR layer
-importable for unit tests while downstream passes catch up.
+Flat package — each sibling module is one lowering pass or emitter.
+Composed by :mod:`.render` in order:
+
+    inject_annotations → place_buffers → canonicalize_names → emit_source
+
+``render_eager`` exposes the full ``f_nkigym`` → NKI source chain
+(IR build + render) via lazy ``__getattr__`` so importing
+:mod:`nkigym.ir` submodules does not pull the builder in eagerly.
 """
 
 from typing import Any
@@ -19,8 +22,8 @@ def __getattr__(name: str) -> Any:
 
         import numpy as np
 
-        from nkigym.codegen.canonical import build_canonical_module
         from nkigym.codegen.render import render
+        from nkigym.ir.build import build_initial_ir
 
         def render_eager(func: Callable[..., np.ndarray], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> str:
             """Lower a decorated ``f_nkigym`` callable to NKI kernel source.
@@ -33,7 +36,7 @@ def __getattr__(name: str) -> Any:
                 NKI source string containing the ``@nki.jit`` kernel.
             """
             canonical_specs = {name: {"shape": shape, "dtype": dtype} for name, (shape, dtype) in input_specs.items()}
-            return render(build_canonical_module(func, canonical_specs))
+            return render(build_initial_ir(func, canonical_specs))
 
         return render_eager
     raise AttributeError(f"module 'nkigym.codegen' has no attribute {name!r}")

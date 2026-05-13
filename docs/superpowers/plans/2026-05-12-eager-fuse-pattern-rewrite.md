@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove `KernelModule.fused_iter_var_map`; make Fuse eagerly rewrite `BufferAccess.iter_var_coeffs` so `BufferAccess` is the single source of truth for access patterns.
+**Goal:** Remove `KernelIR.fused_iter_var_map`; make Fuse eagerly rewrite `BufferAccess.iter_var_coeffs` so `BufferAccess` is the single source of truth for access patterns.
 
 **Architecture:** Same-axis Fuse (outer extent = 1) rewrites affected access patterns in one pass: retired outer drops from coeffs (extent-1 contributes 0), retired inner renames to fused var_id. Cross-axis Fuse with dependent access patterns raises `AtomLegalityError` (non-affine decomposition, deferred). Renderer loses its map-consulting branch: every iter-var in a live access pattern must have a live ForNode binding, else KeyError.
 
@@ -17,7 +17,7 @@
 ## File Map
 
 **Production (3 files):**
-- `nkigym/src/nkigym/codegen/ir.py` — remove `KernelModule.fused_iter_var_map` field; remove its pprint section.
+- `nkigym/src/nkigym/codegen/ir.py` — remove `KernelIR.fused_iter_var_map` field; remove its pprint section.
 - `nkigym/src/nkigym/codegen/lowering/_emit_utils.py` — drop the `fused_iter_var_map` branch in `_resolve_iv_name`.
 - `nkigym/src/nkigym/tune/fuse.py` — legality adds extent checks + access-pattern dependence check; apply eagerly rewrites access patterns; fix tree-rebuild ordering (rewrites don't get clobbered); remove writes to `fused_iter_var_map`; module docstring update.
 
@@ -64,8 +64,8 @@ directly so no side-table is needed; subsequent Split works normally.
 import numpy as np
 
 import nki
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import ForNode, SBlock
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import ForNode, SBlock
 from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
@@ -156,7 +156,7 @@ def test_fuse_then_split_renders_and_cpu_sims():
 
     After all atoms, render must succeed and CPU-sim must match numpy golden.
     """
-    module = build_canonical_module(_matmul, input_specs=_SPECS)
+    module = build_initial_ir(_matmul, input_specs=_SPECS)
     outer_id, inner_id = _find_lhs_d1_pair(module)
     module = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id).apply(module)
     fused_path = _find_d1_2048_path_above_lhs(module)
@@ -197,11 +197,11 @@ Expected: `test_fuse_then_split_renders_and_cpu_sims` FAILS with a `KeyError` me
 - Modify: `/home/ubuntu/nki-autotune/nkigym/src/nkigym/codegen/lowering/_emit_utils.py`
 - Modify: `/home/ubuntu/nki-autotune/nkigym/src/nkigym/tune/fuse.py`
 
-### Step 1: Remove `fused_iter_var_map` field from `KernelModule`
+### Step 1: Remove `fused_iter_var_map` field from `KernelIR`
 
 - [ ] **Edit `ir.py`**
 
-Find the `KernelModule` dataclass (around line 234). Remove the field declaration and its reference in the docstring:
+Find the `KernelIR` dataclass (around line 234). Remove the field declaration and its reference in the docstring:
 
 **Remove these lines** (inside the `Attributes:` docstring section, near lines 250-254):
 ```
@@ -219,7 +219,7 @@ Find the `KernelModule` dataclass (around line 234). Remove the field declaratio
 
 - [ ] **Remove the pprint section for the map**
 
-Find `KernelModule.pprint` (around line 315). Remove the block at the end that prints `fused_iter_var_map`:
+Find `KernelIR.pprint` (around line 315). Remove the block at the end that prints `fused_iter_var_map`:
 
 ```python
         """Retired-iter-var decompositions (if any)."""
@@ -263,7 +263,7 @@ Also check for stale docstring mentions at module top (lines ~20-30 per the grep
 Replace the `Fuse` class's `is_legal` method with:
 
 ```python
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         """Structural + role preconditions + eager-rewrite preconditions + MIN/MAX tile check.
 
         Preconditions for eager access-pattern rewriting:
@@ -302,7 +302,7 @@ Replace the `Fuse` class's `is_legal` method with:
 Replace the `Fuse.apply` method with:
 
 ```python
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         """Execute the fuse.
 
         Same-axis fuse (the common case, ``outer.extent == 1``):
@@ -365,7 +365,7 @@ Replace the `Fuse.apply` method with:
         """Now build the replacement ForNode from the *rewritten* subtree at
         outer_path, not the pre-rewrite inner_node. This ensures the rewritten
         SBlock children survive into the new module."""
-        from nkigym.codegen.ir import resolve_node
+        from nkigym.ir.ir import resolve_node
 
         rewritten_outer = resolve_node(new_body, outer_path)
         assert isinstance(rewritten_outer, ForNode)
@@ -465,7 +465,7 @@ def _rewrite_access_patterns_on_fuse(
     return [rewrite_node(n) for n in body]
 ```
 
-Add the necessary imports to `fuse.py` if missing: `AccessRange`, `BufferAccess` from `nkigym.codegen.ir`.
+Add the necessary imports to `fuse.py` if missing: `AccessRange`, `BufferAccess` from `nkigym.ir.ir`.
 
 Remove the two lines in `apply` that wrote to `fused_iter_var_map`:
 ```python
@@ -531,7 +531,7 @@ Append to `/home/ubuntu/nki-autotune/test/tune/test_fuse_eager_rewrite.py`:
 def test_same_axis_fuse_drops_outer_from_access_patterns():
     """After same-axis Fuse(outer.extent=1, inner), retired outer var_id is
     absent from every BufferAccess.iter_var_coeffs; inner renamed to fused."""
-    module = build_canonical_module(_matmul, input_specs=_SPECS)
+    module = build_initial_ir(_matmul, input_specs=_SPECS)
     outer_id, inner_id = _find_lhs_d1_pair(module)
     module = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id).apply(module)
 
@@ -573,7 +573,7 @@ def _all_sblocks(module):
         yield from walk(root, (i,))
 ```
 
-Add the missing import at the top: `from nkigym.codegen.ir import ForNode, SBlock` already present; `_all_sblocks` is self-contained.
+Add the missing import at the top: `from nkigym.ir.ir import ForNode, SBlock` already present; `_all_sblocks` is self-contained.
 
 - [ ] **Step 4: Run the full fuse test suite**
 
@@ -716,7 +716,7 @@ Spec: docs/superpowers/specs/2026-05-12-eager-fuse-pattern-rewrite-design.md"
 ## Self-Review Checklist
 
 1. **Spec coverage:**
-   - Remove `KernelModule.fused_iter_var_map` → Task 2 Step 1.
+   - Remove `KernelIR.fused_iter_var_map` → Task 2 Step 1.
    - Simplify `_resolve_iv_name` (remove map branch) → Task 2 Step 2.
    - Fuse.is_legal adds extent-1 check for same-axis + access-dependence check for cross-axis → Task 2 Step 3 (`is_legal` rewrite).
    - Fuse.apply eagerly rewrites access patterns → Task 2 Step 3 (`_rewrite_access_patterns_on_fuse` + call from apply).

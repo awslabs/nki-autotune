@@ -3,7 +3,7 @@ SBlock.reads_writes, and their interactions through the canonical builder."""
 
 import numpy as np
 
-from nkigym.codegen.ir import SBlock, Tensor
+from nkigym.ir.ir import SBlock, Tensor
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import NKIOp
 
@@ -145,7 +145,7 @@ def test_every_existing_op_declares_input_operands():
 def test_canonical_parses_nkialloc_into_module_tensors():
     """An NKIAlloc call in f_nkigym registers a Tensor in module.tensors with
     declared location/shape/dtype — no inference, no OP_LOCAL_BUFFERS, no phase."""
-    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.ir.build import build_initial_ir
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.load import NKILoad
@@ -160,7 +160,7 @@ def test_canonical_parses_nkialloc_into_module_tensors():
         return hbm_out
 
     input_specs = {"lhs": {"shape": (128, 512), "dtype": "bfloat16"}}
-    module = build_canonical_module(f, input_specs)
+    module = build_initial_ir(f, input_specs)
 
     assert "lhs_sbuf" in module.tensors
     assert module.tensors["lhs_sbuf"].location == "sbuf"
@@ -172,8 +172,8 @@ def test_canonical_parses_nkialloc_into_module_tensors():
 def test_canonical_matmul_leaf_has_dst_in_reads_writes():
     """After canonical build, NKIMatmul's SBlock carries dst in reads_writes
     (not in reads or writes)."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import blocks_under
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import blocks_under
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.load import NKILoad
@@ -199,7 +199,7 @@ def test_canonical_matmul_leaf_has_dst_in_reads_writes():
         "lhs_T": {"shape": (128, 128), "dtype": "bfloat16"},
         "rhs": {"shape": (128, 512), "dtype": "bfloat16"},
     }
-    module = build_canonical_module(f, input_specs)
+    module = build_initial_ir(f, input_specs)
 
     matmul_blocks = [
         block
@@ -221,8 +221,8 @@ def test_canonical_matmul_leaf_has_dst_in_reads_writes():
 def test_render_emits_alloc_inline_at_tree_position():
     """Rendered kernel declares each tensor at the alloc leaf's tree
     position, not at a global function top."""
-    from nkigym.codegen.canonical import build_canonical_module
     from nkigym.codegen.render import render
+    from nkigym.ir.build import build_initial_ir
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.load import NKILoad
@@ -248,7 +248,7 @@ def test_render_emits_alloc_inline_at_tree_position():
         "lhs_T": {"shape": (128, 128), "dtype": "bfloat16"},
         "rhs": {"shape": (128, 512), "dtype": "bfloat16"},
     }
-    module = build_canonical_module(f, input_specs)
+    module = build_initial_ir(f, input_specs)
     src = render(module)
     assert "psum_acc = nl.ndarray" in src
     assert "buffer=nl.psum" in src
@@ -263,8 +263,8 @@ def test_render_emits_alloc_inline_at_tree_position():
 def test_render_emits_3d_sbuf_and_2d_hbm_shapes():
     """Regression: SBUF/PSUM tensors must be 3D (P_tile, num_slots, F_total);
     HBM tensors keep the declared 2D shape."""
-    from nkigym.codegen.canonical import build_canonical_module
     from nkigym.codegen.render import render
+    from nkigym.ir.build import build_initial_ir
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.load import NKILoad
@@ -279,7 +279,7 @@ def test_render_emits_3d_sbuf_and_2d_hbm_shapes():
         return hbm_out
 
     input_specs = {"lhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
-    module = build_canonical_module(f, input_specs)
+    module = build_initial_ir(f, input_specs)
     src = render(module)
     """SBUF tensor: 3D (128, 16, 2048) — P_tile=128, num_p_tiles=2048/128=16, full F=2048."""
     assert "sbuf = nl.ndarray((128, 16, 2048)" in src, f"sbuf 3D shape missing; got: {src}"

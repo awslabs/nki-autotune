@@ -50,7 +50,7 @@ One ForNode. Rendered NKI source has NO `for` loop for that axis (tile loop is e
 
 ## IR Changes
 
-**`KernelModule` structure:** unchanged.
+**`KernelIR` structure:** unchanged.
 
 **`SBlock.iter_vars`:** bounded axes contribute 2 iter-vars (outer + inner). Unbounded axes contribute **1** iter-var (the tile). Today both contribute 2. Consumers that walked "2 iter-vars per axis" must handle variable counts — but it's still always "at least 1 per axis".
 

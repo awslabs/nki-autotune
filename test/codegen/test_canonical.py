@@ -7,8 +7,8 @@ in ``test_canonical_v1.py.bak`` if needed.
 
 import numpy as np
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import ForNode, KernelModule, NKIOpCall, SBlock, validate_dataflow_ordering
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import ForNode, KernelIR, NKIOpCall, SBlock, validate_dataflow_ordering
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -41,7 +41,7 @@ _INPUT_SPECS = {
 }
 
 
-def _collect_sblocks(module: KernelModule) -> list[SBlock]:
+def _collect_sblocks(module: KernelIR) -> list[SBlock]:
     """Pre-order DFS: every SBlock under every root."""
     blocks: list[SBlock] = []
 
@@ -57,13 +57,13 @@ def _collect_sblocks(module: KernelModule) -> list[SBlock]:
     return blocks
 
 
-def test_builds_kernel_module_shape() -> None:
-    """The builder returns a KernelModule with the expected surface shape.
+def test_builds_kernel_ir_shape() -> None:
+    """The builder returns a KernelIR with the expected surface shape.
 
     5 allocs (root SBlocks) + 6 compute trees (load, load, memset, matmul,
     tensor_copy, store) = 11 roots.
     """
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     assert km.func_name == "_matmul_k"
     assert km.param_names == ["lhs", "rhs"]
     assert len(km.body) == 11
@@ -71,7 +71,7 @@ def test_builds_kernel_module_shape() -> None:
 
 def test_canonical_emits_sblock_per_op() -> None:
     """One SBlock per NKIOp call. 11 total = 5 allocs + 6 compute."""
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     blocks = _collect_sblocks(km)
     assert len(blocks) == 11
 
@@ -82,7 +82,7 @@ def test_canonical_iter_vars_per_block_distinct() -> None:
     Canonical build allocates fresh iter vars per block; shared var_ids
     would cross-couple unrelated blocks.
     """
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     d0_axis_id = km.axis_id_by_name("d0")
     blocks = _collect_sblocks(km)
     d0_ids_across_blocks: list[set[int]] = []
@@ -97,7 +97,7 @@ def test_canonical_iter_vars_per_block_distinct() -> None:
 
 def test_canonical_alloc_sblocks_have_no_iter_vars() -> None:
     """Alloc SBlocks are root-level with empty iter_vars."""
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     alloc_roots = [
         root for root in km.body if isinstance(root, SBlock) and any(c.op_cls is NKIAlloc for c in root.body)
     ]
@@ -108,13 +108,13 @@ def test_canonical_alloc_sblocks_have_no_iter_vars() -> None:
 
 def test_canonical_dataflow_validates() -> None:
     """Canonical module passes dataflow validation."""
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     assert validate_dataflow_ordering(km)
 
 
 def test_matmul_block_operand_classification() -> None:
     """Matmul block puts stationary/moving in reads and dst in reads_writes."""
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     matmul_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKIMatmul]
     assert len(matmul_blocks) == 1
     block = matmul_blocks[0]
@@ -128,7 +128,7 @@ def test_matmul_block_operand_classification() -> None:
 
 def test_fornode_nests_outermost_first() -> None:
     """ForNode wrapping preserves iter_vars order: outermost = iter_vars[0]."""
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     matmul_roots = [
         root
         for root in km.body
@@ -149,7 +149,7 @@ def test_fornode_nests_outermost_first() -> None:
 
 def test_compute_block_has_nkiopcall() -> None:
     """Every compute SBlock contains exactly one NKIOpCall with axis_map+dim_role."""
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     for block in _collect_sblocks(km):
         assert len(block.body) == 1
         call = block.body[0]
@@ -162,7 +162,7 @@ def test_compute_block_has_nkiopcall() -> None:
 
 def test_buffer_access_pattern_references_iter_vars() -> None:
     """Each BufferAccess's pattern coefficients reference block-local iter var ids."""
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     for block in _collect_sblocks(km):
         if block.body and block.body[0].op_cls is NKIAlloc:
             continue
@@ -189,7 +189,7 @@ def test_canonical_render_matmul_lhsT_rhs_produces_valid_python() -> None:
 
     from nkigym.codegen.render import render
 
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     source = render(km)
     ast.parse(source)
     assert "nisa.dma_copy" in source
@@ -207,7 +207,7 @@ def test_canonical_render_iter_var_names_canonical() -> None:
 
     from nkigym.codegen.render import render
 
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     source = render(km)
     pattern = re.compile(r"for i_[a-zA-Z0-9_]+_\d+ in range")
     for line in source.splitlines():
@@ -226,7 +226,7 @@ def test_canonical_render_matmul_sbuf_slices_are_3d() -> None:
     """
     from nkigym.codegen.render import render
 
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     source = render(km)
 
     """SBUF intermediates lhs_sbuf/rhs_sbuf: writer is NKILoad with full-F
@@ -275,7 +275,7 @@ def test_canonical_load_has_full_F_extent() -> None:
     single tile iter-var (extent = full axis). Total = 3 iter-vars ordered
     ``[P_outer, P_inner, F_tile]``.
     """
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     load_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKILoad]
     assert len(load_blocks) == 2
     for block in load_blocks:
@@ -295,7 +295,7 @@ def test_canonical_memset_has_full_F_extent() -> None:
 
     Bounded P yields outer+inner; unbounded F yields a single tile iter-var.
     """
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     memset_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKIMemset]
     assert len(memset_blocks) == 1
     block = memset_blocks[0]
@@ -314,7 +314,7 @@ def test_canonical_tensor_copy_has_full_F_extent() -> None:
 
     Bounded P yields outer+inner; unbounded F yields a single tile iter-var.
     """
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     copy_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKITensorCopy]
     assert len(copy_blocks) == 1
     block = copy_blocks[0]
@@ -332,7 +332,7 @@ def test_canonical_store_has_full_F_extent() -> None:
 
     Bounded P yields outer+inner; unbounded F yields a single tile iter-var.
     """
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     store_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKIStore]
     assert len(store_blocks) == 1
     block = store_blocks[0]
@@ -351,7 +351,7 @@ def test_canonical_uses_max_tile_size() -> None:
     (3 dims) has 6 iter-vars ordered ``[K_outer, K_inner, M_outer, M_inner,
     N_outer, N_inner]``.
     """
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     matmul_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKIMatmul]
     assert len(matmul_blocks) == 1
     block = matmul_blocks[0]
@@ -406,7 +406,7 @@ def test_derive_op_tiles_raises_on_indivisible_extent() -> None:
         return hbm_out
 
     with pytest.raises(ValueError, match="not divisible by MAX_TILE_SIZE"):
-        build_canonical_module(
+        build_initial_ir(
             _k,
             input_specs={
                 "lhs_T": {"shape": (2048, 200), "dtype": "bfloat16"},
@@ -423,7 +423,7 @@ def test_canonical_emits_outer_and_inner_tile_loops():
     K and M tiles of matmul, and all P tiles across the rest of the ops),
     so the asserted shape is reachable.
     """
-    module = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    module = build_initial_ir(_matmul_k, _INPUT_SPECS)
     """Walk the body. After Task 4 each op axis yields a nested (outer,
     inner) ForNode pair. For NKIMatmul: K: trip=16 tile=128,
     M: trip=16 tile=128, N: trip=4 tile=512."""

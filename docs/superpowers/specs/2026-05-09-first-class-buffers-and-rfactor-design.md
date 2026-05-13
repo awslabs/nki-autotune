@@ -64,7 +64,7 @@ The fix needs to be architectural. Per-atom legality patches (e.g., rejecting `C
 - RFactor is supported as a first-class rewrite atom that takes a reducer leaf + outer factor and mechanically emits the staging-buffer decomposition.
 - The root cause of the `psum_tile` scope-death bug closes: once PSUM is a real `Tensor` with producer/consumer tracked through `reads`/`writes`/`reads_writes`, placement atoms cannot separate init/update/drain across disjoint sibling subtrees because the dataflow edge on the PSUM tensor is load-bearing.
 - Synthesis skill updated in-place so agents author `f_nkigym` in the new form.
-- After code lands, the reference doc `docs/ir-design.md` describes the current IR end-to-end (NKIOp surface, `KernelModule` fields, canonical-build pipeline, atom table, renderer structure, file map). The stale pre-first-class-buffers walkthrough at `2026-05-07-forest-ir-visual-walkthrough-design/` was deleted.
+- After code lands, the reference doc `docs/ir-design.md` describes the current IR end-to-end (NKIOp surface, `KernelIR` fields, canonical-build pipeline, atom table, renderer structure, file map). The stale pre-first-class-buffers walkthrough at `2026-05-07-forest-ir-visual-walkthrough-design/` was deleted.
 
 **Non-goals:**
 
@@ -205,7 +205,7 @@ Rule: for any operand name, membership is exactly one of `reads` / `writes` / `r
 ### 4.2 `validate_dataflow_ordering` rewrite
 
 ```python
-def validate_dataflow_ordering(module: KernelModule) -> bool:
+def validate_dataflow_ordering(module: KernelIR) -> bool:
     written: set[str] = set()
     params = {t.name for t in module.tensors.values() if t.origin == "param"}
 
@@ -350,7 +350,7 @@ class RFactor:
 ### 7.2 Recipe dispatch
 
 ```python
-RFACTOR_RECIPES: dict[str, Callable[[KernelModule, RFactor], KernelModule]] = {
+RFACTOR_RECIPES: dict[str, Callable[[KernelIR, RFactor], KernelIR]] = {
     "rmw": _rfactor_rmw,
     "slot": _rfactor_slot,
 }

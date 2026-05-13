@@ -32,8 +32,8 @@ Commit message format: `refactor: <short summary>` for code changes; `test: <sho
 ```
 nkigym/src/nkigym/
 ├── codegen/
-│   ├── ir.py                              # IterVar, ForNode, SBlock, NKIOpCall, BufferAccess, AccessRange, KernelModule, resolve_node, replace_at_path, blocks_under, validate_dataflow_ordering
-│   ├── canonical.py                       # build_canonical_module (AST parse → iter-var-based IR)
+│   ├── ir.py                              # IterVar, ForNode, SBlock, NKIOpCall, BufferAccess, AccessRange, KernelIR, resolve_node, replace_at_path, blocks_under, validate_dataflow_ordering
+│   ├── canonical.py                       # build_initial_ir (AST parse → iter-var-based IR)
 │   ├── dep_cache.py                       # DepCache keyed on SBlockId; _classify_edge folds reads_writes
 │   ├── render.py                          # render entry point
 │   └── lowering/
@@ -597,7 +597,7 @@ git commit -m "refactor: add ForNode dataclass"
 
 ---
 
-### Task 6: Define `KernelModule` v2 + `TreeIR` type alias
+### Task 6: Define `KernelIR` v2 + `TreeIR` type alias
 
 **Files:**
 - Modify: `nkigym/src/nkigym/codegen/ir_v2.py`
@@ -606,19 +606,19 @@ git commit -m "refactor: add ForNode dataclass"
 - [ ] **Step 1: Append failing test**
 
 ```python
-from nkigym.codegen.ir_v2 import KernelModule, TreeIR
-from nkigym.codegen.ir import Tensor, DimInfo  # reuse existing
+from nkigym.codegen.ir_v2 import KernelIR, TreeIR
+from nkigym.ir.ir import Tensor, DimInfo  # reuse existing
 from nkigym.ops.base import TensorOrigin
 
 
-def test_kernel_module_minimal() -> None:
-    """KernelModule carries signature + tensors + dims + body + iter_var_counter."""
+def test_kernel_ir_minimal() -> None:
+    """KernelIR carries signature + tensors + dims + body + iter_var_counter."""
     tensors = {
         "x": Tensor(name="x", dim_ids=("d0",), shape=(128,), dtype="float32",
                     origin="param", location="hbm", buffer_degree={}),
     }
     dims = {"d0": DimInfo(dim_id="d0", total_size=128, tile_size=128, num_tiles=1)}
-    m = KernelModule(
+    m = KernelIR(
         func_name="f",
         param_names=["x"],
         return_name="x",
@@ -631,9 +631,9 @@ def test_kernel_module_minimal() -> None:
     assert m.body == []
 
 
-def test_kernel_module_allocates_monotonic_iter_var_ids() -> None:
+def test_kernel_ir_allocates_monotonic_iter_var_ids() -> None:
     """allocate_iter_var bumps the counter and returns a fresh IterVar."""
-    m = KernelModule(func_name="f", param_names=[], return_name="",
+    m = KernelIR(func_name="f", param_names=[], return_name="",
                      tensors={}, dims={}, iter_var_counter=0, body=[])
     iv1 = m.allocate_iter_var("d0", extent=4, role=AxisRole.PARALLEL)
     iv2 = m.allocate_iter_var("d0", extent=4, role=AxisRole.PARALLEL)
@@ -650,19 +650,19 @@ pytest test/codegen/test_ir_v2.py -x -v
 
 Expected: `ImportError`.
 
-- [ ] **Step 3: Implement KernelModule**
+- [ ] **Step 3: Implement KernelIR**
 
 Append to `ir_v2.py`:
 
 ```python
-from nkigym.codegen.ir import DepCache, DimInfo, Tensor  # reuse unchanged types
+from nkigym.ir.ir import DepCache, DimInfo, Tensor  # reuse unchanged types
 
 
 TreeIR = list["ForNode | SBlock"]
 
 
 @dataclass
-class KernelModule:
+class KernelIR:
     """Envelope IR. Minimal delta from v1 — adds iter_var_counter, retypes body.
 
     Attributes:
@@ -707,7 +707,7 @@ Expected: all pass.
 
 ```bash
 git add nkigym/src/nkigym/codegen/ir_v2.py test/codegen/test_ir_v2.py
-git commit -m "refactor: add KernelModule v2 with iter_var allocator"
+git commit -m "refactor: add KernelIR v2 with iter_var allocator"
 ```
 
 ---
@@ -724,9 +724,9 @@ git commit -m "refactor: add KernelModule v2 with iter_var allocator"
 from nkigym.codegen.ir_v2 import blocks_under, resolve_node, replace_at_path
 
 
-def _mk_mod_with_single_block() -> KernelModule:
+def _mk_mod_with_single_block() -> KernelIR:
     """Build a minimal module: one ForNode → SBlock tree."""
-    m = KernelModule(func_name="f", param_names=[], return_name="",
+    m = KernelIR(func_name="f", param_names=[], return_name="",
                      tensors={}, dims={}, iter_var_counter=0, body=[])
     iv = m.allocate_iter_var("d0", 4, AxisRole.PARALLEL)
     block = SBlock(iter_vars=[iv], reads={}, writes={}, reads_writes={}, body=[])
@@ -902,7 +902,7 @@ def test_validate_rejects_read_before_alloc() -> None:
         "x": Tensor("x", ("d0",), (128,), "float32", "intermediate", "sbuf", {}),
     }
     dims = {"d0": DimInfo("d0", 128, 128, 1)}
-    m = KernelModule("f", [], "x", tensors, dims, 0,
+    m = KernelIR("f", [], "x", tensors, dims, 0,
                      body=[SBlock(iter_vars=[], reads={"src": _mk_access("x", 0)},
                                   writes={}, reads_writes={}, body=[])])
     assert not validate_dataflow_ordering(m)
@@ -925,7 +925,7 @@ def test_validate_accepts_alloc_then_write_then_read() -> None:
     writer_call = NKIOpCall(op_cls=NKILoad, kwargs={}, axis_map={}, dim_role={})
     writer = SBlock(iter_vars=[], reads={}, writes={"dst": _mk_access("x", 0)},
                      reads_writes={}, body=[writer_call])
-    m = KernelModule("f", [], "x", tensors, dims, 0, body=[alloc_block, writer])
+    m = KernelIR("f", [], "x", tensors, dims, 0, body=[alloc_block, writer])
     assert validate_dataflow_ordering(m)
 ```
 
@@ -942,7 +942,7 @@ Expected: ImportError.
 Append to `ir_v2.py`:
 
 ```python
-def validate_dataflow_ordering(module: KernelModule) -> bool:
+def validate_dataflow_ordering(module: KernelIR) -> bool:
     """Enforce 5 dataflow legality rules in pre-order DFS of the forest.
 
     Rules:
@@ -1001,7 +1001,7 @@ def _check_block(
     written: set[str],
     rmw_count: dict[str, int],
     rmw_seen: dict[str, int],
-    module: KernelModule,
+    module: KernelIR,
 ) -> bool:
     """Check one SBlock against all 5 dataflow rules."""
     is_alloc = len(block.body) == 1 and block.body[0].op_cls.__name__ == "NKIAlloc"
@@ -1366,11 +1366,11 @@ git mv test/codegen/test_dep_cache_v2.py test/codegen/test_dep_cache.py
 
 - [ ] **Step 2: Update internal imports in new test files**
 
-Replace every `nkigym.codegen.ir_v2` with `nkigym.codegen.ir` and `nkigym.codegen.dep_cache_v2` with `nkigym.codegen.dep_cache` in the two new test files:
+Replace every `nkigym.codegen.ir_v2` with `nkigym.ir.ir` and `nkigym.codegen.dep_cache_v2` with `nkigym.ir.dep_cache` in the two new test files:
 
 ```bash
-sed -i 's/nkigym.codegen.ir_v2/nkigym.codegen.ir/g' test/codegen/test_ir.py
-sed -i 's/nkigym.codegen.dep_cache_v2/nkigym.codegen.dep_cache/g' test/codegen/test_dep_cache.py
+sed -i 's/nkigym.codegen.ir_v2/nkigym.ir.ir/g' test/codegen/test_ir.py
+sed -i 's/nkigym.codegen.dep_cache_v2/nkigym.ir.dep_cache/g' test/codegen/test_dep_cache.py
 ```
 
 - [ ] **Step 3: Rename module files + update internal cross-references**
@@ -1382,15 +1382,15 @@ git mv nkigym/src/nkigym/codegen/dep_cache.py nkigym/src/nkigym/codegen/dep_cach
 git mv nkigym/src/nkigym/codegen/dep_cache_v2.py nkigym/src/nkigym/codegen/dep_cache.py
 
 # Inside the new ir.py, update the "reuse from ir" import:
-sed -i 's|from nkigym.codegen.ir import DepCache|# from nkigym.codegen.dep_cache import DepCache (below)|' nkigym/src/nkigym/codegen/ir.py
+sed -i 's|from nkigym.ir.ir import DepCache|# from nkigym.ir.dep_cache import DepCache (below)|' nkigym/src/nkigym/codegen/ir.py
 # Instead, DepCache import moves to dep_cache.py; fix ir.py
 python3 -c "
 import re
 p = 'nkigym/src/nkigym/codegen/ir.py'
 s = open(p).read()
 s = s.replace(
-    'from nkigym.codegen.ir import DepCache, DimInfo, Tensor',
-    'from nkigym.codegen.dep_cache import DepCache'
+    'from nkigym.ir.ir import DepCache, DimInfo, Tensor',
+    'from nkigym.ir.dep_cache import DepCache'
 )
 open(p, 'w').write(s)
 "
@@ -1435,12 +1435,12 @@ class Tensor:
 
 Remove the old `DepCache` reuse import from the new ir.py (it's in dep_cache.py; ir.py just references it via forward reference).
 
-- [ ] **Step 5: Update KernelModule's DepCache field to use dep_cache module**
+- [ ] **Step 5: Update KernelIR's DepCache field to use dep_cache module**
 
 Near the top of ir.py:
 
 ```python
-from nkigym.codegen.dep_cache import DepCache
+from nkigym.ir.dep_cache import DepCache
 ```
 
 And update the `dep` field default:
@@ -1508,7 +1508,7 @@ Functions to keep verbatim:
 Functions to rewrite:
 - `_make_leaf` → `_make_sblock` (builds SBlock with iter vars + BufferAccess)
 - `_make_alloc_leaf` → `_make_alloc_sblock` (alloc block, no iter vars)
-- `build_canonical_module` — top-level orchestrator
+- `build_initial_ir` — top-level orchestrator
 
 - [ ] **Step 3: Write failing test for single-op canonical build**
 
@@ -1517,15 +1517,15 @@ Add to `test/codegen/test_canonical.py`:
 ```python
 def test_canonical_emits_sblock_per_op() -> None:
     """Canonical form: one SBlock per NKIOp call; each block has per-op iter vars."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import SBlock, ForNode
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import SBlock, ForNode
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
 
     input_specs = {
         "lhs_T": {"shape": (512, 256), "dtype": "bfloat16"},
         "rhs": {"shape": (512, 1024), "dtype": "bfloat16"},
     }
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, input_specs)
     blocks = []
     def collect(n):
         if isinstance(n, SBlock):
@@ -1540,15 +1540,15 @@ def test_canonical_emits_sblock_per_op() -> None:
 
 def test_canonical_iter_vars_per_block_distinct() -> None:
     """Two blocks iterating d0 start with distinct iter var ids."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import SBlock
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import SBlock
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
 
     input_specs = {
         "lhs_T": {"shape": (512, 256), "dtype": "bfloat16"},
         "rhs": {"shape": (512, 1024), "dtype": "bfloat16"},
     }
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, input_specs)
     # Collect all SBlocks and their d0 iter vars
     d0_ids = set()
     def collect(n):
@@ -1578,7 +1578,7 @@ Expected: either import-error or assertion-error depending on v2 canonical.py st
 Replace `_make_leaf` function (around line 488-517 in current canonical.py) with:
 
 ```python
-def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
+def _make_sblock(op: _ParsedOp, module: KernelIR) -> SBlock:
     """Build an SBlock for one parsed op.
 
     - Allocates fresh IterVars on ``module`` for each dim in
@@ -1685,15 +1685,15 @@ def _make_alloc_sblock(alloc: _AllocRecord) -> SBlock:
     )
 ```
 
-- [ ] **Step 7: Rewrite `build_canonical_module`**
+- [ ] **Step 7: Rewrite `build_initial_ir`**
 
 Replace the top-level function:
 
 ```python
-def build_canonical_module(
+def build_initial_ir(
     f: Callable, input_specs: dict[str, dict]
-) -> KernelModule:
-    """Parse ``f``'s AST and build a canonical iter-var-based KernelModule.
+) -> KernelIR:
+    """Parse ``f``'s AST and build a canonical iter-var-based KernelIR.
 
     Steps:
     1. AST-parse to extract op records + alloc records + return name.
@@ -1707,7 +1707,7 @@ def build_canonical_module(
     raws, allocs, return_name = _parse_ast(func)
 
     if return_name is None:
-        raise ValueError("build_canonical_module: no return statement")
+        raise ValueError("build_initial_ir: no return statement")
 
     param_names = list(input_specs.keys())
     tensors = _build_tensor_map(param_names, input_specs, allocs, return_name)
@@ -1716,7 +1716,7 @@ def build_canonical_module(
     dims = _build_dim_info(raws, per_op_axis_maps, dim_sizes)
     parsed = _build_parsed_ops(raws, per_op_axis_maps, tensors, dims)
 
-    module = KernelModule(
+    module = KernelIR(
         func_name=func.__name__,
         param_names=param_names,
         return_name=return_name,
@@ -1754,13 +1754,13 @@ def _wrap_block_in_fornodes(block: SBlock) -> ForNode | SBlock:
 - [ ] **Step 8: Fix imports in canonical.py top**
 
 ```python
-from nkigym.codegen.ir import (
+from nkigym.ir.ir import (
     AccessRange,
     BufferAccess,
     DimInfo,
     ForNode,
     IterVar,
-    KernelModule,
+    KernelIR,
     NKIOpCall,
     SBlock,
     Tensor,
@@ -1857,15 +1857,15 @@ Add to `test/codegen/test_place_buffers.py`:
 ```python
 def test_place_buffers_emits_trivial_dims_explicitly() -> None:
     """Q5 decision: trivial dims (num_slots=1) stay explicit in buffer shape."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.lowering.place_buffers import place_buffers
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.codegen.place_buffers import place_buffers
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
 
     input_specs = {
         "lhs_T": {"shape": (128, 128), "dtype": "bfloat16"},
         "rhs": {"shape": (128, 512), "dtype": "bfloat16"},
     }
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, input_specs)
     place_buffers(module)
     # In this config: K=128, M=128, N=512 → all single-tile
     # lhs_T_sbuf shape = (P_tile, num_P_tiles=1, F_tile*num_F=128) = (128, 1, 128)
@@ -1875,15 +1875,15 @@ def test_place_buffers_emits_trivial_dims_explicitly() -> None:
 
 def test_place_buffers_nd_sbuf_shape_for_multi_tile() -> None:
     """Multi-tile config: shape = (P_tile, num_P_tiles, F_tile * num_F_tiles)."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.lowering.place_buffers import place_buffers
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.codegen.place_buffers import place_buffers
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
 
     input_specs = {
         "lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
         "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
     }
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, input_specs)
     place_buffers(module)
     # K=2048, tile=128 → num_K_tiles=16; M=2048, tile=128 → num_M_tiles=16
     # lhs_T_sbuf has dims (K, M); canonical SBUF shape = (P, num_K_tiles, num_M_tiles * M_tile)
@@ -1917,17 +1917,17 @@ Per-tensor shape derivation:
 N-D unified path: trivial dims (total_slots == 1) stay explicit.
 """
 
-from nkigym.codegen.ir import (
+from nkigym.ir.ir import (
     ForNode,
     IterVar,
-    KernelModule,
+    KernelIR,
     SBlock,
     Tensor,
     blocks_under,
 )
 
 
-def place_buffers(module: KernelModule) -> None:
+def place_buffers(module: KernelIR) -> None:
     """Mutates ``module.tensors`` to set each intermediate tensor's final shape.
 
     Param / return HBM tensors are untouched — their shapes come from
@@ -1942,7 +1942,7 @@ def place_buffers(module: KernelModule) -> None:
         _place_one_tensor(module, tensor)
 
 
-def _place_one_tensor(module: KernelModule, tensor: Tensor) -> None:
+def _place_one_tensor(module: KernelIR, tensor: Tensor) -> None:
     """Derive N-D SBUF/PSUM shape for one tensor."""
     accesses = _find_accesses_to_tensor(module, tensor.name)
     if not accesses:
@@ -1980,7 +1980,7 @@ def _place_one_tensor(module: KernelModule, tensor: Tensor) -> None:
 
 
 def _find_accesses_to_tensor(
-    module: KernelModule, tensor_name: str
+    module: KernelIR, tensor_name: str
 ) -> list[tuple[SBlock, tuple[IterVar, ...]]]:
     """Collect (block, enclosing_iter_vars) for every block that reads or
     writes the named tensor.
@@ -2009,7 +2009,7 @@ def _find_accesses_to_tensor(
 
 
 def _required_tiles_per_dim(
-    module: KernelModule,
+    module: KernelIR,
     tensor_name: str,
     accesses: list[tuple[SBlock, tuple[IterVar, ...]]],
 ) -> dict[str, int]:
@@ -2076,7 +2076,7 @@ Add to `test/codegen/test_canonical.py`:
 def test_canonical_render_matmul_lhsT_rhs_produces_valid_python() -> None:
     """Canonical render must parse as valid Python and contain expected ISA calls."""
     import ast
-    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.ir.build import build_initial_ir
     from nkigym.codegen.render import render
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
 
@@ -2084,7 +2084,7 @@ def test_canonical_render_matmul_lhsT_rhs_produces_valid_python() -> None:
         "lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
         "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
     }
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, input_specs)
     source = render(module)
     # Parse as Python
     ast.parse(source)
@@ -2097,7 +2097,7 @@ def test_canonical_render_matmul_lhsT_rhs_produces_valid_python() -> None:
 
 def test_canonical_render_cpu_sim_matches_numpy() -> None:
     """Canonical-render output CPU-sims equal to numpy reference."""
-    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.ir.build import build_initial_ir
     from nkigym.codegen.render import render
     from nkigym.tune.verify import _draw_fp32_inputs, _verify
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
@@ -2107,7 +2107,7 @@ def test_canonical_render_cpu_sim_matches_numpy() -> None:
         "rhs": ((2048, 2048), "bfloat16"),
     }
     canon_specs = {k: {"shape": s, "dtype": d} for k, (s, d) in input_specs.items()}
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, canon_specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, canon_specs)
     source = render(module)
     _verify(source, matmul_lhsT_rhs_nkigym, input_specs)
 ```
@@ -2132,7 +2132,7 @@ indexing expression like ``buf[0:128, (i_d0_0 * 4 + i_d0_1), ...]``.
 Trivial dims (extent=1) stay explicit.
 """
 
-from nkigym.codegen.ir import AccessRange, BufferAccess, IterVar
+from nkigym.ir.ir import AccessRange, BufferAccess, IterVar
 
 
 def emit_slice(
@@ -2195,8 +2195,8 @@ Returns one source line.
 
 from dataclasses import dataclass
 
-from nkigym.codegen.ir import BufferAccess, IterVar, NKIOpCall, SBlock
-from nkigym.codegen.lowering._emit_utils import emit_slice
+from nkigym.ir.ir import BufferAccess, IterVar, NKIOpCall, SBlock
+from nkigym.codegen._emit_utils import emit_slice
 
 
 @dataclass
@@ -2302,8 +2302,8 @@ Produces the final NKI source string with full imports + @nki.jit
 wrapper + function body.
 """
 
-from nkigym.codegen.ir import ForNode, KernelModule, SBlock
-from nkigym.codegen.lowering.emit_ops import EmitCtx, emit_op_call
+from nkigym.ir.ir import ForNode, KernelIR, SBlock
+from nkigym.codegen.emit_ops import EmitCtx, emit_op_call
 
 
 HEADER = """import nki
@@ -2316,7 +2316,7 @@ def {func_name}({param_list}):
 """
 
 
-def render(module: KernelModule) -> str:
+def render(module: KernelIR) -> str:
     """Render ``module`` as NKI source.
 
     Pipeline steps assumed already run (place_buffers, annotate injection).
@@ -2364,13 +2364,13 @@ def _emit_node(
 ```python
 """Top-level render entry: orchestrates passes then emits source."""
 
-from nkigym.codegen.ir import KernelModule
-from nkigym.codegen.lowering.emit_source import render as _emit_source
-from nkigym.codegen.lowering.place_buffers import place_buffers
-from nkigym.codegen.lowering.canonicalize_names import canonicalize_iter_var_names
+from nkigym.ir.ir import KernelIR
+from nkigym.codegen.emit_source import render as _emit_source
+from nkigym.codegen.place_buffers import place_buffers
+from nkigym.codegen.canonicalize_names import canonicalize_iter_var_names
 
 
-def render(module: KernelModule) -> str:
+def render(module: KernelIR) -> str:
     """Run passes and emit NKI source.
 
     Passes: place_buffers → inject_annotations → canonicalize_names → emit_source.
@@ -2393,10 +2393,10 @@ distinct ordinals; nested ForNodes on the same dim (e.g. Split pair)
 get increasing ordinals top-down.
 """
 
-from nkigym.codegen.ir import ForNode, KernelModule, SBlock
+from nkigym.ir.ir import ForNode, KernelIR, SBlock
 
 
-def canonicalize_iter_var_names(module: KernelModule) -> None:
+def canonicalize_iter_var_names(module: KernelIR) -> None:
     """Assign ``ForNode.name = "i_<dim>_<ordinal>"`` across the tree."""
     for root in module.body:
         _walk(root, counts={})
@@ -2451,10 +2451,10 @@ Walks the module tree; for each ForNode/SBlock with annotations, invokes
 per-key sub-passes. Sub-passes land in followup tasks.
 """
 
-from nkigym.codegen.ir import KernelModule
+from nkigym.ir.ir import KernelIR
 
 
-def inject_annotations(module: KernelModule) -> None:
+def inject_annotations(module: KernelIR) -> None:
     """Dispatch per-key annotation passes. No-op until sub-passes land."""
     _ = module
 EOF
@@ -2479,20 +2479,20 @@ git commit -m "refactor: remove old multi_buffer/software_pipeline injection; st
 ```python
 def test_canonical_render_matmul_lhs_rhs_cpu_sim() -> None:
     from examples.matmul_lhs_rhs import matmul_lhs_rhs_nkigym
-    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.ir.build import build_initial_ir
     from nkigym.codegen.render import render
     from nkigym.tune.verify import _verify
     input_specs = {"lhs": ((2048, 2048), "bfloat16"),
                     "rhs": ((2048, 2048), "bfloat16")}
     canon_specs = {k: {"shape": s, "dtype": d} for k, (s, d) in input_specs.items()}
-    module = build_canonical_module(matmul_lhs_rhs_nkigym, canon_specs)
+    module = build_initial_ir(matmul_lhs_rhs_nkigym, canon_specs)
     source = render(module)
     _verify(source, matmul_lhs_rhs_nkigym, input_specs)
 
 
 def test_canonical_render_rmsnorm_matmul_cpu_sim() -> None:
     from examples.rmsnorm_matmul import rmsnorm_matmul_nkigym
-    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.ir.build import build_initial_ir
     from nkigym.codegen.render import render
     from nkigym.tune.verify import _verify
     input_specs = {
@@ -2501,7 +2501,7 @@ def test_canonical_render_rmsnorm_matmul_cpu_sim() -> None:
         "weight": ((2048, 2048), "bfloat16"),
     }
     canon_specs = {k: {"shape": s, "dtype": d} for k, (s, d) in input_specs.items()}
-    module = build_canonical_module(rmsnorm_matmul_nkigym, canon_specs)
+    module = build_initial_ir(rmsnorm_matmul_nkigym, canon_specs)
     source = render(module)
     _verify(source, rmsnorm_matmul_nkigym, input_specs)
 ```
@@ -2547,8 +2547,8 @@ git commit -m "test: render parity on all three example kernels; fix per-op emit
 """Unit tests for the Annotate atom and per-key validators."""
 
 import pytest
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import ForNode, SBlock
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import ForNode, SBlock
 from nkigym.tune import AtomLegalityError
 from nkigym.tune.annotate import Annotate
 
@@ -2558,7 +2558,7 @@ def test_annotate_rejects_unknown_key() -> None:
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
     specs = {"lhs_T": {"shape": (128, 128), "dtype": "bfloat16"},
               "rhs": {"shape": (128, 128), "dtype": "bfloat16"}}
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, specs)
     atom = Annotate(target_path=(0,), key="bogus_key", value=42)
     assert not atom.is_legal(module)
 
@@ -2568,7 +2568,7 @@ def test_annotate_buffer_degree_on_sblock() -> None:
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
               "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, specs)
     # Find a root-level alloc SBlock for lhs_T_sbuf (first one in body).
     target_path = None
     for i, root in enumerate(module.body):
@@ -2603,20 +2603,20 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
-from nkigym.codegen.ir import ForNode, KernelModule, SBlock, resolve_node
+from nkigym.ir.ir import ForNode, KernelIR, SBlock, resolve_node
 from nkigym.tune import AtomLegalityError
 
-_KEY_VALIDATORS: dict[str, Callable[[Any, ForNode | SBlock, KernelModule], bool]] = {}
+_KEY_VALIDATORS: dict[str, Callable[[Any, ForNode | SBlock, KernelIR], bool]] = {}
 
 
 def register_annotation_key(
-    key: str, validator: Callable[[Any, ForNode | SBlock, KernelModule], bool]
+    key: str, validator: Callable[[Any, ForNode | SBlock, KernelIR], bool]
 ) -> None:
     """Register a key + its legality validator."""
     _KEY_VALIDATORS[key] = validator
 
 
-def _validate_buffer_degree(value: Any, target: ForNode | SBlock, module: KernelModule) -> bool:
+def _validate_buffer_degree(value: Any, target: ForNode | SBlock, module: KernelIR) -> bool:
     """buffer_degree requires: target is SBlock; value is dict[str, int]; every
     tensor named exists + not a param."""
     if not isinstance(target, SBlock):
@@ -2634,7 +2634,7 @@ def _validate_buffer_degree(value: Any, target: ForNode | SBlock, module: Kernel
 
 
 def _validate_software_pipeline_depth(
-    value: Any, target: ForNode | SBlock, module: KernelModule
+    value: Any, target: ForNode | SBlock, module: KernelIR
 ) -> bool:
     """software_pipeline_depth requires: target is ForNode; value is int >= 1."""
     _ = module
@@ -2663,7 +2663,7 @@ class Annotate:
     key: str
     value: Any
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         target = resolve_node(module.body, self.target_path)
         if target is None:
             return False
@@ -2672,7 +2672,7 @@ class Annotate:
             return False
         return validator(self.value, target, module)
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         if not self.is_legal(module):
             raise AtomLegalityError(f"Annotate.apply: illegal {self!r}")
         target = resolve_node(module.body, self.target_path)
@@ -2696,12 +2696,12 @@ class Annotate:
                 name=target.name,
                 annotations=new_annotations,
             )
-        from nkigym.codegen.ir import replace_at_path
+        from nkigym.ir.ir import replace_at_path
         new_body = replace_at_path(module.body, self.target_path, new_target)
         return replace(module, body=new_body)
 
 
-def enumerate_annotate_atoms(module: KernelModule) -> list[Annotate]:
+def enumerate_annotate_atoms(module: KernelIR) -> list[Annotate]:
     """Emit every legal Annotate instance across keys."""
     atoms: list[Annotate] = []
     atoms.extend(_enumerate_buffer_degree(module))
@@ -2709,7 +2709,7 @@ def enumerate_annotate_atoms(module: KernelModule) -> list[Annotate]:
     return atoms
 
 
-def _enumerate_buffer_degree(module: KernelModule) -> list[Annotate]:
+def _enumerate_buffer_degree(module: KernelIR) -> list[Annotate]:
     """For every alloc SBlock, emit degree ∈ {2, 3, 4} on each of its tensors."""
     atoms: list[Annotate] = []
     for i, root in enumerate(module.body):
@@ -2730,7 +2730,7 @@ def _enumerate_buffer_degree(module: KernelModule) -> list[Annotate]:
     return atoms
 
 
-def _enumerate_software_pipeline_depth(module: KernelModule) -> list[Annotate]:
+def _enumerate_software_pipeline_depth(module: KernelIR) -> list[Annotate]:
     """For every ForNode, emit depth ∈ {2, 3}."""
     atoms: list[Annotate] = []
 
@@ -2788,16 +2788,16 @@ expressions in BufferAccess.pattern for subsequent accesses of widened
 tensors.
 """
 
-from nkigym.codegen.ir import ForNode, KernelModule, SBlock
+from nkigym.ir.ir import ForNode, KernelIR, SBlock
 
 
-def apply_buffer_degree(module: KernelModule) -> None:
+def apply_buffer_degree(module: KernelIR) -> None:
     """Consume buffer_degree annotations; mutate module.tensors + AccessRanges."""
     for root in module.body:
         _walk(root, module)
 
 
-def _walk(node: ForNode | SBlock, module: KernelModule) -> None:
+def _walk(node: ForNode | SBlock, module: KernelIR) -> None:
     if isinstance(node, SBlock):
         bd = node.annotations.get("buffer_degree")
         if bd is not None:
@@ -2825,10 +2825,10 @@ epilogue) is deferred to the Bug B fix followup. Canonical + Annotate
 without this sub-pass performs the same as depth=1.
 """
 
-from nkigym.codegen.ir import ForNode, KernelModule, SBlock
+from nkigym.ir.ir import ForNode, KernelIR, SBlock
 
 
-def apply_software_pipeline(module: KernelModule) -> None:
+def apply_software_pipeline(module: KernelIR) -> None:
     """Validate all software_pipeline_depth annotations; no-op emission."""
     for root in module.body:
         _walk(root)
@@ -2856,14 +2856,14 @@ Replace `inject_annotations/__init__.py`:
 ```python
 """Dispatcher — calls per-key sub-passes in registered order."""
 
-from nkigym.codegen.ir import KernelModule
-from nkigym.codegen.lowering.inject_annotations.buffer_degree import apply_buffer_degree
-from nkigym.codegen.lowering.inject_annotations.software_pipeline import (
+from nkigym.ir.ir import KernelIR
+from nkigym.codegen.buffer_degree import apply_buffer_degree
+from nkigym.codegen.software_pipeline import (
     apply_software_pipeline,
 )
 
 
-def inject_annotations(module: KernelModule) -> None:
+def inject_annotations(module: KernelIR) -> None:
     """Run each annotation key's sub-pass. Order matters: buffer_degree
     before software_pipeline because SW pipeline prologue/body/epilogue
     consumes buffer_degree-widened slots."""
@@ -2874,10 +2874,10 @@ def inject_annotations(module: KernelModule) -> None:
 - [ ] **Step 4: Update render.py**
 
 ```python
-from nkigym.codegen.lowering.inject_annotations import inject_annotations
+from nkigym.codegen.inject_annotations import inject_annotations
 
 
-def render(module: KernelModule) -> str:
+def render(module: KernelIR) -> str:
     place_buffers(module)
     inject_annotations(module)
     canonicalize_iter_var_names(module)
@@ -2889,16 +2889,16 @@ def render(module: KernelModule) -> str:
 ```python
 def test_annotate_buffer_degree_widens_shape() -> None:
     """buffer_degree=2 annotation doubles the P-slot dim in emitted shape."""
-    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.ir.build import build_initial_ir
     from nkigym.codegen.render import render
     from nkigym.tune.annotate import Annotate
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
               "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, specs)
     # Find the lhs_T_sbuf alloc block index
     target_path = None
-    from nkigym.codegen.ir import SBlock
+    from nkigym.ir.ir import SBlock
     for i, root in enumerate(module.body):
         if isinstance(root, SBlock) and any(
             c.op_cls.__name__ == "NKIAlloc" and c.kwargs.get("tensor_name") == "lhs_T_sbuf"
@@ -2943,8 +2943,8 @@ git commit -m "refactor: implement buffer_degree + software_pipeline annotation 
 """Unit tests for Split on the iter-var IR."""
 
 import pytest
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import ForNode, SBlock
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import ForNode, SBlock
 from nkigym.codegen.render import render
 from nkigym.tune import AtomLegalityError
 from nkigym.tune.split import Split
@@ -2973,7 +2973,7 @@ def test_split_divisor_factor_succeeds():
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
               "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, specs)
     # Find matmul's d0 ACC loop (outermost of matmul nest; 16 num_tiles)
     target = _find_first_fornode_path(
         module, lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16
@@ -3002,7 +3002,7 @@ def test_split_non_divisor_rejects():
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
               "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, specs)
     target = _find_first_fornode_path(
         module, lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16
     )
@@ -3018,7 +3018,7 @@ def test_split_rewrites_buffer_access_patterns():
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
               "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, specs)
     target = _find_first_fornode_path(
         module, lambda n: n.iter_var.dim_id == "d0" and n.iter_var.extent == 16
     )
@@ -3045,12 +3045,12 @@ references from v to (v_outer * factor + v_inner).
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import (
+from nkigym.ir.ir import (
     AccessRange,
     BufferAccess,
     ForNode,
     IterVar,
-    KernelModule,
+    KernelIR,
     SBlock,
     resolve_node,
     replace_at_path,
@@ -3070,7 +3070,7 @@ class Split:
     loop_path: tuple[int, ...]
     factor: int
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         target = resolve_node(module.body, self.loop_path)
         if not isinstance(target, ForNode):
             return False
@@ -3079,7 +3079,7 @@ class Split:
             return False
         return iv.extent % self.factor == 0
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         if not self.is_legal(module):
             raise AtomLegalityError(f"Split.apply: illegal {self!r}")
         target = resolve_node(module.body, self.loop_path)
@@ -3183,7 +3183,7 @@ def _update_sblock_iter_vars(body, old_id, v_outer, v_inner):
     return [update_node(n) for n in body]
 
 
-def enumerate_split_atoms(module: KernelModule) -> list[Split]:
+def enumerate_split_atoms(module: KernelIR) -> list[Split]:
     """Emit Split(target, factor) for every ForNode × divisor factor."""
     atoms: list[Split] = []
 
@@ -3232,8 +3232,8 @@ git commit -m "refactor: port Split atom to iter-var IR"
 """Unit tests for Reorder atom on iter-var IR."""
 
 import pytest
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import ForNode
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import ForNode
 from nkigym.tune.reorder import Reorder
 from nkigym.ops.base import AxisRole
 
@@ -3256,7 +3256,7 @@ def test_reorder_adjacent_par_par_commutes():
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
               "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, specs)
     # Find matmul subtree: d0 ACC outer, d1 PAR, d3 PAR, SBlock
     # Reorder d1 and d3 at their iter-var positions.
     fns = _collect_fornodes(module)
@@ -3274,7 +3274,7 @@ def test_reorder_adjacent_par_acc_rejects_when_par_writes():
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
               "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, specs)
     fns = _collect_fornodes(module)
     # matmul's d0 is ACC; its d1 is PAR. d1 indexes psum_acc's M axis (write).
     # Reorder(d1, d0_acc) would require subtree-purity w.r.t. d1 → expected fail.
@@ -3291,7 +3291,7 @@ def test_reorder_round_trip_restores_canonical():
     from examples.matmul_lhsT_rhs import matmul_lhsT_rhs_nkigym
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
               "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, specs)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, specs)
     fns = _collect_fornodes(module)
     d1 = next((p, n) for p, n in fns if n.iter_var.dim_id == "d1"
               and n.iter_var.role == AxisRole.PARALLEL)
@@ -3569,8 +3569,8 @@ git rm test/tune/test_hoist_invariant.py
 import random
 import warnings
 
-from nkigym.codegen.dep_cache import subtree_signature
-from nkigym.codegen.ir import KernelModule, validate_dataflow_ordering
+from nkigym.ir.dep_cache import subtree_signature
+from nkigym.ir.ir import KernelIR, validate_dataflow_ordering
 from nkigym.tune import AtomLegalityError, KernelRewrite
 from nkigym.tune.annotate import enumerate_annotate_atoms
 from nkigym.tune.compute_at import enumerate_compute_at_atoms
@@ -3581,7 +3581,7 @@ from nkigym.tune.rfactor import enumerate_rfactor_atoms
 from nkigym.tune.split import enumerate_split_atoms
 
 
-def _enumerate_atoms(module: KernelModule) -> list[KernelRewrite]:
+def _enumerate_atoms(module: KernelIR) -> list[KernelRewrite]:
     """7 atoms — Split, Reorder, Fuse, ComputeAt, ReverseComputeAt, RFactor, Annotate."""
     atoms: list[KernelRewrite] = []
     atoms.extend(enumerate_split_atoms(module))

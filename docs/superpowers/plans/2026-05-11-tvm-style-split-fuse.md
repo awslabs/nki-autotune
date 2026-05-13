@@ -6,7 +6,7 @@
 
 **Architecture:** Every op axis produces an outer trip loop AND a scalar innermost tile loop in the IR (today's canonical produces only the outer trip, with the tile absorbed into BufferAccess patterns). Split/Fuse get a one-line MIN/MAX check on the innermost tile extent. Renderer walks the tree; if a `ForNode` is the innermost tile loop for at least one descendant leaf, it emits no `for` and the leaf uses `trip` as slice width. For canonical kernels, emitted NKI source is unchanged byte-for-byte.
 
-**Tech Stack:** Python 3.12, existing nkigym IR (`nkigym.codegen.ir`), pytest, kernel-env venv.
+**Tech Stack:** Python 3.12, existing nkigym IR (`nkigym.ir.ir`), pytest, kernel-env venv.
 
 ---
 
@@ -320,7 +320,7 @@ def test_canonical_uses_max_tile_size():
     from nkigym.ops.load import NKILoad
     from nkigym.ops.matmul import NKIMatmul
     from nkigym.ops.store import NKIStore
-    from nkigym.codegen.canonical import build_canonical_module
+    from nkigym.ir.build import build_initial_ir
 
     @nkigym_kernel
     def _k(lhs_T, rhs):
@@ -334,7 +334,7 @@ def test_canonical_uses_max_tile_size():
         NKIStore()(src=psum, dst=hbm_out)
         return hbm_out
 
-    module = build_canonical_module(
+    module = build_initial_ir(
         _k,
         input_specs={
             "lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
@@ -437,8 +437,8 @@ Append to `test/codegen/test_canonical.py`:
 ```python
 def test_canonical_emits_outer_and_inner_tile_loops():
     """Each op axis produces TWO nested ForNodes in the IR: outer trip + inner tile."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import ForNode
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import ForNode
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.memset import NKIMemset
@@ -448,7 +448,7 @@ def test_canonical_emits_outer_and_inner_tile_loops():
         psum = NKIAlloc(location="psum", shape=(128, 2048), dtype="float32")()
         NKIMemset(value=0.0)(dst=psum)
 
-    module = build_canonical_module(_k, input_specs={})
+    module = build_initial_ir(_k, input_specs={})
     # Walk the body for the memset. Expect: ForNode(P, trip=1) > ForNode(P, trip=128)
     # for partition axis, and ForNode(F, trip=16) > ForNode(F, trip=128) for free axis.
     # Drill into nested for-nodes and collect (dim_id, extent) pairs.
@@ -481,7 +481,7 @@ Expected: FAIL — today canonical emits only one ForNode per axis.
 Open `nkigym/src/nkigym/codegen/canonical.py`. Find `_make_sblock` (around line 505). Replace the iter-var allocation loop:
 
 ```python
-def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
+def _make_sblock(op: _ParsedOp, module: KernelIR) -> SBlock:
     """Build an iter-var :class:`SBlock` for ``op`` with per-op tiling.
 
     Allocates TWO fresh :class:`IterVar` per ``dim_id`` in
@@ -584,7 +584,7 @@ must emit only the outer as a python `for`. The inner's extent is
 consumed as slice width on the ISA call.
 """
 
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
@@ -601,7 +601,7 @@ def test_render_emits_only_outer_tile_loop():
     """Expect one `for i_d0_0 in range(1):` (P outer) + one `for i_d1_0 in range(16):` (F outer).
     No `for ... in range(128):` for either P or F inner.
     """
-    module = build_canonical_module(_memset_only, input_specs={})
+    module = build_initial_ir(_memset_only, input_specs={})
     source = render(module)
     assert "for i_d0_0 in range(1):" in source or "range(1)" in source  # P trip
     assert "range(16)" in source  # F trip (2048/128)
@@ -610,7 +610,7 @@ def test_render_emits_only_outer_tile_loop():
 
 def test_render_slice_uses_inner_tile_extent():
     """The ISA call's dst slice should be [..., 0:128] on the inner F tile."""
-    module = build_canonical_module(_memset_only, input_specs={})
+    module = build_initial_ir(_memset_only, input_specs={})
     source = render(module)
     # Memset of 128 elements (inner tile) at offset = outer * 128
     assert "0 : 128" in source or "0:128" in source, f"inner tile slice missing from:\n{source}"
@@ -629,14 +629,14 @@ Expected: FAIL — renderer still emits the inner loop as a `for`.
 Open `nkigym/src/nkigym/codegen/lowering/emit_source.py`. Add at the top (below imports):
 
 ```python
-def _innermost_tile_iter_var_ids(module: "KernelModule") -> set[int]:
+def _innermost_tile_iter_var_ids(module: "KernelIR") -> set[int]:
     """Collect var_ids of iter-vars that are each op's innermost tile loop per axis.
 
     For each SBlock in the tree, for each dim in the block's iter_vars, the
     innermost iter-var (rightmost in the block's iter_vars list for that dim)
     is the tile loop. All such var_ids are returned.
     """
-    from nkigym.codegen.ir import ForNode, SBlock
+    from nkigym.ir.ir import ForNode, SBlock
 
     ids: set[int] = set()
 
@@ -692,7 +692,7 @@ def _emit_node(w: _Writer, node: ForNode | SBlock, ctx: EmitCtx) -> None:
 Find `emit_source` (around line 21). Update:
 
 ```python
-def emit_source(module: KernelModule) -> str:
+def emit_source(module: KernelIR) -> str:
     """Render ``module`` to NKI source via the forest walker."""
     w = _Writer()
     _emit_imports(w)
@@ -721,7 +721,7 @@ class EmitCtx:
     """...existing docstring..."""
     iter_var_to_name: dict[int, str]
     tensors: dict[str, Tensor]
-    module: KernelModule
+    module: KernelIR
     innermost_tile_ids: set[int] = field(default_factory=set)
 ```
 
@@ -748,7 +748,7 @@ Expected: ALL PASS. Emitted source is byte-identical to before the Task 4 change
 ```bash
 PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python - <<'PY'
 from pathlib import Path
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
@@ -773,7 +773,7 @@ def mm(lhs_T, rhs):
     NKIStore()(src=sbuf_prod, dst=hbm_out)
     return hbm_out
 
-module = build_canonical_module(mm, input_specs={
+module = build_initial_ir(mm, input_specs={
     "lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"},
     "rhs":   {"shape": (2048, 2048), "dtype": "bfloat16"},
 })
@@ -807,11 +807,11 @@ def test_split_rejects_below_min_tile():
     """Splitting a fixed-tile inner loop (matmul M innermost, extent=128) to a smaller
     inner is illegal — would violate MIN=128 on M.
     """
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import ForNode
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import ForNode
     from nkigym.tune.split import Split
 
-    module = build_canonical_module(_matmul_large, input_specs=_SPECS_LARGE)
+    module = build_initial_ir(_matmul_large, input_specs=_SPECS_LARGE)
 
     # Find an inner matmul M loop (extent 128).
     def find_inner_M_path(module):
@@ -843,11 +843,11 @@ def test_split_accepts_above_min_on_outer():
     """Splitting an outer trip loop to a smaller factor is legal when the inner tile
     is unaffected (still bounded by the existing inner ForNode, not by this split).
     """
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import ForNode
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import ForNode
     from nkigym.tune.split import Split, enumerate_split_atoms
 
-    module = build_canonical_module(_matmul_large, input_specs=_SPECS_LARGE)
+    module = build_initial_ir(_matmul_large, input_specs=_SPECS_LARGE)
     # Find an outer matmul M loop (extent = 2048/128 = 16).
     def find_outer_M_path(module):
         def walk(node, path):
@@ -885,7 +885,7 @@ Expected: FAIL — current `is_legal` accepts any divisor.
 Open `nkigym/src/nkigym/tune/split.py`. Replace the existing `is_legal`:
 
 ```python
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         """Structural + divisibility preconditions + MIN/MAX tile check.
 
         The split targets a ForNode. If the target is an innermost tile
@@ -902,10 +902,10 @@ Open `nkigym/src/nkigym/tune/split.py`. Replace the existing `is_legal`:
                 result = self._check_min_max(module, target)
         return result
 
-    def _check_min_max(self, module: KernelModule, target: ForNode) -> bool:
+    def _check_min_max(self, module: KernelIR, target: ForNode) -> bool:
         """Walk descendants; for each SBlock whose iter_vars has ``target.iter_var``
         as its innermost for its dim, check factor ∈ [MIN, MAX] for the op's axis."""
-        from nkigym.codegen.ir import SBlock
+        from nkigym.ir.ir import SBlock
 
         target_id = target.iter_var.var_id
         target_dim = target.iter_var.dim_id
@@ -1010,12 +1010,12 @@ Append to `test/tune/test_fuse.py`:
 ```python
 def test_fuse_rejects_when_fused_extent_exceeds_max():
     """Fusing two N-axis loops where the fused extent > MAX_TILE_SIZE["N"]=512 is illegal."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import ForNode
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import ForNode
     from nkigym.tune.fuse import Fuse
     from nkigym.tune.split import Split
 
-    module = build_canonical_module(_matmul_large, input_specs=_SPECS_LARGE)
+    module = build_initial_ir(_matmul_large, input_specs=_SPECS_LARGE)
     # First split the outer N loop so there's an adjacent pair to fuse.
     # Outer N: extent = 2048/512 = 4. Split into (2, 2).
     def find_outer_N(module):
@@ -1058,7 +1058,7 @@ Expected: new test either PASSES (already structurally illegal) or FAILS (extent
 Open `nkigym/src/nkigym/tune/fuse.py`. Replace `is_legal`:
 
 ```python
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         """Structural + role preconditions + MIN/MAX tile check when fuse touches innermost."""
         pair = _find_pair(module, self.outer_iter_var_id, self.inner_iter_var_id)
         result = False
@@ -1070,10 +1070,10 @@ Open `nkigym/src/nkigym/tune/fuse.py`. Replace `is_legal`:
                 result = self._check_min_max(module, outer, inner)
         return result
 
-    def _check_min_max(self, module: KernelModule, outer: ForNode, inner: ForNode) -> bool:
+    def _check_min_max(self, module: KernelIR, outer: ForNode, inner: ForNode) -> bool:
         """If the fused iter-var is the innermost-tile for any leaf on its dim, the
         fused extent must be in [MIN, MAX] for every such leaf's op."""
-        from nkigym.codegen.ir import SBlock
+        from nkigym.ir.ir import SBlock
         from nkigym.tune.split import _abstract_axis_for, _op_cls_for_block
 
         fused_dim = outer.iter_var.dim_id

@@ -170,7 +170,7 @@ Updated `_wrap_leaf_with_dims` signature:
 
 ```python
 def _wrap_leaf_with_dims(
-    leaf: BodyLeaf, dim_trips: list[tuple[str, int]], module: KernelModule
+    leaf: BodyLeaf, dim_trips: list[tuple[str, int]], module: KernelIR
 ) -> LoopNode | BodyLeaf:
     """Wrap ``leaf`` in one LoopNode per (dim, trip) entry, outermost first (1N)."""
     if not dim_trips:

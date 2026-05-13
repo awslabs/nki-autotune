@@ -2,8 +2,8 @@
 
 import numpy as np
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.lowering.place_buffers import place_buffers
+from nkigym.codegen.place_buffers import place_buffers
+from nkigym.ir.build import build_initial_ir
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -58,7 +58,7 @@ _LARGE_SPECS = {
 
 def test_place_buffers_emits_3d_shape_for_2d_tensor_single_tile() -> None:
     """Single-tile config: shape collapses but num_P_tiles=1 stays explicit."""
-    module = build_canonical_module(_matmul_small, _SMALL_SPECS)
+    module = build_initial_ir(_matmul_small, _SMALL_SPECS)
     place_buffers(module)
     """lhs_T_sbuf is 2D (K=128, M=128): K tile=128, so num_K_tiles=1.
        M tile=128, so num_M_tiles=1. Shape = (128, 1, 128)."""
@@ -68,7 +68,7 @@ def test_place_buffers_emits_3d_shape_for_2d_tensor_single_tile() -> None:
 
 def test_place_buffers_emits_3d_shape_for_multi_tile() -> None:
     """Multi-tile config: shape = (P_tile, num_P_tiles, F_tile * num_F_tiles)."""
-    module = build_canonical_module(_matmul_large, _LARGE_SPECS)
+    module = build_initial_ir(_matmul_large, _LARGE_SPECS)
     place_buffers(module)
     """K=2048, tile=128 → num_K_tiles=16; M=2048, tile=128 → num_M_tiles=16.
        lhs_T_sbuf shape = (P_tile=128, num_K_tiles=16, M_tile * num_M_tiles = 2048)."""
@@ -78,7 +78,7 @@ def test_place_buffers_emits_3d_shape_for_multi_tile() -> None:
 
 def test_place_buffers_leaves_param_tensors_alone() -> None:
     """Param tensors (HBM) have shape from input_specs; place_buffers mustn't touch."""
-    module = build_canonical_module(_matmul_large, _LARGE_SPECS)
+    module = build_initial_ir(_matmul_large, _LARGE_SPECS)
     original_lhs_shape = module.tensors["lhs_T"].shape
     original_rhs_shape = module.tensors["rhs"].shape
     place_buffers(module)
@@ -88,7 +88,7 @@ def test_place_buffers_leaves_param_tensors_alone() -> None:
 
 def test_place_buffers_leaves_return_hbm_alone() -> None:
     """Return HBM tensor shape set by canonical build from alloc — not touched."""
-    module = build_canonical_module(_matmul_large, _LARGE_SPECS)
+    module = build_initial_ir(_matmul_large, _LARGE_SPECS)
     hbm_out_before = module.tensors["hbm_out"].shape
     place_buffers(module)
     """HBM return tensors keep their declared 2D shape (output of the kernel)."""
@@ -97,7 +97,7 @@ def test_place_buffers_leaves_return_hbm_alone() -> None:
 
 def test_place_buffers_psum_shape() -> None:
     """PSUM tensor gets 3D shape matching SBUF convention."""
-    module = build_canonical_module(_matmul_large, _LARGE_SPECS)
+    module = build_initial_ir(_matmul_large, _LARGE_SPECS)
     place_buffers(module)
     """psum_acc dims (M=2048, N=2048); M tile=128, N tile=512.
        num_M_tiles=16, num_N_tiles=4. Shape = (128, 16, 4 * 512) = (128, 16, 2048)."""
@@ -107,7 +107,7 @@ def test_place_buffers_psum_shape() -> None:
 
 def test_place_buffers_sbuf_product_shape() -> None:
     """sbuf_prod (M, N) bf16 — same shape as psum_acc."""
-    module = build_canonical_module(_matmul_large, _LARGE_SPECS)
+    module = build_initial_ir(_matmul_large, _LARGE_SPECS)
     place_buffers(module)
     sbuf_prod = module.tensors["sbuf_prod"]
     assert sbuf_prod.shape == (128, 16, 2048)
@@ -134,7 +134,7 @@ def test_writer_driven_buffer_shape() -> None:
         return hbm_out
 
     specs = {"lhs": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
-    km = build_canonical_module(_k, specs)
+    km = build_initial_ir(_k, specs)
     place_buffers(km)
     """lhs_sbuf: writer is NKILoad with tile (P=128, F=2048-full).
     num_P_slots = 16 (covers 2048/128); F_tile * num_F_tiles = 2048 * 1."""

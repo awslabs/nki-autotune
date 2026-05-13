@@ -10,20 +10,20 @@ The axis's display name is consulted via ``module.axes[iv.axis_id].name``;
 identity remains ``axis_id`` so renames cannot change the tree's logic.
 """
 
-from nkigym.codegen.ir import ForNode, KernelModule, SBlock
+from nkigym.ir.ir import ForNode, KernelIR, SBlock
 
 
-def canonicalize_iter_var_names(module: KernelModule) -> None:
+def canonicalize_iter_var_names(module: KernelIR) -> None:
     """Assign canonical names to every ForNode in every tree.
 
     Args:
-        module: KernelModule whose body tree will be named in place.
+        module: KernelIR whose body tree will be named in place.
     """
     for root in module.body:
         _walk(root, module, counts={})
 
 
-def _walk(node: ForNode | SBlock, module: KernelModule, counts: dict[int, int]) -> None:
+def _walk(node: ForNode | SBlock, module: KernelIR, counts: dict[int, int]) -> None:
     """Depth-first walker; assigns each ForNode a per-axis ordinal name.
 
     ``counts[axis_id]`` tracks how many same-axis ancestors the current

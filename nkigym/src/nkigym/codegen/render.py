@@ -1,6 +1,6 @@
 """Render orchestrator — runs lowering passes in order.
 
-The lowering pipeline is split across :mod:`nkigym.codegen.lowering`:
+The lowering pipeline is split across :mod:`nkigym.codegen`:
 
 1. :mod:`inject_annotations` — consume ``SBlock`` / ``ForNode``
    annotations (e.g. ``buffer_degree`` widens ``Tensor.buffer_degree``
@@ -14,16 +14,16 @@ The lowering pipeline is split across :mod:`nkigym.codegen.lowering`:
    :mod:`emit_ops`.
 """
 
-from nkigym.codegen.ir import KernelModule
-from nkigym.codegen.lowering.canonicalize_names import canonicalize_iter_var_names
-from nkigym.codegen.lowering.emit_source import emit_source
-from nkigym.codegen.lowering.inject_annotations import inject_annotations
-from nkigym.codegen.lowering.place_buffers import place_buffers
+from nkigym.codegen.canonicalize_names import canonicalize_iter_var_names
+from nkigym.codegen.emit_source import emit_source
+from nkigym.codegen.inject_annotations import inject_annotations
+from nkigym.codegen.place_buffers import place_buffers
+from nkigym.ir.ir import KernelIR
 
 __all__ = ["render"]
 
 
-def render(module: KernelModule) -> str:
+def render(module: KernelIR) -> str:
     """Run lowering passes and emit NKI source for ``module``.
 
     Pipeline:

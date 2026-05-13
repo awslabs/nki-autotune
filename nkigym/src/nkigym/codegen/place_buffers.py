@@ -19,10 +19,10 @@ Param tensors and return-HBM tensors are untouched — their shape comes
 from input_specs / alloc declaration.
 """
 
-from nkigym.codegen.ir import BufferAccess, ForNode, IterVar, KernelModule, SBlock, Tensor
+from nkigym.ir.ir import BufferAccess, ForNode, IterVar, KernelIR, SBlock, Tensor
 
 
-def place_buffers(module: KernelModule) -> None:
+def place_buffers(module: KernelIR) -> None:
     """Mutate intermediate SBUF/PSUM tensor shapes in place."""
     for tensor in module.tensors.values():
         if tensor.origin == "param":
@@ -32,7 +32,7 @@ def place_buffers(module: KernelModule) -> None:
         _place_one(module, tensor)
 
 
-def _place_one(module: KernelModule, tensor: Tensor) -> None:
+def _place_one(module: KernelIR, tensor: Tensor) -> None:
     """Derive N-D SBUF/PSUM shape for one intermediate tensor.
 
     1D logical tensors (e.g. ``reduce_res``, ``operand0``) promote to 3D
@@ -84,7 +84,7 @@ def _place_one(module: KernelModule, tensor: Tensor) -> None:
     tensor.shape = tuple(shape_parts)
 
 
-def _find_writer_access(module: KernelModule, tensor_name: str) -> BufferAccess | None:
+def _find_writer_access(module: KernelIR, tensor_name: str) -> BufferAccess | None:
     """Return the RMW writer's access if any exists; else the first non-RMW writer.
 
     Under per-op tile sizes, different writers to the same tensor can
@@ -122,7 +122,7 @@ def _find_writer_access(module: KernelModule, tensor_name: str) -> BufferAccess 
     return rmw_writer if rmw_writer is not None else first_non_rmw
 
 
-def _find_accesses(module: KernelModule, tensor_name: str) -> list[tuple[SBlock, tuple[IterVar, ...]]]:
+def _find_accesses(module: KernelIR, tensor_name: str) -> list[tuple[SBlock, tuple[IterVar, ...]]]:
     """Return ``(block, ancestor_iter_vars)`` for every SBlock touching ``tensor_name``.
 
     The ancestor tuple is ordered root-first so the common prefix across
@@ -150,7 +150,7 @@ def _find_accesses(module: KernelModule, tensor_name: str) -> list[tuple[SBlock,
 
 
 def _required_tiles(
-    module: KernelModule, accesses: list[tuple[SBlock, tuple[IterVar, ...]]], per_axis_tile: dict[int, int]
+    module: KernelIR, accesses: list[tuple[SBlock, tuple[IterVar, ...]]], per_axis_tile: dict[int, int]
 ) -> dict[int, int]:
     """Per-axis required slot count based on common-prefix iter vars.
 

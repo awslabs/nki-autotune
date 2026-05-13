@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace nkigym's three-structure IR (OpGraph + LoopForest + DepGraph) with TVM-aligned KernelModule + TreeIR (self-describing leaves) + per-scope DepCache. Grow the transform set from four atoms to nine: Split, Fuse, Reorder, ComputeAt, ReverseComputeAt, DecomposeReduction, HoistInvariant, MultiBuffer, SoftwarePipeline. Split renderer into a six-stage pass pipeline.
+**Goal:** Replace nkigym's three-structure IR (OpGraph + LoopForest + DepGraph) with TVM-aligned KernelIR + TreeIR (self-describing leaves) + per-scope DepCache. Grow the transform set from four atoms to nine: Split, Fuse, Reorder, ComputeAt, ReverseComputeAt, DecomposeReduction, HoistInvariant, MultiBuffer, SoftwarePipeline. Split renderer into a six-stage pass pipeline.
 
-**Architecture:** `KernelModule` is the envelope (signature + tensor/dim declarations + tree body + DepCache). `TreeIR` is the schedule tree with self-describing `BodyLeaf`s carrying op metadata directly (no op_idx back-reference). `DepCache` is a per-scope lazy cache that rebuilds subtree signatures on read. Nine transform atoms operate on `KernelModule`; each has narrow legality rules. Renderer splits into six passes: `LowerDecomposedReduction`, `InjectMultiBuffer`, `InjectSoftwarePipeline`, `LowerPhases`, `PlaceBuffers`, `EmitSource`.
+**Architecture:** `KernelIR` is the envelope (signature + tensor/dim declarations + tree body + DepCache). `TreeIR` is the schedule tree with self-describing `BodyLeaf`s carrying op metadata directly (no op_idx back-reference). `DepCache` is a per-scope lazy cache that rebuilds subtree signatures on read. Nine transform atoms operate on `KernelIR`; each has narrow legality rules. Renderer splits into six passes: `LowerDecomposedReduction`, `InjectMultiBuffer`, `InjectSoftwarePipeline`, `LowerPhases`, `PlaceBuffers`, `EmitSource`.
 
 **Tech Stack:** Python 3.12, `dataclasses`, Apache NKI (neuronx-cc), pytest. Environment: `source ~/venvs/kernel-env/bin/activate`.
 
@@ -29,9 +29,9 @@
 
 ```
 nkigym/src/nkigym/codegen/
-  ir.py                                    # KernelModule, TreeIR, LoopNode, BodyLeaf, Tensor, DimInfo, OpLocalBuffer
+  ir.py                                    # KernelIR, TreeIR, LoopNode, BodyLeaf, Tensor, DimInfo, OpLocalBuffer
   dep_cache.py                             # DepCache, SBlockScope, Dependency, DepKind, LeafId, ScopeId
-  canonical.py                             # build_canonical_module(func, input_specs) → KernelModule
+  canonical.py                             # build_initial_ir(func, input_specs) → KernelIR
   lowering/
     __init__.py
     lower_decomposed_reduction.py
@@ -51,9 +51,9 @@ nkigym/src/nkigym/tune/
   hoist_invariant.py                       # HoistInvariant atom
 
 test/codegen/
-  test_ir.py                               # KernelModule / TreeIR construction + invariants
+  test_ir.py                               # KernelIR / TreeIR construction + invariants
   test_dep_cache.py                        # DepCache lazy rebuild + SBlockScope edges
-  test_canonical.py                        # build_canonical_module on matmul + rmsnorm_matmul
+  test_canonical.py                        # build_initial_ir on matmul + rmsnorm_matmul
   test_lowering_multi_buffer.py
   test_lowering_software_pipeline.py
   test_lowering_phases.py
@@ -121,12 +121,12 @@ test/codegen/_rmsnorm_matmul_fixture.py    # update for new IR
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-"""Tests for core IR types in nkigym.codegen.ir."""
+"""Tests for core IR types in nkigym.ir.ir."""
 
-from nkigym.codegen.ir import (
+from nkigym.ir.ir import (
     BodyLeaf,
     DimInfo,
-    KernelModule,
+    KernelIR,
     LoopNode,
     OpLocalBuffer,
     Tensor,
@@ -163,8 +163,8 @@ def test_body_leaf_self_describing_fields():
     assert leaf.kwargs == {"op": "square"}
 
 
-def test_kernel_module_construction():
-    km = KernelModule(
+def test_kernel_ir_construction():
+    km = KernelIR(
         func_name="f",
         param_names=["x"],
         return_name="y",
@@ -183,7 +183,7 @@ source ~/venvs/kernel-env/bin/activate
 pytest test/codegen/test_ir.py -v
 ```
 
-Expected: FAIL with `ImportError: cannot import name 'KernelModule' from 'nkigym.codegen.ir'`.
+Expected: FAIL with `ImportError: cannot import name 'KernelIR' from 'nkigym.ir.ir'`.
 
 - [ ] **Step 3: Write the module**
 
@@ -194,12 +194,12 @@ Create `nkigym/src/nkigym/codegen/ir.py`:
 
 The IR has three roles:
 
-- :class:`KernelModule` — envelope. Holds signature + tensor/dim declarations +
+- :class:`KernelIR` — envelope. Holds signature + tensor/dim declarations +
   tree body + dep cache.
 - :class:`TreeIR` / :class:`LoopNode` / :class:`BodyLeaf` — schedule tree. Leaves
   self-describe all op metadata (no back-reference to a sidecar).
 - :class:`DepCache` — per-scope dependency cache (defined in
-  :mod:`nkigym.codegen.dep_cache`).
+  :mod:`nkigym.ir.dep_cache`).
 
 Analogous to TVM's PrimFunc + buffer_map + SBlockNode. Leaves mirror TVM's
 self-describing blocks.
@@ -208,7 +208,7 @@ self-describing blocks.
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from nkigym.codegen.dep_cache import DepCache
+from nkigym.ir.dep_cache import DepCache
 from nkigym.ops.base import AxisRole
 
 TensorOrigin = Literal["param", "intermediate", "return"]
@@ -310,7 +310,7 @@ TreeIR = list[LoopNode | BodyLeaf]
 
 
 @dataclass
-class KernelModule:
+class KernelIR:
     """Envelope IR — signature + declarations + body + dep cache.
 
     Analog of TVM's PrimFunc + buffer_map.
@@ -346,7 +346,7 @@ Expected: all four tests PASS.
 
 ```bash
 git add nkigym/src/nkigym/codegen/ir.py test/codegen/test_ir.py
-git commit -m "feat(ir): add KernelModule + TreeIR core types"
+git commit -m "feat(ir): add KernelIR + TreeIR core types"
 ```
 
 ---
@@ -362,7 +362,7 @@ git commit -m "feat(ir): add KernelModule + TreeIR core types"
 ```python
 """Tests for dep_cache module."""
 
-from nkigym.codegen.dep_cache import DepCache, DepKind, Dependency, LeafId, SBlockScope
+from nkigym.ir.dep_cache import DepCache, DepKind, Dependency, LeafId, SBlockScope
 
 
 def test_depkind_enum_values():
@@ -528,8 +528,8 @@ git commit -m "feat(ir): add DepCache per-scope dependency cache"
 Append to `test/codegen/test_dep_cache.py`:
 
 ```python
-from nkigym.codegen.ir import BodyLeaf, LoopNode
-from nkigym.codegen.dep_cache import subtree_signature, rebuild_scope
+from nkigym.ir.ir import BodyLeaf, LoopNode
+from nkigym.ir.dep_cache import subtree_signature, rebuild_scope
 from nkigym.ops.base import AxisRole
 
 
@@ -565,7 +565,7 @@ def test_rebuild_scope_produces_raw_edge():
     scope = rebuild_scope(scope_root_children)
     assert len(scope.src2deps) == 1
     edges = next(iter(scope.src2deps.values()))
-    from nkigym.codegen.dep_cache import DepKind
+    from nkigym.ir.dep_cache import DepKind
     assert edges[0].kind == DepKind.RAW
 ```
 
@@ -588,7 +588,7 @@ def subtree_signature(node: "LoopNode | BodyLeaf") -> int:
     Two subtrees produce the same signature iff they have the same tree
     structure and every leaf's read/write sets are equal.
     """
-    from nkigym.codegen.ir import BodyLeaf, LoopNode
+    from nkigym.ir.ir import BodyLeaf, LoopNode
 
     if isinstance(node, BodyLeaf):
         return hash(("leaf", id(node.op_cls), node.phase, tuple(sorted(node.reads.items())), node.writes))
@@ -611,7 +611,7 @@ def rebuild_scope(children: "list[LoopNode | BodyLeaf]") -> SBlockScope:
     Walks every descendant leaf, classifies pair-wise edges by buffer name,
     returns the resulting dep graph.
     """
-    from nkigym.codegen.ir import BodyLeaf
+    from nkigym.ir.ir import BodyLeaf
 
     leaves: list[tuple[LeafId, "BodyLeaf"]] = []
 
@@ -741,8 +741,8 @@ The canonical builder replaces `parse_and_resolve`. Parses the `f_nkigym` AST, r
 import numpy as np
 import pytest
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import BodyLeaf, LoopNode
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import BodyLeaf, LoopNode
 from nkigym.nkigym_decorators import nkigym_kernel
 from nkigym.ops import NKILoad, NKIStore
 from nkigym.ops.compute.matmul import NKIMatmul
@@ -757,12 +757,12 @@ def _matmul_k(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     return out
 
 
-def test_builds_kernel_module_shape():
+def test_builds_kernel_ir_shape():
     input_specs = {
         "lhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
         "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
     }
-    km = build_canonical_module(_matmul_k, input_specs)
+    km = build_initial_ir(_matmul_k, input_specs)
     assert km.func_name == "_matmul_k"
     assert km.param_names == ["lhs", "rhs"]
     assert len(km.body) == 4  # one tree per op (load, load, matmul, store)
@@ -773,7 +773,7 @@ def test_leaves_are_self_describing():
         "lhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
         "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
     }
-    km = build_canonical_module(_matmul_k, input_specs)
+    km = build_initial_ir(_matmul_k, input_specs)
 
     # Walk to a body leaf for the matmul tree (tree index 2).
     def find_first_leaf(node):
@@ -797,7 +797,7 @@ def test_canonical_loop_names_assigned():
         "lhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
         "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
     }
-    km = build_canonical_module(_matmul_k, input_specs)
+    km = build_initial_ir(_matmul_k, input_specs)
     root = km.body[0]
     assert isinstance(root, LoopNode)
     assert root.name is not None
@@ -810,7 +810,7 @@ def test_canonical_loop_names_assigned():
 pytest test/codegen/test_canonical.py -v
 ```
 
-Expected: FAIL with ImportError on `build_canonical_module`.
+Expected: FAIL with ImportError on `build_initial_ir`.
 
 - [ ] **Step 3: Copy then adapt parsing code from graph.py**
 
@@ -818,7 +818,7 @@ Create `nkigym/src/nkigym/codegen/canonical.py` — port the AST parsing + axis 
 
 Structure:
 ```python
-"""Build a canonical :class:`KernelModule` from an ``f_nkigym`` callable.
+"""Build a canonical :class:`KernelIR` from an ``f_nkigym`` callable.
 
 Pipeline:
     1. AST-parse the math function to an ordered list of parsed-op records.
@@ -839,10 +839,10 @@ from typing import Any
 
 import numpy as np
 
-from nkigym.codegen.ir import (
+from nkigym.ir.ir import (
     BodyLeaf,
     DimInfo,
-    KernelModule,
+    KernelIR,
     LoopNode,
     OpLocalBuffer,
     Tensor,
@@ -873,9 +873,9 @@ Full content: read the corresponding blocks from `graph.py` (lines 183-400) and 
 
 1. `BodyLeaf(op_idx=op.idx, phase=...)` → `BodyLeaf(op_cls=op.op_cls, phase=..., reads=op.operand_names, writes=tuple(op.output_names), kwargs=op.op_kwargs, axis_map=op.axis_map, dim_role=op.dim_role, op_local_buffers=op.op_local_buffers)`.
 
-2. Final return wraps into `KernelModule` instead of `OpGraph`:
+2. Final return wraps into `KernelIR` instead of `OpGraph`:
 ```python
-def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict) -> KernelModule:
+def build_initial_ir(func: Callable[..., np.ndarray], input_specs: dict) -> KernelIR:
     raws, return_name = _parse_ast(func)
     ops = _unify_axes(raws)
     dims = _derive_dims(ops, input_specs)
@@ -884,7 +884,7 @@ def build_canonical_module(func: Callable[..., np.ndarray], input_specs: dict) -
     body = [_build_tree(op, dims) for op in ops]
     for tree in body:
         _assign_canonical_names(tree, same_dim_counts={})
-    return KernelModule(
+    return KernelIR(
         func_name=func.__name__,
         param_names=_extract_params(func),
         return_name=return_name,
@@ -924,7 +924,7 @@ Path-resolution helpers are used by every transform. Add them on the `ir` module
 Append to `test/codegen/test_ir.py`:
 
 ```python
-from nkigym.codegen.ir import resolve_node, replace_at_path, leaves_under
+from nkigym.ir.ir import resolve_node, replace_at_path, leaves_under
 
 
 def test_resolve_node_returns_leaf():
@@ -1059,7 +1059,7 @@ git commit -m "feat(ir): add path-resolution helpers (resolve/replace/leaves_und
 - Modify: `nkigym/src/nkigym/codegen/render.py`
 - Test: move old renderer tests to skip temporarily
 
-Goal: get `render(module) → str` working on the new `KernelModule` so examples can run end-to-end. The pipeline split happens in a later task.
+Goal: get `render(module) → str` working on the new `KernelIR` so examples can run end-to-end. The pipeline split happens in a later task.
 
 - [ ] **Step 1: Read current render.py to know what needs to change**
 
@@ -1071,17 +1071,17 @@ Confirm it is 1312 lines. The strategy: replace every `op_graph` parameter with 
 
 - [ ] **Step 2: Rewrite render.py imports and top-level signatures**
 
-Replace first 15 lines of `render.py` to import from `nkigym.codegen.ir` instead of `graph` / `loop_forest` / `dep_graph`:
+Replace first 15 lines of `render.py` to import from `nkigym.ir.ir` instead of `graph` / `loop_forest` / `dep_graph`:
 
 ```python
-"""``render``: lower a :class:`KernelModule` to NKI source via tree walk."""
+"""``render``: lower a :class:`KernelIR` to NKI source via tree walk."""
 
 from collections.abc import Callable
 
-from nkigym.codegen.dep_cache import ScopeId
-from nkigym.codegen.ir import (
+from nkigym.ir.dep_cache import ScopeId
+from nkigym.ir.ir import (
     BodyLeaf,
-    KernelModule,
+    KernelIR,
     LoopNode,
     Tensor,
     TreeIR,
@@ -1090,15 +1090,15 @@ from nkigym.codegen.ir import (
 )
 ```
 
-Then walk the file; every reference to `op_graph: OpGraph` becomes `module: KernelModule`. Every `forest: LoopForest` becomes `forest: TreeIR` (or derive from `module.body`). Every `leaf.op_idx` lookup against `op_graph.ops[idx]` becomes direct attribute access on the leaf.
+Then walk the file; every reference to `op_graph: OpGraph` becomes `module: KernelIR`. Every `forest: LoopForest` becomes `forest: TreeIR` (or derive from `module.body`). Every `leaf.op_idx` lookup against `op_graph.ops[idx]` becomes direct attribute access on the leaf.
 
 - [ ] **Step 3: Update `render(module) → str` entry point**
 
 The existing `render(op_graph, forest)` signature becomes:
 
 ```python
-def render(module: KernelModule) -> str:
-    """Lower a :class:`KernelModule` to NKI source.
+def render(module: KernelIR) -> str:
+    """Lower a :class:`KernelIR` to NKI source.
 
     The output is a single ``@nki.jit`` function ready to write to a file and
     compile with ``neuronx-cc``.
@@ -1121,7 +1121,7 @@ These depend on dep info. Port `_find_access_paths` to use `module.dep.for_scope
 
 Equivalent:
 ```python
-def _find_access_paths(tensor_name: str, module: KernelModule) -> list[list[LoopNode | BodyLeaf]]:
+def _find_access_paths(tensor_name: str, module: KernelIR) -> list[list[LoopNode | BodyLeaf]]:
     """Root-to-leaf paths for every leaf that reads or writes ``tensor_name``."""
     paths: list[list[LoopNode | BodyLeaf]] = []
 
@@ -1164,10 +1164,10 @@ mv test/codegen/test_render_derivation.py test/codegen/test_render_derivation.py
 # Run as a one-shot ad-hoc test
 source ~/venvs/kernel-env/bin/activate
 python -c "
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
-module = build_canonical_module(f_nkigym, INPUT_SPECS)
+module = build_initial_ir(f_nkigym, INPUT_SPECS)
 source = render(module)
 assert 'def matmul_lhsT_rhs' in source or 'def f_nkigym' in source
 assert 'nc_matmul' in source
@@ -1181,7 +1181,7 @@ Expected: `smoke test: PASS`. If it fails, re-read the specific error and fix th
 
 ```bash
 git add nkigym/src/nkigym/codegen/render.py test/codegen/test_render.py.old test/codegen/test_render_annotated.py.old test/codegen/test_render_derivation.py.old
-git commit -m "feat(ir): port renderer to KernelModule + self-describing leaves"
+git commit -m "feat(ir): port renderer to KernelIR + self-describing leaves"
 ```
 
 ---
@@ -1201,9 +1201,9 @@ Expected: hits on `parse_and_resolve`, `build_canonical_forest`, `render(op_grap
 
 - [ ] **Step 2: Replace calls**
 
-- `from nkigym.codegen.graph import ... parse_and_resolve` → `from nkigym.codegen.canonical import build_canonical_module`
-- `parse_and_resolve(func, input_specs)` → `build_canonical_module(func, input_specs)`
-- Delete references to `build_canonical_forest(op_graph)` — the canonical tree is built inside `build_canonical_module` now; the single returned object holds everything.
+- `from nkigym.codegen.graph import ... parse_and_resolve` → `from nkigym.ir.build import build_initial_ir`
+- `parse_and_resolve(func, input_specs)` → `build_initial_ir(func, input_specs)`
+- Delete references to `build_canonical_forest(op_graph)` — the canonical tree is built inside `build_initial_ir` now; the single returned object holds everything.
 - `render(op_graph, forest)` → `render(module)`
 
 - [ ] **Step 3: Run a smoke test**
@@ -1219,12 +1219,12 @@ Expected: run reaches CPU sim or HW profile without IR-related ImportErrors.
 
 ```bash
 git add nkigym/src/nkigym/compile.py
-git commit -m "refactor(compile): use new IR (KernelModule + canonical builder)"
+git commit -m "refactor(compile): use new IR (KernelIR + canonical builder)"
 ```
 
 ---
 
-## Task 8: Define KernelRewrite protocol over KernelModule
+## Task 8: Define KernelRewrite protocol over KernelIR
 
 **Files:**
 - Modify: `nkigym/src/nkigym/tune/__init__.py`
@@ -1237,24 +1237,24 @@ Replace `nkigym/src/nkigym/tune/__init__.py`:
 """Performance tuning for nkigym kernels.
 
 Every rewrite conforms to :class:`KernelRewrite` — ``is_legal(module)`` →
-``apply(module) -> KernelModule``.
+``apply(module) -> KernelIR``.
 """
 
 from typing import Protocol, runtime_checkable
 
-from nkigym.codegen.ir import KernelModule
+from nkigym.ir.ir import KernelIR
 
 
 @runtime_checkable
 class KernelRewrite(Protocol):
     """A performance-related kernel transform."""
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         """Return ``True`` when the rewrite is applicable to the current state."""
         ...
 
-    def apply(self, module: KernelModule) -> KernelModule:
-        """Return the post-transform :class:`KernelModule`.
+    def apply(self, module: KernelIR) -> KernelIR:
+        """Return the post-transform :class:`KernelIR`.
 
         Callers must check :meth:`is_legal` first; ``apply`` on an illegal
         input is not guaranteed to raise.
@@ -1269,7 +1269,7 @@ __all__ = ["KernelRewrite"]
 
 ```bash
 git add nkigym/src/nkigym/tune/__init__.py
-git commit -m "refactor(tune): KernelRewrite protocol takes KernelModule"
+git commit -m "refactor(tune): KernelRewrite protocol takes KernelIR"
 ```
 
 ---
@@ -1280,7 +1280,7 @@ git commit -m "refactor(tune): KernelRewrite protocol takes KernelModule"
 - Modify: `nkigym/src/nkigym/tune/multi_buffer.py`
 - Rewrite tests: `test/codegen/test_multi_buffer_unit.py`
 
-- [ ] **Step 1: Rewrite the atom to work on KernelModule**
+- [ ] **Step 1: Rewrite the atom to work on KernelIR**
 
 The data structure edit is tiny — `MultiBuffer` only mutates `Tensor.buffer_degree`. Rewrite `multi_buffer.py`:
 
@@ -1289,7 +1289,7 @@ The data structure edit is tiny — `MultiBuffer` only mutates `Tensor.buffer_de
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import KernelModule
+from nkigym.ir.ir import KernelIR
 
 
 @dataclass(frozen=True)
@@ -1306,7 +1306,7 @@ class MultiBuffer:
     dim_id: str
     degree: int
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         if self.tensor_name not in module.tensors:
             return False
         t = module.tensors[self.tensor_name]
@@ -1315,7 +1315,7 @@ class MultiBuffer:
         num_t = module.dims[self.dim_id].num_tiles
         return 1 <= self.degree <= num_t
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         old_t = module.tensors[self.tensor_name]
         new_degree = dict(old_t.buffer_degree)
         new_degree[self.dim_id] = self.degree
@@ -1324,7 +1324,7 @@ class MultiBuffer:
         return replace(module, tensors=new_tensors)
 
 
-def enumerate_multi_buffer_atoms(module: KernelModule) -> list[MultiBuffer]:
+def enumerate_multi_buffer_atoms(module: KernelIR) -> list[MultiBuffer]:
     """Every legal ``(tensor, dim, degree)`` atom on non-param intermediates.
 
     Params and returns are HBM — multi-buffering doesn't apply.
@@ -1351,14 +1351,14 @@ Replace `test/codegen/test_multi_buffer_unit.py`:
 
 import pytest
 
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.tune.multi_buffer import MultiBuffer, enumerate_multi_buffer_atoms
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
 
 
 @pytest.fixture
 def module():
-    return build_canonical_module(f_nkigym, INPUT_SPECS)
+    return build_initial_ir(f_nkigym, INPUT_SPECS)
 
 
 def test_multi_buffer_mutates_tensor_degree(module):
@@ -1398,7 +1398,7 @@ Expected: all tests PASS.
 
 ```bash
 git add nkigym/src/nkigym/tune/multi_buffer.py test/codegen/test_multi_buffer_unit.py
-git commit -m "feat(tune): port MultiBuffer to KernelModule"
+git commit -m "feat(tune): port MultiBuffer to KernelIR"
 ```
 
 ---
@@ -1418,7 +1418,7 @@ git commit -m "feat(tune): port MultiBuffer to KernelModule"
 
 from dataclasses import dataclass
 
-from nkigym.codegen.ir import KernelModule, LoopNode, replace_at_path, resolve_node
+from nkigym.ir.ir import KernelIR, LoopNode, replace_at_path, resolve_node
 
 
 @dataclass(frozen=True)
@@ -1428,7 +1428,7 @@ class SoftwarePipeline:
     loop_path: tuple[int, ...]
     depth: int
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         target = resolve_node(module.body, self.loop_path)
         if not isinstance(target, LoopNode):
             return False
@@ -1437,7 +1437,7 @@ class SoftwarePipeline:
         chain = _chain_length_of_subtree(target)
         return self.depth == chain
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         target = resolve_node(module.body, self.loop_path)
         assert isinstance(target, LoopNode)
         new_target = LoopNode(
@@ -1457,11 +1457,11 @@ class SoftwarePipeline:
 def _chain_length_of_subtree(loop: LoopNode) -> int:
     """Chain length = number of distinct BodyLeaf phases in the subtree that
     form a linear producer-consumer chain. Simple heuristic: count leaves."""
-    from nkigym.codegen.ir import BodyLeaf, leaves_under
+    from nkigym.ir.ir import BodyLeaf, leaves_under
     return sum(1 for leaf in leaves_under(loop))
 
 
-def enumerate_software_pipeline_atoms(module: KernelModule) -> list[SoftwarePipeline]:
+def enumerate_software_pipeline_atoms(module: KernelIR) -> list[SoftwarePipeline]:
     """Every legal SoftwarePipeline atom (one per LoopNode with a chain > 1)."""
     atoms: list[SoftwarePipeline] = []
 
@@ -1485,14 +1485,14 @@ def enumerate_software_pipeline_atoms(module: KernelModule) -> list[SoftwarePipe
 
 import pytest
 
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.tune.software_pipeline import SoftwarePipeline
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
 
 
 @pytest.fixture
 def module():
-    return build_canonical_module(f_nkigym, INPUT_SPECS)
+    return build_initial_ir(f_nkigym, INPUT_SPECS)
 
 
 def test_software_pipeline_sets_depth(module):
@@ -1503,7 +1503,7 @@ def test_software_pipeline_sets_depth(module):
 
 
 def _expected_chain(module, path):
-    from nkigym.codegen.ir import leaves_under, resolve_node
+    from nkigym.ir.ir import leaves_under, resolve_node
     loop = resolve_node(module.body, path)
     return sum(1 for _ in leaves_under(loop))
 ```
@@ -1520,7 +1520,7 @@ Expected: tests PASS.
 
 ```bash
 git add nkigym/src/nkigym/tune/software_pipeline.py test/codegen/test_software_pipeline_unit.py
-git commit -m "feat(tune): port SoftwarePipeline to KernelModule"
+git commit -m "feat(tune): port SoftwarePipeline to KernelIR"
 ```
 
 ---
@@ -1538,14 +1538,14 @@ git commit -m "feat(tune): port SoftwarePipeline to KernelModule"
 ```python
 """Unit tests for the Reorder atom."""
 
-from nkigym.codegen.ir import BodyLeaf, LoopNode, KernelModule, resolve_node
-from nkigym.codegen.dep_cache import DepCache
+from nkigym.ir.ir import BodyLeaf, LoopNode, KernelIR, resolve_node
+from nkigym.ir.dep_cache import DepCache
 from nkigym.ops.base import AxisRole
 from nkigym.tune.reorder import Reorder
 
 
 def _mod_with_body(body):
-    return KernelModule(
+    return KernelIR(
         func_name="f", param_names=[], return_name="x",
         tensors={}, dims={}, body=body, dep=DepCache(scopes={}),
     )
@@ -1606,10 +1606,10 @@ Create `nkigym/src/nkigym/tune/reorder.py`:
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.dep_cache import ScopeId
-from nkigym.codegen.ir import (
+from nkigym.ir.dep_cache import ScopeId
+from nkigym.ir.ir import (
     BodyLeaf,
-    KernelModule,
+    KernelIR,
     LoopNode,
     leaves_under,
     replace_at_path,
@@ -1635,7 +1635,7 @@ class Reorder:
     outer_path: tuple[int, ...]
     inner_path: tuple[int, ...]
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         if self.inner_path != self.outer_path + (0,):
             return False
         outer = resolve_node(module.body, self.outer_path)
@@ -1646,7 +1646,7 @@ class Reorder:
             return False
         return _roles_commute(outer, inner, module)
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         outer = resolve_node(module.body, self.outer_path)
         assert isinstance(outer, LoopNode)
         inner = outer.children[0]
@@ -1673,7 +1673,7 @@ class Reorder:
         return replace(module, body=new_body)
 
 
-def _roles_commute(a: LoopNode, b: LoopNode, module: KernelModule) -> bool:
+def _roles_commute(a: LoopNode, b: LoopNode, module: KernelIR) -> bool:
     """Role-pair + subtree-purity legality."""
     if a.role == AxisRole.SEQUENTIAL or b.role == AxisRole.SEQUENTIAL:
         return False
@@ -1700,7 +1700,7 @@ def _subtree_pure_wrt_dim(node: LoopNode | BodyLeaf, par_dim: str) -> bool:
     return True
 
 
-def enumerate_reorder_atoms(module: KernelModule) -> list[Reorder]:
+def enumerate_reorder_atoms(module: KernelIR) -> list[Reorder]:
     """Every legal adjacent-swap atom in the forest."""
     atoms: list[Reorder] = []
 
@@ -1754,9 +1754,9 @@ git commit -m "feat(tune): new Reorder atom with subtree-purity legality"
 ```python
 """Unit tests for ComputeAt atom."""
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, resolve_node
-from nkigym.codegen.dep_cache import DepCache
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, resolve_node
+from nkigym.ir.dep_cache import DepCache
+from nkigym.ir.build import build_initial_ir
 from nkigym.ops.base import AxisRole
 from nkigym.tune.compute_at import ComputeAt, enumerate_compute_at_atoms
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
@@ -1766,13 +1766,13 @@ def test_compute_at_subsumes_fuse_loops_on_matmul():
     """In canonical matmul, the rhs_load tree precedes the matmul tree. ComputeAt
     moving the rhs_load leaf under the matmul's outer M loop should produce a
     fused nest where rhs_load sits inside M."""
-    module = build_canonical_module(f_nkigym, INPUT_SPECS)
+    module = build_initial_ir(f_nkigym, INPUT_SPECS)
     atoms = enumerate_compute_at_atoms(module)
     assert atoms  # should at least emit producer-into-consumer moves
 
 
 def test_compute_at_applies_and_regenerates_loops():
-    module = build_canonical_module(f_nkigym, INPUT_SPECS)
+    module = build_initial_ir(f_nkigym, INPUT_SPECS)
     atoms = enumerate_compute_at_atoms(module)
     assert atoms
     atom = atoms[0]
@@ -1808,10 +1808,10 @@ After apply, loop names are re-canonicalized.
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.dep_cache import DepCache, DepKind, ScopeId
-from nkigym.codegen.ir import (
+from nkigym.ir.dep_cache import DepCache, DepKind, ScopeId
+from nkigym.ir.ir import (
     BodyLeaf,
-    KernelModule,
+    KernelIR,
     LoopNode,
     TreeIR,
     leaves_under,
@@ -1832,7 +1832,7 @@ class ComputeAt:
     leaf_path: tuple[int, ...]
     target_loop_path: tuple[int, ...]
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         leaf = resolve_node(module.body, self.leaf_path)
         if not isinstance(leaf, BodyLeaf):
             return False
@@ -1847,7 +1847,7 @@ class ComputeAt:
         )
         return consumer_ok
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         leaf = resolve_node(module.body, self.leaf_path)
         assert isinstance(leaf, BodyLeaf)
         # 1. Remove leaf from its current position.
@@ -1916,12 +1916,12 @@ def _ancestor_dims(body: TreeIR, path: tuple[int, ...]) -> set[str]:
     return dims
 
 
-def _leaf_touched_dims(leaf: BodyLeaf, module: KernelModule) -> list[str]:
+def _leaf_touched_dims(leaf: BodyLeaf, module: KernelIR) -> list[str]:
     """Return distinct concrete dim_ids referenced by leaf's metadata."""
     return list({d for d in leaf.dim_role.keys()})
 
 
-def _wrap_leaf_with_dims(leaf: BodyLeaf, dims: list[str], module: KernelModule) -> LoopNode | BodyLeaf:
+def _wrap_leaf_with_dims(leaf: BodyLeaf, dims: list[str], module: KernelIR) -> LoopNode | BodyLeaf:
     """Wrap leaf in the 2N-per-dim canonical chain over ``dims``.
 
     Returns the leaf directly if ``dims`` is empty.
@@ -1984,7 +1984,7 @@ def _rename_canonical(body: TreeIR) -> TreeIR:
     return [walk(root, {}) for root in body]
 
 
-def enumerate_compute_at_atoms(module: KernelModule) -> list[ComputeAt]:
+def enumerate_compute_at_atoms(module: KernelIR) -> list[ComputeAt]:
     """Emit one atom per (leaf, target_loop) pair where legality holds.
 
     The enumerator walks every leaf in the forest and every LoopNode that's
@@ -2096,14 +2096,14 @@ git commit -m "refactor(tune): delete FuseLoops (subsumed by ComputeAt)"
 ```python
 """Unit tests for Split atom."""
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, resolve_node
-from nkigym.codegen.dep_cache import DepCache
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, resolve_node
+from nkigym.ir.dep_cache import DepCache
 from nkigym.ops.base import AxisRole
 from nkigym.tune.split import Split
 
 
 def _mod(body):
-    return KernelModule(
+    return KernelIR(
         func_name="f", param_names=[], return_name="x",
         tensors={}, dims={}, body=body, dep=DepCache(scopes={}),
     )
@@ -2166,7 +2166,7 @@ TVM's LoopPartition semantics.
 from copy import deepcopy
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, resolve_node
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, resolve_node
 
 
 @dataclass(frozen=True)
@@ -2176,7 +2176,7 @@ class Split:
     loop_path: tuple[int, ...]
     factor: int
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         if self.factor < 1:
             return False
         target = resolve_node(module.body, self.loop_path)
@@ -2184,7 +2184,7 @@ class Split:
             return False
         return True
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         target = resolve_node(module.body, self.loop_path)
         assert isinstance(target, LoopNode)
         n = target.trip_count
@@ -2248,7 +2248,7 @@ def _replace_with_siblings(
     return [*body[:idx], new_parent, *body[idx + 1 :]]
 
 
-def enumerate_split_atoms(module: KernelModule) -> list[Split]:
+def enumerate_split_atoms(module: KernelIR) -> list[Split]:
     """Emit one atom per (LoopNode, divisor factor). Divisors only, for brevity."""
     atoms: list[Split] = []
 
@@ -2294,14 +2294,14 @@ git commit -m "feat(tune): add Split atom (LoopPartition-style tail)"
 ```python
 """Unit tests for Fuse atom."""
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, resolve_node
-from nkigym.codegen.dep_cache import DepCache
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, resolve_node
+from nkigym.ir.dep_cache import DepCache
 from nkigym.ops.base import AxisRole
 from nkigym.tune.fuse import Fuse
 
 
 def _mod(body):
-    return KernelModule(
+    return KernelIR(
         func_name="f", param_names=[], return_name="x",
         tensors={}, dims={}, body=body, dep=DepCache(scopes={}),
     )
@@ -2344,7 +2344,7 @@ usage of the two separate loop vars is restored by emit-time div/mod math
 
 from dataclasses import dataclass, field, replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, replace_at_path, resolve_node
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, replace_at_path, resolve_node
 from nkigym.ops.base import AxisRole
 
 
@@ -2363,7 +2363,7 @@ class Fuse:
     outer_path: tuple[int, ...]
     inner_path: tuple[int, ...]
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         if self.inner_path != self.outer_path + (0,):
             return False
         outer = resolve_node(module.body, self.outer_path)
@@ -2380,7 +2380,7 @@ class Fuse:
             return outer.reduce_op == inner.reduce_op and outer.reduce_op is not None
         return True
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         outer = resolve_node(module.body, self.outer_path)
         inner = outer.children[0]
         fused_dim = FusedDim(
@@ -2397,18 +2397,18 @@ class Fuse:
             reduce_op=outer.reduce_op,
             name=None,
         )
-        """Stash FusedDim metadata on the KernelModule for renderer lookup.
+        """Stash FusedDim metadata on the KernelIR for renderer lookup.
         Keyed by the fused loop's synthetic dim_id."""
         fused_map = dict(getattr(module, "_fused_dims", {}))
         fused_map[fused.dim_id] = fused_dim
         new_body = replace_at_path(module.body, self.outer_path, fused)
         new_module = replace(module, body=new_body)
-        # Attach via setattr (KernelModule tolerates extra attrs via dataclass default).
+        # Attach via setattr (KernelIR tolerates extra attrs via dataclass default).
         object.__setattr__(new_module, "_fused_dims", fused_map)
         return new_module
 
 
-def enumerate_fuse_atoms(module: KernelModule) -> list[Fuse]:
+def enumerate_fuse_atoms(module: KernelIR) -> list[Fuse]:
     atoms: list[Fuse] = []
 
     def walk(node, path):
@@ -2453,14 +2453,14 @@ git commit -m "feat(tune): add Fuse atom (iter-space collapse)"
 ```python
 """Unit tests for HoistInvariant atom."""
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, resolve_node
-from nkigym.codegen.dep_cache import DepCache
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, resolve_node
+from nkigym.ir.dep_cache import DepCache
 from nkigym.ops.base import AxisRole
 from nkigym.tune.hoist_invariant import HoistInvariant
 
 
 def _mod(body, dims=None):
-    return KernelModule(
+    return KernelIR(
         func_name="f", param_names=[], return_name="x",
         tensors={}, dims=dims or {}, body=body, dep=DepCache(scopes={}),
     )
@@ -2494,7 +2494,7 @@ consumer is under target_loop_path (otherwise ComputeAt applies instead).
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, leaves_under, resolve_node
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, leaves_under, resolve_node
 
 
 @dataclass(frozen=True)
@@ -2502,7 +2502,7 @@ class HoistInvariant:
     leaf_path: tuple[int, ...]
     target_loop_path: tuple[int, ...]
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         leaf = resolve_node(module.body, self.leaf_path)
         if not isinstance(leaf, BodyLeaf):
             return False
@@ -2516,7 +2516,7 @@ class HoistInvariant:
         leaf_dims = set(leaf.dim_role.keys())
         return not (leaf_dims & crossed_dims)
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         from nkigym.tune.compute_at import _remove_at_path, _append_under, _rename_canonical
         leaf = resolve_node(module.body, self.leaf_path)
         new_body = _remove_at_path(module.body, self.leaf_path)
@@ -2572,8 +2572,8 @@ git commit -m "feat(tune): add HoistInvariant atom (LICM)"
 ```python
 """Unit tests for DecomposeReduction atom."""
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import BodyLeaf, LoopNode, leaves_under, resolve_node
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import BodyLeaf, LoopNode, leaves_under, resolve_node
 from nkigym.tune.decompose_reduction import DecomposeReduction, enumerate_decompose_reduction_atoms
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
 
@@ -2598,7 +2598,7 @@ def _first_matmul_compute_leaf(module):
 
 
 def test_decompose_reduction_produces_three_sibling_trees():
-    module = build_canonical_module(f_nkigym, INPUT_SPECS)
+    module = build_initial_ir(f_nkigym, INPUT_SPECS)
     leaf_path, leaf = _first_matmul_compute_leaf(module)
     assert leaf is not None
     """Pick the outermost (M) loop as target."""
@@ -2611,7 +2611,7 @@ def test_decompose_reduction_produces_three_sibling_trees():
 
 
 def test_enumerate_emits_one_atom_per_reducer_target():
-    module = build_canonical_module(f_nkigym, INPUT_SPECS)
+    module = build_initial_ir(f_nkigym, INPUT_SPECS)
     atoms = enumerate_decompose_reduction_atoms(module)
     assert atoms
 ```
@@ -2636,7 +2636,7 @@ the new positions. Matches TVM's DecomposeReduction semantics.
 from copy import deepcopy
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, leaves_under, resolve_node
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, leaves_under, resolve_node
 from nkigym.ops.base import AxisRole
 
 
@@ -2645,7 +2645,7 @@ class DecomposeReduction:
     leaf_path: tuple[int, ...]
     target_loop_path: tuple[int, ...]
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         leaf = resolve_node(module.body, self.leaf_path)
         if not isinstance(leaf, BodyLeaf):
             return False
@@ -2663,7 +2663,7 @@ class DecomposeReduction:
             return False
         return _is_ancestor(self.target_loop_path, self.leaf_path)
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         """Strategy: locate the reducer op's full nest (containing init,
         compute, drain leaves). Split into three sibling nests; re-attach
         at target_loop_path's level (just before the target_loop).
@@ -2702,7 +2702,7 @@ def _is_ancestor(ancestor: tuple[int, ...], descendant: tuple[int, ...]) -> bool
     return len(ancestor) < len(descendant) and descendant[: len(ancestor)] == ancestor
 
 
-def _find_phase_leaves(target: LoopNode, module: KernelModule):
+def _find_phase_leaves(target: LoopNode, module: KernelIR):
     """Return (init_leaf, update_leaf, drain_leaf) for the reducer inside target.
 
     Single-phase reducers (activation_reduce) have update+close phases but no
@@ -2758,7 +2758,7 @@ def _rebuild_with_leaf(
     return walk(target)
 
 
-def _widen_accumulator(module: KernelModule, update_leaf: BodyLeaf) -> KernelModule:
+def _widen_accumulator(module: KernelIR, update_leaf: BodyLeaf) -> KernelIR:
     """Widen each op_local accumulator buffer in the update leaf's op_local_buffers
     so its shape covers the newly-split spatial iter-space.
 
@@ -2772,7 +2772,7 @@ def _widen_accumulator(module: KernelModule, update_leaf: BodyLeaf) -> KernelMod
     return module
 
 
-def enumerate_decompose_reduction_atoms(module: KernelModule) -> list[DecomposeReduction]:
+def enumerate_decompose_reduction_atoms(module: KernelIR) -> list[DecomposeReduction]:
     atoms: list[DecomposeReduction] = []
 
     def walk(node, path):
@@ -2820,13 +2820,13 @@ git commit -m "feat(tune): add DecomposeReduction atom"
 ```python
 """Unit tests for ReverseComputeAt atom."""
 
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.tune.reverse_compute_at import ReverseComputeAt, enumerate_reverse_compute_at_atoms
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
 
 
 def test_enumerator_emits_atoms():
-    module = build_canonical_module(f_nkigym, INPUT_SPECS)
+    module = build_initial_ir(f_nkigym, INPUT_SPECS)
     atoms = enumerate_reverse_compute_at_atoms(module)
     for atom in atoms:
         assert atom.is_legal(module)
@@ -2844,7 +2844,7 @@ Mirror of ComputeAt: target must contain a producer of the leaf being moved.
 
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, leaves_under, resolve_node
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, leaves_under, resolve_node
 
 
 @dataclass(frozen=True)
@@ -2852,7 +2852,7 @@ class ReverseComputeAt:
     leaf_path: tuple[int, ...]
     target_loop_path: tuple[int, ...]
 
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         leaf = resolve_node(module.body, self.leaf_path)
         if not isinstance(leaf, BodyLeaf):
             return False
@@ -2868,7 +2868,7 @@ class ReverseComputeAt:
         )
         return producer_ok
 
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         from nkigym.tune.compute_at import (
             _ancestor_dims,
             _append_under,
@@ -2887,7 +2887,7 @@ class ReverseComputeAt:
         return replace(module, body=new_body)
 
 
-def enumerate_reverse_compute_at_atoms(module: KernelModule) -> list[ReverseComputeAt]:
+def enumerate_reverse_compute_at_atoms(module: KernelIR) -> list[ReverseComputeAt]:
     from nkigym.tune.compute_at import enumerate_compute_at_atoms
     """Reverse enumerates the dual: every (leaf, loop) where the loop's subtree
     contains a producer of leaf."""
@@ -3058,9 +3058,9 @@ Introduce the pass-pipeline skeleton. Start with a single pass (EmitSource) so w
 Create `nkigym/src/nkigym/codegen/lowering/__init__.py`:
 
 ```python
-"""Lowering pipeline: KernelModule → NKI source, stage by stage.
+"""Lowering pipeline: KernelIR → NKI source, stage by stage.
 
-Each pass takes a KernelModule and returns a KernelModule (or, at the end,
+Each pass takes a KernelIR and returns a KernelIR (or, at the end,
 a string). Passes compose into the ``render`` entry point.
 """
 ```
@@ -3073,14 +3073,14 @@ Create `nkigym/src/nkigym/codegen/lowering/emit_source.py`:
 """Textual NKI Python emission.
 
 This pass is the last step in the pipeline: walks the (post-lowering)
-KernelModule tree and produces source code. No semantic decisions — pure
+KernelIR tree and produces source code. No semantic decisions — pure
 tree-walk-to-string.
 """
 
-from nkigym.codegen.ir import KernelModule
+from nkigym.ir.ir import KernelIR
 
 
-def emit_source(module: KernelModule) -> str:
+def emit_source(module: KernelIR) -> str:
     """Emit NKI Python source for the kernel."""
     # Port the entire body of render.py's render() function here.
     # See render.py for the source to move.
@@ -3105,12 +3105,12 @@ Stages:
     6. EmitSource — final text.
 """
 
-from nkigym.codegen.ir import KernelModule
-from nkigym.codegen.lowering.emit_source import emit_source
+from nkigym.ir.ir import KernelIR
+from nkigym.codegen.emit_source import emit_source
 
 
-def render(module: KernelModule) -> str:
-    """Render the KernelModule to NKI source."""
+def render(module: KernelIR) -> str:
+    """Render the KernelIR to NKI source."""
     # Stages 1–5: currently no-op (the emit_source pass still does everything).
     # Subsequent tasks extract each pass into its own module.
     return emit_source(module)
@@ -3121,10 +3121,10 @@ def render(module: KernelModule) -> str:
 ```bash
 source ~/venvs/kernel-env/bin/activate
 python -c "
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
-module = build_canonical_module(f_nkigym, INPUT_SPECS)
+module = build_initial_ir(f_nkigym, INPUT_SPECS)
 print(len(render(module)), 'chars emitted')
 "
 ```
@@ -3166,10 +3166,10 @@ in one place; emit_source becomes a pure tree-walk.
 
 from dataclasses import replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode
 
 
-def lower_phases(module: KernelModule) -> KernelModule:
+def lower_phases(module: KernelIR) -> KernelIR:
     """Annotate every BodyLeaf with its ISA call-site source snippet."""
     new_body = [_walk(node, module) for node in module.body]
     return replace(module, body=new_body)
@@ -3228,11 +3228,11 @@ if snippet is None:
 - [ ] **Step 4: Update render.py orchestrator**
 
 ```python
-from nkigym.codegen.lowering.emit_source import emit_source
+from nkigym.codegen.emit_source import emit_source
 from nkigym.codegen.lowering.lower_phases import lower_phases
 
 
-def render(module: KernelModule) -> str:
+def render(module: KernelIR) -> str:
     module = lower_phases(module)
     return emit_source(module)
 ```
@@ -3242,14 +3242,14 @@ def render(module: KernelModule) -> str:
 ```python
 """Test lower_phases pass."""
 
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.lowering.lower_phases import lower_phases
-from nkigym.codegen.ir import BodyLeaf, leaves_under
+from nkigym.ir.ir import BodyLeaf, leaves_under
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
 
 
 def test_lower_phases_annotates_every_leaf():
-    module = build_canonical_module(f_nkigym, INPUT_SPECS)
+    module = build_initial_ir(f_nkigym, INPUT_SPECS)
     lowered = lower_phases(module)
     for root in lowered.body:
         for leaf in leaves_under(root):
@@ -3270,10 +3270,10 @@ Expected: PASS.
 
 ```bash
 python -c "
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
-module = build_canonical_module(f_nkigym, INPUT_SPECS)
+module = build_initial_ir(f_nkigym, INPUT_SPECS)
 print(len(render(module)), 'chars emitted')
 "
 ```
@@ -3311,10 +3311,10 @@ the buffer. Emits placement info onto the module for emit_source to consume.
 
 from dataclasses import replace
 
-from nkigym.codegen.ir import BodyLeaf, KernelModule, LoopNode, Tensor, leaves_under
+from nkigym.ir.ir import BodyLeaf, KernelIR, LoopNode, Tensor, leaves_under
 
 
-def place_buffers(module: KernelModule) -> KernelModule:
+def place_buffers(module: KernelIR) -> KernelIR:
     """Compute buffer shapes for every tensor; attach as annotations."""
     # Port the required_tiles + _find_access_paths + _lowest_common_ancestor
     # helpers from render.py. For each tensor in module.tensors:
@@ -3328,11 +3328,11 @@ def place_buffers(module: KernelModule) -> KernelModule:
 
 ```python
 from nkigym.codegen.lowering.lower_phases import lower_phases
-from nkigym.codegen.lowering.place_buffers import place_buffers
-from nkigym.codegen.lowering.emit_source import emit_source
+from nkigym.codegen.place_buffers import place_buffers
+from nkigym.codegen.emit_source import emit_source
 
 
-def render(module: KernelModule) -> str:
+def render(module: KernelIR) -> str:
     module = lower_phases(module)
     module = place_buffers(module)
     return emit_source(module)
@@ -3343,13 +3343,13 @@ def render(module: KernelModule) -> str:
 ```python
 """Test place_buffers pass."""
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.lowering.place_buffers import place_buffers
+from nkigym.ir.build import build_initial_ir
+from nkigym.codegen.place_buffers import place_buffers
 from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
 
 
 def test_place_buffers_preserves_tensor_count():
-    module = build_canonical_module(f_nkigym, INPUT_SPECS)
+    module = build_initial_ir(f_nkigym, INPUT_SPECS)
     placed = place_buffers(module)
     assert len(placed.tensors) == len(module.tensors)
 ```
@@ -3358,7 +3358,7 @@ def test_place_buffers_preserves_tensor_count():
 
 ```bash
 pytest test/codegen/test_lowering_place_buffers.py -v
-python -c "from nkigym.codegen.render import render; from nkigym.codegen.canonical import build_canonical_module; from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS; print(len(render(build_canonical_module(f_nkigym, INPUT_SPECS))))"
+python -c "from nkigym.codegen.render import render; from nkigym.ir.build import build_initial_ir; from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS; print(len(render(build_initial_ir(f_nkigym, INPUT_SPECS))))"
 ```
 
 Expected: both work.
@@ -3387,17 +3387,17 @@ Create `inject_multi_buffer.py` — port the slot-expression code from emit_sour
 ```python
 """InjectMultiBuffer: apply Tensor.buffer_degree to allocation shapes + read/write slot expressions.
 
-Produces a KernelModule where every tensor's emit shape is `base_shape * degree`
+Produces a KernelIR where every tensor's emit shape is `base_shape * degree`
 on each multi-buffered dim, and every leaf's reads/writes carry an additional
 slot-index dimension for the iter-to-slot mapping.
 """
 
 from dataclasses import replace
 
-from nkigym.codegen.ir import KernelModule
+from nkigym.ir.ir import KernelIR
 
 
-def inject_multi_buffer(module: KernelModule) -> KernelModule:
+def inject_multi_buffer(module: KernelIR) -> KernelIR:
     # Port from render.py's multi-buffer inline code. Annotate tensors with
     # `_emit_shape` (post-degree) and leaves with `_slot_exprs` as needed.
     return module
@@ -3415,10 +3415,10 @@ Consumed by emit_source, which prints the three sections when it encounters
 a LoopNode carrying the annotation.
 """
 
-from nkigym.codegen.ir import KernelModule
+from nkigym.ir.ir import KernelIR
 
 
-def inject_software_pipeline(module: KernelModule) -> KernelModule:
+def inject_software_pipeline(module: KernelIR) -> KernelIR:
     # Port from render.py's software-pipeline inline code.
     return module
 ```
@@ -3426,7 +3426,7 @@ def inject_software_pipeline(module: KernelModule) -> KernelModule:
 - [ ] **Step 3: Wire into render.py**
 
 ```python
-def render(module: KernelModule) -> str:
+def render(module: KernelIR) -> str:
     module = inject_multi_buffer(module)
     module = inject_software_pipeline(module)
     module = lower_phases(module)
@@ -3437,7 +3437,7 @@ def render(module: KernelModule) -> str:
 - [ ] **Step 4: Smoke test**
 
 ```bash
-python -c "from nkigym.codegen.render import render; from nkigym.codegen.canonical import build_canonical_module; from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS; print(len(render(build_canonical_module(f_nkigym, INPUT_SPECS))))"
+python -c "from nkigym.codegen.render import render; from nkigym.ir.build import build_initial_ir; from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS; print(len(render(build_initial_ir(f_nkigym, INPUT_SPECS))))"
 ```
 
 Expected: works, same character count.
@@ -3471,10 +3471,10 @@ can derive the correct shared-accumulator shape.
 
 from dataclasses import replace
 
-from nkigym.codegen.ir import KernelModule
+from nkigym.ir.ir import KernelIR
 
 
-def lower_decomposed_reduction(module: KernelModule) -> KernelModule:
+def lower_decomposed_reduction(module: KernelIR) -> KernelIR:
     # For each triplet of init/update/drain sibling trees (identified by sharing
     # a common op_local_buffer), walk each tree and tag the shared buffer's
     # placement scope with the LCA of the three trees' root positions.
@@ -3486,7 +3486,7 @@ This is a no-op for workloads that didn't use DecomposeReduction; invariant hold
 - [ ] **Step 2: Wire into render.py**
 
 ```python
-def render(module: KernelModule) -> str:
+def render(module: KernelIR) -> str:
     module = lower_decomposed_reduction(module)
     module = inject_multi_buffer(module)
     module = inject_software_pipeline(module)
@@ -3517,8 +3517,8 @@ git commit -m "refactor(render): add LowerDecomposedReduction pass"
 import subprocess
 import sys
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import BodyLeaf, LoopNode, resolve_node
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import BodyLeaf, LoopNode, resolve_node
 from nkigym.codegen.render import render
 from nkigym.tune.decompose_reduction import DecomposeReduction, enumerate_decompose_reduction_atoms
 from nkigym.tune.reorder import Reorder
@@ -3526,7 +3526,7 @@ from examples.matmul_lhsT_rhs import f_nkigym, INPUT_SPECS
 
 
 def test_template_kernel_pipeline():
-    module = build_canonical_module(f_nkigym, INPUT_SPECS)
+    module = build_initial_ir(f_nkigym, INPUT_SPECS)
     # Pick first legal DecomposeReduction on the matmul.
     atoms = enumerate_decompose_reduction_atoms(module)
     assert atoms
@@ -3612,7 +3612,7 @@ git commit -m "refactor: complete IR + transforms refactor (TVM-aligned)"
 ## Self-Review Results
 
 **Spec coverage:**
-- KernelModule envelope → Task 1 ✓
+- KernelIR envelope → Task 1 ✓
 - Self-describing BodyLeaf → Task 1 ✓
 - DepCache per-scope + lazy rebuild → Tasks 2, 3 ✓
 - Canonical builder → Task 4 ✓
@@ -3625,7 +3625,7 @@ git commit -m "refactor: complete IR + transforms refactor (TVM-aligned)"
 
 **Placeholder scan:** No "TBD" or "TODO: fill in" left. Task 23 and 24 reference "port from render.py" which is explicit code motion with a concrete source pointer — not a placeholder.
 
-**Type consistency:** `KernelModule` appears with consistent field set throughout. `BodyLeaf` self-describing-field names match across Task 1 (definition) and subsequent tasks consuming them (Tasks 12, 17, etc.).
+**Type consistency:** `KernelIR` appears with consistent field set throughout. `BodyLeaf` self-describing-field names match across Task 1 (definition) and subsequent tasks consuming them (Tasks 12, 17, etc.).
 
 **Ambiguity check:** `Split`'s tail emission resolved to LoopPartition-style (two siblings). `ComputeAt` rename resolved to canonical rename after every apply. `DepCache` resolved to lazy rebuild. All three open questions closed.
 

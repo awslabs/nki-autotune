@@ -41,14 +41,14 @@
 At the top of `test/tune/test_compute_at.py` (after the existing imports), add:
 
 ```python
-from nkigym.codegen.dep_cache import DepCache
-from nkigym.codegen.ir import DimInfo, KernelModule, Tensor
+from nkigym.ir.dep_cache import DepCache
+from nkigym.ir.ir import DimInfo, KernelIR, Tensor
 from nkigym.ops.base import AxisRole
 
 
-def _mod_hand(body: list, dims: dict[str, DimInfo], tensors: dict[str, Tensor]) -> KernelModule:
-    """Build a minimal KernelModule from hand-rolled body / dims / tensors."""
-    return KernelModule(
+def _mod_hand(body: list, dims: dict[str, DimInfo], tensors: dict[str, Tensor]) -> KernelIR:
+    """Build a minimal KernelIR from hand-rolled body / dims / tensors."""
+    return KernelIR(
         func_name="f",
         param_names=[],
         return_name=next(iter(tensors)) if tensors else "x",
@@ -282,7 +282,7 @@ Replace `_wrap_leaf_with_dims` (current lines 169-183) with:
 
 ```python
 def _wrap_leaf_with_dims(
-    leaf: BodyLeaf, dim_trips: list[tuple[str, int]], module: KernelModule
+    leaf: BodyLeaf, dim_trips: list[tuple[str, int]], module: KernelIR
 ) -> LoopNode | BodyLeaf:
     """Wrap ``leaf`` in one LoopNode per ``(dim, trip)`` entry (1N form).
 
@@ -381,14 +381,14 @@ git commit -m "fix: computeat/reverse_computeat regenerate residual trip on part
 If not already present, add the same imports and `_mod_hand` helper used in Task 1 Step 1 to `test/tune/test_reverse_compute_at.py`:
 
 ```python
-from nkigym.codegen.dep_cache import DepCache
-from nkigym.codegen.ir import BodyLeaf, DimInfo, KernelModule, LoopNode, Tensor
+from nkigym.ir.dep_cache import DepCache
+from nkigym.ir.ir import BodyLeaf, DimInfo, KernelIR, LoopNode, Tensor
 from nkigym.ops.base import AxisRole
 from nkigym.tune.reverse_compute_at import ReverseComputeAt
 
 
-def _mod_hand(body: list, dims: dict[str, DimInfo], tensors: dict[str, Tensor]) -> KernelModule:
-    return KernelModule(
+def _mod_hand(body: list, dims: dict[str, DimInfo], tensors: dict[str, Tensor]) -> KernelIR:
+    return KernelIR(
         func_name="f",
         param_names=[],
         return_name=next(iter(tensors)) if tensors else "x",
@@ -615,7 +615,7 @@ git commit -m "test: red for split non-divisor rejection"
 Replace lines 28-36 of `nkigym/src/nkigym/tune/split.py`:
 
 ```python
-    def is_legal(self, module: KernelModule) -> bool:
+    def is_legal(self, module: KernelIR) -> bool:
         """Target must be a LoopNode; ``factor`` must be a positive divisor of ``trip_count``."""
         result: bool
         if self.factor < 1:
@@ -634,7 +634,7 @@ Replace lines 28-36 of `nkigym/src/nkigym/tune/split.py`:
 Replace lines 38-66 with:
 
 ```python
-    def apply(self, module: KernelModule) -> KernelModule:
+    def apply(self, module: KernelIR) -> KernelIR:
         """Replace target with a single outer × inner pair.
 
         Rejects non-divisor factors via :class:`AtomLegalityError` — the
@@ -793,12 +793,12 @@ git commit -m "refactor: canonical builder emits 1N trees"
 Run: `pytest test/ -v 2>&1 | tail -80`
 Expected: list of failing tests. Go through each one:
 
-- If the test constructs a `KernelModule` directly via `_mod([...])` or similar, it doesn't go through `build_canonical_module` — unaffected.
-- If the test calls `build_canonical_module` and asserts on tree shape, update the assertion.
+- If the test constructs a `KernelIR` directly via `_mod([...])` or similar, it doesn't go through `build_initial_ir` — unaffected.
+- If the test calls `build_initial_ir` and asserts on tree shape, update the assertion.
 
 Likely affected:
 - `test/codegen/test_canonical.py` — any `km.body[i]` walk expecting two-tier wrap.
-- `test/codegen/test_place_buffers.py` — if it uses `build_canonical_module`.
+- `test/codegen/test_place_buffers.py` — if it uses `build_initial_ir`.
 - `test/codegen/test_dep_cache.py` — same.
 - `test/tune/test_end_to_end_template_kernel.py` — end-to-end pipeline may tolerate but depth changes.
 

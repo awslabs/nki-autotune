@@ -77,11 +77,11 @@ def test_activation_reduce_axis_roles_marks_f_as_accumulation() -> None:
 
 def test_body_leaf_has_dim_role_for_every_touched_dim() -> None:
     """Every compute SBlock's NKIOpCall carries a dim_role entry per touched dim."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import blocks_under
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import blocks_under
 
     specs = {"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
-    module = build_canonical_module(_matmul_kernel, specs)
+    module = build_initial_ir(_matmul_kernel, specs)
     matmul_blocks = [
         block
         for tree in module.body
@@ -101,11 +101,11 @@ def test_body_leaf_has_dim_role_for_every_touched_dim() -> None:
 
 def test_same_concrete_dim_can_carry_different_roles_across_ops() -> None:
     """In rmsnorm+matmul, the shared F dim is ACCUMULATION in activation_reduce and PARALLEL in tensor_scalar."""
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.ir import blocks_under
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.ir.ir import blocks_under
 
     specs = {"lhs": {"shape": (128, 256), "dtype": "bfloat16"}}
-    module = build_canonical_module(_rmsnorm_kernel, specs)
+    module = build_initial_ir(_rmsnorm_kernel, specs)
     ar_blocks = [
         block
         for tree in module.body

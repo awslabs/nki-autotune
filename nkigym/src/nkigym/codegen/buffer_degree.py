@@ -15,20 +15,20 @@ extent) so the widened slot axis fits without modulo rewriting.
 See the Bug B followup spec for the modulo-emission recipe.
 """
 
-from nkigym.codegen.ir import ForNode, KernelModule, SBlock
+from nkigym.ir.ir import ForNode, KernelIR, SBlock
 
 
-def apply_buffer_degree(module: KernelModule) -> None:
+def apply_buffer_degree(module: KernelIR) -> None:
     """Walk every forest root; apply ``buffer_degree`` annotations to tensor metadata.
 
     Args:
-        module: KernelModule to mutate in place.
+        module: KernelIR to mutate in place.
     """
     for root in module.body:
         _walk(root, module)
 
 
-def _walk(node: ForNode | SBlock, module: KernelModule) -> None:
+def _walk(node: ForNode | SBlock, module: KernelIR) -> None:
     """Depth-first walk; update ``Tensor.buffer_degree`` on each matching SBlock."""
     if isinstance(node, SBlock):
         bd = node.annotations.get("buffer_degree")

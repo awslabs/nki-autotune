@@ -6,12 +6,12 @@ AccessRange) replace the earlier path-based LoopNode/BodyLeaf IR. See
 
 Roles:
 
-- :class:`KernelModule` - envelope. Holds signature + tensor/dim declarations +
+- :class:`KernelIR` - envelope. Holds signature + tensor/dim declarations +
   tree body + dep cache.
 - :class:`TreeIR` / :class:`ForNode` / :class:`SBlock` - schedule tree with
   TVM-style iter-var identity.
 - :class:`DepCache` - per-scope dependency cache (defined in
-  :mod:`nkigym.codegen.dep_cache`).
+  :mod:`nkigym.ir.dep_cache`).
 """
 
 from collections.abc import Iterator
@@ -22,7 +22,7 @@ from nkigym.ops.base import AxisRole
 
 """``DepCache`` import deferred until after ``ForNode``/``SBlock`` are
 defined — ``dep_cache`` imports those names at module top. The deferred
-import executes before ``KernelModule`` is defined so the annotation +
+import executes before ``KernelIR`` is defined so the annotation +
 default factory resolve normally."""
 
 TensorOrigin = Literal["param", "intermediate", "return"]
@@ -72,7 +72,7 @@ class Axis:
 
     Attributes:
         axis_id: Monotonic unique id per module (allocated via
-            :meth:`KernelModule.allocate_axis`).
+            :meth:`KernelIR.allocate_axis`).
         name: Display name, e.g. ``"d0"``, ``"row"``. Purely cosmetic.
         total_size: Axis extent in elements.
         source_axes: Tuple of component axis_ids if this axis was created
@@ -226,13 +226,13 @@ TreeIR = list["ForNode | SBlock"]
 
 """Deferred import: ``dep_cache`` imports ``ForNode``/``SBlock`` from this
 module at its own top; placing this line after those classes are defined
-breaks the cycle. Executed before ``KernelModule`` so the annotation +
+breaks the cycle. Executed before ``KernelIR`` so the annotation +
 default factory resolve normally."""
-from nkigym.codegen.dep_cache import DepCache  # noqa: E402
+from nkigym.ir.dep_cache import DepCache  # noqa: E402
 
 
 @dataclass
-class KernelModule:
+class KernelIR:
     """Envelope IR — signature + tensor/axis declarations + schedule tree.
 
     Analog of TVM's PrimFunc + buffer_map.
@@ -317,7 +317,7 @@ class KernelModule:
         lines: list[str] = []
 
         """Signature."""
-        lines.append(f"KernelModule {self.func_name}({', '.join(self.param_names)}) -> {self.return_name}")
+        lines.append(f"KernelIR {self.func_name}({', '.join(self.param_names)}) -> {self.return_name}")
 
         """Axes."""
         lines.append("axes:")
@@ -342,7 +342,7 @@ class KernelModule:
         return "\n".join(lines)
 
 
-def _pprint_node(node: "ForNode | SBlock", module: "KernelModule", indent: int, lines: list[str]) -> None:
+def _pprint_node(node: "ForNode | SBlock", module: "KernelIR", indent: int, lines: list[str]) -> None:
     """Recursively render one tree node into ``lines`` with ``indent`` level."""
     prefix = "  " * indent
     if isinstance(node, ForNode):
@@ -459,7 +459,7 @@ def blocks_under(node: "ForNode | SBlock") -> Iterator[SBlock]:
         yield from blocks_under(child)
 
 
-def validate_dataflow_ordering(module: KernelModule) -> bool:
+def validate_dataflow_ordering(module: KernelIR) -> bool:
     """Enforce 5 dataflow legality rules in pre-order DFS of the forest.
 
     Rules:

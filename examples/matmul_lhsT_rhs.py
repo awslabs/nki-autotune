@@ -19,9 +19,9 @@ Usage::
 import shutil
 from pathlib import Path
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import KernelModule
 from nkigym.codegen.render import render
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import KernelIR
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -54,7 +54,7 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     return hbm_out
 
 
-def save_step(module: KernelModule, step_idx: int) -> None:
+def save_step(module: KernelIR, step_idx: int) -> None:
     """Write ir.txt + kernel.py into step_<idx>/ and CPU-sim verify."""
     out_dir = CACHE_ROOT / f"step_{step_idx}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -71,5 +71,5 @@ def save_step(module: KernelModule, step_idx: int) -> None:
 if __name__ == "__main__":
     if CACHE_ROOT.exists():
         shutil.rmtree(CACHE_ROOT)
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs=INPUT_SPECS)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, input_specs=INPUT_SPECS)
     save_step(module, 0)

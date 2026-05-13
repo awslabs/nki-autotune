@@ -87,7 +87,7 @@ def test_dim_info_only_carries_dim_id_and_total_size():
     """Per-op tiling model: DimInfo holds identity + total extent only."""
     from dataclasses import fields
 
-    from nkigym.codegen.ir import DimInfo
+    from nkigym.ir.ir import DimInfo
 
     field_names = {f.name for f in fields(DimInfo)}
     assert field_names == {"dim_id", "total_size"}
@@ -143,7 +143,7 @@ def test_canonical_load_has_full_F_extent():
     single whole-extent iteration, not carry NKIMatmul's M=128 through
     shared dim_ids. Regression: the old _derive_dims took a global min
     over ops touching the shared dim."""
-    km = build_canonical_module(_matmul_k, _INPUT_SPECS)
+    km = build_initial_ir(_matmul_k, _INPUT_SPECS)
     load_blocks = [b for b in _collect_sblocks(km) if b.body and b.body[0].op_cls is NKILoad]
     assert len(load_blocks) == 2
     for block in load_blocks:
@@ -191,7 +191,7 @@ def _derive_op_tiles(
     return out
 ```
 
-Update the top-level `build_canonical_module` (lines 60-61) from:
+Update the top-level `build_initial_ir` (lines 60-61) from:
 
 ```python
     dims = _derive_dims(raws, per_op_axis_maps, dim_sizes)
@@ -270,7 +270,7 @@ def _build_parsed_ops(
 Edit `_make_sblock` (lines 499-543) so iter-var extents come from `op.dim_tile`:
 
 ```python
-def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
+def _make_sblock(op: _ParsedOp, module: KernelIR) -> SBlock:
     """Build an iter-var :class:`SBlock` for ``op`` with per-op tiling.
 
     Allocates one fresh :class:`IterVar` per ``dim_id`` in ``op.touched_dims``.
@@ -316,7 +316,7 @@ Edit `_build_buffer_access` (lines 546-574):
 
 ```python
 def _build_buffer_access(
-    tname: str, axes: tuple[str, ...], op: _ParsedOp, dim_to_iv: dict[str, IterVar], module: KernelModule
+    tname: str, axes: tuple[str, ...], op: _ParsedOp, dim_to_iv: dict[str, IterVar], module: KernelIR
 ) -> BufferAccess:
     """Produce a :class:`BufferAccess` for ``tname`` referenced by ``op`` via ``axes``.
 
@@ -380,8 +380,8 @@ def test_writer_driven_buffer_shape():
     the producer's write pattern, not the consumer's tile."""
     import numpy as np
 
-    from nkigym.codegen.canonical import build_canonical_module
-    from nkigym.codegen.lowering.place_buffers import place_buffers
+    from nkigym.ir.build import build_initial_ir
+    from nkigym.codegen.place_buffers import place_buffers
     from nkigym.ops import nkigym_kernel
     from nkigym.ops.alloc import NKIAlloc
     from nkigym.ops.load import NKILoad
@@ -407,7 +407,7 @@ def test_writer_driven_buffer_shape():
 
     specs = {"lhs": {"shape": (2048, 2048), "dtype": "bfloat16"},
              "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}}
-    km = build_canonical_module(_k, specs)
+    km = build_initial_ir(_k, specs)
     place_buffers(km)
     """lhs_sbuf: writer is NKILoad with tile (P=128, F=2048-full).
     num_P_slots = 16 (covers 2048/128); F_tile * num_F_tiles = 2048 * 1."""
@@ -445,10 +445,10 @@ Per-tensor shape derivation (per-op tiling model):
 
 Param tensors and return-HBM tensors are untouched."""
 
-from nkigym.codegen.ir import BufferAccess, ForNode, IterVar, KernelModule, SBlock, Tensor
+from nkigym.ir.ir import BufferAccess, ForNode, IterVar, KernelIR, SBlock, Tensor
 
 
-def place_buffers(module: KernelModule) -> None:
+def place_buffers(module: KernelIR) -> None:
     """Mutate intermediate SBUF/PSUM tensor shapes in place."""
     for tensor in module.tensors.values():
         if tensor.origin == "param":
@@ -458,7 +458,7 @@ def place_buffers(module: KernelModule) -> None:
         _place_one(module, tensor)
 
 
-def _place_one(module: KernelModule, tensor: Tensor) -> None:
+def _place_one(module: KernelIR, tensor: Tensor) -> None:
     """Derive N-D SBUF/PSUM shape for one intermediate tensor."""
     accesses = _find_accesses(module, tensor.name)
     if not accesses:
@@ -492,7 +492,7 @@ def _place_one(module: KernelModule, tensor: Tensor) -> None:
     tensor.shape = tuple(shape_parts)
 
 
-def _find_writer_access(module: KernelModule, tensor_name: str) -> BufferAccess | None:
+def _find_writer_access(module: KernelIR, tensor_name: str) -> BufferAccess | None:
     """Return the RMW (finalising) writer access for ``tensor_name`` if one
     exists; otherwise the single non-RMW writer.
 
@@ -534,7 +534,7 @@ def _find_writer_access(module: KernelModule, tensor_name: str) -> BufferAccess 
     return result if result is not None else first_non_rmw
 
 
-def _find_accesses(module: KernelModule, tensor_name: str) -> list[tuple[SBlock, tuple[IterVar, ...]]]:
+def _find_accesses(module: KernelIR, tensor_name: str) -> list[tuple[SBlock, tuple[IterVar, ...]]]:
     """Return ``(block, ancestor_iter_vars)`` for every SBlock touching ``tensor_name``."""
     results: list[tuple[SBlock, tuple[IterVar, ...]]] = []
 
@@ -558,7 +558,7 @@ def _find_accesses(module: KernelModule, tensor_name: str) -> list[tuple[SBlock,
 
 
 def _required_tiles(
-    module: KernelModule,
+    module: KernelIR,
     accesses: list[tuple[SBlock, tuple[IterVar, ...]]],
     per_dim_tile: dict[str, int],
 ) -> dict[str, int]:

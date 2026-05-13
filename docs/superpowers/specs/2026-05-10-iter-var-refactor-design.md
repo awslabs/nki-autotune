@@ -85,7 +85,7 @@ class IterVar:
     role: AxisRole         # PARALLEL | SEQUENTIAL | ACCUMULATION
 ```
 
-Per-module counter (`KernelModule.iter_var_counter: int = 0`) allocates fresh
+Per-module counter (`KernelIR.iter_var_counter: int = 0`) allocates fresh
 ids. Retired iter vars keep their ids (ids are never reused).
 
 ### 3.2 `ForNode`
@@ -176,13 +176,13 @@ rewrite all patterns referencing `v` to `{v_outer_id: inner_extent, v_inner_id: 
 introduce `v_fused`, rewrite all patterns. Renderer emits `//` and `%` for
 the original-dim decomposition.
 
-### 3.6 `KernelModule`
+### 3.6 `KernelIR`
 
 Envelope. Minimal delta from today.
 
 ```python
 @dataclass
-class KernelModule:
+class KernelIR:
     func_name: str
     param_names: list[str]
     return_name: str
@@ -332,7 +332,7 @@ rejected by `Annotate.is_legal`. Future keys (`"unroll"`, `"vectorize"`,
 
 Enumeration in `batch.py`:
 ```python
-def enumerate_annotate_atoms(module: KernelModule) -> list[Annotate]:
+def enumerate_annotate_atoms(module: KernelIR) -> list[Annotate]:
     atoms = []
     atoms.extend(_enumerate_buffer_degree_annotations(module))
     atoms.extend(_enumerate_software_pipeline_annotations(module))
@@ -345,8 +345,8 @@ Five passes over the tree. File layout:
 
 ```
 codegen/
-├── ir.py                              # IterVar, ForNode, SBlock, NKIOpCall, BufferAccess, AccessRange, KernelModule
-├── canonical.py                       # build_canonical_module (AST parse → IterVar-based IR)
+├── ir.py                              # IterVar, ForNode, SBlock, NKIOpCall, BufferAccess, AccessRange, KernelIR
+├── canonical.py                       # build_initial_ir (AST parse → IterVar-based IR)
 ├── dep_cache.py                       # DepCache keyed on SBlockId
 ├── render.py                          # render entry point
 └── lowering/

@@ -2,7 +2,7 @@
 
 ## Problem
 
-`KernelModule.fused_iter_var_map` is a side-table that records "when the renderer encounters retired iter-var id X in a live `BufferAccess`, decompose it as `(fused // inner_ext)` or `(fused % inner_ext)`". It exists because `Fuse` deliberately does **not** rewrite `BufferAccess.iter_var_coeffs` when it retires the outer and inner iter-vars.
+`KernelIR.fused_iter_var_map` is a side-table that records "when the renderer encounters retired iter-var id X in a live `BufferAccess`, decompose it as `(fused // inner_ext)` or `(fused % inner_ext)`". It exists because `Fuse` deliberately does **not** rewrite `BufferAccess.iter_var_coeffs` when it retires the outer and inner iter-vars.
 
 This splits the source of truth for access patterns between:
 - `BufferAccess.iter_var_coeffs` — the affine expression's coefficients, as they appear in the IR.
@@ -27,7 +27,7 @@ The renderer's `_resolve_iv_name` becomes: "look up the iter-var id in `ctx.iter
 
 ## IR Changes
 
-**Remove:** `KernelModule.fused_iter_var_map: dict[int, tuple[int, int, bool]]`.
+**Remove:** `KernelIR.fused_iter_var_map: dict[int, tuple[int, int, bool]]`.
 
 **Add:** none (the primitives are already in place — `BufferAccess.iter_var_coeffs` already keys by integer id and supports any affine sum).
 

@@ -57,8 +57,8 @@ Create `/home/ubuntu/nki-autotune/test/codegen/test_canonical_one_loop_per_unbou
 """Canonical emits one ForNode per unbounded axis (trip = full extent)
 and two ForNodes per bounded axis (outer trip + inner tile)."""
 
-from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import ForNode, SBlock
+from nkigym.ir.build import build_initial_ir
+from nkigym.ir.ir import ForNode, SBlock
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -111,7 +111,7 @@ def _find_sblock(module, op_name, tensor_substr=None):
 
 def test_nkiload_unbounded_F_has_one_iter_var():
     """lhs_T load: bounded P (trip=16, tile=128) + unbounded F (one loop, trip=2048)."""
-    module = build_canonical_module(_matmul, input_specs=_SPECS)
+    module = build_initial_ir(_matmul, input_specs=_SPECS)
     block, ancestors = _find_sblock(module, "NKILoad", tensor_substr="a")
     d0 = module.axis_id_by_name("d0")
     d1 = module.axis_id_by_name("d1")
@@ -128,7 +128,7 @@ def test_nkiload_unbounded_F_has_one_iter_var():
 
 def test_matmul_all_bounded_axes_have_two_iter_vars():
     """Matmul K/M/N are all bounded (128/128/512)."""
-    module = build_canonical_module(_matmul, input_specs=_SPECS)
+    module = build_initial_ir(_matmul, input_specs=_SPECS)
     block, ancestors = _find_sblock(module, "NKIMatmul")
     d0 = module.axis_id_by_name("d0")
     d1 = module.axis_id_by_name("d1")
@@ -143,7 +143,7 @@ def test_matmul_all_bounded_axes_have_two_iter_vars():
 
 def test_nkimemset_unbounded_F_has_one_iter_var():
     """NKIMemset: bounded P (16, 128) + unbounded F (one loop extent=2048)."""
-    module = build_canonical_module(_matmul, input_specs=_SPECS)
+    module = build_initial_ir(_matmul, input_specs=_SPECS)
     block, ancestors = _find_sblock(module, "NKIMemset")
     d1 = module.axis_id_by_name("d1")
     d3 = module.axis_id_by_name("d3")
@@ -300,7 +300,7 @@ Expected: all 3 PASS.
 PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python - <<'PY'
 import numpy as np
 import nki
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
@@ -324,7 +324,7 @@ def mm(lhs_T, rhs):
     NKITensorCopy()(src=p, dst=s); NKIStore()(src=s, dst=h)
     return h
 
-m = build_canonical_module(mm, input_specs={"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}})
+m = build_initial_ir(mm, input_specs={"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}})
 src = render(m)
 print(src)
 assert "range(1)" not in src, "trip-1 loops STILL present"
@@ -481,7 +481,7 @@ if __name__ == "__main__":
     VERIFY_SPECS = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
     CACHE_ROOT = Path("/home/ubuntu/cache/matmul_lhsT_rhs")
 
-    module = build_canonical_module(matmul_lhsT_rhs_nkigym, input_specs=BUILD_SPECS)
+    module = build_initial_ir(matmul_lhsT_rhs_nkigym, input_specs=BUILD_SPECS)
     save_step(module, 0, "canonical")
 
     """Step 1: move lhs_T load inside matmul's d1 outer loop (trip 16).
@@ -527,7 +527,7 @@ Expected: all PASS (+ 2 skipped + xfailed).
 ```bash
 cd /home/ubuntu/nki-autotune
 PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python - <<'PY'
-from nkigym.codegen.canonical import build_canonical_module
+from nkigym.ir.build import build_initial_ir
 from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
@@ -550,7 +550,7 @@ def mm(lhs_T, rhs):
     NKITensorCopy()(src=p, dst=s); NKIStore()(src=s, dst=h)
     return h
 
-m = build_canonical_module(mm, input_specs={"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}})
+m = build_initial_ir(mm, input_specs={"lhs_T": {"shape": (2048, 2048), "dtype": "bfloat16"}, "rhs": {"shape": (2048, 2048), "dtype": "bfloat16"}})
 src = render(m)
 assert "range(1)" not in src, f"trip-1 loop still present:\n{src}"
 print("No trip-1 loops in canonical render.")

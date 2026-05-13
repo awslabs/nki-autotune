@@ -33,7 +33,7 @@ class IterVar:
     role: AxisRole
 
 @dataclass
-class KernelModule:
+class KernelIR:
     ...
     axes: dict[int, Axis]                     # was: dims: dict[str, DimInfo]
     axis_counter: int = 0
@@ -47,15 +47,15 @@ class KernelModule:
 - Same-axis Fuse (`outer.axis_id == inner.axis_id`): new IterVar reuses that `axis_id`. Chain on the axis shrinks from 2 to 1. Tests that look for "d1 ancestor" still find it.
 - Cross-axis Fuse (`outer.axis_id != inner.axis_id`): allocate a fresh `Axis` with `source_axes=(outer.axis_id, inner.axis_id)` and a derived name (e.g. `f"{outer.name}_x_{inner.name}"`). Name is for display; logic uses `axis_id`.
 
-**`fused_iter_var_map` scope.** The renderer needs the inner-extent at fuse-time to emit `(fused // inner_extent)` / `(fused % inner_extent)` for retired iter-var references. This map continues to live on `KernelModule` unchanged; it's orthogonal to axis identity. A future cleanup may fold `source_extents` onto `Axis`, but this spec leaves `fused_iter_var_map` alone.
+**`fused_iter_var_map` scope.** The renderer needs the inner-extent at fuse-time to emit `(fused // inner_extent)` / `(fused % inner_extent)` for retired iter-var references. This map continues to live on `KernelIR` unchanged; it's orthogonal to axis identity. A future cleanup may fold `source_extents` onto `Axis`, but this spec leaves `fused_iter_var_map` alone.
 
 ## IR Changes
 
 **Remove:** `DimInfo` (replaced by `Axis`). `IterVar.dim_id: str`.
 
-**Add:** `Axis` dataclass. `IterVar.axis_id: int`. `KernelModule.axes: dict[int, Axis]`. `KernelModule.axis_counter: int`.
+**Add:** `Axis` dataclass. `IterVar.axis_id: int`. `KernelIR.axes: dict[int, Axis]`. `KernelIR.axis_counter: int`.
 
-**Update:** `KernelModule.allocate_iter_var` signature: takes `axis_id: int` instead of `dim_id: str`. Add `KernelModule.allocate_axis(name, total_size, source_axes=None) -> Axis` helper.
+**Update:** `KernelIR.allocate_iter_var` signature: takes `axis_id: int` instead of `dim_id: str`. Add `KernelIR.allocate_axis(name, total_size, source_axes=None) -> Axis` helper.
 
 **Keep unchanged:** `fused_iter_var_map` (orthogonal to this refactor). All other IR types.
 

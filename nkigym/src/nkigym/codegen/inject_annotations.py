@@ -14,20 +14,20 @@ pipeline pass may eventually read the widened multi-buffer state to
 plan prologue unrolling.
 
 Called by :func:`nkigym.codegen.render.render` BEFORE
-:func:`nkigym.codegen.lowering.place_buffers.place_buffers` so the
+:func:`nkigym.codegen.place_buffers.place_buffers` so the
 widened ``Tensor.buffer_degree`` shows up in derived shapes.
 """
 
-from nkigym.codegen.ir import KernelModule
-from nkigym.codegen.lowering.inject_annotations.buffer_degree import apply_buffer_degree
-from nkigym.codegen.lowering.inject_annotations.software_pipeline import apply_software_pipeline
+from nkigym.codegen.buffer_degree import apply_buffer_degree
+from nkigym.codegen.software_pipeline import apply_software_pipeline
+from nkigym.ir.ir import KernelIR
 
 
-def inject_annotations(module: KernelModule) -> None:
+def inject_annotations(module: KernelIR) -> None:
     """Run each annotation key's sub-pass in registered order.
 
     Args:
-        module: KernelModule whose body tree carries annotations.
+        module: KernelIR whose body tree carries annotations.
     """
     apply_buffer_degree(module)
     apply_software_pipeline(module)

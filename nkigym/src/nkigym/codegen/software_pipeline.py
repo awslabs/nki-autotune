@@ -10,16 +10,16 @@ precomputing required multi-buffer widths from pipeline stage offsets)
 can slot in without re-threading the render pipeline.
 """
 
-from nkigym.codegen.ir import ForNode, KernelModule, SBlock
+from nkigym.ir.ir import ForNode, KernelIR, SBlock
 
 
-def apply_software_pipeline(module: KernelModule) -> None:
+def apply_software_pipeline(module: KernelIR) -> None:
     """Walk every forest root; observe ``software_pipeline_depth`` annotations.
 
     No mutation yet — see module docstring.
 
     Args:
-        module: KernelModule to visit.
+        module: KernelIR to visit.
     """
     for root in module.body:
         _walk(root)

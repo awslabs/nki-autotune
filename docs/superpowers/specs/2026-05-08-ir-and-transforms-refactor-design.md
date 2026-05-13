@@ -19,7 +19,7 @@ This refactor brings nkigym's IR and transform set in line with modern TVM desig
 ## Goals
 
 - Self-describing tree IR: every `BodyLeaf` carries all metadata needed for rendering and dep reasoning. No back-reference to an op-level sidecar.
-- Collapse `OpGraph` + `ParsedOp` into an envelope (`KernelModule`) holding only declarations (tensors, dims, signature) and a body (`TreeIR`).
+- Collapse `OpGraph` + `ParsedOp` into an envelope (`KernelIR`) holding only declarations (tensors, dims, signature) and a body (`TreeIR`).
 - Replace `DepGraph` (global, immutable) with `DepCache` (per-scope, invalidated on mutation).
 - Grow the transform set to nine atoms mapped to TVM: `Split`, `Fuse`, `Reorder`, `ComputeAt`, `ReverseComputeAt`, `DecomposeReduction`, `HoistInvariant`, `MultiBuffer`, `SoftwarePipeline`. Delete `FuseLoops` (subsumed by `ComputeAt`).
 - Split renderer into a staged pass pipeline mirroring TVM's lowering passes.
@@ -41,7 +41,7 @@ Three roles, cleanly partitioned:
 
 ```python
 @dataclass
-class KernelModule:
+class KernelIR:
     """Envelope. Analog of TVM's PrimFunc + buffer_map."""
     func_name: str
     param_names: list[str]
@@ -98,7 +98,7 @@ class Dependency:
     kind: DepKind                 # RAW | WAR | WAW | OPAQUE
 ```
 
-**What's removed:** `OpGraph` (renamed `KernelModule`, fields slimmed), `ParsedOp` (fields migrate onto `BodyLeaf`), global flat `DepGraph` (replaced by per-scope `DepCache`).
+**What's removed:** `OpGraph` (renamed `KernelIR`, fields slimmed), `ParsedOp` (fields migrate onto `BodyLeaf`), global flat `DepGraph` (replaced by per-scope `DepCache`).
 
 **What's preserved:** `Tensor`, `DimInfo`, `OpLocalBuffer`, `AxisRole`, NKIOp class contract.
 
@@ -157,7 +157,7 @@ LICM within a leaf's own tree. Moves a leaf outward when its reads/writes don't 
 
 **`MultiBuffer(tensor_name, dim_id, degree)`** — unchanged.
 - *Legality:* `1 <= degree <= num_tiles(dim_id)`.
-- *Apply:* mutates `KernelModule.tensors[tensor_name].buffer_degree[dim_id]`.
+- *Apply:* mutates `KernelIR.tensors[tensor_name].buffer_degree[dim_id]`.
 
 **`SoftwarePipeline(loop_path, depth)`** — unchanged. Lives as `LoopNode.pipeline_depth: int`.
 - *Legality:* `depth == chain_length` of the subtree's producer-consumer chain.
@@ -165,14 +165,14 @@ LICM within a leaf's own tree. Moves a leaf outward when its reads/writes don't 
 
 #### Enumeration and hashing
 
-Atoms are frozen dataclasses; `hash_state(module)` folds body structure + `KernelModule.tensors[*].buffer_degree`. Random-sampler default path (`rewrites=None`) emits all structurally-legal atoms per state; draws uniformly without bias.
+Atoms are frozen dataclasses; `hash_state(module)` folds body structure + `KernelIR.tensors[*].buffer_degree`. Random-sampler default path (`rewrites=None`) emits all structurally-legal atoms per state; draws uniformly without bias.
 
 ### Renderer pass pipeline
 
 Replace the single `render()` function with a staged pipeline:
 
 ```
-KernelModule (post-tune)
+KernelIR (post-tune)
       │
 [1] LowerDecomposedReduction    # canonicalize fissioned reducer leaves
 [2] InjectMultiBuffer            # Tensor.buffer_degree → allocation shapes + slot expressions
@@ -185,15 +185,15 @@ KernelModule (post-tune)
   str (kernel.py)
 ```
 
-Each pass's input and output is `KernelModule` (or a late-stage IR carrying explicit allocs/calls). Passes are unit-testable in isolation. Stage boundaries match TVM's pass organization (`InjectSoftwarePipeline`, `InjectDoubleBuffer` are separate passes there).
+Each pass's input and output is `KernelIR` (or a late-stage IR carrying explicit allocs/calls). Passes are unit-testable in isolation. Stage boundaries match TVM's pass organization (`InjectSoftwarePipeline`, `InjectDoubleBuffer` are separate passes there).
 
 ### File layout
 
 ```
 nkigym/src/nkigym/codegen/
-  ir.py                                # KernelModule, TreeIR, LoopNode, BodyLeaf, Tensor, DimInfo
+  ir.py                                # KernelIR, TreeIR, LoopNode, BodyLeaf, Tensor, DimInfo
   dep_cache.py                         # DepCache, SBlockScope, Dependency, DepKind
-  canonical.py                         # build_canonical_module(func, input_specs)
+  canonical.py                         # build_initial_ir(func, input_specs)
   lowering/
     __init__.py
     lower_decomposed_reduction.py
@@ -239,7 +239,7 @@ Populate `ir.py`, `dep_cache.py`, `canonical.py` with new types. No production i
 *Gate:* full existing test suite green; new types compile.
 
 **Layer 2: Port canonical form + renderer onto new IR.**
-Replace `parse_and_resolve` with `build_canonical_module`. Delete old `OpGraph`/`ParsedOp`/`LoopForest`. Port `render.py` to `KernelModule` (still single-pass). Four existing transforms (`FuseLoops`, `ReorderLoops`, `MultiBuffer`, `SoftwarePipeline`) updated for the new IR. `FuseLoops` retained as transition step.
+Replace `parse_and_resolve` with `build_initial_ir`. Delete old `OpGraph`/`ParsedOp`/`LoopForest`. Port `render.py` to `KernelIR` (still single-pass). Four existing transforms (`FuseLoops`, `ReorderLoops`, `MultiBuffer`, `SoftwarePipeline`) updated for the new IR. `FuseLoops` retained as transition step.
 *Gate:* `examples/matmul_lhsT_rhs.py` runs default tune path, CPU-sim passes, random-sample MFU ≥ current SOTA (≥90.92%). Same for `rmsnorm_matmul` (≥79%). Rendered source should be byte-identical where possible; where not (e.g. cosmetic variable-name permutations from the rebuild), CPU-sim pass + SOTA MFU is the acceptance criterion.
 
 **Layer 3: Replace `FuseLoops` with `ComputeAt`.**

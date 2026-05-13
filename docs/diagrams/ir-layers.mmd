@@ -1,9 +1,9 @@
 flowchart LR
     A["<b>f_nkigym</b><br/>Python function<br/>straight-line NKIOp calls"]
-    B["<b>KernelModule</b><br/>envelope IR<br/>tensors + dims + TreeIR + dep"]
+    B["<b>KernelIR</b><br/>envelope IR<br/>tensors + dims + TreeIR + dep"]
     C["<b>NKI source</b><br/>@nki.jit function<br/>nisa.* ISA calls"]
 
-    A -- "build_canonical_module" --> B
+    A -- "build_initial_ir" --> B
     B -- "rewrite atoms<br/>(Split, Reorder,<br/>ComputeAt, ...)" --> B
     B -- "render" --> C
 
