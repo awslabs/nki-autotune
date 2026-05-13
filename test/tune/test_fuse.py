@@ -3,14 +3,20 @@
 Same-axis Fuse requires outer.extent == 1 and eagerly rewrites access
 patterns; no side-table. Cross-axis Fuse with dependent access patterns
 is rejected at ``is_legal``.
+
+Post canonical-drop-trip-1-loops: canonical no longer emits trip-1 outers
+on unbounded axes, so a legal same-axis Fuse pair does not arise from
+canonical alone. Tests of same-axis Fuse semantics inject a synthetic
+trip-1 outer via ``_inject_trip1_outer`` to reach the (1, N) pair state.
 """
 
 import ast
+from dataclasses import replace
 
 import pytest
 
 from nkigym.codegen.canonical import build_canonical_module
-from nkigym.codegen.ir import ForNode, SBlock
+from nkigym.codegen.ir import ForNode, IterVar, KernelModule, SBlock, replace_at_path, resolve_node
 from nkigym.codegen.render import render
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
@@ -57,42 +63,106 @@ def _find_subtree_with_op(module, op_name: str) -> ForNode:
     raise AssertionError(f"No subtree with op {op_name}")
 
 
-def _tensor_copy_pair(module) -> tuple[int, int]:
-    """Return the (outer_var_id, inner_var_id) of the tensor_copy d3
-    outer/inner pair.
+def _inject_trip1_outer(module: KernelModule, fornode_path: tuple[int, ...]) -> tuple[KernelModule, int, int]:
+    """Wrap the ForNode at ``fornode_path`` in a fresh trip-1 ForNode on the same axis.
 
-    Post-Task 4 the tensor_copy spine is ``d1_outer(16) > d1_inner(128)
-    > d3_outer(1) > d3_inner(2048) > SBlock``. We pick the d3 pair
-    because its abstract axis is ``F`` with ``MAX_TILE_SIZE[F] = None`` —
-    Task 7's MIN/MAX check on innermost leaves the fuse legal. (The d1
-    pair would fuse to extent 2048 exceeding ``MAX_TILE_SIZE[P]=128``.)
+    Canonical no longer emits trip-1 outers on unbounded axes, so the
+    same-axis Fuse legality (``outer.extent == 1``) is unreachable via
+    canonical alone. This helper restores that state for testing Fuse
+    semantics. Updates every SBlock under the target to include the new
+    outer iter-var just before the original iter-var in its
+    ``iter_vars`` list.
+
+    Returns ``(module, outer_var_id, inner_var_id)``.
     """
-    d1 = module.axis_id_by_name("d1")
+    target = resolve_node(module.body, fornode_path)
+    assert isinstance(target, ForNode)
+    inner_iv = target.iter_var
+    outer_iv = module.allocate_iter_var(axis_id=inner_iv.axis_id, extent=1, role=inner_iv.role)
+
+    def rewrite(node):
+        if isinstance(node, SBlock):
+            new_ivs: list[IterVar] = []
+            for iv in node.iter_vars:
+                if iv.var_id == inner_iv.var_id:
+                    new_ivs.append(outer_iv)
+                new_ivs.append(iv)
+            return SBlock(
+                iter_vars=new_ivs,
+                reads=node.reads,
+                writes=node.writes,
+                reads_writes=node.reads_writes,
+                body=node.body,
+                annotations=dict(node.annotations),
+            )
+        return ForNode(
+            iter_var=node.iter_var,
+            children=[rewrite(c) for c in node.children],
+            name=node.name,
+            annotations=dict(node.annotations),
+        )
+
+    rewritten_target = rewrite(target)
+    wrapper = ForNode(iter_var=outer_iv, children=[rewritten_target], name=None, annotations={})
+    new_body = replace_at_path(module.body, fornode_path, wrapper)
+    return replace(module, body=new_body), outer_iv.var_id, inner_iv.var_id
+
+
+def _tensor_copy_d3_fornode_path(module: KernelModule) -> tuple[int, ...]:
+    """Return the path to the single d3 ForNode above tensor_copy's SBlock.
+
+    Post canonical-drop-trip-1-loops the tensor_copy spine is
+    ``d1_outer(16) > d1_inner(128) > d3_tile(2048) > SBlock``. d3 is
+    unbounded (MAX_TILE_SIZE[F]=None), so it's a single iter-var.
+    """
     d3 = module.axis_id_by_name("d3")
-    outer = _find_subtree_with_op(module, "NKITensorCopy")
-    assert isinstance(outer, ForNode) and outer.iter_var.axis_id == d1
-    assert len(outer.children) == 1
-    d1_inner = outer.children[0]
-    assert isinstance(d1_inner, ForNode) and d1_inner.iter_var.axis_id == d1
-    assert len(d1_inner.children) == 1
-    d3_outer = d1_inner.children[0]
-    assert isinstance(d3_outer, ForNode) and d3_outer.iter_var.axis_id == d3
-    assert len(d3_outer.children) == 1
-    d3_inner = d3_outer.children[0]
-    assert isinstance(d3_inner, ForNode) and d3_inner.iter_var.axis_id == d3
-    return d3_outer.iter_var.var_id, d3_inner.iter_var.var_id
+
+    def walk(node, path):
+        if isinstance(node, ForNode) and node.iter_var.axis_id == d3:
+
+            def has_tc(n):
+                if isinstance(n, SBlock) and n.body and n.body[0].op_cls is NKITensorCopy:
+                    return True
+                if isinstance(n, ForNode):
+                    return any(has_tc(c) for c in n.children)
+                return False
+
+            if has_tc(node):
+                return path
+        if isinstance(node, ForNode):
+            for i, c in enumerate(node.children):
+                r = walk(c, path + (i,))
+                if r is not None:
+                    return r
+        return None
+
+    for i, root in enumerate(module.body):
+        r = walk(root, (i,))
+        if r is not None:
+            return r
+    raise AssertionError("could not find d3 ForNode above tensor_copy")
+
+
+def _inject_tensor_copy_trip1_pair(module: KernelModule) -> tuple[KernelModule, int, int]:
+    """Inject a trip-1 outer above tensor_copy's d3 ForNode.
+
+    Returns ``(module, outer_var_id, inner_var_id)`` — a legal same-axis
+    Fuse pair on the d3 (F) axis.
+    """
+    return _inject_trip1_outer(module, _tensor_copy_d3_fornode_path(module))
 
 
 def test_fuse_adjacent_par_par_creates_synthetic_dim() -> None:
-    """Fusing the tensor_copy d3 outer(1) > d3 inner(2048) pair yields a
+    """Fusing an injected d3 outer(1) > d3 inner(2048) pair yields a
     single ForNode. Same-axis fuse preserves the axis_id (d3); extent
-    becomes ``1 * 2048 == 2048``. Post-Task 4 canonical splits each axis
-    into outer+inner ForNodes; Task 7's MIN/MAX check leaves the d3 pair
-    legal because tensor_copy's ``F`` axis has ``MAX_TILE_SIZE=None``."""
+    becomes ``1 * 2048 == 2048``. Task 7's MIN/MAX check leaves the d3
+    pair legal because tensor_copy's ``F`` axis has
+    ``MAX_TILE_SIZE=None``. Canonical no longer emits a trip-1 outer on
+    unbounded axes; we inject one here to exercise the Fuse path."""
     module = build_canonical_module(_matmul_large, _SPECS)
     d1 = module.axis_id_by_name("d1")
     d3 = module.axis_id_by_name("d3")
-    outer_id, inner_id = _tensor_copy_pair(module)
+    module, outer_id, inner_id = _inject_tensor_copy_trip1_pair(module)
     atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
     assert atom.is_legal(module)
     new_mod = atom.apply(module)
@@ -115,7 +185,7 @@ def test_fuse_registers_synthetic_dim_info() -> None:
     original ``d3`` axis."""
     module = build_canonical_module(_matmul_large, _SPECS)
     d3 = module.axis_id_by_name("d3")
-    outer_id, inner_id = _tensor_copy_pair(module)
+    module, outer_id, inner_id = _inject_tensor_copy_trip1_pair(module)
     before_axes = set(module.axes)
     atom = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id)
     new_mod = atom.apply(module)
@@ -156,10 +226,19 @@ def test_fuse_apply_raises_on_illegal() -> None:
 
 
 def test_enumerate_fuse_atoms_yields_legal_atoms_only() -> None:
-    """Every atom emitted by the enumerator passes ``is_legal``."""
+    """Every atom emitted by the enumerator passes ``is_legal``.
+
+    Post canonical-drop-trip-1-loops the canonical matmul has no legal
+    same-axis Fuse candidates (trip-1 outers no longer arise). Inject one
+    to get a non-empty enumerator result and verify legality.
+    """
     module = build_canonical_module(_matmul_large, _SPECS)
+    """Canonical alone yields zero legal fuse candidates now."""
+    assert enumerate_fuse_atoms(module) == []
+    """Inject a trip-1 outer to create exactly one legal same-axis pair."""
+    module, _outer_id, _inner_id = _inject_tensor_copy_trip1_pair(module)
     atoms = enumerate_fuse_atoms(module)
-    assert atoms, "expected at least one fuse candidate in canonical matmul"
+    assert atoms, "expected at least one fuse candidate after trip-1 injection"
     for atom in atoms:
         assert atom.is_legal(module), f"enumerator emitted illegal atom {atom!r}"
 
@@ -167,7 +246,7 @@ def test_enumerate_fuse_atoms_yields_legal_atoms_only() -> None:
 def test_fuse_rendered_source_parses() -> None:
     """After Fuse + render, the produced Python source parses cleanly."""
     module = build_canonical_module(_matmul_large, _SPECS)
-    outer_id, inner_id = _tensor_copy_pair(module)
+    module, outer_id, inner_id = _inject_tensor_copy_trip1_pair(module)
     new_mod = Fuse(outer_iter_var_id=outer_id, inner_iter_var_id=inner_id).apply(module)
     source = render(new_mod)
     ast.parse(source)

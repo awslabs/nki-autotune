@@ -526,13 +526,17 @@ def _touched_axes(
 def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
     """Build an iter-var :class:`SBlock` for ``op`` with per-op tiling.
 
-    Allocates TWO fresh :class:`IterVar`\\ s per ``axis_id`` in
-    ``op.touched_axes``: an outer trip iter-var (``extent = total //
-    tile``) and an inner tile iter-var (``extent = tile``). The outer
-    precedes the inner in ``iter_vars`` for each axis. The innermost
-    inner iter-var is present in the IR so per-axis addressing is fully
-    symbolic ``outer * tile + inner``; the renderer elides the inner
-    for-loop by spelling the inner iter-var as ``0`` in slice expressions.
+    Allocates iter-vars per ``axis_id`` in ``op.touched_axes``:
+
+    - **Bounded axis** (``tile < total``): TWO fresh :class:`IterVar`\\ s —
+      an outer trip iter-var (``extent = total // tile``) followed by an
+      inner tile iter-var (``extent = tile``). Per-axis addressing is
+      ``outer * tile + inner``; the renderer elides the inner for-loop by
+      spelling the inner iter-var as ``0`` in slice expressions.
+    - **Unbounded axis** (``tile == total``): ONE fresh iter-var playing
+      the role of the inner tile (``extent = total``, the full axis).
+      There is no outer trip loop. The renderer still elides this single
+      (innermost) loop into the ISA slice width.
 
     Operand slots split into three buckets based on the op's
     ``INPUT_OPERANDS`` / ``RMW_OPERANDS``.
@@ -543,13 +547,24 @@ def _make_sblock(op: _ParsedOp, module: KernelModule) -> SBlock:
     for axis_id in op.touched_axes:
         total = module.axes[axis_id].total_size
         tile = op.axis_tile[axis_id]
-        trip = total // tile
-        outer = module.allocate_iter_var(axis_id=axis_id, extent=trip, role=op.axis_role[axis_id])
-        inner = module.allocate_iter_var(axis_id=axis_id, extent=tile, role=op.axis_role[axis_id])
-        axis_to_outer[axis_id] = outer
-        axis_to_inner[axis_id] = inner
-        iter_vars.append(outer)
-        iter_vars.append(inner)
+        role = op.axis_role[axis_id]
+        if tile < total:
+            """Bounded axis: outer trip + inner tile (two ForNodes)."""
+            outer = module.allocate_iter_var(axis_id=axis_id, extent=total // tile, role=role)
+            inner = module.allocate_iter_var(axis_id=axis_id, extent=tile, role=role)
+            axis_to_outer[axis_id] = outer
+            axis_to_inner[axis_id] = inner
+            iter_vars.append(outer)
+            iter_vars.append(inner)
+        else:
+            """Unbounded axis (tile == total): single tile ForNode for the whole axis.
+
+            The single iter-var plays the role of 'inner tile' for BufferAccess
+            coefficient purposes; no outer trip loop exists.
+            """
+            tile_iv = module.allocate_iter_var(axis_id=axis_id, extent=total, role=role)
+            axis_to_inner[axis_id] = tile_iv
+            iter_vars.append(tile_iv)
 
     rmw = op.op_cls.RMW_OPERANDS
     input_slots = op.op_cls.INPUT_OPERANDS
@@ -591,12 +606,17 @@ def _build_buffer_access(
 ) -> BufferAccess:
     """Produce a :class:`BufferAccess` for ``tname`` referenced by ``op`` via ``axes``.
 
-    Each per-dim :class:`AccessRange` carries coefficients for BOTH the
-    outer trip iter-var (coeff = ``tile``) and the inner tile iter-var
-    (coeff = 1), so the full affine address along that dim is
-    ``outer * tile + inner``. The range's ``extent`` stays equal to
-    ``tile`` — it is a per-iteration width for the innermost loop, which
-    the renderer will ultimately elide.
+    Per-dim :class:`AccessRange` shape depends on whether the axis is
+    bounded or unbounded for this op:
+
+    - **Bounded axis**: coefficients for BOTH the outer trip iter-var
+      (coeff = ``tile``) and the inner tile iter-var (coeff = 1); full
+      affine address along that dim is ``outer * tile + inner``. The
+      range's ``extent`` equals ``tile`` — a per-iteration width for the
+      innermost loop, which the renderer elides.
+    - **Unbounded axis**: single coefficient on the sole tile iter-var
+      (coeff = 1); ``extent`` equals the full axis size. No outer trip
+      entry exists (no outer loop to index).
     """
     tensor = module.tensors[tname]
     iv_ids_seen: list[int] = []
@@ -614,21 +634,29 @@ def _build_buffer_access(
                 axis_id = module.axis_id_by_name(tensor_dim_name)
             except KeyError:
                 axis_id = -1
-        outer = axis_to_outer.get(axis_id)
         inner = axis_to_inner.get(axis_id)
-        if outer is None or inner is None:
+        if inner is None:
             """Untouched axis — constant-offset access along this dim.
             Canonical build never hits this branch but keeps the
             function total."""
             extent = op.axis_tile.get(axis_id, tensor.shape[i]) if axis_id in module.axes else tensor.shape[i]
             pattern_entries.append(AccessRange.make({}, 0, extent))
             continue
-        tile = op.axis_tile[axis_id]
-        if outer.var_id not in iv_ids_seen:
-            iv_ids_seen.append(outer.var_id)
-        if inner.var_id not in iv_ids_seen:
-            iv_ids_seen.append(inner.var_id)
-        pattern_entries.append(AccessRange.make({outer.var_id: tile, inner.var_id: 1}, 0, tile))
+        outer = axis_to_outer.get(axis_id)
+        if outer is not None:
+            """Bounded axis: outer*tile + inner coefficient entries, extent = tile."""
+            tile = op.axis_tile[axis_id]
+            if outer.var_id not in iv_ids_seen:
+                iv_ids_seen.append(outer.var_id)
+            if inner.var_id not in iv_ids_seen:
+                iv_ids_seen.append(inner.var_id)
+            pattern_entries.append(AccessRange.make({outer.var_id: tile, inner.var_id: 1}, 0, tile))
+        else:
+            """Unbounded axis: single inner coefficient, extent = full axis."""
+            total = module.axes[axis_id].total_size
+            if inner.var_id not in iv_ids_seen:
+                iv_ids_seen.append(inner.var_id)
+            pattern_entries.append(AccessRange.make({inner.var_id: 1}, 0, total))
     return BufferAccess(tensor_name=tname, iter_var_ids=tuple(iv_ids_seen), pattern=tuple(pattern_entries))
 
 
@@ -651,13 +679,16 @@ def _make_alloc_sblock(alloc: _AllocRecord) -> SBlock:
 
 
 def _build_tree(op: _ParsedOp, module: KernelModule) -> ForNode | SBlock:
-    """Build the iter-var schedule tree for ``op``: TWO ForNodes per touched dim.
+    """Build the iter-var schedule tree for ``op``.
 
-    If ``op.touched_dims`` is empty, returns the :class:`SBlock` directly
-    (no loop nest needed). Otherwise wraps outer-then-inner per dim, so
-    ``block.iter_vars[0]`` (the outer of the first touched dim) becomes
-    the outermost :class:`ForNode` and the innermost :class:`ForNode`
-    binds the inner iter-var of the last touched dim.
+    Bounded axes contribute TWO ForNodes per touched dim (outer trip +
+    inner tile); unbounded axes contribute ONE ForNode (the tile).
+
+    If ``op.touched_axes`` is empty, returns the :class:`SBlock` directly
+    (no loop nest needed). Otherwise wraps in source-order per axis, so
+    ``block.iter_vars[0]`` becomes the outermost :class:`ForNode` and the
+    innermost :class:`ForNode` binds the last iter-var of the last
+    touched axis.
     """
     block = _make_sblock(op, module)
     return _wrap_block_in_fornodes(block)
@@ -666,9 +697,10 @@ def _build_tree(op: _ParsedOp, module: KernelModule) -> ForNode | SBlock:
 def _wrap_block_in_fornodes(block: SBlock) -> ForNode | SBlock:
     """Wrap ``block`` in one :class:`ForNode` per iter var, outermost first.
 
-    After Task 4 the block's ``iter_vars`` alternates outer/inner per
-    touched dim; iterating in reverse nests them as
-    ``outer_d0 > inner_d0 > outer_d1 > inner_d1 > ... > block``.
+    The block's ``iter_vars`` list holds one entry per unbounded axis
+    (the tile) and two entries per bounded axis (outer trip + inner
+    tile), in axis source-order. Iterating in reverse nests them so
+    that the first iter-var becomes the outermost :class:`ForNode`.
 
     Returns ``block`` unwrapped if it has no iter vars (alloc blocks).
     """
