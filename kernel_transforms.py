@@ -1,11 +1,9 @@
-from pathlib import Path
-
 import nki
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 
-from nkigym.tune.verify import _rewrite_to_fp32
+from nkigym.synthesis import simulate_fp32
 
 """
 d0: K
@@ -22,11 +20,20 @@ def kernel_0(lhs_T, rhs):
     sbuf_prod = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     for i_d0_0 in range(16):
-        nisa.dma_copy(dst=sbuf_lhs_T[0:128, i_d0_0, 0:2048], src=lhs_T[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, 0:2048])
+        for i_d1_0 in range(1):
+            nisa.dma_copy(
+                dst=sbuf_lhs_T[0:128, i_d0_0, i_d1_0 * 2048 : i_d1_0 * 2048 + 2048],
+                src=lhs_T[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, i_d1_0 * 2048 : i_d1_0 * 2048 + 2048],
+            )
     for i_d0_0 in range(16):
-        nisa.dma_copy(dst=sbuf_rhs[0:128, i_d0_0, 0:2048], src=rhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, 0:2048])
+        for i_d2_0 in range(1):
+            nisa.dma_copy(
+                dst=sbuf_rhs[0:128, i_d0_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
+                src=rhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
+            )
     for i_d1_0 in range(16):
-        nisa.memset(psum_acc[0:128, i_d1_0, 0:2048], value=0.0)
+        for i_d2_0 in range(1):
+            nisa.memset(psum_acc[0:128, i_d1_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048], value=0.0)
     for i_d0_0 in range(16):
         for i_d1_0 in range(16):
             for i_d2_0 in range(4):
@@ -36,9 +43,17 @@ def kernel_0(lhs_T, rhs):
                     moving=sbuf_rhs[0:128, i_d0_0, (i_d2_0) * 512 : (i_d2_0) * 512 + 512],
                 )
     for i_d1_0 in range(16):
-        nisa.tensor_copy(sbuf_prod[0:128, i_d1_0, 0:2048], psum_acc[0:128, i_d1_0, 0:2048])
+        for i_d2_0 in range(1):
+            nisa.tensor_copy(
+                sbuf_prod[0:128, i_d1_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
+                psum_acc[0:128, i_d1_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
+            )
     for i_d1_0 in range(16):
-        nisa.dma_copy(dst=hbm_out[(i_d1_0) * 128 : (i_d1_0) * 128 + 128, 0:2048], src=sbuf_prod[0:128, i_d1_0, 0:2048])
+        for i_d2_0 in range(1):
+            nisa.dma_copy(
+                dst=hbm_out[(i_d1_0) * 128 : (i_d1_0) * 128 + 128, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
+                src=sbuf_prod[0:128, i_d1_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
+            )
     return hbm_out
 
 
@@ -517,14 +532,10 @@ def _main() -> None:
     expected = lhs_T.T @ rhs
 
     atol = rtol = 5e-3
-    source = Path(__file__).read_text()
-    sim_source = _rewrite_to_fp32(source)
-    ns: dict = {}
-    exec(sim_source, ns)
-
-    kernel_names = [name for name in ns if name.startswith("kernel_")]
-    for name in kernel_names[-3:]:
-        actual = nki.simulate(ns[name])(lhs_T, rhs)
+    kernels = [(name, obj) for name, obj in globals().items() if name.startswith("kernel_") and callable(obj)]
+    kernels.sort(key=lambda nv: int(nv[0].split("_")[1]))
+    for name, kernel in kernels:
+        actual = simulate_fp32(kernel)(lhs_T, rhs)
         if isinstance(actual, tuple):
             actual = actual[0]
         actual = np.asarray(actual)

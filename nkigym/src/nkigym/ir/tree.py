@@ -23,29 +23,20 @@ terminal :class:`ISANode` records ``tensorize_sizes[dim] = tile_size``
 (``tile_size = op_cls.MAX_TILE_SIZE[abstract]`` when set, else the
 full axis extent — so unbounded axes emit ``Loop trip=1`` with the
 full extent carried on the ISA node).
-:meth:`KernelTree.dump` writes the tree as a Mermaid ``flowchart TB``
-source plus a rendered PNG under a caller-supplied cache directory.
+Visualization helpers live in :mod:`nkigym.ir.tree_visualize`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from pathlib import Path
+from typing import Any
 
 import networkx as nx
 
-from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
-from nkigym.ir.dimension_analysis import DimensionAnalysis, OpAxes, TensorDims
+from nkigym.ir.dimension_analysis import TensorDims, _AnalysisResult, _OpRecord
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import AxisRole, NKIOp
-
-_FLOWCHART_STYLES: list[ClassStyle] = [
-    ClassStyle(name="alloc", fill="#fef", stroke="#963"),
-    ClassStyle(name="loop", fill="#eef", stroke="#336"),
-    ClassStyle(name="tensorize", fill="#ffe", stroke="#a60"),
-    ClassStyle(name="leaf", fill="#efe", stroke="#363"),
-]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -78,11 +69,24 @@ class ISANode:
         reads: Tensor names from slots in ``op_cls.INPUT_OPERANDS``.
         writes: Tensor names from slots that are neither input nor RMW.
         rmw: Tensor names from slots in ``op_cls.RMW_OPERANDS``.
-        tensorize_sizes: Per-axis tile width (``dim → tile_size``)
+        tensorize_sizes: Per-axis tile width (``abstract_axis → tile_size``)
             lowered onto the ISA call's slice width. Keys mirror the
-            ``dim`` of the enclosing :class:`ForNode` chain; for
-            :class:`NKIAlloc` leaves (no surrounding loops) this is
-            empty.
+            ``axis_map`` keys; for :class:`NKIAlloc` leaves they record
+            the per-axis tile sized to ``NKIAlloc.MAX_TILE_SIZE`` (or
+            full extent when unbounded).
+        axis_map: ``abstract_axis → concrete_dim`` (e.g. ``{"K": "d0"}``).
+            Render consults this alongside ``op_cls.OPERAND_AXES`` to
+            resolve each slot's axis labels to concrete dim ids. For
+            :class:`NKIAlloc` leaves it zips ``OPERAND_AXES["dst"]`` to
+            the tensor's ``dim_ids``.
+        kwargs: Non-operand call kwargs captured from the tracer
+            (e.g. ``{"value": 0.0}`` for ``NKIMemset``,
+            ``{"op": "rsqrt", "scale": 1.0}`` for ``NKIActivation``).
+            Empty for :class:`NKIAlloc` leaves.
+        location: Memory location (``"hbm"`` / ``"sbuf"`` / ``"psum"``)
+            for :class:`NKIAlloc` leaves; ``None`` for compute ops.
+        dtype: Declared dtype (``"float32"`` / ``"float16"`` / ``"bfloat16"``)
+            for :class:`NKIAlloc` leaves; ``None`` for compute ops.
     """
 
     op_cls: type[NKIOp]
@@ -90,6 +94,10 @@ class ISANode:
     writes: tuple[str, ...] = ()
     rmw: tuple[str, ...] = ()
     tensorize_sizes: dict[str, int] = field(default_factory=dict)
+    axis_map: dict[str, str] = field(default_factory=dict)
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    location: str | None = None
+    dtype: str | None = None
 
 
 NodeData = RootNode | ForNode | ISANode
@@ -106,14 +114,12 @@ class KernelTree:
         graph: The underlying ``nx.DiGraph``. Node payloads live at
             ``graph.nodes[nid]["data"]``.
         root: Node id of the forest root (a :class:`RootNode`).
-        dim_sizes: ``dim_name → extent`` (retained for display / debug).
     """
 
-    def __init__(self, dim_sizes: dict[str, int]) -> None:
-        """Initialise an empty tree carrying ``dim_sizes`` for dumping."""
+    def __init__(self) -> None:
+        """Initialise an empty tree."""
         self.graph: nx.DiGraph = nx.DiGraph()
         self._next_id: int = 0
-        self.dim_sizes: dict[str, int] = dim_sizes
         self.root: int = self.add_node(RootNode())
 
     def add_node(self, data: NodeData, parent: int | None = None) -> int:
@@ -124,6 +130,11 @@ class KernelTree:
         if parent is not None:
             self.graph.add_edge(parent, nid)
         return nid
+
+    @property
+    def num_nodes(self) -> int:
+        """Total node count in the underlying graph (includes the root)."""
+        return self.graph.number_of_nodes()
 
     def data(self, nid: int) -> NodeData:
         """Return the payload attached to node ``nid``."""
@@ -167,74 +178,36 @@ class KernelTree:
             if self.graph.out_degree(m) == 0:
                 yield m
 
-    def dump(self, cache_dir: str | Path) -> None:
-        """Write ``tree.mmd`` and ``tree.png`` into ``cache_dir``.
 
-        Creates ``cache_dir`` if it does not exist. The ``.mmd`` file
-        holds Mermaid source; ``.png`` is rendered at ``mmdc -s 4``
-        with ``--no-sandbox`` (required on gym hosts under AppArmor).
-        """
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        mmd_path = cache_path / "tree.mmd"
-        png_path = cache_path / "tree.png"
-        mmd_path.write_text(_to_mermaid(self), encoding="utf-8")
-        render_png(mmd_path, png_path)
+def build_initial_tree(analysis: _AnalysisResult) -> KernelTree:
+    """Build the canonical schedule tree from an :class:`_AnalysisResult`.
 
-
-def build_initial_tree(analysis: DimensionAnalysis) -> KernelTree:
-    """Build the canonical schedule tree from a :class:`DimensionAnalysis`.
-
-    Alloc leaves (every :class:`NKIAlloc`) sit as direct children of the
-    root in declaration order — allocation is a whole-tensor statement,
-    so no surrounding trip loop is emitted. Each alloc still carries
-    ``tensorize_sizes`` keyed by its concrete dim ids, derived from the
-    tensor's shape and :attr:`NKIAlloc.MAX_TILE_SIZE` so downstream atoms
-    see a uniform per-leaf tile map. Each compute op gets its own
-    per-axis loop nest; loops appear outermost-to-innermost in the op's
-    ``axis_map`` iteration order (which mirrors ``OPERAND_AXES``).
-
-    Args:
-        analysis: Output of
-            :func:`nkigym.ir.dimension_analysis.analyze_dimensions`.
-
-    Returns:
-        A populated :class:`KernelTree`.
+    Iterates ``analysis.ops`` uniformly — each :class:`_OpRecord`
+    (including :class:`NKIAlloc` records prepended by the tracer)
+    becomes one call to :func:`_attach_op_subtree`. Alloc leaves sit as
+    direct children of the root (no surrounding loops); compute ops get
+    a per-axis loop nest outermost-to-innermost in axis_map order.
     """
-    tree = KernelTree(dim_sizes=analysis.dim_sizes)
-    param_names = set(analysis.param_names)
-    for name, tensor in analysis.tensors.items():
-        if name in param_names:
-            continue
-        tree.add_node(
-            ISANode(op_cls=NKIAlloc, writes=(name,), tensorize_sizes=_alloc_tensorize_sizes(tensor)), parent=tree.root
-        )
+    tree = KernelTree()
     for op in analysis.ops:
-        _attach_op_subtree(tree, op)
+        _attach_op_subtree(tree, op, analysis.dim_sizes, analysis.tensors)
     return tree
 
 
-def _alloc_tensorize_sizes(tensor: TensorDims) -> dict[str, int]:
-    """Build the per-dim tile map for an :class:`NKIAlloc` leaf.
+def _attach_op_subtree(
+    tree: KernelTree, op: _OpRecord, dim_sizes: dict[str, int], tensors: dict[str, TensorDims]
+) -> None:
+    """Attach one op subtree under ``tree.root``.
 
-    Zips the tensor's ``dim_ids`` against ``NKIAlloc.OPERAND_AXES["dst"]``
-    to find each axis's abstract label, then picks the tile width from
-    :attr:`NKIAlloc.MAX_TILE_SIZE` (``None`` ⇒ full extent). The returned
-    map is keyed by concrete dim id so it has the same shape as the
-    ``tensorize_sizes`` of any compute-op leaf.
+    Builds the per-axis loop chain (skipped for :class:`NKIAlloc`) and
+    the terminal :class:`ISANode`. Operand slots are split into reads /
+    writes / rmw via ``op_cls.INPUT_OPERANDS`` and ``op_cls.RMW_OPERANDS``.
+    Per-axis tile widths come from ``op_cls.MAX_TILE_SIZE`` (full extent
+    when ``None``). For :class:`NKIAlloc` leaves the declared
+    ``location`` and ``dtype`` are copied from the allocated
+    :class:`TensorDims` onto the leaf so renderers don't have to
+    round-trip through ``ir.tensors``.
     """
-    dst_axes = NKIAlloc.OPERAND_AXES["dst"]
-    sizes: dict[str, int] = {}
-    for i, dim_id in enumerate(tensor.dim_ids):
-        abstract = dst_axes[i]
-        extent = tensor.shape[i]
-        max_tile = NKIAlloc.MAX_TILE_SIZE.get(abstract)
-        sizes[dim_id] = extent if max_tile is None else max_tile
-    return sizes
-
-
-def _attach_op_subtree(tree: KernelTree, op: OpAxes) -> None:
-    """Attach one compute-op loop nest under ``tree.root``."""
     reads: list[str] = []
     writes: list[str] = []
     rmw: list[str] = []
@@ -245,57 +218,34 @@ def _attach_op_subtree(tree: KernelTree, op: OpAxes) -> None:
             rmw.append(tensor_name)
         else:
             writes.append(tensor_name)
+    emit_loops = op.op_cls is not NKIAlloc
     parent = tree.root
-    tensorize_sizes = {}
+    tensorize_sizes: dict[str, int] = {}
     for abstract, concrete in op.axis_map.items():
-        extent = tree.dim_sizes[concrete]
+        extent = dim_sizes[concrete]
         max_tile = op.op_cls.MAX_TILE_SIZE.get(abstract)
         tile = extent if max_tile is None else max_tile
-        role = op.op_cls.AXIS_ROLES.get(abstract, AxisRole.PARALLEL)
-        parent = tree.add_node(ForNode(dim=concrete, trip=extent // tile, loop_type=role), parent=parent)
-        tensorize_sizes[concrete] = tile
+        tensorize_sizes[abstract] = tile
+        if emit_loops:
+            role = op.op_cls.AXIS_ROLES.get(abstract, AxisRole.PARALLEL)
+            parent = tree.add_node(ForNode(dim=concrete, trip=extent // tile, loop_type=role), parent=parent)
+    is_alloc = op.op_cls is NKIAlloc
+    location = tensors[writes[0]].location if is_alloc else None
+    dtype = tensors[writes[0]].dtype if is_alloc else None
     tree.add_node(
         ISANode(
-            op_cls=op.op_cls, reads=tuple(reads), writes=tuple(writes), rmw=tuple(rmw), tensorize_sizes=tensorize_sizes
+            op_cls=op.op_cls,
+            reads=tuple(reads),
+            writes=tuple(writes),
+            rmw=tuple(rmw),
+            location=location,
+            dtype=dtype,
+            tensorize_sizes=tensorize_sizes,
+            axis_map=dict(op.axis_map),
+            kwargs=dict(op.kwargs),
         ),
         parent=parent,
     )
 
 
-def _to_mermaid(tree: KernelTree) -> str:
-    """Render ``tree`` to a Mermaid ``flowchart TB`` source string."""
-    flow = Flowchart(direction="TB", styles=_FLOWCHART_STYLES)
-    for nid in tree.preorder():
-        node_id = f"n{nid}"
-        decl, class_name = _tree_node_decl(node_id, nid, tree.data(nid))
-        flow.add_node(node_id, decl, class_name)
-        for child in tree.children(nid):
-            flow.add_edge(node_id, f"n{child}")
-    return flow.render()
-
-
-def _tree_node_decl(node_id: str, nid: int, data: NodeData) -> tuple[str, str | None]:
-    """Return the Mermaid declaration + class bucket for one tree node."""
-    if isinstance(data, RootNode):
-        return f'{node_id}(("#{nid} root"))', None
-    if isinstance(data, ForNode):
-        return (f'{node_id}["#{nid} Loop {data.dim} trip={data.trip}<br/>{data.loop_type.name}"]', "loop")
-    if isinstance(data, ISANode):
-        return (f'{node_id}["#{nid} {_isa_label(data)}"]', "alloc" if data.op_cls is NKIAlloc else "leaf")
-    raise TypeError(f"unknown node data type: {type(data).__name__}")
-
-
-def _isa_label(data: ISANode) -> str:
-    """Build the Mermaid node label for an :class:`ISANode` payload."""
-    parts: list[str] = [data.op_cls.__name__]
-    if data.reads:
-        parts.append(f"reads={','.join(data.reads)}")
-    if data.writes:
-        parts.append(f"writes={','.join(data.writes)}")
-    if data.rmw:
-        parts.append(f"rmw={','.join(data.rmw)}")
-    parts.append(f"tensorize_sizes={data.tensorize_sizes}")
-    return "<br/>".join(parts)
-
-
-__all__ = ["DimensionAnalysis", "ForNode", "ISANode", "KernelTree", "NodeData", "RootNode", "build_initial_tree"]
+__all__ = ["ForNode", "ISANode", "KernelTree", "NodeData", "RootNode", "build_initial_tree"]
