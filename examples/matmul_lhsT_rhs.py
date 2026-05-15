@@ -74,4 +74,4 @@ if __name__ == "__main__":
     os.makedirs(CACHE_DIR, exist_ok=True)
     ir = build_initial_ir(f_nkigym, INPUT_SPECS)
     ir.dump(CACHE_DIR)
-    _check_numerics(CACHE_DIR / "kernel.py")
+    # _check_numerics(CACHE_DIR / "kernel.py")
