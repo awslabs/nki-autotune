@@ -77,7 +77,7 @@ Do NOT import NKIOp classes from `nkigym.ops` (flat namespace) — that package 
 
 | Op | Import | Operands (reads → writes) | Call |
 |---|---|---|---|
-| `NKIAlloc` | `nkigym.ops.alloc` | — → declared buffer | `NKIAlloc(location="sbuf\|psum\|hbm", shape=(...), dtype="bfloat16\|float32\|float16")()` — declares a tensor |
+| `NKIAlloc` | `nkigym.ops.alloc` | — → declared buffer | `NKIAlloc(location="sbuf\|psum\|shared_hbm", shape=(...), dtype="bfloat16\|float32\|float16")()` — declares a tensor |
 | `NKIMemset` | `nkigym.ops.memset` | — → dst:(P,F) | `NKIMemset(value=0.0)(dst=buffer)` — fills dst with scalar |
 | `NKILoad` | `nkigym.ops.load` | src:(P,F) → dst:(P,F) | `NKILoad()(src=param, dst=param_sbuf)` — HBM → SBUF |
 | `NKIStore` | `nkigym.ops.store` | src:(P,F) → dst:(P,F) | `NKIStore()(src=sbuf, dst=hbm_out)` — SBUF → HBM |
@@ -98,7 +98,7 @@ Op-arg vocabulary: `op` ∈ `{square, exp, copy, reciprocal, tanh, rsqrt, sqrt}`
    - Load targets: `location="sbuf"` — holds loaded parameters
    - PSUM accumulators: `location="psum", dtype="float32"` — used by matmul and transpose
    - Intermediate compute results: `location="sbuf"` — holds activation, reduce, tensor_scalar outputs
-   - Kernel output: `location="hbm"` — the tensor `NKIStore` writes into and the function returns
+   - Kernel output: `location="shared_hbm"` — the tensor `NKIStore` writes into and the function returns
 2. Load every parameter from `INPUT_SPECS` at the top. Each parameter needs an SBUF buffer declared first, then `NKILoad()(src=param, dst=param_sbuf)`.
 3. List every tensor-level step in `f_numpy`, stripping `.astype(...)` and `keepdims=True` (numpy bookkeeping, not primitives).
 4. Map each step to one or more `NKIOp` calls. Key patterns:
@@ -129,7 +129,7 @@ def f_nkigym(lhs_T, rhs):
     rhs_sbuf   = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
     psum_acc   = NKIAlloc(location="psum", shape=(2048, 2048), dtype="float32")()
     sbuf_prod  = NKIAlloc(location="sbuf", shape=(2048, 2048), dtype="bfloat16")()
-    hbm_out    = NKIAlloc(location="hbm",  shape=(2048, 2048), dtype="bfloat16")()
+    hbm_out    = NKIAlloc(location="shared_hbm", shape=(2048, 2048), dtype="bfloat16")()
 
     NKILoad()(src=lhs_T, dst=lhs_T_sbuf)
     NKILoad()(src=rhs,   dst=rhs_sbuf)

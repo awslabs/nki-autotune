@@ -29,7 +29,7 @@ class NKIAlloc(NKIOp):
     """Declare a tensor with explicit location/shape/dtype.
 
     kwargs on the user call:
-        location: ``"hbm"`` | ``"sbuf"`` | ``"psum"``
+        location: ``"shared_hbm"`` | ``"sbuf"`` | ``"psum"``
         shape: ``tuple[int, ...]``
         dtype: ``str`` — one of ``"float32"`` / ``"float16"`` / ``"bfloat16"``.
 
@@ -39,7 +39,12 @@ class NKIAlloc(NKIOp):
     The returned array is tagged with the ``location`` role so the
     next op's ``_check_roles`` sees the correct operand residency. At
     render time the emitter produces
-    ``<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=nl.<location>)``.
+    ``<name> = nl.ndarray(<shape>, dtype=nl.<dtype>, buffer=nl.<location>)``;
+    the rendered shape depends on the declared location:
+
+    * ``shared_hbm`` — flat ``(P, F)``.
+    * ``sbuf`` / ``psum`` — partition-aware ``(128, P // 128, F)``;
+      ``P`` must be a multiple of 128.
     """
 
     NAME: ClassVar[str] = "alloc"
@@ -56,5 +61,5 @@ class NKIAlloc(NKIOp):
         return np.empty(shape, dtype=dtype)
 
     def _output_role(self, **kwargs: Any) -> str:
-        """Output role = the declared ``location`` (``"hbm"`` / ``"sbuf"`` / ``"psum"``)."""
+        """Output role = the declared ``location`` (``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``)."""
         return kwargs["location"]

@@ -5,7 +5,7 @@ when called on bare numpy arrays: each NKIOp's ``_run`` body writes
 through its ``dst`` operand (or ``reduce_res`` for activation_reduce),
 and the per-op ``_check_roles`` enforces the load/compute/store lineage
 at runtime. The decorator asserts the return value carries role
-``"hbm"`` (direct return of the alloc'd HBM buffer) or ``"stored"``
+``"shared_hbm"`` (direct return of the alloc'd HBM buffer) or ``"stored"``
 (direct return of NKIStore).
 """
 
@@ -30,7 +30,7 @@ def _lhsT_matmul(lhs_T, rhs):
     rhs_sbuf = NKIAlloc(location="sbuf", shape=(K, N), dtype="float32")()
     psum_acc = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
     sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="float32")()
-    hbm_out = NKIAlloc(location="hbm", shape=(M, N), dtype="float32")()
+    hbm_out = NKIAlloc(location="shared_hbm", shape=(M, N), dtype="float32")()
 
     NKILoad()(src=lhs_T, dst=lhs_T_sbuf)
     NKILoad()(src=rhs, dst=rhs_sbuf)
@@ -55,7 +55,7 @@ def test_direct_call_returns_hbm_role():
     lhs_T = rng.standard_normal((K, M)).astype(np.float32)
     rhs = rng.standard_normal((K, N)).astype(np.float32)
     out = _lhsT_matmul(lhs_T=lhs_T, rhs=rhs)
-    assert getattr(out, "role", None) == "hbm"
+    assert getattr(out, "role", None) == "shared_hbm"
 
 
 def test_load_rejects_non_param_src():
@@ -69,7 +69,7 @@ def test_load_rejects_non_param_src():
 def test_store_rejects_non_sbuf_src():
     """NKIStore's per-op _check_roles fires when src is PSUM instead of SBUF."""
     psum = NKIAlloc(location="psum", shape=(16, 16), dtype="float32")()
-    dst = NKIAlloc(location="hbm", shape=(16, 16), dtype="float32")()
+    dst = NKIAlloc(location="shared_hbm", shape=(16, 16), dtype="float32")()
     with pytest.raises(TypeError, match="NKIStore.*expects sbuf"):
         NKIStore()(src=psum, dst=dst)
 

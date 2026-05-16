@@ -20,7 +20,7 @@ def _matmul_fixture(lhs_T, rhs):
     sbuf_rhs = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
     psum_acc = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
     sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
-    hbm_out = NKIAlloc(location="hbm", shape=(M, N), dtype="bfloat16")()
+    hbm_out = NKIAlloc(location="shared_hbm", shape=(M, N), dtype="bfloat16")()
 
     NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
     NKILoad()(src=rhs, dst=sbuf_rhs)
@@ -75,9 +75,15 @@ def test_matmul_leaf_carries_axis_map():
 
 
 def test_alloc_leaves_carry_location():
-    """NKIAlloc leaves carry the declared ``location`` (hbm/sbuf/psum)."""
+    """NKIAlloc leaves carry the declared ``location`` (shared_hbm/sbuf/psum)."""
     ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    expected = {"sbuf_lhs_T": "sbuf", "sbuf_rhs": "sbuf", "psum_acc": "psum", "sbuf_prod": "sbuf", "hbm_out": "hbm"}
+    expected = {
+        "sbuf_lhs_T": "sbuf",
+        "sbuf_rhs": "sbuf",
+        "psum_acc": "psum",
+        "sbuf_prod": "sbuf",
+        "hbm_out": "shared_hbm",
+    }
     for leaf in _leaves_by_op(ir, "NKIAlloc"):
         tname = leaf.writes[0]
         assert leaf.location == expected[tname], f"{tname}.location={leaf.location!r}"
@@ -144,7 +150,7 @@ def test_intermediate_tensor_location_and_dtype():
         "sbuf_rhs": ("sbuf", "bfloat16"),
         "psum_acc": ("psum", "float32"),
         "sbuf_prod": ("sbuf", "bfloat16"),
-        "hbm_out": ("hbm", "bfloat16"),
+        "hbm_out": ("shared_hbm", "bfloat16"),
     }
     for name, (loc, dt) in expected.items():
         t = ir.tensors[name]
@@ -156,7 +162,7 @@ def test_param_tensor_location_is_hbm():
     """Kernel params live in HBM; the location is fixed by the role lattice."""
     ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
     for name in ("lhs_T", "rhs"):
-        assert ir.tensors[name].location == "hbm"
+        assert ir.tensors[name].location == "shared_hbm"
 
 
 def test_param_tensor_dtype_inferred_from_load_dst():
@@ -297,4 +303,4 @@ def test_dump_writes_envelope_markdown(tmp_path):
     assert "| `d0` | 2048 |" in envelope
     assert "## Tensors" in envelope
     assert "| `psum_acc` | intermediate | `psum` | `float32` |" in envelope
-    assert "| `lhs_T` | param | `hbm` | `bfloat16` |" in envelope
+    assert "| `lhs_T` | param | `shared_hbm` | `bfloat16` |" in envelope

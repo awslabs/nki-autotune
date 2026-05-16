@@ -23,8 +23,8 @@ class TensorDims:
         name: Source-level variable name.
         shape: Per-dim extents, aligned with ``dim_ids``.
         dim_ids: Concrete dim names (``d0``, ``d1`` ...).
-        location: ``"hbm"`` / ``"sbuf"`` / ``"psum"``. Params resolve
-            to ``"hbm"`` (the role lattice forbids any other location);
+        location: ``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``. Params resolve
+            to ``"shared_hbm"`` (the role lattice forbids any other location);
             intermediates take the location declared via
             :class:`NKIAlloc`.
         dtype: ``"float32"`` / ``"float16"`` / ``"bfloat16"``. For
@@ -96,7 +96,7 @@ def analyze_dimensions(func: Callable[..., Any], input_specs: dict[str, tuple[in
     state = _TraceState(alloc_names=_collect_alloc_names(unwrapped))
     for name in param_names:
         sym = _Sym(tuple(input_specs[name]), name)
-        sym.location = "hbm"
+        sym.location = "shared_hbm"
         state.sentinels[name] = sym
 
     _run_trace(unwrapped, [state.sentinels[n] for n in param_names], state)

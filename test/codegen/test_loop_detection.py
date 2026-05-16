@@ -27,7 +27,7 @@ def _matmul_fixture(lhs_T, rhs):
     sbuf_rhs = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
     psum_acc = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
     sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
-    hbm_out = NKIAlloc(location="hbm", shape=(M, N), dtype="bfloat16")()
+    hbm_out = NKIAlloc(location="shared_hbm", shape=(M, N), dtype="bfloat16")()
 
     NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
     NKILoad()(src=rhs, dst=sbuf_rhs)

@@ -14,7 +14,7 @@ _INPUT_SPECS: dict[str, tuple[int, ...]] = {"x": (128, 512)}
 def _identity(x):
     """Trivial fixture: load x, store back to a fresh HBM buffer."""
     sbuf_x = NKIAlloc(location="sbuf", shape=(128, 512), dtype="bfloat16")()
-    hbm_y = NKIAlloc(location="hbm", shape=(128, 512), dtype="bfloat16")()
+    hbm_y = NKIAlloc(location="shared_hbm", shape=(128, 512), dtype="bfloat16")()
     NKILoad()(src=x, dst=sbuf_x)
     NKIStore()(src=sbuf_x, dst=hbm_y)
     return hbm_y

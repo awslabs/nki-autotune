@@ -83,7 +83,7 @@ class ISANode:
             (e.g. ``{"value": 0.0}`` for ``NKIMemset``,
             ``{"op": "rsqrt", "scale": 1.0}`` for ``NKIActivation``).
             Empty for :class:`NKIAlloc` leaves.
-        location: Memory location (``"hbm"`` / ``"sbuf"`` / ``"psum"``)
+        location: Memory location (``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``)
             for :class:`NKIAlloc` leaves; ``None`` for compute ops.
         dtype: Declared dtype (``"float32"`` / ``"float16"`` / ``"bfloat16"``)
             for :class:`NKIAlloc` leaves; ``None`` for compute ops.

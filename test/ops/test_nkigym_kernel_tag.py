@@ -14,7 +14,7 @@ def test_nkigym_kernel_sets_tag_on_wrapper():
     @nkigym_kernel
     def identity(x):
         sbuf = NKIAlloc(location="sbuf", shape=(128, 128), dtype="bfloat16")()
-        hbm = NKIAlloc(location="hbm", shape=(128, 128), dtype="bfloat16")()
+        hbm = NKIAlloc(location="shared_hbm", shape=(128, 128), dtype="bfloat16")()
         NKILoad()(src=x, dst=sbuf)
         NKIStore()(src=sbuf, dst=hbm)
         return hbm

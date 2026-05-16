@@ -15,12 +15,12 @@ import numpy as np
 
 """Role lattice for CPU-sim role tracking:
 
-- ``"param"``   — HBM kernel input. Only ``NKILoad`` may consume it.
-- ``"sbuf"``    — SBUF-resident tensor.
-- ``"psum"``    — PSUM-resident tensor.
-- ``"hbm"``     — non-output HBM tensor (intra-kernel scratch / final output).
+- ``"param"``       — HBM kernel input. Only ``NKILoad`` may consume it.
+- ``"sbuf"``        — SBUF-resident tensor.
+- ``"psum"``        — PSUM-resident tensor.
+- ``"shared_hbm"``  — non-output HBM tensor (intra-kernel scratch / final output).
 - ``"stored"`` — HBM output of ``NKIStore``. Also acceptable as the kernel
-  ``return`` value (alongside ``"hbm"``).
+  ``return`` value (alongside ``"shared_hbm"``).
 
 Bare ``np.ndarray`` operands (the typical entry path: a kernel called
 with fresh numpy inputs) are treated as ``"param"``. Per-op ``_check_roles``
@@ -215,7 +215,7 @@ class NKIOp:
         return result
 
 
-_VALID_RETURN_ROLES = frozenset({"stored", "hbm"})
+_VALID_RETURN_ROLES = frozenset({"stored", "shared_hbm"})
 
 
 def nkigym_kernel(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -224,9 +224,9 @@ def nkigym_kernel(func: Callable[..., Any]) -> Callable[..., Any]:
     Tags every ``np.ndarray`` argument with ``role="param"`` on entry
     so any non-``NKILoad`` op that touches them fails its per-op role
     check. After ``func`` returns, asserts the return value is a
-    ``_RoleArray`` with ``role in {"stored", "hbm"}`` — either the
+    ``_RoleArray`` with ``role in {"stored", "shared_hbm"}`` — either the
     direct return of an ``NKIStore`` call (``"stored"``) or the HBM
-    buffer the caller allocated and stored into (``"hbm"``). Other
+    buffer the caller allocated and stored into (``"shared_hbm"``). Other
     roles raise ``TypeError`` at the return site.
 
     The returned wrapper carries ``__nkigym_kernel__ = True`` so public

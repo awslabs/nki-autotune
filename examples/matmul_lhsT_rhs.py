@@ -44,7 +44,7 @@ def f_nkigym(lhs_T, rhs):
     sbuf_rhs = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
     psum_prod = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
     sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
-    hbm_out = NKIAlloc(location="hbm", shape=(M, N), dtype="bfloat16")()
+    hbm_out = NKIAlloc(location="shared_hbm", shape=(M, N), dtype="bfloat16")()
 
     NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
     NKILoad()(src=rhs, dst=sbuf_rhs)
@@ -74,4 +74,4 @@ if __name__ == "__main__":
     os.makedirs(CACHE_DIR, exist_ok=True)
     ir = build_initial_ir(f_nkigym, INPUT_SPECS)
     ir.dump(CACHE_DIR)
-    # _check_numerics(CACHE_DIR / "kernel.py")
+    _check_numerics(CACHE_DIR / "kernel.py")
