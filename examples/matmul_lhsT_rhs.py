@@ -1,9 +1,14 @@
-"""Numpy matmul → ``f_nkigym`` → dim unification.
+"""Numpy matmul → ``f_nkigym`` → canonical IR → ``Split`` demo.
 
 The ``f_nkigym`` body below is the output of
 :func:`nkigym.synthesis.numpy_to_nkigym.compile_numpy_to_nkigym`
 pasted verbatim — re-run the synthesiser manually whenever the op
 surface or workload changes.
+
+After dumping the canonical IR (``kernel_0``), this script applies
+:class:`~nkigym.transforms.Split` on the ``lhs_T`` load's free axis
+``F`` with factors ``(16, 128)`` to produce ``kernel_1`` — matching
+the ``kernel_0 → kernel_1`` trace in ``kernel_transforms.py``.
 
 Usage::
 
@@ -14,7 +19,6 @@ Usage::
 import importlib.util
 import os
 import shutil
-from pathlib import Path
 
 import numpy as np
 
@@ -27,6 +31,7 @@ from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.synthesis.simulate_nki import simulate_fp32
+from nkigym.transforms import Split
 
 K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[int, ...]] = {"lhs_T": (K, M), "rhs": (K, N)}
@@ -55,7 +60,7 @@ def f_nkigym(lhs_T, rhs):
     return hbm_out
 
 
-def _check_numerics(kernel_path: Path, seed: int = 0, atol: float = 5e-3, rtol: float = 5e-3) -> None:
+def _check_numerics(kernel_path: str, seed: int = 0, atol: float = 5e-3, rtol: float = 5e-3) -> None:
     """Simulate the dumped kernel under fp32 and compare against ``f_numpy``."""
     rng = np.random.default_rng(seed)
     inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, shape in INPUT_SPECS.items()}
@@ -69,9 +74,19 @@ def _check_numerics(kernel_path: Path, seed: int = 0, atol: float = 5e-3, rtol: 
 
 
 if __name__ == "__main__":
-    CACHE_DIR = Path("/home/ubuntu/cache/matmul_lhsT_rhs")
+    CACHE_DIR = "/home/ubuntu/cache/matmul_lhsT_rhs"
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
-    ir = build_initial_ir(f_nkigym, INPUT_SPECS)
-    ir.dump(CACHE_DIR)
-    _check_numerics(CACHE_DIR / "kernel.py")
+
+    """step_0: canonical IR straight from f_nkigym."""
+    ir_0 = build_initial_ir(f_nkigym, INPUT_SPECS)
+    cache_0 = f"{CACHE_DIR}/step_0"
+    ir_0.dump(cache_0)
+    _check_numerics(f"{cache_0}/kernel.py")
+
+    options = Split().analyze(ir_0)
+    for counter, option in enumerate(options):
+        ir_1 = Split().apply(ir_0, option)
+        cache_1 = f"{CACHE_DIR}/step_1_option_{counter}"
+        ir_1.dump(cache_1)
+        _check_numerics(f"{cache_1}/kernel.py")
