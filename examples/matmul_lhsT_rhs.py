@@ -1,14 +1,14 @@
-"""Numpy matmul → ``f_nkigym`` → canonical IR → ``Split`` demo.
+"""Numpy matmul → ``f_nkigym`` → canonical IR → random-policy rollouts.
 
 The ``f_nkigym`` body below is the output of
 :func:`nkigym.synthesis.numpy_to_nkigym.compile_numpy_to_nkigym`
 pasted verbatim — re-run the synthesiser manually whenever the op
 surface or workload changes.
 
-After dumping the canonical IR (``kernel_0``), this script applies
-:class:`~nkigym.transforms.Split` on the ``lhs_T`` load's free axis
-``F`` with factors ``(16, 128)`` to produce ``kernel_1`` — matching
-the ``kernel_0 → kernel_1`` trace in ``kernel_transforms.py``.
+After dumping the canonical IR (``step_0``) and checking numerics, this
+script wraps ``f_nkigym`` in :class:`nkigym.environment.KernelMDP`,
+samples random ``(transform, option)`` actions over ``Split + Fuse`` for
+``NUM_ROLLOUTS`` independent rollouts, and dumps every step's IR.
 
 Usage::
 
@@ -18,11 +18,12 @@ Usage::
 
 import importlib.util
 import os
+import random
 import shutil
 
 import numpy as np
 
-from nkigym.ir import build_initial_ir
+from nkigym.environment import KernelMDP
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -31,10 +32,13 @@ from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.synthesis.simulate_nki import simulate_fp32
-from nkigym.transforms import Split
+from nkigym.transforms import Fuse, Split
 
 K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[int, ...]] = {"lhs_T": (K, M), "rhs": (K, N)}
+NUM_ROLLOUTS = 4
+MAX_STEPS = 5
+SEED = 42
 
 
 def f_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -78,15 +82,17 @@ if __name__ == "__main__":
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    """step_0: canonical IR straight from f_nkigym."""
-    ir_0 = build_initial_ir(f_nkigym, INPUT_SPECS)
-    cache_0 = f"{CACHE_DIR}/step_0"
-    ir_0.dump(cache_0)
-    _check_numerics(f"{cache_0}/kernel.py")
-
-    options = Split().analyze(ir_0)
-    for counter, option in enumerate(options):
-        ir_1 = Split().apply(ir_0, option)
-        cache_1 = f"{CACHE_DIR}/step_1_option_{counter}"
-        ir_1.dump(cache_1)
-        _check_numerics(f"{cache_1}/kernel.py")
+    """Random-policy rollouts via the KernelMDP environment."""
+    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse()])
+    rng = random.Random(SEED)
+    for k in range(NUM_ROLLOUTS):
+        state = env.reset()
+        for t in range(1, MAX_STEPS + 1):
+            actions = env.legal_actions(state)
+            if not actions:
+                break
+            action = rng.choice(actions)
+            state = env.step(state, action)
+            cache_t = f"{CACHE_DIR}/rollout_{k}/step_{t}"
+            state.dump(cache_t)
+            _check_numerics(f"{cache_t}/kernel.py")
