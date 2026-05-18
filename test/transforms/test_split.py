@@ -7,7 +7,6 @@ from test.transforms._fixtures import build_canonical_ir
 import pytest
 
 from nkigym.ir.tree import ForNode, ISANode
-from nkigym.ops.base import AxisRole
 from nkigym.transforms import Split, SplitOption, TransformLegalityError
 
 
@@ -189,7 +188,6 @@ def test_split_tensorize_apply_inserts_outer_for():
     assert isinstance(new_parent_data, ForNode)
     assert new_parent_data.trip == 16
     assert new_parent_data.dim == leaf_data.axis_map["F"]
-    assert new_parent_data.loop_type == AxisRole.PARALLEL
 
     """The new ForNode's parent equals the original leaf parent."""
     assert new_ir.tree.parent(new_parent) == parent_before

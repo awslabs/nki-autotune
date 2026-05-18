@@ -177,21 +177,15 @@ def _kwarg_to_tensor(node: ISANode) -> dict[str, str]:
 def _check_axis_coverage(node: ISANode, ir: KernelIR, enclosing_loops: dict[str, list[int]]) -> None:
     """Assert ``Π enclosing trips × tensorize_size == dim_extent`` for every axis in ``axis_map``.
 
-    Applies to both alloc and compute leaves. ISA leaves additionally
-    require an enclosing loop for every referenced axis — they index
-    into the tensor and need a loop variable to spell, even when the
-    trip is 1. Alloc leaves declare a per-iteration footprint and may
-    appear at any nesting depth, including the root with no enclosing
-    loops, as long as ``tensorize_size`` matches the full axis extent.
-    Names the leaf's op class and the failing concrete dim so error
-    messages point at the offending node.
+    The coverage rule is universal: any combination of enclosing-loop
+    trip product and ``tensorize_sizes[axis]`` whose product equals the
+    axis extent is legal. Zero enclosing loops are allowed when the
+    leaf's ``tensorize_size`` already covers the full extent (empty
+    product = 1). Names the leaf's op class and the failing concrete
+    dim so error messages point at the offending node.
     """
     for abstract_axis, concrete_axis in node.axis_map.items():
         enclosing_axis_loops = enclosing_loops.get(concrete_axis, [])
-        if node.op_cls is not NKIAlloc and concrete_axis not in enclosing_loops:
-            raise AssertionError(
-                f"{node.op_cls.__name__} on axis {concrete_axis}: ISA leaf has no enclosing loop " f"covering this dim"
-            )
         trip_product = math.prod(enclosing_axis_loops)
         tensorize_size = node.tensorize_sizes[abstract_axis]
         axis_extent = ir.dim_sizes[concrete_axis]
@@ -211,13 +205,13 @@ def _render_tensor_slice(
     slice_strs: list[str] = []
     for counter, abstract_axis in enumerate(axes):
         concrete_axis = node.axis_map[abstract_axis]
-        enclosing_axis_loops = enclosing_loops[concrete_axis]
+        enclosing_axis_loops = enclosing_loops.get(concrete_axis, [])
         tensorize_size = node.tensorize_sizes[abstract_axis]
         terms = [
             f"i_{concrete_axis}_{cardinal}*{math.prod(enclosing_axis_loops[cardinal + 1 :])}"
             for cardinal in range(len(enclosing_axis_loops))
         ]
-        coord = " + ".join(terms)
+        coord = " + ".join(terms) if terms else "0"
         if counter == 0 and location != "shared_hbm":
             slice_strs.append(f"0:{tensorize_size}")
             slice_strs.append(f"{coord}")

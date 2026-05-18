@@ -10,7 +10,6 @@ from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.ops.alloc import NKIAlloc
-from nkigym.ops.base import AxisRole
 from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
@@ -55,12 +54,10 @@ class Fuse(Transform):
                     kid_data = ir.tree.data(kids[0])
                     if not isinstance(kid_data, ForNode):
                         break
-                    if kid_data.dim != data.dim or kid_data.loop_type != data.loop_type:
+                    if kid_data.dim != data.dim:
                         break
                     chain.append(kids[0])
                     cur = kids[0]
-                    if data.loop_type == AxisRole.SEQUENTIAL:
-                        break
                 for end in range(2, len(chain) + 1):
                     sub = tuple(chain[:end])
                     opt = FuseOption(target_nids=sub, target_axis=None)
@@ -70,9 +67,6 @@ class Fuse(Transform):
                 if data.op_cls is NKIAlloc:
                     continue
                 for axis, dim in data.axis_map.items():
-                    expected_role = data.op_cls.AXIS_ROLES.get(axis, AxisRole.PARALLEL)
-                    if expected_role == AxisRole.SEQUENTIAL:
-                        continue
                     chain_above: list[int] = []
                     walker = ir.tree.parent(nid)
                     prev = nid
@@ -80,7 +74,7 @@ class Fuse(Transform):
                         wdata = ir.tree.data(walker)
                         if not isinstance(wdata, ForNode):
                             break
-                        if wdata.dim != dim or wdata.loop_type != expected_role:
+                        if wdata.dim != dim:
                             break
                         kids = ir.tree.children(walker)
                         if kids != [prev]:
@@ -132,24 +126,17 @@ class Fuse(Transform):
             self._check_tensorize(ir, option)
 
     def _check_outer_trip(self, ir: KernelIR, option: FuseOption) -> None:
-        """Outer-trip legality: chain of ForNodes, same dim/role, parent->child, role != SEQUENTIAL."""
+        """Outer-trip legality: chain of ForNodes, same dim, parent->child, single-child."""
         nodes = [ir.tree.data(nid) for nid in option.target_nids]
         if not all(isinstance(n, ForNode) for n in nodes):
             raise TransformLegalityError(
                 f"Fuse outer-trip flavor: every target must be ForNode; got " f"{[type(n).__name__ for n in nodes]}"
             )
         first = nodes[0]
-        if first.loop_type == AxisRole.SEQUENTIAL:
-            raise TransformLegalityError("Fuse outer-trip flavor: SEQUENTIAL loops cannot be fused")
         for n in nodes[1:]:
             if n.dim != first.dim:
                 raise TransformLegalityError(
                     f"Fuse outer-trip flavor: all entries must share dim; got {first.dim!r} vs {n.dim!r}"
-                )
-            if n.loop_type != first.loop_type:
-                raise TransformLegalityError(
-                    f"Fuse outer-trip flavor: all entries must share loop_type; got "
-                    f"{first.loop_type} vs {n.loop_type}"
                 )
         for parent_nid, child_nid in zip(option.target_nids, option.target_nids[1:]):
             kids = ir.tree.children(parent_nid)
@@ -160,7 +147,7 @@ class Fuse(Transform):
                 )
 
     def _check_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
-        """Tensorize legality: trailing ISANode + chain of same-dim same-role ForNodes."""
+        """Tensorize legality: trailing ISANode + chain of same-dim ForNodes above it."""
         leaf_nid = option.target_nids[-1]
         leaf = ir.tree.data(leaf_nid)
         if not isinstance(leaf, ISANode):
@@ -176,9 +163,6 @@ class Fuse(Transform):
                 f"Fuse.target_axis={option.target_axis!r} not in leaf.axis_map={list(leaf.axis_map)}"
             )
         concrete_dim = leaf.axis_map[option.target_axis]
-        expected_role = leaf.op_cls.AXIS_ROLES.get(option.target_axis, AxisRole.PARALLEL)
-        if expected_role == AxisRole.SEQUENTIAL:
-            raise TransformLegalityError("Fuse tensorize flavor: SEQUENTIAL axes cannot be fused")
 
         for_chain_nids = option.target_nids[:-1]
         for nid in for_chain_nids:
@@ -191,11 +175,6 @@ class Fuse(Transform):
                 raise TransformLegalityError(
                     f"Fuse tensorize flavor: prefix dim must match leaf axis concrete dim "
                     f"({concrete_dim!r}); got {data.dim!r}"
-                )
-            if data.loop_type != expected_role:
-                raise TransformLegalityError(
-                    f"Fuse tensorize flavor: prefix loop_type must match leaf axis role "
-                    f"({expected_role}); got {data.loop_type}"
                 )
 
         for parent_nid, child_nid in zip(option.target_nids, option.target_nids[1:]):
@@ -242,7 +221,7 @@ class Fuse(Transform):
         new_trip = prod(ir.tree.data(nid).trip for nid in nids)
 
         """Build the new fused ForNode DETACHED."""
-        new_nid = ir.tree.add_node(ForNode(dim=first.dim, trip=new_trip, loop_type=first.loop_type), parent=None)
+        new_nid = ir.tree.add_node(ForNode(dim=first.dim, trip=new_trip), parent=None)
 
         """Reparent deepest_kids under the new node."""
         for child in deepest_kids:

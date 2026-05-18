@@ -1,5 +1,12 @@
 # Transforms — Split + Fuse
 
+> **Note (2026-05-18):** Role handling described in this spec
+> (`loop_type` checks, SEQ rejection, role-equality on Fuse) was removed
+> by the loop-role placement refactor. See
+> `2026-05-18-loop-role-placement-refactor-design.md` for the current
+> role model. The structural Split/Fuse semantics described below
+> remain accurate.
+
 ## Problem
 
 `KernelIR` builds a canonical schedule tree but offers no rewrite primitives.

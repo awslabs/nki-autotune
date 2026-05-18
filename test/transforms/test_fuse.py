@@ -224,8 +224,8 @@ def test_fuse_analyze_finds_tensorize_chain_after_split():
 
 
 def test_fuse_analyze_no_tensorize_options_on_canonical():
-    """On the canonical IR, no leaf has an enclosing same-dim ForNode that matches its op axis role,
-    because canonical trip-1 outer loops are dropped — so tensorize Fuse should yield no options."""
+    """On the canonical IR, every enclosing same-dim ForNode chain has trip-product == 1,
+    failing the >= 2 requirement, so tensorize Fuse should yield no options."""
     ir = build_canonical_ir()
     options = [opt for opt in Fuse().analyze(ir) if opt.target_axis is not None]
     assert options == []

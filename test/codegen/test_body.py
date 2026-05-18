@@ -15,7 +15,6 @@ from nkigym.ir import build_initial_ir
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
-from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.memset import NKIMemset
@@ -190,8 +189,8 @@ def _split_d0_into_outer_8_inner_2(ir):
     assert parent_nid is not None
     children_under_d0 = list(tree.children(d0_loop_nid))
 
-    outer_nid = tree.add_node(ForNode(dim="d0", trip=8, loop_type=AxisRole.PARALLEL), parent=parent_nid)
-    inner_nid = tree.add_node(ForNode(dim="d0", trip=2, loop_type=AxisRole.PARALLEL), parent=outer_nid)
+    outer_nid = tree.add_node(ForNode(dim="d0", trip=8), parent=parent_nid)
+    inner_nid = tree.add_node(ForNode(dim="d0", trip=2), parent=outer_nid)
     for grandchild in children_under_d0:
         tree.graph.remove_edge(d0_loop_nid, grandchild)
         tree.graph.add_edge(inner_nid, grandchild)
@@ -282,6 +281,65 @@ def test_emit_block_handles_alloc_inside_loop() -> None:
     ), f"psum alloc must be indented inside the matmul outer loop:\n{alloc_lines!r}"
 
 
+def test_zero_enclosing_loops_with_full_extent_tensorize() -> None:
+    """An ISA leaf with ``tensorize_size == axis_extent`` and zero enclosing
+    loops on that dim renders correctly.
+
+    Fuse can absorb every enclosing ForNode on a dim when the resulting
+    tensorize_size reaches the axis extent. Codegen must accept that
+    shape (universal coverage rule: ``Π trips × tensorize == extent``).
+    Mutate the ``NKIStore`` leaf to ``tensorize_sizes['F'] == 2048`` and
+    detach its d2-dim ForNode chain — the same shape Fuse produces in
+    the random-policy MDP rollouts. ``emit_body`` must not raise, and
+    the rendered F slice must spell as the full-axis range starting at 0.
+    """
+    ir = build_initial_ir(_matmul, _MATMUL_INPUT_SPECS)
+    tree = ir.tree
+    store_isa_nid = next(
+        nid for nid in tree.preorder() if isinstance(tree.data(nid), ISANode) and tree.data(nid).op_cls is NKIStore
+    )
+    store = tree.data(store_isa_nid)
+    f_dim = store.axis_map["F"]
+
+    """Walk the store's enclosing chain and detach every f_dim ForNode,
+    reconnecting the chain so the store sits directly under the next
+    non-f_dim ancestor."""
+    chain = list(tree.ancestors(store_isa_nid)) + [store_isa_nid]
+    for ancestor_nid, child_nid in zip(chain, chain[1:]):
+        ancestor = tree.data(ancestor_nid)
+        if isinstance(ancestor, ForNode) and ancestor.dim == f_dim:
+            grandparent = tree.parent(ancestor_nid)
+            assert grandparent is not None
+            tree.graph.remove_edge(grandparent, ancestor_nid)
+            tree.graph.remove_edge(ancestor_nid, child_nid)
+            tree.graph.add_edge(grandparent, child_nid)
+            tree.graph.remove_node(ancestor_nid)
+
+    """Bump the store's F tensorize to the full axis extent."""
+    new_tensorize = dict(store.tensorize_sizes)
+    new_tensorize["F"] = ir.dim_sizes[f_dim]
+    tree.graph.nodes[store_isa_nid]["data"] = ISANode(
+        op_cls=store.op_cls,
+        reads=store.reads,
+        writes=store.writes,
+        rmw=store.rmw,
+        tensorize_sizes=new_tensorize,
+        axis_map=store.axis_map,
+        kwargs=store.kwargs,
+        location=store.location,
+        dtype=store.dtype,
+    )
+
+    body = emit_body(ir)
+    store_lines = [line for line in body.splitlines() if "dst=hbm_out" in line]
+    assert store_lines, f"NKIStore call missing from body:\n{body}"
+    """The store's F-axis slice must cover the full extent. With zero F-dim loops,
+    the rendered slice expression for F resolves to 0:N (after black) or
+    the literal ``(0)*N:(0+1)*N``; either way ``0`` and ``2048`` appear together."""
+    for line in store_lines:
+        assert "2048" in line, f"NKIStore slice should reference the full F extent (2048): {line!r}"
+
+
 def test_axis_extent_mismatch_raises() -> None:
     """A loop nest that doesn't fully cover an axis must abort codegen.
 
@@ -300,7 +358,7 @@ def test_axis_extent_mismatch_raises() -> None:
         for nid in tree.ancestors(matmul_isa_nid)
         if isinstance(tree.data(nid), ForNode) and tree.data(nid).dim == "d0"
     )
-    tree.graph.nodes[d0_loop_nid]["data"] = ForNode(dim="d0", trip=8, loop_type=AxisRole.PARALLEL)
+    tree.graph.nodes[d0_loop_nid]["data"] = ForNode(dim="d0", trip=8)
 
     with pytest.raises(AssertionError, match="d0"):
         emit_body(ir)

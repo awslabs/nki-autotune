@@ -49,7 +49,7 @@ def _tree_node_decl(node_id: str, nid: int, data: NodeData) -> tuple[str, str | 
     if isinstance(data, RootNode):
         return f'{node_id}(("#{nid} root"))', None
     if isinstance(data, ForNode):
-        return (f'{node_id}["#{nid} Loop {data.dim} trip={data.trip}<br/>{data.loop_type.name}"]', "loop")
+        return (f'{node_id}["#{nid} Loop {data.dim} trip={data.trip}"]', "loop")
     if isinstance(data, ISANode):
         return (f'{node_id}["#{nid} {_isa_label(data)}"]', "alloc" if data.op_cls is NKIAlloc else "leaf")
     raise TypeError(f"unknown node data type: {type(data).__name__}")

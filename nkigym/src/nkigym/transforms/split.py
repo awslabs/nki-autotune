@@ -10,7 +10,6 @@ from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import ForNode, ISANode, KernelTree
 from nkigym.ops.alloc import NKIAlloc
-from nkigym.ops.base import AxisRole
 from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
@@ -146,7 +145,7 @@ class Split(Transform):
         new_top_nid: int | None = None
         prev: int | None = None
         for trip in option.factors:
-            new_nid = ir.tree.add_node(ForNode(dim=target.dim, trip=trip, loop_type=target.loop_type), parent=None)
+            new_nid = ir.tree.add_node(ForNode(dim=target.dim, trip=trip), parent=None)
             if new_top_nid is None:
                 new_top_nid = new_nid
             if prev is not None:
@@ -174,13 +173,12 @@ class Split(Transform):
         assert parent is not None
         assert option.target_axis is not None
         concrete_dim = leaf.axis_map[option.target_axis]
-        loop_type = leaf.op_cls.AXIS_ROLES.get(option.target_axis, AxisRole.PARALLEL)
 
         """Detach the leaf from its parent, then chain new ForNodes from ``parent``, then reattach."""
         ir.tree.graph.remove_edge(parent, leaf_nid)
         prev = parent
         for trip in option.factors[:-1]:
-            new_nid = ir.tree.add_node(ForNode(dim=concrete_dim, trip=trip, loop_type=loop_type), parent=prev)
+            new_nid = ir.tree.add_node(ForNode(dim=concrete_dim, trip=trip), parent=prev)
             prev = new_nid
         ir.tree.graph.add_edge(prev, leaf_nid)
 

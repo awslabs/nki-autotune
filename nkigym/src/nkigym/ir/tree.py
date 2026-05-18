@@ -51,13 +51,10 @@ class ForNode:
     Attributes:
         dim: Concrete dim id (e.g. ``"d0"``).
         trip: Loop trip count (``extent // tile_size``).
-        loop_type: Per-op axis classification
-            (``PARALLEL`` / ``SEQUENTIAL`` / ``ACCUMULATION``).
     """
 
     dim: str
     trip: int
-    loop_type: AxisRole
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -227,8 +224,7 @@ def _attach_op_subtree(
         tile = extent if max_tile is None else max_tile
         tensorize_sizes[abstract] = tile
         if emit_loops:
-            role = op.op_cls.AXIS_ROLES.get(abstract, AxisRole.PARALLEL)
-            parent = tree.add_node(ForNode(dim=concrete, trip=extent // tile, loop_type=role), parent=parent)
+            parent = tree.add_node(ForNode(dim=concrete, trip=extent // tile), parent=parent)
     is_alloc = op.op_cls is NKIAlloc
     location = tensors[writes[0]].location if is_alloc else None
     dtype = tensors[writes[0]].dtype if is_alloc else None
@@ -248,4 +244,22 @@ def _attach_op_subtree(
     )
 
 
-__all__ = ["ForNode", "ISANode", "KernelTree", "NodeData", "RootNode", "build_initial_tree"]
+def role_of(leaf: ISANode, concrete_dim: str) -> AxisRole:
+    """Return the role this leaf assigns to ``concrete_dim``.
+
+    Walks ``leaf.axis_map`` to find the abstract axis that maps to
+    ``concrete_dim``, then consults ``leaf.op_cls.AXIS_ROLES``
+    (defaulting to :attr:`AxisRole.PARALLEL` for axes not listed).
+    Raises ``KeyError`` if the leaf does not touch ``concrete_dim``.
+    """
+    matched_role: AxisRole | None = None
+    for abstract, dim_id in leaf.axis_map.items():
+        if dim_id == concrete_dim:
+            matched_role = leaf.op_cls.AXIS_ROLES.get(abstract, AxisRole.PARALLEL)
+            break
+    if matched_role is None:
+        raise KeyError(f"{leaf.op_cls.__name__} has no axis mapping {concrete_dim}")
+    return matched_role
+
+
+__all__ = ["ForNode", "ISANode", "KernelTree", "NodeData", "RootNode", "build_initial_tree", "role_of"]
