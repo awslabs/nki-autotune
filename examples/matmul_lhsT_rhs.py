@@ -7,8 +7,8 @@ surface or workload changes.
 
 After dumping the canonical IR (``step_0``) and checking numerics, this
 script wraps ``f_nkigym`` in :class:`nkigym.environment.KernelMDP`,
-samples random ``(transform, option)`` actions over ``Split + Fuse`` for
-``NUM_ROLLOUTS`` independent rollouts, and dumps every step's IR.
+samples random ``(transform, option)`` actions over ``Split + Fuse + Reorder``
+for ``NUM_ROLLOUTS`` independent rollouts, and dumps every step's IR.
 
 Usage::
 
@@ -32,7 +32,7 @@ from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.synthesis.simulate_nki import simulate_fp32
-from nkigym.transforms import Fuse, Split
+from nkigym.transforms import Fuse, Reorder, Split
 
 K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[int, ...]] = {"lhs_T": (K, M), "rhs": (K, N)}
@@ -83,7 +83,7 @@ if __name__ == "__main__":
     os.makedirs(CACHE_DIR, exist_ok=True)
 
     """Random-policy rollouts via the KernelMDP environment."""
-    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse()])
+    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder()])
     rng = random.Random(SEED)
     for k in range(NUM_ROLLOUTS):
         state = env.reset()

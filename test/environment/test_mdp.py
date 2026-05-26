@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import random
 from test.environment._fixtures import INPUT_SPECS, f_matmul
 
 import pytest
 
 from nkigym.environment import KernelMDP
 from nkigym.ir import KernelIR, build_initial_ir
-from nkigym.transforms import Fuse, Split, SplitOption, TransformLegalityError
+from nkigym.transforms import Fuse, Reorder, Split, SplitOption, TransformLegalityError
 
 
 def _trees_structurally_equal(a: KernelIR, b: KernelIR) -> bool:
@@ -129,3 +130,31 @@ def test_is_terminal_true_with_no_transforms() -> None:
     env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[])
     state = env.reset()
     assert env.is_terminal(state) is True
+
+
+def test_mdp_with_reorder_random_rollout() -> None:
+    """A random rollout with [Split, Fuse, Reorder] runs without raising."""
+    rng = random.Random(42)
+    env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder()])
+    state = env.reset()
+
+    """5 random steps; legality is checked inside step (loud failure on illegal)."""
+    for _ in range(5):
+        actions = env.legal_actions(state)
+        if not actions:
+            break
+        action = rng.choice(actions)
+        state = env.step(state, action)
+        """Confirm the resulting state is itself legal: legal_actions runs analyze
+        across all transforms, which exercises tree-walk over the new IR."""
+        env.legal_actions(state)
+
+
+def test_mdp_legal_actions_includes_reorder_options_on_canonical() -> None:
+    """``legal_actions`` on the canonical IR must include at least one Reorder action."""
+    reorder = Reorder()
+    env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Fuse(), reorder])
+    state = env.reset()
+    actions = env.legal_actions(state)
+    reorder_actions = [(tr, opt) for tr, opt in actions if tr is reorder]
+    assert reorder_actions, "expected at least one Reorder action on canonical IR"
