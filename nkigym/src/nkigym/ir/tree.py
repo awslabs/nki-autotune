@@ -29,7 +29,7 @@ from typing import Any
 import networkx as nx
 
 from nkigym.ir.dimension_analysis import _AnalysisResult
-from nkigym.ir.expr import Expr
+from nkigym.ir.expr import Expr, format_expr
 from nkigym.ops.base import AxisRole, NKIOp
 
 
@@ -49,6 +49,10 @@ class ForNode:
     loop_var: str
     extent: int
 
+    def label(self) -> str:
+        """Return ``Loop <loop_var> extent=<extent>``."""
+        return f"Loop {self.loop_var} extent={self.extent}"
+
 
 @dataclass(frozen=True, kw_only=True)
 class ISANode:
@@ -66,6 +70,16 @@ class ISANode:
     operand_bindings: dict[str, BufferRegion] = field(default_factory=dict)
     kwargs: dict[str, Any] = field(default_factory=dict)
 
+    def label(self) -> str:
+        """Return the op name plus per-slot region labels and kwargs, newline-separated."""
+        lines: list[str] = [self.op_cls.__name__]
+        if self.operand_bindings:
+            bindings = ", ".join(f"{slot}={region.label()}" for slot, region in self.operand_bindings.items())
+            lines.append(f"bindings=({bindings})")
+        if self.kwargs:
+            lines.append(f"kwargs={self.kwargs}")
+        return "\n".join(lines)
+
 
 @dataclass(frozen=True, kw_only=True)
 class IterVar:
@@ -81,6 +95,10 @@ class IterVar:
     axis: str
     dom: tuple[int, int]
     role: AxisRole
+
+    def label(self) -> str:
+        """Return ``axis(ROL lo..hi)`` with the role abbreviated to 3 letters."""
+        return f"{self.axis}({self.role.name[:3]} {self.dom[0]}..{self.dom[1]})"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -102,6 +120,11 @@ class Buffer:
     dtype: str
     location: str
 
+    def label(self) -> str:
+        """Return ``name (shape) dtype@location`` on one line."""
+        shape_str = ",".join(str(extent) for extent in self.shape)
+        return f"{self.name} ({shape_str}) {self.dtype}@{self.location}"
+
 
 @dataclass(frozen=True, kw_only=True)
 class BufferRegion:
@@ -116,6 +139,21 @@ class BufferRegion:
 
     tensor: str
     ranges: tuple[tuple[Expr, Expr], ...]
+
+    def label(self) -> str:
+        """Return ``tensor[lo : +width, ...]`` from the stored ``(lo, width)`` ranges."""
+        axes = ", ".join(f"{format_expr(lo)} : +{format_expr(width)}" for lo, width in self.ranges)
+        return f"{self.tensor}[{axes}]"
+
+
+def _label_lines(items: tuple[BufferRegion | Buffer, ...], indent: int) -> str:
+    """Join each item's ``label()`` onto its own line; continuation lines indented.
+
+    Returns ``∅`` when ``items`` is empty so empty fields stay visible.
+    """
+    pad = "\n" + " " * indent
+    result = pad.join(item.label() for item in items) if items else "∅"
+    return result
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -138,6 +176,25 @@ class BlockNode:
     writes: tuple[BufferRegion, ...]
     alloc_buffers: tuple[Buffer, ...] = ()
     annotations: dict[str, Any] = field(default_factory=dict)
+
+    def label(self) -> str:
+        """Return a multi-line summary of all six fields; empty fields show as ∅."""
+        if self.iter_vars:
+            iv_line = " ".join(iv.label() for iv in self.iter_vars)
+            val_line = "  ".join(f"{iv.axis}={format_expr(val)}" for iv, val in zip(self.iter_vars, self.iter_values))
+        else:
+            iv_line = "∅"
+            val_line = "∅"
+        lines = [
+            "BlockNode",
+            f"iter_vars:   {iv_line}",
+            f"iter_values: {val_line}",
+            f"reads:   {_label_lines(self.reads, 9)}",
+            f"writes:  {_label_lines(self.writes, 9)}",
+            f"allocs:  {_label_lines(self.alloc_buffers, 9)}",
+            f"annotations: {self.annotations if self.annotations else '∅'}",
+        ]
+        return "\n".join(lines)
 
 
 NodeData = BlockNode | ForNode | ISANode

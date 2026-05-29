@@ -46,34 +46,31 @@ def _to_mermaid(tree: KernelTree) -> str:
 
 
 def _tree_node_decl(node_id: str, nid: int, data: NodeData) -> tuple[str, str | None]:
-    """Return the Mermaid declaration + class bucket for one tree node."""
+    """Return the Mermaid declaration + CSS class bucket for one tree node.
+
+    Content comes from ``data.label()``; this function owns only the
+    tree-position concerns: the ``#nid`` prefix, the node shape
+    (``[[...]]`` for blocks, ``[...]`` otherwise), and the CSS bucket.
+    """
+    text = f"#{nid} {_mermaid_escape(data.label())}"
     if isinstance(data, BlockNode):
-        """Block nodes show their iter_vars summary with role/dom and alloc count."""
-        if not data.iter_vars:
-            label = "root-block"
-        else:
-            iv_summary = ", ".join(f"{iv.axis}({iv.role.name[0]},{iv.dom[0]}..{iv.dom[1]})" for iv in data.iter_vars)
-            label = f"block[{iv_summary}]"
-        alloc_count = len(data.alloc_buffers)
-        full_label = f"{label} allocs={alloc_count}"
-        return (f'{node_id}[["#{nid} {full_label}"]]', "block")
-    if isinstance(data, ForNode):
-        return (f'{node_id}["#{nid} Loop {data.loop_var} extent={data.extent}"]', "loop")
-    if isinstance(data, ISANode):
-        return (f'{node_id}["#{nid} {_isa_label(data)}"]', "alloc" if data.op_cls is NKIAlloc else "leaf")
-    raise TypeError(f"unknown node data type: {type(data).__name__}")
+        decl, class_name = f'{node_id}[["{text}"]]', "block"
+    elif isinstance(data, ForNode):
+        decl, class_name = f'{node_id}["{text}"]', "loop"
+    elif isinstance(data, ISANode):
+        decl, class_name = f'{node_id}["{text}"]', "alloc" if data.op_cls is NKIAlloc else "leaf"
+    else:
+        raise TypeError(f"unknown node data type: {type(data).__name__}")
+    return (decl, class_name)
 
 
-def _isa_label(data: ISANode) -> str:
-    """Build the Mermaid node label for an :class:`ISANode` payload."""
-    parts: list[str] = [data.op_cls.__name__]
-    """ISANode now uses operand_bindings instead of reads/writes/rmw."""
-    if data.operand_bindings:
-        bindings_str = ", ".join(f"{k}={v.tensor}" for k, v in data.operand_bindings.items())
-        parts.append(f"bindings=({bindings_str})")
-    if data.kwargs:
-        parts.append(f"kwargs={data.kwargs}")
-    return "<br/>".join(parts)
+def _mermaid_escape(text: str) -> str:
+    """Make a label safe inside a Mermaid node string.
+
+    Square brackets become HTML entities (Mermaid reads literal ``[``/``]``
+    as node-shape syntax); newlines become ``<br/>`` line breaks.
+    """
+    return text.replace("[", "&#91;").replace("]", "&#93;").replace("\n", "<br/>")
 
 
 __all__ = ["dump_tree"]

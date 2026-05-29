@@ -14,9 +14,21 @@ in a ``finally`` block.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+
+_LABEL_WRAP_WIDTH_PX = 2000
+"""Per-node label wrap threshold. Mermaid's 200px default wraps our multi-line
+BlockNode labels mid-content, warping the boxes; widening it keeps every field
+on its own line so the box grows to fit instead."""
+
+_MERMAID_CONFIG = {
+    "flowchart": {"wrappingWidth": _LABEL_WRAP_WIDTH_PX, "htmlLabels": True, "useMaxWidth": False},
+    "themeVariables": {"fontFamily": "monospace"},
+}
+"""mmdc ``-c`` config: wide labels + monospace so aligned columns stay aligned."""
 
 
 @dataclass
@@ -76,12 +88,31 @@ class Flowchart:
 
 
 def render_png(mmd: Path, png: Path) -> None:
-    """Render ``mmd`` to ``png`` at ``mmdc -s 4`` with ``--no-sandbox``."""
-    config_path = mmd.with_suffix(".puppeteer.json")
-    config_path.write_text('{"args":["--no-sandbox"]}', encoding="utf-8")
+    """Render ``mmd`` to ``png`` at ``mmdc -s 4`` with ``--no-sandbox``.
+
+    A mermaid ``-c`` config widens the per-node label wrap threshold so
+    multi-line BlockNode labels do not wrap mid-content (which warps the
+    boxes); see :data:`_MERMAID_CONFIG`.
+    """
+    puppeteer_path = mmd.with_suffix(".puppeteer.json")
+    mermaid_path = mmd.with_suffix(".mermaid.json")
+    puppeteer_path.write_text('{"args":["--no-sandbox"]}', encoding="utf-8")
+    mermaid_path.write_text(json.dumps(_MERMAID_CONFIG), encoding="utf-8")
     try:
         result = subprocess.run(
-            ["mmdc", "-i", str(mmd), "-o", str(png), "-s", "4", "--puppeteerConfigFile", str(config_path)],
+            [
+                "mmdc",
+                "-i",
+                str(mmd),
+                "-o",
+                str(png),
+                "-s",
+                "4",
+                "--puppeteerConfigFile",
+                str(puppeteer_path),
+                "-c",
+                str(mermaid_path),
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -91,7 +122,8 @@ def render_png(mmd: Path, png: Path) -> None:
                 f"mmdc failed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}"
             )
     finally:
-        config_path.unlink(missing_ok=True)
+        puppeteer_path.unlink(missing_ok=True)
+        mermaid_path.unlink(missing_ok=True)
 
 
 __all__ = ["ClassStyle", "Flowchart", "render_png"]
