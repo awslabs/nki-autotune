@@ -74,3 +74,88 @@ def test_memset_precedes_matmul_in_dependency():
     matmul_nid = _block_for_op(ir, NKIMatmul)
     assert ir.dependency.must_precede(memset_nid, matmul_nid), "memset must precede matmul"
     assert not ir.dependency.must_precede(matmul_nid, memset_nid), "matmul must NOT precede memset"
+
+
+def test_disjoint_tile_writes_have_no_edge():
+    """Two hand-built blocks writing disjoint tiles of one buffer get NO dependency edge."""
+    from dataclasses import replace
+
+    from nkigym.ir.dependency import Dependency
+    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
+    from nkigym.ops.base import AxisRole
+    from nkigym.ops.memset import NKIMemset
+
+    tree = KernelTree()
+    """Add a Buffer to the root block so the dependency graph can find it."""
+    buf = Buffer(name="buf", shape=(256,), dtype="float32", location="shared_hbm")
+    root_blk = tree.data(tree.root)
+    tree.graph.nodes[tree.root]["data"] = replace(root_blk, alloc_buffers=(buf,))
+
+    """Two sibling blocks under root, each writing a distinct CONSTANT tile of 'buf'."""
+
+    def add_writer(offset):
+        blk = BlockNode(
+            iter_vars=(IterVar(axis="d0", dom=(0, 256), role=AxisRole.PARALLEL),),
+            iter_values=(Var(name="i"),),
+            reads=(),
+            writes=(BufferRegion(tensor="buf", ranges=((Const(value=offset), Const(value=128)),)),),
+        )
+        nid = tree.add_node(blk, parent=tree.root)
+        f = tree.add_node(ForNode(loop_var="i", extent=1), parent=nid)
+        tree.add_node(
+            ISANode(
+                op_cls=NKIMemset,
+                operand_bindings={"dst": BufferRegion(tensor="buf", ranges=((Const(value=offset), Const(value=128)),))},
+                kwargs={"value": 0.0},
+            ),
+            parent=f,
+        )
+        return nid
+
+    a = add_writer(0)
+    b = add_writer(128)
+    dep = Dependency(tree)
+    assert not dep.must_precede(a, b)
+    assert not dep.must_precede(b, a)
+
+
+def test_overlapping_tile_writes_have_edge():
+    """Two blocks writing the SAME tile get a WAW edge."""
+    from dataclasses import replace
+
+    from nkigym.ir.dependency import Dependency
+    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
+    from nkigym.ops.base import AxisRole
+    from nkigym.ops.memset import NKIMemset
+
+    tree = KernelTree()
+    """Add a Buffer to the root block so the dependency graph can find it."""
+    buf = Buffer(name="buf", shape=(256,), dtype="float32", location="shared_hbm")
+    root_blk = tree.data(tree.root)
+    tree.graph.nodes[tree.root]["data"] = replace(root_blk, alloc_buffers=(buf,))
+
+    def add_writer():
+        blk = BlockNode(
+            iter_vars=(IterVar(axis="d0", dom=(0, 256), role=AxisRole.PARALLEL),),
+            iter_values=(Var(name="i"),),
+            reads=(),
+            writes=(BufferRegion(tensor="buf", ranges=((Const(value=0), Const(value=128)),)),),
+        )
+        nid = tree.add_node(blk, parent=tree.root)
+        f = tree.add_node(ForNode(loop_var="i", extent=1), parent=nid)
+        tree.add_node(
+            ISANode(
+                op_cls=NKIMemset,
+                operand_bindings={"dst": BufferRegion(tensor="buf", ranges=((Const(value=0), Const(value=128)),))},
+                kwargs={"value": 0.0},
+            ),
+            parent=f,
+        )
+        return nid
+
+    a = add_writer()
+    b = add_writer()
+    dep = Dependency(tree)
+    assert dep.must_precede(a, b)

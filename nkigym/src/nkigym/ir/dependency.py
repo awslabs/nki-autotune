@@ -20,7 +20,8 @@ from pathlib import Path
 import networkx as nx
 
 from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
-from nkigym.ir.tree import BlockNode, BufferRegion, KernelTree
+from nkigym.ir.interval import regions_disjoint
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, KernelTree
 
 _DEPENDENCY_STYLES: list[ClassStyle] = [ClassStyle(name="block", fill="#efe", stroke="#363")]
 
@@ -29,11 +30,15 @@ _HAZARD_PRIORITY: dict[str, int] = {"RAW": 3, "WAW": 2, "WAR": 1}
 
 @dataclass(frozen=True)
 class _BlockInfo:
-    """Cached read / write tensor sets for a single leaf block."""
+    """Cached read/write regions, the buffers they touch, and enclosing-loop extents."""
 
     name: str
     reads: frozenset[str]
     writes: frozenset[str]
+    read_regions: tuple[BufferRegion, ...]
+    write_regions: tuple[BufferRegion, ...]
+    extents: dict[str, int]
+    buffers: dict[str, Buffer]
 
 
 class Dependency:
@@ -86,6 +91,7 @@ class Dependency:
 
     def _build(self, tree: KernelTree) -> None:
         """Populate the graph by walking leaf blocks (skipping the synthetic root)."""
+        buffers = self._buffer_map(tree)
         last_writer: dict[str, int] = {}
         prior_readers: dict[str, list[int]] = {}
         for nid in tree.blocks():
@@ -93,7 +99,7 @@ class Dependency:
             assert isinstance(block, BlockNode)
             if not block.iter_vars and not block.reads and not block.writes:
                 continue
-            info = self._summarise(block)
+            info = self._summarise(nid, block, tree, buffers)
             self.graph.add_node(nid, info=info)
             self.blocks.append(nid)
             for name in info.reads | info.writes:
@@ -105,31 +111,86 @@ class Dependency:
             for name in info.reads - info.writes:
                 prior_readers.setdefault(name, []).append(nid)
 
-    def _summarise(self, block: BlockNode) -> _BlockInfo:
-        """Collapse a block's BufferRegions to ``(reads, writes)`` tensor-name sets."""
+    @staticmethod
+    def _buffer_map(tree: KernelTree) -> dict[str, Buffer]:
+        """Collect every Buffer declared anywhere in the tree."""
+        out: dict[str, Buffer] = {}
+        for nid in tree.blocks():
+            blk = tree.data(nid)
+            assert isinstance(blk, BlockNode)
+            for buf in blk.alloc_buffers:
+                out[buf.name] = buf
+        return out
+
+    def _summarise(self, nid: int, block: BlockNode, tree: KernelTree, buffers: dict[str, Buffer]) -> _BlockInfo:
+        """Build _BlockInfo with tensor-name sets, regions, extents, and buffers."""
+        extents: dict[str, int] = {}
+        for d in tree.descendants(nid):
+            dd = tree.data(d)
+            if isinstance(dd, ForNode):
+                extents[dd.loop_var] = dd.extent
         reads = {r.tensor for r in block.reads}
         writes = {w.tensor for w in block.writes}
-        return _BlockInfo(name=_block_name(block), reads=frozenset(reads), writes=frozenset(writes))
+        return _BlockInfo(
+            name=_block_name(block),
+            reads=frozenset(reads),
+            writes=frozenset(writes),
+            read_regions=tuple(block.reads),
+            write_regions=tuple(block.writes),
+            extents=extents,
+            buffers=buffers,
+        )
 
     def _record_hazards(
         self, nid: int, info: _BlockInfo, last_writer: dict[str, int], prior_readers: dict[str, list[int]]
     ) -> None:
         for name in info.reads:
-            self._try_edge(last_writer.get(name), nid, "RAW")
+            self._try_edge(last_writer.get(name), nid, "RAW", name)
         for name in info.writes:
-            self._try_edge(last_writer.get(name), nid, "WAW")
+            self._try_edge(last_writer.get(name), nid, "WAW", name)
             for prior_r in prior_readers.get(name, ()):
-                self._try_edge(prior_r, nid, "WAR")
+                self._try_edge(prior_r, nid, "WAR", name)
 
-    def _try_edge(self, producer: int | None, consumer: int, kind: str) -> None:
+    def _regions_for(self, nid: int, tensor: str, kind: str) -> tuple[BufferRegion, ...]:
+        """Regions of ``tensor`` touched by block ``nid`` on the read or write side."""
+        info = self.graph.nodes[nid]["info"]
+        side = info.write_regions if kind == "write" else info.read_regions
+        return tuple(r for r in side if r.tensor == tensor)
+
+    def _try_edge(self, producer: int | None, consumer: int, kind: str, tensor: str) -> None:
         """Insert a hazard edge, skipping self-loops and missing producers."""
         if producer is None or producer == consumer:
+            return
+        if self._provably_disjoint(producer, consumer, tensor, kind):
             return
         if self.graph.has_edge(producer, consumer):
             current = self.graph.edges[producer, consumer]["kind"]
             if _HAZARD_PRIORITY[kind] <= _HAZARD_PRIORITY[current]:
                 return
         self.graph.add_edge(producer, consumer, kind=kind)
+
+    def _provably_disjoint(self, producer: int, consumer: int, tensor: str, kind: str) -> bool:
+        """True iff every producer-region/consumer-region pair on ``tensor`` is disjoint.
+
+        RAW: producer writes, consumer reads. WAW: both write. WAR: producer
+        reads, consumer writes. If the tensor has no Buffer (a kernel param),
+        treat as full-tensor → never disjoint (keep the edge).
+        """
+        pinfo = self.graph.nodes[producer]["info"]
+        cinfo = self.graph.nodes[consumer]["info"]
+        if tensor not in pinfo.buffers:
+            return False
+        buf = pinfo.buffers[tensor]
+        prod_side = "write" if kind in ("RAW", "WAW") else "read"
+        cons_side = "read" if kind == "RAW" else "write"
+        prod_regions = self._regions_for(producer, tensor, prod_side)
+        cons_regions = self._regions_for(consumer, tensor, cons_side)
+        extents = {**pinfo.extents, **cinfo.extents}
+        for pr in prod_regions:
+            for cr in cons_regions:
+                if not regions_disjoint(pr, cr, buf, buf, extents):
+                    return False
+        return True
 
 
 def _block_name(block: BlockNode) -> str:
@@ -155,12 +216,6 @@ def _label(nid: int, info: _BlockInfo) -> str:
     if info.writes:
         parts.append(f"writes={','.join(sorted(info.writes))}")
     return "<br/>".join(parts)
-
-
-def _bufferregion_overlaps(_a: BufferRegion, _b: BufferRegion) -> bool:
-    """Stub for future per-region overlap analysis. Today's canonical IR doesn't need it; the
-    block-pair tensor-name match is sufficient. Compute_at-driven nested blocks will exercise this."""
-    return True
 
 
 __all__ = ["Dependency"]

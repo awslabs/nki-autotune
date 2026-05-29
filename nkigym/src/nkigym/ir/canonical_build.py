@@ -9,10 +9,8 @@ non-alloc op, in source order.
 Every compute op (including memset) becomes a sibling leaf block under
 the root block, preserving source order.
 
-Buffer placement: each :class:`Buffer` is placed on the lowest common
-ancestor (LCA) block of all blocks that read or write it. For canonical
-IR (every op is a sibling under the root), this resolves to the root
-block whenever a buffer is touched by multiple leaf blocks.
+Buffer placement is delegated to
+:func:`nkigym.ir.buffer_placement.place_buffers`.
 """
 
 from __future__ import annotations
@@ -33,76 +31,22 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     """Build the canonical :class:`BlockNode`-rooted tree.
 
     Tree.root is already an empty BlockNode from KernelTree.__init__.
-    We build leaf blocks under it, compute LCA buffer placement, then
-    attach buffers to their placement blocks.
+    Build leaf blocks under it, seed all Buffers on the root, then run
+    LCA placement to distribute them to their lifetime-dominating blocks.
     """
+    from nkigym.ir.buffer_placement import place_buffers
+
     tree = KernelTree()
     op_records = list(analysis.ops)
     buffers_by_name = _collect_buffers(analysis.tensors, analysis.param_names)
     compute_records = [rec for rec in op_records if rec.op_cls is not NKIAlloc]
-
-    """Build leaf blocks under tree.root, tracking which block touches which buffer."""
-    touchers: dict[str, set[int]] = {}
     for rec in compute_records:
-        block_nid = _build_subblock(tree, tree.root, rec, analysis)
-        """Collect tensor names from reads and writes of this block."""
-        touched = set()
-        blk = tree.data(block_nid)
-        for region in blk.reads:
-            if region.tensor not in analysis.param_names:
-                touched.add(region.tensor)
-        for region in blk.writes:
-            if region.tensor not in analysis.param_names:
-                touched.add(region.tensor)
-        for tname in touched:
-            touchers.setdefault(tname, set()).add(block_nid)
-
-    """Place buffers at their LCA block."""
-    placement: dict[int, list[Buffer]] = {}
-    for name, buf in buffers_by_name.items():
-        if name not in touchers:
-            """Buffer not touched by any block — place at root (shouldn't happen in canonical)."""
-            lca = tree.root
-        else:
-            lca = _lca(tree, touchers[name])
-        placement.setdefault(lca, []).append(buf)
-
-    """Write alloc_buffers onto each placement block (replace frozen BlockNode payload)."""
-    for block_nid, bufs in placement.items():
-        blk = tree.data(block_nid)
-        tree.graph.nodes[block_nid]["data"] = replace(blk, alloc_buffers=tuple(bufs))
-
+        _build_subblock(tree, tree.root, rec, analysis)
+    """Seed every Buffer on the root block, then let place_buffers redistribute by LCA."""
+    root_blk = tree.data(tree.root)
+    tree.graph.nodes[tree.root]["data"] = replace(root_blk, alloc_buffers=tuple(buffers_by_name.values()))
+    place_buffers(tree)
     return tree
-
-
-def _lca(tree: KernelTree, nids: set[int]) -> int:
-    """Compute the lowest common ancestor of a set of node ids.
-
-    Returns the deepest node that is an ancestor of all nids.
-    For a single-element set, returns that element.
-    """
-    if len(nids) == 1:
-        return next(iter(nids))
-
-    """Collect ancestor sets for each nid (including the node itself)."""
-    ancestor_sets: list[set[int]] = []
-    for nid in nids:
-        ancestors = set(tree.ancestors(nid))
-        ancestors.add(nid)
-        ancestor_sets.append(ancestors)
-
-    """The common ancestors are the intersection of all ancestor sets."""
-    common = ancestor_sets[0].intersection(*ancestor_sets[1:])
-
-    """The LCA is the one with the longest path from root (deepest in tree)."""
-    lca_nid = tree.root
-    max_depth = 0
-    for candidate in common:
-        depth = len(list(tree.ancestors(candidate)))
-        if depth >= max_depth:
-            max_depth = depth
-            lca_nid = candidate
-    return lca_nid
 
 
 def _collect_buffers(tensors: dict[str, "TensorDims"], param_names: list[str]) -> dict[str, Buffer]:
