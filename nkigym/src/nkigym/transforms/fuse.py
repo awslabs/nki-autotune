@@ -1,4 +1,4 @@
-"""``Fuse`` transform — collapse adjacent axis-chain entries into one."""
+"""``Fuse`` transform — collapse adjacent same-axis ForNodes (or absorb them into a tensorize tile)."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from math import prod
 
 from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import ForNode, ISANode
-from nkigym.ops.alloc import NKIAlloc
-from nkigym.transforms._tree_ops import _replace_in_parent_children
+from nkigym.ir.expr import Const, Expr, Mul, Var, from_affine, substitute, to_affine
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
@@ -21,12 +21,8 @@ class FuseOption(TransformOption):
     Attributes:
         target_nids: Adjacent axis-chain entries to fuse, parent->child order.
             ``len >= 2``.
-        target_axis: ``None`` selects the outer-trip flavor — every
-            entry in ``target_nids`` is a :class:`ForNode`. Set to an
-            abstract axis name (e.g. ``"F"``) for the tensorize flavor —
-            ``target_nids[-1]`` is an :class:`ISANode` and the trailing
-            ForNode chain is absorbed into its
-            ``tensorize_sizes[target_axis]``.
+        target_axis: ``None`` for outer-trip flavour. Abstract iter_var
+            axis name for tensorize flavour.
     """
 
     target_nids: tuple[int, ...]
@@ -34,18 +30,14 @@ class FuseOption(TransformOption):
 
 
 class Fuse(Transform):
-    """Collapse a parent->child chain of same-axis entries into one.
-
-    See ``docs/superpowers/specs/2026-05-16-transforms-split-fuse-design.md``.
-    """
+    """Collapse a parent->child chain of same-loop-axis entries into one."""
 
     def analyze(self, ir: KernelIR) -> list[FuseOption]:
-        """Enumerate every legal fuse option (outer-trip and tensorize)."""
         options: list[FuseOption] = []
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
             if isinstance(data, ForNode):
-                chain = [nid]
+                chain: list[int] = [nid]
                 cur = nid
                 while True:
                     kids = ir.tree.children(cur)
@@ -54,222 +46,270 @@ class Fuse(Transform):
                     kid_data = ir.tree.data(kids[0])
                     if not isinstance(kid_data, ForNode):
                         break
-                    if kid_data.dim != data.dim:
+                    """Two adjacent ForNodes are fusion candidates iff their loop_vars share a stem."""
+                    if not _same_loop_axis(data.loop_var, kid_data.loop_var):
                         break
                     chain.append(kids[0])
                     cur = kids[0]
                 for end in range(2, len(chain) + 1):
                     sub = tuple(chain[:end])
-                    opt = FuseOption(target_nids=sub, target_axis=None)
-                    if self._is_legal(ir, opt):
-                        options.append(opt)
-            elif isinstance(data, ISANode):
-                if data.op_cls is NKIAlloc:
-                    continue
-                for axis, dim in data.axis_map.items():
-                    chain_above: list[int] = []
-                    walker = ir.tree.parent(nid)
-                    prev = nid
-                    while walker is not None and walker != ir.tree.root:
-                        wdata = ir.tree.data(walker)
-                        if not isinstance(wdata, ForNode):
-                            break
-                        if wdata.dim != dim:
-                            break
-                        kids = ir.tree.children(walker)
-                        if kids != [prev]:
-                            break
-                        chain_above.insert(0, walker)
-                        prev = walker
-                        walker = ir.tree.parent(walker)
-                    for start in range(len(chain_above)):
-                        sub = tuple(chain_above[start:] + [nid])
-                        if len(sub) < 2:
-                            continue
-                        opt = FuseOption(target_nids=sub, target_axis=axis)
-                        if self._is_legal(ir, opt):
-                            options.append(opt)
+                    options.append(FuseOption(target_nids=sub, target_axis=None))
         return options
 
     def apply(self, ir: KernelIR, option: FuseOption) -> KernelIR:
-        """Re-check legality, deep-copy ``ir``, perform the fuse, return new IR."""
         self._check_legality(ir, option)
         new_ir = copy.deepcopy(ir)
-        self._do_apply(new_ir, option)
+        if option.target_axis is None:
+            self._do_outer_trip(new_ir, option)
+        else:
+            self._do_tensorize(new_ir, option)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
-    def _is_legal(self, ir: KernelIR, option: FuseOption) -> bool:
-        """Wrapper around :meth:`_check_legality` that returns a bool.
-
-        Used by :meth:`analyze` to filter candidate options without raising.
-        Production-path callers must use :meth:`_check_legality` directly so
-        illegal options raise loudly.
-        """
-        legal = True
-        try:
-            self._check_legality(ir, option)
-        except TransformLegalityError:
-            legal = False
-        return legal
-
     def _check_legality(self, ir: KernelIR, option: FuseOption) -> None:
-        """Raise :class:`TransformLegalityError` if ``option`` is invalid for ``ir``."""
         if len(option.target_nids) < 2:
             raise TransformLegalityError(f"Fuse.target_nids must have len >= 2; got {option.target_nids}")
         for nid in option.target_nids:
             if nid not in ir.tree.graph:
                 raise TransformLegalityError(f"Fuse.target_nids contains unknown nid {nid}")
-        if option.target_axis is None:
-            self._check_outer_trip(ir, option)
-        else:
-            self._check_tensorize(ir, option)
-
-    def _check_outer_trip(self, ir: KernelIR, option: FuseOption) -> None:
-        """Outer-trip legality: chain of ForNodes, same dim, parent->child, single-child."""
         nodes = [ir.tree.data(nid) for nid in option.target_nids]
-        if not all(isinstance(n, ForNode) for n in nodes):
-            raise TransformLegalityError(
-                f"Fuse outer-trip flavor: every target must be ForNode; got " f"{[type(n).__name__ for n in nodes]}"
-            )
-        first = nodes[0]
-        for n in nodes[1:]:
-            if n.dim != first.dim:
-                raise TransformLegalityError(
-                    f"Fuse outer-trip flavor: all entries must share dim; got {first.dim!r} vs {n.dim!r}"
-                )
-        for parent_nid, child_nid in zip(option.target_nids, option.target_nids[1:]):
-            kids = ir.tree.children(parent_nid)
-            if kids != [child_nid]:
-                raise TransformLegalityError(
-                    f"Fuse outer-trip flavor: nid {parent_nid} must have a single ForNode child {child_nid}; "
-                    f"got children {kids}"
-                )
-
-    def _check_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
-        """Tensorize legality: trailing ISANode + chain of same-dim ForNodes above it."""
-        leaf_nid = option.target_nids[-1]
-        leaf = ir.tree.data(leaf_nid)
-        if not isinstance(leaf, ISANode):
-            raise TransformLegalityError(
-                f"Fuse tensorize flavor: last target must be ISANode; got {type(leaf).__name__}"
-            )
-        if leaf.op_cls is NKIAlloc:
-            raise TransformLegalityError(
-                "Fuse tensorize flavor: cannot fuse NKIAlloc tensorize_sizes " "(would change buffer placement)"
-            )
-        if option.target_axis not in leaf.axis_map:
-            raise TransformLegalityError(
-                f"Fuse.target_axis={option.target_axis!r} not in leaf.axis_map={list(leaf.axis_map)}"
-            )
-        concrete_dim = leaf.axis_map[option.target_axis]
-
-        for_chain_nids = option.target_nids[:-1]
-        for nid in for_chain_nids:
-            data = ir.tree.data(nid)
-            if not isinstance(data, ForNode):
-                raise TransformLegalityError(
-                    f"Fuse tensorize flavor: prefix entries must be ForNode; got {type(data).__name__}"
-                )
-            if data.dim != concrete_dim:
-                raise TransformLegalityError(
-                    f"Fuse tensorize flavor: prefix dim must match leaf axis concrete dim "
-                    f"({concrete_dim!r}); got {data.dim!r}"
-                )
-
-        for parent_nid, child_nid in zip(option.target_nids, option.target_nids[1:]):
-            kids = ir.tree.children(parent_nid)
-            if kids != [child_nid]:
-                raise TransformLegalityError(
-                    f"Fuse tensorize flavor: nid {parent_nid} must have a single child {child_nid}; "
-                    f"got children {kids}"
-                )
-
-        chain_trip_product = prod(ir.tree.data(nid).trip for nid in for_chain_nids)
-        if chain_trip_product < 2:
-            raise TransformLegalityError(
-                f"Fuse tensorize flavor: chain trip product must be >= 2; got {chain_trip_product}"
-            )
-
-        new_tensorize = leaf.tensorize_sizes[option.target_axis] * chain_trip_product
-        max_tile = leaf.op_cls.MAX_TILE_SIZE.get(option.target_axis)
-        if max_tile is not None and new_tensorize > max_tile:
-            raise TransformLegalityError(
-                f"Fuse tensorize flavor: new tensorize {new_tensorize} > "
-                f"MAX_TILE_SIZE[{option.target_axis!r}]={max_tile}"
-            )
-
-    def _do_apply(self, ir: KernelIR, option: FuseOption) -> None:
-        """Mutate ``ir.tree`` in place per ``option``."""
         if option.target_axis is None:
-            self._do_apply_outer_trip(ir, option)
+            if not all(isinstance(n, ForNode) for n in nodes):
+                raise TransformLegalityError(
+                    f"Fuse outer-trip flavour: every target must be ForNode; got {[type(n).__name__ for n in nodes]}"
+                )
+            for parent_nid, child_nid in zip(option.target_nids, option.target_nids[1:]):
+                kids = ir.tree.children(parent_nid)
+                if kids != [child_nid]:
+                    raise TransformLegalityError(
+                        f"Fuse outer-trip flavour: nid {parent_nid} must have a single child {child_nid}; got {kids}"
+                    )
         else:
-            self._do_apply_tensorize(ir, option)
+            """Tensorize flavour: prefix is ForNodes; last is the ISA leaf."""
+            if not isinstance(nodes[-1], ISANode):
+                raise TransformLegalityError(
+                    f"Fuse tensorize flavour: last target must be ISANode; got {type(nodes[-1]).__name__}"
+                )
+            for n in nodes[:-1]:
+                if not isinstance(n, ForNode):
+                    raise TransformLegalityError(
+                        f"Fuse tensorize flavour: prefix must be all ForNodes; got {type(n).__name__}"
+                    )
+            for parent_nid, child_nid in zip(option.target_nids, option.target_nids[1:]):
+                kids = ir.tree.children(parent_nid)
+                if kids != [child_nid]:
+                    raise TransformLegalityError(
+                        f"Fuse tensorize flavour: nid {parent_nid} must have a single child {child_nid}; got {kids}"
+                    )
 
-    def _do_apply_outer_trip(self, ir: KernelIR, option: FuseOption) -> None:
-        """Replace a chain of same-dim ForNodes with one ForNode whose trip is the product.
-
-        Sibling order under the chain root's parent is preserved: the new fused
-        ForNode occupies the position the chain root held in the parent's child list.
-        """
+    def _do_outer_trip(self, ir: KernelIR, option: FuseOption) -> None:
         nids = option.target_nids
+        """Capture loop_vars and extents BEFORE removing nodes."""
+        old_loop_vars_in_order = [ir.tree.data(nid).loop_var for nid in nids]
+        old_extents_in_order = [ir.tree.data(nid).extent for nid in nids]
+
         first = ir.tree.data(nids[0])
         assert isinstance(first, ForNode)
         parent_nid = ir.tree.parent(nids[0])
         assert parent_nid is not None
         deepest_kids = ir.tree.children(nids[-1])
-        new_trip = prod(ir.tree.data(nid).trip for nid in nids)
+        new_extent = prod(old_extents_in_order)
+        block_nid, block = _find_enclosing_block(ir.tree, nids[0])
 
-        """Build the new fused ForNode DETACHED."""
-        new_nid = ir.tree.add_node(ForNode(dim=first.dim, trip=new_trip), parent=None)
-
-        """Reparent deepest_kids under the new node."""
-        for child in deepest_kids:
-            ir.tree.graph.add_edge(new_nid, child)
-
-        """Swap nids[0] (the chain root, parent's child) for new_nid at the same position."""
+        new_loop_var = _fused_loop_var(first.loop_var)
+        new_nid = ir.tree.add_node(ForNode(loop_var=new_loop_var, extent=new_extent), parent=None)
+        for child_nid in deepest_kids:
+            ir.tree.graph.add_edge(new_nid, child_nid)
         _replace_in_parent_children(ir.tree, parent_nid, [nids[0]], [new_nid])
-
-        """Drop the chain. Each ``remove_node`` also removes any remaining incident edges."""
         for nid in nids:
             ir.tree.graph.remove_node(nid)
 
-    def _do_apply_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
-        """Remove the prefix ForNodes and bump leaf.tensorize_sizes[target_axis]."""
+        """Replace iter_values that reference any old loop_var.
+
+        When fusing a chain, the iter_value that used the chain's loop_vars
+        should now bind directly to the fused loop_var. We detect which
+        iter_value to replace by checking if it contains any of the old
+        loop_vars.
+
+        For reads/writes/operand_bindings, we still need to substitute all
+        occurrences of old loop_vars with the new fused loop_var.
+        """
+        old_loop_var_set = set(old_loop_vars_in_order)
+
+        def _contains_old_var(expr: Expr) -> bool:
+            """Check if expr contains any old loop_var."""
+            affine = to_affine(expr)
+            return bool(old_loop_var_set & affine.keys())
+
+        new_iter_values = tuple(
+            Var(name=new_loop_var) if _contains_old_var(value) else value for value in block.iter_values
+        )
+
+        """For regions, substitute all old loop_vars → new_loop_var."""
+        substitutions: dict[str, Expr] = {
+            old_loop_var: Var(name=new_loop_var) for old_loop_var in old_loop_vars_in_order
+        }
+
+        new_block = BlockNode(
+            iter_vars=block.iter_vars,
+            iter_values=new_iter_values,
+            reads=tuple(_substitute_region(r, substitutions, fused_var=new_loop_var) for r in block.reads),
+            writes=tuple(_substitute_region(w, substitutions, fused_var=new_loop_var) for w in block.writes),
+            alloc_buffers=block.alloc_buffers,
+            annotations=dict(block.annotations),
+        )
+        ir.tree.graph.nodes[block_nid]["data"] = new_block
+
+        """Propagate substitutions into descendant ISANode operand_bindings within this block's scope."""
+        for desc_nid in _block_local_descendants(ir.tree, block_nid):
+            desc_data = ir.tree.data(desc_nid)
+            if isinstance(desc_data, ISANode):
+                new_bindings = {
+                    slot: _substitute_region(region, substitutions, fused_var=new_loop_var)
+                    for slot, region in desc_data.operand_bindings.items()
+                }
+                new_isa = ISANode(op_cls=desc_data.op_cls, operand_bindings=new_bindings, kwargs=dict(desc_data.kwargs))
+                ir.tree.graph.nodes[desc_nid]["data"] = new_isa
+
+    def _do_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
+        """Tensorize Fuse: absorb a chain of same-axis ForNodes above an ISA leaf into the leaf's tile width.
+
+        ``option.target_nids[-1]`` is the ISA leaf; the prefix is the
+        ForNode chain to absorb. The leaf's operand_bindings on
+        ``target_axis`` widen by the product of the absorbed extents.
+        """
         leaf_nid = option.target_nids[-1]
         leaf = ir.tree.data(leaf_nid)
         assert isinstance(leaf, ISANode)
-        assert option.target_axis is not None
-        for_chain_nids = option.target_nids[:-1]
-        chain_root_parent = ir.tree.parent(for_chain_nids[0])
+        for_chain = option.target_nids[:-1]
+        chain_root = for_chain[0]
+        chain_root_parent = ir.tree.parent(chain_root)
         assert chain_root_parent is not None
+        block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
 
-        new_tensorize = leaf.tensorize_sizes[option.target_axis] * prod(
-            ir.tree.data(nid).trip for nid in for_chain_nids
-        )
-
-        """Detach the chain (and the leaf-edge it carries)."""
-        for nid in for_chain_nids:
+        absorbed_extent = prod(ir.tree.data(nid).extent for nid in for_chain)
+        absorbed_loop_vars = [ir.tree.data(nid).loop_var for nid in for_chain]
+        for nid in for_chain:
             ir.tree.graph.remove_node(nid)
-
-        """Reattach the leaf under chain_root_parent (it was detached when the immediate parent was removed)."""
         ir.tree.graph.add_edge(chain_root_parent, leaf_nid)
 
-        """Rewrite the leaf's tensorize_sizes entry."""
-        new_tensorize_sizes = dict(leaf.tensorize_sizes)
-        new_tensorize_sizes[option.target_axis] = new_tensorize
-        new_leaf = ISANode(
-            op_cls=leaf.op_cls,
-            reads=leaf.reads,
-            writes=leaf.writes,
-            rmw=leaf.rmw,
-            tensorize_sizes=new_tensorize_sizes,
-            axis_map=dict(leaf.axis_map),
-            kwargs=dict(leaf.kwargs),
-            location=leaf.location,
-            dtype=leaf.dtype,
-        )
+        new_bindings = {
+            slot: _widen_region_axis(region, leaf.op_cls, slot, option.target_axis, absorbed_extent)
+            for slot, region in leaf.operand_bindings.items()
+        }
+        new_leaf = ISANode(op_cls=leaf.op_cls, operand_bindings=new_bindings, kwargs=dict(leaf.kwargs))
         ir.tree.graph.nodes[leaf_nid]["data"] = new_leaf
+
+        """Drop absorbed loop_vars from the block's iter_values by substituting Const(0) for each."""
+        substitutions: dict[str, Expr] = {lv: Const(value=0) for lv in absorbed_loop_vars}
+        new_iter_values = tuple(substitute(value, substitutions) for value in block.iter_values)
+        new_block = BlockNode(
+            iter_vars=block.iter_vars,
+            iter_values=new_iter_values,
+            reads=tuple(_substitute_region(r, substitutions) for r in block.reads),
+            writes=tuple(_substitute_region(w, substitutions) for w in block.writes),
+            alloc_buffers=block.alloc_buffers,
+            annotations=dict(block.annotations),
+        )
+        ir.tree.graph.nodes[block_nid]["data"] = new_block
+
+        """Propagate substitutions into descendant ISANode operand_bindings within this block's scope."""
+        for desc_nid in _block_local_descendants(ir.tree, block_nid):
+            desc_data = ir.tree.data(desc_nid)
+            if isinstance(desc_data, ISANode):
+                new_bindings_desc = {
+                    slot: _substitute_region(region, substitutions)
+                    for slot, region in desc_data.operand_bindings.items()
+                }
+                new_isa_desc = ISANode(
+                    op_cls=desc_data.op_cls, operand_bindings=new_bindings_desc, kwargs=dict(desc_data.kwargs)
+                )
+                ir.tree.graph.nodes[desc_nid]["data"] = new_isa_desc
+
+
+def _widen_region_axis(region: BufferRegion, op_cls, slot: str, target_axis: str, new_width: int) -> BufferRegion:
+    """Widen the slice for ``target_axis`` on ``region`` to ``new_width`` if the slot's axes contain it."""
+    axes = op_cls.OPERAND_AXES.get(slot)
+    if axes is None or target_axis not in axes:
+        return region
+    axis_index = axes.index(target_axis)
+    if axis_index >= len(region.ranges):
+        return region
+    new_ranges: list[tuple[Expr, Expr]] = []
+    for i, (lo, hi) in enumerate(region.ranges):
+        if i == axis_index:
+            new_ranges.append((lo, Const(value=new_width)))
+        else:
+            new_ranges.append((lo, hi))
+    return BufferRegion(tensor=region.tensor, ranges=tuple(new_ranges))
+
+
+def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
+    for ancestor in reversed(tree.ancestors(nid)):
+        data = tree.data(ancestor)
+        if isinstance(data, BlockNode):
+            return ancestor, data
+    raise TransformLegalityError(f"no enclosing BlockNode for nid {nid}")
+
+
+def _same_loop_axis(a: str, b: str) -> bool:
+    """Two loop_vars are 'same axis' if their split-stem matches.
+
+    For canonical loop_var ``i_<concrete>_0`` and post-Split offspring
+    ``i_<concrete>_0_0`` / ``i_<concrete>_0_1``, the stem is everything
+    before the trailing ``_<int>`` suffix.
+    """
+    return _stem(a) == _stem(b)
+
+
+def _stem(loop_var: str) -> str:
+    parts = loop_var.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0]
+    return loop_var
+
+
+def _fused_loop_var(first_loop_var: str) -> str:
+    return _stem(first_loop_var) + "_fused"
+
+
+def _substitute_region(region: BufferRegion, subs: dict[str, Expr], fused_var: str | None = None) -> BufferRegion:
+    """Substitute loop_vars in a BufferRegion.
+
+    For outer-trip Fuse, if `fused_var` is set, detect subexpressions that
+    contain the old loop_vars and replace them with `Var(fused_var)`.
+    """
+    if fused_var is not None:
+        old_loop_vars = set(subs.keys())
+
+        def _replace_if_contains_old(expr: Expr) -> Expr:
+            """If expr contains any old loop_var, replace it with Var(fused_var).
+
+            This handles the case where expr is like `(i_old_0 * 8 + i_old_1) * stride`,
+            which should become `Var(fused_var) * stride`.
+            """
+            affine = to_affine(expr)
+            if old_loop_vars & affine.keys():
+                """expr contains old loop_vars. Extract the stride if any."""
+                """Check if expr is of form `base * stride` where base contains old vars."""
+                if isinstance(expr, Mul) and isinstance(expr.right, Const):
+                    """expr = base * stride"""
+                    base_affine = to_affine(expr.left)
+                    if old_loop_vars & base_affine.keys():
+                        """base contains old vars; replace base with fused_var."""
+                        return Mul(left=Var(name=fused_var), right=expr.right)
+                """expr directly contains old vars without a constant multiplier."""
+                return Var(name=fused_var)
+            return expr
+
+        new_ranges = tuple((_replace_if_contains_old(lo), hi) for lo, hi in region.ranges)
+    else:
+        """Simple substitution + normalization."""
+        new_ranges = tuple(
+            (from_affine(to_affine(substitute(lo, subs))), from_affine(to_affine(substitute(hi, subs))))
+            for lo, hi in region.ranges
+        )
+    return BufferRegion(tensor=region.tensor, ranges=new_ranges)
 
 
 __all__ = ["Fuse", "FuseOption"]

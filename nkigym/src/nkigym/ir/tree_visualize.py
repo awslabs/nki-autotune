@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
-from nkigym.ir.tree import ForNode, ISANode, KernelTree, NodeData, RootNode
+from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree, NodeData
 from nkigym.ops.alloc import NKIAlloc
 
 _FLOWCHART_STYLES: list[ClassStyle] = [
@@ -19,6 +19,7 @@ _FLOWCHART_STYLES: list[ClassStyle] = [
     ClassStyle(name="loop", fill="#eef", stroke="#336"),
     ClassStyle(name="tensorize", fill="#ffe", stroke="#a60"),
     ClassStyle(name="leaf", fill="#efe", stroke="#363"),
+    ClassStyle(name="block", fill="#ffd", stroke="#960"),
 ]
 
 
@@ -46,10 +47,18 @@ def _to_mermaid(tree: KernelTree) -> str:
 
 def _tree_node_decl(node_id: str, nid: int, data: NodeData) -> tuple[str, str | None]:
     """Return the Mermaid declaration + class bucket for one tree node."""
-    if isinstance(data, RootNode):
-        return f'{node_id}(("#{nid} root"))', None
+    if isinstance(data, BlockNode):
+        """Block nodes show their iter_vars summary with role/dom and alloc count."""
+        if not data.iter_vars:
+            label = "root-block"
+        else:
+            iv_summary = ", ".join(f"{iv.axis}({iv.role.name[0]},{iv.dom[0]}..{iv.dom[1]})" for iv in data.iter_vars)
+            label = f"block[{iv_summary}]"
+        alloc_count = len(data.alloc_buffers)
+        full_label = f"{label} allocs={alloc_count}"
+        return (f'{node_id}[["#{nid} {full_label}"]]', "block")
     if isinstance(data, ForNode):
-        return (f'{node_id}["#{nid} Loop {data.dim} trip={data.trip}"]', "loop")
+        return (f'{node_id}["#{nid} Loop {data.loop_var} extent={data.extent}"]', "loop")
     if isinstance(data, ISANode):
         return (f'{node_id}["#{nid} {_isa_label(data)}"]', "alloc" if data.op_cls is NKIAlloc else "leaf")
     raise TypeError(f"unknown node data type: {type(data).__name__}")
@@ -58,15 +67,12 @@ def _tree_node_decl(node_id: str, nid: int, data: NodeData) -> tuple[str, str | 
 def _isa_label(data: ISANode) -> str:
     """Build the Mermaid node label for an :class:`ISANode` payload."""
     parts: list[str] = [data.op_cls.__name__]
-    if data.reads:
-        parts.append(f"reads={','.join(data.reads)}")
-    if data.writes:
-        parts.append(f"writes={','.join(data.writes)}")
-    if data.rmw:
-        parts.append(f"rmw={','.join(data.rmw)}")
-    parts.append(f"tensorize_sizes={data.tensorize_sizes}")
-    parts.append(f"axis_map={data.axis_map}")
-    parts.append(f"kwargs={data.kwargs}")
+    """ISANode now uses operand_bindings instead of reads/writes/rmw."""
+    if data.operand_bindings:
+        bindings_str = ", ".join(f"{k}={v.tensor}" for k, v in data.operand_bindings.items())
+        parts.append(f"bindings=({bindings_str})")
+    if data.kwargs:
+        parts.append(f"kwargs={data.kwargs}")
     return "<br/>".join(parts)
 
 

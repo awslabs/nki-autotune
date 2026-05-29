@@ -1,9 +1,11 @@
 """Envelope IR for an ``f_nkigym`` kernel.
 
 :class:`KernelIR` is the single envelope. It carries the kernel
-signature, return-tensor identity, per-dim sizes, tensor table,
-canonical schedule tree, and the producer-consumer dependency graph
-that rewrite atoms consult.
+signature, return-tensor identity, schedule tree, and producer-consumer
+dependency graph. Per-buffer and per-axis information is derived from
+the tree on demand via :meth:`KernelIR.all_buffers` and
+:meth:`KernelIR.axis_extent` — caching them on the envelope leads to
+invalidation churn when transforms move buffers between blocks.
 
 :func:`build_initial_ir` runs dim unification, tree construction, and
 dependency graph construction, then flattens the analysis output onto
@@ -15,37 +17,69 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.dimension_analysis import TensorDims, analyze_dimensions
-from nkigym.ir.tree import KernelTree, build_initial_tree
+from nkigym.ir.dimension_analysis import analyze_dimensions
+from nkigym.ir.tree import BlockNode, Buffer, KernelTree, build_initial_tree
 from nkigym.ir.tree_visualize import dump_tree
 
 
 @dataclass
 class KernelIR:
-    """Envelope holding signature, tensor table, schedule tree, and dependency graph.
+    """Envelope holding signature and the schedule tree.
 
     Attributes:
         func_name: Source ``f_nkigym`` name.
         param_names: Signature order.
         return_name: Identifier in the kernel's ``return`` statement.
-        dim_sizes: ``dim_name → extent``.
-        tensors: All named tensors, keyed by name.
         tree: Canonical schedule tree.
         dependency: Producer-consumer graph derived from ``tree``.
+        param_buffers: Parameter buffer metadata (shape/dtype/location).
     """
 
     func_name: str
     param_names: list[str]
     return_name: str
-    dim_sizes: dict[str, int]
-    tensors: dict[str, TensorDims]
     tree: KernelTree
     dependency: Dependency
+    param_buffers: dict[str, Buffer] = field(default_factory=dict)
+
+    def all_buffers(self) -> dict[str, Buffer]:
+        """Walk every :class:`BlockNode` in pre-order; return ``name -> Buffer`` including parameters."""
+        out: dict[str, Buffer] = dict(self.param_buffers)
+        for nid in self.tree.blocks():
+            block = self.tree.data(nid)
+            assert isinstance(block, BlockNode)
+            for buf in block.alloc_buffers:
+                if buf.name in out:
+                    raise ValueError(f"buffer {buf.name!r} declared by two blocks")
+                out[buf.name] = buf
+        return out
+
+    def buffer(self, name: str) -> Buffer:
+        """Resolve a buffer by name; raises :class:`KeyError` if absent."""
+        buffers = self.all_buffers()
+        if name not in buffers:
+            raise KeyError(f"buffer {name!r} not found in any block.alloc_buffers")
+        return buffers[name]
+
+    def axis_extent(self, axis: str) -> int:
+        """Return the extent of the iter_var named ``axis``.
+
+        Walks blocks in pre-order; returns the first ``IterVar`` whose
+        ``axis`` matches. Raises :class:`KeyError` if the axis is not
+        declared anywhere in the tree.
+        """
+        for nid in self.tree.blocks():
+            block = self.tree.data(nid)
+            assert isinstance(block, BlockNode)
+            for iv in block.iter_vars:
+                if iv.axis == axis:
+                    return iv.dom[1] - iv.dom[0]
+        raise KeyError(f"no iter_var with axis {axis!r}")
 
     def dump(self, cache_dir: str | Path) -> None:
         """Write ``envelope.md``, ``tree.*``, ``dependency.*``, and a black-formatted ``kernel.py`` into ``cache_dir``."""
@@ -61,7 +95,7 @@ class KernelIR:
         subprocess.run(["black", "--quiet", str(kernel_path)], check=True)
 
     def _render_envelope_md(self) -> str:
-        """Render signature + dim_sizes + tensors as Markdown."""
+        """Render signature + buffers as Markdown."""
         lines: list[str] = [
             f"# `{self.func_name}`",
             "",
@@ -70,30 +104,14 @@ class KernelIR:
             f"- **Params**: {', '.join(f'`{p}`' for p in self.param_names) or '_(none)_'}",
             f"- **Returns**: `{self.return_name}`",
             "",
-            "## Dim sizes",
+            "## Buffers",
             "",
-            "| Dim | Extent |",
-            "| --- | ------ |",
+            "| Name | Location | Dtype | Shape |",
+            "| ---- | -------- | ----- | ----- |",
         ]
-        for dim, size in self.dim_sizes.items():
-            lines.append(f"| `{dim}` | {size} |")
-        lines.extend(
-            [
-                "",
-                "## Tensors",
-                "",
-                "| Name | Origin | Location | Dtype | Shape | Dim ids |",
-                "| ---- | ------ | -------- | ----- | ----- | ------- |",
-            ]
-        )
-        params = set(self.param_names)
-        for tensor in self.tensors.values():
-            origin = "param" if tensor.name in params else "intermediate"
-            shape = "(" + ", ".join(str(s) for s in tensor.shape) + ")"
-            dim_ids = ", ".join(f"`{d}`" for d in tensor.dim_ids)
-            lines.append(
-                f"| `{tensor.name}` | {origin} | `{tensor.location}` | `{tensor.dtype}` | `{shape}` | {dim_ids} |"
-            )
+        for buf in self.all_buffers().values():
+            shape = "(" + ", ".join(str(s) for s in buf.shape) + ")"
+            lines.append(f"| `{buf.name}` | `{buf.location}` | `{buf.dtype}` | `{shape}` |")
         lines.append("")
         return "\n".join(lines)
 
@@ -111,14 +129,22 @@ def build_initial_ir(func: Callable[..., Any], input_specs: dict[str, tuple[int,
     analysis = analyze_dimensions(func, input_specs)
     tree = build_initial_tree(analysis)
     dependency = Dependency(tree)
+    param_buffers = {
+        name: Buffer(
+            name=name,
+            shape=tuple(analysis.tensors[name].shape),
+            dtype=analysis.tensors[name].dtype,
+            location=analysis.tensors[name].location,
+        )
+        for name in analysis.param_names
+    }
     return KernelIR(
         func_name=analysis.func_name,
         param_names=analysis.param_names,
         return_name=analysis.return_name,
-        dim_sizes=analysis.dim_sizes,
-        tensors=analysis.tensors,
         tree=tree,
         dependency=dependency,
+        param_buffers=param_buffers,
     )
 
 

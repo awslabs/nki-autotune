@@ -1,28 +1,22 @@
 """Canonical schedule tree for an ``f_nkigym`` kernel, backed by ``networkx``.
 
 The tree is stored as an ``nx.DiGraph`` where every node is a stable
-integer id and the payload lives at ``graph.nodes[id]["data"]``. Three
-payload dataclasses discriminate the node kind:
+integer id and the payload lives at ``graph.nodes[id]["data"]``. Payload
+dataclasses discriminate the node kind:
 
-* :class:`RootNode` — dummy root of the forest.
-* :class:`ForNode` — a trip loop (``trip = extent // tile_size``).
-* :class:`ISANode` — a single NKI instruction with operands split into
-  read / write / read-modify-write sets, plus a ``tensorize_sizes``
-  map carrying the per-axis tile width lowered onto the ISA call's
-  slice width.
+* :class:`BlockNode` — TVM-style schedulable unit owning iter_vars,
+  declared reads / writes, and ``alloc_buffers``.
+* :class:`ForNode` — a loop binding to (part of) a block iter_var.
+* :class:`ISANode` — a single NKI instruction.
+
+:class:`IterVar`, :class:`BufferRegion`, and :class:`Buffer` are
+sub-payloads carried on :class:`BlockNode` and :class:`ISANode`.
 
 :class:`KernelTree` wraps the graph with a small traversal surface
 (``children``, ``parent``, ``ancestors``, ``descendants``, ``leaves``,
-``preorder``) so downstream atoms don't have to touch ``networkx``
-directly. :func:`build_initial_tree` walks an ``@nkigym_kernel``
-callable via :func:`nkigym.ir.dimension_analysis.analyze_dimensions`,
-lays alloc leaves at the forest root in declaration order, then hangs
-one per-op loop nest per compute op. Each nest contributes one
-:class:`ForNode` per axis with ``trip = extent // tile_size``; the
-terminal :class:`ISANode` records ``tensorize_sizes[dim] = tile_size``
-(``tile_size = op_cls.MAX_TILE_SIZE[abstract]`` when set, else the
-full axis extent — so unbounded axes emit ``Loop trip=1`` with the
-full extent carried on the ISA node).
+``preorder``, ``blocks``) so downstream atoms don't have to touch
+``networkx`` directly. :func:`build_initial_tree` walks an
+``@nkigym_kernel`` callable via :func:`nkigym.ir.dimension_analysis.analyze_dimensions`.
 Visualization helpers live in :mod:`nkigym.ir.tree_visualize`.
 """
 
@@ -34,70 +28,119 @@ from typing import Any
 
 import networkx as nx
 
-from nkigym.ir.dimension_analysis import TensorDims, _AnalysisResult, _OpRecord
-from nkigym.ops.alloc import NKIAlloc
+from nkigym.ir.dimension_analysis import _AnalysisResult
+from nkigym.ir.expr import Expr
 from nkigym.ops.base import AxisRole, NKIOp
 
 
 @dataclass(frozen=True, kw_only=True)
-class RootNode:
-    """Dummy root payload."""
-
-
-@dataclass(frozen=True, kw_only=True)
 class ForNode:
-    """Trip-loop payload.
+    """Loop binding to one (or part of one) :class:`BlockNode` iter_var.
+
+    Multiple same-axis ``ForNode``s above one block — the result of
+    :class:`Split` — bind the iter_var via the affine combination
+    encoded in the enclosing block's ``iter_values``.
 
     Attributes:
-        dim: Concrete dim id (e.g. ``"d0"``).
-        trip: Loop trip count (``extent // tile_size``).
+        loop_var: symbolic name (e.g. ``"i_M_outer"``).
+        extent: loop trip count.
     """
 
-    dim: str
-    trip: int
+    loop_var: str
+    extent: int
 
 
 @dataclass(frozen=True, kw_only=True)
 class ISANode:
-    """NKI-instruction payload.
+    """Single ISA call.
 
     Attributes:
-        op_cls: The :class:`NKIOp` subclass (e.g. ``NKILoad``).
-        reads: Tensor names from slots in ``op_cls.INPUT_OPERANDS``.
-        writes: Tensor names from slots that are neither input nor RMW.
-        rmw: Tensor names from slots in ``op_cls.RMW_OPERANDS``.
-        tensorize_sizes: Per-axis tile width (``abstract_axis → tile_size``)
-            lowered onto the ISA call's slice width. Keys mirror the
-            ``axis_map`` keys; for :class:`NKIAlloc` leaves they record
-            the per-axis tile sized to ``NKIAlloc.MAX_TILE_SIZE`` (or
-            full extent when unbounded).
-        axis_map: ``abstract_axis → concrete_dim`` (e.g. ``{"K": "d0"}``).
-            Render consults this alongside ``op_cls.OPERAND_AXES`` to
-            resolve each slot's axis labels to concrete dim ids. For
-            :class:`NKIAlloc` leaves it zips ``OPERAND_AXES["dst"]`` to
-            the tensor's ``dim_ids``.
-        kwargs: Non-operand call kwargs captured from the tracer
-            (e.g. ``{"value": 0.0}`` for ``NKIMemset``,
-            ``{"op": "rsqrt", "scale": 1.0}`` for ``NKIActivation``).
-            Empty for :class:`NKIAlloc` leaves.
-        location: Memory location (``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``)
-            for :class:`NKIAlloc` leaves; ``None`` for compute ops.
-        dtype: Declared dtype (``"float32"`` / ``"float16"`` / ``"bfloat16"``)
-            for :class:`NKIAlloc` leaves; ``None`` for compute ops.
+        op_cls: :class:`NKIOp` subclass.
+        operand_bindings: per-slot :class:`BufferRegion` in the
+            enclosing :class:`BlockNode`'s iter_var space.
+        kwargs: non-operand call kwargs (e.g. ``{"value": 0.0}`` for
+            :class:`NKIMemset`).
     """
 
     op_cls: type[NKIOp]
-    reads: tuple[str, ...] = ()
-    writes: tuple[str, ...] = ()
-    rmw: tuple[str, ...] = ()
-    tensorize_sizes: dict[str, int] = field(default_factory=dict)
-    axis_map: dict[str, str] = field(default_factory=dict)
+    operand_bindings: dict[str, BufferRegion] = field(default_factory=dict)
     kwargs: dict[str, Any] = field(default_factory=dict)
-    location: str | None = None
-    dtype: str | None = None
 
 
-NodeData = RootNode | ForNode | ISANode
+@dataclass(frozen=True, kw_only=True)
+class IterVar:
+    """Per-block iteration variable.
+
+    Attributes:
+        axis: abstract axis name (``"M"``, ``"K"``, ``"P"``, ...).
+        dom: half-open extent ``(lo, hi)``.
+        role: ``PARALLEL`` (TVM ``kDataPar``) / ``ACCUMULATION``
+            (``kCommReduce``) / ``SEQUENTIAL`` (``kOrdered``).
+    """
+
+    axis: str
+    dom: tuple[int, int]
+    role: AxisRole
+
+
+@dataclass(frozen=True, kw_only=True)
+class Buffer:
+    """Buffer declaration on an enclosing :class:`BlockNode`.
+
+    Replaces the standalone :class:`NKIAlloc` ISA leaf. The lifetime is
+    bounded by the declaring block.
+
+    Attributes:
+        name: tensor name.
+        shape: per-axis extent.
+        dtype: ``"float32"`` / ``"float16"`` / ``"bfloat16"``.
+        location: ``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``.
+    """
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: str
+    location: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class BufferRegion:
+    """Affine half-open region of a buffer, expressed in iter_var ``Var``s.
+
+    Attributes:
+        tensor: tensor name (key into the kernel's buffers).
+        ranges: one ``(lo, hi)`` pair per axis, in iter_var-Var space.
+            For a single-element access, ``hi`` is ``lo + 1``; for a
+            tile, ``hi`` is ``lo + tile_size``.
+    """
+
+    tensor: str
+    ranges: tuple[tuple[Expr, Expr], ...]
+
+
+@dataclass(frozen=True, kw_only=True)
+class BlockNode:
+    """TVM-style block — schedulable unit aligned with ``tir.SBlockNode``.
+
+    Attributes:
+        iter_vars: per-axis iter_vars owned by this block.
+        iter_values: one Expr per iter_var (in iter_vars order) mapping
+            surrounding ``ForNode.loop_var`` symbols to iter_var values.
+        reads: declared read regions in iter_var space.
+        writes: declared write regions in iter_var space.
+        alloc_buffers: buffers whose lifetime is bounded by this block.
+        annotations: free-form per-block metadata.
+    """
+
+    iter_vars: tuple[IterVar, ...]
+    iter_values: tuple[Expr, ...]
+    reads: tuple[BufferRegion, ...]
+    writes: tuple[BufferRegion, ...]
+    alloc_buffers: tuple[Buffer, ...] = ()
+    annotations: dict[str, Any] = field(default_factory=dict)
+
+
+NodeData = BlockNode | ForNode | ISANode
 
 
 class KernelTree:
@@ -110,14 +153,14 @@ class KernelTree:
     Attributes:
         graph: The underlying ``nx.DiGraph``. Node payloads live at
             ``graph.nodes[nid]["data"]``.
-        root: Node id of the forest root (a :class:`RootNode`).
+        root: Node id of the root block (a :class:`BlockNode`).
     """
 
     def __init__(self) -> None:
-        """Initialise an empty tree."""
+        """Initialise an empty tree with root BlockNode."""
         self.graph: nx.DiGraph = nx.DiGraph()
         self._next_id: int = 0
-        self.root: int = self.add_node(RootNode())
+        self.root: int = self.add_node(BlockNode(iter_vars=(), iter_values=(), reads=(), writes=(), alloc_buffers=()))
 
     def add_node(self, data: NodeData, parent: int | None = None) -> int:
         """Add a node with ``data`` as payload; return the new node id."""
@@ -175,91 +218,52 @@ class KernelTree:
             if self.graph.out_degree(m) == 0:
                 yield m
 
+    def blocks(self, nid: int | None = None) -> Iterator[int]:
+        """Yield ``BlockNode``-bearing nids in pre-order DFS from ``nid``.
 
-def build_initial_tree(analysis: _AnalysisResult) -> KernelTree:
+        Convenience for transforms that walk blocks rather than ISA leaves.
+        ``nid`` defaults to the root.
+        """
+        for m in self.preorder(nid):
+            if isinstance(self.data(m), BlockNode):
+                yield m
+
+
+def build_initial_tree(analysis: "_AnalysisResult") -> "KernelTree":
     """Build the canonical schedule tree from an :class:`_AnalysisResult`.
 
-    Iterates ``analysis.ops`` uniformly — each :class:`_OpRecord`
-    (including :class:`NKIAlloc` records prepended by the tracer)
-    becomes one call to :func:`_attach_op_subtree`. Alloc leaves sit as
-    direct children of the root (no surrounding loops); compute ops get
-    a per-axis loop nest outermost-to-innermost in axis_map order.
+    The returned tree's root is a :class:`BlockNode` (empty iter_vars/reads/writes,
+    holds kernel-lifetime buffers). Per-op leaf blocks are children of the root
+    block, in source order. Allocs become ``Buffer`` entries on the smallest
+    enclosing block whose subtree contains every leaf that touches the buffer
+    (canonical: nearly always the root block).
     """
-    tree = KernelTree()
-    for op in analysis.ops:
-        _attach_op_subtree(tree, op, analysis.dim_sizes, analysis.tensors)
-    return tree
+    from nkigym.ir.canonical_build import build_canonical_blocknode_tree
+
+    return build_canonical_blocknode_tree(analysis)
 
 
-def _attach_op_subtree(
-    tree: KernelTree, op: _OpRecord, dim_sizes: dict[str, int], tensors: dict[str, TensorDims]
-) -> None:
-    """Attach one op subtree under ``tree.root``.
+def role_of(block: BlockNode, axis: str) -> AxisRole:
+    """Return the role this block assigns to ``axis``.
 
-    Builds the per-axis loop chain (skipped for :class:`NKIAlloc`) and
-    the terminal :class:`ISANode`. Operand slots are split into reads /
-    writes / rmw via ``op_cls.INPUT_OPERANDS`` and ``op_cls.RMW_OPERANDS``.
-    Per-axis tile widths come from ``op_cls.MAX_TILE_SIZE`` (full extent
-    when ``None``). For :class:`NKIAlloc` leaves the declared
-    ``location`` and ``dtype`` are copied from the allocated
-    :class:`TensorDims` onto the leaf so renderers don't have to
-    round-trip through ``ir.tensors``.
+    Searches ``block.iter_vars`` for the entry whose ``axis`` matches.
+    Raises :class:`KeyError` if the block does not declare that axis.
     """
-    reads: list[str] = []
-    writes: list[str] = []
-    rmw: list[str] = []
-    for slot, tensor_name in op.operand_names.items():
-        if slot in op.op_cls.INPUT_OPERANDS:
-            reads.append(tensor_name)
-        elif slot in op.op_cls.RMW_OPERANDS:
-            rmw.append(tensor_name)
-        else:
-            writes.append(tensor_name)
-    emit_loops = op.op_cls is not NKIAlloc
-    parent = tree.root
-    tensorize_sizes: dict[str, int] = {}
-    for abstract, concrete in op.axis_map.items():
-        extent = dim_sizes[concrete]
-        max_tile = op.op_cls.MAX_TILE_SIZE.get(abstract)
-        tile = extent if max_tile is None else max_tile
-        tensorize_sizes[abstract] = tile
-        if emit_loops:
-            parent = tree.add_node(ForNode(dim=concrete, trip=extent // tile), parent=parent)
-    is_alloc = op.op_cls is NKIAlloc
-    location = tensors[writes[0]].location if is_alloc else None
-    dtype = tensors[writes[0]].dtype if is_alloc else None
-    tree.add_node(
-        ISANode(
-            op_cls=op.op_cls,
-            reads=tuple(reads),
-            writes=tuple(writes),
-            rmw=tuple(rmw),
-            location=location,
-            dtype=dtype,
-            tensorize_sizes=tensorize_sizes,
-            axis_map=dict(op.axis_map),
-            kwargs=dict(op.kwargs),
-        ),
-        parent=parent,
-    )
+    for iv in block.iter_vars:
+        if iv.axis == axis:
+            return iv.role
+    raise KeyError(f"BlockNode does not declare axis {axis!r}")
 
 
-def role_of(leaf: ISANode, concrete_dim: str) -> AxisRole:
-    """Return the role this leaf assigns to ``concrete_dim``.
-
-    Walks ``leaf.axis_map`` to find the abstract axis that maps to
-    ``concrete_dim``, then consults ``leaf.op_cls.AXIS_ROLES``
-    (defaulting to :attr:`AxisRole.PARALLEL` for axes not listed).
-    Raises ``KeyError`` if the leaf does not touch ``concrete_dim``.
-    """
-    matched_role: AxisRole | None = None
-    for abstract, dim_id in leaf.axis_map.items():
-        if dim_id == concrete_dim:
-            matched_role = leaf.op_cls.AXIS_ROLES.get(abstract, AxisRole.PARALLEL)
-            break
-    if matched_role is None:
-        raise KeyError(f"{leaf.op_cls.__name__} has no axis mapping {concrete_dim}")
-    return matched_role
-
-
-__all__ = ["ForNode", "ISANode", "KernelTree", "NodeData", "RootNode", "build_initial_tree", "role_of"]
+__all__ = [
+    "BlockNode",
+    "Buffer",
+    "BufferRegion",
+    "ForNode",
+    "ISANode",
+    "IterVar",
+    "KernelTree",
+    "NodeData",
+    "build_initial_tree",
+    "role_of",
+]

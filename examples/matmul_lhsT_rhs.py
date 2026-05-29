@@ -87,6 +87,9 @@ if __name__ == "__main__":
     rng = random.Random(SEED)
     for k in range(NUM_ROLLOUTS):
         state = env.reset()
+        cache_0 = f"{CACHE_DIR}/rollout_{k}/step_0"
+        state.dump(cache_0)
+        _check_numerics(f"{cache_0}/kernel.py")
         for t in range(1, MAX_STEPS + 1):
             actions = env.legal_actions(state)
             if not actions:

@@ -1,18 +1,15 @@
-"""Producer-consumer dependency graph over :class:`ISANode` leaves.
+"""Producer-consumer dependency graph over :class:`BlockNode` leaves.
 
 The :class:`Dependency` class scans a :class:`KernelTree` in pre-order
-DFS (emission order) and builds an ``nx.DiGraph`` whose nodes are the
-integer ids of the tree's :class:`ISANode` leaves. An edge ``p -> c``
-means ``p`` must execute before ``c`` to preserve program semantics;
-the edge's ``kind`` attribute names the hazard (``"RAW"``, ``"WAW"``,
-``"WAR"``).
+DFS and builds an ``nx.DiGraph`` whose nodes are leaf-block nids
+(blocks whose subtree contains exactly one ``ISANode``). An edge
+``p -> c`` means ``p`` must execute before ``c``.
 
-Rewrite atoms such as ``ComputeAt`` use the graph to check that a
-proposed move never places a consumer before its producer — the edge
-set is the source of truth for legality. A per-tensor index
-(:attr:`touches_by_tensor`) also provides the raw "who touched this
-tensor and in what order" chain (e.g. ``sbuf_lhs_T -> [1, 10, 27]``)
-that is useful for debugging and for reports.
+Edges are inserted whenever block ``b`` reads / writes a tensor that
+some earlier block wrote / read with overlapping :class:`BufferRegion`
+ranges. For canonical IR (every block under root, no compute_at), the
+overlap test reduces to "same tensor"; transforms can produce nested
+blocks where the per-iteration overlap matters.
 """
 
 from __future__ import annotations
@@ -23,61 +20,35 @@ from pathlib import Path
 import networkx as nx
 
 from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
-from nkigym.ir.tree import ISANode, KernelTree
-from nkigym.ops.alloc import NKIAlloc
+from nkigym.ir.tree import BlockNode, BufferRegion, KernelTree
 
-_DEPENDENCY_STYLES: list[ClassStyle] = [
-    ClassStyle(name="alloc", fill="#fef", stroke="#963"),
-    ClassStyle(name="leaf", fill="#efe", stroke="#363"),
-]
+_DEPENDENCY_STYLES: list[ClassStyle] = [ClassStyle(name="block", fill="#efe", stroke="#363")]
 
 _HAZARD_PRIORITY: dict[str, int] = {"RAW": 3, "WAW": 2, "WAR": 1}
 
 
 @dataclass(frozen=True)
-class _LeafInfo:
-    """Cached reads/writes summary for a single leaf."""
+class _BlockInfo:
+    """Cached read / write tensor sets for a single leaf block."""
 
-    op_name: str
-    is_alloc: bool
+    name: str
     reads: frozenset[str]
     writes: frozenset[str]
-    rmw: frozenset[str]
-
-    @property
-    def read_set(self) -> frozenset[str]:
-        """Tensor names this leaf reads (including RMW slots)."""
-        return self.reads | self.rmw
-
-    @property
-    def write_set(self) -> frozenset[str]:
-        """Tensor names this leaf writes (including RMW slots)."""
-        return self.writes | self.rmw
 
 
 class Dependency:
-    """Producer-consumer graph over the leaves of a :class:`KernelTree`.
-
-    Attributes:
-        graph: Directed graph. Nodes are leaf ids; edges ``p -> c``
-            carry ``kind`` ∈ {``"RAW"``, ``"WAW"``, ``"WAR"``}. When
-            the same pair has multiple hazards, the first one recorded
-            (pre-order walk; RAW > WAW > WAR) wins.
-        touches_by_tensor: Tensor name → ordered list of leaf ids that
-            read / write / rmw it, in emission order.
-        leaves: Leaf ids in emission order.
-    """
+    """Producer-consumer graph over leaf :class:`BlockNode` nids."""
 
     def __init__(self, tree: KernelTree) -> None:
-        """Scan ``tree`` in pre-order and build the dependency graph."""
+        """Scan ``tree`` and build the block-keyed dependency graph."""
         self.graph: nx.DiGraph = nx.DiGraph()
         self.touches_by_tensor: dict[str, list[int]] = {}
-        self.leaves: list[int] = []
+        self.blocks: list[int] = []
         self._build(tree)
         self._closure: nx.DiGraph = nx.transitive_closure(self.graph, reflexive=False)
 
-    def info(self, nid: int) -> "_LeafInfo":
-        """Return the cached :class:`_LeafInfo` for leaf ``nid``."""
+    def info(self, nid: int) -> _BlockInfo:
+        """Return the cached :class:`_BlockInfo` for ``nid``."""
         return self.graph.nodes[nid]["info"]
 
     def direct_producers(self, nid: int) -> list[int]:
@@ -114,38 +85,38 @@ class Dependency:
         render_png(mmd_path, png_path)
 
     def _build(self, tree: KernelTree) -> None:
-        """Populate ``graph``, ``touches_by_tensor``, and ``leaves``."""
+        """Populate the graph by walking leaf blocks (skipping the synthetic root)."""
         last_writer: dict[str, int] = {}
         prior_readers: dict[str, list[int]] = {}
-        for nid in tree.preorder():
-            data = tree.data(nid)
-            if not isinstance(data, ISANode):
+        for nid in tree.blocks():
+            block = tree.data(nid)
+            assert isinstance(block, BlockNode)
+            if not block.iter_vars and not block.reads and not block.writes:
                 continue
-            info = _LeafInfo(
-                op_name=data.op_cls.__name__,
-                is_alloc=data.op_cls is NKIAlloc,
-                reads=frozenset(data.reads),
-                writes=frozenset(data.writes),
-                rmw=frozenset(data.rmw),
-            )
+            info = self._summarise(block)
             self.graph.add_node(nid, info=info)
-            self.leaves.append(nid)
-            for name in info.read_set | info.write_set:
+            self.blocks.append(nid)
+            for name in info.reads | info.writes:
                 self.touches_by_tensor.setdefault(name, []).append(nid)
             self._record_hazards(nid, info, last_writer, prior_readers)
-            for name in info.write_set:
+            for name in info.writes:
                 last_writer[name] = nid
                 prior_readers.pop(name, None)
-            for name in info.read_set - info.write_set:
+            for name in info.reads - info.writes:
                 prior_readers.setdefault(name, []).append(nid)
 
+    def _summarise(self, block: BlockNode) -> _BlockInfo:
+        """Collapse a block's BufferRegions to ``(reads, writes)`` tensor-name sets."""
+        reads = {r.tensor for r in block.reads}
+        writes = {w.tensor for w in block.writes}
+        return _BlockInfo(name=_block_name(block), reads=frozenset(reads), writes=frozenset(writes))
+
     def _record_hazards(
-        self, nid: int, info: _LeafInfo, last_writer: dict[str, int], prior_readers: dict[str, list[int]]
+        self, nid: int, info: _BlockInfo, last_writer: dict[str, int], prior_readers: dict[str, list[int]]
     ) -> None:
-        """Add RAW/WAW/WAR edges from this leaf's current operands."""
-        for name in info.read_set:
+        for name in info.reads:
             self._try_edge(last_writer.get(name), nid, "RAW")
-        for name in info.write_set:
+        for name in info.writes:
             self._try_edge(last_writer.get(name), nid, "WAW")
             for prior_r in prior_readers.get(name, ()):
                 self._try_edge(prior_r, nid, "WAR")
@@ -161,30 +132,35 @@ class Dependency:
         self.graph.add_edge(producer, consumer, kind=kind)
 
 
+def _block_name(block: BlockNode) -> str:
+    """Best-effort label for a block."""
+    return block.annotations.get("name", "block")
+
+
 def _to_mermaid(dep: Dependency) -> str:
-    """Render ``dep`` to a Mermaid ``flowchart LR`` source string."""
     flow = Flowchart(direction="LR", styles=_DEPENDENCY_STYLES)
-    for nid in dep.leaves:
+    for nid in dep.blocks:
         info = dep.info(nid)
         node_id = f"n{nid}"
-        flow.add_node(node_id, f'{node_id}["{_leaf_label(nid, info)}"]', "alloc" if info.is_alloc else "leaf")
+        flow.add_node(node_id, f'{node_id}["{_label(nid, info)}"]', "block")
     for producer, consumer, attrs in dep.graph.edges(data=True):
         flow.add_edge(f"n{producer}", f"n{consumer}", label=attrs["kind"])
     return flow.render()
 
 
-def _leaf_label(nid: int, info: _LeafInfo) -> str:
-    """Build the Mermaid label for a dependency-graph leaf."""
-    if info.is_alloc:
-        return f"#{nid} alloc<br/>{min(info.writes)}"
-    parts: list[str] = [f"#{nid} {info.op_name}"]
+def _label(nid: int, info: _BlockInfo) -> str:
+    parts: list[str] = [f"#{nid} {info.name}"]
     if info.reads:
         parts.append(f"reads={','.join(sorted(info.reads))}")
     if info.writes:
         parts.append(f"writes={','.join(sorted(info.writes))}")
-    if info.rmw:
-        parts.append(f"rmw={','.join(sorted(info.rmw))}")
     return "<br/>".join(parts)
+
+
+def _bufferregion_overlaps(_a: BufferRegion, _b: BufferRegion) -> bool:
+    """Stub for future per-region overlap analysis. Today's canonical IR doesn't need it; the
+    block-pair tensor-name match is sufficient. Compute_at-driven nested blocks will exercise this."""
+    return True
 
 
 __all__ = ["Dependency"]

@@ -7,33 +7,24 @@ from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import ForNode, ISANode, role_of
-from nkigym.ops.alloc import NKIAlloc
+from nkigym.ir.expr import Var
+from nkigym.ir.tree import BlockNode, ForNode, role_of
 from nkigym.ops.base import AxisRole
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
 @dataclass(frozen=True)
 class ReorderOption(TransformOption):
-    """Per-application payload for :class:`Reorder`.
-
-    Attributes:
-        outer_nid: nid of the parent :class:`ForNode` to swap.
-        inner_nid: nid of its sole :class:`ForNode` child.
-    """
+    """Swap the payloads of two adjacent parent-child ForNodes."""
 
     outer_nid: int
     inner_nid: int
 
 
 class Reorder(Transform):
-    """Swap an adjacent parent-child ForNode pair via payload swap.
-
-    See ``docs/superpowers/specs/2026-05-26-reorder-transform-design.md``.
-    """
+    """Swap an adjacent parent-child ForNode pair via payload swap."""
 
     def analyze(self, ir: KernelIR) -> list[ReorderOption]:
-        """Enumerate every legal adjacent-pair ForNode swap."""
         options: list[ReorderOption] = []
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
@@ -51,7 +42,6 @@ class Reorder(Transform):
         return options
 
     def apply(self, ir: KernelIR, option: ReorderOption) -> KernelIR:
-        """Re-check legality, deep-copy ``ir``, swap the two payloads, return."""
         self._check_legality(ir, option)
         new_ir = copy.deepcopy(ir)
         outer_data = new_ir.tree.data(option.outer_nid)
@@ -62,52 +52,46 @@ class Reorder(Transform):
         return new_ir
 
     def _is_legal(self, ir: KernelIR, option: ReorderOption) -> bool:
-        """Wrapper around :meth:`_check_legality` that returns a bool.
-
-        Used by :meth:`analyze` to filter candidate options without raising.
-        Production-path callers must use :meth:`_check_legality` directly so
-        illegal options raise loudly. Mirrors :meth:`Fuse._is_legal`.
-        """
-        legal = True
         try:
             self._check_legality(ir, option)
         except TransformLegalityError:
-            legal = False
-        return legal
+            return False
+        return True
 
     def _check_legality(self, ir: KernelIR, option: ReorderOption) -> None:
-        """Raise :class:`TransformLegalityError` on any rule violation."""
-        """1. Both nids exist."""
-        if option.outer_nid not in ir.tree.graph:
-            raise TransformLegalityError(f"Reorder.outer_nid={option.outer_nid} is not a node in the IR tree")
-        if option.inner_nid not in ir.tree.graph:
-            raise TransformLegalityError(f"Reorder.inner_nid={option.inner_nid} is not a node in the IR tree")
-        """2. Both are ForNodes."""
+        for nid in (option.outer_nid, option.inner_nid):
+            if nid not in ir.tree.graph:
+                raise TransformLegalityError(f"Reorder: nid {nid} not in tree")
         outer = ir.tree.data(option.outer_nid)
         inner = ir.tree.data(option.inner_nid)
         if not isinstance(outer, ForNode) or not isinstance(inner, ForNode):
             raise TransformLegalityError(
-                f"Reorder requires both targets to be ForNode; got "
-                f"outer={type(outer).__name__}, inner={type(inner).__name__}"
+                f"Reorder: both targets must be ForNode; got {type(outer).__name__}, {type(inner).__name__}"
             )
-        """3. Inner is the sole child of outer (perfect-nest of two)."""
         kids = ir.tree.children(option.outer_nid)
         if kids != [option.inner_nid]:
-            raise TransformLegalityError(
-                f"Reorder requires inner_nid={option.inner_nid} to be the sole child of "
-                f"outer_nid={option.outer_nid}; got children {kids}"
-            )
-        """4. No descendant ISA leaf has SEQUENTIAL role on either swapped dim."""
-        for leaf_nid in ir.tree.leaves(option.inner_nid):
-            leaf = ir.tree.data(leaf_nid)
-            if not isinstance(leaf, ISANode) or leaf.op_cls is NKIAlloc:
-                continue
-            leaf_dims = set(leaf.axis_map.values())
-            for swap_dim in (outer.dim, inner.dim):
-                if swap_dim in leaf_dims and role_of(leaf, swap_dim) == AxisRole.SEQUENTIAL:
+            raise TransformLegalityError(f"Reorder: inner must be sole child of outer; got children {kids}")
+        outer_loop_var = outer.loop_var
+        inner_loop_var = inner.loop_var
+        for descendant in ir.tree.blocks(option.inner_nid):
+            block = ir.tree.data(descendant)
+            assert isinstance(block, BlockNode)
+            for loop_var in (outer_loop_var, inner_loop_var):
+                axis = _axis_for_loop_var(block, loop_var)
+                if axis is None:
+                    continue
+                if role_of(block, axis) == AxisRole.SEQUENTIAL:
                     raise TransformLegalityError(
-                        f"Reorder rejected: leaf {leaf.op_cls.__name__} has SEQUENTIAL role " f"on dim {swap_dim!r}"
+                        f"Reorder rejected: descendant block has SEQUENTIAL role on loop_var {loop_var!r}"
                     )
+
+
+def _axis_for_loop_var(block: BlockNode, loop_var: str) -> str | None:
+    """Return the iter_var axis bound by ``loop_var``, if any."""
+    for iv, value in zip(block.iter_vars, block.iter_values):
+        if isinstance(value, Var) and value.name == loop_var:
+            return iv.axis
+    return None
 
 
 __all__ = ["Reorder", "ReorderOption"]

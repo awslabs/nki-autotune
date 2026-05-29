@@ -112,7 +112,7 @@ def test_step_raises_on_illegal_action() -> None:
     env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[split])
     state = env.reset()
     """Construct an obviously illegal SplitOption: factors product != trip,
-    and target_nid is the root (a RootNode, not a ForNode)."""
+    and target_nid is the root block (not a ForNode)."""
     illegal = SplitOption(target_nid=state.tree.root, factors=(2, 2))
     with pytest.raises(TransformLegalityError):
         env.step(state, (split, illegal))

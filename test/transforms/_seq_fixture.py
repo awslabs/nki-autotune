@@ -1,10 +1,10 @@
 """Synthetic ``NKIOp`` with one ``SEQUENTIAL`` axis for Reorder legality tests.
 
-No production op carries SEQUENTIAL today (matmul has ACCUMULATION on K;
-RMSNorm/softmax prefix-scan ops will, when they ship). To verify the
-legality rule before those ops land, we declare a minimal subclass and
-build a hand-rolled IR that encloses one such leaf under two ForNodes
-on its mapped dims.
+Builds a minimal IR by hand: a root :class:`BlockNode` containing one
+leaf :class:`BlockNode` whose body is a chain of two :class:`ForNode`s
+ending in a single :class:`ISANode` of a synthetic op declaring one
+``SEQUENTIAL`` axis. Used to exercise legality rules before any
+production op carries ``SEQUENTIAL`` semantics.
 """
 
 from __future__ import annotations
@@ -13,12 +13,13 @@ from typing import ClassVar
 
 from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import ForNode, ISANode, KernelTree
+from nkigym.ir.expr import Const, Var
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole, NKIOp
 
 
 class _SeqOp(NKIOp):
-    """Minimal NKIOp with one PARALLEL ('P') and one SEQUENTIAL ('F') axis."""
+    """Minimal NKIOp with PARALLEL ('P') and SEQUENTIAL ('F') axes."""
 
     NAME: ClassVar[str] = "_seq_op_test"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F")}
@@ -30,44 +31,69 @@ class _SeqOp(NKIOp):
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
 
     def _run(self, **kwargs):
-        """Concrete stub so the class is instantiable; never called by legality checks."""
         return None
 
 
 def build_seq_ir(p_extent: int = 256, f_extent: int = 256) -> tuple[KernelIR, int, int, int]:
-    """Build a minimal IR: ``RootNode → ForNode(d0, trip=2) → ForNode(d1, trip=2) → _SeqOp leaf``.
+    """Build a minimal hand-rolled IR enclosing a SEQUENTIAL-role leaf.
 
-    The leaf reads tensor 'x' with axis_map {'P': 'd0', 'F': 'd1'} so its
-    SEQUENTIAL role on 'F' resolves to dim 'd1'. Returns ``(ir, outer_nid,
-    inner_nid, leaf_nid)``. ``KernelIR``'s required dataclass fields
-    (`func_name`, `param_names`, `return_name`) are populated with stubs;
-    the legality check reads only ``ir.tree``.
+    Returns ``(ir, outer_nid, inner_nid, leaf_nid)`` for assertions.
     """
     tree = KernelTree()
-    outer = tree.add_node(ForNode(dim="d0", trip=2), parent=tree.root)
-    inner = tree.add_node(ForNode(dim="d1", trip=2), parent=outer)
-    """Build the leaf payload. tensorize_sizes covers each axis (trip * tensorize == extent)."""
-    leaf_data = ISANode(
-        op_cls=_SeqOp,
-        reads=("x",),
+    root_block = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
+    root_block_nid = tree.add_node(root_block, parent=tree.root)
+    leaf_block = BlockNode(
+        iter_vars=(
+            IterVar(axis="P", dom=(0, p_extent), role=AxisRole.PARALLEL),
+            IterVar(axis="F", dom=(0, f_extent), role=AxisRole.SEQUENTIAL),
+        ),
+        iter_values=(Var(name="i_P_0"), Var(name="i_F_0")),
+        reads=(
+            BufferRegion(
+                tensor="x", ranges=((Var(name="i_P_0"), Const(value=128)), (Var(name="i_F_0"), Const(value=f_extent)))
+            ),
+        ),
         writes=(),
-        rmw=(),
-        tensorize_sizes={"P": p_extent // 2, "F": f_extent // 2},
-        axis_map={"P": "d0", "F": "d1"},
-        kwargs={},
     )
-    leaf_nid = tree.add_node(leaf_data, parent=inner)
-
+    leaf_block_nid = tree.add_node(leaf_block, parent=root_block_nid)
+    outer = tree.add_node(ForNode(loop_var="i_P_0", extent=2), parent=leaf_block_nid)
+    inner = tree.add_node(ForNode(loop_var="i_F_0", extent=2), parent=outer)
+    """Add another BlockNode under inner to test descendant block legality check."""
+    nested_block = BlockNode(
+        iter_vars=(
+            IterVar(axis="P", dom=(0, p_extent), role=AxisRole.PARALLEL),
+            IterVar(axis="F", dom=(0, f_extent), role=AxisRole.SEQUENTIAL),
+        ),
+        iter_values=(Var(name="i_P_0"), Var(name="i_F_0")),
+        reads=(
+            BufferRegion(
+                tensor="x", ranges=((Var(name="i_P_0"), Const(value=128)), (Var(name="i_F_0"), Const(value=f_extent)))
+            ),
+        ),
+        writes=(),
+    )
+    nested_block_nid = tree.add_node(nested_block, parent=inner)
+    leaf = tree.add_node(
+        ISANode(
+            op_cls=_SeqOp,
+            operand_bindings={
+                "data": BufferRegion(
+                    tensor="x",
+                    ranges=((Var(name="i_P_0"), Const(value=128)), (Var(name="i_F_0"), Const(value=f_extent))),
+                )
+            },
+        ),
+        parent=nested_block_nid,
+    )
     ir = KernelIR(
         func_name="_seq_fixture",
-        param_names=[],
-        return_name="",
-        dim_sizes={"d0": p_extent, "d1": f_extent},
-        tensors={},
+        param_names=["x"],
+        return_name="x",
         tree=tree,
         dependency=Dependency(tree),
+        param_buffers={"x": Buffer(name="x", shape=(p_extent, f_extent), dtype="bfloat16", location="shared_hbm")},
     )
-    return ir, outer, inner, leaf_nid
+    return ir, outer, inner, leaf
 
 
 __all__ = ["build_seq_ir"]

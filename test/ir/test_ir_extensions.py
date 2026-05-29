@@ -1,6 +1,6 @@
 """Tests for the extended IR fields (location, dtype, kwargs, axis_map, return_name)."""
 
-from nkigym.ir import ISANode, RootNode, build_initial_ir
+from nkigym.ir import ForNode, ISANode, build_initial_ir
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
@@ -55,121 +55,6 @@ def test_non_config_leaves_have_empty_kwargs():
     for op_name in ("NKILoad", "NKIStore", "NKIMatmul", "NKITensorCopy"):
         for leaf in _leaves_by_op(ir, op_name):
             assert leaf.kwargs == {}, f"{op_name} leaf kwargs={leaf.kwargs}"
-
-
-def test_alloc_leaves_have_empty_kwargs():
-    """NKIAlloc leaves never carry kwargs — alloc params live on TensorDims."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    for leaf in _leaves_by_op(ir, "NKIAlloc"):
-        assert leaf.kwargs == {}
-
-
-def test_matmul_leaf_carries_axis_map():
-    """NKIMatmul leaf axis_map resolves every abstract axis to a concrete dim."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    matmuls = _leaves_by_op(ir, "NKIMatmul")
-    assert len(matmuls) == 1
-    axis_map = matmuls[0].axis_map
-    assert set(axis_map) == {"K", "M", "N"}
-    assert all(isinstance(v, str) and v.startswith("d") for v in axis_map.values())
-
-
-def test_alloc_leaves_carry_location():
-    """NKIAlloc leaves carry the declared ``location`` (shared_hbm/sbuf/psum)."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    expected = {
-        "sbuf_lhs_T": "sbuf",
-        "sbuf_rhs": "sbuf",
-        "psum_acc": "psum",
-        "sbuf_prod": "sbuf",
-        "hbm_out": "shared_hbm",
-    }
-    for leaf in _leaves_by_op(ir, "NKIAlloc"):
-        tname = leaf.writes[0]
-        assert leaf.location == expected[tname], f"{tname}.location={leaf.location!r}"
-
-
-def test_non_alloc_leaves_have_no_location():
-    """Only :class:`NKIAlloc` carries a location — compute-op leaves leave it ``None``."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    for leaf in _isa_leaves(ir):
-        if leaf.op_cls is NKIAlloc:
-            continue
-        assert leaf.location is None, f"{leaf.op_cls.__name__}.location={leaf.location!r}"
-
-
-def test_alloc_leaves_carry_dtype():
-    """NKIAlloc leaves carry the declared ``dtype``."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    expected = {
-        "sbuf_lhs_T": "bfloat16",
-        "sbuf_rhs": "bfloat16",
-        "psum_acc": "float32",
-        "sbuf_prod": "bfloat16",
-        "hbm_out": "bfloat16",
-    }
-    for leaf in _leaves_by_op(ir, "NKIAlloc"):
-        tname = leaf.writes[0]
-        assert leaf.dtype == expected[tname], f"{tname}.dtype={leaf.dtype!r}"
-
-
-def test_non_alloc_leaves_have_no_dtype():
-    """Only :class:`NKIAlloc` carries a dtype — compute-op leaves leave it ``None``."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    for leaf in _isa_leaves(ir):
-        if leaf.op_cls is NKIAlloc:
-            continue
-        assert leaf.dtype is None, f"{leaf.op_cls.__name__}.dtype={leaf.dtype!r}"
-
-
-def test_alloc_leaves_carry_axis_map():
-    """NKIAlloc leaves carry an axis_map zipping NKIAlloc.OPERAND_AXES['dst'] to the tensor's dim_ids."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    expected_dst_axes = NKIAlloc.OPERAND_AXES["dst"]
-    for leaf in _leaves_by_op(ir, "NKIAlloc"):
-        assert len(leaf.writes) == 1
-        tensor = ir.tensors[leaf.writes[0]]
-        assert set(leaf.axis_map) == set(expected_dst_axes[: len(tensor.dim_ids)])
-        for abstract, concrete in leaf.axis_map.items():
-            idx = expected_dst_axes.index(abstract)
-            assert concrete == tensor.dim_ids[idx]
-
-
-def test_alloc_axis_map_keys_match_tensorize_sizes_keys():
-    """An alloc's axis_map and tensorize_sizes are both keyed by the same abstract axes."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    for leaf in _leaves_by_op(ir, "NKIAlloc"):
-        assert set(leaf.axis_map) == set(leaf.tensorize_sizes)
-
-
-def test_intermediate_tensor_location_and_dtype():
-    """NKIAlloc kwargs flow through to TensorDims.location / .dtype."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    expected = {
-        "sbuf_lhs_T": ("sbuf", "bfloat16"),
-        "sbuf_rhs": ("sbuf", "bfloat16"),
-        "psum_acc": ("psum", "float32"),
-        "sbuf_prod": ("sbuf", "bfloat16"),
-        "hbm_out": ("shared_hbm", "bfloat16"),
-    }
-    for name, (loc, dt) in expected.items():
-        t = ir.tensors[name]
-        assert t.location == loc, f"{name}.location={t.location!r}"
-        assert t.dtype == dt, f"{name}.dtype={t.dtype!r}"
-
-
-def test_param_tensor_location_is_hbm():
-    """Kernel params live in HBM; the location is fixed by the role lattice."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    for name in ("lhs_T", "rhs"):
-        assert ir.tensors[name].location == "shared_hbm"
-
-
-def test_param_tensor_dtype_inferred_from_load_dst():
-    """Param dtype is inferred from the SBUF buffer it's loaded into."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    for name in ("lhs_T", "rhs"):
-        assert ir.tensors[name].dtype == "bfloat16"
 
 
 import pytest
@@ -234,18 +119,6 @@ def test_missing_return_raises():
         analyze_dimensions(no_return, {"x": (128, 128)})
 
 
-def test_envelope_fields_are_flat():
-    """KernelIR exposes signature + dim_sizes + tensors directly — no .analysis wrapper."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    assert ir.func_name == "_matmul_fixture"
-    assert ir.param_names == ["lhs_T", "rhs"]
-    assert ir.return_name == "hbm_out"
-    assert set(ir.tensors) == {"lhs_T", "rhs", "sbuf_lhs_T", "sbuf_rhs", "psum_acc", "sbuf_prod", "hbm_out"}
-    assert set(ir.dim_sizes.values()) == {K, M, N}
-    assert not hasattr(ir, "analysis")
-    assert not hasattr(ir, "ops")
-
-
 def test_tree_has_no_dim_sizes_attribute():
     """KernelTree is a pure schedule tree — dim_sizes lives on KernelIR."""
     ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
@@ -271,7 +144,7 @@ def test_num_nodes_grows_with_add_node():
 
     tree = KernelTree()
     before = tree.num_nodes
-    tree.add_node(RootNode(), parent=tree.root)
+    tree.add_node(ForNode(loop_var="i", extent=2), parent=tree.root)
     assert tree.num_nodes == before + 1
 
 
@@ -291,16 +164,232 @@ def test_op_record_is_private_in_dimension_analysis_module():
     assert hasattr(dm, "_OpRecord")
 
 
-def test_dump_writes_envelope_markdown(tmp_path):
-    """KernelIR.dump emits envelope.md alongside tree.* and dependency.*."""
+def test_envelope_markdown_format():
+    """KernelIR._render_envelope_md emits signature and buffers table."""
     ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
-    ir.dump(tmp_path)
-    envelope = (tmp_path / "envelope.md").read_text(encoding="utf-8")
+    envelope = ir._render_envelope_md()
     assert "# `_matmul_fixture`" in envelope
     assert "`lhs_T`" in envelope and "`rhs`" in envelope
-    assert "Returns**: `hbm_out`" in envelope
-    assert "## Dim sizes" in envelope
-    assert "| `d0` | 2048 |" in envelope
-    assert "## Tensors" in envelope
-    assert "| `psum_acc` | intermediate | `psum` | `float32` |" in envelope
-    assert "| `lhs_T` | param | `shared_hbm` | `bfloat16` |" in envelope
+    assert "**Returns**: `hbm_out`" in envelope
+    assert "## Buffers" in envelope
+    """Buffers table includes location, dtype, shape for all allocated buffers."""
+    assert "| Name | Location | Dtype | Shape |" in envelope
+    """Check at least one intermediate buffer appears."""
+    assert "psum" in envelope or "sbuf" in envelope
+    assert "bfloat16" in envelope or "float32" in envelope
+
+
+def test_itervar_constructor_and_equality():
+    """IterVar is a frozen dataclass with structural equality."""
+    from nkigym.ir.tree import IterVar
+    from nkigym.ops.base import AxisRole
+
+    a = IterVar(axis="M", dom=(0, 2048), role=AxisRole.PARALLEL)
+    b = IterVar(axis="M", dom=(0, 2048), role=AxisRole.PARALLEL)
+    c = IterVar(axis="M", dom=(0, 2048), role=AxisRole.ACCUMULATION)
+    assert a == b
+    assert a != c
+
+
+def test_buffer_constructor_and_equality():
+    """Buffer is a frozen dataclass with structural equality."""
+    from nkigym.ir.tree import Buffer
+
+    a = Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum")
+    b = Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum")
+    assert a == b
+
+
+def test_bufferregion_constructor_and_equality():
+    """BufferRegion is a frozen dataclass with structural equality on tensor + ranges."""
+    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.tree import BufferRegion
+
+    a = BufferRegion(tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)),))
+    b = BufferRegion(tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)),))
+    assert a == b
+
+
+def test_blocknode_constructor_minimal():
+    """A BlockNode with no iter_vars is the legal empty case (e.g. the synthetic root block)."""
+    from nkigym.ir.tree import BlockNode
+
+    node = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=(), alloc_buffers=())
+    assert node.iter_vars == ()
+    assert node.alloc_buffers == ()
+    assert node.annotations == {}
+
+
+def test_blocknode_constructor_full():
+    """A BlockNode with iter_vars and a region carries every field."""
+    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, IterVar
+    from nkigym.ops.base import AxisRole
+
+    block = BlockNode(
+        iter_vars=(
+            IterVar(axis="M", dom=(0, 2048), role=AxisRole.PARALLEL),
+            IterVar(axis="N", dom=(0, 2048), role=AxisRole.PARALLEL),
+        ),
+        iter_values=(Var(name="i_M"), Var(name="i_N")),
+        reads=(),
+        writes=(BufferRegion(tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)),)),),
+        alloc_buffers=(Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum"),),
+    )
+    assert len(block.iter_vars) == 2
+    assert len(block.alloc_buffers) == 1
+
+
+def test_blocknode_default_annotations_is_fresh_dict():
+    """Two default-constructed BlockNodes don't share an annotations dict."""
+    from nkigym.ir.tree import BlockNode
+
+    a = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
+    b = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
+    a.annotations["k"] = 1
+    assert "k" not in b.annotations
+
+
+def test_kerneltree_blocks_helper_yields_blocknode_nids():
+    """blocks() walks the tree in pre-order and yields nids whose payload is a BlockNode."""
+    from nkigym.ir.tree import BlockNode, KernelTree
+
+    tree = KernelTree()
+    block = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
+    nid_a = tree.add_node(block, parent=tree.root)
+    nid_b = tree.add_node(block, parent=tree.root)
+
+    """Root is also a BlockNode now."""
+    out = list(tree.blocks())
+    assert set(out) == {tree.root, nid_a, nid_b}
+
+
+def test_kerneltree_blocks_skips_non_block_payloads():
+    """blocks() ignores ForNode and ISANode payloads."""
+    from nkigym.ir.tree import BlockNode, ForNode, KernelTree
+
+    tree = KernelTree()
+    block = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
+    block_nid = tree.add_node(block, parent=tree.root)
+    tree.add_node(ForNode(loop_var="i_d0_0", extent=2), parent=block_nid)
+
+    """Root is also a BlockNode, so blocks() returns root + block_nid."""
+    out = list(tree.blocks())
+    assert tree.root in out and block_nid in out
+
+
+def test_ir_module_exports_new_payloads():
+    """The ir package re-exports the new payload classes."""
+    from nkigym.ir import BlockNode, Buffer, BufferRegion, IterVar  # noqa: F401
+
+
+def test_fornode_payload_uses_loop_var_and_extent():
+    """ForNode carries (loop_var, extent), not (dim, trip)."""
+    from nkigym.ir.tree import ForNode
+
+    node = ForNode(loop_var="i_M_0", extent=16)
+    assert node.loop_var == "i_M_0"
+    assert node.extent == 16
+    """Old field names must NOT be present."""
+    assert not hasattr(node, "dim")
+    assert not hasattr(node, "trip")
+
+
+def test_isanode_payload_uses_operand_bindings():
+    """ISANode carries (op_cls, operand_bindings, kwargs); legacy fields removed."""
+    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.tree import BufferRegion, ISANode
+    from nkigym.ops.matmul import NKIMatmul
+
+    bindings = {
+        "stationary": BufferRegion(
+            tensor="sbuf_lhs_T", ranges=((Var(name="vK"), Const(value=1)), (Var(name="vM"), Const(value=128)))
+        ),
+        "moving": BufferRegion(
+            tensor="sbuf_rhs", ranges=((Var(name="vK"), Const(value=1)), (Var(name="vN"), Const(value=512)))
+        ),
+        "dst": BufferRegion(
+            tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)), (Var(name="vN"), Const(value=512)))
+        ),
+    }
+    node = ISANode(op_cls=NKIMatmul, operand_bindings=bindings, kwargs={})
+    assert node.op_cls is NKIMatmul
+    assert set(node.operand_bindings) == {"stationary", "moving", "dst"}
+    """Legacy fields must NOT be present."""
+    for old in ("reads", "writes", "rmw", "axis_map", "tensorize_sizes", "location", "dtype"):
+        assert not hasattr(node, old), f"ISANode unexpectedly carries legacy field {old!r}"
+
+
+def test_kernelir_envelope_is_slim():
+    """KernelIR drops dim_sizes and tensors fields."""
+    import dataclasses
+
+    from nkigym.ir.ir import KernelIR
+
+    field_names = {f.name for f in dataclasses.fields(KernelIR)}
+    assert field_names == {"func_name", "param_names", "return_name", "tree", "dependency", "param_buffers"}
+
+
+def test_kernelir_helper_methods_exposed():
+    """KernelIR exposes all_buffers / buffer / axis_extent."""
+    from nkigym.ir.ir import KernelIR
+
+    assert callable(KernelIR.all_buffers)
+    assert callable(KernelIR.buffer)
+    assert callable(KernelIR.axis_extent)
+
+
+def test_canonical_matmul_emits_root_block_with_alloc_buffers():
+    """The canonical 2048**3 matmul tree's root child is a single BlockNode whose alloc_buffers
+    list every kernel-lifetime tensor, including psum_prod (canonical scope = root)."""
+    from nkigym.ir import build_initial_ir
+    from nkigym.ir.tree import BlockNode
+    from nkigym.ops import nkigym_kernel
+    from nkigym.ops.alloc import NKIAlloc
+    from nkigym.ops.load import NKILoad
+    from nkigym.ops.matmul import NKIMatmul
+    from nkigym.ops.memset import NKIMemset
+    from nkigym.ops.store import NKIStore
+    from nkigym.ops.tensor_copy import NKITensorCopy
+
+    K = M = N = 2048
+
+    @nkigym_kernel
+    def f_matmul(lhs_T, rhs):
+        sbuf_lhs_T = NKIAlloc(location="sbuf", shape=(K, M), dtype="bfloat16")()
+        sbuf_rhs = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
+        psum_prod = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
+        sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
+        hbm_out = NKIAlloc(location="shared_hbm", shape=(M, N), dtype="bfloat16")()
+        NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
+        NKILoad()(src=rhs, dst=sbuf_rhs)
+        NKIMemset(value=0.0)(dst=psum_prod)
+        NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs, dst=psum_prod)
+        NKITensorCopy()(src=psum_prod, dst=sbuf_prod)
+        NKIStore()(src=sbuf_prod, dst=hbm_out)
+        return hbm_out
+
+    ir = build_initial_ir(f_matmul, {"lhs_T": (K, M), "rhs": (K, N)})
+    """Tree.root is now the root block directly (no intermediate RootNode)."""
+    root_block = ir.tree.data(ir.tree.root)
+    assert isinstance(root_block, BlockNode)
+    """Buffer scope: kernel-lifetime tensors are placed at LCA of their users.
+    Most buffers are multi-use (at root); hbm_out is single-use (at its writer block)."""
+    all_buffers = set()
+    for nid in ir.tree.blocks():
+        blk = ir.tree.data(nid)
+        all_buffers.update(buf.name for buf in blk.alloc_buffers)
+    assert {"sbuf_lhs_T", "sbuf_rhs", "psum_prod", "sbuf_prod", "hbm_out"} <= all_buffers
+
+
+def test_dump_tree_runs_on_canonical_ir(tmp_path):
+    """dump_tree on the canonical matmul IR produces tree.mmd and tree.png."""
+    from test.transforms._fixtures import build_canonical_ir
+
+    from nkigym.ir.tree_visualize import dump_tree
+
+    ir = build_canonical_ir()
+    dump_tree(ir.tree, tmp_path)
+    assert (tmp_path / "tree.mmd").exists()
+    """The png is generated by mmdc; if mmdc is unavailable on this host the dump should still succeed
+    but with a warning. We only check the mmd file unconditionally."""

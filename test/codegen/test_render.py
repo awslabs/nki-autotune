@@ -1,34 +1,49 @@
-"""Tests for :func:`nkigym.codegen.render` — the top-level codegen entry."""
+"""End-to-end render + CPU-sim numerics gate for the BlockNode IR refactor."""
 
-from nkigym.codegen import emit_header, emit_return, render
-from nkigym.ir import build_initial_ir
-from nkigym.ops import nkigym_kernel
-from nkigym.ops.alloc import NKIAlloc
-from nkigym.ops.load import NKILoad
-from nkigym.ops.store import NKIStore
+from __future__ import annotations
 
-_INPUT_SPECS: dict[str, tuple[int, ...]] = {"x": (128, 512)}
+import importlib.util
+import shutil
+from pathlib import Path
+from test.transforms._fixtures import INPUT_SPECS, build_canonical_ir
 
+import numpy as np
 
-@nkigym_kernel
-def _identity(x):
-    """Trivial fixture: load x, store back to a fresh HBM buffer."""
-    sbuf_x = NKIAlloc(location="sbuf", shape=(128, 512), dtype="bfloat16")()
-    hbm_y = NKIAlloc(location="shared_hbm", shape=(128, 512), dtype="bfloat16")()
-    NKILoad()(src=x, dst=sbuf_x)
-    NKIStore()(src=sbuf_x, dst=hbm_y)
-    return hbm_y
+from nkigym.codegen import render
+from nkigym.synthesis.simulate_nki import simulate_fp32
 
 
-def test_render_starts_with_header() -> None:
-    """``render`` produces a string that begins with the ``emit_header`` output."""
-    ir = build_initial_ir(_identity, _INPUT_SPECS)
+def _load_module_from_path(path: str):
+    spec = importlib.util.spec_from_file_location("dumped_kernel", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_render_canonical_matmul_emits_expected_structure():
+    """The rendered canonical kernel has the expected top-level shape."""
+    ir = build_canonical_ir()
     src = render(ir)
-    assert src.startswith(emit_header(ir))
+    assert "@nki.jit" in src
+    assert "def nki_f_matmul(lhs_T, rhs):" in src
+    assert "psum_prod = nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum)" in src
+    assert "nisa.memset" in src
+    assert "nisa.nc_matmul" in src
+    assert "return hbm_out" in src.strip().splitlines()[-1]
 
 
-def test_render_ends_with_return_block() -> None:
-    """``render`` closes with the ``emit_return`` output."""
-    ir = build_initial_ir(_identity, _INPUT_SPECS)
+def test_render_canonical_matmul_passes_numerics():
+    """The rendered canonical kernel passes fp32 simulation against numpy."""
+    ir = build_canonical_ir()
     src = render(ir)
-    assert src.endswith(emit_return(ir))
+    cache_dir = Path("/tmp/blocknode_render_test_canonical")
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    cache_dir.mkdir(parents=True)
+    kernel_path = cache_dir / "kernel.py"
+    kernel_path.write_text(src)
+    rng = np.random.default_rng(0)
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, shape in INPUT_SPECS.items()}
+    expected = inputs["lhs_T"].T @ inputs["rhs"]
+    module = _load_module_from_path(str(kernel_path))
+    actual = np.asarray(simulate_fp32(module.nki_f_matmul)(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)

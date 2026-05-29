@@ -1,4 +1,4 @@
-"""``Split`` transform - partition one axis-chain entry into multiple factors."""
+"""``Split`` transform — partition one loop or one tensorize-axis tile into multiple factors."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from math import prod
 
 from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import ForNode, ISANode, KernelTree
-from nkigym.ops.alloc import NKIAlloc
-from nkigym.transforms._tree_ops import _replace_in_parent_children
+from nkigym.ir.expr import Const, Expr, Var, from_affine, substitute
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 _MAX_SPLIT_PARTS = 3
@@ -21,15 +21,12 @@ class SplitOption(TransformOption):
     """Per-application payload for :class:`Split`.
 
     Attributes:
-        target_nid: Node id in ``ir.tree`` to split.
-        factors: Replacement factors, outermost-first. ``len >= 2``,
-            each factor ``>= 2``.
-        target_axis: ``None`` selects the outer-trip flavor -
-            ``target_nid`` is a :class:`ForNode` and ``factors``
-            replaces its trip count. Set to an abstract axis name
-            (e.g. ``"M"``) for the tensorize flavor - ``target_nid``
-            is an :class:`ISANode` and ``factors`` replaces
-            ``tensorize_sizes[target_axis]``.
+        target_nid: Node id in ``ir.tree`` to split. Either a
+            :class:`ForNode` (outer-trip flavour) or an :class:`ISANode`
+            (tensorize flavour).
+        factors: Replacement factors, outermost-first. ``len >= 2``.
+        target_axis: ``None`` for outer-trip flavour. The abstract iter_var
+            axis name (e.g. ``"M"``) for tensorize flavour.
     """
 
     target_nid: int
@@ -38,46 +35,40 @@ class SplitOption(TransformOption):
 
 
 class Split(Transform):
-    """Replace one axis-chain entry on a leaf with a chain of factors.
-
-    See ``docs/superpowers/specs/2026-05-16-transforms-split-fuse-design.md``.
-    """
+    """Replace one loop or tensorize-axis tile with a chain of factors."""
 
     def analyze(self, ir: KernelIR) -> list[SplitOption]:
-        """Enumerate every legal split option (outer-trip and tensorize)."""
         options: list[SplitOption] = []
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
             if isinstance(data, ForNode):
-                for factors in _factorizations(data.trip):
+                for factors in _factorizations(data.extent):
                     options.append(SplitOption(target_nid=nid, factors=factors, target_axis=None))
             elif isinstance(data, ISANode):
-                if data.op_cls is NKIAlloc:
-                    continue
-                for axis, current in data.tensorize_sizes.items():
-                    if axis not in data.axis_map:
+                """Tensorize flavour: walk the enclosing block's iter_vars."""
+                block_nid, block = _find_enclosing_block(ir.tree, nid)
+                for iv in block.iter_vars:
+                    abstract = iv.axis
+                    extent = iv.dom[1] - iv.dom[0]
+                    """Tile width currently bound on the leaf (max_tile or full extent)."""
+                    current = _current_tensorize_width(data, abstract)
+                    if current is None or current < 2:
                         continue
-                    min_tile = data.op_cls.MIN_TILE_SIZE.get(axis)
-                    max_tile = data.op_cls.MAX_TILE_SIZE.get(axis)
                     for factors in _factorizations(current):
-                        last = factors[-1]
-                        if min_tile is not None and last < min_tile:
-                            continue
-                        if max_tile is not None and last > max_tile:
-                            continue
-                        options.append(SplitOption(target_nid=nid, factors=factors, target_axis=axis))
+                        options.append(SplitOption(target_nid=nid, factors=factors, target_axis=abstract))
         return options
 
     def apply(self, ir: KernelIR, option: SplitOption) -> KernelIR:
-        """Re-check legality, deep-copy ``ir``, perform the split, return new IR."""
         self._check_legality(ir, option)
         new_ir = copy.deepcopy(ir)
-        self._do_apply(new_ir, option)
+        if option.target_axis is None:
+            self._do_outer_trip(new_ir, option)
+        else:
+            self._do_tensorize(new_ir, option)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
     def _check_legality(self, ir: KernelIR, option: SplitOption) -> None:
-        """Raise :class:`TransformLegalityError` if ``option`` is invalid for ``ir``."""
         if len(option.factors) < 2:
             raise TransformLegalityError(f"Split.factors must have len >= 2; got {option.factors}")
         if any(f < 2 for f in option.factors):
@@ -86,149 +77,212 @@ class Split(Transform):
         if option.target_axis is None:
             if not isinstance(target, ForNode):
                 raise TransformLegalityError(
-                    f"Split outer-trip flavor requires target to be ForNode; got {type(target).__name__}"
+                    f"Split outer-trip flavour requires target to be ForNode; got {type(target).__name__}"
                 )
-            if prod(option.factors) != target.trip:
+            if prod(option.factors) != target.extent:
                 raise TransformLegalityError(
-                    f"Split.factors product {prod(option.factors)} != ForNode.trip {target.trip}"
+                    f"Split.factors product {prod(option.factors)} != ForNode.extent {target.extent}"
                 )
         else:
             if not isinstance(target, ISANode):
                 raise TransformLegalityError(
-                    f"Split tensorize flavor requires target to be ISANode; got {type(target).__name__}"
+                    f"Split tensorize flavour requires target to be ISANode; got {type(target).__name__}"
                 )
-            if target.op_cls is NKIAlloc:
+            block_nid, block = _find_enclosing_block(ir.tree, option.target_nid)
+            if not any(iv.axis == option.target_axis for iv in block.iter_vars):
                 raise TransformLegalityError(
-                    "Split tensorize flavor: cannot split NKIAlloc tensorize_sizes " "(would change buffer placement)"
+                    f"Split.target_axis={option.target_axis!r} not declared by enclosing block"
                 )
-            if option.target_axis not in target.axis_map:
+            current = _current_tensorize_width(target, option.target_axis)
+            if current is None:
                 raise TransformLegalityError(
-                    f"Split.target_axis={option.target_axis!r} not in leaf.axis_map={list(target.axis_map)}"
+                    f"Split.target_axis={option.target_axis!r}: no tensorize width on this leaf"
                 )
-            current = target.tensorize_sizes[option.target_axis]
             if prod(option.factors) != current:
                 raise TransformLegalityError(
-                    f"Split.factors product {prod(option.factors)} != tensorize_sizes[{option.target_axis!r}]={current}"
-                )
-            min_tile = target.op_cls.MIN_TILE_SIZE.get(option.target_axis)
-            max_tile = target.op_cls.MAX_TILE_SIZE.get(option.target_axis)
-            if min_tile is not None and option.factors[-1] < min_tile:
-                raise TransformLegalityError(
-                    f"Split.factors[-1]={option.factors[-1]} < MIN_TILE_SIZE[{option.target_axis!r}]={min_tile}"
-                )
-            if max_tile is not None and option.factors[-1] > max_tile:
-                raise TransformLegalityError(
-                    f"Split.factors[-1]={option.factors[-1]} > MAX_TILE_SIZE[{option.target_axis!r}]={max_tile}"
+                    f"Split.factors product {prod(option.factors)} != current tensorize width {current}"
                 )
 
-    def _do_apply(self, ir: KernelIR, option: SplitOption) -> None:
-        """Mutate ``ir.tree`` in place per ``option``. Caller already checked legality."""
-        if option.target_axis is None:
-            self._do_apply_outer_trip(ir, option)
-        else:
-            self._do_apply_tensorize(ir, option)
-
-    def _do_apply_outer_trip(self, ir: KernelIR, option: SplitOption) -> None:
-        """Replace a ForNode with a chain of new ForNodes whose trips are ``option.factors``.
-
-        Sibling order under the parent is preserved: the new chain's top occupies
-        the original target's slot in the parent's child list.
-        """
+    def _do_outer_trip(self, ir: KernelIR, option: SplitOption) -> None:
+        """Outer-trip Split: replace the target ForNode with a chain of new ForNodes; rewrite iter_values."""
         target_nid = option.target_nid
         target = ir.tree.data(target_nid)
         assert isinstance(target, ForNode)
         parent_nid = ir.tree.parent(target_nid)
         assert parent_nid is not None
-        original_children_of_target = ir.tree.children(target_nid)
+        original_children = ir.tree.children(target_nid)
 
-        """Build the new chain DETACHED so we can splice its top into target's old slot."""
+        block_nid, block = _find_enclosing_block(ir.tree, target_nid)
+
+        new_loop_vars = [f"{target.loop_var}_{i}" for i in range(len(option.factors))]
         new_top_nid: int | None = None
-        prev: int | None = None
-        for trip in option.factors:
-            new_nid = ir.tree.add_node(ForNode(dim=target.dim, trip=trip), parent=None)
+        prev_nid: int | None = None
+        for loop_var, extent in zip(new_loop_vars, option.factors):
+            new_nid = ir.tree.add_node(ForNode(loop_var=loop_var, extent=extent), parent=None)
             if new_top_nid is None:
                 new_top_nid = new_nid
-            if prev is not None:
-                ir.tree.graph.add_edge(prev, new_nid)
-            prev = new_nid
-
-        """Reparent target's original children under the deepest new node."""
-        assert prev is not None
-        for child in original_children_of_target:
-            ir.tree.graph.add_edge(prev, child)
-
-        """Swap target_nid out for new_top_nid at the same position in parent's child list."""
-        assert new_top_nid is not None
+            if prev_nid is not None:
+                ir.tree.graph.add_edge(prev_nid, new_nid)
+            prev_nid = new_nid
+        assert prev_nid is not None and new_top_nid is not None
+        for child_nid in original_children:
+            ir.tree.graph.add_edge(prev_nid, child_nid)
         _replace_in_parent_children(ir.tree, parent_nid, [target_nid], [new_top_nid])
-
-        """Drop the now-orphaned target node."""
         ir.tree.graph.remove_node(target_nid)
 
-    def _do_apply_tensorize(self, ir: KernelIR, option: SplitOption) -> None:
-        """Insert ``len(factors)-1`` ForNodes above the leaf and update tensorize_sizes."""
+        """Rewrite iter_values: any iter_value referencing the old loop_var becomes the affine sum."""
+        new_value = _affine_split(new_loop_vars, option.factors)
+        substitution = {target.loop_var: new_value}
+        new_iter_values = tuple(substitute(value, substitution) for value in block.iter_values)
+        new_block = BlockNode(
+            iter_vars=block.iter_vars,
+            iter_values=new_iter_values,
+            reads=tuple(_substitute_region(r, substitution) for r in block.reads),
+            writes=tuple(_substitute_region(w, substitution) for w in block.writes),
+            alloc_buffers=block.alloc_buffers,
+            annotations=dict(block.annotations),
+        )
+        ir.tree.graph.nodes[block_nid]["data"] = new_block
+
+        """Also update all descendant ISANodes' operand_bindings within this block's scope."""
+        for desc_nid in _block_local_descendants(ir.tree, block_nid):
+            desc_data = ir.tree.data(desc_nid)
+            if isinstance(desc_data, ISANode):
+                new_bindings = {
+                    slot: _substitute_region(region, substitution)
+                    for slot, region in desc_data.operand_bindings.items()
+                }
+                new_isa = ISANode(op_cls=desc_data.op_cls, operand_bindings=new_bindings, kwargs=dict(desc_data.kwargs))
+                ir.tree.graph.nodes[desc_nid]["data"] = new_isa
+
+    def _do_tensorize(self, ir: KernelIR, option: SplitOption) -> None:
+        """Tensorize Split: insert ForNodes above the leaf, shrink leaf operand bindings."""
         leaf_nid = option.target_nid
         leaf = ir.tree.data(leaf_nid)
         assert isinstance(leaf, ISANode)
-        parent = ir.tree.parent(leaf_nid)
-        assert parent is not None
-        assert option.target_axis is not None
-        concrete_dim = leaf.axis_map[option.target_axis]
+        parent_nid = ir.tree.parent(leaf_nid)
+        assert parent_nid is not None
+        block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
 
-        """Detach the leaf from its parent, then chain new ForNodes from ``parent``, then reattach."""
-        ir.tree.graph.remove_edge(parent, leaf_nid)
-        prev = parent
-        for trip in option.factors[:-1]:
-            new_nid = ir.tree.add_node(ForNode(dim=concrete_dim, trip=trip), parent=prev)
-            prev = new_nid
-        ir.tree.graph.add_edge(prev, leaf_nid)
+        """Choose a base loop_var name from the existing iter_value if it's a Var, else from axis."""
+        base_loop_var = _existing_binding_loop_var(block, option.target_axis) or f"i_{option.target_axis}"
+        new_loop_vars = [f"{base_loop_var}_{i}" for i in range(len(option.factors) - 1)]
 
-        """Update tensorize. ISANode is a frozen dataclass - replace the node payload."""
-        new_tensorize_sizes = dict(leaf.tensorize_sizes)
-        new_tensorize_sizes[option.target_axis] = option.factors[-1]
-        new_leaf = ISANode(
-            op_cls=leaf.op_cls,
-            reads=leaf.reads,
-            writes=leaf.writes,
-            rmw=leaf.rmw,
-            tensorize_sizes=new_tensorize_sizes,
-            axis_map=dict(leaf.axis_map),
-            kwargs=dict(leaf.kwargs),
-            location=leaf.location,
-            dtype=leaf.dtype,
-        )
+        ir.tree.graph.remove_edge(parent_nid, leaf_nid)
+        prev_nid = parent_nid
+        for loop_var, extent in zip(new_loop_vars, option.factors[:-1]):
+            new_nid = ir.tree.add_node(ForNode(loop_var=loop_var, extent=extent), parent=prev_nid)
+            prev_nid = new_nid
+        ir.tree.graph.add_edge(prev_nid, leaf_nid)
+
+        """Shrink the leaf's operand_bindings on target_axis: the new tile width is option.factors[-1]."""
+        new_bindings = {
+            slot: _shrink_region(region, option.target_axis, option.factors[-1])
+            for slot, region in leaf.operand_bindings.items()
+        }
+        new_leaf = ISANode(op_cls=leaf.op_cls, operand_bindings=new_bindings, kwargs=dict(leaf.kwargs))
         ir.tree.graph.nodes[leaf_nid]["data"] = new_leaf
+
+        """Rewrite iter_values for the affected iter_var: existing binding -> affine sum that includes
+        the new outer loop_vars."""
+        new_value_factor = _affine_split([*new_loop_vars, base_loop_var], option.factors)
+        new_iter_values = tuple(substitute(value, {base_loop_var: new_value_factor}) for value in block.iter_values)
+        new_block = BlockNode(
+            iter_vars=block.iter_vars,
+            iter_values=new_iter_values,
+            reads=tuple(_substitute_region(r, {base_loop_var: new_value_factor}) for r in block.reads),
+            writes=tuple(_substitute_region(w, {base_loop_var: new_value_factor}) for w in block.writes),
+            alloc_buffers=block.alloc_buffers,
+            annotations=dict(block.annotations),
+        )
+        ir.tree.graph.nodes[block_nid]["data"] = new_block
 
 
 def _resolve(tree: KernelTree, nid: int):
-    """Return the node payload for ``nid`` or raise."""
     if nid not in tree.graph:
         raise TransformLegalityError(f"Split.target_nid={nid} is not a node in the IR tree")
     return tree.data(nid)
 
 
-def _factorizations(n: int) -> list[tuple[int, ...]]:
-    """Return every ordered factorization of ``n`` into 2..``_MAX_SPLIT_PARTS`` parts, each ``>= 2``.
+def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
+    """Walk ancestors of ``nid`` until we hit a BlockNode."""
+    for ancestor in reversed(tree.ancestors(nid)):
+        data = tree.data(ancestor)
+        if isinstance(data, BlockNode):
+            return ancestor, data
+    raise TransformLegalityError(f"no enclosing BlockNode for nid {nid}")
 
-    Example: ``_factorizations(16)`` returns ``(2, 8)``, ``(4, 4)``, ``(8, 2)``,
-    ``(2, 2, 4)``, ``(2, 4, 2)``, ``(4, 2, 2)``.
-    """
+
+def _existing_binding_loop_var(block: BlockNode, axis: str) -> str | None:
+    """Return the loop_var name on the iter_value for ``axis``, if it is a bare Var; else None."""
+    for iv, value in zip(block.iter_vars, block.iter_values):
+        if iv.axis == axis and isinstance(value, Var):
+            return value.name
+    return None
+
+
+def _current_tensorize_width(leaf: ISANode, abstract_axis: str) -> int | None:
+    """Look up the tile width for ``abstract_axis`` on the first operand whose OPERAND_AXES contains it."""
+    op_cls = leaf.op_cls
+    for slot, axes in op_cls.OPERAND_AXES.items():
+        if abstract_axis not in axes:
+            continue
+        if slot not in leaf.operand_bindings:
+            continue
+        region = leaf.operand_bindings[slot]
+        axis_index = axes.index(abstract_axis)
+        if axis_index >= len(region.ranges):
+            continue
+        _lo, hi = region.ranges[axis_index]
+        if isinstance(hi, Const):
+            return hi.value
+    return None
+
+
+def _affine_split(loop_vars: list[str], factors: tuple[int, ...]) -> Expr:
+    """Build the affine binding ``v_0 * (f_1*f_2*...) + v_1 * (f_2*...) + ... + v_{n-1}``."""
+    coeffs: dict[str | None, int] = {}
+    for i, name in enumerate(loop_vars):
+        stride = prod(factors[i + 1 :]) if i + 1 < len(factors) else 1
+        coeffs[name] = stride
+    return from_affine(coeffs)
+
+
+def _substitute_region(region: BufferRegion, subs: dict[str, Expr]) -> BufferRegion:
+    """Return a copy of ``region`` with ``subs`` applied to every range bound."""
+    new_ranges = tuple((substitute(lo, subs), substitute(hi, subs)) for lo, hi in region.ranges)
+    return BufferRegion(tensor=region.tensor, ranges=new_ranges)
+
+
+def _shrink_region(region: BufferRegion, target_axis: str, new_width: int) -> BufferRegion:
+    """Replace the ``hi`` for the matching axis with Const(new_width)."""
+    """Best-effort: locate the axis by looking for a hi whose Const width matches the existing tile.
+    We can't directly map abstract axes here without OPERAND_AXES; the caller in tensorize Split
+    already validated this width is uniquely the target. For now, replace any range whose hi == old width."""
+    new_ranges: list[tuple[Expr, Expr]] = []
+    for lo, hi in region.ranges:
+        if isinstance(hi, Const):
+            new_ranges.append((lo, Const(value=new_width) if hi.value > new_width else hi))
+        else:
+            new_ranges.append((lo, hi))
+    return BufferRegion(tensor=region.tensor, ranges=tuple(new_ranges))
+
+
+def _factorizations(n: int) -> list[tuple[int, ...]]:
     out: list[tuple[int, ...]] = []
     for parts in range(2, _MAX_SPLIT_PARTS + 1):
-        _enum_ordered_factorizations(n, parts, (), out)
+        _enum(n, parts, (), out)
     return out
 
 
-def _enum_ordered_factorizations(
-    remaining: int, parts_left: int, prefix: tuple[int, ...], out: list[tuple[int, ...]]
-) -> None:
-    """Append every ordered factorization of ``remaining`` into exactly ``parts_left`` factors >= 2."""
+def _enum(remaining: int, parts_left: int, prefix: tuple[int, ...], out: list[tuple[int, ...]]) -> None:
     if parts_left == 1:
         if remaining >= 2:
             out.append(prefix + (remaining,))
         return
     for f in range(2, remaining + 1):
         if remaining % f == 0 and remaining // f >= 2 ** (parts_left - 1):
-            _enum_ordered_factorizations(remaining // f, parts_left - 1, prefix + (f,), out)
+            _enum(remaining // f, parts_left - 1, prefix + (f,), out)
 
 
 __all__ = ["Split", "SplitOption"]

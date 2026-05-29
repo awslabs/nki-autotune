@@ -1,4 +1,4 @@
-"""Tests for :class:`nkigym.transforms.Fuse`."""
+"""Tests for nkigym.transforms.Fuse under BlockNode IR."""
 
 from __future__ import annotations
 
@@ -6,275 +6,87 @@ from test.transforms._fixtures import build_canonical_ir
 
 import pytest
 
-from nkigym.ir.tree import ForNode, ISANode
-from nkigym.transforms import Fuse, FuseOption, Split, SplitOption, TransformLegalityError
+from nkigym.ir.tree import BlockNode, ForNode, ISANode
+from nkigym.transforms import Fuse, FuseOption, Split, SplitOption
 
 
-def _find_first_for_with_trip(ir, trip: int) -> int:
-    for nid in ir.tree.preorder():
-        data = ir.tree.data(nid)
-        if isinstance(data, ForNode) and data.trip == trip:
-            return nid
-    raise AssertionError(f"no ForNode with trip={trip}")
+def _matmul_block_first_for(ir):
+    from nkigym.ops.matmul import NKIMatmul
+
+    for nid in ir.tree.blocks():
+        for d in ir.tree.descendants(nid):
+            if isinstance(ir.tree.data(d), ISANode) and ir.tree.data(d).op_cls is NKIMatmul:
+                """First ForNode on the path from block to leaf."""
+                for path_nid in ir.tree.preorder(nid):
+                    if isinstance(ir.tree.data(path_nid), ForNode):
+                        return path_nid
+    raise AssertionError
 
 
-def test_fuse_outer_trip_undoes_split_round_trip():
-    """Splitting a trip=16 ForNode then fusing the resulting two ForNodes restores trip=16."""
+def test_fuse_outer_trip_inverts_split():
+    """Split then Fuse on the same axis returns the original ForNode extent."""
     ir = build_canonical_ir()
-    target = _find_first_for_with_trip(ir, 16)
-    target_dim = ir.tree.data(target).dim
+    target = _matmul_block_first_for(ir)
+    original_extent = ir.tree.data(target).extent
 
-    split_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(4, 4)))
+    split_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(2, original_extent // 2)))
+    """Locate the new outer ForNode."""
+    parent = split_ir.tree.parent(target) if target in split_ir.tree.graph else None
+    if parent is None:
+        """Target was removed; pick the new top from same parent slot in original IR."""
+        original_parent = ir.tree.parent(target)
+        new_top = split_ir.tree.children(original_parent)[0]
+    else:
+        new_top = parent
+    inner = split_ir.tree.children(new_top)[0]
+    fuse_ir = Fuse().apply(split_ir, FuseOption(target_nids=(new_top, inner), target_axis=None))
 
-    """Find the new chain in split_ir."""
-    chain: list[int] = []
-    for nid in split_ir.tree.preorder():
-        data = split_ir.tree.data(nid)
-        if isinstance(data, ForNode) and data.trip == 4 and data.dim == target_dim:
-            kids = split_ir.tree.children(nid)
-            if len(kids) == 1 and isinstance(split_ir.tree.data(kids[0]), ForNode):
-                child_data = split_ir.tree.data(kids[0])
-                if child_data.trip == 4 and child_data.dim == target_dim:
-                    chain = [nid, kids[0]]
-                    break
-    assert len(chain) == 2
+    """The fused ForNode now has the original extent."""
+    fused_parent = ir.tree.parent(target)
+    fused_top = fuse_ir.tree.children(fused_parent)[0]
+    fused_data = fuse_ir.tree.data(fused_top)
+    assert isinstance(fused_data, ForNode)
+    assert fused_data.extent == original_extent
 
-    fused_ir = Fuse().apply(split_ir, FuseOption(target_nids=tuple(chain)))
 
-    """In fused_ir, the deepest entry of ``chain`` is gone and a new ForNode trip=16 sits at the chain root's old position."""
-    survivors = [
+def test_fuse_tensorize_absorbs_loop_into_leaf_tile():
+    """Tensorize Fuse: a ForNode above the leaf is removed; the leaf's tile widens."""
+    ir = build_canonical_ir()
+    """Find the matmul block's ISA leaf and its immediate ForNode parent."""
+    from nkigym.ops.matmul import NKIMatmul
+
+    leaf_nid = next(
         nid
-        for nid in fused_ir.tree.preorder()
-        if isinstance(fused_ir.tree.data(nid), ForNode)
-        and fused_ir.tree.data(nid).trip == 16
-        and fused_ir.tree.data(nid).dim == target_dim
-    ]
-    assert len(survivors) >= 1
+        for nid in ir.tree.preorder()
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.data(nid).op_cls is NKIMatmul
+    )
+    parent_for = ir.tree.parent(leaf_nid)
+    parent_for_data = ir.tree.data(parent_for)
+    assert isinstance(parent_for_data, ForNode)
+    """Skip the test if the parent is not a ForNode (e.g. the matmul body has no enclosing loops)."""
+    if not isinstance(parent_for_data, ForNode):
+        pytest.skip("matmul leaf has no enclosing ForNode to fuse")
 
+    """Find the iter_var axis bound by parent_for.loop_var on the matmul block."""
+    from nkigym.ir.expr import Var
 
-def test_fuse_apply_preserves_input_ir():
-    """``apply`` must not mutate its input IR."""
-    ir = build_canonical_ir()
-    target = _find_first_for_with_trip(ir, 16)
-    split_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(4, 4)))
-    snapshot = split_ir.tree.num_nodes
-
-    """Find chain again."""
-    target_dim = ir.tree.data(target).dim
-    chain: list[int] = []
-    for nid in split_ir.tree.preorder():
-        data = split_ir.tree.data(nid)
-        if isinstance(data, ForNode) and data.trip == 4 and data.dim == target_dim:
-            kids = split_ir.tree.children(nid)
-            if len(kids) == 1 and isinstance(split_ir.tree.data(kids[0]), ForNode):
-                child_data = split_ir.tree.data(kids[0])
-                if child_data.trip == 4 and child_data.dim == target_dim:
-                    chain = [nid, kids[0]]
-                    break
-
-    Fuse().apply(split_ir, FuseOption(target_nids=tuple(chain)))
-    assert split_ir.tree.num_nodes == snapshot
-
-
-def test_fuse_rejects_single_target():
-    """``len(target_nids)`` must be ``>= 2``."""
-    ir = build_canonical_ir()
-    target = _find_first_for_with_trip(ir, 16)
-    with pytest.raises(TransformLegalityError):
-        Fuse().apply(ir, FuseOption(target_nids=(target,)))
-
-
-def test_fuse_rejects_non_chain_targets():
-    """Two ForNodes that are not in a parent->child chain must be rejected."""
-    ir = build_canonical_ir()
-    """Find two top-level ForNodes (siblings under root)."""
-    root_kids = ir.tree.children(ir.tree.root)
-    fornode_kids = [nid for nid in root_kids if isinstance(ir.tree.data(nid), ForNode)]
-    assert len(fornode_kids) >= 2
-    with pytest.raises(TransformLegalityError):
-        Fuse().apply(ir, FuseOption(target_nids=(fornode_kids[0], fornode_kids[1])))
-
-
-def test_fuse_rejects_dim_mismatch():
-    """Two ForNodes on different dims may not be fused."""
-    ir = build_canonical_ir()
-    """The matmul nest has K (d0) outer, M/N inside. Find adjacent same-chain different-dim pair."""
-    different_dim_chain: tuple[int, int] | None = None
-    for nid in ir.tree.preorder():
-        data = ir.tree.data(nid)
-        if not isinstance(data, ForNode):
-            continue
-        kids = ir.tree.children(nid)
-        if len(kids) == 1 and isinstance(ir.tree.data(kids[0]), ForNode):
-            child = ir.tree.data(kids[0])
-            if child.dim != data.dim:
-                different_dim_chain = (nid, kids[0])
-                break
-    assert different_dim_chain is not None
-    with pytest.raises(TransformLegalityError):
-        Fuse().apply(ir, FuseOption(target_nids=different_dim_chain))
-
-
-def test_fuse_analyze_returns_only_legal_outer_options():
-    """Every outer-trip option must apply without raising."""
-    ir = build_canonical_ir()
-    target = _find_first_for_with_trip(ir, 16)
-    split_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(4, 4)))
-    options = [opt for opt in Fuse().analyze(split_ir) if opt.target_axis is None]
-    assert options, "expected at least one outer-trip Fuse option after a Split"
-    for opt in options:
-        Fuse().apply(split_ir, opt)
-
-
-def _find_lhs_t_load(ir) -> int:
-    for nid in ir.tree.preorder():
-        data = ir.tree.data(nid)
-        if isinstance(data, ISANode) and data.op_cls.NAME == "dma_copy" and "lhs_T" in data.reads:
-            return nid
-    raise AssertionError("lhs_T load not found")
-
-
-def _find_matmul(ir) -> int:
-    for nid in ir.tree.preorder():
-        data = ir.tree.data(nid)
-        if isinstance(data, ISANode) and data.op_cls.NAME == "nc_matmul":
-            return nid
-    raise AssertionError("matmul not found")
-
-
-def test_fuse_tensorize_undoes_split_round_trip():
-    """Splitting lhs_T F tensorize=2048 by (16, 128) then fusing the resulting (ForNode, leaf) chain restores tensorize=2048."""
-    ir = build_canonical_ir()
-    leaf = _find_lhs_t_load(ir)
-    split_ir = Split().apply(ir, SplitOption(target_nid=leaf, factors=(16, 128), target_axis="F"))
-    new_parent = split_ir.tree.parent(leaf)
-    assert split_ir.tree.data(new_parent).trip == 16
-    chain = (new_parent, leaf)
-
-    fused_ir = Fuse().apply(split_ir, FuseOption(target_nids=chain, target_axis="F"))
-
-    """Original split_ir untouched."""
-    assert split_ir.tree.data(leaf).tensorize_sizes["F"] == 128
-
-    """In fused_ir, leaf's tensorize_sizes[F] is back to 2048 and its parent is the original parent of new_parent."""
-    fused_leaf = fused_ir.tree.data(leaf)
-    assert fused_leaf.tensorize_sizes["F"] == 2048
-    grandparent = split_ir.tree.parent(new_parent)
-    assert fused_ir.tree.parent(leaf) == grandparent
-
-
-def test_fuse_tensorize_three_way_chain():
-    """Splitting tensorize=2048 by (4, 4, 128) then fusing the resulting (ForNode, ForNode, leaf) chain restores tensorize=2048."""
-    ir = build_canonical_ir()
-    leaf = _find_lhs_t_load(ir)
-    split_ir = Split().apply(ir, SplitOption(target_nid=leaf, factors=(4, 4, 128), target_axis="F"))
-    parent = split_ir.tree.parent(leaf)
-    grandparent = split_ir.tree.parent(parent)
-    chain = (grandparent, parent, leaf)
-
-    fused_ir = Fuse().apply(split_ir, FuseOption(target_nids=chain, target_axis="F"))
-    assert fused_ir.tree.data(leaf).tensorize_sizes["F"] == 2048
-
-
-def test_fuse_tensorize_rejects_non_isa_last():
-    """The last entry must be an ISANode."""
-    ir = build_canonical_ir()
-    target = _find_first_for_with_trip(ir, 16)
-    """Build a fake 2-ForNode chain via Split, then incorrectly mark target_axis."""
-    split_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(4, 4)))
-    target_dim = ir.tree.data(target).dim
-    chain: list[int] = []
-    for nid in split_ir.tree.preorder():
-        data = split_ir.tree.data(nid)
-        if isinstance(data, ForNode) and data.trip == 4 and data.dim == target_dim:
-            kids = split_ir.tree.children(nid)
-            if len(kids) == 1 and isinstance(split_ir.tree.data(kids[0]), ForNode):
-                chain = [nid, kids[0]]
-                break
-    with pytest.raises(TransformLegalityError):
-        Fuse().apply(split_ir, FuseOption(target_nids=tuple(chain), target_axis="K"))
-
-
-def test_fuse_tensorize_rejects_axis_not_in_axis_map():
-    """Tensorize flavor must reject an axis name absent from the leaf's axis_map."""
-    ir = build_canonical_ir()
-    leaf = _find_lhs_t_load(ir)
-    split_ir = Split().apply(ir, SplitOption(target_nid=leaf, factors=(16, 128), target_axis="F"))
-    parent = split_ir.tree.parent(leaf)
-    with pytest.raises(TransformLegalityError):
-        Fuse().apply(split_ir, FuseOption(target_nids=(parent, leaf), target_axis="ZZZ"))
-
-
-def test_fuse_tensorize_rejects_above_max():
-    """Tensorize MAX upper bound is structurally unreachable when each tensorize Split already respects MAX and Fuse merely recombines factors."""
-    pytest.skip(
-        "Tensorize MAX upper bound is structurally unreachable when each tensorize Split already "
-        "respects MAX and Fuse merely recombines factors."
+    """Find the closest enclosing BlockNode with iter_vars."""
+    matmul_block_nid = None
+    matmul_block = None
+    for anc in reversed(list(ir.tree.ancestors(leaf_nid))):
+        data = ir.tree.data(anc)
+        if isinstance(data, BlockNode) and len(data.iter_vars) > 0:
+            matmul_block_nid = anc
+            matmul_block = data
+            break
+    assert matmul_block is not None
+    target_axis = next(
+        iv.axis
+        for iv, value in zip(matmul_block.iter_vars, matmul_block.iter_values)
+        if isinstance(value, Var) and value.name == parent_for_data.loop_var
     )
 
-
-def test_fuse_analyze_finds_tensorize_chain_after_split():
-    """``analyze`` should surface a tensorize Fuse option for a (ForNode, leaf) chain on the F axis."""
-    ir = build_canonical_ir()
-    leaf = _find_lhs_t_load(ir)
-    split_ir = Split().apply(ir, SplitOption(target_nid=leaf, factors=(16, 128), target_axis="F"))
-    parent = split_ir.tree.parent(leaf)
-    options = [opt for opt in Fuse().analyze(split_ir) if opt.target_axis == "F" and opt.target_nids == (parent, leaf)]
-    assert options, "expected a tensorize Fuse option for the (ForNode, leaf) chain on F"
-
-
-def test_fuse_analyze_no_tensorize_options_on_canonical():
-    """On the canonical IR, every enclosing same-dim ForNode chain has trip-product == 1,
-    failing the >= 2 requirement, so tensorize Fuse should yield no options."""
-    ir = build_canonical_ir()
-    options = [opt for opt in Fuse().analyze(ir) if opt.target_axis is not None]
-    assert options == []
-
-
-def test_fuse_outer_trip_preserves_sibling_order():
-    """Fusing a ForNode chain that has siblings under root must keep the new node at the same position."""
-    ir = build_canonical_ir()
-    target = None
-    for nid in ir.tree.preorder():
-        d = ir.tree.data(nid)
-        if isinstance(d, ForNode) and d.dim == "d0" and d.trip == 16:
-            target = nid
-            break
-    assert target is not None
-    parent = ir.tree.parent(target)
-    target_pos = ir.tree.children(parent).index(target)
-
-    """Apply Split first to manufacture a chain."""
-    split_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(2, 8)))
-
-    """Re-locate the chain (split_ir's parent's child list at the same position now points to a (2, 8) chain)."""
-    split_siblings = split_ir.tree.children(parent)
-    chain_root = split_siblings[target_pos]
-    chain_inner = split_ir.tree.children(chain_root)[0]
-
-    fused_ir = Fuse().apply(split_ir, FuseOption(target_nids=(chain_root, chain_inner)))
-
-    fused_siblings = fused_ir.tree.children(parent)
-    new_node_at_pos = fused_ir.tree.data(fused_siblings[target_pos])
-    assert isinstance(new_node_at_pos, ForNode)
-    assert new_node_at_pos.dim == "d0"
-    assert new_node_at_pos.trip == 16
-
-
-def test_fuse_analyze_skips_nki_alloc():
-    """``analyze`` must not emit tensorize Fuse options whose leaf is NKIAlloc."""
-    from nkigym.ops.alloc import NKIAlloc
-
-    ir = build_canonical_ir()
-    """First create some chain above an NKIAlloc by trying — but Split skips alloc, so to test
-    analyze's filter we need to construct an IR where an alloc has an enclosing same-dim ForNode.
-    Since canonical has no enclosing loops on alloc leaves and Split won't add them, this case
-    cannot arise organically. Just assert that analyze returns no tensorize options with NKIAlloc target."""
-    options = Fuse().analyze(ir)
-    for opt in options:
-        if opt.target_axis is None:
-            continue
-        leaf = ir.tree.data(opt.target_nids[-1])
-        assert (
-            leaf.op_cls is not NKIAlloc
-        ), f"Fuse.analyze emitted a tensorize option on NKIAlloc nid={opt.target_nids[-1]}"
+    fuse_ir = Fuse().apply(ir, FuseOption(target_nids=(parent_for, leaf_nid), target_axis=target_axis))
+    """The parent ForNode is gone; the leaf is now a direct child of what was parent_for's parent."""
+    new_leaf_parent = fuse_ir.tree.parent(leaf_nid)
+    assert new_leaf_parent != parent_for

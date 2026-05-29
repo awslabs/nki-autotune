@@ -39,4 +39,28 @@ def _replace_in_parent_children(
         tree.graph.add_edge(parent_nid, child)
 
 
-__all__ = ["_replace_in_parent_children"]
+def _block_local_descendants(tree: KernelTree, block_nid: int) -> list[int]:
+    """Yield nids descended from ``block_nid`` that share its iter_var scope.
+
+    Walks the tree but does NOT enter sub-blocks (BlockNodes other than block_nid
+    itself, including the block's init sub-block and any nested compute_at-sunk
+    blocks). This is the scope over which iter_value substitutions apply when
+    a Split / Fuse rewrites this block's bindings.
+    """
+    from nkigym.ir.tree import BlockNode
+
+    result: list[int] = []
+    stack = [block_nid]
+    while stack:
+        cur = stack.pop()
+        for child in tree.children(cur):
+            child_data = tree.data(child)
+            if isinstance(child_data, BlockNode):
+                """Don't descend into sub-blocks; they have their own iter_var space."""
+                continue
+            result.append(child)
+            stack.append(child)
+    return result
+
+
+__all__ = ["_replace_in_parent_children", "_block_local_descendants"]
