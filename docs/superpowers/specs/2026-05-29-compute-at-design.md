@@ -6,6 +6,11 @@
   `nkigym/ir/interval.py`, `nkigym/ir/buffer_placement.py`, region-gated
   `nkigym/ir/dependency.py`, plus `test/ir/test_interval.py`,
   `test/ir/test_dependency.py`, `test/ir/test_buffer_placement.py`.
+- **Writers-as-list / `LoopPartition`** — MOVED OUT (2026-05-31) to
+  `docs/superpowers/specs/2026-05-31-loop-partition-and-writers-list-design.md`,
+  sequenced after this spec. `compute_at` does not need it (its only
+  multi-writer pattern, memset+matmul, is non-disjoint and RMW-chains
+  correctly under the current single-`last_writer`).
 - **`ReverseComputeAt`** — legality (`_check_legality`) done; `apply`
   move mechanics are `NotImplementedError`.
 - **`ComputeAt`** — not started.
@@ -256,6 +261,21 @@ stay green.
    bound.
 8. `Dependency` regression: hand-build a 2-block IR writing disjoint
    tiles of one tensor; assert NO edge. And overlapping tiles → edge.
+
+### Multiple writers per tensor — out of scope here (moved 2026-05-31)
+
+`Dependency` currently tracks a single `last_writer` per tensor, which is
+correct for canonical IR and for `compute_at` (the only multi-writer
+pattern compute_at touches — memset + matmul on `psum_prod` — is
+*non-disjoint*: the matmul RMW-reads then overwrites, so the two RMW-chain
+correctly as `memset→matmul→copy`). The latent forgotten-writer bug
+arises only with *disjoint* same-tensor writers, which nothing in this
+spec produces — only the future `LoopPartition` transform does. The
+writers-as-list fix (and the per-scope-graph fidelity question) therefore
+live in their own spec, sequenced after this one:
+`docs/superpowers/specs/2026-05-31-loop-partition-and-writers-list-design.md`.
+`compute_at` runs on the current single-`last_writer` `Dependency`
+unchanged.
 
 ## Part B — ComputeAt / ReverseComputeAt
 
@@ -601,7 +621,7 @@ nkigym/src/nkigym/ir/
 ├── interval.py           # NEW — AffineInterval, intervals_disjoint, regions_disjoint
 ├── buffer_placement.py   # NEW — place_buffers(tree): LCA-of-users, extracted from canonical_build
 ├── canonical_build.py    # EDIT — call place_buffers() instead of inline LCA logic
-└── dependency.py         # EDIT — region-gated hazard edges; _BlockInfo keeps regions+extents
+└── dependency.py         # region-gated hazard edges (shipped Part A); writers-as-list moved to the LoopPartition spec
 
 nkigym/src/nkigym/codegen/
 ├── compact.py            # NEW — compact_shapes(tree) [materialize] + rebased_region(region,buf,tree) [read-time]

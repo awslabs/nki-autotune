@@ -14,6 +14,7 @@ ISA leaf's :attr:`ISANode.operand_bindings`.
 
 from __future__ import annotations
 
+from nkigym.codegen.compact import rebased_region
 from nkigym.ir import KernelIR
 from nkigym.ir.expr import Const, format_expr
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode
@@ -48,7 +49,12 @@ def _emit_block(ir: KernelIR, block_nid: int, depth: int, code: list[str]) -> No
 
 
 def _emit_subtree(ir: KernelIR, nid: int, depth: int, code: list[str]) -> None:
-    """Emit a ForNode or ISANode subtree."""
+    """Emit a ForNode, ISANode, or nested BlockNode subtree.
+
+    A BlockNode may appear as a ForNode child once ``compute_at`` lifts /
+    sinks a block into a loop body; delegate it to :func:`_emit_block` so
+    its ``alloc_buffers`` and body render in place.
+    """
     indent = _INDENT * depth
     node = ir.tree.data(nid)
     if isinstance(node, ForNode):
@@ -57,6 +63,8 @@ def _emit_subtree(ir: KernelIR, nid: int, depth: int, code: list[str]) -> None:
             _emit_subtree(ir, child_nid, depth + 1, code)
     elif isinstance(node, ISANode):
         code.append(indent + _emit_isa_call(node, ir))
+    elif isinstance(node, BlockNode):
+        _emit_block(ir, nid, depth, code)
     else:
         raise TypeError(f"unexpected subtree node type {type(node).__name__}")
 
@@ -79,7 +87,7 @@ def _emit_isa_call(node: ISANode, ir: KernelIR) -> str:
         if slot in node.operand_bindings:
             region = node.operand_bindings[slot]
             buf = ir.buffer(region.tensor)
-            parts.append(f"{slot}={render_buffer_region(region, buf)}")
+            parts.append(f"{slot}={render_buffer_region(rebased_region(region, buf, ir.tree), buf)}")
     for k, v in node.kwargs.items():
         parts.append(f"{k}={v!r}")
     return f"nisa.{op_cls.NAME}({', '.join(parts)})"

@@ -71,3 +71,34 @@ def test_reverse_compute_at_legal_lift_tensor_copy_under_matmul_m_loop():
     opt = ReverseComputeAtOption(block_nid=tc, target_loop_nid=m_loop)
     """_check_legality must NOT raise (apply mechanics tested separately)."""
     ReverseComputeAt()._check_legality(ir, opt)
+
+
+def test_reverse_compute_at_lifts_tensor_copy_and_renders(tmp_path):
+    """Lift tensor_copy under the matmul's M-loop, then render + fp32-sim the result."""
+    import importlib.util
+    from test.transforms._fixtures import INPUT_SPECS
+
+    import numpy as np
+
+    from nkigym.codegen import render
+    from nkigym.synthesis.simulate_nki import simulate_fp32
+
+    ir = build_canonical_ir()
+    tc = _block_for_op(ir, "NKITensorCopy")
+    matmul = _block_for_op(ir, "NKIMatmul")
+    m_loop = _first_for_in_block(ir, matmul)
+    new_ir = ReverseComputeAt().apply(ir, ReverseComputeAtOption(block_nid=tc, target_loop_nid=m_loop))
+
+    assert tc in new_ir.tree.descendants(m_loop)
+
+    src = render(new_ir)
+    kernel_path = tmp_path / "kernel.py"
+    kernel_path.write_text(src)
+    rng = np.random.default_rng(0)
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dt) in INPUT_SPECS.items()}
+    expected = inputs["lhs_T"].T @ inputs["rhs"]
+    spec = importlib.util.spec_from_file_location("k", kernel_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
