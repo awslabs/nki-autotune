@@ -20,20 +20,11 @@ def kernel_0(lhs_T, rhs):
     sbuf_prod = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     for i_d0_0 in range(16):
-        for i_d1_0 in range(1):
-            nisa.dma_copy(
-                dst=sbuf_lhs_T[0:128, i_d0_0, i_d1_0 * 2048 : i_d1_0 * 2048 + 2048],
-                src=lhs_T[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, i_d1_0 * 2048 : i_d1_0 * 2048 + 2048],
-            )
+        nisa.dma_copy(dst=sbuf_lhs_T[0:128, i_d0_0, 0:2048], src=lhs_T[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, 0:2048])
     for i_d0_0 in range(16):
-        for i_d2_0 in range(1):
-            nisa.dma_copy(
-                dst=sbuf_rhs[0:128, i_d0_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
-                src=rhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
-            )
+        nisa.dma_copy(dst=sbuf_rhs[0:128, i_d0_0, 0:2048], src=rhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, 0:2048])
     for i_d1_0 in range(16):
-        for i_d2_0 in range(1):
-            nisa.memset(psum_acc[0:128, i_d1_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048], value=0.0)
+        nisa.memset(psum_acc[0:128, i_d1_0, 0:2048], value=0.0)
     for i_d0_0 in range(16):
         for i_d1_0 in range(16):
             for i_d2_0 in range(4):
@@ -43,17 +34,9 @@ def kernel_0(lhs_T, rhs):
                     moving=sbuf_rhs[0:128, i_d0_0, (i_d2_0) * 512 : (i_d2_0) * 512 + 512],
                 )
     for i_d1_0 in range(16):
-        for i_d2_0 in range(1):
-            nisa.tensor_copy(
-                sbuf_prod[0:128, i_d1_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
-                psum_acc[0:128, i_d1_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
-            )
+        nisa.tensor_copy(sbuf_prod[0:128, i_d1_0, 0:2048], psum_acc[0:128, i_d1_0, 0:2048])
     for i_d1_0 in range(16):
-        for i_d2_0 in range(1):
-            nisa.dma_copy(
-                dst=hbm_out[(i_d1_0) * 128 : (i_d1_0) * 128 + 128, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
-                src=sbuf_prod[0:128, i_d1_0, i_d2_0 * 2048 : i_d2_0 * 2048 + 2048],
-            )
+        nisa.dma_copy(dst=hbm_out[(i_d1_0) * 128 : (i_d1_0) * 128 + 128, 0:2048], src=sbuf_prod[0:128, i_d1_0, 0:2048])
     return hbm_out
 
 
@@ -103,7 +86,7 @@ def kernel_2(lhs_T, rhs):
         nisa.memset(psum_acc[0:128, i_d1_0, 0:2048], value=0.0)
     for i_d0_0 in range(16):
         for i_d1_0 in range(16):
-            # compute_at
+            # move
             nisa.dma_copy(
                 dst=sbuf_lhs_T[0:128, 0, 0:128],
                 src=lhs_T[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, (i_d1_0) * 128 : (i_d1_0) * 128 + 128],
@@ -172,7 +155,7 @@ def kernel_4(lhs_T, rhs):
                 src=lhs_T[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, (i_d1_0) * 128 : (i_d1_0) * 128 + 128],
             )
             for i_d2_0 in range(4):
-                # compute_at
+                # move
                 nisa.dma_copy(
                     dst=sbuf_rhs[0:128, 0, 0:512],
                     src=rhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, (i_d2_0) * 512 : (i_d2_0) * 512 + 512],
@@ -265,7 +248,7 @@ def kernel_7(lhs_T, rhs):
     sbuf_prod = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     for i_d1_0 in range(16):
-        # compute_at
+        # move
         for i_d2_0 in range(4):
             nisa.memset(psum_acc[0:128, i_d1_0, (i_d2_0) * 512 : (i_d2_0) * 512 + 512], value=0.0)
         for i_d0_0 in range(16):
@@ -302,7 +285,7 @@ def kernel_8(lhs_T, rhs):
             nisa.memset(psum_acc[0:128, i_d1_0, (i_d2_0) * 512 : (i_d2_0) * 512 + 512], value=0.0)
         for i_d0_0 in range(16):
             for i_d2_0 in range(4):
-                # compute_at
+                # move
                 nisa.dma_copy(
                     dst=sbuf_lhs_T[0:128, 0, 0:128],
                     src=lhs_T[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, (i_d1_0) * 128 : (i_d1_0) * 128 + 128],
@@ -365,7 +348,7 @@ def kernel_10(lhs_T, rhs):
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     for i_d1_0 in range(16):
         for i_d2_0 in range(4):
-            # compute_at
+            # move
             nisa.memset(psum_acc[0:128, i_d1_0, (i_d2_0) * 512 : (i_d2_0) * 512 + 512], value=0.0)
             for i_d0_0 in range(16):
                 nisa.dma_copy(
@@ -448,7 +431,7 @@ def kernel_12(lhs_T, rhs):
                     stationary=sbuf_lhs_T[0:128, 0, 0:128],
                     moving=sbuf_rhs[0:128, 0, 0:512],
                 )
-            # reverse_compute_at
+            # reverse_move
             nisa.tensor_copy(sbuf_prod[0:128, i_d1_0, (i_d2_0) * 512 : (i_d2_0) * 512 + 512], psum_acc[0:128, 0, 0:512])
     for i_d1_0 in range(16):
         nisa.dma_copy(dst=hbm_out[(i_d1_0) * 128 : (i_d1_0) * 128 + 128, 0:2048], src=sbuf_prod[0:128, i_d1_0, 0:2048])
@@ -515,7 +498,7 @@ def kernel_14(lhs_T, rhs):
                     moving=sbuf_rhs[0:128, 0, 0:512],
                 )
             nisa.tensor_copy(sbuf_prod[0:128, 0, 0:512], psum_acc[0:128, 0, 0:512])
-            # reverse_compute_at
+            # reverse_move
             nisa.dma_copy(
                 dst=hbm_out[(i_d1_0) * 128 : (i_d1_0) * 128 + 128, (i_d2_0) * 512 : (i_d2_0) * 512 + 512],
                 src=sbuf_prod[0:128, 0, 0:512],

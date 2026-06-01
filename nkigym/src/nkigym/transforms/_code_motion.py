@@ -164,6 +164,7 @@ def _rebind_block(tree: KernelTree, block_nid: int, covered_vars: dict[str, str]
         writes=tuple(_sub_region(w, subs) for w in block.writes),
         alloc_buffers=block.alloc_buffers,
         annotations=dict(block.annotations),
+        axis_map=block.axis_map,
     )
     tree.graph.nodes[block_nid]["data"] = new_block
     for nid in _block_local_descendants(tree, block_nid):

@@ -792,6 +792,210 @@ M-loop and renders to numerically-correct NKI."
 
 ---
 
+## Task 5.5: Persist `BlockNode.axis_map` + fix Split tensorize (SHIPPED / SUPERSEDED)
+
+> **SHIPPED separately.** The `BlockNode.axis_map` foundation shipped as
+> `fd4ebfa`, and the tensorize Split/Fuse region-rewrite bugs (which this
+> task only partially scoped) were fully fixed by a dedicated effort:
+> `docs/superpowers/plans/2026-06-01-tensorize-split-fuse-fix.md`
+> (commits `afa84fa` → `b000a7e`: element-space `_tile_region` helper,
+> Split + Fuse `_do_tensorize` rewrites, per-operand `retile_region`, all
+> render+sim verified). When resuming, **Task 6's k0→k1 setup uses the
+> now-working tensorize-Split** (`Split(load_leaf, factors=(16,128),
+> target_axis="d1")` → width-128 load matching the matmul's d1). Skip the
+> reference text below; it predates the full fix.
+
+**Files:**
+- Modify: `nkigym/src/nkigym/ir/tree.py` (`BlockNode` gains `axis_map` field)
+- Modify: `nkigym/src/nkigym/ir/canonical_build.py` (`_build_subblock` populates it)
+- Modify: `nkigym/src/nkigym/transforms/split.py`, `fuse.py`, `_code_motion.py` (carry `axis_map` through `BlockNode` rebuilds; fix `_current_tensorize_width` to map concrete→abstract)
+- Test: `test/transforms/test_split.py`, `test/ir/test_node_labels.py`
+
+**Why (discovered during Task 6):** `Split`'s tensorize flavor is dead. `Split.analyze` walks `block.iter_vars` whose `.axis` is the CONCRETE dim (`d1`), and passes it to `_current_tensorize_width`, which checks membership in `OPERAND_AXES` keyed by ABSTRACT op-axis names (`P`/`F`/`K`/`M`/`N`). `"d1" not in ("P","F")` is always true → returns None → zero tensorize options. `_check_legality` has the mirror conflict: its iter-var check wants concrete (`d1`), `_current_tensorize_width` wants abstract (`F`) — no single `target_axis` value satisfies both. Verified live: `_current_tensorize_width(load_leaf, "d1")` → None; `Split.analyze` emits 0 tensorize options on the load. This blocks Task 6's k1→k2 setup (reproducing k1 = tensorize-Split the load's d1 from width-2048 to 16×128). It is a PRE-EXISTING bug (shipped Split; no test caught it because every Split test uses the outer-trip flavor `target_axis=None`).
+
+**Fix:** persist the op's `axis_map` (abstract→concrete, a per-block bijection — verified: matmul block = `{K:d0, M:d1, N:d2}`) on `BlockNode`. `canonical_build` already computes it as `rec.axis_map` and discards it. Tensorize-Split then inverts `block.axis_map` to translate the concrete `target_axis` (`d1`) to the abstract op-axis (`F`) for the `OPERAND_AXES` lookup. `SplitOption.target_axis` stays CONCRETE, consistent with `iter_var.axis` everywhere. Invariance: no transform renames a concrete dim, so `axis_map` is set once at build and carried unchanged through every `BlockNode` rebuild.
+
+- [ ] **Step 1: Write the failing test (Split.analyze offers a tensorize option on the load)**
+
+Add to `test/transforms/test_split.py`:
+
+```python
+def test_split_analyze_offers_tensorize_on_load():
+    """Split.analyze must offer a tensorize-flavor (target_axis set) option on the load leaf,
+    whose d1 free-axis tile is width-2048 and factorizable to 16x128. Regression: the
+    concrete(d1)-vs-abstract(F) axis-name mismatch made _current_tensorize_width return None."""
+    from test.transforms._fixtures import build_canonical_ir
+
+    from nkigym.ir.tree import ISANode
+    from nkigym.transforms import Split
+
+    ir = build_canonical_ir()
+    load_leaf = next(
+        n for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKILoad"
+    )
+    tensorize_opts = [o for o in Split().analyze(ir) if o.target_nid == load_leaf and o.target_axis is not None]
+    assert tensorize_opts, "Split.analyze offered no tensorize option on the load leaf"
+    """The d1 (concrete) free axis has width 2048 → factorizations include (16, 128)."""
+    assert any(o.factors == (16, 128) for o in tensorize_opts), [o.factors for o in tensorize_opts]
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `source ~/venvs/kernel-env/bin/activate && python -m pytest test/transforms/test_split.py::test_split_analyze_offers_tensorize_on_load -v`
+Expected: FAIL — `assert tensorize_opts` (empty list; the bug).
+
+- [ ] **Step 3: Add `axis_map` to `BlockNode`**
+
+In `nkigym/src/nkigym/ir/tree.py`, add a field to the `BlockNode` dataclass (after `annotations`, before its `label`):
+
+```python
+    axis_map: dict[str, str] = field(default_factory=dict)
+    """Abstract op-axis (``P``/``F``/``K``/``M``/``N``) → concrete dim
+    (``d0``/``d1``...). The per-block bijection between an op's
+    ``OPERAND_AXES`` names and the block's concrete iter_var axes. Set once
+    at canonical build (from the op record) and carried unchanged through
+    every transform (no transform renames a concrete dim). Lets the
+    tensorize-Split path translate a concrete ``target_axis`` to the
+    abstract name ``OPERAND_AXES`` is keyed by. Empty for the synthetic
+    root block and hand-built blocks with no operand axes."""
+```
+
+(`field` and `dict` are already imported in `tree.py`.) Update `BlockNode`'s docstring `Attributes:` to mention `axis_map`. NOTE: do NOT add `axis_map` to `BlockNode.label()` output unless a `test_node_labels.py` test expects it — keep label output unchanged to avoid churn; if a label test breaks, it shouldn't (new field isn't rendered).
+
+- [ ] **Step 4: Populate it in `canonical_build._build_subblock`**
+
+In `nkigym/src/nkigym/ir/canonical_build.py`, `_build_subblock` (the `BlockNode(...)` construction around line 76) — add `axis_map=dict(rec.axis_map)`:
+
+```python
+    block = BlockNode(
+        iter_vars=tuple(iter_vars),
+        iter_values=tuple(iter_values),
+        reads=tuple(reads),
+        writes=tuple(writes),
+        alloc_buffers=(),
+        axis_map=dict(rec.axis_map),
+    )
+```
+
+- [ ] **Step 5: Carry `axis_map` through every BlockNode rebuild**
+
+Every other site that constructs a `BlockNode` from an existing one must pass `axis_map=block.axis_map` (the map is invariant). Find them: `grep -rn "BlockNode(" nkigym/src/nkigym/transforms/`. Sites:
+- `split.py` `_do_outer_trip` and `_do_tensorize` — both build a `new_block = BlockNode(...)`; add `axis_map=block.axis_map`.
+- `fuse.py` `_do_outer_trip` and `_do_tensorize` — same; add `axis_map=block.axis_map`.
+- `_code_motion.py` `_rebind_block` — the `new_block = BlockNode(...)`; add `axis_map=block.axis_map`.
+- `reorder.py` — only swaps ForNode payloads, does NOT rebuild the BlockNode, so no change (verify with grep).
+
+- [ ] **Step 6: Fix `_current_tensorize_width` + `_check_legality` to map concrete→abstract**
+
+In `split.py`, `_current_tensorize_width(leaf, abstract_axis)` currently treats its axis arg as the abstract name. Change the call sites to translate first. The cleanest: give `_current_tensorize_width` the enclosing block and translate inside. Replace its signature/body:
+
+```python
+def _current_tensorize_width(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int | None:
+    """Tile width currently on the leaf for the operand axis matching ``concrete_axis``.
+
+    ``concrete_axis`` is a block iter_var dim (e.g. ``d1``); translate it to
+    the abstract op-axis name (e.g. ``F``) via ``block.axis_map`` before
+    looking it up in ``OPERAND_AXES`` (which is keyed by abstract names).
+    """
+    inverse = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+    abstract = inverse.get(concrete_axis)
+    width: int | None = None
+    if abstract is not None:
+        op_cls = leaf.op_cls
+        for slot, axes in op_cls.OPERAND_AXES.items():
+            if abstract not in axes or slot not in leaf.operand_bindings:
+                continue
+            region = leaf.operand_bindings[slot]
+            axis_index = axes.index(abstract)
+            if axis_index < len(region.ranges):
+                _lo, hi = region.ranges[axis_index]
+                if isinstance(hi, Const):
+                    width = hi.value
+                    break
+    return width
+```
+
+Update both call sites in `split.py`:
+- `analyze` (line ~54): it already has `block` from `_find_enclosing_block`. Change `current = _current_tensorize_width(data, abstract)` to `current = _current_tensorize_width(data, block, iv.axis)` (pass the block + concrete `iv.axis`). The loop variable `abstract = iv.axis` is misleading — rename to `concrete = iv.axis` for clarity, and emit `SplitOption(..., target_axis=concrete)`.
+- `_check_legality` (line ~96): it has `block` from `_find_enclosing_block`. Change `current = _current_tensorize_width(target, option.target_axis)` to `current = _current_tensorize_width(target, block, option.target_axis)`.
+
+The iter-var existence check in `_check_legality` (`if not any(iv.axis == option.target_axis ...)`) stays as-is — it correctly wants the concrete name.
+
+`_do_tensorize`'s `_shrink_region` already matches on Const width (not axis name), so it needs NO change — confirm by reading it. `_existing_binding_loop_var(block, option.target_axis)` is called with the concrete axis; confirm it matches against `iv.axis` (concrete) — it does, so it's fine.
+
+- [ ] **Step 7: Run the analyze test + a tensorize-apply test**
+
+First the analyze test from Step 1 → PASS. Then add a behavioral test to `test/transforms/test_split.py`:
+
+```python
+def test_split_tensorize_load_d1_to_16x128(tmp_path):
+    """Tensorize-Split the load's d1 free-axis tile 2048 -> (16, 128): the load gains a
+    16-trip inner loop and its dst tile shrinks to 128 (this is the k0->k1 setup)."""
+    import importlib.util
+
+    import numpy as np
+
+    from test.transforms._fixtures import build_canonical_ir, INPUT_SPECS
+
+    from nkigym.codegen import render
+    from nkigym.ir.tree import ForNode, ISANode
+    from nkigym.synthesis.simulate_nki import simulate_fp32
+    from nkigym.transforms import Split, SplitOption
+
+    ir = build_canonical_ir()
+    load_leaf = next(
+        n for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKILoad"
+    )
+    new_ir = Split().apply(ir, SplitOption(target_nid=load_leaf, factors=(16, 128), target_axis="d1"))
+    """The load leaf's dst d1 tile is now width 128 (was 2048)."""
+    new_leaf = next(
+        n for n in new_ir.tree.preorder()
+        if isinstance(new_ir.tree.data(n), ISANode) and new_ir.tree.data(n).op_cls.__name__ == "NKILoad"
+    )
+    dst = new_ir.tree.data(new_leaf).operand_bindings["dst"]
+    from nkigym.ir.expr import Const
+    assert any(isinstance(w, Const) and w.value == 128 for _lo, w in dst.ranges), dst.ranges
+    """Renders + sims correctly."""
+    src = render(new_ir)
+    kernel_path = tmp_path / "kernel.py"
+    kernel_path.write_text(src)
+    rng = np.random.default_rng(0)
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dt) in INPUT_SPECS.items()}
+    expected = inputs["lhs_T"].T @ inputs["rhs"]
+    spec = importlib.util.spec_from_file_location("k", kernel_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+```
+
+- [ ] **Step 8: Run both new tests + full suite**
+
+Run: `source ~/venvs/kernel-env/bin/activate && python -m pytest test/transforms/test_split.py -v && python -m pytest test/ -q`
+Expected: PASS. The tensorize-apply test renders + sims correctly. If the numerics fail, STOP and report (the tensorize Split's region/loop rewrite is wrong) — do not loosen tolerance.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add nkigym/src/nkigym/ir/tree.py nkigym/src/nkigym/ir/canonical_build.py nkigym/src/nkigym/transforms/split.py nkigym/src/nkigym/transforms/fuse.py nkigym/src/nkigym/transforms/_code_motion.py test/transforms/test_split.py
+git commit -m "Persist BlockNode.axis_map; fix Split tensorize concrete-vs-abstract axis bug
+
+Split.analyze passed the concrete iter-var axis (d1) to _current_tensorize_width,
+which keys OPERAND_AXES by abstract names (P/F/K/M/N), so tensorize-Split was
+dead (zero options, no test caught it — all Split tests use the outer-trip
+flavor). Persist the op's axis_map (abstract->concrete bijection) on BlockNode
+(canonical_build already computed it as rec.axis_map); tensorize-Split inverts
+it to translate the concrete target_axis to the abstract op-axis. target_axis
+stays concrete. axis_map carried unchanged through every BlockNode rebuild."
+```
+
+## Scope
+Touch the 6 files listed. Do NOT touch the unrelated dirty files. If a `test_node_labels.py` test asserts exact `BlockNode.label()` output and the new field changes it, that's unexpected (label doesn't render axis_map) — but if so, update that one assertion and note it.
+
+---
+
 ## Task 6: `ComputeAt` — new transform (sink a producer)
 
 **Files:**
@@ -831,16 +1035,31 @@ def _block_for_op(ir, op_name):
     raise AssertionError(op_name)
 
 
-def _matmul_d1_loop(ir, matmul):
-    loops = [d for d in ir.tree.preorder(matmul) if isinstance(ir.tree.data(d), ForNode)]
-    return loops[1]  # d0, d1, ...
+def _matmul_loop(ir, matmul, concrete):
+    """The ForNode under the matmul block binding the given concrete dim (d0/d1/d2)."""
+    return next(
+        d for d in ir.tree.preorder(matmul)
+        if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == f"i_{concrete}_0"
+    )
 
 
 def test_compute_at_sinks_load_and_renders(tmp_path):
+    """k0->k1->k2: tensorize-Split the load's d1 to 16x128 (k0->k1, full coverage with the
+    matmul's d1), THEN ComputeAt the load under the matmul's d1 loop (k1->k2). Renders to
+    numerically-correct NKI with the load collapsed inside the matmul's (d0,d1) nest."""
+    from nkigym.transforms import Split, SplitOption
+
     ir = build_canonical_ir()
-    load = _block_for_op(ir, "NKILoad")  # lhs_T
+    load_leaf = next(
+        n for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKILoad"
+    )
+    """k0->k1: split the load's d1 free-axis tile 2048 -> (16, 128) so it matches the matmul's d1 (trip 16)."""
+    ir = Split().apply(ir, SplitOption(target_nid=load_leaf, factors=(16, 128), target_axis="d1"))
+
+    load = _block_for_op(ir, "NKILoad")  # lhs_T, now with a 16-trip d1 nest
     matmul = _block_for_op(ir, "NKIMatmul")
-    d1 = _matmul_d1_loop(ir, matmul)
+    d1 = _matmul_loop(ir, matmul, "d1")
     new_ir = ComputeAt().apply(ir, ComputeAtOption(block_nid=load, target_loop_nid=d1))
     assert load in new_ir.tree.descendants(d1)
     src = render(new_ir)
@@ -856,15 +1075,37 @@ def test_compute_at_sinks_load_and_renders(tmp_path):
     np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
+def test_compute_at_rejects_partial_coverage():
+    """Sinking the RAW canonical load (d1 trip-1, width-2048) under the matmul's d1 loop
+    (trip-16) is partial coverage — rejected with Split-first guidance. (The full-coverage
+    check is merged into ComputeAt._check_legality; see Step 3.)"""
+    ir = build_canonical_ir()
+    load = _block_for_op(ir, "NKILoad")
+    matmul = _block_for_op(ir, "NKIMatmul")
+    d1 = _matmul_loop(ir, matmul, "d1")
+    with pytest.raises(TransformLegalityError, match="coverage|Split"):
+        ComputeAt().apply(ir, ComputeAtOption(block_nid=load, target_loop_nid=d1))
+
+
 def test_compute_at_rejects_sinking_the_store():
     """Condition 4: the kernel's output store has no consumer; sinking it is illegal."""
     ir = build_canonical_ir()
     store = _block_for_op(ir, "NKIStore")
     matmul = _block_for_op(ir, "NKIMatmul")
-    d1 = _matmul_d1_loop(ir, matmul)
-    with pytest.raises(TransformLegalityError, match="output|return"):
+    d1 = _matmul_loop(ir, matmul, "d1")
+    with pytest.raises(TransformLegalityError, match="output|return|coverage|Split"):
         ComputeAt().apply(ir, ComputeAtOption(block_nid=store, target_loop_nid=d1))
 ```
+
+> **Task 6 absorbs the full-coverage check (formerly Task 6.5).** Because
+> `test_compute_at_rejects_partial_coverage` requires it, implement
+> `check_full_coverage` (see Task 6.5 below for its code) in
+> `_code_motion.py` AND call it in `ComputeAt._check_legality` (and
+> `ReverseComputeAt._check_legality`) as part of THIS task. Task 6.5's
+> code block is the reference; Task 6 and 6.5 may be done as one commit.
+> Note: the store-rejection test now also accepts a coverage error in its
+> `match`, since the raw store (trip-1) under the matmul d1 (trip-16) is
+> also partial coverage — whichever check fires first is fine.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -1032,7 +1273,12 @@ the matmul d1-loop (k1->k2), renders to numerically-correct NKI."
 
 ---
 
-## Task 6.5: Full-coverage legality check (spec Part B step 2)
+## Task 6.5: Full-coverage legality check (REFERENCE — implement as part of Task 6)
+
+> **Absorbed into Task 6** (its `test_compute_at_rejects_partial_coverage`
+> needs the check). This section is the reference code for
+> `check_full_coverage`; implement it together with Task 6, in the same or
+> an adjacent commit. Not a separate sequential step.
 
 **Files:**
 - Modify: `nkigym/src/nkigym/transforms/_code_motion.py` (add `check_full_coverage`)
@@ -1166,30 +1412,57 @@ guidance. Both directions call it in _check_legality."
 
 The motivating composite: lift tensor_copy + sink memset under the matmul's `(M,N)`, then assert `psum_prod` descended into the matmul block's `alloc_buffers` AND compacted to one tile, with correct numerics.
 
+> **RISK — read before implementing Task 7.** The PSUM hoist lifts
+> tensor_copy + sinks memset under the matmul's **(M, N)** loops — i.e.
+> the target is the matmul's **M loop (`i_d1_0`)**, NOT its outermost loop
+> (which is `i_d0_0` = K). tensor_copy/memset have axes (d1=M, d2=N) and
+> no K, so they must collapse against M,N. The canonical matmul nest is
+> `d0(K) → d1(M) → d2(N)`, so the M loop is NOT outermost. Two sub-risks
+> the implementer must resolve when reaching this task (STOP + report if
+> either blocks, do not force):
+> 1. **Target the M loop by name** (`i_d1_0`), per the helper below — not
+>    `[...][0]`. The Task-5 render test mistakenly used `[0]` (= K) and
+>    only passed because last-drain-wins; that is NOT the hoist.
+> 2. **K must end up inside (M,N).** Lifting tensor_copy under the matmul's
+>    `i_d1_0` puts it after the K loop's subtree only if K is inside M. It
+>    is (`d0→d1→d2`... wait: d0=K is OUTERMOST). So a **Reorder** to make
+>    K innermost (`d1→d2→d0`) is likely required FIRST. When you reach
+>    Task 7, first check whether the canonical matmul needs a Reorder to
+>    put K inside (M,N) before the hoist is meaningful, and add that step.
+>    This is the spec's "composition with other transforms" case.
+
 - [ ] **Step 1: Write the PSUM-hoist E2E test**
 
 Add to `test/transforms/test_compute_at.py`:
 
 ```python
 def test_psum_hoist_descends_and_compacts(tmp_path):
-    """Lift tensor_copy and sink memset under the matmul's (M,N); assert psum_prod
-    descends into the matmul block and compacts, and the kernel still computes correctly."""
-    from nkigym.ir.tree import BlockNode
+    """PSUM hoist: with K innermost, lift tensor_copy + sink memset under the matmul's
+    M loop (i_d1_0); assert psum_prod descends from root into the matmul nest and the
+    kernel still computes correctly. NOTE: target the M loop by name, not the outermost
+    loop. If the canonical K-outermost nest needs a Reorder (K innermost) first for the
+    hoist to be well-formed, add it here — see the RISK note above."""
     from nkigym.transforms import ReverseComputeAt, ReverseComputeAtOption
 
     ir = build_canonical_ir()
+    """(If needed: Reorder the matmul nest so K is innermost before hoisting — resolve when implementing.)"""
     matmul = _block_for_op(ir, "NKIMatmul")
-    m_loop = [d for d in ir.tree.preorder(matmul) if isinstance(ir.tree.data(d), ForNode)][0]
-
+    m_loop = next(
+        d for d in ir.tree.preorder(matmul)
+        if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == "i_d1_0"
+    )
     tc = _block_for_op(ir, "NKITensorCopy")
     ir = ReverseComputeAt().apply(ir, ReverseComputeAtOption(block_nid=tc, target_loop_nid=m_loop))
 
     memset = _block_for_op(ir, "NKIMemset")
     matmul = _block_for_op(ir, "NKIMatmul")
-    m_loop = [d for d in ir.tree.preorder(matmul) if isinstance(ir.tree.data(d), ForNode)][0]
+    m_loop = next(
+        d for d in ir.tree.preorder(matmul)
+        if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == "i_d1_0"
+    )
     ir = ComputeAt().apply(ir, ComputeAtOption(block_nid=memset, target_loop_nid=m_loop))
 
-    """psum_prod now declared on a block at or below the matmul's M loop (descended from root)."""
+    """psum_prod now declared on a block below root (descended into the matmul nest)."""
     decl = None
     for nid in ir.tree.blocks():
         blk = ir.tree.data(nid)

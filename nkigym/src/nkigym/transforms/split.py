@@ -8,9 +8,11 @@ from math import prod
 
 from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.expr import Const, Expr, Var, from_affine, substitute
-from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
+from nkigym.ir.expr import Const, Expr
+from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
+from nkigym.transforms._normalize import normalize_block
+from nkigym.transforms._tile_region import retile_region
+from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 _MAX_SPLIT_PARTS = 3
@@ -25,8 +27,10 @@ class SplitOption(TransformOption):
             :class:`ForNode` (outer-trip flavour) or an :class:`ISANode`
             (tensorize flavour).
         factors: Replacement factors, outermost-first. ``len >= 2``.
-        target_axis: ``None`` for outer-trip flavour. The abstract iter_var
-            axis name (e.g. ``"M"``) for tensorize flavour.
+        target_axis: ``None`` for outer-trip flavour. The concrete iter_var
+            axis name (e.g. ``"d1"``) for tensorize flavour; matches
+            ``IterVar.axis``. Translated to the abstract op-axis via the
+            enclosing block's ``axis_map`` for the ``OPERAND_AXES`` lookup.
     """
 
     target_nid: int
@@ -48,14 +52,13 @@ class Split(Transform):
                 """Tensorize flavour: walk the enclosing block's iter_vars."""
                 block_nid, block = _find_enclosing_block(ir.tree, nid)
                 for iv in block.iter_vars:
-                    abstract = iv.axis
-                    extent = iv.dom[1] - iv.dom[0]
+                    concrete = iv.axis
                     """Tile width currently bound on the leaf (max_tile or full extent)."""
-                    current = _current_tensorize_width(data, abstract)
+                    current = _current_tensorize_width(data, block, concrete)
                     if current is None or current < 2:
                         continue
                     for factors in _factorizations(current):
-                        options.append(SplitOption(target_nid=nid, factors=factors, target_axis=abstract))
+                        options.append(SplitOption(target_nid=nid, factors=factors, target_axis=concrete))
         return options
 
     def apply(self, ir: KernelIR, option: SplitOption) -> KernelIR:
@@ -93,7 +96,7 @@ class Split(Transform):
                 raise TransformLegalityError(
                     f"Split.target_axis={option.target_axis!r} not declared by enclosing block"
                 )
-            current = _current_tensorize_width(target, option.target_axis)
+            current = _current_tensorize_width(target, block, option.target_axis)
             if current is None:
                 raise TransformLegalityError(
                     f"Split.target_axis={option.target_axis!r}: no tensorize width on this leaf"
@@ -104,59 +107,35 @@ class Split(Transform):
                 )
 
     def _do_outer_trip(self, ir: KernelIR, option: SplitOption) -> None:
-        """Outer-trip Split: replace the target ForNode with a chain of new ForNodes; rewrite iter_values."""
+        """Outer-trip Split: replace the target ForNode with a chain of factor ForNodes.
+
+        Only the loop topology changes (the access tile width is unchanged);
+        :func:`normalize_block` then assigns dense names and rebuilds the
+        iter_values + region offsets from the new loop structure.
+        """
         target_nid = option.target_nid
         target = ir.tree.data(target_nid)
         assert isinstance(target, ForNode)
         parent_nid = ir.tree.parent(target_nid)
         assert parent_nid is not None
         original_children = ir.tree.children(target_nid)
+        block_nid, _block = _find_enclosing_block(ir.tree, target_nid)
 
-        block_nid, block = _find_enclosing_block(ir.tree, target_nid)
-
-        new_loop_vars = [f"{target.loop_var}_{i}" for i in range(len(option.factors))]
-        new_top_nid: int | None = None
-        prev_nid: int | None = None
-        for loop_var, extent in zip(new_loop_vars, option.factors):
-            new_nid = ir.tree.add_node(ForNode(loop_var=loop_var, extent=extent), parent=None)
-            if new_top_nid is None:
-                new_top_nid = new_nid
-            if prev_nid is not None:
-                ir.tree.graph.add_edge(prev_nid, new_nid)
-            prev_nid = new_nid
-        assert prev_nid is not None and new_top_nid is not None
+        new_top_nid, new_bottom_nid = _build_for_chain(ir.tree, target.loop_var, option.factors)
         for child_nid in original_children:
-            ir.tree.graph.add_edge(prev_nid, child_nid)
+            ir.tree.graph.add_edge(new_bottom_nid, child_nid)
         _replace_in_parent_children(ir.tree, parent_nid, [target_nid], [new_top_nid])
         ir.tree.graph.remove_node(target_nid)
 
-        """Rewrite iter_values: any iter_value referencing the old loop_var becomes the affine sum."""
-        new_value = _affine_split(new_loop_vars, option.factors)
-        substitution = {target.loop_var: new_value}
-        new_iter_values = tuple(substitute(value, substitution) for value in block.iter_values)
-        new_block = BlockNode(
-            iter_vars=block.iter_vars,
-            iter_values=new_iter_values,
-            reads=tuple(_substitute_region(r, substitution) for r in block.reads),
-            writes=tuple(_substitute_region(w, substitution) for w in block.writes),
-            alloc_buffers=block.alloc_buffers,
-            annotations=dict(block.annotations),
-        )
-        ir.tree.graph.nodes[block_nid]["data"] = new_block
-
-        """Also update all descendant ISANodes' operand_bindings within this block's scope."""
-        for desc_nid in _block_local_descendants(ir.tree, block_nid):
-            desc_data = ir.tree.data(desc_nid)
-            if isinstance(desc_data, ISANode):
-                new_bindings = {
-                    slot: _substitute_region(region, substitution)
-                    for slot, region in desc_data.operand_bindings.items()
-                }
-                new_isa = ISANode(op_cls=desc_data.op_cls, operand_bindings=new_bindings, kwargs=dict(desc_data.kwargs))
-                ir.tree.graph.nodes[desc_nid]["data"] = new_isa
+        normalize_block(ir.tree, block_nid)
 
     def _do_tensorize(self, ir: KernelIR, option: SplitOption) -> None:
-        """Tensorize Split: insert ForNodes above the leaf, shrink leaf operand bindings."""
+        """Tensorize Split: insert ``factors[:-1]`` loops above the leaf, set the access width.
+
+        The new loops carry temporary names and the affected-axis access
+        width is set to ``factors[-1]``; :func:`normalize_block` then assigns
+        dense names and recomputes the region offsets from the loop strides.
+        """
         leaf_nid = option.target_nid
         leaf = ir.tree.data(leaf_nid)
         assert isinstance(leaf, ISANode)
@@ -164,38 +143,50 @@ class Split(Transform):
         assert parent_nid is not None
         block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
 
-        """Choose a base loop_var name from the existing iter_value if it's a Var, else from axis."""
-        base_loop_var = _existing_binding_loop_var(block, option.target_axis) or f"i_{option.target_axis}"
-        new_loop_vars = [f"{base_loop_var}_{i}" for i in range(len(option.factors) - 1)]
-
+        base_loop_var = f"i_{option.target_axis}"
         ir.tree.graph.remove_edge(parent_nid, leaf_nid)
         prev_nid = parent_nid
-        for loop_var, extent in zip(new_loop_vars, option.factors[:-1]):
-            new_nid = ir.tree.add_node(ForNode(loop_var=loop_var, extent=extent), parent=prev_nid)
+        for i, extent in enumerate(option.factors[:-1]):
+            new_nid = ir.tree.add_node(ForNode(loop_var=f"{base_loop_var}__tmp{i}", extent=extent), parent=prev_nid)
             prev_nid = new_nid
         ir.tree.graph.add_edge(prev_nid, leaf_nid)
 
-        """Shrink the leaf's operand_bindings on target_axis: the new tile width is option.factors[-1]."""
+        inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+        abstract_axis = inverse_axis_map.get(option.target_axis)
+        new_width = option.factors[-1]
+
+        def _set_width(lo: Expr, _width: int) -> tuple[Expr, int]:
+            """Keep the offset (normalize recomputes it); set the new tile width."""
+            return lo, new_width
+
         new_bindings = {
-            slot: _shrink_region(region, option.target_axis, option.factors[-1])
+            slot: retile_region(region, leaf.op_cls.OPERAND_AXES[slot], abstract_axis, _set_width)
             for slot, region in leaf.operand_bindings.items()
         }
-        new_leaf = ISANode(op_cls=leaf.op_cls, operand_bindings=new_bindings, kwargs=dict(leaf.kwargs))
-        ir.tree.graph.nodes[leaf_nid]["data"] = new_leaf
+        ir.tree.graph.nodes[leaf_nid]["data"] = ISANode(
+            op_cls=leaf.op_cls, operand_bindings=new_bindings, kwargs=dict(leaf.kwargs)
+        )
 
-        """Rewrite iter_values for the affected iter_var: existing binding -> affine sum that includes
-        the new outer loop_vars."""
-        new_value_factor = _affine_split([*new_loop_vars, base_loop_var], option.factors)
-        new_iter_values = tuple(substitute(value, {base_loop_var: new_value_factor}) for value in block.iter_values)
+        """Block reads/writes are keyed by tensor name, not slot; map tensor->axes via the leaf
+        so each region uses its own operand's axes. A region whose tensor is not an operand
+        gets () axes -> no-op."""
+        tensor_to_axes = {leaf.operand_bindings[s].tensor: leaf.op_cls.OPERAND_AXES[s] for s in leaf.operand_bindings}
         new_block = BlockNode(
             iter_vars=block.iter_vars,
-            iter_values=new_iter_values,
-            reads=tuple(_substitute_region(r, {base_loop_var: new_value_factor}) for r in block.reads),
-            writes=tuple(_substitute_region(w, {base_loop_var: new_value_factor}) for w in block.writes),
+            iter_values=block.iter_values,
+            reads=tuple(
+                retile_region(r, tensor_to_axes.get(r.tensor, ()), abstract_axis, _set_width) for r in block.reads
+            ),
+            writes=tuple(
+                retile_region(w, tensor_to_axes.get(w.tensor, ()), abstract_axis, _set_width) for w in block.writes
+            ),
             alloc_buffers=block.alloc_buffers,
             annotations=dict(block.annotations),
+            axis_map=block.axis_map,
         )
         ir.tree.graph.nodes[block_nid]["data"] = new_block
+
+        normalize_block(ir.tree, block_nid)
 
 
 def _resolve(tree: KernelTree, nid: int):
@@ -213,59 +204,48 @@ def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
     raise TransformLegalityError(f"no enclosing BlockNode for nid {nid}")
 
 
-def _existing_binding_loop_var(block: BlockNode, axis: str) -> str | None:
-    """Return the loop_var name on the iter_value for ``axis``, if it is a bare Var; else None."""
-    for iv, value in zip(block.iter_vars, block.iter_values):
-        if iv.axis == axis and isinstance(value, Var):
-            return value.name
-    return None
+def _build_for_chain(tree: KernelTree, stem_loop_var: str, factors: tuple[int, ...]) -> tuple[int, int]:
+    """Add a detached chain of ``len(factors)`` ForNodes; return ``(top_nid, bottom_nid)``.
+
+    The loop vars carry temporary names derived from ``stem_loop_var``;
+    :func:`normalize_block` renames them dense once the chain is spliced in.
+    """
+    top_nid: int | None = None
+    prev_nid: int | None = None
+    for i, extent in enumerate(factors):
+        new_nid = tree.add_node(ForNode(loop_var=f"{stem_loop_var}__tmp{i}", extent=extent), parent=None)
+        if top_nid is None:
+            top_nid = new_nid
+        if prev_nid is not None:
+            tree.graph.add_edge(prev_nid, new_nid)
+        prev_nid = new_nid
+    assert top_nid is not None and prev_nid is not None
+    return top_nid, prev_nid
 
 
-def _current_tensorize_width(leaf: ISANode, abstract_axis: str) -> int | None:
-    """Look up the tile width for ``abstract_axis`` on the first operand whose OPERAND_AXES contains it."""
-    op_cls = leaf.op_cls
-    for slot, axes in op_cls.OPERAND_AXES.items():
-        if abstract_axis not in axes:
-            continue
-        if slot not in leaf.operand_bindings:
-            continue
-        region = leaf.operand_bindings[slot]
-        axis_index = axes.index(abstract_axis)
-        if axis_index >= len(region.ranges):
-            continue
-        _lo, hi = region.ranges[axis_index]
-        if isinstance(hi, Const):
-            return hi.value
-    return None
+def _current_tensorize_width(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int | None:
+    """Tile width currently on the leaf for the operand axis matching ``concrete_axis``.
 
-
-def _affine_split(loop_vars: list[str], factors: tuple[int, ...]) -> Expr:
-    """Build the affine binding ``v_0 * (f_1*f_2*...) + v_1 * (f_2*...) + ... + v_{n-1}``."""
-    coeffs: dict[str | None, int] = {}
-    for i, name in enumerate(loop_vars):
-        stride = prod(factors[i + 1 :]) if i + 1 < len(factors) else 1
-        coeffs[name] = stride
-    return from_affine(coeffs)
-
-
-def _substitute_region(region: BufferRegion, subs: dict[str, Expr]) -> BufferRegion:
-    """Return a copy of ``region`` with ``subs`` applied to every range bound."""
-    new_ranges = tuple((substitute(lo, subs), substitute(hi, subs)) for lo, hi in region.ranges)
-    return BufferRegion(tensor=region.tensor, ranges=new_ranges)
-
-
-def _shrink_region(region: BufferRegion, target_axis: str, new_width: int) -> BufferRegion:
-    """Replace the ``hi`` for the matching axis with Const(new_width)."""
-    """Best-effort: locate the axis by looking for a hi whose Const width matches the existing tile.
-    We can't directly map abstract axes here without OPERAND_AXES; the caller in tensorize Split
-    already validated this width is uniquely the target. For now, replace any range whose hi == old width."""
-    new_ranges: list[tuple[Expr, Expr]] = []
-    for lo, hi in region.ranges:
-        if isinstance(hi, Const):
-            new_ranges.append((lo, Const(value=new_width) if hi.value > new_width else hi))
-        else:
-            new_ranges.append((lo, hi))
-    return BufferRegion(tensor=region.tensor, ranges=tuple(new_ranges))
+    ``concrete_axis`` is a block iter_var dim (e.g. ``d1``); translate it to
+    the abstract op-axis name (e.g. ``F``) via ``block.axis_map`` before
+    looking it up in ``OPERAND_AXES`` (which is keyed by abstract names).
+    """
+    inverse = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+    abstract = inverse.get(concrete_axis)
+    width: int | None = None
+    if abstract is not None:
+        op_cls = leaf.op_cls
+        for slot, axes in op_cls.OPERAND_AXES.items():
+            if abstract not in axes or slot not in leaf.operand_bindings:
+                continue
+            region = leaf.operand_bindings[slot]
+            axis_index = axes.index(abstract)
+            if axis_index < len(region.ranges):
+                _lo, hi = region.ranges[axis_index]
+                if isinstance(hi, Const):
+                    width = hi.value
+                    break
+    return width
 
 
 def _factorizations(n: int) -> list[tuple[int, ...]]:

@@ -60,6 +60,19 @@ def _collect_buffers(tensors: dict[str, "TensorDims"], param_names: list[str]) -
     return out
 
 
+def _trip_count(rec: "_OpRecord", abstract: str, analysis: "_AnalysisResult") -> int:
+    """Number of loop trips for ``abstract`` axis of ``rec`` (extent // tile).
+
+    A trip of 1 means the single tile spans the full axis extent, so the
+    axis is loopless: it keeps its iter_var + full-width region but emits
+    no ForNode.
+    """
+    extent = analysis.dim_sizes[rec.axis_map[abstract]]
+    max_tile = rec.op_cls.MAX_TILE_SIZE.get(abstract)
+    tile = extent if max_tile is None else max_tile
+    return extent // tile
+
+
 def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysis: "_AnalysisResult") -> int:
     """Construct one :class:`BlockNode` + its loop chain + ISA leaf; return the block's nid."""
     iter_vars: list[IterVar] = []
@@ -71,7 +84,10 @@ def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysi
         iter_vars.append(IterVar(axis=concrete, dom=(0, extent), role=role))
         loop_var = f"i_{concrete}_0"
         loop_var_names[abstract] = loop_var
-        iter_values.append(Var(name=loop_var))
+        if _trip_count(rec, abstract, analysis) > 1:
+            iter_values.append(Var(name=loop_var))
+        else:
+            iter_values.append(Const(value=0))
     reads, writes = _operand_regions(rec, loop_var_names, analysis)
     block = BlockNode(
         iter_vars=tuple(iter_vars),
@@ -79,17 +95,16 @@ def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysi
         reads=tuple(reads),
         writes=tuple(writes),
         alloc_buffers=(),
+        axis_map=dict(rec.axis_map),
     )
     block_nid = tree.add_node(block, parent=parent_nid)
     parent_for_loops: int = block_nid
     for abstract, concrete in rec.axis_map.items():
-        extent = analysis.dim_sizes[concrete]
-        max_tile = rec.op_cls.MAX_TILE_SIZE.get(abstract)
-        tile = extent if max_tile is None else max_tile
-        trip = extent // tile
-        loop_var = loop_var_names[abstract]
-        for_nid = tree.add_node(ForNode(loop_var=loop_var, extent=trip), parent=parent_for_loops)
-        parent_for_loops = for_nid
+        trip = _trip_count(rec, abstract, analysis)
+        if trip > 1:
+            loop_var = loop_var_names[abstract]
+            for_nid = tree.add_node(ForNode(loop_var=loop_var, extent=trip), parent=parent_for_loops)
+            parent_for_loops = for_nid
     operand_bindings = _operand_bindings(rec, loop_var_names, analysis)
     op_kwargs = {k: v for k, v in rec.kwargs.items() if k not in rec.op_cls.OPERAND_AXES}
     tree.add_node(
@@ -176,16 +191,12 @@ def _build_region(
         else:
             extent_per_tile = max_tile
         loop_var = loop_var_names.get(abstract)
+        looped = loop_var is not None and _trip_count(rec, abstract, analysis) > 1
 
         """Partition axis (axis 0) of SBUF/PSUM operands: tile is 128, lo is bare Var (not multiplied)."""
-        if (
-            axis_index == 0
-            and tensor_location in ("sbuf", "psum")
-            and extent_per_tile == PARTITION_DIM
-            and loop_var is not None
-        ):
+        if axis_index == 0 and tensor_location in ("sbuf", "psum") and extent_per_tile == PARTITION_DIM and looped:
             ranges.append((Var(name=loop_var), Const(value=PARTITION_DIM)))
-        elif loop_var is None:
+        elif not looped:
             ranges.append((Const(value=0), Const(value=extent_per_tile)))
         else:
             lo = Mul(left=Var(name=loop_var), right=Const(value=extent_per_tile))

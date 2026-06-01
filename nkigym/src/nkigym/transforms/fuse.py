@@ -8,9 +8,11 @@ from math import prod
 
 from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.expr import Const, Expr, Mul, Var, from_affine, substitute, to_affine
-from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
+from nkigym.ir.expr import Expr
+from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
+from nkigym.transforms._normalize import _dim_from_loopvar, normalize_block
+from nkigym.transforms._tile_region import retile_region
+from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
@@ -21,8 +23,9 @@ class FuseOption(TransformOption):
     Attributes:
         target_nids: Adjacent axis-chain entries to fuse, parent->child order.
             ``len >= 2``.
-        target_axis: ``None`` for outer-trip flavour. Abstract iter_var
-            axis name for tensorize flavour.
+        target_axis: ``None`` for outer-trip flavour. The concrete iter_var
+            axis name (e.g. ``"d1"``) for tensorize flavour; matches
+            ``IterVar.axis``.
     """
 
     target_nids: tuple[int, ...]
@@ -46,8 +49,8 @@ class Fuse(Transform):
                     kid_data = ir.tree.data(kids[0])
                     if not isinstance(kid_data, ForNode):
                         break
-                    """Two adjacent ForNodes are fusion candidates iff their loop_vars share a stem."""
-                    if not _same_loop_axis(data.loop_var, kid_data.loop_var):
+                    """Two adjacent ForNodes are fusion candidates iff they bind the same dim."""
+                    if _dim_from_loopvar(data.loop_var) != _dim_from_loopvar(kid_data.loop_var):
                         break
                     chain.append(kids[0])
                     cur = kids[0]
@@ -103,80 +106,40 @@ class Fuse(Transform):
                     )
 
     def _do_outer_trip(self, ir: KernelIR, option: FuseOption) -> None:
-        nids = option.target_nids
-        """Capture loop_vars and extents BEFORE removing nodes."""
-        old_loop_vars_in_order = [ir.tree.data(nid).loop_var for nid in nids]
-        old_extents_in_order = [ir.tree.data(nid).extent for nid in nids]
+        """Outer-trip Fuse: merge a parent->child chain of same-dim ForNodes into one loop.
 
+        Only the loop topology changes: the chain is replaced by a single
+        ForNode whose extent is the product of the chain extents (the access
+        tile width is unchanged). :func:`normalize_block` then assigns the
+        dense name and rebuilds the iter_values + region offsets from the new
+        loop structure.
+        """
+        nids = option.target_nids
         first = ir.tree.data(nids[0])
         assert isinstance(first, ForNode)
         parent_nid = ir.tree.parent(nids[0])
         assert parent_nid is not None
         deepest_kids = ir.tree.children(nids[-1])
-        new_extent = prod(old_extents_in_order)
-        block_nid, block = _find_enclosing_block(ir.tree, nids[0])
+        new_extent = prod(ir.tree.data(nid).extent for nid in nids)
+        block_nid, _block = _find_enclosing_block(ir.tree, nids[0])
 
-        new_loop_var = _fused_loop_var(first.loop_var)
-        new_nid = ir.tree.add_node(ForNode(loop_var=new_loop_var, extent=new_extent), parent=None)
+        new_nid = ir.tree.add_node(ForNode(loop_var=f"{first.loop_var}__fused", extent=new_extent), parent=None)
         for child_nid in deepest_kids:
             ir.tree.graph.add_edge(new_nid, child_nid)
         _replace_in_parent_children(ir.tree, parent_nid, [nids[0]], [new_nid])
         for nid in nids:
             ir.tree.graph.remove_node(nid)
 
-        """Replace iter_values that reference any old loop_var.
-
-        When fusing a chain, the iter_value that used the chain's loop_vars
-        should now bind directly to the fused loop_var. We detect which
-        iter_value to replace by checking if it contains any of the old
-        loop_vars.
-
-        For reads/writes/operand_bindings, we still need to substitute all
-        occurrences of old loop_vars with the new fused loop_var.
-        """
-        old_loop_var_set = set(old_loop_vars_in_order)
-
-        def _contains_old_var(expr: Expr) -> bool:
-            """Check if expr contains any old loop_var."""
-            affine = to_affine(expr)
-            return bool(old_loop_var_set & affine.keys())
-
-        new_iter_values = tuple(
-            Var(name=new_loop_var) if _contains_old_var(value) else value for value in block.iter_values
-        )
-
-        """For regions, substitute all old loop_vars → new_loop_var."""
-        substitutions: dict[str, Expr] = {
-            old_loop_var: Var(name=new_loop_var) for old_loop_var in old_loop_vars_in_order
-        }
-
-        new_block = BlockNode(
-            iter_vars=block.iter_vars,
-            iter_values=new_iter_values,
-            reads=tuple(_substitute_region(r, substitutions, fused_var=new_loop_var) for r in block.reads),
-            writes=tuple(_substitute_region(w, substitutions, fused_var=new_loop_var) for w in block.writes),
-            alloc_buffers=block.alloc_buffers,
-            annotations=dict(block.annotations),
-        )
-        ir.tree.graph.nodes[block_nid]["data"] = new_block
-
-        """Propagate substitutions into descendant ISANode operand_bindings within this block's scope."""
-        for desc_nid in _block_local_descendants(ir.tree, block_nid):
-            desc_data = ir.tree.data(desc_nid)
-            if isinstance(desc_data, ISANode):
-                new_bindings = {
-                    slot: _substitute_region(region, substitutions, fused_var=new_loop_var)
-                    for slot, region in desc_data.operand_bindings.items()
-                }
-                new_isa = ISANode(op_cls=desc_data.op_cls, operand_bindings=new_bindings, kwargs=dict(desc_data.kwargs))
-                ir.tree.graph.nodes[desc_nid]["data"] = new_isa
+        normalize_block(ir.tree, block_nid)
 
     def _do_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
-        """Tensorize Fuse: absorb a chain of same-axis ForNodes above an ISA leaf into the leaf's tile width.
+        """Tensorize Fuse: absorb a chain of same-axis ForNodes above an ISA leaf into the tile width.
 
-        ``option.target_nids[-1]`` is the ISA leaf; the prefix is the
-        ForNode chain to absorb. The leaf's operand_bindings on
-        ``target_axis`` widen by the product of the absorbed extents.
+        ``option.target_nids[-1]`` is the ISA leaf; the prefix is the ForNode
+        chain to absorb. The chain is removed and the affected-axis access
+        width grows by the product of the absorbed extents;
+        :func:`normalize_block` then drops any now-trip-1 loops, re-densifies
+        names, and recomputes the region offsets from the surviving loops.
         """
         leaf_nid = option.target_nids[-1]
         leaf = ir.tree.data(leaf_nid)
@@ -188,128 +151,51 @@ class Fuse(Transform):
         block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
 
         absorbed_extent = prod(ir.tree.data(nid).extent for nid in for_chain)
-        absorbed_loop_vars = [ir.tree.data(nid).loop_var for nid in for_chain]
         for nid in for_chain:
             ir.tree.graph.remove_node(nid)
         ir.tree.graph.add_edge(chain_root_parent, leaf_nid)
 
+        inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+        abstract_axis = inverse_axis_map.get(option.target_axis)
+
+        def _widen(lo: Expr, width: int) -> tuple[Expr, int]:
+            """Keep the offset (normalize recomputes it); grow the tile width."""
+            return lo, width * absorbed_extent
+
         new_bindings = {
-            slot: _widen_region_axis(region, leaf.op_cls, slot, option.target_axis, absorbed_extent)
+            slot: retile_region(region, leaf.op_cls.OPERAND_AXES[slot], abstract_axis, _widen)
             for slot, region in leaf.operand_bindings.items()
         }
-        new_leaf = ISANode(op_cls=leaf.op_cls, operand_bindings=new_bindings, kwargs=dict(leaf.kwargs))
-        ir.tree.graph.nodes[leaf_nid]["data"] = new_leaf
+        ir.tree.graph.nodes[leaf_nid]["data"] = ISANode(
+            op_cls=leaf.op_cls, operand_bindings=new_bindings, kwargs=dict(leaf.kwargs)
+        )
 
-        """Drop absorbed loop_vars from the block's iter_values by substituting Const(0) for each."""
-        substitutions: dict[str, Expr] = {lv: Const(value=0) for lv in absorbed_loop_vars}
-        new_iter_values = tuple(substitute(value, substitutions) for value in block.iter_values)
+        """Block reads/writes are keyed by tensor name, not slot; map tensor->axes via the leaf
+        so each region uses its own operand's axes (matmul stationary lacks N -> no-op)."""
+        tensor_to_axes = {leaf.operand_bindings[s].tensor: leaf.op_cls.OPERAND_AXES[s] for s in leaf.operand_bindings}
         new_block = BlockNode(
             iter_vars=block.iter_vars,
-            iter_values=new_iter_values,
-            reads=tuple(_substitute_region(r, substitutions) for r in block.reads),
-            writes=tuple(_substitute_region(w, substitutions) for w in block.writes),
+            iter_values=block.iter_values,
+            reads=tuple(retile_region(r, tensor_to_axes.get(r.tensor, ()), abstract_axis, _widen) for r in block.reads),
+            writes=tuple(
+                retile_region(w, tensor_to_axes.get(w.tensor, ()), abstract_axis, _widen) for w in block.writes
+            ),
             alloc_buffers=block.alloc_buffers,
             annotations=dict(block.annotations),
+            axis_map=block.axis_map,
         )
         ir.tree.graph.nodes[block_nid]["data"] = new_block
 
-        """Propagate substitutions into descendant ISANode operand_bindings within this block's scope."""
-        for desc_nid in _block_local_descendants(ir.tree, block_nid):
-            desc_data = ir.tree.data(desc_nid)
-            if isinstance(desc_data, ISANode):
-                new_bindings_desc = {
-                    slot: _substitute_region(region, substitutions)
-                    for slot, region in desc_data.operand_bindings.items()
-                }
-                new_isa_desc = ISANode(
-                    op_cls=desc_data.op_cls, operand_bindings=new_bindings_desc, kwargs=dict(desc_data.kwargs)
-                )
-                ir.tree.graph.nodes[desc_nid]["data"] = new_isa_desc
-
-
-def _widen_region_axis(region: BufferRegion, op_cls, slot: str, target_axis: str, new_width: int) -> BufferRegion:
-    """Widen the slice for ``target_axis`` on ``region`` to ``new_width`` if the slot's axes contain it."""
-    axes = op_cls.OPERAND_AXES.get(slot)
-    if axes is None or target_axis not in axes:
-        return region
-    axis_index = axes.index(target_axis)
-    if axis_index >= len(region.ranges):
-        return region
-    new_ranges: list[tuple[Expr, Expr]] = []
-    for i, (lo, hi) in enumerate(region.ranges):
-        if i == axis_index:
-            new_ranges.append((lo, Const(value=new_width)))
-        else:
-            new_ranges.append((lo, hi))
-    return BufferRegion(tensor=region.tensor, ranges=tuple(new_ranges))
+        normalize_block(ir.tree, block_nid)
 
 
 def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
+    """Walk ancestors of ``nid`` until we hit a BlockNode."""
     for ancestor in reversed(tree.ancestors(nid)):
         data = tree.data(ancestor)
         if isinstance(data, BlockNode):
             return ancestor, data
     raise TransformLegalityError(f"no enclosing BlockNode for nid {nid}")
-
-
-def _same_loop_axis(a: str, b: str) -> bool:
-    """Two loop_vars are 'same axis' if their split-stem matches.
-
-    For canonical loop_var ``i_<concrete>_0`` and post-Split offspring
-    ``i_<concrete>_0_0`` / ``i_<concrete>_0_1``, the stem is everything
-    before the trailing ``_<int>`` suffix.
-    """
-    return _stem(a) == _stem(b)
-
-
-def _stem(loop_var: str) -> str:
-    parts = loop_var.rsplit("_", 1)
-    if len(parts) == 2 and parts[1].isdigit():
-        return parts[0]
-    return loop_var
-
-
-def _fused_loop_var(first_loop_var: str) -> str:
-    return _stem(first_loop_var) + "_fused"
-
-
-def _substitute_region(region: BufferRegion, subs: dict[str, Expr], fused_var: str | None = None) -> BufferRegion:
-    """Substitute loop_vars in a BufferRegion.
-
-    For outer-trip Fuse, if `fused_var` is set, detect subexpressions that
-    contain the old loop_vars and replace them with `Var(fused_var)`.
-    """
-    if fused_var is not None:
-        old_loop_vars = set(subs.keys())
-
-        def _replace_if_contains_old(expr: Expr) -> Expr:
-            """If expr contains any old loop_var, replace it with Var(fused_var).
-
-            This handles the case where expr is like `(i_old_0 * 8 + i_old_1) * stride`,
-            which should become `Var(fused_var) * stride`.
-            """
-            affine = to_affine(expr)
-            if old_loop_vars & affine.keys():
-                """expr contains old loop_vars. Extract the stride if any."""
-                """Check if expr is of form `base * stride` where base contains old vars."""
-                if isinstance(expr, Mul) and isinstance(expr.right, Const):
-                    """expr = base * stride"""
-                    base_affine = to_affine(expr.left)
-                    if old_loop_vars & base_affine.keys():
-                        """base contains old vars; replace base with fused_var."""
-                        return Mul(left=Var(name=fused_var), right=expr.right)
-                """expr directly contains old vars without a constant multiplier."""
-                return Var(name=fused_var)
-            return expr
-
-        new_ranges = tuple((_replace_if_contains_old(lo), hi) for lo, hi in region.ranges)
-    else:
-        """Simple substitution + normalization."""
-        new_ranges = tuple(
-            (from_affine(to_affine(substitute(lo, subs))), from_affine(to_affine(substitute(hi, subs))))
-            for lo, hi in region.ranges
-        )
-    return BufferRegion(tensor=region.tensor, ranges=new_ranges)
 
 
 __all__ = ["Fuse", "FuseOption"]

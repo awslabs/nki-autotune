@@ -211,6 +211,7 @@ class BlockNode:
         writes: declared write regions in iter_var space.
         alloc_buffers: buffers whose lifetime is bounded by this block.
         annotations: free-form per-block metadata.
+        axis_map: abstract op-axis → concrete dim bijection (see field doc).
     """
 
     iter_vars: tuple[IterVar, ...]
@@ -219,6 +220,15 @@ class BlockNode:
     writes: tuple[BufferRegion, ...]
     alloc_buffers: tuple[Buffer, ...] = ()
     annotations: dict[str, Any] = field(default_factory=dict)
+    axis_map: dict[str, str] = field(default_factory=dict)
+    """Abstract op-axis (``P``/``F``/``K``/``M``/``N``) → concrete dim
+    (``d0``/``d1``...). The per-block bijection between an op's
+    ``OPERAND_AXES`` names and the block's concrete iter_var axes. Set once
+    at canonical build (from the op record) and carried unchanged through
+    every transform (no transform renames a concrete dim). Lets the
+    tensorize-Split path translate a concrete ``target_axis`` to the
+    abstract name ``OPERAND_AXES`` is keyed by. Empty for the synthetic
+    root block and hand-built blocks with no operand axes."""
 
     def label(self) -> str:
         """Return a multi-line summary of all six fields; empty fields show as ∅."""
