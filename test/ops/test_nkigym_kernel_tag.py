@@ -1,9 +1,9 @@
 """Tag assertion for the nkigym_kernel decorator wrapper."""
 
 import numpy as np
+import pytest
 
 from nkigym.ops import nkigym_kernel
-from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
 from nkigym.ops.store import NKIStore
 
@@ -13,10 +13,8 @@ def test_nkigym_kernel_sets_tag_on_wrapper():
 
     @nkigym_kernel
     def identity(x):
-        sbuf = NKIAlloc(location="sbuf", shape=(128, 128), dtype="bfloat16")()
-        hbm = NKIAlloc(location="shared_hbm", shape=(128, 128), dtype="bfloat16")()
-        NKILoad()(src=x, dst=sbuf)
-        NKIStore()(src=sbuf, dst=hbm)
+        sbuf = NKILoad()(src=x)
+        hbm = NKIStore()(src=sbuf)
         return hbm
 
     assert getattr(identity, "__nkigym_kernel__", False) is True
@@ -29,3 +27,14 @@ def test_plain_function_has_no_tag():
         return x
 
     assert getattr(plain, "__nkigym_kernel__", False) is False
+
+
+def test_nkigym_kernel_rejects_non_stored_non_hbm_return():
+    """The decorator rejects kernels returning an sbuf-roled array."""
+
+    @nkigym_kernel
+    def bad_return(x):
+        return NKILoad()(src=x)
+
+    with pytest.raises(TypeError, match="returned role='sbuf'"):
+        bad_return(np.ones((16, 16), dtype=np.float32))

@@ -19,6 +19,7 @@ class NKIStore(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_ROLE: ClassVar[str] = "stored"
+    OUTPUT_LOCATION: ClassVar[str] = "shared_hbm"
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` must be SBUF-resident."""
@@ -27,11 +28,9 @@ class NKIStore(NKIOp):
             raise TypeError(f"NKIStore(src=<role={role}>) expects sbuf; did you forget to stage through SBUF?")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: copy ``src`` into ``dst`` and return ``dst``."""
+        """CPU simulation: allocate and return a copy of ``src`` in HBM."""
         src: np.ndarray = kwargs["src"]
-        dst: np.ndarray = kwargs["dst"]
-        dst[...] = src
-        return dst
+        return np.array(src)
 
 
 def store_block(mem_slice: Any, sbuf: Any) -> None:

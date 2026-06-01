@@ -11,7 +11,6 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
-from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import NKIOp
 
 
@@ -25,12 +24,12 @@ class TensorDims:
         dim_ids: Concrete dim names (``d0``, ``d1`` ...).
         location: ``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``. Params resolve
             to ``"shared_hbm"`` (the role lattice forbids any other location);
-            intermediates take the location declared via
-            :class:`NKIAlloc`.
+            for intermediates it is synthesized from the producing op's
+            ``OUTPUT_LOCATION``.
         dtype: ``"float32"`` / ``"float16"`` / ``"bfloat16"``. For
-            intermediates this is the dtype declared on
-            :class:`NKIAlloc`; for params it is inferred from the
-            SBUF buffer the param is loaded into.
+            intermediates this propagates from the first input's logical
+            dtype through the trace; for params it is seeded directly from
+            the ``input_specs`` ``(shape, dtype)`` entry.
     """
 
     name: str
@@ -48,9 +47,8 @@ class _OpRecord:
         op_cls: The NKIOp subclass.
         operand_names: ``slot → tensor_name`` for every operand in the call.
         axis_map: ``abstract_axis → concrete_dim``.
-        kwargs: Non-operand call kwargs (empty for :class:`NKIAlloc` —
-            its declarative ``shape``/``location``/``dtype`` flow onto
-            :class:`TensorDims` instead).
+        kwargs: Non-operand call kwargs (e.g. ``{"value": 0.0}`` for the
+            synthesized memset, ``{"op": "exp"}`` for activation).
     """
 
     op_cls: type[NKIOp]
@@ -80,12 +78,14 @@ class _AnalysisResult:
     ops: list[_OpRecord]
 
 
-def analyze_dimensions(func: Callable[..., Any], input_specs: dict[str, tuple[int, ...]]) -> _AnalysisResult:
+def analyze_dimensions(
+    func: Callable[..., Any], input_specs: dict[str, tuple[tuple[int, ...], str]]
+) -> _AnalysisResult:
     """Trace ``func`` against sentinel inputs and run cross-op dim unification.
 
     Args:
         func: An ``@nkigym_kernel``-decorated callable to analyse.
-        input_specs: ``{param_name: shape}`` for every positional parameter.
+        input_specs: ``{param_name: (shape, dtype)}`` for every positional parameter.
     """
     unwrapped = inspect.unwrap(func)
     param_names = list(inspect.signature(unwrapped).parameters)
@@ -93,15 +93,16 @@ def analyze_dimensions(func: Callable[..., Any], input_specs: dict[str, tuple[in
         if name not in input_specs:
             raise ValueError(f"Missing input_spec for parameter: {name!r}")
 
-    state = _TraceState(alloc_names=_collect_alloc_names(unwrapped))
+    state = _TraceState(ssa_names=_collect_ssa_names(unwrapped))
     for name in param_names:
-        sym = _Sym(tuple(input_specs[name]), name)
+        shape, dtype = input_specs[name]
+        sym = _Sym(tuple(shape), name)
         sym.location = "shared_hbm"
+        sym.dtype = dtype
         state.sentinels[name] = sym
 
     _run_trace(unwrapped, [state.sentinels[n] for n in param_names], state)
     _canonicalize_dim_names(state)
-    _infer_param_dtypes(state, param_names)
 
     tensors: dict[str, TensorDims] = {}
     for sym in state.sentinels.values():
@@ -144,11 +145,11 @@ class _Sym:
 class _TraceState:
     """Mutable state threaded through the hook during tracing."""
 
-    def __init__(self, alloc_names: Iterator[str]) -> None:
+    def __init__(self, ssa_names: Iterator[str]) -> None:
         self.sentinels: dict[str, _Sym] = {}
         self.dim_sizes: dict[str, int] = {}
         self.op_records: list[_OpRecord] = []
-        self.alloc_names = alloc_names
+        self.ssa_names = ssa_names
         self.next_dim = 0
 
     def fresh_dim(self, size: int) -> str:
@@ -174,27 +175,26 @@ def _run_trace(func: Callable[..., Any], args: list[_Sym], state: _TraceState) -
 
 
 def _make_hook(state: _TraceState) -> Callable[..., Any]:
-    """Build a replacement for :meth:`NKIOp.__call__` that records into ``state``."""
+    """Build a replacement for :meth:`NKIOp.__call__` that records into ``state`` and synthesizes outputs."""
 
     def hook(op: NKIOp, **kwargs: Any) -> Any:
         merged = {**getattr(op, "_init_kwargs", {}), **kwargs}
         cls = type(op)
-        if cls is NKIAlloc:
-            name = next(state.alloc_names)
-            sym = _Sym(tuple(merged["shape"]), name)
-            sym.location = merged["location"]
-            sym.dtype = merged["dtype"]
-            state.sentinels[name] = sym
-            _trace_compute_op(cls, {"dst": sym}, state)
-            return sym
-        _trace_compute_op(cls, merged, state)
-        return merged.get("dst")
+        input_syms, record = _trace_compute_op(cls, merged, state)
+        name = next(state.ssa_names)
+        return _synthesize_outputs(cls, name, input_syms, record, state)
 
     return hook
 
 
-def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceState) -> None:
-    """Unify a compute op's operands and record an :class:`_OpRecord` entry."""
+def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceState) -> tuple[list["_Sym"], "_OpRecord"]:
+    """Unify a compute op's operands and record an :class:`_OpRecord` entry.
+
+    Returns the ordered input operand syms (``OPERAND_AXES`` order filtered
+    to ``INPUT_OPERANDS``) so the caller can synthesize the op's output(s),
+    plus the freshly-appended :class:`_OpRecord` so the caller can write the
+    synthesized output slot names back into ``record.operand_names``.
+    """
     local: dict[str, str] = {}
     operand_names: dict[str, str] = {}
     for slot, axes in cls.OPERAND_AXES.items():
@@ -213,35 +213,57 @@ def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceSta
             else:
                 local[abstract] = existing
     op_kwargs = {k: v for k, v in kwargs.items() if k not in cls.OPERAND_AXES}
-    state.op_records.append(_OpRecord(op_cls=cls, operand_names=operand_names, axis_map=local, kwargs=op_kwargs))
+    record = _OpRecord(op_cls=cls, operand_names=operand_names, axis_map=local, kwargs=op_kwargs)
+    state.op_records.append(record)
+    input_syms = [
+        kwargs[slot] for slot in cls.OPERAND_AXES if slot in cls.INPUT_OPERANDS and isinstance(kwargs.get(slot), _Sym)
+    ]
+    return input_syms, record
 
 
-def _infer_param_dtypes(state: _TraceState, param_names: list[str]) -> None:
-    """Set each param's dtype from the first non-param operand it shares an op with.
+def _synthesize_outputs(
+    cls: type[NKIOp], name: str, input_syms: list["_Sym"], record: "_OpRecord", state: _TraceState
+) -> "_Sym":
+    """Create the output sentinel(s) for an op call; return the primary (assigned) one.
 
-    Params have no ``NKIAlloc`` so their dtype isn't declared. They flow into
-    ``NKILoad`` (or ``NKIDMATranspose``) whose ``dst`` is an SBUF buffer with
-    a declared dtype — copy that dtype back onto the param sentinel.
+    Output slots = ``OPERAND_AXES`` keys not in ``INPUT_OPERANDS``. The
+    primary slot (gets ``name``, returned to thread the SSA chain) is
+    ``reduce_res`` if declared, else ``dst``. Any secondary output slot
+    (e.g. activation_reduce's scratch ``dst``) gets ``f"{name}_scratch"``.
+
+    Output dims come from the op's already-unified ``record.axis_map``,
+    filtered to the declared output axes actually present in that map: an
+    output axis the op's inputs never bound (e.g. ``F`` when ``data`` is a
+    1D ``(P,)`` reduce result) is not part of this instance's output, so a
+    ``(P,)`` input yields a ``(P,)`` output rather than ``(P, F)``. Dtype
+    propagates from the first input's logical dtype; location is
+    ``cls.OUTPUT_LOCATION``.
+
+    Each synthesized slot's tensor name is also written back into
+    ``record.operand_names`` so every op's record carries its output
+    slot(s); ``canonical_build`` reads these to emit write regions and form
+    the producer-consumer dependency chain.
     """
-    params = set(param_names)
-    for rec in state.op_records:
-        param_operands = [n for n in rec.operand_names.values() if n in params]
-        if not param_operands:
-            continue
-        donor_dtype: str | None = None
-        for name in rec.operand_names.values():
-            if name in params:
-                continue
-            sym = state.sentinels.get(name)
-            if sym is not None and sym.dtype is not None:
-                donor_dtype = sym.dtype
-                break
-        if donor_dtype is None:
-            continue
-        for param_name in param_operands:
-            sym = state.sentinels[param_name]
-            if sym.dtype is None:
-                sym.dtype = donor_dtype
+    output_slots = [slot for slot in cls.OPERAND_AXES if slot not in cls.INPUT_OPERANDS]
+    primary_slot = "reduce_res" if "reduce_res" in cls.OPERAND_AXES else "dst"
+    logical_dtype = input_syms[0].dtype if input_syms else None
+    primary_sym: _Sym | None = None
+    for slot in output_slots:
+        slot_name = name if slot == primary_slot else f"{name}_scratch"
+        axes = cls.OPERAND_AXES[slot]
+        dim_ids = [record.axis_map[a] for a in axes if a in record.axis_map]
+        shape = tuple(state.dim_sizes[d] for d in dim_ids)
+        sym = _Sym(shape, slot_name)
+        sym.dim_ids = list(dim_ids)
+        sym.location = cls.OUTPUT_LOCATION
+        sym.dtype = logical_dtype
+        state.sentinels[slot_name] = sym
+        record.operand_names[slot] = slot_name
+        if slot == primary_slot:
+            primary_sym = sym
+    if primary_sym is None:
+        raise ValueError(f"{cls.__name__}: no primary output slot {primary_slot!r} in OPERAND_AXES")
+    return primary_sym
 
 
 def _unify(old: str, new: str, state: _TraceState, local: dict[str, str]) -> None:
@@ -288,8 +310,12 @@ def _apply_rename(state: _TraceState, remap: dict[str, str]) -> None:
             rec.axis_map[abstract] = remap.get(rec.axis_map[abstract], rec.axis_map[abstract])
 
 
-def _collect_alloc_names(func: Callable[..., Any]) -> Iterator[str]:
-    """Yield the LHS of every ``var = NKIAlloc(...)()`` assignment in source order."""
+def _collect_ssa_names(func: Callable[..., Any]) -> Iterator[str]:
+    """Yield the LHS of every ``var = NKIOp()(...)`` assignment in source order.
+
+    Each straight-line op call is assigned to a name; the trace consumes
+    these in execution (= source) order to name synthesized outputs.
+    """
     source = textwrap.dedent(inspect.getsource(func))
     tree = ast.parse(source)
     func_def = tree.body[0]
@@ -299,17 +325,17 @@ def _collect_alloc_names(func: Callable[..., Any]) -> Iterator[str]:
         if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
             continue
         target = stmt.targets[0]
-        if isinstance(target, ast.Name) and _is_alloc_call(stmt.value):
+        if isinstance(target, ast.Name) and _is_op_call(stmt.value):
             yield target.id
 
 
-def _is_alloc_call(node: ast.expr) -> bool:
-    """Return True if ``node`` is an ``NKIAlloc(...)()`` double-call."""
+def _is_op_call(node: ast.expr) -> bool:
+    """Return True if ``node`` is an ``NKIXxx(...)(...)`` double-call (op invocation)."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Call)
         and isinstance(node.func.func, ast.Name)
-        and node.func.func.id == "NKIAlloc"
+        and node.func.func.id.startswith("NKI")
     )
 
 

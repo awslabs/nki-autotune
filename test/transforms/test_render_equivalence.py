@@ -28,7 +28,7 @@ def test_split_outer_trip_renders_and_passes_numerics(tmp_path):
     kernel_path = cache / "kernel.py"
     kernel_path.write_text(src)
     rng = np.random.default_rng(0)
-    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, shape in INPUT_SPECS.items()}
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in INPUT_SPECS.items()}
     expected = inputs["lhs_T"].T @ inputs["rhs"]
     spec = importlib.util.spec_from_file_location("split_kernel", kernel_path)
     module = importlib.util.module_from_spec(spec)
@@ -62,7 +62,7 @@ def test_fuse_outer_trip_renders_and_passes_numerics(tmp_path):
     kernel_path = cache / "kernel.py"
     kernel_path.write_text(src)
     rng = np.random.default_rng(0)
-    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, shape in INPUT_SPECS.items()}
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in INPUT_SPECS.items()}
     expected = inputs["lhs_T"].T @ inputs["rhs"]
     spec = importlib.util.spec_from_file_location("fuse_kernel", kernel_path)
     module = importlib.util.module_from_spec(spec)
@@ -97,7 +97,7 @@ def test_reorder_renders_and_passes_numerics(tmp_path):
     kernel_path = cache / "kernel.py"
     kernel_path.write_text(src)
     rng = np.random.default_rng(0)
-    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, shape in INPUT_SPECS.items()}
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in INPUT_SPECS.items()}
     expected = inputs["lhs_T"].T @ inputs["rhs"]
     spec = importlib.util.spec_from_file_location("reorder_kernel", kernel_path)
     module = importlib.util.module_from_spec(spec)

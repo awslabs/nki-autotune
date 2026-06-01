@@ -10,32 +10,23 @@ import pytest
 from nkigym.codegen import emit_header, emit_return
 from nkigym.ir import build_initial_ir
 from nkigym.ops import nkigym_kernel
-from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
-from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 
 K, M, N = 2048, 2048, 2048
-_INPUT_SPECS: dict[str, tuple[int, ...]] = {"lhs_T": (K, M), "rhs": (K, N)}
+_INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 
 
 @nkigym_kernel
 def _matmul_fixture(lhs_T, rhs):
-    """``lhs_T.T @ rhs`` fixture for header / return tests."""
-    sbuf_lhs_T = NKIAlloc(location="sbuf", shape=(K, M), dtype="bfloat16")()
-    sbuf_rhs = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
-    psum_acc = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
-    sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
-    hbm_out = NKIAlloc(location="shared_hbm", shape=(M, N), dtype="bfloat16")()
-
-    NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
-    NKILoad()(src=rhs, dst=sbuf_rhs)
-    NKIMemset(value=0.0)(dst=psum_acc)
-    NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs, dst=psum_acc)
-    NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
-    NKIStore()(src=sbuf_prod, dst=hbm_out)
+    """``lhs_T.T @ rhs`` fixture for header / return tests (SSA)."""
+    sbuf_lhs_T = NKILoad()(src=lhs_T)
+    sbuf_rhs = NKILoad()(src=rhs)
+    psum_acc = NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs)
+    sbuf_prod = NKITensorCopy()(src=psum_acc)
+    hbm_out = NKIStore()(src=sbuf_prod)
     return hbm_out
 
 
@@ -107,13 +98,11 @@ def test_single_param_kernel_header_and_return() -> None:
 
     @nkigym_kernel
     def identity(x):
-        sbuf_x = NKIAlloc(location="sbuf", shape=(128, 512), dtype="bfloat16")()
-        hbm_y = NKIAlloc(location="shared_hbm", shape=(128, 512), dtype="bfloat16")()
-        NKILoad()(src=x, dst=sbuf_x)
-        NKIStore()(src=sbuf_x, dst=hbm_y)
+        sbuf_x = NKILoad()(src=x)
+        hbm_y = NKIStore()(src=sbuf_x)
         return hbm_y
 
-    ir = build_initial_ir(identity, {"x": (128, 512)})
+    ir = build_initial_ir(identity, {"x": ((128, 512), "bfloat16")})
     header = emit_header(ir)
     ret = emit_return(ir)
     assert "def nki_identity(x):" in header

@@ -1,34 +1,42 @@
 """Tests for the extended IR fields (location, dtype, kwargs, axis_map, return_name)."""
 
+from test.transforms._fixtures import INPUT_SPECS, f_matmul
+
 from nkigym.ir import ForNode, ISANode, build_initial_ir
 from nkigym.ops import nkigym_kernel
-from nkigym.ops.alloc import NKIAlloc
+from nkigym.ops.activation import NKIActivation
+from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.load import NKILoad
-from nkigym.ops.matmul import NKIMatmul
-from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
-from nkigym.ops.tensor_copy import NKITensorCopy
-
-K, M, N = 2048, 2048, 2048
-_INPUT_SPECS: dict[str, tuple[int, ...]] = {"lhs_T": (K, M), "rhs": (K, N)}
 
 
 @nkigym_kernel
-def _matmul_fixture(lhs_T, rhs):
-    """``lhs_T.T @ rhs`` fixture shared across tests in this file."""
-    sbuf_lhs_T = NKIAlloc(location="sbuf", shape=(K, M), dtype="bfloat16")()
-    sbuf_rhs = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
-    psum_acc = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
-    sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
-    hbm_out = NKIAlloc(location="shared_hbm", shape=(M, N), dtype="bfloat16")()
+def _reduce_then_activate(x):
+    """reduce → elementwise activation on the (P,) vector → store (rmsnorm-ish)."""
+    sx = NKILoad()(src=x)
+    red = NKIActivationReduce(op="square", reduce_op="add")(data=sx)
+    act = NKIActivation(op="rsqrt")(data=red)
+    out = NKIStore()(src=act)
+    return out
 
-    NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
-    NKILoad()(src=rhs, dst=sbuf_rhs)
-    NKIMemset(value=0.0)(dst=psum_acc)
-    NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs, dst=psum_acc)
-    NKITensorCopy()(src=psum_acc, dst=sbuf_prod)
-    NKIStore()(src=sbuf_prod, dst=hbm_out)
-    return hbm_out
+
+def test_trace_synthesizes_1d_output_for_elementwise_on_reduce():
+    """An elementwise op consuming a 1D (P,) reduce output yields a 1D output, not (P,F)."""
+    from nkigym.ir.dimension_analysis import analyze_dimensions
+
+    analysis = analyze_dimensions(_reduce_then_activate, {"x": ((128, 512), "bfloat16")})
+    """The activation output 'act' must be 1D (P,) — its F axis is absent from the op's axis map."""
+    assert len(analysis.tensors["act"].dim_ids) == 1
+    assert analysis.dim_sizes[analysis.tensors["act"].dim_ids[0]] == 128
+
+
+def test_build_initial_ir_handles_elementwise_on_1d_reduce():
+    """The full canonical build (not just the trace) must handle a (P,) reduce → elementwise chain."""
+    from nkigym.ir import build_initial_ir
+
+    ir = build_initial_ir(_reduce_then_activate, {"x": ((128, 512), "bfloat16")})
+    """The activation buffer 'act' is 1D (P,)=(128,); the build must not KeyError on the absent F axis."""
+    assert ir.all_buffers()["act"].shape == (128,)
 
 
 def _isa_leaves(ir) -> list[ISANode]:
@@ -42,8 +50,8 @@ def _leaves_by_op(ir, op_name: str) -> list[ISANode]:
 
 
 def test_memset_leaf_carries_value_kwarg():
-    """NKIMemset(value=0.0) call-site kwargs are captured onto ISANode.kwargs."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
+    """The synthesized NKIMemset leaf carries ``value=0.0`` on ISANode.kwargs."""
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     memsets = _leaves_by_op(ir, "NKIMemset")
     assert len(memsets) == 1
     assert memsets[0].kwargs == {"value": 0.0}
@@ -51,7 +59,7 @@ def test_memset_leaf_carries_value_kwarg():
 
 def test_non_config_leaves_have_empty_kwargs():
     """Load/Store/Matmul/TensorCopy take no non-operand kwargs in this fixture."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     for op_name in ("NKILoad", "NKIStore", "NKIMatmul", "NKITensorCopy"):
         for leaf in _leaves_by_op(ir, op_name):
             assert leaf.kwargs == {}, f"{op_name} leaf kwargs={leaf.kwargs}"
@@ -62,48 +70,9 @@ import pytest
 from nkigym.ir.dimension_analysis import analyze_dimensions
 
 
-def test_analysis_ops_includes_allocs_in_source_order():
-    """analyze_dimensions emits _OpRecord entries for NKIAlloc interleaved with compute ops in source order."""
-    analysis = analyze_dimensions(_matmul_fixture, _INPUT_SPECS)
-    op_kinds = [op.op_cls.__name__ for op in analysis.ops]
-    assert op_kinds == [
-        "NKIAlloc",
-        "NKIAlloc",
-        "NKIAlloc",
-        "NKIAlloc",
-        "NKIAlloc",
-        "NKILoad",
-        "NKILoad",
-        "NKIMemset",
-        "NKIMatmul",
-        "NKITensorCopy",
-        "NKIStore",
-    ]
-
-
-def test_alloc_op_record_axis_map():
-    """NKIAlloc _OpRecord has axis_map zipped from OPERAND_AXES['dst'] to dim_ids."""
-    analysis = analyze_dimensions(_matmul_fixture, _INPUT_SPECS)
-    alloc_ops = [op for op in analysis.ops if op.op_cls is NKIAlloc]
-    dst_axes = NKIAlloc.OPERAND_AXES["dst"]
-    for op in alloc_ops:
-        tensor_name = op.operand_names["dst"]
-        tensor = analysis.tensors[tensor_name]
-        expected_axis_map = {dst_axes[i]: dim_id for i, dim_id in enumerate(tensor.dim_ids)}
-        assert op.axis_map == expected_axis_map
-
-
-def test_alloc_op_record_has_empty_kwargs():
-    """NKIAlloc _OpRecord.kwargs is empty — alloc params live on TensorDims."""
-    analysis = analyze_dimensions(_matmul_fixture, _INPUT_SPECS)
-    for op in analysis.ops:
-        if op.op_cls is NKIAlloc:
-            assert op.kwargs == {}
-
-
 def test_return_name_is_parsed():
     """analyse_dimensions captures the top-level ``return <Name>`` identifier."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     assert ir.return_name == "hbm_out"
 
 
@@ -112,22 +81,21 @@ def test_missing_return_raises():
 
     @nkigym_kernel
     def no_return(x):
-        sbuf_x = NKIAlloc(location="sbuf", shape=(128, 128), dtype="bfloat16")()
-        NKILoad()(src=x, dst=sbuf_x)
+        sbuf_x = NKILoad()(src=x)
 
     with pytest.raises(ValueError, match="return"):
-        analyze_dimensions(no_return, {"x": (128, 128)})
+        analyze_dimensions(no_return, {"x": ((128, 128), "bfloat16")})
 
 
 def test_tree_has_no_dim_sizes_attribute():
     """KernelTree is a pure schedule tree — dim_sizes lives on KernelIR."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     assert not hasattr(ir.tree, "dim_sizes")
 
 
 def test_tree_num_nodes_matches_graph_node_count():
     """``KernelTree.num_nodes`` reports the total node count in the underlying graph."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     assert ir.tree.num_nodes == ir.tree.graph.number_of_nodes()
 
 
@@ -166,9 +134,9 @@ def test_op_record_is_private_in_dimension_analysis_module():
 
 def test_envelope_markdown_format():
     """KernelIR._render_envelope_md emits signature and buffers table."""
-    ir = build_initial_ir(_matmul_fixture, _INPUT_SPECS)
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     envelope = ir._render_envelope_md()
-    assert "# `_matmul_fixture`" in envelope
+    assert "# `f_matmul`" in envelope
     assert "`lhs_T`" in envelope and "`rhs`" in envelope
     assert "**Returns**: `hbm_out`" in envelope
     assert "## Buffers" in envelope
@@ -342,34 +310,9 @@ def test_kernelir_helper_methods_exposed():
 def test_canonical_matmul_emits_root_block_with_alloc_buffers():
     """The canonical 2048**3 matmul tree's root child is a single BlockNode whose alloc_buffers
     list every kernel-lifetime tensor, including psum_prod (canonical scope = root)."""
-    from nkigym.ir import build_initial_ir
     from nkigym.ir.tree import BlockNode
-    from nkigym.ops import nkigym_kernel
-    from nkigym.ops.alloc import NKIAlloc
-    from nkigym.ops.load import NKILoad
-    from nkigym.ops.matmul import NKIMatmul
-    from nkigym.ops.memset import NKIMemset
-    from nkigym.ops.store import NKIStore
-    from nkigym.ops.tensor_copy import NKITensorCopy
 
-    K = M = N = 2048
-
-    @nkigym_kernel
-    def f_matmul(lhs_T, rhs):
-        sbuf_lhs_T = NKIAlloc(location="sbuf", shape=(K, M), dtype="bfloat16")()
-        sbuf_rhs = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
-        psum_prod = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
-        sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
-        hbm_out = NKIAlloc(location="shared_hbm", shape=(M, N), dtype="bfloat16")()
-        NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
-        NKILoad()(src=rhs, dst=sbuf_rhs)
-        NKIMemset(value=0.0)(dst=psum_prod)
-        NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs, dst=psum_prod)
-        NKITensorCopy()(src=psum_prod, dst=sbuf_prod)
-        NKIStore()(src=sbuf_prod, dst=hbm_out)
-        return hbm_out
-
-    ir = build_initial_ir(f_matmul, {"lhs_T": (K, M), "rhs": (K, N)})
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     """Tree.root is now the root block directly (no intermediate RootNode)."""
     root_block = ir.tree.data(ir.tree.root)
     assert isinstance(root_block, BlockNode)
@@ -393,3 +336,35 @@ def test_dump_tree_runs_on_canonical_ir(tmp_path):
     assert (tmp_path / "tree.mmd").exists()
     """The png is generated by mmdc; if mmdc is unavailable on this host the dump should still succeed
     but with a warning. We only check the mmd file unconditionally."""
+
+
+def test_trace_synthesizes_ssa_outputs():
+    """The SSA trace names each op's output from its assignment LHS and infers dims/dtype/location."""
+    from test.transforms._fixtures import INPUT_SPECS, f_matmul
+
+    from nkigym.ir.dimension_analysis import analyze_dimensions
+
+    analysis = analyze_dimensions(f_matmul, INPUT_SPECS)
+    t = analysis.tensors
+    assert set(t) == {"lhs_T", "rhs", "sbuf_lhs_T", "sbuf_rhs", "psum_prod", "sbuf_prod", "hbm_out"}
+    assert t["psum_prod"].location == "psum"
+    assert t["psum_prod"].dtype == "bfloat16"
+    assert t["sbuf_prod"].location == "sbuf"
+    assert t["sbuf_prod"].dtype == "bfloat16"
+    assert t["hbm_out"].location == "shared_hbm"
+    assert analysis.dim_sizes[t["psum_prod"].dim_ids[0]] == 2048
+    assert analysis.dim_sizes[t["psum_prod"].dim_ids[1]] == 2048
+
+
+def test_param_dtype_seeded_from_spec():
+    """analyze_dimensions reads param dtype from the (shape, dtype) spec, not from buffer inference.
+
+    The spec dtype (``float16``) deliberately diverges from the dtype of the
+    sbuf buffers the params load into (``bfloat16``). The deleted inference
+    path would have yielded ``bfloat16``; spec-seeding must yield ``float16``.
+    """
+    from test.transforms._fixtures import f_matmul
+
+    analysis = analyze_dimensions(f_matmul, {"lhs_T": ((2048, 2048), "float16"), "rhs": ((2048, 2048), "float16")})
+    assert analysis.tensors["lhs_T"].dtype == "float16"
+    assert analysis.tensors["rhs"].dtype == "float16"

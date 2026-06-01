@@ -13,12 +13,44 @@ def test_itervar_label_abbreviates_role_and_shows_dom():
     assert acc.label() == "K(ACC 0..128)"
 
 
-def test_buffer_label_shows_shape_dtype_location():
-    """Buffer.label() is ``name (s0,s1) dtype@location``."""
+def test_buffer_label_shows_physical_shape_for_sbuf():
+    """Buffer.label() shows the 3D physical sbuf/psum allocation, not the 2D logical shape."""
     from nkigym.ir.tree import Buffer
 
     buf = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
-    assert buf.label() == "sbuf_lhs_T (2048,2048) bfloat16@sbuf"
+    assert buf.label() == "sbuf_lhs_T (128, 16, 2048) bfloat16@sbuf"
+
+
+def test_buffer_label_keeps_2d_for_shared_hbm():
+    """A shared_hbm buffer keeps its 2D logical shape in the label."""
+    from nkigym.ir.tree import Buffer
+
+    buf = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm")
+    assert buf.label() == "hbm_out (2048, 2048) bfloat16@shared_hbm"
+
+
+def test_buffer_physical_shape_expands_sbuf_psum_and_passes_hbm_through():
+    """physical_shape() folds the leading extent into a 128-partition tile count for sbuf/psum."""
+    from nkigym.ir.tree import Buffer
+
+    sbuf = Buffer(name="s", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
+    psum = Buffer(name="p", shape=(256, 512), dtype="float32", location="psum")
+    hbm = Buffer(name="h", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm")
+    assert sbuf.physical_shape() == (128, 16, 2048)
+    assert psum.physical_shape() == (128, 2, 512)
+    assert hbm.physical_shape() == (2048, 2048)
+
+
+def test_buffer_physical_dtype_overrides_psum_to_fp32():
+    """physical_dtype() returns fp32 for psum (HW accumulation), logical dtype otherwise."""
+    from nkigym.ir.tree import Buffer
+
+    psum = Buffer(name="p", shape=(256, 512), dtype="bfloat16", location="psum")
+    sbuf = Buffer(name="s", shape=(256, 512), dtype="bfloat16", location="sbuf")
+    hbm = Buffer(name="h", shape=(256, 512), dtype="bfloat16", location="shared_hbm")
+    assert psum.physical_dtype() == "float32"
+    assert sbuf.physical_dtype() == "bfloat16"
+    assert hbm.physical_dtype() == "bfloat16"
 
 
 def test_bufferregion_label_renders_lo_and_width():
@@ -64,7 +96,7 @@ def test_isanode_label_includes_op_bindings_and_kwargs():
         kwargs={"value": 0.0},
     )
     text = node.label()
-    assert text.startswith("NKIMemset")
+    assert text.startswith("nisa.memset")
     assert "dst=psum_prod[v : +128]" in text
     assert "kwargs={'value': 0.0}" in text
 
@@ -74,7 +106,7 @@ def test_isanode_label_omits_empty_kwargs_and_bindings():
     from nkigym.ir.tree import ISANode
     from nkigym.ops.matmul import NKIMatmul
 
-    assert ISANode(op_cls=NKIMatmul, operand_bindings={}, kwargs={}).label() == "NKIMatmul"
+    assert ISANode(op_cls=NKIMatmul, operand_bindings={}, kwargs={}).label() == "nisa.nc_matmul"
 
 
 def test_blocknode_label_empty_root_shows_all_fields_with_empty_marker():
@@ -109,7 +141,7 @@ def test_blocknode_label_full_renders_every_field_content():
     assert "M=i_M" in text and "N=i_N" in text
     assert "sbuf_in[i_M : +128]" in text
     assert "psum_prod[i_N : +512]" in text
-    assert "psum_prod (2048,2048) float32@psum" in text
+    assert "psum_prod (128, 16, 2048) float32@psum" in text
     """annotations defaulted empty → exactly one ∅ (the annotations line)."""
     assert text.count("∅") == 1
 

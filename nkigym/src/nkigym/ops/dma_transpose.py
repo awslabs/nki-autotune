@@ -29,6 +29,7 @@ class NKIDMATranspose(NKIOp):
     the op's tile limits."""
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` may be HBM param (``LoadTranspose`` rewrite) or SBUF."""
@@ -37,11 +38,8 @@ class NKIDMATranspose(NKIOp):
             raise TypeError(f"NKIDMATranspose(src=<role={role}>) expects param or sbuf")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: write ``src.T`` into ``dst`` and return ``dst``."""
-        src: np.ndarray = kwargs["src"]
-        dst: np.ndarray = kwargs["dst"]
-        dst[...] = src.T
-        return dst
+        """CPU simulation: allocate and return ``src.T``."""
+        return np.array(kwargs["src"]).T
 
 
 def dma_transpose_block(sbuf_dst: Any, src: Any) -> None:

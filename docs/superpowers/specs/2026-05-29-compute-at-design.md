@@ -1,5 +1,33 @@
 # ComputeAt / ReverseComputeAt + Affine Region Overlap
 
+## Status (amended 2026-05-30)
+
+- **Part A (affine region overlap)** — SHIPPED (`ea75f23`):
+  `nkigym/ir/interval.py`, `nkigym/ir/buffer_placement.py`, region-gated
+  `nkigym/ir/dependency.py`, plus `test/ir/test_interval.py`,
+  `test/ir/test_dependency.py`, `test/ir/test_buffer_placement.py`.
+- **`ReverseComputeAt`** — legality (`_check_legality`) done; `apply`
+  move mechanics are `NotImplementedError`.
+- **`ComputeAt`** — not started.
+- **Part C (buffer compaction)** — NEW in this amendment; not started.
+  `compact_shapes(tree)` materializes the shrunk shape on the tree after
+  every shape-affecting `apply` (symmetric with `place_buffers`);
+  `rebased_region` projects the rebased index at read time.
+- **Shipped groundwork (2026-05-30):** `Buffer.physical_shape()` (the
+  2D-logical→3D-physical layout helper, now the single source of truth
+  for allocs + PNG labels) and a single `PARTITION_DIM` constant in
+  `ir/tree.py` (was four copies). These land ahead of Part C since the
+  compaction wiring builds on them.
+
+This amendment (2026-05-30) adds **Part C** and answers two design
+questions raised against the hand-written `kernel_transforms.py` ladder:
+whether TVM has these code-motion atoms, and how to carve them. The
+answers reinforce the existing two-transform decision and surface the
+one piece the original spec left implicit — buffer *shape* (as opposed
+to buffer *placement*) after a move. Per the inspect-after-every-atom
+workflow, shape compaction is materialized on the tree inside each
+`apply`, NOT deferred to a single render-time pass.
+
 ## Problem
 
 `ComputeAt` and `ReverseComputeAt` are the next transforms after Split,
@@ -56,6 +84,50 @@ Non-goals:
 
 - **Two transforms**, `ComputeAt` + `ReverseComputeAt`, mirroring TVM —
   not one flagged transform. Each has one direction.
+
+### Does TVM have these atoms? (2026-05-30)
+
+Yes, and the shape matches exactly. TVM TIR exposes **two** schedule
+primitives, `compute_at(block, loop)` and `reverse_compute_at(block,
+loop)`, both in `src/tir/schedule/primitive/compute_at.cc`. They share
+**one** core implementation (`ComputeAtOrReverseComputeAtImpl(...,
+is_compute_at)`); the only differences are direction (which neighbor set
+bounds the legal insertion region) and the output-block guard
+(compute_at only). TVM has **no** separate primitive for "full coverage"
+vs "partial" vs "sink deeper" vs "remove same loops" — its region-cover
+arithmetic computes, for whatever `loop` you pass, which of the moved
+block's loops collapse and which regenerate as residual loops below the
+insertion point. `preserve_unit_loops` decides whether trip-1 residuals
+survive; our IR keeps trip-1 loops, so that flag is effectively `True`.
+
+### How to carve the atoms — the four hand-written cases are ALL one `ComputeAt` (2026-05-30)
+
+The `kernel_transforms.py` ladder names four producer-sink transitions
+"move". All four are the **same** atom (`ComputeAt`: sink a producer)
+applied with different `target_loop_nid`. The shape differences are
+*outcomes* of the single region-cover step (collapse covered same-dim
+loops, regenerate uncovered dims as residual inner loops), NOT separate
+atoms:
+
+| Transition | Block moved | Producer→consumer | Coverage outcome |
+|---|---|---|---|
+| k1→k2 | `load_lhsT` | producer → matmul | `(d0,d1)` exact-cover → block becomes loopless at insertion |
+| k3→k4 | `load_rhs`  | producer → matmul | `(d0,d2)` covered; target's extra `d1` → redundant re-loads |
+| k6→k7 | `memset`    | producer → matmul | `d1` covered; block's `d2` survives as residual inner loop |
+| k9→k10 | `memset`   | producer → matmul | block's own `d2` matches matmul's sibling `d2` → merge into one |
+
+(k7→k8 is a further `ComputeAt` sinking `load_lhsT` under the inner `d2`;
+the reverse hoists k11→k14, labeled "reverse_move", are
+`ReverseComputeAt` — lift a consumer.)
+
+Carving into four atoms by coverage shape was **rejected**: the shapes
+overlap (k3→k4 is exact-cover AND carries a redundant target loop — is it
+"full" or "+loop"?) and share all mechanics. A single unified `Move` with
+direction inferred was also rejected: legality must branch on direction
+anyway (output-block guard, producer-set vs consumer-set), re-introducing
+the two cases inside one atom and losing the clean TVM mirror. **Two
+atoms by direction**, one shared move implementation — already the
+existing spec's decision; the four cases confirm it.
 - **Full-coverage-only** loop handling (no residual regeneration).
 - **TVM's six legality conditions** (already written up in
   `compute_at_legality.md`), mapped onto our `BlockNode` IR + the
@@ -300,6 +372,23 @@ whose LCA is unchanged stay put). Implement it as: clear all
 `alloc_buffers` on every block, recompute each buffer's LCA over its
 touchers, re-attach. Pure recompute, no incremental diffing.
 
+> **Placement, shape, and rebase are three passes (amended
+> 2026-05-30).** The move proper is purely structural — it moves loops
+> and rewrites covered-loop bindings (step 3); it never touches
+> `Buffer.shape` or operand indices. Two derived passes run after it in
+> every `apply`, both detailed in **Part C**:
+> 1. `place_buffers` — descends *which block declares* each buffer to
+>    its new LCA (e.g. `psum_prod` into the matmul block).
+> 2. `compact_shapes` — shrinks `Buffer.shape` to the region bbox
+>    (k1→k2: `sbuf_lhs_T (128,16,2048)→(128,1,128)`; PSUM hoist:
+>    `psum_prod` to one `(M_tile, N_tile)`). Idempotent, materialized on
+>    the tree like placement.
+>
+> The accompanying **index rebase** is NOT a pass — tree regions stay
+> global-frame (for `Dependency`); rebase is applied at read-time by the
+> inspection surfaces. So after each atom the tree carries descended
+> placement + compacted shape, and rendering projects the rebased index.
+
 ### Transform tests
 
 `test/transforms/test_compute_at.py` (NEW) and
@@ -313,6 +402,198 @@ touchers, re-attach. Pure recompute, no incremental diffing.
 - self-inverse where applicable; input-IR-preservation.
 - render+numerics gate after a full PSUM-hoist sequence.
 
+## Part C — Codegen buffer compaction (amended 2026-05-30)
+
+### Why this is the missing piece
+
+The move atoms (Part B) are purely structural: they relocate loops and
+re-bind covered iter_vars, then `place_buffers` descends each buffer's
+*declaration* to its new LCA. But nothing shrinks `Buffer.shape`, and
+the renderer (`codegen/body.py`) emits shape straight from `buf.shape`
+and indices straight from the raw `BufferRegion`. So after k1→k2 the
+renderer would emit:
+
+```python
+for i_d0_0 in range(16):
+    for i_d1_0 in range(16):
+        sbuf_lhs_T = nl.ndarray((128, 16, 2048), ...)   # full, re-declared each iter
+        dma_copy(dst=sbuf_lhs_T[0:128, i_d0_0, (i_d1_0)*128 : +128], ...)
+```
+
+— over-allocated and wrongly indexed versus the hand-written `kernel_2`
+(`(128,1,128)`, indexed `[0:128, 0, 0:128]`). Compaction closes that gap.
+
+### Shape follows region — a decoupled pass, materialized after each atom
+
+TVM's `CompactBufferAllocation`
+(`src/tir/transforms/compact_buffer_region.cc`) computes each buffer's
+accessed region within its allocation scope and shrinks the `Allocate`
+extents to that bounding box, decoupled from the schedule primitives
+(`compute_at` &c. leave buffers full-sized). We take the **decoupling**
+— shape is a separate region-derived computation, never folded into the
+move — but place it like our own `place_buffers`: a pass that runs after
+every `apply` and **materializes its result on the tree**, because every
+atom is inspected.
+
+So `Buffer.shape` is **authoritative tree state recomputed by
+`compact_shapes`**, exactly as `alloc_buffers` is authoritative state
+recomputed by `place_buffers` — not vestigial, not render-lazy. The move
+atom itself never touches shape (decoupling preserved); the post-move
+`compact_shapes` records it. Rejected alternatives: option 2 (the move
+*itself* recomputes shape — couples a capacity side-effect into the
+structural move, and would force every move to special-case which
+buffers it touched); option 3 (a separate user-invoked `CompactBuffer`
+*atom* — makes k1→k2 two atoms in the action space, and lets
+intermediate IR over-allocate between them). Both are worse than a
+non-atom pass that fires automatically post-move. The bbox analysis is
+identical across all three; running it as an automatic post-pass (a)
+keeps the move structural, (b) compacts after every atom for inspection,
+and (c) fixes the latent Split/Fuse over-allocation for free.
+
+### Run after every transform — symmetric with `place_buffers`
+
+Every atom's result is rendered and verified before the next atom is
+applied (the inspect-after-each-atom workflow). So intermediate
+compaction is *consumed*, not discarded — `compact_shapes` runs **inside
+every shape-affecting `apply`**, materialized on the tree just like
+`place_buffers`. No work is wasted: the IR you inspect at step k already
+shows step-k's compacted buffers.
+
+Compaction has two halves that materialize differently:
+
+- **Shape shrink — materialized on the tree.** `compact_shapes(tree)`
+  recomputes each `Buffer.shape` as the region bounding box over its
+  declaration scope and writes it back, just as `place_buffers`
+  recomputes `alloc_buffers`. It is **idempotent**: the bbox is derived
+  from regions + loop extents, ignoring the buffer's current shape, so
+  `compact(compact(tree)) == compact(tree)`. Safe to store because
+  **nothing reads `Buffer.shape` during a rollout** — `Dependency` keys
+  overlap off regions + `location`, transform legality/LCA read
+  topology + regions; the only `buf.shape` readers are the three
+  render-time inspection surfaces. Materializing it is observably inert
+  except to those surfaces.
+- **Index rebase — a read-time projection, NOT materialized.** Tree
+  `BufferRegion`s MUST stay in **global frame** (`lo = i_d0_0*128`,
+  &c.), because the shipped Part A overlap math (`interval.py`) compares
+  regions across blocks in that frame using loop extents. Rebasing on
+  the tree would (a) break `Dependency` (mismatched frames) and (b) be
+  non-idempotent (`i_d0_0 → 0` once, `→ -i_d0_0` twice — double
+  subtract). So the anchor subtraction is applied when a region is
+  *read* for display, never stored.
+
+This is the same structural-vs-derived split as `place_buffers`, applied
+within one pass: the **idempotent** half (shape) materializes on the
+tree after every atom; the **non-idempotent** half (rebase) is a pure
+projection computed by the shared read helper. Mirrors TVM's spirit
+(`CompactBufferAllocation` shrinks the `Allocate`; index remapping is a
+lowering rewrite) while honoring this repo's "inspect after every atom"
+loop.
+
+`compact.py` therefore exposes two entry points:
+- `compact_shapes(tree) -> None` — in-place shape materialization,
+  called by every shape-affecting `apply`. `ComputeAt`/`ReverseComputeAt`
+  call it right after their `place_buffers` rerun (a move changes both
+  LCA and shape); `Split`/`Fuse` call it alone (tensorize changes region
+  widths but not LCA, so placement is untouched).
+- `rebased_region(region, buf, tree) -> BufferRegion` — read-time anchor
+  subtraction, called by all three inspection surfaces (`kernel.py`,
+  `envelope.md`, `tree.png`) so each shows compacted-shape +
+  rebased-index consistently against the global-frame tree.
+
+Because all three dump artifacts read buffer geometry, all three call
+the shared read helper — `kernel.py` (`body.py`), the `envelope.md`
+buffers table (`ir._render_envelope_md`), and the `tree.png` alloc
+labels (`Buffer.label`) — or they would disagree.
+
+### The bounding-box analysis
+
+Add `nkigym/src/nkigym/codegen/compact.py`. For each `Buffer`, over
+every `BufferRegion` (across all ISA leaves) that touches it, classified
+by the buffer's **declaration (LCA) block** — the block that holds it in
+`alloc_buffers`:
+
+- **Anchor loops** = loop vars bound *at or above* the declaration block.
+  These index *which instance* of the buffer is live; they are
+  **subtracted** from every region `lo` (the index rebases toward 0) and
+  do **not** contribute to the shape.
+- **Interior loops** = loop vars bound *below* the declaration block.
+  These index *within* one instance; the shape extent on each axis is the
+  bounding box of `lo + width` over the interior-loop box (each interior
+  var ∈ `[0, extent)`), with anchors zeroed.
+
+The per-axis extent is computed with the same affine machinery Part A
+already ships (`to_affine`, `_affine_range` in `interval.py`) — the
+bounding box of an affine `lo` plus its constant `width` over the
+interior-loop box. The partition-axis normalization
+(`_interval_for_axis`: axis-0 SBUF/PSUM bare-index → element space) is
+reused so the 3D `(128, num_tiles, F)` layout's tile axis compacts in
+tile space.
+
+Worked, k1→k2 (`sbuf_lhs_T` declared inside the matmul's `(d0,d1)`):
+- anchors = `{i_d0_0, i_d1_0}` (bound above the declaration).
+- region `[0:128, i_d0_0, (i_d1_0)*128 : +128]`: subtract anchors →
+  axis-1 `i_d0_0 → 0`, axis-2 `(i_d1_0)*128 → 0`. Rebased index
+  `[0:128, 0, 0:128]`.
+- no interior loops over those axes → extents are the bare widths:
+  shape `(128, 1, 128)`. ✅ matches `kernel_2`.
+
+Worked, `lhs_T` (a kernel **param**, declared at root, touched by the
+sunk load): anchors = ∅ (declared at root, above nothing relevant is
+subtracted because params keep their global frame), so its
+HBM-side index `[(i_d0_0)*128 : +128, (i_d1_0)*128 : +128]` is
+**unchanged** — only allocated (LCA) buffers rebase. Params are never
+re-declared or resized.
+
+### Wiring
+
+**Shape (materialized in `apply`).** `compact_shapes(tree)` rewrites
+each `Buffer.shape` to its compacted 2D *logical* extents. The 2D→3D
+physical expansion stays in `Buffer.physical_shape()` (the single source
+of truth shared with the tree visualization), so the stored shape is
+logical and every reader that wants the allocation calls
+`physical_shape()`. `_emit_alloc(buf)` and `Buffer.label()` are then
+**unchanged** — they already read `physical_shape()`; the buffer they
+read just already carries the compacted shape. This is the payoff of
+materializing on the tree: no emitter signature changes for shape.
+
+**Index rebase (read-time projection).** Tree regions stay global-frame,
+so the emitters subtract anchors when they format a region:
+- `render_buffer_region(region, buf)` → `render_buffer_region(region,
+  buf, tree)`: rebase via `rebased_region` before formatting. Params
+  (declared at root, no anchors) project to themselves — unchanged.
+- `Buffer.label()` shows shape only (no region), so it needs no rebase;
+  the alloc/region split keeps it simple.
+
+Anchors for a buffer = the loop vars bound at-or-above its declaration
+block, read from tree topology at projection time — no per-buffer anchor
+set is stored. `rebased_region` lives in `compact.py` and is called by
+`body.py` and any other surface that prints a region.
+
+No transform writes a *rebased* region; the tree's region geometry stays
+global-frame for `Dependency`. This honors "codegen direction: ir →
+codegen, never reverse" — the rebase is a render-time read of ir state,
+not a writeback.
+
+### Bonus: fixes latent Split/Fuse over-allocation
+
+`Split._do_tensorize` already shrinks regions and `Fuse._do_tensorize`
+widens them, but neither updates `Buffer.shape` (today harmless —
+CPU-sim has no capacity gate). Once compaction derives shape from
+regions, those buffers compact automatically with no extra work.
+
+### Compaction tests (`test/codegen/test_compact.py`, NEW)
+
+1. Canonical IR: every buffer compacts to its full canonical shape
+   (no anchors above root) → render byte-identical to current output.
+2. k1→k2 hand-target: after `ComputeAt(load_lhsT, matmul d1-loop)`,
+   `sbuf_lhs_T` compacts to `(128,1,128)`, index rebases to
+   `[0:128, 0, 0:128]`. Assert rendered source matches `kernel_2`'s
+   alloc + load lines.
+3. k3→k4: `sbuf_rhs` compacts to `(128,1,512)`.
+4. PSUM hoist: after the trio, `psum_prod` compacts to one
+   `(M_tile, N_tile)` tile.
+5. Param invariance: `lhs_T` / `rhs` HBM indices never rebase.
+
 ## Layout
 
 ```
@@ -322,39 +603,72 @@ nkigym/src/nkigym/ir/
 ├── canonical_build.py    # EDIT — call place_buffers() instead of inline LCA logic
 └── dependency.py         # EDIT — region-gated hazard edges; _BlockInfo keeps regions+extents
 
+nkigym/src/nkigym/codegen/
+├── compact.py            # NEW — compact_shapes(tree) [materialize] + rebased_region(region,buf,tree) [read-time]
+└── body.py               # EDIT — render_buffer_region rebases via compact.rebased_region (_emit_alloc unchanged: already reads physical_shape)
+
+nkigym/src/nkigym/ir/ir.py # EDIT — _render_envelope_md rebases region display (shape via physical_shape, already compacted on tree)
+
 nkigym/src/nkigym/transforms/
 ├── compute_at.py         # NEW — ComputeAt, ComputeAtOption
-├── reverse_compute_at.py # NEW — ReverseComputeAt, ReverseComputeAtOption
+├── reverse_compute_at.py # EDIT — fill ReverseComputeAt.apply (legality already shipped)
+├── _code_motion.py       # NEW — shared _compute_at_impl(ir, ..., is_reverse); runs place_buffers + compact_shapes
+├── split.py, fuse.py     # EDIT — call compact_shapes(tree) in .apply (LCA unchanged by tensorize → no place_buffers needed)
 ├── _tree_ops.py          # reuse _block_local_descendants, _replace_in_parent_children
-└── __init__.py           # EDIT — export the two transforms + options
+└── __init__.py           # EDIT — export ComputeAt + ComputeAtOption (reverse already exported)
 
-nkigym/src/nkigym/transforms/compute_at_legality.md  # EDIT — refresh "What is a block?"
+nkigym/src/nkigym/transforms/compute_at_legality.md  # already refreshed (ea75f23)
 
-test/ir/test_interval.py              # NEW
-test/ir/test_dependency.py            # EDIT — disjoint-tile no-edge test
+test/codegen/test_compact.py          # NEW
 test/transforms/test_compute_at.py    # NEW
-test/transforms/test_reverse_compute_at.py  # NEW
+test/transforms/test_reverse_compute_at.py  # EDIT — apply-mechanics tests (legality tests shipped)
+test/transforms/test_render_equivalence.py  # EDIT — k1→k2, k3→k4 render-match + numerics
 examples/matmul_lhsT_rhs.py           # EDIT — add ComputeAt+ReverseComputeAt to transforms list
 ```
 
+Part A files (`ir/interval.py`, `ir/buffer_placement.py`,
+`ir/dependency.py`, `test/ir/test_interval.py`,
+`test/ir/test_dependency.py`, `test/ir/test_buffer_placement.py`) are
+already shipped (`ea75f23`) — no longer in the work set.
+
 ## Implementation order
 
-1. **Extract `place_buffers`**: pull the LCA-of-users logic out of
-   `canonical_build` into `buffer_placement.place_buffers(tree)`; have
-   `canonical_build` call it. Pure refactor — canonical output
-   byte-identical, all tests green.
-2. **Part A**: `interval.py` + tests → wire into `Dependency` + regression
-   test. Gate: all existing dependency/ir/codegen tests green; new
-   disjoint-tile test passes.
-3. **Legality doc refresh**.
-4. **ComputeAt**: option, analyze, `_check_legality` (6 conditions),
-   `apply` (full-coverage collapse + splice + `place_buffers` rerun).
-   Tests including the buffer-descent side effect.
-5. **ReverseComputeAt**: mirror. Tests.
-6. **PSUM-hoist E2E**: drive the trio on the Split-tiled matmul, render,
+Steps 1–3 (extract `place_buffers`, Part A region overlap, legality-doc
+refresh) are **DONE** (`ea75f23`). Remaining, resequenced so compaction
+lands first — it stands alone (compacts existing canonical + Split/Fuse
+output) and makes every subsequent move's render verifiable against
+`kernel_transforms.py`:
+
+4. **Part C — buffer compaction**: `codegen/compact.py` with two entry
+   points — `compact_shapes(tree)` (in-place bbox shape materialization,
+   idempotent, reusing `interval._affine_range` / partition
+   normalization) and `rebased_region(region, buf, tree)` (read-time
+   anchor subtraction). Call `compact_shapes` in the existing
+   `Split`/`Fuse`.`apply` (their tensorize flavor changes region widths,
+   so shape compacts; LCA is unchanged so no `place_buffers` needed);
+   wire `rebased_region` into
+   `body.render_buffer_region`. Gate: canonical tree shapes unchanged
+   (anchors ∅ above root) and render byte-identical; Split/Fuse
+   tensorize buffers now compact on the tree; `compact_shapes`
+   idempotent (apply twice == once, like `place_buffers`);
+   `test/codegen/test_compact.py` + existing codegen/render/transform
+   tests green.
+5. **Shared `_code_motion._compute_at_impl`**: full-coverage collapse +
+   keep-uncovered-residual + splice at `index` + `place_buffers` rerun +
+   `compact_shapes` rerun + `Dependency` rebuild. Direction-parameterized
+   (`is_reverse`).
+6. **`ReverseComputeAt.apply`**: call the shared impl (legality already
+   shipped). Tests: fill `test_reverse_compute_at.py` apply mechanics;
+   k11→k14 reverse hoists render-match + fp32-sim.
+7. **`ComputeAt`**: option, analyze, `_check_legality` (6 conditions
+   incl. output-block guard), `apply` via shared impl. Tests: k1→k2,
+   k3→k4, k6→k7, k9→k10 each render-match `kernel_transforms.py` +
+   fp32-sim at 5e-3.
+8. **PSUM-hoist E2E**: drive the trio on the Split-tiled matmul, render,
    fp32-sim; assert `psum_prod` descended into the matmul block's
-   `alloc_buffers`. Add the transforms to `examples/matmul_lhsT_rhs.py`'s
-   MDP transform list; confirm random rollouts stay numerically correct.
+   `alloc_buffers` AND compacted to one tile. Add both transforms to
+   `examples/matmul_lhsT_rhs.py`'s MDP transform list; confirm random
+   rollouts stay numerically correct.
 
 ## Out of scope
 

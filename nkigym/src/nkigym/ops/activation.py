@@ -36,9 +36,10 @@ class NKIActivation(NKIOp):
     zips ``OPERAND_AXES`` with the operand's concrete ``dim_ids``
     positionally — 1D operands simply skip the F axis slot.
 
-    Output matches the input dtype by default; pin to fp32 via
-    ``OUTPUT_DTYPES`` at the use site if precision matters (the online
-    rmsnorm kernel hand-builds rsqrt / reciprocal buffers as fp32).
+    Output carries the input's logical dtype (propagated through the
+    trace). A precision-sensitive use (e.g. the online rmsnorm kernel's
+    rsqrt / reciprocal buffers) that needs fp32 is expressed by a
+    separate fp32-producing op rather than a per-output dtype override.
     """
 
     NAME: ClassVar[str] = "activation"
@@ -46,6 +47,7 @@ class NKIActivation(NKIOp):
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data"})
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``data`` must be SBUF-resident."""
@@ -54,11 +56,9 @@ class NKIActivation(NKIOp):
             raise TypeError(f"NKIActivation(data=<role={role}>) expects sbuf")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: write ``op(data * scale + bias)`` into ``dst`` and return ``dst``."""
+        """CPU simulation: allocate and return ``op(data * scale + bias)``."""
         data: np.ndarray = kwargs["data"]
         op_name: str = kwargs["op"]
         scale = kwargs.get("scale", 1.0)
         bias = kwargs.get("bias", 0.0)
-        dst: np.ndarray = kwargs["dst"]
-        dst[...] = _ACT_FNS[op_name](data.astype(np.float32) * scale + bias).astype(dst.dtype)
-        return dst
+        return _ACT_FNS[op_name](data.astype(np.float32) * scale + bias)

@@ -27,6 +27,7 @@ class NKITranspose(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": 128}
     OUTPUT_ROLE: ClassVar[str] = "psum"
+    OUTPUT_LOCATION: ClassVar[str] = "psum"
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` must be SBUF-resident."""
@@ -35,11 +36,8 @@ class NKITranspose(NKIOp):
             raise TypeError(f"NKITranspose(src=<role={role}>) expects sbuf")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: write ``src.T`` into ``dst`` and return ``dst``."""
-        src: np.ndarray = kwargs["src"]
-        dst: np.ndarray = kwargs["dst"]
-        dst[...] = src.T
-        return dst
+        """CPU simulation: allocate and return ``src.T``."""
+        return np.array(kwargs["src"]).T
 
 
 def transpose_block(sbuf_dst: Any, sbuf_src: Any) -> None:

@@ -42,7 +42,7 @@ def test_render_canonical_matmul_passes_numerics():
     kernel_path = cache_dir / "kernel.py"
     kernel_path.write_text(src)
     rng = np.random.default_rng(0)
-    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, shape in INPUT_SPECS.items()}
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in INPUT_SPECS.items()}
     expected = inputs["lhs_T"].T @ inputs["rhs"]
     module = _load_module_from_path(str(kernel_path))
     actual = np.asarray(simulate_fp32(module.nki_f_matmul)(**inputs))

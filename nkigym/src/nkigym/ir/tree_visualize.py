@@ -12,10 +12,8 @@ from pathlib import Path
 
 from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree, NodeData
-from nkigym.ops.alloc import NKIAlloc
 
 _FLOWCHART_STYLES: list[ClassStyle] = [
-    ClassStyle(name="alloc", fill="#fef", stroke="#963"),
     ClassStyle(name="loop", fill="#eef", stroke="#336"),
     ClassStyle(name="tensorize", fill="#ffe", stroke="#a60"),
     ClassStyle(name="leaf", fill="#efe", stroke="#363"),
@@ -58,7 +56,7 @@ def _tree_node_decl(node_id: str, nid: int, data: NodeData) -> tuple[str, str | 
     elif isinstance(data, ForNode):
         decl, class_name = f'{node_id}["{text}"]', "loop"
     elif isinstance(data, ISANode):
-        decl, class_name = f'{node_id}["{text}"]', "alloc" if data.op_cls is NKIAlloc else "leaf"
+        decl, class_name = f'{node_id}["{text}"]', "leaf"
     else:
         raise TypeError(f"unknown node data type: {type(data).__name__}")
     return (decl, class_name)

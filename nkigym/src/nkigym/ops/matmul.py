@@ -31,6 +31,7 @@ class NKIMatmul(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"K": 128, "M": 128, "N": 512}
     OUTPUT_ROLE: ClassVar[str] = "psum"
+    OUTPUT_LOCATION: ClassVar[str] = "psum"
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``stationary`` and ``moving`` must be SBUF-resident."""
@@ -40,12 +41,8 @@ class NKIMatmul(NKIOp):
                 raise TypeError(f"NKIMatmul({slot}=<role={role}>) expects sbuf; did you forget to load?")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: accumulate ``stationary.T @ moving`` into ``dst`` (RMW) and return ``dst``."""
-        stationary: np.ndarray = kwargs["stationary"]
-        moving: np.ndarray = kwargs["moving"]
-        dst: np.ndarray = kwargs["dst"]
-        dst[...] = dst + (stationary.astype(np.float32).T @ moving.astype(np.float32)).astype(dst.dtype)
-        return dst
+        """CPU simulation: allocate and return ``stationary.T @ moving`` at fp32."""
+        return kwargs["stationary"].astype(np.float32).T @ kwargs["moving"].astype(np.float32)
 
 
 def matmul_block(psum_out: Any, sbuf_lhs_T: Any, sbuf_rhs: Any) -> None:

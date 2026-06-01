@@ -103,20 +103,12 @@ class NKIOp:
     Attributes:
         NAME: ISA call name (e.g. ``"nc_matmul"``).
         OPERAND_AXES: Maps operand name to axis label tuple.
-        OUTPUT_AXES: Maps output name to axis label tuple.
-        OUTPUT_DTYPES: Optional per-output dtype override. Default empty
-            means outputs inherit the first operand's dtype (typical for
-            elementwise/math ops). ``NKIActivationReduce`` overrides its
-            reduce output to ``float32`` so the Scalar Engine can
-            accumulate without narrowing.
         AXIS_ROLES: Per-op axis → role classification. Omitted axes default
             to ``AxisRole.PARALLEL``.
     """
 
     NAME: ClassVar[str] = ""
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
-    OUTPUT_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
-    OUTPUT_DTYPES: ClassVar[dict[str, str]] = {}
     AXIS_ROLES: ClassVar[dict[str, "AxisRole"]] = {}
 
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {}
@@ -184,9 +176,17 @@ class NKIOp:
     """Role tag attached to ``__call__``'s return value.
 
     Subclasses override to declare an op-specific output role
-    (e.g. ``NKIStore.OUTPUT_ROLE = "stored"``). ``NKIAlloc`` overrides
-    :meth:`_output_role` directly to select based on ``location``.
+    (e.g. ``NKIStore.OUTPUT_ROLE = "stored"``). ``NKIMemset`` overrides
+    :meth:`_output_role` directly to return its ``dst`` operand's
+    existing role (memset does not change residency).
     """
+
+    OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+    """Physical residency of this op's synthesized output buffer:
+    ``"sbuf"`` / ``"psum"`` / ``"shared_hbm"``. Read by the trace to set
+    the output ``Buffer.location``. Distinct from ``OUTPUT_ROLE`` (the
+    role-lattice lineage tag); the two coincide for every op except
+    ``NKIStore`` (location ``"shared_hbm"``, role ``"stored"``)."""
 
     def _check_roles(self, **kwargs: Any) -> None:
         """Per-op role validation. Default: no-op.
@@ -201,7 +201,7 @@ class NKIOp:
         """Return the role to tag on ``__call__``'s output array.
 
         Default consults the ``OUTPUT_ROLE`` class attribute. Overridden
-        by ``NKIAlloc`` to pick per-call based on ``location``.
+        by ``NKIMemset`` to return its ``dst`` operand's existing role.
         """
         return type(self).OUTPUT_ROLE
 

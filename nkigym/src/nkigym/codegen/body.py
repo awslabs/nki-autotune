@@ -16,10 +16,9 @@ from __future__ import annotations
 
 from nkigym.ir import KernelIR
 from nkigym.ir.expr import Const, format_expr
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode
+from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode
 
 _INDENT = "    "
-_PARTITION_DIM = 128
 
 
 def emit_body(ir: KernelIR) -> str:
@@ -63,17 +62,13 @@ def _emit_subtree(ir: KernelIR, nid: int, depth: int, code: list[str]) -> None:
 
 
 def _emit_alloc(buf: Buffer) -> str:
-    """Emit a single ``nl.ndarray(...)`` line for ``buf``."""
-    if buf.location == "shared_hbm":
-        shape = "(" + ", ".join(str(s) for s in buf.shape) + ")"
-    else:
-        if len(buf.shape) != 2:
-            raise AssertionError(f"{buf.name}: SBUF/PSUM allocation expects a 2D shape; got {buf.shape}")
-        P, F = buf.shape
-        if P % _PARTITION_DIM != 0:
-            raise AssertionError(f"{buf.name}: P={P} must be a multiple of {_PARTITION_DIM}")
-        shape = f"({_PARTITION_DIM}, {P // _PARTITION_DIM}, {F})"
-    return f"{buf.name} = nl.ndarray({shape}, dtype=nl.{buf.dtype}, buffer=nl.{buf.location})"
+    """Emit a single ``nl.ndarray(...)`` line for ``buf``.
+
+    Shape comes from :meth:`Buffer.physical_shape` — the shared source of
+    truth that also feeds the tree visualization.
+    """
+    shape = "(" + ", ".join(str(s) for s in buf.physical_shape()) + ")"
+    return f"{buf.name} = nl.ndarray({shape}, dtype=nl.{buf.physical_dtype()}, buffer=nl.{buf.location})"
 
 
 def _emit_isa_call(node: ISANode, ir: KernelIR) -> str:
@@ -95,9 +90,9 @@ def render_buffer_region(region: BufferRegion, buf: Buffer) -> str:
     parts: list[str] = []
     for axis_index, (lo, hi) in enumerate(region.ranges):
         if axis_index == 0 and buf.location != "shared_hbm":
-            if not isinstance(hi, Const) or hi.value != _PARTITION_DIM:
+            if not isinstance(hi, Const) or hi.value != PARTITION_DIM:
                 raise AssertionError(f"{buf.name}: SBUF/PSUM partition axis must use a partition-sized tile; got {hi}")
-            parts.append(f"0:{_PARTITION_DIM}")
+            parts.append(f"0:{PARTITION_DIM}")
             parts.append(format_expr(lo))
         else:
             lo_str = format_expr(lo)

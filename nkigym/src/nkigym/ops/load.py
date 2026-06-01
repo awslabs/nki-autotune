@@ -21,6 +21,7 @@ class NKILoad(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_ROLE: ClassVar[str] = "sbuf"
+    OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` must be HBM-resident (``param``)."""
@@ -29,11 +30,9 @@ class NKILoad(NKIOp):
             raise TypeError(f"NKILoad(src=<role={role}>) expects HBM param; did you forget to load?")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: copy ``src`` into ``dst`` and return ``dst``."""
+        """CPU simulation: allocate and return a copy of ``src``."""
         src: np.ndarray = kwargs["src"]
-        dst: np.ndarray = kwargs["dst"]
-        dst[...] = src
-        return dst
+        return np.array(src)
 
 
 def load_block(sbuf: Any, mem_slice: Any) -> None:

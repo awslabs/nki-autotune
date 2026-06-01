@@ -68,6 +68,7 @@ class NKIActivationReduce(NKIOp):
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``data`` must be SBUF-resident."""
@@ -76,13 +77,15 @@ class NKIActivationReduce(NKIOp):
             raise TypeError(f"NKIActivationReduce(data=<role={role}>) expects sbuf")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: write ``op(data)`` into ``dst`` and ``reduce_op(op(data), axis=F)`` into ``reduce_res``.
+        """CPU simulation: allocate and return ``reduce_op(op(data), axis=F)``.
 
         Mirrors the valid ISA signature: configuration kwargs are
-        ``{op, reduce_op}``; operand kwargs are ``{data, dst, reduce_res}``.
-        Extra kwargs raise ``TypeError`` to keep the DSL honest.
+        ``{op, reduce_op}``; the operand kwarg is ``{data}``. Extra
+        kwargs raise ``TypeError`` to keep the DSL honest. The activated
+        ``(P, F)`` tile is an internal byproduct; the op's primary output
+        is the ``(P,)`` per-row reduction vector.
         """
-        allowed = {"data", "op", "reduce_op", "dst", "reduce_res"}
+        allowed = {"data", "op", "reduce_op"}
         extra = set(kwargs) - allowed
         if extra:
             raise TypeError(
@@ -93,11 +96,5 @@ class NKIActivationReduce(NKIOp):
         data: np.ndarray = kwargs["data"]
         op_name: str = kwargs["op"]
         reduce_op: str = kwargs["reduce_op"]
-        dst: np.ndarray = kwargs["dst"]
-        reduce_res: np.ndarray = kwargs["reduce_res"]
-        data_f32 = data.astype(np.float32)
-        activated = _ACT_FNS[op_name](data_f32)
-        reduced = _RED_FNS[reduce_op](activated, axis=1).astype(np.float32)
-        dst[...] = activated.astype(dst.dtype)
-        reduce_res[...] = reduced.astype(reduce_res.dtype)
-        return reduce_res
+        activated = _ACT_FNS[op_name](data.astype(np.float32))
+        return _RED_FNS[reduce_op](activated, axis=1).astype(np.float32)

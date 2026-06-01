@@ -26,6 +26,7 @@ class NKITensorReduce(NKIOp):
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``data`` must be SBUF-resident."""
@@ -34,12 +35,6 @@ class NKITensorReduce(NKIOp):
             raise TypeError(f"NKITensorReduce(data=<role={role}>) expects sbuf")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: numpy reduction along axis, write into ``dst``."""
-        data = kwargs["data"]
-        dst = kwargs["dst"]
-        axis = kwargs["axis"]
-        op = kwargs["op"]
-        reduce_fn = _REDUCE_FNS[op]
-        result = reduce_fn(data, axis=axis)
-        dst[...] = result
-        return dst
+        """CPU simulation: allocate and return the numpy reduction along axis."""
+        result = _REDUCE_FNS[kwargs["op"]](kwargs["data"], axis=kwargs["axis"])
+        return np.asarray(result)

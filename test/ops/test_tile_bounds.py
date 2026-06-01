@@ -2,7 +2,6 @@
 
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
-from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.base import NKIOp
 from nkigym.ops.dma_transpose import NKIDMATranspose
 from nkigym.ops.load import NKILoad
@@ -76,9 +75,3 @@ def test_activation_reduce_bounds():
 def test_tensor_scalar_bounds():
     assert NKITensorScalar.MIN_TILE_SIZE == {"P": 128, "F": 128}
     assert NKITensorScalar.MAX_TILE_SIZE == {"P": 128, "F": None}
-
-
-def test_alloc_bounds():
-    """NKIAlloc is just another ISA op: MIN 128 per axis, unbounded max on both."""
-    assert NKIAlloc.MIN_TILE_SIZE == {"P": 128, "F": 128}
-    assert NKIAlloc.MAX_TILE_SIZE == {"P": None, "F": None}

@@ -34,6 +34,7 @@ class NKITensorScalar(NKIOp):
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "operand0"})
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``data`` must be SBUF-resident; ``operand0`` may be SBUF or a literal scalar."""
@@ -45,14 +46,11 @@ class NKITensorScalar(NKIOp):
             raise TypeError(f"NKITensorScalar(operand0=<role={operand0_role}>) expects sbuf")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: broadcast ``operand0`` across F, apply ``op``, write into ``dst``."""
-        data: np.ndarray = kwargs["data"]
-        op_name: str = kwargs["op"]
+        """CPU simulation: broadcast ``operand0`` across F, apply ``op``, return the result."""
+        data = kwargs["data"]
         operand0 = kwargs["operand0"]
-        dst: np.ndarray = kwargs["dst"]
         broadcast = operand0[..., np.newaxis] if isinstance(operand0, np.ndarray) else operand0
-        dst[...] = _OPS[op_name](data, broadcast)
-        return dst
+        return _OPS[kwargs["op"]](data, broadcast)
 
 
 def tensor_scalar_block(sbuf_dst: Any, sbuf_data: Any, sbuf_operand0: Any, op: Any) -> None:

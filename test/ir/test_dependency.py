@@ -76,6 +76,25 @@ def test_memset_precedes_matmul_in_dependency():
     assert not ir.dependency.must_precede(matmul_nid, memset_nid), "matmul must NOT precede memset"
 
 
+def test_canonical_synthesizes_memset_for_matmul():
+    """A matmul (RMW dst) gets a synthesized memset sibling block zeroing its PSUM region."""
+    from test.transforms._fixtures import build_canonical_ir
+
+    from nkigym.ir.tree import ISANode
+    from nkigym.ops.memset import NKIMemset
+
+    ir = build_canonical_ir()
+    memset_leaves = {
+        nid
+        for nid in ir.tree.preorder()
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.data(nid).op_cls is NKIMemset
+    }
+    assert len(memset_leaves) == 1, "exactly one synthesized memset for the matmul"
+    memset = ir.tree.data(next(iter(memset_leaves)))
+    assert memset.operand_bindings["dst"].tensor == "psum_prod"
+    assert memset.kwargs == {"value": 0.0}
+
+
 def test_disjoint_tile_writes_have_no_edge():
     """Two hand-built blocks writing disjoint tiles of one buffer get NO dependency edge."""
     from dataclasses import replace

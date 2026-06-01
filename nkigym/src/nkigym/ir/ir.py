@@ -116,12 +116,12 @@ class KernelIR:
         return "\n".join(lines)
 
 
-def build_initial_ir(func: Callable[..., Any], input_specs: dict[str, tuple[int, ...]]) -> KernelIR:
+def build_initial_ir(func: Callable[..., Any], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
     """Run dim analysis, build the schedule tree, derive the dependency graph, flatten.
 
     Args:
         func: An ``@nkigym_kernel``-decorated callable.
-        input_specs: ``{param_name: shape}`` for every positional param.
+        input_specs: ``{param_name: (shape, dtype)}`` for every positional param.
 
     Returns:
         A populated :class:`KernelIR` envelope.

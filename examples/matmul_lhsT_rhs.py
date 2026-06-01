@@ -25,17 +25,15 @@ import numpy as np
 
 from nkigym.environment import KernelMDP
 from nkigym.ops import nkigym_kernel
-from nkigym.ops.alloc import NKIAlloc
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
-from nkigym.ops.memset import NKIMemset
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.synthesis.simulate_nki import simulate_fp32
 from nkigym.transforms import Fuse, Reorder, Split
 
 K, M, N = 2048, 2048, 2048
-INPUT_SPECS: dict[str, tuple[int, ...]] = {"lhs_T": (K, M), "rhs": (K, N)}
+INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 NUM_ROLLOUTS = 4
 MAX_STEPS = 5
 SEED = 42
@@ -49,25 +47,18 @@ def f_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
 @nkigym_kernel
 def f_nkigym(lhs_T, rhs):
     """Cached output of ``compile_numpy_to_nkigym(f_numpy, ...)``."""
-    sbuf_lhs_T = NKIAlloc(location="sbuf", shape=(K, M), dtype="bfloat16")()
-    sbuf_rhs = NKIAlloc(location="sbuf", shape=(K, N), dtype="bfloat16")()
-    psum_prod = NKIAlloc(location="psum", shape=(M, N), dtype="float32")()
-    sbuf_prod = NKIAlloc(location="sbuf", shape=(M, N), dtype="bfloat16")()
-    hbm_out = NKIAlloc(location="shared_hbm", shape=(M, N), dtype="bfloat16")()
-
-    NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
-    NKILoad()(src=rhs, dst=sbuf_rhs)
-    NKIMemset(value=0.0)(dst=psum_prod)
-    NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs, dst=psum_prod)
-    NKITensorCopy()(src=psum_prod, dst=sbuf_prod)
-    NKIStore()(src=sbuf_prod, dst=hbm_out)
+    sbuf_lhs_T = NKILoad()(src=lhs_T)
+    sbuf_rhs = NKILoad()(src=rhs)
+    psum_prod = NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs)
+    sbuf_prod = NKITensorCopy()(src=psum_prod)
+    hbm_out = NKIStore()(src=sbuf_prod)
     return hbm_out
 
 
 def _check_numerics(kernel_path: str, seed: int = 0, atol: float = 5e-3, rtol: float = 5e-3) -> None:
     """Simulate the dumped kernel under fp32 and compare against ``f_numpy``."""
     rng = np.random.default_rng(seed)
-    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, shape in INPUT_SPECS.items()}
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in INPUT_SPECS.items()}
     expected = f_numpy(**inputs)
     spec = importlib.util.spec_from_file_location("dumped_kernel", kernel_path)
     module = importlib.util.module_from_spec(spec)

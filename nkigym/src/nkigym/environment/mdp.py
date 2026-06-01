@@ -21,13 +21,16 @@ class KernelMDP:
 
     Attributes:
         kernel_func: ``@nkigym_kernel``-decorated callable used by ``reset``.
-        input_specs: ``{param_name: shape}`` passed to ``build_initial_ir``.
+        input_specs: ``{param_name: (shape, dtype)}`` passed to ``build_initial_ir``.
         transforms: Action namespace - each entry contributes its
             ``analyze`` options to ``legal_actions``.
     """
 
     def __init__(
-        self, kernel_func: Callable[..., Any], input_specs: dict[str, tuple[int, ...]], transforms: list[Transform]
+        self,
+        kernel_func: Callable[..., Any],
+        input_specs: dict[str, tuple[tuple[int, ...], str]],
+        transforms: list[Transform],
     ) -> None:
         """Store the kernel + transforms. No IR is built until ``reset``."""
         self.kernel_func = kernel_func

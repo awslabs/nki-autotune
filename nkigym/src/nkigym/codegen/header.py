@@ -6,9 +6,9 @@ body — imports, the ``@nki.jit`` decorator, the ``def`` line, and one
 
 :func:`emit_return` produces the trailing ``return <return_name>``
 line. The HBM allocation for the return tensor is emitted by
-:func:`nkigym.codegen.body.emit_body` — the schedule tree's
-:class:`NKIAlloc` leaves cover every tensor (HBM, SBUF, PSUM)
-including the return tensor.
+:func:`nkigym.codegen.body.emit_body` — every tensor (HBM, SBUF,
+PSUM), including the return tensor, is declared from a
+``BlockNode.alloc_buffers`` entry on its lowest-common-ancestor block.
 
 The renderer composes ``emit_header(ir) + emit_body(ir) + emit_return(ir)``;
 keeping header / body / return in three separate emitters lets the body
@@ -47,10 +47,10 @@ def emit_return(ir: KernelIR) -> str:
     """Render the trailing ``return <return_name>`` statement.
 
     The return tensor's HBM allocation is now emitted by
-    :func:`nkigym.codegen.body.emit_body` (it walks all
-    :class:`NKIAlloc` leaves in the schedule tree, including the
-    one that allocates the return tensor); this emitter only spells
-    the function-scope ``return`` line.
+    :func:`nkigym.codegen.body.emit_body` (it walks the schedule tree's
+    ``BlockNode.alloc_buffers`` entries, including the one declaring the
+    return tensor); this emitter only spells the function-scope
+    ``return`` line.
 
     Args:
         ir: Fully-built :class:`KernelIR` envelope. The renderer reads

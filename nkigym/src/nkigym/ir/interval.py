@@ -18,9 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nkigym.ir.expr import Const, to_affine
-from nkigym.ir.tree import Buffer, BufferRegion
-
-_PARTITION_DIM = 128
+from nkigym.ir.tree import PARTITION_DIM, Buffer, BufferRegion
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -117,10 +115,10 @@ def _interval_for_axis(axis_range: tuple, axis_index: int, buf: Buffer) -> Affin
         raise ValueError(f"region width must be Const; got {width_expr!r}")
     base = to_affine(lo_expr)
     width = width_expr.value
-    is_partition = axis_index == 0 and buf.location in ("sbuf", "psum") and width == _PARTITION_DIM
+    is_partition = axis_index == 0 and buf.location in ("sbuf", "psum") and width == PARTITION_DIM
     if is_partition:
         """bare tile index -> element space: base *= 128, width stays 128."""
-        base = {var: coeff * _PARTITION_DIM for var, coeff in base.items()}
+        base = {var: coeff * PARTITION_DIM for var, coeff in base.items()}
     return AffineInterval(coeffs=base, width=width)
 
 

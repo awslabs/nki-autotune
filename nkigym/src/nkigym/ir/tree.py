@@ -32,6 +32,13 @@ from nkigym.ir.dimension_analysis import _AnalysisResult
 from nkigym.ir.expr import Expr, format_expr
 from nkigym.ops.base import AxisRole, NKIOp
 
+PARTITION_DIM = 128
+"""NeuronCore SBUF/PSUM partition-axis size. The single source of truth
+for the 128-partition layout, shared by the canonical region builder,
+the codegen renderer, the interval/overlap analysis, and
+:meth:`Buffer.physical_shape`. This is the hardware partition dimension,
+distinct from any per-op ``MIN_TILE_SIZE``/``MAX_TILE_SIZE`` cap."""
+
 
 @dataclass(frozen=True, kw_only=True)
 class ForNode:
@@ -72,7 +79,7 @@ class ISANode:
 
     def label(self) -> str:
         """Return the op name plus per-slot region labels and kwargs, newline-separated."""
-        lines: list[str] = [self.op_cls.__name__]
+        lines: list[str] = [f"nisa.{self.op_cls.NAME}"]
         if self.operand_bindings:
             bindings = ", ".join(f"{slot}={region.label()}" for slot, region in self.operand_bindings.items())
             lines.append(f"bindings=({bindings})")
@@ -120,9 +127,45 @@ class Buffer:
     dtype: str
     location: str
 
+    def physical_shape(self) -> tuple[int, ...]:
+        """Return the shape ``nl.ndarray`` actually allocates for this buffer.
+
+        ``shared_hbm`` buffers keep their 2D logical shape. ``sbuf`` and
+        ``psum`` buffers expand to the 3D NeuronCore layout
+        ``(128, num_p_tiles, F_contig)`` — the partition axis is fixed at
+        128 and the leading logical extent folds into the tile count. This
+        is the single source of truth shared by the renderer
+        (:func:`nkigym.codegen.body._emit_alloc`) and the tree
+        visualization, so the two never drift.
+        """
+        if self.location == "shared_hbm":
+            return self.shape
+        if len(self.shape) != 2:
+            raise AssertionError(f"{self.name}: SBUF/PSUM buffer expects a 2D logical shape; got {self.shape}")
+        leading, free = self.shape
+        if leading % PARTITION_DIM != 0:
+            raise AssertionError(f"{self.name}: leading extent {leading} must be a multiple of {PARTITION_DIM}")
+        return (PARTITION_DIM, leading // PARTITION_DIM, free)
+
+    def physical_dtype(self) -> str:
+        """Return the dtype ``nl.ndarray`` actually allocates for this buffer.
+
+        ``psum`` buffers are always allocated ``float32`` — the matmul HW
+        accumulates at fp32 regardless of the logical dtype the value
+        carries. Every other location uses the logical :attr:`dtype`. This
+        is the physical override paired with :meth:`physical_shape`.
+        """
+        if self.location == "psum":
+            return "float32"
+        return self.dtype
+
     def label(self) -> str:
-        """Return ``name (shape) dtype@location`` on one line."""
-        shape_str = ",".join(str(extent) for extent in self.shape)
+        """Return ``name (physical_shape) dtype@location`` on one line.
+
+        Shows the physical allocation shape (3D for sbuf/psum, 2D for
+        shared_hbm) so the visualization matches the rendered kernel.
+        """
+        shape_str = ", ".join(str(extent) for extent in self.physical_shape())
         return f"{self.name} ({shape_str}) {self.dtype}@{self.location}"
 
 
@@ -321,6 +364,7 @@ __all__ = [
     "IterVar",
     "KernelTree",
     "NodeData",
+    "PARTITION_DIM",
     "build_initial_tree",
     "role_of",
 ]

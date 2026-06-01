@@ -18,13 +18,14 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from nkigym.ir.dimension_analysis import _OpRecord
 from nkigym.ir.expr import Const, Var
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
-from nkigym.ops.alloc import NKIAlloc
+from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole
+from nkigym.ops.memset import NKIMemset
 
 if TYPE_CHECKING:
-    from nkigym.ir.dimension_analysis import TensorDims, _AnalysisResult, _OpRecord
+    from nkigym.ir.dimension_analysis import TensorDims, _AnalysisResult
 
 
 def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
@@ -39,8 +40,9 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     tree = KernelTree()
     op_records = list(analysis.ops)
     buffers_by_name = _collect_buffers(analysis.tensors, analysis.param_names)
-    compute_records = [rec for rec in op_records if rec.op_cls is not NKIAlloc]
-    for rec in compute_records:
+    for rec in op_records:
+        if rec.op_cls.RMW_OPERANDS:
+            _build_memset_subblock(tree, tree.root, rec, analysis)
         _build_subblock(tree, tree.root, rec, analysis)
     """Seed every Buffer on the root block, then let place_buffers redistribute by LCA."""
     root_blk = tree.data(tree.root)
@@ -96,6 +98,31 @@ def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysi
     return block_nid
 
 
+def _build_memset_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysis: "_AnalysisResult") -> int:
+    """Synthesize a memset sibling block zeroing the RMW (accumulator) operand of ``rec``.
+
+    Emitted immediately before the RMW op's own block, mirroring the
+    decomposed-canonical form (memset is a sibling, not a nested init).
+    The dependency edge falls out by sibling pre-order: memset writes the
+    PSUM region, the matmul RMW-reads+writes it (WAW/RAW after memset).
+
+    ``rec``'s RMW slot axes (e.g. matmul dst ``(M, N)``) are remapped onto
+    memset's own abstract axes ``(P, F)`` positionally, so the synthesized
+    record renders correctly against the PSUM tensor.
+    """
+    rmw_slot = next(iter(rec.op_cls.RMW_OPERANDS))
+    rmw_axes = rec.op_cls.OPERAND_AXES[rmw_slot]
+    memset_concrete = [rec.axis_map[a] for a in rmw_axes if a in rec.axis_map]
+    memset_axis_map = {abstract: concrete for abstract, concrete in zip(NKIMemset.OPERAND_AXES["dst"], memset_concrete)}
+    memset_rec = _OpRecord(
+        op_cls=NKIMemset,
+        operand_names={"dst": rec.operand_names[rmw_slot]},
+        axis_map=memset_axis_map,
+        kwargs={"value": 0.0},
+    )
+    return _build_subblock(tree, parent_nid, memset_rec, analysis)
+
+
 def _operand_regions(
     rec: "_OpRecord", loop_var_names: dict[str, str], analysis: "_AnalysisResult"
 ) -> tuple[list[BufferRegion], list[BufferRegion]]:
@@ -140,8 +167,9 @@ def _build_region(
 
     tensor_name = rec.operand_names[slot]
     tensor_location = analysis.tensors[tensor_name].location
+    present_axes = [a for a in axes if a in rec.axis_map]
     ranges: list = []
-    for axis_index, abstract in enumerate(axes):
+    for axis_index, abstract in enumerate(present_axes):
         max_tile = rec.op_cls.MAX_TILE_SIZE.get(abstract)
         if max_tile is None:
             extent_per_tile = analysis.dim_sizes[rec.axis_map[abstract]]
@@ -150,14 +178,13 @@ def _build_region(
         loop_var = loop_var_names.get(abstract)
 
         """Partition axis (axis 0) of SBUF/PSUM operands: tile is 128, lo is bare Var (not multiplied)."""
-        _PARTITION_DIM = 128
         if (
             axis_index == 0
             and tensor_location in ("sbuf", "psum")
-            and extent_per_tile == _PARTITION_DIM
+            and extent_per_tile == PARTITION_DIM
             and loop_var is not None
         ):
-            ranges.append((Var(name=loop_var), Const(value=_PARTITION_DIM)))
+            ranges.append((Var(name=loop_var), Const(value=PARTITION_DIM)))
         elif loop_var is None:
             ranges.append((Const(value=0), Const(value=extent_per_tile)))
         else:
