@@ -214,6 +214,85 @@ def test_split_tensorize_ladder_ops_render_and_sim(tmp_path, op_name, which, axi
     np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
 
 
+def test_split_tensorize_below_min_tile_rejected():
+    """A tensorize-split whose innermost factor < the axis MIN_TILE_SIZE is illegal.
+
+    The matmul M axis (d1) is the PSUM partition axis at tile 128 with
+    MIN_TILE_SIZE 128, so factors=(16,8) (final tile 8) must be rejected by
+    apply's legality check — it would otherwise render a sub-128 partition tile.
+    """
+    ir = build_canonical_ir()
+    mm = next(
+        n
+        for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+    )
+    with pytest.raises(TransformLegalityError, match="MIN_TILE_SIZE"):
+        Split().apply(ir, SplitOption(target_nid=mm, factors=(16, 8), target_axis="d1"))
+
+
+def test_split_analyze_omits_below_min_tensorize_splits():
+    """analyze never offers a tensorize-split whose final factor < the axis MIN_TILE_SIZE.
+
+    The matmul K (d0) and M (d1) axes are at tile 128 = MIN, so they admit no
+    tensorize-split at all; N (d2) at tile 512 admits only finals >= 128
+    (i.e. (4,128); (2,256); (2,2,128)). No option may shrink a partition/
+    contraction tile below the hardware floor.
+    """
+    ir = build_canonical_ir()
+    mm = next(
+        n
+        for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+    )
+    block = next(
+        ir.tree.data(a) for a in reversed(ir.tree.ancestors(mm)) if ir.tree.data(a).__class__.__name__ == "BlockNode"
+    )
+    inverse = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+    min_tile = ir.tree.data(mm).op_cls.MIN_TILE_SIZE
+    tensorize = [o for o in Split().analyze(ir) if o.target_nid == mm and o.target_axis is not None]
+    for opt in tensorize:
+        floor = min_tile[inverse[opt.target_axis]]
+        assert opt.factors[-1] >= floor, f"analyze offered {opt.factors} on {opt.target_axis} below floor {floor}"
+    offered_axes = {o.target_axis for o in tensorize}
+    assert "d0" not in offered_axes and "d1" not in offered_axes
+    assert ("d2", (4, 128)) in {(o.target_axis, o.factors) for o in tensorize}
+
+
+def test_split_tensorize_n_to_128_still_legal(tmp_path):
+    """A tensorize-split whose final factor == MIN_TILE_SIZE stays legal and renders.
+
+    Matmul N (d2) tile 512 -> (4,128): final 128 == MIN, so it is offered,
+    applies, and renders + sims correctly. Guards against an off-by-one that
+    would reject the boundary case.
+    """
+    import importlib.util
+    from test.transforms._fixtures import INPUT_SPECS
+
+    import numpy as np
+
+    from nkigym.codegen import render
+    from nkigym.synthesis.simulate_nki import simulate_fp32
+
+    ir = build_canonical_ir()
+    mm = next(
+        n
+        for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+    )
+    new_ir = Split().apply(ir, SplitOption(target_nid=mm, factors=(4, 128), target_axis="d2"))
+    kernel_path = tmp_path / "kernel.py"
+    kernel_path.write_text(render(new_ir))
+    rng = np.random.default_rng(0)
+    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dt) in INPUT_SPECS.items()}
+    expected = inputs["lhs_T"].T @ inputs["rhs"]
+    spec = importlib.util.spec_from_file_location("k", kernel_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
 def test_split_load_d1_matches_hand_k1_byteexact(tmp_path):
     """k0->k1: split the load's d1 tensorize 2048->(16,128). The rendered load loop must
     be exactly `for i_d1_0 in range(16): dma_copy(... i_d1_0*128 : +128)` — single dense

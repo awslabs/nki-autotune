@@ -34,9 +34,8 @@ from nkigym.transforms import Fuse, Reorder, Split
 
 K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-NUM_ROLLOUTS = 4
-MAX_STEPS = 5
-SEED = 42
+NUM_ROLLOUTS = 3
+MAX_STEPS = 10
 
 
 def f_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -75,7 +74,7 @@ if __name__ == "__main__":
 
     """Random-policy rollouts via the KernelMDP environment."""
     env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder()])
-    rng = random.Random(SEED)
+    rng = random.Random()
     for k in range(NUM_ROLLOUTS):
         state = env.reset()
         cache_0 = f"{CACHE_DIR}/rollout_{k}/step_0"

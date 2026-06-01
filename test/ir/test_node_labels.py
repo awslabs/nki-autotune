@@ -157,20 +157,26 @@ def test_blocknode_label_renders_non_empty_annotations():
     assert text.count("∅") == 5
 
 
-def test_mermaid_node_labels_escape_brackets_and_newlines():
-    """Every Mermaid node label is self-contained: no raw newline, no literal [ or ] inside the quoted text."""
+def test_mermaid_node_labels_keep_brackets_literal_no_raw_newline():
+    """Every Mermaid node label is self-contained and renders region brackets literally.
+
+    Labels carry no raw newline (converted to ``<br/>``) and no HTML
+    bracket entity (``&#91;``/``&#93;``). Brackets inside the quoted node
+    string are left literal — Mermaid treats them as text there, and
+    entity-encoding made it leak a stray ``&`` into the rendered label.
+    """
     from test.transforms._fixtures import build_canonical_ir
 
     from nkigym.ir.tree_visualize import _to_mermaid
 
     mmd = _to_mermaid(build_canonical_ir().tree)
+    assert "&#91;" not in mmd and "&#93;" not in mmd, "bracket entity leaks a stray & in the rendered label"
     for line in mmd.splitlines():
         stripped = line.strip()
         if not (stripped.startswith("n") and '"' in stripped):
             continue
         inner = stripped[stripped.index('"') + 1 : stripped.rindex('"')]
         assert "\n" not in inner, f"raw newline in label: {stripped!r}"
-        assert "[" not in inner and "]" not in inner, f"unescaped bracket in label: {stripped!r}"
 
 
 def test_mermaid_shows_blocknode_iter_values_and_regions():
@@ -183,5 +189,6 @@ def test_mermaid_shows_blocknode_iter_values_and_regions():
     assert "iter_values:" in mmd
     assert "reads:" in mmd and "writes:" in mmd
     assert "annotations:" in mmd
-    """Region brackets are HTML-escaped, so the entity appears instead of a literal [."""
-    assert "&#91;" in mmd
+    """Region offsets render with literal brackets (e.g. lhs_T[...]), no HTML entity."""
+    assert "lhs_T[" in mmd
+    assert "&#91;" not in mmd

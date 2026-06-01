@@ -57,7 +57,10 @@ class Split(Transform):
                     current = _current_tensorize_width(data, block, concrete)
                     if current is None or current < 2:
                         continue
+                    floor = _min_tile_floor(data, block, concrete)
                     for factors in _factorizations(current):
+                        if floor is not None and factors[-1] < floor:
+                            continue
                         options.append(SplitOption(target_nid=nid, factors=factors, target_axis=concrete))
         return options
 
@@ -104,6 +107,12 @@ class Split(Transform):
             if prod(option.factors) != current:
                 raise TransformLegalityError(
                     f"Split.factors product {prod(option.factors)} != current tensorize width {current}"
+                )
+            floor = _min_tile_floor(target, block, option.target_axis)
+            if floor is not None and option.factors[-1] < floor:
+                raise TransformLegalityError(
+                    f"Split.target_axis={option.target_axis!r}: innermost tile {option.factors[-1]} "
+                    f"< MIN_TILE_SIZE {floor}"
                 )
 
     def _do_outer_trip(self, ir: KernelIR, option: SplitOption) -> None:
@@ -246,6 +255,23 @@ def _current_tensorize_width(leaf: ISANode, block: BlockNode, concrete_axis: str
                     width = hi.value
                     break
     return width
+
+
+def _min_tile_floor(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int | None:
+    """Minimum legal innermost tile for ``concrete_axis``, or ``None`` if unconstrained.
+
+    Translates the block iter_var dim (e.g. ``d1``) to the abstract op-axis
+    (e.g. ``M``) via ``block.axis_map`` and reads the op's
+    ``MIN_TILE_SIZE``. A tensorize-split whose innermost factor falls below
+    this floor would shrink the access tile past the hardware minimum (the
+    partition axis must stay at 128); such a split is illegal.
+    """
+    inverse = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+    abstract = inverse.get(concrete_axis)
+    floor: int | None = None
+    if abstract is not None:
+        floor = leaf.op_cls.MIN_TILE_SIZE.get(abstract)
+    return floor
 
 
 def _factorizations(n: int) -> list[tuple[int, ...]]:

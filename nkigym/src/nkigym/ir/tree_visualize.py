@@ -65,10 +65,13 @@ def _tree_node_decl(node_id: str, nid: int, data: NodeData) -> tuple[str, str | 
 def _mermaid_escape(text: str) -> str:
     """Make a label safe inside a Mermaid node string.
 
-    Square brackets become HTML entities (Mermaid reads literal ``[``/``]``
-    as node-shape syntax); newlines become ``<br/>`` line breaks.
+    Only newlines need handling — they become ``<br/>`` line breaks.
+    Square brackets are left literal: inside the quoted node string
+    (``["..."]`` / ``[["..."]]``) Mermaid treats them as text, so the
+    region offsets render as ``lhs_T[...]``. Entity-encoding them as
+    ``&#91;``/``&#93;`` made Mermaid leak a stray ``&`` into the label.
     """
-    return text.replace("[", "&#91;").replace("]", "&#93;").replace("\n", "<br/>")
+    return text.replace("\n", "<br/>")
 
 
 __all__ = ["dump_tree"]
