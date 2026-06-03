@@ -49,14 +49,21 @@ def test_reverse_rejects_target_inside_moved_block():
         ReverseComputeAt().apply(ir, ReverseComputeAtOption(block_nid=tc, target_loop_nid=own, index=-1))
 
 
-def test_reverse_lift_tensor_copy_under_matmul_renders_and_sims():
-    """Full-extent lift of tensor_copy under the matmul M-loop renders + sims."""
+def test_reverse_lift_store_under_tensor_copy_renders_and_sims():
+    """Full-extent lift of the store under the tensor_copy's PARALLEL M-loop renders + sims.
+
+    The store consumes ``sbuf_prod``, which the tensor_copy's M-loop does not
+    carry (PARALLEL role), so the lift respects carry-domination and is legal.
+    Lifting the tensor_copy itself into the matmul's K (ACCUMULATION) loop is
+    correctly rejected by the dependency model and is exercised by the
+    rejection tests instead.
+    """
     ir = build_canonical_ir()
+    store = _block_for_op(ir, "NKIStore")
     tc = _block_for_op(ir, "NKITensorCopy")
-    mm = _block_for_op(ir, "NKIMatmul")
-    m_loop = _first_for_in(ir, mm)
-    new_ir = ReverseComputeAt().apply(ir, ReverseComputeAtOption(block_nid=tc, target_loop_nid=m_loop, index=-1))
-    assert tc in new_ir.tree.descendants(m_loop)
+    m_loop = _first_for_in(ir, tc)
+    new_ir = ReverseComputeAt().apply(ir, ReverseComputeAtOption(block_nid=store, target_loop_nid=m_loop, index=-1))
+    assert store in new_ir.tree.descendants(m_loop)
     rng = np.random.default_rng(0)
     inputs = {n: rng.standard_normal(s).astype(np.float32) for n, (s, _d) in INPUT_SPECS.items()}
     expected = inputs["lhs_T"].T @ inputs["rhs"]

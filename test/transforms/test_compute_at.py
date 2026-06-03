@@ -13,7 +13,7 @@ import kernel_transforms as KT
 from nkigym.codegen import render
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.synthesis.simulate_nki import simulate_fp32
-from nkigym.transforms import ComputeAt, ComputeAtOption, Split, SplitOption, TransformLegalityError
+from nkigym.transforms import ComputeAt, ComputeAtOption, ReverseComputeAt, Split, SplitOption, TransformLegalityError
 
 
 def _block_for_op(ir, op_name: str) -> int:
@@ -50,23 +50,43 @@ def test_compute_at_rejects_non_fornode_target():
 
 
 def test_compute_at_rejects_sinking_writer_under_accumulation_loop():
-    """Sinking the PSUM memset (a writer) under the matmul K loop re-inits the reduction.
-
-    The matmul's ``d0`` (K) iter-var is ``ACCUMULATION``; sinking the
-    ``NKIMemset`` block (which writes ``psum_prod``) under that loop re-zeros
-    the accumulator every K-tile. ``analyze`` must not offer it, and ``apply``
-    must raise ``TransformLegalityError``.
-    """
+    """Sinking the memset (accumulator init) under the matmul K loop is rejected
+    by the dependency model (memset->K-loop carry edge would point backward),
+    not an ad-hoc role guard."""
     ir = build_canonical_ir()
     memset = _block_for_op(ir, "NKIMemset")
     mm = _block_for_op(ir, "NKIMatmul")
     kloop = next(
         d for d in ir.tree.preorder(mm) if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == "i_d0_0"
     )
-    with pytest.raises(TransformLegalityError, match="accumulation|psum_prod"):
+    with pytest.raises(TransformLegalityError, match="reorder|dependency"):
         ComputeAt().apply(ir, ComputeAtOption(block_nid=memset, target_loop_nid=kloop, index=0))
-    offered = [o for o in ComputeAt().analyze(ir) if o.block_nid == memset and o.target_loop_nid == kloop]
-    assert offered == []
+    assert not any(o.block_nid == memset and o.target_loop_nid == kloop for o in ComputeAt().analyze(ir))
+
+
+def test_compute_at_rejects_consumer_sunk_before_producer():
+    """Hole #1: sinking the tensor_copy (consumer of psum_prod) under the memset's
+    loop would place it before the matmul producer -> rejected by the same model."""
+    ir = build_canonical_ir()
+    tc = _block_for_op(ir, "NKITensorCopy")
+    memset = _block_for_op(ir, "NKIMemset")
+    memset_loop = next(d for d in ir.tree.preorder(memset) if isinstance(ir.tree.data(d), ForNode))
+    with pytest.raises(TransformLegalityError, match="reorder|dependency"):
+        ComputeAt().apply(ir, ComputeAtOption(block_nid=tc, target_loop_nid=memset_loop, index=0))
+
+
+def test_analyze_does_not_crash_on_transformed_states():
+    """analyze must filter (not crash on) candidates across ladder states 1..12.
+
+    The move-sim legality runs ``_move`` on every candidate, including re-moving
+    an already-nested block. A splice that left a node double-parented used to
+    crash the downstream ``Dependency`` rebuild; ``analyze`` must filter such a
+    candidate, never raise.
+    """
+    for n in range(1, 13):
+        ir = build_ladder_state(n)
+        ComputeAt().analyze(ir)
+        ReverseComputeAt().analyze(ir)
 
 
 def test_compute_at_sink_load_under_matmul_renders_and_sims():

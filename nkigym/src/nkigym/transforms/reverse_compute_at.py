@@ -1,7 +1,9 @@
 """``ReverseComputeAt`` — lift a consumer block under a producer's loop.
 
 See ``compute_at_legality.md`` (conditions 1-3, 5b, 6). Structural move is
-the shared ``_move``; this face owns the producer-direction legality.
+the shared ``_move``; ordering legality (condition 5b) is delegated to
+``_check_move_preserves_dependencies``: it simulates the lift and rejects any
+dependency edge that would point backward afterward.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from nkigym.ir import KernelIR
 from nkigym.ir.buffer_placement import place_buffers
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import ForNode, ISANode
-from nkigym.transforms._code_motion import _move
+from nkigym.transforms._code_motion import _check_move_preserves_dependencies, _move
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
@@ -84,7 +86,7 @@ class ReverseComputeAt(Transform):
         return list(range(lp + 1, fc + 1))
 
     def _check_legality(self, ir: KernelIR, option: ReverseComputeAtOption) -> None:
-        """Conditions 1-3, 5b. (6 enumerated by _legal_indices.)"""
+        """Conditions 1-3, then move-sim ordering (5b). (6 enumerated by _legal_indices.)"""
         if option.target_loop_nid not in ir.tree.graph:
             raise TransformLegalityError(f"target_loop_nid={option.target_loop_nid} not in tree")
         if not isinstance(ir.tree.data(option.target_loop_nid), ForNode):
@@ -99,38 +101,7 @@ class ReverseComputeAt(Transform):
                 f"target_loop_nid={option.target_loop_nid} is a descendant of moved block "
                 f"{option.block_nid} (cannot lift under its own loop)"
             )
-        self._check_producers_visited(ir, option)
-
-    def _check_producers_visited(self, ir: KernelIR, option: ReverseComputeAtOption) -> None:
-        """Condition 5b: every producer is under the target, encloses the target, OR is an earlier root-sibling."""
-        target_root = self._root_sibling_of(ir, option.target_loop_nid)
-        root_order = ir.tree.children(ir.tree.root)
-        target_index = root_order.index(target_root)
-        target_descendants = ir.tree.descendants(option.target_loop_nid)
-        for producer in ir.dependency.producers(option.block_nid):
-            if producer in target_descendants:
-                continue
-            if option.target_loop_nid in ir.tree.descendants(producer):
-                continue
-            producer_root = self._root_sibling_of(ir, producer)
-            if producer_root not in root_order:
-                raise TransformLegalityError(f"producer block {producer} not under a root-sibling")
-            if root_order.index(producer_root) < target_index:
-                continue
-            raise TransformLegalityError(
-                f"producer block {producer} runs after the target loop "
-                f"(root index {root_order.index(producer_root)} >= target {target_index})"
-            )
-
-    @staticmethod
-    def _root_sibling_of(ir: KernelIR, nid: int) -> int:
-        """Return the direct child of tree.root that is nid or an ancestor of it."""
-        if nid in ir.tree.children(ir.tree.root):
-            return nid
-        for anc in ir.tree.ancestors(nid):
-            if anc in ir.tree.children(ir.tree.root):
-                return anc
-        raise TransformLegalityError(f"node {nid} has no root-sibling ancestor")
+        _check_move_preserves_dependencies(ir, option.block_nid, option.target_loop_nid, option.index, is_reverse=True)
 
 
 __all__ = ["ReverseComputeAt", "ReverseComputeAtOption"]

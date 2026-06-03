@@ -1,9 +1,10 @@
 """``ComputeAt`` — sink a producer block under a consumer's loop.
 
 See ``compute_at_legality.md`` (conditions 1-4, 5a, 6). Structural move is
-the shared ``_move``; this face owns the consumer-direction legality plus
-the output-block guard (condition 4: the kernel's final store cannot be
-sunk).
+the shared ``_move``; this face owns the output-block guard (condition 4:
+the kernel's final store cannot be sunk). Ordering legality (condition 5a)
+is delegated to ``_check_move_preserves_dependencies``: it simulates the move
+and rejects any dependency edge that would point backward afterward.
 """
 
 from __future__ import annotations
@@ -15,10 +16,8 @@ from nkigym.codegen.compact import compact_shapes
 from nkigym.ir import KernelIR
 from nkigym.ir.buffer_placement import place_buffers
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import BlockNode, ForNode, ISANode, role_of
-from nkigym.ops.base import AxisRole
-from nkigym.transforms._code_motion import _move
-from nkigym.transforms._domain_solve import _enclosing_block, _loopvar_to_dim
+from nkigym.ir.tree import ForNode, ISANode
+from nkigym.transforms._code_motion import _check_move_preserves_dependencies, _move
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
@@ -88,7 +87,7 @@ class ComputeAt(Transform):
         return list(range(lp + 1, fc + 1))
 
     def _check_legality(self, ir: KernelIR, option: ComputeAtOption) -> None:
-        """Conditions 1-4, 5a. (6 enumerated by _legal_indices.)"""
+        """Conditions 1-4, then move-sim ordering (5a). (6 enumerated by _legal_indices.)"""
         if option.target_loop_nid not in ir.tree.graph:
             raise TransformLegalityError(f"target_loop_nid={option.target_loop_nid} not in tree")
         if not isinstance(ir.tree.data(option.target_loop_nid), ForNode):
@@ -113,71 +112,7 @@ class ComputeAt(Transform):
                     raise TransformLegalityError(
                         f"ComputeAt cannot sink the output block (writes return {ir.return_name})"
                     )
-        self._check_no_writer_under_accumulation(ir, option)
-        self._check_consumers_visited(ir, option)
-
-    def _check_no_writer_under_accumulation(self, ir: KernelIR, option: ComputeAtOption) -> None:
-        """Reject sinking a block that writes a tensor under a reduction loop.
-
-        Sinking an initializer/writer inside a reduction loop re-runs the init
-        each accumulation step, destroying the reduction (e.g. a PSUM memset
-        sunk under the matmul's K loop re-zeros the accumulator every K-tile, so
-        only the last tile's product survives). The only op that legitimately
-        lives inside a reduction loop is the reducer itself, never a separate
-        writer block.
-
-        The guard fires when the moved block has any write region AND the
-        target loop binds an iter-var whose role on its owning block is
-        ``AxisRole.ACCUMULATION``.
-        """
-        moved = ir.tree.data(option.block_nid)
-        assert isinstance(moved, BlockNode)
-        written = {region.tensor for region in moved.writes}
-        if not written:
-            return
-        owner_nid = _enclosing_block(ir.tree, option.target_loop_nid)
-        owner = ir.tree.data(owner_nid)
-        assert isinstance(owner, BlockNode)
-        target = ir.tree.data(option.target_loop_nid)
-        assert isinstance(target, ForNode)
-        axis = _loopvar_to_dim(ir.tree, owner_nid).get(target.loop_var)
-        if axis is None or role_of(owner, axis) != AxisRole.ACCUMULATION:
-            return
-        raise TransformLegalityError(
-            f"ComputeAt cannot sink writer of {sorted(written)} under accumulation loop "
-            f"{target.loop_var} (axis {axis}); re-runs the init each reduction step"
-        )
-
-    def _check_consumers_visited(self, ir: KernelIR, option: ComputeAtOption) -> None:
-        """Condition 5a: every consumer is under the target, encloses the target, OR is a later root-sibling."""
-        target_root = self._root_sibling_of(ir, option.target_loop_nid)
-        root_order = ir.tree.children(ir.tree.root)
-        target_index = root_order.index(target_root)
-        target_descendants = ir.tree.descendants(option.target_loop_nid)
-        for consumer in ir.dependency.consumers(option.block_nid):
-            if consumer in target_descendants:
-                continue
-            if option.target_loop_nid in ir.tree.descendants(consumer):
-                continue
-            consumer_root = self._root_sibling_of(ir, consumer)
-            if consumer_root not in root_order:
-                raise TransformLegalityError(f"consumer block {consumer} not under a root-sibling")
-            if root_order.index(consumer_root) > target_index:
-                continue
-            raise TransformLegalityError(
-                f"consumer block {consumer} runs before the target loop "
-                f"(root index {root_order.index(consumer_root)} <= target {target_index})"
-            )
-
-    @staticmethod
-    def _root_sibling_of(ir: KernelIR, nid: int) -> int:
-        """Return the direct child of tree.root that is nid or an ancestor of it."""
-        if nid in ir.tree.children(ir.tree.root):
-            return nid
-        for anc in ir.tree.ancestors(nid):
-            if anc in ir.tree.children(ir.tree.root):
-                return anc
-        raise TransformLegalityError(f"node {nid} has no root-sibling ancestor")
+        _check_move_preserves_dependencies(ir, option.block_nid, option.target_loop_nid, option.index, is_reverse=False)
 
 
 __all__ = ["ComputeAt", "ComputeAtOption"]

@@ -178,3 +178,196 @@ def test_overlapping_tile_writes_have_edge():
     b = add_writer()
     dep = Dependency(tree)
     assert dep.must_precede(a, b)
+
+
+def test_carry_loops_of_matmul_leaf():
+    """The matmul leaf's K loop (d0, ACCUMULATION) carries psum_prod; M/N (PARALLEL) carry nothing."""
+    from nkigym.ir.dependency import _carry_loops_of_leaf
+    from nkigym.ir.tree import ISANode
+
+    ir = build_canonical_ir()
+    matmul_leaf = next(
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+    )
+    carries = _carry_loops_of_leaf(ir.tree, matmul_leaf)
+    carried_buffers = set(carries.values())
+    assert carried_buffers == {"psum_prod"}, carried_buffers
+    assert len(carries) == 1
+    (kloop_nid,) = carries
+    from nkigym.ir.tree import ForNode
+
+    assert isinstance(ir.tree.data(kloop_nid), ForNode)
+    assert ir.tree.data(kloop_nid).loop_var == "i_d0_0"
+
+
+def test_carry_loops_empty_for_pure_parallel_leaf():
+    """A load leaf (all-PARALLEL axes) has no carry loops."""
+    from nkigym.ir.dependency import _carry_loops_of_leaf
+    from nkigym.ir.tree import ISANode
+
+    ir = build_canonical_ir()
+    load_leaf = next(
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKILoad
+    )
+    assert _carry_loops_of_leaf(ir.tree, load_leaf) == {}
+
+
+def test_dependency_graph_keyed_on_leaf_nids():
+    """Graph nodes are ISA-leaf nids or carry-loop ForNode nids, never block nids."""
+    from nkigym.ir.tree import ForNode, ISANode
+
+    ir = build_canonical_ir()
+    for node in ir.dependency.graph.nodes:
+        data = ir.tree.data(node)
+        assert isinstance(data, (ISANode, ForNode)), f"node {node} is neither an ISA leaf nor a carry loop"
+
+
+def test_must_precede_accepts_block_or_leaf_nids():
+    """must_precede works whether given block nids (legacy) or leaf nids (resolved either way)."""
+    ir = build_canonical_ir()
+    matmul_blk = _block_for_op(ir, NKIMatmul)
+    store_blk = _block_for_op(ir, NKIStore)
+    from nkigym.ir.tree import ISANode
+
+    def leaf_of(blk):
+        return next(
+            d
+            for d in ir.tree.preorder(blk)
+            if isinstance(ir.tree.data(d), ISANode)
+            and next(a for a in reversed(ir.tree.ancestors(d)) if isinstance(ir.tree.data(a), BlockNode)) == blk
+        )
+
+    assert ir.dependency.must_precede(matmul_blk, store_blk)
+    assert ir.dependency.must_precede(leaf_of(matmul_blk), leaf_of(store_blk))
+
+
+def test_carry_edges_memset_dominates_kloop_and_kloop_dominates_drain():
+    """Canonical: memset_leaf -> K_loop and K_loop -> tensor_copy_leaf carry edges exist."""
+    from nkigym.ir.tree import ForNode, ISANode
+    from nkigym.ops.memset import NKIMemset
+
+    ir = build_canonical_ir()
+    dep = ir.dependency
+
+    def leaf(op_cls):
+        return next(
+            n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is op_cls
+        )
+
+    memset_leaf = leaf(NKIMemset)
+    matmul_leaf = leaf(NKIMatmul)
+    tc_leaf = leaf(NKITensorCopy)
+    kloop = next(
+        a
+        for a in ir.tree.ancestors(matmul_leaf)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+    )
+
+    assert dep.graph.has_edge(memset_leaf, kloop), "memset must dominate the K loop"
+    assert dep.graph.has_edge(kloop, tc_leaf), "K loop must dominate the drain (tensor_copy)"
+
+
+def test_no_carry_edge_for_input_loads():
+    """The lhs_T load (writes sbuf_lhs_T, indexed by K) gets NO edge to the K loop."""
+    from nkigym.ir.tree import ForNode, ISANode
+
+    ir = build_canonical_ir()
+    dep = ir.dependency
+    matmul_leaf = next(
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+    )
+    kloop = next(
+        a
+        for a in ir.tree.ancestors(matmul_leaf)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+    )
+    load_leaves = [
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKILoad
+    ]
+    for ll in load_leaves:
+        assert not dep.graph.has_edge(ll, kloop), f"load {ll} must NOT be forced to dominate K"
+
+
+def test_first_backward_edge_flags_memset_sunk_under_kloop():
+    """After sinking the memset (writer of psum_prod, carried over K) under the
+    K loop, the memset->K-loop carry edge points backward."""
+    import copy
+
+    from nkigym.ir.dependency import Dependency
+    from nkigym.ir.tree import ForNode, ISANode
+    from nkigym.ops.memset import NKIMemset
+    from nkigym.transforms._code_motion import _move
+
+    ir = build_canonical_ir()
+    memset_blk = _block_for_op(ir, NKIMemset)
+    matmul_leaf = next(
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+    )
+    kloop = next(
+        a
+        for a in ir.tree.ancestors(matmul_leaf)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+    )
+    moved = copy.deepcopy(ir)
+    _move(moved, block_nid=memset_blk, target_loop_nid=kloop, index=0, is_reverse=False)
+    dep = Dependency(moved.tree)
+    memset_leaf = next(
+        n
+        for n in moved.tree.preorder()
+        if isinstance(moved.tree.data(n), ISANode) and moved.tree.data(n).op_cls is NKIMemset
+    )
+    assert dep.first_backward_edge(memset_leaf) is not None
+
+
+def test_first_backward_edge_flags_consumer_before_producer():
+    """Sinking the tensor_copy (consumer of psum_prod) under the MEMSET's loop puts it
+    before the matmul that produces psum_prod -> backward flow edge matmul->tensor_copy."""
+    import copy
+
+    from nkigym.ir.dependency import Dependency
+    from nkigym.ir.tree import ForNode, ISANode
+    from nkigym.ops.memset import NKIMemset
+    from nkigym.transforms._code_motion import _move
+
+    ir = build_canonical_ir()
+    tc_blk = _block_for_op(ir, NKITensorCopy)
+    memset_blk = _block_for_op(ir, NKIMemset)
+    memset_loop = next(d for d in ir.tree.preorder(memset_blk) if isinstance(ir.tree.data(d), ForNode))
+    moved = copy.deepcopy(ir)
+    _move(moved, block_nid=tc_blk, target_loop_nid=memset_loop, index=0, is_reverse=False)
+    dep = Dependency(moved.tree)
+    tc_leaf = next(
+        n
+        for n in moved.tree.preorder()
+        if isinstance(moved.tree.data(n), ISANode) and moved.tree.data(n).op_cls is NKITensorCopy
+    )
+    assert dep.first_backward_edge(tc_leaf) is not None
+
+
+def test_first_backward_edge_allows_load_under_kloop():
+    """Sinking the lhs_T load (writes sbuf_lhs_T, NOT carried over K) under K is legal -> None."""
+    import copy
+
+    from nkigym.ir.dependency import Dependency
+    from nkigym.ir.tree import ForNode, ISANode
+    from nkigym.transforms._code_motion import _move
+
+    ir = build_canonical_ir()
+    load_blk = _block_for_op(ir, NKILoad)
+    matmul_leaf = next(
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+    )
+    kloop = next(
+        a
+        for a in ir.tree.ancestors(matmul_leaf)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+    )
+    moved = copy.deepcopy(ir)
+    _move(moved, block_nid=load_blk, target_loop_nid=kloop, index=0, is_reverse=False)
+    dep = Dependency(moved.tree)
+    load_leaf = next(
+        n
+        for n in moved.tree.preorder()
+        if isinstance(moved.tree.data(n), ISANode) and moved.tree.data(n).op_cls is NKILoad
+    )
+    assert dep.first_backward_edge(load_leaf) is None

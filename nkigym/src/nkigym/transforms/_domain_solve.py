@@ -162,8 +162,18 @@ def regen_and_rebind(tree: KernelTree, block_nid: int, solved: dict[str, DimDoma
     block = tree.data(block_nid)
     assert isinstance(block, BlockNode)
 
-    """Detach the block's body leaf (single ISA leaf) from its current loop chain."""
+    """Detach the block's body leaf (single ISA leaf) from its current parent.
+
+    The leaf's parent may be a local ForNode (later stripped) OR the block
+    itself when a prior move collapsed all of the block's local loops (the leaf
+    is then edged directly from ``block_nid``). Removing that incoming edge here
+    guarantees the leaf is parentless before the regenerated residual chain (or
+    the block) re-attaches it; otherwise the direct ``block_nid -> leaf`` edge
+    survives ``_strip_block_loops`` and the leaf ends up double-parented.
+    """
     body_leaf = _single_body_leaf(tree, block_nid)
+    for pred in list(tree.graph.predecessors(body_leaf)):
+        tree.graph.remove_edge(pred, body_leaf)
     _strip_block_loops(tree, block_nid)
 
     """Regenerate residual ForNodes (one per dim with residual_extent > 1), chained."""
