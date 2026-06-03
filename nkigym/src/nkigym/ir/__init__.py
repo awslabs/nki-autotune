@@ -1,8 +1,28 @@
 """Dim unification analysis + canonical schedule tree for an ``f_nkigym`` callable."""
 
+from nkigym.ir.arith.expr import (
+    EQ,
+    LE,
+    LT,
+    Add,
+    Const,
+    Expr,
+    FloorDiv,
+    Max,
+    Min,
+    Mod,
+    Mul,
+    NonAffineError,
+    Sub,
+    Var,
+    affine_terms,
+    format_expr,
+    from_affine,
+    substitute,
+    to_affine,
+)
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.dimension_analysis import TensorDims
-from nkigym.ir.expr import Expr
 from nkigym.ir.ir import KernelIR, build_initial_ir
 from nkigym.ir.tree import (
     BlockNode,
@@ -17,18 +37,36 @@ from nkigym.ir.tree import (
 )
 
 __all__ = [
+    "Add",
     "BlockNode",
     "Buffer",
     "BufferRegion",
+    "Const",
     "Dependency",
+    "EQ",
     "Expr",
+    "FloorDiv",
     "ForNode",
     "ISANode",
     "IterVar",
     "KernelIR",
     "KernelTree",
+    "LE",
+    "LT",
+    "Max",
+    "Min",
+    "Mod",
+    "Mul",
     "NodeData",
+    "NonAffineError",
+    "Sub",
     "TensorDims",
+    "Var",
+    "affine_terms",
     "build_initial_ir",
     "build_initial_tree",
+    "format_expr",
+    "from_affine",
+    "substitute",
+    "to_affine",
 ]

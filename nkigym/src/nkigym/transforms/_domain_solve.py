@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import prod
 
-from nkigym.ir.expr import Expr, from_affine, to_affine
+from nkigym.ir.arith.expr import Expr, from_affine, to_affine
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.transforms._tree_ops import _block_local_descendants
 

@@ -22,7 +22,7 @@ from pathlib import Path
 import networkx as nx
 
 from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
-from nkigym.ir.expr import to_affine
+from nkigym.ir.arith.expr import to_affine
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree, role_of
 from nkigym.ops.base import AxisRole

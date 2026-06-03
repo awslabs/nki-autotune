@@ -55,7 +55,7 @@ def test_buffer_physical_dtype_overrides_psum_to_fp32():
 
 def test_bufferregion_label_renders_lo_and_width():
     """BufferRegion.label() shows each axis as ``lo : +width`` (ranges store (lo, width))."""
-    from nkigym.ir.expr import Const, Mul, Var
+    from nkigym.ir.arith.expr import Const, Mul, Var
     from nkigym.ir.tree import BufferRegion
 
     region = BufferRegion(
@@ -70,7 +70,7 @@ def test_bufferregion_label_renders_lo_and_width():
 
 def test_bufferregion_label_single_axis():
     """A single-axis region renders without a comma separator."""
-    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.arith.expr import Const, Var
     from nkigym.ir.tree import BufferRegion
 
     region = BufferRegion(tensor="t", ranges=((Var(name="v"), Const(value=512)),))
@@ -86,7 +86,7 @@ def test_fornode_label():
 
 def test_isanode_label_includes_op_bindings_and_kwargs():
     """ISANode.label() lists the op name, per-slot region labels, and kwargs."""
-    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.arith.expr import Const, Var
     from nkigym.ir.tree import BufferRegion, ISANode
     from nkigym.ops.memset import NKIMemset
 
@@ -123,7 +123,7 @@ def test_blocknode_label_empty_root_shows_all_fields_with_empty_marker():
 
 def test_blocknode_label_full_renders_every_field_content():
     """A populated block surfaces iter_var/iter_value/read/write/alloc content."""
-    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.arith.expr import Const, Var
     from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, IterVar
 
     block = BlockNode(

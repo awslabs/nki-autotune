@@ -18,8 +18,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from nkigym.ir.arith.expr import Const, Var
 from nkigym.ir.dimension_analysis import _OpRecord
-from nkigym.ir.expr import Const, Var
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole
 from nkigym.ops.memset import NKIMemset
@@ -178,7 +178,7 @@ def _build_region(
     SBUF/PSUM operands use 3D layout with partition axis special: axis 0 has
     width=128, lo is the bare partition-coord Var (not multiplied).
     """
-    from nkigym.ir.expr import Mul
+    from nkigym.ir.arith.expr import Mul
 
     tensor_name = rec.operand_names[slot]
     tensor_location = analysis.tensors[tensor_name].location

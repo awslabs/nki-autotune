@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from math import prod
 
 from nkigym.ir import KernelIR
+from nkigym.ir.arith.expr import Const, Expr
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.expr import Const, Expr
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.transforms._normalize import normalize_block
 from nkigym.transforms._tile_region import retile_region
@@ -144,6 +144,21 @@ class Split(Transform):
         The new loops carry temporary names and the affected-axis access
         width is set to ``factors[-1]``; :func:`normalize_block` then assigns
         dense names and recomputes the region offsets from the loop strides.
+
+        Scope — exact-division-only. ``Split`` (both flavours) splits a factor
+        into sub-factors whose product equals the factor: ``_factorizations``
+        only enumerates exact divisors (``remaining % f == 0``) and
+        :meth:`_check_legality` rejects ``prod(factors) != current``. Ragged /
+        non-divisible splits — where the innermost factor does not divide the
+        extent and TVM appends a ``BlockPredicate`` (``floormod`` guard) to mask
+        the out-of-range tail (its ``BlockPredicateAppender``) — are out of
+        scope here: the IR only ever generates tile-multiple splits (constrained
+        by the hardware tile multiples / per-op ``MIN_TILE_SIZE``), so no ragged
+        split is reachable and no predicate-elision path exists. The bespoke
+        affine work this path would otherwise carry (region-offset recompute)
+        lives in :func:`normalize_block` (our equivalent of TVM's
+        ``IterMapSimplifyBlockBinding``); this method only does structural loop
+        insertion plus a constant width-set via :func:`retile_region`.
         """
         leaf_nid = option.target_nid
         leaf = ir.tree.data(leaf_nid)

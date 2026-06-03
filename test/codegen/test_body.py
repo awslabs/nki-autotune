@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from nkigym.codegen.body import render_buffer_region
-from nkigym.ir.expr import Const, Mul, Var
+from nkigym.ir.arith.expr import Const, Mul, Var
 from nkigym.ir.tree import Buffer, BufferRegion
 
 

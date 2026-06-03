@@ -6,7 +6,7 @@ from test.transforms._fixtures import build_canonical_ir
 
 import pytest
 
-from nkigym.ir.expr import to_affine
+from nkigym.ir.arith.expr import to_affine
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.transforms import Split, SplitOption, TransformLegalityError
 
@@ -74,7 +74,7 @@ def test_split_outer_trip_rewrites_iter_value_for_bound_axis():
     """Identify which iter_var was bound by the original loop_var."""
     bound_axis_index = None
     for i, value in enumerate(matmul_block.iter_values):
-        from nkigym.ir.expr import Var
+        from nkigym.ir.arith.expr import Var
 
         if isinstance(value, Var) and value.name == target_loop_var:
             bound_axis_index = i
@@ -141,7 +141,7 @@ def test_split_tensorize_load_d1_to_16x128(tmp_path):
     import numpy as np
 
     from nkigym.codegen import render
-    from nkigym.ir.expr import Const
+    from nkigym.ir.arith.expr import Const
     from nkigym.ir.tree import ISANode
     from nkigym.synthesis.simulate_nki import simulate_fp32
     from nkigym.transforms import Split, SplitOption
@@ -344,3 +344,135 @@ def test_split_trip_dense_names():
     ]
     assert "i_d1_0" in names and "i_d1_1" in names
     assert not any("_0_" in nm for nm in names), names
+
+
+def test_split_matches_tvm_structure():
+    """Layer-B guard: our outer-trip Split's loop nest matches TVM's own ``schedule.split``.
+
+    Splits the canonical matmul's ``i_d1_0`` loop (extent 16) by ``(4, 4)`` and
+    confronts the resulting d1-loop extents AND the recovered iter_var binding
+    against TVM's own TensorIR ``schedule.split`` on an equivalent extent-16 loop
+    (the Layer-B structural oracle). TVM's ``substitute_value`` is
+    ``Σ var_i · Π(factor_j, j>i)`` = ``i0*4 + i1``; our :func:`normalize_block`
+    must reproduce the same outer->inner extents ``[4, 4]`` and the same binding.
+    This is a regression guard on structural fidelity, orthogonal to the
+    byte-exact ladder gate.
+    """
+    pytest.importorskip("tvm")
+    from test.transforms._oracle_helpers import enclosing_for_nids
+    from test.transforms._tvm_struct_oracle import tvm_split_loopnest
+
+    from nkigym.ir.arith.expr import Var, format_expr, substitute
+
+    ir = build_canonical_ir()
+    mm = next(
+        n
+        for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+    )
+    mloop = next(
+        a
+        for a in ir.tree.ancestors(mm)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d1_0"
+    )
+    extent = ir.tree.data(mloop).extent
+    factors = (4, 4)
+    assert extent == 16 and factors[0] * factors[1] == extent
+
+    out = Split().apply(ir, SplitOption(target_nid=mloop, factors=factors, target_axis=None))
+    nest = tvm_split_loopnest(extent=extent, factors=list(factors))
+
+    """Restrict to the d1 loops ENCLOSING the matmul leaf — the block we split.
+    Sibling blocks (loads, tensor_copy, store) each carry their own block-local
+    ``i_d1_0`` loop, so a full-tree preorder would over-collect them."""
+    out_mm = next(
+        n
+        for n in out.tree.preorder()
+        if isinstance(out.tree.data(n), ISANode) and out.tree.data(n).op_cls.__name__ == "NKIMatmul"
+    )
+    d1 = enclosing_for_nids(out, out_mm, "i_d1")
+    our_extents = [out.tree.data(n).extent for n in d1]
+    assert our_extents == nest.extents == [4, 4]
+
+    """The d1 iter_var binding our normalize recomputed must equal TVM's substitute_value
+    (loop vars renamed positionally outer->inner): i_d1_0*4 + i_d1_1 == i0*4 + i1."""
+    out_block = next(
+        out.tree.data(a) for a in reversed(out.tree.ancestors(mm)) if out.tree.data(a).__class__.__name__ == "BlockNode"
+    )
+    d1_value = next(v for iv, v in zip(out_block.iter_vars, out_block.iter_values) if iv.axis == "d1")
+    loop_vars = [out.tree.data(n).loop_var for n in d1]
+    positional = {lv: f"i{idx}" for idx, lv in enumerate(loop_vars)}
+    renamed = substitute(d1_value, {lv: Var(name=positional[lv]) for lv in loop_vars})
+    assert format_expr(renamed).replace(" * ", "*") == nest.binding
+
+
+def test_tensorize_split_matches_tvm_structure():
+    """Layer-B guard: our tensorize Split's loop nest matches TVM's own ``schedule.split``.
+
+    A tensorize-split of an op axis IS a loop-split structurally: it inserts
+    ``factors[:-1]`` outer loops and SETS the access tile width to
+    ``factors[-1]`` (the innermost factor becomes the tile width, not a loop).
+    We split the canonical load's ``d1`` free axis (extent 2048) by
+    ``(16, 128)`` and confront the result against TVM's own ``schedule.split``
+    on an equivalent extent-2048 loop (the structural oracle).
+
+    Correspondence: ``tvm_split_loopnest(extent=2048, factors=[16, 128])``
+    returns ``extents == [16, 128]`` (outer -> inner). Our tensorize-split
+    materializes the OUTER factors ``extents[:-1] == [16]`` as enclosing loops
+    over the leaf and the INNERMOST factor ``extents[-1] == 128`` as the access
+    tile width (no loop). So our single ``i_d1`` enclosing-loop extent ``[16]``
+    must equal TVM's outer extents and our tile width ``128`` must equal TVM's
+    innermost extent. Orthogonal to the byte-exact ladder gate.
+    """
+    pytest.importorskip("tvm")
+    from test.transforms._oracle_helpers import enclosing_for_nids
+    from test.transforms._tvm_struct_oracle import tvm_split_loopnest
+
+    from nkigym.ir.arith.expr import Const
+
+    ir = build_canonical_ir()
+    load = next(
+        n
+        for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode)
+        and ir.tree.data(n).op_cls.__name__ == "NKILoad"
+        and ir.tree.data(n).operand_bindings["src"].tensor == "lhs_T"
+    )
+    extent = 2048
+    factors = (16, 128)
+    assert factors[0] * factors[1] == extent
+
+    out = Split().apply(ir, SplitOption(target_nid=load, factors=factors, target_axis="d1"))
+    nest = tvm_split_loopnest(extent=extent, factors=list(factors))
+    assert nest.extents == [16, 128]
+
+    """Restrict to the d1 loops ENCLOSING the split load leaf — sibling blocks each
+    carry their own block-local d1 loop, so a full-tree preorder would over-collect."""
+    out_load = next(
+        n
+        for n in out.tree.preorder()
+        if isinstance(out.tree.data(n), ISANode)
+        and out.tree.data(n).op_cls.__name__ == "NKILoad"
+        and out.tree.data(n).operand_bindings["src"].tensor == "lhs_T"
+    )
+    d1 = enclosing_for_nids(out, out_load, "i_d1")
+    our_loop_extents = [out.tree.data(n).extent for n in d1]
+
+    """The OUTER factors (factors[:-1]) become loops; the INNERMOST factor is the tile width."""
+    assert our_loop_extents == nest.extents[:-1] == [16]
+
+    """The access tile width on the split d1 axis equals TVM's innermost extent (128).
+    d1 maps (via axis_map) to the load's abstract free axis 'F'; the dst region's F-axis
+    width must be the innermost factor, NOT a loop."""
+    leaf = out.tree.data(out_load)
+    block = next(
+        out.tree.data(a)
+        for a in reversed(out.tree.ancestors(out_load))
+        if out.tree.data(a).__class__.__name__ == "BlockNode"
+    )
+    inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+    f_axis = inverse_axis_map["d1"]
+    dst_axes = leaf.op_cls.OPERAND_AXES["dst"]
+    f_index = dst_axes.index(f_axis)
+    _lo, width = leaf.operand_bindings["dst"].ranges[f_index]
+    assert isinstance(width, Const) and width.value == nest.extents[-1] == 128

@@ -170,7 +170,7 @@ def test_buffer_constructor_and_equality():
 
 def test_bufferregion_constructor_and_equality():
     """BufferRegion is a frozen dataclass with structural equality on tensor + ranges."""
-    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.arith.expr import Const, Var
     from nkigym.ir.tree import BufferRegion
 
     a = BufferRegion(tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)),))
@@ -190,7 +190,7 @@ def test_blocknode_constructor_minimal():
 
 def test_blocknode_constructor_full():
     """A BlockNode with iter_vars and a region carries every field."""
-    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.arith.expr import Const, Var
     from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, IterVar
     from nkigym.ops.base import AxisRole
 
@@ -265,7 +265,7 @@ def test_fornode_payload_uses_loop_var_and_extent():
 
 def test_isanode_payload_uses_operand_bindings():
     """ISANode carries (op_cls, operand_bindings, kwargs); legacy fields removed."""
-    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.arith.expr import Const, Var
     from nkigym.ir.tree import BufferRegion, ISANode
     from nkigym.ops.matmul import NKIMatmul
 

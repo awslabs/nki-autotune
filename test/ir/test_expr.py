@@ -1,10 +1,10 @@
-"""Tests for nkigym.ir.expr."""
+"""Tests for nkigym.ir.arith.expr."""
 
 from __future__ import annotations
 
 import pytest
 
-from nkigym.ir.expr import Add, Const, Mul, NonAffineError, Var, from_affine, substitute, to_affine
+from nkigym.ir.arith.expr import Add, Const, Mul, NonAffineError, Var, from_affine, substitute, to_affine
 
 
 def test_const_and_var_construction():
@@ -61,7 +61,7 @@ def test_to_affine_rejects_var_times_var():
 
 def test_to_affine_rejects_var_in_mod_divisor():
     """Mod with a non-Const divisor is non-affine."""
-    from nkigym.ir.expr import Mod
+    from nkigym.ir.arith.expr import Mod
 
     with pytest.raises(NonAffineError):
         to_affine(Mod(left=Var(name="i"), right=Var(name="j")))
@@ -120,21 +120,21 @@ def test_substitute_unaffected_passes_through():
 
 def test_format_const():
     """Const(5) formats as '5'."""
-    from nkigym.ir.expr import format_expr
+    from nkigym.ir.arith.expr import format_expr
 
     assert format_expr(Const(value=5)) == "5"
 
 
 def test_format_var():
     """Var('i') formats as 'i'."""
-    from nkigym.ir.expr import format_expr
+    from nkigym.ir.arith.expr import format_expr
 
     assert format_expr(Var(name="i")) == "i"
 
 
 def test_format_affine_combination():
     """An affine combination formats with terms in sorted-name order, then constant."""
-    from nkigym.ir.expr import format_expr
+    from nkigym.ir.arith.expr import format_expr
 
     expr = Add(left=Mul(left=Var(name="i"), right=Const(value=8)), right=Var(name="j"))
     assert format_expr(expr) == "i * 8 + j"
@@ -142,7 +142,7 @@ def test_format_affine_combination():
 
 def test_format_negative_constant():
     """Negative constants surface inline (not normalised away)."""
-    from nkigym.ir.expr import format_expr
+    from nkigym.ir.arith.expr import format_expr
 
     expr = Add(left=Var(name="i"), right=Const(value=-3))
     assert format_expr(expr) == "i + -3"

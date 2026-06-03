@@ -54,7 +54,7 @@ def test_constant_only_intervals():
 
 def test_regions_disjoint_multi_axis_one_disjoint():
     """Disjoint on axis 1 (different constant tiles), same on axis 0 -> regions disjoint."""
-    from nkigym.ir.expr import Const, Mul, Var
+    from nkigym.ir.arith.expr import Const, Mul, Var
     from nkigym.ir.interval import regions_disjoint
     from nkigym.ir.tree import Buffer, BufferRegion
 
@@ -78,7 +78,7 @@ def test_regions_disjoint_multi_axis_one_disjoint():
 
 def test_regions_overlap_all_axes():
     """Same indices on every axis -> overlap."""
-    from nkigym.ir.expr import Const, Mul, Var
+    from nkigym.ir.arith.expr import Const, Mul, Var
     from nkigym.ir.interval import regions_disjoint
     from nkigym.ir.tree import Buffer, BufferRegion
 
@@ -101,7 +101,7 @@ def test_regions_partition_axis_normalised():
     is normalised: tile i_m and tile i_m are same -> overlap; tile i_m vs i_m via
     different vars -> overlap (sound). The normalisation must not crash and must
     treat width-128 partition tiles in element space."""
-    from nkigym.ir.expr import Const, Var
+    from nkigym.ir.arith.expr import Const, Var
     from nkigym.ir.interval import regions_disjoint
     from nkigym.ir.tree import Buffer, BufferRegion
 

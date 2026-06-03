@@ -28,8 +28,8 @@ from typing import Any
 
 import networkx as nx
 
+from nkigym.ir.arith.expr import Expr, format_expr
 from nkigym.ir.dimension_analysis import _AnalysisResult
-from nkigym.ir.expr import Expr, format_expr
 from nkigym.ops.base import AxisRole, NKIOp
 
 PARTITION_DIM = 128

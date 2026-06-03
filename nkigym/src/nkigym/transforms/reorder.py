@@ -6,8 +6,8 @@ import copy
 from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
+from nkigym.ir.arith.expr import Var
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.expr import Var
 from nkigym.ir.tree import BlockNode, ForNode, role_of
 from nkigym.ops.base import AxisRole
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption

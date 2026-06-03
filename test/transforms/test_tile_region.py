@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from nkigym.ir.expr import Const, Expr, Mul, Var, format_expr
+from nkigym.ir.arith.expr import Const, Expr, Mul, Var, format_expr
 from nkigym.ir.tree import BufferRegion
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul

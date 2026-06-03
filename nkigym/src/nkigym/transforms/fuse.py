@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from math import prod
 
 from nkigym.ir import KernelIR
+from nkigym.ir.arith.expr import Expr
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.expr import Expr
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.transforms._normalize import _dim_from_loopvar, normalize_block
 from nkigym.transforms._tile_region import retile_region

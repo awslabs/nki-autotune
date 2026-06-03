@@ -2,7 +2,7 @@
 
 An :class:`AffineInterval` is a half-open integer range
 ``[base, base + width)`` where ``base`` is an affine combination of
-loop-var symbols (``coeffs`` in :func:`nkigym.ir.expr.to_affine` form)
+loop-var symbols (``coeffs`` in :func:`nkigym.ir.arith.expr.to_affine` form)
 and ``width`` is a constant. Two intervals on the same axis are
 *provably disjoint* iff the integer range of ``a.base - b.base`` over
 the loop-var box (each var in ``[0, extent)``) cannot fall in the open
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nkigym.ir.expr import Const, to_affine
+from nkigym.ir.arith.expr import Const, to_affine
 from nkigym.ir.tree import PARTITION_DIM, Buffer, BufferRegion
 
 

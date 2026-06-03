@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from nkigym.ir.expr import Const, Var
+from nkigym.ir.arith.expr import Const, Var
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad

@@ -12,8 +12,8 @@ from __future__ import annotations
 from typing import ClassVar
 
 from nkigym.ir import KernelIR
+from nkigym.ir.arith.expr import Const, Var
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.expr import Const, Var
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole, NKIOp
 

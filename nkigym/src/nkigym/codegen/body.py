@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from nkigym.codegen.compact import rebased_region
 from nkigym.ir import KernelIR
-from nkigym.ir.expr import Const, format_expr
+from nkigym.ir.arith.expr import Const, format_expr
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode
 
 _INDENT = "    "

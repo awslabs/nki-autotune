@@ -99,8 +99,8 @@ def test_disjoint_tile_writes_have_no_edge():
     """Two hand-built blocks writing disjoint tiles of one buffer get NO dependency edge."""
     from dataclasses import replace
 
+    from nkigym.ir.arith.expr import Const, Var
     from nkigym.ir.dependency import Dependency
-    from nkigym.ir.expr import Const, Var
     from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
     from nkigym.ops.base import AxisRole
     from nkigym.ops.memset import NKIMemset
@@ -143,8 +143,8 @@ def test_overlapping_tile_writes_have_edge():
     """Two blocks writing the SAME tile get a WAW edge."""
     from dataclasses import replace
 
+    from nkigym.ir.arith.expr import Const, Var
     from nkigym.ir.dependency import Dependency
-    from nkigym.ir.expr import Const, Var
     from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
     from nkigym.ops.base import AxisRole
     from nkigym.ops.memset import NKIMemset

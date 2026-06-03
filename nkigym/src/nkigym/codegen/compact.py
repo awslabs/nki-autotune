@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from nkigym.ir.expr import Const, Expr, substitute, to_affine
+from nkigym.ir.arith.expr import Const, Expr, substitute, to_affine
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 

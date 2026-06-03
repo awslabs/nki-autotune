@@ -1,11 +1,13 @@
 """Affine integer Expression AST for iter_values and BufferRegion ranges.
 
-Supports affine combinations of integer-typed Vars: Const, Var, Add,
-Mul, FloorDiv, Mod. Sufficient for every binding and region range our
-canonical builder and transforms emit.
+Node set: Const, Var, Add, Sub, Mul, FloorDiv, Mod, Min, Max, plus the
+LT / LE / EQ predicate nodes. Sufficient for every binding and region
+range our canonical builder and transforms emit.
 
 Non-affine inputs (Var * Var, Mod / FloorDiv with non-Const divisor)
-raise :class:`NonAffineError` from :func:`to_affine`.
+raise :class:`NonAffineError` from :func:`to_affine`. :func:`affine_terms`
+is the non-raising counterpart: it carries non-affine subterms opaquely
+(keyed by the subterm itself) instead of raising.
 """
 
 from __future__ import annotations
@@ -63,7 +65,55 @@ class Mod:
     right: "Expr"
 
 
-Expr = Const | Var | Add | Mul | FloorDiv | Mod
+@dataclass(frozen=True, kw_only=True)
+class Sub:
+    """Binary subtraction."""
+
+    left: "Expr"
+    right: "Expr"
+
+
+@dataclass(frozen=True, kw_only=True)
+class Min:
+    """Binary minimum."""
+
+    left: "Expr"
+    right: "Expr"
+
+
+@dataclass(frozen=True, kw_only=True)
+class Max:
+    """Binary maximum."""
+
+    left: "Expr"
+    right: "Expr"
+
+
+@dataclass(frozen=True, kw_only=True)
+class LT:
+    """Predicate ``left < right``."""
+
+    left: "Expr"
+    right: "Expr"
+
+
+@dataclass(frozen=True, kw_only=True)
+class LE:
+    """Predicate ``left <= right``."""
+
+    left: "Expr"
+    right: "Expr"
+
+
+@dataclass(frozen=True, kw_only=True)
+class EQ:
+    """Predicate ``left == right``."""
+
+    left: "Expr"
+    right: "Expr"
+
+
+Expr = Const | Var | Add | Sub | Mul | FloorDiv | Mod | Min | Max | LT | LE | EQ
 
 
 def to_affine(expr: Expr) -> dict[str | None, int]:
@@ -140,6 +190,91 @@ def _mul(a: dict[str | None, int], b: dict[str | None, int]) -> dict[str | None,
     return {var: coeff * scale for var, coeff in a.items()}
 
 
+def affine_terms(expr: Expr) -> dict[Expr | None, int]:
+    """Decompose ``expr`` into integer-coefficient terms, never raising.
+
+    Unlike :func:`to_affine`, this carries non-affine subterms opaquely
+    instead of raising. The returned dict maps each term to its integer
+    coefficient: a plain variable is keyed by its :class:`Var` object, the
+    constant term by ``None``, and any subterm that is not affine in Vars
+    (``Var * Var``, ``FloorDiv`` / ``Mod`` with a non-constant divisor or a
+    non-constant ``Mod`` left side, or ``Sub`` / ``Min`` / ``Max`` /
+    predicate nodes) by the subterm :class:`Expr` object itself with
+    coefficient ``1``. Affine subterms still decompose normally.
+    """
+    coeffs = _accumulate_opaque(expr)
+    return {k: v for k, v in coeffs.items() if v != 0}
+
+
+def _accumulate_opaque(expr: Expr) -> dict[Expr | None, int]:
+    """Recurse into ``expr`` returning coefficient terms, carrying non-affine parts opaquely.
+
+    Parallel to :func:`_accumulate` but, instead of raising
+    :class:`NonAffineError`, returns ``{expr: 1}`` for any subterm that is
+    not affine in Vars. Variables are keyed by their :class:`Var` object
+    (not their name) and the constant term by ``None``.
+    """
+    result: dict[Expr | None, int]
+    if isinstance(expr, Const):
+        result = {None: expr.value}
+    elif isinstance(expr, Var):
+        result = {expr: 1}
+    elif isinstance(expr, Add):
+        result = _add_opaque(_accumulate_opaque(expr.left), _accumulate_opaque(expr.right))
+    elif isinstance(expr, Mul):
+        result = _mul_opaque(expr)
+    elif isinstance(expr, (FloorDiv, Mod)):
+        result = _divmod_opaque(expr)
+    else:
+        result = {expr: 1}
+    return result
+
+
+def _add_opaque(a: dict[Expr | None, int], b: dict[Expr | None, int]) -> dict[Expr | None, int]:
+    """Coefficient-wise sum of two opaque-keyed coefficient maps."""
+    out = dict(a)
+    for term, coeff in b.items():
+        out[term] = out.get(term, 0) + coeff
+    return out
+
+
+def _mul_opaque(expr: Mul) -> dict[Expr | None, int]:
+    """Decompose a ``Mul``, scaling by a constant operand or carrying the product opaquely."""
+    left = _accumulate_opaque(expr.left)
+    right = _accumulate_opaque(expr.right)
+    left_terms = set(left) - {None}
+    right_terms = set(right) - {None}
+    if left_terms and right_terms:
+        result: dict[Expr | None, int] = {expr: 1}
+    elif not left_terms:
+        scale = left.get(None, 0)
+        result = {term: coeff * scale for term, coeff in right.items()}
+    else:
+        scale = right.get(None, 0)
+        result = {term: coeff * scale for term, coeff in left.items()}
+    return result
+
+
+def _divmod_opaque(expr: FloorDiv | Mod) -> dict[Expr | None, int]:
+    """Decompose a ``FloorDiv`` / ``Mod`` if affine, else carry it opaquely."""
+    right = _accumulate_opaque(expr.right)
+    left = _accumulate_opaque(expr.left)
+    divisor = right.get(None, 0)
+    result: dict[Expr | None, int]
+    if (set(right) - {None}) or divisor == 0:
+        result = {expr: 1}
+    elif isinstance(expr, FloorDiv):
+        if any(coeff % divisor != 0 for coeff in left.values()):
+            result = {expr: 1}
+        else:
+            result = {term: coeff // divisor for term, coeff in left.items()}
+    elif set(left) - {None}:
+        result = {expr: 1}
+    else:
+        result = {None: left.get(None, 0) % divisor}
+    return result
+
+
 def from_affine(coeffs: dict[str | None, int]) -> Expr:
     """Inverse of :func:`to_affine`. Returns a canonical-form Expr.
 
@@ -172,19 +307,17 @@ def substitute(expr: Expr, subs: dict[str, Expr]) -> Expr:
     expression is not normalised; pipe through ``from_affine(to_affine(...))``
     if a canonical form is needed.
     """
+    result: Expr
     if isinstance(expr, Const):
-        return expr
-    if isinstance(expr, Var):
-        return subs.get(expr.name, expr)
-    if isinstance(expr, Add):
-        return Add(left=substitute(expr.left, subs), right=substitute(expr.right, subs))
-    if isinstance(expr, Mul):
-        return Mul(left=substitute(expr.left, subs), right=substitute(expr.right, subs))
-    if isinstance(expr, FloorDiv):
-        return FloorDiv(left=substitute(expr.left, subs), right=substitute(expr.right, subs))
-    if isinstance(expr, Mod):
-        return Mod(left=substitute(expr.left, subs), right=substitute(expr.right, subs))
-    raise TypeError(f"Unknown Expr node {type(expr).__name__}")
+        result = expr
+    elif isinstance(expr, Var):
+        result = subs.get(expr.name, expr)
+    elif isinstance(expr, (Add, Sub, Mul, FloorDiv, Mod, Min, Max, LT, LE, EQ)):
+        cls = type(expr)
+        result = cls(left=substitute(expr.left, subs), right=substitute(expr.right, subs))
+    else:
+        raise TypeError(f"Unknown Expr node {type(expr).__name__}")
+    return result
 
 
 def format_expr(expr: Expr) -> str:
@@ -219,12 +352,19 @@ def _format_raw(expr: Expr) -> str:
 __all__ = [
     "Add",
     "Const",
+    "EQ",
     "Expr",
     "FloorDiv",
+    "LE",
+    "LT",
+    "Max",
+    "Min",
     "Mod",
     "Mul",
     "NonAffineError",
+    "Sub",
     "Var",
+    "affine_terms",
     "format_expr",
     "from_affine",
     "substitute",

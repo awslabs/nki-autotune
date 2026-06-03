@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from nkigym.ir.expr import Const, Expr
+from nkigym.ir.arith.expr import Const, Expr
 from nkigym.ir.tree import BufferRegion
 
 
