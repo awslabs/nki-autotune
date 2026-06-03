@@ -33,12 +33,32 @@ def place_buffers(tree: KernelTree) -> None:
     placement: dict[int, list[Buffer]] = {}
     for name, buf in buffers.items():
         touch = touchers.get(name)
-        lca = tree.root if not touch else _lca(tree, touch)
-        placement.setdefault(lca, []).append(buf)
+        if buf.location == "shared_hbm":
+            block_nid = tree.root
+        else:
+            lca = tree.root if not touch else _lca(tree, touch)
+            block_nid = _enclosing_block(tree, lca)
+        placement.setdefault(block_nid, []).append(buf)
     for block_nid, bufs in placement.items():
         blk = tree.data(block_nid)
         assert isinstance(blk, BlockNode)
         tree.graph.nodes[block_nid]["data"] = replace(blk, alloc_buffers=tuple(bufs))
+
+
+def _enclosing_block(tree: KernelTree, nid: int) -> int:
+    """Return ``nid`` if it is a BlockNode, else its nearest BlockNode ancestor.
+
+    A buffer is declared on a block, but the LCA of its touchers can be a
+    ForNode when two co-located blocks share an enclosing loop (e.g. a store
+    lifted next to its tensor_copy under a shared d2 loop). The owning block is
+    then the nearest BlockNode at or above that loop.
+    """
+    cur = nid
+    while not isinstance(tree.data(cur), BlockNode):
+        parent = tree.parent(cur)
+        assert parent is not None, f"node {nid} has no enclosing BlockNode"
+        cur = parent
+    return cur
 
 
 def _gather_buffers(tree: KernelTree) -> dict[str, Buffer]:

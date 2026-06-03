@@ -6,10 +6,11 @@ Two entry points:
   as the bounding box of its access regions within its declaration (LCA)
   block, and write it back on the tree. Idempotent; materialized like
   :func:`nkigym.ir.buffer_placement.place_buffers`.
-* :func:`rebased_region` — a read-time projection that subtracts the
-  declaration block's anchor loop vars from a region's ``lo``, so a
-  compacted buffer is indexed within its single live instance. Never
-  written back (tree regions stay global-frame for ``Dependency``).
+* :func:`rebased_region` — a read-time projection that subtracts a
+  buffer's anchor loop vars (the loops enclosing all of its touchers) from
+  a region's ``lo``, so a compacted buffer is indexed within its single
+  live instance. Never written back (tree regions stay global-frame for
+  ``Dependency``).
 """
 
 from __future__ import annotations
@@ -27,19 +28,58 @@ def compact_shapes(tree: KernelTree) -> None:
         assert isinstance(block, BlockNode)
         if not block.alloc_buffers:
             continue
-        anchors = _anchor_loop_vars(tree, block_nid)
-        new_bufs = tuple(_compact_one(tree, buf, anchors) for buf in block.alloc_buffers)
+        new_bufs = tuple(_compact_one(tree, buf, _anchor_loop_vars(tree, buf.name)) for buf in block.alloc_buffers)
         tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=new_bufs)
 
 
-def _anchor_loop_vars(tree: KernelTree, decl_block_nid: int) -> set[str]:
-    """Loop vars bound at or above the declaration block (ForNode ancestors)."""
-    out: set[str] = set()
-    for anc in tree.ancestors(decl_block_nid):
-        data = tree.data(anc)
-        if isinstance(data, ForNode):
-            out.add(data.loop_var)
-    return out
+def _anchor_loop_vars(tree: KernelTree, tensor: str) -> set[str]:
+    """Loop vars that index "which instance" of ``tensor`` is live per iteration.
+
+    A loop is an anchor when (1) it is a ForNode tree node that is an
+    ancestor of every ISA leaf touching the buffer, and (2) it offsets every
+    touching region identically — the same coefficient in the same region
+    axis across all touchers. Such a loop holds exactly one buffer instance
+    live at a time, so it is subtracted from both the compacted shape and the
+    rebased index.
+
+    Condition (1) intersects ForNode *nodes* (by nid), not loop-var names: a
+    canonical buffer whose touchers sit in disjoint sibling loop-nests shares
+    no ancestor node even when those nests reuse a name (e.g. two distinct
+    ``i_d0_0`` loops), so its anchor set is empty and compaction is a no-op.
+
+    Condition (2) rejects a shared loop that addresses touchers
+    inconsistently — e.g. a sunk full-width load writes ``[*, 0:2048]`` (no
+    ``i_d1_0``) while the matmul reads ``[*, i_d1_0*128 : +128]``. Subtracting
+    ``i_d1_0`` there would collapse the matmul to tile 0 while the buffer
+    still holds all 2048 columns; dropping it keeps the read tile-correct.
+    """
+    pairs = _regions_touching(tree, tensor)
+    if not pairs:
+        return set()
+    per_leaf = [{a for a in tree.ancestors(leaf) if isinstance(tree.data(a), ForNode)} for leaf, _r in pairs]
+    candidates = {tree.data(nid).loop_var for nid in set.intersection(*per_leaf)}
+    regions = [region for _leaf, region in pairs]
+    return {v for v in candidates if _offsets_consistently(v, regions)}
+
+
+def _offsets_consistently(loop_var: str, regions: list[BufferRegion]) -> bool:
+    """True when ``loop_var`` has one fixed per-axis coefficient across ``regions``.
+
+    For each region axis, the coefficient of ``loop_var`` in that axis's
+    ``lo`` (zero when absent) must agree across every region. A loop var that
+    offsets one region but not another is not a sound compaction anchor.
+    """
+    n_axes = max(len(r.ranges) for r in regions)
+    return all(len({_axis_coeff(r, axis, loop_var) for r in regions}) == 1 for axis in range(n_axes))
+
+
+def _axis_coeff(region: BufferRegion, axis: int, loop_var: str) -> int:
+    """Coefficient of ``loop_var`` in ``region``'s axis-``axis`` ``lo`` (0 if absent)."""
+    coeff = 0
+    if axis < len(region.ranges):
+        lo, _width = region.ranges[axis]
+        coeff = to_affine(lo).get(loop_var, 0)
+    return coeff
 
 
 def _compact_one(tree: KernelTree, buf: Buffer, anchors: set[str]) -> Buffer:
@@ -120,33 +160,26 @@ def _leaf_loop_extents(tree: KernelTree, leaf_nid: int) -> dict[str, int]:
 
 
 def rebased_region(region: BufferRegion, buf: Buffer, tree: KernelTree) -> BufferRegion:
-    """Subtract the declaration block's anchor loop vars from each axis ``lo``.
+    """Subtract the buffer's anchor loop vars from each axis ``lo``.
 
-    Params (shared_hbm, declared at root → no anchors) project to
-    themselves. For a compacted sbuf/psum buffer declared inside loops, the
-    enclosing loop vars are subtracted so the index addresses the single
-    resident instance (e.g. ``[i_d0_0, (i_d1_0)*128 : +128]`` → ``[0, 0:128]``).
+    A buffer's anchors are the loops enclosing all of its touchers (see
+    :func:`_anchor_loop_vars`). shared_hbm params/outputs are never rebased:
+    they address absolute HBM, so the enclosing loop index is part of the
+    address (symmetric with :func:`_compact_one`, which never resizes them).
+    Canonical sbuf/psum buffers (touchers in disjoint nests) project to
+    themselves. For a compacted sbuf/psum buffer whose touchers share
+    enclosing loops, those loop vars are subtracted so the index addresses
+    the single resident instance (e.g. ``[i_d0_0, (i_d1_0)*128 : +128]`` →
+    ``[0, 0:128]``).
     """
-    decl_block_nid = _declaring_block(tree, buf.name)
-    if decl_block_nid is None:
+    if buf.location == "shared_hbm":
         return region
-    anchors = _anchor_loop_vars(tree, decl_block_nid)
+    anchors = _anchor_loop_vars(tree, buf.name)
     if not anchors:
         return region
     subs = {a: Const(value=0) for a in anchors}
     new_ranges = tuple((substitute(lo, subs), width) for lo, width in region.ranges)
     return BufferRegion(tensor=region.tensor, ranges=new_ranges)
-
-
-def _declaring_block(tree: KernelTree, tensor: str) -> int | None:
-    """Return the block nid whose alloc_buffers declares ``tensor``, or None (a param)."""
-    for nid in tree.blocks():
-        block = tree.data(nid)
-        assert isinstance(block, BlockNode)
-        for buf in block.alloc_buffers:
-            if buf.name == tensor:
-                return nid
-    return None
 
 
 __all__ = ["compact_shapes", "rebased_region"]

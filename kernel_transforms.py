@@ -506,6 +506,45 @@ def kernel_14(lhs_T, rhs):
     return hbm_out
 
 
+@nki.jit
+def kernel_partial(lhs_T, rhs):
+    # partial-coverage byte oracle: lhs_T load (d1 range16) sunk under matmul
+    # outer-d1 range(4); residual range(4) sweeps the 4 inner d1 tiles, M tile
+    # = i_d1_0 * 4 + i_d1_1; sbuf_lhs_T holds those 4 tiles (128, 1, 512).
+    sbuf_lhs_T = nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+    sbuf_rhs = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+    psum_acc = nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum)
+    sbuf_prod = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    for i_d0_0 in range(16):
+        nisa.dma_copy(dst=sbuf_rhs[0:128, i_d0_0, 0:2048], src=rhs[(i_d0_0) * 128 : (i_d0_0) * 128 + 128, 0:2048])
+    for i_d1_0 in range(16):
+        nisa.memset(psum_acc[0:128, i_d1_0, 0:2048], value=0.0)
+    for i_d0_0 in range(16):
+        for i_d1_0 in range(4):
+            # move (partial cover: residual range(4) over the 4 inner d1 tiles)
+            for i_d1_1 in range(4):
+                nisa.dma_copy(
+                    dst=sbuf_lhs_T[0:128, 0, (i_d1_1) * 128 : (i_d1_1) * 128 + 128],
+                    src=lhs_T[
+                        (i_d0_0) * 128 : (i_d0_0) * 128 + 128,
+                        (i_d1_0 * 4 + i_d1_1) * 128 : (i_d1_0 * 4 + i_d1_1) * 128 + 128,
+                    ],
+                )
+            for i_d1_1 in range(4):
+                for i_d2_0 in range(4):
+                    nisa.nc_matmul(
+                        dst=psum_acc[0:128, i_d1_0 * 4 + i_d1_1, (i_d2_0) * 512 : (i_d2_0) * 512 + 512],
+                        stationary=sbuf_lhs_T[0:128, 0, (i_d1_1) * 128 : (i_d1_1) * 128 + 128],
+                        moving=sbuf_rhs[0:128, i_d0_0, (i_d2_0) * 512 : (i_d2_0) * 512 + 512],
+                    )
+    for i_d1_0 in range(16):
+        nisa.tensor_copy(sbuf_prod[0:128, i_d1_0, 0:2048], psum_acc[0:128, i_d1_0, 0:2048])
+    for i_d1_0 in range(16):
+        nisa.dma_copy(dst=hbm_out[(i_d1_0) * 128 : (i_d1_0) * 128 + 128, 0:2048], src=sbuf_prod[0:128, i_d1_0, 0:2048])
+    return hbm_out
+
+
 def _main() -> None:
     """CPU-sim every ``kernel_N`` against a single numpy matmul golden."""
     K, M, N = 2048, 2048, 2048
@@ -516,7 +555,13 @@ def _main() -> None:
 
     atol = rtol = 5e-3
     kernels = [(name, obj) for name, obj in globals().items() if name.startswith("kernel_") and callable(obj)]
-    kernels.sort(key=lambda nv: int(nv[0].split("_")[1]))
+
+    def _order(name: str) -> tuple[int, int, str]:
+        """Sort numeric ``kernel_N`` ascending, then named kernels alphabetically."""
+        suffix = name.split("_", 1)[1]
+        return (0, int(suffix), "") if suffix.isdigit() else (1, 0, suffix)
+
+    kernels.sort(key=lambda nv: _order(nv[0]))
     for name, kernel in kernels:
         actual = simulate_fp32(kernel)(lhs_T, rhs)
         if isinstance(actual, tuple):

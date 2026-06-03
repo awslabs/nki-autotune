@@ -1,5 +1,14 @@
 # ComputeAt / ReverseComputeAt + Affine Region Overlap
 
+> **SUPERSEDED (2026-06-02) for the move transforms** by
+> `docs/superpowers/specs/2026-06-02-compute-at-rewrite-design.md`. The
+> Part B move engine described here shipped but was silently wrong on
+> tiled IR (pre-`normalize_block`) and is being rewritten greenfield.
+> **This doc is RETAINED** as the sole design record of the SHIPPED and
+> still-current Part A (affine region overlap: `interval.py`,
+> `buffer_placement.py`, region-gated `dependency.py`) and Part C
+> (`compact.py`). Read Part A/C here; ignore Part B.
+
 ## Status (amended 2026-05-30)
 
 - **Part A (affine region overlap)** — SHIPPED (`ea75f23`):

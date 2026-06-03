@@ -21,7 +21,7 @@ import networkx as nx
 
 from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
 from nkigym.ir.interval import regions_disjoint
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, KernelTree
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 _DEPENDENCY_STYLES: list[ClassStyle] = [ClassStyle(name="block", fill="#efe", stroke="#363")]
 
@@ -90,15 +90,23 @@ class Dependency:
         render_png(mmd_path, png_path)
 
     def _build(self, tree: KernelTree) -> None:
-        """Populate the graph by walking leaf blocks (skipping the synthetic root)."""
+        """Populate the graph by walking leaf blocks in ISA-execution order.
+
+        A dependency node is a :class:`BlockNode` that directly owns exactly
+        one ISA leaf (an ISA leaf whose nearest enclosing block is that block).
+        Co-location can nest one such block inside another (e.g. a sunk load
+        block under the matmul's block); both still own exactly one leaf each.
+        Blocks are processed in the pre-order of their owned leaf so the
+        hazard walk sees writes and reads in the order the hardware executes
+        them, not in tree pre-order (which lists an enclosing block before the
+        producer block nested within it).
+        """
         buffers = self._buffer_map(tree)
         last_writer: dict[str, int] = {}
         prior_readers: dict[str, list[int]] = {}
-        for nid in tree.blocks():
+        for nid in self._nodes_in_execution_order(tree):
             block = tree.data(nid)
             assert isinstance(block, BlockNode)
-            if not block.iter_vars and not block.reads and not block.writes:
-                continue
             info = self._summarise(nid, block, tree, buffers)
             self.graph.add_node(nid, info=info)
             self.blocks.append(nid)
@@ -110,6 +118,27 @@ class Dependency:
                 prior_readers.pop(name, None)
             for name in info.reads - info.writes:
                 prior_readers.setdefault(name, []).append(nid)
+
+    @staticmethod
+    def _nodes_in_execution_order(tree: KernelTree) -> list[int]:
+        """Return single-leaf-owning blocks ordered by their owned leaf's pre-order position.
+
+        Each ISA leaf is mapped to its nearest enclosing :class:`BlockNode`;
+        walking leaves in pre-order yields the owning blocks in execution
+        order. A block owning no ISA leaf (the synthetic root, or a pure
+        loop-carrier) is skipped — it carries no hazard.
+        """
+        ordered: list[int] = []
+        seen: set[int] = set()
+        for leaf in tree.preorder():
+            if not isinstance(tree.data(leaf), ISANode):
+                continue
+            owner = next(a for a in reversed(tree.ancestors(leaf)) if isinstance(tree.data(a), BlockNode))
+            if owner in seen:
+                raise AssertionError(f"block {owner} owns more than one ISA leaf; dependency model requires one")
+            seen.add(owner)
+            ordered.append(owner)
+        return ordered
 
     @staticmethod
     def _buffer_map(tree: KernelTree) -> dict[str, Buffer]:

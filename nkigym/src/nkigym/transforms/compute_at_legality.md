@@ -24,25 +24,21 @@ unit aligned with TVM's `SBlock`. It owns:
   `ForNode.loop_var` values.
 - `reads` / `writes` — declared `BufferRegion`s in iter_var space.
 - `alloc_buffers` — buffers whose lifetime is bounded by this block.
-- `init` — optional sub-block holding the reduction-init body (e.g. the
-  memset paired with a matmul).
 - `annotations` — free-form metadata.
 
 The canonical IR has a synthetic root block holding every kernel-lifetime
 buffer in `alloc_buffers` and a sequence of leaf blocks (one per compute op)
-under it. Each leaf block has at most one ISA leaf in its body and an optional
-`init` sub-block. Compute_at and reverse_compute_at move blocks under target
-loops, producing nested topologies.
+under it. Each leaf block has at most one ISA leaf in its body. Compute_at and
+reverse_compute_at move blocks under target loops, producing nested topologies.
 
 In the **canonical** IR (before any compute_at), every leaf block is a direct
-child of the synthetic root block. The matmul block has shape:
+child of the synthetic root block. The matmul's reduction-init memset is a
+*sibling* block emitted before the matmul (no `init` sub-block):
 
 ```
 root_block(alloc_buffers=[sbuf_lhs_T, sbuf_rhs, psum_prod, sbuf_prod, hbm_out])
-└── matmul_block(iter_vars=[vM, vN, vK], init=memset_block, ...)
-    ├── memset_block(iter_vars=[vM, vN], writes=[psum_prod[...]])
-    │   └── ForNode(i_d1_0) → ForNode(i_d2_0) → ISANode(NKIMemset)
-    └── ForNode(i_d0_0) → ForNode(i_d1_0) → ForNode(i_d2_0) → ISANode(NKIMatmul)
+├── memset_block  → ForNode(i_d1_0) → ForNode(i_d2_0) → ISANode(NKIMemset)
+└── matmul_block  → ForNode(i_d0_0) → ForNode(i_d1_0) → ForNode(i_d2_0) → ISANode(NKIMatmul)
 ```
 
 After **compute_at / reverse_compute_at**, blocks no longer live flat at root —
@@ -127,13 +123,13 @@ In our IR this collapses to a single check: **the moved block has no
 
 ```python
 # OK — NKILoad has all-PARALLEL axes; complete-block analogue.
-NKILoad()(src=lhs_T, dst=sbuf_lhs_T)
+sbuf_lhs_T = NKILoad()(src=lhs_T)
 
 # OK — NKIMatmul has K as ACCUMULATION (TVM's kCommReduce) and M, N as
-# PARALLEL; reduction-block analogue. RMW on `dst` is the init+reducer
+# PARALLEL; reduction-block analogue. RMW on `psum_prod` is the init+reducer
 # pattern (memset zeroes psum_prod before the K loop, then nc_matmul
 # accumulates into it).
-NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs, dst=psum_prod)
+psum_prod = NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs)
 
 # Hypothetical opaque block — a prefix-scan op declares its scan axis as
 # SEQUENTIAL. Compute_at rejects: iterations aren't independent, sinking
@@ -189,7 +185,7 @@ final store is a legal *consumer* to lift).
 
 ```python
 # Canonical IR ends with:
-NKIStore()(src=sbuf_prod, dst=hbm_out)        # writes the kernel's return tensor
+hbm_out = NKIStore()(src=sbuf_prod)        # writes the kernel's return tensor
 
 # Proposed: ComputeAt(block_subtree_root=<store nest>, target_loop=<anywhere>)
 # ILLEGAL: the store writes `hbm_out`, which is the kernel's `return_name`.
@@ -236,7 +232,7 @@ leaf in `P`):
 
 ```python
 # BEFORE — three sibling root-children, indexed 0, 1, 2:
-NKIMemset(value=0.0)(dst=psum_prod)            # i=0, producer of psum_prod (block A)
+psum_prod = NKIMemset(value=0.0)()             # i=0, producer of psum_prod (block A)
 
 for m in range(16):                            # i=1, RMW psum_prod via matmul
     for n in range(4):
@@ -300,7 +296,7 @@ For every producer `P` of `C` (every leaf `C` reads or RMWs):
 # LEGAL.
 
 # AFTER:
-NKIMemset(value=0.0)(dst=psum_prod)            # i=0, unchanged
+psum_prod = NKIMemset(value=0.0)()             # i=0, unchanged
 
 for m in range(16):                            # i=1, target loop
     for n in range(4):
@@ -333,14 +329,6 @@ for m in range(16):
 The check: for `ReverseComputeAt`, for every producer leaf `P` of any leaf in
 the moved subtree, `P` must be either a descendant of `target_loop_nid` or
 live in a root-sibling whose pre-order index is `< target_root_index`.
-
-> **Note on allocs.** `psum_prod = nl.ndarray(...)` (an `NKIAlloc` leaf) is a
-> producer of any leaf that reads or RMWs `psum_prod`. Allocs sit as the
-> earliest root-children, so they trivially satisfy the "before target"
-> branch of the rule for any `ReverseComputeAt`. Sinking an alloc *into* a
-> loop is itself a legal `ReverseComputeAt` (PSUM hoist needs this — Trn2's
-> 2 MiB PSUM can host one tile at a time, not all `16·4` of them — but it's
-> moved as its own atom, not as a side effect of moving its consumers).
 
 ---
 
