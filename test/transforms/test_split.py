@@ -476,3 +476,42 @@ def test_tensorize_split_matches_tvm_structure():
     f_index = dst_axes.index(f_axis)
     _lo, width = leaf.operand_bindings["dst"].ranges[f_index]
     assert isinstance(width, Const) and width.value == nest.extents[-1] == 128
+
+
+def test_split_rejects_over_cover():
+    """Factors whose product EXCEEDS the extent are illegal (we are exact-division
+    only — TVM would predicate the ragged tail; we reject). 4*5=20 > 16."""
+    ir = build_canonical_ir()
+    matmul_block_nid, _ = _matmul_block(ir)
+    target = _first_for_under(ir, matmul_block_nid)
+    assert ir.tree.data(target).extent == 16
+    with pytest.raises(TransformLegalityError):
+        Split().apply(ir, SplitOption(target_nid=target, factors=(4, 5)))
+
+
+def test_split_accepts_exact_cover():
+    """Factors whose product EQUALS the extent are legal. 4*4 == 16."""
+    ir = build_canonical_ir()
+    matmul_block_nid, _ = _matmul_block(ir)
+    target = _first_for_under(ir, matmul_block_nid)
+    assert ir.tree.data(target).extent == 16
+    new_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(4, 4)))
+    assert new_ir is not ir
+
+
+def test_split_tensorize_rejects_over_cover():
+    """The tensorize-flavour cover check also rejects over-cover via _covers_exactly.
+
+    Matmul N (d2) tile is 512. factors=(4,256) over-covers (1024 > 512); its final
+    tile 256 >= MIN_TILE_SIZE 128 so it clears the floor guard — the cover check
+    is what must reject it. Confirms _covers_exactly is wired into BOTH legality
+    branches (outer-trip and tensorize), not just the outer-trip path.
+    """
+    ir = build_canonical_ir()
+    mm = next(
+        n
+        for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+    )
+    with pytest.raises(TransformLegalityError, match="exactly tile"):
+        Split().apply(ir, SplitOption(target_nid=mm, factors=(4, 256), target_axis="d2"))

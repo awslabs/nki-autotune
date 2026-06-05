@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from math import prod
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Const, Expr
+from nkigym.ir.arith.analyzer import Analyzer
+from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.transforms._normalize import normalize_block
@@ -85,9 +85,9 @@ class Split(Transform):
                 raise TransformLegalityError(
                     f"Split outer-trip flavour requires target to be ForNode; got {type(target).__name__}"
                 )
-            if prod(option.factors) != target.extent:
+            if not _covers_exactly(option.factors, target.extent):
                 raise TransformLegalityError(
-                    f"Split.factors product {prod(option.factors)} != ForNode.extent {target.extent}"
+                    f"Split.factors {option.factors} do not exactly tile ForNode.extent {target.extent}"
                 )
         else:
             if not isinstance(target, ISANode):
@@ -104,9 +104,9 @@ class Split(Transform):
                 raise TransformLegalityError(
                     f"Split.target_axis={option.target_axis!r}: no tensorize width on this leaf"
                 )
-            if prod(option.factors) != current:
+            if not _covers_exactly(option.factors, current):
                 raise TransformLegalityError(
-                    f"Split.factors product {prod(option.factors)} != current tensorize width {current}"
+                    f"Split.factors {option.factors} do not exactly tile tensorize width {current}"
                 )
             floor = _min_tile_floor(target, block, option.target_axis)
             if floor is not None and option.factors[-1] < floor:
@@ -146,9 +146,10 @@ class Split(Transform):
         dense names and recomputes the region offsets from the loop strides.
 
         Scope — exact-division-only. ``Split`` (both flavours) splits a factor
-        into sub-factors whose product equals the factor: ``_factorizations``
-        only enumerates exact divisors (``remaining % f == 0``) and
-        :meth:`_check_legality` rejects ``prod(factors) != current``. Ragged /
+        into sub-factors that exactly tile the factor: ``_factorizations`` only
+        enumerates exact divisors (``remaining % f == 0``) and
+        :meth:`_check_legality` rejects any non-exact cover via
+        :func:`_covers_exactly`. Ragged /
         non-divisible splits — where the innermost factor does not divide the
         extent and TVM appends a ``BlockPredicate`` (``floormod`` guard) to mask
         the out-of-range tail (its ``BlockPredicateAppender``) — are out of
@@ -287,6 +288,30 @@ def _min_tile_floor(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int 
     if abstract is not None:
         floor = leaf.op_cls.MIN_TILE_SIZE.get(abstract)
     return floor
+
+
+def _covers_exactly(factors: tuple[int, ...], extent: int) -> bool:
+    """Whether ``factors`` exactly tile ``extent`` (no under- or over-cover).
+
+    Mirrors TVM Split's mechanism (``loop_transformation.cc`` ~line 421): build
+    ``substitute_value = Σ_i var_i · Π(factor_j, j>i)`` with each ``var_i`` bound
+    to ``[0, factor_i)`` on an :class:`Analyzer`, then read its constant-integer
+    upper bound (TVM's ``ConstIntBoundAnalyzer``). The loop emits this sum in
+    Horner-factored form (``acc = acc * factor_i + var_i``), the same affine.
+    The substitution ranges over
+    ``[0, Π factors)``, so its max is ``Π factors - 1``; exact tiling is
+    ``hi + 1 == extent``. TVM accepts ``Π >= extent`` and predicates the ragged
+    tail — we are exact-division-only (no predicate path in the renderer), so we
+    require equality, rejecting both under-cover and over-cover.
+    """
+    analyzer = Analyzer()
+    substitute: Expr = Const(value=0)
+    for i, factor in enumerate(factors):
+        var = Var(name=f"_split_v{i}")
+        analyzer.bind(var.name, 0, factor)
+        substitute = Add(left=Mul(left=substitute, right=Const(value=factor)), right=var)
+    _lo, hi = analyzer.const_int_bound(substitute)
+    return hi is not None and hi + 1 == extent
 
 
 def _factorizations(n: int) -> list[tuple[int, ...]]:
