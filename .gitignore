@@ -61,7 +61,7 @@ venv.bak/
 *.swp
 *.swo
 .clinerules
-.claude
+.claude/settings.local.json
 .kiro
 memory-bank
 
