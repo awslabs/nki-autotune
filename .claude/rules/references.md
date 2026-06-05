@@ -1,14 +1,15 @@
 ## External References
 
-- **Neuronxcc compiler**: `/home/ubuntu/shared_workplace/KaenaCompiler/neuronxcc` — source may differ slightly from the version in the Python venv, but offers a rough guide.
-- **NKI Python source and documentation**: `/home/ubuntu/venvs/kernel-env/lib/python3.12/site-packages/nki`
-- **NKI CPU simulator driver**: `/home/ubuntu/venvs/kernel-env/lib/python3.12/site-packages/nki/simulator.py`
-- **Online Fusion Math Derivation**: `/home/ubuntu/online_fusion/paper`
-- **TVM Source codes**: `/home/ubuntu/tvm`
+- **Neuronxcc compiler**: `/workplace/weittang/KaenaCompiler/neuronxcc` — source may differ slightly from the version in the Python venv, but offers a rough guide.
+- **NKI Python source and documentation**: `/home/weittang/workplace/venvs/kernel-env/lib/python3.12/site-packages/nki`
+`/workplace/weittang/private-nki-staging`
+- **NKI CPU simulator driver**: `/home/weittang/workplace/venvs/kernel-env/lib/python3.12/site-packages/nki/simulator.py`
+- **Online Fusion Math Derivation**: `/home/weittang/workplace/online_fusion/paper`
+- **TVM Source codes**: `/home/weittang/workplace/tvm`
 
 ## Manually Written Kernels
 
-Paths below are relative to `/home/ubuntu/shared_workplace/KaenaNeuronKernelLibrary`.
+Paths below are relative to `/home/weittang/workplace/KaenaNeuronKernelLibrary`.
 
 ### Attention CTE (Context Encoding / Prefill)
 
