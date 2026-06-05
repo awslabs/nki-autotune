@@ -14,6 +14,28 @@ The transforms move one *block* under a target loop:
 Six conditions, mirroring TVM's `tir.schedule.{ComputeAt, ReverseComputeAt}`
 (`src/tir/schedule/primitive/compute_at.cc`, lines 700–731).
 
+> **Implementation note (current shipped code).** The faces' `_check_legality`
+> enforces the *structural* conditions inline — target-in-graph, target is a
+> `ForNode`, block-in-graph, condition 3 (target not a descendant of the block),
+> and ComputeAt-only condition 4 (output guard) — then delegates the rest to two
+> helpers in `transforms/_code_motion.py`:
+>
+> - `_check_move_realizable` — the **realizability + coverage** guards (the
+>   coverage half of condition 5 plus condition 6's structural feasibility):
+>   `solve_iter_domains` divisibility, reduction-axis-covered,
+>   reduction-replicated.
+> - `_check_move_preserves_dependencies` — the **ordering** half of condition 5,
+>   a single span-based query (`Dependency.first_backward_edge_for_insertion`).
+>
+> Condition 1 is a precondition (never a per-call check). **Condition 2 below
+> is documented for completeness but is NOT currently enforced** — no face reads
+> `AxisRole`/`role_of`; the op set has no opaque/`SEQUENTIAL`-scan block yet, so
+> the check is unreachable. The reduction-specific hazards condition 2 would
+> guard against (sinking an accumulator's init/drain wrongly) are instead caught
+> by the dependency + realizability model (§5). Sections 5 and 6 below give the
+> *original* TVM root-sibling framing first, then a "**shipped check**" note
+> with what the code actually does after the 2026-06 rewrite.
+
 ## What is a "block"?
 
 In our IR, a **block** is a `BlockNode` payload — a first-class schedulable
@@ -98,7 +120,16 @@ impossible by construction.
 
 ---
 
-## 2. Block is "complete" or "reduction" (not opaque)
+## 2. Block is "complete" or "reduction" (not opaque) — *not currently enforced*
+
+> **Status: unenforced.** Neither face checks this today (grep for
+> `SEQUENTIAL` / `role_of` in `compute_at.py` / `reverse_compute_at.py` — none).
+> Every current op (`NKILoad`, `NKIMatmul`, `NKITensorCopy`, `NKIStore`,
+> `NKIMemset`) is complete or reduction; the first op with an order-carried
+> (`SEQUENTIAL`) scan axis will need this guard added. The reduction-block
+> hazards are handled structurally by §5's dependency/realizability model, not
+> by a block-category check. The TVM framing is kept below as the spec for when
+> an opaque op arrives.
 
 TVM categorises every block by its iter_vars and read/write structure:
 
@@ -330,6 +361,75 @@ The check: for `ReverseComputeAt`, for every producer leaf `P` of any leaf in
 the moved subtree, `P` must be either a descendant of `target_loop_nid` or
 live in a root-sibling whose pre-order index is `< target_root_index`.
 
+### 5-shipped. What the code actually does (post-2026-06 rewrite)
+
+The "root-sibling pre-order index" framing above is the original TVM-style
+model. The shipped check is finer: blocks are no longer flat root-siblings
+(compute_at nests them), so the rule is expressed as **one span-based,
+edge-kind-agnostic dependency query** plus a small set of **coverage guards**.
+Both faces (`ComputeAt`/`ReverseComputeAt`) call the *same* two helpers; only
+the structural splice differs (`is_reverse`).
+
+**Ordering — `_check_move_preserves_dependencies` (`_code_motion.py`).** Each
+node has a preorder span `[start, end]` over the tree (a leaf is a point; a loop
+is its whole subtree). An edge `a → b` ("a before b") is satisfied iff
+`span(a).end < span(b).start`, backward otherwise. The move is illegal iff any
+dependency edge incident to the moved leaf would point backward at its
+post-splice position. This subsumes 5a (consumer-before-producer) and 5b
+(producer-after-consumer) in one comparison — a flow edge to a leaf and a
+carry/coverage edge to a *loop* (the loop's wider span = "outside-and-before the
+whole loop") are checked identically.
+
+Two non-obvious rules make this correct:
+
+- **Directions are frozen from the ORIGINAL program** (`ir.dependency`), never
+  re-derived on the moved tree. `Dependency._build` orients every flow edge by
+  execution order, so rebuilding on a moved tree where a producer was sunk past
+  its consumer silently flips the RAW `producer→consumer` edge to a forward WAR
+  `consumer→producer` — the violation vanishes and the matmul reads
+  uninitialised data (NaN). Freezing keeps the RAW orientation so the backward
+  span is seen. (This was the "direction bug", fixed in `df43f44`.)
+- **Positions are computed analytically**, not by mutating a copy:
+  `Dependency.first_backward_edge_for_insertion(moved_leaf, target_loop, index)`
+  derives the moved leaf's post-splice preorder slot from `(target_loop, index)`
+  on the original tree — no deep-copy, no `_move`. Enclosing partners' spans
+  grow to cover the new slot (so sinking a drain *inside* its reduction loop
+  reads as backward); the moved subtree is excluded from every partner's span.
+
+Beyond flow edges, `Dependency` carries two **loop-endpoint** edge kinds that
+make the span query enforce reduction/region domination automatically:
+
+- **CARRY** — for a buffer carried across a non-PARALLEL loop `L` (matmul's
+  `psum_prod` over the K/ACCUMULATION loop): `init → L` and `L → drain`. Forces
+  the memset before, and the tensor_copy after, the whole K nest.
+- **COVER** — for a buffer a producer writes *tiled* by an enclosing loop `L`
+  while a consumer reads it at *full extent* on that axis: `L → consumer`. Forces
+  the full-extent reader after the whole tiling loop (else it reads slices not
+  yet written this iteration).
+
+**Coverage/realizability — `_check_move_realizable` (`_code_motion.py`).** Run
+before the ordering query; rejects moves the region-regen can't realize:
+
+- **Divisibility** — `solve_iter_domains` requires the target's coverage on each
+  moved dim to divide that dim's extent (else `Split` first; see §-composition).
+- **Reduction axis covered** — reject if the move would let the moved block's
+  ACCUMULATION axis be "covered" by an enclosing target loop (the reduction
+  would be driven by a foreign loop, its init no longer dominating → NaN). A
+  reduction axis must stay a residual the block owns.
+- **Reduction replicated** — reject sinking an ACCUMULATION block under a target
+  loop iterating a dim the block writes at *full extent* (no per-tile index):
+  the accumulation would re-run per iteration into an un-reinitialised
+  accumulator (summed `trip` times).
+
+A subtlety the rewrite exposed: the dim-coverage helpers must walk *all* ForNode
+ancestors, **crossing BlockNode boundaries** (`_all_enclosing_loops`,
+`_all_enclosing_loops_of_block`, and `enclosing_dim_loops`'s name-parse
+fallback). A block can be nested several blocks deep, with a dim it binds driven
+by — or a buffer it writes tiled by — a loop above an intervening block; a
+block-local walk that resets at each BlockNode wall misses it (the renderer
+flattens every block into one Python scope, so loop-var names also collide
+across walls). All three "BlockNode wall" bugs were this class.
+
 ---
 
 ## 6. There exists an insertion point under the target loop
@@ -381,18 +481,21 @@ slot; `-2` = `lp + 1`, the earliest). We adopt the same convention.
 
 ## Quick lookup table
 
-| # | Rule | What it catches | Which transform |
-|---|------|-----------------|-----------------|
-| 1 | Stage pipeline (acyclic deps) | Cyclic producer-consumer chains | both (precondition) |
-| 2 | Block is well-formed | Opaque/incomplete blocks | both |
-| 3 | Target not ancestor of block | Self-referential moves | both |
-| 4 | Block is not output | Sinking the kernel's final store | `ComputeAt` only |
-| 5a | Every consumer is under target OR in a later root-sibling | Producer sinks past one of its readers | `ComputeAt` |
-| 5b | Every producer is under target OR in an earlier root-sibling | Consumer lifts above one of its writers | `ReverseComputeAt` |
-| 6 | Insertion gap exists | No legal position among target's children | both |
+| # | Rule | What it catches | Which transform | Enforced by |
+|---|------|-----------------|-----------------|-------------|
+| 1 | Stage pipeline (acyclic deps) | Cyclic producer-consumer chains | both (precondition) | `Dependency` by construction |
+| 2 | Block is well-formed | Opaque/`SEQUENTIAL`-scan blocks | both | **not enforced** (no opaque op yet) |
+| 3 | Target not ancestor of block | Self-referential moves | both | face `_check_legality` (inline) |
+| 4 | Block is not output | Sinking the kernel's final store | `ComputeAt` only | face `_check_legality` (inline) |
+| 5 | No dependency edge points backward after the splice | Producer sunk past a reader / consumer lifted above a writer; init/drain entering its reduction loop; full read before tiled write | both | `_check_move_preserves_dependencies` (span query, frozen directions) |
+| 5-cov | Reduction axis not covered; reduction not replicated; coverage divides | Accumulator driven by a foreign loop / re-run without re-init | both | `_check_move_realizable` |
+| 6 | Insertion gap exists | No legal position among target's children | both | `_legal_indices` (the `(lp, fc]` gap) |
 
-Conditions 5 and 6 together encode the dependency-preservation guarantee. The
-others rule out structurally nonsensical moves.
+Conditions 5/5-cov and 6 together encode the dependency-preservation guarantee.
+The others rule out structurally nonsensical moves. The single span query of 5
+replaced the per-direction 5a/5b root-sibling rules (see §5-shipped); the
+loop-endpoint CARRY/COVER edges let one comparison cover reduction-init
+domination and tiled-write/full-read coverage alongside plain flow ordering.
 
 ## Composition with other transforms
 

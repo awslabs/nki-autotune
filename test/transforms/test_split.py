@@ -111,6 +111,74 @@ def test_split_rejects_factor_product_mismatch():
         Split().apply(ir, SplitOption(target_nid=target, factors=(3, 5)))
 
 
+def test_split_rejects_outer_trip_on_shared_post_computeat_loop():
+    """Outer-trip Split of a loop a prior ComputeAt made shared across two blocks
+    is rejected (would rewrite only the enclosing block, leaving the nested
+    sibling's index stale -> sim OOB / wrong accumulation).
+
+    ``build_ladder_state(2)`` sinks the lhs_T load under the matmul's loop nest,
+    so loop ``i_d0_0`` (the matmul K loop) now encloses both the matmul leaf and
+    the nested load leaf. Splitting it must raise, and ``analyze`` must not offer
+    it. The legal route is to Split the per-op loop BEFORE the ComputeAt.
+    """
+    from test.transforms._fixtures import build_ladder_state
+
+    from nkigym.ir.tree import BlockNode
+
+    ir = build_ladder_state(2)
+
+    def owners_under(loop_nid):
+        return {
+            next(a for a in reversed(ir.tree.ancestors(d)) if isinstance(ir.tree.data(a), BlockNode))
+            for d in ir.tree.descendants(loop_nid)
+            if isinstance(ir.tree.data(d), ISANode)
+        }
+
+    """The shared loop is whichever ForNode encloses ISA leaves of 2+ blocks."""
+    shared = next(
+        nid for nid in ir.tree.preorder() if isinstance(ir.tree.data(nid), ForNode) and len(owners_under(nid)) >= 2
+    )
+    assert len(owners_under(shared)) >= 2, owners_under(shared)
+
+    extent = ir.tree.data(shared).extent
+    with pytest.raises(TransformLegalityError, match="shared across multiple blocks"):
+        Split().apply(ir, SplitOption(target_nid=shared, factors=(2, extent // 2)))
+    assert not any(o.target_nid == shared and o.target_axis is None for o in Split().analyze(ir))
+
+
+def test_split_tensorize_preserves_sibling_order_of_co_located_block():
+    """Tensorizing a leaf that precedes a co-located sibling block must keep it
+    BEFORE that sibling (sibling order is dataflow).
+
+    ``build_ladder_state(7)`` co-locates the memset and matmul blocks under a
+    shared loop, memset first. Splitting the memset leaf inserts loops above it;
+    a naive splice appends the new chain to the parent's child list, moving the
+    memset AFTER the matmul (zeroing the accumulator post-compute -> all-zeros
+    output). The memset's ISA leaf must still pre-order BEFORE the matmul leaf.
+    """
+    from test.transforms._fixtures import build_ladder_state
+
+    def first_index(tree, op_name):
+        return next(
+            i
+            for i, n in enumerate(tree.preorder())
+            if isinstance(tree.data(n), ISANode) and tree.data(n).op_cls.__name__ == op_name
+        )
+
+    ir = build_ladder_state(7)
+    memset_leaf = next(
+        n
+        for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMemset"
+    )
+    assert first_index(ir.tree, "NKIMemset") < first_index(ir.tree, "NKIMatmul"), "precondition: memset before matmul"
+
+    new_ir = Split().apply(ir, SplitOption(target_nid=memset_leaf, factors=(2, 256), target_axis="d2"))
+    assert first_index(new_ir.tree, "NKIMemset") < first_index(
+        new_ir.tree, "NKIMatmul"
+    ), "memset must stay before matmul after tensorize split"
+
+
 def test_split_analyze_offers_tensorize_on_load():
     """Split.analyze must offer a tensorize-flavor (target_axis set) option on the load leaf,
     whose d1 free-axis tile is width-2048 and factorizable to 16x128. Regression: the

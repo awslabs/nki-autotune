@@ -46,6 +46,10 @@ class Split(Transform):
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
             if isinstance(data, ForNode):
+                if _encloses_multiple_blocks(ir.tree, nid):
+                    """Outer-trip Split of a shared (post-ComputeAt) loop is illegal — see
+                    _reject_if_shared_loop; do not offer it as a candidate action."""
+                    continue
                 for factors in _factorizations(data.extent):
                     options.append(SplitOption(target_nid=nid, factors=factors, target_axis=None))
             elif isinstance(data, ISANode):
@@ -89,6 +93,7 @@ class Split(Transform):
                 raise TransformLegalityError(
                     f"Split.factors {option.factors} do not exactly tile ForNode.extent {target.extent}"
                 )
+            _reject_if_shared_loop(ir.tree, option.target_nid)
         else:
             if not isinstance(target, ISANode):
                 raise TransformLegalityError(
@@ -169,12 +174,16 @@ class Split(Transform):
         block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
 
         base_loop_var = f"i_{option.target_axis}"
-        ir.tree.graph.remove_edge(parent_nid, leaf_nid)
-        prev_nid = parent_nid
-        for i, extent in enumerate(option.factors[:-1]):
-            new_nid = ir.tree.add_node(ForNode(loop_var=f"{base_loop_var}__tmp{i}", extent=extent), parent=prev_nid)
-            prev_nid = new_nid
-        ir.tree.graph.add_edge(prev_nid, leaf_nid)
+        """Build the new loop chain DETACHED, then splice its top into the leaf's
+        original child slot. Adding loops directly under ``parent_nid`` would
+        append them (``nx.DiGraph.add_edge`` appends to the successor list),
+        moving the leaf's subtree to the END of its siblings — when the leaf is
+        e.g. a memset that must precede a co-located matmul block, that reorders
+        it after the matmul (zeroing the accumulator post-compute). Splicing at
+        the original index preserves sibling dataflow order."""
+        top_nid, bottom_nid = _build_for_chain(ir.tree, base_loop_var, option.factors[:-1])
+        ir.tree.graph.add_edge(bottom_nid, leaf_nid)
+        _replace_in_parent_children(ir.tree, parent_nid, [leaf_nid], [top_nid])
 
         inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
         abstract_axis = inverse_axis_map.get(option.target_axis)
@@ -218,6 +227,57 @@ def _resolve(tree: KernelTree, nid: int):
     if nid not in tree.graph:
         raise TransformLegalityError(f"Split.target_nid={nid} is not a node in the IR tree")
     return tree.data(nid)
+
+
+def _enclosing_block_of(tree: KernelTree, nid: int) -> int | None:
+    """Nearest BlockNode ancestor of ``nid`` (None if none — e.g. above root)."""
+    return next((a for a in reversed(tree.ancestors(nid)) if isinstance(tree.data(a), BlockNode)), None)
+
+
+def _blocks_under_loop(tree: KernelTree, loop_nid: int) -> set[int]:
+    """The distinct enclosing BlockNodes of every ISA leaf beneath ``loop_nid``."""
+    out: set[int] = set()
+    for d in tree.descendants(loop_nid):
+        if isinstance(tree.data(d), ISANode):
+            owner = _enclosing_block_of(tree, d)
+            if owner is not None:
+                out.add(owner)
+    return out
+
+
+def _encloses_multiple_blocks(tree: KernelTree, loop_nid: int) -> bool:
+    """True when ``loop_nid`` encloses ISA leaves owned by more than one block.
+
+    Such a loop was made shared by a prior ``ComputeAt`` co-location; an
+    outer-trip Split of it is unsafe (see :func:`_reject_if_shared_loop`).
+    """
+    return len(_blocks_under_loop(tree, loop_nid) - {_enclosing_block_of(tree, loop_nid)}) > 0
+
+
+def _reject_if_shared_loop(tree: KernelTree, loop_nid: int) -> None:
+    """Reject an outer-trip Split of a loop shared across more than one block.
+
+    ``_do_outer_trip`` rewrites only the target loop's *enclosing* BlockNode
+    (``normalize_block`` recomputes that block's bindings from the new loop
+    chain). A loop that a prior ``ComputeAt`` made shared — i.e. one enclosing
+    ISA leaves of a nested sub-block as well as the enclosing block's own leaf —
+    would have only the enclosing block rewritten, leaving the nested block's
+    ``iter_value`` referencing the old single loop var while its sibling now
+    indexes the composed split affine. The two then address one buffer
+    inconsistently (sim out-of-bounds / wrong accumulation).
+
+    Splitting a dim is orthogonal to co-locating producers: do the Split on the
+    private per-op loop *before* the ``ComputeAt`` that shares it. This guard
+    keeps the broken ordering a loud rejection rather than a wrong kernel.
+    """
+    if _encloses_multiple_blocks(tree, loop_nid):
+        enclosing_block = _enclosing_block_of(tree, loop_nid)
+        extra = sorted(_blocks_under_loop(tree, loop_nid) - {enclosing_block})
+        raise TransformLegalityError(
+            f"Split target loop {loop_nid} is shared across multiple blocks "
+            f"(encloses leaves of nested block(s) {extra} besides its enclosing "
+            f"block {enclosing_block}); split the per-op loop before ComputeAt co-locates them"
+        )
 
 
 def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
@@ -315,6 +375,17 @@ def _covers_exactly(factors: tuple[int, ...], extent: int) -> bool:
 
 
 def _factorizations(n: int) -> list[tuple[int, ...]]:
+    """Every ordered factorization of ``n`` into ``2.._MAX_SPLIT_PARTS`` factors.
+
+    Each returned tuple holds factors ``>= 2`` whose product is exactly ``n``,
+    listed outermost-first — these are precisely the candidate ``factors`` a
+    :class:`SplitOption` may carry, so every tuple exactly tiles ``n`` (passes
+    :func:`_covers_exactly`). Order is significant: ``(2, 4)`` and ``(4, 2)`` are
+    both emitted because they name distinct loop nests (outer trip 2 / inner 4
+    vs. outer 4 / inner 2). Tuples with fewer factors are listed first.
+
+    Example: ``_factorizations(8) == [(2, 4), (4, 2), (2, 2, 2)]``.
+    """
     out: list[tuple[int, ...]] = []
     for parts in range(2, _MAX_SPLIT_PARTS + 1):
         _enum(n, parts, (), out)
@@ -322,6 +393,15 @@ def _factorizations(n: int) -> list[tuple[int, ...]]:
 
 
 def _enum(remaining: int, parts_left: int, prefix: tuple[int, ...], out: list[tuple[int, ...]]) -> None:
+    """Append to ``out`` every way to factor ``remaining`` into ``parts_left`` factors ``>= 2``.
+
+    Recursive worker for :func:`_factorizations`. ``prefix`` holds the factors
+    already chosen (outer loops); each call either closes the chain (last slot
+    takes all of ``remaining``) or peels off one more divisor. The guard
+    ``remaining // f >= 2 ** (parts_left - 1)`` prunes any divisor that leaves
+    too little for the remaining ``parts_left - 1`` slots to each hold a factor
+    ``>= 2``, so no dead branches are explored.
+    """
     if parts_left == 1:
         if remaining >= 2:
             out.append(prefix + (remaining,))

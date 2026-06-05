@@ -2,8 +2,9 @@
 
 See ``compute_at_legality.md`` (conditions 1-3, 5b, 6). Structural move is
 the shared ``_move``; ordering legality (condition 5b) is delegated to
-``_check_move_preserves_dependencies``: it simulates the lift and rejects any
-dependency edge that would point backward afterward.
+``_check_move_preserves_dependencies``: a pure topological query that rejects
+any dependency edge that would point backward after the splice — no tree
+mutation.
 """
 
 from __future__ import annotations

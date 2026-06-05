@@ -16,6 +16,7 @@ blocks where the per-iteration overlap matters.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -87,25 +88,124 @@ class Dependency:
         """Return True if ``producer`` must execute before ``consumer``."""
         return self._closure.has_edge(self._resolve(producer), self._resolve(consumer))
 
-    def first_backward_edge(self, moved_leaf_nid: int) -> tuple[int, int] | None:
+    def first_backward_edge(self, moved_leaf_nid: int, tree: KernelTree | None = None) -> tuple[int, int] | None:
         """Return the first dependency edge incident to ``moved_leaf_nid`` that
-        points backward in this tree's execution order, else ``None``.
+        points backward in the execution order of ``tree``, else ``None``.
 
         One rule, no edge-kind. Each node has a preorder span ``[start, end]``
         over the tree (a leaf is a point; a loop spans its whole subtree). An
         edge ``a -> b`` ("a before b") is satisfied iff ``span(a).end <
         span(b).start`` and backward otherwise. A carry edge to a loop and a
         flow edge to a leaf are checked identically; the loop's wider span
-        encodes "outside-and-before the whole loop". Callers that want to test
-        a *proposed* move build the moved tree, construct a fresh
-        ``Dependency`` on it, and call this with the moved leaf nid.
-        """
-        order = {n: i for i, n in enumerate(self._tree.preorder())}
+        encodes "outside-and-before the whole loop".
 
-        def span(nid: int) -> tuple[int, int]:
-            idxs = [order[d] for d in (self._tree.descendants(nid) | {nid}) if d in order]
+        Edge *directions* always come from ``self.graph`` — this graph's
+        producer->consumer orientation, frozen at construction. To test a
+        *proposed* move, build this ``Dependency`` on the **original** program
+        (correct directions) and pass the **moved** tree as ``tree`` so spans
+        are read from the new positions. Rebuilding ``Dependency`` on the moved
+        tree instead would be wrong: ``_build`` re-derives every flow edge from
+        execution order, so a producer sunk past its consumer silently flips
+        from RAW ``producer->consumer`` to WAR ``consumer->producer`` and the
+        violation disappears. ``tree`` defaults to ``self._tree`` for the
+        pure same-tree check.
+        """
+        eval_tree = tree if tree is not None else self._tree
+        order = {n: i for i, n in enumerate(eval_tree.preorder())}
+
+        def span(nid: int) -> tuple[float, float]:
+            idxs = [order[d] for d in (eval_tree.descendants(nid) | {nid}) if d in order]
+            if not idxs:
+                raise KeyError(f"dependency endpoint {nid} absent from the evaluated tree")
             return (min(idxs), max(idxs))
 
+        return self._first_backward(moved_leaf_nid, span)
+
+    def first_backward_edge_for_insertion(
+        self, moved_leaf_nid: int, target_loop_nid: int, index: int
+    ) -> tuple[int, int] | None:
+        """Pure ordering check for splicing ``moved_leaf_nid`` under
+        ``target_loop_nid`` at child slot ``index`` — no tree mutation.
+
+        Equivalent to deep-copying, running ``_move``, rebuilding ``Dependency``
+        on the moved tree and calling :meth:`first_backward_edge`, but O(edges)
+        with no copy. Directions come from ``self.graph`` (build this
+        ``Dependency`` on the original program); positions come from
+        ``self._tree`` with the moved leaf relocated to its effective slot.
+        ``index`` follows the ``_splice_under_target`` convention: ``-1``
+        append, ``-2`` prepend, ``>=0`` explicit slot.
+
+        The move relocates only the moved block's subtree; every dependency
+        partner keeps its identity, so its position is read from the original
+        tree with two adjustments that the physical splice would induce:
+
+        - **Exclude the moved subtree** from each partner's span. A partner that
+          enclosed the moved block before the move (or the target's children
+          list, when re-moving an already-nested block) must not keep counting
+          the relocated nodes at their old positions.
+        - **Grow enclosing partners** to cover the new slot. Splicing the moved
+          leaf under ``target_loop_nid`` makes it a descendant of the target and
+          of every ancestor loop the target sits in, so a partner that
+          **encloses the insertion point** has its span extended by the moved
+          position. This is the carry-loop case ``K-loop -> drain``: sinking the
+          drain *inside* the K loop must read as backward.
+        """
+        order: dict[int, float] = {n: i for i, n in enumerate(self._tree.preorder())}
+        owner_block = self._owner_block.get(moved_leaf_nid, moved_leaf_nid)
+        moved_subtree = self._tree.descendants(owner_block) | {owner_block}
+        moved_pos = self._effective_insertion_position(order, target_loop_nid, index, moved_subtree)
+        enclosers = set(self._tree.ancestors(target_loop_nid)) | {target_loop_nid}
+
+        def span(nid: int) -> tuple[float, float]:
+            if nid == moved_leaf_nid:
+                return (moved_pos, moved_pos)
+            positions = [order[d] for d in (self._tree.descendants(nid) | {nid}) - moved_subtree if d in order]
+            if nid in enclosers:
+                positions.append(moved_pos)
+            if not positions:
+                raise KeyError(f"dependency endpoint {nid} absent from the tree")
+            return (min(positions), max(positions))
+
+        return self._first_backward(moved_leaf_nid, span)
+
+    def _effective_insertion_position(
+        self, order: dict[int, float], target_loop_nid: int, index: int, moved_subtree: set[int]
+    ) -> float:
+        """Half-integer preorder position the moved leaf takes under the target.
+
+        The leaf lands among ``target_loop_nid``'s children at the splice slot.
+        Its position sits just after the node it follows: the target loop itself
+        when prepending (before child 0), else the subtree-max of the preceding
+        child. The ``+0.5`` keeps it strictly between adjacent integer indices so
+        the span comparison orders it correctly against every other node.
+
+        ``moved_subtree`` is excluded from the target's children first, matching
+        ``_splice_under_target`` which detaches the moved block before indexing.
+        Without this, re-moving a block that is already a child of the target
+        (a prior compute_at nested it there) would count the block itself as a
+        preceding sibling and place the leaf one slot too early.
+        """
+        children = [c for c in self._tree.children(target_loop_nid) if c not in moved_subtree]
+        if index == -1:
+            pos = len(children)
+        elif index == -2:
+            pos = 0
+        elif index >= 0:
+            pos = index
+        else:
+            raise ValueError(f"unsupported index {index} (use -1 append, -2 prepend, or >=0)")
+        if pos <= 0 or not children:
+            anchor = order[target_loop_nid]
+        else:
+            preceding = children[min(pos, len(children)) - 1]
+            anchor = max(order[d] for d in (self._tree.descendants(preceding) | {preceding}))
+        return anchor + 0.5
+
+    def _first_backward(
+        self, moved_leaf_nid: int, span: Callable[[int], tuple[float, float]]
+    ) -> tuple[int, int] | None:
+        """Return the first edge incident to ``moved_leaf_nid`` that ``span`` ranks
+        backward (``span(a).end < span(b).start`` violated), else ``None``."""
         result: tuple[int, int] | None = None
         for a, b in self.graph.edges():
             if a != moved_leaf_nid and b != moved_leaf_nid:
@@ -183,6 +283,37 @@ class Dependency:
                         self.graph.add_edge(other, loop_nid, kind="CARRY")
                     if tensor in info.reads and tensor not in info.writes:
                         self.graph.add_edge(loop_nid, other, kind="CARRY")
+        self._add_coverage_edges(tree)
+
+    def _add_coverage_edges(self, tree: KernelTree) -> None:
+        """Add ``L -> consumer`` edges when a consumer reads a buffer region wider
+        than a producer writes per iteration of an enclosing loop ``L``.
+
+        A producer leaf ``P`` may write a buffer ``B`` tiled by an enclosing loop
+        ``L`` — each ``L`` iteration writes a distinct slice (``P``'s write offset
+        on some axis varies with ``L``'s loop var). A consumer ``C`` that reads
+        ``B`` over an extent NOT indexed by ``L`` needs EVERY ``L`` iteration's
+        slice, so it must execute after ``L`` completes — outside it. Without this
+        edge a move could place ``C`` inside ``L`` (reading only the current
+        iteration's slice, the rest stale): the flow edge ``P -> C`` alone is
+        satisfied per-iteration yet ``C`` reads data not yet produced. This is the
+        region-coverage analogue of the reduction carry edge, gated on the WRITE
+        being loop-tiled and the READ not — independent of ``L``'s role.
+        """
+        for producer in list(self.graph.nodes):
+            if not isinstance(tree.data(producer), ISANode):
+                continue
+            for loop_nid, tensor in _tiled_write_loops_of_leaf(tree, producer).items():
+                self.graph.add_node(loop_nid)
+                loop_var = tree.data(loop_nid).loop_var
+                for consumer in self.touches_by_tensor.get(tensor, ()):
+                    if consumer == producer:
+                        continue
+                    cinfo = self.graph.nodes[consumer]["info"]
+                    if tensor not in cinfo.reads or tensor in cinfo.writes:
+                        continue
+                    if _reads_independently_of_loop(cinfo, tensor, loop_var):
+                        self.graph.add_edge(loop_nid, consumer, kind="COVER")
 
     @staticmethod
     def _leaves_in_execution_order(tree: KernelTree) -> list[tuple[int, int]]:
@@ -346,6 +477,51 @@ def _carry_loops_of_leaf(tree: KernelTree, leaf_nid: int) -> dict[int, str]:
                     )
                 out[anc] = data.operand_bindings[slot].tensor
     return out
+
+
+def _tiled_write_loops_of_leaf(tree: KernelTree, leaf_nid: int) -> dict[int, str]:
+    """Map each enclosing loop of ``leaf_nid`` to a buffer it WRITES tiled by that loop.
+
+    A loop ``L`` tiles a write when the leaf's enclosing block writes a buffer
+    whose region offset (on some axis) depends on ``L``'s loop var — i.e. each
+    ``L`` iteration writes a distinct slice. Returns ``{loop_nid: tensor}``. A
+    loop tiling writes of more than one buffer keeps the first (only used to add
+    a per-consumer domination edge, which is added per tensor anyway).
+    """
+    data = tree.data(leaf_nid)
+    assert isinstance(data, ISANode)
+    block_nid = _enclosing_block_nid(tree, leaf_nid)
+    block = tree.data(block_nid)
+    assert isinstance(block, BlockNode)
+    out: dict[int, str] = {}
+    for anc in tree.ancestors(leaf_nid):
+        anc_data = tree.data(anc)
+        if not isinstance(anc_data, ForNode):
+            continue
+        loop_var = anc_data.loop_var
+        for region in block.writes:
+            if any(loop_var in to_affine(lo) for lo, _w in region.ranges):
+                out[anc] = region.tensor
+                break
+    return out
+
+
+def _reads_independently_of_loop(info: _BlockInfo, tensor: str, loop_var: str) -> bool:
+    """True iff the block reads ``tensor`` with NO axis offset depending on ``loop_var``.
+
+    Such a read spans the buffer's full extent on the loop's axis regardless of
+    the loop — so if a producer writes that axis tiled by the loop, the read
+    needs every iteration's slice and must sit outside the loop. A read whose
+    offset DOES depend on ``loop_var`` tracks the producer per iteration and is
+    fine.
+    """
+    regions = [r for r in info.read_regions if r.tensor == tensor]
+    independent = bool(regions)
+    for region in regions:
+        if any(loop_var in to_affine(lo) for lo, _w in region.ranges):
+            independent = False
+            break
+    return independent
 
 
 def _block_name(block: BlockNode) -> str:

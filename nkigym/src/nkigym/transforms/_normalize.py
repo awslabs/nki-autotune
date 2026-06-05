@@ -36,32 +36,6 @@ from nkigym.ir.tree import PARTITION_DIM, BlockNode, BufferRegion, ForNode, ISAN
 from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
 
 
-def _enclosing_loops(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
-    """Return the ForNodes the block is nested under, as ``(loop_var, extent)`` outer-to-inner.
-
-    A block moved by ComputeAt becomes nested inside the target's loop chain;
-    the dims it shares with the target (its "covered" dims) are then driven by
-    those ENCLOSING loops rather than by loops the block owns locally. This
-    helper walks ``tree.ancestors(block_nid)`` (root-first = outer-first) and
-    keeps the ForNodes strictly below the block's nearest BlockNode ancestor —
-    i.e. the loops between the block and its enclosing BlockNode.
-
-    For a top-level block (a direct child of the root BlockNode with no
-    op-loops above it), the only ancestor is the empty root BlockNode, so the
-    result is empty and every caller behaves exactly as before — Split / Fuse /
-    Reorder are unaffected.
-    """
-    out: list[tuple[str, int]] = []
-    for anc in tree.ancestors(block_nid):
-        data = tree.data(anc)
-        if isinstance(data, BlockNode):
-            out = []
-            continue
-        if isinstance(data, ForNode):
-            out.append((data.loop_var, data.extent))
-    return out
-
-
 def _iter_value_loopvars(block: BlockNode) -> set[str]:
     """Return the loop_vars that appear in the block's ``iter_values``.
 
@@ -101,27 +75,59 @@ def _drop_trip1(tree: KernelTree, block_nid: int) -> None:
         tree.graph.remove_node(nid)
 
 
-def _enclosing_dim_counts(tree: KernelTree, block_nid: int, block: BlockNode) -> dict[str, int]:
-    """Count, per dim, the block's ENCLOSING loops that drive that dim.
+def _enclosing_dim_counts(tree: KernelTree, block_nid: int) -> dict[str, int]:
+    """Count, per dim, the block's ENCLOSING loops that share that dim's name space.
 
-    Same enclosing notion :func:`_dim_loops` uses: the ForNodes a ComputeAt move
-    nested the block under (``_enclosing_loops``), restricted to the loop vars the
-    block actually binds (``_iter_value_loopvars``). A covered/enclosing loop and a
-    locally-regenerated residual loop on the SAME dim are distinct loops, so the
-    local loops must continue the dim's ordinal AFTER these enclosing ones — else a
-    residual would be renamed to the enclosing loop's name and collide. For a
-    top-level block (Split / Fuse / Reorder) there are no enclosing op-loops, so
-    every count is 0 and local ordinals start at 0 exactly as before.
+    A dim's local ForNodes are renamed ``i_d{dim}_{N}`` (:func:`_rename_dense`);
+    ``N`` must start past every enclosing loop already using that dim's name so
+    the local loop never collides with one in scope. Two distinct kinds of
+    enclosing same-dim loop both consume names and are both counted:
+
+    * **bound** — a covered-dim loop the block indexes (in
+      :func:`_iter_value_loopvars`); the local residual is the SAME logical dim
+      continuing its ordinal (``i_d1_1`` after enclosing ``i_d1_0``).
+    * **unbound** — a same-dim loop owned by a DIFFERENT block that merely
+      encloses this one (e.g. a producer lifted under a consumer's ``i_d0_0``
+      while this block keeps its own independent ``d0`` residual). It is a
+      separate iteration, but its rendered name still occupies ``i_d{dim}_{N}``
+      in scope, so the local loop must skip past it or the renderer emits two
+      nested ``for i_d0_0`` (inner shadows outer) and reads the wrong tile.
+
+    The dim of an enclosing loop is taken from its dense name (``i_d0_0`` ->
+    ``d0``), independent of whether this block binds it. For a top-level block
+    (Split / Fuse / Reorder) there are no enclosing op-loops, so every count is
+    0 and local ordinals start at 0 exactly as before.
+
+    Crucially the walk is over EVERY ancestor ForNode (``_all_enclosing_loops``),
+    crossing BlockNode boundaries. The renderer flattens all blocks into one
+    Python function, so a same-dim loop above an intervening BlockNode still
+    shares the rendered name space — counting only block-local ancestors would
+    let a residual collide with it (``for i_d0_0: ... for i_d0_0:``).
     """
-    old_to_dim = _loopvar_to_dim(tree, block_nid, block)
-    bound = _iter_value_loopvars(block)
     out: dict[str, int] = {}
-    for loop_var, _extent in _enclosing_loops(tree, block_nid):
-        if loop_var not in bound:
-            continue
-        dim = old_to_dim[loop_var]
+    for loop_var, _extent in _all_enclosing_loops(tree, block_nid):
+        dim = _dim_from_loopvar(loop_var)
         out[dim] = out.get(dim, 0) + 1
     return out
+
+
+def _all_enclosing_loops(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
+    """Every ForNode ancestor of ``block_nid`` as ``(loop_var, extent)``, crossing
+    BlockNode boundaries, outer-to-inner.
+
+    Spans the whole ancestor chain rather than stopping at the nearest enclosing
+    BlockNode. Two callers need the wider view: name-dense collision avoidance
+    (the renderer emits all blocks in one flat Python scope, so a loop var
+    anywhere above ``block_nid`` shares the namespace) AND driving-loop gather
+    for a block lifted under a target nested inside ANOTHER block — its covered
+    dims are driven by loops above that intervening BlockNode wall, and a
+    block-local walk would miss them (collapsing the dim to ``Const(0)``).
+    """
+    return [
+        (tree.data(anc).loop_var, tree.data(anc).extent)
+        for anc in tree.ancestors(block_nid)
+        if isinstance(tree.data(anc), ForNode)
+    ]
 
 
 def _rename_dense(tree: KernelTree, block_nid: int) -> None:
@@ -136,7 +142,7 @@ def _rename_dense(tree: KernelTree, block_nid: int) -> None:
     block = tree.data(block_nid)
     assert isinstance(block, BlockNode)
     old_to_dim = _loopvar_to_dim(tree, block_nid, block)
-    counters: dict[str, int] = dict(_enclosing_dim_counts(tree, block_nid, block))
+    counters: dict[str, int] = dict(_enclosing_dim_counts(tree, block_nid))
     for nid in _block_local_descendants(tree, block_nid):
         data = tree.data(nid)
         if not isinstance(data, ForNode):
@@ -196,11 +202,17 @@ def _dim_loops(tree: KernelTree, block_nid: int, block: BlockNode) -> dict[str, 
     own surviving dense loops on that dim (inner). For a top-level block the
     enclosing list is empty, so the result is exactly the block-local loops as
     before.
+
+    The enclosing gather spans ALL ancestor ForNodes (``_all_enclosing_loops``),
+    not just the block-local chain: a block lifted under a target nested inside
+    another block has its covered dims driven by loops above that intervening
+    BlockNode wall. Restricting to ``_iter_value_loopvars`` keeps unrelated
+    ancestor loops out, so only the loops the block actually binds contribute.
     """
     old_to_dim = _loopvar_to_dim(tree, block_nid, block)
     bound = _iter_value_loopvars(block)
     out: dict[str, list[tuple[str, int]]] = {}
-    for loop_var, extent in _enclosing_loops(tree, block_nid):
+    for loop_var, extent in _all_enclosing_loops(tree, block_nid):
         if loop_var not in bound:
             continue
         out.setdefault(old_to_dim[loop_var], []).append((loop_var, extent))

@@ -33,6 +33,32 @@ def build_canonical_ir() -> KernelIR:
     return build_initial_ir(f_matmul, INPUT_SPECS)
 
 
+SMALL_K, SMALL_M, SMALL_N = 256, 256, 512
+SMALL_INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {
+    "lhs_T": ((SMALL_K, SMALL_M), "bfloat16"),
+    "rhs": ((SMALL_K, SMALL_N), "bfloat16"),
+}
+
+
+@nkigym_kernel
+def f_matmul_small(lhs_T, rhs):
+    """Small ``lhs_T.T @ rhs`` (256x256x512) — one N tile, so the matmul's d2/N
+    axis is loopless. Surfaces transform bugs that need a full-extent (untiled)
+    reduction-output dim, at a CPU-sim cost ~500x cheaper than the 2048 fixture.
+    """
+    sbuf_lhs_T = NKILoad()(src=lhs_T)
+    sbuf_rhs = NKILoad()(src=rhs)
+    psum_prod = NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs)
+    sbuf_prod = NKITensorCopy()(src=psum_prod)
+    hbm_out = NKIStore()(src=sbuf_prod)
+    return hbm_out
+
+
+def build_canonical_ir_small() -> KernelIR:
+    """Build the canonical :class:`KernelIR` for the small (256x256x512) matmul."""
+    return build_initial_ir(f_matmul_small, SMALL_INPUT_SPECS)
+
+
 def _ladder_helpers():
     """Return (blk, leaf, loop, inner) target-locators bound to a fresh closure."""
     from nkigym.ir.tree import ForNode, ISANode

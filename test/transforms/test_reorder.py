@@ -104,3 +104,62 @@ def test_reorder_matches_tvm_structure():
     source_extents = [ext for _lv, ext in before_order]
     nest = tvm_reorder_loopnest(extents=source_extents, order=[0, 2, 1])
     assert our_extents == nest.extents == [16, 4, 16]
+
+
+def test_reorder_same_dim_swap_then_compute_at_sims():
+    """A Reorder that swaps TWO loops of the SAME dim must renormalize so a later
+    ComputeAt on a co-located block agrees on the dim's tile linearization.
+
+    Fixed deterministic trace: after splitting the matmul K (d0) into three loops
+    and swapping the outer two (a same-dim Reorder), sinking the rhs load must see
+    the SAME d0 tile-index convention the matmul uses. Pre-fix, Reorder left the
+    matmul's pre-swap binding while ComputeAt recomputed the load's stride from
+    physical order -> disagreement -> OOB on the rhs HBM partition axis.
+    """
+    import importlib.util
+    import pathlib
+    import tempfile
+    from test.transforms._fixtures import INPUT_SPECS, f_matmul
+
+    import numpy as np
+
+    from nkigym.codegen import render
+    from nkigym.environment import KernelMDP
+    from nkigym.synthesis.simulate_nki import simulate_fp32
+    from nkigym.transforms import (
+        ComputeAt,
+        ComputeAtOption,
+        Fuse,
+        ReorderOption,
+        ReverseComputeAt,
+        ReverseComputeAtOption,
+        Split,
+        SplitOption,
+    )
+
+    trace = [
+        (Split(), SplitOption(target_nid=11, factors=(4, 2, 2), target_axis=None)),
+        (ComputeAt(), ComputeAtOption(block_nid=4, target_loop_nid=2, index=1)),
+        (Split(), SplitOption(target_nid=6, factors=(16, 128), target_axis="d2")),
+        (Split(), SplitOption(target_nid=20, factors=(4, 4, 128), target_axis="d2")),
+        (ComputeAt(), ComputeAtOption(block_nid=15, target_loop_nid=25, index=0)),
+        (Split(), SplitOption(target_nid=9, factors=(16, 128), target_axis="d2")),
+        (ReverseComputeAt(), ReverseComputeAtOption(block_nid=4, target_loop_nid=12, index=0)),
+        (Reorder(), ReorderOption(outer_nid=21, inner_nid=22)),
+        (Split(), SplitOption(target_nid=8, factors=(2, 4, 2), target_axis=None)),
+        (ComputeAt(), ComputeAtOption(block_nid=4, target_loop_nid=22, index=0)),
+    ]
+    env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), ComputeAt(), ReverseComputeAt()])
+    state = env.reset()
+    for action in trace:
+        state = env.step(state, action)
+    rng = np.random.default_rng(0)
+    inputs = {n: rng.standard_normal(s).astype(np.float32) for n, (s, _d) in INPUT_SPECS.items()}
+    expected = inputs["lhs_T"].T @ inputs["rhs"]
+    path = pathlib.Path(tempfile.mkdtemp()) / "k.py"
+    path.write_text(render(state))
+    spec = importlib.util.spec_from_file_location("k", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)

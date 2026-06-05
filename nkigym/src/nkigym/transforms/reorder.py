@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Var
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import BlockNode, ForNode, role_of
+from nkigym.ir.tree import BlockNode, ForNode, KernelTree, role_of
 from nkigym.ops.base import AxisRole
+from nkigym.transforms._normalize import normalize_block
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
@@ -48,8 +49,32 @@ class Reorder(Transform):
         inner_data = new_ir.tree.data(option.inner_nid)
         new_ir.tree.graph.nodes[option.outer_nid]["data"] = inner_data
         new_ir.tree.graph.nodes[option.inner_nid]["data"] = outer_data
+        self._renormalize_same_dim_swap(new_ir, option)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
+
+    def _renormalize_same_dim_swap(self, ir: KernelIR, option: ReorderOption) -> None:
+        """Restore the dense-name / stride invariant when the swap interchanges two
+        loops of the SAME dim.
+
+        A pure payload swap leaves the loop names in physical order that no longer
+        matches their dense ordinal (the physically-outer loop may now be named
+        ``i_d0_1`` while ``i_d0_0`` sits inside it). The enclosing block keeps its
+        pre-swap tile-linearization binding, so a LATER transform that
+        renormalizes a co-located block (e.g. ComputeAt sinking a load) recomputes
+        that block's stride from physical order and disagrees with this block on
+        which tile is which -> wrong offset / OOB. Re-normalizing the swapped
+        loops' enclosing block (and its nested sub-blocks) here re-derives names +
+        bindings from physical order immediately, so every block shares one
+        convention. A cross-dim swap (each dim has a single loop) leaves
+        name-order == physical-order, so this is a no-op — the byte-exact ladder
+        (whose only Reorders are cross-dim) is unaffected.
+        """
+        if _dim_of(ir.tree, option.outer_nid) != _dim_of(ir.tree, option.inner_nid):
+            return
+        block_nid = _enclosing_block_nid(ir.tree, option.outer_nid)
+        for nid in (block_nid, *_nested_block_nids(ir.tree, block_nid)):
+            normalize_block(ir.tree, nid)
 
     def _is_legal(self, ir: KernelIR, option: ReorderOption) -> bool:
         try:
@@ -92,6 +117,30 @@ def _axis_for_loop_var(block: BlockNode, loop_var: str) -> str | None:
         if isinstance(value, Var) and value.name == loop_var:
             return iv.axis
     return None
+
+
+def _dim_of(tree: KernelTree, loop_nid: int) -> str:
+    """Concrete dim a ForNode drives, parsed from its dense name ``i_d{dim}_{N}`` -> ``d{dim}``."""
+    loop_var = tree.data(loop_nid).loop_var
+    body = loop_var[2:] if loop_var.startswith("i_") else loop_var
+    return body.split("_")[0]
+
+
+def _enclosing_block_nid(tree: KernelTree, nid: int) -> int:
+    """Nearest BlockNode ancestor of ``nid``."""
+    result: int | None = None
+    for anc in reversed(tree.ancestors(nid)):
+        if isinstance(tree.data(anc), BlockNode):
+            result = anc
+            break
+    if result is None:
+        raise ValueError(f"no enclosing BlockNode for {nid}")
+    return result
+
+
+def _nested_block_nids(tree: KernelTree, block_nid: int) -> list[int]:
+    """BlockNode descendants of ``block_nid`` (co-located sub-blocks), excluding itself."""
+    return [d for d in tree.descendants(block_nid) if d != block_nid and isinstance(tree.data(d), BlockNode)]
 
 
 __all__ = ["Reorder", "ReorderOption"]

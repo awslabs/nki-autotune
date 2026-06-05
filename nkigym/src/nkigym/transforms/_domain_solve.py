@@ -44,10 +44,18 @@ def dim_loops_of_block(tree: KernelTree, block_nid: int) -> dict[str, list[tuple
     dims; those dims are driven entirely by enclosing loops, so re-moving it
     still sees its full iteration domain. For a top-level block the enclosing
     list is empty and the result is exactly the block-local loops.
+
+    The enclosing gather spans ALL ancestor ForNodes, crossing BlockNode walls:
+    a block can be nested several blocks deep (a load co-located under the
+    matmul, then under another producer), with a dim it binds driven by a loop
+    above an intervening block. Filtering by ``lv_to_dim`` (the loop vars the
+    block actually binds) keeps unrelated ancestor loops out, so only the
+    block's own driving loops contribute — restricting to the block-local chain
+    instead would drop a cross-wall driver and collapse the dim to a constant.
     """
     lv_to_dim = _loopvar_to_dim(tree, block_nid)
     out: dict[str, list[tuple[str, int]]] = {}
-    for loop_var, extent in _enclosing_loops_of_block(tree, block_nid):
+    for loop_var, extent in _all_enclosing_loops_of_block(tree, block_nid):
         if loop_var in lv_to_dim:
             out.setdefault(lv_to_dim[loop_var], []).append((loop_var, extent))
     for nid in _block_local_descendants(tree, block_nid):
@@ -57,21 +65,20 @@ def dim_loops_of_block(tree: KernelTree, block_nid: int) -> dict[str, list[tuple
     return out
 
 
-def _enclosing_loops_of_block(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
-    """Return the ForNodes between ``block_nid`` and its enclosing BlockNode, outer→inner.
+def _all_enclosing_loops_of_block(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
+    """Every ForNode ancestor of ``block_nid`` as ``(loop_var, extent)``, outer→inner.
 
-    Walks ``tree.ancestors(block_nid)`` (root-first = outer-first) keeping only
-    the ForNodes below the nearest enclosing BlockNode; a BlockNode boundary
-    resets the accumulator so loops owned by a higher block are excluded.
+    Spans the whole ancestor chain (crossing BlockNode boundaries), unlike a
+    block-local walk that resets at each enclosing BlockNode. Callers filter by
+    the block's bound loop vars, so loops owned by an enclosing block that the
+    block does not index are dropped anyway; what this preserves is a driver of
+    a dim the block DOES bind that happens to sit above an intervening block.
     """
-    out: list[tuple[str, int]] = []
-    for anc in tree.ancestors(block_nid):
-        data = tree.data(anc)
-        if isinstance(data, BlockNode):
-            out = []
-        elif isinstance(data, ForNode):
-            out.append((data.loop_var, data.extent))
-    return out
+    return [
+        (tree.data(anc).loop_var, tree.data(anc).extent)
+        for anc in tree.ancestors(block_nid)
+        if isinstance(tree.data(anc), ForNode)
+    ]
 
 
 def enclosing_dim_loops(tree: KernelTree, target_loop_nid: int) -> dict[str, list[tuple[str, int]]]:
@@ -86,9 +93,24 @@ def enclosing_dim_loops(tree: KernelTree, target_loop_nid: int) -> dict[str, lis
     out: dict[str, list[tuple[str, int]]] = {}
     for nid in chain:
         data = tree.data(nid)
-        if isinstance(data, ForNode) and data.loop_var in lv_to_dim:
-            out.setdefault(lv_to_dim[data.loop_var], []).insert(0, (data.loop_var, data.extent))
+        if not isinstance(data, ForNode):
+            continue
+        """A loop on the chain may belong to a DIFFERENT (enclosing) block than
+        the target's — e.g. the target sits in a producer's sub-block nested
+        under the matmul's M loop. That loop's var is absent from this block's
+        loopvar map, so fall back to parsing its dim from the dense name; the
+        coverage solve must still see it tiling its dim (else a full-extent
+        writer sunk under the target is treated as a free residual and replicated
+        inside the foreign tiling loop -> clobber)."""
+        dim = lv_to_dim.get(data.loop_var) or _dim_from_loopvar(data.loop_var)
+        out.setdefault(dim, []).insert(0, (data.loop_var, data.extent))
     return out
+
+
+def _dim_from_loopvar(loop_var: str) -> str:
+    """``i_d1_0`` / ``i_d1_0_0`` -> ``d1``. Strip the ``i_`` prefix and trailing ``_<int>``."""
+    body = loop_var[2:] if loop_var.startswith("i_") else loop_var
+    return body.split("_")[0]
 
 
 def _enclosing_block(tree: KernelTree, nid: int) -> int:

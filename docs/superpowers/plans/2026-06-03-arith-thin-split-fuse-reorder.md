@@ -293,6 +293,21 @@ ls /home/ubuntu/cache/ 2>/dev/null
 ```
 If a prior `kernel.py` artifact exists, confirm byte-identical; if not, this step is "runs clean" only.
 
+**Execution outcome.** The example uses an UNSEEDED random MDP policy (`random.Random()`)
+over `[Split, Fuse, Reorder, ComputeAt, ReverseComputeAt]`, so each run is a
+different rollout and is NOT a deterministic gate. A run hit a mid-rollout numeric
+failure — but this is a **pre-existing, out-of-scope** bug (the documented
+ComputeAt/ReverseComputeAt + "Split-over-a-shared-loop over-accumulation" MDP
+failures in `.claude/rules/learnings.md`), NOT caused by Part B. **Proof of
+exoneration:** a seeded render+sim rollout harness (`/tmp/seeded_sim.py`, seeds
+0-9, depth 10) was run on the base commit `e6e06e1` (pre-Part-B) and on HEAD
+`fae8d0c` (post-Part-B) — the two produced **byte-identical** rollouts (same
+failing rollout/step/transform per seed: e.g. seed 0 → `FAIL r0s3 Split` on both;
+seeds 1-9 → identical ReverseComputeAt/ComputeAt failures). Part B is a cover-check
+mechanism swap whose verdict equals `prod(factors)==extent` on every input, so it
+changes no legal-action set and no rollout. The full deterministic suite
+(`test/` → 252 passed, 10 skipped; byte-exact gates green) is the real gate.
+
 - [ ] **Step 4: Confirm shipped `nkigym` still imports zero TVM**
 
 Run:

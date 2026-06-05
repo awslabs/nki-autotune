@@ -3,8 +3,9 @@
 See ``compute_at_legality.md`` (conditions 1-4, 5a, 6). Structural move is
 the shared ``_move``; this face owns the output-block guard (condition 4:
 the kernel's final store cannot be sunk). Ordering legality (condition 5a)
-is delegated to ``_check_move_preserves_dependencies``: it simulates the move
-and rejects any dependency edge that would point backward afterward.
+is delegated to ``_check_move_preserves_dependencies``: a pure topological
+query that rejects any dependency edge that would point backward after the
+splice — no tree mutation.
 """
 
 from __future__ import annotations

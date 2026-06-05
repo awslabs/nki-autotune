@@ -344,6 +344,49 @@ def test_first_backward_edge_flags_consumer_before_producer():
     assert dep.first_backward_edge(tc_leaf) is not None
 
 
+def test_first_backward_edge_frozen_directions_catch_parallel_producer_flip():
+    """The direction bug, at the dependency layer: sinking the rhs load (PARALLEL
+    producer of sbuf_rhs, no carry edge) past the matmul that reads it.
+
+    Rebuilding Dependency on the moved tree re-derives the RAW load->matmul
+    hazard as a forward WAR matmul->load (the load now executes after the
+    matmul), so the rebuilt graph reports NO backward edge -> the trap. The fix
+    freezes directions from the ORIGINAL graph and evaluates spans on the moved
+    tree, keeping the RAW load->matmul orientation, so the post-move backward
+    span IS detected.
+    """
+    import copy
+
+    from nkigym.ir.dependency import Dependency
+    from nkigym.ir.tree import ForNode, ISANode
+    from nkigym.transforms._code_motion import _move
+
+    ir = build_canonical_ir()
+    rhs_load = next(
+        nid
+        for nid in ir.tree.blocks()
+        if nid != ir.tree.root
+        and sum(1 for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)) == 1
+        and (leaf := next(d for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)))
+        and ir.tree.data(leaf).op_cls is NKILoad
+        and ir.tree.data(leaf).operand_bindings["src"].tensor == "rhs"
+    )
+    tc_blk = _block_for_op(ir, NKITensorCopy)
+    tc_loop = next(d for d in ir.tree.preorder(tc_blk) if isinstance(ir.tree.data(d), ForNode))
+    moved_leaf = ir.dependency._resolve(rhs_load)
+
+    moved = copy.deepcopy(ir)
+    _move(moved, block_nid=rhs_load, target_loop_nid=tc_loop, index=0, is_reverse=False)
+
+    """The trap: rebuilding on the moved tree hides the violation (edge flipped forward)."""
+    rebuilt = Dependency(moved.tree)
+    assert rebuilt.first_backward_edge(moved_leaf) is None
+
+    """The fix: original directions + moved-tree spans expose the backward RAW edge."""
+    offending = ir.dependency.first_backward_edge(moved_leaf, tree=moved.tree)
+    assert offending is not None
+
+
 def test_first_backward_edge_allows_load_under_kloop():
     """Sinking the lhs_T load (writes sbuf_lhs_T, NOT carried over K) under K is legal -> None."""
     import copy
@@ -371,3 +414,76 @@ def test_first_backward_edge_allows_load_under_kloop():
         if isinstance(moved.tree.data(n), ISANode) and moved.tree.data(n).op_cls is NKILoad
     )
     assert dep.first_backward_edge(load_leaf) is None
+
+
+def test_insertion_check_matches_move_simulation_across_ladder():
+    """``first_backward_edge_for_insertion`` (pure, no tree mutation) must agree
+    with the simulate-and-rebuild path on EVERY candidate across ladder states.
+
+    The pure check derives the moved leaf's post-splice position analytically;
+    the simulation deep-copies, runs ``_move``, and reads the moved tree. Both
+    use frozen original-graph directions. This locks the three corrections the
+    pure derivation needed: enclosing carry-loop span growth, exclusion of the
+    moved subtree from the target's children when re-moving an already-nested
+    block, and the half-integer slot ordering.
+    """
+    import copy
+    from test.transforms._fixtures import build_ladder_state
+
+    from nkigym.ir.tree import ForNode, ISANode
+    from nkigym.transforms._code_motion import _move
+    from nkigym.transforms._domain_solve import DomainSolveError
+
+    for n in range(0, 13):
+        ir = build_ladder_state(n)
+        leaf_blocks = [
+            nid
+            for nid in ir.tree.blocks()
+            if nid != ir.tree.root
+            and sum(1 for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)) == 1
+        ]
+        for block_nid in leaf_blocks:
+            moved_leaf = ir.dependency._resolve(block_nid)
+            for target_nid in ir.tree.preorder():
+                if not isinstance(ir.tree.data(target_nid), ForNode):
+                    continue
+                if target_nid in ir.tree.descendants(block_nid):
+                    continue
+                for index in (-2, -1, 0, 1, 2):
+                    sim = copy.deepcopy(ir)
+                    try:
+                        _move(sim, block_nid=block_nid, target_loop_nid=target_nid, index=index, is_reverse=False)
+                    except (DomainSolveError, ValueError, KeyError, AssertionError):
+                        """Unrealizable splice — ordering equivalence is moot."""
+                        continue
+                    sim_offending = ir.dependency.first_backward_edge(moved_leaf, tree=sim.tree)
+                    pure_offending = ir.dependency.first_backward_edge_for_insertion(moved_leaf, target_nid, index)
+                    assert (sim_offending is None) == (pure_offending is None), (
+                        f"state={n} block={block_nid} target={target_nid} index={index}: "
+                        f"sim={sim_offending} pure={pure_offending}"
+                    )
+
+
+def test_cover_edge_matmul_nloop_dominates_full_read_tensor_copy():
+    """Canonical: the matmul's N-loop (i_d2_0) writes psum_prod tiled by N; the
+    tensor_copy reads psum_prod full-N, so a COVER edge ``i_d2_0-loop ->
+    tensor_copy`` forces the copy after the whole N-loop (region-coverage)."""
+    from nkigym.ir.tree import ForNode, ISANode
+
+    ir = build_canonical_ir()
+    dep = ir.dependency
+    matmul_leaf = next(
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+    )
+    tc_leaf = next(
+        n
+        for n in ir.tree.preorder()
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKITensorCopy
+    )
+    nloop = next(
+        a
+        for a in ir.tree.ancestors(matmul_leaf)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d2_0"
+    )
+    assert dep.graph.has_edge(nloop, tc_leaf), "N-loop must dominate the full-read tensor_copy"
+    assert dep.graph.edges[nloop, tc_leaf]["kind"] == "COVER"

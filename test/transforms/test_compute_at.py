@@ -31,6 +31,17 @@ def _first_for_in(ir, block_nid: int) -> int:
     raise AssertionError("no ForNode")
 
 
+def _load_block_reading(ir, tensor: str) -> int:
+    """Return the single-leaf load block whose ISA ``src`` reads ``tensor``."""
+    for nid in ir.tree.blocks():
+        leaves = [d for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)]
+        if len(leaves) == 1:
+            leaf = ir.tree.data(leaves[0])
+            if leaf.op_cls.__name__ == "NKILoad" and leaf.operand_bindings["src"].tensor == tensor:
+                return nid
+    raise AssertionError(f"no single-leaf load block reading {tensor}")
+
+
 def test_compute_at_rejects_sinking_output_store():
     """Condition 4: sinking the store (writes hbm_out = return) is illegal."""
     ir = build_canonical_ir()
@@ -73,6 +84,25 @@ def test_compute_at_rejects_consumer_sunk_before_producer():
     memset_loop = next(d for d in ir.tree.preorder(memset) if isinstance(ir.tree.data(d), ForNode))
     with pytest.raises(TransformLegalityError, match="reorder|dependency"):
         ComputeAt().apply(ir, ComputeAtOption(block_nid=tc, target_loop_nid=memset_loop, index=0))
+
+
+def test_compute_at_rejects_parallel_producer_sunk_past_consumer():
+    """The direction bug: sinking the rhs load (PARALLEL producer of sbuf_rhs, no
+    carry edge) under the tensor_copy loop places it AFTER the matmul that reads
+    sbuf_rhs. The RAW load->matmul edge would point backward; reject it.
+
+    This is the case ``examples/transform_debug.py`` exercises. The buggy check
+    rebuilt the dependency graph on the moved tree, where the load-after-matmul
+    order re-derives the hazard as a forward WAR matmul->load, hiding the
+    violation. The fix freezes edge directions from the original program.
+    """
+    ir = build_canonical_ir()
+    rhs_load = _load_block_reading(ir, "rhs")
+    tc = _block_for_op(ir, "NKITensorCopy")
+    tc_loop = _first_for_in(ir, tc)
+    with pytest.raises(TransformLegalityError, match="reorder|dependency"):
+        ComputeAt().apply(ir, ComputeAtOption(block_nid=rhs_load, target_loop_nid=tc_loop, index=0))
+    assert not any(o.block_nid == rhs_load and o.target_loop_nid == tc_loop for o in ComputeAt().analyze(ir))
 
 
 def test_analyze_does_not_crash_on_transformed_states():
