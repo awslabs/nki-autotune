@@ -13,9 +13,10 @@ for ``NUM_ROLLOUTS`` independent rollouts, and dumps every step's IR.
 Usage::
 
     source ~/venvs/kernel-env/bin/activate
-    PYTHONPATH=/home/ubuntu/nki-autotune/nkigym/src python examples/matmul_lhsT_rhs.py
+    PYTHONPATH=nkigym/src python examples/matmul_lhsT_rhs.py --cache-root-dir /tmp/autotune_cache
 """
 
+import argparse
 import importlib.util
 import os
 import random
@@ -68,7 +69,10 @@ def _check_numerics(kernel_path: str, seed: int = 0, atol: float = 5e-3, rtol: f
 
 
 if __name__ == "__main__":
-    CACHE_DIR = "/home/ubuntu/cache/matmul_lhsT_rhs"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cache-root-dir", required=True)
+    args = parser.parse_args()
+    CACHE_DIR = os.path.join(args.cache_root_dir, "matmul_lhsT_rhs")
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
 

@@ -21,10 +21,11 @@ only needs to sink the lhs_T load there too — one ComputeAt, not two.
 Usage::
 
     source ~/venvs/kernel-env/bin/activate
-    PYTHONPATH=/home/ubuntu/nki-autotune:/home/ubuntu/nki-autotune/nkigym/src \
-        python examples/kernel_transforms_repro.py
+    PYTHONPATH=.:nkigym/src \
+        python examples/kernel_transforms_repro.py --cache-root-dir /tmp/autotune_cache
 """
 
+import argparse
 import importlib.util
 import os
 import shutil
@@ -116,7 +117,10 @@ def _check_numerics(state, atol: float = 5e-3, rtol: float = 5e-3) -> None:
 
 
 if __name__ == "__main__":
-    CACHE_DIR = "/home/ubuntu/cache/kernel_transforms_repro"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cache-root-dir", required=True)
+    args = parser.parse_args()
+    CACHE_DIR = os.path.join(args.cache_root_dir, "kernel_transforms_repro")
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
 

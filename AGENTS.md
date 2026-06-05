@@ -17,6 +17,26 @@ PYTHONPATH=/home/ubuntu/nki-autotune:/home/ubuntu/nki-autotune/nkigym/src pytest
 For Python scripts, use the same environment and `PYTHONPATH` unless a task
 explicitly requires a different interpreter.
 
+## Running on Trainium (transports)
+
+The profiling backend (`autotune/src/autotune/runner/`) runs **on a Trn2
+box** (`from autotune.runner.api import profile`). `nkigym` also requires
+`nki` installed, so drivers run on the box, not the laptop.
+
+Drive a box from the laptop with a transport shell — each syncs the repo,
+sets up the env (idempotent; `--no-setup` to skip), runs the command, and
+downloads artifacts to the local cache root:
+
+```bash
+transport/ssh_host.sh --host gym-1    --cmd "python examples/matmul_lhsT_rhs.py"
+transport/kaizen.sh   --name trn2-exp --cmd "python examples/matmul_lhsT_rhs.py"
+```
+
+Cache roots are hardcoded in `transport/common.sh`
+(`transport_cache_root_dir` under the box's `$HOME`; `local_cache_root_dir`
+on the laptop). The shell injects `--cache-root-dir`. Already on a box?
+Run directly: `python examples/matmul_lhsT_rhs.py --cache-root-dir <dir>`.
+
 ## Claude Code Resources
 
 This repository still keeps useful Claude Code guidance under `.claude/`.

@@ -7,19 +7,15 @@ timing / MFU / roofline columns as ``benchmark.benchmark_one``, so the
 baseline lines up next to autotune-generated NKI kernels in any
 comparison table.
 
-Worker-only module -- imports nkipy at top level and requires the
-Neuron runtime via ``BaremetalExecutor``. Callers on non-Trn hosts
-should use :func:`remote_numpy_baseline` instead, which SSHs a
-coordinator-side payload into this module's ``baseline_worker_main``
-over the existing worker-bundle transport.
+On-box module -- imports nkipy at top level and requires the Neuron
+runtime via ``BaremetalExecutor``. Must run on a Trainium host; to run
+from a laptop, drive it through a transport shell (see AGENTS.md).
 """
 
 import base64
-import json
 import logging
 import os
 import shutil
-import sys
 from typing import Any, Callable
 
 import numpy as np
@@ -29,7 +25,7 @@ from nkipy.runtime import BaremetalExecutor, CompiledKernel
 logger = logging.getLogger(__name__)
 
 from autotune.runner.benchmark import _collect_profiler_outputs, generate_tensors
-from autotune.runner.types import ProfileResult, capture_error, ensure_venv_on_path
+from autotune.runner.types import ProfileResult, capture_error
 
 
 def _compile_numpy_fn(
@@ -146,60 +142,3 @@ def profile_numpy_baseline(
         ntff_b64=ntff_b64,
     )
     return result, nki_source
-
-
-def baseline_worker_main() -> None:
-    """Remote worker entry point for numpy-baseline profiling.
-
-    Mirrors ``worker.worker_main``: reads a JSON payload from stdin,
-    exec()s the caller-supplied source to resolve the numpy function,
-    runs ``profile_numpy_baseline``, writes a JSON ``ProfileResult`` to
-    stdout. Stderr holds log lines.
-
-    Payload schema::
-
-        {
-          "host": str,
-          "neuron_platform_target": str,
-          "func_source": str,     # exec'd in a fresh namespace
-          "func_name": str,       # callable to lookup in that namespace
-          "input_specs": {name: [[shape...], dtype_str]},
-          "kernel_name": str,
-          "additional_compiler_args": str,
-          "collect_detailed_profile": bool,
-        }
-    """
-    payload: dict[str, Any] = json.loads(sys.stdin.buffer.read())
-    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = payload["neuron_platform_target"]
-    ensure_venv_on_path()
-
-    namespace: dict[str, Any] = {"__builtins__": __builtins__, "__name__": "__baseline_source__"}
-    exec(payload["func_source"], namespace)  # noqa: S102
-    func = namespace[payload["func_name"]]
-
-    input_specs: dict[str, tuple[tuple[int, ...], str]] = {
-        name: (tuple(shape), dt) for name, (shape, dt) in payload["input_specs"].items()
-    }
-
-    real_stdout = sys.stdout
-    sys.stdout = sys.stderr
-    try:
-        result, nki_source = profile_numpy_baseline(
-            func=func,
-            input_specs=input_specs,
-            output_dir=f"/tmp/autotune-baseline-{payload['kernel_name']}",
-            kernel_name=payload["kernel_name"],
-            additional_compiler_args=payload["additional_compiler_args"],
-            collect_detailed_profile=bool(payload.get("collect_detailed_profile", False)),
-        )
-    finally:
-        sys.stdout = real_stdout
-
-    sys.stdout.buffer.write(
-        json.dumps({"host": payload["host"], "result": result._asdict(), "nki_source": nki_source}).encode("utf-8")
-    )
-    sys.stdout.buffer.flush()
-
-
-if __name__ == "__main__":
-    baseline_worker_main()

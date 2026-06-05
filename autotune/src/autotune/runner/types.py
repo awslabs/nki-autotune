@@ -1,7 +1,6 @@
 """Shared types, constants, and utilities for the autotune runner.
 
-Safe to import on both coordinator and worker machines — no nki or
-nkipy dependencies.
+Importable without nki or nkipy — depends only on numpy / ml_dtypes.
 """
 
 import os
@@ -31,15 +30,15 @@ def resolve_dtype(name: str) -> np.dtype:
 
 
 class KernelJob(NamedTuple):
-    """Per-kernel configuration for remote profiling.
+    """Per-kernel configuration for profiling.
 
     Attributes:
         source: NKI kernel source code string.
         func_name: Name of the ``@nki.jit`` function inside ``source``.
         output_shape: Shape of the kernel's HBM output tensor. Supplied
-            by the caller (traced once on the coordinator for
-            nkigym-generated kernels, hardcoded for reference kernels)
-            to avoid unreliable AST parsing on the worker.
+            by the caller (traced once for nkigym-generated kernels,
+            hardcoded for reference kernels) to avoid unreliable AST
+            parsing of the source.
         input_specs: Map of param name to (shape, dtype_str).
         neuronx_cc_args: Extra flags forwarded to neuronx-cc via
             ``CompileOptions.set_pipeline_options(*args)``. Empty for
@@ -78,7 +77,7 @@ class ProfileResult(NamedTuple):
 
     ``profile_detailed``, ``neff_b64``, and ``ntff_b64`` are collected
     only when the caller passes ``collect_detailed_profile=True`` to
-    :func:`remote_profile`:
+    :func:`profile`:
 
     * ``profile_detailed`` is the full ``--output-format json`` dict
       (per-instruction trace, per-engine active intervals, per-layer
@@ -142,9 +141,6 @@ def profiler_percent(summary: dict | None, field: str) -> float | None:
             if scaled >= 0:
                 result = scaled
     return result
-
-
-_DEFAULT_VENV_PYTHON = "/home/ubuntu/venvs/kernel-env/bin/python"
 
 
 def ensure_venv_on_path() -> None:

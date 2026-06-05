@@ -1,17 +1,21 @@
-"""NKI kernel profiling backend.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""NKI kernel profiling backend (local, on-box).
 
-Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-SPDX-License-Identifier: Apache-2.0
+Compiles and benchmarks NKI kernels in-process on a Trainium box::
 
-Distributes NKI kernel compilation and benchmarking across remote
-Trainium hosts via SSH::
+    from autotune.runner.api import profile
 
-    from autotune.runner.api import remote_profile
-
-    output = remote_profile(
-        kernels={"copy_v0.py": source, "copy_v1.py": source},
-        input_specs={"a": ((128, 512), "bfloat16")},
-        hosts=["gym-1", "gym-2", "gym-3"],
+    output = profile(
+        kernels={"copy_v0.py": job0, "copy_v1.py": job1},
+        cache_dir="/home/ubuntu/autotune_cache/copy",
+        seed=42,
+        neuron_platform_target="trn2",
+        collect_detailed_profile=False,
     )
     print(output)
+
+To run on a remote box, drive this through ``transport/ssh_host.sh`` or
+``transport/kaizen.sh`` (sync code, set up the env, execute, download
+artifacts).
 """

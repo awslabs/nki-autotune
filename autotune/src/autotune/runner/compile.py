@@ -1,7 +1,7 @@
 """NKI kernel compilation pipeline.
 
-Worker-only module — imports nki.compiler at top level. Not safe to
-import on the coordinator machine.
+On-box module — imports nki.compiler at top level. Requires a Trainium
+host with nki installed.
 """
 
 import contextlib

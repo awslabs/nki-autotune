@@ -1,7 +1,7 @@
 """Hardware benchmarking for NKI kernels.
 
-Worker-only module — imports nki and nkipy at top level. Not safe to
-import on the coordinator machine.
+On-box module — imports nki and nkipy at top level. Requires a Trainium
+host with nki + nkipy installed.
 """
 
 import base64

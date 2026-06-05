@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-VENV_DIR="/home/ubuntu/venvs/kernel-env"
+VENV_DIR="${AUTOTUNE_VENV_DIR:-/home/ubuntu/venvs/kernel-env}"
 PYTHON="python3.12"
 NEURON_PIP_INDEX="https://pip.repos.neuron.amazonaws.com"
 NKIPY_REPO="https://github.com/aws-neuron/nkipy.git"
