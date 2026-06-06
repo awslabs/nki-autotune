@@ -120,12 +120,19 @@ class Buffer:
         shape: per-axis extent.
         dtype: ``"float32"`` / ``"float16"`` / ``"bfloat16"``.
         location: ``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``.
+        versions: pipeline buffer-version count (default 1).
     """
 
     name: str
     shape: tuple[int, ...]
     dtype: str
     location: str
+    versions: int = 1
+    """Pipeline buffer-version count. 1 = single instance (renders
+    byte-identically to today). >1 multiplies the tile (middle) dim of
+    physical_shape so the renderer's ``loop_var % versions`` rotation
+    addresses distinct slots. Set by SoftwarePipeline (use_stage − def_stage
+    + 1); left 1 everywhere else."""
 
     def physical_shape(self) -> tuple[int, ...]:
         """Return the shape ``nl.ndarray`` actually allocates for this buffer.
@@ -145,7 +152,7 @@ class Buffer:
         leading, free = self.shape
         if leading % PARTITION_DIM != 0:
             raise AssertionError(f"{self.name}: leading extent {leading} must be a multiple of {PARTITION_DIM}")
-        return (PARTITION_DIM, leading // PARTITION_DIM, free)
+        return (PARTITION_DIM, (leading // PARTITION_DIM) * self.versions, free)
 
     def physical_dtype(self) -> str:
         """Return the dtype ``nl.ndarray`` actually allocates for this buffer.

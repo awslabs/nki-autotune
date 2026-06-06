@@ -5,6 +5,7 @@ from nkigym.transforms.compute_at import ComputeAt, ComputeAtOption
 from nkigym.transforms.fuse import Fuse, FuseOption
 from nkigym.transforms.reorder import Reorder, ReorderOption
 from nkigym.transforms.reverse_compute_at import ReverseComputeAt, ReverseComputeAtOption
+from nkigym.transforms.software_pipeline import SoftwarePipeline, SoftwarePipelineOption
 from nkigym.transforms.split import Split, SplitOption
 
 __all__ = [
@@ -16,6 +17,8 @@ __all__ = [
     "ReorderOption",
     "ReverseComputeAt",
     "ReverseComputeAtOption",
+    "SoftwarePipeline",
+    "SoftwarePipelineOption",
     "Split",
     "SplitOption",
     "Transform",

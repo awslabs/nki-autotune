@@ -1,10 +1,11 @@
 """Hand-tuned matmul: a transform sequence found by reading the profiler.
 
 Proof-of-concept tuner for ``lhs_T.T @ rhs`` (K=M=N=2048, bf16). The
-``TRACE`` below is not a canned ladder — it is the sequence I arrived at
-by running candidates on this Trn2 box, reading the profiler feedback,
-and refining. The script replays that final sequence, profiles every
-rung, and prints the MFU climb so the result is reproducible.
+``TRACE`` below is not a canned ladder — it is the five-atom sequence I
+arrived at by running candidates on this Trn2 box, reading the profiler
+feedback, and refining. The script replays that final sequence,
+sim-checks every rung, and profiles the final kernel so the result is
+reproducible.
 
 How the sequence was found (the manual tuning loop):
 
@@ -24,28 +25,34 @@ How the sequence was found (the manual tuning loop):
    is a single 128x2048 fp32 tile (~1 MiB). The inner loop becomes a
    pure ``nc_matmul`` reduction the compiler can software-pipeline.
 
-That final kernel profiles at ~60% MFU (0.000366 s) versus the ladder's
-~16% — a 3.7x improvement from four atoms. For reference, the compiler
-baseline (numpy ``lhs_T.T @ rhs`` via neuronx-cc) lands at ~86% MFU /
-0.000253 s on the same box; closing that last gap needs accumulator
-multi-buffering, which the shipped transform set does not yet express
-cleanly (see CLAUDE.md "Tiles per block").
+   That four-atom kernel profiles at ~60% MFU (0.000366 s) versus the
+   ladder's ~16%. The profiler then shows tensor-engine-active at only
+   ~72% (27% idle): with a single PSUM bank, tile m's drain false-shares
+   the bank with tile m+1's matmul (a WAR hazard), so the engine stalls
+   at every M-tile boundary.
+4. ``SoftwarePipeline`` (rung 5): double-buffer the accumulator across
+   the M loop (stages ``(0,0,1)`` -> 2 PSUM banks, ``psum_prod[:, m%2, :]``).
+   The WAR is gone, so neuronx-cc pipelines the M loop and TE-active jumps
+   to ~88%.
+
+That final kernel profiles at ~83% MFU (0.000262 s) — a 5x improvement
+over the ladder and within ~3pp of the compiler baseline (numpy
+``lhs_T.T @ rhs`` via neuronx-cc, ~86% MFU / 0.000253 s on the same box).
 
 What this script profiles, and why only one kernel: every rung is
 CPU-sim'd at fp32 against the numpy golden, so the whole transform path
 is proven correct (a broken transform fails loudly and halts). But the
-PSUM accumulator only shrinks on the LAST transform — the canonical
-kernel and the three intermediate rungs all hold the full-extent 16 MiB
-PSUM and would PSUM-OOM on hardware. So there is no measurable "MFU
-climb" to profile: only the final tuned kernel fits the box. The script
-profiles that kernel and the compiler baseline, and reports them side by
-side.
+PSUM accumulator only shrinks on the 4th transform — the canonical
+kernel and the early rungs all hold the full-extent 16 MiB PSUM and
+would PSUM-OOM on hardware. So there is no measurable "MFU climb" to
+profile: only the final tuned kernel fits the box. The script profiles
+that kernel and the compiler baseline, and reports them side by side.
 
 Measured (Trn2, seed 0; numbers vary run to run):
 
-    kernel                                 total_s      mfu
-    tuned (loads resident, K innermost)   0.000366   ~59.7%
-    compiler baseline (neuronx-cc)        0.000253   ~86.2%
+    kernel                                       total_s      mfu
+    tuned (5 atoms: + accumulator 2-buffer)     0.000262   ~83.4%
+    compiler baseline (neuronx-cc)              0.000253   ~86.2%
 
 Usage::
 
@@ -89,6 +96,8 @@ from nkigym.transforms import (
     Reorder,
     ReorderOption,
     ReverseComputeAt,
+    SoftwarePipeline,
+    SoftwarePipelineOption,
     Split,
 )
 
@@ -121,6 +130,16 @@ deterministic next tree — the literal nids below are fixed.
 * rung 3 (ComputeAt): sink the PSUM memset under the M loop.
 * rung 4 (ComputeAt): sink the PSUM->SBUF drain under the M loop, which
   drops the PSUM accumulator's live extent to a single 128x2048 tile.
+* rung 5 (SoftwarePipeline): double-buffer the PSUM accumulator across the
+  M loop — stages ``(0,0,1)`` put memset+matmul in stage 0 and the drain in
+  stage 1, so the buffer gets 2 versions and every access indexes
+  ``psum_prod[:, i_d1_0 % 2, :]``. The drain of tile m-1 no longer false-
+  shares the single bank with tile m's matmul, so neuronx-cc pipelines the
+  M loop and the tensor-engine stops stalling at every M-tile boundary.
+
+The M loop is node id 11 after the two Reorders (``build_initial_ir`` is
+deterministic; the loop that started as the d0=K loop holds id 11 and
+becomes the M loop once the matmul nest is rotated to M>N>K).
 
 The two operand loads are never touched, so they stay hoisted at the top
 of the kernel and resident in SBUF across the whole matmul.
@@ -130,6 +149,7 @@ TRACE: list[tuple[object, object]] = [
     (Reorder(), ReorderOption(outer_nid=12, inner_nid=13)),
     (ComputeAt(), ComputeAtOption(block_nid=7, target_loop_nid=11, index=0)),
     (ComputeAt(), ComputeAtOption(block_nid=15, target_loop_nid=11, index=2)),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=11, stages=(0, 0, 1), order=(0, 1, 2))),
 ]
 
 
@@ -176,7 +196,11 @@ def _validate_trace(cache_dir: str) -> tuple[str, tuple[int, ...]]:
     intermediate rungs still hold the full-extent 16 MiB PSUM accumulator
     and would PSUM-OOM on hardware, so only the final kernel is profiled.
     """
-    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), ComputeAt(), ReverseComputeAt()])
+    env = KernelMDP(
+        f_nkigym,
+        INPUT_SPECS,
+        transforms=[Split(), Fuse(), Reorder(), ComputeAt(), ReverseComputeAt(), SoftwarePipeline()],
+    )
     state = env.reset()
     output_shape = tuple(state.buffer(state.return_name).shape)
     scratch_path = os.path.join(tempfile.gettempdir(), "tune_matmul_sim_scratch.py")

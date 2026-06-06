@@ -41,6 +41,33 @@ def test_buffer_physical_shape_expands_sbuf_psum_and_passes_hbm_through():
     assert hbm.physical_shape() == (2048, 2048)
 
 
+def test_buffer_versions_default_unchanged():
+    """versions defaults to 1 and leaves physical_shape identical to today."""
+    from nkigym.ir.tree import Buffer
+
+    buf = Buffer(name="psum_prod", shape=(128, 2048), dtype="float32", location="psum")
+    assert buf.versions == 1
+    assert buf.physical_shape() == (128, 1, 2048)
+
+
+def test_buffer_versions_grows_tile_dim():
+    """versions=2 doubles the tile (middle) dim for sbuf/psum."""
+    from nkigym.ir.tree import Buffer
+
+    psum = Buffer(name="psum_prod", shape=(128, 2048), dtype="float32", location="psum", versions=2)
+    assert psum.physical_shape() == (128, 2, 2048)
+    sbuf = Buffer(name="sbuf_x", shape=(256, 512), dtype="bfloat16", location="sbuf", versions=2)
+    assert sbuf.physical_shape() == (128, 4, 512)
+
+
+def test_buffer_versions_hbm_unaffected():
+    """shared_hbm keeps its 2D logical shape regardless of versions."""
+    from nkigym.ir.tree import Buffer
+
+    hbm = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm", versions=2)
+    assert hbm.physical_shape() == (2048, 2048)
+
+
 def test_buffer_physical_dtype_overrides_psum_to_fp32():
     """physical_dtype() returns fp32 for psum (HW accumulation), logical dtype otherwise."""
     from nkigym.ir.tree import Buffer
