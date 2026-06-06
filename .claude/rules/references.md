@@ -6,6 +6,7 @@
 - **NKI CPU simulator driver**: `/home/weittang/workplace/venvs/kernel-env/lib/python3.12/site-packages/nki/simulator.py`
 - **Online Fusion Math Derivation**: `/home/weittang/workplace/online_fusion/paper`
 - **TVM Source codes**: `/home/weittang/workplace/tvm`
+- **Kaizen Desktop**: `https://w.amazon.com/bin/view/AWS/Neuron/Services/Kaizen/Documentation/UserGuide/KaizenDesktop`
 
 ## Manually Written Kernels
 

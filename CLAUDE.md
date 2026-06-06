@@ -7,9 +7,8 @@ python <script>
 pytest <tests>
 ```
 
-Driver scripts (examples) require `--cache-root-dir`. To run on remote
-Trainium, use `transport/ssh_host.sh` or `transport/kaizen.sh` (see
-AGENTS.md → Running on Trainium).
+Driver scripts (examples) require `--cache`. To run on remote Trainium,
+use `transport/kaizen.sh` (see the header in that script).
 
 Performance tuning:
 - [x] Unified tune stage

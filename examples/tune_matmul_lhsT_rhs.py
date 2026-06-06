@@ -51,7 +51,7 @@ Usage::
 
     source ~/venvs/kernel-env/bin/activate
     PYTHONPATH=.:nkigym/src \
-        python examples/tune_matmul_lhsT_rhs.py --cache-root-dir /tmp/autotune_cache
+        python examples/tune_matmul_lhsT_rhs.py --cache /tmp/autotune_cache
 """
 
 import argparse
@@ -221,11 +221,11 @@ def _print_baseline(baseline: ProfileResult, tuned: ProfileOutput) -> None:
 def main() -> None:
     """Sim-validate the trace, profile the tuned kernel + compiler baseline."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache-root-dir", required=True)
+    parser.add_argument("--cache", required=True)
     parser.add_argument("--detailed", action="store_true", help="collect per-instruction profiler trace + NEFF/NTFF")
     args = parser.parse_args()
 
-    cache_dir = os.path.join(args.cache_root_dir, "tune_matmul_lhsT_rhs")
+    cache_dir = os.path.join(args.cache, "tune_matmul_lhsT_rhs")
     shutil.rmtree(cache_dir, ignore_errors=True)
     os.makedirs(cache_dir, exist_ok=True)
 
