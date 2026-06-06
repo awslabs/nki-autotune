@@ -29,6 +29,14 @@ PYTHON="${PYTHON:-}"
 NKIPY_SRC="${NKIPY_SRC:-$HOME/src/nkipy}"
 NKIPY_REPO="https://github.com/aws-neuron/nkipy.git"
 
+# Node + the global npm prefix live under $HOME so mmdc survives across fresh
+# Kaizen desktops (only $HOME is S3-backed; apt/global-npm in the image are
+# wiped per-desktop). PATH below puts both on PATH for this script.
+NODE_DIR="${NODE_DIR:-$HOME/.local/node}"
+NPM_PREFIX="${NPM_PREFIX:-$HOME/.npm-global}"
+NODE_VERSION="${NODE_VERSION:-v20.18.1}"
+export PATH="$NODE_DIR/bin:$NPM_PREFIX/bin:$PATH"
+
 die() {
     echo "ERROR: $*" >&2
     exit 1
@@ -120,23 +128,30 @@ python -m pip install \
     hypothesis pytest pre-commit \
     black isort
 
-# --- [6/8] Node.js + npm (apt) ---------------------------------------------
-# Ubuntu ships Node 18; mermaid-cli 11.x prints a benign EBADENGINE warning
-# (wants Node >=20) but renders correctly on 18.
-if command -v node >/dev/null 2>&1; then
-    echo "==> [6/8] Node.js present ($(node --version)) — skipping apt install"
+# --- [6/8] Node.js + npm (prebuilt tarball under $HOME) --------------------
+# Installed under $HOME (not apt) so it persists across fresh Kaizen desktops.
+# Node 20 satisfies mermaid-cli 11.x (no EBADENGINE warning). Idempotent: the
+# tarball is only fetched when $NODE_DIR/bin/node is absent.
+if [[ -x "$NODE_DIR/bin/node" ]]; then
+    echo "==> [6/8] Node.js present at $NODE_DIR ($("$NODE_DIR/bin/node" --version)) — skipping"
 else
-    echo "==> [6/8] Installing Node.js + npm via apt"
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y -q nodejs npm
+    echo "==> [6/8] Installing Node.js $NODE_VERSION -> $NODE_DIR"
+    command -v curl >/dev/null 2>&1 || die "curl required to fetch Node"
+    mkdir -p "$NODE_DIR"
+    curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-x64.tar.xz" |
+        tar -xJ -C "$NODE_DIR" --strip-components=1
 fi
+node --version >/dev/null 2>&1 || die "node not callable after install (PATH=$PATH)"
+npm config set prefix "$NPM_PREFIX"
 
 # --- [7/8] Mermaid CLI (mmdc) ----------------------------------------------
-# npm's cacache hardlinks from its cache dir into node_modules. On a Kaizen
-# desktop $HOME is an S3-Files NFS mount that rejects hardlinks ("EMLINK: too
-# many links"), so a default ~/.npm cache breaks `npm install`. Probe $HOME for
-# hardlink support and, when it's missing, relocate the npm cache to local disk
-# (/ustore/ssd on Kaizen, else a tmpdir). No-op on normal filesystems.
+# Installed into $NPM_PREFIX (under $HOME) so mmdc persists across fresh Kaizen
+# desktops — no $SUDO, the prefix is user-owned. npm's cacache hardlinks from
+# its cache dir into node_modules; on a Kaizen desktop $HOME is an S3-Files NFS
+# mount that rejects hardlinks ("EMLINK: too many links"), so a default ~/.npm
+# cache breaks the install. Probe $HOME for hardlink support and, when missing,
+# put the cache on local disk (/ustore/ssd on Kaizen, else a tmpdir). The cache
+# is throwaway, so its non-persistence across desktops is fine.
 if command -v mmdc >/dev/null 2>&1; then
     echo "==> [7/8] mmdc present ($(mmdc --version)) — skipping npm install"
 else
@@ -154,8 +169,8 @@ else
         npm_cache_args=(--cache "$npm_cache_dir")
     fi
     rm -f "$_lt" "$_lt.2"
-    echo "==> [7/8] Installing @mermaid-js/mermaid-cli globally (provides mmdc)"
-    $SUDO npm install -g ${npm_cache_args[@]+"${npm_cache_args[@]}"} @mermaid-js/mermaid-cli
+    echo "==> [7/8] Installing @mermaid-js/mermaid-cli into $NPM_PREFIX (provides mmdc)"
+    npm install -g ${npm_cache_args[@]+"${npm_cache_args[@]}"} @mermaid-js/mermaid-cli
 fi
 
 # --- [8/8] Headless Chrome for Puppeteer -----------------------------------

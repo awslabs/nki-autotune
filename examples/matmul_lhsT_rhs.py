@@ -35,8 +35,8 @@ from nkigym.transforms import ComputeAt, Fuse, Reorder, ReverseComputeAt, Split
 
 K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
-NUM_ROLLOUTS = 3
-MAX_STEPS = 10
+NUM_ROLLOUTS = 1
+MAX_STEPS = 100
 
 
 def f_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:

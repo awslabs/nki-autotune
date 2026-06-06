@@ -15,10 +15,12 @@ remote_repo_subdir="nki-autotune"
 # sync pulls it back to the SAME path locally. On Kaizen it MUST live under
 # $HOME — only $HOME is S3-backed and visible to the reverse sync.
 
-# Line that activates the kernel-env venv on the remote box before running.
-# Overridable via AUTOTUNE_REMOTE_ACTIVATE for boxes with a different layout
-# (e.g. the Kaizen py312 conda image). The literal \$HOME expands remotely.
-remote_activate="${AUTOTUNE_REMOTE_ACTIVATE:-source \$HOME/venvs/kernel-env/bin/activate}"
+# Line that activates the kernel-env venv on the remote box before running, and
+# puts the $HOME-local Node + global-npm bins on PATH so dump()'s `mmdc` (and
+# `node`) are found — install.sh keeps them under $HOME so they survive fresh
+# desktops. Overridable via AUTOTUNE_REMOTE_ACTIVATE for boxes with a different
+# layout (e.g. the Kaizen py312 conda image). The literal \$HOME expands remotely.
+remote_activate="${AUTOTUNE_REMOTE_ACTIVATE:-source \$HOME/venvs/kernel-env/bin/activate && export PATH=\$HOME/.local/node/bin:\$HOME/.npm-global/bin:\$PATH}"
 
 # PYTHONPATH so a bare `python examples/X.py` resolves the first-party packages.
 # install.sh installs only the THIRD-PARTY deps (nkipy/spike); nkigym + autotune
