@@ -10,7 +10,7 @@ from typing import Any, ClassVar, Literal
 import nki.isa as nisa
 import numpy as np
 
-from nkigym.ops.base import AxisRole, NKIOp, _operand_role
+from nkigym.ops.base import AxisRole, NKIOp, ReduceCombinator, _operand_role
 
 MATMUL_FREE_MAX = 512
 
@@ -27,6 +27,7 @@ class NKIMatmul(NKIOp):
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"stationary", "moving"})
     RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset({"dst"})
     RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "rmw"
+    REDUCE_COMBINATOR: ClassVar[ReduceCombinator | None] = ReduceCombinator(combiner="add", identity=0.0)
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"K": AxisRole.ACCUMULATION}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"K": 128, "M": 128, "N": 512}

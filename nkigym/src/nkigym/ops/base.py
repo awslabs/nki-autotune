@@ -8,6 +8,7 @@ axis semantics and hardware limits via class attributes.
 import functools
 from abc import abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, ClassVar, Literal
 
@@ -82,6 +83,21 @@ def _tag_as_param(value: Any) -> Any:
     return value
 
 
+@dataclass(frozen=True)
+class ReduceCombinator:
+    """An op's commutative-associative reducer, mirroring TVM's CommReducer.
+
+    Attributes:
+        combiner: the ``nl.*`` op name applied in the RFactor wb-block combine
+            (e.g. ``"add"`` for a sum reduction).
+        identity: the value RFactor memsets both the rf-block slot and the
+            wb-block accumulator to before reducing (e.g. ``0.0`` for sum).
+    """
+
+    combiner: str
+    identity: float
+
+
 class NKIOp:
     """Base for all NKI operator definitions.
 
@@ -143,13 +159,24 @@ class NKIOp:
     RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = None
     """Which RFactor recipe this op supports, or ``None`` if not rfactorable.
 
-    - ``"rmw"``: ops with a HW accumulator (matmul). RFactor materializes
-      a staging buffer, per-outer-iteration PSUM alloc, drain to SBUF slot,
-      closing tensor_reduce.
-    - ``"slot"``: ops whose write operand naturally indexes by reduction
-      tile (activation_reduce). RFactor points successive calls at
-      successive slots of a staging buffer, closes with tensor_reduce.
-    - ``None``: atom legality rejects any RFactor targeting this op.
+    Both recipes emit the same rf-buffer + write-back-block shape; they differ
+    only in how the rf-block's per-slot accumulate lowers:
+
+    - ``"rmw"``: ops with a HW accumulator (matmul). Per-slot accumulate is
+      HW ``+=`` into a PSUM slot, drained to the SBUF rf-buffer; the wb-block
+      combine is a ``tensor_tensor``.
+    - ``"slot"``: ops with no HW accumulator (activation_reduce). Each slot is
+      written directly in SBUF; the wb-block closes with a ``tensor_reduce``.
+    - ``None``: RFactor legality rejects any atom targeting this op.
+    """
+
+    REDUCE_COMBINATOR: ClassVar["ReduceCombinator | None"] = None
+    """The op's commutative-associative reducer, or ``None`` if not a reduction.
+
+    RFactor reads this to synthesize the rf-block per-slot init, the wb-block
+    init (both ``memset`` to ``identity``), and the wb-block combine (an ISA op
+    applying ``combiner``). Must be set on every op whose ``RFACTOR_RECIPE`` is
+    not ``None``.
     """
 
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset()
