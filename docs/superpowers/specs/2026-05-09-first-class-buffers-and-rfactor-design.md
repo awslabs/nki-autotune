@@ -338,6 +338,18 @@ Shrinks to `required_tiles` + `tensor_total_slots` helpers. Allocation *placemen
 
 ## 7. `RFactor` atom
 
+> **⚠️ SUPERSEDED (2026-06-07).** This section's RFactor design — rf-buffer +
+> closing `tensor_reduce`, expressed in the `NKIAlloc` / `module.tensors` /
+> `LoopNode` vocabulary — is obsolete. The IR surface it targets no longer exists
+> (replaced by the BlockNode IR, 2026-05-27, and the SSA-ops backend, 2026-06-01),
+> and the output form changed from rf-buffer to **fused single-accumulator**. See
+> `docs/superpowers/specs/2026-06-07-rfactor-transform-design.md` for the current
+> design. The surviving contributions of this section — the `RFACTOR_RECIPE =
+> "rmw" | "slot"` taxonomy (which shipped on the ops) and the legality conditions
+> — are carried forward there. §§1–6 above (first-class buffers, RMW operands) are
+> separate topics and remain partially live; see the SSA-ops and BlockNode refactor
+> specs for what actually shipped.
+
 ### 7.1 Signature
 
 ```python
