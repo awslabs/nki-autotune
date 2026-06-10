@@ -72,7 +72,8 @@ parse_common_args() {
     esac
 }
 
-# The first .py token of USER_CMD — the script we run and verify accepts --cache.
+# The first .py token of USER_CMD — the script we run (and verify accepts
+# --cache, via a local static scan in kaizen.sh before the round trip).
 user_script() {
     local tok
     for tok in $USER_CMD; do
@@ -81,13 +82,14 @@ user_script() {
     die "no .py script found in --cmd: $USER_CMD"
 }
 
-# Remote preflight (one round trip): fail fast (exit 3) unless the script's
-# --help advertises a --cache option — so a script that ignores --cache can't
-# silently drop the reverse-synced artifacts — then print the remote $HOME so
-# the caller can map --cache to its S3-export prefix. Runs inside the venv.
+# Remote preflight (one round trip): print the remote $HOME so the caller can
+# map --cache to its S3-export prefix. Activating the venv first doubles as a
+# sanity check that install.sh has run (a missing venv fails the `source` → the
+# caller dies). The --cache acceptance check is done LOCALLY in kaizen.sh before
+# this round trip (the dev box has no Python env to run `python <script>
+# --help`, so it's a static source scan of the script there).
 remote_check_cmd() {
-    printf '%s && cd ~/%s && %s python %s --help 2>&1 | grep -q -- --cache || { echo "TRANSPORT: %s does not accept --cache" >&2; exit 3; }; echo "TRANSPORT_HOME=$HOME"' \
-        "$remote_activate" "$remote_repo_subdir" "$remote_pythonpath" "$(user_script)" "$(user_script)"
+    printf '%s && echo "TRANSPORT_HOME=$HOME"' "$remote_activate"
 }
 
 # Name of the transport's completion manifest, written inside --cache as the
@@ -97,19 +99,42 @@ remote_check_cmd() {
 # done-signal that needs no cooperation from the user's script.
 transport_manifest=".transport_manifest"
 
-# The full remote command. First wipe + recreate --cache so the desktop cache
-# holds ONLY this run's output (mirrors the local wipe; also keeps the manifest
-# below — built from `find $CACHE_DIR` — free of leftover sibling subfolders).
-# Then activate venv, cd into the repo, export the platform target, run the
-# user's command with --cache <dir> appended (mirrored path). On success, write
-# transport_manifest LAST: a sentinel whose presence in S3 means "run finished"
-# and whose contents are the completeness oracle. Built with find -printf,
-# excluding the manifest itself; `&&` so a failed run writes no manifest (and
-# the transport's own non-zero exit still propagates).
+# Name of the full-run log, written inside --cache by kaizen.sh. Every line of
+# the transport's own stdout+stderr (all 4 steps, including any infra failure
+# before the remote run) is tee'd here, so the cache always carries a record of
+# what happened even when the run dies early. Written locally by the transport
+# (not the remote run), so it is NOT in transport_manifest — both the reverse
+# sync's completeness check and the orphan prune must skip it explicitly.
+transport_log="output.log"
+
+# The full remote command. $1 is "1" when the user's script accepts --cache and
+# "0" otherwise (decided by kaizen.sh's local static scan); the two forms differ
+# only in cache plumbing.
+#
+# accepts-cache ("1"): wipe + recreate the desktop --cache so it holds ONLY this
+# run's output (mirrors the local wipe; also keeps the manifest below — built
+# from `find $CACHE_DIR` — free of leftover sibling subfolders). Then activate
+# venv, cd into the repo, export the platform target, run the command with
+# --cache <dir> appended (mirrored path). On success, write transport_manifest
+# LAST: a sentinel whose presence in S3 means "run finished" and whose contents
+# are the completeness oracle. Built with find -printf, excluding the manifest
+# itself; `&&` so a failed run writes no manifest (the non-zero exit propagates).
+#
+# no-cache ("0"): just activate + run the command as-is. The script writes
+# nothing to --cache remotely, so there is no manifest and nothing to
+# reverse-sync; its terminal output still flows back through `connect` into the
+# local output.log (tee'd by kaizen.sh).
 remote_run_cmd() {
-    printf 'rm -rf %s && mkdir -p %s && %s && cd ~/%s && export NEURON_PLATFORM_TARGET_OVERRIDE=%s && %s %s --cache %s && find %s -type f ! -name %s -printf "%%s\\t%%P\\n" | LC_ALL=C sort > %s/%s' \
-        "$CACHE_DIR" "$CACHE_DIR" \
-        "$remote_activate" "$remote_repo_subdir" "$neuron_platform_target" \
-        "$remote_pythonpath" "$USER_CMD" "$CACHE_DIR" \
-        "$CACHE_DIR" "$transport_manifest" "$CACHE_DIR" "$transport_manifest"
+    local accepts_cache="$1"
+    if [[ "$accepts_cache" == "1" ]]; then
+        printf 'rm -rf %s && mkdir -p %s && %s && cd ~/%s && export NEURON_PLATFORM_TARGET_OVERRIDE=%s && %s %s --cache %s && find %s -type f ! -name %s -printf "%%s\\t%%P\\n" | LC_ALL=C sort > %s/%s' \
+            "$CACHE_DIR" "$CACHE_DIR" \
+            "$remote_activate" "$remote_repo_subdir" "$neuron_platform_target" \
+            "$remote_pythonpath" "$USER_CMD" "$CACHE_DIR" \
+            "$CACHE_DIR" "$transport_manifest" "$CACHE_DIR" "$transport_manifest"
+    else
+        printf '%s && cd ~/%s && export NEURON_PLATFORM_TARGET_OVERRIDE=%s && %s %s' \
+            "$remote_activate" "$remote_repo_subdir" "$neuron_platform_target" \
+            "$remote_pythonpath" "$USER_CMD"
+    fi
 }

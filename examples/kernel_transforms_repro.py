@@ -42,7 +42,7 @@ from test.transforms._ladder_compare import assert_matches_hand
 
 import numpy as np
 
-import kernel_transforms as KT
+import examples.kernel_transforms as KT
 from nkigym.codegen import render
 from nkigym.environment import KernelMDP
 from nkigym.ops import nkigym_kernel

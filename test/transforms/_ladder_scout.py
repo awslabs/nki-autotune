@@ -1,6 +1,6 @@
 """Scout: dump canonical IR nids + try to match kernel_1..kernel_7 with shipped
 transforms (Split/Reorder/ComputeAt). Identify where RFactor is needed (k7->k8). Delete after."""
-import kernel_transforms as KT
+import examples.kernel_transforms as KT
 from nkigym.codegen import render
 from nkigym.ir import build_initial_ir
 from nkigym.ir.tree import BlockNode, ForNode, ISANode

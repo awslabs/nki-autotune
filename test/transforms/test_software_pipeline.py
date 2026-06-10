@@ -9,7 +9,7 @@ import tempfile
 import numpy as np
 import pytest
 
-import kernel_transforms as KT
+import examples.kernel_transforms as KT
 from nkigym.codegen import render
 from nkigym.synthesis.simulate_nki import simulate_fp32
 from nkigym.transforms import SoftwarePipeline, SoftwarePipelineOption, TransformLegalityError

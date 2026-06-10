@@ -9,7 +9,7 @@ from test.transforms._ladder_compare import _normalize, assert_matches_hand
 import numpy as np
 import pytest
 
-import kernel_transforms as KT
+import examples.kernel_transforms as KT
 from nkigym.codegen import render
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.synthesis.simulate_nki import simulate_fp32
