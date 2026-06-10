@@ -178,8 +178,25 @@ def _emit_isa_call(node: ISANode, ir: KernelIR, rotations: dict[str, Expr]) -> s
             rendered = render_buffer_region(rebased_region(region, buf, ir.tree), buf, rotations.get(region.tensor))
             parts.append(f"{slot}={rendered}")
     for k, v in node.kwargs.items():
-        parts.append(f"{k}={v!r}")
+        parts.append(f"{k}={_render_kwarg(k, v)}")
     return f"nisa.{op_cls.NAME}({', '.join(parts)})"
+
+
+_NL_OP_KWARGS = frozenset({"op", "op0", "op1", "reduce_op"})
+"""ISA kwargs whose string value names an ``nl`` math operator. ``nisa`` ALU
+ops (``tensor_tensor``, ``tensor_scalar``, ``activation``, ``tensor_reduce``)
+take the operator as an ``nl`` reference (e.g. ``op=nl.add``), not a bare
+string — so these render as ``nl.<value>`` while every other kwarg renders
+via ``repr`` (e.g. memset's ``value=0.0``)."""
+
+
+def _render_kwarg(key: str, value: Any) -> str:
+    """Render one ISA kwarg value, mapping ALU-operator names to ``nl.<name>``."""
+    if key in _NL_OP_KWARGS and isinstance(value, str):
+        rendered = f"nl.{value}"
+    else:
+        rendered = repr(value)
+    return rendered
 
 
 def _format_tile_index(lo: Expr, rotation: Expr | None) -> str:

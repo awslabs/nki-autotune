@@ -445,8 +445,24 @@ def _carry_loops_of_leaf(tree: KernelTree, leaf_nid: int) -> dict[int, str]:
 
     A loop carries state when its bound axis has SEQUENTIAL or ACCUMULATION
     role for the leaf's enclosing block. The carried buffer is the leaf
-    operand whose ``OPERAND_AXES`` tuple omits that loop's axis (the value
-    live across the loop). Loops whose axis is PARALLEL, or which carry no
+    operand whose ``OPERAND_AXES`` tuple omits that loop's axis (so the value is
+    nominally live across the loop) AND whose region offset does NOT depend on
+    the loop var. The region test distinguishes a genuinely carried buffer
+    (constant address across the loop — matmul's ``psum`` accumulator,
+    tensor_tensor's ``out`` RMW slot) from one that is SWEPT (a distinct
+    slice per iteration — the rfactor wb-block reads ``B_rf[ko-slot]``, whose
+    partition offset varies with the reduction loop var): a swept operand omits
+    the axis in ``OPERAND_AXES`` yet is re-addressed each iteration, so it is not
+    carried. This assumes a genuinely carried buffer is addressed
+    loop-invariantly on the NON-PARALLEL loop that carries it; the region test is
+    NOT a general "loop-var-in-offset => swept" rule across all roles. It is
+    consistent with the PARALLEL role gate above (``role_of(...) == PARALLEL``
+    ``continue``): a loop flipped to PARALLEL (e.g. an RFactor rf-block ``psum``
+    slot axis, whose dst offset DOES contain the loop var) is skipped before
+    reaching this region test, so a PARALLEL-indexed slot never arrives here.
+    Operands naming the same carried tensor in multiple slots (an RMW
+    op's ``data1``/``dst`` alias) collapse to one; only DISTINCT carried tensors
+    on one loop are ambiguous. Loops whose axis is PARALLEL, or which carry no
     such operand, are skipped.
     """
     data = tree.data(leaf_nid)
@@ -468,14 +484,19 @@ def _carry_loops_of_leaf(tree: KernelTree, leaf_nid: int) -> dict[int, str]:
         if role_of(block, concrete) == AxisRole.PARALLEL:
             continue
         abstract = inverse_axis_map.get(concrete)
+        loop_var = anc_data.loop_var
+        carried: set[str] = set()
         for slot, axes in op_axes.items():
-            if abstract is not None and abstract not in axes and slot in data.operand_bindings:
-                if anc in out:
-                    raise ValueError(
-                        f"loop {anc} carries multiple operands ({out[anc]}, "
-                        f"{data.operand_bindings[slot].tensor}); ambiguous carried buffer"
-                    )
-                out[anc] = data.operand_bindings[slot].tensor
+            if abstract is None or abstract in axes or slot not in data.operand_bindings:
+                continue
+            region = data.operand_bindings[slot]
+            if any(loop_var in to_affine(lo) for lo, _w in region.ranges):
+                continue
+            carried.add(region.tensor)
+        if len(carried) > 1:
+            raise ValueError(f"loop {anc} carries multiple operands ({sorted(carried)}); ambiguous carried buffer")
+        if carried:
+            out[anc] = next(iter(carried))
     return out
 
 
