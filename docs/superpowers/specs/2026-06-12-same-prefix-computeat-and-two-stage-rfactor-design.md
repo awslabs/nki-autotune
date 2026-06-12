@@ -99,6 +99,23 @@ extent — never a partial split of a shared dim. Any mismatch (extent, dim, or
 interleave order) → loud `TransformLegalityError` instructing the caller to
 `Split` / `Reorder` first.
 
+**No duplication (target longer than moved is rejected, not replicated).** When
+`len(target_seq) > len(moved_seq)`, the prefix test fails — by design. Splicing
+the moved block under an extra outer dim `d` it does not bind would *duplicate* it
+across `d`'s iterations, writing the **same** region each time. That is incorrect
+whenever the block's write actually lives on `d` as a single tensorize tile (each
+replica re-zeros / clobbers the prior iteration's result — e.g. a full-N memset
+duplicated under the N loop wipes earlier N-slices) or whenever the buffer is
+carried/reduced across `d` (the replicas re-run the reduction's init per `d`). The
+correct way to place a block under `d` is to make it *depend* on `d` first — a
+tensorize-size `Split` on `d` narrows the access tile and adds the `d` loop, after
+which the move is an exact prefix (a per-slice write), not a duplication. The lone
+case duplication *would* preserve correctness — a `d`-invariant, non-carried,
+idempotent pure producer (a redundant reload) — is a deliberate non-goal: it is a
+recompute pessimization (for matmul it defeats operand reuse), and admitting it
+would force the legality check to *prove* `d`-invariance + non-carry, the
+error-prone analysis the prefix rule exists to avoid.
+
 ### 1.3 Why this fits the new ladder
 
 The k0..k8 ladder is authored so every compute_at move is exact-prefix:
