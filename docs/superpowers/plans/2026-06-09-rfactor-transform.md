@@ -15,7 +15,7 @@
 
 ## Scope
 
-This plan implements **only the RFactor atom (`"rmw"` recipe) + its two infra dependencies + tests.** Explicitly OUT of scope (per spec §8): the `"slot"` recipe, the rf-buffer→fused fold (blocked on the parked `_check_no_reduction_axis_covered` narrowing), the hoist of `ko` outside M, `SoftwarePipeline` composition, and byte-exact reproduction of `kernel_hand_90.92mfu.py`.
+This plan implements **only the RFactor atom (`"rmw"` recipe) + its two infra dependencies + tests.** Explicitly OUT of scope (per spec §8): the `"slot"` recipe, the rf-buffer→fused fold (blocked on the parked `_check_no_reduction_axis_covered` narrowing), the hoist of `ko` outside M, `SoftwarePipeline` composition, and byte-exact reproduction of the 90.92% hand kernel.
 
 ## File Structure
 

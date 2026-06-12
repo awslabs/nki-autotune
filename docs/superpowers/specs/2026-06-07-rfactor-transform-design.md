@@ -16,7 +16,7 @@
 > (`reduction.cc`; see `.claude/rules/tvm_knowledge.md`), **the RFactor atom now
 > emits TVM's exact terminal output: a multi-slot rf-buffer + a separate write-back
 > block, with the factored loop role-flipped but loops NOT reordered.** The fused
-> single-accumulator that matches `kernel_hand_90.92mfu.py` is reached *downstream*
+> single-accumulator that matches the 90.92% hand kernel is reached *downstream*
 > by composing shipped transforms (ComputeAt + `compact_shapes`); see §7. That fold
 > depends on narrowing `_check_no_reduction_axis_covered`, which is **parked** (the
 > block-granular / region_cover investigation; see §8 and the learnings).
@@ -108,7 +108,7 @@ The shipped transforms peak at a **83.4% MFU** matmul (Tier-B `SoftwarePipeline`
 double-buffering the accumulator). HW measurement shows this is not a matmul-
 efficiency limit: at 83.4% the operands are already SBUF-resident (DMA only ~17.6%
 saturated), so further `SoftwarePipeline` / `ComputeAt` prefetch buys nothing. The
-gap to the 90.92% hand kernel (`kernel_library/matmul/lhsT_rhs/kernel_hand_90.92mfu.py`)
+gap to the 90.92% hand kernel (`KERNEL_SOURCE` in `examples/profile_matmul_lhsT_rhs_hand.py`)
 is **structural**: with a single-level K reduction, the `rhs` operand (which depends
 on K and N, *not* M) is trapped *under* the M loop and reloaded per M block instead
 of loaded once and reused.
@@ -241,7 +241,7 @@ its own init, reducing the slots — exactly `tir.Schedule.rfactor`'s output
 (cf. the `matmul_rfactor` test: `C_rf = alloc([4, M, N])`, `update_rf` block, then a
 separate `update` block reducing over the factored axis).
 
-> This is **not yet** `kernel_hand_90.92mfu.py`. The SOTA kernel has one reused
+> This is **not yet** the 90.92% hand kernel. The SOTA kernel has one reused
 > accumulator and no `[factor,…]` buffer — that is the *folded* form reached by §7
 > (ComputeAt sinks the wb-block's combine into the `ko` loop; `compact_shapes`
 > collapses `B_rf[factor,…] → [tile]`). RFactor stops at the faithful terminal form.
@@ -434,7 +434,7 @@ kwargs, distributes affine). For RFactor:
 - Author the post-RFactor hand kernel (the **rf-buffer + wb-block** form of §3.1 —
   `B_rf[factor,…]`, rf-block fills slots, separate wb-block reduces them) as the
   fixture. Gate: rendered output is AST-identical.
-- This is TVM's terminal rfactor form, **not** `kernel_hand_90.92mfu.py` — that is
+- This is TVM's terminal rfactor form, **not** the 90.92% hand kernel — that is
   the *folded* form reached by the §7 downstream transforms (fold + hoist + pipeline),
   out of scope here. A separate fixture/test covers the folded form when §7 lands.
 
@@ -489,7 +489,7 @@ rf-buffer + wb-block (TVM terminal)     (ko PARALLEL in rf-block / ACC in wb-blo
       │  ComputeAt(wb-combine → ko) + compact_shapes   [shipped transforms; see below]
       ▼
 fused single-accumulator                (B_rf folds [factor,…] → one reused tile;
-  (= kernel_hand_90.92mfu.py shape        wb-combine sunk into ko)
+  (= 90.92% hand-kernel shape             wb-combine sunk into ko)
    modulo hoist/pipeline)
       │  hoist ko outside M + SoftwarePipeline double-buffer   [separate spec]
       ▼
@@ -533,7 +533,7 @@ is *composition of shipped transforms*, not new mechanism:
 - The hoist of `ko` outside M, and `SoftwarePipeline` double-buffering. Whether the
   shipped move transforms can express the M-blocked / N-tiled drain the SOTA needs is
   an open question flagged in the learnings — **not assumed here.**
-- Byte-exact reproduction of `kernel_hand_90.92mfu.py` end-to-end (needs the fold +
+- Byte-exact reproduction of the 90.92% hand kernel end-to-end (needs the fold +
   hoist + pipeline composed).
 - Capacity-aware pruning of RFactor outputs — profiler/HW's job, never the
   transform's (user-locked). The large `[factor,…]` rf-buffer is the motivating case.

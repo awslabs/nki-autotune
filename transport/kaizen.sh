@@ -109,12 +109,40 @@ else
     echo "==> $(user_script) does not reference --cache (local scan of $local_script): running as-is; only output.log returns"
 fi
 
-# Read a desktop's status (RUNNING / FAILED / CANCELLED / PENDING / "" if absent).
+# Read a desktop's status (RUNNING / FAILED / CANCELLED / PENDING, or "" only
+# when the desktop is genuinely ABSENT so the caller starts a fresh one).
+#
+# Any OTHER failure — expired AWS creds (403), a control-plane error, or
+# unparseable output — is FATAL and dies LOUD here. Previously this swallowed
+# every error into "" (bare `except: print("")`), and under `set -o pipefail`
+# the failing `info` exit then aborted the whole script at `STATUS="$(...)"`
+# with NO message — an expired token looked like the run vanishing. We branch on
+# the CLI's own `commandResultCode`: SUCCESS -> use desktopStatus; absent shows
+# up as VALIDATION_EXCEPTION -> "" (start-fresh path); anything else -> die with
+# the kaizen message AND the credential-refresh command. The `|| true` on the
+# capture keeps pipefail from aborting before we can inspect the JSON; the python
+# exit code then drives the `|| die`.
 desktop_status() {
-    AWS_PROFILE=kaizen-access kaizen desktop info --name "$NAME" --output json 2>&1 | tail -1 |
-        python3 -c 'import json,sys
-try: print(json.loads(sys.stdin.read()).get("desktopStatus",""))
-except Exception: print("")'
+    local out status
+    out="$(AWS_PROFILE=kaizen-access kaizen desktop info --name "$NAME" --output json 2>&1 | tail -1)" || true
+    status="$(printf '%s' "$out" | python3 -c 'import json, sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.stderr.write("    kaizen desktop info returned no parseable JSON:\n    " + raw.strip()[:300] + "\n")
+    sys.exit(2)
+code = d.get("commandResultCode")
+if code == "SUCCESS":
+    print(d.get("desktopStatus", ""))
+elif code == "VALIDATION_EXCEPTION":
+    print("")
+else:
+    sys.stderr.write("    commandResultCode=%s: %s\n" % (code, d.get("message", "<no message>")))
+    sys.exit(3)')" || die "kaizen desktop info failed for '$NAME' (see message above). AWS creds are likely expired — refresh with:
+    ada credentials update --account=864981753083 --provider=isengard --role=neuron-inference-dev --profile=kaizen-access --once
+    ada credentials update --account=122949982943 --provider=isengard --role=NeuronKaizenUser  --profile=cluster-role  --once"
+    printf '%s' "$status"
 }
 
 echo "==> Resolving desktop $NAME"

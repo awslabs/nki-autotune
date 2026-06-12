@@ -278,6 +278,31 @@ def kernel_8(lhs_T, rhs):
         nisa.dma_copy(src=sbuf_prod[0:128, i_d1_0, 0:0 + 2048], dst=hbm_out[i_d1_0 * 128:i_d1_0 * 128 + 128, 0:0 + 2048])
     return hbm_out
 
+@nki.jit
+def kernel_alt_1(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    sbuf_lhs_T = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+    sbuf_rhs = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+    psum_prod = nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum)
+    sbuf_prod = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    for i_d0_0 in range(16):
+        nisa.dma_copy(src=lhs_T[i_d0_0 * 128:i_d0_0 * 128 + 128, 0:0 + 2048], dst=sbuf_lhs_T[0:128, i_d0_0, 0:0 + 2048])
+    for i_d0_0 in range(16):
+        nisa.dma_copy(src=rhs[i_d0_0 * 128:i_d0_0 * 128 + 128, 0:0 + 2048], dst=sbuf_rhs[0:128, i_d0_0, 0:0 + 2048])
+    for i_d1_0 in range(16):
+        nisa.memset(dst=psum_prod[0:128, i_d1_0, 0:0 + 2048], value=0.0)
+    # Reorder
+    for i_d2_0 in range(4):
+        for i_d0_0 in range(16):
+            for i_d1_0 in range(16):
+                nisa.nc_matmul(stationary=sbuf_lhs_T[0:128, i_d0_0, i_d1_0 * 128:i_d1_0 * 128 + 128], moving=sbuf_rhs[0:128, i_d0_0, i_d2_0 * 512:i_d2_0 * 512 + 512], dst=psum_prod[0:128, i_d1_0, i_d2_0 * 512:i_d2_0 * 512 + 512])
+    for i_d1_0 in range(16):
+        nisa.tensor_copy(src=psum_prod[0:128, i_d1_0, 0:0 + 2048], dst=sbuf_prod[0:128, i_d1_0, 0:0 + 2048])
+    for i_d1_0 in range(16):
+        nisa.dma_copy(src=sbuf_prod[0:128, i_d1_0, 0:0 + 2048], dst=hbm_out[i_d1_0 * 128:i_d1_0 * 128 + 128, 0:0 + 2048])
+    return hbm_out
 
 def _main() -> None:
     parser = argparse.ArgumentParser()
