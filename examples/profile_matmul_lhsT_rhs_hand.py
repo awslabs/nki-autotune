@@ -62,9 +62,18 @@ point with every compile-time branch folded to its taken arm:
 
 * ``allocate_buffers`` → the concrete buffer allocations for each call site (the
   two ``... is None`` shape branches resolved per site). ``sbuf_output`` uses the
-  canonical 3D SBUF layout ``(128, num_tiles, F)`` indexed ``[0:128, tile, 0:F]``
-  (one tensor per multi-buffer slot); ``sbuf_lhs_T`` / ``sbuf_rhs`` remain
-  nested lists of 2D tiles.
+  canonical 3D SBUF layout ``(128, 16, 512)`` indexed ``[0:128, tile, 0:F]``,
+  allocated fresh per ``i_d2_0`` iteration at the top of that block — its
+  consumer scope (degree-1, no N-block multi-buffering); the per-output-tile
+  ``psum_tile`` / ``acc_tile`` are 3D ``(128, 1, 512)`` indexed
+  ``[0:128, 0, 0:512]`` (degree-1, allocated fresh inside the ``i_d1_1`` loop —
+  their consumer block). ``sbuf_rhs`` is a 2-element Python list of 3D
+  ``(128, 8, 512)`` tensors (the 8 K-tiles packed in the middle dim), indexed
+  ``[i_d0_0 % 2][0:128, i_d0_1, 0:512]`` — the list lifts the depth-2 K-block
+  double-buffer as two SEPARATE allocations (liveness-scheduled, so block 1's
+  load overlaps block 0's matmuls), while each tensor keeps its 8 K-tiles
+  co-resident (the matmul reduction reads all 8); only ``sbuf_lhs_T`` remains a
+  nested list of 2D tiles.
 * ``load_block`` → both calls are non-transposing, so only the ``dma_copy`` arm
   survives.
 * ``matmul_block`` → ``tile_n`` folds to 512, so ``num_n_tiles == 1`` and the N
@@ -96,20 +105,19 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
     assert rhs.shape == (2048, 2048)
     output = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
-    sbuf_output = [nl.ndarray((128, 16, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(4)]
-
     for i_d2_0 in range(4):
         sbuf_lhs_T = [
             [[nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(8)] for _ in range(4)]
             for _ in range(2)
         ]
-        sbuf_rhs = [[nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(8)] for _ in range(2)]
+        sbuf_output = nl.ndarray((128, 16, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+        sbuf_rhs = [nl.ndarray((128, 8, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(2)]
         for i_d1_0 in range(16):
-            nisa.memset(sbuf_output[i_d2_0 % 4][0:128, i_d1_0, 0:512], 0.0)
+            nisa.memset(sbuf_output[0:128, i_d1_0, 0:512], 0.0)
         for i_d0_0 in range(2):
             for i_d0_1 in range(8):
                 nisa.dma_copy(
-                    sbuf_rhs[i_d0_0 % 2][i_d0_1][0:128, 0:512],
+                    sbuf_rhs[i_d0_0 % 2][0:128, i_d0_1, 0:512],
                     rhs[
                         i_d0_0 * 1024 + i_d0_1 * 128 : i_d0_0 * 1024 + (i_d0_1 + 1) * 128,
                         i_d2_0 * 512 : i_d2_0 * 512 + 512,
@@ -125,29 +133,28 @@ def matmul_lhsT_rhs_nkigym(lhs_T, rhs):
                         ],
                     )
                 for i_d1_1 in range(4):
-                    out_tile = i_d1_0 * 4 + i_d1_1
-                    psum_tile = nl.ndarray((128, 512), dtype=nl.float32, buffer=nl.psum)
-                    acc_tile = nl.ndarray((128, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
-                    nisa.memset(psum_tile[0:128, 0:512], 0.0)
+                    psum_tile = nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum)
+                    acc_tile = nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    nisa.memset(psum_tile[0:128, 0, 0:512], 0.0)
                     for i_d0_1 in range(8):
                         nisa.nc_matmul(
-                            dst=psum_tile[0:128, 0:512],
+                            dst=psum_tile[0:128, 0, 0:512],
                             stationary=sbuf_lhs_T[i_d0_0 % 2][i_d1_0 % 4][i_d0_1][
                                 0:128, i_d1_1 * 128 : (i_d1_1 + 1) * 128
                             ],
-                            moving=sbuf_rhs[i_d0_0 % 2][i_d0_1][0:128, 0:512],
+                            moving=sbuf_rhs[i_d0_0 % 2][0:128, i_d0_1, 0:512],
                         )
-                    nisa.tensor_copy(acc_tile[0:128, 0:512], psum_tile[0:128, 0:512])
+                    nisa.tensor_copy(acc_tile[0:128, 0, 0:512], psum_tile[0:128, 0, 0:512])
                     nisa.tensor_tensor(
-                        sbuf_output[i_d2_0 % 4][0:128, out_tile, 0:512],
-                        sbuf_output[i_d2_0 % 4][0:128, out_tile, 0:512],
-                        acc_tile[0:128, 0:512],
+                        sbuf_output[0:128, i_d1_0 * 4 + i_d1_1, 0:512],
+                        sbuf_output[0:128, i_d1_0 * 4 + i_d1_1, 0:512],
+                        acc_tile[0:128, 0, 0:512],
                         op=nl.add,
                     )
         for i_d1_0 in range(16):
             nisa.dma_copy(
                 output[i_d1_0 * 128 : (i_d1_0 + 1) * 128, i_d2_0 * 512 : i_d2_0 * 512 + 512],
-                sbuf_output[i_d2_0 % 4][0:128, i_d1_0, 0:512],
+                sbuf_output[0:128, i_d1_0, 0:512],
             )
 
     return output
