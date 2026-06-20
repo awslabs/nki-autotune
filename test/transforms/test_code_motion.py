@@ -152,6 +152,75 @@ def test_compute_at_rejects_covering_matmul_reduction_axis():
     assert not any(o.block_nid == 10 and o.target_loop_nid == 30 for o in ComputeAt().analyze(state))
 
 
+def test_reverse_compute_at_allows_fold_covering_its_own_ko():
+    """The two-stage fold accumulates across its ENCLOSING ko (its sbuf_prod
+    memset dominates ko via a CARRY edge), so covering ko by that loop is SAFE
+    and must be allowed — the kernel_target fold-inlining precondition."""
+    import pytest
+
+    from test.transforms._fixtures import INPUT_SPECS, f_matmul
+
+    from nkigym.environment import KernelMDP
+    from nkigym.transforms import Reorder, ReorderOption, RFactor, RFactorOption, Split, SplitOption
+
+    def mm_loop(state, loop_var):
+        from nkigym.ir.tree import ForNode, ISANode
+        leaf = next(n for n in state.tree.preorder()
+                    if isinstance(state.tree.data(n), ISANode)
+                    and state.tree.data(n).op_cls.__name__ == "NKIMatmul")
+        return next(a for a in state.tree.ancestors(leaf)
+                    if isinstance(state.tree.data(a), ForNode) and state.tree.data(a).loop_var == loop_var)
+
+    def fold_blk(state):
+        from nkigym.ir.tree import ISANode
+        for nid in state.tree.blocks():
+            leaves = [d for d in state.tree.descendants(nid) if isinstance(state.tree.data(d), ISANode)]
+            if len(leaves) == 1 and state.tree.data(leaves[0]).op_cls.__name__ == "NKITensorTensor":
+                return nid
+        raise AssertionError("no fold block")
+
+    def fold_leaf(state):
+        from nkigym.ir.tree import ISANode
+        return next(d for d in state.tree.descendants(fold_blk(state)) if isinstance(state.tree.data(d), ISANode))
+
+    def fold_loop(state, loop_var):
+        from nkigym.ir.tree import ForNode
+        return next(d for d in state.tree.descendants(fold_blk(state))
+                    if isinstance(state.tree.data(d), ForNode) and state.tree.data(d).loop_var == loop_var)
+
+    from nkigym.ops.base import AxisRole
+    from nkigym.transforms._code_motion import _check_move_realizable
+
+    env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Reorder(), RFactor()])
+    s = env.reset()
+    s = Split().apply(s, SplitOption(target_nid=mm_loop(s, "i_d0_0"), factors=(2, 8), target_axis=None))
+    s = Split().apply(s, SplitOption(target_nid=mm_loop(s, "i_d1_0"), factors=(4, 4), target_axis=None))
+    s = Reorder().apply(s, ReorderOption(outer_nid=mm_loop(s, "i_d1_1"), inner_nid=mm_loop(s, "i_d2_0")))
+    s = Reorder().apply(s, ReorderOption(outer_nid=mm_loop(s, "i_d1_0"), inner_nid=mm_loop(s, "i_d2_0")))
+    s = Reorder().apply(s, ReorderOption(outer_nid=mm_loop(s, "i_d0_1"), inner_nid=mm_loop(s, "i_d2_0")))
+    s = Reorder().apply(s, ReorderOption(outer_nid=mm_loop(s, "i_d0_0"), inner_nid=mm_loop(s, "i_d2_0")))
+    s = Reorder().apply(s, ReorderOption(outer_nid=mm_loop(s, "i_d0_1"), inner_nid=mm_loop(s, "i_d1_0")))
+    s = Reorder().apply(s, ReorderOption(outer_nid=mm_loop(s, "i_d0_1"), inner_nid=mm_loop(s, "i_d1_1")))
+    s = RFactor().apply(s, RFactorOption(target_loop_nid=mm_loop(s, "i_d0_0"), factor_axis=0))
+    s = Split().apply(s, SplitOption(target_nid=fold_leaf(s), factors=(4, 512), target_axis="d2"))
+    s = Split().apply(s, SplitOption(target_nid=fold_loop(s, "i_d1_0"), factors=(4, 4), target_axis=None))
+
+    """Barrier 1 is isolated here via _check_move_realizable, which runs the
+    refined _check_no_reduction_axis_covered. Before this task it raised
+    'would cover reduction axis d0'; now it must return solved with d0 (ko)
+    COVERED by the fold's own enclosing i_d0_0 — proof the guard allows the
+    safe self-domination. (The end-to-end ReverseComputeAt of the fold is
+    deferred to the Task 3 ladder, where the drain tensor_copy co-locates
+    FIRST so the copy->fold RAW on sbuf_rfactor is satisfied; that ordering
+    concern is the separate dependency check, not this reduction guard.)"""
+    fold = fold_blk(s)
+    fold_block = s.tree.data(fold)
+    assert any(iv.axis == "d0" and iv.role == AxisRole.ACCUMULATION for iv in fold_block.iter_vars)
+    solved = _check_move_realizable(s, fold, mm_loop(s, "i_d1_1"))
+    assert solved["d0"].target_loops, "ko (d0) must be covered by the fold's own enclosing loop (allowed)"
+    assert solved["d0"].residual_extent == 1
+
+
 def test_compute_at_rejects_replicating_reduction_over_untiled_output_dim():
     """Sinking the matmul under a consumer loop iterating a dim the matmul writes
     at FULL extent (no per-tile index) is rejected — it would re-run the K

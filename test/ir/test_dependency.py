@@ -487,3 +487,38 @@ def test_cover_edge_matmul_nloop_dominates_full_read_tensor_copy():
     )
     assert dep.graph.has_edge(nloop, tc_leaf), "N-loop must dominate the full-read tensor_copy"
     assert dep.graph.edges[nloop, tc_leaf]["kind"] == "COVER"
+
+
+def test_first_backward_skips_cover_edge_when_loop_recovered():
+    """A COVER edge L->consumer is NOT backward when the move re-binds the
+    consumer's covered dim to L (skip_cover_loops contains L). A RAW edge is
+    never skipped."""
+    from test.transforms._fixtures import build_canonical_ir
+
+    from nkigym.ir.dependency import Dependency
+    from nkigym.ir.tree import ForNode, ISANode
+
+    ir = build_canonical_ir()
+    dep = Dependency(ir.tree)
+    cover_edges = [(a, b) for a, b, d in dep.graph.edges(data=True) if d.get("kind") == "COVER"]
+    assert cover_edges, "fixture must have at least one COVER edge for this test"
+    loop_nid, consumer = cover_edges[0]
+    assert isinstance(ir.tree.data(loop_nid), ForNode)
+    leaf = consumer if isinstance(ir.tree.data(consumer), ISANode) else dep._resolve(consumer)
+
+    """Span = real preorder position for every node, EXCEPT the COVER loop is
+    forced just after the leaf so ONLY its edge (loop->leaf) reads backward;
+    the leaf's other edges (a RAW producer, a CARRY loop) stay forward, proving
+    the skip targets the COVER edge alone. Without the skip the COVER edge is
+    flagged; with loop in skip_cover_loops it is dissolved -> None."""
+    order = {n: float(i) for i, n in enumerate(ir.tree.preorder())}
+    leaf_pos = order[leaf]
+
+    def backward_span(n: int) -> tuple[float, float]:
+        pos = leaf_pos + 0.5 if n == loop_nid else order[n]
+        return (pos, pos)
+
+    without_skip = dep._first_backward(leaf, backward_span)
+    with_skip = dep._first_backward(leaf, backward_span, skip_cover_loops=frozenset({loop_nid}))
+    assert without_skip == (loop_nid, leaf)
+    assert with_skip is None

@@ -88,7 +88,9 @@ class Dependency:
         """Return True if ``producer`` must execute before ``consumer``."""
         return self._closure.has_edge(self._resolve(producer), self._resolve(consumer))
 
-    def first_backward_edge(self, moved_leaf_nid: int, tree: KernelTree | None = None) -> tuple[int, int] | None:
+    def first_backward_edge(
+        self, moved_leaf_nid: int, tree: KernelTree | None = None, skip_cover_loops: frozenset[int] = frozenset()
+    ) -> tuple[int, int] | None:
         """Return the first dependency edge incident to ``moved_leaf_nid`` that
         points backward in the execution order of ``tree``, else ``None``.
 
@@ -119,10 +121,10 @@ class Dependency:
                 raise KeyError(f"dependency endpoint {nid} absent from the evaluated tree")
             return (min(idxs), max(idxs))
 
-        return self._first_backward(moved_leaf_nid, span)
+        return self._first_backward(moved_leaf_nid, span, skip_cover_loops=skip_cover_loops)
 
     def first_backward_edge_for_insertion(
-        self, moved_leaf_nid: int, target_loop_nid: int, index: int
+        self, moved_leaf_nid: int, target_loop_nid: int, index: int, skip_cover_loops: frozenset[int] = frozenset()
     ) -> tuple[int, int] | None:
         """Pure ordering check for splicing ``moved_leaf_nid`` under
         ``target_loop_nid`` at child slot ``index`` — no tree mutation.
@@ -166,7 +168,7 @@ class Dependency:
                 raise KeyError(f"dependency endpoint {nid} absent from the tree")
             return (min(positions), max(positions))
 
-        return self._first_backward(moved_leaf_nid, span)
+        return self._first_backward(moved_leaf_nid, span, skip_cover_loops=skip_cover_loops)
 
     def _effective_insertion_position(
         self, order: dict[int, float], target_loop_nid: int, index: int, moved_subtree: set[int]
@@ -202,13 +204,24 @@ class Dependency:
         return anchor + 0.5
 
     def _first_backward(
-        self, moved_leaf_nid: int, span: Callable[[int], tuple[float, float]]
+        self,
+        moved_leaf_nid: int,
+        span: Callable[[int], tuple[float, float]],
+        skip_cover_loops: frozenset[int] = frozenset(),
     ) -> tuple[int, int] | None:
         """Return the first edge incident to ``moved_leaf_nid`` that ``span`` ranks
-        backward (``span(a).end < span(b).start`` violated), else ``None``."""
+        backward (``span(a).end < span(b).start`` violated), else ``None``.
+
+        A ``COVER`` edge ``L -> moved_leaf_nid`` is SKIPPED when ``L`` is in
+        ``skip_cover_loops`` — the move re-binds the moved block's covered dim to
+        ``L``, dissolving the full-extent coverage that froze the edge. Only COVER
+        edges are skippable; RAW/WAW/WAR/CARRY are real hazards and always checked.
+        """
         result: tuple[int, int] | None = None
-        for a, b in self.graph.edges():
+        for a, b, attrs in self.graph.edges(data=True):
             if a != moved_leaf_nid and b != moved_leaf_nid:
+                continue
+            if attrs.get("kind") == "COVER" and b == moved_leaf_nid and a in skip_cover_loops:
                 continue
             if not (span(a)[1] < span(b)[0]):
                 result = (a, b)

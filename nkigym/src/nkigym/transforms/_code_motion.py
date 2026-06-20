@@ -12,9 +12,10 @@ caller's legality check differs.
 from __future__ import annotations
 
 from nkigym.ir import KernelIR
-from nkigym.ir.tree import BlockNode, KernelTree, role_of
+from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree, role_of
 from nkigym.ops.base import AxisRole
 from nkigym.transforms._domain_solve import (
+    DimDomain,
     _enclosing_block,
     dim_loops_of_block,
     enclosing_dim_loops,
@@ -67,7 +68,7 @@ def _assert_single_parent(tree: KernelTree) -> None:
         raise ValueError(f"_move left nodes with multiple parents: {detail}")
 
 
-def _check_move_realizable(ir: KernelIR, block_nid: int, target_loop_nid: int) -> None:
+def _check_move_realizable(ir: KernelIR, block_nid: int, target_loop_nid: int) -> dict[str, DimDomain]:
     """Raise TransformLegalityError if the target's coverage cannot cleanly
     re-domain the moved block — a pure, read-only check (no tree mutation).
 
@@ -92,6 +93,7 @@ def _check_move_realizable(ir: KernelIR, block_nid: int, target_loop_nid: int) -
         ) from e
     _check_no_reduction_axis_covered(ir, block_nid, target_loop_nid, solved)
     _check_no_reduction_replicated(ir, block_nid, target_loop_nid, moved)
+    return solved
 
 
 def _check_no_reduction_replicated(ir: KernelIR, block_nid: int, target_loop_nid: int, moved: dict) -> None:
@@ -124,24 +126,58 @@ def _check_no_reduction_replicated(ir: KernelIR, block_nid: int, target_loop_nid
         )
 
 
-def _check_no_reduction_axis_covered(ir: KernelIR, block_nid: int, target_loop_nid: int, solved: dict) -> None:
-    """Reject a move that covers the moved block's ACCUMULATION (reduction) axis.
+def _own_carry_loop_nids(ir: KernelIR, block_nid: int) -> set[int]:
+    """Loop NIDs that the moved block's accumulator-init DOMINATES.
 
-    A reduction axis (matmul K) must iterate as a contiguous nest the block
-    OWNS, bracketed by its init (memset) before and drain (tensor_copy) after.
-    ``solve_iter_domains`` marks a dim *covered* when the target's enclosing
-    loops drive it (``target_loops`` non-empty, residual collapsed). Covering a
-    reduction axis means the accumulation is absorbed into an enclosing loop —
-    in practice one owned by a DIFFERENT block (e.g. a producer's prefetch K
-    loop that merely shares the ``i_d0_0`` name) — so the block's init no longer
-    dominates the reduction and it accumulates into an unzeroed / wrong-iteration
-    PSUM (sim NaN). The reduction axis must stay a residual the moved block keeps
-    locally; no legal ladder move ever covers one (verified). Inputs of the
-    reduction (loads, whose K axis is PARALLEL on their own block) are unaffected
-    — only the block that declares the axis ACCUMULATION is guarded.
+    The block's RMW operand (its carried accumulator) is initialised by a
+    sibling memset whose write CARRYs into the reduction loop — recorded as a
+    ``CARRY`` edge ``init_writer -> loop_nid`` in ``ir.dependency``. Covering a
+    reduction axis by one of these loops is the SAFE enclosing-reduction case
+    (init dominates); covering by any other loop is foreign (init does not
+    dominate -> NaN). Returns the loop NIDs into which the block's own
+    accumulator's writers carry.
     """
     block = ir.tree.data(block_nid)
     assert isinstance(block, BlockNode)
+    leaf = next(d for d in ir.tree.descendants(block_nid) if isinstance(ir.tree.data(d), ISANode))
+    isa = ir.tree.data(leaf)
+    acc_tensors = {
+        isa.operand_bindings[slot].tensor for slot in isa.op_cls.RMW_OPERANDS if slot in isa.operand_bindings
+    }
+    out: set[int] = set()
+    for tensor in acc_tensors:
+        for writer in ir.dependency.touches_by_tensor.get(tensor, ()):
+            for _w, loop_nid, attrs in ir.dependency.graph.out_edges(writer, data=True):
+                if attrs.get("kind") == "CARRY":
+                    out.add(loop_nid)
+    return out
+
+
+def _check_no_reduction_axis_covered(ir: KernelIR, block_nid: int, target_loop_nid: int, solved: dict) -> None:
+    """Reject a move that covers the moved block's ACCUMULATION (reduction) axis
+    with a loop the block's own init does NOT dominate (foreign covering loop).
+
+    A reduction axis (matmul K, two-stage fold ko) must iterate as a contiguous
+    nest bracketed by its init (memset) before and drain (tensor_copy) after.
+    ``solve_iter_domains`` marks a dim *covered* when the target's enclosing
+    loops drive it (``target_loops`` non-empty, residual collapsed). Covering a
+    reduction axis by an enclosing loop is SAFE when that loop is one the block's
+    own init dominates (a CARRY edge from the block's accumulator-init writer
+    into that loop NID exists); covering by any other loop is foreign (init does
+    not dominate -> NaN). The block's own-carry loop NIDs are resolved via
+    ``_own_carry_loop_nids``; covering NIDs come from the target's enclosing
+    ForNodes on the covered dim; if any covering NID is not in own-carry, reject.
+    NID-comparison, NOT loop_var-comparison, is load-bearing: after RFactor a
+    foreign K-loop and the fold's own ko-loop are BOTH named ``i_d0_0`` (dim
+    ``d0``). A var comparison silently admits the foreign case -> NaN.
+    """
+    block = ir.tree.data(block_nid)
+    assert isinstance(block, BlockNode)
+    own_carry = _own_carry_loop_nids(ir, block_nid)
+    target_nid_by_var = {ir.tree.data(nid).loop_var: nid
+                         for nid in (target_loop_nid, *ir.tree.ancestors(target_loop_nid))
+                         if isinstance(ir.tree.data(nid), ForNode)}
+    result: None = None
     for dim, domain in solved.items():
         if not domain.target_loops:
             continue
@@ -149,12 +185,17 @@ def _check_no_reduction_axis_covered(ir: KernelIR, block_nid: int, target_loop_n
             role = role_of(block, dim)
         except KeyError:
             continue
-        if role == AxisRole.ACCUMULATION:
-            raise TransformLegalityError(
-                f"move(block={block_nid} under loop={target_loop_nid}) would cover reduction axis "
-                f"{dim!r} (ACCUMULATION) with enclosing loops {domain.target_loops}; a reduction "
-                f"must stay a private nest the block owns (init must dominate it)"
-            )
+        if role != AxisRole.ACCUMULATION:
+            continue
+        covering_nids = {target_nid_by_var[lv] for lv, _e in domain.target_loops if lv in target_nid_by_var}
+        if covering_nids and covering_nids <= own_carry:
+            continue
+        raise TransformLegalityError(
+            f"move(block={block_nid} under loop={target_loop_nid}) would cover reduction axis "
+            f"{dim!r} (ACCUMULATION) with enclosing loops {domain.target_loops} the block's own "
+            f"init does not dominate; a foreign covering loop breaks init-domination"
+        )
+    return result
 
 
 def _check_move_preserves_dependencies(
@@ -184,9 +225,19 @@ def _check_move_preserves_dependencies(
     concern checked by ``_check_move_realizable`` before this; here we assume a
     realizable candidate and only test ordering.
     """
-    _check_move_realizable(ir, block_nid, target_loop_nid)
+    solved = _check_move_realizable(ir, block_nid, target_loop_nid)
+    target_nid_by_var = {
+        ir.tree.data(nid).loop_var: nid
+        for nid in (target_loop_nid, *ir.tree.ancestors(target_loop_nid))
+        if isinstance(ir.tree.data(nid), ForNode)
+    }
+    skip_cover_loops = frozenset(
+        target_nid_by_var[lv] for dom in solved.values() for lv, _ext in dom.target_loops if lv in target_nid_by_var
+    )
     moved_leaf = ir.dependency._resolve(block_nid)
-    offending = ir.dependency.first_backward_edge_for_insertion(moved_leaf, target_loop_nid, index)
+    offending = ir.dependency.first_backward_edge_for_insertion(
+        moved_leaf, target_loop_nid, index, skip_cover_loops=skip_cover_loops
+    )
     result: None = None
     if offending is not None:
         a, b = offending
