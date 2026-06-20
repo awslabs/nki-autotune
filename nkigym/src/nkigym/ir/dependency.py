@@ -444,16 +444,22 @@ def _carry_loops_of_leaf(tree: KernelTree, leaf_nid: int) -> dict[int, str]:
     """Map each enclosing non-PARALLEL loop of ``leaf_nid`` to the buffer it carries.
 
     A loop carries state when its bound axis has SEQUENTIAL or ACCUMULATION
-    role for the leaf's enclosing block. The carried buffer is the leaf
-    operand whose ``OPERAND_AXES`` tuple omits that loop's axis (so the value is
+    role for the leaf's enclosing block. The carried buffer is the leaf's
+    RMW operand (read-modified-written — the ONLY operand that can carry state
+    across iterations; a pure INPUT is merely re-read, a pure output is written
+    fresh) whose ``OPERAND_AXES`` tuple omits that loop's axis (so the value is
     nominally live across the loop) AND whose region offset does NOT depend on
-    the loop var. The region test distinguishes a genuinely carried buffer
-    (constant address across the loop — matmul's ``psum`` accumulator,
+    the loop var. The ``RMW_OPERANDS`` gate is what lets the two-stage rfactor
+    fold ``tensor_tensor(data1=out, data2=sbuf_rfactor, dst=out)`` carry only its
+    RMW accumulator ``out`` (``data1``/``dst``) and NOT the ko-invariant SBUF
+    staging input ``data2`` — both omit the ``ko`` axis and are addressed
+    loop-invariantly, so without the RMW gate the loop would ambiguously carry
+    two distinct tensors. The region test then distinguishes a genuinely carried
+    buffer (constant address across the loop — matmul's ``psum`` accumulator,
     tensor_tensor's ``out`` RMW slot) from one that is SWEPT (a distinct
-    slice per iteration — the rfactor wb-block reads ``B_rf[ko-slot]``, whose
-    partition offset varies with the reduction loop var): a swept operand omits
-    the axis in ``OPERAND_AXES`` yet is re-addressed each iteration, so it is not
-    carried. This assumes a genuinely carried buffer is addressed
+    slice per iteration — the multi-slot rfactor wb-block reads ``B_rf[ko-slot]``,
+    whose partition offset varies with the reduction loop var): a swept operand
+    is re-addressed each iteration, so it is not carried. This assumes a genuinely carried buffer is addressed
     loop-invariantly on the NON-PARALLEL loop that carries it; the region test is
     NOT a general "loop-var-in-offset => swept" rule across all roles. It is
     consistent with the PARALLEL role gate above (``role_of(...) == PARALLEL``
@@ -488,6 +494,8 @@ def _carry_loops_of_leaf(tree: KernelTree, leaf_nid: int) -> dict[int, str]:
         carried: set[str] = set()
         for slot, axes in op_axes.items():
             if abstract is None or abstract in axes or slot not in data.operand_bindings:
+                continue
+            if slot not in data.op_cls.RMW_OPERANDS:
                 continue
             region = data.operand_bindings[slot]
             if any(loop_var in to_affine(lo) for lo, _w in region.ranges):

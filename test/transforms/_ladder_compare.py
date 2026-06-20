@@ -240,3 +240,14 @@ def assert_matches_hand(rendered_src: str, hand_fn: Callable[..., object]) -> No
     got = _normalize(rendered_src)
     want = _normalize(hand_src)
     assert got == want, f"rendered != hand kernel\n--- got ---\n{got}\n--- want ---\n{want}"
+
+
+def assert_matches_render(rendered_src: str, expected_src: str) -> None:
+    """Assert two rendered kernel sources are equal after AST canonicalization.
+
+    Used to compare a single-transform render against the fixture-replayed
+    ladder render of the same rung, without importing an example driver.
+    """
+    got = _normalize(rendered_src)
+    want = _normalize(expected_src)
+    assert got == want, f"rendered != expected\n--- got ---\n{got}\n--- want ---\n{want}"

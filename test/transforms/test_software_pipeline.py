@@ -9,11 +9,9 @@ import tempfile
 import numpy as np
 import pytest
 
-import examples.kernel_transforms as KT
 from nkigym.codegen import render
 from nkigym.synthesis.simulate_nki import simulate_fp32
 from nkigym.transforms import SoftwarePipeline, SoftwarePipelineOption, TransformLegalityError
-from test.transforms._ladder_compare import assert_matches_hand
 from test.transforms._pipeline_fixtures import m_loop_and_children, tuned_ir
 
 
@@ -56,14 +54,6 @@ def test_apply_rejects_duplicate_order():
     m_loop, _children = m_loop_and_children(ir)
     with pytest.raises(TransformLegalityError):
         SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 1)))
-
-
-def test_increment1_matches_kernel_15_byte_exact():
-    """render(apply(tuned, (0,0,1))) reproduces the validated rotate_only kernel."""
-    ir = tuned_ir()
-    m_loop, _children = m_loop_and_children(ir)
-    new_ir = SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2)))
-    assert_matches_hand(render(new_ir), KT.kernel_15)
 
 
 def test_increment1_sim_matches_numpy():

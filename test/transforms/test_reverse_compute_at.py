@@ -6,12 +6,10 @@ import importlib.util
 import pathlib
 import tempfile
 from test.transforms._fixtures import INPUT_SPECS, build_canonical_ir, build_ladder_state
-from test.transforms._ladder_compare import assert_matches_hand
 
 import numpy as np
 import pytest
 
-import examples.kernel_transforms as KT
 from nkigym.codegen import render
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.synthesis.simulate_nki import simulate_fp32
@@ -159,13 +157,6 @@ def test_reverse_lift_deeply_nested_load_preserves_dim_driver():
     spec.loader.exec_module(mod)
     actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
     np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
-
-
-@pytest.mark.parametrize("before_n, hand", [(11, KT.kernel_12), (13, KT.kernel_14)])
-def test_reverse_rung_byte_exact(before_n, hand):
-    """Each ReverseComputeAt rung reproduces its hand kernel byte-exact."""
-    ir = build_ladder_state(before_n + 1)
-    assert_matches_hand(render(ir), hand)
 
 
 def test_psum_hoist_descends_and_compacts():

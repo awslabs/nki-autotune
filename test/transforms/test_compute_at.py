@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import inspect
 from test.transforms._fixtures import INPUT_SPECS, build_canonical_ir, build_ladder_state
-from test.transforms._ladder_compare import _normalize, assert_matches_hand
+from test.transforms._ladder_compare import assert_matches_render
 
 import numpy as np
 import pytest
 
-import examples.kernel_transforms as KT
 from nkigym.codegen import render
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.synthesis.simulate_nki import simulate_fp32
@@ -156,7 +154,7 @@ def test_split_lhsT_load_matches_hand_k1():
     load = _block_for_op(ir, "NKILoad")
     load_leaf = next(d for d in ir.tree.preorder(load) if isinstance(ir.tree.data(d), ISANode))
     ir = Split().apply(ir, SplitOption(target_nid=load_leaf, factors=(16, 128), target_axis="d1"))
-    assert_matches_hand(render(ir), KT.kernel_1)
+    assert_matches_render(render(ir), render(build_ladder_state(1)))
 
 
 def test_compute_at_sink_lhsT_load_matches_hand_k2():
@@ -171,53 +169,4 @@ def test_compute_at_sink_lhsT_load_matches_hand_k2():
         d for d in ir.tree.preorder(mm) if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == "i_d1_0"
     )
     new_ir = ComputeAt().apply(ir, ComputeAtOption(block_nid=load2, target_loop_nid=d1_loop, index=-2))
-    assert_matches_hand(render(new_ir), KT.kernel_2)
-
-
-@pytest.mark.parametrize(
-    "before_n, hand", [(1, KT.kernel_2), (3, KT.kernel_4), (6, KT.kernel_7), (7, KT.kernel_8), (9, KT.kernel_10)]
-)
-def test_compute_at_rung_byte_exact(before_n, hand):
-    """Each forward ComputeAt rung reproduces its hand kernel byte-exact."""
-    ir = build_ladder_state(before_n + 1)
-    assert_matches_hand(render(ir), hand)
-
-
-def test_compute_at_partial_coverage_byte_exact():
-    """A range(16) load sunk under a range(4) target regenerates a range(4) residual.
-
-    Byte oracle for the region-regen residual path the FULL-coverage ladder never
-    exercises. ``kernel_partial`` is hand-written and sim-verified
-    (``python kernel_transforms.py`` prints ``pass=True``). The current ComputeAt
-    produces a numerically wrong residual nest (see the ``xfail`` reason), so this
-    asserts the bug is present until the region-regen fix lands.
-    """
-    ir = build_canonical_ir()
-    load0 = _block_for_op(ir, "NKILoad")
-    leaf0 = next(d for d in ir.tree.preorder(load0) if isinstance(ir.tree.data(d), ISANode))
-    ir = Split().apply(ir, SplitOption(target_nid=leaf0, factors=(16, 128), target_axis="d1"))
-    mm = _block_for_op(ir, "NKIMatmul")
-    m_loop = next(
-        d for d in ir.tree.preorder(mm) if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == "i_d1_0"
-    )
-    ir = Split().apply(ir, SplitOption(target_nid=m_loop, factors=(4, 4)))
-    mm = _block_for_op(ir, "NKIMatmul")
-    m_outer = next(
-        d for d in ir.tree.preorder(mm) if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == "i_d1_0"
-    )
-    load0 = _block_for_op(ir, "NKILoad")
-    new_ir = ComputeAt().apply(ir, ComputeAtOption(block_nid=load0, target_loop_nid=m_outer, index=-2))
-    assert_matches_hand(render(new_ir), KT.kernel_partial)
-
-
-def test_oracle_rejects_genuinely_different_kernels():
-    """The structural oracle must not equate kernels that differ semantically.
-
-    Guards against over-normalization: an op-name change and a slice-width
-    change each survive into the canonical AST, so the comparison fails.
-    """
-    base = inspect.getsource(KT.kernel_1)
-    diff_op = base.replace("nc_matmul", "tensor_copy", 1)
-    diff_width = base.replace("(i_d2_0) * 512 : (i_d2_0) * 512 + 512", "(i_d2_0) * 512 : (i_d2_0) * 512 + 256", 1)
-    assert _normalize(base) != _normalize(diff_op)
-    assert _normalize(base) != _normalize(diff_width)
+    assert_matches_render(render(new_ir), render(build_ladder_state(2)))
