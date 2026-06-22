@@ -189,7 +189,7 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
                     if isinstance(state.tree.data(d), ForNode) and state.tree.data(d).loop_var == loop_var)
 
     from nkigym.ops.base import AxisRole
-    from nkigym.transforms._code_motion import _check_move_realizable
+    from nkigym.transforms._code_motion import _check_same_loop_prefix
 
     env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Reorder(), RFactor()])
     s = env.reset()
@@ -205,10 +205,10 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
     s = Split().apply(s, SplitOption(target_nid=fold_leaf(s), factors=(4, 512), target_axis="d2"))
     s = Split().apply(s, SplitOption(target_nid=fold_loop(s, "i_d1_0"), factors=(4, 4), target_axis=None))
 
-    """Barrier 1 is isolated here via _check_move_realizable, which runs the
-    refined _check_no_reduction_axis_covered. Before this task it raised
-    'would cover reduction axis d0'; now it must return solved with d0 (ko)
-    COVERED by the fold's own enclosing i_d0_0 — proof the guard allows the
+    """Barrier 1 is isolated here via _check_same_loop_prefix, which runs the
+    refined _check_no_reduction_axis_covered. Before the Barrier-1 fix it raised
+    'would cover reduction axis d0'; now it must RETURN the matched prefix
+    (the fold's own enclosing i_d0_0 is allowed) — proof the guard permits the
     safe self-domination. (The end-to-end ReverseComputeAt of the fold is
     deferred to the Task 3 ladder, where the drain tensor_copy co-locates
     FIRST so the copy->fold RAW on sbuf_rfactor is satisfied; that ordering
@@ -216,9 +216,8 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
     fold = fold_blk(s)
     fold_block = s.tree.data(fold)
     assert any(iv.axis == "d0" and iv.role == AxisRole.ACCUMULATION for iv in fold_block.iter_vars)
-    solved = _check_move_realizable(s, fold, mm_loop(s, "i_d1_1"))
-    assert solved["d0"].target_loops, "ko (d0) must be covered by the fold's own enclosing loop (allowed)"
-    assert solved["d0"].residual_extent == 1
+    target_seq = _check_same_loop_prefix(s, fold, mm_loop(s, "i_d1_1"))
+    assert ("i_d0_0", 2) in target_seq, "ko (i_d0_0) must be in the matched prefix (allowed self-domination)"
 
 
 def test_compute_at_rejects_replicating_reduction_over_untiled_output_dim():

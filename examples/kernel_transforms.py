@@ -200,6 +200,20 @@ def _load_blk(ir: object, tensor: str) -> int:
     return next(nid for nid in ir.tree.blocks() if _reads(nid))
 
 
+def _load_leaf(ir: object, tensor: str) -> int:
+    """Node id of the ``NKILoad`` ISA leaf that reads ``tensor`` (the Split target)."""
+    return next(d for d in ir.tree.descendants(_load_blk(ir, tensor)) if isinstance(ir.tree.data(d), ISANode))
+
+
+def _load_for(ir: object, tensor: str, loop_var: str) -> int:
+    """Node id of the ForNode with ``loop_var`` inside the ``tensor`` load block's nest."""
+    return next(
+        d
+        for d in ir.tree.descendants(_load_blk(ir, tensor))
+        if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == loop_var
+    )
+
+
 def _op_blk(ir: object, op_name: str) -> int:
     """Node id of the single-leaf block whose ISA leaf is op ``op_name`` (e.g. NKITensorCopy)."""
 
@@ -264,46 +278,72 @@ def _reorder_blk_to_nm(ir: object, blk_nid: int) -> object:
     )
 
 
+def _blk_m_loop(ir: object, op_name: str) -> int:
+    """Node id of the ``i_d1_0`` (M) ForNode inside op ``op_name``'s single-leaf block."""
+    return _blk_loop(ir, _op_blk(ir, op_name), "i_d1_0")
+
+
 def _build_ladder() -> list[tuple[str, object]]:
     """Drive the shipped transforms from canonical ``f_nkigym`` to a HW-runnable
-    ``kernel_target`` equivalent (k0..k15). Returns ``[(name, ir), ...]``.
+    ``kernel_target`` equivalent (k0..k19), with the ko-fold INLINED into the
+    matmul's innermost M loop. Returns ``[(name, ir), ...]``.
 
     Every locator is SEMANTIC (matmul loop_var, op-class block, PSUM-writer leaf),
     so it tracks node ids across the structural change each ``apply`` makes — no
-    hard-coded nids. The rungs (see the module docstring for the full story):
-    k1 Split(K); k2 RFactor(ko) -> two-stage fold; k3-k5 Reorder (N above M, ki
-    innermost); k6-k8 Split d2 of memset/copy/fold; k9-k11 Reorder each to [N, M];
-    k12-k13 ReverseComputeAt memset + drain under the matmul i_d1_0 -> per-(N,M)-tile
-    PSUM ``(128, 1, 512)`` (``compact_shapes`` shrinks it); k14-k15 ComputeAt the
-    rhs/lhs_T loads to per-block scope (streamed operands). k15 = HW-runnable.
+    hard-coded nids. The N-OUTERMOST ladder (probed sim-clean on gym-1; the
+    fold-inlining the two coverage-guard refinements unblock — see the module
+    docstring):
+    k1-k2  Split K(->ko,ki) + Split M(->Mo,Mi); k3-k8 Reorder x6 -> nest
+    ``N > ko > Mo > Mi > ki``; k9 RFactor(ko) -> two-stage fold; k10-k15 Split each
+    of memset/copy/fold on d2(4x512) AND M(4x4) to the matmul's tile prefix;
+    k16-k18 ReverseComputeAt memset + drain ``tensor_copy`` + ``tensor_tensor``
+    fold under the matmul's ``i_d1_1`` -> all CO-LOCATED per (N, Mo, Mi) tile, fold
+    INLINED in the matmul's innermost body. ``compact_shapes`` then shrinks
+    ``psum_prod`` and ``sbuf_rfactor`` to per-tile ``(128, 1, 512)``. k19-k20 Split
+    the rhs/lhs_T loads on their FREE axis (rhs d2, lhs_T d1, each 4x512) so each
+    load is one N-/M-tile wide, NOT the full 2048; k21-k22 ComputeAt the tiled rhs
+    load under ``i_d2_0`` (N) and lhs_T under ``i_d1_0`` (Mo) -> ``sbuf_rhs``
+    ``(128, 16, 512)`` and ``sbuf_lhs_T`` ``(128, 8, 512)`` streamed per-tile. k22
+    is the fold-inlined, tiled-load ``kernel_target`` reproduction.
     """
     steps = [
         lambda ir: Split().apply(ir, SplitOption(target_nid=_loop(ir, "i_d0_0"), factors=(2, 8), target_axis=None)),
-        lambda ir: RFactor().apply(ir, RFactorOption(target_loop_nid=_loop(ir, "i_d0_0"), factor_axis=0)),
+        lambda ir: Split().apply(ir, SplitOption(target_nid=_loop(ir, "i_d1_0"), factors=(4, 4), target_axis=None)),
+        lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d1_1"), inner_nid=_loop(ir, "i_d2_0"))),
         lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d1_0"), inner_nid=_loop(ir, "i_d2_0"))),
         lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_1"), inner_nid=_loop(ir, "i_d2_0"))),
+        lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_0"), inner_nid=_loop(ir, "i_d2_0"))),
         lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_1"), inner_nid=_loop(ir, "i_d1_0"))),
+        lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_1"), inner_nid=_loop(ir, "i_d1_1"))),
+        lambda ir: RFactor().apply(ir, RFactorOption(target_loop_nid=_loop(ir, "i_d0_0"), factor_axis=0)),
         lambda ir: Split().apply(ir, SplitOption(target_nid=_psum_memset_leaf(ir), factors=(4, 512), target_axis="d2")),
-        lambda ir: Split().apply(
-            ir, SplitOption(target_nid=_op_leaf(ir, "NKITensorCopy"), factors=(4, 512), target_axis="d2")
-        ),
-        lambda ir: Split().apply(
-            ir, SplitOption(target_nid=_op_leaf(ir, "NKITensorTensor"), factors=(4, 512), target_axis="d2")
-        ),
-        lambda ir: _reorder_blk_to_nm(ir, _psum_memset_blk(ir)),
-        lambda ir: _reorder_blk_to_nm(ir, _op_blk(ir, "NKITensorCopy")),
-        lambda ir: _reorder_blk_to_nm(ir, _op_blk(ir, "NKITensorTensor")),
+        lambda ir: Split().apply(ir, SplitOption(target_nid=_blk_loop(ir, _psum_memset_blk(ir), "i_d1_0"), factors=(4, 4), target_axis=None)),
+        lambda ir: Split().apply(ir, SplitOption(target_nid=_op_leaf(ir, "NKITensorCopy"), factors=(4, 512), target_axis="d2")),
+        lambda ir: Split().apply(ir, SplitOption(target_nid=_blk_m_loop(ir, "NKITensorCopy"), factors=(4, 4), target_axis=None)),
+        lambda ir: Split().apply(ir, SplitOption(target_nid=_op_leaf(ir, "NKITensorTensor"), factors=(4, 512), target_axis="d2")),
+        lambda ir: Split().apply(ir, SplitOption(target_nid=_blk_m_loop(ir, "NKITensorTensor"), factors=(4, 4), target_axis=None)),
         lambda ir: ReverseComputeAt().apply(
-            ir, ReverseComputeAtOption(block_nid=_psum_memset_blk(ir), target_loop_nid=_loop(ir, "i_d1_0"), index=0)
+            ir, ReverseComputeAtOption(block_nid=_psum_memset_blk(ir), target_loop_nid=_loop(ir, "i_d1_1"), index=0)
         ),
         lambda ir: ReverseComputeAt().apply(
-            ir,
-            ReverseComputeAtOption(
-                block_nid=_op_blk(ir, "NKITensorCopy"), target_loop_nid=_loop(ir, "i_d1_0"), index=-1
-            ),
+            ir, ReverseComputeAtOption(block_nid=_op_blk(ir, "NKITensorCopy"), target_loop_nid=_loop(ir, "i_d1_1"), index=-1)
+        ),
+        lambda ir: ReverseComputeAt().apply(
+            ir, ReverseComputeAtOption(block_nid=_op_blk(ir, "NKITensorTensor"), target_loop_nid=_loop(ir, "i_d1_1"), index=-1)
+        ),
+        lambda ir: Split().apply(ir, SplitOption(target_nid=_load_leaf(ir, "rhs"), factors=(4, 512), target_axis="d2")),
+        lambda ir: Reorder().apply(
+            ir, ReorderOption(outer_nid=_load_for(ir, "rhs", "i_d0_0"), inner_nid=_load_for(ir, "rhs", "i_d2_0"))
         ),
         lambda ir: ComputeAt().apply(
             ir, ComputeAtOption(block_nid=_load_blk(ir, "rhs"), target_loop_nid=_loop(ir, "i_d2_0"), index=0)
+        ),
+        lambda ir: Split().apply(ir, SplitOption(target_nid=_load_leaf(ir, "lhs_T"), factors=(4, 512), target_axis="d1")),
+        lambda ir: Split().apply(
+            ir, SplitOption(target_nid=_load_for(ir, "lhs_T", "i_d0_0"), factors=(2, 8), target_axis=None)
+        ),
+        lambda ir: Reorder().apply(
+            ir, ReorderOption(outer_nid=_load_for(ir, "lhs_T", "i_d0_1"), inner_nid=_load_for(ir, "lhs_T", "i_d1_0"))
         ),
         lambda ir: ComputeAt().apply(
             ir, ComputeAtOption(block_nid=_load_blk(ir, "lhs_T"), target_loop_nid=_loop(ir, "i_d1_0"), index=0)

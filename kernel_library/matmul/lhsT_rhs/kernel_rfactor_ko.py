@@ -16,6 +16,12 @@ SBUF because ``tensor_tensor`` cannot read a PSUM operand. There is no separate
 write-back block. Because no ``ko``-stride term ever rides ``psum_prod``'s M
 (partition-tile) axis, a later ``Split(M)`` does not corrupt it — the multi-slot
 re-normalize bug is structurally absent.
+
+``psum_prod`` and ``sbuf_rfactor`` are declared INSIDE the ``ko`` loop — their
+tightest scope, since every toucher (the per-``ko`` memset / matmul / drain) is
+under it. The renderer places each ``nl.ndarray`` at the lowest common ancestor
+of its touching ISA leaves (:func:`nkigym.codegen.body._alloc_emit_nodes`), so a
+buffer live only within a loop is declared there, not at kernel scope.
 """
 
 import nki
@@ -41,9 +47,9 @@ def nki_f_matmul(lhs_T, rhs):
         )
     for i_d1_0 in range(16):
         nisa.memset(dst=sbuf_prod[0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
-    psum_prod = nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum)
-    sbuf_rfactor = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
     for i_d0_0 in range(2):
+        psum_prod = nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum)
+        sbuf_rfactor = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
         for i_d1_0 in range(16):
             nisa.memset(dst=psum_prod[0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
         for i_d0_1 in range(8):
