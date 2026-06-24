@@ -17,11 +17,12 @@ write-back block. Because no ``ko``-stride term ever rides ``psum_prod``'s M
 (partition-tile) axis, a later ``Split(M)`` does not corrupt it — the multi-slot
 re-normalize bug is structurally absent.
 
-``psum_prod`` and ``sbuf_rfactor`` are declared INSIDE the ``ko`` loop — their
-tightest scope, since every toucher (the per-``ko`` memset / matmul / drain) is
-under it. The renderer places each ``nl.ndarray`` at the lowest common ancestor
-of its touching ISA leaves (:func:`nkigym.codegen.body._alloc_emit_nodes`), so a
-buffer live only within a loop is declared there, not at kernel scope.
+``psum_prod`` and ``sbuf_rfactor`` are each declared INSIDE the ``ko`` loop
+immediately before its first use: ``psum_prod`` before the per-``ko`` memset that
+first writes it, and ``sbuf_rfactor`` before the ``tensor_copy`` that first writes
+it. The renderer places each ``nl.ndarray`` at the lowest common ancestor of its
+touching ISA leaves (:func:`nkigym.codegen.body._alloc_emit_anchors`), so a buffer
+live only within a loop is declared there, not at kernel scope.
 """
 
 import nki
@@ -49,7 +50,6 @@ def nki_f_matmul(lhs_T, rhs):
         nisa.memset(dst=sbuf_prod[0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
     for i_d0_0 in range(2):
         psum_prod = nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum)
-        sbuf_rfactor = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
         for i_d1_0 in range(16):
             nisa.memset(dst=psum_prod[0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
         for i_d0_1 in range(8):
@@ -60,6 +60,7 @@ def nki_f_matmul(lhs_T, rhs):
                         moving=sbuf_rhs[0:128, i_d0_0 * 8 + i_d0_1, i_d2_0 * 512 : i_d2_0 * 512 + 512],
                         dst=psum_prod[0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
                     )
+        sbuf_rfactor = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
         for i_d1_0 in range(16):
             nisa.tensor_copy(src=psum_prod[0:128, i_d1_0, 0 : 0 + 2048], dst=sbuf_rfactor[0:128, i_d1_0, 0 : 0 + 2048])
         for i_d1_0 in range(16):

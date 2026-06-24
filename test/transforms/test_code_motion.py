@@ -165,14 +165,21 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
 
     def mm_loop(state, loop_var):
         from nkigym.ir.tree import ForNode, ISANode
-        leaf = next(n for n in state.tree.preorder()
-                    if isinstance(state.tree.data(n), ISANode)
-                    and state.tree.data(n).op_cls.__name__ == "NKIMatmul")
-        return next(a for a in state.tree.ancestors(leaf)
-                    if isinstance(state.tree.data(a), ForNode) and state.tree.data(a).loop_var == loop_var)
+
+        leaf = next(
+            n
+            for n in state.tree.preorder()
+            if isinstance(state.tree.data(n), ISANode) and state.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        )
+        return next(
+            a
+            for a in state.tree.ancestors(leaf)
+            if isinstance(state.tree.data(a), ForNode) and state.tree.data(a).loop_var == loop_var
+        )
 
     def fold_blk(state):
         from nkigym.ir.tree import ISANode
+
         for nid in state.tree.blocks():
             leaves = [d for d in state.tree.descendants(nid) if isinstance(state.tree.data(d), ISANode)]
             if len(leaves) == 1 and state.tree.data(leaves[0]).op_cls.__name__ == "NKITensorTensor":
@@ -181,12 +188,17 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
 
     def fold_leaf(state):
         from nkigym.ir.tree import ISANode
+
         return next(d for d in state.tree.descendants(fold_blk(state)) if isinstance(state.tree.data(d), ISANode))
 
     def fold_loop(state, loop_var):
         from nkigym.ir.tree import ForNode
-        return next(d for d in state.tree.descendants(fold_blk(state))
-                    if isinstance(state.tree.data(d), ForNode) and state.tree.data(d).loop_var == loop_var)
+
+        return next(
+            d
+            for d in state.tree.descendants(fold_blk(state))
+            if isinstance(state.tree.data(d), ForNode) and state.tree.data(d).loop_var == loop_var
+        )
 
     from nkigym.ops.base import AxisRole
     from nkigym.transforms._code_motion import _check_same_loop_prefix

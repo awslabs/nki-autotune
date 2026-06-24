@@ -66,8 +66,7 @@ def test_render_region_rotation_applied():
     """A versions>1 psum buffer rotates the tile-axis index by loop_var % versions."""
     buf = Buffer(name="psum_prod", shape=(128, 2048), dtype="float32", location="psum", versions=2)
     region = BufferRegion(
-        tensor="psum_prod",
-        ranges=((Const(value=0), Const(value=128)), (Const(value=0), Const(value=2048))),
+        tensor="psum_prod", ranges=((Const(value=0), Const(value=128)), (Const(value=0), Const(value=2048)))
     )
     out = render_buffer_region(region, buf, rotation=Mod(left=Var(name="i_d1_0"), right=Const(value=2)))
     assert out == "psum_prod[0:128, i_d1_0 % 2, 0:0 + 2048]"
@@ -77,8 +76,7 @@ def test_render_region_no_rotation_when_versions_one():
     """versions=1 (rotation=None) renders byte-identically to today."""
     buf = Buffer(name="psum_prod", shape=(128, 2048), dtype="float32", location="psum")
     region = BufferRegion(
-        tensor="psum_prod",
-        ranges=((Const(value=0), Const(value=128)), (Const(value=0), Const(value=2048))),
+        tensor="psum_prod", ranges=((Const(value=0), Const(value=128)), (Const(value=0), Const(value=2048)))
     )
     assert render_buffer_region(region, buf, rotation=None) == "psum_prod[0:128, 0, 0:0 + 2048]"
 

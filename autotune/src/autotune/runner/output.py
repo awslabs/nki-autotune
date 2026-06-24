@@ -215,9 +215,7 @@ def _kernel_index_row(
     }
 
 
-def write_results_json(
-    cache_dir: str, num_kernels: int, results: list[ProfileResult], wallclock_s: float
-) -> None:
+def write_results_json(cache_dir: str, num_kernels: int, results: list[ProfileResult], wallclock_s: float) -> None:
     """Write results.json (index) and split per-kernel JSONs into subfolders."""
     _write_per_kernel_profiles(cache_dir, results)
 

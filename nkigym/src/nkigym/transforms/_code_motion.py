@@ -216,7 +216,9 @@ def _own_carry_loop_nids(ir: KernelIR, block_nid: int) -> set[int]:
     return out
 
 
-def _check_no_reduction_axis_covered(ir: KernelIR, block_nid: int, target_loop_nid: int, covered_vars: set[str]) -> None:
+def _check_no_reduction_axis_covered(
+    ir: KernelIR, block_nid: int, target_loop_nid: int, covered_vars: set[str]
+) -> None:
     """Reject a move that covers the moved block's ACCUMULATION (reduction) axis
     with a loop the block's own init does NOT dominate (foreign covering loop).
 
@@ -234,9 +236,11 @@ def _check_no_reduction_axis_covered(ir: KernelIR, block_nid: int, target_loop_n
     block = ir.tree.data(block_nid)
     assert isinstance(block, BlockNode)
     own_carry = _own_carry_loop_nids(ir, block_nid)
-    target_nid_by_var = {ir.tree.data(nid).loop_var: nid
-                         for nid in (target_loop_nid, *ir.tree.ancestors(target_loop_nid))
-                         if isinstance(ir.tree.data(nid), ForNode)}
+    target_nid_by_var = {
+        ir.tree.data(nid).loop_var: nid
+        for nid in (target_loop_nid, *ir.tree.ancestors(target_loop_nid))
+        if isinstance(ir.tree.data(nid), ForNode)
+    }
     result: None = None
     for lv in covered_vars:
         nid = target_nid_by_var.get(lv)

@@ -33,30 +33,32 @@ def emit_body(ir: KernelIR) -> str:
     is built once and threaded down so a pipelined loop rotates its
     multi-version buffer accesses (see :func:`_emit_subtree`).
 
-    Buffer declarations are placed at their tightest scope (:func:`_alloc_emit_nodes`):
-    each ``nl.ndarray`` is emitted at the lowest common ancestor of the ISA leaves
-    that touch it — inside an enclosing loop when all uses share one — rather than
-    at the buffer's owning block. The ``{node_nid: [Buffer, ...]}`` map is threaded
-    down so each node emits its own declarations as it is entered.
+    Buffer declarations are placed at their tightest scope (:func:`_alloc_emit_anchors`):
+    each ``nl.ndarray`` is emitted immediately before the first child that uses it —
+    the first child of the buffer's lowest-common-ancestor scope whose subtree
+    touches it — rather than clustered at the buffer's owning block. The
+    ``{node_nid: [Buffer, ...]}`` map is threaded down so each node emits, before
+    each child, the declarations anchored to that child.
     """
     code: list[str] = []
     pipeline_map = _pipeline_loops(ir)
-    emit_at = _alloc_emit_nodes(ir)
-    _emit_block(ir, ir.tree.root, depth=1, code=code, pipeline_map=pipeline_map, rotations={}, emit_at=emit_at)
+    emit_before = _alloc_emit_anchors(ir)
+    _emit_block(ir, ir.tree.root, depth=1, code=code, pipeline_map=pipeline_map, rotations={}, emit_before=emit_before)
     return "\n".join(code) + "\n"
 
 
-def _alloc_emit_nodes(ir: KernelIR) -> dict[int, list[Buffer]]:
-    """Map each tree node to the buffers whose tightest scope is that node.
+def _alloc_emit_anchors(ir: KernelIR) -> dict[int, list[Buffer]]:
+    """Map each tree node to the buffers emitted immediately before it.
 
-    A buffer's tightest scope is the lowest common ancestor of every ISA leaf
-    that touches it (reads or writes its tensor) — the shallowest node whose
-    subtree contains all uses, which a declaration there dominates. ``shared_hbm``
-    buffers (the kernel output) are pinned at the root block, matching their
-    kernel-lifetime use; kernel parameters are never declared. When the LCA is an
-    ISA leaf itself (a lone toucher), the buffer is emitted at that leaf's
-    enclosing node so the declaration still precedes the use. Buffers are walked
-    in ``all_buffers`` order so each node's declaration list is deterministic.
+    A buffer's *scope* is the lowest common ancestor of every ISA leaf that touches
+    it (the depth-tightest node whose subtree contains all uses); ``shared_hbm``
+    buffers are scoped to the root (kernel lifetime). Within that scope the buffer's
+    declaration is anchored to the FIRST child (in tree child order = dataflow
+    order) whose subtree contains a touching leaf — so the ``nl.ndarray`` is emitted
+    right before the first loop / block / leaf that uses it, matching the hand
+    reference ``kernel_0``. When the scope is itself an ISA leaf (a lone toucher),
+    the buffer anchors to that leaf. Kernel parameters are never declared. Buffers
+    are walked in ``all_buffers`` order so each anchor's list is deterministic.
     """
     params = set(ir.param_buffers)
     leaves_by_tensor: dict[str, list[int]] = {}
@@ -69,18 +71,29 @@ def _alloc_emit_nodes(ir: KernelIR) -> dict[int, list[Buffer]]:
     for name, buf in ir.all_buffers().items():
         if name in params:
             continue
-        if buf.location == "shared_hbm":
-            node = ir.tree.root
-        else:
-            leaves = leaves_by_tensor.get(name)
-            assert leaves, f"buffer {name!r} is declared but touched by no ISA leaf"
-            node = _lca_nodes(ir.tree, leaves)
-            if isinstance(ir.tree.data(node), ISANode):
-                parent = ir.tree.parent(node)
-                assert parent is not None, f"toucher leaf {node} of buffer {name!r} has no parent"
-                node = parent
-        out.setdefault(node, []).append(buf)
+        leaves = leaves_by_tensor.get(name)
+        assert leaves, f"buffer {name!r} is declared but touched by no ISA leaf"
+        scope = ir.tree.root if buf.location == "shared_hbm" else _lca_nodes(ir.tree, leaves)
+        anchor = _anchor_child(ir.tree, scope, leaves)
+        out.setdefault(anchor, []).append(buf)
     return out
+
+
+def _anchor_child(tree: KernelTree, scope: int, leaves: list[int]) -> int:
+    """Return the node to emit a buffer's declaration before.
+
+    When ``scope`` is an ISA leaf (lone toucher), the buffer anchors to that leaf.
+    Otherwise the anchor is the first child of ``scope`` (in child order) whose
+    subtree contains one of ``leaves`` — the first dataflow use of the buffer.
+    """
+    if isinstance(tree.data(scope), ISANode):
+        return scope
+    touch = set(leaves)
+    for child in tree.children(scope):
+        subtree = {child, *tree.descendants(child)}
+        if subtree & touch:
+            return child
+    raise AssertionError(f"scope {scope} has no child whose subtree touches the buffer")
 
 
 def _lca_nodes(tree: KernelTree, nids: list[int]) -> int:
@@ -126,20 +139,20 @@ def _emit_block(
     code: list[str],
     pipeline_map: dict[int, dict[str, Any]],
     rotations: dict[str, Expr],
-    emit_at: dict[int, list[Buffer]],
+    emit_before: dict[int, list[Buffer]],
 ) -> None:
-    """Emit one BlockNode: its tightest-scope buffer declarations, then its body."""
+    """Emit one BlockNode: each child's anchored buffer declarations, then the child."""
     block = ir.tree.data(block_nid)
     assert isinstance(block, BlockNode)
     indent = _INDENT * depth
-    for buf in emit_at.get(block_nid, ()):
-        code.append(indent + _emit_alloc(buf))
     for child_nid in ir.tree.children(block_nid):
+        for buf in emit_before.get(child_nid, ()):
+            code.append(indent + _emit_alloc(buf))
         child_data = ir.tree.data(child_nid)
         if isinstance(child_data, BlockNode):
-            _emit_block(ir, child_nid, depth, code, pipeline_map, rotations, emit_at)
+            _emit_block(ir, child_nid, depth, code, pipeline_map, rotations, emit_before)
         else:
-            _emit_subtree(ir, child_nid, depth, code, pipeline_map, rotations, emit_at)
+            _emit_subtree(ir, child_nid, depth, code, pipeline_map, rotations, emit_before)
 
 
 def _emit_subtree(
@@ -149,22 +162,20 @@ def _emit_subtree(
     code: list[str],
     pipeline_map: dict[int, dict[str, Any]],
     rotations: dict[str, Expr],
-    emit_at: dict[int, list[Buffer]],
+    emit_before: dict[int, list[Buffer]],
 ) -> None:
     """Emit a ForNode, ISANode, or nested BlockNode subtree.
 
-    A BlockNode may appear as a ForNode child once ``compute_at`` lifts /
-    sinks a block into a loop body; delegate it to :func:`_emit_block` so
-    its declarations and body render in place.
+    A BlockNode may appear as a ForNode child once ``compute_at`` lifts / sinks a
+    block into a loop body; delegate it to :func:`_emit_block`.
 
-    A ForNode emits any buffers whose tightest scope is that loop
-    (``emit_at[nid]``) as the first lines of its body, before its children — so
-    a buffer used only within the loop is declared inside it.
+    A ForNode emits, before each of its children, any buffers anchored to that
+    child (``emit_before[child]``) — so a buffer used only within the loop is
+    declared inside it, immediately before its first use.
 
     When ``nid`` is a pipelined loop (a key of ``pipeline_map``), the loop is
-    emitted monolithically (Increment 1: no prologue/epilogue) and every
-    ``versions>1`` buffer touched in its subtree is added to ``rotations`` with
-    a ``loop_var % versions`` tile-axis rotation before recursing.
+    emitted monolithically and every ``versions>1`` buffer touched in its subtree
+    is added to ``rotations`` before recursing.
     """
     indent = _INDENT * depth
     node = ir.tree.data(nid)
@@ -173,14 +184,15 @@ def _emit_subtree(
         if nid in pipeline_map:
             child_rotations = {**rotations, **_pipeline_rotations(ir, nid, node.loop_var)}
         code.append(indent + f"for {node.loop_var} in range({node.extent}):")
-        for buf in emit_at.get(nid, ()):
-            code.append(_INDENT * (depth + 1) + _emit_alloc(buf))
+        child_indent = _INDENT * (depth + 1)
         for child_nid in ir.tree.children(nid):
-            _emit_subtree(ir, child_nid, depth + 1, code, pipeline_map, child_rotations, emit_at)
+            for buf in emit_before.get(child_nid, ()):
+                code.append(child_indent + _emit_alloc(buf))
+            _emit_subtree(ir, child_nid, depth + 1, code, pipeline_map, child_rotations, emit_before)
     elif isinstance(node, ISANode):
         code.append(indent + _emit_isa_call(node, ir, rotations))
     elif isinstance(node, BlockNode):
-        _emit_block(ir, nid, depth, code, pipeline_map, rotations, emit_at)
+        _emit_block(ir, nid, depth, code, pipeline_map, rotations, emit_before)
     else:
         raise TypeError(f"unexpected subtree node type {type(node).__name__}")
 

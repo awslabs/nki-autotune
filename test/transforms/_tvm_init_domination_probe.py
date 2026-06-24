@@ -75,8 +75,7 @@ def test_tvm_rejects_init_sunk_into_reduction_loop() -> None:
     pytest.importorskip("tvm")
     outcome = probe_compute_at_init_into_k()
     assert outcome["raised"] is True, (
-        "TVM did NOT reject sinking init into k — it produced:\n"
-        f"{outcome.get('post_move_script')}"
+        "TVM did NOT reject sinking init into k — it produced:\n" f"{outcome.get('post_move_script')}"
     )
 
 

@@ -52,14 +52,28 @@ _POSITIONAL_SLOTS: dict[str, tuple[str, ...]] = {"memset": ("dst",), "tensor_cop
 class _Canonicalize(ast.NodeTransformer):
     """Rewrite a kernel function's AST into a placement / order canonical form."""
 
+    def __init__(self, hoist_decls: bool = True) -> None:
+        """Store whether top-level ``nl.ndarray`` decls are hoisted + sorted.
+
+        ``hoist_decls=True`` (default) reproduces the historical behavior: every
+        declaration is lifted to the top of the function and ordered by name, so
+        declaration *position* is normalized away. ``hoist_decls=False`` keeps the
+        authored statement order, making decl position significant.
+        """
+        self.hoist_decls = hoist_decls
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        """Rename the function, drop asserts, hoist ``nl.ndarray`` declarations."""
+        """Rename the function, drop asserts, optionally hoist ``nl.ndarray`` decls."""
         node.name = "KFN"
         kept: list[ast.stmt] = [stmt for stmt in node.body if not isinstance(stmt, ast.Assert)]
-        decls = [stmt for stmt in kept if _is_ndarray_decl(stmt)]
-        body = [stmt for stmt in kept if not _is_ndarray_decl(stmt)]
-        decls.sort(key=_decl_target_name)
-        node.body = [self.visit(stmt) for stmt in (decls + body)]
+        if self.hoist_decls:
+            decls = [stmt for stmt in kept if _is_ndarray_decl(stmt)]
+            body = [stmt for stmt in kept if not _is_ndarray_decl(stmt)]
+            decls.sort(key=_decl_target_name)
+            ordered = decls + body
+        else:
+            ordered = kept
+        node.body = [self.visit(stmt) for stmt in ordered]
         node.decorator_list = [self.visit(dec) for dec in node.decorator_list]
         return node
 
@@ -118,16 +132,17 @@ def _decl_target_name(stmt: ast.stmt) -> str:
     return target.id
 
 
-def _normalize(src: str) -> str:
+def _normalize(src: str, hoist_decls: bool = True) -> str:
     """Parse ``src`` and return the canonical AST dump of its kernel function.
 
-    Only the (single) ``FunctionDef`` is compared: a rendered module
-    carries top-level ``import`` statements that ``inspect.getsource`` of a
-    hand kernel omits, and those imports are not part of the kernel body.
+    Only the (single) ``FunctionDef`` is compared: a rendered module carries
+    top-level ``import`` statements that ``inspect.getsource`` of a hand kernel
+    omits, and those imports are not part of the kernel body. ``hoist_decls=False``
+    keeps top-level declaration order significant (see :class:`_Canonicalize`).
     """
     module = ast.parse(src)
     fn = _single_function_def(module)
-    canonical = _Canonicalize().visit(fn)
+    canonical = _Canonicalize(hoist_decls=hoist_decls).visit(fn)
     folded = _ConstantFold().visit(canonical)
     ast.fix_missing_locations(folded)
     return ast.dump(folded, annotate_fields=True)
@@ -251,3 +266,16 @@ def assert_matches_render(rendered_src: str, expected_src: str) -> None:
     got = _normalize(rendered_src)
     want = _normalize(expected_src)
     assert got == want, f"rendered != expected\n--- got ---\n{got}\n--- want ---\n{want}"
+
+
+def assert_matches_render_ordered(rendered_src: str, expected_src: str) -> None:
+    """Assert two rendered sources are equal after canonicalization, order-significant.
+
+    Like :func:`assert_matches_render` but does NOT hoist ``nl.ndarray``
+    declarations, so declaration position (before-first-use interleaving) is part
+    of the comparison. Used to pin the renderer's interleaved decl emission against
+    a hand reference such as ``kernel_0``.
+    """
+    got = _normalize(rendered_src, hoist_decls=False)
+    want = _normalize(expected_src, hoist_decls=False)
+    assert got == want, f"rendered != expected (ordered)\n--- got ---\n{got}\n--- want ---\n{want}"

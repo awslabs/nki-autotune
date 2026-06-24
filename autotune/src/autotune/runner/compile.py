@@ -138,11 +138,7 @@ def _run_compiler(kernel: Kernel, tensor_inputs: dict[str, np.ndarray], output_n
             input_specs = cr.input_specs
             input_arrays = [np.zeros(s.shape, dtype=np.dtype(s.dtype)) for s in input_specs]
             compile_bir_to_neff(
-                opts,
-                bir,
-                input_arrays,
-                [s.name for s in input_specs],
-                [s.name for s in cr.output_specs],
+                opts, bir, input_arrays, [s.name for s in input_specs], [s.name for s in cr.output_specs]
             )
         except Exception as exc:
             stderr_content = Path(stderr_path).read_text().strip()

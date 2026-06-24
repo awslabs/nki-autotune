@@ -124,10 +124,7 @@ def _collect_compiler_logs(compile_results: list[CompileResult], neff_dir: Path,
 
 
 def run_pipeline(
-    kernels: dict[str, KernelJob],
-    seed: int,
-    collect_compiler_logs: bool,
-    collect_detailed_profile: bool,
+    kernels: dict[str, KernelJob], seed: int, collect_compiler_logs: bool, collect_detailed_profile: bool
 ) -> tuple[list[ProfileResult], dict[str, str]]:
     """Compile + benchmark every kernel in-process on this box.
 

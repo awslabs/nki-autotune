@@ -10,12 +10,7 @@ import os
 import time
 
 from autotune.runner.driver import run_pipeline
-from autotune.runner.output import (
-    ProfileOutput,
-    write_compiler_logs,
-    write_kernel_sources,
-    write_results_json,
-)
+from autotune.runner.output import ProfileOutput, write_compiler_logs, write_kernel_sources, write_results_json
 from autotune.runner.types import KernelJob
 
 logger = logging.getLogger(__name__)
@@ -53,10 +48,7 @@ def profile(
 
     t0 = time.monotonic()
     results, compiler_logs = run_pipeline(
-        kernels,
-        seed=seed,
-        collect_compiler_logs=collect_logs,
-        collect_detailed_profile=collect_detailed_profile,
+        kernels, seed=seed, collect_compiler_logs=collect_logs, collect_detailed_profile=collect_detailed_profile
     )
     elapsed_s = time.monotonic() - t0
     logger.info("Profile complete: %d results in %.1fs", len(results), elapsed_s)
@@ -67,9 +59,4 @@ def profile(
         write_results_json(cache_dir, len(kernels), results, elapsed_s)
         logger.info("Cache saved to %s", cache_dir)
 
-    return ProfileOutput(
-        results=results,
-        compiler_logs=compiler_logs,
-        elapsed_s=elapsed_s,
-        cache_dir=cache_dir,
-    )
+    return ProfileOutput(results=results, compiler_logs=compiler_logs, elapsed_s=elapsed_s, cache_dir=cache_dir)
