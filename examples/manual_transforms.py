@@ -434,7 +434,56 @@ def kernel_8(lhs_T, rhs):
         )
     return hbm_out
 
+"""
+code motion legality checks
+source instruction = 
+```
+nisa.tensor_copy(
+    src=psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+    dst=sbuf_prod[0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+)
+```
+source enclosing loops = 
+```
+for i_d2_0 in range(4):
+    for i_d1_0 in range(16):
+```
+target location = after "for i_d0_0 in range(2)" loop closure.
+target enclosing loops = 
+```
+for i_d2_0 in range(4): --> relevant dimension loop
+```
+legality checks:
+1. Are relevant dimension loops an identical prefix to source enclosing loops? Yes.
+Counter examples that violate this check:
+target enclosing loops = 
+```
+for i_d2_0 in range(2): --> trip count is not the same
+```
 
+```
+for i_d2_0 in range(4):
+    for i_d1_0 in range(8):  --> trip count is not the same
+```
+
+```
+for i_d1_0 in range(16):
+    for i_d2_0 in range(4): --> loop order is not the same
+```
+
+```
+for i_d1_0 in range(16): --> not the same loop prefix, missing for i_d2_0 in range(4) in front of it
+```
+
+2. Producer-consumer data dependency respected? Yes
+source instruction data access:
+Read: psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512]
+Write: sbuf_prod[0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512]
+If moved to target location:
+1. psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512] has been fully written by producers.
+2. sbuf_prod[0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512] is after producers.
+--> ok
+"""
 @nki.jit
 def kernel_9(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
