@@ -1,14 +1,16 @@
-"""Numpy matmul → ``f_nkigym`` → canonical IR → random-policy rollouts.
+"""Random-policy MDP rollouts — the transform composability + correctness test.
+
+Wraps the canonical matmul ``f_nkigym`` in :class:`nkigym.environment.KernelMDP`
+and samples random ``(transform, option)`` actions over the full shipped set
+(``Split + Fuse + Reorder + CodeMotion``), CPU-sim-checking numerics after EVERY
+step. This is the fuzz test that every legal transform composition stays
+correctness-preserving: a divergence at any step is a transform (or legality) bug,
+independent of any hand-authored ladder.
 
 The ``f_nkigym`` body below is the output of
 :func:`nkigym.synthesis.numpy_to_nkigym.compile_numpy_to_nkigym`
 pasted verbatim — re-run the synthesiser manually whenever the op
 surface or workload changes.
-
-After dumping the canonical IR (``step_0``) and checking numerics, this
-script wraps ``f_nkigym`` in :class:`nkigym.environment.KernelMDP`,
-samples random ``(transform, option)`` actions over ``Split + Fuse + Reorder``
-for ``NUM_ROLLOUTS`` independent rollouts, and dumps every step's IR.
 
 Usage::
 
@@ -37,6 +39,8 @@ K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 NUM_ROLLOUTS = 1
 MAX_STEPS = 100
+SEED = 0
+"""Rollout ``k`` uses ``random.Random(SEED + k)`` so divergences replay exactly."""
 
 
 def f_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -76,10 +80,13 @@ if __name__ == "__main__":
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    """Random-policy rollouts via the KernelMDP environment."""
+    """Random-policy rollouts via the KernelMDP environment. Each rollout is SEEDED
+    (``SEED + k``) so a numerics divergence is REPRODUCIBLE, and every action is
+    printed so the exact ``(transform, option)`` that broke correctness is
+    recoverable from the log — a fuzz test is only useful if its failures replay."""
     env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), CodeMotion()])
-    rng = random.Random()
     for k in range(NUM_ROLLOUTS):
+        rng = random.Random(SEED + k)
         state = env.reset()
         cache_0 = f"{CACHE_DIR}/rollout_{k}/step_0"
         state.dump(cache_0)
@@ -89,6 +96,7 @@ if __name__ == "__main__":
             if not actions:
                 break
             action = rng.choice(actions)
+            print(f"[rollout {k}] step {t}: {type(action[0]).__name__} {action[1]}")
             state = env.step(state, action)
             cache_t = f"{CACHE_DIR}/rollout_{k}/step_{t}"
             state.dump(cache_t)

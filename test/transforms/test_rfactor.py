@@ -15,7 +15,7 @@ from nkigym.ops.base import AxisRole
 from nkigym.synthesis.simulate_nki import simulate_fp32
 from nkigym.transforms import RFactor, RFactorOption, TransformLegalityError
 from test.transforms._ladder_compare import assert_matches_hand
-from test.transforms._rfactor_fixtures import ko_loop_nid, matmul_leaf_nid, split_k_ir
+from test.transforms._rfactor_fixtures import ko_loop_nid, matmul_leaf_nid, mid_ladder_ir, split_k_ir
 
 _HAND_KERNEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
@@ -85,22 +85,37 @@ def test_apply_byte_exact() -> None:
     assert_matches_hand(render(_rfactored_ir()), _load_hand_kernel())
 
 
-def test_apply_sim_matches_matmul() -> None:
-    """The rfactored kernel sims numerically equal to lhs_T.T @ rhs."""
-    src = render(_rfactored_ir())
+def _sim_rendered_matmul(name: str, src: str) -> None:
+    """Round-trip ``src`` through a temp module and assert its kernel sims equal to
+    ``lhs_T.T @ rhs`` (fp32). ``simulate_fp32`` takes a NKI callable, not a KernelIR,
+    so the rendered source is imported and its ``nki_f_matmul`` simmed."""
     rng = np.random.default_rng(0)
     inputs = {
         "lhs_T": rng.standard_normal((2048, 2048)).astype(np.float32),
         "rhs": rng.standard_normal((2048, 2048)).astype(np.float32),
     }
-    path = os.path.join(tempfile.gettempdir(), "rfactor_sim_scratch.py")
+    path = os.path.join(tempfile.gettempdir(), f"rfactor_sim_{name}.py")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(src)
-    spec = importlib.util.spec_from_file_location("rfactor_sim", path)
+    spec = importlib.util.spec_from_file_location(f"rfactor_sim_{name}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     actual = np.asarray(simulate_fp32(module.nki_f_matmul)(**inputs))
     np.testing.assert_allclose(actual, inputs["lhs_T"].T @ inputs["rhs"], atol=5e-3, rtol=5e-3)
+
+
+def test_apply_sim_matches_matmul() -> None:
+    """The rfactored kernel sims numerically equal to lhs_T.T @ rhs."""
+    _sim_rendered_matmul("early_packed", render(_rfactored_ir()))
+
+
+def test_apply_sim_matches_matmul_mid_tiled_m() -> None:
+    """RFactor(ko) on the mid state (K split ko/ki AND M tiled i_d1_0 x i_d1_1,
+    buffers still packed) sims equal to the golden — the tiled-M geometry, pinned
+    as a regression test via the ``mid_ladder_ir`` fixture."""
+    ir = mid_ladder_ir()
+    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0))
+    _sim_rendered_matmul("mid_tiled_m", render(rfactored))
 
 
 def test_ko_roles_split_across_blocks() -> None:

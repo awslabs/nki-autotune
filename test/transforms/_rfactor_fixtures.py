@@ -71,8 +71,7 @@ def mid_ladder_ir() -> KernelIR:
 
     K split (ko/ki) + M tiled (i_d1_0 x i_d1_1), every buffer still a packed ndarray,
     no load sunk — isolates RFactor's role-location + geometry from the list-buffer
-    dimension. Mirrors ``examples/rfactor_states.py``'s ``_mid_packed`` atom-for-atom
-    so the harness diagnosis and these tests share one state.
+    dimension. Pinned by ``test_rfactor.py::test_apply_sim_matches_matmul_mid_tiled_m``.
     """
     ir = split_k_ir()
     return Split().apply(ir, SplitOption(target_nid=_mm_m_loop(ir), factors=(4, 4), target_axis=None))

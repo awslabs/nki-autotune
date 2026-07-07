@@ -1,45 +1,37 @@
-"""Canonical matmul -> the hand ``kernel_target``, by DRIVING the shipped transforms.
+"""Reproduce the ``manual_transforms.py`` ladder by DRIVING the shipped transforms.
 
-d0 = K (reduction), d1 = M, d2 = N. From the canonical SSA matmul ``f_nkigym``
-(== kernel_0), ``_build_ladder`` drives ONE shipped-transform atom per rung to a
-``kernel_target``-equivalent — tiling AND the two-stage psum->sbuf fold in a
-SINGLE IR. Run with ``--cache <dir>``: ``_main`` renders every rung, CPU-sims it
-against ``lhs_T.T @ rhs``, and compiles + profiles each on real Trn2 hardware.
+GOAL: drive the shipped transforms (Split / Reorder / RFactor / CodeMotion) from
+the canonical SSA matmul ``f_nkigym`` (== ``manual_transforms.py`` kernel_0) to the
+hand-built development target, ONE transform atom per rung, so the machine-driven
+ladder reproduces the hand ladder. ``_main`` renders every rung, CPU-sims it against
+``lhs_T.T @ rhs``, and compiles + profiles each on real Trn2 hardware.
 
-THE SINGLE LADDER (``_build_ladder``, k0..k15), all CPU-sim clean on gym-1:
-  k1      Split        K-trip 16 -> ko(2), ki(8)
-  k2      RFactor(ko)  one-stage -> two-stage accumulation: per-ko PSUM partial,
-                       ko folded in SBUF via ``tensor_tensor`` (the fused
-                       single-accumulator form; psum stays per-output-tile, so a
-                       later Split/Reorder of M never corrupts it)
-  k3-k5   Reorder x3   bubble N(i_d2_0) above M, sink ki(i_d0_1) innermost
-                       -> matmul nest ``ko > N > M > ki``
-  k6-k8   Split x3     tensorize d2 (2048 -> 4x512) of the per-ko memset / drain
-                       ``tensor_copy`` / ``tensor_tensor`` fold
-  k9-k11  Reorder x3   each of those blocks to ``[N, M]`` (the matmul's tile-prefix
-                       order, so the next moves are same-prefix legal)
-  k12-k13 CodeMotion  sink memset(psum) + drain ``tensor_copy`` under the
-                       matmul's ``i_d1_0`` -> memset/matmul/copy CO-LOCATED per
-                       (N, M) output tile. ``compact_shapes`` then shrinks
-                       ``psum_prod`` (128,16,2048) -> **(128, 1, 512)** — the
-                       per-tile PSUM the HW needs.
-  k14-k15 CodeMotion    sink the rhs / lhs_T loads to per-(N) / per-(N,M) scope
-                       (stream operands instead of one 32 MiB up-front load).
-k15 is the HW-runnable ``kernel_target`` equivalent: ``ko > N > M`` with a per-tile
-``memset -> ki-matmul -> tensor_copy``, a per-(N,M) ``tensor_tensor`` ko-fold into
-``sbuf_prod``, and streamed loads. ``kernel_target`` (the hand 90.7%-MFU goal) is
-profiled beside it as the reference.
+d0 = K (reduction), d1 = M, d2 = N. ``_build_ladder`` is 25 atoms (k0..k25), all
+CPU-sim clean on gym-1:
+  k1-k2   Split x2     K -> ko(2),ki(8); M -> Mo(4),Mi(4)
+  k3-k8   Reorder x6   bubble N(i_d2_0) outermost, sink ki innermost
+                       -> matmul nest ``N > ko > Mo > Mi > ki``
+  k9      RFactor(ko)  one-stage -> two-stage accumulation: per-ko PSUM partial,
+                       ko folded in SBUF via ``tensor_tensor`` (fused single-
+                       accumulator form; psum stays per-output-tile)
+  k10-k15 Split x6     tensorize d2 (2048 -> 4x512) AND M (4x4) of the per-ko
+                       memset / drain ``tensor_copy`` / ``tensor_tensor`` fold
+  k16-k18 CodeMotion x3 sink memset(psum) + drain copy + ko-fold under the matmul's
+                       ``i_d1_1`` -> CO-LOCATED per (N, Mo, Mi) tile, fold INLINED.
+                       ``compact_shapes`` shrinks psum_prod/sbuf_rfactor to (128,1,512).
+  k19-k25 Split/Reorder/CodeMotion  tile the rhs load (d2) and lhs_T load (d1) and
+                       sink each under its tile loop -> streamed per-tile operands.
+k25 is the HW-runnable target reproduction: ``N > ko > Mo > Mi`` with a per-tile
+``memset -> ki-matmul -> tensor_copy -> ko-fold`` and streamed loads.
 
-MEASURED (gym-1): all k0..k15 + kernel_target CPU-sim PASS (~1.4e-4). On HW,
-k0..k13 (k14 too: it still holds a wide load buffer) hold a full-extent buffer
-neuronx-cc's BIR verifier rejects (exit 70) for most rungs; the runnable rungs are
-**k13 37.7% -> k15 46.2% MFU** (both load sinks); ``kernel_target`` 90.7%. The
-~45pp gap k15 -> kernel_target is PERF, not correctness: kernel_target inlines the
-``tensor_tensor`` fold into the matmul's innermost loop (vs k15's separate ``[N,M]``
-fold sweep, which serializes the two accumulation stages and keeps ``sbuf_rfactor``
-full-extent) and reloads lhs_T as ``(128,1,512)`` slabs (vs k15's full-width
-reload). Inlining the fold is blocked by the reduction-axis-coverage guard (the
-fold carries ``ko`` as ACCUMULATION) — follow-on work.
+RELATION TO ``manual_transforms.py`` (the hand development target): this ladder
+reaches a target-EQUIVALENT compute body via its OWN sequence — it is NOT yet a
+rung-for-rung reproduction of the hand k0..k27. Two gaps remain (see
+``docs/superpowers/specs/2026-07-03-manual-transforms-reproduction-gap.md``):
+(1) the hand ladder's 4 "Buffer layout" rungs (packed ndarray -> list-of-tiles)
+need a ``BufferLayout`` transform that is not shipped — this ladder reaches per-tile
+SHAPES via ``compact_shapes`` but keeps buffers PACKED; (2) the hand ladder applies
+RFactor LAST, this one applies it EARLY. Closing both is what makes it 1-to-1.
 """
 
 import argparse
