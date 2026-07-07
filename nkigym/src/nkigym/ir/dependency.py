@@ -25,8 +25,7 @@ import networkx as nx
 from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
 from nkigym.ir.arith.expr import to_affine
 from nkigym.ir.interval import regions_disjoint
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree, role_of
-from nkigym.ops.base import AxisRole
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 _DEPENDENCY_STYLES: list[ClassStyle] = [ClassStyle(name="block", fill="#efe", stroke="#363")]
 
@@ -89,7 +88,7 @@ class Dependency:
         return self._closure.has_edge(self._resolve(producer), self._resolve(consumer))
 
     def first_backward_edge(
-        self, moved_leaf_nid: int, tree: KernelTree | None = None, skip_cover_loops: frozenset[int] = frozenset()
+        self, moved_leaf_nid: int, tree: KernelTree | None = None
     ) -> tuple[int, int] | None:
         """Return the first dependency edge incident to ``moved_leaf_nid`` that
         points backward in the execution order of ``tree``, else ``None``.
@@ -121,10 +120,13 @@ class Dependency:
                 raise KeyError(f"dependency endpoint {nid} absent from the evaluated tree")
             return (min(idxs), max(idxs))
 
-        return self._first_backward(moved_leaf_nid, span, skip_cover_loops=skip_cover_loops)
+        def enclosing_loops(nid: int) -> list[int]:
+            return [a for a in eval_tree.ancestors(nid) if isinstance(eval_tree.data(a), ForNode)]
+
+        return self._first_backward(moved_leaf_nid, span, eval_tree, enclosing_loops)
 
     def first_backward_edge_for_insertion(
-        self, moved_leaf_nid: int, target_loop_nid: int, index: int, skip_cover_loops: frozenset[int] = frozenset()
+        self, moved_leaf_nid: int, target_loop_nid: int, index: int
     ) -> tuple[int, int] | None:
         """Pure ordering check for splicing ``moved_leaf_nid`` under
         ``target_loop_nid`` at child slot ``index`` — no tree mutation.
@@ -151,12 +153,21 @@ class Dependency:
           **encloses the insertion point** has its span extended by the moved
           position. This is the carry-loop case ``K-loop -> drain``: sinking the
           drain *inside* the K loop must read as backward.
+
+        Span-promotion evaluates the moved leaf's enclosing loops as the
+        TARGET's nest (``target_loop_nid`` + its ForNode ancestors), since the
+        splice makes it their descendant; every other endpoint keeps its own
+        ``self._tree`` ForNode ancestors minus the moved subtree.
         """
         order: dict[int, float] = {n: i for i, n in enumerate(self._tree.preorder())}
         owner_block = self._owner_block.get(moved_leaf_nid, moved_leaf_nid)
         moved_subtree = self._tree.descendants(owner_block) | {owner_block}
         moved_pos = self._effective_insertion_position(order, target_loop_nid, index, moved_subtree)
         enclosers = set(self._tree.ancestors(target_loop_nid)) | {target_loop_nid}
+        target_loops = [
+            n for n in (target_loop_nid, *self._tree.ancestors(target_loop_nid))
+            if isinstance(self._tree.data(n), ForNode)
+        ]
 
         def span(nid: int) -> tuple[float, float]:
             if nid == moved_leaf_nid:
@@ -168,7 +179,15 @@ class Dependency:
                 raise KeyError(f"dependency endpoint {nid} absent from the tree")
             return (min(positions), max(positions))
 
-        return self._first_backward(moved_leaf_nid, span, skip_cover_loops=skip_cover_loops)
+        def enclosing_loops(nid: int) -> list[int]:
+            if nid == moved_leaf_nid:
+                return target_loops
+            return [
+                a for a in self._tree.ancestors(nid)
+                if a not in moved_subtree and isinstance(self._tree.data(a), ForNode)
+            ]
+
+        return self._first_backward(moved_leaf_nid, span, self._tree, enclosing_loops)
 
     def _effective_insertion_position(
         self, order: dict[int, float], target_loop_nid: int, index: int, moved_subtree: set[int]
@@ -207,23 +226,29 @@ class Dependency:
         self,
         moved_leaf_nid: int,
         span: Callable[[int], tuple[float, float]],
-        skip_cover_loops: frozenset[int] = frozenset(),
+        eval_tree: KernelTree,
+        enclosing_loops: Callable[[int], list[int]],
     ) -> tuple[int, int] | None:
         """Return the first edge incident to ``moved_leaf_nid`` that ``span`` ranks
-        backward (``span(a).end < span(b).start`` violated), else ``None``.
+        backward after per-tensor span-promotion, else ``None``.
 
-        A ``COVER`` edge ``L -> moved_leaf_nid`` is SKIPPED when ``L`` is in
-        ``skip_cover_loops`` — the move re-binds the moved block's covered dim to
-        ``L``, dissolving the full-extent coverage that froze the edge. Only COVER
-        edges are skippable; RAW/WAW/WAR/CARRY are real hazards and always checked.
+        Each edge carries the ``tensor`` its two leaves conflict on. Before the
+        ``span(a).end < span(b).start`` test, each endpoint's span is promoted to
+        any enclosing loop across which its access to that tensor is invariant and
+        the tensor is carried (a live-across accumulator). ``enclosing_loops(nid)``
+        returns the ForNode ancestor nids of an endpoint at its evaluated position
+        — for the moved leaf under an insertion query, the TARGET's ancestors.
         """
         result: tuple[int, int] | None = None
         for a, b, attrs in self.graph.edges(data=True):
             if a != moved_leaf_nid and b != moved_leaf_nid:
                 continue
-            if attrs.get("kind") == "COVER" and b == moved_leaf_nid and a in skip_cover_loops:
+            tensor = attrs.get("tensor")
+            if tensor is None:
                 continue
-            if not (span(a)[1] < span(b)[0]):
+            span_a = _promoted_span(span(a), a, tensor, eval_tree, enclosing_loops(a), span)
+            span_b = _promoted_span(span(b), b, tensor, eval_tree, enclosing_loops(b), span)
+            if not (span_a[1] < span_b[0]):
                 result = (a, b)
                 break
         return result
@@ -273,60 +298,7 @@ class Dependency:
                 prior_readers.pop(name, None)
             for name in info.reads - info.writes:
                 prior_readers.setdefault(name, []).append(leaf_nid)
-        self._add_carry_edges(tree)
 
-    def _add_carry_edges(self, tree: KernelTree) -> None:
-        """For each leaf with carry loops, add producer->loop and loop->consumer edges.
-
-        A buffer carried across a non-PARALLEL loop ``L`` must be fully
-        produced before ``L`` (init dominates) and only consumed after ``L``
-        (drain post-dominates). Producers/consumers of the carried buffer are
-        the graph's existing writers/readers of that tensor (``touches_by_tensor``
-        filtered by write/read side). The reducer leaf itself is exempt.
-        """
-        for leaf_nid in list(self.graph.nodes):
-            carries = _carry_loops_of_leaf(tree, leaf_nid)
-            for loop_nid, tensor in carries.items():
-                self.graph.add_node(loop_nid)
-                for other in self.touches_by_tensor.get(tensor, ()):
-                    if other == leaf_nid:
-                        continue
-                    info = self.graph.nodes[other]["info"]
-                    if tensor in info.writes:
-                        self.graph.add_edge(other, loop_nid, kind="CARRY")
-                    if tensor in info.reads and tensor not in info.writes:
-                        self.graph.add_edge(loop_nid, other, kind="CARRY")
-        self._add_coverage_edges(tree)
-
-    def _add_coverage_edges(self, tree: KernelTree) -> None:
-        """Add ``L -> consumer`` edges when a consumer reads a buffer region wider
-        than a producer writes per iteration of an enclosing loop ``L``.
-
-        A producer leaf ``P`` may write a buffer ``B`` tiled by an enclosing loop
-        ``L`` — each ``L`` iteration writes a distinct slice (``P``'s write offset
-        on some axis varies with ``L``'s loop var). A consumer ``C`` that reads
-        ``B`` over an extent NOT indexed by ``L`` needs EVERY ``L`` iteration's
-        slice, so it must execute after ``L`` completes — outside it. Without this
-        edge a move could place ``C`` inside ``L`` (reading only the current
-        iteration's slice, the rest stale): the flow edge ``P -> C`` alone is
-        satisfied per-iteration yet ``C`` reads data not yet produced. This is the
-        region-coverage analogue of the reduction carry edge, gated on the WRITE
-        being loop-tiled and the READ not — independent of ``L``'s role.
-        """
-        for producer in list(self.graph.nodes):
-            if not isinstance(tree.data(producer), ISANode):
-                continue
-            for loop_nid, tensor in _tiled_write_loops_of_leaf(tree, producer).items():
-                self.graph.add_node(loop_nid)
-                loop_var = tree.data(loop_nid).loop_var
-                for consumer in self.touches_by_tensor.get(tensor, ()):
-                    if consumer == producer:
-                        continue
-                    cinfo = self.graph.nodes[consumer]["info"]
-                    if tensor not in cinfo.reads or tensor in cinfo.writes:
-                        continue
-                    if _reads_independently_of_loop(cinfo, tensor, loop_var):
-                        self.graph.add_edge(loop_nid, consumer, kind="COVER")
 
     @staticmethod
     def _leaves_in_execution_order(tree: KernelTree) -> list[tuple[int, int]]:
@@ -396,16 +368,26 @@ class Dependency:
         return tuple(r for r in side if r.tensor == tensor)
 
     def _try_edge(self, producer: int | None, consumer: int, kind: str, tensor: str) -> None:
-        """Insert a hazard edge, skipping self-loops and missing producers."""
+        """Insert a hazard edge, skipping self-loops and missing producers.
+
+        The edge records both the hazard ``kind`` and the ``tensor`` the two
+        leaves conflict on. Span-promotion reads ``tensor`` to decide, per edge,
+        whether the shared buffer is carried across an enclosing loop.
+        """
+        result: None = None
         if producer is None or producer == consumer:
-            return
-        if self._provably_disjoint(producer, consumer, tensor, kind):
-            return
-        if self.graph.has_edge(producer, consumer):
-            current = self.graph.edges[producer, consumer]["kind"]
-            if _HAZARD_PRIORITY[kind] <= _HAZARD_PRIORITY[current]:
-                return
-        self.graph.add_edge(producer, consumer, kind=kind)
+            result = None
+        elif self._provably_disjoint(producer, consumer, tensor, kind):
+            result = None
+        else:
+            keep = True
+            if self.graph.has_edge(producer, consumer):
+                current = self.graph.edges[producer, consumer]["kind"]
+                if _HAZARD_PRIORITY[kind] <= _HAZARD_PRIORITY[current]:
+                    keep = False
+            if keep:
+                self.graph.add_edge(producer, consumer, kind=kind, tensor=tensor)
+        return result
 
     def _provably_disjoint(self, producer: int, consumer: int, tensor: str, kind: str) -> bool:
         """True iff every producer-region/consumer-region pair on ``tensor`` is disjoint.
@@ -431,139 +413,121 @@ class Dependency:
         return True
 
 
-def _enclosing_block_nid(tree: KernelTree, nid: int) -> int:
-    """Return the nearest BlockNode ancestor of ``nid``."""
-    result: int | None = None
-    for anc in reversed(tree.ancestors(nid)):
-        if isinstance(tree.data(anc), BlockNode):
-            result = anc
-            break
-    if result is None:
-        raise ValueError(f"no enclosing BlockNode for {nid}")
-    return result
 
 
-def _loopvar_to_axis(block: BlockNode) -> dict[str, str]:
-    """Map each loop_var bound by the block to its concrete iter-var axis (via iter_values affine)."""
-    out: dict[str, str] = {}
-    for iv, value in zip(block.iter_vars, block.iter_values):
-        for name in to_affine(value):
-            if name is not None:
-                out[name] = iv.axis
-    return out
+def _leaf_operand_regions(
+    tree: KernelTree, leaf_nid: int, tensor: str, rmw_only: bool
+) -> list[BufferRegion]:
+    """Regions of ``tensor`` bound by ``leaf_nid``'s operands.
 
-
-def _carry_loops_of_leaf(tree: KernelTree, leaf_nid: int) -> dict[int, str]:
-    """Map each enclosing non-PARALLEL loop of ``leaf_nid`` to the buffer it carries.
-
-    A loop carries state when its bound axis has SEQUENTIAL or ACCUMULATION
-    role for the leaf's enclosing block. The carried buffer is the leaf's
-    RMW operand (read-modified-written — the ONLY operand that can carry state
-    across iterations; a pure INPUT is merely re-read, a pure output is written
-    fresh) whose ``OPERAND_AXES`` tuple omits that loop's axis (so the value is
-    nominally live across the loop) AND whose region offset does NOT depend on
-    the loop var. The ``RMW_OPERANDS`` gate is what lets the two-stage rfactor
-    fold ``tensor_tensor(data1=out, data2=sbuf_rfactor, dst=out)`` carry only its
-    RMW accumulator ``out`` (``data1``/``dst``) and NOT the ko-invariant SBUF
-    staging input ``data2`` — both omit the ``ko`` axis and are addressed
-    loop-invariantly, so without the RMW gate the loop would ambiguously carry
-    two distinct tensors. The region test then distinguishes a genuinely carried
-    buffer (constant address across the loop — matmul's ``psum`` accumulator,
-    tensor_tensor's ``out`` RMW slot) from one that is SWEPT (a distinct
-    slice per iteration — the multi-slot rfactor wb-block reads ``B_rf[ko-slot]``,
-    whose partition offset varies with the reduction loop var): a swept operand
-    is re-addressed each iteration, so it is not carried. This assumes a genuinely carried buffer is addressed
-    loop-invariantly on the NON-PARALLEL loop that carries it; the region test is
-    NOT a general "loop-var-in-offset => swept" rule across all roles. It is
-    consistent with the PARALLEL role gate above (``role_of(...) == PARALLEL``
-    ``continue``): a loop flipped to PARALLEL (e.g. an RFactor rf-block ``psum``
-    slot axis, whose dst offset DOES contain the loop var) is skipped before
-    reaching this region test, so a PARALLEL-indexed slot never arrives here.
-    Operands naming the same carried tensor in multiple slots (an RMW
-    op's ``data1``/``dst`` alias) collapse to one; only DISTINCT carried tensors
-    on one loop are ambiguous. Loops whose axis is PARALLEL, or which carry no
-    such operand, are skipped.
+    With ``rmw_only`` True, only ``RMW_OPERANDS`` slots are considered — the
+    read-modify-written accumulators (matmul ``dst``, tensor_tensor ``data1``)
+    that can carry a value across a loop.
     """
     data = tree.data(leaf_nid)
-    assert isinstance(data, ISANode)
-    block_nid = _enclosing_block_nid(tree, leaf_nid)
-    block = tree.data(block_nid)
-    assert isinstance(block, BlockNode)
-    lv_to_axis = _loopvar_to_axis(block)
-    inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
-    op_axes = data.op_cls.OPERAND_AXES
-    out: dict[int, str] = {}
-    for anc in tree.ancestors(leaf_nid):
-        anc_data = tree.data(anc)
-        if not isinstance(anc_data, ForNode):
-            continue
-        concrete = lv_to_axis.get(anc_data.loop_var)
-        if concrete is None:
-            continue
-        if role_of(block, concrete) == AxisRole.PARALLEL:
-            continue
-        abstract = inverse_axis_map.get(concrete)
-        loop_var = anc_data.loop_var
-        carried: set[str] = set()
-        for slot, axes in op_axes.items():
-            if abstract is None or abstract in axes or slot not in data.operand_bindings:
-                continue
-            if slot not in data.op_cls.RMW_OPERANDS:
-                continue
-            region = data.operand_bindings[slot]
-            if any(loop_var in to_affine(lo) for lo, _w in region.ranges):
-                continue
-            carried.add(region.tensor)
-        if len(carried) > 1:
-            raise ValueError(f"loop {anc} carries multiple operands ({sorted(carried)}); ambiguous carried buffer")
-        if carried:
-            out[anc] = next(iter(carried))
-    return out
+    regions: list[BufferRegion] = []
+    if isinstance(data, ISANode):
+        slots = data.op_cls.RMW_OPERANDS if rmw_only else data.operand_bindings.keys()
+        for slot in slots:
+            region = data.operand_bindings.get(slot)
+            if region is not None and region.tensor == tensor:
+                regions.append(region)
+    return regions
 
 
-def _tiled_write_loops_of_leaf(tree: KernelTree, leaf_nid: int) -> dict[int, str]:
-    """Map each enclosing loop of ``leaf_nid`` to a buffer it WRITES tiled by that loop.
+def _access_invariant_across(tree: KernelTree, leaf_nid: int, loop_var: str, tensor: str) -> bool:
+    """True iff ``leaf_nid``'s access to ``tensor`` does NOT depend on ``loop_var``.
 
-    A loop ``L`` tiles a write when the leaf's enclosing block writes a buffer
-    whose region offset (on some axis) depends on ``L``'s loop var — i.e. each
-    ``L`` iteration writes a distinct slice. Returns ``{loop_nid: tensor}``. A
-    loop tiling writes of more than one buffer keeps the first (only used to add
-    a per-consumer domination edge, which is added per tensor anyway).
+    Invariant means ``loop_var`` appears in no axis offset (``lo``) of any operand
+    region naming ``tensor`` — so every iteration of the loop touches the same
+    slice (a live-across / replicated access). A leaf that touches no such region
+    is NOT invariant (there is no access to be invariant about).
     """
-    data = tree.data(leaf_nid)
-    assert isinstance(data, ISANode)
-    block_nid = _enclosing_block_nid(tree, leaf_nid)
-    block = tree.data(block_nid)
-    assert isinstance(block, BlockNode)
-    out: dict[int, str] = {}
-    for anc in tree.ancestors(leaf_nid):
-        anc_data = tree.data(anc)
-        if not isinstance(anc_data, ForNode):
-            continue
-        loop_var = anc_data.loop_var
-        for region in block.writes:
-            if any(loop_var in to_affine(lo) for lo, _w in region.ranges):
-                out[anc] = region.tensor
-                break
-    return out
-
-
-def _reads_independently_of_loop(info: _BlockInfo, tensor: str, loop_var: str) -> bool:
-    """True iff the block reads ``tensor`` with NO axis offset depending on ``loop_var``.
-
-    Such a read spans the buffer's full extent on the loop's axis regardless of
-    the loop — so if a producer writes that axis tiled by the loop, the read
-    needs every iteration's slice and must sit outside the loop. A read whose
-    offset DOES depend on ``loop_var`` tracks the producer per iteration and is
-    fine.
-    """
-    regions = [r for r in info.read_regions if r.tensor == tensor]
-    independent = bool(regions)
+    regions = _leaf_operand_regions(tree, leaf_nid, tensor, rmw_only=False)
+    invariant = bool(regions)
     for region in regions:
         if any(loop_var in to_affine(lo) for lo, _w in region.ranges):
-            independent = False
+            invariant = False
             break
-    return independent
+    return invariant
+
+
+def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool:
+    """True iff ``tensor`` is accumulated (live-carried) across ``loop_nid``.
+
+    Two conditions. (1) Some ISA leaf inside the loop RMWs ``tensor`` invariantly
+    across it — an accumulator whose slice is the same every iteration. (2) NO
+    plain-write init of ``tensor`` is invariant across the loop and enclosed by
+    it: such a write (e.g. a memset on a non-``RMW_OPERANDS`` slot) re-establishes
+    the accumulator every iteration, so the loop RE-INITIALIZES rather than
+    carries. Post-RFactor the matmul's psum rmw is invariant across BOTH ko and
+    ki, but the per-ko memset sits inside ko and re-zeros it — so ko is a re-init
+    loop (not carried) while ki (no enclosed init) is the true accumulation carry.
+    A leaf that itself RMWs the tensor is its accumulator store-back (e.g. the
+    fold's ``dst`` aliasing ``data1``), NOT a re-init — only a SEPARATE plain-write
+    leaf (a memset) re-initializes. This is role-blind: it reads regions +
+    ``RMW_OPERANDS`` only, never the axis role (RFactor flips ko/ki to PARALLEL
+    yet psum still carries across ki).
+    """
+    loop = tree.data(loop_nid)
+    assert isinstance(loop, ForNode), f"_tensor_carried_across: {loop_nid} is not a ForNode"
+    loop_var = loop.loop_var
+    has_invariant_rmw = False
+    has_enclosed_init = False
+    for nid in tree.descendants(loop_nid):
+        data = tree.data(nid)
+        if not isinstance(data, ISANode):
+            continue
+        rmw_regions = _leaf_operand_regions(tree, nid, tensor, rmw_only=True)
+        if rmw_regions and not any(
+            loop_var in to_affine(lo) for region in rmw_regions for lo, _w in region.ranges
+        ):
+            has_invariant_rmw = True
+        if rmw_regions:
+            continue
+        for slot, region in data.operand_bindings.items():
+            if region.tensor != tensor:
+                continue
+            if slot in data.op_cls.RMW_OPERANDS:
+                continue
+            if slot in getattr(data.op_cls, "INPUT_OPERANDS", frozenset()):
+                continue
+            if not any(loop_var in to_affine(lo) for lo, _w in region.ranges):
+                has_enclosed_init = True
+    return has_invariant_rmw and not has_enclosed_init
+
+
+def _promoted_span(
+    base: tuple[float, float],
+    endpoint_nid: int,
+    tensor: str,
+    eval_tree: KernelTree,
+    enclosing_loops: list[int],
+    span_of_loop: Callable[[int], tuple[float, float]],
+) -> tuple[float, float]:
+    """Widen ``base`` to any enclosing loop across which ``endpoint_nid``'s access
+    to ``tensor`` is invariant and ``tensor`` is carried.
+
+    A carried, loop-invariant access is live across the whole loop, so its
+    effective span is the loop's span, not the leaf point. Promoting BOTH
+    endpoints of a carried edge is what turns "memset lexically first inside K"
+    into a backward edge (memset.end == K.end is not < matmul.start inside K).
+    """
+    lo, hi = base
+    for loop_nid in enclosing_loops:
+        loop = eval_tree.data(loop_nid)
+        if not isinstance(loop, ForNode):
+            continue
+        if not _access_invariant_across(eval_tree, endpoint_nid, loop.loop_var, tensor):
+            continue
+        if not _tensor_carried_across(eval_tree, loop_nid, tensor):
+            continue
+        l_lo, l_hi = span_of_loop(loop_nid)
+        lo = min(lo, l_lo)
+        hi = max(hi, l_hi)
+    return (lo, hi)
+
+
 
 
 def _block_name(block: BlockNode) -> str:

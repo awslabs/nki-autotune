@@ -198,7 +198,7 @@ def _dim_loops(tree: KernelTree, block_nid: int, block: BlockNode) -> dict[str, 
     """Map each concrete dim to its driving loops as ``(loop_var, extent)`` outer-to-inner.
 
     A dim's loop list is the block's ENCLOSING ForNodes on that dim (the loops
-    a ComputeAt move nested the block under — outer) followed by the block's
+    a CodeMotion move nested the block under — outer) followed by the block's
     own surviving dense loops on that dim (inner). For a top-level block the
     enclosing list is empty, so the result is exactly the block-local loops as
     before.

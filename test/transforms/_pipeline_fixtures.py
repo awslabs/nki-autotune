@@ -16,12 +16,11 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.transforms import (
-    ComputeAt,
-    ComputeAtOption,
+    CodeMotion,
+    CodeMotionOption,
     Fuse,
     Reorder,
     ReorderOption,
-    ReverseComputeAt,
     SoftwarePipeline,
     SoftwarePipelineOption,
     Split,
@@ -45,13 +44,13 @@ def f_nkigym(lhs_T, rhs):
 """The tuned transform sequence (one ``(transform, option)`` atom per rung) that
 the pipeline + body tests replay. Axes ``d0=K``, ``d1=M``, ``d2=N``; literal nids
 are stable from the deterministic ``build_initial_ir``. Two Reorders rotate the
-matmul nest ``K>M>N`` -> ``M>N>K``, two ComputeAts sink the PSUM memset + drain
+matmul nest ``K>M>N`` -> ``M>N>K``, two CodeMotions sink the PSUM memset + drain
 under the M loop, and the final SoftwarePipeline double-buffers the accumulator."""
 TRACE: list[tuple[object, object]] = [
     (Reorder(), ReorderOption(outer_nid=11, inner_nid=12)),
     (Reorder(), ReorderOption(outer_nid=12, inner_nid=13)),
-    (ComputeAt(), ComputeAtOption(block_nid=7, target_loop_nid=11, index=0)),
-    (ComputeAt(), ComputeAtOption(block_nid=15, target_loop_nid=11, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=11, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=15, target_loop_nid=11, index=2)),
     (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=11, stages=(0, 0, 1), order=(0, 1, 2))),
 ]
 
@@ -66,7 +65,7 @@ def tuned_ir() -> KernelIR:
     do). Skipping SoftwarePipeline atoms keeps this fixture the un-pipelined
     state regardless of future TRACE additions.
     """
-    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), ComputeAt(), ReverseComputeAt()])
+    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), CodeMotion()])
     state = env.reset()
     for transform, option in TRACE:
         if isinstance(transform, SoftwarePipeline):

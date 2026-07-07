@@ -131,12 +131,10 @@ def build_ladder_state(n: int) -> KernelIR:
     """
     from nkigym.ir.tree import ISANode
     from nkigym.transforms import (  # noqa: F401
-        ComputeAt,
-        ComputeAtOption,
+        CodeMotion,
+        CodeMotionOption,
         Reorder,
         ReorderOption,
-        ReverseComputeAt,
-        ReverseComputeAtOption,
         Split,
         SplitOption,
     )
@@ -169,10 +167,10 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_0_1)
 
     def rung_1_2(ir):
-        """1->2: ComputeAt load_lhsT block under matmul d1 loop (cover d0,d1)."""
+        """1->2: CodeMotion load_lhsT block under matmul d1 loop (cover d0,d1)."""
         load = load_blk(ir, "lhs_T")
         d1 = mm_loop(ir, "i_d1_0")
-        return ComputeAt().apply(ir, ComputeAtOption(block_nid=load, target_loop_nid=d1, index=-2))
+        return CodeMotion().apply(ir, CodeMotionOption(block_nid=load, target_loop_nid=d1, index=-2))
 
     rungs.append(rung_1_2)
 
@@ -184,10 +182,10 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_2_3)
 
     def rung_3_4(ir):
-        """3->4: ComputeAt load_rhs block under matmul d2 loop (cover d0,d2)."""
+        """3->4: CodeMotion load_rhs block under matmul d2 loop (cover d0,d2)."""
         rhs = load_blk(ir, "rhs")
         d2 = mm_loop(ir, "i_d2_0")
-        return ComputeAt().apply(ir, ComputeAtOption(block_nid=rhs, target_loop_nid=d2, index=0))
+        return CodeMotion().apply(ir, CodeMotionOption(block_nid=rhs, target_loop_nid=d2, index=0))
 
     rungs.append(rung_3_4)
 
@@ -207,19 +205,19 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_5_6)
 
     def rung_6_7(ir):
-        """6->7: ComputeAt memset block under matmul d1 loop (cover d1; d2 residual)."""
+        """6->7: CodeMotion memset block under matmul d1 loop (cover d1; d2 residual)."""
         ms = blk(ir, "NKIMemset")
         d1 = mm_loop(ir, "i_d1_0")
-        return ComputeAt().apply(ir, ComputeAtOption(block_nid=ms, target_loop_nid=d1, index=0))
+        return CodeMotion().apply(ir, CodeMotionOption(block_nid=ms, target_loop_nid=d1, index=0))
 
     rungs.append(rung_6_7)
 
     def rung_7_8(ir):
-        """7->8: ComputeAt x2 — sink load_lhsT then load_rhs under matmul inner d2 loop."""
+        """7->8: CodeMotion x2 — sink load_lhsT then load_rhs under matmul inner d2 loop."""
         lhs = load_blk(ir, "lhs_T")
-        ir = ComputeAt().apply(ir, ComputeAtOption(block_nid=lhs, target_loop_nid=mm_loop(ir, "i_d2_0"), index=0))
+        ir = CodeMotion().apply(ir, CodeMotionOption(block_nid=lhs, target_loop_nid=mm_loop(ir, "i_d2_0"), index=0))
         rhs = load_blk(ir, "rhs")
-        ir = ComputeAt().apply(ir, ComputeAtOption(block_nid=rhs, target_loop_nid=mm_loop(ir, "i_d2_0"), index=1))
+        ir = CodeMotion().apply(ir, CodeMotionOption(block_nid=rhs, target_loop_nid=mm_loop(ir, "i_d2_0"), index=1))
         return ir
 
     rungs.append(rung_7_8)
@@ -233,10 +231,10 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_8_9)
 
     def rung_9_10(ir):
-        """9->10: ComputeAt memset block under matmul d2 loop (cover d2)."""
+        """9->10: CodeMotion memset block under matmul d2 loop (cover d2)."""
         ms = blk(ir, "NKIMemset")
         d2 = mm_loop(ir, "i_d2_0")
-        return ComputeAt().apply(ir, ComputeAtOption(block_nid=ms, target_loop_nid=d2, index=0))
+        return CodeMotion().apply(ir, CodeMotionOption(block_nid=ms, target_loop_nid=d2, index=0))
 
     rungs.append(rung_9_10)
 
@@ -248,10 +246,10 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_10_11)
 
     def rung_11_12(ir):
-        """11->12: ReverseComputeAt tensor_copy block under matmul d2 loop (PSUM hoist)."""
+        """11->12: CodeMotion tensor_copy block under matmul d2 loop (PSUM hoist)."""
         tc = blk(ir, "NKITensorCopy")
         d2 = mm_loop(ir, "i_d2_0")
-        return ReverseComputeAt().apply(ir, ReverseComputeAtOption(block_nid=tc, target_loop_nid=d2, index=-1))
+        return CodeMotion().apply(ir, CodeMotionOption(block_nid=tc, target_loop_nid=d2, index=-1))
 
     rungs.append(rung_11_12)
 
@@ -263,10 +261,10 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_12_13)
 
     def rung_13_14(ir):
-        """13->14: ReverseComputeAt store block under tensor_copy d2 loop."""
+        """13->14: CodeMotion store block under tensor_copy d2 loop."""
         st = blk(ir, "NKIStore")
         d2 = tc_loop(ir, "i_d2_0")
-        return ReverseComputeAt().apply(ir, ReverseComputeAtOption(block_nid=st, target_loop_nid=d2, index=-1))
+        return CodeMotion().apply(ir, CodeMotionOption(block_nid=st, target_loop_nid=d2, index=-1))
 
     rungs.append(rung_13_14)
     if n > len(rungs):

@@ -20,7 +20,7 @@
 - **Modern type hints** (`list`/`dict`/`X | None`), Google/NumPy docstrings on every function.
 - **Tests run on gym-1, not locally.** The dev box has no Neuron env. Run via:
   `transport/ssh_host.sh --host gym-1 --cmd "python -m pytest <files>" --cache /home/weittang/workplace/cache/<name>`
-  `ssh_host.sh` sets `PYTHONPATH=.:nkigym/src:autotune/src`, requires `--cache` even for pytest, and `--cmd` needs a `.py` token (enumerate test files; a bare `test/` dir is rejected).
+  `ssh_host.sh` sets `PYTHONPATH=.:nkigym/src:autotune/src`, requires `--cache` even for pytest, and `--cmd` needs a `.py` token (enumerate test files; a bare `test/` dir is rejected). **To select a single test, use `-k <substring>` (the `path::node-id` form has no `.py` token and is rejected); e.g. `python -m pytest test/ir/test_dependency.py -k hazard_edges_record -v`.**
 - **Pre-existing failing set is 7** (transform-legality/code-motion, e.g. `target_loop_nid not in tree`), identical at the parent commit. Verify any "new" failure against the parent before treating it as a regression.
 - **Byte-exact ladder gate:** `k0…k27` in `examples/manual_transforms.py` must CPU-sim clean, and `examples/kernel_transforms.py` must rebuild the transform-driven ladder. A wrong intermediate rung means the check mis-verdicted — fix the check, not the ladder.
 - **Commit frequently**, ending messages with the Co-Authored-By trailer for Claude Opus 4.8 (1M context).
@@ -406,7 +406,9 @@ Rewrite `_first_backward` to read the edge tensor and promote each endpoint:
         for a, b, attrs in self.graph.edges(data=True):
             if a != moved_leaf_nid and b != moved_leaf_nid:
                 continue
-            tensor = attrs["tensor"]
+            tensor = attrs.get("tensor")
+            if tensor is None:
+                continue
             span_a = _promoted_span(span(a), a, tensor, eval_tree, enclosing_loops(a), span)
             span_b = _promoted_span(span(b), b, tensor, eval_tree, enclosing_loops(b), span)
             if not (span_a[1] < span_b[0]):
@@ -414,6 +416,8 @@ Rewrite `_first_backward` to read the edge tensor and promote each endpoint:
                 break
         return result
 ```
+
+**Why `attrs.get("tensor")` + skip-if-None:** CARRY/COVER edges (still built in `_build` until Task 6) have no `tensor` attr and route through loop-nid endpoints, not real accesses — promotion does not apply to them, so skip them. RAW/WAW/WAR edges all carry `tensor` (Task 1). After Task 6 there are no tensor-less edges, but the guard stays harmless. This is why the memset-into-K reject in this task's test comes from PROMOTION on the RAW `memset→matmul` edge, not from the soon-to-be-deleted CARRY edge.
 
 Update the `first_backward_edge` caller (91-124) to pass `eval_tree` and an `enclosing_loops` reading `eval_tree.ancestors`:
 
@@ -438,15 +442,7 @@ Remove the `skip_cover_loops` parameter from `first_backward_edge`'s signature a
 - [ ] **Step 4: Run the memset test + full dependency suite**
 
 Run: `transport/ssh_host.sh --host gym-1 --cmd "python -m pytest test/ir/test_dependency.py -v" --cache /home/weittang/workplace/cache/span3`
-Expected: PASS for the new test and no NEW failures vs the pre-existing set. If a CARRY loop-nid endpoint has no `tensor` attr (CARRY edges are added without one), the edge walk hits `attrs["tensor"]` KeyError — fix by having Task 3 read `attrs.get("tensor")` and `continue` when absent (a CARRY/COVER edge is not a real-access edge; promotion does not apply to it). Add that guard:
-
-```python
-            tensor = attrs.get("tensor")
-            if tensor is None:
-                continue
-```
-
-(This makes Task 3 robust while CARRY/COVER still exist; after Task 6 there are no tensor-less edges, but the guard is harmless.)
+Expected: PASS for the new test and no NEW failures vs the pre-existing set. (The `attrs.get("tensor")` guard in Step 3 already handles the tensor-less CARRY/COVER edges that still exist at this point, so the edge walk does not KeyError.)
 
 - [ ] **Step 5: Commit**
 
@@ -622,12 +618,61 @@ Drop the `is_reverse` parameter here (it was unused). Update both call sites in 
 
 In `_check_same_loop_prefix` remove line 159 (`_check_no_reduction_axis_covered(...)`). Keep `_check_no_reduction_replicated` (line 160). The function still returns `target_seq`.
 
-- [ ] **Step 4: Run the four pinned verdicts + ladder-shaped tests**
+- [ ] **Step 4: Delete the stale-nid verdict tests; write fresh op-based ones**
 
-Run: `transport/ssh_host.sh --host gym-1 --cmd "python -m pytest test/transforms/test_code_motion.py test/transforms/test_compute_at.py test/transforms/test_reverse_compute_at.py -v" --cache /home/weittang/workplace/cache/span5`
-Expected: all four pinned verdicts PASS. **If `test_compute_at_rejects_covering_matmul_reduction_axis` fails on the `match=` regex** (its regex is `"reduction axis|realizable|reorder"`, and the deleted guard emitted "reduction axis"), confirm the rejection now arrives via the backward-edge message ("reorders dependency edge") which matches `reorder`. If the prefix message fires instead ("Split / Reorder", capital R — `re.search` is case-sensitive, no match), update the test's `match=` to include the surviving message (a preserve-the-verdict rewrite): `match="reduction axis|realizable|reorder|not a prefix"`. Record the actual failing message from the run before editing.
+CONTROLLER FINDING (verified on gym-1, worktree at base `e7ff491`): 4 of 6 tests in
+`test/transforms/test_code_motion.py` ALREADY FAIL at base — `test_sunk_block_residual_loop_does_not_shadow_enclosing_name`, `test_compute_at_rejects_covering_matmul_reduction_axis`, `test_compute_at_rejects_replicating_reduction_over_untiled_output_dim`, `test_compute_at_memset_sink_across_block_wall_sims_correct` — because they hardcode literal nids in `KernelMDP` traces that have DRIFTED (`target_loop_nid=23 not in tree`). These are pre-existing failures, unrelated to span-promotion. Per the user's direction: **DELETE these 4 stale-nid tests and write FRESH tests for the new span-promotion path** using robust op-based lookups (no hardcoded nids), mirroring the passing tests in `test_ir/test_dependency.py`.
 
-- [ ] **Step 5: Run the full ladder CPU-sim on gym-1**
+Delete the 4 stale tests from `test_code_motion.py`. KEEP the 2 passing tests (`test_move_lifts_tensor_copy_under_matmul_inner_loop`, `test_reverse_compute_at_allows_fold_covering_its_own_ko`). Add fresh verdict tests using `_block_for_op` (already in the file) + `ir.dependency.first_backward_edge_for_insertion` on the PRE-move `ir` (production path, no `_move`, no hardcoded nid). Controller-verified pattern (memset-into-K reject returns `(9, 14)` non-None):
+
+```python
+def test_span_promotion_rejects_memset_sunk_into_matmul_kloop():
+    """Init-domination: sinking the psum memset INTO the matmul's K loop is
+    rejected — psum_prod is carried across K, span-promotion widens both to
+    K-span so the init can no longer precede the accumulation. Verdict via the
+    production insertion query on the pre-move tree (no hardcoded nids)."""
+    from test.transforms._fixtures import build_canonical_ir
+    from nkigym.ir.tree import ForNode, ISANode
+
+    ir = build_canonical_ir()
+    memset_blk = _block_for_op(ir, "NKIMemset")
+    matmul_blk = _block_for_op(ir, "NKIMatmul")
+    matmul_leaf = next(d for d in ir.tree.preorder(matmul_blk) if isinstance(ir.tree.data(d), ISANode))
+    kloop = next(
+        a for a in ir.tree.ancestors(matmul_leaf)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+    )
+    moved_leaf = ir.dependency._resolve(memset_blk)
+    assert ir.dependency.first_backward_edge_for_insertion(moved_leaf, kloop, 0) is not None
+
+
+def test_span_promotion_allows_memset_before_matmul_kloop():
+    """The legal placement (memset OUTSIDE K, at the top of the matmul nest) is
+    allowed — memset is not enclosed by K, so no promotion, and it precedes the
+    accumulation. index=-2 (prepend, before child 0) puts it before the K loop."""
+    from test.transforms._fixtures import build_canonical_ir
+    from nkigym.ir.tree import ForNode, ISANode
+
+    ir = build_canonical_ir()
+    memset_blk = _block_for_op(ir, "NKIMemset")
+    matmul_blk = _block_for_op(ir, "NKIMatmul")
+    matmul_leaf = next(d for d in ir.tree.preorder(matmul_blk) if isinstance(ir.tree.data(d), ISANode))
+    kloop = next(
+        a for a in ir.tree.ancestors(matmul_leaf)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+    )
+    moved_leaf = ir.dependency._resolve(memset_blk)
+    assert ir.dependency.first_backward_edge_for_insertion(moved_leaf, kloop, -2) is None
+```
+
+The **replication reject** verdict (`_check_no_reduction_replicated`, a structural guard KEPT by this plan) and the **memset-sink-sims-correct** and **loop-var-shadow** verdicts are best re-established as part of the full-ladder validation (Step 5) rather than brittle standalone traces — the ladder exercises the real co-location moves and CPU-sims them. If a compact standalone reject test for `_check_no_reduction_replicated` is cheap to author with op-based lookups, add one; otherwise rely on the ladder. The controller will confirm the ladder covers the replication path.
+
+**Do NOT** re-add hardcoded-nid `KernelMDP` traces. Every new test uses `_block_for_op` / op-name / loop_var lookups so it survives nid drift.
+
+Run: `transport/ssh_host.sh --host gym-1 --cmd "python -m pytest test/transforms/test_code_motion.py -v" --cache /home/weittang/workplace/cache/span5`
+Expected: the 2 kept tests + the fresh verdict tests PASS; the 4 stale tests are GONE (not failing).
+
+- [ ] **Step 5: Run the full ladder CPU-sim on gym-1 (the real gate)**
 
 Run: `transport/ssh_host.sh --host gym-1 --cmd "python examples/kernel_transforms.py" --cache /home/weittang/workplace/cache/ladder5`
 Expected: every rung CPU-sim PASS (max_abs ~1e-4). This proves span-promotion admits every legal ladder move and the byte-exact structure is unchanged.
@@ -643,8 +688,9 @@ git commit -m "CodeMotion: legality via span-promotion only (drop skip_cover_loo
 
 _check_move_preserves_dependencies no longer builds a cover-skip set;
 _check_same_loop_prefix no longer calls _check_no_reduction_axis_covered.
-Reduction-init domination + coverage now come from span-promotion. Four pinned
-verdicts + full ladder green on gym-1.
+Reduction-init domination + coverage now come from span-promotion. Deleted 4
+stale-hardcoded-nid verdict tests (failing at base); wrote fresh op-based
+span-promotion verdict tests. Full ladder CPU-sim green on gym-1.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```

@@ -61,7 +61,7 @@ class Reorder(Transform):
         matches their dense ordinal (the physically-outer loop may now be named
         ``i_d0_1`` while ``i_d0_0`` sits inside it). The enclosing block keeps its
         pre-swap tile-linearization binding, so a LATER transform that
-        renormalizes a co-located block (e.g. ComputeAt sinking a load) recomputes
+        renormalizes a co-located block (e.g. CodeMotion sinking a load) recomputes
         that block's stride from physical order and disagrees with this block on
         which tile is which -> wrong offset / OOB. Re-normalizing the swapped
         loops' enclosing block (and its nested sub-blocks) here re-derives names +

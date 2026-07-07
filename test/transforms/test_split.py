@@ -112,14 +112,14 @@ def test_split_rejects_factor_product_mismatch():
 
 
 def test_split_rejects_outer_trip_on_shared_post_computeat_loop():
-    """Outer-trip Split of a loop a prior ComputeAt made shared across two blocks
+    """Outer-trip Split of a loop a prior CodeMotion made shared across two blocks
     is rejected (would rewrite only the enclosing block, leaving the nested
     sibling's index stale -> sim OOB / wrong accumulation).
 
     ``build_ladder_state(2)`` sinks the lhs_T load under the matmul's loop nest,
     so loop ``i_d0_0`` (the matmul K loop) now encloses both the matmul leaf and
     the nested load leaf. Splitting it must raise, and ``analyze`` must not offer
-    it. The legal route is to Split the per-op loop BEFORE the ComputeAt.
+    it. The legal route is to Split the per-op loop BEFORE the CodeMotion.
     """
     from test.transforms._fixtures import build_ladder_state
 

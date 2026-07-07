@@ -1,11 +1,11 @@
-"""Tests for nkigym.transforms._code_motion._move (structural move)."""
+"""Tests for nkigym.transforms.code_motion._move (structural move)."""
 
 from __future__ import annotations
 
 from test.transforms._fixtures import build_canonical_ir
 
 from nkigym.ir.tree import ISANode
-from nkigym.transforms._code_motion import _move
+from nkigym.transforms.code_motion import _move
 
 
 def _block_for_op(ir, op_name: str) -> int:
@@ -27,129 +27,8 @@ def test_move_lifts_tensor_copy_under_matmul_inner_loop():
     tc = _block_for_op(ir, "NKITensorCopy")
     mm = _block_for_op(ir, "NKIMatmul")
     target = _innermost_for(ir, mm)
-    _move(ir, block_nid=tc, target_loop_nid=target, index=-1, is_reverse=True)
+    _move(ir, block_nid=tc, target_loop_nid=target, index=-1)
     assert tc in ir.tree.descendants(target)
-
-
-def _loop_var_collision(tree) -> tuple[str, list[int]] | None:
-    """Return (loop_var, path) if any root-to-leaf path repeats a loop_var, else None.
-
-    The renderer emits every block in one flat Python function, so a loop_var
-    reused along a single nesting path becomes ``for x: ... for x:`` (inner
-    shadows outer) — a silent wrong-tile read. No path may repeat a name.
-    """
-    from nkigym.ir.tree import ForNode, ISANode
-
-    leaves = [n for n in tree.preorder() if isinstance(tree.data(n), ISANode)]
-    result: tuple[str, list[int]] | None = None
-    for leaf in leaves:
-        seen: dict[str, int] = {}
-        path = [a for a in tree.ancestors(leaf) if isinstance(tree.data(a), ForNode)]
-        for anc in path:
-            lv = tree.data(anc).loop_var
-            if lv in seen:
-                result = (lv, path)
-                break
-            seen[lv] = anc
-        if result is not None:
-            break
-    return result
-
-
-def test_sunk_block_residual_loop_does_not_shadow_enclosing_name():
-    """Regression: sinking a block whose residual dim-loop reuses a dense name an
-    ENCLOSING loop (of a different block) already owns must not render two nested
-    ``for i_d0_0`` (inner shadows outer -> wrong K-tile -> NaN).
-
-    Fixed deterministic trace (self-contained, not coupled to the mutable
-    ``examples/transform_debug`` repro): the final ComputeAt sinks the rhs load
-    under a loop nested inside another block's ``i_d0_0``; the load's
-    regenerated ``d0`` residual must be named past it (``i_d0_1``), so no
-    root-to-leaf path repeats a loop_var. nids are stable (deterministic build).
-    """
-    from test.transforms._fixtures import INPUT_SPECS, f_matmul
-
-    from nkigym.environment import KernelMDP
-    from nkigym.transforms import (
-        ComputeAt,
-        ComputeAtOption,
-        Fuse,
-        Reorder,
-        ReverseComputeAt,
-        ReverseComputeAtOption,
-        Split,
-        SplitOption,
-    )
-
-    trace = [
-        (ReverseComputeAt(), ReverseComputeAtOption(block_nid=4, target_loop_nid=2, index=1)),
-        (ReverseComputeAt(), ReverseComputeAtOption(block_nid=4, target_loop_nid=2, index=2)),
-        (Split(), SplitOption(target_nid=20, factors=(2, 4, 256), target_axis="d2")),
-        (ReverseComputeAt(), ReverseComputeAtOption(block_nid=15, target_loop_nid=19, index=0)),
-        (ComputeAt(), ComputeAtOption(block_nid=7, target_loop_nid=2, index=0)),
-        (Split(), SplitOption(target_nid=9, factors=(4, 4, 128), target_axis="d2")),
-        (Split(), SplitOption(target_nid=25, factors=(2, 2), target_axis=None)),
-        (ComputeAt(), ComputeAtOption(block_nid=4, target_loop_nid=24, index=0)),
-    ]
-    env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), ComputeAt(), ReverseComputeAt()])
-    state = env.reset()
-    for action in trace:
-        state = env.step(state, action)
-    collision = _loop_var_collision(state.tree)
-    assert collision is None, f"loop_var {collision[0]!r} repeats on a nesting path {collision[1]}"
-
-
-def test_compute_at_rejects_covering_matmul_reduction_axis():
-    """A move that would cover the matmul's ACCUMULATION (K) axis with an enclosing
-    loop is rejected (the reduction must stay a private nest the block owns; else
-    the accumulation is driven by a foreign loop and its init no longer dominates
-    -> NaN).
-
-    Fixed deterministic trace reaching the state where sinking the matmul block
-    (10) under loop 30 (the rhs-load's ``i_d2_0``, whose enclosing chain includes
-    the load's ``i_d0_0`` K-loop) would cover the matmul's d0. The move must
-    raise and ``analyze`` must not offer it.
-    """
-    from test.transforms._fixtures import INPUT_SPECS, f_matmul
-
-    import pytest
-
-    from nkigym.environment import KernelMDP
-    from nkigym.transforms import (
-        ComputeAt,
-        ComputeAtOption,
-        Fuse,
-        Reorder,
-        ReverseComputeAt,
-        ReverseComputeAtOption,
-        Split,
-        SplitOption,
-        TransformLegalityError,
-    )
-
-    trace = [
-        (Split(), SplitOption(target_nid=20, factors=(8, 256), target_axis="d2")),
-        (ComputeAt(), ComputeAtOption(block_nid=4, target_loop_nid=12, index=0)),
-        (Split(), SplitOption(target_nid=9, factors=(4, 512), target_axis="d2")),
-        (ReverseComputeAt(), ReverseComputeAtOption(block_nid=1, target_loop_nid=8, index=1)),
-        (ReverseComputeAt(), ReverseComputeAtOption(block_nid=4, target_loop_nid=23, index=1)),
-        (Split(), SplitOption(target_nid=6, factors=(4, 512), target_axis="d2")),
-        (Split(), SplitOption(target_nid=16, factors=(2, 4, 2), target_axis=None)),
-        (Split(), SplitOption(target_nid=3, factors=(2, 2, 512), target_axis="d1")),
-        (ComputeAt(), ComputeAtOption(block_nid=4, target_loop_nid=29, index=1)),
-    ]
-    env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), ComputeAt(), ReverseComputeAt()])
-    state = env.reset()
-    for action in trace:
-        state = env.step(state, action)
-    bad = ComputeAtOption(block_nid=10, target_loop_nid=30, index=1)
-    """Rejected: sinking the matmul there is illegal. Either the reduction-axis
-    guard or the coverage/realizability solve fires (once enclosing_dim_loops
-    sees the foreign same-dim loops across the BlockNode wall, the d1 coverage
-    no longer divides), so accept either rejection reason."""
-    with pytest.raises(TransformLegalityError, match="reduction axis|realizable|reorder"):
-        ComputeAt().apply(state, bad)
-    assert not any(o.block_nid == 10 and o.target_loop_nid == 30 for o in ComputeAt().analyze(state))
 
 
 def test_reverse_compute_at_allows_fold_covering_its_own_ko():
@@ -201,7 +80,7 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
         )
 
     from nkigym.ops.base import AxisRole
-    from nkigym.transforms._code_motion import _check_same_loop_prefix
+    from nkigym.transforms.code_motion import _check_same_loop_prefix
 
     env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Reorder(), RFactor()])
     s = env.reset()
@@ -217,12 +96,11 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
     s = Split().apply(s, SplitOption(target_nid=fold_leaf(s), factors=(4, 512), target_axis="d2"))
     s = Split().apply(s, SplitOption(target_nid=fold_loop(s, "i_d1_0"), factors=(4, 4), target_axis=None))
 
-    """Barrier 1 is isolated here via _check_same_loop_prefix, which runs the
-    refined _check_no_reduction_axis_covered. Before the Barrier-1 fix it raised
-    'would cover reduction axis d0'; now it must RETURN the matched prefix
-    (the fold's own enclosing i_d0_0 is allowed) — proof the guard permits the
-    safe self-domination. (The end-to-end ReverseComputeAt of the fold is
-    deferred to the Task 3 ladder, where the drain tensor_copy co-locates
+    """Barrier 1 is isolated here via _check_same_loop_prefix and the dependency
+    check (span-promotion verifies init-domination). The fold's own enclosing
+    i_d0_0 is allowed (init dominates that loop). (The end-to-end
+    CodeMotion (lift) of the fold is deferred to the Task 3 ladder, where the
+    drain tensor_copy co-locates
     FIRST so the copy->fold RAW on sbuf_rfactor is satisfied; that ordering
     concern is the separate dependency check, not this reduction guard.)"""
     fold = fold_blk(s)
@@ -232,101 +110,334 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
     assert ("i_d0_0", 2) in target_seq, "ko (i_d0_0) must be in the matched prefix (allowed self-domination)"
 
 
-def test_compute_at_rejects_replicating_reduction_over_untiled_output_dim():
-    """Sinking the matmul under a consumer loop iterating a dim the matmul writes
-    at FULL extent (no per-tile index) is rejected — it would re-run the K
-    accumulation per iteration into an un-reinitialised PSUM (partial/garbled
-    output, not NaN).
+def test_span_promotion_rejects_memset_sunk_into_matmul_kloop():
+    """Init-domination: sinking the psum memset INTO the matmul's K loop is
+    rejected — psum_prod is carried across K, span-promotion widens both to
+    K-span so the init can no longer precede the accumulation. Verdict via the
+    production insertion query on the pre-move tree (no hardcoded nids)."""
+    from nkigym.ir.tree import ForNode, ISANode
 
-    Uses the small (256x256x512) fixture so the matmul's N axis is a single
-    untiled tile (loopless d2). Deterministic trace: split the tensor_copy's N
-    into an i_d2_0 loop, then attempt to sink the matmul (full-N) under it.
+    ir = build_canonical_ir()
+    memset_blk = _block_for_op(ir, "NKIMemset")
+    matmul_blk = _block_for_op(ir, "NKIMatmul")
+    matmul_leaf = next(d for d in ir.tree.preorder(matmul_blk) if isinstance(ir.tree.data(d), ISANode))
+    kloop = next(
+        a for a in ir.tree.ancestors(matmul_leaf)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+    )
+    moved_leaf = ir.dependency._resolve(memset_blk)
+    assert ir.dependency.first_backward_edge_for_insertion(moved_leaf, kloop, 0) is not None
+
+
+def test_span_promotion_allows_pure_load_sunk_into_matmul_kloop():
+    """A pure producer (the lhs_T load writes sbuf_lhs_T, never rmw'd -> NOT
+    carried) may sink INTO the matmul's K loop: no span-promotion applies, and it
+    still precedes the matmul that consumes it. Legal -> None. This is the benign
+    reload sibling of the rejected accumulation-into-K case."""
+    from nkigym.ir.tree import ForNode, ISANode
+
+    ir = build_canonical_ir()
+    load_blk = _block_for_op(ir, "NKILoad")
+    matmul_blk = _block_for_op(ir, "NKIMatmul")
+    matmul_leaf = next(d for d in ir.tree.preorder(matmul_blk) if isinstance(ir.tree.data(d), ISANode))
+    kloop = next(
+        a for a in ir.tree.ancestors(matmul_leaf)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+    )
+    moved_leaf = ir.dependency._resolve(load_blk)
+    assert ir.dependency.first_backward_edge_for_insertion(moved_leaf, kloop, -2) is None
+
+
+def test_code_motion_allows_output_store_sink():
+    """The output store (writes the return tensor) may sink under the drain's N
+    loop — the dropped output-block guard would have rejected it; span-promotion
+    permits it (drain writes the sbuf_prod slice the store reads, same N-iter).
+    This is the _fixtures rung_13_14 move, done via CodeMotion."""
+    from test.transforms._fixtures import build_ladder_state, _ladder_helpers
+    from nkigym.transforms.code_motion import CodeMotion, CodeMotionOption
+
+    state = build_ladder_state(13)
+    blk, _leaf, _loop, _inner, _mm_loop, tc_loop = _ladder_helpers()
+    store_blk = blk(state, "NKIStore")
+    d2 = tc_loop(state, "i_d2_0")
+    opt = CodeMotionOption(block_nid=store_blk, target_loop_nid=d2, index=-1)
+    new_ir = CodeMotion().apply(state, opt)
+    assert new_ir is not None
+    assert any(o.block_nid == store_blk and o.target_loop_nid == d2 for o in CodeMotion().analyze(state))
+
+
+"""Migrated tests from test_compute_at.py and test_reverse_compute_at.py."""
+
+import importlib.util
+import pathlib
+import tempfile
+from test.transforms._fixtures import INPUT_SPECS, build_ladder_state
+
+import numpy as np
+import pytest
+
+from nkigym.codegen import render
+from nkigym.ir.tree import ForNode
+from nkigym.synthesis.simulate_nki import simulate_fp32
+from nkigym.transforms import CodeMotion, CodeMotionOption, Split, SplitOption, TransformLegalityError, Reorder, ReorderOption
+
+
+def _block_for_op(ir, op_name: str) -> int:
+    for nid in ir.tree.blocks():
+        leaves = [d for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)]
+        if len(leaves) == 1 and ir.tree.data(leaves[0]).op_cls.__name__ == op_name:
+            return nid
+    raise AssertionError(f"no leaf block for {op_name}")
+
+
+def _first_for_in(ir, block_nid: int) -> int:
+    for d in ir.tree.preorder(block_nid):
+        if isinstance(ir.tree.data(d), ForNode):
+            return d
+    raise AssertionError("no ForNode")
+
+
+def _load_block_reading(ir, tensor: str) -> int:
+    """Return the single-leaf load block whose ISA ``src`` reads ``tensor``."""
+    for nid in ir.tree.blocks():
+        leaves = [d for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)]
+        if len(leaves) == 1:
+            leaf = ir.tree.data(leaves[0])
+            if leaf.op_cls.__name__ == "NKILoad" and leaf.operand_bindings["src"].tensor == tensor:
+                return nid
+    raise AssertionError(f"no single-leaf load block reading {tensor}")
+
+
+def test_code_motion_rejects_non_fornode_target():
+    ir = build_canonical_ir()
+    load = _block_for_op(ir, "NKILoad")
+    mm = _block_for_op(ir, "NKIMatmul")
+    with pytest.raises(TransformLegalityError, match="ForNode"):
+        CodeMotion().apply(ir, CodeMotionOption(block_nid=load, target_loop_nid=mm, index=-1))
+
+
+def test_code_motion_rejects_target_inside_moved_block():
+    ir = build_canonical_ir()
+    tc = _block_for_op(ir, "NKITensorCopy")
+    own = _first_for_in(ir, tc)
+    with pytest.raises(TransformLegalityError, match="descendant|ancestor|own"):
+        CodeMotion().apply(ir, CodeMotionOption(block_nid=tc, target_loop_nid=own, index=-1))
+
+
+def test_code_motion_rejects_sinking_writer_under_accumulation_loop():
+    """Sinking the memset (accumulator init) under the matmul K loop is rejected
+    by the dependency model (memset->K-loop carry edge would point backward),
+    not an ad-hoc role guard."""
+    ir = build_canonical_ir()
+    memset = _block_for_op(ir, "NKIMemset")
+    mm = _block_for_op(ir, "NKIMatmul")
+    kloop = next(
+        d for d in ir.tree.preorder(mm) if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == "i_d0_0"
+    )
+    with pytest.raises(TransformLegalityError, match="reorder|dependency"):
+        CodeMotion().apply(ir, CodeMotionOption(block_nid=memset, target_loop_nid=kloop, index=0))
+    assert not any(o.block_nid == memset and o.target_loop_nid == kloop for o in CodeMotion().analyze(ir))
+
+
+def test_code_motion_rejects_consumer_sunk_before_producer():
+    """Hole #1: sinking the tensor_copy (consumer of psum_prod) under the memset's
+    loop would place it before the matmul producer -> rejected by the same model."""
+    ir = build_canonical_ir()
+    tc = _block_for_op(ir, "NKITensorCopy")
+    memset = _block_for_op(ir, "NKIMemset")
+    memset_loop = next(d for d in ir.tree.preorder(memset) if isinstance(ir.tree.data(d), ForNode))
+    with pytest.raises(TransformLegalityError, match="reorder|dependency"):
+        CodeMotion().apply(ir, CodeMotionOption(block_nid=tc, target_loop_nid=memset_loop, index=0))
+
+
+def test_code_motion_rejects_parallel_producer_sunk_past_consumer():
+    """The direction bug: sinking the rhs load (PARALLEL producer of sbuf_rhs, no
+    carry edge) under the tensor_copy loop places it AFTER the matmul that reads
+    sbuf_rhs. The RAW load->matmul edge would point backward; reject it.
+
+    This is the case ``examples/transform_debug.py`` exercises. The buggy check
+    rebuilt the dependency graph on the moved tree, where the load-after-matmul
+    order re-derives the hazard as a forward WAR matmul->load, hiding the
+    violation. The fix freezes edge directions from the original program.
     """
-    from test.transforms._fixtures import SMALL_INPUT_SPECS, f_matmul_small
-
-    import pytest
-
-    from nkigym.environment import KernelMDP
-    from nkigym.transforms import (
-        ComputeAt,
-        ComputeAtOption,
-        Fuse,
-        Reorder,
-        ReverseComputeAt,
-        ReverseComputeAtOption,
-        Split,
-        SplitOption,
-        TransformLegalityError,
-    )
-
-    setup = [
-        (Split(), SplitOption(target_nid=19, factors=(4, 128), target_axis="d2")),
-        (ReverseComputeAt(), ReverseComputeAtOption(block_nid=1, target_loop_nid=5, index=1)),
-        (Split(), SplitOption(target_nid=16, factors=(2, 2, 128), target_axis="d2")),
-    ]
-    env = KernelMDP(
-        f_matmul_small, SMALL_INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), ComputeAt(), ReverseComputeAt()]
-    )
-    state = env.reset()
-    for action in setup:
-        state = env.step(state, action)
-    bad = ComputeAtOption(block_nid=10, target_loop_nid=21, index=0)
-    with pytest.raises(TransformLegalityError, match="replicates a reduction"):
-        ComputeAt().apply(state, bad)
-    assert not any(o.block_nid == 10 and o.target_loop_nid == 21 for o in ComputeAt().analyze(state))
+    ir = build_canonical_ir()
+    rhs_load = _load_block_reading(ir, "rhs")
+    tc = _block_for_op(ir, "NKITensorCopy")
+    tc_loop = _first_for_in(ir, tc)
+    with pytest.raises(TransformLegalityError, match="reorder|dependency"):
+        CodeMotion().apply(ir, CodeMotionOption(block_nid=rhs_load, target_loop_nid=tc_loop, index=0))
+    assert not any(o.block_nid == rhs_load and o.target_loop_nid == tc_loop for o in CodeMotion().analyze(ir))
 
 
-def test_compute_at_memset_sink_across_block_wall_sims_correct():
-    """Sinking a full-M memset under a loop nested inside the matmul's per-M-tile
-    loop must re-domain the memset (cover its M by the enclosing matmul loop), not
-    replicate it (which re-zeroed already-computed M tiles -> ~50% wrong).
+def test_analyze_does_not_crash_on_transformed_states():
+    """analyze must filter (not crash on) candidates across ladder states 1..12.
 
-    Regression for the ``enclosing_dim_loops`` BlockNode-wall fix: the coverage
-    solve must see the matmul's M loop across the wall so the memset's M write is
-    covered, not a free residual. Small fixture; render + sim the 6-step trace.
+    The move-sim legality runs ``_move`` on every candidate, including re-moving
+    an already-nested block. A splice that left a node double-parented used to
+    crash the downstream ``Dependency`` rebuild; ``analyze`` must filter such a
+    candidate, never raise.
     """
-    import importlib.util
-    import pathlib
-    import tempfile
-    from test.transforms._fixtures import SMALL_INPUT_SPECS, f_matmul_small
+    for n in range(1, 13):
+        ir = build_ladder_state(n)
+        CodeMotion().analyze(ir)
 
-    import numpy as np
 
-    from nkigym.codegen import render
+def test_code_motion_sink_load_under_matmul_renders_and_sims():
+    """Sink lhs_T load under the matmul's inner loop; render + sim."""
+    ir = build_canonical_ir()
+    load = _block_for_op(ir, "NKILoad")
+    mm = _block_for_op(ir, "NKIMatmul")
+    leaf = next(d for d in ir.tree.preorder(mm) if isinstance(ir.tree.data(d), ISANode))
+    inner = ir.tree.ancestors(leaf)[-1]
+    new_ir = CodeMotion().apply(ir, CodeMotionOption(block_nid=load, target_loop_nid=inner, index=-2))
+    assert load in new_ir.tree.descendants(inner)
+    rng = np.random.default_rng(0)
+    inputs = {n: rng.standard_normal(s).astype(np.float32) for n, (s, _d) in INPUT_SPECS.items()}
+    expected = inputs["lhs_T"].T @ inputs["rhs"]
+    path = pathlib.Path(tempfile.mkdtemp()) / "k.py"
+    path.write_text(render(new_ir))
+    spec = importlib.util.spec_from_file_location("k", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_code_motion_lift_store_under_tensor_copy_renders_and_sims():
+    """Full-extent lift of the store under the tensor_copy's PARALLEL M-loop renders + sims.
+
+    The store consumes ``sbuf_prod``, which the tensor_copy's M-loop does not
+    carry (PARALLEL role), so the lift respects carry-domination and is legal.
+    Lifting the tensor_copy itself into the matmul's K (ACCUMULATION) loop is
+    correctly rejected by the dependency model and is exercised by the
+    rejection tests instead.
+    """
+    ir = build_canonical_ir()
+    store = _block_for_op(ir, "NKIStore")
+    tc = _block_for_op(ir, "NKITensorCopy")
+    m_loop = _first_for_in(ir, tc)
+    new_ir = CodeMotion().apply(ir, CodeMotionOption(block_nid=store, target_loop_nid=m_loop, index=-1))
+    assert store in new_ir.tree.descendants(m_loop)
+    rng = np.random.default_rng(0)
+    inputs = {n: rng.standard_normal(s).astype(np.float32) for n, (s, _d) in INPUT_SPECS.items()}
+    expected = inputs["lhs_T"].T @ inputs["rhs"]
+    src = render(new_ir)
+    path = pathlib.Path(tempfile.mkdtemp()) / "k.py"
+    path.write_text(src)
+    spec = importlib.util.spec_from_file_location("k", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_code_motion_lift_preserves_covered_dim_across_block_wall():
+    """Regression: lifting a block under a target nested inside ANOTHER block must
+    preserve a covered dim driven by an enclosing loop above the intervening
+    BlockNode wall — not collapse it to Const(0).
+
+    Fixed deterministic trace: the rhs load (block 4, d0 driven by the matmul
+    block's enclosing K-loop) is lifted under loop 22, which sits inside a
+    different block. ``normalize_block``'s dim gather must see the K-loop above
+    that wall (``_all_enclosing_loops``); otherwise the load's ``rhs`` source
+    offset loses ``i_d0_0*128`` (reads tile 0 every K-step) -> matmul reads
+    uninitialised sbuf_rhs tiles -> NaN.
+    """
+    from test.transforms._fixtures import f_matmul
     from nkigym.environment import KernelMDP
-    from nkigym.synthesis.simulate_nki import simulate_fp32
-    from nkigym.transforms import (
-        ComputeAt,
-        ComputeAtOption,
-        Fuse,
-        Reorder,
-        ReorderOption,
-        ReverseComputeAt,
-        Split,
-        SplitOption,
-    )
 
     trace = [
-        (ComputeAt(), ComputeAtOption(block_nid=1, target_loop_nid=8, index=1)),
-        (ComputeAt(), ComputeAtOption(block_nid=1, target_loop_nid=8, index=1)),
-        (Split(), SplitOption(target_nid=13, factors=(2, 256), target_axis="d2")),
-        (Reorder(), ReorderOption(outer_nid=11, inner_nid=12)),
-        (ComputeAt(), ComputeAtOption(block_nid=1, target_loop_nid=11, index=0)),
-        (ComputeAt(), ComputeAtOption(block_nid=7, target_loop_nid=23, index=1)),
+        (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=11, index=0)),
+        (Split(), SplitOption(target_nid=17, factors=(8, 256), target_axis="d2")),
+        (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=11, index=1)),
+        (Split(), SplitOption(target_nid=3, factors=(2, 1024), target_axis="d1")),
+        (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=22, index=0)),
     ]
-    env = KernelMDP(
-        f_matmul_small, SMALL_INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), ComputeAt(), ReverseComputeAt()]
-    )
+    env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), CodeMotion()])
     state = env.reset()
     for action in trace:
         state = env.step(state, action)
     rng = np.random.default_rng(0)
-    inputs = {n: rng.standard_normal(s).astype(np.float32) for n, (s, _d) in SMALL_INPUT_SPECS.items()}
+    inputs = {n: rng.standard_normal(s).astype(np.float32) for n, (s, _d) in INPUT_SPECS.items()}
     expected = inputs["lhs_T"].T @ inputs["rhs"]
     path = pathlib.Path(tempfile.mkdtemp()) / "k.py"
     path.write_text(render(state))
     spec = importlib.util.spec_from_file_location("k", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    actual = np.asarray(simulate_fp32(mod.nki_f_matmul_small)(**inputs))
+    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
     np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_code_motion_lift_deeply_nested_load_preserves_dim_driver():
+    """Regression (mirror of the across-block-wall fix, in _domain_solve): a load
+    nested SEVERAL blocks deep, whose covered d0 is driven by a K-loop above two
+    intervening BlockNode walls, must keep that driver when lifted.
+
+    ``dim_loops_of_block`` gathered enclosing loops with a block-local walk that
+    reset at each BlockNode, so the deep lhs-load's d0 driver (the matmul block's
+    i_d0_0, above the rhs-load and lhs-load block walls) was dropped -> empty
+    dim_loops -> the load's lhs_T source offset lost i_d0_0*128 -> NaN. The gather
+    now spans all ancestor ForNodes filtered by the block's bound loop vars.
+    """
+    from test.transforms._fixtures import f_matmul
+    from nkigym.environment import KernelMDP
+
+    trace = [
+        (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=13, index=0)),
+        (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=5, index=1)),
+        (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=11, index=0)),
+        (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=11, index=0)),
+        (Split(), SplitOption(target_nid=17, factors=(2, 4, 256), target_axis="d2")),
+        (Split(), SplitOption(target_nid=6, factors=(2, 4, 256), target_axis="d2")),
+        (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=24, index=0)),
+        (Split(), SplitOption(target_nid=9, factors=(4, 2, 256), target_axis="d2")),
+        (Split(), SplitOption(target_nid=25, factors=(2, 2), target_axis=None)),
+        (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=23, index=1)),
+    ]
+    env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), CodeMotion()])
+    state = env.reset()
+    for action in trace:
+        state = env.step(state, action)
+    rng = np.random.default_rng(0)
+    inputs = {n: rng.standard_normal(s).astype(np.float32) for n, (s, _d) in INPUT_SPECS.items()}
+    expected = inputs["lhs_T"].T @ inputs["rhs"]
+    path = pathlib.Path(tempfile.mkdtemp()) / "k.py"
+    path.write_text(render(state))
+    spec = importlib.util.spec_from_file_location("k", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_psum_hoist_descends_and_compacts():
+    """After k11->k12, psum_prod is declared inside the matmul block and compacted to one tile."""
+    ir = build_ladder_state(12)
+    decls = {buf.name: (nid, buf) for nid in ir.tree.blocks() for buf in ir.tree.data(nid).alloc_buffers}
+    nid, buf = decls["psum_prod"]
+    assert nid != ir.tree.root, "psum_prod did not descend from root"
+    assert buf.shape == (128, 512), f"psum_prod not compacted to one tile: {buf.shape}"
+
+
+@pytest.mark.parametrize("n", list(range(1, 15)))
+def test_ladder_state_sims(n):
+    """Every ladder state 1..14 renders and CPU-sims to the matmul golden.
+
+    Pairs with the byte-exact rung tests: byte-match alone can pass by luck on
+    a structurally-wrong kernel and sim alone can pass on a kernel that differs
+    cosmetically; requiring both per state pins each rung end-to-end.
+    """
+    ir = build_ladder_state(n)
+    rng = np.random.default_rng(0)
+    inputs = {name: rng.standard_normal(s).astype(np.float32) for name, (s, _d) in INPUT_SPECS.items()}
+    expected = inputs["lhs_T"].T @ inputs["rhs"]
+    path = pathlib.Path(tempfile.mkdtemp()) / "k.py"
+    path.write_text(render(ir))
+    spec = importlib.util.spec_from_file_location("k", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+

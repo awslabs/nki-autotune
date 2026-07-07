@@ -133,7 +133,23 @@ anywhere in TVM — checked `primitive/`, `meta_schedule/`, `dlight/`, tests):
   (`memset → K-loop` edge) gives the EQUIVALENT guarantee via a different representation.
   *(This whole bullet is [SRC]+[INFERRED]; the decisive behavior awaits [PROBE].)*
 
-## ⏳ TO REVISIT: block-granular dependency model (parked 2026-06-09)
+## ✅ RESOLVED (2026-07-03): span-promotion, neither block- nor loop-granular carry-edge
+
+**Resolved for the code-motion path by a THIRD option not in the original (a)/(b) framing:
+SPAN-PROMOTION** (`fc3043b`). We ported NEITHER TVM's block-granular `region_cover` (a)
+NOR kept the loop-granular carry-edge model (b). Instead: the shipped preorder-span
+backward-edge test grows a carried, loop-invariant access's span to its carrying loop
+on demand (no materialized carry/cover edges, no `region_cover` port). The init-domination
+guarantee is preserved (memset-into-reduction-loop → backward → reject) and the
+RFactor→fused fold is UNBLOCKED (`_check_no_reduction_axis_covered` DELETED; the narrowing
+it needed is subsumed by the init-breaks-carry clause: a memset sinks into `ko` (re-init,
+legal) but not `ki` (live accumulation)). No TVM build was needed — the ladder CPU-sim +
+an exhaustive pure-vs-simulation cross-check on gym-1 drove the decision, not a TVM oracle.
+The `_tvm_init_domination_probe.py` question is moot for our purposes: our correctness
+rests on the ladder, not on matching TVM's `region_cover` behavior. See the learnings
+"Code-motion legality = SPAN-PROMOTION" bullet.
+
+### Original parked framing (kept for the record)
 
 **We will revisit whether to adopt TVM's block-granular dependency model** (mirroring
 `region_cover` / `stage_pipeline`) vs. keeping our shipped loop-granular carry-edge

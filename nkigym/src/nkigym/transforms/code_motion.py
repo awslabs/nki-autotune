@@ -1,4 +1,4 @@
-"""Shared structural move for ComputeAt / ReverseComputeAt.
+"""Shared structural move for CodeMotion (the merged compute-at / reverse-compute-at).
 
 A move relocates one block under a target loop by a **verbatim residual splice**,
 NOT region recomputation. Precondition (``_check_same_loop_prefix``): the target's
@@ -12,30 +12,32 @@ block's regions referencing them resolve against the target's loops with no rewr
 
 This intentionally avoids TVM-style per-dim domain solving: a partial split of a
 shared dim, or a different loop order, is REJECTED loudly (``Split``/``Reorder``
-first), so every legal move is a clean structural merge. Direction (``is_reverse``)
-does not change the structural steps; the caller's dependency-direction check differs.
+first), so every legal move is a clean structural merge.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
+import copy
+from dataclasses import dataclass, replace
 
+from nkigym.codegen.compact import compact_shapes
 from nkigym.ir import KernelIR
-from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree, role_of
+from nkigym.ir.buffer_placement import place_buffers
+from nkigym.ir.dependency import Dependency
+from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
-from nkigym.transforms._domain_solve import _dim_from_loopvar, _enclosing_block, enclosing_dim_loops
+from nkigym.transforms._domain_solve import _enclosing_block
 from nkigym.transforms._normalize import normalize_block
 from nkigym.transforms._tree_ops import _replace_in_parent_children
-from nkigym.transforms.base import TransformLegalityError
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
-def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int, is_reverse: bool) -> None:
+def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> None:
     """Relocate ``block_nid`` under ``target_loop_nid`` by a verbatim residual splice.
 
     Caller has checked legality (``_check_same_loop_prefix``, so the target's
     enclosing nest is an exact prefix of the moved block's nest) and deep-copied.
     ``index`` follows TVM convention: ``-1`` append, ``-2`` prepend, ``>=0`` slot.
-    ``is_reverse`` is structurally inert.
 
     The moved block's loops are its ENCLOSING loops (above the block, shared with
     the target) plus its BLOCK-LOCAL loops (inside the block). The target prefix
@@ -139,10 +141,8 @@ def _check_same_loop_prefix(ir: KernelIR, block_nid: int, target_loop_nid: int) 
     (``Split`` / ``Reorder`` first). This replaces the old per-dim
     ``solve_iter_domains`` coverage, whose product-matching collapsed a moved block's
     own inner loop (a memset's private ``i_d2_1``) onto a same-extent enclosing loop
-    (the matmul's ``i_d2_0``), re-zeroing only one tile. The reduction guards run on
-    the full target var set (non-dependent dims skip the axis-covered guard via
-    ``role_of`` ``KeyError``; the replication guard uses them to reject accumulation
-    duplication).
+    (the matmul's ``i_d2_0``), re-zeroing only one tile. The replication guard uses
+    the full target var set to reject accumulation duplication.
     """
     target_seq = _target_loop_seq(ir.tree, target_loop_nid)
     moved_seq = _moved_loop_seq(ir.tree, block_nid)
@@ -156,7 +156,6 @@ def _check_same_loop_prefix(ir: KernelIR, block_nid: int, target_loop_nid: int) 
             f"moved={moved_seq} (Split / Reorder the mismatched loop first)"
         )
     covered_vars = {lv for lv, _e in target_seq}
-    _check_no_reduction_axis_covered(ir, block_nid, target_loop_nid, covered_vars)
     _check_no_reduction_replicated(ir, block_nid, target_loop_nid, covered_vars)
     return target_seq
 
@@ -189,82 +188,10 @@ def _check_no_reduction_replicated(ir: KernelIR, block_nid: int, target_loop_nid
         )
 
 
-def _own_carry_loop_nids(ir: KernelIR, block_nid: int) -> set[int]:
-    """Loop NIDs that the moved block's accumulator-init DOMINATES.
-
-    The block's RMW operand (its carried accumulator) is initialised by a
-    sibling memset whose write CARRYs into the reduction loop — recorded as a
-    ``CARRY`` edge ``init_writer -> loop_nid`` in ``ir.dependency``. Covering a
-    reduction axis by one of these loops is the SAFE enclosing-reduction case
-    (init dominates); covering by any other loop is foreign (init does not
-    dominate -> NaN). Returns the loop NIDs into which the block's own
-    accumulator's writers carry.
-    """
-    block = ir.tree.data(block_nid)
-    assert isinstance(block, BlockNode)
-    leaf = next(d for d in ir.tree.descendants(block_nid) if isinstance(ir.tree.data(d), ISANode))
-    isa = ir.tree.data(leaf)
-    acc_tensors = {
-        isa.operand_bindings[slot].tensor for slot in isa.op_cls.RMW_OPERANDS if slot in isa.operand_bindings
-    }
-    out: set[int] = set()
-    for tensor in acc_tensors:
-        for writer in ir.dependency.touches_by_tensor.get(tensor, ()):
-            for _w, loop_nid, attrs in ir.dependency.graph.out_edges(writer, data=True):
-                if attrs.get("kind") == "CARRY":
-                    out.add(loop_nid)
-    return out
-
-
-def _check_no_reduction_axis_covered(
-    ir: KernelIR, block_nid: int, target_loop_nid: int, covered_vars: set[str]
-) -> None:
-    """Reject a move that covers the moved block's ACCUMULATION (reduction) axis
-    with a loop the block's own init does NOT dominate (foreign covering loop).
-
-    A reduction axis (matmul K, two-stage fold ko) must iterate as a contiguous
-    nest bracketed by its init (memset) before and drain (tensor_copy) after.
-    ``covered_vars`` are the prefix (target-provided) loop vars the move folds onto
-    the target's nest. Covering a reduction axis by such a loop is SAFE when that
-    loop is one the block's own init dominates (a CARRY edge from the block's
-    accumulator-init writer into that loop NID exists); covering by any other loop
-    is foreign (init does not dominate -> NaN). NID-comparison, NOT loop_var, is
-    load-bearing: after RFactor a foreign K-loop and the fold's own ko-loop are BOTH
-    named ``i_d0_0`` — but they are different ForNodes; only the target's actual
-    prefix ForNodes count, and they are matched against the block's own-carry NIDs.
-    """
-    block = ir.tree.data(block_nid)
-    assert isinstance(block, BlockNode)
-    own_carry = _own_carry_loop_nids(ir, block_nid)
-    target_nid_by_var = {
-        ir.tree.data(nid).loop_var: nid
-        for nid in (target_loop_nid, *ir.tree.ancestors(target_loop_nid))
-        if isinstance(ir.tree.data(nid), ForNode)
-    }
-    result: None = None
-    for lv in covered_vars:
-        nid = target_nid_by_var.get(lv)
-        if nid is None:
-            continue
-        dim = _dim_from_loopvar(lv)
-        try:
-            role = role_of(block, dim)
-        except KeyError:
-            continue
-        if role != AxisRole.ACCUMULATION:
-            continue
-        if nid in own_carry:
-            continue
-        raise TransformLegalityError(
-            f"move(block={block_nid} under loop={target_loop_nid}) would cover reduction axis "
-            f"{dim!r} (ACCUMULATION) with loop {lv!r} the block's own init does not dominate; "
-            f"a foreign covering loop breaks init-domination"
-        )
-    return result
 
 
 def _check_move_preserves_dependencies(
-    ir: KernelIR, block_nid: int, target_loop_nid: int, index: int, is_reverse: bool
+    ir: KernelIR, block_nid: int, target_loop_nid: int, index: int
 ) -> None:
     """Raise TransformLegalityError if the proposed move would make any
     dependency edge incident to the moved block point backward.
@@ -273,10 +200,9 @@ def _check_move_preserves_dependencies(
     ``Dependency.first_backward_edge_for_insertion`` on the **original**
     program's dependency graph: edge *directions* are frozen at construction,
     and the moved leaf's post-splice preorder position is computed analytically
-    from ``(target_loop_nid, index)``. One span-based, edge-kind-agnostic rule
-    covers reduction-init domination and consumer-before-producer ordering
-    alike. ``is_reverse`` does not change the check — both faces forbid the same
-    backward edges; only their structural splice differs.
+    from ``(target_loop_nid, index)``. Span-promotion delivers reduction-init
+    domination and coverage — one span-based, edge-kind-agnostic rule covers
+    both reduction-init domination and consumer-before-producer ordering.
 
     Directions MUST come from ``ir.dependency`` (the pre-move graph). Rebuilding
     ``Dependency`` on a moved tree would be wrong: ``_build`` re-derives every
@@ -285,25 +211,10 @@ def _check_move_preserves_dependencies(
     and the violation disappears (matmul reads uninitialised data -> NaN).
     Freezing directions keeps the RAW orientation, so the post-splice backward
     span is detected.
-
-    Legality (same loop prefix) is a separate concern checked by
-    ``_check_same_loop_prefix`` before this; here we assume a prefix-legal candidate
-    and only test ordering. The matched prefix loop vars are the ones the move folds
-    onto the target's nest, so their COVER edges (a full-extent consumer made
-    per-tile by the move) are dissolved and skipped in the backward-edge test.
     """
-    target_seq = _check_same_loop_prefix(ir, block_nid, target_loop_nid)
-    covered_vars = {lv for lv, _e in target_seq}
-    target_nid_by_var = {
-        ir.tree.data(nid).loop_var: nid
-        for nid in (target_loop_nid, *ir.tree.ancestors(target_loop_nid))
-        if isinstance(ir.tree.data(nid), ForNode)
-    }
-    skip_cover_loops = frozenset(target_nid_by_var[lv] for lv in covered_vars if lv in target_nid_by_var)
+    _check_same_loop_prefix(ir, block_nid, target_loop_nid)
     moved_leaf = ir.dependency._resolve(block_nid)
-    offending = ir.dependency.first_backward_edge_for_insertion(
-        moved_leaf, target_loop_nid, index, skip_cover_loops=skip_cover_loops
-    )
+    offending = ir.dependency.first_backward_edge_for_insertion(moved_leaf, target_loop_nid, index)
     result: None = None
     if offending is not None:
         a, b = offending
@@ -336,4 +247,99 @@ def _splice_under_target(tree: KernelTree, block_nid: int, target_loop_nid: int,
         tree.graph.add_edge(target_loop_nid, child)
 
 
-__all__ = ["_move", "_check_move_preserves_dependencies"]
+@dataclass(frozen=True)
+class CodeMotionOption(TransformOption):
+    """Relocate ``block_nid`` under ``target_loop_nid`` at child slot ``index``.
+
+    One option type for both directions of motion: sinking a producer under a
+    consumer's loop and lifting a consumer under a producer's loop are the same
+    structural splice, distinguished only by the dependency graph — not a flag.
+    """
+
+    block_nid: int
+    target_loop_nid: int
+    index: int
+
+
+class CodeMotion(Transform):
+    """Relocate one block under a target loop (the merged former ComputeAt/ReverseComputeAt).
+
+    Legality is dependency-ordering (span-promotion) + the structural same-prefix
+    merge + the reduction-replication guard. There is NO output-block guard: the
+    block writing the return tensor is relocatable when ordering permits (e.g. the
+    k11->k12 store-sink under the matmul's N loop).
+    """
+
+    def apply(self, ir: KernelIR, option: CodeMotionOption) -> KernelIR:
+        """Re-check legality, deep-copy, move, re-derive geometry, return."""
+        self._check_legality(ir, option)
+        new_ir = copy.deepcopy(ir)
+        _move(new_ir, block_nid=option.block_nid, target_loop_nid=option.target_loop_nid, index=option.index)
+        place_buffers(new_ir.tree)
+        compact_shapes(new_ir.tree)
+        new_ir.dependency = Dependency(new_ir.tree)
+        return new_ir
+
+    def analyze(self, ir: KernelIR) -> list[CodeMotionOption]:
+        """Enumerate (block, target loop, index) triples passing legality."""
+        options: list[CodeMotionOption] = []
+        leaf_blocks = [
+            nid
+            for nid in ir.tree.blocks()
+            if nid != ir.tree.root
+            and sum(1 for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)) == 1
+        ]
+        for block_nid in leaf_blocks:
+            for target_nid in ir.tree.preorder():
+                if not isinstance(ir.tree.data(target_nid), ForNode):
+                    continue
+                for index in self._legal_indices(ir, block_nid, target_nid):
+                    opt = CodeMotionOption(block_nid=block_nid, target_loop_nid=target_nid, index=index)
+                    try:
+                        self._check_legality(ir, opt)
+                    except TransformLegalityError:
+                        continue
+                    options.append(opt)
+        return options
+
+    def _legal_indices(self, ir: KernelIR, block_nid: int, target_nid: int) -> list[int]:
+        """Slots in the insertion gap (lp, fc] among the target loop's children.
+
+        Bounded below by the last child holding a producer of the moved block and
+        above by the first child holding a consumer — symmetric in both, which is
+        why one enumeration serves producer-sink and consumer-lift alike.
+        """
+        children = ir.tree.children(target_nid)
+        producers = ir.dependency.producers(block_nid)
+        consumers = ir.dependency.consumers(block_nid)
+        lp = -1
+        fc = len(children)
+        for i, child in enumerate(children):
+            sub = ir.tree.descendants(child) | {child}
+            if sub & producers:
+                lp = i
+            if sub & consumers and i < fc:
+                fc = i
+        return list(range(lp + 1, fc + 1))
+
+    def _check_legality(self, ir: KernelIR, option: CodeMotionOption) -> None:
+        """Structural checks (target/block in graph, target a ForNode, target not a
+        descendant of the block) then span-promotion ordering. No output guard."""
+        if option.target_loop_nid not in ir.tree.graph:
+            raise TransformLegalityError(f"target_loop_nid={option.target_loop_nid} not in tree")
+        if not isinstance(ir.tree.data(option.target_loop_nid), ForNode):
+            raise TransformLegalityError(
+                f"CodeMotion requires target_loop_nid to be a ForNode; got "
+                f"{type(ir.tree.data(option.target_loop_nid)).__name__}"
+            )
+        if option.block_nid not in ir.tree.graph:
+            raise TransformLegalityError(f"block_nid={option.block_nid} not in tree")
+        if option.target_loop_nid in ir.tree.descendants(option.block_nid):
+            raise TransformLegalityError(
+                f"target_loop_nid={option.target_loop_nid} is a descendant of moved block "
+                f"{option.block_nid} (cannot move under its own loop)"
+            )
+        _check_move_preserves_dependencies(ir, option.block_nid, option.target_loop_nid, option.index)
+
+
+__all__ = ["_move", "_check_move_preserves_dependencies", "CodeMotion", "CodeMotionOption"]

@@ -18,12 +18,12 @@ THE SINGLE LADDER (``_build_ladder``, k0..k15), all CPU-sim clean on gym-1:
                        ``tensor_copy`` / ``tensor_tensor`` fold
   k9-k11  Reorder x3   each of those blocks to ``[N, M]`` (the matmul's tile-prefix
                        order, so the next moves are same-prefix legal)
-  k12-k13 ReverseComputeAt  sink memset(psum) + drain ``tensor_copy`` under the
+  k12-k13 CodeMotion  sink memset(psum) + drain ``tensor_copy`` under the
                        matmul's ``i_d1_0`` -> memset/matmul/copy CO-LOCATED per
                        (N, M) output tile. ``compact_shapes`` then shrinks
                        ``psum_prod`` (128,16,2048) -> **(128, 1, 512)** — the
                        per-tile PSUM the HW needs.
-  k14-k15 ComputeAt    sink the rhs / lhs_T loads to per-(N) / per-(N,M) scope
+  k14-k15 CodeMotion    sink the rhs / lhs_T loads to per-(N) / per-(N,M) scope
                        (stream operands instead of one 32 MiB up-front load).
 k15 is the HW-runnable ``kernel_target`` equivalent: ``ko > N > M`` with a per-tile
 ``memset -> ki-matmul -> tensor_copy``, a per-(N,M) ``tensor_tensor`` ko-fold into
@@ -72,12 +72,10 @@ from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.synthesis import simulate_fp32
 from nkigym.transforms import (
-    ComputeAt,
-    ComputeAtOption,
+    CodeMotion,
+    CodeMotionOption,
     Reorder,
     ReorderOption,
-    ReverseComputeAt,
-    ReverseComputeAtOption,
     RFactor,
     RFactorOption,
     Split,
@@ -283,7 +281,7 @@ def _psum_memset_leaf(ir: object) -> int:
 
     After RFactor there are two memsets — ``init_two_stage_0`` zeros the SBUF
     accumulator, ``init_two_stage_1`` zeros the per-``ko`` PSUM partial. This finds
-    the PSUM one (the Split/ReverseComputeAt target for the per-tile PSUM shrink).
+    the PSUM one (the Split/CodeMotion target for the per-tile PSUM shrink).
     """
     return next(
         n
@@ -320,7 +318,7 @@ def _reorder_blk_to_nm(ir: object, blk_nid: int) -> object:
 
     The post-Split memset / drain / fold blocks iterate ``i_d1_0(M) > i_d2_0(N)``;
     the matmul's tile prefix is ``i_d2_0(N) > i_d1_0(M)``. Matching that order makes
-    the subsequent same-prefix ``ReverseComputeAt`` under the matmul ``i_d1_0`` legal.
+    the subsequent same-prefix ``CodeMotion`` under the matmul ``i_d1_0`` legal.
     """
     return Reorder().apply(
         ir, ReorderOption(outer_nid=_blk_loop(ir, blk_nid, "i_d1_0"), inner_nid=_blk_loop(ir, blk_nid, "i_d2_0"))
@@ -345,12 +343,12 @@ def _build_ladder() -> list[tuple[str, object]]:
     k1-k2  Split K(->ko,ki) + Split M(->Mo,Mi); k3-k8 Reorder x6 -> nest
     ``N > ko > Mo > Mi > ki``; k9 RFactor(ko) -> two-stage fold; k10-k15 Split each
     of memset/copy/fold on d2(4x512) AND M(4x4) to the matmul's tile prefix;
-    k16-k18 ReverseComputeAt memset + drain ``tensor_copy`` + ``tensor_tensor``
+    k16-k18 CodeMotion memset + drain ``tensor_copy`` + ``tensor_tensor``
     fold under the matmul's ``i_d1_1`` -> all CO-LOCATED per (N, Mo, Mi) tile, fold
     INLINED in the matmul's innermost body. ``compact_shapes`` then shrinks
     ``psum_prod`` and ``sbuf_rfactor`` to per-tile ``(128, 1, 512)``. k19-k20 Split
     the rhs/lhs_T loads on their FREE axis (rhs d2, lhs_T d1, each 4x512) so each
-    load is one N-/M-tile wide, NOT the full 2048; k21-k22 ComputeAt the tiled rhs
+    load is one N-/M-tile wide, NOT the full 2048; k21-k22 CodeMotion the tiled rhs
     load under ``i_d2_0`` (N) and lhs_T under ``i_d1_0`` (Mo) -> ``sbuf_rhs``
     ``(128, 16, 512)`` and ``sbuf_lhs_T`` ``(128, 8, 512)`` streamed per-tile. k22
     is the fold-inlined, tiled-load ``kernel_target`` reproduction.
@@ -381,18 +379,18 @@ def _build_ladder() -> list[tuple[str, object]]:
         lambda ir: Split().apply(
             ir, SplitOption(target_nid=_blk_m_loop(ir, "NKITensorTensor"), factors=(4, 4), target_axis=None)
         ),
-        lambda ir: ReverseComputeAt().apply(
-            ir, ReverseComputeAtOption(block_nid=_psum_memset_blk(ir), target_loop_nid=_loop(ir, "i_d1_1"), index=0)
+        lambda ir: CodeMotion().apply(
+            ir, CodeMotionOption(block_nid=_psum_memset_blk(ir), target_loop_nid=_loop(ir, "i_d1_1"), index=0)
         ),
-        lambda ir: ReverseComputeAt().apply(
+        lambda ir: CodeMotion().apply(
             ir,
-            ReverseComputeAtOption(
+            CodeMotionOption(
                 block_nid=_op_blk(ir, "NKITensorCopy"), target_loop_nid=_loop(ir, "i_d1_1"), index=-1
             ),
         ),
-        lambda ir: ReverseComputeAt().apply(
+        lambda ir: CodeMotion().apply(
             ir,
-            ReverseComputeAtOption(
+            CodeMotionOption(
                 block_nid=_op_blk(ir, "NKITensorTensor"), target_loop_nid=_loop(ir, "i_d1_1"), index=-1
             ),
         ),
@@ -400,8 +398,8 @@ def _build_ladder() -> list[tuple[str, object]]:
         lambda ir: Reorder().apply(
             ir, ReorderOption(outer_nid=_load_for(ir, "rhs", "i_d0_0"), inner_nid=_load_for(ir, "rhs", "i_d2_0"))
         ),
-        lambda ir: ComputeAt().apply(
-            ir, ComputeAtOption(block_nid=_load_blk(ir, "rhs"), target_loop_nid=_loop(ir, "i_d2_0"), index=0)
+        lambda ir: CodeMotion().apply(
+            ir, CodeMotionOption(block_nid=_load_blk(ir, "rhs"), target_loop_nid=_loop(ir, "i_d2_0"), index=0)
         ),
         lambda ir: Split().apply(
             ir, SplitOption(target_nid=_load_leaf(ir, "lhs_T"), factors=(4, 512), target_axis="d1")
@@ -412,8 +410,8 @@ def _build_ladder() -> list[tuple[str, object]]:
         lambda ir: Reorder().apply(
             ir, ReorderOption(outer_nid=_load_for(ir, "lhs_T", "i_d0_1"), inner_nid=_load_for(ir, "lhs_T", "i_d1_0"))
         ),
-        lambda ir: ComputeAt().apply(
-            ir, ComputeAtOption(block_nid=_load_blk(ir, "lhs_T"), target_loop_nid=_loop(ir, "i_d1_0"), index=0)
+        lambda ir: CodeMotion().apply(
+            ir, CodeMotionOption(block_nid=_load_blk(ir, "lhs_T"), target_loop_nid=_loop(ir, "i_d1_0"), index=0)
         ),
     ]
     ir = build_initial_ir(f_nkigym, INPUT_SPECS)

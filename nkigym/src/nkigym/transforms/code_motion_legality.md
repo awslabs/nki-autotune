@@ -1,40 +1,39 @@
-# `ComputeAt` / `ReverseComputeAt` legality
+# `CodeMotion` legality
 
-This file explains every legality condition the two compute_at-flavored
-transforms enforce. Each condition is shown as a small "before / proposed move
-/ verdict" code snippet in our IR's source-rendered form.
+This file explains every legality condition the `CodeMotion` transform enforces.
+Each condition is shown as a small "before / proposed move / verdict" code
+snippet in our IR's source-rendered form.
 
-The transforms move one *block* under a target loop:
-
-- `ComputeAt(block, target_loop)` — sink a producer block under a consumer's
-  loop.
-- `ReverseComputeAt(block, target_loop)` — lift a consumer block under a
-  producer's loop.
+The transform moves one *block* under a target loop. It unifies the prior
+`ComputeAt` (sink a producer) and `ReverseComputeAt` (lift a consumer) into a
+single primitive: the structural move operation is identical, and dependency
+preservation is direction-agnostic via span-based queries.
 
 Six conditions, mirroring TVM's `tir.schedule.{ComputeAt, ReverseComputeAt}`
 (`src/tir/schedule/primitive/compute_at.cc`, lines 700–731).
 
-> **Implementation note (current shipped code).** The faces' `_check_legality`
+> **Implementation note (current shipped code).** `CodeMotion._check_legality`
 > enforces the *structural* conditions inline — target-in-graph, target is a
-> `ForNode`, block-in-graph, condition 3 (target not a descendant of the block),
-> and ComputeAt-only condition 4 (output guard) — then delegates the rest to two
-> helpers in `transforms/_code_motion.py`:
+> `ForNode`, block-in-graph, condition 3 (target not a descendant of the block)
+> — then delegates the rest to two helpers in `transforms/code_motion.py`:
 >
-> - `_check_move_realizable` — the **realizability + coverage** guards (the
+> - `_check_same_loop_prefix` — the **realizability + coverage** guards (the
 >   coverage half of condition 5 plus condition 6's structural feasibility):
->   `solve_iter_domains` divisibility, reduction-axis-covered,
+>   enclosing loop-nest prefix match on dependent dims, reduction-axis-covered,
 >   reduction-replicated.
-> - `_check_move_preserves_dependencies` — the **ordering** half of condition 5,
->   a single span-based query (`Dependency.first_backward_edge_for_insertion`).
+> - `Dependency.first_backward_edge_for_insertion` — the **ordering** half of
+>   condition 5, a single span-based query.
 >
 > Condition 1 is a precondition (never a per-call check). **Condition 2 below
-> is documented for completeness but is NOT currently enforced** — no face reads
+> is documented for completeness but is NOT currently enforced** — no op reads
 > `AxisRole`/`role_of`; the op set has no opaque/`SEQUENTIAL`-scan block yet, so
 > the check is unreachable. The reduction-specific hazards condition 2 would
 > guard against (sinking an accumulator's init/drain wrongly) are instead caught
-> by the dependency + realizability model (§5). Sections 5 and 6 below give the
-> *original* TVM root-sibling framing first, then a "**shipped check**" note
-> with what the code actually does after the 2026-06 rewrite.
+> by the dependency + realizability model (§5). **Condition 4 (output-block guard)
+> has been DROPPED**: the k11->k12 store-sink is legal (drain writes the slice
+> the store reads, same N-iter; span-promotion permits it). Sections 5 and 6 below
+> give the *original* TVM root-sibling framing first, then a "**shipped check**"
+> note with what the code actually does after the 2026-06 rewrite.
 
 ## What is a "block"?
 
@@ -207,25 +206,17 @@ the root (i.e. they're under different root-children).
 
 ---
 
-## 4. Block is not the kernel's output (ComputeAt only)
+## 4. Block is not the kernel's output — **DROPPED**
 
-`ComputeAt` sinks a *producer*. The kernel's final-store leaf has no
-consumers (no later leaf reads its output — it IS the output), so sinking it
-has no meaningful target. `ReverseComputeAt` doesn't need this check (the
-final store is a legal *consumer* to lift).
+**Status: no longer enforced.** The output-block guard was specific to the
+`ComputeAt` face (sinking a store had no meaningful target). With span-promotion
+(§5-shipped), the k11->k12 store-sink (the store moves under the drain's N-loop)
+is LEGAL: the drain writes `sbuf_prod[n*512:(n+1)*512]`, and the store reads the
+same slice within the same N-iteration. The dependency model permits it.
 
-```python
-# Canonical IR ends with:
-hbm_out = NKIStore()(src=sbuf_prod)        # writes the kernel's return tensor
-
-# Proposed: ComputeAt(block_subtree_root=<store nest>, target_loop=<anywhere>)
-# ILLEGAL: the store writes `hbm_out`, which is the kernel's `return_name`.
-# ReverseComputeAt of the store's nest (lifting it under, say, the
-# tensor_copy's M-loop) is legal — covered by condition 5.
-```
-
-The check: in `ComputeAt`, every leaf descended from `block_subtree_root` whose
-`writes` includes `ir.return_name` causes rejection.
+The earlier check (reject any move of a block writing `ir.return_name`) was
+dropped in favor of the universal span-based legality: if a proposed move of the
+output block would reorder any dependency edge backward, §5 rejects it.
 
 ---
 
@@ -243,7 +234,7 @@ The unified rule: pick the moved subtree's *new pre-order position* (under the
 target). Every producer-consumer edge in the dependency graph that crosses the
 move must remain a forward edge.
 
-### 5a. ComputeAt — sinking a producer
+### 5a. Sinking a producer (former ComputeAt)
 
 Let `P` be the moved producer subtree (currently at root position `i_P`),
 `T` be the target loop (currently at root position `i_T`). After the move,
@@ -299,7 +290,7 @@ The check: for `ComputeAt`, for every consumer leaf `C` of any leaf in the
 moved subtree, `C` must be either a descendant of `target_loop_nid` or live in
 a root-sibling whose pre-order index is `> target_root_index`.
 
-### 5b. ReverseComputeAt — lifting a consumer
+### 5b. Lifting a consumer (former ReverseComputeAt)
 
 Mirror. Let `C` be the moved consumer subtree (root position `i_C`), `T` the
 target loop (root position `i_T`). After the move, `C`'s leaves execute inside
@@ -365,12 +356,10 @@ live in a root-sibling whose pre-order index is `< target_root_index`.
 
 The "root-sibling pre-order index" framing above is the original TVM-style
 model. The shipped check is finer: blocks are no longer flat root-siblings
-(compute_at nests them), so the rule is expressed as **one span-based,
+(`CodeMotion` nests them), so the rule is expressed as **one span-based,
 edge-kind-agnostic dependency query** plus a small set of **coverage guards**.
-Both faces (`ComputeAt`/`ReverseComputeAt`) call the *same* two helpers; only
-the structural splice differs (`is_reverse`).
 
-**Ordering — `_check_move_preserves_dependencies` (`_code_motion.py`).** Each
+**Ordering — `Dependency.first_backward_edge_for_insertion` (`code_motion.py`).** Each
 node has a preorder span `[start, end]` over the tree (a leaf is a point; a loop
 is its whole subtree). An edge `a → b` ("a before b") is satisfied iff
 `span(a).end < span(b).start`, backward otherwise. The move is illegal iff any
@@ -396,29 +385,25 @@ Two non-obvious rules make this correct:
   grow to cover the new slot (so sinking a drain *inside* its reduction loop
   reads as backward); the moved subtree is excluded from every partner's span.
 
-Beyond flow edges, `Dependency` carries two **loop-endpoint** edge kinds that
-make the span query enforce reduction/region domination automatically:
+Beyond flow edges, the dependency model enforces reduction/region domination via
+**span-promotion**: a carried tensor (an RMW invariant across a loop, not
+re-initialized inside it) has any invariant access's preorder span grown to that
+loop, so an init/drain/foreign access cannot sit inside the carrying loop. For
+example, matmul's `psum_prod` carried over the K/ACCUMULATION loop forces the
+memset before, and the tensor_copy after, the whole K nest. No materialized edge
+kinds are stored — it is one span comparison via
+`first_backward_edge_for_insertion`.
 
-- **CARRY** — for a buffer carried across a non-PARALLEL loop `L` (matmul's
-  `psum_prod` over the K/ACCUMULATION loop): `init → L` and `L → drain`. Forces
-  the memset before, and the tensor_copy after, the whole K nest.
-- **COVER** — for a buffer a producer writes *tiled* by an enclosing loop `L`
-  while a consumer reads it at *full extent* on that axis: `L → consumer`. Forces
-  the full-extent reader after the whole tiling loop (else it reads slices not
-  yet written this iteration).
+**Coverage/realizability — `_check_same_loop_prefix` (`code_motion.py`).** Run
+before the ordering query; rejects moves the structural merge can't realize:
 
-**Coverage/realizability — `_check_move_realizable` (`_code_motion.py`).** Run
-before the ordering query; rejects moves the region-regen can't realize:
-
-- **Divisibility** — `solve_iter_domains` requires the target's coverage on each
-  moved dim to divide that dim's extent (else `Split` first; see §-composition).
-- **Reduction axis covered** — reject if the move would let the moved block's
-  ACCUMULATION axis be "covered" by an enclosing target loop (the reduction
-  would be driven by a foreign loop, its init no longer dominating → NaN). A
-  reduction axis must stay a residual the block owns.
-- **Reduction replicated** — reject sinking an ACCUMULATION block under a target
-  loop iterating a dim the block writes at *full extent* (no per-tile index):
-  the accumulation would re-run per iteration into an un-reinitialised
+- **Same-prefix merge** — the target's enclosing loops, restricted to the moved
+  block's DEPENDENT dims (dims the block binds in its `iter_values`), must be
+  an exact `(loop_var, extent)` prefix of the moved block's loops. Mismatch
+  (partial split, different order) requires `Split`/`Reorder` first.
+- **Reduction not replicated** — reject sinking an ACCUMULATION block under a
+  target loop iterating a dim the block writes at *full extent* (no per-tile
+  index): the accumulation would re-run per iteration into an un-reinitialised
   accumulator (summed `trip` times).
 
 A subtlety the rewrite exposed: the dim-coverage helpers must walk *all* ForNode
@@ -486,20 +471,20 @@ slot; `-2` = `lp + 1`, the earliest). We adopt the same convention.
 | 1 | Stage pipeline (acyclic deps) | Cyclic producer-consumer chains | both (precondition) | `Dependency` by construction |
 | 2 | Block is well-formed | Opaque/`SEQUENTIAL`-scan blocks | both | **not enforced** (no opaque op yet) |
 | 3 | Target not ancestor of block | Self-referential moves | both | face `_check_legality` (inline) |
-| 4 | Block is not output | Sinking the kernel's final store | `ComputeAt` only | face `_check_legality` (inline) |
-| 5 | No dependency edge points backward after the splice | Producer sunk past a reader / consumer lifted above a writer; init/drain entering its reduction loop; full read before tiled write | both | `_check_move_preserves_dependencies` (span query, frozen directions) |
-| 5-cov | Reduction axis not covered; reduction not replicated; coverage divides | Accumulator driven by a foreign loop / re-run without re-init | both | `_check_move_realizable` |
+| 4 | Block is not output | Sinking the kernel's final store | **DROPPED** (span-promotion permits legal output-block moves) | N/A |
+| 5 | No dependency edge points backward after the splice | Producer sunk past a reader / consumer lifted above a writer; init/drain entering its reduction loop; full read before tiled write | `CodeMotion` | `Dependency.first_backward_edge_for_insertion` (span query, frozen directions) |
+| 5-cov | Same-prefix merge on dependent dims; reduction not replicated | Accumulator driven by a foreign loop / re-run without re-init | `CodeMotion` | `_check_same_loop_prefix` |
 | 6 | Insertion gap exists | No legal position among target's children | both | `_legal_indices` (the `(lp, fc]` gap) |
 
 Conditions 5/5-cov and 6 together encode the dependency-preservation guarantee.
 The others rule out structurally nonsensical moves. The single span query of 5
-replaced the per-direction 5a/5b root-sibling rules (see §5-shipped); the
-loop-endpoint CARRY/COVER edges let one comparison cover reduction-init
-domination and tiled-write/full-read coverage alongside plain flow ordering.
+replaced the per-direction 5a/5b root-sibling rules (see §5-shipped);
+span-promotion lets one comparison cover reduction-init domination and coverage
+alongside plain flow ordering.
 
 ## Composition with other transforms
 
-`ComputeAt` is restricted to *full coverage* of any same-dim loop the moved
+`CodeMotion` is restricted to *full coverage* of any same-dim loop the moved
 subtree carries. Partial-coverage cases must `Split` the moved subtree's loop
 (or the target's enclosing loop) first, so the to-be-collapsed segment matches
 the target's coverage exactly.
@@ -526,10 +511,10 @@ for m_outer in range(2):
         for n in range(4):
             tensor_copy(...)
 #
-# Now ReverseComputeAt(target_loop=<m_inner of matmul>) is legal — the
+# Now CodeMotion(target_loop=<m_inner of matmul>) is legal — the
 # moved subtree's m_inner exactly matches the target's m_inner coverage,
 # and m_outer + n stay as the moved subtree's residual outer/inner loops.
 ```
 
-This keeps `ComputeAt` mechanical: identify covered dims, drop those loops
+This keeps `CodeMotion` mechanical: identify covered dims, drop those loops
 wholesale, splice the rest under the target. No region-cover arithmetic.

@@ -31,7 +31,7 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.synthesis.simulate_nki import simulate_fp32
-from nkigym.transforms import ComputeAt, Fuse, Reorder, ReverseComputeAt, Split
+from nkigym.transforms import CodeMotion, Fuse, Reorder, Split
 
 K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
@@ -77,7 +77,7 @@ if __name__ == "__main__":
     os.makedirs(CACHE_DIR, exist_ok=True)
 
     """Random-policy rollouts via the KernelMDP environment."""
-    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), ComputeAt(), ReverseComputeAt()])
+    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), CodeMotion()])
     rng = random.Random()
     for k in range(NUM_ROLLOUTS):
         state = env.reset()

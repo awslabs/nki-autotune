@@ -47,7 +47,7 @@ class Split(Transform):
             data = ir.tree.data(nid)
             if isinstance(data, ForNode):
                 if _encloses_multiple_blocks(ir.tree, nid):
-                    """Outer-trip Split of a shared (post-ComputeAt) loop is illegal — see
+                    """Outer-trip Split of a shared (post-CodeMotion) loop is illegal — see
                     _reject_if_shared_loop; do not offer it as a candidate action."""
                     continue
                 for factors in _factorizations(data.extent):
@@ -248,7 +248,7 @@ def _blocks_under_loop(tree: KernelTree, loop_nid: int) -> set[int]:
 def _encloses_multiple_blocks(tree: KernelTree, loop_nid: int) -> bool:
     """True when ``loop_nid`` encloses ISA leaves owned by more than one block.
 
-    Such a loop was made shared by a prior ``ComputeAt`` co-location; an
+    Such a loop was made shared by a prior ``CodeMotion`` co-location; an
     outer-trip Split of it is unsafe (see :func:`_reject_if_shared_loop`).
     """
     return len(_blocks_under_loop(tree, loop_nid) - {_enclosing_block_of(tree, loop_nid)}) > 0
@@ -259,7 +259,7 @@ def _reject_if_shared_loop(tree: KernelTree, loop_nid: int) -> None:
 
     ``_do_outer_trip`` rewrites only the target loop's *enclosing* BlockNode
     (``normalize_block`` recomputes that block's bindings from the new loop
-    chain). A loop that a prior ``ComputeAt`` made shared — i.e. one enclosing
+    chain). A loop that a prior ``CodeMotion`` made shared — i.e. one enclosing
     ISA leaves of a nested sub-block as well as the enclosing block's own leaf —
     would have only the enclosing block rewritten, leaving the nested block's
     ``iter_value`` referencing the old single loop var while its sibling now
@@ -267,7 +267,7 @@ def _reject_if_shared_loop(tree: KernelTree, loop_nid: int) -> None:
     inconsistently (sim out-of-bounds / wrong accumulation).
 
     Splitting a dim is orthogonal to co-locating producers: do the Split on the
-    private per-op loop *before* the ``ComputeAt`` that shares it. This guard
+    private per-op loop *before* the ``CodeMotion`` that shares it. This guard
     keeps the broken ordering a loud rejection rather than a wrong kernel.
     """
     if _encloses_multiple_blocks(tree, loop_nid):
@@ -276,7 +276,7 @@ def _reject_if_shared_loop(tree: KernelTree, loop_nid: int) -> None:
         raise TransformLegalityError(
             f"Split target loop {loop_nid} is shared across multiple blocks "
             f"(encloses leaves of nested block(s) {extra} besides its enclosing "
-            f"block {enclosing_block}); split the per-op loop before ComputeAt co-locates them"
+            f"block {enclosing_block}); split the per-op loop before CodeMotion co-locates them"
         )
 
 

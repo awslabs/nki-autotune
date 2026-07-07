@@ -1,4 +1,4 @@
-"""Region-regen core for ComputeAt / ReverseComputeAt.
+"""Region-regen core for CodeMotion.
 
 A move relocates one block under a target loop. These pure functions
 derive, from the affine ``iter_values`` of both the moved block and the
@@ -39,7 +39,7 @@ def dim_loops_of_block(tree: KernelTree, block_nid: int) -> dict[str, list[tuple
     """Map each concrete dim to the ForNodes driving it as ``(loop_var, extent)`` outer→inner.
 
     A dim's loops are the block's ENCLOSING ForNodes on that dim (loops a prior
-    ComputeAt nested the block under — outer) followed by the block's own local
+    CodeMotion nested the block under — outer) followed by the block's own local
     ForNodes (inner). An already-sunk block owns no local loops on its covered
     dims; those dims are driven entirely by enclosing loops, so re-moving it
     still sees its full iteration domain. For a top-level block the enclosing
