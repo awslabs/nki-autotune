@@ -54,3 +54,25 @@ def ko_loop_nid(ir: KernelIR) -> int:
         if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var.startswith("i_d0_")
     ]
     return k_loops[0]
+
+
+def _mm_m_loop(ir: KernelIR) -> int:
+    """nid of the matmul-enclosing M loop (i_d1_0), not a load's same-named loop."""
+    mm = matmul_leaf_nid(ir)
+    return next(
+        a
+        for a in ir.tree.ancestors(mm)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d1_0"
+    )
+
+
+def mid_ladder_ir() -> KernelIR:
+    """Mid state: Split(K -> ko=2, ki=8) then Split(M -> 4, 4); buffers stay packed.
+
+    K split (ko/ki) + M tiled (i_d1_0 x i_d1_1), every buffer still a packed ndarray,
+    no load sunk — isolates RFactor's role-location + geometry from the list-buffer
+    dimension. Mirrors ``examples/rfactor_states.py``'s ``_mid_packed`` atom-for-atom
+    so the harness diagnosis and these tests share one state.
+    """
+    ir = split_k_ir()
+    return Split().apply(ir, SplitOption(target_nid=_mm_m_loop(ir), factors=(4, 4), target_axis=None))
