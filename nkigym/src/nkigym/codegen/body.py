@@ -236,11 +236,19 @@ def _version_rotation(buf: Buffer, loop_var: str) -> Expr | None:
 
 
 def _emit_alloc(buf: Buffer) -> str:
-    """Emit a single ``nl.ndarray(...)`` line for ``buf``.
+    """Emit the ``nl.ndarray(...)`` declaration for ``buf``.
 
-    Shape comes from :meth:`Buffer.physical_shape` — the shared source of
-    truth that also feeds the tree visualization.
+    A list-of-tiles buffer (:attr:`Buffer.num_tiles` > 1) emits a Python list
+    comprehension of ``num_tiles`` separate per-tile ndarrays
+    (:meth:`Buffer.per_tile_physical_shape`); a packed buffer (the default) emits a
+    single ndarray of :meth:`Buffer.physical_shape`, byte-identical to before.
     """
+    if buf.num_tiles > 1:
+        shape = "(" + ", ".join(str(s) for s in buf.per_tile_physical_shape()) + ")"
+        return (
+            f"{buf.name} = [nl.ndarray({shape}, dtype=nl.{buf.physical_dtype()}, "
+            f"buffer=nl.{buf.location}) for _ in range({buf.num_tiles})]"
+        )
     shape = "(" + ", ".join(str(s) for s in buf.physical_shape()) + ")"
     return f"{buf.name} = nl.ndarray({shape}, dtype=nl.{buf.physical_dtype()}, buffer=nl.{buf.location})"
 
@@ -305,23 +313,38 @@ def _format_tile_index(lo: Expr, rotation: Expr | None) -> str:
 def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | None = None) -> str:
     """Render a :class:`BufferRegion` as a Python slice expression on its tensor.
 
-    ``rotation`` (when not None) is the ``loop_var % versions`` term combined
-    with the SBUF/PSUM tile-axis index to select a pipeline buffer version
-    (see :func:`_format_tile_index`). Ignored for ``shared_hbm`` (no tile
-    axis) and when None (single-version buffers, byte-identical to before).
+    For a packed buffer the SBUF/PSUM partition axis renders ``[0:128, tile_index,
+    F]``. For a list-of-tiles buffer (:attr:`Buffer.num_tiles` > 1) the tile index is
+    peeled into a leading list subscript and the within-tile middle index is 0:
+    ``name[tile_index][0:128, 0, F]`` — the k6/k13/k21/k26 form. Only per-tile degree 1
+    is supported (the whole manual ladder uses it); a list buffer with a per-tile middle
+    dim other than 1 is rejected loudly. ``rotation`` (the pipeline version term) never
+    combines with the list form — ``versions>1`` with ``num_tiles>1`` is rejected at
+    allocation — so it applies only on the packed path.
     """
+    list_subscript = ""
     parts: list[str] = []
     for axis_index, (lo, hi) in enumerate(region.ranges):
         if axis_index == 0 and buf.location != "shared_hbm":
             if not isinstance(hi, Const) or hi.value != PARTITION_DIM:
                 raise AssertionError(f"{buf.name}: SBUF/PSUM partition axis must use a partition-sized tile; got {hi}")
-            parts.append(f"0:{PARTITION_DIM}")
-            parts.append(_format_tile_index(lo, rotation))
+            if buf.num_tiles > 1:
+                if buf.per_tile_physical_shape()[1] != 1:
+                    raise AssertionError(
+                        f"{buf.name}: list-of-tiles render supports per-tile degree 1 only; "
+                        f"got per-tile middle {buf.per_tile_physical_shape()[1]}"
+                    )
+                list_subscript = f"[{_format_tile_index(lo, rotation)}]"
+                parts.append(f"0:{PARTITION_DIM}")
+                parts.append("0")
+            else:
+                parts.append(f"0:{PARTITION_DIM}")
+                parts.append(_format_tile_index(lo, rotation))
         else:
             lo_str = format_expr(lo)
             hi_str = format_expr(hi)
             parts.append(f"{lo_str}:{lo_str} + {hi_str}")
-    return f"{region.tensor}[{', '.join(parts)}]"
+    return f"{region.tensor}{list_subscript}[{', '.join(parts)}]"
 
 
 __all__ = ["emit_body", "render_buffer_region"]

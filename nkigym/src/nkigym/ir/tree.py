@@ -121,6 +121,7 @@ class Buffer:
         dtype: ``"float32"`` / ``"float16"`` / ``"bfloat16"``.
         location: ``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``.
         versions: pipeline buffer-version count (default 1).
+        num_tiles: list-of-tiles count (default 1).
     """
 
     name: str
@@ -133,6 +134,13 @@ class Buffer:
     physical_shape so the renderer's ``loop_var % versions`` rotation
     addresses distinct slots. Set by SoftwarePipeline (use_stage − def_stage
     + 1); left 1 everywhere else."""
+    num_tiles: int = 1
+    """List-of-tiles count. 1 = a single packed ``nl.ndarray`` (renders
+    byte-identically to today). >1 splits the buffer into a Python LIST of
+    ``num_tiles`` separate ndarrays, each :meth:`per_tile_physical_shape`, indexed
+    by a leading list subscript at the call site. Orthogonal to :attr:`versions`
+    (degree vs count); the two do not yet compose. Set by the BufferLayout transform;
+    left 1 everywhere else."""
 
     def physical_shape(self) -> tuple[int, ...]:
         """Return the shape ``nl.ndarray`` actually allocates for this buffer.
@@ -154,6 +162,29 @@ class Buffer:
             raise AssertionError(f"{self.name}: leading extent {leading} must be a multiple of {PARTITION_DIM}")
         return (PARTITION_DIM, (leading // PARTITION_DIM) * self.versions, free)
 
+    def per_tile_physical_shape(self) -> tuple[int, ...]:
+        """Return the shape of ONE tile when this buffer renders as a list of tiles.
+
+        The list-of-tiles form (:attr:`num_tiles` > 1) allocates ``num_tiles``
+        separate ndarrays, each this shape — :meth:`physical_shape` with the tile
+        (middle) dim divided by ``num_tiles``. Identity when ``num_tiles == 1`` (the
+        single packed buffer). Rejects the combinations this representation does not
+        yet support: splitting a ``shared_hbm`` buffer (no tile axis) and composing
+        ``versions > 1`` with ``num_tiles > 1`` (two distinct tile-dim multipliers).
+        """
+        if self.num_tiles == 1:
+            return self.physical_shape()
+        if self.location == "shared_hbm":
+            raise AssertionError(f"{self.name}: shared_hbm has no tile axis to split (num_tiles must be 1)")
+        if self.versions > 1:
+            raise AssertionError(
+                f"{self.name}: versions>1 ({self.versions}) with num_tiles>1 ({self.num_tiles}) is unsupported"
+            )
+        partition, total_tiles, free = self.physical_shape()
+        if total_tiles % self.num_tiles != 0:
+            raise AssertionError(f"{self.name}: num_tiles {self.num_tiles} does not divide tile-dim {total_tiles}")
+        return (partition, total_tiles // self.num_tiles, free)
+
     def physical_dtype(self) -> str:
         """Return the dtype ``nl.ndarray`` actually allocates for this buffer.
 
@@ -169,9 +200,14 @@ class Buffer:
     def label(self) -> str:
         """Return ``name (physical_shape) dtype@location`` on one line.
 
-        Shows the physical allocation shape (3D for sbuf/psum, 2D for
-        shared_hbm) so the visualization matches the rendered kernel.
+        For a list-of-tiles buffer (:attr:`num_tiles` > 1) shows
+        ``name [N x (per_tile_shape)] dtype@location`` instead, matching the rendered
+        list allocation. Shows the physical allocation shape so the visualization
+        matches the rendered kernel.
         """
+        if self.num_tiles > 1:
+            per = ", ".join(str(extent) for extent in self.per_tile_physical_shape())
+            return f"{self.name} [{self.num_tiles} x ({per})] {self.dtype}@{self.location}"
         shape_str = ", ".join(str(extent) for extent in self.physical_shape())
         return f"{self.name} ({shape_str}) {self.dtype}@{self.location}"
 

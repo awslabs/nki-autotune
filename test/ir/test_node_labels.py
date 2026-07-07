@@ -219,3 +219,72 @@ def test_mermaid_shows_blocknode_iter_values_and_regions():
     """Region offsets render with literal brackets (e.g. lhs_T[...]), no HTML entity."""
     assert "lhs_T[" in mmd
     assert "&#91;" not in mmd
+
+
+def test_buffer_num_tiles_default_unchanged():
+    """num_tiles defaults to 1; physical_shape and label are byte-identical to today."""
+    from nkigym.ir.tree import Buffer
+
+    buf = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
+    assert buf.num_tiles == 1
+    assert buf.physical_shape() == (128, 16, 2048)
+    assert buf.label() == "sbuf_lhs_T (128, 16, 2048) bfloat16@sbuf"
+
+
+def test_per_tile_physical_shape_splits_middle_dim():
+    """num_tiles>1 divides the tile (middle) dim; partition + free unchanged."""
+    from nkigym.ir.tree import Buffer
+
+    buf = Buffer(name="sbuf_prod", shape=(2048, 512), dtype="bfloat16", location="sbuf", num_tiles=16)
+    assert buf.physical_shape() == (128, 16, 512)
+    assert buf.per_tile_physical_shape() == (128, 1, 512)
+
+
+def test_per_tile_physical_shape_identity_when_one():
+    """num_tiles==1: per_tile_physical_shape == physical_shape (the packed buffer)."""
+    from nkigym.ir.tree import Buffer
+
+    buf = Buffer(name="p", shape=(2048, 2048), dtype="float32", location="psum")
+    assert buf.per_tile_physical_shape() == buf.physical_shape()
+
+
+def test_buffer_label_shows_list_form_when_num_tiles_gt_one():
+    """label() shows ``name [N x (per_tile)] dtype@loc`` for a list-of-tiles buffer."""
+    from nkigym.ir.tree import Buffer
+
+    buf = Buffer(name="sbuf_prod", shape=(2048, 512), dtype="bfloat16", location="sbuf", num_tiles=16)
+    assert buf.label() == "sbuf_prod [16 x (128, 1, 512)] bfloat16@sbuf"
+
+
+def test_per_tile_physical_shape_rejects_hbm_split():
+    """shared_hbm has no tile axis; num_tiles>1 is rejected loudly."""
+    import pytest
+
+    from nkigym.ir.tree import Buffer
+
+    buf = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm", num_tiles=4)
+    with pytest.raises(AssertionError):
+        buf.per_tile_physical_shape()
+
+
+def test_per_tile_physical_shape_rejects_versions_and_tiles_combo():
+    """versions>1 combined with num_tiles>1 is not yet supported; rejected loudly."""
+    import pytest
+
+    from nkigym.ir.tree import Buffer
+
+    buf = Buffer(name="s", shape=(2048, 512), dtype="bfloat16", location="sbuf", versions=2, num_tiles=16)
+    with pytest.raises(AssertionError):
+        buf.per_tile_physical_shape()
+
+
+def test_per_tile_physical_shape_rejects_non_dividing_count():
+    """num_tiles that does not divide the tile (middle) dim is rejected loudly."""
+    import pytest
+
+    from nkigym.ir.tree import Buffer
+
+    buf = Buffer(name="s", shape=(2048, 512), dtype="bfloat16", location="sbuf", num_tiles=3)
+    assert buf.physical_shape()[1] == 16
+    with pytest.raises(AssertionError):
+        buf.per_tile_physical_shape()
