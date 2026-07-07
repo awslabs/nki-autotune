@@ -114,7 +114,7 @@ def _axis_span(lo: Expr, width: Expr, axis: int, location: str, anchors: set[str
     """Max value of ``lo + width`` over the interior-loop box, anchors zeroed.
 
     Axis 0 of sbuf/psum carries a bare partition-tile index with width 128;
-    its compacted extent is reported in element space (num_tiles * 128).
+    its compacted extent is reported in element space (list_len * 128).
     """
     assert isinstance(width, Const), f"region width must be Const; got {width!r}"
     zeroed = substitute(lo, {a: Const(value=0) for a in anchors})

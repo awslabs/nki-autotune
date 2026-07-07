@@ -8,18 +8,18 @@ from test.transforms._ladder_compare import assert_matches_render, assert_matche
 
 _INTERLEAVED = """
 def k(lhs_T, rhs):
-    a = nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum)
-    nisa.memset(dst=a[0:128, 0, 0:512], value=0.0)
-    b = nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=b[0:128, 0, 0:512], src=a[0:128, 0, 0:512])
+    a = [nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(1)]
+    nisa.memset(dst=a[0][0:128, 0, 0:512], value=0.0)
+    b = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    nisa.tensor_copy(dst=b[0][0:128, 0, 0:512], src=a[0][0:128, 0, 0:512])
 """
 
 _HOISTED = """
 def k(lhs_T, rhs):
-    a = nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum)
-    b = nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.memset(dst=a[0:128, 0, 0:512], value=0.0)
-    nisa.tensor_copy(dst=b[0:128, 0, 0:512], src=a[0:128, 0, 0:512])
+    a = [nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(1)]
+    b = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    nisa.memset(dst=a[0][0:128, 0, 0:512], value=0.0)
+    nisa.tensor_copy(dst=b[0][0:128, 0, 0:512], src=a[0][0:128, 0, 0:512])
 """
 
 

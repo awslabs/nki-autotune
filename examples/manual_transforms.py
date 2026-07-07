@@ -104,6 +104,43 @@ def kernel_1(lhs_T, rhs):
     psum_prod = [nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum) for _ in range(1)]
     for i_d1_0 in range(16):
         nisa.memset(dst=psum_prod[0][0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
+    for i_d0_0 in range(16):
+        for i_d2_0 in range(4):
+            for i_d1_0 in range(16):
+                nisa.nc_matmul(
+                    stationary=sbuf_lhs_T[0][0:128, i_d0_0, i_d1_0 * 128 : i_d1_0 * 128 + 128],
+                    moving=sbuf_rhs[0][0:128, i_d0_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                    dst=psum_prod[0][0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                )
+    sbuf_prod = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d1_0 in range(16):
+        nisa.tensor_copy(src=psum_prod[0][0:128, i_d1_0, 0 : 0 + 2048], dst=sbuf_prod[0][0:128, i_d1_0, 0 : 0 + 2048])
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    for i_d1_0 in range(16):
+        nisa.dma_copy(
+            src=sbuf_prod[0][0:128, i_d1_0, 0 : 0 + 2048], dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, 0 : 0 + 2048]
+        )
+    return hbm_out
+
+
+@nki.jit
+def kernel_2(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+
+    sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=lhs_T[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_lhs_T[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+    sbuf_rhs = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=rhs[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_rhs[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+    psum_prod = [nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum) for _ in range(1)]
+    for i_d1_0 in range(16):
+        nisa.memset(dst=psum_prod[0][0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
     # Reorder
     for i_d2_0 in range(4):
         for i_d0_0 in range(16):
@@ -125,7 +162,7 @@ def kernel_1(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_2(lhs_T, rhs):
+def kernel_3(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -164,7 +201,7 @@ def kernel_2(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_3(lhs_T, rhs):
+def kernel_4(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -208,7 +245,7 @@ def kernel_3(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_4(lhs_T, rhs):
+def kernel_5(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -252,7 +289,7 @@ def kernel_4(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_5(lhs_T, rhs):
+def kernel_6(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -296,7 +333,7 @@ def kernel_5(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_6(lhs_T, rhs):
+def kernel_7(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -340,7 +377,7 @@ def kernel_6(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_7(lhs_T, rhs):
+def kernel_8(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -388,7 +425,7 @@ def kernel_7(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_8(lhs_T, rhs):
+def kernel_9(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -485,7 +522,7 @@ If moved to target location:
 --> ok
 """
 @nki.jit
-def kernel_9(lhs_T, rhs):
+def kernel_10(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -532,7 +569,7 @@ def kernel_9(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_10(lhs_T, rhs):
+def kernel_11(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -581,7 +618,7 @@ def kernel_10(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_11(lhs_T, rhs):
+def kernel_12(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -630,7 +667,7 @@ def kernel_11(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_12(lhs_T, rhs):
+def kernel_13(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -678,7 +715,7 @@ def kernel_12(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_13(lhs_T, rhs):
+def kernel_14(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -726,7 +763,7 @@ def kernel_13(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_14(lhs_T, rhs):
+def kernel_15(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -775,7 +812,7 @@ def kernel_14(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_15(lhs_T, rhs):
+def kernel_16(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -824,7 +861,7 @@ def kernel_15(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_16(lhs_T, rhs):
+def kernel_17(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -870,7 +907,7 @@ def kernel_16(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_17(lhs_T, rhs):
+def kernel_18(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -917,7 +954,7 @@ def kernel_17(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_18(lhs_T, rhs):
+def kernel_19(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -968,7 +1005,58 @@ def kernel_18(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_19(lhs_T, rhs):
+def kernel_20(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+
+    sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=lhs_T[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_lhs_T[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+    sbuf_rhs = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    # Split
+    for i_d0_0 in range(2):
+        for i_d2_0 in range(4):
+            for i_d0_1 in range(8):
+                nisa.dma_copy(
+                    src=rhs[
+                        (i_d0_0 * 8 + i_d0_1) * 128 : (i_d0_0 * 8 + i_d0_1) * 128 + 128,
+                        i_d2_0 * 512 : i_d2_0 * 512 + 512,
+                    ],
+                    dst=sbuf_rhs[0][0:128, (i_d0_0 * 8 + i_d0_1), i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                )
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    for i_d2_0 in range(4):
+        psum_prod = [nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(16)]
+        for i_d1_0 in range(16):
+            nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, 0:512], value=0.0)
+        for i_d0_0 in range(2):
+            for i_d1_0 in range(4):
+                for i_d1_1 in range(4):
+                    for i_d0_1 in range(8):
+                        nisa.nc_matmul(
+                            stationary=sbuf_lhs_T[0][
+                                0:128,
+                                i_d0_0 * 8 + i_d0_1,
+                                (i_d1_0 * 4 + i_d1_1) * 128 : (i_d1_0 * 4 + i_d1_1) * 128 + 128,
+                            ],
+                            moving=sbuf_rhs[0][0:128, i_d0_0 * 8 + i_d0_1, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                            dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
+                        )
+        sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]
+        for i_d1_0 in range(16):
+            nisa.tensor_copy(src=psum_prod[i_d1_0][0:128, 0, 0:512], dst=sbuf_prod[i_d1_0][0:128, 0, 0:512])
+        for i_d1_0 in range(16):
+            nisa.dma_copy(
+                src=sbuf_prod[i_d1_0][0:128, 0, 0:512],
+                dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+            )
+    return hbm_out
+
+
+@nki.jit
+def kernel_21(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -1019,7 +1107,7 @@ def kernel_19(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_20(lhs_T, rhs):
+def kernel_22(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -1070,7 +1158,7 @@ def kernel_20(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_21(lhs_T, rhs):
+def kernel_23(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -1120,7 +1208,7 @@ def kernel_21(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_22(lhs_T, rhs):
+def kernel_24(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -1172,7 +1260,7 @@ def kernel_22(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_23(lhs_T, rhs):
+def kernel_25(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -1228,7 +1316,7 @@ def kernel_23(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_24(lhs_T, rhs):
+def kernel_26(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -1284,7 +1372,7 @@ def kernel_24(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_25(lhs_T, rhs):
+def kernel_27(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
@@ -1334,13 +1422,12 @@ def kernel_25(lhs_T, rhs):
 
 
 @nki.jit
-def kernel_26(lhs_T, rhs):
+def kernel_28(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
 
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     for i_d2_0 in range(4):
-        """init_one_stage"""
         psum_prod = [nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(16)]
         for i_d1_0 in range(16):
             nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, 0:512], value=0.0)
@@ -1372,7 +1459,6 @@ def kernel_26(lhs_T, rhs):
                             moving=sbuf_rhs[i_d0_1][0:128, 0, 0:512],
                             dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
                         )
-        """drain_one_stage"""
         sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]
         for i_d1_0 in range(16):
             nisa.tensor_copy(src=psum_prod[i_d1_0][0:128, 0, 0:512], dst=sbuf_prod[i_d1_0][0:128, 0, 0:512])
@@ -1386,7 +1472,7 @@ def kernel_26(lhs_T, rhs):
 
 # Apply RFactor
 @nki.jit
-def kernel_27(lhs_T, rhs):
+def kernel_29(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)

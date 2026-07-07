@@ -687,11 +687,13 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### Task 6: Driven k0→k26 ladder in manual order
 
-Replace `_build_ladder` in `examples/kernel_transforms.py` with a 26-step chain in MANUAL rung order (no RFactor), inserting the 4 `BufferLayout` rungs at k6/k13/k21/k26. Wire per-rung verification: byte-exact vs `manual_transforms.kernel_i`, CPU-sim, and HW-MFU match. This is the deliverable proof of "reproduce k0→k26".
+Replace `_build_ladder` in `examples/kernel_transforms.py` with a MANUAL-rung-order chain (no RFactor), inserting the `BufferLayout` rungs. Wire per-rung verification: byte-exact vs `manual_transforms.kernel_i`, CPU-sim, and HW-MFU match.
+
+**SHIPPED RESULT (2026-07-04, `33b4c44`) — supersedes the "k0→k26" framing below:** driving this on gym-1 found two manual "# Reorder" rungs are 2-level (adjacent-swap `Reorder` needs 2 atomic steps each), so the manual ladder was normalized to carry the intermediates (user-directed) → manual is now **k0…k29** (RFactor k29), pre-RFactor endpoint **k28**, BufferLayout rungs **k7/k14/k23/k28**. The driven ladder is **28 transforms reproducing k0…k28** byte-exact + CPU-sim + HW-MFU. Read "k0→k26" / "k6/k13/k21/k26" below as the pre-discovery estimate. The `_build_ladder_prefix_through_memset_sink()` helper was NOT needed (Task 5 was rewritten to test `compact_shapes` directly).
 
 **Files:**
-- Modify: `examples/kernel_transforms.py` — replace `_build_ladder` (lines 325-414); extend `_main` (lines 451+) to diff each rung vs manual and assert MFU.
-- Add: `_build_ladder_prefix_through_memset_sink()` helper (consumed by Task 5).
+- Modify: `examples/kernel_transforms.py` — replace `_build_ladder`; extend `_main` to diff each rung vs manual, CPU-sim, and profile.
+- Modify: `examples/manual_transforms.py` — insert the 2 atomic-reorder intermediates + renumber; normalize the endpoint kernel's decorative string-literals.
 
 **Interfaces:**
 - Consumes: all shipped transforms + `BufferLayout/BufferLayoutOption`; existing semantic locators (`_loop`, `_psum_memset_leaf`, `_psum_memset_blk`, `_blk_loop`, `_op_leaf`, `_op_blk`, `_blk_m_loop`, `_load_leaf`, `_load_blk`, `_load_for`); `assert_matches_hand`; `manual_transforms`; `autotune.runner.profile`.

@@ -110,18 +110,33 @@ def _normalize_nisa_call(node: ast.Call) -> None:
 
 
 def _is_ndarray_decl(stmt: ast.stmt) -> bool:
-    """True when ``stmt`` is ``<name> = nl.ndarray(...)``."""
+    """True when ``stmt`` is ``<name> = nl.ndarray(...)`` or ``<name> = [nl.ndarray(...) for _ in range(N)]``."""
     if not isinstance(stmt, ast.Assign):
         return False
+    if not (len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)):
+        return False
     value = stmt.value
-    is_ndarray = (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Attribute)
-        and isinstance(value.func.value, ast.Name)
-        and value.func.value.id == "nl"
-        and value.func.attr == "ndarray"
-    )
-    return is_ndarray and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
+    """Bare form: nl.ndarray(...)"""
+    if isinstance(value, ast.Call):
+        is_ndarray = (
+            isinstance(value.func, ast.Attribute)
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "nl"
+            and value.func.attr == "ndarray"
+        )
+        return is_ndarray
+    """ListComp form: [nl.ndarray(...) for _ in range(N)]"""
+    if isinstance(value, ast.ListComp):
+        elt = value.elt
+        is_ndarray_elt = (
+            isinstance(elt, ast.Call)
+            and isinstance(elt.func, ast.Attribute)
+            and isinstance(elt.func.value, ast.Name)
+            and elt.func.value.id == "nl"
+            and elt.func.attr == "ndarray"
+        )
+        return is_ndarray_elt
+    return False
 
 
 def _decl_target_name(stmt: ast.stmt) -> str:

@@ -27,7 +27,7 @@ def test_render_canonical_matmul_emits_expected_structure():
     src = render(ir)
     assert "@nki.jit" in src
     assert "def nki_f_matmul(lhs_T, rhs):" in src
-    assert "psum_prod = nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum)" in src
+    assert "psum_prod = [nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum) for _ in range(1)]" in src
     assert "nisa.memset" in src
     assert "nisa.nc_matmul" in src
     assert "return hbm_out" in src.strip().splitlines()[-1]
@@ -53,25 +53,25 @@ def test_render_canonical_matmul_passes_numerics():
 _KERNEL_0_REFERENCE = """
 @nki.jit
 def kernel_0(lhs_T, rhs):
-    sbuf_lhs_T = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+    sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
     for i_d0_0 in range(16):
-        nisa.dma_copy(src=lhs_T[i_d0_0 * 128:i_d0_0 * 128 + 128, 0:0 + 2048], dst=sbuf_lhs_T[0:128, i_d0_0, 0:0 + 2048])
-    sbuf_rhs = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.dma_copy(src=lhs_T[i_d0_0 * 128:i_d0_0 * 128 + 128, 0:0 + 2048], dst=sbuf_lhs_T[0][0:128, i_d0_0, 0:0 + 2048])
+    sbuf_rhs = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
     for i_d0_0 in range(16):
-        nisa.dma_copy(src=rhs[i_d0_0 * 128:i_d0_0 * 128 + 128, 0:0 + 2048], dst=sbuf_rhs[0:128, i_d0_0, 0:0 + 2048])
-    psum_prod = nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum)
+        nisa.dma_copy(src=rhs[i_d0_0 * 128:i_d0_0 * 128 + 128, 0:0 + 2048], dst=sbuf_rhs[0][0:128, i_d0_0, 0:0 + 2048])
+    psum_prod = [nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum) for _ in range(1)]
     for i_d1_0 in range(16):
-        nisa.memset(dst=psum_prod[0:128, i_d1_0, 0:0 + 2048], value=0.0)
+        nisa.memset(dst=psum_prod[0][0:128, i_d1_0, 0:0 + 2048], value=0.0)
     for i_d0_0 in range(16):
         for i_d1_0 in range(16):
             for i_d2_0 in range(4):
-                nisa.nc_matmul(stationary=sbuf_lhs_T[0:128, i_d0_0, i_d1_0 * 128:i_d1_0 * 128 + 128], moving=sbuf_rhs[0:128, i_d0_0, i_d2_0 * 512:i_d2_0 * 512 + 512], dst=psum_prod[0:128, i_d1_0, i_d2_0 * 512:i_d2_0 * 512 + 512])
-    sbuf_prod = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.nc_matmul(stationary=sbuf_lhs_T[0][0:128, i_d0_0, i_d1_0 * 128:i_d1_0 * 128 + 128], moving=sbuf_rhs[0][0:128, i_d0_0, i_d2_0 * 512:i_d2_0 * 512 + 512], dst=psum_prod[0][0:128, i_d1_0, i_d2_0 * 512:i_d2_0 * 512 + 512])
+    sbuf_prod = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
     for i_d1_0 in range(16):
-        nisa.tensor_copy(src=psum_prod[0:128, i_d1_0, 0:0 + 2048], dst=sbuf_prod[0:128, i_d1_0, 0:0 + 2048])
+        nisa.tensor_copy(src=psum_prod[0][0:128, i_d1_0, 0:0 + 2048], dst=sbuf_prod[0][0:128, i_d1_0, 0:0 + 2048])
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     for i_d1_0 in range(16):
-        nisa.dma_copy(src=sbuf_prod[0:128, i_d1_0, 0:0 + 2048], dst=hbm_out[i_d1_0 * 128:i_d1_0 * 128 + 128, 0:0 + 2048])
+        nisa.dma_copy(src=sbuf_prod[0][0:128, i_d1_0, 0:0 + 2048], dst=hbm_out[i_d1_0 * 128:i_d1_0 * 128 + 128, 0:0 + 2048])
     return hbm_out
 """
 

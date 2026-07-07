@@ -236,21 +236,24 @@ def _version_rotation(buf: Buffer, loop_var: str) -> Expr | None:
 
 
 def _emit_alloc(buf: Buffer) -> str:
-    """Emit the ``nl.ndarray(...)`` declaration for ``buf``.
+    """Emit the buffer declaration for ``buf``.
 
-    A list-of-tiles buffer (:attr:`Buffer.num_tiles` > 1) emits a Python list
-    comprehension of ``num_tiles`` separate per-tile ndarrays
-    (:meth:`Buffer.per_tile_physical_shape`); a packed buffer (the default) emits a
-    single ndarray of :meth:`Buffer.physical_shape`, byte-identical to before.
+    ``shared_hbm`` buffers emit a single bare ``nl.ndarray`` of
+    :meth:`Buffer.physical_shape` (no tile axis). Every sbuf/psum buffer emits a
+    Python list of :attr:`Buffer.list_len` per-tile ndarrays
+    (:meth:`Buffer.per_tile_physical_shape`) — uniformly, including ``list_len == 1``
+    (a list-of-one), so the call site always indexes with a leading ``[list_idx]``.
     """
-    if buf.num_tiles > 1:
+    if buf.location == "shared_hbm":
+        shape = "(" + ", ".join(str(s) for s in buf.physical_shape()) + ")"
+        result = f"{buf.name} = nl.ndarray({shape}, dtype=nl.{buf.physical_dtype()}, buffer=nl.{buf.location})"
+    else:
         shape = "(" + ", ".join(str(s) for s in buf.per_tile_physical_shape()) + ")"
-        return (
+        result = (
             f"{buf.name} = [nl.ndarray({shape}, dtype=nl.{buf.physical_dtype()}, "
-            f"buffer=nl.{buf.location}) for _ in range({buf.num_tiles})]"
+            f"buffer=nl.{buf.location}) for _ in range({buf.list_len})]"
         )
-    shape = "(" + ", ".join(str(s) for s in buf.physical_shape()) + ")"
-    return f"{buf.name} = nl.ndarray({shape}, dtype=nl.{buf.physical_dtype()}, buffer=nl.{buf.location})"
+    return result
 
 
 def _emit_isa_call(node: ISANode, ir: KernelIR, rotations: dict[str, Expr]) -> str:
@@ -313,14 +316,22 @@ def _format_tile_index(lo: Expr, rotation: Expr | None) -> str:
 def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | None = None) -> str:
     """Render a :class:`BufferRegion` as a Python slice expression on its tensor.
 
-    For a packed buffer the SBUF/PSUM partition axis renders ``[0:128, tile_index,
-    F]``. For a list-of-tiles buffer (:attr:`Buffer.num_tiles` > 1) the tile index is
-    peeled into a leading list subscript and the within-tile middle index is 0:
-    ``name[tile_index][0:128, 0, F]`` — the k6/k13/k21/k26 form. Only per-tile degree 1
-    is supported (the whole manual ladder uses it); a list buffer with a per-tile middle
-    dim other than 1 is rejected loudly. ``rotation`` (the pipeline version term) never
-    combines with the list form — ``versions>1`` with ``num_tiles>1`` is rejected at
-    allocation — so it applies only on the packed path.
+    ``shared_hbm`` renders flat ``name[lo:hi, ...]``. Every sbuf/psum buffer renders
+    as a list access ``name[list_idx][0:P, mid_idx, F]`` (uniform — there is no bare
+    form). The partition axis (axis 0) carries the tile index ``t``; with
+    ``a = per_tile middle = T // list_len``, branch on ``list_len``:
+
+    * ``list_len == 1`` — a list-of-one: ``list_idx = 0``, ``mid_idx = t`` (the whole
+      tile index). Preserves the pre-uniform packed middle, so a canonical multi-tile
+      buffer renders ``buf[0][0:P, t, F]``.
+    * ``a == 1`` (``list_len == T``, the full split) — ``list_idx = t``, ``mid_idx = 0``.
+    * ``a > 1`` (``1 < list_len < T``) — ``list_idx = t // a``, ``mid_idx = t % a``,
+      both via the non-normalising ``_format_raw`` (the aligned index is non-affine
+      under ``FloorDiv``, so ``format_expr``/``to_affine`` would raise).
+
+    ``rotation`` (the pipeline version term) applies only on the ``list_len == 1`` and
+    ``a == 1`` paths; ``a > 1`` requires ``list_len > 1``, and ``versions > 1`` with
+    ``list_len > 1`` is rejected at allocation, so no rotation reaches the ``a > 1`` path.
     """
     list_subscript = ""
     parts: list[str] = []
@@ -328,18 +339,20 @@ def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | Non
         if axis_index == 0 and buf.location != "shared_hbm":
             if not isinstance(hi, Const) or hi.value != PARTITION_DIM:
                 raise AssertionError(f"{buf.name}: SBUF/PSUM partition axis must use a partition-sized tile; got {hi}")
-            if buf.num_tiles > 1:
-                if buf.per_tile_physical_shape()[1] != 1:
-                    raise AssertionError(
-                        f"{buf.name}: list-of-tiles render supports per-tile degree 1 only; "
-                        f"got per-tile middle {buf.per_tile_physical_shape()[1]}"
-                    )
+            a = buf.per_tile_physical_shape()[1]
+            if buf.list_len == 1:
+                list_subscript = "[0]"
+                parts.append(f"0:{PARTITION_DIM}")
+                parts.append(_format_tile_index(lo, rotation))
+            elif a == 1:
                 list_subscript = f"[{_format_tile_index(lo, rotation)}]"
                 parts.append(f"0:{PARTITION_DIM}")
                 parts.append("0")
             else:
+                tile = f"({_format_raw(lo)})"
+                list_subscript = f"[{tile} // {a}]"
                 parts.append(f"0:{PARTITION_DIM}")
-                parts.append(_format_tile_index(lo, rotation))
+                parts.append(f"{tile} % {a}")
         else:
             lo_str = format_expr(lo)
             hi_str = format_expr(hi)

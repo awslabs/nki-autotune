@@ -1,37 +1,33 @@
 """Reproduce the ``manual_transforms.py`` ladder by DRIVING the shipped transforms.
 
-GOAL: drive the shipped transforms (Split / Reorder / RFactor / CodeMotion) from
-the canonical SSA matmul ``f_nkigym`` (== ``manual_transforms.py`` kernel_0) to the
-hand-built development target, ONE transform atom per rung, so the machine-driven
-ladder reproduces the hand ladder. ``_main`` renders every rung, CPU-sims it against
-``lhs_T.T @ rhs``, and compiles + profiles each on real Trn2 hardware.
+GOAL: drive the shipped transforms (Split / Reorder / CodeMotion / BufferLayout) from
+the canonical SSA matmul ``f_nkigym`` (== ``manual_transforms.py`` kernel_0), ONE
+transform per rung, so the machine-driven ladder reproduces the hand ladder
+RUNG-FOR-RUNG, BYTE-EXACT. ``_main`` renders every rung, asserts it AST-matches the
+corresponding ``manual_transforms.kernel_i`` (``assert_matches_hand``), CPU-sims it
+against ``lhs_T.T @ rhs``, and compiles + profiles each on real Trn2 hardware.
 
-d0 = K (reduction), d1 = M, d2 = N. ``_build_ladder`` is 25 atoms (k0..k25), all
-CPU-sim clean on gym-1:
-  k1-k2   Split x2     K -> ko(2),ki(8); M -> Mo(4),Mi(4)
-  k3-k8   Reorder x6   bubble N(i_d2_0) outermost, sink ki innermost
-                       -> matmul nest ``N > ko > Mo > Mi > ki``
-  k9      RFactor(ko)  one-stage -> two-stage accumulation: per-ko PSUM partial,
-                       ko folded in SBUF via ``tensor_tensor`` (fused single-
-                       accumulator form; psum stays per-output-tile)
-  k10-k15 Split x6     tensorize d2 (2048 -> 4x512) AND M (4x4) of the per-ko
-                       memset / drain ``tensor_copy`` / ``tensor_tensor`` fold
-  k16-k18 CodeMotion x3 sink memset(psum) + drain copy + ko-fold under the matmul's
-                       ``i_d1_1`` -> CO-LOCATED per (N, Mo, Mi) tile, fold INLINED.
-                       ``compact_shapes`` shrinks psum_prod/sbuf_rfactor to (128,1,512).
-  k19-k25 Split/Reorder/CodeMotion  tile the rhs load (d2) and lhs_T load (d1) and
-                       sink each under its tile loop -> streamed per-tile operands.
-k25 is the HW-runnable target reproduction: ``N > ko > Mo > Mi`` with a per-tile
-``memset -> ki-matmul -> tensor_copy -> ko-fold`` and streamed loads.
+d0 = K (reduction), d1 = M, d2 = N. ``_build_ladder`` is 28 transforms (k0..k28), each
+byte-exact to ``manual_transforms.py`` k0..k28 and CPU-sim clean on gym-1:
+  k1-k2   Reorder x2   bubble N(i_d2_0) outermost (each an adjacent-swap; the manual
+                       "# Reorder" from K>M>N to N>K>M is two atomic swaps -> k1, k2)
+  k3-k4   Split x2     K -> ko(2),ki(8); M -> Mo(4),Mi(4)
+  k5-k6   Reorder x2   -> matmul nest ``N > ko > Mo > Mi > ki``
+  k7      BufferLayout psum_prod -> list-of-16
+  k8-k10  drain tensor_copy: Split d2, Reorder to N-outer, CodeMotion sink under N
+  k11-k13 store: Split d2, Reorder, CodeMotion sink under N (sbuf_prod compacts to 512)
+  k14     BufferLayout sbuf_prod -> list-of-16
+  k15-k17 psum memset: Split d2, Reorder, CodeMotion sink under N
+  k18-k22 rhs load: Split d0(2,8), Split d2, Reorder x2 to N-outer, CodeMotion sink
+                    under ko (sbuf_rhs compacts to (128,8,512))
+  k23     BufferLayout sbuf_rhs -> list-of-8
+  k24-k27 lhs_T load: Split d1, Split d0(2,8), Reorder, CodeMotion sink under Mo
+  k28     BufferLayout sbuf_lhs_T -> list-of-8
 
-RELATION TO ``manual_transforms.py`` (the hand development target): this ladder
-reaches a target-EQUIVALENT compute body via its OWN sequence — it is NOT yet a
-rung-for-rung reproduction of the hand k0..k27. Two gaps remain (see
-``docs/superpowers/specs/2026-07-03-manual-transforms-reproduction-gap.md``):
-(1) the hand ladder's 4 "Buffer layout" rungs (packed ndarray -> list-of-tiles)
-need a ``BufferLayout`` transform that is not shipped — this ladder reaches per-tile
-SHAPES via ``compact_shapes`` but keeps buffers PACKED; (2) the hand ladder applies
-RFactor LAST, this one applies it EARLY. Closing both is what makes it 1-to-1.
+k28 is the pre-RFactor endpoint (== manual k28). The final RFactor rung (manual k28->k29)
+is OUT of scope here — see the BufferLayout design spec. Every locator is SEMANTIC
+(matmul loop_var, op-class block, load/PSUM leaf), tracking node ids across each
+transform's structural change.
 """
 
 import argparse
@@ -54,6 +50,7 @@ for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "nkigym", "src"), os.path.join(_
 
 from autotune.runner.api import profile
 from autotune.runner.types import KernelJob
+from examples import manual_transforms
 from nkigym.codegen import render
 from nkigym.ir import build_initial_ir
 from nkigym.ir.tree import ForNode, ISANode
@@ -64,15 +61,16 @@ from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.synthesis import simulate_fp32
 from nkigym.transforms import (
+    BufferLayout,
+    BufferLayoutOption,
     CodeMotion,
     CodeMotionOption,
     Reorder,
     ReorderOption,
-    RFactor,
-    RFactorOption,
     Split,
     SplitOption,
 )
+from test.transforms._ladder_compare import assert_matches_hand
 
 K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
@@ -323,76 +321,69 @@ def _blk_m_loop(ir: object, op_name: str) -> int:
 
 
 def _build_ladder() -> list[tuple[str, object]]:
-    """Drive the shipped transforms from canonical ``f_nkigym`` to a HW-runnable
-    ``kernel_target`` equivalent (k0..k19), with the ko-fold INLINED into the
-    matmul's innermost M loop. Returns ``[(name, ir), ...]``.
+    """Drive the shipped transforms from canonical ``f_nkigym`` to ``manual_transforms``
+    k0..k28, ONE transform per rung, in MANUAL rung order (NO RFactor — that is the
+    k28->k29 rung, out of scope). Returns ``[(name, ir), ...]`` of 29 entries.
 
-    Every locator is SEMANTIC (matmul loop_var, op-class block, PSUM-writer leaf),
-    so it tracks node ids across the structural change each ``apply`` makes — no
-    hard-coded nids. The N-OUTERMOST ladder (probed sim-clean on gym-1; the
-    fold-inlining the two coverage-guard refinements unblock — see the module
-    docstring):
-    k1-k2  Split K(->ko,ki) + Split M(->Mo,Mi); k3-k8 Reorder x6 -> nest
-    ``N > ko > Mo > Mi > ki``; k9 RFactor(ko) -> two-stage fold; k10-k15 Split each
-    of memset/copy/fold on d2(4x512) AND M(4x4) to the matmul's tile prefix;
-    k16-k18 CodeMotion memset + drain ``tensor_copy`` + ``tensor_tensor``
-    fold under the matmul's ``i_d1_1`` -> all CO-LOCATED per (N, Mo, Mi) tile, fold
-    INLINED in the matmul's innermost body. ``compact_shapes`` then shrinks
-    ``psum_prod`` and ``sbuf_rfactor`` to per-tile ``(128, 1, 512)``. k19-k20 Split
-    the rhs/lhs_T loads on their FREE axis (rhs d2, lhs_T d1, each 4x512) so each
-    load is one N-/M-tile wide, NOT the full 2048; k21-k22 CodeMotion the tiled rhs
-    load under ``i_d2_0`` (N) and lhs_T under ``i_d1_0`` (Mo) -> ``sbuf_rhs``
-    ``(128, 16, 512)`` and ``sbuf_lhs_T`` ``(128, 8, 512)`` streamed per-tile. k22
-    is the fold-inlined, tiled-load ``kernel_target`` reproduction.
+    Every locator is SEMANTIC (matmul loop_var, op-class block, load/PSUM leaf), so it
+    tracks node ids across the structural change each ``apply`` makes. The four
+    ``BufferLayout`` rungs (k7/k14/k23/k28) re-factorize a buffer to its list form; every
+    other rung is a Split / Reorder / CodeMotion.
+
+    k1-k6   Reorder x2 (N-outer, two atomic swaps) + Split K + Split M + Reorder x2
+            -> matmul nest ``N > ko > Mo > Mi > ki`` (manual k6's packed nest)
+    k7      BufferLayout psum_prod -> list-of-16
+    k8-k10  drain tensor_copy: Split d2, Reorder to N-outer, CodeMotion sink under N
+    k11-k13 store: Split d2, Reorder to N-outer, CodeMotion sink under N
+    k14     BufferLayout sbuf_prod -> list-of-16
+    k15-k17 psum memset: Split d2, Reorder to N-outer, CodeMotion sink under N
+    k18-k22 rhs load: Split d0(2,8), Split d2, Reorder x2 to N-outer, CodeMotion sink under ko
+    k23     BufferLayout sbuf_rhs -> list-of-8
+    k24-k27 lhs_T load: Split d1, Split d0(2,8), Reorder, CodeMotion sink under Mo
+    k28     BufferLayout sbuf_lhs_T -> list-of-8
     """
     steps = [
+        lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d1_0"), inner_nid=_loop(ir, "i_d2_0"))),
+        lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_0"), inner_nid=_loop(ir, "i_d2_0"))),
         lambda ir: Split().apply(ir, SplitOption(target_nid=_loop(ir, "i_d0_0"), factors=(2, 8), target_axis=None)),
         lambda ir: Split().apply(ir, SplitOption(target_nid=_loop(ir, "i_d1_0"), factors=(4, 4), target_axis=None)),
-        lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d1_1"), inner_nid=_loop(ir, "i_d2_0"))),
-        lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d1_0"), inner_nid=_loop(ir, "i_d2_0"))),
-        lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_1"), inner_nid=_loop(ir, "i_d2_0"))),
-        lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_0"), inner_nid=_loop(ir, "i_d2_0"))),
         lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_1"), inner_nid=_loop(ir, "i_d1_0"))),
         lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_1"), inner_nid=_loop(ir, "i_d1_1"))),
-        lambda ir: RFactor().apply(ir, RFactorOption(target_loop_nid=_loop(ir, "i_d0_0"), factor_axis=0)),
-        lambda ir: Split().apply(ir, SplitOption(target_nid=_psum_memset_leaf(ir), factors=(4, 512), target_axis="d2")),
-        lambda ir: Split().apply(
-            ir, SplitOption(target_nid=_blk_loop(ir, _psum_memset_blk(ir), "i_d1_0"), factors=(4, 4), target_axis=None)
-        ),
+        lambda ir: BufferLayout().apply(ir, BufferLayoutOption(tensor="psum_prod", list_len=16)),
         lambda ir: Split().apply(
             ir, SplitOption(target_nid=_op_leaf(ir, "NKITensorCopy"), factors=(4, 512), target_axis="d2")
         ),
-        lambda ir: Split().apply(
-            ir, SplitOption(target_nid=_blk_m_loop(ir, "NKITensorCopy"), factors=(4, 4), target_axis=None)
-        ),
-        lambda ir: Split().apply(
-            ir, SplitOption(target_nid=_op_leaf(ir, "NKITensorTensor"), factors=(4, 512), target_axis="d2")
+        lambda ir: _reorder_blk_to_nm(ir, _op_blk(ir, "NKITensorCopy")),
+        lambda ir: CodeMotion().apply(
+            ir, CodeMotionOption(block_nid=_op_blk(ir, "NKITensorCopy"), target_loop_nid=_loop(ir, "i_d2_0"), index=-1)
         ),
         lambda ir: Split().apply(
-            ir, SplitOption(target_nid=_blk_m_loop(ir, "NKITensorTensor"), factors=(4, 4), target_axis=None)
+            ir, SplitOption(target_nid=_op_leaf(ir, "NKIStore"), factors=(4, 512), target_axis="d2")
         ),
+        lambda ir: _reorder_blk_to_nm(ir, _op_blk(ir, "NKIStore")),
         lambda ir: CodeMotion().apply(
-            ir, CodeMotionOption(block_nid=_psum_memset_blk(ir), target_loop_nid=_loop(ir, "i_d1_1"), index=0)
+            ir, CodeMotionOption(block_nid=_op_blk(ir, "NKIStore"), target_loop_nid=_loop(ir, "i_d2_0"), index=-1)
         ),
+        lambda ir: BufferLayout().apply(ir, BufferLayoutOption(tensor="sbuf_prod", list_len=16)),
+        lambda ir: Split().apply(ir, SplitOption(target_nid=_psum_memset_leaf(ir), factors=(4, 512), target_axis="d2")),
+        lambda ir: _reorder_blk_to_nm(ir, _psum_memset_blk(ir)),
         lambda ir: CodeMotion().apply(
-            ir,
-            CodeMotionOption(
-                block_nid=_op_blk(ir, "NKITensorCopy"), target_loop_nid=_loop(ir, "i_d1_1"), index=-1
-            ),
+            ir, CodeMotionOption(block_nid=_psum_memset_blk(ir), target_loop_nid=_loop(ir, "i_d2_0"), index=0)
         ),
-        lambda ir: CodeMotion().apply(
-            ir,
-            CodeMotionOption(
-                block_nid=_op_blk(ir, "NKITensorTensor"), target_loop_nid=_loop(ir, "i_d1_1"), index=-1
-            ),
+        lambda ir: Split().apply(
+            ir, SplitOption(target_nid=_load_for(ir, "rhs", "i_d0_0"), factors=(2, 8), target_axis=None)
         ),
         lambda ir: Split().apply(ir, SplitOption(target_nid=_load_leaf(ir, "rhs"), factors=(4, 512), target_axis="d2")),
+        lambda ir: Reorder().apply(
+            ir, ReorderOption(outer_nid=_load_for(ir, "rhs", "i_d0_1"), inner_nid=_load_for(ir, "rhs", "i_d2_0"))
+        ),
         lambda ir: Reorder().apply(
             ir, ReorderOption(outer_nid=_load_for(ir, "rhs", "i_d0_0"), inner_nid=_load_for(ir, "rhs", "i_d2_0"))
         ),
         lambda ir: CodeMotion().apply(
-            ir, CodeMotionOption(block_nid=_load_blk(ir, "rhs"), target_loop_nid=_loop(ir, "i_d2_0"), index=0)
+            ir, CodeMotionOption(block_nid=_load_blk(ir, "rhs"), target_loop_nid=_loop(ir, "i_d0_0"), index=0)
         ),
+        lambda ir: BufferLayout().apply(ir, BufferLayoutOption(tensor="sbuf_rhs", list_len=8)),
         lambda ir: Split().apply(
             ir, SplitOption(target_nid=_load_leaf(ir, "lhs_T"), factors=(4, 512), target_axis="d1")
         ),
@@ -405,6 +396,7 @@ def _build_ladder() -> list[tuple[str, object]]:
         lambda ir: CodeMotion().apply(
             ir, CodeMotionOption(block_nid=_load_blk(ir, "lhs_T"), target_loop_nid=_loop(ir, "i_d1_0"), index=0)
         ),
+        lambda ir: BufferLayout().apply(ir, BufferLayoutOption(tensor="sbuf_lhs_T", list_len=8)),
     ]
     ir = build_initial_ir(f_nkigym, INPUT_SPECS)
     ladder = [("kernel_0", ir)]
@@ -461,10 +453,19 @@ def _main() -> None:
     inputs = {nm: rng.standard_normal(shape).astype(np.float32) for nm, (shape, _d) in INPUT_SPECS.items()}
     expected = inputs["lhs_T"].T @ inputs["rhs"]
 
-    """Each entry: (name, standalone-module source). The single merged ladder
-    (k0..k13) comes from rendering the transform-driven IR states; kernel_target is
-    the AST-extracted hand kernel, profiled beside k13 as the perf reference."""
-    sources = [(name, render(ir)) for name, ir in _build_ladder()]
+    """Each entry: (name, standalone-module source). The driven ladder (k0..k28)
+    comes from rendering the transform-driven IR states; kernel_target is the
+    AST-extracted hand kernel, profiled beside the endpoint as the perf reference."""
+    ladder = _build_ladder()
+
+    """Byte-exact gate: each driven rung must match manual_transforms.kernel_i
+    AST-canonically. A mismatch prints the got-vs-want diff and aborts."""
+    for name, ir in ladder:
+        manual_fn = getattr(manual_transforms, name)
+        assert_matches_hand(render(ir), manual_fn)
+        print(f"[byte-exact] {name}: OK")
+
+    sources = [(name, render(ir)) for name, ir in ladder]
     sources.append(("kernel_target", _kernel_source("kernel_target")))
 
     """Save every rendered kernel as <cache>/<name>.py for inspection."""

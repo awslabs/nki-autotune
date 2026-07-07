@@ -129,6 +129,19 @@ is no RFactor in the chain, so the "RFactor EARLY vs LAST" question never arises
 is the single-accumulator, fully-tiled, all-list-buffer state — the pre-RFactor
 endpoint.
 
+**Implementation finding (2026-07-04, shipped):** driving this on gym-1 revealed two
+of the manual "# Reorder" rungs (k0→k1 matmul N-bubble, and the rhs-load N-bubble)
+each move a loop up TWO levels, but the shipped `Reorder` only swaps an ADJACENT
+parent-child pair. Each therefore needs two atomic Reorders, and the manual ladder was
+normalized to carry the intermediate kernel (per the user: "fill the manual ladder with
+the atomic reorder missing steps"). Net: the manual ladder is now **k0…k29** (RFactor
+at k29; +2 vs the original k0…k27), the pre-RFactor endpoint is **k28** (was k26), and
+BufferLayout rungs are **k7/k14/k23/k28**. The driven ladder is 28 transforms
+reproducing k0…k28 byte-exact + CPU-sim + HW-MFU (shipped `33b4c44`). "k0→k26"
+throughout this doc predates that finding; read it as "k0→k28 (the RFactor-free
+prefix)". Also normalized: two decorative `"""init_one_stage"""` string-literals in the
+endpoint kernel that the renderer does not emit.
+
 The rung-type table above comes from the read-only gap analysis
 (`2026-07-03-manual-transforms-reproduction-gap.md`). "Uses a shipped transform type"
 is NOT proof the shipped transform emits byte-identical output at that rung — the
