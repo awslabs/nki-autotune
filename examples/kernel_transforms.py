@@ -7,8 +7,8 @@ RUNG-FOR-RUNG, BYTE-EXACT. ``_main`` renders every rung, asserts it AST-matches 
 corresponding ``manual_transforms.kernel_i`` (``assert_matches_hand``), CPU-sims it
 against ``lhs_T.T @ rhs``, and compiles + profiles each on real Trn2 hardware.
 
-d0 = K (reduction), d1 = M, d2 = N. ``_build_ladder`` is 28 transforms (k0..k28), each
-byte-exact to ``manual_transforms.py`` k0..k28 and CPU-sim clean on gym-1:
+d0 = K (reduction), d1 = M, d2 = N. ``_build_ladder`` is 29 transforms (k0..k29), each
+byte-exact to ``manual_transforms.py`` k0..k29 and CPU-sim clean on gym-1:
   k1-k2   Reorder x2   bubble N(i_d2_0) outermost (each an adjacent-swap; the manual
                        "# Reorder" from K>M>N to N>K>M is two atomic swaps -> k1, k2)
   k3-k4   Split x2     K -> ko(2),ki(8); M -> Mo(4),Mi(4)
@@ -23,9 +23,9 @@ byte-exact to ``manual_transforms.py`` k0..k28 and CPU-sim clean on gym-1:
   k23     BufferLayout sbuf_rhs -> list-of-8
   k24-k27 lhs_T load: Split d1, Split d0(2,8), Reorder, CodeMotion sink under Mo
   k28     BufferLayout sbuf_lhs_T -> list-of-8
+  k29     RFactor on ko -> two-stage fused PSUM partial + SBUF accumulator
 
-k28 is the pre-RFactor endpoint (== manual k28). The final RFactor rung (manual k28->k29)
-is OUT of scope here — see the BufferLayout design spec. Every locator is SEMANTIC
+Every locator is SEMANTIC
 (matmul loop_var, op-class block, load/PSUM leaf), tracking node ids across each
 transform's structural change.
 """
@@ -65,6 +65,8 @@ from nkigym.transforms import (
     BufferLayoutOption,
     CodeMotion,
     CodeMotionOption,
+    RFactor,
+    RFactorOption,
     Reorder,
     ReorderOption,
     Split,
@@ -322,8 +324,8 @@ def _blk_m_loop(ir: object, op_name: str) -> int:
 
 def _build_ladder() -> list[tuple[str, object]]:
     """Drive the shipped transforms from canonical ``f_nkigym`` to ``manual_transforms``
-    k0..k28, ONE transform per rung, in MANUAL rung order (NO RFactor — that is the
-    k28->k29 rung, out of scope). Returns ``[(name, ir), ...]`` of 29 entries.
+    k0..k29, ONE transform per rung, in MANUAL rung order. Returns ``[(name, ir), ...]``
+    of 30 entries.
 
     Every locator is SEMANTIC (matmul loop_var, op-class block, load/PSUM leaf), so it
     tracks node ids across the structural change each ``apply`` makes. The four
@@ -397,6 +399,7 @@ def _build_ladder() -> list[tuple[str, object]]:
             ir, CodeMotionOption(block_nid=_load_blk(ir, "lhs_T"), target_loop_nid=_loop(ir, "i_d1_0"), index=0)
         ),
         lambda ir: BufferLayout().apply(ir, BufferLayoutOption(tensor="sbuf_lhs_T", list_len=8)),
+        lambda ir: RFactor().apply(ir, RFactorOption(target_loop_nid=_loop(ir, "i_d0_0"), factor_axis=0)),
     ]
     ir = build_initial_ir(f_nkigym, INPUT_SPECS)
     ladder = [("kernel_0", ir)]

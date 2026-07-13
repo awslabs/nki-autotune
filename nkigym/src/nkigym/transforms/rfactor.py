@@ -17,8 +17,9 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 
+from nkigym.codegen.compact import compact_shapes
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Const, Var, to_affine
+from nkigym.ir.arith.expr import Const, Expr, Var, substitute, to_affine
 from nkigym.ir.buffer_placement import place_buffers
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
@@ -103,27 +104,33 @@ class RFactor(Transform):
     def _emit_rmw(self, ir: KernelIR, option: RFactorOption) -> None:
         """Restructure one-stage → fused two-stage accumulation on ``ir`` (spec §2.1).
 
-        The factored loop ``ko`` (``option.target_loop_nid``, extent ``factor``) is
-        the matmul's outermost reduction loop; the output tile is ``m_tiles`` rows
-        of 128. The emission keeps the PSUM accumulator per-output-tile and folds
-        the ``factor`` partials into the SBUF output ``out_sbuf``:
+        The factored loop ``ko`` (``option.target_loop_nid``) is the matmul's
+        outermost reduction loop; ``ki`` is its INNERMOST reduction loop, whose
+        subtree ends in the matmul run-op. The emission keeps the PSUM accumulator
+        per-output-tile and folds the ``factor`` partials into the SBUF output
+        ``out_sbuf``, anchoring the gadgets to ``ki`` (spec 2026-07-07 §B):
 
         - ``init_two_stage_0``: the canonical flat ``memset`` that zeroed ``psum``
           is RETARGETED to zero ``out_sbuf`` (the second-stage accumulator), staying
           a root sibling before ``ko``.
-        - ``init_two_stage_1``: a NEW per-``ko`` ``memset`` zeroing ``psum`` (bare,
-          NO slot), spliced as the FIRST child of ``ko`` (before the ``ki`` nest).
+        - ``init_two_stage_1``: a NEW ``memset`` zeroing ``psum`` (bare, NO slot),
+          spliced as ``ki``'s PRECEDING sibling.
         - run-op: the matmul block's K iter_var role flips ACCUMULATION → PARALLEL
           (each ``ko`` is an independent partial; ``ki`` HW-accumulates in PSUM); its
           ``dst`` region is UNCHANGED (no slot).
-        - ``drain_two_stage_0``: a per-``ko`` ``tensor_copy`` (``psum`` → SBUF
-          ``sbuf_rfactor``) then a per-``ko`` ``tensor_tensor`` fold
-          (``out_sbuf = combiner(out_sbuf, sbuf_rfactor)``), spliced as the LAST two
-          children of ``ko``. The fold block carries ``ko`` as ACCUMULATION (the
-          closing second-stage reduction on ``out_sbuf``).
+        - ``drain_two_stage_0``: a ``tensor_copy`` (``psum`` → SBUF ``sbuf_rfactor``)
+          then a ``tensor_tensor`` fold (``out_sbuf = combiner(out_sbuf,
+          sbuf_rfactor)``), spliced as ``ki``'s FOLLOWING siblings. The fold block
+          carries ``ko`` as ACCUMULATION (the closing second-stage reduction on
+          ``out_sbuf``).
         - ``drain_two_stage_1``: empty — the result is already in ``out_sbuf``.
 
-        ``place_buffers`` (LCA) + a rebuilt ``Dependency`` follow, per contract.
+        The gadgets are sized to the footprint R — the accumulator region the
+        ``ki``-subtree writes over one full ``ki`` execution: partition loops between
+        ``ki`` and the matmul are MATERIALIZED (early-packed: the 16-trip ``M`` loop),
+        free loops are ABSORBED into the op width. ``place_buffers`` (LCA) +
+        ``compact_shapes`` (shape + ``list_len`` shrink) + a rebuilt ``Dependency``
+        follow, per contract.
         """
         tree = ir.tree
         ko_loop = tree.data(option.target_loop_nid)
@@ -133,26 +140,31 @@ class RFactor(Transform):
         matmul_leaf = self._owning_matmul_leaf(ir, option.target_loop_nid)
         assert matmul_leaf is not None
         matmul_block_nid = self._enclosing_block_nid(tree, matmul_leaf)
-        matmul_leaf_node = tree.data(matmul_leaf)
-        assert isinstance(matmul_leaf_node, ISANode)
-        op_cls = matmul_leaf_node.op_cls
+        matmul_node = tree.data(matmul_leaf)
+        assert isinstance(matmul_node, ISANode)
+        op_cls = matmul_node.op_cls
 
-        psum_name = matmul_leaf_node.operand_bindings["dst"].tensor
-        m_tiles = self._partition_tiles(ir, matmul_block_nid, psum_name)
+        psum_name = matmul_node.operand_bindings["dst"].tensor
         out_name = self._drain_out_tensor(tree, psum_name)
         identity = float(op_cls.REDUCE_COMBINATOR.identity)
         combiner = op_cls.REDUCE_COMBINATOR.combiner
-        free_extent = ir.buffer(out_name).shape[1]
+
+        ki_nid = self._ki_loop_nid(ir, option.target_loop_nid)
+        footprint = self._footprint(ir, ki_nid, matmul_leaf)
+        part_lo = matmul_node.operand_bindings["dst"].ranges[0][0]
+        free_extent = self._absorbed_free_width(ir, ki_nid, matmul_leaf)
+        free_lo = self._gadget_free_lo(ir, ki_nid, matmul_leaf)
 
         self._add_rf_buffer(ir, psum_name, out_name)
         self._flip_matmul_k_role(tree, matmul_block_nid)
         self._retarget_init(tree, psum_name, out_name)
         self._remove_flat_block(tree, self._reader_leaf(tree, psum_name, "tensor_copy"))
-        self._nest_memset(tree, option.target_loop_nid, psum_name, ko_var, m_tiles, free_extent, identity)
-        self._nest_copy(tree, option.target_loop_nid, psum_name, ko_var, m_tiles, free_extent)
-        self._nest_combine(tree, option.target_loop_nid, out_name, ko_var, m_tiles, free_extent, combiner)
+        self._nest_memset(ir, matmul_leaf, ki_nid, psum_name, ko_var, footprint, part_lo, free_lo, free_extent, identity)
+        self._nest_copy(ir, matmul_leaf, ki_nid, psum_name, ko_var, footprint, part_lo, free_lo, free_extent)
+        self._nest_combine(ir, matmul_leaf, ki_nid, out_name, ko_var, footprint, part_lo, free_lo, free_extent, combiner)
 
         place_buffers(tree)
+        compact_shapes(tree)
         ir.dependency = Dependency(tree)
 
     def _enclosing_block_nid(self, tree: KernelTree, nid: int) -> int:
@@ -162,18 +174,111 @@ class RFactor(Transform):
                 return anc
         raise TransformLegalityError(f"no enclosing BlockNode for {nid}")
 
-    def _partition_tiles(self, ir: KernelIR, block_nid: int, psum_name: str) -> int:
-        """Number of 128-row partition tiles in the matmul output (M_extent // 128).
+    def _ki_loop_nid(self, ir: KernelIR, ko_loop_nid: int) -> int:
+        """The INNERMOST ACCUMULATION (K-axis) loop enclosing the matmul, at or below ko.
 
-        Read from the matmul block's iter_var whose abstract axis is the first
-        ``dst`` (output) axis — the partition (M) dim of the accumulator.
+        The matmul's reduction is driven by its K-axis loops; ki is the deepest of them.
+        Found as the last (innermost) matmul-ancestor ForNode whose loop_var binds the
+        matmul block's K axis. For early-packed ki sits directly under ko; for k28 ki is
+        the innermost loop and the matmul is its sole body.
         """
-        block = ir.tree.data(block_nid)
-        assert isinstance(block, BlockNode)
-        m_abstract = self._op_cls_of_block(ir.tree, block_nid).OPERAND_AXES["dst"][0]
-        m_dim = block.axis_map[m_abstract]
-        m_extent = next(iv.dom[1] - iv.dom[0] for iv in block.iter_vars if iv.axis == m_dim)
-        return m_extent // PARTITION_DIM
+        tree = ir.tree
+        matmul_leaf = self._owning_matmul_leaf(ir, ko_loop_nid)
+        assert matmul_leaf is not None
+        block = self._enclosing_block(ir, matmul_leaf)
+        op_cls = self._op_cls_of_block(tree, self._enclosing_block_nid(tree, matmul_leaf))
+        reduction_abstract = next(a for a, role in op_cls.AXIS_ROLES.items() if role == AxisRole.ACCUMULATION)
+        k_axis = block.axis_map[reduction_abstract]
+        k_binding_vars = self._axis_binding_loopvars(block, k_axis)
+        k_loops = [
+            a
+            for a in tree.ancestors(matmul_leaf)
+            if isinstance(tree.data(a), ForNode) and tree.data(a).loop_var in k_binding_vars
+        ]
+        return k_loops[-1]
+
+    def _axis_binding_loopvars(self, block: BlockNode, axis: str) -> set[str]:
+        """Loop vars appearing in the iter_value of ``axis`` (the loops that bind it)."""
+        value = next(v for iv, v in zip(block.iter_vars, block.iter_values) if iv.axis == axis)
+        return {n for n in to_affine(value) if n is not None}
+
+    def _footprint(self, ir: KernelIR, ki_loop_nid: int, matmul_leaf: int) -> list[tuple[str, int]]:
+        """Ordered (loop_var, extent) of the ForNodes STRICTLY between ki and the matmul
+        leaf whose loop_var binds the matmul's PARTITION (dst axis-0) dim.
+
+        These are the partition-tile loops the ki-subtree sweeps over one ki execution;
+        the gadgets materialize them (early-packed: the 16-trip M loop). Free-axis loops
+        between ki and the matmul are absorbed into the op width, so they are NOT returned.
+        For k28 there are no loops between ki and the matmul, so this is empty (R = one
+        tile, loopless gadgets).
+        """
+        tree = ir.tree
+        block = self._enclosing_block(ir, matmul_leaf)
+        m_abstract = tree.data(matmul_leaf).op_cls.OPERAND_AXES["dst"][0]
+        m_axis = block.axis_map[m_abstract]
+        m_binding_vars = self._axis_binding_loopvars(block, m_axis)
+        between = [
+            a for a in tree.ancestors(matmul_leaf) if isinstance(tree.data(a), ForNode) and ki_loop_nid in tree.ancestors(a)
+        ]
+        return [(tree.data(a).loop_var, tree.data(a).extent) for a in between if tree.data(a).loop_var in m_binding_vars]
+
+    def _absorbed_free_width(self, ir: KernelIR, ki_loop_nid: int, matmul_leaf: int) -> int:
+        """Full free extent the ki-subtree sweeps: the matmul dst free-tile width times the
+        product of the FREE-binding loop trips strictly between ki and the matmul.
+
+        Free loops between ki and the matmul are absorbed into one wide gadget op (memset /
+        tensor_copy / tensor_tensor free cap >= 2048). Early-packed: 512 * 4 (i_d2_0) =
+        2048. k28: 512 * 1 (no free loop between) = 512.
+        """
+        tree = ir.tree
+        block = self._enclosing_block(ir, matmul_leaf)
+        dst_region = tree.data(matmul_leaf).operand_bindings["dst"]
+        free_abstract = tree.data(matmul_leaf).op_cls.OPERAND_AXES["dst"][1]
+        free_axis = block.axis_map[free_abstract]
+        free_binding_vars = self._axis_binding_loopvars(block, free_axis)
+        tile_width = dst_region.ranges[1][1]
+        assert isinstance(tile_width, Const)
+        width = tile_width.value
+        for a in tree.ancestors(matmul_leaf):
+            data = tree.data(a)
+            if isinstance(data, ForNode) and ki_loop_nid in tree.ancestors(a) and data.loop_var in free_binding_vars:
+                width *= data.extent
+        return width
+
+    def _gadget_free_lo(self, ir: KernelIR, ki_loop_nid: int, matmul_leaf: int) -> Expr:
+        """Free-axis (dst axis-1) lo the gadgets must share with the matmul dst region.
+
+        RFactor leaves the matmul dst region UNCHANGED, so its free lo still carries the
+        enclosing output-tile loop offset (e.g. ``i_d2_0*512`` for k28). The gadgets must
+        address the SAME frame on the free axis, else ``compact_shapes`` sees inconsistent
+        offsets across the psum/out touchers and never rebases them (the shape stays wide).
+
+        The gadgets ABSORB the free-binding loops strictly between ki and the matmul into
+        one wide op (see :meth:`_absorbed_free_width`), so those loop vars index WITHIN the
+        gadget's own width and must be zeroed in the shared lo. This substitutes each such
+        absorbed free-loop var -> ``Const(0)`` in the matmul dst free lo:
+
+        - k28: no free loop between ki and the matmul -> substitute nothing -> ``i_d2_0*512``
+          (the enclosing output-tile offset). All psum touchers then share ``i_d2_0*512``,
+          so ``i_d2_0`` is a consistent anchor and the free axis rebases to ``0:512``.
+        - early-packed: ``i_d2_0`` IS an absorbed free loop -> substitute ``i_d2_0`` -> 0 ->
+          ``0*512`` (normalises to ``Const(0)``), identical to the previous hardcoded lo, so
+          the free axis stays the full absorbed 2048 and the render is unchanged.
+        """
+        tree = ir.tree
+        block = self._enclosing_block(ir, matmul_leaf)
+        dst_region = tree.data(matmul_leaf).operand_bindings["dst"]
+        free_abstract = tree.data(matmul_leaf).op_cls.OPERAND_AXES["dst"][1]
+        free_axis = block.axis_map[free_abstract]
+        free_binding_vars = self._axis_binding_loopvars(block, free_axis)
+        absorbed = {
+            tree.data(a).loop_var
+            for a in tree.ancestors(matmul_leaf)
+            if isinstance(tree.data(a), ForNode)
+            and ki_loop_nid in tree.ancestors(a)
+            and tree.data(a).loop_var in free_binding_vars
+        }
+        return substitute(dst_region.ranges[1][0], {var: Const(value=0) for var in absorbed})
 
     def _op_cls_of_block(self, tree: KernelTree, block_nid: int) -> type[NKIOp]:
         """Return the op class of the rfactorable (reduction) leaf under ``block_nid``.
@@ -243,8 +348,8 @@ class RFactor(Transform):
         ``init_one_stage`` zeroed the PSUM accumulator; the two-stage form's
         ``init_two_stage_0`` zeros the SBUF accumulator instead (PSUM is re-zeroed
         per-``ko`` by ``init_two_stage_1``). The block keeps its loop nest, iter_vars,
-        and position (a root sibling before ``ko``); only the written tensor changes.
-        ``out_name`` and ``psum_name`` share the same ``(m_tiles, free)`` tile shape.
+        and position (a root sibling before ``ko``); only the written tensor name is
+        retargeted ``psum_name`` → ``out_name`` (the region ranges are preserved).
         """
         leaf_nid = self._writer_leaf(tree, psum_name, "memset")
         block_nid = self._enclosing_block_nid(tree, leaf_nid)
@@ -270,73 +375,88 @@ class RFactor(Transform):
 
     def _nest_memset(
         self,
-        tree: KernelTree,
-        ko_loop_nid: int,
+        ir: KernelIR,
+        matmul_leaf: int,
+        ki_nid: int,
         psum_name: str,
         ko_var: str,
-        m_tiles: int,
+        footprint: list[tuple[str, int]],
+        part_lo: Expr,
+        free_lo: Expr,
         free_extent: int,
         identity: float,
     ) -> None:
-        """Splice ``init_two_stage_1``: a per-``ko`` ``memset(psum)`` as ko's FIRST child.
+        """Splice ``init_two_stage_1``: a ``memset(psum)`` as ``ki``'s preceding sibling.
 
-        Zeros the per-``ko`` PSUM partial before the ``ki`` matmul nest. The block
+        Zeros the per-``ki`` PSUM partial before the ``ki`` matmul nest. The block
         binds ``ko`` (axis ``d0``, role PARALLEL — matching the flipped matmul ``ko``,
         so this is an ordinary init, not a re-zero of ``ko``'s own reduction) and the
-        partition loop ``m``; its dst is bare ``psum[m]`` (NO ``ko`` slot).
+        output partition dim; its dst is bare ``psum[part_lo]`` (NO ``ko`` slot). The
+        ``footprint`` partition loops (if any) are materialized by ``_splice_beside_ki``.
         """
-        m_var = "i_d1_0"
-        region = self._partition_region(psum_name, m_var, free_extent)
-        block = self._partition_block(
-            ko_var, m_var, m_tiles, free_extent, AxisRole.PARALLEL, reads=(), writes=(region,)
+        region = self._partition_region(psum_name, part_lo, free_lo, free_extent)
+        block = self._gadget_block(
+            ir, matmul_leaf, ko_var, footprint, free_extent, AxisRole.PARALLEL, reads=(), writes=(region,)
         )
         leaf = ISANode(op_cls=NKIMemset, operand_bindings={"dst": region}, kwargs={"value": identity})
-        self._splice_block_under_ko(tree, ko_loop_nid, block, m_var, m_tiles, leaf, at_front=True)
+        self._splice_beside_ki(ir.tree, ki_nid, block, footprint, leaf, at_front=True)
 
     def _nest_copy(
-        self, tree: KernelTree, ko_loop_nid: int, psum_name: str, ko_var: str, m_tiles: int, free_extent: int
+        self,
+        ir: KernelIR,
+        matmul_leaf: int,
+        ki_nid: int,
+        psum_name: str,
+        ko_var: str,
+        footprint: list[tuple[str, int]],
+        part_lo: Expr,
+        free_lo: Expr,
+        free_extent: int,
     ) -> None:
         """Splice the first half of ``drain_two_stage_0``: ``tensor_copy(psum → sbuf_rfactor)``.
 
-        Staged after the ``ki`` nest (appended as a child of ``ko``). Moves the
-        per-``ko`` PSUM partial into SBUF so the following ``tensor_tensor`` fold can
-        read it (``tensor_tensor`` cannot read a PSUM operand). The block binds
-        ``ko`` (PARALLEL) + partition loop ``m``; both regions are bare ``[m]``.
+        Staged as ``ki``'s following sibling. Moves the per-``ki`` PSUM partial into
+        SBUF so the following ``tensor_tensor`` fold can read it (``tensor_tensor``
+        cannot read a PSUM operand). The block binds ``ko`` (PARALLEL) + the output
+        partition dim; both regions are bare ``[part_lo]``.
         """
-        m_var = "i_d1_0"
-        src = self._partition_region(psum_name, m_var, free_extent)
-        dst = self._partition_region(_RMW_STAGING_BUFFER, m_var, free_extent)
-        block = self._partition_block(
-            ko_var, m_var, m_tiles, free_extent, AxisRole.PARALLEL, reads=(src,), writes=(dst,)
+        src = self._partition_region(psum_name, part_lo, free_lo, free_extent)
+        dst = self._partition_region(_RMW_STAGING_BUFFER, part_lo, free_lo, free_extent)
+        block = self._gadget_block(
+            ir, matmul_leaf, ko_var, footprint, free_extent, AxisRole.PARALLEL, reads=(src,), writes=(dst,)
         )
         leaf = ISANode(op_cls=NKITensorCopy, operand_bindings={"src": src, "dst": dst}, kwargs={})
-        self._splice_block_under_ko(tree, ko_loop_nid, block, m_var, m_tiles, leaf, at_front=False)
+        self._splice_beside_ki(ir.tree, ki_nid, block, footprint, leaf, at_front=False)
 
     def _nest_combine(
         self,
-        tree: KernelTree,
-        ko_loop_nid: int,
+        ir: KernelIR,
+        matmul_leaf: int,
+        ki_nid: int,
         out_name: str,
         ko_var: str,
-        m_tiles: int,
+        footprint: list[tuple[str, int]],
+        part_lo: Expr,
+        free_lo: Expr,
         free_extent: int,
         combiner: str,
     ) -> None:
         """Splice the second half of ``drain_two_stage_0``: the cross-``ko`` SBUF fold.
 
         ``tensor_tensor(data1=out_sbuf, data2=sbuf_rfactor, dst=out_sbuf, op=combiner)``
-        as ko's LAST child. ``data1``/``dst`` are the RMW accumulator (constant
-        address across ``ko``), so the block binds ``ko`` as ACCUMULATION — its
-        cross-``ko`` carry on ``out_sbuf`` is the closing second-stage reduction.
-        ``combiner`` is the op's ``REDUCE_COMBINATOR.combiner`` (``"add"`` for matmul).
+        as ``ki``'s following sibling (after the copy). ``data1``/``dst`` are the RMW
+        accumulator (constant address across ``ko``), so the block binds ``ko`` as
+        ACCUMULATION — its cross-``ko`` carry on ``out_sbuf`` is the closing
+        second-stage reduction. ``combiner`` is the op's ``REDUCE_COMBINATOR.combiner``
+        (``"add"`` for matmul).
         """
-        m_var = "i_d1_0"
-        out_region = self._partition_region(out_name, m_var, free_extent)
-        rf_region = self._partition_region(_RMW_STAGING_BUFFER, m_var, free_extent)
-        block = self._partition_block(
+        out_region = self._partition_region(out_name, part_lo, free_lo, free_extent)
+        rf_region = self._partition_region(_RMW_STAGING_BUFFER, part_lo, free_lo, free_extent)
+        block = self._gadget_block(
+            ir,
+            matmul_leaf,
             ko_var,
-            m_var,
-            m_tiles,
+            footprint,
             free_extent,
             AxisRole.ACCUMULATION,
             reads=(out_region, rf_region),
@@ -347,7 +467,7 @@ class RFactor(Transform):
             operand_bindings={"data1": out_region, "data2": rf_region, "dst": out_region},
             kwargs={"op": combiner},
         )
-        self._splice_block_under_ko(tree, ko_loop_nid, block, m_var, m_tiles, leaf, at_front=False)
+        self._splice_beside_ki(ir.tree, ki_nid, block, footprint, leaf, at_front=False)
 
     def _remove_flat_block(self, tree: KernelTree, leaf_nid: int) -> None:
         """Delete the canonical flat block owning ``leaf_nid`` (block + loop + leaf).
@@ -365,77 +485,96 @@ class RFactor(Transform):
         for nid in tree.descendants(block_nid) | {block_nid}:
             tree.graph.remove_node(nid)
 
-    def _partition_region(self, tensor: str, m_var: str, free_extent: int) -> BufferRegion:
-        """Build the canonical ``tensor[m : +128, 0 : +free_extent]`` partition region.
+    def _partition_region(self, tensor: str, part_lo: Expr, free_lo: Expr, free_extent: int) -> BufferRegion:
+        """Canonical ``tensor[part_lo : +128, free_lo : +free_extent]`` region.
 
-        Axis 0 is the bare partition-tile index ``Var(m_var)`` with width 128; the
-        free axis is loopless (full ``free_extent``).
+        ``part_lo`` is the matmul dst partition (axis-0) offset — a bare loop Var when a
+        footprint loop is materialized (early-packed ``i_d1_0``) or a compound affine
+        inherited from the enclosing output-tile loops (k28 ``i_d1_0*4 + i_d1_1``).
+        ``free_lo`` is the matmul dst free (axis-1) offset with the absorbed free-loop vars
+        stripped (see :meth:`_gadget_free_lo`) — ``i_d2_0*512`` for k28 (so ``i_d2_0``
+        anchors psum consistently and the free axis rebases to ``0:512``), ``Const(0)`` for
+        early-packed. The free axis spans the full absorbed ``free_extent``.
         """
         return BufferRegion(
             tensor=tensor,
-            ranges=((Var(name=m_var), Const(value=PARTITION_DIM)), (Const(value=0), Const(value=free_extent))),
+            ranges=((part_lo, Const(value=PARTITION_DIM)), (free_lo, Const(value=free_extent))),
         )
 
-    def _partition_block(
+    def _gadget_block(
         self,
+        ir: KernelIR,
+        matmul_leaf: int,
         ko_var: str,
-        m_var: str,
-        m_tiles: int,
+        footprint: list[tuple[str, int]],
         free_extent: int,
         d0_role: AxisRole,
         reads: tuple[BufferRegion, ...],
         writes: tuple[BufferRegion, ...],
     ) -> BlockNode:
-        """Build a per-``ko`` memset/copy/combine :class:`BlockNode` nested under ``ko``.
+        """Build a per-``ki`` gadget :class:`BlockNode` bracketing the ``ki`` loop.
 
-        Declares three iter_vars — ``ko`` (axis ``d0``, role ``d0_role``, bound to the
-        shared matmul ``ko`` ForNode's ``ko_var``), the partition tile ``m`` (axis
-        ``d1``, bound to ``m_var``), and the loopless free axis (``d2``). Only the
-        ``m`` loop is materialized as a ForNode by the caller; ``ko`` is the shared
-        parent loop, so the block reads ``ko_var`` from it. ``d0_role`` is PARALLEL
-        for init/copy (ordinary per-``ko`` ops) and ACCUMULATION for the closing
-        ``tensor_tensor`` fold (whose cross-``ko`` carry is the second-stage reduction).
+        iter_vars mirror the matmul block: ``d0`` (K, bound to ``ko_var``, role ``d0_role``),
+        ``d1`` (the output partition dim, bound to the matmul's own partition iter_value —
+        ``i_d1_0`` early-packed, ``i_d1_0*4 + i_d1_1`` k28), and ``d2`` (free, loopless).
+        The ``footprint`` partition loops are materialized by the caller as ForNodes; when
+        empty (k28) the ``d1`` value is inherited from the enclosing output-tile loops.
+
+        The ``d2`` iter_value is left as ``Const(0)`` for all gadgets. This is intentionally
+        inert: the free axis is loopless (the gadgets absorb free loops into their op width),
+        so no loop resolves to ``d2``; the free position lives on the ``BufferRegion`` ranges
+        (``free_lo``), which is what codegen and dependency analysis consume.
         """
+        tree = ir.tree
+        block = self._enclosing_block(ir, matmul_leaf)
+        op_cls = tree.data(matmul_leaf).op_cls
+        m_axis = block.axis_map[op_cls.OPERAND_AXES["dst"][0]]
+        m_value = next(v for iv, v in zip(block.iter_vars, block.iter_values) if iv.axis == m_axis)
+        m_dom = next(iv.dom for iv in block.iter_vars if iv.axis == m_axis)
         return BlockNode(
             iter_vars=(
-                IterVar(axis="d0", dom=(0, m_tiles * PARTITION_DIM), role=d0_role),
-                IterVar(axis="d1", dom=(0, m_tiles * PARTITION_DIM), role=AxisRole.PARALLEL),
+                IterVar(axis="d0", dom=(0, m_dom[1]), role=d0_role),
+                IterVar(axis="d1", dom=m_dom, role=AxisRole.PARALLEL),
                 IterVar(axis="d2", dom=(0, free_extent), role=AxisRole.PARALLEL),
             ),
-            iter_values=(Var(name=ko_var), Var(name=m_var), Const(value=0)),
+            iter_values=(Var(name=ko_var), m_value, Const(value=0)),
             reads=reads,
             writes=writes,
             alloc_buffers=(),
             axis_map={"K": "d0", "P": "d1", "F": "d2"},
         )
 
-    def _splice_block_under_ko(
+    def _splice_beside_ki(
         self,
         tree: KernelTree,
-        ko_loop_nid: int,
+        ki_loop_nid: int,
         block: BlockNode,
-        m_var: str,
-        m_tiles: int,
+        footprint: list[tuple[str, int]],
         leaf: ISANode,
         at_front: bool,
     ) -> None:
-        """Add ``block`` (with its ``m`` ForNode + ``leaf``) as a child of ``ko``.
+        """Splice ``block`` (with the ``footprint`` partition loops + ``leaf``) as a sibling
+        of ``ki_loop_nid`` under ki's parent.
 
-        The new block becomes a child of the matmul's ``ko`` ForNode, carrying its
-        own partition loop ``m`` (extent ``m_tiles``) and the single ISA ``leaf``.
-        ``at_front`` places it before all existing children (the per-``ko`` memset);
-        otherwise after them (the copy, then the combine). The resulting dataflow
-        order under ``ko`` is ``memset → ki-matmul-nest → tensor_copy → tensor_tensor``.
+        ``at_front`` puts it immediately before ``ki`` (the init memset); otherwise
+        immediately after (the copy, then the fold), so the order under ki's parent is
+        ``memset -> ki -> tensor_copy -> tensor_tensor``. Each footprint entry becomes a
+        materialized ForNode (outer->inner); an empty footprint (k28) attaches ``leaf``
+        directly to ``block`` (a single loopless op).
         """
-        block_nid = tree.add_node(block, parent=ko_loop_nid)
-        m_nid = tree.add_node(ForNode(loop_var=m_var, extent=m_tiles), parent=block_nid)
-        tree.add_node(leaf, parent=m_nid)
-        existing = [c for c in tree.children(ko_loop_nid) if c != block_nid]
-        new_order = [block_nid, *existing] if at_front else [*existing, block_nid]
-        for child in tree.children(ko_loop_nid):
-            tree.graph.remove_edge(ko_loop_nid, child)
+        parent = tree.parent(ki_loop_nid)
+        assert parent is not None, f"ki loop {ki_loop_nid} has no parent"
+        block_nid = tree.add_node(block, parent=parent)
+        cursor = block_nid
+        for loop_var, extent in footprint:
+            cursor = tree.add_node(ForNode(loop_var=loop_var, extent=extent), parent=cursor)
+        tree.add_node(leaf, parent=cursor)
+        siblings = [c for c in tree.children(parent) if c != block_nid]
+        new_order = [block_nid, *siblings] if at_front else [*siblings, block_nid]
+        for child in tree.children(parent):
+            tree.graph.remove_edge(parent, child)
         for child in new_order:
-            tree.graph.add_edge(ko_loop_nid, child)
+            tree.graph.add_edge(parent, child)
 
     def _writer_leaf(self, tree: KernelTree, tensor: str, op_name: str) -> int:
         """The single ISA leaf with NAME ``op_name`` that writes ``tensor`` (dst slot)."""
