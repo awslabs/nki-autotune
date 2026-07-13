@@ -159,9 +159,13 @@ class RFactor(Transform):
         self._flip_matmul_k_role(tree, matmul_block_nid)
         self._retarget_init(tree, psum_name, out_name)
         self._remove_flat_block(tree, self._reader_leaf(tree, psum_name, "tensor_copy"))
-        self._nest_memset(ir, matmul_leaf, ki_nid, psum_name, ko_var, footprint, part_lo, free_lo, free_extent, identity)
+        self._nest_memset(
+            ir, matmul_leaf, ki_nid, psum_name, ko_var, footprint, part_lo, free_lo, free_extent, identity
+        )
         self._nest_copy(ir, matmul_leaf, ki_nid, psum_name, ko_var, footprint, part_lo, free_lo, free_extent)
-        self._nest_combine(ir, matmul_leaf, ki_nid, out_name, ko_var, footprint, part_lo, free_lo, free_extent, combiner)
+        self._nest_combine(
+            ir, matmul_leaf, ki_nid, out_name, ko_var, footprint, part_lo, free_lo, free_extent, combiner
+        )
 
         place_buffers(tree)
         compact_shapes(tree)
@@ -218,9 +222,13 @@ class RFactor(Transform):
         m_axis = block.axis_map[m_abstract]
         m_binding_vars = self._axis_binding_loopvars(block, m_axis)
         between = [
-            a for a in tree.ancestors(matmul_leaf) if isinstance(tree.data(a), ForNode) and ki_loop_nid in tree.ancestors(a)
+            a
+            for a in tree.ancestors(matmul_leaf)
+            if isinstance(tree.data(a), ForNode) and ki_loop_nid in tree.ancestors(a)
         ]
-        return [(tree.data(a).loop_var, tree.data(a).extent) for a in between if tree.data(a).loop_var in m_binding_vars]
+        return [
+            (tree.data(a).loop_var, tree.data(a).extent) for a in between if tree.data(a).loop_var in m_binding_vars
+        ]
 
     def _absorbed_free_width(self, ir: KernelIR, ki_loop_nid: int, matmul_leaf: int) -> int:
         """Full free extent the ki-subtree sweeps: the matmul dst free-tile width times the
@@ -497,8 +505,7 @@ class RFactor(Transform):
         early-packed. The free axis spans the full absorbed ``free_extent``.
         """
         return BufferRegion(
-            tensor=tensor,
-            ranges=((part_lo, Const(value=PARTITION_DIM)), (free_lo, Const(value=free_extent))),
+            tensor=tensor, ranges=((part_lo, Const(value=PARTITION_DIM)), (free_lo, Const(value=free_extent)))
         )
 
     def _gadget_block(

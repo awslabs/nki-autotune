@@ -126,14 +126,7 @@ def test_reorder_same_dim_swap_then_compute_at_sims():
     from nkigym.codegen import render
     from nkigym.environment import KernelMDP
     from nkigym.synthesis.simulate_nki import simulate_fp32
-    from nkigym.transforms import (
-        CodeMotion,
-        CodeMotionOption,
-        Fuse,
-        ReorderOption,
-        Split,
-        SplitOption,
-    )
+    from nkigym.transforms import CodeMotion, CodeMotionOption, Fuse, ReorderOption, Split, SplitOption
 
     trace = [
         (Split(), SplitOption(target_nid=11, factors=(4, 2, 2), target_axis=None)),

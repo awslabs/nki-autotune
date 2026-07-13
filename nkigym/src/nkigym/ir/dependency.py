@@ -87,9 +87,7 @@ class Dependency:
         """Return True if ``producer`` must execute before ``consumer``."""
         return self._closure.has_edge(self._resolve(producer), self._resolve(consumer))
 
-    def first_backward_edge(
-        self, moved_leaf_nid: int, tree: KernelTree | None = None
-    ) -> tuple[int, int] | None:
+    def first_backward_edge(self, moved_leaf_nid: int, tree: KernelTree | None = None) -> tuple[int, int] | None:
         """Return the first dependency edge incident to ``moved_leaf_nid`` that
         points backward in the execution order of ``tree``, else ``None``.
 
@@ -165,7 +163,8 @@ class Dependency:
         moved_pos = self._effective_insertion_position(order, target_loop_nid, index, moved_subtree)
         enclosers = set(self._tree.ancestors(target_loop_nid)) | {target_loop_nid}
         target_loops = [
-            n for n in (target_loop_nid, *self._tree.ancestors(target_loop_nid))
+            n
+            for n in (target_loop_nid, *self._tree.ancestors(target_loop_nid))
             if isinstance(self._tree.data(n), ForNode)
         ]
 
@@ -183,7 +182,8 @@ class Dependency:
             if nid == moved_leaf_nid:
                 return target_loops
             return [
-                a for a in self._tree.ancestors(nid)
+                a
+                for a in self._tree.ancestors(nid)
                 if a not in moved_subtree and isinstance(self._tree.data(a), ForNode)
             ]
 
@@ -299,7 +299,6 @@ class Dependency:
             for name in info.reads - info.writes:
                 prior_readers.setdefault(name, []).append(leaf_nid)
 
-
     @staticmethod
     def _leaves_in_execution_order(tree: KernelTree) -> list[tuple[int, int]]:
         """Return (leaf_nid, owning_block_nid) pairs in ISA pre-order.
@@ -413,11 +412,7 @@ class Dependency:
         return True
 
 
-
-
-def _leaf_operand_regions(
-    tree: KernelTree, leaf_nid: int, tensor: str, rmw_only: bool
-) -> list[BufferRegion]:
+def _leaf_operand_regions(tree: KernelTree, leaf_nid: int, tensor: str, rmw_only: bool) -> list[BufferRegion]:
     """Regions of ``tensor`` bound by ``leaf_nid``'s operands.
 
     With ``rmw_only`` True, only ``RMW_OPERANDS`` slots are considered — the
@@ -479,9 +474,7 @@ def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool
         if not isinstance(data, ISANode):
             continue
         rmw_regions = _leaf_operand_regions(tree, nid, tensor, rmw_only=True)
-        if rmw_regions and not any(
-            loop_var in to_affine(lo) for region in rmw_regions for lo, _w in region.ranges
-        ):
+        if rmw_regions and not any(loop_var in to_affine(lo) for region in rmw_regions for lo, _w in region.ranges):
             has_invariant_rmw = True
         if rmw_regions:
             continue
@@ -526,8 +519,6 @@ def _promoted_span(
         lo = min(lo, l_lo)
         hi = max(hi, l_hi)
     return (lo, hi)
-
-
 
 
 def _block_name(block: BlockNode) -> str:

@@ -188,11 +188,7 @@ def _check_no_reduction_replicated(ir: KernelIR, block_nid: int, target_loop_nid
         )
 
 
-
-
-def _check_move_preserves_dependencies(
-    ir: KernelIR, block_nid: int, target_loop_nid: int, index: int
-) -> None:
+def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> None:
     """Raise TransformLegalityError if the proposed move would make any
     dependency edge incident to the moved block point backward.
 
