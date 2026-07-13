@@ -65,20 +65,6 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
                 return nid
         raise AssertionError("no fold block")
 
-    def fold_leaf(state):
-        from nkigym.ir.tree import ISANode
-
-        return next(d for d in state.tree.descendants(fold_blk(state)) if isinstance(state.tree.data(d), ISANode))
-
-    def fold_loop(state, loop_var):
-        from nkigym.ir.tree import ForNode
-
-        return next(
-            d
-            for d in state.tree.descendants(fold_blk(state))
-            if isinstance(state.tree.data(d), ForNode) and state.tree.data(d).loop_var == loop_var
-        )
-
     from nkigym.ops.base import AxisRole
     from nkigym.transforms.code_motion import _check_same_loop_prefix
 
@@ -93,16 +79,16 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
     s = Reorder().apply(s, ReorderOption(outer_nid=mm_loop(s, "i_d0_1"), inner_nid=mm_loop(s, "i_d1_0")))
     s = Reorder().apply(s, ReorderOption(outer_nid=mm_loop(s, "i_d0_1"), inner_nid=mm_loop(s, "i_d1_1")))
     s = RFactor().apply(s, RFactorOption(target_loop_nid=mm_loop(s, "i_d0_0"), factor_axis=0))
-    s = Split().apply(s, SplitOption(target_nid=fold_leaf(s), factors=(4, 512), target_axis="d2"))
-    s = Split().apply(s, SplitOption(target_nid=fold_loop(s, "i_d1_0"), factors=(4, 4), target_axis=None))
 
-    """Barrier 1 is isolated here via _check_same_loop_prefix and the dependency
-    check (span-promotion verifies init-domination). The fold's own enclosing
-    i_d0_0 is allowed (init dominates that loop). (The end-to-end
-    CodeMotion (lift) of the fold is deferred to the Task 3 ladder, where the
-    drain tensor_copy co-locates
-    FIRST so the copy->fold RAW on sbuf_rfactor is satisfied; that ordering
-    concern is the separate dependency check, not this reduction guard.)"""
+    """After the ki-anchored RFactor the fold is ALREADY per-N-tile (d2 free extent
+    512, region ``i_d2_0*512 : +512``) and per-Mi-tile, nested directly under
+    ``i_d2_0 > i_d0_0(ko) > i_d1_0 > i_d1_1`` with no block-local loops — so the old
+    ``Split(fold, d2, (4,512))`` + ``Split(fold_loop i_d1_0, (4,4))`` scaffolding
+    (which shaped a 2048-wide ko-anchored fold) is now moot and is dropped.
+
+    Barrier 1 is isolated here via _check_same_loop_prefix and the dependency check
+    (span-promotion verifies init-domination). The fold's own enclosing i_d0_0 is
+    allowed (init dominates that loop)."""
     fold = fold_blk(s)
     fold_block = s.tree.data(fold)
     assert any(iv.axis == "d0" and iv.role == AxisRole.ACCUMULATION for iv in fold_block.iter_vars)

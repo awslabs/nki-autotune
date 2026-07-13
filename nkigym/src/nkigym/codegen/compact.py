@@ -107,7 +107,31 @@ def _compact_one(tree: KernelTree, buf: Buffer, anchors: set[str]) -> Buffer:
             span = _axis_span(lo, width, axis, buf.location, anchors, extents)
             widest = max(widest, span)
         new_shape[axis] = widest
-    return replace(buf, shape=tuple(new_shape))
+    return _clamp_list_len_to_tiles(replace(buf, shape=tuple(new_shape)))
+
+
+def _clamp_list_len_to_tiles(buf: Buffer) -> Buffer:
+    """Shrink ``buf.list_len`` so it divides the (possibly compacted) tile count T.
+
+    ``compact_shapes`` recomputes only the logical shape; when a list buffer's leading
+    tile-count axis shrinks below ``list_len`` (e.g. RFactor's psum collapsing from 16
+    live M-tiles to 1), the stale ``list_len`` would no longer divide T and
+    :meth:`Buffer.per_tile_physical_shape` would assert. Clamp ``list_len`` to
+    ``min(list_len, T)``; the clamped value must divide T (loud otherwise — no silent
+    layout guess), which holds whenever T shrinks to a divisor of the old list_len
+    (the only shrink the ladder produces: 16 → 1).
+    """
+    result = buf
+    if buf.location != "shared_hbm" and buf.list_len > 1:
+        total_tiles = buf.physical_shape()[1]
+        if buf.list_len > total_tiles:
+            if total_tiles < 1 or buf.list_len % total_tiles != 0:
+                raise AssertionError(
+                    f"{buf.name}: cannot clamp list_len {buf.list_len} to tile count "
+                    f"{total_tiles} (not a clean divisor collapse)"
+                )
+            result = replace(buf, list_len=total_tiles)
+    return result
 
 
 def _axis_span(lo: Expr, width: Expr, axis: int, location: str, anchors: set[str], extents: dict[str, int]) -> int:

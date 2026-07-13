@@ -75,3 +75,28 @@ def mid_ladder_ir() -> KernelIR:
     """
     ir = split_k_ir()
     return Split().apply(ir, SplitOption(target_nid=_mm_m_loop(ir), factors=(4, 4), target_axis=None))
+
+
+def k28_ir() -> KernelIR:
+    """The pre-RFactor endpoint (manual k28): fully-tiled, all-list-buffer state, matmul
+    nest N > ko > Mo > Mi > ki. Built by the shipped driven ladder in kernel_transforms,
+    so this fixture tracks that ladder exactly (the RFactor input the rewrite targets).
+
+    Selected by NAME (``kernel_28``), not position: the ladder now ends with the
+    RFactor rung (``kernel_29``), so ``[-1]`` would return the already-factored k29
+    state. The named lookup is stable against further ladder appends.
+    """
+    from examples.kernel_transforms import _build_ladder
+
+    return next(ir for name, ir in _build_ladder() if name == "kernel_28")
+
+
+def k28_ko_loop_nid(ir: KernelIR) -> int:
+    """The OUTER matmul K loop (ko) nid in a k28-shaped IR: the first matmul-enclosing
+    i_d0_* ForNode (root-first ancestor order)."""
+    matmul = matmul_leaf_nid(ir)
+    return next(
+        a
+        for a in ir.tree.ancestors(matmul)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var.startswith("i_d0_")
+    )

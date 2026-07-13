@@ -81,14 +81,18 @@ def test_apply_rejects_parallel_loop() -> None:
 
 
 def test_apply_byte_exact() -> None:
-    """render(Split→RFactor) is AST-identical to the hand kernel (rf-buffer + wb-block)."""
+    """render(Split→RFactor) is AST-identical to the hand kernel (fused two-stage:
+    per-ko PSUM partial + tensor_tensor fold into sbuf_prod)."""
     assert_matches_hand(render(_rfactored_ir()), _load_hand_kernel())
 
 
 def _sim_rendered_matmul(name: str, src: str) -> None:
     """Round-trip ``src`` through a temp module and assert its kernel sims equal to
     ``lhs_T.T @ rhs`` (fp32). ``simulate_fp32`` takes a NKI callable, not a KernelIR,
-    so the rendered source is imported and its ``nki_f_matmul`` simmed."""
+    so the rendered source is imported and its ``nki_f*`` kernel simmed. The rendered
+    function name follows the source kernel (``nki_f_matmul`` for the matmul fixture,
+    ``nki_f_nkigym`` for the k28 IR built from ``f_nkigym``), so it is discovered by
+    prefix rather than hardcoded."""
     rng = np.random.default_rng(0)
     inputs = {
         "lhs_T": rng.standard_normal((2048, 2048)).astype(np.float32),
@@ -100,7 +104,8 @@ def _sim_rendered_matmul(name: str, src: str) -> None:
     spec = importlib.util.spec_from_file_location(f"rfactor_sim_{name}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    actual = np.asarray(simulate_fp32(module.nki_f_matmul)(**inputs))
+    fn = next(getattr(module, n) for n in dir(module) if n.startswith("nki_f"))
+    actual = np.asarray(simulate_fp32(fn)(**inputs))
     np.testing.assert_allclose(actual, inputs["lhs_T"].T @ inputs["rhs"], atol=5e-3, rtol=5e-3)
 
 
@@ -119,8 +124,10 @@ def test_apply_sim_matches_matmul_mid_tiled_m() -> None:
 
 
 def test_ko_roles_split_across_blocks() -> None:
-    """After RFactor, the K axis (d0) appears as PARALLEL in the rf-block and
-    ACCUMULATION in the wb-block — one factored axis, two block roles."""
+    """After RFactor, the K axis (d0) appears as PARALLEL in the matmul run-op block
+    (each ko is an independent partial) and ACCUMULATION in the tensor_tensor fold block
+    (carrying ko across the closing second-stage reduction) — one factored axis, two
+    block roles."""
     ir = _rfactored_ir()
     roles = set()
     for nid in ir.tree.blocks():
@@ -168,3 +175,23 @@ def test_rf_memset_drain_nested_in_ko() -> None:
     )
     assert ko in ir.tree.ancestors(rf_memset), "rf-init memset must be nested inside the ko loop"
     assert ko in ir.tree.ancestors(rf_drain), "rf-drain tensor_copy must be nested inside the ko loop"
+
+
+def test_apply_byte_exact_k28_to_k29() -> None:
+    """RFactor(ko) on the k28 IR (ki-innermost, all-list-buffer) renders byte-exact to
+    the hand kernel_29 (fused two-stage, per-Mi-tile psum list-1 + sbuf_rfactor)."""
+    from examples import manual_transforms
+    from test.transforms._rfactor_fixtures import k28_ir, k28_ko_loop_nid
+
+    ir = k28_ir()
+    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k28_ko_loop_nid(ir), factor_axis=0))
+    assert_matches_hand(render(rfactored), manual_transforms.kernel_29)
+
+
+def test_apply_sim_matches_matmul_k28_to_k29() -> None:
+    """The k28->k29 rfactored kernel sims numerically equal to lhs_T.T @ rhs."""
+    from test.transforms._rfactor_fixtures import k28_ir, k28_ko_loop_nid
+
+    ir = k28_ir()
+    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k28_ko_loop_nid(ir), factor_axis=0))
+    _sim_rendered_matmul("k28_to_k29", render(rfactored))

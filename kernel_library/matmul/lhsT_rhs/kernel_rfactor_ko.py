@@ -20,9 +20,14 @@ re-normalize bug is structurally absent.
 ``psum_prod`` and ``sbuf_rfactor`` are each declared INSIDE the ``ko`` loop
 immediately before its first use: ``psum_prod`` before the per-``ko`` memset that
 first writes it, and ``sbuf_rfactor`` before the ``tensor_copy`` that first writes
-it. The renderer places each ``nl.ndarray`` at the lowest common ancestor of its
-touching ISA leaves (:func:`nkigym.codegen.body._alloc_emit_anchors`), so a buffer
-live only within a loop is declared there, not at kernel scope.
+it. The renderer places each buffer at the lowest common ancestor of its touching
+ISA leaves (:func:`nkigym.codegen.body._alloc_emit_anchors`), so a buffer live only
+within a loop is declared there, not at kernel scope.
+
+Every sbuf/psum buffer is a uniform list-of-one (``[nl.ndarray(...) for _ in
+range(1)]``, accessed ``buf[0][...]``) — the machine-canonical form the renderer
+emits after the ``list_len`` codegen migration; ``shared_hbm`` stays a bare 2D
+``nl.ndarray``.
 """
 
 import nki
@@ -34,44 +39,46 @@ import nki.language as nl
 def nki_f_matmul(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
-    sbuf_lhs_T = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
-    sbuf_rhs = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
-    sbuf_prod = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+    sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    sbuf_rhs = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    sbuf_prod = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     for i_d0_0 in range(16):
         nisa.dma_copy(
-            src=lhs_T[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_lhs_T[0:128, i_d0_0, 0 : 0 + 2048]
+            src=lhs_T[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_lhs_T[0][0:128, i_d0_0, 0 : 0 + 2048]
         )
     for i_d0_0 in range(16):
         nisa.dma_copy(
-            src=rhs[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_rhs[0:128, i_d0_0, 0 : 0 + 2048]
+            src=rhs[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_rhs[0][0:128, i_d0_0, 0 : 0 + 2048]
         )
     for i_d1_0 in range(16):
-        nisa.memset(dst=sbuf_prod[0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
+        nisa.memset(dst=sbuf_prod[0][0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
     for i_d0_0 in range(2):
-        psum_prod = nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum)
+        psum_prod = [nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum) for _ in range(1)]
         for i_d1_0 in range(16):
-            nisa.memset(dst=psum_prod[0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
+            nisa.memset(dst=psum_prod[0][0:128, i_d1_0, 0 : 0 + 2048], value=0.0)
         for i_d0_1 in range(8):
             for i_d1_0 in range(16):
                 for i_d2_0 in range(4):
                     nisa.nc_matmul(
-                        stationary=sbuf_lhs_T[0:128, i_d0_0 * 8 + i_d0_1, i_d1_0 * 128 : i_d1_0 * 128 + 128],
-                        moving=sbuf_rhs[0:128, i_d0_0 * 8 + i_d0_1, i_d2_0 * 512 : i_d2_0 * 512 + 512],
-                        dst=psum_prod[0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                        stationary=sbuf_lhs_T[0][0:128, i_d0_0 * 8 + i_d0_1, i_d1_0 * 128 : i_d1_0 * 128 + 128],
+                        moving=sbuf_rhs[0][0:128, i_d0_0 * 8 + i_d0_1, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                        dst=psum_prod[0][0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
                     )
-        sbuf_rfactor = nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf)
+        sbuf_rfactor = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
         for i_d1_0 in range(16):
-            nisa.tensor_copy(src=psum_prod[0:128, i_d1_0, 0 : 0 + 2048], dst=sbuf_rfactor[0:128, i_d1_0, 0 : 0 + 2048])
+            nisa.tensor_copy(
+                src=psum_prod[0][0:128, i_d1_0, 0 : 0 + 2048], dst=sbuf_rfactor[0][0:128, i_d1_0, 0 : 0 + 2048]
+            )
         for i_d1_0 in range(16):
             nisa.tensor_tensor(
-                data1=sbuf_prod[0:128, i_d1_0, 0 : 0 + 2048],
-                data2=sbuf_rfactor[0:128, i_d1_0, 0 : 0 + 2048],
-                dst=sbuf_prod[0:128, i_d1_0, 0 : 0 + 2048],
+                data1=sbuf_prod[0][0:128, i_d1_0, 0 : 0 + 2048],
+                data2=sbuf_rfactor[0][0:128, i_d1_0, 0 : 0 + 2048],
+                dst=sbuf_prod[0][0:128, i_d1_0, 0 : 0 + 2048],
                 op=nl.add,
             )
     for i_d1_0 in range(16):
         nisa.dma_copy(
-            src=sbuf_prod[0:128, i_d1_0, 0 : 0 + 2048], dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, 0 : 0 + 2048]
+            src=sbuf_prod[0][0:128, i_d1_0, 0 : 0 + 2048], dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, 0 : 0 + 2048]
         )
     return hbm_out

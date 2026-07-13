@@ -64,3 +64,33 @@ def test_emit_alloc_follows_compacted_shape():
     compacted = replace(full, shape=(128, 128))
     assert _emit_alloc(full) == "sbuf_x = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
     assert _emit_alloc(compacted) == "sbuf_x = [nl.ndarray((128, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
+
+
+def test_compact_shapes_shrinks_list_len_when_tile_axis_collapses():
+    """When a list buffer's leading (tile-count) axis compacts below its list_len,
+    compact_shapes shrinks list_len to match — it does not leave list_len > T and
+    trip per_tile_physical_shape.
+
+    Models the RFactor psum: a list-16 (2048,512) buffer whose live footprint drops to
+    one 128-row tile. After compaction the buffer must be list-1 (128,512), consistent
+    under per_tile_physical_shape."""
+    from dataclasses import replace
+
+    from nkigym.codegen.compact import _compact_one
+    from nkigym.ir.tree import Buffer
+
+    listed = Buffer(name="psum_x", shape=(2048, 512), dtype="float32", location="psum", list_len=16)
+    assert listed.physical_shape() == (128, 16, 512)
+    shrunk = replace(listed, shape=(128, 512))
+    """physical tile-count T is now 1; list_len 16 would not divide it."""
+    fixed = _compact_one_list_len(shrunk)
+    assert fixed.list_len == 1
+    assert fixed.per_tile_physical_shape() == (128, 1, 512)
+
+
+def _compact_one_list_len(buf):
+    """Local helper mirroring the shrink _compact_one now performs on list_len, so the
+    unit test pins the clamp rule directly on a Buffer (no tree needed)."""
+    from nkigym.codegen.compact import _clamp_list_len_to_tiles
+
+    return _clamp_list_len_to_tiles(buf)
