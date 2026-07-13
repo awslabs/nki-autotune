@@ -62,8 +62,14 @@ def test_emit_alloc_follows_compacted_shape():
 
     full = Buffer(name="sbuf_x", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
     compacted = replace(full, shape=(128, 128))
-    assert _emit_alloc(full) == "sbuf_x = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
-    assert _emit_alloc(compacted) == "sbuf_x = [nl.ndarray((128, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
+    assert (
+        _emit_alloc(full)
+        == "sbuf_x = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
+    )
+    assert (
+        _emit_alloc(compacted)
+        == "sbuf_x = [nl.ndarray((128, 1, 128), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
+    )
 
 
 def test_compact_shapes_shrinks_list_len_when_tile_axis_collapses():

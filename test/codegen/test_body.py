@@ -136,10 +136,7 @@ def test_render_general_a_gt_1_bare_tile_index():
     (t) // a leading, (t) % a middle."""
     buf = Buffer(name="s", shape=(2048, 512), dtype="bfloat16", location="sbuf", list_len=8)
     assert buf.per_tile_physical_shape() == (128, 2, 512)
-    region = BufferRegion(
-        tensor="s",
-        ranges=((Var(name="t"), Const(value=128)), (Const(value=0), Const(value=512))),
-    )
+    region = BufferRegion(tensor="s", ranges=((Var(name="t"), Const(value=128)), (Const(value=0), Const(value=512))))
     out = render_buffer_region(region, buf)
     assert out == "s[(t) // 2][0:128, (t) % 2, 0:0 + 512]"
 
@@ -169,8 +166,10 @@ def test_render_b1_multi_tile_is_list0_whole_index():
     buf = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
     region = BufferRegion(
         tensor="sbuf_lhs_T",
-        ranges=((Var(name="i_d0_0"), Const(value=128)),
-                (Mul(left=Var(name="i_d1_0"), right=Const(value=128)), Const(value=128))),
+        ranges=(
+            (Var(name="i_d0_0"), Const(value=128)),
+            (Mul(left=Var(name="i_d1_0"), right=Const(value=128)), Const(value=128)),
+        ),
     )
     out = render_buffer_region(region, buf)
     assert out == "sbuf_lhs_T[0][0:128, i_d0_0, i_d1_0 * 128:i_d1_0 * 128 + 128]"
@@ -181,12 +180,13 @@ def test_render_full_split_is_list_index_middle_zero():
     buf = Buffer(name="psum_prod", shape=(2048, 512), dtype="float32", location="psum", list_len=16)
     region = BufferRegion(
         tensor="psum_prod",
-        ranges=((Var(name="i_d1_0"), Const(value=128)),
-                (Mul(left=Var(name="i_d2_0"), right=Const(value=512)), Const(value=512))),
+        ranges=(
+            (Var(name="i_d1_0"), Const(value=128)),
+            (Mul(left=Var(name="i_d2_0"), right=Const(value=512)), Const(value=512)),
+        ),
     )
     out = render_buffer_region(region, buf)
     assert out == "psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512:i_d2_0 * 512 + 512]"
-
 
 
 def test_emit_alloc_hbm_stays_bare():

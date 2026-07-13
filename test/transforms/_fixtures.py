@@ -130,14 +130,7 @@ def build_ladder_state(n: int) -> KernelIR:
     returns the new ir. Raises NotImplementedError for unwired rungs (loud).
     """
     from nkigym.ir.tree import ISANode
-    from nkigym.transforms import (  # noqa: F401
-        CodeMotion,
-        CodeMotionOption,
-        Reorder,
-        ReorderOption,
-        Split,
-        SplitOption,
-    )
+    from nkigym.transforms import CodeMotion, CodeMotionOption, Reorder, ReorderOption, Split, SplitOption  # noqa: F401
 
     blk, leaf, loop, inner, mm_loop, tc_loop = _ladder_helpers()
 

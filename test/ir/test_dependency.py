@@ -245,10 +245,6 @@ def test_must_precede_accepts_block_or_leaf_nids():
     assert ir.dependency.must_precede(leaf_of(matmul_blk), leaf_of(store_blk))
 
 
-
-
-
-
 def test_first_backward_edge_flags_memset_sunk_under_kloop():
     """Sinking the psum memset INTO the matmul's K loop is a backward edge, via the
     production insertion query on the pre-move tree (span-promotion; frozen
@@ -260,11 +256,11 @@ def test_first_backward_edge_flags_memset_sunk_under_kloop():
     ir = build_canonical_ir()
     memset_blk = _block_for_op(ir, NKIMemset)
     matmul_leaf = next(
-        n for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
     )
     kloop = next(
-        a for a in ir.tree.ancestors(matmul_leaf)
+        a
+        for a in ir.tree.ancestors(matmul_leaf)
         if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
     )
     moved_leaf = ir.dependency._resolve(memset_blk)
@@ -286,11 +282,11 @@ def test_span_promotion_rejects_memset_sunk_into_kloop():
     ir = build_canonical_ir()
     memset_blk = _block_for_op(ir, NKIMemset)
     matmul_leaf = next(
-        n for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
     )
     kloop = next(
-        a for a in ir.tree.ancestors(matmul_leaf)
+        a
+        for a in ir.tree.ancestors(matmul_leaf)
         if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
     )
     moved_leaf = ir.dependency._resolve(memset_blk)
@@ -385,12 +381,6 @@ def test_first_backward_edge_allows_load_under_kloop():
     assert dep.first_backward_edge(load_leaf) is None
 
 
-
-
-
-
-
-
 def test_hazard_edges_record_conflicting_tensor():
     """Each RAW/WAW/WAR edge carries the tensor it is about, so span-promotion
     can key on the shared buffer per edge (a leaf may have one carried and one
@@ -400,8 +390,7 @@ def test_hazard_edges_record_conflicting_tensor():
     ir = build_canonical_ir()
     dep = ir.dependency
     base_edges = [
-        (a, b, attrs) for a, b, attrs in dep.graph.edges(data=True)
-        if attrs.get("kind") in {"RAW", "WAW", "WAR"}
+        (a, b, attrs) for a, b, attrs in dep.graph.edges(data=True) if attrs.get("kind") in {"RAW", "WAW", "WAR"}
     ]
     assert base_edges, "expected at least one RAW/WAW/WAR edge in the canonical IR"
     for _a, _b, attrs in base_edges:
@@ -418,11 +407,11 @@ def test_tensor_carried_across_psum_over_kloop():
 
     ir = build_canonical_ir()
     matmul_leaf = next(
-        n for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
     )
     kloop = next(
-        a for a in ir.tree.ancestors(matmul_leaf)
+        a
+        for a in ir.tree.ancestors(matmul_leaf)
         if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
     )
     assert _tensor_carried_across(ir.tree, kloop, "psum_prod") is True
@@ -439,8 +428,7 @@ def test_access_invariant_across_matches_offset_var():
 
     ir = build_canonical_ir()
     matmul_leaf = next(
-        n for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
     )
     assert _access_invariant_across(ir.tree, matmul_leaf, "i_d0_0", "psum_prod") is True
     assert _access_invariant_across(ir.tree, matmul_leaf, "i_d1_0", "psum_prod") is False
