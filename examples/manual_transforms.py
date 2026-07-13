@@ -46,7 +46,7 @@ NEURON_PLATFORM_TARGET = "trn2"
 """Hand-placed PSUM: the neuronx-cc scheduler + linear-scan allocator must be OFF
 (scheduler-on OOMs PSUM even with per-iteration alloc)."""
 SCHEDULER_OFF_ARGS = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")
-_KERNEL_NAME = re.compile(r"^kernel_\d+$")
+_KERNEL_NAME = re.compile(r"^kernel_\d+(_intermediate)?$")
 
 
 @nki.jit
@@ -521,6 +521,56 @@ If moved to target location:
 2. sbuf_prod[0][0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512] is after producers.
 --> ok
 """
+
+@nki.jit
+def kernel_10_intermediate(lhs_T, rhs):
+    """CodeMotion (drain-sink under i_d2_0) — structural move only. Its place+compact
+    tail is a no-op here (sbuf_prod stays (128,16,2048)), so this equals kernel_10;
+    kept for uniformity across the CodeMotion+RFactor rungs."""
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+
+    sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=lhs_T[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_lhs_T[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+    sbuf_rhs = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=rhs[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_rhs[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+    psum_prod = [nl.ndarray((128, 1, 2048), dtype=nl.float32, buffer=nl.psum) for _ in range(16)]
+    for i_d1_0 in range(16):
+        nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, 0 : 0 + 2048], value=0.0)
+    sbuf_prod = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d2_0 in range(4):
+        for i_d0_0 in range(2):
+            for i_d1_0 in range(4):
+                for i_d1_1 in range(4):
+                    for i_d0_1 in range(8):
+                        nisa.nc_matmul(
+                            stationary=sbuf_lhs_T[0][
+                                0:128,
+                                i_d0_0 * 8 + i_d0_1,
+                                (i_d1_0 * 4 + i_d1_1) * 128 : (i_d1_0 * 4 + i_d1_1) * 128 + 128,
+                            ],
+                            moving=sbuf_rhs[0][0:128, i_d0_0 * 8 + i_d0_1, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                            dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                        )
+        for i_d1_0 in range(16):
+            nisa.tensor_copy(
+                src=psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                dst=sbuf_prod[0][0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+            )
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    for i_d1_0 in range(16):
+        nisa.dma_copy(
+            src=sbuf_prod[0][0:128, i_d1_0, 0 : 0 + 2048], dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, 0 : 0 + 2048]
+        )
+    return hbm_out
+
+
 @nki.jit
 def kernel_10(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
@@ -658,6 +708,56 @@ def kernel_12(lhs_T, rhs):
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     # Reorder
     for i_d2_0 in range(4):
+        for i_d1_0 in range(16):
+            nisa.dma_copy(
+                src=sbuf_prod[0][0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+            )
+    return hbm_out
+
+
+@nki.jit
+def kernel_13_intermediate(lhs_T, rhs):
+    """CodeMotion (store-sink under i_d2_0) — structural move only, BEFORE the
+    place+compact side effect. sbuf_prod is still (128,16,2048) at top scope, indexed
+    [:, i_d1_0, i_d2_0*512:+512]. kernel_13 then tightens it to (128,16,512) + 0:512."""
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+
+    sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=lhs_T[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_lhs_T[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+    sbuf_rhs = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=rhs[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_rhs[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+    psum_prod = [nl.ndarray((128, 1, 2048), dtype=nl.float32, buffer=nl.psum) for _ in range(16)]
+    for i_d1_0 in range(16):
+        nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, 0 : 0 + 2048], value=0.0)
+    sbuf_prod = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    for i_d2_0 in range(4):
+        for i_d0_0 in range(2):
+            for i_d1_0 in range(4):
+                for i_d1_1 in range(4):
+                    for i_d0_1 in range(8):
+                        nisa.nc_matmul(
+                            stationary=sbuf_lhs_T[0][
+                                0:128,
+                                i_d0_0 * 8 + i_d0_1,
+                                (i_d1_0 * 4 + i_d1_1) * 128 : (i_d1_0 * 4 + i_d1_1) * 128 + 128,
+                            ],
+                            moving=sbuf_rhs[0][0:128, i_d0_0 * 8 + i_d0_1, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                            dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                        )
+        for i_d1_0 in range(16):
+            nisa.tensor_copy(
+                src=psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                dst=sbuf_prod[0][0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+            )
         for i_d1_0 in range(16):
             nisa.dma_copy(
                 src=sbuf_prod[0][0:128, i_d1_0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
@@ -833,6 +933,56 @@ def kernel_16(lhs_T, rhs):
             nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512], value=0.0)
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     for i_d2_0 in range(4):
+        for i_d0_0 in range(2):
+            for i_d1_0 in range(4):
+                for i_d1_1 in range(4):
+                    for i_d0_1 in range(8):
+                        nisa.nc_matmul(
+                            stationary=sbuf_lhs_T[0][
+                                0:128,
+                                i_d0_0 * 8 + i_d0_1,
+                                (i_d1_0 * 4 + i_d1_1) * 128 : (i_d1_0 * 4 + i_d1_1) * 128 + 128,
+                            ],
+                            moving=sbuf_rhs[0][0:128, i_d0_0 * 8 + i_d0_1, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                            dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                        )
+        sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]
+        for i_d1_0 in range(16):
+            nisa.tensor_copy(
+                src=psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                dst=sbuf_prod[i_d1_0][0:128, 0, 0:512],
+            )
+        for i_d1_0 in range(16):
+            nisa.dma_copy(
+                src=sbuf_prod[i_d1_0][0:128, 0, 0:512],
+                dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+            )
+    return hbm_out
+
+
+@nki.jit
+def kernel_17_intermediate(lhs_T, rhs):
+    """CodeMotion (psum-memset sink under i_d2_0) — structural move only, BEFORE
+    place+compact. psum_prod is still (128,1,2048)x16, indexed [:, 0, i_d2_0*512:+512];
+    kernel_17 tightens it to (128,1,512)x16 + 0:512."""
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+
+    sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=lhs_T[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_lhs_T[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+    sbuf_rhs = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=rhs[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_rhs[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    for i_d2_0 in range(4):
+        psum_prod = [nl.ndarray((128, 1, 2048), dtype=nl.float32, buffer=nl.psum) for _ in range(16)]
+        for i_d1_0 in range(16):
+            nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512 : i_d2_0 * 512 + 512], value=0.0)
         for i_d0_0 in range(2):
             for i_d1_0 in range(4):
                 for i_d1_1 in range(4):
@@ -1083,6 +1233,59 @@ def kernel_21(lhs_T, rhs):
         for i_d1_0 in range(16):
             nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, 0:512], value=0.0)
         for i_d0_0 in range(2):
+            for i_d1_0 in range(4):
+                for i_d1_1 in range(4):
+                    for i_d0_1 in range(8):
+                        nisa.nc_matmul(
+                            stationary=sbuf_lhs_T[0][
+                                0:128,
+                                i_d0_0 * 8 + i_d0_1,
+                                (i_d1_0 * 4 + i_d1_1) * 128 : (i_d1_0 * 4 + i_d1_1) * 128 + 128,
+                            ],
+                            moving=sbuf_rhs[0][0:128, i_d0_0 * 8 + i_d0_1, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                            dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
+                        )
+        sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]
+        for i_d1_0 in range(16):
+            nisa.tensor_copy(src=psum_prod[i_d1_0][0:128, 0, 0:512], dst=sbuf_prod[i_d1_0][0:128, 0, 0:512])
+        for i_d1_0 in range(16):
+            nisa.dma_copy(
+                src=sbuf_prod[i_d1_0][0:128, 0, 0:512],
+                dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+            )
+    return hbm_out
+
+
+@nki.jit
+def kernel_22_intermediate(lhs_T, rhs):
+    """CodeMotion (rhs-load sink under i_d0_0) — structural move only, BEFORE
+    place+compact. sbuf_rhs is still (128,16,2048), indexed by the global
+    i_d0_0*8+i_d0_1 tile and i_d2_0*512:+512 free; kernel_22 tightens it to
+    (128,8,512)."""
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+
+    sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d0_0 in range(16):
+        nisa.dma_copy(
+            src=lhs_T[i_d0_0 * 128 : i_d0_0 * 128 + 128, 0 : 0 + 2048], dst=sbuf_lhs_T[0][0:128, i_d0_0, 0 : 0 + 2048]
+        )
+
+    sbuf_rhs = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    for i_d2_0 in range(4):
+        psum_prod = [nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(16)]
+        for i_d1_0 in range(16):
+            nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, 0:512], value=0.0)
+        for i_d0_0 in range(2):
+            for i_d0_1 in range(8):
+                nisa.dma_copy(
+                    src=rhs[
+                        (i_d0_0 * 8 + i_d0_1) * 128 : (i_d0_0 * 8 + i_d0_1) * 128 + 128,
+                        i_d2_0 * 512 : i_d2_0 * 512 + 512,
+                    ],
+                    dst=sbuf_rhs[0][0:128, (i_d0_0 * 8 + i_d0_1), i_d2_0 * 512 : i_d2_0 * 512 + 512],
+                )
             for i_d1_0 in range(4):
                 for i_d1_1 in range(4):
                     for i_d0_1 in range(8):
@@ -1372,6 +1575,63 @@ def kernel_26(lhs_T, rhs):
 
 
 @nki.jit
+def kernel_27_intermediate(lhs_T, rhs):
+    """CodeMotion (lhs_T-load sink under Mo=i_d1_0) — structural move only, BEFORE
+    place+compact. sbuf_lhs_T is still (128,16,2048), dst indexed by the global
+    i_d0_0*8+i_d0_1 tile and i_d1_0*512:+512 free, and the matmul stationary reads the
+    global (i_d1_0*4+i_d1_1)*128 M-tile; kernel_27 tightens sbuf_lhs_T to (128,8,512)
+    and rebases the stationary to i_d1_1*128."""
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
+    for i_d2_0 in range(4):
+        psum_prod = [nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(16)]
+        for i_d1_0 in range(16):
+            nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, 0:512], value=0.0)
+        for i_d0_0 in range(2):
+            sbuf_rhs = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(8)]
+            for i_d0_1 in range(8):
+                nisa.dma_copy(
+                    src=rhs[
+                        (i_d0_0 * 8 + i_d0_1) * 128 : (i_d0_0 * 8 + i_d0_1) * 128 + 128,
+                        i_d2_0 * 512 : i_d2_0 * 512 + 512,
+                    ],
+                    dst=sbuf_rhs[i_d0_1][0:128, 0, 0:512],
+                )
+            for i_d1_0 in range(4):
+                for i_d0_1 in range(8):
+                    nisa.dma_copy(
+                        src=lhs_T[
+                            (i_d0_0 * 8 + i_d0_1) * 128 : (i_d0_0 * 8 + i_d0_1) * 128 + 128,
+                            i_d1_0 * 512 : i_d1_0 * 512 + 512,
+                        ],
+                        dst=sbuf_lhs_T[0][0:128, (i_d0_0 * 8 + i_d0_1), i_d1_0 * 512 : i_d1_0 * 512 + 512],
+                    )
+                for i_d1_1 in range(4):
+                    for i_d0_1 in range(8):
+                        nisa.nc_matmul(
+                            stationary=sbuf_lhs_T[0][
+                                0:128,
+                                i_d0_0 * 8 + i_d0_1,
+                                (i_d1_0 * 4 + i_d1_1) * 128 : (i_d1_0 * 4 + i_d1_1) * 128 + 128,
+                            ],
+                            moving=sbuf_rhs[i_d0_1][0:128, 0, 0:512],
+                            dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
+                        )
+        sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]
+        for i_d1_0 in range(16):
+            nisa.tensor_copy(src=psum_prod[i_d1_0][0:128, 0, 0:512], dst=sbuf_prod[i_d1_0][0:128, 0, 0:512])
+        for i_d1_0 in range(16):
+            nisa.dma_copy(
+                src=sbuf_prod[i_d1_0][0:128, 0, 0:512],
+                dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+            )
+    return hbm_out
+
+
+@nki.jit
 def kernel_27(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
@@ -1428,9 +1688,11 @@ def kernel_28(lhs_T, rhs):
 
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     for i_d2_0 in range(4):
+        # init_one_stage()
         psum_prod = [nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(16)]
         for i_d1_0 in range(16):
             nisa.memset(dst=psum_prod[i_d1_0][0:128, 0, 0:512], value=0.0)
+        # ko loop
         for i_d0_0 in range(2):
             sbuf_rhs = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(8)]
             for i_d0_1 in range(8):
@@ -1453,12 +1715,15 @@ def kernel_28(lhs_T, rhs):
                         dst=sbuf_lhs_T[i_d0_1][0:128, 0, 0:512],
                     )
                 for i_d1_1 in range(4):
+                    # ki loop
                     for i_d0_1 in range(8):
+                        # Run op
                         nisa.nc_matmul(
                             stationary=sbuf_lhs_T[i_d0_1][0:128, 0, i_d1_1 * 128 : i_d1_1 * 128 + 128],
                             moving=sbuf_rhs[i_d0_1][0:128, 0, 0:512],
                             dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
                         )
+        # One stage reduction drain
         sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]
         for i_d1_0 in range(16):
             nisa.tensor_copy(src=psum_prod[i_d1_0][0:128, 0, 0:512], dst=sbuf_prod[i_d1_0][0:128, 0, 0:512])
@@ -1470,18 +1735,23 @@ def kernel_28(lhs_T, rhs):
     return hbm_out
 
 
-# Apply RFactor
 @nki.jit
-def kernel_29(lhs_T, rhs):
+def kernel_29_intermediate(lhs_T, rhs):
+    """RFactor structural emission (two-stage restructure) — BEFORE place+compact.
+    Control flow is the AFTER shape (memset psum before ki, copy+fold after ki, both
+    inside Mi=i_d1_1), but buffers are k28's VERBATIM: psum_prod list-16 addressed
+    [i_d1_0*4+i_d1_1] free 0:512, sbuf_rfactor list-16 at ko-body scope. kernel_29
+    then descends psum/sbuf_rfactor into Mi as list-1 and rebases their tile index."""
     assert lhs_T.shape == (2048, 2048)
     assert rhs.shape == (2048, 2048)
     hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
     for i_d2_0 in range(4):
-        """init_two_stage_0"""
         sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]
         for i_d1_0 in range(16):
             nisa.memset(dst=sbuf_prod[i_d1_0][0:128, 0, 0:512], value=0.0)
+        psum_prod = [nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(16)]
+        sbuf_rfactor = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]
         for i_d0_0 in range(2):
             sbuf_rhs = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(8)]
             for i_d0_1 in range(8):
@@ -1503,16 +1773,94 @@ def kernel_29(lhs_T, rhs):
                         dst=sbuf_lhs_T[i_d0_1][0:128, 0, 0:512],
                     )
                 for i_d1_1 in range(4):
-                    """init_two_stage_1"""
+                    nisa.memset(dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512], value=0.0)
+                    for i_d0_1 in range(8):
+                        nisa.nc_matmul(
+                            stationary=sbuf_lhs_T[i_d0_1][0:128, 0, i_d1_1 * 128 : i_d1_1 * 128 + 128],
+                            moving=sbuf_rhs[i_d0_1][0:128, 0, 0:512],
+                            dst=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
+                        )
+                    nisa.tensor_copy(
+                        src=psum_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
+                        dst=sbuf_rfactor[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
+                    )
+                    nisa.tensor_tensor(
+                        data1=sbuf_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
+                        data2=sbuf_rfactor[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
+                        dst=sbuf_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
+                        op=nl.add,
+                    )
+        for i_d1_0 in range(16):
+            nisa.dma_copy(
+                src=sbuf_prod[i_d1_0][0:128, 0, 0:512],
+                dst=hbm_out[i_d1_0 * 128 : i_d1_0 * 128 + 128, i_d2_0 * 512 : i_d2_0 * 512 + 512],
+            )
+    return hbm_out
+
+
+'''
+Apply RFactor
+BEFORE (one-stage):
+init_one_stage()
+for ko in range(ko_trip):
+    for ki in range(ki_trip):
+        run_op()
+drain_one_stage()
+
+AFTER (two-stage):
+init_two_stage_0()
+for ko in range(ko_trip):
+    init_two_stage_1()
+    for ki in range(ki_trip):
+        run_op()
+    drain_two_stage_0()
+drain_two_stage_1()
+'''
+@nki.jit
+def kernel_29(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
+    hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    for i_d2_0 in range(4):
+        # init_two_stage_0
+        sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]
+        for i_d1_0 in range(16):
+            nisa.memset(dst=sbuf_prod[i_d1_0][0:128, 0, 0:512], value=0.0)
+        # ko loop
+        for i_d0_0 in range(2):
+            sbuf_rhs = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(8)]
+            for i_d0_1 in range(8):
+                nisa.dma_copy(
+                    src=rhs[
+                        (i_d0_0 * 8 + i_d0_1) * 128 : (i_d0_0 * 8 + i_d0_1) * 128 + 128,
+                        i_d2_0 * 512 : i_d2_0 * 512 + 512,
+                    ],
+                    dst=sbuf_rhs[i_d0_1][0:128, 0, 0:512],
+                )
+            for i_d1_0 in range(4):
+                sbuf_lhs_T = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(8)]
+                for i_d0_1 in range(8):
+                    nisa.dma_copy(
+                        src=lhs_T[
+                            (i_d0_0 * 8 + i_d0_1) * 128 : (i_d0_0 * 8 + i_d0_1) * 128 + 128,
+                            i_d1_0 * 512 : i_d1_0 * 512 + 512,
+                        ],
+                        dst=sbuf_lhs_T[i_d0_1][0:128, 0, 0:512],
+                    )
+                for i_d1_1 in range(4):
+                    # init_two_stage_1
                     psum_prod = [nl.ndarray((128, 1, 512), dtype=nl.float32, buffer=nl.psum) for _ in range(1)]
                     nisa.memset(dst=psum_prod[0][0:128, 0, 0:512], value=0.0)
+                    # ki loop
                     for i_d0_1 in range(8):
+                        # Run op
                         nisa.nc_matmul(
                             stationary=sbuf_lhs_T[i_d0_1][0:128, 0, i_d1_1 * 128 : i_d1_1 * 128 + 128],
                             moving=sbuf_rhs[i_d0_1][0:128, 0, 0:512],
                             dst=psum_prod[0][0:128, 0, 0:512],
                         )
-                    """drain_two_stage_0"""
+                    # drain_two_stage_0
                     sbuf_rfactor = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
                     nisa.tensor_copy(src=psum_prod[0][0:128, 0, 0:512], dst=sbuf_rfactor[0][0:128, 0, 0:512])
                     nisa.tensor_tensor(
@@ -1521,7 +1869,7 @@ def kernel_29(lhs_T, rhs):
                         dst=sbuf_prod[i_d1_0 * 4 + i_d1_1][0:128, 0, 0:512],
                         op=nl.add,
                     )
-        """drain_two_stage_1: None"""
+        # drain_two_stage_1: None
         for i_d1_0 in range(16):
             nisa.dma_copy(
                 src=sbuf_prod[i_d1_0][0:128, 0, 0:512],
@@ -1530,9 +1878,17 @@ def kernel_29(lhs_T, rhs):
     return hbm_out
 
 def _discover_kernels(namespace: dict[str, object]) -> list[tuple[str, Callable]]:
-    """Module-level ``kernel_<id>`` callables in ``namespace``, ordered by numeric id."""
+    """Module-level ``kernel_<id>`` / ``kernel_<id>_intermediate`` callables in
+    ``namespace``, ordered by numeric id with each ``_intermediate`` immediately
+    before its same-id final."""
     found = [(name, obj) for name, obj in namespace.items() if _KERNEL_NAME.match(name) and callable(obj)]
-    return sorted(found, key=lambda item: int(item[0].split("_", 1)[1]))
+
+    def _key(item: tuple[str, Callable]) -> tuple[int, int]:
+        name = item[0]
+        digits = name[len("kernel_") :].split("_", 1)[0]
+        return (int(digits), 0 if name.endswith("_intermediate") else 1)
+
+    return sorted(found, key=_key)
 
 
 def _check_numerics(name: str, kernel: Callable, inputs: dict[str, np.ndarray], expected: np.ndarray) -> bool:
