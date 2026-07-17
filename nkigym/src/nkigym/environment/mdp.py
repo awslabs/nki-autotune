@@ -13,7 +13,7 @@ from typing import Any
 from nkigym.ir import KernelIR, build_initial_ir
 from nkigym.transforms import Transform, TransformOption
 
-Action = tuple[Transform, TransformOption]
+Action = tuple[Transform[Any], TransformOption]
 
 
 class KernelMDP:
@@ -30,7 +30,7 @@ class KernelMDP:
         self,
         kernel_func: Callable[..., Any],
         input_specs: dict[str, tuple[tuple[int, ...], str]],
-        transforms: list[Transform],
+        transforms: list[Transform[Any]],
     ) -> None:
         """Store the kernel + transforms. No IR is built until ``reset``."""
         self.kernel_func = kernel_func

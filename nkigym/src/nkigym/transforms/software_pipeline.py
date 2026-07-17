@@ -33,7 +33,7 @@ class SoftwarePipelineOption(TransformOption):
     order: tuple[int, ...]
 
 
-class SoftwarePipeline(Transform):
+class SoftwarePipeline(Transform[SoftwarePipelineOption]):
     """Stage-driven accumulator multi-buffer (Tier B)."""
 
     def analyze(self, ir: KernelIR) -> list[SoftwarePipelineOption]:
@@ -60,7 +60,7 @@ class SoftwarePipeline(Transform):
         new_children = list(new_ir.tree.children(option.loop_nid))
         self._apply_versions(new_ir, option, new_children)
         parent = self._parent_block(new_ir, option.loop_nid)
-        new_ir.tree.data(parent).annotations["software_pipeline"] = {
+        new_ir.tree.block(parent).annotations["software_pipeline"] = {
             "loop_nid": option.loop_nid,
             "stages": option.stages,
             "order": option.order,
@@ -239,7 +239,7 @@ class SoftwarePipeline(Transform):
     def _already_pipelined(self, ir: KernelIR, loop_nid: int) -> bool:
         """True if some block already annotates this loop as pipelined."""
         return any(
-            ir.tree.data(nid).annotations.get("software_pipeline", {}).get("loop_nid") == loop_nid
+            ir.tree.block(nid).annotations.get("software_pipeline", {}).get("loop_nid") == loop_nid
             for nid in ir.tree.blocks()
         )
 

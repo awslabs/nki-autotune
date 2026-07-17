@@ -21,13 +21,13 @@ def test_place_buffers_canonical_matches_build():
 
     """Capture placement, clear it, re-run, assert identical."""
     before = {
-        nid: tuple(b.name for b in ir.tree.data(nid).alloc_buffers)
+        nid: tuple(b.name for b in ir.tree.block(nid).alloc_buffers)
         for nid in ir.tree.blocks()
         if isinstance(ir.tree.data(nid), BlockNode)
     }
     place_buffers(ir.tree)
     after = {
-        nid: tuple(b.name for b in ir.tree.data(nid).alloc_buffers)
+        nid: tuple(b.name for b in ir.tree.block(nid).alloc_buffers)
         for nid in ir.tree.blocks()
         if isinstance(ir.tree.data(nid), BlockNode)
     }
@@ -42,7 +42,7 @@ def test_place_buffers_is_idempotent_when_called_twice():
     """Calling place_buffers twice yields the same placement as once."""
     ir = build_canonical_ir()
     place_buffers(ir.tree)
-    once = {nid: tuple(b.name for b in ir.tree.data(nid).alloc_buffers) for nid in ir.tree.blocks()}
+    once = {nid: tuple(b.name for b in ir.tree.block(nid).alloc_buffers) for nid in ir.tree.blocks()}
     place_buffers(ir.tree)
-    twice = {nid: tuple(b.name for b in ir.tree.data(nid).alloc_buffers) for nid in ir.tree.blocks()}
+    twice = {nid: tuple(b.name for b in ir.tree.block(nid).alloc_buffers) for nid in ir.tree.blocks()}
     assert once == twice

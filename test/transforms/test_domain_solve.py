@@ -143,6 +143,6 @@ def test_regen_and_rebind_residual_keeps_one_loop():
         "d1": DimDomain(target_loops=[("i_d1_0", 4)], residual_extent=4),
     }
     regen_and_rebind(ir.tree, load, solved)
-    remaining = [ir.tree.data(d) for d in ir.tree.descendants(load) if isinstance(ir.tree.data(d), ForNode)]
+    remaining = [ir.tree.loop(d) for d in ir.tree.descendants(load) if isinstance(ir.tree.data(d), ForNode)]
     assert len(remaining) == 1
     assert remaining[0].extent == 4

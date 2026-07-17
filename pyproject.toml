@@ -10,6 +10,7 @@ profile = "black"
 line_length = 120
 
 [tool.pyright]
+extraPaths = ["nkigym/src", "autotune/src"]
 reportMissingImports = "none"
 
 [tool.pytest.ini_options]

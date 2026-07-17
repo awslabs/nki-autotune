@@ -88,7 +88,7 @@ def _target_loop_seq(tree: KernelTree, target_loop_nid: int) -> list[tuple[str, 
     loses interleave order. This is the prefix the moved block must match.
     """
     chain = [*tree.ancestors(target_loop_nid), target_loop_nid]
-    return [(tree.data(n).loop_var, tree.data(n).extent) for n in chain if isinstance(tree.data(n), ForNode)]
+    return [(node.loop_var, node.extent) for n in chain if isinstance((node := tree.data(n)), ForNode)]
 
 
 def _moved_loop_seq(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
@@ -99,7 +99,7 @@ def _moved_loop_seq(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
     """
     leaf = next(d for d in tree.preorder(block_nid) if isinstance(tree.data(d), ISANode))
     chain = [*tree.ancestors(leaf), leaf]
-    return [(tree.data(n).loop_var, tree.data(n).extent) for n in chain if isinstance(tree.data(n), ForNode)]
+    return [(node.loop_var, node.extent) for n in chain if isinstance((node := tree.data(n)), ForNode)]
 
 
 def _assert_single_parent(tree: KernelTree) -> None:
@@ -209,8 +209,8 @@ def _crossed_execution_loops(ir: KernelIR, block_nid: int, target_loop_nid: int)
     target_loops = [
         nid for nid in [*tree.ancestors(target_loop_nid), target_loop_nid] if isinstance(tree.data(nid), ForNode)
     ]
-    moved_vars = {tree.data(nid).loop_var for nid in old_loops}
-    covered_prefix = sum(1 for nid in target_loops if tree.data(nid).loop_var in moved_vars)
+    moved_vars = {tree.loop(nid).loop_var for nid in old_loops}
+    covered_prefix = sum(1 for nid in target_loops if tree.loop(nid).loop_var in moved_vars)
     enclosing_count = len(old_loops) - len(local_loops)
     local_prefix_drop = max(0, covered_prefix - enclosing_count)
     new_loops = [*target_loops, *local_loops[local_prefix_drop:]]
@@ -421,7 +421,7 @@ class CodeMotionOption(TransformOption):
     index: int
 
 
-class CodeMotion(Transform):
+class CodeMotion(Transform[CodeMotionOption]):
     """Relocate one block under a target loop (the merged former ComputeAt/ReverseComputeAt).
 
     Legality is dependency-ordering (span-promotion) + the structural same-prefix

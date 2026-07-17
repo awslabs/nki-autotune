@@ -38,9 +38,7 @@ def place_and_compact_buffer(tree: KernelTree, tensor: str) -> None:
         if not any(b.name == tensor for b in block.alloc_buffers):
             continue
         anchors = _anchor_loop_vars(tree, tensor)
-        new_bufs = tuple(
-            _compact_one(tree, buf, anchors) if buf.name == tensor else buf for buf in block.alloc_buffers
-        )
+        new_bufs = tuple(_compact_one(tree, buf, anchors) if buf.name == tensor else buf for buf in block.alloc_buffers)
         tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=new_bufs)
 
 
@@ -52,16 +50,13 @@ def rebase_regions_of(tree: KernelTree, tensor: str) -> None:
     ``rebased_region`` used to compute at render time. shared_hbm buffers and
     buffers with no anchors are left unchanged (identity).
     """
-    buf = next(
-        (b for nid in tree.blocks() for b in tree.data(nid).alloc_buffers if b.name == tensor),
-        None,
-    )
+    buf = next((b for nid in tree.blocks() for b in tree.block(nid).alloc_buffers if b.name == tensor), None)
     if buf is None or buf.location == "shared_hbm":
         return
     anchors = _anchor_loop_vars(tree, tensor)
     if not anchors:
         return
-    subs = {a: Const(value=0) for a in anchors}
+    subs: dict[str, Expr] = {a: Const(value=0) for a in anchors}
     for nid in tree.preorder():
         data = tree.data(nid)
         if not isinstance(data, ISANode):
@@ -114,7 +109,7 @@ def _anchor_loop_vars(tree: KernelTree, tensor: str) -> set[str]:
     if not pairs:
         return set()
     per_leaf = [{a for a in tree.ancestors(leaf) if isinstance(tree.data(a), ForNode)} for leaf, _r in pairs]
-    candidates = {tree.data(nid).loop_var for nid in set.intersection(*per_leaf)}
+    candidates = {tree.loop(nid).loop_var for nid in set.intersection(*per_leaf)}
     regions = [region for _leaf, region in pairs]
     return {v for v in candidates if _offsets_consistently(v, regions)}
 
@@ -258,7 +253,7 @@ def rebased_region(region: BufferRegion, buf: Buffer, tree: KernelTree) -> Buffe
     anchors = _anchor_loop_vars(tree, buf.name)
     if not anchors:
         return region
-    subs = {a: Const(value=0) for a in anchors}
+    subs: dict[str, Expr] = {a: Const(value=0) for a in anchors}
     new_ranges = tuple((substitute(lo, subs), width) for lo, width in region.ranges)
     return BufferRegion(tensor=region.tensor, ranges=new_ranges)
 

@@ -38,7 +38,7 @@ class SplitOption(TransformOption):
     target_axis: str | None = None
 
 
-class Split(Transform):
+class Split(Transform[SplitOption]):
     """Replace one loop or tensorize-axis tile with a chain of factors."""
 
     def analyze(self, ir: KernelIR) -> list[SplitOption]:
@@ -186,6 +186,7 @@ class Split(Transform):
         _replace_in_parent_children(ir.tree, parent_nid, [leaf_nid], [top_nid])
 
         inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+        assert option.target_axis is not None
         abstract_axis = inverse_axis_map.get(option.target_axis)
         new_width = option.factors[-1]
 

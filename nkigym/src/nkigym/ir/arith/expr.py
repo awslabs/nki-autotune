@@ -179,8 +179,8 @@ def _add(a: dict[str | None, int], b: dict[str | None, int]) -> dict[str | None,
 
 def _mul(a: dict[str | None, int], b: dict[str | None, int]) -> dict[str | None, int]:
     """Coefficient-wise product. At most one operand may contain a non-None key."""
-    a_vars = set(a) - {None}
-    b_vars = set(b) - {None}
+    a_vars = {var for var in a if var is not None}
+    b_vars = {var for var in b if var is not None}
     if a_vars and b_vars:
         raise NonAffineError(f"Var * Var: {sorted(a_vars)} times {sorted(b_vars)}")
     if not a_vars:

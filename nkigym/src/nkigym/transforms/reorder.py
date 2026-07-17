@@ -22,7 +22,7 @@ class ReorderOption(TransformOption):
     inner_nid: int
 
 
-class Reorder(Transform):
+class Reorder(Transform[ReorderOption]):
     """Swap an adjacent parent-child ForNode pair via payload swap."""
 
     def analyze(self, ir: KernelIR) -> list[ReorderOption]:
@@ -162,7 +162,7 @@ def _regions_invariant(regions: tuple[BufferRegion, ...], loop_var: str) -> bool
 
 def _dim_of(tree: KernelTree, loop_nid: int) -> str:
     """Concrete dim a ForNode drives, parsed from its dense name ``i_d{dim}_{N}`` -> ``d{dim}``."""
-    loop_var = tree.data(loop_nid).loop_var
+    loop_var = tree.loop(loop_nid).loop_var
     body = loop_var[2:] if loop_var.startswith("i_") else loop_var
     return body.split("_")[0]
 

@@ -19,10 +19,10 @@ from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.transforms import CodeMotion, CodeMotionOption, Fuse, FuseOption, Split, SplitOption, TransformLegalityError
 
 
-def _matmul_block_first_for(ir):
+def _matmul_block_first_for(ir: KernelIR) -> int:
     for nid in ir.tree.blocks():
         for d in ir.tree.descendants(nid):
-            if isinstance(ir.tree.data(d), ISANode) and ir.tree.data(d).op_cls is NKIMatmul:
+            if isinstance(ir.tree.data(d), ISANode) and ir.tree.isa(d).op_cls is NKIMatmul:
                 """First ForNode on the path from block to leaf."""
                 for path_nid in ir.tree.preorder(nid):
                     if isinstance(ir.tree.data(path_nid), ForNode):
@@ -34,7 +34,7 @@ def test_fuse_outer_trip_inverts_split():
     """Split then Fuse on the same axis returns the original ForNode extent."""
     ir = build_canonical_ir()
     target = _matmul_block_first_for(ir)
-    original_extent = ir.tree.data(target).extent
+    original_extent = ir.tree.loop(target).extent
 
     split_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(2, original_extent // 2)))
     """Locate the new outer ForNode."""
@@ -42,6 +42,7 @@ def test_fuse_outer_trip_inverts_split():
     if parent is None:
         """Target was removed; pick the new top from same parent slot in original IR."""
         original_parent = ir.tree.parent(target)
+        assert original_parent is not None
         new_top = split_ir.tree.children(original_parent)[0]
     else:
         new_top = parent
@@ -50,6 +51,7 @@ def test_fuse_outer_trip_inverts_split():
 
     """The fused ForNode now has the original extent."""
     fused_parent = ir.tree.parent(target)
+    assert fused_parent is not None
     fused_top = fuse_ir.tree.children(fused_parent)[0]
     fused_data = fuse_ir.tree.data(fused_top)
     assert isinstance(fused_data, ForNode)
@@ -60,9 +62,11 @@ def test_fuse_outer_trip_renders_and_passes_numerics(tmp_path) -> None:
     """A split followed by an outer-trip fuse preserves rendered behavior."""
     ir = build_canonical_ir()
     target = _matmul_block_first_for(ir)
-    extent = ir.tree.data(target).extent
+    extent = ir.tree.loop(target).extent
     split = Split().apply(ir, SplitOption(target_nid=target, factors=(2, extent // 2)))
-    outer = split.tree.children(ir.tree.parent(target))[0]
+    target_parent = ir.tree.parent(target)
+    assert target_parent is not None
+    outer = split.tree.children(target_parent)[0]
     inner = split.tree.children(outer)[0]
     fused = Fuse().apply(split, FuseOption(target_nids=(outer, inner), target_axis=None))
     assert_matmul_ir_simulates(fused, tmp_path, "fuse_outer_trip")
@@ -74,43 +78,43 @@ def test_fuse_outer_trip_normalizes_nested_blocks():
     matmul = next(
         nid
         for nid in ir.tree.preorder()
-        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.data(nid).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.isa(nid).op_cls.__name__ == "NKIMatmul"
     )
     matmul_k = next(
         ancestor
         for ancestor in ir.tree.ancestors(matmul)
-        if isinstance(ir.tree.data(ancestor), ForNode) and ir.tree.data(ancestor).loop_var == "i_d0_0"
+        if isinstance(ir.tree.data(ancestor), ForNode) and ir.tree.loop(ancestor).loop_var == "i_d0_0"
     )
     ir = Split().apply(ir, SplitOption(target_nid=matmul_k, factors=(2, 2, 2, 2), target_axis=None))
     load = next(
         nid
         for nid in ir.tree.preorder()
         if isinstance(ir.tree.data(nid), ISANode)
-        and ir.tree.data(nid).op_cls.__name__ == "NKILoad"
-        and ir.tree.data(nid).operand_bindings["src"].tensor == "lhs_T"
+        and ir.tree.isa(nid).op_cls.__name__ == "NKILoad"
+        and ir.tree.isa(nid).operand_bindings["src"].tensor == "lhs_T"
     )
     load_k = next(
         ancestor
         for ancestor in ir.tree.ancestors(load)
-        if isinstance(ir.tree.data(ancestor), ForNode) and ir.tree.data(ancestor).loop_var == "i_d0_0"
+        if isinstance(ir.tree.data(ancestor), ForNode) and ir.tree.loop(ancestor).loop_var == "i_d0_0"
     )
     ir = Split().apply(ir, SplitOption(target_nid=load_k, factors=(2, 2, 2, 2), target_axis=None))
     matmul = next(
         nid
         for nid in ir.tree.preorder()
-        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.data(nid).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.isa(nid).op_cls.__name__ == "NKIMatmul"
     )
     matmul_k_loops = [
         ancestor
         for ancestor in ir.tree.ancestors(matmul)
-        if isinstance(ir.tree.data(ancestor), ForNode) and ir.tree.data(ancestor).loop_var.startswith("i_d0_")
+        if isinstance(ir.tree.data(ancestor), ForNode) and ir.tree.loop(ancestor).loop_var.startswith("i_d0_")
     ]
     load = next(
         nid
         for nid in ir.tree.preorder()
         if isinstance(ir.tree.data(nid), ISANode)
-        and ir.tree.data(nid).op_cls.__name__ == "NKILoad"
-        and ir.tree.data(nid).operand_bindings["src"].tensor == "lhs_T"
+        and ir.tree.isa(nid).op_cls.__name__ == "NKILoad"
+        and ir.tree.isa(nid).operand_bindings["src"].tensor == "lhs_T"
     )
     load_block = next(
         ancestor for ancestor in reversed(ir.tree.ancestors(load)) if isinstance(ir.tree.data(ancestor), BlockNode)
@@ -168,27 +172,27 @@ def test_fuse_outer_trip_rejects_partial_nested_loop_dependence():
         Fuse().apply(ir, option)
 
 
-def test_fuse_tensorize_matmul_n_renders_and_sims(tmp_path):
-    """Tensorize-Fuse the matmul's innermost N loop (i_d2_0, 4 trips) back into the tile
-    (512 -> 2048): renders + sims correctly. (Topology-only assertion was insufficient —
-    it never caught that the tile width stayed 512.)"""
+def test_fuse_tensorize_rejects_matmul_n_above_max_tile():
+    """Tensorize-Fuse cannot widen matmul N past its hardware tile limit."""
     ir = build_canonical_ir()
     leaf_nid = next(
-        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls is NKIMatmul
     )
     parent_for = ir.tree.parent(leaf_nid)  # i_d2_0, the innermost matmul loop
+    assert parent_for is not None
     mb = next(
-        ir.tree.data(a)
+        ir.tree.block(a)
         for a in reversed(ir.tree.ancestors(leaf_nid))
-        if isinstance(ir.tree.data(a), BlockNode) and ir.tree.data(a).iter_vars
+        if isinstance(ir.tree.data(a), BlockNode) and ir.tree.block(a).iter_vars
     )
     target_axis = next(
         iv.axis
         for iv, v in zip(mb.iter_vars, mb.iter_values)
-        if isinstance(v, Var) and v.name == ir.tree.data(parent_for).loop_var
+        if isinstance(v, Var) and v.name == ir.tree.loop(parent_for).loop_var
     )
-    fused = Fuse().apply(ir, FuseOption(target_nids=(parent_for, leaf_nid), target_axis=target_axis))
-    assert_matmul_ir_simulates(fused, tmp_path, "fuse_matmul_n")
+    option = FuseOption(target_nids=(parent_for, leaf_nid), target_axis=target_axis)
+    with pytest.raises(TransformLegalityError, match="MAX_TILE_SIZE"):
+        Fuse().apply(ir, option)
 
 
 def test_split_then_fuse_tensorize_round_trips(tmp_path):
@@ -198,16 +202,17 @@ def test_split_then_fuse_tensorize_round_trips(tmp_path):
     load_leaf = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKILoad"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKILoad"
     )
     split_ir = Split().apply(ir, SplitOption(target_nid=load_leaf, factors=(16, 128), target_axis="d1"))
     """The load now has a new inner ForNode above the leaf; fuse it back."""
     new_leaf = next(
         n
         for n in split_ir.tree.preorder()
-        if isinstance(split_ir.tree.data(n), ISANode) and split_ir.tree.data(n).op_cls.__name__ == "NKILoad"
+        if isinstance(split_ir.tree.data(n), ISANode) and split_ir.tree.isa(n).op_cls.__name__ == "NKILoad"
     )
     inner_for = split_ir.tree.parent(new_leaf)
+    assert inner_for is not None
     assert isinstance(split_ir.tree.data(inner_for), ForNode)
     fused_ir = Fuse().apply(split_ir, FuseOption(target_nids=(inner_for, new_leaf), target_axis="d1"))
     assert_matmul_ir_simulates(fused_ir, tmp_path, "split_then_fuse_tensorize")
@@ -220,22 +225,22 @@ def test_fuse_merge_trips_dense_name():
         n
         for n in ir.tree.preorder()
         if isinstance(ir.tree.data(n), ForNode)
-        and ir.tree.data(n).loop_var == "i_d1_0"
-        and ir.tree.data(n).extent == 16
+        and ir.tree.loop(n).loop_var == "i_d1_0"
+        and ir.tree.loop(n).extent == 16
     )
     ir = Split().apply(ir, SplitOption(target_nid=d1, factors=(2, 8)))
     """Now d1 has i_d1_0(2), i_d1_1(8); fuse them back."""
     outer = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ForNode) and ir.tree.data(n).loop_var == "i_d1_0" and ir.tree.data(n).extent == 2
+        if isinstance(ir.tree.data(n), ForNode) and ir.tree.loop(n).loop_var == "i_d1_0" and ir.tree.loop(n).extent == 2
     )
     inner = next(c for c in ir.tree.children(outer) if isinstance(ir.tree.data(c), ForNode))
     fused = Fuse().apply(ir, FuseOption(target_nids=(outer, inner), target_axis=None))
     names = [
-        fused.tree.data(n).loop_var
+        fused.tree.loop(n).loop_var
         for n in fused.tree.preorder()
-        if isinstance(fused.tree.data(n), ForNode) and fused.tree.data(n).loop_var.startswith("i_d1")
+        if isinstance(fused.tree.data(n), ForNode) and fused.tree.loop(n).loop_var.startswith("i_d1")
     ]
     assert "i_d1_0" in names and not any("fused" in nm for nm in names), names
 
@@ -248,16 +253,17 @@ def test_split_then_fuse_round_trip_byteexact():
     load = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKILoad"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKILoad"
     )
     split_ir = Split().apply(ir, SplitOption(target_nid=load, factors=(16, 128), target_axis="d1"))
     new_load = next(
         n
         for n in split_ir.tree.preorder()
-        if isinstance(split_ir.tree.data(n), ISANode) and split_ir.tree.data(n).op_cls.__name__ == "NKILoad"
+        if isinstance(split_ir.tree.data(n), ISANode) and split_ir.tree.isa(n).op_cls.__name__ == "NKILoad"
     )
     d1_loop = split_ir.tree.parent(new_load)
-    assert isinstance(split_ir.tree.data(d1_loop), ForNode) and split_ir.tree.data(d1_loop).extent == 16
+    assert d1_loop is not None
+    assert isinstance(split_ir.tree.data(d1_loop), ForNode) and split_ir.tree.loop(d1_loop).extent == 16
     fused_ir = Fuse().apply(split_ir, FuseOption(target_nids=(d1_loop, new_load), target_axis="d1"))
     assert render(fused_ir) == canonical_render, "Split->Fuse did not round-trip to canonical"
 
@@ -302,14 +308,14 @@ def test_fuse_matches_tvm_structure():
     mm = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
     mloop = next(
         a
         for a in ir.tree.ancestors(mm)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d1_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d1_0"
     )
-    extent = ir.tree.data(mloop).extent
+    extent = ir.tree.loop(mloop).extent
     factors = (4, 4)
     assert extent == 16 and factors[0] * factors[1] == extent
 
@@ -318,10 +324,10 @@ def test_fuse_matches_tvm_structure():
     sp_mm = next(
         n
         for n in split_ir.tree.preorder()
-        if isinstance(split_ir.tree.data(n), ISANode) and split_ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(split_ir.tree.data(n), ISANode) and split_ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
     d1_after_split = enclosing_for_nids(split_ir, sp_mm, "i_d1")
-    assert [split_ir.tree.data(n).extent for n in d1_after_split] == [4, 4]
+    assert [split_ir.tree.loop(n).extent for n in d1_after_split] == [4, 4]
     out = Fuse().apply(split_ir, FuseOption(target_nids=(d1_after_split[0], d1_after_split[1]), target_axis=None))
 
     nest = tvm_fuse_loopnest(list(factors))
@@ -331,20 +337,20 @@ def test_fuse_matches_tvm_structure():
     out_mm = next(
         n
         for n in out.tree.preorder()
-        if isinstance(out.tree.data(n), ISANode) and out.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(out.tree.data(n), ISANode) and out.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
     d1_after_fuse = enclosing_for_nids(out, out_mm, "i_d1")
-    our_extents = [out.tree.data(n).extent for n in d1_after_fuse]
+    our_extents = [out.tree.loop(n).extent for n in d1_after_fuse]
     assert len(d1_after_fuse) == 1 and our_extents == [nest.extent] == [16]
 
     """Our recovered d1 binding is the bare fused loop var (the contiguous identity)."""
     out_block = next(
-        out.tree.data(a)
+        out.tree.block(a)
         for a in reversed(out.tree.ancestors(out_mm))
-        if out.tree.data(a).__class__.__name__ == "BlockNode" and out.tree.data(a).iter_vars
+        if isinstance(out.tree.data(a), BlockNode) and out.tree.block(a).iter_vars
     )
     d1_value = next(v for iv, v in zip(out_block.iter_vars, out_block.iter_values) if iv.axis == "d1")
-    fused_loop_var = out.tree.data(d1_after_fuse[0]).loop_var
+    fused_loop_var = out.tree.loop(d1_after_fuse[0]).loop_var
     assert d1_value == Var(name=fused_loop_var)
 
     """Binding equivalence: TVM keeps [fused // 4, fused % 4]; the element index they

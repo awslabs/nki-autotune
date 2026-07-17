@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import pytest
-
 from test.transforms._fixtures import build_canonical_ir
+
+import pytest
 
 from nkigym.ir.tree import BlockNode, ISANode
 from nkigym.ops.load import NKILoad
@@ -50,7 +50,7 @@ def test_dependency_does_not_order_independent_loads():
     ir = build_canonical_ir()
     load_nids = []
     for nid in ir.tree.blocks():
-        block = ir.tree.data(nid)
+        block = ir.tree.block(nid)
         """Skip synthetic root."""
         if not block.iter_vars:
             continue
@@ -89,10 +89,10 @@ def test_canonical_synthesizes_memset_for_matmul():
     memset_leaves = {
         nid
         for nid in ir.tree.preorder()
-        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.data(nid).op_cls is NKIMemset
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.isa(nid).op_cls is NKIMemset
     }
     assert len(memset_leaves) == 1, "exactly one synthesized memset for the matmul"
-    memset = ir.tree.data(next(iter(memset_leaves)))
+    memset = ir.tree.isa(next(iter(memset_leaves)))
     assert memset.operand_bindings["dst"].tensor == "psum_prod"
     assert memset.kwargs == {"value": 0.0}
 
@@ -189,12 +189,12 @@ def test_matmul_carries_psum_over_kloop():
 
     ir = build_canonical_ir()
     matmul_leaf = next(
-        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls is NKIMatmul
     )
     kloop = next(
         a
         for a in ir.tree.ancestors(matmul_leaf)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d0_0"
     )
     assert _tensor_carried_across(ir.tree, kloop, "psum_prod") is True
 
@@ -206,12 +206,12 @@ def test_load_does_not_carry_over_kloop():
 
     ir = build_canonical_ir()
     load_leaf = next(
-        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKILoad
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls is NKILoad
     )
     kloop = next(
         a
         for a in ir.tree.ancestors(load_leaf)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d0_0"
     )
     assert _tensor_carried_across(ir.tree, kloop, "sbuf_lhs_T") is False
 
@@ -256,12 +256,12 @@ def test_first_backward_edge_flags_memset_sunk_under_kloop():
     ir = build_canonical_ir()
     memset_blk = _block_for_op(ir, NKIMemset)
     matmul_leaf = next(
-        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls is NKIMatmul
     )
     kloop = next(
         a
         for a in ir.tree.ancestors(matmul_leaf)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d0_0"
     )
     moved_leaf = ir.dependency._resolve(memset_blk)
     assert ir.dependency.first_backward_edge_for_insertion(moved_leaf, kloop, 0) is not None
@@ -275,19 +275,20 @@ def test_span_promotion_rejects_memset_sunk_into_kloop():
 
     (Verdict relies on the insertion-path promotion completed in the next task.)"""
     from test.transforms._fixtures import build_canonical_ir
+
     from nkigym.ir.tree import ForNode, ISANode
-    from nkigym.ops.memset import NKIMemset
     from nkigym.ops.matmul import NKIMatmul
+    from nkigym.ops.memset import NKIMemset
 
     ir = build_canonical_ir()
     memset_blk = _block_for_op(ir, NKIMemset)
     matmul_leaf = next(
-        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls is NKIMatmul
     )
     kloop = next(
         a
         for a in ir.tree.ancestors(matmul_leaf)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d0_0"
     )
     moved_leaf = ir.dependency._resolve(memset_blk)
     assert ir.dependency.first_backward_edge_for_insertion(moved_leaf, kloop, 0) is not None
@@ -333,8 +334,8 @@ def test_first_backward_edge_frozen_directions_catch_parallel_producer_flip():
         if nid != ir.tree.root
         and sum(1 for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)) == 1
         and (leaf := next(d for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)))
-        and ir.tree.data(leaf).op_cls is NKILoad
-        and ir.tree.data(leaf).operand_bindings["src"].tensor == "rhs"
+        and ir.tree.isa(leaf).op_cls is NKILoad
+        and ir.tree.isa(leaf).operand_bindings["src"].tensor == "rhs"
     )
     tc_blk = _block_for_op(ir, NKITensorCopy)
     tc_loop = next(d for d in ir.tree.preorder(tc_blk) if isinstance(ir.tree.data(d), ForNode))
@@ -363,12 +364,12 @@ def test_first_backward_edge_allows_load_under_kloop():
     ir = build_canonical_ir()
     load_blk = _block_for_op(ir, NKILoad)
     matmul_leaf = next(
-        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls is NKIMatmul
     )
     kloop = next(
         a
         for a in ir.tree.ancestors(matmul_leaf)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d0_0"
     )
     moved = copy.deepcopy(ir)
     _move(moved, block_nid=load_blk, target_loop_nid=kloop, index=0)
@@ -376,7 +377,7 @@ def test_first_backward_edge_allows_load_under_kloop():
     load_leaf = next(
         n
         for n in moved.tree.preorder()
-        if isinstance(moved.tree.data(n), ISANode) and moved.tree.data(n).op_cls is NKILoad
+        if isinstance(moved.tree.data(n), ISANode) and moved.tree.isa(n).op_cls is NKILoad
     )
     assert dep.first_backward_edge(load_leaf) is None
 
@@ -401,18 +402,19 @@ def test_tensor_carried_across_psum_over_kloop():
     """psum (matmul rmw, offset invariant across K) is carried across the K loop;
     a pure-read operand (sbuf_lhs_T) is not."""
     from test.transforms._fixtures import build_canonical_ir
+
     from nkigym.ir.dependency import _tensor_carried_across
     from nkigym.ir.tree import ForNode, ISANode
     from nkigym.ops.matmul import NKIMatmul
 
     ir = build_canonical_ir()
     matmul_leaf = next(
-        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls is NKIMatmul
     )
     kloop = next(
         a
         for a in ir.tree.ancestors(matmul_leaf)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d0_0"
     )
     assert _tensor_carried_across(ir.tree, kloop, "psum_prod") is True
     assert _tensor_carried_across(ir.tree, kloop, "sbuf_lhs_T") is False
@@ -422,13 +424,14 @@ def test_access_invariant_across_matches_offset_var():
     """The matmul's psum access is invariant across K (K-var absent from the psum
     offset) but NOT across a loop whose var indexes the psum offset."""
     from test.transforms._fixtures import build_canonical_ir
+
     from nkigym.ir.dependency import _access_invariant_across
     from nkigym.ir.tree import ISANode
     from nkigym.ops.matmul import NKIMatmul
 
     ir = build_canonical_ir()
     matmul_leaf = next(
-        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls is NKIMatmul
+        n for n in ir.tree.preorder() if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls is NKIMatmul
     )
     assert _access_invariant_across(ir.tree, matmul_leaf, "i_d0_0", "psum_prod") is True
     assert _access_invariant_across(ir.tree, matmul_leaf, "i_d1_0", "psum_prod") is False
@@ -442,7 +445,7 @@ def test_fold_accumulator_carried_across_ko_not_broken_by_own_writeback():
     import examples.kernel_transforms as K
     from nkigym.ir import build_initial_ir
     from nkigym.ir.dependency import _tensor_carried_across
-    from nkigym.transforms import Split, SplitOption, Reorder, ReorderOption, RFactor, RFactorOption
+    from nkigym.transforms import Reorder, ReorderOption, RFactor, RFactorOption, Split, SplitOption
 
     loop = K._loop
     ir = build_initial_ir(K.f_nkigym, K.INPUT_SPECS)

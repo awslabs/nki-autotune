@@ -55,7 +55,7 @@ from test.transforms._ladder_compare import assert_matches_hand
 from autotune.runner.types import KernelJob
 from examples import manual_transforms
 from nkigym.codegen import render
-from nkigym.ir import build_initial_ir
+from nkigym.ir import KernelIR, build_initial_ir
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.load import NKILoad
@@ -209,68 +209,68 @@ def kernel_target(lhs_T, rhs):
     return hbm_out
 
 
-def _mm_leaf(ir: object) -> int:
+def _mm_leaf(ir: KernelIR) -> int:
     """Node id of the matmul ISA leaf."""
     return next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
 
 
-def _loop(ir: object, loop_var: str) -> int:
+def _loop(ir: KernelIR, loop_var: str) -> int:
     """Node id of the matmul-enclosing ForNode whose ``loop_var`` matches."""
     return next(
         a
         for a in ir.tree.ancestors(_mm_leaf(ir))
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == loop_var
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == loop_var
     )
 
 
-def _load_blk(ir: object, tensor: str) -> int:
+def _load_blk(ir: KernelIR, tensor: str) -> int:
     """Node id of the single-leaf load block whose ``NKILoad`` reads ``tensor``."""
 
     def _reads(nid: int) -> bool:
         leaves = [d for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)]
         return (
             len(leaves) == 1
-            and ir.tree.data(leaves[0]).op_cls.__name__ == "NKILoad"
-            and ir.tree.data(leaves[0]).operand_bindings["src"].tensor == tensor
+            and ir.tree.isa(leaves[0]).op_cls.__name__ == "NKILoad"
+            and ir.tree.isa(leaves[0]).operand_bindings["src"].tensor == tensor
         )
 
     return next(nid for nid in ir.tree.blocks() if _reads(nid))
 
 
-def _load_leaf(ir: object, tensor: str) -> int:
+def _load_leaf(ir: KernelIR, tensor: str) -> int:
     """Node id of the ``NKILoad`` ISA leaf that reads ``tensor`` (the Split target)."""
     return next(d for d in ir.tree.descendants(_load_blk(ir, tensor)) if isinstance(ir.tree.data(d), ISANode))
 
 
-def _load_for(ir: object, tensor: str, loop_var: str) -> int:
+def _load_for(ir: KernelIR, tensor: str, loop_var: str) -> int:
     """Node id of the ForNode with ``loop_var`` inside the ``tensor`` load block's nest."""
     return next(
         d
         for d in ir.tree.descendants(_load_blk(ir, tensor))
-        if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == loop_var
+        if isinstance(ir.tree.data(d), ForNode) and ir.tree.loop(d).loop_var == loop_var
     )
 
 
-def _op_blk(ir: object, op_name: str) -> int:
+def _op_blk(ir: KernelIR, op_name: str) -> int:
     """Node id of the single-leaf block whose ISA leaf is op ``op_name`` (e.g. NKITensorCopy)."""
 
     def _is(nid: int) -> bool:
         leaves = [d for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)]
-        return len(leaves) == 1 and ir.tree.data(leaves[0]).op_cls.__name__ == op_name
+        return len(leaves) == 1 and ir.tree.isa(leaves[0]).op_cls.__name__ == op_name
 
     return next(nid for nid in ir.tree.blocks() if _is(nid))
 
 
-def _op_leaf(ir: object, op_name: str) -> int:
+def _op_leaf(ir: KernelIR, op_name: str) -> int:
     """Node id of the ISA leaf for op ``op_name`` (the Split tensorize target)."""
     return next(d for d in ir.tree.descendants(_op_blk(ir, op_name)) if isinstance(ir.tree.data(d), ISANode))
 
 
-def _psum_memset_leaf(ir: object) -> int:
+def _psum_memset_leaf(ir: KernelIR) -> int:
     """Node id of the memset ISA leaf that writes the PSUM accumulator (not sbuf_prod).
 
     After RFactor there are two memsets — ``init_two_stage_0`` zeros the SBUF
@@ -281,12 +281,12 @@ def _psum_memset_leaf(ir: object) -> int:
         n
         for n in ir.tree.preorder()
         if isinstance(ir.tree.data(n), ISANode)
-        and ir.tree.data(n).op_cls.NAME == "memset"
-        and ir.tree.data(n).operand_bindings["dst"].tensor.startswith("psum")
+        and ir.tree.isa(n).op_cls.NAME == "memset"
+        and ir.tree.isa(n).operand_bindings["dst"].tensor.startswith("psum")
     )
 
 
-def _psum_memset_blk(ir: object) -> int:
+def _psum_memset_blk(ir: KernelIR) -> int:
     """Node id of the single-leaf block owning the PSUM-zeroing memset leaf."""
     leaf = _psum_memset_leaf(ir)
     return next(
@@ -298,16 +298,16 @@ def _psum_memset_blk(ir: object) -> int:
     )
 
 
-def _blk_loop(ir: object, blk_nid: int, loop_var: str) -> int:
+def _blk_loop(ir: KernelIR, blk_nid: int, loop_var: str) -> int:
     """Node id of the ForNode with ``loop_var`` inside block ``blk_nid``'s subtree."""
     return next(
         d
         for d in ir.tree.descendants(blk_nid)
-        if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == loop_var
+        if isinstance(ir.tree.data(d), ForNode) and ir.tree.loop(d).loop_var == loop_var
     )
 
 
-def _reorder_blk_to_nm(ir: object, blk_nid: int) -> object:
+def _reorder_blk_to_nm(ir: KernelIR, blk_nid: int) -> KernelIR:
     """Reorder a per-``ko`` single-leaf block's ``[M, N]`` loop pair to ``[N, M]``.
 
     The post-Split memset / drain / fold blocks iterate ``i_d1_0(M) > i_d2_0(N)``;
@@ -319,12 +319,12 @@ def _reorder_blk_to_nm(ir: object, blk_nid: int) -> object:
     )
 
 
-def _blk_m_loop(ir: object, op_name: str) -> int:
+def _blk_m_loop(ir: KernelIR, op_name: str) -> int:
     """Node id of the ``i_d1_0`` (M) ForNode inside op ``op_name``'s single-leaf block."""
     return _blk_loop(ir, _op_blk(ir, op_name), "i_d1_0")
 
 
-def _build_ladder() -> list[tuple[str, object]]:
+def _build_ladder() -> list[tuple[str, KernelIR]]:
     """Drive the shipped transforms from canonical ``f_nkigym`` to ``manual_transforms``
     k0..k32, ONE transform per rung, in MANUAL rung order. Returns 33 named states.
 
@@ -439,6 +439,8 @@ def _sim_source(name: str, source: str, func_name: str, inputs: dict, expected: 
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(source)
     spec = importlib.util.spec_from_file_location(f"kt_sim_{name}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load generated module {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     actual = np.asarray(simulate_fp32(getattr(module, func_name))(**inputs))

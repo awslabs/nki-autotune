@@ -7,7 +7,7 @@ the test suite carries no dependency on ``examples/`` code.
 
 from __future__ import annotations
 
-from nkigym.environment import KernelMDP
+from nkigym.environment import Action, KernelMDP
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import BlockNode, ForNode, ISANode
 from nkigym.ops import nkigym_kernel
@@ -48,7 +48,7 @@ the pipeline + body tests replay. Axes ``d0=K``, ``d1=M``, ``d2=N``; literal nid
 are stable from the deterministic ``build_initial_ir``. Two Reorders rotate the
 matmul nest ``K>M>N`` -> ``M>N>K``, two CodeMotions sink the PSUM memset + drain
 under the M loop, and the final SoftwarePipeline double-buffers the accumulator."""
-TRACE: list[tuple[object, object]] = [
+TRACE: list[Action] = [
     (Reorder(), ReorderOption(outer_nid=11, inner_nid=12)),
     (Reorder(), ReorderOption(outer_nid=12, inner_nid=13)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=11, index=0)),
@@ -94,12 +94,12 @@ def m_loop_and_children(ir: KernelIR) -> tuple[int, list[int]]:
     mm_leaf = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
     m_loop = next(
         a
         for a in ir.tree.ancestors(mm_leaf)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d1_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d1_0"
     )
     children = list(ir.tree.children(m_loop))
     return m_loop, children

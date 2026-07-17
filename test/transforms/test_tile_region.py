@@ -21,6 +21,13 @@ def _set_width(new_width: int) -> Callable[[Expr, int], tuple[Expr, int]]:
     return rewrite
 
 
+def _const_value(expr: Expr) -> int:
+    """Return the integer value of a constant test expression."""
+    if not isinstance(expr, Const):
+        raise AssertionError(f"expected Const, got {type(expr).__name__}")
+    return expr.value
+
+
 def test_retile_region_sets_width_on_the_matching_axis_only():
     """retile_region finds the F-axis range on a load dst (P,F) region and sets its width;
     the P axis range is returned unchanged."""
@@ -32,10 +39,10 @@ def test_retile_region_sets_width_on_the_matching_axis_only():
         ),
     )
     out = retile_region(region, NKILoad.OPERAND_AXES["dst"], "F", _set_width(128))
-    assert out.ranges[1][1].value == 128
+    assert _const_value(out.ranges[1][1]) == 128
     """Offset preserved (normalize recomputes it); P axis untouched."""
     assert format_expr(out.ranges[1][0]) == "i_d1_0 * 2048"
-    assert format_expr(out.ranges[0][0]) == "i_d0_0" and out.ranges[0][1].value == 128
+    assert format_expr(out.ranges[0][0]) == "i_d0_0" and _const_value(out.ranges[0][1]) == 128
 
 
 def test_retile_region_noops_on_operand_lacking_axis():
@@ -49,7 +56,7 @@ def test_retile_region_noops_on_operand_lacking_axis():
         ),
     )
     out = retile_region(stat, NKIMatmul.OPERAND_AXES["stationary"], "N", _set_width(512))
-    assert out.ranges[1][1].value == 128, "stationary M width must stay 128 (no N axis)"
+    assert _const_value(out.ranges[1][1]) == 128, "stationary M width must stay 128 (no N axis)"
     assert format_expr(out.ranges[1][0]) == "i_d1_0 * 128"
 
 
@@ -59,5 +66,5 @@ def test_retile_region_noops_when_axis_is_none():
         tensor="sbuf_lhs_T", ranges=((Mul(left=Var(name="i_d1_0"), right=Const(value=2048)), Const(value=2048)),)
     )
     out = retile_region(region, NKILoad.OPERAND_AXES["dst"], None, _set_width(128))
-    assert out.ranges[0][1].value == 2048
+    assert _const_value(out.ranges[0][1]) == 2048
     assert format_expr(out.ranges[0][0]) == "i_d1_0 * 2048"

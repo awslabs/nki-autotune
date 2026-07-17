@@ -121,7 +121,7 @@ def test_apply_rejects_parallel_loop() -> None:
     m_loop = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ForNode) and ir.tree.data(n).loop_var.startswith("i_d1_")
+        if isinstance(ir.tree.data(n), ForNode) and ir.tree.loop(n).loop_var.startswith("i_d1_")
     )
     with pytest.raises(TransformLegalityError):
         RFactor().apply(ir, RFactorOption(target_loop_nid=m_loop, factor_axis=0))
@@ -133,12 +133,12 @@ def test_apply_rejects_drain_block_that_contains_the_output_store() -> None:
     tensor_copy = next(
         nid
         for nid in ir.tree.preorder()
-        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.data(nid).op_cls.__name__ == "NKITensorCopy"
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.isa(nid).op_cls.__name__ == "NKITensorCopy"
     )
     store = next(
         nid
         for nid in ir.tree.preorder()
-        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.data(nid).op_cls.__name__ == "NKIStore"
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.isa(nid).op_cls.__name__ == "NKIStore"
     )
     drain_loop = next(
         ancestor for ancestor in reversed(ir.tree.ancestors(tensor_copy)) if isinstance(ir.tree.data(ancestor), ForNode)
@@ -250,7 +250,7 @@ def test_ko_roles_split_across_blocks() -> None:
     ir = _rfactored_ir()
     roles = set()
     for nid in ir.tree.blocks():
-        block = ir.tree.data(nid)
+        block = ir.tree.block(nid)
         for iv in block.iter_vars:
             if iv.axis == "d0":
                 roles.add(iv.role)
@@ -270,27 +270,27 @@ def test_rf_memset_drain_nested_in_ko() -> None:
     matmul_leaf = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
     ko = next(
         a
         for a in ir.tree.ancestors(matmul_leaf)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var.startswith("i_d0_")
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var.startswith("i_d0_")
     )
-    psum_name = ir.tree.data(matmul_leaf).operand_bindings["dst"].tensor
+    psum_name = ir.tree.isa(matmul_leaf).operand_bindings["dst"].tensor
     rf_memset = next(
         n
         for n in ir.tree.preorder()
         if isinstance(ir.tree.data(n), ISANode)
-        and ir.tree.data(n).op_cls.NAME == "memset"
-        and ir.tree.data(n).operand_bindings["dst"].tensor == psum_name
+        and ir.tree.isa(n).op_cls.NAME == "memset"
+        and ir.tree.isa(n).operand_bindings["dst"].tensor == psum_name
     )
     rf_drain = next(
         n
         for n in ir.tree.preorder()
         if isinstance(ir.tree.data(n), ISANode)
-        and ir.tree.data(n).op_cls.NAME == "tensor_copy"
-        and ir.tree.data(n).operand_bindings["src"].tensor == psum_name
+        and ir.tree.isa(n).op_cls.NAME == "tensor_copy"
+        and ir.tree.isa(n).operand_bindings["src"].tensor == psum_name
     )
     assert ko in ir.tree.ancestors(rf_memset), "rf-init memset must be nested inside the ko loop"
     assert ko in ir.tree.ancestors(rf_drain), "rf-drain tensor_copy must be nested inside the ko loop"
