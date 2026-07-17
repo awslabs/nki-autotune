@@ -2,10 +2,11 @@
 
 Wraps the canonical matmul ``f_nkigym`` in :class:`nkigym.environment.KernelMDP`
 and samples random ``(transform, option)`` actions over the full shipped set
-(``Split + Fuse + Reorder + CodeMotion``), CPU-sim-checking numerics after EVERY
-step. This is the fuzz test that every legal transform composition stays
-correctness-preserving: a divergence at any step is a transform (or legality) bug,
-independent of any hand-authored ladder.
+(``Split + Fuse + Reorder + CodeMotion + RFactor + SoftwarePipeline +
+BufferLayout + BufferCompaction``), CPU-sim-checking numerics after EVERY step.
+This is the fuzz test that every legal transform composition stays
+correctness-preserving: a divergence at any step is a transform (or legality)
+bug, independent of any hand-authored ladder.
 
 The ``f_nkigym`` body below is the output of
 :func:`nkigym.synthesis.numpy_to_nkigym.compile_numpy_to_nkigym`
@@ -33,7 +34,16 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.synthesis.simulate_nki import simulate_fp32
-from nkigym.transforms import CodeMotion, Fuse, Reorder, Split
+from nkigym.transforms import (
+    BufferCompaction,
+    BufferLayout,
+    CodeMotion,
+    Fuse,
+    Reorder,
+    RFactor,
+    SoftwarePipeline,
+    Split,
+)
 
 K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
@@ -41,6 +51,16 @@ NUM_ROLLOUTS = 1
 MAX_STEPS = 100
 SEED = 0
 """Rollout ``k`` uses ``random.Random(SEED + k)`` so divergences replay exactly."""
+TRANSFORMS = [
+    Split(),
+    Fuse(),
+    Reorder(),
+    CodeMotion(),
+    RFactor(),
+    SoftwarePipeline(),
+    BufferLayout(),
+    BufferCompaction(),
+]
 
 
 def f_numpy(lhs_T: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -84,7 +104,7 @@ if __name__ == "__main__":
     (``SEED + k``) so a numerics divergence is REPRODUCIBLE, and every action is
     printed so the exact ``(transform, option)`` that broke correctness is
     recoverable from the log — a fuzz test is only useful if its failures replay."""
-    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), CodeMotion()])
+    env = KernelMDP(f_nkigym, INPUT_SPECS, transforms=TRANSFORMS)
     for k in range(NUM_ROLLOUTS):
         rng = random.Random(SEED + k)
         state = env.reset()
