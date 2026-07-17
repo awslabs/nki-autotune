@@ -17,10 +17,8 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.compact import compact_shapes
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Const, Expr, Var, substitute, to_affine
-from nkigym.ir.buffer_placement import place_buffers
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole, NKIOp
@@ -128,9 +126,12 @@ class RFactor(Transform):
         The gadgets are sized to the footprint R — the accumulator region the
         ``ki``-subtree writes over one full ``ki`` execution: partition loops between
         ``ki`` and the matmul are MATERIALIZED (early-packed: the 16-trip ``M`` loop),
-        free loops are ABSORBED into the op width. ``place_buffers`` (LCA) +
-        ``compact_shapes`` (shape + ``list_len`` shrink) + a rebuilt ``Dependency``
-        follow, per contract.
+        free loops are ABSORBED into the op width. This is now STRUCTURAL-ONLY: the
+        emission plus a rebuilt ``Dependency``. Buffer placement (LCA) and shape /
+        ``list_len`` shrink are an explicit downstream ``BufferCompaction`` step, not an
+        anonymous tail (see the 2026-07-14 BufferCompaction design). The k33 byte-exact
+        repro (the psum ``list_len`` 16→1 shrink) is deferred to the RFactor-template
+        redesign.
         """
         tree = ir.tree
         ko_loop = tree.data(option.target_loop_nid)
@@ -167,8 +168,6 @@ class RFactor(Transform):
             ir, matmul_leaf, ki_nid, out_name, ko_var, footprint, part_lo, free_lo, free_extent, combiner
         )
 
-        place_buffers(tree)
-        compact_shapes(tree)
         ir.dependency = Dependency(tree)
 
     def _enclosing_block_nid(self, tree: KernelTree, nid: int) -> int:

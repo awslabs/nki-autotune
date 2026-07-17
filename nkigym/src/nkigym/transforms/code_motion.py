@@ -20,9 +20,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 
-from nkigym.codegen.compact import compact_shapes
 from nkigym.ir import KernelIR
-from nkigym.ir.buffer_placement import place_buffers
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
@@ -267,12 +265,15 @@ class CodeMotion(Transform):
     """
 
     def apply(self, ir: KernelIR, option: CodeMotionOption) -> KernelIR:
-        """Re-check legality, deep-copy, move, re-derive geometry, return."""
+        """Re-check legality, deep-copy, move, rebuild deps, return.
+
+        Structural-only: the block relocation + Dependency rebuild. Buffer
+        placement/shape/frame is now an explicit BufferCompaction step, not an
+        anonymous tail (see the 2026-07-14 BufferCompaction design).
+        """
         self._check_legality(ir, option)
         new_ir = copy.deepcopy(ir)
         _move(new_ir, block_nid=option.block_nid, target_loop_nid=option.target_loop_nid, index=option.index)
-        place_buffers(new_ir.tree)
-        compact_shapes(new_ir.tree)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 

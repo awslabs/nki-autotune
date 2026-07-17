@@ -1,6 +1,7 @@
 """Rewrite transforms over :class:`nkigym.ir.KernelIR`."""
 
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.buffer_compaction import BufferCompaction, BufferCompactionOption
 from nkigym.transforms.buffer_layout import BufferLayout, BufferLayoutOption
 from nkigym.transforms.code_motion import CodeMotion, CodeMotionOption
 from nkigym.transforms.fuse import Fuse, FuseOption
@@ -10,6 +11,8 @@ from nkigym.transforms.software_pipeline import SoftwarePipeline, SoftwarePipeli
 from nkigym.transforms.split import Split, SplitOption
 
 __all__ = [
+    "BufferCompaction",
+    "BufferCompactionOption",
     "BufferLayout",
     "BufferLayoutOption",
     "CodeMotion",

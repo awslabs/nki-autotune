@@ -130,7 +130,16 @@ def build_ladder_state(n: int) -> KernelIR:
     returns the new ir. Raises NotImplementedError for unwired rungs (loud).
     """
     from nkigym.ir.tree import ISANode
-    from nkigym.transforms import CodeMotion, CodeMotionOption, Reorder, ReorderOption, Split, SplitOption  # noqa: F401
+    from nkigym.transforms import (  # noqa: F401
+        BufferCompaction,
+        BufferCompactionOption,
+        CodeMotion,
+        CodeMotionOption,
+        Reorder,
+        ReorderOption,
+        Split,
+        SplitOption,
+    )
 
     blk, leaf, loop, inner, mm_loop, tc_loop = _ladder_helpers()
 
@@ -175,7 +184,13 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_2_3)
 
     def rung_3_4(ir):
-        """3->4: CodeMotion load_rhs block under matmul d2 loop (cover d0,d2)."""
+        """3->4: CodeMotion load_rhs block under matmul d2 loop (cover d0,d2).
+
+        No compaction here: rung_7_8 re-sinks this load deeper, so sbuf_rhs is not
+        yet at its final scope. Compacting (rebasing + descending) now and then
+        re-splicing the block would corrupt it — sbuf_rhs is compacted after its
+        FINAL sink (rung_7_8).
+        """
         rhs = load_blk(ir, "rhs")
         d2 = mm_loop(ir, "i_d2_0")
         return CodeMotion().apply(ir, CodeMotionOption(block_nid=rhs, target_loop_nid=d2, index=0))
@@ -224,7 +239,13 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_8_9)
 
     def rung_9_10(ir):
-        """9->10: CodeMotion memset block under matmul d2 loop (cover d2)."""
+        """9->10: CodeMotion memset block under matmul d2 loop (cover d2).
+
+        No compaction here: psum_prod's consumer (the drain tensor_copy) is not
+        co-located with the matmul until rung_11_12, so psum_prod's touchers do
+        not yet share a compaction anchor. psum_prod is compacted after the PSUM
+        hoist (rung_11_12), which is the state-12 assertion.
+        """
         ms = blk(ir, "NKIMemset")
         d2 = mm_loop(ir, "i_d2_0")
         return CodeMotion().apply(ir, CodeMotionOption(block_nid=ms, target_loop_nid=d2, index=0))
@@ -239,10 +260,11 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_10_11)
 
     def rung_11_12(ir):
-        """11->12: CodeMotion tensor_copy block under matmul d2 loop (PSUM hoist)."""
+        """11->12: CodeMotion tensor_copy under matmul d2 (PSUM hoist), then compact psum_prod."""
         tc = blk(ir, "NKITensorCopy")
         d2 = mm_loop(ir, "i_d2_0")
-        return CodeMotion().apply(ir, CodeMotionOption(block_nid=tc, target_loop_nid=d2, index=-1))
+        ir = CodeMotion().apply(ir, CodeMotionOption(block_nid=tc, target_loop_nid=d2, index=-1))
+        return BufferCompaction().apply(ir, BufferCompactionOption(tensor="psum_prod"))
 
     rungs.append(rung_11_12)
 
@@ -254,10 +276,15 @@ def build_ladder_state(n: int) -> KernelIR:
     rungs.append(rung_12_13)
 
     def rung_13_14(ir):
-        """13->14: CodeMotion store block under tensor_copy d2 loop."""
+        """13->14: sink the store under tensor_copy d2, then compact ``sbuf_prod``.
+
+        Extent-fit normalization keeps the already-compacted ``psum_prod`` regions
+        local when CodeMotion normalizes the enclosing matmul block.
+        """
         st = blk(ir, "NKIStore")
         d2 = tc_loop(ir, "i_d2_0")
-        return CodeMotion().apply(ir, CodeMotionOption(block_nid=st, target_loop_nid=d2, index=-1))
+        ir = CodeMotion().apply(ir, CodeMotionOption(block_nid=st, target_loop_nid=d2, index=-1))
+        return BufferCompaction().apply(ir, BufferCompactionOption(tensor="sbuf_prod"))
 
     rungs.append(rung_13_14)
     if n > len(rungs):
