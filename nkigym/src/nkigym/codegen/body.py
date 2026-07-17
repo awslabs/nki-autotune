@@ -16,9 +16,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from nkigym.codegen.compact import rebased_region
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Const, Expr, Mod, Mul, Var, _format_raw, format_expr
+from nkigym.ir.arith.expr import Const, Expr, Mod, Mul, Var, _format_raw, format_expr, to_affine
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 _INDENT = "    "
@@ -33,10 +32,11 @@ def emit_body(ir: KernelIR) -> str:
     is built once and threaded down so a pipelined loop rotates its
     multi-version buffer accesses (see :func:`_emit_subtree`).
 
-    Buffer declarations are placed at their tightest scope (:func:`_alloc_emit_anchors`):
-    each ``nl.ndarray`` is emitted immediately before the first child that uses it —
-    the first child of the buffer's lowest-common-ancestor scope whose subtree
-    touches it — rather than clustered at the buffer's owning block. The
+    Buffer declarations are placed at their tightest materialized scope
+    (:func:`_alloc_emit_anchors`): each ``nl.ndarray`` is emitted immediately before
+    the first child that uses it, without crossing the buffer's owning-block
+    placement boundary. Within that block, offset-carrying loops hoist the
+    declaration to cover its live range. The
     ``{node_nid: [Buffer, ...]}`` map is threaded down so each node emits, before
     each child, the declarations anchored to that child.
     """
@@ -50,15 +50,12 @@ def emit_body(ir: KernelIR) -> str:
 def _alloc_emit_anchors(ir: KernelIR) -> dict[int, list[Buffer]]:
     """Map each tree node to the buffers emitted immediately before it.
 
-    A buffer's *scope* is the lowest common ancestor of every ISA leaf that touches
-    it (the depth-tightest node whose subtree contains all uses); ``shared_hbm``
-    buffers are scoped to the root (kernel lifetime). Within that scope the buffer's
-    declaration is anchored to the FIRST child (in tree child order = dataflow
-    order) whose subtree contains a touching leaf — so the ``nl.ndarray`` is emitted
-    right before the first loop / block / leaf that uses it, matching the hand
-    reference ``kernel_0``. When the scope is itself an ISA leaf (a lone toucher),
-    the buffer anchors to that leaf. Kernel parameters are never declared. Buffers
-    are walked in ``all_buffers`` order so each anchor's list is deterministic.
+    Scratch-buffer scope starts from the touchers' LCA, constrained by the owning
+    block and hoisted over loops carried in its offsets; ``shared_hbm`` buffers use
+    the root. The declaration anchors to the first child in dataflow order whose
+    subtree contains a touching leaf, immediately before first use. A lone toucher
+    anchors to that ISA leaf. Kernel parameters are never declared. Buffers are
+    walked in ``all_buffers`` order for deterministic anchor lists.
     """
     params = set(ir.param_buffers)
     leaves_by_tensor: dict[str, list[int]] = {}
@@ -73,7 +70,7 @@ def _alloc_emit_anchors(ir: KernelIR) -> dict[int, list[Buffer]]:
             continue
         leaves = leaves_by_tensor.get(name)
         assert leaves, f"buffer {name!r} is declared but touched by no ISA leaf"
-        scope = ir.tree.root if buf.location == "shared_hbm" else _lca_nodes(ir.tree, leaves)
+        scope = ir.tree.root if buf.location == "shared_hbm" else _hoisted_scope(ir.tree, name, leaves)
         anchor = _anchor_child(ir.tree, scope, leaves)
         out.setdefault(anchor, []).append(buf)
     return out
@@ -97,7 +94,7 @@ def _anchor_child(tree: KernelTree, scope: int, leaves: list[int]) -> int:
 
 
 def _lca_nodes(tree: KernelTree, nids: list[int]) -> int:
-    """Lowest common ancestor of ``nids`` — the deepest node on every root→nid path.
+    """Lowest common ancestor of ``nids`` — the deepest node on every root->nid path.
 
     Each node's path is its ancestors (root-first) plus itself; the LCA is the
     last node shared by all paths. A single distinct nid is its own LCA.
@@ -113,6 +110,67 @@ def _lca_nodes(tree: KernelTree, nids: list[int]) -> int:
         else:
             break
     return lca
+
+
+def _carried_loop_vars(tree: KernelTree, name: str, leaves: list[int]) -> set[str]:
+    """Loop vars appearing in any region offset of buffer ``name`` across its touchers.
+
+    A var in a region's ``lo`` means the buffer's live slice varies with that loop, so
+    the buffer is carried across it and its declaration must hoist above the loop.
+    """
+    carried: set[str] = set()
+    for leaf in leaves:
+        data = tree.data(leaf)
+        if not isinstance(data, ISANode):
+            continue
+        for region in data.operand_bindings.values():
+            if region.tensor != name:
+                continue
+            for lo, _width in region.ranges:
+                carried |= {var for var in to_affine(lo) if var is not None}
+    return carried
+
+
+def _owning_block(tree: KernelTree, name: str) -> int:
+    """Return the block whose ``alloc_buffers`` entry materializes ``name``."""
+    for nid in tree.blocks():
+        block = tree.data(nid)
+        assert isinstance(block, BlockNode)
+        if any(buf.name == name for buf in block.alloc_buffers):
+            return nid
+    raise AssertionError(f"buffer {name!r} is declared by no block")
+
+
+def _hoisted_scope(tree: KernelTree, name: str, leaves: list[int]) -> int:
+    """Find the tightest declaration scope consistent with placement and offsets.
+
+    The owning block is a material placement boundary. The renderer may tighten
+    within that block's direct loop nest, but it must not cross into a nested block;
+    doing so would silently place a root-owned structural-only buffer after
+    CodeMotion. Within the allowed nest, an offset that references an enclosing
+    loop carries the allocation across that loop, so the scope rises above the
+    outermost such loop.
+    """
+    lca = _lca_nodes(tree, leaves)
+    owner = _owning_block(tree, name)
+    chain = [*tree.ancestors(lca), lca]
+    if owner in chain:
+        owner_index = chain.index(owner)
+        local_chain = chain[owner_index + 1 :]
+        if any(isinstance(tree.data(nid), BlockNode) for nid in local_chain):
+            return owner
+    else:
+        local_chain = chain
+    carried = _carried_loop_vars(tree, name, leaves)
+    scope = lca
+    for nid in local_chain:
+        data = tree.data(nid)
+        if isinstance(data, ForNode) and data.loop_var in carried:
+            parent = tree.parent(nid)
+            assert parent is not None, f"carried loop {nid} has no parent"
+            scope = parent
+            break
+    return scope
 
 
 def _pipeline_loops(ir: KernelIR) -> dict[int, dict[str, Any]]:
@@ -269,7 +327,7 @@ def _emit_isa_call(node: ISANode, ir: KernelIR, rotations: dict[str, Expr]) -> s
         if slot in node.operand_bindings:
             region = node.operand_bindings[slot]
             buf = ir.buffer(region.tensor)
-            rendered = render_buffer_region(rebased_region(region, buf, ir.tree), buf, rotations.get(region.tensor))
+            rendered = render_buffer_region(region, buf, rotations.get(region.tensor))
             parts.append(f"{slot}={rendered}")
     for k, v in node.kwargs.items():
         parts.append(f"{k}={_render_kwarg(k, v)}")

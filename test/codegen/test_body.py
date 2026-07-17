@@ -2,12 +2,33 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from test.transforms._pipeline_fixtures import m_loop_and_children, parent_block_of, tuned_ir
 
 from nkigym.codegen import render
-from nkigym.codegen.body import _emit_alloc, render_buffer_region
+from nkigym.codegen.body import _emit_alloc, _hoisted_scope, render_buffer_region
 from nkigym.ir.arith.expr import Add, Const, Mod, Mul, Var
-from nkigym.ir.tree import Buffer, BufferRegion
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.ops.load import NKILoad
+
+
+def test_root_owned_buffer_does_not_tighten_through_nested_block():
+    """A structural-only move must not silently descend a root-owned allocation."""
+    tree = KernelTree()
+    buf = Buffer(name="sbuf_x", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
+    root = tree.data(tree.root)
+    assert isinstance(root, BlockNode)
+    tree.graph.nodes[tree.root]["data"] = replace(root, alloc_buffers=(buf,))
+
+    stage = tree.add_node(BlockNode(iter_vars=(), iter_values=(), reads=(), writes=()), parent=tree.root)
+    outer = tree.add_node(ForNode(loop_var="i_d2_0", extent=4), parent=stage)
+    inner = tree.add_node(ForNode(loop_var="i_d0_0", extent=16), parent=outer)
+    region = BufferRegion(
+        tensor="sbuf_x", ranges=((Var(name="i_d0_0"), Const(value=128)), (Const(value=0), Const(value=2048)))
+    )
+    leaf = tree.add_node(ISANode(op_cls=NKILoad, operand_bindings={"dst": region}), parent=inner)
+
+    assert _hoisted_scope(tree, "sbuf_x", [leaf]) == tree.root
 
 
 def test_render_hbm_2d_region():

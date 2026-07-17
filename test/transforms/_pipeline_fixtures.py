@@ -16,6 +16,8 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.transforms import (
+    BufferCompaction,
+    BufferCompactionOption,
     CodeMotion,
     CodeMotionOption,
     Fuse,
@@ -51,8 +53,14 @@ TRACE: list[tuple[object, object]] = [
     (Reorder(), ReorderOption(outer_nid=12, inner_nid=13)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=11, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=15, target_loop_nid=11, index=2)),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_prod")),
     (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=11, stages=(0, 0, 1), order=(0, 1, 2))),
 ]
+"""The ``BufferCompaction(psum_prod)`` atom follows the two CodeMotion sinks: after
+the 2026-07-14 decouple, ``CodeMotion.apply`` is structural-only, so the memset +
+drain sinks no longer compact ``psum_prod``. The explicit compaction descends its
+decl into the M loop and shrinks its shape to one tile, restoring the pre-decouple
+tuned state the pipeline + body tests assert (``(128, num_p_tiles, 2048)``)."""
 
 
 def tuned_ir() -> KernelIR:

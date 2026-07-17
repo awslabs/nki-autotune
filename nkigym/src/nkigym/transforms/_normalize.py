@@ -18,13 +18,12 @@ merely substituted) from the dim's surviving dense loops:
   factorization, ranging over the dim's full loop space. A loopless dim has
   ``T = 0``.
 * A block ``iter_value`` is exactly ``T`` (tile space, stride unit 1).
-* A region axis ``lo`` is the bare ``T`` for the SBUF/PSUM partition axis
-  (axis 0, width 128 — ``T`` is a tile index) and ``Mul(T, width)`` for every
-  element-space axis. Keeping the offset un-flattened as ``Mul(affine,
-  width)`` mirrors :func:`nkigym.ir.canonical_build._build_region`, so a
-  normalize on canonical IR is the identity, a Split that only inserts loops
-  and sets the access width renders byte-exact to the hand-written ladder,
-  and the element stride stays recoverable by Fuse's outer-trip merge.
+* A region axis keeps the innermost suffix of that dim's loops whose trip
+  product fits the buffer's logical extent at the access width. Outer loops
+  beyond that capacity select a compacted buffer instance and do not contribute
+  to its local offset. The resulting affine is bare for the SBUF/PSUM partition
+  axis and multiplied by ``width`` for element-space axes. Full-extent and HBM
+  buffers retain every loop, so canonical normalization is unchanged.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ from __future__ import annotations
 from math import prod
 
 from nkigym.ir.arith.expr import Const, Expr, Mul, from_affine, to_affine
-from nkigym.ir.tree import PARTITION_DIM, BlockNode, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
 
 
@@ -59,6 +58,18 @@ def normalize_block(tree: KernelTree, block_nid: int) -> None:
     _drop_trip1(tree, block_nid)
     _rename_dense(tree, block_nid)
     _recompute_bindings(tree, block_nid)
+
+
+def normalize_tensor_regions(tree: KernelTree, tensor: str) -> None:
+    """Recompute only ``tensor``'s regions in every block that references it.
+
+    Buffer compaction changes the tensor's logical shape without changing loop
+    structure. Re-running the extent-fit region calculation materializes the
+    corresponding local offsets while leaving every other tensor and all block
+    iter bindings untouched.
+    """
+    for block_nid in tree.blocks():
+        _recompute_bindings(tree, block_nid, tensor=tensor)
 
 
 def _drop_trip1(tree: KernelTree, block_nid: int) -> None:
@@ -157,24 +168,35 @@ def _rename_dense(tree: KernelTree, block_nid: int) -> None:
             tree.graph.nodes[nid]["data"] = ForNode(loop_var=new_name, extent=data.extent)
 
 
-def _recompute_bindings(tree: KernelTree, block_nid: int) -> None:
-    """Recompute iter_values + every region ``lo`` from the renamed dense loops.
+def _recompute_bindings(tree: KernelTree, block_nid: int, tensor: str | None = None) -> None:
+    """Recompute iter_values and selected region offsets from the dense loops.
 
     Each dim's iter_value and region offsets are rebuilt from the dim's
     surviving dense loops (their element strides), so the transform's loop
     edits + access-width edits are sufficient — the offsets never have to be
-    set by the transform.
+    set by the transform. When ``tensor`` is provided, only that tensor's
+    regions are updated and the block's iter values remain unchanged.
     """
     block = tree.data(block_nid)
     assert isinstance(block, BlockNode)
     dim_loops = _dim_loops(tree, block_nid, block)
     tensor_axes = _tensor_to_axes(tree, block_nid)
-    new_iter_values = tuple(_iter_value(iv.axis, dim_loops) for iv in block.iter_vars)
+    new_iter_values = (
+        block.iter_values if tensor is not None else tuple(_iter_value(iv.axis, dim_loops) for iv in block.iter_vars)
+    )
+
+    def recompute(region: BufferRegion) -> BufferRegion:
+        """Recompute ``region`` unless a different tensor was requested."""
+        result = region
+        if tensor is None or region.tensor == tensor:
+            result = _recompute_region(tree, region, tensor_axes, block.axis_map, dim_loops)
+        return result
+
     new_block = BlockNode(
         iter_vars=block.iter_vars,
         iter_values=new_iter_values,
-        reads=tuple(_recompute_region(tree, r, tensor_axes, block.axis_map, dim_loops) for r in block.reads),
-        writes=tuple(_recompute_region(tree, w, tensor_axes, block.axis_map, dim_loops) for w in block.writes),
+        reads=tuple(recompute(region) for region in block.reads),
+        writes=tuple(recompute(region) for region in block.writes),
         alloc_buffers=block.alloc_buffers,
         annotations=dict(block.annotations),
         axis_map=block.axis_map,
@@ -186,7 +208,11 @@ def _recompute_bindings(tree: KernelTree, block_nid: int) -> None:
             continue
         op_axes = data.op_cls.OPERAND_AXES
         new_bindings = {
-            slot: _recompute_region(tree, region, {region.tensor: op_axes[slot]}, block.axis_map, dim_loops)
+            slot: (
+                _recompute_region(tree, region, {region.tensor: op_axes[slot]}, block.axis_map, dim_loops)
+                if tensor is None or region.tensor == tensor
+                else region
+            )
             for slot, region in data.operand_bindings.items()
         }
         tree.graph.nodes[nid]["data"] = ISANode(
@@ -245,6 +271,31 @@ def _tile_space_affine(loops: list[tuple[str, int]]) -> Expr:
     return from_affine(coeffs)
 
 
+def _fit_loops(loops: list[tuple[str, int]], capacity: int) -> list[tuple[str, int]]:
+    """Keep the INNERMOST suffix of ``loops`` whose trip product fits ``capacity``.
+
+    ``loops`` is outer-to-inner. A buffer axis holding ``capacity`` tiles can only
+    address that many distinct positions, so loops beyond it (the outermost) select
+    which INSTANCE of a compacted buffer is live rather than a position within the
+    single resident instance — they must not appear in the intra-instance offset.
+    The kept suffix is the longest tail with ``Π(trips) <= capacity``; the dropped
+    outer loops are the instance selectors.
+
+    For a FULL-extent buffer the capacity covers every loop, so the whole list is
+    kept and the offset is byte-identical to the pre-extent-fit recompute. A
+    ``capacity <= 0`` (degenerate) keeps nothing.
+    """
+    kept: list[tuple[str, int]] = []
+    running = 1
+    for loop_var, extent in reversed(loops):
+        running *= extent
+        if running > capacity:
+            break
+        kept.append((loop_var, extent))
+    kept.reverse()
+    return kept
+
+
 def _recompute_region(
     tree: KernelTree,
     region: BufferRegion,
@@ -267,15 +318,52 @@ def _recompute_region(
         return region
     present = [a for a in abstract_axes if a in axis_map]
     location = _tensor_location(tree, region.tensor)
+    buf = _tensor_buffer(tree, region.tensor)
     new_ranges: list[tuple[Expr, Expr]] = []
     for axis_index, (_lo, width) in enumerate(region.ranges):
         assert isinstance(width, Const), f"region width must be Const; got {width!r}"
         dim = axis_map.get(present[axis_index]) if axis_index < len(present) else None
-        affine = _tile_space_affine(dim_loops.get(dim, []) if dim is not None else [])
+        loops = dim_loops.get(dim, []) if dim is not None else []
+        loops = _fit_loops(loops, _axis_capacity(buf, axis_index, location, width.value))
+        affine = _tile_space_affine(loops)
         is_partition = axis_index == 0 and location in ("sbuf", "psum") and width.value == PARTITION_DIM
         lo = affine if (is_partition or _is_zero(affine)) else Mul(left=affine, right=width)
         new_ranges.append((lo, width))
     return BufferRegion(tensor=region.tensor, ranges=tuple(new_ranges))
+
+
+def _axis_capacity(buf: Buffer | None, axis_index: int, location: str, width: int) -> int:
+    """Tiles buffer ``buf`` can address on region axis ``axis_index`` at ``width``.
+
+    The extent-fit budget for :func:`_fit_loops`. A tensor with no ``Buffer`` (an
+    HBM parameter, absolute-addressed) or a ``shared_hbm`` buffer has NO instance
+    dimension, so every loop is a position within it — return a huge capacity so
+    :func:`_fit_loops` keeps them all (global addressing, unchanged). For an sbuf/psum
+    buffer the capacity is the buffer's own logical extent on that axis divided by the
+    access width: the partition axis (axis 0, width 128) holds ``leading // 128`` tiles;
+    an element axis holds ``extent // width`` slices. Axes beyond the buffer's declared
+    shape (none in practice) also fall through to unbounded.
+    """
+    if buf is None or location == "shared_hbm" or axis_index >= len(buf.shape):
+        return 1 << 30
+    extent = buf.shape[axis_index]
+    return extent // width if width > 0 else 0
+
+
+def _tensor_buffer(tree: KernelTree, tensor: str) -> Buffer | None:
+    """Return the :class:`Buffer` declared for ``tensor`` in any block, else ``None``.
+
+    ``None`` for an HBM kernel parameter (never allocated). Mirrors
+    :func:`_tensor_location`, returning the whole Buffer so the caller can read its
+    compacted logical shape for the extent-fit capacity.
+    """
+    for nid in tree.blocks():
+        block = tree.data(nid)
+        assert isinstance(block, BlockNode)
+        for buf in block.alloc_buffers:
+            if buf.name == tensor:
+                return buf
+    return None
 
 
 def _is_zero(expr: Expr) -> bool:
@@ -343,4 +431,4 @@ def _dim_from_loopvar(loop_var: str) -> str:
     return parts[0]
 
 
-__all__ = ["normalize_block"]
+__all__ = ["normalize_block", "normalize_tensor_regions"]
