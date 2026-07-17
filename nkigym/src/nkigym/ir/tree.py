@@ -17,18 +17,17 @@ sub-payloads carried on :class:`BlockNode` and :class:`ISANode`.
 ``preorder``, ``blocks``) so downstream atoms don't have to touch
 ``networkx`` directly. :func:`build_initial_tree` walks an
 ``@nkigym_kernel`` callable via :func:`nkigym.ir.dimension_analysis.analyze_dimensions`.
-Visualization helpers live in :mod:`nkigym.ir.tree_visualize`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 import networkx as nx
 
-from nkigym.ir.arith.expr import Expr, format_expr
+from nkigym.ir.arith.expr import Expr
 from nkigym.ir.dimension_analysis import _AnalysisResult
 from nkigym.ops.base import AxisRole, NKIOp
 
@@ -56,10 +55,6 @@ class ForNode:
     loop_var: str
     extent: int
 
-    def label(self) -> str:
-        """Return ``Loop <loop_var> extent=<extent>``."""
-        return f"Loop {self.loop_var} extent={self.extent}"
-
 
 @dataclass(frozen=True, kw_only=True)
 class ISANode:
@@ -77,16 +72,6 @@ class ISANode:
     operand_bindings: dict[str, BufferRegion] = field(default_factory=dict)
     kwargs: dict[str, Any] = field(default_factory=dict)
 
-    def label(self) -> str:
-        """Return the op name plus per-slot region labels and kwargs, newline-separated."""
-        lines: list[str] = [f"nisa.{self.op_cls.NAME}"]
-        if self.operand_bindings:
-            bindings = ", ".join(f"{slot}={region.label()}" for slot, region in self.operand_bindings.items())
-            lines.append(f"bindings=({bindings})")
-        if self.kwargs:
-            lines.append(f"kwargs={self.kwargs}")
-        return "\n".join(lines)
-
 
 @dataclass(frozen=True, kw_only=True)
 class IterVar:
@@ -102,10 +87,6 @@ class IterVar:
     axis: str
     dom: tuple[int, int]
     role: AxisRole
-
-    def label(self) -> str:
-        """Return ``axis(ROL lo..hi)`` with the role abbreviated to 3 letters."""
-        return f"{self.axis}({self.role.name[:3]} {self.dom[0]}..{self.dom[1]})"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -150,8 +131,7 @@ class Buffer:
         ``(128, num_p_tiles, F_contig)`` — the partition axis is fixed at
         128 and the leading logical extent folds into the tile count. This
         is the single source of truth shared by the renderer
-        (:func:`nkigym.codegen.body._emit_alloc`) and the tree
-        visualization, so the two never drift.
+        (:func:`nkigym.codegen.body._emit_alloc`) and buffer transforms.
         """
         if self.location == "shared_hbm":
             return self.shape
@@ -197,20 +177,6 @@ class Buffer:
             return "float32"
         return self.dtype
 
-    def label(self) -> str:
-        """Return ``name (physical_shape) dtype@location`` on one line.
-
-        For a list-of-tiles buffer (:attr:`list_len` > 1) shows
-        ``name [N x (per_tile_shape)] dtype@location`` instead, matching the rendered
-        list allocation. Shows the physical allocation shape so the visualization
-        matches the rendered kernel.
-        """
-        if self.list_len > 1:
-            per = ", ".join(str(extent) for extent in self.per_tile_physical_shape())
-            return f"{self.name} [{self.list_len} x ({per})] {self.dtype}@{self.location}"
-        shape_str = ", ".join(str(extent) for extent in self.physical_shape())
-        return f"{self.name} ({shape_str}) {self.dtype}@{self.location}"
-
 
 @dataclass(frozen=True, kw_only=True)
 class BufferRegion:
@@ -225,21 +191,6 @@ class BufferRegion:
 
     tensor: str
     ranges: tuple[tuple[Expr, Expr], ...]
-
-    def label(self) -> str:
-        """Return ``tensor[lo : +width, ...]`` from the stored ``(lo, width)`` ranges."""
-        axes = ", ".join(f"{format_expr(lo)} : +{format_expr(width)}" for lo, width in self.ranges)
-        return f"{self.tensor}[{axes}]"
-
-
-def _label_lines(items: tuple[BufferRegion | Buffer, ...], indent: int) -> str:
-    """Join each item's ``label()`` onto its own line; continuation lines indented.
-
-    Returns ``∅`` when ``items`` is empty so empty fields stay visible.
-    """
-    pad = "\n" + " " * indent
-    result = pad.join(item.label() for item in items) if items else "∅"
-    return result
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -273,27 +224,9 @@ class BlockNode:
     abstract name ``OPERAND_AXES`` is keyed by. Empty for the synthetic
     root block and hand-built blocks with no operand axes."""
 
-    def label(self) -> str:
-        """Return a multi-line summary of all six fields; empty fields show as ∅."""
-        if self.iter_vars:
-            iv_line = " ".join(iv.label() for iv in self.iter_vars)
-            val_line = "  ".join(f"{iv.axis}={format_expr(val)}" for iv, val in zip(self.iter_vars, self.iter_values))
-        else:
-            iv_line = "∅"
-            val_line = "∅"
-        lines = [
-            "BlockNode",
-            f"iter_vars:   {iv_line}",
-            f"iter_values: {val_line}",
-            f"reads:   {_label_lines(self.reads, 9)}",
-            f"writes:  {_label_lines(self.writes, 9)}",
-            f"allocs:  {_label_lines(self.alloc_buffers, 9)}",
-            f"annotations: {self.annotations if self.annotations else '∅'}",
-        ]
-        return "\n".join(lines)
-
 
 NodeData = BlockNode | ForNode | ISANode
+_NodeT = TypeVar("_NodeT", BlockNode, ForNode, ISANode)
 
 
 class KernelTree:
@@ -332,6 +265,25 @@ class KernelTree:
     def data(self, nid: int) -> NodeData:
         """Return the payload attached to node ``nid``."""
         return self.graph.nodes[nid]["data"]
+
+    def _expect_data(self, nid: int, expected: type[_NodeT]) -> _NodeT:
+        """Return node data after validating its concrete payload type."""
+        data = self.data(nid)
+        if not isinstance(data, expected):
+            raise TypeError(f"node {nid} is {type(data).__name__}, expected {expected.__name__}")
+        return data
+
+    def block(self, nid: int) -> BlockNode:
+        """Return node ``nid`` as a :class:`BlockNode`, or raise :class:`TypeError`."""
+        return self._expect_data(nid, BlockNode)
+
+    def loop(self, nid: int) -> ForNode:
+        """Return node ``nid`` as a :class:`ForNode`, or raise :class:`TypeError`."""
+        return self._expect_data(nid, ForNode)
+
+    def isa(self, nid: int) -> ISANode:
+        """Return node ``nid`` as an :class:`ISANode`, or raise :class:`TypeError`."""
+        return self._expect_data(nid, ISANode)
 
     def children(self, nid: int) -> list[int]:
         """Return the ordered list of direct children of ``nid``."""

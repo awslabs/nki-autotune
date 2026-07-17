@@ -113,7 +113,7 @@ def test_emit_pipeline_annotation_rotates_monolithic_loop():
     m_loop, _children = m_loop_and_children(ir)
     object.__setattr__(ir.buffer("psum_prod"), "versions", 2)
     parent = parent_block_of(ir, m_loop)
-    ir.tree.data(parent).annotations["software_pipeline"] = {
+    ir.tree.block(parent).annotations["software_pipeline"] = {
         "loop_nid": m_loop,
         "stages": (0, 0, 1),
         "order": (0, 1, 2),

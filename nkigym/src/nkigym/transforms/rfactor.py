@@ -49,7 +49,7 @@ class RFactorOption(TransformOption):
     factor_axis: int = 0
 
 
-class RFactor(Transform):
+class RFactor(Transform[RFactorOption]):
     """One-stage → two-stage accumulation: per-``ko`` PSUM partial + SBUF fold."""
 
     def analyze(self, ir: KernelIR) -> list[RFactorOption]:
@@ -75,7 +75,7 @@ class RFactor(Transform):
         leaf = self._owning_matmul_leaf(ir, loop_nid)
         result = False
         if leaf is not None:
-            op_cls = ir.tree.data(leaf).op_cls
+            op_cls = ir.tree.isa(leaf).op_cls
             block = self._enclosing_block(ir, leaf)
             axis = self._loop_axis(ir, loop_nid, block)
             axis_loops: list[int] = []
@@ -232,11 +232,13 @@ class RFactor(Transform):
         matmul_node = tree.data(matmul_leaf)
         assert isinstance(matmul_node, ISANode)
         op_cls = matmul_node.op_cls
+        reducer = op_cls.REDUCE_COMBINATOR
+        assert reducer is not None
 
         psum_name = matmul_node.operand_bindings["dst"].tensor
         out_name = self._drain_out_tensor(tree, psum_name)
-        identity = float(op_cls.REDUCE_COMBINATOR.identity)
-        combiner = op_cls.REDUCE_COMBINATOR.combiner
+        identity = float(reducer.identity)
+        combiner = reducer.combiner
 
         ki_nid = self._ki_loop_nid(ir, option.target_loop_nid)
         footprint = self._footprint(ir, ki_nid, matmul_leaf)
@@ -284,7 +286,7 @@ class RFactor(Transform):
         k_loops = [
             a
             for a in tree.ancestors(matmul_leaf)
-            if isinstance(tree.data(a), ForNode) and tree.data(a).loop_var in k_binding_vars
+            if isinstance((node := tree.data(a)), ForNode) and node.loop_var in k_binding_vars
         ]
         return k_loops[-1]
 
@@ -305,7 +307,7 @@ class RFactor(Transform):
         """
         tree = ir.tree
         block = self._enclosing_block(ir, matmul_leaf)
-        m_abstract = tree.data(matmul_leaf).op_cls.OPERAND_AXES["dst"][0]
+        m_abstract = tree.isa(matmul_leaf).op_cls.OPERAND_AXES["dst"][0]
         m_axis = block.axis_map[m_abstract]
         m_binding_vars = self._axis_binding_loopvars(block, m_axis)
         between = [
@@ -314,7 +316,7 @@ class RFactor(Transform):
             if isinstance(tree.data(a), ForNode) and ki_loop_nid in tree.ancestors(a)
         ]
         return [
-            (tree.data(a).loop_var, tree.data(a).extent) for a in between if tree.data(a).loop_var in m_binding_vars
+            (tree.loop(a).loop_var, tree.loop(a).extent) for a in between if tree.loop(a).loop_var in m_binding_vars
         ]
 
     def _absorbed_free_width(self, ir: KernelIR, ki_loop_nid: int, matmul_leaf: int) -> int:
@@ -327,8 +329,9 @@ class RFactor(Transform):
         """
         tree = ir.tree
         block = self._enclosing_block(ir, matmul_leaf)
-        dst_region = tree.data(matmul_leaf).operand_bindings["dst"]
-        free_abstract = tree.data(matmul_leaf).op_cls.OPERAND_AXES["dst"][1]
+        matmul = tree.isa(matmul_leaf)
+        dst_region = matmul.operand_bindings["dst"]
+        free_abstract = matmul.op_cls.OPERAND_AXES["dst"][1]
         free_axis = block.axis_map[free_abstract]
         free_binding_vars = self._axis_binding_loopvars(block, free_axis)
         tile_width = dst_region.ranges[1][1]
@@ -362,16 +365,17 @@ class RFactor(Transform):
         """
         tree = ir.tree
         block = self._enclosing_block(ir, matmul_leaf)
-        dst_region = tree.data(matmul_leaf).operand_bindings["dst"]
-        free_abstract = tree.data(matmul_leaf).op_cls.OPERAND_AXES["dst"][1]
+        matmul = tree.isa(matmul_leaf)
+        dst_region = matmul.operand_bindings["dst"]
+        free_abstract = matmul.op_cls.OPERAND_AXES["dst"][1]
         free_axis = block.axis_map[free_abstract]
         free_binding_vars = self._axis_binding_loopvars(block, free_axis)
         absorbed = {
-            tree.data(a).loop_var
+            node.loop_var
             for a in tree.ancestors(matmul_leaf)
-            if isinstance(tree.data(a), ForNode)
+            if isinstance((node := tree.data(a)), ForNode)
             and ki_loop_nid in tree.ancestors(a)
-            and tree.data(a).loop_var in free_binding_vars
+            and node.loop_var in free_binding_vars
         }
         return substitute(dst_region.ranges[1][0], {var: Const(value=0) for var in absorbed})
 
@@ -383,12 +387,12 @@ class RFactor(Transform):
         single leaf whose op declares an ``RFACTOR_RECIPE`` (the matmul).
         """
         leaves = [d for d in tree.descendants(block_nid) if isinstance(tree.data(d), ISANode)]
-        rfactorable = [n for n in leaves if tree.data(n).op_cls.RFACTOR_RECIPE is not None]
+        rfactorable = [n for n in leaves if tree.isa(n).op_cls.RFACTOR_RECIPE is not None]
         if len(rfactorable) != 1:
             raise TransformLegalityError(
                 f"block {block_nid} must own exactly one rfactorable leaf; got {len(rfactorable)}"
             )
-        return tree.data(rfactorable[0]).op_cls
+        return tree.isa(rfactorable[0]).op_cls
 
     def _drain_out_tensor(self, tree: KernelTree, psum_name: str) -> str:
         """Tensor the drain ``tensor_copy`` writes (reads ``psum_name``, writes SBUF out)."""
@@ -621,7 +625,7 @@ class RFactor(Transform):
         """
         tree = ir.tree
         block = self._enclosing_block(ir, matmul_leaf)
-        op_cls = tree.data(matmul_leaf).op_cls
+        op_cls = tree.isa(matmul_leaf).op_cls
         m_axis = block.axis_map[op_cls.OPERAND_AXES["dst"][0]]
         m_value = next(v for iv, v in zip(block.iter_vars, block.iter_values) if iv.axis == m_axis)
         m_dom = next(iv.dom for iv in block.iter_vars if iv.axis == m_axis)
@@ -693,20 +697,21 @@ class RFactor(Transform):
         leaves = [
             d
             for d in ir.tree.descendants(loop_nid)
-            if isinstance(ir.tree.data(d), ISANode) and ir.tree.data(d).op_cls.RFACTOR_RECIPE is not None
+            if isinstance((node := ir.tree.data(d)), ISANode) and node.op_cls.RFACTOR_RECIPE is not None
         ]
         return leaves[0] if len(leaves) == 1 else None
 
     def _enclosing_block(self, ir: KernelIR, nid: int) -> BlockNode:
         """Nearest enclosing BlockNode payload of ``nid``."""
         for anc in reversed(ir.tree.ancestors(nid)):
-            if isinstance(ir.tree.data(anc), BlockNode):
-                return ir.tree.data(anc)
+            data = ir.tree.data(anc)
+            if isinstance(data, BlockNode):
+                return data
         raise TransformLegalityError(f"no enclosing BlockNode for {nid}")
 
     def _loop_axis(self, ir: KernelIR, loop_nid: int, block: BlockNode) -> str | None:
         """The concrete axis the loop's loop_var binds, via the block's iter_values."""
-        loop_var = ir.tree.data(loop_nid).loop_var
+        loop_var = ir.tree.loop(loop_nid).loop_var
         for iv, value in zip(block.iter_vars, block.iter_values):
             if loop_var in to_affine(value):
                 return iv.axis

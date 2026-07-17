@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from test.transforms._fixtures import build_canonical_ir
+
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.transforms import Split, SplitOption
-from test.transforms._fixtures import build_canonical_ir
 
 
 def matmul_leaf_nid(ir: KernelIR) -> int:
@@ -13,7 +14,7 @@ def matmul_leaf_nid(ir: KernelIR) -> int:
     return next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
 
 
@@ -25,7 +26,7 @@ def _matmul_k_loop_nid(ir: KernelIR) -> int:
     return next(
         a
         for a in ir.tree.ancestors(matmul)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d0_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d0_0"
     )
 
 
@@ -51,7 +52,7 @@ def ko_loop_nid(ir: KernelIR) -> int:
     k_loops = [
         a
         for a in ir.tree.ancestors(matmul)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var.startswith("i_d0_")
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var.startswith("i_d0_")
     ]
     return k_loops[0]
 
@@ -62,7 +63,7 @@ def _mm_m_loop(ir: KernelIR) -> int:
     return next(
         a
         for a in ir.tree.ancestors(mm)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var == "i_d1_0"
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var == "i_d1_0"
     )
 
 
@@ -98,5 +99,5 @@ def k28_ko_loop_nid(ir: KernelIR) -> int:
     return next(
         a
         for a in ir.tree.ancestors(matmul)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var.startswith("i_d0_")
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var.startswith("i_d0_")
     )

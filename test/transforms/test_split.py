@@ -17,31 +17,32 @@ def test_split_outer_trip_replaces_for_with_chain():
     ir = build_canonical_ir()
     matmul_block_nid = block_for_op(ir, "NKIMatmul")
     target = first_for_in(ir, matmul_block_nid)
-    target_extent = ir.tree.data(target).extent
+    target_extent = ir.tree.loop(target).extent
 
     new_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(4, target_extent // 4)))
 
     """Old IR untouched."""
-    assert ir.tree.data(target).extent == target_extent
+    assert ir.tree.loop(target).extent == target_extent
 
     """New IR: parent's child slot now contains a fresh ForNode of extent 4 with one ForNode child."""
     parent = ir.tree.parent(target)
+    assert parent is not None
     new_kid = new_ir.tree.children(parent)[0]
     new_kid_data = new_ir.tree.data(new_kid)
     assert isinstance(new_kid_data, ForNode)
     assert new_kid_data.extent == 4
     inner = new_ir.tree.children(new_kid)[0]
     assert isinstance(new_ir.tree.data(inner), ForNode)
-    assert new_ir.tree.data(inner).extent == target_extent // 4
+    assert new_ir.tree.loop(inner).extent == target_extent // 4
 
 
 def test_split_outer_trip_rewrites_iter_value_for_bound_axis():
     """The enclosing block's iter_value for the split iter_var becomes a sum of new loop_vars * strides."""
     ir = build_canonical_ir()
     matmul_block_nid = block_for_op(ir, "NKIMatmul")
-    matmul_block = ir.tree.data(matmul_block_nid)
+    matmul_block = ir.tree.block(matmul_block_nid)
     target = first_for_in(ir, matmul_block_nid)
-    target_for = ir.tree.data(target)
+    target_for = ir.tree.loop(target)
     target_loop_var = target_for.loop_var
     target_extent = target_for.extent
 
@@ -54,7 +55,7 @@ def test_split_outer_trip_rewrites_iter_value_for_bound_axis():
     assert bound_axis_index is not None, "could not locate the iter_value bound by the target ForNode"
 
     new_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(4, target_extent // 4)))
-    new_block = new_ir.tree.data(matmul_block_nid)
+    new_block = new_ir.tree.block(matmul_block_nid)
     new_value = new_block.iter_values[bound_axis_index]
     coeffs = to_affine(new_value)
     """The new value is a 2-term affine combination summing two loop_vars."""
@@ -69,7 +70,7 @@ def test_split_apply_preserves_input_ir():
     ir = build_canonical_ir()
     matmul_block_nid = block_for_op(ir, "NKIMatmul")
     target = first_for_in(ir, matmul_block_nid)
-    target_extent = ir.tree.data(target).extent
+    target_extent = ir.tree.loop(target).extent
     snapshot_num_nodes = ir.tree.num_nodes
     Split().apply(ir, SplitOption(target_nid=target, factors=(4, target_extent // 4)))
     assert ir.tree.num_nodes == snapshot_num_nodes
@@ -108,7 +109,7 @@ def test_split_rejects_outer_trip_on_shared_post_computeat_loop():
     )
     assert len(owners_under(shared)) >= 2, owners_under(shared)
 
-    extent = ir.tree.data(shared).extent
+    extent = ir.tree.loop(shared).extent
     with pytest.raises(TransformLegalityError, match="shared across multiple blocks"):
         Split().apply(ir, SplitOption(target_nid=shared, factors=(2, extent // 2)))
     assert not any(o.target_nid == shared and o.target_axis is None for o in Split().analyze(ir))
@@ -129,14 +130,14 @@ def test_split_tensorize_preserves_sibling_order_of_co_located_block():
         return next(
             i
             for i, n in enumerate(tree.preorder())
-            if isinstance(tree.data(n), ISANode) and tree.data(n).op_cls.__name__ == op_name
+            if isinstance(tree.data(n), ISANode) and tree.isa(n).op_cls.__name__ == op_name
         )
 
     ir = build_ladder_state(7)
     memset_leaf = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMemset"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMemset"
     )
     assert first_index(ir.tree, "NKIMemset") < first_index(ir.tree, "NKIMatmul"), "precondition: memset before matmul"
 
@@ -154,7 +155,7 @@ def test_split_analyze_offers_tensorize_on_load():
     load_leaf = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKILoad"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKILoad"
     )
     tensorize_opts = [o for o in Split().analyze(ir) if o.target_nid == load_leaf and o.target_axis is not None]
     assert tensorize_opts, "Split.analyze offered no tensorize option on the load leaf"
@@ -173,7 +174,7 @@ def test_split_tensorize_below_min_tile_rejected():
     mm = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
     with pytest.raises(TransformLegalityError, match="MIN_TILE_SIZE"):
         Split().apply(ir, SplitOption(target_nid=mm, factors=(16, 8), target_axis="d1"))
@@ -191,16 +192,16 @@ def test_split_analyze_omits_below_min_tensorize_splits():
     mm = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
-    block = next(
-        ir.tree.data(a) for a in reversed(ir.tree.ancestors(mm)) if ir.tree.data(a).__class__.__name__ == "BlockNode"
-    )
+    block = next(ir.tree.block(a) for a in reversed(ir.tree.ancestors(mm)) if isinstance(ir.tree.data(a), BlockNode))
     inverse = {concrete: abstract for abstract, concrete in block.axis_map.items()}
-    min_tile = ir.tree.data(mm).op_cls.MIN_TILE_SIZE
+    min_tile = ir.tree.isa(mm).op_cls.MIN_TILE_SIZE
     tensorize = [o for o in Split().analyze(ir) if o.target_nid == mm and o.target_axis is not None]
     for opt in tensorize:
-        floor = min_tile[inverse[opt.target_axis]]
+        target_axis = opt.target_axis
+        assert target_axis is not None
+        floor = min_tile[inverse[target_axis]]
         assert opt.factors[-1] >= floor, f"analyze offered {opt.factors} on {opt.target_axis} below floor {floor}"
     offered_axes = {o.target_axis for o in tensorize}
     assert "d0" not in offered_axes and "d1" not in offered_axes
@@ -214,14 +215,14 @@ def test_split_trip_dense_names():
         n
         for n in ir.tree.preorder()
         if isinstance(ir.tree.data(n), ForNode)
-        and ir.tree.data(n).loop_var == "i_d1_0"
-        and ir.tree.data(n).extent == 16
+        and ir.tree.loop(n).loop_var == "i_d1_0"
+        and ir.tree.loop(n).extent == 16
     )
     new_ir = Split().apply(ir, SplitOption(target_nid=d1, factors=(2, 8)))
     names = [
-        new_ir.tree.data(n).loop_var
+        new_ir.tree.loop(n).loop_var
         for n in new_ir.tree.preorder()
-        if isinstance(new_ir.tree.data(n), ForNode) and new_ir.tree.data(n).loop_var.startswith("i_d1_")
+        if isinstance(new_ir.tree.data(n), ForNode) and new_ir.tree.loop(n).loop_var.startswith("i_d1_")
     ]
     assert "i_d1_0" in names and "i_d1_1" in names
     assert not any("_0_" in nm for nm in names), names
@@ -233,7 +234,7 @@ def test_split_rejects_over_cover():
     ir = build_canonical_ir()
     matmul_block_nid = block_for_op(ir, "NKIMatmul")
     target = first_for_in(ir, matmul_block_nid)
-    assert ir.tree.data(target).extent == 16
+    assert ir.tree.loop(target).extent == 16
     with pytest.raises(TransformLegalityError):
         Split().apply(ir, SplitOption(target_nid=target, factors=(4, 5)))
 
@@ -243,7 +244,7 @@ def test_split_accepts_exact_cover():
     ir = build_canonical_ir()
     matmul_block_nid = block_for_op(ir, "NKIMatmul")
     target = first_for_in(ir, matmul_block_nid)
-    assert ir.tree.data(target).extent == 16
+    assert ir.tree.loop(target).extent == 16
     new_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(4, 4)))
     assert new_ir is not ir
 
@@ -260,7 +261,7 @@ def test_split_tensorize_rejects_over_cover():
     mm = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
     with pytest.raises(TransformLegalityError, match="exactly tile"):
         Split().apply(ir, SplitOption(target_nid=mm, factors=(4, 256), target_axis="d2"))

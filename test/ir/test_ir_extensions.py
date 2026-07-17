@@ -1,6 +1,5 @@
 """Tests for the extended IR fields (location, dtype, kwargs, axis_map, return_name)."""
 
-import shutil
 from test.transforms._fixtures import INPUT_SPECS, f_matmul
 
 import pytest
@@ -320,22 +319,18 @@ def test_canonical_matmul_emits_root_block_with_alloc_buffers():
     all_buffers = set()
     for nid in ir.tree.blocks():
         blk = ir.tree.data(nid)
+        assert isinstance(blk, BlockNode)
         all_buffers.update(buf.name for buf in blk.alloc_buffers)
     assert {"sbuf_lhs_T", "sbuf_rhs", "psum_prod", "sbuf_prod", "hbm_out"} <= all_buffers
 
 
-def test_dump_tree_runs_on_canonical_ir(tmp_path):
-    """dump_tree on the canonical matmul IR produces tree.mmd and tree.png."""
-    from test.transforms._fixtures import build_canonical_ir
-
-    from nkigym.ir.tree_visualize import dump_tree
-
-    if shutil.which("mmdc") is None:
-        pytest.skip("mmdc is required for Mermaid PNG export")
-    ir = build_canonical_ir()
-    dump_tree(ir.tree, tmp_path)
-    assert (tmp_path / "tree.mmd").exists()
-    assert (tmp_path / "tree.png").exists()
+def test_kernelir_dump_writes_only_text_artifacts(tmp_path):
+    """KernelIR.dump writes metadata and generated code without diagrams."""
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
+    ir.dump(tmp_path)
+    assert {path.name for path in tmp_path.iterdir()} == {"envelope.md", "kernel.py"}
+    assert (tmp_path / "envelope.md").stat().st_size > 0
+    assert (tmp_path / "kernel.py").stat().st_size > 0
 
 
 def test_trace_synthesizes_ssa_outputs():

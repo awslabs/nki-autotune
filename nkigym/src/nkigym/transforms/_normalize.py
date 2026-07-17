@@ -77,10 +77,11 @@ def _drop_trip1(tree: KernelTree, block_nid: int) -> None:
     trivial = [
         n
         for n in _block_local_descendants(tree, block_nid)
-        if isinstance(tree.data(n), ForNode) and tree.data(n).extent == 1
+        if isinstance((node := tree.data(n)), ForNode) and node.extent == 1
     ]
     for nid in trivial:
         parent = tree.parent(nid)
+        assert parent is not None
         children = tree.children(nid)
         _replace_in_parent_children(tree, parent, [nid], children)
         tree.graph.remove_node(nid)
@@ -135,9 +136,9 @@ def _all_enclosing_loops(tree: KernelTree, block_nid: int) -> list[tuple[str, in
     block-local walk would miss them (collapsing the dim to ``Const(0)``).
     """
     return [
-        (tree.data(anc).loop_var, tree.data(anc).extent)
+        (node.loop_var, node.extent)
         for anc in tree.ancestors(block_nid)
-        if isinstance(tree.data(anc), ForNode)
+        if isinstance((node := tree.data(anc)), ForNode)
     ]
 
 

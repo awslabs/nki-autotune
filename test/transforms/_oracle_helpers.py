@@ -37,5 +37,5 @@ def enclosing_for_nids(ir: KernelIR, leaf_nid: int, dim_prefix: str) -> list[int
     return [
         a
         for a in ir.tree.ancestors(leaf_nid)
-        if isinstance(ir.tree.data(a), ForNode) and ir.tree.data(a).loop_var.startswith(dim_prefix)
+        if isinstance(ir.tree.data(a), ForNode) and ir.tree.loop(a).loop_var.startswith(dim_prefix)
     ]

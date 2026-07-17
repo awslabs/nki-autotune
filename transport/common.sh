@@ -15,12 +15,10 @@ remote_repo_subdir="nki-autotune"
 # sync pulls it back to the SAME path locally. On Kaizen it MUST live under
 # $HOME — only $HOME is S3-backed and visible to the reverse sync.
 
-# Line that activates the kernel-env venv on the remote box before running, and
-# puts the $HOME-local Node + global-npm bins on PATH so dump()'s `mmdc` (and
-# `node`) are found — install.sh keeps them under $HOME so they survive fresh
-# desktops. Overridable via AUTOTUNE_REMOTE_ACTIVATE for boxes with a different
-# layout (e.g. the Kaizen py312 conda image). The literal \$HOME expands remotely.
-remote_activate="${AUTOTUNE_REMOTE_ACTIVATE:-source \$HOME/venvs/kernel-env/bin/activate && export PATH=\$HOME/.local/node/bin:\$HOME/.npm-global/bin:\$PATH}"
+# Line that activates the kernel-env venv on the remote box before running.
+# Overridable via AUTOTUNE_REMOTE_ACTIVATE for boxes with a different layout
+# (e.g. the Kaizen py312 conda image). The literal \$HOME expands remotely.
+remote_activate="${AUTOTUNE_REMOTE_ACTIVATE:-source \$HOME/venvs/kernel-env/bin/activate}"
 
 # PYTHONPATH so a bare `python examples/X.py` resolves the first-party packages.
 # install.sh installs only the THIRD-PARTY deps (nkipy/spike); nkigym + autotune
@@ -43,7 +41,7 @@ desktop_image="${KAIZEN_DESKTOP_IMAGE:-763104351884.dkr.ecr.us-west-2.amazonaws.
 desktop_timeout="${KAIZEN_DESKTOP_TIMEOUT:-86400}"
 
 # Files synced INTO the repo on the box should exclude these.
-sync_excludes=(.git __pycache__ "*.pyc" .pytest_cache .mypy_cache build .venv node_modules)
+sync_excludes=(.git __pycache__ "*.pyc" .pytest_cache .mypy_cache build .venv)
 
 die() {
     echo "ERROR: $*" >&2

@@ -18,16 +18,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 
 import networkx as nx
 
-from nkigym.ir._mermaid import ClassStyle, Flowchart, render_png
 from nkigym.ir.arith.expr import to_affine
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-
-_DEPENDENCY_STYLES: list[ClassStyle] = [ClassStyle(name="block", fill="#efe", stroke="#363")]
 
 _HAZARD_PRIORITY: dict[str, int] = {"RAW": 3, "WAW": 2, "WAR": 1}
 
@@ -36,7 +32,6 @@ _HAZARD_PRIORITY: dict[str, int] = {"RAW": 3, "WAW": 2, "WAR": 1}
 class _BlockInfo:
     """Cached read/write regions, the buffers they touch, and enclosing-loop extents."""
 
-    name: str
     reads: frozenset[str]
     writes: frozenset[str]
     read_regions: tuple[BufferRegion, ...]
@@ -57,7 +52,10 @@ class Dependency:
         self._owner_block: dict[int, int] = {}
         self._tree = tree
         self._build(tree)
-        self._closure: nx.DiGraph = nx.transitive_closure(self.graph, reflexive=False)
+        closure = nx.transitive_closure(self.graph, reflexive=False)
+        self._closure: nx.DiGraph = nx.DiGraph()
+        self._closure.add_nodes_from(closure.nodes(data=True))
+        self._closure.add_edges_from(closure.edges(data=True))
 
     def _resolve(self, nid: int) -> int:
         """Map a block nid to its owned ISA-leaf nid; a leaf/loop nid maps to itself."""
@@ -257,15 +255,6 @@ class Dependency:
         """Return a copy of :attr:`touches_by_tensor` for safe iteration."""
         return {name: list(chain) for name, chain in self.touches_by_tensor.items()}
 
-    def dump(self, cache_dir: str | Path) -> None:
-        """Write ``dependency.mmd`` and ``dependency.png`` into ``cache_dir``."""
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        mmd_path = cache_path / "dependency.mmd"
-        png_path = cache_path / "dependency.png"
-        mmd_path.write_text(_to_mermaid(self), encoding="utf-8")
-        render_png(mmd_path, png_path)
-
     def _build(self, tree: KernelTree) -> None:
         """Populate the graph by walking ISA leaves in execution order.
 
@@ -341,7 +330,6 @@ class Dependency:
         reads = {r.tensor for r in block.reads}
         writes = {w.tensor for w in block.writes}
         return _BlockInfo(
-            name=_block_name(block),
             reads=frozenset(reads),
             writes=frozenset(writes),
             read_regions=tuple(block.reads),
@@ -519,31 +507,6 @@ def _promoted_span(
         lo = min(lo, l_lo)
         hi = max(hi, l_hi)
     return (lo, hi)
-
-
-def _block_name(block: BlockNode) -> str:
-    """Best-effort label for a block."""
-    return block.annotations.get("name", "block")
-
-
-def _to_mermaid(dep: Dependency) -> str:
-    flow = Flowchart(direction="LR", styles=_DEPENDENCY_STYLES)
-    for nid in dep.blocks:
-        info = dep.info(nid)
-        node_id = f"n{nid}"
-        flow.add_node(node_id, f'{node_id}["{_label(nid, info)}"]', "block")
-    for producer, consumer, attrs in dep.graph.edges(data=True):
-        flow.add_edge(f"n{producer}", f"n{consumer}", label=attrs["kind"])
-    return flow.render()
-
-
-def _label(nid: int, info: _BlockInfo) -> str:
-    parts: list[str] = [f"#{nid} {info.name}"]
-    if info.reads:
-        parts.append(f"reads={','.join(sorted(info.reads))}")
-    if info.writes:
-        parts.append(f"writes={','.join(sorted(info.writes))}")
-    return "<br/>".join(parts)
 
 
 __all__ = ["Dependency"]

@@ -8,6 +8,8 @@ from test.transforms._pipeline_fixtures import m_loop_and_children, tuned_ir
 
 import pytest
 
+from nkigym.environment import Action
+from nkigym.ir import KernelIR
 from nkigym.ir.tree import ISANode
 from nkigym.transforms import (
     BufferLayout,
@@ -24,6 +26,12 @@ from nkigym.transforms import (
     SplitOption,
     TransformLegalityError,
 )
+
+
+def _apply_action(ir: KernelIR, action: Action) -> KernelIR:
+    """Apply one heterogeneous transform action."""
+    transform, option = action
+    return transform.apply(ir, option)
 
 
 def test_analyze_enumerates_nondecreasing_labelings():
@@ -47,7 +55,7 @@ def test_apply_derives_versions_and_annotates():
     new_ir = SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2)))
     assert new_ir.buffer("psum_prod").versions == 2
     assert new_ir.tree.graph.number_of_nodes() == n_nodes_before
-    anns = [new_ir.tree.data(nid).annotations.get("software_pipeline") for nid in new_ir.tree.blocks()]
+    anns = [new_ir.tree.block(nid).annotations.get("software_pipeline") for nid in new_ir.tree.blocks()]
     assert any(a and a["stages"] == (0, 0, 1) for a in anns)
 
 
@@ -91,7 +99,7 @@ def test_apply_rejects_pipeline_that_would_version_a_list_buffer():
 def test_pipeline_rejects_partial_version_write_with_wider_read():
     """A pipeline version cannot be read beyond the slice written in that iteration."""
     ir = build_canonical_ir()
-    trace = (
+    trace: tuple[Action, ...] = (
         (Split(), SplitOption(target_nid=8, factors=(8, 2), target_axis=None)),
         (Split(), SplitOption(target_nid=5, factors=(2, 8), target_axis=None)),
         (Split(), SplitOption(target_nid=17, factors=(4, 512), target_axis="d2")),
@@ -109,8 +117,8 @@ def test_pipeline_rejects_partial_version_write_with_wider_read():
         (Fuse(), FuseOption(target_nids=(23, 32, 33), target_axis=None)),
         (Fuse(), FuseOption(target_nids=(30, 31), target_axis=None)),
     )
-    for transform, transform_option in trace:
-        ir = transform.apply(ir, transform_option)
+    for action in trace:
+        ir = _apply_action(ir, action)
     option = SoftwarePipelineOption(loop_nid=25, stages=(0, 1), order=(0, 1))
     with pytest.raises(TransformLegalityError):
         SoftwarePipeline().apply(ir, option)
@@ -127,7 +135,7 @@ def test_pipeline_rejects_loop_touching_an_already_versioned_buffer():
         for nid in ir.tree.blocks()
         if sum(1 for desc in ir.tree.descendants(nid) if isinstance(ir.tree.data(desc), ISANode)) == 1
         and any(
-            isinstance(ir.tree.data(desc), ISANode) and ir.tree.data(desc).op_cls.__name__ == "NKILoad"
+            isinstance(ir.tree.data(desc), ISANode) and ir.tree.isa(desc).op_cls.__name__ == "NKILoad"
             for desc in ir.tree.descendants(nid)
         )
     )

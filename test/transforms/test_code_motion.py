@@ -71,7 +71,7 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
     (span-promotion verifies init-domination). The fold's own enclosing i_d0_0 is
     allowed (init dominates that loop)."""
     fold = block_for_op(state, "NKITensorTensor")
-    fold_block = state.tree.data(fold)
+    fold_block = state.tree.block(fold)
     assert any(iv.axis == "d0" and iv.role == AxisRole.ACCUMULATION for iv in fold_block.iter_vars)
     target_seq = _check_same_loop_prefix(state, fold, matmul_loop(state, "i_d1_1"))
     assert ("i_d0_0", 2) in target_seq, "ko (i_d0_0) must be in the matched prefix (allowed self-domination)"
@@ -118,7 +118,7 @@ def test_code_motion_rejects_lift_that_drops_bound_enclosing_loop():
     memset_d1 = next(
         d
         for d in ir.tree.preorder(memset)
-        if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == "i_d1_0"
+        if isinstance(ir.tree.data(d), ForNode) and ir.tree.loop(d).loop_var == "i_d1_0"
     )
     ir = Split().apply(ir, SplitOption(target_nid=memset_d1, factors=(2, 8), target_axis=None))
     lhs_loops = [d for d in ir.tree.preorder(lhs_load) if isinstance(ir.tree.data(d), ForNode)]
@@ -152,7 +152,7 @@ def test_code_motion_rejects_sinking_writer_under_accumulation_loop():
     memset = block_for_op(ir, "NKIMemset")
     mm = block_for_op(ir, "NKIMatmul")
     kloop = next(
-        d for d in ir.tree.preorder(mm) if isinstance(ir.tree.data(d), ForNode) and ir.tree.data(d).loop_var == "i_d0_0"
+        d for d in ir.tree.preorder(mm) if isinstance(ir.tree.data(d), ForNode) and ir.tree.loop(d).loop_var == "i_d0_0"
     )
     with pytest.raises(TransformLegalityError, match="reorder|dependency"):
         CodeMotion().apply(ir, CodeMotionOption(block_nid=memset, target_loop_nid=kloop, index=0))

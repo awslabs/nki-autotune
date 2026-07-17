@@ -34,7 +34,7 @@ class BufferCompactionOption(TransformOption):
     tensor: str
 
 
-class BufferCompaction(Transform):
+class BufferCompaction(Transform[BufferCompactionOption]):
     """Materialize one buffer's placement, compact shape, and local region frame."""
 
     def analyze(self, ir: KernelIR) -> list[BufferCompactionOption]:

@@ -9,8 +9,8 @@ invalidation churn when transforms move buffers between blocks.
 
 :func:`build_initial_ir` runs dim unification, tree construction, and
 dependency graph construction, then flattens the analysis output onto
-a :class:`KernelIR` instance. :meth:`KernelIR.dump` writes the tree
-and dependency diagrams side-by-side into a cache directory.
+a :class:`KernelIR` instance. :meth:`KernelIR.dump` writes the envelope
+metadata and generated kernel into a cache directory.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from typing import Any
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.dimension_analysis import analyze_dimensions
 from nkigym.ir.tree import BlockNode, Buffer, KernelTree, build_initial_tree
-from nkigym.ir.tree_visualize import dump_tree
 
 
 @dataclass
@@ -82,14 +81,12 @@ class KernelIR:
         raise KeyError(f"no iter_var with axis {axis!r}")
 
     def dump(self, cache_dir: str | Path) -> None:
-        """Write ``envelope.md``, ``tree.*``, ``dependency.*``, and a black-formatted ``kernel.py`` into ``cache_dir``."""
+        """Write ``envelope.md`` and a black-formatted ``kernel.py`` into ``cache_dir``."""
         from nkigym.codegen import render
 
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
         (cache_path / "envelope.md").write_text(self._render_envelope_md(), encoding="utf-8")
-        dump_tree(self.tree, cache_dir)
-        self.dependency.dump(cache_dir)
         kernel_path = cache_path / "kernel.py"
         kernel_path.write_text(render(self), encoding="utf-8")
         subprocess.run(["black", "--quiet", str(kernel_path)], check=True)

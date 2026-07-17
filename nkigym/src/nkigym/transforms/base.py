@@ -14,6 +14,7 @@ Each concrete transform under :mod:`nkigym.transforms` subclasses
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Generic, TypeVar
 
 from nkigym.ir import KernelIR
 
@@ -31,7 +32,10 @@ class TransformLegalityError(ValueError):
     """Raised by :meth:`Transform.apply` when ``option`` is illegal for ``ir``."""
 
 
-class Transform:
+_OptionT = TypeVar("_OptionT", bound=TransformOption)
+
+
+class Transform(Generic[_OptionT]):
     """Base class for stateless rewrite transforms.
 
     Subclasses override :meth:`analyze` and :meth:`apply`. Instances
@@ -39,11 +43,11 @@ class Transform:
     ``ir``'s.
     """
 
-    def analyze(self, ir: KernelIR) -> list[TransformOption]:
+    def analyze(self, ir: KernelIR) -> list[_OptionT]:
         """Return every legal option for this transform on ``ir``."""
         raise NotImplementedError
 
-    def apply(self, ir: KernelIR, option: TransformOption) -> KernelIR:
+    def apply(self, ir: KernelIR, option: _OptionT) -> KernelIR:
         """Re-check legality, deep-copy ``ir``, mutate the copy, return it."""
         raise NotImplementedError
 

@@ -17,7 +17,7 @@ import inspect
 import re
 import sys
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, TextBlock
@@ -206,7 +206,7 @@ def _exec_nkigym_source(source: str) -> Callable[..., np.ndarray]:
     if not callable(func):
         raise ValueError("generated source does not define `f_nkigym`")
     _require_kernel_decorator(source)
-    return func
+    return cast(Callable[..., np.ndarray], func)
 
 
 def _require_kernel_decorator(source: str) -> None:

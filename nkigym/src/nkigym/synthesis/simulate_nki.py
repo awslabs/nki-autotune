@@ -31,7 +31,7 @@ def simulate_fp32(kernel: Callable) -> Callable:
     casts each numpy input tensor to ``np.float32`` before invoking
     ``nki.simulate`` so the simulator sees fp32 end-to-end.
     """
-    func = kernel.func if hasattr(kernel, "func") else kernel
+    func = getattr(kernel, "func", kernel)
     source = textwrap.dedent(inspect.getsource(func))
     for dtype in _FP_DTYPES_NON_FP32:
         source = re.sub(rf"\bnl\.{re.escape(dtype)}\b", "nl.float32", source)

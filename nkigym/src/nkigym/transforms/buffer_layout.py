@@ -31,7 +31,7 @@ class BufferLayoutOption(TransformOption):
     list_len: int
 
 
-class BufferLayout(Transform):
+class BufferLayout(Transform[BufferLayoutOption]):
     """Re-factorize one buffer's tile axis; sets :attr:`Buffer.list_len`."""
 
     def analyze(self, ir: KernelIR) -> list[BufferLayoutOption]:

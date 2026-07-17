@@ -67,9 +67,11 @@ def test_reorder_renders_and_passes_numerics(tmp_path) -> None:
     """Reordering a split loop pair preserves rendered-kernel behavior."""
     ir = build_canonical_ir()
     target, _inner = _first_two_adjacent_fors(ir)
-    extent = ir.tree.data(target).extent
+    extent = ir.tree.loop(target).extent
     split = Split().apply(ir, SplitOption(target_nid=target, factors=(2, extent // 2)))
-    outer = split.tree.children(ir.tree.parent(target))[0]
+    target_parent = ir.tree.parent(target)
+    assert target_parent is not None
+    outer = split.tree.children(target_parent)[0]
     inner = split.tree.children(outer)[0]
     reordered = Reorder().apply(split, ReorderOption(outer_nid=outer, inner_nid=inner))
     assert_matmul_ir_simulates(reordered, tmp_path, "reorder_split_loop")
@@ -178,23 +180,23 @@ def test_reorder_matches_tvm_structure():
     mm = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
     enclosing = enclosing_for_nids(ir, mm, "i_d")
-    before_order = [(ir.tree.data(n).loop_var, ir.tree.data(n).extent) for n in enclosing]
+    before_order = [(ir.tree.loop(n).loop_var, ir.tree.loop(n).extent) for n in enclosing]
     assert before_order == [("i_d0_0", 16), ("i_d1_0", 16), ("i_d2_0", 4)]
 
     """Swap the adjacent d1/d2 pair (both PARALLEL); d1 is the outer of the pair."""
-    d1 = next(n for n in enclosing if ir.tree.data(n).loop_var == "i_d1_0")
-    d2 = next(n for n in enclosing if ir.tree.data(n).loop_var == "i_d2_0")
+    d1 = next(n for n in enclosing if ir.tree.loop(n).loop_var == "i_d1_0")
+    d2 = next(n for n in enclosing if ir.tree.loop(n).loop_var == "i_d2_0")
     out = Reorder().apply(ir, ReorderOption(outer_nid=d1, inner_nid=d2))
 
     out_mm = next(
         n
         for n in out.tree.preorder()
-        if isinstance(out.tree.data(n), ISANode) and out.tree.data(n).op_cls.__name__ == "NKIMatmul"
+        if isinstance(out.tree.data(n), ISANode) and out.tree.isa(n).op_cls.__name__ == "NKIMatmul"
     )
-    our_extents = [out.tree.data(n).extent for n in enclosing_for_nids(out, out_mm, "i_d")]
+    our_extents = [out.tree.loop(n).extent for n in enclosing_for_nids(out, out_mm, "i_d")]
 
     """TVM reorders the equivalent [16, 16, 4] nest, placing original loop 2 (d2)
     before original loop 1 (d1): new outer->inner order = [d0, d2, d1]."""

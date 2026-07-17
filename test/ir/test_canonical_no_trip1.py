@@ -12,9 +12,9 @@ def test_canonical_has_no_trip1_loops():
     (pure tensorize_size on the access)."""
     ir = build_canonical_ir()
     trip1 = [
-        ir.tree.data(n).loop_var
+        ir.tree.loop(n).loop_var
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ForNode) and ir.tree.data(n).extent == 1
+        if isinstance(ir.tree.data(n), ForNode) and ir.tree.loop(n).extent == 1
     ]
     assert trip1 == [], f"canonical still emits trip-1 loops: {trip1}"
 
@@ -28,8 +28,8 @@ def test_canonical_load_d1_is_loopless_full_width():
     load = next(
         n
         for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.data(n).op_cls.__name__ == "NKILoad"
+        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKILoad"
     )
     """Only the d0 (K) loop encloses the load leaf; no d1 loop."""
-    loops = [ir.tree.data(a).loop_var for a in ir.tree.ancestors(load) if isinstance(ir.tree.data(a), ForNode)]
+    loops = [ir.tree.loop(a).loop_var for a in ir.tree.ancestors(load) if isinstance(ir.tree.data(a), ForNode)]
     assert loops == ["i_d0_0"], loops

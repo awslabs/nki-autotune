@@ -278,5 +278,5 @@ def nkigym_kernel(func: Callable[..., Any]) -> Callable[..., Any]:
             )
         return result
 
-    wrapper.__nkigym_kernel__ = True
+    setattr(wrapper, "__nkigym_kernel__", True)
     return wrapper

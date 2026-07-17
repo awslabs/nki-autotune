@@ -75,9 +75,9 @@ def _all_enclosing_loops_of_block(tree: KernelTree, block_nid: int) -> list[tupl
     a dim the block DOES bind that happens to sit above an intervening block.
     """
     return [
-        (tree.data(anc).loop_var, tree.data(anc).extent)
+        (node.loop_var, node.extent)
         for anc in tree.ancestors(block_nid)
-        if isinstance(tree.data(anc), ForNode)
+        if isinstance((node := tree.data(anc)), ForNode)
     ]
 
 

@@ -16,6 +16,8 @@ from nkigym.synthesis.simulate_nki import simulate_fp32
 
 def _load_module_from_path(path: str):
     spec = importlib.util.spec_from_file_location("dumped_kernel", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load generated module {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

@@ -87,7 +87,7 @@ def test_psum_hoist_descends_and_compacts() -> None:
     """The psum allocation descends and compacts at ladder rung 12."""
     ir = build_ladder_state(12)
     declarations = {
-        buffer.name: (nid, buffer) for nid in ir.tree.blocks() for buffer in ir.tree.data(nid).alloc_buffers
+        buffer.name: (nid, buffer) for nid in ir.tree.blocks() for buffer in ir.tree.block(nid).alloc_buffers
     }
     nid, buffer = declarations["psum_prod"]
     assert nid != ir.tree.root

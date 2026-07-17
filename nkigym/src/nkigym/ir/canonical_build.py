@@ -195,10 +195,12 @@ def _build_region(
 
         """Partition axis (axis 0) of SBUF/PSUM operands: tile is 128, lo is bare Var (not multiplied)."""
         if axis_index == 0 and tensor_location in ("sbuf", "psum") and extent_per_tile == PARTITION_DIM and looped:
+            assert loop_var is not None
             ranges.append((Var(name=loop_var), Const(value=PARTITION_DIM)))
         elif not looped:
             ranges.append((Const(value=0), Const(value=extent_per_tile)))
         else:
+            assert loop_var is not None
             lo = Mul(left=Var(name=loop_var), right=Const(value=extent_per_tile))
             ranges.append((lo, Const(value=extent_per_tile)))
     return BufferRegion(tensor=tensor_name, ranges=tuple(ranges))

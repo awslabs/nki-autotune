@@ -101,6 +101,7 @@ def test_step_matches_direct_transform_apply() -> None:
     split_actions = [(tr, opt) for tr, opt in actions if isinstance(tr, Split)]
     assert split_actions, "expected at least one Split action on the canonical IR"
     transform, option = split_actions[0]
+    assert isinstance(option, SplitOption)
     via_step = env.step(state, (transform, option))
     via_apply = transform.apply(state, option)
     assert _trees_structurally_equal(via_step, via_apply)

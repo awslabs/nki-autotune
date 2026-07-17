@@ -37,8 +37,8 @@ def test_normalize_renames_dense():
     """Two d1 loops named i_d1_0_0/i_d1_0_1 -> dense i_d1_0/i_d1_1."""
     tree, bnid, outer, inner, leaf = _two_loop_d1_block()
     normalize_block(tree, bnid)
-    assert tree.data(outer).loop_var == "i_d1_0"
-    assert tree.data(inner).loop_var == "i_d1_1"
+    assert tree.loop(outer).loop_var == "i_d1_0"
+    assert tree.loop(inner).loop_var == "i_d1_1"
 
 
 def test_normalize_drops_trip1():
@@ -53,6 +53,6 @@ def test_normalize_drops_trip1():
     """trip-1 gone; leaf now child of the real loop."""
     from nkigym.ir.tree import ForNode as FN
 
-    remaining = [tree.data(n).loop_var for n in tree.preorder(bnid) if isinstance(tree.data(n), FN)]
+    remaining = [tree.loop(n).loop_var for n in tree.preorder(bnid) if isinstance(tree.data(n), FN)]
     assert remaining == ["i_d0_0"]
     assert tree.parent(leaf) == real

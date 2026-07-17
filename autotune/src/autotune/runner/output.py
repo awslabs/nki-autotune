@@ -236,7 +236,11 @@ def write_results_json(cache_dir: str, num_kernels: int, results: list[ProfileRe
         if not hw_ok and "Out of memory in psum" in r.hardware_output:
             psum_oom += 1
 
-    successes = [(r, extracted[r.kernel_name]) for r in results if extracted[r.kernel_name][0] is not None]
+    successes: list[tuple[ProfileResult, tuple[float, float | None, float | None, float | None]]] = []
+    for result in results:
+        total_s, mfu, mbu, ceiling = extracted[result.kernel_name]
+        if total_s is not None:
+            successes.append((result, (total_s, mfu, mbu, ceiling)))
     times = [e[0] for _, e in successes]
     mfus = [e[1] for _, e in successes if e[1] is not None]
     mbus = [e[2] for _, e in successes if e[2] is not None]

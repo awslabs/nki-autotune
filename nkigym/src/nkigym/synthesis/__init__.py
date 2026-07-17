@@ -11,6 +11,7 @@ from typing import Any
 
 from nkigym.synthesis.simulate_nki import simulate_fp32
 
+compile_numpy_to_nkigym: Any
 __all__ = ["compile_numpy_to_nkigym", "simulate_fp32"]
 
 

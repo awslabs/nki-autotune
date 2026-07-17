@@ -14,6 +14,7 @@ from nkigym.transforms._normalize import _dim_from_loopvar, normalize_block
 from nkigym.transforms._tile_region import retile_region
 from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.split import _current_tensorize_width
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,7 @@ class FuseOption(TransformOption):
     target_axis: str | None = None
 
 
-class Fuse(Transform):
+class Fuse(Transform[FuseOption]):
     """Collapse a parent->child chain of same-loop-axis entries into one."""
 
     def analyze(self, ir: KernelIR) -> list[FuseOption]:
@@ -92,9 +93,10 @@ class Fuse(Transform):
             _check_no_partial_loop_dependence(ir.tree, option.target_nids)
         else:
             """Tensorize flavour: prefix is ForNodes; last is the ISA leaf."""
-            if not isinstance(nodes[-1], ISANode):
+            leaf = nodes[-1]
+            if not isinstance(leaf, ISANode):
                 raise TransformLegalityError(
-                    f"Fuse tensorize flavour: last target must be ISANode; got {type(nodes[-1]).__name__}"
+                    f"Fuse tensorize flavour: last target must be ISANode; got {type(leaf).__name__}"
                 )
             for n in nodes[:-1]:
                 if not isinstance(n, ForNode):
@@ -107,6 +109,21 @@ class Fuse(Transform):
                     raise TransformLegalityError(
                         f"Fuse tensorize flavour: nid {parent_nid} must have a single child {child_nid}; got {kids}"
                     )
+            _block_nid, block = _find_enclosing_block(ir.tree, option.target_nids[-1])
+            current_width = _current_tensorize_width(leaf, block, option.target_axis)
+            if current_width is None:
+                raise TransformLegalityError(
+                    f"Fuse.target_axis={option.target_axis!r}: no tensorize width on this leaf"
+                )
+            inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+            abstract_axis = inverse_axis_map.get(option.target_axis)
+            max_tile = leaf.op_cls.MAX_TILE_SIZE.get(abstract_axis) if abstract_axis is not None else None
+            absorbed_extent = prod(ir.tree.loop(nid).extent for nid in option.target_nids[:-1])
+            fused_width = current_width * absorbed_extent
+            if max_tile is not None and fused_width > max_tile:
+                raise TransformLegalityError(
+                    f"Fuse.target_axis={option.target_axis!r}: fused tile {fused_width} > MAX_TILE_SIZE {max_tile}"
+                )
 
     def _is_legal(self, ir: KernelIR, option: FuseOption) -> bool:
         """Return whether ``option`` passes the same checks used by :meth:`apply`."""
@@ -131,7 +148,7 @@ class Fuse(Transform):
         parent_nid = ir.tree.parent(nids[0])
         assert parent_nid is not None
         deepest_kids = ir.tree.children(nids[-1])
-        new_extent = prod(ir.tree.data(nid).extent for nid in nids)
+        new_extent = prod(ir.tree.loop(nid).extent for nid in nids)
         block_nid, _block = _find_enclosing_block(ir.tree, nids[0])
 
         new_nid = ir.tree.add_node(ForNode(loop_var=f"{first.loop_var}__fused", extent=new_extent), parent=None)
@@ -164,12 +181,13 @@ class Fuse(Transform):
         assert chain_root_parent is not None
         block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
 
-        absorbed_extent = prod(ir.tree.data(nid).extent for nid in for_chain)
+        absorbed_extent = prod(ir.tree.loop(nid).extent for nid in for_chain)
         for nid in for_chain:
             ir.tree.graph.remove_node(nid)
         ir.tree.graph.add_edge(chain_root_parent, leaf_nid)
 
         inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+        assert option.target_axis is not None
         abstract_axis = inverse_axis_map.get(option.target_axis)
 
         def _widen(lo: Expr, width: int) -> tuple[Expr, int]:
@@ -221,7 +239,7 @@ def _check_no_partial_loop_dependence(tree: KernelTree, target_nids: tuple[int, 
     modulo to recover the omitted loop positions. ``normalize_block`` cannot
     represent that mapping and would otherwise silently drop the access offset.
     """
-    target_vars = {tree.data(nid).loop_var for nid in target_nids}
+    target_vars = {tree.loop(nid).loop_var for nid in target_nids}
     for nid in tree.preorder(target_nids[0]):
         for expression in _binding_and_access_offsets(tree.data(nid)):
             used = {name for name in to_affine(expression) if name is not None} & target_vars
