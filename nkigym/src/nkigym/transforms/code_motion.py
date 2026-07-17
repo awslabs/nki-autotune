@@ -21,11 +21,11 @@ import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.dependency import Dependency
+from nkigym.ir.dependency import Dependency, _access_invariant_across, _leaf_operand_regions, _tensor_carried_across
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
 from nkigym.transforms._domain_solve import _enclosing_block
-from nkigym.transforms._normalize import normalize_block
+from nkigym.transforms._normalize import _iter_value_loopvars, normalize_block
 from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
@@ -144,6 +144,20 @@ def _check_same_loop_prefix(ir: KernelIR, block_nid: int, target_loop_nid: int) 
     """
     target_seq = _target_loop_seq(ir.tree, target_loop_nid)
     moved_seq = _moved_loop_seq(ir.tree, block_nid)
+    block = ir.tree.data(block_nid)
+    assert isinstance(block, BlockNode)
+    bound_vars = _iter_value_loopvars(block)
+    target_vars = {loop_var for loop_var, _extent in target_seq}
+    lost_enclosing: list[str] = []
+    for ancestor in ir.tree.ancestors(block_nid):
+        node = ir.tree.data(ancestor)
+        if isinstance(node, ForNode) and node.loop_var in bound_vars and node.loop_var not in target_vars:
+            lost_enclosing.append(node.loop_var)
+    if lost_enclosing:
+        raise TransformLegalityError(
+            f"move(block={block_nid} under loop={target_loop_nid}) would detach the block "
+            f"from enclosing loop(s) {lost_enclosing} that bind its iter_values"
+        )
     moved_vars = {lv for lv, _e in moved_seq}
     dep_target = [(lv, e) for lv, e in target_seq if lv in moved_vars]
     if dep_target != moved_seq[: len(dep_target)]:
@@ -186,6 +200,130 @@ def _check_no_reduction_replicated(ir: KernelIR, block_nid: int, target_loop_nid
         )
 
 
+def _crossed_execution_loops(ir: KernelIR, block_nid: int, target_loop_nid: int) -> list[int]:
+    """Return loops added to or removed from the moved leaf's execution scope."""
+    tree = ir.tree
+    leaf = ir.dependency._resolve(block_nid)
+    old_loops = [nid for nid in tree.ancestors(leaf) if isinstance(tree.data(nid), ForNode)]
+    local_loops = [nid for nid in old_loops if block_nid in tree.ancestors(nid)]
+    target_loops = [
+        nid for nid in [*tree.ancestors(target_loop_nid), target_loop_nid] if isinstance(tree.data(nid), ForNode)
+    ]
+    moved_vars = {tree.data(nid).loop_var for nid in old_loops}
+    covered_prefix = sum(1 for nid in target_loops if tree.data(nid).loop_var in moved_vars)
+    enclosing_count = len(old_loops) - len(local_loops)
+    local_prefix_drop = max(0, covered_prefix - enclosing_count)
+    new_loops = [*target_loops, *local_loops[local_prefix_drop:]]
+
+    unmatched_new = list(new_loops)
+    crossed: list[int] = []
+    for old_nid in old_loops:
+        match = next((index for index, new_nid in enumerate(unmatched_new) if new_nid == old_nid), None)
+        if match is None:
+            crossed.append(old_nid)
+        else:
+            unmatched_new.pop(match)
+    crossed.extend(unmatched_new)
+    return crossed
+
+
+def _plain_written_tensors(node: ISANode) -> set[str]:
+    """Return tensors written by output operands that are not read-modify-write."""
+    input_slots = getattr(node.op_cls, "INPUT_OPERANDS", frozenset())
+    return {
+        region.tensor
+        for slot, region in node.operand_bindings.items()
+        if slot not in input_slots and slot not in node.op_cls.RMW_OPERANDS
+    }
+
+
+def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_nid: int) -> None:
+    """Reject changing a plain reset's frequency relative to an invariant RMW.
+
+    A plain write followed by an RMW of the same region is its reset. Moving that
+    writer or the RMW across a loop where both accesses are invariant changes a
+    per-iteration reset into a loop-carried accumulator, or the reverse, without
+    reversing any dependency edge.
+    """
+    tree = ir.tree
+    moved_leaf = ir.dependency._resolve(block_nid)
+    moved_node = tree.data(moved_leaf)
+    assert isinstance(moved_node, ISANode)
+    plain_writes = _plain_written_tensors(moved_node)
+    crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid)
+    if plain_writes:
+        for _producer, consumer, attrs in ir.dependency.graph.out_edges(moved_leaf, data=True):
+            tensor = attrs.get("tensor")
+            if tensor not in plain_writes or not _leaf_operand_regions(tree, consumer, tensor, rmw_only=True):
+                continue
+            for loop_nid in crossed_loops:
+                loop = tree.data(loop_nid)
+                assert isinstance(loop, ForNode)
+                if consumer not in tree.descendants(loop_nid):
+                    continue
+                if not _access_invariant_across(tree, moved_leaf, loop.loop_var, tensor):
+                    continue
+                if not _access_invariant_across(tree, consumer, loop.loop_var, tensor):
+                    continue
+                raise TransformLegalityError(
+                    f"move(block={block_nid} under loop={target_loop_nid}) changes reset "
+                    f"frequency for tensor {tensor!r} across read-modify-write loop "
+                    f"{loop_nid} ({loop.loop_var!r})"
+                )
+
+    rmw_tensors = {
+        region.tensor for slot, region in moved_node.operand_bindings.items() if slot in moved_node.op_cls.RMW_OPERANDS
+    }
+    for producer, _consumer, attrs in ir.dependency.graph.in_edges(moved_leaf, data=True):
+        tensor = attrs.get("tensor")
+        producer_node = tree.data(producer)
+        assert isinstance(producer_node, ISANode)
+        if tensor not in rmw_tensors or tensor not in _plain_written_tensors(producer_node):
+            continue
+        for loop_nid in crossed_loops:
+            loop = tree.data(loop_nid)
+            assert isinstance(loop, ForNode)
+            if producer not in tree.descendants(loop_nid):
+                continue
+            if not _access_invariant_across(tree, producer, loop.loop_var, tensor):
+                continue
+            if not _access_invariant_across(tree, moved_leaf, loop.loop_var, tensor):
+                continue
+            raise TransformLegalityError(
+                f"move(block={block_nid} under loop={target_loop_nid}) changes reset "
+                f"frequency for tensor {tensor!r} across read-modify-write loop "
+                f"{loop_nid} ({loop.loop_var!r})"
+            )
+
+
+def _check_no_consumer_hoisted_out_of_producer_loop(ir: KernelIR, block_nid: int, target_loop_nid: int) -> None:
+    """Reject hoisting a consumer away from a repeated invariant producer."""
+    tree = ir.tree
+    moved_leaf = ir.dependency._resolve(block_nid)
+    old_loops = set(tree.ancestors(moved_leaf))
+    crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid)
+    for producer, _consumer, attrs in ir.dependency.graph.in_edges(moved_leaf, data=True):
+        tensor = attrs.get("tensor")
+        if tensor is None:
+            continue
+        for loop_nid in crossed_loops:
+            if loop_nid not in old_loops or producer not in tree.descendants(loop_nid):
+                continue
+            loop = tree.data(loop_nid)
+            assert isinstance(loop, ForNode)
+            if _tensor_carried_across(tree, loop_nid, tensor):
+                continue
+            if not _access_invariant_across(tree, producer, loop.loop_var, tensor):
+                continue
+            if not _access_invariant_across(tree, moved_leaf, loop.loop_var, tensor):
+                continue
+            raise TransformLegalityError(
+                f"move(block={block_nid} under loop={target_loop_nid}) changes consumer "
+                f"execution scope relative to producer {producer} for invariant tensor "
+                f"{tensor!r} across loop {loop_nid} ({loop.loop_var!r})"
+            )
+
+
 def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> None:
     """Raise TransformLegalityError if the proposed move would make any
     dependency edge incident to the moved block point backward.
@@ -217,7 +355,35 @@ def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop
             f"edge {a}->{b} backward (a carried buffer's init/drain cannot enter its "
             f"reduction loop, nor a consumer precede its producer)"
         )
+    _check_no_rmw_reset_scope_change(ir, block_nid, target_loop_nid)
+    _check_no_consumer_hoisted_out_of_producer_loop(ir, block_nid, target_loop_nid)
     return result
+
+
+def _check_versioned_pipeline_boundary(ir: KernelIR, block_nid: int, target_loop_nid: int) -> None:
+    """Reject moving a multi-version buffer access into or out of a pipeline loop."""
+    touched: set[str] = set()
+    for nid in [block_nid, *ir.tree.descendants(block_nid)]:
+        node = ir.tree.data(nid)
+        if isinstance(node, ISANode):
+            touched.update(region.tensor for region in node.operand_bindings.values())
+    versioned = {name for name in touched if ir.buffer(name).versions > 1}
+    if not versioned:
+        return
+    old_ancestors = set(ir.tree.ancestors(block_nid))
+    new_ancestors = set(ir.tree.ancestors(target_loop_nid)) | {target_loop_nid}
+    for owner_nid in ir.tree.blocks():
+        owner = ir.tree.data(owner_nid)
+        assert isinstance(owner, BlockNode)
+        annotation = owner.annotations.get("software_pipeline")
+        if annotation is None:
+            continue
+        pipeline_loop = annotation["loop_nid"]
+        if (pipeline_loop in old_ancestors) != (pipeline_loop in new_ancestors):
+            raise TransformLegalityError(
+                f"move(block={block_nid} under loop={target_loop_nid}) crosses software pipeline "
+                f"loop {pipeline_loop} while touching versioned buffer(s) {sorted(versioned)}"
+            )
 
 
 def _splice_under_target(tree: KernelTree, block_nid: int, target_loop_nid: int, index: int) -> None:
@@ -336,6 +502,7 @@ class CodeMotion(Transform):
                 f"target_loop_nid={option.target_loop_nid} is a descendant of moved block "
                 f"{option.block_nid} (cannot move under its own loop)"
             )
+        _check_versioned_pipeline_boundary(ir, option.block_nid, option.target_loop_nid)
         _check_move_preserves_dependencies(ir, option.block_nid, option.target_loop_nid, option.index)
 
 

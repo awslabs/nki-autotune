@@ -34,8 +34,6 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 
-from autotune.runner.api import profile
-from autotune.runner.types import KernelJob
 from nkigym.synthesis import simulate_fp32
 
 K, M, N = 2048, 2048, 2048
@@ -1686,6 +1684,8 @@ AFTER (two-stage):
         drain_two_stage_0()
     drain_two_stage_1()
 """
+
+
 @nki.jit
 def kernel_33(lhs_T, rhs):
     assert lhs_T.shape == (2048, 2048)
@@ -1794,6 +1794,9 @@ def _profile_on_hw(names: list[str], cache_dir: str) -> None:
     (hand-placed PSUM). Kernels that fail to compile or run on HW are reported in
     the profile failure summary and do NOT abort — only CPU-sim divergence does.
     """
+    from autotune.runner.api import profile
+    from autotune.runner.types import KernelJob
+
     jobs: dict[str, KernelJob] = {
         name: KernelJob(
             source=_kernel_source(name),

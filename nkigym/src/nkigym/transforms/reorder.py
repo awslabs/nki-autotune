@@ -6,9 +6,9 @@ import copy
 from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Var
+from nkigym.ir.arith.expr import Var, to_affine
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import BlockNode, ForNode, KernelTree, role_of
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, KernelTree, role_of
 from nkigym.ops.base import AxisRole
 from nkigym.transforms._normalize import normalize_block
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
@@ -109,6 +109,7 @@ class Reorder(Transform):
                     raise TransformLegalityError(
                         f"Reorder rejected: descendant block has SEQUENTIAL role on loop_var {loop_var!r}"
                     )
+        _check_internal_dependency_accesses(ir, option, outer_loop_var, inner_loop_var)
 
 
 def _axis_for_loop_var(block: BlockNode, loop_var: str) -> str | None:
@@ -117,6 +118,46 @@ def _axis_for_loop_var(block: BlockNode, loop_var: str) -> str | None:
         if isinstance(value, Var) and value.name == loop_var:
             return iv.axis
     return None
+
+
+def _check_internal_dependency_accesses(
+    ir: KernelIR, option: ReorderOption, outer_loop_var: str, inner_loop_var: str
+) -> None:
+    """Reject interchange that changes which iteration satisfies an internal dependency.
+
+    For a dependency whose endpoints are both inside the inner loop, each
+    endpoint must agree on whether the dependent tensor is indexed by each
+    swapped loop. A mismatch means the value is carried between iterations of
+    that loop. Interchanging the loops can then place another outer-loop
+    iteration between the producer and consumer.
+    """
+    subtree = ir.tree.descendants(option.inner_nid)
+    for producer, consumer, attrs in ir.dependency.graph.edges(data=True):
+        if producer not in subtree or consumer not in subtree:
+            continue
+        tensor = attrs.get("tensor")
+        kind = attrs.get("kind")
+        if tensor is None or kind not in {"RAW", "WAR", "WAW"}:
+            continue
+        producer_side = "write" if kind in {"RAW", "WAW"} else "read"
+        consumer_side = "read" if kind == "RAW" else "write"
+        producer_regions = ir.dependency._regions_for(producer, tensor, producer_side)
+        consumer_regions = ir.dependency._regions_for(consumer, tensor, consumer_side)
+        for loop_var in (outer_loop_var, inner_loop_var):
+            producer_invariant = _regions_invariant(producer_regions, loop_var)
+            consumer_invariant = _regions_invariant(consumer_regions, loop_var)
+            if producer_invariant != consumer_invariant:
+                raise TransformLegalityError(
+                    f"Reorder rejected: dependency {producer}->{consumer} on tensor {tensor!r} "
+                    f"has different dependence on loop_var {loop_var!r} at its endpoints"
+                )
+
+
+def _regions_invariant(regions: tuple[BufferRegion, ...], loop_var: str) -> bool:
+    """Return whether every region offset is invariant in ``loop_var``."""
+    return bool(regions) and not any(
+        loop_var in to_affine(lower) for region in regions for lower, _width in region.ranges
+    )
 
 
 def _dim_of(tree: KernelTree, loop_nid: int) -> str:

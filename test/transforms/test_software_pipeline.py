@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
-import importlib.util
-import os
-import tempfile
+from test._simulation import assert_matmul_ir_simulates
+from test.transforms._fixtures import build_canonical_ir
+from test.transforms._pipeline_fixtures import m_loop_and_children, tuned_ir
 
-import numpy as np
 import pytest
 
-from nkigym.codegen import render
-from nkigym.synthesis.simulate_nki import simulate_fp32
-from nkigym.transforms import SoftwarePipeline, SoftwarePipelineOption, TransformLegalityError
-from test.transforms._pipeline_fixtures import m_loop_and_children, tuned_ir
+from nkigym.ir.tree import ISANode
+from nkigym.transforms import (
+    BufferLayout,
+    BufferLayoutOption,
+    CodeMotion,
+    CodeMotionOption,
+    Fuse,
+    FuseOption,
+    Reorder,
+    ReorderOption,
+    SoftwarePipeline,
+    SoftwarePipelineOption,
+    Split,
+    SplitOption,
+    TransformLegalityError,
+)
 
 
 def test_analyze_enumerates_nondecreasing_labelings():
@@ -56,23 +67,81 @@ def test_apply_rejects_duplicate_order():
         SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 1)))
 
 
-def test_increment1_sim_matches_numpy():
+def test_analyze_omits_pipeline_that_would_version_a_list_buffer():
+    """Pipeline analysis excludes options that would multi-version a listed buffer."""
+    ir = tuned_ir()
+    object.__setattr__(ir.buffer("psum_prod"), "shape", (2048, 2048))
+    m_loop, _children = m_loop_and_children(ir)
+    listed_ir = BufferLayout().apply(ir, BufferLayoutOption(tensor="psum_prod", list_len=16))
+    option = SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2))
+    assert option not in SoftwarePipeline().analyze(listed_ir)
+
+
+def test_apply_rejects_pipeline_that_would_version_a_list_buffer():
+    """Direct apply rejects an option that would multi-version a listed buffer."""
+    ir = tuned_ir()
+    object.__setattr__(ir.buffer("psum_prod"), "shape", (2048, 2048))
+    m_loop, _children = m_loop_and_children(ir)
+    listed_ir = BufferLayout().apply(ir, BufferLayoutOption(tensor="psum_prod", list_len=16))
+    option = SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2))
+    with pytest.raises(TransformLegalityError):
+        SoftwarePipeline().apply(listed_ir, option)
+
+
+def test_pipeline_rejects_partial_version_write_with_wider_read():
+    """A pipeline version cannot be read beyond the slice written in that iteration."""
+    ir = build_canonical_ir()
+    trace = (
+        (Split(), SplitOption(target_nid=8, factors=(8, 2), target_axis=None)),
+        (Split(), SplitOption(target_nid=5, factors=(2, 8), target_axis=None)),
+        (Split(), SplitOption(target_nid=17, factors=(4, 512), target_axis="d2")),
+        (Split(), SplitOption(target_nid=21, factors=(4, 2), target_axis=None)),
+        (BufferLayout(), BufferLayoutOption(tensor="psum_prod", list_len=4)),
+        (CodeMotion(), CodeMotionOption(block_nid=18, target_loop_nid=25, index=1)),
+        (Split(), SplitOption(target_nid=20, factors=(4, 512), target_axis="d2")),
+        (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=26, index=1)),
+        (Split(), SplitOption(target_nid=12, factors=(2, 2, 4), target_axis=None)),
+        (BufferLayout(), BufferLayoutOption(tensor="sbuf_rhs", list_len=8)),
+        (Split(), SplitOption(target_nid=24, factors=(2, 4), target_axis=None)),
+        (Split(), SplitOption(target_nid=3, factors=(2, 8, 128), target_axis="d1")),
+        (Reorder(), ReorderOption(outer_nid=29, inner_nid=30)),
+        (Split(), SplitOption(target_nid=2, factors=(2, 2, 4), target_axis=None)),
+        (Fuse(), FuseOption(target_nids=(23, 32, 33), target_axis=None)),
+        (Fuse(), FuseOption(target_nids=(30, 31), target_axis=None)),
+    )
+    for transform, transform_option in trace:
+        ir = transform.apply(ir, transform_option)
+    option = SoftwarePipelineOption(loop_nid=25, stages=(0, 1), order=(0, 1))
+    with pytest.raises(TransformLegalityError):
+        SoftwarePipeline().apply(ir, option)
+    assert option not in SoftwarePipeline().analyze(ir)
+
+
+def test_pipeline_rejects_loop_touching_an_already_versioned_buffer():
+    """A nested pipeline cannot replace an existing buffer's rotation variable."""
+    ir = tuned_ir()
+    outer_loop, outer_children = m_loop_and_children(ir)
+    ir = SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=outer_loop, stages=(0, 0, 1), order=(0, 1, 2)))
+    load_block = next(
+        nid
+        for nid in ir.tree.blocks()
+        if sum(1 for desc in ir.tree.descendants(nid) if isinstance(ir.tree.data(desc), ISANode)) == 1
+        and any(
+            isinstance(ir.tree.data(desc), ISANode) and ir.tree.data(desc).op_cls.__name__ == "NKILoad"
+            for desc in ir.tree.descendants(nid)
+        )
+    )
+    inner_loop = outer_children[1]
+    ir = CodeMotion().apply(ir, CodeMotionOption(block_nid=load_block, target_loop_nid=inner_loop, index=0))
+    option = SoftwarePipelineOption(loop_nid=inner_loop, stages=(0, 1), order=(0, 1))
+    with pytest.raises(TransformLegalityError):
+        SoftwarePipeline().apply(ir, option)
+    assert option not in SoftwarePipeline().analyze(ir)
+
+
+def test_increment1_sim_matches_numpy(tmp_path) -> None:
     """The pipelined kernel computes lhs_T.T @ rhs (fp32 CPU sim)."""
     ir = tuned_ir()
     m_loop, _children = m_loop_and_children(ir)
     new_ir = SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2)))
-    source = render(new_ir)
-    rng = np.random.default_rng(0)
-    inputs = {
-        "lhs_T": rng.standard_normal((2048, 2048)).astype(np.float32),
-        "rhs": rng.standard_normal((2048, 2048)).astype(np.float32),
-    }
-    expected = inputs["lhs_T"].T @ inputs["rhs"]
-    scratch = os.path.join(tempfile.gettempdir(), "sp_sim_scratch.py")
-    with open(scratch, "w", encoding="utf-8") as handle:
-        handle.write(source)
-    spec = importlib.util.spec_from_file_location("sp_dumped", scratch)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    actual = np.asarray(simulate_fp32(module.nki_f_nkigym)(**inputs))
-    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+    assert_matmul_ir_simulates(new_ir, tmp_path, "software_pipeline")
