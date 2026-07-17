@@ -53,8 +53,7 @@ class RFactor(Transform):
     """One-stage → two-stage accumulation: per-``ko`` PSUM partial + SBUF fold."""
 
     def analyze(self, ir: KernelIR) -> list[RFactorOption]:
-        """Enumerate every ForNode that binds an ACCUMULATION axis of an
-        rfactorable op (RFACTOR_RECIPE not None)."""
+        """Enumerate every fully legal ACCUMULATION loop of an rfactorable op."""
         options: list[RFactorOption] = []
         for nid in ir.tree.preorder():
             if not isinstance(ir.tree.data(nid), ForNode):
@@ -71,22 +70,110 @@ class RFactor(Transform):
         return new_ir
 
     def _rfactorable(self, ir: KernelIR, loop_nid: int) -> bool:
-        """True iff ``loop_nid`` binds an ACCUMULATION axis whose owning op
-        declares RFACTOR_RECIPE='rmw' and a REDUCE_COMBINATOR."""
+        """True iff ``loop_nid`` is the outermost ACCUMULATION loop of an op
+        with RFACTOR_RECIPE='rmw', a removable drain, and sufficient output."""
         leaf = self._owning_matmul_leaf(ir, loop_nid)
         result = False
         if leaf is not None:
             op_cls = ir.tree.data(leaf).op_cls
             block = self._enclosing_block(ir, leaf)
             axis = self._loop_axis(ir, loop_nid, block)
+            axis_loops: list[int] = []
+            if axis is not None:
+                binding_vars = self._axis_binding_loopvars(block, axis)
+                axis_loops = [
+                    nid
+                    for nid in ir.tree.ancestors(leaf)
+                    if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in binding_vars
+                ]
             if (
                 op_cls.RFACTOR_RECIPE == "rmw"
                 and op_cls.REDUCE_COMBINATOR is not None
                 and axis is not None
                 and self._role_of(block, axis) == AxisRole.ACCUMULATION
+                and axis_loops
+                and axis_loops[0] == loop_nid
+                and self._drain_block_is_removable(ir, leaf)
+                and self._gadget_region_fits_output(ir, loop_nid, leaf)
             ):
                 result = True
         return result
+
+    def _drain_block_is_removable(self, ir: KernelIR, matmul_leaf: int) -> bool:
+        """Return whether removing the PSUM drain block deletes only its copy leaf."""
+        matmul = ir.tree.data(matmul_leaf)
+        assert isinstance(matmul, ISANode)
+        psum_name = matmul.operand_bindings["dst"].tensor
+        drains: list[int] = []
+        for nid in ir.tree.preorder():
+            node = ir.tree.data(nid)
+            if (
+                isinstance(node, ISANode)
+                and node.op_cls.NAME == "tensor_copy"
+                and node.operand_bindings["src"].tensor == psum_name
+            ):
+                drains.append(nid)
+        result = False
+        if len(drains) == 1:
+            drain_block = self._enclosing_block_nid(ir.tree, drains[0])
+            leaves = [nid for nid in ir.tree.preorder(drain_block) if isinstance(ir.tree.data(nid), ISANode)]
+            result = leaves == drains
+        return result
+
+    def _gadget_region_fits_output(self, ir: KernelIR, loop_nid: int, matmul_leaf: int) -> bool:
+        """Return whether the generated gadget region fits the logical output shape.
+
+        RFactor derives its partition offset and absorbed free-axis span from the
+        matmul accumulator, then uses that region for the compacted output and the
+        staging buffer. Check the full affine region over every enclosing loop.
+        List layout and pipeline versions do not increase ``shape`` capacity.
+        """
+        ki_nid = self._ki_loop_nid(ir, loop_nid)
+        matmul = ir.tree.data(matmul_leaf)
+        assert isinstance(matmul, ISANode)
+        psum_name = matmul.operand_bindings["dst"].tensor
+        out_name = self._drain_out_tensor(ir.tree, psum_name)
+        out_buf = ir.buffer(out_name)
+        dst_region = matmul.operand_bindings["dst"]
+        region = self._partition_region(
+            out_name,
+            dst_region.ranges[0][0],
+            self._gadget_free_lo(ir, ki_nid, matmul_leaf),
+            self._absorbed_free_width(ir, ki_nid, matmul_leaf),
+        )
+        loop_extents = {
+            node.loop_var: node.extent
+            for nid in ir.tree.ancestors(matmul_leaf)
+            if isinstance((node := ir.tree.data(nid)), ForNode)
+        }
+        return all(
+            self._region_axis_fits(lo, width, axis, out_buf, loop_extents)
+            for axis, (lo, width) in enumerate(region.ranges)
+        )
+
+    def _region_axis_fits(self, lo: Expr, width: Expr, axis: int, buf: Buffer, loop_extents: dict[str, int]) -> bool:
+        """Return whether one affine gadget axis stays within ``buf.shape``."""
+        assert isinstance(width, Const)
+        coeffs = to_affine(lo)
+        lower = coeffs.get(None, 0)
+        upper = lower
+        bounded = axis < len(buf.shape)
+        for var, coeff in coeffs.items():
+            if var is None:
+                continue
+            extent = loop_extents.get(var)
+            if extent is None:
+                bounded = False
+                break
+            span = coeff * (extent - 1)
+            if span < 0:
+                lower += span
+            else:
+                upper += span
+        if axis == 0 and buf.location in ("sbuf", "psum") and width.value == PARTITION_DIM:
+            lower *= PARTITION_DIM
+            upper *= PARTITION_DIM
+        return bounded and lower >= 0 and upper + width.value <= buf.shape[axis]
 
     def _check_legality(self, ir: KernelIR, option: RFactorOption) -> None:
         """Raise TransformLegalityError if the option is not a valid rmw rfactor."""
@@ -95,8 +182,9 @@ class RFactor(Transform):
             raise TransformLegalityError(f"RFactor target {nid} is not a ForNode in the tree")
         if not self._rfactorable(ir, nid):
             raise TransformLegalityError(
-                f"RFactor target loop {nid} does not bind an ACCUMULATION axis of an "
-                f"op with RFACTOR_RECIPE='rmw' + a REDUCE_COMBINATOR"
+                f"RFactor target loop {nid} is not a legal rmw reduction: it must be "
+                f"the outermost loop binding an ACCUMULATION axis, remove only the drain copy, and fit its "
+                f"generated gadget region within the output capacity"
             )
 
     def _emit_rmw(self, ir: KernelIR, option: RFactorOption) -> None:

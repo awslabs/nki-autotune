@@ -2,36 +2,33 @@
 
 from __future__ import annotations
 
-import importlib.util
-import os
-import tempfile
-
-import numpy as np
-import pytest
-
-from nkigym.codegen import render
-from nkigym.ir.tree import ForNode, ISANode
-from nkigym.ops.base import AxisRole
-from nkigym.synthesis.simulate_nki import simulate_fp32
-from nkigym.transforms import RFactor, RFactorOption, TransformLegalityError
-from test.transforms._ladder_compare import assert_matches_hand
-from test.transforms._rfactor_fixtures import ko_loop_nid, matmul_leaf_nid, mid_ladder_ir, split_k_ir
-
-_HAND_KERNEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-    "kernel_library",
-    "matmul",
-    "lhsT_rhs",
-    "kernel_rfactor_ko.py",
+from dataclasses import replace
+from test._simulation import assert_matmul_ir_simulates
+from test.transforms._rfactor_fixtures import (
+    k28_ir,
+    k28_ko_loop_nid,
+    ko_loop_nid,
+    matmul_leaf_nid,
+    mid_ladder_ir,
+    split_k_ir,
 )
 
+import pytest
 
-def _load_hand_kernel():
-    """Path-load the expected post-RFactor hand kernel (kernel_library is not a package)."""
-    spec = importlib.util.spec_from_file_location("kernel_rfactor_ko", _HAND_KERNEL_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.nki_f_matmul
+from nkigym.ir import KernelIR
+from nkigym.ir.tree import BlockNode, ForNode, ISANode
+from nkigym.ops.base import AxisRole
+from nkigym.transforms import (
+    BufferCompaction,
+    BufferCompactionOption,
+    BufferLayout,
+    BufferLayoutOption,
+    CodeMotion,
+    CodeMotionOption,
+    RFactor,
+    RFactorOption,
+    TransformLegalityError,
+)
 
 
 def _rfactored_ir():
@@ -40,13 +37,47 @@ def _rfactored_ir():
     return RFactor().apply(ir, RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0))
 
 
-def test_fixture_splits_k() -> None:
-    """split_k_ir yields a tree with an outer K loop (ko) of extent 2."""
-    ir = split_k_ir()
-    ko = ko_loop_nid(ir)
-    node = ir.tree.data(ko)
-    assert isinstance(node, ForNode)
-    assert node.extent == 2
+def _compact_sbuf_prod_under_store(ir: KernelIR) -> KernelIR:
+    """Move the drain under the store M loop, then compact their shared output."""
+    tensor_copy = next(
+        nid
+        for nid in ir.tree.preorder()
+        if isinstance((node := ir.tree.data(nid)), ISANode) and node.op_cls.__name__ == "NKITensorCopy"
+    )
+    store = next(
+        nid
+        for nid in ir.tree.preorder()
+        if isinstance((node := ir.tree.data(nid)), ISANode) and node.op_cls.__name__ == "NKIStore"
+    )
+    tensor_copy_block = next(
+        ancestor
+        for ancestor in reversed(ir.tree.ancestors(tensor_copy))
+        if isinstance(ir.tree.data(ancestor), BlockNode)
+    )
+    store_block = next(
+        ancestor for ancestor in reversed(ir.tree.ancestors(store)) if isinstance(ir.tree.data(ancestor), BlockNode)
+    )
+    store_m_loop = next(
+        descendant
+        for descendant in ir.tree.preorder(store_block)
+        if isinstance((node := ir.tree.data(descendant)), ForNode) and node.loop_var.startswith("i_d1_")
+    )
+    moved = CodeMotion().apply(ir, CodeMotionOption(block_nid=tensor_copy_block, target_loop_nid=store_m_loop, index=0))
+    return BufferCompaction().apply(moved, BufferCompactionOption(tensor="sbuf_prod"))
+
+
+def _replace_sbuf_prod(ir: KernelIR, shape: tuple[int, int], versions: int, list_len: int) -> None:
+    """Replace the output buffer geometry in place for a legality fixture."""
+    for block_nid in ir.tree.blocks():
+        block = ir.tree.data(block_nid)
+        if not isinstance(block, BlockNode) or not any(buf.name == "sbuf_prod" for buf in block.alloc_buffers):
+            continue
+        buffers = tuple(
+            replace(buf, shape=shape, versions=versions, list_len=list_len) if buf.name == "sbuf_prod" else buf
+            for buf in block.alloc_buffers
+        )
+        ir.tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=buffers)
+        break
 
 
 def test_analyze_finds_only_reduction_loops() -> None:
@@ -58,6 +89,22 @@ def test_analyze_finds_only_reduction_loops() -> None:
         node = ir.tree.data(o.target_loop_nid)
         assert isinstance(node, ForNode)
         assert node.loop_var.startswith("i_d0_")
+
+
+def test_rfactor_rejects_inner_reduction_loop() -> None:
+    """Only the outermost reduction loop can own the generated second-stage fold."""
+    ir = split_k_ir()
+    matmul = matmul_leaf_nid(ir)
+    inner = next(
+        nid
+        for nid in ir.tree.ancestors(matmul)
+        if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var == "i_d0_1"
+    )
+    option = RFactorOption(target_loop_nid=inner, factor_axis=0)
+
+    with pytest.raises(TransformLegalityError, match="outermost"):
+        RFactor().apply(ir, option)
+    assert option not in RFactor().analyze(ir)
 
 
 def test_apply_rejects_non_forNode() -> None:
@@ -80,55 +127,119 @@ def test_apply_rejects_parallel_loop() -> None:
         RFactor().apply(ir, RFactorOption(target_loop_nid=m_loop, factor_axis=0))
 
 
-@pytest.mark.skip(
-    reason="RFactor byte-exact repro deferred to the RFactor-template redesign "
-    "(2026-07-14 BufferCompaction spec, k33 out of scope). RFactor.apply is now "
-    "structural-only, so its render carries the gadgets' pre-compaction offsets + "
-    "wide psum shape; reproducing the compacted hand kernel needs the deferred "
-    "template rewrite (+ the psum list_len 16->1 shrink). Structural assertions "
-    "(role flip, gadget nesting, Dependency) stay green."
-)
-def test_apply_byte_exact() -> None:
-    """render(Split→RFactor) is AST-identical to the hand kernel (fused two-stage:
-    per-ko PSUM partial + tensor_tensor fold into sbuf_prod)."""
-    assert_matches_hand(render(_rfactored_ir()), _load_hand_kernel())
+def test_apply_rejects_drain_block_that_contains_the_output_store() -> None:
+    """RFactor cannot delete a drain block that owns another ISA operation."""
+    ir = split_k_ir()
+    tensor_copy = next(
+        nid
+        for nid in ir.tree.preorder()
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.data(nid).op_cls.__name__ == "NKITensorCopy"
+    )
+    store = next(
+        nid
+        for nid in ir.tree.preorder()
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.data(nid).op_cls.__name__ == "NKIStore"
+    )
+    drain_loop = next(
+        ancestor for ancestor in reversed(ir.tree.ancestors(tensor_copy)) if isinstance(ir.tree.data(ancestor), ForNode)
+    )
+    store_block = next(
+        ancestor for ancestor in reversed(ir.tree.ancestors(store)) if isinstance(ir.tree.data(ancestor), BlockNode)
+    )
+    ir = CodeMotion().apply(ir, CodeMotionOption(block_nid=store_block, target_loop_nid=drain_loop, index=1))
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+    with pytest.raises(TransformLegalityError):
+        RFactor().apply(ir, option)
+    assert option not in RFactor().analyze(ir)
 
 
-def _sim_rendered_matmul(name: str, src: str) -> None:
-    """Round-trip ``src`` through a temp module and assert its kernel sims equal to
-    ``lhs_T.T @ rhs`` (fp32). ``simulate_fp32`` takes a NKI callable, not a KernelIR,
-    so the rendered source is imported and its ``nki_f*`` kernel simmed. The rendered
-    function name follows the source kernel (``nki_f_matmul`` for the matmul fixture,
-    ``nki_f_nkigym`` for the k28 IR built from ``f_nkigym``), so it is discovered by
-    prefix rather than hardcoded."""
-    rng = np.random.default_rng(0)
-    inputs = {
-        "lhs_T": rng.standard_normal((2048, 2048)).astype(np.float32),
-        "rhs": rng.standard_normal((2048, 2048)).astype(np.float32),
-    }
-    path = os.path.join(tempfile.gettempdir(), f"rfactor_sim_{name}.py")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(src)
-    spec = importlib.util.spec_from_file_location(f"rfactor_sim_{name}", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    fn = next(getattr(module, n) for n in dir(module) if n.startswith("nki_f"))
-    actual = np.asarray(simulate_fp32(fn)(**inputs))
-    np.testing.assert_allclose(actual, inputs["lhs_T"].T @ inputs["rhs"], atol=5e-3, rtol=5e-3)
+def test_apply_rejects_partition_footprint_larger_than_compact_output() -> None:
+    """RFactor cannot materialize 16 partition tiles in a one-tile output buffer."""
+    ir = _compact_sbuf_prod_under_store(split_k_ir())
+    rfactor = RFactor()
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+    matmul_leaf = matmul_leaf_nid(ir)
+    ki_nid = rfactor._ki_loop_nid(ir, option.target_loop_nid)
+
+    assert ir.buffer("sbuf_prod").shape == (128, 2048)
+    assert ir.buffer("sbuf_prod").physical_shape() == (128, 1, 2048)
+    assert rfactor._drain_block_is_removable(ir, matmul_leaf)
+    assert rfactor._footprint(ir, ki_nid, matmul_leaf) == [("i_d1_0", 16)]
+    assert not rfactor._gadget_region_fits_output(ir, option.target_loop_nid, matmul_leaf)
+    with pytest.raises(TransformLegalityError, match="footprint|capacity"):
+        rfactor.apply(ir, option)
+    assert option not in rfactor.analyze(ir)
 
 
-def test_apply_sim_matches_matmul() -> None:
+def test_apply_rejects_product_of_multiple_footprint_extents() -> None:
+    """A 4 x 4 footprint exceeds eight logical tiles despite pipeline versions."""
+    ir = _compact_sbuf_prod_under_store(mid_ladder_ir())
+    _replace_sbuf_prod(ir, shape=(1024, 2048), versions=2, list_len=1)
+
+    rfactor = RFactor()
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+    matmul_leaf = matmul_leaf_nid(ir)
+    ki_nid = rfactor._ki_loop_nid(ir, option.target_loop_nid)
+
+    assert ir.buffer("sbuf_prod").shape[0] // 128 == 8
+    assert ir.buffer("sbuf_prod").physical_shape()[1] == 16
+    assert rfactor._footprint(ir, ki_nid, matmul_leaf) == [("i_d1_0", 4), ("i_d1_1", 4)]
+    with pytest.raises(TransformLegalityError, match="footprint|capacity"):
+        rfactor.apply(ir, option)
+    assert option not in rfactor.analyze(ir)
+
+
+def test_apply_rejects_inherited_partition_offsets_larger_than_compact_output() -> None:
+    """Outer M loops must fit even when the inner materialized footprint is empty."""
+    ir = k28_ir()
+    _replace_sbuf_prod(ir, shape=(128, 512), versions=2, list_len=1)
+    rfactor = RFactor()
+    option = RFactorOption(target_loop_nid=k28_ko_loop_nid(ir), factor_axis=0)
+    matmul_leaf = matmul_leaf_nid(ir)
+    ki_nid = rfactor._ki_loop_nid(ir, option.target_loop_nid)
+
+    assert rfactor._footprint(ir, ki_nid, matmul_leaf) == []
+    with pytest.raises(TransformLegalityError, match="region|capacity"):
+        rfactor.apply(ir, option)
+    assert option not in rfactor.analyze(ir)
+
+
+def test_apply_rejects_absorbed_free_span_larger_than_compact_output() -> None:
+    """The full absorbed free-axis gadget width must fit the output buffer."""
+    ir = split_k_ir()
+    _replace_sbuf_prod(ir, shape=(2048, 128), versions=1, list_len=1)
+    rfactor = RFactor()
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+
+    with pytest.raises(TransformLegalityError, match="region|capacity"):
+        rfactor.apply(ir, option)
+    assert option not in rfactor.analyze(ir)
+
+
+def test_apply_accepts_listed_output_with_sufficient_total_capacity() -> None:
+    """A list-of-16 output retains all 16 logical partition tiles."""
+    ir = split_k_ir()
+    ir = BufferLayout().apply(ir, BufferLayoutOption(tensor="sbuf_prod", list_len=16))
+    rfactor = RFactor()
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+
+    assert ir.buffer("sbuf_prod").per_tile_physical_shape() == (128, 1, 2048)
+    assert option in rfactor.analyze(ir)
+    rfactor.apply(ir, option)
+
+
+def test_apply_sim_matches_matmul(tmp_path) -> None:
     """The rfactored kernel sims numerically equal to lhs_T.T @ rhs."""
-    _sim_rendered_matmul("early_packed", render(_rfactored_ir()))
+    assert_matmul_ir_simulates(_rfactored_ir(), tmp_path, "rfactor_early_packed")
 
 
-def test_apply_sim_matches_matmul_mid_tiled_m() -> None:
+def test_apply_sim_matches_matmul_mid_tiled_m(tmp_path) -> None:
     """RFactor(ko) on the mid state (K split ko/ki AND M tiled i_d1_0 x i_d1_1,
     buffers still packed) sims equal to the golden — the tiled-M geometry, pinned
     as a regression test via the ``mid_ladder_ir`` fixture."""
     ir = mid_ladder_ir()
     rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0))
-    _sim_rendered_matmul("mid_tiled_m", render(rfactored))
+    assert_matmul_ir_simulates(rfactored, tmp_path, "rfactor_mid_tiled_m")
 
 
 def test_ko_roles_split_across_blocks() -> None:
@@ -185,29 +296,8 @@ def test_rf_memset_drain_nested_in_ko() -> None:
     assert ko in ir.tree.ancestors(rf_drain), "rf-drain tensor_copy must be nested inside the ko loop"
 
 
-@pytest.mark.skip(
-    reason="RFactor byte-exact repro deferred to the RFactor-template redesign "
-    "(2026-07-14 BufferCompaction spec, k33 out of scope). Pre-existing/stale at base "
-    "(compares vs manual_transforms.kernel_29, now a Reorder rung after the manual "
-    "renumber — RFactor is kernel_33); also RFactor.apply is now structural-only, so "
-    "the compacted byte-exact form needs the deferred template rewrite + psum "
-    "list_len 16->1 shrink. Structural assertions and the k28->k29 sim stay green."
-)
-def test_apply_byte_exact_k28_to_k29() -> None:
-    """RFactor(ko) on the k28 IR (ki-innermost, all-list-buffer) renders byte-exact to
-    the hand kernel_29 (fused two-stage, per-Mi-tile psum list-1 + sbuf_rfactor)."""
-    from examples import manual_transforms
-    from test.transforms._rfactor_fixtures import k28_ir, k28_ko_loop_nid
-
-    ir = k28_ir()
-    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k28_ko_loop_nid(ir), factor_axis=0))
-    assert_matches_hand(render(rfactored), manual_transforms.kernel_29)
-
-
-def test_apply_sim_matches_matmul_k28_to_k29() -> None:
+def test_apply_sim_matches_matmul_k28_to_k29(tmp_path) -> None:
     """The k28->k29 rfactored kernel sims numerically equal to lhs_T.T @ rhs."""
-    from test.transforms._rfactor_fixtures import k28_ir, k28_ko_loop_nid
-
     ir = k28_ir()
     rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k28_ko_loop_nid(ir), factor_axis=0))
-    _sim_rendered_matmul("k28_to_k29", render(rfactored))
+    assert_matmul_ir_simulates(rfactored, tmp_path, "rfactor_k28_to_k29")

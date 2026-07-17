@@ -11,9 +11,9 @@ import copy
 import itertools
 from dataclasses import dataclass, replace
 
-from nkigym.ir import KernelIR
+from nkigym.ir import KernelIR, to_affine
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import BlockNode, ForNode, ISANode
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
@@ -90,6 +90,16 @@ class SoftwarePipeline(Transform):
         candidates = [unit_nid, *ir.tree.descendants(unit_nid)]
         return [d for d in candidates if isinstance(ir.tree.data(d), ISANode)]
 
+    def _touched_tensors(self, ir: KernelIR, children: list[int]) -> set[str]:
+        """Return every tensor touched by the staged units."""
+        touched: set[str] = set()
+        for child in children:
+            for leaf in self._unit_leaves(ir, child):
+                node = ir.tree.data(leaf)
+                assert isinstance(node, ISANode)
+                touched.update(region.tensor for region in node.operand_bindings.values())
+        return touched
+
     def _is_legal(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> bool:
         """TVM's two graph rules over the dependency DAG, plus order-permutation."""
         result = True
@@ -115,7 +125,66 @@ class SoftwarePipeline(Transform):
                         result = False
                     elif stage_of[src_b] == stage_of[dst_b] and order_of[src_b] >= order_of[dst_b]:
                         result = False
+            if any(ir.buffer(name).versions > 1 for name in self._touched_tensors(ir, children)):
+                result = False
+            version_counts = self._version_counts(ir, option, children)
+            if any(versions > 1 and ir.buffer(name).list_len > 1 for name, versions in version_counts.items()):
+                result = False
+            if not self._version_accesses_are_aligned(ir, option, children, version_counts):
+                result = False
         return result
+
+    def _version_accesses_are_aligned(
+        self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int], version_counts: dict[str, int]
+    ) -> bool:
+        """Return whether each later read stays within its pipeline-selected write."""
+        loop = ir.tree.data(option.loop_nid)
+        assert isinstance(loop, ForNode)
+        stage_of = {children[index]: option.stages[index] for index in range(len(children))}
+        reads: dict[str, list[tuple[int, BufferRegion]]] = {}
+        writes: dict[str, list[tuple[int, BufferRegion]]] = {}
+        for child in children:
+            stage = stage_of[child]
+            for leaf in self._unit_leaves(ir, child):
+                info = ir.dependency.info(leaf)
+                for region in info.read_regions:
+                    reads.setdefault(region.tensor, []).append((stage, region))
+                for region in info.write_regions:
+                    writes.setdefault(region.tensor, []).append((stage, region))
+
+        result = True
+        for name, versions in version_counts.items():
+            if versions <= 1:
+                continue
+            tensor_writes = writes.get(name, [])
+            dependent_writes = [
+                (stage, region, self._region_axes_using(region, loop.loop_var))
+                for stage, region in tensor_writes
+                if self._region_axes_using(region, loop.loop_var)
+            ]
+            for read_stage, read_region in reads.get(name, []):
+                if any(stage <= read_stage and write_region == read_region for stage, write_region in tensor_writes):
+                    continue
+                prior_dependent = [
+                    (write_region, axes)
+                    for write_stage, write_region, axes in dependent_writes
+                    if write_stage < read_stage
+                ]
+                if prior_dependent and not any(
+                    self._regions_match_axes(write_region, read_region, axes) for write_region, axes in prior_dependent
+                ):
+                    result = False
+        return result
+
+    def _region_axes_using(self, region: BufferRegion, loop_var: str) -> tuple[int, ...]:
+        """Return region axes whose lower bound references ``loop_var``."""
+        return tuple(axis for axis, (lower, _extent) in enumerate(region.ranges) if loop_var in to_affine(lower))
+
+    def _regions_match_axes(self, write_region: BufferRegion, read_region: BufferRegion, axes: tuple[int, ...]) -> bool:
+        """Return whether ``read_region`` matches the selected axes of ``write_region``."""
+        return len(write_region.ranges) == len(read_region.ranges) and all(
+            write_region.ranges[axis] == read_region.ranges[axis] for axis in axes
+        )
 
     def _check_legality(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> None:
         """Raise TransformLegalityError if illegal."""
@@ -126,6 +195,12 @@ class SoftwarePipeline(Transform):
         """Set Buffer.versions = use_stage - def_stage + 1 for each buffer the
         staged units touch. Per-leaf reads/writes from ir.dependency.info(leaf)
         (the matmul nest has no BlockNode carrying regions)."""
+        for name, versions in self._version_counts(ir, option, children).items():
+            if versions > 1:
+                self._set_versions(ir, name, versions)
+
+    def _version_counts(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> dict[str, int]:
+        """Return the pipeline version count required for each defined-and-used buffer."""
         stage_of = {children[i]: option.stages[i] for i in range(len(children))}
         defs: dict[str, int] = {}
         uses: dict[str, int] = {}
@@ -141,10 +216,7 @@ class SoftwarePipeline(Transform):
                 defs[name] = min(defs.get(name, st), st)
             for name in reads:
                 uses[name] = max(uses.get(name, st), st)
-        for name in set(defs) & set(uses):
-            versions = uses[name] - defs[name] + 1
-            if versions > 1:
-                self._set_versions(ir, name, versions)
+        return {name: uses[name] - defs[name] + 1 for name in set(defs) & set(uses)}
 
     def _set_versions(self, ir: KernelIR, name: str, versions: int) -> None:
         """Replace the owning block's alloc entry for ``name`` with a versions-updated copy."""

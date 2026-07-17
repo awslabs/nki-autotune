@@ -13,4 +13,5 @@ line_length = 120
 reportMissingImports = "none"
 
 [tool.pytest.ini_options]
-pythonpath = ["nkigym/src"]
+pythonpath = ["nkigym/src", "autotune/src"]
+testpaths = ["test"]

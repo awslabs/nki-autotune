@@ -2,12 +2,29 @@
 
 from __future__ import annotations
 
+from test._simulation import assert_matmul_ir_simulates
 from test.transforms._fixtures import build_canonical_ir
+from test.transforms._helpers import load_block_reading, matmul_loop
+from test.transforms._seq_fixture import build_seq_ir
 
 import pytest
 
-from nkigym.ir.tree import ForNode
-from nkigym.transforms import Reorder, ReorderOption, TransformLegalityError
+from nkigym.ir import KernelIR
+from nkigym.ir.arith.expr import Add, Const, Mul, Var
+from nkigym.ir.dependency import Dependency
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
+from nkigym.ops.base import AxisRole
+from nkigym.ops.store import NKIStore
+from nkigym.ops.tensor_copy import NKITensorCopy
+from nkigym.transforms import (
+    CodeMotion,
+    CodeMotionOption,
+    Reorder,
+    ReorderOption,
+    Split,
+    SplitOption,
+    TransformLegalityError,
+)
 
 
 def _first_two_adjacent_fors(ir):
@@ -46,13 +63,95 @@ def test_reorder_self_inverse():
     assert new_ir.tree.data(inner) == ir.tree.data(inner)
 
 
+def test_reorder_renders_and_passes_numerics(tmp_path) -> None:
+    """Reordering a split loop pair preserves rendered-kernel behavior."""
+    ir = build_canonical_ir()
+    target, _inner = _first_two_adjacent_fors(ir)
+    extent = ir.tree.data(target).extent
+    split = Split().apply(ir, SplitOption(target_nid=target, factors=(2, extent // 2)))
+    outer = split.tree.children(ir.tree.parent(target))[0]
+    inner = split.tree.children(outer)[0]
+    reordered = Reorder().apply(split, ReorderOption(outer_nid=outer, inner_nid=inner))
+    assert_matmul_ir_simulates(reordered, tmp_path, "reorder_split_loop")
+
+
 def test_reorder_rejects_sequential_role():
     """Reorder rejects a swap on a dim whose enclosing block declares SEQUENTIAL role."""
-    from test.transforms._seq_fixture import build_seq_ir
-
     ir, outer, inner, _ = build_seq_ir()
     with pytest.raises(TransformLegalityError, match="SEQUENTIAL"):
         Reorder().apply(ir, ReorderOption(outer_nid=outer, inner_nid=inner))
+
+
+def test_reorder_rejects_internal_loop_carried_flow():
+    """Reorder rejects a scratch flow carried across the inner loop."""
+    tree = KernelTree()
+    outer_var = Var(name="i_d1_0")
+    inner_var = Var(name="i_d2_0")
+    suffix_var = Var(name="i_d2_1")
+    scratch_read = BufferRegion(
+        tensor="scratch",
+        ranges=(
+            (Const(value=0), Const(value=128)),
+            (
+                Add(
+                    left=Mul(left=inner_var, right=Const(value=1024)),
+                    right=Mul(left=suffix_var, right=Const(value=512)),
+                ),
+                Const(value=512),
+            ),
+        ),
+    )
+    output_write = BufferRegion(
+        tensor="output",
+        ranges=((Mul(left=outer_var, right=Const(value=128)), Const(value=128)), scratch_read.ranges[1]),
+    )
+    owner = BlockNode(
+        iter_vars=(
+            IterVar(axis="d1", dom=(0, 16), role=AxisRole.PARALLEL),
+            IterVar(axis="d2", dom=(0, 4), role=AxisRole.PARALLEL),
+        ),
+        iter_values=(outer_var, Add(left=Mul(left=inner_var, right=Const(value=2)), right=suffix_var)),
+        reads=(scratch_read,),
+        writes=(output_write,),
+        alloc_buffers=(Buffer(name="scratch", shape=(128, 2048), dtype="bfloat16", location="sbuf"),),
+        axis_map={"P": "d1", "F": "d2"},
+    )
+    owner_nid = tree.add_node(owner, parent=tree.root)
+    outer = tree.add_node(ForNode(loop_var=outer_var.name, extent=16), parent=owner_nid)
+    inner = tree.add_node(ForNode(loop_var=inner_var.name, extent=2), parent=outer)
+    suffix = tree.add_node(ForNode(loop_var=suffix_var.name, extent=2), parent=inner)
+    scratch_write = BufferRegion(
+        tensor="scratch",
+        ranges=((Const(value=0), Const(value=128)), (Mul(left=suffix_var, right=Const(value=1024)), Const(value=1024))),
+    )
+    source_read = BufferRegion(tensor="source", ranges=((outer_var, Const(value=128)), scratch_write.ranges[1]))
+    producer = BlockNode(
+        iter_vars=(
+            IterVar(axis="d1", dom=(0, 16), role=AxisRole.PARALLEL),
+            IterVar(axis="d2", dom=(0, 2), role=AxisRole.PARALLEL),
+        ),
+        iter_values=(outer_var, suffix_var),
+        reads=(source_read,),
+        writes=(scratch_write,),
+        axis_map={"P": "d1", "F": "d2"},
+    )
+    producer_nid = tree.add_node(producer, parent=suffix)
+    tree.add_node(
+        ISANode(op_cls=NKITensorCopy, operand_bindings={"src": source_read, "dst": scratch_write}), parent=producer_nid
+    )
+    tree.add_node(ISANode(op_cls=NKIStore, operand_bindings={"src": scratch_read, "dst": output_write}), parent=suffix)
+    ir = KernelIR(
+        func_name="loop_carried_flow",
+        param_names=["source"],
+        return_name="output",
+        tree=tree,
+        dependency=Dependency(tree),
+    )
+    option = ReorderOption(outer_nid=outer, inner_nid=inner)
+
+    assert option not in Reorder().analyze(ir)
+    with pytest.raises(TransformLegalityError, match="different dependence"):
+        Reorder().apply(ir, option)
 
 
 def test_reorder_matches_tvm_structure():
@@ -74,8 +173,6 @@ def test_reorder_matches_tvm_structure():
     pytest.importorskip("tvm")
     from test.transforms._oracle_helpers import enclosing_for_nids
     from test.transforms._tvm_struct_oracle import tvm_reorder_loopnest
-
-    from nkigym.ir.tree import ISANode
 
     ir = build_canonical_ir()
     mm = next(
@@ -106,51 +203,26 @@ def test_reorder_matches_tvm_structure():
     assert our_extents == nest.extents == [16, 4, 16]
 
 
-def test_reorder_same_dim_swap_then_compute_at_sims():
-    """A Reorder that swaps TWO loops of the SAME dim must renormalize so a later
-    CodeMotion on a co-located block agrees on the dim's tile linearization.
+def test_reorder_same_dim_swap_then_compute_at_sims(tmp_path) -> None:
+    """A same-dimension reorder stays consistent with later CodeMotion normalization."""
+    ir = build_canonical_ir()
+    ir = Split().apply(ir, SplitOption(target_nid=matmul_loop(ir, "i_d0_0"), factors=(4, 2, 2), target_axis=None))
+    rhs_load = load_block_reading(ir, "rhs")
+    rhs_k_loop = next(
+        nid
+        for nid in ir.tree.preorder(rhs_load)
+        if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var == "i_d0_0"
+    )
+    ir = Split().apply(ir, SplitOption(target_nid=rhs_k_loop, factors=(4, 2, 2), target_axis=None))
 
-    Fixed deterministic trace: after splitting the matmul K (d0) into three loops
-    and swapping the outer two (a same-dim Reorder), sinking the rhs load must see
-    the SAME d0 tile-index convention the matmul uses. Pre-fix, Reorder left the
-    matmul's pre-swap binding while CodeMotion recomputed the load's stride from
-    physical order -> disagreement -> OOB on the rhs HBM partition axis.
-    """
-    import importlib.util
-    import pathlib
-    import tempfile
-    from test.transforms._fixtures import INPUT_SPECS, f_matmul
-
-    import numpy as np
-
-    from nkigym.codegen import render
-    from nkigym.environment import KernelMDP
-    from nkigym.synthesis.simulate_nki import simulate_fp32
-    from nkigym.transforms import CodeMotion, CodeMotionOption, Fuse, ReorderOption, Split, SplitOption
-
-    trace = [
-        (Split(), SplitOption(target_nid=11, factors=(4, 2, 2), target_axis=None)),
-        (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=2, index=1)),
-        (Split(), SplitOption(target_nid=6, factors=(16, 128), target_axis="d2")),
-        (Split(), SplitOption(target_nid=20, factors=(4, 4, 128), target_axis="d2")),
-        (CodeMotion(), CodeMotionOption(block_nid=15, target_loop_nid=25, index=0)),
-        (Split(), SplitOption(target_nid=9, factors=(16, 128), target_axis="d2")),
-        (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=12, index=0)),
-        (Reorder(), ReorderOption(outer_nid=21, inner_nid=22)),
-        (Split(), SplitOption(target_nid=8, factors=(2, 4, 2), target_axis=None)),
-        (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=22, index=0)),
+    ir = Reorder().apply(ir, ReorderOption(outer_nid=matmul_loop(ir, "i_d0_0"), inner_nid=matmul_loop(ir, "i_d0_1")))
+    rhs_loops = [
+        nid
+        for nid in ir.tree.preorder(rhs_load)
+        if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var.startswith("i_d0_")
     ]
-    env = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), CodeMotion()])
-    state = env.reset()
-    for action in trace:
-        state = env.step(state, action)
-    rng = np.random.default_rng(0)
-    inputs = {n: rng.standard_normal(s).astype(np.float32) for n, (s, _d) in INPUT_SPECS.items()}
-    expected = inputs["lhs_T"].T @ inputs["rhs"]
-    path = pathlib.Path(tempfile.mkdtemp()) / "k.py"
-    path.write_text(render(state))
-    spec = importlib.util.spec_from_file_location("k", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    actual = np.asarray(simulate_fp32(mod.nki_f_matmul)(**inputs))
-    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+    ir = Reorder().apply(ir, ReorderOption(outer_nid=rhs_loops[0], inner_nid=rhs_loops[1]))
+    target = matmul_loop(ir, "i_d0_0")
+    moved = CodeMotion().apply(ir, CodeMotionOption(block_nid=rhs_load, target_loop_nid=target, index=0))
+
+    assert_matmul_ir_simulates(moved, tmp_path, "reorder_same_dim_compute_at")

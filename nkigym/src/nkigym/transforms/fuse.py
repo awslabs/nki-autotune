@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from math import prod
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Expr
+from nkigym.ir.arith.expr import Expr, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.transforms._normalize import _dim_from_loopvar, normalize_block
@@ -56,7 +56,9 @@ class Fuse(Transform):
                     cur = kids[0]
                 for end in range(2, len(chain) + 1):
                     sub = tuple(chain[:end])
-                    options.append(FuseOption(target_nids=sub, target_axis=None))
+                    option = FuseOption(target_nids=sub, target_axis=None)
+                    if self._is_legal(ir, option):
+                        options.append(option)
         return options
 
     def apply(self, ir: KernelIR, option: FuseOption) -> KernelIR:
@@ -87,6 +89,7 @@ class Fuse(Transform):
                     raise TransformLegalityError(
                         f"Fuse outer-trip flavour: nid {parent_nid} must have a single child {child_nid}; got {kids}"
                     )
+            _check_no_partial_loop_dependence(ir.tree, option.target_nids)
         else:
             """Tensorize flavour: prefix is ForNodes; last is the ISA leaf."""
             if not isinstance(nodes[-1], ISANode):
@@ -104,6 +107,14 @@ class Fuse(Transform):
                     raise TransformLegalityError(
                         f"Fuse tensorize flavour: nid {parent_nid} must have a single child {child_nid}; got {kids}"
                     )
+
+    def _is_legal(self, ir: KernelIR, option: FuseOption) -> bool:
+        """Return whether ``option`` passes the same checks used by :meth:`apply`."""
+        try:
+            self._check_legality(ir, option)
+        except TransformLegalityError:
+            return False
+        return True
 
     def _do_outer_trip(self, ir: KernelIR, option: FuseOption) -> None:
         """Outer-trip Fuse: merge a parent->child chain of same-dim ForNodes into one loop.
@@ -130,7 +141,10 @@ class Fuse(Transform):
         for nid in nids:
             ir.tree.graph.remove_node(nid)
 
+        nested_blocks = [nid for nid in ir.tree.preorder(new_nid) if isinstance(ir.tree.data(nid), BlockNode)]
         normalize_block(ir.tree, block_nid)
+        for nested_block in nested_blocks:
+            normalize_block(ir.tree, nested_block)
 
     def _do_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
         """Tensorize Fuse: absorb a chain of same-axis ForNodes above an ISA leaf into the tile width.
@@ -196,6 +210,41 @@ def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
         if isinstance(data, BlockNode):
             return ancestor, data
     raise TransformLegalityError(f"no enclosing BlockNode for nid {nid}")
+
+
+def _check_no_partial_loop_dependence(tree: KernelTree, target_nids: tuple[int, ...]) -> None:
+    """Reject accesses that cannot remain affine after the target loops are fused.
+
+    A descendant expression may be invariant across every target loop or use
+    every target loop as one contiguous index. If it uses only a proper subset,
+    replacing the original loops with one variable requires floor division or
+    modulo to recover the omitted loop positions. ``normalize_block`` cannot
+    represent that mapping and would otherwise silently drop the access offset.
+    """
+    target_vars = {tree.data(nid).loop_var for nid in target_nids}
+    for nid in tree.preorder(target_nids[0]):
+        for expression in _binding_and_access_offsets(tree.data(nid)):
+            used = {name for name in to_affine(expression) if name is not None} & target_vars
+            if used and used != target_vars:
+                raise TransformLegalityError(
+                    "Fuse outer-trip flavour: descendant "
+                    f"nid {nid} depends on only {sorted(used)} of fused loops "
+                    f"{sorted(target_vars)}; preserving the access requires floor division or modulo"
+                )
+
+
+def _binding_and_access_offsets(node: BlockNode | ForNode | ISANode) -> list[Expr]:
+    """Return block bindings and region lower bounds carried by ``node``."""
+    expressions: list[Expr] = []
+    if isinstance(node, BlockNode):
+        expressions.extend(node.iter_values)
+        regions = (*node.reads, *node.writes)
+    elif isinstance(node, ISANode):
+        regions = tuple(node.operand_bindings.values())
+    else:
+        regions = ()
+    expressions.extend(lower for region in regions for lower, _width in region.ranges)
+    return expressions
 
 
 __all__ = ["Fuse", "FuseOption"]

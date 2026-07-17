@@ -52,7 +52,6 @@ for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "nkigym", "src"), os.path.join(_
 
 from test.transforms._ladder_compare import assert_matches_hand
 
-from autotune.runner.api import profile
 from autotune.runner.types import KernelJob
 from examples import manual_transforms
 from nkigym.codegen import render
@@ -449,6 +448,8 @@ def _sim_source(name: str, source: str, func_name: str, inputs: dict, expected: 
 
 def _main() -> None:
     """Build the ladder, render every rung, sim-check it, then profile all on Trn2."""
+    from autotune.runner.api import profile
+
     parser = argparse.ArgumentParser(description="Drive canonical->target transforms; CPU-sim + Trn2 HW profile.")
     parser.add_argument("--cache", required=True, help="absolute cache dir (under the box's $HOME on Kaizen)")
     args = parser.parse_args()
