@@ -1,14 +1,12 @@
 """Shared structural move for CodeMotion (the merged compute-at / reverse-compute-at).
 
 A move relocates one block under a target loop by a **verbatim residual splice**,
-NOT region recomputation. Precondition (``_check_same_loop_prefix``): the target's
-enclosing loop nest (outermost down to ``target_loop_nid``), as an ordered
-``(loop_var, extent)`` sequence, must be an EXACT PREFIX of the moved block's own
-loop nest. The move then drops the shared-prefix loops the target already provides
-and re-parents the moved block's residual loops (the inner loops the target does
-not iterate) plus its leaf under the target — regions untouched. Because the prefix
-loop VARS are shared by name between the moved block and the target nest, the moved
-block's regions referencing them resolve against the target's loops with no rewrite.
+NOT region regeneration. Precondition (``_check_same_loop_prefix``): the target's
+enclosing loop nest (outermost down to ``target_loop_nid``), restricted to dimensions
+the moved block binds, must be an exact ordered ``(dimension, extent)`` prefix of the
+moved block's bound loop sequence. The move substitutes the matched target loop
+variables for loops supplied by a different target scope, removes the covered local
+loops, and re-parents the untouched residual loops plus the leaf under the target.
 
 This intentionally avoids TVM-style per-dim domain solving: a partial split of a
 shared dim, or a different loop order, is REJECTED loudly (``Split``/``Reorder``
@@ -21,42 +19,95 @@ import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
+from nkigym.ir.arith.expr import Expr, Var, substitute, to_affine
 from nkigym.ir.dependency import Dependency, _access_invariant_across, _leaf_operand_regions, _tensor_carried_across
-from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
-from nkigym.transforms._domain_solve import _enclosing_block
-from nkigym.transforms._normalize import _iter_value_loopvars, normalize_block
-from nkigym.transforms._tree_ops import _replace_in_parent_children
+from nkigym.transforms._domain_solve import _dim_from_loopvar
+from nkigym.transforms._normalize import normalize_block
+from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+
+
+@dataclass(frozen=True)
+class _PrefixPlan:
+    """Exact-prefix loop correspondence for one CodeMotion move."""
+
+    target_loop_nids: tuple[int, ...]
+    local_loop_nids: tuple[int, ...]
+    matched_loop_nids: tuple[tuple[int, int], ...]
+    matched_local_nids: tuple[int, ...]
+    duplicated_target_nids: tuple[int, ...]
 
 
 def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> None:
     """Relocate ``block_nid`` under ``target_loop_nid`` by a verbatim residual splice.
 
     Caller has checked legality (``_check_same_loop_prefix``, so the target's
-    enclosing nest is an exact prefix of the moved block's nest) and deep-copied.
+    dependent nest is an exact dimension/extent prefix) and deep-copied.
     ``index`` follows TVM convention: ``-1`` append, ``-2`` prepend, ``>=0`` slot.
 
-    The moved block's loops are its ENCLOSING loops (above the block, shared with
-    the target) plus its BLOCK-LOCAL loops (inside the block). The target prefix
-    covers the enclosing loops and the outer part of the local loops; the leftover
-    local loops are the residual. We drop the prefix-covered local ForNodes and
-    re-parent ``block_nid`` (now carrying only its residual loops + leaf) under the
-    target. Regions are NOT recomputed: the dropped loops' vars are reintroduced
-    identically by the target's own nest, so every region offset still resolves.
-    ``normalize_block`` on the fork reconciles trip-1 / names there.
+    Matched local loops may use different identifiers from their corresponding
+    target loops. Their uses are explicitly rebound before the loops are removed.
+    Residual loops receive temporary collision-free names before the splice, then
+    ``normalize_block`` restores dense names and bindings in the moved block's own
+    scope. The target block's unchanged loop nest is not normalized.
     """
     tree = ir.tree
-    moved_seq = _moved_loop_seq(tree, block_nid)
-    moved_vars = {lv for lv, _e in moved_seq}
-    dep_prefix_len = sum(1 for lv, _e in _target_loop_seq(tree, target_loop_nid) if lv in moved_vars)
-    enclosing_count = sum(1 for a in tree.ancestors(block_nid) if isinstance(tree.data(a), ForNode))
-    local_prefix_drop = dep_prefix_len - enclosing_count
-    _strip_local_prefix_loops(tree, block_nid, local_prefix_drop)
+    plan = _prefix_plan(tree, block_nid, target_loop_nid)
+    _prepare_block_for_splice(tree, block_nid, plan)
+    _strip_local_prefix_loops(tree, block_nid, len(plan.matched_local_nids))
     _splice_under_target(tree, block_nid, target_loop_nid, index)
-    fork = _enclosing_block(tree, target_loop_nid)
-    normalize_block(tree, fork)
+    normalize_block(tree, block_nid)
     _assert_single_parent(tree)
+
+
+def _prepare_block_for_splice(tree: KernelTree, block_nid: int, plan: _PrefixPlan) -> None:
+    """Rebind matched loops and temporarily rename every residual local loop."""
+    substitutions: dict[str, Expr] = {
+        tree.loop(local_nid).loop_var: Var(name=tree.loop(target_nid).loop_var)
+        for local_nid, target_nid in plan.matched_loop_nids
+    }
+    used_names = {node.loop_var for nid in tree.preorder() if isinstance((node := tree.data(nid)), ForNode)}
+    matched_local = set(plan.matched_local_nids)
+    for local_nid in plan.local_loop_nids:
+        if local_nid in matched_local:
+            continue
+        loop = tree.loop(local_nid)
+        dim = _dim_from_loopvar(loop.loop_var)
+        temporary = f"i_{dim}__move_{local_nid}"
+        while temporary in used_names:
+            temporary = f"{temporary}_"
+        used_names.add(temporary)
+        substitutions[loop.loop_var] = Var(name=temporary)
+        tree.graph.nodes[local_nid]["data"] = ForNode(loop_var=temporary, extent=loop.extent)
+    _substitute_block_loop_vars(tree, block_nid, substitutions)
+
+
+def _substitute_block_loop_vars(tree: KernelTree, block_nid: int, substitutions: dict[str, Expr]) -> None:
+    """Substitute loop identifiers throughout one leaf block's binding scope."""
+    block = tree.block(block_nid)
+    new_block = replace(
+        block,
+        iter_values=tuple(substitute(value, substitutions) for value in block.iter_values),
+        reads=tuple(_substitute_region(region, substitutions) for region in block.reads),
+        writes=tuple(_substitute_region(region, substitutions) for region in block.writes),
+    )
+    tree.graph.nodes[block_nid]["data"] = new_block
+    for nid in _block_local_descendants(tree, block_nid):
+        node = tree.data(nid)
+        if not isinstance(node, ISANode):
+            continue
+        bindings = {slot: _substitute_region(region, substitutions) for slot, region in node.operand_bindings.items()}
+        tree.graph.nodes[nid]["data"] = replace(node, operand_bindings=bindings)
+
+
+def _substitute_region(region: BufferRegion, substitutions: dict[str, Expr]) -> BufferRegion:
+    """Apply loop-variable substitutions to one buffer region."""
+    ranges = tuple(
+        (substitute(lower, substitutions), substitute(width, substitutions)) for lower, width in region.ranges
+    )
+    return replace(region, ranges=ranges)
 
 
 def _strip_local_prefix_loops(tree: KernelTree, block_nid: int, count: int) -> None:
@@ -64,9 +115,9 @@ def _strip_local_prefix_loops(tree: KernelTree, block_nid: int, count: int) -> N
 
     The block's body is a single chain ``block -> For -> ... -> For -> leaf``; the
     outermost ``count`` of those ForNodes are the prefix the target already provides
-    (their loop vars reappear in the target's enclosing nest, so the leaf's regions
-    that reference them still resolve). Each is spliced out by reconnecting its sole
-    child to its parent, leaving the residual loops + leaf attached to the block.
+    after :func:`_prepare_block_for_splice` has rebound their uses to the target loop
+    variables. Each is spliced out by reconnecting its sole child to its parent,
+    leaving the residual loops + leaf attached to the block.
     ``count == 0`` is a no-op (the whole moved nest is residual).
     """
     for _ in range(count):
@@ -102,6 +153,95 @@ def _moved_loop_seq(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
     return [(node.loop_var, node.extent) for n in chain if isinstance((node := tree.data(n)), ForNode)]
 
 
+def _target_loop_nids(tree: KernelTree, target_loop_nid: int) -> list[int]:
+    """ForNode nids from the outermost target ancestor through the target."""
+    chain = [*tree.ancestors(target_loop_nid), target_loop_nid]
+    return [nid for nid in chain if isinstance(tree.data(nid), ForNode)]
+
+
+def _local_loop_nids(tree: KernelTree, block_nid: int) -> list[int]:
+    """Block-local ForNode nids in execution order."""
+    leaf = next(nid for nid in tree.preorder(block_nid) if isinstance(tree.data(nid), ISANode))
+    chain = tree.ancestors(leaf)
+    start = chain.index(block_nid) + 1
+    return [nid for nid in chain[start:] if isinstance(tree.data(nid), ForNode)]
+
+
+def _bound_loop_dims(block: BlockNode) -> dict[str, str]:
+    """Map each loop variable in the block's iter bindings to its concrete dimension."""
+    result: dict[str, str] = {}
+    for iter_var, value in zip(block.iter_vars, block.iter_values):
+        for name in to_affine(value):
+            if name is not None:
+                result[name] = iter_var.axis
+    return result
+
+
+def _prefix_plan(tree: KernelTree, block_nid: int, target_loop_nid: int) -> _PrefixPlan:
+    """Match target loops to the moved block's bound prefix by dimension and extent."""
+    target_nids = _target_loop_nids(tree, target_loop_nid)
+    local_nids = _local_loop_nids(tree, block_nid)
+    leaf = next(nid for nid in tree.preorder(block_nid) if isinstance(tree.data(nid), ISANode))
+    moved_nids = [nid for nid in tree.ancestors(leaf) if isinstance(tree.data(nid), ForNode)]
+    enclosing_nids = set(moved_nids) - set(local_nids)
+    bound_dims = _bound_loop_dims(tree.block(block_nid))
+    dependent_dims = set(bound_dims.values())
+    bound_nids = [nid for nid in moved_nids if tree.loop(nid).loop_var in bound_dims]
+    matched: list[tuple[int, int]] = []
+    duplicated: list[int] = []
+    bound_index = 0
+    for target_nid in target_nids:
+        target_loop = tree.loop(target_nid)
+        if target_nid in enclosing_nids and target_loop.loop_var not in bound_dims:
+            continue
+        target_dim = _dim_from_loopvar(target_loop.loop_var)
+        if target_dim not in dependent_dims:
+            duplicated.append(target_nid)
+            continue
+        if bound_index >= len(bound_nids):
+            raise TransformLegalityError(
+                f"move(block={block_nid} under loop={target_loop_nid}) has no bound "
+                f"{target_dim} loop matching target {target_loop.loop_var!r}; the "
+                f"distinct target execution scope cannot replace the moved block's scope"
+            )
+        moved_nid = bound_nids[bound_index]
+        moved_loop = tree.loop(moved_nid)
+        moved_dim = bound_dims.get(moved_loop.loop_var)
+        if (moved_dim, moved_loop.extent) != (target_dim, target_loop.extent):
+            raise TransformLegalityError(
+                f"move(block={block_nid} under loop={target_loop_nid}) requires an exact "
+                f"(dimension, extent) prefix; target={(target_dim, target_loop.extent)} "
+                f"does not match moved={(moved_dim, moved_loop.extent)} "
+                f"and cannot replace its execution scope "
+                f"(Split / Reorder the mismatched loop first)"
+            )
+        matched.append((moved_nid, target_nid))
+        bound_index += 1
+    matched_moved = {moved_nid for moved_nid, _target_nid in matched}
+    lost_enclosing = [
+        tree.loop(nid).loop_var for nid in bound_nids if nid in enclosing_nids and nid not in matched_moved
+    ]
+    if lost_enclosing:
+        raise TransformLegalityError(
+            f"move(block={block_nid} under loop={target_loop_nid}) would detach the block "
+            f"from enclosing loop(s) {lost_enclosing} that bind its iter_values"
+        )
+    local_set = set(local_nids)
+    matched_local_nids = tuple(moved_nid for moved_nid, _target_nid in matched if moved_nid in local_set)
+    if matched_local_nids != tuple(local_nids[: len(matched_local_nids)]):
+        raise TransformLegalityError(
+            f"move(block={block_nid} under loop={target_loop_nid}) matched local loops "
+            f"{matched_local_nids} that are not an outer prefix of {local_nids}"
+        )
+    return _PrefixPlan(
+        target_loop_nids=tuple(target_nids),
+        local_loop_nids=tuple(local_nids),
+        matched_loop_nids=tuple(matched),
+        matched_local_nids=matched_local_nids,
+        duplicated_target_nids=tuple(duplicated),
+    )
+
+
 def _assert_single_parent(tree: KernelTree) -> None:
     """Raise loudly if any node has more than one parent after a move.
 
@@ -119,80 +259,46 @@ def _assert_single_parent(tree: KernelTree) -> None:
 
 def _check_same_loop_prefix(ir: KernelIR, block_nid: int, target_loop_nid: int) -> list[tuple[str, int]]:
     """Raise TransformLegalityError unless the target's enclosing loops, restricted
-    to the moved block's DEPENDENT dims, are an exact ``(loop_var, extent)`` prefix
-    of the moved block's loop nest.
+    to the moved block's dependent dimensions, are an exact ``(dimension, extent)``
+    prefix of the moved block's bound loop sequence.
 
     Pure, read-only. Returns ``target_seq`` (the full target nest) for the dependency
-    check. A moved block is tiled only by the dims it indexes — exactly the loop vars
-    in ``moved_seq`` (its own nest). A target loop whose var the block does NOT bind
-    is a *non-dependent* (DUPLICATION) loop: splicing the block under it replicates
-    the block across that loop's iterations. That is correct for a pure producer (a
-    reload re-writes the same buffer — e.g. an N-invariant ``lhs_T`` load reloaded per
-    N-block, matching the hand kernel) and is REJECTED for an accumulation block by
-    ``_check_no_reduction_replicated`` (re-running a reduction per non-tiled iteration
-    corrupts). So only the dependent loops must line up:
-
-    > legal iff ``[t for t in target_seq if t.var in moved_vars]`` is an exact prefix
-    > of ``moved_seq``.
+    check. Target loops already enclosing the moved block retain their node identity.
+    A new target loop on a dimension absent from the block's bindings is a duplication
+    loop: correct for a pure producer, but rejected for an accumulation block.
 
     A dependent-dim mismatch (different extent / dim / order) rejects loudly
-    (``Split`` / ``Reorder`` first). This replaces the old per-dim
-    ``solve_iter_domains`` coverage, whose product-matching collapsed a moved block's
-    own inner loop (a memset's private ``i_d2_1``) onto a same-extent enclosing loop
-    (the matmul's ``i_d2_0``), re-zeroing only one tile. The replication guard uses
-    the full target var set to reject accumulation duplication.
+    (``Split`` / ``Reorder`` first). Matching by dimension instead of identifier is
+    required because independently normalized blocks can assign different dense
+    names to equivalent loops.
     """
     target_seq = _target_loop_seq(ir.tree, target_loop_nid)
-    moved_seq = _moved_loop_seq(ir.tree, block_nid)
     block = ir.tree.data(block_nid)
     assert isinstance(block, BlockNode)
-    bound_vars = _iter_value_loopvars(block)
-    target_vars = {loop_var for loop_var, _extent in target_seq}
-    lost_enclosing: list[str] = []
-    for ancestor in ir.tree.ancestors(block_nid):
-        node = ir.tree.data(ancestor)
-        if isinstance(node, ForNode) and node.loop_var in bound_vars and node.loop_var not in target_vars:
-            lost_enclosing.append(node.loop_var)
-    if lost_enclosing:
-        raise TransformLegalityError(
-            f"move(block={block_nid} under loop={target_loop_nid}) would detach the block "
-            f"from enclosing loop(s) {lost_enclosing} that bind its iter_values"
-        )
-    moved_vars = {lv for lv, _e in moved_seq}
-    dep_target = [(lv, e) for lv, e in target_seq if lv in moved_vars]
-    if dep_target != moved_seq[: len(dep_target)]:
-        raise TransformLegalityError(
-            f"move(block={block_nid} under loop={target_loop_nid}) requires the target's enclosing "
-            f"loops on the moved block's DEPENDENT dims to be an exact (loop_var, extent) prefix of "
-            f"the moved block's loops; dependent-target={dep_target} is not a prefix of "
-            f"moved={moved_seq} (Split / Reorder the mismatched loop first)"
-        )
-    covered_vars = {lv for lv, _e in target_seq}
-    _check_no_reduction_replicated(ir, block_nid, target_loop_nid, covered_vars)
+    plan = _prefix_plan(ir.tree, block_nid, target_loop_nid)
+    _check_no_reduction_replicated(ir, block_nid, target_loop_nid, plan.duplicated_target_nids)
     return target_seq
 
 
-def _check_no_reduction_replicated(ir: KernelIR, block_nid: int, target_loop_nid: int, covered_vars: set[str]) -> None:
+def _check_no_reduction_replicated(
+    ir: KernelIR, block_nid: int, target_loop_nid: int, duplicated_target_nids: tuple[int, ...]
+) -> None:
     """Reject sinking a reduction block under a target loop var the block does NOT
     bind (would replicate the accumulation, not re-init it).
 
     A block with an ACCUMULATION axis accumulates into a carried buffer
     (matmul → ``psum_prod``) whose init (memset) sits outside the block. The
-    same-prefix rule already requires every target loop var to appear in the moved
-    block's nest, so a clean prefix match cannot replicate. This guard remains as a
-    defensive backstop: if any covered (prefix) loop var is absent from the block's
-    bound loop vars, splicing under it would blindly replicate the whole K
-    accumulation into the SAME accumulator region per iteration (sim: garbled, not
-    NaN). PARALLEL producers replicated this way are a benign recompute; only an
-    ACCUMULATION block corrupts.
+    ``duplicated_target_nids`` are target loops that are neither existing shared
+    ancestors nor matched dependent-prefix loops. Splicing under one repeats the
+    whole accumulation into the same region. Parallel producers may be recomputed;
+    accumulation blocks may not.
     """
     block = ir.tree.data(block_nid)
     assert isinstance(block, BlockNode)
     if not any(iv.role == AxisRole.ACCUMULATION for iv in block.iter_vars):
         return
-    bound = {lv for lv, _e in _moved_loop_seq(ir.tree, block_nid)}
-    replicated = sorted(covered_vars - bound)
-    if replicated:
+    if duplicated_target_nids:
+        replicated = [ir.tree.loop(nid).loop_var for nid in duplicated_target_nids]
         raise TransformLegalityError(
             f"move(block={block_nid} under loop={target_loop_nid}) replicates a reduction over "
             f"loop(s) {replicated} the block does not bind; the accumulation would re-run per "
@@ -205,15 +311,9 @@ def _crossed_execution_loops(ir: KernelIR, block_nid: int, target_loop_nid: int)
     tree = ir.tree
     leaf = ir.dependency._resolve(block_nid)
     old_loops = [nid for nid in tree.ancestors(leaf) if isinstance(tree.data(nid), ForNode)]
-    local_loops = [nid for nid in old_loops if block_nid in tree.ancestors(nid)]
-    target_loops = [
-        nid for nid in [*tree.ancestors(target_loop_nid), target_loop_nid] if isinstance(tree.data(nid), ForNode)
-    ]
-    moved_vars = {tree.loop(nid).loop_var for nid in old_loops}
-    covered_prefix = sum(1 for nid in target_loops if tree.loop(nid).loop_var in moved_vars)
-    enclosing_count = len(old_loops) - len(local_loops)
-    local_prefix_drop = max(0, covered_prefix - enclosing_count)
-    new_loops = [*target_loops, *local_loops[local_prefix_drop:]]
+    plan = _prefix_plan(tree, block_nid, target_loop_nid)
+    local_prefix_drop = len(plan.matched_local_nids)
+    new_loops = [*plan.target_loop_nids, *plan.local_loop_nids[local_prefix_drop:]]
 
     unmatched_new = list(new_loops)
     crossed: list[int] = []

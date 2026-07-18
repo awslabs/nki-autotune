@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from test._simulation import assert_matmul_ir_simulates
+from test.transforms._fixtures import build_canonical_ir, f_matmul
+from test.transforms._helpers import block_for_op
+from test.transforms._ladder_compare import assert_matches_hand
 from test.transforms._rfactor_fixtures import (
-    k28_ir,
-    k28_ko_loop_nid,
+    k32_ir,
+    k32_ko_loop_nid,
     ko_loop_nid,
     matmul_leaf_nid,
     mid_ladder_ir,
@@ -15,9 +18,13 @@ from test.transforms._rfactor_fixtures import (
 
 import pytest
 
-from nkigym.ir import KernelIR
-from nkigym.ir.tree import BlockNode, ForNode, ISANode
-from nkigym.ops.base import AxisRole
+from examples import manual_transforms
+from nkigym.codegen import render
+from nkigym.ir import KernelIR, build_initial_ir
+from nkigym.ir.arith.expr import Const, FloorDiv, Mul, Sub, Var
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
+from nkigym.ops.base import AxisRole, ReduceCombinator
+from nkigym.ops.matmul import NKIMatmul
 from nkigym.transforms import (
     BufferCompaction,
     BufferCompactionOption,
@@ -27,8 +34,11 @@ from nkigym.transforms import (
     CodeMotionOption,
     RFactor,
     RFactorOption,
+    Split,
+    SplitOption,
     TransformLegalityError,
 )
+from nkigym.transforms.code_motion import _move
 
 
 def _rfactored_ir():
@@ -91,6 +101,22 @@ def test_analyze_finds_only_reduction_loops() -> None:
         assert node.loop_var.startswith("i_d0_")
 
 
+def test_rfactor_rejects_unsplit_reduction_loop() -> None:
+    """RFactor requires a prior Split that produces distinct ko and ki loops."""
+    ir = build_canonical_ir()
+    matmul = matmul_leaf_nid(ir)
+    unsplit_k = next(
+        nid
+        for nid in ir.tree.ancestors(matmul)
+        if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var == "i_d0_0"
+    )
+    option = RFactorOption(target_loop_nid=unsplit_k, factor_axis=0)
+
+    assert option not in RFactor().analyze(ir)
+    with pytest.raises(TransformLegalityError, match="exactly two loops"):
+        RFactor().apply(ir, option)
+
+
 def test_rfactor_rejects_inner_reduction_loop() -> None:
     """Only the outermost reduction loop can own the generated second-stage fold."""
     ir = split_k_ir()
@@ -105,6 +131,32 @@ def test_rfactor_rejects_inner_reduction_loop() -> None:
     with pytest.raises(TransformLegalityError, match="outermost"):
         RFactor().apply(ir, option)
     assert option not in RFactor().analyze(ir)
+
+
+def test_rfactor_rejects_more_than_two_reduction_loops() -> None:
+    """The emitted fold metadata represents one ko/ki split, not a deeper K nest."""
+    ir = split_k_ir()
+    matmul = matmul_leaf_nid(ir)
+    inner = next(
+        nid
+        for nid in ir.tree.ancestors(matmul)
+        if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var == "i_d0_1"
+    )
+    ir = Split().apply(ir, SplitOption(target_nid=inner, factors=(2, 4), target_axis=None))
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+
+    assert option not in RFactor().analyze(ir)
+    with pytest.raises(TransformLegalityError, match="exactly two loops"):
+        RFactor().apply(ir, option)
+
+
+def test_apply_rejects_nonzero_factor_axis() -> None:
+    """The fused recipe has no inserted factor axis, so only axis 0 is supported."""
+    ir = split_k_ir()
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=1)
+
+    with pytest.raises(TransformLegalityError, match="factor_axis must be 0"):
+        RFactor().apply(ir, option)
 
 
 def test_apply_rejects_non_forNode() -> None:
@@ -153,6 +205,129 @@ def test_apply_rejects_drain_block_that_contains_the_output_store() -> None:
     assert option not in RFactor().analyze(ir)
 
 
+def test_apply_rejects_drain_sunk_inside_factored_loop() -> None:
+    """The one-stage drain must close after ko, not consume each partial inside it."""
+    ir = split_k_ir()
+    ko = ko_loop_nid(ir)
+    _move(ir, block_nid=block_for_op(ir, "NKITensorCopy"), target_loop_nid=ko, index=1)
+    option = RFactorOption(target_loop_nid=ko, factor_axis=0)
+
+    assert option not in RFactor().analyze(ir)
+    with pytest.raises(TransformLegalityError, match="outside-loop"):
+        RFactor().apply(ir, option)
+
+
+def test_apply_rejects_missing_one_stage_init() -> None:
+    """Analyze must not offer an option that apply cannot retarget."""
+    ir = split_k_ir()
+    init = next(
+        nid
+        for nid in ir.tree.preorder()
+        if isinstance((node := ir.tree.data(nid)), ISANode)
+        and node.op_cls.NAME == "memset"
+        and node.operand_bindings["dst"].tensor == "psum_prod"
+    )
+    rfactor = RFactor()
+    rfactor._remove_flat_block(ir.tree, init)
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+
+    assert option not in rfactor.analyze(ir)
+    with pytest.raises(TransformLegalityError, match="canonical outside-loop init"):
+        rfactor.apply(ir, option)
+
+
+def test_apply_rejects_unsupported_rmw_combiner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The generated tensor_tensor fold must have a known associative operator."""
+    ir = split_k_ir()
+    monkeypatch.setattr(NKIMatmul, "REDUCE_COMBINATOR", ReduceCombinator(combiner="max", identity=0.0))
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+
+    assert option not in RFactor().analyze(ir)
+    with pytest.raises(TransformLegalityError, match="supported combiner"):
+        RFactor().apply(ir, option)
+
+
+def test_apply_rejects_noncontiguous_free_footprint() -> None:
+    """Absorbing a reversed free loop into one wide operation is unsupported."""
+    ir = split_k_ir()
+    matmul_nid = matmul_leaf_nid(ir)
+    matmul = ir.tree.isa(matmul_nid)
+    dst = matmul.operand_bindings["dst"]
+    reversed_lo = Sub(left=Const(value=1536), right=Mul(left=Var(name="i_d2_0"), right=Const(value=512)))
+    reversed_dst = BufferRegion(tensor=dst.tensor, ranges=(dst.ranges[0], (reversed_lo, dst.ranges[1][1])))
+    ir.tree.graph.nodes[matmul_nid]["data"] = replace(
+        matmul, operand_bindings={**matmul.operand_bindings, "dst": reversed_dst}
+    )
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+
+    assert option not in RFactor().analyze(ir)
+    with pytest.raises(TransformLegalityError, match="contiguous gadget footprint"):
+        RFactor().apply(ir, option)
+
+
+def test_analyze_rejects_non_affine_free_footprint() -> None:
+    """Unsupported output indexing must withhold the option instead of raising."""
+    ir = k32_ir()
+    matmul_nid = matmul_leaf_nid(ir)
+    matmul = ir.tree.isa(matmul_nid)
+    dst = matmul.operand_bindings["dst"]
+    non_affine_lo = FloorDiv(left=Var(name="i_d2_0"), right=Const(value=2))
+    non_affine_dst = BufferRegion(tensor=dst.tensor, ranges=(dst.ranges[0], (non_affine_lo, dst.ranges[1][1])))
+    ir.tree.graph.nodes[matmul_nid]["data"] = replace(
+        matmul, operand_bindings={**matmul.operand_bindings, "dst": non_affine_dst}
+    )
+    option = RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0)
+
+    assert option not in RFactor().analyze(ir)
+    with pytest.raises(TransformLegalityError, match="contiguous gadget footprint"):
+        RFactor().apply(ir, option)
+
+
+def test_apply_rejects_non_identity_drain_mapping() -> None:
+    """RFactor must not discard a drain's distinct source-to-output indexing."""
+    ir = split_k_ir()
+    drain_nid = next(
+        nid
+        for nid in ir.tree.preorder()
+        if isinstance((node := ir.tree.data(nid)), ISANode) and node.op_cls.NAME == "tensor_copy"
+    )
+    drain = ir.tree.isa(drain_nid)
+    dst = drain.operand_bindings["dst"]
+    mismatched_dst = BufferRegion(tensor=dst.tensor, ranges=((Const(value=0), dst.ranges[0][1]), dst.ranges[1]))
+    ir.tree.graph.nodes[drain_nid]["data"] = replace(
+        drain, operand_bindings={**drain.operand_bindings, "dst": mismatched_dst}
+    )
+    option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+
+    assert option not in RFactor().analyze(ir)
+    with pytest.raises(TransformLegalityError, match="identity-mapped"):
+        RFactor().apply(ir, option)
+
+
+def test_apply_avoids_staging_buffer_name_collision() -> None:
+    """A pre-existing ``sbuf_rfactor`` allocation gets a deterministic suffix."""
+    ir = split_k_ir()
+    for block_nid in ir.tree.blocks():
+        block = ir.tree.block(block_nid)
+        if not any(buf.name == "psum_prod" for buf in block.alloc_buffers):
+            continue
+        existing = replace(ir.buffer("sbuf_prod"), name="sbuf_rfactor")
+        ir.tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=(*block.alloc_buffers, existing))
+        break
+
+    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0))
+    assert rfactored.buffer("sbuf_rfactor").shape == ir.buffer("sbuf_prod").shape
+    assert rfactored.buffer("sbuf_rfactor_1").shape == ir.buffer("sbuf_prod").shape
+    generated_copy = next(
+        rfactored.tree.isa(nid)
+        for nid in rfactored.tree.preorder()
+        if isinstance((node := rfactored.tree.data(nid)), ISANode)
+        and node.op_cls.NAME == "tensor_copy"
+        and node.operand_bindings["src"].tensor == "psum_prod"
+    )
+    assert generated_copy.operand_bindings["dst"].tensor == "sbuf_rfactor_1"
+
+
 def test_apply_rejects_partition_footprint_larger_than_compact_output() -> None:
     """RFactor cannot materialize 16 partition tiles in a one-tile output buffer."""
     ir = _compact_sbuf_prod_under_store(split_k_ir())
@@ -163,7 +338,7 @@ def test_apply_rejects_partition_footprint_larger_than_compact_output() -> None:
 
     assert ir.buffer("sbuf_prod").shape == (128, 2048)
     assert ir.buffer("sbuf_prod").physical_shape() == (128, 1, 2048)
-    assert rfactor._drain_block_is_removable(ir, matmul_leaf)
+    assert not rfactor._drain_block_is_removable(ir, option.target_loop_nid, matmul_leaf)
     assert rfactor._footprint(ir, ki_nid, matmul_leaf) == [("i_d1_0", 16)]
     assert not rfactor._gadget_region_fits_output(ir, option.target_loop_nid, matmul_leaf)
     with pytest.raises(TransformLegalityError, match="footprint|capacity"):
@@ -191,10 +366,10 @@ def test_apply_rejects_product_of_multiple_footprint_extents() -> None:
 
 def test_apply_rejects_inherited_partition_offsets_larger_than_compact_output() -> None:
     """Outer M loops must fit even when the inner materialized footprint is empty."""
-    ir = k28_ir()
+    ir = k32_ir()
     _replace_sbuf_prod(ir, shape=(128, 512), versions=2, list_len=1)
     rfactor = RFactor()
-    option = RFactorOption(target_loop_nid=k28_ko_loop_nid(ir), factor_axis=0)
+    option = RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0)
     matmul_leaf = matmul_leaf_nid(ir)
     ki_nid = rfactor._ki_loop_nid(ir, option.target_loop_nid)
 
@@ -258,6 +433,26 @@ def test_ko_roles_split_across_blocks() -> None:
     assert AxisRole.ACCUMULATION in roles
 
 
+def test_generated_gadgets_inherit_non_square_matmul_domains() -> None:
+    """Generated block metadata derives K and M independently."""
+    input_specs = {"lhs_T": ((512, 256), "bfloat16"), "rhs": ((512, 512), "bfloat16")}
+    ir = build_initial_ir(f_matmul, input_specs)
+    matmul = matmul_leaf_nid(ir)
+    k_loop = next(
+        nid
+        for nid in ir.tree.ancestors(matmul)
+        if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var == "i_d0_0"
+    )
+    ir = Split().apply(ir, SplitOption(target_nid=k_loop, factors=(2, 2), target_axis=None))
+    ir = RFactor().apply(ir, RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0))
+
+    generated = [ir.tree.block(nid) for nid in ir.tree.blocks() if set(ir.tree.block(nid).axis_map) == {"K", "P", "F"}]
+    assert len(generated) == 3
+    for block in generated:
+        domains = {iter_var.axis: iter_var.dom for iter_var in block.iter_vars}
+        assert domains == {"d0": (0, 512), "d1": (0, 256), "d2": (0, 512)}
+
+
 def test_rf_memset_drain_nested_in_ko() -> None:
     """Spec §3.1: the rf-init memset and rf-drain tensor_copy are nested INSIDE the
     matmul's ko loop (per-slot), NOT flat sibling blocks outside it.
@@ -296,8 +491,54 @@ def test_rf_memset_drain_nested_in_ko() -> None:
     assert ko in ir.tree.ancestors(rf_drain), "rf-drain tensor_copy must be nested inside the ko loop"
 
 
-def test_apply_sim_matches_matmul_k28_to_k29(tmp_path) -> None:
-    """The k28->k29 rfactored kernel sims numerically equal to lhs_T.T @ rhs."""
-    ir = k28_ir()
-    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k28_ko_loop_nid(ir), factor_axis=0))
-    assert_matmul_ir_simulates(rfactored, tmp_path, "rfactor_k28_to_k29")
+def test_apply_byte_exact_k32_to_k33() -> None:
+    """Structural RFactor alone reproduces the hand-written k33 rung."""
+    ir = k32_ir()
+    unchanged = ir.all_buffers()
+    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
+
+    assert all(rfactored.buffer(name) == buf for name, buf in unchanged.items())
+    assert (rfactored.buffer("psum_prod").shape, rfactored.buffer("psum_prod").list_len) == ((2048, 512), 16)
+    assert (rfactored.buffer("sbuf_rfactor").shape, rfactored.buffer("sbuf_rfactor").list_len) == ((2048, 512), 1)
+    compactable = {option.tensor for option in BufferCompaction().analyze(rfactored)}
+    assert {"psum_prod", "sbuf_rfactor"} <= compactable
+    assert_matches_hand(render(rfactored), manual_transforms.kernel_33)
+
+
+def test_apply_byte_exact_k33_to_k34() -> None:
+    """The first explicit compaction tightens only the PSUM partial."""
+    ir = k32_ir()
+    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
+    compacted = BufferCompaction().apply(rfactored, BufferCompactionOption(tensor="psum_prod"))
+
+    assert (compacted.buffer("psum_prod").shape, compacted.buffer("psum_prod").list_len) == ((128, 512), 1)
+    assert (compacted.buffer("sbuf_rfactor").shape, compacted.buffer("sbuf_rfactor").list_len) == ((2048, 512), 1)
+    compactable = {option.tensor for option in BufferCompaction().analyze(compacted)}
+    assert "psum_prod" not in compactable
+    assert "sbuf_rfactor" in compactable
+    assert_matches_hand(render(compacted), manual_transforms.kernel_34)
+
+
+def test_apply_byte_exact_k34_to_k35() -> None:
+    """The second explicit compaction tightens only the staging buffer."""
+    ir = k32_ir()
+    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
+    compacted = BufferCompaction().apply(rfactored, BufferCompactionOption(tensor="psum_prod"))
+    final = BufferCompaction().apply(compacted, BufferCompactionOption(tensor="sbuf_rfactor"))
+
+    assert (final.buffer("psum_prod").shape, final.buffer("psum_prod").list_len) == ((128, 512), 1)
+    assert (final.buffer("sbuf_rfactor").shape, final.buffer("sbuf_rfactor").list_len) == ((128, 512), 1)
+    compactable = {option.tensor for option in BufferCompaction().analyze(final)}
+    assert "psum_prod" not in compactable
+    assert "sbuf_rfactor" not in compactable
+    assert_matches_hand(render(final), manual_transforms.kernel_35)
+
+
+def test_apply_sim_matches_matmul_k32_to_k35(tmp_path) -> None:
+    """Structural RFactor and both compactions preserve the matmul result."""
+    ir = k32_ir()
+    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
+    assert_matmul_ir_simulates(rfactored, tmp_path, "rfactor_k32_to_k33")
+    compacted = BufferCompaction().apply(rfactored, BufferCompactionOption(tensor="psum_prod"))
+    final = BufferCompaction().apply(compacted, BufferCompactionOption(tensor="sbuf_rfactor"))
+    assert_matmul_ir_simulates(final, tmp_path, "rfactor_k35")
