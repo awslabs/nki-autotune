@@ -8,6 +8,8 @@ from test.transforms._pipeline_fixtures import m_loop_and_children, tuned_ir
 
 import pytest
 
+from nkigym.ir import KernelIR
+from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode
 from nkigym.ops.base import AxisRole
 from nkigym.transforms import (
@@ -23,12 +25,28 @@ from nkigym.transforms import (
     SplitOption,
     TransformLegalityError,
 )
+from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.code_motion import _check_same_loop_prefix, _move
 
 
 def _innermost_for(ir, block_nid: int) -> int:
     leaf = next(d for d in ir.tree.preorder(block_nid) if isinstance(ir.tree.data(d), ISANode))
     return ir.tree.ancestors(leaf)[-1]
+
+
+def _rfactored_with_ambient_loop(loop_var: str, extent: int) -> tuple[KernelIR, int]:
+    """RFactor a two-way K split with one unbound loop surrounding ``ki``."""
+    ir = build_canonical_ir()
+    ir = Split().apply(ir, SplitOption(target_nid=matmul_loop(ir, "i_d0_0"), factors=(2, 8), target_axis=None))
+    ki = matmul_loop(ir, "i_d0_1")
+    parent = ir.tree.parent(ki)
+    assert parent is not None
+    ambient = ir.tree.add_node(ForNode(loop_var=loop_var, extent=extent))
+    _replace_in_parent_children(ir.tree, parent, [ki], [ambient])
+    ir.tree.graph.add_edge(ambient, ki)
+    ir.dependency = Dependency(ir.tree)
+    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=matmul_loop(ir, "i_d0_0"), factor_axis=0))
+    return rfactored, ambient
 
 
 def test_move_lifts_tensor_copy_under_matmul_inner_loop():
@@ -161,12 +179,7 @@ def test_code_motion_rejects_sinking_writer_under_accumulation_loop():
 
 def test_code_motion_rejects_hoisting_rmw_reset_across_reduction_loop():
     """Hoisting an invariant reset out of an invariant RMW loop changes its frequency."""
-    ir = build_canonical_ir()
-    ir = Split().apply(ir, SplitOption(target_nid=matmul_loop(ir, "i_d0_0"), factors=(2, 4, 2), target_axis=None))
-    ir = Split().apply(ir, SplitOption(target_nid=matmul_loop(ir, "i_d1_0"), factors=(4, 4), target_axis=None))
-    ir = Reorder().apply(ir, ReorderOption(outer_nid=matmul_loop(ir, "i_d0_2"), inner_nid=matmul_loop(ir, "i_d1_0")))
-    ir = Reorder().apply(ir, ReorderOption(outer_nid=matmul_loop(ir, "i_d0_1"), inner_nid=matmul_loop(ir, "i_d1_0")))
-    ir = RFactor().apply(ir, RFactorOption(target_loop_nid=matmul_loop(ir, "i_d0_0"), factor_axis=0))
+    ir, _ambient = _rfactored_with_ambient_loop("i_d3_0", 2)
     psum_memset_leaf = next(
         nid
         for nid in ir.tree.preorder()
@@ -179,7 +192,7 @@ def test_code_motion_rejects_hoisting_rmw_reset_across_reduction_loop():
         for ancestor in reversed(ir.tree.ancestors(psum_memset_leaf))
         if isinstance(ir.tree.data(ancestor), BlockNode)
     )
-    option = CodeMotionOption(block_nid=psum_memset, target_loop_nid=matmul_loop(ir, "i_d1_0"), index=0)
+    option = CodeMotionOption(block_nid=psum_memset, target_loop_nid=matmul_loop(ir, "i_d0_0"), index=0)
 
     with pytest.raises(TransformLegalityError, match="reset|read-modify-write"):
         CodeMotion().apply(ir, option)
@@ -209,9 +222,7 @@ def test_code_motion_rejects_rmw_moved_into_invariant_reset_loop():
 
 def test_code_motion_rejects_hoisting_consumer_out_of_producer_loop():
     """A consumer cannot leave a loop that produces its invariant input each iteration."""
-    ir = build_canonical_ir()
-    ir = Split().apply(ir, SplitOption(target_nid=matmul_loop(ir, "i_d0_0"), factors=(2, 2, 4), target_axis=None))
-    ir = RFactor().apply(ir, RFactorOption(target_loop_nid=matmul_loop(ir, "i_d0_0"), factor_axis=0))
+    ir, _ambient = _rfactored_with_ambient_loop("i_d3_0", 2)
     fold = block_for_op(ir, "NKITensorTensor")
     option = CodeMotionOption(block_nid=fold, target_loop_nid=matmul_loop(ir, "i_d0_0"), index=1)
 
@@ -222,12 +233,9 @@ def test_code_motion_rejects_hoisting_consumer_out_of_producer_loop():
 
 def test_code_motion_rejects_consumer_moved_to_equal_sibling_loop():
     """Equal loop payloads do not make distinct sibling execution scopes equivalent."""
-    ir = build_canonical_ir()
-    ir = Split().apply(ir, SplitOption(target_nid=matmul_loop(ir, "i_d0_0"), factors=(2, 2, 4), target_axis=None))
-    ir = RFactor().apply(ir, RFactorOption(target_loop_nid=matmul_loop(ir, "i_d0_0"), factor_axis=0))
+    ir, old_inner = _rfactored_with_ambient_loop("i_d1_9", 16)
     fold = block_for_op(ir, "NKITensorTensor")
     outer = matmul_loop(ir, "i_d0_0")
-    old_inner = matmul_loop(ir, "i_d0_1")
     target_sibling = ir.tree.add_node(ir.tree.data(old_inner), parent=outer)
     option = CodeMotionOption(block_nid=fold, target_loop_nid=target_sibling, index=0)
 

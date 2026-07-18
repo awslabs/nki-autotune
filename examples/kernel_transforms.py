@@ -1,15 +1,15 @@
 """Reproduce the ``manual_transforms.py`` ladder by DRIVING the shipped transforms.
 
 GOAL: drive the shipped transforms (Split / Reorder / CodeMotion /
-BufferCompaction / BufferLayout) from the canonical SSA matmul ``f_nkigym`` (==
-``manual_transforms.py`` kernel_0), ONE transform per rung, so the machine-driven
-ladder reproduces the hand ladder RUNG-FOR-RUNG, BYTE-EXACT. ``_main`` renders every
-rung, asserts it AST-matches the corresponding ``manual_transforms.kernel_i``
-(``assert_matches_hand``), CPU-sims it against ``lhs_T.T @ rhs``, and compiles +
-profiles each on real Trn2 hardware.
+BufferCompaction / BufferLayout / RFactor) from the canonical SSA matmul
+``f_nkigym`` (== ``manual_transforms.py`` kernel_0), ONE transform per rung, so the
+machine-driven ladder reproduces the hand ladder RUNG-FOR-RUNG, BYTE-EXACT. ``_main``
+renders every rung, asserts it AST-matches the corresponding
+``manual_transforms.kernel_i`` (``assert_matches_hand``), CPU-sims it against
+``lhs_T.T @ rhs``, and compiles + profiles each on real Trn2 hardware.
 
-d0 = K (reduction), d1 = M, d2 = N. ``_build_ladder`` is 32 transforms
-(k0..k32):
+d0 = K (reduction), d1 = M, d2 = N. ``_build_ladder`` is 35 transforms
+(k0..k35):
   k1-k2   Reorder x2   bubble N(i_d2_0) outermost (each an adjacent-swap; the manual
                        "# Reorder" from K>M>N to N>K>M is two atomic swaps -> k1, k2)
   k3-k4   Split x2     K -> ko(2),ki(8); M -> Mo(4),Mi(4)
@@ -24,8 +24,8 @@ d0 = K (reduction), d1 = M, d2 = N. ``_build_ladder`` is 32 transforms
   k25-k26 BufferCompaction sbuf_rhs, then BufferLayout -> list-of-8
   k27-k30 lhs_T load: Split d1, Split d0(2,8), Reorder, structural CodeMotion
   k31-k32 BufferCompaction sbuf_lhs_T, then BufferLayout -> list-of-8
-
-RFactor is the manual k33 rung and is intentionally deferred.
+  k33     RFactor ko -> structural two-stage PSUM partial + SBUF fold
+  k34-k35 BufferCompaction PSUM partial, then SBUF staging
 
 Every locator is SEMANTIC
 (matmul loop_var, op-class block, load/PSUM leaf), tracking node ids across each
@@ -72,6 +72,8 @@ from nkigym.transforms import (
     CodeMotionOption,
     Reorder,
     ReorderOption,
+    RFactor,
+    RFactorOption,
     Split,
     SplitOption,
 )
@@ -326,13 +328,13 @@ def _blk_m_loop(ir: KernelIR, op_name: str) -> int:
 
 def _build_ladder() -> list[tuple[str, KernelIR]]:
     """Drive the shipped transforms from canonical ``f_nkigym`` to ``manual_transforms``
-    k0..k32, ONE transform per rung, in MANUAL rung order. Returns 33 named states.
+    k0..k35, ONE transform per rung, in MANUAL rung order. Returns 36 named states.
 
     Every locator is SEMANTIC (matmul loop_var, op-class block, load/PSUM leaf), so it
     tracks node ids across the structural change each ``apply`` makes. CodeMotion is
     structural-only; k14/k19/k25/k31 explicitly compact the moved buffer, and the
-    following BufferLayout rungs re-factorize it into list form. Manual k33's RFactor
-    is out of scope.
+    following BufferLayout rungs re-factorize it into list form. RFactor is likewise
+    structural-only; k34/k35 explicitly compact its PSUM partial and staging buffer.
 
     k1-k6   Reorder x2 (N-outer, two atomic swaps) + Split K + Split M + Reorder x2
             -> matmul nest ``N > ko > Mo > Mi > ki`` (manual k6's packed nest)
@@ -343,6 +345,8 @@ def _build_ladder() -> list[tuple[str, KernelIR]]:
     k16-k19 psum memset: Split, Reorder, CodeMotion, BufferCompaction
     k20-k26 rhs load: Split x2, Reorder x2, CodeMotion, BufferCompaction, BufferLayout
     k27-k32 lhs_T load: Split x2, Reorder, CodeMotion, BufferCompaction, BufferLayout
+    k33     RFactor on ko -> two-stage fused PSUM partial + SBUF accumulator
+    k34-k35 BufferCompaction psum_prod, then sbuf_rfactor
     """
     steps = [
         lambda ir: Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d1_0"), inner_nid=_loop(ir, "i_d2_0"))),
@@ -403,6 +407,9 @@ def _build_ladder() -> list[tuple[str, KernelIR]]:
         ),
         lambda ir: BufferCompaction().apply(ir, BufferCompactionOption(tensor="sbuf_lhs_T")),
         lambda ir: BufferLayout().apply(ir, BufferLayoutOption(tensor="sbuf_lhs_T", list_len=8)),
+        lambda ir: RFactor().apply(ir, RFactorOption(target_loop_nid=_loop(ir, "i_d0_0"), factor_axis=0)),
+        lambda ir: BufferCompaction().apply(ir, BufferCompactionOption(tensor="psum_prod")),
+        lambda ir: BufferCompaction().apply(ir, BufferCompactionOption(tensor="sbuf_rfactor")),
     ]
     ir = build_initial_ir(f_nkigym, INPUT_SPECS)
     ladder = [("kernel_0", ir)]
@@ -463,7 +470,7 @@ def _main() -> None:
     inputs = {nm: rng.standard_normal(shape).astype(np.float32) for nm, (shape, _d) in INPUT_SPECS.items()}
     expected = inputs["lhs_T"].T @ inputs["rhs"]
 
-    """Each entry: (name, standalone-module source). The driven ladder (k0..k32)
+    """Each entry: (name, standalone-module source). The driven ladder (k0..k35)
     comes from rendering the transform-driven IR states; kernel_target is the
     AST-extracted hand kernel, profiled beside the endpoint as the perf reference."""
     ladder = _build_ladder()
