@@ -22,7 +22,7 @@ def _build_m_outer_store_sink_intermediate() -> KernelIR:
     Builds a topology where both touchers (tensor_copy, store) share an enclosing
     i_d1_0 loop, giving sbuf_prod BOTH M and N compaction anchors. Shape compacts
     to (128, 512). The manual-ladder N-outer case (only N anchored, compacts to
-    (2048, 512)) is covered by the byte-exact manual_transforms.kernel_14 test.
+    (2048, 512)) is covered by the byte-exact manual-ladder kernel_14 test.
     """
     """Start from state 12, apply Split store (12->13), then CodeMotion _move (13->14) without the tail."""
     ir12 = build_ladder_state(12)

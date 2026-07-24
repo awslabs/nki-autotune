@@ -30,6 +30,8 @@ class TensorDims:
             intermediates this propagates from the first input's logical
             dtype through the trace; for params it is seeded directly from
             the ``input_specs`` ``(shape, dtype)`` entry.
+        storage_dtype: Optional physical allocation dtype override supplied by
+            the producing op. ``None`` means the logical ``dtype``.
     """
 
     name: str
@@ -37,6 +39,7 @@ class TensorDims:
     dim_ids: tuple[str, ...]
     location: str
     dtype: str
+    storage_dtype: str | None
 
 
 @dataclass
@@ -118,6 +121,7 @@ def analyze_dimensions(
             dim_ids=tuple(d for d in sym.dim_ids if d is not None),
             location=sym.location,
             dtype=sym.dtype,
+            storage_dtype=sym.storage_dtype,
         )
     return _AnalysisResult(
         func_name=unwrapped.__name__,
@@ -132,7 +136,7 @@ def analyze_dimensions(
 class _Sym:
     """Symbolic tensor: shape + mutable ``dim_ids`` + source name + alloc kwargs."""
 
-    __slots__ = ("shape", "dim_ids", "source_name", "location", "dtype")
+    __slots__ = ("shape", "dim_ids", "source_name", "location", "dtype", "storage_dtype")
 
     def __init__(self, shape: tuple[int, ...], source_name: str) -> None:
         self.shape: tuple[int, ...] = shape
@@ -140,6 +144,7 @@ class _Sym:
         self.source_name: str = source_name
         self.location: str | None = None
         self.dtype: str | None = None
+        self.storage_dtype: str | None = None
 
 
 class _TraceState:
@@ -257,6 +262,7 @@ def _synthesize_outputs(
         sym.dim_ids = list(dim_ids)
         sym.location = cls.OUTPUT_LOCATION
         sym.dtype = logical_dtype
+        sym.storage_dtype = cls.OUTPUT_STORAGE_DTYPE
         state.sentinels[slot_name] = sym
         record.operand_names[slot] = slot_name
         if slot == primary_slot:

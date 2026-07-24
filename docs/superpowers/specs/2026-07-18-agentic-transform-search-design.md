@@ -25,8 +25,8 @@ The experiment must satisfy all of these conditions:
   MCP, web search, shell, file, browser, plugin, and subagent tools disabled.
 - The policy can only choose one legal action ID, evaluate a state, check out a
   discovered state, or finish. It cannot write or repair source.
-- Manual comparison source is read only after search terminates and the
-  selected best observed state passes numerical simulation.
+- Manual ladder source and scores remain outside the example driver and search
+  run; transform-to-manual comparison belongs to the transform tests.
 
 These restrictions are part of the experiment, not optional hardening.
 
@@ -97,25 +97,19 @@ Each run writes:
 - `observations/decision_NNN.md` with the exact policy-visible input;
 - `result.json` with the best observed node and root-to-node trace;
 - runner compile and profile artifacts under each evaluated node;
-- `selected_kernel.py` and `demonstration.json` after numerical validation;
-- a same-batch selected/manual hardware comparison under `final_comparison/`.
+- `selected_kernel.py` and `demonstration.json` after numerical validation.
 
 ## Matmul Experiment
 
-`examples/agentic_matmul_search.py` supplies the canonical 2048x2048 bf16
-matmul and all eight shipped transforms: Split, Fuse, Reorder, CodeMotion,
-RFactor, SoftwarePipeline, BufferLayout, and BufferCompaction. The policy is
-GPT-5.6-sol at maximum reasoning effort. Policy calls run locally; candidate
-profiles run on `gym-1`.
+`examples/matmul_lhsT_rhs_agentic_search.py` supplies the canonical 2048x2048
+bf16 matmul and every shipped transform. The policy is GPT-5.6-sol at maximum
+reasoning effort. Policy calls run locally; candidate profiles run on `gym-1`.
 
 The experiment is complete when:
 
 1. The search starts from canonical IR and produces a full transcript.
 2. At least one candidate compiles and is measured on Trn2.
 3. The highest-scoring observed candidate passes fp32 simulation.
-4. Only then, the selected and manual kernels are profiled together.
-5. The report states the measured MFU delta honestly, whether positive or
-   negative.
 
 ## Demonstration Result
 
@@ -124,8 +118,6 @@ transforms and 583 policy decisions. The best observed state was `N320` at
 89.0603% MFU. It passed fp32 simulation with maximum absolute error
 `1.1444e-4`.
 
-The final same-batch profile measured 89.0914% MFU for `N320` and 90.7071% for
-the manual kernel, a delta of -1.6157 percentage points. The search therefore
-did not beat the manual example within this budget. This result demonstrates
-best-observed selection and an auditable blind search; it is not a claim of a
-global optimum.
+A separate same-batch audit measured 89.0914% MFU for `N320` and 90.7071% for
+the manual kernel. That historical comparison is not part of the example
+driver; manual ladder verification belongs to the transform tests.

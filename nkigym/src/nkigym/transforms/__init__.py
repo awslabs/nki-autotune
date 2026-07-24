@@ -5,6 +5,8 @@ from nkigym.transforms.buffer_compaction import BufferCompaction, BufferCompacti
 from nkigym.transforms.buffer_layout import BufferLayout, BufferLayoutOption
 from nkigym.transforms.code_motion import CodeMotion, CodeMotionOption
 from nkigym.transforms.fuse import Fuse, FuseOption
+from nkigym.transforms.load_transpose import LoadTranspose, LoadTransposeOption
+from nkigym.transforms.matmul_transpose import MatmulTranspose, MatmulTransposeOption
 from nkigym.transforms.reorder import Reorder, ReorderOption
 from nkigym.transforms.rfactor import RFactor, RFactorOption
 from nkigym.transforms.software_pipeline import SoftwarePipeline, SoftwarePipelineOption
@@ -19,6 +21,10 @@ __all__ = [
     "CodeMotionOption",
     "Fuse",
     "FuseOption",
+    "LoadTranspose",
+    "LoadTransposeOption",
+    "MatmulTranspose",
+    "MatmulTransposeOption",
     "Reorder",
     "ReorderOption",
     "RFactor",

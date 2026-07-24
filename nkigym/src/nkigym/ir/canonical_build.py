@@ -56,7 +56,9 @@ def _collect_buffers(tensors: dict[str, "TensorDims"], param_names: list[str]) -
     out: dict[str, Buffer] = {}
     for name, td in tensors.items():
         if name not in param_names:
-            out[name] = Buffer(name=name, shape=tuple(td.shape), dtype=td.dtype, location=td.location)
+            out[name] = Buffer(
+                name=name, shape=tuple(td.shape), dtype=td.dtype, location=td.location, storage_dtype=td.storage_dtype
+            )
     return out
 
 

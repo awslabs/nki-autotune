@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from test.transforms._fixtures import build_canonical_ir
 
-import pytest
-
 from nkigym.ir.tree import BlockNode, ISANode
 from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
@@ -442,13 +440,15 @@ def test_fold_accumulator_carried_across_ko_not_broken_by_own_writeback():
     aliases its data1 rmw — that write-back must NOT be misread as a re-init, so
     sbuf_prod is carried across ko (the drain/store may not sink into ko). psum,
     re-zeroed each ko by a SEPARATE memset leaf, is correctly NOT carried across ko."""
-    import examples.kernel_transforms as K
+    from test.transforms._fixtures import INPUT_SPECS, f_matmul
+    from test.transforms._helpers import matmul_loop
+
     from nkigym.ir import build_initial_ir
     from nkigym.ir.dependency import _tensor_carried_across
     from nkigym.transforms import Reorder, ReorderOption, RFactor, RFactorOption, Split, SplitOption
 
-    loop = K._loop
-    ir = build_initial_ir(K.f_nkigym, K.INPUT_SPECS)
+    loop = matmul_loop
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     ir = Split().apply(ir, SplitOption(target_nid=loop(ir, "i_d0_0"), factors=(2, 8), target_axis=None))
     ir = Split().apply(ir, SplitOption(target_nid=loop(ir, "i_d1_0"), factors=(4, 4), target_axis=None))
     ir = Reorder().apply(ir, ReorderOption(outer_nid=loop(ir, "i_d1_1"), inner_nid=loop(ir, "i_d2_0")))

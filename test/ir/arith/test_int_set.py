@@ -1,90 +1,73 @@
-"""Oracle-gated tests for the IntSet skeleton (mirrors TVM ``src/arith/int_set.cc``).
+"""Tests for IntSet interval arithmetic.
 
-The cross-check evaluates the same affine expression and variable domain through
-TVM's ``Analyzer.int_set`` (the Python entry point onto ``IntervalSetEvaluator``)
-and asserts our ``[min, max]`` interval equals TVM's. TVM's ``dom_map`` carries
-inclusive ``[min, max]`` intervals, so a half-open ``Analyzer.bind(name, lo, hi)``
-maps to TVM's ``IntervalSet(lo, hi - 1)``.
-
-The TVM-independent halves of these checks (literal interval-math assertions)
-live in ``test_int_set_logic.py`` and run unconditionally.
+These exercise :meth:`IntSet.eval` over const-bounded affine expressions and
+:meth:`IntSet.union` / :meth:`IntSet.intersect` interval algebra.
 """
-
-import pytest
-
-tvm = pytest.importorskip("tvm")
-
-from test.ir.arith._tvm_bridge import to_tvm
-
-import tvm.tirx as T
-from tvm import arith as tarith
 
 from nkigym.ir.arith.analyzer import Analyzer
 from nkigym.ir.arith.expr import Add, Const, Mul, Sub, Var
 from nkigym.ir.arith.int_set import IntSet
 
 
-def test_eval_matches_tvm():
-    """Our EvalSet interval equals TVM's ``Analyzer.int_set`` over the same domain.
+def test_eval_affine_over_bound_var():
+    """EvalSet(x*512 + j) with x in [0,4), j in [0,512) -> interval [0, 2047]."""
+    a = Analyzer()
+    a.bind("x", 0, 4)
+    a.bind("j", 0, 512)
+    e = Add(left=Mul(left=Var(name="x"), right=Const(value=512)), right=Var(name="j"))
+    s = IntSet.eval(e, a)
+    assert s.min_value == Const(value=0)
+    assert s.max_value == Const(value=2047)
 
-    Direct TVM IntSet eval: ``Analyzer.int_set(expr, dom_map)`` runs the
-    ``IntervalSetEvaluator`` and returns an ``IntervalSet`` whose simplified
-    ``min_value`` / ``max_value`` are the propagated interval endpoints.
-    """
+
+def test_union_intersect():
+    """Union of [0,10] and [5,20] -> [0,20]; Intersect -> [5,10]."""
+    a = IntSet.interval(Const(value=0), Const(value=10))
+    b = IntSet.interval(Const(value=5), Const(value=20))
+    u = IntSet.union(a, b)
+    i = IntSet.intersect(a, b)
+    assert u.min_value == Const(value=0)
+    assert u.max_value == Const(value=20)
+    assert i.min_value == Const(value=5)
+    assert i.max_value == Const(value=10)
+
+
+def test_eval_affine_two_vars_literal():
+    """EvalSet(x*512 + j) over x in [0,4), j in [0,512) -> literal [0, 2047]."""
     a = Analyzer()
     a.bind("x", 0, 4)
     a.bind("j", 0, 512)
     e = Add(left=Mul(left=Var(name="x"), right=Const(value=512)), right=Var(name="j"))
     ours = IntSet.eval(e, a)
-
-    ta = tarith.Analyzer()
-    env: dict[str, "T.Var"] = {}
-    tvm_expr = to_tvm(e, env)
-    dom_map = {
-        env["x"]: tarith.IntervalSet(T.IntImm("int32", 0), T.IntImm("int32", 3)),
-        env["j"]: tarith.IntervalSet(T.IntImm("int32", 0), T.IntImm("int32", 511)),
-    }
-    tvm_set = ta.int_set(tvm_expr, dom_map)
-    tvm_min = int(ta.simplify(tvm_set.min_value).value)
-    tvm_max = int(ta.simplify(tvm_set.max_value).value)
-
-    assert ours.min_value == Const(value=tvm_min)
-    assert ours.max_value == Const(value=tvm_max)
+    assert ours.min_value == Const(value=0)
+    assert ours.max_value == Const(value=2047)
 
 
-def test_eval_sign_cases_match_tvm():
-    """Sign-sensitive EvalSet endpoints match TVM (Mul-by-negative, Sub-endpoint-swap).
+def test_eval_sign_cases_literal():
+    """Sign-sensitive EvalSet endpoints match literal expectations.
 
-    These are the classic IntSet sign bugs: a negative ``Mul`` factor swaps the
-    interval endpoints, and ``Sub(c, x)`` reflects ``x``'s interval about ``c``.
-    Each case binds half-open ranges (TVM's inclusive ``IntervalSet(lo, hi - 1)``)
-    and cross-checks our ``[min, max]`` against TVM's ``Analyzer.int_set``.
+    A negative ``Mul`` factor swaps the interval endpoints, and ``Sub(c, x)``
+    reflects ``x``'s interval about ``c``; the two-term affine case sums the
+    per-term ranges. Each binds half-open ranges and asserts the propagated
+    ``[min, max]`` against literal :class:`Const` endpoints.
     """
     cases = [
-        (Mul(left=Var(name="i"), right=Const(value=-2)), {"i": (0, 4)}),
-        (Sub(left=Const(value=5), right=Var(name="x")), {"x": (2, 10)}),
+        (Mul(left=Var(name="i"), right=Const(value=-2)), {"i": (0, 4)}, -6, 0),
+        (Sub(left=Const(value=5), right=Var(name="x")), {"x": (2, 10)}, -4, 3),
         (
             Add(
                 left=Mul(left=Var(name="a"), right=Const(value=4)),
                 right=Mul(left=Var(name="b"), right=Const(value=128)),
             ),
             {"a": (0, 2), "b": (0, 4)},
+            0,
+            388,
         ),
     ]
-    for expr, ranges in cases:
+    for expr, ranges, expected_min, expected_max in cases:
         a = Analyzer()
         for name, (lo, hi) in ranges.items():
             a.bind(name, lo, hi)
         ours = IntSet.eval(expr, a)
-
-        ta = tarith.Analyzer()
-        env: dict[str, "T.Var"] = {}
-        tvm_expr = to_tvm(expr, env)
-        dom_map = {
-            env[name]: tarith.IntervalSet(T.IntImm("int32", lo), T.IntImm("int32", hi - 1))
-            for name, (lo, hi) in ranges.items()
-        }
-        tvm_set = ta.int_set(tvm_expr, dom_map)
-        tvm_min = int(ta.simplify(tvm_set.min_value).value)
-        tvm_max = int(ta.simplify(tvm_set.max_value).value)
-        assert (ours.min_value, ours.max_value) == (Const(value=tvm_min), Const(value=tvm_max))
+        assert ours.min_value == Const(value=expected_min)
+        assert ours.max_value == Const(value=expected_max)

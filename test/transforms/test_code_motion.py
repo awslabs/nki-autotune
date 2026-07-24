@@ -62,7 +62,7 @@ def test_move_lifts_tensor_copy_under_matmul_inner_loop():
 def test_reverse_compute_at_allows_fold_covering_its_own_ko():
     """The two-stage fold accumulates across its ENCLOSING ko (its sbuf_prod
     memset dominates ko via a CARRY edge), so covering ko by that loop is SAFE
-    and must be allowed — the kernel_target fold-inlining precondition."""
+    and must be allowed — the manual-ladder endpoint's fold-inlining precondition."""
     state = build_canonical_ir()
     state = Split().apply(state, SplitOption(target_nid=matmul_loop(state, "i_d0_0"), factors=(2, 8), target_axis=None))
     state = Split().apply(state, SplitOption(target_nid=matmul_loop(state, "i_d1_0"), factors=(4, 4), target_axis=None))
@@ -260,10 +260,10 @@ def test_code_motion_rejects_parallel_producer_sunk_past_consumer():
     carry edge) under the tensor_copy loop places it AFTER the matmul that reads
     sbuf_rhs. The RAW load->matmul edge would point backward; reject it.
 
-    This is the case ``examples/transform_debug.py`` exercises. The buggy check
-    rebuilt the dependency graph on the moved tree, where the load-after-matmul
-    order re-derives the hazard as a forward WAR matmul->load, hiding the
-    violation. The fix freezes edge directions from the original program.
+    The buggy check rebuilt the dependency graph on the moved tree, where the
+    load-after-matmul order re-derives the hazard as a forward WAR
+    matmul->load, hiding the violation. The fix freezes edge directions from
+    the original program.
     """
     ir = build_canonical_ir()
     rhs_load = load_block_reading(ir, "rhs")

@@ -80,15 +80,15 @@ def mid_ladder_ir() -> KernelIR:
 
 def k32_ir() -> KernelIR:
     """The pre-RFactor endpoint (manual k32): fully-tiled, all-list-buffer state, matmul
-    nest N > ko > Mo > Mi > ki. Built by the shipped driven ladder in kernel_transforms,
-    so this fixture tracks that ladder exactly (the RFactor input the rewrite targets).
+    nest N > ko > Mo > Mi > ki. Built by the test-only driven ladder, so this
+    fixture tracks the explicit manual ladder exactly.
 
     Selected by NAME (``kernel_32``), not position: the ladder ends with the
     RFactor + two BufferCompaction rungs (``kernel_35``), so ``[-1]`` returns
     the fully compacted state. The named lookup is stable against further
     ladder appends.
     """
-    from examples.kernel_transforms import _build_ladder
+    from test.transforms._matmul_lhsT_rhs_ladder import _build_ladder
 
     return next(ir for name, ir in _build_ladder() if name == "kernel_32")
 

@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from test.transforms import _matmul_lhsT_rhs_manual as manual_ladder
+from test.transforms._fixtures import INPUT_SPECS, f_matmul
+from test.transforms._helpers import leaf_for_op, matmul_loop
+from test.transforms._ladder_compare import assert_matches_hand
+from test.transforms._matmul_lhsT_rhs_ladder import _psum_memset_leaf
+
 import pytest
 
 from nkigym.codegen import render
@@ -18,32 +24,25 @@ from nkigym.transforms import (
     TransformLegalityError,
 )
 
-from examples import manual_transforms
-from examples.kernel_transforms import INPUT_SPECS, _loop, _op_leaf, _psum_memset_leaf, f_nkigym
-from test.transforms._ladder_compare import assert_matches_hand
-
 
 def _canonical_ir():
-    return build_initial_ir(f_nkigym, INPUT_SPECS)
+    return build_initial_ir(f_matmul, INPUT_SPECS)
 
 
 def _ir_at_manual_k6():
     """Drive canonical -> the manual-k6 packed nest (N > ko > Mo > Mi > ki).
 
-    Reuses the verified pre-BufferLayout prefix from ``examples.kernel_transforms``'s
-    ``_build_ladder`` (2 atomic Reorders bubbling N outermost, Split K, Split M, then
-    2 Reorders). ``psum_prod`` is still packed ``(128, 16, 2048)`` here. In the
-    renumbered manual ladder (after the two atomic-reorder intermediates were inserted),
-    this packed pre-BufferLayout state is ``kernel_6``; ``BufferLayout(psum_prod, 16)``
-    then produces ``kernel_7``.
+    Reuses the verified pre-BufferLayout prefix from the test-only driven
+    ladder: two atomic Reorders bubbling N outermost, Split K, Split M, then
+    two Reorders. ``psum_prod`` is still packed ``(128, 16, 2048)`` here.
     """
-    ir = build_initial_ir(f_nkigym, INPUT_SPECS)
-    ir = Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d1_0"), inner_nid=_loop(ir, "i_d2_0")))
-    ir = Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_0"), inner_nid=_loop(ir, "i_d2_0")))
-    ir = Split().apply(ir, SplitOption(target_nid=_loop(ir, "i_d0_0"), factors=(2, 8), target_axis=None))
-    ir = Split().apply(ir, SplitOption(target_nid=_loop(ir, "i_d1_0"), factors=(4, 4), target_axis=None))
-    ir = Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_1"), inner_nid=_loop(ir, "i_d1_0")))
-    ir = Reorder().apply(ir, ReorderOption(outer_nid=_loop(ir, "i_d0_1"), inner_nid=_loop(ir, "i_d1_1")))
+    ir = build_initial_ir(f_matmul, INPUT_SPECS)
+    ir = Reorder().apply(ir, ReorderOption(outer_nid=matmul_loop(ir, "i_d1_0"), inner_nid=matmul_loop(ir, "i_d2_0")))
+    ir = Reorder().apply(ir, ReorderOption(outer_nid=matmul_loop(ir, "i_d0_0"), inner_nid=matmul_loop(ir, "i_d2_0")))
+    ir = Split().apply(ir, SplitOption(target_nid=matmul_loop(ir, "i_d0_0"), factors=(2, 8), target_axis=None))
+    ir = Split().apply(ir, SplitOption(target_nid=matmul_loop(ir, "i_d1_0"), factors=(4, 4), target_axis=None))
+    ir = Reorder().apply(ir, ReorderOption(outer_nid=matmul_loop(ir, "i_d0_1"), inner_nid=matmul_loop(ir, "i_d1_0")))
+    ir = Reorder().apply(ir, ReorderOption(outer_nid=matmul_loop(ir, "i_d0_1"), inner_nid=matmul_loop(ir, "i_d1_1")))
     return ir
 
 
@@ -127,7 +126,7 @@ def test_apply_rejects_noop():
 
 def test_prefix_reaches_manual_kernel_6():
     """Guard: the driven prefix renders byte-exact to manual kernel_6 (packed psum)."""
-    assert_matches_hand(render(_ir_at_manual_k6()), manual_transforms.kernel_6)
+    assert_matches_hand(render(_ir_at_manual_k6()), manual_ladder.kernel_6)
 
 
 def test_k6_to_k7_reproduces_manual_kernel_7():
@@ -135,7 +134,7 @@ def test_k6_to_k7_reproduces_manual_kernel_7():
     kernel_7 — the standalone '# Buffer layout' rung (packed (128,16,2048) -> list-of-16)."""
     ir = _ir_at_manual_k6()
     ir = BufferLayout().apply(ir, BufferLayoutOption(tensor="psum_prod", list_len=16))
-    assert_matches_hand(render(ir), manual_transforms.kernel_7)
+    assert_matches_hand(render(ir), manual_ladder.kernel_7)
 
 
 def test_list_buffer_idempotent_when_no_narrowing():
@@ -163,14 +162,13 @@ def test_compact_shapes_does_not_mis_shrink_list_tile_axis():
     INNER i_d2_1 loop, so each toucher still spans all 4 N-tiles (bbox free = 2048) — the
     free axis only shrinks to 512 once the touchers CO-LOCATE under the enclosing i_d2_0
     (the CodeMotion sink), which is verified byte-exact against the manual memset-sink rung
-    in the driven k0->k28 ladder (kernel_transforms.py), NOT reproducible by compact_shapes
-    alone. What THIS test
+    in the driven manual ladder, NOT reproducible by compact_shapes alone. What THIS test
     pins is the composability SAFETY property: through Split + place + compact on a
     list_len>1 buffer, list_len stays 16 and per_tile_physical_shape never trips (a
     mis-shrunk leading axis would raise). Free stays 2048 here by construction."""
     ir = BufferLayout().apply(_ir_at_manual_k6(), BufferLayoutOption(tensor="psum_prod", list_len=16))
     ir = Split().apply(ir, SplitOption(target_nid=_psum_memset_leaf(ir), factors=(4, 512), target_axis="d2"))
-    ir = Split().apply(ir, SplitOption(target_nid=_op_leaf(ir, "NKITensorCopy"), factors=(4, 512), target_axis="d2"))
+    ir = Split().apply(ir, SplitOption(target_nid=leaf_for_op(ir, "NKITensorCopy"), factors=(4, 512), target_axis="d2"))
     place_buffers(ir.tree)
     compact_shapes(ir.tree)
     buf = ir.buffer("psum_prod")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from test._simulation import assert_matmul_ir_simulates
+from test.transforms import _matmul_lhsT_rhs_manual as manual_ladder
 from test.transforms._fixtures import build_canonical_ir, f_matmul
 from test.transforms._helpers import block_for_op
 from test.transforms._ladder_compare import assert_matches_hand
@@ -18,7 +19,6 @@ from test.transforms._rfactor_fixtures import (
 
 import pytest
 
-from examples import manual_transforms
 from nkigym.codegen import render
 from nkigym.ir import KernelIR, build_initial_ir
 from nkigym.ir.arith.expr import Const, FloorDiv, Mul, Sub, Var
@@ -502,7 +502,7 @@ def test_apply_byte_exact_k32_to_k33() -> None:
     assert (rfactored.buffer("sbuf_rfactor").shape, rfactored.buffer("sbuf_rfactor").list_len) == ((2048, 512), 1)
     compactable = {option.tensor for option in BufferCompaction().analyze(rfactored)}
     assert {"psum_prod", "sbuf_rfactor"} <= compactable
-    assert_matches_hand(render(rfactored), manual_transforms.kernel_33)
+    assert_matches_hand(render(rfactored), manual_ladder.kernel_33)
 
 
 def test_apply_byte_exact_k33_to_k34() -> None:
@@ -516,7 +516,7 @@ def test_apply_byte_exact_k33_to_k34() -> None:
     compactable = {option.tensor for option in BufferCompaction().analyze(compacted)}
     assert "psum_prod" not in compactable
     assert "sbuf_rfactor" in compactable
-    assert_matches_hand(render(compacted), manual_transforms.kernel_34)
+    assert_matches_hand(render(compacted), manual_ladder.kernel_34)
 
 
 def test_apply_byte_exact_k34_to_k35() -> None:
@@ -531,7 +531,7 @@ def test_apply_byte_exact_k34_to_k35() -> None:
     compactable = {option.tensor for option in BufferCompaction().analyze(final)}
     assert "psum_prod" not in compactable
     assert "sbuf_rfactor" not in compactable
-    assert_matches_hand(render(final), manual_transforms.kernel_35)
+    assert_matches_hand(render(final), manual_ladder.kernel_35)
 
 
 def test_apply_sim_matches_matmul_k32_to_k35(tmp_path) -> None:

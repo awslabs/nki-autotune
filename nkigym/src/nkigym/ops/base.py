@@ -215,6 +215,14 @@ class NKIOp:
     role-lattice lineage tag); the two coincide for every op except
     ``NKIStore`` (location ``"shared_hbm"``, role ``"stored"``)."""
 
+    OUTPUT_STORAGE_DTYPE: ClassVar[str | None] = None
+    """Physical dtype override for synthesized output buffers.
+
+    ``None`` preserves the first input's logical dtype. Ops whose hardware
+    destination uses a different dtype set the concrete allocation dtype here;
+    for example, ``NKIMatmul`` accumulates into fp32 PSUM.
+    """
+
     def _check_roles(self, **kwargs: Any) -> None:
         """Per-op role validation. Default: no-op.
 

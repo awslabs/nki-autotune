@@ -1,7 +1,7 @@
 """Shared canonical-IR fixture for transform tests.
 
-Builds the canonical :class:`KernelIR` for the same matmul described
-by ``kernel_transforms.py``: ``lhs_T(K=2048, M=2048).T @ rhs(K, N=2048)``.
+Builds the canonical :class:`KernelIR` for the lhs-transposed matmul examples:
+``lhs_T(K=2048, M=2048).T @ rhs(K, N=2048)``.
 """
 
 from __future__ import annotations
@@ -12,9 +12,11 @@ from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
+from nkigym.ops.transpose import NKITranspose
 
 K, M, N = 2048, 2048, 2048
 INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs_T": ((K, M), "bfloat16"), "rhs": ((K, N), "bfloat16")}
+LHS_INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 
 
 @nkigym_kernel
@@ -31,6 +33,19 @@ def f_matmul(lhs_T, rhs):
 def build_canonical_ir() -> KernelIR:
     """Build the canonical :class:`KernelIR` for the matmul fixture."""
     return build_initial_ir(f_matmul, INPUT_SPECS)
+
+
+@nkigym_kernel
+def f_lhs_matmul(lhs, rhs):
+    """Return the canonical SSA graph for ``lhs @ rhs``."""
+    sbuf_lhs = NKILoad()(src=lhs)
+    psum_lhs_T = NKITranspose()(data=sbuf_lhs)
+    sbuf_lhs_T = NKITensorCopy()(src=psum_lhs_T)
+    sbuf_rhs = NKILoad()(src=rhs)
+    psum_prod = NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs)
+    sbuf_prod = NKITensorCopy()(src=psum_prod)
+    hbm_out = NKIStore()(src=sbuf_prod)
+    return hbm_out
 
 
 SMALL_K, SMALL_M, SMALL_N = 256, 256, 512
@@ -124,7 +139,7 @@ def _ladder_helpers():
 
 
 def build_ladder_state(n: int) -> KernelIR:
-    """Replay the kernel_transforms.py transform sequence from canonical to kernel_n.
+    """Replay the legacy 14-rung transform sequence from canonical to kernel_n.
 
     Rungs appended one at a time. Each lambda takes ir, applies one transform,
     returns the new ir. Raises NotImplementedError for unwired rungs (loud).

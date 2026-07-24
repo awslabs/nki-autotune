@@ -82,7 +82,6 @@ def test_compact_shapes_shrinks_list_len_when_tile_axis_collapses():
     under per_tile_physical_shape."""
     from dataclasses import replace
 
-    from nkigym.codegen.compact import _compact_one
     from nkigym.ir.tree import Buffer
 
     listed = Buffer(name="psum_x", shape=(2048, 512), dtype="float32", location="psum", list_len=16)

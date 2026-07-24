@@ -107,9 +107,10 @@ python -m pip install -e "$NKIPY_SRC/nkipy" -e "$NKIPY_SRC/spike"
 # the code imports but neither manifest declares: networkx (the IR graph
 # backbone in nkigym/ir) and ml_dtypes (bf16 dtype resolution in
 # runner/types.py). The first-party autotune/nkigym packages are NOT installed
-# here — the examples and tests put nkigym/src + the repo root on sys.path
-# themselves, and an editable install of nkigym pins a worktree path that
-# breaks subprocess tests. black + isort drive dump()'s kernel.py formatting.
+# here. Tests use the root pytest configuration, while example commands set
+# PYTHONPATH to the current worktree. An editable nkigym install pins one
+# worktree path and breaks subprocess tests in another worktree. black + isort
+# drive dump()'s kernel.py formatting.
 echo "==> [5/5] Installing Python project requirements + formatters"
 python -m pip install \
     numpy networkx ml_dtypes \
@@ -131,4 +132,4 @@ fi
 black --version >/dev/null || die "black not callable"
 
 echo "==> Done. venv=$VENV | python=$(python --version 2>&1) | black=$(black --version | head -1)"
-echo "==> Verify end-to-end: python examples/matmul_lhsT_rhs.py --cache /home/ubuntu/cache"
+echo "==> Verify end-to-end: PYTHONPATH=.:nkigym/src:autotune/src python examples/random_rollout.py --cache /home/ubuntu/cache"

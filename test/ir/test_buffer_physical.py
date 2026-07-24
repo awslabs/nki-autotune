@@ -36,12 +36,14 @@ def test_buffer_versions_hbm_unaffected():
     assert hbm.physical_shape() == (2048, 2048)
 
 
-def test_buffer_physical_dtype_overrides_psum_to_fp32():
-    """physical_dtype() returns fp32 for psum and the logical dtype otherwise."""
-    psum = Buffer(name="p", shape=(256, 512), dtype="bfloat16", location="psum")
+def test_buffer_physical_dtype_uses_explicit_storage_override():
+    """Physical dtype is logical by default and honors a producer override."""
+    transpose_psum = Buffer(name="t", shape=(256, 512), dtype="bfloat16", location="psum")
+    matmul_psum = Buffer(name="p", shape=(256, 512), dtype="bfloat16", location="psum", storage_dtype="float32")
     sbuf = Buffer(name="s", shape=(256, 512), dtype="bfloat16", location="sbuf")
     hbm = Buffer(name="h", shape=(256, 512), dtype="bfloat16", location="shared_hbm")
-    assert psum.physical_dtype() == "float32"
+    assert transpose_psum.physical_dtype() == "bfloat16"
+    assert matmul_psum.physical_dtype() == "float32"
     assert sbuf.physical_dtype() == "bfloat16"
     assert hbm.physical_dtype() == "bfloat16"
 

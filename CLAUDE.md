@@ -7,5 +7,5 @@ python <script>
 pytest <tests>
 ```
 
-Driver scripts (examples) require `--cache`. To run on remote Trainium,
-use `transport/kaizen.sh` (see the header in that script).
+Driver scripts under `examples/` require `--cache`. To run on remote Trainium,
+use `transport/ssh_host.sh` (see the script header for usage).

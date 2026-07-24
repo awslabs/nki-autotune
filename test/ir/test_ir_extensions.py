@@ -1,6 +1,6 @@
 """Tests for the extended IR fields (location, dtype, kwargs, axis_map, return_name)."""
 
-from test.transforms._fixtures import INPUT_SPECS, f_matmul
+from test.transforms._fixtures import INPUT_SPECS, f_lhs_matmul, f_matmul
 
 import pytest
 
@@ -21,6 +21,18 @@ def _reduce_then_activate(x):
     act = NKIActivation(op="rsqrt")(data=red)
     out = NKIStore()(src=act)
     return out
+
+
+def test_trace_reverses_transpose_axes_and_tracks_storage_dtype():
+    """Transpose swaps logical dims and preserves dtype in PSUM."""
+    analysis = analyze_dimensions(f_lhs_matmul, {"lhs": ((256, 384), "bfloat16"), "rhs": ((384, 512), "bfloat16")})
+    lhs = analysis.tensors["sbuf_lhs"]
+    lhs_T = analysis.tensors["psum_lhs_T"]
+    prod = analysis.tensors["psum_prod"]
+    assert lhs_T.shape == (384, 256)
+    assert lhs_T.dim_ids == (lhs.dim_ids[1], lhs.dim_ids[0])
+    assert lhs_T.storage_dtype is None
+    assert prod.storage_dtype == "float32"
 
 
 def test_trace_synthesizes_1d_output_for_elementwise_on_reduce():

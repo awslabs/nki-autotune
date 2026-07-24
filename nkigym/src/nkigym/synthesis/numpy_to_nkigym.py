@@ -46,7 +46,7 @@ Given a numpy function `f_numpy` and an `INPUT_SPECS` dict, produce an `f_nkigym
 - Body consists ONLY of `var = NKIOp()(...)` assignment statements and the final `return` — no `np.*`, no Python arithmetic, no `if` / `for`, no helper functions.
 - Each op ALLOCATES AND RETURNS its output. Bind that result to a named local — there is NO `NKIAlloc`, NO explicit buffer declaration, NO `dst=` operand anywhere.
 - Returns exactly one tensor: the HBM output produced by `NKIStore`.
-- Matmul uses `stationary.T @ moving`. For raw `A @ B`, transpose `A` first: `psum_A_T = NKITranspose()(src=A)`, drain to SBUF, then `NKIMatmul()(stationary=sbuf_A_T, moving=B)`.
+- Matmul uses `stationary.T @ moving`. For raw `A @ B`, transpose `A` first: `psum_A_T = NKITranspose()(data=A)`, drain to SBUF, then `NKIMatmul()(stationary=sbuf_A_T, moving=B)`.
 - Plain stateless DAG — the vanilla decomposition of the numpy math. NEVER emit an online/single-pass reformulation (flash attention, running-softmax, fused running-mean, etc.). Online fusion is a separate downstream rewrite that operates on your output.
 
 # Imports
@@ -80,7 +80,7 @@ Each op allocates and returns its output. Bind the return value to a named local
 | `NKITensorCopy` | `nkigym.ops.tensor_copy` | src:(P,F) → sbuf:(P,F) | `sbuf_prod = NKITensorCopy()(src=psum)` — typically PSUM → SBUF drain |
 | `NKITensorReduce` | `nkigym.ops.tensor_reduce` | data:(P,F) → reduced:(P,) | `reduced = NKITensorReduce(axis=1, op="add\|max")(data=X)` — reduce along axis |
 | `NKIMatmul` | `nkigym.ops.matmul` | stationary:(K,M), moving:(K,N) → psum:(M,N) | `psum = NKIMatmul()(stationary=A_T, moving=B)` — returns PSUM result; PSUM is zeroed automatically |
-| `NKITranspose` | `nkigym.ops.transpose` | src:(P,F) → psum:(F,P) | `psum_T = NKITranspose()(src=sbuf)` — TE transpose, ≤128×128; returns a PSUM tensor |
+| `NKITranspose` | `nkigym.ops.transpose` | data:(P,F) → psum:(F,P) | `psum_T = NKITranspose()(data=sbuf)` — TE transpose, ≤128×128; returns a PSUM tensor |
 | `NKIDMATranspose` | `nkigym.ops.dma_transpose` | src:(P,F) → sbuf:(F,P) | `sbuf_T = NKIDMATranspose()(src=sbuf_a)` — DMA transpose, frees TE |
 | `NKIActivationReduce` | `nkigym.ops.activation_reduce` | data:(P,F) → reduced:(P,) | `reduced = NKIActivationReduce(op=..., reduce_op=...)(data=X)` — returns the per-row reduction vector |
 | `NKIActivation` | `nkigym.ops.activation` | data:(P,F) or (P,) → same shape | `Y = NKIActivation(op=..., scale=?, bias=?)(data=X)` — elementwise |
@@ -94,7 +94,7 @@ Op-arg vocabulary: `op` ∈ `{square, exp, copy, reciprocal, tanh, rsqrt, sqrt}`
 2. List every tensor-level step in `f_numpy`, stripping `.astype(...)` and `keepdims=True` (numpy bookkeeping, not primitives).
 3. Map each step to one or more `NKIOp` calls, binding each result to a named local. Key patterns:
    - Matmul: `psum = NKIMatmul()(stationary=A_T, moving=B)` returns the PSUM result. The accumulator is zeroed automatically — do NOT author an `NKIMemset` before a matmul. Then drain the PSUM result to SBUF before storing (PSUM can't store directly): `sbuf_prod = NKITensorCopy()(src=psum)`. The drain copy stays explicit.
-   - Transpose: `psum_T = NKITranspose()(src=sbuf_input)` returns a PSUM tensor; drain it with `sbuf_T = NKITensorCopy()(src=psum_T)`.
+   - Transpose: `psum_T = NKITranspose()(data=sbuf_input)` returns a PSUM tensor; drain it with `sbuf_T = NKITensorCopy()(src=psum_T)`.
    - `NKIActivationReduce` returns its per-row reduction vector `(P,)` directly: `reduced = NKIActivationReduce(op=..., reduce_op=...)(data=X)`. There is no scratch/`reduce_res` operand to author.
    - Fused reduce-then-activation (e.g. rmsnorm's `rsqrt(sum(x²)/F + eps)`): split into two DSL calls. Emit `raw_reduced = NKIActivationReduce(op=<act>, reduce_op=<red>)(data=X)` to get the raw reduction; then feed that into `post_reduced = NKIActivation(op=<post>, scale=<scalar>, bias=<scalar>)(data=raw_reduced)` to apply the post-reduction activation with its affine scale/bias. `NKIActivation` applies `op(data * scale + bias)` per-element on its input; for `rsqrt(reduced/F + eps)`, use `scale=1/F` and `bias=eps`. The post-reduction scale/bias is a SEPARATE `NKIActivation` call.
    - `X * v[:, None]` with `v` shape `(P,)`: `Y = NKITensorScalar(op="multiply")(data=X, operand0=v)`. Broadcasts along F.

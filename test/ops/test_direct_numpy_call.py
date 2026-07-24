@@ -7,6 +7,8 @@ lineage at runtime. The decorator asserts the return carries role
 ``"stored"`` (the NKIStore output) or ``"shared_hbm"``.
 """
 
+from test.transforms._fixtures import f_lhs_matmul
+
 import numpy as np
 import pytest
 
@@ -15,6 +17,7 @@ from nkigym.ops.load import NKILoad
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
+from nkigym.ops.transpose import NKITranspose
 
 K, M, N = 128, 128, 128
 
@@ -36,6 +39,23 @@ def test_direct_call_computes_matmul():
     actual = _lhsT_matmul(lhs_T=lhs_T, rhs=rhs)
     expected = lhs_T.T @ rhs
     assert np.allclose(np.asarray(actual), expected, atol=1e-4, rtol=1e-4)
+
+
+def test_direct_call_computes_non_transposed_lhs_matmul():
+    """NKITranspose accepts ``data`` and preserves lhs @ rhs numerics."""
+    rng = np.random.default_rng(1)
+    lhs = rng.standard_normal((M, K)).astype(np.float32)
+    rhs = rng.standard_normal((K, N)).astype(np.float32)
+    actual = f_lhs_matmul(lhs=lhs, rhs=rhs)
+    expected = lhs @ rhs
+    assert np.allclose(np.asarray(actual), expected, atol=1e-4, rtol=1e-4)
+
+
+def test_transpose_rejects_hbm_data():
+    """Tensor Engine transpose requires an SBUF input."""
+    data = np.ones((K, M), dtype=np.float32)
+    with pytest.raises(TypeError, match="NKITranspose.*expects sbuf"):
+        NKITranspose()(data=data)
 
 
 def test_direct_call_returns_stored_role():

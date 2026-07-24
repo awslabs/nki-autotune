@@ -15,6 +15,6 @@ Compiles and benchmarks NKI kernels in-process on a Trainium box::
     )
     print(output)
 
-To run on a remote box, drive this through ``transport/kaizen.sh``
+To run on a remote box, drive this through ``transport/ssh_host.sh``
 (sync code, execute, download artifacts).
 """

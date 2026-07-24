@@ -23,12 +23,6 @@ MANIFEST
 .Python
 *.whl
 
-# Compiled source files
-*.pyc
-*.pyo
-*.pyd
-__pycache__/
-
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
@@ -66,9 +60,6 @@ venv.bak/
 .kiro
 memory-bank
 
-# macOS
-.DS_Store
-
 # Windows
 Thumbs.db
 ehthumbs.db
@@ -105,7 +96,6 @@ remote/config.sh
 
 # Downloaded cache from remote autotune runs
 cache/
-generated_kernels/
 
 # Worktrees
 .worktrees/

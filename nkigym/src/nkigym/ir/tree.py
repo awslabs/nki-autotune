@@ -101,6 +101,8 @@ class Buffer:
         shape: per-axis extent.
         dtype: ``"float32"`` / ``"float16"`` / ``"bfloat16"``.
         location: ``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``.
+        storage_dtype: Optional physical allocation dtype. ``None`` uses
+            ``dtype``.
         versions: pipeline buffer-version count (default 1).
         list_len: list-of-tiles count (default 1).
     """
@@ -109,6 +111,7 @@ class Buffer:
     shape: tuple[int, ...]
     dtype: str
     location: str
+    storage_dtype: str | None = None
     versions: int = 1
     """Pipeline buffer-version count. 1 = single instance (renders
     byte-identically to today). >1 multiplies the tile (middle) dim of
@@ -168,14 +171,11 @@ class Buffer:
     def physical_dtype(self) -> str:
         """Return the dtype ``nl.ndarray`` actually allocates for this buffer.
 
-        ``psum`` buffers are always allocated ``float32`` — the matmul HW
-        accumulates at fp32 regardless of the logical dtype the value
-        carries. Every other location uses the logical :attr:`dtype`. This
-        is the physical override paired with :meth:`physical_shape`.
+        Most buffers use their logical :attr:`dtype`. Producers whose hardware
+        destination differs set :attr:`storage_dtype`; notably matmul uses an
+        fp32 PSUM accumulator while ``nc_transpose`` preserves its input dtype.
         """
-        if self.location == "psum":
-            return "float32"
-        return self.dtype
+        return self.storage_dtype if self.storage_dtype is not None else self.dtype
 
 
 @dataclass(frozen=True, kw_only=True)

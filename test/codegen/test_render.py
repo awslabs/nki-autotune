@@ -5,12 +5,13 @@ from __future__ import annotations
 import importlib.util
 import shutil
 from pathlib import Path
-from test.transforms._fixtures import INPUT_SPECS, build_canonical_ir
+from test.transforms._fixtures import INPUT_SPECS, build_canonical_ir, f_lhs_matmul
 from test.transforms._ladder_compare import assert_matches_render_ordered
 
 import numpy as np
 
 from nkigym.codegen import render
+from nkigym.ir import build_initial_ir
 from nkigym.synthesis.simulate_nki import simulate_fp32
 
 
@@ -35,6 +36,30 @@ def test_render_canonical_matmul_emits_expected_structure():
     assert "return hbm_out" in src.strip().splitlines()[-1]
 
 
+def test_render_nc_transpose_uses_data_and_preserves_psum_dtype(tmp_path):
+    """Rendered transpose matches the NKI signature and dtype contract."""
+    specs = {"lhs": ((128, 128), "bfloat16"), "rhs": ((128, 512), "bfloat16")}
+    ir = build_initial_ir(f_lhs_matmul, specs)
+    src = render(ir)
+    assert ("psum_lhs_T = [nl.ndarray((128, 1, 128), dtype=nl.bfloat16, " "buffer=nl.psum) for _ in range(1)]") in src
+    transpose_call = next(line for line in src.splitlines() if "nisa.nc_transpose" in line)
+    assert "data=sbuf_lhs" in transpose_call
+    assert "dst=psum_lhs_T" in transpose_call
+    assert "src=" not in transpose_call
+
+    kernel_path = tmp_path / "transpose_kernel.py"
+    kernel_path.write_text(src, encoding="utf-8")
+    module = _load_module_from_path(str(kernel_path))
+    rng = np.random.default_rng(2)
+    inputs = {
+        "lhs": rng.standard_normal((128, 128)).astype(np.float32),
+        "rhs": rng.standard_normal((128, 512)).astype(np.float32),
+    }
+    actual = np.asarray(simulate_fp32(module.nki_f_lhs_matmul)(**inputs))
+    expected = inputs["lhs"] @ inputs["rhs"]
+    np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
 def test_render_canonical_matmul_passes_numerics():
     """The rendered canonical kernel passes fp32 simulation against numpy."""
     ir = build_canonical_ir()
@@ -55,6 +80,8 @@ def test_render_canonical_matmul_passes_numerics():
 _KERNEL_0_REFERENCE = """
 @nki.jit
 def kernel_0(lhs_T, rhs):
+    assert lhs_T.shape == (2048, 2048)
+    assert rhs.shape == (2048, 2048)
     sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]
     for i_d0_0 in range(16):
         nisa.dma_copy(src=lhs_T[i_d0_0 * 128:i_d0_0 * 128 + 128, 0:0 + 2048], dst=sbuf_lhs_T[0][0:128, i_d0_0, 0:0 + 2048])

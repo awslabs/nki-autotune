@@ -22,10 +22,9 @@ remote_activate="${AUTOTUNE_REMOTE_ACTIVATE:-source \$HOME/venvs/kernel-env/bin/
 
 # PYTHONPATH so a bare `python examples/X.py` resolves the first-party packages.
 # install.sh installs only the THIRD-PARTY deps (nkipy/spike); nkigym + autotune
-# are imported from the synced source tree. Mirrors what the self-bootstrapping
-# examples insert (repo root + both src trees); set relative to ~/<repo>, which
-# the commands below cd into. Applied to BOTH preflight and run so a script that
-# imports nkigym at module top level (before argparse) doesn't crash either one.
+# are imported from the synced source tree. Paths are relative to ~/<repo>,
+# which the commands below cd into. Applied to BOTH preflight and run so a
+# script that imports nkigym at module top level does not fail before argparse.
 remote_pythonpath="PYTHONPATH=.:nkigym/src:autotune/src"
 
 # Neuron platform target exported on the box for the run.

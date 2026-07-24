@@ -20,6 +20,18 @@ pip install pre-commit
 pre-commit install
 ```
 
+## Examples
+
+The examples provide one combined random-rollout driver and one agentic-search
+driver per workload:
+
+- `examples/random_rollout.py`
+- `examples/matmul_lhsT_rhs_agentic_search.py`
+- `examples/matmul_lhs_rhs_agentic_search.py`
+
+The explicit manual ladders and transform-driven comparisons are test fixtures
+under `test/transforms/` and run with `pytest test/transforms/test_manual_ladders.py`.
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.

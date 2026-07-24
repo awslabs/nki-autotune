@@ -9,13 +9,15 @@ from autotune.search.observation import (
     state_fingerprint,
 )
 from autotune.search.types import Evaluation, SearchConfig, SearchEvent, SearchNode
-from examples.matmul_lhsT_rhs import INPUT_SPECS, TRANSFORMS, f_nkigym
+from examples.random_rollout import LHS_T_RHS, TRANSFORMS
 from nkigym.environment import KernelMDP
+
+WORKLOAD = LHS_T_RHS
 
 
 def test_describe_actions_adds_semantic_loop_and_buffer_context() -> None:
     """Descriptions expose operation scopes and named buffer fields."""
-    environment = KernelMDP(f_nkigym, INPUT_SPECS, TRANSFORMS)
+    environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
     state = environment.reset()
     descriptions = [item.description for item in describe_actions(state, environment.legal_actions(state))]
     assert any(
@@ -26,7 +28,7 @@ def test_describe_actions_adds_semantic_loop_and_buffer_context() -> None:
 
 def test_state_fingerprint_is_render_stable_and_transform_sensitive() -> None:
     """Equivalent canonical builds match while a real transform changes the digest."""
-    environment = KernelMDP(f_nkigym, INPUT_SPECS, TRANSFORMS)
+    environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
     first = environment.reset()
     second = environment.reset()
     split_action = next(
@@ -39,7 +41,7 @@ def test_state_fingerprint_is_render_stable_and_transform_sensitive() -> None:
 
 def test_search_fingerprint_includes_future_action_surface() -> None:
     """Render-equivalent states remain distinct when future choices differ."""
-    environment = KernelMDP(f_nkigym, INPUT_SPECS, TRANSFORMS)
+    environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
     state = environment.reset()
     actions = environment.legal_actions(state)
     assert search_state_fingerprint(state, actions[:1]) != search_state_fingerprint(state, actions[:2])
@@ -47,7 +49,7 @@ def test_search_fingerprint_includes_future_action_surface() -> None:
 
 def test_observation_prioritizes_leaders_and_bounds_stale_history() -> None:
     """Long searches retain useful leaders, active context, and recent events."""
-    environment = KernelMDP(f_nkigym, INPUT_SPECS, TRANSFORMS)
+    environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
     state = environment.reset()
     nodes = [
         SearchNode(
