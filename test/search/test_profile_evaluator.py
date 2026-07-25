@@ -31,6 +31,10 @@ def test_profile_evaluator_uses_mfu_as_score(tmp_path: Path) -> None:
                         "total_time": 0.001,
                         "mfu_estimated_percent": 0.91,
                         "mbu_estimated_percent": 0.12,
+                        "tensor_engine_active_time_percent": 0.94,
+                        "vector_engine_active_time_percent": 0.76,
+                        "dma_active_time_percent": 0.67,
+                        "tensor_engine_instruction_count": 2119,
                     },
                 )
             ],
@@ -53,6 +57,10 @@ def test_profile_evaluator_uses_mfu_as_score(tmp_path: Path) -> None:
 
     assert evaluation.score == 91.0
     assert evaluation.metrics["total_time_s"] == 0.001
+    assert evaluation.metrics["tensor_engine_active_percent"] == 94.0
+    assert evaluation.metrics["vector_engine_active_percent"] == 76.0
+    assert evaluation.metrics["dma_active_percent"] == 67.0
+    assert evaluation.metrics["tensor_engine_instruction_count"] == 2119
 
 
 def test_profile_evaluator_reports_specific_compiler_diagnostic(tmp_path: Path) -> None:

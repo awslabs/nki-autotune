@@ -1,8 +1,8 @@
-"""Tests for isolated Codex policy command construction."""
+"""Tests for isolated Codex next-transform requests."""
 
 from pathlib import Path
 
-from autotune.search.codex_policy import CodexPolicyConfig, CodexTransformPolicy, _latest_evaluation_decision
+from nkigym.search.codex_policy import CodexPolicyConfig, CodexTransformPolicy
 
 
 def test_codex_policy_command_disables_external_context(tmp_path: Path) -> None:
@@ -27,14 +27,3 @@ def test_codex_policy_command_disables_external_context(tmp_path: Path) -> None:
     disabled = {command[index + 1] for index, value in enumerate(command[:-1]) if value == "--disable"}
     assert {"apps", "browser_use", "computer_use", "multi_agent", "plugins", "shell_tool", "unified_exec"} <= disabled
     assert command[-1] == "-"
-
-
-def test_latest_evaluation_decision_tracks_strategy_refresh_point() -> None:
-    """Only completed evaluate operations trigger a strategy refresh."""
-    observation = """\
-# Decision History
-- D001: apply N000->N001; split a loop
-- D002: evaluate N001->N001; measure candidate
-- D003: checkout N001->N000; try another branch
-"""
-    assert _latest_evaluation_decision(observation) == 2

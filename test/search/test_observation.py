@@ -1,16 +1,11 @@
-"""Tests for semantic search observations."""
+"""Tests for measured-state refinement observations."""
 
 from pathlib import Path
 
-from autotune.search.observation import (
-    describe_actions,
-    format_observation,
-    search_state_fingerprint,
-    state_fingerprint,
-)
-from autotune.search.types import Evaluation, SearchConfig, SearchEvent, SearchNode
 from examples.random_rollout import LHS_T_RHS, TRANSFORMS
 from nkigym.environment import KernelMDP
+from nkigym.search.observation import describe_actions, format_observation, state_fingerprint
+from nkigym.search.types import Evaluation, SearchConfig, SearchNode
 
 WORKLOAD = LHS_T_RHS
 
@@ -27,7 +22,7 @@ def test_describe_actions_adds_semantic_loop_and_buffer_context() -> None:
 
 
 def test_state_fingerprint_is_render_stable_and_transform_sensitive() -> None:
-    """Equivalent canonical builds match while a real transform changes the digest."""
+    """Equivalent canonical builds match while a rendered transform differs."""
     environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
     first = environment.reset()
     second = environment.reset()
@@ -39,70 +34,42 @@ def test_state_fingerprint_is_render_stable_and_transform_sensitive() -> None:
     assert state_fingerprint(first) != state_fingerprint(transformed)
 
 
-def test_search_fingerprint_includes_future_action_surface() -> None:
-    """Render-equivalent states remain distinct when future choices differ."""
-    environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
-    state = environment.reset()
-    actions = environment.legal_actions(state)
-    assert search_state_fingerprint(state, actions[:1]) != search_state_fingerprint(state, actions[:2])
-
-
-def test_observation_prioritizes_leaders_and_bounds_stale_history() -> None:
-    """Long searches retain useful leaders, active context, and recent events."""
+def test_observation_contains_current_profile_and_bounded_history() -> None:
+    """The policy receives current metrics, recent measurements, and legal actions."""
     environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
     state = environment.reset()
     nodes = [
         SearchNode(
             node_id=index,
             state=state,
-            fingerprint=str(index),
-            parent_id=None if index == 0 else 0,
+            parent_id=None if index == 0 else index - 1,
             action_id=None,
             action_description=f"state {index}",
-            evaluation=(
-                Evaluation(score=float(index), metrics={"score": index}, message=f"score={index}")
-                if index < 20
-                else None
+            rationale=f"decision {index}",
+            evaluation=Evaluation(
+                score=float(index),
+                metrics={"mfu_percent": float(index), "tensor_engine_active_percent": 90.0},
+                message=f"MFU={index}",
             ),
         )
-        for index in range(60)
+        for index in range(30)
     ]
-    events = [
-        SearchEvent(
-            decision=index,
-            active_before=0,
-            active_after=0,
-            kind="checkout",
-            action_id=None,
-            node_id=0,
-            rationale=f"decision {index}",
-            raw_response="{}",
-        )
-        for index in range(1, 61)
-    ]
+    actions = describe_actions(state, environment.legal_actions(state))
 
     observation = format_observation(
         state=state,
         nodes=nodes,
-        active_node_id=59,
-        actions=[],
-        config=SearchConfig(
-            cache_dir=Path("/tmp/unused"),
-            resume_dir=None,
-            max_transforms=100,
-            max_evaluations=100,
-            min_evaluations=0,
-            max_decisions=100,
-            workload_guidance="test",
-        ),
-        transforms_applied=0,
-        evaluations_run=20,
-        events=events,
+        actions=actions,
+        config=SearchConfig(cache_dir=Path("/tmp/unused"), max_iterations=100, workload_guidance="test guidance"),
     )
 
-    assert observation.index("N019") < observation.index("N018")
-    assert "20 unique rendered hardware evaluations" in observation
-    assert "27 older off-path states omitted" in observation
-    assert "12 earlier decisions are retained in events.jsonl" in observation
-    assert "D013" in observation
-    assert "D012" not in observation
+    assert "best measured state: N029 score=29.0000" in observation
+    assert "# Current Neuron Profile" in observation
+    assert "- tensor_engine_active_percent: 90.0" in observation
+    assert "- 6 earlier states omitted" in observation
+    assert "N006" in observation
+    assert "N005" not in observation
+    assert '"kind":"apply"' in observation
+    assert '"kind":"finish"' in observation
+    assert '"kind":"checkout"' not in observation
+    assert '"kind":"evaluate"' not in observation

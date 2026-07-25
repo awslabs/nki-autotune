@@ -1,29 +1,27 @@
-"""Tests for the blind canonical matmul experiment contract."""
+"""Tests for canonical profiler-feedback matmul refinement."""
 
 import inspect
 import random
 
 import numpy as np
 
-from autotune.search import codex_policy
-from autotune.search.engine import AgenticSearch
-from autotune.search.policy_json import REASONING_POLICY_PROMPT, STRATEGY_POLICY_PROMPT
 from examples import matmul_lhsT_rhs_agentic_search, random_rollout
 from nkigym.environment import KernelMDP
+from nkigym.search import codex_policy
+from nkigym.search.engine import ProfilerGuidedRefinement
+from nkigym.search.policy_json import REASONING_POLICY_PROMPT
 
 
-def test_search_engine_has_no_initial_state_injection() -> None:
-    """Every search root must come from its environment's canonical reset."""
-    parameters = inspect.signature(AgenticSearch).parameters
+def test_refinement_has_no_initial_state_injection() -> None:
+    """Every refinement root comes from the environment reset."""
+    parameters = inspect.signature(ProfilerGuidedRefinement).parameters
     assert "initial_state" not in parameters
 
 
 def test_matmul_policy_context_contains_no_manual_target() -> None:
-    """Policy-visible text and construction contain no comparison schedule."""
+    """Policy-visible text contains no comparison schedule."""
     visible_text = (
         REASONING_POLICY_PROMPT
-        + "\n"
-        + STRATEGY_POLICY_PROMPT
         + "\n"
         + matmul_lhsT_rhs_agentic_search.MATMUL_GUIDANCE
         + "\n"
@@ -34,7 +32,7 @@ def test_matmul_policy_context_contains_no_manual_target() -> None:
 
 
 def test_matmul_policy_uses_gpt_5_6_sol_without_claude_adapter() -> None:
-    """The experiment uses the requested isolated GPT policy implementation."""
+    """The example uses the requested isolated GPT policy."""
     source = inspect.getsource(matmul_lhsT_rhs_agentic_search) + inspect.getsource(codex_policy)
     assert 'default="openai.gpt-5.6-sol"' in source
     assert all(term not in source.lower() for term in ("anthropic", "claude", "opus"))
@@ -59,7 +57,7 @@ def test_combined_rollout_uses_every_shipped_transform() -> None:
 
 
 def test_combined_rollout_graphs_match_numpy() -> None:
-    """Each configured canonical graph matches its paired NumPy function."""
+    """Each configured canonical graph matches its NumPy function."""
     rng = np.random.default_rng(0)
     cases = (
         (

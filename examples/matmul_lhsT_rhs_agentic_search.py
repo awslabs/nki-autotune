@@ -1,10 +1,9 @@
-"""Blind reasoning-driven transform search for canonical 2048x2048 matmul.
+"""Neuron-profiler feedback refinement for transposed-LHS matmul.
 
-The GPT policy starts from ``KernelMDP.reset()`` and sees only generic NKI
-constraints, current IR, legal shipped transforms, explored states, and its own
-profile feedback.
+The loop profiles the canonical kernel, asks GPT for one legal next transform,
+applies it, profiles the result on ``gym-1``, and repeats.
 
-Run from the development machine while ``gym-1`` is reachable over SSH:
+Run from the development machine:
 
     PYTHONPATH=.:nkigym/src:autotune/src \
       python examples/matmul_lhsT_rhs_agentic_search.py --cache /tmp/agentic-search
@@ -20,13 +19,13 @@ from pathlib import Path
 
 import numpy as np
 
-from autotune.search import AgenticSearch, SearchConfig, SearchResult
-from autotune.search.codex_policy import CodexPolicyConfig, CodexTransformPolicy
 from autotune.search.profile_evaluator import ProfileEvaluatorConfig
 from autotune.search.ssh_profile_evaluator import SSHNKIProfileEvaluator, SSHProfileConfig
 from examples.random_rollout import LHS_T_RHS, TRANSFORMS
 from nkigym.codegen import render
 from nkigym.environment import KernelMDP
+from nkigym.search import ProfilerGuidedRefinement, SearchConfig, SearchResult
+from nkigym.search.codex_policy import CodexPolicyConfig, CodexTransformPolicy
 from nkigym.synthesis import simulate_fp32
 
 M = 2048
@@ -45,28 +44,26 @@ Generic NKI constraints and semantics:
   128 and produces an output tile with partition extent 128 and free extent up
   to 512.
 - Inputs originate in shared HBM, DMA loads stage them in SBUF, matrix
-  multiplication accumulates in fp32 PSUM, and output must return through SBUF
-  to shared HBM.
+  multiplication accumulates in fp32 PSUM, and output returns through SBUF to
+  shared HBM.
 - Reordering and placement change reuse, live ranges, transfer frequency, and
-  available overlap. BufferCompaction materializes a moved buffer's tighter
-  scope and access bounding box.
+  overlap. BufferCompaction materializes a moved buffer's tighter scope and
+  access bounding box.
 - An on-chip buffer's list_len refactorizes its existing tile axis into
-  separate ndarray allocations. SoftwarePipeline instead derives version
-  counts from producer and consumer stages.
+  separate ndarray allocations. SoftwarePipeline instead derives versions
+  from producer and consumer stages.
 - Transform legality guarantees dependence preservation, not hardware resource
-  fit. Compilation failures and measured MFU are search feedback.
+  fit. Compilation failures and measured utilization are feedback.
 
-Use all listed transform kinds when they support a measured hypothesis. Keep
-strong evaluated incumbents available through checkout, and spend evaluations
-on materially different complete schedules rather than every local rewrite.
+Use the current Neuron profile to choose one next transform with a concrete
+performance hypothesis.
 """
 
 
 def _parse_args() -> argparse.Namespace:
-    """Parse local policy, remote profiling, and search controls."""
-    parser = argparse.ArgumentParser(description="Run blind GPT-5.6-sol search over every shipped NKI transform.")
+    """Parse policy, remote profiler, and iteration controls."""
+    parser = argparse.ArgumentParser(description="Refine canonical matmul using GPT decisions and Neuron profiles.")
     parser.add_argument("--cache", required=True)
-    parser.add_argument("--resume")
     parser.add_argument("--host", default="gym-1")
     parser.add_argument("--model", default="openai.gpt-5.6-sol")
     parser.add_argument("--model-provider", default="amazon-bedrock")
@@ -74,10 +71,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-executable", default="codex")
     parser.add_argument("--policy-timeout-s", type=int, default=900)
     parser.add_argument("--profile-timeout-s", type=int, default=1800)
-    parser.add_argument("--max-transforms", type=int, default=90)
-    parser.add_argument("--max-evaluations", type=int, default=20)
-    parser.add_argument("--min-evaluations", type=int, default=20)
-    parser.add_argument("--max-decisions", type=int, default=150)
+    parser.add_argument("--max-iterations", type=int, default=20)
     parser.add_argument("--remote-repo-subdir", default=".cache/nki-autotune-agentic/repo")
     parser.add_argument("--remote-cache-subdir", default=".cache/nki-autotune-agentic/profiles")
     parser.add_argument("--remote-activate", default='source "$HOME"/venvs/kernel-env/bin/activate')
@@ -107,7 +101,7 @@ def _profile_evaluator(args: argparse.Namespace) -> SSHNKIProfileEvaluator:
 
 
 async def _run_search(cache_dir: Path, args: argparse.Namespace, evaluator: SSHNKIProfileEvaluator) -> SearchResult:
-    """Run one canonical, transform-only reasoning search."""
+    """Run one canonical linear refinement."""
     policy = CodexTransformPolicy(
         CodexPolicyConfig(
             executable=args.codex_executable,
@@ -117,21 +111,13 @@ async def _run_search(cache_dir: Path, args: argparse.Namespace, evaluator: SSHN
             timeout_s=args.policy_timeout_s,
         )
     )
-    search = AgenticSearch(
+    refinement = ProfilerGuidedRefinement(
         environment=KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, transforms=TRANSFORMS),
         policy=policy,
         evaluator=evaluator,
-        config=SearchConfig(
-            cache_dir=cache_dir,
-            resume_dir=(Path(args.resume).expanduser().resolve() if args.resume is not None else None),
-            max_transforms=args.max_transforms,
-            max_evaluations=args.max_evaluations,
-            min_evaluations=args.min_evaluations,
-            max_decisions=args.max_decisions,
-            workload_guidance=MATMUL_GUIDANCE,
-        ),
+        config=SearchConfig(cache_dir=cache_dir, max_iterations=args.max_iterations, workload_guidance=MATMUL_GUIDANCE),
     )
-    return await search.run()
+    return await refinement.run()
 
 
 def _simulate_selected(source: str, cache_dir: Path) -> float:
@@ -155,46 +141,40 @@ def _simulate_selected(source: str, cache_dir: Path) -> float:
 
 
 def _search_summary(result: SearchResult) -> dict[str, object]:
-    """Return auditable best-node, trace, and evaluation metadata."""
+    """Return the selected state and measured refinement history."""
     best = result.best_node
     return {
         "selected_node_id": best.node_id,
-        "active_node_id": result.active_node_id,
+        "current_node_id": result.current_node.node_id,
+        "best_mfu_percent": best.evaluation.score,
         "transforms_applied": result.transforms_applied,
         "evaluations_run": result.evaluations_run,
         "finish_reason": result.finish_reason,
-        "selected_trace": [
+        "measured_history": [
             {
                 "node_id": node.node_id,
                 "action": node.action_description,
-                "score": (node.evaluation.score if node.evaluation is not None else None),
+                "score": node.evaluation.score,
+                "message": node.evaluation.message,
             }
-            for node in result.trace_to(best.node_id)
-        ],
-        "evaluated_nodes": [
-            {"node_id": node.node_id, "score": node.evaluation.score, "message": node.evaluation.message}
             for node in result.nodes
-            if node.evaluation is not None
         ],
     }
 
 
 def _main() -> None:
-    """Run blind search and validate the selected kernel."""
+    """Run refinement and validate the best measured kernel."""
     args = _parse_args()
     cache_dir = Path(args.cache).expanduser().resolve() / "matmul_lhsT_rhs" / "agentic_search"
-    evaluator = _profile_evaluator(args)
-    result = asyncio.run(_run_search(cache_dir, args, evaluator))
-    selected_source = render(result.best_node.state)
-    max_abs_error = _simulate_selected(selected_source, cache_dir)
+    result = asyncio.run(_run_search(cache_dir, args, _profile_evaluator(args)))
+    max_abs_error = _simulate_selected(render(result.best_node.state), cache_dir)
     summary = {
         "model": args.model,
         "reasoning_effort": args.reasoning_effort,
         "fp32_max_abs_error": max_abs_error,
         **_search_summary(result),
     }
-    summary_path = cache_dir / "demonstration.json"
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    (cache_dir / "demonstration.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))
 
 

@@ -1,4 +1,4 @@
-"""Profile local search states on an always-on remote Trn2 host."""
+"""Profile local refinement states on an always-on remote Trn2 host."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from autotune.search.profile_evaluator import ProfileEvaluatorConfig
-from autotune.search.types import Evaluation, EvaluationMetric
 from nkigym.codegen import render
 from nkigym.ir import KernelIR
+from nkigym.search.types import Evaluation, EvaluationMetric
 
 _RESULT_PREFIX = "AUTOTUNE_PROFILE_RESULT="
 _SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=no")
@@ -20,7 +20,7 @@ _SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictH
 
 @dataclass(frozen=True)
 class SSHProfileConfig:
-    """Repository and transport settings for remote state evaluation."""
+    """Repository and transport settings for remote profiling."""
 
     host: str
     local_repo: Path
@@ -39,7 +39,7 @@ class ProfileKernel:
 
 
 class SSHNKIProfileEvaluator:
-    """Synchronize source once, then profile each state over SSH."""
+    """Synchronize source once, then profile refinement states over SSH."""
 
     def __init__(self, profile_config: ProfileEvaluatorConfig, ssh_config: SSHProfileConfig) -> None:
         """Store profile and SSH controls."""

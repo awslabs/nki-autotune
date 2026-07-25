@@ -1,4 +1,4 @@
-"""Remote worker: read one kernel job from stdin and profile it on-device."""
+"""Remote worker: read a kernel batch from stdin and profile it on-device."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from autotune.runner.api import profile
 from autotune.runner.output import ProfileOutput
 from autotune.runner.types import KernelJob
-from autotune.search.profile_evaluator import profile_failure_message
+from autotune.search.profile_evaluator import evaluations_from_profile_output
 
 _RESULT_PREFIX = "AUTOTUNE_PROFILE_RESULT="
 
@@ -144,29 +144,11 @@ def _main() -> None:
 
 def _serialize_evaluations(output: ProfileOutput, labels: tuple[str, ...]) -> dict[str, dict[str, object]]:
     """Convert runner rows into labeled JSON-safe evaluation objects."""
-    successes = {row.kernel_name: row for row in output.successes}
-    evaluations: dict[str, dict[str, object]] = {}
-    for label in labels:
-        row = successes.get(label)
-        if row is not None:
-            evaluations[label] = {
-                "score": row.mfu,
-                "metrics": {
-                    "mfu_percent": row.mfu,
-                    "total_time_s": row.total_time_s,
-                    "mbu_percent": row.mbu,
-                    "roofline_ceiling_percent": row.roofline_ceiling,
-                },
-                "message": f"Trn2 success: MFU={row.mfu:.2f}%, total={row.total_time_s:.6f}s",
-            }
-        else:
-            message = profile_failure_message(output, label)
-            evaluations[label] = {
-                "score": None,
-                "metrics": {"wallclock_s": output.elapsed_s},
-                "message": f"Trn2 failure: {message[-500:]}",
-            }
-    return evaluations
+    evaluations = evaluations_from_profile_output(output, labels)
+    return {
+        label: {"score": evaluation.score, "metrics": evaluation.metrics, "message": evaluation.message}
+        for label, evaluation in evaluations.items()
+    }
 
 
 if __name__ == "__main__":

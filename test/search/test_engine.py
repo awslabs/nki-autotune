@@ -1,10 +1,9 @@
-"""Behavioral tests for the bounded agentic search engine."""
+"""Behavioral tests for linear profiler-guided refinement."""
 
 from __future__ import annotations
 
 import asyncio
 import copy
-import json
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,24 +12,24 @@ from typing import cast
 
 import pytest
 
-from autotune.search import AgentDecision, AgenticSearch, Evaluation, SearchConfig
-from autotune.search.observation import state_fingerprint
-from autotune.search.types import DecisionKind
 from nkigym.environment import KernelMDP
 from nkigym.ir import KernelIR
-from nkigym.transforms import Fuse, Split
+from nkigym.search import AgentDecision, Evaluation, ProfilerGuidedRefinement, SearchConfig
+from nkigym.transforms import Split
 
 
 class DescriptionPolicy:
-    """Choose actions by semantic text, then finish."""
+    """Apply actions selected by semantic description, then finish."""
 
     def __init__(self, needles: list[str]) -> None:
         """Store ordered action-description substrings."""
         self.needles = needles
         self.index = 0
+        self.observations: list[str] = []
 
     async def decide(self, observation: str) -> AgentDecision:
-        """Select the next matching action or finish after the sequence."""
+        """Choose the next matching action or finish."""
+        self.observations.append(observation)
         decision: AgentDecision
         if self.index < len(self.needles):
             needle = self.needles[self.index]
@@ -40,61 +39,49 @@ class DescriptionPolicy:
                 raise AssertionError(f"could not parse action line {line!r}")
             self.index += 1
             decision = AgentDecision(
-                kind="apply",
-                rationale=f"test applies {needle}",
-                raw_response=line,
-                action_id=match.group(1),
-                node_id=None,
+                kind="apply", rationale=f"apply {needle}", raw_response=line, action_id=match.group(1)
             )
         else:
             decision = AgentDecision(
-                kind="finish",
-                rationale="test sequence complete",
-                raw_response='{"kind":"finish"}',
-                action_id=None,
-                node_id=None,
+                kind="finish", rationale="test sequence complete", raw_response='{"kind":"finish"}', action_id=None
             )
         return decision
 
 
+class FirstActionPolicy:
+    """Always apply the first listed legal action."""
+
+    async def decide(self, observation: str) -> AgentDecision:
+        """Select the first action identifier."""
+        line = next(line for line in observation.splitlines() if line.startswith("- A"))
+        match = re.match(r"- (A\d+):", line)
+        if match is None:
+            raise AssertionError(f"could not parse action line {line!r}")
+        return AgentDecision(kind="apply", rationale="apply first", raw_response=line, action_id=match.group(1))
+
+
+class UnknownActionPolicy:
+    """Return an action ID absent from the observation."""
+
+    async def decide(self, observation: str) -> AgentDecision:
+        """Return one invalid action ID."""
+        return AgentDecision(kind="apply", rationale="invalid", raw_response="{}", action_id="A999")
+
+
 class NodeCountEvaluator:
-    """Score larger trees and record calls."""
+    """Score larger trees and record profile calls."""
 
     def __init__(self) -> None:
         """Initialize call tracking."""
         self.calls: list[int] = []
 
     def evaluate(self, state: KernelIR, node_id: int, cache_dir: Path) -> Evaluation:
-        """Return node count as a deterministic higher-is-better score."""
+        """Return node count as deterministic profiler feedback."""
         self.calls.append(node_id)
         return Evaluation(
             score=float(state.tree.num_nodes),
             metrics={"tree_nodes": state.tree.num_nodes},
             message=f"tree_nodes={state.tree.num_nodes}",
-        )
-
-
-class ScriptedPolicy:
-    """Execute a fixed sequence using the first listed action for apply."""
-
-    def __init__(self, operations: list[DecisionKind]) -> None:
-        """Store operation names in decision order."""
-        self.operations = operations
-        self.index = 0
-
-    async def decide(self, observation: str) -> AgentDecision:
-        """Return the next operation in the script."""
-        operation = self.operations[self.index]
-        self.index += 1
-        action_id: str | None = None
-        if operation == "apply":
-            line = next(line for line in observation.splitlines() if line.startswith("- A"))
-            match = re.match(r"- (A\d+):", line)
-            if match is None:
-                raise AssertionError(f"could not parse action line {line!r}")
-            action_id = match.group(1)
-        return AgentDecision(
-            kind=operation, rationale=f"test {operation}", raw_response=operation, action_id=action_id, node_id=None
         )
 
 
@@ -104,7 +91,7 @@ class AnnotationTransform:
 
 @dataclass(frozen=True)
 class AnnotationOption:
-    """Option that records a completed metadata phase."""
+    """Option that records a metadata phase."""
 
     phase: str
 
@@ -113,7 +100,7 @@ class AnnotationEnvironment:
     """Expose one render-neutral action that changes future legality."""
 
     def __init__(self) -> None:
-        """Create a canonical state and one opaque transform marker."""
+        """Create a canonical state and one metadata transform."""
         self._base = KernelMDP(f_matmul, INPUT_SPECS, transforms=[]).reset()
         self._transform = AnnotationTransform()
         self._option = AnnotationOption(phase="complete")
@@ -123,7 +110,7 @@ class AnnotationEnvironment:
         return copy.deepcopy(self._base)
 
     def legal_actions(self, state: KernelIR) -> list[object]:
-        """Offer the annotation action until it has been applied."""
+        """Offer the annotation until it has been applied."""
         block = state.tree.block(state.tree.root)
         actions: list[object] = []
         if block.annotations.get("phase") != "complete":
@@ -131,269 +118,103 @@ class AnnotationEnvironment:
         return actions
 
     def step(self, state: KernelIR, action: object) -> KernelIR:
-        """Apply the sole action by changing non-rendered block metadata."""
+        """Apply the annotation without changing rendered NKI."""
         if action != (self._transform, self._option):
             raise ValueError("unknown annotation action")
         result = copy.deepcopy(state)
         root = result.tree.root
         block = result.tree.block(root)
-        annotations = {**block.annotations, "phase": "complete"}
-        result.tree.graph.nodes[root]["data"] = replace(block, annotations=annotations)
+        result.tree.graph.nodes[root]["data"] = replace(block, annotations={**block.annotations, "phase": "complete"})
         return result
 
 
-def test_search_deduplicates_split_fuse_cycle_and_writes_artifacts(tmp_path: Path) -> None:
-    """Split followed by its inverse Fuse returns to the existing root node."""
-    environment = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split(), Fuse()])
-    policy = DescriptionPolicy(["Split: split loop nid=2", "Fuse: fuse outer loops"])
+def test_refinement_profiles_root_and_every_transform(tmp_path: Path) -> None:
+    """Neuron feedback is automatic before and after each policy decision."""
+    policy = DescriptionPolicy(["Split: split loop nid=2"])
     evaluator = NodeCountEvaluator()
-    search = AgenticSearch(
-        environment=environment,
+    refinement = ProfilerGuidedRefinement(
+        environment=KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split()]),
         policy=policy,
         evaluator=evaluator,
         config=SearchConfig(
-            cache_dir=tmp_path / "search",
-            resume_dir=None,
-            max_transforms=4,
-            max_evaluations=2,
-            min_evaluations=0,
-            max_decisions=5,
-            workload_guidance="Exercise a reversible transform pair.",
+            cache_dir=tmp_path / "search", max_iterations=3, workload_guidance="Exercise one measured transform."
         ),
     )
 
-    result = asyncio.run(search.run())
+    result = asyncio.run(refinement.run())
 
-    assert len(result.nodes) == 2
-    assert result.active_node_id == 0
-    assert result.transforms_applied == 2
-    assert result.evaluations_run == 1
-    assert evaluator.calls == [0]
-    assert (tmp_path / "search" / "events.jsonl").is_file()
-    assert (tmp_path / "search" / "observations" / "decision_001.md").is_file()
-    assert (tmp_path / "search" / "nodes" / "node_001" / "kernel.py").is_file()
+    assert evaluator.calls == [0, 1]
+    assert result.transforms_applied == 1
+    assert result.evaluations_run == 2
+    assert result.finish_reason == "policy finished"
+    assert "tree_nodes=" in policy.observations[0]
+    assert "The orchestrator profiles every applied transform automatically." in policy.observations[0]
+    assert (tmp_path / "search" / "nodes" / "node_000" / "evaluation.json").is_file()
+    assert (tmp_path / "search" / "observations" / "iteration_001.md").is_file()
+    assert (tmp_path / "search" / "decisions" / "iteration_001.json").is_file()
     assert (tmp_path / "search" / "result.json").is_file()
 
 
-def test_search_replays_prior_actions_and_evaluations_from_canonical(tmp_path: Path) -> None:
-    """Resume reconstructs legal states and reuses hardware feedback."""
-    environment = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split()])
-    first_evaluator = NodeCountEvaluator()
-    first = AgenticSearch(
-        environment=environment,
-        policy=DescriptionPolicy(["Split: split loop nid=2"]),
-        evaluator=first_evaluator,
-        config=SearchConfig(
-            cache_dir=tmp_path / "first",
-            resume_dir=None,
-            max_transforms=3,
-            max_evaluations=2,
-            min_evaluations=0,
-            max_decisions=3,
-            workload_guidance="Create one replayable state.",
-        ),
+def test_refinement_stops_at_transform_budget(tmp_path: Path) -> None:
+    """The iteration limit bounds both transforms and new profiles."""
+    evaluator = NodeCountEvaluator()
+    refinement = ProfilerGuidedRefinement(
+        environment=KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split()]),
+        policy=FirstActionPolicy(),
+        evaluator=evaluator,
+        config=SearchConfig(cache_dir=tmp_path / "search", max_iterations=1, workload_guidance="Apply one transform."),
     )
-    first_result = asyncio.run(first.run())
-    resumed_evaluator = NodeCountEvaluator()
-    resumed = AgenticSearch(
-        environment=environment,
-        policy=DescriptionPolicy([]),
-        evaluator=resumed_evaluator,
+
+    result = asyncio.run(refinement.run())
+
+    assert result.transforms_applied == 1
+    assert result.evaluations_run == 2
+    assert result.finish_reason == "iteration budget exhausted"
+
+
+def test_refinement_reuses_render_identical_profile(tmp_path: Path) -> None:
+    """A metadata-only transform receives cached Neuron feedback."""
+    evaluator = NodeCountEvaluator()
+    refinement = ProfilerGuidedRefinement(
+        environment=cast(KernelMDP, AnnotationEnvironment()),
+        policy=FirstActionPolicy(),
+        evaluator=evaluator,
         config=SearchConfig(
-            cache_dir=tmp_path / "resumed",
-            resume_dir=tmp_path / "first",
-            max_transforms=3,
-            max_evaluations=2,
-            min_evaluations=1,
-            max_decisions=4,
-            workload_guidance="Continue from the replayed graph.",
+            cache_dir=tmp_path / "search", max_iterations=1, workload_guidance="Exercise render caching."
         ),
     )
 
-    resumed_result = asyncio.run(resumed.run())
-
-    assert first_result.transforms_applied == 1
-    assert resumed_result.transforms_applied == 1
-    assert resumed_result.evaluations_run == 1
-    assert len(resumed_result.nodes) == 2
-    assert resumed_result.best_node.fingerprint == first_result.best_node.fingerprint
-    assert resumed_evaluator.calls == []
-
-
-def test_search_replays_semantic_states_and_counts_unique_render_evaluations(tmp_path: Path) -> None:
-    """Resume preserves render-neutral states and hardware cache accounting."""
-    environment = cast(KernelMDP, AnnotationEnvironment())
-    first_evaluator = NodeCountEvaluator()
-    first = AgenticSearch(
-        environment=environment,
-        policy=ScriptedPolicy(["evaluate", "apply", "evaluate", "finish"]),
-        evaluator=first_evaluator,
-        config=SearchConfig(
-            cache_dir=tmp_path / "first",
-            resume_dir=None,
-            max_transforms=1,
-            max_evaluations=2,
-            min_evaluations=0,
-            max_decisions=4,
-            workload_guidance="Exercise render-neutral metadata.",
-        ),
-    )
-    first_result = asyncio.run(first.run())
-    resumed_evaluator = NodeCountEvaluator()
-    resumed = AgenticSearch(
-        environment=environment,
-        policy=ScriptedPolicy([]),
-        evaluator=resumed_evaluator,
-        config=SearchConfig(
-            cache_dir=tmp_path / "resumed",
-            resume_dir=tmp_path / "first",
-            max_transforms=1,
-            max_evaluations=2,
-            min_evaluations=0,
-            max_decisions=4,
-            workload_guidance="Replay render-neutral metadata.",
-        ),
-    )
-
-    resumed_result = asyncio.run(resumed.run())
-
-    assert len(first_result.nodes) == 2
-    assert first_result.evaluations_run == 1
-    assert first_evaluator.calls == [0]
-    assert resumed_result.active_node_id == 1
-    assert resumed_result.evaluations_run == 1
-    assert resumed_evaluator.calls == []
-
-
-def test_search_replays_hybrid_legacy_and_semantic_transitions(tmp_path: Path) -> None:
-    """Recorded node transitions disambiguate a legacy-to-semantic transcript."""
-    environment = cast(KernelMDP, AnnotationEnvironment())
-    first = AgenticSearch(
-        environment=environment,
-        policy=ScriptedPolicy(["apply", "finish"]),
-        evaluator=NodeCountEvaluator(),
-        config=SearchConfig(
-            cache_dir=tmp_path / "first",
-            resume_dir=None,
-            max_transforms=1,
-            max_evaluations=1,
-            min_evaluations=0,
-            max_decisions=2,
-            workload_guidance="Create a semantic metadata transition.",
-        ),
-    )
-    asyncio.run(first.run())
-    events_path = tmp_path / "first" / "events.jsonl"
-    original = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
-    legacy_apply = {**original[0], "active_after": 0}
-    semantic_apply = {**original[0], "decision": 2}
-    finish = {**original[1], "decision": 3}
-    events_path.write_text(
-        "\n".join(json.dumps(event) for event in (legacy_apply, semantic_apply, finish)) + "\n", encoding="utf-8"
-    )
-    resumed = AgenticSearch(
-        environment=environment,
-        policy=ScriptedPolicy([]),
-        evaluator=NodeCountEvaluator(),
-        config=SearchConfig(
-            cache_dir=tmp_path / "resumed",
-            resume_dir=tmp_path / "first",
-            max_transforms=2,
-            max_evaluations=1,
-            min_evaluations=0,
-            max_decisions=3,
-            workload_guidance="Replay a hybrid metadata transition.",
-        ),
-    )
-
-    result = asyncio.run(resumed.run())
+    result = asyncio.run(refinement.run())
 
     assert len(result.nodes) == 2
-    assert result.transforms_applied == 2
-    assert result.active_node_id == 1
+    assert evaluator.calls == [0]
+    assert result.evaluations_run == 1
+    assert result.nodes[0].evaluation == result.nodes[1].evaluation
 
 
-def test_search_replays_legacy_render_fingerprints(tmp_path: Path) -> None:
-    """A render-only transcript is upgraded after canonical replay."""
-    environment = KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split()])
-    first = AgenticSearch(
-        environment=environment,
-        policy=DescriptionPolicy(["Split: split loop nid=2"]),
+def test_refinement_rejects_unknown_action(tmp_path: Path) -> None:
+    """A policy cannot invent a transform action."""
+    refinement = ProfilerGuidedRefinement(
+        environment=KernelMDP(f_matmul, INPUT_SPECS, transforms=[Split()]),
+        policy=UnknownActionPolicy(),
         evaluator=NodeCountEvaluator(),
         config=SearchConfig(
-            cache_dir=tmp_path / "first",
-            resume_dir=None,
-            max_transforms=1,
-            max_evaluations=1,
-            min_evaluations=0,
-            max_decisions=2,
-            workload_guidance="Create one legacy-compatible state.",
-        ),
-    )
-    asyncio.run(first.run())
-    root_path = tmp_path / "first" / "nodes" / "node_000" / "node.json"
-    payload = json.loads(root_path.read_text(encoding="utf-8"))
-    payload["fingerprint"] = state_fingerprint(first.nodes[0].state)
-    root_path.write_text(json.dumps(payload), encoding="utf-8")
-    resumed = AgenticSearch(
-        environment=environment,
-        policy=ScriptedPolicy([]),
-        evaluator=NodeCountEvaluator(),
-        config=SearchConfig(
-            cache_dir=tmp_path / "resumed",
-            resume_dir=tmp_path / "first",
-            max_transforms=1,
-            max_evaluations=1,
-            min_evaluations=0,
-            max_decisions=2,
-            workload_guidance="Replay one legacy-compatible state.",
+            cache_dir=tmp_path / "search", max_iterations=1, workload_guidance="Reject unknown actions."
         ),
     )
 
-    result = asyncio.run(resumed.run())
-
-    assert len(result.nodes) == 2
-    assert result.active_node_id == 1
+    with pytest.raises(ValueError, match="unknown action_id 'A999'"):
+        asyncio.run(refinement.run())
 
 
-def test_search_rejects_repeated_evaluation_of_active_node(tmp_path: Path) -> None:
-    """A live policy cannot spend decisions re-evaluating a cached state."""
-    search = AgenticSearch(
-        environment=KernelMDP(f_matmul, INPUT_SPECS, transforms=[]),
-        policy=ScriptedPolicy(["evaluate", "evaluate"]),
-        evaluator=NodeCountEvaluator(),
-        config=SearchConfig(
-            cache_dir=tmp_path / "search",
-            resume_dir=None,
-            max_transforms=0,
-            max_evaluations=2,
-            min_evaluations=0,
-            max_decisions=2,
-            workload_guidance="Reject a repeated evaluation.",
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="already evaluated node N000"):
-        asyncio.run(search.run())
-
-
-@pytest.mark.parametrize("field", ["max_transforms", "max_evaluations", "min_evaluations", "max_decisions"])
-def test_search_rejects_negative_budgets(tmp_path: Path, field: str) -> None:
-    """Every transform, evaluation, and decision budget must be non-negative."""
-    config = SearchConfig(
-        cache_dir=tmp_path / "search",
-        resume_dir=None,
-        max_transforms=1,
-        max_evaluations=1,
-        min_evaluations=0,
-        max_decisions=1,
-        workload_guidance="Validate search budgets.",
-    )
-
-    with pytest.raises(ValueError, match=f"{field} must be non-negative"):
-        AgenticSearch(
+def test_refinement_rejects_negative_iteration_limit(tmp_path: Path) -> None:
+    """The transform iteration limit must be non-negative."""
+    with pytest.raises(ValueError, match="max_iterations must be non-negative"):
+        ProfilerGuidedRefinement(
             environment=KernelMDP(f_matmul, INPUT_SPECS, transforms=[]),
-            policy=ScriptedPolicy([]),
+            policy=FirstActionPolicy(),
             evaluator=NodeCountEvaluator(),
-            config=replace(config, **{field: -1}),
+            config=SearchConfig(
+                cache_dir=tmp_path / "search", max_iterations=-1, workload_guidance="Validate the budget."
+            ),
         )
