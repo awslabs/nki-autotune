@@ -32,18 +32,16 @@ def _lhsT_matmul(lhs_T, rhs):
     return hbm_out
 
 
-def test_direct_call_computes_matmul():
+def test_direct_calls_compute_both_matmul_forms_and_return_stored_role():
+    """Direct kernels preserve both matmul forms and return stored arrays."""
     rng = np.random.default_rng(0)
     lhs_T = rng.standard_normal((K, M)).astype(np.float32)
     rhs = rng.standard_normal((K, N)).astype(np.float32)
     actual = _lhsT_matmul(lhs_T=lhs_T, rhs=rhs)
     expected = lhs_T.T @ rhs
     assert np.allclose(np.asarray(actual), expected, atol=1e-4, rtol=1e-4)
+    assert getattr(actual, "role", None) == "stored"
 
-
-def test_direct_call_computes_non_transposed_lhs_matmul():
-    """NKITranspose accepts ``data`` and preserves lhs @ rhs numerics."""
-    rng = np.random.default_rng(1)
     lhs = rng.standard_normal((M, K)).astype(np.float32)
     rhs = rng.standard_normal((K, N)).astype(np.float32)
     actual = f_lhs_matmul(lhs=lhs, rhs=rhs)
@@ -51,32 +49,17 @@ def test_direct_call_computes_non_transposed_lhs_matmul():
     assert np.allclose(np.asarray(actual), expected, atol=1e-4, rtol=1e-4)
 
 
-def test_transpose_rejects_hbm_data():
-    """Tensor Engine transpose requires an SBUF input."""
+def test_direct_operations_reject_invalid_roles():
+    """Transpose, load, and store reject operands from invalid memory roles."""
     data = np.ones((K, M), dtype=np.float32)
     with pytest.raises(TypeError, match="NKITranspose.*expects sbuf"):
         NKITranspose()(data=data)
 
-
-def test_direct_call_returns_stored_role():
-    rng = np.random.default_rng(0)
-    lhs_T = rng.standard_normal((K, M)).astype(np.float32)
-    rhs = rng.standard_normal((K, N)).astype(np.float32)
-    out = _lhsT_matmul(lhs_T=lhs_T, rhs=rhs)
-    assert getattr(out, "role", None) == "stored"
-
-
-def test_load_rejects_non_param_src():
-    """NKILoad's _check_roles fires when src is not an HBM param."""
     rng = np.random.default_rng(0)
     sbuf = NKILoad()(src=rng.standard_normal((16, 16)).astype(np.float32))
     with pytest.raises(TypeError, match="NKILoad.*expects HBM param"):
         NKILoad()(src=sbuf)
 
-
-def test_store_rejects_non_sbuf_src():
-    """NKIStore's _check_roles fires when src is PSUM instead of SBUF."""
-    rng = np.random.default_rng(0)
     lhs = NKILoad()(src=rng.standard_normal((16, 16)).astype(np.float32))
     rhs = NKILoad()(src=rng.standard_normal((16, 16)).astype(np.float32))
     psum = NKIMatmul()(stationary=lhs, moving=rhs)

@@ -232,15 +232,16 @@ def _emit_subtree(
     declared inside it, immediately before its first use.
 
     When ``nid`` is a pipelined loop (a key of ``pipeline_map``), the loop is
-    emitted monolithically and every ``versions>1`` buffer touched in its subtree
-    is added to ``rotations`` before recursing.
+    emitted monolithically and the buffers versioned by that pipeline are added
+    to ``rotations`` before recursing.
     """
     indent = _INDENT * depth
     node = ir.tree.data(nid)
     if isinstance(node, ForNode):
         child_rotations = rotations
         if nid in pipeline_map:
-            child_rotations = {**rotations, **_pipeline_rotations(ir, nid, node.loop_var)}
+            annotation = pipeline_map[nid]
+            child_rotations = {**rotations, **_pipeline_rotations(ir, node.loop_var, annotation["versioned_buffers"])}
         code.append(indent + f"for {node.loop_var} in range({node.extent}):")
         child_indent = _INDENT * (depth + 1)
         for child_nid in ir.tree.children(nid):
@@ -255,23 +256,14 @@ def _emit_subtree(
         raise TypeError(f"unexpected subtree node type {type(node).__name__}")
 
 
-def _pipeline_rotations(ir: KernelIR, loop_nid: int, loop_var: str) -> dict[str, Expr]:
-    """Tile-axis rotations for every ``versions>1`` buffer touched in a loop's subtree.
-
-    Walks the descendant ISA leaves of the pipelined loop, collecting the
-    tensor of every operand binding, and maps each multi-version buffer to its
-    ``loop_var % versions`` rotation (see :func:`_version_rotation`).
-    Single-version buffers contribute nothing.
-    """
+def _pipeline_rotations(ir: KernelIR, loop_var: str, versioned_buffers: tuple[str, ...]) -> dict[str, Expr]:
+    """Return rotations for the buffers versioned by one pipeline."""
     out: dict[str, Expr] = {}
-    for desc_nid in ir.tree.descendants(loop_nid):
-        data = ir.tree.data(desc_nid)
-        if not isinstance(data, ISANode):
-            continue
-        for region in data.operand_bindings.values():
-            rotation = _version_rotation(ir.buffer(region.tensor), loop_var)
-            if rotation is not None:
-                out[region.tensor] = rotation
+    for name in versioned_buffers:
+        rotation = _version_rotation(ir.buffer(name), loop_var)
+        if rotation is None:
+            raise AssertionError(f"pipeline marks single-version buffer {name!r} as versioned")
+        out[name] = rotation
     return out
 
 

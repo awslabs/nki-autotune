@@ -7,19 +7,11 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.tensor_copy import NKITensorCopy
 
 
-def test_matmul_declares_sum_reducer() -> None:
-    """NKIMatmul exposes the sum reducer (combiner='add', identity=0.0)."""
+def test_reduce_combinator_contract() -> None:
+    """Reduction operations declare a reducer and other operations default to none."""
     rc = NKIMatmul.REDUCE_COMBINATOR
     assert isinstance(rc, ReduceCombinator)
     assert rc.combiner == "add"
     assert rc.identity == 0.0
-
-
-def test_non_reduction_op_has_no_reducer() -> None:
-    """An op with no reduction (tensor_copy) declares REDUCE_COMBINATOR = None."""
     assert NKITensorCopy.REDUCE_COMBINATOR is None
-
-
-def test_base_default_is_none() -> None:
-    """The base NKIOp default is None."""
     assert NKIOp.REDUCE_COMBINATOR is None

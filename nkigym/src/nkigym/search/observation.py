@@ -13,12 +13,17 @@ from nkigym.search.types import SearchConfig, SearchNode
 from nkigym.transforms import (
     BufferCompactionOption,
     BufferLayoutOption,
+    CancelTransposePairOption,
     CodeMotionOption,
     FuseOption,
+    InsertTransposePairOption,
     ReorderOption,
     RFactorOption,
     SoftwarePipelineOption,
     SplitOption,
+    TransposeThroughLoadOption,
+    TransposeThroughMatmulOption,
+    TransposeThroughTensorCopyOption,
 )
 
 _HISTORY_LIMIT = 24
@@ -199,6 +204,18 @@ def _describe_option(state: KernelIR, option: object) -> str:
         )
     elif isinstance(option, BufferCompactionOption):
         result = f"place and compact {option.tensor} from logical shape {state.buffer(option.tensor).shape}"
+    elif isinstance(option, InsertTransposePairOption):
+        result = (
+            f"insert T(T({option.source})) before " f"{_node_label(tree, option.consumer_nid)} operand {option.operand}"
+        )
+    elif isinstance(option, CancelTransposePairOption):
+        result = f"cancel adjacent transpose pair beginning at {_node_label(tree, option.first_transpose_nid)}"
+    elif isinstance(option, TransposeThroughLoadOption):
+        result = f"commute transpose through {_node_label(tree, option.target_nid)}"
+    elif isinstance(option, TransposeThroughMatmulOption):
+        result = f"commute {_node_label(tree, option.transpose_nid)} through its matmul producer"
+    elif isinstance(option, TransposeThroughTensorCopyOption):
+        result = f"commute {_node_label(tree, option.transpose_nid)} through its tensor-copy drain"
     else:
         result = repr(option)
     return result

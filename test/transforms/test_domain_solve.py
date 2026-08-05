@@ -25,7 +25,7 @@ def _leaf_in(ir, block_nid: int) -> int:
     raise AssertionError("no ISA leaf")
 
 
-def test_dim_loops_of_block_canonical_matmul():
+def _check_dim_loops_of_block_canonical_matmul():
     """The canonical matmul block owns d0,d1,d2 loops, each trip 16/16/4."""
     ir = build_canonical_ir()
     mm = _block_for_op(ir, "NKIMatmul")
@@ -46,7 +46,7 @@ def _dim_for_node_in_block(ir, block_nid: int, dim: str) -> int:
     raise AssertionError(f"no {dim} ForNode in block {block_nid}")
 
 
-def test_dim_loops_of_block_tiled_dim_outer_to_inner():
+def _check_dim_loops_of_block_tiled_dim_outer_to_inner():
     """A split dim's loops list outer->inner: (i_d0_0, 2), (i_d0_1, 8)."""
     ir = build_canonical_ir()
     mm = _block_for_op(ir, "NKIMatmul")
@@ -58,7 +58,7 @@ def test_dim_loops_of_block_tiled_dim_outer_to_inner():
     assert dim_loops_of_block(ir2.tree, mm2)["d0"] == [("i_d0_0", 2), ("i_d0_1", 8)]
 
 
-def test_enclosing_dim_loops_of_matmul_inner_loop():
+def _check_enclosing_dim_loops_of_matmul_inner_loop():
     """The dims covered at/above the matmul's innermost loop are d0,d1,d2."""
     ir = build_canonical_ir()
     mm = _block_for_op(ir, "NKIMatmul")
@@ -69,7 +69,7 @@ def test_enclosing_dim_loops_of_matmul_inner_loop():
     assert set(enclosing) == {"d0", "d1", "d2"}
 
 
-def test_solve_iter_domains_full_cover():
+def _check_solve_iter_domains_full_cover():
     """Moved d1 trip 16, target enclosing d1 trip 16 -> covered, residual 1."""
     from nkigym.transforms._domain_solve import solve_iter_domains
 
@@ -80,7 +80,7 @@ def test_solve_iter_domains_full_cover():
     assert solved["d1"].target_loops == [("i_d1_0", 16)]
 
 
-def test_solve_iter_domains_partial_cover_residual():
+def _check_solve_iter_domains_partial_cover_residual():
     """Moved d1 trip 16, target covers trip 4 -> residual 4."""
     from nkigym.transforms._domain_solve import solve_iter_domains
 
@@ -91,7 +91,7 @@ def test_solve_iter_domains_partial_cover_residual():
     assert solved["d1"].target_loops == [("i_d1_0", 4)]
 
 
-def test_solve_iter_domains_uncovered_dim_all_residual():
+def _check_solve_iter_domains_uncovered_dim_all_residual():
     """A moved dim the target does not iterate stays fully residual."""
     from nkigym.transforms._domain_solve import solve_iter_domains
 
@@ -102,7 +102,7 @@ def test_solve_iter_domains_uncovered_dim_all_residual():
     assert solved["d2"].target_loops == []
 
 
-def test_solve_iter_domains_indivisible_raises():
+def _check_solve_iter_domains_indivisible_raises():
     """A target coverage that does not divide the moved extent is illegal."""
     import pytest
 
@@ -114,7 +114,7 @@ def test_solve_iter_domains_indivisible_raises():
         solve_iter_domains(moved, target)
 
 
-def test_regen_and_rebind_full_cover_drops_all_loops():
+def _check_regen_and_rebind_full_cover_drops_all_loops():
     """Full-coverage move: the moved block keeps no ForNodes (all covered)."""
     from nkigym.ir.tree import ForNode
     from nkigym.transforms._domain_solve import DimDomain, dim_loops_of_block, regen_and_rebind
@@ -130,7 +130,7 @@ def test_regen_and_rebind_full_cover_drops_all_loops():
     assert remaining == []
 
 
-def test_regen_and_rebind_residual_keeps_one_loop():
+def _check_regen_and_rebind_residual_keeps_one_loop():
     """Partial cover (residual 4 on d1) leaves exactly one residual ForNode on d1."""
     from nkigym.ir.tree import ForNode
     from nkigym.transforms._domain_solve import DimDomain, dim_loops_of_block, regen_and_rebind
@@ -146,3 +146,24 @@ def test_regen_and_rebind_residual_keeps_one_loop():
     remaining = [ir.tree.loop(d) for d in ir.tree.descendants(load) if isinstance(ir.tree.data(d), ForNode)]
     assert len(remaining) == 1
     assert remaining[0].extent == 4
+
+
+def test_loop_domain_discovery_contract() -> None:
+    """Loop discovery reports canonical, tiled, and enclosing dimensions."""
+    _check_dim_loops_of_block_canonical_matmul()
+    _check_dim_loops_of_block_tiled_dim_outer_to_inner()
+    _check_enclosing_dim_loops_of_matmul_inner_loop()
+
+
+def test_iter_domain_solver_contract() -> None:
+    """Domain solving handles full, partial, absent, and indivisible coverage."""
+    _check_solve_iter_domains_full_cover()
+    _check_solve_iter_domains_partial_cover_residual()
+    _check_solve_iter_domains_uncovered_dim_all_residual()
+    _check_solve_iter_domains_indivisible_raises()
+
+
+def test_regeneration_respects_residual_domains() -> None:
+    """Rebinding drops fully covered loops and retains one residual loop."""
+    _check_regen_and_rebind_full_cover_drops_all_loops()
+    _check_regen_and_rebind_residual_keeps_one_loop()

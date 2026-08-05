@@ -1,14 +1,12 @@
 """Tests for converting runner output into search scores."""
 
 from pathlib import Path
+from test.transforms._fixtures import INPUT_SPECS, f_matmul
 
 from autotune.runner.output import ProfileOutput
 from autotune.runner.types import KernelJob, ProfileResult
 from autotune.search.profile_evaluator import NKIProfileEvaluator, ProfileEvaluatorConfig
-from examples.random_rollout import LHS_T_RHS
 from nkigym.ir import build_initial_ir
-
-WORKLOAD = LHS_T_RHS
 
 
 def test_profile_evaluator_uses_mfu_as_score(tmp_path: Path) -> None:
@@ -45,7 +43,7 @@ def test_profile_evaluator_uses_mfu_as_score(tmp_path: Path) -> None:
 
     evaluator = NKIProfileEvaluator(
         config=ProfileEvaluatorConfig(
-            input_specs=WORKLOAD.input_specs,
+            input_specs=INPUT_SPECS,
             output_shape=(2048, 2048),
             neuron_platform_target="trn2",
             neuronx_cc_args=(),
@@ -53,7 +51,7 @@ def test_profile_evaluator_uses_mfu_as_score(tmp_path: Path) -> None:
         ),
         profile_runner=fake_profile,
     )
-    evaluation = evaluator.evaluate(build_initial_ir(WORKLOAD.f_nkigym, WORKLOAD.input_specs), 0, tmp_path)
+    evaluation = evaluator.evaluate(build_initial_ir(f_matmul, INPUT_SPECS), 0, tmp_path)
 
     assert evaluation.score == 91.0
     assert evaluation.metrics["total_time_s"] == 0.001
@@ -85,7 +83,7 @@ def test_profile_evaluator_reports_specific_compiler_diagnostic(tmp_path: Path) 
 
     evaluator = NKIProfileEvaluator(
         config=ProfileEvaluatorConfig(
-            input_specs=WORKLOAD.input_specs,
+            input_specs=INPUT_SPECS,
             output_shape=(2048, 2048),
             neuron_platform_target="trn2",
             neuronx_cc_args=(),
@@ -93,7 +91,7 @@ def test_profile_evaluator_reports_specific_compiler_diagnostic(tmp_path: Path) 
         ),
         profile_runner=fake_profile,
     )
-    evaluation = evaluator.evaluate(build_initial_ir(WORKLOAD.f_nkigym, WORKLOAD.input_specs), 0, tmp_path)
+    evaluation = evaluator.evaluate(build_initial_ir(f_matmul, INPUT_SPECS), 0, tmp_path)
 
     assert evaluation.score is None
     assert "[NCC_INLA001] Allocated memory out of bound in PSUM" in evaluation.message

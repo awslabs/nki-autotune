@@ -58,12 +58,13 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         self._check_legality(ir, option, children)
         new_ir = copy.deepcopy(ir)
         new_children = list(new_ir.tree.children(option.loop_nid))
-        self._apply_versions(new_ir, option, new_children)
+        versioned_buffers = self._apply_versions(new_ir, option, new_children)
         parent = self._parent_block(new_ir, option.loop_nid)
         new_ir.tree.block(parent).annotations["software_pipeline"] = {
             "loop_nid": option.loop_nid,
             "stages": option.stages,
             "order": option.order,
+            "versioned_buffers": versioned_buffers,
         }
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
@@ -191,13 +192,14 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         if not self._is_legal(ir, option, children):
             raise TransformLegalityError(f"illegal software-pipeline option {option}")
 
-    def _apply_versions(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> None:
-        """Set Buffer.versions = use_stage - def_stage + 1 for each buffer the
-        staged units touch. Per-leaf reads/writes from ir.dependency.info(leaf)
-        (the matmul nest has no BlockNode carrying regions)."""
-        for name, versions in self._version_counts(ir, option, children).items():
+    def _apply_versions(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> tuple[str, ...]:
+        """Set and return buffers requiring more than one pipeline version."""
+        version_counts = self._version_counts(ir, option, children)
+        versioned_buffers = tuple(sorted(name for name, versions in version_counts.items() if versions > 1))
+        for name, versions in version_counts.items():
             if versions > 1:
                 self._set_versions(ir, name, versions)
+        return versioned_buffers
 
     def _version_counts(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> dict[str, int]:
         """Return the pipeline version count required for each defined-and-used buffer."""

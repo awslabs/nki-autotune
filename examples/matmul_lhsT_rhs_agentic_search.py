@@ -21,7 +21,7 @@ import numpy as np
 
 from autotune.search.profile_evaluator import ProfileEvaluatorConfig
 from autotune.search.ssh_profile_evaluator import SSHNKIProfileEvaluator, SSHProfileConfig
-from examples.random_rollout import LHS_T_RHS, TRANSFORMS
+from examples._matmul_workloads import LHS_T_RHS, TRANSFORMS
 from nkigym.codegen import render
 from nkigym.environment import KernelMDP
 from nkigym.search import ProfilerGuidedRefinement, SearchConfig, SearchResult

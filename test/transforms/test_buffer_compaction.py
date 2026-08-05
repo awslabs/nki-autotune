@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import copy
-from test.transforms._fixtures import build_ladder_state
+from test.transforms._fixtures import build_ladder_state, f_lhs_matmul
 
 from nkigym.codegen.compact import place_and_compact_buffer
-from nkigym.ir import KernelIR
+from nkigym.ir import KernelIR, build_initial_ir
 from nkigym.ir.arith.expr import to_affine
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import ISANode
-from nkigym.transforms import BufferCompaction, BufferCompactionOption, Split, SplitOption
+from nkigym.ir.tree import ForNode, ISANode
+from nkigym.transforms import BufferCompaction, BufferCompactionOption, CodeMotion, CodeMotionOption, Split, SplitOption
 from nkigym.transforms._normalize import normalize_tensor_regions
 from nkigym.transforms.base import TransformLegalityError
 from nkigym.transforms.code_motion import _move
@@ -65,6 +65,31 @@ def _build_m_outer_store_sink_intermediate() -> KernelIR:
     ir13_intermediate.dependency = Dependency(ir13_intermediate.tree)
 
     return ir13_intermediate
+
+
+def _build_transpose_drain_intermediate() -> KernelIR:
+    """Move the transpose drain under an inner loop with an outer live axis."""
+    specs = {"lhs": ((512, 256), "bfloat16"), "rhs": ((256, 128), "bfloat16")}
+    ir = build_initial_ir(f_lhs_matmul, specs)
+    drain_leaf = next(
+        nid
+        for nid in ir.tree.preorder()
+        if isinstance(ir.tree.data(nid), ISANode)
+        and ir.tree.isa(nid).op_cls.__name__ == "NKITensorCopy"
+        and ir.tree.isa(nid).operand_bindings["src"].tensor == "psum_lhs_T"
+    )
+    transpose_leaf = next(
+        nid
+        for nid in ir.tree.preorder()
+        if isinstance(ir.tree.data(nid), ISANode) and ir.tree.isa(nid).op_cls.__name__ == "NKITranspose"
+    )
+    drain_block = next(nid for nid in reversed(ir.tree.ancestors(drain_leaf)) if nid in set(ir.tree.blocks()))
+    inner_loop = next(
+        nid
+        for nid in ir.tree.ancestors(transpose_leaf)
+        if isinstance(ir.tree.data(nid), ForNode) and ir.tree.loop(nid).loop_var == "i_d1_0"
+    )
+    return CodeMotion().apply(ir, CodeMotionOption(drain_block, inner_loop, 1))
 
 
 def _regions_of(ir, tensor):
@@ -123,6 +148,15 @@ def test_apply_compacts_sbuf_prod_end_to_end():
     assert ir.buffer("sbuf_prod").shape == (2048, 2048)
 
 
+def test_compaction_does_not_anchor_inside_a_live_outer_loop() -> None:
+    """An inner selector cannot alias values retained across an outer loop."""
+    ir = _build_transpose_drain_intermediate()
+    compacted = BufferCompaction().apply(ir, BufferCompactionOption(tensor="psum_lhs_T"))
+    assert compacted.buffer("psum_lhs_T").shape == (256, 512)
+    for _nid, region in _regions_of(compacted, "psum_lhs_T"):
+        assert to_affine(region.ranges[0][0]).get("i_d1_0", 0) == 1
+
+
 def test_apply_rejects_shared_hbm():
     """Compacting a shared_hbm buffer is a loud legality error (no tile axis)."""
     ir = _build_m_outer_store_sink_intermediate()
@@ -153,6 +187,21 @@ def test_analyze_offers_uncompacted_buffers():
     tensors = {opt.tensor for opt in BufferCompaction().analyze(ir)}
     assert "sbuf_prod" in tensors
     assert "hbm_out" not in tensors
+
+
+def test_batched_analysis_matches_individual_compaction_probes() -> None:
+    """Batched analysis preserves every individual compaction verdict."""
+    transform = BufferCompaction()
+    states = (
+        build_initial_ir(f_lhs_matmul, {"lhs": ((512, 256), "bfloat16"), "rhs": ((256, 128), "bfloat16")}),
+        _build_m_outer_store_sink_intermediate(),
+        _build_transpose_drain_intermediate(),
+    )
+    for ir in states:
+        candidates = tuple(name for name, buffer in ir.all_buffers().items() if buffer.location in ("sbuf", "psum"))
+        expected = {tensor for tensor in candidates if transform._would_change(ir, tensor)}
+        actual = {option.tensor for option in transform.analyze(ir)}
+        assert actual == expected
 
 
 def test_codemotion_is_structural_only():

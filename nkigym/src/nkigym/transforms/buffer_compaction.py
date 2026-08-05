@@ -14,13 +14,17 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 
-from nkigym.codegen.compact import place_and_compact_buffer
+from nkigym.codegen.compact import compact_shapes, place_and_compact_buffer
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Expr
+from nkigym.ir.buffer_placement import place_buffers
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import BlockNode, ISANode
-from nkigym.transforms._normalize import normalize_tensor_regions
+from nkigym.ir.tree import BlockNode, ISANode, KernelTree
+from nkigym.transforms._normalize import normalize_selected_tensor_regions, normalize_tensor_regions
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+
+_RegionSnapshot = tuple[tuple[tuple[Expr, Expr], ...], ...]
+_CompactionSnapshot = tuple[tuple[int, ...], int, _RegionSnapshot]
 
 
 @dataclass(frozen=True)
@@ -39,11 +43,9 @@ class BufferCompaction(Transform[BufferCompactionOption]):
 
     def analyze(self, ir: KernelIR) -> list[BufferCompactionOption]:
         """Offer every sbuf/psum buffer whose compacted form differs from its current one."""
-        options: list[BufferCompactionOption] = []
-        for name, buf in ir.all_buffers().items():
-            if buf.location in ("sbuf", "psum") and self._would_change(ir, name):
-                options.append(BufferCompactionOption(tensor=name))
-        return options
+        tensors = tuple(name for name, buf in ir.all_buffers().items() if buf.location in ("sbuf", "psum"))
+        changed = self._would_change_many(ir, tensors)
+        return [BufferCompactionOption(tensor=tensor) for tensor in tensors if tensor in changed]
 
     def apply(self, ir: KernelIR, option: BufferCompactionOption) -> KernelIR:
         """Re-check legality, compact a deep copy, normalize its regions, and rebuild deps."""
@@ -66,41 +68,50 @@ class BufferCompaction(Transform[BufferCompactionOption]):
 
     def _would_change(self, ir: KernelIR, tensor: str) -> bool:
         """Whether compaction would alter the tensor's declaration, shape, or regions."""
-        probe = copy.deepcopy(ir)
-        before_shape = probe.buffer(tensor).shape
-        before_regions = _regions_snapshot(probe, tensor)
-        before_decl = _decl_block_of(probe, tensor)
-        place_and_compact_buffer(probe.tree, tensor)
-        normalize_tensor_regions(probe.tree, tensor)
-        after_decl = _decl_block_of(probe, tensor)
-        changed = (
-            probe.buffer(tensor).shape != before_shape
-            or _regions_snapshot(probe, tensor) != before_regions
-            or after_decl != before_decl
-        )
+        probe = copy.deepcopy(ir.tree)
+        before = _compaction_snapshots(ir.tree, frozenset((tensor,)))[tensor]
+        place_and_compact_buffer(probe, tensor)
+        normalize_tensor_regions(probe, tensor)
+        after = _compaction_snapshots(probe, frozenset((tensor,)))[tensor]
+        return after != before
+
+    def _would_change_many(self, ir: KernelIR, tensors: tuple[str, ...]) -> set[str]:
+        """Return changed tensors using one equivalent placement and normalization probe."""
+        selected = frozenset(tensors)
+        changed: set[str] = set()
+        if selected:
+            before = _compaction_snapshots(ir.tree, selected)
+            probe = copy.deepcopy(ir.tree)
+            place_buffers(probe)
+            compact_shapes(probe)
+            normalize_selected_tensor_regions(probe, selected)
+            after = _compaction_snapshots(probe, selected)
+            changed = {tensor for tensor in tensors if after[tensor] != before[tensor]}
         return changed
 
 
-def _decl_block_of(ir: KernelIR, tensor: str) -> int:
-    """Block nid that declares ``tensor`` in its alloc_buffers."""
-    for nid in ir.tree.blocks():
-        block = ir.tree.data(nid)
+def _compaction_snapshots(tree: KernelTree, tensors: frozenset[str]) -> dict[str, _CompactionSnapshot]:
+    """Collect declaration, logical shape, and ISA regions for selected tensors."""
+    shapes: dict[str, tuple[int, ...]] = {}
+    declarations: dict[str, int] = {}
+    regions: dict[str, list[tuple[tuple[Expr, Expr], ...]]] = {tensor: [] for tensor in tensors}
+    for nid in tree.blocks():
+        block = tree.data(nid)
         assert isinstance(block, BlockNode)
-        if any(buf.name == tensor for buf in block.alloc_buffers):
-            return nid
-    raise KeyError(f"{tensor} declared by no block")
-
-
-def _regions_snapshot(ir: KernelIR, tensor: str) -> tuple[tuple[tuple[Expr, Expr], ...], ...]:
-    """Immutable snapshot of every region naming ``tensor`` (for change detection)."""
-    out: list[tuple[tuple[Expr, Expr], ...]] = []
-    for nid in ir.tree.preorder():
-        data = ir.tree.data(nid)
+        for buffer in block.alloc_buffers:
+            if buffer.name in tensors:
+                shapes[buffer.name] = buffer.shape
+                declarations[buffer.name] = nid
+    for nid in tree.preorder():
+        data = tree.data(nid)
         if isinstance(data, ISANode):
             for region in data.operand_bindings.values():
-                if region.tensor == tensor:
-                    out.append(region.ranges)
-    return tuple(out)
+                if region.tensor in tensors:
+                    regions[region.tensor].append(region.ranges)
+    missing = tensors - shapes.keys()
+    if missing:
+        raise KeyError(f"buffers declared by no block: {sorted(missing)}")
+    return {tensor: (shapes[tensor], declarations[tensor], tuple(regions[tensor])) for tensor in tensors}
 
 
 __all__ = ["BufferCompaction", "BufferCompactionOption"]

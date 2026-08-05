@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from test.transforms._fixtures import LHS_INPUT_SPECS, f_lhs_matmul
 
 from nkigym.ir import KernelIR, build_initial_ir
 from nkigym.ir.tree import ForNode, ISANode
+from nkigym.ops import nkigym_kernel
+from nkigym.ops.load import NKILoad
+from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.store import NKIStore
+from nkigym.ops.tensor_copy import NKITensorCopy
+from nkigym.ops.transpose import NKITranspose
 from nkigym.transforms import (
     BufferCompaction,
     BufferCompactionOption,
@@ -14,16 +19,33 @@ from nkigym.transforms import (
     BufferLayoutOption,
     CodeMotion,
     CodeMotionOption,
-    LoadTranspose,
     Reorder,
     ReorderOption,
     RFactor,
     RFactorOption,
     Split,
     SplitOption,
+    TransposeThroughLoad,
 )
 
 Step = Callable[[KernelIR], KernelIR]
+LHS_INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {
+    "lhs": ((2048, 2048), "bfloat16"),
+    "rhs": ((2048, 2048), "bfloat16"),
+}
+
+
+@nkigym_kernel
+def f_lhs_matmul(lhs, rhs):
+    """Return the canonical SSA graph for ``lhs @ rhs``."""
+    sbuf_lhs = NKILoad()(src=lhs)
+    psum_lhs_T = NKITranspose()(data=sbuf_lhs)
+    sbuf_lhs_T = NKITensorCopy()(src=psum_lhs_T)
+    sbuf_rhs = NKILoad()(src=rhs)
+    psum_prod = NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs)
+    sbuf_prod = NKITensorCopy()(src=psum_prod)
+    hbm_out = NKIStore()(src=sbuf_prod)
+    return hbm_out
 
 
 def _op_leaves(ir: KernelIR, op_name: str) -> list[int]:
@@ -185,11 +207,11 @@ def _build_ladder() -> list[tuple[str, KernelIR]]:
     ir = build_initial_ir(f_lhs_matmul, LHS_INPUT_SPECS)
     ladder = [("kernel_0", ir)]
 
-    load_transpose = LoadTranspose()
-    options = load_transpose.analyze(ir)
+    transpose_through_load = TransposeThroughLoad()
+    options = transpose_through_load.analyze(ir)
     if len(options) != 1:
-        raise ValueError(f"expected one canonical LoadTranspose option, found {options}")
-    ir = load_transpose.apply(ir, options[0])
+        raise ValueError(f"expected one canonical TransposeThroughLoad option, found {options}")
+    ir = transpose_through_load.apply(ir, options[0])
     ladder.append(("kernel_1", ir))
 
     steps = [*_matmul_steps(), lambda state: BufferLayout().apply(state, BufferLayoutOption("sbuf_lhs_T", 16))]

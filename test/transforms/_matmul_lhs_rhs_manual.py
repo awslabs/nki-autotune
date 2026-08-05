@@ -56,7 +56,7 @@ def kernel_0(lhs, rhs):
     return hbm_out
 
 
-# dma_k01_load_transpose
+# dma_k01_transpose_through_load
 @nki.jit
 def kernel_1(lhs, rhs):
     assert lhs.shape == (2048, 2048)

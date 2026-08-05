@@ -31,7 +31,7 @@ def _block_for_op(ir, op_cls):
     raise AssertionError(f"no leaf block for {op_cls.__name__}")
 
 
-def test_dependency_orders_canonical_matmul_chain():
+def _check_dependency_orders_canonical_matmul_chain():
     """For canonical matmul: load_lhs / load_rhs precede matmul, which precedes tensor_copy, which precedes store."""
     ir = build_canonical_ir()
     matmul_nid = _block_for_op(ir, NKIMatmul)
@@ -43,7 +43,7 @@ def test_dependency_orders_canonical_matmul_chain():
     assert ir.dependency.must_precede(matmul_nid, store_nid)
 
 
-def test_dependency_does_not_order_independent_loads():
+def _check_dependency_does_not_order_independent_loads():
     """Loads of distinct tensors are independent; neither precedes the other."""
     ir = build_canonical_ir()
     load_nids = []
@@ -65,7 +65,7 @@ def test_dependency_does_not_order_independent_loads():
     assert not ir.dependency.must_precede(a, b)
 
 
-def test_memset_precedes_matmul_in_dependency():
+def _check_memset_precedes_matmul_in_dependency():
     """The canonical memset block must be ordered BEFORE the matmul block (was inverted under bundled init)."""
     from nkigym.ops.memset import NKIMemset
 
@@ -76,7 +76,7 @@ def test_memset_precedes_matmul_in_dependency():
     assert not ir.dependency.must_precede(matmul_nid, memset_nid), "matmul must NOT precede memset"
 
 
-def test_canonical_synthesizes_memset_for_matmul():
+def _check_canonical_synthesizes_memset_for_matmul():
     """A matmul (RMW dst) gets a synthesized memset sibling block zeroing its PSUM region."""
     from test.transforms._fixtures import build_canonical_ir
 
@@ -95,7 +95,7 @@ def test_canonical_synthesizes_memset_for_matmul():
     assert memset.kwargs == {"value": 0.0}
 
 
-def test_disjoint_tile_writes_have_no_edge():
+def _check_disjoint_tile_writes_have_no_edge():
     """Two hand-built blocks writing disjoint tiles of one buffer get NO dependency edge."""
     from dataclasses import replace
 
@@ -139,7 +139,7 @@ def test_disjoint_tile_writes_have_no_edge():
     assert not dep.must_precede(b, a)
 
 
-def test_overlapping_tile_writes_have_edge():
+def _check_overlapping_tile_writes_have_edge():
     """Two blocks writing the SAME tile get a WAW edge."""
     from dataclasses import replace
 
@@ -180,7 +180,7 @@ def test_overlapping_tile_writes_have_edge():
     assert dep.must_precede(a, b)
 
 
-def test_matmul_carries_psum_over_kloop():
+def _check_matmul_carries_psum_over_kloop():
     """The matmul's K loop carries psum_prod (rmw access invariant across K)."""
     from nkigym.ir.dependency import _tensor_carried_across
     from nkigym.ir.tree import ForNode, ISANode
@@ -197,7 +197,7 @@ def test_matmul_carries_psum_over_kloop():
     assert _tensor_carried_across(ir.tree, kloop, "psum_prod") is True
 
 
-def test_load_does_not_carry_over_kloop():
+def _check_load_does_not_carry_over_kloop():
     """A load block (pure output, no rmw) does not carry its output over K."""
     from nkigym.ir.dependency import _tensor_carried_across
     from nkigym.ir.tree import ForNode, ISANode
@@ -214,7 +214,7 @@ def test_load_does_not_carry_over_kloop():
     assert _tensor_carried_across(ir.tree, kloop, "sbuf_lhs_T") is False
 
 
-def test_dependency_graph_keyed_on_leaf_nids():
+def _check_dependency_graph_keyed_on_leaf_nids():
     """Graph nodes are ISA-leaf nids or carry-loop ForNode nids, never block nids."""
     from nkigym.ir.tree import ForNode, ISANode
 
@@ -224,7 +224,7 @@ def test_dependency_graph_keyed_on_leaf_nids():
         assert isinstance(data, (ISANode, ForNode)), f"node {node} is neither an ISA leaf nor a carry loop"
 
 
-def test_must_precede_accepts_block_or_leaf_nids():
+def _check_must_precede_accepts_block_or_leaf_nids():
     """must_precede works whether given block nids (legacy) or leaf nids (resolved either way)."""
     ir = build_canonical_ir()
     matmul_blk = _block_for_op(ir, NKIMatmul)
@@ -243,7 +243,7 @@ def test_must_precede_accepts_block_or_leaf_nids():
     assert ir.dependency.must_precede(leaf_of(matmul_blk), leaf_of(store_blk))
 
 
-def test_first_backward_edge_flags_memset_sunk_under_kloop():
+def _check_first_backward_edge_flags_memset_sunk_under_kloop():
     """Sinking the psum memset INTO the matmul's K loop is a backward edge, via the
     production insertion query on the pre-move tree (span-promotion; frozen
     directions). Rebuilding Dependency on the moved tree would flip RAW->WAR and
@@ -265,7 +265,7 @@ def test_first_backward_edge_flags_memset_sunk_under_kloop():
     assert ir.dependency.first_backward_edge_for_insertion(moved_leaf, kloop, 0) is not None
 
 
-def test_span_promotion_rejects_memset_sunk_into_kloop():
+def _check_span_promotion_rejects_memset_sunk_into_kloop():
     """Sinking the psum memset INTO the matmul's K loop is a backward edge:
     psum_prod is carried across K, so span-promotion widens both endpoints to
     K-span and the memset can no longer sit before the matmul. Checked on the
@@ -292,7 +292,7 @@ def test_span_promotion_rejects_memset_sunk_into_kloop():
     assert ir.dependency.first_backward_edge_for_insertion(moved_leaf, kloop, 0) is not None
 
 
-def test_first_backward_edge_flags_consumer_before_producer():
+def _check_first_backward_edge_flags_consumer_before_producer():
     """Sinking the tensor_copy (consumer of psum_prod) under the MEMSET's loop puts it
     before the matmul that produces psum_prod -> backward flow edge matmul->tensor_copy.
 
@@ -308,7 +308,7 @@ def test_first_backward_edge_flags_consumer_before_producer():
     assert ir.dependency.first_backward_edge_for_insertion(moved_leaf, memset_loop, 0) is not None
 
 
-def test_first_backward_edge_frozen_directions_catch_parallel_producer_flip():
+def _check_first_backward_edge_frozen_directions_catch_parallel_producer_flip():
     """The direction bug, at the dependency layer: sinking the rhs load (PARALLEL
     producer of sbuf_rhs, no carry edge) past the matmul that reads it.
 
@@ -351,7 +351,7 @@ def test_first_backward_edge_frozen_directions_catch_parallel_producer_flip():
     assert offending is not None
 
 
-def test_first_backward_edge_allows_load_under_kloop():
+def _check_first_backward_edge_allows_load_under_kloop():
     """Sinking the lhs_T load (writes sbuf_lhs_T, NOT carried over K) under K is legal -> None."""
     import copy
 
@@ -380,7 +380,7 @@ def test_first_backward_edge_allows_load_under_kloop():
     assert dep.first_backward_edge(load_leaf) is None
 
 
-def test_hazard_edges_record_conflicting_tensor():
+def _check_hazard_edges_record_conflicting_tensor():
     """Each RAW/WAW/WAR edge carries the tensor it is about, so span-promotion
     can key on the shared buffer per edge (a leaf may have one carried and one
     non-carried edge at once)."""
@@ -396,7 +396,7 @@ def test_hazard_edges_record_conflicting_tensor():
         assert isinstance(attrs["tensor"], str) and attrs["tensor"]
 
 
-def test_tensor_carried_across_psum_over_kloop():
+def _check_tensor_carried_across_psum_over_kloop():
     """psum (matmul rmw, offset invariant across K) is carried across the K loop;
     a pure-read operand (sbuf_lhs_T) is not."""
     from test.transforms._fixtures import build_canonical_ir
@@ -461,3 +461,40 @@ def test_fold_accumulator_carried_across_ko_not_broken_by_own_writeback():
     ko = loop(ir, "i_d0_0")
     assert _tensor_carried_across(ir.tree, ko, "sbuf_prod") is True
     assert _tensor_carried_across(ir.tree, ko, "psum_prod") is False
+
+
+def test_canonical_dependency_and_memset_contract() -> None:
+    """Canonical dataflow orders dependent operations while keeping loads independent."""
+    _check_dependency_orders_canonical_matmul_chain()
+    _check_dependency_does_not_order_independent_loads()
+    _check_memset_precedes_matmul_in_dependency()
+    _check_canonical_synthesizes_memset_for_matmul()
+
+
+def test_write_hazards_distinguish_disjoint_and_overlapping_tiles() -> None:
+    """Dependency construction omits disjoint writes and orders overlapping writes."""
+    _check_disjoint_tile_writes_have_no_edge()
+    _check_overlapping_tile_writes_have_edge()
+
+
+def test_loop_carried_tensor_contract() -> None:
+    """RMW tensors carry across invariant loops while pure outputs and reads do not."""
+    _check_matmul_carries_psum_over_kloop()
+    _check_load_does_not_carry_over_kloop()
+    _check_tensor_carried_across_psum_over_kloop()
+
+
+def test_dependency_graph_node_and_edge_metadata() -> None:
+    """The dependency graph resolves block or leaf IDs and labels hazard tensors."""
+    _check_dependency_graph_keyed_on_leaf_nids()
+    _check_must_precede_accepts_block_or_leaf_nids()
+    _check_hazard_edges_record_conflicting_tensor()
+
+
+def test_backward_edge_queries_cover_illegal_and_legal_moves() -> None:
+    """Insertion checks catch reset and producer-order violations while allowing legal loads."""
+    _check_first_backward_edge_flags_memset_sunk_under_kloop()
+    _check_span_promotion_rejects_memset_sunk_into_kloop()
+    _check_first_backward_edge_flags_consumer_before_producer()
+    _check_first_backward_edge_frozen_directions_catch_parallel_producer_flip()
+    _check_first_backward_edge_allows_load_under_kloop()

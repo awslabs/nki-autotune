@@ -21,7 +21,7 @@ import numpy as np
 
 from autotune.search.profile_evaluator import ProfileEvaluatorConfig
 from autotune.search.ssh_profile_evaluator import SSHNKIProfileEvaluator, SSHProfileConfig
-from examples.random_rollout import LHS_RHS, TRANSFORMS
+from examples._matmul_workloads import LHS_RHS, TRANSFORMS
 from nkigym.codegen import render
 from nkigym.environment import KernelMDP
 from nkigym.search import ProfilerGuidedRefinement, SearchConfig, SearchResult
@@ -46,8 +46,9 @@ Generic NKI constraints and semantics:
 - Inputs originate in shared HBM, DMA loads stage them in SBUF, matrix
   multiplication accumulates in fp32 PSUM, and output returns through SBUF to
   shared HBM.
-- nc_transpose uses Tensor Engine and writes PSUM. LoadTranspose can replace a
-  canonical load-transpose-drain chain with direct HBM-to-SBUF DMA transpose.
+- nc_transpose uses Tensor Engine and writes PSUM. TransposeThroughLoad can
+  commute a canonical transpose into its load as direct HBM-to-SBUF DMA
+  transpose.
 - Reordering and placement change reuse, live ranges, transfer frequency, and
   overlap. BufferCompaction materializes a moved buffer's tighter scope and
   access bounding box.

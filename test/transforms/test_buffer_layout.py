@@ -54,7 +54,7 @@ def _divisors(n):
     return {d for d in range(1, n + 1) if n % d == 0}
 
 
-def test_canonical_psum_is_packed_T16():
+def _check_canonical_psum_is_packed_t16():
     """Guard: the canonical psum_prod is packed (128,16,2048) — T=16, list_len=1.
 
     The divisor-set / apply tests below assume T=16; this pins that assumption so a
@@ -64,20 +64,20 @@ def test_canonical_psum_is_packed_T16():
     assert ir.buffer("psum_prod").list_len == 1
 
 
-def test_analyze_enumerates_every_divisor_of_T():
+def _check_analyze_enumerates_every_divisor_of_t():
     """A T=16 psum buffer offers list_len in divisors(16) minus its current layout (1)."""
     ir = _canonical_ir()
     opts = [o for o in BufferLayout().analyze(ir) if o.tensor == "psum_prod"]
     assert {o.list_len for o in opts} == _divisors(16) - {1}  # {2, 4, 8, 16}
 
 
-def test_analyze_skips_shared_hbm():
+def _check_analyze_skips_shared_hbm():
     """No option targets a shared_hbm buffer (no tile axis)."""
     ir = _canonical_ir()
     assert all(ir.buffer(o.tensor).location != "shared_hbm" for o in BufferLayout().analyze(ir))
 
 
-def test_apply_sets_list_len_full_split():
+def _check_apply_sets_list_len_full_split():
     """apply(psum_prod, 16) sets list_len=16; tree node count unchanged; original untouched."""
     ir = _canonical_ir()
     n_before = ir.tree.graph.number_of_nodes()
@@ -87,7 +87,7 @@ def test_apply_sets_list_len_full_split():
     assert new_ir.tree.graph.number_of_nodes() == n_before
 
 
-def test_apply_conserves_total_tiles():
+def _check_apply_conserves_total_tiles():
     """T (=list_len*a) is invariant across apply — re-factorize, never create."""
     ir = _canonical_ir()
     t_before = _tile_count(ir, "psum_prod")
@@ -96,7 +96,7 @@ def test_apply_conserves_total_tiles():
     assert b.list_len * b.per_tile_physical_shape()[1] == t_before
 
 
-def test_apply_round_trip_identity():
+def _check_apply_round_trip_identity():
     """list->pack->list returns to the same list_len."""
     ir = _canonical_ir()
     listed = BufferLayout().apply(ir, BufferLayoutOption(tensor="psum_prod", list_len=16))
@@ -104,32 +104,32 @@ def test_apply_round_trip_identity():
     assert packed.buffer("psum_prod").list_len == 1
 
 
-def test_apply_rejects_missing_tensor():
+def _check_apply_rejects_missing_tensor():
     ir = _canonical_ir()
     with pytest.raises(TransformLegalityError):
         BufferLayout().apply(ir, BufferLayoutOption(tensor="does_not_exist", list_len=2))
 
 
-def test_apply_rejects_non_divisor():
+def _check_apply_rejects_non_divisor():
     """list_len must divide T; 3 does not divide 16."""
     ir = _canonical_ir()
     with pytest.raises(TransformLegalityError):
         BufferLayout().apply(ir, BufferLayoutOption(tensor="psum_prod", list_len=3))
 
 
-def test_apply_rejects_noop():
+def _check_apply_rejects_noop():
     """Setting list_len to its current value is rejected (no-op)."""
     ir = _canonical_ir()
     with pytest.raises(TransformLegalityError):
         BufferLayout().apply(ir, BufferLayoutOption(tensor="psum_prod", list_len=1))
 
 
-def test_prefix_reaches_manual_kernel_6():
+def _check_prefix_reaches_manual_kernel_6():
     """Guard: the driven prefix renders byte-exact to manual kernel_6 (packed psum)."""
     assert_matches_hand(render(_ir_at_manual_k6()), manual_ladder.kernel_6)
 
 
-def test_k6_to_k7_reproduces_manual_kernel_7():
+def _check_k6_to_k7_reproduces_manual_kernel_7():
     """BufferLayout(psum_prod, 16) on the manual-k6 state renders byte-exact to manual
     kernel_7 — the standalone '# Buffer layout' rung (packed (128,16,2048) -> list-of-16)."""
     ir = _ir_at_manual_k6()
@@ -137,7 +137,7 @@ def test_k6_to_k7_reproduces_manual_kernel_7():
     assert_matches_hand(render(ir), manual_ladder.kernel_7)
 
 
-def test_list_buffer_idempotent_when_no_narrowing():
+def _check_list_buffer_idempotent_when_no_narrowing():
     """place_buffers + compact_shapes (the two passes CodeMotion reruns) are idempotent
     on a listed buffer whose touchers are NOT narrowed — list_len and per-tile survive.
 
@@ -154,7 +154,7 @@ def test_list_buffer_idempotent_when_no_narrowing():
     assert buf.per_tile_physical_shape() == before
 
 
-def test_compact_shapes_does_not_mis_shrink_list_tile_axis():
+def _check_compact_shapes_does_not_mis_shrink_list_tile_axis():
     """After tiling a listed psum's touchers on d2, compact_shapes leaves list_len=16 and
     the (128, 1, F) tile-axis form intact — it never collapses the LEADING/tile axis.
 
@@ -174,3 +174,36 @@ def test_compact_shapes_does_not_mis_shrink_list_tile_axis():
     buf = ir.buffer("psum_prod")
     assert buf.list_len == 16
     assert buf.per_tile_physical_shape() == (128, 1, 2048)
+
+
+def test_buffer_layout_analysis_contract() -> None:
+    """Canonical analysis enumerates valid divisors and excludes HBM buffers."""
+    _check_canonical_psum_is_packed_t16()
+    _check_analyze_enumerates_every_divisor_of_t()
+    _check_analyze_skips_shared_hbm()
+
+
+def test_buffer_layout_apply_contract() -> None:
+    """Applying layouts is pure, conserves tiles, and round-trips to packed form."""
+    _check_apply_sets_list_len_full_split()
+    _check_apply_conserves_total_tiles()
+    _check_apply_round_trip_identity()
+
+
+def test_buffer_layout_rejects_invalid_options() -> None:
+    """Missing tensors, non-divisors, and no-op layouts fail loudly."""
+    _check_apply_rejects_missing_tensor()
+    _check_apply_rejects_non_divisor()
+    _check_apply_rejects_noop()
+
+
+def test_buffer_layout_matches_manual_ladder() -> None:
+    """The packed prefix and list transition match their hand-written rungs."""
+    _check_prefix_reaches_manual_kernel_6()
+    _check_k6_to_k7_reproduces_manual_kernel_7()
+
+
+def test_list_layout_survives_placement_and_compaction() -> None:
+    """Placement and compaction preserve valid list geometry."""
+    _check_list_buffer_idempotent_when_no_narrowing()
+    _check_compact_shapes_does_not_mis_shrink_list_tile_axis()

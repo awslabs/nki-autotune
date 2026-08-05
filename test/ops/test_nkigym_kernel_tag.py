@@ -8,8 +8,8 @@ from nkigym.ops.load import NKILoad
 from nkigym.ops.store import NKIStore
 
 
-def test_nkigym_kernel_sets_tag_on_wrapper():
-    """Decorated wrappers expose __nkigym_kernel__ = True."""
+def test_decorator_marks_only_wrapped_kernels():
+    """Only decorated wrappers expose the nkigym-kernel marker."""
 
     @nkigym_kernel
     def identity(x):
@@ -18,10 +18,6 @@ def test_nkigym_kernel_sets_tag_on_wrapper():
         return hbm
 
     assert getattr(identity, "__nkigym_kernel__", False) is True
-
-
-def test_plain_function_has_no_tag():
-    """Undecorated callables lack the tag."""
 
     def plain(x: np.ndarray) -> np.ndarray:
         return x

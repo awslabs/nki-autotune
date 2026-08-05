@@ -104,14 +104,26 @@ def _anchor_loop_vars(tree: KernelTree, tensor: str) -> set[str]:
     ``i_d1_0``) while the matmul reads ``[*, i_d1_0*128 : +128]``. Subtracting
     ``i_d1_0`` there would collapse the matmul to tile 0 while the buffer
     still holds all 2048 columns; dropping it keeps the read tile-correct.
+
+    Anchors must form an outer prefix of the common loop chain. An inner loop
+    cannot select a reusable instance after an outer non-anchor loop because
+    that outer loop revisits the inner selector while values from earlier
+    iterations remain live.
     """
     pairs = _regions_touching(tree, tensor)
     if not pairs:
         return set()
     per_leaf = [{a for a in tree.ancestors(leaf) if isinstance(tree.data(a), ForNode)} for leaf, _r in pairs]
-    candidates = {tree.loop(nid).loop_var for nid in set.intersection(*per_leaf)}
+    common = set.intersection(*per_leaf)
+    candidates = [nid for nid in tree.ancestors(pairs[0][0]) if nid in common]
     regions = [region for _leaf, region in pairs]
-    return {v for v in candidates if _offsets_consistently(v, regions)}
+    anchors: set[str] = set()
+    for nid in candidates:
+        loop_var = tree.loop(nid).loop_var
+        if not _offsets_consistently(loop_var, regions):
+            break
+        anchors.add(loop_var)
+    return anchors
 
 
 def _offsets_consistently(loop_var: str, regions: list[BufferRegion]) -> bool:

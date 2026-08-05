@@ -101,7 +101,7 @@ def test_analyze_finds_only_reduction_loops() -> None:
         assert node.loop_var.startswith("i_d0_")
 
 
-def test_rfactor_rejects_unsplit_reduction_loop() -> None:
+def _check_rejects_unsplit_reduction_loop() -> None:
     """RFactor requires a prior Split that produces distinct ko and ki loops."""
     ir = build_canonical_ir()
     matmul = matmul_leaf_nid(ir)
@@ -117,7 +117,7 @@ def test_rfactor_rejects_unsplit_reduction_loop() -> None:
         RFactor().apply(ir, option)
 
 
-def test_rfactor_rejects_inner_reduction_loop() -> None:
+def _check_rejects_inner_reduction_loop() -> None:
     """Only the outermost reduction loop can own the generated second-stage fold."""
     ir = split_k_ir()
     matmul = matmul_leaf_nid(ir)
@@ -133,7 +133,7 @@ def test_rfactor_rejects_inner_reduction_loop() -> None:
     assert option not in RFactor().analyze(ir)
 
 
-def test_rfactor_rejects_more_than_two_reduction_loops() -> None:
+def _check_rejects_more_than_two_reduction_loops() -> None:
     """The emitted fold metadata represents one ko/ki split, not a deeper K nest."""
     ir = split_k_ir()
     matmul = matmul_leaf_nid(ir)
@@ -150,7 +150,7 @@ def test_rfactor_rejects_more_than_two_reduction_loops() -> None:
         RFactor().apply(ir, option)
 
 
-def test_apply_rejects_nonzero_factor_axis() -> None:
+def _check_rejects_nonzero_factor_axis() -> None:
     """The fused recipe has no inserted factor axis, so only axis 0 is supported."""
     ir = split_k_ir()
     option = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=1)
@@ -159,7 +159,7 @@ def test_apply_rejects_nonzero_factor_axis() -> None:
         RFactor().apply(ir, option)
 
 
-def test_apply_rejects_non_forNode() -> None:
+def _check_rejects_non_for_node() -> None:
     """A target that is not a ForNode (the matmul leaf) is rejected loudly."""
     ir = split_k_ir()
     mm = matmul_leaf_nid(ir)
@@ -167,7 +167,7 @@ def test_apply_rejects_non_forNode() -> None:
         RFactor().apply(ir, RFactorOption(target_loop_nid=mm, factor_axis=0))
 
 
-def test_apply_rejects_parallel_loop() -> None:
+def _check_rejects_parallel_loop() -> None:
     """A PARALLEL loop (the M loop, i_d1_*) is not a reduction loop → rejected."""
     ir = split_k_ir()
     m_loop = next(
@@ -179,7 +179,7 @@ def test_apply_rejects_parallel_loop() -> None:
         RFactor().apply(ir, RFactorOption(target_loop_nid=m_loop, factor_axis=0))
 
 
-def test_apply_rejects_drain_block_that_contains_the_output_store() -> None:
+def _check_rejects_drain_block_that_contains_the_output_store() -> None:
     """RFactor cannot delete a drain block that owns another ISA operation."""
     ir = split_k_ir()
     tensor_copy = next(
@@ -205,7 +205,7 @@ def test_apply_rejects_drain_block_that_contains_the_output_store() -> None:
     assert option not in RFactor().analyze(ir)
 
 
-def test_apply_rejects_drain_sunk_inside_factored_loop() -> None:
+def _check_rejects_drain_sunk_inside_factored_loop() -> None:
     """The one-stage drain must close after ko, not consume each partial inside it."""
     ir = split_k_ir()
     ko = ko_loop_nid(ir)
@@ -217,7 +217,7 @@ def test_apply_rejects_drain_sunk_inside_factored_loop() -> None:
         RFactor().apply(ir, option)
 
 
-def test_apply_rejects_missing_one_stage_init() -> None:
+def _check_rejects_missing_one_stage_init() -> None:
     """Analyze must not offer an option that apply cannot retarget."""
     ir = split_k_ir()
     init = next(
@@ -236,7 +236,7 @@ def test_apply_rejects_missing_one_stage_init() -> None:
         rfactor.apply(ir, option)
 
 
-def test_apply_rejects_unsupported_rmw_combiner(monkeypatch: pytest.MonkeyPatch) -> None:
+def _check_rejects_unsupported_rmw_combiner(monkeypatch: pytest.MonkeyPatch) -> None:
     """The generated tensor_tensor fold must have a known associative operator."""
     ir = split_k_ir()
     monkeypatch.setattr(NKIMatmul, "REDUCE_COMBINATOR", ReduceCombinator(combiner="max", identity=0.0))
@@ -247,7 +247,7 @@ def test_apply_rejects_unsupported_rmw_combiner(monkeypatch: pytest.MonkeyPatch)
         RFactor().apply(ir, option)
 
 
-def test_apply_rejects_noncontiguous_free_footprint() -> None:
+def _check_rejects_noncontiguous_free_footprint() -> None:
     """Absorbing a reversed free loop into one wide operation is unsupported."""
     ir = split_k_ir()
     matmul_nid = matmul_leaf_nid(ir)
@@ -265,7 +265,7 @@ def test_apply_rejects_noncontiguous_free_footprint() -> None:
         RFactor().apply(ir, option)
 
 
-def test_analyze_rejects_non_affine_free_footprint() -> None:
+def _check_rejects_non_affine_free_footprint() -> None:
     """Unsupported output indexing must withhold the option instead of raising."""
     ir = k32_ir()
     matmul_nid = matmul_leaf_nid(ir)
@@ -283,7 +283,7 @@ def test_analyze_rejects_non_affine_free_footprint() -> None:
         RFactor().apply(ir, option)
 
 
-def test_apply_rejects_non_identity_drain_mapping() -> None:
+def _check_rejects_non_identity_drain_mapping() -> None:
     """RFactor must not discard a drain's distinct source-to-output indexing."""
     ir = split_k_ir()
     drain_nid = next(
@@ -328,7 +328,7 @@ def test_apply_avoids_staging_buffer_name_collision() -> None:
     assert generated_copy.operand_bindings["dst"].tensor == "sbuf_rfactor_1"
 
 
-def test_apply_rejects_partition_footprint_larger_than_compact_output() -> None:
+def _check_rejects_partition_footprint_larger_than_compact_output() -> None:
     """RFactor cannot materialize 16 partition tiles in a one-tile output buffer."""
     ir = _compact_sbuf_prod_under_store(split_k_ir())
     rfactor = RFactor()
@@ -346,7 +346,7 @@ def test_apply_rejects_partition_footprint_larger_than_compact_output() -> None:
     assert option not in rfactor.analyze(ir)
 
 
-def test_apply_rejects_product_of_multiple_footprint_extents() -> None:
+def _check_rejects_product_of_multiple_footprint_extents() -> None:
     """A 4 x 4 footprint exceeds eight logical tiles despite pipeline versions."""
     ir = _compact_sbuf_prod_under_store(mid_ladder_ir())
     _replace_sbuf_prod(ir, shape=(1024, 2048), versions=2, list_len=1)
@@ -364,7 +364,7 @@ def test_apply_rejects_product_of_multiple_footprint_extents() -> None:
     assert option not in rfactor.analyze(ir)
 
 
-def test_apply_rejects_inherited_partition_offsets_larger_than_compact_output() -> None:
+def _check_rejects_inherited_partition_offsets_larger_than_compact_output() -> None:
     """Outer M loops must fit even when the inner materialized footprint is empty."""
     ir = k32_ir()
     _replace_sbuf_prod(ir, shape=(128, 512), versions=2, list_len=1)
@@ -379,7 +379,7 @@ def test_apply_rejects_inherited_partition_offsets_larger_than_compact_output() 
     assert option not in rfactor.analyze(ir)
 
 
-def test_apply_rejects_absorbed_free_span_larger_than_compact_output() -> None:
+def _check_rejects_absorbed_free_span_larger_than_compact_output() -> None:
     """The full absorbed free-axis gadget width must fit the output buffer."""
     ir = split_k_ir()
     _replace_sbuf_prod(ir, shape=(2048, 128), versions=1, list_len=1)
@@ -391,7 +391,7 @@ def test_apply_rejects_absorbed_free_span_larger_than_compact_output() -> None:
     assert option not in rfactor.analyze(ir)
 
 
-def test_apply_accepts_listed_output_with_sufficient_total_capacity() -> None:
+def _check_accepts_listed_output_with_sufficient_total_capacity() -> None:
     """A list-of-16 output retains all 16 logical partition tiles."""
     ir = split_k_ir()
     ir = BufferLayout().apply(ir, BufferLayoutOption(tensor="sbuf_prod", list_len=16))
@@ -403,12 +403,12 @@ def test_apply_accepts_listed_output_with_sufficient_total_capacity() -> None:
     rfactor.apply(ir, option)
 
 
-def test_apply_sim_matches_matmul(tmp_path) -> None:
+def _check_apply_sim_matches_matmul(tmp_path) -> None:
     """The rfactored kernel sims numerically equal to lhs_T.T @ rhs."""
     assert_matmul_ir_simulates(_rfactored_ir(), tmp_path, "rfactor_early_packed")
 
 
-def test_apply_sim_matches_matmul_mid_tiled_m(tmp_path) -> None:
+def _check_apply_sim_matches_matmul_mid_tiled_m(tmp_path) -> None:
     """RFactor(ko) on the mid state (K split ko/ki AND M tiled i_d1_0 x i_d1_1,
     buffers still packed) sims equal to the golden — the tiled-M geometry, pinned
     as a regression test via the ``mid_ladder_ir`` fixture."""
@@ -417,7 +417,7 @@ def test_apply_sim_matches_matmul_mid_tiled_m(tmp_path) -> None:
     assert_matmul_ir_simulates(rfactored, tmp_path, "rfactor_mid_tiled_m")
 
 
-def test_ko_roles_split_across_blocks() -> None:
+def _check_ko_roles_split_across_blocks() -> None:
     """After RFactor, the K axis (d0) appears as PARALLEL in the matmul run-op block
     (each ko is an independent partial) and ACCUMULATION in the tensor_tensor fold block
     (carrying ko across the closing second-stage reduction) — one factored axis, two
@@ -433,7 +433,7 @@ def test_ko_roles_split_across_blocks() -> None:
     assert AxisRole.ACCUMULATION in roles
 
 
-def test_generated_gadgets_inherit_non_square_matmul_domains() -> None:
+def _check_generated_gadgets_inherit_non_square_matmul_domains() -> None:
     """Generated block metadata derives K and M independently."""
     input_specs = {"lhs_T": ((512, 256), "bfloat16"), "rhs": ((512, 512), "bfloat16")}
     ir = build_initial_ir(f_matmul, input_specs)
@@ -453,7 +453,7 @@ def test_generated_gadgets_inherit_non_square_matmul_domains() -> None:
         assert domains == {"d0": (0, 512), "d1": (0, 256), "d2": (0, 512)}
 
 
-def test_rf_memset_drain_nested_in_ko() -> None:
+def _check_rf_memset_drain_nested_in_ko() -> None:
     """Spec §3.1: the rf-init memset and rf-drain tensor_copy are nested INSIDE the
     matmul's ko loop (per-slot), NOT flat sibling blocks outside it.
 
@@ -491,7 +491,7 @@ def test_rf_memset_drain_nested_in_ko() -> None:
     assert ko in ir.tree.ancestors(rf_drain), "rf-drain tensor_copy must be nested inside the ko loop"
 
 
-def test_apply_byte_exact_k32_to_k33() -> None:
+def _check_apply_byte_exact_k32_to_k33() -> None:
     """Structural RFactor alone reproduces the hand-written k33 rung."""
     ir = k32_ir()
     unchanged = ir.all_buffers()
@@ -505,7 +505,7 @@ def test_apply_byte_exact_k32_to_k33() -> None:
     assert_matches_hand(render(rfactored), manual_ladder.kernel_33)
 
 
-def test_apply_byte_exact_k33_to_k34() -> None:
+def _check_apply_byte_exact_k33_to_k34() -> None:
     """The first explicit compaction tightens only the PSUM partial."""
     ir = k32_ir()
     rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
@@ -519,7 +519,7 @@ def test_apply_byte_exact_k33_to_k34() -> None:
     assert_matches_hand(render(compacted), manual_ladder.kernel_34)
 
 
-def test_apply_byte_exact_k34_to_k35() -> None:
+def _check_apply_byte_exact_k34_to_k35() -> None:
     """The second explicit compaction tightens only the staging buffer."""
     ir = k32_ir()
     rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
@@ -542,3 +542,49 @@ def test_apply_sim_matches_matmul_k32_to_k35(tmp_path) -> None:
     compacted = BufferCompaction().apply(rfactored, BufferCompactionOption(tensor="psum_prod"))
     final = BufferCompaction().apply(compacted, BufferCompactionOption(tensor="sbuf_rfactor"))
     assert_matmul_ir_simulates(final, tmp_path, "rfactor_k35")
+
+
+def test_rejects_invalid_targets_and_rewrite_preconditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RFactor rejects every unsupported target shape and malformed rewrite segment."""
+    _check_rejects_unsplit_reduction_loop()
+    _check_rejects_inner_reduction_loop()
+    _check_rejects_more_than_two_reduction_loops()
+    _check_rejects_nonzero_factor_axis()
+    _check_rejects_non_for_node()
+    _check_rejects_parallel_loop()
+    _check_rejects_drain_block_that_contains_the_output_store()
+    _check_rejects_drain_sunk_inside_factored_loop()
+    _check_rejects_missing_one_stage_init()
+    _check_rejects_noncontiguous_free_footprint()
+    _check_rejects_non_affine_free_footprint()
+    _check_rejects_non_identity_drain_mapping()
+    _check_rejects_unsupported_rmw_combiner(monkeypatch)
+
+
+def test_output_geometry_contract() -> None:
+    """RFactor rejects undersized outputs and accepts sufficient listed capacity."""
+    _check_rejects_partition_footprint_larger_than_compact_output()
+    _check_rejects_product_of_multiple_footprint_extents()
+    _check_rejects_inherited_partition_offsets_larger_than_compact_output()
+    _check_rejects_absorbed_free_span_larger_than_compact_output()
+    _check_accepts_listed_output_with_sufficient_total_capacity()
+
+
+def test_early_and_mid_rfactor_states_simulate(tmp_path) -> None:
+    """Early and tiled-M RFactor states preserve matmul numerics."""
+    _check_apply_sim_matches_matmul(tmp_path)
+    _check_apply_sim_matches_matmul_mid_tiled_m(tmp_path)
+
+
+def test_generated_rfactor_structure_and_metadata() -> None:
+    """Generated blocks carry split roles, source domains, and nested reset/drain structure."""
+    _check_ko_roles_split_across_blocks()
+    _check_generated_gadgets_inherit_non_square_matmul_domains()
+    _check_rf_memset_drain_nested_in_ko()
+
+
+def test_k32_to_k35_is_byte_exact_at_each_rung() -> None:
+    """RFactor and explicit compactions reproduce all three hand-written rungs."""
+    _check_apply_byte_exact_k32_to_k33()
+    _check_apply_byte_exact_k33_to_k34()
+    _check_apply_byte_exact_k34_to_k35()

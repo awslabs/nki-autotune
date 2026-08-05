@@ -132,4 +132,4 @@ fi
 black --version >/dev/null || die "black not callable"
 
 echo "==> Done. venv=$VENV | python=$(python --version 2>&1) | black=$(black --version | head -1)"
-echo "==> Verify end-to-end: PYTHONPATH=.:nkigym/src:autotune/src python examples/random_rollout.py --cache /home/ubuntu/cache"
+echo "==> Verify end-to-end: python -m pytest -q test/transforms/test_random_rollout.py"

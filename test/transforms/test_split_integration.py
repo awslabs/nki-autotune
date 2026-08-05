@@ -6,8 +6,6 @@ from test._simulation import assert_matmul_ir_simulates
 from test.transforms._fixtures import build_canonical_ir
 from test.transforms._helpers import leaf_for_op
 
-import pytest
-
 from nkigym.codegen import render
 from nkigym.ir.arith.expr import Const
 from nkigym.ir.tree import ForNode
@@ -35,24 +33,20 @@ def test_split_tensorize_load_d1_to_16x128(tmp_path) -> None:
     assert_matmul_ir_simulates(split, tmp_path, "split_load_d1")
 
 
-@pytest.mark.parametrize(
-    "op_name, occurrence, axis, factors",
-    [
+def test_ladder_tensorized_splits_render_and_simulate(tmp_path) -> None:
+    """Every tensorized split used by the transform ladder preserves behavior."""
+    cases = (
         ("NKILoad", 1, "d2", (4, 512)),
         ("NKIMemset", 0, "d2", (4, 512)),
         ("NKITensorCopy", 0, "d2", (4, 512)),
         ("NKIStore", 0, "d2", (4, 512)),
-    ],
-)
-def test_split_tensorize_ladder_ops_render_and_sim(
-    tmp_path, op_name: str, occurrence: int, axis: str, factors: tuple[int, ...]
-) -> None:
-    """Each tensorized split used by the transform ladder preserves behavior."""
-    ir = build_canonical_ir()
-    leaf = leaf_for_op(ir, op_name, occurrence)
-    split = Split().apply(ir, SplitOption(target_nid=leaf, factors=factors, target_axis=axis))
-    module_name = f"split_{op_name.lower()}_{occurrence}"
-    assert_matmul_ir_simulates(split, tmp_path, module_name)
+    )
+    for op_name, occurrence, axis, factors in cases:
+        ir = build_canonical_ir()
+        leaf = leaf_for_op(ir, op_name, occurrence)
+        split = Split().apply(ir, SplitOption(target_nid=leaf, factors=factors, target_axis=axis))
+        module_name = f"split_{op_name.lower()}_{occurrence}"
+        assert_matmul_ir_simulates(split, tmp_path, module_name)
 
 
 def test_split_tensorize_n_to_min_tile_still_simulates(tmp_path) -> None:

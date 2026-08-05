@@ -15,13 +15,9 @@ FUSE_LO = Mod(left=Var(name="fused"), right=Const(value=4))
 FUSE_RANGES: dict[str, tuple[int, int]] = {"fused": (0, 16)}
 
 
-def test_split_recombine_collapses() -> None:
-    """Split: i0*4 + i1 over i0 in [0,4), i1 in [0,4) is one affine iter of extent 16."""
+def test_split_and_fuse_iter_maps() -> None:
+    """Split recombination collapses and fused quotient/remainder recover two iterators."""
     out = iter_map_simplify([SPLIT_BINDING], SPLIT_RANGES)
     assert out is not None and len(out) == 1
-
-
-def test_fuse_split_inverse() -> None:
-    """Fuse: (fused//4, fused%4) over fused in [0,16) recovers two iters of extent 4."""
     out = iter_map_simplify([FUSE_HI, FUSE_LO], FUSE_RANGES)
     assert out is not None and len(out) == 2

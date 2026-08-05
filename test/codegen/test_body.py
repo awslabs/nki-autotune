@@ -1,4 +1,4 @@
-"""Tests for nkigym.codegen.body BufferRegion rendering."""
+"""Tests for body allocation and BufferRegion rendering."""
 
 from __future__ import annotations
 
@@ -12,14 +12,13 @@ from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, Ke
 from nkigym.ops.load import NKILoad
 
 
-def test_root_owned_buffer_does_not_tighten_through_nested_block():
+def test_root_owned_buffer_does_not_tighten_through_nested_block() -> None:
     """A structural-only move must not silently descend a root-owned allocation."""
     tree = KernelTree()
-    buf = Buffer(name="sbuf_x", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
+    buffer = Buffer(name="sbuf_x", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
     root = tree.data(tree.root)
     assert isinstance(root, BlockNode)
-    tree.graph.nodes[tree.root]["data"] = replace(root, alloc_buffers=(buf,))
-
+    tree.graph.nodes[tree.root]["data"] = replace(root, alloc_buffers=(buffer,))
     stage = tree.add_node(BlockNode(iter_vars=(), iter_values=(), reads=(), writes=()), parent=tree.root)
     outer = tree.add_node(ForNode(loop_var="i_d2_0", extent=4), parent=stage)
     inner = tree.add_node(ForNode(loop_var="i_d0_0", extent=16), parent=outer)
@@ -27,88 +26,59 @@ def test_root_owned_buffer_does_not_tighten_through_nested_block():
         tensor="sbuf_x", ranges=((Var(name="i_d0_0"), Const(value=128)), (Const(value=0), Const(value=2048)))
     )
     leaf = tree.add_node(ISANode(op_cls=NKILoad, operand_bindings={"dst": region}), parent=inner)
-
     assert _hoisted_scope(tree, "sbuf_x", [leaf]) == tree.root
 
 
-def test_render_hbm_2d_region():
-    """An HBM 2D region renders as flat ``[lo:hi, lo:hi]``."""
-    buf = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm")
-    region = BufferRegion(
+def test_basic_buffer_region_forms() -> None:
+    """HBM, SBUF, PSUM, and full-extent regions render in their physical layouts."""
+    hbm = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm")
+    hbm_region = BufferRegion(
         tensor="hbm_out",
         ranges=(
             (Mul(left=Var(name="i_d0_0"), right=Const(value=128)), Const(value=128)),
             (Mul(left=Var(name="i_d1_0"), right=Const(value=512)), Const(value=512)),
         ),
     )
-    out = render_buffer_region(region, buf)
-    assert out == "hbm_out[i_d0_0 * 128:i_d0_0 * 128 + 128, i_d1_0 * 512:i_d1_0 * 512 + 512]"
+    assert (
+        render_buffer_region(hbm_region, hbm)
+        == "hbm_out[i_d0_0 * 128:i_d0_0 * 128 + 128, i_d1_0 * 512:i_d1_0 * 512 + 512]"
+    )
+    full = BufferRegion(
+        tensor="hbm_out", ranges=((Const(value=0), Const(value=2048)), (Const(value=0), Const(value=2048)))
+    )
+    assert render_buffer_region(full, hbm) == "hbm_out[0:0 + 2048, 0:0 + 2048]"
 
-
-def test_render_sbuf_3d_region_partition_axis_split():
-    """An SBUF 3D region splits the partition axis: [0:128, P_coord, F_lo:F_hi]."""
-    buf = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
-    region = BufferRegion(
+    sbuf = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
+    sbuf_region = BufferRegion(
         tensor="sbuf_lhs_T",
         ranges=(
             (Var(name="i_d0_0"), Const(value=128)),
             (Mul(left=Var(name="i_d1_0"), right=Const(value=128)), Const(value=128)),
         ),
     )
-    out = render_buffer_region(region, buf)
-    assert out == "sbuf_lhs_T[0][0:128, i_d0_0, i_d1_0 * 128:i_d1_0 * 128 + 128]"
-
-
-def test_render_psum_3d_region_partition_axis_split():
-    """A PSUM region (also 3D) splits the partition axis the same way."""
-    buf = Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum")
-    region = BufferRegion(
+    assert render_buffer_region(sbuf_region, sbuf) == "sbuf_lhs_T[0][0:128, i_d0_0, i_d1_0 * 128:i_d1_0 * 128 + 128]"
+    psum = Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum")
+    psum_region = BufferRegion(
         tensor="psum_prod",
         ranges=(
             (Var(name="i_d0_0"), Const(value=128)),
             (Mul(left=Var(name="i_d1_0"), right=Const(value=512)), Const(value=512)),
         ),
     )
-    out = render_buffer_region(region, buf)
-    assert out == "psum_prod[0][0:128, i_d0_0, i_d1_0 * 512:i_d1_0 * 512 + 512]"
+    assert render_buffer_region(psum_region, psum) == "psum_prod[0][0:128, i_d0_0, i_d1_0 * 512:i_d1_0 * 512 + 512]"
 
 
-def test_render_constant_zero_origin_for_full_extent_axis():
-    """When the lo expression is a bare zero Const, the rendered slice starts at 0 explicitly."""
-    buf = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm")
-    region = BufferRegion(
-        tensor="hbm_out", ranges=((Const(value=0), Const(value=2048)), (Const(value=0), Const(value=2048)))
-    )
-    out = render_buffer_region(region, buf)
-    assert out == "hbm_out[0:0 + 2048, 0:0 + 2048]"
-
-
-def test_render_region_rotation_applied():
-    """A versions>1 psum buffer rotates the tile-axis index by loop_var % versions."""
-    buf = Buffer(name="psum_prod", shape=(128, 2048), dtype="float32", location="psum", versions=2)
+def test_version_rotation_and_pipeline_rendering() -> None:
+    """Versioned regions rotate and pipeline annotations propagate the loop variable."""
     region = BufferRegion(
         tensor="psum_prod", ranges=((Const(value=0), Const(value=128)), (Const(value=0), Const(value=2048)))
     )
-    out = render_buffer_region(region, buf, rotation=Mod(left=Var(name="i_d1_0"), right=Const(value=2)))
-    assert out == "psum_prod[0][0:128, i_d1_0 % 2, 0:0 + 2048]"
+    versioned = Buffer(name="psum_prod", shape=(128, 2048), dtype="float32", location="psum", versions=2)
+    rotation = Mod(left=Var(name="i_d1_0"), right=Const(value=2))
+    assert render_buffer_region(region, versioned, rotation=rotation) == "psum_prod[0][0:128, i_d1_0 % 2, 0:0 + 2048]"
+    packed = Buffer(name="psum_prod", shape=(128, 2048), dtype="float32", location="psum")
+    assert render_buffer_region(region, packed, rotation=None) == "psum_prod[0][0:128, 0, 0:0 + 2048]"
 
-
-def test_render_region_no_rotation_when_versions_one():
-    """versions=1 (rotation=None) renders byte-identically to today."""
-    buf = Buffer(name="psum_prod", shape=(128, 2048), dtype="float32", location="psum")
-    region = BufferRegion(
-        tensor="psum_prod", ranges=((Const(value=0), Const(value=128)), (Const(value=0), Const(value=2048)))
-    )
-    assert render_buffer_region(region, buf, rotation=None) == "psum_prod[0][0:128, 0, 0:0 + 2048]"
-
-
-def test_emit_pipeline_annotation_rotates_monolithic_loop():
-    """A loop whose parent block carries a software_pipeline annotation emits a
-    monolithic loop with every versions>1 access rotated by loop_var % versions.
-
-    ``versions`` is set directly here via ``object.__setattr__`` (Buffer is
-    frozen) to isolate the renderer; Task 4 sets it through the transform.
-    """
     ir = tuned_ir()
     m_loop, _children = m_loop_and_children(ir)
     object.__setattr__(ir.buffer("psum_prod"), "versions", 2)
@@ -117,101 +87,87 @@ def test_emit_pipeline_annotation_rotates_monolithic_loop():
         "loop_nid": m_loop,
         "stages": (0, 0, 1),
         "order": (0, 1, 2),
+        "versioned_buffers": ("psum_prod",),
     }
-    src = render(ir)
-    assert "psum_prod = [nl.ndarray((128, 2, 2048)" in src
-    assert "psum_prod[0][0:128, i_d1_0 % 2, 0:0 + 2048]" in src
-    assert "for i_d1_0 in range(16):" in src
+    source = render(ir)
+    assert "psum_prod = [nl.ndarray((128, 2, 2048)" in source
+    assert "psum_prod[0][0:128, i_d1_0 % 2, 0:0 + 2048]" in source
+    assert "for i_d1_0 in range(16):" in source
 
 
-def test_emit_alloc_list_of_tiles():
-    """list_len>1 emits a Python list comprehension of per-tile ndarrays."""
-    buf = Buffer(name="sbuf_prod", shape=(2048, 512), dtype="bfloat16", location="sbuf", list_len=16)
-    out = _emit_alloc(buf)
-    assert out == "sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]"
+def test_nested_pipeline_does_not_replace_outer_buffer_rotation() -> None:
+    """A nested pipeline rotates only buffers that it versioned."""
+    ir = tuned_ir()
+    outer_loop, children = m_loop_and_children(ir)
+    inner_loop = children[1]
+    object.__setattr__(ir.buffer("psum_prod"), "versions", 2)
+    ir.tree.block(ir.tree.root).annotations["software_pipeline"] = {
+        "loop_nid": outer_loop,
+        "stages": (0, 0, 1),
+        "order": (0, 1, 2),
+        "versioned_buffers": ("psum_prod",),
+    }
+    parent = parent_block_of(ir, outer_loop)
+    ir.tree.block(parent).annotations["software_pipeline"] = {
+        "loop_nid": inner_loop,
+        "stages": (0,),
+        "order": (0,),
+        "versioned_buffers": (),
+    }
+    source = render(ir)
+    assert "psum_prod[0][0:128, i_d1_0 % 2, 0:0 + 2048]" in source
+    assert "psum_prod[0][0:128, i_d2_0 % 2, 0:0 + 2048]" not in source
 
 
-def test_emit_alloc_packed_unchanged():
-    """list_len==1 emits the single packed ndarray, byte-identical to today."""
-    buf = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
-    out = _emit_alloc(buf)
-    assert out == "sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
-
-
-def test_render_buffer_region_list_of_tiles():
-    """list_len>1 peels the tile index into a leading list subscript, middle index 0."""
-    buf = Buffer(name="psum_prod", shape=(2048, 512), dtype="float32", location="psum", list_len=16)
-    region = BufferRegion(
-        tensor="psum_prod",
-        ranges=(
-            (Var(name="i_d1_0"), Const(value=128)),
-            (Mul(left=Var(name="i_d2_0"), right=Const(value=512)), Const(value=512)),
-        ),
+def test_allocation_forms() -> None:
+    """On-chip buffers use lists while shared HBM remains a bare allocation."""
+    listed = Buffer(name="sbuf_prod", shape=(2048, 512), dtype="bfloat16", location="sbuf", list_len=16)
+    assert (
+        _emit_alloc(listed)
+        == "sbuf_prod = [nl.ndarray((128, 1, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(16)]"
     )
-    out = render_buffer_region(region, buf)
-    assert out == "psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512:i_d2_0 * 512 + 512]"
+    packed = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
+    assert (
+        _emit_alloc(packed)
+        == "sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
+    )
+    hbm = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm")
+    assert _emit_alloc(hbm) == "hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)"
 
 
-def test_render_general_a_gt_1_bare_tile_index():
-    """a>1 (list_len=8 on T=16 => a=2) with a bare Var tile index renders
-    (t) // a leading, (t) % a middle."""
-    buf = Buffer(name="s", shape=(2048, 512), dtype="bfloat16", location="sbuf", list_len=8)
-    assert buf.per_tile_physical_shape() == (128, 2, 512)
-    region = BufferRegion(tensor="s", ranges=((Var(name="t"), Const(value=128)), (Const(value=0), Const(value=512))))
-    out = render_buffer_region(region, buf)
-    assert out == "s[(t) // 2][0:128, (t) % 2, 0:0 + 512]"
-
-
-def test_render_general_a_gt_1_compound_tile_index_parenthesized():
-    """a>1 with a COMPOUND tile index (i_d1_0 * 4 + i_d1_1, the post-Split M axis) must
-    parenthesize before // and % — else Python precedence gives (i*4)+(j//a), which is
-    wrong (and OOB). Guards the operator-precedence bug the ladder cannot catch (it uses
-    only a==1/b==1)."""
-    buf = Buffer(name="s", shape=(2048, 512), dtype="bfloat16", location="sbuf", list_len=8)
-    assert buf.per_tile_physical_shape() == (128, 2, 512)
-    tile = Add(left=Mul(left=Var(name="i_d1_0"), right=Const(value=4)), right=Var(name="i_d1_1"))
-    region = BufferRegion(tensor="s", ranges=((tile, Const(value=128)), (Const(value=0), Const(value=512))))
-    out = render_buffer_region(region, buf)
-    assert out == "s[(i_d1_0 * 4 + i_d1_1) // 2][0:128, (i_d1_0 * 4 + i_d1_1) % 2, 0:0 + 512]"
-
-
-def test_emit_alloc_b1_is_list_of_one():
-    """A list_len==1 sbuf buffer emits a list-of-1, not a bare ndarray."""
-    buf = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
-    out = _emit_alloc(buf)
-    assert out == "sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
-
-
-def test_render_b1_multi_tile_is_list0_whole_index():
-    """list_len==1 (T=16) renders buf[0][0:128, i_d0_0, F] — list index 0, whole tile index."""
-    buf = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
-    region = BufferRegion(
+def test_list_tile_region_forms() -> None:
+    """Packed and fully split lists place logical tile indices correctly."""
+    packed = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
+    packed_region = BufferRegion(
         tensor="sbuf_lhs_T",
         ranges=(
             (Var(name="i_d0_0"), Const(value=128)),
             (Mul(left=Var(name="i_d1_0"), right=Const(value=128)), Const(value=128)),
         ),
     )
-    out = render_buffer_region(region, buf)
-    assert out == "sbuf_lhs_T[0][0:128, i_d0_0, i_d1_0 * 128:i_d1_0 * 128 + 128]"
-
-
-def test_render_full_split_is_list_index_middle_zero():
-    """list_len==T (a==1) renders buf[t][0:128, 0, F] — the k6 full-split form."""
-    buf = Buffer(name="psum_prod", shape=(2048, 512), dtype="float32", location="psum", list_len=16)
-    region = BufferRegion(
+    assert (
+        render_buffer_region(packed_region, packed) == "sbuf_lhs_T[0][0:128, i_d0_0, i_d1_0 * 128:i_d1_0 * 128 + 128]"
+    )
+    listed = Buffer(name="psum_prod", shape=(2048, 512), dtype="float32", location="psum", list_len=16)
+    listed_region = BufferRegion(
         tensor="psum_prod",
         ranges=(
             (Var(name="i_d1_0"), Const(value=128)),
             (Mul(left=Var(name="i_d2_0"), right=Const(value=512)), Const(value=512)),
         ),
     )
-    out = render_buffer_region(region, buf)
-    assert out == "psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512:i_d2_0 * 512 + 512]"
+    assert render_buffer_region(listed_region, listed) == "psum_prod[i_d1_0][0:128, 0, i_d2_0 * 512:i_d2_0 * 512 + 512]"
 
 
-def test_emit_alloc_hbm_stays_bare():
-    """shared_hbm keeps its bare 2D ndarray (no tile axis, never listed)."""
-    buf = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm")
-    out = _emit_alloc(buf)
-    assert out == "hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)"
+def test_general_list_factorization_parenthesizes_tile_indices() -> None:
+    """Partially split lists divide bare and compound tile indices with explicit grouping."""
+    buffer = Buffer(name="s", shape=(2048, 512), dtype="bfloat16", location="sbuf", list_len=8)
+    assert buffer.per_tile_physical_shape() == (128, 2, 512)
+    bare = BufferRegion(tensor="s", ranges=((Var(name="t"), Const(value=128)), (Const(value=0), Const(value=512))))
+    assert render_buffer_region(bare, buffer) == "s[(t) // 2][0:128, (t) % 2, 0:0 + 512]"
+    tile = Add(left=Mul(left=Var(name="i_d1_0"), right=Const(value=4)), right=Var(name="i_d1_1"))
+    compound = BufferRegion(tensor="s", ranges=((tile, Const(value=128)), (Const(value=0), Const(value=512))))
+    assert (
+        render_buffer_region(compound, buffer)
+        == "s[(i_d1_0 * 4 + i_d1_1) // 2][0:128, (i_d1_0 * 4 + i_d1_1) % 2, 0:0 + 512]"
+    )

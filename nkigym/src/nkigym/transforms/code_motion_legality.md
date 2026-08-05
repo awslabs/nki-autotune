@@ -399,8 +399,9 @@ before the ordering query; rejects moves the structural merge can't realize:
 
 - **Same-prefix merge** — the target's enclosing loops, restricted to the moved
   block's DEPENDENT dims (dims the block binds in its `iter_values`), must be
-  an exact `(loop_var, extent)` prefix of the moved block's loops. Mismatch
-  (partial split, different order) requires `Split`/`Reorder` first.
+  an exact `(dimension, extent, logical element stride)` prefix of the moved
+  block's loops. Mismatch (partial split, different tiling, or different order)
+  requires `Split`/`Reorder` first.
 - **Reduction not replicated** — reject sinking an ACCUMULATION block under a
   target loop iterating a dim the block writes at *full extent* (no per-tile
   index): the accumulation would re-run per iteration into an un-reinitialised

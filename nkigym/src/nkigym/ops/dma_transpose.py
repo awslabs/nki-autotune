@@ -4,7 +4,7 @@ Same math as :class:`NKITranspose` (which uses Tensor Engine
 ``nisa.nc_transpose``), but runs on the DMA engine so it doesn't
 contend with matmul for TE cycles. Useful when the matmul is TE-bound
 and an explicit DMA transpose is cheaper than a round-trip through
-PSUM. Also the target of the ``LoadTranspose`` rewrite, where the
+PSUM. Also the target of the ``TransposeThroughLoad`` rewrite, where the
 ``src`` input is an HBM parameter instead of an SBUF buffer.
 """
 
@@ -32,7 +32,7 @@ class NKIDMATranspose(NKIOp):
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:
-        """``src`` may be HBM param (``LoadTranspose`` rewrite) or SBUF."""
+        """``src`` may be HBM param (``TransposeThroughLoad`` rewrite) or SBUF."""
         role = _operand_role(kwargs["src"])
         if role is not None and role not in {"param", "sbuf"}:
             raise TypeError(f"NKIDMATranspose(src=<role={role}>) expects param or sbuf")

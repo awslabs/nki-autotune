@@ -1,18 +1,19 @@
 """Tests for measured-state refinement observations."""
 
 from pathlib import Path
+from test.transforms._fixtures import INPUT_SPECS, f_matmul
 
-from examples.random_rollout import LHS_T_RHS, TRANSFORMS
 from nkigym.environment import KernelMDP
 from nkigym.search.observation import describe_actions, format_observation, state_fingerprint
 from nkigym.search.types import Evaluation, SearchConfig, SearchNode
+from nkigym.transforms import BufferLayout, Split
 
-WORKLOAD = LHS_T_RHS
+TRANSFORMS = [BufferLayout(), Split()]
 
 
 def test_describe_actions_adds_semantic_loop_and_buffer_context() -> None:
     """Descriptions expose operation scopes and named buffer fields."""
-    environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
+    environment = KernelMDP(f_matmul, INPUT_SPECS, TRANSFORMS)
     state = environment.reset()
     descriptions = [item.description for item in describe_actions(state, environment.legal_actions(state))]
     assert any(
@@ -23,7 +24,7 @@ def test_describe_actions_adds_semantic_loop_and_buffer_context() -> None:
 
 def test_state_fingerprint_is_render_stable_and_transform_sensitive() -> None:
     """Equivalent canonical builds match while a rendered transform differs."""
-    environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
+    environment = KernelMDP(f_matmul, INPUT_SPECS, TRANSFORMS)
     first = environment.reset()
     second = environment.reset()
     split_action = next(
@@ -36,7 +37,7 @@ def test_state_fingerprint_is_render_stable_and_transform_sensitive() -> None:
 
 def test_observation_contains_current_profile_and_bounded_history() -> None:
     """The policy receives current metrics, recent measurements, and legal actions."""
-    environment = KernelMDP(WORKLOAD.f_nkigym, WORKLOAD.input_specs, TRANSFORMS)
+    environment = KernelMDP(f_matmul, INPUT_SPECS, TRANSFORMS)
     state = environment.reset()
     nodes = [
         SearchNode(

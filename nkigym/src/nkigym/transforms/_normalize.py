@@ -68,8 +68,13 @@ def normalize_tensor_regions(tree: KernelTree, tensor: str) -> None:
     corresponding local offsets while leaving every other tensor and all block
     iter bindings untouched.
     """
+    normalize_selected_tensor_regions(tree, frozenset((tensor,)))
+
+
+def normalize_selected_tensor_regions(tree: KernelTree, tensors: frozenset[str]) -> None:
+    """Recompute regions for ``tensors`` in one traversal of every block."""
     for block_nid in tree.blocks():
-        _recompute_bindings(tree, block_nid, tensor=tensor)
+        _recompute_bindings(tree, block_nid, tensors=tensors)
 
 
 def _drop_trip1(tree: KernelTree, block_nid: int) -> None:
@@ -169,13 +174,13 @@ def _rename_dense(tree: KernelTree, block_nid: int) -> None:
             tree.graph.nodes[nid]["data"] = ForNode(loop_var=new_name, extent=data.extent)
 
 
-def _recompute_bindings(tree: KernelTree, block_nid: int, tensor: str | None = None) -> None:
+def _recompute_bindings(tree: KernelTree, block_nid: int, tensors: frozenset[str] | None = None) -> None:
     """Recompute iter_values and selected region offsets from the dense loops.
 
     Each dim's iter_value and region offsets are rebuilt from the dim's
     surviving dense loops (their element strides), so the transform's loop
     edits + access-width edits are sufficient — the offsets never have to be
-    set by the transform. When ``tensor`` is provided, only that tensor's
+    set by the transform. When ``tensors`` is provided, only those tensors'
     regions are updated and the block's iter values remain unchanged.
     """
     block = tree.data(block_nid)
@@ -183,13 +188,13 @@ def _recompute_bindings(tree: KernelTree, block_nid: int, tensor: str | None = N
     dim_loops = _dim_loops(tree, block_nid, block)
     tensor_axes = _tensor_to_axes(tree, block_nid)
     new_iter_values = (
-        block.iter_values if tensor is not None else tuple(_iter_value(iv.axis, dim_loops) for iv in block.iter_vars)
+        block.iter_values if tensors is not None else tuple(_iter_value(iv.axis, dim_loops) for iv in block.iter_vars)
     )
 
     def recompute(region: BufferRegion) -> BufferRegion:
-        """Recompute ``region`` unless a different tensor was requested."""
+        """Recompute ``region`` when it belongs to the selected tensors."""
         result = region
-        if tensor is None or region.tensor == tensor:
+        if tensors is None or region.tensor in tensors:
             result = _recompute_region(tree, region, tensor_axes, block.axis_map, dim_loops)
         return result
 
@@ -211,7 +216,7 @@ def _recompute_bindings(tree: KernelTree, block_nid: int, tensor: str | None = N
         new_bindings = {
             slot: (
                 _recompute_region(tree, region, {region.tensor: op_axes[slot]}, block.axis_map, dim_loops)
-                if tensor is None or region.tensor == tensor
+                if tensors is None or region.tensor in tensors
                 else region
             )
             for slot, region in data.operand_bindings.items()
@@ -432,4 +437,4 @@ def _dim_from_loopvar(loop_var: str) -> str:
     return parts[0]
 
 
-__all__ = ["normalize_block", "normalize_tensor_regions"]
+__all__ = ["normalize_block", "normalize_selected_tensor_regions", "normalize_tensor_regions"]

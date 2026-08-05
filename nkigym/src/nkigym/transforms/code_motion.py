@@ -17,10 +17,18 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, replace
+from fractions import Fraction
+from math import prod
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Expr, Var, substitute, to_affine
-from nkigym.ir.dependency import Dependency, _access_invariant_across, _leaf_operand_regions, _tensor_carried_across
+from nkigym.ir.dependency import (
+    Dependency,
+    _access_invariant_across,
+    _leaf_operand_regions,
+    _rmw_operand_slots,
+    _tensor_carried_across,
+)
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
 from nkigym.transforms._domain_solve import _dim_from_loopvar
@@ -177,6 +185,64 @@ def _bound_loop_dims(block: BlockNode) -> dict[str, str]:
     return result
 
 
+def _owning_block(tree: KernelTree, nid: int) -> int:
+    """Return the nearest BlockNode ancestor that owns ``nid``."""
+    owner: int | None = None
+    for ancestor in reversed(tree.ancestors(nid)):
+        if isinstance(tree.data(ancestor), BlockNode):
+            owner = ancestor
+            break
+    if owner is None:
+        raise TransformLegalityError(f"node {nid} has no enclosing BlockNode")
+    return owner
+
+
+def _owned_leaf(tree: KernelTree, block_nid: int) -> int:
+    """Return the ISA leaf directly owned by ``block_nid``."""
+    owned: list[int] = []
+    for nid in tree.preorder(block_nid):
+        if not isinstance(tree.data(nid), ISANode):
+            continue
+        if _owning_block(tree, nid) == block_nid:
+            owned.append(nid)
+    if len(owned) != 1:
+        raise TransformLegalityError(f"block {block_nid} must own exactly one ISA leaf; found {owned}")
+    return owned[0]
+
+
+def _loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fraction:
+    """Return one bound loop's logical element stride in ``block_nid``."""
+    block = tree.block(block_nid)
+    loop_var = tree.loop(loop_nid).loop_var
+    matches = [
+        (iter_var, to_affine(value))
+        for iter_var, value in zip(block.iter_vars, block.iter_values)
+        if loop_var in to_affine(value)
+    ]
+    if len(matches) != 1:
+        raise TransformLegalityError(
+            f"loop {loop_nid} ({loop_var!r}) must bind exactly one iter_var in block {block_nid}"
+        )
+    iter_var, affine = matches[0]
+    bound_names = {name for name in affine if name is not None}
+    leaf = _owned_leaf(tree, block_nid)
+    extents: dict[str, int] = {}
+    for nid in tree.ancestors(leaf):
+        node = tree.data(nid)
+        if not isinstance(node, ForNode) or node.loop_var not in bound_names:
+            continue
+        if node.loop_var in extents:
+            raise TransformLegalityError(
+                f"block {block_nid} has duplicate bound loop name {node.loop_var!r} in its execution scope"
+            )
+        extents[node.loop_var] = node.extent
+    missing = bound_names - extents.keys()
+    if missing:
+        raise TransformLegalityError(f"block {block_nid} has no execution loops for bindings {sorted(missing)}")
+    domain_extent = iter_var.dom[1] - iter_var.dom[0]
+    return Fraction(affine[loop_var] * domain_extent, prod(extents.values()))
+
+
 def _prefix_plan(tree: KernelTree, block_nid: int, target_loop_nid: int) -> _PrefixPlan:
     """Match target loops to the moved block's bound prefix by dimension and extent."""
     target_nids = _target_loop_nids(tree, target_loop_nid)
@@ -215,6 +281,18 @@ def _prefix_plan(tree: KernelTree, block_nid: int, target_loop_nid: int) -> _Pre
                 f"and cannot replace its execution scope "
                 f"(Split / Reorder the mismatched loop first)"
             )
+        if moved_nid != target_nid:
+            target_block_nid = _owning_block(tree, target_nid)
+            target_bound_dims = _bound_loop_dims(tree.block(target_block_nid))
+            if target_loop.loop_var in target_bound_dims:
+                moved_stride = _loop_element_stride(tree, block_nid, moved_nid)
+                target_stride = _loop_element_stride(tree, target_block_nid, target_nid)
+                if moved_stride != target_stride:
+                    raise TransformLegalityError(
+                        f"move(block={block_nid} under loop={target_loop_nid}) cannot replace "
+                        f"{moved_loop.loop_var!r} with {target_loop.loop_var!r}: logical element "
+                        f"strides differ ({moved_stride} != {target_stride})"
+                    )
         matched.append((moved_nid, target_nid))
         bound_index += 1
     matched_moved = {moved_nid for moved_nid, _target_nid in matched}
@@ -330,10 +408,11 @@ def _crossed_execution_loops(ir: KernelIR, block_nid: int, target_loop_nid: int)
 def _plain_written_tensors(node: ISANode) -> set[str]:
     """Return tensors written by output operands that are not read-modify-write."""
     input_slots = getattr(node.op_cls, "INPUT_OPERANDS", frozenset())
+    rmw_slots = _rmw_operand_slots(node)
     return {
         region.tensor
         for slot, region in node.operand_bindings.items()
-        if slot not in input_slots and slot not in node.op_cls.RMW_OPERANDS
+        if slot not in input_slots and slot not in rmw_slots
     }
 
 
@@ -371,9 +450,8 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
                     f"{loop_nid} ({loop.loop_var!r})"
                 )
 
-    rmw_tensors = {
-        region.tensor for slot, region in moved_node.operand_bindings.items() if slot in moved_node.op_cls.RMW_OPERANDS
-    }
+    rmw_slots = _rmw_operand_slots(moved_node)
+    rmw_tensors = {region.tensor for slot, region in moved_node.operand_bindings.items() if slot in rmw_slots}
     for producer, _consumer, attrs in ir.dependency.graph.in_edges(moved_leaf, data=True):
         tensor = attrs.get("tensor")
         producer_node = tree.data(producer)
@@ -424,6 +502,45 @@ def _check_no_consumer_hoisted_out_of_producer_loop(ir: KernelIR, block_nid: int
             )
 
 
+def _leaf_execution_invariant_across(tree: KernelTree, leaf_nid: int, loop_var: str) -> bool:
+    """Return whether every operand region of one ISA leaf is loop-invariant."""
+    node = tree.data(leaf_nid)
+    assert isinstance(node, ISANode)
+    return all(
+        loop_var not in to_affine(lo) for region in node.operand_bindings.values() for lo, _width in region.ranges
+    )
+
+
+def _check_no_producer_moved_out_of_consumer_loop(ir: KernelIR, block_nid: int, target_loop_nid: int) -> None:
+    """Reject moving a producer away from a consumer sharing its invariant slice."""
+    tree = ir.tree
+    moved_leaf = ir.dependency._resolve(block_nid)
+    old_loops = set(tree.ancestors(moved_leaf))
+    crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid)
+    for _producer, consumer, attrs in ir.dependency.graph.out_edges(moved_leaf, data=True):
+        tensor = attrs.get("tensor")
+        if tensor is None:
+            continue
+        for loop_nid in crossed_loops:
+            if loop_nid not in old_loops or consumer not in tree.descendants(loop_nid):
+                continue
+            loop = tree.data(loop_nid)
+            assert isinstance(loop, ForNode)
+            if _tensor_carried_across(tree, loop_nid, tensor):
+                continue
+            if _leaf_execution_invariant_across(tree, moved_leaf, loop.loop_var):
+                continue
+            if not _access_invariant_across(tree, moved_leaf, loop.loop_var, tensor):
+                continue
+            if not _access_invariant_across(tree, consumer, loop.loop_var, tensor):
+                continue
+            raise TransformLegalityError(
+                f"move(block={block_nid} under loop={target_loop_nid}) changes producer "
+                f"execution scope relative to consumer {consumer} for invariant tensor "
+                f"{tensor!r} across loop {loop_nid} ({loop.loop_var!r})"
+            )
+
+
 def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> None:
     """Raise TransformLegalityError if the proposed move would make any
     dependency edge incident to the moved block point backward.
@@ -457,6 +574,7 @@ def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop
         )
     _check_no_rmw_reset_scope_change(ir, block_nid, target_loop_nid)
     _check_no_consumer_hoisted_out_of_producer_loop(ir, block_nid, target_loop_nid)
+    _check_no_producer_moved_out_of_consumer_loop(ir, block_nid, target_loop_nid)
     return result
 
 

@@ -5,12 +5,19 @@ from nkigym.transforms.buffer_compaction import BufferCompaction, BufferCompacti
 from nkigym.transforms.buffer_layout import BufferLayout, BufferLayoutOption
 from nkigym.transforms.code_motion import CodeMotion, CodeMotionOption
 from nkigym.transforms.fuse import Fuse, FuseOption
-from nkigym.transforms.load_transpose import LoadTranspose, LoadTransposeOption
-from nkigym.transforms.matmul_transpose import MatmulTranspose, MatmulTransposeOption
 from nkigym.transforms.reorder import Reorder, ReorderOption
 from nkigym.transforms.rfactor import RFactor, RFactorOption
 from nkigym.transforms.software_pipeline import SoftwarePipeline, SoftwarePipelineOption
 from nkigym.transforms.split import Split, SplitOption
+from nkigym.transforms.transpose_pair import (
+    CancelTransposePair,
+    CancelTransposePairOption,
+    InsertTransposePair,
+    InsertTransposePairOption,
+)
+from nkigym.transforms.transpose_through_load import TransposeThroughLoad, TransposeThroughLoadOption
+from nkigym.transforms.transpose_through_matmul import TransposeThroughMatmul, TransposeThroughMatmulOption
+from nkigym.transforms.transpose_through_tensor_copy import TransposeThroughTensorCopy, TransposeThroughTensorCopyOption
 
 __all__ = [
     "BufferCompaction",
@@ -19,12 +26,12 @@ __all__ = [
     "BufferLayoutOption",
     "CodeMotion",
     "CodeMotionOption",
+    "CancelTransposePair",
+    "CancelTransposePairOption",
     "Fuse",
     "FuseOption",
-    "LoadTranspose",
-    "LoadTransposeOption",
-    "MatmulTranspose",
-    "MatmulTransposeOption",
+    "InsertTransposePair",
+    "InsertTransposePairOption",
     "Reorder",
     "ReorderOption",
     "RFactor",
@@ -36,4 +43,10 @@ __all__ = [
     "Transform",
     "TransformLegalityError",
     "TransformOption",
+    "TransposeThroughLoad",
+    "TransposeThroughLoadOption",
+    "TransposeThroughMatmul",
+    "TransposeThroughMatmulOption",
+    "TransposeThroughTensorCopy",
+    "TransposeThroughTensorCopyOption",
 ]

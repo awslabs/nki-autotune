@@ -7,8 +7,6 @@ from test._simulation import assert_matmul_ir_simulates
 from test.transforms._fixtures import INPUT_SPECS, build_canonical_ir, build_ladder_state, f_matmul
 from test.transforms._helpers import block_for_op, first_for_in, load_block_reading
 
-import pytest
-
 from nkigym.environment import KernelMDP
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Expr, Var, to_affine
@@ -149,8 +147,8 @@ def test_psum_hoist_descends_and_compacts() -> None:
     assert buffer.shape == (128, 512)
 
 
-@pytest.mark.parametrize("rung", range(1, 15))
-def test_ladder_state_sims(rung, tmp_path) -> None:
+def test_all_ladder_states_simulate(tmp_path) -> None:
     """Every transform-ladder state simulates to the matmul result."""
-    ir = build_ladder_state(rung)
-    assert_matmul_ir_simulates(ir, tmp_path, f"ladder_state_{rung}")
+    for rung in range(1, 15):
+        ir = build_ladder_state(rung)
+        assert_matmul_ir_simulates(ir, tmp_path, f"ladder_state_{rung}")

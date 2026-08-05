@@ -1,21 +1,30 @@
-"""Tests for the extended IR fields (location, dtype, kwargs, axis_map, return_name)."""
+"""Contract tests for dimension analysis and the BlockNode IR payloads."""
 
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
 from test.transforms._fixtures import INPUT_SPECS, f_lhs_matmul, f_matmul
 
 import pytest
 
-from nkigym.ir import ForNode, ISANode, build_initial_ir
+import nkigym.ir as ir_package
+import nkigym.ir.dimension_analysis as dimension_analysis
+from nkigym.ir import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelIR, KernelTree, build_initial_ir
+from nkigym.ir.arith.expr import Const, Var
 from nkigym.ir.dimension_analysis import analyze_dimensions
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
+from nkigym.ops.base import AxisRole
 from nkigym.ops.load import NKILoad
+from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 
 
 @nkigym_kernel
 def _reduce_then_activate(x):
-    """reduce → elementwise activation on the (P,) vector → store (rmsnorm-ish)."""
+    """Reduce one free axis, activate the vector, and store it."""
     sx = NKILoad()(src=x)
     red = NKIActivationReduce(op="square", reduce_op="add")(data=sx)
     act = NKIActivation(op="rsqrt")(data=red)
@@ -23,261 +32,151 @@ def _reduce_then_activate(x):
     return out
 
 
-def test_trace_reverses_transpose_axes_and_tracks_storage_dtype():
-    """Transpose swaps logical dims and preserves dtype in PSUM."""
-    analysis = analyze_dimensions(f_lhs_matmul, {"lhs": ((256, 384), "bfloat16"), "rhs": ((384, 512), "bfloat16")})
-    lhs = analysis.tensors["sbuf_lhs"]
-    lhs_T = analysis.tensors["psum_lhs_T"]
-    prod = analysis.tensors["psum_prod"]
-    assert lhs_T.shape == (384, 256)
-    assert lhs_T.dim_ids == (lhs.dim_ids[1], lhs.dim_ids[0])
-    assert lhs_T.storage_dtype is None
-    assert prod.storage_dtype == "float32"
+def _isa_leaves(ir: KernelIR) -> list[ISANode]:
+    """Return every ISA payload in preorder."""
+    return [ir.tree.isa(nid) for nid in ir.tree.preorder() if isinstance(ir.tree.data(nid), ISANode)]
 
 
-def test_trace_synthesizes_1d_output_for_elementwise_on_reduce():
-    """An elementwise op consuming a 1D (P,) reduce output yields a 1D output, not (P,F)."""
-    from nkigym.ir.dimension_analysis import analyze_dimensions
+def test_dimension_analysis_tracks_shapes_dtypes_and_ssa_outputs() -> None:
+    """Tracing tracks transpose axes, one-dimensional reductions, SSA names, and parameter dtypes."""
+    transpose = analyze_dimensions(f_lhs_matmul, {"lhs": ((256, 384), "bfloat16"), "rhs": ((384, 512), "bfloat16")})
+    lhs = transpose.tensors["sbuf_lhs"]
+    lhs_t = transpose.tensors["psum_lhs_T"]
+    product = transpose.tensors["psum_prod"]
+    assert lhs_t.shape == (384, 256)
+    assert lhs_t.dim_ids == (lhs.dim_ids[1], lhs.dim_ids[0])
+    assert lhs_t.storage_dtype is None
+    assert product.storage_dtype == "float32"
 
-    analysis = analyze_dimensions(_reduce_then_activate, {"x": ((128, 512), "bfloat16")})
-    """The activation output 'act' must be 1D (P,) — its F axis is absent from the op's axis map."""
-    assert len(analysis.tensors["act"].dim_ids) == 1
-    assert analysis.dim_sizes[analysis.tensors["act"].dim_ids[0]] == 128
+    reduced = analyze_dimensions(_reduce_then_activate, {"x": ((128, 512), "bfloat16")})
+    assert len(reduced.tensors["act"].dim_ids) == 1
+    assert reduced.dim_sizes[reduced.tensors["act"].dim_ids[0]] == 128
+    reduced_ir = build_initial_ir(_reduce_then_activate, {"x": ((128, 512), "bfloat16")})
+    assert reduced_ir.buffer("act").shape == (128,)
+
+    analysis = analyze_dimensions(f_matmul, INPUT_SPECS)
+    tensors = analysis.tensors
+    assert set(tensors) == {"lhs_T", "rhs", "sbuf_lhs_T", "sbuf_rhs", "psum_prod", "sbuf_prod", "hbm_out"}
+    assert tensors["psum_prod"].location == "psum"
+    assert tensors["psum_prod"].dtype == "bfloat16"
+    assert tensors["sbuf_prod"].location == "sbuf"
+    assert tensors["sbuf_prod"].dtype == "bfloat16"
+    assert tensors["hbm_out"].location == "shared_hbm"
+    assert analysis.dim_sizes[tensors["psum_prod"].dim_ids[0]] == 2048
+    assert analysis.dim_sizes[tensors["psum_prod"].dim_ids[1]] == 2048
+
+    float16 = analyze_dimensions(f_matmul, {"lhs_T": ((2048, 2048), "float16"), "rhs": ((2048, 2048), "float16")})
+    assert float16.tensors["lhs_T"].dtype == "float16"
+    assert float16.tensors["rhs"].dtype == "float16"
 
 
-def test_build_initial_ir_handles_elementwise_on_1d_reduce():
-    """The full canonical build (not just the trace) must handle a (P,) reduce → elementwise chain."""
-    from nkigym.ir import build_initial_ir
-
-    ir = build_initial_ir(_reduce_then_activate, {"x": ((128, 512), "bfloat16")})
-    """The activation buffer 'act' is 1D (P,)=(128,); the build must not KeyError on the absent F axis."""
-    assert ir.all_buffers()["act"].shape == (128,)
-
-
-def _isa_leaves(ir) -> list[ISANode]:
-    """Return every :class:`ISANode` payload in pre-order."""
-    return [ir.tree.data(nid) for nid in ir.tree.preorder() if isinstance(ir.tree.data(nid), ISANode)]
-
-
-def _leaves_by_op(ir, op_name: str) -> list[ISANode]:
-    """Filter ISA leaves by their op class name."""
-    return [leaf for leaf in _isa_leaves(ir) if leaf.op_cls.__name__ == op_name]
-
-
-def test_memset_leaf_carries_value_kwarg():
-    """The synthesized NKIMemset leaf carries ``value=0.0`` on ISANode.kwargs."""
+def test_canonical_leaf_metadata_and_return_contract() -> None:
+    """Canonical leaves carry only operation kwargs and analysis requires a named return."""
     ir = build_initial_ir(f_matmul, INPUT_SPECS)
-    memsets = _leaves_by_op(ir, "NKIMemset")
+    memsets = [leaf for leaf in _isa_leaves(ir) if leaf.op_cls.__name__ == "NKIMemset"]
     assert len(memsets) == 1
     assert memsets[0].kwargs == {"value": 0.0}
-
-
-def test_non_config_leaves_have_empty_kwargs():
-    """Load/Store/Matmul/TensorCopy take no non-operand kwargs in this fixture."""
-    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     for op_name in ("NKILoad", "NKIStore", "NKIMatmul", "NKITensorCopy"):
-        for leaf in _leaves_by_op(ir, op_name):
-            assert leaf.kwargs == {}, f"{op_name} leaf kwargs={leaf.kwargs}"
-
-
-def test_return_name_is_parsed():
-    """analyse_dimensions captures the top-level ``return <Name>`` identifier."""
-    ir = build_initial_ir(f_matmul, INPUT_SPECS)
+        for leaf in _isa_leaves(ir):
+            if leaf.op_cls.__name__ == op_name:
+                assert leaf.kwargs == {}, f"{op_name} leaf kwargs={leaf.kwargs}"
     assert ir.return_name == "hbm_out"
-
-
-def test_missing_return_raises():
-    """A kernel that does not end with ``return <Name>`` fails analysis."""
 
     @nkigym_kernel
     def no_return(x):
+        """Build an intentionally invalid graph with no return statement."""
         sbuf_x = NKILoad()(src=x)
 
     with pytest.raises(ValueError, match="return"):
         analyze_dimensions(no_return, {"x": ((128, 128), "bfloat16")})
 
 
-def test_tree_has_no_dim_sizes_attribute():
-    """KernelTree is a pure schedule tree — dim_sizes lives on KernelIR."""
+def test_kernel_tree_counts_and_filters_payloads() -> None:
+    """KernelTree counts graph nodes and its block iterator excludes loop payloads."""
     ir = build_initial_ir(f_matmul, INPUT_SPECS)
     assert not hasattr(ir.tree, "dim_sizes")
-
-
-def test_tree_num_nodes_matches_graph_node_count():
-    """``KernelTree.num_nodes`` reports the total node count in the underlying graph."""
-    ir = build_initial_ir(f_matmul, INPUT_SPECS)
     assert ir.tree.num_nodes == ir.tree.graph.number_of_nodes()
 
-
-def test_empty_tree_num_nodes_is_one():
-    """A freshly-constructed tree contains only the dummy root, so ``num_nodes == 1``."""
-    from nkigym.ir import KernelTree
-
-    assert KernelTree().num_nodes == 1
-
-
-def test_num_nodes_grows_with_add_node():
-    """Each ``add_node`` call increments ``num_nodes`` by one."""
-    from nkigym.ir import KernelTree
-
     tree = KernelTree()
+    assert tree.num_nodes == 1
     before = tree.num_nodes
     tree.add_node(ForNode(loop_var="i", extent=2), parent=tree.root)
     assert tree.num_nodes == before + 1
 
+    blocks = KernelTree()
+    block = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
+    first = blocks.add_node(block, parent=blocks.root)
+    second = blocks.add_node(block, parent=blocks.root)
+    blocks.add_node(ForNode(loop_var="i_d0_0", extent=2), parent=first)
+    assert set(blocks.blocks()) == {blocks.root, first, second}
 
-def test_removed_symbols_are_not_exported_from_package():
-    """DimensionAnalysis / OpAxes / analyze_dimensions must not be package-level imports."""
-    import nkigym.ir as ir_pkg
 
+def test_ir_exports_only_current_public_payloads() -> None:
+    """The package exports current payloads and keeps tracer internals private."""
     for removed in ("DimensionAnalysis", "OpAxes", "analyze_dimensions"):
-        assert not hasattr(ir_pkg, removed), f"nkigym.ir.{removed} should have been removed"
+        assert not hasattr(ir_package, removed), f"nkigym.ir.{removed} should have been removed"
+    assert not hasattr(dimension_analysis, "OpAxes")
+    assert hasattr(dimension_analysis, "_OpRecord")
+    assert ir_package.BlockNode is BlockNode
+    assert ir_package.Buffer is Buffer
+    assert ir_package.BufferRegion is BufferRegion
+    assert ir_package.IterVar is IterVar
 
 
-def test_op_record_is_private_in_dimension_analysis_module():
-    """_OpRecord is the tracer-local replacement for the old OpAxes — it must not be re-exported."""
-    import nkigym.ir.dimension_analysis as dm
-
-    assert not hasattr(dm, "OpAxes")
-    assert hasattr(dm, "_OpRecord")
-
-
-def test_envelope_markdown_format():
-    """KernelIR._render_envelope_md emits signature and buffers table."""
+def test_envelope_and_dump_contain_only_text_artifacts(tmp_path: Path) -> None:
+    """KernelIR metadata is complete and dump emits only Markdown and Python."""
     ir = build_initial_ir(f_matmul, INPUT_SPECS)
     envelope = ir._render_envelope_md()
     assert "# `f_matmul`" in envelope
     assert "`lhs_T`" in envelope and "`rhs`" in envelope
     assert "**Returns**: `hbm_out`" in envelope
     assert "## Buffers" in envelope
-    """Buffers table includes location, dtype, shape for all allocated buffers."""
     assert "| Name | Location | Dtype | Shape |" in envelope
-    """Check at least one intermediate buffer appears."""
     assert "psum" in envelope or "sbuf" in envelope
     assert "bfloat16" in envelope or "float32" in envelope
 
-
-def test_itervar_constructor_and_equality():
-    """IterVar is a frozen dataclass with structural equality."""
-    from nkigym.ir.tree import IterVar
-    from nkigym.ops.base import AxisRole
-
-    a = IterVar(axis="M", dom=(0, 2048), role=AxisRole.PARALLEL)
-    b = IterVar(axis="M", dom=(0, 2048), role=AxisRole.PARALLEL)
-    c = IterVar(axis="M", dom=(0, 2048), role=AxisRole.ACCUMULATION)
-    assert a == b
-    assert a != c
+    ir.dump(tmp_path)
+    assert {path.name for path in tmp_path.iterdir()} == {"envelope.md", "kernel.py"}
+    assert (tmp_path / "envelope.md").stat().st_size > 0
+    assert (tmp_path / "kernel.py").stat().st_size > 0
 
 
-def test_buffer_constructor_and_equality():
-    """Buffer is a frozen dataclass with structural equality."""
-    from nkigym.ir.tree import Buffer
+def test_payload_value_objects_have_structural_semantics() -> None:
+    """IR payload dataclasses compare structurally and isolate mutable annotation defaults."""
+    parallel = IterVar(axis="M", dom=(0, 2048), role=AxisRole.PARALLEL)
+    assert parallel == IterVar(axis="M", dom=(0, 2048), role=AxisRole.PARALLEL)
+    assert parallel != IterVar(axis="M", dom=(0, 2048), role=AxisRole.ACCUMULATION)
 
-    a = Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum")
-    b = Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum")
-    assert a == b
+    buffer = Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum")
+    assert buffer == Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum")
+    region = BufferRegion(tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)),))
+    assert region == BufferRegion(tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)),))
 
-
-def test_bufferregion_constructor_and_equality():
-    """BufferRegion is a frozen dataclass with structural equality on tensor + ranges."""
-    from nkigym.ir.arith.expr import Const, Var
-    from nkigym.ir.tree import BufferRegion
-
-    a = BufferRegion(tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)),))
-    b = BufferRegion(tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)),))
-    assert a == b
-
-
-def test_blocknode_constructor_minimal():
-    """A BlockNode with no iter_vars is the legal empty case (e.g. the synthetic root block)."""
-    from nkigym.ir.tree import BlockNode
-
-    node = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=(), alloc_buffers=())
-    assert node.iter_vars == ()
-    assert node.alloc_buffers == ()
-    assert node.annotations == {}
-
-
-def test_blocknode_constructor_full():
-    """A BlockNode with iter_vars and a region carries every field."""
-    from nkigym.ir.arith.expr import Const, Var
-    from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, IterVar
-    from nkigym.ops.base import AxisRole
-
-    block = BlockNode(
-        iter_vars=(
-            IterVar(axis="M", dom=(0, 2048), role=AxisRole.PARALLEL),
-            IterVar(axis="N", dom=(0, 2048), role=AxisRole.PARALLEL),
-        ),
+    minimal = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=(), alloc_buffers=())
+    assert minimal.iter_vars == ()
+    assert minimal.alloc_buffers == ()
+    assert minimal.annotations == {}
+    full = BlockNode(
+        iter_vars=(parallel, IterVar(axis="N", dom=(0, 2048), role=AxisRole.PARALLEL)),
         iter_values=(Var(name="i_M"), Var(name="i_N")),
         reads=(),
-        writes=(BufferRegion(tensor="psum_prod", ranges=((Var(name="vM"), Const(value=128)),)),),
-        alloc_buffers=(Buffer(name="psum_prod", shape=(2048, 2048), dtype="float32", location="psum"),),
+        writes=(region,),
+        alloc_buffers=(buffer,),
     )
-    assert len(block.iter_vars) == 2
-    assert len(block.alloc_buffers) == 1
+    assert len(full.iter_vars) == 2
+    assert len(full.alloc_buffers) == 1
+    other = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
+    minimal.annotations["k"] = 1
+    assert "k" not in other.annotations
 
 
-def test_blocknode_default_annotations_is_fresh_dict():
-    """Two default-constructed BlockNodes don't share an annotations dict."""
-    from nkigym.ir.tree import BlockNode
-
-    a = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
-    b = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
-    a.annotations["k"] = 1
-    assert "k" not in b.annotations
-
-
-def test_kerneltree_blocks_helper_yields_blocknode_nids():
-    """blocks() walks the tree in pre-order and yields nids whose payload is a BlockNode."""
-    from nkigym.ir.tree import BlockNode, KernelTree
-
-    tree = KernelTree()
-    block = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
-    nid_a = tree.add_node(block, parent=tree.root)
-    nid_b = tree.add_node(block, parent=tree.root)
-
-    """Root is also a BlockNode now."""
-    out = list(tree.blocks())
-    assert set(out) == {tree.root, nid_a, nid_b}
-
-
-def test_kerneltree_blocks_skips_non_block_payloads():
-    """blocks() ignores ForNode and ISANode payloads."""
-    from nkigym.ir.tree import BlockNode, ForNode, KernelTree
-
-    tree = KernelTree()
-    block = BlockNode(iter_vars=(), iter_values=(), reads=(), writes=())
-    block_nid = tree.add_node(block, parent=tree.root)
-    tree.add_node(ForNode(loop_var="i_d0_0", extent=2), parent=block_nid)
-
-    """Root is also a BlockNode, so blocks() returns root + block_nid."""
-    out = list(tree.blocks())
-    assert tree.root in out and block_nid in out
-
-
-def test_ir_module_exports_new_payloads():
-    """The ir package re-exports the new payload classes."""
-    from nkigym.ir import BlockNode, Buffer, BufferRegion, IterVar  # noqa: F401
-
-
-def test_fornode_payload_uses_loop_var_and_extent():
-    """ForNode carries (loop_var, extent), not (dim, trip)."""
-    from nkigym.ir.tree import ForNode
-
-    node = ForNode(loop_var="i_M_0", extent=16)
-    assert node.loop_var == "i_M_0"
-    assert node.extent == 16
-    """Old field names must NOT be present."""
-    assert not hasattr(node, "dim")
-    assert not hasattr(node, "trip")
-
-
-def test_isanode_payload_uses_operand_bindings():
-    """ISANode carries (op_cls, operand_bindings, kwargs); legacy fields removed."""
-    from nkigym.ir.arith.expr import Const, Var
-    from nkigym.ir.tree import BufferRegion, ISANode
-    from nkigym.ops.matmul import NKIMatmul
+def test_loop_and_isa_payloads_exclude_legacy_fields() -> None:
+    """ForNode and ISANode expose current fields without legacy schedule metadata."""
+    loop = ForNode(loop_var="i_M_0", extent=16)
+    assert loop.loop_var == "i_M_0"
+    assert loop.extent == 16
+    assert not hasattr(loop, "dim")
+    assert not hasattr(loop, "trip")
 
     bindings = {
         "stationary": BufferRegion(
@@ -293,85 +192,24 @@ def test_isanode_payload_uses_operand_bindings():
     node = ISANode(op_cls=NKIMatmul, operand_bindings=bindings, kwargs={})
     assert node.op_cls is NKIMatmul
     assert set(node.operand_bindings) == {"stationary", "moving", "dst"}
-    """Legacy fields must NOT be present."""
     for old in ("reads", "writes", "rmw", "axis_map", "tensorize_sizes", "location", "dtype"):
         assert not hasattr(node, old), f"ISANode unexpectedly carries legacy field {old!r}"
 
 
-def test_kernelir_envelope_is_slim():
-    """KernelIR drops dim_sizes and tensors fields."""
-    import dataclasses
-
-    from nkigym.ir.ir import KernelIR
-
-    field_names = {f.name for f in dataclasses.fields(KernelIR)}
+def test_kernel_ir_schema_helpers_and_canonical_allocations() -> None:
+    """KernelIR stays slim while exposing buffer helpers and canonical allocations."""
+    field_names = {field.name for field in dataclasses.fields(KernelIR)}
     assert field_names == {"func_name", "param_names", "return_name", "tree", "dependency", "param_buffers"}
-
-
-def test_kernelir_helper_methods_exposed():
-    """KernelIR exposes all_buffers / buffer / axis_extent."""
-    from nkigym.ir.ir import KernelIR
-
     assert callable(KernelIR.all_buffers)
     assert callable(KernelIR.buffer)
     assert callable(KernelIR.axis_extent)
 
-
-def test_canonical_matmul_emits_root_block_with_alloc_buffers():
-    """The canonical 2048**3 matmul tree's root child is a single BlockNode whose alloc_buffers
-    list every kernel-lifetime tensor, including psum_prod (canonical scope = root)."""
-    from nkigym.ir.tree import BlockNode
-
     ir = build_initial_ir(f_matmul, INPUT_SPECS)
-    """Tree.root is now the root block directly (no intermediate RootNode)."""
-    root_block = ir.tree.data(ir.tree.root)
-    assert isinstance(root_block, BlockNode)
-    """Buffer scope: kernel-lifetime tensors are placed at LCA of their users.
-    Most buffers are multi-use (at root); hbm_out is single-use (at its writer block)."""
+    root = ir.tree.data(ir.tree.root)
+    assert isinstance(root, BlockNode)
     all_buffers = set()
     for nid in ir.tree.blocks():
-        blk = ir.tree.data(nid)
-        assert isinstance(blk, BlockNode)
-        all_buffers.update(buf.name for buf in blk.alloc_buffers)
+        block = ir.tree.data(nid)
+        assert isinstance(block, BlockNode)
+        all_buffers.update(buffer.name for buffer in block.alloc_buffers)
     assert {"sbuf_lhs_T", "sbuf_rhs", "psum_prod", "sbuf_prod", "hbm_out"} <= all_buffers
-
-
-def test_kernelir_dump_writes_only_text_artifacts(tmp_path):
-    """KernelIR.dump writes metadata and generated code without diagrams."""
-    ir = build_initial_ir(f_matmul, INPUT_SPECS)
-    ir.dump(tmp_path)
-    assert {path.name for path in tmp_path.iterdir()} == {"envelope.md", "kernel.py"}
-    assert (tmp_path / "envelope.md").stat().st_size > 0
-    assert (tmp_path / "kernel.py").stat().st_size > 0
-
-
-def test_trace_synthesizes_ssa_outputs():
-    """The SSA trace names each op's output from its assignment LHS and infers dims/dtype/location."""
-    from test.transforms._fixtures import INPUT_SPECS, f_matmul
-
-    from nkigym.ir.dimension_analysis import analyze_dimensions
-
-    analysis = analyze_dimensions(f_matmul, INPUT_SPECS)
-    t = analysis.tensors
-    assert set(t) == {"lhs_T", "rhs", "sbuf_lhs_T", "sbuf_rhs", "psum_prod", "sbuf_prod", "hbm_out"}
-    assert t["psum_prod"].location == "psum"
-    assert t["psum_prod"].dtype == "bfloat16"
-    assert t["sbuf_prod"].location == "sbuf"
-    assert t["sbuf_prod"].dtype == "bfloat16"
-    assert t["hbm_out"].location == "shared_hbm"
-    assert analysis.dim_sizes[t["psum_prod"].dim_ids[0]] == 2048
-    assert analysis.dim_sizes[t["psum_prod"].dim_ids[1]] == 2048
-
-
-def test_param_dtype_seeded_from_spec():
-    """analyze_dimensions reads param dtype from the (shape, dtype) spec, not from buffer inference.
-
-    The spec dtype (``float16``) deliberately diverges from the dtype of the
-    sbuf buffers the params load into (``bfloat16``). The deleted inference
-    path would have yielded ``bfloat16``; spec-seeding must yield ``float16``.
-    """
-    from test.transforms._fixtures import f_matmul
-
-    analysis = analyze_dimensions(f_matmul, {"lhs_T": ((2048, 2048), "float16"), "rhs": ((2048, 2048), "float16")})
-    assert analysis.tensors["lhs_T"].dtype == "float16"
-    assert analysis.tensors["rhs"].dtype == "float16"

@@ -34,7 +34,7 @@ def _apply_action(ir: KernelIR, action: Action) -> KernelIR:
     return transform.apply(ir, option)
 
 
-def test_analyze_enumerates_nondecreasing_labelings():
+def _check_analyze_enumerates_nondecreasing_labelings():
     """The tuned M loop yields exactly the contiguous non-decreasing stage labelings."""
     ir = tuned_ir()
     opts = SoftwarePipeline().analyze(ir)
@@ -47,7 +47,7 @@ def test_analyze_enumerates_nondecreasing_labelings():
     assert all(max(s) <= len(children) - 1 for s in stage_sets)
 
 
-def test_apply_derives_versions_and_annotates():
+def _check_apply_derives_versions_and_annotates():
     """apply((0,0,1)) sets psum versions=2 and writes the annotation; tree unchanged."""
     ir = tuned_ir()
     m_loop, _children = m_loop_and_children(ir)
@@ -57,9 +57,10 @@ def test_apply_derives_versions_and_annotates():
     assert new_ir.tree.graph.number_of_nodes() == n_nodes_before
     anns = [new_ir.tree.block(nid).annotations.get("software_pipeline") for nid in new_ir.tree.blocks()]
     assert any(a and a["stages"] == (0, 0, 1) for a in anns)
+    assert any(a and a["versioned_buffers"] == ("psum_prod",) for a in anns)
 
 
-def test_apply_rejects_consumer_before_producer_stage():
+def _check_apply_rejects_consumer_before_producer_stage():
     """A stage assignment putting a consumer earlier than its producer raises."""
     ir = tuned_ir()
     m_loop, _children = m_loop_and_children(ir)
@@ -67,7 +68,7 @@ def test_apply_rejects_consumer_before_producer_stage():
         SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(1, 0, 1), order=(0, 1, 2)))
 
 
-def test_apply_rejects_duplicate_order():
+def _check_apply_rejects_duplicate_order():
     """An order array that is not a permutation raises."""
     ir = tuned_ir()
     m_loop, _children = m_loop_and_children(ir)
@@ -75,7 +76,7 @@ def test_apply_rejects_duplicate_order():
         SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 1)))
 
 
-def test_analyze_omits_pipeline_that_would_version_a_list_buffer():
+def _check_analyze_omits_pipeline_that_would_version_a_list_buffer():
     """Pipeline analysis excludes options that would multi-version a listed buffer."""
     ir = tuned_ir()
     object.__setattr__(ir.buffer("psum_prod"), "shape", (2048, 2048))
@@ -85,7 +86,7 @@ def test_analyze_omits_pipeline_that_would_version_a_list_buffer():
     assert option not in SoftwarePipeline().analyze(listed_ir)
 
 
-def test_apply_rejects_pipeline_that_would_version_a_list_buffer():
+def _check_apply_rejects_pipeline_that_would_version_a_list_buffer():
     """Direct apply rejects an option that would multi-version a listed buffer."""
     ir = tuned_ir()
     object.__setattr__(ir.buffer("psum_prod"), "shape", (2048, 2048))
@@ -96,7 +97,7 @@ def test_apply_rejects_pipeline_that_would_version_a_list_buffer():
         SoftwarePipeline().apply(listed_ir, option)
 
 
-def test_pipeline_rejects_partial_version_write_with_wider_read():
+def _check_pipeline_rejects_partial_version_write_with_wider_read():
     """A pipeline version cannot be read beyond the slice written in that iteration."""
     ir = build_canonical_ir()
     trace: tuple[Action, ...] = (
@@ -125,7 +126,7 @@ def test_pipeline_rejects_partial_version_write_with_wider_read():
     assert option not in SoftwarePipeline().analyze(ir)
 
 
-def test_pipeline_rejects_loop_touching_an_already_versioned_buffer():
+def _check_pipeline_rejects_loop_touching_an_already_versioned_buffer():
     """A nested pipeline cannot replace an existing buffer's rotation variable."""
     ir = tuned_ir()
     outer_loop, outer_children = m_loop_and_children(ir)
@@ -153,3 +154,27 @@ def test_increment1_sim_matches_numpy(tmp_path) -> None:
     m_loop, _children = m_loop_and_children(ir)
     new_ir = SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2)))
     assert_matmul_ir_simulates(new_ir, tmp_path, "software_pipeline")
+
+
+def test_pipeline_analysis_and_apply_contract() -> None:
+    """Analysis enumerates valid stages and apply derives versions and annotations."""
+    _check_analyze_enumerates_nondecreasing_labelings()
+    _check_apply_derives_versions_and_annotates()
+
+
+def test_pipeline_rejects_invalid_stage_and_order_assignments() -> None:
+    """Consumer-before-producer stages and duplicate order values fail."""
+    _check_apply_rejects_consumer_before_producer_stage()
+    _check_apply_rejects_duplicate_order()
+
+
+def test_pipeline_rejects_listed_buffer_versioning() -> None:
+    """Analysis and direct apply reject versioning an already listed buffer."""
+    _check_analyze_omits_pipeline_that_would_version_a_list_buffer()
+    _check_apply_rejects_pipeline_that_would_version_a_list_buffer()
+
+
+def test_pipeline_rejects_inconsistent_versioned_accesses() -> None:
+    """Partial writes and nested pipelines cannot create inconsistent versions."""
+    _check_pipeline_rejects_partial_version_write_with_wider_read()
+    _check_pipeline_rejects_loop_touching_an_already_versioned_buffer()

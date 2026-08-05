@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-from test.transforms._fixtures import _ladder_helpers, build_canonical_ir, build_ladder_state
+from test.transforms._fixtures import _ladder_helpers, build_canonical_ir, build_ladder_state, f_lhs_matmul
 from test.transforms._helpers import block_for_op, first_for_in, load_block_reading, matmul_loop
 from test.transforms._pipeline_fixtures import m_loop_and_children, tuned_ir
 
 import pytest
 
-from nkigym.ir import KernelIR
+from nkigym.ir import KernelIR, build_initial_ir
+from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import BlockNode, ForNode, ISANode
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole
+from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.transforms import (
+    BufferCompaction,
+    BufferCompactionOption,
     CodeMotion,
     CodeMotionOption,
     Reorder,
@@ -49,7 +53,77 @@ def _rfactored_with_ambient_loop(loop_var: str, extent: int) -> tuple[KernelIR, 
     return rfactored, ambient
 
 
-def test_move_lifts_tensor_copy_under_matmul_inner_loop():
+def _copy_block(index: Expr, width: int, source: str, destination: str) -> BlockNode:
+    """Build a two-dimensional tensor-copy block at one free-axis index."""
+    free_base = Mul(left=index, right=Const(value=width))
+    source_region = BufferRegion(
+        tensor=source, ranges=((Const(value=0), Const(value=128)), (free_base, Const(value=width)))
+    )
+    destination_region = BufferRegion(
+        tensor=destination, ranges=((Const(value=0), Const(value=128)), (free_base, Const(value=width)))
+    )
+    return BlockNode(
+        iter_vars=(
+            IterVar(axis="d2", dom=(0, 128), role=AxisRole.PARALLEL),
+            IterVar(axis="d1", dom=(0, 512), role=AxisRole.PARALLEL),
+        ),
+        iter_values=(Const(value=0), index),
+        reads=(source_region,),
+        writes=(destination_region,),
+        axis_map={"P": "d2", "F": "d1"},
+    )
+
+
+def _add_copy_leaf(tree: KernelTree, block_nid: int, block: BlockNode) -> int:
+    """Add the tensor-copy ISA leaf represented by ``block``."""
+    return tree.add_node(
+        ISANode(op_cls=NKITensorCopy, operand_bindings={"src": block.reads[0], "dst": block.writes[0]}),
+        parent=block_nid,
+    )
+
+
+def _mismatched_stride_move() -> tuple[KernelIR, CodeMotionOption]:
+    """Build a move between equal-trip loops that address 256- and 128-wide tiles."""
+    tree = KernelTree()
+    tree.graph.nodes[tree.root]["data"] = BlockNode(
+        iter_vars=(),
+        iter_values=(),
+        reads=(),
+        writes=(),
+        alloc_buffers=tuple(
+            Buffer(name=name, shape=(128, 512), dtype="bfloat16", location="sbuf")
+            for name in ("source", "stage", "middle", "output")
+        ),
+    )
+    outer_var = Var(name="i_d1_0")
+    producer_inner_var = Var(name="i_d1_1")
+    producer_index = Add(left=Mul(left=outer_var, right=Const(value=2)), right=producer_inner_var)
+    producer = _copy_block(producer_index, 128, "source", "stage")
+    producer_nid = tree.add_node(producer, parent=tree.root)
+    outer = tree.add_node(ForNode(loop_var=outer_var.name, extent=2), parent=producer_nid)
+    producer_inner = tree.add_node(ForNode(loop_var=producer_inner_var.name, extent=2), parent=outer)
+    _add_copy_leaf(tree, producer_inner, producer)
+
+    local_var = Var(name="i_d1_2")
+    moved = _copy_block(local_var, 256, "stage", "middle")
+    moved_nid = tree.add_node(moved, parent=producer_inner)
+    local = tree.add_node(ForNode(loop_var=local_var.name, extent=2), parent=moved_nid)
+    _add_copy_leaf(tree, local, moved)
+
+    target_var = Var(name="i_d1_1")
+    target_index = Add(left=Mul(left=outer_var, right=Const(value=2)), right=target_var)
+    consumer = _copy_block(target_index, 128, "middle", "output")
+    consumer_nid = tree.add_node(consumer, parent=outer)
+    target = tree.add_node(ForNode(loop_var=target_var.name, extent=2), parent=consumer_nid)
+    _add_copy_leaf(tree, target, consumer)
+
+    ir = KernelIR(
+        func_name="mismatched_stride_move", param_names=[], return_name="output", tree=tree, dependency=Dependency(tree)
+    )
+    return ir, CodeMotionOption(block_nid=moved_nid, target_loop_nid=target, index=0)
+
+
+def _check_move_lifts_tensor_copy_under_matmul_inner_loop():
     """Lifting tensor_copy under the matmul's innermost loop nests it there."""
     ir = build_canonical_ir()
     tc = block_for_op(ir, "NKITensorCopy")
@@ -59,7 +133,7 @@ def test_move_lifts_tensor_copy_under_matmul_inner_loop():
     assert tc in ir.tree.descendants(target)
 
 
-def test_reverse_compute_at_allows_fold_covering_its_own_ko():
+def _check_reverse_compute_at_allows_fold_covering_its_own_ko():
     """The two-stage fold accumulates across its ENCLOSING ko (its sbuf_prod
     memset dominates ko via a CARRY edge), so covering ko by that loop is SAFE
     and must be allowed — the manual-ladder endpoint's fold-inlining precondition."""
@@ -95,7 +169,7 @@ def test_reverse_compute_at_allows_fold_covering_its_own_ko():
     assert ("i_d0_0", 2) in target_seq, "ko (i_d0_0) must be in the matched prefix (allowed self-domination)"
 
 
-def test_code_motion_allows_output_store_sink():
+def _check_code_motion_allows_output_store_sink():
     """The output store (writes the return tensor) may sink under the drain's N
     loop — the dropped output-block guard would have rejected it; span-promotion
     permits it (drain writes the sbuf_prod slice the store reads, same N-iter).
@@ -110,7 +184,7 @@ def test_code_motion_allows_output_store_sink():
     assert any(o.block_nid == store_blk and o.target_loop_nid == d2 for o in CodeMotion().analyze(state))
 
 
-def test_code_motion_rejects_non_fornode_target():
+def _check_code_motion_rejects_non_fornode_target():
     ir = build_canonical_ir()
     load = block_for_op(ir, "NKILoad")
     mm = block_for_op(ir, "NKIMatmul")
@@ -118,7 +192,7 @@ def test_code_motion_rejects_non_fornode_target():
         CodeMotion().apply(ir, CodeMotionOption(block_nid=load, target_loop_nid=mm, index=-1))
 
 
-def test_code_motion_rejects_target_inside_moved_block():
+def _check_code_motion_rejects_target_inside_moved_block():
     ir = build_canonical_ir()
     tc = block_for_op(ir, "NKITensorCopy")
     own = first_for_in(ir, tc)
@@ -126,7 +200,7 @@ def test_code_motion_rejects_target_inside_moved_block():
         CodeMotion().apply(ir, CodeMotionOption(block_nid=tc, target_loop_nid=own, index=-1))
 
 
-def test_code_motion_rejects_lift_that_drops_bound_enclosing_loop():
+def _check_code_motion_rejects_lift_that_drops_bound_enclosing_loop():
     """A move cannot detach a block from an enclosing loop that drives its regions."""
     ir = build_canonical_ir()
     memset = block_for_op(ir, "NKIMemset")
@@ -148,7 +222,7 @@ def test_code_motion_rejects_lift_that_drops_bound_enclosing_loop():
     assert option not in CodeMotion().analyze(nested)
 
 
-def test_code_motion_rejects_versioned_buffer_crossing_pipeline_boundary():
+def _check_code_motion_rejects_versioned_buffer_crossing_pipeline_boundary():
     """A block touching a multi-version buffer cannot leave its pipeline loop."""
     ir = tuned_ir()
     pipeline_loop, _children = m_loop_and_children(ir)
@@ -162,7 +236,7 @@ def test_code_motion_rejects_versioned_buffer_crossing_pipeline_boundary():
     assert option not in CodeMotion().analyze(ir)
 
 
-def test_code_motion_rejects_sinking_writer_under_accumulation_loop():
+def _check_code_motion_rejects_sinking_writer_under_accumulation_loop():
     """Sinking the memset (accumulator init) under the matmul K loop is rejected
     by the dependency model (memset->K-loop carry edge would point backward),
     not an ad-hoc role guard."""
@@ -177,7 +251,7 @@ def test_code_motion_rejects_sinking_writer_under_accumulation_loop():
     assert not any(o.block_nid == memset and o.target_loop_nid == kloop for o in CodeMotion().analyze(ir))
 
 
-def test_code_motion_rejects_hoisting_rmw_reset_across_reduction_loop():
+def _check_code_motion_rejects_hoisting_rmw_reset_across_reduction_loop():
     """Hoisting an invariant reset out of an invariant RMW loop changes its frequency."""
     ir, _ambient = _rfactored_with_ambient_loop("i_d3_0", 2)
     psum_memset_leaf = next(
@@ -199,7 +273,7 @@ def test_code_motion_rejects_hoisting_rmw_reset_across_reduction_loop():
     assert option not in CodeMotion().analyze(ir)
 
 
-def test_code_motion_rejects_rmw_moved_into_invariant_reset_loop():
+def _check_code_motion_rejects_rmw_moved_into_invariant_reset_loop():
     """An accumulator cannot enter a loop that resets its region each iteration."""
     ir = build_canonical_ir()
     memset = block_for_op(ir, "NKIMemset")
@@ -220,7 +294,7 @@ def test_code_motion_rejects_rmw_moved_into_invariant_reset_loop():
     assert option not in CodeMotion().analyze(ir)
 
 
-def test_code_motion_rejects_hoisting_consumer_out_of_producer_loop():
+def _check_code_motion_rejects_hoisting_consumer_out_of_producer_loop():
     """A consumer cannot leave a loop that produces its invariant input each iteration."""
     ir, _ambient = _rfactored_with_ambient_loop("i_d3_0", 2)
     fold = block_for_op(ir, "NKITensorTensor")
@@ -231,7 +305,7 @@ def test_code_motion_rejects_hoisting_consumer_out_of_producer_loop():
     assert option not in CodeMotion().analyze(ir)
 
 
-def test_code_motion_rejects_consumer_moved_to_equal_sibling_loop():
+def _check_code_motion_rejects_consumer_moved_to_equal_sibling_loop():
     """Equal loop payloads do not make distinct sibling execution scopes equivalent."""
     ir, old_inner = _rfactored_with_ambient_loop("i_d1_9", 16)
     fold = block_for_op(ir, "NKITensorTensor")
@@ -244,7 +318,24 @@ def test_code_motion_rejects_consumer_moved_to_equal_sibling_loop():
     assert option not in CodeMotion().analyze(ir)
 
 
-def test_code_motion_rejects_consumer_sunk_before_producer():
+def _check_code_motion_rejects_compacted_producer_moved_to_equal_sibling_loop() -> None:
+    """A one-tile producer cannot precompute into a distinct sibling loop."""
+    specs = {"lhs": ((128, 512), "bfloat16"), "rhs": ((512, 128), "bfloat16")}
+    ir = build_initial_ir(f_lhs_matmul, specs)
+    producer = block_for_op(ir, "NKITensorCopy")
+    matmul_target = matmul_loop(ir, "i_d1_0")
+    ir = CodeMotion().apply(ir, CodeMotionOption(block_nid=producer, target_loop_nid=matmul_target, index=0))
+    ir = BufferCompaction().apply(ir, BufferCompactionOption(tensor="sbuf_lhs_T"))
+    rhs_load = load_block_reading(ir, "rhs")
+    sibling_target = first_for_in(ir, rhs_load)
+    option = CodeMotionOption(block_nid=producer, target_loop_nid=sibling_target, index=1)
+
+    with pytest.raises(TransformLegalityError, match="producer|consumer|scope"):
+        CodeMotion().apply(ir, option)
+    assert option not in CodeMotion().analyze(ir)
+
+
+def _check_code_motion_rejects_consumer_sunk_before_producer():
     """Hole #1: sinking the tensor_copy (consumer of psum_prod) under the memset's
     loop would place it before the matmul producer -> rejected by the same model."""
     ir = build_canonical_ir()
@@ -255,7 +346,7 @@ def test_code_motion_rejects_consumer_sunk_before_producer():
         CodeMotion().apply(ir, CodeMotionOption(block_nid=tc, target_loop_nid=memset_loop, index=0))
 
 
-def test_code_motion_rejects_parallel_producer_sunk_past_consumer():
+def _check_code_motion_rejects_parallel_producer_sunk_past_consumer():
     """The direction bug: sinking the rhs load (PARALLEL producer of sbuf_rhs, no
     carry edge) under the tensor_copy loop places it AFTER the matmul that reads
     sbuf_rhs. The RAW load->matmul edge would point backward; reject it.
@@ -272,3 +363,36 @@ def test_code_motion_rejects_parallel_producer_sunk_past_consumer():
     with pytest.raises(TransformLegalityError, match="reorder|dependency"):
         CodeMotion().apply(ir, CodeMotionOption(block_nid=rhs_load, target_loop_nid=tc_loop, index=0))
     assert not any(o.block_nid == rhs_load and o.target_loop_nid == tc_loop for o in CodeMotion().analyze(ir))
+
+
+def _check_code_motion_rejects_equal_trip_loops_with_different_strides() -> None:
+    """Equal dimensions and trip counts do not imply equivalent tile coverage."""
+    ir, option = _mismatched_stride_move()
+
+    with pytest.raises(TransformLegalityError, match="stride"):
+        CodeMotion().apply(ir, option)
+    assert option not in CodeMotion().analyze(ir)
+
+
+def test_code_motion_accepts_supported_placements() -> None:
+    """Supported direct, reverse-compute-at, and output-store placements remain legal."""
+    _check_move_lifts_tensor_copy_under_matmul_inner_loop()
+    _check_reverse_compute_at_allows_fold_covering_its_own_ko()
+    _check_code_motion_allows_output_store_sink()
+
+
+def test_code_motion_rejects_invalid_placements() -> None:
+    """Invalid targets, dependency reversals, and reset-frequency changes fail loudly."""
+    _check_code_motion_rejects_non_fornode_target()
+    _check_code_motion_rejects_target_inside_moved_block()
+    _check_code_motion_rejects_lift_that_drops_bound_enclosing_loop()
+    _check_code_motion_rejects_versioned_buffer_crossing_pipeline_boundary()
+    _check_code_motion_rejects_sinking_writer_under_accumulation_loop()
+    _check_code_motion_rejects_hoisting_rmw_reset_across_reduction_loop()
+    _check_code_motion_rejects_rmw_moved_into_invariant_reset_loop()
+    _check_code_motion_rejects_hoisting_consumer_out_of_producer_loop()
+    _check_code_motion_rejects_consumer_moved_to_equal_sibling_loop()
+    _check_code_motion_rejects_compacted_producer_moved_to_equal_sibling_loop()
+    _check_code_motion_rejects_consumer_sunk_before_producer()
+    _check_code_motion_rejects_parallel_producer_sunk_past_consumer()
+    _check_code_motion_rejects_equal_trip_loops_with_different_strides()

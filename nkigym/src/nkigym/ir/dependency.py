@@ -400,17 +400,33 @@ class Dependency:
         return True
 
 
+def _rmw_operand_slots(node: ISANode) -> frozenset[str]:
+    """Return statically RMW slots plus input/output slots that alias exactly."""
+    slots = set(node.op_cls.RMW_OPERANDS)
+    inputs = node.op_cls.INPUT_OPERANDS
+    outputs = set(node.operand_bindings) - inputs - node.op_cls.RMW_OPERANDS
+    for input_slot in inputs:
+        input_region = node.operand_bindings.get(input_slot)
+        if input_region is None:
+            continue
+        for output_slot in outputs:
+            if node.operand_bindings[output_slot] == input_region:
+                slots.update((input_slot, output_slot))
+    return frozenset(slots)
+
+
 def _leaf_operand_regions(tree: KernelTree, leaf_nid: int, tensor: str, rmw_only: bool) -> list[BufferRegion]:
     """Regions of ``tensor`` bound by ``leaf_nid``'s operands.
 
-    With ``rmw_only`` True, only ``RMW_OPERANDS`` slots are considered — the
-    read-modify-written accumulators (matmul ``dst``, tensor_tensor ``data1``)
-    that can carry a value across a loop.
+    With ``rmw_only`` True, only statically RMW slots or explicitly aliased
+    input/output slots are considered. The latter covers an RFactor
+    ``tensor_tensor(data1=acc, dst=acc)`` without declaring every SSA
+    ``tensor_tensor`` operation read-modify-write.
     """
     data = tree.data(leaf_nid)
     regions: list[BufferRegion] = []
     if isinstance(data, ISANode):
-        slots = data.op_cls.RMW_OPERANDS if rmw_only else data.operand_bindings.keys()
+        slots = _rmw_operand_slots(data) if rmw_only else data.operand_bindings.keys()
         for slot in slots:
             region = data.operand_bindings.get(slot)
             if region is not None and region.tensor == tensor:
@@ -449,8 +465,8 @@ def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool
     A leaf that itself RMWs the tensor is its accumulator store-back (e.g. the
     fold's ``dst`` aliasing ``data1``), NOT a re-init — only a SEPARATE plain-write
     leaf (a memset) re-initializes. This is role-blind: it reads regions +
-    ``RMW_OPERANDS`` only, never the axis role (RFactor flips ko/ki to PARALLEL
-    yet psum still carries across ki).
+    static or explicitly aliased RMW operands only, never the axis role
+    (RFactor flips ko/ki to PARALLEL yet psum still carries across ki).
     """
     loop = tree.data(loop_nid)
     assert isinstance(loop, ForNode), f"_tensor_carried_across: {loop_nid} is not a ForNode"
@@ -466,10 +482,11 @@ def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool
             has_invariant_rmw = True
         if rmw_regions:
             continue
+        rmw_slots = _rmw_operand_slots(data)
         for slot, region in data.operand_bindings.items():
             if region.tensor != tensor:
                 continue
-            if slot in data.op_cls.RMW_OPERANDS:
+            if slot in rmw_slots:
                 continue
             if slot in getattr(data.op_cls, "INPUT_OPERANDS", frozenset()):
                 continue

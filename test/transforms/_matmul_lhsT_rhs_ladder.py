@@ -6,11 +6,13 @@ the transform-driven reconstruction used by dependency and byte-exact tests.
 
 from __future__ import annotations
 
-from test.transforms._fixtures import INPUT_SPECS, f_matmul
-from test.transforms._helpers import block_for_op, leaf_for_op, load_block_reading, matmul_loop
-
 from nkigym.ir import KernelIR, build_initial_ir
 from nkigym.ir.tree import ForNode, ISANode
+from nkigym.ops import nkigym_kernel
+from nkigym.ops.load import NKILoad
+from nkigym.ops.matmul import NKIMatmul
+from nkigym.ops.store import NKIStore
+from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.transforms import (
     BufferCompaction,
     BufferCompactionOption,
@@ -25,6 +27,76 @@ from nkigym.transforms import (
     Split,
     SplitOption,
 )
+
+INPUT_SPECS: dict[str, tuple[tuple[int, ...], str]] = {
+    "lhs_T": ((2048, 2048), "bfloat16"),
+    "rhs": ((2048, 2048), "bfloat16"),
+}
+
+
+@nkigym_kernel
+def f_matmul(lhs_T, rhs):
+    """Return the canonical SSA graph for ``lhs_T.T @ rhs``."""
+    sbuf_lhs_T = NKILoad()(src=lhs_T)
+    sbuf_rhs = NKILoad()(src=rhs)
+    psum_prod = NKIMatmul()(stationary=sbuf_lhs_T, moving=sbuf_rhs)
+    sbuf_prod = NKITensorCopy()(src=psum_prod)
+    hbm_out = NKIStore()(src=sbuf_prod)
+    return hbm_out
+
+
+def _isa_descendants(ir: KernelIR, nid: int) -> list[ISANode]:
+    """Return the ISA nodes below ``nid``."""
+    leaves: list[ISANode] = []
+    for descendant in ir.tree.descendants(nid):
+        node = ir.tree.data(descendant)
+        if isinstance(node, ISANode):
+            leaves.append(node)
+    return leaves
+
+
+def block_for_op(ir: KernelIR, op_name: str) -> int:
+    """Return the single-leaf block containing the named operation."""
+    for nid in ir.tree.blocks():
+        leaves = _isa_descendants(ir, nid)
+        if len(leaves) == 1 and leaves[0].op_cls.__name__ == op_name:
+            return nid
+    raise AssertionError(f"no leaf block for {op_name}")
+
+
+def leaf_for_op(ir: KernelIR, op_name: str) -> int:
+    """Return the sole ISA leaf for an operation name."""
+    leaves: list[int] = []
+    for nid in ir.tree.preorder():
+        node = ir.tree.data(nid)
+        if isinstance(node, ISANode) and node.op_cls.__name__ == op_name:
+            leaves.append(nid)
+    if len(leaves) != 1:
+        raise AssertionError(f"expected one {op_name} leaf, found {leaves}")
+    return leaves[0]
+
+
+def load_block_reading(ir: KernelIR, tensor: str) -> int:
+    """Return the single-leaf load block reading the named tensor."""
+    for nid in ir.tree.blocks():
+        leaves = _isa_descendants(ir, nid)
+        if (
+            len(leaves) == 1
+            and leaves[0].op_cls.__name__ == "NKILoad"
+            and leaves[0].operand_bindings["src"].tensor == tensor
+        ):
+            return nid
+    raise AssertionError(f"no single-leaf load block reading {tensor}")
+
+
+def matmul_loop(ir: KernelIR, loop_var: str) -> int:
+    """Return the named loop enclosing the matmul leaf."""
+    leaf = leaf_for_op(ir, "NKIMatmul")
+    for ancestor in ir.tree.ancestors(leaf):
+        node = ir.tree.data(ancestor)
+        if isinstance(node, ForNode) and node.loop_var == loop_var:
+            return ancestor
+    raise AssertionError(f"no matmul loop named {loop_var}")
 
 
 def _load_leaf(ir: KernelIR, tensor: str) -> int:

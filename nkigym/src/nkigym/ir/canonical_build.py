@@ -70,9 +70,21 @@ def _trip_count(rec: "_OpRecord", abstract: str, analysis: "_AnalysisResult") ->
     no ForNode.
     """
     extent = analysis.dim_sizes[rec.axis_map[abstract]]
-    max_tile = rec.op_cls.MAX_TILE_SIZE.get(abstract)
-    tile = extent if max_tile is None else max_tile
+    tile = _tile_size(rec, abstract, analysis)
     return extent // tile
+
+
+def _tile_size(rec: "_OpRecord", abstract: str, analysis: "_AnalysisResult") -> int:
+    """Return the canonical tile width for one operation axis."""
+    extent = analysis.dim_sizes[rec.axis_map[abstract]]
+    minimum = rec.op_cls.MIN_TILE_SIZE.get(abstract, 1)
+    maximum = rec.op_cls.MAX_TILE_SIZE.get(abstract)
+    tile = extent if maximum is None else min(extent, maximum)
+    if extent < minimum:
+        raise ValueError(f"{rec.op_cls.__name__}.{abstract} extent {extent} is below MIN_TILE_SIZE {minimum}")
+    if extent % tile != 0:
+        raise ValueError(f"{rec.op_cls.__name__}.{abstract} extent {extent} is not divisible by canonical tile {tile}")
+    return tile
 
 
 def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysis: "_AnalysisResult") -> int:
@@ -187,11 +199,7 @@ def _build_region(
     present_axes = [a for a in axes if a in rec.axis_map]
     ranges: list = []
     for axis_index, abstract in enumerate(present_axes):
-        max_tile = rec.op_cls.MAX_TILE_SIZE.get(abstract)
-        if max_tile is None:
-            extent_per_tile = analysis.dim_sizes[rec.axis_map[abstract]]
-        else:
-            extent_per_tile = max_tile
+        extent_per_tile = _tile_size(rec, abstract, analysis)
         loop_var = loop_var_names.get(abstract)
         looped = loop_var is not None and _trip_count(rec, abstract, analysis) > 1
 
