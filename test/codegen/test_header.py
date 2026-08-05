@@ -2,7 +2,7 @@
 
 import pytest
 
-from nkigym.codegen import emit_header, emit_return
+from nkigym.codegen import emit_header
 from nkigym.ir import build_initial_ir
 from nkigym.ops import nkigym_kernel
 from nkigym.ops.load import NKILoad
@@ -26,15 +26,15 @@ def _matmul_fixture(lhs_T, rhs):
 
 
 @pytest.fixture(scope="module")
-def generated_parts() -> tuple[str, str]:
-    """Return the matmul fixture's generated header and return statement."""
+def generated_header() -> str:
+    """Return the matmul fixture's generated header."""
     ir = build_initial_ir(_matmul_fixture, INPUT_SPECS)
-    return emit_header(ir), emit_return(ir)
+    return emit_header(ir)
 
 
-def test_header_contract(generated_parts: tuple[str, str]) -> None:
+def test_header_contract(generated_header: str) -> None:
     """The header emits imports, signature, and shapes without body or return work."""
-    header, _return = generated_parts
+    header = generated_header
     assert "import nki" in header
     assert "import nki.isa as nisa" in header
     assert "import nki.language as nl" in header
@@ -49,30 +49,3 @@ def test_header_contract(generated_parts: tuple[str, str]) -> None:
     assert "sbuf_lhs_T = nl.ndarray" not in header
     assert "psum_acc = nl.ndarray" not in header
     assert "sbuf_prod = nl.ndarray" not in header
-
-
-def test_return_contract(generated_parts: tuple[str, str]) -> None:
-    """The return emitter emits only one indented return statement."""
-    _header, return_source = generated_parts
-    assert return_source == "    return hbm_out\n"
-    assert "nl.ndarray" not in return_source
-    assert "shared_hbm" not in return_source
-
-
-def test_single_parameter_header_and_return() -> None:
-    """A one-input kernel follows the same header and return split."""
-
-    @nkigym_kernel
-    def identity(x):
-        sbuf_x = NKILoad()(src=x)
-        hbm_y = NKIStore()(src=sbuf_x)
-        return hbm_y
-
-    ir = build_initial_ir(identity, {"x": ((128, 512), "bfloat16")})
-    header = emit_header(ir)
-    ret = emit_return(ir)
-    assert "def nki_identity(x):" in header
-    assert "assert x.shape == (128, 512)" in header
-    assert "shared_hbm" not in header
-    assert "return" not in header
-    assert ret == "    return hbm_y\n"

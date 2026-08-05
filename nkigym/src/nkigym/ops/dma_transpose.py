@@ -8,12 +8,13 @@ PSUM. Also the target of the ``TransposeThroughLoad`` rewrite, where the
 ``src`` input is an HBM parameter instead of an SBUF buffer.
 """
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import nki.isa as nisa
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import BatchedPermutationContract, NKIOp, PermutationContract, _operand_role
 
 
 class NKIDMATranspose(NKIOp):
@@ -22,14 +23,23 @@ class NKIDMATranspose(NKIOp):
     NAME: ClassVar[str] = "dma_transpose"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"src": ("P", "F"), "dst": ("F", "P")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
-    """``nisa.dma_transpose`` has no per-axis tile cap beyond the
-    partition axis (128). The mode-specific shape rules (HWDGE's
-    ``src.shape[0]==16`` and ``src.shape[-1] % 128 == 0``, SWDGE's
-    ``src.shape[-1] <= 128``) are selected by the lowering mode, not
-    the op's tile limits."""
+    """Both abstract axes become a partition axis on one side of the
+    transpose, so one instruction covers at most 128 elements of each.
+    Larger free dimensions are represented by outer loops."""
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
-    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": 128}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PermutationContract:
+        """Return the two-axis transpose contract."""
+        _ = kwargs
+        return PermutationContract(
+            input_operand="src",
+            output_operand="dst",
+            permutation=(1, 0),
+            batching=BatchedPermutationContract(permutation=(3, 1, 2, 0), input_axes=(0, 3), batch_axis=2),
+        )
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` may be HBM param (``TransposeThroughLoad`` rewrite) or SBUF."""

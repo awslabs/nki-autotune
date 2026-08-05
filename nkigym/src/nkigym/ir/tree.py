@@ -57,6 +57,20 @@ class ForNode:
 
 
 @dataclass(frozen=True, kw_only=True)
+class AccessPattern:
+    """Flattened multidimensional view used by one ISA operand.
+
+    ``pattern`` stores ``(stride, extent)`` pairs in view-axis order and
+    ``offset`` stores the flattened base element. The corresponding
+    :class:`BufferRegion` remains the logical footprint used by dependency
+    analysis.
+    """
+
+    pattern: tuple[tuple[Expr, Expr], ...]
+    offset: Expr
+
+
+@dataclass(frozen=True, kw_only=True)
 class ISANode:
     """Single ISA call.
 
@@ -71,6 +85,7 @@ class ISANode:
     op_cls: type[NKIOp]
     operand_bindings: dict[str, BufferRegion] = field(default_factory=dict)
     kwargs: dict[str, Any] = field(default_factory=dict)
+    access_patterns: dict[str, AccessPattern] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -115,58 +130,75 @@ class Buffer:
     versions: int = 1
     """Pipeline buffer-version count. 1 = single instance (renders
     byte-identically to today). >1 multiplies the tile (middle) dim of
-    physical_shape so the renderer's ``loop_var % versions`` rotation
+    each list allocation so the renderer's ``loop_var % versions`` rotation
     addresses distinct slots. Set by SoftwarePipeline (use_stage − def_stage
     + 1); left 1 everywhere else."""
     list_len: int = 1
     """List-of-tiles count. 1 = a single packed ``nl.ndarray`` (renders
     byte-identically to today). >1 splits the buffer into a Python LIST of
     ``list_len`` separate ndarrays, each :meth:`per_tile_physical_shape`, indexed
-    by a leading list subscript at the call site. Orthogonal to :attr:`versions`
-    (degree vs count); the two do not yet compose. Set by the BufferLayout transform;
+    by a leading list subscript at the call site. Each list entry contains its
+    logical tiles for every :attr:`versions` slot. Set by the BufferLayout transform;
     left 1 everywhere else."""
+
+    def _on_chip_shape(self) -> tuple[int, int]:
+        """Return the logical ``(leading, free)`` shape for an on-chip buffer."""
+        if self.location == "shared_hbm":
+            raise AssertionError(f"{self.name}: shared_hbm has no on-chip tile shape")
+        if len(self.shape) == 1:
+            leading, free = self.shape[0], 1
+        elif len(self.shape) == 2:
+            leading, free = self.shape
+        else:
+            raise AssertionError(f"{self.name}: SBUF/PSUM buffer expects a 1D or 2D logical shape; got {self.shape}")
+        if leading % PARTITION_DIM != 0:
+            raise AssertionError(f"{self.name}: leading extent {leading} must be a multiple of {PARTITION_DIM}")
+        return leading, free
+
+    def logical_tile_count(self) -> int:
+        """Return the number of logical partition tiles before versioning."""
+        leading, _free = self._on_chip_shape()
+        return leading // PARTITION_DIM
+
+    def tiles_per_list(self) -> int:
+        """Return logical partition tiles stored in each list entry."""
+        logical_tiles = self.logical_tile_count()
+        if self.list_len < 1 or logical_tiles % self.list_len != 0:
+            raise AssertionError(
+                f"{self.name}: list_len {self.list_len} must divide logical tile count {logical_tiles}"
+            )
+        return logical_tiles // self.list_len
 
     def physical_shape(self) -> tuple[int, ...]:
         """Return the shape ``nl.ndarray`` actually allocates for this buffer.
 
-        ``shared_hbm`` buffers keep their 2D logical shape. ``sbuf`` and
+        ``shared_hbm`` buffers keep their logical shape. ``sbuf`` and
         ``psum`` buffers expand to the 3D NeuronCore layout
-        ``(128, num_p_tiles, F_contig)`` — the partition axis is fixed at
-        128 and the leading logical extent folds into the tile count. This
-        is the single source of truth shared by the renderer
+        ``(128, num_p_tiles, F_contig)``. A logical vector ``(P,)`` uses
+        ``F_contig=1``. The partition axis is fixed at 128 and the leading
+        logical extent folds into the tile count. This is the single source
+        of truth shared by the renderer
         (:func:`nkigym.codegen.body._emit_alloc`) and buffer transforms.
         """
         if self.location == "shared_hbm":
             return self.shape
-        if len(self.shape) != 2:
-            raise AssertionError(f"{self.name}: SBUF/PSUM buffer expects a 2D logical shape; got {self.shape}")
-        leading, free = self.shape
-        if leading % PARTITION_DIM != 0:
-            raise AssertionError(f"{self.name}: leading extent {leading} must be a multiple of {PARTITION_DIM}")
-        return (PARTITION_DIM, (leading // PARTITION_DIM) * self.versions, free)
+        _leading, free = self._on_chip_shape()
+        return (PARTITION_DIM, self.logical_tile_count() * self.versions, free)
 
     def per_tile_physical_shape(self) -> tuple[int, ...]:
-        """Return the shape of ONE tile when this buffer renders as a list of tiles.
+        """Return the ndarray shape of one entry in this buffer's allocation list.
 
         The list-of-tiles form (:attr:`list_len` > 1) allocates ``list_len``
-        separate ndarrays, each this shape — :meth:`physical_shape` with the tile
-        (middle) dim divided by ``list_len``. Identity when ``list_len == 1`` (the
-        single packed buffer). Rejects the combinations this representation does not
-        yet support: splitting a ``shared_hbm`` buffer (no tile axis) and composing
-        ``versions > 1`` with ``list_len > 1`` (two distinct tile-dim multipliers).
+        separate ndarrays, each this shape. The middle dimension contains this
+        list entry's logical tiles for every pipeline version:
+        ``tiles_per_list * versions``. Identity when ``list_len == 1``.
         """
         if self.list_len == 1:
             return self.physical_shape()
         if self.location == "shared_hbm":
             raise AssertionError(f"{self.name}: shared_hbm has no tile axis to split (list_len must be 1)")
-        if self.versions > 1:
-            raise AssertionError(
-                f"{self.name}: versions>1 ({self.versions}) with list_len>1 ({self.list_len}) is unsupported"
-            )
-        partition, total_tiles, free = self.physical_shape()
-        if total_tiles % self.list_len != 0:
-            raise AssertionError(f"{self.name}: list_len {self.list_len} does not divide tile-dim {total_tiles}")
-        return (partition, total_tiles // self.list_len, free)
+        partition, _total_tiles, free = self.physical_shape()
+        return (partition, self.tiles_per_list() * self.versions, free)
 
     def physical_dtype(self) -> str:
         """Return the dtype ``nl.ndarray`` actually allocates for this buffer.
@@ -257,10 +289,22 @@ class KernelTree:
             self.graph.add_edge(parent, nid)
         return nid
 
+    def restore_next_id(self, next_id: int) -> None:
+        """Restore the allocator after removing every node added since ``next_id``."""
+        remaining = [nid for nid in self.graph.nodes if nid >= next_id]
+        if remaining:
+            raise ValueError(f"cannot restore next node id to {next_id}; live nodes remain: {remaining}")
+        self._next_id = next_id
+
     @property
     def num_nodes(self) -> int:
         """Total node count in the underlying graph (includes the root)."""
         return self.graph.number_of_nodes()
+
+    @property
+    def next_node_id(self) -> int:
+        """Return the node id that the next :meth:`add_node` call will allocate."""
+        return self._next_id
 
     def data(self, nid: int) -> NodeData:
         """Return the payload attached to node ``nid``."""

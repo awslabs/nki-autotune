@@ -133,6 +133,27 @@ def test_insert_and_cancel_transpose_pair() -> None:
     assert InsertTransposePair().analyze(ir)
 
 
+def test_cancel_preserves_source_allocation_owned_by_removed_block() -> None:
+    """Cancellation retains a live source declared on the first pair block."""
+    ir = build_initial_ir(_matmul, PAIR_SPECS)
+    original = render(ir)
+    inserted = _insert_pair(ir)
+    option = CancelTransposePair().analyze(inserted)[0]
+    source = inserted.buffer("sbuf_prod")
+    root = inserted.tree.block(inserted.tree.root)
+    first = inserted.tree.block(option.first_transpose_nid)
+    inserted.tree.graph.nodes[inserted.tree.root]["data"] = replace(
+        root, alloc_buffers=tuple(buffer for buffer in root.alloc_buffers if buffer.name != source.name)
+    )
+    inserted.tree.graph.nodes[option.first_transpose_nid]["data"] = replace(
+        first, alloc_buffers=(*first.alloc_buffers, source)
+    )
+
+    restored = CancelTransposePair().apply(inserted, option)
+    assert restored.buffer(source.name) == source
+    assert render(restored) == original
+
+
 def test_pair_transforms_reject_stale_and_unknown_options() -> None:
     """Pair transforms fail loudly when their selected graph edge is absent."""
     ir = build_initial_ir(_matmul, PAIR_SPECS)
@@ -172,6 +193,33 @@ def test_insert_rebinds_only_one_aliased_operand() -> None:
     matmul = _leaves(transformed, "NKIMatmul")[0][1]
     assert matmul.operand_bindings["stationary"].tensor == "sbuf_value"
     assert matmul.operand_bindings["moving"].tensor == "sbuf_value_tt"
+
+
+def test_insert_rejects_edges_of_an_existing_identity_pair() -> None:
+    """Pair insertion does not recursively nest an intact identity pair."""
+    inserted = _insert_pair(build_initial_ir(_matmul, PAIR_SPECS))
+    drains = _leaves(inserted, "NKITensorCopy")
+    pair_tensors = {
+        "sbuf_prod",
+        drains[-2][1].operand_bindings["dst"].tensor,
+        drains[-1][1].operand_bindings["dst"].tensor,
+    }
+    insert = InsertTransposePair()
+    tensor_copy = TransposeThroughTensorCopy()
+    states = [inserted]
+    first_materialized = tensor_copy.apply(inserted, tensor_copy.analyze(inserted)[0])
+    states.append(first_materialized)
+    second_materialized = tensor_copy.apply(first_materialized, tensor_copy.analyze(first_materialized)[0])
+    states.append(second_materialized)
+
+    for state in states:
+        assert all(option.source not in pair_tensors for option in insert.analyze(state))
+        store_nid, store = _leaves(state, "NKIStore")[0]
+        source = store.operand_bindings["src"].tensor
+        option = InsertTransposePairOption(consumer_nid=store_nid, operand="src", source=source)
+        assert option not in insert.analyze(state)
+        with pytest.raises(TransformLegalityError, match="not an eligible canonical SBUF edge"):
+            insert.apply(state, option)
 
 
 def test_transpose_through_load_replaces_the_canonical_chain() -> None:

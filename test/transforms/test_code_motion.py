@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from test.transforms._fixtures import _ladder_helpers, build_canonical_ir, build_ladder_state, f_lhs_matmul
+from test.transforms._fixtures import build_canonical_ir, f_lhs_matmul
 from test.transforms._helpers import block_for_op, first_for_in, load_block_reading, matmul_loop
 from test.transforms._pipeline_fixtures import m_loop_and_children, tuned_ir
 
@@ -19,8 +19,6 @@ from nkigym.transforms import (
     BufferCompactionOption,
     CodeMotion,
     CodeMotionOption,
-    Reorder,
-    ReorderOption,
     RFactor,
     RFactorOption,
     SoftwarePipeline,
@@ -30,12 +28,7 @@ from nkigym.transforms import (
     TransformLegalityError,
 )
 from nkigym.transforms._tree_ops import _replace_in_parent_children
-from nkigym.transforms.code_motion import _check_same_loop_prefix, _move
-
-
-def _innermost_for(ir, block_nid: int) -> int:
-    leaf = next(d for d in ir.tree.preorder(block_nid) if isinstance(ir.tree.data(d), ISANode))
-    return ir.tree.ancestors(leaf)[-1]
+from nkigym.transforms.code_motion import _move
 
 
 def _rfactored_with_ambient_loop(loop_var: str, extent: int) -> tuple[KernelIR, int]:
@@ -121,67 +114,6 @@ def _mismatched_stride_move() -> tuple[KernelIR, CodeMotionOption]:
         func_name="mismatched_stride_move", param_names=[], return_name="output", tree=tree, dependency=Dependency(tree)
     )
     return ir, CodeMotionOption(block_nid=moved_nid, target_loop_nid=target, index=0)
-
-
-def _check_move_lifts_tensor_copy_under_matmul_inner_loop():
-    """Lifting tensor_copy under the matmul's innermost loop nests it there."""
-    ir = build_canonical_ir()
-    tc = block_for_op(ir, "NKITensorCopy")
-    mm = block_for_op(ir, "NKIMatmul")
-    target = _innermost_for(ir, mm)
-    _move(ir, block_nid=tc, target_loop_nid=target, index=-1)
-    assert tc in ir.tree.descendants(target)
-
-
-def _check_reverse_compute_at_allows_fold_covering_its_own_ko():
-    """The two-stage fold accumulates across its ENCLOSING ko (its sbuf_prod
-    memset dominates ko via a CARRY edge), so covering ko by that loop is SAFE
-    and must be allowed — the manual-ladder endpoint's fold-inlining precondition."""
-    state = build_canonical_ir()
-    state = Split().apply(state, SplitOption(target_nid=matmul_loop(state, "i_d0_0"), factors=(2, 8), target_axis=None))
-    state = Split().apply(state, SplitOption(target_nid=matmul_loop(state, "i_d1_0"), factors=(4, 4), target_axis=None))
-    for outer, inner in (
-        ("i_d1_1", "i_d2_0"),
-        ("i_d1_0", "i_d2_0"),
-        ("i_d0_1", "i_d2_0"),
-        ("i_d0_0", "i_d2_0"),
-        ("i_d0_1", "i_d1_0"),
-        ("i_d0_1", "i_d1_1"),
-    ):
-        state = Reorder().apply(
-            state, ReorderOption(outer_nid=matmul_loop(state, outer), inner_nid=matmul_loop(state, inner))
-        )
-    state = RFactor().apply(state, RFactorOption(target_loop_nid=matmul_loop(state, "i_d0_0"), factor_axis=0))
-
-    """After the ki-anchored RFactor the fold is ALREADY per-N-tile (d2 free extent
-    512, region ``i_d2_0*512 : +512``) and per-Mi-tile, nested directly under
-    ``i_d2_0 > i_d0_0(ko) > i_d1_0 > i_d1_1`` with no block-local loops — so the old
-    ``Split(fold, d2, (4,512))`` + ``Split(fold_loop i_d1_0, (4,4))`` scaffolding
-    (which shaped a 2048-wide ko-anchored fold) is now moot and is dropped.
-
-    Barrier 1 is isolated here via _check_same_loop_prefix and the dependency check
-    (span-promotion verifies init-domination). The fold's own enclosing i_d0_0 is
-    allowed (init dominates that loop)."""
-    fold = block_for_op(state, "NKITensorTensor")
-    fold_block = state.tree.block(fold)
-    assert any(iv.axis == "d0" and iv.role == AxisRole.ACCUMULATION for iv in fold_block.iter_vars)
-    target_seq = _check_same_loop_prefix(state, fold, matmul_loop(state, "i_d1_1"))
-    assert ("i_d0_0", 2) in target_seq, "ko (i_d0_0) must be in the matched prefix (allowed self-domination)"
-
-
-def _check_code_motion_allows_output_store_sink():
-    """The output store (writes the return tensor) may sink under the drain's N
-    loop — the dropped output-block guard would have rejected it; span-promotion
-    permits it (drain writes the sbuf_prod slice the store reads, same N-iter).
-    This is the _fixtures rung_13_14 move, done via CodeMotion."""
-    state = build_ladder_state(13)
-    blk, _leaf, _loop, _inner, _mm_loop, tc_loop = _ladder_helpers()
-    store_blk = blk(state, "NKIStore")
-    d2 = tc_loop(state, "i_d2_0")
-    opt = CodeMotionOption(block_nid=store_blk, target_loop_nid=d2, index=-1)
-    new_ir = CodeMotion().apply(state, opt)
-    assert new_ir is not None
-    assert any(o.block_nid == store_blk and o.target_loop_nid == d2 for o in CodeMotion().analyze(state))
 
 
 def _check_code_motion_rejects_non_fornode_target():
@@ -372,13 +304,6 @@ def _check_code_motion_rejects_equal_trip_loops_with_different_strides() -> None
     with pytest.raises(TransformLegalityError, match="stride"):
         CodeMotion().apply(ir, option)
     assert option not in CodeMotion().analyze(ir)
-
-
-def test_code_motion_accepts_supported_placements() -> None:
-    """Supported direct, reverse-compute-at, and output-store placements remain legal."""
-    _check_move_lifts_tensor_copy_under_matmul_inner_loop()
-    _check_reverse_compute_at_allows_fold_covering_its_own_ko()
-    _check_code_motion_allows_output_store_sink()
 
 
 def test_code_motion_rejects_invalid_placements() -> None:

@@ -7,11 +7,12 @@ cycles — contrast with :class:`NKIDMATranspose` which runs on the
 DMA engine and leaves TE free for matmul.
 """
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import NKIOp, PermutationContract, _operand_role
 
 
 class NKITranspose(NKIOp):
@@ -26,6 +27,12 @@ class NKITranspose(NKIOp):
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": 128}
     OUTPUT_ROLE: ClassVar[str] = "psum"
     OUTPUT_LOCATION: ClassVar[str] = "psum"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PermutationContract:
+        """Return the two-axis transpose contract."""
+        _ = kwargs
+        return PermutationContract(input_operand="data", output_operand="dst", permutation=(1, 0))
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``data`` must be SBUF-resident."""

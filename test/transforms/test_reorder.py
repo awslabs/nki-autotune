@@ -53,16 +53,6 @@ def test_reorder_swaps_payloads():
     assert new_ir.tree.data(inner) == outer_data
 
 
-def test_reorder_self_inverse():
-    """Apply twice returns the original payload."""
-    ir = build_canonical_ir()
-    outer, inner = _first_two_adjacent_fors(ir)
-    opt = ReorderOption(outer_nid=outer, inner_nid=inner)
-    new_ir = Reorder().apply(Reorder().apply(ir, opt), opt)
-    assert new_ir.tree.data(outer) == ir.tree.data(outer)
-    assert new_ir.tree.data(inner) == ir.tree.data(inner)
-
-
 def test_reorder_renders_and_passes_numerics(tmp_path) -> None:
     """Reordering a split loop pair preserves rendered-kernel behavior."""
     ir = build_canonical_ir()

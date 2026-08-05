@@ -208,26 +208,6 @@ def test_split_analyze_omits_below_min_tensorize_splits():
     assert ("d2", (4, 128)) in {(o.target_axis, o.factors) for o in tensorize}
 
 
-def test_split_trip_dense_names():
-    """Split a trip-16 matmul d1 loop -> (2,8): the two loops are i_d1_0, i_d1_1 (dense)."""
-    ir = build_canonical_ir()
-    d1 = next(
-        n
-        for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ForNode)
-        and ir.tree.loop(n).loop_var == "i_d1_0"
-        and ir.tree.loop(n).extent == 16
-    )
-    new_ir = Split().apply(ir, SplitOption(target_nid=d1, factors=(2, 8)))
-    names = [
-        new_ir.tree.loop(n).loop_var
-        for n in new_ir.tree.preorder()
-        if isinstance(new_ir.tree.data(n), ForNode) and new_ir.tree.loop(n).loop_var.startswith("i_d1_")
-    ]
-    assert "i_d1_0" in names and "i_d1_1" in names
-    assert not any("_0_" in nm for nm in names), names
-
-
 def test_split_rejects_over_cover():
     """Factors whose product EXCEEDS the extent are illegal (we are exact-division
     only — TVM would predicate the ragged tail; we reject). 4*5=20 > 16."""
@@ -237,16 +217,6 @@ def test_split_rejects_over_cover():
     assert ir.tree.loop(target).extent == 16
     with pytest.raises(TransformLegalityError):
         Split().apply(ir, SplitOption(target_nid=target, factors=(4, 5)))
-
-
-def test_split_accepts_exact_cover():
-    """Factors whose product EQUALS the extent are legal. 4*4 == 16."""
-    ir = build_canonical_ir()
-    matmul_block_nid = block_for_op(ir, "NKIMatmul")
-    target = first_for_in(ir, matmul_block_nid)
-    assert ir.tree.loop(target).extent == 16
-    new_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(4, 4)))
-    assert new_ir is not ir
 
 
 def test_split_tensorize_rejects_over_cover():

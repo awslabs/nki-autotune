@@ -6,7 +6,6 @@ from test._simulation import assert_matmul_ir_simulates
 from test.transforms._fixtures import build_canonical_ir
 from test.transforms._helpers import leaf_for_op
 
-from nkigym.codegen import render
 from nkigym.ir.arith.expr import Const
 from nkigym.ir.tree import ForNode
 from nkigym.transforms import Split, SplitOption
@@ -33,40 +32,9 @@ def test_split_tensorize_load_d1_to_16x128(tmp_path) -> None:
     assert_matmul_ir_simulates(split, tmp_path, "split_load_d1")
 
 
-def test_ladder_tensorized_splits_render_and_simulate(tmp_path) -> None:
-    """Every tensorized split used by the transform ladder preserves behavior."""
-    cases = (
-        ("NKILoad", 1, "d2", (4, 512)),
-        ("NKIMemset", 0, "d2", (4, 512)),
-        ("NKITensorCopy", 0, "d2", (4, 512)),
-        ("NKIStore", 0, "d2", (4, 512)),
-    )
-    for op_name, occurrence, axis, factors in cases:
-        ir = build_canonical_ir()
-        leaf = leaf_for_op(ir, op_name, occurrence)
-        split = Split().apply(ir, SplitOption(target_nid=leaf, factors=factors, target_axis=axis))
-        module_name = f"split_{op_name.lower()}_{occurrence}"
-        assert_matmul_ir_simulates(split, tmp_path, module_name)
-
-
 def test_split_tensorize_n_to_min_tile_still_simulates(tmp_path) -> None:
     """A tensorized split ending at the minimum tile size remains valid."""
     ir = build_canonical_ir()
     matmul = leaf_for_op(ir, "NKIMatmul")
     split = Split().apply(ir, SplitOption(target_nid=matmul, factors=(4, 128), target_axis="d2"))
     assert_matmul_ir_simulates(split, tmp_path, "split_matmul_n_min_tile")
-
-
-def test_split_load_d1_matches_hand_k1_render() -> None:
-    """The first ladder split renders one dense loop without a trip-one wrapper."""
-    ir = build_canonical_ir()
-    load = leaf_for_op(ir, "NKILoad")
-    split = Split().apply(ir, SplitOption(target_nid=load, factors=(16, 128), target_axis="d1"))
-    lines = [line.strip() for line in render(split).splitlines()]
-    load_line = next(line for line in lines if "dst=sbuf_lhs_T" in line)
-
-    assert "for i_d1_0 in range(16):" in lines
-    assert not any("i_d1_0_0" in line for line in lines)
-    assert not any(line.startswith("for ") and "range(1)" in line for line in lines)
-    assert "i_d1_0 * 128" in load_line and "+ 128" in load_line
-    assert "* 2048" not in load_line

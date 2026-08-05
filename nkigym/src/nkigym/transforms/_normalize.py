@@ -30,8 +30,8 @@ from __future__ import annotations
 
 from math import prod
 
-from nkigym.ir.arith.expr import Const, Expr, Mul, from_affine, to_affine
-from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.ir.arith.expr import Const, Expr, Mul, Var, from_affine, substitute, to_affine
+from nkigym.ir.tree import PARTITION_DIM, AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
 
 
@@ -160,6 +160,7 @@ def _rename_dense(tree: KernelTree, block_nid: int) -> None:
     assert isinstance(block, BlockNode)
     old_to_dim = _loopvar_to_dim(tree, block_nid, block)
     counters: dict[str, int] = dict(_enclosing_dim_counts(tree, block_nid))
+    substitutions: dict[str, Expr] = {}
     for nid in _block_local_descendants(tree, block_nid):
         data = tree.data(nid)
         if not isinstance(data, ForNode):
@@ -171,7 +172,53 @@ def _rename_dense(tree: KernelTree, block_nid: int) -> None:
         counters[dim] = n + 1
         new_name = f"i_{dim}_{n}"
         if new_name != data.loop_var:
+            substitutions[data.loop_var] = Var(name=new_name)
             tree.graph.nodes[nid]["data"] = ForNode(loop_var=new_name, extent=data.extent)
+    if substitutions:
+        _substitute_block_regions(tree, block_nid, substitutions)
+
+
+def _substitute_block_regions(tree: KernelTree, block_nid: int, substitutions: dict[str, Expr]) -> None:
+    """Rename loop variables in regions before semantic-axis recomputation."""
+    block = tree.block(block_nid)
+
+    def rewrite(region: BufferRegion) -> BufferRegion:
+        """Apply ``substitutions`` to every range expression."""
+        return BufferRegion(
+            tensor=region.tensor,
+            ranges=tuple(
+                (substitute(lower, substitutions), substitute(width, substitutions)) for lower, width in region.ranges
+            ),
+        )
+
+    def rewrite_pattern(pattern: AccessPattern) -> AccessPattern:
+        """Apply ``substitutions`` to one explicit physical view."""
+        return AccessPattern(
+            pattern=tuple(
+                (substitute(stride, substitutions), substitute(extent, substitutions))
+                for stride, extent in pattern.pattern
+            ),
+            offset=substitute(pattern.offset, substitutions),
+        )
+
+    tree.graph.nodes[block_nid]["data"] = BlockNode(
+        iter_vars=block.iter_vars,
+        iter_values=tuple(substitute(value, substitutions) for value in block.iter_values),
+        reads=tuple(rewrite(region) for region in block.reads),
+        writes=tuple(rewrite(region) for region in block.writes),
+        alloc_buffers=block.alloc_buffers,
+        annotations=dict(block.annotations),
+        axis_map=block.axis_map,
+    )
+    for nid in _block_local_descendants(tree, block_nid):
+        node = tree.data(nid)
+        if isinstance(node, ISANode):
+            tree.graph.nodes[nid]["data"] = ISANode(
+                op_cls=node.op_cls,
+                operand_bindings={slot: rewrite(region) for slot, region in node.operand_bindings.items()},
+                kwargs=dict(node.kwargs),
+                access_patterns={slot: rewrite_pattern(pattern) for slot, pattern in node.access_patterns.items()},
+            )
 
 
 def _recompute_bindings(tree: KernelTree, block_nid: int, tensors: frozenset[str] | None = None) -> None:
@@ -222,7 +269,10 @@ def _recompute_bindings(tree: KernelTree, block_nid: int, tensors: frozenset[str
             for slot, region in data.operand_bindings.items()
         }
         tree.graph.nodes[nid]["data"] = ISANode(
-            op_cls=data.op_cls, operand_bindings=new_bindings, kwargs=dict(data.kwargs)
+            op_cls=data.op_cls,
+            operand_bindings=new_bindings,
+            kwargs=dict(data.kwargs),
+            access_patterns=dict(data.access_patterns),
         )
 
 
@@ -326,14 +376,29 @@ def _recompute_region(
     location = _tensor_location(tree, region.tensor)
     buf = _tensor_buffer(tree, region.tensor)
     new_ranges: list[tuple[Expr, Expr]] = []
-    for axis_index, (_lo, width) in enumerate(region.ranges):
+    for axis_index, (old_lo, width) in enumerate(region.ranges):
         assert isinstance(width, Const), f"region width must be Const; got {width!r}"
-        dim = axis_map.get(present[axis_index]) if axis_index < len(present) else None
+        if axis_index >= len(present):
+            new_ranges.append((old_lo, width))
+            continue
+        dim = axis_map.get(present[axis_index])
         loops = dim_loops.get(dim, []) if dim is not None else []
         loops = _fit_loops(loops, _axis_capacity(buf, axis_index, location, width.value))
         affine = _tile_space_affine(loops)
-        is_partition = axis_index == 0 and location in ("sbuf", "psum") and width.value == PARTITION_DIM
-        lo = affine if (is_partition or _is_zero(affine)) else Mul(left=affine, right=width)
+        is_partition = axis_index == 0 and location in ("sbuf", "psum")
+        if is_partition and width.value % PARTITION_DIM != 0:
+            raise ValueError(
+                f"{region.tensor}: partition-axis width {width.value} must be a multiple of {PARTITION_DIM}"
+            )
+        partition_tiles = width.value // PARTITION_DIM
+        if _is_zero(affine):
+            lo = affine
+        elif is_partition and partition_tiles == 1:
+            lo = affine
+        elif is_partition:
+            lo = Mul(left=affine, right=Const(value=partition_tiles))
+        else:
+            lo = Mul(left=affine, right=width)
         new_ranges.append((lo, width))
     return BufferRegion(tensor=region.tensor, ranges=tuple(new_ranges))
 

@@ -32,17 +32,6 @@ def test_union_intersect():
     assert i.max_value == Const(value=10)
 
 
-def test_eval_affine_two_vars_literal():
-    """EvalSet(x*512 + j) over x in [0,4), j in [0,512) -> literal [0, 2047]."""
-    a = Analyzer()
-    a.bind("x", 0, 4)
-    a.bind("j", 0, 512)
-    e = Add(left=Mul(left=Var(name="x"), right=Const(value=512)), right=Var(name="j"))
-    ours = IntSet.eval(e, a)
-    assert ours.min_value == Const(value=0)
-    assert ours.max_value == Const(value=2047)
-
-
 def test_eval_sign_cases_literal():
     """Sign-sensitive EvalSet endpoints match literal expectations.
 

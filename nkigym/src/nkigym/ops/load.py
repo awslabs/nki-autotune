@@ -1,11 +1,12 @@
 """HBM → SBUF load op: ``nisa.dma_copy`` + ``load_block`` gadget."""
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import nki.isa as nisa
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import CopyContract, NKIOp, _operand_role
 
 
 class NKILoad(NKIOp):
@@ -22,6 +23,12 @@ class NKILoad(NKIOp):
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_ROLE: ClassVar[str] = "sbuf"
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> CopyContract:
+        """Return the value-preserving load contract."""
+        _ = kwargs
+        return CopyContract(input_operand="src", output_operand="dst")
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` must be HBM-resident (``param``)."""

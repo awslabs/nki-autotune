@@ -84,9 +84,9 @@ Each op allocates and returns its output. Bind the return value to a named local
 | `NKIDMATranspose` | `nkigym.ops.dma_transpose` | src:(P,F) → sbuf:(F,P) | `sbuf_T = NKIDMATranspose()(src=sbuf_a)` — DMA transpose, frees TE |
 | `NKIActivationReduce` | `nkigym.ops.activation_reduce` | data:(P,F) → reduced:(P,) | `reduced = NKIActivationReduce(op=..., reduce_op=...)(data=X)` — returns the per-row reduction vector |
 | `NKIActivation` | `nkigym.ops.activation` | data:(P,F) or (P,) → same shape | `Y = NKIActivation(op=..., scale=?, bias=?)(data=X)` — elementwise |
-| `NKITensorScalar` | `nkigym.ops.tensor_scalar` | data:(P,F), operand0:(P,) → out:(P,F) | `Y = NKITensorScalar(op=...)(data=X, operand0=v)` — per-row vector broadcast along F |
+| `NKITensorScalar` | `nkigym.ops.tensor_scalar` | data:(P,F), operand0:(P,) → out:(P,F) | `Y = NKITensorScalar(op0=...)(data=X, operand0=v)` — per-row vector broadcast along F |
 
-Op-arg vocabulary: `op` ∈ `{square, exp, copy, reciprocal, tanh, rsqrt, sqrt}`; `reduce_op` ∈ `{add, max}`; `NKITensorScalar.op` ∈ `{multiply, add, subtract}`; `NKIActivation.scale` / `NKIActivation.bias` apply per-element pre-activation.
+Op-arg vocabulary: `op` ∈ `{square, exp, copy, reciprocal, tanh, rsqrt, sqrt}`; `reduce_op` ∈ `{add, maximum}`; `NKITensorScalar.op0` ∈ `{multiply, add, subtract}`; `NKIActivation.scale` / `NKIActivation.bias` apply per-element pre-activation.
 
 # Translation procedure
 
@@ -97,7 +97,7 @@ Op-arg vocabulary: `op` ∈ `{square, exp, copy, reciprocal, tanh, rsqrt, sqrt}`
    - Transpose: `psum_T = NKITranspose()(data=sbuf_input)` returns a PSUM tensor; drain it with `sbuf_T = NKITensorCopy()(src=psum_T)`.
    - `NKIActivationReduce` returns its per-row reduction vector `(P,)` directly: `reduced = NKIActivationReduce(op=..., reduce_op=...)(data=X)`. There is no scratch/`reduce_res` operand to author.
    - Fused reduce-then-activation (e.g. rmsnorm's `rsqrt(sum(x²)/F + eps)`): split into two DSL calls. Emit `raw_reduced = NKIActivationReduce(op=<act>, reduce_op=<red>)(data=X)` to get the raw reduction; then feed that into `post_reduced = NKIActivation(op=<post>, scale=<scalar>, bias=<scalar>)(data=raw_reduced)` to apply the post-reduction activation with its affine scale/bias. `NKIActivation` applies `op(data * scale + bias)` per-element on its input; for `rsqrt(reduced/F + eps)`, use `scale=1/F` and `bias=eps`. The post-reduction scale/bias is a SEPARATE `NKIActivation` call.
-   - `X * v[:, None]` with `v` shape `(P,)`: `Y = NKITensorScalar(op="multiply")(data=X, operand0=v)`. Broadcasts along F.
+   - `X * v[:, None]` with `v` shape `(P,)`: `Y = NKITensorScalar(op0="multiply")(data=X, operand0=v)`. Broadcasts along F.
 4. Fix matmul operand shapes. `NKIMatmul` computes `stationary.T @ moving`. For `A @ B`, transpose `A` first using the transpose-then-drain pattern above.
 5. Bind every intermediate to a named local — no chained calls.
 6. Final step: `hbm_out = NKIStore()(src=sbuf_final)` and `return hbm_out`.

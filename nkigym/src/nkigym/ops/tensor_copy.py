@@ -1,10 +1,11 @@
 """SBUF/PSUM → SBUF copy op: maps to ``nisa.tensor_copy``."""
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import CopyContract, NKIOp, _operand_role
 
 
 class NKITensorCopy(NKIOp):
@@ -21,6 +22,12 @@ class NKITensorCopy(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> CopyContract:
+        """Return the value-preserving tensor-copy contract."""
+        _ = kwargs
+        return CopyContract(input_operand="src", output_operand="dst")
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` must be SBUF- or PSUM-resident (drain pattern allows PSUM src)."""

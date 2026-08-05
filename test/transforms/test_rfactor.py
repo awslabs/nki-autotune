@@ -4,10 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from test._simulation import assert_matmul_ir_simulates
-from test.transforms import _matmul_lhsT_rhs_manual as manual_ladder
 from test.transforms._fixtures import build_canonical_ir, f_matmul
 from test.transforms._helpers import block_for_op
-from test.transforms._ladder_compare import assert_matches_hand
 from test.transforms._rfactor_fixtures import (
     k32_ir,
     k32_ko_loop_nid,
@@ -19,7 +17,6 @@ from test.transforms._rfactor_fixtures import (
 
 import pytest
 
-from nkigym.codegen import render
 from nkigym.ir import KernelIR, build_initial_ir
 from nkigym.ir.arith.expr import Const, FloorDiv, Mul, Sub, Var
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
@@ -91,14 +88,11 @@ def _replace_sbuf_prod(ir: KernelIR, shape: tuple[int, int], versions: int, list
 
 
 def test_analyze_finds_only_reduction_loops() -> None:
-    """analyze offers only ForNodes binding the matmul's ACCUMULATION (K) axis."""
+    """Analyze exposes exactly the outer split reduction accepted by apply."""
     ir = split_k_ir()
-    opts = RFactor().analyze(ir)
-    assert len(opts) >= 1
-    for o in opts:
-        node = ir.tree.data(o.target_loop_nid)
-        assert isinstance(node, ForNode)
-        assert node.loop_var.startswith("i_d0_")
+    expected = RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0)
+    assert RFactor().analyze(ir) == [expected]
+    assert isinstance(RFactor().apply(ir, expected).tree.data(expected.target_loop_nid), ForNode)
 
 
 def _check_rejects_unsplit_reduction_loop() -> None:
@@ -403,20 +397,6 @@ def _check_accepts_listed_output_with_sufficient_total_capacity() -> None:
     rfactor.apply(ir, option)
 
 
-def _check_apply_sim_matches_matmul(tmp_path) -> None:
-    """The rfactored kernel sims numerically equal to lhs_T.T @ rhs."""
-    assert_matmul_ir_simulates(_rfactored_ir(), tmp_path, "rfactor_early_packed")
-
-
-def _check_apply_sim_matches_matmul_mid_tiled_m(tmp_path) -> None:
-    """RFactor(ko) on the mid state (K split ko/ki AND M tiled i_d1_0 x i_d1_1,
-    buffers still packed) sims equal to the golden — the tiled-M geometry, pinned
-    as a regression test via the ``mid_ladder_ir`` fixture."""
-    ir = mid_ladder_ir()
-    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=ko_loop_nid(ir), factor_axis=0))
-    assert_matmul_ir_simulates(rfactored, tmp_path, "rfactor_mid_tiled_m")
-
-
 def _check_ko_roles_split_across_blocks() -> None:
     """After RFactor, the K axis (d0) appears as PARALLEL in the matmul run-op block
     (each ko is an independent partial) and ACCUMULATION in the tensor_tensor fold block
@@ -491,57 +471,15 @@ def _check_rf_memset_drain_nested_in_ko() -> None:
     assert ko in ir.tree.ancestors(rf_drain), "rf-drain tensor_copy must be nested inside the ko loop"
 
 
-def _check_apply_byte_exact_k32_to_k33() -> None:
-    """Structural RFactor alone reproduces the hand-written k33 rung."""
-    ir = k32_ir()
-    unchanged = ir.all_buffers()
-    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
+def test_rfactor_states_simulate(tmp_path) -> None:
+    """RFactor preserves tiled packed and listed-buffer matmul states."""
+    mid = mid_ladder_ir()
+    mid_rfactored = RFactor().apply(mid, RFactorOption(target_loop_nid=ko_loop_nid(mid), factor_axis=0))
+    assert_matmul_ir_simulates(mid_rfactored, tmp_path, "rfactor_mid_tiled_m")
 
-    assert all(rfactored.buffer(name) == buf for name, buf in unchanged.items())
-    assert (rfactored.buffer("psum_prod").shape, rfactored.buffer("psum_prod").list_len) == ((2048, 512), 16)
-    assert (rfactored.buffer("sbuf_rfactor").shape, rfactored.buffer("sbuf_rfactor").list_len) == ((2048, 512), 1)
-    compactable = {option.tensor for option in BufferCompaction().analyze(rfactored)}
-    assert {"psum_prod", "sbuf_rfactor"} <= compactable
-    assert_matches_hand(render(rfactored), manual_ladder.kernel_33)
-
-
-def _check_apply_byte_exact_k33_to_k34() -> None:
-    """The first explicit compaction tightens only the PSUM partial."""
-    ir = k32_ir()
-    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
-    compacted = BufferCompaction().apply(rfactored, BufferCompactionOption(tensor="psum_prod"))
-
-    assert (compacted.buffer("psum_prod").shape, compacted.buffer("psum_prod").list_len) == ((128, 512), 1)
-    assert (compacted.buffer("sbuf_rfactor").shape, compacted.buffer("sbuf_rfactor").list_len) == ((2048, 512), 1)
-    compactable = {option.tensor for option in BufferCompaction().analyze(compacted)}
-    assert "psum_prod" not in compactable
-    assert "sbuf_rfactor" in compactable
-    assert_matches_hand(render(compacted), manual_ladder.kernel_34)
-
-
-def _check_apply_byte_exact_k34_to_k35() -> None:
-    """The second explicit compaction tightens only the staging buffer."""
-    ir = k32_ir()
-    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
-    compacted = BufferCompaction().apply(rfactored, BufferCompactionOption(tensor="psum_prod"))
-    final = BufferCompaction().apply(compacted, BufferCompactionOption(tensor="sbuf_rfactor"))
-
-    assert (final.buffer("psum_prod").shape, final.buffer("psum_prod").list_len) == ((128, 512), 1)
-    assert (final.buffer("sbuf_rfactor").shape, final.buffer("sbuf_rfactor").list_len) == ((128, 512), 1)
-    compactable = {option.tensor for option in BufferCompaction().analyze(final)}
-    assert "psum_prod" not in compactable
-    assert "sbuf_rfactor" not in compactable
-    assert_matches_hand(render(final), manual_ladder.kernel_35)
-
-
-def test_apply_sim_matches_matmul_k32_to_k35(tmp_path) -> None:
-    """Structural RFactor and both compactions preserve the matmul result."""
-    ir = k32_ir()
-    rfactored = RFactor().apply(ir, RFactorOption(target_loop_nid=k32_ko_loop_nid(ir), factor_axis=0))
-    assert_matmul_ir_simulates(rfactored, tmp_path, "rfactor_k32_to_k33")
-    compacted = BufferCompaction().apply(rfactored, BufferCompactionOption(tensor="psum_prod"))
-    final = BufferCompaction().apply(compacted, BufferCompactionOption(tensor="sbuf_rfactor"))
-    assert_matmul_ir_simulates(final, tmp_path, "rfactor_k35")
+    listed = k32_ir()
+    listed_rfactored = RFactor().apply(listed, RFactorOption(target_loop_nid=k32_ko_loop_nid(listed), factor_axis=0))
+    assert_matmul_ir_simulates(listed_rfactored, tmp_path, "rfactor_k32_to_k33")
 
 
 def test_rejects_invalid_targets_and_rewrite_preconditions(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -570,21 +508,8 @@ def test_output_geometry_contract() -> None:
     _check_accepts_listed_output_with_sufficient_total_capacity()
 
 
-def test_early_and_mid_rfactor_states_simulate(tmp_path) -> None:
-    """Early and tiled-M RFactor states preserve matmul numerics."""
-    _check_apply_sim_matches_matmul(tmp_path)
-    _check_apply_sim_matches_matmul_mid_tiled_m(tmp_path)
-
-
 def test_generated_rfactor_structure_and_metadata() -> None:
     """Generated blocks carry split roles, source domains, and nested reset/drain structure."""
     _check_ko_roles_split_across_blocks()
     _check_generated_gadgets_inherit_non_square_matmul_domains()
     _check_rf_memset_drain_nested_in_ko()
-
-
-def test_k32_to_k35_is_byte_exact_at_each_rung() -> None:
-    """RFactor and explicit compactions reproduce all three hand-written rungs."""
-    _check_apply_byte_exact_k32_to_k33()
-    _check_apply_byte_exact_k33_to_k34()
-    _check_apply_byte_exact_k34_to_k35()

@@ -52,3 +52,11 @@ def test_buffer_region_disjointness_cases() -> None:
         tensor="p", ranges=((Var(name="i_m"), Const(value=128)), (Const(value=512), Const(value=512)))
     )
     assert regions_disjoint(partition_first, partition_second, psum, psum, {"i_m": 16})
+
+    first_batch = BufferRegion(
+        tensor="p", ranges=((Const(value=0), Const(value=512)), (Const(value=0), Const(value=512)))
+    )
+    second_batch = BufferRegion(
+        tensor="p", ranges=((Const(value=4), Const(value=512)), (Const(value=0), Const(value=512)))
+    )
+    assert regions_disjoint(first_batch, second_batch, psum, psum, {})

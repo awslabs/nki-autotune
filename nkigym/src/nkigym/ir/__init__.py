@@ -25,6 +25,7 @@ from nkigym.ir.dependency import Dependency
 from nkigym.ir.dimension_analysis import TensorDims
 from nkigym.ir.ir import KernelIR, build_initial_ir
 from nkigym.ir.tree import (
+    AccessPattern,
     BlockNode,
     Buffer,
     BufferRegion,
@@ -37,6 +38,7 @@ from nkigym.ir.tree import (
 )
 
 __all__ = [
+    "AccessPattern",
     "Add",
     "BlockNode",
     "Buffer",

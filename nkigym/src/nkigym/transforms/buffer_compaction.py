@@ -20,6 +20,7 @@ from nkigym.ir.arith.expr import Expr
 from nkigym.ir.buffer_placement import place_buffers
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ISANode, KernelTree
+from nkigym.transforms._access_pattern import tensor_has_access_pattern
 from nkigym.transforms._normalize import normalize_selected_tensor_regions, normalize_tensor_regions
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
@@ -43,7 +44,11 @@ class BufferCompaction(Transform[BufferCompactionOption]):
 
     def analyze(self, ir: KernelIR) -> list[BufferCompactionOption]:
         """Offer every sbuf/psum buffer whose compacted form differs from its current one."""
-        tensors = tuple(name for name, buf in ir.all_buffers().items() if buf.location in ("sbuf", "psum"))
+        tensors = tuple(
+            name
+            for name, buf in ir.all_buffers().items()
+            if buf.location in ("sbuf", "psum") and not tensor_has_access_pattern(ir.tree, name)
+        )
         changed = self._would_change_many(ir, tensors)
         return [BufferCompactionOption(tensor=tensor) for tensor in tensors if tensor in changed]
 
@@ -63,6 +68,10 @@ class BufferCompaction(Transform[BufferCompactionOption]):
             raise TransformLegalityError(f"BufferCompaction: no buffer named {option.tensor!r}")
         if buffers[option.tensor].location == "shared_hbm":
             raise TransformLegalityError(f"BufferCompaction: {option.tensor} is shared_hbm (nothing to compact)")
+        if tensor_has_access_pattern(ir.tree, option.tensor):
+            raise TransformLegalityError(
+                f"BufferCompaction: {option.tensor} participates in an explicit access pattern"
+            )
         if not self._would_change(ir, option.tensor):
             raise TransformLegalityError(f"BufferCompaction: {option.tensor} is already compact (no-op)")
 

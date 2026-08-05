@@ -24,18 +24,6 @@ def _load_module_from_path(path: str):
     return module
 
 
-def test_render_canonical_matmul_emits_expected_structure():
-    """The rendered canonical kernel has the expected top-level shape."""
-    ir = build_canonical_ir()
-    src = render(ir)
-    assert "@nki.jit" in src
-    assert "def nki_f_matmul(lhs_T, rhs):" in src
-    assert "psum_prod = [nl.ndarray((128, 16, 2048), dtype=nl.float32, buffer=nl.psum) for _ in range(1)]" in src
-    assert "nisa.memset" in src
-    assert "nisa.nc_matmul" in src
-    assert "return hbm_out" in src.strip().splitlines()[-1]
-
-
 def test_render_nc_transpose_uses_data_and_preserves_psum_dtype(tmp_path):
     """Rendered transpose matches the NKI signature and dtype contract."""
     specs = {"lhs": ((128, 128), "bfloat16"), "rhs": ((128, 512), "bfloat16")}

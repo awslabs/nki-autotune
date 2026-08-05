@@ -21,6 +21,8 @@ def test_physical_shapes_include_tiles_versions_and_hbm_rules() -> None:
     versioned_sbuf = Buffer(name="sbuf_x", shape=(256, 512), dtype="bfloat16", location="sbuf", versions=2)
     assert versioned_psum.physical_shape() == (128, 2, 2048)
     assert versioned_sbuf.physical_shape() == (128, 4, 512)
+    vector = Buffer(name="row_state", shape=(256,), dtype="float32", location="sbuf")
+    assert vector.physical_shape() == (128, 2, 1)
     versioned_hbm = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm", versions=2)
     assert versioned_hbm.physical_shape() == (2048, 2048)
 
@@ -38,7 +40,7 @@ def test_physical_dtype_honors_storage_override() -> None:
 
 
 def test_list_length_refactorizes_the_tile_dimension() -> None:
-    """List length defaults to one and otherwise divides the on-chip tile dimension."""
+    """List length divides logical tiles while each list carries every version."""
     packed = Buffer(name="sbuf_lhs_T", shape=(2048, 2048), dtype="bfloat16", location="sbuf")
     assert packed.list_len == 1
     assert packed.physical_shape() == (128, 16, 2048)
@@ -49,13 +51,21 @@ def test_list_length_refactorizes_the_tile_dimension() -> None:
     assert listed.per_tile_physical_shape() == (128, 1, 512)
     identity = Buffer(name="p", shape=(2048, 2048), dtype="float32", location="psum")
     assert identity.per_tile_physical_shape() == identity.physical_shape()
+    versioned_list = Buffer(
+        name="versioned", shape=(2048, 512), dtype="bfloat16", location="sbuf", versions=2, list_len=8
+    )
+    assert versioned_list.logical_tile_count() == 16
+    assert versioned_list.tiles_per_list() == 2
+    assert versioned_list.physical_shape() == (128, 32, 512)
+    assert versioned_list.per_tile_physical_shape() == (128, 4, 512)
 
 
 def test_invalid_list_geometries_raise() -> None:
-    """HBM buffers cannot split tiles and versions cannot combine with lists."""
+    """HBM cannot split, and list length must divide logical rather than versioned tiles."""
     hbm = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm", list_len=4)
     with pytest.raises(AssertionError):
         hbm.per_tile_physical_shape()
-    versioned_list = Buffer(name="s", shape=(2048, 512), dtype="bfloat16", location="sbuf", versions=2, list_len=16)
+    versioned_list = Buffer(name="s", shape=(1024, 512), dtype="bfloat16", location="sbuf", versions=2, list_len=16)
+    assert versioned_list.physical_shape()[1] == 16
     with pytest.raises(AssertionError):
         versioned_list.per_tile_physical_shape()

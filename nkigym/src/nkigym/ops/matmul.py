@@ -4,11 +4,12 @@
 accumulation regardless of input dtype.
 """
 
+from collections.abc import Mapping
 from typing import Any, ClassVar, Literal
 
 import numpy as np
 
-from nkigym.ops.base import AxisRole, NKIOp, ReduceCombinator, _operand_role
+from nkigym.ops.base import AxisRole, BilinearReductionContract, NKIOp, ReduceCombinator, _operand_role
 
 
 class NKIMatmul(NKIOp):
@@ -30,6 +31,35 @@ class NKIMatmul(NKIOp):
     OUTPUT_ROLE: ClassVar[str] = "psum"
     OUTPUT_LOCATION: ClassVar[str] = "psum"
     OUTPUT_STORAGE_DTYPE: ClassVar[str | None] = "float32"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> BilinearReductionContract:
+        """Return the matrix product's bilinear sum-reduction contract."""
+        _ = kwargs
+        return BilinearReductionContract(
+            left_operand="stationary",
+            right_operand="moving",
+            output_operand="dst",
+            reduction_axis="K",
+            combinator=ReduceCombinator(combiner="add", identity=0.0),
+        )
+
+    @classmethod
+    def first_write_overwrites(cls, operand: str, kwargs: Mapping[str, Any]) -> bool:
+        """Return the configured PSUM first-write behavior."""
+        return operand == "dst" and kwargs.get("accumulate") is not True
+
+    @classmethod
+    def rmw_operands(cls, kwargs: Mapping[str, Any]) -> frozenset[str]:
+        """Treat an explicit first matmul as a write-only destination."""
+        return frozenset() if kwargs.get("accumulate") is False else cls.RMW_OPERANDS
+
+    @classmethod
+    def with_first_write_overwrite(cls, operand: str, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        """Return an explicit first-matmul configuration."""
+        if operand != "dst" or kwargs.get("accumulate") is True:
+            raise ValueError(f"NKIMatmul.{operand} does not support first-write overwrite")
+        return {**kwargs, "accumulate": False}
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``stationary`` and ``moving`` must be SBUF-resident."""

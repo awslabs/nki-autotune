@@ -19,6 +19,6 @@ def test_run_applies_supported_ops_elementwise() -> None:
 def test_operation_metadata_matches_isa() -> None:
     """Operand roles, axes, and renderer name match the ISA."""
     assert NKITensorTensor.OPERAND_AXES == {"data1": ("P", "F"), "data2": ("P", "F"), "dst": ("P", "F")}
-    assert NKITensorTensor.RMW_OPERANDS == frozenset({"data1"})
-    assert NKITensorTensor.INPUT_OPERANDS == frozenset({"data2"})
+    assert NKITensorTensor.RMW_OPERANDS == frozenset()
+    assert NKITensorTensor.INPUT_OPERANDS == frozenset({"data1", "data2"})
     assert NKITensorTensor.NAME == "tensor_tensor"

@@ -9,7 +9,10 @@ out-edge list to keep sibling order stable.
 
 from __future__ import annotations
 
-from nkigym.ir.tree import KernelTree
+from dataclasses import replace
+
+from nkigym.ir import KernelIR
+from nkigym.ir.tree import BlockNode, KernelTree
 
 
 def _replace_in_parent_children(
@@ -63,4 +66,42 @@ def _block_local_descendants(tree: KernelTree, block_nid: int) -> list[int]:
     return result
 
 
-__all__ = ["_replace_in_parent_children", "_block_local_descendants"]
+def invalidate_stale_software_pipelines(ir: KernelIR) -> None:
+    """Drop pipeline metadata whose staged child list changed.
+
+    Software-pipeline stages are positional labels for one loop's exact direct
+    children. Structural rewrites may remove, replace, reorder, or reparent
+    those children. Such a rewrite invalidates the annotation and every buffer
+    version owned only by that annotation.
+    """
+    active_versioned: set[str] = set()
+    for block_nid in list(ir.tree.blocks()):
+        block = ir.tree.block(block_nid)
+        annotation = block.annotations.get("software_pipeline")
+        if annotation is None:
+            continue
+        loop_nid = annotation["loop_nid"]
+        expected_children = annotation.get("children")
+        stale = loop_nid not in ir.tree.graph
+        if not stale and annotation.get("loop") is not None:
+            stale = ir.tree.data(loop_nid) != annotation["loop"]
+        if not stale and expected_children is not None:
+            stale = tuple(ir.tree.children(loop_nid)) != tuple(expected_children)
+        if stale:
+            annotations = dict(block.annotations)
+            del annotations["software_pipeline"]
+            ir.tree.graph.nodes[block_nid]["data"] = replace(block, annotations=annotations)
+        else:
+            active_versioned.update(annotation["versioned_buffers"])
+
+    for block_nid in ir.tree.blocks():
+        block = ir.tree.block(block_nid)
+        allocations = tuple(
+            replace(buffer, versions=1) if buffer.versions > 1 and buffer.name not in active_versioned else buffer
+            for buffer in block.alloc_buffers
+        )
+        if allocations != block.alloc_buffers:
+            ir.tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=allocations)
+
+
+__all__ = ["_block_local_descendants", "_replace_in_parent_children", "invalidate_stale_software_pipelines"]

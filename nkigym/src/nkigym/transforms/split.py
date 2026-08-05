@@ -10,9 +10,12 @@ from nkigym.ir.arith.analyzer import Analyzer
 from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
+from nkigym.ops.base import AxisRole
+from nkigym.transforms._access_pattern import subtree_has_access_patterns
 from nkigym.transforms._normalize import normalize_block
+from nkigym.transforms._rfactor_slot import SlotRFactor
 from nkigym.transforms._tile_region import retile_region
-from nkigym.transforms._tree_ops import _replace_in_parent_children
+from nkigym.transforms._tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 _MAX_SPLIT_PARTS = 3
@@ -59,13 +62,16 @@ class Split(Transform[SplitOption]):
                     concrete = iv.axis
                     """Tile width currently bound on the leaf (max_tile or full extent)."""
                     current = _current_tensorize_width(data, block, concrete)
-                    if current is None or current < 2:
+                    if current is None or current < 2 or self._is_factored_slot_axis(ir, nid, concrete):
                         continue
                     floor = _min_tile_floor(data, block, concrete)
                     for factors in _factorizations(current):
                         if floor is not None and factors[-1] < floor:
                             continue
-                        options.append(SplitOption(target_nid=nid, factors=factors, target_axis=concrete))
+                        option = SplitOption(target_nid=nid, factors=factors, target_axis=concrete)
+                        if self._requires_slot_rfactor(ir, option) and len(factors) != 2:
+                            continue
+                        options.append(option)
         return options
 
     def apply(self, ir: KernelIR, option: SplitOption) -> KernelIR:
@@ -74,7 +80,10 @@ class Split(Transform[SplitOption]):
         if option.target_axis is None:
             self._do_outer_trip(new_ir, option)
         else:
-            self._do_tensorize(new_ir, option)
+            split_loop_nid = self._do_tensorize(new_ir, option)
+            if self._requires_slot_rfactor(new_ir, option):
+                SlotRFactor().emit(new_ir, split_loop_nid)
+        invalidate_stale_software_pipelines(new_ir)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
@@ -84,6 +93,8 @@ class Split(Transform[SplitOption]):
         if any(f < 2 for f in option.factors):
             raise TransformLegalityError(f"Split.factors entries must be >= 2; got {option.factors}")
         target = _resolve(ir.tree, option.target_nid)
+        if subtree_has_access_patterns(ir.tree, option.target_nid):
+            raise TransformLegalityError("Split cannot rewrite a loop or ISA operand with an explicit access pattern")
         if option.target_axis is None:
             if not isinstance(target, ForNode):
                 raise TransformLegalityError(
@@ -119,6 +130,14 @@ class Split(Transform[SplitOption]):
                     f"Split.target_axis={option.target_axis!r}: innermost tile {option.factors[-1]} "
                     f"< MIN_TILE_SIZE {floor}"
                 )
+            if self._is_factored_slot_axis(ir, option.target_nid, option.target_axis):
+                raise TransformLegalityError(
+                    "a slot reduction axis cannot be split again after its partial results have been factored"
+                )
+            if self._requires_slot_rfactor(ir, option) and len(option.factors) != 2:
+                raise TransformLegalityError(
+                    "a slot reduction requires one outer split factor so Split and RFactor can be applied atomically"
+                )
 
     def _do_outer_trip(self, ir: KernelIR, option: SplitOption) -> None:
         """Outer-trip Split: replace the target ForNode with a chain of factor ForNodes.
@@ -143,7 +162,7 @@ class Split(Transform[SplitOption]):
 
         normalize_block(ir.tree, block_nid)
 
-    def _do_tensorize(self, ir: KernelIR, option: SplitOption) -> None:
+    def _do_tensorize(self, ir: KernelIR, option: SplitOption) -> int:
         """Tensorize Split: insert ``factors[:-1]`` loops above the leaf, set the access width.
 
         The new loops carry temporary names and the affected-axis access
@@ -222,6 +241,34 @@ class Split(Transform[SplitOption]):
         ir.tree.graph.nodes[block_nid]["data"] = new_block
 
         normalize_block(ir.tree, block_nid)
+        return top_nid
+
+    def _requires_slot_rfactor(self, ir: KernelIR, option: SplitOption) -> bool:
+        """Return whether this tensorize split must immediately close partial slots."""
+        result = False
+        if option.target_axis is not None and option.target_nid in ir.tree.graph:
+            target = ir.tree.data(option.target_nid)
+            if isinstance(target, ISANode) and target.op_cls.RFACTOR_RECIPE == "slot":
+                _block_nid, block = _find_enclosing_block(ir.tree, option.target_nid)
+                roles = [iter_var.role for iter_var in block.iter_vars if iter_var.axis == option.target_axis]
+                result = roles == [AxisRole.ACCUMULATION]
+        return result
+
+    def _is_factored_slot_axis(self, ir: KernelIR, target_nid: int, target_axis: str) -> bool:
+        """Return whether a slot reduction axis already writes independent partials."""
+        result = False
+        if target_nid in ir.tree.graph:
+            target = ir.tree.data(target_nid)
+            if isinstance(target, ISANode) and target.op_cls.RFACTOR_RECIPE == "slot":
+                _block_nid, block = _find_enclosing_block(ir.tree, target_nid)
+                abstract_axes = [abstract for abstract, concrete in block.axis_map.items() if concrete == target_axis]
+                roles = [iter_var.role for iter_var in block.iter_vars if iter_var.axis == target_axis]
+                result = (
+                    len(abstract_axes) == 1
+                    and target.op_cls.AXIS_ROLES.get(abstract_axes[0]) == AxisRole.ACCUMULATION
+                    and roles == [AxisRole.PARALLEL]
+                )
+        return result
 
 
 def _resolve(tree: KernelTree, nid: int):

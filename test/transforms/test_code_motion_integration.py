@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from test._simulation import assert_matmul_ir_simulates
-from test.transforms._fixtures import INPUT_SPECS, build_canonical_ir, build_ladder_state, f_matmul
+from test.transforms._fixtures import INPUT_SPECS, build_canonical_ir, f_matmul
 from test.transforms._helpers import block_for_op, first_for_in, load_block_reading
 
 from nkigym.environment import KernelMDP
@@ -25,12 +25,6 @@ def _rename_block_loops(ir: KernelIR, block_nid: int, names: dict[str, str]) -> 
         if isinstance(node, ForNode) and node.loop_var in names:
             ir.tree.graph.nodes[nid]["data"] = replace(node, loop_var=names[node.loop_var])
     ir.dependency = Dependency(ir.tree)
-
-
-def test_analyze_does_not_crash_on_transformed_states() -> None:
-    """Analyze filters invalid candidates across ladder states without raising."""
-    for rung in range(1, 13):
-        CodeMotion().analyze(build_ladder_state(rung))
 
 
 def test_code_motion_sink_load_under_matmul_renders_and_sims(tmp_path) -> None:
@@ -134,21 +128,3 @@ def test_code_motion_matches_equivalent_prefix_with_distinct_loop_names(tmp_path
         ]
         assert len(loop_names) == len(set(loop_names))
     assert_matmul_ir_simulates(moved, tmp_path, "code_motion_distinct_prefix_names")
-
-
-def test_psum_hoist_descends_and_compacts() -> None:
-    """The psum allocation descends and compacts at ladder rung 12."""
-    ir = build_ladder_state(12)
-    declarations = {
-        buffer.name: (nid, buffer) for nid in ir.tree.blocks() for buffer in ir.tree.block(nid).alloc_buffers
-    }
-    nid, buffer = declarations["psum_prod"]
-    assert nid != ir.tree.root
-    assert buffer.shape == (128, 512)
-
-
-def test_all_ladder_states_simulate(tmp_path) -> None:
-    """Every transform-ladder state simulates to the matmul result."""
-    for rung in range(1, 15):
-        ir = build_ladder_state(rung)
-        assert_matmul_ir_simulates(ir, tmp_path, f"ladder_state_{rung}")

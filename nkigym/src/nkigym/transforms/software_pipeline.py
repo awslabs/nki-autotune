@@ -14,7 +14,10 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
+from nkigym.transforms._access_pattern import tensor_has_access_pattern
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+
+_EXHAUSTIVE_STAGE_CHILD_LIMIT = 8
 
 
 @dataclass(frozen=True)
@@ -37,7 +40,7 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
     """Stage-driven accumulator multi-buffer (Tier B)."""
 
     def analyze(self, ir: KernelIR) -> list[SoftwarePipelineOption]:
-        """Enumerate non-decreasing stage labelings for every pipelineable loop."""
+        """Enumerate bounded non-decreasing stage labelings for pipelineable loops."""
         options: list[SoftwarePipelineOption] = []
         for nid in ir.tree.preorder():
             if not isinstance(ir.tree.data(nid), ForNode):
@@ -62,6 +65,8 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         parent = self._parent_block(new_ir, option.loop_nid)
         new_ir.tree.block(parent).annotations["software_pipeline"] = {
             "loop_nid": option.loop_nid,
+            "loop": new_ir.tree.loop(option.loop_nid),
+            "children": tuple(new_children),
             "stages": option.stages,
             "order": option.order,
             "versioned_buffers": versioned_buffers,
@@ -70,19 +75,27 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         return new_ir
 
     def _nondecreasing_labelings(self, n: int) -> list[tuple[int, ...]]:
-        """Contiguous non-decreasing stage labelings of n blocks: stage 0
-        present, no stage gap, excluding the all-zero single-stage no-op."""
+        """Return useful contiguous stage labelings without large-body explosion.
+
+        Small bodies retain every labeling. Larger bodies offer every contiguous
+        two-stage and three-stage partition, keeping option count quadratic while
+        avoiding pathological version counts.
+        """
         out: list[tuple[int, ...]] = []
-        for combo in itertools.product(range(n), repeat=n):
-            if combo[0] != 0:
-                continue
-            if any(combo[i + 1] < combo[i] for i in range(n - 1)):
-                continue
-            if any(combo[i + 1] - combo[i] > 1 for i in range(n - 1)):
-                continue
-            if max(combo) == 0:
-                continue
-            out.append(combo)
+        if 1 < n <= _EXHAUSTIVE_STAGE_CHILD_LIMIT:
+            for advances in itertools.product((0, 1), repeat=n - 1):
+                stage = 0
+                labeling = [stage]
+                for advance in advances:
+                    stage += advance
+                    labeling.append(stage)
+                if stage > 0:
+                    out.append(tuple(labeling))
+        elif n > _EXHAUSTIVE_STAGE_CHILD_LIMIT:
+            for boundary in range(n - 1, 0, -1):
+                out.append((0,) * boundary + (1,) * (n - boundary))
+            for first, second in itertools.combinations(range(1, n), 2):
+                out.append((0,) * first + (1,) * (second - first) + (2,) * (n - second))
         return out
 
     def _unit_leaves(self, ir: KernelIR, unit_nid: int) -> list[int]:
@@ -105,6 +118,13 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         """TVM's two graph rules over the dependency DAG, plus order-permutation."""
         result = True
         if len(option.stages) != len(children) or len(option.order) != len(children):
+            result = False
+        elif (
+            not option.stages
+            or min(option.stages) != 0
+            or max(option.stages) == 0
+            or set(option.stages) != set(range(max(option.stages) + 1))
+        ):
             result = False
         elif sorted(option.order) != list(range(len(children))):
             result = False
@@ -129,11 +149,25 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
             if any(ir.buffer(name).versions > 1 for name in self._touched_tensors(ir, children)):
                 result = False
             version_counts = self._version_counts(ir, option, children)
-            if any(versions > 1 and ir.buffer(name).list_len > 1 for name, versions in version_counts.items()):
+            if not self._versioned_buffer_touches_are_local(ir, children, version_counts):
+                result = False
+            if any(
+                versions > 1 and tensor_has_access_pattern(ir.tree, name) for name, versions in version_counts.items()
+            ):
                 result = False
             if not self._version_accesses_are_aligned(ir, option, children, version_counts):
                 result = False
         return result
+
+    def _versioned_buffer_touches_are_local(
+        self, ir: KernelIR, children: list[int], version_counts: dict[str, int]
+    ) -> bool:
+        """Return whether every versioned intermediate is private to the pipeline."""
+        pipeline_leaves = {leaf for child in children for leaf in self._unit_leaves(ir, child)}
+        return all(
+            versions <= 1 or set(ir.dependency.touches_by_tensor.get(name, ())).issubset(pipeline_leaves)
+            for name, versions in version_counts.items()
+        )
 
     def _version_accesses_are_aligned(
         self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int], version_counts: dict[str, int]

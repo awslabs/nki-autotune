@@ -22,33 +22,28 @@ pre-commit install
 
 ## Examples
 
-The search examples provide one agentic-search driver per workload:
-
-- `examples/matmul_lhsT_rhs_agentic_search.py`
-- `examples/matmul_lhs_rhs_agentic_search.py`
-
-The transpose-layout demo profiles two fixed transform traces on the same
-constructed skewed matmul. The baseline uses `CodeMotion`,
-`BufferCompaction`, and `BufferLayout`. The transpose trace uses
-`TransposeThroughLoad`, inserts a concrete transpose pair,
-`TransposeThroughMatmul`, and `TransposeThroughTensorCopy`. There is no model
-or transform search:
+Each standalone demo defines one `f_nkigym` graph and a fixed sequence of
+transform options. It dumps and CPU-verifies every intermediate kernel. The
+online-fusion attention demo also profiles every state and must run on a Trn2
+host:
 
 ```bash
 PYTHONPATH=.:nkigym/src:autotune/src \
-  python examples/transpose_layout_demo.py \
-  --cache /home/weittang/workplace/cache/transpose-layout-demo
+  python examples/online_fusion_attention.py \
+  --cache /tmp/online-fusion-attention
+
+PYTHONPATH=.:nkigym/src:autotune/src \
+  python examples/matmul_lhsT_rhs.py \
+  --cache /tmp/matmul-lhsT-rhs
+
+PYTHONPATH=.:nkigym/src:autotune/src \
+  python examples/matmul_lhs_rhs.py \
+  --cache /tmp/matmul-lhs-rhs
 ```
 
-The generated kernels and profiles are written under `without_transpose/` and
-`with_transpose/`. Their comparison is written to
-`/home/weittang/workplace/cache/transpose-layout-demo/demonstration.json`.
-
-The explicit manual ladders and transform-driven comparisons are test fixtures
-under `test/transforms/` and run with `pytest test/transforms/test_manual_ladders.py`.
-The skewed matmul transpose rewrites are covered by
-`test/transforms/test_transpose_integration.py`. Deterministic random-transform
-regression coverage lives in `test/transforms/test_random_rollout.py`.
+Add `--profile` to either matmul command on a Trn2 host to compile and measure
+every state. Kernels and accuracy results are stored under `kernels/`; MFU
+results are stored under `mfu/`.
 
 ## Security
 

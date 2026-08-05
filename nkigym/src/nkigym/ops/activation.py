@@ -11,11 +11,13 @@ The underlying gadget ``activation_block`` is shared with
 ``post_op`` phase emits after the F loop closes.
 """
 
+from collections.abc import Mapping
+from numbers import Real
 from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
 
 _ACT_FNS: dict[str, Any] = {
     "square": np.square,
@@ -43,17 +45,36 @@ class NKIActivation(NKIOp):
     """
 
     NAME: ClassVar[str] = "activation"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "dst": ("P", "F")}
-    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data"})
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "bias": ("P",), "dst": ("P", "F")}
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "bias"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {
+        "data": frozenset({"sbuf", "psum"}),
+        "bias": frozenset({"sbuf"}),
+    }
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PointwiseContract:
+        """Return the configured unary pointwise operation."""
+        return PointwiseContract(
+            operator=str(kwargs["op"]),
+            input_operands=("data",),
+            output_operand="dst",
+            scale=float(kwargs.get("scale", 1.0)),
+            bias=float(kwargs["bias"]) if isinstance(kwargs.get("bias"), Real) else 0.0,
+            bias_operand="bias",
+        )
+
     def _check_roles(self, **kwargs: Any) -> None:
-        """``data`` must be SBUF-resident."""
+        """``data`` must be on-chip and a tensor bias must reside in SBUF."""
         role = _operand_role(kwargs["data"])
-        if role is not None and role != "sbuf":
-            raise TypeError(f"NKIActivation(data=<role={role}>) expects sbuf")
+        if role is not None and role not in {"sbuf", "psum"}:
+            raise TypeError(f"NKIActivation(data=<role={role}>) expects sbuf or psum")
+        bias_role = _operand_role(kwargs.get("bias"))
+        if bias_role is not None and bias_role != "sbuf":
+            raise TypeError(f"NKIActivation(bias=<role={bias_role}>) expects sbuf")
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: allocate and return ``op(data * scale + bias)``."""
@@ -61,4 +82,6 @@ class NKIActivation(NKIOp):
         op_name: str = kwargs["op"]
         scale = kwargs.get("scale", 1.0)
         bias = kwargs.get("bias", 0.0)
+        if isinstance(bias, np.ndarray) and data.ndim == bias.ndim + 1:
+            bias = bias[..., np.newaxis]
         return _ACT_FNS[op_name](data.astype(np.float32) * scale + bias)

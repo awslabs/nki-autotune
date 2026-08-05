@@ -10,9 +10,10 @@ from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Expr, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
+from nkigym.transforms._access_pattern import subtree_has_access_patterns
 from nkigym.transforms._normalize import _dim_from_loopvar, normalize_block
 from nkigym.transforms._tile_region import retile_region
-from nkigym.transforms._tree_ops import _replace_in_parent_children
+from nkigym.transforms._tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 from nkigym.transforms.split import _current_tensorize_width
 
@@ -69,6 +70,7 @@ class Fuse(Transform[FuseOption]):
             self._do_outer_trip(new_ir, option)
         else:
             self._do_tensorize(new_ir, option)
+        invalidate_stale_software_pipelines(new_ir)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
@@ -78,6 +80,8 @@ class Fuse(Transform[FuseOption]):
         for nid in option.target_nids:
             if nid not in ir.tree.graph:
                 raise TransformLegalityError(f"Fuse.target_nids contains unknown nid {nid}")
+        if subtree_has_access_patterns(ir.tree, option.target_nids[0]):
+            raise TransformLegalityError("Fuse cannot rewrite a loop or ISA operand with an explicit access pattern")
         nodes = [ir.tree.data(nid) for nid in option.target_nids]
         if option.target_axis is None:
             if not all(isinstance(n, ForNode) for n in nodes):

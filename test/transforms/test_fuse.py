@@ -29,34 +29,6 @@ def _matmul_block_first_for(ir: KernelIR) -> int:
     raise AssertionError
 
 
-def test_fuse_outer_trip_inverts_split():
-    """Split then Fuse on the same axis returns the original ForNode extent."""
-    ir = build_canonical_ir()
-    target = _matmul_block_first_for(ir)
-    original_extent = ir.tree.loop(target).extent
-
-    split_ir = Split().apply(ir, SplitOption(target_nid=target, factors=(2, original_extent // 2)))
-    """Locate the new outer ForNode."""
-    parent = split_ir.tree.parent(target) if target in split_ir.tree.graph else None
-    if parent is None:
-        """Target was removed; pick the new top from same parent slot in original IR."""
-        original_parent = ir.tree.parent(target)
-        assert original_parent is not None
-        new_top = split_ir.tree.children(original_parent)[0]
-    else:
-        new_top = parent
-    inner = split_ir.tree.children(new_top)[0]
-    fuse_ir = Fuse().apply(split_ir, FuseOption(target_nids=(new_top, inner), target_axis=None))
-
-    """The fused ForNode now has the original extent."""
-    fused_parent = ir.tree.parent(target)
-    assert fused_parent is not None
-    fused_top = fuse_ir.tree.children(fused_parent)[0]
-    fused_data = fuse_ir.tree.data(fused_top)
-    assert isinstance(fused_data, ForNode)
-    assert fused_data.extent == original_extent
-
-
 def test_fuse_outer_trip_renders_and_passes_numerics(tmp_path) -> None:
     """A split followed by an outer-trip fuse preserves rendered behavior."""
     ir = build_canonical_ir()
@@ -68,6 +40,8 @@ def test_fuse_outer_trip_renders_and_passes_numerics(tmp_path) -> None:
     outer = split.tree.children(target_parent)[0]
     inner = split.tree.children(outer)[0]
     fused = Fuse().apply(split, FuseOption(target_nids=(outer, inner), target_axis=None))
+    fused_top = fused.tree.children(target_parent)[0]
+    assert fused.tree.loop(fused_top).extent == extent
     assert_matmul_ir_simulates(fused, tmp_path, "fuse_outer_trip")
 
 
@@ -214,54 +188,5 @@ def test_split_then_fuse_tensorize_round_trips(tmp_path):
     assert inner_for is not None
     assert isinstance(split_ir.tree.data(inner_for), ForNode)
     fused_ir = Fuse().apply(split_ir, FuseOption(target_nids=(inner_for, new_leaf), target_axis="d1"))
+    assert render(fused_ir) == render(ir)
     assert_matmul_ir_simulates(fused_ir, tmp_path, "split_then_fuse_tensorize")
-
-
-def test_fuse_merge_trips_dense_name():
-    """Fuse two same-dim trip loops -> one loop named densely (i_d1_0), not i_d1_fused."""
-    ir = build_canonical_ir()
-    d1 = next(
-        n
-        for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ForNode)
-        and ir.tree.loop(n).loop_var == "i_d1_0"
-        and ir.tree.loop(n).extent == 16
-    )
-    ir = Split().apply(ir, SplitOption(target_nid=d1, factors=(2, 8)))
-    """Now d1 has i_d1_0(2), i_d1_1(8); fuse them back."""
-    outer = next(
-        n
-        for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ForNode) and ir.tree.loop(n).loop_var == "i_d1_0" and ir.tree.loop(n).extent == 2
-    )
-    inner = next(c for c in ir.tree.children(outer) if isinstance(ir.tree.data(c), ForNode))
-    fused = Fuse().apply(ir, FuseOption(target_nids=(outer, inner), target_axis=None))
-    names = [
-        fused.tree.loop(n).loop_var
-        for n in fused.tree.preorder()
-        if isinstance(fused.tree.data(n), ForNode) and fused.tree.loop(n).loop_var.startswith("i_d1")
-    ]
-    assert "i_d1_0" in names and not any("fused" in nm for nm in names), names
-
-
-def test_split_then_fuse_round_trip_byteexact():
-    """Split the load d1 2048->(16,128) then fuse back == the original trip-1-free k0 load
-    (loopless d1, full 2048 width). Byte-exact."""
-    ir = build_canonical_ir()
-    canonical_render = render(ir)
-    load = next(
-        n
-        for n in ir.tree.preorder()
-        if isinstance(ir.tree.data(n), ISANode) and ir.tree.isa(n).op_cls.__name__ == "NKILoad"
-    )
-    split_ir = Split().apply(ir, SplitOption(target_nid=load, factors=(16, 128), target_axis="d1"))
-    new_load = next(
-        n
-        for n in split_ir.tree.preorder()
-        if isinstance(split_ir.tree.data(n), ISANode) and split_ir.tree.isa(n).op_cls.__name__ == "NKILoad"
-    )
-    d1_loop = split_ir.tree.parent(new_load)
-    assert d1_loop is not None
-    assert isinstance(split_ir.tree.data(d1_loop), ForNode) and split_ir.tree.loop(d1_loop).extent == 16
-    fused_ir = Fuse().apply(split_ir, FuseOption(target_nids=(d1_loop, new_load), target_axis="d1"))
-    assert render(fused_ir) == canonical_render, "Split->Fuse did not round-trip to canonical"

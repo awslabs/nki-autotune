@@ -22,13 +22,18 @@ def test_nkiop_has_min_and_max_tile_size_dicts():
     assert NKIOp.MAX_TILE_SIZE == {}
 
 
+def test_tensor_scalar_requires_fp32_tensor_operand() -> None:
+    """The broadcast operand carries the ISA's fp32 storage requirement."""
+    assert NKITensorScalar.REQUIRED_INPUT_STORAGE_DTYPES == {"operand0": "float32"}
+
+
 def test_operation_tile_bounds():
     """Every operation declares the expected ISA tile interval."""
     pf_min = {"P": 128, "F": 128}
     cases = {
         NKIMatmul: ({"K": 128, "M": 128, "N": 128}, {"K": 128, "M": 128, "N": 512}),
         NKITranspose: (pf_min, {"P": 128, "F": 128}),
-        NKIDMATranspose: (pf_min, {"P": 128, "F": None}),
+        NKIDMATranspose: (pf_min, {"P": 128, "F": 128}),
         NKILoad: (pf_min, {"P": 128, "F": None}),
         NKIStore: (pf_min, {"P": 128, "F": None}),
         NKIMemset: (pf_min, {"P": 128, "F": None}),

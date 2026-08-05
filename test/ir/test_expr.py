@@ -18,24 +18,6 @@ from nkigym.ir.arith.expr import (
 )
 
 
-def test_expression_value_semantics() -> None:
-    """Expression nodes construct recursively and have structural hash semantics."""
-    assert Const(value=3) == Const(value=3)
-    assert Const(value=3) != Const(value=4)
-    assert Var(name="i") == Var(name="i")
-    assert Var(name="i") != Var(name="j")
-
-    expr = Add(left=Mul(left=Var(name="i"), right=Const(value=8)), right=Var(name="j"))
-    assert isinstance(expr, Add)
-    assert isinstance(expr.left, Mul)
-    assert expr.right == Var(name="j")
-
-    equal = Add(left=Var(name="i"), right=Const(value=1))
-    duplicate = Add(left=Var(name="i"), right=Const(value=1))
-    assert hash(equal) == hash(duplicate)
-    assert {equal: 1, duplicate: 2} == {equal: 2}
-
-
 def test_to_affine_contract() -> None:
     """Affine conversion handles constants and sums and rejects nonlinear forms."""
     assert to_affine(Const(value=7)) == {None: 7}

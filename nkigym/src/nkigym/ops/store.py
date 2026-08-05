@@ -1,11 +1,12 @@
 """SBUF → HBM store op: ``nisa.dma_copy`` + ``store_block`` gadget."""
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import nki.isa as nisa
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import CopyContract, NKIOp, _operand_role
 
 
 class NKIStore(NKIOp):
@@ -20,6 +21,12 @@ class NKIStore(NKIOp):
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_ROLE: ClassVar[str] = "stored"
     OUTPUT_LOCATION: ClassVar[str] = "shared_hbm"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> CopyContract:
+        """Return the value-preserving store contract."""
+        _ = kwargs
+        return CopyContract(input_operand="src", output_operand="dst")
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` must be SBUF-resident."""

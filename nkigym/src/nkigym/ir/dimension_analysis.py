@@ -50,8 +50,8 @@ class _OpRecord:
         op_cls: The NKIOp subclass.
         operand_names: ``slot → tensor_name`` for every operand in the call.
         axis_map: ``abstract_axis → concrete_dim``.
-        kwargs: Non-operand call kwargs (e.g. ``{"value": 0.0}`` for the
-            synthesized memset, ``{"op": "exp"}`` for activation).
+        kwargs: Configuration kwargs and literal operand slots. Tensor operands
+            live in ``operand_names``; a scalar ``operand0`` remains here.
     """
 
     op_cls: type[NKIOp]
@@ -206,6 +206,14 @@ def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceSta
         sym = kwargs.get(slot)
         if not isinstance(sym, _Sym):
             continue
+        required_dtype = cls.REQUIRED_INPUT_STORAGE_DTYPES.get(slot)
+        if required_dtype is not None:
+            if sym.storage_dtype is not None and sym.storage_dtype != required_dtype:
+                raise ValueError(
+                    f"{cls.__name__}.{slot} requires {required_dtype}, but "
+                    f"{sym.source_name} already requires {sym.storage_dtype}"
+                )
+            sym.storage_dtype = required_dtype
         operand_names[slot] = sym.source_name
         for i, abstract in enumerate(axes[: len(sym.shape)]):
             existing = sym.dim_ids[i]
@@ -217,7 +225,7 @@ def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceSta
                 _unify(existing, local[abstract], state, local)
             else:
                 local[abstract] = existing
-    op_kwargs = {k: v for k, v in kwargs.items() if k not in cls.OPERAND_AXES}
+    op_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, _Sym)}
     record = _OpRecord(op_cls=cls, operand_names=operand_names, axis_map=local, kwargs=op_kwargs)
     state.op_records.append(record)
     input_syms = [

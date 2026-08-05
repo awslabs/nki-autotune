@@ -10,7 +10,9 @@ from nkigym.ir.arith.expr import Var, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, KernelTree, role_of
 from nkigym.ops.base import AxisRole
+from nkigym.transforms._access_pattern import subtree_has_access_patterns
 from nkigym.transforms._normalize import normalize_block
+from nkigym.transforms._tree_ops import invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
@@ -50,6 +52,7 @@ class Reorder(Transform[ReorderOption]):
         new_ir.tree.graph.nodes[option.outer_nid]["data"] = inner_data
         new_ir.tree.graph.nodes[option.inner_nid]["data"] = outer_data
         self._renormalize_same_dim_swap(new_ir, option)
+        invalidate_stale_software_pipelines(new_ir)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
@@ -96,6 +99,8 @@ class Reorder(Transform[ReorderOption]):
         kids = ir.tree.children(option.outer_nid)
         if kids != [option.inner_nid]:
             raise TransformLegalityError(f"Reorder: inner must be sole child of outer; got children {kids}")
+        if subtree_has_access_patterns(ir.tree, option.outer_nid):
+            raise TransformLegalityError("Reorder cannot rewrite loops containing an explicit access pattern")
         outer_loop_var = outer.loop_var
         inner_loop_var = inner.loop_var
         for descendant in ir.tree.blocks(option.inner_nid):

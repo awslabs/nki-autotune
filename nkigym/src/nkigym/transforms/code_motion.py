@@ -31,9 +31,14 @@ from nkigym.ir.dependency import (
 )
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
+from nkigym.transforms._access_pattern import subtree_has_access_patterns
 from nkigym.transforms._domain_solve import _dim_from_loopvar
 from nkigym.transforms._normalize import normalize_block
-from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
+from nkigym.transforms._tree_ops import (
+    _block_local_descendants,
+    _replace_in_parent_children,
+    invalidate_stale_software_pipelines,
+)
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
@@ -46,6 +51,14 @@ class _PrefixPlan:
     matched_loop_nids: tuple[tuple[int, int], ...]
     matched_local_nids: tuple[int, ...]
     duplicated_target_nids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _AnalysisContext:
+    """Code-motion facts shared by every option analyzed on one IR."""
+
+    versioned_by_block: dict[int, frozenset[str]]
+    pipeline_loops: tuple[int, ...]
 
 
 def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> None:
@@ -335,7 +348,9 @@ def _assert_single_parent(tree: KernelTree) -> None:
         raise ValueError(f"_move left nodes with multiple parents: {detail}")
 
 
-def _check_same_loop_prefix(ir: KernelIR, block_nid: int, target_loop_nid: int) -> list[tuple[str, int]]:
+def _check_same_loop_prefix(
+    ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan | None = None
+) -> list[tuple[str, int]]:
     """Raise TransformLegalityError unless the target's enclosing loops, restricted
     to the moved block's dependent dimensions, are an exact ``(dimension, extent)``
     prefix of the moved block's bound loop sequence.
@@ -353,8 +368,8 @@ def _check_same_loop_prefix(ir: KernelIR, block_nid: int, target_loop_nid: int) 
     target_seq = _target_loop_seq(ir.tree, target_loop_nid)
     block = ir.tree.data(block_nid)
     assert isinstance(block, BlockNode)
-    plan = _prefix_plan(ir.tree, block_nid, target_loop_nid)
-    _check_no_reduction_replicated(ir, block_nid, target_loop_nid, plan.duplicated_target_nids)
+    resolved_plan = plan if plan is not None else _prefix_plan(ir.tree, block_nid, target_loop_nid)
+    _check_no_reduction_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
     return target_seq
 
 
@@ -384,12 +399,11 @@ def _check_no_reduction_replicated(
         )
 
 
-def _crossed_execution_loops(ir: KernelIR, block_nid: int, target_loop_nid: int) -> list[int]:
+def _crossed_execution_loops(ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan) -> list[int]:
     """Return loops added to or removed from the moved leaf's execution scope."""
     tree = ir.tree
     leaf = ir.dependency._resolve(block_nid)
     old_loops = [nid for nid in tree.ancestors(leaf) if isinstance(tree.data(nid), ForNode)]
-    plan = _prefix_plan(tree, block_nid, target_loop_nid)
     local_prefix_drop = len(plan.matched_local_nids)
     new_loops = [*plan.target_loop_nids, *plan.local_loop_nids[local_prefix_drop:]]
 
@@ -416,7 +430,7 @@ def _plain_written_tensors(node: ISANode) -> set[str]:
     }
 
 
-def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_nid: int) -> None:
+def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan) -> None:
     """Reject changing a plain reset's frequency relative to an invariant RMW.
 
     A plain write followed by an RMW of the same region is its reset. Moving that
@@ -429,7 +443,7 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
     moved_node = tree.data(moved_leaf)
     assert isinstance(moved_node, ISANode)
     plain_writes = _plain_written_tensors(moved_node)
-    crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid)
+    crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid, plan)
     if plain_writes:
         for _producer, consumer, attrs in ir.dependency.graph.out_edges(moved_leaf, data=True):
             tensor = attrs.get("tensor")
@@ -474,12 +488,14 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
             )
 
 
-def _check_no_consumer_hoisted_out_of_producer_loop(ir: KernelIR, block_nid: int, target_loop_nid: int) -> None:
+def _check_no_consumer_hoisted_out_of_producer_loop(
+    ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan
+) -> None:
     """Reject hoisting a consumer away from a repeated invariant producer."""
     tree = ir.tree
     moved_leaf = ir.dependency._resolve(block_nid)
     old_loops = set(tree.ancestors(moved_leaf))
-    crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid)
+    crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid, plan)
     for producer, _consumer, attrs in ir.dependency.graph.in_edges(moved_leaf, data=True):
         tensor = attrs.get("tensor")
         if tensor is None:
@@ -511,12 +527,14 @@ def _leaf_execution_invariant_across(tree: KernelTree, leaf_nid: int, loop_var: 
     )
 
 
-def _check_no_producer_moved_out_of_consumer_loop(ir: KernelIR, block_nid: int, target_loop_nid: int) -> None:
+def _check_no_producer_moved_out_of_consumer_loop(
+    ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan
+) -> None:
     """Reject moving a producer away from a consumer sharing its invariant slice."""
     tree = ir.tree
     moved_leaf = ir.dependency._resolve(block_nid)
     old_loops = set(tree.ancestors(moved_leaf))
-    crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid)
+    crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid, plan)
     for _producer, consumer, attrs in ir.dependency.graph.out_edges(moved_leaf, data=True):
         tensor = attrs.get("tensor")
         if tensor is None:
@@ -561,7 +579,8 @@ def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop
     Freezing directions keeps the RAW orientation, so the post-splice backward
     span is detected.
     """
-    _check_same_loop_prefix(ir, block_nid, target_loop_nid)
+    plan = _prefix_plan(ir.tree, block_nid, target_loop_nid)
+    _check_same_loop_prefix(ir, block_nid, target_loop_nid, plan)
     moved_leaf = ir.dependency._resolve(block_nid)
     offending = ir.dependency.first_backward_edge_for_insertion(moved_leaf, target_loop_nid, index)
     result: None = None
@@ -572,31 +591,49 @@ def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop
             f"edge {a}->{b} backward (a carried buffer's init/drain cannot enter its "
             f"reduction loop, nor a consumer precede its producer)"
         )
-    _check_no_rmw_reset_scope_change(ir, block_nid, target_loop_nid)
-    _check_no_consumer_hoisted_out_of_producer_loop(ir, block_nid, target_loop_nid)
-    _check_no_producer_moved_out_of_consumer_loop(ir, block_nid, target_loop_nid)
+    _check_move_scope_changes(ir, block_nid, target_loop_nid, plan)
     return result
 
 
-def _check_versioned_pipeline_boundary(ir: KernelIR, block_nid: int, target_loop_nid: int) -> None:
+def _check_move_scope_changes(ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan) -> None:
+    """Reject loop-scope changes not represented by dependency direction."""
+    _check_no_rmw_reset_scope_change(ir, block_nid, target_loop_nid, plan)
+    _check_no_consumer_hoisted_out_of_producer_loop(ir, block_nid, target_loop_nid, plan)
+    _check_no_producer_moved_out_of_consumer_loop(ir, block_nid, target_loop_nid, plan)
+
+
+def _analysis_context(ir: KernelIR, block_nids: list[int]) -> _AnalysisContext:
+    """Collect versioned tensors and pipeline loops once for one analysis."""
+    buffers = ir.all_buffers()
+    versioned_names = {name for name, buffer in buffers.items() if buffer.versions > 1}
+    versioned_by_block: dict[int, frozenset[str]] = {}
+    for block_nid in block_nids:
+        touched: set[str] = set()
+        for nid in [block_nid, *ir.tree.descendants(block_nid)]:
+            node = ir.tree.data(nid)
+            if isinstance(node, ISANode):
+                touched.update(region.tensor for region in node.operand_bindings.values())
+        versioned_by_block[block_nid] = frozenset(touched & versioned_names)
+    pipeline_loops = tuple(
+        annotation["loop_nid"]
+        for nid in ir.tree.blocks()
+        if (annotation := ir.tree.block(nid).annotations.get("software_pipeline")) is not None
+    )
+    return _AnalysisContext(versioned_by_block=versioned_by_block, pipeline_loops=pipeline_loops)
+
+
+def _check_versioned_pipeline_boundary(
+    ir: KernelIR, block_nid: int, target_loop_nid: int, context: _AnalysisContext | None
+) -> None:
     """Reject moving a multi-version buffer access into or out of a pipeline loop."""
-    touched: set[str] = set()
-    for nid in [block_nid, *ir.tree.descendants(block_nid)]:
-        node = ir.tree.data(nid)
-        if isinstance(node, ISANode):
-            touched.update(region.tensor for region in node.operand_bindings.values())
-    versioned = {name for name in touched if ir.buffer(name).versions > 1}
+    if context is None:
+        context = _analysis_context(ir, [block_nid])
+    versioned = context.versioned_by_block[block_nid]
     if not versioned:
         return
     old_ancestors = set(ir.tree.ancestors(block_nid))
     new_ancestors = set(ir.tree.ancestors(target_loop_nid)) | {target_loop_nid}
-    for owner_nid in ir.tree.blocks():
-        owner = ir.tree.data(owner_nid)
-        assert isinstance(owner, BlockNode)
-        annotation = owner.annotations.get("software_pipeline")
-        if annotation is None:
-            continue
-        pipeline_loop = annotation["loop_nid"]
+    for pipeline_loop in context.pipeline_loops:
         if (pipeline_loop in old_ancestors) != (pipeline_loop in new_ancestors):
             raise TransformLegalityError(
                 f"move(block={block_nid} under loop={target_loop_nid}) crosses software pipeline "
@@ -658,6 +695,7 @@ class CodeMotion(Transform[CodeMotionOption]):
         self._check_legality(ir, option)
         new_ir = copy.deepcopy(ir)
         _move(new_ir, block_nid=option.block_nid, target_loop_nid=option.target_loop_nid, index=option.index)
+        invalidate_stale_software_pipelines(new_ir)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
@@ -670,17 +708,25 @@ class CodeMotion(Transform[CodeMotionOption]):
             if nid != ir.tree.root
             and sum(1 for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)) == 1
         ]
+        context = _analysis_context(ir, leaf_blocks)
         for block_nid in leaf_blocks:
             for target_nid in ir.tree.preorder():
                 if not isinstance(ir.tree.data(target_nid), ForNode):
                     continue
-                for index in self._legal_indices(ir, block_nid, target_nid):
-                    opt = CodeMotionOption(block_nid=block_nid, target_loop_nid=target_nid, index=index)
-                    try:
-                        self._check_legality(ir, opt)
-                    except TransformLegalityError:
-                        continue
-                    options.append(opt)
+                indices = self._legal_indices(ir, block_nid, target_nid)
+                if not indices:
+                    continue
+                try:
+                    self._check_static_legality(ir, block_nid, target_nid, context)
+                    plan = _prefix_plan(ir.tree, block_nid, target_nid)
+                    _check_same_loop_prefix(ir, block_nid, target_nid, plan)
+                    _check_move_scope_changes(ir, block_nid, target_nid, plan)
+                except TransformLegalityError:
+                    continue
+                for index in indices:
+                    moved_leaf = ir.dependency._resolve(block_nid)
+                    if ir.dependency.first_backward_edge_for_insertion(moved_leaf, target_nid, index) is None:
+                        options.append(CodeMotionOption(block_nid=block_nid, target_loop_nid=target_nid, index=index))
         return options
 
     def _legal_indices(self, ir: KernelIR, block_nid: int, target_nid: int) -> list[int]:
@@ -703,24 +749,32 @@ class CodeMotion(Transform[CodeMotionOption]):
                 fc = i
         return list(range(lp + 1, fc + 1))
 
+    def _check_static_legality(
+        self, ir: KernelIR, block_nid: int, target_loop_nid: int, context: _AnalysisContext | None
+    ) -> None:
+        """Check option legality that does not depend on an insertion slot."""
+        if target_loop_nid not in ir.tree.graph:
+            raise TransformLegalityError(f"target_loop_nid={target_loop_nid} not in tree")
+        if not isinstance(ir.tree.data(target_loop_nid), ForNode):
+            raise TransformLegalityError(
+                f"CodeMotion requires target_loop_nid to be a ForNode; got "
+                f"{type(ir.tree.data(target_loop_nid)).__name__}"
+            )
+        if block_nid not in ir.tree.graph:
+            raise TransformLegalityError(f"block_nid={block_nid} not in tree")
+        if subtree_has_access_patterns(ir.tree, block_nid):
+            raise TransformLegalityError("CodeMotion cannot move a block with an explicit access pattern")
+        if target_loop_nid in ir.tree.descendants(block_nid):
+            raise TransformLegalityError(
+                f"target_loop_nid={target_loop_nid} is a descendant of moved block "
+                f"{block_nid} (cannot move under its own loop)"
+            )
+        _check_versioned_pipeline_boundary(ir, block_nid, target_loop_nid, context)
+
     def _check_legality(self, ir: KernelIR, option: CodeMotionOption) -> None:
         """Structural checks (target/block in graph, target a ForNode, target not a
         descendant of the block) then span-promotion ordering. No output guard."""
-        if option.target_loop_nid not in ir.tree.graph:
-            raise TransformLegalityError(f"target_loop_nid={option.target_loop_nid} not in tree")
-        if not isinstance(ir.tree.data(option.target_loop_nid), ForNode):
-            raise TransformLegalityError(
-                f"CodeMotion requires target_loop_nid to be a ForNode; got "
-                f"{type(ir.tree.data(option.target_loop_nid)).__name__}"
-            )
-        if option.block_nid not in ir.tree.graph:
-            raise TransformLegalityError(f"block_nid={option.block_nid} not in tree")
-        if option.target_loop_nid in ir.tree.descendants(option.block_nid):
-            raise TransformLegalityError(
-                f"target_loop_nid={option.target_loop_nid} is a descendant of moved block "
-                f"{option.block_nid} (cannot move under its own loop)"
-            )
-        _check_versioned_pipeline_boundary(ir, option.block_nid, option.target_loop_nid)
+        self._check_static_legality(ir, option.block_nid, option.target_loop_nid, None)
         _check_move_preserves_dependencies(ir, option.block_nid, option.target_loop_nid, option.index)
 
 

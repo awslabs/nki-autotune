@@ -14,11 +14,13 @@ ISA leaf's :attr:`ISANode.operand_bindings`.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from typing import Any
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Const, Expr, Mod, Mul, Var, _format_raw, format_expr, to_affine
-from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.ir.arith.expr import Add, Const, Expr, Mod, Mul, Var, _format_raw, format_expr, substitute, to_affine
+from nkigym.ir.tree import PARTITION_DIM, AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 _INDENT = "    "
 
@@ -43,7 +45,16 @@ def emit_body(ir: KernelIR) -> str:
     code: list[str] = []
     pipeline_map = _pipeline_loops(ir)
     emit_before = _alloc_emit_anchors(ir)
-    _emit_block(ir, ir.tree.root, depth=1, code=code, pipeline_map=pipeline_map, rotations={}, emit_before=emit_before)
+    _emit_block(
+        ir,
+        ir.tree.root,
+        depth=1,
+        code=code,
+        pipeline_map=pipeline_map,
+        rotations={},
+        substitutions={},
+        emit_before=emit_before,
+    )
     return "\n".join(code) + "\n"
 
 
@@ -58,6 +69,11 @@ def _alloc_emit_anchors(ir: KernelIR) -> dict[int, list[Buffer]]:
     walked in ``all_buffers`` order for deterministic anchor lists.
     """
     params = set(ir.param_buffers)
+    version_loops = {
+        name: loop_nid
+        for loop_nid, annotation in _pipeline_loops(ir).items()
+        for name in annotation["versioned_buffers"]
+    }
     leaves_by_tensor: dict[str, list[int]] = {}
     for nid in ir.tree.preorder():
         data = ir.tree.data(nid)
@@ -71,6 +87,11 @@ def _alloc_emit_anchors(ir: KernelIR) -> dict[int, list[Buffer]]:
         leaves = leaves_by_tensor.get(name)
         assert leaves, f"buffer {name!r} is declared but touched by no ISA leaf"
         scope = ir.tree.root if buf.location == "shared_hbm" else _hoisted_scope(ir.tree, name, leaves)
+        version_loop = version_loops.get(name)
+        if version_loop is not None and (scope == version_loop or version_loop in ir.tree.ancestors(scope)):
+            parent = ir.tree.parent(version_loop)
+            assert parent is not None, f"pipeline loop {version_loop} has no declaration scope"
+            scope = parent
         anchor = _anchor_child(ir.tree, scope, leaves)
         out.setdefault(anchor, []).append(buf)
     return out
@@ -186,6 +207,14 @@ def _pipeline_loops(ir: KernelIR) -> dict[int, dict[str, Any]]:
         assert isinstance(block, BlockNode)
         annotation = block.annotations.get("software_pipeline")
         if annotation is not None:
+            loop_nid = annotation["loop_nid"]
+            expected_children = annotation.get("children")
+            if loop_nid not in ir.tree.graph:
+                raise AssertionError(f"software-pipeline loop {loop_nid} is no longer in the tree")
+            if annotation.get("loop") is not None and ir.tree.data(loop_nid) != annotation["loop"]:
+                raise AssertionError(f"software-pipeline loop {loop_nid} has stale loop metadata")
+            if expected_children is not None and tuple(ir.tree.children(loop_nid)) != tuple(expected_children):
+                raise AssertionError(f"software-pipeline loop {loop_nid} has stale staged children")
             out[annotation["loop_nid"]] = annotation
     return out
 
@@ -197,6 +226,7 @@ def _emit_block(
     code: list[str],
     pipeline_map: dict[int, dict[str, Any]],
     rotations: dict[str, Expr],
+    substitutions: dict[str, Expr],
     emit_before: dict[int, list[Buffer]],
 ) -> None:
     """Emit one BlockNode: each child's anchored buffer declarations, then the child."""
@@ -208,9 +238,9 @@ def _emit_block(
             code.append(indent + _emit_alloc(buf))
         child_data = ir.tree.data(child_nid)
         if isinstance(child_data, BlockNode):
-            _emit_block(ir, child_nid, depth, code, pipeline_map, rotations, emit_before)
+            _emit_block(ir, child_nid, depth, code, pipeline_map, rotations, substitutions, emit_before)
         else:
-            _emit_subtree(ir, child_nid, depth, code, pipeline_map, rotations, emit_before)
+            _emit_subtree(ir, child_nid, depth, code, pipeline_map, rotations, substitutions, emit_before)
 
 
 def _emit_subtree(
@@ -220,6 +250,7 @@ def _emit_subtree(
     code: list[str],
     pipeline_map: dict[int, dict[str, Any]],
     rotations: dict[str, Expr],
+    substitutions: dict[str, Expr],
     emit_before: dict[int, list[Buffer]],
 ) -> None:
     """Emit a ForNode, ISANode, or nested BlockNode subtree.
@@ -238,50 +269,184 @@ def _emit_subtree(
     indent = _INDENT * depth
     node = ir.tree.data(nid)
     if isinstance(node, ForNode):
-        child_rotations = rotations
         if nid in pipeline_map:
-            annotation = pipeline_map[nid]
-            child_rotations = {**rotations, **_pipeline_rotations(ir, node.loop_var, annotation["versioned_buffers"])}
-        code.append(indent + f"for {node.loop_var} in range({node.extent}):")
-        child_indent = _INDENT * (depth + 1)
-        for child_nid in ir.tree.children(nid):
-            for buf in emit_before.get(child_nid, ()):
-                code.append(child_indent + _emit_alloc(buf))
-            _emit_subtree(ir, child_nid, depth + 1, code, pipeline_map, child_rotations, emit_before)
+            _emit_pipelined_loop(ir, nid, node, depth, code, pipeline_map, rotations, substitutions, emit_before)
+        else:
+            code.append(indent + f"for {node.loop_var} in range({node.extent}):")
+            child_indent = _INDENT * (depth + 1)
+            child_substitutions = {name: value for name, value in substitutions.items() if name != node.loop_var}
+            for child_nid in ir.tree.children(nid):
+                for buf in emit_before.get(child_nid, ()):
+                    code.append(child_indent + _emit_alloc(buf))
+                _emit_subtree(ir, child_nid, depth + 1, code, pipeline_map, rotations, child_substitutions, emit_before)
     elif isinstance(node, ISANode):
-        code.append(indent + _emit_isa_call(node, ir, rotations))
+        code.append(indent + _emit_isa_call(node, ir, rotations, substitutions))
     elif isinstance(node, BlockNode):
-        _emit_block(ir, nid, depth, code, pipeline_map, rotations, emit_before)
+        _emit_block(ir, nid, depth, code, pipeline_map, rotations, substitutions, emit_before)
     else:
         raise TypeError(f"unexpected subtree node type {type(node).__name__}")
 
 
-def _pipeline_rotations(ir: KernelIR, loop_var: str, versioned_buffers: tuple[str, ...]) -> dict[str, Expr]:
+def _emit_pipelined_loop(
+    ir: KernelIR,
+    loop_nid: int,
+    loop: ForNode,
+    depth: int,
+    code: list[str],
+    pipeline_map: dict[int, dict[str, Any]],
+    rotations: dict[str, Expr],
+    substitutions: dict[str, Expr],
+    emit_before: dict[int, list[Buffer]],
+) -> None:
+    """Emit a software pipeline as fill, steady-state, and drain phases."""
+    annotation = pipeline_map[loop_nid]
+    children = ir.tree.children(loop_nid)
+    stages = tuple(annotation["stages"])
+    order = tuple(annotation["order"])
+    if len(stages) != len(children) or sorted(order) != list(range(len(children))):
+        raise AssertionError(f"malformed software-pipeline annotation on loop {loop_nid}")
+    max_stage = max(stages)
+    if min(stages) != 0:
+        raise AssertionError(f"software-pipeline stages must start at zero: {stages}")
+    if max_stage == 0:
+        code.append(_INDENT * depth + f"for {loop.loop_var} in range({loop.extent}):")
+        child_substitutions = {name: value for name, value in substitutions.items() if name != loop.loop_var}
+        for child_nid in children:
+            for buf in emit_before.get(child_nid, ()):
+                code.append(_INDENT * (depth + 1) + _emit_alloc(buf))
+            _emit_subtree(
+                ir,
+                child_nid,
+                depth + 1,
+                code,
+                {key: value for key, value in pipeline_map.items() if key != loop_nid},
+                rotations,
+                child_substitutions,
+                emit_before,
+            )
+        return
+
+    prefix_end = min(max_stage, loop.extent + max_stage)
+    for tick in range(prefix_end):
+        logical = {
+            index: Const(value=tick - stage) for index, stage in enumerate(stages) if 0 <= tick - stage < loop.extent
+        }
+        _emit_pipeline_units(
+            ir,
+            children,
+            order,
+            logical,
+            loop.loop_var,
+            annotation["versioned_buffers"],
+            depth,
+            code,
+            pipeline_map,
+            rotations,
+            substitutions,
+            emit_before,
+        )
+
+    if loop.extent > max_stage:
+        code.append(_INDENT * depth + f"for {loop.loop_var} in range({loop.extent - max_stage}):")
+        logical = {
+            index: (
+                Var(name=loop.loop_var)
+                if max_stage == stage
+                else Add(left=Var(name=loop.loop_var), right=Const(value=max_stage - stage))
+            )
+            for index, stage in enumerate(stages)
+        }
+        _emit_pipeline_units(
+            ir,
+            children,
+            order,
+            logical,
+            loop.loop_var,
+            annotation["versioned_buffers"],
+            depth + 1,
+            code,
+            pipeline_map,
+            rotations,
+            substitutions,
+            emit_before,
+        )
+
+    for tick in range(max(max_stage, loop.extent), loop.extent + max_stage):
+        logical = {
+            index: Const(value=tick - stage) for index, stage in enumerate(stages) if 0 <= tick - stage < loop.extent
+        }
+        _emit_pipeline_units(
+            ir,
+            children,
+            order,
+            logical,
+            loop.loop_var,
+            annotation["versioned_buffers"],
+            depth,
+            code,
+            pipeline_map,
+            rotations,
+            substitutions,
+            emit_before,
+        )
+
+
+def _emit_pipeline_units(
+    ir: KernelIR,
+    children: list[int],
+    order: tuple[int, ...],
+    logical_iterations: Mapping[int, Expr],
+    loop_var: str,
+    versioned_buffers: tuple[str, ...],
+    depth: int,
+    code: list[str],
+    pipeline_map: dict[int, dict[str, Any]],
+    rotations: dict[str, Expr],
+    substitutions: dict[str, Expr],
+    emit_before: dict[int, list[Buffer]],
+) -> None:
+    """Emit the active child units for one pipeline tick."""
+    indent = _INDENT * depth
+    active = sorted(logical_iterations, key=lambda index: order[index])
+    for index in active:
+        child_nid = children[index]
+        logical_iteration = logical_iterations[index]
+        child_substitutions = {**substitutions, loop_var: logical_iteration}
+        child_rotations = {**rotations, **_pipeline_rotations(ir, logical_iteration, versioned_buffers)}
+        for buf in emit_before.get(child_nid, ()):
+            code.append(indent + _emit_alloc(buf))
+        _emit_subtree(ir, child_nid, depth, code, pipeline_map, child_rotations, child_substitutions, emit_before)
+
+
+def _pipeline_rotations(ir: KernelIR, logical_iteration: Expr, versioned_buffers: tuple[str, ...]) -> dict[str, Expr]:
     """Return rotations for the buffers versioned by one pipeline."""
     out: dict[str, Expr] = {}
     for name in versioned_buffers:
-        rotation = _version_rotation(ir.buffer(name), loop_var)
+        rotation = _version_rotation(ir.buffer(name), logical_iteration)
         if rotation is None:
             raise AssertionError(f"pipeline marks single-version buffer {name!r} as versioned")
         out[name] = rotation
     return out
 
 
-def _version_rotation(buf: Buffer, loop_var: str) -> Expr | None:
+def _version_rotation(buf: Buffer, logical_iteration: Expr) -> Expr | None:
     """Return the tile-axis version rotation for a multi-version buffer, or None.
 
-    ``num_p_tiles`` (the per-version tile span) is the middle physical dim
-    divided by versions. When ``num_p_tiles == 1`` the rotation is the bare
+    ``tiles_per_list`` is the per-version span inside each list allocation.
+    When ``tiles_per_list == 1`` the rotation is the bare
     ``loop_var % versions`` (NO ``* 1`` — the validated kernel renders
     ``i_d1_0 % 2``, not ``i_d1_0 % 2 * 1``); only a >1 span wraps in
-    ``Mul(..., Const(num_p_tiles))``.
+    ``Mul(..., Const(tiles_per_list))``.
     """
     if buf.versions <= 1:
         result = None
     else:
-        mod = Mod(left=Var(name=loop_var), right=Const(value=buf.versions))
-        num_p_tiles = buf.physical_shape()[1] // buf.versions
-        result = mod if num_p_tiles == 1 else Mul(left=mod, right=Const(value=num_p_tiles))
+        if isinstance(logical_iteration, Const):
+            mod: Expr = Const(value=logical_iteration.value % buf.versions)
+        else:
+            mod = Mod(left=logical_iteration, right=Const(value=buf.versions))
+        tiles_per_list = buf.tiles_per_list()
+        result = mod if tiles_per_list == 1 else Mul(left=mod, right=Const(value=tiles_per_list))
     return result
 
 
@@ -295,7 +460,7 @@ def _emit_alloc(buf: Buffer) -> str:
     (a list-of-one), so the call site always indexes with a leading ``[list_idx]``.
     """
     if buf.location == "shared_hbm":
-        shape = "(" + ", ".join(str(s) for s in buf.physical_shape()) + ")"
+        shape = str(buf.physical_shape())
         result = f"{buf.name} = nl.ndarray({shape}, dtype=nl.{buf.physical_dtype()}, buffer=nl.{buf.location})"
     else:
         shape = "(" + ", ".join(str(s) for s in buf.per_tile_physical_shape()) + ")"
@@ -306,7 +471,7 @@ def _emit_alloc(buf: Buffer) -> str:
     return result
 
 
-def _emit_isa_call(node: ISANode, ir: KernelIR, rotations: dict[str, Expr]) -> str:
+def _emit_isa_call(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], substitutions: dict[str, Expr]) -> str:
     """Emit ``nisa.<NAME>(slot=<region>, ..., kwarg=value, ...)`` for one ISA leaf.
 
     ``rotations`` maps a tensor name to its ``loop_var % versions`` tile-axis
@@ -318,8 +483,29 @@ def _emit_isa_call(node: ISANode, ir: KernelIR, rotations: dict[str, Expr]) -> s
     for slot in op_cls.OPERAND_AXES:
         if slot in node.operand_bindings:
             region = node.operand_bindings[slot]
+            access_pattern = node.access_patterns.get(slot)
+            if substitutions:
+                region = BufferRegion(
+                    tensor=region.tensor,
+                    ranges=tuple(
+                        (substitute(lower, substitutions), substitute(width, substitutions))
+                        for lower, width in region.ranges
+                    ),
+                )
+                if access_pattern is not None:
+                    access_pattern = AccessPattern(
+                        pattern=tuple(
+                            (substitute(stride, substitutions), substitute(extent, substitutions))
+                            for stride, extent in access_pattern.pattern
+                        ),
+                        offset=substitute(access_pattern.offset, substitutions),
+                    )
             buf = ir.buffer(region.tensor)
-            rendered = render_buffer_region(region, buf, rotations.get(region.tensor))
+            rotation = rotations.get(region.tensor)
+            if access_pattern is None:
+                rendered = render_buffer_region(region, buf, rotation)
+            else:
+                rendered = render_access_pattern(region.tensor, access_pattern, buf, rotation)
             parts.append(f"{slot}={rendered}")
     for k, v in node.kwargs.items():
         parts.append(f"{k}={_render_kwarg(k, v)}")
@@ -338,6 +524,10 @@ def _render_kwarg(key: str, value: Any) -> str:
     """Render one ISA kwarg value, mapping ALU-operator names to ``nl.<name>``."""
     if key in _NL_OP_KWARGS and isinstance(value, str):
         rendered = f"nl.{value}"
+    elif isinstance(value, float) and math.isinf(value):
+        rendered = f"float('{value}')"
+    elif isinstance(value, float) and math.isnan(value):
+        rendered = "float('nan')"
     else:
         rendered = repr(value)
     return rendered
@@ -355,11 +545,42 @@ def _format_tile_index(lo: Expr, rotation: Expr | None) -> str:
     if rotation is None:
         result = format_expr(lo)
     else:
-        rot_str = _format_raw(rotation)
+        rot_str = _format_rotation(rotation)
         if isinstance(lo, Const) and lo.value == 0:
             result = rot_str
         else:
             result = f"{format_expr(lo)} + {rot_str}"
+    return result
+
+
+def _format_rotation(expr: Expr) -> str:
+    """Render a modulo rotation with precedence preserved for shifted indices."""
+    if isinstance(expr, (Const, Var)):
+        result = _format_raw(expr)
+    elif isinstance(expr, Add):
+        result = f"{_format_rotation(expr.left)} + {_format_rotation(expr.right)}"
+    elif isinstance(expr, (Mul, Mod)):
+        left = _format_rotation(expr.left)
+        right = _format_rotation(expr.right)
+        if isinstance(expr.left, Add):
+            left = f"({left})"
+        if isinstance(expr.right, Add):
+            right = f"({right})"
+        operator = "*" if isinstance(expr, Mul) else "%"
+        result = f"{left} {operator} {right}"
+    else:
+        raise TypeError(f"unsupported rotation expression {type(expr).__name__}")
+    return result
+
+
+def _format_local_tile_index(local_tile: str, rotation: Expr | None) -> str:
+    """Add a pipeline version rotation to one list-local logical tile index."""
+    if rotation is None:
+        result = local_tile
+    elif local_tile == "0":
+        result = _format_rotation(rotation)
+    else:
+        result = f"{local_tile} + {_format_rotation(rotation)}"
     return result
 
 
@@ -369,7 +590,7 @@ def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | Non
     ``shared_hbm`` renders flat ``name[lo:hi, ...]``. Every sbuf/psum buffer renders
     as a list access ``name[list_idx][0:P, mid_idx, F]`` (uniform — there is no bare
     form). The partition axis (axis 0) carries the tile index ``t``; with
-    ``a = per_tile middle = T // list_len``, branch on ``list_len``:
+    ``a = tiles_per_list = logical_tiles // list_len``, branch on ``list_len``:
 
     * ``list_len == 1`` — a list-of-one: ``list_idx = 0``, ``mid_idx = t`` (the whole
       tile index). Preserves the pre-uniform packed middle, so a canonical multi-tile
@@ -379,9 +600,9 @@ def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | Non
       both via the non-normalising ``_format_raw`` (the aligned index is non-affine
       under ``FloorDiv``, so ``format_expr``/``to_affine`` would raise).
 
-    ``rotation`` (the pipeline version term) applies only on the ``list_len == 1`` and
-    ``a == 1`` paths; ``a > 1`` requires ``list_len > 1``, and ``versions > 1`` with
-    ``list_len > 1`` is rejected at allocation, so no rotation reaches the ``a > 1`` path.
+    ``rotation`` is added only to ``mid_idx``. Its stride is ``a``, so every list
+    entry stores ``a`` logical tiles for each pipeline version while ``list_idx``
+    remains a pure function of the logical tile.
     """
     list_subscript = ""
     parts: list[str] = []
@@ -389,20 +610,20 @@ def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | Non
         if axis_index == 0 and buf.location != "shared_hbm":
             if not isinstance(hi, Const) or hi.value != PARTITION_DIM:
                 raise AssertionError(f"{buf.name}: SBUF/PSUM partition axis must use a partition-sized tile; got {hi}")
-            a = buf.per_tile_physical_shape()[1]
+            a = buf.tiles_per_list()
             if buf.list_len == 1:
                 list_subscript = "[0]"
                 parts.append(f"0:{PARTITION_DIM}")
                 parts.append(_format_tile_index(lo, rotation))
             elif a == 1:
-                list_subscript = f"[{_format_tile_index(lo, rotation)}]"
+                list_subscript = f"[{_format_tile_index(lo, None)}]"
                 parts.append(f"0:{PARTITION_DIM}")
-                parts.append("0")
+                parts.append(_format_local_tile_index("0", rotation))
             else:
                 tile = f"({_format_raw(lo)})"
                 list_subscript = f"[{tile} // {a}]"
                 parts.append(f"0:{PARTITION_DIM}")
-                parts.append(f"{tile} % {a}")
+                parts.append(_format_local_tile_index(f"{tile} % {a}", rotation))
         else:
             lo_str = format_expr(lo)
             hi_str = format_expr(hi)
@@ -410,4 +631,31 @@ def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | Non
     return f"{region.tensor}{list_subscript}[{', '.join(parts)}]"
 
 
-__all__ = ["emit_body", "render_buffer_region"]
+def render_access_pattern(tensor: str, access_pattern: AccessPattern, buf: Buffer, rotation: Expr | None = None) -> str:
+    """Render one flattened multidimensional ``Tensor.ap`` view."""
+    if buf.location != "shared_hbm" and buf.list_len != 1:
+        raise AssertionError(f"{tensor}: access patterns require one contiguous allocation")
+    if buf.versions > 1 and rotation is None:
+        raise AssertionError(f"{tensor}: versioned access pattern requires pipeline buffer rotation")
+    if buf.location == "shared_hbm" and rotation is not None:
+        raise AssertionError(f"{tensor}: shared HBM access pattern cannot use pipeline buffer rotation")
+    base = tensor if buf.location == "shared_hbm" else f"{tensor}[0]"
+    dimensions = ", ".join(
+        f"[{format_expr(stride)}, {format_expr(extent)}]" for stride, extent in access_pattern.pattern
+    )
+    offset = _format_access_pattern_offset(access_pattern.offset, buf, rotation)
+    return f"{base}.ap(pattern=[{dimensions}], offset={offset})"
+
+
+def _format_access_pattern_offset(offset: Expr, buf: Buffer, rotation: Expr | None) -> str:
+    """Render a flattened access-pattern offset with an optional tile rotation."""
+    result = format_expr(offset)
+    if rotation is not None:
+        free = buf.per_tile_physical_shape()[2]
+        flattened = rotation if free == 1 else Mul(left=rotation, right=Const(value=free))
+        rotation_text = _format_rotation(flattened)
+        result = rotation_text if isinstance(offset, Const) and offset.value == 0 else f"{result} + {rotation_text}"
+    return result
+
+
+__all__ = ["emit_body", "render_access_pattern", "render_buffer_region"]

@@ -6,13 +6,14 @@ the free axis. The rmsnorm+matmul example uses the per-partition vector
 form to multiply ``(d0, d1)`` lhs tiles by the 1D rsqrt result.
 """
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
 
 VE_PARTITION_MAX = 128
 VE_FREE_MAX = 512
@@ -32,9 +33,21 @@ class NKITensorScalar(NKIOp):
     NAME: ClassVar[str] = "tensor_scalar"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "operand0": ("P",), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "operand0"})
+    REQUIRED_INPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {"operand0": "float32"}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PointwiseContract:
+        """Return the configured binary pointwise operation."""
+        return PointwiseContract(
+            operator=str(kwargs["op0"]),
+            input_operands=("data", "operand0"),
+            output_operand="dst",
+            broadcast_operands=frozenset({"operand0"}),
+            reverse=bool(kwargs.get("reverse0", False)),
+        )
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``data`` must be SBUF-resident; ``operand0`` may be SBUF or a literal scalar."""
@@ -50,7 +63,8 @@ class NKITensorScalar(NKIOp):
         data = kwargs["data"]
         operand0 = kwargs["operand0"]
         broadcast = operand0[..., np.newaxis] if isinstance(operand0, np.ndarray) else operand0
-        return _OPS[kwargs["op"]](data, broadcast)
+        operands = (broadcast, data) if kwargs.get("reverse0", False) else (data, broadcast)
+        return _OPS[kwargs["op0"]](*operands)
 
 
 def tensor_scalar_block(sbuf_dst: Any, sbuf_data: Any, sbuf_operand0: Any, op: Any) -> None:

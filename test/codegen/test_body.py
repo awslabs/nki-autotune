@@ -6,9 +6,9 @@ from dataclasses import replace
 from test.transforms._pipeline_fixtures import m_loop_and_children, parent_block_of, tuned_ir
 
 from nkigym.codegen import render
-from nkigym.codegen.body import _emit_alloc, _hoisted_scope, render_buffer_region
+from nkigym.codegen.body import _emit_alloc, _hoisted_scope, render_access_pattern, render_buffer_region
 from nkigym.ir.arith.expr import Add, Const, Mod, Mul, Var
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.ir.tree import AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.load import NKILoad
 
 
@@ -95,6 +95,26 @@ def test_version_rotation_and_pipeline_rendering() -> None:
     assert "for i_d1_0 in range(16):" in source
 
 
+def test_versioned_access_pattern_adds_flattened_pipeline_rotation() -> None:
+    """A physical access pattern selects the pipeline version in its flat offset."""
+    buffer = Buffer(name="sbuf_probability_t", shape=(8192, 128), dtype="bfloat16", location="sbuf", versions=2)
+    pattern = AccessPattern(
+        pattern=(
+            (Const(value=16384), Const(value=128)),
+            (Const(value=1), Const(value=1)),
+            (Const(value=128), Const(value=4)),
+            (Const(value=1), Const(value=128)),
+        ),
+        offset=Mul(left=Var(name="group"), right=Const(value=512)),
+    )
+    rotation = Mul(left=Mod(left=Var(name="step"), right=Const(value=2)), right=Const(value=64))
+    assert render_access_pattern("sbuf_probability_t", pattern, buffer, rotation) == (
+        "sbuf_probability_t[0].ap("
+        "pattern=[[16384, 128], [1, 1], [128, 4], [1, 128]], "
+        "offset=group * 512 + step % 2 * 64 * 128)"
+    )
+
+
 def test_nested_pipeline_does_not_replace_outer_buffer_rotation() -> None:
     """A nested pipeline rotates only buffers that it versioned."""
     ir = tuned_ir()
@@ -131,8 +151,17 @@ def test_allocation_forms() -> None:
         _emit_alloc(packed)
         == "sbuf_lhs_T = [nl.ndarray((128, 16, 2048), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(1)]"
     )
+    composed = Buffer(
+        name="sbuf_versioned", shape=(2048, 512), dtype="bfloat16", location="sbuf", versions=2, list_len=8
+    )
+    assert (
+        _emit_alloc(composed)
+        == "sbuf_versioned = [nl.ndarray((128, 4, 512), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(8)]"
+    )
     hbm = Buffer(name="hbm_out", shape=(2048, 2048), dtype="bfloat16", location="shared_hbm")
     assert _emit_alloc(hbm) == "hbm_out = nl.ndarray((2048, 2048), dtype=nl.bfloat16, buffer=nl.shared_hbm)"
+    hbm_vector = replace(hbm, shape=(128,))
+    assert _emit_alloc(hbm_vector) == "hbm_out = nl.ndarray((128,), dtype=nl.bfloat16, buffer=nl.shared_hbm)"
 
 
 def test_list_tile_region_forms() -> None:
@@ -160,7 +189,7 @@ def test_list_tile_region_forms() -> None:
 
 
 def test_general_list_factorization_parenthesizes_tile_indices() -> None:
-    """Partially split lists divide bare and compound tile indices with explicit grouping."""
+    """Lists derive their list and local indices from logical tiles before rotation."""
     buffer = Buffer(name="s", shape=(2048, 512), dtype="bfloat16", location="sbuf", list_len=8)
     assert buffer.per_tile_physical_shape() == (128, 2, 512)
     bare = BufferRegion(tensor="s", ranges=((Var(name="t"), Const(value=128)), (Const(value=0), Const(value=512))))
@@ -171,3 +200,10 @@ def test_general_list_factorization_parenthesizes_tile_indices() -> None:
         render_buffer_region(compound, buffer)
         == "s[(i_d1_0 * 4 + i_d1_1) // 2][0:128, (i_d1_0 * 4 + i_d1_1) % 2, 0:0 + 512]"
     )
+    versioned = replace(buffer, versions=2)
+    rotation = Mul(left=Mod(left=Var(name="step"), right=Const(value=2)), right=Const(value=2))
+    assert versioned.per_tile_physical_shape() == (128, 4, 512)
+    assert render_buffer_region(bare, versioned, rotation) == "s[(t) // 2][0:128, (t) % 2 + step % 2 * 2, 0:0 + 512]"
+    fully_split = replace(versioned, list_len=16)
+    unit_rotation = Mod(left=Var(name="step"), right=Const(value=2))
+    assert render_buffer_region(bare, fully_split, unit_rotation) == "s[t][0:128, step % 2, 0:0 + 512]"

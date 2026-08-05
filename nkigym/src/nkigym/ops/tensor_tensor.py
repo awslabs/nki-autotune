@@ -2,17 +2,24 @@
 
 Applies ``dst = data1 <op> data2`` over two same-shape ``(P, F)`` SBUF tensors.
 RFactor's ``"rmw"`` write-back block uses this as the running combine
-``out_sbuf = out_sbuf + B_rf[ko]`` — ``data1`` is the RMW accumulator, ``data2``
-the per-slot partial.
+``out_sbuf = out_sbuf + B_rf[ko]`` by binding both ``data1`` and ``dst`` to
+``out_sbuf``.
 """
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
 
-_OPS: dict[str, Any] = {"add": np.add, "subtract": np.subtract, "multiply": np.multiply}
+_OPS: dict[str, Any] = {
+    "add": np.add,
+    "subtract": np.subtract,
+    "multiply": np.multiply,
+    "max": np.maximum,
+    "maximum": np.maximum,
+}
 
 
 class NKITensorTensor(NKIOp):
@@ -20,11 +27,19 @@ class NKITensorTensor(NKIOp):
 
     NAME: ClassVar[str] = "tensor_tensor"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data1": ("P", "F"), "data2": ("P", "F"), "dst": ("P", "F")}
-    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data2"})
-    RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data1"})
+    INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data1", "data2"})
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PointwiseContract:
+        """Return the configured binary pointwise operation."""
+        return PointwiseContract(
+            operator="maximum" if kwargs["op"] == "max" else str(kwargs["op"]),
+            input_operands=("data1", "data2"),
+            output_operand="dst",
+        )
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``data1`` and ``data2`` must both be SBUF-resident."""

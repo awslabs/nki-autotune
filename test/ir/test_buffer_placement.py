@@ -36,13 +36,3 @@ def test_place_buffers_canonical_matches_build():
     """All five buffers — including the shared_hbm output — live at root."""
     root_names = set(after[root])
     assert {"sbuf_lhs_T", "sbuf_rhs", "psum_prod", "sbuf_prod", "hbm_out"} <= root_names
-
-
-def test_place_buffers_is_idempotent_when_called_twice():
-    """Calling place_buffers twice yields the same placement as once."""
-    ir = build_canonical_ir()
-    place_buffers(ir.tree)
-    once = {nid: tuple(b.name for b in ir.tree.block(nid).alloc_buffers) for nid in ir.tree.blocks()}
-    place_buffers(ir.tree)
-    twice = {nid: tuple(b.name for b in ir.tree.block(nid).alloc_buffers) for nid in ir.tree.blocks()}
-    assert once == twice

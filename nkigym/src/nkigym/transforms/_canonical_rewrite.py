@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Const, Mul, Var
@@ -11,6 +12,7 @@ from nkigym.ir.buffer_placement import place_buffers
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole, NKIOp
+from nkigym.transforms._tree_ops import invalidate_stale_software_pipelines
 
 
 @dataclass(frozen=True)
@@ -22,22 +24,55 @@ class CanonicalSpec:
     leaf: ISANode
 
 
+@dataclass(frozen=True)
+class _CanonicalContext:
+    """Derived buffer and axis maps shared by canonical matching."""
+
+    buffers: dict[str, Buffer]
+    extents: dict[str, int]
+
+
+_CONTEXTS: WeakKeyDictionary[KernelTree, _CanonicalContext] = WeakKeyDictionary()
+_SINGLE_LEAVES: WeakKeyDictionary[KernelTree, dict[int, int | None]] = WeakKeyDictionary()
+
+
+def _canonical_context(ir: KernelIR) -> _CanonicalContext:
+    """Return cached canonical-matching facts for the current tree."""
+    context = _CONTEXTS.get(ir.tree)
+    if context is None:
+        context = _CanonicalContext(buffers=ir.all_buffers(), extents=axis_extents(ir))
+        _CONTEXTS[ir.tree] = context
+    return context
+
+
+def _invalidate_canonical_context(ir: KernelIR) -> None:
+    """Discard derived canonical facts after mutating a tree."""
+    _CONTEXTS.pop(ir.tree, None)
+    _SINGLE_LEAVES.pop(ir.tree, None)
+
+
 def single_leaf(tree: KernelTree, block_nid: int) -> int | None:
     """Return the sole ISA leaf owned by ``block_nid``."""
-    result: int | None = None
-    if block_nid in tree.graph and isinstance(tree.data(block_nid), BlockNode):
-        leaves = [
-            nid
-            for nid in tree.descendants(block_nid)
-            if isinstance(tree.data(nid), ISANode)
-            and not any(
-                isinstance(tree.data(ancestor), BlockNode) and ancestor != block_nid
-                for ancestor in tree.ancestors(nid)
-                if ancestor in tree.descendants(block_nid)
-            )
-        ]
-        if len(leaves) == 1:
-            result = leaves[0]
+    cache = _SINGLE_LEAVES.setdefault(tree, {})
+    if block_nid in cache:
+        result = cache[block_nid]
+    else:
+        result = None
+        if block_nid in tree.graph and isinstance(tree.data(block_nid), BlockNode):
+            descendants = tree.descendants(block_nid)
+            leaves = [
+                nid
+                for nid in descendants
+                if isinstance(tree.data(nid), ISANode)
+                and not any(
+                    isinstance(tree.data(ancestor), BlockNode) and ancestor != block_nid
+                    for ancestor in tree.ancestors(nid)
+                    if ancestor in descendants
+                )
+            ]
+            if len(leaves) == 1:
+                result = leaves[0]
+        cache[block_nid] = result
     return result
 
 
@@ -60,10 +95,13 @@ def is_canonical_block(ir: KernelIR, block_nid: int) -> bool:
     if leaf_nid is not None:
         leaf = ir.tree.isa(leaf_nid)
         operand_names = {slot: region.tensor for slot, region in leaf.operand_bindings.items()}
-        spec = canonical_spec(ir, leaf.op_cls, operand_names, ir.tree.block(block_nid).axis_map, leaf.kwargs)
+        spec = canonical_spec(
+            ir, leaf.op_cls, operand_names, ir.tree.block(block_nid).axis_map, leaf.kwargs, _canonical_context(ir)
+        )
         chain = block_chain(ir.tree, block_nid)
         if spec is not None and chain is not None:
-            result = chain == (spec.block, *spec.loops, spec.leaf)
+            block = replace(ir.tree.block(block_nid), alloc_buffers=())
+            result = (block, *chain[1:]) == (spec.block, *spec.loops, spec.leaf)
     return result
 
 
@@ -104,17 +142,24 @@ def axis_extents(ir: KernelIR) -> dict[str, int]:
 
 
 def canonical_spec(
-    ir: KernelIR, op_cls: type[NKIOp], operand_names: dict[str, str], axis_map: dict[str, str], kwargs: dict[str, Any]
+    ir: KernelIR,
+    op_cls: type[NKIOp],
+    operand_names: dict[str, str],
+    axis_map: dict[str, str],
+    kwargs: dict[str, Any],
+    context: _CanonicalContext | None = None,
 ) -> CanonicalSpec | None:
     """Build canonical payloads for one operation."""
-    extents = axis_extents(ir)
-    buffers = ir.all_buffers()
-    valid = all(
+    resolved = context if context is not None else _canonical_context(ir)
+    extents = resolved.extents
+    buffers = resolved.buffers
+    valid = all(name in buffers for name in operand_names.values())
+    valid = valid and all(
         abstract in axis_map and axis_map[abstract] in extents
-        for axes in op_cls.OPERAND_AXES.values()
-        for abstract in axes
+        for slot, axes in op_cls.OPERAND_AXES.items()
+        if slot in operand_names
+        for abstract in axes[: len(buffers[operand_names[slot]].shape)]
     )
-    valid = valid and all(name in buffers for name in operand_names.values())
     tiles: dict[str, int] = {}
     if valid:
         for abstract, concrete in axis_map.items():
@@ -160,10 +205,11 @@ def canonical_spec(
         }
         reads: list[BufferRegion] = []
         writes: list[BufferRegion] = []
+        rmw_operands = op_cls.rmw_operands(kwargs)
         for slot, region in bindings.items():
             if slot in op_cls.INPUT_OPERANDS:
                 reads.append(region)
-            elif slot in op_cls.RMW_OPERANDS:
+            elif slot in rmw_operands:
                 reads.append(region)
                 writes.append(region)
             else:
@@ -216,12 +262,14 @@ def rewrite_block(tree: KernelTree, block_nid: int, spec: CanonicalSpec) -> None
 
 def append_root_buffers(ir: KernelIR, buffers: tuple[Buffer, ...]) -> None:
     """Append new buffers to the root before placement recomputation."""
+    _invalidate_canonical_context(ir)
     root = ir.tree.block(ir.tree.root)
     ir.tree.graph.nodes[ir.tree.root]["data"] = replace(root, alloc_buffers=(*root.alloc_buffers, *buffers))
 
 
 def replace_buffer(ir: KernelIR, replacement: Buffer) -> None:
     """Replace one declared buffer by name."""
+    _invalidate_canonical_context(ir)
     found = 0
     for block_nid in ir.tree.blocks():
         block = ir.tree.block(block_nid)
@@ -235,6 +283,7 @@ def replace_buffer(ir: KernelIR, replacement: Buffer) -> None:
 
 def remove_buffers(ir: KernelIR, names: set[str]) -> None:
     """Remove temporary declarations named by ``names``."""
+    _invalidate_canonical_context(ir)
     removed: set[str] = set()
     for block_nid in ir.tree.blocks():
         block = ir.tree.block(block_nid)
@@ -287,6 +336,8 @@ def replace_input_binding(ir: KernelIR, leaf_nid: int, operand: str, tensor: str
 
 def finalize_rewrite(ir: KernelIR) -> None:
     """Recompute buffer placement and dependencies after a graph rewrite."""
+    _invalidate_canonical_context(ir)
+    invalidate_stale_software_pipelines(ir)
     place_buffers(ir.tree)
     ir.dependency = Dependency(ir.tree)
 
@@ -304,7 +355,8 @@ def _canonical_region(
     """Build one canonical operand region."""
     ranges: list[tuple[Const | Var | Mul, Const]] = []
     buffer = buffers[tensor]
-    for axis_index, abstract in enumerate(axes):
+    present_axes = tuple(axis for axis in axes if axis in axis_map)
+    for axis_index, abstract in enumerate(present_axes):
         concrete = axis_map[abstract]
         tile = tiles[abstract]
         trip = extents[concrete] // tile

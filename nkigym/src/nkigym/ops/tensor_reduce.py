@@ -1,12 +1,13 @@
 """Free-axis reduction op: maps to ``nisa.tensor_reduce``."""
 
-from typing import Any, ClassVar
+from collections.abc import Mapping
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 
-from nkigym.ops.base import AxisRole, NKIOp, _operand_role
+from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
 
-_REDUCE_FNS: dict[str, Any] = {"add": np.sum, "max": np.max}
+_REDUCE_FNS: dict[str, Any] = {"add": np.sum, "max": np.max, "maximum": np.max, "multiply": np.prod}
 
 
 class NKITensorReduce(NKIOp):
@@ -23,10 +24,21 @@ class NKITensorReduce(NKIOp):
     NAME: ClassVar[str] = "tensor_reduce"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "dst": ("P",)}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data"})
+    RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "slot"
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> ReductionContract:
+        """Return the configured free-axis reduction."""
+        return ReductionContract(
+            input_operand="data",
+            output_operand="dst",
+            reduction_axis="F",
+            combinator=reduction_combinator(str(kwargs["op"])),
+        )
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``data`` must be SBUF-resident."""

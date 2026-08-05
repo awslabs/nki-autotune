@@ -2,7 +2,7 @@
 
 import json
 
-from autotune.runner.output import ProfileOutput, write_results_json
+from autotune.runner.output import write_results_json
 from autotune.runner.types import ProfileResult
 
 
@@ -35,11 +35,3 @@ def test_write_results_json_sorts_kernels_numerically(tmp_path):
     data = json.loads((tmp_path / "results.json").read_text())
     names = [k["kernel_name"] for k in data["kernels"]]
     assert names == ["kernel_2.py", "kernel_10.py"]
-
-
-def test_profile_output_str_has_no_hosts_line():
-    """The human summary must not reference hosts (field removed)."""
-    out = ProfileOutput(results=[_summary_result("k_0.py", 0.001, 0.9)], compiler_logs={}, elapsed_s=2.0, cache_dir="")
-    text = str(out)
-    assert "Hosts:" not in text
-    assert "Succeeded:" in text

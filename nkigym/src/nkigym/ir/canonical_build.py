@@ -41,7 +41,7 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     op_records = list(analysis.ops)
     buffers_by_name = _collect_buffers(analysis.tensors, analysis.param_names)
     for rec in op_records:
-        if rec.op_cls.RMW_OPERANDS:
+        if rec.op_cls.rmw_operands(rec.kwargs):
             _build_memset_subblock(tree, tree.root, rec, analysis)
         _build_subblock(tree, tree.root, rec, analysis)
     """Seed every Buffer on the root block, then let place_buffers redistribute by LCA."""
@@ -120,7 +120,7 @@ def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysi
             for_nid = tree.add_node(ForNode(loop_var=loop_var, extent=trip), parent=parent_for_loops)
             parent_for_loops = for_nid
     operand_bindings = _operand_bindings(rec, loop_var_names, analysis)
-    op_kwargs = {k: v for k, v in rec.kwargs.items() if k not in rec.op_cls.OPERAND_AXES}
+    op_kwargs = dict(rec.kwargs)
     tree.add_node(
         ISANode(op_cls=rec.op_cls, operand_bindings=operand_bindings, kwargs=op_kwargs), parent=parent_for_loops
     )
@@ -139,7 +139,7 @@ def _build_memset_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", 
     memset's own abstract axes ``(P, F)`` positionally, so the synthesized
     record renders correctly against the PSUM tensor.
     """
-    rmw_slot = next(iter(rec.op_cls.RMW_OPERANDS))
+    rmw_slot = next(iter(rec.op_cls.rmw_operands(rec.kwargs)))
     rmw_axes = rec.op_cls.OPERAND_AXES[rmw_slot]
     memset_concrete = [rec.axis_map[a] for a in rmw_axes if a in rec.axis_map]
     memset_axis_map = {abstract: concrete for abstract, concrete in zip(NKIMemset.OPERAND_AXES["dst"], memset_concrete)}
@@ -158,13 +158,14 @@ def _operand_regions(
     """Build (reads, writes) BufferRegion lists from ``rec.operand_names`` and OPERAND_AXES."""
     reads: list[BufferRegion] = []
     writes: list[BufferRegion] = []
+    rmw_operands = rec.op_cls.rmw_operands(rec.kwargs)
     for slot, axes in rec.op_cls.OPERAND_AXES.items():
         if slot not in rec.operand_names:
             continue
         region = _build_region(rec, slot, axes, loop_var_names, analysis)
         if slot in rec.op_cls.INPUT_OPERANDS:
             reads.append(region)
-        elif slot in rec.op_cls.RMW_OPERANDS:
+        elif slot in rmw_operands:
             reads.append(region)
             writes.append(region)
         else:

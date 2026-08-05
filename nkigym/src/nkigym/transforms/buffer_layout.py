@@ -1,10 +1,10 @@
-"""``BufferLayout`` transform — re-factorize a buffer's tile axis into a
-``list_len x per_tile`` form (``list_len * per_tile == T``, the total tile count).
+"""``BufferLayout`` transform — re-factorize a buffer's logical tile axis into a
+``list_len x tiles_per_list`` form whose product is the logical tile count.
 
 A pure field-set on :attr:`Buffer.list_len`: it changes neither regions nor
-tree structure, only allocation granularity. It CONSERVES the tile count (never
-creates tiles — that is ``versions`` / SoftwarePipeline). Mirrors
-:class:`SoftwarePipeline`, which sets the sibling :attr:`Buffer.versions`.
+tree structure, only allocation granularity. Pipeline versions remain a separate
+multiplier within every list entry. Mirrors :class:`SoftwarePipeline`, which sets
+the sibling :attr:`Buffer.versions`.
 """
 
 from __future__ import annotations
@@ -15,12 +15,13 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode
+from nkigym.transforms._access_pattern import tensor_has_access_pattern
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
 @dataclass(frozen=True)
 class BufferLayoutOption(TransformOption):
-    """Relayout ``tensor`` to ``list_len`` tiles (``per_tile = T // list_len`` derived).
+    """Relayout ``tensor`` into ``list_len`` allocations of equal logical tile count.
 
     Attributes:
         tensor: buffer name to relayout.
@@ -35,14 +36,16 @@ class BufferLayout(Transform[BufferLayoutOption]):
     """Re-factorize one buffer's tile axis; sets :attr:`Buffer.list_len`."""
 
     def analyze(self, ir: KernelIR) -> list[BufferLayoutOption]:
-        """Every (tensor, divisor-of-T) relayout for each sbuf/psum, single-version buffer."""
+        """Return every logical-tile divisor relayout for each on-chip buffer."""
         options: list[BufferLayoutOption] = []
         for name, buf in ir.all_buffers().items():
-            if buf.location not in ("sbuf", "psum") or buf.versions != 1:
+            if buf.location not in ("sbuf", "psum"):
                 continue
-            total_tiles = buf.physical_shape()[1]
-            for b in range(1, total_tiles + 1):
-                if total_tiles % b == 0 and b != buf.list_len:
+            if tensor_has_access_pattern(ir.tree, name):
+                continue
+            logical_tiles = buf.logical_tile_count()
+            for b in range(1, logical_tiles + 1):
+                if logical_tiles % b == 0 and b != buf.list_len:
                     options.append(BufferLayoutOption(tensor=name, list_len=b))
         return options
 
@@ -62,14 +65,12 @@ class BufferLayout(Transform[BufferLayoutOption]):
         buf = buffers[option.tensor]
         if buf.location == "shared_hbm":
             raise TransformLegalityError(f"BufferLayout: {option.tensor} is shared_hbm (no tile axis)")
-        if buf.versions > 1:
+        if tensor_has_access_pattern(ir.tree, option.tensor):
+            raise TransformLegalityError(f"BufferLayout: {option.tensor} participates in an explicit access pattern")
+        logical_tiles = buf.logical_tile_count()
+        if option.list_len < 1 or logical_tiles % option.list_len != 0:
             raise TransformLegalityError(
-                f"BufferLayout: {option.tensor} has versions={buf.versions} (does not compose with list_len)"
-            )
-        total_tiles = buf.physical_shape()[1]
-        if option.list_len < 1 or total_tiles % option.list_len != 0:
-            raise TransformLegalityError(
-                f"BufferLayout: list_len {option.list_len} must be a positive divisor of T={total_tiles}"
+                f"BufferLayout: list_len {option.list_len} must be a positive divisor of T={logical_tiles}"
             )
         if option.list_len == buf.list_len:
             raise TransformLegalityError(f"BufferLayout: {option.tensor} already has list_len={option.list_len}")

@@ -45,6 +45,44 @@ def place_buffers(tree: KernelTree) -> None:
         tree.graph.nodes[block_nid]["data"] = replace(blk, alloc_buffers=tuple(bufs))
 
 
+def place_buffer(tree: KernelTree, tensor: str) -> None:
+    """Recompute and apply LCA-of-users placement for one buffer.
+
+    Every non-selected buffer remains attached to its current owning block.
+    This is required by per-buffer transforms: earlier structural rewrites may
+    have made several declarations eligible for tighter placement, but selecting
+    one buffer must not materialize placement changes for the others.
+    """
+    buffers = _gather_buffers(tree)
+    if tensor not in buffers:
+        raise KeyError(f"buffer {tensor!r} is declared by no block")
+    buf = buffers[tensor]
+    source_nid = _declaring_block(tree, tensor)
+    touch = _touchers_by_tensor(tree).get(tensor)
+    if buf.location == "shared_hbm":
+        target_nid = tree.root
+    else:
+        lca = tree.root if not touch else _lca(tree, touch)
+        target_nid = _enclosing_block(tree, lca)
+    if source_nid != target_nid:
+        source = tree.block(source_nid)
+        remaining = tuple(candidate for candidate in source.alloc_buffers if candidate.name != tensor)
+        tree.graph.nodes[source_nid]["data"] = replace(source, alloc_buffers=remaining)
+
+        order = {name: index for index, name in enumerate(buffers)}
+        target = tree.block(target_nid)
+        placed = tuple(sorted((*target.alloc_buffers, buf), key=lambda candidate: order[candidate.name]))
+        tree.graph.nodes[target_nid]["data"] = replace(target, alloc_buffers=placed)
+
+
+def _declaring_block(tree: KernelTree, tensor: str) -> int:
+    """Return the unique block that declares ``tensor``."""
+    owners = [nid for nid in tree.blocks() if any(buffer.name == tensor for buffer in tree.block(nid).alloc_buffers)]
+    if len(owners) != 1:
+        raise AssertionError(f"buffer {tensor!r} must have exactly one declaration, found {owners}")
+    return owners[0]
+
+
 def _enclosing_block(tree: KernelTree, nid: int) -> int:
     """Return ``nid`` if it is a BlockNode, else its nearest BlockNode ancestor.
 
@@ -116,4 +154,4 @@ def _lca(tree: KernelTree, nids: set[int]) -> int:
     return lca_nid
 
 
-__all__ = ["place_buffers"]
+__all__ = ["place_buffer", "place_buffers"]

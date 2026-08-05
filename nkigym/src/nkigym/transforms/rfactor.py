@@ -11,9 +11,10 @@ PSUM accumulator is per-output-tile (it is re-zeroed every ``ko``, never grown b
 its M (partition-tile) axis — a later ``Split(M)`` cannot corrupt it. See
 ``docs/superpowers/specs/2026-06-12-same-prefix-computeat-and-two-stage-rfactor-design.md``.
 
-The shipped implementation covers the two-dimensional ``"rmw"`` recipe used by
-``NKIMatmul``. It derives loop placement and tensor extents from the IR, but does
-not implement the separate ``"slot"`` reduction recipe.
+This transform covers the two-dimensional ``"rmw"`` recipe used by
+``NKIMatmul``. Fused pointwise reductions use the ``"slot"`` recipe as part of
+the atomic tensorize ``Split`` action, so no overwriting split intermediate is
+ever exposed.
 """
 
 from __future__ import annotations
@@ -29,7 +30,8 @@ from nkigym.ops.base import AxisRole, NKIOp
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.tensor_tensor import NKITensorTensor
-from nkigym.transforms._tree_ops import _replace_in_parent_children
+from nkigym.transforms._canonical_rewrite import single_leaf
+from nkigym.transforms._tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 _RMW_STAGING_BUFFER = "sbuf_rfactor"
@@ -84,7 +86,8 @@ class RFactor(Transform[RFactorOption]):
         result = False
         if leaf is not None:
             op_cls = ir.tree.isa(leaf).op_cls
-            block = self._enclosing_block(ir, leaf)
+            block_nid = self._enclosing_block_nid(ir.tree, leaf)
+            block = ir.tree.block(block_nid)
             axis = self._loop_axis(ir, loop_nid, block)
             axis_loops: list[int] = []
             if axis is not None:
@@ -92,7 +95,9 @@ class RFactor(Transform[RFactorOption]):
                 axis_loops = [
                     nid
                     for nid in ir.tree.ancestors(leaf)
-                    if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in binding_vars
+                    if isinstance((node := ir.tree.data(nid)), ForNode)
+                    and node.loop_var in binding_vars
+                    and block_nid in ir.tree.ancestors(nid)
                 ]
             if (
                 self._supports_rmw_op(op_cls)
@@ -141,11 +146,10 @@ class RFactor(Transform[RFactorOption]):
         if len(inits) == 1:
             init_nid = inits[0]
             init_block = self._enclosing_block_nid(ir.tree, init_nid)
-            leaves = [nid for nid in ir.tree.preorder(init_block) if isinstance(ir.tree.data(nid), ISANode)]
             preorder = list(ir.tree.preorder())
             init = ir.tree.isa(init_nid)
             result = (
-                leaves == inits
+                single_leaf(ir.tree, init_block) == init_nid
                 and loop_nid not in ir.tree.ancestors(init_nid)
                 and preorder.index(init_nid) < preorder.index(matmul_leaf)
                 and init.kwargs.get("value") == float(reducer.identity)
@@ -258,7 +262,7 @@ class RFactor(Transform[RFactorOption]):
             )
         if not self._rfactorable(ir, nid):
             raise TransformLegalityError(
-                f"RFactor target loop {nid} is not a legal rmw reduction: it must be "
+                f"RFactor target loop {nid} is not a legal reduction: an rmw recipe must be "
                 f"the outermost of exactly two loops binding an ACCUMULATION axis, "
                 f"have canonical outside-loop init and identity-mapped drain blocks, "
                 f"use a supported combiner, and fit a contiguous gadget footprint "
@@ -349,6 +353,7 @@ class RFactor(Transform[RFactorOption]):
             combiner,
         )
 
+        invalidate_stale_software_pipelines(ir)
         ir.dependency = Dependency(tree)
 
     def _enclosing_block_nid(self, tree: KernelTree, nid: int) -> int:
@@ -370,15 +375,18 @@ class RFactor(Transform[RFactorOption]):
         tree = ir.tree
         matmul_leaf = self._owning_matmul_leaf(ir, ko_loop_nid)
         assert matmul_leaf is not None
-        block = self._enclosing_block(ir, matmul_leaf)
-        op_cls = self._op_cls_of_block(tree, self._enclosing_block_nid(tree, matmul_leaf))
+        block_nid = self._enclosing_block_nid(tree, matmul_leaf)
+        block = tree.block(block_nid)
+        op_cls = self._op_cls_of_block(tree, block_nid)
         reduction_abstract = next(a for a, role in op_cls.AXIS_ROLES.items() if role == AxisRole.ACCUMULATION)
         k_axis = block.axis_map[reduction_abstract]
         k_binding_vars = self._axis_binding_loopvars(block, k_axis)
         k_loops = [
             a
             for a in tree.ancestors(matmul_leaf)
-            if isinstance((node := tree.data(a)), ForNode) and node.loop_var in k_binding_vars
+            if isinstance((node := tree.data(a)), ForNode)
+            and node.loop_var in k_binding_vars
+            and block_nid in tree.ancestors(a)
         ]
         return k_loops[-1]
 
@@ -491,7 +499,13 @@ class RFactor(Transform[RFactorOption]):
         """
         tree = ir.tree
         out_buf = ir.buffer(out_name)
-        rf_buf = Buffer(name=staging_name, shape=out_buf.shape, dtype=out_buf.dtype, location="sbuf")
+        rf_buf = Buffer(
+            name=staging_name,
+            shape=out_buf.shape,
+            dtype=out_buf.dtype,
+            location="sbuf",
+            storage_dtype=out_buf.storage_dtype,
+        )
         for nid in tree.blocks():
             block = tree.data(nid)
             assert isinstance(block, BlockNode)
@@ -624,8 +638,8 @@ class RFactor(Transform[RFactorOption]):
         """Splice the second half of ``drain_two_stage_0``: the cross-``ko`` SBUF fold.
 
         ``tensor_tensor(data1=out_sbuf, data2=sbuf_rfactor, dst=out_sbuf, op=combiner)``
-        as ``ki``'s following sibling (after the copy). ``data1``/``dst`` are the RMW
-        accumulator (constant address across ``ko``), so the block binds ``ko`` as
+        as ``ki``'s following sibling (after the copy). ``data1`` and ``dst`` alias
+        the accumulator (constant address across ``ko``), so the block binds ``ko`` as
         ACCUMULATION — its cross-``ko`` carry on ``out_sbuf`` is the closing
         second-stage reduction. ``combiner`` is the op's ``REDUCE_COMBINATOR.combiner``
         (``"add"`` for matmul).

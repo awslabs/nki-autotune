@@ -52,6 +52,11 @@ class Dependency:
         self._owner_block: dict[int, int] = {}
         self._tree = tree
         self._build(tree)
+        self._preorder = tuple(tree.preorder())
+        self._order = {nid: index for index, nid in enumerate(self._preorder)}
+        self._ancestors = {nid: tuple(tree.ancestors(nid)) for nid in self._preorder}
+        self._descendants = {nid: frozenset(tree.descendants(nid)) for nid in self._preorder}
+        self._tree_edges = frozenset(tree.graph.edges)
         closure = nx.transitive_closure(self.graph, reflexive=False)
         self._closure: nx.DiGraph = nx.DiGraph()
         self._closure.add_nodes_from(closure.nodes(data=True))
@@ -155,21 +160,19 @@ class Dependency:
         splice makes it their descendant; every other endpoint keeps its own
         ``self._tree`` ForNode ancestors minus the moved subtree.
         """
-        order: dict[int, float] = {n: i for i, n in enumerate(self._tree.preorder())}
+        order, ancestors, descendants = self._topology()
         owner_block = self._owner_block.get(moved_leaf_nid, moved_leaf_nid)
-        moved_subtree = self._tree.descendants(owner_block) | {owner_block}
-        moved_pos = self._effective_insertion_position(order, target_loop_nid, index, moved_subtree)
-        enclosers = set(self._tree.ancestors(target_loop_nid)) | {target_loop_nid}
+        moved_subtree = set(descendants[owner_block]) | {owner_block}
+        moved_pos = self._effective_insertion_position(order, descendants, target_loop_nid, index, moved_subtree)
+        enclosers = set(ancestors[target_loop_nid]) | {target_loop_nid}
         target_loops = [
-            n
-            for n in (target_loop_nid, *self._tree.ancestors(target_loop_nid))
-            if isinstance(self._tree.data(n), ForNode)
+            n for n in (target_loop_nid, *ancestors[target_loop_nid]) if isinstance(self._tree.data(n), ForNode)
         ]
 
         def span(nid: int) -> tuple[float, float]:
             if nid == moved_leaf_nid:
                 return (moved_pos, moved_pos)
-            positions = [order[d] for d in (self._tree.descendants(nid) | {nid}) - moved_subtree if d in order]
+            positions: list[float] = [order[d] for d in (set(descendants[nid]) | {nid}) - moved_subtree]
             if nid in enclosers:
                 positions.append(moved_pos)
             if not positions:
@@ -179,16 +182,32 @@ class Dependency:
         def enclosing_loops(nid: int) -> list[int]:
             if nid == moved_leaf_nid:
                 return target_loops
-            return [
-                a
-                for a in self._tree.ancestors(nid)
-                if a not in moved_subtree and isinstance(self._tree.data(a), ForNode)
-            ]
+            return [a for a in ancestors[nid] if a not in moved_subtree and isinstance(self._tree.data(a), ForNode)]
 
         return self._first_backward(moved_leaf_nid, span, self._tree, enclosing_loops)
 
+    def _topology(self) -> tuple[dict[int, int], dict[int, tuple[int, ...]], dict[int, frozenset[int]]]:
+        """Return cached topology or rebuild it when callers mutate the tree."""
+        current_nodes = frozenset(self._tree.graph.nodes)
+        current_edges = frozenset(self._tree.graph.edges)
+        if current_nodes == frozenset(self._preorder) and current_edges == self._tree_edges:
+            order = self._order
+            ancestors = self._ancestors
+            descendants = self._descendants
+        else:
+            preorder = tuple(self._tree.preorder())
+            order = {nid: index for index, nid in enumerate(preorder)}
+            ancestors = {nid: tuple(self._tree.ancestors(nid)) for nid in preorder}
+            descendants = {nid: frozenset(self._tree.descendants(nid)) for nid in preorder}
+        return order, ancestors, descendants
+
     def _effective_insertion_position(
-        self, order: dict[int, float], target_loop_nid: int, index: int, moved_subtree: set[int]
+        self,
+        order: dict[int, int],
+        descendants: dict[int, frozenset[int]],
+        target_loop_nid: int,
+        index: int,
+        moved_subtree: set[int],
     ) -> float:
         """Half-integer preorder position the moved leaf takes under the target.
 
@@ -217,7 +236,7 @@ class Dependency:
             anchor = order[target_loop_nid]
         else:
             preceding = children[min(pos, len(children)) - 1]
-            anchor = max(order[d] for d in (self._tree.descendants(preceding) | {preceding}))
+            anchor = max(order[d] for d in (*descendants[preceding], preceding))
         return anchor + 0.5
 
     def _first_backward(
@@ -402,9 +421,10 @@ class Dependency:
 
 def _rmw_operand_slots(node: ISANode) -> frozenset[str]:
     """Return statically RMW slots plus input/output slots that alias exactly."""
-    slots = set(node.op_cls.RMW_OPERANDS)
+    configured_rmw = node.op_cls.rmw_operands(node.kwargs)
+    slots = set(configured_rmw)
     inputs = node.op_cls.INPUT_OPERANDS
-    outputs = set(node.operand_bindings) - inputs - node.op_cls.RMW_OPERANDS
+    outputs = set(node.operand_bindings) - inputs - configured_rmw
     for input_slot in inputs:
         input_region = node.operand_bindings.get(input_slot)
         if input_region is None:

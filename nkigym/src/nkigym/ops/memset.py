@@ -1,8 +1,9 @@
 """In-place fill op: maps to ``nisa.memset``."""
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import InitializerContract, NKIOp, _operand_role
 
 
 class NKIMemset(NKIOp):
@@ -19,6 +20,11 @@ class NKIMemset(NKIOp):
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset()
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> InitializerContract:
+        """Return the configured fill contract."""
+        return InitializerContract(output_operand="dst", value=float(kwargs["value"]))
 
     def _output_role(self, **kwargs: Any) -> str:
         """Return the role of ``dst`` unchanged (memset does not change residency)."""

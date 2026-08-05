@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from nkigym.ir.arith.expr import Const, Expr, substitute, to_affine
-from nkigym.ir.buffer_placement import place_buffers
+from nkigym.ir.buffer_placement import place_buffer
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 
@@ -26,12 +26,11 @@ def place_and_compact_buffer(tree: KernelTree, tensor: str) -> None:
     """Descend ``tensor``'s decl to its LCA scope, then shrink its logical shape.
 
     The per-buffer analogue of the old ``place_buffers`` + ``compact_shapes``
-    tail. ``place_buffers`` is a whole-tree LCA recompute that is idempotent for
-    every already-placed buffer, so running it re-places only the buffers whose
-    touchers moved (here, ``tensor``); the others are unchanged. The shape shrink
-    then rewrites only ``tensor``'s owning-block alloc entry.
+    tail. Placement and shape changes are restricted to ``tensor``; declarations
+    made eligible for tighter placement by earlier structural rewrites remain
+    unchanged until their own ``BufferCompaction`` action is selected.
     """
-    place_buffers(tree)
+    place_buffer(tree, tensor)
     for block_nid in tree.blocks():
         block = tree.data(block_nid)
         assert isinstance(block, BlockNode)
@@ -187,7 +186,7 @@ def _clamp_list_len_to_tiles(buf: Buffer) -> Buffer:
     """
     result = buf
     if buf.location != "shared_hbm" and buf.list_len > 1:
-        total_tiles = buf.physical_shape()[1]
+        total_tiles = buf.logical_tile_count()
         if buf.list_len > total_tiles:
             if total_tiles < 1 or buf.list_len % total_tiles != 0:
                 raise AssertionError(

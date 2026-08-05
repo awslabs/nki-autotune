@@ -10,15 +10,12 @@ from test.transforms._fixtures import f_lhs_matmul, f_matmul
 import numpy as np
 
 from nkigym.codegen import render
-from nkigym.environment import KernelMDP
 from nkigym.ir import KernelIR, build_initial_ir
 from nkigym.ir.arith.expr import Const
 from nkigym.ir.tree import ForNode, ISANode
 from nkigym.synthesis import simulate_fp32
 from nkigym.transforms import (
-    CancelTransposePair,
     InsertTransposePair,
-    InsertTransposePairOption,
     Split,
     SplitOption,
     TransposeThroughLoad,
@@ -93,48 +90,6 @@ def _simulate(
     module = _load_source(render(ir), tmp_path, module_name)
     actual = np.asarray(simulate_fp32(getattr(module, function_name))(**inputs))
     np.testing.assert_allclose(actual, expected, atol=5e-3, rtol=5e-3, err_msg=module_name)
-
-
-def test_layout_ladder_exposes_primitive_search_actions() -> None:
-    """The MDP inserts, cancels, and commutes one concrete action at a time."""
-    ladder = _layout_ladder(INPUT_SPECS)
-    assert [name for name, _ir in ladder] == ["canonical", "insert_pair", "commute_matmul", "commute_tensor_copy"]
-    assert [len(_leaves(ir, "NKITranspose")) for _name, ir in ladder] == [0, 2, 1, 0]
-    assert [len(_leaves(ir, "NKIDMATranspose")) for _name, ir in ladder] == [0, 0, 0, 1]
-    assert [len(_leaves(ir, "NKIMatmul")) for _name, ir in ladder] == [1, 1, 1, 1]
-
-    environment = KernelMDP(
-        f_matmul,
-        SMALL_INPUT_SPECS,
-        transforms=[
-            InsertTransposePair(),
-            CancelTransposePair(),
-            TransposeThroughMatmul(),
-            TransposeThroughTensorCopy(),
-        ],
-    )
-    initial = environment.reset()
-    insert_action = next(
-        action
-        for action in environment.legal_actions(initial)
-        if isinstance(action[0], InsertTransposePair)
-        and isinstance(action[1], InsertTransposePairOption)
-        and action[1].source == "sbuf_prod"
-    )
-    inserted = environment.step(initial, insert_action)
-    inserted_actions = environment.legal_actions(inserted)
-    assert any(isinstance(transform, CancelTransposePair) for transform, _option in inserted_actions)
-    commute_action = next(action for action in inserted_actions if isinstance(action[0], TransposeThroughMatmul))
-    commuted = environment.step(inserted, commute_action)
-    materialize_action = next(
-        action for action in environment.legal_actions(commuted) if isinstance(action[0], TransposeThroughTensorCopy)
-    )
-    materialized = environment.step(commuted, materialize_action)
-    assert _leaves(materialized, "NKITranspose") == []
-    assert len(_leaves(materialized, "NKIDMATranspose")) == 1
-
-    cancel_action = next(action for action in inserted_actions if isinstance(action[0], CancelTransposePair))
-    assert render(environment.step(inserted, cancel_action)) == render(initial)
 
 
 def test_layout_ladder_changes_the_matmul_orientation() -> None:

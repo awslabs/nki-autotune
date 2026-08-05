@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from test._simulation import assert_matmul_ir_simulates
 from test.transforms._fixtures import build_canonical_ir
-from test.transforms._pipeline_fixtures import m_loop_and_children, tuned_ir
+from test.transforms._pipeline_fixtures import INPUT_SPECS, TRACE, f_nkigym, m_loop_and_children, tuned_ir
 
 import pytest
 
-from nkigym.environment import Action
+from nkigym.codegen import render
+from nkigym.environment import Action, KernelMDP
 from nkigym.ir import KernelIR
-from nkigym.ir.tree import ISANode
+from nkigym.ir.tree import Buffer, ISANode
+from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.transforms import (
+    BufferCompaction,
     BufferLayout,
     BufferLayoutOption,
     CodeMotion,
@@ -26,6 +29,7 @@ from nkigym.transforms import (
     SplitOption,
     TransformLegalityError,
 )
+from nkigym.transforms._canonical_rewrite import append_block, append_root_buffers, finalize_rewrite, required_spec
 
 
 def _apply_action(ir: KernelIR, action: Action) -> KernelIR:
@@ -48,7 +52,7 @@ def _check_analyze_enumerates_nondecreasing_labelings():
 
 
 def _check_apply_derives_versions_and_annotates():
-    """apply((0,0,1)) sets psum versions=2 and writes the annotation; tree unchanged."""
+    """apply((0,0,1)) versions PSUM and renders fill, steady, and drain phases."""
     ir = tuned_ir()
     m_loop, _children = m_loop_and_children(ir)
     n_nodes_before = ir.tree.graph.number_of_nodes()
@@ -58,6 +62,11 @@ def _check_apply_derives_versions_and_annotates():
     anns = [new_ir.tree.block(nid).annotations.get("software_pipeline") for nid in new_ir.tree.blocks()]
     assert any(a and a["stages"] == (0, 0, 1) for a in anns)
     assert any(a and a["versioned_buffers"] == ("psum_prod",) for a in anns)
+    source = render(new_ir)
+    assert "for i_d1_0 in range(15):" in source
+    assert "dst=psum_prod[0][0:128, (i_d1_0 + 1) % 2, 0:0 + 2048]" in source
+    assert "src=psum_prod[0][0:128, i_d1_0 % 2, 0:0 + 2048]" in source
+    assert "src=psum_prod[0][0:128, 1, 0:0 + 2048], dst=sbuf_prod[0][0:128, 15, 0:0 + 2048]" in source
 
 
 def _check_apply_rejects_consumer_before_producer_stage():
@@ -76,25 +85,68 @@ def _check_apply_rejects_duplicate_order():
         SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 1)))
 
 
-def _check_analyze_omits_pipeline_that_would_version_a_list_buffer():
-    """Pipeline analysis excludes options that would multi-version a listed buffer."""
+def _check_apply_rejects_malformed_stages():
+    """Stage labels must start at zero, be contiguous, and contain work in two stages."""
+    ir = tuned_ir()
+    m_loop, _children = m_loop_and_children(ir)
+    for stages in ((0, 0, 0), (0, 0, 2), (1, 1, 2)):
+        with pytest.raises(TransformLegalityError):
+            SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=m_loop, stages=stages, order=(0, 1, 2)))
+
+
+def _wide_tuned_ir() -> KernelIR:
+    """Return the tuned fixture with sixteen logical accumulator tiles."""
     ir = tuned_ir()
     object.__setattr__(ir.buffer("psum_prod"), "shape", (2048, 2048))
+    return ir
+
+
+def _check_analyze_composes_pipeline_and_list_layout():
+    """Each transform still offers its option after the other transform applies."""
+    ir = _wide_tuned_ir()
     m_loop, _children = m_loop_and_children(ir)
     listed_ir = BufferLayout().apply(ir, BufferLayoutOption(tensor="psum_prod", list_len=16))
     option = SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2))
-    assert option not in SoftwarePipeline().analyze(listed_ir)
+    assert option in SoftwarePipeline().analyze(listed_ir)
+
+    ir = _wide_tuned_ir()
+    m_loop, _children = m_loop_and_children(ir)
+    pipelined_ir = SoftwarePipeline().apply(
+        ir, SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2))
+    )
+    layouts = [candidate for candidate in BufferLayout().analyze(pipelined_ir) if candidate.tensor == "psum_prod"]
+    assert BufferLayoutOption(tensor="psum_prod", list_len=16) in layouts
 
 
-def _check_apply_rejects_pipeline_that_would_version_a_list_buffer():
-    """Direct apply rejects an option that would multi-version a listed buffer."""
-    ir = tuned_ir()
-    object.__setattr__(ir.buffer("psum_prod"), "shape", (2048, 2048))
+def _check_apply_composes_in_both_orders():
+    """List layout and software pipelining commute on buffer geometry and rendering."""
+    ir = _wide_tuned_ir()
     m_loop, _children = m_loop_and_children(ir)
     listed_ir = BufferLayout().apply(ir, BufferLayoutOption(tensor="psum_prod", list_len=16))
     option = SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2))
-    with pytest.raises(TransformLegalityError):
-        SoftwarePipeline().apply(listed_ir, option)
+    listed_then_pipelined = SoftwarePipeline().apply(listed_ir, option)
+
+    ir = _wide_tuned_ir()
+    m_loop, _children = m_loop_and_children(ir)
+    option = SoftwarePipelineOption(loop_nid=m_loop, stages=(0, 0, 1), order=(0, 1, 2))
+    pipelined_ir = SoftwarePipeline().apply(ir, option)
+    pipelined_then_listed = BufferLayout().apply(pipelined_ir, BufferLayoutOption(tensor="psum_prod", list_len=16))
+
+    for composed in (listed_then_pipelined, pipelined_then_listed):
+        buffer = composed.buffer("psum_prod")
+        assert (buffer.list_len, buffer.versions) == (16, 2)
+        assert buffer.per_tile_physical_shape() == (128, 2, 2048)
+    assert render(listed_then_pipelined) == render(pipelined_then_listed)
+
+
+def _check_large_body_option_generation_is_bounded():
+    """A seventeen-child body offers every contiguous two- and three-stage partition."""
+    labelings = SoftwarePipeline()._nondecreasing_labelings(17)
+    assert len(labelings) == 136
+    assert (0,) * 16 + (1,) in labelings
+    assert (0,) * 4 + (1,) * 8 + (2,) * 5 in labelings
+    assert tuple(range(17)) not in labelings
+    assert all(max(stages) in {1, 2} for stages in labelings)
 
 
 def _check_pipeline_rejects_partial_version_write_with_wider_read():
@@ -148,6 +200,50 @@ def _check_pipeline_rejects_loop_touching_an_already_versioned_buffer():
     assert option not in SoftwarePipeline().analyze(ir)
 
 
+def _check_pipeline_rejects_versioned_buffer_liveout() -> None:
+    """A versioned intermediate cannot have an unrotated reader after the pipeline."""
+    environment = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[Split(), Fuse(), Reorder(), CodeMotion()])
+    ir = environment.reset()
+    for transform, transform_option in TRACE:
+        if isinstance(transform, BufferCompaction):
+            break
+        ir = environment.step(ir, (transform, transform_option))
+
+    append_root_buffers(
+        ir, (Buffer(name="sbuf_liveout", shape=ir.buffer("psum_prod").shape, dtype="bfloat16", location="sbuf"),)
+    )
+    liveout = required_spec(ir, NKITensorCopy, {"src": "psum_prod", "dst": "sbuf_liveout"}, {"P": "d1", "F": "d2"}, {})
+    liveout_block = append_block(ir.tree, liveout)
+    ir.tree.graph.add_edge(ir.tree.root, liveout_block)
+    finalize_rewrite(ir)
+
+    loop_nid, _children = m_loop_and_children(ir)
+    option = SoftwarePipelineOption(loop_nid=loop_nid, stages=(0, 0, 1), order=(0, 1, 2))
+    with pytest.raises(TransformLegalityError):
+        SoftwarePipeline().apply(ir, option)
+    assert option not in SoftwarePipeline().analyze(ir)
+
+
+def _check_code_motion_invalidates_changed_pipeline_children():
+    """Moving a direct child into a staged loop drops stale stages and versions."""
+    ir = tuned_ir()
+    loop_nid, children = m_loop_and_children(ir)
+    ir = SoftwarePipeline().apply(ir, SoftwarePipelineOption(loop_nid=loop_nid, stages=(0, 0, 1), order=(0, 1, 2)))
+    option = next(
+        candidate
+        for candidate in CodeMotion().analyze(ir)
+        if ir.tree.parent(candidate.block_nid) == ir.tree.root and candidate.target_loop_nid == loop_nid
+    )
+    transformed = CodeMotion().apply(ir, option)
+    assert transformed.tree.children(loop_nid) != children
+    assert transformed.buffer("psum_prod").versions == 1
+    assert all(
+        "software_pipeline" not in transformed.tree.block(block_nid).annotations
+        for block_nid in transformed.tree.blocks()
+    )
+    render(transformed)
+
+
 def test_increment1_sim_matches_numpy(tmp_path) -> None:
     """The pipelined kernel computes lhs_T.T @ rhs (fp32 CPU sim)."""
     ir = tuned_ir()
@@ -159,6 +255,7 @@ def test_increment1_sim_matches_numpy(tmp_path) -> None:
 def test_pipeline_analysis_and_apply_contract() -> None:
     """Analysis enumerates valid stages and apply derives versions and annotations."""
     _check_analyze_enumerates_nondecreasing_labelings()
+    _check_large_body_option_generation_is_bounded()
     _check_apply_derives_versions_and_annotates()
 
 
@@ -166,15 +263,22 @@ def test_pipeline_rejects_invalid_stage_and_order_assignments() -> None:
     """Consumer-before-producer stages and duplicate order values fail."""
     _check_apply_rejects_consumer_before_producer_stage()
     _check_apply_rejects_duplicate_order()
+    _check_apply_rejects_malformed_stages()
 
 
-def test_pipeline_rejects_listed_buffer_versioning() -> None:
-    """Analysis and direct apply reject versioning an already listed buffer."""
-    _check_analyze_omits_pipeline_that_would_version_a_list_buffer()
-    _check_apply_rejects_pipeline_that_would_version_a_list_buffer()
+def test_pipeline_composes_with_listed_buffer_versioning() -> None:
+    """Analysis and apply compose list layout with pipeline versions in either order."""
+    _check_analyze_composes_pipeline_and_list_layout()
+    _check_apply_composes_in_both_orders()
 
 
 def test_pipeline_rejects_inconsistent_versioned_accesses() -> None:
-    """Partial writes and nested pipelines cannot create inconsistent versions."""
+    """Partial writes, live-outs, and nested pipelines cannot create inconsistent versions."""
     _check_pipeline_rejects_partial_version_write_with_wider_read()
     _check_pipeline_rejects_loop_touching_an_already_versioned_buffer()
+    _check_pipeline_rejects_versioned_buffer_liveout()
+
+
+def test_structural_rewrite_invalidates_stale_pipeline() -> None:
+    """A post-pipeline child-list rewrite remains renderable."""
+    _check_code_motion_invalidates_changed_pipeline_children()
