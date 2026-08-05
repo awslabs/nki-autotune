@@ -1,7 +1,8 @@
-"""Deterministic source-size and public-transform API limits."""
+"""Deterministic source-size, dependency, and public-transform API limits."""
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 from _transform_inventory import inspect_transform_api, inspect_transforms
@@ -10,6 +11,8 @@ MAX_PUBLIC_TRANSFORMS = 25
 TRANSFORM_FILE_LINE_LIMIT = 1000
 MAX_IR_IMPLEMENTATION_LINES = 5000
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+SKILL_SCRIPTS = REPOSITORY_ROOT / ".agents/skills/develop-nkigym/scripts"
+REPOSITORY_IMPORT_ROOTS = {"develop_nkigym", "developer", "kernel_library", "nkigym"}
 
 
 def _transform_file_violations() -> tuple[list[str], int, int]:
@@ -67,12 +70,54 @@ def _ir_size_violation() -> tuple[str | None, int]:
     return violation, total_lines
 
 
+def _import_roots(path: Path) -> tuple[tuple[str, int], ...]:
+    """Return absolute import roots and source lines from one Python file."""
+    module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imports: list[tuple[str, int]] = []
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            imports.extend((alias.name.partition(".")[0], node.lineno) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module is not None:
+            imports.append((node.module.partition(".")[0], node.lineno))
+    return tuple(imports)
+
+
+def _boundary_violations(directory: Path, allowed_repository_roots: set[str]) -> list[str]:
+    """Return repository-package imports forbidden below one directory."""
+    violations: list[str] = []
+    for path in sorted(directory.rglob("*.py")):
+        for root, line in _import_roots(path):
+            if root in REPOSITORY_IMPORT_ROOTS and root not in allowed_repository_roots:
+                relative = path.relative_to(REPOSITORY_ROOT)
+                violations.append(f"{relative}:{line} must not import repository package {root}")
+    return violations
+
+
+def _dependency_violations() -> list[str]:
+    """Enforce the one-way repository dependency graph."""
+    violations = [
+        *_boundary_violations(REPOSITORY_ROOT / "nkigym/src/nkigym", {"nkigym"}),
+        *_boundary_violations(REPOSITORY_ROOT / "kernel_library", {"kernel_library", "nkigym"}),
+        *_boundary_violations(REPOSITORY_ROOT / "test", {"nkigym"}),
+    ]
+    if (REPOSITORY_ROOT / "developer").exists():
+        violations.append("legacy top-level developer package must remain removed")
+    for path in sorted(REPOSITORY_ROOT.rglob("*.py")):
+        if path.is_relative_to(SKILL_SCRIPTS):
+            continue
+        for root, line in _import_roots(path):
+            if root == "develop_nkigym":
+                relative = path.relative_to(REPOSITORY_ROOT)
+                violations.append(f"{relative}:{line} must not import skill support package develop_nkigym")
+    return violations
+
+
 def test_source_size_and_public_transform_contracts() -> None:
-    """Source growth stays bounded and every public transform uses analyze/apply."""
+    """Source growth, dependency boundaries, and public transform APIs remain valid."""
     file_violations, transform_count, largest_transform_file = _transform_file_violations()
     api_violations = _transform_api_violations()
     ir_violation, ir_lines = _ir_size_violation()
-    violations = [*file_violations, *api_violations]
+    violations = [*file_violations, *api_violations, *_dependency_violations()]
     if ir_violation is not None:
         violations.append(ir_violation)
     print(

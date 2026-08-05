@@ -11,6 +11,7 @@ from types import ModuleType
 
 import numpy as np
 
+from kernel_library import InputSpecs, Workload
 from nkigym.codegen import render
 from nkigym.environment import Action, KernelMDP
 from nkigym.ir import KernelIR
@@ -58,8 +59,6 @@ from nkigym.transforms import (
     Split,
     SplitOption,
 )
-
-InputSpecs = dict[str, tuple[tuple[int, ...], str]]
 
 HEAD_DIM = 128
 SEQUENCE_LENGTH = 16384
@@ -199,7 +198,11 @@ ACTIONS: tuple[Action, ...] = (
     (BatchPermutation(), BatchPermutationOption(loop_nid=179)),
 )
 
-STEPS: tuple[tuple[Action, ...], ...] = tuple((action,) for action in ACTIONS)
+INPUT_SPECS = _input_specs(SEQUENCE_LENGTH)
+WORKLOAD = Workload(
+    input_specs=INPUT_SPECS, f_numpy=f_numpy, f_nkigym=f_nkigym, best_action_ladder=ACTIONS, historical_best_mfu=46.43
+)
+STEPS: tuple[tuple[Action, ...], ...] = tuple((action,) for action in WORKLOAD.best_action_ladder)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -223,7 +226,9 @@ def _labels() -> list[str]:
 
 def _build_ladder(input_specs: InputSpecs) -> list[KernelIR]:
     """Apply every fixed action through one kernel environment."""
-    environment = KernelMDP(f_nkigym, input_specs, transforms=[transform for transform, _option in ACTIONS])
+    environment = KernelMDP(
+        WORKLOAD.f_nkigym, input_specs, transforms=[transform for transform, _option in WORKLOAD.best_action_ladder]
+    )
     states = [environment.reset()]
     state = states[0]
     for step in STEPS:
@@ -248,7 +253,7 @@ def _verify_and_dump(states: list[KernelIR], cache: Path) -> dict[str, float]:
     input_specs = _input_specs(VALIDATION_QUERY_LENGTH)
     rng = np.random.default_rng(SEED)
     inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in input_specs.items()}
-    expected = f_numpy(**inputs)
+    expected = WORKLOAD.f_numpy(**inputs)
     errors: dict[str, float] = {}
     for index, (label, state) in enumerate(zip(_labels(), states, strict=True)):
         state_dir = cache / "kernels" / label
@@ -267,7 +272,7 @@ def _verify_and_dump(states: list[KernelIR], cache: Path) -> dict[str, float]:
 
 def _profile(states: list[KernelIR], cache: Path, host: str) -> dict[str, object]:
     """Profile every production-shaped state through SSH."""
-    input_specs = _input_specs(SEQUENCE_LENGTH)
+    input_specs = WORKLOAD.input_specs
     profile_dir = cache / "mfu"
     measurements: dict[str, dict[str, float]] = {}
     failures: dict[str, str] = {}
@@ -308,7 +313,7 @@ def _main() -> None:
         "states": len(validation_states),
         "accuracy": {"passed": len(errors), "max_abs_error": max(errors.values()), "kernels": "kernels/"},
     }
-    profile_states = _build_ladder(_input_specs(SEQUENCE_LENGTH))
+    profile_states = _build_ladder(WORKLOAD.input_specs)
     summary["profile"] = _profile(profile_states, cache, args.host)
     (cache / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))

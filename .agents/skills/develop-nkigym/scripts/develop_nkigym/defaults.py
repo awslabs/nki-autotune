@@ -6,14 +6,14 @@ import os
 import sys
 from pathlib import Path
 
-from developer.types import GateSpec
+from develop_nkigym.types import GateSpec
 from nkigym.search.agentic_tuning import AgenticTuningSpec
 from nkigym.search.profiled_refinement import ReasoningEffort
 
 
-def developer_python() -> str:
+def workflow_python() -> str:
     """Return the interpreter used by compiler and gate processes."""
-    configured = os.environ.get("DEVELOPER_PYTHON")
+    configured = os.environ.get("NKIGYM_DEVELOP_PYTHON")
     kernel_python = Path.home() / "venvs/kernel-env/bin/python"
     if configured is not None:
         executable = configured
@@ -35,7 +35,7 @@ def agentic_tuning_spec(
 ) -> AgenticTuningSpec:
     """Build the nkigym agentic tuning command."""
     argv = [
-        developer_python(),
+        workflow_python(),
         "-m",
         "nkigym.search.agentic_tuning_cli",
         "--host",
@@ -62,7 +62,7 @@ def agentic_tuning_spec(
 
 def gates(profile_host: str) -> tuple[GateSpec, ...]:
     """Return the five candidate acceptance evaluations."""
-    test_python = developer_python()
+    test_python = workflow_python()
     configured = (
         GateSpec(
             name="code-bloat",
@@ -84,7 +84,7 @@ def gates(profile_host: str) -> tuple[GateSpec, ...]:
         ),
         GateSpec(
             name="mfu-regression",
-            argv=(test_python, "-m", "pytest", "-q", "test/test_mfu_regression.py", "-s"),
+            argv=(test_python, ".agents/skills/develop-nkigym/scripts/mfu_gate.py"),
             working_directory=".",
             timeout_seconds=7500,
             environment=(("NKI_PROFILE_HOST", profile_host),),
@@ -99,4 +99,4 @@ def gates(profile_host: str) -> tuple[GateSpec, ...]:
     return configured
 
 
-__all__ = ["agentic_tuning_spec", "developer_python", "gates"]
+__all__ = ["agentic_tuning_spec", "gates", "workflow_python"]

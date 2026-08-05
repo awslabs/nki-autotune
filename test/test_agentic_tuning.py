@@ -1,13 +1,13 @@
-"""Agentic tuning acceptance for the current developer target workload."""
+"""Agentic tuning acceptance for the configured target workload."""
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 
-from developer.gates import candidate_environment
-from developer.git import snapshot_candidate
 from nkigym.search.agentic_tuning import (
     AGENTIC_TUNING_CONTEXT_ENV,
     AgenticTuningContext,
@@ -17,6 +17,7 @@ from nkigym.search.agentic_tuning import (
 
 MAX_MFU_REGRESSION_POINTS = 1.0
 MAX_FAILURE_LOG_CHARACTERS = 12000
+GATE_ARTIFACT_DIRECTORY_ENV = "NKIGYM_GATE_ARTIFACT_DIRECTORY"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -30,9 +31,42 @@ def _load_context() -> AgenticTuningContext:
 
 def _artifact_directory(tmp_path: Path) -> Path:
     """Return the controller artifact directory or a pytest temporary directory."""
-    configured_directory = os.environ.get("DEVELOPER_GATE_ARTIFACT_DIRECTORY")
+    configured_directory = os.environ.get(GATE_ARTIFACT_DIRECTORY_ENV)
     directory = Path(configured_directory) if configured_directory is not None else tmp_path
     return directory.expanduser().resolve()
+
+
+def _candidate_environment() -> dict[str, str]:
+    """Import candidate nkigym source in nested tuning processes."""
+    environment = dict(os.environ)
+    source = str(REPOSITORY_ROOT / "nkigym/src")
+    existing = environment.get("PYTHONPATH")
+    entries = [source]
+    if existing:
+        entries.append(existing)
+    environment["PYTHONPATH"] = os.pathsep.join(entries)
+    return environment
+
+
+def _run_git(arguments: tuple[str, ...], environment: dict[str, str]) -> str:
+    """Run one Git command required for an exact source tree fingerprint."""
+    command = ("git", "-C", str(REPOSITORY_ROOT), *arguments)
+    completed = subprocess.run(command, text=True, capture_output=True, check=False, env=environment)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise AssertionError(f"{' '.join(command)} failed with exit {completed.returncode}: {detail}")
+    return completed.stdout.strip()
+
+
+def _source_tree(baseline_tree: str) -> str:
+    """Return the current non-ignored workspace as a Git tree hash."""
+    with tempfile.TemporaryDirectory(prefix="agentic-tuning-source-index-") as temporary:
+        environment = dict(os.environ)
+        environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
+        _run_git(("read-tree", baseline_tree), environment)
+        _run_git(("add", "--all", "--", "."), environment)
+        tree = _run_git(("write-tree",), environment)
+    return tree
 
 
 def _failure_report(result: AgenticTuningResult, record: dict[str, object]) -> str:
@@ -53,8 +87,8 @@ def test_agentic_tuning_produces_valid_non_regressing_evidence(tmp_path: Path) -
         program_directory=context.program_directory,
         worktree=REPOSITORY_ROOT,
         output_directory=artifact_directory,
-        environment=candidate_environment(REPOSITORY_ROOT),
-        source_fingerprint=lambda: snapshot_candidate(REPOSITORY_ROOT, context.baseline_tree).patch,
+        environment=_candidate_environment(),
+        source_fingerprint=lambda: _source_tree(context.baseline_tree),
     )
     candidate_score = result.best_score
     historical_best = context.historical_best_score

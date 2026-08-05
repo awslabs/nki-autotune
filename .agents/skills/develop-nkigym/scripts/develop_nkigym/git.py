@@ -77,7 +77,7 @@ def set_worktree_baseline(worktree: Path, baseline_tree: str) -> None:
 
 def create_candidate_tree(worktree: Path, baseline: str) -> str:
     """Write and retain the current workspace as a Git tree without changing its index."""
-    with tempfile.TemporaryDirectory(prefix="developer-candidate-index-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="develop-nkigym-candidate-index-") as temporary:
         environment = dict(os.environ)
         environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
         _run_git(worktree, ("read-tree", baseline), environment)
@@ -105,7 +105,7 @@ def _diff_stats(worktree: Path, base_sha: str, environment: dict[str, str]) -> t
 
 def snapshot_candidate(worktree: Path, base_sha: str) -> CandidateSnapshot:
     """Capture all committed, staged, unstaged, and non-ignored new changes."""
-    with tempfile.TemporaryDirectory(prefix="developer-snapshot-index-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="develop-nkigym-snapshot-index-") as temporary:
         environment = dict(os.environ)
         environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
         _run_git(worktree, ("read-tree", base_sha), environment)

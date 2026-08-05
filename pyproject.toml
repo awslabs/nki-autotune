@@ -5,12 +5,12 @@ include = '\.pyi?$'
 skip-magic-trailing-comma = true
 
 [tool.isort]
-known_first_party = ["nkigym"]
+known_first_party = ["develop_nkigym", "kernel_library", "nkigym"]
 profile = "black"
 line_length = 120
 
 [tool.pyright]
-extraPaths = ["nkigym/src"]
+extraPaths = [".agents/skills/develop-nkigym/scripts", "nkigym/src"]
 reportMissingImports = "none"
 
 [tool.pytest.ini_options]

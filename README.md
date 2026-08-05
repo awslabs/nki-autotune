@@ -71,30 +71,20 @@ The supported subset includes 2D transpose and matmul, scalar or per-row
 broadcast arithmetic, common activations, and free-axis sum, maximum, and mean
 reductions. Unsupported operations raise `ValueError`.
 
-## Developer
+## Develop nkigym
 
-The callable developer pipeline accepts an `f_nkigym` operator graph and input
-specifications, searches measured transform states, and uses the resulting
-evidence to improve IR, operations, code generation, and transforms. Every
-candidate must pass all checks and improve the same target; each accepted
-candidate becomes the baseline for another cycle until the run is interrupted:
+Use the repo-local `$develop-nkigym` Codex skill to improve IR, operations,
+code generation, and transforms from measured search evidence. The skill
+bundles the deterministic Git, tuning, gate, and resume scripts it needs:
 
 ```bash
-python -m developer.drivers.matmul --host gym-1
-python -m developer.drivers.rmsnorm --host gym-1
-python -m developer.drivers.attention --host gym-1
+python .agents/skills/develop-nkigym/scripts/develop.py start matmul-lhs-t --host gym-1
 ```
 
-Custom workloads use the callable API:
-
-```python
-from developer import developer
-
-result = developer(f_nkigym, input_specs, "gym-1")
-```
-
-See [`developer/README.md`](developer/README.md) for complete usage and the
-artifact and validation contracts.
+The selectable kernel-library workloads are `attention`, `matmul-lhs`,
+`matmul-lhs-t`, and `rmsnorm-matmul`. See the
+[`develop-nkigym` skill](.agents/skills/develop-nkigym/SKILL.md) for the
+five-command workflow and durable resume contract.
 
 ## Kernel Library
 

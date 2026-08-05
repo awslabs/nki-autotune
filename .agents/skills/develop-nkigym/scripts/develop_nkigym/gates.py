@@ -12,24 +12,32 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
-from developer.types import GateResult, GateSpec
+from develop_nkigym.types import GateResult, GateSpec
 
 _TIMEOUT_EXIT_CODE = 124
 _START_FAILURE_EXIT_CODE = 127
 _TERMINATION_GRACE_SECONDS = 5
 _TERMINATION_POLL_SECONDS = 0.05
 _LOGGER = logging.getLogger(__name__)
+_GATE_ARTIFACT_DIRECTORY_ENV = "NKIGYM_GATE_ARTIFACT_DIRECTORY"
 
 
 def candidate_environment(worktree: Path) -> dict[str, str]:
     """Build an environment that imports candidate code before controller code."""
     environment = dict(os.environ)
-    controller_root = Path(__file__).resolve().parents[1]
-    source_roots = tuple(path for path in (worktree / "nkigym/src", controller_root) if path.is_dir())
+    nkigym_source = worktree / "nkigym/src"
+    if not (nkigym_source / "nkigym").is_dir():
+        raise ValueError(f"candidate nkigym source is missing: {nkigym_source}")
+    source_roots = (nkigym_source, worktree)
     existing = environment.get("PYTHONPATH")
     entries = [str(path) for path in source_roots]
     if existing:
-        entries.append(existing)
+        skill_scripts = Path(__file__).resolve().parents[1]
+        entries.extend(
+            entry
+            for entry in existing.split(os.pathsep)
+            if entry and Path(entry).expanduser().resolve() != skill_scripts
+        )
     if entries:
         environment["PYTHONPATH"] = os.pathsep.join(entries)
     return environment
@@ -118,7 +126,7 @@ def run_gate(
     environment = candidate_environment(candidate_root)
     environment.update(spec.environment)
     environment.update(additional_environment)
-    environment["DEVELOPER_GATE_ARTIFACT_DIRECTORY"] = str(artifact_directory)
+    environment[_GATE_ARTIFACT_DIRECTORY_ENV] = str(artifact_directory)
     _LOGGER.info("gate | started | %s | log=%s", spec.name, log_path)
     started = time.monotonic()
     timed_out = False
@@ -184,3 +192,6 @@ def run_gates(
         if not result.passed:
             break
     return tuple(results)
+
+
+__all__ = ["candidate_environment", "run_gate", "run_gates"]

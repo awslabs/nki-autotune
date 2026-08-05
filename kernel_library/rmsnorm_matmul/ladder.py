@@ -11,6 +11,7 @@ from types import ModuleType
 
 import numpy as np
 
+from kernel_library import Workload
 from nkigym.codegen import render
 from nkigym.environment import Action, KernelMDP
 from nkigym.ir import KernelIR
@@ -134,6 +135,10 @@ ACTIONS: tuple[Action, ...] = (
     (BufferLayout(), BufferLayoutOption(tensor="sbuf_rhs", list_len=4)),
 )
 
+WORKLOAD = Workload(
+    input_specs=INPUT_SPECS, f_numpy=f_numpy, f_nkigym=f_nkigym, best_action_ladder=ACTIONS, historical_best_mfu=86.99
+)
+
 
 def _parse_args() -> argparse.Namespace:
     """Parse artifact and SSH profile controls."""
@@ -145,14 +150,21 @@ def _parse_args() -> argparse.Namespace:
 
 def _labels() -> list[str]:
     """Return one stable cache label per ladder state."""
-    return ["00_canonical", *[f"{index:02d}_{type(action[0]).__name__}" for index, action in enumerate(ACTIONS, 1)]]
+    return [
+        "00_canonical",
+        *[f"{index:02d}_{type(action[0]).__name__}" for index, action in enumerate(WORKLOAD.best_action_ladder, 1)],
+    ]
 
 
 def _build_ladder() -> list[KernelIR]:
     """Apply every fixed action through one kernel environment."""
-    environment = KernelMDP(f_nkigym, INPUT_SPECS, transforms=[transform for transform, _option in ACTIONS])
+    environment = KernelMDP(
+        WORKLOAD.f_nkigym,
+        WORKLOAD.input_specs,
+        transforms=[transform for transform, _option in WORKLOAD.best_action_ladder],
+    )
     states = [environment.reset()]
-    for action in ACTIONS:
+    for action in WORKLOAD.best_action_ladder:
         states.append(environment.step(states[-1], action))
     return states
 
@@ -170,8 +182,10 @@ def _load_kernel(path: Path, module_name: str) -> ModuleType:
 def _verify_and_dump(states: list[KernelIR], cache: Path) -> dict[str, float]:
     """Dump and CPU-verify every ladder state."""
     rng = np.random.default_rng(SEED)
-    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in INPUT_SPECS.items()}
-    expected = f_numpy(**inputs)
+    inputs = {
+        name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in WORKLOAD.input_specs.items()
+    }
+    expected = WORKLOAD.f_numpy(**inputs)
     errors: dict[str, float] = {}
     for index, (label, state) in enumerate(zip(_labels(), states, strict=True)):
         state_dir = cache / "kernels" / label
@@ -197,7 +211,7 @@ def _profile(states: list[KernelIR], cache: Path, host: str) -> dict[str, object
                 host=host,
                 kernel=render(state),
                 func_name="nki_f_nkigym",
-                input_specs=INPUT_SPECS,
+                input_specs=WORKLOAD.input_specs,
                 cache_dir=profile_dir / label,
                 neuronx_cc_args=SCHEDULER_OFF_ARGS,
             )
