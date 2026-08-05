@@ -6,17 +6,10 @@ import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ISANode
-from nkigym.ops.activation import NKIActivation
+from nkigym.ir.tree import BlockNode, BufferRegion, ISANode
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import PointwiseContract, ReductionContract
-from nkigym.transforms._canonical_rewrite import (
-    append_root_buffers,
-    finalize_rewrite,
-    fresh_name,
-    remove_buffers,
-    single_leaf,
-)
+from nkigym.transforms._canonical_rewrite import finalize_rewrite, remove_buffers, single_leaf
 from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
@@ -36,7 +29,6 @@ class _BroadcastActivationMatch:
     option: FuseBroadcastActivationOption
     pointwise_leaf_nid: int
     activation_leaf_nid: int
-    operator: str
     data: BufferRegion
     broadcast: BufferRegion
     intermediate: BufferRegion
@@ -44,7 +36,7 @@ class _BroadcastActivationMatch:
 
 
 class FuseBroadcastActivation(Transform[FuseBroadcastActivationOption]):
-    """Move an elementwise broadcast add or subtract into activation bias."""
+    """Move an elementwise broadcast addition into activation bias."""
 
     def analyze(self, ir: KernelIR) -> list[FuseBroadcastActivationOption]:
         """Return adjacent pointwise-activation pairs with native bias support."""
@@ -106,7 +98,7 @@ class FuseBroadcastActivation(Transform[FuseBroadcastActivationOption]):
         if activation_leaf.op_cls is not NKIActivationReduce or activation.bias_operand != "bias":
             return result
         if (
-            pointwise.operator not in {"add", "subtract"}
+            pointwise.operator != "add"
             or pointwise.reverse
             or len(pointwise.input_operands) != 2
             or len(pointwise.broadcast_operands) != 1
@@ -141,11 +133,19 @@ class FuseBroadcastActivation(Transform[FuseBroadcastActivationOption]):
             return result
         if not self._has_unique_consumer(ir, intermediate.tensor, pointwise_leaf_nid, activation_leaf_nid):
             return result
+        removed_nodes = {pointwise_nid, *ir.tree.descendants(pointwise_nid)}
+        removed_allocations = {
+            buffer.name
+            for nid in removed_nodes
+            if isinstance(ir.tree.data(nid), BlockNode)
+            for buffer in ir.tree.block(nid).alloc_buffers
+        }
+        if removed_allocations - {intermediate.tensor}:
+            return result
         result = _BroadcastActivationMatch(
             option=option,
             pointwise_leaf_nid=pointwise_leaf_nid,
             activation_leaf_nid=activation_leaf_nid,
-            operator=pointwise.operator,
             data=data,
             broadcast=broadcast,
             intermediate=intermediate,
@@ -172,17 +172,13 @@ class FuseBroadcastActivation(Transform[FuseBroadcastActivationOption]):
         return readers == {consumer_leaf_nid} and writers == {producer_leaf_nid}
 
     def _rewrite(self, ir: KernelIR, match: _BroadcastActivationMatch) -> None:
-        """Bind the activation bias and retain only a row-sized negation if needed."""
-        bias = match.broadcast
-        if match.operator == "subtract":
-            bias = self._rewrite_as_negation(ir, match)
-        else:
-            self._remove_pointwise_block(ir, match.option.pointwise_block_nid)
+        """Bind the activation bias and remove the absorbed addition."""
+        self._remove_pointwise_block(ir, match.option.pointwise_block_nid)
 
         activation = ir.tree.isa(match.activation_leaf_nid)
         bindings = dict(activation.operand_bindings)
         bindings["data"] = replace(match.activation_input, tensor=match.data.tensor)
-        bindings["bias"] = bias
+        bindings["bias"] = match.broadcast
         kwargs = dict(activation.kwargs)
         kwargs.pop("bias", None)
         ir.tree.graph.nodes[match.activation_leaf_nid]["data"] = replace(
@@ -195,38 +191,6 @@ class FuseBroadcastActivation(Transform[FuseBroadcastActivationOption]):
         )
         remove_buffers(ir, {match.intermediate.tensor})
         finalize_rewrite(ir)
-
-    def _rewrite_as_negation(self, ir: KernelIR, match: _BroadcastActivationMatch) -> BufferRegion:
-        """Replace the matrix subtraction with one row-vector negation."""
-        source_buffer = ir.buffer(match.broadcast.tensor)
-        negative_name = fresh_name(ir, f"{match.broadcast.tensor}_negative")
-        negative_buffer = replace(source_buffer, name=negative_name)
-        negative = replace(match.broadcast, tensor=negative_name)
-        append_root_buffers(ir, (negative_buffer,))
-
-        block = ir.tree.block(match.option.pointwise_block_nid)
-        partition_axis = block.axis_map["P"]
-        retained = tuple(
-            (iter_var, iter_value)
-            for iter_var, iter_value in zip(block.iter_vars, block.iter_values)
-            if iter_var.axis == partition_axis
-        )
-        if len(retained) != 1:
-            raise AssertionError(f"pointwise block {match.option.pointwise_block_nid} does not bind one partition axis")
-        ir.tree.graph.nodes[match.option.pointwise_block_nid]["data"] = replace(
-            block,
-            iter_vars=(retained[0][0],),
-            iter_values=(retained[0][1],),
-            reads=(match.broadcast,),
-            writes=(negative,),
-            axis_map={"P": partition_axis},
-        )
-        ir.tree.graph.nodes[match.pointwise_leaf_nid]["data"] = ISANode(
-            op_cls=NKIActivation,
-            operand_bindings={"data": match.broadcast, "dst": negative},
-            kwargs={"op": "copy", "scale": -1.0},
-        )
-        return negative
 
     def _remove_pointwise_block(self, ir: KernelIR, block_nid: int) -> None:
         """Delete a fully absorbed pointwise block."""

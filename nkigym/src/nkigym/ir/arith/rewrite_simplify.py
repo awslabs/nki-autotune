@@ -6,10 +6,9 @@ recurses into its children first, rebuilds the node, then applies that node's
 constant-folding (``const_fold.h``) and pattern rewrite rules exactly as the
 corresponding ``RewriteSimplifier::Impl::VisitExpr_`` does in the TVM source.
 
-Only the rules exercised by the oracle test corpus are transcribed; every
-transcribed rule is a faithful copy of TVM's rule (line refs in each method's
-docstring), never an invented simplification. Correctness is arbitrated by a
-TVM oracle in ``test/ir/arith/test_rewrite_simplify.py``.
+Only the rules needed by nkigym are transcribed; every transcribed rule is a
+faithful copy of TVM's rule (line refs in each method's docstring), never an
+invented simplification.
 
 The public :meth:`RewriteSimplifier.simplify` mirrors
 ``RewriteSimplifier::operator()`` (``rewrite_simplify.cc`` ~line 2427): it runs

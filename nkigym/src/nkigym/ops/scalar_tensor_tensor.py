@@ -26,6 +26,9 @@ class NKIScalarTensorTensor(NKIOp):
         "dst": ("P", "F"),
     }
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "operand0", "operand1"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {
+        operand: frozenset({"sbuf", "psum"}) for operand in INPUT_OPERANDS
+    }
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"

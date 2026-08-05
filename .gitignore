@@ -78,8 +78,6 @@ Desktop.ini
 *.err
 !/design/figures/*.png
 !/2026-05-07-forest-ir-visual-walkthrough-design/**/*.png
-!/docs/diagrams/*.png
-
 # Artifacts
 artifacts/
 private
@@ -94,7 +92,7 @@ remote*.json
 # Remote sync configuration (user-specific)
 remote/config.sh
 
-# Downloaded cache from remote autotune runs
+# Downloaded cache from remote profile runs
 cache/
 
 # Worktrees

@@ -5,14 +5,14 @@ include = '\.pyi?$'
 skip-magic-trailing-comma = true
 
 [tool.isort]
-known_first_party = ["autotune", "nkigym"]
+known_first_party = ["nkigym"]
 profile = "black"
 line_length = 120
 
 [tool.pyright]
-extraPaths = ["nkigym/src", "autotune/src"]
+extraPaths = ["nkigym/src"]
 reportMissingImports = "none"
 
 [tool.pytest.ini_options]
-pythonpath = ["nkigym/src", "autotune/src"]
+pythonpath = ["nkigym/src"]
 testpaths = ["test"]

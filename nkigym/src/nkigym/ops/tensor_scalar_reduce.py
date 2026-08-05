@@ -70,6 +70,7 @@ class NKITensorScalarReduce(NKIOp):
             map_operator=map_operator,
             scale=scale,
             bias=bias,
+            mapped_output_operand="dst",
         )
 
     def _check_roles(self, **kwargs: Any) -> None:

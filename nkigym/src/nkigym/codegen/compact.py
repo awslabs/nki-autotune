@@ -1,11 +1,12 @@
 """Buffer geometry compaction over a transformed schedule tree.
 
-Two entry points:
+Primary entry points:
 
-* :func:`compact_shapes` — recompute each :class:`Buffer`'s logical shape
-  as the bounding box of its access regions within its declaration (LCA)
-  block, and write it back on the tree. Idempotent; materialized like
-  :func:`nkigym.ir.buffer_placement.place_buffers`.
+* :func:`compact_buffer_shape` — recompute one selected :class:`Buffer`'s
+  logical shape as the bounding box of its access regions without moving its
+  declaration or changing its allocation layout.
+* :func:`compact_shapes` — apply the same shape calculation to every declared
+  buffer.
 * :func:`rebased_region` — a read-time projection that subtracts a
   buffer's anchor loop vars (the loops enclosing all of its touchers) from
   a region's ``lo``, so a compacted buffer is indexed within its single
@@ -15,30 +16,36 @@ Two entry points:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 
 from nkigym.ir.arith.expr import Const, Expr, substitute, to_affine
-from nkigym.ir.buffer_placement import place_buffer
+from nkigym.ir.buffer_placement import _anchor_loop_nids, _regions_touching
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 
-def place_and_compact_buffer(tree: KernelTree, tensor: str) -> None:
-    """Descend ``tensor``'s decl to its LCA scope, then shrink its logical shape.
-
-    The per-buffer analogue of the old ``place_buffers`` + ``compact_shapes``
-    tail. Placement and shape changes are restricted to ``tensor``; declarations
-    made eligible for tighter placement by earlier structural rewrites remain
-    unchanged until their own ``BufferCompaction`` action is selected.
-    """
-    place_buffer(tree, tensor)
+def compact_buffer_shape(tree: KernelTree, tensor: str) -> Buffer:
+    """Recompute only ``tensor``'s logical shape while preserving its declaration and layout."""
+    anchor_loop_nids = _anchor_loop_nids(tree, tensor)
+    anchors = {tree.loop(nid).loop_var for nid in anchor_loop_nids}
+    compacted: Buffer | None = None
     for block_nid in tree.blocks():
         block = tree.data(block_nid)
         assert isinstance(block, BlockNode)
         if not any(b.name == tensor for b in block.alloc_buffers):
             continue
-        anchors = _anchor_loop_vars(tree, tensor)
-        new_bufs = tuple(_compact_one(tree, buf, anchors) if buf.name == tensor else buf for buf in block.alloc_buffers)
-        tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=new_bufs)
+        if compacted is not None:
+            raise AssertionError(f"buffer {tensor!r} is declared by multiple blocks")
+        new_bufs: list[Buffer] = []
+        for buf in block.alloc_buffers:
+            updated = _compact_one(tree, buf, anchors) if buf.name == tensor else buf
+            new_bufs.append(updated)
+            if buf.name == tensor:
+                compacted = updated
+        tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=tuple(new_bufs))
+    if compacted is None:
+        raise KeyError(f"buffer {tensor!r} is declared by no block")
+    return compacted
 
 
 def rebase_regions_of(tree: KernelTree, tensor: str) -> None:
@@ -72,77 +79,28 @@ def rebase_regions_of(tree: KernelTree, tensor: str) -> None:
             tree.graph.nodes[nid]["data"] = replace(data, operand_bindings=new_bindings)
 
 
-def compact_shapes(tree: KernelTree) -> None:
+def compact_shapes(tree: KernelTree, anchor_loop_nids_by_tensor: Mapping[str, frozenset[int]] | None = None) -> None:
     """Recompute and write back every Buffer's logical shape (bbox over its LCA scope)."""
     for block_nid in tree.blocks():
         block = tree.data(block_nid)
         assert isinstance(block, BlockNode)
         if not block.alloc_buffers:
             continue
-        new_bufs = tuple(_compact_one(tree, buf, _anchor_loop_vars(tree, buf.name)) for buf in block.alloc_buffers)
+        new_bufs: list[Buffer] = []
+        for buf in block.alloc_buffers:
+            anchor_loop_nids = (
+                anchor_loop_nids_by_tensor.get(buf.name) if anchor_loop_nids_by_tensor is not None else None
+            )
+            if anchor_loop_nids is None:
+                anchor_loop_nids = _anchor_loop_nids(tree, buf.name)
+            anchors = {tree.loop(nid).loop_var for nid in anchor_loop_nids}
+            new_bufs.append(_compact_one(tree, buf, anchors))
         tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=new_bufs)
 
 
 def _anchor_loop_vars(tree: KernelTree, tensor: str) -> set[str]:
-    """Loop vars that index "which instance" of ``tensor`` is live per iteration.
-
-    A loop is an anchor when (1) it is a ForNode tree node that is an
-    ancestor of every ISA leaf touching the buffer, and (2) it offsets every
-    touching region identically — the same coefficient in the same region
-    axis across all touchers. Such a loop holds exactly one buffer instance
-    live at a time, so it is subtracted from both the compacted shape and the
-    rebased index.
-
-    Condition (1) intersects ForNode *nodes* (by nid), not loop-var names: a
-    canonical buffer whose touchers sit in disjoint sibling loop-nests shares
-    no ancestor node even when those nests reuse a name (e.g. two distinct
-    ``i_d0_0`` loops), so its anchor set is empty and compaction is a no-op.
-
-    Condition (2) rejects a shared loop that addresses touchers
-    inconsistently — e.g. a sunk full-width load writes ``[*, 0:2048]`` (no
-    ``i_d1_0``) while the matmul reads ``[*, i_d1_0*128 : +128]``. Subtracting
-    ``i_d1_0`` there would collapse the matmul to tile 0 while the buffer
-    still holds all 2048 columns; dropping it keeps the read tile-correct.
-
-    Anchors must form an outer prefix of the common loop chain. An inner loop
-    cannot select a reusable instance after an outer non-anchor loop because
-    that outer loop revisits the inner selector while values from earlier
-    iterations remain live.
-    """
-    pairs = _regions_touching(tree, tensor)
-    if not pairs:
-        return set()
-    per_leaf = [{a for a in tree.ancestors(leaf) if isinstance(tree.data(a), ForNode)} for leaf, _r in pairs]
-    common = set.intersection(*per_leaf)
-    candidates = [nid for nid in tree.ancestors(pairs[0][0]) if nid in common]
-    regions = [region for _leaf, region in pairs]
-    anchors: set[str] = set()
-    for nid in candidates:
-        loop_var = tree.loop(nid).loop_var
-        if not _offsets_consistently(loop_var, regions):
-            break
-        anchors.add(loop_var)
-    return anchors
-
-
-def _offsets_consistently(loop_var: str, regions: list[BufferRegion]) -> bool:
-    """True when ``loop_var`` has one fixed per-axis coefficient across ``regions``.
-
-    For each region axis, the coefficient of ``loop_var`` in that axis's
-    ``lo`` (zero when absent) must agree across every region. A loop var that
-    offsets one region but not another is not a sound compaction anchor.
-    """
-    n_axes = max(len(r.ranges) for r in regions)
-    return all(len({_axis_coeff(r, axis, loop_var) for r in regions}) == 1 for axis in range(n_axes))
-
-
-def _axis_coeff(region: BufferRegion, axis: int, loop_var: str) -> int:
-    """Coefficient of ``loop_var`` in ``region``'s axis-``axis`` ``lo`` (0 if absent)."""
-    coeff = 0
-    if axis < len(region.ranges):
-        lo, _width = region.ranges[axis]
-        coeff = to_affine(lo).get(loop_var, 0)
-    return coeff
+    """Return loop vars that select one reusable instance of ``tensor``."""
+    return {tree.loop(nid).loop_var for nid in _anchor_loop_nids(tree, tensor)}
 
 
 def _compact_one(tree: KernelTree, buf: Buffer, anchors: set[str]) -> Buffer:
@@ -170,31 +128,7 @@ def _compact_one(tree: KernelTree, buf: Buffer, anchors: set[str]) -> Buffer:
             span = _axis_span(lo, width, axis, buf.location, anchors, extents)
             widest = max(widest, span)
         new_shape[axis] = widest
-    return _clamp_list_len_to_tiles(replace(buf, shape=tuple(new_shape)))
-
-
-def _clamp_list_len_to_tiles(buf: Buffer) -> Buffer:
-    """Shrink ``buf.list_len`` so it divides the (possibly compacted) tile count T.
-
-    ``compact_shapes`` recomputes only the logical shape; when a list buffer's leading
-    tile-count axis shrinks below ``list_len`` (e.g. RFactor's psum collapsing from 16
-    live M-tiles to 1), the stale ``list_len`` would no longer divide T and
-    :meth:`Buffer.per_tile_physical_shape` would assert. Clamp ``list_len`` to
-    ``min(list_len, T)``; the clamped value must divide T (loud otherwise — no silent
-    layout guess), which holds whenever T shrinks to a divisor of the old list_len
-    (the only shrink the ladder produces: 16 → 1).
-    """
-    result = buf
-    if buf.location != "shared_hbm" and buf.list_len > 1:
-        total_tiles = buf.logical_tile_count()
-        if buf.list_len > total_tiles:
-            if total_tiles < 1 or buf.list_len % total_tiles != 0:
-                raise AssertionError(
-                    f"{buf.name}: cannot clamp list_len {buf.list_len} to tile count "
-                    f"{total_tiles} (not a clean divisor collapse)"
-                )
-            result = replace(buf, list_len=total_tiles)
-    return result
+    return replace(buf, shape=tuple(new_shape))
 
 
 def _axis_span(lo: Expr, width: Expr, axis: int, location: str, anchors: set[str], extents: dict[str, int]) -> int:
@@ -217,18 +151,6 @@ def _axis_span(lo: Expr, width: Expr, axis: int, location: str, anchors: set[str
     if is_partition:
         return (hi + 1) * PARTITION_DIM
     return hi + width.value
-
-
-def _regions_touching(tree: KernelTree, tensor: str) -> list[tuple[int, BufferRegion]]:
-    """Every (ISA-leaf nid, operand BufferRegion) pair naming ``tensor``."""
-    out: list[tuple[int, BufferRegion]] = []
-    for nid in tree.preorder():
-        data = tree.data(nid)
-        if isinstance(data, ISANode):
-            for region in data.operand_bindings.values():
-                if region.tensor == tensor:
-                    out.append((nid, region))
-    return out
 
 
 def _leaf_loop_extents(tree: KernelTree, leaf_nid: int) -> dict[str, int]:
@@ -269,4 +191,4 @@ def rebased_region(region: BufferRegion, buf: Buffer, tree: KernelTree) -> Buffe
     return BufferRegion(tensor=region.tensor, ranges=new_ranges)
 
 
-__all__ = ["compact_shapes", "place_and_compact_buffer", "rebase_regions_of", "rebased_region"]
+__all__ = ["compact_buffer_shape", "compact_shapes", "rebase_regions_of", "rebased_region"]

@@ -4,9 +4,12 @@
 - **NKI Python source and documentation**: `/home/weittang/workplace/venvs/kernel-env/lib/python3.12/site-packages/nki`
 `/workplace/weittang/private-nki-staging`
 - **NKI CPU simulator driver**: `/home/weittang/workplace/venvs/kernel-env/lib/python3.12/site-packages/nki/simulator.py`
+- **Official NKI documentation**: `https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/index.html`
+- **NKI environment setup**: `https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/get-started/setup-env.html`
+- **NKI CPU simulation**: `https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.simulate.html`
+- **NKI kernel profiling**: `https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/use-neuron-profile.html`
 - **Online Fusion Math Derivation**: `/home/weittang/workplace/online_fusion/paper`
 - **TVM Source codes**: `/home/weittang/workplace/tvm`
-- **Kaizen Desktop**: `https://w.amazon.com/bin/view/AWS/Neuron/Services/Kaizen/Documentation/UserGuide/KaizenDesktop`
 
 ## Manually Written Kernels
 

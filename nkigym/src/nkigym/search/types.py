@@ -1,4 +1,4 @@
-"""Types for linear profiler-guided ``nkigym`` transform refinement."""
+"""Types for branching profiler-guided ``nkigym`` transform refinement."""
 
 from __future__ import annotations
 
@@ -8,23 +8,26 @@ from typing import Literal, Protocol
 
 from nkigym.ir import KernelIR
 
-DecisionKind = Literal["apply", "finish"]
+DecisionKind = Literal["apply", "revisit", "finish"]
 EvaluationMetric = float | int | str | bool | None
+InputSpecs = dict[str, tuple[tuple[int, ...], str]]
+MAX_TRANSFORMS_PER_REASONING_STEP = 3
 
 
 @dataclass(frozen=True)
 class AgentDecision:
-    """One next-transform decision returned by the reasoning policy."""
+    """One branch-selection or ordered transform decision returned by the policy."""
 
     kind: DecisionKind
+    base_node_id: int | None
     rationale: str
     raw_response: str
-    action_id: str | None
+    action_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class Evaluation:
-    """One Neuron compile and profile result."""
+    """One scored state returned by a search evaluator."""
 
     score: float | None
     metrics: dict[str, EvaluationMetric]
@@ -33,7 +36,7 @@ class Evaluation:
 
 @dataclass(frozen=True)
 class SearchNode:
-    """One measured state in the linear refinement history."""
+    """One measured state in the branching refinement trace."""
 
     node_id: int
     state: KernelIR
@@ -46,27 +49,29 @@ class SearchNode:
 
 @dataclass(frozen=True)
 class SearchConfig:
-    """Artifacts, iteration limit, and workload guidance for one run."""
+    """Artifacts, optional reasoning limit, and workload guidance."""
 
     cache_dir: Path
-    max_iterations: int
+    max_reasoning_steps: int | None
     workload_guidance: str
 
 
 @dataclass(frozen=True)
 class SearchResult:
-    """Completed linear refinement history and best measured state."""
+    """Completed branching refinement trace and best measured state."""
 
     nodes: tuple[SearchNode, ...]
     best_node_id: int | None
+    active_node_id: int
     transforms_applied: int
+    reasoning_steps: int
     evaluations_run: int
     finish_reason: str
 
     @property
     def current_node(self) -> SearchNode:
-        """Return the last state reached by refinement."""
-        return self.nodes[-1]
+        """Return the trace node active when refinement finished."""
+        return self.nodes[self.active_node_id]
 
     @property
     def best_node(self) -> SearchNode:
@@ -77,10 +82,10 @@ class SearchResult:
 
 
 class ReasoningPolicy(Protocol):
-    """Policy that chooses one listed transform or finishes."""
+    """Policy that revisits a measured node, applies transforms, or finishes."""
 
     async def decide(self, observation: str) -> AgentDecision:
-        """Choose the next refinement operation."""
+        """Choose the next ordered refinement operations."""
         ...
 
 
@@ -97,6 +102,8 @@ __all__ = [
     "DecisionKind",
     "Evaluation",
     "EvaluationMetric",
+    "InputSpecs",
+    "MAX_TRANSFORMS_PER_REASONING_STEP",
     "ReasoningPolicy",
     "SearchConfig",
     "SearchNode",

@@ -93,6 +93,7 @@ class NKIActivationReduce(NKIOp):
             scale=float(kwargs.get("scale", 1.0)),
             bias=float(kwargs["bias"]) if isinstance(kwargs.get("bias"), Real) else 0.0,
             bias_operand="bias",
+            mapped_output_operand="dst",
         )
 
     def _check_roles(self, **kwargs: Any) -> None:

@@ -109,6 +109,19 @@ def append_corrected_update(context: RecurrenceIR, state: str, correction: str, 
     )
 
 
+def append_additive_update(context: RecurrenceIR, state: str, contribution: str, output: str) -> None:
+    """Append ``output = state + contribution`` with a PSUM-compatible input."""
+    bindings = {"data": context.region(state), "operand1": context.region(contribution), "dst": context.region(output)}
+    append_manual_block(
+        context.tree,
+        context.parent,
+        NKIScalarTensorTensor,
+        bindings,
+        {"op0": "multiply", "operand0": 1.0, "op1": "add"},
+        context.scope,
+    )
+
+
 def append_scaled_output(context: RecurrenceIR, data: str, factor: str, output: str) -> None:
     """Append ``output = data * factor`` with free-axis broadcasting."""
     append_manual_block(
@@ -127,9 +140,9 @@ def append_tensor_tensor(context: RecurrenceIR, data1: str, data2: str, output: 
     append_manual_block(context.tree, context.parent, NKITensorTensor, bindings, {"op": operator}, context.scope)
 
 
-def append_copy(context: RecurrenceIR, source: str, destination: str) -> None:
-    """Append one explicit state roll-forward copy."""
-    append_manual_block(
+def append_copy(context: RecurrenceIR, source: str, destination: str) -> int:
+    """Append one explicit state roll-forward copy and return its block id."""
+    return append_manual_block(
         context.tree,
         context.parent,
         NKITensorCopy,
@@ -214,6 +227,13 @@ def _compile_correction_value(
         left = _compile_correction_value(context, expression.left, old_states, new_states, f"{stem}_left")
         right = _compile_correction_value(context, expression.right, old_states, new_states, f"{stem}_right")
         result = _compile_binary_factor(context, "multiply", left, right, stem)
+    elif isinstance(expression, UnaryFactor) and expression.operator == "rsqrt":
+        operand, scale, bias = _flatten_copy_operand(expression)
+        old_value = _compile_factor(context, operand, old_states, f"{stem}_old_arg")
+        new_value = _compile_factor(context, operand, new_states, f"{stem}_new_arg")
+        old_factor = _append_unary_factor(context, old_value, "sqrt", scale, bias, f"{stem}_old_sqrt")
+        new_factor = _append_unary_factor(context, new_value, "rsqrt", scale, bias, f"{stem}_new_rsqrt")
+        result = _CompiledFactor(tensor=_append_product(context, new_factor, old_factor, stem), literal=None)
     elif isinstance(expression, UnaryFactor) and expression.operator == "exp":
         operand, scale, _bias = _flatten_copy_operand(expression)
         old_value = _compile_factor(context, operand, old_states, f"{stem}_old_arg")
@@ -350,6 +370,32 @@ def _append_ratio(context: RecurrenceIR, numerator: str, denominator: str, stem:
     return ratio
 
 
+def _append_product(context: RecurrenceIR, left: str, right: str, stem: str) -> str:
+    """Materialize the product of two factor tensors."""
+    product = _new_temp(context, stem, left)
+    append_tensor_tensor(context, left, right, product, "multiply")
+    return product
+
+
+def _append_unary_factor(context: RecurrenceIR, data: str, operator: str, scale: float, bias: float, stem: str) -> str:
+    """Materialize one affine unary factor."""
+    output = _new_temp(context, stem, data)
+    kwargs: dict[str, Any] = {"op": operator}
+    if scale != 1.0:
+        kwargs["scale"] = scale
+    if bias != 0.0:
+        kwargs["bias"] = bias
+    append_manual_block(
+        context.tree,
+        context.parent,
+        NKIActivation,
+        {"data": context.region(data), "dst": context.region(output)},
+        kwargs,
+        context.scope,
+    )
+    return output
+
+
 def _append_affine(context: RecurrenceIR, data: str, scale: float, bias: float, stem: str) -> str:
     """Materialize an affine factor only when it is non-identity."""
     result = data
@@ -415,6 +461,7 @@ __all__ = [
     "RecurrenceIR",
     "RecurrenceScope",
     "access_regions",
+    "append_additive_update",
     "append_copy",
     "append_corrected_update",
     "append_initializer",

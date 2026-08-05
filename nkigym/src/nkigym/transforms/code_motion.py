@@ -32,6 +32,7 @@ from nkigym.ir.dependency import (
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
 from nkigym.transforms._access_pattern import subtree_has_access_patterns
+from nkigym.transforms._code_motion_state import loop_carries_plain_state, regions_overlap
 from nkigym.transforms._domain_solve import _dim_from_loopvar
 from nkigym.transforms._normalize import normalize_block
 from nkigym.transforms._tree_ops import (
@@ -68,18 +69,23 @@ def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> Non
     dependent nest is an exact dimension/extent prefix) and deep-copied.
     ``index`` follows TVM convention: ``-1`` append, ``-2`` prepend, ``>=0`` slot.
 
-    Matched local loops may use different identifiers from their corresponding
-    target loops. Their uses are explicitly rebound before the loops are removed.
-    Residual loops receive temporary collision-free names before the splice, then
-    ``normalize_block`` restores dense names and bindings in the moved block's own
-    scope. The target block's unchanged loop nest is not normalized.
+    A same-parent move only changes sibling order, so its payload remains verbatim.
+    Otherwise, matched local loops may use different identifiers from their
+    corresponding target loops. Their uses are explicitly rebound before the loops
+    are removed. Residual loops receive temporary collision-free names before the
+    splice, then ``normalize_block`` restores dense names and bindings in the moved
+    block's own scope. The target block's unchanged loop nest is not normalized.
     """
     tree = ir.tree
-    plan = _prefix_plan(tree, block_nid, target_loop_nid)
-    _prepare_block_for_splice(tree, block_nid, plan)
-    _strip_local_prefix_loops(tree, block_nid, len(plan.matched_local_nids))
-    _splice_under_target(tree, block_nid, target_loop_nid, index)
-    normalize_block(tree, block_nid)
+    same_parent = tree.parent(block_nid) == target_loop_nid
+    if same_parent:
+        _splice_under_target(tree, block_nid, target_loop_nid, index)
+    else:
+        plan = _prefix_plan(tree, block_nid, target_loop_nid)
+        _prepare_block_for_splice(tree, block_nid, plan)
+        _strip_local_prefix_loops(tree, block_nid, len(plan.matched_local_nids))
+        _splice_under_target(tree, block_nid, target_loop_nid, index)
+        normalize_block(tree, block_nid)
     _assert_single_parent(tree)
 
 
@@ -369,8 +375,33 @@ def _check_same_loop_prefix(
     block = ir.tree.data(block_nid)
     assert isinstance(block, BlockNode)
     resolved_plan = plan if plan is not None else _prefix_plan(ir.tree, block_nid, target_loop_nid)
+    _check_no_mutating_input_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
     _check_no_reduction_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
     return target_seq
+
+
+def _check_no_mutating_input_replicated(
+    ir: KernelIR, block_nid: int, target_loop_nid: int, duplicated_target_nids: tuple[int, ...]
+) -> None:
+    """Reject recomputation that closes a feedback path through a block input."""
+    moved_leaf = ir.dependency._resolve(block_nid)
+    moved_reads = ir.dependency.info(moved_leaf).read_regions
+    for loop_nid in duplicated_target_nids:
+        for writer in ir.tree.preorder(loop_nid):
+            if not isinstance(ir.tree.data(writer), ISANode):
+                continue
+            if not ir.dependency.must_precede(moved_leaf, writer):
+                continue
+            for write_region in ir.dependency.info(writer).write_regions:
+                for read_region in moved_reads:
+                    if read_region.tensor != write_region.tensor:
+                        continue
+                    if regions_overlap(ir, moved_leaf, read_region, writer, write_region):
+                        raise TransformLegalityError(
+                            f"move(block={block_nid} under loop={target_loop_nid}) replicates "
+                            f"a feedback read of tensor {read_region.tensor!r} across loop "
+                            f"{loop_nid}, whose downstream path writes the same region"
+                        )
 
 
 def _check_no_reduction_replicated(
@@ -430,13 +461,26 @@ def _plain_written_tensors(node: ISANode) -> set[str]:
     }
 
 
+def _rmw_value_spans_loop(ir: KernelIR, rmw_leaf: int, loop_nid: int, tensor: str) -> bool:
+    """Return whether a RAW consumer observes values from multiple iterations."""
+    loop = ir.tree.loop(loop_nid)
+    loop_descendants = ir.tree.descendants(loop_nid)
+    spans = any(
+        attrs.get("kind") == "RAW"
+        and attrs.get("tensor") == tensor
+        and (consumer not in loop_descendants or _access_invariant_across(ir.tree, consumer, loop.loop_var, tensor))
+        for _producer, consumer, attrs in ir.dependency.graph.out_edges(rmw_leaf, data=True)
+    )
+    return spans
+
+
 def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan) -> None:
-    """Reject changing a plain reset's frequency relative to an invariant RMW.
+    """Reject changing a plain reset's frequency relative to an RMW.
 
     A plain write followed by an RMW of the same region is its reset. Moving that
-    writer or the RMW across a loop where both accesses are invariant changes a
-    per-iteration reset into a loop-carried accumulator, or the reverse, without
-    reversing any dependency edge.
+    writer or the RMW across a loop changes behavior when both accesses are
+    invariant, or when a tiled RMW remains live after the loop. Neither case
+    necessarily reverses a dependency edge.
     """
     tree = ir.tree
     moved_leaf = ir.dependency._resolve(block_nid)
@@ -445,6 +489,17 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
     plain_writes = _plain_written_tensors(moved_node)
     crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid, plan)
     if plain_writes:
+        for tensor in plain_writes:
+            for loop_nid in crossed_loops:
+                loop = tree.loop(loop_nid)
+                if not _access_invariant_across(tree, moved_leaf, loop.loop_var, tensor):
+                    continue
+                if loop_carries_plain_state(ir, loop_nid, tensor, moved_leaf):
+                    raise TransformLegalityError(
+                        f"move(block={block_nid} under loop={target_loop_nid}) changes reset "
+                        f"frequency for carried tensor {tensor!r} across loop {loop_nid} "
+                        f"({loop.loop_var!r})"
+                    )
         for _producer, consumer, attrs in ir.dependency.graph.out_edges(moved_leaf, data=True):
             tensor = attrs.get("tensor")
             if tensor not in plain_writes or not _leaf_operand_regions(tree, consumer, tensor, rmw_only=True):
@@ -456,7 +511,9 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
                     continue
                 if not _access_invariant_across(tree, moved_leaf, loop.loop_var, tensor):
                     continue
-                if not _access_invariant_across(tree, consumer, loop.loop_var, tensor):
+                if not _access_invariant_across(tree, consumer, loop.loop_var, tensor) and not _rmw_value_spans_loop(
+                    ir, consumer, loop_nid, tensor
+                ):
                     continue
                 raise TransformLegalityError(
                     f"move(block={block_nid} under loop={target_loop_nid}) changes reset "
@@ -479,13 +536,28 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
                 continue
             if not _access_invariant_across(tree, producer, loop.loop_var, tensor):
                 continue
-            if not _access_invariant_across(tree, moved_leaf, loop.loop_var, tensor):
+            if not _access_invariant_across(tree, moved_leaf, loop.loop_var, tensor) and not _rmw_value_spans_loop(
+                ir, moved_leaf, loop_nid, tensor
+            ):
                 continue
             raise TransformLegalityError(
                 f"move(block={block_nid} under loop={target_loop_nid}) changes reset "
                 f"frequency for tensor {tensor!r} across read-modify-write loop "
                 f"{loop_nid} ({loop.loop_var!r})"
             )
+
+
+def _loop_reinitializes_tensor(tree: KernelTree, loop_nid: int, tensor: str, excluded_leaves: frozenset[int]) -> bool:
+    """Return whether a repeated invariant plain write resets ``tensor``."""
+    loop = tree.loop(loop_nid)
+    result = any(
+        nid not in excluded_leaves
+        and isinstance((node := tree.data(nid)), ISANode)
+        and tensor in _plain_written_tensors(node)
+        and _access_invariant_across(tree, nid, loop.loop_var, tensor)
+        for nid in tree.descendants(loop_nid)
+    )
+    return result
 
 
 def _check_no_consumer_hoisted_out_of_producer_loop(
@@ -505,6 +577,12 @@ def _check_no_consumer_hoisted_out_of_producer_loop(
                 continue
             loop = tree.data(loop_nid)
             assert isinstance(loop, ForNode)
+            if _loop_reinitializes_tensor(tree, loop_nid, tensor, frozenset((producer, moved_leaf))):
+                raise TransformLegalityError(
+                    f"move(block={block_nid} under loop={target_loop_nid}) delays consumer "
+                    f"past repeated write to tensor {tensor!r} in loop {loop_nid} "
+                    f"({loop.loop_var!r})"
+                )
             if _tensor_carried_across(tree, loop_nid, tensor):
                 continue
             if not _access_invariant_across(tree, producer, loop.loop_var, tensor):
@@ -579,6 +657,7 @@ def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop
     Freezing directions keeps the RAW orientation, so the post-splice backward
     span is detected.
     """
+    _check_move_changes_position(ir.tree, block_nid, target_loop_nid, index)
     plan = _prefix_plan(ir.tree, block_nid, target_loop_nid)
     _check_same_loop_prefix(ir, block_nid, target_loop_nid, plan)
     moved_leaf = ir.dependency._resolve(block_nid)
@@ -660,6 +739,30 @@ def _splice_under_target(tree: KernelTree, block_nid: int, target_loop_nid: int,
         tree.graph.remove_edge(target_loop_nid, child)
     for child in new_order:
         tree.graph.add_edge(target_loop_nid, child)
+
+
+def _check_move_changes_position(tree: KernelTree, block_nid: int, target_loop_nid: int, index: int) -> None:
+    """Reject a splice that leaves a block in its existing child slot."""
+    if tree.parent(block_nid) != target_loop_nid:
+        return
+    original = tree.children(target_loop_nid)
+    remaining = [child for child in original if child != block_nid]
+    if index == -1:
+        pos = len(remaining)
+    elif index == -2:
+        pos = 0
+    elif index >= 0:
+        pos = index
+    else:
+        raise TransformLegalityError(
+            f"CodeMotion index={index} is unsupported; use -1 append, -2 prepend, or a nonnegative child slot"
+        )
+    reordered = remaining[:pos] + [block_nid] + remaining[pos:]
+    if reordered == original:
+        raise TransformLegalityError(
+            f"move(block={block_nid} under loop={target_loop_nid} at index={index}) "
+            f"does not change the block's child slot"
+        )
 
 
 @dataclass(frozen=True)
@@ -747,7 +850,15 @@ class CodeMotion(Transform[CodeMotionOption]):
                 lp = i
             if sub & consumers and i < fc:
                 fc = i
-        return list(range(lp + 1, fc + 1))
+        indices = list(range(lp + 1, fc + 1))
+        legal: list[int] = []
+        for index in indices:
+            try:
+                _check_move_changes_position(ir.tree, block_nid, target_nid, index)
+            except TransformLegalityError:
+                continue
+            legal.append(index)
+        return legal
 
     def _check_static_legality(
         self, ir: KernelIR, block_nid: int, target_loop_nid: int, context: _AnalysisContext | None

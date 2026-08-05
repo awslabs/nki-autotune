@@ -8,7 +8,6 @@ from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Const, Mul, Var
-from nkigym.ir.buffer_placement import place_buffers
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole, NKIOp
@@ -335,10 +334,9 @@ def replace_input_binding(ir: KernelIR, leaf_nid: int, operand: str, tensor: str
 
 
 def finalize_rewrite(ir: KernelIR) -> None:
-    """Recompute buffer placement and dependencies after a graph rewrite."""
+    """Invalidate derived rewrite state and rebuild dependencies."""
     _invalidate_canonical_context(ir)
     invalidate_stale_software_pipelines(ir)
-    place_buffers(ir.tree)
     ir.dependency = Dependency(ir.tree)
 
 

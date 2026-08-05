@@ -23,8 +23,8 @@ class FuseOption(TransformOption):
     """Per-application payload for :class:`Fuse`.
 
     Attributes:
-        target_nids: Adjacent axis-chain entries to fuse, parent->child order.
-            ``len >= 2``.
+        target_nids: Exactly two adjacent axis-chain entries to fuse, in
+            parent-to-child order.
         target_axis: ``None`` for outer-trip flavour. The concrete iter_var
             axis name (e.g. ``"d1"``) for tensorize flavour; matches
             ``IterVar.axis``.
@@ -35,30 +35,33 @@ class FuseOption(TransformOption):
 
 
 class Fuse(Transform[FuseOption]):
-    """Collapse a parent->child chain of same-loop-axis entries into one."""
+    """Collapse two adjacent same-loop-axis entries into one."""
 
     def analyze(self, ir: KernelIR) -> list[FuseOption]:
+        """Return every legal adjacent loop-loop and loop-tensorize pair."""
         options: list[FuseOption] = []
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
-            if isinstance(data, ForNode):
-                chain: list[int] = [nid]
-                cur = nid
-                while True:
-                    kids = ir.tree.children(cur)
-                    if len(kids) != 1:
-                        break
-                    kid_data = ir.tree.data(kids[0])
-                    if not isinstance(kid_data, ForNode):
-                        break
-                    """Two adjacent ForNodes are fusion candidates iff they bind the same dim."""
-                    if _dim_from_loopvar(data.loop_var) != _dim_from_loopvar(kid_data.loop_var):
-                        break
-                    chain.append(kids[0])
-                    cur = kids[0]
-                for end in range(2, len(chain) + 1):
-                    sub = tuple(chain[:end])
-                    option = FuseOption(target_nids=sub, target_axis=None)
+            if not isinstance(data, ForNode):
+                continue
+            kids = ir.tree.children(nid)
+            if len(kids) != 1:
+                continue
+            kid_data = ir.tree.data(kids[0])
+            if isinstance(kid_data, ForNode):
+                if _dim_from_loopvar(data.loop_var) == _dim_from_loopvar(kid_data.loop_var):
+                    option = FuseOption(target_nids=(nid, kids[0]), target_axis=None)
+                    if self._is_legal(ir, option):
+                        options.append(option)
+            elif isinstance(kid_data, ISANode):
+                _block_nid, block = _find_enclosing_block(ir.tree, kids[0])
+                target_axes = [
+                    iter_var.axis
+                    for iter_var, value in zip(block.iter_vars, block.iter_values)
+                    if data.loop_var in to_affine(value)
+                ]
+                for target_axis in target_axes:
+                    option = FuseOption(target_nids=(nid, kids[0]), target_axis=target_axis)
                     if self._is_legal(ir, option):
                         options.append(option)
         return options
@@ -75,8 +78,10 @@ class Fuse(Transform[FuseOption]):
         return new_ir
 
     def _check_legality(self, ir: KernelIR, option: FuseOption) -> None:
-        if len(option.target_nids) < 2:
-            raise TransformLegalityError(f"Fuse.target_nids must have len >= 2; got {option.target_nids}")
+        if len(option.target_nids) != 2:
+            raise TransformLegalityError(
+                f"Fuse.target_nids must contain exactly two adjacent entries; got {option.target_nids}"
+            )
         for nid in option.target_nids:
             if nid not in ir.tree.graph:
                 raise TransformLegalityError(f"Fuse.target_nids contains unknown nid {nid}")
@@ -114,6 +119,17 @@ class Fuse(Transform[FuseOption]):
                         f"Fuse tensorize flavour: nid {parent_nid} must have a single child {child_nid}; got {kids}"
                     )
             _block_nid, block = _find_enclosing_block(ir.tree, option.target_nids[-1])
+            target_values = [
+                value
+                for iter_var, value in zip(block.iter_vars, block.iter_values)
+                if iter_var.axis == option.target_axis
+            ]
+            loop_var = ir.tree.loop(option.target_nids[0]).loop_var
+            if len(target_values) != 1 or loop_var not in to_affine(target_values[0]):
+                raise TransformLegalityError(
+                    f"Fuse.target_axis={option.target_axis!r} is not bound by loop {option.target_nids[0]}"
+                )
+            self._check_tensorize_loop_uses(leaf, block, loop_var, option.target_axis)
             current_width = _current_tensorize_width(leaf, block, option.target_axis)
             if current_width is None:
                 raise TransformLegalityError(
@@ -129,6 +145,25 @@ class Fuse(Transform[FuseOption]):
                     f"Fuse.target_axis={option.target_axis!r}: fused tile {fused_width} > MAX_TILE_SIZE {max_tile}"
                 )
 
+    def _check_tensorize_loop_uses(self, leaf: ISANode, block: BlockNode, loop_var: str, target_axis: str) -> None:
+        """Reject loop uses that widening the selected operand axis cannot absorb."""
+        abstract_axis = next(
+            (abstract for abstract, concrete in block.axis_map.items() if concrete == target_axis), None
+        )
+        invalid_uses: list[str] = []
+        for iter_var, value in zip(block.iter_vars, block.iter_values):
+            if iter_var.axis != target_axis and loop_var in to_affine(value):
+                invalid_uses.append(f"iter_var {iter_var.axis}")
+        for slot, region in leaf.operand_bindings.items():
+            axes = leaf.op_cls.OPERAND_AXES[slot]
+            target_index = axes.index(abstract_axis) if abstract_axis in axes else None
+            for index, (lower, width) in enumerate(region.ranges):
+                if (loop_var in to_affine(lower) or loop_var in to_affine(width)) and index != target_index:
+                    invalid_uses.append(f"operand {slot}[{index}]")
+        if invalid_uses:
+            uses = ", ".join(invalid_uses)
+            raise TransformLegalityError(f"Fuse loop {loop_var!r} has uses outside target_axis={target_axis!r}: {uses}")
+
     def _is_legal(self, ir: KernelIR, option: FuseOption) -> bool:
         """Return whether ``option`` passes the same checks used by :meth:`apply`."""
         try:
@@ -138,7 +173,7 @@ class Fuse(Transform[FuseOption]):
         return True
 
     def _do_outer_trip(self, ir: KernelIR, option: FuseOption) -> None:
-        """Outer-trip Fuse: merge a parent->child chain of same-dim ForNodes into one loop.
+        """Outer-trip Fuse: merge two parent-child same-dim ForNodes into one loop.
 
         Only the loop topology changes: the chain is replaced by a single
         ForNode whose extent is the product of the chain extents (the access
@@ -168,10 +203,10 @@ class Fuse(Transform[FuseOption]):
             normalize_block(ir.tree, nested_block)
 
     def _do_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
-        """Tensorize Fuse: absorb a chain of same-axis ForNodes above an ISA leaf into the tile width.
+        """Tensorize Fuse: absorb one same-axis ForNode into an ISA tile.
 
-        ``option.target_nids[-1]`` is the ISA leaf; the prefix is the ForNode
-        chain to absorb. The chain is removed and the affected-axis access
+        ``option.target_nids[-1]`` is the ISA leaf and the first entry is the
+        ForNode to absorb. The loop is removed and the affected-axis access
         width grows by the product of the absorbed extents;
         :func:`normalize_block` then drops any now-trip-1 loops, re-densifies
         names, and recomputes the region offsets from the surviving loops.
@@ -186,9 +221,10 @@ class Fuse(Transform[FuseOption]):
         block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
 
         absorbed_extent = prod(ir.tree.loop(nid).extent for nid in for_chain)
+        ir.tree.graph.remove_edge(for_chain[-1], leaf_nid)
+        _replace_in_parent_children(ir.tree, chain_root_parent, [chain_root], [leaf_nid])
         for nid in for_chain:
             ir.tree.graph.remove_node(nid)
-        ir.tree.graph.add_edge(chain_root_parent, leaf_nid)
 
         inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
         assert option.target_axis is not None

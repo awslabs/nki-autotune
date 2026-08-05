@@ -1,8 +1,7 @@
 """Markov Decision Process wrapper over Split + Fuse transforms.
 
 State = ``KernelIR``. Action = ``(Transform, TransformOption)``. The env is
-pure-functional: every method takes the state explicitly. See
-``docs/superpowers/specs/2026-05-17-mdp-environment-design.md``.
+pure-functional: every method takes the state explicitly.
 """
 
 from __future__ import annotations

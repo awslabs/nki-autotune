@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 
 from nkigym.codegen import render
 from nkigym.environment import Action
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
-from nkigym.search.types import SearchConfig, SearchNode
+from nkigym.search.types import MAX_TRANSFORMS_PER_REASONING_STEP, SearchConfig, SearchNode
 from nkigym.transforms import (
     BufferCompactionOption,
     BufferLayoutOption,
+    BufferPlacementOption,
     CancelTransposePairOption,
     CodeMotionOption,
     FuseOption,
@@ -25,8 +27,6 @@ from nkigym.transforms import (
     TransposeThroughMatmulOption,
     TransposeThroughTensorCopyOption,
 )
-
-_HISTORY_LIMIT = 24
 
 
 @dataclass(frozen=True)
@@ -58,51 +58,106 @@ def describe_actions(state: KernelIR, actions: list[Action]) -> list[DescribedAc
 
 
 def format_observation(
-    state: KernelIR, nodes: list[SearchNode], actions: list[DescribedAction], config: SearchConfig
+    active: SearchNode,
+    nodes: list[SearchNode],
+    actions: list[DescribedAction],
+    branchable_node_ids: tuple[int, ...],
+    config: SearchConfig,
+    reasoning_step: int,
 ) -> str:
-    """Render one measured-state next-transform prompt."""
-    current = nodes[-1]
+    """Render one complete-trace branch-or-transform prompt."""
+    state = active.state
+    transforms_applied = len(nodes) - 1
+    selection_limit = min(MAX_TRANSFORMS_PER_REASONING_STEP, len(actions))
+    example_ids = [item.action_id for item in actions[: min(2, selection_limit)]]
+    apply_example = json.dumps(example_ids, separators=(",", ":"))
+    reasoning_limit = "unbounded" if config.max_reasoning_steps is None else str(config.max_reasoning_steps)
     successful = [node for node in nodes if node.evaluation.score is not None]
     best = max(successful, key=_node_score) if successful else None
     best_line = "no successful Neuron profile"
     if best is not None:
         best_line = f"N{best.node_id:03d} score={best.evaluation.score:.4f}; {best.evaluation.message}"
+    branchable_text = ", ".join(f"N{node_id:03d}" for node_id in branchable_node_ids)
+    if not branchable_text:
+        branchable_text = "none"
+    revisit_targets = tuple(node_id for node_id in branchable_node_ids if node_id != active.node_id)
+    if selection_limit and revisit_targets:
+        objective = (
+            f"Apply one to {selection_limit} compatible transforms from N{active.node_id:03d}, "
+            "revisit another branchable node, or finish."
+        )
+    elif selection_limit:
+        objective = f"Apply one to {selection_limit} compatible transforms from N{active.node_id:03d} or finish."
+    elif revisit_targets:
+        objective = f"N{active.node_id:03d} has no unexplored actions; revisit another branchable node or finish."
+    else:
+        objective = f"N{active.node_id:03d} has no unexplored actions; finish."
+    decision_examples: list[str] = []
+    if selection_limit:
+        decision_examples.append(
+            f'{{"kind":"apply","base_node_id":{active.node_id},"action_ids":{apply_example},'
+            '"rationale":"why this branch should improve"}}'
+        )
+    if revisit_targets:
+        decision_examples.append(
+            f'{{"kind":"revisit","base_node_id":{revisit_targets[0]},"action_ids":[],'
+            '"rationale":"why this earlier state is a better branch point"}}'
+        )
+    decision_examples.append(
+        '{"kind":"finish","base_node_id":null,"action_ids":[],"rationale":"why no unexplored branch is worthwhile"}'
+    )
     sections = [
         "# Objective",
-        "Choose one next legal transform to improve measured MFU.",
+        objective,
         "",
         "# Progress",
-        f"- applied transforms: {len(nodes) - 1}/{config.max_iterations}",
-        f"- current state: N{current.node_id:03d}",
+        f"- measured states: {len(nodes)}",
+        f"- transform applications: {transforms_applied}",
+        f"- reasoning step: {reasoning_step}/{reasoning_limit}",
+        f"- active state: N{active.node_id:03d}",
+        f"- active path: {_format_path(nodes, active.node_id)}",
         f"- best measured state: {best_line}",
+        f"- branchable nodes with unexplored actions: {branchable_text}",
         "",
         "# Workload Guidance",
         config.workload_guidance.strip(),
         "",
-        "# Current Neuron Profile",
-        current.evaluation.message,
-        *_format_metrics(current),
+        f"# Active Neuron Profile (N{active.node_id:03d})",
+        active.evaluation.message,
+        *_format_metrics(active),
         "",
-        "# Measured Refinement History",
-        *_format_history(nodes),
+        "# Complete Measured Search Trace",
+        *_format_trace(nodes, active.node_id, best.node_id if best is not None else None, branchable_node_ids),
         "",
-        "# Buffers",
+        "# Active Buffers",
         *_format_buffers(state),
         "",
-        "# Current NKI",
+        f"# Active NKI (N{active.node_id:03d})",
         "```python",
         render(state).rstrip(),
         "```",
         "",
-        f"# Legal Actions ({len(actions)})",
+        f"# Unexplored Legal Actions for N{active.node_id:03d} ({len(actions)})",
         *(f"- {item.action_id}: {item.description}" for item in actions),
         "",
         "# Decision Contract",
         "Return exactly one JSON object:",
-        '{"kind":"apply","action_id":"A000","rationale":"why this transform should improve the next profile"}',
-        '{"kind":"finish","action_id":null,"rationale":"why no listed transform is worth another profile"}',
-        "The orchestrator profiles every applied transform automatically.",
-        "Do not emit markdown, source code, or an action that is not listed.",
+        *decision_examples,
+        (
+            f"An apply decision must name active base_node_id={active.node_id} and select at most "
+            f"{selection_limit} listed IDs."
+            if selection_limit
+            else f"Do not apply from N{active.node_id:03d}; it has no unexplored actions."
+        ),
+        (
+            "A revisit decision selects another listed branchable node and profiles nothing; "
+            "its full NKI and actions appear next."
+            if revisit_targets
+            else "No other branchable node is available to revisit."
+        ),
+        "The orchestrator applies and profiles every selected transform and intermediate state in order.",
+        "Select one action when its profile result should determine the next choice.",
+        "Do not emit markdown, source code, an unlisted action, or an unlisted node.",
     ]
     return "\n".join(sections)
 
@@ -115,22 +170,45 @@ def _format_metrics(node: SearchNode) -> list[str]:
     return lines
 
 
-def _format_history(nodes: list[SearchNode]) -> list[str]:
-    """Format recent measured transform steps."""
-    visible = nodes[-_HISTORY_LIMIT:]
+def _format_trace(
+    nodes: list[SearchNode], active_node_id: int, best_node_id: int | None, branchable_node_ids: tuple[int, ...]
+) -> list[str]:
+    """Format every measured node with its parent edge and search status."""
+    branchable = set(branchable_node_ids)
     lines: list[str] = []
-    if len(visible) < len(nodes):
-        lines.append(f"- {len(nodes) - len(visible)} earlier states omitted")
-    for node in visible:
-        action = node.action_description or "canonical"
+    for node in nodes:
+        action = (
+            "canonical"
+            if node.action_description is None
+            else f"{node.action_id or 'unknown action'}: {node.action_description}"
+        )
         rationale = node.rationale or "initial Neuron profile"
         score = "compile/profile failed" if node.evaluation.score is None else f"score={node.evaluation.score:.4f}"
-        metrics = ", ".join(f"{name}={value}" for name, value in sorted(node.evaluation.metrics.items()))
+        metrics = ", ".join(f"{name}={value}" for name, value in sorted(node.evaluation.metrics.items())) or "none"
+        parent = "root" if node.parent_id is None else f"N{node.parent_id:03d}"
+        tags: list[str] = []
+        if node.node_id == active_node_id:
+            tags.append("active")
+        if node.node_id == best_node_id:
+            tags.append("best")
+        if node.node_id in branchable:
+            tags.append("branchable")
+        status = f" [{', '.join(tags)}]" if tags else ""
         lines.append(
-            f"- N{node.node_id:03d}: {action}; {score}; {node.evaluation.message}; "
+            f"- N{node.node_id:03d} <- {parent}{status}: {action}; {score}; {node.evaluation.message}; "
             f"metrics: {metrics}; decision: {rationale}"
         )
     return lines
+
+
+def _format_path(nodes: list[SearchNode], node_id: int) -> str:
+    """Format the root-to-node parent chain."""
+    path: list[int] = []
+    current: int | None = node_id
+    while current is not None:
+        path.append(current)
+        current = nodes[current].parent_id
+    return " -> ".join(f"N{item:03d}" for item in reversed(path))
 
 
 def _node_score(node: SearchNode) -> float:
@@ -193,7 +271,7 @@ def _describe_option(state: KernelIR, option: object) -> str:
     elif isinstance(option, SoftwarePipelineOption):
         result = (
             f"pipeline children of {_node_label(tree, option.loop_nid)} "
-            f"with stages={option.stages}, order={option.order}; "
+            f"with stages={option.stages} in source order; "
             f"children={_direct_children(tree, option.loop_nid)}"
         )
     elif isinstance(option, BufferLayoutOption):
@@ -203,7 +281,9 @@ def _describe_option(state: KernelIR, option: object) -> str:
             f"(current={buffer.list_len}, total physical tiles={buffer.physical_shape()[1]})"
         )
     elif isinstance(option, BufferCompactionOption):
-        result = f"place and compact {option.tensor} from logical shape {state.buffer(option.tensor).shape}"
+        result = f"compact {option.tensor} from logical shape {state.buffer(option.tensor).shape}"
+    elif isinstance(option, BufferPlacementOption):
+        result = f"move only {option.tensor}'s declaration to its lifetime-safe LCA scope"
     elif isinstance(option, InsertTransposePairOption):
         result = (
             f"insert T(T({option.source})) before " f"{_node_label(tree, option.consumer_nid)} operand {option.operand}"

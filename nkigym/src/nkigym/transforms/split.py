@@ -1,4 +1,4 @@
-"""``Split`` transform — partition one loop or one tensorize-axis tile into multiple factors."""
+"""``Split`` transform — partition one loop or tensorized tile into two factors."""
 
 from __future__ import annotations
 
@@ -10,15 +10,12 @@ from nkigym.ir.arith.analyzer import Analyzer
 from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
-from nkigym.ops.base import AxisRole
+from nkigym.ops.base import ReductionContract
 from nkigym.transforms._access_pattern import subtree_has_access_patterns
 from nkigym.transforms._normalize import normalize_block
-from nkigym.transforms._rfactor_slot import SlotRFactor
 from nkigym.transforms._tile_region import retile_region
 from nkigym.transforms._tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
-
-_MAX_SPLIT_PARTS = 3
 
 
 @dataclass(frozen=True)
@@ -29,7 +26,7 @@ class SplitOption(TransformOption):
         target_nid: Node id in ``ir.tree`` to split. Either a
             :class:`ForNode` (outer-trip flavour) or an :class:`ISANode`
             (tensorize flavour).
-        factors: Replacement factors, outermost-first. ``len >= 2``.
+        factors: Two replacement factors, outermost-first.
         target_axis: ``None`` for outer-trip flavour. The concrete iter_var
             axis name (e.g. ``"d1"``) for tensorize flavour; matches
             ``IterVar.axis``. Translated to the abstract op-axis via the
@@ -42,12 +39,14 @@ class SplitOption(TransformOption):
 
 
 class Split(Transform[SplitOption]):
-    """Replace one loop or tensorize-axis tile with a chain of factors."""
+    """Replace one loop or tensorized tile with exactly two factors."""
 
     def analyze(self, ir: KernelIR) -> list[SplitOption]:
         options: list[SplitOption] = []
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
+            if isinstance(data, (ForNode, ISANode)) and subtree_has_access_patterns(ir.tree, nid):
+                continue
             if isinstance(data, ForNode):
                 if _encloses_multiple_blocks(ir.tree, nid):
                     """Outer-trip Split of a shared (post-CodeMotion) loop is illegal — see
@@ -60,18 +59,17 @@ class Split(Transform[SplitOption]):
                 block_nid, block = _find_enclosing_block(ir.tree, nid)
                 for iv in block.iter_vars:
                     concrete = iv.axis
+                    if _is_slot_reduction_axis(ir, nid, concrete):
+                        continue
                     """Tile width currently bound on the leaf (max_tile or full extent)."""
                     current = _current_tensorize_width(data, block, concrete)
-                    if current is None or current < 2 or self._is_factored_slot_axis(ir, nid, concrete):
+                    if current is None or current < 2:
                         continue
                     floor = _min_tile_floor(data, block, concrete)
                     for factors in _factorizations(current):
                         if floor is not None and factors[-1] < floor:
                             continue
-                        option = SplitOption(target_nid=nid, factors=factors, target_axis=concrete)
-                        if self._requires_slot_rfactor(ir, option) and len(factors) != 2:
-                            continue
-                        options.append(option)
+                        options.append(SplitOption(target_nid=nid, factors=factors, target_axis=concrete))
         return options
 
     def apply(self, ir: KernelIR, option: SplitOption) -> KernelIR:
@@ -80,16 +78,14 @@ class Split(Transform[SplitOption]):
         if option.target_axis is None:
             self._do_outer_trip(new_ir, option)
         else:
-            split_loop_nid = self._do_tensorize(new_ir, option)
-            if self._requires_slot_rfactor(new_ir, option):
-                SlotRFactor().emit(new_ir, split_loop_nid)
+            self._do_tensorize(new_ir, option)
         invalidate_stale_software_pipelines(new_ir)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
     def _check_legality(self, ir: KernelIR, option: SplitOption) -> None:
-        if len(option.factors) < 2:
-            raise TransformLegalityError(f"Split.factors must have len >= 2; got {option.factors}")
+        if len(option.factors) != 2:
+            raise TransformLegalityError(f"Split.factors must contain exactly two factors; got {option.factors}")
         if any(f < 2 for f in option.factors):
             raise TransformLegalityError(f"Split.factors entries must be >= 2; got {option.factors}")
         target = _resolve(ir.tree, option.target_nid)
@@ -110,6 +106,8 @@ class Split(Transform[SplitOption]):
                 raise TransformLegalityError(
                     f"Split tensorize flavour requires target to be ISANode; got {type(target).__name__}"
                 )
+            if _is_slot_reduction_axis(ir, option.target_nid, option.target_axis):
+                raise TransformLegalityError("Split cannot partition a slot reduction; use RFactor")
             block_nid, block = _find_enclosing_block(ir.tree, option.target_nid)
             if not any(iv.axis == option.target_axis for iv in block.iter_vars):
                 raise TransformLegalityError(
@@ -129,14 +127,6 @@ class Split(Transform[SplitOption]):
                 raise TransformLegalityError(
                     f"Split.target_axis={option.target_axis!r}: innermost tile {option.factors[-1]} "
                     f"< MIN_TILE_SIZE {floor}"
-                )
-            if self._is_factored_slot_axis(ir, option.target_nid, option.target_axis):
-                raise TransformLegalityError(
-                    "a slot reduction axis cannot be split again after its partial results have been factored"
-                )
-            if self._requires_slot_rfactor(ir, option) and len(option.factors) != 2:
-                raise TransformLegalityError(
-                    "a slot reduction requires one outer split factor so Split and RFactor can be applied atomically"
                 )
 
     def _do_outer_trip(self, ir: KernelIR, option: SplitOption) -> None:
@@ -243,33 +233,6 @@ class Split(Transform[SplitOption]):
         normalize_block(ir.tree, block_nid)
         return top_nid
 
-    def _requires_slot_rfactor(self, ir: KernelIR, option: SplitOption) -> bool:
-        """Return whether this tensorize split must immediately close partial slots."""
-        result = False
-        if option.target_axis is not None and option.target_nid in ir.tree.graph:
-            target = ir.tree.data(option.target_nid)
-            if isinstance(target, ISANode) and target.op_cls.RFACTOR_RECIPE == "slot":
-                _block_nid, block = _find_enclosing_block(ir.tree, option.target_nid)
-                roles = [iter_var.role for iter_var in block.iter_vars if iter_var.axis == option.target_axis]
-                result = roles == [AxisRole.ACCUMULATION]
-        return result
-
-    def _is_factored_slot_axis(self, ir: KernelIR, target_nid: int, target_axis: str) -> bool:
-        """Return whether a slot reduction axis already writes independent partials."""
-        result = False
-        if target_nid in ir.tree.graph:
-            target = ir.tree.data(target_nid)
-            if isinstance(target, ISANode) and target.op_cls.RFACTOR_RECIPE == "slot":
-                _block_nid, block = _find_enclosing_block(ir.tree, target_nid)
-                abstract_axes = [abstract for abstract, concrete in block.axis_map.items() if concrete == target_axis]
-                roles = [iter_var.role for iter_var in block.iter_vars if iter_var.axis == target_axis]
-                result = (
-                    len(abstract_axes) == 1
-                    and target.op_cls.AXIS_ROLES.get(abstract_axes[0]) == AxisRole.ACCUMULATION
-                    and roles == [AxisRole.PARALLEL]
-                )
-        return result
-
 
 def _resolve(tree: KernelTree, nid: int):
     if nid not in tree.graph:
@@ -335,6 +298,18 @@ def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
         if isinstance(data, BlockNode):
             return ancestor, data
     raise TransformLegalityError(f"no enclosing BlockNode for nid {nid}")
+
+
+def _is_slot_reduction_axis(ir: KernelIR, leaf_nid: int, target_axis: str) -> bool:
+    """Return whether ``target_axis`` is a slot recipe's reduction axis."""
+    result = False
+    leaf = ir.tree.data(leaf_nid)
+    if isinstance(leaf, ISANode) and leaf.op_cls.RFACTOR_RECIPE == "slot":
+        _block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
+        contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
+        if isinstance(contract, ReductionContract):
+            result = block.axis_map.get(contract.reduction_axis) == target_axis
+    return result
 
 
 def _build_for_chain(tree: KernelTree, stem_loop_var: str, factors: tuple[int, ...]) -> tuple[int, int]:
@@ -422,41 +397,14 @@ def _covers_exactly(factors: tuple[int, ...], extent: int) -> bool:
     return hi is not None and hi + 1 == extent
 
 
-def _factorizations(n: int) -> list[tuple[int, ...]]:
-    """Every ordered factorization of ``n`` into ``2.._MAX_SPLIT_PARTS`` factors.
+def _factorizations(n: int) -> list[tuple[int, int]]:
+    """Return every ordered binary factorization of ``n``.
 
-    Each returned tuple holds factors ``>= 2`` whose product is exactly ``n``,
-    listed outermost-first — these are precisely the candidate ``factors`` a
-    :class:`SplitOption` may carry, so every tuple exactly tiles ``n`` (passes
-    :func:`_covers_exactly`). Order is significant: ``(2, 4)`` and ``(4, 2)`` are
-    both emitted because they name distinct loop nests (outer trip 2 / inner 4
-    vs. outer 4 / inner 2). Tuples with fewer factors are listed first.
-
-    Example: ``_factorizations(8) == [(2, 4), (4, 2), (2, 2, 2)]``.
+    Each tuple contains factors ``>= 2`` whose product is exactly ``n``.
+    Order is significant because ``(2, 4)`` and ``(4, 2)`` name distinct loop
+    nests. Deeper factorizations are composed from separate binary Split actions.
     """
-    out: list[tuple[int, ...]] = []
-    for parts in range(2, _MAX_SPLIT_PARTS + 1):
-        _enum(n, parts, (), out)
-    return out
-
-
-def _enum(remaining: int, parts_left: int, prefix: tuple[int, ...], out: list[tuple[int, ...]]) -> None:
-    """Append to ``out`` every way to factor ``remaining`` into ``parts_left`` factors ``>= 2``.
-
-    Recursive worker for :func:`_factorizations`. ``prefix`` holds the factors
-    already chosen (outer loops); each call either closes the chain (last slot
-    takes all of ``remaining``) or peels off one more divisor. The guard
-    ``remaining // f >= 2 ** (parts_left - 1)`` prunes any divisor that leaves
-    too little for the remaining ``parts_left - 1`` slots to each hold a factor
-    ``>= 2``, so no dead branches are explored.
-    """
-    if parts_left == 1:
-        if remaining >= 2:
-            out.append(prefix + (remaining,))
-        return
-    for f in range(2, remaining + 1):
-        if remaining % f == 0 and remaining // f >= 2 ** (parts_left - 1):
-            _enum(remaining // f, parts_left - 1, prefix + (f,), out)
+    return [(outer, n // outer) for outer in range(2, n) if n % outer == 0 and n // outer >= 2]
 
 
 __all__ = ["Split", "SplitOption"]

@@ -75,15 +75,33 @@ def evaluate_algebra(ir: KernelIR, graph: ValueGraph, progress_axis: str) -> Alg
         inputs = {
             slot: _operand_value(leaf, slot, graph, values_by_tensor, progress_axis)
             for slot in contract_input_operands(contract)
-            if slot in leaf.operand_bindings or slot in leaf.kwargs
+            if _operand_is_available(leaf, contract, slot)
         }
-        value, stage = _transfer(ir, graph, leaf_nid, contract, inputs, progress_axis, tuple(stages))
+        value, stage, mapped_output = _transfer(ir, graph, leaf_nid, contract, inputs, progress_axis, tuple(stages))
+        if isinstance(contract, ReductionContract) and contract.mapped_output_operand is not None:
+            if mapped_output is None:
+                raise AssertionError(f"{type(contract).__name__} has no mapped output value")
+            mapped_region = leaf.operand_bindings.get(contract.mapped_output_operand)
+            if mapped_region is None:
+                raise ValueError(
+                    f"{leaf.op_cls.__name__} contract mapped output " f"{contract.mapped_output_operand!r} is unbound"
+                )
+            values_by_tensor[mapped_region.tensor] = mapped_output
         output_tensor = graph.output_by_leaf[leaf_nid]
         values_by_tensor[output_tensor] = value
         values_by_leaf[leaf_nid] = value
         if stage is not None:
             stages.append(stage)
     return AlgebraEvaluation(stages=tuple(stages), values_by_tensor=values_by_tensor, values_by_leaf=values_by_leaf)
+
+
+def _operand_is_available(leaf: ISANode, contract: OperatorContract, slot: str) -> bool:
+    """Return whether ``slot`` is a tensor binding or independent literal."""
+    available = slot in leaf.operand_bindings
+    bias_operand = contract.bias_operand if isinstance(contract, (PointwiseContract, ReductionContract)) else None
+    if slot != bias_operand:
+        available = available or slot in leaf.kwargs
+    return available
 
 
 def _operand_value(
@@ -114,9 +132,10 @@ def _transfer(
     inputs: Mapping[str, SeparatedValue],
     progress_axis: str,
     stages: tuple[OnlineFusionStage, ...],
-) -> tuple[SeparatedValue, OnlineFusionStage | None]:
+) -> tuple[SeparatedValue, OnlineFusionStage | None, SeparatedValue | None]:
     """Apply one contract's separation transfer rule."""
     stage: OnlineFusionStage | None = None
+    mapped_output: SeparatedValue | None = None
     if isinstance(contract, PointwiseContract):
         value = _pointwise(contract, inputs)
     elif isinstance(contract, (CopyContract, PermutationContract)):
@@ -130,6 +149,7 @@ def _transfer(
             if contract.map_operator == "copy"
             else _apply_unary(contract.map_operator, mapped_input, 1.0, 0.0)
         )
+        mapped_output = mapped
         value, stage = _reduce(
             ir, graph, leaf_nid, contract.combinator, contract.reduction_axis, mapped, progress_axis, stages
         )
@@ -144,7 +164,7 @@ def _transfer(
         value = _unknown()
     else:
         raise TypeError(f"unsupported contract {type(contract).__name__}")
-    return value, stage
+    return value, stage, mapped_output
 
 
 def _pointwise(contract: PointwiseContract, inputs: Mapping[str, SeparatedValue]) -> SeparatedValue:

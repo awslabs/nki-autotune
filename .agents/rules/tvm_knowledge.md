@@ -18,23 +18,13 @@ NOT classic `tvm.tir`. Every claim is tagged with its evidence level:
 > contradicts a system's core invariant (e.g. "correctness-preserving schedule
 > primitives silently emit wrong kernels"), the prior is that the TRACE is wrong.
 
-## How to actually run TVM (probe harness)
+## TVM probe status
 
-**TVM is NOT built or installed ANYWHERE on the Kaizen desktop** ([PROBE]
-2026-06-09, exhaustive): not in `/opt/conda` (default), not in
-`~/venvs/kernel-env`, no `libtvm*.so` under `$HOME`, no `tvm` package dir, source
-not synced to `$HOME`. **`install.sh` does NOT build/install TVM** (only the Neuron
-SDK + spike). The repo's oracle tests (`test/transforms/_tvm_struct_oracle.py`,
-`importorskip("tvm")`) therefore SKIP on this desktop; the "oracle-verified vs a
-BUILT TVM" note in `learnings.md` was a PRIOR/DIFFERENT environment, not this one.
-
-**Consequence: [PROBE]-grade evidence is currently UNAVAILABLE** without first
-building the TIRx-fork TVM (heavy CMake/C++ build) on the desktop. Until then,
-init-domination claims rest on [SRC]+[INFERRED] only — see the open question below.
-
-Probe script (ready, awaiting a built TVM): `test/transforms/_tvm_init_domination_probe.py`
-— uses the same TIRx surface as `_tvm_struct_oracle.py` (`tvm.te.create_prim_func`,
-`tvm.s_tir.Schedule`). Run via `transport/remote_pytest.sh` once TVM is built.
+TVM is not a project dependency, and `install.sh` does not build or install it.
+The optional TVM oracle and probe tests were removed after native arithmetic
+coverage replaced them. The source findings below remain historical evidence;
+future TVM experiments require a separately built checkout and normal local test
+commands. There is no remote test transport in this repository.
 
 ## Reduction block `init` — the model [SRC]
 
@@ -89,11 +79,11 @@ re-validates after EVERY primitive.
 - ❌ "TVM ALLOWS sinking a decomposed init into the reduction loop → silently produces a
   wrong kernel." Claimed from a shallow `FindInsertionPoint` subagent trace that MISSED
   the `region_cover`/`stage_pipeline` gate. **[INFERRED, suspected wrong]** — the
-  `region_cover` [SRC] analysis predicts TVM REJECTS it. **NEEDS [PROBE] to confirm**
-  (probe written, not yet run against a located TVM). Do not cite "TVM allows it."
+  `region_cover` [SRC] analysis predicts TVM REJECTS it. A probe was drafted but
+  removed without being run. Do not cite "TVM allows it."
   Open nuance the trace exposed: region_cover checks region *coverage*, and a memset
   sunk into K still *writes* `C[i,j]` — so whether coverage alone catches the re-zeroing
-  is exactly what the probe must settle.
+  was never independently confirmed.
 
 ## `rfactor` [SRC]
 
@@ -131,7 +121,7 @@ anywhere in TVM — checked `primitive/`, `meta_schedule/`, `dlight/`, tests):
   "mirror TVM block-granular" is viable IF we also port `region_cover` + `stage_pipeline`
   + `VerifyCachedFlags`. Our shipped loop-granular carry-edge model
   (`memset → K-loop` edge) gives the EQUIVALENT guarantee via a different representation.
-  *(This whole bullet is [SRC]+[INFERRED]; the decisive behavior awaits [PROBE].)*
+  *(This whole bullet is [SRC]+[INFERRED]; the TVM behavior was not probed.)*
 
 ## ✅ RESOLVED (2026-07-03): span-promotion, neither block- nor loop-granular carry-edge
 
@@ -145,15 +135,16 @@ RFactor→fused fold is UNBLOCKED (`_check_no_reduction_axis_covered` DELETED; t
 it needed is subsumed by the init-breaks-carry clause: a memset sinks into `ko` (re-init,
 legal) but not `ki` (live accumulation)). No TVM build was needed — the ladder CPU-sim +
 an exhaustive pure-vs-simulation cross-check on gym-1 drove the decision, not a TVM oracle.
-The `_tvm_init_domination_probe.py` question is moot for our purposes: our correctness
-rests on the ladder, not on matching TVM's `region_cover` behavior. See the learnings
-"Code-motion legality = SPAN-PROMOTION" bullet.
+The unrun TVM probe question is moot for our purposes: our correctness rests on the
+ladder, not on matching TVM's `region_cover` behavior. See the learnings "Code-motion
+legality = SPAN-PROMOTION" bullet.
 
-### Original parked framing (kept for the record)
+### Original parked framing (historical)
 
-**We will revisit whether to adopt TVM's block-granular dependency model** (mirroring
-`region_cover` / `stage_pipeline`) vs. keeping our shipped loop-granular carry-edge
-model. Parked, NOT decided. Status when parked:
+Before span-promotion shipped, the choice between TVM's block-granular
+`region_cover`/`stage_pipeline` model and the loop-granular carry-edge model was
+parked pending a TVM probe. That probe was never run and was later removed. This
+is no longer an open prerequisite or a current execution instruction.
 
 - The two models give the **equivalent** init-domination guarantee (see the bullet
   above); the choice is representation + faithfulness, not correctness. *[SRC]+[INFERRED]*
@@ -162,14 +153,6 @@ model. Parked, NOT decided. Status when parked:
 - It is the **blocker for the RFactor→fused fold** (narrowing
   `_check_no_reduction_axis_covered`; see the RFactor spec §7). The fold stays blocked
   until this is resolved.
-- **Prerequisite to decide it properly:** run `_tvm_init_domination_probe.py` against a
-  BUILT TVM (does TVM reject sinking a decomposed init into the reduction loop, via
-  `region_cover`/`stage_pipeline`?). TVM is not built on the current desktop — see
-  "How to actually run TVM" above. The probe verdict, not another source trace, should
-  drive the decision (per the method note).
-
-When revisiting: start from the probe result, then weigh (a) port `region_cover` +
-go block-granular, vs (b) keep loop-granular and narrow `_check_no_reduction_axis_covered`.
 
 ## Trn2-vs-GPU specialization (why our rfactor diverges in OUTPUT, not mechanism)
 

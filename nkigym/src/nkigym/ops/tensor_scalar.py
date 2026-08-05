@@ -33,6 +33,10 @@ class NKITensorScalar(NKIOp):
     NAME: ClassVar[str] = "tensor_scalar"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "operand0": ("P",), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "operand0"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {
+        "data": frozenset({"sbuf", "psum"}),
+        "operand0": frozenset({"sbuf", "psum"}),
+    }
     REQUIRED_INPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {"operand0": "float32"}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
@@ -50,13 +54,13 @@ class NKITensorScalar(NKIOp):
         )
 
     def _check_roles(self, **kwargs: Any) -> None:
-        """``data`` must be SBUF-resident; ``operand0`` may be SBUF or a literal scalar."""
+        """Tensor inputs may be SBUF- or PSUM-resident."""
         data_role = _operand_role(kwargs["data"])
-        if data_role is not None and data_role != "sbuf":
-            raise TypeError(f"NKITensorScalar(data=<role={data_role}>) expects sbuf")
+        if data_role is not None and data_role not in {"sbuf", "psum"}:
+            raise TypeError(f"NKITensorScalar(data=<role={data_role}>) expects sbuf or psum")
         operand0_role = _operand_role(kwargs.get("operand0"))
-        if operand0_role is not None and operand0_role != "sbuf":
-            raise TypeError(f"NKITensorScalar(operand0=<role={operand0_role}>) expects sbuf")
+        if operand0_role is not None and operand0_role not in {"sbuf", "psum"}:
+            raise TypeError(f"NKITensorScalar(operand0=<role={operand0_role}>) expects sbuf or psum")
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: broadcast ``operand0`` across F, apply ``op``, return the result."""

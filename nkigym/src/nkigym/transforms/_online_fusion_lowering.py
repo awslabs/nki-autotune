@@ -7,10 +7,14 @@ from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var, substitute, to_affine
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
-from nkigym.ops.base import AxisRole, CopyContract
+from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
+from nkigym.ops.activation import NKIActivation
+from nkigym.ops.activation_reduce import NKIActivationReduce
+from nkigym.ops.base import AxisRole, CopyContract, ReductionContract
 from nkigym.ops.load import NKILoad
 from nkigym.ops.store import NKIStore
+from nkigym.ops.tensor_scalar import NKITensorScalar
+from nkigym.ops.tensor_scalar_reduce import NKITensorScalarReduce
 from nkigym.transforms._canonical_rewrite import block_chain, finalize_rewrite, owning_block
 from nkigym.transforms._online_fusion_analysis import build_value_graph
 from nkigym.transforms._online_fusion_recurrence import (
@@ -18,6 +22,7 @@ from nkigym.transforms._online_fusion_recurrence import (
     RecurrenceIR,
     RecurrenceScope,
     access_regions,
+    append_additive_update,
     append_copy,
     append_corrected_update,
     append_initializer,
@@ -32,6 +37,7 @@ from nkigym.transforms._online_fusion_types import (
     OnlineFusionStage,
     ValueGraph,
     contract_output_operand,
+    factor_states,
 )
 
 
@@ -63,6 +69,28 @@ class _TerminalStore:
     output_region: BufferRegion
 
 
+@dataclass(frozen=True)
+class _MappedGroupSchedule:
+    """Mapped recurrence schedule selected by an explicit partition split."""
+
+    stage_scopes: tuple[RecurrenceScope, ...]
+
+
+@dataclass(frozen=True)
+class OnlineFusionPrefixLowering:
+    """Structure retained for an incremental online-fusion completion."""
+
+    roots: tuple[int, ...]
+    added_buffers: tuple[str, ...]
+    carrier_nid: int
+    loop_nid: int
+    roll_forward_blocks: tuple[int, ...]
+    derivation_leaves: tuple[int, ...]
+    stage_buffers: tuple[tuple[str, str, str], ...]
+    stage_scopes: tuple[RecurrenceScope | None, ...]
+    stage_regions: tuple[BufferRegion, ...]
+
+
 @dataclass
 class _LoweringContext:
     """Mutable state shared by graph-lowering helpers."""
@@ -76,6 +104,7 @@ class _LoweringContext:
     stage_scopes: tuple[RecurrenceScope | None, ...]
     carry_tensor: str | None = None
     output_tensor: str | None = None
+    outer_loop_var: str | None = None
 
 
 def can_lower_online_fusion(ir: KernelIR, match: OnlineFusionMatch, chunk_size: int) -> bool:
@@ -95,6 +124,12 @@ def can_lower_online_fusion(ir: KernelIR, match: OnlineFusionMatch, chunk_size: 
             for buffer in state_buffers
         )
         valid = valid and all(len(ir.buffer(stage.state_tensor).shape) == 1 for stage in match.stages[:-1])
+    if valid and chunk_size == match.progress_extent:
+        valid = False
+        if _uses_mapped_state(ir, match):
+            graph = build_value_graph(ir)
+            stage_scopes = tuple(_stage_scope(ir, graph, stage, match.progress_axis) for stage in match.stages)
+            valid = _mapped_group_schedule(ir, match, graph, stage_scopes) is not None
     if valid and _uses_mapped_state(ir, match):
         graph = build_value_graph(ir)
         terminal = _terminal_store(ir, match, graph)
@@ -118,6 +153,7 @@ def can_lower_online_fusion_prefix(ir: KernelIR, match: OnlineFusionMatch, chunk
     valid = (
         match.incremental_prefix
         and chunk_size in match.chunk_sizes
+        and chunk_size < match.progress_extent
         and len(match.stages) >= 2
         and len(match.external_outputs) == 1
     )
@@ -133,6 +169,8 @@ def can_lower_online_fusion_prefix(ir: KernelIR, match: OnlineFusionMatch, chunk
             and buffer.shape[0] % 128 == 0
             for buffer in state_buffers
         )
+    if valid:
+        valid = _prefix_insertion_index(ir, match) is not None
     return valid
 
 
@@ -147,31 +185,37 @@ def lower_online_fusion(ir: KernelIR, match: OnlineFusionMatch, chunk_size: int)
 
 
 def lower_online_fusion_prefix(
-    ir: KernelIR, match: OnlineFusionMatch, chunk_size: int
-) -> tuple[tuple[int, ...], tuple[str, ...]]:
-    """Add an explicit recurrence prefix while retaining the materialized path."""
+    ir: KernelIR, match: OnlineFusionMatch, complete: OnlineFusionMatch, chunk_size: int
+) -> OnlineFusionPrefixLowering:
+    """Replace prefix reducers with a live recurrence while retaining the materialized suffix."""
     if not can_lower_online_fusion_prefix(ir, match, chunk_size):
         raise ValueError(f"online-fusion prefix {match.match_id} cannot lower with chunk_size={chunk_size}")
     graph = build_value_graph(ir)
     original_buffers = ir.all_buffers()
     names = NameSupply(set(original_buffers))
-    stage_buffers, new_buffers = _plan_stage_buffers(ir, match, graph, names, fresh_states=True)
+    stage_buffers, new_buffers = _plan_stage_buffers(
+        ir, match, graph, names, fresh_states=False, preserve_deferred_dtype=False, separate_final_current=True
+    )
     buffers = dict(original_buffers)
     buffers.update(new_buffers)
     mapped = _uses_mapped_state(ir, match)
     if mapped:
-        stage_scopes = tuple(_stage_scope(ir, graph, stage, match.progress_axis) for stage in match.stages)
+        prefix_scopes = tuple(_stage_scope(ir, graph, stage, match.progress_axis) for stage in match.stages)
+        stage_scopes = tuple(_stage_scope(ir, graph, stage, complete.progress_axis) for stage in complete.stages)
+        complete_regions = tuple(_stage_output_region(ir, graph, stage) for stage in complete.stages)
         output_regions = tuple(_stage_output_region(ir, graph, stage) for stage in match.stages)
         regions = _stage_regions(stage_buffers, output_regions)
     else:
-        stage_scopes = tuple(None for _stage in match.stages)
+        prefix_scopes = tuple(None for _stage in match.stages)
+        stage_scopes = tuple(None for _stage in complete.stages)
+        complete_regions = tuple(_stage_output_region(ir, graph, stage) for stage in complete.stages)
         regions = {}
 
     tree = ir.tree
     init_context = RecurrenceIR(tree=tree, parent=None, buffers=buffers, names=names, regions=regions)
     init_blocks: list[int] = []
     for index, (stage, plan) in enumerate(zip(match.stages, stage_buffers)):
-        init_context.scope = stage_scopes[index]
+        init_context.scope = prefix_scopes[index]
         init_blocks.append(append_initializer(init_context, plan.state, stage.combinator.identity))
 
     loop_var = f"i_{match.progress_axis}_online"
@@ -192,18 +236,189 @@ def lower_online_fusion_prefix(
         progress_index=Var(name=loop_var),
         tensor_axes=graph.tensor_axes,
         recurrence=recurrence,
-        stage_scopes=stage_scopes,
+        stage_scopes=prefix_scopes,
     )
-    _append_derivation(context, graph, stage_buffers)
+    _append_derivation(context, graph, stage_buffers, append_roll_forward=False)
+    roll_forward_blocks: list[int] = []
+    for stage_index, plan in enumerate(stage_buffers):
+        recurrence.scope = prefix_scopes[stage_index]
+        roll_forward_blocks.append(append_copy(recurrence, plan.current, plan.state))
 
     roots = (*init_blocks, carrier_nid)
-    root_children = tree.children(tree.root)
-    insertion_index = min(root_children.index(block) for block in match.absorbed_blocks)
+    insertion_index = _prefix_insertion_index(ir, match)
+    if insertion_index is None:
+        raise ValueError(f"online-fusion prefix {match.match_id} has no dependency-valid insertion")
     _insert_root_blocks(tree, list(roots), insertion_index)
-    _seed_buffers(ir, buffers)
+    removed_reducers: list[int] = []
+    for stage in match.stages:
+        contract = graph.contracts[stage.reducer_leaf]
+        if isinstance(contract, ReductionContract) and contract.mapped_output_operand is not None:
+            _rewrite_reducer_as_map(ir, stage, contract)
+        else:
+            removed_reducers.append(stage.reducer_block)
+    _remove_root_blocks(tree, removed_reducers)
+    for block_nid in removed_reducers:
+        tree.graph.remove_nodes_from({block_nid, *tree.descendants(block_nid)})
+    _seed_buffers(ir, buffers, frozenset())
     finalize_rewrite(ir)
     added_buffers = tuple(name for name in buffers if name not in original_buffers and name in ir.all_buffers())
-    return roots, added_buffers
+    return OnlineFusionPrefixLowering(
+        roots=roots,
+        added_buffers=added_buffers,
+        carrier_nid=carrier_nid,
+        loop_nid=loop_nid,
+        roll_forward_blocks=tuple(roll_forward_blocks),
+        derivation_leaves=match.derivation_leaves,
+        stage_buffers=tuple((plan.state, plan.contribution, plan.current) for plan in stage_buffers),
+        stage_scopes=stage_scopes,
+        stage_regions=complete_regions,
+    )
+
+
+def complete_online_fusion_prefix(
+    ir: KernelIR, match: OnlineFusionMatch, graph: ValueGraph, prefix: OnlineFusionPrefixLowering, chunk_size: int
+) -> None:
+    """Append one final recurrence stage to a retained live prefix."""
+    prefix_plans = tuple(_StageBuffers(*names) for names in prefix.stage_buffers)
+    if len(match.stages) != len(prefix_plans) + 1:
+        raise ValueError("incremental online fusion requires exactly one final-stage extension")
+    if prefix.loop_nid not in ir.tree.graph or prefix.carrier_nid not in ir.tree.graph:
+        raise ValueError("incremental online-fusion carrier is missing")
+
+    all_buffers = ir.all_buffers()
+    names = NameSupply(set(all_buffers))
+    final_stage = match.stages[-1]
+    state_source = ir.buffer(match.external_outputs[0])
+    deferred_state = match.deferred_factor is not None and len(match.stages) - 1 == match.deferred_factor.stage
+    if deferred_state:
+        state_name = names.fresh(f"{final_stage.state_tensor}_online_state")
+        state_buffer = replace(state_source, name=state_name, storage_dtype="float32")
+    else:
+        state_name = match.external_outputs[0]
+        state_buffer = replace(state_source, storage_dtype="float32")
+    contribution_leaf = _stage_contribution_leaf(match, graph, len(match.stages) - 1)
+    contribution_source = graph.output_by_leaf[contribution_leaf]
+    contribution_name = names.fresh(f"{final_stage.state_tensor}_online_chunk")
+    contribution_buffer = replace(ir.buffer(contribution_source), name=contribution_name, storage_dtype="float32")
+    final_plan = _StageBuffers(state=state_name, contribution=contribution_name, current=state_name)
+    plans = (*prefix_plans, final_plan)
+
+    buffers = _localized_buffers(ir, match, graph.tensor_axes, all_buffers, chunk_size)
+    buffers[state_name] = state_buffer
+    buffers[contribution_name] = contribution_buffer
+    mapped = _uses_mapped_state(ir, match)
+    regions = _stage_regions(plans, prefix.stage_regions) if mapped else {}
+    carry_tensor: str | None = None
+    output_tensor: str | None = None
+    terminal: _TerminalStore | None = None
+    init_roots: list[int] = []
+    tree = ir.tree
+
+    if mapped:
+        terminal = _terminal_store(ir, match, graph)
+        if terminal is None:
+            raise ValueError(f"mapped online-fusion match {match.match_id} has no terminal HBM store")
+        output_tensor = ir.return_name
+        output_buffer = buffers[output_tensor]
+        carry_tensor = names.fresh(f"{output_tensor}_online_carry")
+        buffers[carry_tensor] = replace(output_buffer, name=carry_tensor, dtype="float32", storage_dtype="float32")
+        final_region = prefix.stage_regions[-1]
+        regions[carry_tensor] = _hbm_tile_region(final_region, carry_tensor)
+        regions[output_tensor] = _hbm_tile_region(final_region, output_tensor)
+        zero_tensor = names.fresh(f"{match.external_outputs[0]}_online_zero")
+        zero_shape = _region_shape(final_region)
+        buffers[zero_tensor] = Buffer(
+            name=zero_tensor, shape=zero_shape, dtype="float32", location="sbuf", storage_dtype="float32"
+        )
+        regions[zero_tensor] = BufferRegion(
+            tensor=zero_tensor, ranges=tuple((Const(value=0), Const(value=extent)) for extent in zero_shape)
+        )
+        init_context = RecurrenceIR(
+            tree=tree, parent=None, buffers=buffers, names=names, regions=regions, scope=prefix.stage_scopes[-1]
+        )
+        init_roots.append(append_initializer(init_context, zero_tensor, 0.0))
+        init_roots.append(
+            append_manual_block(
+                tree,
+                None,
+                NKIStore,
+                {"src": regions[zero_tensor], "dst": regions[carry_tensor]},
+                {},
+                prefix.stage_scopes[-1],
+            )
+        )
+    else:
+        init_context = RecurrenceIR(tree=tree, parent=None, buffers=buffers, names=names)
+        init_roots.append(append_initializer(init_context, final_plan.state, final_stage.combinator.identity))
+
+    recurrence = RecurrenceIR(tree=tree, parent=None, buffers=buffers, names=names, regions=regions)
+    context = _LoweringContext(
+        ir=ir,
+        match=match,
+        chunk_size=chunk_size,
+        progress_index=Var(name=tree.loop(prefix.loop_nid).loop_var),
+        tensor_axes=graph.tensor_axes,
+        recurrence=recurrence,
+        stage_scopes=prefix.stage_scopes,
+        carry_tensor=carry_tensor,
+        output_tensor=output_tensor,
+    )
+    initial_remap = {stage.state_tensor: plan.current for stage, plan in zip(match.stages[:-1], prefix_plans)}
+    completion_leaves = frozenset(match.derivation_leaves) - frozenset(prefix.derivation_leaves)
+    nodes_before_suffix = set(tree.graph)
+    _append_derivation(
+        context, graph, plans, initial_remap=initial_remap, append_roll_forward=False, selected_leaves=completion_leaves
+    )
+    suffix_roots = _new_detached_roots(tree, nodes_before_suffix)
+    epilogue_roots = _append_deferred_epilogue(context, plans)
+
+    _insert_root_blocks_before(tree, prefix.carrier_nid, init_roots)
+    _insert_child_blocks_before(tree, prefix.loop_nid, prefix.roll_forward_blocks, suffix_roots)
+    _insert_root_blocks_after(tree, prefix.carrier_nid, epilogue_roots)
+
+    old_blocks = [block for block in match.absorbed_blocks if block in tree.graph]
+    if terminal is not None:
+        old_blocks.append(terminal.block)
+    _remove_root_blocks(tree, old_blocks)
+    for block_nid in old_blocks:
+        tree.graph.remove_nodes_from({block_nid, *tree.descendants(block_nid)})
+    _seed_buffers(ir, buffers, _match_tensors(match, graph))
+    finalize_rewrite(ir)
+
+
+def _rewrite_reducer_as_map(ir: KernelIR, stage: OnlineFusionStage, contract: ReductionContract) -> None:
+    """Retain the mapped output of a dual-output reducer as a pointwise block."""
+    leaf = ir.tree.isa(stage.reducer_leaf)
+    mapped_operand = contract.mapped_output_operand
+    if mapped_operand is None:
+        raise ValueError("mapped reducer rewrite requires a mapped output")
+    if leaf.op_cls is NKIActivationReduce:
+        op_cls = NKIActivation
+        input_operands = ("data", "bias")
+    elif leaf.op_cls is NKITensorScalarReduce:
+        op_cls = NKITensorScalar
+        input_operands = ("data", "operand0")
+    else:
+        raise ValueError(f"unsupported dual-output reducer {leaf.op_cls.__name__}")
+    bindings = {
+        slot: region
+        for slot, region in leaf.operand_bindings.items()
+        if slot in input_operands or slot == mapped_operand
+    }
+    bindings["dst"] = bindings.pop(mapped_operand)
+    kwargs = {name: value for name, value in leaf.kwargs.items() if name != "reduce_op"}
+    reads, writes = access_regions(op_cls, bindings, kwargs)
+    block = ir.tree.block(stage.reducer_block)
+    iter_vars = tuple(
+        (
+            replace(iter_var, role=AxisRole.PARALLEL)
+            if iter_var.axis == ir.tree.block(stage.reducer_block).axis_map[contract.reduction_axis]
+            else iter_var
+        )
+        for iter_var in block.iter_vars
+    )
+    ir.tree.graph.nodes[stage.reducer_block]["data"] = replace(block, iter_vars=iter_vars, reads=reads, writes=writes)
+    ir.tree.graph.nodes[stage.reducer_leaf]["data"] = ISANode(op_cls=op_cls, operand_bindings=bindings, kwargs=kwargs)
 
 
 def _lower_tile_online_fusion(ir: KernelIR, match: OnlineFusionMatch, chunk_size: int) -> None:
@@ -211,7 +426,9 @@ def _lower_tile_online_fusion(ir: KernelIR, match: OnlineFusionMatch, chunk_size
     graph = build_value_graph(ir)
     all_buffers = ir.all_buffers()
     names = NameSupply(set(all_buffers))
-    stage_buffers, new_buffers = _plan_stage_buffers(ir, match, graph, names, fresh_states=False)
+    stage_buffers, new_buffers = _plan_stage_buffers(
+        ir, match, graph, names, fresh_states=False, preserve_deferred_dtype=False, separate_final_current=False
+    )
     buffers = _localized_buffers(ir, match, graph.tensor_axes, all_buffers, chunk_size)
     buffers.update(new_buffers)
     insertion_index = _root_insertion_index(ir, match)
@@ -250,30 +467,47 @@ def _lower_tile_online_fusion(ir: KernelIR, match: OnlineFusionMatch, chunk_size
     _replace_root_blocks(tree, old_blocks, [*init_blocks, carrier_nid, *epilogue_blocks], insertion_index)
     for block_nid in old_blocks:
         tree.graph.remove_nodes_from({block_nid, *tree.descendants(block_nid)})
-    _seed_buffers(ir, buffers)
+    _seed_buffers(ir, buffers, _match_tensors(match, graph))
     finalize_rewrite(ir)
 
 
 def _lower_mapped_online_fusion(ir: KernelIR, match: OnlineFusionMatch, chunk_size: int) -> None:
     """Lower a recurrence mapped over multiple partition tiles."""
     graph = build_value_graph(ir)
+    stage_scopes = tuple(_stage_scope(ir, graph, stage, match.progress_axis) for stage in match.stages)
+    group_schedule = _mapped_group_schedule(ir, match, graph, stage_scopes)
+    if group_schedule is None:
+        _lower_hbm_carried_online_fusion(ir, match, graph, stage_scopes, chunk_size)
+    else:
+        _lower_grouped_online_fusion(ir, match, graph, group_schedule, chunk_size)
+
+
+def _lower_hbm_carried_online_fusion(
+    ir: KernelIR,
+    match: OnlineFusionMatch,
+    graph: ValueGraph,
+    stage_scopes: tuple[RecurrenceScope, ...],
+    chunk_size: int,
+) -> None:
+    """Lower mapped state through an FP32 HBM carry."""
     terminal = _terminal_store(ir, match, graph)
     if terminal is None:
         raise AssertionError(f"mapped online-fusion match {match.match_id} has no terminal HBM store")
     all_buffers = ir.all_buffers()
     names = NameSupply(set(all_buffers))
-    stage_buffers, new_buffers = _plan_stage_buffers(ir, match, graph, names, fresh_states=False)
+    stage_buffers, new_buffers = _plan_stage_buffers(
+        ir, match, graph, names, fresh_states=False, preserve_deferred_dtype=False, separate_final_current=False
+    )
     buffers = _localized_buffers(ir, match, graph.tensor_axes, all_buffers, chunk_size)
     buffers.update(new_buffers)
     output_tensor = ir.return_name
     output_buffer = buffers[output_tensor]
     carry_tensor = names.fresh(f"{output_tensor}_online_carry")
     buffers[carry_tensor] = replace(output_buffer, name=carry_tensor, dtype="float32", storage_dtype="float32")
-    stage_scopes = tuple(_stage_scope(ir, graph, stage, match.progress_axis) for stage in match.stages)
     stage_regions = tuple(_stage_output_region(ir, graph, stage) for stage in match.stages)
     regions = _stage_regions(stage_buffers, stage_regions)
-    regions[carry_tensor] = replace(terminal.output_region, tensor=carry_tensor)
-    regions[output_tensor] = terminal.output_region
+    regions[carry_tensor] = _hbm_tile_region(stage_regions[-1], carry_tensor)
+    regions[output_tensor] = _hbm_tile_region(stage_regions[-1], output_tensor)
 
     tree = ir.tree
     init_context = RecurrenceIR(tree=tree, parent=None, buffers=buffers, names=names, regions=regions)
@@ -333,8 +567,176 @@ def _lower_mapped_online_fusion(ir: KernelIR, match: OnlineFusionMatch, chunk_si
     _replace_root_blocks(tree, old_blocks, [*init_blocks, carrier_nid, *epilogue_blocks], insertion_index)
     for block_nid in old_blocks:
         tree.graph.remove_nodes_from({block_nid, *tree.descendants(block_nid)})
-    _seed_buffers(ir, buffers)
+    _seed_buffers(ir, buffers, _match_tensors(match, graph))
     finalize_rewrite(ir)
+
+
+def _lower_grouped_online_fusion(
+    ir: KernelIR, match: OnlineFusionMatch, graph: ValueGraph, schedule: _MappedGroupSchedule, chunk_size: int
+) -> None:
+    """Keep one explicitly split partition group on chip across the progress loop."""
+    terminal = _terminal_store(ir, match, graph)
+    if terminal is None:
+        raise AssertionError(f"mapped online-fusion match {match.match_id} has no terminal HBM store")
+    all_buffers = ir.all_buffers()
+    names = NameSupply(set(all_buffers))
+    stage_buffers, new_buffers = _plan_stage_buffers(
+        ir, match, graph, names, fresh_states=False, preserve_deferred_dtype=True, separate_final_current=False
+    )
+    buffers = _localized_buffers(ir, match, graph.tensor_axes, all_buffers, chunk_size)
+    buffers.update(new_buffers)
+    output_tensor = ir.return_name
+    stage_regions = tuple(_stage_output_region(ir, graph, stage) for stage in match.stages)
+    regions = _stage_regions(stage_buffers, stage_regions)
+    regions[output_tensor] = _hbm_tile_region(stage_regions[-1], output_tensor)
+
+    tree = ir.tree
+    group_root = tree.add_node(BlockNode(iter_vars=(), iter_values=(), reads=(), writes=(), alloc_buffers=()))
+    group_body = tree.add_node(
+        BlockNode(iter_vars=(), iter_values=(), reads=(), writes=(), alloc_buffers=()), parent=group_root
+    )
+
+    init_context = RecurrenceIR(tree=tree, parent=group_body, buffers=buffers, names=names, regions=regions)
+    if chunk_size < match.progress_extent:
+        for index, (stage, plan) in enumerate(zip(match.stages, stage_buffers)):
+            init_context.scope = schedule.stage_scopes[index]
+            append_initializer(init_context, plan.state, stage.combinator.identity)
+
+    loop_var = f"i_{match.progress_axis}_online"
+    carrier = BlockNode(
+        iter_vars=(IterVar(axis=match.progress_axis, dom=(0, match.progress_extent), role=AxisRole.SEQUENTIAL),),
+        iter_values=(Var(name=loop_var),),
+        reads=(),
+        writes=(),
+        alloc_buffers=(),
+    )
+    recurrence_parent = group_body
+    progress_index: Expr = Const(value=0)
+    if chunk_size < match.progress_extent:
+        carrier_nid = tree.add_node(carrier, parent=group_body)
+        recurrence_parent = tree.add_node(
+            ForNode(loop_var=loop_var, extent=match.progress_extent // chunk_size), parent=carrier_nid
+        )
+        progress_index = Var(name=loop_var)
+    recurrence = RecurrenceIR(tree=tree, parent=recurrence_parent, buffers=buffers, names=names, regions=regions)
+    context = _LoweringContext(
+        ir=ir,
+        match=match,
+        chunk_size=chunk_size,
+        progress_index=progress_index,
+        tensor_axes=graph.tensor_axes,
+        recurrence=recurrence,
+        stage_scopes=schedule.stage_scopes,
+        output_tensor=output_tensor,
+    )
+    _append_derivation(context, graph, stage_buffers)
+    final_scope = schedule.stage_scopes[-1]
+    store_source = stage_buffers[-1].current
+    if match.deferred_factor is not None:
+        store_source = _append_grouped_deferred_epilogue(context, stage_buffers, group_body)
+    append_manual_block(
+        tree, group_body, NKIStore, {"src": regions[store_source], "dst": regions[output_tensor]}, {}, final_scope
+    )
+
+    insertion_index = _root_insertion_index(
+        ir, match, extra_blocks=frozenset((terminal.block,)), extra_leaves=frozenset((terminal.leaf,))
+    )
+    if insertion_index is None:
+        raise AssertionError(f"mapped online-fusion match {match.match_id} has no dependency-valid insertion")
+    old_blocks = [*match.absorbed_blocks, terminal.block]
+    _replace_root_blocks(tree, old_blocks, [group_root], insertion_index)
+    for block_nid in old_blocks:
+        tree.graph.remove_nodes_from({block_nid, *tree.descendants(block_nid)})
+    _seed_buffers(ir, buffers, _match_tensors(match, graph))
+    finalize_rewrite(ir)
+
+
+def _mapped_group_schedule(
+    ir: KernelIR, match: OnlineFusionMatch, graph: ValueGraph, stage_scopes: tuple[RecurrenceScope, ...]
+) -> _MappedGroupSchedule | None:
+    """Return an on-chip grouping schedule when every mapped block has the same outer split."""
+    schedule: _MappedGroupSchedule | None = None
+    output_axes = graph.tensor_axes[match.external_outputs[0]]
+    if output_axes:
+        mapped_axis = output_axes[0]
+        final_scope = stage_scopes[-1]
+        axis_loops = _scope_axis_loops(final_scope, mapped_axis)
+        if len(axis_loops) >= 2:
+            outer_loop = axis_loops[0]
+            if _derivation_uses_group_loop(ir, match, mapped_axis, outer_loop):
+                schedule = _MappedGroupSchedule(stage_scopes=stage_scopes)
+    return schedule
+
+
+def _append_grouped_deferred_epilogue(context: _LoweringContext, plans: tuple[_StageBuffers, ...], parent: int) -> str:
+    """Apply one deferred factor after a grouped on-chip recurrence."""
+    deferred = context.match.deferred_factor
+    if deferred is None:
+        raise ValueError("grouped deferred epilogue requires a deferred factor")
+    normalized = context.match.external_outputs[0]
+    final_region = context.recurrence.region(plans[deferred.stage].current)
+    context.recurrence.regions[normalized] = replace(final_region, tensor=normalized)
+    states = {index: plan.state for index, plan in enumerate(plans[: deferred.stage])}
+    state_indices = sorted(factor_states(deferred.factor))
+    if not state_indices:
+        raise ValueError("grouped deferred factor does not reference an online state")
+    factor_scope = context.stage_scopes[state_indices[-1]]
+    output_scope = context.stage_scopes[deferred.stage]
+    if factor_scope is None or output_scope is None:
+        raise ValueError("grouped deferred factor has no mapped recurrence scope")
+    epilogue = RecurrenceIR(
+        tree=context.recurrence.tree,
+        parent=parent,
+        buffers=context.recurrence.buffers,
+        names=context.recurrence.names,
+        regions=context.recurrence.regions,
+        scope=factor_scope,
+    )
+    factor = compile_factor(epilogue, deferred.factor, states, "deferred_factor")
+    epilogue.scope = output_scope
+    append_scaled_output(epilogue, plans[deferred.stage].current, factor, normalized)
+    return normalized
+
+
+def _scope_axis_loops(scope: RecurrenceScope, axis: str) -> tuple[ForNode, ...]:
+    """Return one scope's loops that form the requested concrete axis."""
+    values = [value for iter_var, value in zip(scope.block.iter_vars, scope.block.iter_values) if iter_var.axis == axis]
+    loop_vars = set(to_affine(values[0])) if len(values) == 1 else set()
+    loop_vars.discard(None)
+    return tuple(loop for loop in scope.loops if loop.loop_var in loop_vars)
+
+
+def _derivation_uses_group_loop(ir: KernelIR, match: OnlineFusionMatch, mapped_axis: str, outer_loop: ForNode) -> bool:
+    """Return whether every derivation block mapped on this axis has the explicit group loop."""
+    valid = True
+    for leaf_nid in match.derivation_leaves:
+        block_nid = owning_block(ir.tree, leaf_nid)
+        block = ir.tree.block(block_nid)
+        values = [value for iter_var, value in zip(block.iter_vars, block.iter_values) if iter_var.axis == mapped_axis]
+        if not values:
+            continue
+        chain = block_chain(ir.tree, block_nid)
+        loop_vars = set(to_affine(values[0])) if len(values) == 1 else set()
+        matching = (
+            []
+            if chain is None
+            else [
+                payload
+                for payload in chain[1:-1]
+                if isinstance(payload, ForNode)
+                and payload.loop_var == outer_loop.loop_var
+                and payload.extent == outer_loop.extent
+            ]
+        )
+        axis_loop_count = (
+            0
+            if chain is None
+            else sum(isinstance(payload, ForNode) and payload.loop_var in loop_vars for payload in chain[1:-1])
+        )
+        if len(values) != 1 or len(matching) != 1 or axis_loop_count < 2:
+            valid = False
+            break
+    return valid
 
 
 def _uses_mapped_state(ir: KernelIR, match: OnlineFusionMatch) -> bool:
@@ -410,6 +812,35 @@ def _root_insertion_index(
     return result
 
 
+def _prefix_insertion_index(ir: KernelIR, match: OnlineFusionMatch) -> int | None:
+    """Return a root slot where the live prefix precedes every retained consumer."""
+    tree = ir.tree
+    root_children = tree.children(tree.root)
+    positions = {block: index for index, block in enumerate(root_children)}
+    absorbed_leaves = set(match.derivation_leaves)
+    lower = 0
+    upper = len(root_children)
+    valid = True
+    for producer, consumer in ir.dependency.graph.edges:
+        producer_absorbed = producer in absorbed_leaves
+        consumer_absorbed = consumer in absorbed_leaves
+        if producer_absorbed == consumer_absorbed:
+            continue
+        outside_leaf = consumer if producer_absorbed else producer
+        outside_block = owning_block(tree, outside_leaf)
+        if outside_block not in positions:
+            valid = False
+            break
+        if producer_absorbed:
+            upper = min(upper, positions[outside_block])
+        else:
+            lower = max(lower, positions[outside_block] + 1)
+    result: int | None = None
+    if valid and lower <= upper:
+        result = lower
+    return result
+
+
 def _replace_root_blocks(tree: KernelTree, old_blocks: list[int], new_blocks: list[int], insertion_index: int) -> None:
     """Remove arbitrary root blocks and insert their replacement at one slot."""
     root = tree.root
@@ -444,9 +875,71 @@ def _insert_root_blocks(tree: KernelTree, new_blocks: list[int], insertion_index
         tree.graph.add_edge(root, child)
 
 
-def _append_derivation(context: _LoweringContext, graph: ValueGraph, stage_buffers: tuple[_StageBuffers, ...]) -> None:
+def _remove_root_blocks(tree: KernelTree, removed_blocks: list[int]) -> None:
+    """Detach selected root blocks without changing remaining sibling order."""
+    removed = set(removed_blocks)
+    siblings = tree.children(tree.root)
+    if not removed.issubset(siblings):
+        raise ValueError(f"online-fusion blocks are not all root children: {removed - set(siblings)}")
+    for block_nid in removed_blocks:
+        tree.graph.remove_edge(tree.root, block_nid)
+
+
+def _new_detached_roots(tree: KernelTree, previous_nodes: set[int]) -> list[int]:
+    """Return newly added block roots that have not yet been attached."""
+    return [
+        nid
+        for nid in tree.graph.nodes
+        if nid not in previous_nodes and tree.parent(nid) is None and isinstance(tree.data(nid), BlockNode)
+    ]
+
+
+def _insert_root_blocks_before(tree: KernelTree, anchor: int, blocks: list[int]) -> None:
+    """Attach detached root blocks immediately before one existing root child."""
+    if not blocks:
+        return
+    siblings = tree.children(tree.root)
+    index = siblings.index(anchor)
+    _insert_root_blocks(tree, blocks, index)
+
+
+def _insert_root_blocks_after(tree: KernelTree, anchor: int, blocks: list[int]) -> None:
+    """Attach detached root blocks immediately after one existing root child."""
+    if not blocks:
+        return
+    siblings = tree.children(tree.root)
+    index = siblings.index(anchor) + 1
+    _insert_root_blocks(tree, blocks, index)
+
+
+def _insert_child_blocks_before(tree: KernelTree, parent: int, anchors: tuple[int, ...], blocks: list[int]) -> None:
+    """Attach detached blocks before one contiguous child suffix."""
+    if not blocks:
+        return
+    if not anchors:
+        raise ValueError("online-fusion completion has no state roll-forward anchor")
+    siblings = tree.children(parent)
+    index = siblings.index(anchors[0])
+    if tuple(siblings[index : index + len(anchors)]) != anchors:
+        raise ValueError("online-fusion state roll-forward blocks are no longer contiguous")
+    order = siblings[:index] + blocks + siblings[index:]
+    for child in siblings:
+        tree.graph.remove_edge(parent, child)
+    for child in order:
+        tree.graph.add_edge(parent, child)
+
+
+def _append_derivation(
+    context: _LoweringContext,
+    graph: ValueGraph,
+    stage_buffers: tuple[_StageBuffers, ...],
+    start_index: int = 0,
+    initial_remap: Mapping[str, str] | None = None,
+    append_roll_forward: bool = True,
+    selected_leaves: frozenset[int] | None = None,
+) -> None:
     """Clone the per-chunk derivation and insert each recurrence update."""
-    tensor_remap: dict[str, str] = {}
+    tensor_remap = dict(initial_remap or {})
     contribution_leaves = [
         _stage_contribution_leaf(context.match, graph, index) for index in range(len(context.match.stages))
     ]
@@ -454,7 +947,10 @@ def _append_derivation(context: _LoweringContext, graph: ValueGraph, stage_buffe
     stage_output_plan = {
         graph.output_by_leaf[leaf]: plan.contribution for leaf, plan in zip(contribution_leaves, stage_buffers)
     }
-    for leaf_nid in context.match.derivation_leaves:
+    derivation_leaves = context.match.derivation_leaves[start_index:]
+    if selected_leaves is not None:
+        derivation_leaves = tuple(leaf for leaf in derivation_leaves if leaf in selected_leaves)
+    for leaf_nid in derivation_leaves:
         deferred = context.match.deferred_factor
         if deferred is not None and leaf_nid == deferred.producer_leaf:
             continue
@@ -470,13 +966,20 @@ def _append_derivation(context: _LoweringContext, graph: ValueGraph, stage_buffe
             _append_stage_update(context, stage_index, stage_buffers)
             stage = context.match.stages[stage_index]
             tensor_remap[stage.state_tensor] = stage_buffers[stage_index].current
-    for stage_index, plan in enumerate(stage_buffers[:-1]):
-        context.recurrence.scope = context.stage_scopes[stage_index]
-        append_copy(context.recurrence, plan.current, plan.state)
+    if append_roll_forward:
+        for stage_index, plan in enumerate(stage_buffers[:-1]):
+            context.recurrence.scope = context.stage_scopes[stage_index]
+            append_copy(context.recurrence, plan.current, plan.state)
 
 
 def _plan_stage_buffers(
-    ir: KernelIR, match: OnlineFusionMatch, graph: ValueGraph, names: NameSupply, fresh_states: bool
+    ir: KernelIR,
+    match: OnlineFusionMatch,
+    graph: ValueGraph,
+    names: NameSupply,
+    fresh_states: bool,
+    preserve_deferred_dtype: bool,
+    separate_final_current: bool,
 ) -> tuple[tuple[_StageBuffers, ...], dict[str, Buffer]]:
     """Choose state, contribution, and current-state buffers per stage."""
     plans: list[_StageBuffers] = []
@@ -489,7 +992,9 @@ def _plan_stage_buffers(
             state_buffer = replace(ir.buffer(stage.state_tensor), name=state_name, storage_dtype="float32")
         elif deferred_state:
             state_name = names.fresh(f"{stage.state_tensor}_online_state")
-            state_buffer = replace(ir.buffer(match.external_outputs[0]), name=state_name, storage_dtype="float32")
+            source = ir.buffer(match.external_outputs[0])
+            storage_dtype = source.storage_dtype if preserve_deferred_dtype else "float32"
+            state_buffer = replace(source, name=state_name, storage_dtype=storage_dtype)
         else:
             state_name = match.external_outputs[0] if index == last else stage.state_tensor
             state_buffer = replace(ir.buffer(state_name), storage_dtype="float32")
@@ -500,8 +1005,9 @@ def _plan_stage_buffers(
         if index != last or contribution_name == state_name or contribution_leaf != stage.reducer_leaf:
             contribution_name = names.fresh(f"{stage.state_tensor}_online_chunk")
             source = ir.buffer(contribution_source)
-            buffers[contribution_name] = replace(source, name=contribution_name, storage_dtype="float32")
-        if index == last:
+            storage_dtype = source.storage_dtype if deferred_state and preserve_deferred_dtype else "float32"
+            buffers[contribution_name] = replace(source, name=contribution_name, storage_dtype=storage_dtype)
+        if index == last and not separate_final_current:
             current_name = state_name
         else:
             current_name = names.fresh(f"{stage.state_tensor}_online_current")
@@ -708,6 +1214,14 @@ def _region_shape(region: BufferRegion) -> tuple[int, ...]:
     return tuple(shape)
 
 
+def _hbm_tile_region(on_chip_region: BufferRegion, tensor: str) -> BufferRegion:
+    """Map an on-chip output tile region into element-addressed HBM."""
+    ranges = list(on_chip_region.ranges)
+    partition_lower, partition_width = ranges[0]
+    ranges[0] = (Mul(left=partition_lower, right=Const(value=PARTITION_DIM)), partition_width)
+    return BufferRegion(tensor=tensor, ranges=tuple(ranges))
+
+
 def _localized_buffers(
     ir: KernelIR,
     match: OnlineFusionMatch,
@@ -720,6 +1234,7 @@ def _localized_buffers(
     internal = {
         region.tensor
         for leaf_nid in match.derivation_leaves
+        if leaf_nid in ir.tree.graph
         for region in ir.tree.isa(leaf_nid).operand_bindings.values()
         if region.tensor not in match.external_inputs and region.tensor not in match.external_outputs
     }
@@ -771,6 +1286,8 @@ def _append_cloned_block(
     block_nid = tree.add_node(block, parent=context.recurrence.parent)
     parent = block_nid
     for payload in chain[1:-1]:
+        if isinstance(payload, ForNode) and payload.loop_var == context.outer_loop_var:
+            continue
         if isinstance(payload, ForNode) and payload.loop_var in progress_vars:
             if tiling.trip_count > 1:
                 parent = tree.add_node(replace(payload, extent=tiling.trip_count), parent=parent)
@@ -868,7 +1385,10 @@ def _append_stage_update(context: _LoweringContext, stage_index: int, plans: tup
     plan = plans[stage_index]
     context.recurrence.scope = context.stage_scopes[stage_index]
     is_final = stage_index == len(plans) - 1
-    if is_final and context.carry_tensor is not None:
+    single_chunk = context.chunk_size == context.match.progress_extent
+    if single_chunk:
+        append_copy(context.recurrence, plan.contribution, plan.current)
+    elif is_final and context.carry_tensor is not None:
         append_manual_block(
             context.recurrence.tree,
             context.recurrence.parent,
@@ -877,21 +1397,29 @@ def _append_stage_update(context: _LoweringContext, stage_index: int, plans: tup
             {},
             context.recurrence.scope,
         )
-    if stage_index == 0:
+    if not single_chunk and stage_index == 0:
         append_tensor_tensor(context.recurrence, plan.state, plan.contribution, plan.current, stage.combinator.combiner)
-    else:
+    elif not single_chunk:
         factor = stage.factor
         deferred = context.match.deferred_factor
         if deferred is not None and stage_index == deferred.stage:
             factor = deferred.recurrence_factor
-        if factor is None:
+        if deferred is not None and stage_index == deferred.stage and factor is None:
+            append_additive_update(context.recurrence, plan.state, plan.contribution, plan.current)
+        elif factor is None:
             raise ValueError(f"online stage {stage_index} has no correction factor")
-        old_states = {index: prior.state for index, prior in enumerate(plans[:stage_index])}
-        new_states = {index: prior.current for index, prior in enumerate(plans[:stage_index])}
-        correction = compile_correction(
-            context.recurrence, factor, old_states, new_states, f"stage{stage_index}_correction"
-        )
-        append_corrected_update(context.recurrence, plan.state, correction, plan.contribution, plan.current)
+        else:
+            update_scope = context.recurrence.scope
+            state_indices = sorted(factor_states(factor))
+            if state_indices:
+                context.recurrence.scope = context.stage_scopes[state_indices[-1]]
+            old_states = {index: prior.state for index, prior in enumerate(plans[:stage_index])}
+            new_states = {index: prior.current for index, prior in enumerate(plans[:stage_index])}
+            correction = compile_correction(
+                context.recurrence, factor, old_states, new_states, f"stage{stage_index}_correction"
+            )
+            context.recurrence.scope = update_scope
+            append_corrected_update(context.recurrence, plan.state, correction, plan.contribution, plan.current)
     if is_final and context.carry_tensor is not None:
         if context.output_tensor is None:
             raise AssertionError("mapped online recurrence has no output tensor")
@@ -909,14 +1437,19 @@ def _append_stage_update(context: _LoweringContext, stage_index: int, plans: tup
             )
 
 
-def _seed_buffers(ir: KernelIR, buffers: dict[str, Buffer]) -> None:
-    """Seed all non-parameter buffers on root before placement recomputation."""
+def _match_tensors(match: OnlineFusionMatch, graph: ValueGraph) -> frozenset[str]:
+    """Return tensors owned by one online-fusion rewrite boundary."""
+    tensors: set[str] = set()
+    for leaf_nid in match.derivation_leaves:
+        tensors.add(graph.output_by_leaf[leaf_nid])
+        tensors.update(graph.input_tensors_by_leaf[leaf_nid].values())
+    tensors.update(stage.state_tensor for stage in match.stages)
+    return frozenset(tensors)
+
+
+def _seed_buffers(ir: KernelIR, buffers: dict[str, Buffer], prunable: frozenset[str]) -> None:
+    """Update matched declarations in place and attach only missing live buffers at root."""
     tree = ir.tree
-    for block_nid in tree.blocks():
-        block = tree.block(block_nid)
-        if block.alloc_buffers:
-            tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=())
-    root = tree.block(tree.root)
     touched = {
         region.tensor
         for nid in tree.preorder()
@@ -926,13 +1459,36 @@ def _seed_buffers(ir: KernelIR, buffers: dict[str, Buffer]) -> None:
     missing = touched - set(buffers) - set(ir.param_buffers)
     if missing:
         raise AssertionError(f"online lowering has no buffer declarations for {sorted(missing)}")
-    allocs = tuple(buffer for name, buffer in buffers.items() if name not in ir.param_buffers and name in touched)
-    tree.graph.nodes[tree.root]["data"] = replace(root, alloc_buffers=allocs)
+
+    declared: set[str] = set()
+    for block_nid in tree.blocks():
+        block = tree.block(block_nid)
+        allocations: list[Buffer] = []
+        for buffer in block.alloc_buffers:
+            if buffer.name in prunable and buffer.name not in touched:
+                continue
+            replacement = buffers.get(buffer.name, buffer)
+            allocations.append(replacement)
+            declared.add(replacement.name)
+        updated = tuple(allocations)
+        if updated != block.alloc_buffers:
+            tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=updated)
+
+    root = tree.block(tree.root)
+    additions = tuple(
+        buffer
+        for name, buffer in buffers.items()
+        if name in touched and name not in ir.param_buffers and name not in declared
+    )
+    if additions:
+        tree.graph.nodes[tree.root]["data"] = replace(root, alloc_buffers=(*root.alloc_buffers, *additions))
 
 
 __all__ = [
+    "OnlineFusionPrefixLowering",
     "can_lower_online_fusion",
     "can_lower_online_fusion_prefix",
+    "complete_online_fusion_prefix",
     "lower_online_fusion",
     "lower_online_fusion_prefix",
 ]

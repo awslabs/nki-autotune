@@ -1,4 +1,4 @@
-"""Tool-free Codex policy for choosing one next transform."""
+"""Tool-free Codex policy for branching over atomic transforms."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ _DISABLED_FEATURES = (
     "unified_exec",
     "workspace_dependencies",
 )
+_MODEL_PROVIDER = "amazon-bedrock"
 
 
 @dataclass(frozen=True)
@@ -35,25 +36,23 @@ class CodexPolicyConfig:
     """Controls for isolated, read-only Codex policy turns."""
 
     executable: str
-    model: str
-    model_provider: str | None
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"]
     timeout_s: int
 
 
 class CodexTransformPolicy:
-    """Ask one isolated Codex turn for each next transform."""
+    """Ask one isolated Codex turn for each branch-search decision."""
 
     def __init__(self, config: CodexPolicyConfig) -> None:
         """Store subprocess controls."""
         self.config = config
 
     async def decide(self, observation: str) -> AgentDecision:
-        """Run the blocking CLI request in a worker thread."""
+        """Run one blocking branch-search request in a worker thread."""
         return await asyncio.to_thread(self._decide_sync, observation)
 
     def _decide_sync(self, observation: str) -> AgentDecision:
-        """Request and parse one apply-or-finish decision."""
+        """Request and parse one branch, transform-sequence, or finish decision."""
         reply = self._request(REASONING_POLICY_PROMPT + "\n\n" + observation)
         decision = parse_decision(reply)
         return replace(decision, raw_response=reply)
@@ -82,8 +81,6 @@ class CodexTransformPolicy:
             self.config.executable,
             "exec",
             "--ignore-user-config",
-            "--model",
-            self.config.model,
             "--sandbox",
             "read-only",
             "--ephemeral",
@@ -103,9 +100,9 @@ class CodexTransformPolicy:
             'web_search="disabled"',
             "-c",
             "mcp_servers={}",
+            "-c",
+            f"model_provider={json.dumps(_MODEL_PROVIDER)}",
         ]
-        if self.config.model_provider is not None:
-            command.extend(["-c", f"model_provider={json.dumps(self.config.model_provider)}"])
         for feature in _DISABLED_FEATURES:
             command.extend(["--disable", feature])
         command.append("-")

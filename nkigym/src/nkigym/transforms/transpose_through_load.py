@@ -11,8 +11,6 @@ from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, IterVar
 from nkigym.ops.base import AxisRole
 from nkigym.ops.dma_transpose import NKIDMATranspose
 from nkigym.ops.load import NKILoad
-from nkigym.ops.tensor_copy import NKITensorCopy
-from nkigym.ops.transpose import NKITranspose
 from nkigym.transforms._canonical_rewrite import finalize_rewrite, is_canonical_block, remove_buffers, single_leaf
 from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
@@ -27,14 +25,12 @@ class TransposeThroughLoadOption(TransformOption):
 
 @dataclass(frozen=True)
 class _Match:
-    """One canonical load, transpose, and drain segment."""
+    """One canonical load followed by an SBUF DMA transpose."""
 
     load_block: int
     transpose_block: int
-    drain_block: int
     source: str
     loaded: str
-    transpose_psum: str
     output: str
     first_axis: str
     second_axis: str
@@ -52,7 +48,7 @@ class TransposeThroughLoad(Transform[TransposeThroughLoadOption]):
         return options
 
     def apply(self, ir: KernelIR, option: TransposeThroughLoadOption) -> KernelIR:
-        """Recheck and commute one transpose into its load."""
+        """Recheck and commute one materialized DMA transpose into its load."""
         match = _match(ir, option.target_nid)
         if match is None:
             raise TransformLegalityError(
@@ -73,68 +69,55 @@ def _match(ir: KernelIR, target_nid: int) -> _Match | None:
     root_children = ir.tree.children(ir.tree.root)
     if target_nid in root_children:
         index = root_children.index(target_nid)
-        if index + 2 < len(root_children):
+        if index + 1 < len(root_children):
             transpose_block = root_children[index + 1]
-            drain_block = root_children[index + 2]
-            result = _validate(ir, target_nid, transpose_block, drain_block)
+            result = _validate(ir, target_nid, transpose_block)
     return result
 
 
-def _validate(ir: KernelIR, load_block: int, transpose_block: int, drain_block: int) -> _Match | None:
-    """Validate one adjacent canonical load-transpose-drain chain."""
+def _validate(ir: KernelIR, load_block: int, transpose_block: int) -> _Match | None:
+    """Validate one adjacent canonical load-DMA-transpose chain."""
     result: _Match | None = None
     load_leaf = single_leaf(ir.tree, load_block)
     transpose_leaf = single_leaf(ir.tree, transpose_block)
-    drain_leaf = single_leaf(ir.tree, drain_block)
-    leaves_exist = load_leaf is not None and transpose_leaf is not None and drain_leaf is not None
+    leaves_exist = load_leaf is not None and transpose_leaf is not None
     if leaves_exist:
         assert load_leaf is not None
         assert transpose_leaf is not None
-        assert drain_leaf is not None
         load = ir.tree.isa(load_leaf)
         transpose = ir.tree.isa(transpose_leaf)
-        drain = ir.tree.isa(drain_leaf)
-        op_chain = load.op_cls is NKILoad and transpose.op_cls is NKITranspose and drain.op_cls is NKITensorCopy
-        canonical = all(is_canonical_block(ir, block) for block in (load_block, transpose_block, drain_block))
+        op_chain = load.op_cls is NKILoad and transpose.op_cls is NKIDMATranspose
+        canonical = all(is_canonical_block(ir, block) for block in (load_block, transpose_block))
         if op_chain and canonical:
             source = load.operand_bindings["src"].tensor
             loaded = load.operand_bindings["dst"].tensor
-            transpose_psum = transpose.operand_bindings["dst"].tensor
-            output = drain.operand_bindings["dst"].tensor
-            connected = (
-                transpose.operand_bindings["data"].tensor == loaded
-                and drain.operand_bindings["src"].tensor == transpose_psum
-            )
+            output = transpose.operand_bindings["dst"].tensor
+            connected = transpose.operand_bindings["src"].tensor == loaded
             buffers = ir.all_buffers()
-            names_exist = all(name in buffers for name in (source, loaded, transpose_psum, output))
+            names_exist = all(name in buffers for name in (source, loaded, output))
             if connected and names_exist:
                 source_buffer = buffers[source]
                 loaded_buffer = buffers[loaded]
-                psum_buffer = buffers[transpose_psum]
                 output_buffer = buffers[output]
                 shapes = (
                     len(source_buffer.shape) == 2
                     and loaded_buffer.shape == source_buffer.shape
-                    and psum_buffer.shape == source_buffer.shape[::-1]
                     and output_buffer.shape == source_buffer.shape[::-1]
                 )
                 storage = (
                     source_buffer.location == "shared_hbm"
                     and loaded_buffer.location == "sbuf"
-                    and psum_buffer.location == "psum"
                     and output_buffer.location == "sbuf"
                 )
-                dtype = len({source_buffer.dtype, loaded_buffer.dtype, psum_buffer.dtype, output_buffer.dtype}) == 1
+                dtype = len({source_buffer.dtype, loaded_buffer.dtype, output_buffer.dtype}) == 1
                 physical_dtype = all(
                     buffer.physical_dtype() == source_buffer.dtype
-                    for buffer in (source_buffer, loaded_buffer, psum_buffer, output_buffer)
+                    for buffer in (source_buffer, loaded_buffer, output_buffer)
                 )
                 divisible = all(extent % 128 == 0 for extent in source_buffer.shape)
                 exact_loaded = set(ir.dependency.touches_by_tensor.get(loaded, ())) == {load_leaf, transpose_leaf}
-                exact_psum = set(ir.dependency.touches_by_tensor.get(transpose_psum, ())) == {
-                    transpose_leaf,
-                    drain_leaf,
-                }
+                deleted_allocations = {buffer.name for buffer in ir.tree.block(transpose_block).alloc_buffers}
+                preserves_ownership = deleted_allocations <= {loaded, output}
                 axis_map = ir.tree.block(load_block).axis_map
                 first_axis = axis_map.get("P")
                 second_axis = axis_map.get("F")
@@ -146,7 +129,7 @@ def _validate(ir: KernelIR, load_block: int, transpose_block: int, drain_block: 
                     and physical_dtype
                     and divisible
                     and exact_loaded
-                    and exact_psum
+                    and preserves_ownership
                     and axes
                 ):
                     assert isinstance(first_axis, str)
@@ -154,10 +137,8 @@ def _validate(ir: KernelIR, load_block: int, transpose_block: int, drain_block: 
                     result = _Match(
                         load_block=load_block,
                         transpose_block=transpose_block,
-                        drain_block=drain_block,
                         source=source,
                         loaded=loaded,
-                        transpose_psum=transpose_psum,
                         output=output,
                         first_axis=first_axis,
                         second_axis=second_axis,
@@ -191,6 +172,12 @@ def _apply_match(ir: KernelIR, match: _Match) -> None:
             (Mul(left=first_value, right=Const(value=first_tile)), Const(value=first_tile)),
         ),
     )
+    retained_allocations = {
+        buffer.name: buffer
+        for block_nid in (match.load_block, match.transpose_block)
+        for buffer in ir.tree.block(block_nid).alloc_buffers
+        if buffer.name != match.loaded
+    }
     block = BlockNode(
         iter_vars=(
             IterVar(axis=match.first_axis, dom=(0, source.shape[0]), role=AxisRole.PARALLEL),
@@ -199,7 +186,7 @@ def _apply_match(ir: KernelIR, match: _Match) -> None:
         iter_values=(first_value, second_value),
         reads=(src_region,),
         writes=(dst_region,),
-        alloc_buffers=(),
+        alloc_buffers=tuple(retained_allocations.values()),
         axis_map={"P": match.first_axis, "F": match.second_axis},
     )
     descendants = list(ir.tree.descendants(match.load_block))
@@ -214,18 +201,9 @@ def _apply_match(ir: KernelIR, match: _Match) -> None:
         ISANode(op_cls=NKIDMATranspose, operand_bindings={"src": src_region, "dst": dst_region}, kwargs={}),
         parent=parent,
     )
-    _replace_in_parent_children(
-        ir.tree, ir.tree.root, [match.load_block, match.transpose_block, match.drain_block], [match.load_block]
-    )
-    ir.tree.graph.remove_nodes_from(
-        [
-            match.transpose_block,
-            *ir.tree.descendants(match.transpose_block),
-            match.drain_block,
-            *ir.tree.descendants(match.drain_block),
-        ]
-    )
-    remove_buffers(ir, {match.loaded, match.transpose_psum})
+    _replace_in_parent_children(ir.tree, ir.tree.root, [match.load_block, match.transpose_block], [match.load_block])
+    ir.tree.graph.remove_nodes_from([match.transpose_block, *ir.tree.descendants(match.transpose_block)])
+    remove_buffers(ir, {match.loaded})
 
 
 __all__ = ["TransposeThroughLoad", "TransposeThroughLoadOption"]

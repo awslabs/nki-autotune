@@ -18,15 +18,13 @@ helpers, ``NormalizeToIterWithOffset``, the ``IterMarkSplitCollector`` +
 ``CheckMapping`` / ``TryNormalizeSplits`` independence check) and
 ``IterMapToExprNormalizer`` for ``NormalizeIterMapToExpr``.
 
-Scope (demand-driven, oracle-arbitrated): only the surjective, padding-free,
-predicate-free, constant-factor corpus is ported. The padding machinery
+Scope is demand-driven: only the surjective, padding-free, predicate-free,
+constant-factor behavior needed by nkigym is ported. The padding machinery
 (``PadDividendToDivisor`` update passes, ``padding_predicate_``), the predicate
 constraint solver (``MatchBoundConstraints`` / ``NormalizeToIterOnBoundExpr`` /
 ``CheckConstraints``), subspace division, the bijective-only branches, and
-symbolic (non-constant) scales/extents are intentionally omitted -- no oracle
-case in the corpus reaches them. All extents, lower factors, and scales are
-plain ``int`` because every corpus value is a constant. Correctness is gated by
-the TVM oracle in ``test/ir/arith/test_iter_map.py``.
+symbolic (non-constant) scales/extents are intentionally omitted. All extents,
+lower factors, and scales are plain ``int``.
 """
 
 from __future__ import annotations

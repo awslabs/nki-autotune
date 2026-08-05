@@ -12,7 +12,9 @@ import itertools
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR, to_affine
+from nkigym.ir.arith.expr import Add, Const, Expr, Var, substitute
 from nkigym.ir.dependency import Dependency
+from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.transforms._access_pattern import tensor_has_access_pattern
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
@@ -28,12 +30,10 @@ class SoftwarePipelineOption(TransformOption):
         loop_nid: the ForNode whose child blocks are staged.
         stages: stage index per child block, in child order. Full assignment
             (one entry per child); non-decreasing along the dependency chain.
-        order: emission order per child block. Tier B: identity.
     """
 
     loop_nid: int
     stages: tuple[int, ...]
-    order: tuple[int, ...]
 
 
 class SoftwarePipeline(Transform[SoftwarePipelineOption]):
@@ -48,31 +48,46 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
             children = list(ir.tree.children(nid))
             if len(children) < 2 or self._already_pipelined(ir, nid):
                 continue
-            order = tuple(range(len(children)))
             for stages in self._nondecreasing_labelings(len(children)):
-                opt = SoftwarePipelineOption(loop_nid=nid, stages=stages, order=order)
+                opt = SoftwarePipelineOption(loop_nid=nid, stages=stages)
                 if self._is_legal(ir, opt, children):
                     options.append(opt)
         return options
 
     def apply(self, ir: KernelIR, option: SoftwarePipelineOption) -> KernelIR:
         """Re-check legality, deep-copy, derive versions, write annotation."""
-        children = list(ir.tree.children(option.loop_nid))
+        children = self._selected_children(ir, option)
         self._check_legality(ir, option, children)
         new_ir = copy.deepcopy(ir)
         new_children = list(new_ir.tree.children(option.loop_nid))
         versioned_buffers = self._apply_versions(new_ir, option, new_children)
         parent = self._parent_block(new_ir, option.loop_nid)
+        source_order = tuple(range(len(new_children)))
         new_ir.tree.block(parent).annotations["software_pipeline"] = {
             "loop_nid": option.loop_nid,
             "loop": new_ir.tree.loop(option.loop_nid),
             "children": tuple(new_children),
             "stages": option.stages,
-            "order": option.order,
+            "order": source_order,
             "versioned_buffers": versioned_buffers,
         }
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
+
+    def _selected_children(self, ir: KernelIR, option: SoftwarePipelineOption) -> list[int]:
+        """Validate the selected loop and return its stageable children."""
+        if option.loop_nid not in ir.tree.graph:
+            raise TransformLegalityError(f"SoftwarePipeline target loop {option.loop_nid} does not exist")
+        if not isinstance(ir.tree.data(option.loop_nid), ForNode):
+            raise TransformLegalityError(f"SoftwarePipeline target {option.loop_nid} is not a ForNode")
+        children = list(ir.tree.children(option.loop_nid))
+        if len(children) < 2:
+            raise TransformLegalityError(
+                f"SoftwarePipeline target loop {option.loop_nid} must have at least two children"
+            )
+        if self._already_pipelined(ir, option.loop_nid):
+            raise TransformLegalityError(f"SoftwarePipeline target loop {option.loop_nid} is already pipelined")
+        return children
 
     def _nondecreasing_labelings(self, n: int) -> list[tuple[int, ...]]:
         """Return useful contiguous stage labelings without large-body explosion.
@@ -115,9 +130,9 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         return touched
 
     def _is_legal(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> bool:
-        """TVM's two graph rules over the dependency DAG, plus order-permutation."""
+        """Check TVM's two graph rules in intrinsic source order."""
         result = True
-        if len(option.stages) != len(children) or len(option.order) != len(children):
+        if len(option.stages) != len(children):
             result = False
         elif (
             not option.stages
@@ -126,11 +141,9 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
             or set(option.stages) != set(range(max(option.stages) + 1))
         ):
             result = False
-        elif sorted(option.order) != list(range(len(children))):
-            result = False
         else:
             stage_of = {children[i]: option.stages[i] for i in range(len(children))}
-            order_of = {children[i]: option.order[i] for i in range(len(children))}
+            order_of = {child: index for index, child in enumerate(children)}
             for src_b in children:
                 for dst_b in children:
                     if src_b is dst_b:
@@ -148,6 +161,8 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
                         result = False
             if any(ir.buffer(name).versions > 1 for name in self._touched_tensors(ir, children)):
                 result = False
+            if self._has_cross_iteration_read_before_write_hazard(ir, option, children):
+                result = False
             version_counts = self._version_counts(ir, option, children)
             if not self._versioned_buffer_touches_are_local(ir, children, version_counts):
                 result = False
@@ -158,6 +173,59 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
             if not self._version_accesses_are_aligned(ir, option, children, version_counts):
                 result = False
         return result
+
+    def _has_cross_iteration_read_before_write_hazard(
+        self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]
+    ) -> bool:
+        """Return whether staging violates a loop-carried read-before-write."""
+        loop = ir.tree.loop(option.loop_nid)
+        stage_of = {children[index]: option.stages[index] for index in range(len(children))}
+        reads: dict[str, list[tuple[int, int, int, BufferRegion]]] = {}
+        writes: dict[str, list[tuple[int, int, int, BufferRegion]]] = {}
+        for child_index, child in enumerate(children):
+            stage = stage_of[child]
+            for leaf in self._unit_leaves(ir, child):
+                info = ir.dependency.info(leaf)
+                for region in info.read_regions:
+                    reads.setdefault(region.tensor, []).append((child_index, stage, leaf, region))
+                for region in info.write_regions:
+                    writes.setdefault(region.tensor, []).append((child_index, stage, leaf, region))
+
+        return loop.extent > 1 and any(
+            read_index < write_index
+            and read_stage < write_stage
+            and self._regions_overlap_next_iteration(ir, loop, read_leaf, read_region, write_leaf, write_region)
+            for name, tensor_reads in reads.items()
+            for read_index, read_stage, read_leaf, read_region in tensor_reads
+            for write_index, write_stage, write_leaf, write_region in writes.get(name, ())
+        )
+
+    def _regions_overlap_next_iteration(
+        self,
+        ir: KernelIR,
+        loop: ForNode,
+        read_leaf: int,
+        read_region: BufferRegion,
+        write_leaf: int,
+        write_region: BufferRegion,
+    ) -> bool:
+        """Return whether iteration ``i`` writes what iteration ``i + 1`` reads."""
+        next_iteration = Add(left=Var(name=loop.loop_var), right=Const(value=1))
+        substitutions: dict[str, Expr] = {loop.loop_var: next_iteration}
+        shifted_read = replace(
+            read_region,
+            ranges=tuple(
+                (substitute(lower, substitutions), substitute(width, substitutions))
+                for lower, width in read_region.ranges
+            ),
+        )
+        extents = {
+            **ir.dependency.info(write_leaf).extents,
+            **ir.dependency.info(read_leaf).extents,
+            loop.loop_var: loop.extent - 1,
+        }
+        buffer = ir.buffer(read_region.tensor)
+        return not regions_disjoint(write_region, shifted_read, buffer, buffer, extents)
 
     def _versioned_buffer_touches_are_local(
         self, ir: KernelIR, children: list[int], version_counts: dict[str, int]

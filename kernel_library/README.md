@@ -1,24 +1,27 @@
 # Kernel Library
 
-Best kernels and test-owned reference endpoints for each workload. Library
-artifacts use a concrete `<kernel_name>_<mfu>.py` with a sibling `.ir.md`;
-explicit transform-ladder endpoints link to their test fixture instead.
+Reproducible transform ladders for the best retained kernel schedules. Each
+module owns its workload graph, fixed transform actions, CPU verification,
+artifact dump, and hardware profiling. Rendered NKI kernels are generated
+artifacts and are not checked in.
 
-All measurements below use 2048³ bf16 inputs.
+All measurements below use 2048³ BF16 inputs on `gym-1`.
 
-| workload | kernel | MFU | notes |
-| --- | --- | ---: | --- |
-| matmul/lhsT_rhs | `kernel_35` in `test/transforms/_matmul_lhsT_rhs_manual.py` | **90.92%** | Canonical-to-champion ladder endpoint; `nkipy` baseline 86.65%. |
-| matmul/lhs_rhs | `matmul/lhs_rhs/kernel_handtuned_89.26mfu.py` | **89.26%** | Hand-tuned kernel; `nkipy` HLO baseline 83.84%. |
+| workload | ladder | states | endpoint MFU |
+| --- | --- | ---: | ---: |
+| matmul/lhsT_rhs | `matmul/lhsT_rhs/ladder.py` | 36 | **90.92%** |
+| matmul/lhs_rhs | `matmul/lhs_rhs/ladder.py` | 32 | **86.40%** |
+| rmsnorm_matmul | `rmsnorm_matmul/ladder.py` | 42 | **86.99%** |
 
-Both kernels require
+The measured endpoints use
 `("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")`.
 
 The lhs-transposed endpoint uses N-outer scheduling, two-stage accumulation,
 list-backed input tiles, and per-output-tile PSUM allocation.
 
-The non-transposed lhs kernel uses `dim_order=[d0, d2, d1]`,
-`ltiles_per_block={d0:8, d1:8, d2:1}`, middle-scope output SBUF, and deep input
-rotation. Its 10-run mean was 89.26% MFU with 0.05 percentage-point standard
-deviation; the best run reached 89.47%. The remaining gap is primarily
-transpose cost and PSUM lifetime scheduling.
+The RMSNorm+matmul endpoint uses full-reduction online fusion, fused and
+software-pipelined row blocks, batched transpose, and a four-way RHS buffer
+layout.
+
+The 59-state `attention/ladder.py` ladder targets pretransposed single-head
+attention with a 16K sequence length and head dimension 128.

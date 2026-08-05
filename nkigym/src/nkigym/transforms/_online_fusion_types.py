@@ -142,6 +142,14 @@ def contract_output_operand(contract: OperatorContract) -> str:
     return contract.output_operand
 
 
+def contract_output_operands(contract: OperatorContract) -> tuple[str, ...]:
+    """Return the primary output followed by any mapped reduction output."""
+    outputs = (contract.output_operand,)
+    if isinstance(contract, ReductionContract) and contract.mapped_output_operand is not None:
+        outputs = (*outputs, contract.mapped_output_operand)
+    return outputs
+
+
 def factor_states(expression: FactorExpression | None) -> frozenset[int]:
     """Return all state references in a factor expression."""
     states: set[int] = set()
@@ -167,5 +175,6 @@ __all__ = [
     "ValueGraph",
     "contract_input_operands",
     "contract_output_operand",
+    "contract_output_operands",
     "factor_states",
 ]

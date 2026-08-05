@@ -70,12 +70,17 @@ def _apply_match(ir: KernelIR, match: TransposeChain) -> None:
     ir.tree.graph.nodes[match.transpose_leaf]["data"] = ISANode(
         op_cls=NKIDMATranspose, operand_bindings={"src": source_region, "dst": output_region}, kwargs={}
     )
-    _remove_drain_block(ir, match.drain_block)
+    _remove_drain_block(ir, match.transpose_block, match.drain_block)
     remove_buffers(ir, {match.psum})
 
 
-def _remove_drain_block(ir: KernelIR, drain_block: int) -> None:
-    """Remove one top-level drain block and its local subtree."""
+def _remove_drain_block(ir: KernelIR, retained_block: int, drain_block: int) -> None:
+    """Transfer declarations, then remove one top-level drain block."""
+    retained = ir.tree.block(retained_block)
+    drain = ir.tree.block(drain_block)
+    ir.tree.graph.nodes[retained_block]["data"] = replace(
+        retained, alloc_buffers=(*retained.alloc_buffers, *drain.alloc_buffers)
+    )
     _replace_in_parent_children(ir.tree, ir.tree.root, [drain_block], [])
     ir.tree.graph.remove_nodes_from({drain_block, *ir.tree.descendants(drain_block)})
 

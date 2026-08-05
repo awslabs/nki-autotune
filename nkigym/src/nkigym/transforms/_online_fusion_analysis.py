@@ -6,7 +6,8 @@ from collections.abc import Mapping
 from dataclasses import replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.tree import ISANode
+from nkigym.ir.arith.expr import Expr, Var, substitute
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import (
     BilinearReductionContract,
     CopyContract,
@@ -16,7 +17,7 @@ from nkigym.ops.base import (
     PointwiseContract,
     ReductionContract,
 )
-from nkigym.transforms._canonical_rewrite import is_canonical_block, owning_block
+from nkigym.transforms._canonical_rewrite import block_chain, is_canonical_block, owning_block, required_spec
 from nkigym.transforms._online_fusion_algebra import AlgebraEvaluation, evaluate_algebra
 from nkigym.transforms._online_fusion_types import (
     BinaryFactor,
@@ -30,6 +31,7 @@ from nkigym.transforms._online_fusion_types import (
     ValueGraph,
     contract_input_operands,
     contract_output_operand,
+    contract_output_operands,
     factor_states,
 )
 
@@ -70,7 +72,11 @@ def build_value_graph(ir: KernelIR) -> ValueGraph:
             raise ValueError(f"{leaf.op_cls.__name__} contract output {output_operand!r} is unbound")
         output_tensor = leaf.operand_bindings[output_operand].tensor
         output_by_leaf[leaf_nid] = output_tensor
-        current_producer[output_tensor] = leaf_nid
+        for produced_operand in contract_output_operands(contract):
+            if produced_operand not in leaf.operand_bindings:
+                raise ValueError(f"{leaf.op_cls.__name__} contract output {produced_operand!r} is unbound")
+            produced_tensor = leaf.operand_bindings[produced_operand].tensor
+            current_producer[produced_tensor] = leaf_nid
         if isinstance(contract, InitializerContract):
             initializers_mut.setdefault(output_tensor, []).append(leaf_nid)
 
@@ -109,16 +115,110 @@ def detect_online_fusion(ir: KernelIR) -> list[OnlineFusionMatch]:
 def detect_complete_online_fusion(ir: KernelIR) -> list[OnlineFusionMatch]:
     """Return maximal canonical chains proven by the registered contracts."""
     matches: list[OnlineFusionMatch] = []
-    canonical = all(block_nid == ir.tree.root or is_canonical_block(ir, block_nid) for block_nid in ir.tree.blocks())
-    if canonical:
+    compatible_axes = tuple(
+        progress_axis
+        for progress_axis in _candidate_progress_axes(ir)
+        if all(
+            block_nid == ir.tree.root or _is_online_fusion_block(ir, block_nid, progress_axis)
+            for block_nid in ir.tree.blocks()
+        )
+    )
+    if compatible_axes:
         graph = build_value_graph(ir)
-        for progress_axis in _candidate_progress_axes(ir, graph):
+        for progress_axis in compatible_axes:
             evaluation = evaluate_algebra(ir, graph, progress_axis)
             if len(evaluation.stages) >= 2:
                 match = _build_match(ir, graph, progress_axis, evaluation)
                 if match is not None:
                     matches.append(match)
     return matches
+
+
+def _is_online_fusion_block(ir: KernelIR, block_nid: int, progress_axis: str) -> bool:
+    """Accept canonical blocks and exact non-progress outer-loop factorizations."""
+    valid = is_canonical_block(ir, block_nid)
+    chain = block_chain(ir.tree, block_nid)
+    if not valid and chain is not None:
+        block = ir.tree.block(block_nid)
+        leaf = chain[-1]
+        if not isinstance(leaf, ISANode):
+            raise AssertionError(f"canonical block chain {block_nid} has no ISA leaf")
+        operand_names = {slot: region.tensor for slot, region in leaf.operand_bindings.items()}
+        spec = required_spec(ir, leaf.op_cls, operand_names, block.axis_map, leaf.kwargs)
+        substitutions = _canonical_iter_substitutions(spec.block, block)
+        valid = substitutions is not None and _factored_loops_match(
+            spec.loops, tuple(payload for payload in chain[1:-1] if isinstance(payload, ForNode)), progress_axis
+        )
+        if valid and substitutions is not None:
+            expected_block = replace(
+                spec.block,
+                iter_values=block.iter_values,
+                reads=tuple(_substitute_region(region, substitutions) for region in spec.block.reads),
+                writes=tuple(_substitute_region(region, substitutions) for region in spec.block.writes),
+            )
+            expected_leaf = replace(
+                spec.leaf,
+                operand_bindings={
+                    slot: _substitute_region(region, substitutions)
+                    for slot, region in spec.leaf.operand_bindings.items()
+                },
+            )
+            valid = replace(block, alloc_buffers=()) == expected_block and leaf == expected_leaf
+    return valid
+
+
+def _canonical_iter_substitutions(canonical: BlockNode, actual: BlockNode) -> dict[str, Expr] | None:
+    """Map canonical loop variables to one factored block's linearized values."""
+    substitutions: dict[str, Expr] = {}
+    valid = canonical.iter_vars == actual.iter_vars and canonical.axis_map == actual.axis_map
+    if valid:
+        for expected, replacement in zip(canonical.iter_values, actual.iter_values):
+            if isinstance(expected, Var):
+                substitutions[expected.name] = replacement
+            elif expected != replacement:
+                valid = False
+                break
+    return substitutions if valid else None
+
+
+def _factored_loops_match(canonical: tuple[ForNode, ...], actual: tuple[ForNode, ...], progress_axis: str) -> bool:
+    """Check ordered exact loop products while forbidding progress-axis factorization."""
+    cursor = 0
+    valid = True
+    for expected in canonical:
+        axis = _loop_axis(expected.loop_var)
+        group: list[ForNode] = []
+        while cursor < len(actual) and _loop_axis(actual[cursor].loop_var) == axis:
+            group.append(actual[cursor])
+            cursor += 1
+        product = 1
+        for loop in group:
+            product *= loop.extent
+        names = [loop.loop_var for loop in group]
+        dense_names = [f"i_{axis}_{index}" for index in range(len(group))]
+        if not group or product != expected.extent or names != dense_names:
+            valid = False
+            break
+        if axis == progress_axis and group != [expected]:
+            valid = False
+            break
+    return valid and cursor == len(actual)
+
+
+def _loop_axis(loop_var: str) -> str:
+    """Return the concrete axis encoded in one normalized loop variable."""
+    body = loop_var[2:] if loop_var.startswith("i_") else loop_var
+    return body.rsplit("_", 1)[0]
+
+
+def _substitute_region(region: BufferRegion, substitutions: dict[str, Expr]) -> BufferRegion:
+    """Apply canonical-to-factored iteration substitutions to one region."""
+    return replace(
+        region,
+        ranges=tuple(
+            (substitute(lower, substitutions), substitute(width, substitutions)) for lower, width in region.ranges
+        ),
+    )
 
 
 def _build_incremental_prefix(
@@ -179,11 +279,14 @@ def _record_tensor_axes(leaf: ISANode, axis_map: Mapping[str, str], result: dict
         result[region.tensor] = concrete_axes
 
 
-def _candidate_progress_axes(ir: KernelIR, graph: ValueGraph) -> tuple[str, ...]:
+def _candidate_progress_axes(ir: KernelIR) -> tuple[str, ...]:
     """Return concrete axes used by at least one associative reduction."""
     axes: set[str] = set()
-    for leaf_nid in graph.leaves:
-        contract = graph.contracts[leaf_nid]
+    for leaf_nid in ir.tree.preorder():
+        node = ir.tree.data(leaf_nid)
+        if not isinstance(node, ISANode):
+            continue
+        contract = node.op_cls.algebraic_contract(node.kwargs)
         if isinstance(contract, (ReductionContract, BilinearReductionContract)):
             block = ir.tree.block(owning_block(ir.tree, leaf_nid))
             axes.add(block.axis_map[contract.reduction_axis])
@@ -250,7 +353,7 @@ def _build_match(
 
 
 def _detect_deferred_factor(graph: ValueGraph, evaluation: AlgebraEvaluation) -> DeferredFactor | None:
-    """Find a removable broadcast reciprocal in the final contribution."""
+    """Find a final broadcast state factor that can move after the recurrence."""
     result: DeferredFactor | None = None
     if evaluation.stages:
         stage_index = len(evaluation.stages) - 1
@@ -284,6 +387,37 @@ def _detect_deferred_factor(graph: ValueGraph, evaluation: AlgebraEvaluation) ->
                     )
                 if len(candidates) == 1:
                     result = candidates[0]
+        if result is None:
+            result = _detect_fully_deferred_factor(graph, evaluation, stage_index)
+    return result
+
+
+def _detect_fully_deferred_factor(
+    graph: ValueGraph, evaluation: AlgebraEvaluation, stage_index: int
+) -> DeferredFactor | None:
+    """Defer a uniquely produced broadcast factor in its entirety."""
+    result: DeferredFactor | None = None
+    final_stage = evaluation.stages[stage_index]
+    deferred = final_stage.factor
+    states = factor_states(deferred)
+    if deferred is not None and states and all(index < stage_index for index in states):
+        producers = [
+            leaf
+            for leaf in graph.leaves
+            if evaluation.values_by_leaf[leaf].factor == deferred
+            and not evaluation.values_by_leaf[leaf].depends_on_progress
+            and _is_unary_pointwise_producer(graph.contracts[leaf])
+        ]
+        final_ancestors = _ancestors(graph, {final_stage.reducer_leaf})
+        candidates: list[DeferredFactor] = []
+        for producer in producers:
+            candidates.extend(
+                _deferred_factor_candidates(
+                    graph, evaluation, final_ancestors, stage_index, final_stage.factor, deferred, None, producer
+                )
+            )
+        if len(candidates) == 1:
+            result = candidates[0]
     return result
 
 
@@ -338,6 +472,11 @@ def _is_reciprocal_producer(contract: OperatorContract) -> bool:
         and contract.scale == 1.0
         and contract.bias == 0.0
     )
+
+
+def _is_unary_pointwise_producer(contract: OperatorContract) -> bool:
+    """Return whether one contract materializes a unary pointwise factor."""
+    return isinstance(contract, PointwiseContract) and len(contract.input_operands) == 1
 
 
 def _is_positive_sum_stage(graph: ValueGraph, evaluation: AlgebraEvaluation, stage_index: int) -> bool:
@@ -464,10 +603,10 @@ def _final_copy_chain(ir: KernelIR, graph: ValueGraph, reducer_leaf: int) -> tup
 
 
 def _chunk_sizes(ir: KernelIR, absorbed: set[int], progress_axis: str) -> tuple[int, ...]:
-    """Enumerate proper divisors tileable by every operation in the chain."""
+    """Enumerate divisors tileable by every operation in the chain."""
     extent = ir.axis_extent(progress_axis)
     sizes: list[int] = []
-    for size in range(1, extent):
+    for size in range(1, extent + 1):
         valid = extent % size == 0
         for leaf_nid in absorbed:
             leaf = ir.tree.isa(leaf_nid)

@@ -1,0 +1,106 @@
+"""Single-kernel compile and profile pipeline for an installed Trn2 host."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import sys
+import tempfile
+import time
+import traceback
+from pathlib import Path
+from types import FrameType
+
+import ml_dtypes
+import numpy as np
+
+from nkigym.profile._benchmark import benchmark_kernel
+from nkigym.profile._compile import compile_kernel
+from nkigym.profile.types import ProfileConfig, ProfileResult
+
+_COMPILE_TIMEOUT_S = 600
+_COMPILER_LOG_FILE = "log-neuron-cc.txt"
+_DTYPE_CACHE: dict[str, np.dtype] = {}
+
+
+def _ensure_tools_on_path() -> None:
+    """Expose the virtualenv and standard Neuron tool directories."""
+    venv_bin = str(Path(sys.executable).parent)
+    neuron_bin = "/opt/aws/neuron/bin"
+    current = os.environ.get("PATH", "").split(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join(dict.fromkeys((venv_bin, neuron_bin, *current)))
+
+
+def _timeout_handler(signum: int, frame: FrameType | None) -> None:
+    """Abort a compiler invocation that exceeds the fixed host timeout."""
+    raise TimeoutError(f"NKI compilation exceeded {_COMPILE_TIMEOUT_S} seconds")
+
+
+def _resolve_dtype(name: str) -> np.dtype:
+    """Resolve a NumPy dtype name, including ``bfloat16``."""
+    if name not in _DTYPE_CACHE:
+        try:
+            dtype = np.dtype(name)
+        except TypeError:
+            dtype = np.dtype(getattr(ml_dtypes, name))
+        _DTYPE_CACHE[name] = dtype
+    return _DTYPE_CACHE[name]
+
+
+def _capture_error(error: Exception) -> str:
+    """Render one exception with its traceback for remote diagnostics."""
+    return "".join(traceback.format_exception(type(error), error, error.__traceback__))
+
+
+def _allocate_inputs(config: ProfileConfig) -> dict[str, np.ndarray]:
+    """Allocate compile-time tensors from the declared input signatures."""
+    return {name: np.zeros(shape, dtype=_resolve_dtype(dtype)) for name, (shape, dtype) in config.input_specs.items()}
+
+
+def _compile_with_timeout(
+    kernel_path: Path, func_name: str, inputs: dict[str, np.ndarray], compile_dir: Path, config: ProfileConfig
+) -> Path:
+    """Compile one kernel while bounding compiler hangs."""
+    previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(_COMPILE_TIMEOUT_S)
+    try:
+        neff_path = compile_kernel(kernel_path, func_name, inputs, compile_dir, config.neuronx_cc_args, config.lnc)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+    return neff_path
+
+
+def _copy_compiler_log(compile_dir: Path, output_dir: Path) -> None:
+    """Preserve the compiler diagnostic log when the compiler emitted one."""
+    source = compile_dir / _COMPILER_LOG_FILE
+    if source.is_file():
+        shutil.copy2(source, output_dir / _COMPILER_LOG_FILE)
+
+
+def run_profile(kernel_path: Path, func_name: str, config: ProfileConfig, output_dir: Path) -> ProfileResult:
+    """Compile and profile exactly one NKI kernel on the local Trn2 host."""
+    _ensure_tools_on_path()
+    os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
+    os.environ["NEURON_LOGICAL_NC_CONFIG"] = str(config.lnc)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    summary: dict[str, object] | None = None
+    error_text: str | None = None
+    inputs = _allocate_inputs(config)
+    with tempfile.TemporaryDirectory(prefix="nkigym-profile-") as raw_work_dir:
+        compile_dir = Path(raw_work_dir) / "compiler"
+        try:
+            neff_path = _compile_with_timeout(kernel_path, func_name, inputs, compile_dir, config)
+            profile_neff_path = output_dir / "file.neff"
+            shutil.copy2(neff_path, profile_neff_path)
+            os.environ["NEURON_RT_VISIBLE_CORES"] = "0" if config.lnc == 1 else "0,1"
+            summary = benchmark_kernel(profile_neff_path, output_dir)
+        except Exception as error:
+            error_text = _capture_error(error)
+        _copy_compiler_log(compile_dir, output_dir)
+    return ProfileResult(profiler_summary=summary, error=error_text, elapsed_s=time.monotonic() - started)
+
+
+__all__ = ["run_profile"]

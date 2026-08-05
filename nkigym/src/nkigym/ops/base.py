@@ -141,6 +141,8 @@ class ReductionContract:
     ``map_operator`` is applied elementwise before ``combinator`` reduces
     ``reduction_axis``. ``"copy"`` denotes an identity map.
     ``bias_operand`` names an optional broadcast tensor added before the map.
+    ``mapped_output_operand`` names an optional second output receiving the
+    mapped tile before reduction.
     """
 
     input_operand: str
@@ -151,6 +153,7 @@ class ReductionContract:
     scale: float = 1.0
     bias: float = 0.0
     bias_operand: str | None = None
+    mapped_output_operand: str | None = None
 
 
 @dataclass(frozen=True)

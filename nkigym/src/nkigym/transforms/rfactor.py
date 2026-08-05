@@ -1,4 +1,4 @@
-"""``RFactor`` transform — one-stage → two-stage accumulation (spec 2026-06-12 §2).
+"""``RFactor`` transform for one-stage to two-stage accumulation.
 
 Factors a reduction loop into ``ko``/``ki`` and restructures the one-stage
 accumulation (init once, reduce, drain once) into the FUSED two-stage form:
@@ -8,13 +8,12 @@ SBUF accumulator via a ``tensor_tensor`` fold. Loops are NOT reordered.
 This is the fused single-accumulator form, NOT TVM's multi-slot terminal: the
 PSUM accumulator is per-output-tile (it is re-zeroed every ``ko``, never grown by
 ``factor`` and never carries a ``ko`` slot), so no ``ko``-stride term ever rides
-its M (partition-tile) axis — a later ``Split(M)`` cannot corrupt it. See
-``docs/superpowers/specs/2026-06-12-same-prefix-computeat-and-two-stage-rfactor-design.md``.
+its M (partition-tile) axis, and a later ``Split(M)`` cannot corrupt it.
 
 This transform covers the two-dimensional ``"rmw"`` recipe used by
-``NKIMatmul``. Fused pointwise reductions use the ``"slot"`` recipe as part of
-the atomic tensorize ``Split`` action, so no overwriting split intermediate is
-ever exposed.
+``NKIMatmul`` and the ``"slot"`` recipe used by free-axis reductions. Slot
+factorization introduces its own outer factor loop as intrinsic RFactor
+structure, so no overwriting Split intermediate is exposed.
 """
 
 from __future__ import annotations
@@ -31,11 +30,12 @@ from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.tensor_tensor import NKITensorTensor
 from nkigym.transforms._canonical_rewrite import single_leaf
+from nkigym.transforms._rfactor_slot import SlotRFactor
 from nkigym.transforms._tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 _RMW_STAGING_BUFFER = "sbuf_rfactor"
-"""The ``"rmw"`` recipe's transient SBUF staging buffer (spec §2.3). The per-``ko``
+"""The ``"rmw"`` recipe's transient SBUF staging buffer. The per-``ko``
 PSUM partial is copied here before the ``tensor_tensor`` fold, because
 ``tensor_tensor`` cannot read a PSUM operand."""
 
@@ -43,19 +43,31 @@ _RMW_COMBINERS = frozenset({"add", "multiply"})
 """Associative, commutative reducers supported by the generated tensor_tensor fold."""
 
 
+def _role_of(block: BlockNode, axis: str) -> AxisRole:
+    """Return the role ``block`` assigns to ``axis``, defaulting to parallel."""
+    role = next((iter_var.role for iter_var in block.iter_vars if iter_var.axis == axis), AxisRole.PARALLEL)
+    return role
+
+
 @dataclass(frozen=True)
 class RFactorOption(TransformOption):
     """Factor the reduction loop ``target_loop_nid``.
 
     Attributes:
-        target_loop_nid: the ForNode (a reduction/ACCUMULATION loop) to factor.
+        target_loop_nid: For the ``"rmw"`` recipe, the reduction ForNode to
+            factor. For the ``"slot"`` recipe, the tensorized reduction ISA
+            node; the historical field name is retained for action compatibility.
         factor_axis: retained for API parity with TVM ``rfactor(loop, factor_axis)``;
             the fused form keeps a per-output-tile accumulator (no factor slot), so
             only ``0`` is supported.
+        factors: Two outer-to-inner factors for a ``"slot"`` recipe.
+        target_axis: Concrete reduction axis for a ``"slot"`` recipe.
     """
 
     target_loop_nid: int
     factor_axis: int = 0
+    factors: tuple[int, int] | None = None
+    target_axis: str | None = None
 
 
 class RFactor(Transform[RFactorOption]):
@@ -69,13 +81,20 @@ class RFactor(Transform[RFactorOption]):
                 continue
             if self._rfactorable(ir, nid):
                 options.append(RFactorOption(target_loop_nid=nid, factor_axis=0))
+        for leaf_nid, target_axis, factors in SlotRFactor().analyze(ir):
+            options.append(
+                RFactorOption(target_loop_nid=leaf_nid, factor_axis=0, factors=factors, target_axis=target_axis)
+            )
         return options
 
     def apply(self, ir: KernelIR, option: RFactorOption) -> KernelIR:
         """Re-check legality, deep-copy, emit the two-stage accumulation, return."""
         self._check_legality(ir, option)
         new_ir = copy.deepcopy(ir)
-        self._emit_rmw(new_ir, option)
+        if option.factors is not None and option.target_axis is not None:
+            SlotRFactor().emit(new_ir, option.target_loop_nid, option.target_axis, option.factors)
+        else:
+            self._emit_rmw(new_ir, option)
         return new_ir
 
     def _rfactorable(self, ir: KernelIR, loop_nid: int) -> bool:
@@ -102,7 +121,7 @@ class RFactor(Transform[RFactorOption]):
             if (
                 self._supports_rmw_op(op_cls)
                 and axis is not None
-                and self._role_of(block, axis) == AxisRole.ACCUMULATION
+                and _role_of(block, axis) == AxisRole.ACCUMULATION
                 and len(axis_loops) == 2
                 and axis_loops[0] == loop_nid
                 and self._init_block_is_retargetable(ir, loop_nid, leaf)
@@ -252,7 +271,32 @@ class RFactor(Transform[RFactorOption]):
         return result
 
     def _check_legality(self, ir: KernelIR, option: RFactorOption) -> None:
-        """Raise TransformLegalityError if the option is not a valid rmw rfactor."""
+        """Raise TransformLegalityError if the option is not a valid RFactor."""
+        has_factors = option.factors is not None
+        has_target_axis = option.target_axis is not None
+        if has_factors != has_target_axis:
+            raise TransformLegalityError("RFactor slot options must provide both factors and target_axis")
+        if has_factors:
+            self._check_slot_legality(ir, option)
+        else:
+            self._check_rmw_legality(ir, option)
+
+    def _check_slot_legality(self, ir: KernelIR, option: RFactorOption) -> None:
+        """Raise when ``option`` is not a complete slot-style RFactor."""
+        if option.factor_axis != 0:
+            raise TransformLegalityError(f"RFactor factor_axis must be 0 for the slot recipe; got {option.factor_axis}")
+        factors = option.factors
+        target_axis = option.target_axis
+        if factors is None or target_axis is None:
+            raise AssertionError("slot RFactor legality requires factors and target_axis")
+        if not SlotRFactor().rfactorable(ir, option.target_loop_nid, target_axis, factors):
+            raise TransformLegalityError(
+                f"RFactor target {option.target_loop_nid} is not a legal slot reduction "
+                f"for axis {target_axis!r} and factors {factors}"
+            )
+
+    def _check_rmw_legality(self, ir: KernelIR, option: RFactorOption) -> None:
+        """Raise TransformLegalityError if the option is not a valid rmw RFactor."""
         nid = option.target_loop_nid
         if nid not in ir.tree.graph or not isinstance(ir.tree.data(nid), ForNode):
             raise TransformLegalityError(f"RFactor target {nid} is not a ForNode in the tree")
@@ -494,8 +538,9 @@ class RFactor(Transform[RFactorOption]):
         """Add the SBUF staging buffer ``sbuf_rfactor`` (spec §2.3 transient).
 
         The structural RFactor atom gives staging the output's existing full-frame
-        shape and declares it beside the PSUM. A later per-buffer
-        ``BufferCompaction`` action can place, shrink, and normalize it.
+        shape and declares it beside the PSUM. A later ``BufferPlacement`` action
+        can move the declaration, and ``BufferCompaction`` can then shrink and
+        normalize its regions.
         """
         tree = ir.tree
         out_buf = ir.buffer(out_name)
@@ -823,13 +868,6 @@ class RFactor(Transform[RFactorOption]):
             if loop_var in to_affine(value):
                 return iv.axis
         return None
-
-    def _role_of(self, block: BlockNode, axis: str) -> AxisRole:
-        """Role the block assigns to ``axis`` (default PARALLEL if absent)."""
-        for iv in block.iter_vars:
-            if iv.axis == axis:
-                return iv.role
-        return AxisRole.PARALLEL
 
 
 __all__ = ["RFactor", "RFactorOption"]
