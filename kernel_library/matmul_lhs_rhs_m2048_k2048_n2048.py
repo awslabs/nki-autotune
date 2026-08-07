@@ -11,7 +11,7 @@ from types import ModuleType
 
 import numpy as np
 
-from kernel_library import Workload
+from kernel_library import InputSpecs, Workload
 from nkigym.codegen import render
 from nkigym.environment import Action, KernelMDP
 from nkigym.ir import KernelIR
@@ -47,12 +47,16 @@ M = 2048
 K = 2048
 N = 2048
 SEED = 0
-ATOL = 5e-3
-RTOL = 5e-3
 WORKLOAD_NAME = "matmul-lhs"
 SHAPE = "m2048_k2048_n2048"
 INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 SCHEDULER_OFF_ARGS = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")
+
+
+def input_generator(input_specs: InputSpecs, seed: int) -> dict[str, np.ndarray]:
+    """Generate Kaena-style uniform FP32 matmul inputs."""
+    rng = np.random.default_rng(seed)
+    return {name: rng.random(shape).astype(np.float32) for name, (shape, _dtype) in input_specs.items()}
 
 
 def f_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -113,7 +117,14 @@ ACTIONS: tuple[Action, ...] = (
 )
 
 WORKLOAD = Workload(
-    input_specs=INPUT_SPECS, f_numpy=f_numpy, f_nkigym=f_nkigym, best_action_ladder=ACTIONS, historical_best_mfu=87.46
+    input_specs=INPUT_SPECS,
+    f_numpy=f_numpy,
+    f_nkigym=f_nkigym,
+    input_generator=input_generator,
+    atol=1e-3,
+    rtol=1e-3,
+    best_action_ladder=ACTIONS,
+    historical_best_mfu=87.46,
 )
 
 
@@ -158,10 +169,7 @@ def _load_kernel(path: Path, module_name: str) -> ModuleType:
 
 def _verify_and_dump(workload: Workload, states: list[KernelIR], cache: Path) -> dict[str, float]:
     """Dump and CPU-verify every ladder state."""
-    rng = np.random.default_rng(SEED)
-    inputs = {
-        name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in workload.input_specs.items()
-    }
+    inputs = workload.generate_inputs(SEED)
     expected = workload.f_numpy(**inputs)
     errors: dict[str, float] = {}
     for index, (label, state) in enumerate(zip(_labels(workload), states, strict=True)):
@@ -169,10 +177,11 @@ def _verify_and_dump(workload: Workload, states: list[KernelIR], cache: Path) ->
         state.dump(state_dir)
         module = _load_kernel(state_dir / "kernel.py", f"matmul_lhs_rhs_{index}")
         actual = np.asarray(simulate_fp32(module.nki_f_nkigym)(**inputs))
-        np.testing.assert_allclose(actual, expected, atol=ATOL, rtol=RTOL)
+        np.testing.assert_allclose(actual, expected, atol=workload.atol, rtol=workload.rtol)
         errors[label] = float(np.max(np.abs(actual - expected)))
         (state_dir / "accuracy.json").write_text(
-            json.dumps({"max_abs_error": errors[label], "atol": ATOL, "rtol": RTOL}, indent=2) + "\n", encoding="utf-8"
+            json.dumps({"max_abs_error": errors[label], "atol": workload.atol, "rtol": workload.rtol}, indent=2) + "\n",
+            encoding="utf-8",
         )
     return errors
 

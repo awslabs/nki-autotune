@@ -108,9 +108,9 @@ the [`debug-nkigym` skill](.agents/skills/debug-nkigym/SKILL.md) for repair.
 ## Kernel Library
 
 Each flat kernel-library module owns one exact `(workload, shape)` tuple,
-including its NumPy reference, input specifications, `f_nkigym` graph, and
-transform ladder. The module dumps, CPU-verifies, and profiles every
-intermediate kernel:
+including its NumPy reference, input specifications, seeded random input
+generator, validation tolerances, `f_nkigym` graph, and transform ladder. The
+module dumps, CPU-verifies, and profiles every intermediate kernel:
 
 ```bash
 PYTHONPATH=.:nkigym/src \

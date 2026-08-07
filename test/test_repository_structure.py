@@ -34,7 +34,7 @@ Allowed repository imports:
 
 nkigym        -> nkigym
 kernel_library -> kernel_library, nkigym
-test           -> nkigym
+test           -> kernel_library, nkigym
 
 The top-level developer package must not exist. self_evolve may be imported only
 within .agents/skills/self-evolve/scripts.
@@ -333,7 +333,7 @@ def _dependency_violations() -> list[str]:
     violations = [
         *_boundary_violations(REPOSITORY_ROOT / "nkigym/src/nkigym", {"nkigym"}),
         *_boundary_violations(REPOSITORY_ROOT / "kernel_library", {"kernel_library", "nkigym"}),
-        *_boundary_violations(REPOSITORY_ROOT / "test", {"nkigym"}),
+        *_boundary_violations(REPOSITORY_ROOT / "test", {"kernel_library", "nkigym"}),
     ]
     if (REPOSITORY_ROOT / "developer").exists():
         violations.append("legacy top-level developer package must remain removed")

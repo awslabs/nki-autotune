@@ -3,15 +3,21 @@
 Reproducible transform ladders for the best retained kernel schedules. Each
 flat module owns one exact `(workload, shape)` tuple and exposes a singular
 `WORKLOAD` containing its input specifications, NumPy reference, nkigym graph,
-best retained action ladder, and historical best MFU. Modules also own CPU
-verification, artifact dump, and hardware profiling. Rendered NKI kernels are
-generated artifacts and are not checked in.
+seeded FP32 input generator, validation tolerances, best retained action ladder,
+and historical best MFU. Modules also own CPU verification, artifact dump, and
+hardware profiling. Rendered NKI kernels are generated artifacts and are not
+checked in.
 
 `registry.py` maps each tuple to its module. Ladders and historical MFU values
 are never inherited across shapes.
 
 Matmul and RMSNorm+matmul measurements use 2048³ BF16 inputs on `gym-1`.
 Attention uses a 16K sequence length and head dimension 128.
+
+Validation follows the corresponding Kaena tests: matmul uses uniform `[0, 1]`
+inputs with `atol=rtol=1e-3`; RMSNorm+matmul uses uniform `[-0.1, 0.1]`
+inputs with `atol=1e-3`, `rtol=2e-2`; attention uses uniform `[0, 1]` inputs
+with `atol=1e-5`, `rtol=2e-2`.
 
 | workload | shape | module | states | historical best MFU |
 | --- | --- | --- | ---: | ---: |

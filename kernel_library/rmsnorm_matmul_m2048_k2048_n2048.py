@@ -6,12 +6,13 @@ import argparse
 import importlib.util
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
 import numpy as np
 
-from kernel_library import Workload
+from kernel_library import InputSpecs, Workload
 from nkigym.codegen import render
 from nkigym.environment import Action, KernelMDP
 from nkigym.ir import KernelIR
@@ -55,12 +56,18 @@ K = 2048
 N = 2048
 EPSILON = 1e-6
 SEED = 0
-ATOL = 5e-3
-RTOL = 5e-3
 WORKLOAD_NAME = "rmsnorm-matmul"
 SHAPE = "m2048_k2048_n2048"
 INPUT_SPECS = {"lhs": ((M, K), "bfloat16"), "rhs": ((K, N), "bfloat16")}
 SCHEDULER_OFF_ARGS = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")
+
+
+def input_generator(input_specs: InputSpecs, seed: int) -> dict[str, np.ndarray]:
+    """Generate Kaena-style small uniform FP32 RMSNorm inputs."""
+    rng = np.random.default_rng(seed)
+    return {
+        name: rng.uniform(-0.1, 0.1, size=shape).astype(np.float32) for name, (shape, _dtype) in input_specs.items()
+    }
 
 
 def f_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -70,19 +77,28 @@ def f_numpy(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     return normalized @ rhs.astype(np.float32)
 
 
-@nkigym_kernel
-def f_nkigym(lhs, rhs):
-    """Define ``rmsnorm(lhs) @ rhs`` as an SSA operator graph."""
-    sbuf_rhs = NKILoad()(src=rhs)
-    sbuf_lhs = NKILoad()(src=lhs)
-    sbuf_square_sum = NKIActivationReduce(op="square", reduce_op="add")(data=sbuf_lhs)
-    sbuf_rms_inverse = NKIActivation(op="rsqrt", scale=1.0 / K, bias=EPSILON)(data=sbuf_square_sum)
-    sbuf_normalized = NKITensorScalar(op0="multiply")(data=sbuf_lhs, operand0=sbuf_rms_inverse)
-    sbuf_normalized_T = NKIDMATranspose()(src=sbuf_normalized)
-    psum_output = NKIMatmul()(stationary=sbuf_normalized_T, moving=sbuf_rhs)
-    sbuf_output = NKITensorCopy()(src=psum_output)
-    hbm_output = NKIStore()(src=sbuf_output)
-    return hbm_output
+def make_f_nkigym(k: int) -> Callable[..., np.ndarray]:
+    """Build an RMSNorm+matmul graph for one reduction extent."""
+    scale = 1.0 / k
+
+    @nkigym_kernel
+    def f_nkigym(lhs, rhs):
+        """Define ``rmsnorm(lhs) @ rhs`` as an SSA operator graph."""
+        sbuf_rhs = NKILoad()(src=rhs)
+        sbuf_lhs = NKILoad()(src=lhs)
+        sbuf_square_sum = NKIActivationReduce(op="square", reduce_op="add")(data=sbuf_lhs)
+        sbuf_rms_inverse = NKIActivation(op="rsqrt", scale=scale, bias=EPSILON)(data=sbuf_square_sum)
+        sbuf_normalized = NKITensorScalar(op0="multiply")(data=sbuf_lhs, operand0=sbuf_rms_inverse)
+        sbuf_normalized_T = NKIDMATranspose()(src=sbuf_normalized)
+        psum_output = NKIMatmul()(stationary=sbuf_normalized_T, moving=sbuf_rhs)
+        sbuf_output = NKITensorCopy()(src=psum_output)
+        hbm_output = NKIStore()(src=sbuf_output)
+        return hbm_output
+
+    return f_nkigym
+
+
+f_nkigym = make_f_nkigym(K)
 
 
 ACTIONS: tuple[Action, ...] = (
@@ -138,7 +154,14 @@ ACTIONS: tuple[Action, ...] = (
 )
 
 WORKLOAD = Workload(
-    input_specs=INPUT_SPECS, f_numpy=f_numpy, f_nkigym=f_nkigym, best_action_ladder=ACTIONS, historical_best_mfu=86.99
+    input_specs=INPUT_SPECS,
+    f_numpy=f_numpy,
+    f_nkigym=f_nkigym,
+    input_generator=input_generator,
+    atol=1e-3,
+    rtol=2e-2,
+    best_action_ladder=ACTIONS,
+    historical_best_mfu=86.99,
 )
 
 
@@ -183,10 +206,7 @@ def _load_kernel(path: Path, module_name: str) -> ModuleType:
 
 def _verify_and_dump(workload: Workload, states: list[KernelIR], cache: Path) -> dict[str, float]:
     """Dump and CPU-verify every ladder state."""
-    rng = np.random.default_rng(SEED)
-    inputs = {
-        name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in workload.input_specs.items()
-    }
+    inputs = workload.generate_inputs(SEED)
     expected = workload.f_numpy(**inputs)
     errors: dict[str, float] = {}
     for index, (label, state) in enumerate(zip(_labels(workload), states, strict=True)):
@@ -194,10 +214,11 @@ def _verify_and_dump(workload: Workload, states: list[KernelIR], cache: Path) ->
         state.dump(state_dir)
         module = _load_kernel(state_dir / "kernel.py", f"rmsnorm_matmul_{index}")
         actual = np.asarray(simulate_fp32(module.nki_f_nkigym)(**inputs))
-        np.testing.assert_allclose(actual, expected, atol=ATOL, rtol=RTOL)
+        np.testing.assert_allclose(actual, expected, atol=workload.atol, rtol=workload.rtol)
         errors[label] = float(np.max(np.abs(actual - expected)))
         (state_dir / "accuracy.json").write_text(
-            json.dumps({"max_abs_error": errors[label], "atol": ATOL, "rtol": RTOL}, indent=2) + "\n", encoding="utf-8"
+            json.dumps({"max_abs_error": errors[label], "atol": workload.atol, "rtol": workload.rtol}, indent=2) + "\n",
+            encoding="utf-8",
         )
     return errors
 

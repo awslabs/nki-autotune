@@ -64,20 +64,24 @@ HEAD_DIM = 128
 SEQUENCE_LENGTH = 16384
 VALIDATION_QUERY_LENGTH = 512
 SEED = 0
-ATOL = 5e-3
-RTOL = 5e-3
 WORKLOAD_NAME = "attention"
 SHAPE = "q16384_kv16384_d128"
 SCHEDULER_OFF_ARGS = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")
 
 
-def _input_specs(query_length: int, sequence_length: int, head_dim: int) -> InputSpecs:
+def make_input_specs(query_length: int, sequence_length: int, head_dim: int) -> InputSpecs:
     """Return pretransposed BF16 attention inputs."""
     return {
         "query": ((head_dim, query_length), "bfloat16"),
         "key": ((head_dim, sequence_length), "bfloat16"),
         "value": ((sequence_length, head_dim), "bfloat16"),
     }
+
+
+def input_generator(input_specs: InputSpecs, seed: int) -> dict[str, np.ndarray]:
+    """Generate Kaena-style uniform FP32 attention inputs."""
+    rng = np.random.default_rng(seed)
+    return {name: rng.random(shape).astype(np.float32) for name, (shape, _dtype) in input_specs.items()}
 
 
 def f_numpy(query: np.ndarray, key: np.ndarray, value: np.ndarray) -> np.ndarray:
@@ -200,9 +204,16 @@ ACTIONS: tuple[Action, ...] = (
     (BatchPermutation(), BatchPermutationOption(loop_nid=179)),
 )
 
-INPUT_SPECS = _input_specs(SEQUENCE_LENGTH, SEQUENCE_LENGTH, HEAD_DIM)
+INPUT_SPECS = make_input_specs(SEQUENCE_LENGTH, SEQUENCE_LENGTH, HEAD_DIM)
 WORKLOAD = Workload(
-    input_specs=INPUT_SPECS, f_numpy=f_numpy, f_nkigym=f_nkigym, best_action_ladder=ACTIONS, historical_best_mfu=46.43
+    input_specs=INPUT_SPECS,
+    f_numpy=f_numpy,
+    f_nkigym=f_nkigym,
+    input_generator=input_generator,
+    atol=1e-5,
+    rtol=2e-2,
+    best_action_ladder=ACTIONS,
+    historical_best_mfu=46.43,
 )
 
 
@@ -248,15 +259,14 @@ def _validation_input_specs(workload: Workload) -> InputSpecs:
     query_shape, _query_dtype = workload.input_specs["query"]
     key_shape, _key_dtype = workload.input_specs["key"]
     query_length = min(VALIDATION_QUERY_LENGTH, query_shape[1])
-    return _input_specs(query_length, key_shape[1], query_shape[0])
+    return make_input_specs(query_length, key_shape[1], query_shape[0])
 
 
 def _verify_and_dump(
     workload: Workload, input_specs: InputSpecs, states: list[KernelIR], cache: Path
 ) -> dict[str, float]:
     """Dump and CPU-verify every validation-shaped state."""
-    rng = np.random.default_rng(SEED)
-    inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in input_specs.items()}
+    inputs = workload.generate_inputs(SEED, input_specs)
     expected = workload.f_numpy(**inputs)
     errors: dict[str, float] = {}
     for index, (label, state) in enumerate(zip(_labels(workload), states, strict=True)):
@@ -266,10 +276,11 @@ def _verify_and_dump(
         kernel = getattr(module, "nki_f_nkigym")
         with np.errstate(divide="ignore", invalid="ignore"):
             actual = np.asarray(simulate_fp32(kernel)(**inputs))
-        np.testing.assert_allclose(actual, expected, atol=ATOL, rtol=RTOL)
+        np.testing.assert_allclose(actual, expected, atol=workload.atol, rtol=workload.rtol)
         errors[label] = float(np.max(np.abs(actual - expected)))
         (state_dir / "accuracy.json").write_text(
-            json.dumps({"max_abs_error": errors[label], "atol": ATOL, "rtol": RTOL}, indent=2) + "\n", encoding="utf-8"
+            json.dumps({"max_abs_error": errors[label], "atol": workload.atol, "rtol": workload.rtol}, indent=2) + "\n",
+            encoding="utf-8",
         )
     return errors
 
