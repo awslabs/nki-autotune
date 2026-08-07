@@ -10,6 +10,9 @@ from pathlib import Path
 
 from config import MFU_PROFILE_HOSTS
 
+from kernel_library import load_workload
+from nkigym.codegen import render
+from nkigym.environment import KernelMDP
 from nkigym.profile import profile
 from nkigym.search.types import InputSpecs
 
@@ -19,12 +22,17 @@ MIN_ATTENTION_MFU_PERCENT = 44.0
 MAX_RMSNORM_MATMUL_MFU_GAP_PERCENT = 3.0
 ENDPOINT_PROFILE_TIMEOUT_SECONDS = 1800
 SCHEDULER_OFF_ARGS = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")
-EXPECTED_ENDPOINTS = {"attention", "matmul-lhs", "matmul-lhs-t", "rmsnorm-matmul"}
+ENDPOINT_SHAPES = {
+    "attention": "q16384_kv16384_d128",
+    "matmul-lhs": "m2048_k2048_n2048",
+    "matmul-lhs-t": "m2048_k2048_n2048",
+    "rmsnorm-matmul": "m2048_k2048_n2048",
+}
 
 
 @dataclass(frozen=True)
 class _Endpoint:
-    """One rendered kernel supplied by the workflow gate."""
+    """One rendered final state from a retained workload ladder."""
 
     name: str
     kernel: str
@@ -32,62 +40,26 @@ class _Endpoint:
     input_specs: InputSpecs
 
 
-def _decode_input_specs(value: object) -> InputSpecs:
-    """Decode and validate endpoint input specifications."""
-    if not isinstance(value, dict) or not value:
-        raise AssertionError("endpoint input_specs must be a non-empty object")
-    input_specs: InputSpecs = {}
-    for name, raw_spec in value.items():
-        if not isinstance(name, str) or not name.isidentifier() or not isinstance(raw_spec, dict):
-            raise AssertionError(f"invalid endpoint input specification: {name!r}")
-        raw_shape = raw_spec.get("shape")
-        dtype = raw_spec.get("dtype")
-        if (
-            not isinstance(raw_shape, list)
-            or not raw_shape
-            or any(
-                not isinstance(dimension, int) or isinstance(dimension, bool) or dimension < 1
-                for dimension in raw_shape
-            )
-        ):
-            raise AssertionError(f"endpoint input {name!r} must have a positive integer shape")
-        if not isinstance(dtype, str) or not dtype:
-            raise AssertionError(f"endpoint input {name!r} must have a dtype")
-        input_specs[name] = (tuple(raw_shape), dtype)
-    return input_specs
-
-
-def _decode_endpoint(value: object) -> _Endpoint:
-    """Decode one endpoint manifest entry."""
-    if not isinstance(value, dict):
-        raise AssertionError("endpoint entry must be an object")
-    name = value.get("name")
-    kernel = value.get("kernel")
-    func_name = value.get("func_name")
-    if not isinstance(name, str) or not name:
-        raise AssertionError("endpoint name must be a non-empty string")
-    if not isinstance(kernel, str) or not kernel.strip():
-        raise AssertionError(f"endpoint {name!r} kernel must be non-empty")
-    if not isinstance(func_name, str) or not func_name.isidentifier():
-        raise AssertionError(f"endpoint {name!r} func_name must be a Python identifier")
-    return _Endpoint(
-        name=name, kernel=kernel, func_name=func_name, input_specs=_decode_input_specs(value.get("input_specs"))
+def _build_endpoint(name: str, shape: str) -> _Endpoint:
+    """Replay one retained ladder and render its final state."""
+    workload = load_workload(name, shape)
+    environment = KernelMDP(
+        workload.f_nkigym,
+        workload.input_specs,
+        transforms=[transform for transform, _option in workload.best_action_ladder],
     )
+    state = environment.reset()
+    for action in workload.best_action_ladder:
+        state = environment.step(state, action)
+    endpoint = _Endpoint(
+        name=name, kernel=render(state), func_name=f"nki_{state.func_name}", input_specs=workload.input_specs
+    )
+    return endpoint
 
 
-def _load_endpoints(manifest_path: Path) -> dict[str, _Endpoint]:
-    """Load the controller-generated endpoint manifest."""
-    decoded = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(decoded, dict) or decoded.get("schema_version") != 1:
-        raise AssertionError(f"unsupported endpoint manifest: {manifest_path}")
-    raw_endpoints = decoded.get("endpoints")
-    if not isinstance(raw_endpoints, list):
-        raise AssertionError("endpoint manifest entries must be a list")
-    endpoints = {_endpoint.name: _endpoint for _endpoint in map(_decode_endpoint, raw_endpoints)}
-    if set(endpoints) != EXPECTED_ENDPOINTS or len(endpoints) != len(raw_endpoints):
-        raise AssertionError(
-            f"endpoint manifest names must be exactly {sorted(EXPECTED_ENDPOINTS)}, got {sorted(endpoints)}"
-        )
+def _build_endpoints() -> dict[str, _Endpoint]:
+    """Build every fixed MFU endpoint from its kernel-library ladder."""
+    endpoints = {name: _build_endpoint(name, shape) for name, shape in ENDPOINT_SHAPES.items()}
     return endpoints
 
 
@@ -124,8 +96,8 @@ def _profile_endpoint_group(host: str, requests: tuple[tuple[str, _Endpoint, Pat
 
 def test_best_known_generated_kernels_do_not_regress_mfu(tmp_path: Path) -> None:
     """Best-known generated endpoints retain their established hardware MFU."""
-    cache_dir = tmp_path.parents[1]
-    endpoints = _load_endpoints(cache_dir / "endpoints.json")
+    cache_dir = tmp_path
+    endpoints = _build_endpoints()
     lhs_t_host, lhs_host = MFU_PROFILE_HOSTS
     lhs_t_requests = (
         ("lhsT", endpoints["matmul-lhs-t"], cache_dir / "matmul_lhs_t_rhs"),
