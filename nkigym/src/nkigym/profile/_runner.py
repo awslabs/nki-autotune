@@ -59,13 +59,20 @@ def _allocate_inputs(config: ProfileConfig) -> dict[str, np.ndarray]:
 
 
 def _compile_with_timeout(
-    kernel_path: Path, func_name: str, inputs: dict[str, np.ndarray], compile_dir: Path, config: ProfileConfig
+    kernel_path: Path,
+    func_name: str,
+    inputs: dict[str, np.ndarray],
+    compile_dir: Path,
+    config: ProfileConfig,
+    compiler_jobs: int | None,
 ) -> Path:
     """Compile one kernel while bounding compiler hangs."""
     previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(_COMPILE_TIMEOUT_S)
     try:
-        neff_path = compile_kernel(kernel_path, func_name, inputs, compile_dir, config.neuronx_cc_args, config.lnc)
+        neff_path = compile_kernel(
+            kernel_path, func_name, inputs, compile_dir, config.neuronx_cc_args, config.lnc, compiler_jobs
+        )
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
@@ -79,28 +86,50 @@ def _copy_compiler_log(compile_dir: Path, output_dir: Path) -> None:
         shutil.copy2(source, output_dir / _COMPILER_LOG_FILE)
 
 
-def run_profile(kernel_path: Path, func_name: str, config: ProfileConfig, output_dir: Path) -> ProfileResult:
+def run_profile(
+    kernel_path: Path,
+    func_name: str,
+    config: ProfileConfig,
+    output_dir: Path,
+    visible_core: int,
+    compiler_jobs: int | None,
+) -> ProfileResult:
     """Compile and profile exactly one NKI kernel on the local Trn2 host."""
     _ensure_tools_on_path()
     os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
     os.environ["NEURON_LOGICAL_NC_CONFIG"] = str(config.lnc)
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    compile_s = 0.0
+    profile_s = 0.0
     summary: dict[str, object] | None = None
     error_text: str | None = None
-    inputs = _allocate_inputs(config)
     with tempfile.TemporaryDirectory(prefix="nkigym-profile-") as raw_work_dir:
         compile_dir = Path(raw_work_dir) / "compiler"
+        profile_neff_path = output_dir / "file.neff"
+        compile_started = time.monotonic()
         try:
-            neff_path = _compile_with_timeout(kernel_path, func_name, inputs, compile_dir, config)
-            profile_neff_path = output_dir / "file.neff"
+            inputs = _allocate_inputs(config)
+            neff_path = _compile_with_timeout(kernel_path, func_name, inputs, compile_dir, config, compiler_jobs)
             shutil.copy2(neff_path, profile_neff_path)
-            os.environ["NEURON_RT_VISIBLE_CORES"] = "0" if config.lnc == 1 else "0,1"
-            summary = benchmark_kernel(profile_neff_path, output_dir)
         except Exception as error:
             error_text = _capture_error(error)
+        compile_s = time.monotonic() - compile_started
         _copy_compiler_log(compile_dir, output_dir)
-    return ProfileResult(profiler_summary=summary, error=error_text, elapsed_s=time.monotonic() - started)
+        if error_text is None:
+            profile_started = time.monotonic()
+            try:
+                summary = benchmark_kernel(profile_neff_path, output_dir, config.lnc, visible_core)
+            except Exception as error:
+                error_text = _capture_error(error)
+            profile_s = time.monotonic() - profile_started
+    return ProfileResult(
+        profiler_summary=summary,
+        error=error_text,
+        elapsed_s=time.monotonic() - started,
+        compile_s=compile_s,
+        profile_s=profile_s,
+    )
 
 
 __all__ = ["run_profile"]

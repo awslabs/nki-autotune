@@ -1,4 +1,0 @@
-interface:
-  display_name: "Self-evolve nkigym"
-  short_description: "Refine a healthy current branch"
-  default_prompt: "Use $self-evolve to verify the tests pass and complete my selected refinement rounds in the current branch, stopping without repairs on failure."

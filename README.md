@@ -52,6 +52,22 @@ compiler logs, `file.neff`, `profile.ntff`, and the JSON profiler summary. A
 failed compile or profile raises an exception after preserving available
 artifacts.
 
+Use `profile_many()` for independent kernels on the same Trn2 host. It uploads
+the batch once, compiles kernels in separate processes, and profiles each
+process on a distinct logical NeuronCore:
+
+```python
+from nkigym.profile import profile_many
+
+result = profile_many(
+    host="gym-1",
+    kernels={"candidate-0": Path("kernel.py").read_text()},
+    func_name="nki_kernel",
+    input_specs={"x": ((128, 512), "bfloat16")},
+    cache_dir="/tmp/kernel-profiles",
+)
+```
+
 ## Programmatic Synthesis
 
 The synthesis API traces supported NumPy math with shape-only symbolic tensors
@@ -77,31 +93,6 @@ source = compile_numpy_to_nkigym(
 The supported subset includes 2D transpose and matmul, scalar or per-row
 broadcast arithmetic, common activations, and free-axis sum, maximum, and mean
 reductions. Unsupported operations raise `ValueError`.
-
-## Agent Workflows
-
-Use `$self-evolve` to refine IR, operations, code generation, and transforms
-from measured search feedback. It first runs the standalone tests as a
-read-only health check. If a test fails, it stops and reports the failure
-without repairing it. Debug failing tests separately before starting or
-resuming refinement. Refinement edits happen directly in the current branch
-checkout. Run artifacts remain under the external state directory; no detached
-Git worktree is created:
-
-```bash
-python .agents/skills/self-evolve/scripts/develop.py start matmul-lhs-t \
-  --shape m2048_k2048_n2048 \
-  --host gym-1 \
-  --rounds 3
-```
-
-If a run later reports `mode=repair`, `$self-evolve` stops and reports the
-failure. Resolve the failure before resuming the run.
-
-The selectable kernel-library workloads are `attention`, `matmul-lhs`,
-`matmul-lhs-t`, and `rmsnorm-matmul`. Every selection also requires one of
-the shape keys registered for that workload. See the
-[`self-evolve` skill](.agents/skills/self-evolve/SKILL.md) for refinement.
 
 ## Kernel Library
 
@@ -133,7 +124,8 @@ PYTHONPATH=.:nkigym/src \
 ```
 
 Kernels and accuracy results are stored under `kernels/`; remote MFU results
-are stored under `mfu/`.
+are stored under `mfu/`. All four drivers submit their ladder once; the
+profiling backend manages compiler processes and NeuronCore assignment.
 
 ## Security
 

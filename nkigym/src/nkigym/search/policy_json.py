@@ -28,6 +28,12 @@ sequence. Continue from that child when it exposes the locality, factorization,
 placement, compaction, or pipelining needed to test the hypothesis. Never write
 source or invent an action or node.
 
+MFU is the optimization score. Use latency, MBU, engine active time, memory
+traffic, spill traffic, DMA transfer size, arithmetic intensity, and throttling
+to explain why MFU changed and to choose the next transform. Engine active-time
+percentages can overlap because engines run concurrently; do not add them
+together.
+
 Transform semantics:
 - Split exposes hardware tile and outer-loop factors.
 - Fuse removes an unhelpful split.

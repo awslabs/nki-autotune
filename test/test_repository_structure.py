@@ -36,8 +36,7 @@ nkigym        -> nkigym
 kernel_library -> kernel_library, nkigym
 test           -> kernel_library, nkigym
 
-The top-level developer package must not exist. self_evolve may be imported only
-within .agents/skills/self-evolve/scripts.
+The top-level developer package must not exist.
 """
 
 from __future__ import annotations
@@ -62,8 +61,7 @@ MAX_SYNTHESIS_IMPLEMENTATION_LINES = 2000
 OP_FILE_LINE_LIMIT = 100
 OP_BASE_FILE_LINE_LIMIT = 500
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-SKILL_SCRIPTS = REPOSITORY_ROOT / ".agents/skills/self-evolve/scripts"
-REPOSITORY_IMPORT_ROOTS = {"developer", "kernel_library", "nkigym", "self_evolve"}
+REPOSITORY_IMPORT_ROOTS = {"developer", "kernel_library", "nkigym"}
 REQUIRED_PACKAGE_INITIALIZERS = frozenset(
     {
         "nkigym/src/nkigym/__init__.py",
@@ -337,13 +335,6 @@ def _dependency_violations() -> list[str]:
     ]
     if (REPOSITORY_ROOT / "developer").exists():
         violations.append("legacy top-level developer package must remain removed")
-    for path in sorted(REPOSITORY_ROOT.rglob("*.py")):
-        if path.is_relative_to(SKILL_SCRIPTS):
-            continue
-        for root, line in _import_roots(path):
-            if root == "self_evolve":
-                relative = path.relative_to(REPOSITORY_ROOT)
-                violations.append(f"{relative}:{line} must not import skill support package self_evolve")
     return violations
 
 

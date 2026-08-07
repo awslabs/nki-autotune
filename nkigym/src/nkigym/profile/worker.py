@@ -31,7 +31,12 @@ def _main() -> None:
     shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True)
     result = run_profile(
-        kernel_path=kernel_path, func_name=request.func_name, config=request.config, output_dir=output_dir
+        kernel_path=kernel_path,
+        func_name=request.func_name,
+        config=request.config,
+        output_dir=output_dir,
+        visible_core=0,
+        compiler_jobs=None,
     )
     (output_dir / "result.json").write_text(json.dumps(result_payload(result), indent=2) + "\n", encoding="utf-8")
     if result.profiler_summary is not None:

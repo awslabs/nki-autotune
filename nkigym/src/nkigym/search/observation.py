@@ -10,6 +10,7 @@ from nkigym.codegen import render
 from nkigym.environment import Action
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
+from nkigym.search.profile_feedback import format_profile_metrics, format_trace_metrics
 from nkigym.search.types import MAX_TRANSFORMS_PER_REASONING_STEP, SearchConfig, SearchNode
 from nkigym.transforms import (
     BatchPermutationOption,
@@ -140,7 +141,8 @@ def format_observation(
         "",
         f"# Active Neuron Profile (N{active.node_id:03d})",
         active.evaluation.message,
-        *_format_metrics(active),
+        "MFU is the score. Engine active percentages can overlap.",
+        *format_profile_metrics(active),
         "",
         "# Complete Measured Search Trace",
         *_format_trace(nodes, active.node_id, best.node_id if best is not None else None, branchable_node_ids),
@@ -184,14 +186,6 @@ def format_observation(
     return "\n".join(sections)
 
 
-def _format_metrics(node: SearchNode) -> list[str]:
-    """Format every profiler metric for one node."""
-    lines = [f"- {name}: {value}" for name, value in sorted(node.evaluation.metrics.items())]
-    if not lines:
-        lines.append("- no structured metrics")
-    return lines
-
-
 def _format_trace(
     nodes: list[SearchNode], active_node_id: int, best_node_id: int | None, branchable_node_ids: tuple[int, ...]
 ) -> list[str]:
@@ -206,7 +200,7 @@ def _format_trace(
         )
         rationale = node.rationale or "initial Neuron profile"
         score = "compile/profile failed" if node.evaluation.score is None else f"score={node.evaluation.score:.4f}"
-        metrics = ", ".join(f"{name}={value}" for name, value in sorted(node.evaluation.metrics.items())) or "none"
+        metrics = format_trace_metrics(node)
         parent = "root" if node.parent_id is None else f"N{node.parent_id:03d}"
         tags: list[str] = []
         if node.node_id == active_node_id:

@@ -72,16 +72,26 @@ def compile_kernel(
     output_dir: Path,
     neuronx_cc_args: tuple[str, ...],
     lnc: int,
+    compiler_jobs: int | None,
 ) -> Path:
     """Compile one NKI source file for Trn2 and return its NEFF path."""
+    if compiler_jobs is not None and compiler_jobs <= 0:
+        raise ValueError("compiler jobs must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
-    tempfile.tempdir = str(output_dir)
     neff_path = output_dir / "file.neff"
-    options = CompileOptions(target="trn2", lnc=lnc, output_path=str(neff_path), artifacts_dir=str(output_dir))
-    if neuronx_cc_args:
-        options = options.set_pipeline_options(*neuronx_cc_args)
-    kernel = Kernel(load_kernel(kernel_path, func_name))
-    _run_compiler(kernel, inputs, options)
+    backend_args = () if compiler_jobs is None else (f"--jobs={compiler_jobs}",)
+    options = CompileOptions(
+        target="trn2", lnc=lnc, output_path=str(neff_path), artifacts_dir=str(output_dir), neuronx_cc_args=backend_args
+    )
+    previous_tempdir = tempfile.tempdir
+    tempfile.tempdir = str(output_dir)
+    try:
+        if neuronx_cc_args:
+            options = options.set_pipeline_options(*neuronx_cc_args)
+        kernel = Kernel(load_kernel(kernel_path, func_name))
+        _run_compiler(kernel, inputs, options)
+    finally:
+        tempfile.tempdir = previous_tempdir
     if not neff_path.is_file():
         raise RuntimeError(f"compiler returned without creating {neff_path}")
     return neff_path

@@ -25,7 +25,7 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.tensor_scalar import NKITensorScalar
-from nkigym.profile import profile, simulate_fp32
+from nkigym.profile import profile_many, simulate_fp32
 from nkigym.transforms import (
     BatchPermutation,
     BatchPermutationOption,
@@ -232,31 +232,16 @@ def _verify_and_dump(workload: Workload, states: list[KernelIR], cache: Path) ->
 
 def _profile(workload: Workload, states: list[KernelIR], cache: Path, host: str) -> dict[str, object]:
     """Profile every state on the SSH Trn2 host."""
-    profile_dir = cache / "mfu"
-    measurements: dict[str, dict[str, float]] = {}
-    failures: dict[str, str] = {}
-    for label, state in zip(_labels(workload), states, strict=True):
-        try:
-            mfu_percent, latency_ms = profile(
-                host=host,
-                kernel=render(state),
-                func_name="nki_f_nkigym",
-                input_specs=workload.input_specs,
-                cache_dir=profile_dir / label,
-                neuronx_cc_args=SCHEDULER_OFF_ARGS,
-            )
-            measurements[label] = {"mfu_percent": mfu_percent, "latency_ms": latency_ms}
-        except RuntimeError as error:
-            if not (profile_dir / label / "result.json").is_file():
-                raise
-            failures[label] = str(error)
-    (profile_dir / "results.json").write_text(
-        json.dumps({"successes": measurements, "failures": failures}, indent=2) + "\n", encoding="utf-8"
+    labels = _labels(workload)
+    return profile_many(
+        host=host,
+        kernels={label: render(state) for label, state in zip(labels, states, strict=True)},
+        func_name="nki_f_nkigym",
+        input_specs=workload.input_specs,
+        cache_dir=cache / "mfu",
+        neuronx_cc_args=SCHEDULER_OFF_ARGS,
+        required_successes=(labels[-1],),
     )
-    final_label = _labels(workload)[-1]
-    if final_label not in measurements:
-        raise RuntimeError(f"final state did not profile successfully: {failures[final_label]}")
-    return {"successes": measurements, "failure_count": len(failures), "results": "mfu/results.json"}
 
 
 def _main() -> None:

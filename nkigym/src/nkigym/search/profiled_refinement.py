@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
 from nkigym.codegen import render
 from nkigym.environment import KernelMDP
 from nkigym.ir import KernelIR
-from nkigym.profile import profile
+from nkigym.profile import profile_metrics
 from nkigym.search.codex_policy import CodexPolicyConfig, CodexTransformPolicy
 from nkigym.search.engine import ProfilerGuidedRefinement
+from nkigym.search.profile_feedback import evaluation_from_profile
 from nkigym.search.types import Evaluation, InputSpecs, SearchConfig, SearchResult
 from nkigym.transforms import public_transforms
 
@@ -52,7 +55,7 @@ class NKIProfileEvaluator:
         evaluation: Evaluation
         profile_dir = cache_dir / "profile"
         try:
-            mfu_percent, latency_ms = profile(
+            profile_result = profile_metrics(
                 host=self.config.host,
                 kernel=render(state),
                 func_name=f"nki_{state.func_name}",
@@ -72,59 +75,66 @@ class NKIProfileEvaluator:
                 message=f"Neuron profile failed for N{node_id:03d}: {detail}",
             )
         else:
-            evaluation = Evaluation(
-                score=mfu_percent,
-                metrics={"profile_succeeded": True, "mfu_percent": mfu_percent, "latency_ms": latency_ms},
-                message=(
-                    f"Neuron profile succeeded for N{node_id:03d}: "
-                    f"MFU={mfu_percent:.2f}%, latency={latency_ms:.4f} ms"
-                ),
-            )
+            evaluation = evaluation_from_profile(profile_result, node_id)
         return evaluation
+
+
+def _workload_guidance(kernel_func: Callable[..., Any], input_specs: InputSpecs) -> str:
+    """Describe the kernel and profile inputs to the reasoning policy."""
+    inputs = ", ".join(f"{name}={shape}:{dtype}" for name, (shape, dtype) in input_specs.items())
+    return (
+        f"Optimize nkigym function {kernel_func.__name__} with inputs {inputs}. "
+        "Use measured Neuron profiles to select legal transforms."
+    )
 
 
 def run_profiled_refinement(
     kernel_func: Callable[..., Any],
     input_specs: InputSpecs,
     profile_host: str,
-    cache_dir: Path,
     /,
     *,
-    workload_guidance: str,
     target_score: float | None = None,
+    trace_dir: Path | None = None,
     neuronx_cc_args: tuple[str, ...] = (),
-    reasoning_effort: ReasoningEffort = "high",
+    reasoning_effort: ReasoningEffort = "max",
     max_reasoning_steps: int | None = None,
     profile_timeout_s: int = 1800,
     policy_timeout_s: int = 600,
     lnc: int = 1,
     codex_executable: str = "codex",
 ) -> SearchResult:
-    """Run measured agentic refinement for one decorated nkigym callable."""
-    evaluator = NKIProfileEvaluator(
-        ProfileEvaluatorConfig(
-            host=profile_host,
-            input_specs=input_specs,
-            neuronx_cc_args=neuronx_cc_args,
-            lnc=lnc,
-            timeout_s=profile_timeout_s,
+    """Run measured agentic refinement, retaining artifacts only when requested."""
+    with ExitStack() as stack:
+        cache_dir = trace_dir
+        if cache_dir is None:
+            cache_dir = Path(stack.enter_context(TemporaryDirectory(prefix="nkigym-refinement-")))
+        evaluator = NKIProfileEvaluator(
+            ProfileEvaluatorConfig(
+                host=profile_host,
+                input_specs=input_specs,
+                neuronx_cc_args=neuronx_cc_args,
+                lnc=lnc,
+                timeout_s=profile_timeout_s,
+            )
         )
-    )
-    policy = CodexTransformPolicy(
-        CodexPolicyConfig(executable=codex_executable, reasoning_effort=reasoning_effort, timeout_s=policy_timeout_s)
-    )
-    refinement = ProfilerGuidedRefinement(
-        environment=KernelMDP(kernel_func, input_specs, transforms=public_transforms()),
-        policy=policy,
-        evaluator=evaluator,
-        config=SearchConfig(
-            cache_dir=cache_dir,
-            max_reasoning_steps=max_reasoning_steps,
-            workload_guidance=workload_guidance,
-            target_score=target_score,
-        ),
-    )
-    result = asyncio.run(refinement.run())
+        policy = CodexTransformPolicy(
+            CodexPolicyConfig(
+                executable=codex_executable, reasoning_effort=reasoning_effort, timeout_s=policy_timeout_s
+            )
+        )
+        refinement = ProfilerGuidedRefinement(
+            environment=KernelMDP(kernel_func, input_specs, transforms=public_transforms()),
+            policy=policy,
+            evaluator=evaluator,
+            config=SearchConfig(
+                cache_dir=cache_dir,
+                max_reasoning_steps=max_reasoning_steps,
+                workload_guidance=_workload_guidance(kernel_func, input_specs),
+                target_score=target_score,
+            ),
+        )
+        result = asyncio.run(refinement.run())
     return result
 
 
