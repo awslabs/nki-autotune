@@ -1,11 +1,11 @@
-"""Structural validation for durable develop-nkigym workflow state."""
+"""Structural validation for durable nkigym workflow state."""
 
 from __future__ import annotations
 
 import math
 from pathlib import Path
 
-from develop_nkigym.types import CycleState, GateSpec, RunConfig, RunRecord
+from self_evolve.types import CycleState, GateSpec, RunConfig, RunRecord
 
 AGENTIC_TUNING_GATE_NAME = "agentic-tuning"
 
@@ -128,8 +128,8 @@ def validate_record(record: RunRecord, run_directory: Path) -> None:
     """Check structural invariants needed for deterministic resume."""
     if record.run_directory.expanduser().resolve() != run_directory:
         raise ValueError(f"run record belongs to a different directory: {record.run_directory}")
-    if record.worktree.expanduser().resolve().parent != run_directory:
-        raise ValueError("run worktree must be directly below the run directory")
+    if record.worktree.expanduser().resolve() != record.source_repository.expanduser().resolve():
+        raise ValueError("run checkout must be the source repository")
     if record.program_directory.expanduser().resolve().parent != run_directory:
         raise ValueError("run program directory must be directly below the run directory")
     if not record.worktree.is_dir():

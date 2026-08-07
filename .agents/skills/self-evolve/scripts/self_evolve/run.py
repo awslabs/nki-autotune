@@ -1,17 +1,17 @@
-"""Create durable runs for the develop-nkigym skill."""
+"""Create durable nkigym workflow runs."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-from develop_nkigym.defaults import agentic_tuning_spec, gates
-from develop_nkigym.git import resolve_repository
-from develop_nkigym.types import RunConfig, RunStatus
-from develop_nkigym.workflow import create_run as create_configured_run
 from kernel_library import Workload
 from nkigym.search.profiled_refinement import ReasoningEffort
 from nkigym.search.program import program_from_callable
+from self_evolve.defaults import agentic_tuning_spec, gates
+from self_evolve.git import resolve_repository
+from self_evolve.types import RunConfig, RunStatus
+from self_evolve.workflow import create_run as create_configured_run
 
 _SCHEDULER_OFF_ARGS = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")
 _REASONING_EFFORT: ReasoningEffort = "high"
@@ -25,7 +25,7 @@ def default_artifact_root(repository: Path) -> Path:
     """Return the persistent skill artifact location for a repository."""
     configured = os.environ.get("XDG_STATE_HOME")
     state_root = Path(configured).expanduser() if configured is not None else Path.home() / ".local/state"
-    return state_root / "develop-nkigym" / repository.name
+    return state_root / "self-evolve" / repository.name
 
 
 def create_run(

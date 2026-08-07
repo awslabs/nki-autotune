@@ -335,12 +335,14 @@ class KernelTree:
 
     def parent(self, nid: int) -> int | None:
         """Return the parent of ``nid`` (``None`` for the root)."""
-        preds = list(self.graph.predecessors(nid))
-        if not preds:
+        predecessors = iter(self.graph.predecessors(nid))
+        parent = next(predecessors, None)
+        if parent is None:
             return None
-        if len(preds) > 1:
-            raise ValueError(f"Node {nid} has multiple parents: {preds}")
-        return preds[0]
+        extra_parent = next(predecessors, None)
+        if extra_parent is not None:
+            raise ValueError(f"Node {nid} has multiple parents: {[parent, extra_parent, *predecessors]}")
+        return parent
 
     def ancestors(self, nid: int) -> list[int]:
         """Return ancestors of ``nid``, root-first."""
@@ -354,12 +356,28 @@ class KernelTree:
 
     def descendants(self, nid: int) -> set[int]:
         """Return the set of all transitive descendants of ``nid``."""
-        return set(nx.descendants(self.graph, nid))
+        descendants = {nid}
+        pending = list(self.graph.successors(nid))
+        while pending:
+            descendant = pending.pop()
+            if descendant not in descendants:
+                descendants.add(descendant)
+                pending.extend(self.graph.successors(descendant))
+        descendants.remove(nid)
+        return descendants
 
     def preorder(self, nid: int | None = None) -> Iterator[int]:
         """Yield node ids in pre-order DFS from ``nid`` (default: root)."""
         start = self.root if nid is None else nid
-        yield from nx.dfs_preorder_nodes(self.graph, source=start)
+        pending = [start]
+        visited: set[int] = set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            yield current
+            pending.extend(reversed(tuple(self.graph.successors(current))))
 
     def leaves(self, nid: int | None = None) -> Iterator[int]:
         """Yield leaves (out-degree 0) reachable from ``nid``."""

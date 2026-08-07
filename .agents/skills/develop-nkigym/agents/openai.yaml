@@ -1,4 +1,0 @@
-interface:
-  display_name: "Develop nkigym"
-  short_description: "Repair bugs, then run chosen improvement rounds"
-  default_prompt: "Use $develop-nkigym, ask me how many improvement rounds to run, repair existing bugs, then complete that many focused rounds."

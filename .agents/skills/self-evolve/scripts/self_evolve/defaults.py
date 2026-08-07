@@ -6,9 +6,9 @@ import os
 import sys
 from pathlib import Path
 
-from develop_nkigym.types import GateSpec
 from nkigym.search.agentic_tuning import AgenticTuningSpec
 from nkigym.search.profiled_refinement import ReasoningEffort
+from self_evolve.types import GateSpec
 
 
 def workflow_python() -> str:
@@ -65,8 +65,8 @@ def gates(profile_host: str) -> tuple[GateSpec, ...]:
     test_python = workflow_python()
     configured = (
         GateSpec(
-            name="code-bloat",
-            argv=(test_python, "-m", "pytest", "-q", "test/test_code_bloat.py", "-s"),
+            name="repository-structure",
+            argv=(test_python, "-m", "pytest", "-q", "test/test_repository_structure.py", "-s"),
             working_directory=".",
             timeout_seconds=120,
         ),
@@ -84,7 +84,7 @@ def gates(profile_host: str) -> tuple[GateSpec, ...]:
         ),
         GateSpec(
             name="mfu-regression",
-            argv=(test_python, ".agents/skills/develop-nkigym/scripts/mfu_gate.py"),
+            argv=(test_python, ".agents/skills/self-evolve/scripts/mfu_gate.py"),
             working_directory=".",
             timeout_seconds=7500,
             environment=(("NKI_PROFILE_HOST", profile_host),),

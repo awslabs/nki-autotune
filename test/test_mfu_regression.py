@@ -24,7 +24,7 @@ EXPECTED_ENDPOINTS = {"attention", "matmul-lhs", "matmul-lhs-t", "rmsnorm-matmul
 
 @dataclass(frozen=True)
 class _Endpoint:
-    """One rendered kernel supplied by the develop-nkigym gate."""
+    """One rendered kernel supplied by the workflow gate."""
 
     name: str
     kernel: str

@@ -1,4 +1,4 @@
-"""Command-line support for the repo-local develop-nkigym skill."""
+"""Command-line support for durable nkigym workflows."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from develop_nkigym.run import create_run
-from develop_nkigym.types import RunStatus
-from develop_nkigym.workflow import accept_run, check_run, status_run, tune_run, validate_run
-from develop_nkigym.workloads import load_workload, workload_names
+from self_evolve.run import create_run
+from self_evolve.types import RunStatus
+from self_evolve.workflow import accept_run, check_run, status_run, tune_run, validate_run
+from self_evolve.workloads import load_workload, workload_names
 
 _RUN_COMMANDS: dict[str, Callable[[Path], RunStatus]] = {
     "accept": accept_run,
@@ -30,8 +30,9 @@ def _parser() -> argparse.ArgumentParser:
 
     start_parser = subparsers.add_parser("start", help="create a run from one kernel-library workload")
     start_parser.add_argument("workload", choices=workload_names())
+    start_parser.add_argument("--shape", required=True, help="shape key registered for the workload")
     start_parser.add_argument("--host", required=True, help="SSH destination for the Trn2 profile worker")
-    start_parser.add_argument("--rounds", required=True, type=int, help="number of ordinary improvement cycles")
+    start_parser.add_argument("--rounds", required=True, type=int, help="number of refinement cycles")
     start_parser.add_argument("--artifact-root", type=Path)
     start_parser.add_argument("--base-revision", default="HEAD")
 
@@ -45,7 +46,7 @@ def _dispatch(arguments: argparse.Namespace) -> RunStatus:
     """Execute one parsed command."""
     command = str(arguments.command)
     if command == "start":
-        workload = load_workload(str(arguments.workload))
+        workload = load_workload(str(arguments.workload), str(arguments.shape))
         status = create_run(
             workload,
             str(arguments.host),

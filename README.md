@@ -4,18 +4,25 @@ Build, transform, validate, and remotely profile NKI kernels.
 
 ## Installation
 
-Create the local environment and provision an SSH-accessible Trn2 host:
+Create the local environment and provision an SSH-accessible Trn2 host and CPU
+simulation workers:
 
 ```bash
 cd nki-autotune
-./install.sh --host gym-1
+./install.sh --host \
+  gym-1 \
+  gym-cpu-1 \
+  gym-cpu-2 \
+  gym-cpu-3 \
+  gym-cpu-4
 source ~/venvs/kernel-env/bin/activate
 ```
 
-The installer creates `~/venvs/kernel-env` when missing on both machines,
-installs the local checkout, and installs the profile worker remotely. It
-requires `python3`, `ssh`, and `rsync`; the host must already have the Neuron
-driver, runtime, and tools.
+The installer creates `~/venvs/kernel-env` when missing locally and on each
+host, installs the local checkout, and installs the profile and simulation
+worker dependencies remotely. The `--host` option accepts one or more SSH
+destinations. The installer requires `python3`, `ssh`, and `rsync`; the Trn2
+host must already have the Neuron driver, runtime, and tools.
 
 CPU checks use the official
 [`nki.simulate`](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.simulate.html)
@@ -71,44 +78,58 @@ The supported subset includes 2D transpose and matmul, scalar or per-row
 broadcast arithmetic, common activations, and free-axis sum, maximum, and mean
 reductions. Unsupported operations raise `ValueError`.
 
-## Develop nkigym
+## Agent Workflows
 
-Use the repo-local `$develop-nkigym` Codex skill to improve IR, operations,
-code generation, and transforms from measured search evidence. The skill
-bundles the deterministic Git, tuning, gate, and resume scripts it needs:
+Use `$debug-nkigym` to run the standalone repository tests directly in the
+current checkout and fix implementation bugs until they pass. Use
+`$self-evolve` separately to refine IR, operations, code generation, and
+transforms from measured search feedback. It first runs the standalone tests as
+a read-only health check. If a test fails, it stops and reports the failure
+without repairing it or invoking `$debug-nkigym`. Refinement edits happen
+directly in the current branch checkout. Run artifacts remain under the external
+state directory; no detached Git worktree is created:
 
 ```bash
-python .agents/skills/develop-nkigym/scripts/develop.py start matmul-lhs-t --host gym-1
+python .agents/skills/self-evolve/scripts/develop.py start matmul-lhs-t \
+  --shape m2048_k2048_n2048 \
+  --host gym-1 \
+  --rounds 3
 ```
 
+If a run later reports `mode=repair`, `$self-evolve` stops and reports the
+failure. Debugging requires a separate, explicit `$debug-nkigym` invocation.
+
 The selectable kernel-library workloads are `attention`, `matmul-lhs`,
-`matmul-lhs-t`, and `rmsnorm-matmul`. See the
-[`develop-nkigym` skill](.agents/skills/develop-nkigym/SKILL.md) for the
-five-command workflow and durable resume contract.
+`matmul-lhs-t`, and `rmsnorm-matmul`. Every selection also requires one of
+the shape keys registered for that workload. See the
+[`self-evolve` skill](.agents/skills/self-evolve/SKILL.md) for refinement and
+the [`debug-nkigym` skill](.agents/skills/debug-nkigym/SKILL.md) for repair.
 
 ## Kernel Library
 
-Each kernel-library module defines one `f_nkigym` graph and a fixed transform
-ladder. It dumps, CPU-verifies, and profiles every intermediate kernel:
+Each flat kernel-library module owns one exact `(workload, shape)` tuple,
+including its NumPy reference, input specifications, `f_nkigym` graph, and
+transform ladder. The module dumps, CPU-verifies, and profiles every
+intermediate kernel:
 
 ```bash
 PYTHONPATH=.:nkigym/src \
-  python kernel_library/matmul/lhsT_rhs/ladder.py \
+  python kernel_library/matmul_lhs_t_rhs_m2048_k2048_n2048.py \
   --host gym-1 \
   --cache /tmp/matmul-lhsT-rhs
 
 PYTHONPATH=.:nkigym/src \
-  python kernel_library/matmul/lhs_rhs/ladder.py \
+  python kernel_library/matmul_lhs_rhs_m2048_k2048_n2048.py \
   --host gym-1 \
   --cache /tmp/matmul-lhs-rhs
 
 PYTHONPATH=.:nkigym/src \
-  python kernel_library/rmsnorm_matmul/ladder.py \
+  python kernel_library/rmsnorm_matmul_m2048_k2048_n2048.py \
   --host gym-1 \
   --cache /tmp/rmsnorm-matmul
 
 PYTHONPATH=.:nkigym/src \
-  python kernel_library/attention/ladder.py \
+  python kernel_library/attention_q16384_kv16384_d128.py \
   --host gym-1 \
   --cache /tmp/online-fusion-attention
 ```

@@ -10,16 +10,18 @@ from __future__ import annotations
 import copy
 import itertools
 from dataclasses import dataclass, replace
+from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR, to_affine
 from nkigym.ir.arith.expr import Add, Const, Expr, Var, substitute
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.interval import regions_disjoint
-from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.transforms._access_pattern import tensor_has_access_pattern
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 _EXHAUSTIVE_STAGE_CHILD_LIMIT = 8
+_UNIT_LEAVES: WeakKeyDictionary[KernelTree, dict[int, tuple[int, ...]]] = WeakKeyDictionary()
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
     def analyze(self, ir: KernelIR) -> list[SoftwarePipelineOption]:
         """Enumerate bounded non-decreasing stage labelings for pipelineable loops."""
         options: list[SoftwarePipelineOption] = []
+        buffers = ir.all_buffers()
         for nid in ir.tree.preorder():
             if not isinstance(ir.tree.data(nid), ForNode):
                 continue
@@ -50,7 +53,7 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
                 continue
             for stages in self._nondecreasing_labelings(len(children)):
                 opt = SoftwarePipelineOption(loop_nid=nid, stages=stages)
-                if self._is_legal(ir, opt, children):
+                if self._is_legal(ir, opt, children, buffers):
                     options.append(opt)
         return options
 
@@ -113,11 +116,16 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
                 out.append((0,) * first + (1,) * (second - first) + (2,) * (n - second))
         return out
 
-    def _unit_leaves(self, ir: KernelIR, unit_nid: int) -> list[int]:
+    def _unit_leaves(self, ir: KernelIR, unit_nid: int) -> tuple[int, ...]:
         """ISA-leaf nids inside a stageable unit (a direct loop child) — works
         for a BlockNode child or a ForNode-nest child (the matmul loop nest)."""
-        candidates = [unit_nid, *ir.tree.descendants(unit_nid)]
-        return [d for d in candidates if isinstance(ir.tree.data(d), ISANode)]
+        leaves_by_unit = _UNIT_LEAVES.setdefault(ir.tree, {})
+        leaves = leaves_by_unit.get(unit_nid)
+        if leaves is None:
+            candidates = (unit_nid, *ir.tree.descendants(unit_nid))
+            leaves = tuple(candidate for candidate in candidates if isinstance(ir.tree.data(candidate), ISANode))
+            leaves_by_unit[unit_nid] = leaves
+        return leaves
 
     def _touched_tensors(self, ir: KernelIR, children: list[int]) -> set[str]:
         """Return every tensor touched by the staged units."""
@@ -129,7 +137,9 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
                 touched.update(region.tensor for region in node.operand_bindings.values())
         return touched
 
-    def _is_legal(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> bool:
+    def _is_legal(
+        self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int], buffers: dict[str, Buffer]
+    ) -> bool:
         """Check TVM's two graph rules in intrinsic source order."""
         result = True
         if len(option.stages) != len(children):
@@ -159,7 +169,7 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
                         result = False
                     elif stage_of[src_b] == stage_of[dst_b] and order_of[src_b] >= order_of[dst_b]:
                         result = False
-            if any(ir.buffer(name).versions > 1 for name in self._touched_tensors(ir, children)):
+            if any(buffers[name].versions > 1 for name in self._touched_tensors(ir, children)):
                 result = False
             if self._has_cross_iteration_read_before_write_hazard(ir, option, children):
                 result = False
@@ -291,7 +301,7 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
 
     def _check_legality(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> None:
         """Raise TransformLegalityError if illegal."""
-        if not self._is_legal(ir, option, children):
+        if not self._is_legal(ir, option, children, ir.all_buffers()):
             raise TransformLegalityError(f"illegal software-pipeline option {option}")
 
     def _apply_versions(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> tuple[str, ...]:

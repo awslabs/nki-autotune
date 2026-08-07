@@ -1,4 +1,4 @@
-"""Apply, verify, dump, and profile a fixed attention ladder."""
+"""Apply, verify, dump, and profile the Q16384/KV16384/D128 attention ladder."""
 
 from __future__ import annotations
 
@@ -66,15 +66,17 @@ VALIDATION_QUERY_LENGTH = 512
 SEED = 0
 ATOL = 5e-3
 RTOL = 5e-3
+WORKLOAD_NAME = "attention"
+SHAPE = "q16384_kv16384_d128"
 SCHEDULER_OFF_ARGS = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")
 
 
-def _input_specs(query_length: int) -> InputSpecs:
+def _input_specs(query_length: int, sequence_length: int, head_dim: int) -> InputSpecs:
     """Return pretransposed BF16 attention inputs."""
     return {
-        "query": ((HEAD_DIM, query_length), "bfloat16"),
-        "key": ((HEAD_DIM, SEQUENCE_LENGTH), "bfloat16"),
-        "value": ((SEQUENCE_LENGTH, HEAD_DIM), "bfloat16"),
+        "query": ((head_dim, query_length), "bfloat16"),
+        "key": ((head_dim, sequence_length), "bfloat16"),
+        "value": ((sequence_length, head_dim), "bfloat16"),
     }
 
 
@@ -198,11 +200,10 @@ ACTIONS: tuple[Action, ...] = (
     (BatchPermutation(), BatchPermutationOption(loop_nid=179)),
 )
 
-INPUT_SPECS = _input_specs(SEQUENCE_LENGTH)
+INPUT_SPECS = _input_specs(SEQUENCE_LENGTH, SEQUENCE_LENGTH, HEAD_DIM)
 WORKLOAD = Workload(
     input_specs=INPUT_SPECS, f_numpy=f_numpy, f_nkigym=f_nkigym, best_action_ladder=ACTIONS, historical_best_mfu=46.43
 )
-STEPS: tuple[tuple[Action, ...], ...] = tuple((action,) for action in WORKLOAD.best_action_ladder)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -213,28 +214,22 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _labels() -> list[str]:
+def _labels(workload: Workload) -> list[str]:
     """Return one stable cache label per ladder state."""
     return [
         "00_canonical",
-        *[
-            f"{index:02d}_{'_'.join(type(action[0]).__name__ for action in step)}"
-            for index, step in enumerate(STEPS, 1)
-        ],
+        *[f"{index:02d}_{type(action[0]).__name__}" for index, action in enumerate(workload.best_action_ladder, 1)],
     ]
 
 
-def _build_ladder(input_specs: InputSpecs) -> list[KernelIR]:
+def _build_ladder(workload: Workload, input_specs: InputSpecs) -> list[KernelIR]:
     """Apply every fixed action through one kernel environment."""
     environment = KernelMDP(
-        WORKLOAD.f_nkigym, input_specs, transforms=[transform for transform, _option in WORKLOAD.best_action_ladder]
+        workload.f_nkigym, input_specs, transforms=[transform for transform, _option in workload.best_action_ladder]
     )
     states = [environment.reset()]
-    state = states[0]
-    for step in STEPS:
-        for action in step:
-            state = environment.step(state, action)
-        states.append(state)
+    for action in workload.best_action_ladder:
+        states.append(environment.step(states[-1], action))
     return states
 
 
@@ -248,14 +243,23 @@ def _load_kernel(path: Path, module_name: str) -> ModuleType:
     return module
 
 
-def _verify_and_dump(states: list[KernelIR], cache: Path) -> dict[str, float]:
+def _validation_input_specs(workload: Workload) -> InputSpecs:
+    """Use a bounded query length while preserving the selected KV shape."""
+    query_shape, _query_dtype = workload.input_specs["query"]
+    key_shape, _key_dtype = workload.input_specs["key"]
+    query_length = min(VALIDATION_QUERY_LENGTH, query_shape[1])
+    return _input_specs(query_length, key_shape[1], query_shape[0])
+
+
+def _verify_and_dump(
+    workload: Workload, input_specs: InputSpecs, states: list[KernelIR], cache: Path
+) -> dict[str, float]:
     """Dump and CPU-verify every validation-shaped state."""
-    input_specs = _input_specs(VALIDATION_QUERY_LENGTH)
     rng = np.random.default_rng(SEED)
     inputs = {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in input_specs.items()}
-    expected = WORKLOAD.f_numpy(**inputs)
+    expected = workload.f_numpy(**inputs)
     errors: dict[str, float] = {}
-    for index, (label, state) in enumerate(zip(_labels(), states, strict=True)):
+    for index, (label, state) in enumerate(zip(_labels(workload), states, strict=True)):
         state_dir = cache / "kernels" / label
         state.dump(state_dir)
         module = _load_kernel(state_dir / "kernel.py", f"online_fusion_attention_{index}")
@@ -270,19 +274,18 @@ def _verify_and_dump(states: list[KernelIR], cache: Path) -> dict[str, float]:
     return errors
 
 
-def _profile(states: list[KernelIR], cache: Path, host: str) -> dict[str, object]:
+def _profile(workload: Workload, states: list[KernelIR], cache: Path, host: str) -> dict[str, object]:
     """Profile every production-shaped state through SSH."""
-    input_specs = WORKLOAD.input_specs
     profile_dir = cache / "mfu"
     measurements: dict[str, dict[str, float]] = {}
     failures: dict[str, str] = {}
-    for label, state in zip(_labels(), states, strict=True):
+    for label, state in zip(_labels(workload), states, strict=True):
         try:
             mfu_percent, latency_ms = profile(
                 host=host,
                 kernel=render(state),
                 func_name="nki_f_nkigym",
-                input_specs=input_specs,
+                input_specs=workload.input_specs,
                 cache_dir=profile_dir / label,
                 neuronx_cc_args=SCHEDULER_OFF_ARGS,
             )
@@ -294,7 +297,7 @@ def _profile(states: list[KernelIR], cache: Path, host: str) -> dict[str, object
     (profile_dir / "results.json").write_text(
         json.dumps({"successes": measurements, "failures": failures}, indent=2) + "\n", encoding="utf-8"
     )
-    final_label = _labels()[-1]
+    final_label = _labels(workload)[-1]
     if final_label not in measurements:
         raise RuntimeError(f"final state did not profile successfully: {failures[final_label]}")
     return {"successes": measurements, "failure_count": len(failures), "results": "mfu/results.json"}
@@ -307,14 +310,17 @@ def _main() -> None:
     shutil.rmtree(cache, ignore_errors=True)
     cache.mkdir(parents=True)
 
-    validation_states = _build_ladder(_input_specs(VALIDATION_QUERY_LENGTH))
-    errors = _verify_and_dump(validation_states, cache)
+    validation_input_specs = _validation_input_specs(WORKLOAD)
+    validation_states = _build_ladder(WORKLOAD, validation_input_specs)
+    errors = _verify_and_dump(WORKLOAD, validation_input_specs, validation_states, cache)
     summary: dict[str, object] = {
+        "workload": WORKLOAD_NAME,
+        "shape": SHAPE,
         "states": len(validation_states),
         "accuracy": {"passed": len(errors), "max_abs_error": max(errors.values()), "kernels": "kernels/"},
     }
-    profile_states = _build_ladder(WORKLOAD.input_specs)
-    summary["profile"] = _profile(profile_states, cache, args.host)
+    profile_states = _build_ladder(WORKLOAD, WORKLOAD.input_specs)
+    summary["profile"] = _profile(WORKLOAD, profile_states, cache, args.host)
     (cache / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))
 

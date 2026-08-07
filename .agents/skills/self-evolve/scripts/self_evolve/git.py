@@ -1,4 +1,4 @@
-"""Helpers for Git worktree isolation and candidate snapshots."""
+"""Helpers for Git repository discovery and candidate snapshots."""
 
 from __future__ import annotations
 
@@ -59,25 +59,9 @@ def resolve_revision(repository: Path, revision: str) -> str:
     return sha
 
 
-def create_detached_worktree(repository: Path, worktree: Path, base_sha: str, initial_tree: str) -> None:
-    """Create a detached worktree containing an exact workspace tree."""
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    _run_git(repository, ("worktree", "add", "--detach", str(worktree), base_sha))
-    _run_git(worktree, ("read-tree", "--reset", "-u", initial_tree))
-    set_worktree_baseline(worktree, initial_tree)
-
-
-def set_worktree_baseline(worktree: Path, baseline_tree: str) -> None:
-    """Track an exact candidate tree as the worktree's editing baseline."""
-    remaining = snapshot_candidate(worktree, baseline_tree)
-    if remaining.changed_files:
-        raise GitCommandError(f"candidate worktree does not match baseline tree: {remaining.changed_files}")
-    _run_git(worktree, ("read-tree", baseline_tree))
-
-
 def create_candidate_tree(worktree: Path, baseline: str) -> str:
     """Write and retain the current workspace as a Git tree without changing its index."""
-    with tempfile.TemporaryDirectory(prefix="develop-nkigym-candidate-index-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="self-evolve-candidate-index-") as temporary:
         environment = dict(os.environ)
         environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
         _run_git(worktree, ("read-tree", baseline), environment)
@@ -105,7 +89,7 @@ def _diff_stats(worktree: Path, base_sha: str, environment: dict[str, str]) -> t
 
 def snapshot_candidate(worktree: Path, base_sha: str) -> CandidateSnapshot:
     """Capture all committed, staged, unstaged, and non-ignored new changes."""
-    with tempfile.TemporaryDirectory(prefix="develop-nkigym-snapshot-index-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="self-evolve-snapshot-index-") as temporary:
         environment = dict(os.environ)
         environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
         _run_git(worktree, ("read-tree", base_sha), environment)

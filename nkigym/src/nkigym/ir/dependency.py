@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from weakref import WeakKeyDictionary
 
 import networkx as nx
 
@@ -26,6 +27,12 @@ from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 _HAZARD_PRIORITY: dict[str, int] = {"RAW": 3, "WAW": 2, "WAR": 1}
+_LEAF_OPERAND_REGIONS: WeakKeyDictionary[KernelTree, dict[tuple[int, str, bool], tuple[BufferRegion, ...]]] = (
+    WeakKeyDictionary()
+)
+_ACCESS_INVARIANTS: WeakKeyDictionary[KernelTree, dict[tuple[int, str, str], bool]] = WeakKeyDictionary()
+_CARRIED_TENSORS: WeakKeyDictionary[KernelTree, dict[tuple[int, str], bool]] = WeakKeyDictionary()
+_Topology = tuple[dict[int, int], dict[int, tuple[int, ...]], dict[int, frozenset[int]]]
 
 
 @dataclass(frozen=True)
@@ -127,7 +134,7 @@ class Dependency:
         return self._first_backward(moved_leaf_nid, span, eval_tree, enclosing_loops)
 
     def first_backward_edge_for_insertion(
-        self, moved_leaf_nid: int, target_loop_nid: int, index: int
+        self, moved_leaf_nid: int, target_loop_nid: int, index: int, topology: _Topology | None = None
     ) -> tuple[int, int] | None:
         """Pure ordering check for splicing ``moved_leaf_nid`` under
         ``target_loop_nid`` at child slot ``index`` — no tree mutation.
@@ -159,8 +166,11 @@ class Dependency:
         TARGET's nest (``target_loop_nid`` + its ForNode ancestors), since the
         splice makes it their descendant; every other endpoint keeps its own
         ``self._tree`` ForNode ancestors minus the moved subtree.
+
+        ``topology`` may provide a snapshot already validated by a read-only
+        analysis pass, avoiding repeated graph mutation checks for each slot.
         """
-        order, ancestors, descendants = self._topology()
+        order, ancestors, descendants = self._topology() if topology is None else topology
         owner_block = self._owner_block.get(moved_leaf_nid, moved_leaf_nid)
         moved_subtree = set(descendants[owner_block]) | {owner_block}
         moved_pos = self._effective_insertion_position(order, descendants, target_loop_nid, index, moved_subtree)
@@ -186,7 +196,7 @@ class Dependency:
 
         return self._first_backward(moved_leaf_nid, span, self._tree, enclosing_loops)
 
-    def _topology(self) -> tuple[dict[int, int], dict[int, tuple[int, ...]], dict[int, frozenset[int]]]:
+    def _topology(self) -> _Topology:
         """Return cached topology or rebuild it when callers mutate the tree."""
         current_nodes = frozenset(self._tree.graph.nodes)
         current_edges = frozenset(self._tree.graph.edges)
@@ -435,7 +445,7 @@ def _rmw_operand_slots(node: ISANode) -> frozenset[str]:
     return frozenset(slots)
 
 
-def _leaf_operand_regions(tree: KernelTree, leaf_nid: int, tensor: str, rmw_only: bool) -> list[BufferRegion]:
+def _leaf_operand_regions(tree: KernelTree, leaf_nid: int, tensor: str, rmw_only: bool) -> tuple[BufferRegion, ...]:
     """Regions of ``tensor`` bound by ``leaf_nid``'s operands.
 
     With ``rmw_only`` True, only statically RMW slots or explicitly aliased
@@ -443,14 +453,20 @@ def _leaf_operand_regions(tree: KernelTree, leaf_nid: int, tensor: str, rmw_only
     ``tensor_tensor(data1=acc, dst=acc)`` without declaring every SSA
     ``tensor_tensor`` operation read-modify-write.
     """
-    data = tree.data(leaf_nid)
-    regions: list[BufferRegion] = []
-    if isinstance(data, ISANode):
-        slots = _rmw_operand_slots(data) if rmw_only else data.operand_bindings.keys()
-        for slot in slots:
-            region = data.operand_bindings.get(slot)
-            if region is not None and region.tensor == tensor:
-                regions.append(region)
+    cache = _LEAF_OPERAND_REGIONS.setdefault(tree, {})
+    key = (leaf_nid, tensor, rmw_only)
+    regions = cache.get(key)
+    if regions is None:
+        data = tree.data(leaf_nid)
+        selected: list[BufferRegion] = []
+        if isinstance(data, ISANode):
+            slots = _rmw_operand_slots(data) if rmw_only else data.operand_bindings.keys()
+            for slot in slots:
+                region = data.operand_bindings.get(slot)
+                if region is not None and region.tensor == tensor:
+                    selected.append(region)
+        regions = tuple(selected)
+        cache[key] = regions
     return regions
 
 
@@ -462,12 +478,17 @@ def _access_invariant_across(tree: KernelTree, leaf_nid: int, loop_var: str, ten
     slice (a live-across / replicated access). A leaf that touches no such region
     is NOT invariant (there is no access to be invariant about).
     """
-    regions = _leaf_operand_regions(tree, leaf_nid, tensor, rmw_only=False)
-    invariant = bool(regions)
-    for region in regions:
-        if any(loop_var in to_affine(lo) for lo, _w in region.ranges):
-            invariant = False
-            break
+    cache = _ACCESS_INVARIANTS.setdefault(tree, {})
+    key = (leaf_nid, loop_var, tensor)
+    invariant = cache.get(key)
+    if invariant is None:
+        regions = _leaf_operand_regions(tree, leaf_nid, tensor, rmw_only=False)
+        invariant = bool(regions)
+        for region in regions:
+            if any(loop_var in to_affine(lo) for lo, _w in region.ranges):
+                invariant = False
+                break
+        cache[key] = invariant
     return invariant
 
 
@@ -488,31 +509,37 @@ def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool
     static or explicitly aliased RMW operands only, never the axis role
     (RFactor flips ko/ki to PARALLEL yet psum still carries across ki).
     """
-    loop = tree.data(loop_nid)
-    assert isinstance(loop, ForNode), f"_tensor_carried_across: {loop_nid} is not a ForNode"
-    loop_var = loop.loop_var
-    has_invariant_rmw = False
-    has_enclosed_init = False
-    for nid in tree.descendants(loop_nid):
-        data = tree.data(nid)
-        if not isinstance(data, ISANode):
-            continue
-        rmw_regions = _leaf_operand_regions(tree, nid, tensor, rmw_only=True)
-        if rmw_regions and not any(loop_var in to_affine(lo) for region in rmw_regions for lo, _w in region.ranges):
-            has_invariant_rmw = True
-        if rmw_regions:
-            continue
-        rmw_slots = _rmw_operand_slots(data)
-        for slot, region in data.operand_bindings.items():
-            if region.tensor != tensor:
+    cache = _CARRIED_TENSORS.setdefault(tree, {})
+    key = (loop_nid, tensor)
+    carried = cache.get(key)
+    if carried is None:
+        loop = tree.data(loop_nid)
+        assert isinstance(loop, ForNode), f"_tensor_carried_across: {loop_nid} is not a ForNode"
+        loop_var = loop.loop_var
+        has_invariant_rmw = False
+        has_enclosed_init = False
+        for nid in tree.descendants(loop_nid):
+            data = tree.data(nid)
+            if not isinstance(data, ISANode):
                 continue
-            if slot in rmw_slots:
+            rmw_regions = _leaf_operand_regions(tree, nid, tensor, rmw_only=True)
+            if rmw_regions and not any(loop_var in to_affine(lo) for region in rmw_regions for lo, _w in region.ranges):
+                has_invariant_rmw = True
+            if rmw_regions:
                 continue
-            if slot in getattr(data.op_cls, "INPUT_OPERANDS", frozenset()):
-                continue
-            if not any(loop_var in to_affine(lo) for lo, _w in region.ranges):
-                has_enclosed_init = True
-    return has_invariant_rmw and not has_enclosed_init
+            rmw_slots = _rmw_operand_slots(data)
+            for slot, region in data.operand_bindings.items():
+                if region.tensor != tensor:
+                    continue
+                if slot in rmw_slots:
+                    continue
+                if slot in getattr(data.op_cls, "INPUT_OPERANDS", frozenset()):
+                    continue
+                if not any(loop_var in to_affine(lo) for lo, _w in region.ranges):
+                    has_enclosed_init = True
+        carried = has_invariant_rmw and not has_enclosed_init
+        cache[key] = carried
+    return carried
 
 
 def _promoted_span(

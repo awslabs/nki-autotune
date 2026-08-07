@@ -12,7 +12,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
-from develop_nkigym.types import GateResult, GateSpec
+from self_evolve.types import GateResult, GateSpec
 
 _TIMEOUT_EXIT_CODE = 124
 _START_FAILURE_EXIT_CODE = 127

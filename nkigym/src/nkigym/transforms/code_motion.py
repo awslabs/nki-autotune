@@ -19,6 +19,7 @@ import copy
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from math import prod
+from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Expr, Var, substitute, to_affine
@@ -60,6 +61,66 @@ class _AnalysisContext:
 
     versioned_by_block: dict[int, frozenset[str]]
     pipeline_loops: tuple[int, ...]
+    topology: tuple[dict[int, int], dict[int, tuple[int, ...]], dict[int, frozenset[int]]]
+
+
+_ANCESTORS: WeakKeyDictionary[KernelTree, dict[int, tuple[int, ...]]] = WeakKeyDictionary()
+_DESCENDANTS: WeakKeyDictionary[KernelTree, dict[int, frozenset[int]]] = WeakKeyDictionary()
+_PREORDERS: WeakKeyDictionary[KernelTree, dict[int | None, tuple[int, ...]]] = WeakKeyDictionary()
+_OWNING_BLOCKS: WeakKeyDictionary[KernelTree, dict[int, int]] = WeakKeyDictionary()
+_OWNED_LEAVES: WeakKeyDictionary[KernelTree, dict[int, int]] = WeakKeyDictionary()
+_LOOP_STRIDES: WeakKeyDictionary[KernelTree, dict[tuple[int, int], Fraction]] = WeakKeyDictionary()
+_CROSSED_LOOPS: WeakKeyDictionary[KernelTree, dict[tuple[int, int, _PrefixPlan], tuple[int, ...]]] = WeakKeyDictionary()
+_TARGET_LOOPS: WeakKeyDictionary[KernelTree, dict[int, tuple[int, ...]]] = WeakKeyDictionary()
+_LOCAL_LOOPS: WeakKeyDictionary[KernelTree, dict[int, tuple[int, ...]]] = WeakKeyDictionary()
+_BOUND_DIMS: WeakKeyDictionary[KernelTree, dict[int, dict[str, str]]] = WeakKeyDictionary()
+
+
+def _ancestors(tree: KernelTree, nid: int) -> tuple[int, ...]:
+    """Return one cached root-first ancestor chain."""
+    cache = _ANCESTORS.setdefault(tree, {})
+    ancestors = cache.get(nid)
+    if ancestors is None:
+        ancestors = tuple(tree.ancestors(nid))
+        cache[nid] = ancestors
+    return ancestors
+
+
+def _descendants(tree: KernelTree, nid: int) -> frozenset[int]:
+    """Return one cached descendant set."""
+    cache = _DESCENDANTS.setdefault(tree, {})
+    descendants = cache.get(nid)
+    if descendants is None:
+        descendants = frozenset(tree.descendants(nid))
+        cache[nid] = descendants
+    return descendants
+
+
+def _preorder(tree: KernelTree, nid: int | None = None) -> tuple[int, ...]:
+    """Return one cached preorder traversal."""
+    cache = _PREORDERS.setdefault(tree, {})
+    preorder = cache.get(nid)
+    if preorder is None:
+        preorder = tuple(tree.preorder(nid))
+        cache[nid] = preorder
+    return preorder
+
+
+def _clear_analysis_cache(tree: KernelTree) -> None:
+    """Discard cached structural facts after mutating ``tree``."""
+    for cache in (
+        _ANCESTORS,
+        _DESCENDANTS,
+        _PREORDERS,
+        _OWNING_BLOCKS,
+        _OWNED_LEAVES,
+        _LOOP_STRIDES,
+        _CROSSED_LOOPS,
+        _TARGET_LOOPS,
+        _LOCAL_LOOPS,
+        _BOUND_DIMS,
+    ):
+        cache.pop(tree, None)
 
 
 def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> None:
@@ -87,6 +148,7 @@ def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> Non
         _splice_under_target(tree, block_nid, target_loop_nid, index)
         normalize_block(tree, block_nid)
     _assert_single_parent(tree)
+    _clear_analysis_cache(tree)
 
 
 def _prepare_block_for_splice(tree: KernelTree, block_nid: int, plan: _PrefixPlan) -> None:
@@ -165,33 +227,32 @@ def _target_loop_seq(tree: KernelTree, target_loop_nid: int) -> list[tuple[str, 
     interleaved), built from the ancestor chain — not the per-dim-grouped map, which
     loses interleave order. This is the prefix the moved block must match.
     """
-    chain = [*tree.ancestors(target_loop_nid), target_loop_nid]
-    return [(node.loop_var, node.extent) for n in chain if isinstance((node := tree.data(n)), ForNode)]
-
-
-def _moved_loop_seq(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
-    """Ordered ``(loop_var, extent)`` of the moved block's full loop nest.
-
-    Outermost→innermost: the ForNodes enclosing the block (above it) followed by the
-    block-local loop chain (inside it, down to the single ISA leaf). True tree order.
-    """
-    leaf = next(d for d in tree.preorder(block_nid) if isinstance(tree.data(d), ISANode))
-    chain = [*tree.ancestors(leaf), leaf]
+    chain = [*_ancestors(tree, target_loop_nid), target_loop_nid]
     return [(node.loop_var, node.extent) for n in chain if isinstance((node := tree.data(n)), ForNode)]
 
 
 def _target_loop_nids(tree: KernelTree, target_loop_nid: int) -> list[int]:
     """ForNode nids from the outermost target ancestor through the target."""
-    chain = [*tree.ancestors(target_loop_nid), target_loop_nid]
-    return [nid for nid in chain if isinstance(tree.data(nid), ForNode)]
+    cache = _TARGET_LOOPS.setdefault(tree, {})
+    target_nids = cache.get(target_loop_nid)
+    if target_nids is None:
+        chain = [*_ancestors(tree, target_loop_nid), target_loop_nid]
+        target_nids = tuple(nid for nid in chain if isinstance(tree.data(nid), ForNode))
+        cache[target_loop_nid] = target_nids
+    return list(target_nids)
 
 
 def _local_loop_nids(tree: KernelTree, block_nid: int) -> list[int]:
     """Block-local ForNode nids in execution order."""
-    leaf = next(nid for nid in tree.preorder(block_nid) if isinstance(tree.data(nid), ISANode))
-    chain = tree.ancestors(leaf)
-    start = chain.index(block_nid) + 1
-    return [nid for nid in chain[start:] if isinstance(tree.data(nid), ForNode)]
+    cache = _LOCAL_LOOPS.setdefault(tree, {})
+    local_nids = cache.get(block_nid)
+    if local_nids is None:
+        leaf = next(nid for nid in _preorder(tree, block_nid) if isinstance(tree.data(nid), ISANode))
+        chain = _ancestors(tree, leaf)
+        start = chain.index(block_nid) + 1
+        local_nids = tuple(nid for nid in chain[start:] if isinstance(tree.data(nid), ForNode))
+        cache[block_nid] = local_nids
+    return list(local_nids)
 
 
 def _bound_loop_dims(block: BlockNode) -> dict[str, str]:
@@ -204,33 +265,55 @@ def _bound_loop_dims(block: BlockNode) -> dict[str, str]:
     return result
 
 
+def _cached_bound_loop_dims(tree: KernelTree, block_nid: int) -> dict[str, str]:
+    """Return cached loop-variable dimensions for one block."""
+    cache = _BOUND_DIMS.setdefault(tree, {})
+    dimensions = cache.get(block_nid)
+    if dimensions is None:
+        dimensions = _bound_loop_dims(tree.block(block_nid))
+        cache[block_nid] = dimensions
+    return dimensions
+
+
 def _owning_block(tree: KernelTree, nid: int) -> int:
     """Return the nearest BlockNode ancestor that owns ``nid``."""
-    owner: int | None = None
-    for ancestor in reversed(tree.ancestors(nid)):
-        if isinstance(tree.data(ancestor), BlockNode):
-            owner = ancestor
-            break
+    cache = _OWNING_BLOCKS.setdefault(tree, {})
+    owner = cache.get(nid)
     if owner is None:
-        raise TransformLegalityError(f"node {nid} has no enclosing BlockNode")
+        owner = next(
+            (ancestor for ancestor in reversed(_ancestors(tree, nid)) if isinstance(tree.data(ancestor), BlockNode)),
+            None,
+        )
+        if owner is None:
+            raise TransformLegalityError(f"node {nid} has no enclosing BlockNode")
+        cache[nid] = owner
     return owner
 
 
 def _owned_leaf(tree: KernelTree, block_nid: int) -> int:
     """Return the ISA leaf directly owned by ``block_nid``."""
-    owned: list[int] = []
-    for nid in tree.preorder(block_nid):
-        if not isinstance(tree.data(nid), ISANode):
-            continue
-        if _owning_block(tree, nid) == block_nid:
-            owned.append(nid)
-    if len(owned) != 1:
-        raise TransformLegalityError(f"block {block_nid} must own exactly one ISA leaf; found {owned}")
-    return owned[0]
+    cache = _OWNED_LEAVES.setdefault(tree, {})
+    leaf = cache.get(block_nid)
+    if leaf is None:
+        owned = [
+            nid
+            for nid in _preorder(tree, block_nid)
+            if isinstance(tree.data(nid), ISANode) and _owning_block(tree, nid) == block_nid
+        ]
+        if len(owned) != 1:
+            raise TransformLegalityError(f"block {block_nid} must own exactly one ISA leaf; found {owned}")
+        leaf = owned[0]
+        cache[block_nid] = leaf
+    return leaf
 
 
 def _loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fraction:
     """Return one bound loop's logical element stride in ``block_nid``."""
+    cache = _LOOP_STRIDES.setdefault(tree, {})
+    key = (block_nid, loop_nid)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
     block = tree.block(block_nid)
     loop_var = tree.loop(loop_nid).loop_var
     matches = [
@@ -246,7 +329,7 @@ def _loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fra
     bound_names = {name for name in affine if name is not None}
     leaf = _owned_leaf(tree, block_nid)
     extents: dict[str, int] = {}
-    for nid in tree.ancestors(leaf):
+    for nid in _ancestors(tree, leaf):
         node = tree.data(nid)
         if not isinstance(node, ForNode) or node.loop_var not in bound_names:
             continue
@@ -259,17 +342,19 @@ def _loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fra
     if missing:
         raise TransformLegalityError(f"block {block_nid} has no execution loops for bindings {sorted(missing)}")
     domain_extent = iter_var.dom[1] - iter_var.dom[0]
-    return Fraction(affine[loop_var] * domain_extent, prod(extents.values()))
+    stride = Fraction(affine[loop_var] * domain_extent, prod(extents.values()))
+    cache[key] = stride
+    return stride
 
 
 def _prefix_plan(tree: KernelTree, block_nid: int, target_loop_nid: int) -> _PrefixPlan:
     """Match target loops to the moved block's bound prefix by dimension and extent."""
     target_nids = _target_loop_nids(tree, target_loop_nid)
     local_nids = _local_loop_nids(tree, block_nid)
-    leaf = next(nid for nid in tree.preorder(block_nid) if isinstance(tree.data(nid), ISANode))
-    moved_nids = [nid for nid in tree.ancestors(leaf) if isinstance(tree.data(nid), ForNode)]
+    leaf = next(nid for nid in _preorder(tree, block_nid) if isinstance(tree.data(nid), ISANode))
+    moved_nids = [nid for nid in _ancestors(tree, leaf) if isinstance(tree.data(nid), ForNode)]
     enclosing_nids = set(moved_nids) - set(local_nids)
-    bound_dims = _bound_loop_dims(tree.block(block_nid))
+    bound_dims = _cached_bound_loop_dims(tree, block_nid)
     dependent_dims = set(bound_dims.values())
     bound_nids = [nid for nid in moved_nids if tree.loop(nid).loop_var in bound_dims]
     matched: list[tuple[int, int]] = []
@@ -302,7 +387,7 @@ def _prefix_plan(tree: KernelTree, block_nid: int, target_loop_nid: int) -> _Pre
             )
         if moved_nid != target_nid:
             target_block_nid = _owning_block(tree, target_nid)
-            target_bound_dims = _bound_loop_dims(tree.block(target_block_nid))
+            target_bound_dims = _cached_bound_loop_dims(tree, target_block_nid)
             if target_loop.loop_var in target_bound_dims:
                 moved_stride = _loop_element_stride(tree, block_nid, moved_nid)
                 target_stride = _loop_element_stride(tree, target_block_nid, target_nid)
@@ -387,7 +472,7 @@ def _check_no_mutating_input_replicated(
     moved_leaf = ir.dependency._resolve(block_nid)
     moved_reads = ir.dependency.info(moved_leaf).read_regions
     for loop_nid in duplicated_target_nids:
-        for writer in ir.tree.preorder(loop_nid):
+        for writer in _preorder(ir.tree, loop_nid):
             if not isinstance(ir.tree.data(writer), ISANode):
                 continue
             if not ir.dependency.must_precede(moved_leaf, writer):
@@ -433,8 +518,13 @@ def _check_no_reduction_replicated(
 def _crossed_execution_loops(ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan) -> list[int]:
     """Return loops added to or removed from the moved leaf's execution scope."""
     tree = ir.tree
+    cache = _CROSSED_LOOPS.setdefault(tree, {})
+    key = (block_nid, target_loop_nid, plan)
+    cached = cache.get(key)
+    if cached is not None:
+        return list(cached)
     leaf = ir.dependency._resolve(block_nid)
-    old_loops = [nid for nid in tree.ancestors(leaf) if isinstance(tree.data(nid), ForNode)]
+    old_loops = [nid for nid in _ancestors(tree, leaf) if isinstance(tree.data(nid), ForNode)]
     local_prefix_drop = len(plan.matched_local_nids)
     new_loops = [*plan.target_loop_nids, *plan.local_loop_nids[local_prefix_drop:]]
 
@@ -447,6 +537,7 @@ def _crossed_execution_loops(ir: KernelIR, block_nid: int, target_loop_nid: int,
         else:
             unmatched_new.pop(match)
     crossed.extend(unmatched_new)
+    cache[key] = tuple(crossed)
     return crossed
 
 
@@ -464,7 +555,7 @@ def _plain_written_tensors(node: ISANode) -> set[str]:
 def _rmw_value_spans_loop(ir: KernelIR, rmw_leaf: int, loop_nid: int, tensor: str) -> bool:
     """Return whether a RAW consumer observes values from multiple iterations."""
     loop = ir.tree.loop(loop_nid)
-    loop_descendants = ir.tree.descendants(loop_nid)
+    loop_descendants = _descendants(ir.tree, loop_nid)
     spans = any(
         attrs.get("kind") == "RAW"
         and attrs.get("tensor") == tensor
@@ -507,7 +598,7 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
             for loop_nid in crossed_loops:
                 loop = tree.data(loop_nid)
                 assert isinstance(loop, ForNode)
-                if consumer not in tree.descendants(loop_nid):
+                if consumer not in _descendants(tree, loop_nid):
                     continue
                 if not _access_invariant_across(tree, moved_leaf, loop.loop_var, tensor):
                     continue
@@ -532,7 +623,7 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
         for loop_nid in crossed_loops:
             loop = tree.data(loop_nid)
             assert isinstance(loop, ForNode)
-            if producer not in tree.descendants(loop_nid):
+            if producer not in _descendants(tree, loop_nid):
                 continue
             if not _access_invariant_across(tree, producer, loop.loop_var, tensor):
                 continue
@@ -555,7 +646,7 @@ def _loop_reinitializes_tensor(tree: KernelTree, loop_nid: int, tensor: str, exc
         and isinstance((node := tree.data(nid)), ISANode)
         and tensor in _plain_written_tensors(node)
         and _access_invariant_across(tree, nid, loop.loop_var, tensor)
-        for nid in tree.descendants(loop_nid)
+        for nid in _descendants(tree, loop_nid)
     )
     return result
 
@@ -566,14 +657,14 @@ def _check_no_consumer_hoisted_out_of_producer_loop(
     """Reject hoisting a consumer away from a repeated invariant producer."""
     tree = ir.tree
     moved_leaf = ir.dependency._resolve(block_nid)
-    old_loops = set(tree.ancestors(moved_leaf))
+    old_loops = set(_ancestors(tree, moved_leaf))
     crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid, plan)
     for producer, _consumer, attrs in ir.dependency.graph.in_edges(moved_leaf, data=True):
         tensor = attrs.get("tensor")
         if tensor is None:
             continue
         for loop_nid in crossed_loops:
-            if loop_nid not in old_loops or producer not in tree.descendants(loop_nid):
+            if loop_nid not in old_loops or producer not in _descendants(tree, loop_nid):
                 continue
             loop = tree.data(loop_nid)
             assert isinstance(loop, ForNode)
@@ -611,14 +702,14 @@ def _check_no_producer_moved_out_of_consumer_loop(
     """Reject moving a producer away from a consumer sharing its invariant slice."""
     tree = ir.tree
     moved_leaf = ir.dependency._resolve(block_nid)
-    old_loops = set(tree.ancestors(moved_leaf))
+    old_loops = set(_ancestors(tree, moved_leaf))
     crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid, plan)
     for _producer, consumer, attrs in ir.dependency.graph.out_edges(moved_leaf, data=True):
         tensor = attrs.get("tensor")
         if tensor is None:
             continue
         for loop_nid in crossed_loops:
-            if loop_nid not in old_loops or consumer not in tree.descendants(loop_nid):
+            if loop_nid not in old_loops or consumer not in _descendants(tree, loop_nid):
                 continue
             loop = tree.data(loop_nid)
             assert isinstance(loop, ForNode)
@@ -683,12 +774,16 @@ def _check_move_scope_changes(ir: KernelIR, block_nid: int, target_loop_nid: int
 
 def _analysis_context(ir: KernelIR, block_nids: list[int]) -> _AnalysisContext:
     """Collect versioned tensors and pipeline loops once for one analysis."""
+    topology = ir.dependency._topology()
+    _ANCESTORS[ir.tree] = topology[1]
+    _DESCENDANTS[ir.tree] = topology[2]
+    _PREORDERS[ir.tree] = {None: tuple(sorted(topology[0], key=topology[0].__getitem__))}
     buffers = ir.all_buffers()
     versioned_names = {name for name, buffer in buffers.items() if buffer.versions > 1}
     versioned_by_block: dict[int, frozenset[str]] = {}
     for block_nid in block_nids:
         touched: set[str] = set()
-        for nid in [block_nid, *ir.tree.descendants(block_nid)]:
+        for nid in [block_nid, *_descendants(ir.tree, block_nid)]:
             node = ir.tree.data(nid)
             if isinstance(node, ISANode):
                 touched.update(region.tensor for region in node.operand_bindings.values())
@@ -698,7 +793,7 @@ def _analysis_context(ir: KernelIR, block_nids: list[int]) -> _AnalysisContext:
         for nid in ir.tree.blocks()
         if (annotation := ir.tree.block(nid).annotations.get("software_pipeline")) is not None
     )
-    return _AnalysisContext(versioned_by_block=versioned_by_block, pipeline_loops=pipeline_loops)
+    return _AnalysisContext(versioned_by_block=versioned_by_block, pipeline_loops=pipeline_loops, topology=topology)
 
 
 def _check_versioned_pipeline_boundary(
@@ -710,8 +805,8 @@ def _check_versioned_pipeline_boundary(
     versioned = context.versioned_by_block[block_nid]
     if not versioned:
         return
-    old_ancestors = set(ir.tree.ancestors(block_nid))
-    new_ancestors = set(ir.tree.ancestors(target_loop_nid)) | {target_loop_nid}
+    old_ancestors = set(_ancestors(ir.tree, block_nid))
+    new_ancestors = set(_ancestors(ir.tree, target_loop_nid)) | {target_loop_nid}
     for pipeline_loop in context.pipeline_loops:
         if (pipeline_loop in old_ancestors) != (pipeline_loop in new_ancestors):
             raise TransformLegalityError(
@@ -809,11 +904,11 @@ class CodeMotion(Transform[CodeMotionOption]):
             nid
             for nid in ir.tree.blocks()
             if nid != ir.tree.root
-            and sum(1 for d in ir.tree.descendants(nid) if isinstance(ir.tree.data(d), ISANode)) == 1
+            and sum(1 for d in _descendants(ir.tree, nid) if isinstance(ir.tree.data(d), ISANode)) == 1
         ]
         context = _analysis_context(ir, leaf_blocks)
         for block_nid in leaf_blocks:
-            for target_nid in ir.tree.preorder():
+            for target_nid in _preorder(ir.tree):
                 if not isinstance(ir.tree.data(target_nid), ForNode):
                     continue
                 indices = self._legal_indices(ir, block_nid, target_nid)
@@ -828,7 +923,12 @@ class CodeMotion(Transform[CodeMotionOption]):
                     continue
                 for index in indices:
                     moved_leaf = ir.dependency._resolve(block_nid)
-                    if ir.dependency.first_backward_edge_for_insertion(moved_leaf, target_nid, index) is None:
+                    if (
+                        ir.dependency.first_backward_edge_for_insertion(
+                            moved_leaf, target_nid, index, topology=context.topology
+                        )
+                        is None
+                    ):
                         options.append(CodeMotionOption(block_nid=block_nid, target_loop_nid=target_nid, index=index))
         return options
 
@@ -845,7 +945,7 @@ class CodeMotion(Transform[CodeMotionOption]):
         lp = -1
         fc = len(children)
         for i, child in enumerate(children):
-            sub = ir.tree.descendants(child) | {child}
+            sub = _descendants(ir.tree, child) | {child}
             if sub & producers:
                 lp = i
             if sub & consumers and i < fc:
@@ -875,7 +975,7 @@ class CodeMotion(Transform[CodeMotionOption]):
             raise TransformLegalityError(f"block_nid={block_nid} not in tree")
         if subtree_has_access_patterns(ir.tree, block_nid):
             raise TransformLegalityError("CodeMotion cannot move a block with an explicit access pattern")
-        if target_loop_nid in ir.tree.descendants(block_nid):
+        if target_loop_nid in _descendants(ir.tree, block_nid):
             raise TransformLegalityError(
                 f"target_loop_nid={target_loop_nid} is a descendant of moved block "
                 f"{block_nid} (cannot move under its own loop)"

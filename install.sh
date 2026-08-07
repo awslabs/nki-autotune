@@ -3,13 +3,21 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 --host HOST" >&2
+    echo "Usage: $0 --host HOST..." >&2
     exit 2
 }
 
-[[ $# -eq 2 && "$1" == "--host" ]] || usage
-HOST="$2"
-[[ -n "$HOST" && "$HOST" != -* && "$HOST" != *[[:space:]]* ]] || usage
+valid_host() {
+    local host="$1"
+    [[ -n "$host" && "$host" != -* && "$host" != *[[:space:]]* ]]
+}
+
+[[ $# -ge 2 && "$1" == "--host" ]] || usage
+shift
+REMOTE_HOSTS=("$@")
+for remote_host in "${REMOTE_HOSTS[@]}"; do
+    valid_host "$remote_host" || usage
+done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$HOME/venvs/kernel-env"
@@ -29,14 +37,17 @@ fi
 echo "==> Installing local environment"
 "$VENV/bin/python" -m pip install --only-binary=:all: --extra-index-url "$PIP_INDEX" -e "$ROOT/nkigym" black pytest
 
-echo "==> Uploading nkigym to $HOST"
-ssh "${SSH_OPTIONS[@]}" "$HOST" "mkdir -p \"\$HOME\"/$REMOTE_ROOT"
-rsync -az --delete -e "ssh ${SSH_OPTIONS[*]}" \
-    --exclude __pycache__ --exclude '*.pyc' \
-    "$ROOT/nkigym/" "$HOST:$REMOTE_ROOT/nkigym/"
+install_remote_environment() {
+    local remote_host="$1"
 
-echo "==> Installing remote environment"
-ssh "${SSH_OPTIONS[@]}" "$HOST" "bash -s -- '$REMOTE_ROOT/nkigym' '$PIP_INDEX'" <<'REMOTE'
+    echo "==> Uploading nkigym to $remote_host"
+    ssh "${SSH_OPTIONS[@]}" "$remote_host" "mkdir -p \"\$HOME\"/$REMOTE_ROOT"
+    rsync -az --delete -e "ssh ${SSH_OPTIONS[*]}" \
+        --exclude __pycache__ --exclude '*.pyc' \
+        "$ROOT/nkigym/" "$remote_host:$REMOTE_ROOT/nkigym/"
+
+    echo "==> Installing remote environment on $remote_host"
+    ssh "${SSH_OPTIONS[@]}" "$remote_host" "bash -s -- '$REMOTE_ROOT/nkigym' '$PIP_INDEX'" <<'REMOTE'
 set -euo pipefail
 
 SOURCE="$HOME/$1"
@@ -50,5 +61,10 @@ fi
 
 "$VENV/bin/python" -m pip install --only-binary=:all: --extra-index-url "$PIP_INDEX" "$SOURCE"
 REMOTE
+}
 
-echo "==> Installed local and remote environments"
+for remote_host in "${REMOTE_HOSTS[@]}"; do
+    install_remote_environment "$remote_host"
+done
+
+echo "==> Installed local environment and remote environments on ${REMOTE_HOSTS[*]}"

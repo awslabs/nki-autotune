@@ -8,10 +8,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from develop_nkigym.workloads import load_workload, mfu_regression_workload_names
 from kernel_library import Workload
 from nkigym.codegen import render
 from nkigym.environment import KernelMDP
+from self_evolve.workloads import load_workload, mfu_regression_workloads
 
 _GATE_ARTIFACT_DIRECTORY_ENV = "NKIGYM_GATE_ARTIFACT_DIRECTORY"
 _MFU_ENDPOINT_MANIFEST_ENV = "NKIGYM_MFU_ENDPOINT_MANIFEST"
@@ -43,7 +43,7 @@ def _endpoint_record(name: str, workload: Workload) -> dict[str, object]:
 
 def _write_manifest(path: Path) -> None:
     """Write all retained endpoints consumed by the MFU regression test."""
-    endpoints = [_endpoint_record(name, load_workload(name)) for name in mfu_regression_workload_names()]
+    endpoints = [_endpoint_record(name, load_workload(name, shape)) for name, shape in mfu_regression_workloads()]
     path.write_text(json.dumps({"schema_version": 1, "endpoints": endpoints}, indent=2) + "\n", encoding="utf-8")
 
 

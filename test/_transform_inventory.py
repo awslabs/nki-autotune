@@ -57,10 +57,11 @@ def _base_name(expression: ast.expr) -> str:
 
 
 def _class_records(transforms_directory: Path) -> tuple[_ClassRecord, ...]:
-    """Parse public transform modules without importing candidate code."""
+    """Parse transform and helper modules without importing candidate code."""
     records: list[_ClassRecord] = []
-    for path in sorted(transforms_directory.glob("*.py")):
-        if path.name.startswith("_") or path.name == "base.py":
+    for path in sorted(transforms_directory.rglob("*.py")):
+        relative = path.relative_to(transforms_directory).as_posix()
+        if relative in {"__init__.py", "base.py"}:
             continue
         source = path.read_text(encoding="utf-8")
         module_lines = len(source.splitlines())
@@ -71,7 +72,7 @@ def _class_records(transforms_directory: Path) -> tuple[_ClassRecord, ...]:
                     raise ValueError(f"AST has no ending line for class {node.name} in {path}")
                 metric = TransformMetric(
                     name=node.name,
-                    module=path.name,
+                    module=relative,
                     class_lines=node.end_lineno - node.lineno + 1,
                     module_lines=module_lines,
                 )

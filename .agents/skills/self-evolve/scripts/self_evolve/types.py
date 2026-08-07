@@ -1,4 +1,4 @@
-"""Typed contracts for deterministic develop-nkigym skill support."""
+"""Typed contracts for deterministic nkigym workflow support."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from nkigym.search.program import ProgramSpec
 
 NextAction = Literal["validate", "tune", "edit", "check", "accept", "complete"]
 WorkflowMode = Literal["repair", "improve"]
-RUN_RECORD_SCHEMA_VERSION = 18
+RUN_RECORD_SCHEMA_VERSION = 19
 
 
 def _required_dict(value: object, name: str) -> dict[str, object]:
@@ -392,7 +392,7 @@ class RunRecord:
         version = decoded.get("schema_version")
         raw_gates = decoded.get("gates")
         raw_cycles = decoded.get("cycles")
-        if version not in {16, 17, RUN_RECORD_SCHEMA_VERSION}:
+        if version not in {16, 17, 18, RUN_RECORD_SCHEMA_VERSION}:
             raise ValueError(f"unsupported run record schema version: {version!r}")
         if not isinstance(raw_gates, list):
             raise ValueError("run record gates must be a list")

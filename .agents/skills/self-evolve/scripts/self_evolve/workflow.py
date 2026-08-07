@@ -13,17 +13,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from develop_nkigym.gates import candidate_environment, run_gates
-from develop_nkigym.git import (
+from nkigym.search.agentic_tuning import (
+    AGENTIC_TUNING_CONTEXT_ENV,
+    AgenticTuningContext,
+    AgenticTuningResult,
+    run_agentic_tuning,
+)
+from nkigym.search.program import write_program
+from self_evolve.gates import candidate_environment, run_gates
+from self_evolve.git import (
     CandidateSnapshot,
     create_candidate_tree,
-    create_detached_worktree,
     resolve_repository,
     resolve_revision,
-    set_worktree_baseline,
     snapshot_candidate,
 )
-from develop_nkigym.types import (
+from self_evolve.types import (
     BaselineCheckAttempt,
     CheckAttempt,
     CycleState,
@@ -33,14 +38,7 @@ from develop_nkigym.types import (
     RunStatus,
     WorkflowMode,
 )
-from develop_nkigym.validation import AGENTIC_TUNING_GATE_NAME, baseline_gates, validate_config, validate_record
-from nkigym.search.agentic_tuning import (
-    AGENTIC_TUNING_CONTEXT_ENV,
-    AgenticTuningContext,
-    AgenticTuningResult,
-    run_agentic_tuning,
-)
-from nkigym.search.program import write_program
+from self_evolve.validation import AGENTIC_TUNING_GATE_NAME, baseline_gates, validate_config, validate_record
 
 _RUN_RECORD_FILENAME = "run.json"
 _RUN_LOCK_FILENAME = "run.lock"
@@ -96,7 +94,7 @@ def _exclusive_run_lock(run_directory: Path) -> Iterator[None]:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise RuntimeError(f"another develop-nkigym command is already running for {run_directory}") from error
+            raise RuntimeError(f"another workflow command is already running for {run_directory}") from error
         yield
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -267,8 +265,6 @@ def create_run(config: RunConfig) -> RunStatus:
     run_id = _new_run_id()
     run_directory = config.artifact_root.expanduser().resolve() / run_id
     run_directory.mkdir(parents=True)
-    worktree = run_directory / "worktree"
-    create_detached_worktree(repository, worktree, base_sha, initial_tree)
     program_directory = run_directory / "program"
     write_program(config.program, program_directory)
     cycle = CycleState(
@@ -284,7 +280,7 @@ def create_run(config: RunConfig) -> RunStatus:
         run_id=run_id,
         source_repository=repository,
         run_directory=run_directory,
-        worktree=worktree,
+        worktree=repository,
         base_sha=base_sha,
         initial_tree=initial_tree,
         program_directory=program_directory,
@@ -299,7 +295,7 @@ def create_run(config: RunConfig) -> RunStatus:
 
 
 def status_run(run_directory: Path) -> RunStatus:
-    """Return the action implied by one durable run and its current worktree."""
+    """Return the action implied by one durable run and its source checkout."""
     record = _read_record(run_directory)
     return _status(record)
 
@@ -464,7 +460,6 @@ def accept_run(run_directory: Path) -> RunStatus:
         if candidate_tree != check.candidate_tree:
             raise RuntimeError("candidate Git tree changed after its passing check")
         tuning = _passing_tuning_result(check)
-        set_worktree_baseline(record.worktree, candidate_tree)
         baseline_check = BaselineCheckAttempt(
             index=0,
             artifact_directory=check.artifact_directory,

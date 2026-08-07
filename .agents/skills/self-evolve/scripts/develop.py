@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the repository's deterministic develop-nkigym support commands."""
+"""Run the repository's shared deterministic workflow commands."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ def _repository_root() -> Path:
     """Find the repository containing this repo-local skill."""
     root = None
     for candidate in Path(__file__).resolve().parents:
-        skill = candidate / ".agents/skills/develop-nkigym/SKILL.md"
+        skill = candidate / ".agents/skills/self-evolve/SKILL.md"
         if skill.is_file() and (candidate / "nkigym/src/nkigym").is_dir():
             root = candidate
             break
@@ -33,7 +33,7 @@ def main() -> int:
         entries.append(existing)
     environment["PYTHONPATH"] = os.pathsep.join(entries)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    command = [sys.executable, "-m", "develop_nkigym", *sys.argv[1:]]
+    command = [sys.executable, "-m", "self_evolve", *sys.argv[1:]]
     completed = subprocess.run(command, cwd=repository, env=environment, check=False)
     return completed.returncode
 
