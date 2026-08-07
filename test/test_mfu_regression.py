@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import math
-import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+
+from config import MFU_PROFILE_HOSTS
 
 from nkigym.profile import profile
 from nkigym.search.types import InputSpecs
@@ -17,8 +19,6 @@ MIN_ATTENTION_MFU_PERCENT = 44.0
 MAX_RMSNORM_MATMUL_MFU_GAP_PERCENT = 3.0
 ENDPOINT_PROFILE_TIMEOUT_SECONDS = 1800
 SCHEDULER_OFF_ARGS = ("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")
-GATE_ARTIFACT_DIRECTORY_ENV = "NKIGYM_GATE_ARTIFACT_DIRECTORY"
-MFU_ENDPOINT_MANIFEST_ENV = "NKIGYM_MFU_ENDPOINT_MANIFEST"
 EXPECTED_ENDPOINTS = {"attention", "matmul-lhs", "matmul-lhs-t", "rmsnorm-matmul"}
 
 
@@ -75,12 +75,8 @@ def _decode_endpoint(value: object) -> _Endpoint:
     )
 
 
-def _load_endpoints() -> dict[str, _Endpoint]:
+def _load_endpoints(manifest_path: Path) -> dict[str, _Endpoint]:
     """Load the controller-generated endpoint manifest."""
-    configured_path = os.environ.get(MFU_ENDPOINT_MANIFEST_ENV)
-    if configured_path is None:
-        raise AssertionError(f"{MFU_ENDPOINT_MANIFEST_ENV} must identify the endpoint manifest")
-    manifest_path = Path(configured_path).expanduser().resolve()
     decoded = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(decoded, dict) or decoded.get("schema_version") != 1:
         raise AssertionError(f"unsupported endpoint manifest: {manifest_path}")
@@ -117,23 +113,36 @@ def _validated_mfu(name: str, value: float) -> float:
     return value
 
 
+def _profile_endpoint_group(host: str, requests: tuple[tuple[str, _Endpoint, Path], ...]) -> dict[str, float]:
+    """Profile one sequential endpoint group on a single Trn2 host."""
+    measurements = {
+        name: _validated_mfu(name, _profile_endpoint(host, endpoint, cache_dir))
+        for name, endpoint, cache_dir in requests
+    }
+    return measurements
+
+
 def test_best_known_generated_kernels_do_not_regress_mfu(tmp_path: Path) -> None:
     """Best-known generated endpoints retain their established hardware MFU."""
-    host = os.environ.get("NKI_PROFILE_HOST", "gym-1")
-    configured_directory = os.environ.get(GATE_ARTIFACT_DIRECTORY_ENV)
-    cache_dir = Path(configured_directory) if configured_directory is not None else tmp_path
-    endpoints = _load_endpoints()
-
-    lhs_t_mfu = _validated_mfu(
-        "lhsT", _profile_endpoint(host, endpoints["matmul-lhs-t"], cache_dir / "matmul_lhs_t_rhs")
+    cache_dir = tmp_path.parents[1]
+    endpoints = _load_endpoints(cache_dir / "endpoints.json")
+    lhs_t_host, lhs_host = MFU_PROFILE_HOSTS
+    lhs_t_requests = (
+        ("lhsT", endpoints["matmul-lhs-t"], cache_dir / "matmul_lhs_t_rhs"),
+        ("attention", endpoints["attention"], cache_dir / "attention"),
     )
-    lhs_mfu = _validated_mfu("lhs", _profile_endpoint(host, endpoints["matmul-lhs"], cache_dir / "matmul_lhs_rhs"))
-    rmsnorm_mfu = _validated_mfu(
-        "RMSNorm+matmul", _profile_endpoint(host, endpoints["rmsnorm-matmul"], cache_dir / "rmsnorm_matmul")
+    lhs_requests = (
+        ("lhs", endpoints["matmul-lhs"], cache_dir / "matmul_lhs_rhs"),
+        ("RMSNorm+matmul", endpoints["rmsnorm-matmul"], cache_dir / "rmsnorm_matmul"),
     )
-    attention_mfu = _validated_mfu(
-        "attention", _profile_endpoint(host, endpoints["attention"], cache_dir / "attention")
-    )
+    with ThreadPoolExecutor(max_workers=len(MFU_PROFILE_HOSTS)) as executor:
+        lhs_t_future = executor.submit(_profile_endpoint_group, lhs_t_host, lhs_t_requests)
+        lhs_future = executor.submit(_profile_endpoint_group, lhs_host, lhs_requests)
+        measurements_by_name = {**lhs_t_future.result(), **lhs_future.result()}
+    lhs_t_mfu = measurements_by_name["lhsT"]
+    lhs_mfu = measurements_by_name["lhs"]
+    rmsnorm_mfu = measurements_by_name["RMSNorm+matmul"]
+    attention_mfu = measurements_by_name["attention"]
     rmsnorm_gap = lhs_mfu - rmsnorm_mfu
     measurements = {
         "lhs_t_mfu_percent": lhs_t_mfu,

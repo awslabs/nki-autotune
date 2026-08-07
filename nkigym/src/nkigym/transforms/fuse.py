@@ -7,14 +7,14 @@ from dataclasses import dataclass
 from math import prod
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Expr, to_affine
+from nkigym.ir.arith.expr import Const, Expr, Var, substitute, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
-from nkigym.transforms._access_pattern import subtree_has_access_patterns
-from nkigym.transforms._normalize import _dim_from_loopvar, normalize_block
-from nkigym.transforms._tile_region import retile_region
-from nkigym.transforms._tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
+from nkigym.transforms.helper.normalize import _dim_from_loopvar, _substitute_block_regions, normalize_block
+from nkigym.transforms.helper.tile_region import retile_region
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 from nkigym.transforms.split import _current_tensorize_width
 
 
@@ -189,6 +189,7 @@ class Fuse(Transform[FuseOption]):
         deepest_kids = ir.tree.children(nids[-1])
         new_extent = prod(ir.tree.loop(nid).extent for nid in nids)
         block_nid, _block = _find_enclosing_block(ir.tree, nids[0])
+        old_loop_vars = tuple(ir.tree.loop(nid).loop_var for nid in nids)
 
         new_nid = ir.tree.add_node(ForNode(loop_var=f"{first.loop_var}__fused", extent=new_extent), parent=None)
         for child_nid in deepest_kids:
@@ -197,10 +198,10 @@ class Fuse(Transform[FuseOption]):
         for nid in nids:
             ir.tree.graph.remove_node(nid)
 
-        nested_blocks = [nid for nid in ir.tree.preorder(new_nid) if isinstance(ir.tree.data(nid), BlockNode)]
-        normalize_block(ir.tree, block_nid)
-        for nested_block in nested_blocks:
-            normalize_block(ir.tree, nested_block)
+        nested_blocks = {nid for nid in ir.tree.preorder(new_nid) if isinstance(ir.tree.data(nid), BlockNode)}
+        substitutions: dict[str, Expr] = {loop_var: Const(value=0) for loop_var in old_loop_vars}
+        substitutions[old_loop_vars[-1]] = Var(name=ir.tree.loop(new_nid).loop_var)
+        _normalize_block_hierarchy(ir.tree, block_nid, substitutions, nested_blocks)
 
     def _do_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
         """Tensorize Fuse: absorb one same-axis ForNode into an ISA tile.
@@ -270,24 +271,91 @@ def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
     raise TransformLegalityError(f"no enclosing BlockNode for nid {nid}")
 
 
+def _normalize_block_hierarchy(
+    tree: KernelTree, block_nid: int, substitutions: dict[str, Expr], nested_scope: set[int]
+) -> None:
+    """Normalize one block and propagate its loop rewrites into nested blocks."""
+    nested_paths = {
+        nested_block: _loop_path_names(tree, block_nid, nested_block)
+        for nested_block in _immediate_nested_blocks(tree, block_nid)
+        if nested_block in nested_scope
+    }
+    if substitutions:
+        _substitute_block_regions(tree, block_nid, substitutions)
+    normalize_block(tree, block_nid)
+
+    for nested_block, path_names in nested_paths.items():
+        local_substitutions: dict[str, Expr] = {}
+        for nid, old_name in path_names.items():
+            replacement: Expr
+            if nid in tree.graph:
+                replacement = Var(name=tree.loop(nid).loop_var)
+            else:
+                replacement = Const(value=0)
+            if replacement != Var(name=old_name):
+                local_substitutions[old_name] = replacement
+        child_substitutions = {
+            old_name: substitute(replacement, local_substitutions) for old_name, replacement in substitutions.items()
+        }
+        child_substitutions.update(local_substitutions)
+        _normalize_block_hierarchy(tree, nested_block, child_substitutions, nested_scope)
+
+
+def _immediate_nested_blocks(tree: KernelTree, block_nid: int) -> list[int]:
+    """Return nested blocks whose nearest enclosing block is ``block_nid``."""
+    nested_blocks: list[int] = []
+    stack = [block_nid]
+    while stack:
+        for child_nid in tree.children(stack.pop()):
+            if isinstance(tree.data(child_nid), BlockNode):
+                nested_blocks.append(child_nid)
+            else:
+                stack.append(child_nid)
+    return nested_blocks
+
+
+def _loop_path_names(tree: KernelTree, block_nid: int, nested_block: int) -> dict[int, str]:
+    """Return loop names on the path from ``block_nid`` to ``nested_block``."""
+    names: dict[int, str] = {}
+    current = tree.parent(nested_block)
+    while current is not None and current != block_nid:
+        node = tree.data(current)
+        if isinstance(node, ForNode):
+            names[current] = node.loop_var
+        current = tree.parent(current)
+    if current != block_nid:
+        raise AssertionError(f"block {nested_block} is not nested under block {block_nid}")
+    return names
+
+
 def _check_no_partial_loop_dependence(tree: KernelTree, target_nids: tuple[int, ...]) -> None:
     """Reject accesses that cannot remain affine after the target loops are fused.
 
     A descendant expression may be invariant across every target loop or use
-    every target loop as one contiguous index. If it uses only a proper subset,
-    replacing the original loops with one variable requires floor division or
-    modulo to recover the omitted loop positions. ``normalize_block`` cannot
-    represent that mapping and would otherwise silently drop the access offset.
+    their mixed-radix coefficients as one contiguous index. Any other
+    coefficient pattern requires floor division or modulo to recover an
+    original loop position. ``normalize_block`` cannot represent that mapping
+    and would otherwise silently change the access offset.
     """
-    target_vars = {tree.loop(nid).loop_var for nid in target_nids}
+    target_loops = [(tree.loop(nid).loop_var, tree.loop(nid).extent) for nid in target_nids]
+    target_strides: dict[str, int] = {}
+    stride = 1
+    for loop_var, extent in reversed(target_loops):
+        target_strides[loop_var] = stride
+        stride *= extent
+    innermost_var = target_loops[-1][0]
     for nid in tree.preorder(target_nids[0]):
         for expression in _binding_and_access_offsets(tree.data(nid)):
-            used = {name for name in to_affine(expression) if name is not None} & target_vars
-            if used and used != target_vars:
+            coefficients = to_affine(expression)
+            scale = coefficients.get(innermost_var, 0)
+            actual = tuple(coefficients.get(loop_var, 0) for loop_var, _extent in target_loops)
+            expected = tuple(scale * target_strides[loop_var] for loop_var, _extent in target_loops)
+            if actual != expected:
                 raise TransformLegalityError(
                     "Fuse outer-trip flavour: descendant "
-                    f"nid {nid} depends on only {sorted(used)} of fused loops "
-                    f"{sorted(target_vars)}; preserving the access requires floor division or modulo"
+                    f"nid {nid} uses non-contiguous coefficients {actual} for fused loops "
+                    f"{tuple(loop_var for loop_var, _extent in target_loops)}; expected coefficients "
+                    f"proportional to {tuple(target_strides[loop_var] for loop_var, _extent in target_loops)}"
                 )
 
 

@@ -17,8 +17,8 @@ from nkigym.ir.arith.expr import Add, Const, Expr, Var, substitute
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.transforms._access_pattern import tensor_has_access_pattern
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
 
 _EXHAUSTIVE_STAGE_CHILD_LIMIT = 8
 _UNIT_LEAVES: WeakKeyDictionary[KernelTree, dict[int, tuple[int, ...]]] = WeakKeyDictionary()

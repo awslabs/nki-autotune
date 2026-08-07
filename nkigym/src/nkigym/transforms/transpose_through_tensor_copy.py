@@ -8,10 +8,10 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import ISANode
 from nkigym.ops.dma_transpose import NKIDMATranspose
-from nkigym.transforms._canonical_rewrite import finalize_rewrite, remove_buffers
-from nkigym.transforms._transpose_pattern import TransposeChain, match_transpose_chain
-from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, remove_buffers
+from nkigym.transforms.helper.transpose_pattern import TransposeChain, match_transpose_chain
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 
 @dataclass(frozen=True)

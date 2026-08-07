@@ -15,8 +15,8 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode
-from nkigym.transforms._access_pattern import tensor_has_access_pattern
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
 
 
 @dataclass(frozen=True)

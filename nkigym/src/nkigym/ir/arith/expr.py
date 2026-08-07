@@ -334,19 +334,33 @@ def format_expr(expr: Expr) -> str:
 
 def _format_raw(expr: Expr) -> str:
     """Format an Expr without prior normalisation. Internal helper."""
+    return _format_raw_at_precedence(expr, parent_precedence=0, group_equal_precedence=False)
+
+
+def _format_raw_at_precedence(expr: Expr, parent_precedence: int, group_equal_precedence: bool) -> str:
+    """Format one expression while preserving its tree under Python precedence."""
     if isinstance(expr, Const):
-        return str(expr.value)
-    if isinstance(expr, Var):
-        return expr.name
-    if isinstance(expr, Add):
-        return f"{_format_raw(expr.left)} + {_format_raw(expr.right)}"
-    if isinstance(expr, Mul):
-        return f"{_format_raw(expr.left)} * {_format_raw(expr.right)}"
-    if isinstance(expr, FloorDiv):
-        return f"{_format_raw(expr.left)} // {_format_raw(expr.right)}"
-    if isinstance(expr, Mod):
-        return f"{_format_raw(expr.left)} % {_format_raw(expr.right)}"
-    raise TypeError(f"Unknown Expr node {type(expr).__name__}")
+        result = str(expr.value)
+        precedence = 4
+    elif isinstance(expr, Var):
+        result = expr.name
+        precedence = 4
+    elif isinstance(expr, Add):
+        left = _format_raw_at_precedence(expr.left, parent_precedence=1, group_equal_precedence=False)
+        right = _format_raw_at_precedence(expr.right, parent_precedence=1, group_equal_precedence=False)
+        result = f"{left} + {right}"
+        precedence = 1
+    elif isinstance(expr, (Mul, FloorDiv, Mod)):
+        left = _format_raw_at_precedence(expr.left, parent_precedence=2, group_equal_precedence=False)
+        group_right = isinstance(expr, (FloorDiv, Mod)) or isinstance(expr.right, (FloorDiv, Mod))
+        right = _format_raw_at_precedence(expr.right, parent_precedence=2, group_equal_precedence=group_right)
+        operator = "*" if isinstance(expr, Mul) else "//" if isinstance(expr, FloorDiv) else "%"
+        result = f"{left} {operator} {right}"
+        precedence = 2
+    else:
+        raise TypeError(f"Unknown Expr node {type(expr).__name__}")
+    needs_parentheses = precedence < parent_precedence or (group_equal_precedence and precedence == parent_precedence)
+    return f"({result})" if needs_parentheses else result
 
 
 __all__ = [

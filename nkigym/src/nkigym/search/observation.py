@@ -12,6 +12,7 @@ from nkigym.ir import KernelIR
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.search.types import MAX_TRANSFORMS_PER_REASONING_STEP, SearchConfig, SearchNode
 from nkigym.transforms import (
+    BatchPermutationOption,
     BufferCompactionOption,
     BufferLayoutOption,
     BufferPlacementOption,
@@ -62,6 +63,7 @@ def format_observation(
     nodes: list[SearchNode],
     actions: list[DescribedAction],
     branchable_node_ids: tuple[int, ...],
+    branch_action_types: dict[int, tuple[str, ...]],
     config: SearchConfig,
     reasoning_step: int,
 ) -> str:
@@ -77,6 +79,14 @@ def format_observation(
     best_line = "no successful Neuron profile"
     if best is not None:
         best_line = f"N{best.node_id:03d} score={best.evaluation.score:.4f}; {best.evaluation.message}"
+    target_line = "not configured"
+    target_gap_line = "not configured"
+    if config.target_score is not None:
+        target_line = f"{config.target_score:.4f}"
+        if best is None:
+            target_gap_line = "no successful profile yet"
+        else:
+            target_gap_line = f"{max(0.0, config.target_score - _node_score(best)):.4f}"
     branchable_text = ", ".join(f"N{node_id:03d}" for node_id in branchable_node_ids)
     if not branchable_text:
         branchable_text = "none"
@@ -117,7 +127,13 @@ def format_observation(
         f"- active state: N{active.node_id:03d}",
         f"- active path: {_format_path(nodes, active.node_id)}",
         f"- best measured state: {best_line}",
+        f"- target score: {target_line}",
+        f"- remaining target gap: {target_gap_line}",
         f"- branchable nodes with unexplored actions: {branchable_text}",
+        "",
+        "# Branch Opportunities",
+        "Revisit a node to inspect exact action IDs; these lines summarize its unexplored transform types.",
+        *(f"- N{node_id:03d}: {', '.join(branch_action_types[node_id])}" for node_id in branchable_node_ids),
         "",
         "# Workload Guidance",
         config.workload_guidance.strip(),
@@ -157,6 +173,12 @@ def format_observation(
         ),
         "The orchestrator applies and profiles every selected transform and intermediate state in order.",
         "Select one action when its profile result should determine the next choice.",
+        (
+            f"Do not finish while the best score is below the configured target {config.target_score:.4f}; "
+            "continue from the active node or revisit a branch that preserves a missing structural sequence."
+            if config.target_score is not None and (best is None or _node_score(best) < config.target_score)
+            else "The configured target is met or no target is configured."
+        ),
         "Do not emit markdown, source code, an unlisted action, or an unlisted node.",
     ]
     return "\n".join(sections)
@@ -258,22 +280,29 @@ def _describe_option(state: KernelIR, option: object) -> str:
             f"and inner={_node_label(tree, option.inner_nid)}"
         )
     elif isinstance(option, CodeMotionOption):
-        children = _direct_children(tree, option.target_loop_nid)
+        children = tuple(tree.children(option.target_loop_nid))
         result = (
             f"move {_block_label(tree, option.block_nid)} under "
-            f"{_node_label(tree, option.target_loop_nid)} at child slot {option.index}; "
-            f"current children={children}"
+            f"{_loop_label(tree, option.target_loop_nid)} at child slot {option.index}; "
+            f"current child nids={children}"
         )
     elif isinstance(option, RFactorOption):
-        result = (
-            f"factor reduction {_node_label(tree, option.target_loop_nid)} " f"with factor_axis={option.factor_axis}"
-        )
+        target = _node_label(tree, option.target_loop_nid)
+        if option.factors is not None and option.target_axis is not None:
+            result = (
+                f"factor reduction {target} on tensorized axis {option.target_axis} "
+                f"into outer-to-inner factors {option.factors}; fold axis={option.factor_axis}"
+            )
+        else:
+            result = f"factor reduction {target} with fold axis={option.factor_axis}"
     elif isinstance(option, SoftwarePipelineOption):
         result = (
-            f"pipeline children of {_node_label(tree, option.loop_nid)} "
+            f"pipeline children of {_loop_label(tree, option.loop_nid)} "
             f"with stages={option.stages} in source order; "
-            f"children={_direct_children(tree, option.loop_nid)}"
+            f"child nids={tuple(tree.children(option.loop_nid))}"
         )
+    elif isinstance(option, BatchPermutationOption):
+        result = f"permute batches of {_node_label(tree, option.loop_nid)}"
     elif isinstance(option, BufferLayoutOption):
         buffer = state.buffer(option.tensor)
         result = (
@@ -305,7 +334,7 @@ def _node_label(tree: KernelTree, nid: int) -> str:
     """Return a semantic label for one tree node."""
     data = tree.data(nid)
     if isinstance(data, ForNode):
-        result = f"loop nid={nid} {data.loop_var} trip={data.extent} scope=[{_descendant_ops(tree, nid)}]"
+        result = f"{_loop_label(tree, nid)} scope=[{_descendant_ops(tree, nid)}]"
     elif isinstance(data, ISANode):
         result = f"ISA nid={nid} {_isa_label(data)}"
     elif isinstance(data, BlockNode):
@@ -315,17 +344,17 @@ def _node_label(tree: KernelTree, nid: int) -> str:
     return result
 
 
+def _loop_label(tree: KernelTree, nid: int) -> str:
+    """Return one loop's stable identity and trip count."""
+    loop = tree.loop(nid)
+    return f"loop nid={nid} {loop.loop_var} trip={loop.extent}"
+
+
 def _block_label(tree: KernelTree, nid: int) -> str:
     """Return a block label based on directly owned ISA leaves."""
     labels = [_isa_label(tree.isa(leaf)) for leaf in _direct_isa_leaves(tree, nid)]
     body = ", ".join(labels) if labels else "container"
     return f"block nid={nid} [{body}]"
-
-
-def _direct_children(tree: KernelTree, nid: int) -> str:
-    """Return ordered labels for direct children of one node."""
-    labels = [f"{index}:{_node_label(tree, child)}" for index, child in enumerate(tree.children(nid))]
-    return "[" + ", ".join(labels) + "]"
 
 
 def _direct_isa_leaves(tree: KernelTree, block_nid: int) -> list[int]:

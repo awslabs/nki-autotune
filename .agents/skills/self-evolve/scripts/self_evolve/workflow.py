@@ -14,13 +14,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from nkigym.search.agentic_tuning import (
-    AGENTIC_TUNING_CONTEXT_ENV,
     AgenticTuningContext,
     AgenticTuningResult,
+    agentic_target_score,
     run_agentic_tuning,
 )
 from nkigym.search.program import write_program
-from self_evolve.gates import candidate_environment, run_gates
+from self_evolve.gates import run_gates
 from self_evolve.git import (
     CandidateSnapshot,
     create_candidate_tree,
@@ -360,12 +360,12 @@ def tune_run(run_directory: Path) -> RunStatus:
         if status.changed_files:
             raise RuntimeError("restore the cycle baseline before running baseline tuning")
         _, output_directory = _next_attempt_directory(record.run_directory / "cycles" / f"{cycle.index:03d}" / "tuning")
+        tuning = replace(record.agentic_tuning, target_score=agentic_target_score(_historical_best_score(record)))
         result = run_agentic_tuning(
-            spec=record.agentic_tuning,
+            spec=tuning,
             program_directory=record.program_directory,
             worktree=record.worktree,
             output_directory=output_directory,
-            environment=candidate_environment(record.worktree),
             source_fingerprint=lambda: snapshot_candidate(record.worktree, cycle.baseline_tree).patch,
         )
         _write_json(output_directory / "result.json", result.as_dict())
@@ -412,14 +412,11 @@ def check_run(run_directory: Path) -> RunStatus:
             tuning=record.agentic_tuning,
             historical_best_score=_historical_best_score(record),
         )
-        context_path = attempt_directory / "agentic-tuning-context.json"
+        gate_directory = attempt_directory / "gates"
+        context_path = gate_directory / "agentic-tuning-artifacts" / "agentic-tuning-context.json"
+        context_path.parent.mkdir(parents=True, exist_ok=True)
         _write_json(context_path, context.as_dict())
-        gates = run_gates(
-            record.gates,
-            record.worktree,
-            attempt_directory / "gates",
-            {AGENTIC_TUNING_GATE_NAME: ((AGENTIC_TUNING_CONTEXT_ENV, str(context_path.resolve())),)},
-        )
+        gates = run_gates(record.gates, record.worktree, gate_directory)
         final_snapshot = snapshot_candidate(record.worktree, cycle.baseline_tree)
         final_tree = create_candidate_tree(record.worktree, cycle.baseline_tree)
         worktree_modified = _candidate_fingerprint(final_snapshot) != fingerprint or final_tree != candidate_tree

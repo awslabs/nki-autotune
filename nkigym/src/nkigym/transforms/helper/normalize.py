@@ -1,30 +1,4 @@
-"""Loop-var + trip-1 normalization for a block subtree.
-
-After a transform (Split/Fuse) mutates a block's ForNode chain,
-:func:`normalize_block` restores the two IR invariants:
-
-* No trip-1 ForNodes — a trip-1 loop is removed, its children re-linked to
-  its parent (the axis becomes loopless; its extent folds into the access
-  tile width, already set by the transform).
-* Dense position-in-dim names — each dim's surviving ForNodes are named
-  ``i_d{dim}_{N}`` with N the loop's ordinal among that dim's loops,
-  outer-to-inner.
-
-iter_values and every region ``lo`` in the block are then RECOMPUTED (not
-merely substituted) from the dim's surviving dense loops:
-
-* The tile-space affine for a dim with loops ``l_0(t_0) … l_{k-1}(t_{k-1})``
-  (outer-to-inner) is ``T = Σ_j l_j · Π(t_i for i > j)`` — the pure
-  factorization, ranging over the dim's full loop space. A loopless dim has
-  ``T = 0``.
-* A block ``iter_value`` is exactly ``T`` (tile space, stride unit 1).
-* A region axis keeps the innermost suffix of that dim's loops whose trip
-  product fits the buffer's logical extent at the access width. Outer loops
-  beyond that capacity select a compacted buffer instance and do not contribute
-  to its local offset. The resulting affine is bare for the SBUF/PSUM partition
-  axis and multiplied by ``width`` for element-space axes. Full-extent and HBM
-  buffers retain every loop, so canonical normalization is unchanged.
-"""
+"""Normalize loop names, bindings, and regions after structural rewrites."""
 
 from __future__ import annotations
 
@@ -32,19 +6,11 @@ from math import prod
 
 from nkigym.ir.arith.expr import Const, Expr, Mul, Var, from_affine, substitute, to_affine
 from nkigym.ir.tree import PARTITION_DIM, AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.transforms._tree_ops import _block_local_descendants, _replace_in_parent_children
+from nkigym.transforms.helper.tree_ops import _block_local_descendants, _replace_in_parent_children
 
 
 def _iter_value_loopvars(block: BlockNode) -> set[str]:
-    """Return the loop_vars that appear in the block's ``iter_values``.
-
-    These are the loops genuinely driving the block's dims: a covered dim's
-    iter_value (set by ``regen_and_rebind``) references the enclosing loop var
-    it binds to, while an enclosing loop the block does not index never
-    appears. Restricting the enclosing-loop gather to this set keeps unrelated
-    ancestor loops (e.g. a consumer's free-axis loop the moved block reads in
-    full) from being treated as tiling the moved block.
-    """
+    """Return loop variables that drive the block's dimensions."""
     out: set[str] = set()
     for value in block.iter_values:
         for name in to_affine(value):
@@ -61,13 +27,7 @@ def normalize_block(tree: KernelTree, block_nid: int) -> None:
 
 
 def normalize_tensor_regions(tree: KernelTree, tensor: str) -> None:
-    """Recompute only ``tensor``'s regions in every block that references it.
-
-    Buffer compaction changes the tensor's logical shape without changing loop
-    structure. Re-running the extent-fit region calculation materializes the
-    corresponding local offsets while leaving every other tensor and all block
-    iter bindings untouched.
-    """
+    """Recompute one tensor's regions without changing iteration bindings."""
     normalize_selected_tensor_regions(tree, frozenset((tensor,)))
 
 
@@ -93,34 +53,7 @@ def _drop_trip1(tree: KernelTree, block_nid: int) -> None:
 
 
 def _enclosing_dim_counts(tree: KernelTree, block_nid: int) -> dict[str, int]:
-    """Count, per dim, the block's ENCLOSING loops that share that dim's name space.
-
-    A dim's local ForNodes are renamed ``i_d{dim}_{N}`` (:func:`_rename_dense`);
-    ``N`` must start past every enclosing loop already using that dim's name so
-    the local loop never collides with one in scope. Two distinct kinds of
-    enclosing same-dim loop both consume names and are both counted:
-
-    * **bound** — a covered-dim loop the block indexes (in
-      :func:`_iter_value_loopvars`); the local residual is the SAME logical dim
-      continuing its ordinal (``i_d1_1`` after enclosing ``i_d1_0``).
-    * **unbound** — a same-dim loop owned by a DIFFERENT block that merely
-      encloses this one (e.g. a producer lifted under a consumer's ``i_d0_0``
-      while this block keeps its own independent ``d0`` residual). It is a
-      separate iteration, but its rendered name still occupies ``i_d{dim}_{N}``
-      in scope, so the local loop must skip past it or the renderer emits two
-      nested ``for i_d0_0`` (inner shadows outer) and reads the wrong tile.
-
-    The dim of an enclosing loop is taken from its dense name (``i_d0_0`` ->
-    ``d0``), independent of whether this block binds it. For a top-level block
-    (Split / Fuse / Reorder) there are no enclosing op-loops, so every count is
-    0 and local ordinals start at 0 exactly as before.
-
-    Crucially the walk is over EVERY ancestor ForNode (``_all_enclosing_loops``),
-    crossing BlockNode boundaries. The renderer flattens all blocks into one
-    Python function, so a same-dim loop above an intervening BlockNode still
-    shares the rendered name space — counting only block-local ancestors would
-    let a residual collide with it (``for i_d0_0: ... for i_d0_0:``).
-    """
+    """Count enclosing loops per dimension to avoid rendered-name collisions."""
     out: dict[str, int] = {}
     for loop_var, _extent in _all_enclosing_loops(tree, block_nid):
         dim = _dim_from_loopvar(loop_var)
@@ -129,17 +62,7 @@ def _enclosing_dim_counts(tree: KernelTree, block_nid: int) -> dict[str, int]:
 
 
 def _all_enclosing_loops(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
-    """Every ForNode ancestor of ``block_nid`` as ``(loop_var, extent)``, crossing
-    BlockNode boundaries, outer-to-inner.
-
-    Spans the whole ancestor chain rather than stopping at the nearest enclosing
-    BlockNode. Two callers need the wider view: name-dense collision avoidance
-    (the renderer emits all blocks in one flat Python scope, so a loop var
-    anywhere above ``block_nid`` shares the namespace) AND driving-loop gather
-    for a block lifted under a target nested inside ANOTHER block — its covered
-    dims are driven by loops above that intervening BlockNode wall, and a
-    block-local walk would miss them (collapsing the dim to ``Const(0)``).
-    """
+    """Return every enclosing loop, crossing intervening block boundaries."""
     return [
         (node.loop_var, node.extent)
         for anc in tree.ancestors(block_nid)
@@ -148,14 +71,7 @@ def _all_enclosing_loops(tree: KernelTree, block_nid: int) -> list[tuple[str, in
 
 
 def _rename_dense(tree: KernelTree, block_nid: int) -> None:
-    """Rename each dim's surviving LOCAL ForNodes to dense ``i_d{dim}_{N}`` (outer-to-inner).
-
-    A dim's ordinal CONTINUES across the block's enclosing same-dim loops: ``N``
-    starts at the count of bound enclosing loops on the dim, so a residual loop
-    regenerated below an enclosing target loop gets the next ordinal (``i_d1_1``
-    after enclosing ``i_d1_0``) rather than re-using and colliding with it.
-    Enclosing loops belong to the parent block's scope and are left untouched.
-    """
+    """Rename local loops densely after all enclosing same-dimension loops."""
     block = tree.data(block_nid)
     assert isinstance(block, BlockNode)
     old_to_dim = _loopvar_to_dim(tree, block_nid, block)
@@ -222,14 +138,7 @@ def _substitute_block_regions(tree: KernelTree, block_nid: int, substitutions: d
 
 
 def _recompute_bindings(tree: KernelTree, block_nid: int, tensors: frozenset[str] | None = None) -> None:
-    """Recompute iter_values and selected region offsets from the dense loops.
-
-    Each dim's iter_value and region offsets are rebuilt from the dim's
-    surviving dense loops (their element strides), so the transform's loop
-    edits + access-width edits are sufficient — the offsets never have to be
-    set by the transform. When ``tensors`` is provided, only those tensors'
-    regions are updated and the block's iter values remain unchanged.
-    """
+    """Recompute iteration bindings and selected regions from dense loops."""
     block = tree.data(block_nid)
     assert isinstance(block, BlockNode)
     dim_loops = _dim_loops(tree, block_nid, block)
@@ -277,20 +186,7 @@ def _recompute_bindings(tree: KernelTree, block_nid: int, tensors: frozenset[str
 
 
 def _dim_loops(tree: KernelTree, block_nid: int, block: BlockNode) -> dict[str, list[tuple[str, int]]]:
-    """Map each concrete dim to its driving loops as ``(loop_var, extent)`` outer-to-inner.
-
-    A dim's loop list is the block's ENCLOSING ForNodes on that dim (the loops
-    a CodeMotion move nested the block under — outer) followed by the block's
-    own surviving dense loops on that dim (inner). For a top-level block the
-    enclosing list is empty, so the result is exactly the block-local loops as
-    before.
-
-    The enclosing gather spans ALL ancestor ForNodes (``_all_enclosing_loops``),
-    not just the block-local chain: a block lifted under a target nested inside
-    another block has its covered dims driven by loops above that intervening
-    BlockNode wall. Restricting to ``_iter_value_loopvars`` keeps unrelated
-    ancestor loops out, so only the loops the block actually binds contribute.
-    """
+    """Map each dimension to its driving loops from outermost to innermost."""
     old_to_dim = _loopvar_to_dim(tree, block_nid, block)
     bound = _iter_value_loopvars(block)
     out: dict[str, list[tuple[str, int]]] = {}
@@ -313,13 +209,7 @@ def _iter_value(dim: str, dim_loops: dict[str, list[tuple[str, int]]]) -> Expr:
 
 
 def _tile_space_affine(loops: list[tuple[str, int]]) -> Expr:
-    """Build ``Σ_j loop_j · Π(extent_i for i inner to j)`` over ``loops`` (outer-to-inner).
-
-    The innermost loop has stride 1; each outer loop strides by the product
-    of all extents nested inside it. An empty ``loops`` yields ``Const(0)``.
-    This is the pure factorization an :class:`IterVar` binds (its iter_value)
-    and the base a region offset scales by its element width.
-    """
+    """Build the tile-space affine expression for outer-to-inner loops."""
     coeffs: dict[str | None, int] = {None: 0}
     for j, (loop_var, _extent) in enumerate(loops):
         inner_extents = [extent for _v, extent in loops[j + 1 :]]
@@ -328,19 +218,7 @@ def _tile_space_affine(loops: list[tuple[str, int]]) -> Expr:
 
 
 def _fit_loops(loops: list[tuple[str, int]], capacity: int) -> list[tuple[str, int]]:
-    """Keep the INNERMOST suffix of ``loops`` whose trip product fits ``capacity``.
-
-    ``loops`` is outer-to-inner. A buffer axis holding ``capacity`` tiles can only
-    address that many distinct positions, so loops beyond it (the outermost) select
-    which INSTANCE of a compacted buffer is live rather than a position within the
-    single resident instance — they must not appear in the intra-instance offset.
-    The kept suffix is the longest tail with ``Π(trips) <= capacity``; the dropped
-    outer loops are the instance selectors.
-
-    For a FULL-extent buffer the capacity covers every loop, so the whole list is
-    kept and the offset is byte-identical to the pre-extent-fit recompute. A
-    ``capacity <= 0`` (degenerate) keeps nothing.
-    """
+    """Keep the longest innermost loop suffix that fits the tile capacity."""
     kept: list[tuple[str, int]] = []
     running = 1
     for loop_var, extent in reversed(loops):
@@ -359,16 +237,7 @@ def _recompute_region(
     axis_map: dict[str, str],
     dim_loops: dict[str, list[tuple[str, int]]],
 ) -> BufferRegion:
-    """Rebuild each axis ``lo`` of ``region`` from its dim's dense loops at the stored width.
-
-    The width on each range is left untouched (the transform owns it). The
-    SBUF/PSUM partition axis (axis 0, width 128) carries the bare tile-space
-    affine — a tile index, stride unit 1. Every element-space axis carries
-    that affine scaled by its element width, stored as ``Mul(affine, width)``
-    so the offset structurally mirrors
-    :func:`nkigym.ir.canonical_build._build_region`. A region whose tensor
-    has no known operand axes is returned unchanged.
-    """
+    """Rebuild region offsets from dense loops while retaining access widths."""
     abstract_axes = tensor_axes.get(region.tensor)
     if abstract_axes is None:
         return region
@@ -404,17 +273,7 @@ def _recompute_region(
 
 
 def _axis_capacity(buf: Buffer | None, axis_index: int, location: str, width: int) -> int:
-    """Tiles buffer ``buf`` can address on region axis ``axis_index`` at ``width``.
-
-    The extent-fit budget for :func:`_fit_loops`. A tensor with no ``Buffer`` (an
-    HBM parameter, absolute-addressed) or a ``shared_hbm`` buffer has NO instance
-    dimension, so every loop is a position within it — return a huge capacity so
-    :func:`_fit_loops` keeps them all (global addressing, unchanged). For an sbuf/psum
-    buffer the capacity is the buffer's own logical extent on that axis divided by the
-    access width: the partition axis (axis 0, width 128) holds ``leading // 128`` tiles;
-    an element axis holds ``extent // width`` slices. Axes beyond the buffer's declared
-    shape (none in practice) also fall through to unbounded.
-    """
+    """Return the number of addressable tiles on one buffer axis."""
     if buf is None or location == "shared_hbm" or axis_index >= len(buf.shape):
         return 1 << 30
     extent = buf.shape[axis_index]
@@ -422,12 +281,7 @@ def _axis_capacity(buf: Buffer | None, axis_index: int, location: str, width: in
 
 
 def _tensor_buffer(tree: KernelTree, tensor: str) -> Buffer | None:
-    """Return the :class:`Buffer` declared for ``tensor`` in any block, else ``None``.
-
-    ``None`` for an HBM kernel parameter (never allocated). Mirrors
-    :func:`_tensor_location`, returning the whole Buffer so the caller can read its
-    compacted logical shape for the extent-fit capacity.
-    """
+    """Return the buffer declaration for a tensor, or None for parameters."""
     for nid in tree.blocks():
         block = tree.data(nid)
         assert isinstance(block, BlockNode)
@@ -443,12 +297,7 @@ def _is_zero(expr: Expr) -> bool:
 
 
 def _tensor_to_axes(tree: KernelTree, block_nid: int) -> dict[str, tuple[str, ...]]:
-    """Map each operand tensor in the block to its op's abstract axis tuple.
-
-    Built from the block's ISA leaves (``op_cls.OPERAND_AXES[slot]`` keyed by
-    the slot's bound tensor name). Used to project block reads/writes — which
-    are keyed by tensor, not slot — back onto operand axes.
-    """
+    """Map each operand tensor to its operation's abstract axes."""
     out: dict[str, tuple[str, ...]] = {}
     for nid in _block_local_descendants(tree, block_nid):
         data = tree.data(nid)
@@ -460,11 +309,7 @@ def _tensor_to_axes(tree: KernelTree, block_nid: int) -> dict[str, tuple[str, ..
 
 
 def _tensor_location(tree: KernelTree, tensor: str) -> str:
-    """Return the residency of ``tensor`` from any block's ``alloc_buffers``.
-
-    Kernel parameters carry no ``Buffer`` (they are never allocated), so a
-    tensor not declared anywhere is an HBM parameter — ``shared_hbm``.
-    """
+    """Return tensor residency, treating undeclared parameters as shared HBM."""
     for nid in tree.blocks():
         block = tree.data(nid)
         assert isinstance(block, BlockNode)
@@ -475,12 +320,7 @@ def _tensor_location(tree: KernelTree, tensor: str) -> str:
 
 
 def _loopvar_to_dim(tree: KernelTree, block_nid: int, block: BlockNode) -> dict[str, str]:
-    """Map each ForNode loop_var in the block to the concrete dim it binds.
-
-    A loop_var binds the iter_var whose iter_value affine contains it. Since
-    iter_values are affine over a single dim's loops, the loop_var->dim map is
-    each loop_var to the iter_var.axis of the iter_value mentioning it.
-    """
+    """Map each local loop variable to the concrete dimension it binds."""
     out: dict[str, str] = {}
     for iv, value in zip(block.iter_vars, block.iter_values):
         for name in to_affine(value).keys():

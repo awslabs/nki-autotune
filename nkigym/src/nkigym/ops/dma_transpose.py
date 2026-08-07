@@ -28,6 +28,14 @@ class NKIDMATranspose(NKIOp):
     Larger free dimensions are represented by outer loops."""
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": 128}
+    HBM_SOURCE_MAX_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 512, "F": 128}
+    """Location-specific limits for a direct HBM-to-SBUF transpose.
+
+    HBM input does not occupy the source partition axis, so the logical P
+    extent becomes a packed SBUF free axis and may cover up to 512 elements.
+    The logical F extent still becomes the destination partition axis and
+    remains capped at 128.
+    """
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     @classmethod

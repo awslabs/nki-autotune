@@ -122,6 +122,7 @@ WORKLOAD = Workload(
     rtol=1e-3,
     best_action_ladder=ACTIONS,
     historical_best_mfu=90.92,
+    reference_mfu=90.92,
 )
 
 

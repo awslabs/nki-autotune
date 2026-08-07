@@ -11,11 +11,11 @@ from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
 from nkigym.ops.base import ReductionContract
-from nkigym.transforms._access_pattern import subtree_has_access_patterns
-from nkigym.transforms._normalize import normalize_block
-from nkigym.transforms._tile_region import retile_region
-from nkigym.transforms._tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
+from nkigym.transforms.helper.normalize import _substitute_block_regions, normalize_block
+from nkigym.transforms.helper.tile_region import retile_region
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 
 
 @dataclass(frozen=True)
@@ -150,6 +150,12 @@ class Split(Transform[SplitOption]):
         _replace_in_parent_children(ir.tree, parent_nid, [target_nid], [new_top_nid])
         ir.tree.graph.remove_node(target_nid)
 
+        outer = ir.tree.loop(new_top_nid)
+        inner = ir.tree.loop(new_bottom_nid)
+        composed = Add(
+            left=Mul(left=Var(name=outer.loop_var), right=Const(value=inner.extent)), right=Var(name=inner.loop_var)
+        )
+        _substitute_block_regions(ir.tree, block_nid, {target.loop_var: composed})
         normalize_block(ir.tree, block_nid)
 
     def _do_tensorize(self, ir: KernelIR, option: SplitOption) -> int:

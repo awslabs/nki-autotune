@@ -1,7 +1,6 @@
 """Branching profiler-guided refinement over legal ``nkigym`` transforms."""
 
 from nkigym.search.agentic_tuning import (
-    AGENTIC_TUNING_CONTEXT_ENV,
     AGENTIC_TUNING_CONTEXT_VERSION,
     AgenticTuningContext,
     AgenticTuningResult,
@@ -24,7 +23,6 @@ from nkigym.search.types import (
 )
 
 __all__ = [
-    "AGENTIC_TUNING_CONTEXT_ENV",
     "AGENTIC_TUNING_CONTEXT_VERSION",
     "AgentDecision",
     "AgenticTuningContext",

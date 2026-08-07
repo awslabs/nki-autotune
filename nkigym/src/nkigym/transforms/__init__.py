@@ -19,19 +19,17 @@ from nkigym.transforms.eliminate_identity_initializer import (
     EliminateIdentityInitializerOption,
 )
 from nkigym.transforms.fuse import Fuse, FuseOption
-from nkigym.transforms.fuse_broadcast_activation import FuseBroadcastActivation, FuseBroadcastActivationOption
-from nkigym.transforms.fuse_pointwise_activation import FusePointwiseActivation, FusePointwiseActivationOption
-from nkigym.transforms.fuse_pointwise_reduction import FusePointwiseReduction, FusePointwiseReductionOption
+from nkigym.transforms.fuse_pointwise import FusePointwise, FusePointwiseOption
 from nkigym.transforms.online_fusion import OnlineFusion, OnlineFusionOption
 from nkigym.transforms.reorder import Reorder, ReorderOption
 from nkigym.transforms.rfactor import RFactor, RFactorOption
 from nkigym.transforms.software_pipeline import SoftwarePipeline, SoftwarePipelineOption
 from nkigym.transforms.split import Split, SplitOption
 from nkigym.transforms.transpose_pair import (
-    CancelTransposePair,
     CancelTransposePairOption,
-    InsertTransposePair,
     InsertTransposePairOption,
+    TransposePair,
+    TransposePairOption,
 )
 from nkigym.transforms.transpose_through_load import TransposeThroughLoad, TransposeThroughLoadOption
 from nkigym.transforms.transpose_through_matmul import TransposeThroughMatmul, TransposeThroughMatmulOption
@@ -42,22 +40,19 @@ PUBLIC_TRANSFORM_TYPES: tuple[type[Transform[Any]], ...] = (
     BufferPlacement,
     BufferCompaction,
     BufferLayout,
-    CancelTransposePair,
     CodeMotion,
     CommonSubexpressionElimination,
     CopyPropagation,
     DecomposeBroadcastSubtract,
     EliminateIdentityInitializer,
     Fuse,
-    FuseBroadcastActivation,
-    FusePointwiseActivation,
-    FusePointwiseReduction,
-    InsertTransposePair,
+    FusePointwise,
     OnlineFusion,
     Reorder,
     RFactor,
     SoftwarePipeline,
     Split,
+    TransposePair,
     TransposeThroughLoad,
     TransposeThroughMatmul,
     TransposeThroughTensorCopy,
@@ -88,17 +83,11 @@ __all__ = [
     "DecomposeBroadcastSubtractOption",
     "EliminateIdentityInitializer",
     "EliminateIdentityInitializerOption",
-    "CancelTransposePair",
     "CancelTransposePairOption",
     "Fuse",
     "FuseOption",
-    "FuseBroadcastActivation",
-    "FuseBroadcastActivationOption",
-    "FusePointwiseActivation",
-    "FusePointwiseActivationOption",
-    "FusePointwiseReduction",
-    "FusePointwiseReductionOption",
-    "InsertTransposePair",
+    "FusePointwise",
+    "FusePointwiseOption",
     "InsertTransposePairOption",
     "OnlineFusion",
     "OnlineFusionOption",
@@ -114,6 +103,8 @@ __all__ = [
     "Transform",
     "TransformLegalityError",
     "TransformOption",
+    "TransposePair",
+    "TransposePairOption",
     "TransposeThroughLoad",
     "TransposeThroughLoadOption",
     "TransposeThroughMatmul",

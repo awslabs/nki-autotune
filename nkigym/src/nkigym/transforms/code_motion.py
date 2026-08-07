@@ -1,17 +1,4 @@
-"""Shared structural move for CodeMotion (the merged compute-at / reverse-compute-at).
-
-A move relocates one block under a target loop by a **verbatim residual splice**,
-NOT region regeneration. Precondition (``_check_same_loop_prefix``): the target's
-enclosing loop nest (outermost down to ``target_loop_nid``), restricted to dimensions
-the moved block binds, must be an exact ordered ``(dimension, extent)`` prefix of the
-moved block's bound loop sequence. The move substitutes the matched target loop
-variables for loops supplied by a different target scope, removes the covered local
-loops, and re-parents the untouched residual loops plus the leaf under the target.
-
-This intentionally avoids TVM-style per-dim domain solving: a partial split of a
-shared dim, or a different loop order, is REJECTED loudly (``Split``/``Reorder``
-first), so every legal move is a clean structural merge.
-"""
+"""Move one block under a loop by merging an exact loop-prefix match."""
 
 from __future__ import annotations
 
@@ -30,18 +17,17 @@ from nkigym.ir.dependency import (
     _rmw_operand_slots,
     _tensor_carried_across,
 )
+from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
-from nkigym.transforms._access_pattern import subtree_has_access_patterns
-from nkigym.transforms._code_motion_state import loop_carries_plain_state, regions_overlap
-from nkigym.transforms._domain_solve import _dim_from_loopvar
-from nkigym.transforms._normalize import normalize_block
-from nkigym.transforms._tree_ops import (
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
+from nkigym.transforms.helper.normalize import _dim_from_loopvar, normalize_block
+from nkigym.transforms.helper.tree_ops import (
     _block_local_descendants,
     _replace_in_parent_children,
     invalidate_stale_software_pipelines,
 )
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 
 
 @dataclass(frozen=True)
@@ -60,7 +46,7 @@ class _AnalysisContext:
     """Code-motion facts shared by every option analyzed on one IR."""
 
     versioned_by_block: dict[int, frozenset[str]]
-    pipeline_loops: tuple[int, ...]
+    pipeline_stages: dict[int, dict[int, int]]
     topology: tuple[dict[int, int], dict[int, tuple[int, ...]], dict[int, frozenset[int]]]
 
 
@@ -69,11 +55,58 @@ _DESCENDANTS: WeakKeyDictionary[KernelTree, dict[int, frozenset[int]]] = WeakKey
 _PREORDERS: WeakKeyDictionary[KernelTree, dict[int | None, tuple[int, ...]]] = WeakKeyDictionary()
 _OWNING_BLOCKS: WeakKeyDictionary[KernelTree, dict[int, int]] = WeakKeyDictionary()
 _OWNED_LEAVES: WeakKeyDictionary[KernelTree, dict[int, int]] = WeakKeyDictionary()
+_DEPENDENCY_LEAVES: WeakKeyDictionary[KernelTree, dict[int, int]] = WeakKeyDictionary()
 _LOOP_STRIDES: WeakKeyDictionary[KernelTree, dict[tuple[int, int], Fraction]] = WeakKeyDictionary()
 _CROSSED_LOOPS: WeakKeyDictionary[KernelTree, dict[tuple[int, int, _PrefixPlan], tuple[int, ...]]] = WeakKeyDictionary()
 _TARGET_LOOPS: WeakKeyDictionary[KernelTree, dict[int, tuple[int, ...]]] = WeakKeyDictionary()
 _LOCAL_LOOPS: WeakKeyDictionary[KernelTree, dict[int, tuple[int, ...]]] = WeakKeyDictionary()
 _BOUND_DIMS: WeakKeyDictionary[KernelTree, dict[int, dict[str, str]]] = WeakKeyDictionary()
+
+
+def regions_overlap(
+    ir: KernelIR, first_leaf: int, first_region: BufferRegion, second_leaf: int, second_region: BufferRegion
+) -> bool:
+    """Return whether two regions of one materialized tensor may overlap."""
+    extents = {**ir.dependency.info(first_leaf).extents, **ir.dependency.info(second_leaf).extents}
+    buffer = ir.buffer(first_region.tensor)
+    return not regions_disjoint(first_region, second_region, buffer, buffer, extents)
+
+
+def loop_carries_plain_state(ir: KernelIR, loop_nid: int, tensor: str, excluded_leaf: int) -> bool:
+    """Return whether a read-before-write carries a tensor between iterations."""
+    tree = ir.tree
+    loop = tree.loop(loop_nid)
+    accesses: list[tuple[int, tuple[BufferRegion, ...], tuple[BufferRegion, ...]]] = []
+    for leaf in tree.preorder(loop_nid):
+        if leaf == excluded_leaf or not isinstance(tree.data(leaf), ISANode):
+            continue
+        info = ir.dependency.info(leaf)
+        reads = tuple(
+            region
+            for region in info.read_regions
+            if region.tensor == tensor and _access_invariant_across(tree, leaf, loop.loop_var, tensor)
+        )
+        writes = tuple(
+            region
+            for region in info.write_regions
+            if region.tensor == tensor and _access_invariant_across(tree, leaf, loop.loop_var, tensor)
+        )
+        if reads or writes:
+            accesses.append((leaf, reads, writes))
+    return any(
+        not any(
+            regions_overlap(ir, prior_leaf, prior_write, read_leaf, read_region)
+            for prior_leaf, _prior_reads, prior_writes in accesses[:read_index]
+            for prior_write in prior_writes
+        )
+        and any(
+            regions_overlap(ir, later_leaf, later_write, read_leaf, read_region)
+            for later_leaf, _later_reads, later_writes in accesses[read_index:]
+            for later_write in later_writes
+        )
+        for read_index, (read_leaf, read_regions, _read_writes) in enumerate(accesses)
+        for read_region in read_regions
+    )
 
 
 def _ancestors(tree: KernelTree, nid: int) -> tuple[int, ...]:
@@ -114,6 +147,7 @@ def _clear_analysis_cache(tree: KernelTree) -> None:
         _PREORDERS,
         _OWNING_BLOCKS,
         _OWNED_LEAVES,
+        _DEPENDENCY_LEAVES,
         _LOOP_STRIDES,
         _CROSSED_LOOPS,
         _TARGET_LOOPS,
@@ -124,19 +158,7 @@ def _clear_analysis_cache(tree: KernelTree) -> None:
 
 
 def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> None:
-    """Relocate ``block_nid`` under ``target_loop_nid`` by a verbatim residual splice.
-
-    Caller has checked legality (``_check_same_loop_prefix``, so the target's
-    dependent nest is an exact dimension/extent prefix) and deep-copied.
-    ``index`` follows TVM convention: ``-1`` append, ``-2`` prepend, ``>=0`` slot.
-
-    A same-parent move only changes sibling order, so its payload remains verbatim.
-    Otherwise, matched local loops may use different identifiers from their
-    corresponding target loops. Their uses are explicitly rebound before the loops
-    are removed. Residual loops receive temporary collision-free names before the
-    splice, then ``normalize_block`` restores dense names and bindings in the moved
-    block's own scope. The target block's unchanged loop nest is not normalized.
-    """
+    """Relocate a block by rebinding and removing its matched loop prefix."""
     tree = ir.tree
     same_parent = tree.parent(block_nid) == target_loop_nid
     if same_parent:
@@ -200,15 +222,7 @@ def _substitute_region(region: BufferRegion, substitutions: dict[str, Expr]) -> 
 
 
 def _strip_local_prefix_loops(tree: KernelTree, block_nid: int, count: int) -> None:
-    """Remove the outermost ``count`` block-local ForNodes of ``block_nid``.
-
-    The block's body is a single chain ``block -> For -> ... -> For -> leaf``; the
-    outermost ``count`` of those ForNodes are the prefix the target already provides
-    after :func:`_prepare_block_for_splice` has rebound their uses to the target loop
-    variables. Each is spliced out by reconnecting its sole child to its parent,
-    leaving the residual loops + leaf attached to the block.
-    ``count == 0`` is a no-op (the whole moved nest is residual).
-    """
+    """Remove the outermost matched loops from one block-local loop chain."""
     for _ in range(count):
         child = tree.children(block_nid)
         assert len(child) == 1, f"block {block_nid} body is not a single loop chain: children {child}"
@@ -221,12 +235,7 @@ def _strip_local_prefix_loops(tree: KernelTree, block_nid: int, count: int) -> N
 
 
 def _target_loop_seq(tree: KernelTree, target_loop_nid: int) -> list[tuple[str, int]]:
-    """Ordered ``(loop_var, extent)`` of every ForNode from outermost down to the target.
-
-    The target's enclosing nest in TRUE tree order (outermost→innermost, all dims
-    interleaved), built from the ancestor chain — not the per-dim-grouped map, which
-    loses interleave order. This is the prefix the moved block must match.
-    """
+    """Return target-loop ancestors in true outer-to-inner tree order."""
     chain = [*_ancestors(tree, target_loop_nid), target_loop_nid]
     return [(node.loop_var, node.extent) for n in chain if isinstance((node := tree.data(n)), ForNode)]
 
@@ -307,6 +316,55 @@ def _owned_leaf(tree: KernelTree, block_nid: int) -> int:
     return leaf
 
 
+def _dependency_leaf(ir: KernelIR, block_nid: int) -> int:
+    """Return the sole dependency endpoint in a leaf block or container."""
+    cache = _DEPENDENCY_LEAVES.setdefault(ir.tree, {})
+    leaf = cache.get(block_nid)
+    if leaf is None:
+        leaves = [
+            nid
+            for nid in _preorder(ir.tree, block_nid)
+            if isinstance(ir.tree.data(nid), ISANode) and nid in ir.dependency.graph
+        ]
+        if len(leaves) != 1:
+            raise TransformLegalityError(
+                f"block {block_nid} must contain exactly one dependency endpoint; found {leaves}"
+            )
+        leaf = leaves[0]
+        cache[block_nid] = leaf
+    return leaf
+
+
+def _bound_execution_extents(tree: KernelTree, block_nid: int, bound_names: set[str]) -> dict[str, int]:
+    """Return consistent loop extents for a leaf block or structural container."""
+    try:
+        leaves = (_owned_leaf(tree, block_nid),)
+    except TransformLegalityError:
+        leaves = tuple(nid for nid in _preorder(tree, block_nid) if isinstance(tree.data(nid), ISANode))
+        if not leaves:
+            raise TransformLegalityError(f"block {block_nid} has no ISA descendants")
+    extent_maps: list[dict[str, int]] = []
+    for leaf in leaves:
+        extents: dict[str, int] = {}
+        for nid in _ancestors(tree, leaf):
+            node = tree.data(nid)
+            if not isinstance(node, ForNode) or node.loop_var not in bound_names:
+                continue
+            if node.loop_var in extents:
+                raise TransformLegalityError(
+                    f"block {block_nid} has duplicate bound loop name {node.loop_var!r} in its execution scope"
+                )
+            extents[node.loop_var] = node.extent
+        missing = bound_names - extents.keys()
+        if missing:
+            raise TransformLegalityError(f"block {block_nid} has no execution loops for bindings {sorted(missing)}")
+        extent_maps.append(extents)
+    first = extent_maps[0]
+    if any(extents != first for extents in extent_maps[1:]):
+        raise TransformLegalityError(f"container block {block_nid} has inconsistent bound loop extents")
+    return first
+
+
 def _loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fraction:
     """Return one bound loop's logical element stride in ``block_nid``."""
     cache = _LOOP_STRIDES.setdefault(tree, {})
@@ -327,20 +385,7 @@ def _loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fra
         )
     iter_var, affine = matches[0]
     bound_names = {name for name in affine if name is not None}
-    leaf = _owned_leaf(tree, block_nid)
-    extents: dict[str, int] = {}
-    for nid in _ancestors(tree, leaf):
-        node = tree.data(nid)
-        if not isinstance(node, ForNode) or node.loop_var not in bound_names:
-            continue
-        if node.loop_var in extents:
-            raise TransformLegalityError(
-                f"block {block_nid} has duplicate bound loop name {node.loop_var!r} in its execution scope"
-            )
-        extents[node.loop_var] = node.extent
-    missing = bound_names - extents.keys()
-    if missing:
-        raise TransformLegalityError(f"block {block_nid} has no execution loops for bindings {sorted(missing)}")
+    extents = _bound_execution_extents(tree, block_nid, bound_names)
     domain_extent = iter_var.dom[1] - iter_var.dom[0]
     stride = Fraction(affine[loop_var] * domain_extent, prod(extents.values()))
     cache[key] = stride
@@ -425,14 +470,7 @@ def _prefix_plan(tree: KernelTree, block_nid: int, target_loop_nid: int) -> _Pre
 
 
 def _assert_single_parent(tree: KernelTree) -> None:
-    """Raise loudly if any node has more than one parent after a move.
-
-    The tree is a forest: every node except the root has exactly one parent.
-    A splice that detaches a node from its old parent without removing the old
-    edge leaves the node double-parented (a real corruption, not a legal-move
-    distinction); failing here keeps that bug loud instead of surfacing as a
-    downstream ``Dependency``/render crash on a malformed tree.
-    """
+    """Raise if a move leaves any node with multiple parents."""
     multi = [n for n in tree.graph.nodes if len(list(tree.graph.predecessors(n))) > 1]
     if multi:
         detail = {n: list(tree.graph.predecessors(n)) for n in multi}
@@ -442,34 +480,54 @@ def _assert_single_parent(tree: KernelTree) -> None:
 def _check_same_loop_prefix(
     ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan | None = None
 ) -> list[tuple[str, int]]:
-    """Raise TransformLegalityError unless the target's enclosing loops, restricted
-    to the moved block's dependent dimensions, are an exact ``(dimension, extent)``
-    prefix of the moved block's bound loop sequence.
-
-    Pure, read-only. Returns ``target_seq`` (the full target nest) for the dependency
-    check. Target loops already enclosing the moved block retain their node identity.
-    A new target loop on a dimension absent from the block's bindings is a duplication
-    loop: correct for a pure producer, but rejected for an accumulation block.
-
-    A dependent-dim mismatch (different extent / dim / order) rejects loudly
-    (``Split`` / ``Reorder`` first). Matching by dimension instead of identifier is
-    required because independently normalized blocks can assign different dense
-    names to equivalent loops.
-    """
+    """Require the target loops to match the moved block's dependent prefix."""
     target_seq = _target_loop_seq(ir.tree, target_loop_nid)
     block = ir.tree.data(block_nid)
     assert isinstance(block, BlockNode)
     resolved_plan = plan if plan is not None else _prefix_plan(ir.tree, block_nid, target_loop_nid)
+    _check_no_partial_input_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
     _check_no_mutating_input_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
+    _check_no_feedback_output_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
     _check_no_reduction_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
     return target_seq
+
+
+def _check_no_partial_input_replicated(
+    ir: KernelIR, block_nid: int, target_loop_nid: int, duplicated_target_nids: tuple[int, ...]
+) -> None:
+    """Reject a replicated consumer that enters its producer's tiled loop."""
+    moved_leaf = _dependency_leaf(ir, block_nid)
+    moved_reads = ir.dependency.info(moved_leaf).read_regions
+    for loop_nid in duplicated_target_nids:
+        loop = ir.tree.loop(loop_nid)
+        descendants = _descendants(ir.tree, loop_nid)
+        for producer, _consumer, attrs in ir.dependency.graph.in_edges(moved_leaf, data=True):
+            tensor = attrs.get("tensor")
+            if producer not in descendants or not isinstance(tensor, str):
+                continue
+            producer_writes = tuple(
+                region for region in ir.dependency.info(producer).write_regions if region.tensor == tensor
+            )
+            consumer_reads = tuple(region for region in moved_reads if region.tensor == tensor)
+            producer_varies = any(
+                loop.loop_var in to_affine(lower) for region in producer_writes for lower, _width in region.ranges
+            )
+            consumer_is_invariant = bool(consumer_reads) and all(
+                loop.loop_var not in to_affine(lower) for region in consumer_reads for lower, _width in region.ranges
+            )
+            if producer_varies and consumer_is_invariant:
+                raise TransformLegalityError(
+                    f"move(block={block_nid} under loop={target_loop_nid}) replicates a full read "
+                    f"of tensor {tensor!r} inside loop {loop_nid}, whose producer writes a "
+                    f"different slice per iteration"
+                )
 
 
 def _check_no_mutating_input_replicated(
     ir: KernelIR, block_nid: int, target_loop_nid: int, duplicated_target_nids: tuple[int, ...]
 ) -> None:
     """Reject recomputation that closes a feedback path through a block input."""
-    moved_leaf = ir.dependency._resolve(block_nid)
+    moved_leaf = _dependency_leaf(ir, block_nid)
     moved_reads = ir.dependency.info(moved_leaf).read_regions
     for loop_nid in duplicated_target_nids:
         for writer in _preorder(ir.tree, loop_nid):
@@ -486,6 +544,30 @@ def _check_no_mutating_input_replicated(
                             f"move(block={block_nid} under loop={target_loop_nid}) replicates "
                             f"a feedback read of tensor {read_region.tensor!r} across loop "
                             f"{loop_nid}, whose downstream path writes the same region"
+                        )
+
+
+def _check_no_feedback_output_replicated(
+    ir: KernelIR, block_nid: int, target_loop_nid: int, duplicated_target_nids: tuple[int, ...]
+) -> None:
+    """Reject a replicated write that feeds an earlier loop operation."""
+    moved_leaf = _dependency_leaf(ir, block_nid)
+    moved_writes = ir.dependency.info(moved_leaf).write_regions
+    for loop_nid in duplicated_target_nids:
+        for reader in _preorder(ir.tree, loop_nid):
+            if not isinstance(ir.tree.data(reader), ISANode):
+                continue
+            if not ir.dependency.must_precede(reader, moved_leaf):
+                continue
+            for read_region in ir.dependency.info(reader).read_regions:
+                for write_region in moved_writes:
+                    if read_region.tensor != write_region.tensor:
+                        continue
+                    if regions_overlap(ir, reader, read_region, moved_leaf, write_region):
+                        raise TransformLegalityError(
+                            f"move(block={block_nid} under loop={target_loop_nid}) replicates "
+                            f"a feedback write to tensor {write_region.tensor!r} across loop "
+                            f"{loop_nid}, whose earlier path reads the same region"
                         )
 
 
@@ -523,7 +605,7 @@ def _crossed_execution_loops(ir: KernelIR, block_nid: int, target_loop_nid: int,
     cached = cache.get(key)
     if cached is not None:
         return list(cached)
-    leaf = ir.dependency._resolve(block_nid)
+    leaf = _dependency_leaf(ir, block_nid)
     old_loops = [nid for nid in _ancestors(tree, leaf) if isinstance(tree.data(nid), ForNode)]
     local_prefix_drop = len(plan.matched_local_nids)
     new_loops = [*plan.target_loop_nids, *plan.local_loop_nids[local_prefix_drop:]]
@@ -574,7 +656,7 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
     necessarily reverses a dependency edge.
     """
     tree = ir.tree
-    moved_leaf = ir.dependency._resolve(block_nid)
+    moved_leaf = _dependency_leaf(ir, block_nid)
     moved_node = tree.data(moved_leaf)
     assert isinstance(moved_node, ISANode)
     plain_writes = _plain_written_tensors(moved_node)
@@ -656,7 +738,7 @@ def _check_no_consumer_hoisted_out_of_producer_loop(
 ) -> None:
     """Reject hoisting a consumer away from a repeated invariant producer."""
     tree = ir.tree
-    moved_leaf = ir.dependency._resolve(block_nid)
+    moved_leaf = _dependency_leaf(ir, block_nid)
     old_loops = set(_ancestors(tree, moved_leaf))
     crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid, plan)
     for producer, _consumer, attrs in ir.dependency.graph.in_edges(moved_leaf, data=True):
@@ -701,7 +783,7 @@ def _check_no_producer_moved_out_of_consumer_loop(
 ) -> None:
     """Reject moving a producer away from a consumer sharing its invariant slice."""
     tree = ir.tree
-    moved_leaf = ir.dependency._resolve(block_nid)
+    moved_leaf = _dependency_leaf(ir, block_nid)
     old_loops = set(_ancestors(tree, moved_leaf))
     crossed_loops = _crossed_execution_loops(ir, block_nid, target_loop_nid, plan)
     for _producer, consumer, attrs in ir.dependency.graph.out_edges(moved_leaf, data=True):
@@ -751,7 +833,7 @@ def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop
     _check_move_changes_position(ir.tree, block_nid, target_loop_nid, index)
     plan = _prefix_plan(ir.tree, block_nid, target_loop_nid)
     _check_same_loop_prefix(ir, block_nid, target_loop_nid, plan)
-    moved_leaf = ir.dependency._resolve(block_nid)
+    moved_leaf = _dependency_leaf(ir, block_nid)
     offending = ir.dependency.first_backward_edge_for_insertion(moved_leaf, target_loop_nid, index)
     result: None = None
     if offending is not None:
@@ -788,31 +870,59 @@ def _analysis_context(ir: KernelIR, block_nids: list[int]) -> _AnalysisContext:
             if isinstance(node, ISANode):
                 touched.update(region.tensor for region in node.operand_bindings.values())
         versioned_by_block[block_nid] = frozenset(touched & versioned_names)
-    pipeline_loops = tuple(
-        annotation["loop_nid"]
+    pipeline_stages = {
+        annotation["loop_nid"]: dict(zip(annotation["children"], annotation["stages"]))
         for nid in ir.tree.blocks()
         if (annotation := ir.tree.block(nid).annotations.get("software_pipeline")) is not None
-    )
-    return _AnalysisContext(versioned_by_block=versioned_by_block, pipeline_loops=pipeline_loops, topology=topology)
+    }
+    return _AnalysisContext(versioned_by_block=versioned_by_block, pipeline_stages=pipeline_stages, topology=topology)
 
 
-def _check_versioned_pipeline_boundary(
+def _direct_pipeline_child(tree: KernelTree, pipeline_loop: int, nid: int) -> int | None:
+    """Return the direct pipeline-loop child containing ``nid``."""
+    chain = (*_ancestors(tree, nid), nid)
+    child = None
+    if pipeline_loop in chain:
+        position = chain.index(pipeline_loop) + 1
+        if position < len(chain):
+            child = chain[position]
+    return child
+
+
+def _check_pipeline_boundary(
     ir: KernelIR, block_nid: int, target_loop_nid: int, context: _AnalysisContext | None
-) -> None:
-    """Reject moving a multi-version buffer access into or out of a pipeline loop."""
+) -> frozenset[int]:
+    """Reject moves that change software-pipeline timing or versioning."""
     if context is None:
         context = _analysis_context(ir, [block_nid])
     versioned = context.versioned_by_block[block_nid]
-    if not versioned:
-        return
     old_ancestors = set(_ancestors(ir.tree, block_nid))
     new_ancestors = set(_ancestors(ir.tree, target_loop_nid)) | {target_loop_nid}
-    for pipeline_loop in context.pipeline_loops:
-        if (pipeline_loop in old_ancestors) != (pipeline_loop in new_ancestors):
+    crossed_loops = frozenset(
+        pipeline_loop
+        for pipeline_loop in context.pipeline_stages
+        if (pipeline_loop in old_ancestors) != (pipeline_loop in new_ancestors)
+    )
+    for pipeline_loop, stage_by_child in context.pipeline_stages.items():
+        old_child = _direct_pipeline_child(ir.tree, pipeline_loop, block_nid)
+        target_child = _direct_pipeline_child(ir.tree, pipeline_loop, target_loop_nid)
+        if (
+            old_child in stage_by_child
+            and target_child in stage_by_child
+            and stage_by_child[old_child] != stage_by_child[target_child]
+            and old_child != block_nid
+        ):
+            raise TransformLegalityError(
+                f"move(block={block_nid} under loop={target_loop_nid}) crosses software pipeline "
+                f"loop {pipeline_loop} from stage {stage_by_child[old_child]} "
+                f"to stage {stage_by_child[target_child]}"
+            )
+        if versioned and pipeline_loop in crossed_loops:
             raise TransformLegalityError(
                 f"move(block={block_nid} under loop={target_loop_nid}) crosses software pipeline "
                 f"loop {pipeline_loop} while touching versioned buffer(s) {sorted(versioned)}"
             )
+    return crossed_loops
 
 
 def _splice_under_target(tree: KernelTree, block_nid: int, target_loop_nid: int, index: int) -> None:
@@ -820,6 +930,7 @@ def _splice_under_target(tree: KernelTree, block_nid: int, target_loop_nid: int,
     old_parent = tree.parent(block_nid)
     assert old_parent is not None, f"moved block {block_nid} has no parent"
     _replace_in_parent_children(tree, old_parent, [block_nid], [])
+    _prune_empty_loop_chain(tree, old_parent, target_loop_nid)
     children = tree.children(target_loop_nid)
     if index == -1:
         pos = len(children)
@@ -834,6 +945,17 @@ def _splice_under_target(tree: KernelTree, block_nid: int, target_loop_nid: int,
         tree.graph.remove_edge(target_loop_nid, child)
     for child in new_order:
         tree.graph.add_edge(target_loop_nid, child)
+
+
+def _prune_empty_loop_chain(tree: KernelTree, nid: int, stop_nid: int) -> None:
+    """Remove empty old-scope loops without removing the insertion target."""
+    current = nid
+    while current != stop_nid and isinstance(tree.data(current), ForNode) and not tree.children(current):
+        parent = tree.parent(current)
+        if parent is None:
+            raise AssertionError(f"empty loop {current} has no parent")
+        tree.graph.remove_node(current)
+        current = parent
 
 
 def _check_move_changes_position(tree: KernelTree, block_nid: int, target_loop_nid: int, index: int) -> None:
@@ -890,10 +1012,10 @@ class CodeMotion(Transform[CodeMotionOption]):
         placement/shape/frame is now an explicit BufferCompaction step, not an
         anonymous tail (see the 2026-07-14 BufferCompaction design).
         """
-        self._check_legality(ir, option)
+        invalidated_pipeline_loops = self._check_legality(ir, option)
         new_ir = copy.deepcopy(ir)
         _move(new_ir, block_nid=option.block_nid, target_loop_nid=option.target_loop_nid, index=option.index)
-        invalidate_stale_software_pipelines(new_ir)
+        invalidate_stale_software_pipelines(new_ir, invalidated_pipeline_loops)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
@@ -922,7 +1044,7 @@ class CodeMotion(Transform[CodeMotionOption]):
                 except TransformLegalityError:
                     continue
                 for index in indices:
-                    moved_leaf = ir.dependency._resolve(block_nid)
+                    moved_leaf = _dependency_leaf(ir, block_nid)
                     if (
                         ir.dependency.first_backward_edge_for_insertion(
                             moved_leaf, target_nid, index, topology=context.topology
@@ -940,8 +1062,9 @@ class CodeMotion(Transform[CodeMotionOption]):
         why one enumeration serves producer-sink and consumer-lift alike.
         """
         children = ir.tree.children(target_nid)
-        producers = ir.dependency.producers(block_nid)
-        consumers = ir.dependency.consumers(block_nid)
+        moved_leaf = _dependency_leaf(ir, block_nid)
+        producers = ir.dependency.producers(moved_leaf)
+        consumers = ir.dependency.consumers(moved_leaf)
         lp = -1
         fc = len(children)
         for i, child in enumerate(children):
@@ -962,7 +1085,7 @@ class CodeMotion(Transform[CodeMotionOption]):
 
     def _check_static_legality(
         self, ir: KernelIR, block_nid: int, target_loop_nid: int, context: _AnalysisContext | None
-    ) -> None:
+    ) -> frozenset[int]:
         """Check option legality that does not depend on an insertion slot."""
         if target_loop_nid not in ir.tree.graph:
             raise TransformLegalityError(f"target_loop_nid={target_loop_nid} not in tree")
@@ -980,13 +1103,14 @@ class CodeMotion(Transform[CodeMotionOption]):
                 f"target_loop_nid={target_loop_nid} is a descendant of moved block "
                 f"{block_nid} (cannot move under its own loop)"
             )
-        _check_versioned_pipeline_boundary(ir, block_nid, target_loop_nid, context)
+        return _check_pipeline_boundary(ir, block_nid, target_loop_nid, context)
 
-    def _check_legality(self, ir: KernelIR, option: CodeMotionOption) -> None:
+    def _check_legality(self, ir: KernelIR, option: CodeMotionOption) -> frozenset[int]:
         """Structural checks (target/block in graph, target a ForNode, target not a
         descendant of the block) then span-promotion ordering. No output guard."""
-        self._check_static_legality(ir, option.block_nid, option.target_loop_nid, None)
+        invalidated_pipeline_loops = self._check_static_legality(ir, option.block_nid, option.target_loop_nid, None)
         _check_move_preserves_dependencies(ir, option.block_nid, option.target_loop_nid, option.index)
+        return invalidated_pipeline_loops
 
 
 __all__ = ["_move", "_check_move_preserves_dependencies", "CodeMotion", "CodeMotionOption"]

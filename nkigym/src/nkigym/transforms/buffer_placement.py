@@ -9,8 +9,8 @@ from nkigym.ir import KernelIR
 from nkigym.ir.buffer_placement import place_buffer
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, KernelTree
-from nkigym.transforms._access_pattern import tensor_has_access_pattern
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
 
 
 @dataclass(frozen=True)

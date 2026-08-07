@@ -10,7 +10,8 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
-from nkigym.transforms._canonical_rewrite import (
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.canonical_rewrite import (
     canonical_spec,
     finalize_rewrite,
     is_canonical_block,
@@ -20,9 +21,8 @@ from nkigym.transforms._canonical_rewrite import (
     rewrite_block,
     single_leaf,
 )
-from nkigym.transforms._transpose_pattern import TransposeChain, match_transpose_chain
-from nkigym.transforms._tree_ops import _replace_in_parent_children
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.transpose_pattern import TransposeChain, match_transpose_chain
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 
 @dataclass(frozen=True)
@@ -176,19 +176,29 @@ def _validate_segment(
                     and stationary.physical_dtype() == stationary.dtype
                     and moving.physical_dtype() == moving.dtype
                 )
-                swapped_matmul_legal = axes and (
-                    canonical_spec(
-                        ir,
-                        NKIMatmul,
-                        {"stationary": moving.name, "moving": stationary.name, "dst": transpose_psum.name},
-                        {
-                            "K": matmul_block_data.axis_map["K"],
-                            "M": matmul_block_data.axis_map["N"],
-                            "N": matmul_block_data.axis_map["M"],
-                        },
-                        {},
+                partition_tile = NKIMatmul.MAX_TILE_SIZE["M"]
+                preserves_tiling = (
+                    isinstance(partition_tile, int)
+                    and stationary.shape[1] <= partition_tile
+                    and moving.shape[1] <= partition_tile
+                )
+                swapped_matmul_legal = (
+                    axes
+                    and preserves_tiling
+                    and (
+                        canonical_spec(
+                            ir,
+                            NKIMatmul,
+                            {"stationary": moving.name, "moving": stationary.name, "dst": transpose_psum.name},
+                            {
+                                "K": matmul_block_data.axis_map["K"],
+                                "M": matmul_block_data.axis_map["N"],
+                                "N": matmul_block_data.axis_map["M"],
+                            },
+                            {},
+                        )
+                        is not None
                     )
-                    is not None
                 )
                 exact_old_psum = set(ir.dependency.touches_by_tensor.get(old_psum, ())) == {
                     memset_leaf,

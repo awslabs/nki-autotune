@@ -11,7 +11,7 @@ from nkigym.ir.arith.expr import Const, Mul, Var
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole, NKIOp
-from nkigym.transforms._tree_ops import invalidate_stale_software_pipelines
+from nkigym.transforms.helper.tree_ops import invalidate_stale_software_pipelines
 
 
 @dataclass(frozen=True)

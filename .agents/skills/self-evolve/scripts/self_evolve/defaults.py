@@ -60,7 +60,7 @@ def agentic_tuning_spec(
     return spec
 
 
-def gates(profile_host: str) -> tuple[GateSpec, ...]:
+def gates() -> tuple[GateSpec, ...]:
     """Return the five candidate acceptance evaluations."""
     test_python = workflow_python()
     configured = (
@@ -87,7 +87,6 @@ def gates(profile_host: str) -> tuple[GateSpec, ...]:
             argv=(test_python, ".agents/skills/self-evolve/scripts/mfu_gate.py"),
             working_directory=".",
             timeout_seconds=7500,
-            environment=(("NKI_PROFILE_HOST", profile_host),),
         ),
         GateSpec(
             name="agentic-tuning",

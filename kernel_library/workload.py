@@ -50,6 +50,12 @@ def _validate_tolerance(name: str, value: float) -> None:
         raise ValueError(f"{name} must be finite and non-negative")
 
 
+def _validate_optional_percentage(name: str, value: float | None) -> None:
+    """Require an optional finite percentage."""
+    if value is not None and (isinstance(value, bool) or not math.isfinite(value) or value < 0.0 or value > 100.0):
+        raise ValueError(f"{name} must be a finite percentage in [0, 100] or None")
+
+
 @dataclass(frozen=True)
 class Workload:
     """Define one workload and its best-known optimization result.
@@ -63,6 +69,7 @@ class Workload:
         rtol: Relative tolerance for CPU validation.
         best_action_ladder: Ordered actions for the best retained schedule.
         historical_best_mfu: Highest measured MFU percentage, or ``None`` before profiling.
+        reference_mfu: Best manually achieved Kaena MFU percentage for the same workload and shape.
     """
 
     input_specs: InputSpecs
@@ -73,6 +80,7 @@ class Workload:
     rtol: float
     best_action_ladder: tuple[Action, ...] = ()
     historical_best_mfu: float | None = None
+    reference_mfu: float | None = None
 
     def __post_init__(self) -> None:
         """Validate the workload contract at its declaration site."""
@@ -86,13 +94,8 @@ class Workload:
             raise ValueError("f_nkigym must be decorated with @nkigym_kernel")
         if not isinstance(self.best_action_ladder, tuple):
             raise ValueError("best_action_ladder must be a tuple")
-        if self.historical_best_mfu is not None and (
-            isinstance(self.historical_best_mfu, bool)
-            or not math.isfinite(self.historical_best_mfu)
-            or self.historical_best_mfu < 0.0
-            or self.historical_best_mfu > 100.0
-        ):
-            raise ValueError("historical_best_mfu must be a finite percentage in [0, 100] or None")
+        _validate_optional_percentage("historical_best_mfu", self.historical_best_mfu)
+        _validate_optional_percentage("reference_mfu", self.reference_mfu)
 
     def generate_inputs(self, seed: int, input_specs: InputSpecs | None = None) -> dict[str, np.ndarray]:
         """Generate and validate replayable FP32 inputs."""

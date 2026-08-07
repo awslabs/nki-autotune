@@ -10,9 +10,9 @@ from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Expr
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, Buffer, ISANode, KernelTree
-from nkigym.transforms._access_pattern import tensor_has_access_pattern
-from nkigym.transforms._normalize import normalize_selected_tensor_regions, normalize_tensor_regions
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
+from nkigym.transforms.helper.normalize import normalize_selected_tensor_regions, normalize_tensor_regions
 
 _RegionSnapshot = tuple[tuple[tuple[Expr, Expr], ...], ...]
 _CompactionSnapshot = tuple[tuple[int, ...], _RegionSnapshot]

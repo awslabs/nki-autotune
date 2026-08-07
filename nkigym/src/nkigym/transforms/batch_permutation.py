@@ -9,8 +9,8 @@ from nkigym.ir import AccessPattern, Add, Const, Expr, KernelIR, Mul, substitute
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import AxisRole, BatchedPermutationContract, PermutationContract
-from nkigym.transforms._tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,6 @@ class BatchPermutation(Transform[BatchPermutationOption]):
         if copied_match is None:
             raise AssertionError("BatchPermutation match disappeared after deepcopy")
         _apply_match(new_ir, copied_match)
-        invalidate_stale_software_pipelines(new_ir)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
@@ -208,15 +207,6 @@ def _apply_match(ir: KernelIR, match: _BatchMatch) -> None:
     leaf = ir.tree.isa(match.leaf_nid)
     source = leaf.operand_bindings[match.contract.input_operand]
     output = leaf.operand_bindings[match.contract.output_operand]
-    source_buffer = ir.buffer(source.tensor)
-    output_buffer = ir.buffer(output.tensor)
-    expanded_rank = len(match.batching.permutation)
-    source_view = _make_access_pattern(
-        source, source_buffer, loop, match.batching.input_axes, match.batching.batch_axis, expanded_rank
-    )
-    output_axes = _output_axis_positions(match.contract, match.batching)
-    output_batch_axis = match.batching.permutation.index(match.batching.batch_axis)
-    output_view = _make_access_pattern(output, output_buffer, loop, output_axes, output_batch_axis, expanded_rank)
     widened_source = _widen_region(source, loop, match.source_axis)
     widened_output = _widen_region(output, loop, match.output_axis)
     bindings = dict(leaf.operand_bindings)
@@ -224,10 +214,6 @@ def _apply_match(ir: KernelIR, match: _BatchMatch) -> None:
     bindings[match.contract.output_operand] = widened_output
     kwargs = dict(leaf.kwargs)
     kwargs["axes"] = match.batching.permutation
-    access_patterns = {match.contract.input_operand: source_view, match.contract.output_operand: output_view}
-    ir.tree.graph.nodes[match.leaf_nid]["data"] = replace(
-        leaf, operand_bindings=bindings, kwargs=kwargs, access_patterns=access_patterns
-    )
     block = ir.tree.block(match.block_nid)
     substitutions: dict[str, Expr] = {loop.loop_var: Const(value=0)}
     ir.tree.graph.nodes[match.block_nid]["data"] = replace(
@@ -241,6 +227,21 @@ def _apply_match(ir: KernelIR, match: _BatchMatch) -> None:
         raise AssertionError(f"batch loop {match.loop_nid} has no parent")
     _replace_in_parent_children(ir.tree, parent, [match.loop_nid], [match.leaf_nid])
     ir.tree.graph.remove_node(match.loop_nid)
+    invalidate_stale_software_pipelines(ir)
+
+    source_buffer = ir.buffer(source.tensor)
+    output_buffer = ir.buffer(output.tensor)
+    expanded_rank = len(match.batching.permutation)
+    source_view = _make_access_pattern(
+        source, source_buffer, loop, match.batching.input_axes, match.batching.batch_axis, expanded_rank
+    )
+    output_axes = _output_axis_positions(match.contract, match.batching)
+    output_batch_axis = match.batching.permutation.index(match.batching.batch_axis)
+    output_view = _make_access_pattern(output, output_buffer, loop, output_axes, output_batch_axis, expanded_rank)
+    access_patterns = {match.contract.input_operand: source_view, match.contract.output_operand: output_view}
+    ir.tree.graph.nodes[match.leaf_nid]["data"] = replace(
+        leaf, operand_bindings=bindings, kwargs=kwargs, access_patterns=access_patterns
+    )
 
 
 def _output_axis_positions(contract: PermutationContract, batching: BatchedPermutationContract) -> tuple[int, ...]:

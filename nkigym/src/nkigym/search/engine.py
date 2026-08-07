@@ -46,6 +46,7 @@ class ProfilerGuidedRefinement:
         """Profile the root, then explore policy-selected branches."""
         self._prepare_run()
         finish_reason: str | None = None
+        can_revisit = True
         while finish_reason is None and (
             self.config.max_reasoning_steps is None or self._reasoning_steps < self.config.max_reasoning_steps
         ):
@@ -56,11 +57,17 @@ class ProfilerGuidedRefinement:
             active = self.nodes[self._active_node_id]
             actions = self._available_actions(active.node_id)
             reasoning_step = self._reasoning_steps + 1
+            observation_branchable_node_ids = branchable_node_ids if can_revisit else (self._active_node_id,)
+            branch_action_types = {
+                node_id: _action_type_names(self._available_actions(node_id))
+                for node_id in observation_branchable_node_ids
+            }
             observation = format_observation(
                 active=active,
                 nodes=self.nodes,
                 actions=actions,
-                branchable_node_ids=branchable_node_ids,
+                branchable_node_ids=observation_branchable_node_ids,
+                branch_action_types=branch_action_types,
                 config=self.config,
                 reasoning_step=reasoning_step,
             )
@@ -70,9 +77,19 @@ class ProfilerGuidedRefinement:
             self._write_decision(reasoning_step, decision)
             if decision.kind == "finish":
                 self._check_finish_decision(decision)
-                finish_reason = "policy finished"
+                if self._target_unmet():
+                    target = self.config.target_score
+                    if target is None:
+                        raise RuntimeError("target status changed while checking a finish decision")
+                    _log(f"rejected finish below target score {target:.4f}")
+                else:
+                    finish_reason = "policy finished"
             elif decision.kind == "revisit":
-                self._revisit(decision, branchable_node_ids)
+                if can_revisit:
+                    self._revisit(decision, branchable_node_ids)
+                    can_revisit = False
+                else:
+                    _log(f"rejected consecutive revisit to N{decision.base_node_id:03d}; apply or finish is required")
             elif decision.kind == "apply":
                 self._check_apply_base(decision, active.node_id)
                 selected = _selected_actions(decision, actions)
@@ -90,6 +107,7 @@ class ProfilerGuidedRefinement:
                     parent_id = node.node_id
                     _log(f"N{node.node_id:03d}: {item.description}; {node.evaluation.message}")
                 self._active_node_id = parent_id
+                can_revisit = True
             else:
                 raise ValueError(f"policy selected unknown decision kind {decision.kind!r}")
         if finish_reason is None:
@@ -172,6 +190,12 @@ class ProfilerGuidedRefinement:
         """Reject malformed finish decisions from non-JSON policy implementations."""
         if decision.base_node_id is not None or decision.action_ids:
             raise ValueError("finish requires base_node_id=None and no action_ids")
+
+    def _target_unmet(self) -> bool:
+        """Return whether measured evidence is still below a configured target."""
+        target = self.config.target_score
+        scores = [node.evaluation.score for node in self.nodes if node.evaluation.score is not None]
+        return target is not None and (not scores or max(scores) < target)
 
     def _check_apply_base(self, decision: AgentDecision, active_node_id: int) -> None:
         """Require action IDs to be interpreted against the active node's menu."""
@@ -308,7 +332,7 @@ def _selected_actions(decision: AgentDecision, actions: list[DescribedAction]) -
 def _plan_states(
     environment: KernelMDP, initial_state: KernelIR, selected: tuple[DescribedAction, ...]
 ) -> tuple[tuple[DescribedAction, KernelIR], ...]:
-    """Apply a sequence only when every action remains legal in order."""
+    """Apply the longest prefix whose actions remain legal in order."""
     state = initial_state
     steps: list[tuple[DescribedAction, KernelIR]] = []
     applied_ids: list[str] = []
@@ -316,9 +340,11 @@ def _plan_states(
         current_actions = describe_actions(state, environment.legal_actions(state))
         current_item = next((candidate for candidate in current_actions if candidate.action == item.action), None)
         if current_item is None:
-            raise ValueError(
-                f"policy action_id {item.action_id!r} is not legal after selected predecessors {applied_ids}"
+            _log(
+                f"rejected policy suffix beginning with {item.action_id!r}; "
+                f"action is not legal after selected predecessors {applied_ids}"
             )
+            break
         state = environment.step(state, item.action)
         steps.append((current_item, state))
         applied_ids.append(item.action_id)
@@ -329,6 +355,11 @@ def _action_key(action: Action) -> str:
     """Return a stable identity for one transform option within a run."""
     transform, option = action
     return f"{type(transform).__module__}.{type(transform).__qualname__}:{option!r}"
+
+
+def _action_type_names(actions: list[DescribedAction]) -> tuple[str, ...]:
+    """Return sorted transform types represented in one action menu."""
+    return tuple(sorted({type(item.action[0]).__name__ for item in actions}))
 
 
 def _successful_score(node: SearchNode) -> float:

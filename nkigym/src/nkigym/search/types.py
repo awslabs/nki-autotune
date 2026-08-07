@@ -54,6 +54,7 @@ class SearchConfig:
     cache_dir: Path
     max_reasoning_steps: int | None
     workload_guidance: str
+    target_score: float | None
 
 
 @dataclass(frozen=True)

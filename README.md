@@ -80,14 +80,13 @@ reductions. Unsupported operations raise `ValueError`.
 
 ## Agent Workflows
 
-Use `$debug-nkigym` to run the standalone repository tests directly in the
-current checkout and fix implementation bugs until they pass. Use
-`$self-evolve` separately to refine IR, operations, code generation, and
-transforms from measured search feedback. It first runs the standalone tests as
-a read-only health check. If a test fails, it stops and reports the failure
-without repairing it or invoking `$debug-nkigym`. Refinement edits happen
-directly in the current branch checkout. Run artifacts remain under the external
-state directory; no detached Git worktree is created:
+Use `$self-evolve` to refine IR, operations, code generation, and transforms
+from measured search feedback. It first runs the standalone tests as a
+read-only health check. If a test fails, it stops and reports the failure
+without repairing it. Debug failing tests separately before starting or
+resuming refinement. Refinement edits happen directly in the current branch
+checkout. Run artifacts remain under the external state directory; no detached
+Git worktree is created:
 
 ```bash
 python .agents/skills/self-evolve/scripts/develop.py start matmul-lhs-t \
@@ -97,13 +96,12 @@ python .agents/skills/self-evolve/scripts/develop.py start matmul-lhs-t \
 ```
 
 If a run later reports `mode=repair`, `$self-evolve` stops and reports the
-failure. Debugging requires a separate, explicit `$debug-nkigym` invocation.
+failure. Resolve the failure before resuming the run.
 
 The selectable kernel-library workloads are `attention`, `matmul-lhs`,
 `matmul-lhs-t`, and `rmsnorm-matmul`. Every selection also requires one of
 the shape keys registered for that workload. See the
-[`self-evolve` skill](.agents/skills/self-evolve/SKILL.md) for refinement and
-the [`debug-nkigym` skill](.agents/skills/debug-nkigym/SKILL.md) for repair.
+[`self-evolve` skill](.agents/skills/self-evolve/SKILL.md) for refinement.
 
 ## Kernel Library
 

@@ -6,20 +6,14 @@ import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.tree import BlockNode, BufferRegion
+from nkigym.ir.arith.expr import to_affine
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.base import PointwiseContract
 from nkigym.ops.tensor_scalar import NKITensorScalar
-from nkigym.transforms._canonical_rewrite import (
-    append_block,
-    append_root_buffers,
-    finalize_rewrite,
-    fresh_name,
-    required_spec,
-    single_leaf,
-)
-from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.canonical_rewrite import append_root_buffers, finalize_rewrite, fresh_name, single_leaf
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 
 @dataclass(frozen=True)
@@ -110,6 +104,7 @@ def _resolve(ir: KernelIR, option: DecomposeBroadcastSubtractOption) -> _Match |
                     and broadcast_buffer.location == "sbuf"
                     and broadcast_buffer.shape == (partition_extent,)
                     and broadcast_buffer.versions == 1
+                    and not _has_internal_producer(ir, block_nid, broadcast.tensor)
                 ):
                     result = _Match(
                         block_nid=block_nid,
@@ -121,26 +116,30 @@ def _resolve(ir: KernelIR, option: DecomposeBroadcastSubtractOption) -> _Match |
     return result
 
 
+def _has_internal_producer(ir: KernelIR, block_nid: int, tensor: str) -> bool:
+    """Return whether ``tensor`` is produced after entry to ``block_nid``."""
+    result = False
+    for nid in ir.tree.descendants(block_nid):
+        if isinstance(ir.tree.data(nid), ISANode) and any(
+            region.tensor == tensor for region in ir.dependency.info(nid).write_regions
+        ):
+            result = True
+    return result
+
+
 def _rewrite(ir: KernelIR, match: _Match) -> None:
     """Insert the negation and retarget the subtraction as addition."""
     source_buffer = ir.buffer(match.broadcast.tensor)
     negative_name = fresh_name(ir, f"{match.broadcast.tensor}_negative")
     append_root_buffers(ir, (replace(source_buffer, name=negative_name),))
-    spec = required_spec(
-        ir,
-        NKIActivation,
-        {"data": match.broadcast.tensor, "dst": negative_name},
-        {"P": match.partition_axis},
-        {"op": "copy", "scale": -1.0},
-    )
-    negation_block = append_block(ir.tree, spec)
+    negative_region = replace(match.broadcast, tensor=negative_name)
+    negation_block = _append_negation_block(ir, match, negative_region)
     parent = ir.tree.parent(match.block_nid)
     if parent is None:
         raise AssertionError(f"pointwise block {match.block_nid} has no parent")
     _replace_in_parent_children(ir.tree, parent, [match.block_nid], [negation_block, match.block_nid])
 
     leaf = ir.tree.isa(match.leaf_nid)
-    negative_region = replace(match.broadcast, tensor=negative_name)
     bindings = dict(leaf.operand_bindings)
     bindings[match.broadcast_operand] = negative_region
     kwargs = dict(leaf.kwargs)
@@ -151,6 +150,50 @@ def _rewrite(ir: KernelIR, match: _Match) -> None:
     reads = tuple(negative_region if region == match.broadcast else region for region in block.reads)
     ir.tree.graph.nodes[match.block_nid]["data"] = replace(block, reads=reads)
     finalize_rewrite(ir)
+
+
+def _append_negation_block(ir: KernelIR, match: _Match, negative_region: BufferRegion) -> int:
+    """Append a negation with the pointwise block's exact partition scope."""
+    pointwise = ir.tree.block(match.block_nid)
+    partition_bindings = [
+        (iter_var, iter_value)
+        for iter_var, iter_value in zip(pointwise.iter_vars, pointwise.iter_values)
+        if iter_var.axis == match.partition_axis
+    ]
+    if len(partition_bindings) != 1:
+        raise AssertionError(
+            f"pointwise block {match.block_nid} must bind partition axis {match.partition_axis!r} exactly once"
+        )
+    partition_iter_var, partition_iter_value = partition_bindings[0]
+    bound_names = {name for name in to_affine(partition_iter_value) if name is not None}
+    ancestors = ir.tree.ancestors(match.leaf_nid)
+    block_index = ancestors.index(match.block_nid)
+    local_loops = tuple(
+        node
+        for nid in ancestors[block_index + 1 :]
+        if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in bound_names
+    )
+    block = BlockNode(
+        iter_vars=(partition_iter_var,),
+        iter_values=(partition_iter_value,),
+        reads=(match.broadcast,),
+        writes=(negative_region,),
+        alloc_buffers=(),
+        axis_map={"P": match.partition_axis},
+    )
+    block_nid = ir.tree.add_node(block)
+    parent_nid = block_nid
+    for loop in local_loops:
+        parent_nid = ir.tree.add_node(loop, parent=parent_nid)
+    ir.tree.add_node(
+        ISANode(
+            op_cls=NKIActivation,
+            operand_bindings={"data": match.broadcast, "dst": negative_region},
+            kwargs={"op": "copy", "scale": -1.0},
+        ),
+        parent=parent_nid,
+    )
+    return block_nid
 
 
 __all__ = ["DecomposeBroadcastSubtract", "DecomposeBroadcastSubtractOption"]

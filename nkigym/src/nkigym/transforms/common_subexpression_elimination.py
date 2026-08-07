@@ -8,10 +8,10 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import PointwiseContract
-from nkigym.transforms._canonical_rewrite import finalize_rewrite, remove_buffers, single_leaf
-from nkigym.transforms._online_fusion_types import contract_input_operands
-from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, remove_buffers, single_leaf
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
+from nkigym.transforms.helper.value_graph import contract_input_operands
 
 
 @dataclass(frozen=True)

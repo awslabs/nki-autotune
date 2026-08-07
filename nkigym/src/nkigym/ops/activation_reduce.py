@@ -1,12 +1,4 @@
-"""Fused activation + free-axis reduce op: mirrors ``nisa.activation_reduce``.
-
-Math: ``reduce_op(op(data), axis=F)``. Output is the per-row reduction vector.
-The fully activated tile is an internal byproduct the ISA call discards.
-
-OPERAND_AXES reflects the valid ISA signature: ``data`` is the input
-tile, ``dst`` receives the activated scratch (discarded by downstream
-consumers), and ``reduce_res`` receives the per-row reduction result.
-"""
+"""Fused activation and free-axis reduction."""
 
 from collections.abc import Mapping
 from numbers import Real
@@ -32,32 +24,7 @@ _RED_FNS: dict[str, Any] = {"add": np.sum, "max": np.max}
 
 
 class NKIActivationReduce(NKIOp):
-    """Fused activation + free-axis reduce — mirrors ``nisa.activation_reduce``.
-
-    Math: ``reduce_op(op(data), axis=F)``. Output is the ``(P,)`` per-row
-    reduction vector. The fully activated ``(P, F)`` tile is an internal
-    byproduct the gadget discards.
-
-    Kwargs mirror the valid subset of ``nisa.activation_reduce``:
-
-    * ``op``: activation applied per-element before the reduce.
-    * ``reduce_op``: reduction operator along the free axis.
-
-    Fused closures (e.g. rmsnorm's ``rsqrt(sum(x²)·scale + bias)``) must
-    be spelled out in the DSL as a separate ``NKIActivation(op="rsqrt",
-    scale=..., bias=...)`` call on the reduction output — not as
-    ``post_op``/``scale``/``bias`` kwargs on this op.
-
-    Lowering (Pattern 2): one ``nisa.activation_reduce`` per F-tile
-    writes to a distinct slot of the op-local ``slot_vec`` buffer;
-    after the F loop exits, one ``nisa.tensor_reduce(axis=2)`` folds
-    ``slot_vec`` into the op's ``(P, 1)`` output.
-
-    Future work: a hoist transform that pulls ``activation_reduce`` out
-    of the F loop, combined with DCE on the closing ``tensor_reduce``
-    (trivial when ``num_f_tiles == 1``), will reach Pattern 1 (one
-    full-F ``activation_reduce`` call, no slot vector) monotonically.
-    """
+    """Apply an activation and reduce the result along the free axis."""
 
     NAME: ClassVar[str] = "activation_reduce"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {
@@ -72,10 +39,6 @@ class NKIActivationReduce(NKIOp):
         "bias": frozenset({"sbuf", "psum"}),
     }
     RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "slot"
-    """The F axis is a reduction axis — the op iterates over all F tiles
-    before its output is complete. Render emits an F-loop memset prologue
-    (on the reduce accumulator) and places downstream consumers outside
-    this F-loop, symmetric to how matmul's K dim is handled."""
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
@@ -106,14 +69,7 @@ class NKIActivationReduce(NKIOp):
             raise TypeError(f"NKIActivationReduce(bias=<role={bias_role}>) expects sbuf or psum")
 
     def _run(self, **kwargs: Any) -> Any:
-        """CPU simulation: allocate and return ``reduce_op(op(data), axis=F)``.
-
-        Mirrors the valid ISA signature: configuration kwargs are
-        ``{op, reduce_op}``; the operand kwarg is ``{data}``. Extra
-        kwargs raise ``TypeError`` to keep the DSL honest. The activated
-        ``(P, F)`` tile is an internal byproduct; the op's primary output
-        is the ``(P,)`` per-row reduction vector.
-        """
+        """Return ``reduce_op(op(data), axis=F)`` for CPU simulation."""
         allowed = {"data", "op", "reduce_op", "scale", "bias"}
         extra = set(kwargs) - allowed
         if extra:

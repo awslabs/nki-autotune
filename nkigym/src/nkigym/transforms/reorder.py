@@ -10,10 +10,10 @@ from nkigym.ir.arith.expr import Var, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, KernelTree, role_of
 from nkigym.ops.base import AxisRole
-from nkigym.transforms._access_pattern import subtree_has_access_patterns
-from nkigym.transforms._normalize import normalize_block
-from nkigym.transforms._tree_ops import invalidate_stale_software_pipelines
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
+from nkigym.transforms.helper.normalize import _substitute_block_regions, normalize_block
+from nkigym.transforms.helper.tree_ops import invalidate_stale_software_pipelines
 
 
 @dataclass(frozen=True)
@@ -75,8 +75,16 @@ class Reorder(Transform[ReorderOption]):
         """
         if _dim_of(ir.tree, option.outer_nid) != _dim_of(ir.tree, option.inner_nid):
             return
+        outer = ir.tree.loop(option.outer_nid)
+        inner = ir.tree.loop(option.inner_nid)
+        substitutions = {outer.loop_var: Var(name=inner.loop_var), inner.loop_var: Var(name=outer.loop_var)}
+        ir.tree.graph.nodes[option.outer_nid]["data"] = ForNode(loop_var=inner.loop_var, extent=outer.extent)
+        ir.tree.graph.nodes[option.inner_nid]["data"] = ForNode(loop_var=outer.loop_var, extent=inner.extent)
         block_nid = _enclosing_block_nid(ir.tree, option.outer_nid)
-        for nid in (block_nid, *_nested_block_nids(ir.tree, block_nid)):
+        affected_blocks = (block_nid, *ir.tree.blocks(option.outer_nid))
+        for nid in affected_blocks:
+            _substitute_block_regions(ir.tree, nid, substitutions)
+        for nid in affected_blocks:
             normalize_block(ir.tree, nid)
 
     def _is_legal(self, ir: KernelIR, option: ReorderOption) -> bool:
@@ -182,11 +190,6 @@ def _enclosing_block_nid(tree: KernelTree, nid: int) -> int:
     if result is None:
         raise ValueError(f"no enclosing BlockNode for {nid}")
     return result
-
-
-def _nested_block_nids(tree: KernelTree, block_nid: int) -> list[int]:
-    """BlockNode descendants of ``block_nid`` (co-located sub-blocks), excluding itself."""
-    return [d for d in tree.descendants(block_nid) if d != block_nid and isinstance(tree.data(d), BlockNode)]
 
 
 __all__ = ["Reorder", "ReorderOption"]

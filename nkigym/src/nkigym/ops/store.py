@@ -21,6 +21,7 @@ class NKIStore(NKIOp):
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_ROLE: ClassVar[str] = "stored"
     OUTPUT_LOCATION: ClassVar[str] = "shared_hbm"
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"sbuf"})}
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> CopyContract:

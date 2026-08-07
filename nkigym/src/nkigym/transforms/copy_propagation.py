@@ -8,9 +8,9 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import BlockNode, BufferRegion, ISANode
 from nkigym.ops.base import CopyContract
-from nkigym.transforms._canonical_rewrite import finalize_rewrite, remove_buffers, single_leaf
-from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, remove_buffers, single_leaf
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 
 @dataclass(frozen=True)
@@ -120,6 +120,9 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             return result
         if tuple(width for _lower, width in source.ranges) != tuple(width for _lower, width in copied.ranges):
             return result
+        copy_block = ir.tree.block(copy_nid)
+        if any(buffer.name != copied.tensor for buffer in copy_block.alloc_buffers):
+            return result
         if not self._has_single_use_and_definition(ir, copied.tensor, copy_leaf_nid, consumer_leaf_nid):
             return result
         result = _CopyPropagationMatch(
@@ -176,11 +179,20 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         parent = ir.tree.parent(match.option.copy_block_nid)
         if parent is None:
             raise AssertionError(f"copy block {match.option.copy_block_nid} has no parent")
-        _replace_in_parent_children(ir.tree, parent, [match.option.copy_block_nid], [])
-        ir.tree.graph.remove_nodes_from(
-            {match.option.copy_block_nid, *ir.tree.descendants(match.option.copy_block_nid)}
-        )
+        copy_parent = ir.tree.parent(match.copy_leaf_nid)
+        if copy_parent is None:
+            raise AssertionError(f"copy leaf {match.copy_leaf_nid} has no parent")
         remove_buffers(ir, {match.copied.tensor})
+        ir.tree.graph.remove_node(match.copy_leaf_nid)
+        while copy_parent != match.option.copy_block_nid and not ir.tree.children(copy_parent):
+            empty_loop = copy_parent
+            copy_parent = ir.tree.parent(empty_loop)
+            if copy_parent is None:
+                raise AssertionError(f"copy loop {empty_loop} has no parent")
+            ir.tree.graph.remove_node(empty_loop)
+        remaining = ir.tree.children(match.option.copy_block_nid)
+        _replace_in_parent_children(ir.tree, parent, [match.option.copy_block_nid], remaining)
+        ir.tree.graph.remove_node(match.option.copy_block_nid)
         finalize_rewrite(ir)
 
 

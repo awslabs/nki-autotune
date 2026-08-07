@@ -11,9 +11,9 @@ from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, IterVar
 from nkigym.ops.base import AxisRole
 from nkigym.ops.dma_transpose import NKIDMATranspose
 from nkigym.ops.load import NKILoad
-from nkigym.transforms._canonical_rewrite import finalize_rewrite, is_canonical_block, remove_buffers, single_leaf
-from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, is_canonical_block, remove_buffers, single_leaf
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,8 @@ class _Match:
     output: str
     first_axis: str
     second_axis: str
+    first_tile: int
+    second_tile: int
 
 
 class TransposeThroughLoad(Transform[TransposeThroughLoadOption]):
@@ -114,7 +116,18 @@ def _validate(ir: KernelIR, load_block: int, transpose_block: int) -> _Match | N
                     buffer.physical_dtype() == source_buffer.dtype
                     for buffer in (source_buffer, loaded_buffer, output_buffer)
                 )
-                divisible = all(extent % 128 == 0 for extent in source_buffer.shape)
+                transpose_source = transpose.operand_bindings["src"]
+                tiles = tuple(
+                    width.value if isinstance(width, Const) and isinstance(width.value, int) else None
+                    for _lower, width in transpose_source.ranges
+                )
+                tileable = len(tiles) == 2 and all(
+                    tile is not None
+                    and NKIDMATranspose.MIN_TILE_SIZE[axis] <= tile
+                    and tile <= NKIDMATranspose.HBM_SOURCE_MAX_TILE_SIZE[axis]
+                    and extent % tile == 0
+                    for extent, axis, tile in zip(source_buffer.shape, ("P", "F"), tiles)
+                )
                 exact_loaded = set(ir.dependency.touches_by_tensor.get(loaded, ())) == {load_leaf, transpose_leaf}
                 deleted_allocations = {buffer.name for buffer in ir.tree.block(transpose_block).alloc_buffers}
                 preserves_ownership = deleted_allocations <= {loaded, output}
@@ -127,13 +140,16 @@ def _validate(ir: KernelIR, load_block: int, transpose_block: int) -> _Match | N
                     and storage
                     and dtype
                     and physical_dtype
-                    and divisible
+                    and tileable
                     and exact_loaded
                     and preserves_ownership
                     and axes
                 ):
                     assert isinstance(first_axis, str)
                     assert isinstance(second_axis, str)
+                    first_tile, second_tile = tiles
+                    assert isinstance(first_tile, int)
+                    assert isinstance(second_tile, int)
                     result = _Match(
                         load_block=load_block,
                         transpose_block=transpose_block,
@@ -142,6 +158,8 @@ def _validate(ir: KernelIR, load_block: int, transpose_block: int) -> _Match | N
                         output=output,
                         first_axis=first_axis,
                         second_axis=second_axis,
+                        first_tile=first_tile,
+                        second_tile=second_tile,
                     )
     return result
 
@@ -149,11 +167,10 @@ def _validate(ir: KernelIR, load_block: int, transpose_block: int) -> _Match | N
 def _apply_match(ir: KernelIR, match: _Match) -> None:
     """Rewrite a validated segment in place."""
     source = ir.buffer(match.source)
-    first_tile = min(source.shape[0], 512)
-    if source.shape[0] % first_tile != 0:
-        raise AssertionError(f"{match.source} extent {source.shape[0]} is not tiled by {first_tile}")
+    first_tile = match.first_tile
+    second_tile = match.second_tile
     first_trip = source.shape[0] // first_tile
-    second_trip = source.shape[1] // 128
+    second_trip = source.shape[1] // second_tile
     first_loop = f"i_{match.first_axis}_0"
     second_loop = f"i_{match.second_axis}_0"
     first_value = Var(name=first_loop) if first_trip > 1 else Const(value=0)
@@ -162,13 +179,13 @@ def _apply_match(ir: KernelIR, match: _Match) -> None:
         tensor=match.source,
         ranges=(
             (Mul(left=first_value, right=Const(value=first_tile)), Const(value=first_tile)),
-            (Mul(left=second_value, right=Const(value=128)), Const(value=128)),
+            (Mul(left=second_value, right=Const(value=second_tile)), Const(value=second_tile)),
         ),
     )
     dst_region = BufferRegion(
         tensor=match.output,
         ranges=(
-            (second_value, Const(value=128)),
+            (second_value, Const(value=second_tile)),
             (Mul(left=first_value, right=Const(value=first_tile)), Const(value=first_tile)),
         ),
     )

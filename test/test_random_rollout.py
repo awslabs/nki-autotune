@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import cast
 
 import numpy as np
+from config import SIMULATION_HOSTS
 
 from kernel_library import Workload
 from kernel_library.attention_q16384_kv16384_d128 import HEAD_DIM
@@ -36,9 +37,6 @@ TILE_SIZE = NKIMatmul.MIN_TILE_SIZE["K"]
 MAX_EXTENT_TILES = 8
 MAX_MATMUL_TILE_VOLUME = 60
 MAX_ATTENTION_TILE_AREA = 20
-RUN_SEED_ENVIRONMENT = "NKI_RANDOM_ROLLOUT_SEED"
-SIMULATION_HOSTS_ENVIRONMENT = "NKI_SIMULATION_HOSTS"
-DEFAULT_SIMULATION_HOSTS = ("gym-cpu-1", "gym-cpu-2", "gym-cpu-3", "gym-cpu-4")
 TRANSFORMS = public_transforms()
 AnalysisResult = tuple[int, tuple[TransformOption, ...], float]
 
@@ -132,17 +130,8 @@ def _rmsnorm_matmul_workload(k: int, m: int, n: int) -> RolloutWorkload:
 
 
 def _run_seed() -> int:
-    """Return a fresh run seed unless an explicit replay seed is configured."""
-    configured = os.environ.get(RUN_SEED_ENVIRONMENT)
-    if configured is None:
-        seed = random.SystemRandom().randrange(1 << 63)
-    else:
-        try:
-            seed = int(configured, 0)
-        except ValueError as error:
-            raise ValueError(f"{RUN_SEED_ENVIRONMENT} must be an integer") from error
-        if seed < 0 or seed >= 1 << 63:
-            raise ValueError(f"{RUN_SEED_ENVIRONMENT} must be in [0, {1 << 63})")
+    """Return a fresh run seed."""
+    seed = random.SystemRandom().randrange(1 << 63)
     return seed
 
 
@@ -200,13 +189,8 @@ def _random_workloads(rng: random.Random) -> tuple[RolloutWorkload, ...]:
 
 
 def _simulation_hosts() -> list[str]:
-    """Return configured CPU simulation hosts or the canonical four-host pool."""
-    configured = os.environ.get(SIMULATION_HOSTS_ENVIRONMENT)
-    raw_hosts = configured.split(",") if configured is not None else list(DEFAULT_SIMULATION_HOSTS)
-    hosts = [host.strip() for host in raw_hosts]
-    if not hosts or any(not host for host in hosts):
-        raise ValueError(f"{SIMULATION_HOSTS_ENVIRONMENT} must be a comma-separated list of SSH hosts")
-    return hosts
+    """Return the configured CPU simulation host pool."""
+    return list(SIMULATION_HOSTS)
 
 
 def _rollout(workload: RolloutWorkload, seed: int) -> Iterator[tuple[str, KernelIR]]:
@@ -346,7 +330,7 @@ def test_one_random_rollout_per_randomized_shape_preserves_every_generated_kerne
     """One 500-step rollout per newly sampled shape preserves every generated kernel."""
     run_seed = _run_seed()
     rng = random.Random(run_seed)
-    print(f"{RUN_SEED_ENVIRONMENT}={run_seed}", flush=True)
+    print(f"random_rollout_seed={run_seed}", flush=True)
     workloads = _random_workloads(rng)
     tasks: list[RolloutTask] = []
     for workload in workloads:
@@ -362,7 +346,7 @@ def test_one_random_rollout_per_randomized_shape_preserves_every_generated_kerne
         definition = _workload_for_task(task).definition
         cases_by_tolerance.setdefault((definition.atol, definition.rtol), []).extend(workload_cases)
     hosts = _simulation_hosts()
-    print(f"{SIMULATION_HOSTS_ENVIRONMENT}={','.join(hosts)}", flush=True)
+    print(f"simulation_hosts={','.join(hosts)}", flush=True)
     completed = 0
     for (atol, rtol), cases in cases_by_tolerance.items():
         print(f"validating {len(cases)} cases with atol={atol:g}, rtol={rtol:g}", flush=True)

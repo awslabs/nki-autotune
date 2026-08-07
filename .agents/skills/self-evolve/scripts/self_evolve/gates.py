@@ -9,7 +9,6 @@ import shlex
 import signal
 import subprocess
 import time
-from collections.abc import Mapping
 from pathlib import Path
 
 from self_evolve.types import GateResult, GateSpec
@@ -19,7 +18,6 @@ _START_FAILURE_EXIT_CODE = 127
 _TERMINATION_GRACE_SECONDS = 5
 _TERMINATION_POLL_SECONDS = 0.05
 _LOGGER = logging.getLogger(__name__)
-_GATE_ARTIFACT_DIRECTORY_ENV = "NKIGYM_GATE_ARTIFACT_DIRECTORY"
 
 
 def candidate_environment(worktree: Path) -> dict[str, str]:
@@ -111,9 +109,16 @@ def _interrupt_process_group(process: subprocess.Popen[str]) -> None:
             process.wait()
 
 
-def run_gate(
-    spec: GateSpec, worktree: Path, gate_directory: Path, additional_environment: tuple[tuple[str, str], ...] = ()
-) -> GateResult:
+def _gate_command(argv: tuple[str, ...], artifact_directory: Path) -> tuple[str, ...]:
+    """Add the standard artifact path argument for one gate command."""
+    if len(argv) >= 3 and argv[1:3] == ("-m", "pytest"):
+        command = (*argv, "--basetemp", str(artifact_directory / "pytest"))
+    else:
+        command = (*argv, "--gate-artifact-directory", str(artifact_directory))
+    return command
+
+
+def run_gate(spec: GateSpec, worktree: Path, gate_directory: Path) -> GateResult:
     """Run one gate in the candidate and capture combined output."""
     candidate_root = worktree.resolve()
     working_directory = (candidate_root / spec.working_directory).resolve()
@@ -123,19 +128,19 @@ def run_gate(
         raise ValueError(f"gate working directory does not exist: {working_directory}")
     log_path = gate_directory / _log_name(spec.name)
     artifact_directory = gate_directory / f"{log_path.stem}-artifacts"
+    artifact_directory.mkdir(parents=True, exist_ok=True)
     environment = candidate_environment(candidate_root)
     environment.update(spec.environment)
-    environment.update(additional_environment)
-    environment[_GATE_ARTIFACT_DIRECTORY_ENV] = str(artifact_directory)
+    command = _gate_command(spec.argv, artifact_directory)
     _LOGGER.info("gate | started | %s | log=%s", spec.name, log_path)
     started = time.monotonic()
     timed_out = False
     exit_code = _START_FAILURE_EXIT_CODE
     with log_path.open("w", encoding="utf-8") as log:
-        log.write(f"$ {shlex.join(spec.argv)}\n\n")
+        log.write(f"$ {shlex.join(command)}\n\n")
         try:
             process = subprocess.Popen(
-                spec.argv,
+                command,
                 cwd=working_directory,
                 env=environment,
                 stdout=log,
@@ -164,7 +169,7 @@ def run_gate(
         log.write(f"\nexit_code={exit_code} duration_seconds={duration:.3f}\n")
     result = GateResult(
         name=spec.name,
-        argv=spec.argv,
+        argv=command,
         exit_code=exit_code,
         timed_out=timed_out,
         duration_seconds=duration,
@@ -176,18 +181,12 @@ def run_gate(
     return result
 
 
-def run_gates(
-    specs: tuple[GateSpec, ...],
-    worktree: Path,
-    gate_directory: Path,
-    additional_environments: Mapping[str, tuple[tuple[str, str], ...]] | None = None,
-) -> tuple[GateResult, ...]:
+def run_gates(specs: tuple[GateSpec, ...], worktree: Path, gate_directory: Path) -> tuple[GateResult, ...]:
     """Run gates sequentially through the first failure."""
     gate_directory.mkdir(parents=True, exist_ok=True)
     results: list[GateResult] = []
     for spec in specs:
-        environment = () if additional_environments is None else additional_environments.get(spec.name, ())
-        result = run_gate(spec, worktree, gate_directory, environment)
+        result = run_gate(spec, worktree, gate_directory)
         results.append(result)
         if not result.passed:
             break

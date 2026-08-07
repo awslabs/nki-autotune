@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TextIO
 
@@ -24,8 +24,18 @@ _REFINEMENT_PREFIX = "[refinement] "
 _LOG_POLL_SECONDS = 0.1
 _LOGGER = logging.getLogger(__name__)
 
-AGENTIC_TUNING_CONTEXT_ENV = "NKIGYM_AGENTIC_TUNING_CONTEXT"
 AGENTIC_TUNING_CONTEXT_VERSION = 1
+AGENTIC_TUNING_MAX_REGRESSION_POINTS = 1.0
+
+
+def agentic_target_score(historical_best_score: float | None) -> float | None:
+    """Return the minimum score accepted relative to historical evidence."""
+    target = (
+        None
+        if historical_best_score is None
+        else max(0.0, historical_best_score - AGENTIC_TUNING_MAX_REGRESSION_POINTS)
+    )
+    return target
 
 
 @dataclass(frozen=True)
@@ -36,6 +46,19 @@ class AgenticTuningSpec:
     argv: tuple[str, ...]
     required_artifacts: tuple[str, ...]
     timeout_seconds: int
+    target_score: float | None = None
+
+    def __post_init__(self) -> None:
+        """Reject an invalid optional MFU target."""
+        target = self.target_score
+        if target is not None and (
+            isinstance(target, bool)
+            or not isinstance(target, (int, float))
+            or not math.isfinite(target)
+            or target < 0.0
+            or target > 100.0
+        ):
+            raise ValueError("agentic tuning target_score must be a finite percentage in [0, 100] or null")
 
     def as_dict(self) -> dict[str, object]:
         """Return a JSON-compatible representation."""
@@ -44,6 +67,7 @@ class AgenticTuningSpec:
             "argv": list(self.argv),
             "required_artifacts": list(self.required_artifacts),
             "timeout_seconds": self.timeout_seconds,
+            "target_score": self.target_score,
         }
 
     @classmethod
@@ -55,6 +79,7 @@ class AgenticTuningSpec:
         raw_argv = value.get("argv")
         raw_artifacts = value.get("required_artifacts")
         timeout_seconds = value.get("timeout_seconds")
+        raw_target_score = value.get("target_score")
         if not isinstance(name, str) or not name:
             raise ValueError("agentic tuning spec name must be a non-empty string")
         if not isinstance(raw_argv, list) or not raw_argv or any(not isinstance(arg, str) for arg in raw_argv):
@@ -67,8 +92,20 @@ class AgenticTuningSpec:
             raise ValueError("agentic tuning spec required_artifacts must be a non-empty list of strings")
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or timeout_seconds < 1:
             raise ValueError("agentic tuning spec timeout_seconds must be a positive integer")
+        if raw_target_score is not None and (
+            isinstance(raw_target_score, bool)
+            or not isinstance(raw_target_score, (int, float))
+            or not math.isfinite(raw_target_score)
+            or raw_target_score < 0.0
+            or raw_target_score > 100.0
+        ):
+            raise ValueError("agentic tuning spec target_score must be a finite percentage in [0, 100] or null")
         return cls(
-            name=name, argv=tuple(raw_argv), required_artifacts=tuple(raw_artifacts), timeout_seconds=timeout_seconds
+            name=name,
+            argv=tuple(raw_argv),
+            required_artifacts=tuple(raw_artifacts),
+            timeout_seconds=timeout_seconds,
+            target_score=None if raw_target_score is None else float(raw_target_score),
         )
 
 
@@ -80,6 +117,12 @@ class AgenticTuningContext:
     baseline_tree: str
     tuning: AgenticTuningSpec
     historical_best_score: float | None
+
+    def __post_init__(self) -> None:
+        """Derive the policy's accepted MFU floor from historical evidence."""
+        target = agentic_target_score(self.historical_best_score)
+        if target is not None:
+            object.__setattr__(self, "tuning", replace(self.tuning, target_score=target))
 
     def as_dict(self) -> dict[str, object]:
         """Return the versioned JSON-compatible tuning context."""
@@ -384,13 +427,24 @@ def _run_process(
     return exit_code, timed_out, duration
 
 
+def _candidate_environment(worktree: Path) -> dict[str, str]:
+    """Build the subprocess environment for one candidate checkout."""
+    environment = dict(os.environ)
+    source_roots = (worktree / "nkigym/src", worktree)
+    existing = environment.get("PYTHONPATH")
+    entries = [str(path) for path in source_roots]
+    if existing:
+        entries.append(existing)
+    environment["PYTHONPATH"] = os.pathsep.join(entries)
+    return environment
+
+
 def run_agentic_tuning(
     spec: AgenticTuningSpec,
     program_directory: Path,
     worktree: Path,
     output_directory: Path,
     *,
-    environment: Mapping[str, str],
     source_fingerprint: Callable[[], str],
 ) -> AgenticTuningResult:
     """Run one evidence-producing search without permitting input changes."""
@@ -402,8 +456,16 @@ def run_agentic_tuning(
     program_before = _program_snapshot(isolated_program_directory)
     source_before = source_fingerprint()
     log_path = output_directory / "agentic-tuning.log"
-    command = (*spec.argv, "--trace-dir", str(artifact_directory), "--program-dir", str(isolated_program_directory))
-    process_environment = dict(environment)
+    target_arguments = () if spec.target_score is None else ("--target-score", str(spec.target_score))
+    command = (
+        *spec.argv,
+        *target_arguments,
+        "--trace-dir",
+        str(artifact_directory),
+        "--program-dir",
+        str(isolated_program_directory),
+    )
+    process_environment = _candidate_environment(worktree)
     process_environment["PYTHONDONTWRITEBYTECODE"] = "1"
     header = (
         f"source_program_dir={program_directory}\n"
@@ -448,10 +510,11 @@ def run_agentic_tuning(
 
 
 __all__ = [
-    "AGENTIC_TUNING_CONTEXT_ENV",
     "AGENTIC_TUNING_CONTEXT_VERSION",
+    "AGENTIC_TUNING_MAX_REGRESSION_POINTS",
     "AgenticTuningContext",
     "AgenticTuningResult",
     "AgenticTuningSpec",
+    "agentic_target_score",
     "run_agentic_tuning",
 ]

@@ -91,6 +91,7 @@ def run_profiled_refinement(
     /,
     *,
     workload_guidance: str,
+    target_score: float | None = None,
     neuronx_cc_args: tuple[str, ...] = (),
     reasoning_effort: ReasoningEffort = "high",
     max_reasoning_steps: int | None = None,
@@ -117,7 +118,10 @@ def run_profiled_refinement(
         policy=policy,
         evaluator=evaluator,
         config=SearchConfig(
-            cache_dir=cache_dir, max_reasoning_steps=max_reasoning_steps, workload_guidance=workload_guidance
+            cache_dir=cache_dir,
+            max_reasoning_steps=max_reasoning_steps,
+            workload_guidance=workload_guidance,
+            target_score=target_score,
         ),
     )
     result = asyncio.run(refinement.run())

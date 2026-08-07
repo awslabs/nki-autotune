@@ -2,71 +2,44 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-import os
 import subprocess
-import tempfile
 from pathlib import Path
 
-from nkigym.search.agentic_tuning import (
-    AGENTIC_TUNING_CONTEXT_ENV,
-    AgenticTuningContext,
-    AgenticTuningResult,
-    run_agentic_tuning,
-)
+from nkigym.search.agentic_tuning import AgenticTuningContext, AgenticTuningResult, run_agentic_tuning
 
 MAX_MFU_REGRESSION_POINTS = 1.0
 MAX_FAILURE_LOG_CHARACTERS = 12000
-GATE_ARTIFACT_DIRECTORY_ENV = "NKIGYM_GATE_ARTIFACT_DIRECTORY"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_context() -> AgenticTuningContext:
+def _load_context(path: Path) -> AgenticTuningContext:
     """Load the controller-owned target workload and historical MFU context."""
-    configured_path = os.environ.get(AGENTIC_TUNING_CONTEXT_ENV)
-    if configured_path is None:
-        raise AssertionError(f"{AGENTIC_TUNING_CONTEXT_ENV} must identify the agentic tuning context")
-    return AgenticTuningContext.from_path(Path(configured_path))
+    return AgenticTuningContext.from_path(path)
 
 
-def _artifact_directory(tmp_path: Path) -> Path:
-    """Return the controller artifact directory or a pytest temporary directory."""
-    configured_directory = os.environ.get(GATE_ARTIFACT_DIRECTORY_ENV)
-    directory = Path(configured_directory) if configured_directory is not None else tmp_path
-    return directory.expanduser().resolve()
-
-
-def _candidate_environment() -> dict[str, str]:
-    """Import candidate nkigym source in nested tuning processes."""
-    environment = dict(os.environ)
-    source = str(REPOSITORY_ROOT / "nkigym/src")
-    existing = environment.get("PYTHONPATH")
-    entries = [source]
-    if existing:
-        entries.append(existing)
-    environment["PYTHONPATH"] = os.pathsep.join(entries)
-    return environment
-
-
-def _run_git(arguments: tuple[str, ...], environment: dict[str, str]) -> str:
+def _run_git(arguments: tuple[str, ...]) -> bytes:
     """Run one Git command required for an exact source tree fingerprint."""
     command = ("git", "-C", str(REPOSITORY_ROOT), *arguments)
-    completed = subprocess.run(command, text=True, capture_output=True, check=False, env=environment)
+    completed = subprocess.run(command, capture_output=True, check=False)
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+        detail = (completed.stderr.strip() or completed.stdout.strip()).decode(errors="replace")
         raise AssertionError(f"{' '.join(command)} failed with exit {completed.returncode}: {detail}")
-    return completed.stdout.strip()
+    return completed.stdout
 
 
-def _source_tree(baseline_tree: str) -> str:
-    """Return the current non-ignored workspace as a Git tree hash."""
-    with tempfile.TemporaryDirectory(prefix="agentic-tuning-source-index-") as temporary:
-        environment = dict(os.environ)
-        environment["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
-        _run_git(("read-tree", baseline_tree), environment)
-        _run_git(("add", "--all", "--", "."), environment)
-        tree = _run_git(("write-tree",), environment)
-    return tree
+def _source_fingerprint(baseline_tree: str) -> str:
+    """Return a fingerprint of tracked changes and untracked file contents."""
+    digest = hashlib.sha256()
+    digest.update(_run_git(("diff", "--binary", baseline_tree, "--", ".")))
+    untracked = _run_git(("ls-files", "--others", "--exclude-standard", "-z"))
+    digest.update(untracked)
+    for relative_path in filter(None, untracked.split(b"\0")):
+        content = (REPOSITORY_ROOT / relative_path.decode()).read_bytes()
+        digest.update(len(content).to_bytes(8, byteorder="big"))
+        digest.update(content)
+    return digest.hexdigest()
 
 
 def _failure_report(result: AgenticTuningResult, record: dict[str, object]) -> str:
@@ -80,15 +53,14 @@ def _failure_report(result: AgenticTuningResult, record: dict[str, object]) -> s
 
 def test_agentic_tuning_produces_valid_non_regressing_evidence(tmp_path: Path) -> None:
     """Target tuning produces measured evidence within the allowed MFU fluctuation."""
-    context = _load_context()
-    artifact_directory = _artifact_directory(tmp_path)
+    artifact_directory = tmp_path.parents[1]
+    context = _load_context(artifact_directory / "agentic-tuning-context.json")
     result = run_agentic_tuning(
         spec=context.tuning,
         program_directory=context.program_directory,
         worktree=REPOSITORY_ROOT,
         output_directory=artifact_directory,
-        environment=_candidate_environment(),
-        source_fingerprint=lambda: _source_tree(context.baseline_tree),
+        source_fingerprint=lambda: _source_fingerprint(context.baseline_tree),
     )
     candidate_score = result.best_score
     historical_best = context.historical_best_score

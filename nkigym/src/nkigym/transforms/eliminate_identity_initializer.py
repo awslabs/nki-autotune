@@ -8,9 +8,9 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR, to_affine
 from nkigym.ir.tree import BlockNode, ForNode
 from nkigym.ops.base import BilinearReductionContract, InitializerContract, ReductionContract
-from nkigym.transforms._canonical_rewrite import finalize_rewrite, owning_block, single_leaf
-from nkigym.transforms._tree_ops import _replace_in_parent_children
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, owning_block, single_leaf
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 
 @dataclass(frozen=True)
@@ -113,7 +113,6 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             or initializer_contract.value != identity
             or output_operand not in reduction.op_cls.rmw_operands(reduction.kwargs)
             or not reduction.op_cls.first_write_overwrites(output_operand, reduction.kwargs)
-            or self._has_reduction_loop(ir, reduction_block_nid, reduction_leaf_nid, reduction_axis)
         ):
             return result
         reset_loop_nid = ir.tree.parent(initializer_block_nid)
@@ -122,6 +121,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             reset_loop_nid is None
             or not isinstance(ir.tree.data(reset_loop_nid), ForNode)
             or reset_loop_nid not in ir.tree.ancestors(reduction_leaf_nid)
+            or self._has_reduction_loop(ir, reset_loop_nid, reduction_block_nid, reduction_leaf_nid, reduction_axis)
             or self._has_local_loop(ir, initializer_block_nid)
             or allocation_block_nid is None
             or not isinstance(ir.tree.data(allocation_block_nid), BlockNode)
@@ -148,8 +148,10 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             result = (contract.output_operand, contract.reduction_axis, contract.combinator.identity)
         return result
 
-    def _has_reduction_loop(self, ir: KernelIR, block_nid: int, leaf_nid: int, reduction_axis: str) -> bool:
-        """Return whether the reduction axis executes more than one ISA call."""
+    def _has_reduction_loop(
+        self, ir: KernelIR, reset_loop_nid: int, block_nid: int, leaf_nid: int, reduction_axis: str
+    ) -> bool:
+        """Return whether one reset is followed by multiple reduction calls."""
         block = ir.tree.block(block_nid)
         concrete_axis = block.axis_map.get(reduction_axis)
         binding_vars: set[str] = set()
@@ -159,11 +161,11 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             ]
             if len(values) == 1:
                 binding_vars = {name for name in to_affine(values[0]) if name is not None}
+        ancestors = ir.tree.ancestors(leaf_nid)
+        reset_index = ancestors.index(reset_loop_nid)
         return any(
-            isinstance((node := ir.tree.data(nid)), ForNode)
-            and node.loop_var in binding_vars
-            and block_nid in ir.tree.ancestors(nid)
-            for nid in ir.tree.ancestors(leaf_nid)
+            isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in binding_vars
+            for nid in ancestors[reset_index + 1 :]
         )
 
     def _has_local_loop(self, ir: KernelIR, block_nid: int) -> bool:

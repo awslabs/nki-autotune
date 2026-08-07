@@ -23,7 +23,7 @@ _TERMINATION_GRACE_SECONDS = 5
 _TIMEOUT_EXIT_CODE = 124
 _START_FAILURE_EXIT_CODE = 127
 EVALUATION_TIMEOUT_SECONDS = 3600
-GATE_ARTIFACT_DIRECTORY_ENV = "NKIGYM_GATE_ARTIFACT_DIRECTORY"
+CODEX_EXECUTABLE = "codex"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -507,14 +507,11 @@ def _run_transform_evaluation(
 
 def test_every_public_transform_is_atomic_and_generic(tmp_path: Path) -> None:
     """Every public transform is one atomic operation implemented generically."""
-    executable = os.environ.get("CODEX_EXECUTABLE", "codex")
-    configured_directory = os.environ.get(GATE_ARTIFACT_DIRECTORY_ENV)
-    artifact_directory = Path(configured_directory) if configured_directory is not None else tmp_path
     passed, log_path = _run_transform_evaluation(
         worktree=REPOSITORY_ROOT,
-        executable=executable,
+        executable=CODEX_EXECUTABLE,
         timeout_seconds=EVALUATION_TIMEOUT_SECONDS,
-        gate_directory=artifact_directory,
+        gate_directory=tmp_path,
     )
     if not passed:
         report = log_path.read_text(encoding="utf-8", errors="replace")

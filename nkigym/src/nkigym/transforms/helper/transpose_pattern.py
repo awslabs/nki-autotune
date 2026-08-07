@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from nkigym.ir import KernelIR
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
-from nkigym.transforms._canonical_rewrite import is_canonical_block, single_leaf
+from nkigym.transforms.helper.canonical_rewrite import is_canonical_block, single_leaf
 
 
 @dataclass(frozen=True)

@@ -64,7 +64,7 @@ def create_run(
         artifact_root=output_root,
         program=program_from_callable(workload.f_nkigym, workload.input_specs, _SCHEDULER_OFF_ARGS, _PROFILE_LNC),
         agentic_tuning=tuning,
-        gates=gates(profile_host),
+        gates=gates(),
         improvement_round_limit=improvement_round_limit,
         initial_historical_best_score=workload.historical_best_mfu,
         base_revision=base_revision,

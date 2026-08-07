@@ -17,6 +17,8 @@
 - The repository-structure test owns transform count, one-transform-per-file,
   transform and aggregate helper source-size, public analyze/apply API, total
   IR source-size, and repository dependency limits.
+- `test/config.py` owns remote test hosts. Tests must not read environment
+  variables for configuration.
 - The transforms directory permits only `__init__.py`, `base.py`, one direct
   Python file per transform, and a flat `helper/` Python package containing no
   transform classes.
