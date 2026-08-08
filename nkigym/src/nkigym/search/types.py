@@ -1,33 +1,20 @@
-"""Types for branching profiler-guided ``nkigym`` transform refinement."""
+"""Types for deterministic heuristic schedule search."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal, Protocol
+from typing import TypeAlias
 
 from nkigym.ir import KernelIR
+from nkigym.search.heuristics import ScheduleStep
 
-DecisionKind = Literal["apply", "revisit", "finish"]
-EvaluationMetric = float | int | str | bool | None
-InputSpecs = dict[str, tuple[tuple[int, ...], str]]
-MAX_TRANSFORMS_PER_REASONING_STEP = 3
-
-
-@dataclass(frozen=True)
-class AgentDecision:
-    """One branch-selection or ordered transform decision returned by the policy."""
-
-    kind: DecisionKind
-    base_node_id: int | None
-    rationale: str
-    raw_response: str
-    action_ids: tuple[str, ...]
+EvaluationMetric: TypeAlias = float | int | str | bool | None
+InputSpecs: TypeAlias = dict[str, tuple[tuple[int, ...], str]]
 
 
 @dataclass(frozen=True)
 class Evaluation:
-    """One scored state returned by a search evaluator."""
+    """Measured hardware result for one schedule candidate."""
 
     score: float | None
     metrics: dict[str, EvaluationMetric]
@@ -35,79 +22,33 @@ class Evaluation:
 
 
 @dataclass(frozen=True)
-class SearchNode:
-    """One measured state in the branching refinement trace."""
+class ScheduleCandidate:
+    """One fully lowered schedule and its optional hardware measurement."""
 
-    node_id: int
+    candidate_id: int
+    family: str
+    strategy: str
     state: KernelIR
-    parent_id: int | None
-    action_id: str | None
-    action_description: str | None
-    rationale: str | None
+    steps: tuple[ScheduleStep, ...]
     evaluation: Evaluation
 
 
 @dataclass(frozen=True)
-class SearchConfig:
-    """Artifacts, optional reasoning limit, and workload guidance."""
-
-    cache_dir: Path
-    max_reasoning_steps: int | None
-    workload_guidance: str
-    target_score: float | None
-
-
-@dataclass(frozen=True)
 class SearchResult:
-    """Completed branching refinement trace and best measured state."""
+    """Completed deterministic schedule search."""
 
-    nodes: tuple[SearchNode, ...]
-    best_node_id: int | None
-    active_node_id: int
+    candidates: tuple[ScheduleCandidate, ...]
+    best_candidate_id: int | None
     transforms_applied: int
-    reasoning_steps: int
     evaluations_run: int
     finish_reason: str
 
     @property
-    def current_node(self) -> SearchNode:
-        """Return the trace node active when refinement finished."""
-        return self.nodes[self.active_node_id]
-
-    @property
-    def best_node(self) -> SearchNode:
-        """Return the highest-scoring successful state."""
-        if self.best_node_id is None:
-            raise RuntimeError("refinement produced no successful evaluation")
-        return self.nodes[self.best_node_id]
+    def best_candidate(self) -> ScheduleCandidate:
+        """Return the highest-MFU successfully measured schedule."""
+        if self.best_candidate_id is None:
+            raise RuntimeError("heuristic search produced no successful evaluation")
+        return self.candidates[self.best_candidate_id]
 
 
-class ReasoningPolicy(Protocol):
-    """Policy that revisits a measured node, applies transforms, or finishes."""
-
-    async def decide(self, observation: str) -> AgentDecision:
-        """Choose the next ordered refinement operations."""
-        ...
-
-
-class StateEvaluator(Protocol):
-    """Evaluator that compiles and profiles one state on Neuron."""
-
-    def evaluate(self, state: KernelIR, node_id: int, cache_dir: Path) -> Evaluation:
-        """Evaluate ``state`` with a higher-is-better score."""
-        ...
-
-
-__all__ = [
-    "AgentDecision",
-    "DecisionKind",
-    "Evaluation",
-    "EvaluationMetric",
-    "InputSpecs",
-    "MAX_TRANSFORMS_PER_REASONING_STEP",
-    "ReasoningPolicy",
-    "SearchConfig",
-    "SearchNode",
-    "SearchResult",
-    "StateEvaluator",
-]
+__all__ = ["Evaluation", "EvaluationMetric", "InputSpecs", "ScheduleCandidate", "SearchResult"]
